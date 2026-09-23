@@ -1786,7 +1786,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								'AMOUNT_TOO_SMALL naming the minimum of the applicable mode, or INVALID_PARAMS'
 						},
 						'409': {
-							description: 'RECEIVE_UNAVAILABLE: the peer is not connected'
+							description:
+								"RECEIVE_UNAVAILABLE: the peer is not connected, or in bolt11 mode did not answer within 15 s or refused (the message is the peer's own, e.g. 'Your node does not provide offline receiving.'); RECEIVE_BUSY: too many receive requests in flight"
 						}
 					}
 				}
@@ -1810,7 +1811,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'409': {
 							description:
-								'RECEIVE_UNAVAILABLE: the peer is not connected, or direct funding is configured for a different peer'
+								"RECEIVE_UNAVAILABLE: the peer is not connected, in bolt11 mode did not answer within 15 s or refused (the message is the peer's own, e.g. 'Your node does not provide offline receiving.'), or direct funding is configured for a different peer; RECEIVE_BUSY: another request is being prepared or too many receive requests are in flight"
 						}
 					}
 				}

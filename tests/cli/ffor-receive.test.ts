@@ -2,6 +2,8 @@ import assert from 'assert';
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
 import { FforReceiveService } from '../../src/cli/ffor-receive';
+import { BeignetError } from '../../src/cli/errors';
+import { statusForErrorCode } from '../../src/cli/daemon';
 import { FforSlotState, FforState } from '../../src/lightning/ffor/types';
 
 const peer = '02' + '11'.repeat(32);
@@ -9,6 +11,21 @@ const other = '03' + '22'.repeat(32);
 const channelId = '33'.repeat(32);
 const epochId = '44'.repeat(32);
 const preimage = Buffer.alloc(32, 5);
+/**
+ * An assert.rejects check for a typed refusal: a BeignetError with this code
+ * and message, which the daemon answers with a 409 rather than scrubbing it to
+ * a 500 "Internal server error" (issue #920).
+ */
+const typed =
+	(code: string, message: string | RegExp) =>
+	(e: unknown): boolean => {
+		assert.ok(e instanceof BeignetError, `not a BeignetError: ${String(e)}`);
+		assert.equal(e.code, code);
+		if (typeof message === 'string') assert.equal(e.message, message);
+		else assert.match(e.message, message);
+		assert.equal(statusForErrorCode(e.code), 409);
+		return true;
+	};
 function fixture(role = 'R') {
 	const node: any = new EventEmitter();
 	const sent: any[] = [];
@@ -78,6 +95,16 @@ function fixture(role = 'R') {
 				JSON.stringify({ id: sent[sent.length - 1].id, ok: true, result })
 			)
 		});
+	/** The settlement peer's refusal of the last request, in its own words. */
+	const refuse = (error: unknown, sender = peer) =>
+		node.emit('custom-message', {
+			peerPubkey: sender,
+			version: 1,
+			subtype: 81,
+			payload: Buffer.from(
+				JSON.stringify({ id: sent[sent.length - 1].id, ok: false, error })
+			)
+		});
 	return {
 		service,
 		node,
@@ -85,6 +112,7 @@ function fixture(role = 'R') {
 		record,
 		added,
 		response,
+		refuse,
 		host,
 		storage,
 		opened,
@@ -242,5 +270,103 @@ describe('automatic receive service', () => {
 		const p = f.service.request(peer, { op: 'quote' });
 		f.service.stop();
 		await assert.rejects(p, /stopped/);
+		await assert.rejects(p, typed('RECEIVE_UNAVAILABLE', 'Wallet stopped'));
+	});
+	// Issue #920: every rejection below used to be a plain Error with a code
+	// attached, which the daemon does not map, so GET /receive/quote and POST
+	// /receive/invoice answered a peer's honest refusal with a 500.
+	it("rejects a settlement peer's refusal typed, in the peer's own words", async () => {
+		const f = fixture();
+		try {
+			const p = f.service.request(peer, { op: 'quote' });
+			f.refuse('Your node does not provide offline receiving.');
+			await assert.rejects(
+				p,
+				typed(
+					'RECEIVE_UNAVAILABLE',
+					'Your node does not provide offline receiving.'
+				)
+			);
+		} finally {
+			f.service.stop();
+		}
+	});
+	it('reads a refusal that is not a bounded, non-blank string as the generic one', async () => {
+		const f = fixture();
+		try {
+			for (const error of [42, 'x'.repeat(501), '', '   ', null]) {
+				const p = f.service.request(peer, { op: 'quote' });
+				f.refuse(error);
+				await assert.rejects(
+					p,
+					typed('RECEIVE_UNAVAILABLE', 'Receiving is unavailable.')
+				);
+			}
+			const longest = 'y'.repeat(500);
+			const p = f.service.request(peer, { op: 'quote' });
+			f.refuse(longest);
+			await assert.rejects(p, typed('RECEIVE_UNAVAILABLE', longest));
+		} finally {
+			f.service.stop();
+		}
+	});
+	it('rejects typed when the peer never answers', async () => {
+		const f = fixture();
+		try {
+			await assert.rejects(
+				f.service.request(peer, { op: 'quote' }, 5),
+				typed('RECEIVE_UNAVAILABLE', /did not answer/)
+			);
+		} finally {
+			f.service.stop();
+		}
+	});
+	it('rejects typed when the send throws, and leaves nothing pending', async () => {
+		const f = fixture();
+		try {
+			f.node.sendCustomMessage = (): never => {
+				throw Error(`Not connected to peer ${peer}`);
+			};
+			await assert.rejects(
+				f.service.request(peer, { op: 'quote' }),
+				typed('RECEIVE_UNAVAILABLE', /Connect to your node/)
+			);
+			assert.equal((f.service as any).pending.size, 0);
+			// A refusal that is already typed keeps its own code and words.
+			const own = new BeignetError('RECEIVE_BUSY', 'Busy elsewhere.');
+			f.node.sendCustomMessage = (): never => {
+				throw own;
+			};
+			await assert.rejects(
+				f.service.request(peer, { op: 'quote' }),
+				(e) => e === own
+			);
+			assert.equal((f.service as any).pending.size, 0);
+		} finally {
+			f.service.stop();
+		}
+	});
+	it('refuses a request past the in-flight cap as busy', async () => {
+		const f = fixture();
+		try {
+			for (let i = 0; i < 32; i++)
+				f.service.request(peer, { op: 'quote' }).catch(() => {
+					// stop() below cancels these.
+				});
+			await assert.rejects(
+				f.service.request(peer, { op: 'quote' }),
+				typed('RECEIVE_BUSY', 'Receiving is busy. Try again shortly.')
+			);
+		} finally {
+			f.service.stop();
+		}
+	});
+	it('refuses a request after stopping as stopped, not busy', async () => {
+		const f = fixture();
+		f.service.stop();
+		await assert.rejects(
+			f.service.request(peer, { op: 'quote' }),
+			typed('RECEIVE_UNAVAILABLE', 'Wallet stopped')
+		);
 	});
 });

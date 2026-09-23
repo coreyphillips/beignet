@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import type { BeignetNode } from './beignet-node';
+import { BeignetError } from './errors';
 import { FforSlotState, FforState } from '../lightning/ffor/types';
 import { BeignetCustomSubtype } from '../lightning/message/custom';
 
@@ -18,8 +19,21 @@ const KEY = 'ffor_receive_allocations_v1';
 const HEX = /^[a-f0-9]{64}$/;
 const ID = /^[a-f0-9]{32}$/;
 const fail = (code: string, message: string): never => {
-	throw Object.assign(new Error(message), { code });
+	throw new BeignetError(code, message);
 };
+/** The longest refusal a settlement peer may put in front of the wallet. */
+const MAX_REFUSAL_LENGTH = 500;
+/**
+ * A settlement peer's refusal, in its own words, for the wallet to show (issue
+ * #920). It is remote text bound for an HTTP body, so only a bounded,
+ * non-blank string passes; anything else reads as the generic refusal.
+ */
+const refusal = (error: unknown): string =>
+	typeof error === 'string' &&
+	error.trim().length > 0 &&
+	error.length <= MAX_REFUSAL_LENGTH
+		? error
+		: 'Receiving is unavailable.';
 type Allocation = {
 	peer: string;
 	id: string;
@@ -87,7 +101,7 @@ export class FforReceiveService {
 		this.host.getNode().removeListener('custom-message', this.listener);
 		for (const p of this.pending.values()) {
 			clearTimeout(p.timer);
-			p.reject(Error('Wallet stopped'));
+			p.reject(new BeignetError('RECEIVE_UNAVAILABLE', 'Wallet stopped'));
 		}
 		this.pending.clear();
 	}
@@ -96,16 +110,19 @@ export class FforReceiveService {
 		body: Record<string, unknown>,
 		timeout = 15000
 	): Promise<any> {
-		if (this.stopped || this.pending.size >= 32)
+		// Every refusal below is a BeignetError, so the daemon answers it with
+		// its mapped 409 instead of scrubbing it to a 500 (issue #920).
+		if (this.stopped) return fail('RECEIVE_UNAVAILABLE', 'Wallet stopped');
+		if (this.pending.size >= 32)
 			return fail('RECEIVE_BUSY', 'Receiving is busy. Try again shortly.');
 		const id = crypto.randomBytes(16).toString('hex');
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pending.delete(id);
 				reject(
-					Object.assign(
-						Error('Your node did not answer the receive request.'),
-						{ code: 'RECEIVE_UNAVAILABLE' }
+					new BeignetError(
+						'RECEIVE_UNAVAILABLE',
+						'Your node did not answer the receive request.'
 					)
 				);
 			}, timeout);
@@ -122,7 +139,16 @@ export class FforReceiveService {
 			} catch (e) {
 				clearTimeout(timer);
 				this.pending.delete(id);
-				reject(e);
+				// The transport's own text (not connected, gate or lane refused)
+				// is not the wallet's to act on; the peer being unreachable is.
+				reject(
+					e instanceof BeignetError
+						? e
+						: new BeignetError(
+								'RECEIVE_UNAVAILABLE',
+								'Connect to your node before creating this payment request.'
+						  )
+				);
 			}
 		});
 	}
@@ -147,17 +173,7 @@ export class FforReceiveService {
 			clearTimeout(p.timer);
 			this.pending.delete(b.id);
 			if (b.ok === true) p.resolve(b.result);
-			else
-				p.reject(
-					Object.assign(
-						Error(
-							typeof b.error === 'string'
-								? b.error
-								: 'Receiving is unavailable.'
-						),
-						{ code: 'RECEIVE_UNAVAILABLE' }
-					)
-				);
+			else p.reject(new BeignetError('RECEIVE_UNAVAILABLE', refusal(b.error)));
 			return;
 		}
 		let reply: any;

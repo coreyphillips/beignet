@@ -1484,7 +1484,11 @@ export class BeignetNode extends EventEmitter {
 		this.offlineReceiveTimer = undefined;
 	}
 	getFforReceiveService(): FforReceiveService {
-		if (!this.fforReceiveService) throw new Error('Wallet is not running');
+		if (!this.fforReceiveService)
+			throw new BeignetError(
+				'RECEIVE_UNAVAILABLE',
+				'Automatic receiving is unavailable.'
+			);
 		return this.fforReceiveService;
 	}
 	// ─── Typed event overloads ───
