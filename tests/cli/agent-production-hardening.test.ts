@@ -330,6 +330,52 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 		// destroy() reaches wallet.stop() before its first await.
 		await heldWalletWriteLandsBeforeClose((node) => node.destroy(), true);
 	});
+
+	it('a payment queue first built after shutdown began dispatches none of the rows it restores (issue #958)', async function () {
+		this.timeout(15_000);
+		const { BeignetNode } = await import('../../src/cli/beignet-node');
+		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-test-'));
+		const node = await BeignetNode.create({
+			network: 'regtest',
+			dataDir: tmpDir,
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
+		});
+		const internals = node as unknown as {
+			destroyed: boolean;
+			payInvoiceSafe: (b: string) => Promise<unknown>;
+		};
+		try {
+			const payCalls: string[] = [];
+			internals.payInvoiceSafe = (bolt11: string): Promise<unknown> => {
+				payCalls.push(bolt11);
+				return Promise.reject(new Error('node destroyed'));
+			};
+			// Queued by an earlier run; this run never touched the queue.
+			const storage = node.getStorage();
+			storage.saveQueueEntry({
+				id: 'q-1-issue958',
+				bolt11: 'lnbcrt_issue958_restored',
+				priority: 5,
+				status: 'queued',
+				createdAt: Date.now()
+			});
+			// Shutdown has begun and the wallet is still stopping, so the
+			// database is open when the queue is first built.
+			internals.destroyed = true;
+			node.enqueuePayment('lnbcrt_issue958_late');
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			expect(payCalls).to.have.length(0);
+			const statusOf = (id: string): string | undefined =>
+				storage.loadAllQueueEntries().find((row) => row.id === id)?.status;
+			expect(statusOf('q-1-issue958')).to.equal('queued');
+		} finally {
+			internals.destroyed = false;
+			await node.destroy();
+			fs.rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
 });
 
 // ─────────────── Phase 3: Timeout Safety ───────────────

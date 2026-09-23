@@ -219,12 +219,16 @@ describe('A queued payment survives a graceful stop (issue #958)', function () {
 		const firstPort = (first.server.address() as AddressInfo).port;
 		const payCalls: string[] = [];
 		const failPays: Array<(e: Error) => void> = [];
+		let stopCalled = false;
 		(
 			first.node as unknown as {
 				payInvoiceSafe: (b: string) => Promise<unknown>;
 			}
 		).payInvoiceSafe = (bolt11: string): Promise<unknown> => {
 			payCalls.push(bolt11);
+			// As the stopped node does: a dispatch after stop() fails at once,
+			// so one the queue should have held back persists 'failed'.
+			if (stopCalled) return Promise.reject(new Error('node destroyed'));
 			return new Promise((_resolve, reject) => failPays.push(reject));
 		};
 		const listQueue = async (port: number): Promise<Entry[]> =>
@@ -243,6 +247,7 @@ describe('A queued payment survives a graceful stop (issue #958)', function () {
 			expect(waiting).to.not.equal(undefined);
 			const inFlight = payCalls.length;
 
+			stopCalled = true;
 			const stopped = first.stop();
 			// The stopped node fails what it had in flight.
 			for (const fail of failPays) fail(new Error('node destroyed'));

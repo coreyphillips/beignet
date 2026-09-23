@@ -477,11 +477,25 @@ describe('Production Hardening 10', () => {
 			}
 		});
 
-		it('destroy with closeStorage false leaves the storage open', () => {
+		it('destroy with closeStorage false leaves the storage open, and a late node write does not rewrite a blob from its cleared maps', () => {
 			const { node, storage, dbPath } = nodeWithStorage(231);
+			const setPendingFundingTx = (txid: string, txHex: string): void =>
+				(
+					node as unknown as {
+						setPendingFundingTx(txid: string, txHex: string): void;
+					}
+				).setPendingFundingTx(txid, txHex);
 			try {
+				setPendingFundingTx('aa'.repeat(32), '01');
+				const before = storage.loadMetadata('pending_funding_txs');
+				expect(before).to.include('aa'.repeat(32));
+
 				node.destroy({ closeStorage: false });
 				expect(isOpen(storage)).to.equal(true);
+				// A funding build that resolves after destroy() used to save the
+				// whole map, which destroy() had emptied, over the stored one.
+				setPendingFundingTx('bb'.repeat(32), '02');
+				expect(storage.loadMetadata('pending_funding_txs')).to.equal(before);
 			} finally {
 				storage.close();
 				fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });

@@ -10134,7 +10134,13 @@ export class LightningNode extends EventEmitter {
 		// Close storage to release WAL file handles. A caller that owns the
 		// backend may keep it open: BeignetNode shares it with the on-chain
 		// wallet, which stops after the node and still writes (issue #958).
-		if (this.storage && opts?.closeStorage !== false) {
+		// The node lets go of it all the same, so a continuation that resumes
+		// after this skips its writes, as it would against a closed backend,
+		// instead of rewriting a whole-map blob such as pending_funding_txs
+		// from the maps cleared below.
+		if (this.storage && opts?.closeStorage === false) {
+			this.storage = null;
+		} else if (this.storage) {
 			try {
 				this.storage.close();
 			} catch {
@@ -10163,7 +10169,8 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * Graceful shutdown: waits for in-flight HTLCs to settle, persists state, then destroys.
-	 * `opts` goes to destroy(); `closeStorage: false` leaves the storage open.
+	 * `opts` goes to destroy(); `closeStorage: false` leaves the storage open
+	 * for its owner, and the node drops its own reference to it.
 	 */
 	async gracefulShutdown(
 		timeoutMs = 30_000,

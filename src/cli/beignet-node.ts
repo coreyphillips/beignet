@@ -11864,6 +11864,10 @@ export class BeignetNode extends EventEmitter {
 				undefined,
 				this.storage
 			);
+			// First built after shutdown began, while the database stays open
+			// for the wallet: the rows it restored must not dispatch against
+			// the stopped node and persist 'failed' (issue #958).
+			if (this.destroyed) this.paymentQueue.stop();
 		}
 		return this.paymentQueue;
 	}
