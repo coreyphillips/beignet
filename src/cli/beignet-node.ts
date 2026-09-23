@@ -797,6 +797,30 @@ export function parseScid(scid: string): Buffer {
 }
 
 /**
+ * The BeignetError code for each LightningErrorCode the engine throws out of a
+ * send, as payInvoice has always mapped them. Every public payment method
+ * routes an engine refusal through this table (issue #991), so a refusal
+ * carries the same code, and over HTTP the same status, whichever method or
+ * route it came in by.
+ */
+export const ENGINE_PAYMENT_ERROR_CODES: Readonly<Record<string, string>> = {
+	NO_ROUTE: 'NO_ROUTE',
+	DUPLICATE_PAYMENT: 'DUPLICATE_PAYMENT',
+	NO_CHANNEL_TO_HOP: 'PEER_NOT_CONNECTED',
+	FEE_EXCEEDS_MAX: 'PAYMENT_FAILED',
+	// The caller's own bound (#751): its code, not a generic failure, so a
+	// swap provider can tell "no route under the refund height" from "no
+	// route at all".
+	CLTV_EXCEEDS_MAX: 'CLTV_EXCEEDS_MAX',
+	MISSING_AMOUNT: 'INVALID_PARAMS',
+	INVALID_INVOICE: 'INVALID_PARAMS',
+	// A keysend refused for its own arguments (a destination that is not a
+	// 33-byte key, a zero amount): the caller's problem, as MISSING_AMOUNT is.
+	INVALID_KEYSEND: 'INVALID_PARAMS',
+	INVOICE_EXPIRED: 'INVOICE_EXPIRED'
+};
+
+/**
  * Decode a user-supplied BOLT 11 string. The parser throws plain Error, which
  * the daemon scrubs to a generic 500 and logs as an unhandled server fault;
  * a typed INVALID_INVOICE keeps the parser's message and answers 400.
@@ -10009,6 +10033,35 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
+	 * The BeignetError for a refusal the engine threw out of a send: its
+	 * LightningErrorCode through ENGINE_PAYMENT_ERROR_CODES, or, for an
+	 * untyped throw, the code its message implies. One mapping for every
+	 * payment method (issue #991): sendPaymentAsync used to let the engine's
+	 * LightningPaymentError through untouched, and the daemon, seeing no
+	 * BeignetError, answered PAYMENT_FAILED with a 502 that told an agent to
+	 * retry a payment that was already made. A BeignetError passes through.
+	 */
+	private _toBeignetPaymentError(err: unknown): BeignetError {
+		if (err instanceof BeignetError) return err;
+		const msg = err instanceof Error ? err.message : String(err);
+		let code = 'PAYMENT_FAILED';
+		if (err instanceof Error && 'code' in err) {
+			const lpErr = err as { code: string };
+			code = ENGINE_PAYMENT_ERROR_CODES[lpErr.code] || 'PAYMENT_FAILED';
+		} else if (msg.includes('No route found')) {
+			code = 'NO_ROUTE';
+		} else if (msg.includes('already in flight')) {
+			code = 'DUPLICATE_PAYMENT';
+		} else if (
+			msg.includes('No channel to first hop') ||
+			msg.includes('Peer not found')
+		) {
+			code = 'PEER_NOT_CONNECTED';
+		}
+		return new BeignetError(code, msg);
+	}
+
+	/**
 	 * Pay a BOLT 11 invoice and wait for its outcome, at most timeoutMs. At
 	 * the timeout the payment is failed only when no HTLC is out for it; with
 	 * one still in flight the record stays PENDING until that HTLC resolves,
@@ -10147,36 +10200,7 @@ export class BeignetNode extends EventEmitter {
 				// duplicate, a peer that is gone) and ratcheted the counter up
 				// until the daily limit refused real payments (issue #474).
 				if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
-				const msg = err instanceof Error ? err.message : String(err);
-				// Use typed error code if available, fall back to string matching
-				let code = 'PAYMENT_FAILED';
-				if (err instanceof Error && 'code' in err) {
-					const lpErr = err as { code: string };
-					const codeMap: Record<string, string> = {
-						NO_ROUTE: 'NO_ROUTE',
-						DUPLICATE_PAYMENT: 'DUPLICATE_PAYMENT',
-						NO_CHANNEL_TO_HOP: 'PEER_NOT_CONNECTED',
-						FEE_EXCEEDS_MAX: 'PAYMENT_FAILED',
-						// The caller's own bound (#751): its code, not a generic
-						// failure, so a swap provider can tell "no route under the
-						// refund height" from "no route at all".
-						CLTV_EXCEEDS_MAX: 'CLTV_EXCEEDS_MAX',
-						MISSING_AMOUNT: 'INVALID_PARAMS',
-						INVALID_INVOICE: 'INVALID_PARAMS',
-						INVOICE_EXPIRED: 'INVOICE_EXPIRED'
-					};
-					code = codeMap[lpErr.code] || 'PAYMENT_FAILED';
-				} else {
-					if (msg.includes('No route found')) code = 'NO_ROUTE';
-					else if (msg.includes('already in flight'))
-						code = 'DUPLICATE_PAYMENT';
-					else if (
-						msg.includes('No channel to first hop') ||
-						msg.includes('Peer not found')
-					)
-						code = 'PEER_NOT_CONNECTED';
-				}
-				reject(new BeignetError(code, msg));
+				reject(this._toBeignetPaymentError(err));
 			}
 		});
 	}
@@ -10427,13 +10451,9 @@ export class BeignetNode extends EventEmitter {
 			// identity, so a refused duplicate frees only this submission's
 			// claim and leaves the in-flight attempt's alone.
 			if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
-			if (
-				err instanceof Error &&
-				(err as { code?: string }).code === 'CLTV_EXCEEDS_MAX'
-			) {
-				throw new BeignetError('CLTV_EXCEEDS_MAX', err.message);
-			}
-			throw err;
+			// With its own code (issue #991): a duplicate answers 409 over
+			// HTTP, not the retryable 502 an unmapped throw was flattened to.
+			throw this._toBeignetPaymentError(err);
 		}
 		// Not every refusal throws. An expired invoice, a locally refused
 		// addHtlc and an undispatchable MPP part all RETURN a failed payment,
@@ -10498,7 +10518,7 @@ export class BeignetNode extends EventEmitter {
 			});
 		} catch (err: unknown) {
 			if (claim) this._closeAsyncSpendClaim(provisionalKey, claim);
-			throw err;
+			throw this._toBeignetPaymentError(err);
 		}
 		const paymentHashHex = result.paymentHash.toString('hex');
 		if (claim) {
@@ -11554,8 +11574,7 @@ export class BeignetNode extends EventEmitter {
 				// ratcheted the counter up until the daily limit refused real
 				// payments, as it did on the BOLT 11 path (issue #474).
 				if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
-				const msg = err instanceof Error ? err.message : String(err);
-				reject(new BeignetError('PAYMENT_FAILED', msg));
+				reject(this._toBeignetPaymentError(err));
 			}
 		});
 	}

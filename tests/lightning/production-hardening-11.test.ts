@@ -11,6 +11,7 @@ import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
+import { ENGINE_PAYMENT_ERROR_CODES } from '../../src/cli/beignet-node';
 import {
 	INodeConfig,
 	PaymentStatus,
@@ -1640,18 +1641,25 @@ describe('Production Hardening 11', function () {
 			});
 
 			it('should BeignetNode code mapping be correct', () => {
+				// The mapping payInvoice applied inline, now the one table every
+				// payment method routes an engine refusal through (#991).
 				const codeMap: Record<string, string> = {
 					NO_ROUTE: 'NO_ROUTE',
 					DUPLICATE_PAYMENT: 'DUPLICATE_PAYMENT',
 					NO_CHANNEL_TO_HOP: 'PEER_NOT_CONNECTED',
 					FEE_EXCEEDS_MAX: 'PAYMENT_FAILED',
+					CLTV_EXCEEDS_MAX: 'CLTV_EXCEEDS_MAX',
 					MISSING_AMOUNT: 'INVALID_PARAMS',
 					INVALID_INVOICE: 'INVALID_PARAMS',
+					INVALID_KEYSEND: 'INVALID_PARAMS',
 					INVOICE_EXPIRED: 'INVOICE_EXPIRED'
 				};
 
 				for (const [lightningCode, beignetCode] of Object.entries(codeMap)) {
-					expect(codeMap[lightningCode]).to.equal(beignetCode);
+					expect(
+						ENGINE_PAYMENT_ERROR_CODES[lightningCode],
+						lightningCode
+					).to.equal(beignetCode);
 				}
 			});
 		});

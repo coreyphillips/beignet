@@ -708,9 +708,10 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 			);
 
 			stubSendKeysend(node, 1_000, { throws: new Error('No route found') });
+			// A keysend refusal carries its code as an invoice's does (#991).
 			expect(
 				await rejectionOf(node.sendKeysend(PUBKEY, 1_000, 5_000))
-			).to.equal('ERROR');
+			).to.equal('NO_ROUTE');
 
 			expect(spent(node)).to.equal(0);
 			expect(pending(node)).to.equal(0);
