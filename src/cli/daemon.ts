@@ -23,8 +23,7 @@ import { BeignetError } from './errors';
 import { L402Error } from '../lightning/l402';
 import { ApiResponse, RouteHop, SpliceResult } from './types';
 import { getOpenApiSpec } from './openapi';
-import { WebhookManager } from './webhooks';
-import { PaymentQueue } from './payment-queue';
+import { IWebhookStorage, WebhookManager } from './webhooks';
 import {
 	HttpRateLimiter,
 	RateLimitOptions,
@@ -1050,7 +1049,10 @@ async function bootDaemon(
 	}
 	const node = await BeignetNode.create(logger ? { ...opts, logger } : opts);
 	started.node = node;
-	const storage = node.getStorage();
+	// Every store below reads node.getStorage() on each call rather than
+	// keeping the handle: an in-process capsule resume closes the database
+	// the node booted on and installs the restored one, and a write to the
+	// closed handle throws (issue #978).
 	// Durable auth-key state: persisted rotate/revoke overrides live in the
 	// encrypted wallet_data table and are re-applied over the config-declared
 	// keys on every start (so a restart no longer resurrects a revoked or
@@ -1058,7 +1060,9 @@ async function bootDaemon(
 	authenticator.attachOverrideStore({
 		load: (): Record<string, StoredKeyOverride> | null => {
 			try {
-				const raw = storage.loadWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY);
+				const raw = node
+					.getStorage()
+					.loadWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY);
 				if (raw === null) return null;
 				const parsed = JSON.parse(raw);
 				return typeof parsed === 'object' &&
@@ -1071,23 +1075,29 @@ async function bootDaemon(
 			}
 		},
 		save: (overrides): void => {
-			storage.saveWalletData(
-				AUTH_KEY_OVERRIDES_STORAGE_KEY,
-				JSON.stringify(overrides)
-			);
+			node
+				.getStorage()
+				.saveWalletData(
+					AUTH_KEY_OVERRIDES_STORAGE_KEY,
+					JSON.stringify(overrides)
+				);
 		}
 	});
-	const webhookManager = new WebhookManager(storage);
-	const paymentQueue = new PaymentQueue(
-		(bolt11, timeout, maxFee, amount, meta) =>
-			node.payInvoiceSafe(bolt11, timeout, maxFee, amount, meta),
-		(amount) => node.canSend(amount),
-		// A restored entry that was in flight at the last stop is settled
-		// against the node's record before anything sends it again (issue
-		// #967).
-		{ resolveInterrupted: (b) => node.resolveInterruptedPayment(b) },
-		storage
-	);
+	const webhookStorage: IWebhookStorage = {
+		saveWebhook: (id, url, events, secretHash, createdAt) =>
+			node.getStorage().saveWebhook(id, url, events, secretHash, createdAt),
+		deleteWebhook: (id) => node.getStorage().deleteWebhook(id),
+		deleteAllWebhooks: () => node.getStorage().deleteAllWebhooks(),
+		loadAllWebhooks: () => node.getStorage().loadAllWebhooks()
+	};
+	const webhookManager = new WebhookManager(webhookStorage);
+	// The node's queue, the one this process runs over the payment_queue
+	// table (issue #978): the routes under /queue and the node's own
+	// enqueuePayment/listQueue/cancelQueuedPayment serve the same instance.
+	// Building it here wires its start (once the node can pay, issue #967)
+	// and its poke on every channel:usable; a boot that fails from here on
+	// destroys the node, which stops the queue.
+	const paymentQueue = node.getPaymentQueue();
 	const rateLimiter = opts.rateLimit
 		? new HttpRateLimiter(opts.rateLimit)
 		: null;
@@ -3386,15 +3396,10 @@ async function bootDaemon(
 		server.on('error', reject);
 		server.listen(port, host, () => {
 			logger?.info(`Daemon listening on ${host}:${port}`);
-			// What the queue restored dispatches once the node can pay, not on
-			// the next enqueue (issue #967). Started only now that the boot
-			// can no longer fail: a failed boot destroys the node without
-			// stopping the queue. stop() halts the queue first, so a start
-			// that comes after it does nothing. A payment held back by canSend
-			// is looked at again whenever a channel can carry HTLCs again,
-			// not only on the next enqueue.
-			node.whenReadyToPay(() => paymentQueue.start());
-			node.on('channel:usable', () => paymentQueue.poke());
+			// The queue's start (once the node can pay, issue #967) and its
+			// poke on channel:usable were wired when the node built it above;
+			// stop() halts the queue first, so a start that comes after it
+			// does nothing (issue #978).
 			resolve({ server, node, stop });
 		});
 	});
