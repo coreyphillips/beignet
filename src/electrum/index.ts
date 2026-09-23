@@ -2835,6 +2835,41 @@ export class Electrum {
 		this.connectedToElectrum = false;
 	}
 
+	/**
+	 * Stops an instance whose wallet was never handed to anyone, such as the
+	 * one a Wallet.create builds before it returns an error (issue #966).
+	 *
+	 * The constructor starts the connection poll, and the caller has no wallet
+	 * to stop, so without this the poll runs forever: it connects to the
+	 * configured servers, reports the connection through a wallet the caller
+	 * was told does not exist, and keeps the process alive.
+	 *
+	 * The full disconnect() only runs when this instance is connected or has a
+	 * connect in flight. It stops rn-electrum-client's client for the network,
+	 * and there is only one of those per network in the whole process, so for
+	 * an instance that never connected it would tear down the socket a sibling
+	 * wallet on the same network is using.
+	 * @returns {Promise<void>}
+	 */
+	public async abandon(): Promise<void> {
+		this.stopConnectionPolling();
+		// A poll tick already running checks this at entry and again before it
+		// reconnects, so it returns instead of putting the instance on the
+		// network. Only an explicit connectToElectrum clears it.
+		this._disconnected = true;
+		const connecting = this._connectInFlight;
+		if (!this.connectedToElectrum && !connecting) return;
+		if (connecting) {
+			// The attempt reads the flag above, so it never reports a
+			// connection. How it ended does not matter here, only that the
+			// teardown runs after it: an attempt that succeeds records its server
+			// as held by this instance, and one that finished after disconnect()
+			// would leave that record with nothing left to release it.
+			await connecting.catch(() => undefined);
+		}
+		await this.disconnect();
+	}
+
 	public startConnectionPolling(): void {
 		if (this.connectionPollingInterval) return;
 		this.connectionPollingInterval = setInterval((): void => {
