@@ -6,8 +6,23 @@
  */
 
 import { expect } from 'chai';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { BeignetNode } from '../../src/cli/beignet-node';
 import { BeignetError, BeignetErrorCode } from '../../src/cli/errors';
-import { PaymentInfo } from '../../src/cli/types';
+import { PaymentInfo, RouteHop } from '../../src/cli/types';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
+import {
+	DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+	Network
+} from '../../src/lightning/invoice/types';
+import {
+	PaymentDirection,
+	PaymentStatus
+} from '../../src/lightning/node/types';
 
 /**
  * Since BeignetNode.create() requires real Electrum/wallet, we test the
@@ -164,9 +179,189 @@ describe('payInvoiceSafe — Never Throws', () => {
 
 	// ─── Verify BeignetNode.payInvoiceSafe method exists ───
 
-	it('BeignetNode.prototype.payInvoiceSafe exists', async function () {
-		this.timeout(10_000);
-		const { BeignetNode } = await import('../../src/cli/beignet-node');
+	it('BeignetNode.prototype.payInvoiceSafe exists', () => {
 		expect(typeof BeignetNode.prototype.payInvoiceSafe).to.equal('function');
+	});
+});
+
+// Same rationale as tests/cli/payment-queue-restart.test.ts: a refused
+// loopback connect returns instantly, where the regtest default is a public
+// host.
+const OFFLINE_ELECTRUM = {
+	electrumHost: '127.0.0.1',
+	electrumPort: 65529,
+	electrumTls: false
+};
+
+const MNEMONIC =
+	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+
+/** An invoice from somebody else, for a preimage the test knows. */
+const invoiceFrom = (
+	description: string
+): { bolt11: string; paymentHash: Buffer; preimage: Buffer } => {
+	const preimage = crypto.randomBytes(32);
+	const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+	return {
+		bolt11: encodeInvoice({
+			network: Network.REGTEST,
+			amountMsat: 1_000_000n,
+			timestamp: Math.floor(Date.now() / 1000),
+			paymentHash,
+			paymentSecret: crypto.randomBytes(32),
+			description,
+			expiry: 3600,
+			minFinalCltvExpiry: DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+			privateKey: crypto
+				.createHash('sha256')
+				.update(Buffer.from(`payee-${description}`))
+				.digest()
+		}),
+		paymentHash,
+		preimage
+	};
+};
+
+/** The BeignetError a rejected promise carries, or undefined when it resolved. */
+const rejection = async (
+	run: () => Promise<unknown>
+): Promise<BeignetError | undefined> => {
+	try {
+		await run();
+		return undefined;
+	} catch (err) {
+		expect(err).to.be.instanceOf(BeignetError);
+		return err as BeignetError;
+	}
+};
+
+/**
+ * Issue #975: the engine refuses to pay a hash whose durable OUTGOING row
+ * says it was paid, and the in-memory record is pruned 24 hours after
+ * completion while that row stays. payInvoiceSafe used to answer such a
+ * refusal with a synthetic FAILED record, since it read memory only. The
+ * durable row answers only a DUPLICATE_PAYMENT refusal: for any other
+ * failure it is an earlier attempt's history, not this one's outcome.
+ */
+describe('payInvoiceSafe answers a pruned paid hash with its durable record (issue #975)', function () {
+	this.timeout(30_000);
+
+	let tmpDir: string;
+	let node: BeignetNode;
+
+	before(async () => {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-safe-durable-'));
+		node = await BeignetNode.create({
+			mnemonic: MNEMONIC,
+			network: 'regtest',
+			dataDir: tmpDir,
+			logLevel: 'silent',
+			rapidGossipSync: false,
+			autoGossipSync: false,
+			...OFFLINE_ELECTRUM
+		});
+	});
+
+	after(async () => {
+		await node?.destroy();
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	/** A paid OUTGOING row in storage alone, as the prune leaves it. */
+	const seedPaidRow = (
+		description: string
+	): { bolt11: string; hashHex: string; preimage: Buffer } => {
+		const { bolt11, paymentHash, preimage } = invoiceFrom(description);
+		const hashHex = paymentHash.toString('hex');
+		node.getStorage().savePayment(hashHex, {
+			paymentHash,
+			preimage,
+			amountMsat: 1_000_000n,
+			status: PaymentStatus.COMPLETED,
+			direction: PaymentDirection.OUTGOING,
+			createdAt: Date.now() - 2_000,
+			completedAt: Date.now() - 1_000
+		});
+		expect(node.getPayment(hashHex), 'memory holds nothing').to.equal(null);
+		return { bolt11, hashHex, preimage };
+	};
+
+	it('returns the COMPLETED record, preimage included, when only storage holds it', async () => {
+		const { bolt11, hashHex, preimage } = seedPaidRow('pruned paid');
+
+		// The engine refuses from the row (before the fix the send went out,
+		// failing here for want of a route), and payInvoiceSafe answers the
+		// refusal with the row.
+		const refused = await rejection(() => node.payInvoice(bolt11, 2_000));
+		expect(refused?.code).to.equal(BeignetErrorCode.DUPLICATE_PAYMENT);
+
+		const result = await node.payInvoiceSafe(bolt11, 2_000);
+		expect(result.paymentHash).to.equal(hashHex);
+		expect(result.status).to.equal('COMPLETED');
+		expect(result.direction).to.equal('OUTGOING');
+		expect(result.preimage).to.equal(preimage.toString('hex'));
+		expect(result.failureDescription).to.equal(undefined);
+	});
+
+	it('answers a fresh NO_ROUTE with the synthetic record, not a stale FAILED row', async () => {
+		const { bolt11, paymentHash } = invoiceFrom('stale failure');
+		const hashHex = paymentHash.toString('hex');
+		const staleCreatedAt = Date.now() - 3 * 86_400_000;
+		node.getStorage().savePayment(hashHex, {
+			paymentHash,
+			amountMsat: 1_000_000n,
+			status: PaymentStatus.FAILED,
+			direction: PaymentDirection.OUTGOING,
+			failureReason: 'stale: an earlier attempt, days ago',
+			createdAt: staleCreatedAt,
+			completedAt: staleCreatedAt + 1_000
+		});
+
+		const result = await node.payInvoiceSafe(bolt11, 2_000);
+		expect(result.status).to.equal('FAILED');
+		expect(result.failureDescription ?? '').to.match(/^\[NO_ROUTE\]/);
+		expect(result.failureDescription ?? '').to.not.include('stale');
+		expect(result.createdAt).to.be.greaterThan(staleCreatedAt + 86_400_000);
+	});
+
+	it('payInvoiceWithRetry returns the COMPLETED record for a pruned paid hash', async () => {
+		const { bolt11, hashHex, preimage } = seedPaidRow('retry paid');
+		const result = await node.payInvoiceWithRetry(bolt11, { maxRetries: 0 });
+		expect(result.paymentHash).to.equal(hashHex);
+		expect(result.status).to.equal('COMPLETED');
+		expect(result.preimage).to.equal(preimage.toString('hex'));
+		expect(result.attempts).to.equal(1);
+	});
+
+	it('sendToRoute refuses a pruned paid hash with DUPLICATE_PAYMENT', () => {
+		const { hashHex } = seedPaidRow('route paid');
+		const hop: RouteHop = {
+			pubkey: getPublicKey(crypto.randomBytes(32)).toString('hex'),
+			shortChannelId: '500x1x0',
+			amountToForwardMsat: '1000000',
+			outgoingCltvValue: 40,
+			feeMsat: '0',
+			cltvExpiryDelta: 40
+		};
+		// Before the fix this reached the channel lookup (NO_CHANNEL_TO_HOP
+		// here, a second HTLC on a node with the channel).
+		let thrown: unknown;
+		try {
+			node.sendToRoute(hashHex, { hops: [hop] });
+		} catch (err) {
+			thrown = err;
+		}
+		expect(thrown).to.be.instanceOf(BeignetError);
+		expect((thrown as BeignetError).code).to.equal(
+			BeignetErrorCode.DUPLICATE_PAYMENT
+		);
+	});
+
+	it('still returns a synthetic FAILED record for a hash nothing knows', async () => {
+		const { bolt11, paymentHash } = invoiceFrom('unknown');
+		const result = await node.payInvoiceSafe(bolt11, 2_000);
+		expect(result.paymentHash).to.equal(paymentHash.toString('hex'));
+		expect(result.status).to.equal('FAILED');
+		expect(result.failureDescription ?? '').to.match(/^\[[A-Z_]+\]/);
 	});
 });

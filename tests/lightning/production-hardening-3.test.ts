@@ -616,8 +616,9 @@ describe('Production Hardening 3: Fund Safety', function () {
 			bob.destroy();
 		});
 
-		it('after payment completes, same hash can be used again', () => {
-			// This validates the check only blocks PENDING, not COMPLETED/FAILED
+		it('after a failed attempt, same hash can be sent again', () => {
+			// The check blocks a hash that is PENDING, still has an HTLC out,
+			// or was paid (#975); a FAILED attempt with nothing out is retryable.
 			const alice = createNode(52);
 			const bob = createNode(53);
 			connectNodes(alice, bob);

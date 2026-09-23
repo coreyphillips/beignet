@@ -9640,9 +9640,11 @@ export class BeignetNode extends EventEmitter {
 		// records, counting one payment twice.
 		//
 		// The claims a fire-and-forget attempt on this hash already holds stay
-		// where they are, reservations and all. This attempt adds an HTLC to
-		// the ones already out there rather than replacing them, and the engine
-		// reports at most one of them settling (it emits nothing further for a
+		// where they are, reservations and all. The engine refuses this
+		// attempt while any HTLC of that one is still out or once it paid
+		// (#975); when it does dispatch, its HTLC is a new one beside the
+		// resolved ones rather than a replacement, and the engine reports at
+		// most one settlement for the hash (it emits nothing further for a
 		// hash it has marked completed), so the rest have to go on holding
 		// budget on their own account.
 		this._acquireBlockingPayment(paymentHashHex);
@@ -9814,9 +9816,11 @@ export class BeignetNode extends EventEmitter {
 				/* bolt11 is malformed — use defaults */
 			}
 
-			// Return persisted record if available
+			// Return persisted record if available: the in-memory one, or for
+			// a duplicate refusal the durable row the engine refused from.
 			if (hashHex !== 'unknown') {
-				const existing = this.getPayment(hashHex);
+				const existing =
+					this.getPayment(hashHex) ?? this.durablePaymentFor(err, hashHex);
 				if (existing) return existing;
 			}
 
@@ -9860,7 +9864,9 @@ export class BeignetNode extends EventEmitter {
 
 				// Don't retry permanent failures
 				if (!isRetryableError(err)) {
-					const pi = this.getPayment(paymentHashHex);
+					const pi =
+						this.getPayment(paymentHashHex) ??
+						this.durablePaymentFor(err, paymentHashHex);
 					if (pi) return { ...pi, attempts: attempt };
 					return {
 						paymentHash: paymentHashHex,
@@ -10224,6 +10230,33 @@ export class BeignetNode extends EventEmitter {
 		const p = this.node.getPayment(Buffer.from(paymentHash, 'hex'));
 		if (!p) return null;
 		return this.toPaymentInfo(p);
+	}
+
+	/**
+	 * The durable record behind a DUPLICATE_PAYMENT refusal whose in-memory
+	 * record is gone (issue #975). The in-memory record is pruned 24 hours
+	 * after completion (oldest first past the size cap) while the row stays,
+	 * and the engine refuses to pay a hash whose row says it was paid, so a
+	 * refused re-send of a pruned paid invoice answers with its COMPLETED
+	 * record rather than a synthetic failure. Null for any other error: a
+	 * fresh NO_ROUTE or FEE_EXCEEDS_MAX on a hash with a days-old FAILED row
+	 * is this attempt's outcome, and the row is an earlier attempt's. A row
+	 * that cannot be read (the database is closed) is no record, so the safe
+	 * callers still never throw.
+	 */
+	private durablePaymentFor(err: unknown, hashHex: string): PaymentInfo | null {
+		if (
+			!(err instanceof BeignetError) ||
+			err.code !== BeignetErrorCode.DUPLICATE_PAYMENT
+		) {
+			return null;
+		}
+		try {
+			const durable = this.storage.loadPayment(hashHex);
+			return durable ? this.toPaymentInfo(durable) : null;
+		} catch {
+			return null;
+		}
 	}
 
 	/** Settled forwards, newest first. Msat values as strings (JSON-safe). */
@@ -12055,11 +12088,11 @@ export class BeignetNode extends EventEmitter {
 	 * How a payment the payment queue was dispatching when the process last
 	 * stopped ended, from this node's own record for its invoice (issue
 	 * #967). The queue's resolver for such an entry: it must know this before
-	 * sending the invoice again, since sendPayment refuses a second payment
-	 * to a hash only while the first is PENDING. A COMPLETED one would be
-	 * paid again with a new HTLC, and a PENDING one would come back from
-	 * payInvoiceSafe as that record and be marked failed although it may
-	 * still complete.
+	 * sending the invoice again. The engine refuses to pay a hash that was
+	 * paid or still has an HTLC out (#975), so a re-send can no longer pay
+	 * twice, but it would come back from payInvoiceSafe as the old record,
+	 * a PENDING one marked failed although it may still complete; this
+	 * resolver waits for the outcome instead.
 	 *
 	 * Resolves once every HTLC the node offered for the hash is terminal,
 	 * which for one stuck at a peer can take until its expiry. 'completed'
