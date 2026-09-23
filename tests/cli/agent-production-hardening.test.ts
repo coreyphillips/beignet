@@ -12,7 +12,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { BeignetError } from '../../src/cli/errors';
-import { PaymentFilter } from '../../src/cli/types';
+import { PaymentFilter, QueuedPayment } from '../../src/cli/types';
 import type { BeignetNode } from '../../src/cli/beignet-node';
 
 // Electrum intentionally unreachable: nothing below needs a live chain, and a
@@ -172,6 +172,8 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 	// SqliteStorage, and wallet.stop() waits for the writes queued when it is
 	// called. The database has to stay open through that wait. It used to be
 	// closed first, by the node's own destroy(), so the write answered Err.
+	// The payment queue stops with the node, so the longer-open database
+	// never records a payment still waiting its turn as dispatched and failed.
 	const heldWalletWriteLandsBeforeClose = async (
 		shutdown: (node: BeignetNode) => Promise<void>,
 		stoppingAtCall: boolean
@@ -188,6 +190,7 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 			...OFFLINE_ELECTRUM
 		});
 		let release: () => void = () => {};
+		let done: Promise<void> | undefined;
 		try {
 			await node.waitForInitialSync();
 			const wallet = node.onchainWallet;
@@ -229,7 +232,29 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 			const labels = { bcrt1qissue958: 'issue-958' };
 			const write = wallet.saveWalletData('addressLabels', labels);
 
-			const done = shutdown(node);
+			// Payments are in flight and one more waits its turn.
+			const payCalls: string[] = [];
+			const failPays: Array<(e: Error) => void> = [];
+			(
+				node as unknown as { payInvoiceSafe: (b: string) => Promise<unknown> }
+			).payInvoiceSafe = (bolt11: string): Promise<unknown> => {
+				payCalls.push(bolt11);
+				return new Promise((_resolve, reject) => failPays.push(reject));
+			};
+			const queuedNow = (): QueuedPayment[] =>
+				node.listQueue().filter((e) => e.status === 'queued');
+			while (queuedNow().length === 0 && payCalls.length < 10) {
+				node.enqueuePayment(`lnbcrt_issue958_${payCalls.length}`);
+			}
+			const [waiting] = queuedNow();
+			expect(waiting).to.not.equal(undefined);
+			const inFlight = node
+				.listQueue()
+				.filter((e) => e.status === 'dispatching')
+				.map((e) => e.id);
+			expect(inFlight).to.have.length(payCalls.length);
+
+			done = shutdown(node);
 			if (stoppingAtCall) {
 				expect(walletInternals._stopping).to.equal(true);
 			} else {
@@ -241,6 +266,11 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 					await new Promise((resolve) => setTimeout(resolve, 10));
 				}
 			}
+			// The stopped node fails what it had in flight. The queue records
+			// that, and hands the waiting payment to nobody.
+			for (const fail of failPays) fail(new Error('node destroyed'));
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(payCalls).to.have.length(inFlight.length);
 			release();
 			await done;
 
@@ -270,18 +300,24 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 				expect(
 					JSON.parse(reopened.loadWalletData(key) ?? 'null')
 				).to.deep.equal(labels);
+				const statusOf = (id: string): string | undefined =>
+					reopened.loadAllQueueEntries().find((row) => row.id === id)?.status;
+				expect(statusOf(waiting.id)).to.equal('queued');
+				for (const id of inFlight) expect(statusOf(id)).to.equal('failed');
 			} finally {
 				reopened.close();
 			}
 		} finally {
-			// A failed assertion must not leave stop() waiting on the gate.
+			// A failed assertion must not leave stop() waiting on the gate, or
+			// the shutdown still running when the directory goes.
 			release();
+			await done?.catch(() => {});
 			await node.destroy();
 			fs.rmSync(tmpDir, { recursive: true, force: true });
 		}
 	};
 
-	it('gracefulShutdown stops the wallet before closing the database, so its held write lands (issue #958)', async function () {
+	it('gracefulShutdown stops the wallet before closing the database, so its held write lands and no queued payment dispatches (issue #958)', async function () {
 		this.timeout(45_000);
 		await heldWalletWriteLandsBeforeClose(
 			(node) => node.gracefulShutdown(1_000),
@@ -289,7 +325,7 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 		);
 	});
 
-	it('destroy stops the wallet before closing the database, so its held write lands (issue #958)', async function () {
+	it('destroy stops the wallet before closing the database, so its held write lands and no queued payment dispatches (issue #958)', async function () {
 		this.timeout(45_000);
 		// destroy() reaches wallet.stop() before its first await.
 		await heldWalletWriteLandsBeforeClose((node) => node.destroy(), true);

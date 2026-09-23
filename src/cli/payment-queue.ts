@@ -258,9 +258,10 @@ export class PaymentQueue extends EventEmitter {
 	/**
 	 * Stop dispatching, for shutdown. Payments already dispatching still
 	 * record how they ended; queued ones, including any enqueued after this,
-	 * stay 'queued' in storage and resume after a restart. Without this, a
-	 * dispatch against the stopped node fails at once and persists 'failed',
-	 * now that the database stays open while the wallet stops (issue #958).
+	 * stay 'queued' in storage. The next start restores them, and they
+	 * dispatch on its first enqueue(). Without this, a dispatch against the
+	 * stopped node fails at once and persists 'failed', now that the database
+	 * stays open while the wallet stops (issue #958).
 	 */
 	stop(): void {
 		this.stopped = true;

@@ -181,7 +181,7 @@ describe('Payment Queue Persistence', () => {
 
 	// Issue #958: shutdown now keeps the database open while the wallet
 	// stops, so a dispatch against the stopped node would persist 'failed'.
-	// stop() leaves queued entries to resume after the restart instead.
+	// stop() leaves queued entries in storage for the next start instead.
 	describe('stop()', () => {
 		type PayResult = { status: string; paymentHash: string };
 		const statusOf = (id: string): string | undefined =>
@@ -213,7 +213,7 @@ describe('Payment Queue Persistence', () => {
 			expect(finishers).to.have.length(1);
 			expect(queue.activePayments).to.equal(0);
 
-			// The next start dispatches them.
+			// The next start restores them; they dispatch on its first enqueue.
 			const restarted = new PaymentQueue(
 				noopPay,
 				noopCanSend,
