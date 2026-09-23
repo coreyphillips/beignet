@@ -1250,7 +1250,7 @@ usual 502, because the payee refuses it every time. Failure bodies carry
 
 #### Typed Payment Errors (Lightning Layer)
 
-When `payInvoice()` fails, the underlying `LightningNode` throws a `LightningPaymentError` with a typed `code` property. The CLI layer catches these and maps them to `BeignetErrorCode`, but you can also import and check them directly:
+When a send is refused, the underlying `LightningNode` throws a `LightningPaymentError` with a typed `code` property. The CLI layer catches these and maps them to `BeignetErrorCode`, in `payInvoice()`, `sendPaymentAsync()`, `sendKeysend()` and `payOffer()` alike (issue #991), so every payment route answers a refusal with its own code and HTTP status. When driving the `LightningNode` directly you can import and check them yourself:
 
 ```typescript
 import { LightningPaymentError, LightningErrorCode } from 'beignet/cli';
@@ -2096,7 +2096,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/invoice/pay` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay invoice (`amountSats` for amount-less invoices, `metadata` for labels). `cltvLimit` bounds the payment's total CLTV expiry in blocks above the current tip; no route under it answers `409 CLTV_EXCEEDS_MAX` with nothing sent, and a node without a tip yet answers `503 CHAIN_NOT_SYNCED`. |
 | POST | `/invoice/pay-safe` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay invoice; resolves with `status: 'FAILED'` on failure instead of error. |
 | POST | `/invoice/pay-retry` | `{ bolt11, maxRetries?, backoffMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay with exponential backoff retry. Returns `RetryPaymentResult` with `attempts`. |
-| POST | `/invoice/pay-async` | `{ bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Fire-and-forget pay; returns `{ paymentHash, status }` immediately. Poll `GET /payment` for settlement. Answers 409 while draining and 403 over a spending limit. |
+| POST | `/invoice/pay-async` | `{ bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Fire-and-forget pay; returns `{ paymentHash, status }` immediately. Poll `GET /payment` for settlement. Answers 409 while draining and 403 over a spending limit. A refusal carries the same code and status as `/invoice/pay`: 409 `DUPLICATE_PAYMENT` for a hash already paid or still in flight, 502 `NO_ROUTE`, 400 `INVALID_INVOICE`, and so on, never a bare 502 `PAYMENT_FAILED` (issue #991). |
 | POST | `/payment/cancel` | `{ paymentHash }` | Cancel a pending outbound payment (marks as FAILED) |
 | POST | `/payment/metadata` | `{ paymentHash, metadata }` | Attach key-value metadata to an existing payment |
 | POST | `/route/estimate` | `{ bolt11, amountSats? }` | Estimate route fee without sending |
