@@ -653,6 +653,50 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 				'the removal is reported once'
 			).to.have.length(1);
 		});
+
+		it('does not undo a clearing again newer than its lookup', async function () {
+			let served = false;
+			let lookups = 0;
+			sinon
+				.stub(wallet.electrum, 'getTransactions')
+				.callsFake(async ({ txHashes }: { txHashes: ITxHash[] }) => {
+					// The refresh's first lookup of its address history. While it
+					// is in flight, a second refresh, such as the one a rescan
+					// forces, finds the transaction back. Then the node loses it
+					// again, and a check clears it from that newer answer.
+					if (txHashes.some((h) => 'height' in h) && ++lookups === 1) {
+						await wallet.updateTransactions({});
+						expect(wallet.transactions[TXID].exists, 'back').to.equal(true);
+						served = false;
+						await wallet.checkUnconfirmedTransactions();
+						expect(wallet.transactions[TXID].exists, 'lost again').to.equal(
+							false
+						);
+						// Answered before the node lost it again.
+						return lookupReply(...txHashes.map((h) => answer(h, true)));
+					}
+					return lookupReply(...txHashes.map((h) => answer(h, served)));
+				});
+
+			// Already cleared when the refresh starts: its flag reads the same
+			// before and after its lookup.
+			await wallet.checkUnconfirmedTransactions();
+			expect(wallet.transactions[TXID].exists, 'lost').to.equal(false);
+
+			served = true;
+			const res = await wallet.updateTransactions({});
+			expect(res.isOk(), 'the refresh ran').to.equal(true);
+
+			expect(
+				wallet.transactions[TXID].exists,
+				'the newer answer stands'
+			).to.equal(false);
+			expect(savedTransactions()[TXID].exists).to.equal(false);
+			expect(
+				messages.filter((m) => m.key === 'rbf'),
+				'each removal is reported once'
+			).to.have.length(2);
+		});
 	});
 
 	/**

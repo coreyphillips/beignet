@@ -211,6 +211,11 @@ export class Wallet {
 	// outlasts two new blocks is final (issue #935). Memory only: a restart
 	// counts again from its own first miss, which only waits longer.
 	private readonly _noTxindexMisses: Map<string, number> = new Map();
+	// How often this session has set each transaction's exists flag to false,
+	// by txid. A refresh reads a cleared record as back only if no clearing
+	// came after its lookup went out. Never reset, so a count never repeats
+	// (issue #945).
+	private readonly _ghostClearings: Map<string, number> = new Map();
 	// The highest tip updateHeader has replaced. A failover to a server
 	// further behind lowers the tip, and that server may announce new blocks
 	// while it catches up to the one a transaction was mined in (issue #935).
@@ -3308,14 +3313,20 @@ export class Wallet {
 				return !((this.data.transactions[tx.tx_hash]?.height ?? 0) >= 6);
 			});
 		}
-		// Records the ghost path cleared before this lookup went out. Only these
-		// may be read as back below: a clearing that lands while the lookup is in
+		// Records the ghost path cleared before this lookup went out, with their
+		// clearing counts. Only these may be read as back below, and only if the
+		// count has not moved: a clearing that lands while the lookup is in
 		// flight, from a check beside this refresh, rests on a newer answer than
-		// this one and must stand (issue #945).
-		const clearedBeforeLookup = new Set(
+		// this one and must stand. That holds for a record cleared again after a
+		// concurrent refresh found it back, whose flag alone looks unchanged
+		// (issue #945).
+		const clearedBeforeLookup = new Map(
 			filteredTxHashes
 				.filter((tx) => this.data.transactions[tx.tx_hash]?.exists === false)
-				.map((tx) => tx.tx_hash)
+				.map((tx): [string, number] => [
+					tx.tx_hash,
+					this._ghostClearings.get(tx.tx_hash) ?? 0
+				])
 		);
 
 		const getTransactionsResponse = await this.electrum.getTransactions({
@@ -3363,7 +3374,8 @@ export class Wallet {
 			// changed. The server has just served it, so it is pending again
 			// (issue #945).
 			const returned =
-				stored?.exists === false && clearedBeforeLookup.has(txid);
+				stored?.exists === false &&
+				clearedBeforeLookup.get(txid) === (this._ghostClearings.get(txid) ?? 0);
 			//If the tx is new, was cleared and is back, or now has a different block height
 			if (isNew || returned || stored.height !== transactions[txid].height) {
 				formattedTransactions[txid] = {
@@ -3811,6 +3823,10 @@ export class Wallet {
 			txIds.forEach((txId) => {
 				if (txId in transactions) {
 					transactions[txId]['exists'] = false;
+					this._ghostClearings.set(
+						txId,
+						(this._ghostClearings.get(txId) ?? 0) + 1
+					);
 					// A reorg'd out transaction no mempool took back is answered "no
 					// such transaction" rather than with no confirmations: by a server
 					// with a txindex always, and by electrs on a node without one for
@@ -5528,6 +5544,7 @@ export class Wallet {
 	async addGhostTransaction({ txid }: { txid: string }): Promise<void> {
 		if (txid in this._data.transactions) {
 			this._data.transactions[txid].exists = false;
+			this._ghostClearings.set(txid, (this._ghostClearings.get(txid) ?? 0) + 1);
 		}
 		await this.saveWalletData('transactions', this._data.transactions);
 	}
