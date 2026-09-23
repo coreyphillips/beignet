@@ -2529,7 +2529,10 @@ export class Wallet {
 	 * @param {number} addressIndex
 	 * @param {number} changeAddressIndex
 	 * @param {EAddressType[]} [addressTypesToCheck]
-	 * @returns {Promise<Result<IGetUtxosResponse>>}
+	 * @returns {Promise<Result<IGetUtxosResponse>>} The pair the scan applied
+	 * to memory, or, when a newer scan already landed, memory's pair as it
+	 * stands, applied and written by that scan instead. A write that storage
+	 * refuses is logged, not returned: the scan itself succeeded.
 	 */
 	public async getUtxos({
 		scanningStrategy = EScanningStrategy.gapLimit,
@@ -2579,10 +2582,10 @@ export class Wallet {
 		const balance = (getUtxosRes.value?.balance ?? 0) - scanned.spentValue;
 		this._data.utxos = utxos;
 		this._data.balance = balance;
-		await Promise.all([
-			this.saveWalletData('utxos', this._data.utxos),
-			this.saveWalletData('balance', this._data.balance)
-		]);
+		// A refused write is logged and left to the next scan, which writes both
+		// again. An Err here would stop refreshWallet before updateTransactions
+		// and subscribeToAddresses, and deposits would go unseen.
+		await this.saveUtxoState();
 		return ok({ utxos, balance });
 	}
 
@@ -2599,8 +2602,15 @@ export class Wallet {
 	 * set and records their outpoints, so a scan that predates the broadcast
 	 * cannot put them back. Called for every broadcast: inputs that are not
 	 * this wallet's coins match nothing.
+	 *
+	 * A write of the new set that storage refuses is logged, not returned. The
+	 * removal happened and stands, since the coins are spent whatever storage
+	 * says, and a retry of this call would find nothing left to remove. The
+	 * scan the spend triggers through the wallet's own scripthash
+	 * subscription writes the pair again.
 	 * @param {string} rawTx The transaction that was broadcast, as hex.
-	 * @returns {Promise<Result<IUtxo[]>>} The coins removed from the set.
+	 * @returns {Promise<Result<IUtxo[]>>} The coins removed from the set, or
+	 * Err when the hex does not parse (nothing removed).
 	 */
 	public async removeSpentUtxos(rawTx: string): Promise<Result<IUtxo[]>> {
 		let outpoints: string[];
@@ -2628,10 +2638,7 @@ export class Wallet {
 			0,
 			this._data.balance - removed.reduce((sum, utxo) => sum + utxo.value, 0)
 		);
-		await Promise.all([
-			this.saveWalletData('utxos', this._data.utxos),
-			this.saveWalletData('balance', this._data.balance)
-		]);
+		await this.saveUtxoState();
 		return ok(removed);
 	}
 
@@ -2669,6 +2676,38 @@ export class Wallet {
 			if (mark <= settled) this._spentOutpoints.delete(outpoint);
 		}
 		return { utxos, spentValue };
+	}
+
+	/**
+	 * Writes the UTXO set, then the balance, as one pair read from memory at
+	 * the call. They are separate storage keys and cannot be written
+	 * atomically, so the balance is written only once the set has landed. A
+	 * refused set write then leaves both keys as they were, instead of the old
+	 * set beside the new balance (#812). A refused balance write leaves the
+	 * new set beside the old balance, and so does a stop() between the two
+	 * writes: it drops the balance write without a log, as it drops every
+	 * write after it. Either way this is display consistency, not selection
+	 * safety: coin selection reads the set, never the balance. Memory keeps
+	 * the new state regardless, and the next applied scan writes both again.
+	 * @returns {Promise<Result<string>>} Err naming the refused write, which
+	 * has already been logged.
+	 */
+	private async saveUtxoState(): Promise<Result<string>> {
+		// Read before the first await: a scan landing while the set write is
+		// queued replaces memory, and pairing this set with that scan's balance
+		// would split the stored pair if the scan's own set write were refused.
+		const { utxos, balance } = this._data;
+		const set = await this.saveWalletData('utxos', utxos);
+		const saved = set.isErr()
+			? set
+			: await this.saveWalletData('balance', balance);
+		if (saved.isErr()) {
+			const refused = set.isErr() ? 'UTXO set' : "UTXO set's balance";
+			const message = `Failed to persist the ${refused}: ${saved.error.message}`;
+			this.logger.error(message);
+			return err(message);
+		}
+		return ok('UTXO set saved.');
 	}
 
 	/**
@@ -3686,7 +3725,8 @@ export class Wallet {
 	}
 
 	/**
-	 * Clears the UTXO array and balance from storage.
+	 * Clears the UTXO array and balance from storage. A write storage refuses
+	 * is logged, and the next applied scan writes both again.
 	 * @public
 	 * @async
 	 * @returns {Promise<string>}
@@ -3694,10 +3734,7 @@ export class Wallet {
 	public async clearUtxos(): Promise<string> {
 		this._data.balance = 0;
 		this._data.utxos = [];
-		await Promise.all([
-			this.saveWalletData('balance', this._data.balance),
-			this.saveWalletData('utxos', this._data.utxos)
-		]);
+		await this.saveUtxoState();
 		return "Successfully cleared UTXO's.";
 	}
 
@@ -5557,13 +5594,20 @@ export class Wallet {
 
 	/**
 	 * Used to temporarily update the balance until the Electrum server catches up after sending a transaction.
+	 * The write is not awaited; a refusal of it is logged.
 	 * @param {number} balance
 	 * @returns {Result<string>}
 	 */
 	public updateWalletBalance({ balance }: { balance: number }): Result<string> {
 		try {
 			this._data.balance = balance;
-			void this.saveWalletData('balance', balance);
+			void this.saveWalletData('balance', balance).then((saved) => {
+				if (saved.isErr()) {
+					this.logger.error(
+						`Failed to persist the balance: ${saved.error.message}`
+					);
+				}
+			});
 			return ok('Successfully updated balance.');
 		} catch (e) {
 			return err(e);
