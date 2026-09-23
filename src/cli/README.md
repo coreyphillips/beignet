@@ -437,8 +437,10 @@ same, so the switch waits until both sets confirm the namespace holds nothing,
 with at least two members of each answering. If a set holds records this
 journal does not, the rotation is refused with `ROTATION_UNAVAILABLE` (409)
 and the outgoing set is left untouched: restore instead of rotating. If too
-few members answer, it is refused with `ROTATION_NO_QUORUM`. A pending or
-refused rotation never blocks the wallet's first durable write.
+few members answer, it is refused with `ROTATION_NO_QUORUM`. If the wallet's
+first entry lands while the sets are being asked, it is refused with
+`ROTATION_NOT_CATCHING_UP`, and a retry completes it. A pending or refused
+rotation never blocks the wallet's first durable write.
 
 #### Guardian recovery (Recovery Protocol)
 

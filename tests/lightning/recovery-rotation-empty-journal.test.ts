@@ -25,10 +25,23 @@
  *    journal lost refuses as journal-behind, with no switch and no
  *    retirement;
  *  - A7: a torn incoming watermark over an empty journal is refused;
- *  - A8: a first frame committed while the rotation starts takes the
- *    normal switch;
+ *  - A8: a first frame committed as the rotation starts, before the
+ *    registration, takes the normal switch;
  *  - A9: an outgoing set that cannot confirm the namespace is empty
- *    refuses the genesis switch.
+ *    refuses the genesis switch;
+ *  - A10 and A11: a first frame that lands while a set is asked is this
+ *    journal's own: the switch is refused as retryable, never as a lost
+ *    journal, and a retry carries the frame over;
+ *  - A12: a lost journal whose new first frame lands while the outgoing
+ *    set is asked still refuses as journal-behind;
+ *  - A13: an outgoing member that answers as another guardian counts for
+ *    nothing, and the other two still prove the namespace empty;
+ *  - A14: an outgoing member taken over by a newer epoch refuses the
+ *    switch;
+ *  - A15: torn bookkeeping over an empty store is never switched as an
+ *    unused journal;
+ *  - A16: one outgoing member at genesis does not hide the history the
+ *    other two hold.
  */
 
 import { expect } from 'chai';
@@ -38,9 +51,12 @@ import {
 	GuardianHttpServer,
 	GuardianReplicator,
 	GuardianRotation,
+	GuardianState,
+	GuardianStatus,
 	IParsedGuardian,
 	IRotationEvent,
 	IWriterLeaseKeys,
+	JOURNAL_META_KEYS,
 	REPLICATION_META_KEYS,
 	RecoveryCriticality,
 	RecoveryJournal,
@@ -51,10 +67,12 @@ import {
 	computeGuardianSetId,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
+	generateWriterKey,
 	readGeneration,
 	readGuardianSet,
 	readRetirePending,
 	readRotationIntent,
+	signAcquisition,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
@@ -268,6 +286,45 @@ function watermarkKeys(storage: SqliteStorage): string[] {
 }
 
 const hexOf = (ids: Buffer[]): string[] => ids.map((id) => id.toString('hex'));
+
+/** A fresh outgoing set (guardians 1, 2, 3) and incoming set (2, 3, 4). */
+async function serveSets(): Promise<{
+	outgoing: IServed[];
+	incoming: IServed[];
+}> {
+	return {
+		outgoing: await Promise.all([0, 1, 2].map((i) => serve(i, OLD_MEMBERS))),
+		incoming: await Promise.all([1, 2, 3].map((i) => serve(i, NEW_MEMBERS)))
+	};
+}
+
+type Confirm = GuardianReplicator['confirmOwnership'];
+
+/**
+ * Run `body` with `during` fired inside the `call`th ownership check, before
+ * its GET_HEAD: at genesis the first is the outgoing set's proof, the second
+ * the incoming set's.
+ */
+async function duringProof<T>(
+	call: number,
+	during: () => Promise<void>,
+	body: () => Promise<T>
+): Promise<T> {
+	const original: Confirm = GuardianReplicator.prototype.confirmOwnership;
+	let calls = 0;
+	GuardianReplicator.prototype.confirmOwnership = async function (
+		this: GuardianReplicator,
+		lease: IWriterLeaseKeys
+	): ReturnType<Confirm> {
+		if (++calls === call) await during();
+		return original.call(this, lease);
+	};
+	try {
+		return await body();
+	} finally {
+		GuardianReplicator.prototype.confirmOwnership = original;
+	}
+}
 
 describe('Guardian rotation on an empty journal (issue #862)', () => {
 	it('A1: switches an unused wallet, and its first frame journals and replicates to the incoming set', async function (): Promise<void> {
@@ -656,6 +713,306 @@ describe('Guardian rotation on an empty journal (issue #862)', () => {
 			expect(readGeneration(storage)).to.equal(1n);
 			expect(readRetirePending(storage)).to.equal(null);
 			expect(readRotationIntent(storage)).to.not.equal(null);
+		} finally {
+			storage.close();
+			await shutdown(outgoing);
+			await shutdown(incoming);
+		}
+	});
+
+	it('A10: a first frame that reaches the outgoing set while the incoming set is asked stops the genesis switch', async function (): Promise<void> {
+		this.timeout(20_000);
+		const { outgoing, incoming } = await serveSets();
+		const storage = openStorage();
+		try {
+			const { lease, replicator } = await registered(storage, outgoing);
+			const manager = journaled(storage);
+			// The live barrier: frame 1 commits and the outgoing set receipts
+			// it, after that set proved the namespace empty.
+			const refused = await refusal(
+				duringProof(
+					2,
+					async () => {
+						expect(commitOne(manager, 11).committed).to.equal(true);
+						await replicator.replicatePending(lease);
+					},
+					() => rotationFor(storage, lease, outgoing, incoming).rotate()
+				)
+			);
+			expect(refused.reason).to.equal('not-catching-up');
+			expect(readGeneration(storage)).to.equal(1n);
+			expect(readRotationIntent(storage)).to.not.equal(null);
+			expect(readRetirePending(storage)).to.equal(null);
+			// The outgoing set still carries the journal: its watermark stands,
+			// and the incoming set, which holds nothing, never takes over.
+			expect(
+				storage.getRecoveryMeta!(REPLICATION_META_KEYS.replicatedThrough)
+			).to.equal('1');
+			expect(heads(incoming, NEW_SET).map((h) => h.sequence)).to.deep.equal([
+				0n,
+				0n,
+				0n
+			]);
+		} finally {
+			storage.close();
+			await shutdown(outgoing);
+			await shutdown(incoming);
+		}
+	});
+
+	it('A11: a first frame that reaches the outgoing set while it is asked is retryable, not a lost journal', async function (): Promise<void> {
+		this.timeout(20_000);
+		const { outgoing, incoming } = await serveSets();
+		const storage = openStorage();
+		try {
+			const { lease, replicator } = await registered(storage, outgoing);
+			const manager = journaled(storage);
+			const refused = await refusal(
+				duringProof(
+					1,
+					async () => {
+						expect(commitOne(manager, 12).committed).to.equal(true);
+						await replicator.replicatePending(lease);
+					},
+					() => rotationFor(storage, lease, outgoing, incoming).rotate()
+				)
+			);
+			expect(refused.reason).to.equal('not-catching-up');
+			expect(refused.message).to.match(
+				/wrote its first frame while the outgoing set was asked/
+			);
+			expect(readGeneration(storage)).to.equal(1n);
+			expect(readRotationIntent(storage)).to.not.equal(null);
+			expect(readRetirePending(storage)).to.equal(null);
+			expect(heads(outgoing, OLD_SET)).to.deep.equal([
+				{ sequence: 1n, rotated: false },
+				{ sequence: 1n, rotated: false },
+				{ sequence: 1n, rotated: false }
+			]);
+
+			// A retry takes the normal switch and carries the frame over.
+			const result = await rotationFor(
+				storage,
+				lease,
+				outgoing,
+				incoming
+			).rotate();
+			expect(result.generation).to.equal(2n);
+			expect(readRotationIntent(storage)).to.equal(null);
+			expect(
+				storage.getRecoveryMeta!(REPLICATION_META_KEYS.replicatedThrough)
+			).to.equal('1');
+			expect(heads(incoming, NEW_SET).map((h) => h.sequence)).to.deep.equal([
+				1n,
+				1n,
+				1n
+			]);
+		} finally {
+			storage.close();
+			await shutdown(outgoing);
+			await shutdown(incoming);
+		}
+	});
+
+	it('A12: a lost journal whose new first frame lands while the outgoing set is asked still refuses as journal-behind', async function (): Promise<void> {
+		this.timeout(20_000);
+		const { outgoing, incoming } = await serveSets();
+		const storage = openStorage();
+		try {
+			const { lease, replicator } = await registered(storage, outgoing);
+			expect(commitOne(journaled(storage), 13).committed).to.equal(true);
+			expect(
+				(await replicator.replicatePending(lease)).replicatedThrough
+			).to.equal(1n);
+			loseJournal(storage, false);
+
+			// A NEW frame 1, not the one the outgoing set holds.
+			const manager = journaled(storage);
+			const refused = await refusal(
+				duringProof(
+					1,
+					async () => {
+						expect(commitOne(manager, 14).committed).to.equal(true);
+					},
+					() => rotationFor(storage, lease, outgoing, incoming).rotate()
+				)
+			);
+			expect(refused.reason).to.equal('journal-behind');
+			expect(refused.message).to.match(
+				/outgoing set holds this namespace through 1/
+			);
+			expect(readGeneration(storage)).to.equal(1n);
+			expect(readRetirePending(storage)).to.equal(null);
+			expect(heads(outgoing, OLD_SET).some((h) => h.rotated)).to.equal(false);
+		} finally {
+			storage.close();
+			await shutdown(outgoing);
+			await shutdown(incoming);
+		}
+	});
+
+	it('A13: an outgoing member that answers as another guardian counts for nothing at genesis', async function (): Promise<void> {
+		this.timeout(20_000);
+		const { outgoing, incoming } = await serveSets();
+		const storage = openStorage();
+		try {
+			const { lease } = await registered(storage, outgoing);
+			// Guardian 1's address now reaches guardian 4, and guardian 2's
+			// reaches guardian 1: only one member proves who it is.
+			const twoWrong = [
+				{ ...outgoing[0], url: incoming[2].url },
+				{ ...outgoing[1], url: outgoing[0].url },
+				outgoing[2]
+			];
+			const refused = await refusal(
+				rotationFor(storage, lease, twoWrong, incoming).rotate()
+			);
+			expect(refused.reason).to.equal('no-quorum');
+			expect(refused.message).to.match(
+				/only 1 of the outgoing set prove they are the configured guardians/
+			);
+			expect(readGeneration(storage)).to.equal(1n);
+			expect(readRotationIntent(storage)).to.not.equal(null);
+
+			// With one member answering as another guardian, the other two
+			// still prove the namespace empty: the rotation away from it
+			// completes.
+			const oneWrong = [
+				{ ...outgoing[0], url: incoming[2].url },
+				outgoing[1],
+				outgoing[2]
+			];
+			const result = await rotationFor(
+				storage,
+				lease,
+				oneWrong,
+				incoming
+			).rotate();
+			expect(result.generation).to.equal(2n);
+			expect(readGuardianSet(storage)!.map((e) => e.guardianId)).to.deep.equal(
+				hexOf(NEW_MEMBERS)
+			);
+		} finally {
+			storage.close();
+			await shutdown(outgoing);
+			await shutdown(incoming);
+		}
+	});
+
+	it('A14: an outgoing member taken over by a newer epoch refuses the genesis switch', async function (): Promise<void> {
+		this.timeout(20_000);
+		const { outgoing, incoming } = await serveSets();
+		const storage = openStorage();
+		try {
+			const { lease } = await registered(storage, outgoing);
+			// Another device takes guardian 1 at the next epoch; guardians 2
+			// and 3 still name this lease, enough to meet the count alone.
+			const head = outgoing[0].guardian.getHead({
+				protocolVersion: 1,
+				guardianSetId: OLD_SET,
+				recoveryId: ROOT.recoveryId
+			}).state as GuardianState;
+			const writer = generateWriterKey();
+			const newEpoch = head.lease.epoch + 1n;
+			const taken = outgoing[0].guardian.acquireEpoch({
+				protocolVersion: 1,
+				guardianSetId: OLD_SET,
+				expectedState: head,
+				newEpoch,
+				newWriterPublicKey: writer.publicKey,
+				...signAcquisition(OLD_SET, head, newEpoch, writer, ROOT.rootSecret)
+			});
+			expect(taken.status).to.equal(GuardianStatus.OK);
+
+			const refused = await refusal(
+				rotationFor(storage, lease, outgoing, incoming).rotate()
+			);
+			expect(refused.reason).to.equal('no-quorum');
+			expect(refused.message).to.match(/outgoing set reports a newer writer/);
+			expect(readGeneration(storage)).to.equal(1n);
+			expect(readRetirePending(storage)).to.equal(null);
+			expect(readRotationIntent(storage)).to.not.equal(null);
+			expect(heads(outgoing, OLD_SET).some((h) => h.rotated)).to.equal(false);
+		} finally {
+			storage.close();
+			await shutdown(outgoing);
+			await shutdown(incoming);
+		}
+	});
+
+	it('A15: torn bookkeeping over an empty store is never switched as an unused journal', async function (): Promise<void> {
+		this.timeout(40_000);
+		const hash = 'aa'.repeat(32);
+		const shapes: Array<[string, Array<[string, string]>]> = [
+			[
+				'a main watermark',
+				[
+					[REPLICATION_META_KEYS.replicatedThrough, '1'],
+					[REPLICATION_META_KEYS.replicatedThroughHash, hash]
+				]
+			],
+			['a tip hash', [[JOURNAL_META_KEYS.tipHash, hash]]],
+			[
+				'a non-numeric incoming watermark',
+				[
+					[PREFIX + REPLICATION_META_KEYS.replicatedThrough, 'abc'],
+					[PREFIX + REPLICATION_META_KEYS.replicatedThroughHash, hash]
+				]
+			]
+		];
+		for (const [shape, rows] of shapes) {
+			const { outgoing, incoming } = await serveSets();
+			const storage = openStorage();
+			try {
+				const { lease } = await registered(storage, outgoing);
+				for (const [key, value] of rows) storage.setRecoveryMeta!(key, value);
+				const refused = await refusal(
+					rotationFor(storage, lease, outgoing, incoming).rotate()
+				);
+				expect(refused.reason, shape).to.equal('not-catching-up');
+				expect(readGeneration(storage), shape).to.equal(1n);
+				expect(readRetirePending(storage), shape).to.equal(null);
+				expect(
+					heads(outgoing, OLD_SET).some((h) => h.rotated),
+					shape
+				).to.equal(false);
+			} finally {
+				storage.close();
+				await shutdown(outgoing);
+				await shutdown(incoming);
+			}
+		}
+	});
+
+	it('A16: one outgoing member at genesis does not hide the history the other two hold', async function (): Promise<void> {
+		this.timeout(20_000);
+		const { outgoing, incoming } = await serveSets();
+		const storage = openStorage();
+		try {
+			const { lease, replicator } = await registered(storage, outgoing);
+			const manager = journaled(storage);
+			expect(commitOne(manager, 15).committed).to.equal(true);
+			expect(commitOne(manager, 16).committed).to.equal(true);
+			// Guardian 1 is down while the history is written; it answers
+			// first afterwards, at genesis.
+			await closeServers([outgoing[0]]);
+			expect(
+				(await replicator.replicatePending(lease)).replicatedThrough
+			).to.equal(2n);
+			outgoing[0] = await reserve(outgoing[0]);
+			loseJournal(storage, false);
+
+			const refused = await refusal(
+				rotationFor(storage, lease, outgoing, incoming).rotate()
+			);
+			expect(refused.reason).to.equal('journal-behind');
+			expect(heads(outgoing, OLD_SET)).to.deep.equal([
+				{ sequence: 0n, rotated: false },
+				{ sequence: 2n, rotated: false },
+				{ sequence: 2n, rotated: false }
+			]);
+			expect(readGeneration(storage)).to.equal(1n);
+			expect(readRetirePending(storage)).to.equal(null);
 		} finally {
 			storage.close();
 			await shutdown(outgoing);

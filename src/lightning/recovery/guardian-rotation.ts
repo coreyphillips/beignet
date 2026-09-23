@@ -42,10 +42,12 @@ import {
 	REPLICATION_META_KEYS
 } from './guardian-replication';
 import {
+	GuardianBindingError,
 	GuardianClient,
 	IBoundGuardianClient,
 	IGuardianSetContext,
-	boundFanOut
+	boundFanOut,
+	verifyGuardianBindings
 } from './guardian-client';
 import { GuardianStatus, IGuardianRotateSetRequest } from './guardian';
 import { IWriterLeaseKeys } from './writer-lease';
@@ -549,14 +551,37 @@ export class GuardianRotation {
 	 * kept its lease looks exactly like an unused one, and switching it
 	 * would retire the outgoing set that holds the real history. Each set
 	 * must confirm this lease with enough members to meet every write
-	 * quorum (n - required + 1), and no signed head may be past genesis.
+	 * quorum (n - required + 1), and no signed head may be past genesis
+	 * unless it is a frame this journal wrote while the sets were asked.
 	 */
 	private async proveNamespaceEmpty(
 		incoming: GuardianReplicator
 	): Promise<void> {
+		const storage = this.config.storage;
+		const outgoingNeeded =
+			this.config.outgoing.bound.length - this.config.required + 1;
+		// A member whose endpoint no longer proves it is the guardian it was
+		// bound to counts for nothing, like an unreachable one, and the rest
+		// must meet the count on their own. Refusing the whole set on it
+		// would block the rotation away from that very member.
+		const proven: IBoundGuardianClient[] = [];
+		for (const entry of this.config.outgoing.bound) {
+			try {
+				await verifyGuardianBindings([entry], this.config.outgoing.context);
+				proven.push(entry);
+			} catch (error) {
+				if (!(error instanceof GuardianBindingError)) throw error;
+			}
+		}
+		if (proven.length < Math.max(outgoingNeeded, this.config.required)) {
+			throw new RotationRefusedError(
+				'no-quorum',
+				`only ${proven.length} of the outgoing set prove they are the configured guardians; ${outgoingNeeded} must confirm the namespace is empty`
+			);
+		}
 		const outgoing = new GuardianReplicator({
-			storage: this.config.storage,
-			guardians: this.config.outgoing.bound,
+			storage,
+			guardians: proven,
 			context: this.config.outgoing.context,
 			required: this.config.required,
 			recoveryRoot: this.config.recoveryRoot,
@@ -565,10 +590,14 @@ export class GuardianRotation {
 			allowUnencryptedSecrets: this.config.allowUnencryptedSecrets
 		});
 		const sets: Array<[string, GuardianReplicator, number]> = [
-			['outgoing', outgoing, this.config.outgoing.bound.length],
-			['incoming', incoming, this.config.incoming.bound.length]
+			['outgoing', outgoing, outgoingNeeded],
+			[
+				'incoming',
+				incoming,
+				this.config.incoming.bound.length - this.config.required + 1
+			]
 		];
-		for (const [name, replicator, size] of sets) {
+		for (const [name, replicator, needed] of sets) {
 			const proof = await replicator.confirmOwnership(this.config.lease);
 			if (proof.superseded || proof.rotated) {
 				throw new RotationRefusedError(
@@ -576,18 +605,38 @@ export class GuardianRotation {
 					`the ${name} set reports a newer writer or a rotation of this namespace; refusing to rotate`
 				);
 			}
-			const held = proof.states.reduce(
-				(max, state) =>
-					state.logHead.sequence > max ? state.logHead.sequence : max,
-				0n
-			);
-			if (held > 0n) {
+			const past = proof.states.filter((state) => state.logHead.sequence > 0n);
+			if (past.length > 0) {
+				// Read after the answer: a first frame committed (and
+				// replicated) while the set was asked is this journal's own,
+				// and a retry carries it over. Any head this journal cannot
+				// show with the same hash is history it lost.
+				const ours = new Map(
+					(storage.loadRecoveryFrames?.(0) ?? []).map((row) => [
+						BigInt(row.sequence),
+						row.frameHash
+					])
+				);
+				const held = past.reduce(
+					(max, state) =>
+						state.logHead.sequence > max ? state.logHead.sequence : max,
+					0n
+				);
+				const lost = past.some(
+					(state) =>
+						!ours.get(state.logHead.sequence)?.equals(state.logHead.frameHash)
+				);
+				if (lost) {
+					throw new RotationRefusedError(
+						'journal-behind',
+						`the ${name} set holds this namespace through ${held} but this journal does not hold those records; restore instead of rotating`
+					);
+				}
 				throw new RotationRefusedError(
-					'journal-behind',
-					`the ${name} set holds this namespace through ${held} but this journal has no frames; restore instead of rotating`
+					'not-catching-up',
+					`this journal wrote its first frame while the ${name} set was asked; the rotation stays pending, and a retry carries the frame over`
 				);
 			}
-			const needed = size - this.config.required + 1;
 			if (proof.confirming < needed) {
 				throw new RotationRefusedError(
 					'no-quorum',

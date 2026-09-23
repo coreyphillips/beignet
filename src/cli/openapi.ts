@@ -2185,7 +2185,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'503': {
 							description:
-								'ROTATION_NO_QUORUM or ROTATION_NOT_CATCHING_UP: the incoming set did not register or did not reach the tip, or, on a wallet with no journal entries, too few members of either set confirmed the namespace is empty; retry'
+								'ROTATION_NO_QUORUM or ROTATION_NOT_CATCHING_UP: the incoming set did not register or did not reach the tip, or, on a wallet with no journal entries, too few members of either set confirmed the namespace is empty or its first entry landed during that check; retry'
 						}
 					}
 				}

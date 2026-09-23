@@ -910,7 +910,8 @@ describe('Guardian rotation surface: a wallet that has journaled nothing yet (is
 	/** Wallets of their own, so each test registers a namespace of its own. */
 	const UNUSED_WALLETS = [
 		'scheme spot photo card baby mountain device kick cradle pact join borrow',
-		'ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic'
+		'ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic',
+		'elegant toe obey brand car resemble awesome alert silk health recipe retreat'
 	];
 	const hosts: Array<IHost | null> = [];
 	const wallets: Array<{ daemon: IStartedDaemon | null; dir: string }> = [];
@@ -932,6 +933,27 @@ describe('Guardian rotation surface: a wallet that has journaled nothing yet (is
 		'confirmed';
 	const idsOf = (entries: string[]): string[] =>
 		entries.map((e) => e.slice(0, 64)).sort();
+
+	/** What a refused rotation on 0.21.x left behind: an intent over a store with no frames. */
+	const plantIntent = (
+		dir: string,
+		mnemonic: string,
+		entries: Array<{ guardianId: string; url: string }>
+	): void => {
+		const storage = new SqliteStorage(path.join(dir, 'regtest.db'), undefined, {
+			encryptionKey: deriveStorageKey(bip39.mnemonicToSeedSync(mnemonic))
+		});
+		storage.open();
+		try {
+			expect(storage.loadRecoveryFrames!()).to.have.length(0);
+			storage.setRecoveryMeta!(
+				ROTATION_META_KEYS.pending,
+				JSON.stringify({ version: 1, generation: '2', entries })
+			);
+		} finally {
+			storage.close();
+		}
+	};
 
 	const startWallet = async (
 		mnemonic: string,
@@ -1040,7 +1062,7 @@ describe('Guardian rotation surface: a wallet that has journaled nothing yet (is
 		await waitFor(async () => (await durable(port)) >= 1n);
 	});
 
-	it('an intent left on a frame-less wallet by 0.21.x no longer blocks it, and the rotation resumes on restart', async function (): Promise<void> {
+	it('an intent left on a frame-less wallet by 0.21.x resumes on restart, and the first entry lands on the new set', async function (): Promise<void> {
 		this.timeout(240_000);
 		const mnemonic = UNUSED_WALLETS[1];
 		const wallet = {
@@ -1054,30 +1076,11 @@ describe('Guardian rotation surface: a wallet that has journaled nothing yet (is
 		await wallet.daemon.stop();
 		wallet.daemon = null;
 
-		// What a refused rotation on 0.21.x left behind: the intent over a
-		// store with no frames.
-		const storage = new SqliteStorage(
-			path.join(wallet.dir, 'regtest.db'),
-			undefined,
-			{ encryptionKey: deriveStorageKey(bip39.mnemonicToSeedSync(mnemonic)) }
+		plantIntent(
+			wallet.dir,
+			mnemonic,
+			newEntries.map((e) => ({ guardianId: e.slice(0, 64), url: e.slice(65) }))
 		);
-		storage.open();
-		try {
-			expect(storage.loadRecoveryFrames!()).to.have.length(0);
-			storage.setRecoveryMeta!(
-				ROTATION_META_KEYS.pending,
-				JSON.stringify({
-					version: 1,
-					generation: '2',
-					entries: newEntries.map((e) => ({
-						guardianId: e.slice(0, 64),
-						url: e.slice(65)
-					}))
-				})
-			);
-		} finally {
-			storage.close();
-		}
 
 		wallet.daemon = await startWallet(mnemonic, wallet.dir);
 		const port = portOf(wallet.daemon);
@@ -1107,5 +1110,54 @@ describe('Guardian rotation surface: a wallet that has journaled nothing yet (is
 		});
 		expect(invoice.body.ok, JSON.stringify(invoice.body)).to.equal(true);
 		await waitFor(async () => (await durable(port)) >= 1n);
+	});
+
+	it('an intent that cannot resume stays pending, and the first entry still goes durable', async function (): Promise<void> {
+		this.timeout(240_000);
+		const mnemonic = UNUSED_WALLETS[2];
+		const wallet = {
+			daemon: null as IStartedDaemon | null,
+			dir: tmpDir('unused-pending')
+		};
+		wallets.push(wallet);
+		wallet.daemon = await startWallet(mnemonic, wallet.dir);
+		await waitFor(() => confirmed(portOf(wallet.daemon!)));
+		expect(await durable(portOf(wallet.daemon))).to.equal(0n);
+		await wallet.daemon.stop();
+		wallet.daemon = null;
+
+		// The new set at addresses nothing answers: the resume can never
+		// register it, so the intent is pending for the whole test.
+		plantIntent(
+			wallet.dir,
+			mnemonic,
+			newEntries.map((e) => ({
+				guardianId: e.slice(0, 64),
+				url: e.slice(65).replace(/:\d+$/, ':1')
+			}))
+		);
+
+		wallet.daemon = await startWallet(mnemonic, wallet.dir);
+		const port = portOf(wallet.daemon);
+		await waitFor(() => confirmed(port));
+		const invoice = await request(port, 'POST', '/invoice/create', {
+			amountSats: 1000,
+			description: 'first entry beside a pending rotation'
+		});
+		expect(invoice.body.ok, JSON.stringify(invoice.body)).to.equal(true);
+		await waitFor(async () => (await durable(port)) >= 1n);
+
+		// The resume ran, was refused, and left the intent pending.
+		await waitFor(async () => {
+			const rotation = (await status(port)).rotation as {
+				inProgress: boolean;
+				lastEvent: { type: string } | null;
+			};
+			return rotation.lastEvent !== null && !rotation.inProgress;
+		}, 60_000);
+		const after = await status(port);
+		expect(after.generation).to.equal('1');
+		expect((after.rotation as { pending: boolean }).pending).to.equal(true);
+		expect(Number(await durable(port))).to.be.at.least(1);
 	});
 });
