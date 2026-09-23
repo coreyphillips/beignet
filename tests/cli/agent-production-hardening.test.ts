@@ -14,6 +14,10 @@ import * as os from 'os';
 import { BeignetError } from '../../src/cli/errors';
 import { PaymentFilter, QueuedPayment } from '../../src/cli/types';
 import type { BeignetNode } from '../../src/cli/beignet-node';
+import type { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import type { RecoveryManager } from '../../src/lightning/recovery/recovery-manager';
+import { RecoveryCriticality } from '../../src/lightning/recovery/types';
+import type { Result } from '../../src/utils/result';
 
 // Electrum intentionally unreachable: nothing below needs a live chain, and a
 // refused loopback connect returns ECONNREFUSED instantly. Without this the
@@ -172,8 +176,50 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 	// SqliteStorage, and wallet.stop() waits for the writes queued when it is
 	// called. The database has to stay open through that wait. It used to be
 	// closed first, by the node's own destroy(), so the write answered Err.
-	// The payment queue stops with the node, so the longer-open database
-	// never records a payment still waiting its turn as dispatched and failed.
+	// The node now closes only a fenced view of it. The payment queue stops
+	// with the node, so the longer-open database never records a payment
+	// still waiting its turn as dispatched and failed.
+
+	// The wallet adapter holds this write until release(), as a write still
+	// in progress holds it when shutdown starts. With no refresh in flight,
+	// stop() waits on it alone.
+	const holdWalletWrite = (
+		node: BeignetNode
+	): {
+		stopping: () => boolean;
+		release: () => void;
+		key: string;
+		labels: Record<string, string>;
+		write: Promise<Result<string>>;
+	} => {
+		const wallet = node.onchainWallet;
+		const walletInternals = wallet as unknown as {
+			_stopping: boolean;
+			_setData: (key: string, value: unknown) => Promise<unknown>;
+		};
+		expect(wallet.isRefreshing).to.equal(false);
+		const setData = walletInternals._setData;
+		let release: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		walletInternals._setData = async (
+			k: string,
+			v: unknown
+		): Promise<unknown> => {
+			await gate;
+			return setData(k, v);
+		};
+		const labels = { bcrt1qissue958: 'issue-958' };
+		return {
+			stopping: (): boolean => walletInternals._stopping,
+			release,
+			key: wallet.getWalletDataKey('addressLabels'),
+			labels,
+			write: wallet.saveWalletData('addressLabels', labels)
+		};
+	};
+
 	const heldWalletWriteLandsBeforeClose = async (
 		shutdown: (node: BeignetNode) => Promise<void>,
 		stoppingAtCall: boolean
@@ -193,13 +239,6 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 		let done: Promise<void> | undefined;
 		try {
 			await node.waitForInitialSync();
-			const wallet = node.onchainWallet;
-			const walletInternals = wallet as unknown as {
-				_stopping: boolean;
-				_setData: (key: string, value: unknown) => Promise<unknown>;
-			};
-			// With no refresh in flight, stop() waits on the held write alone.
-			expect(wallet.isRefreshing).to.equal(false);
 			const storage = node.getStorage();
 			const storageInternals = storage as unknown as {
 				db: { open: boolean };
@@ -216,21 +255,9 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 				order.push('close');
 				close();
 			};
-			// The adapter is still making this write when shutdown starts.
-			const setData = walletInternals._setData;
-			const gate = new Promise<void>((resolve) => {
-				release = resolve;
-			});
-			walletInternals._setData = async (
-				k: string,
-				v: unknown
-			): Promise<unknown> => {
-				await gate;
-				return setData(k, v);
-			};
-			const key = wallet.getWalletDataKey('addressLabels');
-			const labels = { bcrt1qissue958: 'issue-958' };
-			const write = wallet.saveWalletData('addressLabels', labels);
+			const held = holdWalletWrite(node);
+			release = held.release;
+			const { key, labels, write } = held;
 
 			// Payments are in flight and one more waits its turn.
 			const payCalls: string[] = [];
@@ -256,10 +283,10 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 
 			done = shutdown(node);
 			if (stoppingAtCall) {
-				expect(walletInternals._stopping).to.equal(true);
+				expect(held.stopping()).to.equal(true);
 			} else {
 				const deadline = Date.now() + 10_000;
-				while (!walletInternals._stopping) {
+				while (!held.stopping()) {
 					if (Date.now() > deadline) {
 						throw new Error('wallet.stop() never started');
 					}
@@ -282,7 +309,8 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 			expect(order.indexOf(`saved:${key}`)).to.be.lessThan(
 				order.indexOf('close')
 			);
-			// Closed once, by BeignetNode after the wallet; the node left it open.
+			// Closed once, by BeignetNode after the wallet; the node closed only
+			// its view.
 			expect(order.filter((e) => e === 'close')).to.have.length(1);
 			expect(storageInternals.db.open).to.equal(false);
 
@@ -329,6 +357,106 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 		this.timeout(45_000);
 		// destroy() reaches wallet.stop() before its first await.
 		await heldWalletWriteLandsBeforeClose((node) => node.destroy(), true);
+	});
+
+	// What the reviewer of the first fix found: the node's subsystems keep
+	// the storage reference they were built with, so leaving the database
+	// open for the wallet must not leave those references writable. A force
+	// close in this window used to commit a chain-monitor row through the
+	// recovery manager while the channel row, written through the node's own
+	// path, was skipped. The view fails every such write as the closed
+	// database did before, and only the wallet's lands.
+	it('a write through a storage reference the node took at construction throws while the wallet stops, and does not land (issue #958)', async function () {
+		this.timeout(45_000);
+		const { BeignetNode } = await import('../../src/cli/beignet-node');
+		const { SqliteStorage } = await import(
+			'../../src/lightning/storage/sqlite-storage'
+		);
+		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-test-'));
+		const node = await BeignetNode.create({
+			network: 'regtest',
+			dataDir: tmpDir,
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
+		});
+		let release: () => void = () => {};
+		let done: Promise<void> | undefined;
+		try {
+			await node.waitForInitialSync();
+			const lightning = node.getNode() as unknown as {
+				storage: SqliteStorage;
+				recovery: RecoveryManager;
+			};
+			// Taken before shutdown, as each subsystem took its own.
+			const nodeStorage = lightning.storage;
+			const recovery = lightning.recovery;
+			expect(nodeStorage).to.be.instanceOf(SqliteStorage);
+			const database = node.getStorage() as unknown as {
+				db: { open: boolean };
+				dbPath: string;
+			};
+			const held = holdWalletWrite(node);
+			release = held.release;
+
+			// destroy() reaches wallet.stop() before its first await.
+			done = node.destroy();
+			expect(held.stopping()).to.equal(true);
+			const paymentHash = '95'.repeat(32);
+			const commit = recovery.commit({
+				criticality: RecoveryCriticality.Important,
+				mutations: [
+					{
+						type: 'payment_preimage',
+						paymentHash,
+						preimage: Buffer.alloc(32, 0x58)
+					}
+				],
+				outboundMessages: []
+			});
+			expect(commit.committed).to.equal(false);
+			expect(commit.error?.message).to.equal(
+				'The database connection is not open'
+			);
+			expect(() =>
+				nodeStorage.saveMetadata('issue958_after_node_stop', '1')
+			).to.throw(TypeError, 'The database connection is not open');
+			// The database itself is still open, for the wallet.
+			expect(database.db.open).to.equal(true);
+
+			release();
+			await done;
+			const saved = await held.write;
+			expect(saved.isOk(), saved.isErr() ? saved.error.message : '').to.equal(
+				true
+			);
+			expect(database.db.open).to.equal(false);
+
+			const encryptionKey = (
+				node as unknown as { _storageEncryptionKey?: Buffer }
+			)._storageEncryptionKey;
+			const reopened = new SqliteStorage(
+				database.dbPath,
+				undefined,
+				encryptionKey ? { encryptionKey } : undefined
+			);
+			try {
+				reopened.open();
+				expect(
+					JSON.parse(reopened.loadWalletData(held.key) ?? 'null')
+				).to.deep.equal(held.labels);
+				expect(reopened.loadPreimage(paymentHash)).to.equal(null);
+				expect(reopened.loadMetadata('issue958_after_node_stop')).to.equal(
+					null
+				);
+			} finally {
+				reopened.close();
+			}
+		} finally {
+			release();
+			await done?.catch(() => {});
+			await node.destroy();
+			fs.rmSync(tmpDir, { recursive: true, force: true });
+		}
 	});
 
 	it('a payment queue first built after shutdown began dispatches none of the rows it restores (issue #958)', async function () {

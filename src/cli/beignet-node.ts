@@ -34,6 +34,7 @@ import {
 	TMessageDataMap
 } from '../types/wallet';
 import { createWalletStorage } from './wallet-storage';
+import { nodeStorageView } from './node-storage-view';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
 import { DF_DEFAULT_UNPAIRED_SPLICE_DEPTH } from '../lightning/direct-funding/receiver/types';
@@ -2331,7 +2332,12 @@ export class BeignetNode extends EventEmitter {
 		this.node = LightningNode.fromMnemonic(this.mnemonic, {
 			coinType,
 			network: lnNetwork,
-			storage: this.storage,
+			// A fenced view, not the database itself: the node's destroy()
+			// closes it, and the database stays open for the wallet, which
+			// stops after the node and still writes (issue #958). Every path
+			// that builds a node comes through here, so each gets a fresh view
+			// of the database it runs on.
+			storage: nodeStorageView(this.storage),
 			// Issue #906: fence fresh indices during active auto-apply or a
 			// rebuild, and while the node's block height is zero.
 			newChannelsRefused: (): string | null => this.newChannelRefusal(),
@@ -4334,8 +4340,8 @@ export class BeignetNode extends EventEmitter {
 			}
 			if (resume) this._resuming = true;
 			else this._restartRequired = true;
-			// Tear the running node down (its destroy closes the database), then
-			// swap the files through the same path a crashed swap resumes on.
+			// Tear the running node down and close the database, then swap the
+			// files through the same path a crashed swap resumes on.
 			this.teardownNodeForRestart();
 			try {
 				this.finishStagedCapsuleRestore(dbPath);
@@ -4782,6 +4788,14 @@ export class BeignetNode extends EventEmitter {
 		}
 		this.paymentQueue?.removeAllListeners();
 		this.node.destroy();
+		// The node's destroy() closes only its view of the database (issue
+		// #958); the swap needs the file itself closed, as it was when the
+		// node closed the database directly.
+		try {
+			this.storage.close();
+		} catch {
+			// best-effort, as the node's own close was
+		}
 		void (this.wallet as Wallet | undefined)?.stop().catch(() => {
 			/* best effort */
 		});
@@ -12510,14 +12524,13 @@ export class BeignetNode extends EventEmitter {
 			});
 		}
 		// A restore-pending daemon never built the node or the wallet. The
-		// node leaves the database open: the wallet writes through it too, and
-		// its stop() waits for a refresh in flight and its queued writes. The
-		// node stops first, since its chain backend and funding provider use
-		// the wallet (issue #958).
+		// node closes only its view of the database: the wallet writes
+		// through the database too, and its stop() waits for a refresh in
+		// flight and its queued writes. The node stops first, since its chain
+		// backend and funding provider use the wallet (issue #958).
 		try {
 			await (this.node as LightningNode | undefined)?.gracefulShutdown(
-				timeoutMs,
-				{ closeStorage: false }
+				timeoutMs
 			);
 		} finally {
 			await this.stopWalletAndCloseStorage();
@@ -12558,12 +12571,10 @@ export class BeignetNode extends EventEmitter {
 		this.directFundingSender?.stop();
 		// A restore-pending daemon never built the node or the wallet; the
 		// definite-assignment assertions on the fields do not change that.
-		// The node leaves the database open for the wallet, as in
+		// The node closes only its view of the database, as in
 		// gracefulShutdown (issue #958).
 		try {
-			(this.node as LightningNode | undefined)?.destroy({
-				closeStorage: false
-			});
+			(this.node as LightningNode | undefined)?.destroy();
 		} finally {
 			await this.stopWalletAndCloseStorage();
 		}
@@ -12571,10 +12582,11 @@ export class BeignetNode extends EventEmitter {
 
 	/**
 	 * The shared tail of gracefulShutdown and destroy, run after the node
-	 * has stopped: the wallet, then the database, then the lock. The wallet
-	 * stops before the close so the writes its stop() waits for land (issue
-	 * #958). Listeners go first, so nothing the wallet reports while it
-	 * stops reaches the daemon's SSE or webhook subscribers.
+	 * has stopped and fenced its view of the database: the wallet, then the
+	 * database, then the lock. The wallet stops before the close so the
+	 * writes its stop() waits for land (issue #958). Listeners go first, so
+	 * nothing the wallet reports while it stops reaches the daemon's SSE or
+	 * webhook subscribers.
 	 */
 	private async stopWalletAndCloseStorage(): Promise<void> {
 		this.removeAllListeners();

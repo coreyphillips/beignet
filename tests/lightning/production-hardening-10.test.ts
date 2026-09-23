@@ -6,8 +6,7 @@
  * Fix 3: Persist outbound payment at creation time (2 tests)
  * Fix 4: Wrap fulfillPayment() in storage.transaction() (2 tests)
  * Fix 7: tempChannels memory leak on open failure (4 tests)
- * Fix 8: gracefulShutdown flushes channel states (2 tests), and leaves the
- *        storage open when told to (2 tests, issue #958)
+ * Fix 8: gracefulShutdown flushes channel states (2 tests)
  * Fix 9: Block height persistence across restarts (3 tests)
  */
 
@@ -436,70 +435,6 @@ describe('Production Hardening 10', () => {
 			);
 			expect(shutdownSection).to.include('PENDING');
 			expect(shutdownSection).to.include('persistPayment');
-		});
-
-		// Issue #958: BeignetNode shares the storage with the on-chain wallet,
-		// which stops after the node and still writes, so it asks the node to
-		// leave the storage open. Every other caller keeps the close, which
-		// production-hardening-9 Fix 5 pins.
-		const nodeWithStorage = (
-			seedId: number
-		): { node: LightningNode; storage: SqliteStorage; dbPath: string } => {
-			const dbPath = tmpDbPath();
-			const storage = new SqliteStorage(dbPath);
-			storage.open();
-			const config = makeNodeConfig(seedId);
-			config.storage = storage;
-			const node = new LightningNode(config);
-			node.on('error', () => {});
-			node.on('node:error', () => {});
-			return { node, storage, dbPath };
-		};
-		const isOpen = (storage: SqliteStorage): boolean =>
-			(storage as unknown as { db: { open: boolean } }).db.open;
-
-		it('gracefulShutdown with closeStorage false persists state and leaves the storage open', async () => {
-			const { node, storage, dbPath } = nodeWithStorage(230);
-			try {
-				node.handleNewBlock(900000);
-				// handleNewBlock wrote the height already; only the shutdown
-				// flush puts it back.
-				storage.saveMetadata('blockHeight', '0');
-				await node.gracefulShutdown(1_000, { closeStorage: false });
-				expect(isOpen(storage)).to.equal(true);
-				expect(storage.loadMetadata('blockHeight')).to.equal('900000');
-				// The owner can still write through it.
-				storage.saveMetadata('afterShutdown', '1');
-				expect(storage.loadMetadata('afterShutdown')).to.equal('1');
-			} finally {
-				storage.close();
-				fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
-			}
-		});
-
-		it('destroy with closeStorage false leaves the storage open, and a late node write does not rewrite a blob from its cleared maps', () => {
-			const { node, storage, dbPath } = nodeWithStorage(231);
-			const setPendingFundingTx = (txid: string, txHex: string): void =>
-				(
-					node as unknown as {
-						setPendingFundingTx(txid: string, txHex: string): void;
-					}
-				).setPendingFundingTx(txid, txHex);
-			try {
-				setPendingFundingTx('aa'.repeat(32), '01');
-				const before = storage.loadMetadata('pending_funding_txs');
-				expect(before).to.include('aa'.repeat(32));
-
-				node.destroy({ closeStorage: false });
-				expect(isOpen(storage)).to.equal(true);
-				// A funding build that resolves after destroy() used to save the
-				// whole map, which destroy() had emptied, over the stored one.
-				setPendingFundingTx('bb'.repeat(32), '02');
-				expect(storage.loadMetadata('pending_funding_txs')).to.equal(before);
-			} finally {
-				storage.close();
-				fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
-			}
 		});
 	});
 
