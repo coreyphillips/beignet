@@ -250,14 +250,16 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			IFormattedTransaction
 		>;
 
-	/** The lookup's reply carrying one answer. */
-	const lookupReply = (tx: ITransaction<IUtxo>): Result<IGetTransactions> =>
+	/** The lookup's reply carrying these answers. */
+	const lookupReply = (
+		...data: ITransaction<IUtxo>[]
+	): Result<IGetTransactions> =>
 		ok<IGetTransactions>({
 			error: false,
 			id: 0,
 			method: 'getTransactions',
 			network: 'bitcoinRegtest',
-			data: [tx]
+			data
 		});
 
 	const answerWith = (tx: ITransaction<IUtxo>): sinon.SinonStub =>
@@ -590,6 +592,9 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 				expectKept(rescan);
 			}
 
+			// The count of issue #935 is final here too: for a record seen in a
+			// block it counts from that block. The single checks above hold this
+			// rule to its own margin.
 			tipAt(REORGED_HEIGHT + 2);
 			await wallet.checkUnconfirmedTransactions();
 			expect(
@@ -671,11 +676,13 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		});
 
 		/**
-		 * Issue #935: for a record the rule above keeps, above all one only ever
-		 * seen in the mempool, the same answer is final once it outlasts two new
-		 * blocks. electrs indexes a block before it announces the block's header,
-		 * so by then a transaction mined in the meantime is found through its
-		 * index, and one still missing was replaced or evicted.
+		 * Issue #935: for a record only ever seen in the mempool, which the rule
+		 * above keeps, the same answer is final once it outlasts two new blocks.
+		 * electrs indexes a block before it announces the block's header, so by
+		 * then a transaction mined in the meantime is found through its index,
+		 * and one still missing was replaced or evicted. Counted from no lower
+		 * than the highest tip this wallet held, nor than a block the record was
+		 * seen in.
 		 */
 		describe('a miss that outlasts new blocks (issue #935)', function () {
 			/** The tip this wallet holds at the first check that misses. */
@@ -785,20 +792,128 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 				expectCleared(rescan);
 			});
 
-			it('clears a record within a block of the tip, which the rule above keeps', async function () {
-				// Its block is one past the header this wallet holds, as a history
-				// read just before a header notification lands can report. Two
-				// blocks on it is still within a block of the tip, where the rule
-				// of #871 never reads the miss as final.
-				observe(confirmedRecord(FIRST_MISS + 1));
+			it('keeps a record seen in a block above the tip until the tip passes it', async function () {
+				// A failover to a server further behind lowers the tip below the
+				// block the record was seen in, and that server announces new
+				// blocks while it catches up to it. Two of them are not enough.
+				observe(confirmedRecord(FIRST_MISS + 5));
 				answerWith(miss(NO_TXINDEX_MISS));
 				const rescan = stubRescan();
 
-				await checkAt(FIRST_MISS, FIRST_MISS + 1);
-				expectKept(rescan, FIRST_MISS + 1);
+				await checkAt(FIRST_MISS, FIRST_MISS + 1, FIRST_MISS + 2);
+				expectKept(rescan, FIRST_MISS + 5);
+				await checkAt(FIRST_MISS + 6);
+				expectKept(rescan, FIRST_MISS + 5);
 
+				// Two blocks past it, the rule of #871 reads the miss as final.
+				await checkAt(FIRST_MISS + 7);
+				expectCleared(rescan);
+			});
+
+			it('counts from the highest tip this wallet held', async function () {
+				// A failover to a server further behind lowered the tip from where
+				// the transaction was last seen in the mempool. It may be in any
+				// block that server catches up on past there.
+				await wallet.updateHeader({
+					height: FIRST_MISS + 5,
+					hash: '',
+					hex: ''
+				});
+				await wallet.updateHeader({ height: FIRST_MISS, hash: '', hex: '' });
+				answerWith(miss(NO_TXINDEX_MISS));
+				const rescan = stubRescan();
+
+				await checkAt(FIRST_MISS, FIRST_MISS + 2, FIRST_MISS + 6);
+				expectKept(rescan, 0);
+
+				await checkAt(FIRST_MISS + 7);
+				expectCleared(rescan);
+			});
+
+			it('judges the miss by the tip it was answered at', async function () {
+				const lookup = answerWith(miss(NO_TXINDEX_MISS));
+				const rescan = stubRescan();
+				await checkAt(FIRST_MISS);
+
+				// Two headers land while the next lookup is in flight, after the
+				// server answered it.
+				lookup.callsFake(async () => {
+					tipAt(FIRST_MISS + 2);
+					return lookupReply(miss(NO_TXINDEX_MISS));
+				});
+				await wallet.checkUnconfirmedTransactions();
+				expectKept(rescan, 0);
+
+				lookup.resolves(lookupReply(miss(NO_TXINDEX_MISS)));
 				await checkAt(FIRST_MISS + 2);
 				expectCleared(rescan);
+			});
+
+			it('counts no other answer', async function () {
+				for (const message of [
+					STILL_INDEXING,
+					WRAPPED_NO_TXINDEX_MISS,
+					'server overloaded'
+				]) {
+					sinon.restore();
+					observe(mempoolRecord(0));
+					answerWith(miss(message));
+					const rescan = stubRescan();
+
+					await checkAt(
+						FIRST_MISS,
+						FIRST_MISS + 1,
+						FIRST_MISS + 2,
+						FIRST_MISS + 5
+					);
+
+					expectKept(rescan, 0);
+				}
+			});
+
+			it('counts afresh for a cleared transaction observed again', async function () {
+				answerWith(miss(NO_TXINDEX_MISS));
+				const rescan = stubRescan();
+				await checkAt(FIRST_MISS, FIRST_MISS + 1, FIRST_MISS + 2);
+				expectCleared(rescan);
+
+				// Rebroadcast, say, and found again by a refresh. Its first miss
+				// may be a block electrs has not indexed yet, so it counts afresh.
+				observe(mempoolRecord(0));
+				messages = [];
+				rescan.resetHistory();
+				await checkAt(FIRST_MISS + 10);
+
+				expectKept(rescan, 0);
+			});
+
+			it('counts afresh for a deleted transaction observed again', async function () {
+				answerWith(miss(NO_TXINDEX_MISS));
+				const rescan = stubRescan();
+				await checkAt(FIRST_MISS);
+
+				await wallet.deleteOnChainTransactionById({ txid: TXID });
+				observe(mempoolRecord(0));
+				await checkAt(FIRST_MISS + 10);
+
+				expectKept(rescan, 0);
+			});
+
+			it('drops the count of a transaction no longer observed', async function () {
+				const lookup = answerWith(miss(NO_TXINDEX_MISS));
+				const rescan = stubRescan();
+				await checkAt(FIRST_MISS);
+
+				// Gone from observation for a check.
+				delete wallet.data.unconfirmedTransactions[TXID];
+				lookup.resolves(lookupReply());
+				await checkAt(FIRST_MISS + 1);
+
+				observe(mempoolRecord(0));
+				lookup.resolves(lookupReply(miss(NO_TXINDEX_MISS)));
+				await checkAt(FIRST_MISS + 10);
+
+				expectKept(rescan, 0);
 			});
 
 			it('starts counting again after a restart', async function () {

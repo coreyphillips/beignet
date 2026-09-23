@@ -207,10 +207,14 @@ export class Wallet {
 	private _appliedScanSeq = 0;
 	// This wallet's tip at the first check a node without a txindex answered
 	// "no such mempool transaction" for a record the rule of issue #871 kept,
-	// by txid. A miss that outlasts two new blocks is final (issue #935). Memory
-	// only: a restart counts again from its own first miss, which only waits
-	// longer.
+	// by txid, or the highest tip it held if that was higher. A miss that
+	// outlasts two new blocks is final (issue #935). Memory only: a restart
+	// counts again from its own first miss, which only waits longer.
 	private readonly _noTxindexMisses: Map<string, number> = new Map();
+	// The highest tip updateHeader has replaced. A failover to a server
+	// further behind lowers the tip, and that server may announce new blocks
+	// while it catches up to the one a transaction was mined in (issue #935).
+	private _replacedTipHeight = 0;
 	private _disableMessagesOnCreate: boolean;
 	private _disableRefreshOnCreate: boolean;
 	// Raised by stop(). Work that outlived the shutdown, above all the refresh
@@ -3546,6 +3550,9 @@ export class Wallet {
 					return { tx_hash: transaction.txid };
 				}
 			);
+			// A header that lands while the lookup is in flight is newer than the
+			// answer, so the rule of issue #935 below judges by this one.
+			const tipBeforeLookup = this.data.header?.height ?? 0;
 			const txs = await this.electrum.getTransactions({
 				txHashes: tx_hashes
 			});
@@ -3591,22 +3598,36 @@ export class Wallet {
 				}
 
 				if (this.electrum.transactionMissingWithoutTxindex(txData)) {
-					// The same miss for a record the rule above keeps, above all one
-					// only ever seen in the mempool, is final once it outlasts two new
-					// blocks. electrs indexes a block before it announces the block's
-					// header, so once this wallet's tip has moved on, a transaction
-					// mined in the meantime is found through electrs' index. The
-					// second block covers a failover to a server a block behind, as
-					// above. So what is still missing then was replaced or evicted
-					// from the mempool. Nothing is counted before the wallet knows a
-					// tip, and the count stays until the transaction is answered for
-					// or leaves observation (issue #935).
+					// For a record only ever seen in the mempool, which the rule above
+					// keeps, the same miss is final once it outlasts two new blocks.
+					// electrs indexes a block before it announces the block's header,
+					// so once this wallet's tip has moved on, a transaction mined in
+					// the meantime is found through electrs' index. The second block
+					// covers a failover to a server a block behind, as above. So what
+					// is still missing then was replaced or evicted from the mempool
+					// (issue #935).
+					//
+					// Counted from no lower than the highest tip this wallet has
+					// held, though: a failover to a server further behind lowers the
+					// tip, and that server announces new blocks while it catches up to
+					// the one the transaction may be in. Nor from lower than a block
+					// the record was seen in, which leaves such a record to the rule
+					// above. Nothing is counted before the wallet knows a tip, and the
+					// count stays until the transaction is answered for or leaves
+					// observation.
 					const firstMiss = this._noTxindexMisses.get(txData.data.tx_hash);
 					if (firstMiss === undefined) {
 						if (tipHeight > 0) {
-							this._noTxindexMisses.set(txData.data.tx_hash, tipHeight);
+							this._noTxindexMisses.set(
+								txData.data.tx_hash,
+								Math.max(tipHeight, this._replacedTipHeight)
+							);
 						}
-					} else if (tipHeight - firstMiss >= 2) {
+					} else if (
+						Math.min(tipBeforeLookup, tipHeight) -
+							Math.max(firstMiss, oldHeight) >=
+						2
+					) {
 						ghostTxs.push(txData.data.tx_hash);
 						return;
 					}
@@ -3712,6 +3733,10 @@ export class Wallet {
 	 * @returns {Promise<void>}
 	 */
 	public async updateHeader(headerData: IHeader): Promise<void> {
+		this._replacedTipHeight = Math.max(
+			this._replacedTipHeight,
+			this._data.header?.height ?? 0
+		);
 		this._data.header = headerData;
 		await this.saveWalletData('header', headerData);
 	}
@@ -5450,6 +5475,8 @@ export class Wallet {
 		if (txid in unconfirmed) {
 			delete unconfirmed[txid];
 		}
+		// No longer observed, so a count of its misses is over (issue #935).
+		this._noTxindexMisses.delete(txid);
 		await this.saveWalletData('transactions', transactions);
 		await this.saveWalletData('unconfirmedTransactions', unconfirmed);
 	}
