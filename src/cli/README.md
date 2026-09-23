@@ -737,7 +737,7 @@ node.on('htlc:fulfilled', ({ channelId, htlcId }) => { ... }); // an HTLC we off
 node.on('htlc:failed', ({ channelId, htlcId }) => { ... });
 node.on('peer:connect', ({ pubkey }) => { ... });
 node.on('peer:disconnect', ({ pubkey }) => { ... });
-node.on('node:error', ({ code, message, timestamp }) => { ... });
+node.on('node:error', ({ code, message, timestamp }) => { ... }); // code LISTEN_FAILED: a configured listener could not bind (see below)
 node.on('node:ready', () => { ... });           // node fully operational
 node.on('payment:retry', ({ paymentHash, attempt, maxRetries, nextRetryMs, error }) => { ... });
 node.on('backup:completed', ({ path, timestamp }) => { ... });
@@ -745,6 +745,27 @@ node.on('backup:failed', ({ path, error, timestamp }) => { ... });
 node.on('electrum:failover', ({ from, to, timestamp }) => { ... }); // auto-reconnects to next server
 node.on('log', (entry: LogEntry) => { ... });  // structured logs
 ```
+
+A configured listener that does not bind is not fatal, and is never silent
+(issues #861 and #933). When the OS refuses the bind (the port is taken, or
+not permitted), the node raises `node:error` with code `LISTEN_FAILED`,
+naming the listener, the port and the OS error, and saying inbound peers
+cannot connect (and, for a guardian host, that its guardian is
+unreachable). It is logged, kept in `GET /logs?category=error` and passed
+to `onError`; a throwing `onError` does not fail the boot. Nothing retries
+it: free the port and restart. `GET /info` carries the port asked for as
+`listenPort` and the reason as `listenError` (or `websocketListenError`),
+with `state: 'failed'` and the OS code as `errno`. In a guardian recovery
+mode (`async-remote`, `quorum`) the startup quarantine refuses the bind
+until writer ownership is confirmed and any startup repair is receipted:
+`listenError.state` is `'held'` meanwhile, no `LISTEN_FAILED` is raised,
+and the listener binds on its own once the gate opens (`'fenced'` if the
+node is fenced instead, when it stays down). A fence also closes a
+listener that was bound, which then reads `'fenced'` and gives no
+`GET /node/uri`. A guardian host's TCP bind is
+admitted during quarantine by the guardian-only lane. A failure at startup
+is raised before the daemon's SSE stream and webhooks are wired, so read it
+from `GET /info`.
 
 The `log` event fires based on the `logLevel` option. Set `logLevel: 'debug'` for verbose output, `'silent'` to suppress. Pass a `logger` (any `ILogger`, e.g. `createConsoleLogger(level)` from the main package) to also receive those entries as `logger.debug/info/warn/error(message, meta)` calls; the daemon uses this with `--log-level` / `BEIGNET_LOG_LEVEL` to print diagnostics to stderr (silent by default).
 
@@ -761,7 +782,18 @@ interface NodeInfo {
   channelCount: number;      // every known channel row, incl. CLOSED/FORCE_CLOSED
   openChannelCount: number;  // channels not in a terminal state
   peerCount: number;
-  listening: boolean;
+  listening: boolean;        // an inbound listener (TCP or WebSocket) is bound
+  listenPort?: number;       // the TCP port asked for, present whenever one was configured, bound or not
+  listenError?: ListenerProblem;          // why the TCP listener is not bound; absent while it is
+  websocketPort?: number;    // the WebSocket listener port, only while bound
+  websocketListenError?: ListenerProblem; // why the WebSocket listener is not bound
+}
+
+interface ListenerProblem {
+  port: number;              // the port asked for
+  state: 'failed' | 'held' | 'fenced';
+  message: string;           // the OS error, or why the bind is held
+  errno?: string;            // EADDRINUSE, EACCES, ... when the OS refused
 }
 
 interface BalanceInfo {
@@ -2107,7 +2139,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/recovery/status` | -- | Recovery Protocol status: mode, guardian set, daemon state (`disabled`/`running`/`restore-required`/`restoring`/`restart-required`/`fenced`), the node view (startup gate, durability, last durable sequence, per-channel recovery status), and the Recovery Capsules storage peers returned this session (`capsules`, whose `best` names the guardian locators the capsule carries, credentials redacted), plus `autoApply` (the automatic capsule application: enabled, phase, settleUntil, lastReason). 404 on an older daemon = predates the feature; 200 with `disabled` = supported but off |
 | POST | `/recovery/restore` | `{ confirm: true }` | Restore from guardian replicas and start the node on the restored state (restore-pending daemons only; channels RESUME instead of force-closing; the takeover permanently fences the previous writer). Progress streams over SSE as `recovery:restore-progress` |
 | POST | `/recovery/restore-capsule` | `{ confirm: true, unfenced?: boolean }` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session. Tier 2 installs the exact state into a fresh database and holds the daemon until a restart (503 `NODE_RESTART_REQUIRED` elsewhere); Tier 1 recovers the embedded SCB on the live node. Progress streams over SSE as `recovery:restore-progress` |
-| GET | `/guardian/status` | -- | The guardian this node serves to others: `{ serving }` plus guardian id, token requirement, sessions, served sets (members, namespaces, bytes) and limits |
+| GET | `/guardian/status` | -- | The guardian this node serves to others: `{ serving }` plus guardian id, token requirement, sessions, served sets (members, namespaces, bytes) and limits whenever hosting is on. `serving` is false when hosting is off, and also while the Lightning listener guardians dial is not bound, when `listenError` says why (issue #861) |
 | POST | `/recovery/rotate-guardians` | `{ guardians: [3 entries], confirm: true }` | Move this wallet to a new guardian set (one member or all three) with the channels running (wire 5.9): register with the incoming set under the current lease at the next generation, backfill, switch, retire the outgoing set. The env keeps naming the old set until updated; the journal's set is in force and the status route reports `configuredSetStale` |
 | POST | `/recovery/resolve-guardian` | `{ uri }` | A beignet node's `<node id>@host:port` to a guardian entry `<guardianId>@bolt8://<node id>@host:port`, by asking its guardian over a bolt8 session. Adopts nothing |
 | POST | `/recovery/capsule-guardians` | `{ confirm: true }` | The guardian set the best retrieved capsule names, INCLUDING transport credentials, as config-file entries for `recoveryGuardians`. The status route redacts credentials; this admin handoff is how a seed restore whose guardians need authentication gets them back. Nothing is adopted or persisted |
