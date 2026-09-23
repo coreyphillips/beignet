@@ -3308,6 +3308,15 @@ export class Wallet {
 				return !((this.data.transactions[tx.tx_hash]?.height ?? 0) >= 6);
 			});
 		}
+		// Records the ghost path cleared before this lookup went out. Only these
+		// may be read as back below: a clearing that lands while the lookup is in
+		// flight, from a check beside this refresh, rests on a newer answer than
+		// this one and must stand (issue #945).
+		const clearedBeforeLookup = new Set(
+			filteredTxHashes
+				.filter((tx) => this.data.transactions[tx.tx_hash]?.exists === false)
+				.map((tx) => tx.tx_hash)
+		);
 
 		const getTransactionsResponse = await this.electrum.getTransactions({
 			txHashes: filteredTxHashes
@@ -3349,8 +3358,14 @@ export class Wallet {
 		Object.keys(transactions).forEach((txid) => {
 			const stored = storedTransactions[txid];
 			const isNew = !stored;
-			//If the tx is new or the tx now has a block height (state changed to confirmed)
-			if (isNew || stored.height !== transactions[txid].height) {
+			// The ghost path leaves a cleared record at height 0, and a transaction
+			// back in the mempool returns at height 0 too, so only its exists flag
+			// changed. The server has just served it, so it is pending again
+			// (issue #945).
+			const returned =
+				stored?.exists === false && clearedBeforeLookup.has(txid);
+			//If the tx is new, was cleared and is back, or now has a different block height
+			if (isNew || returned || stored.height !== transactions[txid].height) {
 				formattedTransactions[txid] = {
 					...transactions[txid],
 					// Keep the previous timestamp if the tx is not new.
@@ -5505,7 +5520,9 @@ export class Wallet {
 	}
 
 	/**
-	 * Sets "exists" to false for a given on-chain transaction id.
+	 * Sets "exists" to false for a given on-chain transaction id. A later
+	 * refresh that fetches the transaction again and gets it from the server
+	 * sets it back to true (issue #945).
 	 * @param {string} txid
 	 */
 	async addGhostTransaction({ txid }: { txid: string }): Promise<void> {
