@@ -4150,6 +4150,11 @@ export class Wallet {
 
 	/**
 	 * Formats the provided transaction.
+	 *
+	 * A transaction is left out of the result, like an entry the server
+	 * answered with an error, when the previous output of any of its inputs
+	 * could not be looked up (issue #965). The caller keeps whatever record it
+	 * has for it and the next refresh tries again.
 	 * @async
 	 * @param {ITransaction<IUtxo>[]} transactions
 	 * @returns {Promise<Result<IFormattedTransactions>>}
@@ -4181,7 +4186,7 @@ export class Wallet {
 				});
 			}
 		});
-		const inputDataResponse = await this.getInputData({
+		const inputDataResponse = await this._getInputData({
 			inputs
 		});
 		if (inputDataResponse.isErr()) {
@@ -4190,7 +4195,7 @@ export class Wallet {
 			);
 		}
 		const addressTypeKeys = Object.values(EAddressType);
-		const inputData = inputDataResponse.value;
+		const { inputData, unresolved } = inputDataResponse.value;
 		const currentAddresses = currentWallet.addresses;
 		const currentChangeAddresses = currentWallet.changeAddresses;
 
@@ -4223,10 +4228,34 @@ export class Wallet {
 		);
 
 		const formattedTransactions: IFormattedTransactions = {};
+		const heldBack: string[] = [];
 		transactions.forEach(({ data, result }) => {
 			// An entry the server answered with an error carries no result
 			// (issue #934). Skip it and format the rest of the batch.
 			if (!result?.txid) {
+				return;
+			}
+
+			// Hold back a transaction with an input whose previous output could
+			// not be looked up. Formatted from a partial answer, the wallet's own
+			// send has no matched input value and reads as received, with its
+			// change as the value and a fee that is off by the missing input. It
+			// has to be any input, not only one spending a transaction the wallet
+			// knows: on a restore the history scan covers a window of addresses at
+			// a time (filterAddressesForGapLimit), so the wallet's own funding
+			// transaction may not be known yet. Left out here, the transaction is
+			// neither recorded nor announced and the next refresh tries again.
+			// The balance does not depend on it, since UTXOs are read separately
+			// (issue #965).
+			const unresolvedInput = result.vin.some(
+				(vin) =>
+					'txid' in vin &&
+					vin.txid !== undefined &&
+					vin.vout !== undefined &&
+					unresolved.has(`${vin.txid}${vin.vout}`)
+			);
+			if (unresolvedInput) {
+				heldBack.push(result.txid);
 				return;
 			}
 
@@ -4350,11 +4379,23 @@ export class Wallet {
 			};
 		});
 
+		if (heldBack.length) {
+			this.logger.warn(
+				'Holding back transactions whose inputs could not all be looked up, to retry on the next refresh:',
+				heldBack
+			);
+		}
+
 		return ok(formattedTransactions);
 	}
 
 	/**
 	 * Returns formatted input data from the inputs array.
+	 *
+	 * An input whose previous output could not be looked up, even on a retry,
+	 * is missing from the result. formatTransactions holds back a transaction
+	 * with such an input rather than format it from a partial answer (issue
+	 * #965).
 	 * @async
 	 * @param {{tx_hash: string, vout: number}[]} inputs
 	 * @returns {Promise<Result<InputData>>}
@@ -4364,6 +4405,33 @@ export class Wallet {
 	}: {
 		inputs: { tx_hash: string; vout: number }[];
 	}): Promise<Result<InputData>> {
+		const res = await this._getInputData({ inputs });
+		if (res.isErr()) return err(res.error);
+		return ok(res.value.inputData);
+	}
+
+	/**
+	 * Looks up the previous output of each input, and names the inputs it
+	 * could not resolve.
+	 *
+	 * An input is unresolved when no usable answer came back for it on the
+	 * first attempt or on a retry: the server answered it with an error, with
+	 * nothing, or with a transaction lacking that output. It is found by what
+	 * is missing rather than by the error branch, so each of these is retried
+	 * and reported. Inputs are keyed as formatTransactions looks them up,
+	 * `${tx_hash}${vout}`, taken from the request. An input the server calls
+	 * too large to send is neither retried nor unresolved, since that answer
+	 * does not change (issue #965).
+	 * @private
+	 * @async
+	 * @param {{tx_hash: string, vout: number}[]} inputs
+	 * @returns {Promise<Result<{ inputData: InputData; unresolved: Set<string> }>>}
+	 */
+	private async _getInputData({
+		inputs
+	}: {
+		inputs: { tx_hash: string; vout: number }[];
+	}): Promise<Result<{ inputData: InputData; unresolved: Set<string> }>> {
 		try {
 			// Defense-in-depth behind the updateTransactions guard: never ask
 			// the server for a prevout that does not exist (coinbase inputs
@@ -4372,7 +4440,30 @@ export class Wallet {
 				(i) => i.tx_hash !== undefined && i.vout !== undefined
 			);
 			const inputData: InputData = {};
-			const failedRequests: { tx_hash: string; vout: number }[] = [];
+			// The last error the server answered each input with.
+			const errors = new Map<string, { code?: number; message?: string }>();
+			// Inputs Electrum considers too large to send. No point in asking for
+			// them again, so they are logged and skipped.
+			const tooLarge = new Set<string>();
+
+			const read = (
+				answers: ITransaction<{ tx_hash: string; vout: number }>[]
+			): void => {
+				for (const { data, result, error } of answers) {
+					if (!data) continue;
+					const key = `${data.tx_hash}${data.vout}`;
+					const output = result?.vout?.[data.vout];
+					if (output?.scriptPubKey) {
+						inputData[key] = this._extractVoutData(output);
+					} else if (error) {
+						errors.set(key, error);
+						if (/response too large/i.test(error.message ?? '')) {
+							tooLarge.add(key);
+							this._logGetInputDataError(error, data);
+						}
+					}
+				}
+			};
 
 			const batchLimit = this.electrum.batchLimit;
 			for (let i = 0; i < inputs.length; i += batchLimit) {
@@ -4389,29 +4480,18 @@ export class Wallet {
 							getTransactionsResponse.error?.data
 					);
 				}
-				getTransactionsResponse.value.data.map(({ data, result, error }) => {
-					if (result && result?.vout) {
-						const { addresses, value, key } = this._extractVoutData(
-							result.vout[data.vout],
-							data
-						);
-						inputData[key] = { addresses, value };
-					} else if (error) {
-						if (
-							error?.message &&
-							error.message.includes('response too large')
-						) {
-							// No point in re-running this tx_hash since Electrum considers the tx too large, just log the error.
-							this._logGetInputDataError(error, data);
-						} else {
-							failedRequests.push(data);
-						}
-					}
-				});
+				read(getTransactionsResponse.value.data);
 			}
 
-			// Attempt to retrieve the data for any failed getTransactionsFromInputs request.
-			for (const input of failedRequests) {
+			// Every input still without a usable answer, each asked once more.
+			const missing = new Map<string, { tx_hash: string; vout: number }>();
+			for (const input of inputs) {
+				const key = `${input.tx_hash}${input.vout}`;
+				if (!(key in inputData) && !tooLarge.has(key)) {
+					missing.set(key, input);
+				}
+			}
+			for (const input of missing.values()) {
 				const getTransactionsResponse =
 					await this.electrum.getTransactionsFromInputs({
 						txHashes: [input]
@@ -4423,19 +4503,21 @@ export class Wallet {
 							getTransactionsResponse.error?.data
 					);
 				}
-				getTransactionsResponse.value.data.map(({ data, result, error }) => {
-					if (result && result?.vout) {
-						const { addresses, value, key } = this._extractVoutData(
-							result.vout[data.vout],
-							data
-						);
-						inputData[key] = { addresses, value };
-					} else if (error) {
-						this._logGetInputDataError(error, data);
-					}
-				});
+				read(getTransactionsResponse.value.data);
 			}
-			return ok(inputData);
+
+			const unresolved = new Set<string>();
+			for (const [key, input] of missing) {
+				if (key in inputData || tooLarge.has(key)) continue;
+				unresolved.add(key);
+				const error = errors.get(key);
+				if (error) {
+					this._logGetInputDataError(error, input);
+				} else {
+					this.logger.warn('No usable answer for input data of:', input);
+				}
+			}
+			return ok({ inputData, unresolved });
 		} catch (e) {
 			return err(e);
 		}
@@ -4445,21 +4527,19 @@ export class Wallet {
 	 * Extracts data from the provided vout.
 	 * @private
 	 * @param {IVout} vout
-	 * @param { tx_hash: string; vout: number } data
-	 * @returns { addresses: string[]; value: number; key: string }
+	 * @returns { addresses: string[]; value: number }
 	 */
-	private _extractVoutData(
-		vout: IVout,
-		data: { tx_hash: string; vout: number }
-	): { addresses: string[]; value: number; key: string } {
+	private _extractVoutData(vout: IVout): {
+		addresses: string[];
+		value: number;
+	} {
 		const addresses = vout.scriptPubKey.addresses
 			? vout.scriptPubKey.addresses
 			: vout.scriptPubKey.address
 			? [vout.scriptPubKey.address]
 			: [];
 		const value = vout.value;
-		const key = `${data.tx_hash}${vout.n}`;
-		return { addresses, value, key };
+		return { addresses, value };
 	}
 
 	/*
