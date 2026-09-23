@@ -270,6 +270,10 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | `enqueuePayment(bolt11, priority?, opts?)` | `QueuedPayment` | Add payment to priority queue (1-10, lower = higher priority). `opts: { amountSats?, maxFeeSats?, metadata? }` |
 | `listQueue()` | `QueuedPayment[]` | List all queue entries |
 | `cancelQueuedPayment(id)` | `boolean` | Cancel a queued payment by ID |
+| `resolveInterruptedPayment(bolt11)` | `Promise<InterruptedPaymentOutcome>` | How a payment the queue was dispatching when the process stopped ended, from the node's record: `{ status: 'completed', paymentHash }` or `{ status: 'unpaid' }`, once every HTLC offered for it is resolved. The queue's resolver for such an entry |
+| `whenReadyToPay(run)` | `void` | Calls `run` once the node can pay (after a pending guardian restore, once the node is ready); never after shutdown |
+
+Entries survive a restart. The queue dispatches the restored ones once the node is ready, without waiting for another enqueue. An entry that was `dispatching` when the process stopped is never sent again blindly: a payment that was made is recorded `completed`, one whose HTLCs are still out stays `dispatching` until they resolve, and only one that paid nothing is queued again (issue #967). A `PaymentQueue` built without a `resolveInterrupted` option records such an entry `failed` instead.
 
 #### Liquidity & Channel Intelligence
 

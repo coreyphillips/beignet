@@ -160,7 +160,8 @@ import {
 	ChannelFundingUnavailableCode,
 	SpliceRefusalCode,
 	IHoldCancelledEvent,
-	IHoldInvoiceStateEvent
+	IHoldInvoiceStateEvent,
+	PaymentStatus
 } from '../lightning/node/types';
 import {
 	BITCOIN_CHAIN_HASH,
@@ -177,7 +178,7 @@ import {
 	describeFailureCode,
 	isRetryableError
 } from './errors';
-import { PaymentQueue } from './payment-queue';
+import { InterruptedPaymentOutcome, PaymentQueue } from './payment-queue';
 import {
 	NodeInfo,
 	PeerInfo,
@@ -11876,19 +11877,126 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Payment Queue ───────────────
 
+	/**
+	 * How a payment the payment queue was dispatching when the process last
+	 * stopped ended, from this node's own record for its invoice (issue
+	 * #967). The queue's resolver for such an entry: it must know this before
+	 * sending the invoice again, since sendPayment refuses a second payment
+	 * to a hash only while the first is PENDING. A COMPLETED one would be
+	 * paid again with a new HTLC, and a PENDING one would come back from
+	 * payInvoiceSafe as that record and be marked failed although it may
+	 * still complete.
+	 *
+	 * Resolves once every HTLC the node offered for the hash is terminal,
+	 * which for one stuck at a peer can take until its expiry. 'completed'
+	 * when the preimage is known or the record says COMPLETED; 'unpaid'
+	 * otherwise, since the PENDING record is committed before any HTLC is
+	 * offered and the HTLC view covers offered HTLCs even without a record:
+	 * resolved with no preimage means nothing was paid. Throws while there is
+	 * no node to ask (restore pending, a capsule restore rebuilding it, a
+	 * restart required, destroyed); the queue then leaves the entry for the
+	 * next start.
+	 */
+	async resolveInterruptedPayment(
+		bolt11: string
+	): Promise<InterruptedPaymentOutcome> {
+		if (this.destroyed) {
+			throw new BeignetError(
+				BeignetErrorCode.NODE_DESTROYED,
+				'Node is shut down; an interrupted payment is settled at the next start'
+			);
+		}
+		if (this._restorePending || this._resuming) {
+			throw new BeignetError(
+				'NODE_RESTORE_PENDING',
+				'No node is running yet to settle an interrupted payment against'
+			);
+		}
+		if (this._restartRequired) {
+			throw new BeignetError(
+				'NODE_RESTART_REQUIRED',
+				'A capsule restore replaced this database; an interrupted payment ' +
+					'is settled after the restart'
+			);
+		}
+		let paymentHash: Buffer;
+		try {
+			// The decoder sendPayment uses. A string it cannot decode never
+			// reached an HTLC, and sending it again fails it as before.
+			paymentHash = decodeInvoice(bolt11).paymentHash;
+		} catch {
+			return { status: 'unpaid' };
+		}
+		const view = await this.node.awaitPaymentResolution(paymentHash);
+		if (view.preimage || view.status === PaymentStatus.COMPLETED) {
+			return { status: 'completed', paymentHash: paymentHash.toString('hex') };
+		}
+		return { status: 'unpaid' };
+	}
+
+	/**
+	 * Run `run` once this node can pay: after a pending guardian restore has
+	 * built the node, and once the node is ready. Never while a capsule
+	 * restore rebuilds the node or a restart is required, and never after
+	 * shutdown. The payment queues start here (issue #967).
+	 */
+	whenReadyToPay(run: () => void): void {
+		if (this.destroyed) return;
+		if (this._restorePending) {
+			// Shutdown removes every listener, so this cannot outlive the node.
+			this.once('recovery:restored', () => this.whenReadyToPay(run));
+			return;
+		}
+		if (this._resuming || this._restartRequired) return;
+		let ready: Promise<void>;
+		try {
+			ready = this.node.waitForReady(BeignetNode.MAX_TIMER_MS);
+		} catch {
+			return;
+		}
+		ready
+			.then(
+				() => {
+					if (this.destroyed || this._resuming || this._restartRequired) {
+						return;
+					}
+					run();
+				},
+				() => {
+					// Destroyed (a shutdown, or a capsule restore rebuilding the
+					// node) before it was ready: nothing to start.
+				}
+			)
+			.catch((err: unknown) => {
+				try {
+					this.log('warn', 'Starting the payment queue failed', {
+						error: err instanceof Error ? err.message : String(err)
+					});
+				} catch {
+					// A throwing log listener must not become an unhandled
+					// rejection either.
+				}
+			});
+	}
+
 	private getPaymentQueue(): PaymentQueue {
 		if (!this.paymentQueue) {
 			this.paymentQueue = new PaymentQueue(
 				(bolt11, timeout, maxFee, amount, meta) =>
 					this.payInvoiceSafe(bolt11, timeout, maxFee, amount, meta),
 				(amount) => this.canSend(amount),
-				undefined,
+				// A restored entry that was in flight is settled against the
+				// node's record before anything sends it again (issue #967).
+				{ resolveInterrupted: (b) => this.resolveInterruptedPayment(b) },
 				this.storage
 			);
 			// First built after shutdown began, while the database stays open
 			// for the wallet: the rows it restored must not dispatch against
-			// the stopped node and persist 'failed' (issue #958).
+			// the stopped node and persist 'failed' (issue #958). Otherwise
+			// they dispatch once the node can pay, not on the next enqueue()
+			// (issue #967).
 			if (this.destroyed) this.paymentQueue.stop();
+			else this.whenReadyToPay(() => this.paymentQueue?.start());
 		}
 		return this.paymentQueue;
 	}

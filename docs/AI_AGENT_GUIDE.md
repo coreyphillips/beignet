@@ -279,7 +279,7 @@ if (result.status === 'COMPLETED') {
 ```
 
 ### Payment queuing
-For batch payments with concurrency control. The queue is **persistent** — queued payments survive daemon restarts and crashes. Payments that were mid-dispatch at crash time are automatically reset to `queued` on recovery.
+For batch payments with concurrency control. The queue is **persistent**: queued payments survive daemon restarts and crashes, and dispatch once the node is ready after the next start. A payment that was mid-dispatch at the restart is checked against the node's own record for its invoice before anything sends it again: one that was paid is recorded `completed`, one whose HTLCs are still out stays `dispatching` until they resolve, and only one that paid nothing is queued again.
 
 ```typescript
 const queue = node.enqueuePayment(bolt11, 1); // priority 1 (highest)

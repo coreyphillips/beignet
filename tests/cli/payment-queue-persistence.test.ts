@@ -3,7 +3,11 @@
  */
 
 import { expect } from 'chai';
-import { PaymentQueue } from '../../src/cli/payment-queue';
+import {
+	INTERRUPTED_PAYMENT_ERROR,
+	InterruptedPaymentOutcome,
+	PaymentQueue
+} from '../../src/cli/payment-queue';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 
 // Stub functions that never actually pay — we only test persistence
@@ -43,7 +47,7 @@ describe('Payment Queue Persistence', () => {
 		expect(rows[0].priority).to.equal(3);
 	});
 
-	it('dispatching entries reset to queued on restore (crash recovery)', () => {
+	it('with no resolver, a restored dispatching entry is recorded failed, never sent again (issue #967)', () => {
 		// Manually insert a "dispatching" entry into storage to simulate crash
 		storage.saveQueueEntry({
 			id: 'q-1-12345',
@@ -53,16 +57,31 @@ describe('Payment Queue Persistence', () => {
 			createdAt: Date.now()
 		});
 
+		let calls = 0;
 		const queue = new PaymentQueue(
-			noopPay,
+			async () => {
+				calls++;
+				return { status: 'COMPLETED', paymentHash: 'abc' };
+			},
 			noopCanSend,
-			{ maxConcurrent: 0 },
+			undefined,
 			storage
 		);
+		queue.start();
+		queue.enqueue('lnbc_other', 5);
 		const list = queue.list();
-		expect(list).to.have.lengthOf(1);
-		expect(list[0].status).to.equal('queued'); // Reset from dispatching
-		expect(list[0].bolt11).to.equal('lnbc_crashed');
+		const crashed = list.find((e) => e.id === 'q-1-12345');
+		// It may have been paid before the crash: sending it again could pay
+		// twice, and with no resolver nothing can tell.
+		expect(crashed?.status).to.equal('failed');
+		expect(crashed?.error).to.equal(INTERRUPTED_PAYMENT_ERROR);
+		expect(crashed?.completedAt).to.be.a('number');
+		const row = storage.loadAllQueueEntries().find((r) => r.id === 'q-1-12345');
+		expect(row?.status).to.equal('failed');
+		expect(row?.error).to.equal(INTERRUPTED_PAYMENT_ERROR);
+		expect(row?.completedAt).to.be.a('number');
+		// Only the new entry was paid.
+		expect(calls).to.equal(1);
 	});
 
 	it('completed/failed entries are loadable', () => {
@@ -213,7 +232,7 @@ describe('Payment Queue Persistence', () => {
 			expect(finishers).to.have.length(1);
 			expect(queue.activePayments).to.equal(0);
 
-			// The next start restores them; they dispatch on its first enqueue.
+			// The next start restores them; they dispatch on its start().
 			const restarted = new PaymentQueue(
 				noopPay,
 				noopCanSend,
@@ -248,6 +267,385 @@ describe('Payment Queue Persistence', () => {
 			expect(statusOf(inFlight.id)).to.equal('failed');
 			expect(statusOf(waiting.id)).to.equal('queued');
 			expect(calls).to.equal(1);
+		});
+	});
+
+	// Issue #967: restored entries dispatched only on the next unrelated
+	// enqueue(), and an entry in flight at the restart was restored 'queued'
+	// and sent again. The node refuses a second payment to the same hash only
+	// while the first is pending, so one that had completed was paid twice.
+	describe('restart (issue #967)', () => {
+		type PayResult = { status: string; paymentHash: string };
+		type Row = ReturnType<SqliteStorage['loadAllQueueEntries']>[number];
+		const rowOf = (id: string): Row | undefined =>
+			storage.loadAllQueueEntries().find((row) => row.id === id);
+		const statusOf = (id: string): string | undefined => rowOf(id)?.status;
+		const seed = (
+			id: string,
+			bolt11: string,
+			status: string,
+			priority = 5
+		): void =>
+			storage.saveQueueEntry({
+				id,
+				bolt11,
+				priority,
+				status,
+				createdAt: Date.now()
+			});
+		const settle = (): Promise<void> =>
+			new Promise((resolve) => setTimeout(resolve, 20));
+
+		/** A payer that records each call and completes it at once. */
+		const recordingPay = (): {
+			calls: string[];
+			pay: (bolt11: string) => Promise<PayResult>;
+		} => {
+			const calls: string[] = [];
+			return {
+				calls,
+				pay: async (bolt11: string): Promise<PayResult> => {
+					calls.push(bolt11);
+					return { status: 'COMPLETED', paymentHash: `paid-${bolt11}` };
+				}
+			};
+		};
+
+		/** A resolver whose answers the test gives, one per call. */
+		const heldResolver = (): {
+			asked: string[];
+			answer: (index: number, outcome: InterruptedPaymentOutcome) => void;
+			refuse: (index: number) => void;
+			resolve: (bolt11: string) => Promise<InterruptedPaymentOutcome>;
+		} => {
+			const asked: string[] = [];
+			const pending: Array<{
+				resolve: (o: InterruptedPaymentOutcome) => void;
+				reject: (e: Error) => void;
+			}> = [];
+			return {
+				asked,
+				answer: (index, outcome): void => pending[index].resolve(outcome),
+				refuse: (index): void =>
+					pending[index].reject(new Error('Node destroyed')),
+				resolve: (bolt11): Promise<InterruptedPaymentOutcome> => {
+					asked.push(bolt11);
+					return new Promise((resolve, reject) =>
+						pending.push({ resolve, reject })
+					);
+				}
+			};
+		};
+
+		it('restored queued rows are not paid at construction, and dispatch on start() with no enqueue', async () => {
+			seed('q-1-a', 'lnbc_restored_a', 'queued', 1);
+			seed('q-2-b', 'lnbc_restored_b', 'queued', 5);
+			const { calls, pay } = recordingPay();
+			const queue = new PaymentQueue(pay, noopCanSend, undefined, storage);
+			await settle();
+			expect(calls).to.have.length(0);
+			expect(queue.pendingCount).to.equal(2);
+
+			queue.start();
+			await settle();
+			expect(calls).to.deep.equal(['lnbc_restored_a', 'lnbc_restored_b']);
+			expect(statusOf('q-1-a')).to.equal('completed');
+			expect(statusOf('q-2-b')).to.equal('completed');
+		});
+
+		it('start() after stop() dispatches nothing, and the rows stay queued', async () => {
+			seed('q-1-a', 'lnbc_restored_a', 'queued');
+			seed('q-2-b', 'lnbc_in_flight', 'dispatching');
+			const { calls, pay } = recordingPay();
+			const resolver = heldResolver();
+			const queue = new PaymentQueue(
+				pay,
+				noopCanSend,
+				{ resolveInterrupted: resolver.resolve },
+				storage
+			);
+			queue.stop();
+			queue.start();
+			await settle();
+			expect(calls).to.have.length(0);
+			expect(resolver.asked).to.have.length(0);
+			expect(statusOf('q-1-a')).to.equal('queued');
+			expect(statusOf('q-2-b')).to.equal('dispatching');
+		});
+
+		it('a second start() calls neither the payer nor the resolver again', async () => {
+			seed('q-1-a', 'lnbc_restored_a', 'queued');
+			seed('q-2-b', 'lnbc_in_flight', 'dispatching');
+			const { calls, pay } = recordingPay();
+			const resolver = heldResolver();
+			const queue = new PaymentQueue(
+				pay,
+				noopCanSend,
+				{ resolveInterrupted: resolver.resolve },
+				storage
+			);
+			queue.start();
+			await settle();
+			queue.start();
+			await settle();
+			expect(calls).to.deep.equal(['lnbc_restored_a']);
+			expect(resolver.asked).to.deep.equal(['lnbc_in_flight']);
+		});
+
+		it('with a resolver, a restored dispatching row stays dispatching, and is not asked about before start()', async () => {
+			seed('q-1-a', 'lnbc_in_flight', 'dispatching');
+			const { calls, pay } = recordingPay();
+			const resolver = heldResolver();
+			const queue = new PaymentQueue(
+				pay,
+				noopCanSend,
+				{ resolveInterrupted: resolver.resolve },
+				storage
+			);
+			// An enqueue before start() dispatches as always, but never the
+			// restored row: it is not 'queued'.
+			queue.enqueue('lnbc_new', 5);
+			await settle();
+			expect(queue.list().find((e) => e.id === 'q-1-a')?.status).to.equal(
+				'dispatching'
+			);
+			expect(statusOf('q-1-a')).to.equal('dispatching');
+			expect(resolver.asked).to.have.length(0);
+			expect(calls).to.deep.equal(['lnbc_new']);
+		});
+
+		it("the resolver's 'completed' records it completed with its hash, and never pays it", async () => {
+			seed('q-1-a', 'lnbc_in_flight', 'dispatching');
+			const { calls, pay } = recordingPay();
+			const queue = new PaymentQueue(
+				pay,
+				noopCanSend,
+				{
+					resolveInterrupted: async (): Promise<InterruptedPaymentOutcome> => ({
+						status: 'completed',
+						paymentHash: 'aa'.repeat(32)
+					})
+				},
+				storage
+			);
+			const completed: Array<{ id: string; paymentHash: string }> = [];
+			queue.on('queue:completed', (e) => completed.push(e));
+			queue.start();
+			await settle();
+
+			expect(calls).to.have.length(0);
+			expect(completed).to.deep.equal([
+				{ id: 'q-1-a', paymentHash: 'aa'.repeat(32) }
+			]);
+			const row = rowOf('q-1-a');
+			expect(row?.status).to.equal('completed');
+			expect(row?.completedAt).to.be.a('number');
+			const entry = queue.list().find((e) => e.id === 'q-1-a');
+			expect(entry?.status).to.equal('completed');
+			expect(entry?.completedAt).to.be.a('number');
+		});
+
+		it("the resolver's 'unpaid' queues it again, and it is paid exactly once with the outcome recorded", async () => {
+			seed('q-1-a', 'lnbc_never_paid', 'dispatching');
+			const { calls, pay } = recordingPay();
+			const queue = new PaymentQueue(
+				pay,
+				noopCanSend,
+				{
+					resolveInterrupted: async (): Promise<InterruptedPaymentOutcome> => ({
+						status: 'unpaid'
+					})
+				},
+				storage
+			);
+			const completed: Array<{ id: string; paymentHash: string }> = [];
+			queue.on('queue:completed', (e) => completed.push(e));
+			queue.start();
+			await settle();
+
+			expect(calls).to.deep.equal(['lnbc_never_paid']);
+			expect(completed).to.deep.equal([
+				{ id: 'q-1-a', paymentHash: 'paid-lnbc_never_paid' }
+			]);
+			expect(statusOf('q-1-a')).to.equal('completed');
+		});
+
+		it('while the resolver waits, the entry stays dispatching, cannot be cancelled or pruned, and holds no slot', async () => {
+			seed('q-1-a', 'lnbc_stuck', 'dispatching', 1);
+			seed('q-2-b', 'lnbc_restored', 'queued', 5);
+			const { calls, pay } = recordingPay();
+			const resolver = heldResolver();
+			const queue = new PaymentQueue(
+				pay,
+				noopCanSend,
+				{ maxConcurrent: 1, resolveInterrupted: resolver.resolve },
+				storage
+			);
+			queue.start();
+			await settle();
+
+			expect(resolver.asked).to.deep.equal(['lnbc_stuck']);
+			// A stuck HTLC can last until its expiry; the single slot is not
+			// held for it.
+			expect(calls).to.deep.equal(['lnbc_restored']);
+			expect(statusOf('q-2-b')).to.equal('completed');
+			expect(queue.activePayments).to.equal(0);
+
+			expect(queue.cancel('q-1-a')).to.equal(false);
+			expect(queue.prune()).to.equal(1); // the completed q-2-b only
+			expect(queue.list().map((e) => e.id)).to.deep.equal(['q-1-a']);
+			expect(queue.list()[0].status).to.equal('dispatching');
+			expect(statusOf('q-1-a')).to.equal('dispatching');
+
+			resolver.answer(0, { status: 'completed', paymentHash: 'bb'.repeat(32) });
+			await settle();
+			expect(statusOf('q-1-a')).to.equal('completed');
+			expect(calls).to.deep.equal(['lnbc_restored']);
+		});
+
+		it('a resolver that rejects or throws leaves it dispatching, and the next start asks again', async () => {
+			seed('q-1-a', 'lnbc_in_flight', 'dispatching');
+			const { calls, pay } = recordingPay();
+			const asked: string[] = [];
+
+			const throwing = new PaymentQueue(
+				pay,
+				noopCanSend,
+				{
+					resolveInterrupted: (
+						bolt11: string
+					): Promise<InterruptedPaymentOutcome> => {
+						asked.push(bolt11);
+						throw new Error('no node yet');
+					}
+				},
+				storage
+			);
+			throwing.start();
+			await settle();
+			expect(statusOf('q-1-a')).to.equal('dispatching');
+			expect(throwing.list()[0].status).to.equal('dispatching');
+
+			const rejecting = new PaymentQueue(
+				pay,
+				noopCanSend,
+				{
+					resolveInterrupted: async (
+						bolt11: string
+					): Promise<InterruptedPaymentOutcome> => {
+						asked.push(bolt11);
+						throw new Error('Node destroyed');
+					}
+				},
+				storage
+			);
+			rejecting.start();
+			await settle();
+			expect(statusOf('q-1-a')).to.equal('dispatching');
+			expect(rejecting.list()[0].status).to.equal('dispatching');
+
+			const answering = new PaymentQueue(
+				pay,
+				noopCanSend,
+				{
+					resolveInterrupted: async (
+						bolt11: string
+					): Promise<InterruptedPaymentOutcome> => {
+						asked.push(bolt11);
+						return { status: 'unpaid' };
+					}
+				},
+				storage
+			);
+			answering.start();
+			await settle();
+			expect(asked).to.deep.equal([
+				'lnbc_in_flight',
+				'lnbc_in_flight',
+				'lnbc_in_flight'
+			]);
+			// Paid once, by the start that could settle it.
+			expect(calls).to.deep.equal(['lnbc_in_flight']);
+			expect(statusOf('q-1-a')).to.equal('completed');
+		});
+
+		it('an outcome that arrives after stop() is recorded; an unpaid one stays queued and is not dispatched', async () => {
+			seed('q-1-a', 'lnbc_paid', 'dispatching');
+			seed('q-2-b', 'lnbc_unpaid', 'dispatching');
+			const { calls, pay } = recordingPay();
+			const resolver = heldResolver();
+			const queue = new PaymentQueue(
+				pay,
+				noopCanSend,
+				{ resolveInterrupted: resolver.resolve },
+				storage
+			);
+			queue.start();
+			await settle();
+			expect(resolver.asked).to.deep.equal(['lnbc_paid', 'lnbc_unpaid']);
+
+			queue.stop();
+			resolver.answer(0, { status: 'completed', paymentHash: 'cc'.repeat(32) });
+			resolver.answer(1, { status: 'unpaid' });
+			await settle();
+
+			expect(statusOf('q-1-a')).to.equal('completed');
+			expect(statusOf('q-2-b')).to.equal('queued');
+			expect(calls).to.have.length(0);
+
+			// The next start restores it queued, to dispatch on its start().
+			const restarted = new PaymentQueue(pay, noopCanSend, undefined, storage);
+			expect(restarted.pendingCount).to.equal(1);
+		});
+
+		it('a resolver answer the queue does not know leaves it dispatching', async () => {
+			seed('q-1-a', 'lnbc_in_flight', 'dispatching');
+			const { calls, pay } = recordingPay();
+			const queue = new PaymentQueue(
+				pay,
+				noopCanSend,
+				{
+					resolveInterrupted: async (): Promise<InterruptedPaymentOutcome> =>
+						({ status: 'pending' }) as unknown as InterruptedPaymentOutcome
+				},
+				storage
+			);
+			queue.start();
+			await settle();
+			expect(statusOf('q-1-a')).to.equal('dispatching');
+			expect(calls).to.have.length(0);
+		});
+
+		it('a throwing queue:completed listener neither loses the outcome nor becomes an unhandled rejection', async () => {
+			seed('q-1-a', 'lnbc_in_flight', 'dispatching');
+			const unhandled: unknown[] = [];
+			const onUnhandled = (reason: unknown): void => {
+				unhandled.push(reason);
+			};
+			process.on('unhandledRejection', onUnhandled);
+			try {
+				const queue = new PaymentQueue(
+					noopPay,
+					noopCanSend,
+					{
+						resolveInterrupted:
+							async (): Promise<InterruptedPaymentOutcome> => ({
+								status: 'completed',
+								paymentHash: 'dd'.repeat(32)
+							})
+					},
+					storage
+				);
+				queue.on('queue:completed', () => {
+					throw new Error('listener bug');
+				});
+				queue.start();
+				await settle();
+				expect(statusOf('q-1-a')).to.equal('completed');
+				expect(unhandled).to.have.length(0);
+			} finally {
+				process.removeListener('unhandledRejection', onUnhandled);
+			}
 		});
 	});
 
