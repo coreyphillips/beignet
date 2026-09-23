@@ -65,6 +65,7 @@ export class PaymentQueue extends EventEmitter {
 	private payInvoiceSafe: PayInvoiceSafeFn;
 	private canSend: CanSendFn;
 	private processing = false;
+	private stopped = false;
 	private idCounter = 0;
 	private storage: IPaymentQueueStorage | null;
 
@@ -254,8 +255,19 @@ export class PaymentQueue extends EventEmitter {
 		return before - this.queue.length;
 	}
 
+	/**
+	 * Stop dispatching, for shutdown. Payments already dispatching still
+	 * record how they ended; queued ones, including any enqueued after this,
+	 * stay 'queued' in storage and resume after a restart. Without this, a
+	 * dispatch against the stopped node fails at once and persists 'failed',
+	 * now that the database stays open while the wallet stops (issue #958).
+	 */
+	stop(): void {
+		this.stopped = true;
+	}
+
 	private processQueue(): void {
-		if (this.processing) return;
+		if (this.processing || this.stopped) return;
 		this.processing = true;
 
 		// Process all eligible entries

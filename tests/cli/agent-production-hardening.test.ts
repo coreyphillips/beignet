@@ -13,6 +13,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { BeignetError } from '../../src/cli/errors';
 import { PaymentFilter } from '../../src/cli/types';
+import type { BeignetNode } from '../../src/cli/beignet-node';
 
 // Electrum intentionally unreachable: nothing below needs a live chain, and a
 // refused loopback connect returns ECONNREFUSED instantly. Without this the
@@ -165,6 +166,133 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 			fs.rmSync(tmpDir, { recursive: true, force: true });
 			fs.rmSync(backupDir, { recursive: true, force: true });
 		}
+	});
+
+	// Issue #958: the node and the on-chain wallet write through one
+	// SqliteStorage, and wallet.stop() waits for the writes queued when it is
+	// called. The database has to stay open through that wait. It used to be
+	// closed first, by the node's own destroy(), so the write answered Err.
+	const heldWalletWriteLandsBeforeClose = async (
+		shutdown: (node: BeignetNode) => Promise<void>,
+		stoppingAtCall: boolean
+	): Promise<void> => {
+		const { BeignetNode } = await import('../../src/cli/beignet-node');
+		const { SqliteStorage } = await import(
+			'../../src/lightning/storage/sqlite-storage'
+		);
+		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-test-'));
+		const node = await BeignetNode.create({
+			network: 'regtest',
+			dataDir: tmpDir,
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
+		});
+		let release: () => void = () => {};
+		try {
+			await node.waitForInitialSync();
+			const wallet = node.onchainWallet;
+			const walletInternals = wallet as unknown as {
+				_stopping: boolean;
+				_setData: (key: string, value: unknown) => Promise<unknown>;
+			};
+			// With no refresh in flight, stop() waits on the held write alone.
+			expect(wallet.isRefreshing).to.equal(false);
+			const storage = node.getStorage();
+			const storageInternals = storage as unknown as {
+				db: { open: boolean };
+				dbPath: string;
+			};
+			const order: string[] = [];
+			const save = storage.saveWalletData.bind(storage);
+			storage.saveWalletData = (k: string, v: string): void => {
+				save(k, v);
+				order.push(`saved:${k}`);
+			};
+			const close = storage.close.bind(storage);
+			storage.close = (): void => {
+				order.push('close');
+				close();
+			};
+			// The adapter is still making this write when shutdown starts.
+			const setData = walletInternals._setData;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			walletInternals._setData = async (
+				k: string,
+				v: unknown
+			): Promise<unknown> => {
+				await gate;
+				return setData(k, v);
+			};
+			const key = wallet.getWalletDataKey('addressLabels');
+			const labels = { bcrt1qissue958: 'issue-958' };
+			const write = wallet.saveWalletData('addressLabels', labels);
+
+			const done = shutdown(node);
+			if (stoppingAtCall) {
+				expect(walletInternals._stopping).to.equal(true);
+			} else {
+				const deadline = Date.now() + 10_000;
+				while (!walletInternals._stopping) {
+					if (Date.now() > deadline) {
+						throw new Error('wallet.stop() never started');
+					}
+					await new Promise((resolve) => setTimeout(resolve, 10));
+				}
+			}
+			release();
+			await done;
+
+			const saved = await write;
+			expect(saved.isOk(), saved.isErr() ? saved.error.message : '').to.equal(
+				true
+			);
+			expect(order).to.include(`saved:${key}`);
+			expect(order.indexOf(`saved:${key}`)).to.be.lessThan(
+				order.indexOf('close')
+			);
+			// Closed once, by BeignetNode after the wallet; the node left it open.
+			expect(order.filter((e) => e === 'close')).to.have.length(1);
+			expect(storageInternals.db.open).to.equal(false);
+
+			// The row is on disk, not only handed to the handle.
+			const encryptionKey = (
+				node as unknown as { _storageEncryptionKey?: Buffer }
+			)._storageEncryptionKey;
+			const reopened = new SqliteStorage(
+				storageInternals.dbPath,
+				undefined,
+				encryptionKey ? { encryptionKey } : undefined
+			);
+			try {
+				reopened.open();
+				expect(
+					JSON.parse(reopened.loadWalletData(key) ?? 'null')
+				).to.deep.equal(labels);
+			} finally {
+				reopened.close();
+			}
+		} finally {
+			// A failed assertion must not leave stop() waiting on the gate.
+			release();
+			await node.destroy();
+			fs.rmSync(tmpDir, { recursive: true, force: true });
+		}
+	};
+
+	it('gracefulShutdown stops the wallet before closing the database, so its held write lands (issue #958)', async function () {
+		this.timeout(45_000);
+		await heldWalletWriteLandsBeforeClose(
+			(node) => node.gracefulShutdown(1_000),
+			false
+		);
+	});
+
+	it('destroy stops the wallet before closing the database, so its held write lands (issue #958)', async function () {
+		this.timeout(45_000);
+		// destroy() reaches wallet.stop() before its first await.
+		await heldWalletWriteLandsBeforeClose((node) => node.destroy(), true);
 	});
 });
 

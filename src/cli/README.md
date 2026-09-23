@@ -711,8 +711,8 @@ gets paid whatever `amountSats` asked for.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `gracefulShutdown(timeoutMs?)` | `Promise<void>` | Graceful shutdown: drains in-flight HTLCs, persists state, then stops (default 30s timeout) |
-| `destroy()` | `Promise<void>` | Immediate shutdown (stops wallet, storage, node) |
+| `gracefulShutdown(timeoutMs?)` | `Promise<void>` | Graceful shutdown: drains in-flight HTLCs, persists state, then stops the node, then the on-chain wallet, then closes the database, so the wallet's last writes land (default 30s timeout) |
+| `destroy()` | `Promise<void>` | Immediate shutdown (stops the node, then the on-chain wallet, then closes the database) |
 
 ### Events
 

@@ -6,7 +6,8 @@
  * Fix 3: Persist outbound payment at creation time (2 tests)
  * Fix 4: Wrap fulfillPayment() in storage.transaction() (2 tests)
  * Fix 7: tempChannels memory leak on open failure (4 tests)
- * Fix 8: gracefulShutdown flushes channel states (2 tests)
+ * Fix 8: gracefulShutdown flushes channel states (2 tests), and closes the
+ *        storage unless told not to (3 tests, issue #958)
  * Fix 9: Block height persistence across restarts (3 tests)
  */
 
@@ -435,6 +436,68 @@ describe('Production Hardening 10', () => {
 			);
 			expect(shutdownSection).to.include('PENDING');
 			expect(shutdownSection).to.include('persistPayment');
+		});
+
+		// Issue #958: BeignetNode shares the storage with the on-chain wallet,
+		// which stops after the node and still writes, so it asks the node to
+		// leave the storage open. Every other caller keeps the close.
+		const nodeWithStorage = (
+			seedId: number
+		): { node: LightningNode; storage: SqliteStorage; dbPath: string } => {
+			const dbPath = tmpDbPath();
+			const storage = new SqliteStorage(dbPath);
+			storage.open();
+			const config = makeNodeConfig(seedId);
+			config.storage = storage;
+			const node = new LightningNode(config);
+			node.on('error', () => {});
+			node.on('node:error', () => {});
+			return { node, storage, dbPath };
+		};
+		const isOpen = (storage: SqliteStorage): boolean =>
+			(storage as unknown as { db: { open: boolean } }).db.open;
+
+		it('gracefulShutdown with closeStorage false persists state and leaves the storage open', async () => {
+			const { node, storage, dbPath } = nodeWithStorage(230);
+			try {
+				node.handleNewBlock(900000);
+				await node.gracefulShutdown(1_000, { closeStorage: false });
+				expect(isOpen(storage)).to.equal(true);
+				expect(storage.loadMetadata('blockHeight')).to.equal('900000');
+				// The owner can still write through it.
+				storage.saveMetadata('afterShutdown', '1');
+				expect(storage.loadMetadata('afterShutdown')).to.equal('1');
+			} finally {
+				storage.close();
+				fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+			}
+		});
+
+		it('destroy with closeStorage false leaves the storage open', () => {
+			const { node, storage, dbPath } = nodeWithStorage(231);
+			try {
+				node.destroy({ closeStorage: false });
+				expect(isOpen(storage)).to.equal(true);
+			} finally {
+				storage.close();
+				fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+			}
+		});
+
+		it('gracefulShutdown and destroy still close the storage by default', async () => {
+			const graceful = nodeWithStorage(232);
+			const plain = nodeWithStorage(233);
+			try {
+				await graceful.node.gracefulShutdown(1_000);
+				expect(isOpen(graceful.storage)).to.equal(false);
+				plain.node.destroy();
+				expect(isOpen(plain.storage)).to.equal(false);
+			} finally {
+				for (const { storage, dbPath } of [graceful, plain]) {
+					storage.close();
+					fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+				}
+			}
 		});
 	});
 

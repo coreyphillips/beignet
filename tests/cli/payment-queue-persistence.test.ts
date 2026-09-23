@@ -179,6 +179,78 @@ describe('Payment Queue Persistence', () => {
 		expect(num).to.be.greaterThan(100);
 	});
 
+	// Issue #958: shutdown now keeps the database open while the wallet
+	// stops, so a dispatch against the stopped node would persist 'failed'.
+	// stop() leaves queued entries to resume after the restart instead.
+	describe('stop()', () => {
+		type PayResult = { status: string; paymentHash: string };
+		const statusOf = (id: string): string | undefined =>
+			storage.loadAllQueueEntries().find((row) => row.id === id)?.status;
+
+		it('lets a dispatch in flight record how it ended, and dispatches nothing more', async () => {
+			const finishers: Array<(result: PayResult) => void> = [];
+			const heldPay = (): Promise<PayResult> =>
+				new Promise((resolve) => finishers.push(resolve));
+			const queue = new PaymentQueue(
+				heldPay,
+				noopCanSend,
+				{ maxConcurrent: 1 },
+				storage
+			);
+			const inFlight = queue.enqueue('lnbc_in_flight', 1);
+			const waiting = queue.enqueue('lnbc_waiting', 5);
+			expect(statusOf(inFlight.id)).to.equal('dispatching');
+			expect(statusOf(waiting.id)).to.equal('queued');
+
+			queue.stop();
+			const late = queue.enqueue('lnbc_after_stop', 5);
+			finishers[0]({ status: 'COMPLETED', paymentHash: 'h1' });
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			expect(statusOf(inFlight.id)).to.equal('completed');
+			expect(statusOf(waiting.id)).to.equal('queued');
+			expect(statusOf(late.id)).to.equal('queued');
+			expect(finishers).to.have.length(1);
+			expect(queue.activePayments).to.equal(0);
+
+			// The next start dispatches them.
+			const restarted = new PaymentQueue(
+				noopPay,
+				noopCanSend,
+				{ maxConcurrent: 0 },
+				storage
+			);
+			expect(restarted.pendingCount).to.equal(2);
+		});
+
+		it('records a dispatch that fails after stop() as failed, and leaves the rest queued', async () => {
+			let calls = 0;
+			let failIt!: (e: Error) => void;
+			const heldPay = (): Promise<PayResult> => {
+				calls++;
+				return new Promise((_resolve, reject) => {
+					failIt = reject;
+				});
+			};
+			const queue = new PaymentQueue(
+				heldPay,
+				noopCanSend,
+				{ maxConcurrent: 1 },
+				storage
+			);
+			const inFlight = queue.enqueue('lnbc_in_flight', 1);
+			const waiting = queue.enqueue('lnbc_waiting', 5);
+
+			queue.stop();
+			failIt(new Error('Payment timed out'));
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			expect(statusOf(inFlight.id)).to.equal('failed');
+			expect(statusOf(waiting.id)).to.equal('queued');
+			expect(calls).to.equal(1);
+		});
+	});
+
 	it('metadata JSON round-trips', () => {
 		const queue1 = new PaymentQueue(
 			noopPay,

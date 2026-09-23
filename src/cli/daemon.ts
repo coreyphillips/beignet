@@ -3340,6 +3340,10 @@ async function bootDaemon(
 	let stopping: Promise<void> | null = null;
 	const stop = (timeoutMs = 30_000): Promise<void> => {
 		stopping ??= (async (): Promise<void> => {
+			// The database stays open while the wallet stops (issue #958); a
+			// queued payment dispatched against the stopped node would persist
+			// 'failed' there instead of resuming after the restart.
+			paymentQueue.stop();
 			paymentQueue.removeAllListeners();
 			await node.gracefulShutdown(timeoutMs).catch(() => node.destroy());
 			if (rateLimiter) rateLimiter.destroy();

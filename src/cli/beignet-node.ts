@@ -12490,6 +12490,7 @@ export class BeignetNode extends EventEmitter {
 			clearInterval(this._fallbackRecoveryTimer);
 			this._fallbackRecoveryTimer = undefined;
 		}
+		this.paymentQueue?.stop();
 		this.paymentQueue?.removeAllListeners();
 		this.directFundingSender?.stop();
 		if (this._confirmTimer) {
@@ -12504,16 +12505,19 @@ export class BeignetNode extends EventEmitter {
 				/* best-effort: backup errors already surface via backup:failed */
 			});
 		}
-		// A restore-pending daemon never built the node or the wallet.
-		await (this.node as LightningNode | undefined)?.gracefulShutdown(timeoutMs);
-		this.storage.close();
-		this.removeAllListeners();
+		// A restore-pending daemon never built the node or the wallet. The
+		// node leaves the database open: the wallet writes through it too, and
+		// its stop() waits for a refresh in flight and its queued writes. The
+		// node stops first, since its chain backend and funding provider use
+		// the wallet (issue #958).
 		try {
-			await (this.wallet as Wallet | undefined)?.stop();
-		} catch {
-			// Ignore shutdown errors
+			await (this.node as LightningNode | undefined)?.gracefulShutdown(
+				timeoutMs,
+				{ closeStorage: false }
+			);
+		} finally {
+			await this.stopWalletAndCloseStorage();
 		}
-		this.releaseLock();
 	}
 
 	async destroy(): Promise<void> {
@@ -12545,17 +12549,40 @@ export class BeignetNode extends EventEmitter {
 		}
 		this.stopRecoveryLeaseCheck();
 		this.clearAutoApplyTimers();
+		this.paymentQueue?.stop();
 		this.paymentQueue?.removeAllListeners();
 		this.directFundingSender?.stop();
 		// A restore-pending daemon never built the node or the wallet; the
 		// definite-assignment assertions on the fields do not change that.
-		(this.node as LightningNode | undefined)?.destroy();
-		this.storage.close();
+		// The node leaves the database open for the wallet, as in
+		// gracefulShutdown (issue #958).
+		try {
+			(this.node as LightningNode | undefined)?.destroy({
+				closeStorage: false
+			});
+		} finally {
+			await this.stopWalletAndCloseStorage();
+		}
+	}
+
+	/**
+	 * The shared tail of gracefulShutdown and destroy, run after the node
+	 * has stopped: the wallet, then the database, then the lock. The wallet
+	 * stops before the close so the writes its stop() waits for land (issue
+	 * #958). Listeners go first, so nothing the wallet reports while it
+	 * stops reaches the daemon's SSE or webhook subscribers.
+	 */
+	private async stopWalletAndCloseStorage(): Promise<void> {
 		this.removeAllListeners();
 		try {
 			await (this.wallet as Wallet | undefined)?.stop();
 		} catch {
 			// Ignore shutdown errors
+		}
+		try {
+			this.storage.close();
+		} catch {
+			// best-effort: the lock must still be released
 		}
 		this.releaseLock();
 	}

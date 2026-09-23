@@ -10024,7 +10024,7 @@ export class LightningNode extends EventEmitter {
 		});
 	}
 
-	destroy(): void {
+	destroy(opts?: { closeStorage?: boolean }): void {
 		this._destroyed = true;
 		this.guardianHost?.close();
 		for (const [nonce, pending] of this.pendingGrantRequests) {
@@ -10131,12 +10131,14 @@ export class LightningNode extends EventEmitter {
 				} as ILightningError);
 			}
 		}
-		// Close storage to release WAL file handles
-		if (this.storage) {
+		// Close storage to release WAL file handles. A caller that owns the
+		// backend may keep it open: BeignetNode shares it with the on-chain
+		// wallet, which stops after the node and still writes (issue #958).
+		if (this.storage && opts?.closeStorage !== false) {
 			try {
 				this.storage.close();
 			} catch {
-				// best-effort — storage may already be closed
+				// best-effort, storage may already be closed
 			}
 		}
 		this.payments.clear();
@@ -10161,8 +10163,12 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * Graceful shutdown: waits for in-flight HTLCs to settle, persists state, then destroys.
+	 * `opts` goes to destroy(); `closeStorage: false` leaves the storage open.
 	 */
-	async gracefulShutdown(timeoutMs = 30_000): Promise<void> {
+	async gracefulShutdown(
+		timeoutMs = 30_000,
+		opts?: { closeStorage?: boolean }
+	): Promise<void> {
 		// Stop accepting new operations
 		this._destroyed = true;
 		++this.chainStartupGeneration;
@@ -10211,7 +10217,7 @@ export class LightningNode extends EventEmitter {
 		}
 
 		// Final destroy
-		this.destroy();
+		this.destroy(opts);
 	}
 
 	// ─────────────── Resource Cleanup ───────────────
