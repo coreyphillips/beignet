@@ -19,10 +19,11 @@
  * not an answer either, and dropping it stopped the monitoring that finds a
  * reorg. The formatter cases cover issues #934 and #941: an entry the server
  * answered with an error reaches the formatter too, and must be skipped
- * there. The cases after them cover issue #871: a node without a txindex
- * answers a transaction in no block and not in its mempool in words of its
- * own. And issue #935: for a transaction only seen in the mempool, that
- * answer is final once it outlasts two new blocks.
+ * there. Then issue #945: a lost transaction the server serves again is
+ * shown as held again. The cases after them cover issue #871: a node
+ * without a txindex answers a transaction in no block and not in its mempool
+ * in words of its own. And issue #935: for a transaction only seen in the
+ * mempool, that answer is final once it outlasts two new blocks.
  */
 
 import { expect } from 'chai';
@@ -43,6 +44,7 @@ import {
 	EProtocol,
 	err,
 	IFormattedTransaction,
+	IGetAddressHistoryResponse,
 	IGetTransactions,
 	ITransaction,
 	ITxHash,
@@ -487,6 +489,263 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 				'a final transaction formatted after it'
 			).to.equal(false);
 		}
+	});
+
+	/**
+	 * Issue #945: the ghost path leaves a record it clears at height 0, and a
+	 * transaction back in the mempool is listed at height 0 as well. A refresh
+	 * rewrote a stored record only when it was new or its height changed, so a
+	 * returned transaction stayed cleared until it confirmed.
+	 */
+	describe('a lost transaction back in the mempool (issue #945)', function () {
+		/** The transaction's address history entry, as a refresh reads it. */
+		const historyEntry = {
+			tx_hash: TXID,
+			height: 0,
+			address: confirmedRecord(0).address,
+			scriptHash: SCRIPT_HASH
+		} as IGetAddressHistoryResponse;
+
+		/**
+		 * The server's answer for a looked up entry: served from its mempool, or
+		 * missed. A served answer echoes the entry back as its data, as the
+		 * client does, and a refresh reads the height from there.
+		 */
+		const answer = (h: ITxHash, served: boolean): ITransaction<IUtxo> =>
+			served
+				? ({
+						...txAnswer(0, undefined, h.tx_hash),
+						data: h
+				  } as unknown as ITransaction<IUtxo>)
+				: txAnswer(undefined, { code: 2, message: TXINDEX_MISS }, h.tx_hash);
+
+		/** Every lookup answered as `served` says at the time. */
+		const serveWhile = (served: () => boolean): sinon.SinonStub =>
+			sinon
+				.stub(wallet.electrum, 'getTransactions')
+				.callsFake(async ({ txHashes }: { txHashes: ITxHash[] }) =>
+					lookupReply(...txHashes.map((h) => answer(h, served())))
+				);
+
+		/** Messages announcing a transaction or its confirmation since `from`. */
+		const announced = (from: number): typeof messages =>
+			messages
+				.slice(from)
+				.filter((m) =>
+					[
+						'transactionReceived',
+						'transactionSent',
+						'transactionConfirmed'
+					].includes(m.key)
+				);
+
+		beforeEach(function () {
+			// The rescan the ghost path fires needs a server.
+			sinon.stub(wallet, 'rescanAddresses').resolves(ok(wallet.data));
+			sinon
+				.stub(wallet.electrum, 'getAddressHistory')
+				.resolves(ok([historyEntry]));
+		});
+
+		const cases: Array<[string, () => IFormattedTransaction]> = [
+			[
+				'a transaction reorged out',
+				(): IFormattedTransaction => confirmedRecord(REORGED_HEIGHT)
+			],
+			[
+				'a transaction only seen in the mempool',
+				(): IFormattedTransaction => mempoolRecord()
+			]
+		];
+		for (const [kind, record] of cases) {
+			it(`shows ${kind} again once it returns to the mempool`, async function () {
+				wallet.data.transactions[TXID] = record();
+				wallet.data.unconfirmedTransactions[TXID] = record();
+				let back = false;
+				serveWhile(() => back);
+
+				await wallet.checkUnconfirmedTransactions();
+				expect(wallet.transactions[TXID].exists, 'lost').to.equal(false);
+				expect(wallet.transactions[TXID].height).to.equal(0);
+				expect(
+					wallet.getUnconfirmedTransactions()[TXID],
+					'and no longer observed'
+				).to.equal(undefined);
+
+				// Rebroadcast: the history lists it at 0 and the server serves it.
+				back = true;
+				const before = messages.length;
+				const res = await wallet.updateTransactions({});
+				expect(res.isOk(), 'the refresh ran').to.equal(true);
+
+				expect(wallet.transactions[TXID].exists, 'pending again').to.equal(
+					true
+				);
+				const persisted = savedTransactions()[TXID];
+				expect(persisted.exists, 'and a restart reads it so').to.equal(true);
+				expect(persisted.height, 'in the mempool').to.equal(0);
+				expect(persisted.address, 'at the same address').to.equal(
+					record().address
+				);
+				expect(persisted.timestamp, 'first seen time kept').to.equal(
+					record().timestamp
+				);
+				expect(
+					wallet.getUnconfirmedTransactions()[TXID]?.height,
+					'and observed again'
+				).to.equal(0);
+				expect(
+					announced(before),
+					'a transaction the wallet held is not news'
+				).to.have.length(0);
+			});
+		}
+
+		it('keeps it lost while the server still misses it', async function () {
+			serveWhile(() => false);
+			await wallet.checkUnconfirmedTransactions();
+			expect(wallet.transactions[TXID].exists, 'lost').to.equal(false);
+
+			// The history can lag the node, and still list a transaction the
+			// node replaced or evicted. Only a served answer brings it back.
+			const before = messages.length;
+			const res = await wallet.updateTransactions({});
+			expect(res.isOk(), 'the refresh ran').to.equal(true);
+
+			expect(wallet.transactions[TXID].exists, 'still lost').to.equal(false);
+			expect(savedTransactions()[TXID].exists).to.equal(false);
+			expect(messages.slice(before), 'and nothing was reported').to.have.length(
+				0
+			);
+		});
+
+		it('does not undo a clearing newer than its lookup', async function () {
+			// Still in the mempool when the refresh starts.
+			wallet.data.transactions[TXID] = mempoolRecord();
+			wallet.data.unconfirmedTransactions[TXID] = mempoolRecord();
+			let gone = false;
+			sinon
+				.stub(wallet.electrum, 'getTransactions')
+				.callsFake(async ({ txHashes }: { txHashes: ITxHash[] }) => {
+					// The refresh's lookup of its address history, whose entries
+					// carry a height. The node loses the transaction while it is in
+					// flight, and a check beside the refresh, such as the one a new
+					// header runs, clears it from that newer answer.
+					if (!gone && txHashes.some((h) => 'height' in h)) {
+						gone = true;
+						await wallet.checkUnconfirmedTransactions();
+						// Answered before the node lost it.
+						return lookupReply(...txHashes.map((h) => answer(h, true)));
+					}
+					return lookupReply(...txHashes.map((h) => answer(h, !gone)));
+				});
+
+			const res = await wallet.updateTransactions({});
+			expect(res.isOk(), 'the refresh ran').to.equal(true);
+
+			expect(
+				wallet.transactions[TXID].exists,
+				'the newer answer stands'
+			).to.equal(false);
+			expect(savedTransactions()[TXID].exists).to.equal(false);
+			expect(
+				messages.filter((m) => m.key === 'rbf'),
+				'the removal is reported once'
+			).to.have.length(1);
+		});
+
+		it('does not undo a clearing again newer than its lookup', async function () {
+			let served = false;
+			let lookups = 0;
+			sinon
+				.stub(wallet.electrum, 'getTransactions')
+				.callsFake(async ({ txHashes }: { txHashes: ITxHash[] }) => {
+					// The refresh's first lookup of its address history. While it
+					// is in flight, a second refresh, such as the one a rescan
+					// forces, finds the transaction back. Then the node loses it
+					// again, and a check clears it from that newer answer.
+					if (txHashes.some((h) => 'height' in h) && ++lookups === 1) {
+						await wallet.updateTransactions({});
+						expect(wallet.transactions[TXID].exists, 'back').to.equal(true);
+						served = false;
+						await wallet.checkUnconfirmedTransactions();
+						expect(wallet.transactions[TXID].exists, 'lost again').to.equal(
+							false
+						);
+						// Answered before the node lost it again.
+						return lookupReply(...txHashes.map((h) => answer(h, true)));
+					}
+					return lookupReply(...txHashes.map((h) => answer(h, served)));
+				});
+
+			// Already cleared when the refresh starts: its flag reads the same
+			// before and after its lookup.
+			await wallet.checkUnconfirmedTransactions();
+			expect(wallet.transactions[TXID].exists, 'lost').to.equal(false);
+
+			served = true;
+			const res = await wallet.updateTransactions({});
+			expect(res.isOk(), 'the refresh ran').to.equal(true);
+
+			expect(
+				wallet.transactions[TXID].exists,
+				'the newer answer stands'
+			).to.equal(false);
+			expect(savedTransactions()[TXID].exists).to.equal(false);
+			expect(
+				messages.filter((m) => m.key === 'rbf'),
+				'each removal is reported once'
+			).to.have.length(2);
+		});
+
+		it('keeps watching one a refresh finds back during its removal', async function () {
+			wallet.data.transactions[TXID] = mempoolRecord();
+			wallet.data.unconfirmedTransactions[TXID] = mempoolRecord();
+			let served = false;
+			serveWhile(() => served);
+			const save = wallet.saveWalletData.bind(wallet);
+			let refreshed = false;
+			const saveBesideRefresh = async (
+				key: keyof IWalletData,
+				data: IWalletData[keyof IWalletData]
+			): Promise<Result<string>> => {
+				const saving = save(key, data);
+				// The check's write of the cleared record. While it is in flight, a
+				// refresh reaches a server that serves the transaction, such as
+				// after a failover, and finds it back.
+				if (
+					key === 'transactions' &&
+					!refreshed &&
+					wallet.transactions[TXID].exists === false
+				) {
+					refreshed = true;
+					served = true;
+					await wallet.updateTransactions({});
+					expect(wallet.transactions[TXID].exists, 'back').to.equal(true);
+				}
+				return saving;
+			};
+			sinon.stub(wallet, 'saveWalletData').callsFake(saveBesideRefresh);
+
+			await wallet.checkUnconfirmedTransactions();
+			expect(wallet.transactions[TXID].exists, 'held').to.equal(true);
+			expect(
+				wallet.getUnconfirmedTransactions()[TXID],
+				'so still observed'
+			).to.not.equal(undefined);
+			expect(savedUnconfirmed()[TXID], 'as a restart reads it').to.not.equal(
+				undefined
+			);
+
+			// Lost again and gone from the history: only the observation can
+			// notice, and a held record nothing watches would stay pending.
+			served = false;
+			(wallet.electrum.getAddressHistory as sinon.SinonStub).resolves(ok([]));
+			const res = await wallet.updateTransactions({});
+			expect(res.isOk(), 'the refresh ran').to.equal(true);
+			expect(wallet.transactions[TXID].exists, 'lost again').to.equal(false);
+			expect(savedTransactions()[TXID].exists).to.equal(false);
+		});
 	});
 
 	/**

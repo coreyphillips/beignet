@@ -211,6 +211,11 @@ export class Wallet {
 	// outlasts two new blocks is final (issue #935). Memory only: a restart
 	// counts again from its own first miss, which only waits longer.
 	private readonly _noTxindexMisses: Map<string, number> = new Map();
+	// How often this session has set each transaction's exists flag to false,
+	// by txid. A refresh reads a cleared record as back only if no clearing
+	// came after its lookup went out. Never reset, so a count never repeats
+	// (issue #945).
+	private readonly _ghostClearings: Map<string, number> = new Map();
 	// The highest tip updateHeader has replaced. A failover to a server
 	// further behind lowers the tip, and that server may announce new blocks
 	// while it catches up to the one a transaction was mined in (issue #935).
@@ -3308,6 +3313,22 @@ export class Wallet {
 				return !((this.data.transactions[tx.tx_hash]?.height ?? 0) >= 6);
 			});
 		}
+		// Records the ghost path cleared before this lookup went out, with their
+		// clearing counts. Only these may be read as back below, and only if the
+		// count has not moved: a clearing that lands while the lookup is in
+		// flight, from a check beside this refresh, may rest on a newer answer
+		// than this one, so it stands, and the next refresh reads the record
+		// again if the transaction really is back. That holds for a record
+		// cleared again after a concurrent refresh found it back, whose flag
+		// alone looks unchanged (issue #945).
+		const clearedBeforeLookup = new Map(
+			filteredTxHashes
+				.filter((tx) => this.data.transactions[tx.tx_hash]?.exists === false)
+				.map((tx): [string, number] => [
+					tx.tx_hash,
+					this._ghostClearings.get(tx.tx_hash) ?? 0
+				])
+		);
 
 		const getTransactionsResponse = await this.electrum.getTransactions({
 			txHashes: filteredTxHashes
@@ -3349,8 +3370,15 @@ export class Wallet {
 		Object.keys(transactions).forEach((txid) => {
 			const stored = storedTransactions[txid];
 			const isNew = !stored;
-			//If the tx is new or the tx now has a block height (state changed to confirmed)
-			if (isNew || stored.height !== transactions[txid].height) {
+			// The ghost path leaves a cleared record at height 0, and a transaction
+			// back in the mempool returns at height 0 too, so only its exists flag
+			// changed. The server has just served it, so it is pending again
+			// (issue #945).
+			const returned =
+				stored?.exists === false &&
+				clearedBeforeLookup.get(txid) === (this._ghostClearings.get(txid) ?? 0);
+			//If the tx is new, was cleared and is back, or now has a different block height
+			if (isNew || returned || stored.height !== transactions[txid].height) {
 				formattedTransactions[txid] = {
 					...transactions[txid],
 					// Keep the previous timestamp if the tx is not new.
@@ -3796,6 +3824,10 @@ export class Wallet {
 			txIds.forEach((txId) => {
 				if (txId in transactions) {
 					transactions[txId]['exists'] = false;
+					this._ghostClearings.set(
+						txId,
+						(this._ghostClearings.get(txId) ?? 0) + 1
+					);
 					// A reorg'd out transaction no mempool took back is answered "no
 					// such transaction" rather than with no confirmations: by a server
 					// with a txindex always, and by electrs on a node without one for
@@ -3823,6 +3855,16 @@ export class Wallet {
 			// zero from now on, where its old copy would report the same reorg
 			// again on the next check.
 			const next = this.keepAddedMeanwhile(unconfirmedTxs, observed);
+			// A refresh that ran during the write above may have been served one
+			// of these ghosts, read it as back and watched it again. Its record no
+			// longer reads cleared, and dropping its entry would leave it held and
+			// unwatched, so a later loss would never show. The next check judges
+			// it again instead (issue #945).
+			for (const txId of txIds) {
+				const live = this.data.unconfirmedTransactions[txId];
+				const record = this.data.transactions[txId];
+				if (live && record && record.exists !== false) next[txId] = live;
+			}
 			this._data.unconfirmedTransactions = next;
 			// Their counted misses end here, with their observation, and not when
 			// the check found them: a ghost whose write failed above is still
@@ -5505,12 +5547,15 @@ export class Wallet {
 	}
 
 	/**
-	 * Sets "exists" to false for a given on-chain transaction id.
+	 * Sets "exists" to false for a given on-chain transaction id. A later
+	 * refresh that fetches the transaction again and gets it from the server
+	 * sets it back to true (issue #945).
 	 * @param {string} txid
 	 */
 	async addGhostTransaction({ txid }: { txid: string }): Promise<void> {
 		if (txid in this._data.transactions) {
 			this._data.transactions[txid].exists = false;
+			this._ghostClearings.set(txid, (this._ghostClearings.get(txid) ?? 0) + 1);
 		}
 		await this.saveWalletData('transactions', this._data.transactions);
 	}
