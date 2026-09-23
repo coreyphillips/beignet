@@ -210,8 +210,9 @@ export class Wallet {
 	// Raised by stop(). Work that outlived the shutdown, above all the refresh
 	// its deadline walked away from, must not undo the teardown.
 	private _stopped = false;
-	// Raised by stop() before it waits for the refresh in flight. A wallet
-	// shutting down owes no further scan, and one would only hold stop() up.
+	// Raised by stop() before it waits for the refresh in flight and the
+	// queued writes. A wallet shutting down owes no further scan, and one
+	// would only hold stop() up.
 	private _stopping = false;
 	// BIP32 account index as a path segment string ('0' by default).
 	private readonly _account: string;
@@ -752,10 +753,14 @@ export class Wallet {
 				if (this.isRefreshing) {
 					abandonedRefresh = !(await this._waitForRefresh(refreshTimeout));
 				}
-				abandonedWrites = await this._waitForWrites(
-					queuedWrites,
-					deadline - Date.now()
-				);
+				// Only with a write queued: with nothing to wait for, the teardown
+				// below runs in the same tick as the call, as it always has.
+				if (queuedWrites.length) {
+					abandonedWrites = await this._waitForWrites(
+						queuedWrites,
+						deadline - Date.now()
+					);
+				}
 			} finally {
 				// However the wait above ended, the teardown runs: a shutdown that
 				// leaves the socket and the message callback live is worse than one
@@ -953,7 +958,12 @@ export class Wallet {
 		force?: boolean;
 		onStart?: () => void;
 	} = {}): Promise<Result<IWalletData>> {
-		if (this._stopped) return err('Wallet stopped.');
+		// A stopping wallet starts no new body: one started while stop() waits
+		// on queued writes would only be abandoned mid-step by the teardown. A
+		// call made while a refresh is in flight still queues behind it, which
+		// is how stop() waits for one.
+		if (this._stopped || (this._stopping && !this.isRefreshing))
+			return err('Wallet stopped.');
 		if (onStart) this._refreshStartCallbacks.push(onStart);
 		if (this.isRefreshing && !force) {
 			this._refreshOwed = true;
@@ -3146,6 +3156,11 @@ export class Wallet {
 		return clone.toBase58();
 	}
 
+	// The newest write queued for each key. Each write waits for the one
+	// queued before it, so this one settles only after all of them, and it
+	// never rejects.
+	private savingOperations: Record<string, Promise<Result<string>>> = {};
+
 	/**
 	 * Saves the wallet data object to storage if able.
 	 *
@@ -3168,21 +3183,23 @@ export class Wallet {
 	 * @param {IWalletData[K]} data
 	 * @returns {Promise<Result<string>>}
 	 */
-	// The newest write queued for each key. Each write waits for the one
-	// queued before it, so this one settles only after all of them, and it
-	// never rejects.
-	private savingOperations: Record<string, Promise<Result<string>>> = {};
 	public async saveWalletData<K extends keyof IWalletData>(
 		key: TWalletDataKeys,
 		data: IWalletData[K]
 	): Promise<Result<string>> {
 		if (!this._setData) return ok('No setData method has been provided');
+		// Fixed now, not when the write's turn comes: switchNetwork moves the
+		// wallet to another network while a write may still be waiting, and
+		// that write carries the old network's data.
+		const walletDataKey = this.getWalletDataKey(key);
 		// With nothing queued for the key the write is issued in this same
 		// tick, so a stop() that follows the call cannot get in ahead of it.
 		const operation =
 			key in this.savingOperations
-				? this.savingOperations[key].then(() => this.writeWalletData(key, data))
-				: this.writeWalletData(key, data);
+				? this.savingOperations[key].then(() =>
+						this.writeWalletData(walletDataKey, data)
+				  )
+				: this.writeWalletData(walletDataKey, data);
 		this.savingOperations[key] = operation;
 		const saved = await operation;
 		// A newer write that queued behind this one owns the entry now.
@@ -3196,17 +3213,15 @@ export class Wallet {
 	 * Hands one write to the storage adapter, for saveWalletData once the
 	 * write's turn has come. Never rejects.
 	 * @private
-	 * @param {TWalletDataKeys} key
+	 * @param {string} walletDataKey The storage key, fixed when the write was issued.
 	 * @param {IWalletData[K]} data
 	 * @returns {Promise<Result<string>>}
 	 */
 	private async writeWalletData<K extends keyof IWalletData>(
-		key: TWalletDataKeys,
+		walletDataKey: string,
 		data: IWalletData[K]
 	): Promise<Result<string>> {
-		let walletDataKey: string = key;
 		try {
-			walletDataKey = this.getWalletDataKey(key);
 			// stop() clears the adapter on purpose, so that work it walked away
 			// from cannot write after it. A write still waiting its turn then
 			// was accepted and never made, and its caller has to hear that.

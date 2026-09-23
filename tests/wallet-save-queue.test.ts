@@ -305,11 +305,6 @@ describe('Wallet storage writes (#946)', function () {
 			'stop() behind a write that does not land'
 		);
 		expect(stopped.isOk(), 'the wallet stopped').to.equal(true);
-		if (stopped.isOk()) {
-			expect(stopped.value, 'the result names what was abandoned').to.include(
-				'writes to balance'
-			);
-		}
 
 		writes[0].land();
 		expect((await first).isOk(), 'the write in flight landed').to.equal(true);
@@ -321,6 +316,100 @@ describe('Wallet storage writes (#946)', function () {
 		}
 		expect(writes, 'the dropped write never reached storage').to.have.length(1);
 		expect(store.get(BALANCE_KEY)).to.equal(1);
+		// Checked last, so that the drop above is still pinned if stop()'s
+		// write wait regresses.
+		if (stopped.isOk()) {
+			expect(stopped.value, 'the result names what was abandoned').to.include(
+				'writes to balance'
+			);
+		}
+	});
+
+	// A write waiting its turn is stored under the key of the network it was
+	// issued on: switchNetwork changes the network before its awaits finish,
+	// and the queued data belongs to the old one.
+	it('keeps the storage key a queued write was issued under', async () => {
+		control.defer = true;
+		const first = settle(wallet.saveWalletData('balance', 1), 'write 1');
+		const second = settle(wallet.saveWalletData('balance', 2), 'write 2');
+		await flush();
+
+		const internals = wallet as unknown as { _network: EAvailableNetworks };
+		internals._network = EAvailableNetworks.testnet;
+		try {
+			writes[0].land();
+			expect((await first).isOk()).to.equal(true);
+			await flush();
+			// Only balance writes under the regtest key are held.
+			expect(writes, 'the queued write went to the regtest key').to.have.length(
+				2
+			);
+			writes[1].land();
+			expect((await second).isOk()).to.equal(true);
+		} finally {
+			internals._network = EAvailableNetworks.regtest;
+		}
+		expect(store.get(BALANCE_KEY)).to.equal(2);
+		expect(
+			store.has(`${NAME}-testnet-balance`),
+			'nothing landed under the new network'
+		).to.equal(false);
+	});
+
+	it('tears down in the same tick when no refresh or write is pending', async () => {
+		const internals = wallet as unknown as {
+			_stopped: boolean;
+			_setData?: unknown;
+		};
+		const stopping = wallet.stop({ refreshTimeout: 5000 });
+		expect(internals._stopped, 'stopped before the first await').to.equal(true);
+		expect(internals._setData, 'storage off before the first await').to.equal(
+			undefined
+		);
+		expect(wallet.disableMessages).to.equal(true);
+		const stopped = await withDeadline(stopping, 5000, 'stop()');
+		expect(stopped.isOk()).to.equal(true);
+	});
+
+	it('starts no refresh while stop() waits on queued writes', async () => {
+		control.defer = true;
+		const first = settle(wallet.saveWalletData('balance', 1), 'write 1');
+		await flush();
+		const runRefresh = sinon.spy(
+			wallet as unknown as { _runRefresh: () => unknown },
+			'_runRefresh'
+		);
+
+		let stopSettled = false;
+		const stopping = wallet.stop({ refreshTimeout: 5000 }).then((res) => {
+			stopSettled = true;
+			return res;
+		});
+		await flush();
+		expect(stopSettled, 'stop() is waiting on the write').to.equal(false);
+
+		let started = false;
+		const refreshed = await withDeadline(
+			wallet.refreshWallet({
+				onStart: () => {
+					started = true;
+				}
+			}),
+			1000,
+			'a refresh during the write wait'
+		);
+		expect(refreshed.isErr(), 'the refresh was refused').to.equal(true);
+		if (refreshed.isErr()) {
+			expect(refreshed.error.message).to.equal('Wallet stopped.');
+		}
+		expect(runRefresh.callCount, 'no refresh body ran').to.equal(0);
+		expect(started, 'onStart was not called').to.equal(false);
+
+		writes[0].land();
+		expect((await withDeadline(stopping, 5000, 'stop()')).isOk()).to.equal(
+			true
+		);
+		expect((await first).isOk()).to.equal(true);
 	});
 
 	it('lets writes queued before stop() land when they do so inside the deadline', async () => {
