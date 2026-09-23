@@ -708,6 +708,18 @@ export class Electrum {
 				lastError = String(startResponse.error);
 				continue;
 			}
+			// disconnect() may have landed during the dial. It released this
+			// instance's hold and withdrew it from the routers, and it does not
+			// wait for the attempt it interrupted, so recording the server now
+			// would put a stopped instance back into connectedServers, where
+			// isOurPeer would keep vouching for the peer on behalf of a wallet
+			// that has stopped, with nothing left to release the entry. The
+			// socket the dial built is taken back down and nothing is recorded:
+			// the candidate did connect, so it is not charged a failure either.
+			if (this._disconnected) {
+				await electrum.stop({ network: electrumNetwork });
+				return err(DISCONNECTED_ERROR);
+			}
 			this.recordServerSuccess(candidate, electrumNetwork);
 			connected = true;
 			break;
@@ -770,7 +782,13 @@ export class Electrum {
 		// stopped. Take it back down, and announce nothing: disconnect()
 		// publishes nothing itself, and a connected event for a stopped wallet
 		// is a lie its consumers act on.
+		// The hold is released as well. The candidate loop records a server
+		// only after it saw the flag clear, so nothing should be held here
+		// today, but an await that lands between that record and this check
+		// would let disconnect() slip in after the record, and a hold that
+		// outlives disconnect() is released by nobody.
 		if (this._disconnected) {
+			this.holdConnectedServer(null, null);
 			await electrum.stop({ network: electrumNetwork });
 			return err(DISCONNECTED_ERROR);
 		}

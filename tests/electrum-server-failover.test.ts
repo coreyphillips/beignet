@@ -2614,6 +2614,70 @@ describe('Electrum lifecycle and disconnect races', () => {
 		).to.be.greaterThan(0);
 	});
 
+	it('records nothing for a connect that finishes after disconnect() (#979)', async () => {
+		await electrum.connectToElectrum({ servers: serverA });
+		await flush();
+		// The connect is inside electrum.start() when the wallet stops, and
+		// disconnect() does not wait for it.
+		const dial = createGate();
+		let dials = 0;
+		(electrumHelpers.start as sinon.SinonStub).callsFake(
+			async ({
+				network,
+				customPeers
+			}: {
+				network: string;
+				customPeers: TServer[];
+			}) => {
+				dials += 1;
+				if (dials === 1) await dial.promise;
+				const server = customPeers[0];
+				const protocol = server.protocol;
+				const port = protocol === EProtocol.ssl ? server.ssl : server.tcp;
+				connectionEvents.push(`connect:${server.host}`);
+				client.peer = { host: server.host, port, protocol };
+				return { error: false, data: client.peer, network };
+			}
+		);
+
+		const connecting = electrum.connectToElectrum({ servers: serverB });
+		try {
+			await flush();
+			expect(dials, 'the candidate is parked in the dial').to.equal(1);
+			await electrum.disconnect();
+		} finally {
+			dial.release();
+		}
+		const result = await connecting;
+		await flush();
+
+		expect(
+			result.isErr(),
+			'a connect that finished after disconnect() has not connected'
+		).to.equal(true);
+		expect(
+			(electrum as unknown as { _heldServer: unknown })._heldServer,
+			'and it must not hold the server it dialled'
+		).to.equal(null);
+
+		// A sibling on the same network finds that peer on the shared client.
+		// Nobody left in this process chose it, so the sibling must treat it
+		// as a stray dial and redial its own server rather than accept a peer
+		// only a stopped instance vouches for.
+		const other = createElectrum(sinon.spy(), sinon.spy(), 'cccc');
+		other.servers = [serverB];
+		client.peer = { host: serverB.host, port: serverB.ssl, protocol: 'ssl' };
+		connectionEvents.length = 0;
+
+		await pollConnection(other);
+		await flush();
+
+		expect(
+			connectionEvents.filter((event) => event.startsWith('connect:')),
+			'the stopped instance must no longer vouch for the peer'
+		).to.deep.equal([`connect:${serverB.host}`]);
+	});
+
 	it('lets a sibling discharge the debt a failed restore left (#499)', async () => {
 		const other = createElectrum(sinon.spy(), sinon.spy(), 'cccc');
 		await electrum.connectToElectrum({ servers: serverA });
