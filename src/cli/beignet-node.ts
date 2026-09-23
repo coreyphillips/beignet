@@ -9751,22 +9751,12 @@ export class BeignetNode extends EventEmitter {
 				/* bolt11 is malformed — use defaults */
 			}
 
-			// Return persisted record if available. The in-memory record is
-			// pruned 24 hours after completion (oldest first past the size cap)
-			// while the durable row stays, and the engine refuses to pay a hash
-			// whose row says it was paid (#975), so a refused re-send of a
-			// pruned paid invoice answers with its COMPLETED record rather than
-			// a synthetic failure. A row that cannot be read (the database is
-			// closed) is no record: this method never throws.
+			// Return persisted record if available: the in-memory one, or for
+			// a duplicate refusal the durable row the engine refused from.
 			if (hashHex !== 'unknown') {
-				const existing = this.getPayment(hashHex);
+				const existing =
+					this.getPayment(hashHex) ?? this.durablePaymentFor(err, hashHex);
 				if (existing) return existing;
-				try {
-					const durable = this.storage.loadPayment(hashHex);
-					if (durable) return this.toPaymentInfo(durable);
-				} catch {
-					/* fall through to the synthetic record */
-				}
 			}
 
 			const message = err instanceof Error ? err.message : String(err);
@@ -9809,7 +9799,9 @@ export class BeignetNode extends EventEmitter {
 
 				// Don't retry permanent failures
 				if (!isRetryableError(err)) {
-					const pi = this.getPayment(paymentHashHex);
+					const pi =
+						this.getPayment(paymentHashHex) ??
+						this.durablePaymentFor(err, paymentHashHex);
 					if (pi) return { ...pi, attempts: attempt };
 					return {
 						paymentHash: paymentHashHex,
@@ -10173,6 +10165,33 @@ export class BeignetNode extends EventEmitter {
 		const p = this.node.getPayment(Buffer.from(paymentHash, 'hex'));
 		if (!p) return null;
 		return this.toPaymentInfo(p);
+	}
+
+	/**
+	 * The durable record behind a DUPLICATE_PAYMENT refusal whose in-memory
+	 * record is gone (issue #975). The in-memory record is pruned 24 hours
+	 * after completion (oldest first past the size cap) while the row stays,
+	 * and the engine refuses to pay a hash whose row says it was paid, so a
+	 * refused re-send of a pruned paid invoice answers with its COMPLETED
+	 * record rather than a synthetic failure. Null for any other error: a
+	 * fresh NO_ROUTE or FEE_EXCEEDS_MAX on a hash with a days-old FAILED row
+	 * is this attempt's outcome, and the row is an earlier attempt's. A row
+	 * that cannot be read (the database is closed) is no record, so the safe
+	 * callers still never throw.
+	 */
+	private durablePaymentFor(err: unknown, hashHex: string): PaymentInfo | null {
+		if (
+			!(err instanceof BeignetError) ||
+			err.code !== BeignetErrorCode.DUPLICATE_PAYMENT
+		) {
+			return null;
+		}
+		try {
+			const durable = this.storage.loadPayment(hashHex);
+			return durable ? this.toPaymentInfo(durable) : null;
+		} catch {
+			return null;
+		}
 	}
 
 	/** Settled forwards, newest first. Msat values as strings (JSON-safe). */

@@ -853,6 +853,12 @@ export class LightningNode extends EventEmitter {
 	// rows remain, and the payee and every hop can know the preimage, so a
 	// keysend or an invoice on the hash would write over the row.
 	private prunedOutgoingHashes: Set<string> = new Set();
+	// The PAID subset of those (COMPLETED, or FAILED with the preimage
+	// recorded). The senders refuse these after the record and preimage are
+	// gone (issue #975): the durable row answers on a node with storage, this
+	// set on one without. A pruned FAILED hash is not here: it stays
+	// retryable.
+	private prunedCompletedOutgoingHashes: Set<string> = new Set();
 	private scidToChannelId: Map<string, Buffer> = new Map();
 	private htlcPaymentMap: Map<string, string> = new Map(); // "channelId:htlcId" → paymentHash hex
 	// For forwarded HTLCs: maps "outChannelId:outHtlcId" → { inChannelId, inHtlcId }
@@ -10143,6 +10149,7 @@ export class LightningNode extends EventEmitter {
 		this.preimages.clear();
 		this.prunedKeysendHashes.clear();
 		this.prunedOutgoingHashes.clear();
+		this.prunedCompletedOutgoingHashes.clear();
 		this.paymentSecrets.clear();
 		this.invoices.clear();
 		this.scidToChannelId.clear();
@@ -10264,6 +10271,12 @@ export class LightningNode extends EventEmitter {
 			}
 			if (payment.direction === PaymentDirection.OUTGOING) {
 				this.prunedOutgoingHashes.add(hash);
+				if (
+					payment.status === PaymentStatus.COMPLETED ||
+					payment.preimage !== undefined
+				) {
+					this.prunedCompletedOutgoingHashes.add(hash);
+				}
 			}
 			pruned++;
 		};
@@ -15438,7 +15451,10 @@ export class LightningNode extends EventEmitter {
 
 		// Payment deduplication (Fix 1.4, widened by issue #975): a hash whose
 		// payment completed, or that still has an HTLC out, is not paid again.
-		this.assertHashUnpaid(invoice.paymentHash);
+		// Early and direction-agnostic (a PENDING record of either direction
+		// refuses, as it always has); sendPaymentToRoute repeats the check as
+		// the guarantee on the route, and MPP dispatch runs only after this.
+		this.assertHashUnpaid(invoice.paymentHash, 'any-pending');
 		const dedupHashHex = invoice.paymentHash.toString('hex');
 
 		// Absolute outgoing expiry ceiling (issue #737). A retry re-enters here
@@ -15725,6 +15741,23 @@ export class LightningNode extends EventEmitter {
 		if (route.hops.length === 0) {
 			throw new Error('Route must have at least one hop');
 		}
+
+		// The guarantee behind the senders' early refusal, and the only check
+		// on the explicit-route entry (POST /payment/send-to-route): a paid
+		// hash, or one with an HTLC out, is not paid again (issue #975). Only
+		// an OUTGOING PENDING record counts as in flight here: a circular
+		// rebalance sends to its own fresh invoice, whose record is INCOMING
+		// PENDING. A part of an MPP set (total_msat above what the final hop
+		// receives) joins the parts already out for the hash, so nothing
+		// counts as in flight for it; a paid hash refuses a part all the same.
+		const finalAmountMsat =
+			route.hops[route.hops.length - 1].amountToForwardMsat;
+		this.assertHashUnpaid(
+			paymentHash,
+			totalMsat !== undefined && totalMsat > finalAmountMsat
+				? 'mpp-part'
+				: 'outgoing-pending'
+		);
 
 		// BOLT 4 self-introduction (issue #550): a blinded path can name US as
 		// its introduction node; the routine case is an unannounced node's
@@ -26815,7 +26848,7 @@ export class LightningNode extends EventEmitter {
 		// completed, or that still has an HTLC out, is not paid again (issue
 		// #975), and a second dispatch for a hash still in flight would fight
 		// the first attempt's retry context and in-flight record.
-		this.assertHashUnpaid(invoice.paymentHash);
+		this.assertHashUnpaid(invoice.paymentHash, 'any-pending');
 
 		const destination = invoice.nodeId;
 		const amountMsat = invoice.amount;
@@ -27396,13 +27429,38 @@ export class LightningNode extends EventEmitter {
 	 *   update_fail_htlc, before the removal round completes, and a peer
 	 *   that failed an HTLC cannot fulfil it, so refusing there would refuse
 	 *   every retry;
-	 * - completed, from the durable row: the in-memory record and preimage
-	 *   are pruned 24 hours after completion (and oldest first past the size
-	 *   cap), while storage keeps the row. One synchronous read per send;
-	 *   only an OUTGOING row that is COMPLETED or carries a preimage counts,
-	 *   as for the payment queue's resolver (#967).
+	 * - completed, after a prune: the in-memory record and preimage are
+	 *   pruned 24 hours after completion (and oldest first past the size
+	 *   cap). A node without storage remembers the pruned paid hashes in
+	 *   prunedCompletedOutgoingHashes; a node with storage still has the
+	 *   row, read below;
+	 * - completed, from storage: an OUTGOING row that is COMPLETED, carries
+	 *   a preimage, or has a preimage row beside it. The preimage row is
+	 *   committed first and SafetyCritical, so a settle whose record commit
+	 *   failed leaves the row next to a PENDING record. Only an OUTGOING row
+	 *   consults it: the preimage store also holds this node's own
+	 *   invoices' preimages, as for the payment queue's resolver (#967).
+	 *   Two synchronous reads at most per send. A read that throws (the
+	 *   database is closed) fails the send closed with a plain Error: a send
+	 *   that cannot check its record must not go out.
+	 *
+	 * `inFlight` says what counts as in flight, the completed rules being
+	 * the same for every caller:
+	 * - 'any-pending': an outstanding HTLC, or a PENDING record of either
+	 *   direction. sendPayment and payBolt12Invoice, the rule they always
+	 *   had (createInvoice's INCOMING PENDING record refuses a payment to
+	 *   this node's own invoice);
+	 * - 'outgoing-pending': an outstanding HTLC, or an OUTGOING PENDING
+	 *   record. A single-part sendPaymentToRoute, which a circular rebalance
+	 *   calls with its own fresh invoice;
+	 * - 'mpp-part': nothing. A part of an MPP set sent through
+	 *   sendPaymentToRoute joins the sibling parts already out for the hash,
+	 *   which is what an HTLC set is (BOLT 4).
 	 */
-	private assertHashUnpaid(paymentHash: Buffer): void {
+	private assertHashUnpaid(
+		paymentHash: Buffer,
+		inFlight: 'any-pending' | 'outgoing-pending' | 'mpp-part'
+	): void {
 		const hashHex = paymentHash.toString('hex');
 		const completed = (): LightningPaymentError =>
 			new LightningPaymentError(
@@ -27410,26 +27468,48 @@ export class LightningNode extends EventEmitter {
 				'Payment already completed for this invoice'
 			);
 		const view = this.getOutgoingHtlcs(paymentHash);
-		if (view.preimage || view.status === PaymentStatus.COMPLETED) {
+		if (
+			view.preimage ||
+			view.status === PaymentStatus.COMPLETED ||
+			this.prunedCompletedOutgoingHashes.has(hashHex)
+		) {
 			throw completed();
 		}
 		const existingPayment = this.payments.get(hashHex);
 		if (
-			view.htlcs.some(
+			inFlight !== 'mpp-part' &&
+			(view.htlcs.some(
 				(h) => h.state === 'offered' || h.state === 'onchain-pending'
 			) ||
-			existingPayment?.status === PaymentStatus.PENDING
+				(existingPayment?.status === PaymentStatus.PENDING &&
+					(inFlight === 'any-pending' ||
+						existingPayment.direction === PaymentDirection.OUTGOING)))
 		) {
 			throw new LightningPaymentError(
 				LightningErrorCode.DUPLICATE_PAYMENT,
 				'Payment already in flight for this invoice'
 			);
 		}
-		const durable = this.storage?.loadPayment(hashHex);
+		if (!this.storage) return;
+		let durable: IPaymentInfo | null;
+		let durablePreimage: Buffer | null = null;
+		try {
+			durable = this.storage.loadPayment(hashHex);
+			if (durable?.direction === PaymentDirection.OUTGOING) {
+				durablePreimage = this.storage.loadPreimage(hashHex);
+			}
+		} catch (err) {
+			throw new Error(
+				`payment record could not be read: ${
+					err instanceof Error ? err.message : String(err)
+				}`
+			);
+		}
 		if (
 			durable?.direction === PaymentDirection.OUTGOING &&
 			(durable.status === PaymentStatus.COMPLETED ||
-				durable.preimage !== undefined)
+				durable.preimage !== undefined ||
+				durablePreimage !== null)
 		) {
 			throw completed();
 		}

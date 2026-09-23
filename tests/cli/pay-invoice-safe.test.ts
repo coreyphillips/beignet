@@ -12,7 +12,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { BeignetNode } from '../../src/cli/beignet-node';
 import { BeignetError, BeignetErrorCode } from '../../src/cli/errors';
-import { PaymentInfo } from '../../src/cli/types';
+import { PaymentInfo, RouteHop } from '../../src/cli/types';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
 import {
 	DEFAULT_MIN_FINAL_CLTV_EXPIRY,
@@ -221,11 +222,26 @@ const invoiceFrom = (
 	};
 };
 
+/** The BeignetError a rejected promise carries, or undefined when it resolved. */
+const rejection = async (
+	run: () => Promise<unknown>
+): Promise<BeignetError | undefined> => {
+	try {
+		await run();
+		return undefined;
+	} catch (err) {
+		expect(err).to.be.instanceOf(BeignetError);
+		return err as BeignetError;
+	}
+};
+
 /**
  * Issue #975: the engine refuses to pay a hash whose durable OUTGOING row
  * says it was paid, and the in-memory record is pruned 24 hours after
  * completion while that row stays. payInvoiceSafe used to answer such a
- * refusal with a synthetic FAILED record, since it read memory only.
+ * refusal with a synthetic FAILED record, since it read memory only. The
+ * durable row answers only a DUPLICATE_PAYMENT refusal: for any other
+ * failure it is an earlier attempt's history, not this one's outcome.
  */
 describe('payInvoiceSafe answers a pruned paid hash with its durable record (issue #975)', function () {
 	this.timeout(30_000);
@@ -251,8 +267,11 @@ describe('payInvoiceSafe answers a pruned paid hash with its durable record (iss
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	});
 
-	it('returns the COMPLETED record, preimage included, when only storage holds it', async () => {
-		const { bolt11, paymentHash, preimage } = invoiceFrom('pruned paid');
+	/** A paid OUTGOING row in storage alone, as the prune leaves it. */
+	const seedPaidRow = (
+		description: string
+	): { bolt11: string; hashHex: string; preimage: Buffer } => {
+		const { bolt11, paymentHash, preimage } = invoiceFrom(description);
 		const hashHex = paymentHash.toString('hex');
 		node.getStorage().savePayment(hashHex, {
 			paymentHash,
@@ -264,6 +283,17 @@ describe('payInvoiceSafe answers a pruned paid hash with its durable record (iss
 			completedAt: Date.now() - 1_000
 		});
 		expect(node.getPayment(hashHex), 'memory holds nothing').to.equal(null);
+		return { bolt11, hashHex, preimage };
+	};
+
+	it('returns the COMPLETED record, preimage included, when only storage holds it', async () => {
+		const { bolt11, hashHex, preimage } = seedPaidRow('pruned paid');
+
+		// The engine refuses from the row (before the fix the send went out,
+		// failing here for want of a route), and payInvoiceSafe answers the
+		// refusal with the row.
+		const refused = await rejection(() => node.payInvoice(bolt11, 2_000));
+		expect(refused?.code).to.equal(BeignetErrorCode.DUPLICATE_PAYMENT);
 
 		const result = await node.payInvoiceSafe(bolt11, 2_000);
 		expect(result.paymentHash).to.equal(hashHex);
@@ -271,6 +301,60 @@ describe('payInvoiceSafe answers a pruned paid hash with its durable record (iss
 		expect(result.direction).to.equal('OUTGOING');
 		expect(result.preimage).to.equal(preimage.toString('hex'));
 		expect(result.failureDescription).to.equal(undefined);
+	});
+
+	it('answers a fresh NO_ROUTE with the synthetic record, not a stale FAILED row', async () => {
+		const { bolt11, paymentHash } = invoiceFrom('stale failure');
+		const hashHex = paymentHash.toString('hex');
+		const staleCreatedAt = Date.now() - 3 * 86_400_000;
+		node.getStorage().savePayment(hashHex, {
+			paymentHash,
+			amountMsat: 1_000_000n,
+			status: PaymentStatus.FAILED,
+			direction: PaymentDirection.OUTGOING,
+			failureReason: 'stale: an earlier attempt, days ago',
+			createdAt: staleCreatedAt,
+			completedAt: staleCreatedAt + 1_000
+		});
+
+		const result = await node.payInvoiceSafe(bolt11, 2_000);
+		expect(result.status).to.equal('FAILED');
+		expect(result.failureDescription ?? '').to.match(/^\[NO_ROUTE\]/);
+		expect(result.failureDescription ?? '').to.not.include('stale');
+		expect(result.createdAt).to.be.greaterThan(staleCreatedAt + 86_400_000);
+	});
+
+	it('payInvoiceWithRetry returns the COMPLETED record for a pruned paid hash', async () => {
+		const { bolt11, hashHex, preimage } = seedPaidRow('retry paid');
+		const result = await node.payInvoiceWithRetry(bolt11, { maxRetries: 0 });
+		expect(result.paymentHash).to.equal(hashHex);
+		expect(result.status).to.equal('COMPLETED');
+		expect(result.preimage).to.equal(preimage.toString('hex'));
+		expect(result.attempts).to.equal(1);
+	});
+
+	it('sendToRoute refuses a pruned paid hash with DUPLICATE_PAYMENT', () => {
+		const { hashHex } = seedPaidRow('route paid');
+		const hop: RouteHop = {
+			pubkey: getPublicKey(crypto.randomBytes(32)).toString('hex'),
+			shortChannelId: '500x1x0',
+			amountToForwardMsat: '1000000',
+			outgoingCltvValue: 40,
+			feeMsat: '0',
+			cltvExpiryDelta: 40
+		};
+		// Before the fix this reached the channel lookup (NO_CHANNEL_TO_HOP
+		// here, a second HTLC on a node with the channel).
+		let thrown: unknown;
+		try {
+			node.sendToRoute(hashHex, { hops: [hop] });
+		} catch (err) {
+			thrown = err;
+		}
+		expect(thrown).to.be.instanceOf(BeignetError);
+		expect((thrown as BeignetError).code).to.equal(
+			BeignetErrorCode.DUPLICATE_PAYMENT
+		);
 	});
 
 	it('still returns a synthetic FAILED record for a hash nothing knows', async () => {
