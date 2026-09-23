@@ -673,8 +673,10 @@ describe('Restored queue entries wait for a channel that can carry an HTLC (issu
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	});
 
-	/** A restored channel waiting on its peer's channel_reestablish. */
-	const injectReestablishingChannel = (): Channel => {
+	/** A restored channel, by default waiting on its peer's channel_reestablish. */
+	const injectReestablishingChannel = (
+		initial: ChannelState = ChannelState.AWAITING_REESTABLISH
+	): Channel => {
 		const seed = crypto.randomBytes(32);
 		const basepoint = (i: number): Buffer =>
 			getPublicKey(
@@ -700,7 +702,7 @@ describe('Restored queue entries wait for a channel that can carry an HTLC (issu
 			localPerCommitmentSeed: seed
 		});
 		state.channelId = crypto.randomBytes(32);
-		state.state = ChannelState.AWAITING_REESTABLISH;
+		state.state = initial;
 		state.fundingTxid = crypto.randomBytes(32);
 		state.localBalanceMsat = 900_000_000n;
 		state.remoteBalanceMsat = 100_000_000n;
@@ -810,8 +812,157 @@ describe('Restored queue entries wait for a channel that can carry an HTLC (issu
 		await settle();
 		expect(node.listenerCount('channel:usable')).to.equal(before + 1);
 		await node.destroy();
-		expect(node.listenerCount('channel:usable')).to.equal(0);
+		expect(node.eventNames()).to.deep.equal([]);
 		expect(runs).to.equal(0);
+	});
+
+	const setState = (channel: Channel, state: ChannelState): void => {
+		(channel as unknown as { _state: { state: ChannelState } })._state.state =
+			state;
+	};
+
+	const seedQueued = (id: string, bolt11: string): void =>
+		node.getStorage().saveQueueEntry({
+			id,
+			bolt11,
+			priority: 5,
+			status: 'queued',
+			createdAt: Date.now() - 1_000
+		});
+
+	// Review round 2 (C2): the channel manager reports a reestablish only for
+	// a channel that can settle HTLCs, and a splice lock only as
+	// splice:complete. A channel still SPLICING at the reestablish, or a
+	// taproot one parked until splice_locked, never announced itself.
+	it('a channel still SPLICING at the start releases the restored row when its splice locks, with no enqueue', async () => {
+		const channel = injectReestablishingChannel(ChannelState.SPLICING);
+		expect(channel.acceptsNewHtlcs()).to.equal(false);
+		const invoice = invoiceFrom('restored behind a splice');
+		seedQueued('q-1-splice', invoice.bolt11);
+		const payCalls = stubPayInvoiceSafe(node);
+
+		node.listQueue();
+		await settle(200);
+		expect(payCalls).to.deep.equal([]);
+
+		setState(channel, ChannelState.NORMAL);
+		node.getNode().emit('splice:complete', {
+			channelId: channel.getChannelId(),
+			fundingTxid: channel.getFullState().fundingTxid
+		});
+
+		expect((await queueEntryOnceFinal(node, 'q-1-splice')).status).to.equal(
+			'completed'
+		);
+		expect(payCalls).to.deep.equal([invoice.bolt11]);
+	});
+
+	it('a funding quarantine lifting releases the restored row, with no enqueue', async () => {
+		const channel = injectReestablishingChannel(ChannelState.NORMAL);
+		(
+			channel as unknown as { _state: { fundingUnaccounted?: boolean } }
+		)._state.fundingUnaccounted = true;
+		expect(channel.acceptsNewHtlcs()).to.equal(false);
+		const invoice = invoiceFrom('restored behind a quarantine');
+		seedQueued('q-1-quarantine', invoice.bolt11);
+		const payCalls = stubPayInvoiceSafe(node);
+
+		node.listQueue();
+		await settle(200);
+		expect(payCalls).to.deep.equal([]);
+
+		(
+			node.getNode() as unknown as {
+				liftFundingMissingHold: (channelId: Buffer) => void;
+			}
+		).liftFundingMissingHold(channel.getChannelId()!);
+
+		expect((await queueEntryOnceFinal(node, 'q-1-quarantine')).status).to.equal(
+			'completed'
+		);
+		expect(payCalls).to.deep.equal([invoice.bolt11]);
+	});
+
+	// Review round 2 (C3): a closed channel counted as one that might yet
+	// become usable, so a node whose only channel was closing waited for
+	// good, and an interrupted payment needed no channel to settle.
+	it('with only a FORCE_CLOSED channel, an interrupted payment settles against the durable record at once', async () => {
+		injectReestablishingChannel(ChannelState.FORCE_CLOSED);
+		const paid = invoiceFrom('paid before the channel closed');
+		const storage = node.getStorage();
+		const hashHex = paid.paymentHash.toString('hex');
+		storage.savePayment(hashHex, {
+			paymentHash: paid.paymentHash,
+			preimage: paid.preimage,
+			amountMsat: 1_000_000n,
+			status: PaymentStatus.COMPLETED,
+			direction: PaymentDirection.OUTGOING,
+			createdAt: Date.now() - 2_000,
+			completedAt: Date.now() - 1_000
+		});
+		storage.saveQueueEntry({
+			id: 'q-1-closed',
+			bolt11: paid.bolt11,
+			priority: 5,
+			status: 'dispatching',
+			createdAt: Date.now() - 2_000
+		});
+		const payCalls = stubPayInvoiceSafe(node);
+
+		node.listQueue();
+		expect((await queueEntryOnceFinal(node, 'q-1-closed')).status).to.equal(
+			'completed'
+		);
+		expect(payCalls).to.deep.equal([]);
+	});
+
+	it('a wait for a usable channel ends once the last live channel closes', async () => {
+		const channel = injectReestablishingChannel();
+		const invoice = invoiceFrom('restored, channel then closes');
+		seedQueued('q-1-last-close', invoice.bolt11);
+		const payCalls = stubPayInvoiceSafe(node);
+
+		node.listQueue();
+		await settle(200);
+		expect(payCalls).to.deep.equal([]);
+
+		setState(channel, ChannelState.FORCE_CLOSED);
+		node.getNode().emit('channel:force-closing', {
+			channelId: channel.getChannelId(),
+			initiator: 'remote'
+		});
+
+		// No live channel is left, so the queue starts and the payment fails
+		// (here: the stub completes it) on its own terms.
+		expect((await queueEntryOnceFinal(node, 'q-1-last-close')).status).to.equal(
+			'completed'
+		);
+		expect(payCalls).to.deep.equal([invoice.bolt11]);
+	});
+
+	// Review round 2 (P3).
+	it('announces no channel:usable while a capsule restore rebuilds the node', async () => {
+		const channel = injectReestablishingChannel(ChannelState.NORMAL);
+		let usable = 0;
+		node.on('channel:usable', () => usable++);
+		const flags = node as unknown as { _resuming: boolean };
+		flags._resuming = true;
+		try {
+			node
+				.getNode()
+				.getChannelManager()
+				.emit('channel:reestablished', channel.getChannelId());
+			await settle();
+			expect(usable).to.equal(0);
+		} finally {
+			flags._resuming = false;
+		}
+		node
+			.getNode()
+			.getChannelManager()
+			.emit('channel:reestablished', channel.getChannelId());
+		await settle();
+		expect(usable).to.equal(1);
 	});
 });
 

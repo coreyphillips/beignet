@@ -1309,8 +1309,9 @@ export interface BeignetNodeEvents {
 	'channel:ready': (data: { channelId: string }) => void;
 	/**
 	 * The channel can take a new HTLC again: it reached NORMAL on
-	 * channel_ready, or finished reestablishing on a reconnect. Fires on every
-	 * reconnect. The payment queues start and retry on it (issue #967).
+	 * channel_ready, finished reestablishing on a reconnect, a splice locked
+	 * or unwound, or its funding quarantine lifted. Fires on every reconnect.
+	 * The payment queues start and retry on it (issue #967).
 	 */
 	'channel:usable': (data: { channelId: string }) => void;
 	'channel:pending-close': (data: {

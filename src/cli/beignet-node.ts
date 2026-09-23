@@ -161,6 +161,7 @@ import {
 	SpliceRefusalCode,
 	IHoldCancelledEvent,
 	IHoldInvoiceStateEvent,
+	IStructuredLog,
 	PaymentDirection,
 	PaymentStatus
 } from '../lightning/node/types';
@@ -171,6 +172,8 @@ import {
 	isAnchorChannel,
 	ChannelState
 } from '../lightning/channel/types';
+import { isRecencyUnproven } from '../lightning/channel/channel-state';
+import type { Channel } from '../lightning/channel/channel';
 import { decode as decodeInvoice } from '../lightning/invoice/decode';
 import { decodeOffer } from '../lightning/offer/decode';
 import {
@@ -1427,6 +1430,37 @@ function isHeldRestore(ch: {
 		ch.restoreRevokedRisk === true
 	);
 }
+
+/** States a channel never takes a new HTLC from again. */
+const CLOSING_CHANNEL_STATES: ReadonlySet<ChannelState> = new Set([
+	ChannelState.SHUTTING_DOWN,
+	ChannelState.NEGOTIATING_CLOSING,
+	ChannelState.CLOSED,
+	ChannelState.FORCE_CLOSED,
+	ChannelState.ERRORED
+]);
+
+/**
+ * Whether a channel can still come to take a new HTLC (issue #967): one that
+ * is closing, closed or failed cannot, looked through a pending reestablish,
+ * and neither can one under a recency hold, which ends only in a close.
+ */
+function canBecomeUsable(channel: Channel): boolean {
+	const st = channel.getFullState();
+	const effective =
+		st.state === ChannelState.AWAITING_REESTABLISH && st.preReestablishState
+			? st.preReestablishState
+			: st.state;
+	return !CLOSING_CHANNEL_STATES.has(effective) && !isRecencyUnproven(st);
+}
+
+/**
+ * Private trigger for the pay-readiness wait: a channel closed, failed or
+ * went away, so "no live channel left" may now hold (issue #967). A symbol,
+ * so it is no public event, and shutdown's removeAllListeners() takes its
+ * listeners with the rest.
+ */
+const CHANNELS_CHANGED = Symbol('channels-changed');
 
 /**
  * The refusal an operator force close of a capsule-restored channel gets
@@ -2694,21 +2728,19 @@ export class BeignetNode extends EventEmitter {
 		// node:ready fires once the peers' init handshakes are done, before
 		// any reestablish, so the payment queues wait for this instead.
 		const usableNode = this.node;
-		const announceUsable = (channelId: Buffer): void => {
-			// Out of the channel manager's dispatch turn: a payment the event
-			// releases must not be sent from inside the message handler that
-			// is still finishing the reestablish.
+		// Out of the channel manager's dispatch turn: a payment the event
+		// releases must not be sent from inside the message handler that is
+		// still finishing the reestablish or the splice lock.
+		const deferEmit = (emit: () => void): void => {
 			setImmediate(() => {
-				if (this.destroyed || this.node !== usableNode) return;
+				if (this.destroyed || this._resuming || this.node !== usableNode) {
+					return;
+				}
 				try {
-					const channel = usableNode.getChannelManager().getChannel(channelId);
-					if (!channel?.acceptsNewHtlcs()) return;
-					this.emit('channel:usable', {
-						channelId: channelId.toString('hex')
-					});
+					emit();
 				} catch (err: unknown) {
 					try {
-						this.log('warn', 'A channel:usable listener failed', {
+						this.log('warn', 'A payment-readiness listener failed', {
 							error: err instanceof Error ? err.message : String(err)
 						});
 					} catch {
@@ -2718,6 +2750,12 @@ export class BeignetNode extends EventEmitter {
 				}
 			});
 		};
+		const announceUsable = (channelId: Buffer): void =>
+			deferEmit(() => {
+				const channel = usableNode.getChannelManager().getChannel(channelId);
+				if (!channel?.acceptsNewHtlcs()) return;
+				this.emit('channel:usable', { channelId: channelId.toString('hex') });
+			});
 		this.node.on('channel:ready', (data: { channelId: Buffer }) =>
 			announceUsable(data.channelId)
 		);
@@ -2726,6 +2764,39 @@ export class BeignetNode extends EventEmitter {
 			.on('channel:reestablished', (channelId: Buffer) =>
 				announceUsable(channelId)
 			);
+		// A splice that locks, or one that unwinds, can leave the channel
+		// usable where the reestablish could not (still SPLICING then, or a
+		// taproot channel parked until splice_locked). One channel grown by
+		// splice is the whole of a typical wallet.
+		for (const event of [
+			'splice:complete',
+			'splice:aborted',
+			'splice:reverted'
+		]) {
+			this.node.on(event, (data: { channelId: Buffer }) =>
+				announceUsable(data.channelId)
+			);
+		}
+		// The funding quarantine lifting says so only in its structured log.
+		this.node.on('log', (entry: IStructuredLog) => {
+			if (entry?.action !== 'funding_missing_quarantine_lifted') return;
+			const idHex = entry.data?.channelId;
+			if (typeof idHex === 'string') announceUsable(Buffer.from(idHex, 'hex'));
+		});
+		// A channel that closed, failed or went away may have been the last
+		// live one; the pay-readiness wait then stops waiting.
+		const channelsChanged = (): void =>
+			deferEmit(() => this.emit(CHANNELS_CHANGED));
+		for (const event of [
+			'channel:pending-close',
+			'channel:force-closing',
+			'channel:closed',
+			'channel:voided',
+			'channel:aborted'
+		]) {
+			this.node.on(event, channelsChanged);
+		}
+		this.node.getChannelManager().on('channel:errored', channelsChanged);
 		this.node.on('channel:closed', (data: { channelId: Buffer }) => {
 			const channelId = data.channelId.toString('hex');
 			this.log('info', 'Channel closed', { channelId });
@@ -11989,13 +12060,17 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
-	 * True when a new HTLC can go out now: some channel accepts one, or there
-	 * is no channel at all, where waiting would never end and a payment fails
-	 * on its own terms (issue #967).
+	 * True when a new HTLC can go out now: some channel accepts one, or no
+	 * channel can ever come to (none at all, or only closing, closed or held
+	 * ones), where waiting would never end and a payment fails on its own
+	 * terms (issue #967).
 	 */
 	private canCarryHtlc(): boolean {
-		const channels = this.node.getChannelManager().listChannels();
-		return channels.length === 0 || channels.some((ch) => ch.acceptsNewHtlcs());
+		const live = this.node
+			.getChannelManager()
+			.listChannels()
+			.filter(canBecomeUsable);
+		return live.length === 0 || live.some((ch) => ch.acceptsNewHtlcs());
 	}
 
 	/**
@@ -12038,14 +12113,18 @@ export class BeignetNode extends EventEmitter {
 						run();
 						return;
 					}
+					// Looked at again when a channel becomes usable, and when one
+					// closes or goes away, which can leave no live channel.
 					// Shutdown removes every listener, so this cannot outlive
 					// the node; a retired wait removes itself on the next event.
-					const onUsable = (): void => {
+					const recheck = (): void => {
 						if (live() && !this.canCarryHtlc()) return;
-						this.removeListener('channel:usable', onUsable);
+						this.removeListener('channel:usable', recheck);
+						this.removeListener(CHANNELS_CHANGED, recheck);
 						if (live()) run();
 					};
-					this.on('channel:usable', onUsable);
+					this.on('channel:usable', recheck);
+					this.on(CHANNELS_CHANGED, recheck);
 				},
 				() => {
 					// Destroyed (a shutdown, or a capsule restore rebuilding the
@@ -12069,7 +12148,12 @@ export class BeignetNode extends EventEmitter {
 			this.paymentQueue = new PaymentQueue(
 				(bolt11, timeout, maxFee, amount, meta) =>
 					this.payInvoiceSafe(bolt11, timeout, maxFee, amount, meta),
-				(amount) => this.canSend(amount),
+				// No node yet (a guardian restore pending): no capacity, for
+				// now, rather than a throw (issue #967).
+				(amount) =>
+					(this.node as LightningNode | undefined)
+						? this.canSend(amount)
+						: { canSend: false, availableSats: 0 },
 				// A restored entry that was in flight is settled against the
 				// node's record before anything sends it again (issue #967).
 				{ resolveInterrupted: (b) => this.resolveInterruptedPayment(b) },

@@ -8,15 +8,27 @@ import { EventEmitter } from 'events';
 import { BeignetError, BeignetErrorCode } from './errors';
 import { QueuedPayment } from './types';
 
-/** Absent, or a whole number of satoshis, zero or greater. */
-function requireOptionalSats(value: unknown, field: string): void {
-	if (value === undefined) return;
-	if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+const SATS_MESSAGE = 'must be a whole number of satoshis, zero or greater';
+
+/** A whole number of satoshis, zero or greater. */
+function isWholeSats(value: unknown): value is number {
+	return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Absent, or a whole number of satoshis, zero or greater. An explicit null
+ * counts as absent, as it always has: generated clients send null for an
+ * unset optional field.
+ */
+function optionalSats(value: unknown, field: string): number | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (!isWholeSats(value)) {
 		throw new BeignetError(
 			BeignetErrorCode.INVALID_PARAMS,
-			`${field} must be a whole number of satoshis, zero or greater`
+			`${field} ${SATS_MESSAGE}`
 		);
 	}
+	return value;
 }
 
 /**
@@ -114,6 +126,13 @@ export class PaymentQueue extends EventEmitter {
 	 * for its invoice (issue #967).
 	 */
 	private interrupted = new Set<string>();
+	/**
+	 * Entries restored from storage, including an interrupted one queued
+	 * again as unpaid. Only start() releases them: an enqueue() before it
+	 * dispatches its own entry, never these into channels that cannot carry
+	 * them yet (issue #967).
+	 */
+	private restored = new Set<string>();
 
 	constructor(
 		payInvoiceSafe: PayInvoiceSafeFn,
@@ -147,6 +166,7 @@ export class PaymentQueue extends EventEmitter {
 						completedAt: row.completedAt
 					};
 					this.queue.push(entry);
+					this.restored.add(row.id);
 
 					// A row still 'dispatching' was in flight when the process
 					// stopped, and its payment may have been made. Sending it
@@ -222,16 +242,16 @@ export class PaymentQueue extends EventEmitter {
 		// A persisted amount the capacity check refuses would be refused again
 		// at every start, so it is refused here, before it is stored (issue
 		// #967).
-		requireOptionalSats(opts?.amountSats, 'amountSats');
-		requireOptionalSats(opts?.maxFeeSats, 'maxFeeSats');
+		const amountSats = optionalSats(opts?.amountSats, 'amountSats');
+		const maxFeeSats = optionalSats(opts?.maxFeeSats, 'maxFeeSats');
 
 		const entry: QueuedPayment = {
 			id: `q-${++this.idCounter}-${Date.now()}`,
 			bolt11,
 			priority,
 			status: 'queued',
-			amountSats: opts?.amountSats,
-			maxFeeSats: opts?.maxFeeSats,
+			amountSats,
+			maxFeeSats,
 			metadata: opts?.metadata,
 			createdAt: Date.now()
 		};
@@ -343,7 +363,9 @@ export class PaymentQueue extends EventEmitter {
 	 * resolve. Such an entry holds no concurrency slot while it waits (a
 	 * stuck HTLC can last until its expiry, and canSend already counts what
 	 * it holds), so the restored 'queued' entries dispatch now rather than on
-	 * the next enqueue(). Runs once, and does nothing after stop().
+	 * the next enqueue(). Until this runs, restored entries do not dispatch
+	 * at all; entries enqueued since do. Runs once, and does nothing after
+	 * stop().
 	 */
 	start(): void {
 		if (this.stopped || this.started) return;
@@ -463,21 +485,33 @@ export class PaymentQueue extends EventEmitter {
 		try {
 			// Process all eligible entries
 			while (this.activeCount < this.maxConcurrent) {
-				const next = this.queue.find((e) => e.status === 'queued');
+				// A restored entry waits for start() (issue #967).
+				const next = this.queue.find(
+					(e) =>
+						e.status === 'queued' && (this.started || !this.restored.has(e.id))
+				);
 				if (!next) break;
 
 				// Check capacity
 				const amountToCheck = next.amountSats ?? 0;
+				if (!isWholeSats(amountToCheck)) {
+					// A row stored before enqueue() validated amounts: the check
+					// refuses it on every pass, so fail it rather than hold the
+					// rest behind it.
+					this.failUndispatchable(
+						next,
+						new Error(`amountSats ${SATS_MESSAGE}`)
+					);
+					continue;
+				}
 				if (amountToCheck > 0) {
 					let check: ReturnType<CanSendFn>;
 					try {
 						check = this.canSend(amountToCheck);
-					} catch (err: unknown) {
-						// An amount the check refuses (a row stored before
-						// enqueue() validated it) is refused on every pass: fail
-						// the entry rather than hold the rest behind it.
-						this.failUndispatchable(next, err);
-						continue;
+					} catch {
+						// Any other refusal is temporary (no node yet, say):
+						// treated as no capacity, and looked at again later.
+						break;
 					}
 					if (!check.canSend) break; // No capacity, stop processing
 				}

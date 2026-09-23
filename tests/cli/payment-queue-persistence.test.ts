@@ -706,7 +706,6 @@ describe('Payment Queue Persistence', () => {
 				{ amountSats: '1000' },
 				{ amountSats: -1 },
 				{ amountSats: Number.NaN },
-				{ amountSats: null },
 				{ maxFeeSats: 0.5 },
 				{ maxFeeSats: -2 }
 			];
@@ -776,6 +775,86 @@ describe('Payment Queue Persistence', () => {
 			await settle();
 			expect(calls).to.deep.equal(['lnbc_needs_capacity']);
 			expect(statusOf('q-2-b')).to.equal('queued');
+		});
+
+		// Review round 2 (C1): processQueue() is ungated for enqueue(), so one
+		// enqueue between the boot and the first usable channel sent every
+		// restored row into channels that could not carry it yet.
+		it('an enqueue before start() dispatches only its own entry; restored rows wait for start()', async () => {
+			seed('q-1-restored', 'lnbc_restored', 'queued', 1);
+			seed('q-2-in-flight', 'lnbc_in_flight', 'dispatching', 1);
+			const { calls, pay } = recordingPay();
+			const unpaid = async (): Promise<InterruptedPaymentOutcome> => ({
+				status: 'unpaid'
+			});
+			const queue = new PaymentQueue(
+				pay,
+				noopCanSend,
+				{ resolveInterrupted: unpaid },
+				storage
+			);
+			const fresh = queue.enqueue('lnbc_fresh', 5);
+			await settle();
+			expect(calls).to.deep.equal(['lnbc_fresh']);
+			expect(statusOf(fresh.id)).to.equal('completed');
+			expect(statusOf('q-1-restored')).to.equal('queued');
+			expect(statusOf('q-2-in-flight')).to.equal('dispatching');
+
+			queue.start();
+			await settle();
+			expect([...calls].sort()).to.deep.equal(
+				['lnbc_fresh', 'lnbc_in_flight', 'lnbc_restored'].sort()
+			);
+			expect(statusOf('q-1-restored')).to.equal('completed');
+			expect(statusOf('q-2-in-flight')).to.equal('completed');
+		});
+
+		// Review round 2 (C4): a canSend that throws is not a verdict on the
+		// entry. BeignetNode's has no node to ask while a guardian restore is
+		// pending, and a whole amount recorded failed for that is a payment
+		// the operator has to enqueue again.
+		it('a canSend that throws for a whole amount leaves the entry queued, and it dispatches once canSend answers', async () => {
+			let broken = true;
+			const canSend = (): { canSend: boolean; availableSats: number } => {
+				if (broken) throw new TypeError('Cannot read properties of undefined');
+				return { canSend: true, availableSats: 10_000 };
+			};
+			const { calls, pay } = recordingPay();
+			const queue = new PaymentQueue(pay, canSend, undefined, storage);
+			queue.start();
+			const entry = queue.enqueue('lnbc_waits_for_a_node', 5, {
+				amountSats: 1_000
+			});
+			await settle();
+			expect(calls).to.deep.equal([]);
+			expect(statusOf(entry.id)).to.equal('queued');
+			expect(queue.list()[0].status).to.equal('queued');
+
+			broken = false;
+			queue.poke();
+			await settle();
+			expect(calls).to.deep.equal(['lnbc_waits_for_a_node']);
+			expect(statusOf(entry.id)).to.equal('completed');
+		});
+
+		// Review round 2 (P4): null always behaved as absent, and generated
+		// clients send it for an unset optional field.
+		it('enqueue() takes an explicit null amountSats or maxFeeSats as absent', () => {
+			const queue = new PaymentQueue(
+				noopPay,
+				noopCanSend,
+				{ maxConcurrent: 0 },
+				storage
+			);
+			const entry = queue.enqueue('lnbc_nulls', 5, {
+				amountSats: null,
+				maxFeeSats: null
+			} as unknown as { amountSats?: number; maxFeeSats?: number });
+			expect(entry.amountSats).to.equal(undefined);
+			expect(entry.maxFeeSats).to.equal(undefined);
+			const row = rowOf(entry.id);
+			expect(row?.amountSats).to.equal(undefined);
+			expect(row?.maxFeeSats).to.equal(undefined);
 		});
 	});
 
