@@ -120,6 +120,27 @@ async function waitFor(
 	}
 }
 
+/** A node:error as the onError callback receives it. */
+interface IErrorEvent {
+	code: string;
+	message: string;
+}
+
+interface IListenerProblem {
+	port: number;
+	state: string;
+	message: string;
+	errno?: string;
+}
+
+/** The listener fields of GET /info (issues #861 and #933). */
+interface IListenerInfo {
+	listening: boolean;
+	listenPort?: number;
+	listenError?: IListenerProblem;
+	websocketListenError?: IListenerProblem;
+}
+
 interface IHost {
 	daemon: IStartedDaemon;
 	dir: string;
@@ -207,6 +228,109 @@ describe('Guardian host surface: config', () => {
 	});
 });
 
+describe('Guardian host surface: a listen port another process holds (issue #861)', () => {
+	/** Hold a port on every interface, as PeerManager binds by default. */
+	async function squat(): Promise<{ port: number; squatter: net.Server }> {
+		const port = await freePort();
+		const squatter = net.createServer();
+		await new Promise<void>((resolve, reject) => {
+			squatter.once('error', reject);
+			squatter.listen(port, '0.0.0.0', () => resolve());
+		});
+		return { port, squatter };
+	}
+
+	async function release(squatter: net.Server): Promise<void> {
+		await new Promise<void>((resolve) => squatter.close(() => resolve()));
+	}
+
+	it('reports the refused bind as LISTEN_FAILED and in the status routes, and keeps running', async function (): Promise<void> {
+		this.timeout(60_000);
+		const dir = tmpDir('squatted');
+		const { port, squatter } = await squat();
+		const errors: IErrorEvent[] = [];
+		let daemon: IStartedDaemon | null = null;
+		try {
+			// Not fatal, even for a guardian host.
+			daemon = await startDaemon({
+				...OFFLINE,
+				mnemonic: MNEMONICS[0],
+				dataDir: dir,
+				listenPort: port,
+				guardianServe: true,
+				onError: (e: IErrorEvent) => errors.push(e)
+			});
+			const daemonPort = portOf(daemon);
+
+			const failed = errors.filter((e) => e.code === 'LISTEN_FAILED');
+			expect(failed, JSON.stringify(errors)).to.have.length(1);
+			expect(failed[0].message).to.include(`port ${port}`);
+			expect(failed[0].message).to.match(/EADDRINUSE/);
+			expect(failed[0].message).to.match(/inbound peers cannot connect/);
+			expect(failed[0].message).to.match(/guardian/);
+
+			const info = (await request(daemonPort, 'GET', '/info')).body
+				.result as IListenerInfo;
+			expect(info.listening).to.equal(false);
+			expect(info.listenPort).to.equal(port);
+			expect(info.listenError?.state).to.equal('failed');
+			expect(info.listenError?.port).to.equal(port);
+			expect(info.listenError?.errno).to.equal('EADDRINUSE');
+			expect(info.listenError?.message).to.match(/EADDRINUSE/);
+			expect(info.websocketListenError).to.equal(undefined);
+
+			// Hosting is configured but nobody can dial it.
+			const host = (await request(daemonPort, 'GET', '/guardian/status')).body
+				.result as {
+				serving: boolean;
+				guardianId?: string;
+				listenError?: IListenerProblem;
+			};
+			expect(host.serving).to.equal(false);
+			expect(host.guardianId).to.match(/^[0-9a-f]{64}$/);
+			expect(host.listenError?.state).to.equal('failed');
+
+			const logs = (await request(daemonPort, 'GET', '/logs?category=error'))
+				.body.result as Array<{ action: string }>;
+			expect(logs.some((e) => e.action === 'LISTEN_FAILED')).to.equal(true);
+			expect((await request(daemonPort, 'GET', '/node/uri')).status).to.equal(
+				404
+			);
+		} finally {
+			if (daemon) await daemon.stop();
+			await release(squatter);
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it('boots when the onError observer throws on LISTEN_FAILED', async function (): Promise<void> {
+		this.timeout(60_000);
+		const dir = tmpDir('squatted-throw');
+		const { port, squatter } = await squat();
+		let daemon: IStartedDaemon | null = null;
+		try {
+			daemon = await startDaemon({
+				...OFFLINE,
+				mnemonic: MNEMONICS[0],
+				dataDir: dir,
+				listenPort: port,
+				onError: (e: IErrorEvent) => {
+					if (e.code === 'LISTEN_FAILED') throw new Error('observer failed');
+				}
+			});
+			const info = (await request(portOf(daemon), 'GET', '/info')).body
+				.result as IListenerInfo;
+			expect(info.listening).to.equal(false);
+			expect(info.listenError?.state).to.equal('failed');
+			expect(info.listenError?.errno).to.equal('EADDRINUSE');
+		} finally {
+			if (daemon) await daemon.stop();
+			await release(squatter);
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe('Guardian host surface: a wallet guarded by three beignet nodes', () => {
 	const hosts: Array<IHost | null> = [];
 	let wallet: IStartedDaemon | null = null;
@@ -252,14 +376,18 @@ describe('Guardian host surface: a wallet guarded by three beignet nodes', () =>
 			serving: boolean;
 			guardianId: string;
 			sets: unknown[];
+			listenError?: unknown;
 		};
 		expect(before.serving).to.equal(true);
 		expect(before.guardianId).to.match(/^[0-9a-f]{64}$/);
 		expect(before.sets).to.have.length(0);
+		expect(before.listenError).to.equal(undefined);
 		// Guardians are dialled at the host's Lightning address: it is bound.
 		const hostInfo = (await request(portOf(a.daemon), 'GET', '/info')).body
-			.result as { listening: boolean };
+			.result as IListenerInfo;
 		expect(hostInfo.listening).to.equal(true);
+		expect(hostInfo.listenPort).to.equal(a.listenPort);
+		expect(hostInfo.listenError).to.equal(undefined);
 
 		// One host resolves the others' URIs (and its own) to entries.
 		const entries: string[] = [];
@@ -315,6 +443,7 @@ describe('Guardian host surface: a wallet guarded by three beignet nodes', () =>
 		walletDir = tmpDir('wallet');
 		pinned = entries;
 		const walletListen = await freePort();
+		const walletErrors: IErrorEvent[] = [];
 		wallet = await startDaemon({
 			...OFFLINE,
 			mnemonic: MNEMONICS[3],
@@ -322,7 +451,8 @@ describe('Guardian host surface: a wallet guarded by three beignet nodes', () =>
 			listenPort: walletListen,
 			recoveryMode: 'quorum',
 			recoveryGuardians: entries,
-			recoveryLeaseCheckIntervalMs: 200
+			recoveryLeaseCheckIntervalMs: 200,
+			onError: (e: IErrorEvent) => walletErrors.push(e)
 		});
 		const walletPort = portOf(wallet);
 		const status = await request(walletPort, 'GET', '/recovery/status');
@@ -361,6 +491,14 @@ describe('Guardian host surface: a wallet guarded by three beignet nodes', () =>
 		expect((walletUri.body.result as { uri: string }).uri).to.match(
 			new RegExp(`:${walletListen}$`)
 		);
+		const boundInfo = (await request(walletPort, 'GET', '/info')).body
+			.result as IListenerInfo;
+		expect(boundInfo.listenPort).to.equal(walletListen);
+		expect(boundInfo.listenError).to.equal(undefined);
+		// The hold was never reported as a failed bind.
+		expect(
+			walletErrors.filter((e) => e.code === 'LISTEN_FAILED')
+		).to.have.length(0);
 
 		// A journaled commit goes durable on the quorum over the sessions.
 		const durableBefore = BigInt(
@@ -614,8 +752,10 @@ describe('Guardian host surface: the guardian-only lane', () => {
 			expect(view.node?.gate).to.equal('quarantined');
 			// The lane admits the host's bind during quarantine.
 			const laneInfo = (await request(portOf(a), 'GET', '/info')).body
-				.result as { listening: boolean };
+				.result as IListenerInfo;
 			expect(laneInfo.listening).to.equal(true);
+			expect(laneInfo.listenPort).to.equal(listenA);
+			expect(laneInfo.listenError).to.equal(undefined);
 
 			// The lane: a stranger's guardian session gets INFO answered.
 			const transport = bolt8GuardianTransport();
@@ -643,6 +783,46 @@ describe('Guardian host surface: the guardian-only lane', () => {
 			expect(
 				(still.body.result as { node: { gate: string } }).node.gate
 			).to.equal('quarantined');
+
+			// Without hosting, the quarantine holds A's listeners: reported as
+			// held until ownership is confirmed, never as a failed bind.
+			await a.stop();
+			const errors: IErrorEvent[] = [];
+			const wsA = await freePort();
+			a = await startDaemon({
+				...OFFLINE,
+				mnemonic: MNEMONICS[0],
+				dataDir: dirA,
+				listenPort: listenA,
+				websocketPort: wsA,
+				recoveryMode: 'quorum',
+				recoveryGuardians: [entryB, entryC, entryDead],
+				recoveryLeaseCheckIntervalMs: 200,
+				onError: (e: IErrorEvent) => errors.push(e)
+			});
+			const heldInfo = (await request(portOf(a), 'GET', '/info')).body
+				.result as IListenerInfo;
+			expect(heldInfo.listening).to.equal(false);
+			expect(heldInfo.listenPort).to.equal(listenA);
+			expect(heldInfo.listenError?.state).to.equal('held');
+			expect(heldInfo.listenError?.port).to.equal(listenA);
+			expect(heldInfo.listenError?.errno).to.equal(undefined);
+			expect(heldInfo.websocketListenError?.state).to.equal('held');
+			expect(heldInfo.websocketListenError?.port).to.equal(wsA);
+			expect(errors.filter((e) => e.code === 'LISTEN_FAILED')).to.have.length(
+				0
+			);
+			expect((await request(portOf(a), 'GET', '/node/uri')).status).to.equal(
+				404
+			);
+			// A fence means the hold never lifts, and the report says so. The
+			// node relays the same event a superseding writer raises.
+			a.node.getNode().emit('recovery:fenced', undefined);
+			const fencedInfo = (await request(portOf(a), 'GET', '/info')).body
+				.result as IListenerInfo;
+			expect(fencedInfo.listening).to.equal(false);
+			expect(fencedInfo.listenError?.state).to.equal('fenced');
+			expect(fencedInfo.websocketListenError?.state).to.equal('fenced');
 		} finally {
 			await a.stop();
 			fs.rmSync(dirA, { recursive: true, force: true });

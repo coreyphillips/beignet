@@ -48,9 +48,19 @@ export interface NodeInfo {
 	/** Channels not in a terminal state (CLOSED, FORCE_CLOSED, ERRORED). */
 	openChannelCount: number;
 	peerCount: number;
+	/** True while an inbound listener (TCP or WebSocket) is bound. */
 	listening: boolean;
+	/**
+	 * The TCP listen port this node was asked for, present whenever one was
+	 * configured, bound or not. `listening` and `listenError` say which.
+	 */
+	listenPort?: number;
+	/** Why the configured TCP listener is not bound; absent while it is. */
+	listenError?: ListenerProblem;
 	/** WebSocket listener port when accepting inbound WS peers (opt-in). */
 	websocketPort?: number;
+	/** Why the configured WebSocket listener is not bound; absent while it is. */
+	websocketListenError?: ListenerProblem;
 }
 
 /**

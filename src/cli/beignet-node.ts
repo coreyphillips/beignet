@@ -1725,6 +1725,8 @@ export class BeignetNode extends EventEmitter {
 	/** The TCP listener's port, set only once the bind succeeded. */
 	private _listenPort?: number;
 	private _websocketPort?: number;
+	/** The TCP port asked for, bound or not. */
+	private _requestedListenPort?: number;
 	/** Why a configured listener is not bound (issues #861 and #933). */
 	private _listenError?: ListenerProblem;
 	private _websocketListenError?: ListenerProblem;
@@ -3224,6 +3226,7 @@ export class BeignetNode extends EventEmitter {
 		// fresh node.
 		this.resetListenerState();
 		if (opts.listenPort) {
+			this._requestedListenPort = opts.listenPort;
 			await this.bindListener('tcp', opts.listenPort);
 		}
 		if (opts.websocketPort) {
@@ -5228,14 +5231,23 @@ export class BeignetNode extends EventEmitter {
 
 	/**
 	 * The guardian this node serves to others (issue #699), for the status
-	 * route: `serving` false when hosting is off.
+	 * route: `serving` false when hosting is off. A guardian is dialled at
+	 * this node's Lightning address, so hosting without a bound TCP listener
+	 * serves nobody: `serving` is false then too, the host fields still say
+	 * what is held, and `listenError` says why (issue #861).
 	 */
 	getGuardianHostSurfaceStatus(): {
 		serving: boolean;
+		listenError?: ListenerProblem;
 	} & Partial<IGuardianHostStatus> {
 		const status = this.node?.getGuardianHostStatus() ?? null;
 		if (!status) return { serving: false };
-		return { serving: true, ...status };
+		const serving = this._listenPort !== undefined && this.node.isListening();
+		return {
+			serving,
+			...status,
+			...(this._listenError ? { listenError: { ...this._listenError } } : {})
+		};
 	}
 
 	/**
@@ -5544,8 +5556,15 @@ export class BeignetNode extends EventEmitter {
 			peerCount: info.peerCount,
 			listening: this.node.isListening()
 		};
+		if (this._requestedListenPort !== undefined) {
+			result.listenPort = this._requestedListenPort;
+		}
+		if (this._listenError) result.listenError = { ...this._listenError };
 		if (this._websocketPort !== undefined) {
 			result.websocketPort = this._websocketPort;
+		}
+		if (this._websocketListenError) {
+			result.websocketListenError = { ...this._websocketListenError };
 		}
 		return result;
 	}
@@ -12493,6 +12512,7 @@ export class BeignetNode extends EventEmitter {
 		this._listenEpoch++;
 		this._listenPort = undefined;
 		this._websocketPort = undefined;
+		this._requestedListenPort = undefined;
 		this._listenError = undefined;
 		this._websocketListenError = undefined;
 		this._listenBinds = {};
@@ -12532,7 +12552,9 @@ export class BeignetNode extends EventEmitter {
 			const problem = this.classifyListenFailure(node, port, err);
 			const held = this.listenerProblem(kind)?.state === 'held';
 			this.setListenerProblem(kind, problem);
-			if (problem.state === 'held' && !held) {
+			if (problem.state === 'failed') {
+				this.reportListenFailed(node, kind, problem);
+			} else if (problem.state === 'held' && !held) {
 				this.log(
 					'info',
 					`${listenerLabel(kind)} on port ${port} is held until ` +
@@ -12575,6 +12597,35 @@ export class BeignetNode extends EventEmitter {
 			return { port, state: 'held', message: LISTENER_HELD_MESSAGE };
 		}
 		return { port, state: 'failed', message, ...(errno ? { errno } : {}) };
+	}
+
+	/**
+	 * Raise a failed bind as node:error LISTEN_FAILED through the node's own
+	 * funnel, which logs it and keeps it in the action log (GET
+	 * /logs?category=error) before onError and the relay see it. A throwing
+	 * observer must not turn a non-fatal bind into a boot failure: the state
+	 * is recorded either way.
+	 */
+	private reportListenFailed(
+		node: LightningNode,
+		kind: ListenerKind,
+		problem: ListenerProblem
+	): void {
+		try {
+			const hosting =
+				kind === 'tcp' && node.getGuardianHostStatus() !== null
+					? ' and the guardian this node hosts is unreachable'
+					: '';
+			node.emit('node:error', {
+				code: 'LISTEN_FAILED',
+				message:
+					`${listenerLabel(kind)} could not bind port ${problem.port}: ` +
+					`${problem.message}; inbound peers cannot connect${hosting}`,
+				timestamp: Date.now()
+			});
+		} catch {
+			// An observer threw; the failure is recorded on /info.
+		}
 	}
 
 	private nodeFenced(node: LightningNode): boolean {
