@@ -197,6 +197,80 @@ describe('Webhooks survive a graceful stop (issue 402)', function () {
 	});
 });
 
+describe('A queued payment survives a graceful stop (issue #958)', function () {
+	this.timeout(120_000);
+
+	let tmpDir: string;
+
+	before(function () {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-stop-queue-'));
+	});
+
+	after(function () {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	// The database stays open while the wallet stops, so stop() halts the
+	// queue first: a payment still waiting its turn is not dispatched to the
+	// stopped node and recorded as failed, it stays queued for the next boot.
+	it('a payment waiting its turn at stop() is not dispatched, and is still queued after a restart', async () => {
+		type Entry = { id: string; status: string };
+		const first = await bootDaemon(tmpDir);
+		const firstPort = (first.server.address() as AddressInfo).port;
+		const payCalls: string[] = [];
+		const failPays: Array<(e: Error) => void> = [];
+		let stopCalled = false;
+		(
+			first.node as unknown as {
+				payInvoiceSafe: (b: string) => Promise<unknown>;
+			}
+		).payInvoiceSafe = (bolt11: string): Promise<unknown> => {
+			payCalls.push(bolt11);
+			// As the stopped node does: a dispatch after stop() fails at once,
+			// so one the queue should have held back persists 'failed'.
+			if (stopCalled) return Promise.reject(new Error('node destroyed'));
+			return new Promise((_resolve, reject) => failPays.push(reject));
+		};
+		const listQueue = async (port: number): Promise<Entry[]> =>
+			(await request(port, 'GET', '/queue')).body.result as Entry[];
+		let waiting: Entry | undefined;
+		try {
+			while (!waiting && payCalls.length < 10) {
+				const added = await request(firstPort, 'POST', '/queue/add', {
+					bolt11: `lnbcrt_issue958_${payCalls.length}`
+				});
+				expect(added.status).to.equal(200);
+				waiting = (await listQueue(firstPort)).find(
+					(e) => e.status === 'queued'
+				);
+			}
+			expect(waiting).to.not.equal(undefined);
+			const inFlight = payCalls.length;
+
+			stopCalled = true;
+			const stopped = first.stop();
+			// The stopped node fails what it had in flight.
+			for (const fail of failPays) fail(new Error('node destroyed'));
+			await stopped;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(payCalls).to.have.length(inFlight);
+		} finally {
+			await first.stop();
+		}
+
+		const second = await bootDaemon(tmpDir);
+		try {
+			const secondPort = (second.server.address() as AddressInfo).port;
+			const restored = (await listQueue(secondPort)).find(
+				(e) => e.id === waiting!.id
+			);
+			expect(restored?.status).to.equal('queued');
+		} finally {
+			await second.stop();
+		}
+	});
+});
+
 describe('POST /stop runs the shared teardown (issue 402)', function () {
 	this.timeout(120_000);
 

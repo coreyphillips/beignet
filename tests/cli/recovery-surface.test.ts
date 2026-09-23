@@ -1714,6 +1714,22 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 				deviceB.node.on('recovery:restored', (data) =>
 					restored.push(data as Record<string, unknown>)
 				);
+				// The swap moves the database file, so the teardown closes it
+				// first. The node's destroy() closes only its view of the
+				// database now (issue #958), so the teardown closes the file
+				// itself.
+				const database = deviceB.node.getStorage() as unknown as {
+					db: { open: boolean };
+				};
+				const swapper = deviceB.node as unknown as {
+					finishStagedCapsuleRestore: (dbPath: string) => void;
+				};
+				const swap = swapper.finishStagedCapsuleRestore.bind(deviceB.node);
+				let openAtSwap: boolean | undefined;
+				swapper.finishStagedCapsuleRestore = (dbPath: string): void => {
+					openAtSwap = database.db.open;
+					swap(dbPath);
+				};
 				const res = await post(portB, '/recovery/restore-capsule', {
 					confirm: true
 				});
@@ -1726,6 +1742,7 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 					head: { writerEpoch: string; latestSequence: string };
 				};
 				report = result;
+				expect(openAtSwap).to.equal(false);
 				expect(result.tier).to.equal(2);
 				expect(result.framesApplied).to.be.at.least(1);
 				expect(result.rejectedCandidates).to.equal(1);
