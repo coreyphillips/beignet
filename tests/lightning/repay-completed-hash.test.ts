@@ -21,6 +21,13 @@
  * there (a circular rebalance sends to its own fresh invoice), and a part of
  * an MPP set is admitted beside the parts already out, since that is what an
  * HTLC set is; a paid hash refuses a part all the same.
+ *
+ * Issue #990 bounds that part waiver: a part is refused once the amounts of
+ * the HTLCs still out for the hash reach the set's total_msat, since the
+ * payee fulfils every part once it holds the total, so a part beyond that
+ * overpays. The view carries first-hop amounts, fee inclusive, so the bound
+ * is conservative: a legitimate last part is refused only when the fees
+ * already paid on the earlier parts reach its amount.
  */
 
 import { expect } from 'chai';
@@ -118,6 +125,19 @@ const CHANNEL_SCID = encodeShortChannelId({
 	outputIndex: 0
 });
 
+function wire(a: LightningNode, b: LightningNode): void {
+	a.on('message:outbound', (pubkey, type, payload) => {
+		if (pubkey === b.getNodeId()) {
+			b.handlePeerMessage(a.getNodeId(), type, payload);
+		}
+	});
+	b.on('message:outbound', (pubkey, type, payload) => {
+		if (pubkey === a.getNodeId()) {
+			a.handlePeerMessage(b.getNodeId(), type, payload);
+		}
+	});
+}
+
 function setupPair(
 	aliceSeed: number,
 	bobSeed: number,
@@ -125,17 +145,7 @@ function setupPair(
 ): { alice: LightningNode; bob: LightningNode } {
 	const alice = createNode(aliceSeed, undefined, aliceExtra);
 	const bob = createNode(bobSeed);
-
-	alice.on('message:outbound', (pubkey, type, payload) => {
-		if (pubkey === bob.getNodeId()) {
-			bob.handlePeerMessage(alice.getNodeId(), type, payload);
-		}
-	});
-	bob.on('message:outbound', (pubkey, type, payload) => {
-		if (pubkey === alice.getNodeId()) {
-			alice.handlePeerMessage(bob.getNodeId(), type, payload);
-		}
-	});
+	wire(alice, bob);
 
 	const channel = alice.openChannel(bob.getNodeId(), 1_000_000n);
 	const channelId = alice.createFunding(
@@ -148,6 +158,82 @@ function setupPair(
 	bob.handleFundingConfirmed(channelId);
 	alice.registerChannelScid(channelId, CHANNEL_SCID);
 	return { alice, bob };
+}
+
+/**
+ * Alice -> Bob -> Charlie, one ready channel per link, Bob forwarding for a
+ * 500 msat base fee. A two-hop route from Alice carries a first-hop amount
+ * above what Charlie receives, which is what the issue #990 bound reads.
+ */
+const CHANNEL_SCID_BC = encodeShortChannelId({
+	block: 500,
+	txIndex: 2,
+	outputIndex: 0
+});
+
+function setupChain(
+	aliceSeed: number,
+	bobSeed: number,
+	charlieSeed: number
+): { alice: LightningNode; bob: LightningNode; charlie: LightningNode } {
+	const alice = createNode(aliceSeed);
+	const bob = createNode(bobSeed);
+	const charlie = createNode(charlieSeed);
+	wire(alice, bob);
+	wire(bob, charlie);
+
+	const openReady = (
+		opener: LightningNode,
+		acceptor: LightningNode,
+		scid: Buffer
+	): Buffer => {
+		const channel = opener.openChannel(acceptor.getNodeId(), 1_000_000n);
+		const channelId = opener.createFunding(
+			channel,
+			crypto.randomBytes(32),
+			0,
+			crypto.randomBytes(64)
+		)!;
+		opener.handleFundingConfirmed(channelId);
+		acceptor.handleFundingConfirmed(channelId);
+		opener.registerChannelScid(channelId, scid);
+		acceptor.registerChannelScid(channelId, scid);
+		return channelId;
+	};
+	openReady(alice, bob, CHANNEL_SCID);
+	const bcChannelId = openReady(bob, charlie, CHANNEL_SCID_BC);
+	bob.setChannelPolicy(bcChannelId, {
+		feeBaseMsat: 500,
+		feeProportionalMillionths: 0
+	});
+	for (const node of [alice, bob, charlie]) node.handleNewBlock(1000);
+	return { alice, bob, charlie };
+}
+
+/** The two-hop route from Alice to Charlie: Bob is paid firstHopMsat and
+ * forwards finalMsat, so Alice's channel carries the fee on top. */
+function routeViaBob(
+	bob: LightningNode,
+	charlie: LightningNode,
+	firstHopMsat: bigint,
+	finalMsat: bigint
+): Parameters<LightningNode['sendPaymentToRoute']>[0] {
+	return {
+		hops: [
+			{
+				pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+				shortChannelId: CHANNEL_SCID,
+				amountToForwardMsat: firstHopMsat,
+				outgoingCltvValue: 80
+			},
+			{
+				pubkey: Buffer.from(charlie.getNodeId(), 'hex'),
+				shortChannelId: CHANNEL_SCID_BC,
+				amountToForwardMsat: finalMsat,
+				outgoingCltvValue: 40
+			}
+		]
+	};
 }
 
 /** The one-hop route to bob over the pair's channel, as a rebalance or a
@@ -612,6 +698,177 @@ describe('Issue #975: a hash is not paid again', () => {
 
 		alice.destroy();
 		bob.destroy();
+	});
+
+	it("refuses a third part once the two parts out reach the set's total, and offers no third HTLC", () => {
+		const { alice, bob } = setupPair(950, 951);
+		alice.handleNewBlock(1000);
+		bob.handleNewBlock(1000);
+		const preimage = crypto.randomBytes(32);
+		const hash = sha256(preimage);
+		const totalMsat = 40_000n;
+		const held = bob.createInvoice({
+			amountMsat: totalMsat,
+			description: 'hold-mpp-bound',
+			hold: true,
+			paymentHash: hash
+		});
+		const adds = countAdds(alice);
+		const sendPart = (part: bigint): LightningPaymentError | undefined =>
+			refusal(() =>
+				alice.sendPaymentToRoute(
+					routeToBob(bob, part),
+					hash,
+					40,
+					held.paymentSecret,
+					totalMsat
+				)
+			);
+
+		expect(sendPart(totalMsat / 2n)).to.be.undefined;
+		expect(sendPart(totalMsat / 2n)).to.be.undefined;
+		expect(adds(), 'the set went out').to.equal(2);
+
+		// The parts out already reach total_msat: bob fulfils every part
+		// once he holds the total, so a third part would be paid on top of
+		// the set. Before the fix the part waiver admitted it (issue #990).
+		expectDuplicate(sendPart(10_000n), /already in flight/);
+		expect(adds(), 'no third HTLC was offered').to.equal(2);
+		const view = alice.getOutgoingHtlcs(hash);
+		expect(view.htlcs.filter((h) => h.state === 'offered')).to.have.lengthOf(2);
+		expect(view.status).to.equal(PaymentStatus.PENDING);
+
+		// The set itself is untouched: settling it fulfils every part and
+		// completes the payment.
+		expect(bob.settleHeldHtlc(hash, preimage), 'every part fulfilled').to.equal(
+			true
+		);
+		expect(alice.getPayment(hash)?.status).to.equal(PaymentStatus.COMPLETED);
+		expect(alice.hasHtlcInFlight(hash)).to.equal(false);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it("admits the last part of a set while the parts out are below the set's total", () => {
+		const { alice, bob } = setupPair(952, 953);
+		alice.handleNewBlock(1000);
+		bob.handleNewBlock(1000);
+		const preimage = crypto.randomBytes(32);
+		const hash = sha256(preimage);
+		const totalMsat = 40_000n;
+		const held = bob.createInvoice({
+			amountMsat: totalMsat,
+			description: 'hold-mpp-three',
+			hold: true,
+			paymentHash: hash
+		});
+		const adds = countAdds(alice);
+		const sendPart = (part: bigint): LightningPaymentError | undefined =>
+			refusal(() =>
+				alice.sendPaymentToRoute(
+					routeToBob(bob, part),
+					hash,
+					40,
+					held.paymentSecret,
+					totalMsat
+				)
+			);
+
+		// Three parts: the third goes out with 30000 of the 40000 already
+		// out. The bound is on the amount out, not on the number of parts,
+		// and this pins that a set below its total keeps taking parts.
+		expect(sendPart(15_000n)).to.be.undefined;
+		expect(sendPart(15_000n)).to.be.undefined;
+		expect(sendPart(10_000n), 'the last part is admitted').to.be.undefined;
+		expect(adds()).to.equal(3);
+
+		expect(bob.settleHeldHtlc(hash, preimage), 'every part fulfilled').to.equal(
+			true
+		);
+		expect(alice.getPayment(hash)?.status).to.equal(PaymentStatus.COMPLETED);
+		expect(alice.hasHtlcInFlight(hash)).to.equal(false);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('bounds a part by the first-hop amounts of the parts out, fee included', () => {
+		const { alice, bob, charlie } = setupChain(954, 955, 956);
+		const preimage = crypto.randomBytes(32);
+		const hash = sha256(preimage);
+		const totalMsat = 40_000n;
+		const held = charlie.createInvoice({
+			amountMsat: totalMsat,
+			description: 'hold-mpp-fee',
+			hold: true,
+			paymentHash: hash
+		});
+		const adds = countAdds(alice);
+		const sendPart = (
+			firstHopMsat: bigint,
+			finalMsat: bigint,
+			invoice: { paymentHash: Buffer; paymentSecret: Buffer } = held,
+			total: bigint = totalMsat
+		): LightningPaymentError | undefined =>
+			refusal(() =>
+				alice.sendPaymentToRoute(
+					routeViaBob(bob, charlie, firstHopMsat, finalMsat),
+					invoice.paymentHash,
+					40,
+					invoice.paymentSecret,
+					total
+				)
+			);
+		const heldByCharlie = (h: Buffer): bigint | undefined =>
+			charlie.getHeldInvoiceSnapshot(h)?.committedMsat;
+
+		// Part 1 pays bob 1000 msat to forward 20000: alice's channel
+		// carries 21000, and that is what the view reports.
+		expect(sendPart(21_000n, 20_000n)).to.be.undefined;
+		expect(adds()).to.equal(1);
+		expect(
+			alice.getOutgoingHtlcs(hash).htlcs.map((h) => h.amountMsat)
+		).to.deep.equal([21_000n]);
+		expect(heldByCharlie(hash)).to.equal(20_000n);
+
+		// Part 2, 19000 for a 500 msat fee: the 21000 out is below the
+		// total although it carries a fee, so the part is admitted.
+		expect(sendPart(19_500n, 19_000n)).to.be.undefined;
+		expect(adds()).to.equal(2);
+		expect(heldByCharlie(hash)).to.equal(39_000n);
+
+		// The bound's cost, documented rather than required: the first-hop
+		// amounts out sum to 40500, at the total, while charlie holds 39000.
+		// The legitimate 1000 msat last part is refused, since the 1500 msat
+		// of fees already paid reach its amount. A node that recorded the
+		// parts' final amounts would admit it.
+		expectDuplicate(sendPart(1_500n, 1_000n), /already in flight/);
+		expect(adds()).to.equal(2);
+		expect(heldByCharlie(hash)).to.equal(39_000n);
+
+		// The re-send the issue describes: a caller that hands the route
+		// total (amount plus fees) in as totalMsat classifies as a part. The
+		// first send goes out with nothing out for the hash; the channel
+		// then carries that same route total, so the re-send is refused.
+		const whole = charlie.createInvoice({
+			amountMsat: totalMsat,
+			description: 'route total as totalMsat',
+			hold: true,
+			paymentHash: sha256(crypto.randomBytes(32))
+		});
+		expect(sendPart(41_000n, 40_000n, whole, 41_000n)).to.be.undefined;
+		expect(adds()).to.equal(3);
+		expect(heldByCharlie(whole.paymentHash)).to.equal(40_000n);
+		expectDuplicate(
+			sendPart(41_000n, 40_000n, whole, 41_000n),
+			/already in flight/
+		);
+		expect(adds(), 'the re-send offered nothing').to.equal(3);
+
+		alice.destroy();
+		bob.destroy();
+		charlie.destroy();
 	});
 
 	it("does not refuse a circular rebalance's send to this node's own fresh invoice", () => {
