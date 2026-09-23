@@ -348,8 +348,9 @@ describe('Phase 2: Graceful Shutdown Completeness', () => {
 					reopened.loadAllQueueEntries().find((row) => row.id === id)?.status;
 				expect(statusOf(waiting.id)).to.equal('queued');
 				// A dispatch that settles before the close records its outcome.
-				// Only one still pending at the close stays 'dispatching', for a
-				// retry after the restart.
+				// Only one still pending at the close stays 'dispatching', for the
+				// next start to settle against the node's record before any
+				// retry (issue #967).
 				for (const id of inFlight) expect(statusOf(id)).to.equal('failed');
 			} finally {
 				reopened.close();

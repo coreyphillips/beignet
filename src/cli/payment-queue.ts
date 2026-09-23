@@ -5,13 +5,63 @@
  */
 
 import { EventEmitter } from 'events';
+import { BeignetError, BeignetErrorCode } from './errors';
 import { QueuedPayment } from './types';
+
+const SATS_MESSAGE = 'must be a whole number of satoshis, zero or greater';
+
+/** A whole number of satoshis, zero or greater. */
+function isWholeSats(value: unknown): value is number {
+	return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Absent, or a whole number of satoshis, zero or greater. An explicit null
+ * counts as absent, as it always has: generated clients send null for an
+ * unset optional field.
+ */
+function optionalSats(value: unknown, field: string): number | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (!isWholeSats(value)) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`${field} ${SATS_MESSAGE}`
+		);
+	}
+	return value;
+}
+
+/**
+ * How a payment the queue was dispatching when the process stopped ended, as
+ * the node's own record for its invoice tells it (issue #967). 'completed':
+ * the payment was made (its preimage is known), so it must never be sent
+ * again. 'unpaid': every HTLC it offered is resolved and none paid, so
+ * nothing was paid and it may be sent again.
+ */
+export type InterruptedPaymentOutcome =
+	| { status: 'completed'; paymentHash: string }
+	| { status: 'unpaid' };
 
 export interface PaymentQueueOptions {
 	maxConcurrent?: number;
 	/** Timeout per payment in ms (default 60000) */
 	paymentTimeoutMs?: number;
+	/**
+	 * Settles a restored entry that was 'dispatching' when the process
+	 * stopped, before anything sends it again (issue #967). It resolves once
+	 * the payment's outcome is final, which can take until its HTLCs expire.
+	 * A rejection (or a throw) means the outcome is unknown right now, and the
+	 * entry stays 'dispatching' for the next start to ask again. Without a
+	 * resolver such an entry is recorded 'failed' at restore: the queue
+	 * cannot tell whether it was paid, and sending it again could pay twice.
+	 */
+	resolveInterrupted?: (bolt11: string) => Promise<InterruptedPaymentOutcome>;
 }
+
+/** Recorded on a restored in-flight entry when no resolver can settle it. */
+export const INTERRUPTED_PAYMENT_ERROR =
+	'Interrupted by a restart while dispatching; outcome unknown. Check the ' +
+	'payment for this invoice before paying it again.';
 
 export interface IPaymentQueueStorage {
 	saveQueueEntry(entry: {
@@ -66,8 +116,23 @@ export class PaymentQueue extends EventEmitter {
 	private canSend: CanSendFn;
 	private processing = false;
 	private stopped = false;
+	private started = false;
 	private idCounter = 0;
 	private storage: IPaymentQueueStorage | null;
+	private resolveInterrupted?: PaymentQueueOptions['resolveInterrupted'];
+	/**
+	 * Restored entries that were 'dispatching' when the process stopped. They
+	 * stay 'dispatching' until start() settles each against the node's record
+	 * for its invoice (issue #967).
+	 */
+	private interrupted = new Set<string>();
+	/**
+	 * Entries restored from storage, including an interrupted one queued
+	 * again as unpaid. Only start() releases them: an enqueue() before it
+	 * dispatches its own entry, never these into channels that cannot carry
+	 * them yet (issue #967).
+	 */
+	private restored = new Set<string>();
 
 	constructor(
 		payInvoiceSafe: PayInvoiceSafeFn,
@@ -80,19 +145,19 @@ export class PaymentQueue extends EventEmitter {
 		this.canSend = canSend;
 		this.maxConcurrent = options?.maxConcurrent ?? 3;
 		this.paymentTimeoutMs = options?.paymentTimeoutMs ?? 60_000;
+		this.resolveInterrupted = options?.resolveInterrupted;
 		this.storage = storage ?? null;
 
-		// Restore persisted queue entries
+		// Restore persisted queue entries. Nothing dispatches here: start()
+		// does, once the payer can pay (issue #967).
 		if (this.storage) {
 			try {
 				for (const row of this.storage.loadAllQueueEntries()) {
-					const restoredStatus =
-						row.status === 'dispatching' ? 'queued' : row.status;
 					const entry: QueuedPayment = {
 						id: row.id,
 						bolt11: row.bolt11,
 						priority: row.priority,
-						status: restoredStatus as QueuedPayment['status'],
+						status: row.status as QueuedPayment['status'],
 						amountSats: row.amountSats,
 						maxFeeSats: row.maxFeeSats,
 						metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
@@ -101,13 +166,33 @@ export class PaymentQueue extends EventEmitter {
 						completedAt: row.completedAt
 					};
 					this.queue.push(entry);
+					this.restored.add(row.id);
 
-					// Reset dispatching→queued in storage
+					// A row still 'dispatching' was in flight when the process
+					// stopped, and its payment may have been made. Sending it
+					// again is not safe: the node refuses a second payment to the
+					// same hash only while the first is pending, so one that
+					// already completed would be paid twice (issue #967). It
+					// stays 'dispatching' until start() has the resolver settle
+					// it. With no resolver it is recorded 'failed', for the
+					// operator to check.
 					if (row.status === 'dispatching') {
-						try {
-							this.storage.updateQueueEntryStatus(row.id, 'queued');
-						} catch {
-							/* best-effort */
+						if (this.resolveInterrupted) {
+							this.interrupted.add(row.id);
+						} else {
+							entry.status = 'failed';
+							entry.error = INTERRUPTED_PAYMENT_ERROR;
+							entry.completedAt = Date.now();
+							try {
+								this.storage.updateQueueEntryStatus(
+									row.id,
+									entry.status,
+									entry.error,
+									entry.completedAt
+								);
+							} catch {
+								/* best-effort */
+							}
 						}
 					}
 
@@ -142,17 +227,31 @@ export class PaymentQueue extends EventEmitter {
 			metadata?: Record<string, string>;
 		}
 	): QueuedPayment {
-		if (!bolt11) throw new Error('bolt11 is required');
-		if (priority < 1 || priority > 10)
-			throw new Error('priority must be between 1 and 10');
+		if (!bolt11) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'bolt11 is required'
+			);
+		}
+		if (!(priority >= 1 && priority <= 10)) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'priority must be between 1 and 10'
+			);
+		}
+		// A persisted amount the capacity check refuses would be refused again
+		// at every start, so it is refused here, before it is stored (issue
+		// #967).
+		const amountSats = optionalSats(opts?.amountSats, 'amountSats');
+		const maxFeeSats = optionalSats(opts?.maxFeeSats, 'maxFeeSats');
 
 		const entry: QueuedPayment = {
 			id: `q-${++this.idCounter}-${Date.now()}`,
 			bolt11,
 			priority,
 			status: 'queued',
-			amountSats: opts?.amountSats,
-			maxFeeSats: opts?.maxFeeSats,
+			amountSats,
+			maxFeeSats,
 			metadata: opts?.metadata,
 			createdAt: Date.now()
 		};
@@ -256,52 +355,207 @@ export class PaymentQueue extends EventEmitter {
 	}
 
 	/**
+	 * Start dispatching what the constructor restored, once the payer can pay
+	 * (issue #967). Each entry that was 'dispatching' when the process stopped
+	 * is settled by the resolver first: a payment that was made is recorded
+	 * 'completed' and never sent again, one that paid nothing is queued
+	 * again, and one whose HTLCs are still out stays 'dispatching' until they
+	 * resolve. Such an entry holds no concurrency slot while it waits (a
+	 * stuck HTLC can last until its expiry, and canSend already counts what
+	 * it holds), so the restored 'queued' entries dispatch now rather than on
+	 * the next enqueue(). Until this runs, restored entries do not dispatch
+	 * at all; entries enqueued since do. Runs once, and does nothing after
+	 * stop().
+	 */
+	start(): void {
+		if (this.stopped || this.started) return;
+		this.started = true;
+		const interrupted = this.queue.filter((e) => this.interrupted.has(e.id));
+		this.interrupted.clear();
+		for (const entry of interrupted) this.reconcileInterrupted(entry);
+		this.processQueue();
+	}
+
+	/**
+	 * Look at the queue again because capacity may have appeared, such as a
+	 * channel that can carry HTLCs again after a restart (issue #967). An
+	 * entry held back by canSend otherwise waits for the next enqueue() or
+	 * finished dispatch. Does nothing before start() or after stop().
+	 */
+	poke(): void {
+		if (!this.started || this.stopped) return;
+		this.processQueue();
+	}
+
+	/**
 	 * Stop dispatching, for shutdown. Payments already dispatching still
 	 * record how they ended; queued ones, including any enqueued after this,
 	 * stay 'queued' in storage. The next start restores them, and they
-	 * dispatch on its first enqueue(). Without this, a dispatch against the
-	 * stopped node fails at once and persists 'failed', now that the database
-	 * stays open while the wallet stops (issue #958).
+	 * dispatch on its start(). Without this, a dispatch against the stopped
+	 * node fails at once and persists 'failed', now that the database stays
+	 * open while the wallet stops (issue #958). A restored in-flight entry
+	 * the resolver has not settled yet stays 'dispatching', for the next
+	 * start to settle (issue #967).
 	 */
 	stop(): void {
 		this.stopped = true;
+	}
+
+	/**
+	 * Settle one restored entry that was 'dispatching' when the process
+	 * stopped (issue #967). An outcome that arrives after stop() is still
+	 * recorded, as dispatchPayment records one; an 'unpaid' entry is then
+	 * left 'queued' for the next start.
+	 */
+	private reconcileInterrupted(entry: QueuedPayment): void {
+		const resolve = this.resolveInterrupted;
+		if (!resolve) return;
+		let outcome: Promise<InterruptedPaymentOutcome>;
+		try {
+			outcome = Promise.resolve(resolve(entry.bolt11));
+		} catch {
+			// Unknown right now: it stays 'dispatching' for the next start.
+			return;
+		}
+		outcome
+			.then(
+				(result) => this.recordInterruptedOutcome(entry, result),
+				() => {
+					// Unknown right now: it stays 'dispatching' for the next start.
+				}
+			)
+			.catch(() => {
+				// A 'queue:completed' listener threw. The outcome is already
+				// recorded, and the throw must not become an unhandled
+				// rejection.
+			});
+	}
+
+	private recordInterruptedOutcome(
+		entry: QueuedPayment,
+		result: InterruptedPaymentOutcome | undefined
+	): void {
+		if (entry.status !== 'dispatching') return;
+		if (
+			result?.status === 'completed' &&
+			typeof result.paymentHash === 'string'
+		) {
+			entry.status = 'completed';
+			entry.completedAt = Date.now();
+			if (this.storage) {
+				try {
+					this.storage.updateQueueEntryStatus(
+						entry.id,
+						entry.status,
+						undefined,
+						entry.completedAt
+					);
+				} catch {
+					/* best-effort */
+				}
+			}
+			this.emit('queue:completed', {
+				id: entry.id,
+				paymentHash: result.paymentHash
+			});
+			return;
+		}
+		// Anything but a clear 'unpaid' is treated as unknown, never as leave
+		// to send the payment again.
+		if (result?.status !== 'unpaid') return;
+		// Every HTLC it offered resolved and none paid, so nothing was paid:
+		// it takes its turn again like any queued payment.
+		entry.status = 'queued';
+		if (this.storage) {
+			try {
+				this.storage.updateQueueEntryStatus(entry.id, entry.status);
+			} catch {
+				/* best-effort */
+			}
+		}
+		this.processQueue();
 	}
 
 	private processQueue(): void {
 		if (this.processing || this.stopped) return;
 		this.processing = true;
 
-		// Process all eligible entries
-		while (this.activeCount < this.maxConcurrent) {
-			const next = this.queue.find((e) => e.status === 'queued');
-			if (!next) break;
+		// Reset however the pass ends: a throw that left it set would stop
+		// every later pass, and so the queue, for good (issue #967).
+		try {
+			// Process all eligible entries
+			while (this.activeCount < this.maxConcurrent) {
+				// A restored entry waits for start() (issue #967).
+				const next = this.queue.find(
+					(e) =>
+						e.status === 'queued' && (this.started || !this.restored.has(e.id))
+				);
+				if (!next) break;
 
-			// Check capacity
-			const amountToCheck = next.amountSats ?? 0;
-			if (amountToCheck > 0) {
-				const check = this.canSend(amountToCheck);
-				if (!check.canSend) break; // No capacity, stop processing
-			}
-
-			next.status = 'dispatching';
-			this.activeCount++;
-			this.emit('queue:dispatched', { id: next.id, bolt11: next.bolt11 });
-
-			if (this.storage) {
-				try {
-					this.storage.updateQueueEntryStatus(next.id, 'dispatching');
-				} catch {
-					/* best-effort */
+				// Check capacity
+				const amountToCheck = next.amountSats ?? 0;
+				if (!isWholeSats(amountToCheck)) {
+					// A row stored before enqueue() validated amounts: the check
+					// refuses it on every pass, so fail it rather than hold the
+					// rest behind it.
+					this.failUndispatchable(
+						next,
+						new Error(`amountSats ${SATS_MESSAGE}`)
+					);
+					continue;
 				}
+				if (amountToCheck > 0) {
+					let check: ReturnType<CanSendFn>;
+					try {
+						check = this.canSend(amountToCheck);
+					} catch {
+						// Any other refusal is temporary (no node yet, say):
+						// treated as no capacity, and looked at again later.
+						break;
+					}
+					if (!check.canSend) break; // No capacity, stop processing
+				}
+
+				next.status = 'dispatching';
+				this.activeCount++;
+				this.emit('queue:dispatched', { id: next.id, bolt11: next.bolt11 });
+
+				if (this.storage) {
+					try {
+						this.storage.updateQueueEntryStatus(next.id, 'dispatching');
+					} catch {
+						/* best-effort */
+					}
+				}
+
+				// Fire and forget -- will call back when done
+				this.dispatchPayment(next).catch(() => {
+					// Error already handled in dispatchPayment
+				});
 			}
-
-			// Fire and forget -- will call back when done
-			this.dispatchPayment(next).catch(() => {
-				// Error already handled in dispatchPayment
-			});
+		} finally {
+			this.processing = false;
 		}
+	}
 
-		this.processing = false;
+	/** Record a queued entry that can never be dispatched as failed. */
+	private failUndispatchable(entry: QueuedPayment, err: unknown): void {
+		entry.status = 'failed';
+		entry.error = err instanceof Error ? err.message : String(err);
+		entry.completedAt = Date.now();
+		if (this.storage) {
+			try {
+				this.storage.updateQueueEntryStatus(
+					entry.id,
+					entry.status,
+					entry.error,
+					entry.completedAt
+				);
+			} catch {
+				/* best-effort */
+			}
+		}
+		this.emit('queue:failed', { id: entry.id, error: entry.error });
 	}
 
 	private async dispatchPayment(entry: QueuedPayment): Promise<void> {

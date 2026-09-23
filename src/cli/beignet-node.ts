@@ -160,7 +160,10 @@ import {
 	ChannelFundingUnavailableCode,
 	SpliceRefusalCode,
 	IHoldCancelledEvent,
-	IHoldInvoiceStateEvent
+	IHoldInvoiceStateEvent,
+	IStructuredLog,
+	PaymentDirection,
+	PaymentStatus
 } from '../lightning/node/types';
 import {
 	BITCOIN_CHAIN_HASH,
@@ -169,6 +172,8 @@ import {
 	isAnchorChannel,
 	ChannelState
 } from '../lightning/channel/types';
+import { isRecencyUnproven } from '../lightning/channel/channel-state';
+import type { Channel } from '../lightning/channel/channel';
 import { decode as decodeInvoice } from '../lightning/invoice/decode';
 import { decodeOffer } from '../lightning/offer/decode';
 import {
@@ -177,7 +182,7 @@ import {
 	describeFailureCode,
 	isRetryableError
 } from './errors';
-import { PaymentQueue } from './payment-queue';
+import { InterruptedPaymentOutcome, PaymentQueue } from './payment-queue';
 import {
 	NodeInfo,
 	PeerInfo,
@@ -1425,6 +1430,37 @@ function isHeldRestore(ch: {
 		ch.restoreRevokedRisk === true
 	);
 }
+
+/** States a channel never takes a new HTLC from again. */
+const CLOSING_CHANNEL_STATES: ReadonlySet<ChannelState> = new Set([
+	ChannelState.SHUTTING_DOWN,
+	ChannelState.NEGOTIATING_CLOSING,
+	ChannelState.CLOSED,
+	ChannelState.FORCE_CLOSED,
+	ChannelState.ERRORED
+]);
+
+/**
+ * Whether a channel can still come to take a new HTLC (issue #967): one that
+ * is closing, closed or failed cannot, looked through a pending reestablish,
+ * and neither can one under a recency hold, which ends only in a close.
+ */
+function canBecomeUsable(channel: Channel): boolean {
+	const st = channel.getFullState();
+	const effective =
+		st.state === ChannelState.AWAITING_REESTABLISH && st.preReestablishState
+			? st.preReestablishState
+			: st.state;
+	return !CLOSING_CHANNEL_STATES.has(effective) && !isRecencyUnproven(st);
+}
+
+/**
+ * Private trigger for the pay-readiness wait: a channel closed, failed or
+ * went away, so "no live channel left" may now hold (issue #967). A symbol,
+ * so it is no public event, and shutdown's removeAllListeners() takes its
+ * listeners with the rest.
+ */
+const CHANNELS_CHANGED = Symbol('channels-changed');
 
 /**
  * The refusal an operator force close of a capsule-restored channel gets
@@ -2687,6 +2723,80 @@ export class BeignetNode extends EventEmitter {
 			this.refreshStaticChannelBackup();
 			this.emit('channel:ready', { channelId });
 		});
+		// A channel that can take a new HTLC again (issue #967): it reached
+		// NORMAL on channel_ready, or finished reestablishing on a reconnect.
+		// node:ready fires once the peers' init handshakes are done, before
+		// any reestablish, so the payment queues wait for this instead.
+		const usableNode = this.node;
+		// Out of the channel manager's dispatch turn: a payment the event
+		// releases must not be sent from inside the message handler that is
+		// still finishing the reestablish or the splice lock.
+		const deferEmit = (emit: () => void): void => {
+			setImmediate(() => {
+				if (this.destroyed || this._resuming || this.node !== usableNode) {
+					return;
+				}
+				try {
+					emit();
+				} catch (err: unknown) {
+					try {
+						this.log('warn', 'A payment-readiness listener failed', {
+							error: err instanceof Error ? err.message : String(err)
+						});
+					} catch {
+						// A throwing log listener must not crash the process
+						// from a timer callback either.
+					}
+				}
+			});
+		};
+		const announceUsable = (channelId: Buffer): void =>
+			deferEmit(() => {
+				const channel = usableNode.getChannelManager().getChannel(channelId);
+				if (!channel?.acceptsNewHtlcs()) return;
+				this.emit('channel:usable', { channelId: channelId.toString('hex') });
+			});
+		this.node.on('channel:ready', (data: { channelId: Buffer }) =>
+			announceUsable(data.channelId)
+		);
+		this.node
+			.getChannelManager()
+			.on('channel:reestablished', (channelId: Buffer) =>
+				announceUsable(channelId)
+			);
+		// A splice that locks, or one that unwinds, can leave the channel
+		// usable where the reestablish could not (still SPLICING then, or a
+		// taproot channel parked until splice_locked). One channel grown by
+		// splice is the whole of a typical wallet.
+		for (const event of [
+			'splice:complete',
+			'splice:aborted',
+			'splice:reverted'
+		]) {
+			this.node.on(event, (data: { channelId: Buffer }) =>
+				announceUsable(data.channelId)
+			);
+		}
+		// The funding quarantine lifting says so only in its structured log.
+		this.node.on('log', (entry: IStructuredLog) => {
+			if (entry?.action !== 'funding_missing_quarantine_lifted') return;
+			const idHex = entry.data?.channelId;
+			if (typeof idHex === 'string') announceUsable(Buffer.from(idHex, 'hex'));
+		});
+		// A channel that closed, failed or went away may have been the last
+		// live one; the pay-readiness wait then stops waiting.
+		const channelsChanged = (): void =>
+			deferEmit(() => this.emit(CHANNELS_CHANGED));
+		for (const event of [
+			'channel:pending-close',
+			'channel:force-closing',
+			'channel:closed',
+			'channel:voided',
+			'channel:aborted'
+		]) {
+			this.node.on(event, channelsChanged);
+		}
+		this.node.getChannelManager().on('channel:errored', channelsChanged);
 		this.node.on('channel:closed', (data: { channelId: Buffer }) => {
 			const channelId = data.channelId.toString('hex');
 			this.log('info', 'Channel closed', { channelId });
@@ -11876,19 +11986,191 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Payment Queue ───────────────
 
+	/**
+	 * How a payment the payment queue was dispatching when the process last
+	 * stopped ended, from this node's own record for its invoice (issue
+	 * #967). The queue's resolver for such an entry: it must know this before
+	 * sending the invoice again, since sendPayment refuses a second payment
+	 * to a hash only while the first is PENDING. A COMPLETED one would be
+	 * paid again with a new HTLC, and a PENDING one would come back from
+	 * payInvoiceSafe as that record and be marked failed although it may
+	 * still complete.
+	 *
+	 * Resolves once every HTLC the node offered for the hash is terminal,
+	 * which for one stuck at a peer can take until its expiry. 'completed'
+	 * when the preimage is known or the record says COMPLETED; 'unpaid'
+	 * otherwise, since the PENDING record is committed before any HTLC is
+	 * offered and the HTLC view covers offered HTLCs even without a record:
+	 * resolved with no preimage means nothing was paid. The in-memory record
+	 * and preimage are pruned 24 hours after completion (and oldest first past
+	 * the size cap), and the cleanup tick can run before this does, so the
+	 * durable record is read before answering 'unpaid': pruning leaves it on
+	 * disk. Throws while there is no node to ask (restore pending, a capsule
+	 * restore rebuilding it, a restart required, destroyed) or the durable
+	 * record cannot be read; the queue then leaves the entry for the next
+	 * start.
+	 */
+	async resolveInterruptedPayment(
+		bolt11: string
+	): Promise<InterruptedPaymentOutcome> {
+		if (this.destroyed) {
+			throw new BeignetError(
+				BeignetErrorCode.NODE_DESTROYED,
+				'Node is shut down; an interrupted payment is settled at the next start'
+			);
+		}
+		if (this._restorePending || this._resuming) {
+			throw new BeignetError(
+				'NODE_RESTORE_PENDING',
+				'No node is running yet to settle an interrupted payment against'
+			);
+		}
+		if (this._restartRequired) {
+			throw new BeignetError(
+				'NODE_RESTART_REQUIRED',
+				'A capsule restore replaced this database; an interrupted payment ' +
+					'is settled after the restart'
+			);
+		}
+		let paymentHash: Buffer;
+		try {
+			// The decoder sendPayment uses. A string it cannot decode never
+			// reached an HTLC, and sending it again fails it as before.
+			paymentHash = decodeInvoice(bolt11).paymentHash;
+		} catch {
+			return { status: 'unpaid' };
+		}
+		const hashHex = paymentHash.toString('hex');
+		const view = await this.node.awaitPaymentResolution(paymentHash);
+		if (view.preimage || view.status === PaymentStatus.COMPLETED) {
+			return { status: 'completed', paymentHash: hashHex };
+		}
+		// Only an OUTGOING record counts: the preimage store alone also holds
+		// this node's own invoices' preimages. A read that throws propagates,
+		// so the entry waits rather than being sent on a guess.
+		const durable = this.storage.loadPayment(hashHex);
+		if (
+			durable?.direction === PaymentDirection.OUTGOING &&
+			(durable.status === PaymentStatus.COMPLETED ||
+				durable.preimage !== undefined)
+		) {
+			return { status: 'completed', paymentHash: hashHex };
+		}
+		return { status: 'unpaid' };
+	}
+
+	/**
+	 * True when a new HTLC can go out now: some channel accepts one, or no
+	 * channel can ever come to (none at all, or only closing, closed or held
+	 * ones), where waiting would never end and a payment fails on its own
+	 * terms (issue #967).
+	 */
+	private canCarryHtlc(): boolean {
+		const live = this.node
+			.getChannelManager()
+			.listChannels()
+			.filter(canBecomeUsable);
+		return live.length === 0 || live.some((ch) => ch.acceptsNewHtlcs());
+	}
+
+	/**
+	 * Run `run` once this node can pay: after a pending guardian restore has
+	 * built the node, once the node is ready, and once some channel can carry
+	 * an HTLC. node:ready alone comes after the peers' init handshakes and
+	 * before any channel_reestablish, when every restored channel still
+	 * refuses new HTLCs: a payment sent then fails for want of a route, and
+	 * one held back by canSend waits for the next enqueue. Never while a
+	 * capsule restore rebuilds the node or a restart is required, and never
+	 * after shutdown. The payment queues start here (issue #967).
+	 */
+	whenReadyToPay(run: () => void): void {
+		if (this.destroyed) return;
+		if (this._restorePending) {
+			// Shutdown removes every listener, so this cannot outlive the node.
+			this.once('recovery:restored', () => this.whenReadyToPay(run));
+			return;
+		}
+		if (this._resuming || this._restartRequired) return;
+		const node = this.node;
+		// Bound to the node it was asked about: a capsule restore that
+		// rebuilds the node retires the wait.
+		const live = (): boolean =>
+			!this.destroyed &&
+			!this._resuming &&
+			!this._restartRequired &&
+			this.node === node;
+		let ready: Promise<void>;
+		try {
+			ready = node.waitForReady(BeignetNode.MAX_TIMER_MS);
+		} catch {
+			return;
+		}
+		ready
+			.then(
+				() => {
+					if (!live()) return;
+					if (this.canCarryHtlc()) {
+						run();
+						return;
+					}
+					// Looked at again when a channel becomes usable, and when one
+					// closes or goes away, which can leave no live channel.
+					// Shutdown removes every listener, so this cannot outlive
+					// the node; a retired wait removes itself on the next event.
+					const recheck = (): void => {
+						if (live() && !this.canCarryHtlc()) return;
+						this.removeListener('channel:usable', recheck);
+						this.removeListener(CHANNELS_CHANGED, recheck);
+						if (live()) run();
+					};
+					this.on('channel:usable', recheck);
+					this.on(CHANNELS_CHANGED, recheck);
+				},
+				() => {
+					// Destroyed (a shutdown, or a capsule restore rebuilding the
+					// node) before it was ready: nothing to start.
+				}
+			)
+			.catch((err: unknown) => {
+				try {
+					this.log('warn', 'Starting the payment queue failed', {
+						error: err instanceof Error ? err.message : String(err)
+					});
+				} catch {
+					// A throwing log listener must not become an unhandled
+					// rejection either.
+				}
+			});
+	}
+
 	private getPaymentQueue(): PaymentQueue {
 		if (!this.paymentQueue) {
 			this.paymentQueue = new PaymentQueue(
 				(bolt11, timeout, maxFee, amount, meta) =>
 					this.payInvoiceSafe(bolt11, timeout, maxFee, amount, meta),
-				(amount) => this.canSend(amount),
-				undefined,
+				// No node yet (a guardian restore pending): no capacity, for
+				// now, rather than a throw (issue #967).
+				(amount) =>
+					(this.node as LightningNode | undefined)
+						? this.canSend(amount)
+						: { canSend: false, availableSats: 0 },
+				// A restored entry that was in flight is settled against the
+				// node's record before anything sends it again (issue #967).
+				{ resolveInterrupted: (b) => this.resolveInterruptedPayment(b) },
 				this.storage
 			);
 			// First built after shutdown began, while the database stays open
 			// for the wallet: the rows it restored must not dispatch against
-			// the stopped node and persist 'failed' (issue #958).
-			if (this.destroyed) this.paymentQueue.stop();
+			// the stopped node and persist 'failed' (issue #958). Otherwise
+			// they dispatch once the node can pay, not on the next enqueue(),
+			// and one held back by canSend is looked at again whenever a
+			// channel can carry HTLCs again (issue #967).
+			if (this.destroyed) {
+				this.paymentQueue.stop();
+			} else {
+				this.whenReadyToPay(() => this.paymentQueue?.start());
+				this.on('channel:usable', () => this.paymentQueue?.poke());
+			}
 		}
 		return this.paymentQueue;
 	}

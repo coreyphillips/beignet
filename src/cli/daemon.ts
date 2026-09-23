@@ -1082,7 +1082,10 @@ async function bootDaemon(
 		(bolt11, timeout, maxFee, amount, meta) =>
 			node.payInvoiceSafe(bolt11, timeout, maxFee, amount, meta),
 		(amount) => node.canSend(amount),
-		undefined,
+		// A restored entry that was in flight at the last stop is settled
+		// against the node's record before anything sends it again (issue
+		// #967).
+		{ resolveInterrupted: (b) => node.resolveInterruptedPayment(b) },
 		storage
 	);
 	const rateLimiter = opts.rateLimit
@@ -3383,6 +3386,15 @@ async function bootDaemon(
 		server.on('error', reject);
 		server.listen(port, host, () => {
 			logger?.info(`Daemon listening on ${host}:${port}`);
+			// What the queue restored dispatches once the node can pay, not on
+			// the next enqueue (issue #967). Started only now that the boot
+			// can no longer fail: a failed boot destroys the node without
+			// stopping the queue. stop() halts the queue first, so a start
+			// that comes after it does nothing. A payment held back by canSend
+			// is looked at again whenever a channel can carry HTLCs again,
+			// not only on the next enqueue.
+			node.whenReadyToPay(() => paymentQueue.start());
+			node.on('channel:usable', () => paymentQueue.poke());
 			resolve({ server, node, stop });
 		});
 	});

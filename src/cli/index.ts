@@ -24,7 +24,13 @@ export {
 } from './auth';
 export { getOpenApiSpec } from './openapi';
 export { WebhookManager, IWebhookStorage } from './webhooks';
-export { PaymentQueue, IPaymentQueueStorage } from './payment-queue';
+export {
+	PaymentQueue,
+	IPaymentQueueStorage,
+	PaymentQueueOptions,
+	InterruptedPaymentOutcome,
+	INTERRUPTED_PAYMENT_ERROR
+} from './payment-queue';
 export { HttpRateLimiter, RateLimitOptions } from './http-rate-limiter';
 export {
 	LightningErrorCode,
