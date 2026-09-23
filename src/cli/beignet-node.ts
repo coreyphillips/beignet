@@ -185,7 +185,11 @@ import {
 	describeFailureCode,
 	isRetryableError
 } from './errors';
-import { InterruptedPaymentOutcome, PaymentQueue } from './payment-queue';
+import {
+	IPaymentQueueStorage,
+	InterruptedPaymentOutcome,
+	PaymentQueue
+} from './payment-queue';
 import {
 	NodeInfo,
 	PeerInfo,
@@ -4587,6 +4591,16 @@ export class BeignetNode extends EventEmitter {
 			}
 			this._resuming = false;
 			this._bootTargetEmpty = false;
+			// The queue's wait to start was bound to the node just torn down;
+			// the rebuilt node gets its own. start() runs once, so a queue
+			// already started only looks at its held entries again (issue
+			// #978).
+			if (this.paymentQueue) {
+				this.whenReadyToPay(() => {
+					this.paymentQueue?.start();
+					this.paymentQueue?.poke();
+				});
+			}
 			// The candidates served their purpose; a fresh boot would hold
 			// none, and the peers re-send on their next connect anyway.
 			this._peerRetrievedCapsules.clear();
@@ -4931,6 +4945,9 @@ export class BeignetNode extends EventEmitter {
 			clearInterval(this._fallbackRecoveryTimer);
 			this._fallbackRecoveryTimer = undefined;
 		}
+		// The queue itself stays, and is not stopped: stop() is for good, and
+		// after the resume it serves the rebuilt node over the installed
+		// database through its live storage view (issue #978).
 		this.paymentQueue?.removeAllListeners();
 		this.node.destroy();
 		// The node's destroy() closes only its view of the database (issue
@@ -4954,10 +4971,11 @@ export class BeignetNode extends EventEmitter {
 	 * Daemon-local state that lives in the database beside the channel
 	 * state, and must follow the operator into the restored one: persisted
 	 * API-key rotations and revocations (a dropped override resurrects a
-	 * revoked secret), registered webhooks, and the peer addresses just
-	 * used to retrieve the capsules (so the restored node dials its channel
-	 * peers on its own). The auth override is mandatory; the rest is best
-	 * effort and logged.
+	 * revoked secret), registered webhooks, the payment queue's rows (the
+	 * queue outlives an in-process resume and updates them later, issue
+	 * #978), and the peer addresses just used to retrieve the capsules (so
+	 * the restored node dials its channel peers on its own). The auth
+	 * override is mandatory; the rest is best effort and logged.
 	 */
 	private carryDaemonState(from: SqliteStorage, to: SqliteStorage): void {
 		const overrides = from.loadWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY);
@@ -4976,6 +4994,25 @@ export class BeignetNode extends EventEmitter {
 			}
 		} catch (err) {
 			this.log('warn', 'Could not carry webhooks into the restore', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+		try {
+			for (const row of from.loadAllQueueEntries()) {
+				// saveQueueEntry writes the columns an enqueue sets; the
+				// outcome columns follow as the queue records them.
+				to.saveQueueEntry(row);
+				if (row.error !== undefined || row.completedAt !== undefined) {
+					to.updateQueueEntryStatus(
+						row.id,
+						row.status,
+						row.error,
+						row.completedAt
+					);
+				}
+			}
+		} catch (err) {
+			this.log('warn', 'Could not carry the payment queue into the restore', {
 				error: err instanceof Error ? err.message : String(err)
 			});
 		}
@@ -12171,7 +12208,15 @@ export class BeignetNode extends EventEmitter {
 			});
 	}
 
-	private getPaymentQueue(): PaymentQueue {
+	/**
+	 * The one payment queue this process runs over the payment_queue table
+	 * (issue #978), built on first use. The daemon's routes under /queue and
+	 * enqueuePayment/listQueue/cancelQueuedPayment all serve this instance:
+	 * a second queue over the same table would restore and dispatch the same
+	 * rows. It persists through the node's CURRENT storage, so it survives an
+	 * in-process capsule resume that replaces the database.
+	 */
+	getPaymentQueue(): PaymentQueue {
 		if (!this.paymentQueue) {
 			this.paymentQueue = new PaymentQueue(
 				(bolt11, timeout, maxFee, amount, meta) =>
@@ -12185,7 +12230,7 @@ export class BeignetNode extends EventEmitter {
 				// A restored entry that was in flight is settled against the
 				// node's record before anything sends it again (issue #967).
 				{ resolveInterrupted: (b) => this.resolveInterruptedPayment(b) },
-				this.storage
+				this.liveQueueStorage()
 			);
 			// First built after shutdown began, while the database stays open
 			// for the wallet: the rows it restored must not dispatch against
@@ -12201,6 +12246,22 @@ export class BeignetNode extends EventEmitter {
 			}
 		}
 		return this.paymentQueue;
+	}
+
+	/**
+	 * The payment queue's view of storage: this.storage on every call, never
+	 * the handle the queue was built over. A capsule resume closes that
+	 * handle and installs a new one, and a write to the closed one throws
+	 * (issue #978).
+	 */
+	private liveQueueStorage(): IPaymentQueueStorage {
+		return {
+			saveQueueEntry: (entry) => this.storage.saveQueueEntry(entry),
+			updateQueueEntryStatus: (id, status, error, completedAt) =>
+				this.storage.updateQueueEntryStatus(id, status, error, completedAt),
+			deleteQueueEntry: (id) => this.storage.deleteQueueEntry(id),
+			loadAllQueueEntries: () => this.storage.loadAllQueueEntries()
+		};
 	}
 
 	enqueuePayment(
@@ -12801,7 +12862,11 @@ export class BeignetNode extends EventEmitter {
 		return this.node;
 	}
 
-	/** Access the underlying SqliteStorage — used by daemon for webhook/queue persistence. */
+	/**
+	 * The node's current SqliteStorage. An in-process capsule resume closes
+	 * it and installs a new one, so anything that persists through it reads
+	 * this on every call instead of keeping the handle (issue #978).
+	 */
 	getStorage(): SqliteStorage {
 		return this.storage;
 	}
