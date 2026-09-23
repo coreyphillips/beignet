@@ -22,7 +22,9 @@ export const DUST_LIMITS = {
 };
 
 /**
- * How long stop() waits for an in-flight refresh before shutting down anyway.
+ * How long stop() waits for an in-flight refresh, and for the storage writes
+ * already queued when it was called, before shutting down anyway. The two
+ * share this one deadline.
  *
  * A refresh is not itself bounded: it awaits an Electrum client that falls into
  * an untimed server_version handshake whenever a network has no client, plus
