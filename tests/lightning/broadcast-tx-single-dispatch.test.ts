@@ -83,6 +83,8 @@ function makeNodeConfig(label: string): INodeConfig {
  */
 class MempoolBackend implements IChainBackend {
 	broadcasts: string[] = [];
+	/** When set, every submission is refused with this reason. */
+	refusal: string | null = null;
 	private accepted: Set<string> = new Set();
 
 	async subscribeToHeaders(): Promise<void> {}
@@ -97,6 +99,7 @@ class MempoolBackend implements IChainBackend {
 	}
 	async broadcastTransaction(rawTxHex: string): Promise<string> {
 		this.broadcasts.push(rawTxHex);
+		if (this.refusal !== null) throw new Error(this.refusal);
 		const txid = bitcoin.Transaction.fromHex(rawTxHex).getId();
 		if (this.accepted.has(txid)) {
 			throw new Error('txn-already-in-mempool');
@@ -174,8 +177,23 @@ describe('broadcast:tx single dispatch', () => {
 	});
 
 	it('still surfaces BROADCAST_FAILED when the backend genuinely rejects', async () => {
+		// A refusal that means the tx can never be on the network.
+		backend.refusal = 'bad-txns-inputs-missingorspent';
+
+		node.getChannelManager().emit('broadcast:tx', makeSweepTx().toBuffer());
+		await new Promise((resolve) => setTimeout(resolve, 30));
+
+		expect(backend.broadcasts.length, 'one attempt was made').to.equal(1);
+		expect(
+			errors.filter((e) => e.code === 'BROADCAST_FAILED'),
+			'the genuine failure is still reported'
+		).to.have.length(1);
+	});
+
+	it('does not raise BROADCAST_FAILED for a tx the mempool already holds (issue #921)', async () => {
 		const tx = makeSweepTx();
-		// Pre-accept the txid so the real dispatch is rejected.
+		// Pre-accept the txid so the dispatch hears txn-already-in-mempool:
+		// the network has the tx, which is the success path.
 		await backend.broadcastTransaction(tx.toHex());
 		backend.broadcasts.length = 0;
 
@@ -185,7 +203,7 @@ describe('broadcast:tx single dispatch', () => {
 		expect(backend.broadcasts.length, 'one attempt was made').to.equal(1);
 		expect(
 			errors.filter((e) => e.code === 'BROADCAST_FAILED'),
-			'the genuine failure is still reported'
-		).to.have.length(1);
+			'a duplicate answer is not a failure'
+		).to.have.length(0);
 	});
 });

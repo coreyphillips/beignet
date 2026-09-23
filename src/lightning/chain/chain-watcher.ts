@@ -15,6 +15,7 @@ import { createFundingScript } from '../script/funding';
 import { createTaprootFundingScript } from '../script/funding-taproot';
 import { isTaprootChannel } from '../channel/types';
 import { IRREVOCABLE_DEPTH } from './types';
+import { isDuplicateBroadcastRejection } from './broadcast-rejection';
 
 bitcoin.initEccLib(ecc);
 
@@ -447,7 +448,9 @@ export async function classifyRemoteFundingInput(
  * - 'watch:output:requested' (txid: string, outputIndex: number): this watcher
  *   needs an output watched and cannot arm it itself
  * - 'block' (height: number)
- * - 'broadcast:success' (txid: string)
+ * - 'broadcast:success' (txid: string): also when the backend refuses a
+ *   transaction because it already has it, mined or in the mempool (issue
+ *   #921)
  * - 'broadcast:failure' (error: Error)
  * - 'broadcast:permanent_failure' (error: Error): retries exhausted
  * - 'error' (error: Error)
@@ -1492,6 +1495,13 @@ export class ChainWatcher extends EventEmitter {
 
 	// ─────────────── Private ───────────────
 
+	/** A broadcast refusal that says the network already has the tx. */
+	private isDuplicateRejection(err: unknown): boolean {
+		return isDuplicateBroadcastRejection(
+			err instanceof Error ? err.message : String(err)
+		);
+	}
+
 	/**
 	 * ChannelManager subscriptions are held as named handlers so stop() can
 	 * detach them. Registered inline, a stopped watcher kept receiving channel
@@ -1584,21 +1594,32 @@ export class ChainWatcher extends EventEmitter {
 			// A rejection that lands after teardown must not repopulate the retry
 			// queue of a watcher that is no longer retrying anything.
 			if (!this.isCurrentGeneration(generation)) return;
-			// Queue for retry on next block. Guard the decode so a malformed
-			// payload is logged and dropped rather than throwing an unhandled
-			// rejection inside this catch handler (which would crash the process).
+			// Guard the decode so a malformed payload is logged and dropped
+			// rather than throwing an unhandled rejection inside this catch
+			// handler (which would crash the process).
+			let txidHex: string | null = null;
 			try {
-				const txidHex = bitcoin.Transaction.fromBuffer(tx).getId();
-				// Dedup by txid
-				if (!this.failedBroadcasts.some((fb) => fb.txidHex === txidHex)) {
-					this.failedBroadcasts.push({
-						rawTx: Buffer.from(tx),
-						txidHex,
-						retryCount: 0
-					});
-				}
+				txidHex = bitcoin.Transaction.fromBuffer(tx).getId();
 			} catch {
 				// Not a decodable transaction; nothing to queue for retry.
+			}
+			// The network already has this exact transaction, mined or in the
+			// mempool: that is the success path. Queued, every retry would hear
+			// the same answer until the permanent failure (issue #921).
+			if (txidHex !== null && this.isDuplicateRejection(err)) {
+				this.emit('broadcast:success', txidHex);
+				return;
+			}
+			// Queue for retry on next block, deduped by txid.
+			if (
+				txidHex !== null &&
+				!this.failedBroadcasts.some((fb) => fb.txidHex === txidHex)
+			) {
+				this.failedBroadcasts.push({
+					rawTx: Buffer.from(tx),
+					txidHex,
+					retryCount: 0
+				});
 			}
 			this.emit('broadcast:failure', err);
 		});
@@ -1664,10 +1685,15 @@ export class ChainWatcher extends EventEmitter {
 					);
 					continue;
 				}
-				this.broadcastTransaction(fb.rawTx).catch(() => {
+				this.broadcastTransaction(fb.rawTx).catch((err) => {
 					// A rejection landing after teardown must not repopulate the
 					// queue stop() just cleared, or the next start retries it.
 					if (!this.isCurrentGeneration(generation)) return;
+					// Mined or in the mempool by now: done, as on a success.
+					if (this.isDuplicateRejection(err)) {
+						this.emit('broadcast:success', fb.txidHex);
+						return;
+					}
 					// Still failing — re-queue with dedup
 					if (
 						!this.failedBroadcasts.some(
