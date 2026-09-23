@@ -9300,12 +9300,13 @@ export class BeignetNode extends EventEmitter {
 	 * What a payment:failed report does to the hash's claims. Every
 	 * reservation under the hash goes when nothing is in flight for it any
 	 * more (the engine gave up after its last HTLC failed back, or refused
-	 * before dispatching): a 'failed' HTLC does not count as in flight, so
-	 * the give-up report itself sees none. The records stay, for a settlement
-	 * that still arrives and for the boot reconciliation. With an HTLC still
-	 * in flight (a cancelPayment on a live HTLC) every claim stays whole: the
-	 * HTLC cannot be retracted, and its settle charges a claim. Nothing is
-	 * asked of the engine for a hash that holds no reservation.
+	 * before dispatching): a failed HTLC counts as in flight only until its
+	 * removal is irrevocable, and the engine gives up only after that (issue
+	 * #989), so the give-up report itself sees none. The records stay, for a
+	 * settlement that still arrives and for the boot reconciliation. With an
+	 * HTLC still in flight (a cancelPayment on a live HTLC) every claim stays
+	 * whole: the HTLC cannot be retracted, and its settle charges a claim.
+	 * Nothing is asked of the engine for a hash that holds no reservation.
 	 */
 	private _releaseAsyncSpendClaimsUnlessInFlight(paymentHash: Buffer): void {
 		const claims = this._asyncSpendClaims.get(paymentHash.toString('hex'));

@@ -14,8 +14,9 @@
  * or a COMPLETED record refuses as completed, an HTLC that is still out
  * refuses as in flight, and the durable row (or, without storage, the set
  * of pruned paid hashes) answers for a record pruned from memory. A failed
- * HTLC does not count as in flight, so the retry that re-enters sendPayment
- * right after the peer's update_fail_htlc is not refused. sendPaymentToRoute,
+ * HTLC counts as in flight until its removal is irrevocable, which is also
+ * when the retry re-enters sendPayment (issue #989), so the retry is not
+ * refused. sendPaymentToRoute,
  * the explicit-route entry behind POST /payment/send-to-route, runs the same
  * check, except that only an OUTGOING PENDING record counts as in flight
  * there (a circular rebalance sends to its own fresh invoice), and a part of
@@ -420,9 +421,10 @@ describe('Issue #975: a hash is not paid again', () => {
 		const accept = b.handleFinalHopHtlc as (...args: unknown[]) => unknown;
 		let attempts = 0;
 		// The first HTLC comes back with a temporary failure, which the
-		// retry path answers by re-entering sendPayment at once, before the
-		// removal round for the failed HTLC has completed. The second is
-		// accepted.
+		// retry path answers by re-entering sendPayment once the removal
+		// round for the failed HTLC has completed (issue #989); the relay
+		// here is synchronous, so that round runs inside the send. The
+		// second is accepted.
 		b.handleFinalHopHtlc = (...args: unknown[]): unknown => {
 			attempts++;
 			if (attempts > 1) return accept.apply(bob, args);
