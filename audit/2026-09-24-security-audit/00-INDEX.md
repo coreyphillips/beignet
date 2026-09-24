@@ -63,3 +63,55 @@ Audit of master at commit 1086c09 (v0.22.0). Each file in this directory is a re
 ## Verified sound (high level)
 
 BOLT 8 Noise handshake and cipher rotation, wire codec bounds, BOLT 3 scripts and key derivation (Appendix C/E/F vectors pass), shachain handling, commitment construction and fee trimming, commitment_signed / revoke_and_ack ordering and persist-before-send, interactive-tx validation, Sphinx processing, failure-onion attribution, forwarding fee arithmetic, payment_secret and MPP set handling, keysend, hold invoices, SQLite parameterization and WAL/FULL durability, serialization round trips, swap scripts and refund construction, recovery frame AEAD and writer lease, guardian verb authentication, watchtower blob format and justice construction, coin selection and fee tables, multisig and taproot signing, BIP 21 parsing, daemon auth and scope keying, idempotency for BOLT 11 routes.
+
+## Filed on GitHub (2026-09-24)
+
+| File | Issue |
+|------|-------|
+| 06 | #1001 | 
+| 17 | #1002 |
+| 01 | #1003 |
+| 02 | #1004 |
+| 03 | #1005 |
+| 07 | #1006 |
+| 08 | #1007 |
+| 09 | #1008 |
+| 13 | #1009 |
+| 18 | #1010 |
+| 19 | #1011 |
+| 23 | #1012 |
+| 25 | #1013 |
+| 26 | #1014 |
+| 29 | #1015 |
+| 32 | #1016 |
+| 35 | #1017 |
+| 36 | #1018 |
+| 39 | #1019 |
+| 44 | #1020 |
+| 04 | #1021 |
+| 10 | #1022 |
+| 14 | #1023 |
+| 15 | #1024 |
+| 16 | #1025 |
+| 20 | #1026 |
+| 21 | #1027 |
+| 27 | #1028 |
+| 30 | #1029 |
+| 31 | #1030 |
+| 33 | #1031 |
+| 40 | #1032 |
+| 45 | #1033 |
+| 46 | #1034 |
+| 05 | #1035 |
+| 11 | #1036 |
+| 12 | #1037 |
+| 22 | #1038 |
+| 24 | #1039 |
+| 28 | #1040 |
+| 34 | #1041 |
+| 37 | #1042 |
+| 38 | #1043 |
+| 41 | #1044 |
+| 42 | #1045 |
+| 43 | #1046 |
+| 47 | #1047 |
