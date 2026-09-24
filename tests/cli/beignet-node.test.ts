@@ -325,6 +325,25 @@ describe('Config management', () => {
 		expect(resolved.alias).to.equal('fileAlias');
 	});
 
+	it('resolveConfig prefers BEIGNET_API_TOKEN over the file token, and reads the file token without it (issue #1005)', () => {
+		// beignet init writes the token to the file; an operator who sets the
+		// env var on top still gets the env var.
+		saveConfig({ network: 'regtest', apiToken: 'filetoken' });
+		const origEnv = process.env.BEIGNET_API_TOKEN;
+		try {
+			delete process.env.BEIGNET_API_TOKEN;
+			expect(resolveConfig({}).apiToken).to.equal('filetoken');
+			process.env.BEIGNET_API_TOKEN = 'envtoken';
+			expect(resolveConfig({}).apiToken).to.equal('envtoken');
+			expect(resolveConfig({ apiToken: 'flagtoken' }).apiToken).to.equal(
+				'flagtoken'
+			);
+		} finally {
+			if (origEnv === undefined) delete process.env.BEIGNET_API_TOKEN;
+			else process.env.BEIGNET_API_TOKEN = origEnv;
+		}
+	});
+
 	it('resolveConfig uses env vars as middle priority', () => {
 		const config: BeignetConfig = { network: 'mainnet' };
 		saveConfig(config);

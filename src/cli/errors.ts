@@ -94,7 +94,17 @@ export enum BeignetErrorCode {
 	BODY_TOO_LARGE = 'BODY_TOO_LARGE',
 	MNEMONIC_REQUIRES_AUTH = 'MNEMONIC_REQUIRES_AUTH',
 	UNAUTHORIZED = 'UNAUTHORIZED',
-	RATE_LIMITED = 'RATE_LIMITED'
+	RATE_LIMITED = 'RATE_LIMITED',
+	// Browser guards (issue #1005), enforced only while no credential is
+	// configured: a web page can reach a loopback daemon with a body it did
+	// not label application/json, with a foreign Origin, or through a DNS
+	// name that rebinds to 127.0.0.1. Each refusal names what to fix.
+	/** A request body whose Content-Type is not application/json (415). */
+	UNSUPPORTED_MEDIA_TYPE = 'UNSUPPORTED_MEDIA_TYPE',
+	/** An Origin or Sec-Fetch-Site header from a page this daemon does not serve (403). */
+	CROSS_SITE_REQUEST_REFUSED = 'CROSS_SITE_REQUEST_REFUSED',
+	/** A Host header that is not the loopback name the daemon is bound on (421). */
+	HOST_NOT_ALLOWED = 'HOST_NOT_ALLOWED'
 }
 
 export class BeignetError extends Error {
@@ -139,6 +149,10 @@ export function isRetryableError(err: BeignetError): boolean {
 		BeignetErrorCode.UNAUTHORIZED,
 		BeignetErrorCode.BODY_TOO_LARGE,
 		BeignetErrorCode.MNEMONIC_REQUIRES_AUTH,
+		// The browser guards refuse the request's shape, which a retry repeats.
+		BeignetErrorCode.UNSUPPORTED_MEDIA_TYPE,
+		BeignetErrorCode.CROSS_SITE_REQUEST_REFUSED,
+		BeignetErrorCode.HOST_NOT_ALLOWED,
 		BeignetErrorCode.SPENDING_LIMIT_EXCEEDED,
 		BeignetErrorCode.SERVICE_DRAINING,
 		// A node with no funding provider will not grow one on a retry.

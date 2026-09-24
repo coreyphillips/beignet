@@ -193,6 +193,96 @@ export const AUTH_EXEMPT_ROUTES = new Set([
 ]);
 
 /**
+ * Logged once at boot when no credential is configured (issue #1005). The
+ * daemon keeps running: a loopback bind with no token is the documented
+ * pre-1005 default, and every install created by `beignet init` since then
+ * carries a token, so this line only reaches configs written by hand or by
+ * an older release.
+ */
+export const AUTH_OFF_WARNING =
+	'authentication is off: any local process can drive this daemon; run beignet init or set apiToken';
+
+// ── Browser guards (issue #1005) ──
+// A web page can reach a loopback daemon: fetch() in no-cors mode sends a
+// POST with a text/plain body and no preflight, an <img> or <form> carries
+// a cross-site request, and a DNS name that rebinds to 127.0.0.1 lets the
+// page read the answers. With a credential configured none of that works
+// (a browser cannot attach a bearer token cross-site), so the guards run
+// only while authentication is off, where they are the only defence.
+
+/**
+ * True when the Content-Type names application/json, with or without media
+ * type parameters ("application/json; charset=utf-8"), any case. A missing
+ * header is not JSON: a Blob body from fetch() sends none.
+ */
+export function isJsonContentType(header: string | undefined): boolean {
+	if (header === undefined) return false;
+	const mediaType = header.split(';', 1)[0].trim().toLowerCase();
+	return mediaType === 'application/json';
+}
+
+/** True for a bind address that means every interface (0.0.0.0, ::, [::]). */
+export function isWildcardBindHost(host: string): boolean {
+	const bare =
+		host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+	return bare === '0.0.0.0' || /^[0:]+$/.test(bare);
+}
+
+/** True for a literal loopback bind: the localhost name, ::1 or 127.0.0.0/8. */
+export function isLoopbackBindHost(host: string): boolean {
+	const bare =
+		host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+	return (
+		bare === 'localhost' ||
+		bare === '::1' ||
+		(net.isIPv4(bare) && bare.startsWith('127.'))
+	);
+}
+
+/**
+ * The host name a Host header carries, lower-cased, without its port and
+ * without IPv6 brackets; null when the value is not a host name with an
+ * optional port at all ("a b", "[::1", "a:b:c").
+ */
+export function hostNameOfHeader(header: string): string | null {
+	const value = header.trim();
+	if (value.startsWith('[')) {
+		const end = value.indexOf(']');
+		if (end === -1) return null;
+		const rest = value.slice(end + 1);
+		if (rest !== '' && !/^:\d{1,5}$/.test(rest)) return null;
+		const name = value.slice(1, end);
+		return net.isIPv6(name) ? name.toLowerCase() : null;
+	}
+	const match = /^([A-Za-z0-9._-]+)(?::(\d{1,5}))?$/.exec(value);
+	return match ? match[1].toLowerCase() : null;
+}
+
+/**
+ * Whether a Host header may reach a daemon bound on `bindHost` while no
+ * credential is configured. Loopback names always may (localhost, ::1,
+ * 127.0.0.0/8), and so may the bound address itself when it is concrete.
+ * A missing Host (HTTP/1.0) counts as allowed only for a loopback bind.
+ * Any other name is a DNS name that resolved to this machine from a page
+ * the operator never meant to serve.
+ */
+export function isAllowedHostHeader(
+	header: string | undefined,
+	bindHost: string
+): boolean {
+	if (header === undefined) return isLoopbackBindHost(bindHost);
+	const name = hostNameOfHeader(header);
+	if (name === null) return false;
+	if (isLoopbackBindHost(name)) return true;
+	if (isWildcardBindHost(bindHost)) return false;
+	const bound =
+		bindHost.startsWith('[') && bindHost.endsWith(']')
+			? bindHost.slice(1, -1)
+			: bindHost;
+	return name === bound.toLowerCase();
+}
+
+/**
  * Routes a restore-pending daemon still serves (GET /events bypasses this
  * set through its own dispatcher arm, so SSE restore progress flows too).
  */
@@ -227,6 +317,12 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	IDEMPOTENCY_CONFLICT: 409,
 	BODY_TOO_LARGE: 413,
 	RATE_LIMITED: 429,
+	// Browser guards (issue #1005): the request's own shape is refused, so
+	// none of these is a node fault and none changes on a retry. 421 is
+	// Misdirected Request, the status for a Host the server does not serve.
+	UNSUPPORTED_MEDIA_TYPE: 415,
+	CROSS_SITE_REQUEST_REFUSED: 403,
+	HOST_NOT_ALLOWED: 421,
 	// L402 refusals are decisions about the caller's request, not node faults.
 	// They must not read as 5xx, which is the class agents retry on: retrying
 	// a refused challenge just fetches a new invoice and refuses that too.
@@ -704,10 +800,7 @@ async function bootDaemon(
 	// drive those same routes. `insecure: true` is the deliberate escape.
 	// A literal loopback IP or the localhost name only: a HOSTNAME beginning
 	// with "127." (e.g. 127.example.com) could resolve anywhere.
-	const isLoopbackHost =
-		host === 'localhost' ||
-		host === '::1' ||
-		(net.isIPv4(host) && host.startsWith('127.'));
+	const isLoopbackHost = isLoopbackBindHost(host);
 	if (!isLoopbackHost && !authenticator.enabled && opts.insecure !== true) {
 		throw new BeignetError(
 			'INVALID_PARAMS',
@@ -3050,6 +3143,51 @@ async function bootDaemon(
 	const corsOrigin =
 		opts.cors === true ? '*' : typeof opts.cors === 'string' ? opts.cors : null;
 
+	// The Host check is skipped for a wildcard bind (only reachable without
+	// auth under `insecure`): every name the machine answers to is the
+	// operator's choice there, and there is no one address to hold it to.
+	const skipHostGuard = isWildcardBindHost(host);
+	const browserGuardRefusal = (
+		req: http.IncomingMessage,
+		allowedOrigin: string | null
+	): { code: string; message: string } | null => {
+		const hasBody =
+			req.headers['transfer-encoding'] !== undefined ||
+			Number(req.headers['content-length']) > 0;
+		if (hasBody && !isJsonContentType(req.headers['content-type'])) {
+			return {
+				code: 'UNSUPPORTED_MEDIA_TYPE',
+				message: 'Request bodies must be sent as Content-Type: application/json'
+			};
+		}
+		const origin = req.headers['origin'];
+		if (allowedOrigin !== '*') {
+			if (origin !== undefined) {
+				if (allowedOrigin === null || origin !== allowedOrigin) {
+					return {
+						code: 'CROSS_SITE_REQUEST_REFUSED',
+						message:
+							"Cross-site browser requests are refused while authentication is off; configure apiToken or apiKeys, or set cors to this page's origin"
+					};
+				}
+			} else if (req.headers['sec-fetch-site'] === 'cross-site') {
+				return {
+					code: 'CROSS_SITE_REQUEST_REFUSED',
+					message:
+						'Cross-site browser requests are refused while authentication is off; configure apiToken or apiKeys'
+				};
+			}
+		}
+		if (!skipHostGuard && !isAllowedHostHeader(req.headers['host'], host)) {
+			return {
+				code: 'HOST_NOT_ALLOWED',
+				message:
+					'The Host header must name the loopback address this daemon is bound on (localhost, 127.0.0.1 or [::1]) while authentication is off'
+			};
+		}
+		return null;
+	};
+
 	// A fault the request pipeline did not classify: the detail goes to the
 	// operator (stderr when no logger is configured, so a generic 500 stays
 	// diagnosable), never to the client. Raw messages leak filesystem paths
@@ -3109,6 +3247,23 @@ async function bootDaemon(
 			res.statusCode = 204;
 			res.end();
 			return;
+		}
+
+		// ── Browser guards (issue #1005), only while authentication is off ──
+		// Ahead of the rate limiter and the auth middleware, so a configured
+		// credential costs this one branch and nothing else. They apply to
+		// every route, the auth-exempt ones included: a plain client sends no
+		// Origin and a loopback Host, and no foreign page has business with
+		// /health. The wildcard-CORS case is an insecure opt-in (refused at
+		// boot otherwise), where the operator asked for any page to be served.
+		if (!authenticator.enabled) {
+			const refusal = browserGuardRefusal(req, corsOrigin);
+			if (refusal) {
+				res.setHeader('Content-Type', 'application/json');
+				res.statusCode = statusForErrorCode(refusal.code);
+				res.end(JSON.stringify(failure(refusal.code, refusal.message)));
+				return;
+			}
 		}
 
 		// ── Rate limiting (opt-in) ──
@@ -3484,6 +3639,7 @@ async function bootDaemon(
 		server.on('error', reject);
 		server.listen(port, host, () => {
 			logger?.info(`Daemon listening on ${host}:${port}`);
+			if (!authenticator.enabled) logger?.warn(AUTH_OFF_WARNING);
 			// The queue's start (once the node can pay, issue #967) and its
 			// poke on channel:usable were wired when the node built it above;
 			// stop() halts the queue first, so a start that comes after it
