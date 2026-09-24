@@ -882,6 +882,28 @@ export class LightningNode extends EventEmitter {
 			failPreWrapped?: boolean;
 		}
 	> = new Map();
+	/**
+	 * Failures of this node's own outgoing HTLCs held back until the failed
+	 * HTLC's removal is irrevocable (issue #989), keyed like htlcPaymentMap
+	 * ("channelIdHex:offered-<htlcId>"). Parked by handleHtlcFailed, settled
+	 * by drainRetriesAwaitingRemoval on the revoke_and_ack that completes the
+	 * removal, dropped by handleHtlcFulfilled when the HTLC is fulfilled
+	 * after all. Memory-only, like a forward's held failReason: a restart
+	 * inside the window loses the parked failure and with it the retry
+	 * attempt, never a payment. The removal still completes on reestablish;
+	 * a fail the peer retransmits is parked and settled anew (on the give-up
+	 * path, the retry context being memory too), and one it does not
+	 * retransmit leaves the record PENDING for scanStuckPayments.
+	 */
+	private retriesAwaitingRemoval: Map<
+		string,
+		{
+			channelId: Buffer;
+			htlcId: bigint;
+			reason: Buffer;
+			localFailureReason?: string;
+		}
+	> = new Map();
 	// Payment secret for receiving: paymentHashHex → paymentSecret
 	private paymentSecrets: Map<string, Buffer> = new Map();
 	private resourceConfig: Required<IResourceConfig>;
@@ -4267,6 +4289,16 @@ export class LightningNode extends EventEmitter {
 			const resolvedIdHex = channelId.toString('hex');
 			this._recoveryCloseRequested.delete(resolvedIdHex);
 			this._lastCloseBroadcast.delete(resolvedIdHex);
+			// A failure parked on this channel until its removal round
+			// completed (issue #989) never completes off chain now: the
+			// chain machinery owns its HTLC (handleOnChainOutputResolved
+			// fails the record when the timeout path wins, the preimage
+			// path completes it) and the stuck-payment sweep the rest.
+			for (const key of this.retriesAwaitingRemoval.keys()) {
+				if (key.startsWith(`${resolvedIdHex}:offered-`)) {
+					this.retriesAwaitingRemoval.delete(key);
+				}
+			}
 			for (const [txid, idHex] of this._pendingCloseTxids) {
 				if (idHex === resolvedIdHex) this._pendingCloseTxids.delete(txid);
 			}
@@ -4889,9 +4921,12 @@ export class LightningNode extends EventEmitter {
 		);
 
 		// A commitment round completed on this channel: any upstream refund
-		// held back on it as the outgoing leg may now be owed (issue #623).
+		// held back on it as the outgoing leg may now be owed (issue #623),
+		// and any own-payment failure parked on it may now be settled, and
+		// the payment retried (issue #989).
 		this.channelManager.on('commitment:revoked', (channelId: Buffer) => {
 			this.drainForwardsAwaitingRemoval(channelId);
+			this.drainRetriesAwaitingRemoval(channelId);
 		});
 
 		// An offered HTLC the channel dropped on a held restore rather than
@@ -10162,6 +10197,7 @@ export class LightningNode extends EventEmitter {
 		this.scidToChannelId.clear();
 		this.htlcPaymentMap.clear();
 		this.forwardedHtlcs.clear();
+		this.retriesAwaitingRemoval.clear();
 		this.gossipSyncManagers.clear();
 		this.pendingMppPayments.clear();
 		this.pendingFundingTxs.clear();
@@ -21807,6 +21843,11 @@ export class LightningNode extends EventEmitter {
 
 		// Check if this is a forwarded HTLC — propagate fulfillment upstream
 		const outKey = `${channelId.toString('hex')}:offered-${htlcId}`;
+		// A failure parked on this HTLC until its removal round completed
+		// (issue #989) is void: the peer fulfilled it after all (a disconnect
+		// before our revocation rolled the fail back, and the peer
+		// retransmitted a fulfil). The payment completes below, no retry.
+		this.retriesAwaitingRemoval.delete(outKey);
 		const forward = this.forwardedHtlcs.get(outKey);
 		if (forward) {
 			// FFOR receipt witness (section 9.6.5): a delegated fulfil is
@@ -22250,6 +22291,59 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * A commitment round completed on this channel: settle any own-payment
+	 * failure parked on it whose removal is now irrevocable (issue #989),
+	 * which retries the payment or gives it up.
+	 *
+	 * The peer's revoke_and_ack is the one event that makes a removal
+	 * irrevocable, and handleRevokeAndAck's settlement loop drops the entry
+	 * from the channel in that same step, so a parked HTLC gone from a
+	 * channel that still carries updates off chain (NORMAL, SHUTTING_DOWN or
+	 * the ECDSA splice pending-lock window, the states in which the channel
+	 * processes a revoke_and_ack; that loop is the only off-chain deletion
+	 * of an offered FAILED entry) has completed its removal, as has one
+	 * still present with both phase flags set. An entry
+	 * rolled back to COMMITTED by a disconnect stays parked: the peer's
+	 * retransmitted fail parks it again, or its fulfil drops it in
+	 * handleHtlcFulfilled. A channel that went to chain never fires this;
+	 * its HTLC is the monitor's, and channel:resolved drops the parked entry.
+	 *
+	 * Each entry is unparked before it is settled: the settlement may
+	 * dispatch the retry on this very channel, and that round re-enters here.
+	 */
+	private drainRetriesAwaitingRemoval(channelId: Buffer): void {
+		const channelIdHex = channelId.toString('hex');
+		const prefix = `${channelIdHex}:offered-`;
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const state = channel.getFullState();
+		// The same states in which handleRevokeAndAck accepts the message.
+		const liveOffChain =
+			this.channelManager.getMonitor(channelId) === undefined &&
+			(state.state === ChannelState.NORMAL ||
+				state.state === ChannelState.SHUTTING_DOWN ||
+				channel.isSplicePendingLock());
+		for (const [key, parked] of [...this.retriesAwaitingRemoval]) {
+			if (!key.startsWith(prefix)) continue;
+			// A retry dispatched below can complete its own round inside this
+			// call, and that nested drain may have settled this entry already.
+			if (!this.retriesAwaitingRemoval.has(key)) continue;
+			const htlc = state.htlcs.get(key.slice(channelIdHex.length + 1));
+			const irrevocable = htlc
+				? LightningNode.isOfferedFailIrrevocable(htlc)
+				: liveOffChain;
+			if (!irrevocable) continue;
+			this.retriesAwaitingRemoval.delete(key);
+			this.settleOwnPaymentFailure(
+				parked.channelId,
+				parked.htlcId,
+				parked.reason,
+				parked.localFailureReason
+			);
+		}
+	}
+
+	/**
 	 * Propagate a downstream failure to the inbound leg it refunds. Mirror
 	 * of settleForwardUpstream, with the same discipline (issue 297): the
 	 * forward linkage is consumed ONLY when the inbound channel actually
@@ -22614,13 +22708,95 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
+		// Our own payment: BOLT 2 fund safety again (issue #989), the rule the
+		// forward above follows. The peer's update_fail_htlc starts a
+		// removal; it does not end the attempt. Until the peer's
+		// revoke_and_ack covers our commitment without the HTLC, the peer's
+		// last signed commitment still carries the offered output, so a hop
+		// that failed early and later learns the preimage (from the retry's
+		// route, say) can go to chain with it and claim the first HTLC while
+		// the retry settles too; and until we revoke for the peer's covering
+		// commitment, a disconnect rolls the entry back to COMMITTED
+		// (markForReestablish) and the peer may retransmit a fulfil instead.
+		// LND hands a fail to its switch only after that revocation. So while
+		// the channel still holds the entry as a provisional FAILED, the
+		// failure is parked, its mapping kept so the HTLC view reads it as
+		// in flight (a re-send is refused until then), and the removal round
+		// decides: drainRetriesAwaitingRemoval settles it on the
+		// revoke_and_ack that completes the removal, handleHtlcFulfilled
+		// drops it if the HTLC is fulfilled after all, and a re-fail after a
+		// rollback parks it again. An entry already irrevocable, or gone from
+		// the channel (the settlement loop dropped it before a reestablish
+		// replay of the fail arrived, or the failure was generated here for
+		// an add the channel abandoned, which has no entry to wait on), is
+		// settled at once.
+		const hashHex = this.htlcPaymentMap.get(outKey);
+		if (!hashHex) return;
+		const owned = this.payments.get(hashHex);
+		if (!owned || owned.direction !== PaymentDirection.OUTGOING) return;
+		const entry = this.channelManager
+			.getChannel(channelId)
+			?.getFullState()
+			.htlcs.get(`offered-${htlcId}`);
+		if (
+			entry &&
+			entry.state === HtlcState.FAILED &&
+			!LightningNode.isOfferedFailIrrevocable(entry)
+		) {
+			this.retriesAwaitingRemoval.set(outKey, {
+				channelId,
+				htlcId,
+				reason,
+				localFailureReason
+			});
+			this.emitStructuredLog('payment', 'retry_deferred', {
+				paymentHash: hashHex,
+				channelId: channelId.toString('hex'),
+				htlcId: Number(htlcId)
+			});
+			return;
+		}
+		this.settleOwnPaymentFailure(channelId, htlcId, reason, localFailureReason);
+	}
+
+	/**
+	 * Settle one failed HTLC of this node's own outgoing payment: record the
+	 * failure, release the attempt's mapping, and retry the payment or give
+	 * it up. Reached from handleHtlcFailed once the failed HTLC's removal is
+	 * irrevocable, or from drainRetriesAwaitingRemoval when the removal
+	 * round completes later (issue #989); one body, so the two cannot
+	 * diverge.
+	 *
+	 * `localFailureReason` is set when the failure was generated HERE rather
+	 * than returned by the peer: `reason` is then already a complete failure
+	 * message (or empty) and this string is the human-readable cause.
+	 */
+	private settleOwnPaymentFailure(
+		channelId: Buffer,
+		htlcId: bigint,
+		reason: Buffer,
+		localFailureReason?: string
+	): void {
 		// Find the payment associated with this HTLC
-		const key = outKey;
+		const key = `${channelId.toString('hex')}:offered-${htlcId}`;
 		const hashHex = this.htlcPaymentMap.get(key);
 		if (!hashHex) return;
 
 		const payment = this.payments.get(hashHex);
 		if (!payment || payment.direction !== PaymentDirection.OUTGOING) return;
+
+		// The hash is paid: another HTLC of it settled while this one's
+		// removal ran. This attempt is over, but the record says what the
+		// preimage proves, so only the attempt's mapping is released and its
+		// resolution reported; the record is not failed.
+		if (payment.status === PaymentStatus.COMPLETED) {
+			this.htlcPaymentMap.delete(key);
+			this.commitMutations('release failed HTLC mapping', [
+				{ type: 'delete_htlc_payment_mapping', htlcKey: key }
+			]);
+			this.emitHtlcResolved(payment.paymentHash, channelId, htlcId, 'failed');
+			return;
+		}
 
 		// MPP: every part is a distinct onion, so a returned failure decrypts
 		// only with the secrets of the part it came back on, and its culpable
@@ -27470,10 +27646,15 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * Whether an HTLC this node offered for the hash can still settle (issue
-	 * #976): one that is 'offered', or 'onchain-pending' on a channel that
-	 * went to chain, in the getOutgoingHtlcs view. A 'failed' HTLC does not
-	 * count, terminal or not: a peer that failed it cannot fulfil it. The
-	 * one predicate behind assertHashUnpaid's in-flight refusal and
+	 * #976): one that is 'offered', 'onchain-pending' on a channel that went
+	 * to chain, or 'failed' but not yet terminal, in the getOutgoingHtlcs
+	 * view. A failed HTLC counts until its removal is irrevocable (issue
+	 * #989): until the peer's revoke_and_ack covers our commitment without
+	 * it, the peer's last signed commitment still carries it, and until we
+	 * revoke for the peer's covering commitment a disconnect rolls it back
+	 * to COMMITTED and the peer may fulfil it after all. Once terminal it
+	 * does not count: a peer that failed it cannot fulfil it. The one
+	 * predicate behind assertHashUnpaid's in-flight refusal and
 	 * failPaymentUnlessInFlight, so the two cannot drift.
 	 */
 	hasHtlcInFlight(paymentHash: Buffer): boolean {
@@ -27500,8 +27681,18 @@ export class LightningNode extends EventEmitter {
 			.reduce((sum, h) => sum + h.amountMsat, 0n);
 	}
 
+	/**
+	 * A 'failed' view counts until it is terminal (issue #989): the peer's
+	 * last signed commitment carries the HTLC until its revoke_and_ack for
+	 * the removal, and a disconnect before this node's own revocation rolls
+	 * the fail back.
+	 */
 	private static htlcViewInFlight(h: IOutgoingHtlcView): boolean {
-		return h.state === 'offered' || h.state === 'onchain-pending';
+		return (
+			h.state === 'offered' ||
+			h.state === 'onchain-pending' ||
+			(h.state === 'failed' && !h.terminal)
+		);
 	}
 
 	/**
@@ -27518,13 +27709,12 @@ export class LightningNode extends EventEmitter {
 	 *   offered an HTLC for or holds an OUTGOING record for, so the preimage
 	 *   of this node's own invoice does not read as a payment made;
 	 * - in flight: some offered HTLC for the hash is not terminal ('offered',
-	 *   or 'onchain-pending' on a channel that went to chain), or the
-	 *   in-memory record is PENDING (a record exists before any HTLC does).
-	 *   A 'failed' HTLC does NOT count as in flight, terminal or not: the
-	 *   retry path re-enters the senders right after the peer's
-	 *   update_fail_htlc, before the removal round completes, and a peer
-	 *   that failed an HTLC cannot fulfil it, so refusing there would refuse
-	 *   every retry;
+	 *   'onchain-pending' on a channel that went to chain, or 'failed' with
+	 *   a removal not yet irrevocable, issue #989), or the in-memory record
+	 *   is PENDING (a record exists before any HTLC does). The automatic
+	 *   retry is dispatched only once the failed HTLC's removal is
+	 *   irrevocable (drainRetriesAwaitingRemoval), when no such view is
+	 *   left for it, so it is never refused here;
 	 * - completed, after a prune: the in-memory record and preimage are
 	 *   pruned 24 hours after completion (and oldest first past the size
 	 *   cap). A node without storage remembers the pruned paid hashes in
@@ -27900,8 +28090,17 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Scan for stuck PENDING outbound payments with no corresponding HTLC.
-	 * Fails payments that have been PENDING for >10 minutes with no active HTLC.
+	 * Scan for stuck PENDING outbound payments with no corresponding HTLC: a
+	 * payment PENDING for over ten minutes with no PENDING or COMMITTED
+	 * offered HTLC is failed, unless an HTLC of it can still settle
+	 * (failPaymentUnlessInFlight, issue #989). A fail whose removal is not
+	 * yet irrevocable (the peer withholding its revoke_and_ack, or offline
+	 * since our own revocation) and an HTLC awaiting its on-chain outcome
+	 * both keep the record PENDING with the retry budget frozen; the round,
+	 * or the chain, settles it, and the sweep fails it once nothing is out.
+	 * Failing it here instead emitted payment:failed with the HTLC still in
+	 * flight, which the CLI's spend ledger cannot release on, and the give-up
+	 * that followed the round had nothing left to report.
 	 */
 	private scanStuckPayments(): void {
 		const TEN_MINUTES = 10 * 60 * 1000;
@@ -27933,7 +28132,7 @@ export class LightningNode extends EventEmitter {
 			if (activeHtlcHashes.has(hashHex)) continue;
 
 			// No active HTLC and payment older than 10 min → fail
-			this.failPayment(
+			this.failPaymentUnlessInFlight(
 				payment.paymentHash,
 				'Stuck payment swept: no active HTLC after 10 minutes'
 			);

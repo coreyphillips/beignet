@@ -404,9 +404,19 @@ describe('Replayed update_fail_htlc re-drives the refund (issue 297)', () => {
 		await settle();
 		expect(captured, 'fail bytes captured').to.not.equal(null);
 		expect(failEvents, 'one fail event so far').to.equal(1);
-		expect(payment.status, 'payment failed by the cancel').to.equal(
-			PaymentStatus.FAILED
+		// Alice's wire to bob is cut, so the removal round never completes:
+		// the failure is parked until the peer revokes for the removal and
+		// the record stays PENDING with the HTLC in flight (issue #989).
+		expect(payment.status, 'payment pending until the removal').to.equal(
+			PaymentStatus.PENDING
 		);
+		const aliceInternals = alice as unknown as {
+			retriesAwaitingRemoval: Map<string, unknown>;
+		};
+		expect(
+			aliceInternals.retriesAwaitingRemoval.size,
+			'the failure is parked'
+		).to.equal(1);
 		const channel = alice.getChannelManager().listChannels()[0];
 		expect(
 			channel.getFullState().htlcs.get('offered-0')?.state,
@@ -421,9 +431,13 @@ describe('Replayed update_fail_htlc re-drives the refund (issue 297)', () => {
 			channel.getFullState().htlcs.get('offered-0')?.state,
 			'entry unchanged by the replay'
 		).to.equal(HtlcState.FAILED);
-		expect(payment.status, 'payment stays failed').to.equal(
-			PaymentStatus.FAILED
+		expect(payment.status, 'payment stays pending').to.equal(
+			PaymentStatus.PENDING
 		);
+		expect(
+			aliceInternals.retriesAwaitingRemoval.size,
+			'the replay parked the same failure again, once'
+		).to.equal(1);
 
 		alice.destroy();
 		bob.destroy();
