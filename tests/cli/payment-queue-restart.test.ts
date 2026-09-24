@@ -846,9 +846,9 @@ describe('Restored queue entries wait for a channel that can carry an HTLC (issu
 
 		// The channel's balance grows (an inbound payment settled, say).
 		state.localBalanceMsat = 900_000_000n;
-		node.emit('channel:usable', {
-			channelId: channel.getChannelId().toString('hex')
-		});
+		const usableId = channel.getChannelId();
+		if (!usableId) throw new Error('the funded channel has no channel id');
+		node.emit('channel:usable', { channelId: usableId.toString('hex') });
 
 		expect((await queueEntryOnceFinal(node, entry.id)).status).to.equal(
 			'completed'
