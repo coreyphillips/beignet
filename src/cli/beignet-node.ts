@@ -807,10 +807,13 @@ export const ENGINE_PAYMENT_ERROR_CODES: Readonly<Record<string, string>> = {
 	NO_ROUTE: 'NO_ROUTE',
 	DUPLICATE_PAYMENT: 'DUPLICATE_PAYMENT',
 	NO_CHANNEL_TO_HOP: 'PEER_NOT_CONNECTED',
-	FEE_EXCEEDS_MAX: 'PAYMENT_FAILED',
-	// The caller's own bound (#751): its code, not a generic failure, so a
-	// swap provider can tell "no route under the refund height" from "no
-	// route at all".
+	// The caller's own bounds (#751, #1001): their codes, not a generic
+	// failure, so a swap provider can tell "no route under the refund height"
+	// from "no route at all", and a fee refusal answers 409 as the rebalance
+	// path's always has, rather than the 502 PAYMENT_FAILED that told
+	// payInvoiceWithRetry and every daemon client to retry a cap that the
+	// same request meets again.
+	FEE_EXCEEDS_MAX: 'FEE_EXCEEDS_MAX',
 	CLTV_EXCEEDS_MAX: 'CLTV_EXCEEDS_MAX',
 	MISSING_AMOUNT: 'INVALID_PARAMS',
 	INVALID_INVOICE: 'INVALID_PARAMS',

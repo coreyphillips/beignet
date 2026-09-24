@@ -22,6 +22,12 @@ export enum BeignetErrorCode {
 	NO_ROUTE = 'NO_ROUTE',
 	/** No route fits under the caller's cltvLimit; nothing was sent (#751). */
 	CLTV_EXCEEDS_MAX = 'CLTV_EXCEEDS_MAX',
+	/**
+	 * Every route costs more than the caller's fee cap (maxFeeSats or
+	 * maxFeeMsat); nothing was sent. The same request meets the same cap, so
+	 * it is permanent, like CLTV_EXCEEDS_MAX (#1001).
+	 */
+	FEE_EXCEEDS_MAX = 'FEE_EXCEEDS_MAX',
 	/** The node has no chain tip yet, so a height-relative bound cannot be set. */
 	CHAIN_NOT_SYNCED = 'CHAIN_NOT_SYNCED',
 	/** User-supplied BOLT 11 string failed to parse. */
@@ -145,7 +151,12 @@ export function isRetryableError(err: BeignetError): boolean {
 		BeignetErrorCode.FUNDING_PROVIDER_REQUIRED,
 		// The caller's own CLTV bound refused every route; the same request
 		// meets the same bound.
-		BeignetErrorCode.CLTV_EXCEEDS_MAX
+		BeignetErrorCode.CLTV_EXCEEDS_MAX,
+		// The caller's own fee cap refused every route, before anything was
+		// sent. Answered 409, never a retryable 5xx: as PAYMENT_FAILED it
+		// made payInvoiceWithRetry and daemon clients retry a deterministic
+		// refusal with backoff (#1001).
+		BeignetErrorCode.FEE_EXCEEDS_MAX
 	]);
 	if (permanentCodes.has(err.code)) return false;
 

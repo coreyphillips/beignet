@@ -595,6 +595,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'200': {
 							description: 'Payment result',
 							content: jsonContent({ $ref: '#/components/schemas/PaymentInfo' })
+						},
+						'409': {
+							description:
+								'FEE_EXCEEDS_MAX, every route costs more than maxFeeSats / maxFeeMsat; nothing was sent'
 						}
 					}
 				}
@@ -621,6 +625,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 									status: { type: 'string', enum: ['PENDING', 'FAILED'] }
 								}
 							})
+						},
+						'409': {
+							description:
+								'FEE_EXCEEDS_MAX, every route costs more than maxFeeSats / maxFeeMsat; nothing was sent'
 						}
 					}
 				}
@@ -1209,6 +1217,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'200': {
 							description: 'Payment result',
 							content: jsonContent({ $ref: '#/components/schemas/PaymentInfo' })
+						},
+						'409': {
+							description:
+								'FEE_EXCEEDS_MAX, every route costs more than maxFeeSats / maxFeeMsat; nothing was sent'
 						}
 					}
 				}
@@ -3396,6 +3408,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'200': {
 							description: 'Payment result',
 							content: jsonContent({ $ref: '#/components/schemas/PaymentInfo' })
+						},
+						'409': {
+							description:
+								'FEE_EXCEEDS_MAX, every route costs more than maxFeeSats / maxFeeMsat; nothing was sent'
 						}
 					}
 				}

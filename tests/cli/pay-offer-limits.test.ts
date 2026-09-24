@@ -482,7 +482,7 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		} catch (err) {
 			error = err;
 		}
-		expect((error as { code: string }).code).to.equal('PAYMENT_FAILED');
+		expect((error as { code: string }).code).to.equal('FEE_EXCEEDS_MAX');
 		expect(String((error as Error).message)).to.contain(
 			'Route fee exceeds maximum'
 		);

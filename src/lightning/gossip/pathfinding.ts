@@ -1011,8 +1011,14 @@ import { IBlindedPath, IBlindedPayInfo } from '../onion/blinded-path';
  * `finalCltvExpiry + payInfo.cltvExpiryDelta` of headroom, and the recipient
  * still receives exactly `amountMsat`. The payinfo is written by the payee,
  * so its fee is part of what the route reports as `totalFeeMsat` (public
- * hops plus the blinded section, issue #1001) and its htlc bounds are
- * enforced on the amount entering the blinded section.
+ * hops plus the blinded section, issue #1001). Its htlc bounds apply to
+ * `amountMsat`, the amount the RECIPIENT receives: every writer expresses
+ * them net of the path's fees (LDK subtracts each relay fee, eclair seeds
+ * the maximum with the invoice amount, CLN and LND take the post-fee
+ * channel limits, and our own builder uses the peer's channel maximum),
+ * so judging the fee-inclusive amount at the introduction node would refuse
+ * every invoice whose maximum equals its amount. A maximum of 0 admits
+ * nothing (no known writer emits one; the FFOR issuer maps 0 to 21M BTC).
  *
  * @param graph - The network graph
  * @param source - 33-byte source node public key
@@ -1022,8 +1028,8 @@ import { IBlindedPath, IBlindedPayInfo } from '../onion/blinded-path';
  * @param finalCltvExpiry - CLTV expiry delta for the final hop
  * @param maxHops - Maximum number of hops (default 20)
  * @returns Combined route, or null if there is no path to the introduction
- *   node or the amount at the introduction node falls outside the payinfo's
- *   htlc_minimum_msat / htlc_maximum_msat
+ *   node or `amountMsat` falls outside the payinfo's htlc_minimum_msat /
+ *   htlc_maximum_msat
  */
 export function findRouteToBlindedPath(
 	graph: NetworkGraph,
@@ -1047,13 +1053,14 @@ export function findRouteToBlindedPath(
 		(amountMsat * BigInt(payInfo.feeProportionalMillionths)) / 1_000_000n;
 	const amountAtIntro = amountMsat + blindedFeeMsat;
 	const cltvAtIntro = finalCltvExpiry + payInfo.cltvExpiryDelta;
-	// BOLT 4: the payinfo's htlc bounds are the blinded section's aggregate
-	// limits, judged on the amount that enters it. The decoder reads both as
-	// plain u64s (there is no "absent" encoding), so a payee that wrote a
-	// maximum of 0 admits nothing, exactly as a relay with that policy would.
+	// The payinfo's htlc bounds are the blinded section's aggregate limits as
+	// seen by the recipient, so they are judged on amountMsat and never on
+	// the fee-inclusive amountAtIntro (see the doc comment). The decoder reads
+	// both as plain u64s (there is no "absent" encoding), so a payee that
+	// wrote a maximum of 0 admits nothing, as a relay with that policy would.
 	if (
-		amountAtIntro < payInfo.htlcMinimumMsat ||
-		amountAtIntro > payInfo.htlcMaximumMsat
+		amountMsat < payInfo.htlcMinimumMsat ||
+		amountMsat > payInfo.htlcMaximumMsat
 	) {
 		return null;
 	}
