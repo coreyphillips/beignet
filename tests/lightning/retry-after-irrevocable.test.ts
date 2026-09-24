@@ -263,6 +263,7 @@ type Internals = {
 	paymentRetryContexts: Map<string, IPaymentRetryContext>;
 	payments: Map<string, IPaymentInfo>;
 	scanStuckPayments: () => void;
+	drainRetriesAwaitingRemoval: (channelId: Buffer) => void;
 	channelManager: {
 		emit: (event: string, ...args: unknown[]) => boolean;
 	};
@@ -616,5 +617,126 @@ describe('Issue #989: a failed HTLC is retried only once its removal is irrevoca
 		restarted.destroy();
 		bob.destroy();
 		storage2.close();
+	});
+
+	it('the stuck-payment sweep leaves a payment whose failed HTLC is still in flight PENDING with its retries frozen, and the round then gives it up once', () => {
+		const { alice, bob, gate, release } = setupPair(990, 991);
+		// Bob would accept a second attempt; none must come.
+		const { attempts } = failFirstAttempt(bob, gate);
+		const events = recordEvents(alice);
+		const invoice = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'swept in the window'
+		});
+		const hash = invoice.paymentHash;
+		const hashHex = hash.toString('hex');
+		const adds = countAdds(alice);
+
+		alice.sendPayment(invoice.bolt11);
+		expect(adds()).to.equal(1);
+		expect(gate.held.length, "bob's revoke_and_ack is held").to.equal(1);
+		expect(alice.hasHtlcInFlight(hash)).to.equal(true);
+
+		// Older than the sweep's window (a hold-invoice swap, say), and a
+		// block lands while the peer still withholds its revocation.
+		internals(alice).payments.get(hashHex)!.createdAt =
+			Date.now() - 11 * 60_000;
+		alice.handleNewBlock(1);
+
+		// Before the fix the sweep failed the record here, emitting
+		// payment:failed with the HTLC still in flight, and the round that
+		// followed had nothing left to report.
+		expect(
+			alice.getPayment(hash)?.status,
+			'not failed while the HTLC is in flight'
+		).to.equal(PaymentStatus.PENDING);
+		expect(events.failed).to.deep.equal([]);
+		const context = internals(alice).paymentRetryContexts.get(hashHex);
+		expect(context, 'the context stays').to.not.equal(undefined);
+		expect(context!.maxRetries, 'the retry budget is frozen').to.equal(
+			context!.retryCount
+		);
+		expect(internals(alice).retriesAwaitingRemoval.size).to.equal(1);
+
+		// The removal completes: the parked failure gives the payment up,
+		// once, with nothing in flight for the report's consumers.
+		let inFlightAtReport: boolean | undefined;
+		alice.on('payment:failed', (info: IPaymentInfo) => {
+			inFlightAtReport = alice.hasHtlcInFlight(info.paymentHash);
+		});
+		release();
+
+		expect(attempts()).to.equal(1);
+		expect(adds(), 'no retry').to.equal(1);
+		expect(alice.getPayment(hash)?.status).to.equal(PaymentStatus.FAILED);
+		expect(events.failed).to.deep.equal([hashHex]);
+		expect(inFlightAtReport, 'nothing in flight at the report').to.equal(false);
+		expect(events.sent).to.deep.equal([]);
+		expect(internals(alice).paymentRetryContexts.has(hashHex)).to.equal(false);
+		expect(internals(alice).retriesAwaitingRemoval.size).to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it("the drain's gone arm admits the ECDSA splice pending-lock window, where removals complete too, and not a splice before it", () => {
+		const { alice, bob, channelId, gate } = setupPair(992, 993);
+		const { first } = failFirstAttempt(bob, gate);
+		const invoice = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'removed during a splice'
+		});
+		alice.sendPayment(invoice.bolt11);
+		expect(internals(alice).retriesAwaitingRemoval.size).to.equal(1);
+		const [, htlcId] = first()!;
+		const key = `${channelId.toString('hex')}:offered-${htlcId}`;
+		expect(internals(alice).htlcPaymentMap.has(key)).to.equal(true);
+
+		// The removal round completed while the channel sat in a splice:
+		// the settlement loop dropped the entry. Driving a real splice to
+		// that point is the splice harness's business; here the channel is
+		// put in the state the drain must read.
+		const channel = alice.getChannelManager().getChannel(channelId)!;
+		const state = channel.getFullState() as unknown as {
+			state: ChannelState;
+			htlcs: Map<string, unknown>;
+			spliceInFlight?: {
+				sentTxSignatures: boolean;
+				receivedTxSignatures: boolean;
+			};
+		};
+		state.htlcs.delete(`offered-${htlcId}`);
+		state.state = ChannelState.SPLICING;
+
+		// Signatures not yet exchanged: no revoke_and_ack is processed in
+		// this state, so the drain must not read the absence as a removal.
+		state.spliceInFlight = {
+			sentTxSignatures: true,
+			receivedTxSignatures: false
+		};
+		expect(channel.isSplicePendingLock()).to.equal(false);
+		internals(alice).drainRetriesAwaitingRemoval(channelId);
+		expect(
+			internals(alice).retriesAwaitingRemoval.size,
+			'still parked'
+		).to.equal(1);
+		expect(internals(alice).htlcPaymentMap.has(key)).to.equal(true);
+
+		// Pending lock: the channel processes the round, so the entry gone
+		// means the removal completed, and the parked failure is settled.
+		state.spliceInFlight = {
+			sentTxSignatures: true,
+			receivedTxSignatures: true
+		};
+		expect(channel.isSplicePendingLock()).to.equal(true);
+		internals(alice).drainRetriesAwaitingRemoval(channelId);
+		expect(internals(alice).retriesAwaitingRemoval.size, 'settled').to.equal(0);
+		expect(
+			internals(alice).htlcPaymentMap.has(key),
+			"the attempt's mapping was released"
+		).to.equal(false);
+
+		alice.destroy();
+		bob.destroy();
 	});
 });

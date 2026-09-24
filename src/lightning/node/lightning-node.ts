@@ -22298,10 +22298,11 @@ export class LightningNode extends EventEmitter {
 	 * The peer's revoke_and_ack is the one event that makes a removal
 	 * irrevocable, and handleRevokeAndAck's settlement loop drops the entry
 	 * from the channel in that same step, so a parked HTLC gone from a
-	 * channel that still carries updates off chain (NORMAL or SHUTTING_DOWN,
-	 * the states that process a revoke_and_ack; that loop is the only
-	 * off-chain deletion of an offered FAILED entry) has completed its
-	 * removal, as has one still present with both phase flags set. An entry
+	 * channel that still carries updates off chain (NORMAL, SHUTTING_DOWN or
+	 * the ECDSA splice pending-lock window, the states in which the channel
+	 * processes a revoke_and_ack; that loop is the only off-chain deletion
+	 * of an offered FAILED entry) has completed its removal, as has one
+	 * still present with both phase flags set. An entry
 	 * rolled back to COMMITTED by a disconnect stays parked: the peer's
 	 * retransmitted fail parks it again, or its fulfil drops it in
 	 * handleHtlcFulfilled. A channel that went to chain never fires this;
@@ -22316,12 +22317,17 @@ export class LightningNode extends EventEmitter {
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) return;
 		const state = channel.getFullState();
+		// The same states in which handleRevokeAndAck accepts the message.
 		const liveOffChain =
 			this.channelManager.getMonitor(channelId) === undefined &&
 			(state.state === ChannelState.NORMAL ||
-				state.state === ChannelState.SHUTTING_DOWN);
+				state.state === ChannelState.SHUTTING_DOWN ||
+				channel.isSplicePendingLock());
 		for (const [key, parked] of [...this.retriesAwaitingRemoval]) {
 			if (!key.startsWith(prefix)) continue;
+			// A retry dispatched below can complete its own round inside this
+			// call, and that nested drain may have settled this entry already.
+			if (!this.retriesAwaitingRemoval.has(key)) continue;
 			const htlc = state.htlcs.get(key.slice(channelIdHex.length + 1));
 			const irrevocable = htlc
 				? LightningNode.isOfferedFailIrrevocable(htlc)
@@ -28084,8 +28090,17 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Scan for stuck PENDING outbound payments with no corresponding HTLC.
-	 * Fails payments that have been PENDING for >10 minutes with no active HTLC.
+	 * Scan for stuck PENDING outbound payments with no corresponding HTLC: a
+	 * payment PENDING for over ten minutes with no PENDING or COMMITTED
+	 * offered HTLC is failed, unless an HTLC of it can still settle
+	 * (failPaymentUnlessInFlight, issue #989). A fail whose removal is not
+	 * yet irrevocable (the peer withholding its revoke_and_ack, or offline
+	 * since our own revocation) and an HTLC awaiting its on-chain outcome
+	 * both keep the record PENDING with the retry budget frozen; the round,
+	 * or the chain, settles it, and the sweep fails it once nothing is out.
+	 * Failing it here instead emitted payment:failed with the HTLC still in
+	 * flight, which the CLI's spend ledger cannot release on, and the give-up
+	 * that followed the round had nothing left to report.
 	 */
 	private scanStuckPayments(): void {
 		const TEN_MINUTES = 10 * 60 * 1000;
@@ -28117,7 +28132,7 @@ export class LightningNode extends EventEmitter {
 			if (activeHtlcHashes.has(hashHex)) continue;
 
 			// No active HTLC and payment older than 10 min → fail
-			this.failPayment(
+			this.failPaymentUnlessInFlight(
 				payment.paymentHash,
 				'Stuck payment swept: no active HTLC after 10 minutes'
 			);
