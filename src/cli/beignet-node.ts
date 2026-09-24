@@ -6095,40 +6095,42 @@ export class BeignetNode extends EventEmitter {
 		// External onchain sends share the daily budget with Lightning
 		// payments. Fail fast on the amount alone before building.
 		this._checkSpendLimit(amountSats);
-		// wallet.send with broadcast:true resolves to the txid, not the raw
-		// hex, so build first (broadcast:false returns the hex) and broadcast
-		// separately to report both txid and hex. rbf must be passed per-send:
-		// the wallet-level flag does not propagate into setupTransaction.
-		const result = await this.wallet.send({
-			address,
-			amount: amountSats,
-			broadcast: false,
-			rbf: this.wallet.rbf,
-			...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
-		});
-		if (result.isErr()) {
-			throw new BeignetError('SEND_FAILED', result.error.message);
-		}
-		// No limit configured: broadcast without touching the budget.
-		if (this._dailySpendLimitSats === undefined) {
-			return this._broadcastRawTx(result.value);
-		}
-		// Re-check with the real fee included, then reserve the total so
-		// concurrent sends cannot both pass before either records.
-		const totalSats = this._builtOnchainTotalSats(amountSats);
+		// The staged send is read below (the built fee) and reset on every
+		// way out, as _boostRbf does: what one send staged must not outlive
+		// it (#1002).
 		try {
+			// wallet.send with broadcast:true resolves to the txid, not the raw
+			// hex, so build first (broadcast:false returns the hex) and broadcast
+			// separately to report both txid and hex. rbf must be passed per-send:
+			// the wallet-level flag does not propagate into setupTransaction.
+			const result = await this.wallet.send({
+				address,
+				amount: amountSats,
+				broadcast: false,
+				rbf: this.wallet.rbf,
+				...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
+			});
+			if (result.isErr()) {
+				throw new BeignetError('SEND_FAILED', result.error.message);
+			}
+			// No limit configured: broadcast without touching the budget.
+			if (this._dailySpendLimitSats === undefined) {
+				return await this._broadcastRawTx(result.value);
+			}
+			// Re-check with the real fee included, then reserve the total so
+			// concurrent sends cannot both pass before either records.
+			const totalSats = this._builtOnchainTotalSats(amountSats);
 			this._checkSpendLimit(totalSats);
-		} catch (e) {
-			await this.wallet.resetSendTransaction();
-			throw e;
-		}
-		this._pendingSpendSats += totalSats;
-		try {
-			const info = await this._broadcastRawTx(result.value);
-			this._recordSpend(totalSats, 'onchain');
-			return info;
+			this._pendingSpendSats += totalSats;
+			try {
+				const info = await this._broadcastRawTx(result.value);
+				this._recordSpend(totalSats, 'onchain');
+				return info;
+			} finally {
+				this._pendingSpendSats -= totalSats;
+			}
 		} finally {
-			this._pendingSpendSats -= totalSats;
+			await this.wallet.resetSendTransaction();
 		}
 	}
 
@@ -6155,32 +6157,38 @@ export class BeignetNode extends EventEmitter {
 			}
 		}
 		this._validateFeeRate(satsPerVbyte);
-		const result = await this.wallet.buildPsbt({
-			txs: outputs.map((o) => ({ address: o.address, amount: o.amountSats })),
-			rbf: this.wallet.rbf,
-			...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
-		});
-		if (result.isErr()) {
-			throw new BeignetError('PSBT_BUILD_FAILED', result.error.message);
+		// Everything the later steps need (import-signed, combine) is in the
+		// PSBT itself; none of them reads the staged send, so it is reset here.
+		try {
+			const result = await this.wallet.buildPsbt({
+				txs: outputs.map((o) => ({ address: o.address, amount: o.amountSats })),
+				rbf: this.wallet.rbf,
+				...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
+			});
+			if (result.isErr()) {
+				throw new BeignetError('PSBT_BUILD_FAILED', result.error.message);
+			}
+			const built = result.value;
+			return {
+				psbtBase64: built.psbtBase64,
+				feeSats: built.fee,
+				vsizeEstimate: built.vsizeEstimate,
+				satsPerVbyte: built.satsPerByte,
+				inputs: built.inputs.map((input) => ({
+					txid: input.tx_hash,
+					vout: input.tx_pos,
+					address: input.address,
+					valueSats: input.value,
+					path: input.path
+				})),
+				outputs: built.outputs.map((output) => ({
+					address: output.address,
+					valueSats: output.value
+				}))
+			};
+		} finally {
+			await this.wallet.resetSendTransaction();
 		}
-		const built = result.value;
-		return {
-			psbtBase64: built.psbtBase64,
-			feeSats: built.fee,
-			vsizeEstimate: built.vsizeEstimate,
-			satsPerVbyte: built.satsPerByte,
-			inputs: built.inputs.map((input) => ({
-				txid: input.tx_hash,
-				vout: input.tx_pos,
-				address: input.address,
-				valueSats: input.value,
-				path: input.path
-			})),
-			outputs: built.outputs.map((output) => ({
-				address: output.address,
-				valueSats: output.value
-			}))
-		};
 	}
 
 	/**
@@ -6490,46 +6498,46 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		this._validateFeeRate(satsPerVbyte);
-		const result = await this.wallet.sendMax({
-			address,
-			satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
-			rbf: this.wallet.rbf,
-			broadcast: false
-		});
-		if (result.isErr()) {
-			throw new BeignetError('SEND_FAILED', result.error.message);
-		}
-		// No limit configured: broadcast without touching the budget.
-		if (this._dailySpendLimitSats === undefined) {
-			return this._broadcastRawTx(result.value);
-		}
-		// A sweep drains the entire input value (send amount + fee). Check it
-		// against the shared daily budget BEFORE broadcast; the amount is only
-		// known once the transaction has been built.
-		const totalSats = this.wallet.transaction.getTransactionInputValue({
-			inputs: this.wallet.transaction.data.inputs
-		});
-		if (totalSats <= 0) {
-			// Fail closed: never broadcast a sweep the limit cannot account for.
-			await this.wallet.resetSendTransaction();
-			throw new BeignetError(
-				'SPENDING_LIMIT_EXCEEDED',
-				'Unable to determine the swept amount for the daily spend limit check; refusing to send'
-			);
-		}
+		// The staged send is read below (the swept inputs) and reset on every
+		// way out, as _boostRbf does (#1002).
 		try {
+			const result = await this.wallet.sendMax({
+				address,
+				satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
+				rbf: this.wallet.rbf,
+				broadcast: false
+			});
+			if (result.isErr()) {
+				throw new BeignetError('SEND_FAILED', result.error.message);
+			}
+			// No limit configured: broadcast without touching the budget.
+			if (this._dailySpendLimitSats === undefined) {
+				return await this._broadcastRawTx(result.value);
+			}
+			// A sweep drains the entire input value (send amount + fee). Check it
+			// against the shared daily budget BEFORE broadcast; the amount is only
+			// known once the transaction has been built.
+			const totalSats = this.wallet.transaction.getTransactionInputValue({
+				inputs: this.wallet.transaction.data.inputs
+			});
+			if (totalSats <= 0) {
+				// Fail closed: never broadcast a sweep the limit cannot account for.
+				throw new BeignetError(
+					'SPENDING_LIMIT_EXCEEDED',
+					'Unable to determine the swept amount for the daily spend limit check; refusing to send'
+				);
+			}
 			this._checkSpendLimit(totalSats);
-		} catch (e) {
-			await this.wallet.resetSendTransaction();
-			throw e;
-		}
-		this._pendingSpendSats += totalSats;
-		try {
-			const info = await this._broadcastRawTx(result.value);
-			this._recordSpend(totalSats, 'onchain');
-			return info;
+			this._pendingSpendSats += totalSats;
+			try {
+				const info = await this._broadcastRawTx(result.value);
+				this._recordSpend(totalSats, 'onchain');
+				return info;
+			} finally {
+				this._pendingSpendSats -= totalSats;
+			}
 		} finally {
-			this._pendingSpendSats -= totalSats;
+			await this.wallet.resetSendTransaction();
 		}
 	}
 
@@ -6733,18 +6741,24 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		const address = await this.getNewAddress();
-		const result = await this.wallet.sendMax({
-			address,
-			satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
-			rbf: this.wallet.rbf,
-			broadcast: false
-		});
-		if (result.isErr()) {
-			throw new BeignetError('SEND_FAILED', result.error.message);
+		// The staged send is read below (the fee) and reset on every way out,
+		// as _boostRbf does (#1002).
+		try {
+			const result = await this.wallet.sendMax({
+				address,
+				satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
+				rbf: this.wallet.rbf,
+				broadcast: false
+			});
+			if (result.isErr()) {
+				throw new BeignetError('SEND_FAILED', result.error.message);
+			}
+			const feeSats = this.wallet.transaction.data.fee;
+			const info = await this._broadcastRawTx(result.value);
+			return { ...info, utxosConsolidated: utxoCount, address, feeSats };
+		} finally {
+			await this.wallet.resetSendTransaction();
 		}
-		const feeSats = this.wallet.transaction.data.fee;
-		const info = await this._broadcastRawTx(result.value);
-		return { ...info, utxosConsolidated: utxoCount, address, feeSats };
 	}
 
 	async refreshWallet(): Promise<void> {

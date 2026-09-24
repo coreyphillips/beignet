@@ -999,6 +999,8 @@ describe('BeignetNode new methods', () => {
 					calls.push({ method: 'send', ...opts });
 					return ok(rawTxHex);
 				},
+				// sendOnchain resets the staged send on every way out (#1002).
+				resetSendTransaction: async (): Promise<unknown> => ok('reset'),
 				electrum: {
 					broadcastTransaction: async (opts: {
 						rawTx: string;
@@ -1031,6 +1033,7 @@ describe('BeignetNode new methods', () => {
 			const { ok, err } = require('../../src/utils/result');
 			const fakeWallet = {
 				send: async (): Promise<unknown> => ok(rawTxHex),
+				resetSendTransaction: async (): Promise<unknown> => ok('reset'),
 				electrum: {
 					broadcastTransaction: async (): Promise<unknown> =>
 						err('electrum rejected')

@@ -129,7 +129,8 @@ import {
 	addressTypes,
 	defaultFeesShape,
 	getAddressTypeContent,
-	getAddressTypes
+	getAddressTypes,
+	getDefaultSendTransaction
 } from '../shapes';
 import { Electrum } from '../electrum';
 import { Transaction } from '../transaction';
@@ -1144,11 +1145,29 @@ export class Wallet {
 			if (walletDataResponse.isErr())
 				return err(walletDataResponse.error.message);
 			this._data = walletDataResponse.value;
+			await this._scrubStoredSendTransaction();
 			await this._applyBirthdayHeightOption();
 			return ok(true);
 		} catch (e) {
 			return err(e);
 		}
+	}
+
+	/**
+	 * The staged send is a per-call working area, never a draft to restore:
+	 * nothing reads the stored copy, and a copy an older version left behind
+	 * can carry an earlier call's recipients (#1002) and, after a key sweep,
+	 * the swept key pair (#1011). Drop it rather than keep it, in memory and
+	 * in storage, and only write when there is something to drop.
+	 * @private
+	 * @async
+	 * @returns {Promise<void>}
+	 */
+	private async _scrubStoredSendTransaction(): Promise<void> {
+		const stored = this._data.transaction;
+		if (!stored?.inputs?.length && !stored?.outputs?.length) return;
+		this._data.transaction = getDefaultSendTransaction();
+		await this.saveWalletData('transaction', this._data.transaction);
 	}
 
 	/**
@@ -4820,57 +4839,69 @@ export class Wallet {
 		if (!this.data.utxos.length) {
 			return err('No UTXOs available.');
 		}
-		const setupTransactionRes = await this.transaction.setupTransaction({
-			rbf
-		});
-		if (setupTransactionRes.isErr()) {
-			return err(setupTransactionRes.error.message);
-		}
-
-		if (!Array.isArray(txs)) txs = [txs];
-
-		const shuffledTxs = shuffleOutputs ? shuffleArray(txs) : txs;
-		let index = 0;
-		for (const tx of shuffledTxs) {
-			const updateSendTransactionRes = this.transaction.updateSendTransaction({
-				transaction: {
-					label: tx.message,
-					outputs: [{ address: tx.address, value: tx.amount, index }]
-				}
+		// The staged send is a per-call working area. It starts empty, so
+		// nothing an earlier call staged rides along (#1002), and its stored
+		// copy is dropped on the way out, so nothing of this call outlives the
+		// process. The live copy stays readable (fee, inputs) until the next
+		// call resets it.
+		await this.resetSendTransaction();
+		try {
+			const setupTransactionRes = await this.transaction.setupTransaction({
+				rbf
 			});
-			if (updateSendTransactionRes.isErr())
-				return err(updateSendTransactionRes.error.message);
-			index++;
-		}
-
-		const updateFeeRes = this.transaction.updateFee({ satsPerByte });
-		if (updateFeeRes.isErr()) {
-			if (updateFeeRes.error.message.includes('Unable to increase the fee')) {
-				const feeInfo = this.getFeeInfo({ satsPerByte: 1 });
-				if (feeInfo.isOk()) {
-					return err(
-						`Fee is too high. The maximum fee for this transaction is ${feeInfo.value.maxSatPerByte}`
-					);
-				}
+			if (setupTransactionRes.isErr()) {
+				return err(setupTransactionRes.error.message);
 			}
-			// The fee probe above only refines the message. Either way the fee was
-			// never updated, so never fall through to build and broadcast.
-			return err(updateFeeRes.error.message);
-		}
 
-		const createRes = await this.transaction.createTransaction({
-			shuffleOutputs
-		});
-		if (createRes.isErr()) return err(createRes.error.message);
-		const { hex } = createRes.value;
-		if (!broadcast) {
-			return ok(hex);
+			if (!Array.isArray(txs)) txs = [txs];
+
+			const shuffledTxs = shuffleOutputs ? shuffleArray(txs) : txs;
+			let index = 0;
+			for (const tx of shuffledTxs) {
+				const updateSendTransactionRes = this.transaction.updateSendTransaction(
+					{
+						transaction: {
+							label: tx.message,
+							outputs: [{ address: tx.address, value: tx.amount, index }]
+						}
+					}
+				);
+				if (updateSendTransactionRes.isErr())
+					return err(updateSendTransactionRes.error.message);
+				index++;
+			}
+
+			const updateFeeRes = this.transaction.updateFee({ satsPerByte });
+			if (updateFeeRes.isErr()) {
+				if (updateFeeRes.error.message.includes('Unable to increase the fee')) {
+					const feeInfo = this.getFeeInfo({ satsPerByte: 1 });
+					if (feeInfo.isOk()) {
+						return err(
+							`Fee is too high. The maximum fee for this transaction is ${feeInfo.value.maxSatPerByte}`
+						);
+					}
+				}
+				// The fee probe above only refines the message. Either way the fee
+				// was never updated, so never fall through to build and broadcast.
+				return err(updateFeeRes.error.message);
+			}
+
+			const createRes = await this.transaction.createTransaction({
+				shuffleOutputs
+			});
+			if (createRes.isErr()) return err(createRes.error.message);
+			const { hex } = createRes.value;
+			if (!broadcast) {
+				return ok(hex);
+			}
+			const broadcastRes = await this.electrum.broadcastTransaction({
+				rawTx: hex
+			});
+			if (broadcastRes.isErr()) return err(broadcastRes.error.message);
+			return ok(broadcastRes.value);
+		} finally {
+			await this.transaction.clearStoredSendTransaction();
 		}
-		const broadcastRes = await this.electrum.broadcastTransaction({
-			rawTx: hex
-		});
-		if (broadcastRes.isErr()) return err(broadcastRes.error.message);
-		return ok(broadcastRes.value);
 	}
 
 	/**
@@ -4897,34 +4928,40 @@ export class Wallet {
 		if (!this.data.utxos.length) {
 			return err('No UTXOs available.');
 		}
+		// Same working-area rule as sendMany: empty on entry, dropped from
+		// storage on exit, live copy readable until the next call.
 		await this.resetSendTransaction();
-		const setupTransactionRes = await this.transaction.setupTransaction();
-		if (setupTransactionRes.isErr()) {
-			return err(setupTransactionRes.error.message);
-		}
-		const sendMaxRes = await this.transaction.sendMax({
-			address,
-			satsPerByte,
-			rbf
-		});
+		try {
+			const setupTransactionRes = await this.transaction.setupTransaction();
+			if (setupTransactionRes.isErr()) {
+				return err(setupTransactionRes.error.message);
+			}
+			const sendMaxRes = await this.transaction.sendMax({
+				address,
+				satsPerByte,
+				rbf
+			});
 
-		if (sendMaxRes.isErr()) {
-			return err(sendMaxRes.error.message);
-		}
+			if (sendMaxRes.isErr()) {
+				return err(sendMaxRes.error.message);
+			}
 
-		const createRes = await this.transaction.createTransaction({
-			shuffleOutputs: true
-		});
-		if (createRes.isErr()) return err(createRes.error.message);
-		const { hex } = createRes.value;
-		if (!broadcast) {
-			return ok(hex);
+			const createRes = await this.transaction.createTransaction({
+				shuffleOutputs: true
+			});
+			if (createRes.isErr()) return err(createRes.error.message);
+			const { hex } = createRes.value;
+			if (!broadcast) {
+				return ok(hex);
+			}
+			const broadcastRes = await this.electrum.broadcastTransaction({
+				rawTx: hex
+			});
+			if (broadcastRes.isErr()) return err(broadcastRes.error.message);
+			return ok(broadcastRes.value);
+		} finally {
+			await this.transaction.clearStoredSendTransaction();
 		}
-		const broadcastRes = await this.electrum.broadcastTransaction({
-			rawTx: hex
-		});
-		if (broadcastRes.isErr()) return err(broadcastRes.error.message);
-		return ok(broadcastRes.value);
 	}
 
 	/**
@@ -5068,6 +5105,11 @@ export class Wallet {
 			});
 		} catch (e) {
 			return err(e);
+		} finally {
+			// The response carries everything the caller needs; the later
+			// steps (signPsbtWithOurKey, combinePsbts, importSignedPsbt) work
+			// on the PSBT alone and never read the staged send.
+			await this.transaction.clearStoredSendTransaction();
 		}
 	}
 
@@ -6101,44 +6143,51 @@ export class Wallet {
 			utxos = [...walletUtxos, ...utxos];
 		}
 		await this.transaction.resetSendTransaction();
-		await this.transaction.setupTransaction({
-			satsPerByte,
-			utxos,
-			outputs: [{ address: toAddress, value: balance, index: 0 }]
-		});
-		const sendMaxRes = await this.transaction.sendMax({
-			address: toAddress,
-			satsPerByte,
-			transaction: {
-				...this.transaction.data,
-				outputs: [{ address: toAddress, value: balance, index: 0 }],
-				inputs: utxos,
-				satsPerByte
+		try {
+			await this.transaction.setupTransaction({
+				satsPerByte,
+				utxos,
+				outputs: [{ address: toAddress, value: balance, index: 0 }]
+			});
+			const sendMaxRes = await this.transaction.sendMax({
+				address: toAddress,
+				satsPerByte,
+				transaction: {
+					...this.transaction.data,
+					outputs: [{ address: toAddress, value: balance, index: 0 }],
+					inputs: utxos,
+					satsPerByte
+				}
+			});
+			if (sendMaxRes.isErr()) {
+				return err(sendMaxRes.error.message);
 			}
-		});
-		if (sendMaxRes.isErr()) {
-			return err(sendMaxRes.error.message);
-		}
-		const createRes = await this.transaction.createTransaction({});
-		if (createRes.isErr()) {
-			return err(createRes.error.message);
-		}
-		const response = {
-			...createRes.value,
-			balance
-		};
-		if (!broadcast) {
+			const createRes = await this.transaction.createTransaction({});
+			if (createRes.isErr()) {
+				return err(createRes.error.message);
+			}
+			const response = {
+				...createRes.value,
+				balance
+			};
+			if (!broadcast) {
+				return ok(response);
+			}
+			const broadcastResponse = await this.electrum.broadcastTransaction({
+				rawTx: response.hex,
+				subscribeToOutputAddress: false
+			});
+			if (broadcastResponse.isErr()) {
+				return err(broadcastResponse.error.message);
+			}
+			response.id = broadcastResponse.value;
 			return ok(response);
+		} finally {
+			// The staged inputs carry the swept key pair, so the live copy goes
+			// too, not only the stored one (#1011). The response already holds
+			// the hex and the balance.
+			await this.transaction.resetSendTransaction();
 		}
-		const broadcastResponse = await this.electrum.broadcastTransaction({
-			rawTx: response.hex,
-			subscribeToOutputAddress: false
-		});
-		if (broadcastResponse.isErr()) {
-			return err(broadcastResponse.error.message);
-		}
-		response.id = broadcastResponse.value;
-		return ok(response);
 	}
 
 	public getAddressInfoFromScriptHash(scriptHash: string): Result<{
