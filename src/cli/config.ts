@@ -7,6 +7,13 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { BeignetConfig } from './types';
 import { TLogLevel } from '../logger';
+import {
+	ensurePrivateDir,
+	SECRET_DIR_MODE,
+	SECRET_FILE_MODE,
+	tightenMode,
+	writeFileAtomic
+} from './fs-utils';
 
 const LOG_LEVELS: TLogLevel[] = ['debug', 'info', 'warn', 'error', 'silent'];
 
@@ -40,7 +47,47 @@ function pidPath(): string {
 	return path.join(beignetDir(), 'daemon.pid');
 }
 
+/**
+ * Paths whose chmod already failed this process, so a filesystem that keeps
+ * refusing it (read-only, or one without permission bits) warns once rather
+ * than on every command that reads the config.
+ */
+const modeWarningsPrinted = new Set<string>();
+
+/**
+ * Owner-only permissions on the config file and its directory, checked on
+ * every read and after every write (issue #1004). The file holds the mnemonic
+ * and the API token; one written by a release before this was 0644 under the
+ * usual umask, readable by every other account on the host, and neither
+ * mkdir nor writeFileSync changes the bits of something that already exists.
+ * One line on stderr names each path tightened, or warns when the chmod was
+ * refused, so an operator watching the file knows what happened to it.
+ */
+function tightenConfigPermissions(): void {
+	const targets: Array<[string, number]> = [
+		[beignetDir(), SECRET_DIR_MODE],
+		[configPath(), SECRET_FILE_MODE]
+	];
+	for (const [target, mode] of targets) {
+		const result = tightenMode(target, mode);
+		if (result.previous === undefined) continue;
+		const was = result.previous.toString(8).padStart(4, '0');
+		const now = mode.toString(8).padStart(4, '0');
+		if (result.changed) {
+			process.stderr.write(
+				`beignet: tightened permissions on ${target} (was ${was}, now ${now})\n`
+			);
+		} else if (result.error && !modeWarningsPrinted.has(target)) {
+			modeWarningsPrinted.add(target);
+			process.stderr.write(
+				`beignet: warning: could not tighten permissions on ${target} (mode ${was}, other accounts may read it): ${result.error.message}\n`
+			);
+		}
+	}
+}
+
 export function loadConfig(): BeignetConfig {
+	tightenConfigPermissions();
 	try {
 		const raw = fs.readFileSync(configPath(), 'utf-8');
 		return JSON.parse(raw) as BeignetConfig;
@@ -50,8 +97,11 @@ export function loadConfig(): BeignetConfig {
 }
 
 export function saveConfig(config: BeignetConfig): void {
-	fs.mkdirSync(beignetDir(), { recursive: true });
-	fs.writeFileSync(configPath(), JSON.stringify(config, null, 2) + '\n');
+	// Owner-only directory and file (issue #1004): the file carries the
+	// mnemonic. The check afterwards only speaks up when a chmod was refused.
+	ensurePrivateDir(beignetDir());
+	writeFileAtomic(configPath(), JSON.stringify(config, null, 2) + '\n');
+	tightenConfigPermissions();
 }
 
 /**
@@ -692,8 +742,8 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 }
 
 export function writePidFile(pid: number, port: number): void {
-	fs.mkdirSync(beignetDir(), { recursive: true });
-	fs.writeFileSync(pidPath(), JSON.stringify({ pid, port }));
+	ensurePrivateDir(beignetDir());
+	writeFileAtomic(pidPath(), JSON.stringify({ pid, port }));
 }
 
 export function readPidFile(): { pid: number; port: number } | null {

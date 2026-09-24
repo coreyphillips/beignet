@@ -137,7 +137,9 @@ export function acquireInstanceLock(
 	// so a live competitor can never be silently overwritten.
 	for (let attempt = 0; attempt < 2; attempt++) {
 		try {
-			const fd = fs.openSync(lockPath, 'wx'); // atomic: fails if it exists
+			// atomic: fails if it exists; owner-only like the rest of the data
+			// directory (issue #1004)
+			const fd = fs.openSync(lockPath, 'wx', 0o600);
 			try {
 				fs.writeSync(fd, payload);
 			} finally {

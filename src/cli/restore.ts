@@ -13,6 +13,7 @@
 
 import * as fs from 'fs';
 import { acquireInstanceLock, releaseInstanceLock } from './instance-lock';
+import { SECRET_FILE_MODE, tightenMode } from './fs-utils';
 
 /** First 16 bytes of every SQLite 3 database file. */
 export const SQLITE_HEADER = Buffer.from('SQLite format 3\0', 'ascii');
@@ -73,10 +74,15 @@ export function restoreDbFile(
 		);
 	}
 
+	// Every copy made here is owner-only (issue #1004): copyFileSync gives the
+	// destination the SOURCE's bits, so a backup an operator saved as 0644
+	// would otherwise become a 0644 live database, and the pre-restore copy
+	// keeps whatever an older release left on the file it came from.
 	let preRestorePath: string | null = null;
 	if (fs.existsSync(dbPath)) {
 		preRestorePath = preRestoreBackupPath(dbPath, now);
 		fs.copyFileSync(dbPath, preRestorePath);
+		tightenMode(preRestorePath, SECRET_FILE_MODE);
 	}
 	// Stale WAL/SHM sidecars pair with the OLD database; replayed against the
 	// restored file they corrupt it. Preserve them next to the pre-restore copy.
@@ -85,12 +91,14 @@ export function restoreDbFile(
 		if (fs.existsSync(sidecar)) {
 			if (preRestorePath) {
 				fs.renameSync(sidecar, `${preRestorePath}${suffix}`);
+				tightenMode(`${preRestorePath}${suffix}`, SECRET_FILE_MODE);
 			} else {
 				fs.unlinkSync(sidecar);
 			}
 		}
 	}
 	fs.copyFileSync(backupFile, dbPath);
+	tightenMode(dbPath, SECRET_FILE_MODE);
 	return { dbPath, preRestorePath };
 }
 
