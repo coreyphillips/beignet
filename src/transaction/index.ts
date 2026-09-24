@@ -56,7 +56,9 @@ bitcoin.initEccLib(ecc);
  * one. Storage adapters JSON-stringify what they are handed, and an ECPair or
  * BIP32 node stringifies with its private key, so a key handed to
  * sweepPrivateKey or addExternalInputs used to sit in storage in the clear
- * (#1011).
+ * (#1011). The inputs, outputs and tags are copied too: saveWalletData queues
+ * a write behind the previous one for the same key, so a write serialises
+ * what the arrays hold when its turn comes, not when it was issued.
  * @param {ISendTransaction} data
  * @returns {ISendTransaction}
  */
@@ -64,6 +66,8 @@ export const persistableTransaction = (
 	data: ISendTransaction
 ): ISendTransaction => ({
 	...data,
+	outputs: data.outputs.map((output) => ({ ...output })),
+	tags: [...(data.tags ?? [])],
 	inputs: data.inputs.map((input) => {
 		const { keyPair, ...rest } = input;
 		void keyPair;
