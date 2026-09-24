@@ -12152,11 +12152,18 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── Route Estimation & Probing ───────────────
 
 	estimateRouteFee(bolt11: string, amountSats?: number): RouteEstimate | null {
-		return this.node.estimateRouteFee(bolt11, amountSats);
+		const estimate = this.node.estimateRouteFee(bolt11, amountSats);
+		if (!estimate) return null;
+		return { ...estimate, feeMsat: estimate.feeMsat.toString() };
 	}
 
 	estimatePayment(bolt11: string, amountSats?: number): PaymentEstimate | null {
-		return this.node.estimatePayment(bolt11, amountSats);
+		const estimate = this.node.estimatePayment(bolt11, amountSats);
+		if (!estimate) return null;
+		return {
+			...estimate,
+			estimatedFeeMsat: estimate.estimatedFeeMsat.toString()
+		};
 	}
 
 	probeRoute(
@@ -12165,13 +12172,18 @@ export class BeignetNode extends EventEmitter {
 	): {
 		success: boolean;
 		feeSats?: number;
+		feeMsat?: string;
 		hops?: number;
 		path?: Array<{ pubkey: string; shortChannelId: string }>;
 	} {
-		const result = this.node.probeRoute(destination, amountSats);
-		if (!result.path) return result;
+		const { feeMsat, ...result } = this.node.probeRoute(
+			destination,
+			amountSats
+		);
+		if (feeMsat === undefined || !result.path) return result;
 		return {
 			...result,
+			feeMsat: feeMsat.toString(),
 			path: result.path.map((hop) => ({
 				pubkey: hop.pubkey,
 				shortChannelId: formatScid(Buffer.from(hop.shortChannelId, 'hex'))

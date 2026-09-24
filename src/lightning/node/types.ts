@@ -1747,6 +1747,9 @@ export interface IPaymentEstimate {
 	routeQuality: 'HIGH' | 'MEDIUM' | 'LOW';
 	warning?: string;
 	alternativeAvailable: boolean;
+	/** Route fee rounded UP to whole sats, so it is safe to pass as maxFeeSats. */
 	estimatedFeeSats: number;
+	/** The exact route fee. */
+	estimatedFeeMsat: bigint;
 	hopCount: number;
 }
