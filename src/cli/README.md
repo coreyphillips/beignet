@@ -306,7 +306,10 @@ key derived (HKDF-SHA256) from the wallet's BIP39 seed. Sensitive payloads
 state) are AES-256-GCM encrypted, so backups made with `backup()` are encrypted
 too; restoring one requires the same mnemonic. Pre-encryption databases are
 migrated in place on first open. Set `storageEncryption: false` to opt out
-(plaintext storage).
+(plaintext storage). Lookup columns (payment hashes, channel ids, peer pubkeys,
+gossip) stay plaintext, so the database file, its sidecars and every backup
+are created `0600` and the data directory `0700` (see
+[File permissions](#file-permissions)).
 
 #### Static Channel Backup (SCB)
 
@@ -1864,6 +1867,25 @@ Every response follows this format:
   "htlcEvents": false
 }
 ```
+
+### File permissions
+
+The config file carries the mnemonic and the API token, so everything under
+`~/.beignet` is created owner-only: `~/.beignet` and the data directory are
+`0700`, and `config.json`, `daemon.pid`, the SQLite database with its `-wal`
+and `-shm` sidecars, the instance lock, database backups (`backup()`, the
+scheduled backup, `POST /backup`), restore copies and SCB exports are `0600`.
+The modes are set explicitly rather than trusted to the umask; the CLI also
+sets the process umask to `077` for `init`, `start`, `backup` and `restore`,
+so anything else those commands create is owner-only too. A library host that
+embeds `BeignetNode` keeps its own umask.
+
+A `config.json` or `~/.beignet` written by an earlier release is tightened the
+next time the config is read (every CLI command reads it), with one line on
+stderr naming the path: `beignet: tightened permissions on <path> (was 0644,
+now 0600)`. When the chmod is refused (a read-only or foreign filesystem) a
+warning is printed once instead and startup continues. On Windows, where ACLs
+govern access, none of this applies.
 
 ### Environment Variables
 

@@ -26,6 +26,7 @@ import { defaultDataDirForMnemonic } from './beignet-node';
 import { performDbRestore } from './restore';
 import { InstanceLockError } from './instance-lock';
 import { installProcessFaultHandlers } from './process-faults';
+import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
 import { ApiResponse, BeignetConfig } from './types';
 
 const args = process.argv.slice(2);
@@ -156,6 +157,17 @@ async function httpRequest(
 	});
 }
 
+/**
+ * Owner-only creation for every file this process makes (issue #1004): the
+ * paths that write secrets set their modes explicitly, but SQLite's WAL and
+ * shm sidecars, backups and anything else created without a mode inherit the
+ * umask. Set here in the CLI only: a host embedding BeignetNode owns its own
+ * process umask, so no library path ever calls this. Windows has no umask.
+ */
+function restrictUmask(): void {
+	if (process.platform !== 'win32') process.umask(0o077);
+}
+
 async function main(): Promise<void> {
 	const cmd = filteredArgs[0];
 
@@ -166,8 +178,10 @@ async function main(): Promise<void> {
 
 	switch (cmd) {
 		case 'init':
+			restrictUmask();
 			return handleInit();
 		case 'start':
+			restrictUmask();
 			return handleStart();
 		case 'stop':
 			return handleStop();
@@ -352,8 +366,10 @@ async function main(): Promise<void> {
 		case 'auth':
 			return handleAuth();
 		case 'backup':
+			restrictUmask();
 			return handleBackup();
 		case 'restore':
+			restrictUmask();
 			return handleRestore();
 		case 'recovery':
 			return handleRecovery();
@@ -2427,7 +2443,8 @@ async function handleBackup(): Promise<void> {
 			encoded: string;
 			channelCount: number;
 		};
-		fs.writeFileSync(destPath, encoded);
+		// Owner-only, like the copy the daemon keeps in the data directory.
+		writeFileAtomic(destPath, encoded);
 		return output({
 			ok: true,
 			result: { written: true, path: destPath, channelCount }
@@ -2650,7 +2667,7 @@ async function handleRestore(): Promise<void> {
 		const dbPath = nodePath.join(dataDir, `${network}.db`);
 		const lockPath = nodePath.join(dataDir, `${network}.lock`);
 		try {
-			fs.mkdirSync(dataDir, { recursive: true });
+			ensurePrivateDir(dataDir);
 			const result = performDbRestore(file, dbPath, lockPath);
 			output({
 				ok: true,

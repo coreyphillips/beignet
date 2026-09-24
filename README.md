@@ -459,6 +459,8 @@ npx beignet invoice pay <bolt11>
 
 Electrum and most other settings come from `~/.beignet/config.json` or the environment (`BEIGNET_MNEMONIC`, `BEIGNET_ELECTRUM_HOST`, `BEIGNET_ELECTRUM_PORT`, `BEIGNET_NETWORK`, ...). Run `npx beignet help` for the full command and flag list.
 
+`config.json` holds the mnemonic, so everything under `~/.beignet` is created owner-only (`0700` directories, `0600` files: config, pid file, database and sidecars, backups, SCB exports), the CLI runs `init`, `start`, `backup` and `restore` under umask `077`, and a config file an earlier release left readable is tightened the next time it is read, with a notice on stderr. Details in [src/cli/README.md](src/cli/README.md#file-permissions).
+
 Or over HTTP directly:
 
 ```bash
@@ -743,6 +745,7 @@ Recommended safeguards in production:
 - Cap exposure with `maxPaymentSats` and `dailySpendLimitSats`.
 - Call `validatePayment()` before every send.
 - Set `backupPath` for automated database backups, and keep an SCB (`beignet backup scb`).
+- Keep `~/.beignet` and the data directory owner-only. The CLI creates them `0700`/`0600` and tightens an older config on load; check them again after copying files between hosts.
 - Pass multiple `electrumServers` for connection redundancy.
 - Configure watchtowers so breaches are punished while you are offline.
 - Monitor `node:error` events and the `/health` endpoint.

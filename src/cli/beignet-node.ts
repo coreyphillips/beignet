@@ -34,6 +34,7 @@ import {
 	TMessageDataMap
 } from '../types/wallet';
 import { createWalletStorage } from './wallet-storage';
+import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
 import { nodeStorageView } from './node-storage-view';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
@@ -703,13 +704,6 @@ function sameGuardianIds(a: string[], b: string[]): boolean {
 	const sortedA = a.map((id) => id.toLowerCase()).sort();
 	const sortedB = b.map((id) => id.toLowerCase()).sort();
 	return sortedA.every((id, i) => id === sortedB[i]);
-}
-
-/** Write through a temp file and rename, so a crash never leaves a torn file. */
-function writeFileAtomic(filePath: string, content: string): void {
-	const tmp = `${filePath}.tmp`;
-	fs.writeFileSync(tmp, content);
-	fs.renameSync(tmp, filePath);
 }
 
 const RESTORE_ERROR_CODES: Record<RestoreRefusedError['reason'], string> = {
@@ -1982,11 +1976,20 @@ export class BeignetNode extends EventEmitter {
 		// An explicit dataDir is respected as-is (one wallet per dataDir).
 		const dataDir = opts.dataDir || defaultDataDirForMnemonic(mnemonic);
 
-		// Ensure data directory exists
-		fs.mkdirSync(dataDir, { recursive: true });
+		// Owner-only data directory (issue #1004): the database's lookup
+		// columns are plaintext, and mkdir leaves an existing directory's bits
+		// alone, so one created by an older release under umask 022 is
+		// tightened here. A refused chmod is logged once the logger is wired.
+		const dirMode = ensurePrivateDir(dataDir);
 
 		const instance = new BeignetNode(mnemonic, networkName, dataDir);
 		await instance.init(opts);
+		if (dirMode.error) {
+			instance.log('warn', 'Could not restrict data directory permissions', {
+				dataDir,
+				error: dirMode.error.message
+			});
+		}
 		return instance;
 	}
 
@@ -13029,9 +13032,9 @@ export class BeignetNode extends EventEmitter {
 		const encoded = encodeScb(backup, seed);
 		const scbPath = path.join(this.dataDir, 'channels.scb');
 		// Atomic write: a crash mid-write must never leave a truncated backup.
-		const tmpPath = `${scbPath}.tmp`;
-		fs.writeFileSync(tmpPath, encoded);
-		fs.renameSync(tmpPath, scbPath);
+		// Owner-only: the blob is seed-encrypted, but it still names every
+		// channel and peer of this wallet (issue #1004).
+		writeFileAtomic(scbPath, encoded);
 		return { encoded, channelCount: data.channels.length, path: scbPath };
 	}
 
