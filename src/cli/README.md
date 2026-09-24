@@ -241,7 +241,7 @@ verify the Lightning leg outlives its on-chain refund before funding.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `estimateRouteFee(bolt11, amountSats?)` | `RouteEstimate \| null` | Estimate fee without sending. Returns `{ feeSats, hops, cltvDelta }` or null |
+| `estimateRouteFee(bolt11, amountSats?)` | `RouteEstimate \| null` | Estimate fee without sending. Returns `{ feeSats, feeMsat, hops, cltvDelta }` or null. `feeSats` is rounded up, so it is safe to pass as `maxFeeSats`; `feeMsat` is the exact fee |
 | `probeRoute(destination, amountSats)` | `{ success, feeSats?, hops? }` | Probe route viability to a destination node |
 | `estimatePayment(bolt11, amountSats?)` | `PaymentEstimate \| null` | Full payment intelligence: success probability, route quality, estimated fee and time, warnings |
 
@@ -1009,7 +1009,8 @@ interface PaymentEstimate {
   routeQuality: 'HIGH' | 'MEDIUM' | 'LOW';
   warning?: string;
   alternativeAvailable: boolean; // MPP route exists
-  estimatedFeeSats: number;
+  estimatedFeeSats: number;     // rounded UP, safe to pass as maxFeeSats
+  estimatedFeeMsat: string;     // exact fee, decimal string
   hopCount: number;
 }
 

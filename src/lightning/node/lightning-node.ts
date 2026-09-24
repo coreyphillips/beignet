@@ -23194,7 +23194,12 @@ export class LightningNode extends EventEmitter {
 	estimateRouteFee(
 		bolt11: string,
 		amountSats?: number
-	): { feeSats: number; hops: number; cltvDelta: number } | null {
+	): {
+		feeSats: number;
+		feeMsat: bigint;
+		hops: number;
+		cltvDelta: number;
+	} | null {
 		try {
 			const decoded = decodeInvoice(bolt11);
 			// Same precedence sendPayment applies (see estimatePayment).
@@ -23223,7 +23228,11 @@ export class LightningNode extends EventEmitter {
 			);
 			if (!route) return null;
 			return {
-				feeSats: Number(route.totalFeeMsat / 1000n),
+				// Rounded UP: a caller caps the payment at this figure, and the cap
+				// is enforced in msat, so a floored quote refuses its own route
+				// (issue #998).
+				feeSats: Number((route.totalFeeMsat + 999n) / 1000n),
+				feeMsat: route.totalFeeMsat,
 				hops: route.hops.length,
 				cltvDelta: route.totalCltvDelta
 			};
@@ -23295,7 +23304,10 @@ export class LightningNode extends EventEmitter {
 
 			const successPct = Math.round(successProbability * 100);
 			const hopCount = route.hops.length;
-			const feeSats = Number(route.totalFeeMsat / 1000n);
+			// Rounded UP, like estimateRouteFee: maxFeeSats is whole sats checked
+			// against the route in msat, so a cap equal to a floored quote refused
+			// the very route it priced (issue #998).
+			const feeSats = Number((route.totalFeeMsat + 999n) / 1000n);
 
 			// Route quality based on hop count and probability
 			let routeQuality: 'HIGH' | 'MEDIUM' | 'LOW' = 'HIGH';
@@ -23343,6 +23355,7 @@ export class LightningNode extends EventEmitter {
 				warning,
 				alternativeAvailable,
 				estimatedFeeSats: feeSats,
+				estimatedFeeMsat: route.totalFeeMsat,
 				hopCount
 			};
 		} catch {
@@ -23364,6 +23377,7 @@ export class LightningNode extends EventEmitter {
 	): {
 		success: boolean;
 		feeSats?: number;
+		feeMsat?: bigint;
 		hops?: number;
 		path?: Array<{ pubkey: string; shortChannelId: string }>;
 	} {
@@ -23398,7 +23412,9 @@ export class LightningNode extends EventEmitter {
 
 			return {
 				success: true,
-				feeSats: Number(route.totalFeeMsat / 1000n),
+				// Rounded up for the same reason as estimateRouteFee (issue #998).
+				feeSats: Number((route.totalFeeMsat + 999n) / 1000n),
+				feeMsat: route.totalFeeMsat,
 				hops: route.hops.length,
 				// A hop's shortChannelId is the channel used to REACH it, so this is
 				// exactly the set of SCIDs the onion will name. Surfacing them is what

@@ -990,7 +990,10 @@ export interface ForwardingSummaryInfo {
 }
 
 export interface RouteEstimate {
+	/** Route fee rounded UP to whole sats, so it is safe to pass as maxFeeSats. */
 	feeSats: number;
+	/** The exact route fee, as a decimal string (bigint in the library). */
+	feeMsat: string;
 	hops: number;
 	cltvDelta: number;
 }
@@ -1202,7 +1205,10 @@ export interface PaymentEstimate {
 	routeQuality: 'HIGH' | 'MEDIUM' | 'LOW';
 	warning?: string;
 	alternativeAvailable: boolean;
+	/** Route fee rounded UP to whole sats, so it is safe to pass as maxFeeSats. */
 	estimatedFeeSats: number;
+	/** The exact route fee, as a decimal string (bigint in the library). */
+	estimatedFeeMsat: string;
 	hopCount: number;
 }
 

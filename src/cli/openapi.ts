@@ -4395,7 +4395,15 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				RouteEstimate: {
 					type: 'object',
 					properties: {
-						feeSats: { type: 'integer' },
+						feeSats: {
+							type: 'integer',
+							description:
+								'Route fee rounded up to whole sats, so it is safe to pass as maxFeeSats'
+						},
+						feeMsat: {
+							type: 'string',
+							description: 'Exact route fee in msat, as a decimal string'
+						},
 						hops: { type: 'integer' },
 						cltvDelta: { type: 'integer' }
 					}
@@ -4922,7 +4930,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						estimatedFeeSats: {
 							type: 'integer',
-							description: 'Estimated routing fee in satoshis'
+							description:
+								'Estimated routing fee in satoshis, rounded up so it is safe to pass as maxFeeSats'
+						},
+						estimatedFeeMsat: {
+							type: 'string',
+							description:
+								'Exact estimated routing fee in msat, as a decimal string'
 						},
 						hopCount: {
 							type: 'integer',
@@ -4935,6 +4949,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'routeQuality',
 						'alternativeAvailable',
 						'estimatedFeeSats',
+						'estimatedFeeMsat',
 						'hopCount'
 					]
 				},
