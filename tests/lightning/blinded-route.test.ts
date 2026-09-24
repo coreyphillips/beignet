@@ -123,6 +123,13 @@ describe('findRouteToBlindedPath blinded tail (M1.3)', function () {
 		// Blinded fee folded in: intro receives amount + base + 0.1%.
 		const expectedFee = 500n + (amount * 1000n) / 1_000_000n;
 		expect(intro.amountToForwardMsat).to.equal(amount + expectedFee);
+
+		// The route's fee is everything sent beyond what the recipient
+		// receives, the payee-written blinded fee included (issue #1001): over
+		// a direct channel to the introduction node this reported 0 while
+		// totalAmountMsat carried the fee.
+		expect(route!.totalFeeMsat).to.equal(route!.totalAmountMsat - amount);
+		expect(route!.totalFeeMsat).to.equal(expectedFee);
 	});
 
 	it('returns just the blinded tail when source is the intro node', function () {
@@ -156,5 +163,135 @@ describe('findRouteToBlindedPath blinded tail (M1.3)', function () {
 		expect(route!.hops[0].blindingPoint).to.deep.equal(
 			blindedPath.blindingPoint
 		);
+	});
+});
+
+/** alice with one public channel to bob, and a blinded path introduced at bob. */
+function directWorld(): {
+	graph: NetworkGraph;
+	alice: Buffer;
+	bob: Buffer;
+	blindedPath: IBlindedPath;
+} {
+	const graph = new NetworkGraph();
+	const alice = nodeId();
+	const bob = nodeId();
+	const scid = encodeShortChannelId({ block: 100, txIndex: 1, outputIndex: 0 });
+	graph.addChannelAnnouncement(announce(scid, alice, bob));
+	const aliceFirst = Buffer.compare(alice, bob) < 0;
+	graph.applyChannelUpdate(update(scid, aliceFirst ? 0 : 1));
+	graph.applyChannelUpdate(update(scid, aliceFirst ? 1 : 0));
+	const blindedPath: IBlindedPath = {
+		introductionNodeId: bob,
+		blindingPoint: nodeId(),
+		blindedHops: [
+			{ blindedNodeId: nodeId(), encryptedData: crypto.randomBytes(24) },
+			{ blindedNodeId: nodeId(), encryptedData: crypto.randomBytes(18) }
+		]
+	};
+	return { graph, alice, bob, blindedPath };
+}
+
+describe('findRouteToBlindedPath payinfo htlc bounds (issue #1001)', function () {
+	// 500 msat + 0.1% on 1_000_000 msat: 1_001_500 msat enters the blinded
+	// section at the introduction node.
+	const amount = 1_000_000n;
+	const atIntro = 1_001_500n;
+	const payInfo = (bounds: { min: bigint; max: bigint }) => ({
+		feeBaseMsat: 500,
+		feeProportionalMillionths: 1000,
+		cltvExpiryDelta: 100,
+		htlcMinimumMsat: bounds.min,
+		htlcMaximumMsat: bounds.max
+	});
+
+	it('refuses a path whose htlc_minimum_msat is above the amount at the introduction node', function () {
+		const { graph, alice, blindedPath } = directWorld();
+		expect(
+			findRouteToBlindedPath(
+				graph,
+				alice,
+				blindedPath,
+				payInfo({ min: atIntro + 1n, max: 1_000_000_000n }),
+				amount,
+				40
+			),
+			'one msat over the amount refuses'
+		).to.be.null;
+		const route = findRouteToBlindedPath(
+			graph,
+			alice,
+			blindedPath,
+			payInfo({ min: atIntro, max: 1_000_000_000n }),
+			amount,
+			40
+		);
+		expect(route, 'the bound itself admits').to.not.be.null;
+		expect(route!.totalAmountMsat).to.equal(atIntro);
+	});
+
+	it('refuses a path whose htlc_maximum_msat is below the amount at the introduction node', function () {
+		const { graph, alice, blindedPath } = directWorld();
+		expect(
+			findRouteToBlindedPath(
+				graph,
+				alice,
+				blindedPath,
+				payInfo({ min: 0n, max: atIntro - 1n }),
+				amount,
+				40
+			),
+			'one msat under the amount refuses'
+		).to.be.null;
+		expect(
+			findRouteToBlindedPath(
+				graph,
+				alice,
+				blindedPath,
+				payInfo({ min: 0n, max: atIntro }),
+				amount,
+				40
+			),
+			'the bound itself admits'
+		).to.not.be.null;
+	});
+
+	it('a payinfo maximum of 0 admits nothing: the decoder has no absent value', function () {
+		const { graph, alice, blindedPath } = directWorld();
+		expect(
+			findRouteToBlindedPath(
+				graph,
+				alice,
+				blindedPath,
+				payInfo({ min: 0n, max: 0n }),
+				amount,
+				40
+			)
+		).to.be.null;
+	});
+
+	it('applies the bounds to the self-introduction tail as well', function () {
+		const { graph, blindedPath } = directWorld();
+		const me = blindedPath.introductionNodeId;
+		expect(
+			findRouteToBlindedPath(
+				graph,
+				me,
+				blindedPath,
+				payInfo({ min: 0n, max: atIntro - 1n }),
+				amount,
+				40
+			)
+		).to.be.null;
+		expect(
+			findRouteToBlindedPath(
+				graph,
+				me,
+				blindedPath,
+				payInfo({ min: atIntro, max: atIntro }),
+				amount,
+				40
+			)
+		).to.not.be.null;
 	});
 });

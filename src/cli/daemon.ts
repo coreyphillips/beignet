@@ -2743,13 +2743,23 @@ async function bootDaemon(
 			return success({ removed: true });
 		},
 		'POST /offer/pay': async (body) => {
-			const { offer, amountSats, timeoutMs } = body as {
+			const { offer, amountSats, timeoutMs, maxFeeSats, maxFeeMsat } = body as {
 				offer: string;
 				amountSats?: number;
 				timeoutMs?: number;
+				maxFeeSats?: number;
+				maxFeeMsat?: number | string;
 			};
 			if (!offer) return failure('INVALID_PARAMS', 'offer required');
-			return success(await node.payOffer(offer, amountSats, timeoutMs));
+			return success(
+				await node.payOffer(
+					offer,
+					amountSats,
+					timeoutMs,
+					maxFeeSats,
+					maxFeeMsat
+				)
+			);
 		},
 
 		// ── Guardian Recovery (docs/RECOVERY-PROTOCOL.md section 8) ──

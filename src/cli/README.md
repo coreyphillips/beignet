@@ -227,7 +227,7 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | `createOffer({ description, amountSats?, issuer? })` | `OfferInfo` | Create a reusable BOLT 12 offer |
 | `decodeOfferString(offerStr)` | `OfferInfo` | Decode a BOLT 12 offer string without paying |
 | `listOffers()` | `OfferInfo[]` | List local offers |
-| `payOffer(offerStr, amountSats?, timeoutMs?)` | `Promise<PaymentInfo>` | Pay a BOLT 12 offer (requests invoice, then pays). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. Drain mode and the spending limits apply to the returned invoice's amount |
+| `payOffer(offerStr, amountSats?, timeoutMs?, maxFeeSats?, maxFeeMsat?)` | `Promise<PaymentInfo>` | Pay a BOLT 12 offer (requests invoice, then pays). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. Drain mode and the spending limits apply to the returned invoice's amount. `maxFeeSats` / `maxFeeMsat` cap the routing fee exactly as `payInvoice`'s do (one or the other; both at once is `INVALID_PARAMS`, judged before the invoice is requested). The cap covers the public hops plus the invoice's own blinded-path fee, which the payee writes into the invoice and which is otherwise paid unbounded (#1001); an invoice path over the cap is skipped for the invoice's other paths, and when none fits the payment is refused with `FEE_EXCEEDS_MAX` and nothing is sent |
 
 #### Channel Readiness
 
@@ -1784,6 +1784,10 @@ beignet offer decode lno1...
 beignet offer pay lno1... 1000
 # Requests invoice from offer issuer, then pays it
 # {"ok":true,"result":{"paymentHash":"ab12...","status":"COMPLETED",...}}
+
+beignet offer pay lno1... 1000 --max-fee 5
+# Same, refusing to pay more than 5 sats of routing fee (public hops plus the
+# invoice's own blinded-path fee); over the cap nothing is sent
 ```
 
 ### Webhooks (CLI)
@@ -2127,7 +2131,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/payment/wait` | `{ paymentHash, timeoutMs? }` | Wait for payment to settle (default 60s) |
 | POST | `/offer/create` | `{ description, amountSats?, issuer? }` | Create BOLT 12 offer |
 | POST | `/offer/decode` | `{ offer }` | Decode a BOLT 12 offer string |
-| POST | `/offer/pay` | `{ offer, amountSats?, timeoutMs? }` | Pay BOLT 12 offer. Answers 409 while draining and 403 over a spending limit, judged on the invoice the payee returns. |
+| POST | `/offer/pay` | `{ offer, amountSats?, timeoutMs?, maxFeeSats?, maxFeeMsat? }` | Pay BOLT 12 offer. Answers 409 while draining and 403 over a spending limit, judged on the invoice the payee returns. `maxFeeSats` or `maxFeeMsat` (a number or a decimal string) caps the routing fee, including the invoice's own blinded-path fee; both at once is 400 `INVALID_PARAMS`. |
 | GET | `/payment/proof` | `?paymentHash=<hex>` | Cryptographic payment proof (preimage, invoice, route) |
 | GET | `/payment/verify-proof` | `?paymentHash=<hex>` | Verify proof: `sha256(preimage) === paymentHash` |
 | GET | `/node/uri` | `?host=<addr>` | Node connection URI (`pubkey@host:port`). Optional external host override. |

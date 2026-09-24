@@ -1009,7 +1009,10 @@ import { IBlindedPath, IBlindedPayInfo } from '../onion/blinded-path';
  * The blinded section's aggregate fee/CLTV (payInfo) is paid at the
  * introduction node: we route `amountMsat + blindedFee` to it with
  * `finalCltvExpiry + payInfo.cltvExpiryDelta` of headroom, and the recipient
- * still receives exactly `amountMsat`.
+ * still receives exactly `amountMsat`. The payinfo is written by the payee,
+ * so its fee is part of what the route reports as `totalFeeMsat` (public
+ * hops plus the blinded section, issue #1001) and its htlc bounds are
+ * enforced on the amount entering the blinded section.
  *
  * @param graph - The network graph
  * @param source - 33-byte source node public key
@@ -1018,7 +1021,9 @@ import { IBlindedPath, IBlindedPayInfo } from '../onion/blinded-path';
  * @param amountMsat - Amount to deliver to the recipient (in millisatoshis)
  * @param finalCltvExpiry - CLTV expiry delta for the final hop
  * @param maxHops - Maximum number of hops (default 20)
- * @returns Combined route or null if no path to introduction node
+ * @returns Combined route, or null if there is no path to the introduction
+ *   node or the amount at the introduction node falls outside the payinfo's
+ *   htlc_minimum_msat / htlc_maximum_msat
  */
 export function findRouteToBlindedPath(
 	graph: NetworkGraph,
@@ -1042,6 +1047,16 @@ export function findRouteToBlindedPath(
 		(amountMsat * BigInt(payInfo.feeProportionalMillionths)) / 1_000_000n;
 	const amountAtIntro = amountMsat + blindedFeeMsat;
 	const cltvAtIntro = finalCltvExpiry + payInfo.cltvExpiryDelta;
+	// BOLT 4: the payinfo's htlc bounds are the blinded section's aggregate
+	// limits, judged on the amount that enters it. The decoder reads both as
+	// plain u64s (there is no "absent" encoding), so a payee that wrote a
+	// maximum of 0 admits nothing, exactly as a relay with that policy would.
+	if (
+		amountAtIntro < payInfo.htlcMinimumMsat ||
+		amountAtIntro > payInfo.htlcMaximumMsat
+	) {
+		return null;
+	}
 
 	const introNodeId = blindedPath.introductionNodeId;
 	const sourceHex = source.toString('hex');
@@ -1105,10 +1120,15 @@ export function findRouteToBlindedPath(
 
 	const combinedHops = [...routeToIntro.hops, ...tail.slice(1)];
 
+	// The fee is everything we send beyond what the recipient receives: the
+	// public hops' fees (routeToIntro prices those against amountAtIntro) plus
+	// the blinded section's own fee. Reporting only routeToIntro.totalFeeMsat
+	// hid the payee-written part from every fee cap and every payment record
+	// (a direct channel to the introduction node reported 0, issue #1001).
 	return {
 		hops: combinedHops,
 		totalAmountMsat: routeToIntro.totalAmountMsat,
 		totalCltvDelta: routeToIntro.totalCltvDelta,
-		totalFeeMsat: routeToIntro.totalFeeMsat
+		totalFeeMsat: routeToIntro.totalAmountMsat - amountMsat
 	};
 }

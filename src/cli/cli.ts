@@ -2333,15 +2333,22 @@ async function handleOffer(): Promise<void> {
 					offer: filteredArgs[2]
 				})
 			);
-		case 'pay':
+		case 'pay': {
+			// amountSats is positional and optional, so the token after the
+			// offer may already be a flag.
+			const amountArg = filteredArgs[3];
+			const maxFee = parseFlag('--max-fee');
 			return outputResult(
 				await httpRequest('POST', '/offer/pay', {
 					offer: filteredArgs[2],
-					amountSats: filteredArgs[3]
-						? parseInt(filteredArgs[3], 10)
-						: undefined
+					amountSats:
+						amountArg && !amountArg.startsWith('--')
+							? parseInt(amountArg, 10)
+							: undefined,
+					maxFeeSats: maxFee !== undefined ? parseInt(maxFee, 10) : undefined
 				})
 			);
+		}
 		default:
 			output({
 				ok: false,
@@ -3000,7 +3007,7 @@ BOLT 12 Offers:
   offer create <description> [amountSats]  Create reusable offer
   offer list                             List local offers
   offer decode <offer>                   Decode a BOLT 12 offer string
-  offer pay <offer> [amountSats]         Pay a BOLT 12 offer
+  offer pay <offer> [amountSats] [--max-fee <sats>]  Pay a BOLT 12 offer
 
 Direct funding (a payer's on-chain payment IS this node's channel funding):
   direct-funding configure [--lsp <pubkey>] [--lsp-host H] [--lsp-port P]

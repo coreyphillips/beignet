@@ -3388,7 +3388,9 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					requestBody: bodyContent({
 						offer: 'string',
 						amountSats: 'number?',
-						timeoutMs: 'number?'
+						timeoutMs: 'number?',
+						maxFeeSats: 'number?',
+						maxFeeMsat: 'string?'
 					}),
 					responses: {
 						'200': {
