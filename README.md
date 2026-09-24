@@ -284,7 +284,7 @@ coordinator.exportDescriptors();
 <details>
 <summary><b>Encrypted storage and leveled logging</b></summary>
 
-The wallet persists through the host-injected `TStorage` interface (`storage: { getData, setData }`), and values are handed over as-is, so by default they are stored in plaintext. Persisted data is addresses, indexes, UTXOs, transactions, balance and fee estimates: no private keys and no mnemonic are ever written, so exposure is a privacy concern (full wallet history), not fund loss.
+The wallet persists through the host-injected `TStorage` interface (`storage: { getData, setData }`), and values are handed over as-is, so by default they are stored in plaintext. Persisted data is addresses, indexes, UTXOs, transactions, balance and fee estimates: no private keys and no mnemonic are ever written, so exposure is a privacy concern (full wallet history), not fund loss. The staged send (`transaction`) is written without signing keys, so a key pair handed to `sweepPrivateKey` or `addExternalInputs` never reaches storage, and `send`, `sendMany`, `sendMax`, `buildPsbt` and `sweepPrivateKey` reset the staged send when they return, so a restart never replays an earlier call's recipients.
 
 Wrap any `TStorage` with `createEncryptedStorage` to encrypt at rest with AES-256-GCM under an HKDF-derived key from the seed. Pre-existing plaintext values pass through unchanged and migrate lazily as they are rewritten.
 

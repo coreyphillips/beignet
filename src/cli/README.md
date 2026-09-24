@@ -1493,7 +1493,10 @@ beignet wallet descriptors
 
 On-chain sends signal BIP 125 replace-by-fee, so an underpaying transaction
 can later be bumped with `tx bump-fee` (or `tx boost`, which falls back to
-CPFP when RBF is unavailable).
+CPFP when RBF is unavailable). The wallet's staged send is reset after every
+`send`, `send-max`, `consolidate`, `psbt build` and boost, so a restart never
+replays an earlier call's recipients, and external signing keys are never
+written to storage.
 
 **Daily spend limit (combined):** when the daemon is started with
 `--daily-spend-limit`, `send` and `send-max` count amount + fee against the
