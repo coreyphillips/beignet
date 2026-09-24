@@ -3497,8 +3497,11 @@ export class Channel {
 		// wire failure that costs the channel (issue 404). The node fails it
 		// back with expiry_too_soon once committed, exactly as the far-future
 		// horizon (MAX_HTLC_CLTV_EXPIRY_DELTA, issue 410) is failed back with
-		// expiry_too_far. An expired inbound HTLC we never claim costs us
-		// nothing; the peer times it out on chain if the fail cannot be sent.
+		// expiry_too_far. The node never claims a stamped entry: its claim
+		// backstop (scanExpiringHtlcs) excludes one that was not actually
+		// fulfilled, so a block landing while the peer still owes the ack of
+		// the fail-back does not close the channel, and if the fail cannot be
+		// sent the peer times the HTLC out on chain at no cost to us.
 		const expiredOnArrival =
 			this._currentBlockHeight > 0 &&
 			msg.cltvExpiry <= this._currentBlockHeight;

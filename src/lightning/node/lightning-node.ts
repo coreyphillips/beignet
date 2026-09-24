@@ -16873,6 +16873,15 @@ export class LightningNode extends EventEmitter {
 			// timeout scan uses for an inbound HTLC at its deadline. The
 			// channel used to be failed for this; the add turns on state the
 			// peer cannot see (our tip), so it is a fail-back like the horizon.
+			// Logged like the restore refusals: the old close was diagnosed
+			// from nothing but a force-close, and this is the same event class.
+			this.emitStructuredLog('htlc', 'refused_expired_on_arrival', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				cltvExpiry: htlcEntry.cltvExpiry,
+				height: this.currentBlockHeight,
+				finalHop
+			});
 			policyCode = finalHop
 				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 				: EXPIRY_TOO_SOON;
@@ -25976,8 +25985,18 @@ export class LightningNode extends EventEmitter {
 					paymentHashHex !== undefined &&
 					this.heldInvoiceHashes.has(paymentHashHex) &&
 					resolution?.outcome !== 'settle';
+				// An add admitted past its expiry (issue #1009) is failed back
+				// by the policy block, never settled, so holding its preimage
+				// is no claim: every invoice we ever issued has its preimage
+				// here, and such an entry is inside the claim buffer by
+				// definition. Without this arm a block landing while the peer
+				// still owes the ack of our fail-back closed the very channel
+				// the fail-back keeps open. A genuinely FULFILLED one is claimed.
+				const expiredUnclaimed =
+					htlc.expiredOnArrival === true && htlc.state !== HtlcState.FULFILLED;
 				const haveClaim =
 					!parkedHold &&
+					!expiredUnclaimed &&
 					(htlc.state === HtlcState.FULFILLED ||
 						(paymentHashHex !== undefined &&
 							this.preimages.has(paymentHashHex)));
