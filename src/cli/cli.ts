@@ -25,6 +25,7 @@ import { daemonOptions } from './daemon-options';
 import { defaultDataDirForMnemonic } from './beignet-node';
 import { performDbRestore } from './restore';
 import { InstanceLockError } from './instance-lock';
+import { installProcessFaultHandlers } from './process-faults';
 import { ApiResponse, BeignetConfig } from './types';
 
 const args = process.argv.slice(2);
@@ -495,7 +496,16 @@ async function handleStart(): Promise<void> {
 	const isDaemon = hasFlag('--daemon');
 
 	try {
-		const { stop } = await startDaemon(daemonOptions(config, daemonPort));
+		const { stop, logger } = await startDaemon(
+			daemonOptions(config, daemonPort)
+		);
+
+		// A fault nothing caught (an unhandled rejection, an uncaught
+		// exception) is logged with its stack and the process stays up
+		// (issue #1003): Node's default would terminate it, and a node that
+		// exits cannot claim or time out its HTLCs. Registered here, not in
+		// the library, because a host owns its process.
+		installProcessFaultHandlers(logger);
 
 		// Clean shutdown on signals: the same teardown POST /stop runs, so an
 		// in-flight backup completes and SQLite closes before the process ends.

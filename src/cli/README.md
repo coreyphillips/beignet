@@ -1980,7 +1980,7 @@ CLI flags > environment variables > config file > defaults.
 
 ## HTTP API
 
-The daemon exposes these endpoints on `127.0.0.1:2112` (configurable via `daemonHost`/`daemonPort`). All POST endpoints accept JSON bodies. HTTPS is supported when started with `--tls-cert` and `--tls-key`.
+The daemon exposes these endpoints on `127.0.0.1:2112` (configurable via `daemonHost`/`daemonPort`). All POST endpoints accept JSON bodies. HTTPS is supported when started with `--tls-cert` and `--tls-key`. A malformed request (an unparseable request target, or a `Host` header that is not a valid host) answers `400 INVALID_PARAMS` and never terminates the process; `beignet start` also logs any unhandled rejection or uncaught exception with its stack and keeps running.
 
 These endpoints support the `X-Idempotency-Key` header (24h cache): `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`. A repeat with the same key and body returns the cached response; the same key with a different body returns `409 IDEMPOTENCY_CONFLICT`. The cache is in memory, so it does not survive a daemon restart.
 

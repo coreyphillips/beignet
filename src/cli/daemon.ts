@@ -647,6 +647,12 @@ export interface IStartedDaemon {
 	 * CLI signal handler both use it.
 	 */
 	stop: (timeoutMs?: number) => Promise<void>;
+	/**
+	 * The diagnostic logger the daemon resolved (an injected one, else the
+	 * console logger a logLevel configures), so the process that hosts the
+	 * daemon can report through the same channel. Absent when neither is set.
+	 */
+	logger?: ILogger;
 }
 
 export async function startDaemon(
@@ -3044,14 +3050,41 @@ async function bootDaemon(
 	const corsOrigin =
 		opts.cors === true ? '*' : typeof opts.cors === 'string' ? opts.cors : null;
 
-	const requestHandler = async (
+	// A fault the request pipeline did not classify: the detail goes to the
+	// operator (stderr when no logger is configured, so a generic 500 stays
+	// diagnosable), never to the client. Raw messages leak filesystem paths
+	// and database layout.
+	const reportFault = (context: string, err: unknown): void => {
+		const detail =
+			err instanceof Error ? err.stack ?? err.message : String(err);
+		if (logger) {
+			logger.error(`${context}: ${detail}`);
+		} else {
+			process.stderr.write(`[beignet-daemon] ${context}: ${detail}\n`);
+		}
+	};
+
+	const handleRequest = async (
 		req: http.IncomingMessage,
 		res: http.ServerResponse
 	): Promise<void> => {
-		const parsedUrl = new URL(
-			req.url || '/',
-			`http://${req.headers.host || 'localhost'}`
-		);
+		// Only the path and the query are read, so the target is parsed against
+		// a constant base. The Host header is caller-controlled, and a value the
+		// URL parser refuses ("a b", "[::1", "a:b:c") used to throw here, above
+		// every try/catch, and Node's default for the unhandled rejection
+		// terminated the process (issue #1003). A target the parser refuses on
+		// its own ("//[") is answered as a malformed request instead.
+		let parsedUrl: URL;
+		try {
+			parsedUrl = new URL(req.url || '/', 'http://localhost');
+		} catch {
+			res.setHeader('Content-Type', 'application/json');
+			res.statusCode = 400;
+			res.end(
+				JSON.stringify(failure('INVALID_PARAMS', 'Malformed request target'))
+			);
+			return;
+		}
 		// API versioning: strip /v1/ prefix for backward compat
 		let pathname = parsedUrl.pathname;
 		if (pathname.startsWith('/v1/')) {
@@ -3334,24 +3367,44 @@ async function bootDaemon(
 				res.end(JSON.stringify({ ok: false, error: err.toJSON() }));
 			} else {
 				// Unknown throw: log the detail server-side and answer with a
-				// generic message. Raw messages leak filesystem paths and
-				// database layout; HTTP 200 on errors blinds every proxy and
-				// health check in front of the daemon. An unhandled exception
-				// is worth a stderr line even when logging is not configured;
-				// discarding it makes the generic 500 undiagnosable.
-				const detail =
-					err instanceof Error ? err.stack ?? err.message : String(err);
-				if (logger) {
-					logger.error(`Unhandled error on ${routeKey}: ${detail}`);
-				} else {
-					process.stderr.write(
-						`[beignet-daemon] Unhandled error on ${routeKey}: ${detail}\n`
-					);
-				}
+				// generic message. HTTP 200 on errors blinds every proxy and
+				// health check in front of the daemon.
+				reportFault(`Unhandled error on ${routeKey}`, err);
 				res.statusCode = 500;
 				res.end(
 					JSON.stringify(failure('INTERNAL_ERROR', 'Internal server error'))
 				);
+			}
+		}
+	};
+
+	// Nothing may reject out of a request: an escaped rejection reaches
+	// Node's default handler, which terminates the process, so one request
+	// would take the node down (issue #1003). The routes' own catch above
+	// classifies their errors; this covers the prologue, the SSE, metrics and
+	// stop arms, and anything a later change puts outside that catch.
+	const requestHandler = async (
+		req: http.IncomingMessage,
+		res: http.ServerResponse
+	): Promise<void> => {
+		try {
+			await handleRequest(req, res);
+		} catch (err: unknown) {
+			reportFault(`Unhandled error on ${req.method} ${req.url ?? ''}`, err);
+			try {
+				if (!res.headersSent) {
+					res.setHeader('Content-Type', 'application/json');
+					res.statusCode = 500;
+					res.end(
+						JSON.stringify(failure('INTERNAL_ERROR', 'Internal server error'))
+					);
+				} else if (!res.writableEnded) {
+					// The status is already on the wire; end the body so the
+					// socket does not hang open.
+					res.end();
+				}
+			} catch {
+				// The socket is gone; there is nothing left to answer.
 			}
 		}
 	};
@@ -3364,11 +3417,17 @@ async function bootDaemon(
 			key: fs.readFileSync(opts.tlsKey)
 		};
 		server = https.createServer(tlsOptions, (req, res) => {
-			void requestHandler(req, res);
+			// Unreachable while requestHandler catches everything; kept so a
+			// regression there still cannot escape to the process.
+			requestHandler(req, res).catch((err: unknown) =>
+				reportFault('Request handler rejected', err)
+			);
 		});
 	} else {
 		server = http.createServer((req, res) => {
-			void requestHandler(req, res);
+			requestHandler(req, res).catch((err: unknown) =>
+				reportFault('Request handler rejected', err)
+			);
 		});
 	}
 
@@ -3429,7 +3488,7 @@ async function bootDaemon(
 			// poke on channel:usable were wired when the node built it above;
 			// stop() halts the queue first, so a start that comes after it
 			// does nothing (issue #978).
-			resolve({ server, node, stop });
+			resolve({ server, node, stop, logger });
 		});
 	});
 }
