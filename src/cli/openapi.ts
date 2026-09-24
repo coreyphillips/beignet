@@ -586,6 +586,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						bolt11: 'string',
 						timeoutMs: 'number?',
 						maxFeeSats: 'number?',
+						maxFeeMsat: 'string?',
 						amountSats: 'number?',
 						metadata: 'Record<string,string>?',
 						cltvLimit: 'number?'
@@ -633,6 +634,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						bolt11: 'string',
 						timeoutMs: 'number?',
 						maxFeeSats: 'number?',
+						maxFeeMsat: 'string?',
 						amountSats: 'number?',
 						metadata: 'Record<string,string>?',
 						cltvLimit: 'number?'
