@@ -999,7 +999,7 @@ describe('Funding-missing quarantine (issue #593)', function () {
 		const actions = channel.addHtlc(
 			50_000_000n,
 			crypto.randomBytes(32),
-			500_000,
+			700_100, // past the tip set above: the expiry is not what is judged here
 			crypto.randomBytes(1366)
 		);
 		expect(
@@ -1021,7 +1021,7 @@ describe('Funding-missing quarantine (issue #593)', function () {
 		const after = channel.addHtlc(
 			50_000_000n,
 			crypto.randomBytes(32),
-			500_000,
+			700_100, // past the tip set above: the expiry is not what is judged here
 			crypto.randomBytes(1366)
 		);
 		expect(

@@ -3160,6 +3160,23 @@ export class Channel {
 				}
 			];
 		}
+		// An expiry at or below our tip can never be offered (issue #1009):
+		// the peer could not claim it before we could time it out, and a peer
+		// may answer the offer by failing the channel. Local refusal, same
+		// shape as the timestamp check; the node maps it to a fail-back of the
+		// inbound leg when the add was a forward. Skipped while the tip is
+		// unknown, as every height-dependent check in this class is.
+		if (
+			this._currentBlockHeight > 0 &&
+			cltvExpiry <= this._currentBlockHeight
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `HTLC cltv_expiry ${cltvExpiry} has already expired at height ${this._currentBlockHeight}`
+				}
+			];
+		}
 
 		// Check amount exceeds minimum
 		if (amountMsat < this._state.remoteConfig.htlcMinimumMsat) {
@@ -3472,20 +3489,19 @@ export class Channel {
 			);
 		}
 
-		// CLTV validation
-		if (this._currentBlockHeight > 0) {
-			if (msg.cltvExpiry <= this._currentBlockHeight) {
-				// The one arm that turns on state the peer cannot see, our own
-				// _currentBlockHeight. A skew large enough to reach here past the
-				// sender's cltv_expiry_delta means our chain view is broken rather than
-				// that the peer raced us, and the add cannot enter our commitment
-				// either way.
-				return this._failChannelWithWireError('HTLC CLTV already expired');
-			}
-			// The far-future horizon (MAX_HTLC_CLTV_EXPIRY_DELTA) is OUR policy,
-			// not a BOLT 2 MUST: the node admits the add and fails it back with
-			// expiry_too_far once committed (issue 410).
-		}
+		// CLTV against our tip: admitted and stamped, never a channel failure
+		// (issue #1009). This arm turns on state the peer cannot see, our own
+		// _currentBlockHeight: a peer one block behind us, or a forwarder that
+		// relayed a payer's stale outgoing_cltv_value, is not attacking the
+		// channel, and the add cannot be kept out of our commitment without a
+		// wire failure that costs the channel (issue 404). The node fails it
+		// back with expiry_too_soon once committed, exactly as the far-future
+		// horizon (MAX_HTLC_CLTV_EXPIRY_DELTA, issue 410) is failed back with
+		// expiry_too_far. An expired inbound HTLC we never claim costs us
+		// nothing; the peer times it out on chain if the fail cannot be sent.
+		const expiredOnArrival =
+			this._currentBlockHeight > 0 &&
+			msg.cltvExpiry <= this._currentBlockHeight;
 
 		const entry: IHtlcEntry = {
 			id: msg.id,
@@ -3497,6 +3513,7 @@ export class Channel {
 			state: HtlcState.PENDING,
 			...(msg.blindingPoint ? { blindingPoint: msg.blindingPoint } : {}),
 			...(dustExposureFailback ? { dustExposureFailback: true } : {}),
+			...(expiredOnArrival ? { expiredOnArrival: true } : {}),
 			// Provenance for the recency holds (issues #469 and #907) and for a
 			// proven revocation (issues #905 and #915): only an add admitted
 			// while the restriction already stood is refused by the node; one
@@ -14678,6 +14695,26 @@ export class Channel {
 			return false;
 		}
 		return entry.dustExposureFailback === true;
+	}
+
+	/**
+	 * Whether this in-flight received HTLC's cltv_expiry was already at or
+	 * below our chain tip when it was ADMITTED (the expiredOnArrival stamp set
+	 * by handleUpdateAddHtlc, issue #1009). The node fails it back once
+	 * committed: expiry_too_soon for a forward, incorrect_or_unknown_payment_
+	 * details at the final hop. Stamped and persisted like dustExposureFailback
+	 * so a restart replay answers identically.
+	 */
+	receivedHtlcExpiredOnArrival(htlcId: bigint): boolean {
+		const entry = this._state.htlcs.get('received-' + htlcId);
+		if (!entry) return false;
+		if (
+			entry.state !== HtlcState.PENDING &&
+			entry.state !== HtlcState.COMMITTED
+		) {
+			return false;
+		}
+		return entry.expiredOnArrival === true;
 	}
 
 	/**

@@ -601,6 +601,15 @@ const GOSSIP_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
  * would close the channel). Mirrors the safety margin used for forwarded HTLCs.
  */
 export const HELD_HTLC_EXPIRY_MARGIN = 18;
+/**
+ * Blocks between our chain tip and the lowest outgoing cltv_expiry a forward
+ * may carry (issue #1009). An onward HTLC whose expiry has passed, or sits
+ * this close to the tip, is failed upstream with expiry_too_soon rather than
+ * offered downstream: the downstream cannot take it safely, and a peer that
+ * answers the offer by failing the channel would cost us the outgoing
+ * channel. LND's OutgoingCltvRejectDelta defaults to the same 3 blocks.
+ */
+export const OUTGOING_CLTV_REJECT_DELTA = 3;
 /** awaitPaymentResolution re-reads the HTLC view on this clock (#737). */
 const PAYMENT_RESOLUTION_POLL_MS = 250;
 /**
@@ -16858,6 +16867,15 @@ export class LightningNode extends EventEmitter {
 			policyCode = finalHop
 				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 				: TEMPORARY_CHANNEL_FAILURE;
+		} else if (channel.receivedHtlcExpiredOnArrival(htlcId)) {
+			// Admitted with a cltv_expiry at or below our tip (issue #1009):
+			// never settled or forwarded, failed back with the code the
+			// timeout scan uses for an inbound HTLC at its deadline. The
+			// channel used to be failed for this; the add turns on state the
+			// peer cannot see (our tip), so it is a fail-back like the horizon.
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: EXPIRY_TOO_SOON;
 		} else if (
 			this.currentBlockHeight > 0 &&
 			htlcEntry.cltvExpiry >
@@ -21057,6 +21075,32 @@ export class LightningNode extends EventEmitter {
 			blinded: isBlindedForward
 		});
 
+		// The outgoing expiry against OUR chain tip (issue #1009). The delta
+		// checks further down relate the outgoing expiry only to the incoming
+		// one, so an onion whose outgoing_cltv_value already lay in the past,
+		// under an incoming HTLC generous enough to cover our delta, was
+		// relayed as it was: a downstream that refuses it costs the payer a
+		// retry, and one that fails its channel over it costs us the outgoing
+		// channel. Judged before the SCID lookup so that a JIT intercept and an
+		// async hold never park an HTLC that could not be forwarded now either.
+		// A blinded hop answers invalid_onion_blinding through failIncoming.
+		if (
+			this.currentBlockHeight > 0 &&
+			forwardCltv <= this.currentBlockHeight + OUTGOING_CLTV_REJECT_DELTA
+		) {
+			this.emitStructuredLog('htlc', 'forward_expiry_too_soon', {
+				paymentHash: paymentHash.toString('hex'),
+				inChannelId: inChannelId.toString('hex'),
+				inHtlcId: Number(inHtlcId),
+				incomingCltvExpiry,
+				outgoingCltvExpiry: forwardCltv,
+				height: this.currentBlockHeight,
+				stage: 'judged'
+			});
+			failIncoming(EXPIRY_TOO_SOON);
+			return;
+		}
+
 		if (!outgoingScid) {
 			failIncoming(UNKNOWN_NEXT_PEER);
 			return;
@@ -21540,6 +21584,32 @@ export class LightningNode extends EventEmitter {
 		part: IHeldJitPart,
 		refundOwner: 'engine' | 'caller' = 'engine'
 	): ForwardPlacement {
+		// The tip may have moved since the forward was judged (issue #1009): a
+		// JIT part held for a splice, a held forward its receiver releases and
+		// a redispatched hold all reach this method later, sometimes many
+		// blocks later. Re-judged here, before the linkage is recorded and
+		// before the add, with the same fail-back and the same single-owner
+		// refund rule as a refused add below. Ahead of the hold-for-splice hook
+		// on purpose: a stale expiry is not a liquidity shortfall, and a splice
+		// would only make it staler.
+		if (
+			this.currentBlockHeight > 0 &&
+			part.forwardCltv <= this.currentBlockHeight + OUTGOING_CLTV_REJECT_DELTA
+		) {
+			this.emitStructuredLog('htlc', 'forward_expiry_too_soon', {
+				paymentHash: part.paymentHash.toString('hex'),
+				inChannelId: part.inChannelId.toString('hex'),
+				inHtlcId: Number(part.inHtlcId),
+				incomingCltvExpiry: part.incomingCltvExpiry,
+				outgoingCltvExpiry: part.forwardCltv,
+				height: this.currentBlockHeight,
+				stage: 'placement'
+			});
+			if (!part.failIncoming(EXPIRY_TOO_SOON) && refundOwner === 'engine') {
+				this.jitReceiveManager?.owedUpstreamFailure(part);
+			}
+			return 'refused';
+		}
 		const nextOnionBuf = encodeOnionPacket(part.nextPacket);
 		const outChannel = this.channelManager.getChannel(outChannelId);
 		const outHtlcId = outChannel
