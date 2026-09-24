@@ -1990,15 +1990,23 @@ async function bootDaemon(
 			return success(node.decodeInvoice(bolt11));
 		},
 		'POST /invoice/pay': async (body) => {
-			const { bolt11, timeoutMs, maxFeeSats, amountSats, metadata, cltvLimit } =
-				body as {
-					bolt11: string;
-					timeoutMs?: number;
-					maxFeeSats?: number;
-					amountSats?: number;
-					metadata?: Record<string, string>;
-					cltvLimit?: number;
-				};
+			const {
+				bolt11,
+				timeoutMs,
+				maxFeeSats,
+				maxFeeMsat,
+				amountSats,
+				metadata,
+				cltvLimit
+			} = body as {
+				bolt11: string;
+				timeoutMs?: number;
+				maxFeeSats?: number;
+				maxFeeMsat?: number | string;
+				amountSats?: number;
+				metadata?: Record<string, string>;
+				cltvLimit?: number;
+			};
 			if (!bolt11) return failure('INVALID_PARAMS', 'bolt11 required');
 			return success(
 				await node.payInvoice(
@@ -2007,7 +2015,8 @@ async function bootDaemon(
 					maxFeeSats,
 					amountSats,
 					metadata,
-					cltvLimit
+					cltvLimit,
+					maxFeeMsat
 				)
 			);
 		},
@@ -2041,15 +2050,23 @@ async function bootDaemon(
 			}
 		},
 		'POST /invoice/pay-safe': async (body) => {
-			const { bolt11, timeoutMs, maxFeeSats, amountSats, metadata, cltvLimit } =
-				body as {
-					bolt11: string;
-					timeoutMs?: number;
-					maxFeeSats?: number;
-					amountSats?: number;
-					metadata?: Record<string, string>;
-					cltvLimit?: number;
-				};
+			const {
+				bolt11,
+				timeoutMs,
+				maxFeeSats,
+				maxFeeMsat,
+				amountSats,
+				metadata,
+				cltvLimit
+			} = body as {
+				bolt11: string;
+				timeoutMs?: number;
+				maxFeeSats?: number;
+				maxFeeMsat?: number | string;
+				amountSats?: number;
+				metadata?: Record<string, string>;
+				cltvLimit?: number;
+			};
 			if (!bolt11) return failure('INVALID_PARAMS', 'bolt11 required');
 			return success(
 				await node.payInvoiceSafe(
@@ -2058,7 +2075,8 @@ async function bootDaemon(
 					maxFeeSats,
 					amountSats,
 					metadata,
-					cltvLimit
+					cltvLimit,
+					maxFeeMsat
 				)
 			);
 		},

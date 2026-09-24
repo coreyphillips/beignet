@@ -1247,6 +1247,31 @@ function requireMsatValue(value: number | string, field: string): bigint {
 	);
 }
 
+/**
+ * A payment's fee cap in msat, from whole sats or from an exact msat figure.
+ * Both at once is refused rather than reconciled: a caller that sent two caps
+ * has a bug, and silently picking one would hide it (issue #998).
+ */
+function resolveMaxFeeMsat(
+	maxFeeSats: number | undefined,
+	maxFeeMsat: number | string | undefined
+): bigint | undefined {
+	if (maxFeeSats !== undefined && maxFeeMsat !== undefined) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			'maxFeeSats and maxFeeMsat are mutually exclusive'
+		);
+	}
+	if (maxFeeMsat !== undefined)
+		return requireMsatValue(maxFeeMsat, 'maxFeeMsat');
+	if (maxFeeSats !== undefined) {
+		return (
+			BigInt(requireNonNegativeSafeInteger(maxFeeSats, 'maxFeeSats')) * 1000n
+		);
+	}
+	return undefined;
+}
+
 /** A fee rate may be fractional, but it must be a real, positive, finite number. */
 function requirePositiveFiniteNumber(value: unknown, field: string): number {
 	if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
@@ -10068,6 +10093,10 @@ export class BeignetNode extends EventEmitter {
 	 * one still in flight the record stays PENDING until that HTLC resolves,
 	 * and the PAYMENT_TIMEOUT says so (issue #976). A hash that was paid or
 	 * still has an HTLC out is refused as DUPLICATE_PAYMENT (#975).
+	 *
+	 * The fee cap is maxFeeSats OR maxFeeMsat, never both: maxFeeMsat lets a
+	 * caller cap at an exact quote such as estimatePayment's estimatedFeeMsat
+	 * (issue #998).
 	 */
 	async payInvoice(
 		bolt11: string,
@@ -10075,7 +10104,8 @@ export class BeignetNode extends EventEmitter {
 		maxFeeSats?: number,
 		amountSats?: number,
 		metadata?: Record<string, string>,
-		cltvLimit?: number
+		cltvLimit?: number,
+		maxFeeMsatCap?: number | string
 	): Promise<PaymentInfo> {
 		this._checkDraining();
 		// Decode to get paymentHash for event matching
@@ -10091,11 +10121,7 @@ export class BeignetNode extends EventEmitter {
 		// counter would stay raised for the life of the process, and once it
 		// passed dailySpendLimit _checkSpendLimit would refuse every real
 		// payment until the daemon restarted (issue #474).
-		const maxFeeMsat =
-			maxFeeSats !== undefined
-				? BigInt(requireNonNegativeSafeInteger(maxFeeSats, 'maxFeeSats')) *
-				  1000n
-				: undefined;
+		const maxFeeMsat = resolveMaxFeeMsat(maxFeeSats, maxFeeMsatCap);
 		const amountMsat =
 			amountSats !== undefined
 				? BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) *
@@ -10220,7 +10246,8 @@ export class BeignetNode extends EventEmitter {
 		maxFeeSats?: number,
 		amountSats?: number,
 		metadata?: Record<string, string>,
-		cltvLimit?: number
+		cltvLimit?: number,
+		maxFeeMsat?: number | string
 	): Promise<PaymentInfo> {
 		try {
 			return await this.payInvoice(
@@ -10229,7 +10256,8 @@ export class BeignetNode extends EventEmitter {
 				maxFeeSats,
 				amountSats,
 				metadata,
-				cltvLimit
+				cltvLimit,
+				maxFeeMsat
 			);
 		} catch (err: unknown) {
 			// Extract payment hash if possible (bolt11 itself may be invalid)
