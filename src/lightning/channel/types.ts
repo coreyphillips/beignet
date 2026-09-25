@@ -364,6 +364,20 @@ export interface IHtlcEntry {
 	 */
 	expiredOnArrival?: boolean;
 	/**
+	 * Admission-time classification (issue #1020): this received HTLC was
+	 * admitted inside the funder-fee band. We fund the channel, and by the
+	 * sender's own view of our commitment (the one eclair, LND and CLN price
+	 * before offering an add) our commitment fee could no longer be met above
+	 * our reserve once this HTLC was in, but under the dearest reading our
+	 * output still survived, so the add was taken rather than failing the
+	 * channel, and the node fails it back once committed (BOLT 4:
+	 * temporary_channel_failure forwarding, incorrect_or_unknown_payment_
+	 * details at the final hop). Stamped at admission for the same reason as
+	 * dustExposureFailback: the classification is order-dependent within a
+	 * batch, and a restart replay must answer identically. Persisted.
+	 */
+	funderFeeFailback?: boolean;
+	/**
 	 * Admission-time provenance (issue #469): this received HTLC entered the
 	 * channel while a restriction that disarms its on-chain enforcement was
 	 * already standing: the recency hold (restoreRecencyUnproven, or the

@@ -161,6 +161,8 @@ export interface ISerializedHtlcEntry {
 	dustExposureFailback?: boolean;
 	/** Admission-time expired-at-our-tip classification (see IHtlcEntry). */
 	expiredOnArrival?: boolean;
+	/** Admission-time funder-fee band classification (see IHtlcEntry). */
+	funderFeeFailback?: boolean;
 	/** Admitted while the capsule-restore hold stood (see IHtlcEntry). */
 	addedWhileRestoreUnproven?: boolean;
 	/** Admitted while the funding-missing quarantine stood (see IHtlcEntry). */
@@ -222,6 +224,9 @@ export function serializeHtlcEntry(
 		...(e.expiredOnArrival !== undefined
 			? { expiredOnArrival: e.expiredOnArrival }
 			: {}),
+		...(e.funderFeeFailback !== undefined
+			? { funderFeeFailback: e.funderFeeFailback }
+			: {}),
 		...(e.addedWhileRestoreUnproven !== undefined
 			? { addedWhileRestoreUnproven: e.addedWhileRestoreUnproven }
 			: {}),
@@ -276,6 +281,9 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 				: {}),
 			...(s.expiredOnArrival !== undefined
 				? { expiredOnArrival: s.expiredOnArrival }
+				: {}),
+			...(s.funderFeeFailback !== undefined
+				? { funderFeeFailback: s.funderFeeFailback }
 				: {}),
 			...(s.addedWhileRestoreUnproven !== undefined
 				? { addedWhileRestoreUnproven: s.addedWhileRestoreUnproven }
