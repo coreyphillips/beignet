@@ -209,7 +209,7 @@ verify the Lightning leg outlives its on-chain refund before funding.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `payInvoice(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?, maxFeeMsat?)` | `Promise<PaymentInfo>` | Pay invoice. **Blocks until settled or timeout** (default 60s). At the timeout the payment is failed only when no HTLC is out for it; with one still in flight the record stays `PENDING` until that HTLC resolves, no further route is tried after the timeout, and the record is failed when the HTLC fails or its on-chain timeout resolves; the `PAYMENT_TIMEOUT` message says so (issue #976). `maxFeeSats` caps routing fees in whole sats; `maxFeeMsat` (a number or a decimal string) caps them exactly, for a caller holding an exact quote such as `estimatePayment`'s `estimatedFeeMsat`. Pass one or the other: both at once is refused with `INVALID_PARAMS`. `amountSats` is required for amount-less invoices. `metadata` attaches key-value labels. `cltvLimit` caps the payment's total CLTV expiry at that many blocks above the current tip (every attempt, retry and MPP part); when no route fits it fails with `CLTV_EXCEEDS_MAX` and nothing is sent. A swap provider paying the counterparty's invoice sets it from the on-chain refund height (#751). |
+| `payInvoice(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?, maxFeeMsat?)` | `Promise<PaymentInfo>` | Pay invoice. **Blocks until settled or timeout** (default 60s). At the timeout the payment is failed only when no HTLC is out for it; with one still in flight the record stays `PENDING` until that HTLC resolves, no further route is tried after the timeout, and the record is failed when the HTLC fails or its on-chain timeout resolves; the `PAYMENT_TIMEOUT` message says so (issue #976). `maxFeeSats` caps routing fees in whole sats; `maxFeeMsat` (a number or a decimal string) caps them exactly, for a caller holding an exact quote such as `estimatePayment`'s `estimatedFeeMsat`. Pass one or the other: both at once is refused with `INVALID_PARAMS`; a route over the cap is refused with `FEE_EXCEEDS_MAX` (409 over HTTP, permanent for `isRetryableError` and `payInvoiceWithRetry`) and nothing is sent. `amountSats` is required for amount-less invoices. `metadata` attaches key-value labels. `cltvLimit` caps the payment's total CLTV expiry at that many blocks above the current tip (every attempt, retry and MPP part); when no route fits it fails with `CLTV_EXCEEDS_MAX` and nothing is sent. A swap provider paying the counterparty's invoice sets it from the on-chain refund height (#751). |
 | `payInvoiceSafe(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?, maxFeeMsat?)` | `Promise<PaymentInfo>` | Like `payInvoice` but **never throws**: catches all errors and resolves with the hash's existing record when there is one (after a timeout with an HTLC still out, the `PENDING` record, which no further route is tried for and which is failed when that HTLC fails or its on-chain timeout resolves; for a duplicate refusal, the record the engine refused from) and otherwise with `status: 'FAILED'`. The `failureDescription` field contains `[ERROR_CODE] message` for machine parsing. |
 | `sendPaymentAsync(bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `{ paymentHash, status: 'PENDING' \| 'FAILED' }` | Fire-and-forget pay. Returns immediately, `FAILED` when the engine refused the submission outright (an expired invoice, an HTLC the channel would not take). Poll `getPayment()` for settlement. Drain mode and the spending limits are applied at submission, so it can throw `SERVICE_DRAINING` or `SPENDING_LIMIT_EXCEEDED`; the limits use the invoice's own amount whenever it carries one, since that is what gets paid. |
 | `payInvoiceWithRetry(bolt11, opts?)` | `Promise<RetryPaymentResult>` | Pay with exponential backoff retry. `opts: { maxRetries? (3), backoffMs? (2000), maxFeeSats?, amountSats?, metadata?, cltvLimit? }`. Emits `payment:retry` events. |
@@ -227,7 +227,7 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | `createOffer({ description, amountSats?, issuer? })` | `OfferInfo` | Create a reusable BOLT 12 offer |
 | `decodeOfferString(offerStr)` | `OfferInfo` | Decode a BOLT 12 offer string without paying |
 | `listOffers()` | `OfferInfo[]` | List local offers |
-| `payOffer(offerStr, amountSats?, timeoutMs?)` | `Promise<PaymentInfo>` | Pay a BOLT 12 offer (requests invoice, then pays). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. Drain mode and the spending limits apply to the returned invoice's amount |
+| `payOffer(offerStr, amountSats?, timeoutMs?, maxFeeSats?, maxFeeMsat?)` | `Promise<PaymentInfo>` | Pay a BOLT 12 offer (requests invoice, then pays). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. Drain mode and the spending limits apply to the returned invoice's amount. `maxFeeSats` / `maxFeeMsat` cap the routing fee exactly as `payInvoice`'s do (one or the other; both at once is `INVALID_PARAMS`, judged before the invoice is requested). The cap covers the public hops plus the invoice's own blinded-path fee, which the payee writes into the invoice and which is otherwise paid unbounded (#1001); an invoice path over the cap is skipped for the invoice's other paths, and when none fits the payment is refused with `FEE_EXCEEDS_MAX` and nothing is sent |
 
 #### Channel Readiness
 
@@ -1199,6 +1199,7 @@ not repeat a 4xx unchanged.
 | `NOTHING_TO_CONSOLIDATE` | Wallet | 409 | Consolidation needs at least two spendable UTXOs |
 | `INSTANCE_ALREADY_RUNNING` | Wallet | n/a | Another instance holds the data-dir lock (startup only, never over HTTP) |
 | `PAYMENT_FAILED` | Payments | 502 | Lightning payment failed |
+| `FEE_EXCEEDS_MAX` | Payments | 409 | Every route costs more than the caller's `maxFeeSats` / `maxFeeMsat`; nothing was sent (permanent: the same request meets the same cap) |
 | `PAYMENT_TIMEOUT` | Payments | 504 | Payment did not settle within timeout. The payment is failed only when no HTLC is out for it; with one still in flight the record stays `PENDING` until it resolves, no further route is tried, and the record is failed when the HTLC fails or its on-chain timeout resolves; the message says so (issue #976) |
 | `INVOICE_EXPIRED` | Payments | 410 | Invoice has expired |
 | `NO_ROUTE` | Payments | 502 | No route found to destination |
@@ -1790,6 +1791,10 @@ beignet offer decode lno1...
 beignet offer pay lno1... 1000
 # Requests invoice from offer issuer, then pays it
 # {"ok":true,"result":{"paymentHash":"ab12...","status":"COMPLETED",...}}
+
+beignet offer pay lno1... 1000 --max-fee 5
+# Same, refusing to pay more than 5 sats of routing fee (public hops plus the
+# invoice's own blinded-path fee); over the cap nothing is sent
 ```
 
 ### Webhooks (CLI)
@@ -2152,7 +2157,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/payment/wait` | `{ paymentHash, timeoutMs? }` | Wait for payment to settle (default 60s) |
 | POST | `/offer/create` | `{ description, amountSats?, issuer? }` | Create BOLT 12 offer |
 | POST | `/offer/decode` | `{ offer }` | Decode a BOLT 12 offer string |
-| POST | `/offer/pay` | `{ offer, amountSats?, timeoutMs? }` | Pay BOLT 12 offer. Answers 409 while draining and 403 over a spending limit, judged on the invoice the payee returns. |
+| POST | `/offer/pay` | `{ offer, amountSats?, timeoutMs?, maxFeeSats?, maxFeeMsat? }` | Pay BOLT 12 offer. Answers 409 while draining and 403 over a spending limit, judged on the invoice the payee returns. `maxFeeSats` or `maxFeeMsat` (a number or a decimal string) caps the routing fee, including the invoice's own blinded-path fee; over the cap answers 409 `FEE_EXCEEDS_MAX` with nothing sent; both at once is 400 `INVALID_PARAMS`. |
 | GET | `/payment/proof` | `?paymentHash=<hex>` | Cryptographic payment proof (preimage, invoice, route) |
 | GET | `/payment/verify-proof` | `?paymentHash=<hex>` | Verify proof: `sha256(preimage) === paymentHash` |
 | GET | `/node/uri` | `?host=<addr>` | Node connection URI (`pubkey@host:port`). Optional external host override. |

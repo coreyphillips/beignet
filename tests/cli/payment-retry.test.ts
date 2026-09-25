@@ -109,7 +109,10 @@ describe('Payment Retry with Exponential Backoff', () => {
 			const permanentErrors = [
 				new BeignetError(BeignetErrorCode.INVOICE_EXPIRED, 'expired'),
 				new BeignetError(BeignetErrorCode.DUPLICATE_PAYMENT, 'duplicate'),
-				new BeignetError(BeignetErrorCode.INVALID_PARAMS, 'bad params')
+				new BeignetError(BeignetErrorCode.INVALID_PARAMS, 'bad params'),
+				// The caller's own fee cap refuses the same request every time
+				// (#1001); as PAYMENT_FAILED it was retried with backoff.
+				new BeignetError(BeignetErrorCode.FEE_EXCEEDS_MAX, 'over the cap')
 			];
 			for (const err of permanentErrors) {
 				expect(isRetryableError(err)).to.be.false;

@@ -801,10 +801,13 @@ export const ENGINE_PAYMENT_ERROR_CODES: Readonly<Record<string, string>> = {
 	NO_ROUTE: 'NO_ROUTE',
 	DUPLICATE_PAYMENT: 'DUPLICATE_PAYMENT',
 	NO_CHANNEL_TO_HOP: 'PEER_NOT_CONNECTED',
-	FEE_EXCEEDS_MAX: 'PAYMENT_FAILED',
-	// The caller's own bound (#751): its code, not a generic failure, so a
-	// swap provider can tell "no route under the refund height" from "no
-	// route at all".
+	// The caller's own bounds (#751, #1001): their codes, not a generic
+	// failure, so a swap provider can tell "no route under the refund height"
+	// from "no route at all", and a fee refusal answers 409 as the rebalance
+	// path's always has, rather than the 502 PAYMENT_FAILED that told
+	// payInvoiceWithRetry and every daemon client to retry a cap that the
+	// same request meets again.
+	FEE_EXCEEDS_MAX: 'FEE_EXCEEDS_MAX',
 	CLTV_EXCEEDS_MAX: 'CLTV_EXCEEDS_MAX',
 	MISSING_AMOUNT: 'INVALID_PARAMS',
 	INVALID_INVOICE: 'INVALID_PARAMS',
@@ -11511,10 +11514,19 @@ export class BeignetNode extends EventEmitter {
 			.map(({ offer, encoded }) => this.toOfferInfo(offer, encoded));
 	}
 
+	/**
+	 * Pay a BOLT 12 offer: request its invoice, then pay that. The fee cap is
+	 * maxFeeSats OR maxFeeMsat, never both, exactly as payInvoice takes it
+	 * (issue #998); it bounds the public hops plus the invoice's own
+	 * blinded-path fee, which the payee writes (issue #1001). Without a cap
+	 * the fee is unbounded.
+	 */
 	async payOffer(
 		offerStr: string,
 		amountSats?: number,
-		timeoutMs = 60_000
+		timeoutMs = 60_000,
+		maxFeeSats?: number,
+		maxFeeMsatCap?: number | string
 	): Promise<PaymentInfo> {
 		// Paying an offer spends outbound liquidity exactly as payInvoice does,
 		// so it runs the same admission: drain mode, both spending limits, a
@@ -11523,6 +11535,12 @@ export class BeignetNode extends EventEmitter {
 		// go asking a payee for an invoice.
 		this._checkDraining();
 		const offer = decodeOfferInput(offerStr);
+
+		// Converted BEFORE the invoice request and before any reservation, as
+		// payInvoice does: a refused cap must leave nothing raised and must
+		// not have asked the payee for an invoice it will never pay (issue
+		// #474).
+		const maxFeeMsat = resolveMaxFeeMsat(maxFeeSats, maxFeeMsatCap);
 
 		// Request invoice from the offer. Guarded before BigInt(): a fractional
 		// amount threw an uncaught RangeError that shipped as a scrubbed 500
@@ -11612,7 +11630,7 @@ export class BeignetNode extends EventEmitter {
 			this.node.on('payment:failed', onFailed);
 
 			try {
-				this.node.payBolt12Invoice(bolt12Invoice);
+				this.node.payBolt12Invoice(bolt12Invoice, undefined, maxFeeMsat);
 			} catch (err: unknown) {
 				cleanup();
 				// A payment that never started holds no capacity. Without this a

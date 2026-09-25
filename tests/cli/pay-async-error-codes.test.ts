@@ -239,7 +239,7 @@ describe('sendPaymentAsync answers an engine refusal with a BeignetError (issue 
 		const cases: Array<[LightningErrorCode, string]> = [
 			[LightningErrorCode.NO_ROUTE, 'NO_ROUTE'],
 			[LightningErrorCode.NO_CHANNEL_TO_HOP, 'PEER_NOT_CONNECTED'],
-			[LightningErrorCode.FEE_EXCEEDS_MAX, 'PAYMENT_FAILED'],
+			[LightningErrorCode.FEE_EXCEEDS_MAX, 'FEE_EXCEEDS_MAX'],
 			[LightningErrorCode.CLTV_EXCEEDS_MAX, 'CLTV_EXCEEDS_MAX'],
 			[LightningErrorCode.MISSING_AMOUNT, 'INVALID_PARAMS'],
 			[LightningErrorCode.INVALID_INVOICE, 'INVALID_PARAMS'],
@@ -262,6 +262,31 @@ describe('sendPaymentAsync answers an engine refusal with a BeignetError (issue 
 		const err = thrownBy(() => node.sendPaymentAsync(bolt11));
 		expect(err.code).to.equal(BeignetErrorCode.PAYMENT_FAILED);
 		expect(err.message).to.equal('something else entirely');
+	});
+
+	it('payInvoiceWithRetry does not retry a FEE_EXCEEDS_MAX refusal', async () => {
+		// The caller's cap refuses the same request every time. Mapped to
+		// PAYMENT_FAILED it read as retryable, so this looped four times
+		// with backoff before giving up (#1001).
+		let attempts = 0;
+		engineOf(node).sendPayment = (): never => {
+			attempts++;
+			throw new LightningPaymentError(
+				LightningErrorCode.FEE_EXCEEDS_MAX,
+				'Route fee exceeds maximum'
+			);
+		};
+		const { bolt11 } = invoiceFrom('over the cap');
+		const result = await node.payInvoiceWithRetry(bolt11, {
+			maxRetries: 3,
+			backoffMs: 1,
+			maxFeeSats: 1
+		});
+		expect(attempts, 'one attempt, no retry').to.equal(1);
+		expect(result.attempts).to.equal(1);
+		expect(result.status).to.equal('FAILED');
+		expect(result.failureDescription).to.equal('Route fee exceeds maximum');
+		expect(pendingSats(node)).to.equal(0);
 	});
 
 	it('sendKeysend answers an engine refusal with its code too', async () => {
@@ -333,6 +358,29 @@ describe('POST /invoice/pay-async answers an engine refusal with its own code an
 		expect(res.status).to.equal(statusForErrorCode('NO_ROUTE'));
 		expect(res.body.ok).to.equal(false);
 		expect((res.body.error as { code: string }).code).to.equal('NO_ROUTE');
+	});
+
+	it('answers 409 FEE_EXCEEDS_MAX for a route over the cap, not a retryable 502', async () => {
+		engineOf(daemon!.node).sendPayment = (): never => {
+			throw new LightningPaymentError(
+				LightningErrorCode.FEE_EXCEEDS_MAX,
+				'Route fee exceeds maximum'
+			);
+		};
+		try {
+			const res = await request(port, 'POST', '/invoice/pay-async', {
+				bolt11: invoiceFrom('over the cap over http').bolt11,
+				maxFeeSats: 1
+			});
+			expect(res.status).to.equal(409);
+			expect(res.body.ok).to.equal(false);
+			const error = res.body.error as { code: string; message: string };
+			expect(error.code).to.equal('FEE_EXCEEDS_MAX');
+			expect(error.message).to.equal('Route fee exceeds maximum');
+			expect(pendingSats(daemon!.node)).to.equal(0);
+		} finally {
+			delete (engineOf(daemon!.node) as Partial<Engine>).sendPayment;
+		}
 	});
 
 	it('answers 400 INVALID_INVOICE for a bolt11 that does not decode', async () => {

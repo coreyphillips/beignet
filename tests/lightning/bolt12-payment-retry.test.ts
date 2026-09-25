@@ -13,7 +13,12 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { INodeConfig, PaymentStatus } from '../../src/lightning/node/types';
+import {
+	INodeConfig,
+	LightningErrorCode,
+	LightningPaymentError,
+	PaymentStatus
+} from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
@@ -34,6 +39,7 @@ import {
 	IBolt12Invoice
 } from '../../src/lightning/offer';
 import { constructBlindedPath } from '../../src/lightning/onion/blinded-path';
+import { MessageType } from '../../src/lightning/message/types';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -97,7 +103,8 @@ function createNode(seedId: number): LightningNode {
 
 function setupPair(
 	aliceSeed: number,
-	bobSeed: number
+	bobSeed: number,
+	channelSats = 1_000_000n
 ): { alice: LightningNode; bob: LightningNode } {
 	const alice = createNode(aliceSeed);
 	const bob = createNode(bobSeed);
@@ -113,7 +120,7 @@ function setupPair(
 		}
 	});
 
-	const channel = alice.openChannel(bob.getNodeId(), 1_000_000n);
+	const channel = alice.openChannel(bob.getNodeId(), channelSats);
 	const channelId = alice.createFunding(
 		channel,
 		crypto.randomBytes(32),
@@ -505,6 +512,105 @@ describe('BOLT 12 payment retry (issue #261)', () => {
 		expect(() => alice.payBolt12Invoice(invoice)).to.throw(
 			/already in flight/i
 		);
+
+		alice.destroy();
+		bob.destroy();
+	});
+});
+
+/**
+ * Bob's invoice path is a grafted one for alice (bob, not alice, introduces
+ * it), so the payinfo fee is added to what alice sends and never inverted
+ * away. Rewrite the payee-written fee on the invoice alice is handed. Bob is
+ * also the recipient here, so a payment carrying this fee would overpay him
+ * and be refused: these tests only ever judge the cap, never a settlement
+ * (blinded-fee-cap.test.ts pays through a relaying introduction node).
+ */
+function setBlindedFee(invoice: IBolt12Invoice, feeBaseMsat: number): void {
+	invoice.blindedPayInfo = invoice.blindedPayInfo!.map((info) => ({
+		...info,
+		feeBaseMsat,
+		feeProportionalMillionths: 0,
+		htlcMaximumMsat: 100_000_000_000n
+	}));
+}
+
+/** update_add_htlc amounts alice puts on the wire from now on. */
+function recordAdds(alice: LightningNode): bigint[] {
+	const adds: bigint[] = [];
+	alice.on('message:outbound', (_pk: string, type: number, payload: Buffer) => {
+		if (type === MessageType.UPDATE_ADD_HTLC) {
+			adds.push(payload.readBigUInt64BE(40));
+		}
+	});
+	return adds;
+}
+
+describe('BOLT 12 blinded-path fee cap (issue #1001)', () => {
+	it('refuses a payee-written blinded fee over the cap before any HTLC leaves', () => {
+		// The largest fee the u32 payinfo fields express; the channel is sized
+		// so the router finds the route and it is the cap that refuses.
+		const { alice, bob } = setupPair(960, 961, 10_000_000n);
+		const invoice = issueBolt12Invoice(bob, 960, 50_000n);
+		invoice.blindedPayInfo = invoice.blindedPayInfo!.map((info) => ({
+			...info,
+			feeBaseMsat: 0xffffffff,
+			feeProportionalMillionths: 0xffffffff,
+			htlcMaximumMsat: 100_000_000_000n
+		}));
+		const adds = recordAdds(alice);
+
+		let error: unknown;
+		try {
+			alice.payBolt12Invoice(invoice, undefined, 1_000n);
+		} catch (err) {
+			error = err;
+		}
+		expect(error).to.be.instanceOf(LightningPaymentError);
+		expect((error as LightningPaymentError).code).to.equal(
+			LightningErrorCode.FEE_EXCEEDS_MAX
+		);
+		expect(adds, 'no update_add_htlc left alice').to.have.length(0);
+		expect(alice.getPayment(invoice.paymentHash)).to.be.undefined;
+		expect(
+			(
+				alice as unknown as { paymentRetryContexts: Map<string, unknown> }
+			).paymentRetryContexts.has(invoice.paymentHash.toString('hex')),
+			'no retry context'
+		).to.equal(false);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a retry keeps the fee cap', () => {
+		const { alice, bob } = setupPair(966, 967);
+		const invoice = issueBolt12Invoice(bob, 966, 50_000n);
+		setBlindedFee(invoice, 10_000);
+		const attempts = failEveryHtlcTemporarily(bob);
+
+		// Every re-entry into payBolt12Invoice, the first call included.
+		const caps: Array<bigint | undefined> = [];
+		const real = alice.payBolt12Invoice.bind(alice);
+		alice.payBolt12Invoice = (
+			inv: IBolt12Invoice,
+			excluded?: Set<string>,
+			maxFeeMsat?: bigint
+		): ReturnType<LightningNode['payBolt12Invoice']> => {
+			caps.push(maxFeeMsat);
+			return real(inv, excluded, maxFeeMsat);
+		};
+
+		alice.payBolt12Invoice(invoice, undefined, 10_000n);
+
+		// Not every re-entry dispatches (the last one finds nothing left to
+		// try), so the count is judged against re-entries, not HTLCs.
+		expect(attempts(), 'the payment was retried').to.be.greaterThan(1);
+		expect(
+			caps.length,
+			'retries re-entered payBolt12Invoice'
+		).to.be.greaterThan(1);
+		expect(caps.map(String)).to.deep.equal(caps.map(() => '10000'));
 
 		alice.destroy();
 		bob.destroy();

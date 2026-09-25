@@ -248,6 +248,26 @@ describe('Blinded-path payer self-relay (issue #550)', function () {
 		}
 	});
 
+	it('a genuinely zero-fee self-intro payment passes maxFeeMsat 0 (BOLT 12, issue #1001)', function () {
+		// payBolt12Invoice's cap judges the same figure sendPayment's does: the
+		// self-relay's wire route, whose introduction fee is our own and is
+		// inverted away, not the invoice's payinfo fee.
+		const { alice, bob } = setupPair();
+		try {
+			const amountMsat = 5_000_000n;
+			const invoice = issueBolt12Invoice(bob, 1, amountMsat);
+			const payment = alice.payBolt12Invoice(invoice, undefined, 0n);
+			expect(payment.status, payment.failureReason ?? '').to.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(payment.amountMsat).to.equal(amountMsat);
+			expect(payment.route?.totalFeeMsat).to.equal(0n);
+		} finally {
+			alice.destroy();
+			bob.destroy();
+		}
+	});
+
 	it('fails by name when the onward SCID resolves no usable channel', function () {
 		const { alice, bob } = setupPair();
 		try {

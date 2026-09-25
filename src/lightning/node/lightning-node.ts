@@ -15618,10 +15618,14 @@ export class LightningNode extends EventEmitter {
 			// send removes our own introduction fee on the wire, so a
 			// genuinely zero-fee payment must pass maxFeeMsat 0 (issue #550
 			// review). prepareSelfIntroSend also validates the path, so an
-			// unusable self-intro path fails here by name.
+			// unusable self-intro path fails here by name. A grafted route is
+			// judged on what leaves us beyond what the recipient receives:
+			// that includes the payee-written blinded fee, which the route's
+			// reported fee used to leave out (issue #1001).
 			const selfIntroForCap = this.prepareSelfIntroSend(blindedRoute);
 			const effectiveFeeMsat =
-				selfIntroForCap?.wireRoute.totalFeeMsat ?? blindedRoute.totalFeeMsat;
+				selfIntroForCap?.wireRoute.totalFeeMsat ??
+				blindedRoute.totalAmountMsat - paymentAmountMsat;
 			if (maxFeeMsat !== undefined && effectiveFeeMsat > maxFeeMsat) {
 				throw new LightningPaymentError(
 					LightningErrorCode.FEE_EXCEEDS_MAX,
@@ -23051,7 +23055,8 @@ export class LightningNode extends EventEmitter {
 				} else if (retryCtx.bolt12Invoice) {
 					retried = this.payBolt12Invoice(
 						retryCtx.bolt12Invoice,
-						retryCtx.excludedChannels
+						retryCtx.excludedChannels,
+						retryCtx.maxFeeMsat
 					);
 				} else {
 					retried = this.sendPayment(
@@ -27144,10 +27149,19 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Pay a BOLT 12 invoice by extracting payment info and delegating to sendPayment.
 	 * This creates a BOLT 11-like payment flow using the BOLT 12 invoice details.
+	 *
+	 * `maxFeeMsat` caps the fee actually paid, as sendPayment's does: the
+	 * public hops plus the invoice's own blinded-path fee, which the payee
+	 * writes and which used to be paid uncapped and unreported (issue
+	 * #1001). A blinded path over the cap is skipped in favour of the
+	 * invoice's other paths; when every usable path is over it the payment is
+	 * refused with FEE_EXCEEDS_MAX before anything is sent. Undefined leaves
+	 * the fee uncapped. The cap is kept for the payment's retries.
 	 */
 	payBolt12Invoice(
 		invoice: IBolt12Invoice,
-		excludedChannels?: Set<string>
+		excludedChannels?: Set<string>,
+		maxFeeMsat?: bigint
 	): IPaymentInfo {
 		if (!invoice.paymentHash || !invoice.amount || !invoice.nodeId) {
 			throw new Error('BOLT 12 invoice missing required fields');
@@ -27176,6 +27190,7 @@ export class LightningNode extends EventEmitter {
 			)?.bolt12ExcludedPathIndices;
 			let blindedRoute: IRoute | null = null;
 			let pathIndex = 0;
+			let overCap = false;
 			for (let i = 0; i < invoice.paths.length && !blindedRoute; i++) {
 				if (excludedPaths?.has(i)) continue;
 				const payInfo = invoice.blindedPayInfo?.[i] ?? {
@@ -27207,8 +27222,9 @@ export class LightningNode extends EventEmitter {
 				// another usable path (issue #550 review). Validate now and
 				// keep scanning on a typed local refusal.
 				if (blindedRoute) {
+					let selfIntro: { wireRoute: { totalFeeMsat: bigint } } | null;
 					try {
-						this.prepareSelfIntroSend(blindedRoute);
+						selfIntro = this.prepareSelfIntroSend(blindedRoute);
 					} catch (err) {
 						if (
 							err instanceof LightningPaymentError &&
@@ -27220,10 +27236,31 @@ export class LightningNode extends EventEmitter {
 						}
 						throw err;
 					}
+					// The fee this path would actually cost: a self-introduction
+					// send sheds our own introduction fee on the wire; a grafted
+					// route pays the public hops plus the path's blinded fee
+					// (issue #1001). A path over the cap is skipped, not fatal:
+					// the invoice may advertise a cheaper one.
+					if (maxFeeMsat !== undefined) {
+						const feeMsat =
+							selfIntro?.wireRoute.totalFeeMsat ??
+							blindedRoute.totalAmountMsat - amountMsat;
+						if (feeMsat > maxFeeMsat) {
+							overCap = true;
+							blindedRoute = null;
+							continue;
+						}
+					}
 				}
 				if (blindedRoute) pathIndex = i;
 			}
 			if (!blindedRoute) {
+				if (overCap) {
+					throw new LightningPaymentError(
+						LightningErrorCode.FEE_EXCEEDS_MAX,
+						'Route fee exceeds maximum'
+					);
+				}
 				throw new Error('No route to BOLT 12 blinded path introduction node');
 			}
 			return this.dispatchBolt12Route(
@@ -27231,7 +27268,8 @@ export class LightningNode extends EventEmitter {
 				invoice,
 				finalCltvExpiry,
 				excludedChannels,
-				pathIndex
+				pathIndex,
+				maxFeeMsat
 			);
 		}
 
@@ -27252,12 +27290,20 @@ export class LightningNode extends EventEmitter {
 		if (!route) {
 			throw new Error('No route found to BOLT 12 invoice destination');
 		}
+		if (maxFeeMsat !== undefined && route.totalFeeMsat > maxFeeMsat) {
+			throw new LightningPaymentError(
+				LightningErrorCode.FEE_EXCEEDS_MAX,
+				'Route fee exceeds maximum'
+			);
+		}
 
 		return this.dispatchBolt12Route(
 			route,
 			invoice,
 			finalCltvExpiry,
-			excludedChannels
+			excludedChannels,
+			undefined,
+			maxFeeMsat
 		);
 	}
 
@@ -27276,13 +27322,16 @@ export class LightningNode extends EventEmitter {
 	 * reaches the onion failure handler, so nothing else would clean it up
 	 * and nothing can retry it. A pre-existing context is left alone; during
 	 * a retry the failure handler owns its rollback and give-up behavior.
+	 * The fee cap rides in the context so a retry is held to the same bound
+	 * as the first attempt (issue #1001).
 	 */
 	private dispatchBolt12Route(
 		route: IRoute,
 		invoice: IBolt12Invoice,
 		finalCltvExpiry: number,
 		excludedChannels?: Set<string>,
-		pathIndex?: number
+		pathIndex?: number,
+		maxFeeMsat?: bigint
 	): IPaymentInfo {
 		const hashHex = invoice.paymentHash.toString('hex');
 		const created = !this.paymentRetryContexts.has(hashHex);
@@ -27291,7 +27340,8 @@ export class LightningNode extends EventEmitter {
 				bolt12Invoice: invoice,
 				excludedChannels: excludedChannels ?? new Set(),
 				retryCount: 0,
-				maxRetries: this.maxPaymentRetries
+				maxRetries: this.maxPaymentRetries,
+				maxFeeMsat
 			});
 		}
 		const ctx = this.paymentRetryContexts.get(hashHex)!;

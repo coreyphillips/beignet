@@ -21,6 +21,10 @@ import { BeignetNode } from '../../src/cli/beignet-node';
 import { startDaemon } from '../../src/cli/daemon';
 import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
 import {
+	LightningErrorCode,
+	LightningPaymentError
+} from '../../src/lightning/node/types';
+import {
 	DEFAULT_MIN_FINAL_CLTV_EXPIRY,
 	Network
 } from '../../src/lightning/invoice/types';
@@ -62,6 +66,8 @@ type Payee = {
 	requests: Array<bigint | undefined>;
 	/** Payment hashes payOffer handed to the engine to pay. */
 	dispatched: string[];
+	/** The fee cap (msat) each dispatch carried, as payBolt12Invoice saw it. */
+	caps: Array<bigint | undefined>;
 };
 
 /**
@@ -84,7 +90,8 @@ const stubPayee = (
 	const payee: Payee = {
 		paymentHash: paymentHash.toString('hex'),
 		requests: [],
-		dispatched: []
+		dispatched: [],
+		caps: []
 	};
 	const engine = internals(node).node;
 	engine.requestInvoice = async (...args: unknown[]): Promise<unknown> => {
@@ -102,6 +109,7 @@ const stubPayee = (
 		payee.dispatched.push(
 			(args[0] as { paymentHash: Buffer }).paymentHash.toString('hex')
 		);
+		payee.caps.push(args[2] as bigint | undefined);
 		if (opts.throws) throw opts.throws;
 		return { status: 'PENDING' };
 	};
@@ -369,6 +377,118 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		expect(node.getDailySpendInfo().spentSats).to.equal(1);
 		expect(pending()).to.equal(0);
 	});
+
+	// The fee cap (#1001): converted like payInvoice's and handed to the
+	// engine, which judges the public hops plus the invoice's blinded fee.
+	it('hands maxFeeSats to the engine as an exact msat cap', async () => {
+		const payee = stubPayee(node, 1_000_000n);
+		const paid = node.payOffer(
+			offerString(node, 'capped'),
+			undefined,
+			undefined,
+			25
+		);
+		await waitFor(() => payee.dispatched.length === 1, 'the dispatch');
+		expect(payee.caps.map(String)).to.deep.equal(['25000']);
+
+		settle(node, payee.paymentHash, 1_000, 'COMPLETED');
+		expect((await paid).status).to.equal('COMPLETED');
+	});
+
+	it('hands an exact maxFeeMsat through unchanged, as a number or a digit string', async () => {
+		const first = stubPayee(node, 1_000_000n);
+		const firstPaid = node.payOffer(
+			offerString(node, 'exact msat'),
+			undefined,
+			undefined,
+			undefined,
+			'25001'
+		);
+		await waitFor(() => first.dispatched.length === 1, 'the first dispatch');
+		settle(node, first.paymentHash, 1_000, 'COMPLETED');
+		await firstPaid;
+
+		const second = stubPayee(node, 1_000_000n);
+		const secondPaid = node.payOffer(
+			offerString(node, 'exact msat number'),
+			undefined,
+			undefined,
+			undefined,
+			25_002
+		);
+		await waitFor(() => second.dispatched.length === 1, 'the second dispatch');
+		settle(node, second.paymentHash, 1_000, 'COMPLETED');
+		await secondPaid;
+
+		expect(first.caps.map(String)).to.deep.equal(['25001']);
+		expect(second.caps.map(String)).to.deep.equal(['25002']);
+	});
+
+	it('leaves the fee uncapped when no cap is given', async () => {
+		const payee = stubPayee(node, 1_000_000n);
+		const paid = node.payOffer(offerString(node, 'uncapped'));
+		await waitFor(() => payee.dispatched.length === 1, 'the dispatch');
+		expect(payee.caps).to.deep.equal([undefined]);
+
+		settle(node, payee.paymentHash, 1_000, 'COMPLETED');
+		await paid;
+	});
+
+	it('refuses both caps at once before asking the payee, with nothing reserved', async () => {
+		const payee = stubPayee(node, 1_000_000n);
+		expect(
+			await refusalOf(
+				node.payOffer(
+					offerString(node, 'two caps'),
+					undefined,
+					undefined,
+					25,
+					25_000
+				)
+			)
+		).to.contain('mutually exclusive');
+		expect(payee.requests, 'no invoice was requested').to.have.length(0);
+		expect(payee.dispatched).to.have.length(0);
+		expect(pending()).to.equal(0);
+	});
+
+	it('refuses a fractional maxFeeSats before asking the payee, with nothing reserved', async () => {
+		const payee = stubPayee(node, 1_000_000n);
+		expect(
+			await refusalOf(
+				node.payOffer(offerString(node, 'bad cap'), undefined, undefined, 1.5)
+			)
+		).to.contain('maxFeeSats');
+		expect(payee.requests, 'no invoice was requested').to.have.length(0);
+		expect(payee.dispatched).to.have.length(0);
+		expect(pending()).to.equal(0);
+	});
+
+	it("reports the engine's FEE_EXCEEDS_MAX refusal by code and releases the reservation", async () => {
+		const payee = stubPayee(node, 1_000_000n, {
+			throws: new LightningPaymentError(
+				LightningErrorCode.FEE_EXCEEDS_MAX,
+				'Route fee exceeds maximum'
+			)
+		});
+		let error: unknown;
+		try {
+			await node.payOffer(
+				offerString(node, 'over cap'),
+				undefined,
+				undefined,
+				1
+			);
+		} catch (err) {
+			error = err;
+		}
+		expect((error as { code: string }).code).to.equal('FEE_EXCEEDS_MAX');
+		expect(String((error as Error).message)).to.contain(
+			'Route fee exceeds maximum'
+		);
+		expect(payee.caps.map(String)).to.deep.equal(['1000']);
+		expect(pending()).to.equal(0);
+	});
 });
 
 describe('POST /offer/pay admission (#529)', function () {
@@ -487,6 +607,44 @@ describe('POST /offer/pay admission (#529)', function () {
 		expect((await firstRes).body.ok).to.equal(true);
 		expect((await secondRes).body.ok).to.equal(true);
 		expect(node.getDailySpendInfo().spentSats).to.equal(8_000);
+		expect(pending()).to.equal(0);
+	});
+
+	it('passes maxFeeSats and maxFeeMsat from the body to the engine (#1001)', async () => {
+		const sats = stubPayee(node, 1_000_000n);
+		const satsRes = post({
+			offer: offerString(node, 'route capped sats'),
+			maxFeeSats: 25
+		});
+		await waitFor(() => sats.dispatched.length === 1, 'the sats dispatch');
+		settle(node, sats.paymentHash, 1_000, 'COMPLETED');
+		expect((await satsRes).body.ok).to.equal(true);
+
+		const msat = stubPayee(node, 1_000_000n);
+		const msatRes = post({
+			offer: offerString(node, 'route capped msat'),
+			maxFeeMsat: '25001'
+		});
+		await waitFor(() => msat.dispatched.length === 1, 'the msat dispatch');
+		settle(node, msat.paymentHash, 1_000, 'COMPLETED');
+		expect((await msatRes).body.ok).to.equal(true);
+
+		expect(sats.caps.map(String)).to.deep.equal(['25000']);
+		expect(msat.caps.map(String)).to.deep.equal(['25001']);
+		expect(pending()).to.equal(0);
+	});
+
+	it('answers 400 INVALID_PARAMS for both caps at once, asking the payee nothing', async () => {
+		const payee = stubPayee(node, 1_000_000n);
+		const res = await post({
+			offer: offerString(node, 'route two caps'),
+			maxFeeSats: 25,
+			maxFeeMsat: 25_000
+		});
+		expect(res.status).to.equal(400);
+		expect(errorCode(res.body)).to.equal('INVALID_PARAMS');
+		expect(payee.requests).to.have.length(0);
+		expect(payee.dispatched).to.have.length(0);
 		expect(pending()).to.equal(0);
 	});
 });
