@@ -647,6 +647,16 @@ export interface IChannelState {
 	 */
 	spliceInFlight?: ISpliceInFlight | null;
 	/**
+	 * Set once a splice has been adopted (completeSplice), never cleared: the
+	 * channel's funding has moved at least once. The funder-fee guard (issue
+	 * #1020) reads it for eclair's climb-out branch: on a channel that has
+	 * been spliced, with fewer than 5 HTLCs in the map, eclair offers an add
+	 * while the funder's balance exceeds the fee, reserve or not, so that a
+	 * funder a splice-out left short of its reserve can climb back out.
+	 * Persisted.
+	 */
+	hasBeenSpliced?: boolean;
+	/**
 	 * Issue #764: the splice (txid in internal byte order) that the commitment
 	 * this FORCE_CLOSED channel broadcast spends, when the chain had that
 	 * splice but it had not reached its lock depth. The channel itself was NOT

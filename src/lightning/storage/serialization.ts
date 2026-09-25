@@ -344,6 +344,8 @@ export interface ISerializedChannelState {
 	 * quarantine the chain has not lifted.
 	 */
 	fundingUnaccounted?: boolean;
+	/** A splice has been adopted at least once (see IChannelState). */
+	hasBeenSpliced?: boolean;
 	fundingOutputIndex: number;
 	minimumDepth: number;
 	localConfig: ISerializedChannelConfig;
@@ -862,6 +864,7 @@ export function serializeChannelState(
 		pendingFundingTxHex: s.pendingFundingTxHex,
 		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
 		fundingUnaccounted: s.fundingUnaccounted,
+		hasBeenSpliced: s.hasBeenSpliced,
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: serializeChannelConfig(s.localConfig),
@@ -1280,6 +1283,7 @@ export function deserializeChannelState(
 		pendingFundingTxHex: s.pendingFundingTxHex,
 		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
 		fundingUnaccounted: s.fundingUnaccounted,
+		hasBeenSpliced: s.hasBeenSpliced,
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: deserializeChannelConfig(s.localConfig),

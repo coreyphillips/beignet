@@ -7,6 +7,7 @@ import {
 } from '../../src/lightning/channel/channel-actions';
 import {
 	createAcceptorState,
+	createOpenerState,
 	IChannelState,
 	ISpliceInFlight
 } from '../../src/lightning/channel/channel-state';
@@ -26,15 +27,33 @@ import {
 	isAnchorChannel
 } from '../../src/lightning/channel/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import {
+	IChannelBasepoints as IBasepointsForRestore,
+	perCommitmentPointFromSecret
+} from '../../src/lightning/keys/derivation';
+import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
+import { ICommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
 import { IUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
 import { MessageType } from '../../src/lightning/message/types';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { PaymentStatus } from '../../src/lightning/node/types';
-import { INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS } from '../../src/lightning/onion/types';
 import {
+	INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+	TEMPORARY_CHANNEL_FAILURE
+} from '../../src/lightning/onion/types';
+import {
+	constructOnionPacket,
+	encodeOnionPacket
+} from '../../src/lightning/onion/construct';
+import { computeSharedSecrets } from '../../src/lightning/onion/sphinx-crypto';
+import { decryptFailureMessage } from '../../src/lightning/onion/failures';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import {
+	deserializeChannelState,
 	deserializeHtlcEntry,
+	serializeChannelState,
 	serializeHtlcEntry
 } from '../../src/lightning/storage/serialization';
 import { expectWireFailure } from './helpers/open-refusal';
@@ -135,6 +154,10 @@ interface IFixtureOpts {
 	remoteMsat?: bigint;
 	htlcs?: IFixtureHtlc[];
 	spliceInFlight?: Partial<ISpliceInFlight>;
+	/** A splice has been adopted on this channel (eclair's climb-out regime). */
+	hasBeenSpliced?: boolean;
+	/** The rate the stored remote signature was verified against. */
+	lastSignedCommitFeeratePerKw?: number;
 }
 
 /**
@@ -193,6 +216,10 @@ function makeChannel(opts: IFixtureOpts = {}): Channel {
 	}
 	if (opts.spliceInFlight) {
 		state.spliceInFlight = opts.spliceInFlight as ISpliceInFlight;
+	}
+	if (opts.hasBeenSpliced) state.hasBeenSpliced = true;
+	if (opts.lastSignedCommitFeeratePerKw !== undefined) {
+		state.lastSignedCommitFeeratePerKw = opts.lastSignedCommitFeeratePerKw;
 	}
 
 	(opts.htlcs ?? []).forEach((h, i) => {
@@ -288,6 +315,34 @@ function heldCommitment(channel: Channel): {
 		htlcOutputs: built.outputMap.htlcs.length
 	};
 }
+
+/**
+ * Outputs of the commitment the STORED remote signature covers: the one we
+ * would broadcast now, rebuilt at its own rate and per-commitment point.
+ */
+function heldSignedCommitment(channel: Channel): {
+	toLocalSats: number | null;
+	htlcOutputs: number;
+} {
+	const state = channel.getFullState();
+	const n = state.localCommitmentNumber;
+	const point = perCommitmentPointFromSecret(
+		generateFromSeed(state.localPerCommitmentSeed, MAX_INDEX - n)
+	);
+	const built = buildLocalCommitment(state, point, n, true).result;
+	const idx = built.outputMap.toLocal;
+	return {
+		toLocalSats: idx === undefined ? null : built.tx.outs[idx].value,
+		htlcOutputs: built.outputMap.htlcs.length
+	};
+}
+
+const TRIM_WIRE = /Commitment would trim our output to fees/;
+const commitSigMsg = (channel: Channel): ICommitmentSignedMessage => ({
+	channelId: channel.getChannelId()!,
+	signature: Buffer.alloc(64),
+	htlcSignatures: []
+});
 
 const RESERVE_MSAT = 10_000_000n;
 const RATE = 2_500;
@@ -682,6 +737,88 @@ describe('Funder commitment fee on an inbound add (issue #1020)', function () {
 			expect(outcomeOf(channel, 5_000_000n)).to.equal('clean');
 		});
 
+		it('the floor credits an offered HTLC the peer failed once we revoked for the removal (T5)', function () {
+			// Both builders already refund it; without the credit a pending
+			// refund wire-failed an honest add with our real to_local intact
+			// (review round 2). One msat under the boundary without the credit,
+			// exactly on it with it: stamped, not wire.
+			const revoked: IFixtureHtlc = {
+				amountMsat: 5_000_000n,
+				direction: HtlcDirection.OFFERED,
+				state: HtlcState.FAILED,
+				removalLocallyRevoked: true
+			};
+			const credited = makeChannel({
+				localMsat: DUST_MSAT + cost(1) - 5_000_000n,
+				htlcs: [revoked]
+			});
+			expect(outcomeOf(credited, 5_000_000n)).to.equal('stamped');
+			expect(heldCommitment(credited).toLocalSats).to.equal(354);
+			// Not yet revoked for: the remote build still carries the output,
+			// so it counts and is not credited.
+			const standing = makeChannel({
+				localMsat: DUST_MSAT + cost(1) - 5_000_000n,
+				htlcs: [{ ...revoked, removalLocallyRevoked: false }]
+			});
+			expect(outcomeOf(standing, 5_000_000n)).to.equal('wire');
+		});
+
+		it("eclair's climb-out on a spliced channel: fewer than 5 HTLCs, balance above the fee, reserve ignored (T4)", function () {
+			// Balance 3,000 sats, well under the 10,000-sat reserve, on a
+			// channel whose funding has moved. eclair offers while our balance
+			// exceeds the fee: add 1 (3,000 > 2,240) and add 2 (3,000 > 2,670),
+			// not add 3 (3,000 < 3,100). We admit the first two outright and
+			// fail the channel on the third, which no conforming peer sends.
+			const channel = makeChannel({
+				hasBeenSpliced: true,
+				localMsat: 3_000_000n
+			});
+			expect(outcomeOf(channel, 5_000_000n, 1n)).to.equal('clean');
+			expect(outcomeOf(channel, 5_000_000n, 2n)).to.equal('clean');
+			// Our output is now under the dust limit (330 sats): the sign-time
+			// backstop tolerates it in this regime, as the fee (2,670) does not
+			// exceed our balance, so the commitment eclair expects gets signed.
+			expect(heldCommitment(channel).toLocalSats).to.equal(null);
+			expect(errorOf(channel.signCommitment(Buffer.alloc(64), []))).to.equal(
+				null
+			);
+			expect(outcomeOf(channel, 5_000_000n, 3n)).to.equal('wire');
+			// Off the regime, the same first add lands in the band: five entries
+			// in the map, or a channel never spliced.
+			const five: IFixtureHtlc[] = [];
+			for (let i = 0; i < 5; i++) {
+				five.push({
+					amountMsat: 1_000_000n,
+					direction: HtlcDirection.RECEIVED
+				});
+			}
+			expect(
+				outcomeOf(
+					makeChannel({
+						hasBeenSpliced: true,
+						localMsat: 3_000_000n,
+						htlcs: five
+					}),
+					5_000_000n
+				)
+			).to.equal('stamped');
+			expect(
+				outcomeOf(makeChannel({ localMsat: 3_000_000n }), 5_000_000n)
+			).to.equal('stamped');
+		});
+
+		it('the splice marker is written on adoption and survives serialization', function () {
+			const channel = makeChannel({ hasBeenSpliced: true });
+			const state = channel.getFullState();
+			expect(
+				deserializeChannelState(serializeChannelState(state)).hasBeenSpliced
+			).to.equal(true);
+			const fresh = makeChannel().getFullState();
+			expect(
+				deserializeChannelState(serializeChannelState(fresh)).hasBeenSpliced
+			).to.equal(undefined);
+		});
+
 		it('the stamp survives serialization', function () {
 			const channel = makeChannel({ localMsat: RESERVE_MSAT + cost(1) - 1n });
 			expect(outcomeOf(channel, 5_000_000n)).to.equal('stamped');
@@ -968,33 +1105,45 @@ describe('Funder commitment fee on an inbound add (issue #1020)', function () {
 			expect(refunded.canOfferHtlcSet([5_000_000n])).to.equal(true);
 		});
 
-		it("a trimmed add asks only the slot: it is a received output on the funder's commitment", function () {
+		it("a trimmed add asks nothing of the funder: it is a received output on the funder's commitment, and a trimmed one costs no weight", function () {
 			// Our offered add is a RECEIVED output there, so the HTLC-success
-			// fee sets its threshold at the funder's dust limit.
-			const channel = fixture(RESERVE_MSAT + cost(1));
+			// fee sets its threshold at the funder's dust limit. Below it the
+			// add adds no fee weight and the spare slot is not charged either
+			// (review round 2, T6): at zero slots we still send dust, as LND
+			// and eclair senders do.
+			const channel = fixture(RESERVE_MSAT + cost(0));
+			expect(channel.canOfferHtlcSet([1_000_000n])).to.equal(true);
 			expect(
 				channel.canOfferHtlcSet([RECEIVED_TRIM_SATS * 1000n - 1n])
 			).to.equal(true);
 			expect(channel.canOfferHtlcSet([RECEIVED_TRIM_SATS * 1000n])).to.equal(
 				false
 			);
+			// One msat under the funder's own cost, nothing goes.
+			expect(
+				fixture(RESERVE_MSAT + cost(0) - 1n).canOfferHtlcSet([1_000_000n])
+			).to.equal(false);
 		});
-
 		it('folds into the outbound ceiling: unchanged, trimmed-only, or zero', function () {
+			// Unchanged while the funder can carry one more untrimmed add plus
+			// the slot (cost(2) with nothing in flight); the largest trimmed
+			// amount while it can carry the set it has (cost(0)); zero below.
 			const own = fixture(RESERVE_MSAT + cost(2));
 			const unchanged = own.getSpendableOutboundMsat();
 			expect(unchanged > RECEIVED_TRIM_SATS * 1000n).to.equal(true);
+			for (const remoteMsat of [
+				RESERVE_MSAT + cost(2) - 1n,
+				RESERVE_MSAT + cost(1),
+				RESERVE_MSAT + cost(0)
+			]) {
+				expect(fixture(remoteMsat).getSpendableOutboundMsat()).to.equal(
+					RECEIVED_TRIM_SATS * 1000n - 1n
+				);
+			}
 			expect(
-				fixture(RESERVE_MSAT + cost(2) - 1n).getSpendableOutboundMsat()
-			).to.equal(RECEIVED_TRIM_SATS * 1000n - 1n);
-			expect(
-				fixture(RESERVE_MSAT + cost(1)).getSpendableOutboundMsat()
-			).to.equal(RECEIVED_TRIM_SATS * 1000n - 1n);
-			expect(
-				fixture(RESERVE_MSAT + cost(1) - 1n).getSpendableOutboundMsat()
+				fixture(RESERVE_MSAT + cost(0) - 1n).getSpendableOutboundMsat()
 			).to.equal(0n);
 		});
-
 		it('binds on the pending-splice view from the persisted record after a restart', function () {
 			// The funder spliced 490,000 sats out; no in-memory session (a
 			// restart), only the record. Its pending balance is the remainder
@@ -1027,15 +1176,290 @@ describe('Funder commitment fee on an inbound add (issue #1020)', function () {
 		});
 	});
 
+	describe('the sign-time backstop: never sign or accept a commitment whose fee trimmed our output', function () {
+		it('verify path (T1): adds admitted at the old rate, then the raise promotes and the peer signs at the new one', function () {
+			// We raised 2,500 -> 10,000; the peer withheld its revoke_and_ack
+			// and stacked 14 adds of 20,000 sats, each admitted outright at the
+			// old rate (its own view priced them there). Its revoke_and_ack has
+			// now promoted the rate: at 10,000 the fee on 14 outputs is 31,320
+			// sats against our 28,240, so the commitment its next
+			// commitment_signed covers has no to_local. Refused before any
+			// verification, before any state moves.
+			const adds: IFixtureHtlc[] = [];
+			for (let i = 0; i < 14; i++) {
+				adds.push({
+					amountMsat: 20_000_000n,
+					direction: HtlcDirection.RECEIVED,
+					state: HtlcState.PENDING,
+					addLocallyRevoked: false
+				});
+			}
+			const channel = makeChannel({
+				localFeeratePerKw: 10_000,
+				lastSignedCommitFeeratePerKw: 2_500,
+				localMsat: 28_240_000n,
+				htlcs: adds
+			});
+			expect(funderCommitmentCostSats(10_000, 14, null)).to.equal(31_320n);
+			expect(
+				heldCommitment(channel).toLocalSats,
+				'the next commitment'
+			).to.equal(null);
+			const actions = channel.handleCommitmentSigned(commitSigMsg(channel));
+			expectWireFailure(actions, channel.getChannelId()!, TRIM_WIRE);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+			// The commitment we hold, at the rate its signature was made at,
+			// still carries our output: 28,240 - 7,830 = 20,410 sats.
+			const held = heldSignedCommitment(channel);
+			expect(held.htlcOutputs).to.equal(14);
+			expect(held.toLocalSats).to.equal(20_410);
+		});
+
+		it('verify path: at the old rate the same state passes the backstop', function () {
+			const adds: IFixtureHtlc[] = [];
+			for (let i = 0; i < 14; i++) {
+				adds.push({
+					amountMsat: 20_000_000n,
+					direction: HtlcDirection.RECEIVED,
+					state: HtlcState.PENDING,
+					addLocallyRevoked: false
+				});
+			}
+			const channel = makeChannel({ localMsat: 28_240_000n, htlcs: adds });
+			// No signer in the fixture: the handler stops at its own local
+			// invariant, never at the backstop.
+			const err = errorOf(
+				channel.handleCommitmentSigned(commitSigMsg(channel))
+			);
+			expect(err).to.not.equal(null);
+			expect(err).to.not.match(TRIM_WIRE);
+			expect(channel.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('sign path (T2): our own add plus the adds it let through would trim our to_remote', function () {
+			// Our 15,000-sat add not yet revoked for by the peer, live balance at
+			// reserve plus our own send buffer (cost(2) at twice the rate =
+			// 15,340 sats), 43 peer adds admitted outright since our add was
+			// credited back in the sender's view. The commitment we would now
+			// sign for the peer carries all 44: cost(44) = 20,730 sats, our
+			// to_remote gone. Refused before the signature leaves.
+			const stacked: IFixtureHtlc[] = [
+				{
+					amountMsat: 15_000_000n,
+					direction: HtlcDirection.OFFERED,
+					state: HtlcState.PENDING,
+					addRemoteCommitted: false
+				}
+			];
+			for (let i = 0; i < 43; i++) {
+				stacked.push({
+					amountMsat: 20_000_000n,
+					direction: HtlcDirection.RECEIVED
+				});
+			}
+			const channel = makeChannel({
+				localMsat: RESERVE_MSAT + cost(2, null, 5_000),
+				htlcs: stacked
+			});
+			expect(cost(2, null, 5_000)).to.equal(5_340_000n);
+			expect(funderCommitmentCostSats(RATE, 44, null)).to.equal(20_730n);
+			const actions = channel.signCommitment(Buffer.alloc(64), []);
+			expectWireFailure(actions, channel.getChannelId()!, TRIM_WIRE);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+			expect(
+				channel.getFullState().lastSentCommitmentSigned ?? null,
+				'nothing recorded as sent'
+			).to.equal(null);
+			// The commitment we hold excludes our un-revoked add and credits it
+			// back: 43 outputs, to_local 30,340 - 20,300 = 10,040 sats.
+			const held = heldCommitment(channel);
+			expect(held.htlcOutputs).to.equal(43);
+			expect(held.toLocalSats).to.equal(10_040);
+		});
+
+		it('sign path: one add fewer and the signature goes out', function () {
+			const stacked: IFixtureHtlc[] = [
+				{
+					amountMsat: 15_000_000n,
+					direction: HtlcDirection.OFFERED,
+					state: HtlcState.PENDING,
+					addRemoteCommitted: false
+				}
+			];
+			// 32 peer adds: cost(33) = 16,000 sats, to_remote 15,340 - 16,000
+			// is still gone; 30: cost(31) = 15,140, to_remote 200 sats, gone
+			// under dust; 26: cost(27) = 13,420, to_remote 1,920, present.
+			for (let i = 0; i < 26; i++) {
+				stacked.push({
+					amountMsat: 20_000_000n,
+					direction: HtlcDirection.RECEIVED
+				});
+			}
+			const channel = makeChannel({
+				localMsat: RESERVE_MSAT + cost(2, null, 5_000),
+				htlcs: stacked
+			});
+			const actions = channel.signCommitment(Buffer.alloc(64), []);
+			expect(errorOf(actions)).to.equal(null);
+			expect(channel.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('is not asked of an acceptor: the fee never trims its output', function () {
+			const adds: IFixtureHtlc[] = [];
+			for (let i = 0; i < 14; i++) {
+				adds.push({
+					amountMsat: 20_000_000n,
+					direction: HtlcDirection.RECEIVED,
+					state: HtlcState.PENDING,
+					addLocallyRevoked: false
+				});
+			}
+			const channel = makeChannel({
+				role: ChannelRole.ACCEPTOR,
+				remoteFeeratePerKw: 10_000,
+				localMsat: 28_240_000n,
+				htlcs: adds
+			});
+			const err = errorOf(
+				channel.handleCommitmentSigned(commitSigMsg(channel))
+			);
+			expect(err).to.not.match(TRIM_WIRE);
+			expect(channel.getState()).to.equal(ChannelState.NORMAL);
+		});
+	});
+
+	describe('a restart honours the funderFeeFailback stamp', function () {
+		function restoreBasepoints(): IBasepointsForRestore {
+			const keys: Buffer[] = [];
+			for (let i = 0; i < 5; i++) keys.push(crypto.randomBytes(32));
+			return {
+				fundingPubkey: getPublicKey(keys[0]),
+				revocationBasepoint: getPublicKey(keys[1]),
+				paymentBasepoint: getPublicKey(keys[2]),
+				delayedPaymentBasepoint: getPublicKey(keys[3]),
+				htlcBasepoint: getPublicKey(keys[4]),
+				firstPerCommitmentPoint: Buffer.alloc(33)
+			};
+		}
+
+		it('the redispatch fails the HTLC back with temporary_channel_failure, never settles it', function () {
+			// Mirror of the #1050 shape: a stamped, committed and once-dispatched
+			// forward is persisted, the node restarts, and the redispatch reads
+			// the stamp back rather than re-deriving anything.
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const before = createNode('d1020-rs', 6, storage);
+			const peerHex = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 1_000_000n,
+				pushMsat: 0n,
+				localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+				localBasepoints: restoreBasepoints(),
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			const channelId = crypto.randomBytes(32);
+			state.channelId = channelId;
+			state.state = ChannelState.NORMAL;
+
+			const paymentHash = crypto.randomBytes(32);
+			const sessionKey = crypto.randomBytes(32);
+			const hops = [
+				{
+					pubkey: Buffer.from(before.getNodeId(), 'hex'),
+					payload: {
+						amountToForwardMsat: 1_000_000n,
+						outgoingCltvValue: 360,
+						shortChannelId: Buffer.alloc(8, 7)
+					}
+				},
+				{
+					pubkey: getPublicKey(crypto.randomBytes(32)),
+					payload: { amountToForwardMsat: 1_000_000n, outgoingCltvValue: 360 }
+				}
+			];
+			const packet = constructOnionPacket(sessionKey, hops, paymentHash);
+			const { sharedSecrets } = computeSharedSecrets(
+				sessionKey,
+				hops.map((h) => h.pubkey)
+			);
+			state.htlcs.set('received-0', {
+				id: 0n,
+				amountMsat: 1_000_000n,
+				paymentHash,
+				cltvExpiry: 400,
+				onionRoutingPacket: encodeOnionPacket(packet),
+				direction: HtlcDirection.RECEIVED,
+				state: HtlcState.COMMITTED,
+				forwardEmitted: true,
+				funderFeeFailback: true
+			});
+			before.getChannelManager().restoreChannel(new Channel(state), peerHex);
+			(
+				before as unknown as { persistChannel: (id: Buffer) => void }
+			).persistChannel(channelId);
+			expect(storage.loadAllChannels(), 'row persisted').to.have.length(1);
+
+			const after = createNode('d1020-rs', 6, storage);
+			const restored = after.getChannelManager().getChannel(channelId)!;
+			expect(restored, 'channel restored').to.not.equal(undefined);
+			expect(
+				restored.getFullState().htlcs.get('received-0')!.funderFeeFailback,
+				'stamp restored'
+			).to.equal(true);
+			(
+				after as unknown as { currentBlockHeight: number }
+			).currentBlockHeight = 100;
+
+			const reasons: Buffer[] = [];
+			const cm = after.getChannelManager();
+			(cm as unknown as { failHtlc: unknown }).failHtlc = (
+				_c: Buffer,
+				_id: bigint,
+				reason: Buffer
+			): { ok: boolean } => {
+				reasons.push(reason);
+				return { ok: true };
+			};
+			let fulfilled = 0;
+			(cm as unknown as { fulfillHtlc: unknown }).fulfillHtlc = (): {
+				ok: boolean;
+			} => {
+				fulfilled++;
+				return { ok: true };
+			};
+			(
+				after as unknown as {
+					redispatchUnresolvedReceivedHtlcs: (id: Buffer) => void;
+				}
+			).redispatchUnresolvedReceivedHtlcs(channelId);
+
+			expect(fulfilled, 'never settled').to.equal(0);
+			expect(reasons, 'failed back on redispatch').to.have.length(1);
+			const decrypted = decryptFailureMessage([sharedSecrets[0]], reasons[0]);
+			expect(decrypted, 'failure decrypts').to.not.be.null;
+			expect(decrypted!.failure.failureCode).to.equal(
+				TEMPORARY_CHANNEL_FAILURE
+			);
+			expect(restored.getState()).to.not.equal(ChannelState.ERRORED);
+			before.destroy();
+			after.destroy();
+			storage.close?.();
+		});
+	});
+
 	describe('two honest beignet nodes over a loopback wire', function () {
-		this.timeout(30_000);
+		this.timeout(180_000);
 
 		let alice: LightningNode;
 		let bob: LightningNode;
 		let errors: string[];
 
-		function node(seed: number): LightningNode {
-			const n = createNode('funder-fee-1020', seed);
+		function node(
+			seed: number,
+			extra: Parameters<typeof createNode>[3] = {}
+		): LightningNode {
+			const n = createNode('funder-fee-1020', seed, undefined, extra);
 			n.on('node:error', (e: { message?: string }) => {
 				errors.push(e.message ?? '');
 			});
@@ -1193,6 +1617,191 @@ describe('Funder commitment fee on an inbound add (issue #1020)', function () {
 				'no wire refusal at the funder'
 			).to.equal(false);
 			bothNormal(channelId);
+		});
+
+		it('T1 over the wire: adds admitted at the old rate, promoted by a late revoke_and_ack, refused at the verify with our output intact', function () {
+			// Alice trims her own commitment at 1,000 sats, Bob at 354, so a
+			// promoted fee that leaves her between the two keeps her to_remote
+			// on Bob's commitment standing (she signs it) while her to_local on
+			// her own is trimmed: the refusal lands at the verify of Bob's
+			// commitment_signed. Her outbound direction is held from the raise
+			// on, so Bob prices and signs at the old rate until the release
+			// delivers her covering commitment_signed; his adds are legal
+			// crossing traffic.
+			alice.destroy();
+			alice = node(11, {
+				channelConfig: { ...DEFAULT_CHANNEL_CONFIG, dustLimitSatoshis: 1_000n }
+			});
+			let held = false;
+			const queue: { type: number; payload: Buffer }[] = [];
+			alice.on('message:outbound', (pk: string, t: number, p: Buffer) => {
+				if (pk !== bob.getNodeId()) return;
+				if (held && t !== MessageType.UPDATE_FEE) {
+					queue.push({ type: t, payload: Buffer.from(p) });
+					return;
+				}
+				bob.handlePeerMessage(alice.getNodeId(), t, p);
+			});
+			bob.on('message:outbound', (pk: string, t: number, p: Buffer) => {
+				if (pk === alice.getNodeId()) {
+					alice.handlePeerMessage(bob.getNodeId(), t, p);
+				}
+			});
+			const channelId = openReadyChannel(alice, bob);
+			const aliceChannel = alice.getChannelManager().getChannel(channelId)!;
+			const s0 = aliceChannel.getFullState();
+			const reserveMsat = s0.remoteConfig.channelReserveSatoshis * 1000n;
+			// Headroom 3,600 sats: enough to raise tenfold (cost(0) at 2,530 on
+			// the harness's anchor channel is 3,503) and, at the old rate, to
+			// admit dozens of adds. The count is the first whose promoted fee
+			// leaves her output over Bob's dust limit and under hers; the fee
+			// step per HTLC (435 sats at 2,530) is narrower than that window
+			// (646 sats), so one always exists.
+			const drain = s0.localBalanceMsat - reserveMsat - 3_600_000n;
+			const inv = bob.createInvoice({
+				amountMsat: drain,
+				description: 'drain'
+			});
+			expect(
+				alice.getPayment(alice.sendPayment(inv.bolt11).paymentHash)?.status
+			).to.equal(PaymentStatus.COMPLETED);
+			const raised = s0.localConfig.feeratePerKw * 10;
+			// Read after the drain: the state handed out is live.
+			const balanceSats = aliceChannel.getFullState().localBalanceMsat / 1000n;
+			expect(balanceSats).to.equal(
+				s0.remoteConfig.channelReserveSatoshis + 3_600n
+			);
+			const aliceDust = s0.localConfig.dustLimitSatoshis;
+			const bobDust = s0.remoteConfig.dustLimitSatoshis;
+			let adds = 0;
+			for (let k = 1; k <= 60; k++) {
+				const rest =
+					balanceSats - funderCommitmentCostSats(raised, k, s0.channelType);
+				if (rest >= bobDust && rest < aliceDust) {
+					adds = k;
+					break;
+				}
+			}
+			expect(adds > 0, 'a count inside the window').to.equal(true);
+			expect(
+				funderCommitmentCostSats(
+					s0.localConfig.feeratePerKw,
+					adds,
+					s0.channelType
+				) <= 3_600n,
+				'all admitted outright at the old rate'
+			).to.equal(true);
+			held = true;
+			expect(alice.updateChannelFee(channelId, raised).ok).to.equal(true);
+			for (let i = 0; i < adds; i++) {
+				expect(
+					payHold(bob, alice, 20_000_000n, `t1 ${i}`).status,
+					`add ${i}`
+				).to.equal(PaymentStatus.PENDING);
+			}
+			for (const [k, e] of aliceChannel.getFullState().htlcs) {
+				if (k.startsWith('received-')) {
+					expect(
+						aliceChannel.receivedHtlcExceedsFunderFee(e.id),
+						'admitted outright at the old rate'
+					).to.equal(false);
+				}
+			}
+			while (queue.length > 0) {
+				const m = queue.shift()!;
+				bob.handlePeerMessage(alice.getNodeId(), m.type, m.payload);
+			}
+			held = false;
+			expect(
+				errors.some((m) => TRIM_WIRE.test(m)),
+				'refused at the verify'
+			).to.equal(true);
+			expect(aliceChannel.getState()).to.not.equal(ChannelState.NORMAL);
+			const held0 = heldSignedCommitment(aliceChannel);
+			expect(
+				held0.toLocalSats,
+				'the commitment we hold keeps our output'
+			).to.not.equal(null);
+			expect(held0.toLocalSats! >= Number(aliceDust)).to.equal(true);
+		});
+
+		it('T2 over the wire: our own add, the adds it let through, and the revoke_and_ack that brings it in', function () {
+			// Alice at 2,500 sat/kw with 23,000 sats over reserve sends exactly
+			// her ceiling, 15,000, to Bob; her commitment_signed is held so Bob
+			// never revokes for it. Bob stacks adds Alice admits outright (her
+			// un-revoked add is credited back in the sender's view). The
+			// release lets Bob revoke for her add and sign a commitment carrying
+			// all of them: refused at the verify, our output intact on the one
+			// we hold.
+			alice.destroy();
+			alice = node(12, {
+				channelConfig: { ...DEFAULT_CHANNEL_CONFIG, feeratePerKw: 2_500 }
+			});
+			let held = false;
+			const queue: { type: number; payload: Buffer }[] = [];
+			alice.on('message:outbound', (pk: string, t: number, p: Buffer) => {
+				if (pk !== bob.getNodeId()) return;
+				if (held && t !== MessageType.UPDATE_ADD_HTLC) {
+					queue.push({ type: t, payload: Buffer.from(p) });
+					return;
+				}
+				bob.handlePeerMessage(alice.getNodeId(), t, p);
+			});
+			bob.on('message:outbound', (pk: string, t: number, p: Buffer) => {
+				if (pk === alice.getNodeId()) {
+					alice.handlePeerMessage(bob.getNodeId(), t, p);
+				}
+			});
+			const channelId = openReadyChannel(alice, bob);
+			const aliceChannel = alice.getChannelManager().getChannel(channelId)!;
+			const s0 = aliceChannel.getFullState();
+			const reserveMsat = s0.remoteConfig.channelReserveSatoshis * 1000n;
+			const drain = s0.localBalanceMsat - reserveMsat - 23_000_000n;
+			const inv = bob.createInvoice({
+				amountMsat: drain,
+				description: 'drain'
+			});
+			expect(
+				alice.getPayment(alice.sendPayment(inv.bolt11).paymentHash)?.status
+			).to.equal(PaymentStatus.COMPLETED);
+			const ceiling = aliceChannel.getSpendableOutboundMsat();
+			expect(ceiling).to.equal(15_000_000n);
+			held = true;
+			expect(payHold(alice, bob, ceiling, 'ours').status).to.equal(
+				PaymentStatus.PENDING
+			);
+			// 35 adds: at 2,500 on this anchor channel cost(k) = 3,470 + 430k,
+			// so 36 outputs cost 18,950 against her 18,000 sats once her add
+			// counts, while 35 alone (her add credited back) fit the 23,000 the
+			// sender's view holds.
+			for (let i = 0; i < 35; i++) {
+				expect(
+					payHold(bob, alice, 20_000_000n, `t2 ${i}`).status,
+					`add ${i}`
+				).to.equal(PaymentStatus.PENDING);
+			}
+			for (const [k, e] of aliceChannel.getFullState().htlcs) {
+				if (k.startsWith('received-')) {
+					expect(aliceChannel.receivedHtlcExceedsFunderFee(e.id)).to.equal(
+						false
+					);
+				}
+			}
+			while (queue.length > 0) {
+				const m = queue.shift()!;
+				bob.handlePeerMessage(alice.getNodeId(), m.type, m.payload);
+			}
+			held = false;
+			expect(
+				errors.some((m) => TRIM_WIRE.test(m)),
+				'refused'
+			).to.equal(true);
+			expect(aliceChannel.getState()).to.not.equal(ChannelState.NORMAL);
+			const held0 = heldSignedCommitment(aliceChannel);
+			expect(
+				held0.toLocalSats,
+				'the commitment we hold keeps our output'
+			).to.not.equal(null);
 		});
 
 		it('a peer without the mirror lands in the band: failed back after commit, channel kept', function () {
