@@ -715,7 +715,13 @@ and the message says to lower `maxFeeSats` or the amount. `sendToRoute` and
 carries, which is the amount plus every fee in the route, with no cap on top.
 `validatePayment(bolt11, amountSats?, maxFeeSats?)` previews the same
 judgement for a BOLT 11 payment; `estimatePayment` and `estimateRouteFee`
-preview the amount.
+preview the amount. A settlement that lands while the process is down is
+charged by the boot reconciliation at the same figure as a live one: the
+amount plus the fee the record says was paid, or the reservation when no
+record can say. Excluded by design: the submarine swap provider's payment of
+the counterparty's invoice runs outside `maxPaymentSats`, the daily limit and
+the ledger; the provider's own per-swap fee cap and the swap-in it is funded
+from bound it.
 
 The ledger is persisted (issue #977): a restart within the UTC day resumes
 the day's total, and the budget a payment still holds while its HTLC is out
@@ -2140,7 +2146,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/invoices/held` | -- | List hold invoices with state + parked totals. Each row also carries `minFinalCltvExpiry` (the delta the invoice advertised and the final hop enforces on every arriving HTLC) and the realised expiry of the parked set: `earliestExpiry`, `cancelMarginBlocks` and `cancelHeight` (null before any part is committed). A swap provider checks `earliestExpiry` against its on-chain refund timeout before funding instead of trusting the advertised delta |
 | POST | `/invoice/decode` | `{ bolt11 }` | Decode invoice |
 | POST | `/invoice/pay` | `{ bolt11, timeoutMs?, maxFeeSats?, maxFeeMsat?, amountSats?, metadata?, cltvLimit? }` | Pay invoice (`amountSats` for amount-less invoices, `metadata` for labels). Without `maxFeeSats`/`maxFeeMsat` the routing fee is capped at 1% of the amount, never below 50 sats; `maxPaymentSats` and the daily limit count the amount plus the cap (403 `SPENDING_LIMIT_EXCEEDED`, the message says whether to lower `maxFeeSats` or the amount). `cltvLimit` bounds the payment's total CLTV expiry in blocks above the current tip; no route under it answers `409 CLTV_EXCEEDS_MAX` with nothing sent, and a node without a tip yet answers `503 CHAIN_NOT_SYNCED`. |
-| POST | `/invoice/pay-safe` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay invoice; resolves with `status: 'FAILED'` on failure instead of error. |
+| POST | `/invoice/pay-safe` | `{ bolt11, timeoutMs?, maxFeeSats?, maxFeeMsat?, amountSats?, metadata?, cltvLimit? }` | Pay invoice; resolves with `status: 'FAILED'` on failure instead of error. Same fee cap and limits as `/invoice/pay`; a limit refusal is reported in `failureDescription`. |
 | POST | `/invoice/pay-retry` | `{ bolt11, maxRetries?, backoffMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay with exponential backoff retry. Returns `RetryPaymentResult` with `attempts`. |
 | POST | `/invoice/pay-async` | `{ bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Fire-and-forget pay; returns `{ paymentHash, status }` immediately. Poll `GET /payment` for settlement. Answers 409 while draining and 403 over a spending limit. A refusal carries the same code and status as `/invoice/pay`: 409 `DUPLICATE_PAYMENT` for a hash already paid or still in flight, 502 `NO_ROUTE`, 400 `INVALID_INVOICE`, and so on, never a bare 502 `PAYMENT_FAILED` (issue #991). |
 | POST | `/payment/cancel` | `{ paymentHash }` | Cancel a pending outbound payment (marks as FAILED) |

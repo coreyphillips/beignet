@@ -457,8 +457,11 @@ export interface BeignetNodeOptions {
 	 * at admission and is charged its amount plus the fee actually paid when
 	 * it settles (issue #1008); sendToRoute reserves and charges what its
 	 * first hop carries. Excluded by design: consolidateUtxos (self-pay), our
-	 * own channel opens/splices/funding, and bumpFeeOnchain/boostOnchain
-	 * (fee-only). Resets at midnight UTC.
+	 * own channel opens/splices/funding, bumpFeeOnchain/boostOnchain
+	 * (fee-only), and the submarine swap provider's payment of the
+	 * counterparty's invoice, which is bounded by the provider's own per-swap
+	 * fee cap and by the swap-in it is funded from rather than by this
+	 * limit. Resets at midnight UTC.
 	 * NOTE: before v0.3.0 this limit covered Lightning only.
 	 */
 	dailySpendLimitSats?: number;
@@ -468,6 +471,9 @@ export interface BeignetNodeOptions {
 	 * amount plus routing-fee cap exceeds this (issue #1008): the cap is the
 	 * caller's maxFeeSats/maxFeeMsat, or the default of 1% of the amount with
 	 * a 50 sat floor when none is given. Prevents accidental large payments.
+	 * The submarine swap provider's payment of the counterparty's invoice is
+	 * excluded by design: the provider's own per-swap fee cap and the swap-in
+	 * it is funded from bound it.
 	 */
 	maxPaymentSats?: number;
 	/** Timeout for connectPeer() in milliseconds (default: 15000) */
@@ -9699,8 +9705,10 @@ export class BeignetNode extends EventEmitter {
 	 *   in the durable row, or a preimage is known): the hash's claims come
 	 *   back without their reservations, since nothing can settle under them
 	 *   any more, and one claim not yet marked settled is charged now, as the
-	 *   payment:sent handler would have, the rest being marked settled so
-	 *   that no later boot charges the same settlement again;
+	 *   payment:sent handler would have and at the same figure (the amount
+	 *   plus the fee the record says was paid, the reservation when it cannot
+	 *   say; issue #1008), the rest being marked settled so that no later
+	 *   boot charges the same settlement again;
 	 * - the record is FAILED or gone and no HTLC is in flight for the hash:
 	 *   nothing can settle under the claim any more, so it is dropped and
 	 *   its reservation is not restored;
@@ -9811,9 +9819,14 @@ export class BeignetNode extends EventEmitter {
 			}
 		}
 		// Only once every claim is back, so each charge writes the whole
-		// ledger.
+		// ledger. Charged at what the record says left the node, as a live
+		// settle is; the reservation (amount plus fee cap) only when no record
+		// can say (issue #1008).
 		for (const paymentHashHex of toCharge) {
-			this._chargeAsyncSpendClaim(paymentHashHex);
+			const record = this._settledRecordAtBoot(paymentHashHex);
+			this._chargeAsyncSpendClaim(paymentHashHex, {
+				actualSats: record ? sentSats(record) : undefined
+			});
 			charged++;
 		}
 		this._expireAsyncSpendClaims(false);
@@ -9826,6 +9839,24 @@ export class BeignetNode extends EventEmitter {
 				settledWhileDown: charged,
 				claimsDropped: dropped
 			});
+		}
+	}
+
+	/**
+	 * The record of a hash the boot reconciliation is about to charge, for
+	 * the figure to charge it at: the in-memory record when the engine still
+	 * holds one, else the durable row. Undefined when neither can be read,
+	 * which charges the reservation (issue #1008).
+	 */
+	private _settledRecordAtBoot(
+		paymentHashHex: string
+	): IPaymentInfo | undefined {
+		const inMemory = this.node.getPayment(Buffer.from(paymentHashHex, 'hex'));
+		if (inMemory) return inMemory;
+		try {
+			return this.storage.loadPayment(paymentHashHex) ?? undefined;
+		} catch {
+			return undefined;
 		}
 	}
 

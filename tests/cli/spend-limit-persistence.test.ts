@@ -537,6 +537,33 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 	});
 
 	describe('boot reconciliation of the stored claims', () => {
+		it('charges a settlement that landed while down at the amount plus the fee paid, not at the reservation (#1008)', async () => {
+			const invoice = invoiceFrom(1_000, 'settled while down, with a fee');
+			stubSendPayment(node);
+			// The default cap: 1 000 sats plus the 50 sat floor is reserved.
+			expect(node.sendPaymentAsync(invoice.bolt11).status).to.equal('PENDING');
+			expect(pending(node)).to.equal(1_050);
+
+			// The route cost 20 sats of the 50 allowed: the record the engine
+			// persisted carries the first-hop amount, fees included.
+			engineOf(node).payments.get(invoice.hashHex)!.amountMsat = 1_020_000n;
+			persistRecord(node, invoice.paymentHash, PaymentStatus.COMPLETED);
+
+			await restart();
+			// The boot charge used to take the reservation, 1 050, where a
+			// live settle of the same record charges 1 020.
+			expect(spent(node)).to.equal(1_020);
+			expect(node.getDailySpendInfo().lightningSats).to.equal(1_020);
+			expect(pending(node)).to.equal(0);
+			expect(claimedSats(node, invoice.hashHex)).to.equal(0);
+			expect(internals(node)._asyncSpendClaims.size).to.equal(0);
+			expect(storedLedger(node)?.totalSats).to.equal(1_020);
+
+			await restart();
+			expect(spent(node)).to.equal(1_020);
+			expect(pending(node)).to.equal(0);
+		});
+
 		it('charges a claim whose payment completed while the process was down, and drops one whose payment failed with nothing out', async () => {
 			const completed = invoiceFrom(1_000, 'completed while down');
 			const failed = invoiceFrom(2_000, 'failed while down');

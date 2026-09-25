@@ -508,6 +508,48 @@ describe('amount plus fee cap at admission, amount plus fee at settlement (#1008
 		expect(spent()).to.equal(1_020);
 	});
 
+	it('charges a keysend settled inside the send once, at the amount plus the fee paid, under the default cap', async () => {
+		// The engine picks the keysend's hash, so the claim sits under a
+		// provisional key while the send runs: a settlement reported inside
+		// the call reaches the handler in create() before the claim carries
+		// the hash, and the send charges it afterwards at what the record
+		// says left the node.
+		const paymentHash = crypto.randomBytes(32);
+		const engine = internals(node).node;
+		engine.sendKeysend = (): unknown => {
+			const record = {
+				paymentHash,
+				amountMsat: 1_020_000n,
+				status: 'COMPLETED',
+				direction: 'OUTGOING',
+				createdAt: Date.now(),
+				completedAt: Date.now(),
+				route: {
+					hops: [],
+					totalAmountMsat: 1_020_000n,
+					totalFeeMsat: 20_000n,
+					totalCltvDelta: 40
+				}
+			};
+			engine.emit('payment:sent', record);
+			return record;
+		};
+
+		const info = await node.sendKeysend(PUBKEY, 1_000);
+		expect(info.status).to.equal('COMPLETED');
+		expect(info.feeSats).to.equal(20);
+		// 1 000 plus the 50 sat floor was reserved; 1 020 left the node.
+		expect(spent()).to.equal(1_020);
+		expect(node.getDailySpendInfo().lightningSats).to.equal(1_020);
+		expect(pending()).to.equal(0);
+		expect(internals(node)._asyncSpendClaims.size).to.equal(0);
+
+		// A repeat of the report finds nothing left to charge.
+		settle(node, paymentHash.toString('hex'), { amountMsat: 1_020_000n });
+		expect(spent()).to.equal(1_020);
+		expect(pending()).to.equal(0);
+	});
+
 	it('charges sentMsat over amountMsat when the record carries it', () => {
 		recordCaps(node);
 		const { paymentHash } = node.sendPaymentAsync(invoice(1_000, 'mpp'), 100);
