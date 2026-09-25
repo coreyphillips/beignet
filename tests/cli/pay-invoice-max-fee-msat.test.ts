@@ -136,11 +136,12 @@ describe('payInvoice exact fee cap (#998)', function () {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	});
 
-	it('still hands the engine maxFeeSats in msat', async () => {
+	it('still hands the engine maxFeeSats in msat, and the default floor with none', async () => {
 		const caps = recordFeeCaps(node);
 		await node.payInvoice(invoice('sats cap'), 5_000, 11);
 		await node.payInvoice(invoice('no cap'), 5_000);
-		expect(caps).to.deep.equal([11_000n, undefined]);
+		// A 1 000 sat invoice: 1% is 10 sats, so the 50 sat floor applies (#1008).
+		expect(caps).to.deep.equal([11_000n, 50_000n]);
 	});
 
 	it('hands the engine an exact maxFeeMsat, as a number or a string', async () => {

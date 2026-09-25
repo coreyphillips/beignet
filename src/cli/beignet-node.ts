@@ -450,15 +450,31 @@ export interface BeignetNodeOptions {
 	backupIntervalMs?: number;
 	/**
 	 * COMBINED daily spending limit in satoshis, shared by Lightning payments
-	 * (payInvoice/sendKeysend/sendPaymentAsync) AND external on-chain sends
-	 * (sendOnchain and sendMaxOnchain, address-targeted spliceOut and
-	 * sendDirectFunding, counted as amount + fee). Excluded by design:
-	 * consolidateUtxos (self-pay), our own channel opens/splices/funding, and
-	 * bumpFeeOnchain/boostOnchain (fee-only). Resets at midnight UTC.
+	 * (payInvoice, sendPaymentAsync, sendKeysend, payOffer, sendToRoute and
+	 * the queue) AND external on-chain sends (sendOnchain and sendMaxOnchain,
+	 * address-targeted spliceOut and sendDirectFunding, counted as amount +
+	 * fee). A Lightning payment reserves its amount plus its routing-fee cap
+	 * at admission and is charged its amount plus the fee actually paid when
+	 * it settles (issue #1008); sendToRoute reserves and charges what its
+	 * first hop carries. Excluded by design: consolidateUtxos (self-pay), our
+	 * own channel opens/splices/funding, bumpFeeOnchain/boostOnchain
+	 * (fee-only), and the submarine swap provider's payment of the
+	 * counterparty's invoice, which is bounded by the provider's own per-swap
+	 * fee cap and by the swap-in it is funded from rather than by this
+	 * limit. Resets at midnight UTC.
 	 * NOTE: before v0.3.0 this limit covered Lightning only.
 	 */
 	dailySpendLimitSats?: number;
-	/** Maximum amount in satoshis for a single payment. Rejects any payInvoice/sendKeysend/sendPaymentAsync call exceeding this. Prevents accidental large payments. */
+	/**
+	 * Maximum amount in satoshis for a single payment. Rejects any
+	 * payInvoice/sendPaymentAsync/sendKeysend/payOffer/sendToRoute call whose
+	 * amount plus routing-fee cap exceeds this (issue #1008): the cap is the
+	 * caller's maxFeeSats/maxFeeMsat, or the default of 1% of the amount with
+	 * a 50 sat floor when none is given. Prevents accidental large payments.
+	 * The submarine swap provider's payment of the counterparty's invoice is
+	 * excluded by design: the provider's own per-swap fee cap and the swap-in
+	 * it is funded from bound it.
+	 */
 	maxPaymentSats?: number;
 	/** Timeout for connectPeer() in milliseconds (default: 15000) */
 	connectTimeoutMs?: number;
@@ -870,6 +886,44 @@ export function paymentSpendSats(
 }
 
 /**
+ * What a Lightning payment has to be admitted for, in sats: the amount that
+ * will be paid plus the routing-fee cap the send carries, rounded up together
+ * (issue #1008). The fee is money that leaves the node exactly as the amount
+ * is, and a cap that both limits never saw let a hostile route hint charge a
+ * 4.29M sat fee on a 1 sat invoice. Zero means there is nothing to admit: an
+ * amountless invoice with no usable override, which the engine refuses.
+ */
+export function paymentAdmissionSats(
+	payAmountMsat: bigint | undefined,
+	maxFeeMsat: bigint
+): number {
+	if (payAmountMsat === undefined || payAmountMsat <= 0n) return 0;
+	return spendLimitSats(payAmountMsat + maxFeeMsat);
+}
+
+/**
+ * What a settled payment actually cost, in sats, for the ledger to charge in
+ * place of the reservation (issue #1008); undefined when the record cannot
+ * say, in which case the reservation (amount plus fee cap) stands.
+ *
+ * A single-path, keysend or BOLT 12 record carries the first-hop amount, fees
+ * included, in amountMsat. An MPP record carries the invoice amount there and
+ * the sum of its parts' first-hop amounts in sentMsat. An MPP record written
+ * before sentMsat existed shows as a route (its first part) whose total
+ * differs from the amount, and nothing in it says what the other parts cost.
+ */
+function sentSats(info: IPaymentInfo): number | undefined {
+	if (info.sentMsat !== undefined) return spendLimitSats(info.sentMsat);
+	if (
+		info.route?.totalAmountMsat !== undefined &&
+		info.route.totalAmountMsat !== info.amountMsat
+	) {
+		return undefined;
+	}
+	return spendLimitSats(info.amountMsat);
+}
+
+/**
  * Decode a user-supplied BOLT 12 offer string. Same contract as
  * decodeInvoiceInput: parse failures become a typed INVALID_OFFER (400).
  */
@@ -1008,6 +1062,14 @@ export function jsonToRouteHops(hops: RouteHop[]): Array<{
 				`Route hop ${idx}: amountToForwardMsat must be a decimal string`
 			);
 		}
+		// BigInt('-1') parses. A negative first hop would have reached the
+		// spend accounting as a credit (issue #1017).
+		if (amountToForwardMsat < 0n) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				`Route hop ${idx}: amountToForwardMsat must not be negative`
+			);
+		}
 		if (
 			typeof hop.outgoingCltvValue !== 'number' ||
 			!Number.isInteger(hop.outgoingCltvValue) ||
@@ -1032,9 +1094,10 @@ const GRAPH_DESCRIBE_MAX_LIMIT = 500;
 
 /**
  * One dispatched Lightning payment attempt's claim on the daily budget,
- * whichever path sent it: payInvoice, sendKeysend, payOffer and
- * sendPaymentAsync all open one at admission, and the payment:sent handler
- * in create() charges it when the payment settles (issue #977).
+ * whichever path sent it: payInvoice, sendKeysend, payOffer,
+ * sendPaymentAsync and sendToRoute all open one at admission, and the
+ * payment:sent handler in create() charges it when the payment settles
+ * (issue #977).
  *
  * A claim has two lifetimes. Its RESERVATION holds `sats` in
  * _pendingSpendSats so nothing else is admitted against capacity this attempt
@@ -1044,6 +1107,12 @@ const GRAPH_DESCRIBE_MAX_LIMIT = 500;
  * charged to the day it lands on.
  */
 export interface AsyncSpendClaim {
+	/**
+	 * The amount plus the routing-fee cap the attempt was admitted for
+	 * (issue #1008); for sendToRoute, what its first hop carries. The
+	 * settlement charges what was actually sent when the record says, and
+	 * this otherwise.
+	 */
 	sats: number;
 	/** Epoch ms at which the reservation lapses (see the TTL below). */
 	expiresAt: number;
@@ -1245,11 +1314,32 @@ function requireMsatValue(value: number | string, field: string): bigint {
 }
 
 /**
- * A payment's fee cap in msat, from whole sats or from an exact msat figure.
- * Both at once is refused rather than reconciled: a caller that sent two caps
- * has a bug, and silently picking one would hide it (issue #998).
+ * The routing-fee cap a payment carries when its caller passes none (issue
+ * #1008): 1% of the amount, rounded up to the msat, and never below 50 sats
+ * so that small payments still route. Before this the pay paths handed the
+ * engine no cap at all, and a route hint carrying a u32 fee_base_msat of
+ * 0xffffffff routed a 4.29M sat fee that neither spending limit ever saw.
+ *
+ * The default lives here and not in the engine: LightningNode keeps
+ * `undefined` as uncapped for library callers.
  */
-function resolveMaxFeeMsat(
+export const DEFAULT_MAX_FEE_PPM = 10_000;
+export const DEFAULT_MAX_FEE_FLOOR_SATS = 50;
+
+export function defaultMaxFeeMsat(amountMsat: bigint): bigint {
+	const proportional =
+		(amountMsat * BigInt(DEFAULT_MAX_FEE_PPM) + 999_999n) / 1_000_000n;
+	const floor = BigInt(DEFAULT_MAX_FEE_FLOOR_SATS) * 1000n;
+	return proportional > floor ? proportional : floor;
+}
+
+/**
+ * The caller's fee cap in msat, from whole sats or from an exact msat figure,
+ * or undefined when the caller gave none. Both at once is refused rather than
+ * reconciled: a caller that sent two caps has a bug, and silently picking one
+ * would hide it (issue #998).
+ */
+function explicitMaxFeeMsat(
 	maxFeeSats: number | undefined,
 	maxFeeMsat: number | string | undefined
 ): bigint | undefined {
@@ -1267,6 +1357,24 @@ function resolveMaxFeeMsat(
 		);
 	}
 	return undefined;
+}
+
+/**
+ * The fee cap a payment of `amountMsat` is sent under: the caller's when one
+ * was given, else the default for that amount (issue #1008). Never undefined,
+ * so no pay path can reach the engine uncapped by omission. With no amount to
+ * size it (an amountless invoice with no override, which the engine refuses)
+ * the default is its floor.
+ */
+function resolveMaxFeeMsat(
+	maxFeeSats: number | undefined,
+	maxFeeMsat: number | string | undefined,
+	amountMsat: bigint | undefined
+): bigint {
+	return (
+		explicitMaxFeeMsat(maxFeeSats, maxFeeMsat) ??
+		defaultMaxFeeMsat(amountMsat ?? 0n)
+	);
 }
 
 /** A fee rate may be fractional, but it must be a real, positive, finite number. */
@@ -2814,8 +2922,12 @@ export class BeignetNode extends EventEmitter {
 			// and this handler is registered before any of their listeners, so
 			// the spend is counted before a blocking caller resolves, and
 			// before the forward, so a subscriber reading the daily spend from
-			// this event sees the settled payment already counted.
-			this._chargeAsyncSpendClaim(pi.paymentHash);
+			// this event sees the settled payment already counted. Charged at
+			// what actually left the node, fees included, where the record
+			// says; the reservation (amount plus fee cap) otherwise (#1008).
+			this._chargeAsyncSpendClaim(pi.paymentHash, {
+				actualSats: sentSats(info)
+			});
 			this.log('info', 'Payment sent', {
 				paymentHash: pi.paymentHash,
 				amountSats: pi.amountSats,
@@ -9186,7 +9298,13 @@ export class BeignetNode extends EventEmitter {
 		}
 	}
 
-	private _checkSpendLimit(amountSats: number): void {
+	/**
+	 * The daily limit, judged on `spendSats`: what the request can cost in
+	 * full, which for a Lightning payment is its amount plus its fee cap
+	 * (issue #1008). `amountSats` is the amount alone, so the refusal can say
+	 * how much of the request is the fee allowance.
+	 */
+	private _checkSpendLimit(spendSats: number, amountSats = spendSats): void {
 		if (this._dailySpendLimitSats === undefined) return;
 		this._resetDailySpendIfNeeded();
 		// An async payment holds its claim past its own failure report, so the
@@ -9194,16 +9312,28 @@ export class BeignetNode extends EventEmitter {
 		// budget for good.
 		this._expireAsyncSpendClaims();
 		const effectiveSpent = this._dailySpentSats + this._pendingSpendSats;
-		if (effectiveSpent + amountSats > this._dailySpendLimitSats) {
+		if (effectiveSpent + spendSats > this._dailySpendLimitSats) {
 			const remaining = Math.max(0, this._dailySpendLimitSats - effectiveSpent);
+			const requested =
+				spendSats > amountSats
+					? `${spendSats} sats (${amountSats} sats plus up to ${
+							spendSats - amountSats
+					  } sats in routing fees; lower maxFeeSats or the amount)`
+					: `${spendSats} sats`;
 			throw new BeignetError(
 				'SPENDING_LIMIT_EXCEEDED',
-				`Daily spend limit exceeded. Limit: ${this._dailySpendLimitSats} sats, spent: ${this._dailySpentSats} sats, remaining: ${remaining} sats, requested: ${amountSats} sats`
+				`Daily spend limit exceeded. Limit: ${this._dailySpendLimitSats} sats, spent: ${this._dailySpentSats} sats, remaining: ${remaining} sats, requested: ${requested}`
 			);
 		}
 	}
 
-	private _checkMaxPayment(amountSats: number): void {
+	/**
+	 * The per-payment limit, judged on `spendSats` (amount plus fee cap, issue
+	 * #1008). An amount that is over the limit on its own is refused in the
+	 * words it always was; one that only crosses it with its fee cap is told
+	 * which of the two to lower.
+	 */
+	private _checkMaxPayment(spendSats: number, amountSats = spendSats): void {
 		if (this._maxPaymentSats === undefined) return;
 		if (amountSats > this._maxPaymentSats) {
 			throw new BeignetError(
@@ -9211,6 +9341,38 @@ export class BeignetNode extends EventEmitter {
 				`Payment amount ${amountSats} sats exceeds per-payment limit of ${this._maxPaymentSats} sats`
 			);
 		}
+		if (spendSats > this._maxPaymentSats) {
+			throw new BeignetError(
+				'SPENDING_LIMIT_EXCEEDED',
+				`Payment amount ${amountSats} sats plus up to ${
+					spendSats - amountSats
+				} sats in routing fees exceeds per-payment limit of ${
+					this._maxPaymentSats
+				} sats; lower maxFeeSats or the amount`
+			);
+		}
+	}
+
+	/**
+	 * The admission every Lightning pay path runs once its arguments are
+	 * converted (issue #1008): the per-payment and daily limits judged on the
+	 * amount plus the fee cap, and a claim reserving that sum for the
+	 * in-flight window. Returns the claim, or undefined when there is nothing
+	 * to admit (no amount) or no daily limit is configured. Callers convert
+	 * and validate BEFORE this, since a refusal thrown after the claim would
+	 * strand the reservation (issue #474).
+	 */
+	private _admitLightningSpend(
+		claimKey: string,
+		payAmountMsat: bigint | undefined,
+		maxFeeMsat: bigint
+	): AsyncSpendClaim | undefined {
+		const spendSats = paymentAdmissionSats(payAmountMsat, maxFeeMsat);
+		if (spendSats === 0) return undefined;
+		const amountSats = spendLimitSats(payAmountMsat ?? 0n);
+		this._checkMaxPayment(spendSats, amountSats);
+		this._checkSpendLimit(spendSats, amountSats);
+		return this._openAsyncSpendClaim(claimKey, spendSats);
 	}
 
 	private _recordSpend(
@@ -9383,11 +9545,18 @@ export class BeignetNode extends EventEmitter {
 	 * is the day that has to carry it. A claim not yet marked settled is
 	 * preferred at each step, so a boot charge lands on the attempt it
 	 * belongs to.
+	 *
+	 * With `actualSats`, the day is charged that, what actually left the
+	 * node, rather than the claim's reservation of amount plus fee cap
+	 * (issue #1008). An actual above the reservation is charged in full and
+	 * logged: it is what a claim persisted by a version that reserved the
+	 * amount alone looks like once its payment settles with a fee.
 	 */
 	private _chargeAsyncSpendClaim(
 		paymentHashHex: string,
-		claim?: AsyncSpendClaim
+		opts: { claim?: AsyncSpendClaim; actualSats?: number } = {}
 	): void {
+		const { claim, actualSats } = opts;
 		this._expireAsyncSpendClaims();
 		const claims = this._asyncSpendClaims.get(paymentHashHex);
 		if (!claims || claims.length === 0) return;
@@ -9413,7 +9582,18 @@ export class BeignetNode extends EventEmitter {
 		// _checkSpendLimit never sees the same sats counted twice. The record
 		// is the one write for all of it.
 		this._releaseClaimReservation(charged);
-		this._recordSpend(charged.sats);
+		if (actualSats !== undefined && actualSats > charged.sats) {
+			this.log(
+				'warn',
+				'Payment settled above its reservation; charged in full',
+				{
+					paymentHash: paymentHashHex,
+					reservedSats: charged.sats,
+					sentSats: actualSats
+				}
+			);
+		}
+		this._recordSpend(actualSats ?? charged.sats);
 	}
 
 	/**
@@ -9525,8 +9705,10 @@ export class BeignetNode extends EventEmitter {
 	 *   in the durable row, or a preimage is known): the hash's claims come
 	 *   back without their reservations, since nothing can settle under them
 	 *   any more, and one claim not yet marked settled is charged now, as the
-	 *   payment:sent handler would have, the rest being marked settled so
-	 *   that no later boot charges the same settlement again;
+	 *   payment:sent handler would have and at the same figure (the amount
+	 *   plus the fee the record says was paid, the reservation when it cannot
+	 *   say; issue #1008), the rest being marked settled so that no later
+	 *   boot charges the same settlement again;
 	 * - the record is FAILED or gone and no HTLC is in flight for the hash:
 	 *   nothing can settle under the claim any more, so it is dropped and
 	 *   its reservation is not restored;
@@ -9637,9 +9819,14 @@ export class BeignetNode extends EventEmitter {
 			}
 		}
 		// Only once every claim is back, so each charge writes the whole
-		// ledger.
+		// ledger. Charged at what the record says left the node, as a live
+		// settle is; the reservation (amount plus fee cap) only when no record
+		// can say (issue #1008).
 		for (const paymentHashHex of toCharge) {
-			this._chargeAsyncSpendClaim(paymentHashHex);
+			const record = this._settledRecordAtBoot(paymentHashHex);
+			this._chargeAsyncSpendClaim(paymentHashHex, {
+				actualSats: record ? sentSats(record) : undefined
+			});
 			charged++;
 		}
 		this._expireAsyncSpendClaims(false);
@@ -9652,6 +9839,24 @@ export class BeignetNode extends EventEmitter {
 				settledWhileDown: charged,
 				claimsDropped: dropped
 			});
+		}
+	}
+
+	/**
+	 * The record of a hash the boot reconciliation is about to charge, for
+	 * the figure to charge it at: the in-memory record when the engine still
+	 * holds one, else the durable row. Undefined when neither can be read,
+	 * which charges the reservation (issue #1008).
+	 */
+	private _settledRecordAtBoot(
+		paymentHashHex: string
+	): IPaymentInfo | undefined {
+		const inMemory = this.node.getPayment(Buffer.from(paymentHashHex, 'hex'));
+		if (inMemory) return inMemory;
+		try {
+			return this.storage.loadPayment(paymentHashHex) ?? undefined;
+		} catch {
+			return undefined;
 		}
 	}
 
@@ -9795,12 +10000,22 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── Payment Validation ───────────────
 
 	/**
-	 * Pre-flight validation: checks whether a payment is likely to succeed.
-	 * Combines invoice decoding, amount limits, spending limits, channel capacity,
-	 * invoice expiry, and route availability into a single structured response.
-	 * Never throws — always returns a PaymentValidation result.
+	 * Pre-flight validation: checks whether a BOLT 11 payment is likely to
+	 * succeed. Combines invoice decoding, amount limits, spending limits,
+	 * channel capacity, invoice expiry, and route availability into a single
+	 * structured response. Never throws: it always returns a
+	 * PaymentValidation result.
+	 *
+	 * The limit checks are judged as payInvoice judges them (issue #1008): on
+	 * the amount plus the routing-fee cap, `maxFeeSats` when given and the
+	 * default for the amount otherwise. Previews BOLT 11 payments only; it
+	 * says nothing about keysend, offers or sendToRoute.
 	 */
-	validatePayment(bolt11: string, amountSats?: number): PaymentValidation {
+	validatePayment(
+		bolt11: string,
+		amountSats?: number,
+		maxFeeSats?: number
+	): PaymentValidation {
 		const checks: PaymentValidationCheck[] = [];
 		let decoded: ReturnType<typeof decodeInvoice> | null = null;
 		let decodedInfo: DecodedInvoice | undefined;
@@ -9878,6 +10093,28 @@ export class BeignetNode extends EventEmitter {
 		}
 
 		if (effectiveAmountSats !== undefined && effectiveAmountSats > 0) {
+			// The fee cap payInvoice would send under, and the amount plus that
+			// cap, which is what both limits are judged on (issue #1008). A cap
+			// that payInvoice would refuse is previewed as the default rather
+			// than thrown on: this method never throws.
+			const payAmountMsat =
+				decoded.amountMsat ??
+				(Number.isSafeInteger(amountSats) && amountSats! > 0
+					? BigInt(amountSats!) * 1000n
+					: undefined);
+			const capMsat =
+				maxFeeSats !== undefined &&
+				Number.isSafeInteger(maxFeeSats) &&
+				maxFeeSats >= 0
+					? BigInt(maxFeeSats) * 1000n
+					: defaultMaxFeeMsat(payAmountMsat ?? 0n);
+			const admissionSats =
+				payAmountMsat !== undefined
+					? spendLimitSats(payAmountMsat + capMsat)
+					: effectiveAmountSats;
+			const feeCapSats = admissionSats - effectiveAmountSats;
+			const withFees = `Amount ${effectiveAmountSats} sats plus up to ${feeCapSats} sats in routing fees`;
+
 			// 4. Per-payment limit
 			if (
 				this._maxPaymentSats !== undefined &&
@@ -9888,11 +10125,20 @@ export class BeignetNode extends EventEmitter {
 					status: 'FAIL',
 					message: `Amount ${effectiveAmountSats} sats exceeds per-payment limit of ${this._maxPaymentSats} sats`
 				});
+			} else if (
+				this._maxPaymentSats !== undefined &&
+				admissionSats > this._maxPaymentSats
+			) {
+				checks.push({
+					name: 'MAX_PAYMENT',
+					status: 'FAIL',
+					message: `${withFees} exceeds per-payment limit of ${this._maxPaymentSats} sats; lower maxFeeSats or the amount`
+				});
 			} else if (this._maxPaymentSats !== undefined) {
 				checks.push({
 					name: 'MAX_PAYMENT',
 					status: 'OK',
-					message: `Within per-payment limit (${this._maxPaymentSats} sats)`
+					message: `Within per-payment limit (${this._maxPaymentSats} sats) with up to ${feeCapSats} sats in routing fees`
 				});
 			}
 
@@ -9913,11 +10159,17 @@ export class BeignetNode extends EventEmitter {
 						status: 'FAIL',
 						message: `Amount ${effectiveAmountSats} sats exceeds daily remaining of ${remaining} sats`
 					});
+				} else if (admissionSats > remaining) {
+					checks.push({
+						name: 'DAILY_LIMIT',
+						status: 'FAIL',
+						message: `${withFees} exceeds daily remaining of ${remaining} sats; lower maxFeeSats or the amount`
+					});
 				} else {
 					checks.push({
 						name: 'DAILY_LIMIT',
 						status: 'OK',
-						message: `Within daily limit (${remaining} sats remaining)`
+						message: `Within daily limit (${remaining} sats remaining) with up to ${feeCapSats} sats in routing fees`
 					});
 				}
 			}
@@ -10132,21 +10384,26 @@ export class BeignetNode extends EventEmitter {
 		const decoded = decodeInvoiceInput(bolt11);
 		const paymentHashHex = decoded.paymentHash.toString('hex');
 
-		// Per-payment and daily spending limit checks, applied to what the engine
-		// will actually pay rather than to what the caller asked for (#528).
-		const spendAmountSats = paymentSpendSats(decoded.amountMsat, amountSats);
 		// Converted BEFORE the spend accounting below, not after it. Every
 		// decrement of _pendingSpendSats lives inside the Promise executor
 		// further down, which a RangeError out of BigInt() never reaches: the
 		// counter would stay raised for the life of the process, and once it
 		// passed dailySpendLimit _checkSpendLimit would refuse every real
 		// payment until the daemon restarted (issue #474).
-		const maxFeeMsat = resolveMaxFeeMsat(maxFeeSats, maxFeeMsatCap);
 		const amountMsat =
 			amountSats !== undefined
 				? BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) *
 				  1000n
 				: undefined;
+		// What the engine will actually pay rather than what the caller asked
+		// for (#528), and the fee cap on top of it: the caller's, or the
+		// default for that amount (#1008).
+		const payAmountMsat = decoded.amountMsat ?? amountMsat;
+		const maxFeeMsat = resolveMaxFeeMsat(
+			maxFeeSats,
+			maxFeeMsatCap,
+			payAmountMsat
+		);
 		// Judged here, before any reservation, for the same reason as the
 		// conversions above: a refused bound must leave nothing raised.
 		const maxCltvExpiryHeight = this._cltvCeiling(cltvLimit);
@@ -10167,12 +10424,11 @@ export class BeignetNode extends EventEmitter {
 		// settlement for the hash (it emits nothing further for a hash it has
 		// marked completed), so the rest have to go on holding budget on
 		// their own account.
-		let claim: AsyncSpendClaim | undefined;
-		if (spendAmountSats > 0) {
-			this._checkMaxPayment(spendAmountSats);
-			this._checkSpendLimit(spendAmountSats);
-			claim = this._openAsyncSpendClaim(paymentHashHex, spendAmountSats);
-		}
+		const claim = this._admitLightningSpend(
+			paymentHashHex,
+			payAmountMsat,
+			maxFeeMsat
+		);
 
 		// Store metadata on the payment if provided. Guarded, because nothing
 		// between the claim above and the executor below may strand it.
@@ -10452,21 +10708,18 @@ export class BeignetNode extends EventEmitter {
 		this._checkDraining();
 		const decoded = decodeInvoiceInput(bolt11);
 		const paymentHashHex = decoded.paymentHash.toString('hex');
-		// Admitted on what the engine will pay, not on the caller's override.
-		const spendAmountSats = paymentSpendSats(decoded.amountMsat, amountSats);
 		// Converted BEFORE the spend accounting below, for the reason
 		// payInvoice's copy documents: a RangeError out of BigInt() must not
 		// leave the reservation raised for the life of the process (issue #474).
-		const maxFeeMsat =
-			maxFeeSats !== undefined
-				? BigInt(requireNonNegativeSafeInteger(maxFeeSats, 'maxFeeSats')) *
-				  1000n
-				: undefined;
 		const amountMsat =
 			amountSats !== undefined
 				? BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) *
 				  1000n
 				: undefined;
+		// Admitted on what the engine will pay, not on the caller's override
+		// (#528), plus the fee cap: the caller's, or the default (#1008).
+		const payAmountMsat = decoded.amountMsat ?? amountMsat;
+		const maxFeeMsat = resolveMaxFeeMsat(maxFeeSats, undefined, payAmountMsat);
 		const maxCltvExpiryHeight = this._cltvCeiling(cltvLimit);
 
 		// This attempt's own claim, opened BEFORE the send both because a later
@@ -10476,12 +10729,11 @@ export class BeignetNode extends EventEmitter {
 		// create() has to find a claim for. A resubmission of a hash whose
 		// earlier attempt may still be live gets a claim of its own rather than
 		// replacing that one: either attempt can be the one that settles.
-		let claim: AsyncSpendClaim | undefined;
-		if (spendAmountSats > 0) {
-			this._checkMaxPayment(spendAmountSats);
-			this._checkSpendLimit(spendAmountSats);
-			claim = this._openAsyncSpendClaim(paymentHashHex, spendAmountSats);
-		}
+		const claim = this._admitLightningSpend(
+			paymentHashHex,
+			payAmountMsat,
+			maxFeeMsat
+		);
 
 		let result: IPaymentInfo;
 		try {
@@ -10540,13 +10792,8 @@ export class BeignetNode extends EventEmitter {
 		// to leave _pendingSpendSats permanently raised (issue #474).
 		const amountMsat =
 			BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) * 1000n;
-		const maxFeeMsat =
-			maxFeeSats !== undefined
-				? BigInt(requireNonNegativeSafeInteger(maxFeeSats, 'maxFeeSats')) *
-				  1000n
-				: undefined;
-		this._checkMaxPayment(amountSats);
-		this._checkSpendLimit(amountSats);
+		// The caller's cap, or the default for the amount (#1008).
+		const maxFeeMsat = resolveMaxFeeMsat(maxFeeSats, undefined, amountMsat);
 		// This attempt's claim on the daily budget, charged by the
 		// payment:sent handler in create() as payInvoice's is (issue #977).
 		// The engine picks a keysend's preimage, so the hash is unknown until
@@ -10554,7 +10801,11 @@ export class BeignetNode extends EventEmitter {
 		// that its reservation holds across the call, and moved under the
 		// hash after it. A keysend that never started holds no capacity.
 		const provisionalKey = `keysend:${crypto.randomBytes(8).toString('hex')}`;
-		const claim = this._openAsyncSpendClaim(provisionalKey, amountSats);
+		const claim = this._admitLightningSpend(
+			provisionalKey,
+			amountMsat,
+			maxFeeMsat
+		);
 		const destination = Buffer.from(pubkey, 'hex');
 
 		let result: IPaymentInfo;
@@ -10581,7 +10832,10 @@ export class BeignetNode extends EventEmitter {
 		if (result.status !== 'PENDING') {
 			if (claim) {
 				if (result.status === 'COMPLETED') {
-					this._chargeAsyncSpendClaim(paymentHashHex, claim);
+					this._chargeAsyncSpendClaim(paymentHashHex, {
+						claim,
+						actualSats: sentSats(result)
+					});
 				} else {
 					this._releaseAsyncSpendClaim(claim);
 				}
@@ -11110,7 +11364,11 @@ export class BeignetNode extends EventEmitter {
 			// FAILED payment with nothing at all to explain it.
 			info.failureDescription = p.failureReason;
 		}
-		if (p.route?.totalFeeMsat !== undefined) {
+		if (p.sentMsat !== undefined && p.sentMsat >= p.amountMsat) {
+			// An MPP record: its route is the first part only, so the fee
+			// is what left the node over what the invoice asked (#1008).
+			info.feeSats = Number((p.sentMsat - p.amountMsat) / 1000n);
+		} else if (p.route?.totalFeeMsat !== undefined) {
 			info.feeSats = Number(p.route.totalFeeMsat / 1000n);
 		}
 		if (p.route) {
@@ -11539,8 +11797,9 @@ export class BeignetNode extends EventEmitter {
 		// Converted BEFORE the invoice request and before any reservation, as
 		// payInvoice does: a refused cap must leave nothing raised and must
 		// not have asked the payee for an invoice it will never pay (issue
-		// #474).
-		const maxFeeMsat = resolveMaxFeeMsat(maxFeeSats, maxFeeMsatCap);
+		// #474). The default cap is sized on the invoice's amount, which the
+		// payee has not priced yet, so it is resolved after the request.
+		const callerMaxFeeMsat = explicitMaxFeeMsat(maxFeeSats, maxFeeMsatCap);
 
 		// Request invoice from the offer. Guarded before BigInt(): a fractional
 		// amount threw an uncaught RangeError that shipped as a scrubbed 500
@@ -11565,20 +11824,22 @@ export class BeignetNode extends EventEmitter {
 		// the payee prices the offer, and there is nothing else to pay (an
 		// amountless BOLT 12 invoice is refused outright). Admitting on the
 		// caller's amountSats instead is the precedence #528 removed from the
-		// BOLT 11 paths, so the shared helper decides it here too.
-		const spendAmountSats = paymentSpendSats(bolt12Invoice.amount, amountSats);
+		// BOLT 11 paths, so the same rule decides it here too. The fee cap on
+		// top of it is the caller's, or the default for that amount (#1008).
+		const payAmountMsat = bolt12Invoice.amount ?? requestOptions?.amount;
+		const maxFeeMsat =
+			callerMaxFeeMsat ?? defaultMaxFeeMsat(payAmountMsat ?? 0n);
 
 		// This attempt's claim on the daily budget, charged by the payment:sent
 		// handler in create() rather than by the listener below, for the
 		// reason payInvoice's copy documents (issue #977). Held for the whole
 		// in-flight window: it is what stops two concurrent offer payments
 		// both passing the daily limit before either is charged.
-		let claim: AsyncSpendClaim | undefined;
-		if (spendAmountSats > 0) {
-			this._checkMaxPayment(spendAmountSats);
-			this._checkSpendLimit(spendAmountSats);
-			claim = this._openAsyncSpendClaim(paymentHashHex, spendAmountSats);
-		}
+		const claim = this._admitLightningSpend(
+			paymentHashHex,
+			payAmountMsat,
+			maxFeeMsat
+		);
 
 		return new Promise<PaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
@@ -12429,6 +12690,13 @@ export class BeignetNode extends EventEmitter {
 	/**
 	 * Send a payment along an explicit route (from queryRoute / POST
 	 * /route/query). paymentSecret is required by most modern invoices.
+	 *
+	 * Admitted like every other pay path (issue #1017): drain mode, the
+	 * per-payment and daily limits, and a claim on the daily budget, all on
+	 * what the first hop carries, which is exactly what leaves this node. No
+	 * fee cap sits on top, since the route spells its fee out. Before this
+	 * the route ran only the drain check, and its settlement, finding no
+	 * claim, was never charged.
 	 */
 	sendToRoute(
 		paymentHash: string,
@@ -12459,16 +12727,39 @@ export class BeignetNode extends EventEmitter {
 		this._checkDraining();
 		const hops = jsonToRouteHops(route.hops);
 		const finalHop = hops[hops.length - 1];
+		// The claim is keyed the way the settlement will look it up: the
+		// engine reports the hash as lowercase hex, and the regex above admits
+		// uppercase.
+		const paymentHashHex = paymentHash.toLowerCase();
+		// The wire amount is what the first hop is asked to carry.
+		const sentMsat = hops[0].amountToForwardMsat;
+		if (sentMsat < finalHop.amountToForwardMsat) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'route.hops[0].amountToForwardMsat must cover the final hop: the first hop carries the amount plus every fee'
+			);
+		}
+		// The engine records the route it is handed, so the totals ride along
+		// and the record reports a real fee rather than NaN.
+		const wireRoute = {
+			hops,
+			totalAmountMsat: sentMsat,
+			totalFeeMsat: sentMsat - finalHop.amountToForwardMsat,
+			totalCltvDelta: hops[0].outgoingCltvValue
+		};
+		const claim = this._admitLightningSpend(paymentHashHex, sentMsat, 0n);
+		let payment: IPaymentInfo;
 		try {
-			const payment = this.node.sendPaymentToRoute(
-				{ hops },
-				Buffer.from(paymentHash, 'hex'),
+			payment = this.node.sendPaymentToRoute(
+				wireRoute,
+				Buffer.from(paymentHashHex, 'hex'),
 				finalHop.outgoingCltvValue,
 				paymentSecret ? Buffer.from(paymentSecret, 'hex') : undefined,
 				finalHop.amountToForwardMsat
 			);
-			return this.toPaymentInfo(payment);
 		} catch (err) {
+			// A payment that never started holds no capacity (issue #474).
+			if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
 			if (err instanceof BeignetError) throw err;
 			// Surface library payment errors (NO_CHANNEL_TO_HOP, ...) by code
 			const code =
@@ -12480,6 +12771,14 @@ export class BeignetNode extends EventEmitter {
 				err instanceof Error ? err.message : String(err)
 			);
 		}
+		// A refusal the engine reports by return dispatched nothing, so the
+		// reservation goes; the record stays, as sendPaymentAsync's does. A
+		// settlement inside the call was charged by the handler in create(),
+		// which found the claim under this hash.
+		if (claim && payment.status === PaymentStatus.FAILED) {
+			this._releaseAsyncSpendClaim(claim);
+		}
+		return this.toPaymentInfo(payment);
 	}
 
 	// ─────────────── Channel Readiness Helpers ───────────────

@@ -815,6 +815,15 @@ export interface IPaymentInfo {
 	paymentHash: Buffer;
 	preimage?: Buffer;
 	amountMsat: bigint;
+	/**
+	 * The msat that left this node, fees included, when amountMsat is not
+	 * that figure. A single-path send records its first-hop amount in
+	 * amountMsat, so it needs nothing here; an MPP send records the invoice
+	 * amount there and the sum of its parts' first-hop amounts here, written
+	 * with the record's first persist. A part refused at dispatch is not
+	 * subtracted, so this can overstate by that part.
+	 */
+	sentMsat?: bigint;
 	status: PaymentStatus;
 	direction: PaymentDirection;
 	route?: IRoute;

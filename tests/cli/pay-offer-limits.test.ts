@@ -191,9 +191,9 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		const offer = offerString(node, 'draining');
 		node.setDraining(true);
 
-		expect(await refusalOf(node.payOffer(offer))).to.contain(
-			'Node is draining'
-		);
+		expect(
+			await refusalOf(node.payOffer(offer, undefined, undefined, 0))
+		).to.contain('Node is draining');
 		// A drained node does not go asking a payee for an invoice it may not pay.
 		expect(payee.requests).to.have.length(0);
 		expect(payee.dispatched).to.have.length(0);
@@ -206,7 +206,14 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		});
 
 		expect(
-			await refusalOf(node.payOffer(offerString(node, 'drains mid-request')))
+			await refusalOf(
+				node.payOffer(
+					offerString(node, 'drains mid-request'),
+					undefined,
+					undefined,
+					0
+				)
+			)
 		).to.contain('Node is draining');
 		// The request is a round trip to the payee, so the check before it is not
 		// the one that keeps an HTLC in.
@@ -219,7 +226,9 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		const payee = stubPayee(node, 5_001_000n);
 
 		expect(
-			await refusalOf(node.payOffer(offerString(node, 'too big')))
+			await refusalOf(
+				node.payOffer(offerString(node, 'too big'), undefined, undefined, 0)
+			)
 		).to.contain('Payment amount 5001 sats exceeds per-payment limit');
 		expect(payee.dispatched).to.have.length(0);
 		expect(pending()).to.equal(0);
@@ -231,7 +240,9 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		const payee = stubPayee(node, 6_000_000n);
 
 		expect(
-			await refusalOf(node.payOffer(offerString(node, 'underpriced ask'), 1))
+			await refusalOf(
+				node.payOffer(offerString(node, 'underpriced ask'), 1, undefined, 0)
+			)
 		).to.contain('Payment amount 6000 sats exceeds per-payment limit');
 		// The request itself still carried what the caller asked for.
 		expect(payee.requests).to.deep.equal([1_000n]);
@@ -241,11 +252,21 @@ describe('payOffer admission and spend accounting (#529)', function () {
 
 	it('reserves the amount in flight so concurrent offer payments cannot overshoot the daily limit', async () => {
 		const first = stubPayee(node, 4_000_000n);
-		const firstPaid = node.payOffer(offerString(node, 'first'));
+		const firstPaid = node.payOffer(
+			offerString(node, 'first'),
+			undefined,
+			undefined,
+			0
+		);
 		await waitFor(() => pending() === 4_000, 'the first reservation');
 
 		const second = stubPayee(node, 4_000_000n);
-		const secondPaid = node.payOffer(offerString(node, 'second'));
+		const secondPaid = node.payOffer(
+			offerString(node, 'second'),
+			undefined,
+			undefined,
+			0
+		);
 		await waitFor(() => pending() === 8_000, 'the second reservation');
 		// Nothing has settled, so the reported spend is still zero: it is the
 		// reservation, not the spend, that has to refuse the third payment.
@@ -253,7 +274,9 @@ describe('payOffer admission and spend accounting (#529)', function () {
 
 		const third = stubPayee(node, 4_000_000n);
 		expect(
-			await refusalOf(node.payOffer(offerString(node, 'third')))
+			await refusalOf(
+				node.payOffer(offerString(node, 'third'), undefined, undefined, 0)
+			)
 		).to.contain('Daily spend limit exceeded');
 		expect(third.dispatched).to.have.length(0);
 
@@ -267,7 +290,12 @@ describe('payOffer admission and spend accounting (#529)', function () {
 
 	it('records the spend once and drops the reservation on settlement', async () => {
 		const payee = stubPayee(node, 3_000_000n);
-		const paid = node.payOffer(offerString(node, 'settles'));
+		const paid = node.payOffer(
+			offerString(node, 'settles'),
+			undefined,
+			undefined,
+			0
+		);
 		await waitFor(() => pending() === 3_000, 'the reservation');
 		expect(payee.dispatched).to.deep.equal([payee.paymentHash]);
 
@@ -286,7 +314,12 @@ describe('payOffer admission and spend accounting (#529)', function () {
 
 	it('releases the reservation when the payment fails', async () => {
 		const payee = stubPayee(node, 3_000_000n);
-		const paid = node.payOffer(offerString(node, 'fails'));
+		const paid = node.payOffer(
+			offerString(node, 'fails'),
+			undefined,
+			undefined,
+			0
+		);
 		await waitFor(() => pending() === 3_000, 'the reservation');
 
 		settle(node, payee.paymentHash, 3_000, 'FAILED');
@@ -300,7 +333,8 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		const paid = node.payOffer(
 			offerString(node, 'never settles'),
 			undefined,
-			50
+			50,
+			0
 		);
 
 		expect(await refusalOf(paid)).to.contain('Payment timed out');
@@ -316,7 +350,9 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		});
 
 		expect(
-			await refusalOf(node.payOffer(offerString(node, 'no route')))
+			await refusalOf(
+				node.payOffer(offerString(node, 'no route'), undefined, undefined, 0)
+			)
 		).to.contain('No route found');
 		expect(payee.dispatched).to.have.length(1);
 		expect(pending()).to.equal(0);
@@ -324,7 +360,14 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		// The budget is intact: a payment that never started holds no capacity,
 		// so the retry is refused by the engine again rather than by the limit.
 		expect(
-			await refusalOf(node.payOffer(offerString(node, 'no route again')))
+			await refusalOf(
+				node.payOffer(
+					offerString(node, 'no route again'),
+					undefined,
+					undefined,
+					0
+				)
+			)
 		).to.contain('No route found');
 	});
 
@@ -346,13 +389,17 @@ describe('payOffer admission and spend accounting (#529)', function () {
 				expiry: 3600,
 				minFinalCltvExpiry: DEFAULT_MIN_FINAL_CLTV_EXPIRY,
 				privateKey: crypto.createHash('sha256').update('payee').digest()
-			})
+			}),
+			0
 		);
 		expect(pending()).to.equal(3_000);
 
 		const payee = stubPayee(node, 3_000_000n, { paymentHash });
 		const paid = node.payOffer(
-			offerString(node, 'same preimage, over BOLT 12')
+			offerString(node, 'same preimage, over BOLT 12'),
+			undefined,
+			undefined,
+			0
 		);
 		await waitFor(() => pending() === 6_000, 'both reservations');
 
@@ -367,7 +414,12 @@ describe('payOffer admission and spend accounting (#529)', function () {
 
 	it('rounds a sub-satoshi invoice up instead of letting it skip the limits', async () => {
 		const payee = stubPayee(node, 999n);
-		const paid = node.payOffer(offerString(node, 'fractional'));
+		const paid = node.payOffer(
+			offerString(node, 'fractional'),
+			undefined,
+			undefined,
+			0
+		);
 		await waitFor(() => pending() === 1, 'the rounded-up reservation');
 
 		settle(node, payee.paymentHash, 1, 'COMPLETED');
@@ -424,11 +476,12 @@ describe('payOffer admission and spend accounting (#529)', function () {
 		expect(second.caps.map(String)).to.deep.equal(['25002']);
 	});
 
-	it('leaves the fee uncapped when no cap is given', async () => {
+	it('sends under the default cap when no cap is given (#1008)', async () => {
 		const payee = stubPayee(node, 1_000_000n);
 		const paid = node.payOffer(offerString(node, 'uncapped'));
 		await waitFor(() => payee.dispatched.length === 1, 'the dispatch');
-		expect(payee.caps).to.deep.equal([undefined]);
+		// A 1 000 sat invoice: 1% is 10 sats, so the 50 sat floor applies.
+		expect(payee.caps.map(String)).to.deep.equal(['50000']);
 
 		settle(node, payee.paymentHash, 1_000, 'COMPLETED');
 		await paid;
@@ -589,15 +642,24 @@ describe('POST /offer/pay admission (#529)', function () {
 
 	it('reserves an accepted payment against the daily budget', async () => {
 		const first = stubPayee(node, 4_000_000n);
-		const firstRes = post({ offer: offerString(node, 'route first') });
+		const firstRes = post({
+			offer: offerString(node, 'route first'),
+			maxFeeSats: 0
+		});
 		await waitFor(() => pending() === 4_000, 'the first reservation');
 
 		const second = stubPayee(node, 4_000_000n);
-		const secondRes = post({ offer: offerString(node, 'route second') });
+		const secondRes = post({
+			offer: offerString(node, 'route second'),
+			maxFeeSats: 0
+		});
 		await waitFor(() => pending() === 8_000, 'the second reservation');
 
 		const third = stubPayee(node, 4_000_000n);
-		const refused = await post({ offer: offerString(node, 'route third') });
+		const refused = await post({
+			offer: offerString(node, 'route third'),
+			maxFeeSats: 0
+		});
 		expect(refused.status).to.equal(403);
 		expect(errorCode(refused.body)).to.equal('SPENDING_LIMIT_EXCEEDED');
 		expect(third.dispatched).to.have.length(0);
@@ -611,22 +673,25 @@ describe('POST /offer/pay admission (#529)', function () {
 	});
 
 	it('passes maxFeeSats and maxFeeMsat from the body to the engine (#1001)', async () => {
-		const sats = stubPayee(node, 1_000_000n);
+		// 500 sat invoices: the day above already carries 8 000 of its 10 000
+		// sats, and the daily limit now counts each payment's fee cap on top
+		// of its amount (#1008).
+		const sats = stubPayee(node, 500_000n);
 		const satsRes = post({
 			offer: offerString(node, 'route capped sats'),
 			maxFeeSats: 25
 		});
 		await waitFor(() => sats.dispatched.length === 1, 'the sats dispatch');
-		settle(node, sats.paymentHash, 1_000, 'COMPLETED');
+		settle(node, sats.paymentHash, 500, 'COMPLETED');
 		expect((await satsRes).body.ok).to.equal(true);
 
-		const msat = stubPayee(node, 1_000_000n);
+		const msat = stubPayee(node, 500_000n);
 		const msatRes = post({
 			offer: offerString(node, 'route capped msat'),
 			maxFeeMsat: '25001'
 		});
 		await waitFor(() => msat.dispatched.length === 1, 'the msat dispatch');
-		settle(node, msat.paymentHash, 1_000, 'COMPLETED');
+		settle(node, msat.paymentHash, 500, 'COMPLETED');
 		expect((await msatRes).body.ok).to.equal(true);
 
 		expect(sats.caps.map(String)).to.deep.equal(['25000']);

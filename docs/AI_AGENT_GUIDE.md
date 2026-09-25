@@ -239,6 +239,16 @@ const check = node.validatePayment(bigInvoice);
 // check.status === 'FAIL', check.summary includes "exceeds per-payment limit"
 ```
 
+Both limits count the routing fee, not just the invoice amount. Every pay
+path sends under a fee cap: `maxFeeSats` / `maxFeeMsat` when you pass one,
+otherwise 1% of the amount with a 50 sat floor. `maxPaymentSats` and the daily
+limit are judged on the amount plus that cap when the payment is admitted, and
+the day is charged the amount plus the fee actually paid when it settles. A
+payment that fits the limit on its amount alone but not with its cap is
+refused, and the error says whether to lower `maxFeeSats` or the amount;
+`validatePayment(bolt11, amountSats, maxFeeSats)` previews the same
+judgement. `sendToRoute` is judged on what its first hop carries.
+
 ## Error Handling
 
 ### Decision tree
@@ -663,8 +673,9 @@ What the client guarantees before any payment leaves:
 
 `maxPriceSats` is per request; your `dailySpendLimitSats` and `maxPaymentSats`
 still apply underneath it. An unattended agent wants both: one bounds a single
-purchase, the other bounds the wallet. Note that the wallet limits count the
-invoice amount, not the routing fee, which is why the fee cap above matters.
+purchase, the other bounds the wallet. The wallet limits count the invoice
+amount plus the routing-fee cap, so the L402 fee cap above is also what the
+wallet limits are judged against for that purchase.
 
 Over HTTP, `POST /l402/fetch` honours `X-Idempotency-Key`, so a retried fetch
 replays the first result instead of buying a second challenge.

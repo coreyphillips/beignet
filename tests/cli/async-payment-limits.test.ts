@@ -168,7 +168,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		const { bolt11 } = node.createInvoice(1_000, 'draining');
 		node.setDraining(true);
 
-		expect(() => node.sendPaymentAsync(bolt11)).to.throw('Node is draining');
+		expect(() => node.sendPaymentAsync(bolt11, 0)).to.throw('Node is draining');
 		expect(calls).to.have.length(0);
 		expect(internals(node)._pendingSpendSats).to.equal(0);
 	});
@@ -177,7 +177,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		const calls = stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(5_001, 'too big');
 
-		expect(() => node.sendPaymentAsync(bolt11)).to.throw(
+		expect(() => node.sendPaymentAsync(bolt11, 0)).to.throw(
 			'exceeds per-payment limit'
 		);
 		expect(calls).to.have.length(0);
@@ -188,7 +188,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		const calls = stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(undefined, 'amountless');
 
-		expect(() => node.sendPaymentAsync(bolt11, undefined, 5_001)).to.throw(
+		expect(() => node.sendPaymentAsync(bolt11, 0, 5_001)).to.throw(
 			'exceeds per-payment limit'
 		);
 		expect(calls).to.have.length(0);
@@ -197,10 +197,12 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 	it('reserves the amount while pending so concurrent submissions cannot overshoot the daily limit', () => {
 		const calls = stubSendPayment(node);
 		const first = node.sendPaymentAsync(
-			node.createInvoice(4_000, 'first').bolt11
+			node.createInvoice(4_000, 'first').bolt11,
+			0
 		);
 		const second = node.sendPaymentAsync(
-			node.createInvoice(4_000, 'second').bolt11
+			node.createInvoice(4_000, 'second').bolt11,
+			0
 		);
 		expect(first.status).to.equal('PENDING');
 		expect(second.status).to.equal('PENDING');
@@ -210,7 +212,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		expect(node.getDailySpendInfo().spentSats).to.equal(0);
 
 		const third = node.createInvoice(4_000, 'third').bolt11;
-		expect(() => node.sendPaymentAsync(third)).to.throw(
+		expect(() => node.sendPaymentAsync(third, 0)).to.throw(
 			'Daily spend limit exceeded'
 		);
 		expect(calls).to.have.length(2);
@@ -219,7 +221,8 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 	it('records the spend once and drops the reservation on settlement', () => {
 		stubSendPayment(node);
 		const { paymentHash } = node.sendPaymentAsync(
-			node.createInvoice(3_000, 'settles').bolt11
+			node.createInvoice(3_000, 'settles').bolt11,
+			0
 		);
 		expect(internals(node)._pendingSpendSats).to.equal(3_000);
 
@@ -238,7 +241,8 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 	it('keeps a failed payment claimed while its HTLC can still settle', () => {
 		stubSendPayment(node);
 		const { paymentHash } = node.sendPaymentAsync(
-			node.createInvoice(3_000, 'fails').bolt11
+			node.createInvoice(3_000, 'fails').bolt11,
+			0
 		);
 
 		// A failure report is not a retraction: cancelPayment() marks a
@@ -254,7 +258,8 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 	it("releases a failed payment's reservation once nothing is out for it", () => {
 		stubSendPayment(node);
 		const { paymentHash } = node.sendPaymentAsync(
-			node.createInvoice(3_000, 'gave up').bolt11
+			node.createInvoice(3_000, 'gave up').bolt11,
+			0
 		);
 		expect(internals(node)._pendingSpendSats).to.equal(3_000);
 
@@ -273,18 +278,20 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 	it('holds the daily budget a failed payment can still spend', () => {
 		stubSendPayment(node);
 		const cancelled = node.sendPaymentAsync(
-			node.createInvoice(5_000, 'cancelled').bolt11
+			node.createInvoice(5_000, 'cancelled').bolt11,
+			0
 		);
 		holdHtlcsInFlight(node, true);
 		settle(node, cancelled.paymentHash, 5_000, 'FAILED');
 
 		const second = node.sendPaymentAsync(
-			node.createInvoice(5_000, 'second').bolt11
+			node.createInvoice(5_000, 'second').bolt11,
+			0
 		);
 		// Freeing the budget on the failure report let a caller cancel a live
 		// payment and spend its whole allowance a second time.
 		const third = node.createInvoice(5_000, 'third').bolt11;
-		expect(() => node.sendPaymentAsync(third)).to.throw(
+		expect(() => node.sendPaymentAsync(third, 0)).to.throw(
 			'Daily spend limit exceeded'
 		);
 
@@ -297,7 +304,8 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 	it('releases a claim that has run out of time, not one that is merely old', () => {
 		stubSendPayment(node);
 		const { paymentHash } = node.sendPaymentAsync(
-			node.createInvoice(5_000, 'expires').bolt11
+			node.createInvoice(5_000, 'expires').bolt11,
+			0
 		);
 		holdHtlcsInFlight(node, true);
 		settle(node, paymentHash, 5_000, 'FAILED');
@@ -306,7 +314,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		ageClaimsPastExpiry(node);
 		// Swept on the admission path, so the budget comes back with no timer
 		// and no settlement — and only once the amount can no longer be spent.
-		node.sendPaymentAsync(node.createInvoice(5_000, 'after expiry').bolt11);
+		node.sendPaymentAsync(node.createInvoice(5_000, 'after expiry').bolt11, 0);
 		expect(internals(node)._pendingSpendSats).to.equal(5_000);
 		expect(claimedSats(node, paymentHash)).to.equal(0);
 		// The record outlives the hold: 24 hours is where pinning a DAILY
@@ -318,10 +326,14 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 	it('charges a settlement that arrives after its claim expired to the day it lands on', () => {
 		stubSendPayment(node);
 		const { paymentHash } = node.sendPaymentAsync(
-			node.createInvoice(5_000, 'slow settlement').bolt11
+			node.createInvoice(5_000, 'slow settlement').bolt11,
+			0
 		);
 		ageClaimsPastExpiry(node);
-		node.sendPaymentAsync(node.createInvoice(5_000, 'admitted after').bolt11);
+		node.sendPaymentAsync(
+			node.createInvoice(5_000, 'admitted after').bolt11,
+			0
+		);
 		expect(internals(node)._pendingSpendSats).to.equal(5_000);
 
 		settle(node, paymentHash, 5_000, 'COMPLETED');
@@ -336,7 +348,8 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		stubSendPayment(node);
 		const before = Date.now();
 		const { paymentHash } = node.sendPaymentAsync(
-			node.createInvoice(1_000, 'ttl').bolt11
+			node.createInvoice(1_000, 'ttl').bolt11,
+			0
 		);
 
 		const [claim] = internals(node)._asyncSpendClaims.get(paymentHash)!;
@@ -350,11 +363,11 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		stubSendPayment(node, { throws: new Error('No route found') });
 		const { bolt11 } = node.createInvoice(3_000, 'no route');
 
-		expect(() => node.sendPaymentAsync(bolt11)).to.throw('No route found');
+		expect(() => node.sendPaymentAsync(bolt11, 0)).to.throw('No route found');
 		expect(internals(node)._pendingSpendSats).to.equal(0);
 		expect(internals(node)._asyncSpendClaims.size).to.equal(0);
 		// The budget is intact: a payment that never started holds no capacity.
-		expect(() => node.sendPaymentAsync(bolt11)).to.throw('No route found');
+		expect(() => node.sendPaymentAsync(bolt11, 0)).to.throw('No route found');
 	});
 
 	it('limits a fixed-amount invoice by its own amount, not by the override', () => {
@@ -363,11 +376,11 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		// admitting the payment on the override's word waves it past both limits.
 		const { bolt11 } = node.createInvoice(6_000, 'fixed');
 
-		expect(() => node.sendPaymentAsync(bolt11, undefined, 1)).to.throw(
+		expect(() => node.sendPaymentAsync(bolt11, 0, 1)).to.throw(
 			'exceeds per-payment limit'
 		);
 		// Zero is the worse case: it used to skip the checks altogether.
-		expect(() => node.sendPaymentAsync(bolt11, undefined, 0)).to.throw(
+		expect(() => node.sendPaymentAsync(bolt11, 0, 0)).to.throw(
 			'exceeds per-payment limit'
 		);
 		expect(calls).to.have.length(0);
@@ -378,7 +391,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(3_000, 'understated');
 
-		const { paymentHash } = node.sendPaymentAsync(bolt11, undefined, 1);
+		const { paymentHash } = node.sendPaymentAsync(bolt11, 0, 1);
 		expect(internals(node)._pendingSpendSats).to.equal(3_000);
 
 		settle(node, paymentHash, 3_000, 'COMPLETED');
@@ -388,7 +401,8 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 	it('charges a payment that settles after it was reported failed', () => {
 		stubSendPayment(node);
 		const { paymentHash } = node.sendPaymentAsync(
-			node.createInvoice(3_000, 'cancelled').bolt11
+			node.createInvoice(3_000, 'cancelled').bolt11,
+			0
 		);
 
 		// What cancelPayment() does: the engine marks the payment failed, but
@@ -410,13 +424,13 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 	it('claims each dispatched attempt of a hash, and one settlement releases the rest', () => {
 		stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(3_000, 'retried');
-		const { paymentHash } = node.sendPaymentAsync(bolt11);
+		const { paymentHash } = node.sendPaymentAsync(bolt11, 0);
 		holdHtlcsInFlight(node, true);
 		settle(node, paymentHash, 3_000, 'FAILED');
 
 		// Two HTLCs can be out there for one hash, and either can settle, so
 		// the retry claims alongside the first attempt rather than replacing it.
-		node.sendPaymentAsync(bolt11);
+		node.sendPaymentAsync(bolt11, 0);
 		expect(claimedSats(node, paymentHash)).to.equal(6_000);
 		expect(internals(node)._pendingSpendSats).to.equal(6_000);
 
@@ -442,14 +456,14 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 	it('keeps the live attempt claimed when a retry never leaves the node', () => {
 		stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(3_000, 'refused retry');
-		const { paymentHash } = node.sendPaymentAsync(bolt11);
+		const { paymentHash } = node.sendPaymentAsync(bolt11, 0);
 		holdHtlcsInFlight(node, true);
 		settle(node, paymentHash, 3_000, 'FAILED');
 
 		// The retry dispatched nothing, so only its own claim goes: taking the
 		// first attempt's with it lost a live HTLC's amount entirely.
 		stubSendPayment(node, { throws: new Error('No route found') });
-		expect(() => node.sendPaymentAsync(bolt11)).to.throw('No route found');
+		expect(() => node.sendPaymentAsync(bolt11, 0)).to.throw('No route found');
 		expect(claimedSats(node, paymentHash)).to.equal(3_000);
 		expect(internals(node)._pendingSpendSats).to.equal(3_000);
 
@@ -462,7 +476,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		stubSendPayment(node);
 		const { bolt11, paymentHash } = msatInvoice(node, 999n, 'fractional');
 
-		node.sendPaymentAsync(bolt11);
+		node.sendPaymentAsync(bolt11, 0);
 		// Truncating 999 msat to 0 sats took the invoice out of admission and
 		// out of the accounting alike, so any number of them could be paid.
 		expect(claimedSats(node, paymentHash)).to.equal(1);
@@ -476,13 +490,13 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		const calls = stubSendPayment(node);
 		const { bolt11 } = msatInvoice(node, 5_000_001n, 'just over');
 
-		expect(() => node.sendPaymentAsync(bolt11)).to.throw(
+		expect(() => node.sendPaymentAsync(bolt11, 0)).to.throw(
 			'exceeds per-payment limit'
 		);
 		// payInvoice derives the same amount the same way.
 		let blockingError = '';
 		try {
-			await node.payInvoice(bolt11, 5_000);
+			await node.payInvoice(bolt11, 5_000, 0);
 		} catch (err: unknown) {
 			blockingError = err instanceof Error ? err.message : String(err);
 		}
@@ -493,7 +507,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 	it("records a payInvoice retry once and releases the async attempt's reservation with it", async () => {
 		stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(3_000, 'blocking retry');
-		const { paymentHash } = node.sendPaymentAsync(bolt11);
+		const { paymentHash } = node.sendPaymentAsync(bolt11, 0);
 		holdHtlcsInFlight(node, true);
 		settle(node, paymentHash, 3_000, 'FAILED');
 		expect(claimedSats(node, paymentHash)).to.equal(3_000);
@@ -501,7 +515,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		// The forwarding handler in create() charges the one settlement, to the
 		// oldest claim still holding budget; payInvoice's own listener records
 		// nothing (issue #977).
-		const retried = node.payInvoice(bolt11, 5_000);
+		const retried = node.payInvoice(bolt11, 5_000, 0);
 		expect(internals(node)._pendingSpendSats).to.equal(6_000);
 		settle(node, paymentHash, 3_000, 'COMPLETED');
 		await retried;
@@ -519,13 +533,13 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 	it("releases every attempt's reservation when the blocking retry settles", async () => {
 		stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(3_000, 'retried twice');
-		const { paymentHash } = node.sendPaymentAsync(bolt11);
+		const { paymentHash } = node.sendPaymentAsync(bolt11, 0);
 		holdHtlcsInFlight(node, true);
 		settle(node, paymentHash, 3_000, 'FAILED');
-		node.sendPaymentAsync(bolt11);
+		node.sendPaymentAsync(bolt11, 0);
 		settle(node, paymentHash, 3_000, 'FAILED');
 
-		const retried = node.payInvoice(bolt11, 5_000);
+		const retried = node.payInvoice(bolt11, 5_000, 0);
 		expect(internals(node)._pendingSpendSats).to.equal(9_000);
 		settle(node, paymentHash, 3_000, 'COMPLETED');
 		await retried;
@@ -535,7 +549,8 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		expect(node.getDailySpendInfo().spentSats).to.equal(3_000);
 		expect(internals(node)._pendingSpendSats).to.equal(0);
 		expect(
-			node.sendPaymentAsync(node.createInvoice(2_000, 'on top').bolt11).status
+			node.sendPaymentAsync(node.createInvoice(2_000, 'on top').bolt11, 0)
+				.status
 		).to.equal('PENDING');
 		expect(internals(node)._pendingSpendSats).to.equal(2_000);
 	});
@@ -543,11 +558,11 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 	it('keeps every claim of a hash while an HTLC is still out, whichever attempt failed', async () => {
 		stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(3_000, 'failed blocking retry');
-		const { paymentHash } = node.sendPaymentAsync(bolt11);
+		const { paymentHash } = node.sendPaymentAsync(bolt11, 0);
 		holdHtlcsInFlight(node, true);
 		settle(node, paymentHash, 3_000, 'FAILED');
 
-		const retried = node.payInvoice(bolt11, 5_000);
+		const retried = node.payInvoice(bolt11, 5_000, 0);
 		settle(node, paymentHash, 3_000, 'FAILED');
 		let rejected = false;
 		try {
@@ -589,7 +604,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		}
 
 		stubSendPayment(node);
-		node.sendPaymentAsync(node.createInvoice(1, 'overflow').bolt11);
+		node.sendPaymentAsync(node.createInvoice(1, 'overflow').bolt11, 0);
 
 		// The oldest lapsed record goes: all it can still do is charge a late
 		// settlement, and the newer ones are likelier to see one.
@@ -621,7 +636,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		// outstanding HTLC could still spend: the ledger then admitted more than
 		// the limit allows while reporting less than it had claimed.
 		expect(() =>
-			node.sendPaymentAsync(node.createInvoice(1, 'over the cap').bolt11)
+			node.sendPaymentAsync(node.createInvoice(1, 'over the cap').bolt11, 0)
 		).to.throw('Too many unsettled async payments');
 		expect(calls).to.have.length(0);
 		expect(int._pendingSpendSats).to.equal(MAX_ASYNC_SPEND_CLAIMS);
@@ -640,7 +655,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		int._asyncSpendClaims.set(hashAt(0), lapsed);
 
 		stubSendPayment(node);
-		node.sendPaymentAsync(node.createInvoice(1, 'one more').bolt11);
+		node.sendPaymentAsync(node.createInvoice(1, 'one more').bolt11, 0);
 
 		let total = 0;
 		for (const claims of int._asyncSpendClaims.values()) total += claims.length;
@@ -654,13 +669,13 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		stubSendPayment(node, { status: 'FAILED' });
 		const { bolt11 } = node.createInvoice(5_000, 'expired');
 
-		const result = node.sendPaymentAsync(bolt11);
+		const result = node.sendPaymentAsync(bolt11, 0);
 		expect(result.status).to.equal('FAILED');
 		// Half the day's allowance used to go on a payment that never left the
 		// node, and stay gone for 24 hours.
 		expect(internals(node)._pendingSpendSats).to.equal(0);
 		expect(claimedSats(node, result.paymentHash)).to.equal(0);
-		expect(node.sendPaymentAsync(bolt11).status).to.equal('FAILED');
+		expect(node.sendPaymentAsync(bolt11, 0).status).to.equal('FAILED');
 	});
 
 	it('still charges a settlement of a submission reported failed by return', () => {
@@ -669,7 +684,8 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		// the record has to outlive the reservation.
 		stubSendPayment(node, { status: 'FAILED' });
 		const { paymentHash } = node.sendPaymentAsync(
-			node.createInvoice(4_000, 'partial mpp').bolt11
+			node.createInvoice(4_000, 'partial mpp').bolt11,
+			0
 		);
 		expect(internals(node)._pendingSpendSats).to.equal(0);
 
@@ -680,7 +696,8 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 	it('counts a settlement that arrives after midnight UTC against the new day', () => {
 		stubSendPayment(node);
 		const { paymentHash } = node.sendPaymentAsync(
-			node.createInvoice(3_000, 'past midnight').bolt11
+			node.createInvoice(3_000, 'past midnight').bolt11,
+			0
 		);
 		// The daily window expired while the payment was in flight.
 		internals(node)._dailySpendResetTime = Date.now() - 1;
@@ -696,7 +713,7 @@ describe('sendPaymentAsync admission and spend accounting (#526)', function () {
 		stubSendPayment(node);
 		const { bolt11 } = node.createInvoice(undefined, 'amountless');
 
-		expect(node.sendPaymentAsync(bolt11).status).to.equal('PENDING');
+		expect(node.sendPaymentAsync(bolt11, 0).status).to.equal('PENDING');
 		expect(internals(node)._pendingSpendSats).to.equal(0);
 		expect(internals(node)._asyncSpendClaims.size).to.equal(0);
 	});
@@ -773,7 +790,7 @@ describe('POST /invoice/pay-async admission (#526)', function () {
 
 	it('answers 403 SPENDING_LIMIT_EXCEEDED over the per-payment limit', async () => {
 		const { bolt11 } = node.createInvoice(5_001, 'too big');
-		const res = await post({ bolt11 });
+		const res = await post({ bolt11, maxFeeSats: 0 });
 		expect(res.status).to.equal(403);
 		expect((res.body.error as { code: string }).code).to.equal(
 			'SPENDING_LIMIT_EXCEEDED'
@@ -785,7 +802,7 @@ describe('POST /invoice/pay-async admission (#526)', function () {
 		const { bolt11 } = node.createInvoice(1_000, 'draining');
 		node.setDraining(true);
 		try {
-			const res = await post({ bolt11 });
+			const res = await post({ bolt11, maxFeeSats: 0 });
 			expect(res.status).to.equal(409);
 			expect((res.body.error as { code: string }).code).to.equal(
 				'SERVICE_DRAINING'
@@ -798,18 +815,21 @@ describe('POST /invoice/pay-async admission (#526)', function () {
 
 	it('reserves an accepted payment against the daily budget', async () => {
 		const accepted = await post({
-			bolt11: node.createInvoice(4_000, 'accepted').bolt11
+			bolt11: node.createInvoice(4_000, 'accepted').bolt11,
+			maxFeeSats: 0
 		});
 		expect(accepted.body.ok).to.equal(true);
 		expect(calls).to.have.length(1);
 		expect(internals(node)._pendingSpendSats).to.equal(4_000);
 
 		const overshoot = await post({
-			bolt11: node.createInvoice(4_000, 'overshoot').bolt11
+			bolt11: node.createInvoice(4_000, 'overshoot').bolt11,
+			maxFeeSats: 0
 		});
 		expect(overshoot.body.ok).to.equal(true);
 		const refused = await post({
-			bolt11: node.createInvoice(4_000, 'refused').bolt11
+			bolt11: node.createInvoice(4_000, 'refused').bolt11,
+			maxFeeSats: 0
 		});
 		expect(refused.status).to.equal(403);
 		expect((refused.body.error as { code: string }).code).to.equal(

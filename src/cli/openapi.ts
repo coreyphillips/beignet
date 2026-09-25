@@ -548,8 +548,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Pre-flight payment validation — checks decode, expiry, limits, capacity, route',
+					description:
+						'Judges MAX_PAYMENT and DAILY_LIMIT as POST /invoice/pay will: on the amount plus the routing-fee cap, maxFeeSats when given and 1% of the amount with a 50 sat floor otherwise. Previews BOLT 11 payments only.',
 					tags: ['Payments'],
-					requestBody: bodyContent({ bolt11: 'string', amountSats: 'number?' }),
+					requestBody: bodyContent({
+						bolt11: 'string',
+						amountSats: 'number?',
+						maxFeeSats: 'number?'
+					}),
 					responses: {
 						'200': {
 							description: 'Validation result',
@@ -582,6 +588,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/invoice/pay': {
 				post: {
 					summary: 'Pay an invoice (blocks until settled or timeout)',
+					description:
+						'When neither maxFeeSats nor maxFeeMsat is given the routing fee is capped at 1% of the amount, never below 50 sats. maxPaymentSats and the daily spend limit count the amount plus that cap at admission (403 SPENDING_LIMIT_EXCEEDED; the message says whether to lower maxFeeSats or the amount) and the amount plus the fee actually paid once the payment settles.',
 					tags: ['Payments'],
 					requestBody: bodyContent({
 						bolt11: 'string',
@@ -607,6 +615,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/invoice/pay-async': {
 				post: {
 					summary: 'Pay an invoice (returns immediately)',
+					description:
+						'When neither maxFeeSats nor maxFeeMsat is given the routing fee is capped at 1% of the amount, never below 50 sats. maxPaymentSats and the daily spend limit count the amount plus that cap at admission (403 SPENDING_LIMIT_EXCEEDED; the message says whether to lower maxFeeSats or the amount) and the amount plus the fee actually paid once the payment settles.',
 					tags: ['Payments'],
 					requestBody: bodyContent({
 						bolt11: 'string',
@@ -638,6 +648,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Pay an invoice (never throws — always returns PaymentInfo with COMPLETED or FAILED status)',
+					description:
+						"When neither maxFeeSats nor maxFeeMsat is given the routing fee is capped at 1% of the amount, never below 50 sats. maxPaymentSats and the daily spend limit count the amount plus that cap at admission (403 SPENDING_LIMIT_EXCEEDED; the message says whether to lower maxFeeSats or the amount) and the amount plus the fee actually paid once the payment settles. A limit refusal is reported in the result's failureDescription.",
 					tags: ['Payments'],
 					requestBody: bodyContent({
 						bolt11: 'string',
@@ -1182,6 +1194,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Pay an invoice with automatic retry and exponential backoff',
+					description:
+						'When neither maxFeeSats nor maxFeeMsat is given the routing fee is capped at 1% of the amount, never below 50 sats. maxPaymentSats and the daily spend limit count the amount plus that cap at admission (403 SPENDING_LIMIT_EXCEEDED; the message says whether to lower maxFeeSats or the amount) and the amount plus the fee actually paid once the payment settles. A limit refusal is not retried.',
 					tags: ['Payments'],
 					requestBody: bodyContent({
 						bolt11: 'string',
@@ -1206,6 +1220,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Send a keysend (spontaneous) payment — blocks until settled or timeout',
+					description:
+						'When maxFeeSats is not given the routing fee is capped at 1% of the amount, never below 50 sats. maxPaymentSats and the daily spend limit count the amount plus that cap at admission (403 SPENDING_LIMIT_EXCEEDED) and the amount plus the fee actually paid once the keysend settles.',
 					tags: ['Payments'],
 					requestBody: bodyContent({
 						pubkey: 'string',
@@ -1230,6 +1246,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Send a keysend payment — never throws, always returns PaymentInfo',
+					description:
+						"Same fee cap and limits as POST /keysend: 1% of the amount with a 50 sat floor when maxFeeSats is not given, counted with the amount by maxPaymentSats and the daily spend limit. A limit refusal is reported in the result's failureDescription.",
 					tags: ['Payments'],
 					requestBody: bodyContent({
 						pubkey: 'string',
@@ -1470,6 +1488,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Send a payment along an explicit route (hops from POST /route/query)',
+					description:
+						"Admitted like every other pay route: 409 SERVICE_DRAINING while draining, and maxPaymentSats and the daily spend limit judged on what the first hop carries (the amount plus every fee in the route), which is what leaves this node; over a limit answers 403 SPENDING_LIMIT_EXCEEDED. The first hop must carry at least the final hop's amount and no hop may be negative (400 INVALID_PARAMS). The settlement is charged to the daily spend at the first hop's amount.",
 					tags: ['Payments'],
 					requestBody: {
 						content: {
@@ -3397,6 +3417,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/offer/pay': {
 				post: {
 					summary: 'Pay a BOLT 12 offer',
+					description:
+						"When neither maxFeeSats nor maxFeeMsat is given the routing fee is capped at 1% of the invoice the payee returns, never below 50 sats. maxPaymentSats and the daily spend limit count that invoice's amount plus the cap at admission (403 SPENDING_LIMIT_EXCEEDED) and the amount plus the fee actually paid once the payment settles.",
 					tags: ['Offers'],
 					requestBody: bodyContent({
 						offer: 'string',
@@ -3468,6 +3490,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Add a payment to the priority queue (persistent — survives restarts)',
+					description:
+						'Dispatched through POST /invoice/pay-safe: when maxFeeSats is not given the routing fee is capped at 1% of the amount, never below 50 sats, and maxPaymentSats and the daily spend limit count the amount plus that cap at dispatch.',
 					tags: ['Queue'],
 					requestBody: bodyContent({
 						bolt11: 'string',

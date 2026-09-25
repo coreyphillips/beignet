@@ -31,9 +31,17 @@ import {
 	InvalidPeerConnectError,
 	InvalidSpliceError
 } from '../../src/lightning/node/types';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { encodeOffer } from '../../src/lightning/offer/encode';
 
 const PUBKEY = '02' + 'ab'.repeat(32);
 const CHANNEL_ID = 'cd'.repeat(32);
+/** A BOLT 12 offer that decodes: an issuer id and a description are all it needs. */
+const OFFER = encodeOffer({
+	offerId: Buffer.alloc(32),
+	description: 'guarded',
+	issuerId: getPublicKey(Buffer.alloc(32, 7))
+});
 
 /**
  * A BeignetNode whose engine is the given stub. Inheriting the prototype keeps
@@ -677,6 +685,15 @@ describe('Issue #474: the payment and invoice paths guard before BigInt()', () =
 			engineMethod: 'sendKeysend',
 			call: (bn, bad): unknown =>
 				bn.sendKeysend(PUBKEY, 1_000, 60_000, bad as number),
+			field: 'maxFeeSats'
+		},
+		{
+			// The explicit cap is judged before the payee is asked for an
+			// invoice (#1052), so the guard sits in front of requestInvoice.
+			name: 'payOffer(maxFeeSats)',
+			engineMethod: 'requestInvoice',
+			call: (bn, bad): unknown =>
+				bn.payOffer(OFFER, undefined, 60_000, bad as number),
 			field: 'maxFeeSats'
 		},
 		{

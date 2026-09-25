@@ -168,13 +168,13 @@ describe('payInvoice admission on a fixed-amount invoice (#528)', function () {
 		// admitting the payment on the override's word waves it past both limits.
 		const { bolt11 } = invoiceFrom(6_000, 'fixed');
 
-		expect(
-			await refusalOf(node.payInvoice(bolt11, 5_000, undefined, 1))
-		).to.contain('Payment amount 6000 sats exceeds per-payment limit');
+		expect(await refusalOf(node.payInvoice(bolt11, 5_000, 0, 1))).to.contain(
+			'Payment amount 6000 sats exceeds per-payment limit'
+		);
 		// Zero is the worse case: it used to skip the checks altogether.
-		expect(
-			await refusalOf(node.payInvoice(bolt11, 5_000, undefined, 0))
-		).to.contain('Payment amount 6000 sats exceeds per-payment limit');
+		expect(await refusalOf(node.payInvoice(bolt11, 5_000, 0, 0))).to.contain(
+			'Payment amount 6000 sats exceeds per-payment limit'
+		);
 
 		expect(calls).to.have.length(0);
 		expect(internals(node)._pendingSpendSats).to.equal(0);
@@ -184,16 +184,14 @@ describe('payInvoice admission on a fixed-amount invoice (#528)', function () {
 		const calls = stubSendPayment(node);
 		for (const description of ['first', 'second']) {
 			const invoice = invoiceFrom(4_000, description);
-			const paid = node.payInvoice(invoice.bolt11, 5_000);
+			const paid = node.payInvoice(invoice.bolt11, 5_000, 0);
 			settle(node, invoice.paymentHash, 4_000, 'COMPLETED');
 			await paid;
 		}
 		expect(node.getDailySpendInfo().spentSats).to.equal(8_000);
 
 		const { bolt11 } = invoiceFrom(4_000, 'over budget');
-		const refusal = await refusalOf(
-			node.payInvoice(bolt11, 5_000, undefined, 1)
-		);
+		const refusal = await refusalOf(node.payInvoice(bolt11, 5_000, 0, 1));
 		expect(refusal).to.contain('Daily spend limit exceeded');
 		expect(refusal).to.contain('requested: 4000 sats');
 		expect(calls).to.have.length(2);
@@ -203,7 +201,7 @@ describe('payInvoice admission on a fixed-amount invoice (#528)', function () {
 		stubSendPayment(node);
 		const invoice = invoiceFrom(3_000, 'understated');
 
-		const paid = node.payInvoice(invoice.bolt11, 5_000, undefined, 1);
+		const paid = node.payInvoice(invoice.bolt11, 5_000, 0, 1);
 		// Reserving the override left 9 999 sats of a 10 000 sat budget apparently
 		// free while 3 000 were on their way out.
 		expect(internals(node)._pendingSpendSats).to.equal(3_000);
@@ -220,10 +218,10 @@ describe('payInvoice admission on a fixed-amount invoice (#528)', function () {
 		const invoice = invoiceFrom(undefined, 'amountless');
 
 		expect(
-			await refusalOf(node.payInvoice(invoice.bolt11, 5_000, undefined, 5_001))
+			await refusalOf(node.payInvoice(invoice.bolt11, 5_000, 0, 5_001))
 		).to.contain('exceeds per-payment limit');
 
-		const paid = node.payInvoice(invoice.bolt11, 5_000, undefined, 4_000);
+		const paid = node.payInvoice(invoice.bolt11, 5_000, 0, 4_000);
 		expect(internals(node)._pendingSpendSats).to.equal(4_000);
 		expect(calls).to.have.length(1);
 
@@ -237,7 +235,7 @@ describe('payInvoice admission on a fixed-amount invoice (#528)', function () {
 		// stay the engine's own MISSING_AMOUNT.
 		const { bolt11 } = invoiceFrom(undefined, 'no amount anywhere');
 
-		expect(await refusalOf(node.payInvoice(bolt11, 5_000))).to.contain(
+		expect(await refusalOf(node.payInvoice(bolt11, 5_000, 0))).to.contain(
 			'Invoice has no amount'
 		);
 		expect(internals(node)._pendingSpendSats).to.equal(0);
@@ -247,7 +245,7 @@ describe('payInvoice admission on a fixed-amount invoice (#528)', function () {
 		const calls = stubSendPayment(node);
 		const { bolt11 } = invoiceFrom(6_000, 'safe');
 
-		const result = await node.payInvoiceSafe(bolt11, 5_000, undefined, 1);
+		const result = await node.payInvoiceSafe(bolt11, 5_000, 0, 1);
 		expect(result.status).to.equal('FAILED');
 		expect(result.failureDescription).to.contain('SPENDING_LIMIT_EXCEEDED');
 		expect(calls).to.have.length(0);
@@ -257,7 +255,10 @@ describe('payInvoice admission on a fixed-amount invoice (#528)', function () {
 		const calls = stubSendPayment(node);
 		const { bolt11 } = invoiceFrom(6_000, 'retried');
 
-		const result = await node.payInvoiceWithRetry(bolt11, { amountSats: 0 });
+		const result = await node.payInvoiceWithRetry(bolt11, {
+			amountSats: 0,
+			maxFeeSats: 0
+		});
 		expect(result.status).to.equal('FAILED');
 		expect(result.attempts).to.equal(1);
 		expect(result.failureDescription).to.contain('exceeds per-payment limit');
@@ -273,7 +274,10 @@ describe('payInvoice admission on a fixed-amount invoice (#528)', function () {
 			alwaysHasCapacity;
 		const { bolt11 } = invoiceFrom(6_000, 'queued');
 
-		const entry = node.enqueuePayment(bolt11, 1, { amountSats: 1 });
+		const entry = node.enqueuePayment(bolt11, 1, {
+			amountSats: 1,
+			maxFeeSats: 0
+		});
 		const settled = await settledQueueEntry(node, entry.id);
 		expect(settled.status).to.equal('failed');
 		// The limits refused it, so the engine never saw it.
