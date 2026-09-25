@@ -161,6 +161,8 @@ export interface ISerializedHtlcEntry {
 	dustExposureFailback?: boolean;
 	/** Admission-time expired-at-our-tip classification (see IHtlcEntry). */
 	expiredOnArrival?: boolean;
+	/** Admission-time funder-fee band classification (see IHtlcEntry). */
+	funderFeeFailback?: boolean;
 	/** Admitted while the capsule-restore hold stood (see IHtlcEntry). */
 	addedWhileRestoreUnproven?: boolean;
 	/** Admitted while the funding-missing quarantine stood (see IHtlcEntry). */
@@ -222,6 +224,9 @@ export function serializeHtlcEntry(
 		...(e.expiredOnArrival !== undefined
 			? { expiredOnArrival: e.expiredOnArrival }
 			: {}),
+		...(e.funderFeeFailback !== undefined
+			? { funderFeeFailback: e.funderFeeFailback }
+			: {}),
 		...(e.addedWhileRestoreUnproven !== undefined
 			? { addedWhileRestoreUnproven: e.addedWhileRestoreUnproven }
 			: {}),
@@ -276,6 +281,9 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 				: {}),
 			...(s.expiredOnArrival !== undefined
 				? { expiredOnArrival: s.expiredOnArrival }
+				: {}),
+			...(s.funderFeeFailback !== undefined
+				? { funderFeeFailback: s.funderFeeFailback }
 				: {}),
 			...(s.addedWhileRestoreUnproven !== undefined
 				? { addedWhileRestoreUnproven: s.addedWhileRestoreUnproven }
@@ -336,6 +344,8 @@ export interface ISerializedChannelState {
 	 * quarantine the chain has not lifted.
 	 */
 	fundingUnaccounted?: boolean;
+	/** A splice has been adopted at least once (see IChannelState). */
+	hasBeenSpliced?: boolean;
 	fundingOutputIndex: number;
 	minimumDepth: number;
 	localConfig: ISerializedChannelConfig;
@@ -854,6 +864,7 @@ export function serializeChannelState(
 		pendingFundingTxHex: s.pendingFundingTxHex,
 		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
 		fundingUnaccounted: s.fundingUnaccounted,
+		hasBeenSpliced: s.hasBeenSpliced,
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: serializeChannelConfig(s.localConfig),
@@ -1272,6 +1283,7 @@ export function deserializeChannelState(
 		pendingFundingTxHex: s.pendingFundingTxHex,
 		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
 		fundingUnaccounted: s.fundingUnaccounted,
+		hasBeenSpliced: s.hasBeenSpliced,
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: deserializeChannelConfig(s.localConfig),

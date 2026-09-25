@@ -16889,6 +16889,22 @@ export class LightningNode extends EventEmitter {
 			policyCode = finalHop
 				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 				: EXPIRY_TOO_SOON;
+		} else if (channel.receivedHtlcExceedsFunderFee(htlcId)) {
+			// We fund the channel and this add was admitted inside the
+			// funder-fee band (issue #1020): by the sender's own arithmetic our
+			// commitment fee could not be met above our reserve once it was in,
+			// but our output survived, so the channel took it rather than
+			// failing. Settling it would keep paying that fee out of our
+			// reserve; failing it back returns the peer's value and the fee
+			// weight in one removal round. Same answers as the dust arm above.
+			this.emitStructuredLog('htlc', 'refused_funder_fee', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				finalHop
+			});
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: TEMPORARY_CHANNEL_FAILURE;
 		} else if (
 			this.currentBlockHeight > 0 &&
 			htlcEntry.cltvExpiry >
