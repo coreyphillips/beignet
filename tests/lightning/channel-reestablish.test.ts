@@ -1160,6 +1160,13 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			const state = channel.getFullState();
 			state.localBalanceMsat = 1_200_000n;
 			state.role = ChannelRole.ACCEPTOR;
+			// The row was serialised from the OPENER, so its remote balance is
+			// the original acceptor's push amount. With the role flipped the
+			// peer is the funder, and the ceiling now also asks whether that
+			// funder can pay the commitment fee for one more HTLC (issue
+			// #1020); give it the rest of the capacity so only our own dust
+			// floor binds, which is what this case pins.
+			state.remoteBalanceMsat = 148_800_000n;
 			expect(channel.getSpendableOutboundMsat()).to.equal(138_000n);
 		});
 
