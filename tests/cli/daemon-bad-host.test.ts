@@ -10,9 +10,11 @@
  *
  * Runs against a chainless daemon over a raw socket, because http.request
  * refuses to send the Host values that matter. The daemon reads only the path
- * and the query, so the Host header is not a base any more and such requests
- * answer 200; a target the parser refuses on its own ("//[") answers 400. A
- * plain request afterwards proves the process survived.
+ * and the query, so the Host header is not a base any more; with no
+ * credential configured such a Host is refused by the browser guard of issue
+ * #1005 (421 HOST_NOT_ALLOWED), an answer rather than a crash. A target the
+ * parser refuses on its own ("//[") answers 400. A plain request afterwards
+ * proves the process survived.
  */
 
 import { expect } from 'chai';
@@ -114,8 +116,12 @@ describe('daemon malformed request target and Host header (issue #1003)', functi
 			const response = await raw(
 				`GET /health HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`
 			);
-			expect(statusOf(response), response).to.equal(200);
-			expect(bodyOf(response).ok).to.equal(true);
+			expect(statusOf(response), response).to.equal(421);
+			const body = bodyOf(response);
+			expect(body.ok).to.equal(false);
+			expect((body.error as { code: string }).code).to.equal(
+				'HOST_NOT_ALLOWED'
+			);
 			const after = await get('/health');
 			expect(after.status).to.equal(200);
 			expect(daemon.server.listening).to.equal(true);

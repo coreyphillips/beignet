@@ -442,14 +442,17 @@ CLI: `beignet watchtower list|add <pubkey@host:port>|remove <uri>`, daemon flag 
 The same node runs as an HTTP/SSE daemon for language-agnostic integrations, driven by a JSON CLI.
 
 ```bash
-# 1. Generate a mnemonic + ~/.beignet/config.json
+# 1. Generate a mnemonic, an API token and ~/.beignet/config.json
 npx beignet init --network regtest
+# {"ok":true,"result":{"message":"Initialized","mnemonic":"...","network":"regtest",
+#   "apiToken":"3f9c...64 hex...","note":"apiToken was generated and saved to config.json; ..."}}
 
-# 2. Start the daemon (add --daemon to background it)
+# 2. Start the daemon (add --daemon to background it). It reads the token from
+#    config.json; --api-token or BEIGNET_API_TOKEN override it.
 BEIGNET_ELECTRUM_HOST=127.0.0.1 BEIGNET_ELECTRUM_PORT=60001 BEIGNET_ELECTRUM_TLS=false \
-  npx beignet start --network regtest --api-token mytoken
+  npx beignet start --network regtest
 
-# 3. Drive it with the CLI (thin HTTP client, JSON out)
+# 3. Drive it with the CLI (thin HTTP client, JSON out; it sends the token itself)
 npx beignet info --pretty
 npx beignet address
 npx beignet channel connect-and-open <pubkey> <host> <port> 200000
@@ -461,22 +464,24 @@ Electrum and most other settings come from `~/.beignet/config.json` or the envir
 
 `config.json` holds the mnemonic, so everything under `~/.beignet` is created owner-only (`0700` directories, `0600` files: config, pid file, database and sidecars, backups, SCB exports), the CLI runs `init`, `start`, `backup` and `restore` under umask `077`, and a config file an earlier release left readable is tightened the next time it is read, with a notice on stderr. Details in [src/cli/README.md](src/cli/README.md#file-permissions).
 
-Or over HTTP directly:
+Or over HTTP directly, with the token `init` printed (or `apiToken` from `~/.beignet/config.json`):
 
 ```bash
-curl -X POST http://localhost:2112/invoice/create -H 'Authorization: Bearer mytoken' \
+TOKEN=3f9c...   # the apiToken from beignet init
+curl -X POST http://localhost:2112/invoice/create -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d '{"amountSats": 1000, "description": "coffee"}'
 
-curl -X POST http://localhost:2112/invoice/pay -H 'Authorization: Bearer mytoken' \
+curl -X POST http://localhost:2112/invoice/pay -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d '{"bolt11": "lnbcrt10n1..."}'
 
-curl -N http://localhost:2112/events -H 'Authorization: Bearer mytoken'  # SSE stream
-curl http://localhost:2112/ready                                        # load-balancer probe
+curl -N http://localhost:2112/events -H "Authorization: Bearer $TOKEN"  # SSE stream
+curl http://localhost:2112/ready                                       # load-balancer probe
 ```
 
 - Responses are `{ "ok": true, "result": {...} }` or `{ "ok": false, "error": { "code": "...", "message": "..." } }`.
 - Full spec at `GET /openapi.json`.
-- `GET /health`, `/ready`, `/openapi.json` and `/metrics` are auth-exempt; everything else requires the bearer token **when one is configured**. Auth is off unless you set `apiToken` or `apiKeys` (named keys with `readonly`/`invoice`/`admin` scopes), so configure a token before exposing the daemon anywhere. It binds `127.0.0.1` by default.
+- Authentication is on for every install `beignet init` creates (releases after 0.22.0): `init` mints a random `apiToken` and saves it in `config.json` (run `init` again on an older config to add one). Auth is off only for a config with neither `apiToken` nor `apiKeys` (named keys with `readonly`/`invoice`/`admin` scopes); `beignet start` warns on stderr in that case. `GET /health`, `/ready` and `/openapi.json` are auth-exempt; `/metrics` only with `metricsPublic`; everything else requires the bearer token. The daemon binds `127.0.0.1` by default.
+- While auth is off, three browser guards keep a web page from driving the loopback daemon (issue #1005): a request body must be `Content-Type: application/json` (else `415 UNSUPPORTED_MEDIA_TYPE`), an `Origin` other than the configured `cors` origin or a `Sec-Fetch-Site: cross-site` request is refused (`403 CROSS_SITE_REQUEST_REFUSED`), and the `Host` header must be the loopback name the daemon is bound on (else `421 HOST_NOT_ALLOWED`, which also defeats DNS rebinding). They apply to every route but `OPTIONS`; plain clients (curl, the CLI, the SDKs) send none of those headers and are unaffected, and with a token configured the guards do not run at all.
 - Embed it instead of shelling out: `import { startDaemon } from 'beignet/cli'`.
 
 ### FFOR offline receive

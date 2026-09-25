@@ -14,7 +14,8 @@ Both return plain JSON with hex string IDs and satoshi amounts (no Buffer, no bi
 ### CLI
 
 ```bash
-# Initialize (generates mnemonic, writes ~/.beignet/config.json)
+# Initialize (generates mnemonic and API token, writes ~/.beignet/config.json;
+# the token is printed once, and every command below reads it from the config)
 npx ts-node src/cli/cli.ts init --network regtest
 
 # Start the daemon (stays in foreground, listens on 127.0.0.1:2112)
@@ -1365,6 +1366,16 @@ one via `BEIGNET_MNEMONIC`/config); the daemon never generates or replaces a
 seed. `GET /mnemonic` only reveals the configured seed, and only when
 `apiToken` or `apiKeys` is set (admin scope).
 
+`init` also mints an `apiToken` (32 random bytes, hex) whenever the config
+carries neither `apiToken` nor `apiKeys` and the environment supplies neither
+`BEIGNET_API_TOKEN` nor `BEIGNET_API_KEYS`. The token is saved to
+`config.json` and printed once, as `apiToken` with a `note` on how to send it;
+an existing token or key set is left alone and never printed. Running `init`
+on a config an older release wrote (mnemonic, no credential) adds a token the
+same way. `beignet start` with no credential at all keeps running but warns
+on stderr: `authentication is off: any local process can drive this daemon;
+run beignet init or set apiToken`.
+
 ### API key management
 
 ```bash
@@ -2025,9 +2036,17 @@ When any credential is configured, all endpoints require an `Authorization: Bear
 
 - `GET /health`, `GET /ready` -- monitoring tools
 - `GET /openapi.json` -- API discovery
-- `GET /metrics` -- Prometheus scrapers
+- `GET /metrics` -- Prometheus scrapers, only with `metricsPublic` (it reports balances)
 
-If neither `apiToken` nor `apiKeys` is configured, all endpoints are open (backward-compatible). `GET /mnemonic` is only accessible when auth is configured (and only to `admin`).
+Every install `beignet init` creates carries an `apiToken` (see [Setup](#setup)). If neither `apiToken` nor `apiKeys` is configured (a config written by hand or by a release before 0.22.0's successor), all endpoints are open to local processes, `GET /mnemonic` excepted (it needs auth, and `admin`), the daemon logs a warning at boot, and three browser guards keep a web page from driving it (issue #1005):
+
+| Guard | Refusal |
+|-------|---------|
+| A request with a body must carry `Content-Type: application/json` (media type parameters such as `; charset=utf-8` are fine, case does not matter). A body with no Content-Type is refused too: `fetch()` in `no-cors` mode sends `text/plain` or nothing, with no preflight. | `415 UNSUPPORTED_MEDIA_TYPE` |
+| An `Origin` header must equal the configured `cors` origin string; with `cors` off, any `Origin` is refused, `null` included. Without an `Origin`, a `Sec-Fetch-Site: cross-site` request is refused (`same-origin`, `same-site` and `none` pass). With wildcard CORS (an `insecure` opt-in), any origin passes. | `403 CROSS_SITE_REQUEST_REFUSED` |
+| The `Host` header must name the loopback address the daemon is bound on: `localhost`, `127.0.0.0/8` or `[::1]`, with or without a port, or the configured `daemonHost` when it is a concrete address. A missing `Host` (HTTP/1.0) passes only on a loopback bind. This defeats DNS rebinding, where a page reads answers through a name that resolves to 127.0.0.1. Skipped for a wildcard bind (`0.0.0.0`, `::`, only possible under `insecure`). | `421 HOST_NOT_ALLOWED` |
+
+The guards run ahead of the rate limiter and the auth middleware and apply to every route, the auth-exempt ones and the SSE stream included; only `OPTIONS` (204) is exempt. Plain clients (curl, the CLI, the SDKs) send none of those headers, so they are unaffected; a reverse proxy in front of an unauthenticated daemon must forward a loopback `Host` (or the daemon needs a credential, which is the better fix). With a credential configured the guards do not run at all: a browser cannot attach a bearer token cross-site, and non-browser clients keep sending whatever Content-Type they like.
 
 **Scopes:**
 
@@ -2257,7 +2276,7 @@ All responses include `X-API-Version: 1` header. Non-prefixed routes continue to
 
 ### CORS
 
-Enable CORS with `cors: true` (allows all origins) or `cors: 'https://myapp.com'` (specific origin) in DaemonOptions. Wildcard CORS requires authentication: with `apiToken`/`apiKeys` unset, `cors: true` is refused at startup (any page the operator visits could otherwise drive the API); pass an explicit origin, configure auth, or set `insecure: true` to accept the risk.
+Enable CORS with `cors: true` (allows all origins) or `cors: 'https://myapp.com'` (specific origin) in DaemonOptions. Wildcard CORS requires authentication: with `apiToken`/`apiKeys` unset, `cors: true` is refused at startup (any page the operator visits could otherwise drive the API); pass an explicit origin, configure auth, or set `insecure: true` to accept the risk. While authentication is off, the configured origin string is also the only `Origin` the browser guards admit (see [Authentication](#authentication)): a page at any other origin is refused with `403 CROSS_SITE_REQUEST_REFUSED` before the route runs.
 
 ```typescript
 startDaemon({ cors: true, apiToken: '...' });  // Access-Control-Allow-Origin: *

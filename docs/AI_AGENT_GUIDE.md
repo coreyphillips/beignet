@@ -62,7 +62,7 @@ const { server, node } = await startDaemon({
 });
 ```
 
-All endpoints use JSON. Example:
+All endpoints use JSON: send every body as `Content-Type: application/json` (with authentication off the daemon refuses anything else with `415 UNSUPPORTED_MEDIA_TYPE`). `$TOKEN` is the `apiToken` that `beignet init` prints and saves to `~/.beignet/config.json` (or whatever `apiToken`/`apiKeys` you configured). Example:
 
 ```bash
 # Pay an invoice
@@ -680,6 +680,7 @@ node.forgetL402Credential(scope);    // drop one, so the next call pays again
 Via HTTP:
 ```bash
 curl -X POST http://localhost:2112/l402/fetch -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
   -d '{"url":"https://api.example/v1/data","maxPriceSats":50}'
 ```
 
@@ -748,7 +749,7 @@ await node.gracefulShutdown();
 
 ## Security
 
-- **API Token**: Always set `apiToken` in production
+- **API Token**: `beignet init` mints one and saves it to the config; always keep `apiToken` (or `apiKeys`) set in production. Without one the daemon warns at start and falls back to browser guards (JSON-only bodies, no foreign `Origin`, loopback `Host` only), which keep a web page out but not another local process.
 - **Mnemonic**: Store securely, never log
 - **Network**: Bind daemon to `127.0.0.1` (default)
 - **TLS**: For production, enable HTTPS with `--tls-cert` and `--tls-key` (or `BEIGNET_TLS_CERT`/`BEIGNET_TLS_KEY` env vars)
