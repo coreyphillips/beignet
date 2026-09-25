@@ -354,6 +354,16 @@ export interface IHtlcEntry {
 	 */
 	dustExposureFailback?: boolean;
 	/**
+	 * Admission-time classification (issue #1009): this received HTLC's
+	 * cltv_expiry was at or below our chain tip when it was admitted, so the
+	 * node fails it back once committed (expiry_too_soon as a forwarder,
+	 * incorrect_or_unknown_payment_details as the final hop) and never settles
+	 * it. Stamped at admission because the tip is ours alone and the peer
+	 * cannot be blamed for it; persisted so a restart replay answers
+	 * identically.
+	 */
+	expiredOnArrival?: boolean;
+	/**
 	 * Admission-time provenance (issue #469): this received HTLC entered the
 	 * channel while a restriction that disarms its on-chain enforcement was
 	 * already standing: the recency hold (restoreRecencyUnproven, or the
