@@ -1462,6 +1462,8 @@ export interface ISerializedPaymentInfo {
 	paymentHash: string;
 	preimage?: string;
 	amountMsat: string;
+	/** Msat that left the node, fees included, when amountMsat is not that (MPP). */
+	sentMsat?: string;
 	status: string;
 	direction: string;
 	route?: string; // JSON string
@@ -1480,6 +1482,7 @@ export function serializePaymentInfo(p: IPaymentInfo): ISerializedPaymentInfo {
 		paymentHash: p.paymentHash.toString('hex'),
 		preimage: bufToHex(p.preimage) ?? undefined,
 		amountMsat: bigintToStr(p.amountMsat),
+		...(p.sentMsat !== undefined ? { sentMsat: bigintToStr(p.sentMsat) } : {}),
 		status: p.status,
 		direction: p.direction,
 		route: p.route
@@ -1523,6 +1526,7 @@ export function deserializePaymentInfo(
 		paymentHash: Buffer.from(s.paymentHash, 'hex'),
 		preimage: s.preimage ? Buffer.from(s.preimage, 'hex') : undefined,
 		amountMsat: strToBigint(s.amountMsat),
+		...(s.sentMsat !== undefined ? { sentMsat: strToBigint(s.sentMsat) } : {}),
 		status: s.status as PaymentStatus,
 		direction: s.direction as PaymentDirection,
 		route: s.route ? JSON.parse(s.route, reviver) : undefined,

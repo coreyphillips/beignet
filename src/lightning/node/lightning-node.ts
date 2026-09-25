@@ -16488,10 +16488,15 @@ export class LightningNode extends EventEmitter {
 		// Create a single payment record, journaled BEFORE any part leaves,
 		// as the single-path send does: a restart mid-flight must find the
 		// record, or the parts' outcome (and the preimage) has no owner
-		// (#743 audit).
+		// (#743 audit). sentMsat is the sum of the parts' first-hop amounts,
+		// the invoice amount plus every part's fees: it is written here, with
+		// the first persist, because settledHtlcs holds incoming-side keys
+		// with no amounts and the MPP state is not restored at boot, so it
+		// cannot be summed at settlement (issue #1008).
 		const payment: IPaymentInfo = {
 			paymentHash,
 			amountMsat: totalMsat,
+			sentMsat: multiRoute.totalAmountMsat,
 			status: PaymentStatus.PENDING,
 			direction: PaymentDirection.OUTGOING,
 			createdAt: Date.now()

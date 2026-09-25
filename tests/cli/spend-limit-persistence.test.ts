@@ -328,7 +328,7 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 		it("keeps the day's counters across a restart within the UTC day", async () => {
 			const invoice = invoiceFrom(1_000, 'before the restart');
 			stubSendPayment(node);
-			const paid = node.payInvoice(invoice.bolt11, 5_000);
+			const paid = node.payInvoice(invoice.bolt11, 5_000, 0);
 			settle(node, invoice.paymentHash);
 			await paid;
 			expect(spent(node)).to.equal(1_000);
@@ -356,15 +356,15 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 
 			// The restored total is what the limit is judged against.
 			const over = invoiceFrom(LIMIT_SATS - 999, 'over the restored total');
-			expect(await rejectionOf(node.payInvoice(over.bolt11, 5_000))).to.equal(
-				'SPENDING_LIMIT_EXCEEDED'
-			);
+			expect(
+				await rejectionOf(node.payInvoice(over.bolt11, 5_000, 0))
+			).to.equal('SPENDING_LIMIT_EXCEEDED');
 		});
 
 		it('starts the day at zero when the stored day has ended', async () => {
 			const invoice = invoiceFrom(1_000, 'yesterday');
 			stubSendPayment(node);
-			const paid = node.payInvoice(invoice.bolt11, 5_000);
+			const paid = node.payInvoice(invoice.bolt11, 5_000, 0);
 			settle(node, invoice.paymentHash);
 			await paid;
 			expect(spent(node)).to.equal(1_000);
@@ -383,7 +383,7 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 		it('carryDaemonState copies the ledger into the staged database of a capsule resume', async () => {
 			const invoice = invoiceFrom(1_000, 'carried');
 			stubSendPayment(node);
-			const paid = node.payInvoice(invoice.bolt11, 5_000);
+			const paid = node.payInvoice(invoice.bolt11, 5_000, 0);
 			settle(node, invoice.paymentHash);
 			await paid;
 
@@ -412,9 +412,9 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 			engineOf(node).hasHtlcInFlight = (hash): boolean =>
 				hash.equals(invoice.paymentHash);
 
-			expect(await rejectionOf(node.payInvoice(invoice.bolt11, 50))).to.equal(
-				'PAYMENT_TIMEOUT'
-			);
+			expect(
+				await rejectionOf(node.payInvoice(invoice.bolt11, 50, 0))
+			).to.equal('PAYMENT_TIMEOUT');
 			expect(node.getPayment(invoice.hashHex)?.status).to.equal('PENDING');
 			expect(spent(node)).to.equal(0);
 			// The HTLC can still spend the money, so its budget stays held.
@@ -436,9 +436,9 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 			stubSendPayment(node);
 			engineOf(node).hasHtlcInFlight = (hash): boolean =>
 				hash.equals(invoice.paymentHash);
-			expect(await rejectionOf(node.payInvoice(invoice.bolt11, 50))).to.equal(
-				'PAYMENT_TIMEOUT'
-			);
+			expect(
+				await rejectionOf(node.payInvoice(invoice.bolt11, 50, 0))
+			).to.equal('PAYMENT_TIMEOUT');
 			expect(pending(node)).to.equal(1_000);
 			expect(storedLedger(node)?.claims[invoice.hashHex]).to.have.length(1);
 			// The engine persists its PENDING record; the stub does not.
@@ -471,9 +471,9 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 			stubSendPayment(node);
 			engineOf(node).hasHtlcInFlight = (hash): boolean =>
 				hash.equals(invoice.paymentHash);
-			expect(await rejectionOf(node.payInvoice(invoice.bolt11, 50))).to.equal(
-				'PAYMENT_TIMEOUT'
-			);
+			expect(
+				await rejectionOf(node.payInvoice(invoice.bolt11, 50, 0))
+			).to.equal('PAYMENT_TIMEOUT');
 			const held = node.getDailySpendInfo();
 			expect(held.pendingSats).to.equal(1_000);
 			expect(held.remainingSats).to.equal(LIMIT_SATS - 1_000);
@@ -498,7 +498,7 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 			// sendPaymentAsync, which never had a listener, releases the same
 			// way.
 			const async = invoiceFrom(2_000, 'async gave up');
-			expect(node.sendPaymentAsync(async.bolt11).status).to.equal('PENDING');
+			expect(node.sendPaymentAsync(async.bolt11, 0).status).to.equal('PENDING');
 			expect(pending(node)).to.equal(2_000);
 			fail(node, async.paymentHash);
 			expect(pending(node)).to.equal(0);
@@ -510,9 +510,9 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 			stubSendPayment(node);
 			engineOf(node).hasHtlcInFlight = (hash): boolean =>
 				hash.equals(invoice.paymentHash);
-			expect(await rejectionOf(node.payInvoice(invoice.bolt11, 50))).to.equal(
-				'PAYMENT_TIMEOUT'
-			);
+			expect(
+				await rejectionOf(node.payInvoice(invoice.bolt11, 50, 0))
+			).to.equal('PAYMENT_TIMEOUT');
 			persistRecord(node, invoice.paymentHash, PaymentStatus.PENDING);
 
 			await restart();
@@ -541,10 +541,12 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 			const completed = invoiceFrom(1_000, 'completed while down');
 			const failed = invoiceFrom(2_000, 'failed while down');
 			stubSendPayment(node);
-			expect(node.sendPaymentAsync(completed.bolt11).status).to.equal(
+			expect(node.sendPaymentAsync(completed.bolt11, 0).status).to.equal(
 				'PENDING'
 			);
-			expect(node.sendPaymentAsync(failed.bolt11).status).to.equal('PENDING');
+			expect(node.sendPaymentAsync(failed.bolt11, 0).status).to.equal(
+				'PENDING'
+			);
 			expect(pending(node)).to.equal(3_000);
 			expect(Object.keys(storedLedger(node)?.claims ?? {})).to.have.length(2);
 
@@ -573,12 +575,16 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 		it('charges a hash with two attempts once per settlement report, and never again at a later boot', async () => {
 			const invoice = invoiceFrom(1_000, 'retried');
 			stubSendPayment(node);
-			expect(node.sendPaymentAsync(invoice.bolt11).status).to.equal('PENDING');
+			expect(node.sendPaymentAsync(invoice.bolt11, 0).status).to.equal(
+				'PENDING'
+			);
 			// The first attempt fails with its HTLC still out, so its claim
 			// stays; the retry claims beside it.
 			engineOf(node).hasHtlcInFlight = (): boolean => true;
 			fail(node, invoice.paymentHash);
-			expect(node.sendPaymentAsync(invoice.bolt11).status).to.equal('PENDING');
+			expect(node.sendPaymentAsync(invoice.bolt11, 0).status).to.equal(
+				'PENDING'
+			);
 			expect(pending(node)).to.equal(2_000);
 
 			// One settlement per hash, and no re-send of a paid hash (#975):
@@ -607,7 +613,7 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 		it('payInvoice: the settle is charged once, before the caller resolves', async () => {
 			const invoice = invoiceFrom(1_000, 'blocking');
 			stubSendPayment(node);
-			const paid = node.payInvoice(invoice.bolt11, 5_000);
+			const paid = node.payInvoice(invoice.bolt11, 5_000, 0);
 			expect(pending(node)).to.equal(1_000);
 			let spentWhenResolved = -1;
 			const resolved = paid.then(() => {
@@ -626,7 +632,7 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 
 		it('sendKeysend: a keysend that settles later is charged once', async () => {
 			const paymentHash = stubSendKeysend(node, 1_000);
-			const paid = node.sendKeysend(PUBKEY, 1_000, 5_000);
+			const paid = node.sendKeysend(PUBKEY, 1_000, 5_000, 0);
 			// The reservation moved under the hash the engine chose.
 			expect(pending(node)).to.equal(1_000);
 			expect(claimedSats(node, paymentHash.toString('hex'))).to.equal(1_000);
@@ -643,7 +649,7 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 			const quiet = stubSendKeysend(node, 1_000, {
 				status: PaymentStatus.COMPLETED
 			});
-			expect((await node.sendKeysend(PUBKEY, 1_000, 5_000)).status).to.equal(
+			expect((await node.sendKeysend(PUBKEY, 1_000, 5_000, 0)).status).to.equal(
 				'COMPLETED'
 			);
 			expect(spent(node)).to.equal(1_000);
@@ -657,7 +663,7 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 				status: PaymentStatus.COMPLETED,
 				emitInside: true
 			});
-			expect((await node.sendKeysend(PUBKEY, 1_000, 5_000)).status).to.equal(
+			expect((await node.sendKeysend(PUBKEY, 1_000, 5_000, 0)).status).to.equal(
 				'COMPLETED'
 			);
 			expect(spent(node)).to.equal(2_000);
@@ -670,7 +676,7 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 		it('payOffer: the settle is charged once', async () => {
 			const paymentHash = stubPayee(node, 1_000);
 			const offer = node.createOffer({ description: 'charged once' }).encoded!;
-			const paid = node.payOffer(offer, undefined, 5_000);
+			const paid = node.payOffer(offer, undefined, 5_000, 0);
 			// The claim opens once the payee has priced the offer.
 			while (pending(node) !== 1_000) {
 				await new Promise((resolve) => setTimeout(resolve, 5));
@@ -687,7 +693,9 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 		it('sendPaymentAsync: the settle is charged once', async () => {
 			const invoice = invoiceFrom(1_000, 'async');
 			stubSendPayment(node);
-			expect(node.sendPaymentAsync(invoice.bolt11).status).to.equal('PENDING');
+			expect(node.sendPaymentAsync(invoice.bolt11, 0).status).to.equal(
+				'PENDING'
+			);
 			expect(pending(node)).to.equal(1_000);
 			settle(node, invoice.paymentHash);
 			expect(spent(node)).to.equal(1_000);
@@ -701,16 +709,16 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 			const invoice = invoiceFrom(1_000, 'refused');
 			stubSendPayment(node, { throws: new Error('No route found') });
 			expect(
-				await rejectionOf(node.payInvoice(invoice.bolt11, 5_000))
+				await rejectionOf(node.payInvoice(invoice.bolt11, 5_000, 0))
 			).to.equal('NO_ROUTE');
-			expect(() => node.sendPaymentAsync(invoice.bolt11)).to.throw(
+			expect(() => node.sendPaymentAsync(invoice.bolt11, 0)).to.throw(
 				'No route found'
 			);
 
 			stubSendKeysend(node, 1_000, { throws: new Error('No route found') });
 			// A keysend refusal carries its code as an invoice's does (#991).
 			expect(
-				await rejectionOf(node.sendKeysend(PUBKEY, 1_000, 5_000))
+				await rejectionOf(node.sendKeysend(PUBKEY, 1_000, 5_000, 0))
 			).to.equal('NO_ROUTE');
 
 			expect(spent(node)).to.equal(0);
@@ -722,7 +730,7 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 		it('a definitive failure with nothing out releases the reservation and charges nothing', async () => {
 			const invoice = invoiceFrom(1_000, 'fails');
 			stubSendPayment(node);
-			const paid = node.payInvoice(invoice.bolt11, 5_000);
+			const paid = node.payInvoice(invoice.bolt11, 5_000, 0);
 			expect(pending(node)).to.equal(1_000);
 			fail(node, invoice.paymentHash);
 			expect(await rejectionOf(paid)).to.equal('PAYMENT_FAILED');
@@ -730,7 +738,7 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 			expect(spent(node)).to.equal(0);
 
 			const paymentHash = stubSendKeysend(node, 1_000);
-			const keysend = node.sendKeysend(PUBKEY, 1_000, 5_000);
+			const keysend = node.sendKeysend(PUBKEY, 1_000, 5_000, 0);
 			expect(pending(node)).to.equal(1_000);
 			fail(node, paymentHash);
 			expect(await rejectionOf(keysend)).to.equal('PAYMENT_FAILED');
@@ -739,7 +747,7 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 
 			// A ghost timeout, with nothing out, releases the same way.
 			const ghost = invoiceFrom(1_000, 'ghost');
-			expect(await rejectionOf(node.payInvoice(ghost.bolt11, 50))).to.equal(
+			expect(await rejectionOf(node.payInvoice(ghost.bolt11, 50, 0))).to.equal(
 				'PAYMENT_TIMEOUT'
 			);
 			expect(pending(node)).to.equal(0);
@@ -756,7 +764,7 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 			stubSendPayment(node);
 			engineOf(node).hasHtlcInFlight = (hash): boolean =>
 				hash.equals(invoice.paymentHash);
-			const paid = node.payInvoice(invoice.bolt11, 5_000);
+			const paid = node.payInvoice(invoice.bolt11, 5_000, 0);
 			fail(node, invoice.paymentHash);
 			expect(await rejectionOf(paid)).to.equal('PAYMENT_FAILED');
 			// The HTLC cannot be retracted: the budget stays held for it.

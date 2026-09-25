@@ -209,7 +209,7 @@ verify the Lightning leg outlives its on-chain refund before funding.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `payInvoice(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?, maxFeeMsat?)` | `Promise<PaymentInfo>` | Pay invoice. **Blocks until settled or timeout** (default 60s). At the timeout the payment is failed only when no HTLC is out for it; with one still in flight the record stays `PENDING` until that HTLC resolves, no further route is tried after the timeout, and the record is failed when the HTLC fails or its on-chain timeout resolves; the `PAYMENT_TIMEOUT` message says so (issue #976). `maxFeeSats` caps routing fees in whole sats; `maxFeeMsat` (a number or a decimal string) caps them exactly, for a caller holding an exact quote such as `estimatePayment`'s `estimatedFeeMsat`. Pass one or the other: both at once is refused with `INVALID_PARAMS`; a route over the cap is refused with `FEE_EXCEEDS_MAX` (409 over HTTP, permanent for `isRetryableError` and `payInvoiceWithRetry`) and nothing is sent. `amountSats` is required for amount-less invoices. `metadata` attaches key-value labels. `cltvLimit` caps the payment's total CLTV expiry at that many blocks above the current tip (every attempt, retry and MPP part); when no route fits it fails with `CLTV_EXCEEDS_MAX` and nothing is sent. A swap provider paying the counterparty's invoice sets it from the on-chain refund height (#751). |
+| `payInvoice(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?, maxFeeMsat?)` | `Promise<PaymentInfo>` | Pay invoice. **Blocks until settled or timeout** (default 60s). At the timeout the payment is failed only when no HTLC is out for it; with one still in flight the record stays `PENDING` until that HTLC resolves, no further route is tried after the timeout, and the record is failed when the HTLC fails or its on-chain timeout resolves; the `PAYMENT_TIMEOUT` message says so (issue #976). `maxFeeSats` caps routing fees in whole sats; `maxFeeMsat` (a number or a decimal string) caps them exactly, for a caller holding an exact quote such as `estimatePayment`'s `estimatedFeeMsat`; with neither, the cap is 1% of the amount, never below 50 sats. The spending limits count the amount plus the cap (see Spending Limits). Pass one or the other: both at once is refused with `INVALID_PARAMS`; a route over the cap is refused with `FEE_EXCEEDS_MAX` (409 over HTTP, permanent for `isRetryableError` and `payInvoiceWithRetry`) and nothing is sent. `amountSats` is required for amount-less invoices. `metadata` attaches key-value labels. `cltvLimit` caps the payment's total CLTV expiry at that many blocks above the current tip (every attempt, retry and MPP part); when no route fits it fails with `CLTV_EXCEEDS_MAX` and nothing is sent. A swap provider paying the counterparty's invoice sets it from the on-chain refund height (#751). |
 | `payInvoiceSafe(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?, maxFeeMsat?)` | `Promise<PaymentInfo>` | Like `payInvoice` but **never throws**: catches all errors and resolves with the hash's existing record when there is one (after a timeout with an HTLC still out, the `PENDING` record, which no further route is tried for and which is failed when that HTLC fails or its on-chain timeout resolves; for a duplicate refusal, the record the engine refused from) and otherwise with `status: 'FAILED'`. The `failureDescription` field contains `[ERROR_CODE] message` for machine parsing. |
 | `sendPaymentAsync(bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `{ paymentHash, status: 'PENDING' \| 'FAILED' }` | Fire-and-forget pay. Returns immediately, `FAILED` when the engine refused the submission outright (an expired invoice, an HTLC the channel would not take). Poll `getPayment()` for settlement. Drain mode and the spending limits are applied at submission, so it can throw `SERVICE_DRAINING` or `SPENDING_LIMIT_EXCEEDED`; the limits use the invoice's own amount whenever it carries one, since that is what gets paid. |
 | `payInvoiceWithRetry(bolt11, opts?)` | `Promise<RetryPaymentResult>` | Pay with exponential backoff retry. `opts: { maxRetries? (3), backoffMs? (2000), maxFeeSats?, amountSats?, metadata?, cltvLimit? }`. Emits `payment:retry` events. |
@@ -217,7 +217,7 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | `listPayments(filter?)` | `PaymentInfo[]` | List payments sorted by createdAt desc. Filter by `status`, `direction`, `since`, `limit`, `offset`, `metadataKey`, `metadataValue`. |
 | `getPayment(paymentHash)` | `PaymentInfo \| null` | Get specific payment |
 | `setPaymentMetadata(paymentHash, metadata)` | `void` | Attach key-value metadata to an existing payment |
-| `sendKeysend(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Spontaneous payment (no invoice). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. |
+| `sendKeysend(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Spontaneous payment (no invoice). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. Without `maxFeeSats` the routing fee is capped at 1% of the amount, never below 50 sats; the spending limits count the amount plus the cap. |
 | `sendKeysendSafe(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Like `sendKeysend` but **never throws** — resolves with `status: 'FAILED'` instead. |
 
 #### BOLT 12 Offers
@@ -254,7 +254,7 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | `getGraphChannel(scid)` | `GraphChannelInfo \| null` | Channel endpoints, capacity (from htlc_maximum_msat) and both directions' policies |
 | `describeGraph(limit?, offset?)` | `GraphDescribeResult` | Paged channel dump (limit defaults to 500, capped at 500) |
 | `queryRoute(destination, amountSats, maxFeeSats?)` | `RouteQueryResult` | Compute a route WITHOUT sending; hops feed `sendToRoute` |
-| `sendToRoute(paymentHash, route, paymentSecret?)` | `PaymentInfo` | Send a payment along an explicit route from `queryRoute` |
+| `sendToRoute(paymentHash, route, paymentSecret?)` | `PaymentInfo` | Send a payment along an explicit route from `queryRoute`. Drain mode and the spending limits apply to what the first hop carries (the amount plus every fee in the route), which is what leaves the node, and the settlement is charged to the daily spend at that figure; the first hop must carry at least the final hop's amount (`INVALID_PARAMS` otherwise) |
 
 #### Payment Proof
 
@@ -697,10 +697,25 @@ Every invoice payment (`payInvoice`, `payInvoiceSafe`, `payInvoiceWithRetry`,
 `sendPaymentAsync`, the queue and their routes) is checked and recorded at the
 amount that actually gets paid: the invoice's own amount whenever it carries
 one, and `amountSats` only for an amount-less invoice. A fractional msat amount
-rounds up. `validatePayment`, `estimatePayment` and `estimateRouteFee` preview
-the same amount. `payOffer` is checked and recorded the same way, against the
+rounds up. `payOffer` is checked and recorded the same way, against the
 amount of the BOLT 12 invoice the payee returns for the offer, which is what
 gets paid whatever `amountSats` asked for.
+
+Routing fees count too (issue #1008). Every Lightning pay path (`payInvoice`,
+`payInvoiceSafe`, `payInvoiceWithRetry`, the queue, `sendPaymentAsync`,
+`sendKeysend`, `payOffer` and their routes) sends under a fee cap: the caller's
+`maxFeeSats` / `maxFeeMsat`, or, when none is given, 1% of the amount rounded
+up and never below 50 sats. `maxPaymentSats` and the daily limit are judged on
+the amount PLUS that cap at admission, and the day is charged the amount plus
+the fee actually paid at settlement (the reservation stands in for a settlement
+whose record cannot say what it cost). A payment that fits a limit on its
+amount alone but not with its cap is refused with `SPENDING_LIMIT_EXCEEDED`,
+and the message says to lower `maxFeeSats` or the amount. `sendToRoute` and
+`POST /payment/send-to-route` are admitted and charged on what the first hop
+carries, which is the amount plus every fee in the route, with no cap on top.
+`validatePayment(bolt11, amountSats?, maxFeeSats?)` previews the same
+judgement for a BOLT 11 payment; `estimatePayment` and `estimateRouteFee`
+preview the amount.
 
 The ledger is persisted (issue #977): a restart within the UTC day resumes
 the day's total, and the budget a payment still holds while its HTLC is out
@@ -2124,7 +2139,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/invoice/cancel-hold` | `{ paymentHash }` | Cancel a hold invoice; fails parked HTLCs back |
 | GET | `/invoices/held` | -- | List hold invoices with state + parked totals. Each row also carries `minFinalCltvExpiry` (the delta the invoice advertised and the final hop enforces on every arriving HTLC) and the realised expiry of the parked set: `earliestExpiry`, `cancelMarginBlocks` and `cancelHeight` (null before any part is committed). A swap provider checks `earliestExpiry` against its on-chain refund timeout before funding instead of trusting the advertised delta |
 | POST | `/invoice/decode` | `{ bolt11 }` | Decode invoice |
-| POST | `/invoice/pay` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay invoice (`amountSats` for amount-less invoices, `metadata` for labels). `cltvLimit` bounds the payment's total CLTV expiry in blocks above the current tip; no route under it answers `409 CLTV_EXCEEDS_MAX` with nothing sent, and a node without a tip yet answers `503 CHAIN_NOT_SYNCED`. |
+| POST | `/invoice/pay` | `{ bolt11, timeoutMs?, maxFeeSats?, maxFeeMsat?, amountSats?, metadata?, cltvLimit? }` | Pay invoice (`amountSats` for amount-less invoices, `metadata` for labels). Without `maxFeeSats`/`maxFeeMsat` the routing fee is capped at 1% of the amount, never below 50 sats; `maxPaymentSats` and the daily limit count the amount plus the cap (403 `SPENDING_LIMIT_EXCEEDED`, the message says whether to lower `maxFeeSats` or the amount). `cltvLimit` bounds the payment's total CLTV expiry in blocks above the current tip; no route under it answers `409 CLTV_EXCEEDS_MAX` with nothing sent, and a node without a tip yet answers `503 CHAIN_NOT_SYNCED`. |
 | POST | `/invoice/pay-safe` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay invoice; resolves with `status: 'FAILED'` on failure instead of error. |
 | POST | `/invoice/pay-retry` | `{ bolt11, maxRetries?, backoffMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay with exponential backoff retry. Returns `RetryPaymentResult` with `attempts`. |
 | POST | `/invoice/pay-async` | `{ bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Fire-and-forget pay; returns `{ paymentHash, status }` immediately. Poll `GET /payment` for settlement. Answers 409 while draining and 403 over a spending limit. A refusal carries the same code and status as `/invoice/pay`: 409 `DUPLICATE_PAYMENT` for a hash already paid or still in flight, 502 `NO_ROUTE`, 400 `INVALID_INVOICE`, and so on, never a bare 502 `PAYMENT_FAILED` (issue #991). |
@@ -2137,7 +2152,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/graph/channel` | `?scid=<BxTxO or hex>` | Channel endpoints, capacity and both directions' policies (404 if unknown) |
 | GET | `/graph/describe` | `?limit=&offset=` | Paged channel dump (limit defaults to 500, capped at 500) |
 | POST | `/route/query` | `{ destination, amountSats, maxFeeSats? }` | Compute a route WITHOUT sending; hops feed `/payment/send-to-route` |
-| POST | `/payment/send-to-route` | `{ paymentHash, route: { hops }, paymentSecret? }` | Send a payment along an explicit route from `/route/query` |
+| POST | `/payment/send-to-route` | `{ paymentHash, route: { hops }, paymentSecret? }` | Send a payment along an explicit route from `/route/query`. Answers 409 while draining and 403 over a spending limit, judged on what the first hop carries (amount plus every fee); a first hop below the final amount or a negative amount is 400 `INVALID_PARAMS` |
 | POST | `/backup` | `{ destPath }` | Create online database backup |
 | GET | `/backup/scb` | - | Export encrypted static channel backup `{ encoded, channelCount, path }` |
 | POST | `/backup/trigger` | -- | Run the configured scheduled backup now (no-op when `backupPath` unset) |
@@ -2171,10 +2186,10 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/webhooks/register` | `{ url, events, secret? }` | Register webhook callback |
 | DELETE | `/webhooks/unregister` | `{ id }` | Remove webhook |
 | GET | `/webhooks` | -- | List registered webhooks |
-| POST | `/queue/add` | `{ bolt11, priority?, amountSats?, maxFeeSats?, metadata? }` | Enqueue payment |
+| POST | `/queue/add` | `{ bolt11, priority?, amountSats?, maxFeeSats?, metadata? }` | Enqueue payment. Dispatched through `/invoice/pay-safe`, with the same default fee cap and limits |
 | GET | `/queue` | -- | List payment queue |
 | POST | `/queue/cancel` | `{ id }` | Cancel queued payment |
-| POST | `/keysend` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Spontaneous payment (no invoice). Blocks until settled. |
+| POST | `/keysend` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Spontaneous payment (no invoice). Blocks until settled. Without `maxFeeSats` the fee is capped at 1% of the amount, never below 50 sats; the spending limits count the amount plus the cap. |
 | POST | `/keysend/safe` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Keysend that never errors — resolves with `status: 'FAILED'` instead. |
 | GET | `/spend-limit` | -- | COMBINED LN + on-chain daily spend limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, pendingSats, resetsAt, spentSats }` (`spentSats` mirrors `totalSats` for back-compat; `pendingSats` is what in-flight payments hold and `remainingSats` subtracts it). Persisted: the figures survive a restart within the UTC day, and a payment that settles after a timeout or a restart is still counted once |
 | GET | `/auth/keys` | -- | List named API keys: names, scopes, revoked/expired flags, expiresAt/rotatedAt (never secrets; admin scope) |

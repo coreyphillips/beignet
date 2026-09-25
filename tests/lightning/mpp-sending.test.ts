@@ -51,6 +51,10 @@ import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
 import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
 import { IRoutingHintHop } from '../../src/lightning/invoice/types';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
+import {
+	deserializePaymentInfo,
+	serializePaymentInfo
+} from '../../src/lightning/storage/serialization';
 
 // ─────────────── Helpers ───────────────
 
@@ -1315,6 +1319,120 @@ describe('MPP Sending (Phase 5)', function () {
 			expect(alice.getPayment(payment.paymentHash)!.status).to.equal(
 				PaymentStatus.COMPLETED
 			);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('records sentMsat as the sum of the parts and it survives a serialise round trip (#1008)', async function () {
+			// The daemon's spend ledger charges what left the node, fees
+			// included. An MPP record carries the invoice amount in amountMsat
+			// and its route is the first part only, so the sum of the parts'
+			// first-hop amounts is written to the record with its first
+			// persist, where a restart can still find it.
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(76),
+				htlcBasepointSecret: htlcSecretFor(76)
+			});
+			alice.on('error', () => {});
+			const bob = new LightningNode({
+				...makeNodeConfig(77),
+				htlcBasepointSecret: htlcSecretFor(77)
+			});
+			bob.on('error', () => {});
+			connectNodes(alice, bob);
+
+			const channelA = openReadyChannel(alice, bob, 200_000n);
+			const channelB = openReadyChannel(alice, bob, 500_000n);
+			const scidOf = (channelId: Buffer): Buffer => {
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				const st = (alice as any).channelManager
+					.getChannel(channelId)
+					.getFullState();
+				return (st.shortChannelId ?? st.scidAlias) as Buffer;
+			};
+			const bobPub = Buffer.from(bob.getNodeId(), 'hex');
+
+			const invoice = bob.createInvoice({
+				description: 'sent msat',
+				amountMsat: 100_000_000n
+			});
+			const decoded = decodeInvoice(invoice.bolt11);
+
+			// Each part carries 1 000 msat of fee on top of its 50 000 000.
+			const mkPart = (
+				scid: Buffer,
+				feeMsat: bigint
+			): {
+				hops: Array<{
+					pubkey: Buffer;
+					shortChannelId: Buffer;
+					amountToForwardMsat: bigint;
+					outgoingCltvValue: number;
+					cltvExpiryDelta: number;
+					feeBaseMsat: number;
+					feeProportionalMillionths: number;
+				}>;
+				totalAmountMsat: bigint;
+				totalCltvDelta: number;
+				totalFeeMsat: bigint;
+			} => ({
+				hops: [
+					{
+						pubkey: bobPub,
+						shortChannelId: scid,
+						amountToForwardMsat: 50_000_000n,
+						outgoingCltvValue: 40,
+						cltvExpiryDelta: 40,
+						feeBaseMsat: 0,
+						feeProportionalMillionths: 0
+					}
+				],
+				totalAmountMsat: 50_000_000n + feeMsat,
+				totalCltvDelta: 40,
+				totalFeeMsat: feeMsat
+			});
+			const multiRoute = {
+				parts: [
+					mkPart(scidOf(channelA), 1_000n),
+					mkPart(scidOf(channelB), 2_000n)
+				],
+				totalAmountMsat: 100_003_000n,
+				totalFeeMsat: 3_000n
+			};
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const payment = (alice as any).sendPaymentMpp(
+				invoice.bolt11,
+				{
+					paymentHash: decoded.paymentHash,
+					paymentSecret: decoded.paymentSecret,
+					amountMsat: decoded.amountMsat
+				},
+				multiRoute,
+				40
+			);
+			await new Promise((r) => setTimeout(r, 50));
+
+			const record = alice.getPayment(payment.paymentHash)!;
+			expect(record.amountMsat.toString()).to.equal('100000000');
+			expect(record.sentMsat?.toString()).to.equal('100003000');
+
+			const restored = deserializePaymentInfo(serializePaymentInfo(record));
+			expect(restored.sentMsat?.toString()).to.equal('100003000');
+			expect(restored.amountMsat.toString()).to.equal('100000000');
+			// A record without the field comes back without it, not with an
+			// undefined key.
+			const legacy = deserializePaymentInfo(
+				serializePaymentInfo({ ...record, sentMsat: undefined })
+			);
+			expect('sentMsat' in legacy).to.equal(false);
 
 			alice.destroy();
 			bob.destroy();

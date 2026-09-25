@@ -1716,12 +1716,13 @@ async function bootDaemon(
 		},
 
 		'POST /invoice/validate': (body) => {
-			const { bolt11, amountSats } = body as {
+			const { bolt11, amountSats, maxFeeSats } = body as {
 				bolt11: string;
 				amountSats?: number;
+				maxFeeSats?: number;
 			};
 			if (!bolt11) return failure('INVALID_PARAMS', 'bolt11 required');
-			return success(node.validatePayment(bolt11, amountSats));
+			return success(node.validatePayment(bolt11, amountSats, maxFeeSats));
 		},
 		'POST /invoice/create': (body) => {
 			const {

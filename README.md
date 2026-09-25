@@ -742,7 +742,10 @@ Beignet is under active development. Known gaps and caveats:
 
 Recommended safeguards in production:
 
-- Cap exposure with `maxPaymentSats` and `dailySpendLimitSats`.
+- Cap exposure with `maxPaymentSats` and `dailySpendLimitSats`. Both count a
+  payment's amount plus its routing-fee cap, so the fee cannot slip past them:
+  the cap is `maxFeeSats`/`maxFeeMsat` when you pass one, and 1% of the
+  amount (never below 50 sats) when you do not.
 - Call `validatePayment()` before every send.
 - Set `backupPath` for automated database backups, and keep an SCB (`beignet backup scb`).
 - Keep `~/.beignet` and the data directory owner-only. The CLI creates them `0700`/`0600` and tightens an older config on load; check them again after copying files between hosts.
