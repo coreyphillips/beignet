@@ -34,6 +34,15 @@ const OFFLINE_ELECTRUM = {
 // ─────────────── Phase 1: Spend Limit Safety ───────────────
 
 describe('Phase 1: Spend Limit Safety', () => {
+	// The first dynamic import of beignet-node pays for ts-node compiling its
+	// whole module graph, which on a loaded box runs past the 15 s a single
+	// case allows and made this case time out while every later case, with
+	// the module already compiled, passed. Warm it here with its own budget.
+	before(async function () {
+		this.timeout(120_000);
+		await import('../../src/cli/beignet-node');
+	});
+
 	it('failed payment does NOT count against daily spend limit', async function () {
 		this.timeout(15_000);
 		const { BeignetNode } = await import('../../src/cli/beignet-node');
