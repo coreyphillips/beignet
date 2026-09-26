@@ -215,6 +215,10 @@ export interface ChannelPolicyInfo {
 export interface PaymentRouteHop {
 	pubkey: string;
 	shortChannelId: string;
+	/**
+	 * The fee this hop kept, in msat: what it received less what it
+	 * forwarded. 0 at the final hop. The hops' fees sum to totalFeeMsat.
+	 */
 	feeMsat: number;
 }
 

@@ -4028,7 +4028,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 										properties: {
 											pubkey: { type: 'string' },
 											shortChannelId: { type: 'string' },
-											feeMsat: { type: 'integer' }
+											feeMsat: {
+												type: 'integer',
+												description:
+													'Fee this hop kept, in msat: what it received less what it forwarded. 0 at the final hop.'
+											}
 										}
 									}
 								},
