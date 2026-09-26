@@ -38,6 +38,7 @@ import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
 import { nodeStorageView } from './node-storage-view';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
+import { CommitmentType, OutputType } from '../lightning/chain/types';
 import { DF_DEFAULT_UNPAIRED_SPLICE_DEPTH } from '../lightning/direct-funding/receiver/types';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX as DF_UNPAIRED_SPLICE_DEPTH_MAX } from '../lightning/message/splice';
 import {
@@ -6006,10 +6007,22 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
-	 * Sum of local balances in force-closed / closing channels — funds being
+	 * Sum of local balances in force-closed / closing channels: funds being
 	 * recovered on-chain (claimable, possibly still timelocked), which are not
 	 * counted as live lightning balance and not yet in the wallet. Surfaces
 	 * funds that would otherwise be invisible after a force-close.
+	 *
+	 * "Not yet in the wallet" is checked, not assumed (issue #1065): the
+	 * wallet balance counts the sweep of our balance output from its mempool
+	 * sighting on, while the channel stays FORCE_CLOSED until every tracked
+	 * output is IRREVOCABLE_DEPTH deep, so the same sats used to be reported
+	 * here and in onchainBalanceSats for 100+ blocks. A FORCE_CLOSED channel
+	 * leaves this figure in the same read in which the wallet history first
+	 * holds that sweep, never earlier. The test is re-derived on every read,
+	 * so a sweep the wallet drops again (evicted, replaced by a version it has
+	 * not seen, a restart before its first sync) puts the channel back here
+	 * in that read. SHUTTING_DOWN and NEGOTIATING_CLOSING are counted whole,
+	 * as before.
 	 */
 	private getPendingCloseBalanceSats(): number {
 		const recovering = new Set<ChannelState>([
@@ -6019,11 +6032,72 @@ export class BeignetNode extends EventEmitter {
 		]);
 		let totalMsat = 0n;
 		for (const ch of this.node.listChannels()) {
-			if (recovering.has(ch.state)) {
-				totalMsat += ch.localBalanceMsat;
+			if (!recovering.has(ch.state)) continue;
+			if (
+				ch.state === ChannelState.FORCE_CLOSED &&
+				this.isForceCloseBalanceInWallet(ch.channelId)
+			) {
+				continue;
 			}
+			totalMsat += ch.localBalanceMsat;
 		}
 		return Number(totalMsat / 1000n);
+	}
+
+	/**
+	 * True once the wallet history holds the sweep of our balance output on
+	 * the force-close commitment the monitor classified: our to_remote on any
+	 * of the peer's commitments, our commitment to_local on ours (a
+	 * second-level HTLC to_local is an HTLC resolution, not the balance).
+	 * HTLC outputs resolve separately and are no part of localBalanceMsat, so
+	 * they play no part here. The sweep is the spend the monitor saw
+	 * (resolutionTxid), else the sweep it built (sweepTxHex). The history
+	 * entry is the test rather than a UTXO because a later wallet spend
+	 * removes the UTXO but not the entry; a ghosted entry (exists false) is
+	 * one the wallet no longer observes. No monitor, no classified
+	 * commitment, no balance output or no sweep yet means the funds are
+	 * still pending close.
+	 */
+	private isForceCloseBalanceInWallet(channelId: Buffer): boolean {
+		const monitor = this.node.getChannelManager().getMonitor(channelId);
+		const broadcast = monitor?.getFullState().commitmentBroadcast;
+		if (!monitor || !broadcast) return false;
+		let balanceOutputType: OutputType;
+		switch (broadcast.commitmentType) {
+			case CommitmentType.OUR_COMMITMENT:
+				balanceOutputType = OutputType.TO_LOCAL;
+				break;
+			case CommitmentType.THEIR_CURRENT_COMMITMENT:
+			case CommitmentType.THEIR_REVOKED_COMMITMENT:
+			case CommitmentType.THEIR_FUTURE_COMMITMENT:
+				balanceOutputType = OutputType.TO_REMOTE;
+				break;
+			default:
+				return false;
+		}
+		const balanceOutput = monitor
+			.getTrackedOutputs()
+			.find(
+				(o) =>
+					o.txid === broadcast.txid &&
+					o.outputType === balanceOutputType &&
+					!o.isSecondLevelHtlc
+			);
+		if (!balanceOutput) return false;
+		let sweepTxid = balanceOutput.resolutionTxid;
+		if (!sweepTxid && balanceOutput.sweepTxHex) {
+			const bitcoin = require('bitcoinjs-lib');
+			try {
+				sweepTxid = bitcoin.Transaction.fromHex(
+					balanceOutput.sweepTxHex
+				).getId();
+			} catch {
+				return false;
+			}
+		}
+		if (!sweepTxid) return false;
+		const entry = this.wallet.transactions[sweepTxid];
+		return entry !== undefined && entry.exists !== false;
 	}
 
 	/**

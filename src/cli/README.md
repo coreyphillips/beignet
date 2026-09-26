@@ -801,6 +801,7 @@ interface NodeInfo {
   blockHeight: number;
   onchainBalanceSats: number;
   lightningBalanceSats: number;
+  pendingCloseBalanceSats: number; // local balance of closing channels not yet in the wallet (see below)
   channelCount: number;      // every known channel row, incl. CLOSED/FORCE_CLOSED
   openChannelCount: number;  // channels not in a terminal state
   peerCount: number;
@@ -1163,6 +1164,8 @@ interface LogEntry {
 }
 ```
 
+`pendingCloseBalanceSats` is the local balance of every SHUTTING_DOWN, NEGOTIATING_CLOSING and FORCE_CLOSED channel whose funds the wallet does not count yet. A FORCE_CLOSED channel leaves the figure in the same read in which the wallet history first holds the sweep of its balance output (our to_remote on the peer's commitment, our to_local on ours), which the wallet counts from the mempool on, so a sat of the channel is in `onchainBalanceSats` or in `pendingCloseBalanceSats`, never both. If the wallet drops the sweep again (evicted, replaced, a restart before its first sync), the channel is back in the figure in that read.
+
 ### Channel States
 
 Channels progress through these states:
@@ -1175,7 +1178,8 @@ Channels progress through these states:
 | `AWAITING_REESTABLISH` | No | Reconnected after disconnect, re-syncing state |
 | `SHUTTING_DOWN` | No | Cooperative close initiated, no new HTLCs |
 | `NEGOTIATING_CLOSING` | No | Exchanging closing fee proposals |
-| `CLOSED` | No | Channel closed (cooperative or forced) |
+| `FORCE_CLOSED` | No | A unilateral close is on chain and the chain monitor is sweeping our outputs |
+| `CLOSED` | No | Channel closed (cooperative or forced). A force close gets here once every output that is ours to claim is swept and 100 blocks deep; the peer's own output (its to_remote on our commitment, its to_local on its own current one) does not hold the transition, since only the peer can spend it |
 
 Only channels in `NORMAL` state can send/receive payments.
 
