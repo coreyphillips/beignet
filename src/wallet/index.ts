@@ -4622,7 +4622,19 @@ export class Wallet {
 			this.logger.warn(generateAddressResponse.error.message);
 			return err('Unable to successfully generate a change address.');
 		}
-		return ok(generateAddressResponse.value.changeAddresses[0]);
+		// generateAddresses keys its result by scriptHash, so `[0]` read an
+		// index that never exists and this leg answered ok(undefined) on a
+		// wallet that had not yet set its indexes (issue #1064: the offline
+		// force-close sweep leg on a never-synced wallet). Change index 0 is
+		// what the first gap scan starts from on such a wallet, so it is
+		// always inside the scan window.
+		const generated = Object.values(
+			generateAddressResponse.value.changeAddresses
+		)[0];
+		if (!generated?.address) {
+			return err('Unable to successfully generate a change address.');
+		}
+		return ok(generated);
 	}
 
 	/**

@@ -24,7 +24,7 @@ import type { Result } from '../../src/utils/result';
 // regtest default in src/cli/beignet-node.ts is a remote public host, so these
 // nominally offline tests dial a third party over the internet and fail
 // whenever it is unreachable. BeignetNode.init tolerates a failed connect:
-// resolveWalletSweepScript falls back to a locally derived index-0 address.
+// resolveWalletSweepScript falls back to a locally derived change address.
 const OFFLINE_ELECTRUM = {
 	electrumHost: '127.0.0.1',
 	electrumPort: 65529,

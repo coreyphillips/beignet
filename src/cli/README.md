@@ -160,8 +160,8 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `openChannelAndWait(pubkey, amountSats, opts?)` | `Promise<ChannelInfo>` | Open channel + wait for NORMAL state. `opts: { pushSats?, timeoutMs? }` |
 | `openZeroConfChannel(pubkey, sats, pushSats?)` | `ChannelInfo` | Open zero-conf channel (peer must be trusted) |
 | `openChannelV2(pubkey, params)` | `ChannelInfo` | Open dual-funded v2 channel |
-| `closeChannel(channelId, acceptStaleStateRisk?)` | `Promise<{ ok, error? }>` | Cooperative close (`await` it): the payout resolves to a wallet-scanned address first. A capsule-restored channel needs `acceptStaleStateRisk: true`, because a mutual close signs the balances that row carries |
-| `forceCloseChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error?, commitmentTxid? }` | Force close; a capsule-restored channel needs `acceptStaleStateRisk: true` |
+| `closeChannel(channelId, acceptStaleStateRisk?)` | `Promise<{ ok, error? }>` | Cooperative close (`await` it): the payout goes to a wallet-scanned address on the change chain, never to a handed-out receive address. A capsule-restored channel needs `acceptStaleStateRisk: true`, because a mutual close signs the balances that row carries |
+| `forceCloseChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error?, commitmentTxid? }` | Force close; the sweep pays the wallet's change chain, never a handed-out receive address. A capsule-restored channel needs `acceptStaleStateRisk: true` |
 | `spliceIn(channelId, amountSats, feerate)` | `SpliceResult` | Add funds to existing channel |
 | `spliceOut(channelId, amountSats, feerate, destinationAddress?)` | `SpliceResult` | Withdraw funds from channel, to the wallet or an external address. An address-targeted splice-out counts amount + fee against `dailySpendLimitSats` |
 | `listChannels()` | `ChannelInfo[]` | List all channels |
@@ -1605,11 +1605,15 @@ beignet channel open-and-wait <pubkey> <sats> [pushSats] [--timeout 60000]
 beignet channel connect-and-open <pubkey> <host> <port> <sats> [pushSats]
 beignet channel close <channelId> [--accept-stale-state-risk]
 beignet channel forceclose <channelId> [--accept-stale-state-risk]
-# Both closes pay out to a wallet-owned address the wallet scans (the current
-# unused address when the wallet can produce one; consecutive closes may get
-# the same address until it sees use), falling back to the startup sweep
-# address and then the funding-key address, so the closed balance is tracked
-# and spendable without a rescue sweep.
+# Both closes pay out to a wallet-owned address the wallet scans, on the
+# internal change chain: the next unused change address when the wallet can
+# produce one (consecutive closes may get the same address until it sees use),
+# falling back to the startup sweep address (the stored change address when
+# Electrum was down at startup) and then the funding-key address, so the
+# closed balance is tracked and spendable without a rescue sweep. Never a
+# receive address: the next unused receive address is the one `address new` /
+# `POST /address/new` handed out most recently, and a payout there would read
+# as that receive request being paid (issue #1064).
 # A channel restored from a Recovery Capsule refuses either close without the
 # flag. Cooperative: a mutual close pays out restored balances that cannot be
 # proven current. Force: if the peer holds a newer state the broadcast is
@@ -2142,8 +2146,8 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/channels/ensure-minimum` | `{ count, satsPerChannel, timeoutMs? }` | Auto-open channels to meet minimum count |
 | POST | `/channel/connect-and-open` | `{ pubkey, host, port, amountSats, pushSats? }` | Connect + open in one call |
 | POST | `/channel/open-and-wait` | `{ pubkey, amountSats, pushSats?, timeoutMs? }` | Open channel + wait for NORMAL state |
-| POST | `/channel/close` | `{ channelId, acceptStaleStateRisk? }` | Coop close; the flag is required for a capsule-restored channel |
-| POST | `/channel/forceclose` | `{ channelId, acceptStaleStateRisk? }` | Force close; the flag is required for a capsule-restored channel |
+| POST | `/channel/close` | `{ channelId, acceptStaleStateRisk? }` | Coop close; the payout goes to the wallet's change chain, never a handed-out receive address. The flag is required for a capsule-restored channel |
+| POST | `/channel/forceclose` | `{ channelId, acceptStaleStateRisk? }` | Force close; the sweep pays the wallet's change chain, never a handed-out receive address. The flag is required for a capsule-restored channel |
 | POST | `/channel/rebroadcast-close` | `{ channelId }` | Rebroadcast the recorded close tx of a force-closed channel (or an unconfirmed mutual close); idempotent, always rebuilds from the latest state |
 | POST | `/channel/splice-in` | `{ channelId, amountSats, feeratePerkw }` | Splice-in funds. A 2xx means the splice started; a refusal is a failure envelope (404 `CHANNEL_NOT_FOUND`, 409 `SPLICING_NOT_NEGOTIATED` / `FUNDING_PROVIDER_REQUIRED` / `SPLICE_REFUSED`, 503 `SPLICE_BUSY`, 400 `INVALID_PARAMS`) |
 | POST | `/channel/splice-out` | `{ channelId, amountSats, feeratePerkw, address? }` | Splice-out funds, optionally to an external address. Same refusal codes, plus 409 `INSUFFICIENT_BALANCE` |

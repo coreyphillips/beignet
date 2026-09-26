@@ -6085,41 +6085,61 @@ export class BeignetNode extends EventEmitter {
 	 * Best-effort derivation of a wallet-owned output script for force-close
 	 * sweeps. Returns undefined if the wallet can't produce an address yet
 	 * (e.g. Electrum not connected). Never throws.
+	 *
+	 * Both legs pay the wallet's internal (change) chain, never the receive
+	 * chain (issue #1064). A receive address is what getNewAddress and
+	 * POST /address/new hand out to payers and what a saved receive request
+	 * holds, and the next unused receive address is exactly the one handed
+	 * out most recently and not yet paid, so a close payout sent there read
+	 * as the payer paying that request: wallet-core marked the request partly
+	 * paid (or paid) and dropped the payout's own row. No request, route or
+	 * API ever hands out a change address, so a payout on the change chain
+	 * can never be mistaken for a request's payment. It is still an address
+	 * the wallet scans, so the payout sits in the balance and in the
+	 * transaction list as its own received row.
 	 */
 	private async resolveWalletSweepScript(): Promise<Buffer | undefined> {
-		// Preferred: the current unused wallet address. This requires Electrum
-		// to gap-scan for the next unused index.
+		// Preferred: the next unused change address. This requires Electrum
+		// to gap-scan for the next unused change index.
 		const fresh = await this.resolveCurrentWalletAddressScript();
 		if (fresh) return fresh;
-		// Fallback: deterministically derive a wallet-owned address (index 0) with
-		// NO network dependency. Reusing index 0 is a minor privacy tradeoff, but
-		// it guarantees force-close sweeps always target a wallet-scanned address
-		// rather than the invisible funding-key P2WPKH — even when Electrum is down
-		// at startup, which is exactly when an offline force-close is detected on
-		// restart and a sweep gets built. recoverFallbackFunds remains a safety net
-		// for funds stranded by older sessions. (The cooperative-close path
-		// deliberately does NOT use this leg: on a mature wallet index 0 can
-		// sit outside the 20-address scan window behind the current index, and
-		// nothing rescues it, so the close chain prefers its cached script and
-		// then the rescuable funding key instead; issue #542 review.)
+		// Fallback: the wallet's stored change address, read locally with NO
+		// network dependency. It guarantees force-close sweeps always target a
+		// wallet-scanned address rather than the invisible funding-key P2WPKH,
+		// even when Electrum is down at startup, which is exactly when an
+		// offline force-close is detected on restart and a sweep gets built.
+		// The stored change index is the one normal sends take their change
+		// from, so it always sits inside the change scan window
+		// (updateAddressIndexes clamps it there). Not a fixed change index 0:
+		// on a used wallet it can sit outside that window, the same reason
+		// receive index 0 was kept out of the cooperative close chain (issue
+		// #542 review). The one side effect is address reuse: a send that is
+		// still unconfirmed at the next refresh took its change from this same
+		// index, so the sweep can share the address with it. That is a
+		// privacy tradeoff only; both outputs are the wallet's. recoverFallbackFunds
+		// remains a safety net for funds stranded by older sessions.
 		const bitcoin = require('bitcoinjs-lib');
 		try {
-			const address = await this.wallet.getAddress({ index: '0' });
-			if (address) {
+			const change = await this.wallet.getChangeAddress();
+			if (change.isOk() && change.value?.address) {
 				return bitcoin.address.toOutputScript(
-					address,
+					change.value.address,
 					this.getBitcoinNetwork()
 				);
 			}
 		} catch {
-			// give up — caller keeps the funding-key fallback + background refresh
+			// give up: caller keeps the funding-key fallback + background refresh
 		}
 		return undefined;
 	}
 
 	/**
-	 * The current unused wallet address as an output script, or undefined when
+	 * The next unused change address as an output script, or undefined when
 	 * the wallet cannot produce one (Electrum needed for the gap scan).
+	 * The change chain, never the receive chain: see resolveWalletSweepScript
+	 * (issue #1064). The lookup is the same getNextAvailableAddress call that
+	 * gap-scans both chains, so the Electrum dependency and the timeouts the
+	 * callers wrap around it are unchanged; only the chain read out differs.
 	 */
 	private async resolveCurrentWalletAddressScript(): Promise<
 		Buffer | undefined
@@ -6129,7 +6149,7 @@ export class BeignetNode extends EventEmitter {
 			const res = await this.wallet.getNextAvailableAddress();
 			if (res.isOk()) {
 				return bitcoin.address.toOutputScript(
-					res.value.addressIndex.address,
+					res.value.changeAddressIndex.address,
 					this.getBitcoinNetwork()
 				) as Buffer;
 			}
@@ -7373,17 +7393,24 @@ export class BeignetNode extends EventEmitter {
 		// funding-key script was invisible to the wallet: the payout sat
 		// confirmed on-chain while the balance read zero until
 		// recoverFallbackFunds swept it, a second transaction and fee. The
-		// chain: the current unused wallet address (BOUNDED, because the
-		// lookup can enter an Electrum handshake with no timeout of its own
-		// and the close must reach the engine regardless), then the sweep
-		// script resolved at startup, then the funding-key P2WPKH that
-		// recoverFallbackFunds can still rescue. The index-0 leg the
-		// force-close startup resolution uses is deliberately NOT in this
-		// chain: on a mature wallet index 0 can sit outside the 20-address
-		// scan window behind the current index and nothing rescues it, which
-		// would recreate the invisible payout this change removes (issue #542
-		// review). Every leg is derived locally from our own keys, so the
-		// chain always terminates in a script we control.
+		// chain: the next unused CHANGE address (BOUNDED, because the lookup
+		// can enter an Electrum handshake with no timeout of its own and the
+		// close must reach the engine regardless), then the sweep script
+		// resolved at startup (also on the change chain), then the
+		// funding-key P2WPKH that recoverFallbackFunds can still rescue. The
+		// change chain, never the receive chain (issue #1064): the next
+		// unused receive address is the one most recently handed out to a
+		// payer by getNewAddress / POST /address/new and not yet paid, so a
+		// payout there read as that receive request being paid, while no
+		// request or route ever hands out a change address. The offline leg
+		// the force-close startup resolution uses (the stored change address;
+		// receive index 0 before issue #1064) is deliberately NOT in this
+		// chain: index 0 could sit outside the 20-address scan window behind
+		// the current index with nothing to rescue it, which would recreate
+		// the invisible payout this change removes (issue #542 review), and
+		// the startup script already covers an Electrum outage at close
+		// time. Every leg is derived locally from our own keys, so the chain
+		// always terminates in a script we control.
 		let scriptPubkey = await this.boundedCurrentWalletAddressScript();
 		if (!scriptPubkey) scriptPubkey = this.sweepDestinationScript;
 		if (!scriptPubkey) {
