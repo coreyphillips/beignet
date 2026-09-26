@@ -63,6 +63,7 @@ import {
 	readCappedBody
 } from '../lightning/l402';
 import { ILightningError, IPaymentInfo } from '../lightning/node/types';
+import { IInvoiceInfo } from '../lightning/storage/types';
 import { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
 import { SqliteStorage } from '../lightning/storage/sqlite-storage';
@@ -926,6 +927,14 @@ function sentSats(info: IPaymentInfo): number | undefined {
 		return undefined;
 	}
 	return spendLimitSats(info.amountMsat);
+}
+
+/**
+ * Whether a payment record marks its invoice paid: a completed receive for
+ * the hash. Null and undefined (no record) read as unpaid.
+ */
+function settlesInvoice(p: IPaymentInfo | null | undefined): boolean {
+	return p?.status === 'COMPLETED' && p.direction === 'INCOMING';
 }
 
 /**
@@ -10673,7 +10682,7 @@ export class BeignetNode extends EventEmitter {
 			// a duplicate refusal the durable row the engine refused from.
 			if (hashHex !== 'unknown') {
 				const existing =
-					this.getPayment(hashHex) ?? this.durablePaymentFor(err, hashHex);
+					this.livePayment(hashHex) ?? this.durablePaymentFor(err, hashHex);
 				if (existing) return existing;
 			}
 
@@ -10718,7 +10727,7 @@ export class BeignetNode extends EventEmitter {
 				// Don't retry permanent failures
 				if (!isRetryableError(err)) {
 					const pi =
-						this.getPayment(paymentHashHex) ??
+						this.livePayment(paymentHashHex) ??
 						this.durablePaymentFor(err, paymentHashHex);
 					if (pi) return { ...pi, attempts: attempt };
 					return {
@@ -10758,7 +10767,7 @@ export class BeignetNode extends EventEmitter {
 
 				// Check drain mode before retrying
 				if (this._draining) {
-					const pi = this.getPayment(paymentHashHex);
+					const pi = this.livePayment(paymentHashHex);
 					if (pi) return { ...pi, attempts: attempt };
 					return {
 						paymentHash: paymentHashHex,
@@ -10779,7 +10788,7 @@ export class BeignetNode extends EventEmitter {
 					const amountSats = Number(decoded.amountMsat / 1000n);
 					const check = this.canSend(amountSats);
 					if (!check.canSend) {
-						const pi = this.getPayment(paymentHashHex);
+						const pi = this.livePayment(paymentHashHex);
 						if (pi) return { ...pi, attempts: attempt };
 						return {
 							paymentHash: paymentHashHex,
@@ -10796,7 +10805,7 @@ export class BeignetNode extends EventEmitter {
 		}
 
 		// All retries exhausted
-		const pi = this.getPayment(paymentHashHex);
+		const pi = this.livePayment(paymentHashHex);
 		if (pi) return { ...pi, attempts: maxRetries + 1 };
 		return {
 			paymentHash: paymentHashHex,
@@ -11040,8 +11049,17 @@ export class BeignetNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Every payment the node has a record of, newest first (issue #1063).
+	 * The engine keeps a completed or failed record in memory for 24 hours
+	 * (oldest first past 10,000) while its durable row stays, so the rows
+	 * are read under the map on every call: the live record wins where both
+	 * exist, the row stands in where the map has forgotten. A wallet must
+	 * never show less than it already knew, so a row set that cannot be
+	 * read fails the call rather than answering with the map alone.
+	 */
 	listPayments(filter?: PaymentFilter): PaymentInfo[] {
-		let payments = this.node.listPayments().map((p) => this.toPaymentInfo(p));
+		let payments = this.paymentRecords().map((p) => this.toPaymentInfo(p));
 
 		// Sort by createdAt descending (newest first)
 		payments.sort((a, b) => b.createdAt - a.createdAt);
@@ -11078,10 +11096,47 @@ export class BeignetNode extends EventEmitter {
 		return payments;
 	}
 
+	/**
+	 * The record for a hash: the in-memory one, else its durable row, in the
+	 * order _settledRecordAtBoot reads them (issue #1063). Null when neither
+	 * exists. A row that cannot be read throws rather than reading as absent:
+	 * a NOT_FOUND for a payment the caller already knew is the answer this
+	 * exists to prevent.
+	 */
 	getPayment(paymentHash: string): PaymentInfo | null {
+		const live = this.livePayment(paymentHash);
+		if (live) return live;
+		const durable = this.storage.loadPayment(paymentHash);
+		return durable ? this.toPaymentInfo(durable) : null;
+	}
+
+	/**
+	 * The in-memory record only. The pay paths read this, not getPayment: a
+	 * fresh NO_ROUTE or FEE_EXCEEDS_MAX on a hash with a days-old FAILED row
+	 * is this attempt's outcome, and the row is an earlier attempt's, so
+	 * falling through to the row would report the old failure as the new
+	 * one. They take the row only for a DUPLICATE_PAYMENT refusal, through
+	 * durablePaymentFor, where the row is what the engine refused from.
+	 */
+	private livePayment(paymentHash: string): PaymentInfo | null {
 		const p = this.node.getPayment(Buffer.from(paymentHash, 'hex'));
-		if (!p) return null;
-		return this.toPaymentInfo(p);
+		return p ? this.toPaymentInfo(p) : null;
+	}
+
+	/**
+	 * The durable rows under the in-memory map, keyed by hash, the live
+	 * record winning. One storage read per call; a row set that cannot be
+	 * read throws.
+	 */
+	private paymentRecords(): IPaymentInfo[] {
+		const byHash = new Map<string, IPaymentInfo>();
+		for (const { paymentHash, payment } of this.storage.loadAllPayments()) {
+			byHash.set(paymentHash, payment);
+		}
+		for (const p of this.node.listPayments()) {
+			byHash.set(p.paymentHash.toString('hex'), p);
+		}
+		return [...byHash.values()];
 	}
 
 	/**
@@ -12046,9 +12101,52 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Invoices (List) ───────────────
 
+	/**
+	 * An invoice with its status: PAID on a completed receive for its hash,
+	 * from the in-memory record or, once that is pruned, the durable row
+	 * (issue #1063); EXPIRED past its expiry otherwise; PENDING until then.
+	 */
 	getInvoice(paymentHash: string): InvoiceInfo | null {
 		const inv = this.node.getInvoice(paymentHash);
 		if (!inv) return null;
+		const live = this.node.getPayment(Buffer.from(inv.paymentHash, 'hex'));
+		const paid = live
+			? settlesInvoice(live)
+			: settlesInvoice(this.storage.loadPayment(inv.paymentHash));
+		return this.toInvoiceInfo(inv, paid);
+	}
+
+	/**
+	 * Every invoice with its status, judged as getInvoice judges one. The
+	 * durable rows are read at most once per call, for the invoices the map
+	 * has no record of; a wallet polls this every few seconds, and a row
+	 * lookup per invoice would not scale with its history.
+	 */
+	listInvoices(): InvoiceInfo[] {
+		let durablePaid: Set<string> | undefined;
+		return this.node.listInvoices().map((inv) => {
+			const live = this.node.getPayment(Buffer.from(inv.paymentHash, 'hex'));
+			let paid: boolean;
+			if (live) {
+				paid = settlesInvoice(live);
+			} else {
+				if (!durablePaid) durablePaid = this.durablePaidHashes();
+				paid = durablePaid.has(inv.paymentHash);
+			}
+			return this.toInvoiceInfo(inv, paid);
+		});
+	}
+
+	/** The hashes whose durable row is a completed receive. */
+	private durablePaidHashes(): Set<string> {
+		const paid = new Set<string>();
+		for (const { paymentHash, payment } of this.storage.loadAllPayments()) {
+			if (settlesInvoice(payment)) paid.add(paymentHash);
+		}
+		return paid;
+	}
+
+	private toInvoiceInfo(inv: IInvoiceInfo, paid: boolean): InvoiceInfo {
 		const info: InvoiceInfo = {
 			bolt11: inv.bolt11,
 			paymentHash: inv.paymentHash
@@ -12059,13 +12157,7 @@ export class BeignetNode extends EventEmitter {
 		if (inv.description) info.description = inv.description;
 		if (inv.expiry !== undefined) info.expiry = inv.expiry;
 		if (inv.createdAt !== undefined) info.createdAt = inv.createdAt;
-		// Derive status
-		const payment = this.node.getPayment(Buffer.from(inv.paymentHash, 'hex'));
-		if (
-			payment &&
-			payment.status === 'COMPLETED' &&
-			payment.direction === 'INCOMING'
-		) {
+		if (paid) {
 			info.status = 'PAID';
 		} else if (
 			inv.createdAt !== undefined &&
@@ -12077,39 +12169,6 @@ export class BeignetNode extends EventEmitter {
 			info.status = 'PENDING';
 		}
 		return info;
-	}
-
-	listInvoices(): InvoiceInfo[] {
-		return this.node.listInvoices().map((inv) => {
-			const info: InvoiceInfo = {
-				bolt11: inv.bolt11,
-				paymentHash: inv.paymentHash
-			};
-			if (inv.amountMsat !== undefined) {
-				info.amountSats = Number(inv.amountMsat / 1000n);
-			}
-			if (inv.description) info.description = inv.description;
-			if (inv.expiry !== undefined) info.expiry = inv.expiry;
-			if (inv.createdAt !== undefined) info.createdAt = inv.createdAt;
-			// Derive status from payment map + expiry
-			const payment = this.node.getPayment(Buffer.from(inv.paymentHash, 'hex'));
-			if (
-				payment &&
-				payment.status === 'COMPLETED' &&
-				payment.direction === 'INCOMING'
-			) {
-				info.status = 'PAID';
-			} else if (
-				inv.createdAt !== undefined &&
-				inv.expiry !== undefined &&
-				Date.now() / 1000 > inv.createdAt + inv.expiry
-			) {
-				info.status = 'EXPIRED';
-			} else {
-				info.status = 'PENDING';
-			}
-			return info;
-		});
 	}
 
 	// ─────────────── Health ───────────────

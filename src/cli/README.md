@@ -176,7 +176,7 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 |--------|---------|-------------|
 | `createInvoice(amountSats?, description?, expirySecs?, descriptionHash?)` | `InvoiceInfo` | Create BOLT 11 invoice. Use `descriptionHash` (hex Buffer) for hashed descriptions > 639 bytes — omit `description` when using hash. Returns `paymentSecret` for correlating incoming payments. |
 | `decodeInvoice(bolt11)` | `DecodedInvoice` | Decode any BOLT 11 invoice |
-| `listInvoices()` | `InvoiceInfo[]` | List all created invoices |
+| `listInvoices()` | `InvoiceInfo[]` | List all created invoices. `status` is `PAID` on a completed receive for the hash, from the in-memory record or, once the engine has pruned it, the database row (one database read per call), so a paid invoice never reads `EXPIRED` or `PENDING` later |
 | `createHoldInvoice({ paymentHash, amountMsat?, amountSats?, description?, expiry?, minFinalCltvExpiry? })` | `InvoiceInfo` | Hold invoice for a caller-supplied `sha256(preimage)`: the preimage stays with the caller and the incoming HTLC parks instead of settling. `minFinalCltvExpiry` is 1..2016 blocks and sets the BOLT 11 `c` tag |
 | `settleHoldInvoice(preimage)` | `{ paymentHash }` | Validate `sha256(preimage)` and fulfill every parked HTLC (all MPP parts) |
 | `cancelHoldInvoice(paymentHash)` | `{ paymentHash, htlcsFailed }` | Fail parked HTLCs back (`incorrect_or_unknown_payment_details`) and close the invoice |
@@ -215,8 +215,8 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | `sendPaymentAsync(bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `{ paymentHash, status: 'PENDING' \| 'FAILED' }` | Fire-and-forget pay. Returns immediately, `FAILED` when the engine refused the submission outright (an expired invoice, an HTLC the channel would not take). Poll `getPayment()` for settlement. Drain mode and the spending limits are applied at submission, so it can throw `SERVICE_DRAINING` or `SPENDING_LIMIT_EXCEEDED`; the limits use the invoice's own amount whenever it carries one, since that is what gets paid. |
 | `payInvoiceWithRetry(bolt11, opts?)` | `Promise<RetryPaymentResult>` | Pay with exponential backoff retry. `opts: { maxRetries? (3), backoffMs? (2000), maxFeeSats?, amountSats?, metadata?, cltvLimit? }`. Emits `payment:retry` events. |
 | `cancelPayment(paymentHash)` | `{ ok: true }` | Cancel a pending outbound payment (marks as FAILED). The HTLC cannot be retracted, so a cancelled payment keeps holding its amount against the daily limit until that HTLC settles or fails back, or the 24h window ends; `getDailySpendInfo().pendingSats` shows what is held. |
-| `listPayments(filter?)` | `PaymentInfo[]` | List payments sorted by createdAt desc. Filter by `status`, `direction`, `since`, `limit`, `offset`, `metadataKey`, `metadataValue`. |
-| `getPayment(paymentHash)` | `PaymentInfo \| null` | Get specific payment |
+| `listPayments(filter?)` | `PaymentInfo[]` | List payments sorted by createdAt desc. Filter by `status`, `direction`, `since`, `limit`, `offset`, `metadataKey`, `metadataValue`. Reads through to the node database: a completed or failed payment stays listed with its status after the engine prunes its in-memory record (24 hours after completion, oldest first past 10,000), however long the node has been running. A database read that fails fails the call rather than returning a shorter list. |
+| `getPayment(paymentHash)` | `PaymentInfo \| null` | Get specific payment: the in-memory record, else its database row, so a payment is found however long ago it completed |
 | `setPaymentMetadata(paymentHash, metadata)` | `void` | Attach key-value metadata to an existing payment |
 | `sendKeysend(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Spontaneous payment (no invoice). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. Without `maxFeeSats` the routing fee is capped at 1% of the amount, never below 50 sats; the spending limits count the amount plus the cap. |
 | `sendKeysendSafe(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Like `sendKeysend` but **never throws** — resolves with `status: 'FAILED'` instead. |
@@ -2115,13 +2115,13 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/channels/ready` | -- | List channels that are NORMAL and will accept a new HTLC (a capsule-restored channel holding for recency is excluded) |
 | GET | `/can-send` | `?amountSats=<n>` | Check send capacity |
 | GET | `/can-receive` | `?amountSats=<n>` | Check receive capacity |
-| GET | `/payments` | `?status=&direction=&since=&limit=&offset=` | List payments (filterable) |
+| GET | `/payments` | `?status=&direction=&since=&limit=&offset=` | List payments (filterable). Read through to the node database, so a completed or failed payment stays listed after the engine prunes its in-memory record (24 hours after completion); a database read that fails answers 500, never a shorter list |
 | GET | `/forwards` | `?since=&until=&limit=&offset=&channelId=` | Settled forwards with fees earned (msat values as strings) |
 | GET | `/forwards/summary` | `?since=` | Forwarding totals: `{ count, volumeOutMsat, feesEarnedMsat }` |
-| GET | `/invoices` | -- | List created invoices |
+| GET | `/invoices` | -- | List created invoices. `status` is `PAID` on a completed receive, from the in-memory record or the database row once the engine has pruned it, so a paid invoice never reads `EXPIRED` or `PENDING` later |
 | GET | `/channel` | `?channelId=<hex>` | Get channel (query param or body) |
 | GET | `/channel/health` | `?channelId=<hex>` | Channel health assessment with liquidity warnings |
-| GET | `/payment` | `?paymentHash=<hex>` | Get payment (query param or body) |
+| GET | `/payment` | `?paymentHash=<hex>` | Get payment (query param or body): the in-memory record, else its database row, so a payment is found however long ago it completed |
 | GET | `/trusted-peers` | -- | List trusted peers |
 | GET | `/offers` | -- | List BOLT 12 offers |
 | GET | `/events` | -- | SSE event stream (auth-gated) |
