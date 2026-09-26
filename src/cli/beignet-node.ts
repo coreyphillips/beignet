@@ -870,6 +870,22 @@ export function spendLimitSats(amountMsat: bigint): number {
 }
 
 /**
+ * The fee hop `i` of a route kept, in msat: what it received (its own
+ * amountToForwardMsat, the amount the previous node forwards TO it) less what
+ * it forwarded to the next hop. The final hop keeps nothing, and a record
+ * whose hop amounts are missing reports 0 rather than a NaN (issue #1056).
+ */
+export function hopFeeMsat(
+	hops: ReadonlyArray<{ amountToForwardMsat?: bigint }>,
+	i: number
+): number {
+	const received = hops[i]?.amountToForwardMsat;
+	const forwarded = hops[i + 1]?.amountToForwardMsat;
+	if (typeof received !== 'bigint' || typeof forwarded !== 'bigint') return 0;
+	return received > forwarded ? Number(received - forwarded) : 0;
+}
+
+/**
  * The amount an invoice payment has to be admitted and accounted for, in sats.
  *
  * The ENCODED amount wins wherever the invoice carries one, because that is
@@ -11491,14 +11507,20 @@ export class BeignetNode extends EventEmitter {
 			info.feeSats = Number(p.route.totalFeeMsat / 1000n);
 		}
 		if (p.route) {
+			const hops = p.route.hops;
 			info.route = {
-				hops: p.route.hops.map((h) => ({
+				hops: hops.map((h, i) => ({
 					pubkey: h.pubkey.toString('hex'),
 					shortChannelId: h.shortChannelId.toString('hex'),
-					feeMsat: h.feeBaseMsat
+					// The fee this hop kept: what it received less what it
+					// forwarded to the next hop. The final hop keeps nothing.
+					// This reported the hop's fee_base_msat before, so a route
+					// paying 753 msat over 0-base hops read 0 at every hop
+					// (issue #1056).
+					feeMsat: hopFeeMsat(hops, i)
 				})),
 				totalFeeMsat: Number(p.route.totalFeeMsat),
-				hopCount: p.route.hops.length
+				hopCount: hops.length
 			};
 		}
 		if (p.metadata) info.metadata = p.metadata;

@@ -85,7 +85,9 @@ import {
 	findMultiPathRoute,
 	findRouteToBlindedPath,
 	calculateFee,
-	ILocalChannelEdge
+	ILocalChannelEdge,
+	TPolicyOverrides,
+	policyOverrideKey
 } from '../gossip/pathfinding';
 import {
 	applyRapidGossipSnapshot,
@@ -103,6 +105,8 @@ import {
 	ADDRESS_TYPE_TORV2,
 	ADDRESS_TYPE_TORV3,
 	DEFAULT_PRUNE_MAX_AGE,
+	CHANNEL_FLAG_DIRECTION,
+	CHANNEL_FLAG_DISABLED,
 	gossipTimestampTooFarFuture
 } from '../gossip/types';
 import {
@@ -141,6 +145,7 @@ import {
 	createFailureMessage,
 	wrapFailureMessage,
 	decryptFailureMessage,
+	extractChannelUpdate,
 	FAILURE_MESSAGE_LENGTH
 } from '../onion/failures';
 import {
@@ -15628,7 +15633,8 @@ export class LightningNode extends EventEmitter {
 		excludedChannels?: Set<string>,
 		maxFeeMsat?: bigint,
 		amountMsat?: bigint,
-		maxCltvExpiryHeight?: number
+		maxCltvExpiryHeight?: number,
+		policyOverrides?: TPolicyOverrides
 	): IPaymentInfo {
 		const invoice = decodeInvoice(invoiceStr);
 
@@ -15647,6 +15653,12 @@ export class LightningNode extends EventEmitter {
 			maxCltvExpiryHeight ??
 			this.paymentRetryContexts.get(dedupHashHex)?.maxCltvExpiryHeight;
 		if (cltvCeiling !== undefined) this.validateCltvCeiling(cltvCeiling);
+		// The channel policies this payment's own failures taught us ride the
+		// context the same way (issue #1056), so a retry re-prices the hops
+		// it learned about instead of excluding them.
+		const overrides =
+			policyOverrides ??
+			this.paymentRetryContexts.get(dedupHashHex)?.policyOverrides;
 
 		const destination = invoice.payeeNodeKey || invoice.recoveredPubkey;
 		if (!destination) {
@@ -15737,7 +15749,8 @@ export class LightningNode extends EventEmitter {
 				excludedChannels,
 				this.missionControl,
 				this.getLocalChannelEdges(),
-				cltvBudget
+				cltvBudget,
+				overrides
 			);
 			if (!blindedRoute) {
 				throw new LightningPaymentError(
@@ -15772,7 +15785,8 @@ export class LightningNode extends EventEmitter {
 					maxRetries: this.maxPaymentRetries,
 					maxFeeMsat,
 					amountMsat,
-					maxCltvExpiryHeight: cltvCeiling
+					maxCltvExpiryHeight: cltvCeiling,
+					policyOverrides: overrides
 				});
 			}
 			return this.sendPaymentToRoute(
@@ -15797,7 +15811,8 @@ export class LightningNode extends EventEmitter {
 			cltvBudget,
 			invoice.routingHints,
 			undefined,
-			localChannels
+			localChannels,
+			overrides
 		);
 		// The router can bound our first hop looser than what addHtlc enforces
 		// (a graph update's advertised maximum, or a race against in-flight
@@ -15840,7 +15855,8 @@ export class LightningNode extends EventEmitter {
 				undefined,
 				localChannels,
 				excludedChannels,
-				cltvBudget
+				cltvBudget,
+				overrides
 			);
 			if (multiRoute) {
 				if (maxFeeMsat !== undefined && multiRoute.totalFeeMsat > maxFeeMsat) {
@@ -15884,7 +15900,8 @@ export class LightningNode extends EventEmitter {
 				maxRetries: this.maxPaymentRetries,
 				maxFeeMsat,
 				amountMsat,
-				maxCltvExpiryHeight: cltvCeiling
+				maxCltvExpiryHeight: cltvCeiling,
+				policyOverrides: overrides
 			});
 		}
 
@@ -15911,7 +15928,8 @@ export class LightningNode extends EventEmitter {
 			options.excludedChannels,
 			options.maxFeeMsat,
 			options.amountMsat,
-			options.maxCltvExpiryHeight
+			options.maxCltvExpiryHeight,
+			options.policyOverrides
 		);
 	}
 
@@ -16356,6 +16374,169 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Re-price a hop from the channel_update its failure carries (issue
+	 * #1056). fee_insufficient, incorrect_cltv_expiry and
+	 * amount_below_minimum mean the erring node holds a policy for its
+	 * outgoing channel other than the one we routed with, and the failure
+	 * says which. BOLT 4 lets the origin consider that update when retrying
+	 * this payment and forbids applying it to the network graph, since any
+	 * hop can forge one for any channel (issue #182). So the update is kept
+	 * on the retry context, scoped to this payment, once it passes the
+	 * checks that bind it to the route: it decodes, it names the erring
+	 * hop's outgoing channel, it is for our chain, its direction bit is the
+	 * erring node's side and the erring node signed it. The retry then
+	 * routes over that channel at its real price instead of excluding it;
+	 * the payment's fee cap still bounds the re-priced route.
+	 *
+	 * Returns true when an override was stored. Returns false, so the caller
+	 * excludes the channel as before, when there is no usable update or when
+	 * it changes nothing against the policy this attempt routed with: a node
+	 * refusing the very policy it advertises (an inbound fee we cannot see,
+	 * for instance) will not accept it on a retry either. One override per
+	 * edge, so the retry budget bounds their number.
+	 */
+	private notePolicyFailureUpdate(
+		ctx: IPaymentRetryContext | undefined,
+		payment: IPaymentInfo,
+		failureData: Buffer | undefined,
+		route: IPaymentInfo['route']
+	): boolean {
+		if (!ctx || !route || !failureData) return false;
+		const code = payment.failureCode;
+		const index = payment.failureSourceIndex;
+		if (code === undefined || index === undefined) return false;
+		if (
+			code !== FEE_INSUFFICIENT &&
+			code !== INCORRECT_CLTV_EXPIRY &&
+			code !== AMOUNT_BELOW_MINIMUM
+		) {
+			return false;
+		}
+		const erringHop = route.hops[index];
+		const outgoingHop = route.hops[index + 1];
+		if (!erringHop || !outgoingHop) return false;
+		// A blinded hop's SCID is opaque (zeroed): nothing to re-price.
+		if (outgoingHop.shortChannelId.equals(Buffer.alloc(8))) return false;
+
+		const payload = extractChannelUpdate(code, failureData);
+		if (!payload) return false;
+		let update: IChannelUpdateMessage;
+		try {
+			update = decodeChannelUpdateMessage(payload);
+		} catch {
+			return false;
+		}
+		const scidHex = outgoingHop.shortChannelId.toString('hex');
+		if (update.shortChannelId.toString('hex') !== scidHex) return false;
+		if (!update.chainHash.equals(this.chainHash())) return false;
+		// A disabled channel is not re-priced, it is routed around as before.
+		if ((update.channelFlags & CHANNEL_FLAG_DISABLED) !== 0) return false;
+
+		// The channel's endpoints in BOLT 7 order: the graph's when it
+		// announced the channel (and the route must agree with them), else
+		// the route's own pair (a hint edge).
+		const known = this.graph.getChannel(outgoingHop.shortChannelId);
+		let nodeId1: Buffer;
+		let nodeId2: Buffer;
+		if (known) {
+			nodeId1 = known.nodeId1;
+			nodeId2 = known.nodeId2;
+			const isEndpoint = (pubkey: Buffer): boolean =>
+				pubkey.equals(nodeId1) || pubkey.equals(nodeId2);
+			if (!isEndpoint(erringHop.pubkey) || !isEndpoint(outgoingHop.pubkey)) {
+				return false;
+			}
+		} else {
+			const erringIsLesser =
+				Buffer.compare(erringHop.pubkey, outgoingHop.pubkey) < 0;
+			nodeId1 = erringIsLesser ? erringHop.pubkey : outgoingHop.pubkey;
+			nodeId2 = erringIsLesser ? outgoingHop.pubkey : erringHop.pubkey;
+		}
+		const direction = update.channelFlags & CHANNEL_FLAG_DIRECTION;
+		const signer = direction === 0 ? nodeId1 : nodeId2;
+		if (!signer.equals(erringHop.pubkey)) return false;
+		if (!verifyChannelUpdate(update, payload, nodeId1, nodeId2)) return false;
+
+		// What this attempt routed with: the override an earlier failure of
+		// this payment stored, else the graph's policy for the erring node's
+		// side, else (a hint edge) the fee and delta the route recorded.
+		const key = policyOverrideKey(scidHex, direction);
+		const routedWith =
+			ctx.policyOverrides?.get(key) ??
+			(known ? (direction === 0 ? known.update1 : known.update2) : undefined);
+		const unchanged = routedWith
+			? routedWith.feeBaseMsat === update.feeBaseMsat &&
+			  routedWith.feeProportionalMillionths ===
+					update.feeProportionalMillionths &&
+			  routedWith.cltvExpiryDelta === update.cltvExpiryDelta &&
+			  routedWith.htlcMinimumMsat === update.htlcMinimumMsat &&
+			  routedWith.htlcMaximumMsat === update.htlcMaximumMsat
+			: erringHop.feeBaseMsat === update.feeBaseMsat &&
+			  erringHop.feeProportionalMillionths ===
+					update.feeProportionalMillionths &&
+			  outgoingHop.cltvExpiryDelta === update.cltvExpiryDelta;
+		if (unchanged) return false;
+
+		if (!ctx.policyOverrides) ctx.policyOverrides = new Map();
+		ctx.policyOverrides.set(key, update);
+		this.emitStructuredLog('payment', 'retry_repriced', {
+			paymentHash: payment.paymentHash.toString('hex'),
+			failureCode: code,
+			failureSourceIndex: index,
+			node: erringHop.pubkey.toString('hex'),
+			shortChannelId: scidHex,
+			direction,
+			feeBaseMsat: update.feeBaseMsat,
+			feeProportionalMillionths: update.feeProportionalMillionths,
+			cltvExpiryDelta: update.cltvExpiryDelta,
+			htlcMinimumMsat: update.htlcMinimumMsat.toString(),
+			timestamp: update.timestamp
+		});
+		return true;
+	}
+
+	/**
+	 * First-hop diversification for a retry after a retry (issue #1056).
+	 * The failed route's first hop, our own channel, is excluded only when
+	 * the failure implicates it (source index 0, or a failure we could not
+	 * decrypt or read) AND another of our channels can carry the route's
+	 * total on its own. It used to be excluded on every second retry
+	 * whatever the failure said, which on a wallet with one channel able to
+	 * carry the payment excluded that channel and ended the payment with
+	 * NO_ROUTE while a retry over it was still worth making.
+	 */
+	private diversifyFirstHop(
+		ctx: IPaymentRetryContext,
+		payment: IPaymentInfo,
+		route: IRoute
+	): void {
+		if (route.hops.length === 0) return;
+		const sourceIndex = payment.failureSourceIndex;
+		// The first hop did its part; the culpable channel is excluded already.
+		if (sourceIndex !== undefined && sourceIndex !== 0) return;
+		const firstHopScid = route.hops[0].shortChannelId.toString('hex');
+		const alternative = this.getLocalChannelEdges().find((edge) => {
+			const scid = edge.shortChannelId.toString('hex');
+			return (
+				scid !== firstHopScid &&
+				!ctx.excludedChannels.has(scid) &&
+				edge.outboundMsat >= route.totalAmountMsat
+			);
+		});
+		if (!alternative) {
+			this.emitStructuredLog('payment', 'first_hop_kept', {
+				paymentHash: payment.paymentHash.toString('hex'),
+				shortChannelId: firstHopScid,
+				failureSourceIndex: sourceIndex,
+				totalAmountMsat: route.totalAmountMsat.toString(),
+				reason: 'no other local channel can carry the payment'
+			});
+			return;
+		}
+		ctx.excludedChannels.add(firstHopScid);
+	}
+
+	/**
 	 * Send a keysend (spontaneous) payment — bLIP-0003.
 	 *
 	 * The sender generates a random preimage, includes it in the final hop
@@ -16377,7 +16558,8 @@ export class LightningNode extends EventEmitter {
 	private dispatchKeysend(
 		options: IKeysendOptions,
 		preimage: Buffer,
-		excludedChannels?: Set<string>
+		excludedChannels?: Set<string>,
+		policyOverrides?: TPolicyOverrides
 	): IPaymentInfo {
 		const {
 			destination,
@@ -16428,7 +16610,8 @@ export class LightningNode extends EventEmitter {
 			undefined,
 			undefined,
 			undefined,
-			this.getLocalChannelEdges()
+			this.getLocalChannelEdges(),
+			policyOverrides
 		);
 		if (!route) {
 			throw new LightningPaymentError(
@@ -16455,7 +16638,8 @@ export class LightningNode extends EventEmitter {
 				excludedChannels: excludedChannels ?? new Set(),
 				retryCount: 0,
 				maxRetries: this.maxPaymentRetries,
-				maxFeeMsat
+				maxFeeMsat,
+				policyOverrides
 			});
 		}
 
@@ -23175,13 +23359,8 @@ export class LightningNode extends EventEmitter {
 			failureRoute
 		);
 
-		// Record failure in MissionControl for future pathfinding. Skipped for
-		// height skew: no channel misbehaved, our expiry was stale, so penalising
-		// the route would degrade pathfinding over an innocent channel.
-		const culpableScid = this.getCulpableHopScid(payment, failureRoute);
-		if (culpableScid && !heightSkew) {
-			this.missionControl.recordFailure(culpableScid, payment.amountMsat);
-		}
+		const retryCtx = this.paymentRetryContexts.get(hashHex);
+		const maxRetries = retryCtx?.maxRetries ?? this.maxPaymentRetries;
 
 		// A channel_update embedded in the failure is NOT applied to the graph.
 		// BOLT 4: the origin node MAY consider it when calculating routes to
@@ -23193,14 +23372,40 @@ export class LightningNode extends EventEmitter {
 		// channel, and graph contents are served onward via gossip queries.
 		// LDK dropped this handling for the same reason, and peers are
 		// transitioning away from embedding updates at all (we send len 0
-		// ourselves since #177). Routing around the failure is handled by the
-		// MissionControl penalty above and the retry's excludedChannels below;
-		// fresh policy arrives via ordinary gossip.
+		// ourselves since #177). The one use BOLT 4 allows is what
+		// notePolicyFailureUpdate makes of it (issue #1056): a fee_insufficient,
+		// incorrect_cltv_expiry or amount_below_minimum failure whose update
+		// is bound to the route (right channel, right side, signed by the
+		// erring node) is a price, not a fault. The update rides THIS
+		// payment's retry context, its retries route over the channel at that
+		// price, and nothing else reads it. Every other failure is routed
+		// around by the MissionControl penalty and the retry's
+		// excludedChannels below; fresh policy arrives via ordinary gossip.
+		// An MPP part is never auto-retried (see below), so its failure is
+		// not re-priced either: the penalty and exclusion apply as before.
+		const repriced =
+			!heightSkew &&
+			!mppState &&
+			this.notePolicyFailureUpdate(
+				retryCtx,
+				payment,
+				failureData,
+				failureRoute
+			);
+
+		// Record failure in MissionControl for future pathfinding. Skipped for
+		// height skew: no channel misbehaved, our expiry was stale, so penalising
+		// the route would degrade pathfinding over an innocent channel. Skipped
+		// for a re-priced hop for the same reason: our copy of its policy was
+		// stale, not the channel, and a penalty would steer the retry off the
+		// one channel whose price we now know.
+		const culpableScid = this.getCulpableHopScid(payment, failureRoute);
+		if (culpableScid && !heightSkew && !repriced) {
+			this.missionControl.recordFailure(culpableScid, payment.amountMsat);
+		}
 
 		// Attempt payment retry for temporary failures, plus the height-skew case
 		// detected above.
-		const retryCtx = this.paymentRetryContexts.get(hashHex);
-		const maxRetries = retryCtx?.maxRetries ?? this.maxPaymentRetries;
 
 		// A failure INSIDE the blinded segment of a BOLT 12 payment implicates
 		// the blinded path rather than any public channel: its hops are opaque
@@ -23235,21 +23440,18 @@ export class LightningNode extends EventEmitter {
 		) {
 			// Exclude the failing channel's SCID from future routes. Skipped for
 			// height skew: the route is fine, our expiry was stale, and banning a
-			// healthy channel would push the retry onto a worse path.
-			if (culpableScid && !heightSkew) {
+			// healthy channel would push the retry onto a worse path. Skipped
+			// for a re-priced hop: the retry takes it at its real price.
+			if (culpableScid && !heightSkew && !repriced) {
 				retryCtx.excludedChannels.add(culpableScid);
 			}
 
-			// First-hop diversification: also exclude previous first hop on retries
-			if (
-				!heightSkew &&
-				retryCtx.retryCount > 0 &&
-				payment.route &&
-				payment.route.hops.length > 0
-			) {
-				retryCtx.excludedChannels.add(
-					payment.route.hops[0].shortChannelId.toString('hex')
-				);
+			// First-hop diversification: a retry after a retry also excludes
+			// the failed route's first hop, but only when the failure
+			// implicates that hop and another channel of ours can carry the
+			// payment (issue #1056).
+			if (!heightSkew && retryCtx.retryCount > 0 && payment.route) {
+				this.diversifyFirstHop(retryCtx, payment, payment.route);
 			}
 
 			retryCtx.retryCount++;
@@ -23285,13 +23487,15 @@ export class LightningNode extends EventEmitter {
 					retried = this.dispatchKeysend(
 						retryCtx.keysend.options,
 						retryCtx.keysend.preimage,
-						retryCtx.excludedChannels
+						retryCtx.excludedChannels,
+						retryCtx.policyOverrides
 					);
 				} else if (retryCtx.bolt12Invoice) {
 					retried = this.payBolt12Invoice(
 						retryCtx.bolt12Invoice,
 						retryCtx.excludedChannels,
-						retryCtx.maxFeeMsat
+						retryCtx.maxFeeMsat,
+						retryCtx.policyOverrides
 					);
 				} else {
 					retried = this.sendPayment(
@@ -23299,7 +23503,8 @@ export class LightningNode extends EventEmitter {
 						retryCtx.excludedChannels,
 						retryCtx.maxFeeMsat,
 						retryCtx.amountMsat,
-						retryCtx.maxCltvExpiryHeight
+						retryCtx.maxCltvExpiryHeight,
+						retryCtx.policyOverrides
 					);
 				}
 				retried.retryCount = retryCtx.retryCount;
@@ -27396,7 +27601,8 @@ export class LightningNode extends EventEmitter {
 	payBolt12Invoice(
 		invoice: IBolt12Invoice,
 		excludedChannels?: Set<string>,
-		maxFeeMsat?: bigint
+		maxFeeMsat?: bigint,
+		policyOverrides?: TPolicyOverrides
 	): IPaymentInfo {
 		if (!invoice.paymentHash || !invoice.amount || !invoice.nodeId) {
 			throw new Error('BOLT 12 invoice missing required fields');
@@ -27448,7 +27654,9 @@ export class LightningNode extends EventEmitter {
 					// Our own channels: a direct channel to the introduction node must
 					// be routable even when it never entered the public gossip graph
 					// (private channels; a fresh interop channel paying a CLN offer).
-					this.getLocalChannelEdges()
+					this.getLocalChannelEdges(),
+					undefined,
+					policyOverrides
 				);
 				// A self-introduction path is accepted by route construction as
 				// the bare tail BEFORE its decryption, constraints or channel
@@ -27504,7 +27712,8 @@ export class LightningNode extends EventEmitter {
 				finalCltvExpiry,
 				excludedChannels,
 				pathIndex,
-				maxFeeMsat
+				maxFeeMsat,
+				policyOverrides
 			);
 		}
 
@@ -27520,7 +27729,8 @@ export class LightningNode extends EventEmitter {
 			undefined,
 			undefined,
 			undefined,
-			this.getLocalChannelEdges()
+			this.getLocalChannelEdges(),
+			policyOverrides
 		);
 		if (!route) {
 			throw new Error('No route found to BOLT 12 invoice destination');
@@ -27538,7 +27748,8 @@ export class LightningNode extends EventEmitter {
 			finalCltvExpiry,
 			excludedChannels,
 			undefined,
-			maxFeeMsat
+			maxFeeMsat,
+			policyOverrides
 		);
 	}
 
@@ -27566,7 +27777,8 @@ export class LightningNode extends EventEmitter {
 		finalCltvExpiry: number,
 		excludedChannels?: Set<string>,
 		pathIndex?: number,
-		maxFeeMsat?: bigint
+		maxFeeMsat?: bigint,
+		policyOverrides?: TPolicyOverrides
 	): IPaymentInfo {
 		const hashHex = invoice.paymentHash.toString('hex');
 		const created = !this.paymentRetryContexts.has(hashHex);
@@ -27576,7 +27788,8 @@ export class LightningNode extends EventEmitter {
 				excludedChannels: excludedChannels ?? new Set(),
 				retryCount: 0,
 				maxRetries: this.maxPaymentRetries,
-				maxFeeMsat
+				maxFeeMsat,
+				policyOverrides
 			});
 		}
 		const ctx = this.paymentRetryContexts.get(hashHex)!;

@@ -10,7 +10,7 @@ import { IRoutingHintHop, Network } from '../invoice/types';
 import { IBolt12Invoice } from '../offer/types';
 import { IChannelConfig, ChannelState } from '../channel/types';
 import { IChannelBasepoints } from '../keys/derivation';
-import { IRoute, INodeAddress } from '../gossip/types';
+import { IRoute, INodeAddress, IChannelUpdateMessage } from '../gossip/types';
 import { FeatureFlags } from '../features/flags';
 import { IStorageBackend, IInvoiceInfo } from '../storage/types';
 import { IChainBackend } from '../chain/chain-watcher';
@@ -902,12 +902,30 @@ export interface IPaymentRetryContext {
 	 * before the HTLC is added. Preserved across retries.
 	 */
 	maxCltvExpiryHeight?: number;
+	/**
+	 * Channel policies this payment's own failures taught us (issue #1056):
+	 * the signed channel_update a fee_insufficient, incorrect_cltv_expiry or
+	 * amount_below_minimum failure carried, verified against the erring hop
+	 * and its outgoing channel. Keyed by SCID plus direction bit
+	 * (policyOverrideKey), one per edge, read by this payment's retries and
+	 * by nothing else: BOLT 4 lets the origin use such an update for the
+	 * same payment and forbids applying it to the network graph (issue
+	 * #182). A retry routes over the re-priced channel instead of excluding
+	 * it.
+	 */
+	policyOverrides?: Map<string, IChannelUpdateMessage>;
 }
 
 /** Options-object form of sendPayment's positional arguments. */
 export interface ISendPaymentOptions {
 	excludedChannels?: Set<string>;
 	maxFeeMsat?: bigint;
+	/**
+	 * Channel policies to route with in place of the graph's, keyed as
+	 * IPaymentRetryContext.policyOverrides. Scoped to this payment; the
+	 * graph is not touched.
+	 */
+	policyOverrides?: Map<string, IChannelUpdateMessage>;
 	/** Amount for an amount-less invoice. */
 	amountMsat?: bigint;
 	/**
