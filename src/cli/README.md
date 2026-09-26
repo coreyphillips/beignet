@@ -780,7 +780,7 @@ node.on('htlc:fulfilled', ({ channelId, htlcId }) => { ... }); // an HTLC we off
 node.on('htlc:failed', ({ channelId, htlcId }) => { ... });
 node.on('peer:connect', ({ pubkey }) => { ... });
 node.on('peer:disconnect', ({ pubkey }) => { ... });
-node.on('node:error', ({ code, message, timestamp }) => { ... });
+node.on('node:error', ({ code, message, timestamp, channelId, txid, retained }) => { ... }); // channelId when the error belongs to a channel; txid + retained on the broadcast codes (issue #1062)
 node.on('node:ready', () => { ... });           // node fully operational
 node.on('payment:retry', ({ paymentHash, attempt, maxRetries, nextRetryMs, error }) => { ... });
 node.on('backup:completed', ({ path, timestamp }) => { ... });
@@ -830,10 +830,13 @@ interface ChannelInfo {
   remoteBalanceSats: number;
   capacitySats: number;
   isAnchor: boolean;        // true if anchor channel (option_anchors_zero_fee_htlc_tx)
-  fundingTxid?: string;     // funding transaction ID hex
+  fundingTxid?: string;     // funding transaction ID hex (display order)
   shortChannelId?: string;  // e.g. "800000x1x0"
   feeratePerKw?: number;    // current commitment feerate
   htlcCount?: number;       // number of active HTLCs
+  pendingSpliceLocalBalanceSats?: number;  // local balance once the in-flight splice locks; present only mid-splice
+  pendingSpliceTxid?: string;              // the in-flight splice's txid, display order; present exactly when pendingSpliceLocalBalanceSats is (issue #1060)
+  previousFundingTxids?: string[];         // fundings retired by adopted splices, oldest first, display order; absent when never spliced (issue #1060)
   closeStatus?: {           // present for closing/closed channels
     closer: 'local' | 'remote' | 'cooperative' | 'unknown';
     reason?: string;        // 'user' or an automatic close code; absent for peer closes
@@ -1145,7 +1148,7 @@ interface BeignetNodeEvents {
   'htlc:failed': (data: { channelId: string; htlcId: string }) => void;
   'peer:connect': (data: { pubkey: string }) => void;
   'peer:disconnect': (data: { pubkey: string }) => void;
-  'node:error': (data: { code: string; message: string; timestamp: number }) => void;
+  'node:error': (data: { code: string; message: string; timestamp: number; channelId?: string; txid?: string; retained?: boolean }) => void;
   'node:ready': () => void;
   'payment:retry': (data: { paymentHash: string; attempt: number; maxRetries: number; nextRetryMs: number; error: string }) => void;
   'backup:completed': (data: { path: string; timestamp: number }) => void;
@@ -2249,6 +2252,13 @@ Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, 
 
 - `invoice:settled` fires when an invoice this node issued is paid. `payment:received` also covers spontaneous (keysend) receives, which have no invoice.
 - `channel:force-closing` fires both when this node broadcasts its own commitment (`initiator: "local"`) and when a peer's unilateral close is detected on-chain (`initiator: "remote"`).
+- `node:error` carries `code`, `message`, `timestamp` and, when the error belongs to a channel, `channelId`. The three broadcast codes also carry `txid` (display order) and `retained` (issue #1062):
+
+  | Code | Meaning | `retained` |
+  |------|---------|------------|
+  | `BROADCAST_FAILED` | The chain watcher could not hand a transaction to the backend; it retries on the next block | `true` when the node itself also holds the transaction (a pending funding, an in-flight or adopted but unconfirmed splice) |
+  | `BROADCAST_PERMANENT_FAILURE` | The watcher's retries ran out and it dropped the transaction from its queue | `true` means the node still re-sends it on every block until it confirms; `false` (a close, a sweep) means nothing else will |
+  | `SPLICE_BROADCAST_REFUSED` | The backend refused a fully signed splice the node re-sends every block; raised once per transaction and reason, with the backend's reason in the message | always `true` |
 - The `hold:*` events carry `{paymentHash, state, heldAmountMsat, htlcCount, minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks, cancelHeight}`, plus `reason` (`api` or `expiry-scan`) on `hold:cancelled`. The amount, count and expiry fields describe the set acted on. Terminal events retain these totals even though a subsequent `GET /invoices/held` row has zero parked parts. `hold:accepted` fires once per new MPP part with the running total. Before funding, require `BigInt(heldAmountMsat)` to cover the full expected amount. For an amountless invoice, use the amount agreed with the payer.
 
 Per-HTLC events (`htlc:forwarded`, `htlc:fulfilled`, `htlc:failed`) are relayed only when the daemon is started with `--htlc-events` (config `htlcEvents: true`, env `BEIGNET_HTLC_EVENTS=true`); routing nodes generate one event per HTLC, so they are off by default.

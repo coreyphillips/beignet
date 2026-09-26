@@ -657,6 +657,15 @@ export interface IChannelState {
 	 */
 	hasBeenSpliced?: boolean;
 	/**
+	 * Every funding txid this channel ran on before fundingTxid, oldest first
+	 * (internal byte order), one entry per adopted splice (issue #1060). A
+	 * wallet whose own deposit is the on-chain side of a splice matches that
+	 * transaction against the channel's fundings; once the channel has moved
+	 * on, the spent funding is only known here. Persisted; absent on rows
+	 * written before the field existed and on a never-spliced channel.
+	 */
+	previousFundingTxids?: Buffer[];
+	/**
 	 * Issue #764: the splice (txid in internal byte order) that the commitment
 	 * this FORCE_CLOSED channel broadcast spends, when the chain had that
 	 * splice but it had not reached its lock depth. The channel itself was NOT
