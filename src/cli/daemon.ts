@@ -1639,8 +1639,9 @@ async function bootDaemon(
 			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
 			// Strict boolean, the same rule the force close uses: the
 			// acknowledgement is authorization, so only the exact value counts.
-			// Async since issue #542: the close resolves a fresh wallet address
-			// for its payout before signing.
+			// Async since issue #542: the close resolves a wallet address on the
+			// change chain for its payout before signing (issue #1064: never a
+			// receive address a payer may have been given).
 			const result = await node.closeChannel(
 				channelId,
 				acceptStaleStateRisk === true

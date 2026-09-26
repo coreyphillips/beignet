@@ -19,6 +19,7 @@ import {
 	defaultDataDirForMnemonic,
 	gossipPrimeLatch
 } from '../../src/cli/beignet-node';
+import { Wallet } from '../../src/wallet';
 import type {
 	ApiResponse,
 	NodeInfo,
@@ -46,7 +47,7 @@ import type {
 // regtest default in src/cli/beignet-node.ts is a remote public host, so these
 // nominally offline tests dial a third party over the internet and fail
 // whenever it is unreachable. BeignetNode.init tolerates a failed connect:
-// resolveWalletSweepScript falls back to a locally derived index-0 address.
+// resolveWalletSweepScript falls back to a locally derived change address.
 const OFFLINE_ELECTRUM = {
 	electrumHost: '127.0.0.1',
 	electrumPort: 65529,
@@ -492,10 +493,12 @@ describe('BeignetNode', () => {
 		// catch that accepted any Error, and expect.fail throws an
 		// AssertionError, so the test passed whether or not create rejected.
 		// It does not reject: resolveWalletSweepScript swallows the connect
-		// failure and falls back to a deterministic index-0 wallet address,
-		// which is what keeps an offline restart able to build a force-close
-		// sweep. (The dial is a refused loopback port rather than the old
-		// 192.0.2.1 blackhole, which cost a connect timeout per run.)
+		// failure and falls back to the wallet's change address (change index
+		// 0 on a wallet that has never set its indexes; receive index 0 before
+		// issue #1064), which is what keeps an offline restart able to build
+		// a force-close sweep. (The dial is a refused loopback port rather
+		// than the old 192.0.2.1 blackhole, which cost a connect timeout per
+		// run.)
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-test-'));
 		let node: BeignetNode | undefined;
 		try {
@@ -513,6 +516,26 @@ describe('BeignetNode', () => {
 				'the offline fallback still produced a wallet-owned sweep script'
 			).to.be.instanceOf(Buffer);
 			expect(sweepScript!.length).to.be.greaterThan(0);
+			// The change chain, never the receive chain (issue #1064): the
+			// receive address is the one POST /address/new hands out on a new
+			// wallet, so a sweep there would read as a request being paid.
+			const wallet = (node as unknown as { wallet: Wallet }).wallet;
+			const generated = await wallet.generateAddresses({
+				addressAmount: 1,
+				changeAddressAmount: 1
+			});
+			expect(generated.isOk()).to.equal(true);
+			const bitcoin = require('bitcoinjs-lib');
+			const scriptOf = (address: string): Buffer =>
+				bitcoin.address.toOutputScript(address, bitcoin.networks.regtest);
+			const change0 = Object.values(
+				generated.isOk() ? generated.value.changeAddresses : {}
+			)[0].address;
+			const receive0 = Object.values(
+				generated.isOk() ? generated.value.addresses : {}
+			)[0].address;
+			expect(sweepScript!.equals(scriptOf(change0))).to.equal(true);
+			expect(sweepScript!.equals(scriptOf(receive0))).to.equal(false);
 		} finally {
 			await node?.destroy();
 			fs.rmSync(dir, { recursive: true, force: true });
