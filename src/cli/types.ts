@@ -128,6 +128,19 @@ export interface ChannelInfo {
 	 * localBalanceSats stays pre-splice until splice_locked.
 	 */
 	pendingSpliceLocalBalanceSats?: number;
+	/**
+	 * The in-flight splice's txid (display byte order, like fundingTxid).
+	 * Present exactly when pendingSpliceLocalBalanceSats is, so a wallet can
+	 * tell the transaction moving its coins is this channel's splice and not
+	 * a send (issue #1060).
+	 */
+	pendingSpliceTxid?: string;
+	/**
+	 * Funding txids this channel ran on before fundingTxid, oldest first
+	 * (display byte order), one per adopted splice. Absent on a channel that
+	 * has never been spliced (issue #1060).
+	 */
+	previousFundingTxids?: string[];
 	/** Whether the channel will accept a NEW HTLC (0.6.0+). */
 	htlcUsable?: boolean;
 	/**
@@ -1382,6 +1395,19 @@ export interface BeignetNodeEvents {
 		 * one field that says which open just failed.
 		 */
 		channelId?: string;
+		/**
+		 * The transaction a broadcast error is about (display byte order):
+		 * BROADCAST_FAILED, BROADCAST_PERMANENT_FAILURE and
+		 * SPLICE_BROADCAST_REFUSED carry it when the watcher could name it
+		 * (issue #1062).
+		 */
+		txid?: string;
+		/**
+		 * True when the node still holds that transaction and rebroadcasts it
+		 * on every block (a pending funding or an unconfirmed splice), so the
+		 * watcher's retry queue giving up is not the end of the attempt.
+		 */
+		retained?: boolean;
 	}) => void;
 	'node:ready': () => void;
 	log: (entry: {

@@ -1141,6 +1141,13 @@ export class LightningNode extends EventEmitter {
 	 * because a local frame is not a quorum-durable one.
 	 */
 	private authorizedSpliceBroadcasts: Set<string> = new Set();
+	/**
+	 * SPLICE_BROADCAST_REFUSED already raised this process, keyed
+	 * `${txid}:${reason}` (issue #1062): the per-block re-send repeats the
+	 * same refusal until the splice confirms, and one report per reason is
+	 * the useful number.
+	 */
+	private _spliceRefusalsReported: Set<string> = new Set();
 	private static readonly REAUTH_RETRY_MS = 10 * 60_000;
 	private paymentRetryContexts: Map<string, IPaymentRetryContext> = new Map();
 	private mppCleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -7115,13 +7122,105 @@ export class LightningNode extends EventEmitter {
 	 */
 	private rebroadcastAuthorizedSplice(idHex: string, txHex: string): void {
 		if (!this._chainBackend) return;
-		this._chainBackend.broadcastTransaction(txHex).catch(() => {
+		this._chainBackend.broadcastTransaction(txHex).catch((err) => {
+			const reason = (err as Error)?.message ?? String(err);
 			// Already in mempool or confirmed, or a backend hiccup. The watch
 			// on the new funding output reports the confirmation either way.
 			this.emitStructuredLog('chain', 'splice_rebroadcast_failed', {
-				channelId: idHex
+				channelId: idHex,
+				error: reason
 			});
+			// A transaction the network already has is the outcome wanted,
+			// not a refusal; funding:confirmed retires the obligation.
+			if (/already in block ?chain|already known|txn-already/i.test(reason)) {
+				return;
+			}
+			let txid: string;
+			try {
+				txid = bitcoin.Transaction.fromHex(txHex).getId();
+			} catch {
+				return;
+			}
+			// Once per (txid, reason), issue #1062: the same refusal repeats on
+			// every block for as long as the obligation stands, and the log
+			// line above already carries each repeat.
+			const key = `${txid}:${reason}`;
+			if (this._spliceRefusalsReported.has(key)) return;
+			this._spliceRefusalsReported.add(key);
+			this.emit('node:error', {
+				code: 'SPLICE_BROADCAST_REFUSED',
+				channelId: Buffer.from(idHex, 'hex'),
+				txid,
+				retained: true,
+				message: `splice ${txid} refused by the chain backend: ${reason}; the node still holds the transaction and rebroadcasts it on every block until it confirms`,
+				timestamp: Date.now()
+			} as ILightningError);
 		});
+	}
+
+	/**
+	 * What the node knows about a transaction the watcher reports on (issue
+	 * #1062): the channel it belongs to, and whether the node itself still
+	 * holds the bytes and re-sends them on every block. The retained sources
+	 * are exactly the block-driven obligations, pendingFundingTxs and the two
+	 * splice lists retryPendingSpliceBroadcasts walks. A close txid names its
+	 * channel, but the watcher's queue was its only driver. The txid arrives
+	 * in display order (the watcher's getId); channel state holds internal
+	 * order.
+	 */
+	private _describeBroadcastTxid(txid: string | undefined): {
+		txid?: string;
+		channelId?: Buffer;
+		retained: boolean;
+	} {
+		if (!txid) return { retained: false };
+		const internal = Buffer.from(txid, 'hex').reverse();
+		const internalHex = internal.toString('hex');
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			const id = state.channelId ?? state.temporaryChannelId;
+			const channelId = id ? Buffer.from(id) : undefined;
+			const inflight = state.spliceInFlight;
+			if (inflight?.spliceTxid?.equals(internal)) {
+				return {
+					txid,
+					channelId,
+					retained: inflight.fullySigned === true && !!inflight.spliceTxHex
+				};
+			}
+			if (
+				(state.unconfirmedSpliceTxs ?? []).some(
+					(e) => e.txid.equals(internal) && !!e.txHex
+				)
+			) {
+				return { txid, channelId, retained: true };
+			}
+			if (state.fundingTxid?.equals(internal)) {
+				return {
+					txid,
+					channelId,
+					retained: this.pendingFundingTxs.has(internalHex)
+				};
+			}
+		}
+		const closeIdHex = this._pendingCloseTxids.get(txid);
+		if (closeIdHex !== undefined) {
+			return {
+				txid,
+				channelId: Buffer.from(closeIdHex, 'hex'),
+				retained: false
+			};
+		}
+		if (this.pendingFundingTxs.has(internalHex))
+			return { txid, retained: true };
+		return { txid, retained: false };
+	}
+
+	/** The watcher's message, plus what happens next when the node still holds the tx. */
+	private _broadcastErrorMessage(message: string, retained: boolean): string {
+		return retained
+			? `${message}; the node still holds this transaction and rebroadcasts it on every block until it confirms`
+			: message;
 	}
 
 	/**
@@ -8561,27 +8660,40 @@ export class LightningNode extends EventEmitter {
 		// The watcher owns the broadcast; surface its failures under the code
 		// consumers already watch for. It re-queues and retries on the next
 		// block, so this is a warning rather than a terminal outcome.
-		this.chainWatcher.on('broadcast:failure', (err: Error) => {
+		this.chainWatcher.on('broadcast:failure', (err: Error, txid?: string) => {
+			const about = this._describeBroadcastTxid(txid);
 			this.emit('node:error', {
 				code: 'BROADCAST_FAILED',
-				message: err.message,
+				...about,
+				message: this._broadcastErrorMessage(err.message, about.retained),
 				timestamp: Date.now()
 			} as ILightningError);
 		});
 		// The watcher's own retries ran out and it drops the transaction from
 		// its list (issue #756). The block-driven obligations (pending fundings,
 		// pending splices) keep re-asking regardless; anything else ends here,
-		// so the end is reported instead of vanishing.
-		this.chainWatcher.on('broadcast:permanent_failure', (err: Error) => {
-			this.emitStructuredLog('chain', 'broadcast_permanent_failure', {
-				error: err.message
-			});
-			this.emit('node:error', {
-				code: 'BROADCAST_PERMANENT_FAILURE',
-				message: err.message,
-				timestamp: Date.now()
-			} as ILightningError);
-		});
+		// so the end is reported instead of vanishing. The txid, the channel
+		// and whether the node still holds the transaction ride along (issue
+		// #1062) so a consumer can tell a dropped sweep from a splice the node
+		// is still re-sending every block.
+		this.chainWatcher.on(
+			'broadcast:permanent_failure',
+			(err: Error, txid?: string) => {
+				const about = this._describeBroadcastTxid(txid);
+				this.emitStructuredLog('chain', 'broadcast_permanent_failure', {
+					error: err.message,
+					txid: about.txid,
+					channelId: about.channelId?.toString('hex'),
+					retained: about.retained
+				});
+				this.emit('node:error', {
+					code: 'BROADCAST_PERMANENT_FAILURE',
+					...about,
+					message: this._broadcastErrorMessage(err.message, about.retained),
+					timestamp: Date.now()
+				} as ILightningError);
+			}
+		);
 		// Wire watch:output:requested — handle sweep output watching after force-close
 		this.chainWatcher.on(
 			'watch:output:requested',
@@ -13792,8 +13904,27 @@ export class LightningNode extends EventEmitter {
 			info.fundingOutputIndex = state.fundingOutputIndex;
 		}
 		const pendingSplice = channel.getPendingSpliceLocalBalanceMsat();
-		if (pendingSplice !== null)
+		if (pendingSplice !== null) {
 			info.pendingSpliceLocalBalanceMsat = pendingSplice;
+			// Same branch, same presence rule (issue #1060): the getter answers
+			// non-null exactly when spliceInFlight is set, and the wallet that
+			// sees this transaction spend its coins needs the channel to own
+			// it before the adoption moves fundingTxid onto it.
+			const inflight = state.spliceInFlight;
+			if (inflight) {
+				info.pendingSpliceTxid = Buffer.from(inflight.spliceTxid)
+					.reverse()
+					.toString('hex');
+			}
+		}
+		// The fundings a splice has retired, oldest first (issue #1060): a
+		// deposit that funded this channel stays this channel's after the
+		// channel has moved on. Display order like fundingTxid.
+		if (state.previousFundingTxids && state.previousFundingTxids.length > 0) {
+			info.previousFundingTxids = state.previousFundingTxids.map((t) =>
+				Buffer.from(t).reverse().toString('hex')
+			);
+		}
 		info.htlcUsable = channel.acceptsNewHtlcs();
 		// The reason a NORMAL channel can still answer false, so a consumer can
 		// tell "mid-splice and parked" from "restored and held" (issue #469) and

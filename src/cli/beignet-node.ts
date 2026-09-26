@@ -61,7 +61,7 @@ import {
 	MemoryL402CredentialStore,
 	readCappedBody
 } from '../lightning/l402';
-import { IPaymentInfo } from '../lightning/node/types';
+import { ILightningError, IPaymentInfo } from '../lightning/node/types';
 import { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
 import { SqliteStorage } from '../lightning/storage/sqlite-storage';
@@ -431,6 +431,10 @@ export interface BeignetNodeOptions {
 		message: string;
 		timestamp: number;
 		channelId?: string;
+		/** The transaction a broadcast error is about, display order (issue #1062). */
+		txid?: string;
+		/** The node still holds that transaction and rebroadcasts it every block. */
+		retained?: boolean;
 	}) => void;
 	/** Log level (default 'info'). Set to 'silent' to suppress. */
 	logLevel?: LogLevel;
@@ -2877,34 +2881,7 @@ export class BeignetNode extends EventEmitter {
 		}
 
 		// Forward errors to callback or absorb to prevent process crash
-		this.node.on(
-			'node:error',
-			(err: {
-				code: string;
-				message: string;
-				timestamp: number;
-				channelId?: Buffer;
-			}) => {
-				if (opts.onError) {
-					opts.onError({
-						code: err.code,
-						message: err.message,
-						timestamp: err.timestamp,
-						channelId: err.channelId ? err.channelId.toString('hex') : undefined
-					});
-				}
-				// Carry the channel id, as onError already does. Without it a
-				// subscriber (SSE, webhooks) cannot tell which channel an error
-				// belongs to, so an error raised while a channel is being opened
-				// is indistinguishable from an unrelated one on another channel.
-				this.emit('node:error', {
-					code: err.code,
-					message: err.message,
-					timestamp: err.timestamp,
-					channelId: err.channelId ? err.channelId.toString('hex') : undefined
-				});
-			}
-		);
+		this.wireNodeErrorRelay(opts.onError);
 
 		// Forward payment events with JSON-safe types + structured logging
 		this.node.on('payment:received', (info: IPaymentInfo) => {
@@ -8272,6 +8249,38 @@ export class BeignetNode extends EventEmitter {
 		};
 	}
 
+	/**
+	 * Relay the engine's node:error to the onError callback and to this
+	 * emitter (SSE, webhooks), JSON-safe. The channel id rides as hex, as
+	 * onError always did: without it a subscriber cannot tell which channel
+	 * an error belongs to, so an error raised while a channel is being
+	 * opened is indistinguishable from an unrelated one. txid and retained
+	 * (issue #1062) ride whenever the engine set them, so a broadcast
+	 * failure names its transaction and says whether the node is still
+	 * re-sending it.
+	 */
+	private wireNodeErrorRelay(onError: BeignetNodeOptions['onError']): void {
+		this.node.on('node:error', (err: ILightningError) => {
+			const data: {
+				code: string;
+				message: string;
+				timestamp: number;
+				channelId?: string;
+				txid?: string;
+				retained?: boolean;
+			} = {
+				code: err.code,
+				message: err.message,
+				timestamp: err.timestamp,
+				channelId: err.channelId ? err.channelId.toString('hex') : undefined
+			};
+			if (err.txid !== undefined) data.txid = err.txid;
+			if (err.retained !== undefined) data.retained = err.retained;
+			if (onError) onError(data);
+			this.emit('node:error', data);
+		});
+	}
+
 	private toChannelInfo(ch: {
 		channelId: Buffer;
 		peerPubkey: string;
@@ -8286,6 +8295,8 @@ export class BeignetNode extends EventEmitter {
 		feeratePerKw?: number;
 		htlcCount?: number;
 		pendingSpliceLocalBalanceMsat?: bigint;
+		pendingSpliceTxid?: string;
+		previousFundingTxids?: string[];
 		htlcUsable?: boolean;
 		restoreRecencyUnproven?: boolean;
 		reestablishRecencyUnproven?: boolean;
@@ -8346,6 +8357,13 @@ export class BeignetNode extends EventEmitter {
 			info.pendingSpliceLocalBalanceSats = Number(
 				ch.pendingSpliceLocalBalanceMsat / 1000n
 			);
+		// The splice txid and the retired fundings (issue #1060): a wallet
+		// matches its own deposits against them, so a channel's splice is
+		// not shown as a send. Already display order from the node layer.
+		if (ch.pendingSpliceTxid !== undefined)
+			info.pendingSpliceTxid = ch.pendingSpliceTxid;
+		if (ch.previousFundingTxids && ch.previousFundingTxids.length > 0)
+			info.previousFundingTxids = [...ch.previousFundingTxids];
 		// The dashboard's Send gating reads these off the wire; dropping them
 		// here re-parked every mid-splice channel in the UI while the daemon
 		// happily paid through the window.

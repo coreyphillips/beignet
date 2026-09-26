@@ -14552,6 +14552,22 @@ export class Channel {
 		// The funding has moved: from here on the funder-fee guard admits the
 		// climb-out adds eclair sends on a spliced channel (issue #1020).
 		fields.hasBeenSpliced = true;
+		// Keep the funding this adoption retires (issue #1060). The state
+		// still holds the OLD txid here: the swap above is a value in
+		// `fields`, applied by the caller. Only a real swap appends, so the
+		// degenerate empty-fields adoption and a view built against the
+		// funding already current leave the list alone, and an applied
+		// adoption appends exactly once.
+		if (
+			fields.fundingTxid &&
+			this._state.fundingTxid &&
+			!fields.fundingTxid.equals(this._state.fundingTxid)
+		) {
+			fields.previousFundingTxids = [
+				...(this._state.previousFundingTxids ?? []),
+				Buffer.from(this._state.fundingTxid)
+			];
+		}
 		// The reads below have to see the funding swap this same adoption
 		// makes, exactly as they did when this ran after the live mutation.
 		const adopted = { ...this._state, ...fields } as IChannelState;

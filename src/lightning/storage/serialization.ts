@@ -346,6 +346,11 @@ export interface ISerializedChannelState {
 	fundingUnaccounted?: boolean;
 	/** A splice has been adopted at least once (see IChannelState). */
 	hasBeenSpliced?: boolean;
+	/**
+	 * Funding txids retired by adopted splices, oldest first, internal byte
+	 * order hex (issue #1060). Absent on rows written before the field.
+	 */
+	previousFundingTxids?: string[];
 	fundingOutputIndex: number;
 	minimumDepth: number;
 	localConfig: ISerializedChannelConfig;
@@ -865,6 +870,7 @@ export function serializeChannelState(
 		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
 		fundingUnaccounted: s.fundingUnaccounted,
 		hasBeenSpliced: s.hasBeenSpliced,
+		previousFundingTxids: s.previousFundingTxids?.map((t) => t.toString('hex')),
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: serializeChannelConfig(s.localConfig),
@@ -1284,6 +1290,9 @@ export function deserializeChannelState(
 		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
 		fundingUnaccounted: s.fundingUnaccounted,
 		hasBeenSpliced: s.hasBeenSpliced,
+		previousFundingTxids: s.previousFundingTxids?.map((t) =>
+			Buffer.from(t, 'hex')
+		),
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: deserializeChannelConfig(s.localConfig),

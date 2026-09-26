@@ -191,6 +191,77 @@ describe('Channel listing wire fields (GET /channels JSON)', () => {
 		expect(info.payThroughSplice).to.equal(undefined);
 	});
 
+	// Issue #1060: a wallet matches its own deposits against the channel's
+	// fundings, so the in-flight splice txid has to ride with the pending
+	// balance (same presence rule) and the retired fundings have to survive
+	// the adoption that moves fundingTxid on.
+	it('toChannelInfo passes pendingSpliceTxid through, present exactly with the pending balance', () => {
+		const call = (ch: Record<string, unknown>): Record<string, unknown> =>
+			(BeignetNode.prototype as any).toChannelInfo.call(
+				{
+					node: {
+						getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' }),
+						peerSupportsSplicing: () => null
+					}
+				},
+				ch
+			);
+		const base = {
+			channelId: Buffer.alloc(32, 4),
+			peerPubkey: 'peerpk',
+			state: 'NORMAL',
+			localBalanceMsat: 132_295_000n,
+			remoteBalanceMsat: 5_000_000n,
+			fundingSatoshis: 137_295n,
+			channelType: null
+		};
+		const spliceTxid = 'ab'.repeat(32);
+		const mid = call({
+			...base,
+			state: 'SPLICING',
+			pendingSpliceLocalBalanceMsat: 211_746_000n,
+			pendingSpliceTxid: spliceTxid
+		});
+		expect(mid.pendingSpliceLocalBalanceSats).to.equal(211_746);
+		expect(mid.pendingSpliceTxid).to.equal(spliceTxid);
+		const idle = call(base);
+		expect(idle.pendingSpliceLocalBalanceSats).to.equal(undefined);
+		expect(idle).to.not.have.property('pendingSpliceTxid');
+	});
+
+	it('toChannelInfo passes previousFundingTxids through in display order, oldest first', () => {
+		const call = (ch: Record<string, unknown>): Record<string, unknown> =>
+			(BeignetNode.prototype as any).toChannelInfo.call(
+				{
+					node: {
+						getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' }),
+						peerSupportsSplicing: () => null
+					}
+				},
+				ch
+			);
+		const base = {
+			channelId: Buffer.alloc(32, 5),
+			peerPubkey: 'peerpk',
+			state: 'NORMAL',
+			localBalanceMsat: 1_000_000n,
+			remoteBalanceMsat: 0n,
+			fundingSatoshis: 1_000n,
+			channelType: null,
+			fundingTxid: 'cc'.repeat(32)
+		};
+		// The node layer already reversed these; the serializer must pass
+		// them through untouched and in order.
+		const previous = ['aa'.repeat(32), 'bb'.repeat(32)];
+		const spliced = call({ ...base, previousFundingTxids: previous });
+		expect(spliced.previousFundingTxids).to.deep.equal(previous);
+		expect(spliced.fundingTxid).to.equal('cc'.repeat(32));
+		const never = call(base);
+		expect(never).to.not.have.property('previousFundingTxids');
+		const empty = call({ ...base, previousFundingTxids: [] });
+		expect(empty).to.not.have.property('previousFundingTxids');
+	});
+
 	// The dashboard hides its splice buttons on `false` alone, so the
 	// distinction between false and absent is load-bearing: absent means the
 	// peer is disconnected and support is unknowable, and hiding on unknown

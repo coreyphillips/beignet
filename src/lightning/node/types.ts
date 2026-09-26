@@ -1026,6 +1026,20 @@ export interface IChannelInfo {
 	 */
 	pendingSpliceLocalBalanceMsat?: bigint;
 	/**
+	 * The in-flight splice's transaction id (display byte order, like
+	 * fundingTxid). Present exactly when pendingSpliceLocalBalanceMsat is:
+	 * the splice is past its point of no return and not yet adopted, so a
+	 * wallet can recognise the transaction moving its own coins as this
+	 * channel's rather than as a send (issue #1060).
+	 */
+	pendingSpliceTxid?: string;
+	/**
+	 * Funding txids this channel ran on before fundingTxid, oldest first
+	 * (display byte order), one per adopted splice. Absent on a channel
+	 * that has never been spliced (issue #1060).
+	 */
+	previousFundingTxids?: string[];
+	/**
 	 * Whether the channel will accept a NEW HTLC: it can carry traffic right
 	 * now (NORMAL, or ECDSA pending-lock mid-splice with pay-during-splice
 	 * active) AND its state is provably current.
@@ -1216,6 +1230,20 @@ export interface ILightningError {
 	channelId?: Buffer;
 	message: string;
 	timestamp: number;
+	/**
+	 * The transaction a broadcast error is about (display byte order), when
+	 * the watcher could name it (issue #1062). Carried by BROADCAST_FAILED,
+	 * BROADCAST_PERMANENT_FAILURE and SPLICE_BROADCAST_REFUSED.
+	 */
+	txid?: string;
+	/**
+	 * True when the node itself still holds this transaction and re-sends
+	 * it on every block (a pending funding, an in-flight or adopted but
+	 * unconfirmed splice), so the watcher's own queue giving up on it is not
+	 * the end of the attempt. False when that queue was the only driver (a
+	 * close, a sweep) or the transaction is not one this node tracks.
+	 */
+	retained?: boolean;
 }
 
 export interface IPaymentPart {

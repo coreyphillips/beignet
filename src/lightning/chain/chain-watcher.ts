@@ -448,8 +448,10 @@ export async function classifyRemoteFundingInput(
  *   needs an output watched and cannot arm it itself
  * - 'block' (height: number)
  * - 'broadcast:success' (txid: string)
- * - 'broadcast:failure' (error: Error)
- * - 'broadcast:permanent_failure' (error: Error): retries exhausted
+ * - 'broadcast:failure' (error: Error, txid?: string): txid in display
+ *   order when the payload decoded (issue #1062)
+ * - 'broadcast:permanent_failure' (error: Error, txid: string): retries
+ *   exhausted; the transaction leaves the watcher's queue
  * - 'error' (error: Error)
  *
  * CONTRACT: register an 'error' listener. Chain failures are reported there
@@ -1587,8 +1589,9 @@ export class ChainWatcher extends EventEmitter {
 			// Queue for retry on next block. Guard the decode so a malformed
 			// payload is logged and dropped rather than throwing an unhandled
 			// rejection inside this catch handler (which would crash the process).
+			let txidHex: string | undefined;
 			try {
-				const txidHex = bitcoin.Transaction.fromBuffer(tx).getId();
+				txidHex = bitcoin.Transaction.fromBuffer(tx).getId();
 				// Dedup by txid
 				if (!this.failedBroadcasts.some((fb) => fb.txidHex === txidHex)) {
 					this.failedBroadcasts.push({
@@ -1600,7 +1603,10 @@ export class ChainWatcher extends EventEmitter {
 			} catch {
 				// Not a decodable transaction; nothing to queue for retry.
 			}
-			this.emit('broadcast:failure', err);
+			// The txid rides as a second argument (issue #1062) so the node
+			// can say which transaction, and whose channel, the failure is
+			// about. Undefined when the payload did not decode.
+			this.emit('broadcast:failure', err, txidHex);
 		});
 	};
 
@@ -1656,11 +1662,15 @@ export class ChainWatcher extends EventEmitter {
 			for (const fb of pendingBroadcasts) {
 				fb.retryCount++;
 				if (fb.retryCount > MAX_BROADCAST_RETRIES) {
+					// The txid as a second argument (issue #1062): the node
+					// resolves the channel and whether it still holds the
+					// transaction itself from it.
 					this.emit(
 						'broadcast:permanent_failure',
 						new Error(
 							`Broadcast permanently failed after ${MAX_BROADCAST_RETRIES} retries: ${fb.txidHex}`
-						)
+						),
+						fb.txidHex
 					);
 					continue;
 				}
