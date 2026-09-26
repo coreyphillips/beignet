@@ -20493,6 +20493,11 @@ export class LightningNode extends EventEmitter {
 	 * opening fee. In hop mode (`feeMode: 'hop'`) the hint carries the fee
 	 * terms instead, the sender pays them, and the invoice needs no allowance:
 	 * a receiver-pays fee becomes a sender-pays one.
+	 *
+	 * The total the intent declares is only the share of the amount that has
+	 * to cross the LSP: the invoice also advertises every other usable channel
+	 * of ours, and what those can receive never reaches the LSP (issue #1061,
+	 * jitShareCrossingLspMsat).
 	 */
 	async createJitInvoice(opts: {
 		lspPubkeyHex: string;
@@ -20544,11 +20549,17 @@ export class LightningNode extends EventEmitter {
 				);
 			}
 		}
+		// The total the LSP waits for before it funds is the share of the
+		// amount that has to come through it, not the whole invoice (issue
+		// #1061, jitShareCrossingLspMsat); an amount-less invoice declares
+		// none, as before.
+		const expectedTotalMsat =
+			opts.amountMsat !== undefined
+				? this.jitShareCrossingLspMsat(opts.lspPubkeyHex, opts.amountMsat)
+				: undefined;
 		const grant = await this.requestJitReceive(opts.lspPubkeyHex, {
 			maxAmountMsat,
-			...(opts.amountMsat !== undefined
-				? { expectedTotalMsat: opts.amountMsat }
-				: {}),
+			...(expectedTotalMsat !== undefined ? { expectedTotalMsat } : {}),
 			targetRemainingInboundSat: opts.targetRemainingInboundSat ?? 0n,
 			expirySeconds: expiry,
 			...(opts.maxFlatFeeSat !== undefined
@@ -20581,6 +20592,13 @@ export class LightningNode extends EventEmitter {
 			// only the fee owed on what actually arrives. Hop mode records no
 			// allowance at all: the forward is the full amount, and an allowance
 			// would let a short HTLC settle for a fee nobody is deducting.
+			//
+			// The declared total is the payer's onion total_msat: the full
+			// invoice amount however its parts route. The LSP skims the flat
+			// fee plus the ppm of what it actually forwards, which is at most
+			// that, and the intent's expectedTotalMsat plays no part in either
+			// figure, so a lowered or omitted total leaves the allowance at
+			// exactly the fee owed (admitJitSkim).
 			...(grant.feeMode === 'skim'
 				? {
 						jitFeeAllowance: {
@@ -20597,6 +20615,71 @@ export class LightningNode extends EventEmitter {
 			feePpm: grant.feePpm,
 			feeMode: grant.feeMode
 		};
+	}
+
+	/**
+	 * The share of a fixed-amount JIT invoice that has to arrive through the
+	 * LSP, which is the total its intent must declare (issue #1061), or
+	 * undefined when the other channels could carry all of it.
+	 *
+	 * createInvoice puts a hint on the invoice for EVERY usable channel, so a
+	 * payer that can reach one with another peer may deliver part of the
+	 * amount over it and only the rest through the intercept hint. The LSP
+	 * funds once the parts it holds reach the declared total, and a total the
+	 * other channel absorbs part of is never reached: the held parts time out
+	 * (aggregationTimeoutMs) as temporary_channel_failure, every attempt.
+	 * Switching primaries leaves a wallet in exactly this state, since the
+	 * channel with the old primary stays open, and the old primary itself is
+	 * the payer that splits this way with certainty.
+	 *
+	 * So the total declared is the amount minus what those other channels can
+	 * receive, and no total at all (0 on the wire, "unknown") once they could
+	 * carry the whole amount: the LSP then funds on the first intercepted part
+	 * and this node's own final-hop MPP accumulation joins it with the parts
+	 * that came the other way. Receivable is the peer's balance above the
+	 * reserve we hold it to, the figure the daemon's canReceive uses, counted
+	 * only for a channel the invoice will actually advertise (the predicate
+	 * getPrivateChannelRoutingHints applies). A channel with the LSP itself is
+	 * not "other": what arrives over it lands at the LSP either way, and a
+	 * part that outgrows it is answered with a splice, not a wait.
+	 *
+	 * The trade-off, since the two failure modes are not symmetric: with the
+	 * total lowered or omitted, a payer that splits ACROSS the intercept hint
+	 * itself loses its late parts. The held set is consumed when the funding
+	 * starts, a part arriving while it runs is refused, and the intent is gone
+	 * once the forward is placed, so only one part can cross the LSP and the
+	 * payer sees that attempt fail and retries. The mismatch above is worse:
+	 * deterministic, and it fails every attempt that touches the other
+	 * channel. Dropping the other hints from a JIT invoice instead would not
+	 * help: the payer adjacent to this node (the old primary, as reported)
+	 * needs no hint to pay over its own channel, and a public channel is in
+	 * every payer's graph regardless.
+	 *
+	 * Erring high on what the other channels can carry is the safe side (the
+	 * reserve is the only deduction; the funder's commitment fee and the
+	 * in-flight ceilings are not): it lowers the total, and a total that is
+	 * too low costs a retry where one that is too high fails every time.
+	 */
+	private jitShareCrossingLspMsat(
+		lspPubkeyHex: string,
+		amountMsat: bigint
+	): bigint | undefined {
+		let otherInboundMsat = 0n;
+		for (const channel of this.channelManager.listChannels()) {
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			if (this.channelManager.getPeerForChannel(channelId) === lspPubkeyHex) {
+				continue;
+			}
+			if (!this.buildRoutingHintForChannel(channel)) continue;
+			const state = channel.getFullState();
+			const receivableMsat =
+				state.remoteBalanceMsat -
+				state.localConfig.channelReserveSatoshis * 1000n;
+			if (receivableMsat > 0n) otherInboundMsat += receivableMsat;
+		}
+		const share = amountMsat - otherInboundMsat;
+		return share > 0n ? share : undefined;
 	}
 
 	/**
