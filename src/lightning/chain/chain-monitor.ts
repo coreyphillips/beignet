@@ -511,16 +511,36 @@ export class ChainMonitor {
 		return this._commitmentReverifyPending;
 	}
 
+	/**
+	 * An unspent output only the PEER can spend: its to_remote on OUR
+	 * commitment, or its own to_local on ITS current (unrevoked) commitment.
+	 * Both are tracked for classification completeness, but neither is ours to
+	 * claim, so a vanished peer would otherwise pin the monitor in RESOLVING
+	 * forever and the channel FORCE_CLOSED (issue #1065): an unspent one does
+	 * not block full resolution, and once the peer does spend it the normal
+	 * SPEND_CONFIRMED path applies. Not matched: a to_local on a REVOKED
+	 * commitment, which is our penalty claim; a FUTURE commitment, which
+	 * tracks no to_local at all; and a second-level to_local, which is ours.
+	 */
+	private _isPeerOnlyUnspentOutput(output: ITrackedOutput): boolean {
+		if (output.status !== OutputStatus.CONFIRMED) return false;
+		const commitmentType = this._commitmentBroadcast?.commitmentType;
+		return (
+			(commitmentType === CommitmentType.OUR_COMMITMENT &&
+				output.outputType === OutputType.TO_REMOTE) ||
+			(commitmentType === CommitmentType.THEIR_CURRENT_COMMITMENT &&
+				output.outputType === OutputType.TO_LOCAL &&
+				!output.isSecondLevelHtlc)
+		);
+	}
+
 	private _allTrackedOutputsResolved(): boolean {
 		return (
 			this._trackedOutputs.length > 0 &&
 			this._trackedOutputs.every(
 				(output) =>
 					output.status === OutputStatus.IRREVOCABLY_RESOLVED ||
-					(this._commitmentBroadcast?.commitmentType ===
-						CommitmentType.OUR_COMMITMENT &&
-						output.outputType === OutputType.TO_REMOTE &&
-						output.status === OutputStatus.CONFIRMED)
+					this._isPeerOnlyUnspentOutput(output)
 			)
 		);
 	}
@@ -819,17 +839,10 @@ export class ChainMonitor {
 				continue;
 			}
 
-			// The PEER's to_remote on OUR commitment is tracked (classification
-			// completeness) but only the peer can spend it. A vanished peer would
-			// otherwise pin the monitor in RESOLVING forever, so an unspent one
-			// does not block full resolution; once the peer does spend it, the
-			// normal SPEND_CONFIRMED path below applies.
-			if (
-				this._commitmentBroadcast?.commitmentType ===
-					CommitmentType.OUR_COMMITMENT &&
-				output.outputType === OutputType.TO_REMOTE &&
-				output.status === OutputStatus.CONFIRMED
-			) {
+			// The peer's own output (see _isPeerOnlyUnspentOutput) is not ours
+			// to mature or sweep; once the peer does spend it, the normal
+			// SPEND_CONFIRMED path below applies.
+			if (this._isPeerOnlyUnspentOutput(output)) {
 				continue;
 			}
 
