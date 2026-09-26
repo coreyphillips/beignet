@@ -98,7 +98,15 @@ const seedPaidRow = (
 		createdAt: Date.now() - 2_000,
 		completedAt: Date.now() - 1_000
 	});
-	expect(node.getPayment(hashHex), 'memory holds nothing').to.equal(null);
+	// The engine holds nothing for the hash; the read API still finds the
+	// row (issue #1063), so the map is checked directly.
+	expect(
+		node.getNode().getPayment(Buffer.from(hashHex, 'hex')),
+		'memory holds nothing'
+	).to.equal(undefined);
+	expect(node.getPayment(hashHex)?.status, 'the row is read through').to.equal(
+		'COMPLETED'
+	);
 	return { bolt11, hashHex };
 };
 

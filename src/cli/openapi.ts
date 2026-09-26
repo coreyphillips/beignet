@@ -128,6 +128,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/payments': {
 				get: {
 					summary: 'List payments with optional filtering',
+					description:
+						'Newest first. Read through to the node database: a completed or failed payment stays listed with its status after the engine prunes its in-memory record (24 hours after completion, oldest first past 10,000). A database read that fails answers 500, never a shorter list.',
 					tags: ['Payments'],
 					parameters: [
 						{
@@ -271,6 +273,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/invoices': {
 				get: {
 					summary: 'List created invoices',
+					description:
+						'status is PAID on a completed receive for the hash, from the in-memory record or the database row once the engine has pruned it, so a paid invoice never reads EXPIRED or PENDING later. A database read that fails answers 500.',
 					tags: ['Invoices'],
 					responses: {
 						'200': {
@@ -519,6 +523,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/invoice': {
 				get: {
 					summary: 'Get a specific invoice by payment hash',
+					description:
+						'status is judged as GET /invoices judges it: PAID from the in-memory record or the database row, so it never reverts to EXPIRED or PENDING after the engine prunes the record.',
 					tags: ['Invoices'],
 					parameters: [
 						{
@@ -991,6 +997,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/payment': {
 				get: {
 					summary: 'Get a specific payment by hash',
+					description:
+						'The in-memory record, else its database row, so a payment is found however long ago it completed. NOT_FOUND only when neither exists; a database read that fails answers 500.',
 					tags: ['Payments'],
 					parameters: [
 						{
