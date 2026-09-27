@@ -93,10 +93,9 @@ export class GossipSyncManager extends EventEmitter {
 	/** A batch of this sync was given up on, so it cannot end SYNCED. */
 	private _incomplete = false;
 	/**
-	 * Gossip from this peer was lost and has not been fetched again since.
-	 * The next range sync then asks for every channel the peer lists:
-	 * getMissingSCIDs only finds absent channels, and a channel whose updates
-	 * were dropped is not absent.
+	 * Gossip was lost and no sync has ended SYNCED since. The next range sync
+	 * then asks for every channel the peer lists: getMissingSCIDs only finds
+	 * absent channels, and a channel whose updates were dropped is not absent.
 	 */
 	private _repairPending = false;
 	private readonly _chainHash: Buffer;
@@ -116,11 +115,20 @@ export class GossipSyncManager extends EventEmitter {
 		return this._state;
 	}
 
+	/** Lost gossip that no sync has fetched again yet. */
+	get repairPending(): boolean {
+		return this._repairPending;
+	}
+
 	/**
 	 * Initiate gossip sync with a peer.
 	 * Returns messages to send: gossip_timestamp_filter + query_channel_range.
+	 *
+	 * @param repair Gossip was lost on a connection that closed before its
+	 *   sync could fetch it again, so ask for every channel.
 	 */
-	initiateSync(): IGossipSyncMessage[] {
+	initiateSync(repair = false): IGossipSyncMessage[] {
+		if (repair) this._repairPending = true;
 		const messages: IGossipSyncMessage[] = [];
 
 		// Send gossip_timestamp_filter to receive future gossip
@@ -275,14 +283,16 @@ export class GossipSyncManager extends EventEmitter {
 	 * During a batch that message may be part of the reply, so the batch is
 	 * asked for again when its end marker arrives. Before the range reply
 	 * completes it is gossip no batch would ask for, so the sync asks for
-	 * every channel instead.
+	 * every channel instead. Either way the loss stays recorded until a sync
+	 * ends SYNCED, so the node can carry it past a disconnect.
 	 */
 	noteIntakeLoss(): void {
-		if (this._state === GossipSyncState.AWAITING_RANGE_REPLY) {
-			this._repairPending = true;
-		} else if (this._state === GossipSyncState.AWAITING_SCID_REPLY) {
+		if (this._state === GossipSyncState.AWAITING_SCID_REPLY) {
 			this._batchLost = true;
+		} else if (this._state !== GossipSyncState.AWAITING_RANGE_REPLY) {
+			return;
 		}
+		this._repairPending = true;
 	}
 
 	// ── Responding side ────────────────────────────────────────────

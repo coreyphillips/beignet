@@ -907,6 +907,32 @@ describe('Gossip Sync (Phase 5)', function () {
 			expect(offer(mgr, offered)).to.eql([unknown]);
 		});
 
+		it('keeps a batch loss recorded for a sync on the next connection', function () {
+			const graph = new NetworkGraph();
+			const known = populateGraph(graph, 3).map((s) => s.toString('hex'));
+			const unknown = makeScid(100_000, 1, 0).toString('hex');
+			const mgr = new GossipSyncManager(graph);
+			expect(offer(mgr, [...known, unknown])).to.eql([unknown]);
+			expect(mgr.repairPending).to.equal(false);
+
+			// Lost before the end marker: the connection may close first.
+			mgr.noteIntakeLoss();
+			expect(mgr.repairPending).to.equal(true);
+
+			const next = new GossipSyncManager(graph);
+			next.initiateSync(true);
+			const out = next.handleReplyChannelRange({
+				chainHash: BITCOIN_CHAIN_HASH,
+				firstBlocknum: 0,
+				numberOfBlocks: 0xffffffff,
+				syncComplete: true,
+				encodedShortIds: encodeShortChannelIds(
+					known.map((s) => Buffer.from(s, 'hex'))
+				)
+			});
+			expect(queried(out)).to.have.members(known);
+		});
+
 		it('ignores intake loss while no batch is in flight', function () {
 			const mgr = new GossipSyncManager(new NetworkGraph());
 			expect(startSync(mgr, 10)).to.have.length(10);
@@ -1902,7 +1928,9 @@ describe('Gossip Sync (Phase 5)', function () {
 			let onQuery: (() => void) | null;
 
 			beforeEach(function () {
-				node = makeNode();
+				// Networking on for the peer manager's disconnect event; the peer
+				// is never connected, so queries still go to message:outbound.
+				node = makeNode(true);
 				queries = [];
 				onQuery = null;
 				node.on(
@@ -2010,6 +2038,31 @@ describe('Gossip Sync (Phase 5)', function () {
 					expect(node.getGossipSyncState(peerPubkey)).to.equal(
 						GossipSyncState.SYNCED
 					);
+				} finally {
+					statics.GOSSIP_INTAKE_MAX = saved;
+				}
+			});
+
+			it('asks for every channel after a connection closed on a loss', async function () {
+				const statics = LightningNode as unknown as {
+					GOSSIP_INTAKE_MAX: number;
+				};
+				const saved = statics.GOSSIP_INTAKE_MAX;
+				statics.GOSSIP_INTAKE_MAX = 1;
+				try {
+					startSync(1);
+					sendAnnouncement(queries[0][0], 0);
+					// The intake is full, so this is dropped.
+					sendAnnouncement(queries[0][0], 0);
+					node.getPeerManager()!.emit('peer:disconnect', peerPubkey);
+					await node.flushGossip();
+					expect(node.getGraph().getChannelCount()).to.equal(1);
+
+					// The channel is known, but whatever was lost went with the
+					// connection, so it is asked for again.
+					startSync(1);
+					expect(queries).to.have.length(2);
+					expect(queries[1]).to.eql(queries[0]);
 				} finally {
 					statics.GOSSIP_INTAKE_MAX = saved;
 				}
