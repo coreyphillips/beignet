@@ -666,7 +666,11 @@ export class OfferManager extends EventEmitter {
 			metadata: crypto.randomBytes(32)
 		};
 
-		if (options?.quantity !== undefined) request.quantity = options.quantity;
+		// BOLT 12: an offer with offer_quantity_max requires invreq_quantity,
+		// even for a single unit.
+		if (options?.quantity !== undefined || offer.quantityMax !== undefined) {
+			request.quantity = quantity;
+		}
 		if (options?.payerNote) request.payerNote = options.payerNote;
 		// BOLT 12: invreq_chain MUST name the chain unless it is bitcoin
 		// mainnet. Default it from the offer's own chains — omitting it on
