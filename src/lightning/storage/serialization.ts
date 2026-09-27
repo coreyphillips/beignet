@@ -405,6 +405,8 @@ export interface ISerializedChannelState {
 	htlcs: ISerializedHtlcEntry[];
 	/** Per-remote-commitment HTLC snapshots for penalty completeness (H2). */
 	revokedHtlcSnapshots?: ISerializedHtlcSnapshot[];
+	/** Unrevoked remote commitment txs kept for watchtower backups. */
+	watchtowerRemoteCommitmentTxs?: Array<{ point: string; tx: string }>;
 	remoteCommitmentSignature: string | null;
 	remoteHtlcSignatures: string[];
 	/**
@@ -906,6 +908,12 @@ export function serializeChannelState(
 		localHtlcCounter: bigintToStr(s.localHtlcCounter),
 		htlcs,
 		revokedHtlcSnapshots,
+		watchtowerRemoteCommitmentTxs: s.watchtowerRemoteCommitmentTxs?.size
+			? [...s.watchtowerRemoteCommitmentTxs].map(([point, tx]) => ({
+					point,
+					tx: tx.toString('hex')
+			  }))
+			: undefined,
 		remoteCommitmentSignature: bufToHex(s.remoteCommitmentSignature),
 		remoteHtlcSignatures: s.remoteHtlcSignatures.map((b) => b.toString('hex')),
 		remoteSigningNonce: bufToHex(s.remoteSigningNonce ?? null),
@@ -1330,6 +1338,14 @@ export function deserializeChannelState(
 		localHtlcCounter: strToBigint(s.localHtlcCounter),
 		htlcs,
 		revokedHtlcSnapshots,
+		watchtowerRemoteCommitmentTxs: s.watchtowerRemoteCommitmentTxs?.length
+			? new Map(
+					s.watchtowerRemoteCommitmentTxs.map((e) => [
+						e.point,
+						Buffer.from(e.tx, 'hex')
+					])
+			  )
+			: undefined,
 		remoteCommitmentSignature: hexToBuf(s.remoteCommitmentSignature),
 		remoteHtlcSignatures: s.remoteHtlcSignatures.map((h) =>
 			Buffer.from(h, 'hex')

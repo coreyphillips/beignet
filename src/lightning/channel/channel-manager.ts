@@ -2620,6 +2620,8 @@ export class ChannelManager extends EventEmitter {
 					channel.getFullState().v2InFlight != null)
 			) {
 				this._rollbackForReestablish(channel);
+				// After the rollback, which can drop the only pending update.
+				channel.repairWatchtowerCommitmentCache();
 			}
 			this.channels.set(channelId.toString('hex'), channel);
 			this.channelPeers.set(channelId.toString('hex'), peerPubkey);
@@ -4305,6 +4307,25 @@ export class ChannelManager extends EventEmitter {
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
+		// Watchtower: hand the revoked tx over before the revoke is applied, so
+		// the tower backlog is on disk before the persist that records the
+		// revocation. A crash in between leaves the row unrevoked and the peer
+		// resends revoke_and_ack. A cache hit proves the secret belongs to a
+		// commitment we signed, so the backup is valid even if the channel then
+		// rejects the message. Nothing of the revoke is applied yet, so a
+		// listener that re-enters acts as if it ran before the message arrived.
+		const revokedTx = channel.takeRevokedCommitmentTx(msg.perCommitmentSecret);
+		const revChannelId = channel.getChannelId();
+		if (revokedTx && revChannelId) {
+			this.emitContained(
+				'watchtower:backup',
+				revChannelId,
+				peerPubkey,
+				msg.perCommitmentSecret,
+				revokedTx
+			);
+		}
+
 		const actions = channel.handleRevokeAndAck(msg);
 		const hadError = actions.some((a) => a.type === ChannelActionType.ERROR);
 
@@ -4331,25 +4352,6 @@ export class ChannelManager extends EventEmitter {
 		}
 
 		this.processActions(peerPubkey, channel, actions);
-
-		// Watchtower: on a clean revocation, hand the just-revoked remote
-		// commitment tx (if we cached it) to any listener so it can ship justice
-		// data to towers before the peer can broadcast the breach.
-		if (!hadError) {
-			const revokedTx = channel.takeRevokedCommitmentTx(
-				msg.perCommitmentSecret
-			);
-			const revChannelId = channel.getChannelId();
-			if (revokedTx && revChannelId) {
-				this.emit(
-					'watchtower:backup',
-					revChannelId,
-					peerPubkey,
-					msg.perCommitmentSecret,
-					revokedTx
-				);
-			}
-		}
 
 		const channelId = channel.getChannelId();
 

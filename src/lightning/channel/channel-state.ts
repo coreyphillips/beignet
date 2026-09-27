@@ -448,6 +448,14 @@ export interface IChannelState {
 	 */
 	revokedHtlcSnapshots?: Map<string, IHtlcSnapshotEntry[]>;
 
+	/**
+	 * Watchtower: the remote commitment transactions we signed that the peer
+	 * has not revoked yet, keyed by the per-commitment point (hex) each uses.
+	 * The revoke_and_ack that reveals a point's secret is when the tower
+	 * needs that exact tx, which may be after a restart, so this persists.
+	 */
+	watchtowerRemoteCommitmentTxs?: Map<string, Buffer>;
+
 	/** Cached remote signature on our latest commitment */
 	remoteCommitmentSignature: Buffer | null;
 	remoteHtlcSignatures: Buffer[];

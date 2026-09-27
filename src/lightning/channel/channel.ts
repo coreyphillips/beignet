@@ -1024,11 +1024,8 @@ export class Channel {
 		revocationIndex: bigint;
 		secretIndex: bigint;
 	} | null = null;
-	// Watchtower: the remote commitment transactions we have signed, keyed by the
-	// per-commitment point they use, so that when the peer later reveals that
-	// point's secret (revoke_and_ack) we can ship the exact revoked tx to a tower.
-	// In-memory only and bounded; unrevoked states number at most a couple.
-	private _remoteCommitmentTxCache = new Map<string, string>();
+	// Bound on state.watchtowerRemoteCommitmentTxs; unrevoked states number at
+	// most a couple.
 	private static readonly REVOKED_TX_CACHE_MAX = 8;
 	// We dropped an unresumable splice on disconnect/restart, but the peer may
 	// still hold its in-flight copy (CLN never forgets one on its own — it blocks
@@ -1999,6 +1996,10 @@ export class Channel {
 			partialSignatureWithNonce: taproot ? partialSignatureWithNonce : undefined
 		};
 
+		this._cacheRemoteCommitmentForWatchtower(
+			this._state.remoteCurrentPerCommitmentPoint,
+			0n
+		);
 		this._state.state = ChannelState.SENT_FUNDING_CREATED;
 		return [
 			sendMsg(MessageType.FUNDING_CREATED, encodeFundingCreatedMessage(msg))
@@ -2548,6 +2549,10 @@ export class Channel {
 			partialSignatureWithNonce: taproot ? partialSignatureWithNonce : undefined
 		};
 
+		this._cacheRemoteCommitmentForWatchtower(
+			this._state.remoteCurrentPerCommitmentPoint,
+			0n
+		);
 		this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 
 		const actions: ChannelAction[] = [
@@ -4367,35 +4372,29 @@ export class Channel {
 	}
 
 	/**
-	 * Cache the remote commitment tx we just signed, keyed by its per-commitment
-	 * point, mirroring the manager's build (remoteNextPerCommitmentPoint, number
-	 * +1). Taproot commitments are cached too: they feed the version-1 (schnorr)
-	 * justice kit. Never throws: a cache miss only forfeits a pre-emptive tower
-	 * ship, it must not break commitment signing.
+	 * Cache the remote commitment tx we signed at `commitmentNumber`, keyed by
+	 * its per-commitment point, so the revoke_and_ack that later reveals that
+	 * point's secret can hand the exact tx to a watchtower. Taproot commitments
+	 * are cached too: they feed the version-1 (schnorr) justice kit. Never
+	 * throws: a cache miss only forfeits a pre-emptive tower ship, it must not
+	 * break commitment signing.
 	 */
-	private _cacheRemoteCommitmentForWatchtower(): void {
+	private _cacheRemoteCommitmentForWatchtower(
+		point: Buffer | null,
+		commitmentNumber: bigint
+	): void {
 		try {
-			if (!this._state.remoteBasepoints || !this._state.fundingTxid) return;
-			const point =
-				this._state.remoteNextPerCommitmentPoint ||
-				this._state.remoteCurrentPerCommitmentPoint;
-			if (!point) return;
-			const built = buildRemoteCommitment(
-				this._state,
-				point,
-				this._state.remoteCommitmentNumber + 1n
-			);
-			this._remoteCommitmentTxCache.set(
-				point.toString('hex'),
-				built.result.tx.toBuffer().toString('hex')
-			);
+			if (!point || !this._state.remoteBasepoints || !this._state.fundingTxid) {
+				return;
+			}
+			const built = buildRemoteCommitment(this._state, point, commitmentNumber);
+			const cache = (this._state.watchtowerRemoteCommitmentTxs ??= new Map());
+			cache.set(point.toString('hex'), built.result.tx.toBuffer());
 			// Bound the cache: only unrevoked states matter and there are few.
-			while (
-				this._remoteCommitmentTxCache.size > Channel.REVOKED_TX_CACHE_MAX
-			) {
-				const oldest = this._remoteCommitmentTxCache.keys().next().value;
+			while (cache.size > Channel.REVOKED_TX_CACHE_MAX) {
+				const oldest = cache.keys().next().value;
 				if (oldest === undefined) break;
-				this._remoteCommitmentTxCache.delete(oldest);
+				cache.delete(oldest);
 			}
 		} catch {
 			// Best-effort cache; ignore.
@@ -4403,17 +4402,44 @@ export class Channel {
 	}
 
 	/**
+	 * Cache the peer's latest signed commitment if a restored row has no entry
+	 * for it. Rows written before the cache was persisted have none, and the
+	 * revoke_and_ack that retires that commitment would go without a backup.
+	 * The tx is rebuilt from the row, which describes the signed commitment
+	 * only while no update is pending, so a row that owes a signature is left
+	 * alone.
+	 */
+	repairWatchtowerCommitmentCache(): void {
+		if (this._state.needsCommitment) return;
+		const point = this.isAwaitingRemoteRevocation()
+			? this._state.remoteNextPerCommitmentPoint
+			: this._state.remoteCurrentPerCommitmentPoint;
+		if (
+			!point ||
+			this._state.watchtowerRemoteCommitmentTxs?.has(point.toString('hex'))
+		) {
+			return;
+		}
+		this._cacheRemoteCommitmentForWatchtower(
+			point,
+			this._state.remoteCommitmentNumber
+		);
+	}
+
+	/**
 	 * Given a per-commitment secret the peer just revealed, return (and forget)
 	 * the revoked remote commitment tx we cached for that state, or null if we
-	 * never signed it (e.g. the initial funding commitment).
+	 * never cached it (an older row restored with a commitment in flight or an
+	 * update pending).
 	 */
 	takeRevokedCommitmentTx(perCommitmentSecret: Buffer): Buffer | null {
 		const pointHex =
 			perCommitmentPointFromSecret(perCommitmentSecret).toString('hex');
-		const txHex = this._remoteCommitmentTxCache.get(pointHex);
-		if (!txHex) return null;
-		this._remoteCommitmentTxCache.delete(pointHex);
-		return Buffer.from(txHex, 'hex');
+		const cache = this._state.watchtowerRemoteCommitmentTxs;
+		const tx = cache?.get(pointHex);
+		if (!cache || !tx) return null;
+		cache.delete(pointHex);
+		return tx;
 	}
 
 	/**
@@ -4534,7 +4560,11 @@ export class Channel {
 
 		// Watchtower: cache the remote commitment tx we just committed the peer to,
 		// keyed by its per-commitment point, for pre-emptive justice on breach.
-		this._cacheRemoteCommitmentForWatchtower();
+		this._cacheRemoteCommitmentForWatchtower(
+			this._state.remoteNextPerCommitmentPoint ||
+				this._state.remoteCurrentPerCommitmentPoint,
+			this._state.remoteCommitmentNumber + 1n
+		);
 
 		// A staged update_fee that is signable here (opener always; acceptor
 		// once the fee round reached it — see getRemoteCommitmentFeeRate) is
@@ -18754,6 +18784,10 @@ export class Channel {
 			);
 		}
 		this._v2SentCommitment = true;
+		this._cacheRemoteCommitmentForWatchtower(
+			this._state.remoteCurrentPerCommitmentPoint,
+			0n
+		);
 		const msg: ICommitmentSignedMessage = {
 			channelId: this._state.channelId!,
 			signature,
@@ -20436,6 +20470,15 @@ export class Channel {
 		// A v2 opening commitment (#0) carries no HTLCs.
 		this._state.remoteHtlcSignatures = [];
 		this._restoreV2RecordSnapshot(record);
+		// Every attempt shares the peer's point #0, so the watchtower entry
+		// under it describes whichever attempt was signed last. Re-cache it
+		// for the attempt that can now actually be revoked.
+		if (this._state.remoteCommitmentNumber === 0n) {
+			this._cacheRemoteCommitmentForWatchtower(
+				this._state.remoteCurrentPerCommitmentPoint,
+				0n
+			);
+		}
 	}
 
 	/**
