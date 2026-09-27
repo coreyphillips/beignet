@@ -167,7 +167,10 @@ function stalledRemoval(
 	let failSeen = !signsTheAdd;
 	filter.allow = (from: string, type: number): boolean => {
 		if (from !== bobId) return true;
-		if (type === MessageType.UPDATE_FAIL_HTLC) {
+		if (
+			type === MessageType.UPDATE_FAIL_HTLC ||
+			type === MessageType.UPDATE_FAIL_MALFORMED_HTLC
+		) {
 			failSeen = true;
 			return true;
 		}

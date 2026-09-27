@@ -4287,7 +4287,8 @@ export class Channel {
 				{
 					type: ChannelActionType.HTLC_FAILED,
 					htlcId: msg.id,
-					reason: replayReason
+					reason: replayReason,
+					malformedCode: msg.failureCode
 				}
 			];
 		}
@@ -4314,7 +4315,8 @@ export class Channel {
 			{
 				type: ChannelActionType.HTLC_FAILED,
 				htlcId: msg.id,
-				reason
+				reason,
+				malformedCode: msg.failureCode
 			}
 		];
 	}

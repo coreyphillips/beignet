@@ -489,7 +489,9 @@ export interface IChannelManagerConfig {
  * - 'channel:closed' (channelId: Buffer)
  * - 'htlc:forwarded' (channelId: Buffer, htlcId: bigint, amountMsat: bigint, paymentHash: Buffer)
  * - 'htlc:fulfilled' (channelId: Buffer, htlcId: bigint, preimage: Buffer)
- * - 'htlc:failed' (channelId: Buffer, htlcId: bigint, reason: Buffer)
+ * - 'htlc:failed' (channelId: Buffer, htlcId: bigint, reason: Buffer,
+ *   malformedCode?: number): malformedCode is set only for
+ *   update_fail_malformed_htlc
  * - 'htlc:claimed-onchain' (channelId: Buffer, paymentHash: Buffer, preimage: Buffer,
  *   claimTxid: string): a confirmed spend of a received HTLC output revealed
  *   its preimage; repeats when the spend is re-reported
@@ -9328,13 +9330,26 @@ export class ChannelManager extends EventEmitter {
 					break;
 				}
 				case ChannelActionType.HTLC_FORWARDED:
-					this.emit(
-						'htlc:forwarded',
-						channel.getChannelId(),
-						action.htlcId,
-						action.amountMsat,
-						action.paymentHash
-					);
+					// Contained per HTLC: the event is edge-triggered and not
+					// re-emitted until a restart, so a throw here would strand
+					// every later HTLC in the batch until its CLTV backstop.
+					try {
+						this.emit(
+							'htlc:forwarded',
+							channel.getChannelId(),
+							action.htlcId,
+							action.amountMsat,
+							action.paymentHash
+						);
+					} catch (err) {
+						this.emitContained(
+							'error',
+							channel.getChannelId(),
+							`htlc:forwarded handler threw for HTLC ${action.htlcId}: ${
+								err instanceof Error ? err.message : String(err)
+							}`
+						);
+					}
 					break;
 				case ChannelActionType.HTLC_FULFILLED:
 					this.emit(
@@ -9349,7 +9364,8 @@ export class ChannelManager extends EventEmitter {
 						'htlc:failed',
 						channel.getChannelId(),
 						action.htlcId,
-						action.reason
+						action.reason,
+						action.malformedCode
 					);
 					break;
 				case ChannelActionType.WATCH_FUNDING:

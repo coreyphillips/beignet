@@ -151,7 +151,10 @@ export function decodeUpdateAddHtlcMessage(
 	offset += 1366;
 
 	// Optional trailing blinding_point TLV (type 0, length 33). Parse only the
-	// blinding_point; tolerate/ignore any other trailing TLV records.
+	// blinding_point; tolerate/ignore any other trailing TLV records. Not
+	// checked to be a curve point: a decode error fails the channel, and an
+	// honest relay can pass on a bad point chosen by the path's creator. The
+	// node fails only that HTLC, with invalid_onion_blinding (BOLT 2).
 	let blindingPoint: Buffer | undefined;
 	if (payload.length >= offset + 2 && payload[offset] === 0x00) {
 		const len = payload[offset + 1];
