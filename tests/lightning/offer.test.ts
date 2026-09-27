@@ -1749,6 +1749,63 @@ describe('BOLT 12: Offers', () => {
 		});
 	});
 
+	// ── OfferManager Payer Quantity (#1097) ─────────────────────────
+
+	describe('OfferManager payer quantity (#1097)', () => {
+		const UNIT = 100_000_000n;
+
+		/** The request a payer sends with no options, and the issuer's answer. */
+		async function payDefault(
+			options: Parameters<OfferManager['createOffer']>[0]
+		): Promise<{
+			request: IInvoiceRequest;
+			invoice: IBolt12Invoice | null;
+			errors: string[];
+		}> {
+			const issuer = new OfferManager(privkey1);
+			const errors: string[] = [];
+			issuer.on('invoice:error', (e: IInvoiceError) => errors.push(e.error));
+			const { offer } = issuer.createOffer(options);
+			const payer = new OfferManager(privkey2);
+			let request: IInvoiceRequest | null = null;
+			payer.on('invoice:requested', (r: IInvoiceRequest) => {
+				request = r;
+			});
+			const pending = payer.requestInvoice(offer).catch(() => undefined);
+			const invoice = issuer.handleInvoiceRequest(
+				encodeInvoiceRequestTlv(request!, encodeOfferTlv(offer))
+			);
+			payer.destroy();
+			issuer.destroy();
+			await pending;
+			return { request: request!, invoice, errors };
+		}
+
+		it('sends quantity 1 to an offer with offer_quantity_max', async () => {
+			for (const quantityMax of [10n, 0n]) {
+				const { request, invoice, errors } = await payDefault({
+					description: 'widget',
+					amount: UNIT,
+					quantityMax
+				});
+				expect(request.quantity).to.equal(1n);
+				expect(request.amount).to.equal(UNIT);
+				expect(errors).to.deep.equal([]);
+				expect(invoice!.amount).to.equal(UNIT);
+			}
+		});
+
+		it('sends no quantity to an offer without offer_quantity_max', async () => {
+			const { request, invoice, errors } = await payDefault({
+				description: 'widget',
+				amount: UNIT
+			});
+			expect(request.quantity).to.equal(undefined);
+			expect(errors).to.deep.equal([]);
+			expect(invoice!.amount).to.equal(UNIT);
+		});
+	});
+
 	// ── OfferManager Expired Offer Rejection ────────────────────────
 
 	describe('OfferManager expired offer rejection', () => {
