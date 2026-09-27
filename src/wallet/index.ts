@@ -137,6 +137,7 @@ import { Transaction } from '../transaction';
 import {
 	GAP_LIMIT,
 	GAP_LIMIT_CHANGE,
+	MAX_REMEMBERED_PSBT_BUILDS,
 	STOP_REFRESH_WAIT_MS,
 	TRANSACTION_DEFAULTS
 } from './constants';
@@ -222,6 +223,11 @@ export class Wallet {
 	// further behind lowers the tip, and that server may announce new blocks
 	// while it catches up to the one a transaction was mined in (issue #935).
 	private _replacedTipHeight = 0;
+	// The previous output of every input of each PSBT buildPsbt returned, keyed
+	// by the PSBT's unsigned transaction. importSignedPsbt finalizes nothing
+	// else unless the caller hands it the unsigned PSBT, so an output rewritten
+	// between build and sign is refused. Memory only.
+	private readonly _builtPsbts: Map<string, bitcoin.TxOutput[]> = new Map();
 	private _disableMessagesOnCreate: boolean;
 	private _disableRefreshOnCreate: boolean;
 	// Raised by stop(). Work that outlived the shutdown, above all the refresh
@@ -5074,6 +5080,7 @@ export class Wallet {
 			});
 			if (psbtRes.isErr()) return err(psbtRes.error.message);
 			const psbt = psbtRes.value;
+			this._rememberBuiltPsbt(psbt);
 			const txData = this.transaction.data;
 			const inputValue = this.transaction.getTransactionInputValue({
 				inputs: txData.inputs
@@ -5118,9 +5125,9 @@ export class Wallet {
 		} catch (e) {
 			return err(e);
 		} finally {
-			// The response carries everything the caller needs; the later
-			// steps (signPsbtWithOurKey, combinePsbts, importSignedPsbt) work
-			// on the PSBT alone and never read the staged send.
+			// The response carries everything the caller needs, and none of
+			// the later steps (signPsbtWithOurKey, combinePsbts,
+			// importSignedPsbt) reads the staged send.
 			await this.transaction.clearStoredSendTransaction();
 		}
 	}
@@ -5129,26 +5136,35 @@ export class Wallet {
 	 * Imports an externally signed PSBT, validates that EVERY input carries a
 	 * valid signature, finalizes and extracts the transaction WITHOUT
 	 * broadcasting it. Broadcast separately via broadcastTransaction.
+	 * The PSBT must spend the same inputs to the same outputs as one this
+	 * wallet's buildPsbt returned, or as unsignedPsbtBase64 when given (a PSBT
+	 * built by another instance, e.g. a multisig cosigner). Inputs the signer
+	 * already finalized are refused, since their signatures cannot be checked.
 	 * Multisig (P2WSH m-of-n witnessScript) inputs finalize only when at
 	 * least m VALID partial signatures from script keys are present; below
 	 * the threshold the error names how many signatures it has and needs.
 	 * @param {string} psbtBase64
+	 * @param {string} [unsignedPsbtBase64] the PSBT buildPsbt returned
 	 * @returns {Result<IImportSignedPsbtResponse>}
 	 */
 	public importSignedPsbt(
-		psbtBase64: string
+		psbtBase64: string,
+		unsignedPsbtBase64?: string
 	): Result<IImportSignedPsbtResponse> {
 		try {
 			if (!psbtBase64) return err('No PSBT provided.');
 			const network = this.getBitcoinNetwork();
 			const psbt = bitcoin.Psbt.fromBase64(psbtBase64, { network });
 			if (psbt.inputCount === 0) return err('PSBT has no inputs.');
+			const buildRes = this._checkAgainstBuild(psbt, unsignedPsbtBase64);
+			if (buildRes.isErr()) return err(buildRes.error.message);
 			for (let i = 0; i < psbt.inputCount; i++) {
 				const input = psbt.data.inputs[i];
-				// Inputs already finalized by the signer carry their signature in
-				// the final script and cannot be re-validated via partialSig.
-				const finalized = !!(input.finalScriptSig || input.finalScriptWitness);
-				if (finalized) continue;
+				if (input.finalScriptSig || input.finalScriptWitness) {
+					return err(
+						`Input ${i} is already finalized, so its signature cannot be checked. Import the PSBT before it is finalized.`
+					);
+				}
 				const hasSignature =
 					(input.partialSig?.length ?? 0) > 0 ||
 					!!input.tapKeySig ||
@@ -5176,6 +5192,97 @@ export class Wallet {
 		} catch (e) {
 			return err(e);
 		}
+	}
+
+	/**
+	 * Refuses a PSBT unless its unsigned transaction (every input outpoint and
+	 * sequence, every output script and value) and the previous output each
+	 * input claims to spend are those of the build: unsignedPsbtBase64 when
+	 * given, otherwise a PSBT this wallet's buildPsbt returned.
+	 * @private
+	 * @param {bitcoin.Psbt} psbt
+	 * @param {string} [unsignedPsbtBase64]
+	 * @returns {Result<string>}
+	 */
+	private _checkAgainstBuild(
+		psbt: bitcoin.Psbt,
+		unsignedPsbtBase64?: string
+	): Result<string> {
+		const unsignedTx = psbt.data.getTransaction().toString('hex');
+		let built: bitcoin.TxOutput[] | undefined;
+		if (unsignedPsbtBase64) {
+			const unsigned = bitcoin.Psbt.fromBase64(unsignedPsbtBase64, {
+				network: this.getBitcoinNetwork()
+			});
+			if (unsigned.data.getTransaction().toString('hex') !== unsignedTx) {
+				return err(
+					'The PSBT does not spend the same inputs to the same outputs as the unsigned PSBT.'
+				);
+			}
+			built = this._psbtPrevouts(unsigned);
+		} else {
+			built = this._builtPsbts.get(unsignedTx);
+			if (!built) {
+				return err(
+					'The PSBT does not match any this wallet built: its inputs or outputs were changed, or it was built elsewhere (pass the unsigned PSBT to import it).'
+				);
+			}
+		}
+		const prevouts = this._psbtPrevouts(psbt);
+		for (let i = 0; i < prevouts.length; i++) {
+			if (
+				!prevouts[i].script.equals(built[i].script) ||
+				prevouts[i].value !== built[i].value
+			) {
+				return err(
+					`Input ${i} claims a different previous output than the one built.`
+				);
+			}
+		}
+		return ok('The PSBT matches the build.');
+	}
+
+	/**
+	 * Records the previous outputs of a PSBT buildPsbt is about to return, so
+	 * importSignedPsbt can recognise it. Only the newest
+	 * MAX_REMEMBERED_PSBT_BUILDS are kept.
+	 * @private
+	 * @param {bitcoin.Psbt} psbt
+	 */
+	private _rememberBuiltPsbt(psbt: bitcoin.Psbt): void {
+		const unsignedTx = psbt.data.getTransaction().toString('hex');
+		this._builtPsbts.delete(unsignedTx);
+		this._builtPsbts.set(unsignedTx, this._psbtPrevouts(psbt));
+		for (const oldest of this._builtPsbts.keys()) {
+			if (this._builtPsbts.size <= MAX_REMEMBERED_PSBT_BUILDS) break;
+			this._builtPsbts.delete(oldest);
+		}
+	}
+
+	/**
+	 * The previous output (script and value) each PSBT input spends, read the
+	 * way bitcoinjs reads it when checking signatures: witnessUtxo first,
+	 * otherwise the output of nonWitnessUtxo the input points at. Throws when
+	 * an input carries neither or its nonWitnessUtxo is another transaction.
+	 * @private
+	 * @param {bitcoin.Psbt} psbt
+	 * @returns {bitcoin.TxOutput[]}
+	 */
+	private _psbtPrevouts(psbt: bitcoin.Psbt): bitcoin.TxOutput[] {
+		return psbt.txInputs.map((txInput, i) => {
+			const { witnessUtxo, nonWitnessUtxo } = psbt.data.inputs[i];
+			if (witnessUtxo) {
+				return { script: witnessUtxo.script, value: witnessUtxo.value };
+			}
+			if (nonWitnessUtxo) {
+				const prevTx = bitcoin.Transaction.fromBuffer(nonWitnessUtxo);
+				const prevOut = prevTx.outs[txInput.index];
+				if (prevTx.getHash().equals(txInput.hash) && prevOut) {
+					return { script: prevOut.script, value: prevOut.value };
+				}
+			}
+			throw new Error(`Input ${i} does not carry the output it spends.`);
+		});
 	}
 
 	/**

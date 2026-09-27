@@ -2387,7 +2387,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': { description: 'Finalized transaction (not broadcast)' },
 						'400': {
-							description: 'PSBT_IMPORT_FAILED (missing/invalid signatures)'
+							description:
+								'PSBT_IMPORT_FAILED (missing/invalid signatures, an input already finalized, or inputs/outputs that differ from a PSBT this node built)'
 						}
 					}
 				}
