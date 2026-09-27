@@ -237,6 +237,7 @@ describe('Force-close sweep destination resolution', () => {
 			node: {
 				getChannel: () => ({ channelId: Buffer.from(CHANNEL_ID, 'hex') }),
 				getRecoveryStatus: () => ({ channels: [] }),
+				getRecoveryOwnershipHold: () => null,
 				getChannelManager: () => ({ getChannel: () => undefined }),
 				getFundingAddress: () => p2wpkh(5),
 				forceCloseChannel: (_id: Buffer, script: Buffer) => {

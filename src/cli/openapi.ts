@@ -742,7 +742,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/channel/forceclose': {
 				post: {
 					summary:
-						'Force close a channel (returns commitment txid). A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because its recency cannot be proven: the node refuses to broadcast such a commitment on its own initiative, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path. Waiting for the peer to close is the safe outcome; the flag is the labelled way to accept the risk anyway. Once any channel reports restoreRevokedRisk on /recovery/status (its peer has shown in channel_reestablish that it already holds the revocation for the stored commitment), the force close is refused with FORCE_CLOSE_REVOKED (409) whatever the flag says: there is no risk left to accept; wait for the peer to force close',
+						'Force close a channel (returns commitment txid). A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because its recency cannot be proven: the node refuses to broadcast such a commitment on its own initiative, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path. Waiting for the peer to close is the safe outcome; the flag is the labelled way to accept the risk anyway. Every channel needs the flag while /recovery/status reports the gate fenced or quarantined (issue #1013): a fenced device was taken over by another restored from the same seed, whose channel updates revoked the commitments this one stores, and a quarantined one cannot yet show that no takeover happened. Once any channel reports restoreRevokedRisk on /recovery/status (its peer has shown in channel_reestablish that it already holds the revocation for the stored commitment), the force close is refused with FORCE_CLOSE_REVOKED (409) whatever the flag says: there is no risk left to accept; wait for the peer to force close',
 					tags: ['Channels'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -1995,7 +1995,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ffor/recover': {
 				post: {
 					summary:
-						'R, back online: fetch every provisioned witness, credit each record that verifies, then close the epoch cooperatively when S is there and ACTIVE, or force-close with every known preimage when forceCloseIfUnreachable is true and S is not. Returns what was learned and what was done. On a channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret, forceCloseIfUnreachable also needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for, since it publishes the same commitment (issue #908)',
+						'R, back online: fetch every provisioned witness, credit each record that verifies, then close the epoch cooperatively when S is there and ACTIVE, or force-close with every known preimage when forceCloseIfUnreachable is true and S is not. Returns what was learned and what was done. On a channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret, forceCloseIfUnreachable also needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for, since it publishes the same commitment (issue #908). So does any channel while the recovery gate is fenced or quarantined (issue #1013)',
 					tags: ['FFOR'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -2019,7 +2019,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ffor/enforce': {
 				post: {
 					summary:
-						'R: force-close the channel carrying every known preimage; each settled voucher claims through its setup-time HTLC-success signature. The remedy when S will not answer ff_close or contradicted the epoch. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for: its recency cannot be proven, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path (issue #908)',
+						'R: force-close the channel carrying every known preimage; each settled voucher claims through its setup-time HTLC-success signature. The remedy when S will not answer ff_close or contradicted the epoch. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for: its recency cannot be proven, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path (issue #908). So does any channel while the recovery gate is fenced or quarantined (issue #1013)',
 					tags: ['FFOR'],
 					requestBody: bodyContent({
 						channelId: 'string',

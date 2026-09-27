@@ -2940,7 +2940,8 @@ Channels:
   channel forceclose <id>                Force close
                                          --accept-stale-state-risk: required
                                          for a channel restored from a
-                                         Recovery Capsule, whose commitment
+                                         Recovery Capsule, or on a fenced or
+                                         quarantined device, whose commitment
                                          the peer may have already revoked
   channel rebroadcast-close <id>         Rebroadcast recorded close tx
   channel funding-quote <pubkey> [satsPerVbyte]

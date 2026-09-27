@@ -586,6 +586,14 @@ Operational notes:
   `BEIGNET_RECOVERY_LEASE_CHECK_MS` (default 300000; 0 disables) so a device
   superseded while parked reports `fenced` within that window instead of at
   its next commit or restart. An outage never changes the gate.
+- A fenced device was taken over by another restored from the same seed,
+  and every update that device made revoked a commitment this one still
+  stores. So while the gate is `fenced`, and while it is `quarantined`
+  (where a takeover cannot yet be ruled out), every force close route
+  (`/channel/forceclose`, `/ffor/enforce`, `/ffor/recover` with
+  `forceCloseIfUnreachable`) is refused without `acceptStaleStateRisk: true`
+  (issue #1013). Close from the device that took over instead, or let the
+  peer close.
 - Restore-from-nothing: start the daemon with the same mnemonic, the same
   guardian set, and a FRESH data dir. The boot detects the namespace on the
   guardians and holds in a restore-pending state where only
