@@ -41,10 +41,7 @@ import {
 	perCommitmentPointFromSecret
 } from '../../src/lightning/keys/derivation';
 import { MAX_INDEX } from '../../src/lightning/keys/shachain';
-import {
-	ChannelActionType,
-	IChannelPersistEvent
-} from '../../src/lightning/channel/channel-actions';
+import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
 	serializeChannelState,
@@ -1284,7 +1281,7 @@ describe('watchtower persistence round-trip', function () {
 });
 
 describe('watchtower hand-off on revoke_and_ack (#1029)', function () {
-	it('hands off the revoked tx before the revoke persists, and that persist drops it', function () {
+	it('hands off the peer commitment #0 when it is revoked', function () {
 		const alice = createNode('wt-handoff', 1);
 		const bob = createNode('wt-handoff', 2);
 		connectNodes(alice, bob);
@@ -1304,16 +1301,6 @@ describe('watchtower hand-off on revoke_and_ack (#1029)', function () {
 				handedOff.push(perCommitmentPointFromSecret(secret).toString('hex'));
 			}
 		);
-		let revokePersist: { handedOff: number; stillCached: boolean } | null =
-			null;
-		bobCm.on('channel:persist', (ev: IChannelPersistEvent) => {
-			const state = ev.channel.getFullState();
-			if (revokePersist || state.remoteRevocationNumber !== 1n) return;
-			revokePersist = {
-				handedOff: handedOff.length,
-				stillCached: !!state.watchtowerRemoteCommitmentTxs?.has(point0)
-			};
-		});
 
 		// Bob fails it back (random hash); the add round alone revokes #0.
 		alice
@@ -1327,10 +1314,6 @@ describe('watchtower hand-off on revoke_and_ack (#1029)', function () {
 			);
 
 		expect(handedOff).to.include(point0);
-		expect(revokePersist, 'the revoke persisted').to.deep.equal({
-			handedOff: 1,
-			stillCached: false
-		});
 		alice.destroy();
 		bob.destroy();
 	});

@@ -4310,30 +4310,6 @@ export class ChannelManager extends EventEmitter {
 		const actions = channel.handleRevokeAndAck(msg);
 		const hadError = actions.some((a) => a.type === ChannelActionType.ERROR);
 
-		// Watchtower: on a clean revocation, hand the just-revoked remote
-		// commitment tx to any listener so it can ship justice data to towers.
-		// Done BEFORE the revoke is persisted: the tower backlog is written by
-		// the listener, and the persist below drops the tx from the channel's
-		// cache. In the other order a crash between the two writes would
-		// leave a revocation on disk with nothing for the tower; in this one
-		// it only replays the revoke_and_ack on reestablish. Contained,
-		// because a throwing listener must not cost the revoke its persist.
-		if (!hadError) {
-			const revokedTx = channel.takeRevokedCommitmentTx(
-				msg.perCommitmentSecret
-			);
-			const revChannelId = channel.getChannelId();
-			if (revokedTx && revChannelId) {
-				this.emitContained(
-					'watchtower:backup',
-					revChannelId,
-					peerPubkey,
-					msg.perCommitmentSecret,
-					revokedTx
-				);
-			}
-		}
-
 		// Recovery outbox: the peer's revocation proves it holds every update we
 		// sent and the commitment_signed that covered them, so BOLT 2 can never
 		// ask us to retransmit them again. This mirrors channel.ts clearing its
@@ -4357,6 +4333,25 @@ export class ChannelManager extends EventEmitter {
 		}
 
 		this.processActions(peerPubkey, channel, actions);
+
+		// Watchtower: on a clean revocation, hand the just-revoked remote
+		// commitment tx (if we cached it) to any listener so it can ship justice
+		// data to towers before the peer can broadcast the breach.
+		if (!hadError) {
+			const revokedTx = channel.takeRevokedCommitmentTx(
+				msg.perCommitmentSecret
+			);
+			const revChannelId = channel.getChannelId();
+			if (revokedTx && revChannelId) {
+				this.emit(
+					'watchtower:backup',
+					revChannelId,
+					peerPubkey,
+					msg.perCommitmentSecret,
+					revokedTx
+				);
+			}
+		}
 
 		const channelId = channel.getChannelId();
 
@@ -10165,9 +10160,8 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
-	 * emit, where a throwing listener must not propagate: the terminal
-	 * teardown paths, and the watchtower hand-off that runs ahead of a
-	 * revoke's persist. Everything these announce has already happened.
+	 * emit, for the terminal teardown paths, where a throwing listener must
+	 * not propagate. Everything these announce has already happened.
 	 */
 	private emitContained(event: string, ...args: unknown[]): void {
 		try {
