@@ -22611,6 +22611,17 @@ export class Channel {
 				'settlement_deadline is not in the future'
 			);
 		}
+		// The vouchers are our own offered HTLCs on preimages only we hold, and
+		// only ff_close or T_exp releases them (ACTIVE has no timeout). With any
+		// host policy or none, they may not reach past the horizon we accept on
+		// a received HTLC.
+		const epochBlocks = params.voucherExpiry - this._currentBlockHeight;
+		if (epochBlocks > Channel.MAX_HTLC_CLTV_EXPIRY_DELTA) {
+			return refuse(
+				FforAbortReason.TERMS_REFUSED,
+				`epoch of ${epochBlocks} blocks exceeds the ${Channel.MAX_HTLC_CLTV_EXPIRY_DELTA}-block voucher horizon`
+			);
+		}
 		if (
 			params.hashChain &&
 			params.voucherAmountsMsat.some((a) => a !== params.voucherAmountsMsat[0])
