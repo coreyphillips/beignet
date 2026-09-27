@@ -334,6 +334,9 @@ export interface INodeConfig {
 	fforSettle?: import('../ffor/types').IFforSettlePolicy;
 	/** Max reconnect delay in ms */
 	maxReconnectDelay?: number;
+	/** Inbound peer connections (default 125). Once this many are up, only
+	 *  peers holding a channel with this node are admitted. */
+	maxInboundPeers?: number;
 	/** Resource management config */
 	resourceConfig?: IResourceConfig;
 	/** Storage backend for persistence */

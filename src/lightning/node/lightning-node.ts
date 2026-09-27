@@ -2161,6 +2161,9 @@ export class LightningNode extends EventEmitter {
 				networks: config.chainHashes,
 				autoReconnect: this.autoReconnect,
 				maxReconnectDelay: config.maxReconnectDelay,
+				maxInboundPeers: config.maxInboundPeers,
+				isChannelPeer: (pubkey): boolean =>
+					this.channelManager.getChannelsByPeer(pubkey).length > 0,
 				socks5Proxy: config.socks5Proxy,
 				socks5ProxyScope: this.socks5ProxyScope,
 				webSocketImpl: config.webSocketImpl
@@ -26981,6 +26984,7 @@ export class LightningNode extends EventEmitter {
 			logger?: ILogger;
 			socks5Proxy?: { host: string; port: number };
 			socks5ProxyScope?: Socks5ProxyScope;
+			maxInboundPeers?: number;
 			webSocketImpl?: import('../transport/websocket').WebSocketConstructor;
 			preferAnchors?: boolean;
 			largeChannels?: boolean;
@@ -27078,6 +27082,7 @@ export class LightningNode extends EventEmitter {
 			logger: options?.logger,
 			socks5Proxy: options?.socks5Proxy,
 			socks5ProxyScope: options?.socks5ProxyScope,
+			maxInboundPeers: options?.maxInboundPeers,
 			webSocketImpl: options?.webSocketImpl,
 			preferAnchors: options?.preferAnchors,
 			largeChannels: options?.largeChannels,

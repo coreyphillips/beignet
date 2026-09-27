@@ -1075,6 +1075,16 @@ async function bootDaemon(
 			);
 		}
 	}
+	// Zero is meaningful: only peers holding a channel get in.
+	if (
+		opts.maxInboundPeers !== undefined &&
+		(!Number.isInteger(opts.maxInboundPeers) || opts.maxInboundPeers < 0)
+	) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			'maxInboundPeers must be a non-negative integer (BEIGNET_MAX_INBOUND_PEERS)'
+		);
+	}
 	// Routing fee defaults ride in channel_update as u32/u32/u16 (BOLT 7),
 	// so a value the wire cannot hold refuses startup here, naming the env
 	// var, before it can wrap into an advertised policy the operator never

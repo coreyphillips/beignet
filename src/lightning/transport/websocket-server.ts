@@ -272,6 +272,12 @@ export interface IWebSocketServerOptions {
 	path?: string;
 	/** Per-frame payload sanity cap in bytes (default 16 MiB). */
 	maxFramePayloadBytes?: number;
+	/** Accepted connections still waiting to upgrade, all addresses
+	 *  together; sockets past it are destroyed on accept (default 50). */
+	maxPendingUpgrades?: number;
+	/** Hard deadline in ms for a connection to complete its upgrade
+	 *  (default 10000). */
+	upgradeTimeoutMs?: number;
 }
 
 /**
@@ -286,10 +292,22 @@ export class WebSocketServer extends EventEmitter {
 	private httpServer: http.Server;
 	private options: IWebSocketServerOptions;
 	private listeningFlag = false;
+	/**
+	 * Sockets accepted but not yet upgraded, with their deadline. The HTTP
+	 * phase sits in front of the peer manager's own admission, so without
+	 * this a flood of silent connections would be held here unbounded for
+	 * the HTTP server's much longer header timeout.
+	 */
+	private pendingUpgrades = new Map<
+		net.Socket,
+		ReturnType<typeof setTimeout>
+	>();
 
 	constructor(options?: IWebSocketServerOptions) {
 		super();
 		this.options = options ?? {};
+		const maxPendingUpgrades = this.options.maxPendingUpgrades ?? 50;
+		const upgradeTimeoutMs = this.options.upgradeTimeoutMs ?? 10_000;
 		this.httpServer = http.createServer((req, res) => {
 			// Plain HTTP requests are not part of the peer protocol
 			res.writeHead(426, {
@@ -299,9 +317,21 @@ export class WebSocketServer extends EventEmitter {
 			});
 			res.end('Upgrade Required');
 		});
+		this.httpServer.on('connection', (socket: net.Socket) => {
+			if (this.pendingUpgrades.size >= maxPendingUpgrades) {
+				socket.destroy();
+				return;
+			}
+			this.pendingUpgrades.set(
+				socket,
+				setTimeout(() => socket.destroy(), upgradeTimeoutMs)
+			);
+			socket.once('close', () => this.settleUpgrade(socket));
+		});
 		this.httpServer.on(
 			'upgrade',
 			(req: http.IncomingMessage, socket, head: Buffer) => {
+				this.settleUpgrade(socket as net.Socket);
 				this.handleUpgrade(req, socket as net.Socket, head);
 			}
 		);
@@ -334,6 +364,13 @@ export class WebSocketServer extends EventEmitter {
 	close(): void {
 		this.listeningFlag = false;
 		this.httpServer.close();
+	}
+
+	private settleUpgrade(socket: net.Socket): void {
+		const deadline = this.pendingUpgrades.get(socket);
+		if (deadline === undefined) return;
+		clearTimeout(deadline);
+		this.pendingUpgrades.delete(socket);
 	}
 
 	private handleUpgrade(

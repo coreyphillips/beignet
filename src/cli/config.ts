@@ -439,6 +439,8 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? parseInt(process.env.BEIGNET_WEBSOCKET_PORT, 10)
 				: undefined) ||
 			file.websocketPort,
+		maxInboundPeers:
+			integerEnv(process.env.BEIGNET_MAX_INBOUND_PEERS) ?? file.maxInboundPeers,
 		daemonHost:
 			cliFlags.daemonHost || process.env.BEIGNET_DAEMON_HOST || file.daemonHost,
 		daemonPort:

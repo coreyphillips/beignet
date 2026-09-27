@@ -1960,6 +1960,7 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_ELECTRUM_PORT` | Electrum server port |
 | `BEIGNET_ELECTRUM_TLS` | `true` or `false` |
 | `BEIGNET_LISTEN_PORT` | Lightning listen port |
+| `BEIGNET_MAX_INBOUND_PEERS` | Inbound peer connections (default 125); once this many are up, only peers holding a channel with this node are admitted |
 | `BEIGNET_DAEMON_HOST` | HTTP daemon bind address (default: `127.0.0.1`) |
 | `BEIGNET_DAEMON_PORT` | HTTP daemon port |
 | `BEIGNET_PREFER_ANCHORS` | `true` to prefer anchor channels |

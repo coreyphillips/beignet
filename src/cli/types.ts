@@ -721,6 +721,10 @@ export interface BeignetConfig {
 	/** Accept inbound Lightning peers over WebSocket on this port (opt-in;
 	 *  coexists with the TCP listener on listenPort). */
 	websocketPort?: number;
+	/** Inbound peer connections (default 125); once this many are up, only
+	 *  peers holding a channel with this node are admitted. Env:
+	 *  BEIGNET_MAX_INBOUND_PEERS. */
+	maxInboundPeers?: number;
 	daemonPort?: number;
 	daemonHost?: string;
 	preferAnchors?: boolean;

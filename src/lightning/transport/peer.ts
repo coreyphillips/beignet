@@ -80,7 +80,8 @@ export interface IPeerOptions {
 	createSocket?: (host: string, port: number) => Promise<IDuplexTransport>;
 	/** TCP connect timeout in ms (default 15000) */
 	connectTimeout?: number;
-	/** Noise handshake + init exchange timeout in ms (default 30000) */
+	/** Noise handshake + init exchange timeout in ms (default 30000). An
+	 *  idle timeout when dialing; a hard deadline when accepting inbound. */
 	handshakeTimeout?: number;
 }
 
@@ -353,12 +354,6 @@ export class Peer extends EventEmitter {
 		this.aborted = false;
 		socket.setKeepAlive(true, TCP_KEEPALIVE_DELAY_MS);
 
-		// Set handshake timeout for inbound connections
-		socket.setTimeout(this.handshakeTimeoutMs);
-		socket.once('timeout', () => {
-			socket.destroy(new Error('Inbound handshake timeout'));
-		});
-
 		let abortEstablish: (err: Error) => void = () => undefined;
 		const abortPromise = new Promise<never>((_, reject) => {
 			abortEstablish = reject;
@@ -367,13 +362,19 @@ export class Peer extends EventEmitter {
 			// Consumed via the race below when an abort lands mid-handshake.
 		});
 		this.establishmentAbort = abortEstablish;
+		// A hard deadline, not an idle timeout: a stranger sending one byte
+		// at a time would reset an idle timer indefinitely and keep the
+		// socket and this Peer alive for as long as it liked.
+		const deadline = setTimeout(
+			() => abortEstablish(new Error('Inbound handshake timeout')),
+			this.handshakeTimeoutMs
+		);
 		try {
 			const handshake = this.doHandshakeAndInit(true);
 			handshake.catch(() => {
 				// Consumed via the race; see connect().
 			});
 			await Promise.race([handshake, abortPromise]);
-			this.socket!.setTimeout(0); // Clear handshake timeout
 			this.state = 'ready';
 			this.setupMessageLoop();
 			this.startPingTimer();
@@ -382,6 +383,7 @@ export class Peer extends EventEmitter {
 			this.destroySocket();
 			throw err;
 		} finally {
+			clearTimeout(deadline);
 			this.establishmentAbort = null;
 		}
 	}

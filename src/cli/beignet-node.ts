@@ -302,6 +302,9 @@ export interface BeignetNodeOptions {
 	 * Opt-in and additive: coexists with the TCP listener on listenPort.
 	 */
 	websocketPort?: number;
+	/** Inbound peer connections (default 125); once this many are up, only
+	 *  peers holding a channel with this node are admitted. */
+	maxInboundPeers?: number;
 	preferAnchors?: boolean;
 	/**
 	 * option_wumbo (large_channels, default false): advertise the bit and lift
@@ -2869,6 +2872,7 @@ export class BeignetNode extends EventEmitter {
 			sweepDestinationScript,
 			socks5Proxy,
 			socks5ProxyScope,
+			maxInboundPeers: opts.maxInboundPeers,
 			...(opts.guardianServe
 				? {
 						guardianHost: {
