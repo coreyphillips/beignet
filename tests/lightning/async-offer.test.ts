@@ -240,7 +240,10 @@ describe('BOLT 12 async offer (M2.4)', function () {
 			payerKey: getPublicKey(payerPriv),
 			offerId: (offer as IOffer).offerId,
 			amount: amountMsat,
-			metadata: crypto.randomBytes(16)
+			metadata: crypto.randomBytes(16),
+			// A regtest offer lists its chain, and a request that omits
+			// invreq_chain is for bitcoin mainnet.
+			chain: offer.chains?.[0]
 		};
 		const offerTlv = encodeOfferTlv(offer);
 		const unsigned = encodeInvoiceRequestTlv(request, offerTlv);

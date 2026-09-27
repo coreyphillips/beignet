@@ -64,7 +64,11 @@ import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { OnionMessageManager } from '../../src/lightning/onion-message/manager';
 import { findRouteToBlindedPath } from '../../src/lightning/gossip/pathfinding';
 import { NetworkGraph } from '../../src/lightning/gossip/network-graph';
-import { BITCOIN_CHAIN_HASH } from '../../src/lightning/channel/types';
+import {
+	BITCOIN_CHAIN_HASH,
+	REGTEST_CHAIN_HASH,
+	TESTNET_CHAIN_HASH
+} from '../../src/lightning/channel/types';
 
 describe('BOLT 12: Offers', () => {
 	// ── Test Fixtures ───────────────────────────────────────────────
@@ -1571,6 +1575,176 @@ describe('BOLT 12: Offers', () => {
 			mgr.handleInvoiceRequest(requestTlv);
 
 			expect(errorEmitted).to.be.true;
+			mgr.destroy();
+		});
+	});
+
+	// ── OfferManager Invoice Request Terms (#1007) ───────────────────
+
+	describe('OfferManager invoice request terms (#1007)', () => {
+		const UNIT = 100_000_000n; // a 100k-sat offer
+
+		function issue(
+			options: Parameters<OfferManager['createOffer']>[0],
+			fields: Partial<IInvoiceRequest>
+		): { invoice: IBolt12Invoice | null; errors: string[] } {
+			const mgr = new OfferManager(privkey1);
+			const errors: string[] = [];
+			mgr.on('invoice:error', (e: IInvoiceError) => errors.push(e.error));
+			const { offer } = mgr.createOffer(options);
+			const invoice = mgr.handleInvoiceRequest(
+				makeSignedRequestTlv(fields, offer)
+			);
+			mgr.destroy();
+			return { invoice, errors };
+		}
+
+		it('refuses an invreq_amount below the offer amount', () => {
+			const { invoice, errors } = issue(
+				{ description: 'widget', amount: UNIT },
+				{ amount: 1n }
+			);
+			expect(invoice).to.be.null;
+			expect(errors).to.deep.equal(['Amount below the offer price']);
+		});
+
+		it('invoices the offer amount times the quantity when no amount is sent', () => {
+			const { invoice } = issue(
+				{ description: 'widget', amount: UNIT, quantityMax: 10n },
+				{ quantity: 5n }
+			);
+			expect(invoice!.amount).to.equal(5n * UNIT);
+		});
+
+		it('refuses an invreq_amount below the offer amount times the quantity', () => {
+			const { invoice, errors } = issue(
+				{ description: 'widget', amount: UNIT, quantityMax: 10n },
+				{ amount: UNIT, quantity: 5n }
+			);
+			expect(invoice).to.be.null;
+			expect(errors).to.deep.equal(['Amount below the offer price']);
+		});
+
+		it('invoices an invreq_amount at or above the offer price', () => {
+			const exact = issue(
+				{ description: 'widget', amount: UNIT, quantityMax: 10n },
+				{ amount: 5n * UNIT, quantity: 5n }
+			);
+			expect(exact.invoice!.amount).to.equal(5n * UNIT);
+			const tip = issue(
+				{ description: 'widget', amount: UNIT },
+				{ amount: UNIT + 1n }
+			);
+			expect(tip.invoice!.amount).to.equal(UNIT + 1n);
+		});
+
+		it('refuses a quantity above offer_quantity_max', () => {
+			const { invoice, errors } = issue(
+				{ description: 'widget', amount: UNIT, quantityMax: 10n },
+				{ amount: 1000n * UNIT, quantity: 1000n }
+			);
+			expect(invoice).to.be.null;
+			expect(errors).to.deep.equal(['Invalid quantity']);
+		});
+
+		it('refuses a zero quantity, even when the offer sets no limit', () => {
+			for (const quantityMax of [10n, 0n]) {
+				const { invoice, errors } = issue(
+					{ description: 'widget', amount: UNIT, quantityMax },
+					{ quantity: 0n }
+				);
+				expect(invoice).to.be.null;
+				expect(errors).to.deep.equal(['Invalid quantity']);
+			}
+		});
+
+		it('takes any positive quantity when offer_quantity_max is zero', () => {
+			const { invoice } = issue(
+				{ description: 'widget', amount: UNIT, quantityMax: 0n },
+				{ quantity: 1000n }
+			);
+			expect(invoice!.amount).to.equal(1000n * UNIT);
+		});
+
+		it('refuses a request without a quantity when the offer sets offer_quantity_max', () => {
+			const { invoice, errors } = issue(
+				{ description: 'widget', amount: UNIT, quantityMax: 10n },
+				{ amount: UNIT }
+			);
+			expect(invoice).to.be.null;
+			expect(errors).to.deep.equal(['Quantity required']);
+		});
+
+		it('refuses a quantity when the offer sets no offer_quantity_max', () => {
+			const { invoice, errors } = issue(
+				{ description: 'widget', amount: UNIT },
+				{ amount: UNIT, quantity: 1n }
+			);
+			expect(invoice).to.be.null;
+			expect(errors).to.deep.equal(['Offer does not take a quantity']);
+		});
+
+		it('refuses a price that does not fit in a u64 instead of throwing', () => {
+			const { invoice, errors } = issue(
+				{ description: 'widget', amount: UNIT, quantityMax: 0n },
+				{ quantity: 0xffff_ffff_ffff_ffffn }
+			);
+			expect(invoice).to.be.null;
+			expect(errors).to.deep.equal(['Amount too large']);
+		});
+
+		it('still needs an amount for an amountless offer', () => {
+			const { invoice, errors } = issue({ description: 'tips' }, {});
+			expect(invoice).to.be.null;
+			expect(errors).to.deep.equal(['Amount required but not specified']);
+		});
+
+		it('refuses an invreq_chain the offer does not list', () => {
+			const onRegtest = issue(
+				{ description: 'widget', amount: UNIT, chains: [REGTEST_CHAIN_HASH] },
+				{ amount: UNIT, chain: TESTNET_CHAIN_HASH }
+			);
+			expect(onRegtest.invoice).to.be.null;
+			expect(onRegtest.errors).to.deep.equal(['Wrong chain']);
+			// No offer_chains: bitcoin only.
+			const onMainnet = issue(
+				{ description: 'widget', amount: UNIT },
+				{ amount: UNIT, chain: TESTNET_CHAIN_HASH }
+			);
+			expect(onMainnet.invoice).to.be.null;
+			expect(onMainnet.errors).to.deep.equal(['Wrong chain']);
+		});
+
+		it('reads a missing invreq_chain as bitcoin', () => {
+			const regtestOnly = issue(
+				{ description: 'widget', amount: UNIT, chains: [REGTEST_CHAIN_HASH] },
+				{ amount: UNIT }
+			);
+			expect(regtestOnly.invoice).to.be.null;
+			expect(regtestOnly.errors).to.deep.equal(['Wrong chain']);
+			const listed = issue(
+				{ description: 'widget', amount: UNIT, chains: [REGTEST_CHAIN_HASH] },
+				{ amount: UNIT, chain: REGTEST_CHAIN_HASH }
+			);
+			expect(listed.invoice!.amount).to.equal(UNIT);
+			const mainnet = issue(
+				{ description: 'widget', amount: UNIT },
+				{ amount: UNIT, chain: BITCOIN_CHAIN_HASH }
+			);
+			expect(mainnet.invoice!.amount).to.equal(UNIT);
+		});
+
+		it('mints no preimage for a refused request', () => {
+			const mgr = new OfferManager(privkey1);
+			mgr.on('invoice:error', () => {});
+			let issued = 0;
+			mgr.on('invoice:issued', () => issued++);
+			const { offer } = mgr.createOffer({
+				description: 'widget',
+				amount: UNIT
+			});
+			mgr.handleInvoiceRequest(makeSignedRequestTlv({ amount: 1n }, offer));
+			expect(issued).to.equal(0);
 			mgr.destroy();
 		});
 	});
