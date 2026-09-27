@@ -81,19 +81,26 @@ function sanitizeSlot(
 }
 
 /**
- * Settle a restored update slot with unresolved provenance, in either mode:
- * pathfinding reads every update slot, so unlike an announcement it cannot
- * wait deferred for a gossip query (issue #1024). Returns null for a signed
- * update that fails, which must be dropped rather than left routable. A
- * signatureless one is RGS data and stays, unverified.
+ * Settle a restored update slot in either mode: pathfinding reads every
+ * update slot, so unlike an announcement it cannot wait deferred for a
+ * gossip query (issue #1024). Returns null for a slot to drop rather than
+ * leave routable: a signed update with unresolved provenance that fails, or
+ * a signatureless one flagged false. Lazy intake stored a peer's
+ * zero-signature forgery as false, and RGS data saved that way comes back
+ * from the snapshot. An unflagged signatureless slot predates lazy intake,
+ * when every peer update was verified, so it is RGS data and stays.
  */
 function settleRestoredUpdate(
 	update: IChannelUpdateMessage,
+	verified: boolean | undefined,
 	nodeId1: Buffer,
 	nodeId2: Buffer
 ): boolean | null {
+	const signatureless = isSignatureless(update.signature);
+	if (verified === false && signatureless) return null;
+	if (verified !== undefined) return verified;
 	if (verifyChannelUpdateMessage(update, nodeId1, nodeId2)) return true;
-	return isSignatureless(update.signature) ? false : null;
+	return signatureless ? false : null;
 }
 
 export class NetworkGraph {
@@ -769,15 +776,23 @@ export class NetworkGraph {
 				ann.verified === undefined ? true : undefined;
 		}
 		const settled1 = channel.update1
-			? upd1.verified ??
-			  settleRestoredUpdate(channel.update1, channel.nodeId1, channel.nodeId2)
+			? settleRestoredUpdate(
+					channel.update1,
+					upd1.verified,
+					channel.nodeId1,
+					channel.nodeId2
+			  )
 			: undefined;
 		if (settled1 === null) channel.update1 = undefined;
 		channel.update1Verified = settled1 ?? undefined;
 		channel.update1VerifyDeferred = undefined;
 		const settled2 = channel.update2
-			? upd2.verified ??
-			  settleRestoredUpdate(channel.update2, channel.nodeId1, channel.nodeId2)
+			? settleRestoredUpdate(
+					channel.update2,
+					upd2.verified,
+					channel.nodeId1,
+					channel.nodeId2
+			  )
 			: undefined;
 		if (settled2 === null) channel.update2 = undefined;
 		channel.update2Verified = settled2 ?? undefined;

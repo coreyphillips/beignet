@@ -350,9 +350,9 @@ describe('Gossip far-future timestamps (NetworkGraph, issue #446)', () => {
 		).to.equal(true);
 	});
 
-	it('a lazy restore settles deferred updates instead of routing over them (issue #1024)', () => {
-		// Rows an older lazy run saved deferred: a forged update must not
-		// survive the upgrade, while a signatureless RGS one stays routable.
+	it('a lazy restore drops forged updates instead of routing over them (issue #1024)', () => {
+		// Rows an older lazy run saved: a random-signature forgery marked
+		// deferred, and a zero-signature one it stored as explicit false.
 		const graph = new NetworkGraph(REGTEST_CHAIN_HASH);
 		const ann = buildAnnouncement(704, REGTEST_CHAIN_HASH);
 		graph.restoreChannel({
@@ -370,14 +370,14 @@ describe('Gossip far-future timestamps (NetworkGraph, issue #446)', () => {
 			update2: {
 				...buildUpdate(ann, 1000, 1, REGTEST_CHAIN_HASH).msg,
 				signature: Buffer.alloc(64)
-			}
+			},
+			update2Verified: false
 		});
 		const ch = graph.getChannel(ann.msg.shortChannelId)!;
 		expect(ch.update1).to.equal(undefined);
 		expect(ch.update1VerifyDeferred).to.equal(undefined);
-		expect(ch.update2?.timestamp).to.equal(1000);
-		expect(ch.update2Verified).to.equal(false);
-		expect(ch.update2VerifyDeferred).to.equal(undefined);
+		expect(ch.update2).to.equal(undefined);
+		expect(ch.update2Verified).to.equal(undefined);
 	});
 });
 

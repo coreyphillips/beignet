@@ -1027,7 +1027,9 @@ as before; eager mode also re-requests signatureless RGS-primed entries from
 peers so their signed copies become servable. Stored rows that predate the
 provenance flags are resolved at restore. Update slots are verified in either
 mode, and a signed update that fails is dropped because pathfinding would read
-it. For announcements, eager mode verifies the canonical re-encoding (failing
+it. A signatureless update slot flagged unverified is dropped too: older lazy
+runs stored a peer's zero-signature forgery that way, and RGS data comes back
+from the snapshot. For announcements, eager mode verifies the canonical re-encoding (failing
 safe to unverified), lazy mode marks them deferred and lets the point of
 consumption decide.
 
