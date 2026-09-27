@@ -700,8 +700,9 @@ describe('Gossip intake queue (LightningNode)', () => {
 
 	it('the event loop keeps ticking while a dump drains', async () => {
 		// The tick floor below only exists when intake verifies (issue #437's
-		// contract); the lazy default admits a 40-message dump in one slice.
-		// destroy() closes the storage handle, so build a fresh one.
+		// contract), so pin eager mode rather than lean on which messages the
+		// lazy default verifies. destroy() closes the storage handle, so build
+		// a fresh one.
 		node.destroy();
 		storage = new SqliteStorage(dbPath);
 		storage.open();
@@ -726,41 +727,118 @@ describe('Gossip intake queue (LightningNode)', () => {
 		expect(ticks).to.be.at.least(5);
 	});
 
-	it('lazy intake (default) admits a dump as deferred without paying for signatures', async () => {
+	it('lazy intake (default) verifies what pathfinding reads: a new channel and its update', async () => {
 		const ann = buildAnnouncement(500, REGTEST_CHAIN_HASH);
 		const update = buildUpdate(ann, 1000, 0, REGTEST_CHAIN_HASH);
 		feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
 		feed(MessageType.CHANNEL_UPDATE, update.payload);
 		await node.flushGossip();
 		const ch = graphOf(node).getChannel(ann.msg.shortChannelId)!;
-		expect(ch.announcementVerified).to.equal(undefined);
-		expect(ch.announcementVerifyDeferred).to.equal(true);
-		expect(ch.update1VerifyDeferred).to.equal(true);
+		expect(ch.announcementVerified).to.equal(true);
+		expect(ch.announcementVerifyDeferred).to.equal(undefined);
+		expect(ch.update1Verified).to.equal(true);
+		expect(ch.update1VerifyDeferred).to.equal(undefined);
 	});
 
-	it('lazy intake admits a garbage-signature announcement as deferred; eager drops it', async () => {
+	it('a garbage-signature announcement for a new SCID is dropped in lazy mode too', async () => {
 		const ann = buildAnnouncement(501, REGTEST_CHAIN_HASH);
 		const garbage = {
 			...ann.msg,
 			nodeSignature1: crypto.randomBytes(64)
 		};
-		const garbagePayload = encodeChannelAnnouncementMessage(garbage);
-		feed(MessageType.CHANNEL_ANNOUNCEMENT, garbagePayload);
-		await node.flushGossip();
-		expect(
-			graphOf(node).getChannel(ann.msg.shortChannelId)!
-				.announcementVerifyDeferred
-		).to.equal(true);
-
-		node.destroy();
-		storage = new SqliteStorage(dbPath);
-		storage.open();
-		node = new LightningNode(makeConfig(true));
-		feed(MessageType.CHANNEL_ANNOUNCEMENT, garbagePayload);
+		let writes = 0;
+		const original = storage.saveGossipChannel.bind(storage);
+		storage.saveGossipChannel = (scidHex, channel): void => {
+			writes++;
+			original(scidHex, channel);
+		};
+		feed(
+			MessageType.CHANNEL_ANNOUNCEMENT,
+			encodeChannelAnnouncementMessage(garbage)
+		);
 		await node.flushGossip();
 		expect(graphOf(node).getChannel(ann.msg.shortChannelId)).to.equal(
 			undefined
 		);
+		expect(writes).to.equal(0);
+	});
+
+	it('a forged update cannot rewrite or camp a channel policy in lazy mode (issue #1024)', async () => {
+		const now = Math.floor(Date.now() / 1000);
+		const ann = buildAnnouncement(503, REGTEST_CHAIN_HASH);
+		const real = buildUpdate(ann, now - 60, 0, REGTEST_CHAIN_HASH);
+		feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
+		feed(MessageType.CHANNEL_UPDATE, real.payload);
+		await node.flushGossip();
+		const ch = graphOf(node).getChannel(ann.msg.shortChannelId)!;
+
+		// Unsigned, near the far-future bound, and pricing the hop out.
+		const forged = {
+			...buildUpdate(ann, now + 3599, 0, REGTEST_CHAIN_HASH).msg,
+			feeBaseMsat: 0xffffffff,
+			signature: crypto.randomBytes(64)
+		};
+		feed(MessageType.CHANNEL_UPDATE, encodeChannelUpdateMessage(forged));
+		await node.flushGossip();
+		expect(ch.update1?.timestamp).to.equal(now - 60);
+		expect(ch.update1?.feeBaseMsat).to.equal(1000);
+
+		// The endpoint's next real update still lands.
+		const next = buildUpdate(ann, now, 0, REGTEST_CHAIN_HASH);
+		feed(MessageType.CHANNEL_UPDATE, next.payload);
+		await node.flushGossip();
+		expect(ch.update1?.timestamp).to.equal(now);
+		expect(ch.update1Verified).to.equal(true);
+	});
+
+	it('an RGS-primed channel keeps its deferred announcement upgrade but refuses forged updates', async () => {
+		const now = Math.floor(Date.now() / 1000);
+		const ann = buildAnnouncement(504, REGTEST_CHAIN_HASH);
+		const graph = graphOf(node);
+		// RGS rows carry zero signatures and a synthetic snapshot timestamp.
+		graph.addChannelAnnouncement(
+			{
+				...ann.msg,
+				nodeSignature1: Buffer.alloc(64),
+				nodeSignature2: Buffer.alloc(64),
+				bitcoinSignature1: Buffer.alloc(64),
+				bitcoinSignature2: Buffer.alloc(64)
+			},
+			{ verified: false }
+		);
+		graph.applyChannelUpdate(
+			{
+				...buildUpdate(ann, now, 0, REGTEST_CHAIN_HASH).msg,
+				signature: Buffer.alloc(64)
+			},
+			{ verified: false }
+		);
+		const ch = graph.getChannel(ann.msg.shortChannelId)!;
+
+		// The signed announcement cannot move the endpoints, so lazy mode
+		// still skips its signatures.
+		feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
+		await node.flushGossip();
+		expect(ch.announcementVerifyDeferred).to.equal(true);
+
+		// A forged update no longer takes the signatureless slot.
+		const forged = {
+			...buildUpdate(ann, now - 60, 0, REGTEST_CHAIN_HASH).msg,
+			channelFlags: 2, // disabled, direction 0
+			signature: crypto.randomBytes(64)
+		};
+		feed(MessageType.CHANNEL_UPDATE, encodeChannelUpdateMessage(forged));
+		await node.flushGossip();
+		expect(ch.update1?.channelFlags).to.equal(0);
+		expect(ch.update1Verified).to.equal(false);
+
+		// The endpoint's signed update does, even though its timestamp is
+		// older than the snapshot's synthetic one.
+		const real = buildUpdate(ann, now - 60, 0, REGTEST_CHAIN_HASH);
+		feed(MessageType.CHANNEL_UPDATE, real.payload);
+		await node.flushGossip();
+		expect(ch.update1?.timestamp).to.equal(now - 60);
+		expect(ch.update1Verified).to.equal(true);
 	});
 
 	it('a re-served dump in lazy mode causes no graph change and no storage writes', async () => {
@@ -770,9 +848,9 @@ describe('Gossip intake queue (LightningNode)', () => {
 		feed(MessageType.CHANNEL_UPDATE, update.payload);
 		await node.flushGossip();
 
-		// A deferred slot holding real signatures must refuse its own re-serve
-		// at apply, or every re-served dump would rewrite the whole gossip
-		// table (the #437 failure class relocated to disk).
+		// Every re-served entry must refuse at the gates, or every re-served
+		// dump would rewrite the whole gossip table (the #437 failure class
+		// relocated to disk).
 		let writes = 0;
 		const original = storage.saveGossipChannel.bind(storage);
 		storage.saveGossipChannel = (scidHex, channel): void => {
@@ -784,7 +862,7 @@ describe('Gossip intake queue (LightningNode)', () => {
 		await node.flushGossip();
 		expect(writes).to.equal(0);
 		const ch = graphOf(node).getChannel(ann.msg.shortChannelId)!;
-		expect(ch.announcementVerifyDeferred).to.equal(true);
+		expect(ch.announcementVerified).to.equal(true);
 		expect(ch.update1?.timestamp).to.equal(1000);
 	});
 

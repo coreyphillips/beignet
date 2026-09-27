@@ -422,10 +422,11 @@ export interface BeignetNodeOptions {
 	/** Rapid Gossip Sync snapshot URL (defaults to the public LDK endpoint). */
 	rapidGossipSyncUrl?: string;
 	/**
-	 * Signature-verify foreign broadcast gossip at intake (default false).
-	 * By default verification is deferred until a gossip query asks for an
-	 * entry, which skips nearly the whole first-dump verification cost;
-	 * nothing unverified is ever served either way. Set true on relay-class
+	 * Signature-verify all foreign broadcast gossip at intake (default false).
+	 * By default only what pathfinding reads (channel updates, announcements
+	 * of new channels) is verified at intake; the rest is deferred until a
+	 * gossip query asks for it, and nothing unverified is ever served either
+	 * way. Set true on relay-class
 	 * nodes that serve the graph: intake and restore verify eagerly and
 	 * signatureless RGS-primed entries are re-fetched signed from peers.
 	 */

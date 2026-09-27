@@ -998,19 +998,24 @@ unverified (`*Verified: false`, failed verification or signatureless, never
 served and never re-checked) and deferred (`*VerifyDeferred: true` with the
 boolean unset: carries signatures, not yet checked). The booleans never go
 truthy for unchecked data, so existing `if (announcementVerified)` consumers
-stay safe. By default the node runs lazy verification: foreign broadcast
-gossip is admitted deferred without any signature work, `reply_channel_range`
-advertises those SCIDs, and the first `query_short_channel_ids` that asks for
-an entry resolves it, serving only what verifies. Resolution draws on a
+stay safe. Pathfinding reads every stored update whatever its provenance, so
+the node verifies every `channel_update`, and every `channel_announcement` for
+an SCID it does not hold yet, at intake in either mode; otherwise any peer
+could rewrite the policy of any channel. By default the node runs lazy
+verification for the rest: node announcements, and signed announcements that
+upgrade a held signatureless (RGS) entry in place, are admitted deferred
+without any signature work, `reply_channel_range` advertises those SCIDs, and
+the first `query_short_channel_ids` that asks for an entry resolves it,
+serving only what verifies. Resolution draws on a
 verification budget shared by all queries in a rolling window
 (`NetworkGraph.SERVE_VERIFY_BUDGET_MS` per `SERVE_VERIFY_WINDOW_MS`); each
 channel is served atomically (announcement plus updates plus endpoint node
 announcements) or omitted whole, and an omission forced by the budget is
 reported through the `reply_short_channel_ids_end` `full_information` bit.
-This skips nearly the entire first-dump verification cost for wallet nodes
-while preserving the never-serve-unverified rule. Trust-consuming reads stay
-verified everywhere: updates naming our own channels and node announcements
-that feed peer address capture are verified at intake, and every dial-address
+On an RGS-primed wallet this skips the announcement signatures of the whole
+snapshot while preserving the never-serve-unverified rule. Trust-consuming
+reads stay verified everywhere: node announcements that feed peer address
+capture are verified at intake, and every dial-address
 consumer goes through `NetworkGraph.getVerifiedNodeAnnouncement`, which
 resolves a deferred announcement before handing out addresses. FFOR public-fee
 eligibility uses `NetworkGraph.getVerifiedChannelAnnouncement`, which resolves

@@ -433,13 +433,8 @@ describe('Lightning Node', function () {
 		});
 
 		it('should reject invalid channel announcement', async function () {
-			// Eager mode drops a corrupted signature at intake. The lazy
-			// default admits it as 'deferred' and the serve path rejects it
-			// instead (issue #443); either way it is never served.
-			const node = new LightningNode({
-				...makeNodeConfig(1),
-				eagerGossipVerify: true
-			});
+			// A new channel is a pathfinding edge, so both modes drop a
+			// corrupted signature at intake (issue #1024).
 			const { payload } = createSignedChannelAnnouncement(
 				gossipKey1,
 				gossipKey2,
@@ -450,28 +445,19 @@ describe('Lightning Node', function () {
 			// Corrupt a signature byte
 			const corrupted = Buffer.from(payload);
 			corrupted[10] ^= 0xff;
-			node.handlePeerMessage(
-				'somepeer',
-				MessageType.CHANNEL_ANNOUNCEMENT,
-				corrupted
-			);
-			await node.flushGossip();
-			expect(node.getGraph().getChannelCount()).to.equal(0);
-
-			const lazy = createNode(1);
-			lazy.handlePeerMessage(
-				'somepeer',
-				MessageType.CHANNEL_ANNOUNCEMENT,
-				corrupted
-			);
-			await lazy.flushGossip();
-			expect(lazy.getGraph().getChannelCount()).to.equal(1);
-			expect(
-				lazy.getGraph().getChannel(testScid)!.announcementVerifyDeferred
-			).to.equal(true);
-			expect(
-				lazy.getGraph().getGossipMessagesForChannels([testScid]).announcements
-			).to.have.length(0);
+			for (const eagerGossipVerify of [true, false]) {
+				const node = new LightningNode({
+					...makeNodeConfig(1),
+					eagerGossipVerify
+				});
+				node.handlePeerMessage(
+					'somepeer',
+					MessageType.CHANNEL_ANNOUNCEMENT,
+					corrupted
+				);
+				await node.flushGossip();
+				expect(node.getGraph().getChannelCount()).to.equal(0);
+			}
 		});
 
 		it('should apply channel update after announcement', async function () {

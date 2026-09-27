@@ -1981,7 +1981,7 @@ describe('Gossip Sync (Phase 5)', function () {
 			node.destroy();
 		});
 
-		it('defers intake verification and resolves it at serve time (issue #443, lazy default)', async function () {
+		it('verifies channel gossip at intake in lazy mode and serves only what re-encodes (issues #443, #1024)', async function () {
 			const node = makeNode();
 			const peer = 'aa'.repeat(33);
 			const cleanScid = makeScid(150, 3, 0);
@@ -1992,9 +1992,8 @@ describe('Gossip Sync (Phase 5)', function () {
 				cleanKeys,
 				REGTEST_CHAIN_HASH
 			);
-			// Signed future fields the codec cannot round-trip: serve-time
-			// resolution verifies the canonical re-encoding, so this one must
-			// resolve unservable exactly like eager intake would classify it.
+			// Signed future fields the codec cannot round-trip: validly signed,
+			// so it is admitted and routable, but never served.
 			const extra = makeSignedChannelAnnouncement(
 				extraScid,
 				makeSignedChannelKeys(),
@@ -2025,22 +2024,19 @@ describe('Gossip Sync (Phase 5)', function () {
 			);
 			await node.flushGossip();
 
-			// Intake paid for no signatures: everything sits deferred, with the
-			// boolean flags unset so truthiness checks read unverified.
+			// Pathfinding reads these, so intake settled them even in lazy mode.
 			const graph = node.getGraph();
-			expect(graph.getChannel(cleanScid)!.announcementVerified).to.equal(
-				undefined
-			);
-			expect(graph.getChannel(cleanScid)!.announcementVerifyDeferred).to.equal(
-				true
-			);
-			expect(graph.getChannel(cleanScid)!.update1VerifyDeferred).to.equal(true);
-			expect(graph.getChannel(extraScid)!.announcementVerifyDeferred).to.equal(
-				true
-			);
+			expect(graph.getChannel(cleanScid)!.announcementVerified).to.be.true;
+			expect(graph.getChannel(cleanScid)!.update1Verified).to.be.true;
+			expect(graph.getChannel(extraScid)!.announcementVerified).to.be.false;
+			for (const scid of [cleanScid, extraScid]) {
+				const ch = graph.getChannel(scid)!;
+				expect(ch.announcementVerifyDeferred).to.equal(undefined);
+				expect(ch.update1VerifyDeferred).to.equal(undefined);
+			}
 
-			// A gossip query triggers resolution: the clean entry is served
-			// byte-identically, the unreproducible one is withheld.
+			// The clean entry is served byte-identically, the unreproducible
+			// one is withheld.
 			const outbound: Array<{ type: number; payload: Buffer }> = [];
 			node.on(
 				'message:outbound',
@@ -2066,11 +2062,6 @@ describe('Gossip Sync (Phase 5)', function () {
 			);
 			expect(servedUpds.length).to.equal(1);
 			expect(servedUpds[0].payload.equals(cleanUpd.payload)).to.be.true;
-
-			// Resolution is sticky: the flags are booleans now.
-			expect(graph.getChannel(cleanScid)!.announcementVerified).to.be.true;
-			expect(graph.getChannel(cleanScid)!.update1Verified).to.be.true;
-			expect(graph.getChannel(extraScid)!.announcementVerified).to.be.false;
 			node.destroy();
 		});
 

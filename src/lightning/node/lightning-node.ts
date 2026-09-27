@@ -15114,11 +15114,13 @@ export class LightningNode extends EventEmitter {
 		if (!this.graph.wouldAcceptChannelAnnouncement(msg)) {
 			return;
 		}
-		// Lazy mode (default): admit with deferred provenance and skip the
-		// signature work entirely; verification pays for itself only at serve
-		// time, when a gossip query asks for the entry (issue #443).
+		// A new SCID becomes a pathfinding edge between the node ids it names,
+		// so its signatures are checked now in either mode (issue #1024). Lazy
+		// mode (default) defers only the in-place upgrade of a held
+		// signatureless (RGS) entry: that cannot change the endpoints, and its
+		// verification buys nothing but the right to serve (issue #443).
 		let verified: TGossipVerified = 'deferred';
-		if (this.eagerGossipVerify) {
+		if (this.eagerGossipVerify || !this.graph.getChannel(msg.shortChannelId)) {
 			if (!verifyChannelAnnouncement(msg, payload)) {
 				return;
 			}
@@ -15289,19 +15291,15 @@ export class LightningNode extends EventEmitter {
 		if (!this.graph.wouldAcceptChannelUpdate(msg)) {
 			return;
 		}
-		// Updates naming one of OUR channels keep eager verification even in
-		// lazy mode: their graph slots back invoice route hints and must never
-		// sit deferred. Everything else defers to serve time (issue #443).
-		let verified: TGossipVerified = 'deferred';
-		if (this.eagerGossipVerify || this.channelUpdateTargetsOurChannel(msg)) {
-			if (
-				!verifyChannelUpdate(msg, payload, channel.nodeId1, channel.nodeId2)
-			) {
-				return;
-			}
-			// Serve only what re-encodes byte-identically (see handleChannelAnnouncement).
-			verified = encodeChannelUpdateMessage(msg).equals(payload);
+		// Verified in either mode: pathfinding and route hints read every
+		// update in the graph, and a deferred one would let any peer rewrite
+		// (or, with a future timestamp, camp) the policy of any channel
+		// (issue #1024).
+		if (!verifyChannelUpdate(msg, payload, channel.nodeId1, channel.nodeId2)) {
+			return;
 		}
+		// Serve only what re-encodes byte-identically (see handleChannelAnnouncement).
+		const verified = encodeChannelUpdateMessage(msg).equals(payload);
 		if (this.graph.applyChannelUpdate(msg, { verified })) {
 			const ch = this.graph.getChannel(msg.shortChannelId);
 			if (ch)
