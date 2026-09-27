@@ -1360,6 +1360,8 @@ export class PeerManager extends EventEmitter {
 		}
 		const server = new WebSocketServer({
 			maxPendingUpgrades: this.maxPendingInbound,
+			maxPendingUpgradesPerAddress: this.maxPendingInboundPerAddress,
+			upgradeAddressKey: inboundAddressKey,
 			upgradeTimeoutMs: this.inboundHandshakeTimeoutMs
 		});
 		server.on('connection', (transport: IDuplexTransport) => {
@@ -1559,7 +1561,7 @@ export class PeerManager extends EventEmitter {
 				// channel peer from reconnecting.
 				if (
 					this.inboundPeerCount >= this.maxInboundPeers &&
-					!this.isChannelPeer?.(pubkey)
+					!this.admitsPastInboundCap(pubkey)
 				) {
 					peer.disconnect();
 					return;
@@ -1661,6 +1663,16 @@ export class PeerManager extends EventEmitter {
 				this.pendingPeers.delete(peer);
 				this.pendingInbound.delete(peer);
 			});
+	}
+
+	/** A throwing isChannelPeer admits nothing. Letting the throw escape
+	 *  would land in the handshake-failure catch, which never disconnects. */
+	private admitsPastInboundCap(pubkey: string): boolean {
+		try {
+			return this.isChannelPeer?.(pubkey) ?? false;
+		} catch {
+			return false;
+		}
 	}
 
 	private dispatchPeerMessage(

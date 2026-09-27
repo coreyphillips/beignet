@@ -14,7 +14,14 @@ import {
 	PeerManager,
 	inboundAddressKey
 } from '../../src/lightning/transport/peer-manager';
-import { WebSocketServer } from '../../src/lightning/transport/websocket-server';
+import {
+	WebSocketServer,
+	WebSocketServerTransport
+} from '../../src/lightning/transport/websocket-server';
+import {
+	encodeWsFrame,
+	WsOpcode
+} from '../../src/lightning/transport/websocket-frame';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 
@@ -258,6 +265,28 @@ describe('peer manager inbound admission', () => {
 		await until(() => pm!.listPeers().length === 2);
 		expect(pm.getPeer(channelPubkey)).to.exist;
 	});
+
+	it('refuses a peer past maxInboundPeers when isChannelPeer throws', async () => {
+		pm = new PeerManager({
+			localPrivateKey: HOST_SECRET,
+			maxInboundPeers: 0,
+			isChannelPeer: (): boolean => {
+				throw new Error('lookup failed');
+			}
+		});
+		const port = await listenLocal(pm);
+		const peer = dialer(port);
+		peers.push(peer);
+		let closed = false;
+		peer.on('close', () => {
+			closed = true;
+		});
+		await peer.connect().catch(() => {
+			closed = true;
+		});
+		await until(() => closed);
+		expect(pm.listPeers()).to.have.length(0);
+	});
 });
 
 describe('websocket server upgrade admission', () => {
@@ -287,6 +316,79 @@ describe('websocket server upgrade admission', () => {
 		expect(silent.closed).to.equal(false);
 
 		await until(() => silent.closed, 2_000);
+	});
+
+	it('bounds connections that have not upgraded per source address key', async () => {
+		const keys: Array<string | null> = ['a', 'a', 'b', null, null];
+		server = new WebSocketServer({
+			maxPendingUpgradesPerAddress: 1,
+			upgradeAddressKey: (): string | null => keys.shift() ?? null
+		});
+		await server.listen(0, '127.0.0.1');
+		const port = (server.address() as net.AddressInfo).port;
+
+		const clients: Array<{ socket: net.Socket; closed: boolean }> = [];
+		for (let i = 0; i < 5; i++) {
+			const client = silentClient(port);
+			sockets.push(client.socket);
+			clients.push(client);
+			await settle(50);
+		}
+		expect(clients.map((c) => c.closed)).to.deep.equal([
+			false,
+			true,
+			false,
+			false,
+			false
+		]);
+	});
+
+	it('counts an upgraded connection it closes until it is gone, reading nothing more from it', async function () {
+		this.timeout(5_000);
+		server = new WebSocketServer({ maxPendingUpgrades: 1 });
+		let transport: WebSocketServerTransport | undefined;
+		server.on('connection', (t: WebSocketServerTransport) => {
+			transport = t;
+			t.destroy();
+		});
+		await server.listen(0, '127.0.0.1');
+		const port = (server.address() as net.AddressInfo).port;
+
+		// A client that never answers our close, so the socket lingers.
+		const client = silentClient(port);
+		sockets.push(client.socket);
+		client.socket.write(
+			'GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n' +
+				'Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n' +
+				`Sec-WebSocket-Key: ${crypto
+					.randomBytes(16)
+					.toString('base64')}\r\n\r\n`
+		);
+		await until(() => transport !== undefined);
+		client.socket.write(
+			encodeWsFrame({
+				opcode: WsOpcode.BINARY,
+				payload: Buffer.alloc(1024),
+				maskKey: crypto.randomBytes(4)
+			})
+		);
+		await settle(50);
+		const received: Buffer[] = [];
+		transport!.on('data', (chunk: Buffer) => received.push(chunk));
+		expect(received).to.have.length(0);
+
+		const refused = silentClient(port);
+		sockets.push(refused.socket);
+		await until(() => refused.closed, 250);
+
+		const pending = (
+			server as unknown as { pendingUpgrades: Map<unknown, unknown> }
+		).pendingUpgrades;
+		await until(() => pending.size === 0, 2_000);
+		const admitted = silentClient(port);
+		sockets.push(admitted.socket);
+		await settle(100);
+		expect(admitted.closed).to.equal(false);
 	});
 });
 

@@ -57,16 +57,24 @@ export class WebSocketServerTransport
 	private parser: WsFrameParser;
 	private closeSent = false;
 	private closed = false;
+	private closing = false;
 	private hadError = false;
 	// null = no fragmented data message in progress
 	private fragmentedOpcode: number | null = null;
+	private onClosing?: () => void;
 
 	constructor(
 		socket: net.Socket,
-		opts?: { maxFramePayloadBytes?: number; initialData?: Buffer }
+		opts?: {
+			maxFramePayloadBytes?: number;
+			initialData?: Buffer;
+			/** Called once when we start closing a still-open socket. */
+			onClosing?: () => void;
+		}
 	) {
 		super();
 		this.socket = socket;
+		this.onClosing = opts?.onClosing;
 		this.parser = new WsFrameParser({
 			maxPayloadBytes:
 				opts?.maxFramePayloadBytes ?? DEFAULT_MAX_WS_PAYLOAD_BYTES,
@@ -148,6 +156,9 @@ export class WebSocketServerTransport
 	// ── Internal ─────────────────────────────────────────────────
 
 	private handleRawData(chunk: Buffer): void {
+		// Nothing arriving while we close is delivered, so none of it is
+		// parsed or buffered while the socket lingers.
+		if (this.closing) return;
 		let frames: IWsFrame[];
 		try {
 			frames = this.parser.push(chunk);
@@ -160,7 +171,7 @@ export class WebSocketServerTransport
 			return;
 		}
 		for (const frame of frames) {
-			if (!this.handleFrame(frame)) return; // connection torn down
+			if (this.closing || !this.handleFrame(frame)) return; // torn down
 		}
 	}
 
@@ -242,8 +253,10 @@ export class WebSocketServerTransport
 	 * then hard-destroy shortly after in case the peer never closes its side.
 	 */
 	private teardown(): void {
-		if (this.socket.destroyed) return;
+		if (this.socket.destroyed || this.closing) return;
+		this.closing = true;
 		this.socket.end();
+		this.onClosing?.();
 		const timer = setTimeout(() => this.socket.destroy(), 1000);
 		if (timer.unref) timer.unref();
 	}
@@ -272,9 +285,16 @@ export interface IWebSocketServerOptions {
 	path?: string;
 	/** Per-frame payload sanity cap in bytes (default 16 MiB). */
 	maxFramePayloadBytes?: number;
-	/** Accepted connections still waiting to upgrade, all addresses
-	 *  together; sockets past it are destroyed on accept (default 50). */
+	/** Accepted connections still waiting to upgrade, or upgraded and now
+	 *  closing, all addresses together; sockets past it are destroyed on
+	 *  accept (default 50). */
 	maxPendingUpgrades?: number;
+	/** The same, from one source address (default: no limit). */
+	maxPendingUpgradesPerAddress?: number;
+	/** The key a source address counts under for
+	 *  maxPendingUpgradesPerAddress, or null to leave it unlimited (default:
+	 *  the address itself). */
+	upgradeAddressKey?: (address: string | undefined) => string | null;
 	/** Hard deadline in ms for a connection to complete its upgrade
 	 *  (default 10000). */
 	upgradeTimeoutMs?: number;
@@ -293,21 +313,29 @@ export class WebSocketServer extends EventEmitter {
 	private options: IWebSocketServerOptions;
 	private listeningFlag = false;
 	/**
-	 * Sockets accepted but not yet upgraded, with their deadline. The HTTP
-	 * phase sits in front of the peer manager's own admission, so without
-	 * this a flood of silent connections would be held here unbounded for
-	 * the HTTP server's much longer header timeout.
+	 * Sockets accepted but not yet upgraded, with their address key and
+	 * deadline. The HTTP phase sits in front of the peer manager's own
+	 * admission, so without this a flood of silent connections would be held
+	 * here unbounded for the HTTP server's much longer header timeout. An
+	 * upgraded socket we close returns here until it is gone: it lingers so
+	 * the client can read our close frame, and the peer manager no longer
+	 * counts it.
 	 */
 	private pendingUpgrades = new Map<
 		net.Socket,
-		ReturnType<typeof setTimeout>
+		{ key: string | null; deadline?: ReturnType<typeof setTimeout> }
 	>();
+	private addressKey: (address: string | undefined) => string | null;
 
 	constructor(options?: IWebSocketServerOptions) {
 		super();
 		this.options = options ?? {};
 		const maxPendingUpgrades = this.options.maxPendingUpgrades ?? 50;
+		const maxPerAddress = this.options.maxPendingUpgradesPerAddress ?? Infinity;
 		const upgradeTimeoutMs = this.options.upgradeTimeoutMs ?? 10_000;
+		this.addressKey =
+			this.options.upgradeAddressKey ??
+			((address): string | null => address ?? null);
 		this.httpServer = http.createServer((req, res) => {
 			// Plain HTTP requests are not part of the peer protocol
 			res.writeHead(426, {
@@ -318,14 +346,22 @@ export class WebSocketServer extends EventEmitter {
 			res.end('Upgrade Required');
 		});
 		this.httpServer.on('connection', (socket: net.Socket) => {
-			if (this.pendingUpgrades.size >= maxPendingUpgrades) {
+			const key = this.addressKey(socket.remoteAddress);
+			let fromAddress = 0;
+			for (const pending of this.pendingUpgrades.values()) {
+				if (key !== null && pending.key === key) fromAddress++;
+			}
+			if (
+				this.pendingUpgrades.size >= maxPendingUpgrades ||
+				fromAddress >= maxPerAddress
+			) {
 				socket.destroy();
 				return;
 			}
-			this.pendingUpgrades.set(
-				socket,
-				setTimeout(() => socket.destroy(), upgradeTimeoutMs)
-			);
+			this.pendingUpgrades.set(socket, {
+				key,
+				deadline: setTimeout(() => socket.destroy(), upgradeTimeoutMs)
+			});
 			socket.once('close', () => this.settleUpgrade(socket));
 		});
 		this.httpServer.on(
@@ -367,9 +403,9 @@ export class WebSocketServer extends EventEmitter {
 	}
 
 	private settleUpgrade(socket: net.Socket): void {
-		const deadline = this.pendingUpgrades.get(socket);
-		if (deadline === undefined) return;
-		clearTimeout(deadline);
+		const pending = this.pendingUpgrades.get(socket);
+		if (pending === undefined) return;
+		clearTimeout(pending.deadline);
 		this.pendingUpgrades.delete(socket);
 	}
 
@@ -420,7 +456,11 @@ export class WebSocketServer extends EventEmitter {
 
 		const transport = new WebSocketServerTransport(socket, {
 			maxFramePayloadBytes: this.options.maxFramePayloadBytes,
-			initialData: head
+			initialData: head,
+			onClosing: () =>
+				this.pendingUpgrades.set(socket, {
+					key: this.addressKey(socket.remoteAddress)
+				})
 		});
 		this.emit('connection', transport, req);
 	}
