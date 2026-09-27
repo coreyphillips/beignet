@@ -94,7 +94,7 @@ export class Transaction {
 	 * Outputs come only from the outputs argument. The copy of the staged send
 	 * that wallet storage holds is never read, so a restart cannot replay an
 	 * earlier call's recipients (#1002).
-	 * @param {string[]} [inputTxHashes]
+	 * @param {string[]} [inputTxHashes] Errs when none of them has a spendable UTXO.
 	 * @param {IUtxo[]} [utxos]
 	 * @param {boolean} [rbf]
 	 * @param {number} [satsPerByte]
@@ -128,6 +128,16 @@ export class Transaction {
 						return inputTxHashes.includes(utxo.tx_hash);
 					})
 				);
+				// The fallback below would spend every coin in the wallet instead.
+				// For a CPFP that is a full-wallet self-send at the boost rate,
+				// which need not even descend from the parent (#1026).
+				if (!inputs.length) {
+					return err(
+						`No spendable UTXOs found for the requested transactions: ${inputTxHashes.join(
+							', '
+						)}.`
+					);
+				}
 			} else if (utxos) {
 				inputs = utxos;
 			} else {
