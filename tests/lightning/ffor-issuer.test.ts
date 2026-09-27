@@ -16,6 +16,7 @@ import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig, PaymentStatus } from '../../src/lightning/node/types';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
+import { BITCOIN_CHAIN_HASH } from '../../src/lightning/channel/types';
 import { IOffer, IBolt12Invoice } from '../../src/lightning/offer/types';
 import {
 	encodeInvoiceTlv,
@@ -434,6 +435,41 @@ describe('FFOR BOLT 12 issuer (M9.5, section 9.7)', function () {
 			refused = err as Error;
 		}
 		expect(refused?.message).to.include(FF_ISSUER_REFUSAL);
+		w.wStorage.close();
+	});
+
+	it('a request that breaks the offer terms gets no slot, even one of its exact amount (issue #1096)', async () => {
+		const w = createIssuerWorld();
+		const { offer, mailboxId } = await setup(w, [G, 2n * G, 3n * G], G, 3n);
+		const om = w.p.getOfferManager();
+		const refusal = async (
+			opts: Parameters<typeof om.requestInvoice>[1]
+		): Promise<string | undefined> => {
+			try {
+				await om.requestInvoice(offer, opts);
+			} catch (err) {
+				return (err as Error).message;
+			}
+			return undefined;
+		};
+		// Each of these names the amount of a slot the book holds.
+		expect(await refusal({ quantity: 3n, amount: G })).to.include(
+			'Amount below the offer price'
+		);
+		expect(await refusal({ quantity: 4n, amount: 3n * G })).to.include(
+			'Invalid quantity'
+		);
+		expect(
+			await refusal({ quantity: 1n, chain: BITCOIN_CHAIN_HASH })
+		).to.include('Wrong chain');
+		expect(
+			w.w.getFforIssuerService()!.issuedSlots(mailboxId.toString('hex'))
+		).to.deep.equal([]);
+		// A request that pays the offer still gets its exact slot.
+		const three = await om.requestInvoice(offer, { quantity: 3n });
+		expect(three.amount).to.equal(3n * G);
+		expect(three.paymentHash.equals(record(w.s, w.srHex).paymentHashes[2])).to
+			.be.true;
 		w.wStorage.close();
 	});
 
