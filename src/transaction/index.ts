@@ -932,7 +932,7 @@ export class Transaction {
 				inputs: transactionData.inputs
 			});
 			if (metadataRes.isErr()) return err(metadataRes.error.message);
-			const changeRes = this.addChangeOutputMetadata(psbt);
+			const changeRes = await this.addChangeOutputMetadata(psbt);
 			if (changeRes.isErr()) return err(changeRes.error.message);
 			return ok(psbt);
 		} catch (e) {
@@ -947,10 +947,10 @@ export class Transaction {
 	 * payment, so without this the change looks like a second recipient and
 	 * a change output rewritten in transit looks no different.
 	 * @param {Psbt} psbt
-	 * @returns {Result<string>}
+	 * @returns {Promise<Result<string>>}
 	 * @private
 	 */
-	private addChangeOutputMetadata(psbt: Psbt): Result<string> {
+	private async addChangeOutputMetadata(psbt: Psbt): Promise<Result<string>> {
 		try {
 			const { changeAddresses, changeAddressIndex } = this._wallet.data;
 			const changePaths = new Map<string, string>();
@@ -962,6 +962,11 @@ export class Transaction {
 			for (const { address, path } of Object.values(changeAddressIndex)) {
 				if (address && path) changePaths.set(address, path);
 			}
+			// A wallet that has not set its change index yet gets its change
+			// address generated on the fly, and neither map above holds it.
+			const fallbackRes = await this._wallet.getChangeAddress();
+			if (fallbackRes.isErr()) return err(fallbackRes.error.message);
+			changePaths.set(fallbackRes.value.address, fallbackRes.value.path);
 			const network = getBitcoinJsNetwork(this._wallet.network);
 			const masterFingerprint = this._wallet.getMasterFingerprint();
 			psbt.txOutputs.forEach((output, index) => {

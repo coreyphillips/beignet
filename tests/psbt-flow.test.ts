@@ -30,6 +30,7 @@ import {
 	validatePsbtSignature,
 	Wallet
 } from '../src';
+import { getDefaultSendTransaction } from '../src/shapes/wallet';
 import { startDaemon } from '../src/cli/daemon';
 import { BeignetNode } from '../src/cli/beignet-node';
 import { BeignetError } from '../src/cli/errors';
@@ -306,6 +307,34 @@ describe('External-Signer PSBT Flow', function () {
 			expect(
 				p2wpkh.output!.equals(psbt.txOutputs[changeIndex].script)
 			).to.equal(true);
+		});
+
+		it('marks the change output generated for a wallet with no change index yet', async () => {
+			const res = await Wallet.create({
+				mnemonic: MNEMONIC,
+				network,
+				addressType: EAddressType.p2wpkh,
+				electrumOptions,
+				disableRefreshOnCreate: true
+			});
+			if (res.isErr()) throw res.error;
+			const freshWallet = res.value;
+			createdWallets.push(freshWallet);
+			expect(freshWallet.data.changeAddressIndex.p2wpkh.address).to.equal('');
+			const psbtRes = await freshWallet.transaction.createUnsignedPsbt({
+				transactionData: {
+					...getDefaultSendTransaction(),
+					inputs: [await makeUtxo(freshWallet, { index: 0, value: 60000 })],
+					outputs: [{ address: RECIPIENT, value: 20000, index: 0 }],
+					fee: 500
+				},
+				shuffleOutputs: false
+			});
+			if (psbtRes.isErr()) throw psbtRes.error;
+			const psbt = psbtRes.value;
+			const derivation = psbt.data.outputs[changeIndexOf(psbt)].bip32Derivation;
+			expect(derivation).to.have.length(1);
+			expect(derivation![0].path).to.equal("m/84'/1'/0'/1/0");
 		});
 
 		it('includes redeemScript for p2sh-p2wpkh inputs', async () => {
