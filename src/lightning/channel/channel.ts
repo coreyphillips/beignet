@@ -4402,9 +4402,35 @@ export class Channel {
 	}
 
 	/**
+	 * Cache the peer's latest signed commitment if a restored row has no entry
+	 * for it. Rows written before the cache was persisted have none, and the
+	 * revoke_and_ack that retires that commitment would go without a backup.
+	 * The tx is rebuilt from the row, which describes the signed commitment
+	 * only while no update is pending, so a row that owes a signature is left
+	 * alone.
+	 */
+	repairWatchtowerCommitmentCache(): void {
+		if (this._state.needsCommitment) return;
+		const point = this.isAwaitingRemoteRevocation()
+			? this._state.remoteNextPerCommitmentPoint
+			: this._state.remoteCurrentPerCommitmentPoint;
+		if (
+			!point ||
+			this._state.watchtowerRemoteCommitmentTxs?.has(point.toString('hex'))
+		) {
+			return;
+		}
+		this._cacheRemoteCommitmentForWatchtower(
+			point,
+			this._state.remoteCommitmentNumber
+		);
+	}
+
+	/**
 	 * Given a per-commitment secret the peer just revealed, return (and forget)
 	 * the revoked remote commitment tx we cached for that state, or null if we
-	 * never cached it (a channel opened before the cache was persisted).
+	 * never cached it (an older row restored with a commitment in flight or an
+	 * update pending).
 	 */
 	takeRevokedCommitmentTx(perCommitmentSecret: Buffer): Buffer | null {
 		const pointHex =

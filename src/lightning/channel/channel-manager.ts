@@ -2620,6 +2620,8 @@ export class ChannelManager extends EventEmitter {
 					channel.getFullState().v2InFlight != null)
 			) {
 				this._rollbackForReestablish(channel);
+				// After the rollback, which can drop the only pending update.
+				channel.repairWatchtowerCommitmentCache();
 			}
 			this.channels.set(channelId.toString('hex'), channel);
 			this.channelPeers.set(channelId.toString('hex'), peerPubkey);

@@ -1334,6 +1334,29 @@ describe('watchtower hand-off on revoke_and_ack (#1029)', function () {
 		alice.destroy();
 		bob.destroy();
 	});
+
+	it('restoring a row written before the cache persisted rebuilds the entry the next revoke needs', function () {
+		const alice = createNode('wt-legacy-row', 1);
+		const bob = createNode('wt-legacy-row', 2);
+		connectNodes(alice, bob);
+		const channelId = openReadyChannel(alice, bob);
+		const bobCm = bob.getChannelManager();
+		const state = bobCm.getChannel(channelId)!.getFullState();
+		const point0 = state.remoteCurrentPerCommitmentPoint!.toString('hex');
+		const cachedAtFunding = state.watchtowerRemoteCommitmentTxs!.get(point0);
+		expect(cachedAtFunding, 'cached when #0 was signed').to.not.be.undefined;
+
+		const row = JSON.parse(JSON.stringify(serializeChannelState(state)));
+		delete row.watchtowerRemoteCommitmentTxs;
+		const restored = new Channel(deserializeChannelState(row));
+		bobCm.restoreChannel(restored, alice.getNodeId());
+
+		expect(
+			restored.getFullState().watchtowerRemoteCommitmentTxs?.get(point0)
+		).to.deep.equal(cachedAtFunding);
+		alice.destroy();
+		bob.destroy();
+	});
 });
 
 describe('watchtower config gating', function () {
