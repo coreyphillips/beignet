@@ -561,6 +561,7 @@ export class ChainMonitor {
 		const actions: ChainAction[] = [];
 		this._retryUnsweptRevokedSweeps(actions);
 		this._retryUnsweptPeerCommitmentClaims(actions, true);
+		this._retryUnsweptOurCommitmentSweeps(actions);
 		return actions;
 	}
 
@@ -1043,6 +1044,7 @@ export class ChainMonitor {
 		// passes.
 		this._retryUnsweptRevokedSweeps(actions);
 		this._retryUnsweptPeerCommitmentClaims(actions);
+		this._retryUnsweptOurCommitmentSweeps(actions);
 
 		// A retry can adopt a snapshot-reconstructed output after the scan above.
 		// Recompute from the current tracked set so a new in-flight claim cannot be
@@ -1213,6 +1215,9 @@ export class ChainMonitor {
 							r,
 							'second-level HTLC sweep (CSV delayed)'
 						);
+						if (r.declinedAsUneconomic) {
+							this._reportDeclinedClaims(actions, [r.trackedOutput]);
+						}
 					}
 				}
 			}
@@ -2227,6 +2232,11 @@ export class ChainMonitor {
 			}
 		}
 
+		this._reportDeclinedClaims(
+			actions,
+			resolved.filter((r) => r.declinedAsUneconomic).map((r) => r.trackedOutput)
+		);
+
 		return actions;
 	}
 
@@ -3005,6 +3015,14 @@ export class ChainMonitor {
 	private _contestHeight(output: ITrackedOutput): number | undefined {
 		switch (output.outputType) {
 			case OutputType.TO_LOCAL: {
+				// Only a revocation spend contests a to_local, and the peer never
+				// learns the secret for our own unrevoked commitment.
+				if (
+					this._commitmentBroadcast?.commitmentType ===
+					CommitmentType.OUR_COMMITMENT
+				) {
+					return undefined;
+				}
 				// A relative delay needs the height it counts from. A mempool-first
 				// sighting has none yet, and treating that as 0 would name a height
 				// already behind the tip and report a race that has not started.
@@ -3386,6 +3404,66 @@ export class ChainMonitor {
 					? 'HTLC-timeout claim (retried after skip)'
 					: 'HTLC preimage claim (retried after skip)';
 			this._scheduleSweep(actions, entry, description);
+		}
+		this._reportDeclinedClaims(
+			actions,
+			resolved
+				.filter((entry) => entry.declinedAsUneconomic)
+				.map((entry) => entry.trackedOutput)
+		);
+	}
+
+	/**
+	 * Retry to_local sweeps on our own commitment that were declined as
+	 * uneconomic, including the CSV outputs of our second-level HTLC txs.
+	 *
+	 * Only a to_local is priced by the sweep feerate here: our HTLC-success and
+	 * HTLC-timeout carry the fee the peer signed, so they are never declined.
+	 * Nobody else can spend these outputs, so the retry has no deadline and runs
+	 * until the sweep is built.
+	 */
+	private _retryUnsweptOurCommitmentSweeps(actions: ChainAction[]): void {
+		const broadcast = this._commitmentBroadcast;
+		if (
+			!broadcast ||
+			broadcast.commitmentType !== CommitmentType.OUR_COMMITMENT
+		) {
+			return;
+		}
+
+		const retryable = this._trackedOutputs.filter(
+			(output) =>
+				output.status === OutputStatus.CONFIRMED &&
+				output.sweepTxHex === undefined &&
+				output.outputType === OutputType.TO_LOCAL
+		);
+		if (retryable.length === 0) return;
+
+		let resolved: ReturnType<typeof resolveOurCommitmentOutputs>;
+		try {
+			resolved = resolveOurCommitmentOutputs(
+				this._channelState,
+				retryable,
+				broadcast.commitmentNumber,
+				this._destinationScript,
+				this._feeRatePerVbyte,
+				this._knownPreimages,
+				this._delayedPaymentBasepointSecret,
+				this._htlcBasepointSecret,
+				this._channelState.remoteHtlcSignatures
+			);
+		} catch {
+			// A malformed retained output must not abort block or fee processing.
+			return;
+		}
+
+		for (const entry of resolved) {
+			if (!entry.spendTx) continue;
+			this._scheduleSweep(
+				actions,
+				entry,
+				'to_local sweep (retried after skip)'
+			);
 		}
 		this._reportDeclinedClaims(
 			actions,
