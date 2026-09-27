@@ -151,12 +151,20 @@ describe('Issue #177: forwarding failures carry their BOLT 4 data', function () 
 			0n,
 			crypto.randomBytes(32),
 			{
-				hopPayload: {
-					amountToForwardMsat: forwardAmountMsat,
-					outgoingCltvValue: forwardCltv,
-					shortChannelId: outgoingScid,
-					...(blinded ?? {})
-				},
+				// A blinded intermediate payload carries no cleartext forwarding
+				// fields (BOLT 4), which is how the decoder reports it.
+				hopPayload: blinded
+					? {
+							amountToForwardMsat: 0n,
+							outgoingCltvValue: 0,
+							omitForwardAmounts: true,
+							...blinded
+					  }
+					: {
+							amountToForwardMsat: forwardAmountMsat,
+							outgoingCltvValue: forwardCltv,
+							shortChannelId: outgoingScid
+					  },
 				nextPacket: {
 					version: 0,
 					ephemeralKey: crypto.randomBytes(33),

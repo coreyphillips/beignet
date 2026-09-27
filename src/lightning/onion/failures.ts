@@ -21,6 +21,7 @@ import {
 	INVALID_ONION_VERSION,
 	INVALID_ONION_HMAC,
 	INVALID_ONION_KEY,
+	INVALID_ONION_PAYLOAD,
 	AMOUNT_BELOW_MINIMUM,
 	FEE_INSUFFICIENT,
 	INCORRECT_CLTV_EXPIRY,
@@ -115,6 +116,8 @@ export function wrapFailureMessage(
 /**
  * Decrypt a failure message by trying each shared secret.
  * Returns the originating hop index and decoded failure, or null if invalid.
+ * A failure whose HMAC matches but whose failure_len cannot hold a code is
+ * still that hop's, and comes back with failureCode 0 (no BOLT 4 code).
  */
 export function decryptFailureMessage(
 	sharedSecrets: Buffer[],
@@ -140,7 +143,13 @@ export function decryptFailureMessage(
 
 		if (hmac.equals(expectedHmac)) {
 			// Valid! Decode failure
-			const len = lenAndPad.readUInt16BE(0);
+			const len = lenAndPad.length >= 2 ? lenAndPad.readUInt16BE(0) : 0;
+			if (len < 2 || 2 + len > lenAndPad.length) {
+				return {
+					originIndex: i,
+					failure: { failureCode: 0, failureData: Buffer.alloc(0) }
+				};
+			}
 			const payload = lenAndPad.subarray(2, 2 + len);
 			const failureCode = payload.readUInt16BE(0);
 			const failureData = Buffer.from(payload.subarray(2));
@@ -237,6 +246,10 @@ export function decodeFailureCode(code: number): {
 			hasChannelUpdate: false
 		},
 		[INVALID_ONION_KEY]: { name: 'invalid_onion_key', hasChannelUpdate: false },
+		[INVALID_ONION_PAYLOAD]: {
+			name: 'invalid_onion_payload',
+			hasChannelUpdate: false
+		},
 		[AMOUNT_BELOW_MINIMUM]: {
 			name: 'amount_below_minimum',
 			hasChannelUpdate: true

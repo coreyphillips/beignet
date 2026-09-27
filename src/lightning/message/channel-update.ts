@@ -31,6 +31,8 @@
  *   [4: feerate_per_kw]
  */
 
+import { isValidPublicKey } from '../crypto/ecdh';
+
 export interface IUpdateAddHtlcMessage {
 	channelId: Buffer;
 	id: bigint;
@@ -159,6 +161,9 @@ export function decodeUpdateAddHtlcMessage(
 			blindingPoint = Buffer.from(
 				payload.subarray(offset + 2, offset + 2 + 33)
 			);
+			if (!isValidPublicKey(blindingPoint)) {
+				throw new Error('update_add_htlc blinding_point is not a valid point');
+			}
 		}
 	}
 

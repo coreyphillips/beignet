@@ -139,7 +139,11 @@ import {
 	encodeOnionPacket,
 	decodeOnionPacket
 } from '../onion/construct';
-import { processOnionPacket, isFinalHop } from '../onion/process';
+import {
+	processOnionPacket,
+	isFinalHop,
+	OnionProcessingError
+} from '../onion/process';
 import { computeSharedSecrets } from '../onion/sphinx-crypto';
 import {
 	createFailureMessage,
@@ -156,6 +160,7 @@ import {
 	FINAL_INCORRECT_HTLC_AMOUNT,
 	INVALID_ONION_HMAC,
 	INVALID_ONION_BLINDING,
+	INVALID_ONION_PAYLOAD,
 	PERMANENT_CHANNEL_FAILURE,
 	UNKNOWN_NEXT_PEER,
 	REQUIRED_CHANNEL_FEATURE_MISSING,
@@ -17083,19 +17088,20 @@ export class LightningNode extends EventEmitter {
 
 		const onionBuf = htlcEntry.onionRoutingPacket;
 
-		// Route blinding: if this HTLC arrived with a blinding_point (we are a
-		// downstream blinded hop, not the introduction node), the sender encrypted
-		// our onion layer to our blinded node id, so we must peel it with the
-		// matching blinded private key. The introduction node has no message-level
-		// blinding_point (it receives it inside the onion as TLV 12) and so keeps
-		// using its real key.
-		const onionPrivkey = htlcEntry.blindingPoint
-			? deriveBlindedPrivkey(htlcEntry.blindingPoint, this.nodePrivkey)
-			: this.nodePrivkey;
-
 		let onionPacket;
 		let processed;
 		try {
+			// Route blinding: if this HTLC arrived with a blinding_point (we are a
+			// downstream blinded hop, not the introduction node), the sender
+			// encrypted our onion layer to our blinded node id, so we must peel it
+			// with the matching blinded private key. The introduction node has no
+			// message-level blinding_point (it receives it inside the onion as TLV
+			// 12) and so keeps using its real key. Inside the try: a blinding
+			// point that is not a curve point must fail this HTLC, not throw out
+			// of the batch that dispatches its siblings.
+			const onionPrivkey = htlcEntry.blindingPoint
+				? deriveBlindedPrivkey(htlcEntry.blindingPoint, this.nodePrivkey)
+				: this.nodePrivkey;
 			onionPacket = decodeOnionPacket(onionBuf);
 			processed = processOnionPacket(onionPacket, onionPrivkey, paymentHash);
 		} catch (err) {
@@ -17120,12 +17126,30 @@ export class LightningNode extends EventEmitter {
 				);
 				return;
 			}
-			// BOLT 4: INVALID_ONION_HMAC — we can't decrypt, so use a zero shared secret
-			// (the sender will not be able to decrypt this, but it's the best we can do)
-			this.channelManager.failHtlc(
+			// BOLT 4: a sound onion whose payload is invalid is answered under the
+			// sender's shared secret (invalid_onion_payload). Every other failure
+			// is a BADONION code with no secret to encrypt under, which only
+			// update_fail_malformed_htlc can carry; the upstream hop turns it
+			// into a failure the sender can read.
+			if (err instanceof OnionProcessingError && err.sharedSecret) {
+				this.channelManager.failHtlc(
+					channelId,
+					htlcId,
+					createFailureMessage(
+						err.sharedSecret,
+						err.failureCode,
+						err.failureData
+					)
+				);
+				return;
+			}
+			this.channelManager.failMalformedHtlc(
 				channelId,
 				htlcId,
-				createFailureMessage(Buffer.alloc(32), INVALID_ONION_HMAC)
+				crypto.createHash('sha256').update(onionBuf).digest(),
+				err instanceof OnionProcessingError
+					? err.failureCode
+					: INVALID_ONION_HMAC
 			);
 			return;
 		}
@@ -21428,9 +21452,19 @@ export class LightningNode extends EventEmitter {
 		let blindedOutAmount: bigint | undefined;
 		let blindedOutCltv: number | undefined;
 		let blindedMaxCltv: number | undefined;
+		let blindedMinMsat: bigint | undefined;
+		// BOLT 4: a blinded intermediate payload carries only
+		// encrypted_recipient_data and current_path_key; the forwarding terms
+		// come from the encrypted payment_relay, never from cleartext.
+		let blindedCleartextFields = false;
 		const effectiveBlindingPoint =
 			hopPayload.blindingPoint ?? incomingBlindingPoint;
 		if (effectiveBlindingPoint && hopPayload.encryptedRecipientData) {
+			blindedCleartextFields =
+				hopPayload.omitForwardAmounts !== true ||
+				hopPayload.shortChannelId !== undefined ||
+				hopPayload.paymentSecret !== undefined ||
+				hopPayload.totalAmountMsat !== undefined;
 			try {
 				const { hopData, nextBlindingKey } = processBlindedHop(
 					effectiveBlindingPoint,
@@ -21457,6 +21491,7 @@ export class LightningNode extends EventEmitter {
 					blindedOutCltv = incomingCltvExpiry - relay.cltvExpiryDelta;
 				}
 				blindedMaxCltv = hopData.paymentConstraints?.maxCltvExpiry;
+				blindedMinMsat = hopData.paymentConstraints?.htlcMinimumMsat;
 			} catch {
 				outgoingScid = undefined;
 			}
@@ -21515,6 +21550,16 @@ export class LightningNode extends EventEmitter {
 			this.cleanupHtlcSharedSecret(inHtlcSecretKey);
 			return true;
 		};
+
+		if (blindedCleartextFields) {
+			this.emitStructuredLog('htlc', 'blinded_payload_cleartext_fields', {
+				paymentHash: paymentHash.toString('hex'),
+				inChannelId: inChannelId.toString('hex'),
+				inHtlcId: Number(inHtlcId)
+			});
+			failIncoming(INVALID_ONION_PAYLOAD);
+			return;
+		}
 
 		// Forwarding opt-out: a node that does not want to be a routing hop
 		// declines every forward up front, before any onward lookup or policy
@@ -21653,6 +21698,11 @@ export class LightningNode extends EventEmitter {
 				failIncoming(INCORRECT_CLTV_EXPIRY, {
 					cltvExpiry: forwardCltv
 				});
+				return;
+			}
+			// BOLT 4 payment_constraints: the incoming amount, not the forwarded one.
+			if (blindedMinMsat !== undefined && incomingAmountMsat < blindedMinMsat) {
+				failIncoming(AMOUNT_BELOW_MINIMUM, { htlcMsat: incomingAmountMsat });
 				return;
 			}
 			// Fee enforcement: the relay fee the receiver wrote into the path must
@@ -23193,6 +23243,53 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
+	/**
+	 * The BADONION code of an update_fail_malformed_htlc, which the channel
+	 * layer surfaces as the synthetic reason [failure_code][0x0000]; undefined
+	 * for any other reason.
+	 */
+	private static malformedFailureCode(reason: Buffer): number | undefined {
+		if (
+			reason.length === 4 &&
+			(reason.readUInt16BE(0) & 0x8000) !== 0 &&
+			reason.readUInt16BE(2) === 0
+		) {
+			return reason.readUInt16BE(0);
+		}
+		return undefined;
+	}
+
+	/**
+	 * BOLT 2: a forward failed downstream by update_fail_malformed_htlc is
+	 * failed upstream with a failure WE originate, carrying the downstream's
+	 * code and the sha256 of the onion we forwarded. The synthetic 4-byte
+	 * reason is not an onion failure: wrapped, it reaches the sender as bytes
+	 * no hop's key decrypts, and an unreadable failure penalises every hop on
+	 * the route. Undefined for any other reason, or when the inbound shared
+	 * secret is gone (the reason then relays as before).
+	 */
+	private originateMalformedForwardFailure(
+		outChannelId: Buffer,
+		outHtlcId: bigint,
+		forward: { inChannelId: Buffer; inHtlcId: bigint },
+		reason: Buffer
+	): Buffer | undefined {
+		const code = LightningNode.malformedFailureCode(reason);
+		if (code === undefined) return undefined;
+		const sharedSecret = this.receivedHtlcSharedSecrets.get(
+			`${forward.inChannelId.toString('hex')}:${forward.inHtlcId}`
+		);
+		if (!sharedSecret) return undefined;
+		const onion = this.channelManager
+			.getChannel(outChannelId)
+			?.getFullState()
+			.htlcs.get(`offered-${outHtlcId}`)?.onionRoutingPacket;
+		const sha256OfOnion = onion
+			? crypto.createHash('sha256').update(onion).digest()
+			: Buffer.alloc(32);
+		return createFailureMessage(sharedSecret, code, sha256OfOnion);
+	}
+
 	private handleHtlcFailed(
 		channelId: Buffer,
 		htlcId: bigint,
@@ -23224,13 +23321,25 @@ export class LightningNode extends EventEmitter {
 			// settleForwardsOwedUpstream retries it, and a downstream that
 			// never finishes the round is force-closed out by
 			// scanForwardTimeouts at the forward-timeout margin.
+			const originated =
+				localFailureReason === undefined
+					? this.originateMalformedForwardFailure(
+							channelId,
+							htlcId,
+							forward,
+							reason
+					  )
+					: undefined;
+			const upstreamReason = originated ?? reason;
+			const preWrapped =
+				originated !== undefined || localFailureReason !== undefined;
 			const inboundHash = this.forwardPaymentHash(forward);
 			if (
 				inboundHash &&
 				!this.isOutgoingLegTerminallyFailed(outKey, inboundHash)
 			) {
-				forward.failReason = reason;
-				forward.failPreWrapped = localFailureReason !== undefined;
+				forward.failReason = upstreamReason;
+				forward.failPreWrapped = preWrapped;
 				this.emitStructuredLog('htlc', 'forward_fail_deferred', {
 					inChannelId: forward.inChannelId.toString('hex'),
 					inHtlcId: Number(forward.inHtlcId),
@@ -23244,8 +23353,8 @@ export class LightningNode extends EventEmitter {
 				forward,
 				channelId,
 				htlcId,
-				reason,
-				localFailureReason !== undefined
+				upstreamReason,
+				preWrapped
 			);
 			return;
 		}
@@ -23363,12 +23472,9 @@ export class LightningNode extends EventEmitter {
 		// compliant blinded peer's invalid_onion_blinding was unreadable, the
 		// broken path was never excluded, and the retry hammered it while a
 		// working path sat unused (issue #550 review).
-		if (
-			reason.length === 4 &&
-			(reason.readUInt16BE(0) & 0x8000) !== 0 &&
-			reason.readUInt16BE(2) === 0
-		) {
-			payment.failureCode = reason.readUInt16BE(0);
+		const malformedCode = LightningNode.malformedFailureCode(reason);
+		if (malformedCode !== undefined) {
+			payment.failureCode = malformedCode;
 			payment.failureSourceIndex = 0;
 		} else if (failureSecrets && reason.length > 0) {
 			const result = decryptFailureMessage(failureSecrets, reason);

@@ -9328,13 +9328,26 @@ export class ChannelManager extends EventEmitter {
 					break;
 				}
 				case ChannelActionType.HTLC_FORWARDED:
-					this.emit(
-						'htlc:forwarded',
-						channel.getChannelId(),
-						action.htlcId,
-						action.amountMsat,
-						action.paymentHash
-					);
+					// Contained per HTLC: the event is edge-triggered and not
+					// re-emitted until a restart, so a throw here would strand
+					// every later HTLC in the batch until its CLTV backstop.
+					try {
+						this.emit(
+							'htlc:forwarded',
+							channel.getChannelId(),
+							action.htlcId,
+							action.amountMsat,
+							action.paymentHash
+						);
+					} catch (err) {
+						this.emitContained(
+							'error',
+							channel.getChannelId(),
+							`htlc:forwarded handler threw for HTLC ${action.htlcId}: ${
+								err instanceof Error ? err.message : String(err)
+							}`
+						);
+					}
 					break;
 				case ChannelActionType.HTLC_FULFILLED:
 					this.emit(

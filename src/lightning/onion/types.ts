@@ -29,6 +29,8 @@ export interface IHopPayload {
 	 * Encode hint (BOLT 4): omit amt_to_forward/outgoing_cltv_value. Set for a
 	 * blinded INTERMEDIATE hop, whose payload carries only encrypted_recipient_data
 	 * (+ intro blinding_point); it derives amounts from its encrypted payment_relay.
+	 * The decoder sets it when the payload carried neither, since the two
+	 * amount fields read 0 either way.
 	 */
 	omitForwardAmounts?: boolean;
 }
@@ -92,6 +94,8 @@ export const INVALID_ONION_KEY = 0x8000 | 6;
  * portion (BADONION | PERM | 24, failure data = sha256 of the onion).
  */
 export const INVALID_ONION_BLINDING = 0x8000 | 0x4000 | 24;
+/** BOLT 4 PERM|22, data [bigsize type][u16 offset] of the offending TLV. */
+export const INVALID_ONION_PAYLOAD = 0x4000 | 22;
 export const AMOUNT_BELOW_MINIMUM = 0x1000 | 11;
 export const FEE_INSUFFICIENT = 0x1000 | 12;
 export const INCORRECT_CLTV_EXPIRY = 0x1000 | 13;
