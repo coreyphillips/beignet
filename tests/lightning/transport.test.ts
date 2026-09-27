@@ -587,4 +587,44 @@ describe('Lightning Transport (BOLT 8)', function () {
 			expect(() => transport.encryptPacket(oversizedPayload)).to.throw();
 		});
 	});
+
+	describe('Gossip write backpressure (issue #969)', function () {
+		it('drops broadcast gossip but never the sync end markers', function () {
+			const { Peer } = require('../../src/lightning/transport/peer');
+			const { MessageType } = require('../../src/lightning/message/types');
+			const peer = new Peer({
+				localPrivateKey: crypto.randomBytes(32),
+				remotePublicKey: getPublicKey(crypto.randomBytes(32)),
+				host: '127.0.0.1',
+				port: 9735
+			});
+			const written: number[] = [];
+			// A ready connection whose write buffer is past the 4 MB cap.
+			Object.assign(peer, {
+				state: 'ready',
+				transport: { encryptPacket: (message: Buffer): Buffer => message },
+				socket: {
+					writableLength: 5 * 1024 * 1024,
+					write: (data: Buffer): boolean => {
+						written.push(data.readUInt16BE(0));
+						return false;
+					}
+				}
+			});
+
+			peer.sendMessage(MessageType.CHANNEL_ANNOUNCEMENT, Buffer.alloc(8));
+			peer.sendMessage(MessageType.CHANNEL_UPDATE, Buffer.alloc(8));
+			peer.sendMessage(MessageType.NODE_ANNOUNCEMENT, Buffer.alloc(8));
+			peer.sendMessage(
+				MessageType.REPLY_SHORT_CHANNEL_IDS_END,
+				Buffer.alloc(8)
+			);
+			peer.sendMessage(MessageType.REPLY_CHANNEL_RANGE, Buffer.alloc(8));
+
+			expect(written).to.eql([
+				MessageType.REPLY_SHORT_CHANNEL_IDS_END,
+				MessageType.REPLY_CHANNEL_RANGE
+			]);
+		});
+	});
 });

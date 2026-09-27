@@ -40,7 +40,8 @@ import {
 } from './helpers/signed-gossip';
 import {
 	GossipSyncManager,
-	GossipSyncState
+	GossipSyncState,
+	IGossipSyncMessage
 } from '../../src/lightning/gossip/gossip-sync';
 import { MessageType } from '../../src/lightning/message/types';
 import {
@@ -734,7 +735,7 @@ describe('Gossip Sync (Phase 5)', function () {
 			const mgr = new GossipSyncManager(new NetworkGraph());
 			mgr.initiateSync();
 
-			const chunk = uniqueScids(0, 8000);
+			const chunk = uniqueScids(0, 1000);
 			for (let i = 0; i < 3; i++) {
 				mgr.handleReplyChannelRange(rangeReply(chunk, false));
 			}
@@ -744,13 +745,105 @@ describe('Gossip Sync (Phase 5)', function () {
 			expect(out.length).to.equal(1);
 			const query = decodeQueryShortChannelIdsMessage(out[0].payload);
 			expect(decodeShortChannelIds(query.encodedShortIds).length).to.equal(
-				8000
+				1000
 			);
 			// One query batch in total: the duplicates were never queued.
 			mgr.handleReplyShortChannelIdsEnd({
 				chainHash: BITCOIN_CHAIN_HASH,
 				complete: true
 			});
+			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
+		});
+	});
+
+	describe('GossipSyncManager — batch size and lost batches (issue #969)', function () {
+		const END = { chainHash: BITCOIN_CHAIN_HASH, complete: true };
+
+		function startSync(mgr: GossipSyncManager, count: number): string[] {
+			const scids: Buffer[] = [];
+			for (let i = 0; i < count; i++) {
+				scids.push(makeScid(100_000 + i, 1, 0));
+			}
+			mgr.initiateSync();
+			return queried(
+				mgr.handleReplyChannelRange({
+					chainHash: BITCOIN_CHAIN_HASH,
+					firstBlocknum: 0,
+					numberOfBlocks: 0xffffffff,
+					syncComplete: true,
+					encodedShortIds: encodeShortChannelIds(scids)
+				})
+			);
+		}
+
+		function queried(out: IGossipSyncMessage[]): string[] {
+			if (out.length === 0) return [];
+			expect(out).to.have.length(1);
+			expect(out[0].type).to.equal(MessageType.QUERY_SHORT_CHANNEL_IDS);
+			const query = decodeQueryShortChannelIdsMessage(out[0].payload);
+			return decodeShortChannelIds(query.encodedShortIds).map((s) =>
+				s.toString('hex')
+			);
+		}
+
+		it('asks for at most 1,000 SCIDs per query', function () {
+			const mgr = new GossipSyncManager(new NetworkGraph());
+			const sizes = [startSync(mgr, 2500).length];
+			for (;;) {
+				const next = queried(mgr.handleReplyShortChannelIdsEnd(END));
+				if (next.length === 0) break;
+				sizes.push(next.length);
+			}
+			expect(sizes).to.eql([1000, 1000, 500]);
+			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
+		});
+
+		it('asks for a batch again when the intake lost part of its reply', function () {
+			const mgr = new GossipSyncManager(new NetworkGraph());
+			const first = startSync(mgr, 1500);
+
+			mgr.noteIntakeLoss();
+			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql(first);
+
+			// The re-asked batch arrived whole: the sync moves on.
+			const second = queried(mgr.handleReplyShortChannelIdsEnd(END));
+			expect(second).to.have.length(500);
+			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
+			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
+		});
+
+		it('gives up on a batch after three attempts and ends IDLE, not SYNCED', function () {
+			const mgr = new GossipSyncManager(new NetworkGraph());
+			let synced = false;
+			mgr.on('synced', () => {
+				synced = true;
+			});
+			const first = startSync(mgr, 1500);
+
+			mgr.noteIntakeLoss();
+			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql(first);
+			mgr.noteIntakeLoss();
+			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql(first);
+			// Third loss: the batch is given up on, and the next one follows.
+			mgr.noteIntakeLoss();
+			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.have.length(
+				500
+			);
+
+			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
+			expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+			expect(synced).to.equal(false);
+		});
+
+		it('ignores intake loss while no batch is in flight', function () {
+			const mgr = new GossipSyncManager(new NetworkGraph());
+			expect(startSync(mgr, 10)).to.have.length(10);
+			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
+			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
+
+			// Broadcast gossip dropped after the sync is not a lost batch.
+			mgr.noteIntakeLoss();
+			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
 			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
 		});
 	});
@@ -1678,6 +1771,177 @@ describe('Gossip Sync (Phase 5)', function () {
 				initiator.destroy();
 				responder.destroy();
 			}
+		});
+
+		it('syncs more than one batch over the built-in TCP transport (issue #969)', async function () {
+			this.timeout(60_000);
+			const initiatorKey = crypto.randomBytes(32);
+			const responderKey = crypto.randomBytes(32);
+			const responderPubkey = getPublicKey(responderKey).toString('hex');
+			const initiator = makeNode(true, initiatorKey);
+			const responder = makeNode(true, responderKey);
+			// One old-size batch: its reply ran past the responder's 4 MB write
+			// cap and lost its end marker, so the sync never finished.
+			const scids = populateGraph(
+				responder.getGraph(),
+				8000,
+				REGTEST_CHAIN_HASH
+			);
+
+			try {
+				await responder.listen(0, '127.0.0.1');
+				const responderPort = (
+					responder.getPeerManager() as unknown as {
+						server: { address(): { port: number } };
+					}
+				).server.address().port;
+				await initiator.connectPeer(
+					responderPubkey,
+					'127.0.0.1',
+					responderPort
+				);
+
+				initiator.initiateGossipSync(responderPubkey);
+				await waitFor(
+					() =>
+						initiator.getGossipSyncState(responderPubkey) ===
+						GossipSyncState.SYNCED,
+					50_000
+				);
+				await initiator.flushGossip();
+
+				const graph = initiator.getGraph();
+				expect(graph.getChannelCount()).to.equal(scids.length);
+				for (const scid of scids) {
+					const ch = graph.getChannel(scid);
+					expect(ch?.update1, scid.toString('hex')).to.not.equal(undefined);
+					expect(ch?.update2, scid.toString('hex')).to.not.equal(undefined);
+				}
+			} finally {
+				initiator.destroy();
+				responder.destroy();
+			}
+		});
+
+		describe('requester pacing (issue #969)', function () {
+			const peerPubkey = 'aa'.repeat(33);
+			let node: LightningNode;
+			let queries: string[][];
+			let onQuery: (() => void) | null;
+
+			beforeEach(function () {
+				node = makeNode();
+				queries = [];
+				onQuery = null;
+				node.on(
+					'message:outbound',
+					(_pubkey: string, type: number, payload: Buffer) => {
+						if (type !== MessageType.QUERY_SHORT_CHANNEL_IDS) return;
+						const query = decodeQueryShortChannelIdsMessage(payload);
+						queries.push(
+							decodeShortChannelIds(query.encodedShortIds).map((s) =>
+								s.toString('hex')
+							)
+						);
+						onQuery?.();
+					}
+				);
+			});
+
+			afterEach(function () {
+				node.destroy();
+			});
+
+			function startSync(count: number): void {
+				const scids: Buffer[] = [];
+				for (let i = 0; i < count; i++) scids.push(makeScid(1000 + i, 1, 0));
+				node.initiateGossipSync(peerPubkey);
+				node.handlePeerMessage(
+					peerPubkey,
+					MessageType.REPLY_CHANNEL_RANGE,
+					encodeReplyChannelRangeMessage({
+						chainHash: REGTEST_CHAIN_HASH,
+						firstBlocknum: 0,
+						numberOfBlocks: 0xffffffff,
+						syncComplete: true,
+						encodedShortIds: encodeShortChannelIds(scids)
+					})
+				);
+			}
+
+			function sendAnnouncement(scidHex: string, i: number): void {
+				const node1 = Buffer.alloc(33, 0x02);
+				node1[32] = i * 2 + 1;
+				const node2 = Buffer.alloc(33, 0x02);
+				node2[32] = i * 2 + 2;
+				node.handlePeerMessage(
+					peerPubkey,
+					MessageType.CHANNEL_ANNOUNCEMENT,
+					encodeChannelAnnouncementMessage(
+						makeChannelAnnouncement(
+							Buffer.from(scidHex, 'hex'),
+							node1,
+							node2,
+							REGTEST_CHAIN_HASH
+						)
+					)
+				);
+			}
+
+			function sendEnd(): void {
+				node.handlePeerMessage(
+					peerPubkey,
+					MessageType.REPLY_SHORT_CHANNEL_IDS_END,
+					encodeReplyShortChannelIdsEndMessage({
+						chainHash: REGTEST_CHAIN_HASH,
+						complete: true
+					})
+				);
+			}
+
+			it('asks for the next batch only once the previous one is applied', async function () {
+				startSync(1500);
+				expect(queries).to.have.length(1);
+
+				let channelsAtSecondQuery = -1;
+				onQuery = (): void => {
+					channelsAtSecondQuery = node.getGraph().getChannelCount();
+				};
+				sendAnnouncement(queries[0][0], 0);
+				sendEnd();
+				// The announcement is still queued, so the query waits.
+				expect(queries).to.have.length(1);
+
+				await waitFor(() => queries.length === 2);
+				expect(channelsAtSecondQuery).to.equal(1);
+				expect(queries[1]).to.have.length(500);
+			});
+
+			it('asks for a batch again when the intake dropped part of its reply', async function () {
+				const statics = LightningNode as unknown as {
+					GOSSIP_INTAKE_MAX: number;
+				};
+				const saved = statics.GOSSIP_INTAKE_MAX;
+				statics.GOSSIP_INTAKE_MAX = 2;
+				try {
+					startSync(1500);
+					for (let i = 0; i < 4; i++) sendAnnouncement(queries[0][i], i);
+					sendEnd();
+					await waitFor(() => queries.length === 2);
+					expect(queries[1]).to.eql(queries[0]);
+
+					// The second reply fits: the sync moves on to the last batch.
+					sendEnd();
+					await waitFor(() => queries.length === 3);
+					expect(queries[2]).to.have.length(500);
+					sendEnd();
+					expect(node.getGossipSyncState(peerPubkey)).to.equal(
+						GossipSyncState.SYNCED
+					);
+				} finally {
+					statics.GOSSIP_INTAKE_MAX = saved;
+				}
+			});
 		});
 
 		it('falls back to message:outbound when the peer is disconnected', function () {

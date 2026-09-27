@@ -14927,8 +14927,20 @@ export class LightningNode extends EventEmitter {
 				if (syncMgr) {
 					const msg = decodeReplyShortChannelIdsEndMessage(payload);
 					const responses = syncMgr.handleReplyShortChannelIdsEnd(msg);
-					for (const resp of responses) {
-						this.emitOutbound(pubkey, resp.type, resp.payload);
+					// The batch this marker closes may still be queued. A fast
+					// peer's next reply would land behind it and overflow the
+					// intake, so the next query waits for the intake to drain.
+					if (responses.length > 0) {
+						void this.flushGossip().then(() => {
+							if (this.gossipSyncManagers.get(pubkey) !== syncMgr) return;
+							try {
+								for (const resp of responses) {
+									this.emitOutbound(pubkey, resp.type, resp.payload);
+								}
+							} catch {
+								// Peer disconnected while the intake drained.
+							}
+						});
 					}
 				}
 				break;
@@ -14982,6 +14994,7 @@ export class LightningNode extends EventEmitter {
 				});
 			}
 			this.gossipIntakeDropped++;
+			this.gossipSyncManagers.get(pubkey)?.noteIntakeLoss();
 			return;
 		}
 		this.gossipIntake.push({ pubkey, type, payload });

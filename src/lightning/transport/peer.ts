@@ -417,13 +417,16 @@ export class Peer extends EventEmitter {
 		this.socket.write(encrypted);
 	}
 
-	/** Best-effort gossip messages that may be dropped under write backpressure. */
+	/**
+	 * Best-effort gossip messages that may be dropped under write backpressure.
+	 * reply_short_channel_ids_end and reply_channel_range are not among them:
+	 * they are small, and the requester waits on them to take its next step,
+	 * so losing one stalls its whole sync.
+	 */
 	private static readonly GOSSIP_MESSAGE_TYPES = new Set<number>([
 		256, // channel_announcement
 		257, // node_announcement
 		258, // channel_update
-		262, // reply_short_channel_ids_end
-		264, // reply_channel_range
 		265 // gossip_timestamp_filter
 	]);
 
