@@ -101,6 +101,36 @@ export function isPrivateOrLoopbackHost(host: string): boolean {
 }
 
 /**
+ * The key an inbound source address counts under for
+ * maxPendingInboundPerAddress, or null when it is not limited. Private and
+ * loopback sources are not: a Tor onion service, a reverse proxy or a
+ * container gateway hands every peer it carries to us from one such address.
+ * IPv6 keys on the /64, since a single host is routinely given a whole /64.
+ */
+export function inboundAddressKey(address: string | undefined): string | null {
+	if (!address || isPrivateOrLoopbackHost(address)) return null;
+	const a = address.toLowerCase();
+	const mapped = a.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+	if (mapped) return mapped[1];
+	if (!a.includes(':')) return a;
+	const [head, tail] = a.split('::');
+	const front = head ? head.split(':') : [];
+	const back = tail ? tail.split(':') : [];
+	const groups =
+		tail === undefined
+			? front
+			: [
+					...front,
+					...new Array<string>(
+						Math.max(0, 8 - front.length - back.length)
+					).fill('0'),
+					...back
+			  ];
+	const prefix = groups.slice(0, 4).map((g) => parseInt(g, 16).toString(16));
+	return `${prefix.join(':')}::/64`;
+}
+
+/**
  * Which destinations a configured SOCKS5 proxy is used for (issue #963).
  *
  * - `'all'`: every public host rides the proxy (privacy: the node's clearnet
@@ -188,8 +218,23 @@ export interface IPeerManagerOptions {
 	/** SOCKS5 connect/negotiation timeout in ms (default 20000). Lower it when a
 	 *  fast failure is preferable to waiting out a stalled/filtered proxy. */
 	socks5TimeoutMs?: number;
-	/** Maximum number of inbound peer connections (default 125) */
+	/** Maximum number of inbound peer connections (default 125). A peer
+	 *  isChannelPeer approves is admitted past it. */
 	maxInboundPeers?: number;
+	/**
+	 * Peers we hold a channel with. They are admitted inbound even at
+	 * maxInboundPeers, so strangers filling the slots cannot lock them out.
+	 */
+	isChannelPeer?: (pubkey: string) => boolean;
+	/** Inbound handshakes in flight at once, all addresses together
+	 *  (default 50). Sockets past it are destroyed on accept. */
+	maxPendingInbound?: number;
+	/** Inbound handshakes in flight at once from one public source address
+	 *  (default 4); see inboundAddressKey. */
+	maxPendingInboundPerAddress?: number;
+	/** Hard deadline in ms for an inbound connection to finish the Noise
+	 *  handshake and init exchange (default 10000). */
+	inboundHandshakeTimeoutMs?: number;
 	/**
 	 * Maximum inbound connections admitted into the guardian-only lane while
 	 * the connection gate is closed (default 32). Counted apart from
@@ -325,6 +370,12 @@ export class PeerManager extends EventEmitter {
 	private socks5ProxyScope: Socks5ProxyScope;
 	private socks5TimeoutMs: number;
 	private maxInboundPeers: number;
+	private isChannelPeer?: (pubkey: string) => boolean;
+	private maxPendingInbound: number;
+	private maxPendingInboundPerAddress: number;
+	private inboundHandshakeTimeoutMs: number;
+	/** Inbound handshakes in flight, with the inboundAddressKey of each. */
+	private pendingInbound = new Map<Peer, string | null>();
 	private maxLanePeers: number;
 	/**
 	 * Lane peers (recovery 5.6 exception, issue #699 D6): inbound connections
@@ -354,6 +405,15 @@ export class PeerManager extends EventEmitter {
 		this.socks5ProxyScope = options.socks5ProxyScope ?? 'all';
 		this.socks5TimeoutMs = options.socks5TimeoutMs ?? 20_000;
 		this.maxInboundPeers = options.maxInboundPeers ?? 125;
+		// NaN would silently disable the cap: `count >= NaN` is never true.
+		if (!Number.isInteger(this.maxInboundPeers) || this.maxInboundPeers < 0) {
+			throw new Error('maxInboundPeers must be a non-negative integer');
+		}
+		this.isChannelPeer = options.isChannelPeer;
+		this.maxPendingInbound = options.maxPendingInbound ?? 50;
+		this.maxPendingInboundPerAddress = options.maxPendingInboundPerAddress ?? 4;
+		this.inboundHandshakeTimeoutMs =
+			options.inboundHandshakeTimeoutMs ?? 10_000;
 		this.maxLanePeers = options.maxLanePeers ?? 32;
 		this.webSocketImpl = options.webSocketImpl;
 	}
@@ -1302,7 +1362,12 @@ export class PeerManager extends EventEmitter {
 		if (this.wsServer) {
 			throw new Error('Already listening for WebSocket peers');
 		}
-		const server = new WebSocketServer();
+		const server = new WebSocketServer({
+			maxPendingUpgrades: this.maxPendingInbound,
+			maxPendingUpgradesPerAddress: this.maxPendingInboundPerAddress,
+			upgradeAddressKey: inboundAddressKey,
+			upgradeTimeoutMs: this.inboundHandshakeTimeoutMs
+		});
 		server.on('connection', (transport: IDuplexTransport) => {
 			this.handleInboundConnection(transport);
 		});
@@ -1403,6 +1468,20 @@ export class PeerManager extends EventEmitter {
 			socket.destroy();
 			return;
 		}
+		// A handshake holds a socket and a Peer until it completes or hits
+		// its deadline, and counts toward no other cap until it completes.
+		const addressKey = inboundAddressKey(socket.remoteAddress);
+		let pendingFromAddress = 0;
+		for (const key of this.pendingInbound.values()) {
+			if (addressKey !== null && key === addressKey) pendingFromAddress++;
+		}
+		if (
+			this.pendingInbound.size >= this.maxPendingInbound ||
+			pendingFromAddress >= this.maxPendingInboundPerAddress
+		) {
+			socket.destroy();
+			return;
+		}
 		// Quarantined or fenced (recovery 5.6): destroy the socket BEFORE
 		// the BOLT 8 handshake, so a node that cannot prove writer ownership
 		// never exchanges channel state with anyone. The one exception is the
@@ -1420,10 +1499,6 @@ export class PeerManager extends EventEmitter {
 				return;
 			}
 			lane = true;
-		} else if (this.inboundPeerCount >= this.maxInboundPeers) {
-			// Reject if at inbound peer limit
-			socket.destroy();
-			return;
 		}
 
 		// Create peer with placeholder pubkey — discovered during Noise handshake
@@ -1434,6 +1509,7 @@ export class PeerManager extends EventEmitter {
 			port: socket.remotePort || 0,
 			localFeatures: this.localFeatures,
 			networks: this.networks,
+			handshakeTimeout: this.inboundHandshakeTimeoutMs,
 			// Held until bring-up completes; see the outbound twin. For
 			// inbound this also closes the harder gap: the drain runs
 			// before acceptInbound() resolves, when no listener is even
@@ -1444,6 +1520,7 @@ export class PeerManager extends EventEmitter {
 
 		// Visible to freezeConnections() while the handshake is in flight.
 		this.pendingPeers.add(peer);
+		this.pendingInbound.set(peer, addressKey);
 
 		// Identity is unknown until Noise completes, so a disconnectPeer()
 		// during the handshake has nothing pubkey-addressable to abort.
@@ -1455,6 +1532,7 @@ export class PeerManager extends EventEmitter {
 			.acceptInbound(socket)
 			.then(() => {
 				this.pendingPeers.delete(peer);
+				this.pendingInbound.delete(peer);
 				// Recheck AFTER the handshake: a freeze that landed
 				// mid-establishment must win over registration.
 				if (this.connectionsDisabled()) {
@@ -1479,6 +1557,16 @@ export class PeerManager extends EventEmitter {
 				}
 				const pubkey = peer.remotePublicKey.toString('hex');
 				if ((this.lastCancelEraByPubkey.get(pubkey) ?? 0) > acceptEra) {
+					peer.disconnect();
+					return;
+				}
+				// The cap is applied here, once identity is known, and not
+				// on accept: a stranger holding every slot must not keep a
+				// channel peer from reconnecting.
+				if (
+					this.inboundPeerCount >= this.maxInboundPeers &&
+					!this.admitsPastInboundCap(pubkey)
+				) {
 					peer.disconnect();
 					return;
 				}
@@ -1577,7 +1665,18 @@ export class PeerManager extends EventEmitter {
 			.catch(() => {
 				// Handshake/init failed — socket already cleaned up by Peer
 				this.pendingPeers.delete(peer);
+				this.pendingInbound.delete(peer);
 			});
+	}
+
+	/** A throwing isChannelPeer admits nothing. Letting the throw escape
+	 *  would land in the handshake-failure catch, which never disconnects. */
+	private admitsPastInboundCap(pubkey: string): boolean {
+		try {
+			return this.isChannelPeer?.(pubkey) ?? false;
+		} catch {
+			return false;
+		}
 	}
 
 	private dispatchPeerMessage(
