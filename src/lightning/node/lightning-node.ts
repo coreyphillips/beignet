@@ -6031,6 +6031,23 @@ export class LightningNode extends EventEmitter {
 		return this.recoveryGate ? this.recoveryGate.getState() : 'disabled';
 	}
 
+	/**
+	 * Why this device cannot show it still owns the channel state it stores,
+	 * or null when it can (or runs without guardians). 'superseded' once a
+	 * newer writer is proven, by the startup gate or by the barrier at
+	 * runtime: the device that replaced this one revoked a stored commitment
+	 * with every update it made. 'unconfirmed' while the gate is still
+	 * quarantined, where that takeover is possible but unproven. The
+	 * operator's force close stays admitted under either, but only as the
+	 * labelled decision the daemon asks for (issue #1013).
+	 */
+	getRecoveryOwnershipHold(): 'superseded' | 'unconfirmed' | null {
+		const gate = this.getRecoveryGateState();
+		if (this._barrierFenced || gate === 'fenced') return 'superseded';
+		if (gate === 'quarantined') return 'unconfirmed';
+		return null;
+	}
+
 	// ─────────────── Guardian-set rotation (wire 5.9, issue #701) ───────────────
 
 	/**
@@ -17956,7 +17973,10 @@ export class LightningNode extends EventEmitter {
 		channelIdHex: string,
 		opts: {
 			forceCloseIfUnreachable?: boolean;
-			/** Required to force-close a channel with either recency hold. */
+			/**
+			 * Required to force-close a channel with a recency hold, or on a
+			 * device with a getRecoveryOwnershipHold.
+			 */
 			acceptStaleStateRisk?: boolean;
 			destinationScript?: Buffer;
 			timeoutMs?: number;
@@ -18011,6 +18031,16 @@ export class LightningNode extends EventEmitter {
 				throw new InvalidRequestError(
 					'Force closing a channel with unproven recency requires ' +
 						'acceptStaleStateRisk: true'
+				);
+			}
+			// So can a fence: the barrier latches whenever a newer writer shows up.
+			if (
+				this.getRecoveryOwnershipHold() !== null &&
+				opts.acceptStaleStateRisk !== true
+			) {
+				throw new InvalidRequestError(
+					'Force closing on a device that cannot show it still owns its ' +
+						'channels requires acceptStaleStateRisk: true'
 				);
 			}
 			const res = this.channelManager.forceClose(
@@ -26259,8 +26289,10 @@ export class LightningNode extends EventEmitter {
 	 *
 	 * The operator's own force close (reason 'user') stays admitted: it is
 	 * 5.6's labelled escape hatch, and the only exit a fenced node has. The
-	 * one refusal that covers 'user' as well is forceCloseRevokedRefusal
-	 * (issue #905), which names a certainty rather than a risk.
+	 * label is the daemon's acceptStaleStateRisk, asked for while
+	 * getRecoveryOwnershipHold is set (issue #1013). The one refusal that
+	 * covers 'user' as well is forceCloseRevokedRefusal (issue #905), which
+	 * names a certainty rather than a risk.
 	 */
 	private skipAutoCloseRecoveryGated(
 		channelId: Buffer,

@@ -1735,6 +1735,32 @@ const SECRET_MISSING_FORCE_CLOSE_REFUSAL =
 	'the peer to close is the safe outcome. Set acceptStaleStateRisk: true ' +
 	'to force close anyway.';
 
+/**
+ * The same acknowledgement for a whole device rather than one channel
+ * (issue #1013). A fenced device was taken over by another holding the
+ * same seed, and every update that device made revoked a commitment this
+ * one still stores, so its force close is normally a revoked broadcast.
+ */
+const SUPERSEDED_FORCE_CLOSE_REFUSAL =
+	'This device was superseded: another device restored this node from ' +
+	'the same seed and took over its channels, so this one is fenced. ' +
+	'Every channel update the other device has made revoked a commitment ' +
+	'this device still stores. If it has used this channel, force closing ' +
+	'here publishes a revoked commitment and the whole channel balance is ' +
+	'lost to the justice path. Close the channel from the device that took ' +
+	'over, or wait for the peer to close. Set acceptStaleStateRisk: true to ' +
+	'force close anyway.';
+
+const UNCONFIRMED_OWNER_FORCE_CLOSE_REFUSAL =
+	'This device has not confirmed with its guardians that it still owns ' +
+	"this node's channels (the recovery gate is quarantined), so another " +
+	'device restored from the same seed may have taken them over. If one ' +
+	'has and has used this channel, force closing publishes a revoked ' +
+	'commitment and the whole channel balance is lost to the justice path. ' +
+	'Waiting for the guardians to confirm this device, or for the peer to ' +
+	'close, is the safe outcome. Set acceptStaleStateRisk: true to force ' +
+	'close anyway.';
+
 interface IRecencyHold {
 	restoreRecencyUnproven?: true;
 	reestablishRecencyUnproven?: true;
@@ -8111,7 +8137,8 @@ export class BeignetNode extends EventEmitter {
 	forceCloseChannel(
 		channelId: string,
 		// The labelled risk acknowledgement RECOVERY-PROTOCOL 5.6 asks for
-		// (issues #469 and #907). Required for either recency hold: this node refuses to
+		// (issues #469 and #907). Required for either recency hold, and on a
+		// fenced or quarantined device (issue #1013): this node refuses to
 		// broadcast such a commitment on its own initiative because the peer
 		// may already hold a revocation for it, and an operator command is the
 		// documented exit. It should be a decision, not a default, so the
@@ -8215,6 +8242,17 @@ export class BeignetNode extends EventEmitter {
 		acceptStaleStateRisk: boolean
 	): void {
 		if (acceptStaleStateRisk === true) return;
+		// Ahead of the per-channel holds: a takeover puts every channel at
+		// risk at once, and no channel row records it.
+		const ownership = this.node.getRecoveryOwnershipHold();
+		if (ownership !== null) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				ownership === 'superseded'
+					? SUPERSEDED_FORCE_CLOSE_REFUSAL
+					: UNCONFIRMED_OWNER_FORCE_CLOSE_REFUSAL
+			);
+		}
 		const hold = this.recencyHold(channelId);
 		// One refusal per origin, in the engine's own precedence
 		// (recencyHoldOrigin): the local fault first, because it is the only
