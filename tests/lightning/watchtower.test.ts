@@ -1281,7 +1281,7 @@ describe('watchtower persistence round-trip', function () {
 });
 
 describe('watchtower hand-off on revoke_and_ack (#1029)', function () {
-	it('hands off the peer commitment #0 when it is revoked', function () {
+	it('hands off the peer commitment #0 before its revocation is persisted', function () {
 		const alice = createNode('wt-handoff', 1);
 		const bob = createNode('wt-handoff', 2);
 		connectNodes(alice, bob);
@@ -1301,6 +1301,16 @@ describe('watchtower hand-off on revoke_and_ack (#1029)', function () {
 				handedOff.push(perCommitmentPointFromSecret(secret).toString('hex'));
 			}
 		);
+		// A restart after the revoke's persist must find the backup queued.
+		let handedOffAtRevokePersist: boolean | null = null;
+		bobCm.on('channel:persist', ({ channel }: { channel: Channel }) => {
+			if (
+				handedOffAtRevokePersist === null &&
+				channel.getFullState().remoteRevocationNumber === 1n
+			) {
+				handedOffAtRevokePersist = handedOff.includes(point0);
+			}
+		});
 
 		// Bob fails it back (random hash); the add round alone revokes #0.
 		alice
@@ -1314,6 +1324,7 @@ describe('watchtower hand-off on revoke_and_ack (#1029)', function () {
 			);
 
 		expect(handedOff).to.include(point0);
+		expect(handedOffAtRevokePersist).to.equal(true);
 		alice.destroy();
 		bob.destroy();
 	});
