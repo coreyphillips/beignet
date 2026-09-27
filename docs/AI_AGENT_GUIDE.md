@@ -726,7 +726,15 @@ curl -X POST http://localhost:2112/invoice/pay-safe \
 # Same key with DIFFERENT body — returns 409 IDEMPOTENCY_CONFLICT
 ```
 
-Supported endpoints: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`.
+Supported endpoints: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/splice-out`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`.
+
+Any other `POST` that carries the header is refused with `400 INVALID_PARAMS`
+and does not run, so a key is never silently dropped. Drop the header for
+those routes.
+
+A BOLT 12 offer payment needs the key more than a BOLT 11 one: every
+`POST /offer/pay` asks the payee for a fresh invoice with a fresh payment hash,
+so nothing but the key can tell a retry from a new payment.
 
 The same applies to the on-chain sends: a retried `POST /send` that carries the
 key of a send already broadcast returns that broadcast's txid instead of
