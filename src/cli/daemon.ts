@@ -105,7 +105,19 @@ const IDEMPOTENT_ROUTES = new Set([
 	// response cannot tell "not broadcast" from "broadcast, answer lost", and
 	// checking the chain instead races the mempool.
 	'POST /send',
-	'POST /send-max'
+	'POST /send-max',
+	// Each call requests a fresh BOLT 12 invoice with a fresh payment hash, so
+	// the engine's duplicate-hash refusal cannot catch a retry (#1018).
+	'POST /offer/pay',
+	// A retried splice-out moves the funds twice (to an external address, a
+	// real spend), and a retried open opens a second channel. open-and-wait
+	// is left out: its wait usually outlasts the timeout, and a thrown
+	// timeout is not cached, so a keyed retry would open again anyway.
+	'POST /channel/splice-out',
+	'POST /channel/open',
+	'POST /channel/open-v2',
+	'POST /channel/open-zeroconf',
+	'POST /channel/connect-and-open'
 ]);
 
 function success<T>(result: T): ApiResponse<T> {
@@ -121,11 +133,13 @@ function failure(code: string, message: string): ApiResponse<never> {
  * refusal in band, and wrapping that in success() produced a third shape:
  * 200 ok:true around ok:false, the only daemon answer where a failure is
  * indistinguishable from a success to a client that reads the envelope and
- * stops there (issue #618).
+ * stops there (issue #618). The refusal is thrown, not returned: the
+ * idempotency cache keeps returned envelopes, and replaying a transient
+ * SPLICE_BUSY for 24 hours would stop a keyed retry from ever running.
  */
 function spliceOrRefuse(result: SpliceResult): ApiResponse<SpliceResult> {
 	const refusal = spliceRefusalError(result);
-	if (refusal) return failure(refusal.code, refusal.message);
+	if (refusal) throw refusal;
 	return success(result);
 }
 
@@ -3482,6 +3496,24 @@ async function bootDaemon(
 			const idempotencyKey = req.headers['x-idempotency-key'] as
 				| string
 				| undefined;
+			// A key the route would drop leaves the caller believing a retry is
+			// safe when it is not, so refuse before the handler runs. GET and
+			// DELETE are idempotent by method, where a key misleads no one.
+			if (
+				idempotencyKey &&
+				req.method === 'POST' &&
+				!IDEMPOTENT_ROUTES.has(routeKey)
+			) {
+				endWithResult(
+					res,
+					failure(
+						'INVALID_PARAMS',
+						`${routeKey} does not honour X-Idempotency-Key; nothing was ` +
+							'run. Resend without the header.'
+					)
+				);
+				return;
+			}
 			if (idempotencyKey && IDEMPOTENT_ROUTES.has(routeKey)) {
 				const cacheKey = `${routeKey}:${idempotencyKey}`;
 				const bodyHash = JSON.stringify(body);

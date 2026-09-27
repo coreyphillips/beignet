@@ -14,9 +14,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			version: '1.0.0',
 			description:
 				'HTTP API for a self-custodial Bitcoin + Lightning node. Designed for AI agents.\n\n' +
-				'**Idempotency:** These endpoints support the `X-Idempotency-Key` header: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`. ' +
+				'**Idempotency:** These endpoints support the `X-Idempotency-Key` header: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/splice-out`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`. ' +
 				'When provided, the response is cached in memory for 24 hours (or until the daemon restarts), and repeated requests with the same key and body return the cached response. ' +
-				'If the same key is reused with a different request body, a `409 IDEMPOTENCY_CONFLICT` error is returned.\n\n' +
+				'If the same key is reused with a different request body, a `409 IDEMPOTENCY_CONFLICT` error is returned. ' +
+				'Any other POST that carries the header answers `400 INVALID_PARAMS` without running.\n\n' +
 				'**TLS:** The daemon supports HTTPS when started with `--tls-cert` and `--tls-key` flags (or `BEIGNET_TLS_CERT`/`BEIGNET_TLS_KEY` env vars).\n\n' +
 				'**Scoped API keys:** Besides the legacy single `apiToken` (implicit admin scope), the `apiKeys` config defines named keys with `readonly`, `invoice`, and/or `admin` scopes. Each operation lists the scopes it accepts in `x-accepted-scopes`; unclassified routes are admin-only. Requests fail with 401 (bad/absent key) or 403 (valid key, insufficient scope). `beignet init` mints an `apiToken` for every install it creates.\n\n' +
 				'**Browser guards (no credential configured):** a request body must be `Content-Type: application/json` (else `415 UNSUPPORTED_MEDIA_TYPE`), an `Origin` other than the configured `cors` origin or a `Sec-Fetch-Site: cross-site` request is refused (`403 CROSS_SITE_REQUEST_REFUSED`), and the `Host` header must be the loopback name the daemon is bound on (else `421 HOST_NOT_ALLOWED`). They apply to every route but `OPTIONS` and do not run once `apiToken` or `apiKeys` is set.\n\n' +

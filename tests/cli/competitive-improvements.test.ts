@@ -343,7 +343,7 @@ describe('Idempotency Keys', () => {
 		}
 	});
 
-	it('non-payment routes ignore idempotency key', async function () {
+	it('GET routes ignore idempotency key', async function () {
 		this.timeout(15_000);
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-idem-'));
 		const { server, node } = await startDaemon({
@@ -439,6 +439,168 @@ describe('Idempotency Keys', () => {
 			}
 		});
 	}
+
+	// #1018: a retry of these pays, spends or opens again, and nothing below
+	// the daemon can tell it from a new request (an offer payment gets a fresh
+	// invoice and payment hash each time). The node call is stubbed; a keyed
+	// retry must not reach it.
+	describe('offer, splice-out and channel-open routes (#1018)', () => {
+		const pubkey = '02' + 'b'.repeat(64);
+		const opened = { channelId: 'f'.repeat(64) };
+		const cases: Array<{
+			route: string;
+			method: string;
+			body: Record<string, unknown>;
+			result: unknown;
+		}> = [
+			{
+				route: '/offer/pay',
+				method: 'payOffer',
+				body: { offer: 'lno1stub', amountSats: 100_000 },
+				result: { paymentHash: 'e'.repeat(64), status: 'succeeded' }
+			},
+			{
+				route: '/channel/splice-out',
+				method: 'spliceOut',
+				body: {
+					channelId: 'a'.repeat(64),
+					amountSats: 50_000,
+					feeratePerkw: 253,
+					address: 'bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080'
+				},
+				result: { ok: true }
+			},
+			{
+				route: '/channel/open',
+				method: 'openChannel',
+				body: { pubkey, amountSats: 100_000 },
+				result: opened
+			},
+			{
+				route: '/channel/open-v2',
+				method: 'openChannelV2',
+				body: { pubkey, amountSats: 100_000 },
+				result: opened
+			},
+			{
+				route: '/channel/open-zeroconf',
+				method: 'openZeroConfChannel',
+				body: { pubkey, amountSats: 100_000 },
+				result: opened
+			},
+			{
+				route: '/channel/connect-and-open',
+				method: 'connectAndOpenChannel',
+				body: { pubkey, host: '127.0.0.1', port: 9735, amountSats: 100_000 },
+				result: opened
+			}
+		];
+
+		let server: http.Server;
+		let node: any;
+		let port: number;
+
+		before(async function () {
+			this.timeout(15_000);
+			const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-idem-'));
+			({ server, node } = await startDaemon({
+				network: 'regtest',
+				dataDir: tmpDir,
+				daemonPort: 0,
+				logLevel: 'silent',
+				...OFFLINE_ELECTRUM
+			}));
+			port = (server.address() as any).port;
+		});
+
+		after(async () => {
+			await node.destroy();
+			server.close();
+		});
+
+		for (const { route, method, body, result } of cases) {
+			it(`POST ${route} replays a cached response instead of running again`, async () => {
+				let calls = 0;
+				node[method] = (): unknown => {
+					calls += 1;
+					return result;
+				};
+				const payload = JSON.stringify(body);
+				const headers = { 'X-Idempotency-Key': `${route}-${Date.now()}` };
+
+				const res1 = await httpPostRaw(port, route, payload, headers);
+				const res2 = await httpPostRaw(port, route, payload, headers);
+				expect(res1.statusCode, res1.body).to.equal(200);
+				expect(JSON.parse(res1.body).ok).to.equal(true);
+				expect(res2.body).to.equal(res1.body);
+				expect(calls, 'the keyed retry was served from the cache').to.equal(1);
+
+				// The count is the node call's: without a key it runs again.
+				await httpPostRaw(port, route, payload);
+				expect(calls, 'an unkeyed request still runs').to.equal(2);
+			});
+		}
+
+		it('a transient splice-out refusal is not cached, so a keyed retry runs', async () => {
+			let calls = 0;
+			node.spliceOut = (): unknown => {
+				calls += 1;
+				return calls === 1
+					? { ok: false, code: 'SPLICE_BUSY', error: 'stubbed busy' }
+					: { ok: true };
+			};
+			const payload = JSON.stringify(cases[1].body);
+			const headers = { 'X-Idempotency-Key': `splice-busy-${Date.now()}` };
+
+			const refused = await httpPostRaw(
+				port,
+				'/channel/splice-out',
+				payload,
+				headers
+			);
+			expect(refused.statusCode).to.equal(503);
+			expect(JSON.parse(refused.body)).to.deep.equal({
+				ok: false,
+				error: { code: 'SPLICE_BUSY', message: 'stubbed busy' }
+			});
+
+			const retried = await httpPostRaw(
+				port,
+				'/channel/splice-out',
+				payload,
+				headers
+			);
+			expect(retried.statusCode).to.equal(200);
+			expect(JSON.parse(retried.body).result).to.deep.equal({ ok: true });
+			expect(calls).to.equal(2);
+		});
+
+		it('a POST route that does not honour the key refuses it without running', async () => {
+			let calls = 0;
+			node.spliceIn = (): unknown => {
+				calls += 1;
+				return { ok: true };
+			};
+			const payload = JSON.stringify({
+				channelId: 'a'.repeat(64),
+				amountSats: 50_000,
+				feeratePerkw: 253
+			});
+
+			const refused = await httpPostRaw(port, '/channel/splice-in', payload, {
+				'X-Idempotency-Key': `splice-in-${Date.now()}`
+			});
+			expect(refused.statusCode).to.equal(400);
+			const parsed = JSON.parse(refused.body);
+			expect(parsed.error.code).to.equal('INVALID_PARAMS');
+			expect(parsed.error.message).to.include('X-Idempotency-Key');
+			expect(calls, 'the handler ran for a refused key').to.equal(0);
+
+			const unkeyed = await httpPostRaw(port, '/channel/splice-in', payload);
+			expect(unkeyed.statusCode).to.equal(200);
+			expect(calls).to.equal(1);
+		});
+	});
 
 	// #768: the cache is written only after the handler returns, so two
 	// requests with one key that overlap both miss it. The stubbed send parks
