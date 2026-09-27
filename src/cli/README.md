@@ -1977,7 +1977,7 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_TOR_PROXY` | SOCKS5 proxy as `host:port` for outbound Lightning peer and watchtower connections (e.g. Tor at `127.0.0.1:9050`); `.onion` peers need one. Unset, `.onion` peers fall back to `127.0.0.1:9050` and everything else is dialed directly |
 | `BEIGNET_TOR_PROXY_ONION_ONLY` | `true` to use `BEIGNET_TOR_PROXY` for `.onion` hosts only and dial public clearnet hosts directly (hybrid mode, LND's `tor.skip-proxy-for-clearnet-targets`); exact `true`/`false`, anything else is ignored. Needs `BEIGNET_TOR_PROXY`, or startup is refused |
 | `BEIGNET_HTLC_EVENTS` | `true` to relay per-HTLC events over SSE + webhooks |
-| `BEIGNET_EAGER_GOSSIP_VERIFY` | `true` to verify foreign gossip signatures at intake instead of lazily at serve time (default: lazy; exact `true`/`false`, anything else is ignored) |
+| `BEIGNET_EAGER_GOSSIP_VERIFY` | `true` to verify all foreign gossip signatures at intake (default: lazy, which still verifies channel data and channel peers' node announcements at intake and the rest at serve time; exact `true`/`false`, anything else is ignored) |
 | `BEIGNET_LOG_LEVEL` | Daemon stderr log level: `debug`, `info`, `warn`, `error`, `silent` (default: silent) |
 | `BEIGNET_RECOVERY_MODE` | Recovery Protocol mode: `off`, `peer-storage`, `async-remote`, `quorum` (default: off; unknown values fall back to off) |
 | `BEIGNET_RECOVERY_GUARDIANS` | Guardian set for async-remote/quorum, comma-separated `<64-hex-x-only-pubkey>@<url>` where the URL is `http(s)://...` for an HTTP guardian or `bolt8://<66-hex node id>@host:port` for a guardian hosted by a beignet node (crash-v1: exactly three; malformed entries refuse startup) |

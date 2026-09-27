@@ -80,6 +80,22 @@ function sanitizeSlot(
 	};
 }
 
+/**
+ * Settle a restored update slot with unresolved provenance, in either mode:
+ * pathfinding reads every update slot, so unlike an announcement it cannot
+ * wait deferred for a gossip query (issue #1024). Returns null for a signed
+ * update that fails, which must be dropped rather than left routable. A
+ * signatureless one is RGS data and stays, unverified.
+ */
+function settleRestoredUpdate(
+	update: IChannelUpdateMessage,
+	nodeId1: Buffer,
+	nodeId2: Buffer
+): boolean | null {
+	if (verifyChannelUpdateMessage(update, nodeId1, nodeId2)) return true;
+	return isSignatureless(update.signature) ? false : null;
+}
+
 export class NetworkGraph {
 	/**
 	 * Wall-clock budget for resolving deferred provenance inside
@@ -366,19 +382,19 @@ export class NetworkGraph {
 			direction === 0 ? channel.update1Verified : channel.update2Verified;
 		const verified = normalizeVerified(opts.verified, msg.signature);
 
-		// Reject if not strictly newer, unless a verified update is taking over
-		// an unverified slot: RGS stamps synthetic updates with the snapshot's
-		// global latest-seen timestamp, which would otherwise block the real
-		// signed update forever. A deferred candidate (always real-signature,
-		// normalizeVerified downgrades the rest) gets the same bypass but
-		// ONLY over a signatureless slot (whose timestamp is synthetic by
-		// construction); over signed slots normal freshness applies, so a
-		// re-served known update refuses here without a storage write.
+		// Reject if not strictly newer, unless a signed update is taking over
+		// a signatureless slot: RGS stamps synthetic updates with the
+		// snapshot's global latest-seen timestamp, which would otherwise block
+		// the real signed update forever. Over signed slots normal freshness
+		// applies whatever the provenance. An unverified signed slot may hold
+		// a valid update the codec cannot re-encode, and an older canonical
+		// replay must not roll it back (issue #1024). A re-served known update
+		// also refuses here without a storage write.
 		if (existing && msg.timestamp <= existing.timestamp) {
 			const takeover =
 				existingVerified !== true &&
-				(verified === true ||
-					(verified === 'deferred' && isSignatureless(existing.signature)));
+				isSignatureless(existing.signature) &&
+				(verified === true || verified === 'deferred');
 			if (!takeover) {
 				return false;
 			}
@@ -695,10 +711,11 @@ export class NetworkGraph {
 	 * Rows persisted before provenance tracking carry no verified flags;
 	 * absence cannot be trusted (pre-#340 rows could hold zero-signature RGS
 	 * messages persisted alongside a verified update), so unresolved flags
-	 * (absent, non-boolean, or marked deferred) are resolved here. Eager mode
-	 * verifies the canonical re-encoding at once, so an eager node never
-	 * holds deferred entries post-boot, a lazy-to-eager migration included.
-	 * Lazy mode (default) marks them deferred instead, moving the signature
+	 * (absent, non-boolean, or marked deferred) are resolved here. Update
+	 * slots are verified at once in either mode (see settleRestoredUpdate).
+	 * Eager mode verifies the announcement too, so an eager node never holds
+	 * deferred entries post-boot, a lazy-to-eager migration included. Lazy
+	 * mode (default) marks the announcement deferred instead, moving that
 	 * work to the point of consumption (issue #443); either way nothing
 	 * unresolved is ever served. Rows with explicit boolean flags skip the
 	 * signature checks. This is the common boundary for every storage
@@ -746,35 +763,25 @@ export class NetworkGraph {
 			channel.announcementVerified =
 				ann.verified ?? verifyChannelAnnouncementMessage(channel.announcement);
 			channel.announcementVerifyDeferred = undefined;
-			channel.update1Verified = channel.update1
-				? upd1.verified ??
-				  verifyChannelUpdateMessage(
-						channel.update1,
-						channel.nodeId1,
-						channel.nodeId2
-				  )
-				: undefined;
-			channel.update1VerifyDeferred = undefined;
-			channel.update2Verified = channel.update2
-				? upd2.verified ??
-				  verifyChannelUpdateMessage(
-						channel.update2,
-						channel.nodeId1,
-						channel.nodeId2
-				  )
-				: undefined;
-			channel.update2VerifyDeferred = undefined;
 		} else {
 			channel.announcementVerified = ann.verified;
 			channel.announcementVerifyDeferred =
 				ann.verified === undefined ? true : undefined;
-			channel.update1Verified = channel.update1 ? upd1.verified : undefined;
-			channel.update1VerifyDeferred =
-				channel.update1 && upd1.verified === undefined ? true : undefined;
-			channel.update2Verified = channel.update2 ? upd2.verified : undefined;
-			channel.update2VerifyDeferred =
-				channel.update2 && upd2.verified === undefined ? true : undefined;
 		}
+		const settled1 = channel.update1
+			? upd1.verified ??
+			  settleRestoredUpdate(channel.update1, channel.nodeId1, channel.nodeId2)
+			: undefined;
+		if (settled1 === null) channel.update1 = undefined;
+		channel.update1Verified = settled1 ?? undefined;
+		channel.update1VerifyDeferred = undefined;
+		const settled2 = channel.update2
+			? upd2.verified ??
+			  settleRestoredUpdate(channel.update2, channel.nodeId1, channel.nodeId2)
+			: undefined;
+		if (settled2 === null) channel.update2 = undefined;
+		channel.update2Verified = settled2 ?? undefined;
+		channel.update2VerifyDeferred = undefined;
 
 		const scidHex = channel.shortChannelId.toString('hex');
 

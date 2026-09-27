@@ -1025,9 +1025,11 @@ local public channel. Set
 `eagerGossipVerify: true` on relay-class nodes to verify everything at intake
 as before; eager mode also re-requests signatureless RGS-primed entries from
 peers so their signed copies become servable. Stored rows that predate the
-provenance flags are resolved at restore: eager mode verifies the canonical
-re-encoding (failing safe to unverified), lazy mode marks them deferred and
-lets the point of consumption decide.
+provenance flags are resolved at restore. Update slots are verified in either
+mode, and a signed update that fails is dropped because pathfinding would read
+it. For announcements, eager mode verifies the canonical re-encoding (failing
+safe to unverified), lazy mode marks them deferred and lets the point of
+consumption decide.
 
 Local public-channel gossip is rebuilt from stored channel signatures on restart,
 including when a graph row already exists. Periodic refresh updates the local graph

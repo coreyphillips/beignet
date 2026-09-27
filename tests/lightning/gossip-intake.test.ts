@@ -349,6 +349,36 @@ describe('Gossip far-future timestamps (NetworkGraph, issue #446)', () => {
 			graph.applyNodeAnnouncement(realAnn.msg, { verified: true })
 		).to.equal(true);
 	});
+
+	it('a lazy restore settles deferred updates instead of routing over them (issue #1024)', () => {
+		// Rows an older lazy run saved deferred: a forged update must not
+		// survive the upgrade, while a signatureless RGS one stays routable.
+		const graph = new NetworkGraph(REGTEST_CHAIN_HASH);
+		const ann = buildAnnouncement(704, REGTEST_CHAIN_HASH);
+		graph.restoreChannel({
+			shortChannelId: ann.msg.shortChannelId,
+			nodeId1: ann.msg.nodeId1,
+			nodeId2: ann.msg.nodeId2,
+			features: Buffer.alloc(0),
+			announcement: ann.msg,
+			announcementVerifyDeferred: true,
+			update1: {
+				...buildUpdate(ann, 1000, 0, REGTEST_CHAIN_HASH).msg,
+				signature: crypto.randomBytes(64)
+			},
+			update1VerifyDeferred: true,
+			update2: {
+				...buildUpdate(ann, 1000, 1, REGTEST_CHAIN_HASH).msg,
+				signature: Buffer.alloc(64)
+			}
+		});
+		const ch = graph.getChannel(ann.msg.shortChannelId)!;
+		expect(ch.update1).to.equal(undefined);
+		expect(ch.update1VerifyDeferred).to.equal(undefined);
+		expect(ch.update2?.timestamp).to.equal(1000);
+		expect(ch.update2Verified).to.equal(false);
+		expect(ch.update2VerifyDeferred).to.equal(undefined);
+	});
 });
 
 describe('Gossip channel ceiling (NetworkGraph, issue #446)', () => {

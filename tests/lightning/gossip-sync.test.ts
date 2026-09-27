@@ -1013,9 +1013,12 @@ describe('Gossip Sync (Phase 5)', function () {
 			graph.addChannelAnnouncement(makeChannelAnnouncement(scid, n1, n2), {
 				verified: true
 			});
-			// RGS-style: synthetic update stamped with the snapshot's global
-			// latest-seen timestamp.
-			graph.applyChannelUpdate(makeChannelUpdate(scid, 0, 2000));
+			// RGS-style: signatureless synthetic update stamped with the
+			// snapshot's global latest-seen timestamp.
+			graph.applyChannelUpdate({
+				...makeChannelUpdate(scid, 0, 2000),
+				signature: Buffer.alloc(64)
+			});
 			// The real signed update carries its true, older timestamp and must
 			// still win the slot.
 			expect(
@@ -1978,6 +1981,46 @@ describe('Gossip Sync (Phase 5)', function () {
 			const served = node.getGraph().getGossipMessagesForChannels([scid]);
 			expect(served.updates.length).to.equal(1);
 			expect(served.updates[0].channelFlags & 0x01).to.equal(0);
+			node.destroy();
+		});
+
+		it('an older canonical update cannot roll back a newer one that does not re-encode (issue #1024)', async function () {
+			const node = makeNode();
+			const peer = 'aa'.repeat(33);
+			const scid = makeScid(152, 1, 0);
+			const keys = makeSignedChannelKeys();
+			const ann = makeSignedChannelAnnouncement(scid, keys, REGTEST_CHAIN_HASH);
+			const extended = makeSignedChannelUpdate(
+				scid,
+				keys.nodeKey1,
+				0,
+				2000,
+				REGTEST_CHAIN_HASH,
+				Buffer.from([9, 9])
+			);
+			const older = makeSignedChannelUpdate(
+				scid,
+				keys.nodeKey1,
+				0,
+				1000,
+				REGTEST_CHAIN_HASH
+			);
+			node.handlePeerMessage(
+				peer,
+				MessageType.CHANNEL_ANNOUNCEMENT,
+				ann.payload
+			);
+			node.handlePeerMessage(
+				peer,
+				MessageType.CHANNEL_UPDATE,
+				extended.payload
+			);
+			node.handlePeerMessage(peer, MessageType.CHANNEL_UPDATE, older.payload);
+			await node.flushGossip();
+
+			const ch = node.getGraph().getChannel(scid)!;
+			expect(ch.update1?.timestamp).to.equal(2000);
+			expect(ch.update1Verified).to.be.false;
 			node.destroy();
 		});
 

@@ -424,7 +424,8 @@ export interface BeignetNodeOptions {
 	/**
 	 * Signature-verify all foreign broadcast gossip at intake (default false).
 	 * By default only what pathfinding reads (channel updates, announcements
-	 * of new channels) is verified at intake; the rest is deferred until a
+	 * of new channels) and channel peers' node announcements are verified at
+	 * intake; the rest is deferred until a
 	 * gossip query asks for it, and nothing unverified is ever served either
 	 * way. Set true on relay-class
 	 * nodes that serve the graph: intake and restore verify eagerly and

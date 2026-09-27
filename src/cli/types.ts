@@ -770,7 +770,8 @@ export interface BeignetConfig {
 	 *  false so a wallet declines all forwards. Env: BEIGNET_FORWARDING_ENABLED. */
 	forwardingEnabled?: boolean;
 	/** Signature-verify all foreign broadcast gossip at intake (default false:
-	 *  only what pathfinding reads is verified at intake, the rest is deferred
+	 *  only what pathfinding reads and channel peers' node announcements are
+	 *  verified at intake, the rest is deferred
 	 *  until a gossip query asks for it; nothing unverified is ever served
 	 *  either way). Set true on relay-class
 	 *  nodes that serve the graph. Env: BEIGNET_EAGER_GOSSIP_VERIFY, exact

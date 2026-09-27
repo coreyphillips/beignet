@@ -352,7 +352,9 @@ describe('Storage Layer', function () {
 				restoredInvalid.shortChannelId
 			)!;
 			expect(chInvalid.announcementVerified).to.be.false;
-			expect(chInvalid.update1Verified).to.be.false;
+			// Pathfinding reads update slots, so a failed one is dropped.
+			expect(chInvalid.update1).to.be.undefined;
+			expect(chInvalid.update1Verified).to.be.undefined;
 
 			// A genuinely signed legacy row resolves verified.
 			const scid = Buffer.from('0000010000020003', 'hex');
@@ -719,20 +721,20 @@ describe('Storage Layer', function () {
 			expect(served.updates).to.have.length(0);
 
 			// Lazy restore reaches the same end state through the serve path:
-			// the row restores deferred, gets advertised once, then the first
+			// the announcement restores deferred (the update settles at once,
+			// since pathfinding reads it), gets advertised once, then the first
 			// query resolves the zero-signature announcement unservable, and
-			// the whole channel (signed update included, its endpoints being
-			// unauthenticated) is withheld and drops out of later ranges.
+			// the whole channel is withheld and drops out of later ranges.
 			const lazy = new NetworkGraph();
 			lazy.restoreChannel(storage.loadAllGossipChannels()[0]);
 			const lazyCh = lazy.getChannel(scid)!;
 			expect(lazyCh.announcementVerifyDeferred).to.equal(true);
+			expect(lazyCh.update1Verified).to.be.true;
 			expect(lazy.getChannelsByBlockRange(100, 5)).to.have.length(1);
 			const lazyServed = lazy.getGossipMessagesForChannels([scid]);
 			expect(lazyServed.announcements).to.have.length(0);
 			expect(lazyServed.updates).to.have.length(0);
 			expect(lazyCh.announcementVerified).to.be.false;
-			expect(lazyCh.update1VerifyDeferred).to.equal(true);
 			expect(lazy.getChannelsByBlockRange(100, 5)).to.have.length(0);
 		});
 
