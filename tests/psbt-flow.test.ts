@@ -563,6 +563,37 @@ describe('External-Signer PSBT Flow', function () {
 			}
 		});
 
+		it('rejects an input whose witnessUtxo and nonWitnessUtxo disagree', () => {
+			const key = root.derivePath("m/84'/1'/0'/0/0");
+			const script = bitcoin.payments.p2wpkh({
+				pubkey: key.publicKey,
+				network: regtest
+			}).output!;
+			const parent = new bitcoin.Transaction();
+			parent.addInput(Buffer.alloc(32, 7), 0);
+			parent.addOutput(script, 10000);
+			const unsigned = new bitcoin.Psbt({ network: regtest });
+			unsigned.addInput({
+				hash: parent.getId(),
+				index: 0,
+				witnessUtxo: { script, value: 9000 }
+			});
+			unsigned.addOutput({ script, value: 8000 });
+			const signed = bitcoin.Psbt.fromBase64(unsigned.toBase64(), {
+				network: regtest
+			});
+			signed.updateInput(0, { nonWitnessUtxo: parent.toBuffer() });
+			signed.signInput(0, key);
+			const res = watchOnly.importSignedPsbt(
+				signed.toBase64(),
+				unsigned.toBase64()
+			);
+			expect(res.isErr()).to.equal(true);
+			if (res.isErr()) {
+				expect(res.error.message).to.include('two different records');
+			}
+		});
+
 		it('rejects an input the signer already finalized', () => {
 			const psbt = bitcoin.Psbt.fromBase64(signExternally(builtBase64), {
 				network: regtest

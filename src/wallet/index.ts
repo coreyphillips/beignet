@@ -5260,10 +5260,12 @@ export class Wallet {
 	}
 
 	/**
-	 * The previous output (script and value) each PSBT input spends, read the
-	 * way bitcoinjs reads it when checking signatures: witnessUtxo first,
-	 * otherwise the output of nonWitnessUtxo the input points at. Throws when
-	 * an input carries neither or its nonWitnessUtxo is another transaction.
+	 * The previous output (script and value) each PSBT input spends, from its
+	 * witnessUtxo or the output of nonWitnessUtxo the input points at. bitcoinjs
+	 * checks segwit v0 signatures against nonWitnessUtxo when present and
+	 * taproot ones against witnessUtxo, so an input carrying both is refused
+	 * unless they agree. Throws when an input carries neither, its
+	 * nonWitnessUtxo is another transaction, or the two disagree.
 	 * @private
 	 * @param {bitcoin.Psbt} psbt
 	 * @returns {bitcoin.TxOutput[]}
@@ -5271,17 +5273,30 @@ export class Wallet {
 	private _psbtPrevouts(psbt: bitcoin.Psbt): bitcoin.TxOutput[] {
 		return psbt.txInputs.map((txInput, i) => {
 			const { witnessUtxo, nonWitnessUtxo } = psbt.data.inputs[i];
-			if (witnessUtxo) {
-				return { script: witnessUtxo.script, value: witnessUtxo.value };
-			}
+			let prevOut: bitcoin.TxOutput | undefined = witnessUtxo;
 			if (nonWitnessUtxo) {
 				const prevTx = bitcoin.Transaction.fromBuffer(nonWitnessUtxo);
-				const prevOut = prevTx.outs[txInput.index];
-				if (prevTx.getHash().equals(txInput.hash) && prevOut) {
-					return { script: prevOut.script, value: prevOut.value };
+				const out = prevTx.getHash().equals(txInput.hash)
+					? prevTx.outs[txInput.index]
+					: undefined;
+				if (!out) {
+					throw new Error(`Input ${i} does not carry the output it spends.`);
 				}
+				if (
+					witnessUtxo &&
+					(!witnessUtxo.script.equals(out.script) ||
+						witnessUtxo.value !== out.value)
+				) {
+					throw new Error(
+						`Input ${i} carries two different records of the output it spends.`
+					);
+				}
+				prevOut = out;
 			}
-			throw new Error(`Input ${i} does not carry the output it spends.`);
+			if (!prevOut) {
+				throw new Error(`Input ${i} does not carry the output it spends.`);
+			}
+			return { script: prevOut.script, value: prevOut.value };
 		});
 	}
 
