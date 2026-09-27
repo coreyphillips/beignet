@@ -448,6 +448,65 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(h.chain.broadcasts).to.deep.equal([stuck.fundingTxHex]);
 		});
 
+		it('a retry past the funding margin is withheld, and a funding someone else puts out is still watched (issue #1012)', async function () {
+			const h = await harness();
+			h.chain.failBroadcasts = 1_000;
+			const swap = clientSwap();
+			await create(h, swap);
+			const r = record(h, swap);
+			h.holds.hold(
+				swap.paymentHash,
+				BigInt(r.invoiceMsat),
+				r.refundHeight + 60
+			);
+			await settle();
+			expect(record(h, swap).state).to.equal('FUNDING');
+			// The backend would take the bytes now, but the refund height is
+			// inside the funding margin: a fresh admission would refuse.
+			h.chain.failBroadcasts = 0;
+			for (const height of [r.refundHeight - 6, r.refundHeight - 5]) {
+				h.chain.height = height;
+				await h.engine.onBlock(height);
+			}
+			const withheld = record(h, swap);
+			expect(withheld.state).to.equal('FUNDING');
+			expect(withheld.lastError).to.match(/^broadcast withheld: /);
+			expect(h.chain.broadcasts).to.have.length(0);
+			expect(h.chain.mempoolHas(withheld.fundingTxid!)).to.equal(false);
+			expect(h.holds.cancelled).to.have.length(0);
+			expect(
+				h.logs.filter((l) => l.action === 'swap_broadcast_withheld')
+			).to.have.length(1);
+			// Bytes that reach the chain anyway move on, and the claim on them
+			// settles the hold that was left parked.
+			h.chain.place(bitcoin.Transaction.fromHex(withheld.fundingTxHex!), 0);
+			await h.engine.onBlock(h.chain.height);
+			expect(record(h, swap).state).to.equal('FUNDING_BROADCAST');
+			h.chain.place(claimTxFor(record(h, swap), swap), 0);
+			await h.engine.onBlock(h.chain.height);
+			expect(record(h, swap).state).to.equal('SETTLED');
+			expect(h.holds.settled).to.have.length(1);
+		});
+
+		it('a funding the mempool dropped is rebroadcast only while the margins hold (issue #1012)', async function () {
+			const h = await harness();
+			const { swap } = await fundedSwap(h);
+			const r = record(h, swap);
+			expect(h.chain.broadcasts).to.have.length(1);
+			h.chain.evict(r.fundingTxid!);
+			await h.engine.onBlock(1001);
+			expect(h.chain.broadcasts).to.have.length(2);
+			h.chain.evict(r.fundingTxid!);
+			h.chain.height = r.refundHeight - 6;
+			await h.engine.onBlock(h.chain.height);
+			expect(h.chain.broadcasts).to.have.length(2);
+			expect(h.chain.mempoolHas(r.fundingTxid!)).to.equal(false);
+			const withheld = record(h, swap);
+			expect(withheld.state).to.equal('FUNDING_BROADCAST');
+			expect(withheld.lastError).to.match(/^broadcast withheld: /);
+			expect(h.holds.cancelled).to.have.length(0);
+		});
+
 		it('reports funding progress over status and confirms to policy', async function () {
 			const h = await harness();
 			const { swap, ack } = await fundedSwap(h);
@@ -455,7 +514,7 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			let st = await status(h, ack.terms!.swapId);
 			expect(st.state).to.equal(SwapWireState.FUNDING);
 			expect(st.fundingTxid!.toString('hex')).to.equal(r.fundingTxid);
-			expect(st.fundingTx!.toString('hex')).to.equal(r.fundingTxHex);
+			expect(st.fundingTx).to.equal(undefined);
 			h.chain.confirm(r.fundingTxid!, 1001);
 			h.chain.height = 1001;
 			await h.engine.onBlock(1001);
@@ -464,6 +523,7 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			st = await status(h, ack.terms!.swapId);
 			expect(st.state).to.equal(SwapWireState.FUNDED);
 			expect(st.fundingConfirmations).to.equal(1);
+			expect(st.fundingTx!.toString('hex')).to.equal(r.fundingTxHex);
 			expect(names(h)).to.include('swap:funded');
 		});
 	});
@@ -913,9 +973,9 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(h.chain.broadcasts).to.have.length(0);
 		});
 
-		it('status carries the funding bytes only once a broadcast was attempted', async function () {
+		it('status carries the funding bytes only once the chain confirms them (issue #1012)', async function () {
 			const h = await harness();
-			h.chain.failBroadcasts = 1;
+			h.chain.failBroadcasts = 1_000;
 			const swap = clientSwap();
 			await create(h, swap);
 			const r = record(h, swap);
@@ -925,13 +985,27 @@ describe('Reverse swap provider engine (issue #737)', function () {
 				r.refundHeight + 60
 			);
 			await settle();
-			// Attempted and refused by the backend: the bytes may be out,
-			// the payer may have them.
+			// Attempted and refused while the hold is parked: bytes handed
+			// over now could still be put out after the cancel.
 			const stuck = record(h, swap);
 			expect(stuck.state).to.equal('FUNDING');
 			expect(stuck.fundingBroadcastAttemptedAt).to.be.a('number');
-			const st = await status(h, Buffer.from(stuck.id, 'hex'));
-			expect(st.fundingTx!.toString('hex')).to.equal(stuck.fundingTxHex);
+			const id = Buffer.from(stuck.id, 'hex');
+			expect((await status(h, id)).fundingTx).to.equal(undefined);
+			h.holds.sweep(swap.paymentHash);
+			await settle();
+			expect(record(h, swap).state).to.equal('EXPOSED');
+			const exposed = await status(h, id);
+			expect(exposed.state).to.equal(SwapWireState.EXPOSED);
+			expect(exposed.fundingTx).to.equal(undefined);
+			// Confirmed bytes are public: handing them out costs nothing.
+			h.chain.place(bitcoin.Transaction.fromHex(stuck.fundingTxHex!), 1001);
+			h.chain.height = 1001;
+			await h.engine.onBlock(1001);
+			expect(record(h, swap).fundingHeight).to.equal(1001);
+			expect((await status(h, id)).fundingTx!.toString('hex')).to.equal(
+				stuck.fundingTxHex
+			);
 		});
 
 		it('a restart judges the hold again before the first broadcast', async function () {
