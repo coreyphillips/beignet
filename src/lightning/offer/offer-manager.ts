@@ -870,6 +870,22 @@ export class OfferManager extends EventEmitter {
 			}
 		}
 
+		// Delegated offers too (spec section 9.7.3 answers only requests that
+		// pass BOLT 12's checks): a policy prices by the requested amount, so
+		// an underpaying request would otherwise buy a cheaper slot.
+		const terms = this.invoiceRequestTerms(matchedOffer, request);
+		if ('error' in terms) {
+			const error: IInvoiceError = { error: terms.error };
+			if (replyPath && this.onionMessageManager) {
+				const errData = encodeInvoiceErrorTlv(error);
+				const messageData = new Map<number, Buffer>();
+				messageData.set(TLV_INVOICE_ERROR, errData);
+				this.onionMessageManager.sendReply(replyPath, messageData);
+			}
+			this.emit('invoice:error', error);
+			return null;
+		}
+
 		// A delegated offer (spec section 9.7): the policy decides the hash,
 		// the amount, the paths and the key. It never mints a preimage here.
 		const policy = this.offers.get(matchedOfferIdHex!)?.policy;
@@ -886,19 +902,6 @@ export class OfferManager extends EventEmitter {
 				},
 				replyPath
 			);
-		}
-
-		const terms = this.invoiceRequestTerms(matchedOffer, request);
-		if ('error' in terms) {
-			const error: IInvoiceError = { error: terms.error };
-			if (replyPath && this.onionMessageManager) {
-				const errData = encodeInvoiceErrorTlv(error);
-				const messageData = new Map<number, Buffer>();
-				messageData.set(TLV_INVOICE_ERROR, errData);
-				this.onionMessageManager.sendReply(replyPath, messageData);
-			}
-			this.emit('invoice:error', error);
-			return null;
 		}
 		const amount = terms.amount;
 
@@ -1028,7 +1031,7 @@ export class OfferManager extends EventEmitter {
 
 	/**
 	 * BOLT 12 issuer checks of an invoice_request against the terms of an
-	 * offer we answer ourselves, and the amount to invoice: invreq_amount,
+	 * offer we answer, and the amount to invoice: invreq_amount,
 	 * never below the offer's price times the quantity, or that price when
 	 * the request names no amount.
 	 */
