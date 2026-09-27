@@ -831,10 +831,17 @@ export class ReverseSwapProvider extends EventEmitter {
 			// Bytes travel only once a broadcast was attempted: signed bytes
 			// that never left (a refused first broadcast, a FUNDING row) are
 			// a valid, relayable transaction the payer must never be handed.
+			// Even then, only while the hold that pays for them is parked or
+			// once the chain has confirmed them: bytes that never relayed,
+			// handed out after the cancel, fund a claim nothing pays for.
 			const fundingTx =
 				record.fundingTxHex &&
 				record.fundingBroadcastAttemptedAt !== undefined &&
-				record.fundingTxHex.length / 2 <= SWAP_MAX_FUNDING_TX_BYTES
+				record.fundingTxHex.length / 2 <= SWAP_MAX_FUNDING_TX_BYTES &&
+				(record.fundingHeight !== undefined ||
+					(!record.holdCancelledAt &&
+						this.deps.heldSnapshot(Buffer.from(record.paymentHashHex, 'hex'))
+							?.state === 'ACCEPTED'))
 					? Buffer.from(record.fundingTxHex, 'hex')
 					: undefined;
 			status = {
@@ -1206,6 +1213,27 @@ export class ReverseSwapProvider extends EventEmitter {
 		}
 	}
 
+	/** Why the funding bytes must not be put out now, judged live. */
+	private broadcastProblem(record: ISwapRecord): string | undefined {
+		const snapshot = this.deps.heldSnapshot(
+			Buffer.from(record.paymentHashHex, 'hex')
+		);
+		return !snapshot || snapshot.state !== 'ACCEPTED' || !snapshot.complete
+			? `hold is ${snapshot ? snapshot.state : 'gone'} at broadcast time`
+			: this.admissionProblem(record, snapshot, this.deps.currentHeight());
+	}
+
+	private withholdFunding(record: ISwapRecord, problem: string): void {
+		const lastError = `broadcast withheld: ${problem}`;
+		if (record.lastError === lastError) return;
+		this.deps.ledger.patch(record.id, { lastError });
+		this.deps.log('swap_broadcast_withheld', {
+			swapId: record.id,
+			state: record.state,
+			reason: problem
+		});
+	}
+
 	private async processFunding(record: ISwapRecord): Promise<void> {
 		let current = record;
 		if (current.state === 'HELD') {
@@ -1316,13 +1344,7 @@ export class ReverseSwapProvider extends EventEmitter {
 				await this.dropUnsentFunding(current);
 				return;
 			}
-			const snapshot = this.deps.heldSnapshot(
-				Buffer.from(current.paymentHashHex, 'hex')
-			);
-			const problem =
-				!snapshot || snapshot.state !== 'ACCEPTED' || !snapshot.complete
-					? `hold is ${snapshot ? snapshot.state : 'gone'} at broadcast time`
-					: this.admissionProblem(current, snapshot, this.deps.currentHeight());
+			const problem = this.broadcastProblem(current);
 			if (problem) {
 				const moved = this.deps.ledger.move(current.id, 'FAILED', {
 					failureReason: `broadcast refused: ${problem}`
@@ -1345,6 +1367,17 @@ export class ReverseSwapProvider extends EventEmitter {
 			});
 			if (marked.outcome !== 'applied') return;
 			current = marked.record!;
+		} else if (!(await this.fundingSeenOnChain(current))) {
+			// Every retry is judged the same way: bytes that first relay past
+			// the funding margin, or as the sweeper cancels the hold, fund a
+			// claim nothing pays for. They may be out already, so they are
+			// kept, the hold is left parked for a claim to settle, and the
+			// chain is still read on every pass.
+			const problem = this.broadcastProblem(current);
+			if (problem) {
+				this.withholdFunding(current, problem);
+				return;
+			}
 		}
 		try {
 			await this.deps.broadcast(current.fundingTxHex!);
@@ -1509,11 +1542,17 @@ export class ReverseSwapProvider extends EventEmitter {
 			current.fundingTxHex &&
 			current.state === 'FUNDING_BROADCAST'
 		) {
-			// Not seen yet: the broadcast may not have propagated.
-			try {
-				await this.deps.broadcast(current.fundingTxHex);
-			} catch {
-				/* retried next block */
+			// Not seen yet: the broadcast may not have propagated, or the
+			// mempool dropped it. Judged like any funding retry.
+			const problem = this.broadcastProblem(current);
+			if (problem) {
+				this.withholdFunding(current, problem);
+			} else {
+				try {
+					await this.deps.broadcast(current.fundingTxHex);
+				} catch {
+					/* retried next block */
+				}
 			}
 		}
 
