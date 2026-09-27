@@ -1506,7 +1506,23 @@ export class LightningNode extends EventEmitter {
 								});
 							},
 							snapshotIntervalFrames: config.recovery.snapshotIntervalFrames,
-							snapshotIntervalBytes: config.recovery.snapshotIntervalBytes
+							snapshotIntervalBytes: config.recovery.snapshotIntervalBytes,
+							maxFrameCiphertextBytes: barrier
+								? (): number => barrier.maxRecordBytes()
+								: undefined,
+							onFrameCeiling: ({ outcome, detail }): void => {
+								this.logger?.warn(`recovery journal: ${detail}`);
+								// Deferred out of the commit's open transaction, as above.
+								setImmediate(() => {
+									this.emitStructuredLog(
+										'channel',
+										outcome === 'trimmed'
+											? 'recovery_snapshot_trimmed'
+											: 'recovery_frame_oversized',
+										{ detail }
+									);
+								});
+							}
 						}
 				  )
 				: undefined;

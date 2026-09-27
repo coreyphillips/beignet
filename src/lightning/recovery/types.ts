@@ -296,6 +296,10 @@ export interface EncryptedRecoveryFrame {
  * journaled. A reconstruction therefore restores post-snapshot rows as
  * pending_send, which errs toward retransmission: the safe direction, since
  * peers treat replays idempotently.
+ *
+ * Size note: a snapshot that would exceed the guardians' record limit omits
+ * the oldest forwarding events and settled payment history instead
+ * (fitSnapshotUnderCeiling in journal.ts), so those two may be partial.
  */
 export interface RecoverySnapshot {
 	/**

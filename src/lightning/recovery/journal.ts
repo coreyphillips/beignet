@@ -38,6 +38,7 @@ import {
 	withStorageTransaction
 } from '../storage/transaction';
 import { decodeFrame, encodeFrame, hashFrame } from './frame-codec';
+import { PaymentDirection, PaymentStatus } from '../node/types';
 import { RecoveryManager } from './recovery-manager';
 import {
 	IRecoveryJournalSink,
@@ -52,6 +53,8 @@ import {
 
 const IV_LENGTH = 12;
 const TAG_LENGTH = 16;
+/** A stored frame's ciphertext is its plaintext plus the IV and tag. */
+const FRAME_CIPHERTEXT_OVERHEAD = IV_LENGTH + TAG_LENGTH;
 /** 32 zero bytes: previousFrameHash of the first frame in a chain. */
 const GENESIS_HASH = Buffer.alloc(32);
 
@@ -243,6 +246,35 @@ export const JOURNAL_META_KEYS = {
 	generation: 'guardian_generation_v1'
 } as const;
 
+/**
+ * Keep the longest tail of `rows` (oldest first, so the newest) under which
+ * the frame fits, applying each trial through `apply`; returns how many were
+ * kept. Rows encode to similar sizes, so the average predicts the count and
+ * each correction drops at least one more.
+ */
+function keepNewestThatFit<T>(
+	rows: T[],
+	apply: (kept: T[]) => void,
+	size: () => number,
+	ceiling: number
+): number {
+	const full = size();
+	if (full <= ceiling) return rows.length;
+	apply([]);
+	const bare = size();
+	if (bare >= ceiling) return 0;
+	const perRow = (full - bare) / rows.length;
+	let kept = Math.min(rows.length - 1, Math.floor((ceiling - bare) / perRow));
+	while (kept > 0) {
+		apply(rows.slice(rows.length - kept));
+		const over = size() - ceiling;
+		if (over <= 0) return kept;
+		kept -= Math.max(1, Math.ceil(over / perRow));
+	}
+	apply([]);
+	return 0;
+}
+
 /** Deltas between full-state snapshot frames. */
 const DEFAULT_SNAPSHOT_INTERVAL_FRAMES = 256;
 /** Delta plaintext bytes between snapshots (spec 5.3: N frames OR M bytes). */
@@ -323,6 +355,24 @@ export interface IRecoveryJournalOptions {
 	 * are large (a busy channel's full state per frame).
 	 */
 	snapshotIntervalBytes?: number;
+	/**
+	 * The largest record ciphertext every replica accepts (the smallest
+	 * `maxCiphertextBytes` the guardian set advertises). A guardian refuses a
+	 * bigger record and, accepting only `logHead.sequence + 1`, every record
+	 * after it, for good. Snapshots are held under it by dropping their oldest
+	 * history (see fitSnapshotUnderCeiling). Omit for a journal with no
+	 * replicas.
+	 */
+	maxFrameCiphertextBytes?: () => number;
+	/**
+	 * The ceiling above cost a snapshot some of its history (`trimmed`), or
+	 * a frame is over it with nothing left to drop (`oversized`: the
+	 * guardians will refuse it).
+	 */
+	onFrameCeiling?: (event: {
+		outcome: 'trimmed' | 'oversized';
+		detail: string;
+	}) => void;
 }
 
 /**
@@ -628,6 +678,8 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	/** null means no ceiling: the prune is never forced. */
 	private readonly maxRetainedFrameGap: number | null;
 	private readonly onCompactionForced: ((detail: string) => void) | undefined;
+	private readonly maxFrameCiphertextBytes: (() => number) | undefined;
+	private readonly onFrameCeiling: IRecoveryJournalOptions['onFrameCeiling'];
 	/** Set once this run's first append has re-based the chain (see appendFrame). */
 	private rebasedThisRun = false;
 	/** One-shot: the write boundary validated the stored schema marker. */
@@ -710,6 +762,8 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			options.maxRetainedFrameGap ??
 			(this.durability === 'quorum' ? null : DEFAULT_MAX_RETAINED_FRAME_GAP);
 		this.onCompactionForced = options.onCompactionForced;
+		this.maxFrameCiphertextBytes = options.maxFrameCiphertextBytes;
+		this.onFrameCeiling = options.onFrameCeiling;
 		this.activeLeaseEpoch = options.activeLeaseEpoch;
 	}
 
@@ -1336,20 +1390,24 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 					`verified chain's epoch ${this.epochFloor}; refusing to write`
 			);
 		}
-		// Stamped here rather than at each construction site so that deltas,
-		// bootstrap snapshots, per-run re-base snapshots and interval snapshots
-		// all carry the same declaration; a snapshot that omitted it would be a
-		// certified head that says nothing about what its writer promised.
-		if (this.durability) {
-			frame.durability = this.durability;
-			// Only quorum frames carry a policy stamp, because only they make a
-			// claim about which messages waited. Local and async-remote frames
-			// keep exactly the bytes they had before.
-			if (this.durability === 'quorum') {
-				frame.durabilityPolicy = WIRE_SAFETY_POLICY_VERSION;
-			}
-		}
+		this.stampDurability(frame);
 		const plaintext = encodeFrame(frame);
+		const ceiling = this.maxFrameCiphertextBytes?.();
+		if (
+			ceiling !== undefined &&
+			plaintext.length + FRAME_CIPHERTEXT_OVERHEAD > ceiling
+		) {
+			// Written anyway: refusing would roll back the transition and stop
+			// every channel locally, which is worse than a replica stuck behind.
+			this.onFrameCeiling?.({
+				outcome: 'oversized',
+				detail:
+					`frame ${frame.sequence} is ` +
+					`${plaintext.length + FRAME_CIPHERTEXT_OVERHEAD} ciphertext bytes ` +
+					`against the ${ceiling} byte guardian record limit with nothing ` +
+					`left to drop; the guardians will refuse it and every frame after it`
+			});
+		}
 		const frameHash = hashFrame(plaintext);
 		const key = deriveFrameKey(this.masterKey, this.nodeId, frame.writerEpoch);
 		const aad = frameAad(
@@ -1401,6 +1459,96 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			);
 		}
 		return { frameHash, plaintextBytes: plaintext.length };
+	}
+
+	/**
+	 * Stamped at write time rather than at each construction site so that
+	 * deltas, bootstrap snapshots, per-run re-base snapshots and interval
+	 * snapshots all carry the same declaration; a snapshot that omitted it
+	 * would be a certified head that says nothing about what its writer
+	 * promised.
+	 */
+	private stampDurability(frame: RecoveryFrame): void {
+		if (!this.durability) return;
+		frame.durability = this.durability;
+		// Only quorum frames carry a policy stamp, because only they make a
+		// claim about which messages waited. Local and async-remote frames
+		// keep exactly the bytes they had before.
+		if (this.durability === 'quorum') {
+			frame.durabilityPolicy = WIRE_SAFETY_POLICY_VERSION;
+		}
+	}
+
+	/**
+	 * Hold a snapshot under the replicas' record ceiling by dropping history
+	 * no safety path reads, oldest first, and say what went. First the
+	 * forwarding ledger, then terminal payment records the send-side
+	 * duplicate checks never consult: completed or failed receives, and
+	 * failed sends with no preimage (a failed hash stays retryable anyway).
+	 * Payment records are what grow without bound, a few hundred bytes to a
+	 * few KB each. Completed sends always stay, because the double-pay guard
+	 * (issue #975) reads exactly those rows after a restore. A snapshot still
+	 * over after both is reported by writeFrame.
+	 */
+	private fitSnapshotUnderCeiling(frame: RecoveryFrame): string[] {
+		const ceiling = this.maxFrameCiphertextBytes?.();
+		if (ceiling === undefined) return [];
+		this.stampDurability(frame);
+		const size = (): number =>
+			encodeFrame(frame).length + FRAME_CIPHERTEXT_OVERHEAD;
+		if (size() <= ceiling) return [];
+		const snapshot = frame.snapshot!;
+		const dropped: string[] = [];
+
+		// captureSnapshot orders the ledger oldest first.
+		const events = snapshot.forwardingEvents;
+		const keptEvents = keepNewestThatFit(
+			events,
+			(kept) => {
+				snapshot.forwardingEvents = kept;
+			},
+			size,
+			ceiling
+		);
+		if (keptEvents < events.length) {
+			dropped.push(
+				`the oldest ${events.length - keptEvents} of ${events.length} ` +
+					`forwarding events`
+			);
+		}
+		if (size() <= ceiling) return dropped;
+
+		const payments = snapshot.payments;
+		const preimages = new Set(snapshot.preimages.map((p) => p.paymentHash));
+		const history = payments
+			.filter(
+				({ paymentHash, payment }) =>
+					payment.status !== PaymentStatus.PENDING &&
+					(payment.direction === PaymentDirection.INCOMING ||
+						(payment.status === PaymentStatus.FAILED &&
+							payment.preimage === undefined &&
+							!preimages.has(paymentHash)))
+			)
+			.sort((a, b) => a.payment.createdAt - b.payment.createdAt);
+		const historic = new Set(history);
+		const keptHistory = keepNewestThatFit(
+			history,
+			(kept) => {
+				const keep = new Set(kept);
+				snapshot.payments = payments.filter(
+					(p) => !historic.has(p) || keep.has(p)
+				);
+			},
+			size,
+			ceiling
+		);
+		if (keptHistory < history.length) {
+			dropped.push(
+				`the oldest ${history.length - keptHistory} of ${history.length} ` +
+					`settled receives and failed sends`
+			);
+		}
+		return dropped;
 	}
 
 	/**
@@ -1498,7 +1646,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		sequence: bigint,
 		previousFrameHash: Buffer
 	): void {
-		this.writeFrame({
+		const frame: RecoveryFrame = {
 			version: 1,
 			writerEpoch: this.writerEpoch(),
 			sequence,
@@ -1507,7 +1655,17 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			mutations: [],
 			outboundMessages: [],
 			snapshot: this.captureSnapshot()
-		});
+		};
+		const dropped = this.fitSnapshotUnderCeiling(frame);
+		this.writeFrame(frame);
+		if (dropped.length > 0) {
+			this.onFrameCeiling?.({
+				outcome: 'trimmed',
+				detail:
+					`snapshot ${sequence} dropped ${dropped.join(' and ')} to fit ` +
+					`the guardian record limit; a restore from it will not have them`
+			});
+		}
 		// Cadence is measured against snapshots WRITTEN. The verified base only
 		// moves when the deltas below it are actually pruned, which a lagging
 		// replica can postpone (see compactTo).

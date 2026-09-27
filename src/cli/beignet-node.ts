@@ -137,6 +137,7 @@ import {
 	JOURNAL_META_KEYS,
 	REPLICATION_META_KEYS,
 	IRotationEvent,
+	IGuardianReplicationEvent,
 	isOnionV3Hostname,
 	parseBolt8GuardianUrl
 } from '../lightning/recovery';
@@ -4018,7 +4019,25 @@ export class BeignetNode extends EventEmitter {
 				this.log('debug', `Recovery replication: ${event.type}`, {
 					detail: event.detail
 				});
+				this.relayRecordTooLarge(event);
 			}
+		});
+	}
+
+	/**
+	 * A guardian that refuses a record as too large can take nothing after
+	 * it, so in quorum mode the node stops releasing channel updates and in
+	 * async mode its backup stops advancing. Neither shows up anywhere else.
+	 */
+	private relayRecordTooLarge(event: IGuardianReplicationEvent): void {
+		if (event.type !== 'record:too-large') return;
+		this.log('error', 'Recovery guardian refused an oversized record', {
+			detail: event.detail
+		});
+		this.emit('node:error', {
+			code: 'RECOVERY_RECORD_TOO_LARGE',
+			message: event.detail,
+			timestamp: Date.now()
 		});
 	}
 
@@ -5531,6 +5550,7 @@ export class BeignetNode extends EventEmitter {
 					this.log('debug', `Rotation replication: ${event.type}`, {
 						detail: event.detail
 					});
+					this.relayRecordTooLarge(event);
 				}
 			});
 		} catch (error) {
