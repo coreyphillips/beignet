@@ -962,11 +962,14 @@ export class Transaction {
 			for (const { address, path } of Object.values(changeAddressIndex)) {
 				if (address && path) changePaths.set(address, path);
 			}
-			// A wallet that has not set its change index yet gets its change
-			// address generated on the fly, and neither map above holds it.
-			const fallbackRes = await this._wallet.getChangeAddress();
-			if (fallbackRes.isErr()) return err(fallbackRes.error.message);
-			changePaths.set(fallbackRes.value.address, fallbackRes.value.path);
+			// A wallet that has not set a type's change index yet gets that
+			// type's change address generated on the fly, and neither map above
+			// holds it.
+			for (const type of this._wallet.addressTypesToMonitor) {
+				const fallbackRes = await this._wallet.getChangeAddress(type);
+				if (fallbackRes.isErr()) return err(fallbackRes.error.message);
+				changePaths.set(fallbackRes.value.address, fallbackRes.value.path);
+			}
 			const network = getBitcoinJsNetwork(this._wallet.network);
 			const masterFingerprint = this._wallet.getMasterFingerprint();
 			psbt.txOutputs.forEach((output, index) => {

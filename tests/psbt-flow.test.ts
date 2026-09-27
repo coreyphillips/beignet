@@ -335,6 +335,26 @@ describe('External-Signer PSBT Flow', function () {
 			const derivation = psbt.data.outputs[changeIndexOf(psbt)].bip32Derivation;
 			expect(derivation).to.have.length(1);
 			expect(derivation![0].path).to.equal("m/84'/1'/0'/1/0");
+
+			// Change of another type, also generated on the fly.
+			const p2trChange = await freshWallet.getChangeAddress(EAddressType.p2tr);
+			if (p2trChange.isErr()) throw p2trChange.error;
+			const p2trRes = await freshWallet.transaction.createUnsignedPsbt({
+				transactionData: {
+					...getDefaultSendTransaction(),
+					inputs: [await makeUtxo(freshWallet, { index: 0, value: 60000 })],
+					outputs: [{ address: RECIPIENT, value: 20000, index: 0 }],
+					changeAddress: p2trChange.value.address,
+					fee: 500
+				},
+				shuffleOutputs: false
+			});
+			if (p2trRes.isErr()) throw p2trRes.error;
+			const tapDerivation =
+				p2trRes.value.data.outputs[changeIndexOf(p2trRes.value)]
+					.tapBip32Derivation;
+			expect(tapDerivation).to.have.length(1);
+			expect(tapDerivation![0].path).to.equal("m/86'/1'/0'/1/0");
 		});
 
 		it('includes redeemScript for p2sh-p2wpkh inputs', async () => {
