@@ -635,6 +635,45 @@ describe('Multisig P2WSH Wallets', function () {
 				expect(sendMax.error).to.be.instanceOf(MultisigSpendError);
 			}
 		});
+
+		it('no cosigner signs over a previous transaction worth more than witnessUtxo (#1098)', async () => {
+			const utxo = await makeMultisigUtxo(walletA, { index: 0, value: 500000 });
+			const prevTx = new bitcoin.Transaction();
+			prevTx.addInput(Buffer.alloc(32, 7), 0);
+			prevTx.addOutput(
+				bitcoin.address.toOutputScript(utxo.address, regtest),
+				1000000
+			);
+			const savedUtxos = walletA.data.utxos;
+			walletA.data.utxos = [{ ...utxo, tx_hash: prevTx.getId() }];
+			try {
+				// Offline, so the build attaches no previous transaction and prices
+				// the fee from the reported 500000.
+				const built = await walletA.buildPsbt({
+					address: RECIPIENT,
+					amount: 200000,
+					satsPerByte: 2,
+					shuffleOutputs: false
+				});
+				if (built.isErr()) throw built.error;
+				const psbt = bitcoin.Psbt.fromBase64(built.value.psbtBase64, {
+					network: regtest
+				});
+				expect(psbt.data.inputs[0].nonWitnessUtxo).to.equal(undefined);
+				psbt.updateInput(0, { nonWitnessUtxo: prevTx.toBuffer() });
+				// B holds no record of the coin, so only witnessUtxo stops it.
+				for (const wallet of [walletA, walletB]) {
+					const res = wallet.signPsbtWithOurKey(psbt.toBase64());
+					expect(res.isErr()).to.equal(true);
+					if (res.isOk()) return;
+					expect(res.error.message).to.contain(
+						'holds 1000000 sats, not the 500000 its witnessUtxo records'
+					);
+				}
+			} finally {
+				walletA.data.utxos = savedUtxos;
+			}
+		});
 	});
 
 	describe('Descriptor export', () => {

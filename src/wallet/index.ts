@@ -5254,8 +5254,10 @@ export class Wallet {
 	 * Adds OUR partial signature(s) to a PSBT without finalizing it (multisig
 	 * cosigner flow). Inputs are matched through their bip32Derivation
 	 * entries: any entry whose pubkey equals the key this wallet derives at
-	 * that path gets signed. Inputs we already signed are skipped. Requires
-	 * the mnemonic; watch-only wallets get the typed WatchOnlySigningError.
+	 * that path gets signed. Inputs we already signed are skipped. Errs when
+	 * an input we would sign spends a previous output that disagrees with its
+	 * witnessUtxo or this wallet's UTXO. Requires the mnemonic; watch-only
+	 * wallets get the typed WatchOnlySigningError.
 	 * @param {string} psbtBase64
 	 * @returns {Result<string>} The PSBT (base64) including our signatures.
 	 */
@@ -5282,7 +5284,11 @@ export class Wallet {
 					const alreadySigned = (input.partialSig ?? []).some((ps) =>
 						ps.pubkey.equals(keyPair.publicKey)
 					);
-					if (!alreadySigned) psbt.signInput(i, keyPair);
+					if (!alreadySigned) {
+						const prevOutCheck = this._checkPsbtPrevOut(psbt, i);
+						if (prevOutCheck.isErr()) return err(prevOutCheck.error.message);
+						psbt.signInput(i, keyPair);
+					}
 					break;
 				}
 			}
@@ -5295,6 +5301,68 @@ export class Wallet {
 		} catch (e) {
 			return err(e);
 		}
+	}
+
+	/**
+	 * Refuses to sign input i unless the previous output its signature commits
+	 * to agrees with the input's witnessUtxo and with this wallet's record of
+	 * the coin. bitcoinjs signs segwit v0 and legacy inputs over the output in
+	 * nonWitnessUtxo when present, while buildPsbt priced the fee from the
+	 * server-reported value (also written to witnessUtxo). A real previous
+	 * transaction added later for an under-reported coin would otherwise get
+	 * a valid signature that pays the difference as fee. A cosigner that has
+	 * no record of the coin still checks witnessUtxo.
+	 * @private
+	 * @param {bitcoin.Psbt} psbt
+	 * @param {number} i
+	 * @returns {Result<string>}
+	 */
+	private _checkPsbtPrevOut(psbt: bitcoin.Psbt, i: number): Result<string> {
+		const { witnessUtxo, nonWitnessUtxo } = psbt.data.inputs[i];
+		const { hash, index } = psbt.txInputs[i];
+		const txid = Buffer.from(hash).reverse().toString('hex');
+		const outpoint = `${txid}:${index}`;
+		let prevOut: bitcoin.TxOutput | undefined = witnessUtxo;
+		if (nonWitnessUtxo) {
+			const prevTx = bitcoin.Transaction.fromBuffer(nonWitnessUtxo);
+			prevOut = prevTx.getHash().equals(hash) ? prevTx.outs[index] : undefined;
+			if (!prevOut) {
+				return err(
+					`Input ${i}: nonWitnessUtxo is not the transaction holding ${outpoint}.`
+				);
+			}
+		}
+		if (!prevOut) return err(`Input ${i} does not carry the output it spends.`);
+		const records: { source: string; script: Buffer; value: number }[] = [];
+		if (witnessUtxo) {
+			records.push({ source: 'its witnessUtxo', ...witnessUtxo });
+		}
+		const utxo = this.data.utxos.find(
+			(u) => u.tx_hash === txid && u.tx_pos === index
+		);
+		if (utxo) {
+			records.push({
+				source: 'this wallet',
+				script: bitcoin.address.toOutputScript(
+					utxo.address,
+					this.getBitcoinNetwork()
+				),
+				value: utxo.value
+			});
+		}
+		for (const record of records) {
+			if (!prevOut.script.equals(record.script)) {
+				return err(
+					`Input ${i}: ${outpoint} pays a different script than ${record.source} records.`
+				);
+			}
+			if (prevOut.value !== record.value) {
+				return err(
+					`Input ${i}: ${outpoint} holds ${prevOut.value} sats, not the ${record.value} ${record.source} records.`
+				);
+			}
+		}
+		return ok('Previous output matches.');
 	}
 
 	/**
