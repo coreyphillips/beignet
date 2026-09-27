@@ -4943,8 +4943,19 @@ export class LightningNode extends EventEmitter {
 
 		this.channelManager.on(
 			'htlc:failed',
-			(channelId: Buffer, htlcId: bigint, reason: Buffer) => {
-				this.handleHtlcFailed(channelId, htlcId, reason);
+			(
+				channelId: Buffer,
+				htlcId: bigint,
+				reason: Buffer,
+				malformedCode?: number
+			) => {
+				this.handleHtlcFailed(
+					channelId,
+					htlcId,
+					reason,
+					undefined,
+					malformedCode
+				);
 				this.emit('htlc:failed', { channelId, htlcId });
 			}
 		);
@@ -23265,17 +23276,15 @@ export class LightningNode extends EventEmitter {
 	 * code and the sha256 of the onion we forwarded. The synthetic 4-byte
 	 * reason is not an onion failure: wrapped, it reaches the sender as bytes
 	 * no hop's key decrypts, and an unreadable failure penalises every hop on
-	 * the route. Undefined for any other reason, or when the inbound shared
-	 * secret is gone (the reason then relays as before).
+	 * the route. Undefined when the inbound shared secret is gone (the reason
+	 * then relays as before).
 	 */
 	private originateMalformedForwardFailure(
 		outChannelId: Buffer,
 		outHtlcId: bigint,
 		forward: { inChannelId: Buffer; inHtlcId: bigint },
-		reason: Buffer
+		code: number
 	): Buffer | undefined {
-		const code = LightningNode.malformedFailureCode(reason);
-		if (code === undefined) return undefined;
 		const sharedSecret = this.receivedHtlcSharedSecrets.get(
 			`${forward.inChannelId.toString('hex')}:${forward.inHtlcId}`
 		);
@@ -23299,7 +23308,9 @@ export class LightningNode extends EventEmitter {
 		 * peer: `reason` is then already a complete failure message (or empty)
 		 * and this string is the human-readable cause.
 		 */
-		localFailureReason?: string
+		localFailureReason?: string,
+		/** The failure_code, when the peer failed it by update_fail_malformed_htlc. */
+		malformedCode?: number
 	): void {
 		// Check if this is a forwarded HTLC — wrap and propagate failure upstream
 		const outKey = `${channelId.toString('hex')}:offered-${htlcId}`;
@@ -23322,12 +23333,12 @@ export class LightningNode extends EventEmitter {
 			// never finishes the round is force-closed out by
 			// scanForwardTimeouts at the forward-timeout margin.
 			const originated =
-				localFailureReason === undefined
+				malformedCode !== undefined
 					? this.originateMalformedForwardFailure(
 							channelId,
 							htlcId,
 							forward,
-							reason
+							malformedCode
 					  )
 					: undefined;
 			const upstreamReason = originated ?? reason;

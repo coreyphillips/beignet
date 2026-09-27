@@ -85,9 +85,9 @@ export const HOP_DATA_LEGACY_LENGTH = 32;
 
 // ── Failure Codes ───────────────────────────────────────────────────
 
-export const INVALID_ONION_VERSION = 0x8000 | 4;
-export const INVALID_ONION_HMAC = 0x8000 | 5;
-export const INVALID_ONION_KEY = 0x8000 | 6;
+export const INVALID_ONION_VERSION = 0x8000 | 0x4000 | 4;
+export const INVALID_ONION_HMAC = 0x8000 | 0x4000 | 5;
+export const INVALID_ONION_KEY = 0x8000 | 0x4000 | 6;
 /**
  * BOLT 4 route blinding: any failure at a node inside a blinded route must
  * surface as this single error so the sender learns nothing about the blinded

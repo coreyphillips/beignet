@@ -6,9 +6,9 @@
  *    not relayed as a 4-byte synthetic blob no hop's key decrypts.
  * 2. An unparseable non-blinded onion is answered with
  *    update_fail_malformed_htlc and the BADONION code for its error class.
- * 3. An invalid update_add_htlc blinding point fails its HTLC (and is
- *    refused by the decoder), and a throwing htlc:forwarded listener cannot
- *    skip the sibling HTLCs of its batch.
+ * 3. An invalid update_add_htlc blinding point fails its HTLC, not the
+ *    channel, and a throwing htlc:forwarded listener cannot skip the sibling
+ *    HTLCs of its batch.
  * 4. An authenticated failure with failure_len < 2 is attributed to its hop.
  * 5. Hop payloads missing required fields, or with wrong-length fields, are
  *    invalid_onion_payload; the blinded relay enforces htlc_minimum_msat and
@@ -277,9 +277,14 @@ describe('BOLT 4 failure handling (issue #1025)', function () {
 	this.timeout(10_000);
 
 	describe('1. downstream update_fail_malformed_htlc on a forward', function () {
+		/**
+		 * Carol fails Alice's forward by update_fail_malformed_htlc, or when
+		 * `forged`, by an update_fail_htlc whose reason has the same 4 bytes.
+		 */
 		function forwardFailedMalformed(
 			seedBase: number,
-			provisional: boolean
+			provisional: boolean,
+			forged = false
 		): {
 			f: IFixture;
 			inSecret: Buffer;
@@ -301,11 +306,7 @@ describe('BOLT 4 failure handling (issue #1025)', function () {
 				cltvExpiry: HEIGHT + 400,
 				onionRoutingPacket: forwardedOnion,
 				direction: HtlcDirection.OFFERED,
-				// The shape handleUpdateFailMalformedHtlc leaves, with the
-				// removal round still to run when provisional.
-				state: HtlcState.FAILED,
-				removalLocallyRevoked: !provisional,
-				removalRemoteCommitted: !provisional
+				state: HtlcState.COMMITTED
 			});
 			const outKey = `${f.outChannelId.toString('hex')}:offered-7`;
 			a.forwardedHtlcs.set(outKey, {
@@ -317,11 +318,27 @@ describe('BOLT 4 failure handling (issue #1025)', function () {
 				`${f.inChannelId.toString('hex')}:7`,
 				inSecret
 			);
-			a.handleHtlcFailed(
-				f.outChannelId,
-				7n,
-				malformedReason(INVALID_ONION_HMAC)
-			);
+			const cm = a.channelManager;
+			const channel = cm.getChannel(f.outChannelId);
+			const actions = forged
+				? channel.handleUpdateFailHtlc({
+						channelId: f.outChannelId,
+						id: 7n,
+						reason: malformedReason(INVALID_ONION_HMAC)
+				  })
+				: channel.handleUpdateFailMalformedHtlc({
+						channelId: f.outChannelId,
+						id: 7n,
+						sha256OfOnion: sha256(forwardedOnion),
+						failureCode: INVALID_ONION_HMAC
+				  });
+			if (!provisional) {
+				// The removal round has run.
+				const entry = f.outHtlcs.get('offered-7')!;
+				entry.removalLocallyRevoked = true;
+				entry.removalRemoteCommitted = true;
+			}
+			cm.processActions(cm.getPeerForChannel(f.outChannelId), channel, actions);
 			return { f, inSecret, forwardedOnion };
 		}
 
@@ -369,6 +386,18 @@ describe('BOLT 4 failure handling (issue #1025)', function () {
 			expectOriginated(f, inSecret, forwardedOnion);
 			f.destroy();
 		});
+
+		it('relays an update_fail_htlc of the same 4 bytes instead of vouching for it', function () {
+			const { f, inSecret } = forwardFailedMalformed(715, false, true);
+			expect(f.failed.length).to.equal(1);
+			expect(
+				f.failed[0].reason.equals(
+					wrapFailureMessage(inSecret, malformedReason(INVALID_ONION_HMAC))
+				),
+				'wrapped as received, not a failure under our key'
+			).to.equal(true);
+			f.destroy();
+		});
 	});
 
 	describe('2. unparseable non-blinded onion', function () {
@@ -409,6 +438,14 @@ describe('BOLT 4 failure handling (issue #1025)', function () {
 				true
 			);
 		}
+
+		it('the BADONION codes carry PERM, as BOLT 4 defines them', function () {
+			expect([
+				INVALID_ONION_VERSION,
+				INVALID_ONION_HMAC,
+				INVALID_ONION_KEY
+			]).to.deep.equal([0xc004, 0xc005, 0xc006]);
+		});
 
 		it('a bad HMAC is invalid_onion_hmac', function () {
 			const f = incoming(720, (onion) => {
@@ -497,7 +534,7 @@ describe('BOLT 4 failure handling (issue #1025)', function () {
 			f.destroy();
 		});
 
-		it('the update_add_htlc decoder refuses a blinding point off the curve', function () {
+		it('the update_add_htlc decoder keeps a blinding point off the curve for the HTLC to fail', function () {
 			const msg = {
 				channelId: crypto.randomBytes(32),
 				id: 1n,
@@ -512,11 +549,12 @@ describe('BOLT 4 failure handling (issue #1025)', function () {
 					encodeUpdateAddHtlcMessage({ ...msg, blindingPoint: valid })
 				).blindingPoint?.equals(valid)
 			).to.equal(true);
-			expect(() =>
+			// A decoder throw would fail the whole channel.
+			expect(
 				decodeUpdateAddHtlcMessage(
 					encodeUpdateAddHtlcMessage({ ...msg, blindingPoint: NOT_A_POINT })
-				)
-			).to.throw(/not a valid point/);
+				).blindingPoint?.equals(NOT_A_POINT)
+			).to.equal(true);
 		});
 
 		it('a throwing htlc:forwarded listener does not skip later HTLCs of the batch', function () {

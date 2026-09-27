@@ -489,7 +489,9 @@ export interface IChannelManagerConfig {
  * - 'channel:closed' (channelId: Buffer)
  * - 'htlc:forwarded' (channelId: Buffer, htlcId: bigint, amountMsat: bigint, paymentHash: Buffer)
  * - 'htlc:fulfilled' (channelId: Buffer, htlcId: bigint, preimage: Buffer)
- * - 'htlc:failed' (channelId: Buffer, htlcId: bigint, reason: Buffer)
+ * - 'htlc:failed' (channelId: Buffer, htlcId: bigint, reason: Buffer,
+ *   malformedCode?: number): malformedCode is set only for
+ *   update_fail_malformed_htlc
  * - 'htlc:claimed-onchain' (channelId: Buffer, paymentHash: Buffer, preimage: Buffer,
  *   claimTxid: string): a confirmed spend of a received HTLC output revealed
  *   its preimage; repeats when the spend is re-reported
@@ -9362,7 +9364,8 @@ export class ChannelManager extends EventEmitter {
 						'htlc:failed',
 						channel.getChannelId(),
 						action.htlcId,
-						action.reason
+						action.reason,
+						action.malformedCode
 					);
 					break;
 				case ChannelActionType.WATCH_FUNDING:
