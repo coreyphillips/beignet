@@ -1519,13 +1519,19 @@ export class ReverseSwapProvider extends EventEmitter {
 				swapId: current.id,
 				previousHeight: observation.funding.previousHeight
 			});
-			// Rebroadcast our own bytes; the state clock only moves forward
-			// again once the chain confirms them.
+			// Rebroadcast our own bytes, judged like any funding retry: after a
+			// cancelled hold nothing pays for the claim they would enable. The
+			// state clock only moves forward again once the chain confirms them.
 			if (current.fundingTxHex) {
-				try {
-					await this.deps.broadcast(current.fundingTxHex);
-				} catch {
-					/* retried next block */
+				const problem = this.broadcastProblem(current);
+				if (problem) {
+					this.withholdFunding(current, problem);
+				} else {
+					try {
+						await this.deps.broadcast(current.fundingTxHex);
+					} catch {
+						/* retried next block */
+					}
 				}
 			}
 			const patched = this.deps.ledger.patch(current.id, {

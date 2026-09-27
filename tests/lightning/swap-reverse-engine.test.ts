@@ -507,6 +507,42 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(h.holds.cancelled).to.have.length(0);
 		});
 
+		it('a funding reorged out is rebroadcast only while the hold is live (issue #1099)', async function () {
+			const h = await harness();
+			const { swap } = await fundedSwap(h);
+			const r = record(h, swap);
+			h.chain.confirm(r.fundingTxid!, 1001);
+			h.chain.height = 1001;
+			await h.engine.onBlock(1001);
+			expect(record(h, swap).fundingHeight).to.equal(1001);
+			h.chain.evict(r.fundingTxid!);
+			h.chain.height = 1002;
+			await h.engine.onBlock(1002);
+			expect(h.chain.broadcasts).to.have.length(2);
+			expect(record(h, swap).fundingHeight).to.equal(undefined);
+
+			h.chain.confirm(r.fundingTxid!, 1003);
+			h.chain.height = 1003;
+			await h.engine.onBlock(1003);
+			expect(record(h, swap).fundingHeight).to.equal(1003);
+			h.holds.sweep(swap.paymentHash);
+			await settle();
+			expect(record(h, swap).state).to.equal('EXPOSED');
+			h.chain.evict(r.fundingTxid!);
+			h.chain.height = 1004;
+			await h.engine.onBlock(1004);
+			const withheld = record(h, swap);
+			expect(h.chain.broadcasts).to.have.length(2);
+			expect(h.chain.mempoolHas(r.fundingTxid!)).to.equal(false);
+			expect(withheld.fundingHeight).to.equal(undefined);
+			expect(withheld.lastError).to.match(/^broadcast withheld: hold is/);
+			// Still watched: bytes someone else puts back are tracked again.
+			h.chain.place(bitcoin.Transaction.fromHex(r.fundingTxHex!), 1005);
+			h.chain.height = 1005;
+			await h.engine.onBlock(1005);
+			expect(record(h, swap).fundingHeight).to.equal(1005);
+		});
+
 		it('reports funding progress over status and confirms to policy', async function () {
 			const h = await harness();
 			const { swap, ack } = await fundedSwap(h);
