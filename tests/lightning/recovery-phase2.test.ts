@@ -2867,6 +2867,13 @@ describe('Recovery phase 2: snapshots fit the guardian record limit (issue #1014
 				record(settled, PaymentDirection.OUTGOING, PaymentStatus.FAILED, at(0))
 			);
 			storage.savePreimage(settled.toString('hex'), Buffer.alloc(32, 4));
+			// A failed send whose HTLC is still live and can yet be fulfilled.
+			const live = hashOf(9, 0);
+			storage.savePayment(
+				live.toString('hex'),
+				record(live, PaymentDirection.OUTGOING, PaymentStatus.FAILED, at(0))
+			);
+			storage.saveHtlcPaymentMapping('live-htlc', live.toString('hex'));
 			// A receive still waiting.
 			const waiting = hashOf(5, 0);
 			storage.savePayment(
@@ -2928,6 +2935,7 @@ describe('Recovery phase 2: snapshots fit the guardian record limit (issue #1014
 		}
 		expect(kept.has(hashOf(4, 0).toString('hex'))).to.equal(true);
 		expect(kept.has(hashOf(5, 0).toString('hex'))).to.equal(true);
+		expect(kept.has(hashOf(9, 0).toString('hex'))).to.equal(true);
 		// hashOf keeps the tag in the last byte.
 		const history = snapshot.payments.filter((p) =>
 			[6, 7].includes(Buffer.from(p.paymentHash, 'hex')[31])

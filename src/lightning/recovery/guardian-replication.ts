@@ -549,6 +549,10 @@ export class GuardianReplicator {
 	): Promise<NamespaceDecision> {
 		const held = loadWriterLease(this.config.storage);
 		if (held.state === 'present') {
+			// Nothing else on this path reads INFO before the node's first
+			// append writes this run's re-base snapshot, which must already be
+			// sized for the set's real limit.
+			await this.readMissingLimits();
 			return { outcome: 'already-held', lease: held.lease };
 		}
 
@@ -1240,6 +1244,7 @@ export class GuardianReplicator {
 			(frame) => BigInt(frame.sequence) > from
 		);
 		if (frames.length === 0) {
+			await this.readMissingLimits();
 			return {
 				outcome: 'replicated',
 				attempted: 0,

@@ -1483,7 +1483,8 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	 * Hold a snapshot under the replicas' record ceiling by dropping history
 	 * no safety path reads, oldest first, and say what went. First the
 	 * forwarding ledger, then failed payment records: failed receives, and
-	 * failed sends with no preimage (a failed hash stays retryable anyway).
+	 * failed sends with no preimage and no live HTLC (a failed hash stays
+	 * retryable anyway).
 	 * Payment records are what grow without bound, a few hundred bytes to a
 	 * few KB each. Completed payments always stay. The double-pay guard
 	 * (issue #975) reads the completed sends after a restore, and a completed
@@ -1521,12 +1522,19 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 
 		const payments = snapshot.payments;
 		const preimages = new Set(snapshot.preimages.map((p) => p.paymentHash));
+		// A send marked failed can still be fulfilled while its HTLC is live,
+		// and the double-pay guard needs the row when that happens.
+		const inFlight = new Set(
+			snapshot.htlcPaymentMappings.map((m) => m.paymentHash)
+		);
 		const history = payments
 			.filter(
 				({ paymentHash, payment }) =>
 					payment.status === PaymentStatus.FAILED &&
 					(payment.direction === PaymentDirection.INCOMING ||
-						(payment.preimage === undefined && !preimages.has(paymentHash)))
+						(payment.preimage === undefined &&
+							!preimages.has(paymentHash) &&
+							!inFlight.has(paymentHash)))
 			)
 			.sort((a, b) => a.payment.createdAt - b.payment.createdAt);
 		const historic = new Set(history);

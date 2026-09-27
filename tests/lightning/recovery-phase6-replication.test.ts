@@ -975,6 +975,44 @@ describe('Recovery phase 6: records over a guardian limit (issue #1014)', () => 
 		storage.close();
 	});
 
+	it('reads the limits before the first frame of a restart and on an idle pass', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0, 100_000), serve(1), serve(2)]);
+		const { storage } = journaledStorage(1);
+		const lease = await registered(replicator(storage, bind(served)));
+
+		// A restart finds its lease on disk, so no binding runs at boot.
+		const booted = replicator(storage, bind(served));
+		expect((await booted.ensureNamespace()).outcome).to.equal('already-held');
+		expect(booted.maxRecordBytes()).to.equal(100_000);
+
+		let down = true;
+		const flaky: IBoundGuardianClient = {
+			expectedGuardianId: served[0].id,
+			client: new GuardianClient({
+				url: served[0].client.url,
+				guardianSetId: SET_ID,
+				transport: async (
+					url,
+					init
+				): Promise<{ status: number; body: Buffer }> => {
+					if (down) throw new Error('connection refused');
+					return nodeGuardianTransport()(url, init);
+				}
+			})
+		};
+		const rep = replicator(storage, [flaky, ...bind(served.slice(1))]);
+		await rep.replicatePending(lease);
+		expect(rep.maxRecordBytes()).to.equal(
+			GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES
+		);
+		down = false;
+		expect((await rep.replicatePending(lease)).attempted).to.equal(0);
+		expect(rep.maxRecordBytes()).to.equal(100_000);
+		await shutdown(served);
+		storage.close();
+	});
+
 	it('reports each guardian that refuses a record as too large, once, whichever layer refused it', async function (): Promise<void> {
 		this.timeout(20_000);
 		const storage = openStorage();
