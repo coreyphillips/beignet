@@ -730,12 +730,12 @@ describe('Gossip Sync (Phase 5)', function () {
 			expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
 		});
 
-		it('counts a re-sent SCID once toward the ceiling', function () {
+		it('queries a re-sent SCID once', function () {
 			const mgr = new GossipSyncManager(new NetworkGraph());
 			mgr.initiateSync();
 
 			const chunk = uniqueScids(0, 8000);
-			for (let i = 0; i * 8000 <= MAX_RANGE_REPLY_SCIDS; i++) {
+			for (let i = 0; i < 3; i++) {
 				mgr.handleReplyChannelRange(rangeReply(chunk, false));
 			}
 			expect(mgr.getState()).to.equal(GossipSyncState.AWAITING_RANGE_REPLY);

@@ -51,9 +51,9 @@ const MAX_SCIDS_PER_QUERY = 8000;
 const MAX_SCIDS_PER_REPLY = 8000;
 
 /**
- * Most distinct SCIDs one range sync will hold before it is abandoned. The
- * public graph is a fraction of this; the ceiling exists because a peer can
- * stream sync_complete=0 replies for as long as it likes.
+ * Most SCIDs one range sync will hold before it is abandoned. The public
+ * graph is a fraction of this; the ceiling exists because a peer can stream
+ * sync_complete=0 replies for as long as it likes.
  */
 const MAX_RANGE_REPLY_SCIDS = 200_000;
 
@@ -65,9 +65,15 @@ export interface IGossipSyncMessage {
 export class GossipSyncManager extends EventEmitter {
 	private _state: GossipSyncState = GossipSyncState.IDLE;
 	private _graph: NetworkGraph;
-	/** Keyed by SCID hex, so a re-sent SCID does not count twice. */
-	private _accumulatedScids = new Map<string, Buffer>();
-	private _pendingQueryBatches: Buffer[][] = [];
+	/**
+	 * Range reply SCIDs packed 8 bytes each, and the query_short_channel_ids
+	 * payloads still to send. Both stay packed because every inbound peer gets
+	 * a sync: one Buffer object per SCID costs ~160 bytes, and 125 peers each
+	 * held at the ceiling would exhaust the heap.
+	 */
+	private _rangeScids = Buffer.alloc(0);
+	private _rangeScidBytes = 0;
+	private _pendingQueries: Buffer[] = [];
 	private _currentBatchIndex = 0;
 	private readonly _chainHash: Buffer;
 
@@ -114,7 +120,7 @@ export class GossipSyncManager extends EventEmitter {
 		});
 
 		this._state = GossipSyncState.AWAITING_RANGE_REPLY;
-		this._accumulatedScids.clear();
+		this._clearRangeScids();
 		return messages;
 	}
 
@@ -133,13 +139,26 @@ export class GossipSyncManager extends EventEmitter {
 			return [];
 		}
 
-		for (const scid of decodeShortChannelIds(msg.encodedShortIds)) {
-			this._accumulatedScids.set(scid.toString('hex'), scid);
-		}
-		if (this._accumulatedScids.size > MAX_RANGE_REPLY_SCIDS) {
-			this._accumulatedScids.clear();
+		const scids = decodeShortChannelIds(msg.encodedShortIds);
+		const needed = this._rangeScidBytes + scids.length * 8;
+		if (needed > MAX_RANGE_REPLY_SCIDS * 8) {
+			this._clearRangeScids();
 			this._state = GossipSyncState.IDLE;
 			return [];
+		}
+		if (needed > this._rangeScids.length) {
+			const grown = Buffer.alloc(
+				Math.min(
+					Math.max(needed, this._rangeScids.length * 2),
+					MAX_RANGE_REPLY_SCIDS * 8
+				)
+			);
+			this._rangeScids.copy(grown, 0, 0, this._rangeScidBytes);
+			this._rangeScids = grown;
+		}
+		for (const scid of scids) {
+			scid.copy(this._rangeScids, this._rangeScidBytes);
+			this._rangeScidBytes += 8;
 		}
 
 		if (!msg.syncComplete) {
@@ -147,11 +166,14 @@ export class GossipSyncManager extends EventEmitter {
 			return [];
 		}
 
-		// All range replies received — find missing SCIDs
-		const missing = this._graph.getMissingSCIDs([
-			...this._accumulatedScids.values()
-		]);
-		this._accumulatedScids.clear();
+		// All range replies received — find missing SCIDs, each queried once
+		const distinct = new Map<string, Buffer>();
+		for (let i = 0; i < this._rangeScidBytes; i += 8) {
+			const scid = this._rangeScids.subarray(i, i + 8);
+			distinct.set(scid.toString('hex'), scid);
+		}
+		const missing = this._graph.getMissingSCIDs([...distinct.values()]);
+		this._clearRangeScids();
 
 		if (missing.length === 0) {
 			this._state = GossipSyncState.SYNCED;
@@ -160,9 +182,16 @@ export class GossipSyncManager extends EventEmitter {
 		}
 
 		// Batch into chunks of MAX_SCIDS_PER_QUERY
-		this._pendingQueryBatches = [];
+		this._pendingQueries = [];
 		for (let i = 0; i < missing.length; i += MAX_SCIDS_PER_QUERY) {
-			this._pendingQueryBatches.push(missing.slice(i, i + MAX_SCIDS_PER_QUERY));
+			this._pendingQueries.push(
+				encodeQueryShortChannelIdsMessage({
+					chainHash: this._chainHash,
+					encodedShortIds: encodeShortChannelIds(
+						missing.slice(i, i + MAX_SCIDS_PER_QUERY)
+					)
+				})
+			);
 		}
 		this._currentBatchIndex = 0;
 
@@ -179,10 +208,10 @@ export class GossipSyncManager extends EventEmitter {
 	): IGossipSyncMessage[] {
 		this._currentBatchIndex++;
 
-		if (this._currentBatchIndex >= this._pendingQueryBatches.length) {
+		if (this._currentBatchIndex >= this._pendingQueries.length) {
 			// All batches processed
 			this._state = GossipSyncState.SYNCED;
-			this._pendingQueryBatches = [];
+			this._pendingQueries = [];
 			this.emit('synced');
 			return [];
 		}
@@ -295,17 +324,18 @@ export class GossipSyncManager extends EventEmitter {
 	// ── Internal ───────────────────────────────────────────────────
 
 	private _sendNextScidQuery(): IGossipSyncMessage[] {
-		const batch = this._pendingQueryBatches[this._currentBatchIndex];
 		this._state = GossipSyncState.AWAITING_SCID_REPLY;
 
 		return [
 			{
 				type: MessageType.QUERY_SHORT_CHANNEL_IDS,
-				payload: encodeQueryShortChannelIdsMessage({
-					chainHash: this._chainHash,
-					encodedShortIds: encodeShortChannelIds(batch)
-				})
+				payload: this._pendingQueries[this._currentBatchIndex]
 			}
 		];
+	}
+
+	private _clearRangeScids(): void {
+		this._rangeScids = Buffer.alloc(0);
+		this._rangeScidBytes = 0;
 	}
 }
