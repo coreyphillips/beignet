@@ -18776,7 +18776,13 @@ export class LightningNode extends EventEmitter {
 					RecoveryCriticality.SafetyCritical
 				);
 			}
-			this.fulfillPayment(channelId, htlcId, paymentHash, keysendPreimage);
+			this.fulfillPayment(
+				channelId,
+				htlcId,
+				paymentHash,
+				keysendPreimage,
+				amountMsat
+			);
 			return;
 		}
 
@@ -19106,7 +19112,13 @@ export class LightningNode extends EventEmitter {
 			paymentHash: hashHex,
 			amountMsat: amountMsat.toString()
 		});
-		this.fulfillPayment(channelId, htlcId, paymentHash, preimage!);
+		this.fulfillPayment(
+			channelId,
+			htlcId,
+			paymentHash,
+			preimage!,
+			partAmountMsat
+		);
 	}
 
 	/**
@@ -21318,6 +21330,9 @@ export class LightningNode extends EventEmitter {
 				payment.settledHtlcs = pending.receivedParts.map(
 					(p) => `${p.channelId.toString('hex')}:${p.htlcId}`
 				);
+				// An any-amount invoice's record holds 0n until paid, so the
+				// settled parts are the only source of what it received.
+				if (payment.amountMsat === 0n) payment.amountMsat = totalReceived;
 				this.persistPayment(paymentHash);
 				this.emit('payment:received', payment);
 				this.emitInvoiceSettled(paymentHash, payment);
@@ -21354,11 +21369,17 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * receivedMsat is the settled HTLC's payment amount. It replaces the
+	 * record's amount only when that is 0n, which is an any-amount invoice
+	 * that has not been paid yet.
+	 */
 	private fulfillPayment(
 		channelId: Buffer,
 		htlcId: bigint,
 		paymentHash: Buffer,
-		preimage: Buffer
+		preimage: Buffer,
+		receivedMsat: bigint
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		// Clean up shared secret on fulfillment
@@ -21379,6 +21400,7 @@ export class LightningNode extends EventEmitter {
 			payment.status = PaymentStatus.COMPLETED;
 			payment.completedAt = Date.now();
 			payment.settledHtlcs = [`${channelId.toString('hex')}:${htlcId}`];
+			if (payment.amountMsat === 0n) payment.amountMsat = receivedMsat;
 		}
 
 		// Persist BEFORE sending fulfill message: on crash, reestablish
