@@ -405,6 +405,10 @@ export class PeerManager extends EventEmitter {
 		this.socks5ProxyScope = options.socks5ProxyScope ?? 'all';
 		this.socks5TimeoutMs = options.socks5TimeoutMs ?? 20_000;
 		this.maxInboundPeers = options.maxInboundPeers ?? 125;
+		// NaN would silently disable the cap: `count >= NaN` is never true.
+		if (!Number.isInteger(this.maxInboundPeers) || this.maxInboundPeers < 0) {
+			throw new Error('maxInboundPeers must be a non-negative integer');
+		}
 		this.isChannelPeer = options.isChannelPeer;
 		this.maxPendingInbound = options.maxPendingInbound ?? 50;
 		this.maxPendingInboundPerAddress = options.maxPendingInboundPerAddress ?? 4;

@@ -266,6 +266,14 @@ describe('peer manager inbound admission', () => {
 		expect(pm.getPeer(channelPubkey)).to.exist;
 	});
 
+	it('rejects a maxInboundPeers that is not a non-negative integer', () => {
+		for (const maxInboundPeers of [NaN, -1, 1.5, Infinity]) {
+			expect(
+				() => new PeerManager({ localPrivateKey: HOST_SECRET, maxInboundPeers })
+			).to.throw('maxInboundPeers must be a non-negative integer');
+		}
+	});
+
 	it('refuses a peer past maxInboundPeers when isChannelPeer throws', async () => {
 		pm = new PeerManager({
 			localPrivateKey: HOST_SECRET,
