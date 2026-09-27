@@ -49,6 +49,7 @@ import {
 } from '../onion/blinded-path';
 import { OnionMessageManager } from '../onion-message/manager';
 import { getPublicKey } from '../crypto/ecdh';
+import { BITCOIN_CHAIN_HASH } from '../channel/types';
 
 /** TLV type for BOLT 12 invoice request in onion messages */
 export const TLV_INVOICE_REQUEST = 64;
@@ -65,6 +66,7 @@ const DEFAULT_INVOICE_RELATIVE_EXPIRY = 7200;
 const INVOICE_PREIMAGE_TTL_MS = (7200 + 3600) * 1000;
 /** Hard cap on retained preimages: requests are remote-driven. */
 const MAX_INVOICE_PREIMAGES = 10_000;
+const MAX_U64 = 0xffff_ffff_ffff_ffffn;
 
 // BOLT 12 signature tags are "lightning" || messagename || fieldname (the field
 // is always the "signature" field, type 240). A bare "lightning" tag made every
@@ -871,12 +873,9 @@ export class OfferManager extends EventEmitter {
 			);
 		}
 
-		// Validate amount
-		const amount = request.amount ?? matchedOffer.amount;
-		if (amount === undefined) {
-			const error: IInvoiceError = {
-				error: 'Amount required but not specified'
-			};
+		const terms = this.invoiceRequestTerms(matchedOffer, request);
+		if ('error' in terms) {
+			const error: IInvoiceError = { error: terms.error };
 			if (replyPath && this.onionMessageManager) {
 				const errData = encodeInvoiceErrorTlv(error);
 				const messageData = new Map<number, Buffer>();
@@ -886,6 +885,7 @@ export class OfferManager extends EventEmitter {
 			this.emit('invoice:error', error);
 			return null;
 		}
+		const amount = terms.amount;
 
 		// Create invoice
 		const preimage = crypto.randomBytes(32);
@@ -1009,6 +1009,54 @@ export class OfferManager extends EventEmitter {
 		this.emit('invoice:issued', invoice, preimage, invoicePathId);
 		this.emit('invoice:received', invoice);
 		return invoice;
+	}
+
+	/**
+	 * BOLT 12 issuer checks of an invoice_request against the terms of an
+	 * offer we answer ourselves, and the amount to invoice: invreq_amount,
+	 * never below the offer's price times the quantity, or that price when
+	 * the request names no amount.
+	 */
+	private invoiceRequestTerms(
+		offer: IOffer,
+		request: IInvoiceRequest
+	): { amount: bigint } | { error: string } {
+		// No offer_chains means bitcoin only; no invreq_chain means bitcoin.
+		const chain = request.chain ?? BITCOIN_CHAIN_HASH;
+		const chains = offer.chains ?? [BITCOIN_CHAIN_HASH];
+		if (!chains.some((c) => c.equals(chain))) return { error: 'Wrong chain' };
+
+		if (offer.quantityMax === undefined) {
+			if (request.quantity !== undefined) {
+				return { error: 'Offer does not take a quantity' };
+			}
+		} else if (request.quantity === undefined) {
+			return { error: 'Quantity required' };
+		} else if (
+			// A zero quantity prices the request at nothing; a zero
+			// offer_quantity_max means no upper limit.
+			request.quantity === 0n ||
+			(offer.quantityMax !== 0n && request.quantity > offer.quantityMax)
+		) {
+			return { error: 'Invalid quantity' };
+		}
+
+		const expected =
+			offer.amount === undefined
+				? undefined
+				: offer.amount * (request.quantity ?? 1n);
+		if (request.amount === undefined) {
+			if (expected === undefined) {
+				return { error: 'Amount required but not specified' };
+			}
+			// invoice_amount is a u64 on the wire; encoding a larger one throws.
+			if (expected > MAX_U64) return { error: 'Amount too large' };
+			return { amount: expected };
+		}
+		if (expected !== undefined && request.amount < expected) {
+			return { error: 'Amount below the offer price' };
+		}
+		return { amount: request.amount };
 	}
 
 	private answerByPolicy(
