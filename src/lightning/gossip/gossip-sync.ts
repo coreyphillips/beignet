@@ -50,6 +50,13 @@ const MAX_SCIDS_PER_QUERY = 8000;
 /** Maximum SCIDs per reply_channel_range chunk. */
 const MAX_SCIDS_PER_REPLY = 8000;
 
+/**
+ * Most distinct SCIDs one range sync will hold before it is abandoned. The
+ * public graph is a fraction of this; the ceiling exists because a peer can
+ * stream sync_complete=0 replies for as long as it likes.
+ */
+const MAX_RANGE_REPLY_SCIDS = 200_000;
+
 export interface IGossipSyncMessage {
 	type: MessageType;
 	payload: Buffer;
@@ -58,7 +65,8 @@ export interface IGossipSyncMessage {
 export class GossipSyncManager extends EventEmitter {
 	private _state: GossipSyncState = GossipSyncState.IDLE;
 	private _graph: NetworkGraph;
-	private _accumulatedScids: Buffer[] = [];
+	/** Keyed by SCID hex, so a re-sent SCID does not count twice. */
+	private _accumulatedScids = new Map<string, Buffer>();
 	private _pendingQueryBatches: Buffer[][] = [];
 	private _currentBatchIndex = 0;
 	private readonly _chainHash: Buffer;
@@ -106,20 +114,33 @@ export class GossipSyncManager extends EventEmitter {
 		});
 
 		this._state = GossipSyncState.AWAITING_RANGE_REPLY;
-		this._accumulatedScids = [];
+		this._accumulatedScids.clear();
 		return messages;
 	}
 
 	/**
 	 * Handle reply_channel_range from peer.
 	 * Accumulates SCIDs until syncComplete, then queries missing ones.
+	 * Replies we did not ask for, or for another chain, are dropped.
 	 */
 	handleReplyChannelRange(
 		msg: IReplyChannelRangeMessage
 	): IGossipSyncMessage[] {
-		// Decode the SCIDs from this chunk
-		const scids = decodeShortChannelIds(msg.encodedShortIds);
-		this._accumulatedScids.push(...scids);
+		if (
+			this._state !== GossipSyncState.AWAITING_RANGE_REPLY ||
+			!msg.chainHash.equals(this._chainHash)
+		) {
+			return [];
+		}
+
+		for (const scid of decodeShortChannelIds(msg.encodedShortIds)) {
+			this._accumulatedScids.set(scid.toString('hex'), scid);
+		}
+		if (this._accumulatedScids.size > MAX_RANGE_REPLY_SCIDS) {
+			this._accumulatedScids.clear();
+			this._state = GossipSyncState.IDLE;
+			return [];
+		}
 
 		if (!msg.syncComplete) {
 			// More chunks coming
@@ -127,8 +148,10 @@ export class GossipSyncManager extends EventEmitter {
 		}
 
 		// All range replies received — find missing SCIDs
-		const missing = this._graph.getMissingSCIDs(this._accumulatedScids);
-		this._accumulatedScids = [];
+		const missing = this._graph.getMissingSCIDs([
+			...this._accumulatedScids.values()
+		]);
+		this._accumulatedScids.clear();
 
 		if (missing.length === 0) {
 			this._state = GossipSyncState.SYNCED;
