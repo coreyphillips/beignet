@@ -1068,7 +1068,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								allowPrivateNetwork: {
 									type: 'boolean',
 									description:
-										'Permit a target on a private, loopback, or link-local host, which is refused by default because this endpoint fetches on behalf of the caller from the node machine'
+										'Permit a target on a private, loopback, or link-local host, which is refused by default (for redirect targets too, before they are requested) because this endpoint fetches on behalf of the caller from the node machine'
 								}
 							}
 						})

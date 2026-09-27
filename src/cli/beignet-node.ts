@@ -11270,6 +11270,11 @@ export class BeignetNode extends EventEmitter {
 		const result = await l402Fetch(url, init, {
 			...options,
 			credentials: this._l402Credentials,
+			// Vetting only the final URL would be too late: by then fetch has
+			// already sent the caller's request, body included, to whatever the
+			// redirect named.
+			checkRedirect: (target) =>
+				this._assertL402TargetAllowed(target, options.allowPrivateNetwork),
 			payer: {
 				payInvoice: async (
 					bolt11: string,
@@ -11290,15 +11295,6 @@ export class BeignetNode extends EventEmitter {
 				}
 			}
 		});
-		// A redirect can land on a host the caller never named. The paid path
-		// already refuses cross-origin challenges, but an unpaid response that
-		// followed a redirect to a private target must not be relayed either.
-		if (result.response.url) {
-			this._assertL402TargetAllowed(
-				result.response.url,
-				options.allowPrivateNetwork
-			);
-		}
 		// The body is relayed to the daemon caller, so its size has to be
 		// bounded here. Refuse a response that declares itself too large, and
 		// stream-read the rest under the cap (a server can lie about

@@ -57,6 +57,7 @@ export type FetchLike = (
 		headers?: Record<string, string>;
 		body?: string;
 		signal?: AbortSignal;
+		redirect?: 'follow' | 'manual' | 'error';
 	}
 ) => Promise<IL402Response>;
 
@@ -137,6 +138,14 @@ export interface IL402FetchOptions {
 	 * does not.
 	 */
 	allowCrossOriginChallenge?: boolean;
+	/**
+	 * Vet each redirect target before it is requested; throw to refuse it.
+	 * When set, redirects are followed here instead of by fetch, because fetch
+	 * has already sent the request (method and body intact, on a 307 or 308)
+	 * by the time the final URL can be seen. The fetch implementation must
+	 * honour `redirect: 'manual'` for this to hold.
+	 */
+	checkRedirect?: (url: string) => void;
 }
 
 /** Per-request HTTP timeout when the caller sets none. */
@@ -203,14 +212,24 @@ export async function l402Fetch(
 	init: IL402RequestInit = {},
 	options: IL402FetchOptions
 ): Promise<IL402FetchResult> {
-	const doFetch =
+	const baseFetch =
 		options.fetchImpl ?? (globalThis.fetch as unknown as FetchLike);
-	if (typeof doFetch !== 'function') {
+	if (typeof baseFetch !== 'function') {
 		throw new Error('l402Fetch: no fetch implementation available');
 	}
 	if (!Number.isFinite(options.maxPriceSats) || options.maxPriceSats < 0) {
 		throw new Error('l402Fetch: maxPriceSats must be a non-negative number');
 	}
+	const { checkRedirect } = options;
+	const doFetch: FetchLike = checkRedirect
+		? (input, requestInit): Promise<IL402Response> =>
+				fetchCheckingRedirects(
+					baseFetch,
+					input,
+					requestInit ?? {},
+					checkRedirect
+				)
+		: baseFetch;
 
 	const store = options.credentials ?? new MemoryL402CredentialStore();
 	const scope = credentialScope(url, options.scopePerPath);
@@ -478,6 +497,94 @@ function withTimeout(
 	const ms = options.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
 	if (!Number.isFinite(ms) || ms <= 0) return init;
 	return { ...init, signal: AbortSignal.timeout(ms) };
+}
+
+/** Redirects one request may follow, the same limit fetch applies. */
+const MAX_REDIRECTS = 20;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+/** Dropped when a redirect turns the request into a bodiless GET. */
+const BODY_HEADERS = new Set([
+	'content-encoding',
+	'content-language',
+	'content-location',
+	'content-type',
+	'content-length'
+]);
+/** Dropped on a hop to another origin, so a credential stays with its issuer. */
+const CREDENTIAL_HEADERS = new Set([
+	'authorization',
+	'proxy-authorization',
+	'cookie',
+	'host'
+]);
+
+/**
+ * Follow redirects by hand, so `checkRedirect` sees every target before a
+ * request reaches it. Each hop is rewritten the way fetch itself would: 301
+ * and 302 turn a POST into a GET, 303 turns anything but HEAD into one, and a
+ * hop to another origin drops the credential headers.
+ */
+async function fetchCheckingRedirects(
+	doFetch: FetchLike,
+	url: string,
+	init: IL402RequestInit,
+	checkRedirect: (url: string) => void
+): Promise<IL402Response> {
+	let current = url;
+	let request = init;
+	for (let hops = 0; ; hops++) {
+		const response = await doFetch(current, { ...request, redirect: 'manual' });
+		const location = REDIRECT_STATUSES.has(response.status)
+			? response.headers.get('location')
+			: null;
+		if (location === null) return response;
+		discardBody(response);
+		if (hops >= MAX_REDIRECTS) {
+			throw new Error(`l402Fetch: more than ${MAX_REDIRECTS} redirects`);
+		}
+		const next = new URL(location, current);
+		if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+			throw new Error(
+				`l402Fetch: redirect to unsupported ${next.protocol} URL`
+			);
+		}
+		checkRedirect(next.href);
+		request = redirectedRequest(
+			request,
+			response.status,
+			new URL(current).origin !== next.origin
+		);
+		current = next.href;
+	}
+}
+
+function redirectedRequest(
+	init: IL402RequestInit,
+	status: number,
+	crossOrigin: boolean
+): IL402RequestInit {
+	const method = (init.method ?? 'GET').toUpperCase();
+	const toGet =
+		((status === 301 || status === 302) && method === 'POST') ||
+		(status === 303 && method !== 'GET' && method !== 'HEAD');
+	const headers = Object.fromEntries(
+		Object.entries(init.headers ?? {}).filter(([name]) => {
+			const lower = name.toLowerCase();
+			if (toGet && BODY_HEADERS.has(lower)) return false;
+			return !(crossOrigin && CREDENTIAL_HEADERS.has(lower));
+		})
+	);
+	if (!toGet) return { ...init, headers };
+	return { ...init, method: 'GET', body: undefined, headers };
+}
+
+/** Release a redirect's body, which is never read, so its socket frees. */
+function discardBody(response: IL402Response): void {
+	try {
+		Promise.resolve(response.body?.getReader().cancel()).catch(() => undefined);
+	} catch {
+		// A body that cannot be cancelled is left to the fetch implementation.
+	}
 }
 
 /**
