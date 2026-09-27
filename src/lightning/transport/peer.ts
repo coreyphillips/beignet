@@ -405,11 +405,24 @@ export class Peer extends EventEmitter {
 			);
 		}
 
+		const buffered = this.socket.writableLength;
 		if (
 			Peer.GOSSIP_MESSAGE_TYPES.has(type) &&
-			this.socket.writableLength > Peer.MAX_GOSSIP_WRITE_BUFFER
+			buffered > Peer.MAX_GOSSIP_WRITE_BUFFER
 		) {
 			return; // drop best-effort gossip under backpressure
+		}
+		if (Peer.SYNC_REPLY_TYPES.has(type)) {
+			if (buffered > Peer.MAX_SYNC_REPLY_WRITE_BUFFER) {
+				return; // the peer is not reading the replies it asks for
+			}
+			if (type === 262 && buffered > Peer.MAX_GOSSIP_WRITE_BUFFER) {
+				// The reply ahead of this marker is written in the same tick,
+				// so a buffer over the gossip cap now means part of it may have
+				// been dropped. full_information 0 says the reply is not whole.
+				payload = Buffer.from(payload);
+				payload[32] = 0;
+			}
 		}
 
 		const message = encodeMessage(type, payload);
@@ -417,12 +430,7 @@ export class Peer extends EventEmitter {
 		this.socket.write(encrypted);
 	}
 
-	/**
-	 * Best-effort gossip messages that may be dropped under write backpressure.
-	 * reply_short_channel_ids_end and reply_channel_range are not among them:
-	 * they are small, and the requester waits on them to take its next step,
-	 * so losing one stalls its whole sync.
-	 */
+	/** Best-effort gossip messages that may be dropped under write backpressure. */
 	private static readonly GOSSIP_MESSAGE_TYPES = new Set<number>([
 		256, // channel_announcement
 		257, // node_announcement
@@ -430,8 +438,28 @@ export class Peer extends EventEmitter {
 		265 // gossip_timestamp_filter
 	]);
 
+	/**
+	 * Replies a gossip-query requester waits on to take its next step, so
+	 * losing one stalls its whole sync. They may pass the gossip cap, but only
+	 * up to MAX_SYNC_REPLY_WRITE_BUFFER: a peer that keeps asking without
+	 * reading must not grow the buffer without bound.
+	 */
+	private static readonly SYNC_REPLY_TYPES = new Set<number>([
+		262, // reply_short_channel_ids_end
+		264 // reply_channel_range
+	]);
+
 	/** Above this many buffered bytes, gossip sends are dropped. */
 	private static readonly MAX_GOSSIP_WRITE_BUFFER = 4 * 1024 * 1024; // 4 MB
+
+	/**
+	 * Above this many buffered bytes, sync replies are dropped too. The
+	 * headroom holds a reply_channel_range series for a graph at its ceiling
+	 * (NetworkGraph.MAX_CHANNELS SCIDs of 8 bytes) on top of a saturated
+	 * gossip buffer.
+	 */
+	private static readonly MAX_SYNC_REPLY_WRITE_BUFFER =
+		Peer.MAX_GOSSIP_WRITE_BUFFER + 1024 * 1024;
 
 	/**
 	 * Disconnect from the peer gracefully.

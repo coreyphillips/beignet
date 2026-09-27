@@ -760,10 +760,15 @@ describe('Gossip Sync (Phase 5)', function () {
 		const END = { chainHash: BITCOIN_CHAIN_HASH, complete: true };
 
 		function startSync(mgr: GossipSyncManager, count: number): string[] {
-			const scids: Buffer[] = [];
+			const scids: string[] = [];
 			for (let i = 0; i < count; i++) {
-				scids.push(makeScid(100_000 + i, 1, 0));
+				scids.push(makeScid(100_000 + i, 1, 0).toString('hex'));
 			}
+			return offer(mgr, scids);
+		}
+
+		/** Starts a sync the peer answers with these SCIDs; returns batch 0. */
+		function offer(mgr: GossipSyncManager, scids: string[]): string[] {
 			mgr.initiateSync();
 			return queried(
 				mgr.handleReplyChannelRange({
@@ -771,7 +776,9 @@ describe('Gossip Sync (Phase 5)', function () {
 					firstBlocknum: 0,
 					numberOfBlocks: 0xffffffff,
 					syncComplete: true,
-					encodedShortIds: encodeShortChannelIds(scids)
+					encodedShortIds: encodeShortChannelIds(
+						scids.map((s) => Buffer.from(s, 'hex'))
+					)
 				})
 			);
 		}
@@ -833,6 +840,71 @@ describe('Gossip Sync (Phase 5)', function () {
 			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
 			expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
 			expect(synced).to.equal(false);
+		});
+
+		it('asks for a batch again when the responder reports it incomplete', function () {
+			const mgr = new GossipSyncManager(new NetworkGraph());
+			const first = startSync(mgr, 1500);
+
+			const partial = { ...END, complete: false };
+			expect(queried(mgr.handleReplyShortChannelIdsEnd(partial))).to.eql(first);
+			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.have.length(
+				500
+			);
+			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
+			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
+		});
+
+		it('asks for every channel after losing gossip before the range reply', function () {
+			const graph = new NetworkGraph();
+			const known = populateGraph(graph, 3).map((s) => s.toString('hex'));
+			const mgr = new GossipSyncManager(graph);
+
+			mgr.initiateSync();
+			mgr.noteIntakeLoss();
+			// The graph holds these channels, but the loss may have been their
+			// updates, so they are asked for anyway.
+			expect(
+				queried(
+					mgr.handleReplyChannelRange({
+						chainHash: BITCOIN_CHAIN_HASH,
+						firstBlocknum: 0,
+						numberOfBlocks: 0xffffffff,
+						syncComplete: true,
+						encodedShortIds: encodeShortChannelIds(
+							known.map((s) => Buffer.from(s, 'hex'))
+						)
+					})
+				)
+			).to.have.members(known);
+			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
+			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
+
+			// Repaired: the next sync asks only for what is missing.
+			expect(offer(mgr, known)).to.eql([]);
+			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
+		});
+
+		it('asks for every channel on the next sync after giving up on a batch', function () {
+			const graph = new NetworkGraph();
+			const known = populateGraph(graph, 3).map((s) => s.toString('hex'));
+			const unknown = makeScid(100_000, 1, 0).toString('hex');
+			const offered = [...known, unknown];
+			const mgr = new GossipSyncManager(graph);
+
+			expect(offer(mgr, offered)).to.eql([unknown]);
+			for (let i = 0; i < 3; i++) {
+				mgr.noteIntakeLoss();
+				mgr.handleReplyShortChannelIdsEnd(END);
+			}
+			expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+
+			expect(offer(mgr, offered)).to.have.members(offered);
+			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
+			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
+
+			// Repaired: the next sync asks only for what is missing.
+			expect(offer(mgr, offered)).to.eql([unknown]);
 		});
 
 		it('ignores intake loss while no batch is in flight', function () {

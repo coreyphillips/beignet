@@ -54,8 +54,8 @@ export enum GossipSyncState {
 const MAX_SCIDS_PER_QUERY = 1000;
 
 /**
- * How many times one batch is asked for while the node's intake keeps
- * dropping its reply. After that the sync moves on and ends IDLE, not SYNCED.
+ * How many times one batch is asked for while its reply keeps arriving
+ * incomplete. After that the sync moves on and ends IDLE, not SYNCED.
  */
 const MAX_BATCH_ATTEMPTS = 3;
 
@@ -88,10 +88,17 @@ export class GossipSyncManager extends EventEmitter {
 	private _pendingQueries: Buffer[] = [];
 	private _currentBatchIndex = 0;
 	private _batchAttempts = 0;
-	/** The intake dropped gossip from this peer while the batch was in flight. */
+	/** Part of the in-flight batch's reply was dropped or left out. */
 	private _batchLost = false;
-	/** A batch was given up on, so the sync cannot end SYNCED. */
+	/** A batch of this sync was given up on, so it cannot end SYNCED. */
 	private _incomplete = false;
+	/**
+	 * Gossip from this peer was lost and has not been fetched again since.
+	 * The next range sync then asks for every channel the peer lists:
+	 * getMissingSCIDs only finds absent channels, and a channel whose updates
+	 * were dropped is not absent.
+	 */
+	private _repairPending = false;
 	private readonly _chainHash: Buffer;
 
 	/**
@@ -189,10 +196,14 @@ export class GossipSyncManager extends EventEmitter {
 			const scid = this._rangeScids.subarray(i, i + 8);
 			distinct.set(scid.toString('hex'), scid);
 		}
-		const missing = this._graph.getMissingSCIDs([...distinct.values()]);
+		const offered = [...distinct.values()];
+		const missing = this._repairPending
+			? offered
+			: this._graph.getMissingSCIDs(offered);
 		this._clearRangeScids();
 
 		if (missing.length === 0) {
+			this._repairPending = false;
 			this._state = GossipSyncState.SYNCED;
 			this.emit('synced');
 			return [];
@@ -225,14 +236,19 @@ export class GossipSyncManager extends EventEmitter {
 	 * sends the next batch or ends the sync.
 	 */
 	handleReplyShortChannelIdsEnd(
-		_msg: IReplyShortChannelIdsEndMessage
+		msg: IReplyShortChannelIdsEndMessage
 	): IGossipSyncMessage[] {
+		// full_information 0: the responder left part of the reply out.
+		if (!msg.complete && this._state === GossipSyncState.AWAITING_SCID_REPLY) {
+			this._batchLost = true;
+		}
 		if (this._batchLost) {
 			this._batchLost = false;
 			if (this._batchAttempts < MAX_BATCH_ATTEMPTS) {
 				return this._sendNextScidQuery();
 			}
 			this._incomplete = true;
+			this._repairPending = true;
 		}
 
 		this._currentBatchIndex++;
@@ -245,6 +261,7 @@ export class GossipSyncManager extends EventEmitter {
 				this._state = GossipSyncState.IDLE;
 				return [];
 			}
+			this._repairPending = false;
 			this._state = GossipSyncState.SYNCED;
 			this.emit('synced');
 			return [];
@@ -256,10 +273,14 @@ export class GossipSyncManager extends EventEmitter {
 	/**
 	 * The node's gossip intake was full and dropped a message from this peer.
 	 * During a batch that message may be part of the reply, so the batch is
-	 * asked for again when its end marker arrives.
+	 * asked for again when its end marker arrives. Before the range reply
+	 * completes it is gossip no batch would ask for, so the sync asks for
+	 * every channel instead.
 	 */
 	noteIntakeLoss(): void {
-		if (this._state === GossipSyncState.AWAITING_SCID_REPLY) {
+		if (this._state === GossipSyncState.AWAITING_RANGE_REPLY) {
+			this._repairPending = true;
+		} else if (this._state === GossipSyncState.AWAITING_SCID_REPLY) {
 			this._batchLost = true;
 		}
 	}
