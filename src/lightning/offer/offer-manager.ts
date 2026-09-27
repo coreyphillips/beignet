@@ -57,6 +57,9 @@ export const TLV_INVOICE = 66;
 /** TLV type for BOLT 12 invoice error in onion messages */
 export const TLV_INVOICE_ERROR = 68;
 
+/** BOLT 12: an invoice without invoice_relative_expiry expires after 7200s. */
+const DEFAULT_INVOICE_RELATIVE_EXPIRY = 7200;
+
 /** Issued invoices carry relativeExpiry 7200s; keep the preimage for the
  *  invoice's life plus an hour of grace for an HTLC in flight at expiry. */
 const INVOICE_PREIMAGE_TTL_MS = (7200 + 3600) * 1000;
@@ -202,6 +205,10 @@ export class OfferManager extends EventEmitter {
 			 * invoices that arrive without a reply-path binding.
 			 */
 			offerIdHex: string;
+			/** The offer requested: it names who may sign the invoice. */
+			offer: IOffer;
+			/** The invreq_amount we sent; the invoice must charge exactly this. */
+			amountMsat: bigint;
 			/**
 			 * The signed invreq records we sent, retained so the invoice's
 			 * mirrored fields can be checked (BOLT 12: the reader MUST reject an
@@ -636,12 +643,18 @@ export class OfferManager extends EventEmitter {
 		// quantity when the offer prices a unit; sending the unit price with a
 		// quantity above one is rejected by a spec reader.
 		const quantity = options?.quantity ?? 1n;
+		const amountMsat =
+			options?.amount ??
+			(offer.amount !== undefined ? offer.amount * quantity : undefined);
+		// BOLT 12 requires invreq_amount when the offer has none, and it is
+		// what the returned invoice's amount is held to.
+		if (amountMsat === undefined) {
+			throw new Error('Amount required: the offer does not set one');
+		}
 		const request: IInvoiceRequest = {
 			payerKey: payerPubkey,
 			offerId: offer.offerId,
-			amount:
-				options?.amount ??
-				(offer.amount !== undefined ? offer.amount * quantity : undefined),
+			amount: amountMsat,
 			metadata: crypto.randomBytes(32)
 		};
 
@@ -742,7 +755,9 @@ export class OfferManager extends EventEmitter {
 				timer,
 				sentRecords,
 				replyPathId,
-				offerIdHex: offer.offerId.toString('hex')
+				offerIdHex: offer.offerId.toString('hex'),
+				offer,
+				amountMsat
 			});
 		});
 	}
@@ -1211,13 +1226,19 @@ export class OfferManager extends EventEmitter {
 
 		// BOLT 12 reader checks (S-4.H3), split in two. The request-independent
 		// part — the signature commits to the FULL record set (mirrored +
-		// unknown fields included), and the invoice MUST carry blinded payment
-		// paths with exactly one payinfo per path — is memoized so candidate
-		// scanning runs it once. The per-request part checks the invoice's
-		// invreq-range fields byte-match the records THAT request sent.
+		// unknown fields included), the invoice MUST carry blinded payment
+		// paths with exactly one payinfo per path, and it must not have
+		// expired — is memoized so candidate scanning runs it once. The
+		// per-request part checks the invoice's invreq-range fields
+		// byte-match the records THAT request sent, that it charges exactly
+		// the amount that request asked for, and that its signer is the one
+		// the offer designates.
 		let globalReasonMemo: string | null | undefined;
 		const globalReason = (): string | null => {
 			if (globalReasonMemo !== undefined) return globalReasonMemo;
+			const expiresAt =
+				invoice.createdAt +
+				BigInt(invoice.relativeExpiry ?? DEFAULT_INVOICE_RELATIVE_EXPIRY);
 			if (!this.verifyInvoiceSignature(invoice, records)) {
 				globalReasonMemo = 'invalid invoice signature';
 			} else if (!invoice.paths || invoice.paths.length === 0) {
@@ -1227,6 +1248,8 @@ export class OfferManager extends EventEmitter {
 				invoice.blindedPayInfo.length !== invoice.paths.length
 			) {
 				globalReasonMemo = 'invoice_blindedpay must carry one payinfo per path';
+			} else if (BigInt(Math.floor(Date.now() / 1000)) > expiresAt) {
+				globalReasonMemo = 'invoice has expired';
 			} else {
 				globalReasonMemo = null;
 			}
@@ -1244,16 +1267,23 @@ export class OfferManager extends EventEmitter {
 			}
 			return null;
 		};
-		const validateAgainstSent = (sentRecords?: ITlvRecord[]): string | null =>
-			globalReason() ?? mirrorReason(sentRecords);
+		type Pending = NonNullable<
+			ReturnType<(typeof this.pendingInvoiceRequests)['get']>
+		>;
+		const validateAgainstSent = (pending: Pending): string | null => {
+			const reason = globalReason() ?? mirrorReason(pending.sentRecords);
+			if (reason) return reason;
+			if (invoice.amount !== pending.amountMsat) {
+				return `invoice_amount ${invoice.amount} msat is not the requested ${pending.amountMsat} msat`;
+			}
+			if (!this.invoiceSignerMatchesOffer(invoice, pending.offer)) {
+				return 'invoice_node_id is not the signer the offer designates';
+			}
+			return null;
+		};
 
-		const settle = (
-			requestIdHex: string,
-			pending: NonNullable<
-				ReturnType<(typeof this.pendingInvoiceRequests)['get']>
-			>
-		): void => {
-			const reason = validateAgainstSent(pending.sentRecords);
+		const settle = (requestIdHex: string, pending: Pending): void => {
+			const reason = validateAgainstSent(pending);
 			clearTimeout(pending.timer);
 			this.pendingInvoiceRequests.delete(requestIdHex);
 			if (reason) {
@@ -1318,7 +1348,7 @@ export class OfferManager extends EventEmitter {
 			);
 			if (!descMatch || !issuerMatch) continue;
 			sawCompatibleOffer = true;
-			if (validateAgainstSent(pending.sentRecords) !== null) continue;
+			if (validateAgainstSent(pending) !== null) continue;
 			settle(requestIdHex, pending);
 			return;
 		}
