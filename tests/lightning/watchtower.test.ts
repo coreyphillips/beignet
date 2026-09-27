@@ -29,7 +29,10 @@ import {
 	decodeCommitmentSignedMessage,
 	decodeRevokeAndAckMessage
 } from '../../src/lightning/message/channel-commitment';
-import { buildRemoteCommitment } from '../../src/lightning/channel/commitment-builder';
+import {
+	buildLocalCommitment,
+	buildRemoteCommitment
+} from '../../src/lightning/channel/commitment-builder';
 import { buildToLocalScript } from '../../src/lightning/script/commitment';
 import { buildToRemoteAnchorScript } from '../../src/lightning/script/anchor';
 import {
@@ -38,8 +41,15 @@ import {
 	perCommitmentPointFromSecret
 } from '../../src/lightning/keys/derivation';
 import { MAX_INDEX } from '../../src/lightning/keys/shachain';
-import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import {
+	ChannelActionType,
+	IChannelPersistEvent
+} from '../../src/lightning/channel/channel-actions';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import {
+	serializeChannelState,
+	deserializeChannelState
+} from '../../src/lightning/storage/serialization';
 import {
 	WtMessageType,
 	CreateSessionCode,
@@ -92,6 +102,11 @@ import {
 	realCommitmentSigs
 } from './helpers/real-signing';
 import { settle } from './helpers/settle';
+import {
+	createNode,
+	connectNodes,
+	openReadyChannel
+} from './helpers/loopback-nodes';
 
 bitcoin.initEccLib(ecc);
 
@@ -576,9 +591,8 @@ describe('watchtower justice against a REAL revoked commitment', function () {
 
 	it('the channel caches the revoked tx and returns it by revealed secret', function () {
 		const pair = freshPair();
-		// Two rounds: the first revoke reveals the funding-state point (never
-		// signed via signCommitment, so never cached); the second reveals the
-		// commitment we signed and cached in round one.
+		// Two rounds: the second revoke reveals the commitment signed and
+		// cached by signCommitment in round one.
 		exchangeOnce(pair.opener, pair.acceptor);
 		const secret = exchangeOnce(pair.opener, pair.acceptor);
 
@@ -607,6 +621,67 @@ describe('watchtower justice against a REAL revoked commitment', function () {
 		expect(tx.outs.some((o) => o.script.equals(toLocalSpk))).to.be.true;
 		// Consumed once: a second take returns null.
 		expect(pair.opener.takeRevokedCommitmentTx(secret)).to.be.null;
+	});
+
+	it('caches the peer commitment #0 signed at funding, on either side (#1029)', function () {
+		// The acceptor side is the inbound channel of the issue: the opener's
+		// #0 pays it the whole funding amount, its best state to breach with.
+		for (const side of ['acceptor', 'opener'] as const) {
+			const pair = freshPair();
+			const us = side === 'acceptor' ? pair.acceptor : pair.opener;
+			const peer = side === 'acceptor' ? pair.opener : pair.acceptor;
+			// The tx the peer holds and could broadcast once #0 is revoked.
+			const peerTx0 = buildLocalCommitment(
+				peer.getFullState(),
+				us.getFullState().remoteCurrentPerCommitmentPoint!,
+				0n
+			).result.tx;
+
+			const secret = exchangeOnce(us, peer);
+
+			const revokedTx = us.takeRevokedCommitmentTx(secret);
+			expect(revokedTx, `${side} cached #0`).to.not.be.null;
+			expect(bitcoin.Transaction.fromBuffer(revokedTx!).getId()).to.equal(
+				peerTx0.getId()
+			);
+		}
+	});
+
+	it('keeps the cached tx across a restart between commitment_signed and revoke_and_ack (#1029)', function () {
+		const pair = freshPair();
+		exchangeOnce(pair.opener, pair.acceptor);
+		// Round two: sign, then restart from the persisted row before the
+		// peer's revoke_and_ack (revoking the commitment cached in round one)
+		// arrives.
+		const sigs = realCommitmentSigs(pair.opener);
+		const csMsg = findSendAction(
+			pair.opener.signCommitment(sigs.signature, sigs.htlcSignatures),
+			MessageType.COMMITMENT_SIGNED
+		);
+		const restarted = new Channel(
+			deserializeChannelState(
+				JSON.parse(
+					JSON.stringify(serializeChannelState(pair.opener.getFullState()))
+				)
+			)
+		);
+		const raaMsg = findSendAction(
+			pair.acceptor.handleCommitmentSigned(
+				decodeCommitmentSignedMessage(csMsg.payload)
+			),
+			MessageType.REVOKE_AND_ACK
+		);
+		const raa = decodeRevokeAndAckMessage(raaMsg.payload);
+		const actions = restarted.handleRevokeAndAck(raa);
+		expect(actions.some((a) => a.type === ChannelActionType.ERROR)).to.be.false;
+
+		const revokedTx = restarted.takeRevokedCommitmentTx(
+			raa.perCommitmentSecret
+		);
+		expect(revokedTx, 'cached tx survived the restart').to.not.be.null;
+		expect(revokedTx).to.deep.equal(
+			pair.opener.takeRevokedCommitmentTx(raa.perCommitmentSecret)
+		);
 	});
 
 	it('fails loud when the to_local output is absent', function () {
@@ -1205,6 +1280,59 @@ describe('watchtower persistence round-trip', function () {
 			sessionKey
 		);
 		store.close();
+	});
+});
+
+describe('watchtower hand-off on revoke_and_ack (#1029)', function () {
+	it('hands off the revoked tx before the revoke persists, and that persist drops it', function () {
+		const alice = createNode('wt-handoff', 1);
+		const bob = createNode('wt-handoff', 2);
+		connectNodes(alice, bob);
+		const channelId = openReadyChannel(alice, bob);
+		const bobCm = bob.getChannelManager();
+		// Bob accepted the channel: Alice's commitment #0 is the first one he
+		// sees revoked.
+		const point0 = bobCm
+			.getChannel(channelId)!
+			.getFullState()
+			.remoteCurrentPerCommitmentPoint!.toString('hex');
+
+		const handedOff: string[] = [];
+		bobCm.on(
+			'watchtower:backup',
+			(_id: Buffer, _peer: string, secret: Buffer) => {
+				handedOff.push(perCommitmentPointFromSecret(secret).toString('hex'));
+			}
+		);
+		let revokePersist: { handedOff: number; stillCached: boolean } | null =
+			null;
+		bobCm.on('channel:persist', (ev: IChannelPersistEvent) => {
+			const state = ev.channel.getFullState();
+			if (revokePersist || state.remoteRevocationNumber !== 1n) return;
+			revokePersist = {
+				handedOff: handedOff.length,
+				stillCached: !!state.watchtowerRemoteCommitmentTxs?.has(point0)
+			};
+		});
+
+		// Bob fails it back (random hash); the add round alone revokes #0.
+		alice
+			.getChannelManager()
+			.addHtlc(
+				channelId,
+				10_000_000n,
+				crypto.randomBytes(32),
+				500,
+				Buffer.alloc(1366)
+			);
+
+		expect(handedOff).to.include(point0);
+		expect(revokePersist, 'the revoke persisted').to.deep.equal({
+			handedOff: 1,
+			stillCached: false
+		});
+		alice.destroy();
+		bob.destroy();
 	});
 });
 
