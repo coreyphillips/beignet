@@ -298,7 +298,7 @@ export interface EncryptedRecoveryFrame {
  * peers treat replays idempotently.
  *
  * Size note: a snapshot that would exceed the guardians' record limit omits
- * the oldest forwarding events and settled payment history instead
+ * the oldest forwarding events and failed payment records instead
  * (fitSnapshotUnderCeiling in journal.ts), so those two may be partial.
  */
 export interface RecoverySnapshot {

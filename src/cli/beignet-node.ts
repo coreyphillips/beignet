@@ -4034,11 +4034,15 @@ export class BeignetNode extends EventEmitter {
 		this.log('error', 'Recovery guardian refused an oversized record', {
 			detail: event.detail
 		});
-		this.emit('node:error', {
+		const data = {
 			code: 'RECOVERY_RECORD_TOO_LARGE',
 			message: event.detail,
 			timestamp: Date.now()
-		});
+		};
+		// Reported once per record, so a boot-time refusal must also reach
+		// the callback, which exists before any listener can attach.
+		this._bootOpts?.onError?.(data);
+		this.emit('node:error', data);
 	}
 
 	/**

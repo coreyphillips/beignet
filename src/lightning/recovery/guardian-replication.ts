@@ -353,6 +353,38 @@ export class GuardianReplicator {
 		return ceiling;
 	}
 
+	/** Start from the limits another replicator read for the same guardians. */
+	adoptRecordLimits(from: GuardianReplicator): void {
+		for (const [key, bytes] of from.advertisedCeilings) {
+			this.advertisedCeilings.set(key, bytes);
+		}
+	}
+
+	/**
+	 * Binding reads INFO once, so a guardian that was down then would count
+	 * at the host default for good. Asking it again each pass means records
+	 * written after it returns are sized for the limit it actually enforces.
+	 */
+	private async readMissingLimits(): Promise<void> {
+		await Promise.all(
+			this.config.guardians.map(async (entry) => {
+				const key = entry.expectedGuardianId.toString('hex');
+				if (this.advertisedCeilings.has(key)) return;
+				try {
+					const info = await entry.client.info();
+					if (
+						info.guardianId.equals(entry.expectedGuardianId) &&
+						info.maxCiphertextBytes > 0
+					) {
+						this.advertisedCeilings.set(key, info.maxCiphertextBytes);
+					}
+				} catch {
+					// Still unreachable: asked again next pass.
+				}
+			})
+		);
+	}
+
 	private emit(event: IGuardianReplicationEvent): void {
 		this.config.onEvent?.(event);
 	}
@@ -1225,11 +1257,14 @@ export class GuardianReplicator {
 		}
 		const tip = BigInt(frames[frames.length - 1].sequence);
 
-		const streams = await Promise.all(
-			this.config.guardians.map((entry) =>
-				this.streamToGuardian(entry, frames, lease, framesBySequence, tip)
-			)
-		);
+		const [streams] = await Promise.all([
+			Promise.all(
+				this.config.guardians.map((entry) =>
+					this.streamToGuardian(entry, frames, lease, framesBySequence, tip)
+				)
+			),
+			this.readMissingLimits()
+		]);
 
 		for (const [index, stream] of streams.entries()) {
 			if (stream.conflictAt != null) {

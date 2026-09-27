@@ -1482,13 +1482,14 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	/**
 	 * Hold a snapshot under the replicas' record ceiling by dropping history
 	 * no safety path reads, oldest first, and say what went. First the
-	 * forwarding ledger, then terminal payment records the send-side
-	 * duplicate checks never consult: completed or failed receives, and
+	 * forwarding ledger, then failed payment records: failed receives, and
 	 * failed sends with no preimage (a failed hash stays retryable anyway).
 	 * Payment records are what grow without bound, a few hundred bytes to a
-	 * few KB each. Completed sends always stay, because the double-pay guard
-	 * (issue #975) reads exactly those rows after a restore. A snapshot still
-	 * over after both is reported by writeFrame.
+	 * few KB each. Completed payments always stay. The double-pay guard
+	 * (issue #975) reads the completed sends after a restore, and a completed
+	 * receive is what refuses a second HTLC for a paid hash and keeps a
+	 * settled hold invoice disarmed. A snapshot still over after both is
+	 * reported by writeFrame.
 	 */
 	private fitSnapshotUnderCeiling(frame: RecoveryFrame): string[] {
 		const ceiling = this.maxFrameCiphertextBytes?.();
@@ -1523,11 +1524,9 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		const history = payments
 			.filter(
 				({ paymentHash, payment }) =>
-					payment.status !== PaymentStatus.PENDING &&
+					payment.status === PaymentStatus.FAILED &&
 					(payment.direction === PaymentDirection.INCOMING ||
-						(payment.status === PaymentStatus.FAILED &&
-							payment.preimage === undefined &&
-							!preimages.has(paymentHash)))
+						(payment.preimage === undefined && !preimages.has(paymentHash)))
 			)
 			.sort((a, b) => a.payment.createdAt - b.payment.createdAt);
 		const historic = new Set(history);
@@ -1545,7 +1544,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		if (keptHistory < history.length) {
 			dropped.push(
 				`the oldest ${history.length - keptHistory} of ${history.length} ` +
-					`settled receives and failed sends`
+					`failed payments`
 			);
 		}
 		return dropped;

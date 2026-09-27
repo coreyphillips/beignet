@@ -938,6 +938,43 @@ describe('Recovery phase 6: records over a guardian limit (issue #1014)', () => 
 		fresh.close();
 	});
 
+	it('reads the limit of a guardian that was down when the set was bound', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0, 100_000), serve(1), serve(2)]);
+		let down = true;
+		const flaky: IBoundGuardianClient = {
+			expectedGuardianId: served[0].id,
+			client: new GuardianClient({
+				url: served[0].client.url,
+				guardianSetId: SET_ID,
+				transport: async (
+					url,
+					init
+				): Promise<{ status: number; body: Buffer }> => {
+					if (down) throw new Error('connection refused');
+					return nodeGuardianTransport()(url, init);
+				}
+			})
+		};
+		const { storage } = journaledStorage(1);
+		const rep = replicator(storage, [flaky, ...bind(served.slice(1))]);
+		const lease = await registered(rep);
+		expect(rep.maxRecordBytes()).to.equal(
+			GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES
+		);
+
+		down = false;
+		await rep.replicatePending(lease);
+		expect(rep.maxRecordBytes()).to.equal(100_000);
+
+		// A rotation's switched-in replicator starts from what the backfill read.
+		const next = replicator(storage, bind(served));
+		next.adoptRecordLimits(rep);
+		expect(next.maxRecordBytes()).to.equal(100_000);
+		await shutdown(served);
+		storage.close();
+	});
+
 	it('reports each guardian that refuses a record as too large, once, whichever layer refused it', async function (): Promise<void> {
 		this.timeout(20_000);
 		const storage = openStorage();

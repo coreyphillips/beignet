@@ -2803,7 +2803,7 @@ describe('Recovery phase 2: snapshots fit the guardian record limit (issue #1014
 		storage.close();
 	});
 
-	it('then drops settled receives and failed sends, oldest first, but never a completed send', () => {
+	it('then drops failed receives and failed sends, oldest first, but never a completed payment', () => {
 		const at = (i: number): number => 1_700_000_000_000 + i;
 		const hashOf = (tag: number, i: number): Buffer => {
 			const hash = Buffer.alloc(32, tag);
@@ -2847,6 +2847,19 @@ describe('Recovery phase 2: snapshots fit the guardian record limit (issue #1014
 					)
 				);
 			}
+			// Completed receives: what refuses a second HTLC for a paid hash.
+			for (let i = 0; i < 20; i++) {
+				const hash = hashOf(8, i);
+				storage.savePayment(
+					hash.toString('hex'),
+					record(
+						hash,
+						PaymentDirection.INCOMING,
+						PaymentStatus.COMPLETED,
+						at(i)
+					)
+				);
+			}
 			// A failed send whose HTLC settled after all: it counts as paid.
 			const settled = hashOf(4, 0);
 			storage.savePayment(
@@ -2868,7 +2881,7 @@ describe('Recovery phase 2: snapshots fit the guardian record limit (issue #1014
 					record(
 						receive,
 						PaymentDirection.INCOMING,
-						PaymentStatus.COMPLETED,
+						PaymentStatus.FAILED,
 						at(2 * i)
 					)
 				);
@@ -2911,6 +2924,7 @@ describe('Recovery phase 2: snapshots fit the guardian record limit (issue #1014
 		const kept = new Map(snapshot.payments.map((p) => [p.paymentHash, p]));
 		for (let i = 0; i < 20; i++) {
 			expect(kept.has(hashOf(3, i).toString('hex'))).to.equal(true);
+			expect(kept.has(hashOf(8, i).toString('hex'))).to.equal(true);
 		}
 		expect(kept.has(hashOf(4, 0).toString('hex'))).to.equal(true);
 		expect(kept.has(hashOf(5, 0).toString('hex'))).to.equal(true);
@@ -2927,13 +2941,16 @@ describe('Recovery phase 2: snapshots fit the guardian record limit (issue #1014
 		expect(reports[0].outcome).to.equal('trimmed');
 		expect(reports[0].detail).to.contain('40 of 40 forwarding events');
 		expect(reports[0].detail).to.contain(
-			`${400 - history.length} of 400 settled receives and failed sends`
+			`${400 - history.length} of 400 failed payments`
 		);
 
 		const target = openStorage();
 		reconstructFromFrames(target, frames);
 		for (let i = 0; i < 20; i++) {
 			expect(target.loadPayment(hashOf(3, i).toString('hex'))?.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(target.loadPayment(hashOf(8, i).toString('hex'))?.status).to.equal(
 				PaymentStatus.COMPLETED
 			);
 		}

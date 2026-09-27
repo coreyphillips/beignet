@@ -307,7 +307,7 @@ Honest scoping of the hash chain: a hash chain detects tampering and reordering 
 
 Snapshots and compaction: periodically emit a full-state snapshot frame (all safety-critical tables serialized), then prune deltas older than the last snapshot. Snapshot cadence adaptive: after N frames or M bytes of deltas.
 
-A snapshot must fit the smallest `maxCiphertextBytes` the guardian set advertises (a guardian not yet heard from counts at the 4 MiB host default). One that does not drops history no safety path reads, oldest first: the forwarding ledger, then settled receives and failed sends that carry no preimage. Completed sends always stay, since the duplicate-payment guard reads them after a restore. A frame still over the limit is written anyway and reported: refusing it would roll back the transition and stop every channel locally.
+A snapshot must fit the smallest `maxCiphertextBytes` the guardian set advertises (a guardian not yet heard from counts at the 4 MiB host default). One that does not drops history no safety path reads, oldest first: the forwarding ledger, then failed receives and failed sends that carry no preimage. Completed payments always stay. The duplicate-payment guard reads the completed sends after a restore, and a completed receive is what refuses a second HTLC for a paid hash and keeps a settled hold invoice disarmed. A frame still over the limit is written anyway and reported: refusing it would roll back the transition and stop every channel locally.
 
 New tables: `recovery_frames(sequence PRIMARY KEY, writer_epoch, frame_hash, previous_hash, ciphertext, created_at)` and `recovery_meta(key, value)` for the current epoch, tip hash, and snapshot sequence.
 
