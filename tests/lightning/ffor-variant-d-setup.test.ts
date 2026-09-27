@@ -202,7 +202,7 @@ interface IPair {
 const FUNDING_SATOSHIS = 1_000_000n;
 const T_EXP = 800_000;
 const D_DEADLINE = 798_992;
-const TIP = 790_000;
+const TIP = 795_000;
 const AMOUNTS = [994_000n, 546_250n, 49_749_000n];
 
 let pairSeed = 0;

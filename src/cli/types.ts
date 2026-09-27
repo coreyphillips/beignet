@@ -833,7 +833,9 @@ export interface BeignetConfig {
 	 *  default: being a settlement peer locks liquidity for the whole epoch.
 	 *  Env: BEIGNET_FFOR_SETTLE (exact true/false), with
 	 *  BEIGNET_FFOR_MAX_BUDGET_MSAT, BEIGNET_FFOR_MAX_EPOCH_BLOCKS,
-	 *  BEIGNET_FFOR_FEE_BASE_MSAT and BEIGNET_FFOR_FEE_PPM as the terms floor. */
+	 *  BEIGNET_FFOR_FEE_BASE_MSAT and BEIGNET_FFOR_FEE_PPM as the terms floor.
+	 *  An epoch reaching more than 5040 blocks past the tip is refused
+	 *  whatever maxEpochBlocks says. */
 	fforSettle?: {
 		enabled: boolean;
 		maxBudgetMsat?: string | number;
