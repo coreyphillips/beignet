@@ -22,9 +22,14 @@ import { schnorrSign } from '../../src/lightning/offer/schnorr';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { OnionMessageManager } from '../../src/lightning/onion-message/manager';
 import {
+	constructBlindedPath,
+	deriveBlindedPrivkey
+} from '../../src/lightning/onion/blinded-path';
+import {
 	IBolt12Invoice,
 	IInvoiceRequest
 } from '../../src/lightning/offer/types';
+import { ITlvRecord } from '../../src/lightning/message/tlv';
 
 const issuerPriv = crypto.randomBytes(32);
 const strangerPriv = crypto.randomBytes(32);
@@ -177,6 +182,112 @@ describe('BOLT 12 payer checks the invoice against its request (#1006)', functio
 			reissue(x.issued, issuerPriv, { createdAt, relativeExpiry: undefined })
 		);
 		await expectRejected(x, /invoice has expired/);
+	});
+});
+
+describe('BOLT 12 payer holds a path-terminal invoice to the path it used (#1095)', function () {
+	const terminalPrivs = [crypto.randomBytes(32), crypto.randomBytes(32)];
+	const offerPaths = terminalPrivs.map((priv) =>
+		constructBlindedPath(crypto.randomBytes(32), [getPublicKey(priv)], [{}])
+	);
+	let payer: OfferManager;
+	let issuer: OfferManager;
+	let omm: OnionMessageManager;
+	let pending: Promise<IBolt12Invoice | Error>;
+	let replyPathId: Buffer;
+	let sentRecords: ITlvRecord[];
+	let errors: Array<{ error: string; matchedPendingRequest?: boolean }>;
+
+	beforeEach(() => {
+		const payerPriv = crypto.randomBytes(32);
+		omm = new OnionMessageManager(payerPriv);
+		omm.setSendFunction(() => {});
+		payer = new OfferManager(payerPriv, {
+			onionMessageManager: omm,
+			invoiceRequestTimeoutMs: 5_000
+		});
+		issuer = new OfferManager(issuerPriv);
+		const { offer } = issuer.createOffer({
+			description: 'two-path offer',
+			amount: 1_000_000n,
+			paths: offerPaths,
+			pathTerminal: true
+		});
+		errors = [];
+		payer.on('invoice:error', (e) => errors.push(e));
+		pending = payer.requestInvoice(offer).catch((e: Error) => e);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const entries = [...(payer as any).pendingInvoiceRequests.entries()];
+		expect(entries).to.have.length(1);
+		replyPathId = Buffer.from(entries[0][0], 'hex');
+		sentRecords = entries[0][1].sentRecords;
+	});
+
+	afterEach(() => {
+		payer.destroy();
+		issuer.destroy();
+		omm.destroy();
+	});
+
+	/** A valid invoice for the request, signed by the terminal of `pathIndex`. */
+	function signedByPath(pathIndex: number): Buffer {
+		const path = offerPaths[pathIndex];
+		const signerPriv = deriveBlindedPrivkey(
+			path.blindingPoint,
+			terminalPrivs[pathIndex]
+		);
+		const invoice: IBolt12Invoice = {
+			paymentHash: crypto.randomBytes(32),
+			amount: 1_000_000n,
+			description: 'two-path offer',
+			createdAt: BigInt(Math.floor(Date.now() / 1000)),
+			relativeExpiry: 7200,
+			nodeId: path.blindedHops[0].blindedNodeId,
+			paths: [path],
+			blindedPayInfo: [
+				{
+					feeBaseMsat: 0,
+					feeProportionalMillionths: 0,
+					cltvExpiryDelta: 18,
+					htlcMinimumMsat: 1n,
+					htlcMaximumMsat: 1_000_000_000n
+				}
+			]
+		};
+		const mirror = sentRecords.filter((r) => r.type < 160n);
+		const root = computeMerkleRootFromRecords(
+			getTlvRecords(encodeInvoiceTlv(invoice, mirror))
+		);
+		invoice.signature = schnorrSign(
+			computeSignatureHash('lightninginvoicesignature', root),
+			signerPriv
+		);
+		return encodeInvoiceTlv(invoice, mirror);
+	}
+
+	function deliverPathInvoice(invoiceTlv: Buffer): void {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(payer as any).handleIncomingInvoice(invoiceTlv, replyPathId);
+	}
+
+	it('accepts an invoice signed by the terminal of the path it sent to', async function () {
+		deliverPathInvoice(signedByPath(0));
+		const outcome = await pending;
+		expect(outcome).to.not.be.instanceOf(Error);
+		expect((outcome as IBolt12Invoice).nodeId).to.deep.equal(
+			offerPaths[0].blindedHops[0].blindedNodeId
+		);
+	});
+
+	it('rejects an invoice signed by the terminal of another offer path', async function () {
+		deliverPathInvoice(signedByPath(1));
+		const outcome = await pending;
+		expect(outcome).to.be.instanceOf(Error);
+		expect((outcome as Error).message).to.match(
+			/not the signer the offer designates/
+		);
+		expect(errors).to.have.length(1);
+		expect(errors[0].matchedPendingRequest).to.equal(true);
 	});
 });
 
