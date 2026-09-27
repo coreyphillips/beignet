@@ -514,7 +514,7 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			let st = await status(h, ack.terms!.swapId);
 			expect(st.state).to.equal(SwapWireState.FUNDING);
 			expect(st.fundingTxid!.toString('hex')).to.equal(r.fundingTxid);
-			expect(st.fundingTx!.toString('hex')).to.equal(r.fundingTxHex);
+			expect(st.fundingTx).to.equal(undefined);
 			h.chain.confirm(r.fundingTxid!, 1001);
 			h.chain.height = 1001;
 			await h.engine.onBlock(1001);
@@ -523,6 +523,7 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			st = await status(h, ack.terms!.swapId);
 			expect(st.state).to.equal(SwapWireState.FUNDED);
 			expect(st.fundingConfirmations).to.equal(1);
+			expect(st.fundingTx!.toString('hex')).to.equal(r.fundingTxHex);
 			expect(names(h)).to.include('swap:funded');
 		});
 	});
@@ -972,28 +973,7 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(h.chain.broadcasts).to.have.length(0);
 		});
 
-		it('status carries the funding bytes only once a broadcast was attempted', async function () {
-			const h = await harness();
-			h.chain.failBroadcasts = 1;
-			const swap = clientSwap();
-			await create(h, swap);
-			const r = record(h, swap);
-			h.holds.hold(
-				swap.paymentHash,
-				BigInt(r.invoiceMsat),
-				r.refundHeight + 60
-			);
-			await settle();
-			// Attempted and refused by the backend: the bytes may be out,
-			// the payer may have them.
-			const stuck = record(h, swap);
-			expect(stuck.state).to.equal('FUNDING');
-			expect(stuck.fundingBroadcastAttemptedAt).to.be.a('number');
-			const st = await status(h, Buffer.from(stuck.id, 'hex'));
-			expect(st.fundingTx!.toString('hex')).to.equal(stuck.fundingTxHex);
-		});
-
-		it('status stops carrying bytes that never relayed once the hold is cancelled, until the chain confirms them (issue #1012)', async function () {
+		it('status carries the funding bytes only once the chain confirms them (issue #1012)', async function () {
 			const h = await harness();
 			h.chain.failBroadcasts = 1_000;
 			const swap = clientSwap();
@@ -1005,13 +985,12 @@ describe('Reverse swap provider engine (issue #737)', function () {
 				r.refundHeight + 60
 			);
 			await settle();
+			// Attempted and refused while the hold is parked: bytes handed
+			// over now could still be put out after the cancel.
 			const stuck = record(h, swap);
+			expect(stuck.state).to.equal('FUNDING');
+			expect(stuck.fundingBroadcastAttemptedAt).to.be.a('number');
 			const id = Buffer.from(stuck.id, 'hex');
-			expect((await status(h, id)).fundingTx!.toString('hex')).to.equal(
-				stuck.fundingTxHex
-			);
-			// Cancelled, and the engine has not heard yet: the hold itself says so.
-			h.holds.cancelHold(swap.paymentHash);
 			expect((await status(h, id)).fundingTx).to.equal(undefined);
 			h.holds.sweep(swap.paymentHash);
 			await settle();

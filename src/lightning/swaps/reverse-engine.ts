@@ -828,20 +828,15 @@ export class ReverseSwapProvider extends EventEmitter {
 			return;
 		}
 		if (record && record.peerNodeIdHex === peer) {
-			// Bytes travel only once a broadcast was attempted: signed bytes
-			// that never left (a refused first broadcast, a FUNDING row) are
-			// a valid, relayable transaction the payer must never be handed.
-			// Even then, only while the hold that pays for them is parked or
-			// once the chain has confirmed them: bytes that never relayed,
-			// handed out after the cancel, fund a claim nothing pays for.
+			// Bytes travel only once the chain has confirmed them. Bytes that
+			// never relayed are a valid transaction the payer could put out
+			// after the hold is cancelled, funding a claim nothing pays for,
+			// and no cancel can take back bytes already handed over.
 			const fundingTx =
 				record.fundingTxHex &&
 				record.fundingBroadcastAttemptedAt !== undefined &&
-				record.fundingTxHex.length / 2 <= SWAP_MAX_FUNDING_TX_BYTES &&
-				(record.fundingHeight !== undefined ||
-					(!record.holdCancelledAt &&
-						this.deps.heldSnapshot(Buffer.from(record.paymentHashHex, 'hex'))
-							?.state === 'ACCEPTED'))
+				record.fundingHeight !== undefined &&
+				record.fundingTxHex.length / 2 <= SWAP_MAX_FUNDING_TX_BYTES
 					? Buffer.from(record.fundingTxHex, 'hex')
 					: undefined;
 			status = {
