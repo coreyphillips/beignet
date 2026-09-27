@@ -15867,7 +15867,11 @@ export class LightningNode extends EventEmitter {
 				}
 				return this.sendPaymentMpp(
 					invoiceStr,
-					invoice,
+					{
+						paymentHash: invoice.paymentHash,
+						paymentSecret: invoice.paymentSecret,
+						amountMsat: paymentAmountMsat
+					},
 					multiRoute,
 					finalCltvExpiry,
 					excludedChannels,
@@ -16772,7 +16776,10 @@ export class LightningNode extends EventEmitter {
 		invoice: {
 			paymentHash: Buffer;
 			paymentSecret?: Buffer;
-			amountMsat?: bigint;
+			// The amount being paid, not the invoice field: a zero-amount
+			// invoice has none, and this becomes the record's amount and every
+			// part's total_msat.
+			amountMsat: bigint;
 		},
 		multiRoute: {
 			parts: Array<{
@@ -16798,7 +16805,7 @@ export class LightningNode extends EventEmitter {
 	): IPaymentInfo {
 		const paymentHash = invoice.paymentHash;
 		const hashHex = paymentHash.toString('hex');
-		const totalMsat = invoice.amountMsat!;
+		const totalMsat = invoice.amountMsat;
 
 		// Create a single payment record, journaled BEFORE any part leaves,
 		// as the single-path send does: a restart mid-flight must find the

@@ -831,6 +831,62 @@ describe('MPP Sending (Phase 5)', function () {
 			bob.destroy();
 		});
 
+		it('an MPP split of a zero-amount invoice pays and records the caller amount (#1016)', async function () {
+			// A zero-amount invoice takes its amount from the caller. The MPP
+			// fallback used to read the invoice's amount instead, so every part
+			// carried total_msat equal to its own amount (the payee settled one
+			// part as the whole payment) and the payer's record had no amount
+			// and could not be serialized.
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(78),
+				htlcBasepointSecret: htlcSecretFor(78)
+			});
+			alice.on('error', () => {});
+			const bob = new LightningNode({
+				...makeNodeConfig(79),
+				htlcBasepointSecret: htlcSecretFor(79)
+			});
+			bob.on('error', () => {});
+			connectNodes(alice, bob);
+
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+
+			const invoice = bob.createInvoice({ description: 'any amount mpp' });
+			expect(decodeInvoice(invoice.bolt11).amountMsat).to.equal(undefined);
+
+			const payment = alice.sendPayment(
+				invoice.bolt11,
+				undefined,
+				undefined,
+				250_000_000n
+			);
+			await new Promise((r) => setTimeout(r, 50));
+
+			const record = alice.getPayment(payment.paymentHash)!;
+			expect(record.status).to.equal(PaymentStatus.COMPLETED);
+			expect(record.amountMsat).to.equal(250_000_000n);
+			const restored = deserializePaymentInfo(serializePaymentInfo(record));
+			expect(restored.amountMsat).to.equal(250_000_000n);
+
+			const bobPayment = bob.getPayment(payment.paymentHash);
+			expect(bobPayment, 'bob recorded the payment').to.exist;
+			expect(bobPayment!.status).to.equal(PaymentStatus.COMPLETED);
+			expect(
+				bobPayment!.settledHtlcs,
+				'bob settled both parts as one payment'
+			).to.have.length(2);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
 		it('a routing hint whose forwarding node is the sender cannot bypass the local capacity bound (#254)', function () {
 			// Unit-level companion to the test above: the synthetic edge for a
 			// hint hop naming the SENDER as forwarder must not exist — the
