@@ -2631,6 +2631,13 @@ export class ChannelManager extends EventEmitter {
 			}
 			this.channels.set(channelId.toString('hex'), channel);
 			this.channelPeers.set(channelId.toString('hex'), peerPubkey);
+			// After registering: the listener looks the channel up.
+			this._handOffRevokedCommitments(
+				channelId,
+				peerPubkey,
+				channel,
+				channel.takeOwedWatchtowerBackups()
+			);
 			// Reported only now: a listener persists the disposal, and both the
 			// channel and its peer mapping have to be registered before it can.
 			if (disposition !== 'none') {
@@ -4321,15 +4328,24 @@ export class ChannelManager extends EventEmitter {
 		// commitment we signed, so the backup is valid even if the channel then
 		// rejects the message. Nothing of the revoke is applied yet, so a
 		// listener that re-enters acts as if it ran before the message arrived.
-		const revokedTx = channel.takeRevokedCommitmentTx(msg.perCommitmentSecret);
+		// Earlier hand-offs that failed go first.
 		const revChannelId = channel.getChannelId();
-		if (revokedTx && revChannelId) {
-			this.emitContained(
-				'watchtower:backup',
+		if (revChannelId) {
+			const revoked = channel.takeOwedWatchtowerBackups();
+			const revokedTx = channel.takeRevokedCommitmentTx(
+				msg.perCommitmentSecret
+			);
+			if (revokedTx) {
+				revoked.push({
+					perCommitmentSecret: msg.perCommitmentSecret,
+					tx: revokedTx
+				});
+			}
+			this._handOffRevokedCommitments(
 				revChannelId,
 				peerPubkey,
-				msg.perCommitmentSecret,
-				revokedTx
+				channel,
+				revoked
 			);
 		}
 
@@ -10164,6 +10180,32 @@ export class ChannelManager extends EventEmitter {
 			channelIdHex,
 			detached.batches.length
 		);
+	}
+
+	/**
+	 * Emit watchtower:backup for each revoked commitment. A listener throws
+	 * when the backup did not reach durable storage, and the channel then
+	 * keeps that tx as owed, so the next revoke_and_ack or restore retries it.
+	 */
+	private _handOffRevokedCommitments(
+		channelId: Buffer,
+		peerPubkey: string,
+		channel: Channel,
+		revoked: Array<{ perCommitmentSecret: Buffer; tx: Buffer }>
+	): void {
+		for (const { perCommitmentSecret, tx } of revoked) {
+			try {
+				this.emit(
+					'watchtower:backup',
+					channelId,
+					peerPubkey,
+					perCommitmentSecret,
+					tx
+				);
+			} catch {
+				channel.oweWatchtowerBackup(perCommitmentSecret, tx);
+			}
+		}
 	}
 
 	/**

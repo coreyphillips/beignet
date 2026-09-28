@@ -102,8 +102,10 @@ import { settle } from './helpers/settle';
 import {
 	createNode,
 	connectNodes,
+	makeSeed,
 	openReadyChannel
 } from './helpers/loopback-nodes';
+import { LightningNode } from '../../src/lightning/node/lightning-node';
 
 bitcoin.initEccLib(ecc);
 
@@ -1144,6 +1146,43 @@ describe('watchtower client session state machine (fake tower)', function () {
 		expect(client.getHealth()[0].pendingBacklog).to.equal(1);
 	});
 
+	it('a failed backlog write queues nothing and returns false; the retry queues and ships it once (#1109)', async function () {
+		const store = new InMemoryStore();
+		const add = store.addWatchtowerUpdate.bind(store);
+		let broken = true;
+		store.addWatchtowerUpdate = (update): number => {
+			if (broken) throw new Error('disk I/O error');
+			return add(update);
+		};
+		const fake = new FakeTower(parseTowerUri(TOWER_URI));
+		const client = makeClient(fake, store);
+		const logs: Array<{ event: string; channelId?: string }> = [];
+		client.on('log', (e: { event: string; channelId?: string }) =>
+			logs.push(e)
+		);
+		const ctx = contextForClient();
+
+		expect(client.backupRevokedState(ctx)).to.equal(false);
+		expect(store.updates).to.have.length(0);
+		expect(client.getHealth()[0].pendingBacklog).to.equal(0);
+		expect(logs.find((l) => l.event === 'backup_failed')?.channelId).to.equal(
+			ctx.channelId
+		);
+
+		broken = false;
+		expect(client.backupRevokedState(ctx)).to.equal(true);
+		expect(store.updates).to.have.length(1);
+		expect(client.getHealth()[0].pendingBacklog).to.equal(1);
+
+		// Queued before start, as a retry at channel restore is: start()
+		// loads the same row and must not ship it twice.
+		await client.start();
+		expect(client.getHealth()[0].pendingBacklog).to.equal(1);
+		await settle(() => client.getHealth()[0].pendingBacklog === 0, 5000);
+		expect(fake.receivedUpdates).to.have.length(1);
+		client.stop();
+	});
+
 	it('backup_failed names the channel of the update that failed, not the trigger', async function () {
 		// An older queued update for another channel sits at the head of the
 		// backlog; a fresh backup for 'wt-test' triggers the drain, the head
@@ -1350,6 +1389,134 @@ describe('watchtower hand-off on revoke_and_ack (#1029)', function () {
 		).to.deep.equal(cachedAtFunding);
 		alice.destroy();
 		bob.destroy();
+	});
+});
+
+describe('watchtower hand-off after a failed backlog write (#1109)', function () {
+	const TAG = 'wt-owed';
+
+	/** A node with a tower configured over `storage`, as the daemon runs it. */
+	function towerNode(seedId: number, storage: SqliteStorage): LightningNode {
+		const secret = (i: number): Buffer =>
+			crypto
+				.createHash('sha256')
+				.update(makeSeed(TAG, seedId))
+				.update(Buffer.from([i]))
+				.digest();
+		return createNode(TAG, seedId, storage, {
+			watchtowers: [TOWER_URI],
+			revocationBasepointSecret: secret(1),
+			paymentBasepointSecret: secret(2)
+		});
+	}
+
+	/** Fail every tower backlog write while `broken()` says so. */
+	function breakBacklogWrites(
+		storage: SqliteStorage,
+		broken: () => boolean
+	): void {
+		const add = storage.addWatchtowerUpdate.bind(storage);
+		storage.addWatchtowerUpdate = (update): number => {
+			if (broken()) throw new Error('disk I/O error');
+			return add(update);
+		};
+	}
+
+	function hintOf(tx: Buffer): string {
+		return breachHintFromTxid(
+			bitcoin.Transaction.fromBuffer(tx).getHash()
+		).toString('hex');
+	}
+
+	/** Open a channel to Bob and run one HTLC through it, revoking #0 and more. */
+	function runRevokes(
+		alice: LightningNode,
+		bob: LightningNode
+	): {
+		channelId: Buffer;
+		tx0: Buffer;
+	} {
+		connectNodes(alice, bob);
+		const channelId = openReadyChannel(alice, bob);
+		const state = bob.getChannelManager().getChannel(channelId)!.getFullState();
+		const tx0 = state.watchtowerRemoteCommitmentTxs!.get(
+			state.remoteCurrentPerCommitmentPoint!.toString('hex')
+		)!;
+		alice
+			.getChannelManager()
+			.addHtlc(
+				channelId,
+				10_000_000n,
+				crypto.randomBytes(32),
+				500,
+				Buffer.alloc(1366)
+			);
+		return { channelId, tx0 };
+	}
+
+	it('keeps the revoked tx in the channel row and queues it after a restart', function () {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		let broken = true;
+		breakBacklogWrites(storage, () => broken);
+		const alice = createNode(TAG, 1);
+		const bob = towerNode(2, storage);
+		let restarted: LightningNode | null = null;
+		try {
+			const { channelId, tx0 } = runRevokes(alice, bob);
+			const idHex = channelId.toString('hex');
+
+			expect(storage.loadPendingWatchtowerUpdates()).to.have.length(0);
+			const owed = storage.loadChannel(idHex)!.state.watchtowerBackupsOwed;
+			expect(owed, 'owed txs persisted with the revoke').to.not.equal(
+				undefined
+			);
+			const owedHints = owed!.map((o) => hintOf(o.tx));
+			expect(owedHints).to.include(hintOf(tx0));
+
+			// A fresh process over the same database (destroy() would close it).
+			broken = false;
+			restarted = towerNode(2, storage);
+
+			const queued = storage
+				.loadPendingWatchtowerUpdates()
+				.filter((u) => u.channelId === idHex)
+				.map((u) => u.hint);
+			expect(queued).to.have.members(owedHints);
+			expect(
+				restarted.getChannelManager().getChannel(channelId)!.getFullState()
+					.watchtowerBackupsOwed
+			).to.equal(undefined);
+		} finally {
+			restarted?.destroy();
+			bob.destroy();
+			alice.destroy();
+			storage.close();
+		}
+	});
+
+	it('retries a failed hand-off on the next revoke_and_ack', function () {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		let writes = 0;
+		breakBacklogWrites(storage, () => writes++ === 0);
+		const alice = createNode(TAG, 1);
+		const bob = towerNode(2, storage);
+		try {
+			const { channelId, tx0 } = runRevokes(alice, bob);
+
+			const queued = storage.loadPendingWatchtowerUpdates().map((u) => u.hint);
+			expect(queued).to.include(hintOf(tx0));
+			expect(new Set(queued).size).to.equal(queued.length);
+			expect(
+				bob.getChannelManager().getChannel(channelId)!.getFullState()
+					.watchtowerBackupsOwed
+			).to.equal(undefined);
+		} finally {
+			bob.destroy();
+			alice.destroy();
+			storage.close();
+		}
 	});
 });
 

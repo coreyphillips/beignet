@@ -407,6 +407,8 @@ export interface ISerializedChannelState {
 	revokedHtlcSnapshots?: ISerializedHtlcSnapshot[];
 	/** Unrevoked remote commitment txs kept for watchtower backups. */
 	watchtowerRemoteCommitmentTxs?: Array<{ point: string; tx: string }>;
+	/** Revoked remote commitment txs whose watchtower hand-off failed. */
+	watchtowerBackupsOwed?: Array<{ secret: string; tx: string }>;
 	remoteCommitmentSignature: string | null;
 	remoteHtlcSignatures: string[];
 	/**
@@ -914,6 +916,12 @@ export function serializeChannelState(
 					tx: tx.toString('hex')
 			  }))
 			: undefined,
+		watchtowerBackupsOwed: s.watchtowerBackupsOwed?.length
+			? s.watchtowerBackupsOwed.map((e) => ({
+					secret: e.perCommitmentSecret.toString('hex'),
+					tx: e.tx.toString('hex')
+			  }))
+			: undefined,
 		remoteCommitmentSignature: bufToHex(s.remoteCommitmentSignature),
 		remoteHtlcSignatures: s.remoteHtlcSignatures.map((b) => b.toString('hex')),
 		remoteSigningNonce: bufToHex(s.remoteSigningNonce ?? null),
@@ -1345,6 +1353,12 @@ export function deserializeChannelState(
 						Buffer.from(e.tx, 'hex')
 					])
 			  )
+			: undefined,
+		watchtowerBackupsOwed: s.watchtowerBackupsOwed?.length
+			? s.watchtowerBackupsOwed.map((e) => ({
+					perCommitmentSecret: Buffer.from(e.secret, 'hex'),
+					tx: Buffer.from(e.tx, 'hex')
+			  }))
 			: undefined,
 		remoteCommitmentSignature: hexToBuf(s.remoteCommitmentSignature),
 		remoteHtlcSignatures: s.remoteHtlcSignatures.map((h) =>

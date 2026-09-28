@@ -4443,6 +4443,27 @@ export class Channel {
 	}
 
 	/**
+	 * Keep a revoked commitment whose tower hand-off failed, with the secret
+	 * that revoked it, until takeOwedWatchtowerBackups hands it out again.
+	 */
+	oweWatchtowerBackup(perCommitmentSecret: Buffer, tx: Buffer): void {
+		(this._state.watchtowerBackupsOwed ??= []).push({
+			perCommitmentSecret,
+			tx
+		});
+	}
+
+	/** Return (and forget) every revoked commitment still owed to the towers. */
+	takeOwedWatchtowerBackups(): Array<{
+		perCommitmentSecret: Buffer;
+		tx: Buffer;
+	}> {
+		const owed = this._state.watchtowerBackupsOwed ?? [];
+		this._state.watchtowerBackupsOwed = undefined;
+		return owed;
+	}
+
+	/**
 	 * Sign and send commitment_signed.
 	 * The caller provides the signature and HTLC signatures (from commitment-builder).
 	 */

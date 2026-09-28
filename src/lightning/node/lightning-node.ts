@@ -8243,6 +8243,9 @@ export class LightningNode extends EventEmitter {
 	 * Assemble the justice context for a revoked remote commitment and ship it to
 	 * the towers. Combines the channel's static params with the per-channel
 	 * signing secrets and our sweep destination.
+	 *
+	 * Throws when a tower update could not be written to the store, which
+	 * tells the channel manager to keep the revoked tx and retry.
 	 */
 	private backupRevokedStateToTowers(
 		channelId: Buffer,
@@ -8251,6 +8254,7 @@ export class LightningNode extends EventEmitter {
 	): void {
 		const client = this.watchtowerClient;
 		if (!client || !client.enabled) return;
+		let ctx: IJusticeContext;
 		try {
 			const channel = this.channelManager.getChannel(channelId);
 			if (!channel) return;
@@ -8263,7 +8267,7 @@ export class LightningNode extends EventEmitter {
 			const paymentBasepointSecret =
 				perCh?.paymentBasepointSecret ?? this.paymentBasepointSecret;
 			const btcNetwork = this.getBitcoinNetwork();
-			const ctx: IJusticeContext = {
+			ctx = {
 				channelId: channelId.toString('hex'),
 				revokedTx: bitcoin.Transaction.fromBuffer(revokedTx),
 				perCommitmentSecret,
@@ -8284,12 +8288,15 @@ export class LightningNode extends EventEmitter {
 				leaseExpiry: state.leaseExpiry,
 				leaseCommitBlockheight: state.leaseCommitBlockheight
 			};
-			client.backupRevokedState(ctx);
 		} catch (err) {
 			this.emitStructuredLog('watchtower', 'backup_context_failed', {
 				channelId: channelId.toString('hex'),
 				error: err instanceof Error ? err.message : String(err)
 			});
+			return;
+		}
+		if (!client.backupRevokedState(ctx)) {
+			throw new Error('watchtower backup was not queued for every tower');
 		}
 	}
 
