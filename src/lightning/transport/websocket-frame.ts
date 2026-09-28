@@ -148,7 +148,7 @@ export function decodeWsClosePayload(payload: Buffer): {
  */
 export class WsFrameParser {
 	private buffer: Buffer = Buffer.alloc(0);
-	private readonly maxPayloadBytes: number;
+	private maxPayloadBytes: number;
 	private readonly requireMasked: boolean;
 
 	constructor(opts?: { maxPayloadBytes?: number; requireMasked?: boolean }) {
@@ -160,6 +160,11 @@ export class WsFrameParser {
 	/** Bytes currently buffered awaiting a complete frame. */
 	get bufferedLength(): number {
 		return this.buffer.length;
+	}
+
+	/** Change the payload cap; it applies to every frame not yet complete. */
+	setMaxPayloadBytes(maxPayloadBytes: number): void {
+		this.maxPayloadBytes = maxPayloadBytes;
 	}
 
 	push(data: Buffer): IWsFrame[] {

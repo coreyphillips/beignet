@@ -124,6 +124,7 @@ export class BufferedDataEmitter extends EventEmitter {
 	private pendingBytes = 0;
 	/** Overflow guard for the no-listener window (destroy() on breach). */
 	protected static readonly MAX_PENDING_DATA_BYTES = 16 * 1024 * 1024;
+	protected maxPendingDataBytes = BufferedDataEmitter.MAX_PENDING_DATA_BYTES;
 
 	/** Subclasses route incoming bytes through this instead of emit('data'). */
 	protected emitData(chunk: Buffer): void {
@@ -133,7 +134,7 @@ export class BufferedDataEmitter extends EventEmitter {
 		}
 		this.pendingData.push(chunk);
 		this.pendingBytes += chunk.length;
-		if (this.pendingBytes > BufferedDataEmitter.MAX_PENDING_DATA_BYTES) {
+		if (this.pendingBytes > this.maxPendingDataBytes) {
 			this.onPendingOverflow();
 		}
 	}

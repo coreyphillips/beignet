@@ -375,6 +375,7 @@ export class Peer extends EventEmitter {
 				// Consumed via the race; see connect().
 			});
 			await Promise.race([handshake, abortPromise]);
+			socket.markEstablished?.();
 			this.state = 'ready';
 			this.setupMessageLoop();
 			this.startPingTimer();
