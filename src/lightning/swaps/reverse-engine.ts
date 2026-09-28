@@ -1541,10 +1541,15 @@ export class ReverseSwapProvider extends EventEmitter {
 		} else if (
 			observation.funding.kind === 'absent' &&
 			current.fundingTxHex &&
-			current.state === 'FUNDING_BROADCAST'
+			(current.state === 'FUNDING_BROADCAST' ||
+				current.state === 'FUNDED' ||
+				current.state === 'REFUND_PENDING')
 		) {
 			// Not seen yet: the broadcast may not have propagated, or the
-			// mempool dropped it. Judged like any funding retry.
+			// mempool dropped it. A funded row lands here once a reorg has
+			// cleared its height, so this is also where a failed reorg
+			// rebroadcast is retried. Judged like any funding retry. EXPOSED
+			// is left out: its hold is gone, so every retry would be withheld.
 			const problem = this.broadcastProblem(current);
 			if (problem) {
 				this.withholdFunding(current, problem);
