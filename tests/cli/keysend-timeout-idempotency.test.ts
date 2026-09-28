@@ -252,6 +252,35 @@ describe('keyed POST /keysend after a timeout (#1133)', function () {
 		expect(sent[1]).to.not.equal(first);
 	});
 
+	// Issue #1161: the stored row carries the preimage the sender picked, which
+	// proves nothing about whether the keysend paid.
+	it('sends again under the key once a stored keysend failed', async () => {
+		const request = { ...body, timeoutMs: 50 };
+		const headers = { 'X-Idempotency-Key': `keysend-stored-${Date.now()}` };
+		const storage = node.getStorage();
+		const dispatch = engine().sendKeysend;
+		engine().sendKeysend = (...args: unknown[]): unknown => {
+			const record = dispatch(...args) as IPaymentInfo;
+			// As the engine records a keysend before its HTLC goes out.
+			record.preimage = (args[0] as { preimage: Buffer }).preimage;
+			record.metadata = { _keysend: 'true' };
+			storage.savePayment(record.paymentHash.toString('hex'), record);
+			return record;
+		};
+
+		expect((await postKeysend(port, request, headers)).status).to.equal(504);
+		const [first] = sent;
+		expect(node.paymentOutcome(first)).to.equal('live');
+		resolveHtlc(first, 'FAILED');
+		storage.savePayment(first, engine().payments.get(first)!);
+		expect(node.paymentOutcome(first)).to.equal('gone');
+
+		const rerun = await postKeysend(port, request, headers);
+		expect(rerun.status).to.equal(504);
+		expect(sent).to.have.length(2);
+		expect(errorOf(rerun).paymentHash).to.equal(sent[1]);
+	});
+
 	// Issue #1153: stored before the HTLC goes out, so a daemon stopped before
 	// the timeout still leaves the retry after a restart its marker.
 	it('stores the keysend in flight under its hash until the request answers', async () => {
