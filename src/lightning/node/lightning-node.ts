@@ -16845,8 +16845,18 @@ export class LightningNode extends EventEmitter {
 	 * via TLV type 5482373484, and the recipient extracts + verifies it.
 	 */
 	sendKeysend(options: IKeysendOptions): IPaymentInfo {
-		// A fresh preimage per call, so each keysend is its own payment.
-		return this.dispatchKeysend(options, crypto.randomBytes(32));
+		if (options.preimage !== undefined && options.preimage.length !== 32) {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVALID_KEYSEND,
+				'preimage must be 32 bytes'
+			);
+		}
+		// A fresh preimage per call unless the caller picked one, so each
+		// keysend is its own payment.
+		return this.dispatchKeysend(
+			options,
+			options.preimage ?? crypto.randomBytes(32)
+		);
 	}
 
 	/**

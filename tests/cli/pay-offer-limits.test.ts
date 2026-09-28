@@ -942,12 +942,17 @@ describe('keyed POST /offer/pay across a daemon restart (#1132)', function () {
 		hasHtlcInFlight: (paymentHash: Buffer) => boolean;
 	};
 
+	const noop = (): void => undefined;
+
 	const start = async (): Promise<void> => {
 		({ server, node } = await startDaemon({
 			mnemonic: MNEMONIC,
 			network: 'regtest',
 			dataDir: tmpDir,
 			logLevel: 'silent',
+			// A stopped daemon's handler that times out later fails to write
+			// to its closed database, which would otherwise print.
+			logger: { debug: noop, info: noop, warn: noop, error: noop },
 			rapidGossipSync: false,
 			autoGossipSync: false,
 			daemonPort: 0,
@@ -990,6 +995,13 @@ describe('keyed POST /offer/pay across a daemon restart (#1132)', function () {
 		await node!.destroy();
 		await start();
 	};
+
+	/** The markers the daemon has stored, by cache key. */
+	const storedMarkers = (): Record<string, { paymentHash: string }> =>
+		JSON.parse(
+			node!.getStorage().loadWalletData('daemon:payment-timeout-markers:v1') ??
+				'{}'
+		);
 
 	before(async () => {
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-offer-1132-'));
@@ -1051,5 +1063,84 @@ describe('keyed POST /offer/pay across a daemon restart (#1132)', function () {
 		const again = await postOfferPay(port, body, headers);
 		expect(again).to.deep.equal(settled);
 		expect(issued).to.have.length(2);
+	});
+
+	// Issue #1153: the marker was written only when the route's timeout fired,
+	// so a daemon stopped before it left none, and the retry after the restart
+	// asked the payee for a fresh invoice while the first HTLC could settle.
+	it('answers a retry after a stop mid-payment from the first payment (#1153)', async () => {
+		// Long enough for the stop below to come first.
+		const body = {
+			offer: offerString(node!, 'stops mid-payment'),
+			timeoutMs: 3_000
+		};
+		const headers = { 'X-Idempotency-Key': `offer-stop-${Date.now()}` };
+		const cacheKey = `POST /offer/pay:${headers['X-Idempotency-Key']}`;
+		const before = issued.length;
+
+		const e = internals(node!).node;
+		const dispatch = e.payBolt12Invoice;
+		let storedAtDispatch: string | undefined;
+		e.payBolt12Invoice = (...args: unknown[]): unknown => {
+			storedAtDispatch = storedMarkers()[cacheKey]?.paymentHash;
+			return dispatch(...args);
+		};
+		const firstReply = postOfferPay(port, body, headers);
+		await waitFor(() => issued.length > before, 'the dispatch');
+		const first = issued[before];
+		await waitFor(() => htlcsOut.has(first), 'the HTLC');
+		expect(storedAtDispatch, 'stored before the HTLC went out').to.equal(first);
+
+		// Stopped with the handler still waiting on the payment.
+		await restart();
+		const retried = await postOfferPay(port, body, headers);
+		expect(retried.status).to.equal(409);
+		expect(errorCode(retried.body)).to.equal('DUPLICATE_PAYMENT');
+		expect(
+			(retried.body.error as { paymentHash?: string }).paymentHash
+		).to.equal(first);
+		expect(
+			issued,
+			'the retry asked the payee for another invoice'
+		).to.have.length(before + 1);
+
+		// The stopped daemon's handler still times out in this process; waited
+		// for so its timer does not outlive the test.
+		await firstReply;
+
+		const record = records.get(first)!;
+		record.status = PaymentStatus.COMPLETED;
+		record.completedAt = Date.now();
+		htlcsOut.delete(first);
+		const settled = await postOfferPay(port, body, headers);
+		expect(settled.status).to.equal(200);
+		expect(
+			(settled.body.result as { paymentHash: string }).paymentHash
+		).to.equal(first);
+		expect(issued).to.have.length(before + 1);
+	});
+
+	it('drops the stored in-flight payment once the request answers (#1153)', async () => {
+		const headers = { 'X-Idempotency-Key': `offer-answers-${Date.now()}` };
+		const cacheKey = `POST /offer/pay:${headers['X-Idempotency-Key']}`;
+		const before = issued.length;
+
+		const reply = postOfferPay(
+			port,
+			{ offer: offerString(node!, 'answers'), timeoutMs: 60_000 },
+			headers
+		);
+		await waitFor(() => issued.length > before, 'the dispatch');
+		const hash = issued[before];
+		await waitFor(() => htlcsOut.has(hash), 'the HTLC');
+		expect(storedMarkers()[cacheKey]?.paymentHash).to.equal(hash);
+
+		const record = records.get(hash)!;
+		record.status = PaymentStatus.COMPLETED;
+		record.completedAt = Date.now();
+		htlcsOut.delete(hash);
+		internals(node!).node.emit('payment:sent', record);
+		expect((await reply).status).to.equal(200);
+		expect(storedMarkers()).to.not.have.property(cacheKey);
 	});
 });

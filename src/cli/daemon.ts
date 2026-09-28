@@ -71,8 +71,9 @@ export interface DaemonOptions extends BeignetNodeOptions {
 const MAX_BODY_BYTES = 1_048_576; // 1 MB
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
-// The CachedResponse entries that carry a paymentHash, kept across restarts
-// (#1132): a retry that missed its marker would pay again under a fresh hash.
+// The CachedResponse entries that carry a paymentHash, and the keyed payments
+// still in flight, kept across restarts (#1132, #1153): a retry that missed
+// its marker would pay again under a fresh hash.
 const PAYMENT_TIMEOUT_MARKERS_STORAGE_KEY = 'daemon:payment-timeout-markers:v1';
 
 interface CachedResponse {
@@ -81,8 +82,9 @@ interface CachedResponse {
 	expiresAt: number;
 	/**
 	 * Set instead of a response for a keyed POST /offer/pay or POST /keysend
-	 * that timed out: the payment the key started, whose outcome answers each
-	 * retry (#1094, #1133).
+	 * that timed out, or was still in flight when the daemon stopped: the
+	 * payment the key started, whose outcome answers each retry (#1094,
+	 * #1133, #1153).
 	 */
 	paymentHash?: string;
 }
@@ -1275,8 +1277,19 @@ async function bootDaemon(
 			});
 		}
 	}
+	// A keyed /offer/pay or /keysend still in flight, stored with the timeout
+	// markers from before its HTLC goes out until its handler settles (#1153):
+	// a stop or crash before the route's timeout never reaches the catch that
+	// writes the timeout marker. A restart loads it as one.
+	const inFlightPaymentMarkers = new Map<
+		string,
+		Omit<CachedResponse, 'response'>
+	>();
 	const saveTimeoutMarkers = (): void => {
-		const markers: Record<string, Omit<CachedResponse, 'response'>> = {};
+		const markers: Record<
+			string,
+			Omit<CachedResponse, 'response'>
+		> = Object.fromEntries(inFlightPaymentMarkers);
 		for (const [
 			key,
 			{ bodyHash, expiresAt, paymentHash }
@@ -1358,7 +1371,10 @@ async function bootDaemon(
 
 	type RouteHandler = (
 		body: Record<string, unknown>,
-		query: URLSearchParams
+		query: URLSearchParams,
+		/** Set on a keyed request: called with the payment hash before the
+		 *  HTLC goes out. */
+		onPaymentHash?: (paymentHash: string) => void
 	) => unknown;
 
 	const routes: Record<string, RouteHandler> = {
@@ -2334,7 +2350,7 @@ async function bootDaemon(
 				})
 			);
 		},
-		'POST /keysend': async (body) => {
+		'POST /keysend': async (body, _query, onPaymentHash) => {
 			const { pubkey, amountSats, timeoutMs, maxFeeSats, metadata } = body as {
 				pubkey: string;
 				amountSats: number;
@@ -2351,7 +2367,8 @@ async function bootDaemon(
 						amountSats,
 						timeoutMs,
 						maxFeeSats,
-						metadata
+						metadata,
+						onPaymentHash
 					)
 				);
 			} catch (err: unknown) {
@@ -2969,7 +2986,7 @@ async function bootDaemon(
 			if (!removed) return failure('NOT_FOUND', 'Offer not found');
 			return success({ removed: true });
 		},
-		'POST /offer/pay': async (body) => {
+		'POST /offer/pay': async (body, _query, onPaymentHash) => {
 			const { offer, amountSats, timeoutMs, maxFeeSats, maxFeeMsat } = body as {
 				offer: string;
 				amountSats?: number;
@@ -2984,7 +3001,8 @@ async function bootDaemon(
 					amountSats,
 					timeoutMs,
 					maxFeeSats,
-					maxFeeMsat
+					maxFeeMsat,
+					onPaymentHash
 				)
 			);
 		},
@@ -3671,11 +3689,21 @@ async function bootDaemon(
 					endWithResult(res, await inFlight.promise);
 					return;
 				}
+				const onPaymentHash = (paymentHash: string): void => {
+					inFlightPaymentMarkers.set(cacheKey, {
+						bodyHash,
+						expiresAt: Date.now() + IDEMPOTENCY_TTL_MS,
+						paymentHash
+					});
+					saveTimeoutMarkers();
+				};
 				// Wrapped so a synchronous throw rejects the shared promise
 				// instead of escaping before the reservation is released.
-				const pending = (async (): Promise<unknown> => handler(body, query))();
+				const pending = (async (): Promise<unknown> =>
+					handler(body, query, onPaymentHash))();
 				idempotencyInFlight.set(cacheKey, { bodyHash, promise: pending });
 				let result: unknown;
+				let markersChanged = false;
 				try {
 					result = await pending;
 				} catch (err: unknown) {
@@ -3697,11 +3725,13 @@ async function bootDaemon(
 							expiresAt: Date.now() + IDEMPOTENCY_TTL_MS,
 							paymentHash: err.paymentHash
 						});
-						saveTimeoutMarkers();
+						markersChanged = true;
 					}
 					throw err;
 				} finally {
 					idempotencyInFlight.delete(cacheKey);
+					if (inFlightPaymentMarkers.delete(cacheKey)) markersChanged = true;
+					if (markersChanged) saveTimeoutMarkers();
 				}
 				idempotencyCache.set(cacheKey, {
 					response: result,
