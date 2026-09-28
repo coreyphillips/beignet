@@ -1335,7 +1335,7 @@ async function bootDaemon(
 	};
 	const idempotencyCleanupTimer = setInterval(() => {
 		const now = Date.now();
-		let markerDropped = false;
+		let markerChanged = false;
 		for (const [key, entry] of idempotencyCache) {
 			if (now < entry.expiresAt) continue;
 			// An HTLC can stay out for up to 2016 blocks, well past the TTL,
@@ -1345,12 +1345,13 @@ async function bootDaemon(
 				node.paymentOutcome(entry.paymentHash) === 'live'
 			) {
 				entry.expiresAt = now + IDEMPOTENCY_TTL_MS;
+				markerChanged = true;
 				continue;
 			}
-			if (entry.paymentHash !== undefined) markerDropped = true;
+			if (entry.paymentHash !== undefined) markerChanged = true;
 			idempotencyCache.delete(key);
 		}
-		if (markerDropped) saveTimeoutMarkers();
+		if (markerChanged) saveTimeoutMarkers();
 	}, IDEMPOTENCY_CLEANUP_INTERVAL_MS);
 	if (idempotencyCleanupTimer.unref) idempotencyCleanupTimer.unref();
 	started.release.push(() => clearInterval(idempotencyCleanupTimer));

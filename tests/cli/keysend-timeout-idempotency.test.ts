@@ -103,7 +103,7 @@ describe('keyed POST /keysend after a timeout (#1133)', function () {
 	let sweepIdempotency: (() => void) | undefined;
 
 	/** Runs the sweep as it would run 25 hours from now, past the TTL. */
-	const sweepPastTtl = (): void => {
+	const sweepPastTtl = (): number => {
 		expect(sweepIdempotency, 'the cache sweep was captured').to.be.a(
 			'function'
 		);
@@ -115,6 +115,7 @@ describe('keyed POST /keysend after a timeout (#1133)', function () {
 		} finally {
 			Date.now = realNow;
 		}
+		return later;
 	};
 
 	before(async () => {
@@ -202,7 +203,18 @@ describe('keyed POST /keysend after a timeout (#1133)', function () {
 			'the timeout names the payment to look up'
 		).to.equal(first);
 
-		sweepPastTtl();
+		const sweptAt = sweepPastTtl();
+		const stored = node
+			.getStorage()
+			.loadWalletData('daemon:payment-timeout-markers:v1');
+		expect(stored).to.not.equal(null);
+		const markers = JSON.parse(stored!) as Record<
+			string,
+			{ expiresAt: number }
+		>;
+		expect(
+			markers[`POST /keysend:${headers['X-Idempotency-Key']}`].expiresAt
+		).to.be.greaterThan(sweptAt);
 
 		const retried = await postKeysend(port, request, headers);
 		expect(retried.status).to.equal(409);
