@@ -99,6 +99,13 @@ const META_LAST_SNAPSHOT_WRITTEN = 'journal_last_snapshot_written';
 const META_SNAPSHOT_SCHEMA = 'journal_snapshot_schema';
 export const SNAPSHOT_SCHEMA_VERSION = '2';
 /**
+ * Declared instead by a snapshot whose rows spilled into page frames (see
+ * pageSnapshotRows). Its content is schema 2, but a release that predates
+ * pageFrames would restore it without the pages a guardian never received,
+ * so those releases must read it as a schema they cannot restore.
+ */
+const PAGED_SNAPSHOT_SCHEMA_VERSION = '2+pages';
+/**
  * The EXACT marker strings this release knows how to migrate from. An
  * absent or empty marker (a journal written before versioning existed)
  * is also migratable. Anything else, including malformed numerics such
@@ -1138,7 +1145,10 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			if (!frames[i].snapshot) continue;
 			sawSnapshot = true;
 			const declared = frames[i].snapshot!.schemaVersion;
-			if (!snapshotSchemaKnown(declared)) {
+			if (
+				declared !== PAGED_SNAPSHOT_SCHEMA_VERSION &&
+				!snapshotSchemaKnown(declared)
+			) {
 				throw new Error(
 					`recovery: the journal's retained base snapshot declares ` +
 						`schema '${declared}', which is not one this release can ` +
@@ -1754,6 +1764,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 
 		const paged: RecoverySnapshot = {
 			...snapshot,
+			schemaVersion: PAGED_SNAPSHOT_SCHEMA_VERSION,
 			pageFrames: pages.length,
 			preimages: [],
 			payments: [],
@@ -2254,7 +2265,12 @@ export function assertFramesReconstructable(frames: RecoveryFrame[]): void {
 	// that shape, and a capsule chain without one fails the base binding.
 	if (!snapshot) return;
 	const declared = snapshot.schemaVersion;
-	if (declared === SNAPSHOT_SCHEMA_VERSION) return;
+	if (
+		declared === SNAPSHOT_SCHEMA_VERSION ||
+		declared === PAGED_SNAPSHOT_SCHEMA_VERSION
+	) {
+		return;
+	}
 	if (
 		declared == null ||
 		declared === '' ||
@@ -2312,7 +2328,12 @@ export function reconstructFromFrames(
 	// the local marker cannot stand in for it because it does not survive
 	// the loss of the device.
 	assertFramesReconstructable(frames);
-	const snapshotSchema = frames[snapshotIndex].snapshot!.schemaVersion;
+	const declaredSchema = frames[snapshotIndex].snapshot!.schemaVersion;
+	// The local marker records content, and a paged snapshot's is schema 2.
+	const snapshotSchema =
+		declaredSchema === PAGED_SNAPSHOT_SCHEMA_VERSION
+			? SNAPSHOT_SCHEMA_VERSION
+			: declaredSchema;
 	const replayEnd = lastAppliedFrameIndex(frames) + 1;
 	// Path_id preflight runs over the WHOLE restore set (snapshot AND replay
 	// deltas) before the first write: a refusal discovered mid-replay would

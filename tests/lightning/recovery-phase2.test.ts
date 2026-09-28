@@ -3094,6 +3094,10 @@ describe('Recovery phase 2: snapshots page what a guardian record cannot hold (i
 		expect(reports).to.deep.equal([]);
 		const frames = journal.loadVerifiedFrames();
 		expect(frames[0].snapshot!.pageFrames).to.equal(frames.length - 1);
+		// Releases that predate pageFrames restore only schema '2', so they
+		// refuse this rather than restore it without missing pages.
+		expect(frames[0].snapshot!.schemaVersion).to.equal('2+pages');
+		expect(storage.getRecoveryMeta!('journal_snapshot_schema')).to.equal('2');
 		// The transition's own row may sit in any page, so its barrier waits
 		// for the last one.
 		expect(result.frameSequence).to.equal(BigInt(frames.length));
@@ -3101,6 +3105,7 @@ describe('Recovery phase 2: snapshots page what a guardian record cannot hold (i
 		const target = openStorage();
 		reconstructFromFrames(target, frames);
 		expect(dumpTables(target)).to.equal(dumpTables(storage));
+		expect(target.getRecoveryMeta!('journal_snapshot_schema')).to.equal('2');
 		// What the double-pay guard and the paid-hash refusal read.
 		for (let i = 0; i < PAID; i++) {
 			expect(target.loadPayment(hashOf(3, i))).to.include({
