@@ -3670,6 +3670,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								message: {
 									type: 'string',
 									description: 'Human-readable error message'
+								},
+								paymentHash: {
+									type: 'string',
+									description:
+										'The payment the error is about, hex (PAYMENT_TIMEOUT, and DUPLICATE_PAYMENT on a keyed /offer/pay retry)'
 								}
 							},
 							description: 'Error details (present when ok=false)'

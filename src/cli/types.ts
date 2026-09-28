@@ -969,7 +969,7 @@ export interface EventMessage {
 export interface ApiResponse<T> {
 	ok: boolean;
 	result?: T;
-	error?: { code: string; message: string };
+	error?: { code: string; message: string; paymentHash?: string };
 }
 
 export interface PaymentFilter {

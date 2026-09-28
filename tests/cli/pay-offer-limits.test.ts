@@ -751,18 +751,30 @@ describe('keyed POST /offer/pay after a timeout (#1094)', function () {
 	};
 	const engine = (): Engine => internals(node).node as Engine;
 
+	/** The daemon's idempotency cache sweep, run by hand instead of on its timer. */
+	let sweepIdempotency: (() => void) | undefined;
+
 	before(async () => {
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-offer-1094-'));
-		({ server, node } = await startDaemon({
-			mnemonic: MNEMONIC,
-			network: 'regtest',
-			dataDir: tmpDir,
-			logLevel: 'silent',
-			rapidGossipSync: false,
-			autoGossipSync: false,
-			daemonPort: 0,
-			...OFFLINE_ELECTRUM
-		}));
+		const realSetInterval = global.setInterval;
+		global.setInterval = ((fn: () => void, ...rest: unknown[]) => {
+			if (String(fn).includes('idempotencyCache')) sweepIdempotency = fn;
+			return (realSetInterval as (...args: unknown[]) => unknown)(fn, ...rest);
+		}) as unknown as typeof setInterval;
+		try {
+			({ server, node } = await startDaemon({
+				mnemonic: MNEMONIC,
+				network: 'regtest',
+				dataDir: tmpDir,
+				logLevel: 'silent',
+				rapidGossipSync: false,
+				autoGossipSync: false,
+				daemonPort: 0,
+				...OFFLINE_ELECTRUM
+			}));
+		} finally {
+			global.setInterval = realSetInterval;
+		}
 		port = (server.address() as AddressInfo).port;
 	});
 
@@ -879,5 +891,28 @@ describe('keyed POST /offer/pay after a timeout (#1094)', function () {
 			issued[1]
 		);
 		expect(issued[1]).to.not.equal(first);
+	});
+
+	it('keeps the timeout past the idempotency TTL while the payment is out', async () => {
+		const body = { offer: offerString(node, 'outlives ttl'), timeoutMs: 50 };
+		const headers = { 'X-Idempotency-Key': `offer-ttl-${Date.now()}` };
+
+		expect((await postOfferPay(port, body, headers)).status).to.equal(504);
+		expect(sweepIdempotency, 'the cache sweep was captured').to.be.a(
+			'function'
+		);
+		const realNow = Date.now;
+		const later = realNow() + 25 * 60 * 60 * 1000;
+		Date.now = (): number => later;
+		try {
+			sweepIdempotency!();
+		} finally {
+			Date.now = realNow;
+		}
+
+		const retried = await postOfferPay(port, body, headers);
+		expect(retried.status).to.equal(409);
+		expect(errorCode(retried.body)).to.equal('DUPLICATE_PAYMENT');
+		expect(issued).to.have.length(1);
 	});
 });
