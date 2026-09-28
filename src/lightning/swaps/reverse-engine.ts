@@ -1428,6 +1428,42 @@ export class ReverseSwapProvider extends EventEmitter {
 		return undefined;
 	}
 
+	/**
+	 * Put retained funding bytes back out after a reorg or a mempool drop.
+	 * The wallet lists their inputs as unspent again and has already pruned
+	 * the pledge, so they are pledged again before the bytes leave, or a
+	 * failed broadcast leaves them free for another selection. A withheld
+	 * funding is not pledged, so it holds no wallet coins. The hold is judged
+	 * again after the pledge because a cancel can land while the wallet waits.
+	 */
+	private async rebroadcastFunding(record: ISwapRecord): Promise<void> {
+		const txHex = record.fundingTxHex!;
+		let problem = this.broadcastProblem(record);
+		if (!problem) {
+			try {
+				await this.deps.pledge?.(txHex);
+			} catch (err) {
+				this.deps.log('swap_pledge_failed', {
+					swapId: record.id,
+					error: err instanceof Error ? err.message : String(err)
+				});
+			}
+			problem = this.broadcastProblem(record);
+			// Nothing renews a withheld row, so the coins it just froze would
+			// stay frozen until a prune.
+			if (problem) await this.release(txHex);
+		}
+		if (problem) {
+			this.withholdFunding(record, problem);
+			return;
+		}
+		try {
+			await this.deps.broadcast(txHex);
+		} catch {
+			/* retried next block */
+		}
+	}
+
 	private async processWatched(record: ISwapRecord): Promise<void> {
 		if (!record.fundingTxid || record.fundingVout === undefined) return;
 		const fundingTxid = record.fundingTxid;
@@ -1522,18 +1558,7 @@ export class ReverseSwapProvider extends EventEmitter {
 			// Rebroadcast our own bytes, judged like any funding retry: after a
 			// cancelled hold nothing pays for the claim they would enable. The
 			// state clock only moves forward again once the chain confirms them.
-			if (current.fundingTxHex) {
-				const problem = this.broadcastProblem(current);
-				if (problem) {
-					this.withholdFunding(current, problem);
-				} else {
-					try {
-						await this.deps.broadcast(current.fundingTxHex);
-					} catch {
-						/* retried next block */
-					}
-				}
-			}
+			if (current.fundingTxHex) await this.rebroadcastFunding(current);
 			const patched = this.deps.ledger.patch(current.id, {
 				fundingHeight: undefined
 			});
@@ -1550,16 +1575,7 @@ export class ReverseSwapProvider extends EventEmitter {
 			// cleared its height, so this is also where a failed reorg
 			// rebroadcast is retried. Judged like any funding retry. EXPOSED
 			// is left out: its hold is gone, so every retry would be withheld.
-			const problem = this.broadcastProblem(current);
-			if (problem) {
-				this.withholdFunding(current, problem);
-			} else {
-				try {
-					await this.deps.broadcast(current.fundingTxHex);
-				} catch {
-					/* retried next block */
-				}
-			}
+			await this.rebroadcastFunding(current);
 		}
 
 		// Refund path: after the refund height, with funding confirmed and

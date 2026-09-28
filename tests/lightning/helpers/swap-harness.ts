@@ -348,6 +348,8 @@ export async function harness(
 		start?: boolean;
 		/** The refund destination the engine is handed (default a P2WPKH). */
 		destination?: Buffer;
+		/** Replace the fake wallet's closures, e.g. with a real funding provider. */
+		deps?: Partial<IReverseSwapProviderDeps>;
 	} = {}
 ): Promise<ISwapHarness> {
 	const net = options.net ?? new FakeDfNetwork();
@@ -428,7 +430,8 @@ export async function harness(
 		refundDestinationScript: () => destination,
 		network: bitcoin.networks.regtest,
 		networkName: 'regtest',
-		log: (action, data) => logs.push({ action, data })
+		log: (action, data) => logs.push({ action, data }),
+		...options.deps
 	};
 	const engine = new ReverseSwapProvider(deps, config);
 	for (const evt of [
