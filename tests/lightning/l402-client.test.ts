@@ -1439,6 +1439,54 @@ describe('L402 concurrent calls and result hygiene', () => {
 		expect(a.amountPaidSats + b.amountPaidSats).to.equal(3);
 	});
 
+	it('keeps a credential another call paid for while a rejected one was in flight', async () => {
+		const server = createMockL402Server({ priceSats: 3 });
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => (release = resolve));
+		let calls = 0;
+		// Hold only the first request, so the second call pays and stores its
+		// credential before the first call's rejection comes back.
+		const fetchImpl: typeof server.fetchImpl = async (url, init) => {
+			const first = ++calls === 1;
+			const response = await server.fetchImpl(url, init);
+			if (first) await held;
+			return response;
+		};
+		const store = new MemoryL402CredentialStore();
+		const scope = credentialScope('https://mock.example');
+		store.set({
+			scope,
+			macaroon: makeMacaroon(crypto.randomBytes(32)),
+			preimage: crypto.randomBytes(32).toString('hex'),
+			paymentHash: crypto.randomBytes(32).toString('hex'),
+			amountSats: 1,
+			createdAt: Date.now(),
+			scheme: 'L402'
+		});
+		const opts = {
+			payer: server.payer,
+			maxPriceSats: 10,
+			credentials: store,
+			fetchImpl
+		};
+
+		const stale = l402Fetch('https://mock.example/data', {}, opts);
+		const paying = await l402Fetch('https://mock.example/data', {}, opts);
+		expect(paying.paid).to.equal(true);
+		release();
+		const result = await stale;
+
+		expect(result.response.status).to.equal(200);
+		expect(result.paid).to.equal(false);
+		expect(server.payer.payments).to.equal(1);
+		expect(result.credential?.paymentHash).to.equal(
+			paying.credential?.paymentHash
+		);
+		expect(store.get(scope)?.paymentHash).to.equal(
+			paying.credential?.paymentHash
+		);
+	});
+
 	it('does not report a credential this call already dropped', async () => {
 		const store = new MemoryL402CredentialStore();
 		store.set({

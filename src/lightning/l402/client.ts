@@ -254,7 +254,16 @@ export async function l402Fetch(
 		(response.status === 401 || response.status === 402) &&
 		credentialReached(url, response)
 	) {
-		store.delete(scope);
+		// Another call may have paid for a replacement while this request was in
+		// flight, and nothing has rejected that one. Compared by value, since a
+		// store may hand back a fresh object on every get.
+		const held = store.get(scope);
+		if (
+			held?.macaroon === usable.macaroon &&
+			held.preimage === usable.preimage
+		) {
+			store.delete(scope);
+		}
 		usable = undefined;
 		response = await doFetch(url, request(undefined));
 	}
