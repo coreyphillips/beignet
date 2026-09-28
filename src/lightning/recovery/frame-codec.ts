@@ -498,6 +498,14 @@ function decodeSnapshot(encoded: IEncodedSnapshot): RecoverySnapshot {
 	};
 }
 
+/**
+ * Throw if a mutation cannot be encoded. The storage write runs the same
+ * serializers, so a mutation that fails here fails every commit it joins.
+ */
+export function assertMutationEncodable(mutation: RecoveryMutation): void {
+	JSON.stringify(encodeMutation(mutation));
+}
+
 /** Encode a frame to the plaintext bytes the frame hash commits to. */
 export function encodeFrame(frame: RecoveryFrame): Buffer {
 	const encoded: IEncodedFrame = {

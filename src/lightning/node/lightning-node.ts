@@ -355,6 +355,8 @@ import {
 	RecoveryManager,
 	RecoveryCriticality,
 	RecoveryMutation,
+	IRecoveryCommitResult,
+	assertMutationEncodable,
 	GuardianStartupGate,
 	DurabilityBarrier,
 	IBarrierLatency,
@@ -3634,14 +3636,25 @@ export class LightningNode extends EventEmitter {
 		// Whatever the caller staged for this transition (preimage before a
 		// fulfill, linkage before a forward) commits with it or not at all.
 		const staged = this.takeStagedMutations();
-		mutations.push(...staged);
+		const encodable = this.dropUnencodable(staged);
+		mutations.push(...encodable);
 
-		const result = this.recovery.commit({
-			criticality: RecoveryCriticality.SafetyCritical,
-			mutations,
-			outboundMessages: request?.outbound ?? [],
-			reportedByCaller: true
-		});
+		// A dropped mutation can never commit, so the transition that carried
+		// it fails as a whole: its sends are the action that depended on it.
+		const result: IRecoveryCommitResult =
+			encodable.length < staged.length
+				? {
+						committed: false,
+						released: [],
+						error: new Error('a staged mutation cannot be encoded'),
+						frameSequence: null
+				  }
+				: this.recovery.commit({
+						criticality: RecoveryCriticality.SafetyCritical,
+						mutations,
+						outboundMessages: request?.outbound ?? [],
+						reportedByCaller: true
+				  });
 
 		if (request) {
 			request.committed = result.committed;
@@ -3668,7 +3681,7 @@ export class LightningNode extends EventEmitter {
 				this.dirtyMonitors.add(channelIdHex);
 				this.monitorsAwaitingChannel.add(channelIdHex);
 			}
-			if (staged.length) this.stagedMutations.unshift(...staged);
+			if (encodable.length) this.stagedMutations.unshift(...encodable);
 			// A failed persist of a TERMINAL state has no later transition to
 			// ride; arm the per-block retry so the close (and its closeReason)
 			// still reaches disk once storage recovers.
@@ -3791,9 +3804,32 @@ export class LightningNode extends EventEmitter {
 		return this.stagedMutations.splice(0, this.stagedMutations.length);
 	}
 
+	/**
+	 * Drop and report every mutation that cannot be encoded, returning the
+	 * rest. Such a mutation fails every commit it joins, so requeueing it the
+	 * way a storage failure is requeued would sink every later channel persist
+	 * until restart.
+	 */
+	private dropUnencodable(mutations: RecoveryMutation[]): RecoveryMutation[] {
+		return mutations.filter((mutation) => {
+			try {
+				assertMutationEncodable(mutation);
+				return true;
+			} catch (error) {
+				const reason = (error as Error).message;
+				this.emit('node:error', {
+					code: 'PERSISTENCE_ERROR',
+					message: `Dropped a staged ${mutation.type} mutation that cannot be encoded: ${reason}`,
+					timestamp: Date.now()
+				} as ILightningError);
+				return false;
+			}
+		});
+	}
+
 	/** Commit any mutations no channel transition picked up. */
 	private flushStagedMutations(): void {
-		const mutations = this.takeStagedMutations();
+		const mutations = this.dropUnencodable(this.takeStagedMutations());
 		if (mutations.length === 0 || !this.recovery) return;
 		const result = this.recovery.commit({
 			criticality: RecoveryCriticality.SafetyCritical,
