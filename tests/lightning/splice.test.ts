@@ -7936,6 +7936,108 @@ describe('Splice', function () {
 			).to.include(peerTx1);
 		});
 
+		it('rebuilds the splice-side commitment a row from before #1108 did not cache (#1138)', function () {
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				openerPubkey,
+				acceptorPubkey
+			} = pendingLockPair();
+			const oldFunding = openerChannel
+				.getFullState()
+				.fundingTxid!.toString('hex');
+			const spliceFunding = openerChannel
+				.getFullState()
+				.spliceInFlight!.spliceTxid.toString('hex');
+			const fundingOf = (tx: Buffer): string =>
+				Buffer.from(bitcoin.Transaction.fromBuffer(tx).ins[0].hash).toString(
+					'hex'
+				);
+			const backups = new Map<string, Buffer[]>();
+			openerManager.on(
+				'watchtower:backup',
+				(_id: Buffer, _peer: string, secret: Buffer, tx: Buffer) => {
+					const point = perCommitmentPointFromSecret(secret).toString('hex');
+					backups.set(point, [...(backups.get(point) ?? []), tx]);
+				}
+			);
+
+			// The splice negotiation signed #0 over the new funding too.
+			const point0 = openerChannel
+				.getFullState()
+				.remoteCurrentPerCommitmentPoint!.toString('hex');
+			const signed = openerChannel
+				.getFullState()
+				.watchtowerRemoteCommitmentTxs!.get(point0)!
+				.map((tx) => tx.toString('hex'))
+				.sort();
+			expect(
+				signed.map((tx) => fundingOf(Buffer.from(tx, 'hex'))).sort()
+			).to.deep.equal([oldFunding, spliceFunding].sort());
+
+			// The prior version kept one tx per point, the current funding's.
+			openerManager.handlePeerDisconnected(acceptorPubkey);
+			acceptorManager.handlePeerDisconnected(openerPubkey);
+			const row = JSON.parse(
+				JSON.stringify(serializeChannelState(openerChannel.getFullState()))
+			);
+			row.watchtowerRemoteCommitmentTxs =
+				row.watchtowerRemoteCommitmentTxs.filter(
+					(e: { tx: string }) =>
+						fundingOf(Buffer.from(e.tx, 'hex')) === oldFunding
+				);
+			const restarted = new Channel(deserializeChannelState(row));
+			expect(
+				restarted
+					.getFullState()
+					.watchtowerRemoteCommitmentTxs!.get(point0)!
+					.map(fundingOf)
+			).to.deep.equal([oldFunding]);
+			openerManager.restoreChannel(restarted, acceptorPubkey);
+			expect(
+				restarted
+					.getFullState()
+					.watchtowerRemoteCommitmentTxs!.get(point0)!
+					.map((tx) => tx.toString('hex'))
+					.sort()
+			).to.deep.equal(signed);
+
+			openerManager.removeAllListeners('message:outbound');
+			acceptorManager.removeAllListeners('message:outbound');
+			const fromOpener: Array<{ type: number; payload: Buffer }> = [];
+			const fromAcceptor: Array<{ type: number; payload: Buffer }> = [];
+			openerManager.on('message:outbound', (pk, type, payload) => {
+				if (pk === acceptorPubkey) fromOpener.push({ type, payload });
+			});
+			acceptorManager.on('message:outbound', (pk, type, payload) => {
+				if (pk === openerPubkey) fromAcceptor.push({ type, payload });
+			});
+			openerManager.handlePeerReconnected(acceptorPubkey);
+			acceptorManager.handlePeerReconnected(openerPubkey);
+			openerManager.removeAllListeners('message:outbound');
+			acceptorManager.removeAllListeners('message:outbound');
+			connectManagers(
+				openerManager,
+				openerPubkey,
+				acceptorManager,
+				acceptorPubkey
+			);
+			for (const m of fromOpener.splice(0)) {
+				acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
+			}
+			for (const m of fromAcceptor.splice(0)) {
+				openerManager.handleMessage(acceptorPubkey, m.type, m.payload);
+			}
+			expect(restarted.isSplicePendingLock()).to.equal(true);
+
+			expect(openerManager.updateChannelFee(channelId, 1000).ok).to.equal(true);
+			expect(
+				(backups.get(point0) ?? []).map((tx) => tx.toString('hex')).sort()
+			).to.deep.equal(signed);
+		});
+
 		it('spliced-state invariant holds at every HTLC lifecycle stage mid-splice', function () {
 			// The table-driven check the review asked for before lifting gates:
 			// at each observable stage of add and settle during pending-lock, the
