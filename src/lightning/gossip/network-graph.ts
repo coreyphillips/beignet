@@ -169,6 +169,13 @@ export class NetworkGraph {
 	// funding unproven, so the owner can check the funding output on chain
 	// and report back through markChannelFundingProven (issue #1105).
 	private readonly _onFundingUnproven?: (scidHex: string) => void;
+	// Fired with the scidHex of every channel whose deferred announcement
+	// resolves to failed, so the owner can persist the verdict. A restored
+	// row still marked deferred would block every other candidate until it
+	// is resolved again (issue #1131). Passing verdicts are not reported:
+	// they only save a re-verification, at the cost of a write per resolved
+	// channel.
+	private readonly _onChannelAnnouncementFailed?: (scidHex: string) => void;
 	// Non-null while a ceiling replacement is in flight: removeChannel
 	// deposits GC'd node hexes here instead of reporting them, and the
 	// admission flushes only the ones still absent once the incoming
@@ -184,6 +191,7 @@ export class NetworkGraph {
 			onChannelEvicted?: (scidHex: string) => void;
 			onNodeEvicted?: (nodeIdHex: string) => void;
 			onFundingUnproven?: (scidHex: string) => void;
+			onChannelAnnouncementFailed?: (scidHex: string) => void;
 		} = {}
 	) {
 		this._chainHash = chainHash;
@@ -191,6 +199,7 @@ export class NetworkGraph {
 		this._onChannelEvicted = opts.onChannelEvicted;
 		this._onNodeEvicted = opts.onNodeEvicted;
 		this._onFundingUnproven = opts.onFundingUnproven;
+		this._onChannelAnnouncementFailed = opts.onChannelAnnouncementFailed;
 	}
 
 	/**
@@ -215,6 +224,21 @@ export class NetworkGraph {
 			} catch {
 				// The channel simply stays unproven, hence evictable.
 			}
+		}
+	}
+
+	/** Settle a deferred channel announcement by checking its signatures. */
+	private _resolveDeferredAnnouncement(
+		scidHex: string,
+		channel: IGraphChannel
+	): void {
+		channel.announcementVerified = verifyChannelAnnouncementMessage(
+			channel.announcement
+		);
+		channel.announcementVerifyDeferred = undefined;
+		this._syncUnverifiedIndex(scidHex, channel);
+		if (channel.announcementVerified === false) {
+			this._onChannelAnnouncementFailed?.(scidHex);
 		}
 	}
 
@@ -622,11 +646,7 @@ export class NetworkGraph {
 			return undefined;
 		}
 		if (channel.announcementVerifyDeferred === true) {
-			channel.announcementVerified = verifyChannelAnnouncementMessage(
-				channel.announcement
-			);
-			channel.announcementVerifyDeferred = undefined;
-			this._syncUnverifiedIndex(scidHex, channel);
+			this._resolveDeferredAnnouncement(scidHex, channel);
 		}
 		return channel.announcementVerified === true
 			? channel.announcement
@@ -1094,11 +1114,7 @@ export class NetworkGraph {
 				// checks: 4 announcement, 2 updates, 2 node announcements).
 				const t0 = Date.now();
 				if (channel.announcementVerifyDeferred === true) {
-					channel.announcementVerified = verifyChannelAnnouncementMessage(
-						channel.announcement
-					);
-					channel.announcementVerifyDeferred = undefined;
-					this._syncUnverifiedIndex(scidHex, channel);
+					this._resolveDeferredAnnouncement(scidHex, channel);
 				}
 				// The updates and node announcements of a non-servable channel
 				// are never verified: its endpoint keys are unauthenticated.

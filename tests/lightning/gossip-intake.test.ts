@@ -1018,6 +1018,68 @@ describe('Gossip intake queue (LightningNode)', () => {
 		expect(ch.update1?.timestamp).to.equal(1000);
 	});
 
+	it('a failed announcement verdict survives a restart, so the genuine announcement still replaces it (issue #1131)', async () => {
+		// One forgery per resolution path: a consumer read and a gossip query.
+		const now = Math.floor(Date.now() / 1000);
+		const genuine = [
+			buildAnnouncement(503, REGTEST_CHAIN_HASH),
+			buildAnnouncement(504, REGTEST_CHAIN_HASH)
+		];
+		const forged = genuine.map((ann) =>
+			encodeChannelAnnouncementMessage({
+				...ann.msg,
+				nodeSignature1: crypto.randomBytes(64)
+			})
+		);
+		for (let i = 0; i < genuine.length; i++) {
+			feed(MessageType.CHANNEL_ANNOUNCEMENT, forged[i]);
+			// A row with no fresh update would be dropped at restore.
+			feed(
+				MessageType.CHANNEL_UPDATE,
+				buildUpdate(genuine[i], now - 60, 0, REGTEST_CHAIN_HASH).payload
+			);
+		}
+		await node.flushGossip();
+		const [viaRead, viaServe] = genuine.map((ann) => ann.msg.shortChannelId);
+		expect(graphOf(node).getVerifiedChannelAnnouncement(viaRead)).to.equal(
+			undefined
+		);
+		expect(
+			graphOf(node).getGossipMessagesForChannels([viaServe]).announcements
+		).to.have.length(0);
+
+		node.destroy();
+		storage = new SqliteStorage(dbPath);
+		storage.open();
+		node = new LightningNode(makeConfig());
+		for (const scid of [viaRead, viaServe]) {
+			expect(graphOf(node).getChannel(scid)!.announcementVerified).to.be.false;
+		}
+
+		let writes = 0;
+		const original = storage.saveGossipChannel.bind(storage);
+		storage.saveGossipChannel = (scidHex, channel): void => {
+			writes++;
+			original(scidHex, channel);
+		};
+		for (const payload of forged) {
+			feed(MessageType.CHANNEL_ANNOUNCEMENT, payload);
+		}
+		await node.flushGossip();
+		expect(writes).to.equal(0);
+
+		for (const ann of genuine) {
+			feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
+		}
+		await node.flushGossip();
+		expect(writes).to.equal(2);
+		for (const scid of [viaRead, viaServe]) {
+			expect(graphOf(node).getVerifiedChannelAnnouncement(scid)).to.not.equal(
+				undefined
+			);
+		}
+	});
+
 	it('our-channel updates keep eager verification in lazy mode', async () => {
 		const ann = buildAnnouncement(600, REGTEST_CHAIN_HASH);
 		feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);

@@ -1900,6 +1900,17 @@ export class LightningNode extends EventEmitter {
 				}
 				this.gossipFundingQueue.add(scidHex);
 				this.checkGossipFunding();
+			},
+			// The failed verdict is what lets a different announcement replace
+			// this one, so it has to outlive a restart (issue #1131).
+			onChannelAnnouncementFailed: (scidHex): void => {
+				const channel = this.graph.getChannel(Buffer.from(scidHex, 'hex'));
+				if (channel) {
+					this.safeStorage(
+						() => this.storage!.saveGossipChannel(scidHex, channel),
+						'saveGossipChannel'
+					);
+				}
 			}
 		});
 
