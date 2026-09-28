@@ -453,8 +453,10 @@ export interface IChannelState {
 	 * has not revoked yet, keyed by the per-commitment point (hex) each uses.
 	 * The revoke_and_ack that reveals a point's secret is when the tower
 	 * needs that exact tx, which may be after a restart, so this persists.
+	 * While a splice is pending a point is signed over both funding outputs,
+	 * so it holds one tx for each.
 	 */
-	watchtowerRemoteCommitmentTxs?: Map<string, Buffer>;
+	watchtowerRemoteCommitmentTxs?: Map<string, Buffer[]>;
 
 	/**
 	 * Watchtower: revoked peer commitments whose tower hand-off failed, each

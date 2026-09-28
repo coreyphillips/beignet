@@ -4378,18 +4378,38 @@ export class Channel {
 	 * are cached too: they feed the version-1 (schnorr) justice kit. Never
 	 * throws: a cache miss only forfeits a pre-emptive tower ship, it must not
 	 * break commitment signing.
+	 *
+	 * `spliced` is the pending splice's view: its tx joins the one cached for
+	 * the current funding under the same point.
 	 */
 	private _cacheRemoteCommitmentForWatchtower(
 		point: Buffer | null,
-		commitmentNumber: bigint
+		commitmentNumber: bigint,
+		spliced?: IChannelState
 	): void {
 		try {
-			if (!point || !this._state.remoteBasepoints || !this._state.fundingTxid) {
+			const view = spliced ?? this._state;
+			if (!point || !view.remoteBasepoints || !view.fundingTxid) {
 				return;
 			}
-			const built = buildRemoteCommitment(this._state, point, commitmentNumber);
-			const cache = (this._state.watchtowerRemoteCommitmentTxs ??= new Map());
-			cache.set(point.toString('hex'), built.result.tx.toBuffer());
+			const built = buildRemoteCommitment(view, point, commitmentNumber);
+			const cache = (this._state.watchtowerRemoteCommitmentTxs ??= new Map<
+				string,
+				Buffer[]
+			>());
+			const key = point.toString('hex');
+			// Anything else under the point is a signature since replaced, or a
+			// splice attempt that never locked, so only the current funding's tx
+			// survives a splice-side write.
+			const current = this._state.fundingTxid;
+			const kept =
+				spliced && current
+					? (cache.get(key) ?? []).filter(
+							(tx) =>
+								bitcoin.Transaction.fromBuffer(tx).ins[0]?.hash.equals(current)
+					  )
+					: [];
+			cache.set(key, [...kept, built.result.tx.toBuffer()]);
 			// Bound the cache: only unrevoked states matter and there are few.
 			while (cache.size > Channel.REVOKED_TX_CACHE_MAX) {
 				const oldest = cache.keys().next().value;
@@ -4428,18 +4448,17 @@ export class Channel {
 
 	/**
 	 * Given a per-commitment secret the peer just revealed, return (and forget)
-	 * the revoked remote commitment tx we cached for that state, or null if we
-	 * never cached it (an older row restored with a commitment in flight or an
-	 * update pending).
+	 * the revoked remote commitment txs we cached for that state, one per
+	 * funding output it was signed over. Empty if we never cached it (an older
+	 * row restored with a commitment in flight or an update pending).
 	 */
-	takeRevokedCommitmentTx(perCommitmentSecret: Buffer): Buffer | null {
+	takeRevokedCommitmentTxs(perCommitmentSecret: Buffer): Buffer[] {
 		const pointHex =
 			perCommitmentPointFromSecret(perCommitmentSecret).toString('hex');
 		const cache = this._state.watchtowerRemoteCommitmentTxs;
-		const tx = cache?.get(pointHex);
-		if (!cache || !tx) return null;
-		cache.delete(pointHex);
-		return tx;
+		const txs = cache?.get(pointHex) ?? [];
+		cache?.delete(pointHex);
+		return txs;
 	}
 
 	/**
@@ -4581,11 +4600,21 @@ export class Channel {
 
 		// Watchtower: cache the remote commitment tx we just committed the peer to,
 		// keyed by its per-commitment point, for pre-emptive justice on breach.
-		this._cacheRemoteCommitmentForWatchtower(
+		const signedPoint =
 			this._state.remoteNextPerCommitmentPoint ||
-				this._state.remoteCurrentPerCommitmentPoint,
+			this._state.remoteCurrentPerCommitmentPoint;
+		this._cacheRemoteCommitmentForWatchtower(
+			signedPoint,
 			this._state.remoteCommitmentNumber + 1n
 		);
+		const splicedView = spliceBatch ? this._splicedState() : null;
+		if (splicedView) {
+			this._cacheRemoteCommitmentForWatchtower(
+				signedPoint,
+				this._state.remoteCommitmentNumber + 1n,
+				splicedView
+			);
+		}
 
 		// A staged update_fee that is signable here (opener always; acceptor
 		// once the fee round reached it — see getRemoteCommitmentFeeRate) is
@@ -13574,6 +13603,11 @@ export class Channel {
 			this._signer,
 			this._state.remoteCurrentPerCommitmentPoint,
 			this._state.remoteCommitmentNumber
+		);
+		this._cacheRemoteCommitmentForWatchtower(
+			this._state.remoteCurrentPerCommitmentPoint,
+			this._state.remoteCommitmentNumber,
+			spliced
 		);
 		this._spliceSentCommitment = true;
 		// From this point the splice MUST survive a disconnect or restart (the
