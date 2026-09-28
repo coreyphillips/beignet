@@ -294,12 +294,13 @@ describe('Previous transaction checks on wallet inputs (#1010)', function () {
 		 * no nonWitnessUtxo and prices the fee from the reported value.
 		 */
 		const buildOffline = async (
-			reportedValue: number
+			reportedValue: number,
+			txHash = prevTx.getId()
 		): Promise<{ psbt: bitcoin.Psbt; fee: number }> => {
 			await fund({
 				wallet,
 				addressType: EAddressType.p2wpkh,
-				txHash: prevTx.getId(),
+				txHash,
 				reportedValue,
 				servedTx: prevTx
 			});
@@ -335,6 +336,21 @@ describe('Previous transaction checks on wallet inputs (#1010)', function () {
 		it("refuses when witnessUtxo was rewritten to match, against the wallet's UTXO", async () => {
 			const { psbt } = await buildOffline(REPORTED_VALUE);
 			// A signer that copies the previous output into witnessUtxo.
+			psbt.data.inputs[0].witnessUtxo = { script, value: REAL_VALUE };
+			psbt.updateInput(0, { nonWitnessUtxo: prevTx.toBuffer() });
+			const res = wallet.signPsbtWithOurKey(psbt.toBase64());
+			expect(res.isErr(), 'the signature is refused').to.equal(true);
+			if (res.isOk()) return;
+			expect(res.error.message).to.contain(
+				`holds ${REAL_VALUE} sats, not the ${REPORTED_VALUE} this wallet records`
+			);
+		});
+
+		it("finds the wallet's UTXO when the server reported its txid in uppercase", async () => {
+			const { psbt } = await buildOffline(
+				REPORTED_VALUE,
+				prevTx.getId().toUpperCase()
+			);
 			psbt.data.inputs[0].witnessUtxo = { script, value: REAL_VALUE };
 			psbt.updateInput(0, { nonWitnessUtxo: prevTx.toBuffer() });
 			const res = wallet.signPsbtWithOurKey(psbt.toBase64());

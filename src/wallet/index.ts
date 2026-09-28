@@ -5343,7 +5343,7 @@ export class Wallet {
 			records.push({ source: 'its witnessUtxo', ...witnessUtxo });
 		}
 		const utxo = this.data.utxos.find(
-			(u) => u.tx_hash === txid && u.tx_pos === index
+			(u) => u.tx_hash.toLowerCase() === txid && u.tx_pos === index
 		);
 		if (utxo) {
 			records.push({
