@@ -1966,10 +1966,24 @@ export function resolveSecondLevelHtlcOutput(
 		const feeSatoshis = BigInt(
 			Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_LOCAL))
 		);
-		const sweepValue = sweepOutputValue(amount, feeSatoshis, destinationScript);
-		// Nothing left after fees: there is no sweep to build.
-		if (sweepValue === null) return null;
 		const htlcTxid = htlcTx.getId();
+		const trackedOutput: ITrackedOutput = {
+			txid: htlcTxid,
+			outputIndex: 0,
+			amount,
+			outputType: OutputType.TO_LOCAL,
+			status: OutputStatus.CONFIRMED,
+			confirmationHeight,
+			witnessScript: sl.output,
+			// Tag so a later rebuild reconstructs the second-level tree (revocation
+			// internal + single delay leaf), not the commitment to_local tree.
+			isSecondLevelHtlc: true
+		};
+		const sweepValue = sweepOutputValue(amount, feeSatoshis, destinationScript);
+		if (sweepValue === null) {
+			// Still ours to track and watch; the monitor retries it as fees fall.
+			return { trackedOutput, declinedAsUneconomic: true };
+		}
 		const sweepTx = new bitcoin.Transaction();
 		sweepTx.version = 2;
 		sweepTx.addInput(Buffer.from(htlcTxid, 'hex').reverse(), 0, toSelfDelay);
@@ -1990,18 +2004,7 @@ export function resolveSecondLevelHtlcOutput(
 		);
 		const sig = signTaprootHtlcLeaf(sighash, delayedPrivkey);
 		return {
-			trackedOutput: {
-				txid: htlcTxid,
-				outputIndex: 0,
-				amount,
-				outputType: OutputType.TO_LOCAL,
-				status: OutputStatus.CONFIRMED,
-				confirmationHeight,
-				witnessScript: sl.output,
-				// Tag so a later rebuild reconstructs the second-level tree (revocation
-				// internal + single delay leaf), not the commitment to_local tree.
-				isSecondLevelHtlc: true
-			},
+			trackedOutput,
 			spendTx: sweepTx,
 			witness: [sig, sl.delay.script, sl.delay.controlBlock],
 			csvDelay: toSelfDelay
