@@ -784,6 +784,10 @@ export class GuardianReplicator {
 			detail: `namespace registered with ${accepted} guardians at origin sequence ${initialState.origin.firstSequence}`,
 			receipts: accepted
 		});
+		// A guardian whose binding INFO failed can still have registered, and
+		// the first snapshot is written before any replication pass reads its
+		// limit again.
+		await this.readMissingLimits();
 		return { outcome: 'registered', lease };
 	}
 

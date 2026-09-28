@@ -975,6 +975,93 @@ describe('Recovery phase 6: records over a guardian limit (issue #1014)', () => 
 		storage.close();
 	});
 
+	it('sizes the first snapshot for a guardian whose binding INFO failed but whose registration landed (issue #1136)', async function (): Promise<void> {
+		this.timeout(20_000);
+		const LIMIT = 80_000;
+		const served = await Promise.all([serve(0, LIMIT), serve(1), serve(2)]);
+		let infoCalls = 0;
+		const recovered: IBoundGuardianClient = {
+			expectedGuardianId: served[0].id,
+			client: new GuardianClient({
+				url: served[0].client.url,
+				guardianSetId: SET_ID,
+				transport: async (
+					url,
+					init
+				): Promise<{ status: number; body: Buffer }> => {
+					// Only the binding's INFO fails; the compatibility probe
+					// ahead of GET_HEAD and everything after it succeed.
+					if (url.endsWith('/info') && ++infoCalls === 1) {
+						throw new Error('connection refused');
+					}
+					return nodeGuardianTransport()(url, init);
+				}
+			})
+		};
+		const storage = openStorage();
+		for (let i = 0; i < 2_000; i++) {
+			storage.saveForwardingEvent({
+				settledAt: 1_700_000_000_000 + i,
+				inChannelId: Buffer.alloc(32, 1).toString('hex'),
+				outChannelId: Buffer.alloc(32, 2).toString('hex'),
+				amountInMsat: 1_001_000n,
+				amountOutMsat: 1_000_000n,
+				feeMsat: 1_000n
+			});
+		}
+		const events: IGuardianReplicationEvent[] = [];
+		const rep = replicator(
+			storage,
+			[recovered, ...bind(served.slice(1))],
+			events
+		);
+		const ceilingReports: string[] = [];
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId,
+			{
+				maxFrameCiphertextBytes: (): number => rep.maxRecordBytes(),
+				onFrameCeiling: (event): void => {
+					ceilingReports.push(event.outcome);
+				}
+			}
+		);
+		const manager = new RecoveryManager(storage, { journal });
+
+		const lease = await registered(rep);
+		expect(infoCalls).to.be.greaterThan(1);
+		expect(rep.maxRecordBytes()).to.equal(LIMIT);
+
+		expect(
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'payment_preimage',
+						paymentHash: Buffer.alloc(32, 1).toString('hex'),
+						preimage: Buffer.alloc(32, 1)
+					}
+				],
+				outboundMessages: []
+			}).committed
+		).to.equal(true);
+		// The bootstrap snapshot had to be trimmed to fit the recovered limit.
+		expect(ceilingReports).to.deep.equal(['trimmed']);
+		expect(storage.loadRecoveryFrames()[0].ciphertext.length).to.be.at.most(
+			LIMIT
+		);
+
+		const pass = await rep.replicatePending(lease);
+		expect(pass.outcome).to.equal('replicated');
+		expect(events.some((e) => e.type === 'record:too-large')).to.equal(false);
+		const head = await served[0].client.getHead(ROOT.recoveryId);
+		expect(head.state?.logHead.sequence).to.equal(1n);
+		await shutdown(served);
+		storage.close();
+	});
+
 	it('reads the limits before the first frame of a restart and on an idle pass', async function (): Promise<void> {
 		this.timeout(20_000);
 		const served = await Promise.all([serve(0, 100_000), serve(1), serve(2)]);
