@@ -29,6 +29,7 @@ import {
 	ChannelFundingUnavailableCode,
 	ChannelFundingUnavailableError,
 	InvalidPeerConnectError,
+	InvalidRequestError,
 	InvalidSpliceError
 } from '../../src/lightning/node/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -558,6 +559,25 @@ describe('Issue #471: the grab-bag codes stop swallowing caller refusals', () =>
 	});
 });
 
+describe('Issue #1134: payment metadata the guardians cannot hold', () => {
+	it('answers INVALID_PARAMS with the reason, not a scrubbed 500', () => {
+		const message =
+			'payment metadata is too large for the recovery guardians to accept';
+		const bn = nodeWithEngine({
+			setPaymentMetadata: (): never => {
+				throw new InvalidRequestError(message);
+			}
+		});
+		const err = refusalFrom(
+			() => bn.setPaymentMetadata('ab'.repeat(32), { note: 'x' }),
+			'setPaymentMetadata'
+		);
+		expect(err.code).to.equal(BeignetErrorCode.INVALID_PARAMS);
+		expect(err.message).to.equal(message);
+		expect(statusForErrorCode(err.code)).to.equal(400);
+	});
+});
+
 /**
  * Issue #474: the payment and invoice paths were left out of #472's sweep.
  *
@@ -801,6 +821,34 @@ describe('Issue #474: the payment and invoice paths guard before BigInt()', () =
 		expect(err.code).to.equal(BeignetErrorCode.NO_ROUTE);
 		// A payment that never started holds no capacity.
 		expect(pendingOf(bn)).to.equal(0);
+	});
+
+	it('payInvoice and sendPaymentAsync refuse oversized metadata as INVALID_PARAMS (issue #1134)', async () => {
+		const bn = payingNode({
+			setPaymentMetadata: (): never => {
+				throw new InvalidRequestError(
+					'payment metadata is too large for the recovery guardians to accept'
+				);
+			},
+			sendPayment: (): never => expect.fail('the engine was reached')
+		});
+		const metadata = { note: 'x' };
+		for (const [name, pay] of [
+			[
+				'payInvoice',
+				(): Promise<unknown> =>
+					bn.payInvoice(BOLT11, 60_000, undefined, undefined, metadata)
+			],
+			[
+				'sendPaymentAsync',
+				async (): Promise<unknown> =>
+					bn.sendPaymentAsync(BOLT11, undefined, undefined, metadata)
+			]
+		] as Array<[string, () => Promise<unknown>]>) {
+			const err = await asyncRefusalFrom(pay, name);
+			expect(err.code, name).to.equal(BeignetErrorCode.INVALID_PARAMS);
+			expect(pendingOf(bn), name).to.equal(0);
+		}
 	});
 
 	it('sendKeysend releases the reservation when the send throws', async () => {

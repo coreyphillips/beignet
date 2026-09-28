@@ -368,6 +368,7 @@ import {
 	RecoveryJournal,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
+	encodedMutationBytes,
 	journalSupported,
 	loadWriterLease,
 	composeRecoveryCapsule,
@@ -16831,6 +16832,13 @@ export class LightningNode extends EventEmitter {
 				'amountMsat must be positive'
 			);
 		}
+		const paymentMetadata = { _keysend: 'true', ...(metadata || {}) };
+		if (!this.paymentMetadataFits(paymentMetadata)) {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVALID_KEYSEND,
+				'metadata is too large for the recovery guardians to accept'
+			);
+		}
 
 		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
 		const hashHex = paymentHash.toString('hex');
@@ -16874,22 +16882,6 @@ export class LightningNode extends EventEmitter {
 				LightningErrorCode.FEE_EXCEEDS_MAX,
 				'Route fee exceeds maximum'
 			);
-		}
-
-		// A keysend has no invoice to re-pay, so record what a retry needs to
-		// replay it: the same preimage, and therefore the same payment hash.
-		// Registered only after the route and fee checks pass, mirroring
-		// sendPayment: a dispatch that throws above must not leave a context
-		// behind for a payment that never existed.
-		if (!this.paymentRetryContexts.has(hashHex)) {
-			this.paymentRetryContexts.set(hashHex, {
-				keysend: { options, preimage },
-				excludedChannels: excludedChannels ?? new Set(),
-				retryCount: 0,
-				maxRetries: this.maxPaymentRetries,
-				maxFeeMsat,
-				policyOverrides
-			});
 		}
 
 		const hops = route.hops;
@@ -16961,26 +16953,40 @@ export class LightningNode extends EventEmitter {
 			route: route as IPaymentInfo['route'],
 			sharedSecrets,
 			createdAt: Date.now(),
-			metadata: { _keysend: 'true', ...(metadata || {}) }
+			metadata: paymentMetadata
 		};
-		this.payments.set(hashHex, payment);
-
-		// Track offered HTLC → payment mapping
 		const htlcId = outChannel.getFullState().localHtlcCounter;
 		const htlcKey = `${channelId.toString('hex')}:offered-${htlcId}`;
-		this.htlcPaymentMap.set(htlcKey, hashHex);
-		{
-			const mutations: RecoveryMutation[] = [
-				{ type: 'htlc_payment_mapping', htlcKey, paymentHash: hashHex }
-			];
-			const paymentMutation = this.paymentMutation(paymentHash);
-			if (paymentMutation) mutations.unshift(paymentMutation);
-			this.commitMutations(
-				'persist payment + HTLC mapping',
-				mutations,
-				RecoveryCriticality.SafetyCritical
+		const mutations: RecoveryMutation[] = [
+			{ type: 'payment_state', paymentHash: hashHex, payment },
+			{ type: 'htlc_payment_mapping', htlcKey, paymentHash: hashHex }
+		];
+		if (!this.paymentMetadataFits(paymentMetadata, mutations)) {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVALID_KEYSEND,
+				'metadata is too large for the recovery guardians to accept'
 			);
 		}
+
+		// A keysend has no invoice to re-pay, so record what a retry needs to
+		// replay it: the same preimage, and therefore the same payment hash.
+		if (!this.paymentRetryContexts.has(hashHex)) {
+			this.paymentRetryContexts.set(hashHex, {
+				keysend: { options, preimage },
+				excludedChannels: excludedChannels ?? new Set(),
+				retryCount: 0,
+				maxRetries: this.maxPaymentRetries,
+				maxFeeMsat,
+				policyOverrides
+			});
+		}
+		this.payments.set(hashHex, payment);
+		this.htlcPaymentMap.set(htlcKey, hashHex);
+		this.commitMutations(
+			'persist payment + HTLC mapping',
+			mutations,
+			RecoveryCriticality.SafetyCritical
+		);
 
 		const result = this.channelManager.addHtlc(
 			channelId,
@@ -24093,7 +24099,9 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Set or update metadata on a payment (for agent labeling).
+	 * Set or update metadata on a payment (for agent labeling). Refused with
+	 * an InvalidRequestError, the payment untouched, when the labelled row
+	 * would be too large for the recovery guardians to accept.
 	 */
 	setPaymentMetadata(
 		paymentHash: Buffer,
@@ -24102,11 +24110,50 @@ export class LightningNode extends EventEmitter {
 		const hashHex = paymentHash.toString('hex');
 		const existing = this.payments.get(hashHex);
 		if (existing) {
-			existing.metadata = { ...existing.metadata, ...metadata };
+			const merged = { ...existing.metadata, ...metadata };
+			const labelled: RecoveryMutation = {
+				type: 'payment_state',
+				paymentHash: hashHex,
+				payment: { ...existing, metadata: merged }
+			};
+			if (!this.paymentMetadataFits(merged, [labelled])) {
+				throw new InvalidRequestError(
+					'payment metadata is too large for the recovery guardians to accept'
+				);
+			}
+			existing.metadata = merged;
 			this.commitMutations('savePaymentMetadata', [
 				{ type: 'payment_state', paymentHash: hashHex, payment: existing }
 			]);
 		}
+	}
+
+	/**
+	 * A guardian refuses a record over its limit, and every record after it,
+	 * so one payment row that outgrows a frame stops replication for good.
+	 * Metadata is the part of a row the caller sizes, and it may take half a
+	 * frame: the rest is left for what the payment carries and gains after
+	 * it is labelled (route, shared secrets, preimage, a retry's invoice).
+	 * Given the mutations that store it, their complete batch has to fit a
+	 * frame as well.
+	 */
+	private paymentMetadataFits(
+		metadata: Record<string, string>,
+		mutations?: RecoveryMutation[]
+	): boolean {
+		const room = this.recoveryJournal?.mutationRoom();
+		if (room === undefined) return true;
+		if (Buffer.byteLength(JSON.stringify(metadata), 'utf8') > room / 2) {
+			return false;
+		}
+		if (mutations === undefined) return true;
+		return (
+			mutations.reduce(
+				(bytes, mutation, index) =>
+					bytes + encodedMutationBytes(mutation) + (index === 0 ? 0 : 1),
+				0
+			) <= room
+		);
 	}
 
 	/**
