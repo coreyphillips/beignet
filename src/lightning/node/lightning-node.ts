@@ -3635,14 +3635,15 @@ export class LightningNode extends EventEmitter {
 		}
 		// Whatever the caller staged for this transition (preimage before a
 		// fulfill, linkage before a forward) commits with it or not at all.
-		const staged = this.takeStagedMutations();
-		const encodable = this.dropUnencodable(staged);
+		const { encodable, dropped } = this.dropUnencodable(
+			this.takeStagedMutations()
+		);
 		mutations.push(...encodable);
 
 		// A dropped mutation can never commit, so the transition that carried
 		// it fails as a whole: its sends are the action that depended on it.
 		const result: IRecoveryCommitResult =
-			encodable.length < staged.length
+			dropped.length > 0
 				? {
 						committed: false,
 						released: [],
@@ -3693,6 +3694,7 @@ export class LightningNode extends EventEmitter {
 			) {
 				this._failedTerminalPersists.add(channelIdHex);
 			}
+			for (const error of dropped) this.emit('node:error', error);
 			this.emit('node:error', {
 				code: 'PERSISTENCE_ERROR',
 				channelId,
@@ -3805,45 +3807,56 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Drop and report every mutation that cannot be encoded, returning the
-	 * rest. Such a mutation fails every commit it joins, so requeueing it the
-	 * way a storage failure is requeued would sink every later channel persist
-	 * until restart.
+	 * Split off every mutation that cannot be encoded. Such a mutation fails
+	 * every commit it joins, so requeueing it the way a storage failure is
+	 * requeued would sink every later channel persist until restart.
+	 *
+	 * The caller emits the returned errors only once the encodable rest is
+	 * committed or back on the stage, so a throwing listener cannot lose them.
 	 */
-	private dropUnencodable(mutations: RecoveryMutation[]): RecoveryMutation[] {
-		return mutations.filter((mutation) => {
+	private dropUnencodable(mutations: RecoveryMutation[]): {
+		encodable: RecoveryMutation[];
+		dropped: ILightningError[];
+	} {
+		const encodable: RecoveryMutation[] = [];
+		const dropped: ILightningError[] = [];
+		for (const mutation of mutations) {
 			try {
 				assertMutationEncodable(mutation);
-				return true;
+				encodable.push(mutation);
 			} catch (error) {
 				const reason = (error as Error).message;
-				this.emit('node:error', {
+				dropped.push({
 					code: 'PERSISTENCE_ERROR',
 					message: `Dropped a staged ${mutation.type} mutation that cannot be encoded: ${reason}`,
 					timestamp: Date.now()
 				} as ILightningError);
-				return false;
 			}
-		});
+		}
+		return { encodable, dropped };
 	}
 
 	/** Commit any mutations no channel transition picked up. */
 	private flushStagedMutations(): void {
-		const mutations = this.dropUnencodable(this.takeStagedMutations());
-		if (mutations.length === 0 || !this.recovery) return;
-		const result = this.recovery.commit({
-			criticality: RecoveryCriticality.SafetyCritical,
-			mutations,
-			outboundMessages: []
-		});
-		if (!result.committed) {
-			// Keep them staged so the next transition (or the next flush)
-			// retries, rather than silently dropping writes the caller believes
-			// it made. The failure itself is surfaced by the manager's onError
-			// hook; what must not happen is a preimage for value already paid
-			// downstream evaporating because one standalone commit failed.
-			this.stagedMutations.unshift(...mutations);
+		const { encodable: mutations, dropped } = this.dropUnencodable(
+			this.takeStagedMutations()
+		);
+		if (mutations.length > 0 && this.recovery) {
+			const result = this.recovery.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations,
+				outboundMessages: []
+			});
+			if (!result.committed) {
+				// Keep them staged so the next transition (or the next flush)
+				// retries, rather than silently dropping writes the caller believes
+				// it made. The failure itself is surfaced by the manager's onError
+				// hook; what must not happen is a preimage for value already paid
+				// downstream evaporating because one standalone commit failed.
+				this.stagedMutations.unshift(...mutations);
+			}
 		}
+		for (const error of dropped) this.emit('node:error', error);
 	}
 
 	/**

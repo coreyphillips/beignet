@@ -1511,7 +1511,12 @@ describe('Recovery phase 1: failure recovery paths', () => {
 			}
 		);
 
-		internals.flushStagedMutations();
+		// The report goes out after the rest is committed, so a listener that
+		// throws cannot take the preimage with it.
+		node.on('node:error', () => {
+			throw new Error('listener failed');
+		});
+		expect(() => internals.flushStagedMutations()).to.throw('listener failed');
 
 		expect(internals.stagedMutations).to.have.length(0);
 		expect(storage.loadPreimage(goodHash)).to.not.equal(null);
