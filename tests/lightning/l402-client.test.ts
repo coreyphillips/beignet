@@ -1087,6 +1087,157 @@ describe('l402Fetch payment safety', () => {
 		);
 	});
 
+	describe('a credential a redirect kept from the responder', () => {
+		const servers: http.Server[] = [];
+		const seen: Array<[string, boolean]> = [];
+
+		/** Serve `handler` on its own origin, recording each request. */
+		async function serve(
+			name: string,
+			handler: (req: http.IncomingMessage, res: http.ServerResponse) => void
+		): Promise<string> {
+			const server = http.createServer((req, res) => {
+				seen.push([`${name}${req.url}`, Boolean(req.headers.authorization)]);
+				handler(req, res);
+			});
+			servers.push(server);
+			await new Promise<void>((resolve) =>
+				server.listen(0, '127.0.0.1', resolve)
+			);
+			return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+		}
+
+		function hold(
+			store: MemoryL402CredentialStore,
+			scope: string,
+			pair: ReturnType<typeof makeChallengePair>
+		): void {
+			store.set({
+				scope,
+				macaroon: pair.macaroon,
+				preimage: pair.preimage.toString('hex'),
+				paymentHash: pair.paymentHash.toString('hex'),
+				amountSats: 1,
+				createdAt: Date.now(),
+				scheme: 'L402'
+			});
+		}
+
+		/** 200 for the held credential, the replacement's challenge otherwise. */
+		function gate(
+			held: ReturnType<typeof makeChallengePair>,
+			replacement: ReturnType<typeof makeChallengePair>,
+			req: http.IncomingMessage,
+			res: http.ServerResponse
+		): void {
+			const parsed = parseL402AuthorizationHeader(
+				req.headers.authorization ?? ''
+			);
+			if (parsed?.preimage === held.preimage.toString('hex')) {
+				res.end('paid content');
+				return;
+			}
+			res.writeHead(402, {
+				'WWW-Authenticate': `L402 macaroon="${replacement.macaroon}", invoice="${replacement.invoice}"`
+			});
+			res.end('payment required');
+		}
+
+		beforeEach(() => {
+			seen.length = 0;
+		});
+
+		afterEach(() => {
+			for (const server of servers.splice(0)) {
+				server.closeAllConnections();
+				server.close();
+			}
+		});
+
+		it('keeps it when the redirect ends at another origin', async () => {
+			const held = makeChallengePair(1_000n);
+			const replacement = makeChallengePair(1_000n);
+			const bOrigin = await serve('b', (req, res) =>
+				gate(held, replacement, req, res)
+			);
+			const aOrigin = await serve('a', (_req, res) => {
+				res.writeHead(302, { Location: `${bOrigin}/pay` });
+				res.end();
+			});
+
+			// Once with fetch following redirects itself, once hop by hop.
+			for (const checkRedirect of [undefined, (): void => {}]) {
+				seen.length = 0;
+				const payer = recordingPayer(replacement.preimage);
+				const store = new MemoryL402CredentialStore();
+				hold(store, aOrigin, held);
+
+				let error: unknown;
+				try {
+					await l402Fetch(
+						`${aOrigin}/start`,
+						{},
+						{ payer, maxPriceSats: 10, credentials: store, checkRedirect }
+					);
+				} catch (err) {
+					error = err;
+				}
+				expect((error as L402Error).code).to.equal('CROSS_ORIGIN_CHALLENGE');
+				expect(seen).to.deep.equal([
+					['a/start', true],
+					['b/pay', false]
+				]);
+				expect(payer.payments).to.equal(0);
+				expect(store.get(aOrigin)?.preimage).to.equal(
+					held.preimage.toString('hex')
+				);
+			}
+		});
+
+		it('keeps it when the redirect passes through another origin and back', async () => {
+			const held = makeChallengePair(1_000n);
+			const replacement = makeChallengePair(1_000n);
+			let cOrigin = '';
+			const bOrigin = await serve('b', (req, res) => {
+				if (req.url === '/start') {
+					res.writeHead(302, { Location: `${cOrigin}/hop` });
+					res.end();
+					return;
+				}
+				gate(held, replacement, req, res);
+			});
+			cOrigin = await serve('c', (_req, res) => {
+				res.writeHead(302, { Location: `${bOrigin}/pay` });
+				res.end();
+			});
+			const payer = recordingPayer(replacement.preimage);
+			const store = new MemoryL402CredentialStore();
+			hold(store, bOrigin, held);
+
+			const result = await l402Fetch(
+				`${bOrigin}/start`,
+				{},
+				{
+					payer,
+					maxPriceSats: 10,
+					credentials: store,
+					checkRedirect: () => {}
+				}
+			);
+			expect(seen.slice(0, 3)).to.deep.equal([
+				['b/start', true],
+				['c/hop', false],
+				['b/pay', false]
+			]);
+			expect(result.response.status).to.equal(402);
+			expect(result.paid).to.equal(false);
+			expect(payer.payments).to.equal(0);
+			expect(store.get(bOrigin)?.preimage).to.equal(
+				held.preimage.toString('hex')
+			);
+		});
+	});
+
 	it('rejects a preimage that does not open the invoice hash', async () => {
 		const pair = makeChallengePair(1_000n);
 		const payer = recordingPayer(crypto.randomBytes(32)); // wrong preimage
