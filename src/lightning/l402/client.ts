@@ -562,7 +562,14 @@ async function fetchCheckingRedirects(
 		const location = REDIRECT_STATUSES.has(response.status)
 			? response.headers.get('location')
 			: null;
-		if (location === null) return response;
+		if (location === null) {
+			// The caller tells which origin answered from the final URL, so a
+			// fetch that reports none would hide the hops followed here.
+			if (!response.url) {
+				Object.defineProperty(response, 'url', { value: current });
+			}
+			return response;
+		}
 		discardBody(response);
 		if (hops >= MAX_REDIRECTS) {
 			throw new Error(`l402Fetch: more than ${MAX_REDIRECTS} redirects`);

@@ -1063,7 +1063,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								allowCrossOriginChallenge: {
 									type: 'boolean',
 									description:
-										'Unsafe: pay a challenge served from a different origin than requested, after a redirect'
+										'Unsafe: pay a challenge served from a different origin than requested, after a redirect. Only GET and HEAD requests qualify'
 								},
 								allowPrivateNetwork: {
 									type: 'boolean',

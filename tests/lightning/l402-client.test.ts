@@ -1606,6 +1606,65 @@ describe('l402Fetch checkRedirect', () => {
 		);
 	});
 
+	it('sees a cross-origin challenge from a fetch that reports no final URL', async () => {
+		const pair = makeChallengePair(1_000n);
+		const challenge = `L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`;
+		const requests: Array<[string, boolean]> = [];
+		// A redirects to B, which challenges. No response carries a url.
+		const fetchImpl: FetchLike = async (url, init) => {
+			const authorized = Boolean(init?.headers?.Authorization);
+			requests.push([url, authorized]);
+			const atA = url === 'https://a.example/x';
+			const status = atA ? 302 : authorized ? 200 : 402;
+			return {
+				status,
+				headers: {
+					get: (name: string): string | null => {
+						const lower = name.toLowerCase();
+						if (atA && lower === 'location') return 'https://b.example/pay';
+						if (status === 402 && lower === 'www-authenticate') {
+							return challenge;
+						}
+						return null;
+					}
+				},
+				text: async (): Promise<string> => ''
+			};
+		};
+		let payments = 0;
+		const options = {
+			maxPriceSats: 10,
+			fetchImpl,
+			checkRedirect: refusePrivate,
+			payer: {
+				payInvoice: async (): Promise<{ preimage: Buffer }> => {
+					payments++;
+					return { preimage: pair.preimage };
+				}
+			}
+		};
+
+		const error = await rejection(
+			l402Fetch('https://a.example/x', {}, options)
+		);
+		expect((error as L402Error).code).to.equal('CROSS_ORIGIN_CHALLENGE');
+		expect(payments).to.equal(0);
+
+		requests.length = 0;
+		const result = await l402Fetch(
+			'https://a.example/x',
+			{},
+			{ ...options, allowCrossOriginChallenge: true }
+		);
+		expect(result.paid).to.equal(true);
+		expect(result.response.status).to.equal(200);
+		expect(requests).to.deep.equal([
+			['https://a.example/x', false],
+			['https://b.example/pay', false],
+			['https://b.example/pay', true]
+		]);
+	});
+
 	it('gives up after 20 redirects', async () => {
 		const { fetchImpl, requests } = redirectServer({
 			'https://loop.example/a': [302, '/a']

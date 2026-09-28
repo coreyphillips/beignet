@@ -664,7 +664,8 @@ What the client guarantees before any payment leaves:
   A macaroon that cannot be sent back in a header (one carrying whitespace, which
   base64 decoding would happily ignore) is refused before paying, not after.
 - The challenge came from the origin you asked for. A redirect to another origin
-  is not paid unless you pass `allowCrossOriginChallenge: true`.
+  is not paid unless you pass `allowCrossOriginChallenge: true`, and even then
+  only for a GET or HEAD request.
 - Both halves of the challenge come from the SAME entry in the
   `WWW-Authenticate` header, so a reflected or multi-scheme header cannot pair a
   macaroon with someone else's invoice.
