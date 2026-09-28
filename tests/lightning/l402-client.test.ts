@@ -874,6 +874,86 @@ describe('l402Fetch payment safety', () => {
 		expect(payer.payments).to.equal(1);
 	});
 
+	it('sends a cross-origin credential to its issuer, never the redirector', async () => {
+		const pair = makeChallengePair(1_000n);
+		const seen: Array<{ at: 'a' | 'b'; authorization?: string }> = [];
+		const b = http.createServer((req, res) => {
+			seen.push({ at: 'b', authorization: req.headers.authorization });
+			const parsed = parseL402AuthorizationHeader(
+				req.headers.authorization ?? ''
+			);
+			if (parsed?.preimage === pair.preimage.toString('hex')) {
+				res.end('paid content');
+				return;
+			}
+			res.writeHead(402, {
+				'WWW-Authenticate': `L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`
+			});
+			res.end('payment required');
+		});
+		const a = http.createServer((req, res) => {
+			seen.push({ at: 'a', authorization: req.headers.authorization });
+			res.writeHead(302, { Location: `${bOrigin}/pay` });
+			res.end();
+		});
+		const listen = async (server: http.Server): Promise<string> => {
+			await new Promise<void>((resolve) =>
+				server.listen(0, '127.0.0.1', resolve)
+			);
+			return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+		};
+		const bOrigin = await listen(b);
+		const aOrigin = await listen(a);
+
+		try {
+			// Once with fetch following redirects itself, once hop by hop.
+			for (const checkRedirect of [undefined, (): void => {}]) {
+				seen.length = 0;
+				const payer = recordingPayer(pair.preimage);
+				const store = new MemoryL402CredentialStore();
+				const options = {
+					payer,
+					maxPriceSats: 10,
+					credentials: store,
+					allowCrossOriginChallenge: true,
+					checkRedirect
+				};
+
+				const paid = await l402Fetch(`${aOrigin}/start`, {}, options);
+				expect(seen.map((r) => [r.at, Boolean(r.authorization)])).to.deep.equal(
+					[
+						['a', false],
+						['b', false],
+						['b', true]
+					]
+				);
+				expect(paid.paid).to.equal(true);
+				expect(await paid.response.text()).to.equal('paid content');
+				expect(store.get(bOrigin)).to.not.equal(undefined);
+				expect(store.get(aOrigin)).to.equal(undefined);
+
+				// A later call finds the credential under B and reuses it there.
+				seen.length = 0;
+				const reused = await l402Fetch(`${aOrigin}/start`, {}, options);
+				expect(reused.paid).to.equal(false);
+				expect(await reused.response.text()).to.equal('paid content');
+				expect(payer.payments).to.equal(1);
+				expect(seen.map((r) => [r.at, Boolean(r.authorization)])).to.deep.equal(
+					[
+						['a', false],
+						['b', false],
+						['b', true]
+					]
+				);
+			}
+		} finally {
+			for (const server of [a, b]) {
+				server.closeAllConnections();
+				server.close();
+			}
+		}
+	});
+
 	it('rejects a preimage that does not open the invoice hash', async () => {
 		const pair = makeChallengePair(1_000n);
 		const payer = recordingPayer(crypto.randomBytes(32)); // wrong preimage
