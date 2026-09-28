@@ -411,6 +411,9 @@ export class GuardianRotation {
 			onEvent: this.config.onReplicationEvent,
 			allowUnencryptedSecrets: this.config.allowUnencryptedSecrets
 		});
+		// The journal sizes its next snapshot from this replicator before its
+		// first pass has read any INFO.
+		replicator.adoptRecordLimits(incoming);
 		return {
 			generation,
 			replicator,

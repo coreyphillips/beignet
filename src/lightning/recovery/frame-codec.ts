@@ -57,6 +57,8 @@ interface IEncodedSnapshot {
 	 *  first so its bytes sit at a stable position; conditional so frames
 	 *  captured before the field existed re-encode byte-identically. */
 	schemaVersion?: string;
+	/** Conditional for the same reason: only a paged snapshot carries it. */
+	pageFrames?: number;
 	channels: Array<{
 		channelId: string;
 		state: ISerializedChannelState;
@@ -385,6 +387,9 @@ function encodeSnapshot(snapshot: RecoverySnapshot): IEncodedSnapshot {
 		...(snapshot.schemaVersion !== undefined
 			? { schemaVersion: snapshot.schemaVersion }
 			: {}),
+		...(snapshot.pageFrames !== undefined
+			? { pageFrames: snapshot.pageFrames }
+			: {}),
 		channels: snapshot.channels.map((c) => ({
 			channelId: c.channelId,
 			state: serializeChannelState(c.state),
@@ -446,9 +451,21 @@ function decodeSnapshot(encoded: IEncodedSnapshot): RecoverySnapshot {
 			'Recovery snapshot schemaVersion, when present, must be a nonempty string'
 		);
 	}
+	// Restore trusts this count to say whether the snapshot is whole.
+	if (
+		'pageFrames' in encoded &&
+		(!Number.isSafeInteger(encoded.pageFrames) || encoded.pageFrames! < 1)
+	) {
+		throw new Error(
+			'Recovery snapshot pageFrames, when present, must be a positive integer'
+		);
+	}
 	return {
 		...(encoded.schemaVersion !== undefined
 			? { schemaVersion: encoded.schemaVersion }
+			: {}),
+		...(encoded.pageFrames !== undefined
+			? { pageFrames: encoded.pageFrames }
 			: {}),
 		channels: encoded.channels.map((c) => ({
 			channelId: c.channelId,
@@ -504,6 +521,15 @@ function decodeSnapshot(encoded: IEncodedSnapshot): RecoverySnapshot {
  */
 export function assertMutationEncodable(mutation: RecoveryMutation): void {
 	JSON.stringify(encodeMutation(mutation));
+}
+
+/**
+ * The bytes a mutation adds to an encoded frame's mutations array, less the
+ * separating comma: JSON.stringify writes a nested value exactly as it would
+ * write it alone.
+ */
+export function encodedMutationBytes(mutation: RecoveryMutation): number {
+	return Buffer.byteLength(JSON.stringify(encodeMutation(mutation)), 'utf8');
 }
 
 /** Encode a frame to the plaintext bytes the frame hash commits to. */

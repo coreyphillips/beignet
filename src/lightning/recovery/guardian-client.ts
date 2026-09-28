@@ -729,11 +729,13 @@ export function assertDistinctGuardianMembers(
  * answer INFO cannot answer anything else either, so it contributes
  * nothing to any quorum regardless. The returned set names the identities
  * that were positively verified, so unsigned negative answers can be
- * counted only for guardians that proved who they are.
+ * counted only for guardians that proved who they are. `onVerified` sees
+ * each verified guardian's INFO, for callers that need its advertised limits.
  */
 export async function verifyGuardianBindings(
 	bound: IBoundGuardianClient[],
-	context: IGuardianSetContext
+	context: IGuardianSetContext,
+	onVerified?: (key: string, info: IGuardianInfoResponse) => void
 ): Promise<Set<string>> {
 	assertDistinctGuardianMembers(bound, context);
 	const verified = new Set<string>();
@@ -764,6 +766,7 @@ export async function verifyGuardianBindings(
 			);
 		}
 		verified.add(key);
+		onVerified?.(key, info);
 	}
 	return verified;
 }

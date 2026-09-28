@@ -37,7 +37,13 @@ import {
 	isStorageTransactionActive,
 	withStorageTransaction
 } from '../storage/transaction';
-import { decodeFrame, encodeFrame, hashFrame } from './frame-codec';
+import {
+	decodeFrame,
+	encodeFrame,
+	encodedMutationBytes,
+	hashFrame
+} from './frame-codec';
+import { PaymentDirection, PaymentStatus } from '../node/types';
 import { RecoveryManager } from './recovery-manager';
 import {
 	IRecoveryJournalSink,
@@ -52,6 +58,8 @@ import {
 
 const IV_LENGTH = 12;
 const TAG_LENGTH = 16;
+/** A stored frame's ciphertext is its plaintext plus the IV and tag. */
+const FRAME_CIPHERTEXT_OVERHEAD = IV_LENGTH + TAG_LENGTH;
 /** 32 zero bytes: previousFrameHash of the first frame in a chain. */
 const GENESIS_HASH = Buffer.alloc(32);
 
@@ -90,6 +98,13 @@ const META_LAST_SNAPSHOT_WRITTEN = 'journal_last_snapshot_written';
  */
 const META_SNAPSHOT_SCHEMA = 'journal_snapshot_schema';
 export const SNAPSHOT_SCHEMA_VERSION = '2';
+/**
+ * Declared instead by a snapshot whose rows spilled into page frames (see
+ * pageSnapshotRows). Its content is schema 2, but a release that predates
+ * pageFrames would restore it without the pages a guardian never received,
+ * so those releases must read it as a schema they cannot restore.
+ */
+const PAGED_SNAPSHOT_SCHEMA_VERSION = '2+pages';
 /**
  * The EXACT marker strings this release knows how to migrate from. An
  * absent or empty marker (a journal written before versioning existed)
@@ -243,6 +258,35 @@ export const JOURNAL_META_KEYS = {
 	generation: 'guardian_generation_v1'
 } as const;
 
+/**
+ * Keep the longest tail of `rows` (oldest first, so the newest) under which
+ * the frame fits, applying each trial through `apply`; returns how many were
+ * kept. Rows encode to similar sizes, so the average predicts the count and
+ * each correction drops at least one more.
+ */
+function keepNewestThatFit<T>(
+	rows: T[],
+	apply: (kept: T[]) => void,
+	size: () => number,
+	ceiling: number
+): number {
+	const full = size();
+	if (full <= ceiling) return rows.length;
+	apply([]);
+	const bare = size();
+	if (bare >= ceiling) return 0;
+	const perRow = (full - bare) / rows.length;
+	let kept = Math.min(rows.length - 1, Math.floor((ceiling - bare) / perRow));
+	while (kept > 0) {
+		apply(rows.slice(rows.length - kept));
+		const over = size() - ceiling;
+		if (over <= 0) return kept;
+		kept -= Math.max(1, Math.ceil(over / perRow));
+	}
+	apply([]);
+	return 0;
+}
+
 /** Deltas between full-state snapshot frames. */
 const DEFAULT_SNAPSHOT_INTERVAL_FRAMES = 256;
 /** Delta plaintext bytes between snapshots (spec 5.3: N frames OR M bytes). */
@@ -323,6 +367,24 @@ export interface IRecoveryJournalOptions {
 	 * are large (a busy channel's full state per frame).
 	 */
 	snapshotIntervalBytes?: number;
+	/**
+	 * The largest record ciphertext every replica accepts (the smallest
+	 * `maxCiphertextBytes` the guardian set advertises). A guardian refuses a
+	 * bigger record and, accepting only `logHead.sequence + 1`, every record
+	 * after it, for good. Snapshots are held under it by dropping their oldest
+	 * history (see fitSnapshotUnderCeiling). Omit for a journal with no
+	 * replicas.
+	 */
+	maxFrameCiphertextBytes?: () => number;
+	/**
+	 * The ceiling above cost a snapshot some of its history (`trimmed`), or
+	 * a frame is over it with nothing left to drop (`oversized`: the
+	 * guardians will refuse it).
+	 */
+	onFrameCeiling?: (event: {
+		outcome: 'trimmed' | 'oversized';
+		detail: string;
+	}) => void;
 }
 
 /**
@@ -628,8 +690,18 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	/** null means no ceiling: the prune is never forced. */
 	private readonly maxRetainedFrameGap: number | null;
 	private readonly onCompactionForced: ((detail: string) => void) | undefined;
+	private readonly maxFrameCiphertextBytes: (() => number) | undefined;
+	private readonly onFrameCeiling: IRecoveryJournalOptions['onFrameCeiling'];
 	/** Set once this run's first append has re-based the chain (see appendFrame). */
 	private rebasedThisRun = false;
+	/**
+	 * The last frame of the newest snapshot this run wrote, its last page
+	 * when paged. The frame interval counts from here: counting from the
+	 * snapshot itself, a snapshot with an interval's worth of pages would
+	 * be rewritten on every append. Every run writes a snapshot before its
+	 * first interval check, so memory is enough.
+	 */
+	private snapshotGroupEnd: bigint | null = null;
 	/** One-shot: the write boundary validated the stored schema marker. */
 	private writeSchemaChecked = false;
 	/**
@@ -710,6 +782,8 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			options.maxRetainedFrameGap ??
 			(this.durability === 'quorum' ? null : DEFAULT_MAX_RETAINED_FRAME_GAP);
 		this.onCompactionForced = options.onCompactionForced;
+		this.maxFrameCiphertextBytes = options.maxFrameCiphertextBytes;
+		this.onFrameCeiling = options.onFrameCeiling;
 		this.activeLeaseEpoch = options.activeLeaseEpoch;
 	}
 
@@ -734,6 +808,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		epochFloor: bigint;
 		expectedRetainedMin: bigint | null;
 		rebasedThisRun: boolean;
+		snapshotGroupEnd: bigint | null;
 		writeSchemaChecked: boolean;
 	} | null = null;
 
@@ -758,6 +833,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			epochFloor: maxBig(this.epochFloor, durableEpoch),
 			expectedRetainedMin: this.expectedRetainedMin,
 			rebasedThisRun: this.rebasedThisRun,
+			snapshotGroupEnd: this.snapshotGroupEnd,
 			writeSchemaChecked: this.writeSchemaChecked
 		};
 	}
@@ -771,6 +847,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		this.epochFloor = checkpoint.epochFloor;
 		this.expectedRetainedMin = checkpoint.expectedRetainedMin;
 		this.rebasedThisRun = checkpoint.rebasedThisRun;
+		this.snapshotGroupEnd = checkpoint.snapshotGroupEnd;
 		this.writeSchemaChecked = checkpoint.writeSchemaChecked;
 	}
 
@@ -827,16 +904,20 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		const tipSequence = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
 		if (tipSequence == null) {
 			// The bootstrap snapshot CONTAINS this transition's effects, so the
-			// snapshot frame is the one that carries it.
-			this.appendSnapshotFrame(1n, GENESIS_HASH);
+			// snapshot frame is the one that carries it, together with any page
+			// frames its rows spilled into.
+			const last = this.appendSnapshotFrame(1n, GENESIS_HASH);
 			this.rebasedThisRun = true;
-			return 1n;
+			return last;
 		}
 		if (!this.rebasedThisRun) {
 			const rebaseSequence = BigInt(tipSequence) + 1n;
-			this.appendSnapshotFrame(rebaseSequence, this.storedTipHash());
+			const last = this.appendSnapshotFrame(
+				rebaseSequence,
+				this.storedTipHash()
+			);
 			this.rebasedThisRun = true;
-			return rebaseSequence;
+			return last;
 		}
 
 		const sequence = BigInt(tipSequence) + 1n;
@@ -856,11 +937,13 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		// Cadence follows snapshots WRITTEN, not the verified base: a base held
 		// back for a lagging replica would otherwise read as "no snapshot for
 		// ages" and fire one on every single append.
-		const lastSnapshot = BigInt(
-			this.storage.getRecoveryMeta!(META_LAST_SNAPSHOT_WRITTEN) ??
-				this.storage.getRecoveryMeta!(META_LAST_SNAPSHOT) ??
-				'0'
-		);
+		const lastSnapshot =
+			this.snapshotGroupEnd ??
+			BigInt(
+				this.storage.getRecoveryMeta!(META_LAST_SNAPSHOT_WRITTEN) ??
+					this.storage.getRecoveryMeta!(META_LAST_SNAPSHOT) ??
+					'0'
+			);
 		const deltaBytes =
 			Number(this.storage.getRecoveryMeta!(META_DELTA_BYTES) ?? '0') +
 			plaintextBytes;
@@ -1062,7 +1145,10 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			if (!frames[i].snapshot) continue;
 			sawSnapshot = true;
 			const declared = frames[i].snapshot!.schemaVersion;
-			if (!snapshotSchemaKnown(declared)) {
+			if (
+				declared !== PAGED_SNAPSHOT_SCHEMA_VERSION &&
+				!snapshotSchemaKnown(declared)
+			) {
 				throw new Error(
 					`recovery: the journal's retained base snapshot declares ` +
 						`schema '${declared}', which is not one this release can ` +
@@ -1336,20 +1422,24 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 					`verified chain's epoch ${this.epochFloor}; refusing to write`
 			);
 		}
-		// Stamped here rather than at each construction site so that deltas,
-		// bootstrap snapshots, per-run re-base snapshots and interval snapshots
-		// all carry the same declaration; a snapshot that omitted it would be a
-		// certified head that says nothing about what its writer promised.
-		if (this.durability) {
-			frame.durability = this.durability;
-			// Only quorum frames carry a policy stamp, because only they make a
-			// claim about which messages waited. Local and async-remote frames
-			// keep exactly the bytes they had before.
-			if (this.durability === 'quorum') {
-				frame.durabilityPolicy = WIRE_SAFETY_POLICY_VERSION;
-			}
-		}
+		this.stampDurability(frame);
 		const plaintext = encodeFrame(frame);
+		const ceiling = this.maxFrameCiphertextBytes?.();
+		if (
+			ceiling !== undefined &&
+			plaintext.length + FRAME_CIPHERTEXT_OVERHEAD > ceiling
+		) {
+			// Written anyway: refusing would roll back the transition and stop
+			// every channel locally, which is worse than a replica stuck behind.
+			this.onFrameCeiling?.({
+				outcome: 'oversized',
+				detail:
+					`frame ${frame.sequence} is ` +
+					`${plaintext.length + FRAME_CIPHERTEXT_OVERHEAD} ciphertext bytes ` +
+					`against the ${ceiling} byte guardian record limit with nothing ` +
+					`left to drop; the guardians will refuse it and every frame after it`
+			});
+		}
 		const frameHash = hashFrame(plaintext);
 		const key = deriveFrameKey(this.masterKey, this.nodeId, frame.writerEpoch);
 		const aad = frameAad(
@@ -1404,6 +1494,103 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	}
 
 	/**
+	 * Stamped at write time rather than at each construction site so that
+	 * deltas, bootstrap snapshots, per-run re-base snapshots and interval
+	 * snapshots all carry the same declaration; a snapshot that omitted it
+	 * would be a certified head that says nothing about what its writer
+	 * promised.
+	 */
+	private stampDurability(frame: RecoveryFrame): void {
+		if (!this.durability) return;
+		frame.durability = this.durability;
+		// Only quorum frames carry a policy stamp, because only they make a
+		// claim about which messages waited. Local and async-remote frames
+		// keep exactly the bytes they had before.
+		if (this.durability === 'quorum') {
+			frame.durabilityPolicy = WIRE_SAFETY_POLICY_VERSION;
+		}
+	}
+
+	/**
+	 * Hold a snapshot under the replicas' record ceiling by dropping history
+	 * no safety path reads, oldest first, and say what went. First the
+	 * forwarding ledger, then failed payment records: failed receives, and
+	 * failed sends with no preimage and no live HTLC (a failed hash stays
+	 * retryable anyway).
+	 * Payment records are what grow without bound, a few hundred bytes to a
+	 * few KB each. Completed payments always stay. The double-pay guard
+	 * (issue #975) reads the completed sends after a restore, and a completed
+	 * receive is what refuses a second HTLC for a paid hash and keeps a
+	 * settled hold invoice disarmed. A snapshot still over after both is
+	 * reported by writeFrame.
+	 */
+	private fitSnapshotUnderCeiling(frame: RecoveryFrame): string[] {
+		const ceiling = this.maxFrameCiphertextBytes?.();
+		if (ceiling === undefined) return [];
+		this.stampDurability(frame);
+		const size = (): number =>
+			encodeFrame(frame).length + FRAME_CIPHERTEXT_OVERHEAD;
+		if (size() <= ceiling) return [];
+		const snapshot = frame.snapshot!;
+		const dropped: string[] = [];
+
+		// captureSnapshot orders the ledger oldest first.
+		const events = snapshot.forwardingEvents;
+		const keptEvents = keepNewestThatFit(
+			events,
+			(kept) => {
+				snapshot.forwardingEvents = kept;
+			},
+			size,
+			ceiling
+		);
+		if (keptEvents < events.length) {
+			dropped.push(
+				`the oldest ${events.length - keptEvents} of ${events.length} ` +
+					`forwarding events`
+			);
+		}
+		if (size() <= ceiling) return dropped;
+
+		const payments = snapshot.payments;
+		const preimages = new Set(snapshot.preimages.map((p) => p.paymentHash));
+		// A send marked failed can still be fulfilled while its HTLC is live,
+		// and the double-pay guard needs the row when that happens.
+		const inFlight = new Set(
+			snapshot.htlcPaymentMappings.map((m) => m.paymentHash)
+		);
+		const history = payments
+			.filter(
+				({ paymentHash, payment }) =>
+					payment.status === PaymentStatus.FAILED &&
+					(payment.direction === PaymentDirection.INCOMING ||
+						(payment.preimage === undefined &&
+							!preimages.has(paymentHash) &&
+							!inFlight.has(paymentHash)))
+			)
+			.sort((a, b) => a.payment.createdAt - b.payment.createdAt);
+		const historic = new Set(history);
+		const keptHistory = keepNewestThatFit(
+			history,
+			(kept) => {
+				const keep = new Set(kept);
+				snapshot.payments = payments.filter(
+					(p) => !historic.has(p) || keep.has(p)
+				);
+			},
+			size,
+			ceiling
+		);
+		if (keptHistory < history.length) {
+			dropped.push(
+				`the oldest ${history.length - keptHistory} of ${history.length} ` +
+					`failed payments`
+			);
+		}
+		return dropped;
+	}
+
+	/**
 	 * Append a full-state snapshot frame and prune the deltas below it
 	 * (spec 5.3, snapshots and compaction). Runs inside the caller's
 	 * transaction: the tables it reads already include the current
@@ -1414,9 +1601,9 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	 * compacted by an older release omitted deleted channels' key-index
 	 * rows; append a fresh full snapshot so the guardian head regains the
 	 * burned indices, and record coverage so this runs once. Returns the
-	 * snapshot's sequence for receipt gating, or null when already covered
-	 * or when nothing was ever journaled (the first real snapshot will
-	 * carry the full table by construction).
+	 * snapshot's last frame (its last page, when paged) for receipt gating,
+	 * or null when already covered or when nothing was ever journaled (the
+	 * first real snapshot will carry the full table by construction).
 	 */
 	snapshotSchemaRepair(): bigint | null {
 		const marker = this.storage.getRecoveryMeta!(META_SNAPSHOT_SCHEMA);
@@ -1438,9 +1625,10 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		// owned here too: a rollback restores every in-memory field.
 		this.assertOwnsTransaction('snapshotSchemaRepair');
 		this.beginWriteAttempt();
+		let last = sequence;
 		try {
 			this.storage.transaction(() => {
-				this.appendSnapshotFrame(
+				last = this.appendSnapshotFrame(
 					sequence,
 					decodeStoredHashHex(tipHash, 'journal tip hash')
 				);
@@ -1454,7 +1642,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			throw err;
 		}
 		this.settleWriteAttempt(true);
-		return sequence;
+		return last;
 	}
 
 	/**
@@ -1494,11 +1682,130 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		);
 	}
 
+	/**
+	 * Move a snapshot's per-payment rows (payments, preimages, payment
+	 * secrets, invoices and their path ids) into page frames when the
+	 * snapshot is still over the ceiling after fitSnapshotUnderCeiling. Those
+	 * tables grow with the payment count, and their completed rows are what
+	 * the double-pay guard and the paid-hash refusal read after a restore, so
+	 * they are carried rather than dropped: as ordinary upserts in frames
+	 * written right after the snapshot, each packed to the ceiling, which
+	 * reconstruction replays like any delta. The snapshot records how many
+	 * follow so a restore can tell a whole snapshot from one whose pages never
+	 * reached the guardian. A snapshot over the ceiling even without these
+	 * rows is left whole for writeFrame to report.
+	 */
+	private pageSnapshotRows(frame: RecoveryFrame): RecoveryMutation[][] {
+		const ceiling = this.maxFrameCiphertextBytes?.();
+		if (ceiling === undefined) return [];
+		const bytes = (f: RecoveryFrame): number =>
+			encodeFrame(f).length + FRAME_CIPHERTEXT_OVERHEAD;
+		if (bytes(frame) <= ceiling) return [];
+		const snapshot = frame.snapshot!;
+		// applySnapshot's order.
+		const rows: RecoveryMutation[] = [
+			...snapshot.preimages.map(
+				(p): RecoveryMutation => ({
+					type: 'payment_preimage',
+					paymentHash: p.paymentHash,
+					preimage: p.preimage
+				})
+			),
+			...snapshot.payments.map(
+				(p): RecoveryMutation => ({
+					type: 'payment_state',
+					paymentHash: p.paymentHash,
+					payment: p.payment
+				})
+			),
+			...snapshot.paymentSecrets.map(
+				(s): RecoveryMutation => ({
+					type: 'payment_secret',
+					paymentHash: s.paymentHash,
+					secret: s.secret
+				})
+			),
+			...snapshot.invoices.map(
+				(i): RecoveryMutation => ({
+					type: 'invoice_state',
+					paymentHash: i.paymentHash,
+					invoice: i.invoice
+				})
+			),
+			...snapshot.invoicePathIds.map(
+				(i): RecoveryMutation => ({
+					type: 'invoice_path_id',
+					paymentHash: i.paymentHash,
+					pathId: i.pathId
+				})
+			)
+		];
+		if (rows.length === 0) return [];
+
+		// Any 32 bytes size a page: the hash encodes as 64 hex characters.
+		const room = (index: number): number =>
+			ceiling - bytes(this.pageFrame(frame, index, GENESIS_HASH, []));
+		const pages: RecoveryMutation[][] = [];
+		let page: RecoveryMutation[] = [];
+		let used = 0;
+		let capacity = room(0);
+		for (const row of rows) {
+			const size = encodedMutationBytes(row);
+			// +1 for the comma before every row but a page's first.
+			if (page.length > 0 && used + 1 + size > capacity) {
+				pages.push(page);
+				page = [];
+				capacity = room(pages.length);
+			}
+			used = page.length === 0 ? size : used + 1 + size;
+			page.push(row);
+		}
+		pages.push(page);
+
+		const paged: RecoverySnapshot = {
+			...snapshot,
+			schemaVersion: PAGED_SNAPSHOT_SCHEMA_VERSION,
+			pageFrames: pages.length,
+			preimages: [],
+			payments: [],
+			paymentSecrets: [],
+			invoices: [],
+			invoicePathIds: []
+		};
+		if (bytes({ ...frame, snapshot: paged }) > ceiling) return [];
+		frame.snapshot = paged;
+		return pages;
+	}
+
+	/** The `index`th page frame after a paged snapshot frame. */
+	private pageFrame(
+		snapshotFrame: RecoveryFrame,
+		index: number,
+		previousFrameHash: Buffer,
+		mutations: RecoveryMutation[]
+	): RecoveryFrame {
+		const frame: RecoveryFrame = {
+			version: 1,
+			writerEpoch: snapshotFrame.writerEpoch,
+			sequence: snapshotFrame.sequence + BigInt(index) + 1n,
+			previousFrameHash,
+			timestamp: snapshotFrame.timestamp,
+			mutations,
+			outboundMessages: []
+		};
+		this.stampDurability(frame);
+		return frame;
+	}
+
+	/**
+	 * Returns the last sequence written: the snapshot's, or its last page
+	 * frame's.
+	 */
 	private appendSnapshotFrame(
 		sequence: bigint,
 		previousFrameHash: Buffer
-	): void {
-		this.writeFrame({
+	): bigint {
+		const frame: RecoveryFrame = {
 			version: 1,
 			writerEpoch: this.writerEpoch(),
 			sequence,
@@ -1507,7 +1814,23 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			mutations: [],
 			outboundMessages: [],
 			snapshot: this.captureSnapshot()
-		});
+		};
+		const dropped = this.fitSnapshotUnderCeiling(frame);
+		const pages = this.pageSnapshotRows(frame);
+		let { frameHash } = this.writeFrame(frame);
+		for (let i = 0; i < pages.length; i++) {
+			({ frameHash } = this.writeFrame(
+				this.pageFrame(frame, i, frameHash, pages[i])
+			));
+		}
+		if (dropped.length > 0) {
+			this.onFrameCeiling?.({
+				outcome: 'trimmed',
+				detail:
+					`snapshot ${sequence} dropped ${dropped.join(' and ')} to fit ` +
+					`the guardian record limit; a restore from it will not have them`
+			});
+		}
 		// Cadence is measured against snapshots WRITTEN. The verified base only
 		// moves when the deltas below it are actually pruned, which a lagging
 		// replica can postpone (see compactTo).
@@ -1524,6 +1847,8 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			SNAPSHOT_SCHEMA_VERSION
 		);
 		this.compactTo(sequence);
+		this.snapshotGroupEnd = sequence + BigInt(pages.length);
+		return this.snapshotGroupEnd;
 	}
 
 	/**
@@ -1877,8 +2202,43 @@ export function verifyFrameChain(
 }
 
 /**
- * Assert that a decoded frame set's base snapshot (the NEWEST snapshot, the
- * one a reconstruction builds from) may be restored by THIS release. Unlike
+ * Index of the snapshot a reconstruction builds on, or -1: the newest one
+ * whose page frames all follow it. A guardian can hold a snapshot without its
+ * last pages (replication stopped between them), and building on that would
+ * silently lose the paged rows. The state at such a head is the state before
+ * that snapshot, which the previous one plus the deltas reproduce. A group
+ * is written in one transaction and every run starts with a snapshot, so a
+ * snapshot inside the expected page range means the group was cut off and a
+ * restored writer carried on after it.
+ */
+function baseSnapshotIndex(frames: RecoveryFrame[]): number {
+	for (let i = frames.length - 1; i >= 0; i--) {
+		const snapshot = frames[i].snapshot;
+		if (!snapshot) continue;
+		const pages = frames.slice(i + 1, i + 1 + (snapshot.pageFrames ?? 0));
+		if (
+			pages.length === (snapshot.pageFrames ?? 0) &&
+			pages.every((page) => !page.snapshot)
+		) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+/**
+ * Index of the last frame reconstructFromFrames applies: the head, or the
+ * frame before a later snapshot cut off before its last page.
+ */
+export function lastAppliedFrameIndex(frames: RecoveryFrame[]): number {
+	const base = baseSnapshotIndex(frames);
+	const cutOff = frames.findIndex((frame, i) => i > base && frame.snapshot);
+	return (cutOff < 0 ? frames.length : cutOff) - 1;
+}
+
+/**
+ * Assert that a decoded frame set's base snapshot (the NEWEST whole snapshot,
+ * the one a reconstruction builds from) may be restored by THIS release. Unlike
  * the write boundary's migration rule, restoration is STRICT: only the
  * exact current schema passes.
  *
@@ -1900,18 +2260,17 @@ export function verifyFrameChain(
  * touches the restore target.
  */
 export function assertFramesReconstructable(frames: RecoveryFrame[]): void {
-	let snapshot: RecoveryFrame['snapshot'];
-	for (let i = frames.length - 1; i >= 0; i--) {
-		if (frames[i].snapshot) {
-			snapshot = frames[i].snapshot;
-			break;
-		}
-	}
-	// No snapshot at all: reconstructFromFrames has its own refusal for
+	const snapshot = frames[baseSnapshotIndex(frames)]?.snapshot;
+	// No whole snapshot: reconstructFromFrames has its own refusal for
 	// that shape, and a capsule chain without one fails the base binding.
 	if (!snapshot) return;
 	const declared = snapshot.schemaVersion;
-	if (declared === SNAPSHOT_SCHEMA_VERSION) return;
+	if (
+		declared === SNAPSHOT_SCHEMA_VERSION ||
+		declared === PAGED_SNAPSHOT_SCHEMA_VERSION
+	) {
+		return;
+	}
 	if (
 		declared == null ||
 		declared === '' ||
@@ -1934,11 +2293,14 @@ export function assertFramesReconstructable(frames: RecoveryFrame[]): void {
  * Rebuild every safety-critical table from a verified frame sequence
  * (spec 5.3, deterministic reconstruction).
  *
- * The LAST snapshot frame is the base: its tables are written directly. Every
- * frame after it replays through RecoveryManager.commit on the target, i.e.
- * through the EXACT code path that produced the original writes (applyMutation
- * plus insertOutboxRow with its same-kind supersede and row cap), which is
- * what makes the rebuilt tables byte-identical rather than merely equivalent.
+ * The LAST whole snapshot frame is the base (see baseSnapshotIndex): its
+ * tables are written directly. Every frame after it replays through
+ * RecoveryManager.commit on the target, i.e. through the EXACT code path that
+ * produced the original writes (applyMutation plus insertOutboxRow with its
+ * same-kind supersede and row cap), which is what makes the rebuilt tables
+ * byte-identical rather than merely equivalent. That includes the base's own
+ * page frames. Replay stops at a later snapshot, which can only be one cut
+ * off before its last page: the state at that point is the state before it.
  *
  * Frames at or below the snapshot's sequence are ignored: the snapshot
  * already contains their effects.
@@ -1948,31 +2310,35 @@ export function reconstructFromFrames(
 	frames: RecoveryFrame[],
 	options: { maxOutboxRowsPerChannel?: number } = {}
 ): void {
-	let snapshotIndex = -1;
-	for (let i = frames.length - 1; i >= 0; i--) {
-		if (frames[i].snapshot) {
-			snapshotIndex = i;
-			break;
-		}
-	}
+	const snapshotIndex = baseSnapshotIndex(frames);
 	// A journal ALWAYS begins with a snapshot (bootstrap or compaction base),
 	// so a frame set without one is a suffix of deltas whose base was lost:
 	// replaying it into an empty database would produce an authenticated but
-	// INCOMPLETE state. Fail closed.
+	// INCOMPLETE state. Fail closed. The same holds for a first snapshot cut
+	// off before its last page frame.
 	if (snapshotIndex < 0) {
 		throw new Error(
-			'Recovery reconstruction requires an authenticated base snapshot'
+			frames.some((frame) => frame.snapshot)
+				? 'Recovery reconstruction requires an authenticated base ' +
+				  'snapshot with all of its page frames'
+				: 'Recovery reconstruction requires an authenticated base snapshot'
 		);
 	}
 	// The snapshot's AUTHENTICATED schema declaration gates the restore;
 	// the local marker cannot stand in for it because it does not survive
 	// the loss of the device.
 	assertFramesReconstructable(frames);
-	const snapshotSchema = frames[snapshotIndex].snapshot!.schemaVersion;
+	const declaredSchema = frames[snapshotIndex].snapshot!.schemaVersion;
+	// The local marker records content, and a paged snapshot's is schema 2.
+	const snapshotSchema =
+		declaredSchema === PAGED_SNAPSHOT_SCHEMA_VERSION
+			? SNAPSHOT_SCHEMA_VERSION
+			: declaredSchema;
+	const replayEnd = lastAppliedFrameIndex(frames) + 1;
 	// Path_id preflight runs over the WHOLE restore set (snapshot AND replay
 	// deltas) before the first write: a refusal discovered mid-replay would
 	// leave the target partially populated and unretryable.
-	assertPathIdsRestorable(target, frames, snapshotIndex);
+	assertPathIdsRestorable(target, frames, snapshotIndex, replayEnd);
 	// The target must be empty: applySnapshot and replay only insert and
 	// replace, so rows already present that the journal never mentions would
 	// silently survive into the "reconstructed" state.
@@ -1982,7 +2348,7 @@ export function reconstructFromFrames(
 	const manager = new RecoveryManager(target, {
 		maxOutboxRowsPerChannel: options.maxOutboxRowsPerChannel
 	});
-	for (let i = snapshotIndex + 1; i < frames.length; i++) {
+	for (let i = snapshotIndex + 1; i < replayEnd; i++) {
 		const frame = frames[i];
 		const result = manager.commit({
 			criticality: RecoveryCriticality.SafetyCritical,
@@ -2135,7 +2501,8 @@ export function assertEmptyTarget(target: IStorageBackend): void {
 function assertPathIdsRestorable(
 	target: IStorageBackend,
 	frames: RecoveryFrame[],
-	snapshotIndex: number
+	snapshotIndex: number,
+	replayEnd: number
 ): void {
 	const snapshot = frames[snapshotIndex].snapshot!;
 	const pathIds = new Set(snapshot.invoicePathIds.map((i) => i.paymentHash));
@@ -2144,7 +2511,7 @@ function assertPathIdsRestorable(
 	);
 	const preimages = new Set(snapshot.preimages.map((p) => p.paymentHash));
 	let carriesPathIds = pathIds.size > 0;
-	for (let i = snapshotIndex + 1; i < frames.length; i++) {
+	for (let i = snapshotIndex + 1; i < replayEnd; i++) {
 		for (const m of frames[i].mutations) {
 			switch (m.type) {
 				case 'invoice_path_id':

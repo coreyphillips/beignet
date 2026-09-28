@@ -41,6 +41,7 @@ import {
 	deriveRecoveryRoot,
 	genesisLogHead,
 	generateWriterKey,
+	GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES,
 	loadWriterLease,
 	nodeGuardianTransport,
 	registerTranscriptHash,
@@ -52,6 +53,11 @@ import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IStorageBackend } from '../../src/lightning/storage/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { serializePaymentInfo } from '../../src/lightning/storage/serialization';
+import {
+	IPaymentInfo,
+	PaymentDirection,
+	PaymentStatus
+} from '../../src/lightning/node/types';
 import { createOpenerState } from '../../src/lightning/channel/channel-state';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 
@@ -87,12 +93,16 @@ function bind(served: IServed[]): IBoundGuardianClient[] {
 	}));
 }
 
-async function serve(index: number): Promise<IServed> {
+async function serve(
+	index: number,
+	maxCiphertextBytes?: number
+): Promise<IServed> {
 	const guardian = new ReferenceGuardian({
 		path: ':memory:',
 		guardianSecret: GUARDIAN_SECRETS[index],
 		members: GUARDIAN_IDS,
-		clock
+		clock,
+		maxCiphertextBytes
 	});
 	const server = new GuardianHttpServer({ guardian });
 	const port = await server.listen(0);
@@ -1244,6 +1254,100 @@ describe('Recovery phase 5: restore driver', () => {
 		expect(target.loadRecoveryFrames()).to.have.length(0);
 		await shutdown(served);
 		live.storage.close();
+		target.close();
+	});
+});
+
+describe('Recovery phase 5: restore past the guardian record limit (issue #1102)', () => {
+	it('restores 20k completed payments whose snapshot outgrew the 4 MiB record limit', async function (): Promise<void> {
+		this.timeout(120_000);
+		const PAID = 10_000;
+		const served = await Promise.all(
+			[0, 1, 2].map((i) => serve(i, GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES))
+		);
+		const storage = openStorage();
+		const hashOf = (tag: number, i: number): string => {
+			const hash = Buffer.alloc(32, tag);
+			hash.writeUInt32BE(i, 0);
+			return hash.toString('hex');
+		};
+		const record = (hash: string, direction: PaymentDirection): IPaymentInfo =>
+			({
+				paymentHash: Buffer.from(hash, 'hex'),
+				amountMsat: 1_000_000n,
+				status: PaymentStatus.COMPLETED,
+				direction,
+				createdAt: 1_700_000_000_000
+			}) as IPaymentInfo;
+		storage.transaction(() => {
+			for (let i = 0; i < PAID; i++) {
+				const sent = hashOf(3, i);
+				storage.savePayment(sent, {
+					...record(sent, PaymentDirection.OUTGOING),
+					preimage: Buffer.alloc(32, 3)
+				});
+				const received = hashOf(8, i);
+				storage.savePayment(
+					received,
+					record(received, PaymentDirection.INCOMING)
+				);
+				storage.savePreimage(received, Buffer.alloc(32, 8));
+			}
+		});
+		const rep = replicatorFor(storage, bind(served));
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId,
+			{ maxFrameCiphertextBytes: (): number => rep.maxRecordBytes() }
+		);
+		const manager = new RecoveryManager(storage, { journal });
+		expect(
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'payment_preimage',
+						paymentHash: hashOf(4, 0),
+						preimage: Buffer.alloc(32, 4)
+					}
+				],
+				outboundMessages: []
+			}).committed
+		).to.equal(true);
+		const rows = storage.loadRecoveryFrames();
+		expect(rows.length).to.be.greaterThan(1);
+		for (const row of rows) {
+			expect(row.ciphertext.length).to.be.at.most(
+				GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES
+			);
+		}
+
+		const decision = await rep.ensureNamespace();
+		const pass = await rep.replicatePending(
+			(decision as { lease: IWriterLeaseKeys }).lease
+		);
+		expect(pass.outcome).to.equal('replicated');
+		expect(pass.replicatedThrough).to.equal(BigInt(rows.length));
+		const expectedDump = dumpTables(storage);
+
+		const target = openStorage();
+		await driverFor(target, bind(served)).restore();
+		expect(dumpTables(target)).to.equal(expectedDump);
+		// What the double-pay guard and the paid-hash refusal read.
+		for (let i = 0; i < PAID; i++) {
+			expect(target.loadPayment(hashOf(3, i))).to.include({
+				status: PaymentStatus.COMPLETED,
+				direction: PaymentDirection.OUTGOING
+			});
+			expect(target.loadPayment(hashOf(8, i))).to.include({
+				status: PaymentStatus.COMPLETED,
+				direction: PaymentDirection.INCOMING
+			});
+		}
+		await shutdown(served);
+		storage.close();
 		target.close();
 	});
 });

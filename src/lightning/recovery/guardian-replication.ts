@@ -44,6 +44,7 @@ import {
 	IGuardianGetHeadResponse
 } from './guardian';
 import {
+	GuardianTransportError,
 	IBoundGuardianClient,
 	IGuardianSetContext,
 	boundFanOut,
@@ -53,6 +54,7 @@ import {
 	verifyGuardianRotation,
 	IGuardianFanOutResult
 } from './guardian-client';
+import { GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES } from './guardian-host';
 import {
 	JOURNAL_META_KEYS,
 	chainLostBackfill,
@@ -208,6 +210,7 @@ export interface IGuardianReplicationEvent {
 		| 'record:under-replicated'
 		| 'record:rejected'
 		| 'record:conflict'
+		| 'record:too-large'
 		| 'writer:fenced'
 		| 'writer:supersession-unproven';
 	detail: string;
@@ -258,6 +261,8 @@ interface IGuardianStreamResult {
 	sawRetired: boolean;
 	/** A guardian holding a DIFFERENT record at one of our sequences. */
 	conflictAt: bigint | null;
+	/** The record this guardian refused as larger than it accepts. */
+	tooLargeAt: bigint | null;
 	requests: number;
 }
 
@@ -267,6 +272,10 @@ export class GuardianReplicator {
 	private readonly pipelineWindow: number;
 
 	private verifiedBindings: Set<string> | null = null;
+	/** maxCiphertextBytes each verified guardian advertised, by guardian id. */
+	private readonly advertisedCeilings = new Map<string, number>();
+	/** Too-large refusals already reported, as `guardian:sequence`. */
+	private readonly reportedTooLarge = new Set<string>();
 	/**
 	 * Single-flight over replicatePending. Two overlapping passes would fan
 	 * the same records out twice and, worse, race the watermark: each computes
@@ -314,9 +323,66 @@ export class GuardianReplicator {
 		if (this.verifiedBindings) return this.verifiedBindings;
 		this.verifiedBindings = await verifyGuardianBindings(
 			this.config.guardians,
-			this.config.context
+			this.config.context,
+			(key, info) => {
+				if (info.maxCiphertextBytes > 0) {
+					this.advertisedCeilings.set(key, info.maxCiphertextBytes);
+				}
+			}
 		);
 		return this.verifiedBindings;
+	}
+
+	/**
+	 * The largest record ciphertext every guardian in the set accepts. A
+	 * guardian refuses a bigger record and, accepting only the next sequence,
+	 * every record after it, so the journal holds its frames under this. A
+	 * guardian whose INFO has not been read yet counts at the host default.
+	 */
+	maxRecordBytes(): number {
+		let ceiling = Number.POSITIVE_INFINITY;
+		for (const entry of this.config.guardians) {
+			const advertised = this.advertisedCeilings.get(
+				entry.expectedGuardianId.toString('hex')
+			);
+			ceiling = Math.min(
+				ceiling,
+				advertised ?? GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES
+			);
+		}
+		return ceiling;
+	}
+
+	/** Start from the limits another replicator read for the same guardians. */
+	adoptRecordLimits(from: GuardianReplicator): void {
+		for (const [key, bytes] of from.advertisedCeilings) {
+			this.advertisedCeilings.set(key, bytes);
+		}
+	}
+
+	/**
+	 * Binding reads INFO once, so a guardian that was down then would count
+	 * at the host default for good. Asking it again each pass means records
+	 * written after it returns are sized for the limit it actually enforces.
+	 */
+	private async readMissingLimits(): Promise<void> {
+		await Promise.all(
+			this.config.guardians.map(async (entry) => {
+				const key = entry.expectedGuardianId.toString('hex');
+				if (this.advertisedCeilings.has(key)) return;
+				try {
+					const info = await entry.client.info();
+					if (
+						info.guardianId.equals(entry.expectedGuardianId) &&
+						info.maxCiphertextBytes > 0
+					) {
+						this.advertisedCeilings.set(key, info.maxCiphertextBytes);
+					}
+				} catch {
+					// Still unreachable: asked again next pass.
+				}
+			})
+		);
 	}
 
 	private emit(event: IGuardianReplicationEvent): void {
@@ -483,6 +549,10 @@ export class GuardianReplicator {
 	): Promise<NamespaceDecision> {
 		const held = loadWriterLease(this.config.storage);
 		if (held.state === 'present') {
+			// Nothing else on this path reads INFO before the node's first
+			// append writes this run's re-base snapshot, which must already be
+			// sized for the set's real limit.
+			await this.readMissingLimits();
 			return { outcome: 'already-held', lease: held.lease };
 		}
 
@@ -1039,6 +1109,7 @@ export class GuardianReplicator {
 			sawSupersession: false,
 			sawRetired: false,
 			conflictAt: null,
+			tooLargeAt: null,
 			requests: 0
 		};
 		let window = this.pipelineWindow;
@@ -1047,6 +1118,12 @@ export class GuardianReplicator {
 		// Strictly bounded: every round either advances the cursor or narrows
 		// the window, and a round that does neither twice stops the stream.
 		const maxRounds = frames.length + this.pipelineWindow + 1;
+		const noteTooLarge = (frame: IStoredRecoveryFrame): void => {
+			const sequence = BigInt(frame.sequence);
+			if (result.tooLargeAt == null || sequence < result.tooLargeAt) {
+				result.tooLargeAt = sequence;
+			}
+		};
 
 		for (let round = 0; round < maxRounds && cursor < frames.length; round++) {
 			const batch = frames.slice(cursor, cursor + window);
@@ -1055,15 +1132,27 @@ export class GuardianReplicator {
 				batch.map(async (frame) => {
 					try {
 						return await entry.client.putState(this.signRecord(frame, lease));
-					} catch {
+					} catch (error) {
+						// A body past the advertised limit plus the envelope
+						// allowance is refused by the transport (HTTP and BOLT 8
+						// alike answer 413) before the guardian ever sees it.
+						if (
+							error instanceof GuardianTransportError &&
+							error.httpStatus === 413
+						) {
+							noteTooLarge(frame);
+						}
 						return undefined;
 					}
 				})
 			);
 
 			let reported: bigint | null = null;
-			for (const response of responses) {
+			for (const [index, response] of responses.entries()) {
 				if (!response) continue;
+				if (response.status === GuardianStatus.ERR_TOO_LARGE) {
+					noteTooLarge(batch[index]);
+				}
 				if (response.status === GuardianStatus.ERR_EPOCH_SUPERSEDED) {
 					result.sawSupersession = true;
 				}
@@ -1155,6 +1244,7 @@ export class GuardianReplicator {
 			(frame) => BigInt(frame.sequence) > from
 		);
 		if (frames.length === 0) {
+			await this.readMissingLimits();
 			return {
 				outcome: 'replicated',
 				attempted: 0,
@@ -1172,13 +1262,16 @@ export class GuardianReplicator {
 		}
 		const tip = BigInt(frames[frames.length - 1].sequence);
 
-		const streams = await Promise.all(
-			this.config.guardians.map((entry) =>
-				this.streamToGuardian(entry, frames, lease, framesBySequence, tip)
-			)
-		);
+		const [streams] = await Promise.all([
+			Promise.all(
+				this.config.guardians.map((entry) =>
+					this.streamToGuardian(entry, frames, lease, framesBySequence, tip)
+				)
+			),
+			this.readMissingLimits()
+		]);
 
-		for (const stream of streams) {
+		for (const [index, stream] of streams.entries()) {
 			if (stream.conflictAt != null) {
 				this.emit({
 					type: 'record:conflict',
@@ -1187,6 +1280,25 @@ export class GuardianReplicator {
 						`its receipts are not evidence for this chain`,
 					sequence: stream.conflictAt
 				});
+			}
+			if (stream.tooLargeAt != null) {
+				const guardian =
+					this.config.guardians[index].expectedGuardianId.toString('hex');
+				const key = `${guardian}:${stream.tooLargeAt}`;
+				// Every later pass resends the same record and meets the same
+				// refusal, so each one is reported once, not once per pass.
+				if (!this.reportedTooLarge.has(key)) {
+					this.reportedTooLarge.add(key);
+					this.emit({
+						type: 'record:too-large',
+						detail:
+							`guardian ${guardian} refused record ${stream.tooLargeAt} as larger ` +
+							`than the ciphertext it accepts; it takes only the next sequence, ` +
+							`so it can store nothing after this until its operator raises ` +
+							`the limit (the protocol allows up to 16 MiB)`,
+						sequence: stream.tooLargeAt
+					});
+				}
 			}
 		}
 
