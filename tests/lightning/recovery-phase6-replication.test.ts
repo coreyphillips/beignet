@@ -40,10 +40,12 @@ import {
 	REPLICATION_META_KEYS,
 	computeGuardianSetId,
 	decodeGetHeadResponse,
+	decodeInfoResponse,
 	decodePutStateResponse,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
 	encodeGetHeadResponse,
+	encodeInfoResponse,
 	encodePutStateResponse,
 	nodeGuardianTransport,
 	receiptTranscriptHash,
@@ -1096,6 +1098,32 @@ describe('Recovery phase 6: records over a guardian limit (issue #1014)', () => 
 		down = false;
 		expect((await rep.replicatePending(lease)).attempted).to.equal(0);
 		expect(rep.maxRecordBytes()).to.equal(100_000);
+		await shutdown(served);
+		storage.close();
+	});
+
+	it('reads the limit of a guardian whose INFO is outside our protocol range', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0, 100_000), serve(1), serve(2)]);
+		const { storage } = journaledStorage(1);
+		await registered(replicator(storage, bind(served)));
+
+		const newer = instrument(served[0], {
+			rewrite: (path, response) => {
+				if (path !== '/info') return response;
+				return {
+					status: response.status,
+					body: encodeInfoResponse({
+						...decodeInfoResponse(response.body),
+						minProtocolVersion: GUARDIAN_PROTOCOL_VERSION + 1,
+						maxProtocolVersion: GUARDIAN_PROTOCOL_VERSION + 1
+					})
+				};
+			}
+		});
+		const booted = replicator(storage, [newer, ...bind(served.slice(1))]);
+		expect((await booted.ensureNamespace()).outcome).to.equal('already-held');
+		expect(booted.maxRecordBytes()).to.equal(100_000);
 		await shutdown(served);
 		storage.close();
 	});
