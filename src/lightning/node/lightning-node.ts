@@ -17157,23 +17157,27 @@ export class LightningNode extends EventEmitter {
 			...(metadata && { metadata: { ...metadata } })
 		};
 		// Dispatch gives the row a part's route and secrets, and settlement
-		// adds the preimage and invoice. The settled row has to fit a frame
-		// with any part's route before a part leaves.
+		// adds the preimage and invoice. The row has to fit a frame with any
+		// part's route before a part leaves, both as labelled and as settled.
+		// Settlement writes the invoice of a context left by an earlier
+		// attempt, since that context is kept below.
+		const settledInvoice =
+			this.paymentRetryContexts.get(hashHex)?.invoiceStr ?? invoiceStr;
 		if (
 			metadata &&
-			!multiRoute.parts.every((part) =>
-				this.paymentMetadataFits(metadata, [
-					this.settledPaymentMutation(
-						{
-							...payment,
-							cltvBaseHeight: this.cltvBaseHeight(paymentHash),
-							route: part as IPaymentInfo['route'],
-							sharedSecrets: part.hops.map(() => Buffer.alloc(32))
-						},
-						invoiceStr
-					)
-				])
-			)
+			!multiRoute.parts.every((part) => {
+				const labelled: IPaymentInfo = {
+					...payment,
+					cltvBaseHeight: this.cltvBaseHeight(paymentHash),
+					route: part as IPaymentInfo['route'],
+					sharedSecrets: part.hops.map(() => Buffer.alloc(32))
+				};
+				return this.paymentMetadataFits(
+					metadata,
+					[{ type: 'payment_state', paymentHash: hashHex, payment: labelled }],
+					[this.settledPaymentMutation(labelled, settledInvoice)]
+				);
+			})
 		) {
 			throw new InvalidRequestError(
 				'payment metadata is too large for the recovery guardians to accept'

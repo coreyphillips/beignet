@@ -1104,6 +1104,64 @@ describe('Recovery phase 6: the node drives durability', () => {
 		expect(() =>
 			node.setPaymentMetadata(fitting.paymentHash, { _invoice: longInvoice })
 		).to.throw(InvalidRequestError, /too large/);
+
+		// An MPP part's row also carries the sum the parts send.
+		const mppLabelledBytes = (metadata: Record<string, string>): number =>
+			encodedMutationBytes({
+				type: 'payment_state',
+				paymentHash: mpp.paymentHash.toString('hex'),
+				payment: {
+					...node.getPayment(fitting.paymentHash)!,
+					paymentHash: mpp.paymentHash,
+					sentMsat: route.totalAmountMsat,
+					metadata
+				}
+			});
+		const sendMpp = (
+			invoiceStr: string,
+			metadata?: Record<string, string>,
+			maxCltvExpiryHeight?: number
+		): IPaymentInfo =>
+			(
+				node as unknown as {
+					sendPaymentMpp(...args: unknown[]): IPaymentInfo;
+				}
+			).sendPaymentMpp(
+				invoiceStr,
+				{ paymentHash: mpp.paymentHash, amountMsat: 5_000_000n },
+				{
+					parts: [route],
+					totalAmountMsat: route.totalAmountMsat,
+					totalFeeMsat: route.totalFeeMsat
+				},
+				40,
+				undefined,
+				maxCltvExpiryHeight,
+				metadata
+			);
+		// A caller's _invoice that overflows only the labelled part row.
+		const mppCallerInvoice = 'x'.repeat(
+			room + 1 - mppLabelledBytes({ _invoice: '' })
+		);
+		expect(mppLabelledBytes({ _invoice: mppCallerInvoice })).to.equal(room + 1);
+		expect(JSON.stringify({ _invoice: mppCallerInvoice }).length).to.be.at.most(
+			room / 2
+		);
+		expect(() => sendMpp(mpp.bolt11, { _invoice: mppCallerInvoice })).to.throw(
+			InvalidRequestError,
+			/too large/
+		);
+		// An attempt refused locally leaves its retry context, and settlement
+		// writes that context's invoice, here one byte longer than this send's.
+		expect(sendMpp(`${mpp.bolt11}x`, undefined, 1).status).to.equal(
+			PaymentStatus.FAILED
+		);
+		const sentMsatBytes =
+			mppLabelledBytes({ note: fittingNote, _invoice: '' }) - labelledBytes('');
+		expect(() =>
+			sendMpp(mpp.bolt11, { note: fittingNote.slice(sentMsatBytes) })
+		).to.throw(InvalidRequestError, /too large/);
+
 		expect(payee.settleHeldHtlc(fitting.paymentHash, preimage)).to.equal(true);
 		expect(
 			(await node.awaitPaymentResolution(fitting.paymentHash, 5_000)).status
