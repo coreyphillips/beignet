@@ -744,12 +744,15 @@ async function handlePsbt(): Promise<void> {
 						: undefined
 				})
 			);
-		case 'import-signed':
+		case 'import-signed': {
+			const pos = positionalArgs();
 			return outputResult(
 				await httpRequest('POST', '/psbt/import-signed', {
-					psbtBase64: readPsbtArg(filteredArgs[2])
+					psbtBase64: readPsbtArg(pos[2]),
+					unsignedPsbtBase64: readPsbtArg(pos[3])
 				})
 			);
+		}
 		case 'combine':
 			return outputResult(
 				await httpRequest('POST', '/psbt/combine', {
@@ -765,7 +768,7 @@ async function handlePsbt(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet psbt [build <address> <sats> [satsPerVbyte]|import-signed <psbtBase64|file>|combine <psbt|file> <psbt|file> ...]'
+						'Usage: beignet psbt [build <address> <sats> [satsPerVbyte]|import-signed <psbtBase64|file> [unsignedPsbt|file]|combine <psbt|file> <psbt|file> ...]'
 				}
 			});
 			process.exitCode = 1;
@@ -2843,8 +2846,12 @@ On-chain:
   psbt build <address> <sats> [satsPerVbyte]
                                          Build an UNSIGNED PSBT for an external
                                          signer (hardware wallet)
-  psbt import-signed <psbtBase64|file>   Validate + finalize a signed PSBT;
-                                         returns txid/txHex WITHOUT broadcast
+  psbt import-signed <psbtBase64|file> [unsignedPsbt|file]
+                                         Validate + finalize a signed PSBT;
+                                         returns txid/txHex WITHOUT broadcast.
+                                         Pass the unsigned PSBT from psbt build
+                                         once the daemon has restarted or made
+                                         50 newer builds
   psbt combine <psbt|file> <psbt|file>   Combine partially signed PSBT copies
   transactions [limit]                   List on-chain transactions (newest first)
   utxos                                  List wallet UTXOs (includes frozen flag)

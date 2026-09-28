@@ -41,6 +41,12 @@ export const DUST_LIMITS = {
  */
 export const STOP_REFRESH_WAIT_MS = 30_000;
 
+/**
+ * How many PSBTs buildPsbt remembers for importSignedPsbt to check against.
+ * The oldest is forgotten first; importing it then needs the unsigned PSBT.
+ */
+export const MAX_REMEMBERED_PSBT_BUILDS = 50;
+
 export const TRANSACTION_DEFAULTS = {
 	recommendedBaseFee: 256, // Total recommended tx base fee in sats
 	dustLimit: 546 // Minimum value in sats for an output. Outputs below the dust limit may not be processed because the fees required to include them in a block would be greater than the value of the transaction itself.

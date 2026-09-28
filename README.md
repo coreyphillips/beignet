@@ -194,7 +194,7 @@ The full read-only surface works: address generation, gap-limit scanning, Electr
 <details>
 <summary><b>Hardware wallets and external signers (PSBT)</b></summary>
 
-`buildPsbt` runs the normal setup (coin selection, change, fee) but stops before signing, returning a base64 PSBT populated with what a hardware signer needs: `witnessUtxo` (or `nonWitnessUtxo` for legacy p2pkh), `redeemScript` for p2sh-p2wpkh, `tapInternalKey` plus `tapBip32Derivation` for p2tr, and `bip32Derivation` on every wallet input. Works on full and watch-only wallets.
+`buildPsbt` runs the normal setup (coin selection, change, fee) but stops before signing, returning a base64 PSBT populated with what a hardware signer needs: `witnessUtxo` (or `nonWitnessUtxo` for legacy p2pkh), `redeemScript` for p2sh-p2wpkh, `tapInternalKey` plus `tapBip32Derivation` for p2tr, and `bip32Derivation` on every wallet input. The change output carries the same derivation fields, so the signer shows it as change rather than as a second recipient. Works on full and watch-only wallets.
 
 ```typescript
 // 1. Build (never touches private keys)
@@ -205,9 +205,10 @@ const { psbtBase64, fee, vsizeEstimate } = build.value;
 // 2. Sign externally (hardware wallet, HWI, another machine)
 const signedBase64 = await myHardwareWallet.signPsbt(psbtBase64);
 
-// 3. Import: validates a signature on EVERY input, finalizes, does NOT broadcast
+// 3. Import: checks the inputs and outputs are the ones built, validates a
+//    signature on EVERY input, finalizes, does NOT broadcast
 const imported = wallet.importSignedPsbt(signedBase64);
-if (imported.isErr()) return; // missing/invalid signatures are rejected loudly
+if (imported.isErr()) return; // changed outputs, missing/invalid signatures are rejected loudly
 const { txHex, txid } = imported.value;
 
 // 4. Broadcast when ready
@@ -217,9 +218,11 @@ await wallet.broadcastTransaction(txHex);
 const combined = wallet.combinePsbts([copyA, copyB]);
 ```
 
+`importSignedPsbt` finalizes only a PSBT that spends the same inputs to the same outputs as one this wallet instance built (it remembers its 50 most recent builds, in memory). To import a PSBT built elsewhere, or after a restart, pass the unsigned PSBT as the second argument: `wallet.importSignedPsbt(signedBase64, psbtBase64)`. Inputs the signer already finalized are refused, since their signatures cannot be checked.
+
 For watch-only wallets the true master fingerprint is unknowable from an account xpub, so the xpub's parent fingerprint is used: signers should locate keys by derivation path.
 
-Also on the daemon (`POST /psbt/build`, `/psbt/import-signed`, `/psbt/combine`) and the CLI (`beignet psbt build|import-signed|combine`).
+Also on the daemon (`POST /psbt/build`, `/psbt/import-signed`, `/psbt/combine`) and the CLI (`beignet psbt build|import-signed|combine`). A restart forgets the daemon's builds, so the import there takes the unsigned PSBT too: `unsignedPsbtBase64` on the route, a second argument to `beignet psbt import-signed`.
 
 </details>
 
@@ -262,10 +265,11 @@ const signedA = walletA.signPsbtWithOurKey(unsigned);
 const signedB = walletB.signPsbtWithOurKey(unsigned);
 if (signedA.isErr() || signedB.isErr()) return;
 
-// 5. Combine, finalize at threshold, broadcast.
+// 5. Combine, finalize at threshold, broadcast. The coordinator did not build
+//    the PSBT, so it checks the combined one against the unsigned original.
 const combined = coordinator.combinePsbts([signedA.value, signedB.value]);
 if (combined.isErr()) return;
-const finalized = coordinator.importSignedPsbt(combined.value); // 2-of-3 met
+const finalized = coordinator.importSignedPsbt(combined.value, unsigned); // 2-of-3 met
 if (finalized.isErr()) return;
 await coordinator.broadcastTransaction(finalized.value.txHex);
 
