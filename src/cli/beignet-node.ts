@@ -10571,6 +10571,11 @@ export class BeignetNode extends EventEmitter {
 	private _toBeignetPaymentError(err: unknown): BeignetError {
 		if (err instanceof BeignetError) return err;
 		const msg = err instanceof Error ? err.message : String(err);
+		// The caller's own arguments, such as metadata the recovery guardians
+		// could not hold.
+		if (err instanceof InvalidRequestError) {
+			return new BeignetError(BeignetErrorCode.INVALID_PARAMS, msg);
+		}
 		let code = 'PAYMENT_FAILED';
 		if (err instanceof Error && 'code' in err) {
 			const lpErr = err as { code: string };
@@ -10659,17 +10664,6 @@ export class BeignetNode extends EventEmitter {
 			maxFeeMsat
 		);
 
-		// Store metadata on the payment if provided. Guarded, because nothing
-		// between the claim above and the executor below may strand it.
-		try {
-			if (metadata) {
-				this.setPaymentMetadata(paymentHashHex, metadata);
-			}
-		} catch (err: unknown) {
-			if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
-			throw err;
-		}
-
 		return new Promise<PaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
@@ -10718,12 +10712,16 @@ export class BeignetNode extends EventEmitter {
 			this.node.on('payment:failed', onFailed);
 
 			try {
+				// The metadata rides the send, which creates the record it belongs
+				// on; setPaymentMetadata only labels a record that already exists.
 				this.node.sendPayment(
 					bolt11,
 					undefined,
 					maxFeeMsat,
 					amountMsat,
-					maxCltvExpiryHeight
+					maxCltvExpiryHeight,
+					undefined,
+					metadata
 				);
 			} catch (err: unknown) {
 				cleanup();
@@ -10966,15 +10964,14 @@ export class BeignetNode extends EventEmitter {
 
 		let result: IPaymentInfo;
 		try {
-			if (metadata) {
-				this.setPaymentMetadata(paymentHashHex, metadata);
-			}
 			result = this.node.sendPayment(
 				bolt11,
 				undefined,
 				maxFeeMsat,
 				amountMsat,
-				maxCltvExpiryHeight
+				maxCltvExpiryHeight,
+				undefined,
+				metadata
 			);
 		} catch (err: unknown) {
 			// A payment that never started holds no capacity. Matched by

@@ -917,6 +917,8 @@ export interface IPaymentRetryContext {
 	 * it.
 	 */
 	policyOverrides?: Map<string, IChannelUpdateMessage>;
+	/** Caller metadata, carried onto the record every attempt creates. */
+	metadata?: Record<string, string>;
 }
 
 /** Options-object form of sendPayment's positional arguments. */
@@ -939,6 +941,12 @@ export interface ISendPaymentOptions {
 	 * on-chain refund height less its claim margin.
 	 */
 	maxCltvExpiryHeight?: number;
+	/**
+	 * Labels stored on the payment record, as setPaymentMetadata stores them.
+	 * Refused with an InvalidRequestError, before anything is sent, when they
+	 * are too large for the recovery guardians to accept.
+	 */
+	metadata?: Record<string, string>;
 }
 
 export interface ICreateInvoiceOptions {

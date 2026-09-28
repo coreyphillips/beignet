@@ -15880,7 +15880,8 @@ export class LightningNode extends EventEmitter {
 		maxFeeMsat?: bigint,
 		amountMsat?: bigint,
 		maxCltvExpiryHeight?: number,
-		policyOverrides?: TPolicyOverrides
+		policyOverrides?: TPolicyOverrides,
+		metadata?: Record<string, string>
 	): IPaymentInfo {
 		const invoice = decodeInvoice(invoiceStr);
 
@@ -15905,6 +15906,15 @@ export class LightningNode extends EventEmitter {
 		const overrides =
 			policyOverrides ??
 			this.paymentRetryContexts.get(dedupHashHex)?.policyOverrides;
+		if (metadata && !this.paymentMetadataFits(metadata)) {
+			throw new InvalidRequestError(
+				'payment metadata is too large for the recovery guardians to accept'
+			);
+		}
+		// A context an earlier call left behind (its dispatch threw) is reused
+		// below, so its retries must carry this call's labels, not that call's.
+		const lingeringCtx = this.paymentRetryContexts.get(dedupHashHex);
+		if (lingeringCtx) lingeringCtx.metadata = metadata && { ...metadata };
 
 		const destination = invoice.payeeNodeKey || invoice.recoveredPubkey;
 		if (!destination) {
@@ -15938,9 +15948,20 @@ export class LightningNode extends EventEmitter {
 					expiryTimestamp * 1000
 				).toISOString()}`,
 				createdAt: Date.now(),
-				completedAt: Date.now()
+				completedAt: Date.now(),
+				...(metadata && { metadata: { ...metadata } })
 			};
 			const expiredHashHex = invoice.paymentHash.toString('hex');
+			if (
+				metadata &&
+				!this.paymentMetadataFits(metadata, [
+					{ type: 'payment_state', paymentHash: expiredHashHex, payment }
+				])
+			) {
+				throw new InvalidRequestError(
+					'payment metadata is too large for the recovery guardians to accept'
+				);
+			}
 			this.payments.set(expiredHashHex, payment);
 			// A retry that lands here (the invoice expired between attempts)
 			// is over: its context would otherwise linger until prune, and
@@ -16032,7 +16053,8 @@ export class LightningNode extends EventEmitter {
 					maxFeeMsat,
 					amountMsat,
 					maxCltvExpiryHeight: cltvCeiling,
-					policyOverrides: overrides
+					policyOverrides: overrides,
+					metadata: metadata && { ...metadata }
 				});
 			}
 			return this.sendPaymentToRoute(
@@ -16040,7 +16062,8 @@ export class LightningNode extends EventEmitter {
 				invoice.paymentHash,
 				finalCltvExpiry,
 				invoice.paymentSecret,
-				paymentAmountMsat
+				paymentAmountMsat,
+				metadata
 			);
 		}
 
@@ -16121,7 +16144,8 @@ export class LightningNode extends EventEmitter {
 					multiRoute,
 					finalCltvExpiry,
 					excludedChannels,
-					cltvCeiling
+					cltvCeiling,
+					metadata
 				);
 			}
 		}
@@ -16151,7 +16175,8 @@ export class LightningNode extends EventEmitter {
 				maxFeeMsat,
 				amountMsat,
 				maxCltvExpiryHeight: cltvCeiling,
-				policyOverrides: overrides
+				policyOverrides: overrides,
+				metadata: metadata && { ...metadata }
 			});
 		}
 
@@ -16160,7 +16185,8 @@ export class LightningNode extends EventEmitter {
 			invoice.paymentHash,
 			finalCltvExpiry,
 			invoice.paymentSecret,
-			paymentAmountMsat
+			paymentAmountMsat,
+			metadata
 		);
 	}
 
@@ -16179,7 +16205,8 @@ export class LightningNode extends EventEmitter {
 			options.maxFeeMsat,
 			options.amountMsat,
 			options.maxCltvExpiryHeight,
-			options.policyOverrides
+			options.policyOverrides,
+			options.metadata
 		);
 	}
 
@@ -16197,7 +16224,8 @@ export class LightningNode extends EventEmitter {
 		paymentHash: Buffer,
 		finalCltvExpiry: number,
 		paymentSecret?: Buffer,
-		totalMsat?: bigint
+		totalMsat?: bigint,
+		metadata?: Record<string, string>
 	): IPaymentInfo {
 		if (route.hops.length === 0) {
 			throw new Error('Route must have at least one hop');
@@ -16362,13 +16390,37 @@ export class LightningNode extends EventEmitter {
 				totalFeeMsat: bigint;
 			},
 			sharedSecrets,
-			createdAt: Date.now()
+			createdAt: Date.now(),
+			...(metadata && { metadata: { ...metadata } })
 		};
+		const htlcId = outChannel.getFullState().localHtlcCounter;
+		const htlcKey = `${channelId.toString('hex')}:offered-${htlcId}`;
+		// The labelled row has to fit a frame with the route it now carries.
+		if (
+			metadata &&
+			!this.paymentMetadataFits(metadata, [
+				{
+					type: 'payment_state',
+					paymentHash: paymentHash.toString('hex'),
+					payment
+				},
+				{
+					type: 'htlc_payment_mapping',
+					htlcKey,
+					paymentHash: paymentHash.toString('hex')
+				}
+			])
+		) {
+			// sendPayment seeded a retry context for this attempt. Left behind,
+			// a later send of the hash would retry with the refused labels.
+			this.paymentRetryContexts.delete(paymentHash.toString('hex'));
+			throw new InvalidRequestError(
+				'payment metadata is too large for the recovery guardians to accept'
+			);
+		}
 		this.payments.set(paymentHash.toString('hex'), payment);
 
 		// Track offered HTLC → payment mapping
-		const htlcId = outChannel.getFullState().localHtlcCounter;
-		const htlcKey = `${channelId.toString('hex')}:offered-${htlcId}`;
 		this.htlcPaymentMap.set(htlcKey, paymentHash.toString('hex'));
 		{
 			const mutations: RecoveryMutation[] = [
@@ -17052,7 +17104,8 @@ export class LightningNode extends EventEmitter {
 		},
 		_finalCltvExpiry: number,
 		excludedChannels?: Set<string>,
-		maxCltvExpiryHeight?: number
+		maxCltvExpiryHeight?: number,
+		metadata?: Record<string, string>
 	): IPaymentInfo {
 		const paymentHash = invoice.paymentHash;
 		const hashHex = paymentHash.toString('hex');
@@ -17072,8 +17125,32 @@ export class LightningNode extends EventEmitter {
 			sentMsat: multiRoute.totalAmountMsat,
 			status: PaymentStatus.PENDING,
 			direction: PaymentDirection.OUTGOING,
-			createdAt: Date.now()
+			createdAt: Date.now(),
+			...(metadata && { metadata: { ...metadata } })
 		};
+		// Dispatch gives the row a part's route and secrets, so the labelled
+		// row has to fit a frame with any of them before a part leaves.
+		if (
+			metadata &&
+			!multiRoute.parts.every((part) =>
+				this.paymentMetadataFits(metadata, [
+					{
+						type: 'payment_state',
+						paymentHash: hashHex,
+						payment: {
+							...payment,
+							cltvBaseHeight: this.cltvBaseHeight(paymentHash),
+							route: part as IPaymentInfo['route'],
+							sharedSecrets: part.hops.map(() => Buffer.alloc(32))
+						}
+					}
+				])
+			)
+		) {
+			throw new InvalidRequestError(
+				'payment metadata is too large for the recovery guardians to accept'
+			);
+		}
 		this.payments.set(hashHex, payment);
 		{
 			const paymentMutation = this.paymentMutation(paymentHash);
@@ -17095,7 +17172,8 @@ export class LightningNode extends EventEmitter {
 				excludedChannels: excludedChannels ?? new Set(),
 				retryCount: 0,
 				maxRetries: this.maxPaymentRetries,
-				maxCltvExpiryHeight
+				maxCltvExpiryHeight,
+				metadata: metadata && { ...metadata }
 			});
 		}
 
@@ -23907,7 +23985,8 @@ export class LightningNode extends EventEmitter {
 						retryCtx.maxFeeMsat,
 						retryCtx.amountMsat,
 						retryCtx.maxCltvExpiryHeight,
-						retryCtx.policyOverrides
+						retryCtx.policyOverrides,
+						retryCtx.metadata
 					);
 				}
 				retried.retryCount = retryCtx.retryCount;

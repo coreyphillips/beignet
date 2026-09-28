@@ -308,6 +308,76 @@ describe('Payment retry actually dispatches', () => {
 		alice.destroy();
 		bob.destroy();
 	});
+
+	// Each attempt replaces the record, so the caller's metadata has to ride
+	// the retry context onto every one of them (issue #1152).
+	it('carries the caller metadata onto every attempt', () => {
+		const { alice, bob } = setupPair(908, 909);
+		const invoice = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'labelled'
+		});
+		const seen: Array<Record<string, string> | undefined> = [];
+		const labels = { requestId: 'req-1' };
+		const attempts = failEveryHtlcTemporarily(bob, () => {
+			seen.push(alice.getPayment(invoice.paymentHash)?.metadata);
+			// The caller changing its own object must not relabel a retry.
+			labels.requestId = 'changed';
+		});
+
+		alice.sendPaymentWithOptions(invoice.bolt11, { metadata: labels });
+
+		expect(attempts()).to.be.greaterThan(1);
+		expect(seen).to.have.length(attempts());
+		for (const metadata of seen) {
+			expect(metadata).to.deep.equal({ requestId: 'req-1' });
+		}
+		const failed = alice.getPayment(invoice.paymentHash)!;
+		expect(failed.status).to.equal(PaymentStatus.FAILED);
+		expect(failed.metadata).to.deep.equal({ requestId: 'req-1' });
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it("does not relabel a later send's retries with a failed send's metadata", () => {
+		const { alice, bob } = setupPair(914, 915);
+		const invoice = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'relabelled'
+		});
+		// The first send throws after seeding its retry context.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const a = alice as any;
+		a.findChannelForPeer = (): null => null;
+		a.findLocalChannelByScid = (): null => null;
+		expect(() =>
+			alice.sendPaymentWithOptions(invoice.bolt11, {
+				metadata: { requestId: 'first' }
+			})
+		).to.throw(/No channel to first hop/);
+		delete a.findChannelForPeer;
+		delete a.findLocalChannelByScid;
+
+		const seen: Array<Record<string, string> | undefined> = [];
+		const attempts = failEveryHtlcTemporarily(bob, () => {
+			seen.push(alice.getPayment(invoice.paymentHash)?.metadata);
+		});
+		alice.sendPaymentWithOptions(invoice.bolt11, {
+			metadata: { requestId: 'second' }
+		});
+
+		expect(attempts()).to.be.greaterThan(1);
+		for (const metadata of seen) {
+			expect(metadata).to.deep.equal({ requestId: 'second' });
+		}
+		expect(alice.getPayment(invoice.paymentHash)!.metadata).to.deep.equal({
+			requestId: 'second'
+		});
+
+		alice.destroy();
+		bob.destroy();
+	});
 });
 
 describe('Retry context lifecycle', () => {

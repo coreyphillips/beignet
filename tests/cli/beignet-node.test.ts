@@ -1246,11 +1246,12 @@ describe('Payment Fee Safety', () => {
 		const {
 			LightningNode
 		} = require('../../src/lightning/node/lightning-node');
-		// sendPayment(invoiceStr, excludedChannels?, maxFeeMsat?, amountMsat?, maxCltvExpiryHeight?, policyOverrides?)
+		// sendPayment(invoiceStr, excludedChannels?, maxFeeMsat?, amountMsat?, maxCltvExpiryHeight?, policyOverrides?, metadata?)
 		expect(typeof LightningNode.prototype.sendPayment).to.equal('function');
-		// Verify it accepts 6 params (invoiceStr, excludedChannels, maxFeeMsat,
-		// amountMsat, maxCltvExpiryHeight, policyOverrides; the last since #1056)
-		expect(LightningNode.prototype.sendPayment.length).to.equal(6);
+		// Verify it accepts 7 params (invoiceStr, excludedChannels, maxFeeMsat,
+		// amountMsat, maxCltvExpiryHeight, policyOverrides since #1056,
+		// metadata since #1152)
+		expect(LightningNode.prototype.sendPayment.length).to.equal(7);
 	});
 
 	it('sendPayment is backward compatible without maxFeeMsat', () => {
