@@ -46,6 +46,7 @@ import {
 } from '../message/error';
 import { decodeChannelReestablishMessage } from '../message/channel-reestablish';
 import { decodeStfuMessage } from '../message/stfu';
+import { normalizeHexPubkey } from '../validation';
 import {
 	decodeSpliceMessage,
 	decodeSpliceAckMessage,
@@ -1240,6 +1241,7 @@ export class ChannelManager extends EventEmitter {
 		fundingSatoshis: bigint,
 		pushMsat?: bigint
 	): Channel | null {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
 		if (!this.zeroConfManager.canOpenZeroConfTo(peerPubkey)) {
 			this.emit('error', null, 'Peer is not trusted for zero-conf channels');
 			return null;
@@ -1314,6 +1316,7 @@ export class ChannelManager extends EventEmitter {
 		beforeNegotiate?: (temporaryChannelId: Buffer) => void,
 		opts?: { trusted?: boolean }
 	): Channel {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
 		// Verify peer is connected before creating channel state
 		if (this.peerManager && !this.peerManager.getPeer(peerPubkey)) {
 			throw new Error(`Not connected to peer ${peerPubkey}`);
@@ -2527,6 +2530,9 @@ export class ChannelManager extends EventEmitter {
 		keyIndex?: number | null,
 		perChannelKeys?: IPerChannelKeys | null
 	): void {
+		// Rows written before opens lowercased the caller's pubkey can carry
+		// any case, and inbound connections register the lowercase form.
+		peerPubkey = normalizeHexPubkey(peerPubkey);
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
 		}
@@ -2698,6 +2704,7 @@ export class ChannelManager extends EventEmitter {
 	 * Get all channels for a specific peer.
 	 */
 	getChannelsByPeer(peerPubkey: string): Channel[] {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
 		const result: Channel[] = [];
 		for (const [id, channel] of this.channels) {
 			if (this.channelPeers.get(id) === peerPubkey) {
