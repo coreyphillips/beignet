@@ -59,6 +59,7 @@
 
 import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
 import { GuardianState } from './guardian-wire';
+import { lastAppliedFrameIndex } from './journal';
 import { RecoveryFrame, VerifiedRecoveryChain } from './types';
 
 /**
@@ -162,6 +163,26 @@ export function deriveWireSafetyProof(
 				`the certified head was written under wire-safety policy ` +
 				`'${String(head.durabilityPolicy ?? 'none')}', and this build can ` +
 				`only reason about policy ${WIRE_SAFETY_POLICY_VERSION}`
+		};
+	}
+	// Reconstruction stops at a snapshot cut off before its last page, so the
+	// state installed is the one at the frame before it. The pages at the head
+	// declare the mode of the run that wrote them, not of that state.
+	const applied = frames[lastAppliedFrameIndex(frames)];
+	if (
+		applied !== head &&
+		(applied?.durability !== 'quorum' ||
+			applied.durabilityPolicy !== WIRE_SAFETY_POLICY_VERSION)
+	) {
+		return {
+			proven: false,
+			reason:
+				applied?.durability !== 'quorum' ? 'not-quorum' : 'policy-mismatch',
+			detail:
+				`the restore stops at frame ${applied?.sequence ?? 'none'}, ` +
+				'before a snapshot whose last pages never reached the guardians, ' +
+				'and that frame was not written under quorum policy ' +
+				`${WIRE_SAFETY_POLICY_VERSION}`
 		};
 	}
 	return {

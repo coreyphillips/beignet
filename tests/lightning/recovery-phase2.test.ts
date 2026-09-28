@@ -33,7 +33,10 @@ import {
 	RecoveryOutboundMessage,
 	RecoveryJournal,
 	RecoveryFrame,
+	VerifiedRecoveryChain,
+	WireSafetyDerivation,
 	deriveRecoveryMasterKey,
+	deriveWireSafetyProof,
 	deriveRecoveryRoot,
 	deriveFrameIv,
 	deriveFrameKey,
@@ -3054,7 +3057,11 @@ describe('Recovery phase 2: snapshots page what a guardian record cannot hold (i
 	function limitedJournal(
 		storage: SqliteStorage,
 		reports: Array<{ outcome: string; detail: string }>,
-		extra: { snapshotIntervalFrames?: number; retainFrom?: () => bigint } = {}
+		extra: {
+			snapshotIntervalFrames?: number;
+			retainFrom?: () => bigint;
+			durability?: 'quorum';
+		} = {}
 	): { manager: RecoveryManager; journal: RecoveryJournal } {
 		const journal = new RecoveryJournal(
 			storage,
@@ -3161,6 +3168,47 @@ describe('Recovery phase 2: snapshots page what a guardian record cannot hold (i
 		);
 		expect(target.loadAllPayments()).to.have.length(0);
 		target.close();
+		storage.close();
+	});
+
+	it('does not certify a restore that stops before a cut-off re-base as exact', () => {
+		const storage = paidStorage();
+		const retainFrom = (): bigint => 1n;
+		const first = limitedJournal(storage, [], { retainFrom }).manager;
+		expect(commitPayment(first, hashOf(4, 0)).committed).to.equal(true);
+		expect(commitPayment(first, hashOf(4, 1)).committed).to.equal(true);
+		const rebaseIndex = storage.loadRecoveryFrames().length;
+		// The next run is a quorum one, and its re-base is paged.
+		const { manager, journal } = limitedJournal(storage, [], {
+			retainFrom,
+			durability: 'quorum'
+		});
+		expect(commitPayment(manager, hashOf(4, 2)).committed).to.equal(true);
+		const frames = journal.loadVerifiedFrames();
+		expect(frames[rebaseIndex].snapshot!.pageFrames).to.be.at.least(2);
+
+		const proofAt = (set: RecoveryFrame[]): WireSafetyDerivation =>
+			deriveWireSafetyProof(
+				{
+					recoveryId: RECOVERY_ID,
+					lease: { epoch: 1n, writerPublicKey: Buffer.alloc(32, 1) },
+					origin: { firstSequence: 1n, previousHash: Buffer.alloc(32) },
+					logHead: {
+						sequence: set[set.length - 1].sequence,
+						frameHash: Buffer.alloc(32),
+						ciphertextHash: Buffer.alloc(32),
+						recordEpoch: 1n
+					}
+				},
+				set as VerifiedRecoveryChain,
+				RECOVERY_ID
+			);
+		expect(proofAt(frames).proven).to.equal(true);
+		// The head is a quorum page, but the restore stops at the undeclared
+		// delta before the re-base.
+		const cut = frames.slice(0, frames.length - 1);
+		expect(cut[cut.length - 1].durability).to.equal('quorum');
+		expect(proofAt(cut)).to.include({ proven: false, reason: 'not-quorum' });
 		storage.close();
 	});
 

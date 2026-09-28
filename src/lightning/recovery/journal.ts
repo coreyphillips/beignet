@@ -2216,6 +2216,16 @@ function baseSnapshotIndex(frames: RecoveryFrame[]): number {
 }
 
 /**
+ * Index of the last frame reconstructFromFrames applies: the head, or the
+ * frame before a later snapshot cut off before its last page.
+ */
+export function lastAppliedFrameIndex(frames: RecoveryFrame[]): number {
+	const base = baseSnapshotIndex(frames);
+	const cutOff = frames.findIndex((frame, i) => i > base && frame.snapshot);
+	return (cutOff < 0 ? frames.length : cutOff) - 1;
+}
+
+/**
  * Assert that a decoded frame set's base snapshot (the NEWEST whole snapshot,
  * the one a reconstruction builds from) may be restored by THIS release. Unlike
  * the write boundary's migration rule, restoration is STRICT: only the
@@ -2303,10 +2313,7 @@ export function reconstructFromFrames(
 	// the loss of the device.
 	assertFramesReconstructable(frames);
 	const snapshotSchema = frames[snapshotIndex].snapshot!.schemaVersion;
-	const cutOff = frames.findIndex(
-		(frame, i) => i > snapshotIndex && frame.snapshot
-	);
-	const replayEnd = cutOff < 0 ? frames.length : cutOff;
+	const replayEnd = lastAppliedFrameIndex(frames) + 1;
 	// Path_id preflight runs over the WHOLE restore set (snapshot AND replay
 	// deltas) before the first write: a refusal discovered mid-replay would
 	// leave the target partially populated and unretryable.
