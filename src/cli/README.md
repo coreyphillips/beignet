@@ -119,7 +119,7 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `listBoostableTransactions()` | `BoostableTransactions` | Unconfirmed wallet txs eligible for RBF and/or CPFP |
 | `consolidateUtxos(satsPerVbyte?)` | `Promise<ConsolidateResult>` | Merge all UTXOs into one output at a fresh wallet address (send-max-to-self) |
 | `buildPsbt(outputs, satsPerVbyte?)` | `Promise<PsbtBuildInfo>` | Build an UNSIGNED PSBT for an external signer (hardware wallet); nothing is signed or broadcast |
-| `importSignedPsbt(psbtBase64)` | `PsbtImportInfo` | Validate + finalize an externally signed PSBT; returns `{ txid, txHex }` WITHOUT broadcasting |
+| `importSignedPsbt(psbtBase64, unsignedPsbtBase64?)` | `PsbtImportInfo` | Validate + finalize an externally signed PSBT that this node built (same inputs and outputs), or that matches `unsignedPsbtBase64` (needed after a restart); returns `{ txid, txHex }` WITHOUT broadcasting |
 | `combinePsbts(psbts)` | `{ psbtBase64 }` | Combine partially signed copies of the same PSBT (multi-party signing) |
 | `refreshWallet()` | `Promise<void>` | Sync UTXOs from Electrum (incremental: wallet state persists in the node's SQLite DB across restarts) |
 | `listUtxos()` | `UtxoInfo[]` | Wallet UTXOs; each entry carries a `frozen` flag |
@@ -1511,8 +1511,10 @@ beignet consolidate [satsPerVbyte]
 beignet psbt build <address> <sats> [satsPerVbyte]
 # Unsigned PSBT for a hardware wallet: {"ok":true,"result":{"psbtBase64":"cHNi...","feeSats":418,...}}
 
-beignet psbt import-signed <psbtBase64|file>
+beignet psbt import-signed <psbtBase64|file> [unsignedPsbt|file]
 # Validate + finalize (no broadcast): {"ok":true,"result":{"txid":"ab12...","txHex":"0200..."}}
+# The daemon remembers its 50 most recent builds, in memory only. After a
+# restart (or 50 newer builds), pass the unsigned PSBT from `psbt build` too.
 
 beignet psbt combine <psbt|file> <psbt|file>
 # {"ok":true,"result":{"psbtBase64":"cHNi..."}}
@@ -2144,7 +2146,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/transactions/boostable` | -- | Unconfirmed txs eligible for RBF/CPFP, by method |
 | POST | `/consolidate` | `{ satsPerVbyte? }` | Merge all UTXOs into one output at a fresh wallet address |
 | POST | `/psbt/build` | `{ outputs, satsPerVbyte? }` | Build an UNSIGNED PSBT for an external signer |
-| POST | `/psbt/import-signed` | `{ psbtBase64 }` | Validate + finalize a signed PSBT (no broadcast) |
+| POST | `/psbt/import-signed` | `{ psbtBase64, unsignedPsbtBase64? }` | Validate + finalize a signed PSBT this node built, or one matching `unsignedPsbtBase64` (no broadcast) |
 | POST | `/psbt/combine` | `{ psbts }` | Combine partially signed PSBT copies |
 | POST | `/utxo/freeze` | `{ txid, index }` | Freeze a UTXO: excluded from all coin selection until unfrozen |
 | POST | `/utxo/unfreeze` | `{ txid, index }` | Unfreeze a previously frozen UTXO |

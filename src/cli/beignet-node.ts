@@ -6463,16 +6463,30 @@ export class BeignetNode extends EventEmitter {
 	/**
 	 * Validates and finalizes an externally signed PSBT. Returns the raw
 	 * transaction WITHOUT broadcasting; use sendRawTransaction-style flows or
-	 * the wallet broadcast explicitly.
+	 * the wallet broadcast explicitly. The wallet remembers only its recent
+	 * builds, in memory, so a PSBT built before a restart is imported against
+	 * unsignedPsbtBase64, the PSBT buildPsbt returned.
 	 */
-	importSignedPsbt(psbtBase64: string): PsbtImportInfo {
+	importSignedPsbt(
+		psbtBase64: string,
+		unsignedPsbtBase64?: string
+	): PsbtImportInfo {
 		if (!psbtBase64 || typeof psbtBase64 !== 'string') {
 			throw new BeignetError(
 				BeignetErrorCode.INVALID_PARAMS,
 				'psbtBase64 required'
 			);
 		}
-		const result = this.wallet.importSignedPsbt(psbtBase64);
+		if (
+			unsignedPsbtBase64 !== undefined &&
+			typeof unsignedPsbtBase64 !== 'string'
+		) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'unsignedPsbtBase64 must be a string'
+			);
+		}
+		const result = this.wallet.importSignedPsbt(psbtBase64, unsignedPsbtBase64);
 		if (result.isErr()) {
 			throw new BeignetError('PSBT_IMPORT_FAILED', result.error.message);
 		}

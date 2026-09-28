@@ -1601,9 +1601,12 @@ async function bootDaemon(
 			return success(await node.buildPsbt(outputs, satsPerVbyte));
 		},
 		'POST /psbt/import-signed': (body) => {
-			const { psbtBase64 } = body as { psbtBase64?: string };
+			const { psbtBase64, unsignedPsbtBase64 } = body as {
+				psbtBase64?: string;
+				unsignedPsbtBase64?: string;
+			};
 			if (!psbtBase64) return failure('INVALID_PARAMS', 'psbtBase64 required');
-			return success(node.importSignedPsbt(psbtBase64));
+			return success(node.importSignedPsbt(psbtBase64, unsignedPsbtBase64));
 		},
 		'POST /psbt/combine': (body) => {
 			const { psbts } = body as { psbts?: string[] };

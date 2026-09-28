@@ -2381,13 +2381,17 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/psbt/import-signed': {
 				post: {
 					summary:
-						'Validate and finalize an externally signed PSBT; returns { txid, txHex } WITHOUT broadcasting',
+						'Validate and finalize an externally signed PSBT; returns { txid, txHex } WITHOUT broadcasting. The node remembers only its 50 most recent builds, in memory; for an older build or one from before a restart, pass unsignedPsbtBase64 (the PSBT /psbt/build returned)',
 					tags: ['Node'],
-					requestBody: bodyContent({ psbtBase64: 'string' }),
+					requestBody: bodyContent({
+						psbtBase64: 'string',
+						unsignedPsbtBase64: 'string?'
+					}),
 					responses: {
 						'200': { description: 'Finalized transaction (not broadcast)' },
 						'400': {
-							description: 'PSBT_IMPORT_FAILED (missing/invalid signatures)'
+							description:
+								'PSBT_IMPORT_FAILED (missing/invalid signatures, an input already finalized, or inputs/outputs that differ from unsignedPsbtBase64 or, without it, from every PSBT this node remembers building)'
 						}
 					}
 				}

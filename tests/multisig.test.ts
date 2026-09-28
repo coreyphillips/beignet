@@ -507,6 +507,29 @@ describe('Multisig P2WSH Wallets', function () {
 			).to.equal(true);
 		});
 
+		it('buildPsbt marks the change output with its witnessScript and every cosigner derivation', () => {
+			const psbt = bitcoin.Psbt.fromBase64(builtBase64, { network: regtest });
+			const expected = expectedPayment(1, 0);
+			const changeIndex = psbt.txOutputs.findIndex(
+				(o) => o.address === expected.address
+			);
+			expect(changeIndex).to.not.equal(-1);
+			const change = psbt.data.outputs[changeIndex];
+			expect(change.witnessScript!.equals(expected.witnessScript)).to.equal(
+				true
+			);
+			expect(
+				change.bip32Derivation!.map((d) => d.pubkey.toString('hex'))
+			).to.deep.equal(expected.pubkeys.map((pk) => pk.toString('hex')));
+			for (const derivation of change.bip32Derivation!) {
+				expect(derivation.path).to.equal(`${ACCOUNT_PATH}/1/0`);
+			}
+			const recipientIndex = psbt.txOutputs.findIndex(
+				(o) => o.address === RECIPIENT
+			);
+			expect(psbt.data.outputs[recipientIndex].bip32Derivation).to.be.undefined;
+		});
+
 		it('signPsbtWithOurKey adds exactly our partial signature without finalizing', () => {
 			const res = walletA.signPsbtWithOurKey(builtBase64);
 			if (res.isErr()) throw res.error;
@@ -533,7 +556,7 @@ describe('Multisig P2WSH Wallets', function () {
 		it('rejects finalization below the threshold naming have/need', () => {
 			const signedA = walletA.signPsbtWithOurKey(builtBase64);
 			if (signedA.isErr()) throw signedA.error;
-			const res = watchOnly.importSignedPsbt(signedA.value);
+			const res = watchOnly.importSignedPsbt(signedA.value, builtBase64);
 			expect(res.isErr()).to.equal(true);
 			if (res.isErr()) {
 				expect(res.error.message).to.match(/have 1 signature\(s\), need 2/);
@@ -554,7 +577,7 @@ describe('Multisig P2WSH Wallets', function () {
 			merged.data.inputs.forEach((input) => {
 				expect(input.partialSig).to.have.length(2);
 			});
-			const imported = watchOnly.importSignedPsbt(combined.value);
+			const imported = watchOnly.importSignedPsbt(combined.value, builtBase64);
 			if (imported.isErr()) throw imported.error;
 			const tx = bitcoin.Transaction.fromHex(imported.value.txHex);
 			expect(tx.getId()).to.equal(imported.value.txid);
@@ -605,7 +628,7 @@ describe('Multisig P2WSH Wallets', function () {
 					]
 				});
 			});
-			const res = watchOnly.importSignedPsbt(psbt.toBase64());
+			const res = watchOnly.importSignedPsbt(psbt.toBase64(), builtBase64);
 			expect(res.isErr()).to.equal(true);
 			if (res.isErr()) {
 				expect(res.error.message).to.include('not in the multisig script');
@@ -672,7 +695,7 @@ describe('Multisig P2WSH Wallets', function () {
 				}
 				// Once a signer copies the real output into witnessUtxo, recordless
 				// cosigners have nothing left to compare, so the coordinator's
-				// record must stop the import.
+				// record of its build must stop the import.
 				psbt.data.inputs[0].witnessUtxo = {
 					script: psbt.data.inputs[0].witnessUtxo!.script,
 					value: 1000000
@@ -687,7 +710,7 @@ describe('Multisig P2WSH Wallets', function () {
 				expect(imported.isErr()).to.equal(true);
 				if (imported.isOk()) return;
 				expect(imported.error.message).to.contain(
-					'holds 1000000 sats, not the 500000 this wallet records'
+					'Input 0 claims a different previous output than the one built'
 				);
 			} finally {
 				walletA.data.utxos = savedUtxos;
