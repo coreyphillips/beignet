@@ -636,7 +636,7 @@ describe('Multisig P2WSH Wallets', function () {
 			}
 		});
 
-		it('no cosigner signs over a previous transaction worth more than witnessUtxo (#1098)', async () => {
+		it('neither cosigners nor the coordinator accept a previous transaction worth more than the build (#1098)', async () => {
 			const utxo = await makeMultisigUtxo(walletA, { index: 0, value: 500000 });
 			const prevTx = new bitcoin.Transaction();
 			prevTx.addInput(Buffer.alloc(32, 7), 0);
@@ -670,6 +670,25 @@ describe('Multisig P2WSH Wallets', function () {
 						'holds 1000000 sats, not the 500000 its witnessUtxo records'
 					);
 				}
+				// Once a signer copies the real output into witnessUtxo, recordless
+				// cosigners have nothing left to compare, so the coordinator's
+				// record must stop the import.
+				psbt.data.inputs[0].witnessUtxo = {
+					script: psbt.data.inputs[0].witnessUtxo!.script,
+					value: 1000000
+				};
+				const signedB = walletB.signPsbtWithOurKey(psbt.toBase64());
+				if (signedB.isErr()) throw signedB.error;
+				const signed = bitcoin.Psbt.fromBase64(signedB.value, {
+					network: regtest
+				});
+				signed.signInput(0, rootC.derivePath(`${ACCOUNT_PATH}/0/0`));
+				const imported = walletA.importSignedPsbt(signed.toBase64());
+				expect(imported.isErr()).to.equal(true);
+				if (imported.isOk()) return;
+				expect(imported.error.message).to.contain(
+					'holds 1000000 sats, not the 500000 this wallet records'
+				);
 			} finally {
 				walletA.data.utxos = savedUtxos;
 			}

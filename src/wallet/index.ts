@@ -5132,6 +5132,9 @@ export class Wallet {
 	 * Multisig (P2WSH m-of-n witnessScript) inputs finalize only when at
 	 * least m VALID partial signatures from script keys are present; below
 	 * the threshold the error names how many signatures it has and needs.
+	 * Errs when an input spends a previous output that disagrees with its
+	 * witnessUtxo or this wallet's UTXO, since cosigners with no record of
+	 * the coin can only check the PSBT against itself.
 	 * @param {string} psbtBase64
 	 * @returns {Result<IImportSignedPsbtResponse>}
 	 */
@@ -5144,6 +5147,8 @@ export class Wallet {
 			const psbt = bitcoin.Psbt.fromBase64(psbtBase64, { network });
 			if (psbt.inputCount === 0) return err('PSBT has no inputs.');
 			for (let i = 0; i < psbt.inputCount; i++) {
+				const prevOutCheck = this._checkPsbtPrevOut(psbt, i);
+				if (prevOutCheck.isErr()) return err(prevOutCheck.error.message);
 				const input = psbt.data.inputs[i];
 				// Inputs already finalized by the signer carry their signature in
 				// the final script and cannot be re-validated via partialSig.
@@ -5304,7 +5309,7 @@ export class Wallet {
 	}
 
 	/**
-	 * Refuses to sign input i unless the previous output its signature commits
+	 * Refuses input i unless the previous output its signature commits
 	 * to agrees with the input's witnessUtxo and with this wallet's record of
 	 * the coin. bitcoinjs signs segwit v0 and legacy inputs over the output in
 	 * nonWitnessUtxo when present, while buildPsbt priced the fee from the
