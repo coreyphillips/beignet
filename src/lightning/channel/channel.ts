@@ -4428,22 +4428,45 @@ export class Channel {
 	 * The tx is rebuilt from the row, which describes the signed commitment
 	 * only while no update is pending, so a row that owes a signature is left
 	 * alone.
+	 *
+	 * A pending splice signed the same point over its own funding, and rows
+	 * written before that side was cached hold only the current funding's tx,
+	 * so the splice side is checked on its own.
 	 */
 	repairWatchtowerCommitmentCache(): void {
 		if (this._state.needsCommitment) return;
 		const point = this.isAwaitingRemoteRevocation()
 			? this._state.remoteNextPerCommitmentPoint
 			: this._state.remoteCurrentPerCommitmentPoint;
-		if (
-			!point ||
-			this._state.watchtowerRemoteCommitmentTxs?.has(point.toString('hex'))
-		) {
-			return;
+		if (!point) return;
+		const key = point.toString('hex');
+		if (!this._state.watchtowerRemoteCommitmentTxs?.has(key)) {
+			this._cacheRemoteCommitmentForWatchtower(
+				point,
+				this._state.remoteCommitmentNumber
+			);
 		}
-		this._cacheRemoteCommitmentForWatchtower(
-			point,
-			this._state.remoteCommitmentNumber
-		);
+		const spliced = this._state.spliceInFlight ? this._splicedState() : null;
+		const spliceFunding = spliced?.fundingTxid;
+		if (!spliced || !spliceFunding) return;
+		const spliceCached = (
+			this._state.watchtowerRemoteCommitmentTxs?.get(key) ?? []
+		).some((tx) => {
+			try {
+				return bitcoin.Transaction.fromBuffer(tx).ins[0]?.hash.equals(
+					spliceFunding
+				);
+			} catch {
+				return false;
+			}
+		});
+		if (!spliceCached) {
+			this._cacheRemoteCommitmentForWatchtower(
+				point,
+				this._state.remoteCommitmentNumber,
+				spliced
+			);
+		}
 	}
 
 	/**
