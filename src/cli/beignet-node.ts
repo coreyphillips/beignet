@@ -10511,12 +10511,14 @@ export class BeignetNode extends EventEmitter {
 	): BeignetError {
 		const failed = this.node.failPaymentUnlessInFlight(paymentHash);
 		if (failed && claim) this._releaseAsyncSpendClaim(claim);
-		return new BeignetError(
+		const err = new BeignetError(
 			'PAYMENT_TIMEOUT',
 			failed
 				? `${what} timed out after ${timeoutMs}ms`
 				: `${what} timed out after ${timeoutMs}ms; an HTLC is still in flight and the payment stays PENDING until it resolves; no further route is tried after the timeout`
 		);
+		err.paymentHash = paymentHash.toString('hex');
+		return err;
 	}
 
 	/**
@@ -11169,6 +11171,19 @@ export class BeignetNode extends EventEmitter {
 		if (live) return live;
 		const durable = this.storage.loadPayment(paymentHash);
 		return durable ? this.toPaymentInfo(durable) : null;
+	}
+
+	/**
+	 * Where an outgoing payment stands, judged as the engine judges a
+	 * duplicate (#975): 'settled' once paid, 'live' while its record is
+	 * PENDING or an HTLC is still out for it, 'gone' when nothing sent for it
+	 * can settle any more. A durable row that cannot be read reads as live.
+	 */
+	paymentOutcome(paymentHash: string): 'settled' | 'live' | 'gone' {
+		return this._spendClaimOutcomeAtBoot(
+			Buffer.from(paymentHash, 'hex'),
+			paymentHash
+		);
 	}
 
 	/**

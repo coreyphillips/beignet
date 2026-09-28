@@ -21,7 +21,7 @@ import { parseGuardianEntry } from '../lightning/recovery';
 import { ILogger, createConsoleLogger } from '../logger';
 import { BeignetError } from './errors';
 import { L402Error } from '../lightning/l402';
-import { ApiResponse, RouteHop, SpliceResult } from './types';
+import { ApiResponse, PaymentInfo, RouteHop, SpliceResult } from './types';
 import { getOpenApiSpec } from './openapi';
 import { IWebhookStorage, WebhookManager } from './webhooks';
 import {
@@ -75,6 +75,11 @@ interface CachedResponse {
 	response: unknown;
 	bodyHash: string;
 	expiresAt: number;
+	/**
+	 * Set instead of a response for a keyed POST /offer/pay that timed out:
+	 * the payment the key started, whose outcome answers each retry (#1094).
+	 */
+	paymentHash?: string;
 }
 
 // Every request header a browser client may send. A preflight is answered
@@ -1246,15 +1251,48 @@ async function bootDaemon(
 	// handler's promise and answers with its result, a different-body overlap
 	// gets the 409 without running anything. The entry is dropped when the
 	// handler settles, after which the cache takes over as before (a returned
-	// envelope is cached, a throw caches nothing).
+	// envelope is cached, a throw caches nothing but an /offer/pay timeout's
+	// payment hash).
 	const idempotencyInFlight = new Map<
 		string,
 		{ bodyHash: string; promise: Promise<unknown> }
 	>();
+	/**
+	 * The answer to a keyed /offer/pay retry whose first attempt timed out
+	 * (#1094): the completed payment once it settled, a 409 carrying its hash
+	 * while it can still settle, and null once it cannot, when the key may pay
+	 * again. 409 rather than the first 504, which would invite another retry.
+	 */
+	const timedOutOfferReplay = (
+		paymentHash: string
+	): ApiResponse<PaymentInfo> | null => {
+		const outcome = node.paymentOutcome(paymentHash);
+		if (outcome === 'gone') return null;
+		const paid = outcome === 'settled' ? node.getPayment(paymentHash) : null;
+		if (paid?.status === 'COMPLETED') return success(paid);
+		const err = new BeignetError(
+			'DUPLICATE_PAYMENT',
+			'The offer payment this idempotency key started is still in flight; ' +
+				`nothing was paid again. GET /payment?paymentHash=${paymentHash} ` +
+				'reports its outcome.'
+		);
+		err.paymentHash = paymentHash;
+		return { ok: false, error: err.toJSON() };
+	};
 	const idempotencyCleanupTimer = setInterval(() => {
 		const now = Date.now();
 		for (const [key, entry] of idempotencyCache) {
-			if (now >= entry.expiresAt) idempotencyCache.delete(key);
+			if (now < entry.expiresAt) continue;
+			// An HTLC can stay out for up to 2016 blocks, well past the TTL,
+			// and dropping the marker then would let the key pay again.
+			if (
+				entry.paymentHash !== undefined &&
+				node.paymentOutcome(entry.paymentHash) === 'live'
+			) {
+				entry.expiresAt = now + IDEMPOTENCY_TTL_MS;
+				continue;
+			}
+			idempotencyCache.delete(key);
 		}
 	}, IDEMPOTENCY_CLEANUP_INTERVAL_MS);
 	if (idempotencyCleanupTimer.unref) idempotencyCleanupTimer.unref();
@@ -3533,8 +3571,24 @@ async function bootDaemon(
 						endIdempotencyConflict(res);
 						return;
 					}
-					endWithResult(res, cached.response);
-					return;
+					if (cached.paymentHash === undefined) {
+						endWithResult(res, cached.response);
+						return;
+					}
+					const replay = timedOutOfferReplay(cached.paymentHash);
+					if (replay !== null) {
+						if (replay.ok) {
+							idempotencyCache.set(cacheKey, {
+								response: replay,
+								bodyHash,
+								expiresAt: cached.expiresAt
+							});
+						}
+						endWithResult(res, replay);
+						return;
+					}
+					// The first attempt can no longer settle, so this one runs.
+					idempotencyCache.delete(cacheKey);
 				}
 				const inFlight = idempotencyInFlight.get(cacheKey);
 				if (inFlight) {
@@ -3554,6 +3608,27 @@ async function bootDaemon(
 				let result: unknown;
 				try {
 					result = await pending;
+				} catch (err: unknown) {
+					// A thrown error is not cached, but an offer payment's
+					// timeout can leave an HTLC out that still settles, and a
+					// rerun would ask the payee for a fresh invoice under a
+					// fresh hash that the engine cannot tie to the first. A
+					// retried /invoice/pay meets the engine's duplicate refusal
+					// on its own hash instead.
+					if (
+						routeKey === 'POST /offer/pay' &&
+						err instanceof BeignetError &&
+						err.code === 'PAYMENT_TIMEOUT' &&
+						err.paymentHash !== undefined
+					) {
+						idempotencyCache.set(cacheKey, {
+							response: undefined,
+							bodyHash,
+							expiresAt: Date.now() + IDEMPOTENCY_TTL_MS,
+							paymentHash: err.paymentHash
+						});
+					}
+					throw err;
 				} finally {
 					idempotencyInFlight.delete(cacheKey);
 				}

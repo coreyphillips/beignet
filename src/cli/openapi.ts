@@ -3443,7 +3443,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'409': {
 							description:
-								'FEE_EXCEEDS_MAX, every route costs more than maxFeeSats / maxFeeMsat; nothing was sent'
+								'FEE_EXCEEDS_MAX, every route costs more than maxFeeSats / maxFeeMsat; nothing was sent. DUPLICATE_PAYMENT, with error.paymentHash, for a keyed retry of a timed-out payment that can still settle'
+						},
+						'504': {
+							description:
+								'PAYMENT_TIMEOUT, with error.paymentHash. A keyed retry does not request a new invoice while that payment can still settle, and answers 200 once it completed'
 						}
 					}
 				}
@@ -3666,6 +3670,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								message: {
 									type: 'string',
 									description: 'Human-readable error message'
+								},
+								paymentHash: {
+									type: 'string',
+									description:
+										'The payment the error is about, hex (PAYMENT_TIMEOUT, and DUPLICATE_PAYMENT on a keyed /offer/pay retry)'
 								}
 							},
 							description: 'Error details (present when ok=false)'
