@@ -730,20 +730,20 @@ function readPsbtArg(arg?: string): string | undefined {
 async function handlePsbt(): Promise<void> {
 	const sub = filteredArgs[1];
 	switch (sub) {
-		case 'build':
+		case 'build': {
+			const pos = positionalArgs();
 			return outputResult(
 				await httpRequest('POST', '/psbt/build', {
 					outputs: [
 						{
-							address: filteredArgs[2],
-							amountSats: parseInt(filteredArgs[3], 10)
+							address: pos[2],
+							amountSats: parseInt(pos[3], 10)
 						}
 					],
-					satsPerVbyte: filteredArgs[4]
-						? parseInt(filteredArgs[4], 10)
-						: undefined
+					satsPerVbyte: pos[4] ? parseInt(pos[4], 10) : undefined
 				})
 			);
+		}
 		case 'import-signed': {
 			const pos = positionalArgs();
 			return outputResult(
