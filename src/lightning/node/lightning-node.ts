@@ -15252,13 +15252,14 @@ export class LightningNode extends EventEmitter {
 				this.currentBlockHeight
 			);
 			if (this._destroyed) return;
+			// Evicted, pruned or replaced while the lookup ran. A replacement
+			// queued itself, and that entry is not this lookup's to clear.
+			if (this.graph.getChannel(scid) !== channel) continue;
 			this.gossipFundingQueue.delete(scidHex);
 			if (verdict === 'unavailable') {
 				this.gossipFundingQueue.add(scidHex);
 				return;
 			}
-			// Evicted, pruned or replaced while the lookup ran.
-			if (this.graph.getChannel(scid) !== channel) continue;
 			if (verdict === 'proven') {
 				if (this.graph.markChannelFundingProven(scid)) {
 					this.safeStorage(

@@ -48,6 +48,8 @@ import {
 	classifyAnnouncedChannelFunding,
 	computeScriptHash
 } from '../../src/lightning/chain/chain-watcher';
+import { ElectrumBackend } from '../../src/lightning/chain/electrum-backend';
+import { Electrum } from '../../src/electrum';
 import { createFundingScript } from '../../src/lightning/script/funding';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { MessageType } from '../../src/lightning/message/types';
@@ -59,6 +61,11 @@ import {
 	REGTEST_CHAIN_HASH
 } from '../../src/lightning/channel/types';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+
+// The raw module.exports object, which src/electrum reads through live
+// bindings, so replacing a helper here is seen there.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const electrumHelpers = require('rn-electrum-client/helpers');
 
 function makeKeypair(): { privateKey: Buffer; publicKey: Buffer } {
 	let privKey: Buffer;
@@ -757,6 +764,42 @@ describe('Announced channel funding check (issue #1105)', () => {
 		expect(
 			await classifyAnnouncedChannelFunding(down, real.msg, 1010)
 		).to.equal('unavailable');
+	});
+
+	it('takes an Electrum error for the script hash as no answer', async () => {
+		const real = buildAnnouncement(990, REGTEST_CHAIN_HASH);
+		const electrum = Object.assign(Object.create(Electrum.prototype), {
+			connectedToElectrum: true,
+			_disconnected: false,
+			batchLimit: 10,
+			batchDelay: 0,
+			electrumNetwork: 'bitcoinRegtest'
+		}) as Electrum;
+		const original = electrumHelpers.listUnspentAddressScriptHashes;
+		electrumHelpers.listUnspentAddressScriptHashes =
+			async (): Promise<unknown> => ({
+				error: false,
+				data: [
+					{
+						jsonrpc: '2.0',
+						id: 1,
+						error: { code: -32603, message: 'busy' },
+						param: 'x',
+						data: {}
+					}
+				]
+			});
+		try {
+			expect(
+				await classifyAnnouncedChannelFunding(
+					new ElectrumBackend(electrum),
+					real.msg,
+					1010
+				)
+			).to.equal('unavailable');
+		} finally {
+			electrumHelpers.listUnspentAddressScriptHashes = original;
+		}
 	});
 });
 
