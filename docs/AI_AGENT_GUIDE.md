@@ -739,8 +739,10 @@ so nothing but the key can tell a retry from a new payment. That holds after a
 `504 PAYMENT_TIMEOUT` too, whose error carries the `paymentHash`: a keyed retry
 answers `200` with the payment once it completed and `409 DUPLICATE_PAYMENT`
 while an HTLC for it can still settle, and asks for a new invoice only once
-nothing sent for the first can (issue #1094). Query
-`GET /payment?paymentHash=...` rather than retrying in a loop.
+nothing sent for the first can (issue #1094). A keyed `POST /keysend` that
+timed out is answered the same way, since a rerun would pick a fresh preimage
+(issue #1133). Query `GET /payment?paymentHash=...` rather than retrying in a
+loop.
 
 The same applies to the on-chain sends: a retried `POST /send` that carries the
 key of a send already broadcast returns that broadcast's txid instead of
