@@ -935,8 +935,9 @@ describe('Recovery phase 6: the node drives durability', () => {
 
 	it('sizes payment metadata against the row settlement journals (issue #1160)', async function (): Promise<void> {
 		// Small enough that a direct payment's labels can fill what its
-		// PENDING batch leaves of the room without breaking the half-frame rule.
-		const CEILING = 2_000;
+		// PENDING batch or row leaves of the room without breaking the
+		// half-frame rule.
+		const CEILING = 1_700;
 		const storage = openStorage();
 		// No lease, so nothing is ever sent to these endpoints.
 		const replicator = replicatorFor(
@@ -1083,6 +1084,25 @@ describe('Recovery phase 6: the node drives durability', () => {
 		);
 		expect(() =>
 			node.setPaymentMetadata(fitting.paymentHash, { more: 'x' })
+		).to.throw(InvalidRequestError, /too large/);
+		// Settlement would replace a caller's _invoice with the invoice paid,
+		// so a long one overflows only the labelled row.
+		const labelledBytes = (invoice: string): number =>
+			encodedMutationBytes({
+				type: 'payment_state',
+				paymentHash: fitting.paymentHash.toString('hex'),
+				payment: {
+					...node.getPayment(fitting.paymentHash)!,
+					metadata: { note: fittingNote, _invoice: invoice }
+				}
+			});
+		const longInvoice = 'x'.repeat(room + 1 - labelledBytes(''));
+		expect(labelledBytes(longInvoice)).to.equal(room + 1);
+		expect(
+			JSON.stringify({ note: fittingNote, _invoice: longInvoice }).length
+		).to.be.at.most(room / 2);
+		expect(() =>
+			node.setPaymentMetadata(fitting.paymentHash, { _invoice: longInvoice })
 		).to.throw(InvalidRequestError, /too large/);
 		expect(payee.settleHeldHtlc(fitting.paymentHash, preimage)).to.equal(true);
 		expect(

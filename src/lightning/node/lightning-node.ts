@@ -24218,12 +24218,16 @@ export class LightningNode extends EventEmitter {
 		const existing = this.payments.get(hashHex);
 		if (existing) {
 			const merged = { ...existing.metadata, ...metadata };
-			// The settled row carries everything the labelled one does, and more.
-			const settled = this.settledPaymentMutation({
-				...existing,
-				metadata: merged
-			});
-			if (!this.paymentMetadataFits(merged, [settled])) {
+			const labelled = { ...existing, metadata: merged };
+			// Settlement replaces a caller's _invoice with the retry's invoice,
+			// so either row can be the larger one.
+			if (
+				!this.paymentMetadataFits(
+					merged,
+					[{ type: 'payment_state', paymentHash: hashHex, payment: labelled }],
+					[this.settledPaymentMutation(labelled)]
+				)
+			) {
 				throw new InvalidRequestError(
 					'payment metadata is too large for the recovery guardians to accept'
 				);
