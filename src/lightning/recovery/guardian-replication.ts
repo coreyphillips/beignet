@@ -44,6 +44,7 @@ import {
 	IGuardianGetHeadResponse
 } from './guardian';
 import {
+	GuardianProtocolMismatchError,
 	GuardianTransportError,
 	IBoundGuardianClient,
 	IGuardianSetContext,
@@ -373,11 +374,16 @@ export class GuardianReplicator {
 				try {
 					// The client's cached compatibility INFO: a guardian that
 					// answered any verb has a known limit without another request
-					// that could fail. That gate throws for a guardian outside our
-					// protocol range, whose limit still binds once it is back in it.
+					// that could fail. A guardian outside our protocol range is
+					// refused with the INFO it sent, and that limit still binds
+					// once it is back in range.
 					const info = await entry.client
 						.checkVersion()
-						.catch(() => entry.client.info());
+						.catch((error) =>
+							error instanceof GuardianProtocolMismatchError
+								? error.info
+								: entry.client.info()
+						);
 					if (
 						info.guardianId.equals(entry.expectedGuardianId) &&
 						info.maxCiphertextBytes > 0

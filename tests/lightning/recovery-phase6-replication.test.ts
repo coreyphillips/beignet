@@ -1108,9 +1108,12 @@ describe('Recovery phase 6: records over a guardian limit (issue #1014)', () => 
 		const { storage } = journaledStorage(1);
 		await registered(replicator(storage, bind(served)));
 
+		let infoCalls = 0;
 		const newer = instrument(served[0], {
 			rewrite: (path, response) => {
 				if (path !== '/info') return response;
+				// Only the first INFO answers, so its limit has to be kept.
+				if (++infoCalls > 1) throw new Error('connection refused');
 				return {
 					status: response.status,
 					body: encodeInfoResponse({
