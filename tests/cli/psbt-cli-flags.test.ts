@@ -71,6 +71,36 @@ http.request = (_options, callback) => {
 describe('CLI PSBT commands with trailing global flags', function () {
 	this.timeout(120_000);
 
+	it('does not send an auth flag as the omitted build fee rate', async () => {
+		const body = await captureRequestBody([
+			'psbt',
+			'build',
+			'address',
+			'1000',
+			'--api-key',
+			'secret'
+		]);
+		expect(body).to.deep.equal({
+			outputs: [{ address: 'address', amountSats: 1000 }]
+		});
+	});
+
+	it('still sends an explicit build fee rate before an auth flag', async () => {
+		const body = await captureRequestBody([
+			'psbt',
+			'build',
+			'address',
+			'1000',
+			'5',
+			'--api-token',
+			'secret'
+		]);
+		expect(body).to.deep.equal({
+			outputs: [{ address: 'address', amountSats: 1000 }],
+			satsPerVbyte: 5
+		});
+	});
+
 	it('does not send an auth flag as the omitted unsigned PSBT', async () => {
 		const body = await captureRequestBody([
 			'psbt',
