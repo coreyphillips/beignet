@@ -1170,6 +1170,7 @@ export class PeerManager extends EventEmitter {
 	 * Send a message to a specific peer.
 	 */
 	sendToPeer(pubkey: string, type: number, payload: Buffer): void {
+		pubkey = normalizeHexPubkey(pubkey);
 		const lanePeer = this.lanePeers.get(pubkey);
 		if (lanePeer) {
 			// Lane traffic answers to the lane gate, not the outbound gate:
@@ -1201,7 +1202,7 @@ export class PeerManager extends EventEmitter {
 	 * Get a connected peer by pubkey.
 	 */
 	getPeer(pubkey: string): Peer | undefined {
-		return this.peers.get(pubkey);
+		return this.peers.get(normalizeHexPubkey(pubkey));
 	}
 
 	/**
@@ -1228,7 +1229,7 @@ export class PeerManager extends EventEmitter {
 	 * Get a stored peer address.
 	 */
 	getPeerAddress(pubkey: string): { host: string; port: number } | undefined {
-		return this.peerAddresses.get(pubkey);
+		return this.peerAddresses.get(normalizeHexPubkey(pubkey));
 	}
 
 	/**

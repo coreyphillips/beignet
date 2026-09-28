@@ -110,6 +110,15 @@ describe('Mixed-case peer pubkeys (issue #1104)', function () {
 			expect(bobUpper).to.not.equal(bobId);
 
 			await alice.connectPeer(bobUpper, '127.0.0.1', bobPort);
+			const alicePeers = alice.getPeerManager()!;
+			expect(alicePeers.getPeer(bobUpper)).to.exist;
+			expect(alicePeers.getPeerAddress(bobUpper)).to.deep.equal({
+				host: '127.0.0.1',
+				port: bobPort
+			});
+			expect(() =>
+				alicePeers.sendToPeer(bobUpper, MessageType.PING, Buffer.alloc(4))
+			).not.to.throw();
 			const accepted = new Promise<void>((resolve) => {
 				alice.getChannelManager().once('channel:accepted', () => resolve());
 			});
@@ -141,6 +150,9 @@ describe('Mixed-case peer pubkeys (issue #1104)', function () {
 			expect(alice.getChannelManager().getPeerForChannel(channelId!)).to.equal(
 				bobId
 			);
+			expect(
+				alice.getChannelManager().getChannelsByPeer(bobUpper)
+			).to.deep.equal([channel]);
 
 			alice.disconnectPeer(bobUpper);
 			await waitFor(

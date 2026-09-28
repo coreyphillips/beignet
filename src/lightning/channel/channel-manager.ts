@@ -2702,6 +2702,7 @@ export class ChannelManager extends EventEmitter {
 	 * Get all channels for a specific peer.
 	 */
 	getChannelsByPeer(peerPubkey: string): Channel[] {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
 		const result: Channel[] = [];
 		for (const [id, channel] of this.channels) {
 			if (this.channelPeers.get(id) === peerPubkey) {
