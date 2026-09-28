@@ -16395,21 +16395,26 @@ export class LightningNode extends EventEmitter {
 		};
 		const htlcId = outChannel.getFullState().localHtlcCounter;
 		const htlcKey = `${channelId.toString('hex')}:offered-${htlcId}`;
-		// The labelled row has to fit a frame with the route it now carries.
+		// The labelled row has to fit a frame with the route it now carries,
+		// both beside its HTLC mapping and as settlement will journal it.
 		if (
 			metadata &&
-			!this.paymentMetadataFits(metadata, [
-				{
-					type: 'payment_state',
-					paymentHash: paymentHash.toString('hex'),
-					payment
-				},
-				{
-					type: 'htlc_payment_mapping',
-					htlcKey,
-					paymentHash: paymentHash.toString('hex')
-				}
-			])
+			!this.paymentMetadataFits(
+				metadata,
+				[
+					{
+						type: 'payment_state',
+						paymentHash: paymentHash.toString('hex'),
+						payment
+					},
+					{
+						type: 'htlc_payment_mapping',
+						htlcKey,
+						paymentHash: paymentHash.toString('hex')
+					}
+				],
+				[this.settledPaymentMutation(payment)]
+			)
 		) {
 			// sendPayment seeded a retry context for this attempt. Left behind,
 			// a later send of the hash would retry with the refused labels.
@@ -17032,7 +17037,11 @@ export class LightningNode extends EventEmitter {
 			{ type: 'payment_state', paymentHash: hashHex, payment },
 			{ type: 'htlc_payment_mapping', htlcKey, paymentHash: hashHex }
 		];
-		if (!this.paymentMetadataFits(paymentMetadata, mutations)) {
+		if (
+			!this.paymentMetadataFits(paymentMetadata, mutations, [
+				this.settledPaymentMutation(payment)
+			])
+		) {
 			throw new LightningPaymentError(
 				LightningErrorCode.INVALID_KEYSEND,
 				'metadata is too large for the recovery guardians to accept'
@@ -17147,22 +17156,22 @@ export class LightningNode extends EventEmitter {
 			createdAt: Date.now(),
 			...(metadata && { metadata: { ...metadata } })
 		};
-		// Dispatch gives the row a part's route and secrets, so the labelled
-		// row has to fit a frame with any of them before a part leaves.
+		// Dispatch gives the row a part's route and secrets, and settlement
+		// adds the preimage and invoice. The settled row has to fit a frame
+		// with any part's route before a part leaves.
 		if (
 			metadata &&
 			!multiRoute.parts.every((part) =>
 				this.paymentMetadataFits(metadata, [
-					{
-						type: 'payment_state',
-						paymentHash: hashHex,
-						payment: {
+					this.settledPaymentMutation(
+						{
 							...payment,
 							cltvBaseHeight: this.cltvBaseHeight(paymentHash),
 							route: part as IPaymentInfo['route'],
 							sharedSecrets: part.hops.map(() => Buffer.alloc(32))
-						}
-					}
+						},
+						invoiceStr
+					)
 				])
 			)
 		) {
@@ -24209,12 +24218,12 @@ export class LightningNode extends EventEmitter {
 		const existing = this.payments.get(hashHex);
 		if (existing) {
 			const merged = { ...existing.metadata, ...metadata };
-			const labelled: RecoveryMutation = {
-				type: 'payment_state',
-				paymentHash: hashHex,
-				payment: { ...existing, metadata: merged }
-			};
-			if (!this.paymentMetadataFits(merged, [labelled])) {
+			// The settled row carries everything the labelled one does, and more.
+			const settled = this.settledPaymentMutation({
+				...existing,
+				metadata: merged
+			});
+			if (!this.paymentMetadataFits(merged, [settled])) {
 				throw new InvalidRequestError(
 					'payment metadata is too large for the recovery guardians to accept'
 				);
@@ -24232,26 +24241,52 @@ export class LightningNode extends EventEmitter {
 	 * Metadata is the part of a row the caller sizes, and it may take half a
 	 * frame: the rest is left for what the payment carries and gains after
 	 * it is labelled (route, shared secrets, preimage, a retry's invoice).
-	 * Given the mutations that store it, their complete batch has to fit a
-	 * frame as well.
+	 * Given the batches that store the row, as it is written and as it
+	 * settles, each has to fit a frame as well.
 	 */
 	private paymentMetadataFits(
 		metadata: Record<string, string>,
-		mutations?: RecoveryMutation[]
+		...batches: RecoveryMutation[][]
 	): boolean {
 		const room = this.recoveryJournal?.mutationRoom();
 		if (room === undefined) return true;
 		if (Buffer.byteLength(JSON.stringify(metadata), 'utf8') > room / 2) {
 			return false;
 		}
-		if (mutations === undefined) return true;
-		return (
-			mutations.reduce(
-				(bytes, mutation, index) =>
-					bytes + encodedMutationBytes(mutation) + (index === 0 ? 0 : 1),
-				0
-			) <= room
+		return batches.every(
+			(mutations) =>
+				mutations.reduce(
+					(bytes, mutation, index) =>
+						bytes + encodedMutationBytes(mutation) + (index === 0 ? 0 : 1),
+					0
+				) <= room
 		);
+	}
+
+	/**
+	 * The payment_state settlement journals for a row: it adds the preimage,
+	 * the completion time and, for an invoice payment, the invoice string
+	 * from the retry context as metadata._invoice (handleHtlcFulfilled).
+	 */
+	private settledPaymentMutation(
+		payment: IPaymentInfo,
+		invoiceStr = this.paymentRetryContexts.get(
+			payment.paymentHash.toString('hex')
+		)?.invoiceStr
+	): RecoveryMutation {
+		return {
+			type: 'payment_state',
+			paymentHash: payment.paymentHash.toString('hex'),
+			payment: {
+				...payment,
+				status: PaymentStatus.COMPLETED,
+				preimage: payment.preimage ?? Buffer.alloc(32),
+				completedAt: Date.now(),
+				...(invoiceStr !== undefined && {
+					metadata: { ...payment.metadata, _invoice: invoiceStr }
+				})
+			}
+		};
 	}
 
 	/**

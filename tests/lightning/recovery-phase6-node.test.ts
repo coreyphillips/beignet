@@ -60,6 +60,7 @@ import {
 	deriveRecoveryRoot,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
+import { encodedMutationBytes } from '../../src/lightning/recovery/frame-codec';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	IChannelAnnouncementMessage,
@@ -928,6 +929,174 @@ describe('Recovery phase 6: the node drives durability', () => {
 		expect(node.getPayment(hash)).to.equal(undefined);
 		expect(storage.loadRecoveryFrames()).to.have.length(0);
 
+		node.destroy();
+		storage.close();
+	});
+
+	it('sizes payment metadata against the row settlement journals (issue #1160)', async function (): Promise<void> {
+		// Small enough that a direct payment's labels can fill what its
+		// PENDING batch leaves of the room without breaking the half-frame rule.
+		const CEILING = 2_000;
+		const storage = openStorage();
+		// No lease, so nothing is ever sent to these endpoints.
+		const replicator = replicatorFor(
+			storage,
+			GUARDIAN_IDS.map((id) => ({
+				client: new GuardianClient({
+					url: 'http://127.0.0.1:9',
+					guardianSetId: SET_ID
+				}),
+				expectedGuardianId: id
+			}))
+		);
+		replicator.maxRecordBytes = (): number => CEILING;
+		const barrier = barrierFor(replicator, () => null, 'async-remote');
+		const node = createNode(storage, {
+			enabled: true,
+			durability: 'async-remote',
+			barrier
+		});
+		const payee = createLoopbackNode('settled-metadata', 2);
+		connectNodes(node, payee);
+		node.handleNewBlock(1000);
+		payee.handleNewBlock(1000);
+		const channelId = openReadyChannel(node, payee);
+		const room = (
+			node as unknown as {
+				recoveryJournal: { mutationRoom(): number };
+			}
+		).recoveryJournal.mutationRoom();
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId
+		);
+		// Encoded bytes of the batch written before the HTLC left (the
+		// PENDING row and its mapping) and of the row settlement wrote.
+		const journaledBytes = (
+			hashHex: string
+		): { pending: number; settled: number } => {
+			const bytes = { pending: 0, settled: 0 };
+			for (const frame of journal.loadVerifiedFrames()) {
+				for (const mutation of frame.mutations) {
+					if (
+						mutation.type === 'htlc_payment_mapping' &&
+						mutation.paymentHash === hashHex
+					) {
+						bytes.pending = frame.mutations.reduce(
+							(sum, m, index) =>
+								sum + encodedMutationBytes(m) + (index === 0 ? 0 : 1),
+							0
+						);
+					}
+					if (
+						mutation.type === 'payment_state' &&
+						mutation.paymentHash === hashHex &&
+						mutation.payment.status === PaymentStatus.COMPLETED
+					) {
+						bytes.settled = encodedMutationBytes(mutation);
+					}
+				}
+			}
+			return bytes;
+		};
+		// Every invoice has this amount and description, so its rows differ
+		// from the probe's only by the length of the note.
+		const newInvoice = (): { bolt11: string; paymentHash: Buffer } =>
+			payee.createInvoice({ amountMsat: 5_000_000n, description: 'settled' });
+
+		const probe = newInvoice();
+		node.sendPaymentWithOptions(probe.bolt11, { metadata: { note: '' } });
+		expect(
+			(await node.awaitPaymentResolution(probe.paymentHash, 5_000)).status
+		).to.equal(PaymentStatus.COMPLETED);
+		const unlabelled = journaledBytes(probe.paymentHash.toString('hex'));
+
+		const htlcCounter = (): bigint =>
+			node.getChannelManager().getChannel(channelId)!.getFullState()
+				.localHtlcCounter;
+		const beforeCounter = htlcCounter();
+		const beforeFrames = storage.loadRecoveryFrames().length;
+
+		// The PENDING batch fills the room exactly, and settlement adds the
+		// preimage and the invoice: refused before a record or an HTLC exists.
+		const overflowing = newInvoice();
+		expect(overflowing.bolt11).to.have.length(probe.bolt11.length);
+		const overflowNote = 'x'.repeat(room - unlabelled.pending);
+		expect(JSON.stringify({ note: overflowNote }).length).to.be.at.most(
+			room / 2
+		);
+		expect(unlabelled.settled + overflowNote.length).to.be.above(room);
+		expect(() =>
+			node.sendPaymentWithOptions(overflowing.bolt11, {
+				metadata: { note: overflowNote }
+			})
+		).to.throw(InvalidRequestError, /too large/);
+		expect(node.getPayment(overflowing.paymentHash)).to.equal(undefined);
+		expect(htlcCounter()).to.equal(beforeCounter);
+		expect(storage.loadRecoveryFrames()).to.have.length(beforeFrames);
+
+		// The same labels on an MPP part's row, refused before a part leaves.
+		const mpp = newInvoice();
+		const route = node.getPayment(probe.paymentHash)!.route!;
+		expect(() =>
+			(
+				node as unknown as {
+					sendPaymentMpp(...args: unknown[]): IPaymentInfo;
+				}
+			).sendPaymentMpp(
+				mpp.bolt11,
+				{ paymentHash: mpp.paymentHash, amountMsat: 5_000_000n },
+				{
+					parts: [route],
+					totalAmountMsat: route.totalAmountMsat,
+					totalFeeMsat: route.totalFeeMsat
+				},
+				40,
+				undefined,
+				undefined,
+				{ note: overflowNote }
+			)
+		).to.throw(InvalidRequestError, /too large/);
+		expect(node.getPayment(mpp.paymentHash)).to.equal(undefined);
+		expect(htlcCounter()).to.equal(beforeCounter);
+		expect(storage.loadRecoveryFrames()).to.have.length(beforeFrames);
+
+		// Settles into exactly the room, so it is sent. The payee holds it,
+		// and while it is PENDING a further label would overflow the settled
+		// row, so that is refused.
+		const preimage = sha('settled-metadata-preimage');
+		const fitting = payee.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'settled',
+			hold: true,
+			paymentHash: crypto.createHash('sha256').update(preimage).digest()
+		});
+		expect(fitting.bolt11).to.have.length(probe.bolt11.length);
+		const fittingNote = 'x'.repeat(room - unlabelled.settled);
+		node.sendPaymentWithOptions(fitting.bolt11, {
+			metadata: { note: fittingNote }
+		});
+		expect(node.getPayment(fitting.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+		expect(() =>
+			node.setPaymentMetadata(fitting.paymentHash, { more: 'x' })
+		).to.throw(InvalidRequestError, /too large/);
+		expect(payee.settleHeldHtlc(fitting.paymentHash, preimage)).to.equal(true);
+		expect(
+			(await node.awaitPaymentResolution(fitting.paymentHash, 5_000)).status
+		).to.equal(PaymentStatus.COMPLETED);
+		expect(node.getPayment(fitting.paymentHash)!.metadata).to.deep.equal({
+			note: fittingNote,
+			_invoice: fitting.bolt11
+		});
+		expect(
+			journaledBytes(fitting.paymentHash.toString('hex')).settled
+		).to.equal(room);
+
+		payee.destroy();
 		node.destroy();
 		storage.close();
 	});
