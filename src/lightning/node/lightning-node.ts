@@ -16040,7 +16040,7 @@ export class LightningNode extends EventEmitter {
 					amountMsat,
 					maxCltvExpiryHeight: cltvCeiling,
 					policyOverrides: overrides,
-					metadata
+					metadata: metadata && { ...metadata }
 				});
 			}
 			return this.sendPaymentToRoute(
@@ -16162,7 +16162,7 @@ export class LightningNode extends EventEmitter {
 				amountMsat,
 				maxCltvExpiryHeight: cltvCeiling,
 				policyOverrides: overrides,
-				metadata
+				metadata: metadata && { ...metadata }
 			});
 		}
 
@@ -16397,6 +16397,9 @@ export class LightningNode extends EventEmitter {
 				}
 			])
 		) {
+			// sendPayment seeded a retry context for this attempt. Left behind,
+			// a later send of the hash would retry with the refused labels.
+			this.paymentRetryContexts.delete(paymentHash.toString('hex'));
 			throw new InvalidRequestError(
 				'payment metadata is too large for the recovery guardians to accept'
 			);
@@ -17111,6 +17114,29 @@ export class LightningNode extends EventEmitter {
 			createdAt: Date.now(),
 			...(metadata && { metadata: { ...metadata } })
 		};
+		// Dispatch gives the row a part's route and secrets, so the labelled
+		// row has to fit a frame with any of them before a part leaves.
+		if (
+			metadata &&
+			!multiRoute.parts.every((part) =>
+				this.paymentMetadataFits(metadata, [
+					{
+						type: 'payment_state',
+						paymentHash: hashHex,
+						payment: {
+							...payment,
+							cltvBaseHeight: this.cltvBaseHeight(paymentHash),
+							route: part as IPaymentInfo['route'],
+							sharedSecrets: part.hops.map(() => Buffer.alloc(32))
+						}
+					}
+				])
+			)
+		) {
+			throw new InvalidRequestError(
+				'payment metadata is too large for the recovery guardians to accept'
+			);
+		}
 		this.payments.set(hashHex, payment);
 		{
 			const paymentMutation = this.paymentMutation(paymentHash);
@@ -17133,7 +17159,7 @@ export class LightningNode extends EventEmitter {
 				retryCount: 0,
 				maxRetries: this.maxPaymentRetries,
 				maxCltvExpiryHeight,
-				metadata
+				metadata: metadata && { ...metadata }
 			});
 		}
 

@@ -318,13 +318,14 @@ describe('Payment retry actually dispatches', () => {
 			description: 'labelled'
 		});
 		const seen: Array<Record<string, string> | undefined> = [];
+		const labels = { requestId: 'req-1' };
 		const attempts = failEveryHtlcTemporarily(bob, () => {
 			seen.push(alice.getPayment(invoice.paymentHash)?.metadata);
+			// The caller changing its own object must not relabel a retry.
+			labels.requestId = 'changed';
 		});
 
-		alice.sendPaymentWithOptions(invoice.bolt11, {
-			metadata: { requestId: 'req-1' }
-		});
+		alice.sendPaymentWithOptions(invoice.bolt11, { metadata: labels });
 
 		expect(attempts()).to.be.greaterThan(1);
 		expect(seen).to.have.length(attempts());

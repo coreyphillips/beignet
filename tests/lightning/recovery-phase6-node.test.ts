@@ -829,6 +829,47 @@ describe('Recovery phase 6: the node drives durability', () => {
 				metadata: { note: 'x'.repeat(Math.floor(room / 2) - 20) }
 			})
 		).to.throw(InvalidRequestError, /too large/);
+		// A later send of the hash must not retry with the refused labels.
+		expect(
+			(
+				node as unknown as { paymentRetryContexts: Map<string, unknown> }
+			).paymentRetryContexts.has(farHash.toString('hex'))
+		).to.equal(false);
+
+		// The same labels over ten-hop MPP parts, refused before a part leaves.
+		const part = {
+			hops: Array.from({ length: 10 }, () => ({
+				pubkey: farPayee,
+				shortChannelId: Buffer.alloc(8),
+				amountToForwardMsat: 500n,
+				outgoingCltvValue: 400,
+				cltvExpiryDelta: 40,
+				feeBaseMsat: 1_000,
+				feeProportionalMillionths: 1
+			})),
+			totalAmountMsat: 500n,
+			totalCltvDelta: 400,
+			totalFeeMsat: 0n
+		};
+		expect(() =>
+			(
+				node as unknown as {
+					sendPaymentMpp(...args: unknown[]): IPaymentInfo;
+				}
+			).sendPaymentMpp(
+				farInvoice,
+				{
+					paymentHash: farHash,
+					paymentSecret: sha('far-invoice-secret'),
+					amountMsat: 1_000n
+				},
+				{ parts: [part, part], totalAmountMsat: 1_000n, totalFeeMsat: 0n },
+				40,
+				undefined,
+				undefined,
+				{ note: 'x'.repeat(Math.floor(room / 2) - 20) }
+			)
+		).to.throw(InvalidRequestError, /too large/);
 
 		expect(node.getPayment(second.paymentHash)).to.equal(undefined);
 		expect(node.getPayment(farHash)).to.equal(undefined);
