@@ -10090,7 +10090,8 @@ export class BeignetNode extends EventEmitter {
 	/**
 	 * What the node knows of a stored claim's payment at boot: 'settled' when
 	 * the HTLC view or the durable row reports the hash paid, judged the way
-	 * the engine judges a duplicate (#975); 'live' while the record is
+	 * the engine judges a duplicate (#975) except that a keysend row's own
+	 * preimage is not proof (#1161); 'live' while the record is
 	 * PENDING or an HTLC is still out for it; 'gone' otherwise. A durable row
 	 * that cannot be read is logged and reads as live: a reservation kept too
 	 * long is the safe side of that error.
@@ -10108,7 +10109,10 @@ export class BeignetNode extends EventEmitter {
 			if (
 				durable?.direction === PaymentDirection.OUTGOING &&
 				(durable.status === PaymentStatus.COMPLETED ||
-					durable.preimage !== undefined ||
+					// A keysend row holds the preimage its sender picked before the
+					// HTLC went out. A learned one is saved as its own row first.
+					(durable.preimage !== undefined &&
+						durable.metadata?._keysend !== 'true') ||
 					this.storage.loadPreimage(paymentHashHex) !== null)
 			) {
 				return 'settled';
