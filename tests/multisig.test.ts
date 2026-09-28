@@ -635,6 +635,64 @@ describe('Multisig P2WSH Wallets', function () {
 				expect(sendMax.error).to.be.instanceOf(MultisigSpendError);
 			}
 		});
+
+		it('neither cosigners nor the coordinator accept a previous transaction worth more than the build (#1098)', async () => {
+			const utxo = await makeMultisigUtxo(walletA, { index: 0, value: 500000 });
+			const prevTx = new bitcoin.Transaction();
+			prevTx.addInput(Buffer.alloc(32, 7), 0);
+			prevTx.addOutput(
+				bitcoin.address.toOutputScript(utxo.address, regtest),
+				1000000
+			);
+			const savedUtxos = walletA.data.utxos;
+			walletA.data.utxos = [{ ...utxo, tx_hash: prevTx.getId() }];
+			try {
+				// Offline, so the build attaches no previous transaction and prices
+				// the fee from the reported 500000.
+				const built = await walletA.buildPsbt({
+					address: RECIPIENT,
+					amount: 200000,
+					satsPerByte: 2,
+					shuffleOutputs: false
+				});
+				if (built.isErr()) throw built.error;
+				const psbt = bitcoin.Psbt.fromBase64(built.value.psbtBase64, {
+					network: regtest
+				});
+				expect(psbt.data.inputs[0].nonWitnessUtxo).to.equal(undefined);
+				psbt.updateInput(0, { nonWitnessUtxo: prevTx.toBuffer() });
+				// B holds no record of the coin, so only witnessUtxo stops it.
+				for (const wallet of [walletA, walletB]) {
+					const res = wallet.signPsbtWithOurKey(psbt.toBase64());
+					expect(res.isErr()).to.equal(true);
+					if (res.isOk()) return;
+					expect(res.error.message).to.contain(
+						'holds 1000000 sats, not the 500000 its witnessUtxo records'
+					);
+				}
+				// Once a signer copies the real output into witnessUtxo, recordless
+				// cosigners have nothing left to compare, so the coordinator's
+				// record must stop the import.
+				psbt.data.inputs[0].witnessUtxo = {
+					script: psbt.data.inputs[0].witnessUtxo!.script,
+					value: 1000000
+				};
+				const signedB = walletB.signPsbtWithOurKey(psbt.toBase64());
+				if (signedB.isErr()) throw signedB.error;
+				const signed = bitcoin.Psbt.fromBase64(signedB.value, {
+					network: regtest
+				});
+				signed.signInput(0, rootC.derivePath(`${ACCOUNT_PATH}/0/0`));
+				const imported = walletA.importSignedPsbt(signed.toBase64());
+				expect(imported.isErr()).to.equal(true);
+				if (imported.isOk()) return;
+				expect(imported.error.message).to.contain(
+					'holds 1000000 sats, not the 500000 this wallet records'
+				);
+			} finally {
+				walletA.data.utxos = savedUtxos;
+			}
+		});
 	});
 
 	describe('Descriptor export', () => {
