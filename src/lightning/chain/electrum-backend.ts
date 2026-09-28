@@ -468,7 +468,9 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 						scriptHash,
 						publicKey: ''
 					}
-				}
+				},
+				// Callers read an empty list as "no such output".
+				rejectFailedEntries: true
 			}),
 			`listUnspent(${scriptHash.slice(0, 8)}...)`
 		);

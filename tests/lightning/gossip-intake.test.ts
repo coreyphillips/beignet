@@ -40,8 +40,17 @@ import {
 	IChannelUpdateMessage,
 	IGraphChannel,
 	DEFAULT_PRUNE_MAX_AGE,
-	MAX_GOSSIP_TIMESTAMP_SKEW
+	MAX_GOSSIP_TIMESTAMP_SKEW,
+	decodeShortChannelId
 } from '../../src/lightning/gossip/types';
+import {
+	IChainBackend,
+	classifyAnnouncedChannelFunding,
+	computeScriptHash
+} from '../../src/lightning/chain/chain-watcher';
+import { ElectrumBackend } from '../../src/lightning/chain/electrum-backend';
+import { Electrum } from '../../src/electrum';
+import { createFundingScript } from '../../src/lightning/script/funding';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { MessageType } from '../../src/lightning/message/types';
 import { Network } from '../../src/lightning/invoice/types';
@@ -52,6 +61,11 @@ import {
 	REGTEST_CHAIN_HASH
 } from '../../src/lightning/channel/types';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+
+// The raw module.exports object, which src/electrum reads through live
+// bindings, so replacing a helper here is seen there.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const electrumHelpers = require('rn-electrum-client/helpers');
 
 function makeKeypair(): { privateKey: Buffer; publicKey: Buffer } {
 	let privKey: Buffer;
@@ -149,6 +163,52 @@ function buildUpdate(
 	const signature = signChannelUpdate(placeholderPayload, signer.privateKey);
 	const msg = { ...placeholder, signature };
 	return { msg, payload: encodeChannelUpdateMessage(msg) };
+}
+
+type TUnspent = Awaited<ReturnType<NonNullable<IChainBackend['listUnspent']>>>;
+
+/** A chain backend holding exactly the given announcements' funding outputs. */
+function fundingBackend(
+	funded: Array<{ ann: ReturnType<typeof buildAnnouncement>; txid: string }>
+): IChainBackend {
+	const unspent = new Map<string, TUnspent>();
+	const positions = new Map<string, number>();
+	for (const { ann, txid } of funded) {
+		const scid = decodeShortChannelId(ann.msg.shortChannelId);
+		const script = createFundingScript(
+			ann.msg.bitcoinKey1,
+			ann.msg.bitcoinKey2
+		).p2wshOutput;
+		unspent.set(computeScriptHash(script), [
+			{
+				txid,
+				outputIndex: scid.outputIndex,
+				valueSat: 100_000,
+				height: scid.block
+			}
+		]);
+		positions.set(txid, scid.txIndex);
+	}
+	return {
+		subscribeToHeaders: async (): Promise<void> => {},
+		subscribeToScriptHash: async (): Promise<void> => {},
+		getScriptHashHistory: async (): Promise<[]> => [],
+		getTransaction: async (): Promise<Buffer> => {
+			throw new Error('unused');
+		},
+		broadcastTransaction: async (): Promise<string> => {
+			throw new Error('unused');
+		},
+		listUnspent: async (scriptHash: string): Promise<TUnspent> =>
+			unspent.get(scriptHash) ?? [],
+		getTransactionMerkleProof: async (
+			txid: string,
+			height: number
+		): Promise<{ blockHeight: number; txIndex: number }> => ({
+			blockHeight: height,
+			txIndex: positions.get(txid) ?? 0
+		})
+	};
 }
 
 describe('Gossip pre-verification gates (NetworkGraph)', () => {
@@ -449,7 +509,36 @@ describe('Gossip channel ceiling (NetworkGraph, issue #446)', () => {
 		expect(evictedNodes).to.have.length(2);
 	});
 
-	it('a full graph of verified entries refuses even verified admissions', () => {
+	it('signed channels with unproven funding stay evictable (issue #1105)', () => {
+		// Anyone can sign a channel_announcement with four keys they made up,
+		// so a full graph of signed fabrications must not lock out a real one.
+		NetworkGraph.MAX_CHANNELS = 2;
+		const evicted: string[] = [];
+		const graph = new NetworkGraph(REGTEST_CHAIN_HASH, {
+			onChannelEvicted: (scidHex): void => {
+				evicted.push(scidHex);
+			}
+		});
+		const fake1 = buildAnnouncement(740, REGTEST_CHAIN_HASH);
+		const fake2 = buildAnnouncement(741, REGTEST_CHAIN_HASH);
+		const real = buildAnnouncement(742, REGTEST_CHAIN_HASH);
+		graph.addChannelAnnouncement(fake1.msg, { verified: true });
+		graph.addChannelAnnouncement(fake2.msg, { verified: true });
+
+		// Unverified admissions still displace nothing.
+		expect(
+			graph.addChannelAnnouncement(real.msg, { verified: 'deferred' })
+		).to.equal(false);
+		expect(graph.wouldAcceptChannelAnnouncement(real.msg)).to.equal(true);
+		expect(graph.addChannelAnnouncement(real.msg, { verified: true })).to.equal(
+			true
+		);
+		expect(graph.getChannelCount()).to.equal(2);
+		expect(graph.getChannel(real.msg.shortChannelId)).to.not.equal(undefined);
+		expect(evicted).to.deep.equal([fake1.msg.shortChannelId.toString('hex')]);
+	});
+
+	it('a full graph of funding-proven entries refuses even verified admissions', () => {
 		NetworkGraph.MAX_CHANNELS = 2;
 		const evicted: string[] = [];
 		const graph = new NetworkGraph(REGTEST_CHAIN_HASH, {
@@ -462,6 +551,12 @@ describe('Gossip channel ceiling (NetworkGraph, issue #446)', () => {
 		const ann3 = buildAnnouncement(718, REGTEST_CHAIN_HASH);
 		graph.addChannelAnnouncement(ann1.msg, { verified: true });
 		graph.addChannelAnnouncement(ann2.msg, { verified: true });
+		expect(graph.markChannelFundingProven(ann1.msg.shortChannelId)).to.equal(
+			true
+		);
+		expect(graph.markChannelFundingProven(ann2.msg.shortChannelId)).to.equal(
+			true
+		);
 		expect(graph.wouldAcceptChannelAnnouncement(ann3.msg)).to.equal(false);
 		expect(graph.addChannelAnnouncement(ann3.msg, { verified: true })).to.equal(
 			false
@@ -491,8 +586,8 @@ describe('Gossip channel ceiling (NetworkGraph, issue #446)', () => {
 			graph.getChannel(ann1.msg.shortChannelId)!.announcementVerified
 		).to.equal(true);
 
-		// The upgraded entry left the evictable pool: a verified admission at
-		// the ceiling now takes the remaining deferred one.
+		// The upgraded entry now ranks behind the unverified one: a verified
+		// admission at the ceiling takes the remaining deferred entry first.
 		const ann3 = buildAnnouncement(721, REGTEST_CHAIN_HASH);
 		expect(graph.addChannelAnnouncement(ann3.msg, { verified: true })).to.equal(
 			true
@@ -500,21 +595,27 @@ describe('Gossip channel ceiling (NetworkGraph, issue #446)', () => {
 		expect(evicted).to.deep.equal([ann2.msg.shortChannelId.toString('hex')]);
 	});
 
-	it('serve-time resolution moves an entry out of the evictable pool', () => {
-		NetworkGraph.MAX_CHANNELS = 1;
+	it('serve-time resolution moves an entry behind the unverified ones', () => {
+		NetworkGraph.MAX_CHANNELS = 2;
 		const evicted: string[] = [];
+		const unfunded: string[] = [];
 		const graph = new NetworkGraph(REGTEST_CHAIN_HASH, {
 			onChannelEvicted: (scidHex): void => {
 				evicted.push(scidHex);
+			},
+			onFundingUnproven: (scidHex): void => {
+				unfunded.push(scidHex);
 			}
 		});
 		const ann1 = buildAnnouncement(722, REGTEST_CHAIN_HASH);
-		expect(
-			graph.addChannelAnnouncement(ann1.msg, { verified: 'deferred' })
-		).to.equal(true);
+		const ann2 = buildAnnouncement(723, REGTEST_CHAIN_HASH);
+		graph.addChannelAnnouncement(ann1.msg, { verified: 'deferred' });
+		graph.addChannelAnnouncement(ann2.msg, { verified: 'deferred' });
+		expect(unfunded).to.deep.equal([]);
 
 		// A gossip query resolves the deferred announcement (real signatures,
-		// so it settles verified) and the eviction index must follow.
+		// so it settles verified), the eviction indexes must follow, and the
+		// owner is told the funding still needs checking.
 		const served = graph.getGossipMessagesForChannels([
 			ann1.msg.shortChannelId
 		]);
@@ -522,13 +623,38 @@ describe('Gossip channel ceiling (NetworkGraph, issue #446)', () => {
 		expect(
 			graph.getChannel(ann1.msg.shortChannelId)!.announcementVerified
 		).to.equal(true);
+		expect(unfunded).to.deep.equal([ann1.msg.shortChannelId.toString('hex')]);
 
-		const ann2 = buildAnnouncement(723, REGTEST_CHAIN_HASH);
-		expect(graph.addChannelAnnouncement(ann2.msg, { verified: true })).to.equal(
-			false
+		const ann3 = buildAnnouncement(724, REGTEST_CHAIN_HASH);
+		expect(graph.addChannelAnnouncement(ann3.msg, { verified: true })).to.equal(
+			true
 		);
 		expect(graph.getChannel(ann1.msg.shortChannelId)).to.not.equal(undefined);
-		expect(evicted).to.deep.equal([]);
+		expect(evicted).to.deep.equal([ann2.msg.shortChannelId.toString('hex')]);
+	});
+
+	it('a funding proof restores only on a verified row', () => {
+		const graph = new NetworkGraph(REGTEST_CHAIN_HASH);
+		const proven = buildAnnouncement(750, REGTEST_CHAIN_HASH);
+		const unverified = buildAnnouncement(751, REGTEST_CHAIN_HASH);
+		graph.restoreChannel(
+			makeRow(proven, { announcementVerified: true, fundingVerified: true })
+		);
+		graph.restoreChannel(
+			makeRow(unverified, {
+				announcementVerified: false,
+				fundingVerified: true
+			})
+		);
+		expect(
+			graph.getChannel(proven.msg.shortChannelId)!.fundingVerified
+		).to.equal(true);
+		expect(
+			graph.getChannel(unverified.msg.shortChannelId)!.fundingVerified
+		).to.equal(undefined);
+		expect(
+			graph.markChannelFundingProven(unverified.msg.shortChannelId)
+		).to.equal(false);
 	});
 
 	it('restoreChannel enforces the ceiling with the same preference', () => {
@@ -570,6 +696,110 @@ describe('Gossip channel ceiling (NetworkGraph, issue #446)', () => {
 		expect(graph.getChannelCount()).to.equal(1);
 		expect(graph.getChannel(ann4.msg.shortChannelId)).to.equal(undefined);
 		expect(evicted).to.have.length(2);
+	});
+});
+
+describe('Announced channel funding check (issue #1105)', () => {
+	it('proves a real output and refutes only on a conclusive answer', async () => {
+		const real = buildAnnouncement(990, REGTEST_CHAIN_HASH);
+		const backend = fundingBackend([{ ann: real, txid: 'cd'.repeat(32) }]);
+		expect(
+			await classifyAnnouncedChannelFunding(backend, real.msg, 1010)
+		).to.equal('proven');
+
+		// No output: refuted once the SCID is deep, but a recent one may just
+		// be missing from a server behind our tip.
+		const fake = buildAnnouncement(900, REGTEST_CHAIN_HASH);
+		expect(
+			await classifyAnnouncedChannelFunding(backend, fake.msg, 1010)
+		).to.equal('refuted');
+		expect(
+			await classifyAnnouncedChannelFunding(backend, fake.msg, 905)
+		).to.equal('unknown');
+
+		// The real output claimed under another transaction index is never
+		// proven, and not refuted either.
+		const otherIndex = {
+			...real.msg,
+			shortChannelId: encodeShortChannelId({
+				block: 990,
+				txIndex: 7,
+				outputIndex: 0
+			})
+		};
+		expect(
+			await classifyAnnouncedChannelFunding(backend, otherIndex, 1010)
+		).to.equal('unknown');
+
+		// ElectrumBackend turns a failed proof into index 0, so a claim of
+		// index 0 is never taken as proven.
+		const failedProof: IChainBackend = {
+			...backend,
+			getTransactionMerkleProof: async (
+				_txid: string,
+				height: number
+			): Promise<{ blockHeight: number; txIndex: number }> => ({
+				blockHeight: height,
+				txIndex: 0
+			})
+		};
+		const coinbaseIndex = {
+			...real.msg,
+			shortChannelId: encodeShortChannelId({
+				block: 990,
+				txIndex: 0,
+				outputIndex: 0
+			})
+		};
+		expect(
+			await classifyAnnouncedChannelFunding(failedProof, coinbaseIndex, 1010)
+		).to.equal('unknown');
+
+		const down: IChainBackend = {
+			...backend,
+			listUnspent: async (): Promise<TUnspent> => {
+				throw new Error('Electrum not connected');
+			}
+		};
+		expect(
+			await classifyAnnouncedChannelFunding(down, real.msg, 1010)
+		).to.equal('unavailable');
+	});
+
+	it('takes an Electrum error for the script hash as no answer', async () => {
+		const real = buildAnnouncement(990, REGTEST_CHAIN_HASH);
+		const electrum = Object.assign(Object.create(Electrum.prototype), {
+			connectedToElectrum: true,
+			_disconnected: false,
+			batchLimit: 10,
+			batchDelay: 0,
+			electrumNetwork: 'bitcoinRegtest'
+		}) as Electrum;
+		const original = electrumHelpers.listUnspentAddressScriptHashes;
+		electrumHelpers.listUnspentAddressScriptHashes =
+			async (): Promise<unknown> => ({
+				error: false,
+				data: [
+					{
+						jsonrpc: '2.0',
+						id: 1,
+						error: { code: -32603, message: 'busy' },
+						param: 'x',
+						data: {}
+					}
+				]
+			});
+		try {
+			expect(
+				await classifyAnnouncedChannelFunding(
+					new ElectrumBackend(electrum),
+					real.msg,
+					1010
+				)
+			).to.equal('unavailable');
+		} finally {
+			electrumHelpers.listUnspentAddressScriptHashes = original;
+		}
 	});
 });
 
@@ -1138,5 +1368,143 @@ describe('Gossip intake queue (LightningNode)', () => {
 		feed(MessageType.NODE_ANNOUNCEMENT, real.payload);
 		await node.flushGossip();
 		expect(captures).to.equal(1);
+	});
+
+	describe('funding checks (issue #1105)', () => {
+		const savedCap = NetworkGraph.MAX_CHANNELS;
+		afterEach(() => {
+			NetworkGraph.MAX_CHANNELS = savedCap;
+		});
+
+		const eagerNode = (backend?: IChainBackend): void => {
+			node.destroy();
+			storage = new SqliteStorage(dbPath);
+			storage.open();
+			node = new LightningNode(makeConfig(true));
+			if (backend) {
+				(node as unknown as { _chainBackend: IChainBackend })._chainBackend =
+					backend;
+			}
+			node.handleNewBlock(1010);
+		};
+		const feedChannel = (ann: ReturnType<typeof buildAnnouncement>): void => {
+			const now = Math.floor(Date.now() / 1000);
+			feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
+			feed(
+				MessageType.CHANNEL_UPDATE,
+				buildUpdate(ann, now, 0, REGTEST_CHAIN_HASH).payload
+			);
+		};
+		/** Wait out the funding-check pass the intake or a block started. */
+		const settleFundingChecks = async (): Promise<void> => {
+			const internals = node as unknown as { gossipFundingChecking: boolean };
+			for (let i = 0; i < 100 && internals.gossipFundingChecking; i++) {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			}
+			expect(internals.gossipFundingChecking).to.equal(false);
+		};
+
+		it('signed fabrications cannot lock a real channel out of a full graph', async () => {
+			eagerNode();
+			NetworkGraph.MAX_CHANNELS = 2;
+			feedChannel(buildAnnouncement(900, REGTEST_CHAIN_HASH));
+			feedChannel(buildAnnouncement(901, REGTEST_CHAIN_HASH));
+			await node.flushGossip();
+			expect(graphOf(node).getChannelCount()).to.equal(2);
+
+			const real = buildAnnouncement(902, REGTEST_CHAIN_HASH);
+			feedChannel(real);
+			await node.flushGossip();
+			expect(graphOf(node).getChannel(real.msg.shortChannelId)).to.not.equal(
+				undefined
+			);
+			expect(graphOf(node).getChannelCount()).to.equal(2);
+		});
+
+		it('drops a fabricated channel and keeps a proven one at the ceiling', async () => {
+			const fake = buildAnnouncement(910, REGTEST_CHAIN_HASH);
+			const real = buildAnnouncement(911, REGTEST_CHAIN_HASH);
+			eagerNode(fundingBackend([{ ann: real, txid: 'ab'.repeat(32) }]));
+			feedChannel(fake);
+			feedChannel(real);
+			await node.flushGossip();
+			await settleFundingChecks();
+
+			expect(graphOf(node).getChannel(fake.msg.shortChannelId)).to.equal(
+				undefined
+			);
+			expect(
+				graphOf(node).getChannel(real.msg.shortChannelId)!.fundingVerified
+			).to.equal(true);
+			const rows = storage.loadAllGossipChannels();
+			expect(rows).to.have.length(1);
+			expect(rows[0].shortChannelId.equals(real.msg.shortChannelId)).to.equal(
+				true
+			);
+			expect(rows[0].fundingVerified).to.equal(true);
+
+			// Proven, it holds its slot against a later signed fabrication.
+			NetworkGraph.MAX_CHANNELS = 1;
+			const flood = buildAnnouncement(912, REGTEST_CHAIN_HASH);
+			feedChannel(flood);
+			await node.flushGossip();
+			expect(graphOf(node).getChannel(flood.msg.shortChannelId)).to.equal(
+				undefined
+			);
+			expect(graphOf(node).getChannel(real.msg.shortChannelId)).to.not.equal(
+				undefined
+			);
+		});
+
+		it('the own-channel pass proves only our own announcement', () => {
+			const squatter = buildAnnouncement(930, REGTEST_CHAIN_HASH);
+			const ours = buildAnnouncement(930, REGTEST_CHAIN_HASH);
+			const graph = graphOf(node);
+			graph.addChannelAnnouncement(squatter.msg, { verified: true });
+			const announce = (): void => {
+				const now = Math.floor(Date.now() / 1000);
+				node
+					.getChannelManager()
+					.emit(
+						'announcement:ready',
+						crypto.randomBytes(32),
+						ours.payload,
+						buildUpdate(ours, now, 0, REGTEST_CHAIN_HASH).payload
+					);
+			};
+
+			announce();
+			const held = graph.getChannel(ours.msg.shortChannelId)!;
+			expect(held.nodeId1.equals(squatter.msg.nodeId1)).to.equal(true);
+			expect(held.fundingVerified).to.equal(undefined);
+
+			graph.removeChannel(squatter.msg.shortChannelId);
+			announce();
+			expect(
+				graph.getChannel(ours.msg.shortChannelId)!.fundingVerified
+			).to.equal(true);
+		});
+
+		it('a check the backend cannot answer resumes on the next block', async () => {
+			const real = buildAnnouncement(920, REGTEST_CHAIN_HASH);
+			const backend = fundingBackend([{ ann: real, txid: 'ef'.repeat(32) }]);
+			const answer = backend.listUnspent!;
+			let connected = false;
+			backend.listUnspent = (scriptHash: string): Promise<TUnspent> =>
+				connected
+					? answer(scriptHash)
+					: Promise.reject(new Error('Electrum not connected'));
+			eagerNode(backend);
+			feedChannel(real);
+			await node.flushGossip();
+			await settleFundingChecks();
+			const channel = graphOf(node).getChannel(real.msg.shortChannelId)!;
+			expect(channel.fundingVerified).to.equal(undefined);
+
+			connected = true;
+			node.handleNewBlock(1011);
+			await settleFundingChecks();
+			expect(channel.fundingVerified).to.equal(true);
+		});
 	});
 });

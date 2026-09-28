@@ -381,6 +381,7 @@ import {
 import { FeatureFlags, Feature } from '../features/flags';
 import {
 	ChainWatcher,
+	classifyAnnouncedChannelFunding,
 	classifyRemoteFundingInput,
 	computeScriptHash
 } from '../chain/chain-watcher';
@@ -1037,6 +1038,13 @@ export class LightningNode extends EventEmitter {
 	private gossipIntakeDropped = 0;
 	private static readonly GOSSIP_INTAKE_MAX = 30_000;
 	private static readonly GOSSIP_INTAKE_SLICE_MS = 10;
+	/**
+	 * SCIDs of verified graph channels whose funding output is still to be
+	 * checked on chain, oldest first (issue #1105). Only filled when the chain
+	 * backend can answer the check.
+	 */
+	private gossipFundingQueue: Set<string> = new Set();
+	private gossipFundingChecking = false;
 	/** Our own node_announcement (cached so we can re-broadcast it for propagation). */
 	private _ownNodeAnnouncement?: Buffer;
 	/** Our own channel_announcement + channel_update per channel, cached for re-broadcast. */
@@ -1858,6 +1866,7 @@ export class LightningNode extends EventEmitter {
 			// Ceiling evictions (issue #446) must reach disk, or the evicted
 			// rows re-inflate the graph on the next restore.
 			onChannelEvicted: (scidHex) => {
+				this.gossipFundingQueue.delete(scidHex);
 				if (typeof this.storage?.deleteGossipChannel === 'function') {
 					this.safeStorage(
 						() => this.storage!.deleteGossipChannel!(scidHex),
@@ -1883,6 +1892,14 @@ export class LightningNode extends EventEmitter {
 						'deleteGossipNode'
 					);
 				}
+			},
+			onFundingUnproven: (scidHex): void => {
+				const backend = this._chainBackend;
+				if (!backend?.listUnspent || !backend.getTransactionMerkleProof) {
+					return;
+				}
+				this.gossipFundingQueue.add(scidHex);
+				this.checkGossipFunding();
 			}
 		});
 
@@ -5220,6 +5237,16 @@ export class LightningNode extends EventEmitter {
 					this.graph.addChannelAnnouncement(annMsg, {
 						verified: announcementValid
 					});
+					// Our own funding output needs no chain lookup to prove it. A
+					// row held under this SCID with other endpoints is someone
+					// else's and refused ours, so it gets no such pass.
+					const held = this.graph.getChannel(annMsg.shortChannelId);
+					if (
+						held?.nodeId1.equals(annMsg.nodeId1) &&
+						held.nodeId2.equals(annMsg.nodeId2)
+					) {
+						this.graph.markChannelFundingProven(annMsg.shortChannelId);
+					}
 					const updateMsg = decodeChannelUpdateMessage(signedChannelUpdate);
 					let updateValid = false;
 					try {
@@ -15178,6 +15205,77 @@ export class LightningNode extends EventEmitter {
 			this.gossipIntakeDraining
 		) {
 			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+	}
+
+	/**
+	 * Check queued channels' funding outputs on chain, one at a time (issue
+	 * #1105). A signature only proves keys the announcement carries, so this
+	 * is what separates a real channel, kept at the graph ceiling from then
+	 * on, from a fabricated or closed one, which is dropped. Without an answer
+	 * the pass stops until the next block, and the channel goes to the back
+	 * of the queue so one failing lookup cannot hold up the rest.
+	 */
+	private checkGossipFunding(): void {
+		if (this.gossipFundingChecking || this.gossipFundingQueue.size === 0) {
+			return;
+		}
+		this.gossipFundingChecking = true;
+		// Deferred: the caller may still be settling the channel (our own is
+		// marked proven right after it is added).
+		setImmediate(() => {
+			void this.runGossipFundingChecks().finally(() => {
+				this.gossipFundingChecking = false;
+			});
+		});
+	}
+
+	private async runGossipFundingChecks(): Promise<void> {
+		while (!this._destroyed) {
+			const backend = this._chainBackend;
+			const next = this.gossipFundingQueue.values().next();
+			if (!backend || next.done) return;
+			const scidHex = next.value;
+			const scid = Buffer.from(scidHex, 'hex');
+			const channel = this.graph.getChannel(scid);
+			if (
+				!channel ||
+				channel.announcementVerified !== true ||
+				channel.fundingVerified === true
+			) {
+				this.gossipFundingQueue.delete(scidHex);
+				continue;
+			}
+			const verdict = await classifyAnnouncedChannelFunding(
+				backend,
+				channel.announcement,
+				this.currentBlockHeight
+			);
+			if (this._destroyed) return;
+			// Evicted, pruned or replaced while the lookup ran. A replacement
+			// queued itself, and that entry is not this lookup's to clear.
+			if (this.graph.getChannel(scid) !== channel) continue;
+			this.gossipFundingQueue.delete(scidHex);
+			if (verdict === 'unavailable') {
+				this.gossipFundingQueue.add(scidHex);
+				return;
+			}
+			if (verdict === 'proven') {
+				if (this.graph.markChannelFundingProven(scid)) {
+					this.safeStorage(
+						() => this.storage!.saveGossipChannel(scidHex, channel),
+						'saveGossipChannel'
+					);
+				}
+			} else if (verdict === 'refuted') {
+				this.graph.removeChannel(scid);
+				if (typeof this.storage?.deleteGossipChannel === 'function') {
+					this.safeStorage(
+						() => this.storage!.deleteGossipChannel!(scidHex),
+						'deleteGossipChannel'
+					);
+				}
+			}
 		}
 	}
 
@@ -26081,6 +26179,8 @@ export class LightningNode extends EventEmitter {
 		this.retryFailedTerminalPersists();
 		this.retrySpliceCloseRedrives();
 		this.retryPendingOutputWatches();
+		// Funding checks a backend outage paused (issue #1105).
+		this.checkGossipFunding();
 		// Re-CPFP any stuck anchor force-close commitment at the current live feerate
 		// so a fee spike after the original broadcast cannot pin the package (M1).
 		this.channelManager.reCpfpStuckCommitments(
