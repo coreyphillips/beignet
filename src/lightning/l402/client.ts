@@ -135,7 +135,9 @@ export interface IL402FetchOptions {
 	 * Pay a challenge that arrived from a different origin than the one
 	 * requested, after following redirects. Default false: a redirect chain
 	 * otherwise lets any site the caller trusts hand the payment to one it
-	 * does not.
+	 * does not. When allowed, the credential is stored for the origin that
+	 * issued the challenge and the paid retry goes straight to it, never back
+	 * through the redirecting URL. Only GET and HEAD requests qualify.
 	 */
 	allowCrossOriginChallenge?: boolean;
 	/**
@@ -275,6 +277,23 @@ export async function l402Fetch(
 	// reason rather than for whatever its invoice happens to look like.
 	assertSameOrigin(url, response.url, options);
 
+	// A permitted cross-origin challenge was issued by the origin that served
+	// it, so its credential is filed under that origin and sent straight to
+	// it. Retrying the requested URL instead would hand the credential to the
+	// redirector, and the cross-origin hop would strip it before the issuer
+	// ever saw it. The caller's own credential headers were meant for the
+	// requested origin, so they stay behind as they would on that hop.
+	const issuer = challengeIssuer(url, response.url);
+	assertReplayableAt(issuer, url, init);
+	const issuerRequest = (credential?: IL402Credential): IL402RequestInit =>
+		withTimeout(
+			withAuthorization(
+				isSameOrigin(url, issuer) ? init : redirectedRequest(init, 307, true),
+				credential
+			),
+			options
+		);
+
 	// From here a payment can leave, so overlapping calls for one scope are
 	// serialized: two calls that both saw a 402 would otherwise each pay their
 	// own invoice for the same access. The lock only covers the challenge
@@ -282,13 +301,20 @@ export async function l402Fetch(
 	// concurrently. Callers who pass no store get no cross-call coalescing,
 	// since without shared storage the second call could not reuse the first
 	// call's credential anyway.
-	return await withScopeLock(store, scope, async () => {
+	const issuerScope = credentialScope(issuer, options.scopePerPath);
+	return await withScopeLock(store, issuerScope, async () => {
 		// Another call may have paid while this one waited for the lock; its
 		// credential satisfies this request without a second payment.
-		const minted = usableCredential(store.get(scope), store);
+		const minted = usableCredential(store.get(issuerScope), store);
 		if (minted) {
-			const reused = await doFetch(url, request(minted));
-			if (reused.status !== 402) {
+			const reused = await doFetch(issuer, issuerRequest(minted));
+			// Only the issuer can reject its credential. A response from another
+			// origin followed a redirect that stripped it, so it says nothing
+			// about the credential and is returned as it is.
+			if (
+				(reused.status !== 401 && reused.status !== 402) ||
+				challengeIssuer(issuer, reused.url) !== issuer
+			) {
 				return {
 					response: reused,
 					paid: false,
@@ -304,7 +330,6 @@ export async function l402Fetch(
 				reused.headers.get('www-authenticate') ?? ''
 			);
 			if (fresh) {
-				assertSameOrigin(url, reused.url, options);
 				challenge = fresh;
 				response = reused;
 			}
@@ -338,7 +363,7 @@ export async function l402Fetch(
 		}
 
 		const credential: IL402Credential = {
-			scope,
+			scope: credentialScope(issuer, options.scopePerPath),
 			macaroon: challenge.macaroon,
 			preimage: preimage.toString('hex'),
 			paymentHash: paymentHash.toString('hex'),
@@ -350,7 +375,7 @@ export async function l402Fetch(
 
 		// Exactly one retry. If it is another 402 the caller sees it and
 		// decides; this function never pays twice.
-		const retried = await doFetch(url, request(credential));
+		const retried = await doFetch(issuer, issuerRequest(credential));
 		return {
 			response: retried,
 			paid: true,
@@ -537,7 +562,14 @@ async function fetchCheckingRedirects(
 		const location = REDIRECT_STATUSES.has(response.status)
 			? response.headers.get('location')
 			: null;
-		if (location === null) return response;
+		if (location === null) {
+			// The caller tells which origin answered from the final URL, so a
+			// fetch that reports none would hide the hops followed here.
+			if (!response.url) {
+				Object.defineProperty(response, 'url', { value: current });
+			}
+			return response;
+		}
 		discardBody(response);
 		if (hops >= MAX_REDIRECTS) {
 			throw new Error(`l402Fetch: more than ${MAX_REDIRECTS} redirects`);
@@ -636,6 +668,49 @@ function assertSameOrigin(
 		`L402 challenge came from ${final} after a redirect from ${requested}, so it was not paid`,
 		'CROSS_ORIGIN_CHALLENGE'
 	);
+}
+
+/**
+ * The URL whose origin issued a challenge: the final URL when a redirect
+ * ended on another origin, the requested one otherwise. A same-origin redirect
+ * keeps the requested URL, since the credential survives that hop.
+ */
+function challengeIssuer(
+	requestedUrl: string,
+	finalUrl: string | undefined
+): string {
+	if (!finalUrl) return requestedUrl;
+	try {
+		return isSameOrigin(requestedUrl, finalUrl) ? requestedUrl : finalUrl;
+	} catch {
+		return requestedUrl;
+	}
+}
+
+/**
+ * Refuse a cross-origin challenge to anything but a GET or HEAD. A 301, 302
+ * or 303 on the way may have turned the request into a bodiless GET, and
+ * nothing here records which hops ran. Replaying the caller's method and body
+ * at the issuer could send it a body the redirect withheld.
+ */
+function assertReplayableAt(
+	issuer: string,
+	requestedUrl: string,
+	init: IL402RequestInit
+): void {
+	const method = (init.method ?? 'GET').toUpperCase();
+	if (method === 'GET' || method === 'HEAD') return;
+	if (isSameOrigin(requestedUrl, issuer)) return;
+	throw new L402Error(
+		`L402 challenge came from ${
+			new URL(issuer).origin
+		} after a redirect, and a ${method} cannot be replayed there, so it was not paid`,
+		'CROSS_ORIGIN_CHALLENGE'
+	);
+}
+
+function isSameOrigin(a: string, b: string): boolean {
+	return new URL(a).origin === new URL(b).origin;
 }
 
 /**
