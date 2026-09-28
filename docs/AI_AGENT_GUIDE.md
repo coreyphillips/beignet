@@ -735,7 +735,12 @@ those routes.
 
 A BOLT 12 offer payment needs the key more than a BOLT 11 one: every
 `POST /offer/pay` asks the payee for a fresh invoice with a fresh payment hash,
-so nothing but the key can tell a retry from a new payment.
+so nothing but the key can tell a retry from a new payment. That holds after a
+`504 PAYMENT_TIMEOUT` too, whose error carries the `paymentHash`: a keyed retry
+answers `200` with the payment once it completed and `409 DUPLICATE_PAYMENT`
+while an HTLC for it can still settle, and asks for a new invoice only once
+nothing sent for the first can (issue #1094). Query
+`GET /payment?paymentHash=...` rather than retrying in a loop.
 
 The same applies to the on-chain sends: a retried `POST /send` that carries the
 key of a send already broadcast returns that broadcast's txid instead of
