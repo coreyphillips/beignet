@@ -954,6 +954,85 @@ describe('l402Fetch payment safety', () => {
 		}
 	});
 
+	it('refuses a cross-origin challenge to a POST, whose body a redirect may have dropped', async () => {
+		const pair = makeChallengePair(1_000n);
+		const payer = recordingPayer(pair.preimage);
+		let error: unknown;
+		try {
+			await l402Fetch(
+				'https://trusted.example/x',
+				{ method: 'POST', body: 'secret-body' },
+				{
+					payer,
+					maxPriceSats: 10,
+					allowCrossOriginChallenge: true,
+					fetchImpl: fixedChallengeServer(
+						`L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`,
+						'https://other.example/pay'
+					)
+				}
+			);
+		} catch (err) {
+			error = err;
+		}
+		expect((error as L402Error).code).to.equal('CROSS_ORIGIN_CHALLENGE');
+		expect(payer.payments).to.equal(0);
+	});
+
+	it('replaces a cross-origin credential its issuer rejects with 401', async () => {
+		const pair = makeChallengePair(1_000n);
+		const payer = recordingPayer(pair.preimage);
+		const store = new MemoryL402CredentialStore();
+		store.set({
+			scope: 'https://issuer.example',
+			macaroon: makeMacaroon(crypto.randomBytes(32)),
+			preimage: crypto.randomBytes(32).toString('hex'),
+			paymentHash: crypto.randomBytes(32).toString('hex'),
+			amountSats: 1,
+			createdAt: Date.now(),
+			scheme: 'L402'
+		});
+		const challenge = `L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`;
+		// Every request ends at the issuer: unauthenticated ones are
+		// challenged, and only the fresh credential is accepted.
+		const fetchImpl: FetchLike = async (_url, init) => {
+			const authorization = init?.headers?.Authorization;
+			const status = !authorization
+				? 402
+				: authorization.includes(pair.preimage.toString('hex'))
+				? 200
+				: 401;
+			return {
+				status,
+				url: 'https://issuer.example/pay',
+				headers: {
+					get: (name: string): string | null =>
+						status === 402 && name.toLowerCase() === 'www-authenticate'
+							? challenge
+							: null
+				},
+				text: async (): Promise<string> => ''
+			};
+		};
+
+		const result = await l402Fetch(
+			'https://redirector.example/x',
+			{},
+			{
+				payer,
+				maxPriceSats: 10,
+				credentials: store,
+				allowCrossOriginChallenge: true,
+				fetchImpl
+			}
+		);
+		expect(result.response.status).to.equal(200);
+		expect(result.paid).to.equal(true);
+		expect(store.get('https://issuer.example')?.preimage).to.equal(
+			pair.preimage.toString('hex')
+		);
+	});
+
 	it('rejects a preimage that does not open the invoice hash', async () => {
 		const pair = makeChallengePair(1_000n);
 		const payer = recordingPayer(crypto.randomBytes(32)); // wrong preimage

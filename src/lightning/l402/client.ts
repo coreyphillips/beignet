@@ -137,7 +137,7 @@ export interface IL402FetchOptions {
 	 * otherwise lets any site the caller trusts hand the payment to one it
 	 * does not. When allowed, the credential is stored for the origin that
 	 * issued the challenge and the paid retry goes straight to it, never back
-	 * through the redirecting URL.
+	 * through the redirecting URL. Only GET and HEAD requests qualify.
 	 */
 	allowCrossOriginChallenge?: boolean;
 	/**
@@ -284,6 +284,7 @@ export async function l402Fetch(
 	// ever saw it. The caller's own credential headers were meant for the
 	// requested origin, so they stay behind as they would on that hop.
 	let issuer = challengeIssuer(url, response.url);
+	assertReplayableAt(issuer, url, init);
 	const issuerRequest = (credential?: IL402Credential): IL402RequestInit =>
 		withTimeout(
 			withAuthorization(
@@ -307,7 +308,7 @@ export async function l402Fetch(
 		const minted = usableCredential(store.get(issuerScope), store);
 		if (minted) {
 			const reused = await doFetch(issuer, issuerRequest(minted));
-			if (reused.status !== 402) {
+			if (reused.status !== 401 && reused.status !== 402) {
 				return {
 					response: reused,
 					paid: false,
@@ -327,6 +328,7 @@ export async function l402Fetch(
 				challenge = fresh;
 				response = reused;
 				issuer = challengeIssuer(issuer, reused.url);
+				assertReplayableAt(issuer, url, init);
 			}
 		}
 
@@ -673,6 +675,28 @@ function challengeIssuer(
 	} catch {
 		return requestedUrl;
 	}
+}
+
+/**
+ * Refuse a cross-origin challenge to anything but a GET or HEAD. A 301, 302
+ * or 303 on the way may have turned the request into a bodiless GET, and
+ * nothing here records which hops ran. Replaying the caller's method and body
+ * at the issuer could send it a body the redirect withheld.
+ */
+function assertReplayableAt(
+	issuer: string,
+	requestedUrl: string,
+	init: IL402RequestInit
+): void {
+	const method = (init.method ?? 'GET').toUpperCase();
+	if (method === 'GET' || method === 'HEAD') return;
+	if (isSameOrigin(requestedUrl, issuer)) return;
+	throw new L402Error(
+		`L402 challenge came from ${
+			new URL(issuer).origin
+		} after a redirect, and a ${method} cannot be replayed there, so it was not paid`,
+		'CROSS_ORIGIN_CHALLENGE'
+	);
 }
 
 function isSameOrigin(a: string, b: string): boolean {
