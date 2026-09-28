@@ -33,6 +33,7 @@ import {
 	PaymentStatus
 } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
+import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
 import {
 	DEFAULT_CHANNEL_CONFIG,
 	REGTEST_CHAIN_HASH
@@ -710,6 +711,132 @@ describe('Recovery phase 6: the node drives durability', () => {
 		expect(storage.loadRecoveryFrames()).to.have.length(beforeFrames);
 
 		firstHop.destroy();
+		node.destroy();
+		storage.close();
+	});
+
+	it('labels, stores and journals a first invoice payment, and refuses metadata over the ceiling (issue #1152)', async function (): Promise<void> {
+		const CEILING = 5_000;
+		const storage = openStorage();
+		// No lease, so nothing is ever sent to these endpoints.
+		const replicator = replicatorFor(
+			storage,
+			GUARDIAN_IDS.map((id) => ({
+				client: new GuardianClient({
+					url: 'http://127.0.0.1:9',
+					guardianSetId: SET_ID
+				}),
+				expectedGuardianId: id
+			}))
+		);
+		replicator.maxRecordBytes = (): number => CEILING;
+		const barrier = barrierFor(replicator, () => null, 'async-remote');
+		const node = createNode(storage, {
+			enabled: true,
+			durability: 'async-remote',
+			barrier
+		});
+		const payee = createLoopbackNode('first-invoice-metadata', 2);
+		connectNodes(node, payee);
+		node.handleNewBlock(1000);
+		payee.handleNewBlock(1000);
+		const channelId = openReadyChannel(node, payee);
+		const farPayee = addTenHopRoute(node, payee, channelId);
+
+		// A hash with no record yet: the send creates it, labels and all.
+		const invoice = payee.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'first'
+		});
+		const hashHex = invoice.paymentHash.toString('hex');
+		expect(node.getPayment(invoice.paymentHash)).to.equal(undefined);
+		node.sendPaymentWithOptions(invoice.bolt11, {
+			metadata: { requestId: 'req-1' }
+		});
+		const resolution = await node.awaitPaymentResolution(
+			invoice.paymentHash,
+			5_000
+		);
+		expect(resolution.status).to.equal(PaymentStatus.COMPLETED);
+		expect(node.getPayment(invoice.paymentHash)!.metadata).to.include({
+			requestId: 'req-1'
+		});
+		expect(storage.loadPayment(hashHex)!.metadata).to.include({
+			requestId: 'req-1'
+		});
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId
+		);
+		const journaled: IPaymentInfo[] = [];
+		for (const frame of journal.loadVerifiedFrames()) {
+			for (const mutation of frame.mutations) {
+				if (
+					mutation.type === 'payment_state' &&
+					mutation.paymentHash === hashHex
+				) {
+					journaled.push(mutation.payment);
+				}
+			}
+			for (const row of frame.snapshot?.payments ?? []) {
+				if (row.paymentHash === hashHex) journaled.push(row.payment);
+			}
+		}
+		// From the PENDING row written before the HTLC left, on.
+		expect(journaled.map((p) => p.status)).to.include(PaymentStatus.PENDING);
+		for (const payment of journaled) {
+			expect(payment.metadata).to.include({ requestId: 'req-1' });
+		}
+
+		const htlcCounter = (): bigint =>
+			node.getChannelManager().getChannel(channelId)!.getFullState()
+				.localHtlcCounter;
+		const beforeCounter = htlcCounter();
+		const beforeFrames = storage.loadRecoveryFrames().length;
+		const beforePayments = node.listPayments().length;
+
+		// Too large for any row: refused before a record or an HTLC exists.
+		const second = payee.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'second'
+		});
+		expect(() =>
+			node.sendPaymentWithOptions(second.bolt11, {
+				metadata: { note: 'x'.repeat(10_000) }
+			})
+		).to.throw(InvalidRequestError, /too large/);
+
+		// Fits the metadata half of a frame, but not beside a ten-hop route.
+		const room = (
+			node as unknown as {
+				recoveryJournal: { mutationRoom(): number };
+			}
+		).recoveryJournal.mutationRoom();
+		const farHash = sha('far-invoice-preimage');
+		const farInvoice = encodeInvoice({
+			network: Network.REGTEST,
+			amountMsat: 1_000n,
+			paymentHash: farHash,
+			paymentSecret: sha('far-invoice-secret'),
+			description: 'far',
+			privateKey: sha('keysend-route-10')
+		});
+		expect(getPublicKey(sha('keysend-route-10'))).to.deep.equal(farPayee);
+		expect(() =>
+			node.sendPaymentWithOptions(farInvoice, {
+				metadata: { note: 'x'.repeat(Math.floor(room / 2) - 20) }
+			})
+		).to.throw(InvalidRequestError, /too large/);
+
+		expect(node.getPayment(second.paymentHash)).to.equal(undefined);
+		expect(node.getPayment(farHash)).to.equal(undefined);
+		expect(node.listPayments()).to.have.length(beforePayments);
+		expect(htlcCounter()).to.equal(beforeCounter);
+		expect(storage.loadRecoveryFrames()).to.have.length(beforeFrames);
+
+		payee.destroy();
 		node.destroy();
 		storage.close();
 	});

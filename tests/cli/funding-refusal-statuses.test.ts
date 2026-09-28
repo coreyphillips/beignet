@@ -824,15 +824,18 @@ describe('Issue #474: the payment and invoice paths guard before BigInt()', () =
 	});
 
 	it('payInvoice and sendPaymentAsync refuse oversized metadata as INVALID_PARAMS (issue #1134)', async () => {
+		const metadata = { note: 'x' };
 		const bn = payingNode({
-			setPaymentMetadata: (): never => {
+			on: (): void => {},
+			removeListener: (): void => {},
+			// The engine judges the metadata with the send (issue #1152).
+			sendPayment: (...args: unknown[]): never => {
+				expect(args[6]).to.equal(metadata);
 				throw new InvalidRequestError(
 					'payment metadata is too large for the recovery guardians to accept'
 				);
-			},
-			sendPayment: (): never => expect.fail('the engine was reached')
+			}
 		});
-		const metadata = { note: 'x' };
 		for (const [name, pay] of [
 			[
 				'payInvoice',
