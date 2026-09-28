@@ -724,6 +724,30 @@ describe('Announced channel funding check (issue #1105)', () => {
 			await classifyAnnouncedChannelFunding(backend, otherIndex, 1010)
 		).to.equal('unknown');
 
+		// ElectrumBackend turns a failed proof into index 0, so a claim of
+		// index 0 is never taken as proven.
+		const failedProof: IChainBackend = {
+			...backend,
+			getTransactionMerkleProof: async (
+				_txid: string,
+				height: number
+			): Promise<{ blockHeight: number; txIndex: number }> => ({
+				blockHeight: height,
+				txIndex: 0
+			})
+		};
+		const coinbaseIndex = {
+			...real.msg,
+			shortChannelId: encodeShortChannelId({
+				block: 990,
+				txIndex: 0,
+				outputIndex: 0
+			})
+		};
+		expect(
+			await classifyAnnouncedChannelFunding(failedProof, coinbaseIndex, 1010)
+		).to.equal('unknown');
+
 		const down: IChainBackend = {
 			...backend,
 			listUnspent: async (): Promise<TUnspent> => {
@@ -1387,6 +1411,35 @@ describe('Gossip intake queue (LightningNode)', () => {
 			expect(graphOf(node).getChannel(real.msg.shortChannelId)).to.not.equal(
 				undefined
 			);
+		});
+
+		it('the own-channel pass proves only our own announcement', () => {
+			const squatter = buildAnnouncement(930, REGTEST_CHAIN_HASH);
+			const ours = buildAnnouncement(930, REGTEST_CHAIN_HASH);
+			const graph = graphOf(node);
+			graph.addChannelAnnouncement(squatter.msg, { verified: true });
+			const announce = (): void => {
+				const now = Math.floor(Date.now() / 1000);
+				node
+					.getChannelManager()
+					.emit(
+						'announcement:ready',
+						crypto.randomBytes(32),
+						ours.payload,
+						buildUpdate(ours, now, 0, REGTEST_CHAIN_HASH).payload
+					);
+			};
+
+			announce();
+			const held = graph.getChannel(ours.msg.shortChannelId)!;
+			expect(held.nodeId1.equals(squatter.msg.nodeId1)).to.equal(true);
+			expect(held.fundingVerified).to.equal(undefined);
+
+			graph.removeChannel(squatter.msg.shortChannelId);
+			announce();
+			expect(
+				graph.getChannel(ours.msg.shortChannelId)!.fundingVerified
+			).to.equal(true);
 		});
 
 		it('a check the backend cannot answer resumes on the next block', async () => {

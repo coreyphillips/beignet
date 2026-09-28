@@ -472,10 +472,12 @@ export async function classifyAnnouncedChannelFunding(
 		} catch {
 			return 'unavailable';
 		}
-		if (txIndex === scid.txIndex) return 'proven';
+		// ElectrumBackend reports a failed proof as index 0, so index 0 (the
+		// coinbase) can never prove a position.
+		if (txIndex !== 0 && txIndex === scid.txIndex) return 'proven';
 	}
 	// The right output in a transaction at another index proves nothing
-	// either way: ElectrumBackend reports a failed proof as index 0.
+	// either way, for the same reason.
 	if (candidates.length > 0) return 'unknown';
 	return tipHeight - scid.block + 1 >= FUNDING_REFUTE_DEPTH
 		? 'refuted'

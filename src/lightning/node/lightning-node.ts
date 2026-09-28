@@ -5237,8 +5237,16 @@ export class LightningNode extends EventEmitter {
 					this.graph.addChannelAnnouncement(annMsg, {
 						verified: announcementValid
 					});
-					// Our own funding output needs no chain lookup to prove it.
-					this.graph.markChannelFundingProven(annMsg.shortChannelId);
+					// Our own funding output needs no chain lookup to prove it. A
+					// row held under this SCID with other endpoints is someone
+					// else's and refused ours, so it gets no such pass.
+					const held = this.graph.getChannel(annMsg.shortChannelId);
+					if (
+						held?.nodeId1.equals(annMsg.nodeId1) &&
+						held.nodeId2.equals(annMsg.nodeId2)
+					) {
+						this.graph.markChannelFundingProven(annMsg.shortChannelId);
+					}
 					const updateMsg = decodeChannelUpdateMessage(signedChannelUpdate);
 					let updateValid = false;
 					try {
