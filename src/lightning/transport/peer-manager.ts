@@ -24,6 +24,7 @@ import {
 } from './websocket';
 import { WebSocketServer } from './websocket-server';
 import { NodeWebSocket } from './websocket-node-client';
+import { normalizeHexPubkey } from '../validation';
 
 /**
  * Default WS client for outbound peers when none is injected. Under Node the
@@ -435,6 +436,8 @@ export class PeerManager extends EventEmitter {
 		transport?: IPeerTransportOptions,
 		options: IPeerDialOptions = {}
 	): Promise<void> {
+		// The same key an inbound connection from this peer registers under.
+		pubkey = normalizeHexPubkey(pubkey);
 		const cancelGeneration = this.cancelGenerations.get(pubkey) ?? 0;
 		if (options.reconnect !== false) {
 			this.noReconnectPeers.delete(pubkey);
@@ -872,6 +875,7 @@ export class PeerManager extends EventEmitter {
 	 * Disconnect from a peer.
 	 */
 	disconnectPeer(pubkey: string): void {
+		pubkey = normalizeHexPubkey(pubkey);
 		const lanePeer = this.lanePeers.get(pubkey);
 		if (lanePeer) {
 			lanePeer.disconnect();

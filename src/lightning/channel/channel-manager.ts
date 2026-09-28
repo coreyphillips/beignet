@@ -46,6 +46,7 @@ import {
 } from '../message/error';
 import { decodeChannelReestablishMessage } from '../message/channel-reestablish';
 import { decodeStfuMessage } from '../message/stfu';
+import { normalizeHexPubkey } from '../validation';
 import {
 	decodeSpliceMessage,
 	decodeSpliceAckMessage,
@@ -2527,6 +2528,9 @@ export class ChannelManager extends EventEmitter {
 		keyIndex?: number | null,
 		perChannelKeys?: IPerChannelKeys | null
 	): void {
+		// Rows written before opens lowercased the caller's pubkey can carry
+		// any case, and inbound connections register the lowercase form.
+		peerPubkey = normalizeHexPubkey(peerPubkey);
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
 		}

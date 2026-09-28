@@ -65,6 +65,7 @@ import {
 import { ILightningError, IPaymentInfo } from '../lightning/node/types';
 import { IInvoiceInfo } from '../lightning/storage/types';
 import { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
+import { normalizeHexPubkey } from '../lightning/validation';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
 import { SqliteStorage } from '../lightning/storage/sqlite-storage';
 import { deriveStorageKey } from '../lightning/storage/encryption';
@@ -7187,6 +7188,8 @@ export class BeignetNode extends EventEmitter {
 		port?: number,
 		transport?: IPeerTransportOptions
 	): Promise<PeerInfo> {
+		// listPeers reports the lowercase key the node registers the peer under.
+		pubkey = normalizeHexPubkey(pubkey);
 		// Where we are dialing, for error messages: explicit host:port, or the
 		// gossip/DNS resolution the library performs when both are omitted.
 		const target =

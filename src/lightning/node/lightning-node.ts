@@ -331,6 +331,7 @@ import {
 } from './funding-selection';
 import {
 	validateHexPubkey,
+	normalizeHexPubkey,
 	validateBuffer,
 	validateBufferMinMax,
 	validatePositiveBigint,
@@ -3112,7 +3113,7 @@ export class LightningNode extends EventEmitter {
 							typeof pubkey === 'string' &&
 							validateHexPubkey(pubkey, 'pubkeyHex') === null
 						) {
-							this.channelManager.addTrustedPeer(pubkey);
+							this.channelManager.addTrustedPeer(normalizeHexPubkey(pubkey));
 						}
 					}
 				}
@@ -6566,7 +6567,7 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
-		const peerAddresses = this.storage.loadAllPeerAddresses();
+		const peerAddresses = this.loadPeerAddresses();
 		const channelPeers = new Set<string>();
 
 		// Only reconnect peers that have channels needing reestablishment, or
@@ -6683,6 +6684,28 @@ export class LightningNode extends EventEmitter {
 			this._reconnectTimers.add(timer);
 			delay += STAGGER_MS;
 		}
+	}
+
+	/**
+	 * Stored peer addresses under the lowercase key every live map uses.
+	 * Rows written before connectPeer lowercased its argument can carry any
+	 * case; where a peer has both, the lowercase row is the newer write.
+	 */
+	private loadPeerAddresses(): Array<{
+		pubkey: string;
+		host: string;
+		port: number;
+	}> {
+		const byPubkey = new Map<
+			string,
+			{ pubkey: string; host: string; port: number }
+		>();
+		for (const row of this.storage!.loadAllPeerAddresses()) {
+			const pubkey = normalizeHexPubkey(row.pubkey);
+			if (row.pubkey !== pubkey && byPubkey.has(pubkey)) continue;
+			byPubkey.set(pubkey, { pubkey, host: row.host, port: row.port });
+		}
+		return [...byPubkey.values()];
 	}
 
 	private emitReady(): void {
@@ -7718,7 +7741,7 @@ export class LightningNode extends EventEmitter {
 		// One persisted address per peer (upserted on connect); map to 'host:port'.
 		const peerAddresses = new Map<string, string[]>();
 		if (this.storage) {
-			for (const addr of this.storage.loadAllPeerAddresses()) {
+			for (const addr of this.loadPeerAddresses()) {
 				const list = peerAddresses.get(addr.pubkey) ?? [];
 				list.push(`${addr.host}:${addr.port}`);
 				peerAddresses.set(addr.pubkey, list);
@@ -8370,6 +8393,7 @@ export class LightningNode extends EventEmitter {
 		this.assertPeerContactPermitted('connectPeer');
 		const pubkeyErr = validateHexPubkey(pubkey, 'pubkey');
 		if (pubkeyErr) throw new InvalidPeerConnectError(pubkeyErr);
+		pubkey = normalizeHexPubkey(pubkey);
 		if (transport?.type === 'ws' && transport.url !== undefined) {
 			// Derive the dial address from the explicit URL (and reject a
 			// mismatched host/port pair to avoid ambiguous bookkeeping).
@@ -10020,7 +10044,7 @@ export class LightningNode extends EventEmitter {
 	addTrustedPeer(pubkeyHex: string): void {
 		const pubkeyErr = validateHexPubkey(pubkeyHex, 'pubkeyHex');
 		if (pubkeyErr) throw new Error(pubkeyErr);
-		this.channelManager.addTrustedPeer(pubkeyHex);
+		this.channelManager.addTrustedPeer(normalizeHexPubkey(pubkeyHex));
 		this.persistTrustedPeers();
 	}
 
@@ -10028,7 +10052,7 @@ export class LightningNode extends EventEmitter {
 	 * Remove a peer from the zero-conf trusted set.
 	 */
 	removeTrustedPeer(pubkeyHex: string): void {
-		this.channelManager.removeTrustedPeer(pubkeyHex);
+		this.channelManager.removeTrustedPeer(normalizeHexPubkey(pubkeyHex));
 		this.persistTrustedPeers();
 	}
 
@@ -10662,6 +10686,7 @@ export class LightningNode extends EventEmitter {
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
 		if (pubkeyErr) throw new InvalidChannelOpenError(pubkeyErr);
+		peerPubkey = normalizeHexPubkey(peerPubkey);
 		const satsErr = validatePositiveBigint(fundingSatoshis, 'fundingSatoshis');
 		if (satsErr) throw new InvalidChannelOpenError(satsErr);
 		if (pushMsat !== undefined && pushMsat > fundingSatoshis * 1000n) {
@@ -10926,6 +10951,7 @@ export class LightningNode extends EventEmitter {
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
 		if (pubkeyErr) throw new InvalidChannelOpenError(pubkeyErr);
+		peerPubkey = normalizeHexPubkey(peerPubkey);
 		const satsErr = validatePositiveBigint(
 			params.fundingSatoshis,
 			'fundingSatoshis'

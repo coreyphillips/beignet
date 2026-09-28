@@ -33,6 +33,15 @@ export function validateHexPubkey(value: string, name: string): string | null {
 }
 
 /**
+ * The form a node pubkey takes as a map key: lowercase hex, which is how
+ * the transport renders the key it authenticates on an inbound connection.
+ * A non-string passes through untouched for the caller's validation.
+ */
+export function normalizeHexPubkey(value: string): string {
+	return typeof value === 'string' ? value.toLowerCase() : value;
+}
+
+/**
  * Validate a Buffer has the expected exact length.
  * Returns null on success, error string on failure.
  */
