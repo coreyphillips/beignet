@@ -44,6 +44,7 @@ import {
 	IGuardianGetHeadResponse
 } from './guardian';
 import {
+	GuardianProtocolMismatchError,
 	GuardianTransportError,
 	IBoundGuardianClient,
 	IGuardianSetContext,
@@ -371,7 +372,18 @@ export class GuardianReplicator {
 				const key = entry.expectedGuardianId.toString('hex');
 				if (this.advertisedCeilings.has(key)) return;
 				try {
-					const info = await entry.client.info();
+					// The client's cached compatibility INFO: a guardian that
+					// answered any verb has a known limit without another request
+					// that could fail. A guardian outside our protocol range is
+					// refused with the INFO it sent, and that limit still binds
+					// once it is back in range.
+					const info = await entry.client
+						.checkVersion()
+						.catch((error) =>
+							error instanceof GuardianProtocolMismatchError
+								? error.info
+								: entry.client.info()
+						);
 					if (
 						info.guardianId.equals(entry.expectedGuardianId) &&
 						info.maxCiphertextBytes > 0
@@ -784,6 +796,10 @@ export class GuardianReplicator {
 			detail: `namespace registered with ${accepted} guardians at origin sequence ${initialState.origin.firstSequence}`,
 			receipts: accepted
 		});
+		// A guardian whose binding INFO failed can still have registered, and
+		// the first snapshot is written before any replication pass reads its
+		// limit again.
+		await this.readMissingLimits();
 		return { outcome: 'registered', lease };
 	}
 

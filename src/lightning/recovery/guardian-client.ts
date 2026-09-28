@@ -83,6 +83,17 @@ export class GuardianTransportError extends Error {
 	}
 }
 
+/** The guardian's INFO is outside our protocol range; carries that INFO. */
+export class GuardianProtocolMismatchError extends GuardianTransportError {
+	readonly info: IGuardianInfoResponse;
+
+	constructor(message: string, info: IGuardianInfoResponse) {
+		super(message);
+		this.name = 'GuardianProtocolMismatchError';
+		this.info = info;
+	}
+}
+
 /** Minimal binary HTTP transport, injectable for Tor and for tests. */
 export type GuardianHttpTransport = (
 	url: string,
@@ -430,9 +441,10 @@ export class GuardianClient {
 					info.minProtocolVersion > GUARDIAN_PROTOCOL_VERSION ||
 					info.maxProtocolVersion < GUARDIAN_PROTOCOL_VERSION
 				) {
-					throw new GuardianTransportError(
+					throw new GuardianProtocolMismatchError(
 						`guardian supports protocol ${info.minProtocolVersion}..` +
-							`${info.maxProtocolVersion}, not ${GUARDIAN_PROTOCOL_VERSION}`
+							`${info.maxProtocolVersion}, not ${GUARDIAN_PROTOCOL_VERSION}`,
+						info
 					);
 				}
 				return info;
