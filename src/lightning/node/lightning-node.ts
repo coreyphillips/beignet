@@ -15952,6 +15952,16 @@ export class LightningNode extends EventEmitter {
 				...(metadata && { metadata: { ...metadata } })
 			};
 			const expiredHashHex = invoice.paymentHash.toString('hex');
+			if (
+				metadata &&
+				!this.paymentMetadataFits(metadata, [
+					{ type: 'payment_state', paymentHash: expiredHashHex, payment }
+				])
+			) {
+				throw new InvalidRequestError(
+					'payment metadata is too large for the recovery guardians to accept'
+				);
+			}
 			this.payments.set(expiredHashHex, payment);
 			// A retry that lands here (the invoice expired between attempts)
 			// is over: its context would otherwise linger until prune, and

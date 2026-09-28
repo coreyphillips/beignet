@@ -881,6 +881,56 @@ describe('Recovery phase 6: the node drives durability', () => {
 		node.destroy();
 		storage.close();
 	});
+
+	it('refuses metadata that pushes an expired invoice payment row over the ceiling (issue #1152)', async function (): Promise<void> {
+		const storage = openStorage();
+		// No lease, so nothing is ever sent to these endpoints.
+		const replicator = replicatorFor(
+			storage,
+			GUARDIAN_IDS.map((id) => ({
+				client: new GuardianClient({
+					url: 'http://127.0.0.1:9',
+					guardianSetId: SET_ID
+				}),
+				expectedGuardianId: id
+			}))
+		);
+		replicator.maxRecordBytes = (): number => 700;
+		const barrier = barrierFor(replicator, () => null, 'async-remote');
+		const node = createNode(storage, {
+			enabled: true,
+			durability: 'async-remote',
+			barrier
+		});
+		const room = (
+			node as unknown as {
+				recoveryJournal: { mutationRoom(): number };
+			}
+		).recoveryJournal.mutationRoom();
+		const hash = sha('expired-invoice-preimage');
+		const expired = encodeInvoice({
+			network: Network.REGTEST,
+			amountMsat: 1_000n,
+			paymentHash: hash,
+			paymentSecret: sha('expired-invoice-secret'),
+			description: 'expired',
+			timestamp: Math.floor(Date.now() / 1000) - 7_200,
+			expiry: 60,
+			privateKey: sha('expired-invoice-payee')
+		});
+
+		// Fits the metadata half of a frame, but not beside the FAILED row.
+		expect(() =>
+			node.sendPaymentWithOptions(expired, {
+				metadata: { note: 'x'.repeat(Math.floor(room / 2) - 20) }
+			})
+		).to.throw(InvalidRequestError, /too large/);
+		expect(node.getPayment(hash)).to.equal(undefined);
+		expect(storage.loadRecoveryFrames()).to.have.length(0);
+
+		node.destroy();
+		storage.close();
+	});
 });
 
 describe('Recovery phase 6: the status surface', () => {
