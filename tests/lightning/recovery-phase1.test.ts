@@ -18,7 +18,8 @@
  * 12. The revoke supersede rides the persist transaction (rolls back with it)
  * 13. A blocked transition is surfaced so the node can force a reconnect
  * 14. A held-back monitor delta retries as a combined channel+monitor commit
- * 15. Staged mutations survive a failed standalone flush
+ * 15. Staged mutations survive a failed standalone flush; one that cannot be
+ *     encoded is dropped instead, so it cannot block later persists
  * 16. Restart restores the LAST start_batch group from stored rows
  * 17. splice:complete retires the splice negotiation rows
  */
@@ -39,7 +40,7 @@ import { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { Network } from '../../src/lightning/invoice/types';
-import { INodeConfig } from '../../src/lightning/node/types';
+import { INodeConfig, IPaymentInfo } from '../../src/lightning/node/types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
 	BITCOIN_CHAIN_HASH,
@@ -1407,6 +1408,118 @@ describe('Recovery phase 1: failure recovery paths', () => {
 		internals.flushStagedMutations();
 		expect(internals.stagedMutations).to.have.length(0);
 		expect(storage.loadPreimage(hashHex)).to.not.equal(null);
+
+		node.destroy();
+		storage.close();
+	});
+
+	it('drops a staged mutation that cannot be encoded instead of requeueing it', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const alice = createNode(1, storage);
+		const bob = createNode(2);
+		connectNodes(alice, bob);
+		const channelId = openReadyChannel(alice, bob);
+		const errors: string[] = [];
+		alice.on('node:error', (err: { code: string; message: string }) => {
+			if (err.code === 'PERSISTENCE_ERROR') errors.push(err.message);
+		});
+		let channelSaves = 0;
+		const originalSave = storage.saveChannel.bind(storage);
+		storage.saveChannel = (id, state, peer): void => {
+			channelSaves++;
+			originalSave(id, state, peer);
+		};
+
+		const internals = alice as unknown as {
+			stagedMutations: RecoveryMutation[];
+			persistChannelCommitted(channelId: Buffer): boolean;
+		};
+		const badHash = 'cd'.repeat(32);
+		const goodHash = 'ab'.repeat(32);
+		internals.stagedMutations.push(
+			{
+				type: 'payment_state',
+				paymentHash: badHash,
+				payment: {
+					paymentHash: Buffer.from(badHash, 'hex'),
+					status: 'completed',
+					direction: 'outgoing',
+					createdAt: Date.now()
+				} as unknown as IPaymentInfo
+			},
+			{
+				type: 'payment_preimage',
+				paymentHash: goodHash,
+				preimage: Buffer.alloc(32, 7)
+			}
+		);
+
+		// The transition that carried it fails without touching storage, so
+		// nothing it authorized is released. Only the bad mutation is dropped.
+		expect(internals.persistChannelCommitted(channelId)).to.equal(false);
+		expect(channelSaves).to.equal(0);
+		expect(internals.stagedMutations.map((m) => m.type)).to.deep.equal([
+			'payment_preimage'
+		]);
+		expect(errors.some((m) => m.includes('staged payment_state'))).to.equal(
+			true
+		);
+
+		// A storage failure is still transient: the good mutation stays staged.
+		const originalTransaction = storage.transaction.bind(storage);
+		(storage as unknown as { transaction: unknown }).transaction =
+			(): never => {
+				throw new Error('disk on fire');
+			};
+		expect(internals.persistChannelCommitted(channelId)).to.equal(false);
+		expect(internals.stagedMutations).to.have.length(1);
+		(storage as unknown as { transaction: unknown }).transaction =
+			originalTransaction;
+
+		// Later channel persists land, carrying the good mutation with them.
+		expect(internals.persistChannelCommitted(channelId)).to.equal(true);
+		expect(channelSaves).to.equal(1);
+		expect(internals.stagedMutations).to.have.length(0);
+		expect(storage.loadPreimage(goodHash)).to.not.equal(null);
+		expect(storage.loadPayment(badHash)).to.equal(null);
+
+		alice.destroy();
+		bob.destroy();
+		storage.close();
+	});
+
+	it('a standalone flush commits the rest when one staged mutation cannot be encoded', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const node = createNode(1, storage);
+		const goodHash = 'ab'.repeat(32);
+		const internals = node as unknown as {
+			stagedMutations: RecoveryMutation[];
+			flushStagedMutations(): void;
+		};
+		internals.stagedMutations.push(
+			{
+				type: 'payment_state',
+				paymentHash: 'cd'.repeat(32),
+				payment: {} as IPaymentInfo
+			},
+			{
+				type: 'payment_preimage',
+				paymentHash: goodHash,
+				preimage: Buffer.alloc(32, 7)
+			}
+		);
+
+		// The report goes out after the rest is committed, so a listener that
+		// throws cannot take the preimage with it.
+		node.on('node:error', () => {
+			throw new Error('listener failed');
+		});
+		expect(() => internals.flushStagedMutations()).to.throw('listener failed');
+
+		expect(internals.stagedMutations).to.have.length(0);
+		expect(storage.loadPreimage(goodHash)).to.not.equal(null);
 
 		node.destroy();
 		storage.close();
