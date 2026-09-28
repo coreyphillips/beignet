@@ -566,6 +566,16 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 		expect(alice.listChannels()).to.have.length(0);
 	});
 
+	it('matches a quote reply to an upper-case LSP pubkey', async function () {
+		const pair = nodePair();
+		open.push(pair);
+		const quote = await pair.bob.requestJitQuote(
+			pair.alice.getNodeId().toUpperCase(),
+			{ timeoutMs: 1_000 }
+		);
+		expect(quote.accepted).to.equal(true);
+	});
+
 	it('declines a quote the LSP cannot front from its on-chain funds', async function () {
 		const pair = nodePair({
 			fundingProvider: {

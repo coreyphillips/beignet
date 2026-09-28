@@ -15129,6 +15129,7 @@ export class LightningNode extends EventEmitter {
 	 * Initiate gossip sync with a connected peer.
 	 */
 	initiateGossipSync(pubkey: string): void {
+		pubkey = normalizeHexPubkey(pubkey);
 		const mgr = this.getOrCreateSyncManager(pubkey);
 		const messages = mgr.initiateSync();
 		for (const msg of messages) {
@@ -15140,6 +15141,7 @@ export class LightningNode extends EventEmitter {
 	 * Get gossip sync state for a peer.
 	 */
 	getGossipSyncState(pubkey: string): string | null {
+		pubkey = normalizeHexPubkey(pubkey);
 		const mgr = this.gossipSyncManagers.get(pubkey);
 		return mgr ? mgr.getState() : null;
 	}
@@ -20049,6 +20051,7 @@ export class LightningNode extends EventEmitter {
 	 * receiver never assumes support.
 	 */
 	peerAdvertisesAsyncReceive(pubkeyHex: string): boolean {
+		pubkeyHex = normalizeHexPubkey(pubkeyHex);
 		const init = this.peerManager?.getPeer(pubkeyHex)?.getRemoteInit();
 		if (init) return init.features.hasFeature(Feature.ASYNC_RECEIVE_SERVICE);
 		const ann = this.graph.getVerifiedNodeAnnouncement(
@@ -20078,6 +20081,7 @@ export class LightningNode extends EventEmitter {
 			timeoutMs?: number;
 		} = {}
 	): Promise<IReceiverGrant> {
+		lspNodeIdHex = normalizeHexPubkey(lspNodeIdHex);
 		if (!this.peerAdvertisesAsyncReceive(lspNodeIdHex)) {
 			throw new Error(
 				`peer ${lspNodeIdHex} does not advertise the async receive service (feature bit ${
@@ -20259,6 +20263,7 @@ export class LightningNode extends EventEmitter {
 
 	/** Receiver: drop every grant held for an LSP. */
 	forgetAsyncReceiveGrant(lspNodeIdHex: string): boolean {
+		lspNodeIdHex = normalizeHexPubkey(lspNodeIdHex);
 		const had = this.asyncReceiveGrants.delete(lspNodeIdHex);
 		if (had) this.persistAsyncReceiveGrants();
 		return had;
@@ -20729,6 +20734,7 @@ export class LightningNode extends EventEmitter {
 	> {
 		const pubkeyErr = validateHexPubkey(lspPubkeyHex, 'lspPubkeyHex');
 		if (pubkeyErr) throw new Error(pubkeyErr);
+		lspPubkeyHex = normalizeHexPubkey(lspPubkeyHex);
 		const maxAmountMsat = params.maxAmountMsat ?? JIT_RECEIVE_DEFAULT_MAX_MSAT;
 		if (maxAmountMsat <= 0n) {
 			throw new Error('maxAmountMsat must be positive');
@@ -20819,6 +20825,7 @@ export class LightningNode extends EventEmitter {
 	}> {
 		const pubkeyErr = validateHexPubkey(lspPubkeyHex, 'lspPubkeyHex');
 		if (pubkeyErr) throw new Error(pubkeyErr);
+		lspPubkeyHex = normalizeHexPubkey(lspPubkeyHex);
 		if (params.maxAmountMsat <= 0n) {
 			throw new Error('maxAmountMsat must be positive');
 		}
@@ -20952,6 +20959,7 @@ export class LightningNode extends EventEmitter {
 			feeMode: JitFeeMode;
 		}
 	> {
+		const lspPubkeyHex = normalizeHexPubkey(opts.lspPubkeyHex);
 		const expiry = opts.expiry ?? JIT_RECEIVE_DEFAULT_EXPIRY_SECONDS;
 		const maxAmountMsat =
 			opts.amountMsat ?? opts.maxAmountMsat ?? JIT_RECEIVE_DEFAULT_MAX_MSAT;
@@ -20968,7 +20976,7 @@ export class LightningNode extends EventEmitter {
 		// Asked of the SAME predicate the hint decision below uses: over an
 		// existing usable channel the payment needs no new channel at all and
 		// nothing here applies.
-		if (!this.liveChannelWith(opts.lspPubkeyHex)) {
+		if (!this.liveChannelWith(lspPubkeyHex)) {
 			const refusal = this.channelManager.newChannelRefusal();
 			if (refusal) {
 				throw new Error(
@@ -20983,9 +20991,9 @@ export class LightningNode extends EventEmitter {
 		// none, as before.
 		const expectedTotalMsat =
 			opts.amountMsat !== undefined
-				? this.jitShareCrossingLspMsat(opts.lspPubkeyHex, opts.amountMsat)
+				? this.jitShareCrossingLspMsat(lspPubkeyHex, opts.amountMsat)
 				: undefined;
-		const grant = await this.requestJitReceive(opts.lspPubkeyHex, {
+		const grant = await this.requestJitReceive(lspPubkeyHex, {
 			maxAmountMsat,
 			...(expectedTotalMsat !== undefined ? { expectedTotalMsat } : {}),
 			targetRemainingInboundSat: opts.targetRemainingInboundSat ?? 0n,
@@ -21008,7 +21016,7 @@ export class LightningNode extends EventEmitter {
 		// A channel mid-splice counts: it is still the home channel, it still
 		// receives under its pre-splice scid, and an intercept hint minted
 		// while it splices is the same second channel by another door.
-		const existing = this.liveChannelWith(opts.lspPubkeyHex);
+		const existing = this.liveChannelWith(lspPubkeyHex);
 		const result = this.createInvoice({
 			amountMsat: opts.amountMsat,
 			description: opts.description ?? '',
@@ -24311,6 +24319,7 @@ export class LightningNode extends EventEmitter {
 		if (!this.peerManager) {
 			throw new Error('Networking is not enabled on this node');
 		}
+		peerPubkeyHex = normalizeHexPubkey(peerPubkeyHex);
 		const envelope = encodeCustomMessage(subtype, payload);
 		this.peerManager.sendToPeer(
 			peerPubkeyHex,
