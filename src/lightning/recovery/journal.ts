@@ -963,6 +963,29 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		return tip == null ? 1n : BigInt(tip) + 1n;
 	}
 
+	/**
+	 * Encoded bytes one mutation can take in a frame of its own without a
+	 * guardian refusing the frame, or undefined with no replicas. Measured
+	 * with the widest header storage can hold, so it holds for a delta at
+	 * any sequence and for a snapshot page alike.
+	 */
+	mutationRoom(): number | undefined {
+		const ceiling = this.maxFrameCiphertextBytes?.();
+		if (ceiling === undefined) return undefined;
+		const widest = BigInt(Number.MAX_SAFE_INTEGER);
+		const frame: RecoveryFrame = {
+			version: 1,
+			writerEpoch: widest,
+			sequence: widest,
+			previousFrameHash: GENESIS_HASH,
+			timestamp: Number.MAX_SAFE_INTEGER,
+			mutations: [],
+			outboundMessages: []
+		};
+		this.stampDurability(frame);
+		return ceiling - encodeFrame(frame).length - FRAME_CIPHERTEXT_OVERHEAD;
+	}
+
 	/** The journal tip, or null when nothing has been journaled. */
 	getTip(): { sequence: bigint; frameHash: Buffer } | null {
 		const sequence = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);

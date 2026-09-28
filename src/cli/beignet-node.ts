@@ -10663,7 +10663,7 @@ export class BeignetNode extends EventEmitter {
 		// between the claim above and the executor below may strand it.
 		try {
 			if (metadata) {
-				this.node.setPaymentMetadata(decoded.paymentHash, metadata);
+				this.setPaymentMetadata(paymentHashHex, metadata);
 			}
 		} catch (err: unknown) {
 			if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
@@ -10967,7 +10967,7 @@ export class BeignetNode extends EventEmitter {
 		let result: IPaymentInfo;
 		try {
 			if (metadata) {
-				this.node.setPaymentMetadata(decoded.paymentHash, metadata);
+				this.setPaymentMetadata(paymentHashHex, metadata);
 			}
 			result = this.node.sendPayment(
 				bolt11,
@@ -13160,7 +13160,14 @@ export class BeignetNode extends EventEmitter {
 		paymentHash: string,
 		metadata: Record<string, string>
 	): void {
-		this.node.setPaymentMetadata(Buffer.from(paymentHash, 'hex'), metadata);
+		try {
+			this.node.setPaymentMetadata(Buffer.from(paymentHash, 'hex'), metadata);
+		} catch (err: unknown) {
+			if (err instanceof InvalidRequestError) {
+				throw new BeignetError(BeignetErrorCode.INVALID_PARAMS, err.message);
+			}
+			throw err;
+		}
 	}
 
 	// ─────────────── Payment Queue ───────────────

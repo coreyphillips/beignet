@@ -368,6 +368,7 @@ import {
 	RecoveryJournal,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
+	encodedMutationBytes,
 	journalSupported,
 	loadWriterLease,
 	composeRecoveryCapsule,
@@ -16831,6 +16832,13 @@ export class LightningNode extends EventEmitter {
 				'amountMsat must be positive'
 			);
 		}
+		const paymentMetadata = { _keysend: 'true', ...(metadata || {}) };
+		if (!this.paymentMetadataFits(paymentMetadata)) {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVALID_KEYSEND,
+				'metadata is too large for the recovery guardians to accept'
+			);
+		}
 
 		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
 		const hashHex = paymentHash.toString('hex');
@@ -16961,7 +16969,7 @@ export class LightningNode extends EventEmitter {
 			route: route as IPaymentInfo['route'],
 			sharedSecrets,
 			createdAt: Date.now(),
-			metadata: { _keysend: 'true', ...(metadata || {}) }
+			metadata: paymentMetadata
 		};
 		this.payments.set(hashHex, payment);
 
@@ -24093,7 +24101,9 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Set or update metadata on a payment (for agent labeling).
+	 * Set or update metadata on a payment (for agent labeling). Refused with
+	 * an InvalidRequestError, the payment untouched, when the labelled row
+	 * would be too large for the recovery guardians to accept.
 	 */
 	setPaymentMetadata(
 		paymentHash: Buffer,
@@ -24102,11 +24112,42 @@ export class LightningNode extends EventEmitter {
 		const hashHex = paymentHash.toString('hex');
 		const existing = this.payments.get(hashHex);
 		if (existing) {
-			existing.metadata = { ...existing.metadata, ...metadata };
+			const merged = { ...existing.metadata, ...metadata };
+			const labelled: RecoveryMutation = {
+				type: 'payment_state',
+				paymentHash: hashHex,
+				payment: { ...existing, metadata: merged }
+			};
+			if (!this.paymentMetadataFits(merged, labelled)) {
+				throw new InvalidRequestError(
+					'payment metadata is too large for the recovery guardians to accept'
+				);
+			}
+			existing.metadata = merged;
 			this.commitMutations('savePaymentMetadata', [
 				{ type: 'payment_state', paymentHash: hashHex, payment: existing }
 			]);
 		}
+	}
+
+	/**
+	 * A guardian refuses a record over its limit, and every record after it,
+	 * so one payment row that outgrows a frame stops replication for good.
+	 * Metadata is the part of a row the caller sizes, and it may take half a
+	 * frame: the rest is left for what the payment carries and gains after
+	 * it is labelled (route, shared secrets, preimage, a retry's invoice).
+	 * Given the labelled row, that has to fit a frame as well.
+	 */
+	private paymentMetadataFits(
+		metadata: Record<string, string>,
+		row?: RecoveryMutation
+	): boolean {
+		const room = this.recoveryJournal?.mutationRoom();
+		if (room === undefined) return true;
+		if (Buffer.byteLength(JSON.stringify(metadata), 'utf8') > room / 2) {
+			return false;
+		}
+		return row === undefined || encodedMutationBytes(row) <= room;
 	}
 
 	/**

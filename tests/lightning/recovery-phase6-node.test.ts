@@ -23,7 +23,15 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
-import { INodeConfig } from '../../src/lightning/node/types';
+import {
+	INodeConfig,
+	IPaymentInfo,
+	InvalidRequestError,
+	LightningErrorCode,
+	LightningPaymentError,
+	PaymentDirection,
+	PaymentStatus
+} from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
@@ -515,6 +523,89 @@ describe('Recovery phase 6: the node drives durability', () => {
 		);
 		const [snapshot] = journal.loadVerifiedFrames();
 		expect(snapshot.snapshot!.forwardingEvents).to.have.length(0);
+		node.destroy();
+		storage.close();
+	});
+
+	it('refuses payment metadata a guardian record could not hold (issue #1134)', async function (): Promise<void> {
+		const CEILING = 5_000;
+		const storage = openStorage();
+		// No lease, so nothing is ever sent to these endpoints.
+		const replicator = replicatorFor(
+			storage,
+			GUARDIAN_IDS.map((id) => ({
+				client: new GuardianClient({
+					url: 'http://127.0.0.1:9',
+					guardianSetId: SET_ID
+				}),
+				expectedGuardianId: id
+			}))
+		);
+		replicator.maxRecordBytes = (): number => CEILING;
+		const barrier = barrierFor(replicator, () => null, 'async-remote');
+		const node = createNode(storage, {
+			enabled: true,
+			durability: 'async-remote',
+			barrier
+		});
+		const actions: string[] = [];
+		node.on('log', (log: { action: string }) => actions.push(log.action));
+
+		const hash = sha('labelled');
+		const payment: IPaymentInfo = {
+			paymentHash: hash,
+			preimage: sha('labelled-preimage'),
+			amountMsat: 1_000_000n,
+			status: PaymentStatus.COMPLETED,
+			direction: PaymentDirection.OUTGOING,
+			createdAt: 1_700_000_000_000,
+			completedAt: 1_700_000_001_000
+		};
+		storage.savePayment(hash.toString('hex'), payment);
+		(node as unknown as { payments: Map<string, IPaymentInfo> }).payments.set(
+			hash.toString('hex'),
+			payment
+		);
+
+		// Larger than an empty page on its own: before, it was saved, and the
+		// bootstrap snapshot's page carrying it was refused by every guardian.
+		expect(() =>
+			node.setPaymentMetadata(hash, { note: 'x'.repeat(10_000) })
+		).to.throw(InvalidRequestError, /too large/);
+		// Would fit a frame today, but leaves no room for the row to grow.
+		expect(() =>
+			node.setPaymentMetadata(hash, { note: 'x'.repeat(3_000) })
+		).to.throw(InvalidRequestError, /too large/);
+		expect(node.getPayment(hash)!.metadata).to.equal(undefined);
+		expect(storage.loadPayment(hash.toString('hex'))!.metadata).to.equal(
+			undefined
+		);
+		expect(storage.loadRecoveryFrames()).to.have.length(0);
+
+		// Keysend takes caller metadata into its row too.
+		expect(() =>
+			node.sendKeysend({
+				destination: getPublicKey(sha('keysend-payee')),
+				amountMsat: 1_000n,
+				metadata: { note: 'x'.repeat(10_000) }
+			})
+		)
+			.to.throw(LightningPaymentError, /too large/)
+			.with.property('code', LightningErrorCode.INVALID_KEYSEND);
+
+		// A label that fits lands, and the bootstrap snapshot it triggers stays
+		// under the limit.
+		node.setPaymentMetadata(hash, { note: 'coffee' });
+		const frames = storage.loadRecoveryFrames();
+		expect(frames).to.not.have.length(0);
+		for (const frame of frames) {
+			expect(frame.ciphertext.length).to.be.at.most(CEILING);
+		}
+		expect(storage.loadPayment(hash.toString('hex'))!.metadata).to.deep.equal({
+			note: 'coffee'
+		});
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(actions).to.not.include('recovery_frame_oversized');
 		node.destroy();
 		storage.close();
 	});
