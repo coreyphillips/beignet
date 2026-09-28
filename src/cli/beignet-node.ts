@@ -11004,13 +11004,16 @@ export class BeignetNode extends EventEmitter {
 
 	/**
 	 * Send a keysend (spontaneous) payment — blocks until settled or timeout.
+	 * `onPaymentHash` is called with the payment hash before the HTLC goes
+	 * out; a throw from it refuses the payment.
 	 */
 	async sendKeysend(
 		pubkey: string,
 		amountSats: number,
 		timeoutMs = 60_000,
 		maxFeeSats?: number,
-		metadata?: Record<string, string>
+		metadata?: Record<string, string>,
+		onPaymentHash?: (paymentHash: string) => void
 	): Promise<PaymentInfo> {
 		this._checkDraining();
 		// Guarded before the accounting for the same reason payInvoice is: the
@@ -11020,12 +11023,13 @@ export class BeignetNode extends EventEmitter {
 			BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) * 1000n;
 		// The caller's cap, or the default for the amount (#1008).
 		const maxFeeMsat = resolveMaxFeeMsat(maxFeeSats, undefined, amountMsat);
+		const preimage = crypto.randomBytes(32);
+		onPaymentHash?.(crypto.createHash('sha256').update(preimage).digest('hex'));
 		// This attempt's claim on the daily budget, charged by the
 		// payment:sent handler in create() as payInvoice's is (issue #977).
-		// The engine picks a keysend's preimage, so the hash is unknown until
-		// the send returns; the claim is opened under a provisional key so
-		// that its reservation holds across the call, and moved under the
-		// hash after it. A keysend that never started holds no capacity.
+		// The claim is opened under a provisional key so that its reservation
+		// holds across the call, and moved under the hash after it. A keysend
+		// that never started holds no capacity.
 		const provisionalKey = `keysend:${crypto.randomBytes(8).toString('hex')}`;
 		const claim = this._admitLightningSpend(
 			provisionalKey,
@@ -11040,7 +11044,8 @@ export class BeignetNode extends EventEmitter {
 				destination,
 				amountMsat,
 				maxFeeMsat,
-				metadata
+				metadata,
+				preimage
 			});
 		} catch (err: unknown) {
 			if (claim) this._closeAsyncSpendClaim(provisionalKey, claim);
@@ -12064,14 +12069,17 @@ export class BeignetNode extends EventEmitter {
 	 * maxFeeSats OR maxFeeMsat, never both, exactly as payInvoice takes it
 	 * (issue #998); it bounds the public hops plus the invoice's own
 	 * blinded-path fee, which the payee writes (issue #1001). Without a cap
-	 * the fee is unbounded.
+	 * the fee is unbounded. `onPaymentHash` is called with the invoice's
+	 * payment hash before the HTLC goes out; a throw from it refuses the
+	 * payment.
 	 */
 	async payOffer(
 		offerStr: string,
 		amountSats?: number,
 		timeoutMs = 60_000,
 		maxFeeSats?: number,
-		maxFeeMsatCap?: number | string
+		maxFeeMsatCap?: number | string,
+		onPaymentHash?: (paymentHash: string) => void
 	): Promise<PaymentInfo> {
 		// Paying an offer spends outbound liquidity exactly as payInvoice does,
 		// so it runs the same admission: drain mode, both spending limits, a
@@ -12106,6 +12114,7 @@ export class BeignetNode extends EventEmitter {
 		// started meanwhile has to stop.
 		this._checkDraining();
 		const paymentHashHex = bolt12Invoice.paymentHash.toString('hex');
+		onPaymentHash?.(paymentHashHex);
 
 		// What payBolt12Invoice will actually pay is the invoice's own amount:
 		// the payee prices the offer, and there is nothing else to pay (an

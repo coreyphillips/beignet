@@ -1603,6 +1603,13 @@ export interface IKeysendOptions {
 	customRecords?: Map<number, Buffer>;
 	/** Payment metadata (optional) */
 	metadata?: Record<string, string>;
+	/**
+	 * The 32-byte preimage to pay under (optional; a fresh random one by
+	 * default). A caller that must record the payment hash before the HTLC
+	 * goes out picks it. One whose hash was already paid or is in flight is
+	 * refused with DUPLICATE_PAYMENT.
+	 */
+	preimage?: Buffer;
 }
 
 /**

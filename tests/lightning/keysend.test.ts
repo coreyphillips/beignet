@@ -481,6 +481,56 @@ describe('Keysend: Send Keysend', () => {
 		expect(expectedHash.equals(result.paymentHash)).to.be.true;
 	});
 
+	it('sendKeysend pays under a preimage the caller picked', () => {
+		const { alice, bob } = setupKeysendPair(717, 718);
+		const preimage = crypto.randomBytes(32);
+
+		const result = alice.sendKeysend({
+			destination: Buffer.from(bob.getNodeId(), 'hex'),
+			amountMsat: 50000n,
+			preimage
+		});
+
+		expect(result.preimage!.equals(preimage)).to.be.true;
+		expect(
+			result.paymentHash.equals(
+				crypto.createHash('sha256').update(preimage).digest()
+			)
+		).to.be.true;
+	});
+
+	it('sendKeysend refuses a picked preimage that already paid', () => {
+		const { alice, bob } = setupKeysendPair(736, 737);
+		const options: IKeysendOptions = {
+			destination: Buffer.from(bob.getNodeId(), 'hex'),
+			amountMsat: 50000n,
+			preimage: crypto.randomBytes(32)
+		};
+		expect(alice.sendKeysend(options).status).to.equal(PaymentStatus.COMPLETED);
+
+		let refusal: unknown;
+		try {
+			alice.sendKeysend(options);
+		} catch (err) {
+			refusal = err;
+		}
+		expect(refusal).to.be.instanceOf(LightningPaymentError);
+		expect((refusal as LightningPaymentError).code).to.equal(
+			LightningErrorCode.DUPLICATE_PAYMENT
+		);
+	});
+
+	it('sendKeysend rejects a preimage that is not 32 bytes', () => {
+		const alice = createNode(719);
+		expect(() =>
+			alice.sendKeysend({
+				destination: crypto.randomBytes(33),
+				amountMsat: 50000n,
+				preimage: Buffer.alloc(31)
+			})
+		).to.throw('preimage must be 32 bytes');
+	});
+
 	it('sendKeysend includes metadata from options', () => {
 		const { alice, bob } = setupKeysendPair(715, 716);
 

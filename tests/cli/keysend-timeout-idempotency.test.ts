@@ -152,8 +152,9 @@ describe('keyed POST /keysend after a timeout (#1133)', function () {
 		sent = [];
 		htlcsOut = new Set();
 		const e = engine();
-		e.sendKeysend = (): IPaymentInfo => {
-			const paymentHash = crypto.randomBytes(32);
+		e.sendKeysend = (...args: unknown[]): IPaymentInfo => {
+			const { preimage } = args[0] as { preimage: Buffer };
+			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
 			const hashHex = paymentHash.toString('hex');
 			const record: IPaymentInfo = {
 				paymentHash,
@@ -249,5 +250,61 @@ describe('keyed POST /keysend after a timeout (#1133)', function () {
 		expect(sent).to.have.length(2);
 		expect(errorOf(rerun).paymentHash).to.equal(sent[1]);
 		expect(sent[1]).to.not.equal(first);
+	});
+
+	// Issue #1153: stored before the HTLC goes out, so a daemon stopped before
+	// the timeout still leaves the retry after a restart its marker.
+	it('stores the keysend in flight under its hash until the request answers', async () => {
+		const headers = { 'X-Idempotency-Key': `keysend-in-flight-${Date.now()}` };
+		const cacheKey = `POST /keysend:${headers['X-Idempotency-Key']}`;
+		const storedMarkers = (): Record<string, { paymentHash: string }> =>
+			JSON.parse(
+				node.getStorage().loadWalletData('daemon:payment-timeout-markers:v1') ??
+					'{}'
+			);
+
+		const dispatch = engine().sendKeysend;
+		let storedAtDispatch: string | undefined;
+		engine().sendKeysend = (...args: unknown[]): unknown => {
+			storedAtDispatch = storedMarkers()[cacheKey]?.paymentHash;
+			return dispatch(...args);
+		};
+		const reply = postKeysend(port, { ...body, timeoutMs: 60_000 }, headers);
+		for (let i = 0; sent.length === 0 && i < 250; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		expect(sent).to.have.length(1);
+		expect(storedAtDispatch, 'stored before the HTLC went out').to.equal(
+			sent[0]
+		);
+
+		resolveHtlc(sent[0], 'COMPLETED');
+		expect((await reply).status).to.equal(200);
+		expect(storedMarkers()).to.not.have.property(cacheKey);
+	});
+
+	it('refuses the keysend when its hash cannot be stored', async () => {
+		const headers = { 'X-Idempotency-Key': `keysend-unstored-${Date.now()}` };
+		const storage = node.getStorage();
+		const save = storage.saveWalletData;
+		storage.saveWalletData = (key: string, value: string): void => {
+			if (key === 'daemon:payment-timeout-markers:v1') {
+				throw new Error('disk full');
+			}
+			save.call(storage, key, value);
+		};
+		// The daemon reports the failed write on stderr.
+		const write = process.stderr.write;
+		process.stderr.write = ((): boolean => true) as typeof write;
+		let reply: Reply;
+		try {
+			reply = await postKeysend(port, { ...body, timeoutMs: 1_000 }, headers);
+		} finally {
+			storage.saveWalletData = save;
+			process.stderr.write = write;
+		}
+		expect(reply.status).to.equal(503);
+		expect(errorOf(reply).code).to.equal('NOT_PERSISTED');
+		expect(sent, 'the keysend went out').to.have.length(0);
 	});
 });
