@@ -15,6 +15,7 @@ import {
 	gossipTimestampTooFarFuture,
 	decodeShortChannelId
 } from './types';
+import { encodeChannelAnnouncementMessage } from './messages';
 import {
 	verifyChannelAnnouncementMessage,
 	verifyChannelUpdateMessage,
@@ -30,6 +31,20 @@ const ZERO_SIG = Buffer.alloc(64);
  */
 function isSignatureless(sig: Buffer): boolean {
 	return sig.equals(ZERO_SIG);
+}
+
+/** Whether two channel_announcements carry the same signed content. */
+function sameChannelAnnouncement(
+	a: IChannelAnnouncementMessage,
+	b: IChannelAnnouncementMessage
+): boolean {
+	try {
+		return encodeChannelAnnouncementMessage(a).equals(
+			encodeChannelAnnouncementMessage(b)
+		);
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -256,16 +271,21 @@ export class NetworkGraph {
 			// in place, so the channel becomes servable. Endpoints must match;
 			// existing updates and their provenance flags are preserved. A
 			// deferred candidate (always real-signature, normalizeVerified
-			// downgrades the rest) may only displace a SIGNATURELESS slot:
-			// over a signed slot it could change nothing servability-wise,
-			// and a peer re-serving a known dump against an all-deferred
-			// graph would otherwise "accept" every duplicate and re-trigger a
+			// downgrades the rest) may only displace a SIGNATURELESS slot or
+			// one whose signatures already FAILED (settled false), and never
+			// with the same message: over a pending or verified slot it could
+			// change nothing servability-wise, and a peer re-serving a known
+			// dump would otherwise "accept" every duplicate and re-trigger a
 			// storage write per entry (the issue #437 failure class,
-			// relocated to disk).
+			// relocated to disk). Without the failed-slot case, a forged
+			// upgrade of an RGS slot would block the genuine one forever
+			// (issue #1106).
 			const upgrade =
 				verified === true ||
 				(verified === 'deferred' &&
-					isSignatureless(existing.announcement.nodeSignature1));
+					(isSignatureless(existing.announcement.nodeSignature1) ||
+						(existing.announcementVerified === false &&
+							!sameChannelAnnouncement(existing.announcement, msg))));
 			if (
 				upgrade &&
 				existing.announcementVerified !== true &&
@@ -451,8 +471,8 @@ export class NetworkGraph {
 	// re-serving a known graph pinned the event loop for the whole dump).
 	// Deferred candidates (issue #443) accept a strict subset of what verified
 	// candidates accept (every deferred takeover additionally requires a
-	// signatureless slot), so mirroring the verified rules keeps these gates
-	// valid upper bounds for both provenances.
+	// signatureless or failed slot), so mirroring the verified rules keeps
+	// these gates valid upper bounds for both provenances.
 
 	/**
 	 * Whether a channel_announcement could change the graph at all. False for
