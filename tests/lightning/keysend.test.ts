@@ -499,6 +499,27 @@ describe('Keysend: Send Keysend', () => {
 		).to.be.true;
 	});
 
+	it('sendKeysend refuses a picked preimage that already paid', () => {
+		const { alice, bob } = setupKeysendPair(736, 737);
+		const options: IKeysendOptions = {
+			destination: Buffer.from(bob.getNodeId(), 'hex'),
+			amountMsat: 50000n,
+			preimage: crypto.randomBytes(32)
+		};
+		expect(alice.sendKeysend(options).status).to.equal(PaymentStatus.COMPLETED);
+
+		let refusal: unknown;
+		try {
+			alice.sendKeysend(options);
+		} catch (err) {
+			refusal = err;
+		}
+		expect(refusal).to.be.instanceOf(LightningPaymentError);
+		expect((refusal as LightningPaymentError).code).to.equal(
+			LightningErrorCode.DUPLICATE_PAYMENT
+		);
+	});
+
 	it('sendKeysend rejects a preimage that is not 32 bytes', () => {
 		const alice = createNode(719);
 		expect(() =>

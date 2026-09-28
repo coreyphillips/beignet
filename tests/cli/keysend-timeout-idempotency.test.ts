@@ -282,4 +282,29 @@ describe('keyed POST /keysend after a timeout (#1133)', function () {
 		expect((await reply).status).to.equal(200);
 		expect(storedMarkers()).to.not.have.property(cacheKey);
 	});
+
+	it('refuses the keysend when its hash cannot be stored', async () => {
+		const headers = { 'X-Idempotency-Key': `keysend-unstored-${Date.now()}` };
+		const storage = node.getStorage();
+		const save = storage.saveWalletData;
+		storage.saveWalletData = (key: string, value: string): void => {
+			if (key === 'daemon:payment-timeout-markers:v1') {
+				throw new Error('disk full');
+			}
+			save.call(storage, key, value);
+		};
+		// The daemon reports the failed write on stderr.
+		const write = process.stderr.write;
+		process.stderr.write = ((): boolean => true) as typeof write;
+		let reply: Reply;
+		try {
+			reply = await postKeysend(port, { ...body, timeoutMs: 1_000 }, headers);
+		} finally {
+			storage.saveWalletData = save;
+			process.stderr.write = write;
+		}
+		expect(reply.status).to.equal(503);
+		expect(errorOf(reply).code).to.equal('NOT_PERSISTED');
+		expect(sent, 'the keysend went out').to.have.length(0);
+	});
 });

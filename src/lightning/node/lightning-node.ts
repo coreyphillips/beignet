@@ -16845,10 +16845,19 @@ export class LightningNode extends EventEmitter {
 	 * via TLV type 5482373484, and the recipient extracts + verifies it.
 	 */
 	sendKeysend(options: IKeysendOptions): IPaymentInfo {
-		if (options.preimage !== undefined && options.preimage.length !== 32) {
-			throw new LightningPaymentError(
-				LightningErrorCode.INVALID_KEYSEND,
-				'preimage must be 32 bytes'
+		if (options.preimage !== undefined) {
+			if (options.preimage.length !== 32) {
+				throw new LightningPaymentError(
+					LightningErrorCode.INVALID_KEYSEND,
+					'preimage must be 32 bytes'
+				);
+			}
+			// dispatchKeysend refuses only a PENDING record, which a random
+			// preimage never meets again. A reused one would pay a second time
+			// under a hash the first payee already knows the preimage of.
+			this.assertHashUnpaid(
+				crypto.createHash('sha256').update(options.preimage).digest(),
+				'any-pending'
 			);
 		}
 		// A fresh preimage per call unless the caller picked one, so each

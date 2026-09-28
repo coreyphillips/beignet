@@ -1606,7 +1606,8 @@ export interface IKeysendOptions {
 	/**
 	 * The 32-byte preimage to pay under (optional; a fresh random one by
 	 * default). A caller that must record the payment hash before the HTLC
-	 * goes out picks it.
+	 * goes out picks it. One whose hash was already paid or is in flight is
+	 * refused with DUPLICATE_PAYMENT.
 	 */
 	preimage?: Buffer;
 }

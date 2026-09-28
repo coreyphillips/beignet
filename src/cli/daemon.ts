@@ -1285,7 +1285,8 @@ async function bootDaemon(
 		string,
 		Omit<CachedResponse, 'response'>
 	>();
-	const saveTimeoutMarkers = (): void => {
+	/** False when the write failed, which it reports. */
+	const saveTimeoutMarkers = (): boolean => {
 		const markers: Record<
 			string,
 			Omit<CachedResponse, 'response'>
@@ -1305,9 +1306,11 @@ async function bootDaemon(
 					PAYMENT_TIMEOUT_MARKERS_STORAGE_KEY,
 					JSON.stringify(markers)
 				);
+			return true;
 		} catch (err) {
 			// The marker in memory still answers retries until a restart.
 			reportFault('Could not persist the payment timeout markers', err);
+			return false;
 		}
 	};
 	// #768: a key only reaches the cache once its handler has RETURNED, so two
@@ -3695,7 +3698,14 @@ async function bootDaemon(
 						expiresAt: Date.now() + IDEMPOTENCY_TTL_MS,
 						paymentHash
 					});
-					saveTimeoutMarkers();
+					// Unstored, a crash from here lets the retry pay again.
+					if (!saveTimeoutMarkers()) {
+						inFlightPaymentMarkers.delete(cacheKey);
+						throw new BeignetError(
+							'NOT_PERSISTED',
+							'Could not store the payment before sending it; nothing was sent'
+						);
+					}
 				};
 				// Wrapped so a synchronous throw rejects the shared promise
 				// instead of escaping before the reservation is released.
