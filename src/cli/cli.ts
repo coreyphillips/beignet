@@ -744,13 +744,15 @@ async function handlePsbt(): Promise<void> {
 						: undefined
 				})
 			);
-		case 'import-signed':
+		case 'import-signed': {
+			const pos = positionalArgs();
 			return outputResult(
 				await httpRequest('POST', '/psbt/import-signed', {
-					psbtBase64: readPsbtArg(filteredArgs[2]),
-					unsignedPsbtBase64: readPsbtArg(filteredArgs[3])
+					psbtBase64: readPsbtArg(pos[2]),
+					unsignedPsbtBase64: readPsbtArg(pos[3])
 				})
 			);
+		}
 		case 'combine':
 			return outputResult(
 				await httpRequest('POST', '/psbt/combine', {
