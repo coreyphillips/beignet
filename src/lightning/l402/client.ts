@@ -283,7 +283,7 @@ export async function l402Fetch(
 	// redirector, and the cross-origin hop would strip it before the issuer
 	// ever saw it. The caller's own credential headers were meant for the
 	// requested origin, so they stay behind as they would on that hop.
-	let issuer = challengeIssuer(url, response.url);
+	const issuer = challengeIssuer(url, response.url);
 	assertReplayableAt(issuer, url, init);
 	const issuerRequest = (credential?: IL402Credential): IL402RequestInit =>
 		withTimeout(
@@ -308,7 +308,13 @@ export async function l402Fetch(
 		const minted = usableCredential(store.get(issuerScope), store);
 		if (minted) {
 			const reused = await doFetch(issuer, issuerRequest(minted));
-			if (reused.status !== 401 && reused.status !== 402) {
+			// Only the issuer can reject its credential. A response from another
+			// origin followed a redirect that stripped it, so it says nothing
+			// about the credential and is returned as it is.
+			if (
+				(reused.status !== 401 && reused.status !== 402) ||
+				challengeIssuer(issuer, reused.url) !== issuer
+			) {
 				return {
 					response: reused,
 					paid: false,
@@ -324,11 +330,8 @@ export async function l402Fetch(
 				reused.headers.get('www-authenticate') ?? ''
 			);
 			if (fresh) {
-				assertSameOrigin(url, reused.url, options);
 				challenge = fresh;
 				response = reused;
-				issuer = challengeIssuer(issuer, reused.url);
-				assertReplayableAt(issuer, url, init);
 			}
 		}
 

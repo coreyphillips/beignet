@@ -1033,6 +1033,60 @@ describe('l402Fetch payment safety', () => {
 		);
 	});
 
+	it('keeps a cross-origin credential when a redirect past its issuer ends in 401', async () => {
+		const pair = makeChallengePair(1_000n);
+		const payer = recordingPayer(pair.preimage);
+		const store = new MemoryL402CredentialStore();
+		const heldPreimage = crypto.randomBytes(32).toString('hex');
+		store.set({
+			scope: 'https://issuer.example',
+			macaroon: makeMacaroon(crypto.randomBytes(32)),
+			preimage: heldPreimage,
+			paymentHash: crypto.randomBytes(32).toString('hex'),
+			amountSats: 1,
+			createdAt: Date.now(),
+			scheme: 'L402'
+		});
+		const challenge = `L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`;
+		// Unauthenticated requests end at the issuer's challenge. The issuer
+		// accepts the held credential and redirects to another origin, which
+		// answers 401 because the hop stripped the credential.
+		const fetchImpl: FetchLike = async (_url, init) => {
+			const authenticated = Boolean(init?.headers?.Authorization);
+			return {
+				status: authenticated ? 401 : 402,
+				url: authenticated
+					? 'https://downstream.example/x'
+					: 'https://issuer.example/pay',
+				headers: {
+					get: (name: string): string | null =>
+						!authenticated && name.toLowerCase() === 'www-authenticate'
+							? challenge
+							: null
+				},
+				text: async (): Promise<string> => ''
+			};
+		};
+
+		const result = await l402Fetch(
+			'https://redirector.example/x',
+			{},
+			{
+				payer,
+				maxPriceSats: 10,
+				credentials: store,
+				allowCrossOriginChallenge: true,
+				fetchImpl
+			}
+		);
+		expect(result.response.status).to.equal(401);
+		expect(result.paid).to.equal(false);
+		expect(payer.payments).to.equal(0);
+		expect(store.get('https://issuer.example')?.preimage).to.equal(
+			heldPreimage
+		);
+	});
+
 	it('rejects a preimage that does not open the invoice hash', async () => {
 		const pair = makeChallengePair(1_000n);
 		const payer = recordingPayer(crypto.randomBytes(32)); // wrong preimage
