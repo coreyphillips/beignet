@@ -490,6 +490,112 @@ describe('Hold Invoices (M4 batch 1)', function () {
 				}
 			}
 		});
+
+		it('records the settled amount on an any-amount hold invoice (#1128)', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createNode(55);
+			const bob = createNode(56, storage);
+			connectNodes(alice, bob);
+			const ch1 = openReadyChannel(alice, bob, 200_000n);
+			const ch2 = openReadyChannel(alice, bob, 200_000n);
+			buildGraph(alice, bob, [ch1, ch2], 200_000_000n);
+
+			const settledEvents = new Map<string, bigint>();
+			bob.on(
+				'invoice:settled',
+				(e: { paymentHash: Buffer; amountMsat: bigint }) => {
+					settledEvents.set(e.paymentHash.toString('hex'), e.amountMsat);
+				}
+			);
+
+			const settle = (
+				label: string,
+				invoiceAmountMsat: bigint | undefined,
+				pay: (bolt11: string, hash: Buffer, secret: Buffer) => void,
+				paidMsat: bigint,
+				parts: number
+			): void => {
+				const { preimage, hash } = makeExternalHash();
+				const invoice = bob.createInvoice({
+					amountMsat: invoiceAmountMsat,
+					description: label,
+					hold: true,
+					paymentHash: hash
+				});
+				pay(invoice.bolt11, hash, invoice.paymentSecret);
+				const held = bob
+					.listHoldInvoices()
+					.find((h) => h.paymentHash === hash.toString('hex'))!;
+				expect(held.heldAmountMsat, `${label} held`).to.equal(paidMsat);
+				expect(held.htlcCount, `${label} parts`).to.equal(parts);
+
+				expect(bob.settleHeldHtlc(hash, preimage), label).to.be.true;
+				const expected = invoiceAmountMsat ?? paidMsat;
+				expect(bob.getPayment(hash)!.amountMsat, `${label} record`).to.equal(
+					expected
+				);
+				expect(
+					storage.loadPayment(hash.toString('hex'))!.amountMsat,
+					`${label} persisted`
+				).to.equal(expected);
+				expect(
+					settledEvents.get(hash.toString('hex')),
+					`${label} invoice:settled`
+				).to.equal(expected);
+			};
+
+			// One part per channel, each carrying partMsat toward totalMsat.
+			const payParts =
+				(partMsat: bigint, parts: number) =>
+				(_bolt11: string, hash: Buffer, secret: Buffer): void => {
+					for (let i = 0; i < parts; i++) {
+						alice.sendPaymentToRoute(
+							{
+								hops: [
+									{
+										pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+										shortChannelId: encodeShortChannelId({
+											block: 500,
+											txIndex: i + 1,
+											outputIndex: 0
+										}),
+										amountToForwardMsat: partMsat,
+										outgoingCltvValue: 40
+									}
+								]
+							},
+							hash,
+							40,
+							secret,
+							partMsat * BigInt(parts)
+						);
+					}
+				};
+
+			settle(
+				'single part',
+				undefined,
+				(bolt11) =>
+					alice.sendPayment(bolt11, undefined, undefined, 50_000_000n),
+				50_000_000n,
+				1
+			);
+			settle('mpp', undefined, payParts(30_000_000n, 2), 60_000_000n, 2);
+			// A fixed-amount invoice keeps the amount it was issued for, even
+			// when the payer overpays it.
+			settle(
+				'fixed amount',
+				40_000_000n,
+				payParts(45_000_000n, 1),
+				45_000_000n,
+				1
+			);
+
+			alice.destroy();
+			bob.destroy();
+			storage.close();
+		});
 	});
 
 	describe('restart persistence', function () {

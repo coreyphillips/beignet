@@ -19541,6 +19541,7 @@ export class LightningNode extends EventEmitter {
 			outcome: 'settle'
 		});
 		if (!settledSet) return false;
+		const settledMsat = settledSet.reduce((sum, h) => sum + h.amountMsat, 0n);
 
 		const payment = this.payments.get(hashHex);
 		if (payment) {
@@ -19550,6 +19551,8 @@ export class LightningNode extends EventEmitter {
 			payment.settledHtlcs = held.map(
 				(h) => `${h.channelId.toString('hex')}:${h.htlcId}`
 			);
+			// 0n is an any-amount invoice that had no payment until now.
+			if (payment.amountMsat === 0n) payment.amountMsat = settledMsat;
 			this.safeStorage(
 				() => this.persistPayment(paymentHash),
 				'persistPayment'
@@ -19564,7 +19567,7 @@ export class LightningNode extends EventEmitter {
 		const event: IHoldInvoiceStateEvent = {
 			paymentHash,
 			state: 'SETTLED',
-			heldAmountMsat: settledSet.reduce((sum, h) => sum + h.amountMsat, 0n),
+			heldAmountMsat: settledMsat,
 			htlcCount: settledSet.length,
 			...this.heldSetExpiry(hashHex, settledSet)
 		};
