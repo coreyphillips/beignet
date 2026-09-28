@@ -76,8 +76,9 @@ interface CachedResponse {
 	bodyHash: string;
 	expiresAt: number;
 	/**
-	 * Set instead of a response for a keyed POST /offer/pay that timed out:
-	 * the payment the key started, whose outcome answers each retry (#1094).
+	 * Set instead of a response for a keyed POST /offer/pay or POST /keysend
+	 * that timed out: the payment the key started, whose outcome answers each
+	 * retry (#1094, #1133).
 	 */
 	paymentHash?: string;
 }
@@ -1251,19 +1252,20 @@ async function bootDaemon(
 	// handler's promise and answers with its result, a different-body overlap
 	// gets the 409 without running anything. The entry is dropped when the
 	// handler settles, after which the cache takes over as before (a returned
-	// envelope is cached, a throw caches nothing but an /offer/pay timeout's
-	// payment hash).
+	// envelope is cached, a throw caches nothing but an /offer/pay or /keysend
+	// timeout's payment hash).
 	const idempotencyInFlight = new Map<
 		string,
 		{ bodyHash: string; promise: Promise<unknown> }
 	>();
 	/**
-	 * The answer to a keyed /offer/pay retry whose first attempt timed out
-	 * (#1094): the completed payment once it settled, a 409 carrying its hash
-	 * while it can still settle, and null once it cannot, when the key may pay
-	 * again. 409 rather than the first 504, which would invite another retry.
+	 * The answer to a keyed /offer/pay or /keysend retry whose first attempt
+	 * timed out (#1094): the completed payment once it settled, a 409 carrying
+	 * its hash while it can still settle, and null once it cannot, when the
+	 * key may pay again. 409 rather than the first 504, which would invite
+	 * another retry.
 	 */
-	const timedOutOfferReplay = (
+	const timedOutPaymentReplay = (
 		paymentHash: string
 	): ApiResponse<PaymentInfo> | null => {
 		const outcome = node.paymentOutcome(paymentHash);
@@ -1272,7 +1274,7 @@ async function bootDaemon(
 		if (paid?.status === 'COMPLETED') return success(paid);
 		const err = new BeignetError(
 			'DUPLICATE_PAYMENT',
-			'The offer payment this idempotency key started is still in flight; ' +
+			'The payment this idempotency key started is still in flight; ' +
 				`nothing was paid again. GET /payment?paymentHash=${paymentHash} ` +
 				'reports its outcome.'
 		);
@@ -2297,6 +2299,15 @@ async function bootDaemon(
 					)
 				);
 			} catch (err: unknown) {
+				// Thrown, not returned, so a keyed timeout is remembered by its
+				// hash rather than cached as an envelope that expires (#1133).
+				if (
+					err instanceof BeignetError &&
+					err.code === 'PAYMENT_TIMEOUT' &&
+					err.paymentHash !== undefined
+				) {
+					throw err;
+				}
 				const msg = err instanceof Error ? err.message : String(err);
 				const code = err instanceof BeignetError ? err.code : 'PAYMENT_FAILED';
 				return failure(code, msg);
@@ -3578,7 +3589,7 @@ async function bootDaemon(
 						endWithResult(res, cached.response);
 						return;
 					}
-					const replay = timedOutOfferReplay(cached.paymentHash);
+					const replay = timedOutPaymentReplay(cached.paymentHash);
 					if (replay !== null) {
 						if (replay.ok) {
 							idempotencyCache.set(cacheKey, {
@@ -3612,14 +3623,14 @@ async function bootDaemon(
 				try {
 					result = await pending;
 				} catch (err: unknown) {
-					// A thrown error is not cached, but an offer payment's
-					// timeout can leave an HTLC out that still settles, and a
-					// rerun would ask the payee for a fresh invoice under a
-					// fresh hash that the engine cannot tie to the first. A
-					// retried /invoice/pay meets the engine's duplicate refusal
-					// on its own hash instead.
+					// A thrown error is not cached, but an offer payment's or a
+					// keysend's timeout can leave an HTLC out that still
+					// settles, and a rerun would pay under a fresh hash (a new
+					// invoice, a new preimage) that the engine cannot tie to
+					// the first. A retried /invoice/pay meets the engine's
+					// duplicate refusal on its own hash instead.
 					if (
-						routeKey === 'POST /offer/pay' &&
+						(routeKey === 'POST /offer/pay' || routeKey === 'POST /keysend') &&
 						err instanceof BeignetError &&
 						err.code === 'PAYMENT_TIMEOUT' &&
 						err.paymentHash !== undefined
