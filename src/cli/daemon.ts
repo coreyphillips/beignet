@@ -8,6 +8,7 @@ import * as http from 'http';
 import * as net from 'net';
 import * as https from 'https';
 import * as fs from 'fs';
+import { createHash } from 'crypto';
 import { Console } from 'console';
 import {
 	BeignetNode,
@@ -70,6 +71,9 @@ export interface DaemonOptions extends BeignetNodeOptions {
 const MAX_BODY_BYTES = 1_048_576; // 1 MB
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+// The CachedResponse entries that carry a paymentHash, kept across restarts
+// (#1132): a retry that missed its marker would pay again under a fresh hash.
+const PAYMENT_TIMEOUT_MARKERS_STORAGE_KEY = 'daemon:payment-timeout-markers:v1';
 
 interface CachedResponse {
 	response: unknown;
@@ -1245,6 +1249,54 @@ async function bootDaemon(
 
 	// Idempotency cache
 	const idempotencyCache = new Map<string, CachedResponse>();
+	// A marker lost here lets a retry pay twice, so a row that cannot be read
+	// fails the boot rather than starting without it.
+	const storedMarkers = node
+		.getStorage()
+		.loadWalletData(PAYMENT_TIMEOUT_MARKERS_STORAGE_KEY);
+	if (storedMarkers !== null) {
+		const markers = JSON.parse(storedMarkers) as Record<
+			string,
+			Omit<CachedResponse, 'response'>
+		>;
+		for (const [key, m] of Object.entries(markers)) {
+			if (
+				!/^[0-9a-f]{64}$/.test(m?.bodyHash) ||
+				!Number.isFinite(m.expiresAt) ||
+				!/^[0-9a-f]{64}$/.test(m.paymentHash ?? '')
+			) {
+				throw new Error(`Unreadable payment timeout marker for ${key}`);
+			}
+			idempotencyCache.set(key, {
+				response: undefined,
+				bodyHash: m.bodyHash,
+				expiresAt: m.expiresAt,
+				paymentHash: m.paymentHash
+			});
+		}
+	}
+	const saveTimeoutMarkers = (): void => {
+		const markers: Record<string, Omit<CachedResponse, 'response'>> = {};
+		for (const [
+			key,
+			{ bodyHash, expiresAt, paymentHash }
+		] of idempotencyCache) {
+			if (paymentHash !== undefined) {
+				markers[key] = { bodyHash, expiresAt, paymentHash };
+			}
+		}
+		try {
+			node
+				.getStorage()
+				.saveWalletData(
+					PAYMENT_TIMEOUT_MARKERS_STORAGE_KEY,
+					JSON.stringify(markers)
+				);
+		} catch (err) {
+			// The marker in memory still answers retries until a restart.
+			reportFault('Could not persist the payment timeout markers', err);
+		}
+	};
 	// #768: a key only reaches the cache once its handler has RETURNED, so two
 	// requests carrying the same key that overlap both miss the cache and both
 	// run the handler (two broadcasts on /send). This map reserves the key
@@ -1283,6 +1335,7 @@ async function bootDaemon(
 	};
 	const idempotencyCleanupTimer = setInterval(() => {
 		const now = Date.now();
+		let markerDropped = false;
 		for (const [key, entry] of idempotencyCache) {
 			if (now < entry.expiresAt) continue;
 			// An HTLC can stay out for up to 2016 blocks, well past the TTL,
@@ -1294,8 +1347,10 @@ async function bootDaemon(
 				entry.expiresAt = now + IDEMPOTENCY_TTL_MS;
 				continue;
 			}
+			if (entry.paymentHash !== undefined) markerDropped = true;
 			idempotencyCache.delete(key);
 		}
+		if (markerDropped) saveTimeoutMarkers();
 	}, IDEMPOTENCY_CLEANUP_INTERVAL_MS);
 	if (idempotencyCleanupTimer.unref) idempotencyCleanupTimer.unref();
 	started.release.push(() => clearInterval(idempotencyCleanupTimer));
@@ -3578,7 +3633,10 @@ async function bootDaemon(
 			}
 			if (idempotencyKey && IDEMPOTENT_ROUTES.has(routeKey)) {
 				const cacheKey = `${routeKey}:${idempotencyKey}`;
-				const bodyHash = JSON.stringify(body);
+				// A digest, so a stored timeout marker stays small whatever the body.
+				const bodyHash = createHash('sha256')
+					.update(JSON.stringify(body))
+					.digest('hex');
 				const cached = idempotencyCache.get(cacheKey);
 				if (cached) {
 					if (cached.bodyHash !== bodyHash) {
@@ -3589,20 +3647,17 @@ async function bootDaemon(
 						endWithResult(res, cached.response);
 						return;
 					}
+					// The marker stays after a settled answer: a response cached in
+					// its place would not survive a restart, and the retry after
+					// one would pay again.
 					const replay = timedOutPaymentReplay(cached.paymentHash);
 					if (replay !== null) {
-						if (replay.ok) {
-							idempotencyCache.set(cacheKey, {
-								response: replay,
-								bodyHash,
-								expiresAt: cached.expiresAt
-							});
-						}
 						endWithResult(res, replay);
 						return;
 					}
 					// The first attempt can no longer settle, so this one runs.
 					idempotencyCache.delete(cacheKey);
+					saveTimeoutMarkers();
 				}
 				const inFlight = idempotencyInFlight.get(cacheKey);
 				if (inFlight) {
@@ -3641,6 +3696,7 @@ async function bootDaemon(
 							expiresAt: Date.now() + IDEMPOTENCY_TTL_MS,
 							paymentHash: err.paymentHash
 						});
+						saveTimeoutMarkers();
 					}
 					throw err;
 				} finally {
