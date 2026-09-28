@@ -2699,3 +2699,526 @@ describe('Recovery phase 2: round-17 watermark anchoring', () => {
 		storage.close();
 	});
 });
+
+describe('Recovery phase 2: snapshots fit the guardian record limit (issue #1014)', () => {
+	const EVENTS = 300;
+
+	function commitPreimage(
+		manager: RecoveryManager,
+		fill: number
+	): ReturnType<RecoveryManager['commit']> {
+		return manager.commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, fill).toString('hex'),
+					preimage: Buffer.alloc(32, fill)
+				}
+			],
+			outboundMessages: []
+		});
+	}
+
+	/** A store whose forwarding ledger dominates its snapshot. */
+	function routedStorage(): SqliteStorage {
+		const storage = openStorage();
+		for (let i = 0; i < EVENTS; i++) {
+			storage.saveForwardingEvent({
+				settledAt: 1_700_000_000_000 + i,
+				inChannelId: Buffer.alloc(32, 1).toString('hex'),
+				outChannelId: Buffer.alloc(32, 2).toString('hex'),
+				amountInMsat: 1_001_000n,
+				amountOutMsat: 1_000_000n,
+				feeMsat: 1_000n
+			});
+		}
+		return storage;
+	}
+
+	/** Ciphertext bytes of the bootstrap snapshot with no limit applied. */
+	function unboundedSnapshotBytes(): number {
+		const storage = routedStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 1).committed).to.equal(true);
+		const bytes = storage.loadRecoveryFrames()[0].ciphertext.length;
+		storage.close();
+		return bytes;
+	}
+
+	function limitedJournal(
+		storage: SqliteStorage,
+		ceiling: number,
+		reports: Array<{ outcome: string; detail: string }>
+	): { manager: RecoveryManager; journal: RecoveryJournal } {
+		const journal = new RecoveryJournal(
+			storage,
+			MASTER_KEY,
+			NODE_ID,
+			RECOVERY_ID,
+			{
+				maxFrameCiphertextBytes: (): number => ceiling,
+				onFrameCeiling: (event): void => {
+					reports.push(event);
+				}
+			}
+		);
+		return { manager: new RecoveryManager(storage, { journal }), journal };
+	}
+
+	it('drops the oldest forwarding events until the snapshot fits, and still restores', () => {
+		const ceiling = Math.floor(unboundedSnapshotBytes() / 2);
+		const storage = routedStorage();
+		const reports: Array<{ outcome: string; detail: string }> = [];
+		const { manager, journal } = limitedJournal(storage, ceiling, reports);
+		expect(commitPreimage(manager, 1).committed).to.equal(true);
+
+		expect(storage.loadRecoveryFrames()[0].ciphertext.length).to.be.at.most(
+			ceiling
+		);
+		const frames = journal.loadVerifiedFrames();
+		const kept = frames[0].snapshot!.forwardingEvents;
+		expect(kept.length).to.be.greaterThan(EVENTS / 3);
+		expect(kept.length).to.be.lessThan(EVENTS);
+		// The newest events survive, contiguously.
+		expect(kept[kept.length - 1].settledAt).to.equal(
+			1_700_000_000_000 + EVENTS - 1
+		);
+		expect(kept[0].settledAt).to.equal(
+			1_700_000_000_000 + EVENTS - kept.length
+		);
+		// Every other table is whole.
+		expect(frames[0].snapshot!.preimages).to.have.length(1);
+		expect(reports).to.have.length(1);
+		expect(reports[0].outcome).to.equal('trimmed');
+		expect(reports[0].detail).to.contain(
+			`oldest ${EVENTS - kept.length} of ${EVENTS}`
+		);
+
+		const target = openStorage();
+		reconstructFromFrames(target, frames);
+		expect(target.listForwardingEvents()).to.have.length(kept.length);
+		expect(target.loadAllPreimages()).to.have.length(1);
+		target.close();
+		storage.close();
+	});
+
+	it('then drops failed receives and failed sends, oldest first, but never a completed payment', () => {
+		const at = (i: number): number => 1_700_000_000_000 + i;
+		const hashOf = (tag: number, i: number): Buffer => {
+			const hash = Buffer.alloc(32, tag);
+			hash.writeUInt32BE(i, 0);
+			return hash;
+		};
+		const record = (
+			hash: Buffer,
+			direction: PaymentDirection,
+			status: PaymentStatus,
+			createdAt: number
+		): IPaymentInfo =>
+			({
+				paymentHash: hash,
+				amountMsat: 1_000_000n,
+				status,
+				direction,
+				createdAt
+			}) as IPaymentInfo;
+		const fill = (storage: SqliteStorage, withHistory: boolean): void => {
+			for (let i = 0; i < 40; i++) {
+				storage.saveForwardingEvent({
+					settledAt: at(i),
+					inChannelId: Buffer.alloc(32, 1).toString('hex'),
+					outChannelId: Buffer.alloc(32, 2).toString('hex'),
+					amountInMsat: 1_001_000n,
+					amountOutMsat: 1_000_000n,
+					feeMsat: 1_000n
+				});
+			}
+			// Completed sends: the double-pay guard's evidence.
+			for (let i = 0; i < 20; i++) {
+				const hash = hashOf(3, i);
+				storage.savePayment(
+					hash.toString('hex'),
+					record(
+						hash,
+						PaymentDirection.OUTGOING,
+						PaymentStatus.COMPLETED,
+						at(i)
+					)
+				);
+			}
+			// Completed receives: what refuses a second HTLC for a paid hash.
+			for (let i = 0; i < 20; i++) {
+				const hash = hashOf(8, i);
+				storage.savePayment(
+					hash.toString('hex'),
+					record(
+						hash,
+						PaymentDirection.INCOMING,
+						PaymentStatus.COMPLETED,
+						at(i)
+					)
+				);
+			}
+			// A failed send whose HTLC settled after all: it counts as paid.
+			const settled = hashOf(4, 0);
+			storage.savePayment(
+				settled.toString('hex'),
+				record(settled, PaymentDirection.OUTGOING, PaymentStatus.FAILED, at(0))
+			);
+			storage.savePreimage(settled.toString('hex'), Buffer.alloc(32, 4));
+			// A failed send whose HTLC is still live and can yet be fulfilled.
+			const live = hashOf(9, 0);
+			storage.savePayment(
+				live.toString('hex'),
+				record(live, PaymentDirection.OUTGOING, PaymentStatus.FAILED, at(0))
+			);
+			storage.saveHtlcPaymentMapping('live-htlc', live.toString('hex'));
+			// A receive still waiting.
+			const waiting = hashOf(5, 0);
+			storage.savePayment(
+				waiting.toString('hex'),
+				record(waiting, PaymentDirection.INCOMING, PaymentStatus.PENDING, at(0))
+			);
+			if (!withHistory) return;
+			for (let i = 0; i < 200; i++) {
+				const receive = hashOf(6, i);
+				storage.savePayment(
+					receive.toString('hex'),
+					record(
+						receive,
+						PaymentDirection.INCOMING,
+						PaymentStatus.FAILED,
+						at(2 * i)
+					)
+				);
+				const failed = hashOf(7, i);
+				storage.savePayment(
+					failed.toString('hex'),
+					record(
+						failed,
+						PaymentDirection.OUTGOING,
+						PaymentStatus.FAILED,
+						at(2 * i + 1)
+					)
+				);
+			}
+		};
+		const bytes = (withHistory: boolean): number => {
+			const storage = openStorage();
+			fill(storage, withHistory);
+			const { manager } = makeJournaledManager(storage);
+			expect(commitPreimage(manager, 1).committed).to.equal(true);
+			const size = storage.loadRecoveryFrames()[0].ciphertext.length;
+			storage.close();
+			return size;
+		};
+		const ceiling = Math.floor((bytes(true) + bytes(false)) / 2);
+
+		const storage = openStorage();
+		fill(storage, true);
+		const reports: Array<{ outcome: string; detail: string }> = [];
+		const { manager, journal } = limitedJournal(storage, ceiling, reports);
+		expect(commitPreimage(manager, 1).committed).to.equal(true);
+		expect(storage.loadRecoveryFrames()[0].ciphertext.length).to.be.at.most(
+			ceiling
+		);
+
+		const frames = journal.loadVerifiedFrames();
+		const snapshot = frames[0].snapshot!;
+		// The ledger goes first and in full before any payment record does.
+		expect(snapshot.forwardingEvents).to.have.length(0);
+		const kept = new Map(snapshot.payments.map((p) => [p.paymentHash, p]));
+		for (let i = 0; i < 20; i++) {
+			expect(kept.has(hashOf(3, i).toString('hex'))).to.equal(true);
+			expect(kept.has(hashOf(8, i).toString('hex'))).to.equal(true);
+		}
+		expect(kept.has(hashOf(4, 0).toString('hex'))).to.equal(true);
+		expect(kept.has(hashOf(5, 0).toString('hex'))).to.equal(true);
+		expect(kept.has(hashOf(9, 0).toString('hex'))).to.equal(true);
+		// hashOf keeps the tag in the last byte.
+		const history = snapshot.payments.filter((p) =>
+			[6, 7].includes(Buffer.from(p.paymentHash, 'hex')[31])
+		);
+		expect(history.length).to.be.greaterThan(0);
+		expect(history.length).to.be.lessThan(400);
+		// Oldest first: every kept history row is newer than every dropped one.
+		const oldestKept = Math.min(...history.map((p) => p.payment.createdAt));
+		expect(oldestKept).to.equal(at(400 - history.length));
+		expect(reports).to.have.length(1);
+		expect(reports[0].outcome).to.equal('trimmed');
+		expect(reports[0].detail).to.contain('40 of 40 forwarding events');
+		expect(reports[0].detail).to.contain(
+			`${400 - history.length} of 400 failed payments`
+		);
+
+		const target = openStorage();
+		reconstructFromFrames(target, frames);
+		for (let i = 0; i < 20; i++) {
+			expect(target.loadPayment(hashOf(3, i).toString('hex'))?.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(target.loadPayment(hashOf(8, i).toString('hex'))?.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+		}
+		target.close();
+		storage.close();
+	});
+
+	it('leaves a snapshot that already fits untouched', () => {
+		const ceiling = unboundedSnapshotBytes();
+		const storage = routedStorage();
+		const reports: Array<{ outcome: string; detail: string }> = [];
+		const { manager, journal } = limitedJournal(storage, ceiling, reports);
+		expect(commitPreimage(manager, 1).committed).to.equal(true);
+		expect(
+			journal.loadVerifiedFrames()[0].snapshot!.forwardingEvents
+		).to.have.length(EVENTS);
+		expect(reports).to.have.length(0);
+		storage.close();
+	});
+
+	it('writes a frame it cannot bring under the limit, and reports it', () => {
+		const storage = openStorage();
+		const reports: Array<{ outcome: string; detail: string }> = [];
+		const { manager, journal } = limitedJournal(storage, 64, reports);
+		// Refusing would roll the transition back and stop the node locally.
+		expect(commitPreimage(manager, 1).committed).to.equal(true);
+		expect(journal.getTip()!.sequence).to.equal(1n);
+		expect(reports).to.have.length(1);
+		expect(reports[0].outcome).to.equal('oversized');
+		expect(reports[0].detail).to.contain('frame 1 is');
+		storage.close();
+	});
+});
+
+describe('Recovery phase 2: snapshots page what a guardian record cannot hold (issue #1102)', () => {
+	const CEILING = 80_000;
+	const PAID = 300;
+	const at = (i: number): number => 1_700_000_000_000 + i;
+	const hashOf = (tag: number, i: number): string => {
+		const hash = Buffer.alloc(32, tag);
+		hash.writeUInt32BE(i, 0);
+		return hash.toString('hex');
+	};
+
+	/** Completed sends, and settled receives with their invoices. */
+	function paidStorage(): SqliteStorage {
+		const storage = openStorage();
+		for (let i = 0; i < PAID; i++) {
+			const sent = hashOf(3, i);
+			storage.savePayment(sent, {
+				...makePayment(Buffer.from(sent, 'hex'), 1_000_000n),
+				preimage: Buffer.alloc(32, 3),
+				createdAt: at(i)
+			});
+			const received = hashOf(8, i);
+			storage.savePayment(received, {
+				paymentHash: Buffer.from(received, 'hex'),
+				amountMsat: 1_000_000n,
+				status: PaymentStatus.COMPLETED,
+				direction: PaymentDirection.INCOMING,
+				createdAt: at(i)
+			} as IPaymentInfo);
+			storage.savePreimage(received, Buffer.alloc(32, 8));
+			storage.saveInvoice(received, {
+				paymentHash: received,
+				bolt11: `lnbcrt10u1${'q'.repeat(200)}`,
+				amountMsat: 1_000_000n,
+				expiry: 3600,
+				createdAt: at(i),
+				hold: i % 2 === 0
+			});
+		}
+		return storage;
+	}
+
+	function commitPayment(
+		manager: RecoveryManager,
+		hash: string
+	): ReturnType<RecoveryManager['commit']> {
+		return manager.commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_state',
+					paymentHash: hash,
+					payment: makePayment(Buffer.from(hash, 'hex'), 2_000_000n)
+				}
+			],
+			outboundMessages: []
+		});
+	}
+
+	function limitedJournal(
+		storage: SqliteStorage,
+		reports: Array<{ outcome: string; detail: string }>,
+		extra: { snapshotIntervalFrames?: number; retainFrom?: () => bigint } = {}
+	): { manager: RecoveryManager; journal: RecoveryJournal } {
+		const journal = new RecoveryJournal(
+			storage,
+			MASTER_KEY,
+			NODE_ID,
+			RECOVERY_ID,
+			{
+				...extra,
+				maxFrameCiphertextBytes: (): number => CEILING,
+				onFrameCeiling: (event): void => {
+					reports.push(event);
+				}
+			}
+		);
+		return { manager: new RecoveryManager(storage, { journal }), journal };
+	}
+
+	it('carries every completed payment in frames under the limit, and a restore gets them all back', () => {
+		const storage = paidStorage();
+		const reports: Array<{ outcome: string; detail: string }> = [];
+		const { manager, journal } = limitedJournal(storage, reports);
+		const result = commitPayment(manager, hashOf(4, 0));
+		expect(result.committed).to.equal(true);
+
+		const rows = storage.loadRecoveryFrames();
+		expect(rows.length).to.be.greaterThan(2);
+		for (const row of rows) {
+			expect(row.ciphertext.length).to.be.at.most(CEILING);
+		}
+		expect(reports).to.deep.equal([]);
+		const frames = journal.loadVerifiedFrames();
+		expect(frames[0].snapshot!.pageFrames).to.equal(frames.length - 1);
+		// The transition's own row may sit in any page, so its barrier waits
+		// for the last one.
+		expect(result.frameSequence).to.equal(BigInt(frames.length));
+
+		const target = openStorage();
+		reconstructFromFrames(target, frames);
+		expect(dumpTables(target)).to.equal(dumpTables(storage));
+		// What the double-pay guard and the paid-hash refusal read.
+		for (let i = 0; i < PAID; i++) {
+			expect(target.loadPayment(hashOf(3, i))).to.include({
+				status: PaymentStatus.COMPLETED,
+				direction: PaymentDirection.OUTGOING
+			});
+			expect(target.loadPayment(hashOf(8, i))).to.include({
+				status: PaymentStatus.COMPLETED,
+				direction: PaymentDirection.INCOMING
+			});
+		}
+		target.close();
+		storage.close();
+	});
+
+	it('restores the state before a snapshot whose last pages never reached the guardian', () => {
+		const storage = paidStorage();
+		const { manager, journal } = limitedJournal(storage, [], {
+			snapshotIntervalFrames: 1,
+			// Keeps every frame, as a guardian does.
+			retainFrom: (): bigint => 1n
+		});
+		expect(commitPayment(manager, hashOf(4, 0)).committed).to.equal(true);
+		const firstPages = storage.loadRecoveryFrames().length - 1;
+		// A delta, then an interval snapshot behind it.
+		expect(commitPayment(manager, hashOf(4, 1)).committed).to.equal(true);
+		const expected = dumpTables(storage);
+		const frames = journal.loadVerifiedFrames();
+		const second = firstPages + 2;
+		expect(frames[second].snapshot!.pageFrames).to.be.at.least(2);
+		expect(frames).to.have.length(
+			second + 1 + frames[second].snapshot!.pageFrames!
+		);
+
+		const restored = (set: RecoveryFrame[]): string => {
+			const target = openStorage();
+			reconstructFromFrames(target, set);
+			const dump = dumpTables(target);
+			target.close();
+			return dump;
+		};
+		expect(restored(frames)).to.equal(expected);
+		// Cut inside the second group, or right after its snapshot frame.
+		expect(restored(frames.slice(0, frames.length - 1))).to.equal(expected);
+		expect(restored(frames.slice(0, second + 1))).to.equal(expected);
+
+		// Nothing whole to build on: the first snapshot is cut off too.
+		const target = openStorage();
+		expect(() => reconstructFromFrames(target, frames.slice(0, 2))).to.throw(
+			/with all of its page frames/
+		);
+		// A restored writer carried on after the first cut and was cut off
+		// in turn: the next run's frames fill the first group's page range,
+		// but its snapshot is not one of the first group's pages.
+		const carriedOn = [
+			frames[0],
+			frames[1],
+			...frames.slice(second, frames.length - 1)
+		];
+		expect(carriedOn.length - 1).to.be.at.least(
+			frames[0].snapshot!.pageFrames!
+		);
+		expect(() => reconstructFromFrames(target, carriedOn)).to.throw(
+			/with all of its page frames/
+		);
+		expect(target.loadAllPayments()).to.have.length(0);
+		target.close();
+		storage.close();
+	});
+
+	it('counts the snapshot interval from the last page, and a re-base waits for its last page', () => {
+		const storage = paidStorage();
+		const { manager } = limitedJournal(storage, [], {
+			snapshotIntervalFrames: 3
+		});
+		expect(commitPayment(manager, hashOf(4, 0)).committed).to.equal(true);
+		const group = storage.loadRecoveryFrames().length;
+		expect(group).to.be.greaterThan(3);
+		// Plain deltas: pages do not count toward the interval, and a delta's
+		// barrier waits for the delta alone.
+		for (let i = 1; i <= 2; i++) {
+			expect(commitPayment(manager, hashOf(4, i)).frameSequence).to.equal(
+				BigInt(group + i)
+			);
+		}
+		expect(storage.loadRecoveryFrames()).to.have.length(group + 2);
+
+		// The next run re-bases on a paged snapshot that carries its transition.
+		const rerun = limitedJournal(storage, []).manager;
+		const rebase = commitPayment(rerun, hashOf(4, 3));
+		const rows = storage.loadRecoveryFrames();
+		expect(rows[0].sequence).to.equal(group + 3);
+		expect(rows.length).to.be.greaterThan(1);
+		expect(rebase.frameSequence).to.equal(
+			BigInt(rows[rows.length - 1].sequence)
+		);
+		storage.close();
+	});
+
+	it('refuses a page count that is not a positive integer', () => {
+		const storage = paidStorage();
+		const { manager } = limitedJournal(storage, []);
+		expect(commitPayment(manager, hashOf(4, 0)).committed).to.equal(true);
+		const row = storage.loadRecoveryFrames()[0];
+		const plaintext = decryptFrame(
+			deriveFrameKey(MASTER_KEY, NODE_ID, BigInt(row.writerEpoch)),
+			row.ciphertext,
+			frameAad(
+				NODE_ID,
+				BigInt(row.writerEpoch),
+				BigInt(row.sequence),
+				row.previousFrameHash
+			)
+		);
+		expect(decodeFrame(plaintext).snapshot!.pageFrames).to.be.greaterThan(0);
+		for (const bad of [0, -1, 1.5, '2', null]) {
+			const parsed = JSON.parse(plaintext.toString('utf8')) as {
+				snapshot: { pageFrames?: unknown };
+			};
+			parsed.snapshot.pageFrames = bad;
+			expect(
+				() => decodeFrame(Buffer.from(JSON.stringify(parsed), 'utf8')),
+				`page count ${JSON.stringify(bad)}`
+			).to.throw(/positive integer/);
+		}
+		storage.close();
+	});
+});

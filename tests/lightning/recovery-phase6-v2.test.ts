@@ -63,6 +63,7 @@ import {
 	GuardianClient,
 	GuardianHttpServer,
 	GuardianReplicator,
+	GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES,
 	IBoundGuardianClient,
 	IWriterLeaseKeys,
 	RecoveryCriticality,
@@ -409,13 +410,15 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 		// A replication stub, deliberately. The assertions below are about
 		// the open STARTING and its irreversible sends being held, never
 		// about a release, so standing up real guardians would only make the
-		// tests slower without making them stricter. The three reads the
+		// tests slower without making them stricter. The four reads the
 		// barrier actually performs are answered honestly: nothing
-		// replicated, no lost backfill, no stale watermark.
+		// replicated, no lost backfill, no stale watermark, and the record
+		// limit of a set whose INFO was never read.
 		const replicator = {
 			replicatedThrough: (): bigint => 0n,
 			namespaceLostBackfill: (): string | null => null,
 			watermarkExceedingJournal: (): string | null => null,
+			maxRecordBytes: (): number => GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES,
 			replicatePending: async (): Promise<void> => undefined
 		} as unknown as GuardianReplicator;
 		return {

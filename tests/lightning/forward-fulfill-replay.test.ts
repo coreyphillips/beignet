@@ -153,14 +153,18 @@ class AsyncAutoBarrier implements IWireDurabilityBarrier {
 		);
 	}
 
-	// The node-side wiring surface (fencing, replication, compaction), all
-	// irrelevant to the dispatch reordering this stand-in exists to produce.
+	// The node-side wiring surface (fencing, replication, compaction, the
+	// record limit), all irrelevant to the dispatch reordering this stand-in
+	// exists to produce.
 	onFenced(): void {}
 	onDurableAdvance(): void {}
 	kickReplication(): void {}
 	stop(): void {}
 	watermark(): bigint {
 		return 0n;
+	}
+	maxRecordBytes(): number {
+		return Number.POSITIVE_INFINITY;
 	}
 }
 

@@ -457,6 +457,67 @@ describe('Recovery phase 6: the node drives durability', () => {
 		await shutdown(served);
 		storage.close();
 	});
+
+	it('holds snapshots under the record limit the guardian set advertises (issue #1014)', async function (): Promise<void> {
+		const storage = openStorage();
+		for (let i = 0; i < 20; i++) {
+			storage.saveForwardingEvent({
+				settledAt: 1_700_000_000_000 + i,
+				inChannelId: Buffer.alloc(32, 1).toString('hex'),
+				outChannelId: Buffer.alloc(32, 2).toString('hex'),
+				amountInMsat: 1_001_000n,
+				amountOutMsat: 1_000_000n,
+				feeMsat: 1_000n
+			});
+		}
+		// No lease, so nothing is ever sent to these endpoints.
+		const replicator = replicatorFor(
+			storage,
+			GUARDIAN_IDS.map((id) => ({
+				client: new GuardianClient({
+					url: 'http://127.0.0.1:9',
+					guardianSetId: SET_ID
+				}),
+				expectedGuardianId: id
+			}))
+		);
+		replicator.maxRecordBytes = (): number => 64;
+		const barrier = barrierFor(replicator, () => null, 'async-remote');
+		const node = createNode(storage, {
+			enabled: true,
+			durability: 'async-remote',
+			barrier
+		});
+		const actions: string[] = [];
+		node.on('log', (log: { action: string }) => actions.push(log.action));
+
+		expect(
+			(node as unknown as { recovery: RecoveryManager }).recovery.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'payment_preimage',
+						paymentHash: sha('limited').toString('hex'),
+						preimage: sha('limited-preimage')
+					}
+				],
+				outboundMessages: []
+			}).committed
+		).to.equal(true);
+		await waitFor(() => actions.includes('recovery_frame_oversized'));
+		expect(actions).to.include('recovery_snapshot_trimmed');
+
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId
+		);
+		const [snapshot] = journal.loadVerifiedFrames();
+		expect(snapshot.snapshot!.forwardingEvents).to.have.length(0);
+		node.destroy();
+		storage.close();
+	});
 });
 
 describe('Recovery phase 6: the status surface', () => {
