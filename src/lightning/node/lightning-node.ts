@@ -15911,6 +15911,10 @@ export class LightningNode extends EventEmitter {
 				'payment metadata is too large for the recovery guardians to accept'
 			);
 		}
+		// A context an earlier call left behind (its dispatch threw) is reused
+		// below, so its retries must carry this call's labels, not that call's.
+		const lingeringCtx = this.paymentRetryContexts.get(dedupHashHex);
+		if (lingeringCtx) lingeringCtx.metadata = metadata && { ...metadata };
 
 		const destination = invoice.payeeNodeKey || invoice.recoveredPubkey;
 		if (!destination) {
