@@ -33,7 +33,10 @@ import {
 	PaymentStatus
 } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
-import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
+import {
+	DEFAULT_CHANNEL_CONFIG,
+	REGTEST_CHAIN_HASH
+} from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IStorageBackend } from '../../src/lightning/storage/types';
@@ -57,6 +60,16 @@ import {
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import {
+	IChannelAnnouncementMessage,
+	IChannelUpdateMessage,
+	encodeShortChannelId
+} from '../../src/lightning/gossip/types';
+import {
+	connectNodes,
+	createNode as createLoopbackNode,
+	openReadyChannel
+} from './helpers/loopback-nodes';
 
 const sha = (s: string): Buffer =>
 	crypto.createHash('sha256').update(s).digest();
@@ -186,6 +199,63 @@ function openStorage(): SqliteStorage {
 	const storage = new SqliteStorage(':memory:');
 	storage.open();
 	return storage;
+}
+
+function addTenHopRoute(
+	payer: LightningNode,
+	firstHop: LightningNode,
+	channelId: Buffer
+): Buffer {
+	const nodes = [
+		Buffer.from(payer.getNodeId(), 'hex'),
+		Buffer.from(firstHop.getNodeId(), 'hex')
+	];
+	for (let i = 2; i <= 10; i++) {
+		nodes.push(getPublicKey(sha(`keysend-route-${i}`)));
+	}
+
+	for (let i = 0; i < 10; i++) {
+		const shortChannelId = encodeShortChannelId({
+			block: 700,
+			txIndex: i + 1,
+			outputIndex: 0
+		});
+		const [nodeId1, nodeId2] =
+			Buffer.compare(nodes[i], nodes[i + 1]) < 0
+				? [nodes[i], nodes[i + 1]]
+				: [nodes[i + 1], nodes[i]];
+		const announcement: IChannelAnnouncementMessage = {
+			nodeSignature1: Buffer.alloc(64),
+			nodeSignature2: Buffer.alloc(64),
+			bitcoinSignature1: Buffer.alloc(64),
+			bitcoinSignature2: Buffer.alloc(64),
+			features: Buffer.alloc(0),
+			chainHash: REGTEST_CHAIN_HASH,
+			shortChannelId,
+			nodeId1,
+			nodeId2,
+			bitcoinKey1: Buffer.alloc(33, 2),
+			bitcoinKey2: Buffer.alloc(33, 3)
+		};
+		payer.getGraph().addChannelAnnouncement(announcement);
+		const update: IChannelUpdateMessage = {
+			signature: Buffer.alloc(64),
+			chainHash: REGTEST_CHAIN_HASH,
+			shortChannelId,
+			timestamp: Math.floor(Date.now() / 1000),
+			messageFlags: 1,
+			channelFlags: 0,
+			cltvExpiryDelta: 40,
+			htlcMinimumMsat: 1_000n,
+			feeBaseMsat: 1_000,
+			feeProportionalMillionths: 1,
+			htlcMaximumMsat: 1_000_000_000n
+		};
+		payer.getGraph().applyChannelUpdate(update);
+		payer.getGraph().applyChannelUpdate({ ...update, channelFlags: 1 });
+		if (i === 0) payer.registerChannelScid(channelId, shortChannelId);
+	}
+	return nodes[10];
 }
 
 function replicatorFor(
@@ -527,7 +597,7 @@ describe('Recovery phase 6: the node drives durability', () => {
 		storage.close();
 	});
 
-	it('refuses payment metadata a guardian record could not hold (issue #1134)', async function (): Promise<void> {
+	it('refuses oversized payment metadata and routed keysend state (issue #1134)', async function (): Promise<void> {
 		const CEILING = 5_000;
 		const storage = openStorage();
 		// No lease, so nothing is ever sent to these endpoints.
@@ -606,6 +676,40 @@ describe('Recovery phase 6: the node drives durability', () => {
 		});
 		await new Promise((resolve) => setImmediate(resolve));
 		expect(actions).to.not.include('recovery_frame_oversized');
+		const firstHop = createLoopbackNode('keysend-frame-limit', 2);
+		connectNodes(node, firstHop);
+		const channelId = openReadyChannel(node, firstHop);
+		const destination = addTenHopRoute(node, firstHop, channelId);
+		const beforeCounter = node
+			.getChannelManager()
+			.getChannel(channelId)!
+			.getFullState().localHtlcCounter;
+		const beforeFrames = storage.loadRecoveryFrames().length;
+		const internals = node as unknown as {
+			paymentRetryContexts: Map<string, unknown>;
+			htlcPaymentMap: Map<string, string>;
+		};
+		const beforePayments = node.listPayments().length;
+
+		expect(() =>
+			node.sendKeysend({
+				destination,
+				amountMsat: 1_000n,
+				metadata: { note: 'x'.repeat(2_000) }
+			})
+		)
+			.to.throw(LightningPaymentError, /too large/)
+			.with.property('code', LightningErrorCode.INVALID_KEYSEND);
+		expect(node.listPayments()).to.have.length(beforePayments);
+		expect(internals.paymentRetryContexts.size).to.equal(0);
+		expect(internals.htlcPaymentMap.size).to.equal(0);
+		expect(
+			node.getChannelManager().getChannel(channelId)!.getFullState()
+				.localHtlcCounter
+		).to.equal(beforeCounter);
+		expect(storage.loadRecoveryFrames()).to.have.length(beforeFrames);
+
+		firstHop.destroy();
 		node.destroy();
 		storage.close();
 	});

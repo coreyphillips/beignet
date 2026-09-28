@@ -16884,22 +16884,6 @@ export class LightningNode extends EventEmitter {
 			);
 		}
 
-		// A keysend has no invoice to re-pay, so record what a retry needs to
-		// replay it: the same preimage, and therefore the same payment hash.
-		// Registered only after the route and fee checks pass, mirroring
-		// sendPayment: a dispatch that throws above must not leave a context
-		// behind for a payment that never existed.
-		if (!this.paymentRetryContexts.has(hashHex)) {
-			this.paymentRetryContexts.set(hashHex, {
-				keysend: { options, preimage },
-				excludedChannels: excludedChannels ?? new Set(),
-				retryCount: 0,
-				maxRetries: this.maxPaymentRetries,
-				maxFeeMsat,
-				policyOverrides
-			});
-		}
-
 		const hops = route.hops;
 		// Route CLTVs are relative deltas; the wire needs absolute (height + delta).
 		const baseHeight = this.cltvBaseHeight(paymentHash);
@@ -16971,24 +16955,38 @@ export class LightningNode extends EventEmitter {
 			createdAt: Date.now(),
 			metadata: paymentMetadata
 		};
-		this.payments.set(hashHex, payment);
-
-		// Track offered HTLC → payment mapping
 		const htlcId = outChannel.getFullState().localHtlcCounter;
 		const htlcKey = `${channelId.toString('hex')}:offered-${htlcId}`;
-		this.htlcPaymentMap.set(htlcKey, hashHex);
-		{
-			const mutations: RecoveryMutation[] = [
-				{ type: 'htlc_payment_mapping', htlcKey, paymentHash: hashHex }
-			];
-			const paymentMutation = this.paymentMutation(paymentHash);
-			if (paymentMutation) mutations.unshift(paymentMutation);
-			this.commitMutations(
-				'persist payment + HTLC mapping',
-				mutations,
-				RecoveryCriticality.SafetyCritical
+		const mutations: RecoveryMutation[] = [
+			{ type: 'payment_state', paymentHash: hashHex, payment },
+			{ type: 'htlc_payment_mapping', htlcKey, paymentHash: hashHex }
+		];
+		if (!this.paymentMetadataFits(paymentMetadata, mutations)) {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVALID_KEYSEND,
+				'metadata is too large for the recovery guardians to accept'
 			);
 		}
+
+		// A keysend has no invoice to re-pay, so record what a retry needs to
+		// replay it: the same preimage, and therefore the same payment hash.
+		if (!this.paymentRetryContexts.has(hashHex)) {
+			this.paymentRetryContexts.set(hashHex, {
+				keysend: { options, preimage },
+				excludedChannels: excludedChannels ?? new Set(),
+				retryCount: 0,
+				maxRetries: this.maxPaymentRetries,
+				maxFeeMsat,
+				policyOverrides
+			});
+		}
+		this.payments.set(hashHex, payment);
+		this.htlcPaymentMap.set(htlcKey, hashHex);
+		this.commitMutations(
+			'persist payment + HTLC mapping',
+			mutations,
+			RecoveryCriticality.SafetyCritical
+		);
 
 		const result = this.channelManager.addHtlc(
 			channelId,
@@ -24118,7 +24116,7 @@ export class LightningNode extends EventEmitter {
 				paymentHash: hashHex,
 				payment: { ...existing, metadata: merged }
 			};
-			if (!this.paymentMetadataFits(merged, labelled)) {
+			if (!this.paymentMetadataFits(merged, [labelled])) {
 				throw new InvalidRequestError(
 					'payment metadata is too large for the recovery guardians to accept'
 				);
@@ -24136,18 +24134,26 @@ export class LightningNode extends EventEmitter {
 	 * Metadata is the part of a row the caller sizes, and it may take half a
 	 * frame: the rest is left for what the payment carries and gains after
 	 * it is labelled (route, shared secrets, preimage, a retry's invoice).
-	 * Given the labelled row, that has to fit a frame as well.
+	 * Given the mutations that store it, their complete batch has to fit a
+	 * frame as well.
 	 */
 	private paymentMetadataFits(
 		metadata: Record<string, string>,
-		row?: RecoveryMutation
+		mutations?: RecoveryMutation[]
 	): boolean {
 		const room = this.recoveryJournal?.mutationRoom();
 		if (room === undefined) return true;
 		if (Buffer.byteLength(JSON.stringify(metadata), 'utf8') > room / 2) {
 			return false;
 		}
-		return row === undefined || encodedMutationBytes(row) <= room;
+		if (mutations === undefined) return true;
+		return (
+			mutations.reduce(
+				(bytes, mutation, index) =>
+					bytes + encodedMutationBytes(mutation) + (index === 0 ? 0 : 1),
+				0
+			) <= room
+		);
 	}
 
 	/**
