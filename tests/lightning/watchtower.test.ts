@@ -597,9 +597,9 @@ describe('watchtower justice against a REAL revoked commitment', function () {
 
 		// The channel-manager calls this on a clean revoke; it must return the
 		// revoked remote commitment keyed by the revealed secret's point.
-		const revokedTx = pair.opener.takeRevokedCommitmentTx(secret);
-		expect(revokedTx, 'cached revoked tx returned').to.not.be.null;
-		const tx = bitcoin.Transaction.fromBuffer(revokedTx!);
+		const revokedTxs = pair.opener.takeRevokedCommitmentTxs(secret);
+		expect(revokedTxs, 'cached revoked tx returned').to.have.length(1);
+		const tx = bitcoin.Transaction.fromBuffer(revokedTxs[0]);
 		const revokedPoint = perCommitmentPointFromSecret(secret);
 		const state = pair.opener.getFullState();
 		const toLocalScript = buildToLocalScript(
@@ -618,8 +618,8 @@ describe('watchtower justice against a REAL revoked commitment', function () {
 			network
 		}).output!;
 		expect(tx.outs.some((o) => o.script.equals(toLocalSpk))).to.be.true;
-		// Consumed once: a second take returns null.
-		expect(pair.opener.takeRevokedCommitmentTx(secret)).to.be.null;
+		// Consumed once: a second take returns nothing.
+		expect(pair.opener.takeRevokedCommitmentTxs(secret)).to.be.empty;
 	});
 
 	it('caches the peer commitment #0 signed at funding, on either side (#1029)', function () {
@@ -638,9 +638,9 @@ describe('watchtower justice against a REAL revoked commitment', function () {
 
 			const secret = exchangeOnce(us, peer);
 
-			const revokedTx = us.takeRevokedCommitmentTx(secret);
-			expect(revokedTx, `${side} cached #0`).to.not.be.null;
-			expect(bitcoin.Transaction.fromBuffer(revokedTx!).getId()).to.equal(
+			const revokedTxs = us.takeRevokedCommitmentTxs(secret);
+			expect(revokedTxs, `${side} cached #0`).to.have.length(1);
+			expect(bitcoin.Transaction.fromBuffer(revokedTxs[0]).getId()).to.equal(
 				peerTx0.getId()
 			);
 		}
@@ -674,12 +674,12 @@ describe('watchtower justice against a REAL revoked commitment', function () {
 		const actions = restarted.handleRevokeAndAck(raa);
 		expect(actions.some((a) => a.type === ChannelActionType.ERROR)).to.be.false;
 
-		const revokedTx = restarted.takeRevokedCommitmentTx(
+		const revokedTxs = restarted.takeRevokedCommitmentTxs(
 			raa.perCommitmentSecret
 		);
-		expect(revokedTx, 'cached tx survived the restart').to.not.be.null;
-		expect(revokedTx).to.deep.equal(
-			pair.opener.takeRevokedCommitmentTx(raa.perCommitmentSecret)
+		expect(revokedTxs, 'cached tx survived the restart').to.have.length(1);
+		expect(revokedTxs).to.deep.equal(
+			pair.opener.takeRevokedCommitmentTxs(raa.perCommitmentSecret)
 		);
 	});
 
@@ -1439,7 +1439,7 @@ describe('watchtower hand-off after a failed backlog write (#1109)', function ()
 		connectNodes(alice, bob);
 		const channelId = openReadyChannel(alice, bob);
 		const state = bob.getChannelManager().getChannel(channelId)!.getFullState();
-		const tx0 = state.watchtowerRemoteCommitmentTxs!.get(
+		const [tx0] = state.watchtowerRemoteCommitmentTxs!.get(
 			state.remoteCurrentPerCommitmentPoint!.toString('hex')
 		)!;
 		alice

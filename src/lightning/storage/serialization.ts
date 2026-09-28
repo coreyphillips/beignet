@@ -405,7 +405,10 @@ export interface ISerializedChannelState {
 	htlcs: ISerializedHtlcEntry[];
 	/** Per-remote-commitment HTLC snapshots for penalty completeness (H2). */
 	revokedHtlcSnapshots?: ISerializedHtlcSnapshot[];
-	/** Unrevoked remote commitment txs kept for watchtower backups. */
+	/**
+	 * Unrevoked remote commitment txs kept for watchtower backups. A point
+	 * repeats once per funding output it was signed over.
+	 */
 	watchtowerRemoteCommitmentTxs?: Array<{ point: string; tx: string }>;
 	/** Revoked remote commitment txs whose watchtower hand-off failed. */
 	watchtowerBackupsOwed?: Array<{ secret: string; tx: string }>;
@@ -911,10 +914,9 @@ export function serializeChannelState(
 		htlcs,
 		revokedHtlcSnapshots,
 		watchtowerRemoteCommitmentTxs: s.watchtowerRemoteCommitmentTxs?.size
-			? [...s.watchtowerRemoteCommitmentTxs].map(([point, tx]) => ({
-					point,
-					tx: tx.toString('hex')
-			  }))
+			? [...s.watchtowerRemoteCommitmentTxs].flatMap(([point, txs]) =>
+					txs.map((tx) => ({ point, tx: tx.toString('hex') }))
+			  )
 			: undefined,
 		watchtowerBackupsOwed: s.watchtowerBackupsOwed?.length
 			? s.watchtowerBackupsOwed.map((e) => ({
@@ -1347,11 +1349,13 @@ export function deserializeChannelState(
 		htlcs,
 		revokedHtlcSnapshots,
 		watchtowerRemoteCommitmentTxs: s.watchtowerRemoteCommitmentTxs?.length
-			? new Map(
-					s.watchtowerRemoteCommitmentTxs.map((e) => [
-						e.point,
-						Buffer.from(e.tx, 'hex')
-					])
+			? s.watchtowerRemoteCommitmentTxs.reduce(
+					(cache, e) =>
+						cache.set(e.point, [
+							...(cache.get(e.point) ?? []),
+							Buffer.from(e.tx, 'hex')
+						]),
+					new Map<string, Buffer[]>()
 			  )
 			: undefined,
 		watchtowerBackupsOwed: s.watchtowerBackupsOwed?.length

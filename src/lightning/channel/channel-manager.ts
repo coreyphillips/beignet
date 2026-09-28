@@ -4332,14 +4332,10 @@ export class ChannelManager extends EventEmitter {
 		const revChannelId = channel.getChannelId();
 		if (revChannelId) {
 			const revoked = channel.takeOwedWatchtowerBackups();
-			const revokedTx = channel.takeRevokedCommitmentTx(
+			for (const tx of channel.takeRevokedCommitmentTxs(
 				msg.perCommitmentSecret
-			);
-			if (revokedTx) {
-				revoked.push({
-					perCommitmentSecret: msg.perCommitmentSecret,
-					tx: revokedTx
-				});
+			)) {
+				revoked.push({ perCommitmentSecret: msg.perCommitmentSecret, tx });
 			}
 			this._handOffRevokedCommitments(
 				revChannelId,
