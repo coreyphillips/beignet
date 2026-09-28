@@ -456,6 +456,13 @@ export interface IChannelState {
 	 */
 	watchtowerRemoteCommitmentTxs?: Map<string, Buffer>;
 
+	/**
+	 * Watchtower: revoked peer commitments whose tower hand-off failed, each
+	 * with the secret that revoked it. Retried on the next revoke_and_ack and
+	 * on restore; until one succeeds this is the only copy.
+	 */
+	watchtowerBackupsOwed?: Array<{ perCommitmentSecret: Buffer; tx: Buffer }>;
+
 	/** Cached remote signature on our latest commitment */
 	remoteCommitmentSignature: Buffer | null;
 	remoteHtlcSignatures: Buffer[];
