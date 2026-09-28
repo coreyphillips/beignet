@@ -1449,6 +1449,9 @@ export class ReverseSwapProvider extends EventEmitter {
 				});
 			}
 			problem = this.broadcastProblem(record);
+			// Nothing renews a withheld row, so the coins it just froze would
+			// stay frozen until a prune.
+			if (problem) await this.release(txHex);
 		}
 		if (problem) {
 			this.withholdFunding(record, problem);

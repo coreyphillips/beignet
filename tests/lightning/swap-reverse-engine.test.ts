@@ -618,6 +618,8 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(record(h, swap).lastError).to.match(
 				/^broadcast withheld: hold is CANCELLED/
 			);
+			// The pledge it took while waiting is given back.
+			expect(h.wallet.released).to.deep.equal([r.fundingTxHex]);
 		});
 
 		it('a failed reorg rebroadcast keeps its input out of wallet selection (issue #1149)', async function () {
