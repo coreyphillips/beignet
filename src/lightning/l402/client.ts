@@ -247,7 +247,13 @@ export async function l402Fetch(
 
 	// A held credential the server no longer accepts is dead weight: drop it
 	// and fall through to the challenge path rather than failing the call.
-	if (usable && (response.status === 401 || response.status === 402)) {
+	// A responder that never received it has not rejected it, so its answer
+	// goes to the challenge path as it is.
+	if (
+		usable &&
+		(response.status === 401 || response.status === 402) &&
+		credentialReached(url, response)
+	) {
 		store.delete(scope);
 		usable = undefined;
 		response = await doFetch(url, request(undefined));
@@ -308,12 +314,12 @@ export async function l402Fetch(
 		const minted = usableCredential(store.get(issuerScope), store);
 		if (minted) {
 			const reused = await doFetch(issuer, issuerRequest(minted));
-			// Only the issuer can reject its credential. A response from another
-			// origin followed a redirect that stripped it, so it says nothing
-			// about the credential and is returned as it is.
+			// Only a responder that received the credential can reject it. One
+			// past a redirect that stripped it says nothing about the
+			// credential, so its answer is returned as it is.
 			if (
 				(reused.status !== 401 && reused.status !== 402) ||
-				challengeIssuer(issuer, reused.url) !== issuer
+				!credentialReached(issuer, reused)
 			) {
 				return {
 					response: reused,
@@ -544,6 +550,13 @@ const CREDENTIAL_HEADERS = new Set([
 ]);
 
 /**
+ * Responses reached through a hop to another origin, whose request therefore
+ * carried no credential. The final URL cannot show this once the chain has
+ * returned to the origin it started from.
+ */
+const crossOriginResponses = new WeakSet<IL402Response>();
+
+/**
  * Follow redirects by hand, so `checkRedirect` sees every target before a
  * request reaches it. Each hop is rewritten the way fetch itself would: 301
  * and 302 turn a POST into a GET, 303 turns anything but HEAD into one, and a
@@ -557,6 +570,7 @@ async function fetchCheckingRedirects(
 ): Promise<IL402Response> {
 	let current = url;
 	let request = init;
+	let leftOrigin = false;
 	for (let hops = 0; ; hops++) {
 		const response = await doFetch(current, { ...request, redirect: 'manual' });
 		const location = REDIRECT_STATUSES.has(response.status)
@@ -568,6 +582,7 @@ async function fetchCheckingRedirects(
 			if (!response.url) {
 				Object.defineProperty(response, 'url', { value: current });
 			}
+			if (leftOrigin) crossOriginResponses.add(response);
 			return response;
 		}
 		discardBody(response);
@@ -581,11 +596,9 @@ async function fetchCheckingRedirects(
 			);
 		}
 		checkRedirect(next.href);
-		request = redirectedRequest(
-			request,
-			response.status,
-			new URL(current).origin !== next.origin
-		);
+		const crossOrigin = new URL(current).origin !== next.origin;
+		if (crossOrigin) leftOrigin = true;
+		request = redirectedRequest(request, response.status, crossOrigin);
 		current = next.href;
 	}
 }
@@ -685,6 +698,23 @@ function challengeIssuer(
 	} catch {
 		return requestedUrl;
 	}
+}
+
+/**
+ * Whether the credential sent to `requestedUrl` reached whoever answered. A
+ * hop to another origin strips it, and a later hop back does not restore it.
+ * When fetch follows redirects itself only the final URL is visible, so a
+ * chain that leaves and returns to the requested origin is seen only with
+ * `checkRedirect` set.
+ */
+function credentialReached(
+	requestedUrl: string,
+	response: IL402Response
+): boolean {
+	return (
+		!crossOriginResponses.has(response) &&
+		challengeIssuer(requestedUrl, response.url) === requestedUrl
+	);
 }
 
 /**
