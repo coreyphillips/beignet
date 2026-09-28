@@ -28,14 +28,16 @@ import {
 } from '../../src/lightning/transport/websocket';
 import {
 	WebSocketServer,
-	WebSocketServerTransport
+	WebSocketServerTransport,
+	PRE_HANDSHAKE_MAX_WS_BYTES
 } from '../../src/lightning/transport/websocket-server';
 import {
 	encodeWsFrame,
 	WsOpcode,
 	WsCloseCode,
 	decodeWsClosePayload,
-	WsFrameParser
+	WsFrameParser,
+	DEFAULT_MAX_WS_PAYLOAD_BYTES
 } from '../../src/lightning/transport/websocket-frame';
 import { parsePeerUri } from '../../src/lightning/transport/peer-uri';
 import { NodeWebSocket } from '../../src/lightning/transport/websocket-node-client';
@@ -116,6 +118,29 @@ function rawUpgrade(
 			}
 		};
 		socket.on('data', onData);
+	});
+}
+
+/** Resolve with the server's close frame on a raw-upgraded socket. */
+function nextClose(socket: net.Socket): Promise<{ code: number }> {
+	return new Promise((resolve, reject) => {
+		const parser = new WsFrameParser({ requireMasked: false });
+		socket.on('data', (d) => {
+			for (const f of parser.push(d)) {
+				if (f.opcode === WsOpcode.CLOSE) {
+					resolve(decodeWsClosePayload(f.payload));
+				}
+			}
+		});
+		socket.on('error', reject);
+	});
+}
+
+function maskedBinary(payload: Buffer): Buffer {
+	return encodeWsFrame({
+		opcode: WsOpcode.BINARY,
+		payload,
+		maskKey: crypto.randomBytes(4)
 	});
 }
 
@@ -719,6 +744,87 @@ describe('WebSocket transport (offline)', function () {
 				server.close();
 			}
 		});
+
+		it('closes 1009 on an incomplete frame too large for an unestablished peer', async function () {
+			const { server, port } = await startWsServer();
+			try {
+				let transportClosed = false;
+				server.on('connection', (t: WebSocketServerTransport) => {
+					t.on('error', () => {});
+					t.on('close', () => {
+						transportClosed = true;
+					});
+				});
+				const { socket } = await rawUpgrade(port);
+				const closed = nextClose(socket);
+				// Declares the full default cap, then sends only the start of it.
+				const header = Buffer.alloc(14);
+				header[0] = 0x80 | WsOpcode.BINARY;
+				header[1] = 0x80 | 127;
+				header.writeBigUInt64BE(BigInt(DEFAULT_MAX_WS_PAYLOAD_BYTES), 2);
+				crypto.randomBytes(4).copy(header, 10);
+				socket.write(Buffer.concat([header, crypto.randomBytes(64 * 1024)]));
+				expect((await closed).code).to.equal(WsCloseCode.MESSAGE_TOO_BIG);
+				await waitFor(() => transportClosed, 5000, 'transport close');
+				socket.destroy();
+			} finally {
+				server.close();
+			}
+		});
+
+		it('holds an unestablished peer to the cap for unread data', async function () {
+			const { server, port } = await startWsServer();
+			try {
+				server.on('connection', (t: WebSocketServerTransport) => {
+					t.on('error', () => {});
+				});
+				const { socket } = await rawUpgrade(port);
+				const closed = nextClose(socket);
+				// A frame at the cap is accepted; one more unread byte is not.
+				socket.write(
+					Buffer.concat([
+						maskedBinary(crypto.randomBytes(PRE_HANDSHAKE_MAX_WS_BYTES)),
+						maskedBinary(Buffer.alloc(1))
+					])
+				);
+				expect((await closed).code).to.equal(WsCloseCode.INTERNAL_ERROR);
+				socket.destroy();
+			} finally {
+				server.close();
+			}
+		});
+
+		it('lifts both caps once the peer is established', async function () {
+			const { server, port } = await startWsServer();
+			try {
+				let transport: WebSocketServerTransport | undefined;
+				server.on('connection', (t: WebSocketServerTransport) => {
+					t.on('error', () => {});
+					t.markEstablished();
+					transport = t;
+				});
+				const { socket } = await rawUpgrade(port);
+				const big = crypto.randomBytes(1024 * 1024);
+				const small = crypto.randomBytes(1);
+				socket.write(Buffer.concat([maskedBinary(big), maskedBinary(small)]));
+				await waitFor(
+					() =>
+						(transport as unknown as { pendingBytes: number } | undefined)
+							?.pendingBytes ===
+						big.length + small.length,
+					5000,
+					'unread frames buffered'
+				);
+				const received: Buffer[] = [];
+				transport!.on('data', (d: Buffer) => received.push(d));
+				expect(
+					Buffer.concat(received).equals(Buffer.concat([big, small]))
+				).to.equal(true);
+				socket.destroy();
+			} finally {
+				server.close();
+			}
+		});
 	});
 
 	// ─── In-repo Node WS client ─────────────────────────────────
@@ -1031,8 +1137,14 @@ describe('WebSocket transport (offline)', function () {
 
 			const { server, port } = await startWsServer();
 			let responderPeer: Peer | null = null;
+			let establishedCalls = 0;
 			const responderReady = new Promise<Peer>((resolve, reject) => {
 				server.on('connection', (transport: WebSocketServerTransport) => {
+					const markEstablished = transport.markEstablished.bind(transport);
+					transport.markEstablished = (): void => {
+						establishedCalls++;
+						markEstablished();
+					};
 					const peer = new Peer({
 						localPrivateKey: responderKey,
 						remotePublicKey: Buffer.alloc(33, 0), // learned in handshake
@@ -1076,6 +1188,8 @@ describe('WebSocket transport (offline)', function () {
 				// Init exchanged
 				expect(initiator.getRemoteInit()).to.not.equal(null);
 				expect(responder.getRemoteInit()).to.not.equal(null);
+				// ...so the server transport stops holding it to stranger caps
+				expect(establishedCalls).to.equal(1);
 
 				// Exchange an application message (odd/unknown type passes through)
 				const payload = crypto.randomBytes(32);
