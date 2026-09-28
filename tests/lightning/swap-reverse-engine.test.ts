@@ -543,6 +543,37 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(record(h, swap).fundingHeight).to.equal(1005);
 		});
 
+		it('a reorg rebroadcast that fails is retried on the next block (issue #1129)', async function () {
+			const h = await harness();
+			const { swap } = await fundedSwap(h);
+			const r = record(h, swap);
+			h.chain.confirm(r.fundingTxid!, 1001);
+			h.chain.height = 1001;
+			await h.engine.onBlock(1001);
+			expect(record(h, swap).state).to.equal('FUNDED');
+			h.chain.evict(r.fundingTxid!);
+			h.chain.failBroadcasts = 1;
+			h.chain.height = 1002;
+			await h.engine.onBlock(1002);
+			expect(h.chain.broadcasts).to.have.length(1);
+			expect(record(h, swap).fundingHeight).to.equal(undefined);
+
+			h.chain.height = 1003;
+			await h.engine.onBlock(1003);
+			expect(h.chain.broadcasts).to.have.length(2);
+			expect(h.chain.mempoolHas(r.fundingTxid!)).to.equal(true);
+			expect(record(h, swap).state).to.equal('FUNDED');
+
+			// The retry is judged live, like any other.
+			h.chain.evict(r.fundingTxid!);
+			h.chain.height = r.refundHeight - 6;
+			await h.engine.onBlock(h.chain.height);
+			expect(h.chain.broadcasts).to.have.length(2);
+			const withheld = record(h, swap);
+			expect(withheld.state).to.equal('FUNDED');
+			expect(withheld.lastError).to.match(/^broadcast withheld: /);
+		});
+
 		it('reports funding progress over status and confirms to policy', async function () {
 			const h = await harness();
 			const { swap, ack } = await fundedSwap(h);
