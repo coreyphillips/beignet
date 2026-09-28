@@ -756,7 +756,7 @@ async function handlePsbt(): Promise<void> {
 		case 'combine':
 			return outputResult(
 				await httpRequest('POST', '/psbt/combine', {
-					psbts: filteredArgs
+					psbts: positionalArgs()
 						.slice(2)
 						.map((arg) => readPsbtArg(arg))
 						.filter((psbt): psbt is string => !!psbt)
