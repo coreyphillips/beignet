@@ -989,9 +989,9 @@ describe('Recovery phase 6: records over a guardian limit (issue #1014)', () => 
 					url,
 					init
 				): Promise<{ status: number; body: Buffer }> => {
-					// Only the binding's INFO fails; the compatibility probe
-					// ahead of GET_HEAD and everything after it succeed.
-					if (url.endsWith('/info') && ++infoCalls === 1) {
+					// Only the compatibility probe ahead of GET_HEAD gets an INFO
+					// answer; the binding's INFO and any later one fail.
+					if (url.endsWith('/info') && ++infoCalls !== 2) {
 						throw new Error('connection refused');
 					}
 					return nodeGuardianTransport()(url, init);

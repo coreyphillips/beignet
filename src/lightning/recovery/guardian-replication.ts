@@ -371,7 +371,10 @@ export class GuardianReplicator {
 				const key = entry.expectedGuardianId.toString('hex');
 				if (this.advertisedCeilings.has(key)) return;
 				try {
-					const info = await entry.client.info();
+					// The client's cached compatibility INFO: a guardian that
+					// answered any verb has a known limit without another request
+					// that could fail.
+					const info = await entry.client.checkVersion();
 					if (
 						info.guardianId.equals(entry.expectedGuardianId) &&
 						info.maxCiphertextBytes > 0
