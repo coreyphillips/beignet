@@ -14,6 +14,7 @@ import { ChannelManager } from '../channel/channel-manager';
 import { createFundingScript } from '../script/funding';
 import { createTaprootFundingScript } from '../script/funding-taproot';
 import { isTaprootChannel } from '../channel/types';
+import { decodeShortChannelId } from '../gossip/types';
 import { IRREVOCABLE_DEPTH } from './types';
 
 bitcoin.initEccLib(ecc);
@@ -401,6 +402,84 @@ export async function classifyRemoteFundingInput(
 	// mempool utxos inconsistently, so absence from listunspent proves
 	// nothing; fail open.
 	return entry.height > 0 ? 'spent-or-missing' : 'unknown';
+}
+
+/**
+ * Chain verdict on a gossiped channel's funding output (issue #1105).
+ * 'proven' = unspent at the SCID's height, transaction index and output
+ * index, paying the 2-of-2 of the announced bitcoin keys. 'refuted' = the
+ * server answered with no such output although the SCID is deep enough to
+ * need one: fabricated, or since closed. 'unknown' = the answer settles
+ * nothing. 'unavailable' = no answer; ask again later.
+ */
+export type AnnouncedFundingVerdict =
+	| 'proven'
+	| 'refuted'
+	| 'unknown'
+	| 'unavailable';
+
+/**
+ * Confirmations after which a missing funding output refutes an
+ * announcement: channels are announced at 6, and the other 6 cover a server
+ * that lags the tip this node last recorded.
+ */
+const FUNDING_REFUTE_DEPTH = 12;
+
+/**
+ * Check a channel_announcement's SCID against the chain. Never throws.
+ */
+export async function classifyAnnouncedChannelFunding(
+	backend: IChainBackend,
+	announcement: {
+		shortChannelId: Buffer;
+		bitcoinKey1: Buffer;
+		bitcoinKey2: Buffer;
+	},
+	tipHeight: number
+): Promise<AnnouncedFundingVerdict> {
+	if (!backend.listUnspent || !backend.getTransactionMerkleProof) {
+		return 'unknown';
+	}
+	let scid: ReturnType<typeof decodeShortChannelId>;
+	let scriptHash: string;
+	try {
+		scid = decodeShortChannelId(announcement.shortChannelId);
+		scriptHash = computeScriptHash(
+			createFundingScript(announcement.bitcoinKey1, announcement.bitcoinKey2)
+				.p2wshOutput
+		);
+	} catch {
+		return 'unknown';
+	}
+	let unspent: Awaited<ReturnType<NonNullable<IChainBackend['listUnspent']>>>;
+	try {
+		unspent = await backend.listUnspent(scriptHash);
+	} catch {
+		return 'unavailable';
+	}
+	// Height 0 is the mempool, which an SCID can never name.
+	const candidates = unspent.filter(
+		(u) =>
+			u.height > 0 &&
+			u.height === scid.block &&
+			u.outputIndex === scid.outputIndex
+	);
+	for (const u of candidates) {
+		let txIndex: number;
+		try {
+			txIndex = (await backend.getTransactionMerkleProof(u.txid, u.height))
+				.txIndex;
+		} catch {
+			return 'unavailable';
+		}
+		if (txIndex === scid.txIndex) return 'proven';
+	}
+	// The right output in a transaction at another index proves nothing
+	// either way: ElectrumBackend reports a failed proof as index 0.
+	if (candidates.length > 0) return 'unknown';
+	return tipHeight - scid.block + 1 >= FUNDING_REFUTE_DEPTH
+		? 'refuted'
+		: 'unknown';
 }
 
 /**
