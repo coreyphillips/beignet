@@ -92,8 +92,8 @@ const META_LAST_SNAPSHOT_WRITTEN = 'journal_last_snapshot_written';
  * The newest snapshot WRITTEN as a group, JSON `{ sequence, groupEnd,
  * frameHash }`: groupEnd is its last page frame, or the snapshot itself
  * when unpaged. The replicator reads it to tell guardians they may free
- * the records below the base (guardian-replication.ts retainFloor), which
- * is only safe once the quorum holds the whole group.
+ * the records below it (guardian-replication.ts retainFloor), which is
+ * only safe once the quorum holds the whole group.
  */
 export const META_LAST_SNAPSHOT_GROUP = 'journal_last_snapshot_group';
 /**

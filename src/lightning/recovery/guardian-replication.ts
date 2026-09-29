@@ -869,22 +869,21 @@ export class GuardianReplicator {
 		return { accepted, initialState };
 	}
 
-	/** Sign one journal frame as a guardian record (wire 4.2 RECORD). */
 	/**
-	 * The floor guardians may free below (wire 5.2): the journal's retained
-	 * base snapshot, once the quorum holds its whole page group. A restore
+	 * The floor guardians may free below (wire 5.2): the newest snapshot the
+	 * journal wrote, once the quorum holds its whole page group. A restore
 	 * builds on the first record it downloads, so a guardian must never
 	 * keep less than a complete group, and a takeover can never certify
 	 * below a quorum-held record, so nothing freed can be asked for again.
+	 * The journal's base need not have reached it yet: the same watermark
+	 * releases that compaction, but only after this pass returns.
 	 */
 	retainFloor(
 		lease: IWriterLeaseKeys,
 		replicatedThrough: bigint
 	): IGuardianRetainFloor | undefined {
-		const storage = this.config.storage;
-		const base = storage.getRecoveryMeta?.(JOURNAL_META_KEYS.lastSnapshot);
-		const raw = storage.getRecoveryMeta?.(META_LAST_SNAPSHOT_GROUP);
-		if (base == null || raw == null) return undefined;
+		const raw = this.config.storage.getRecoveryMeta?.(META_LAST_SNAPSHOT_GROUP);
+		if (raw == null) return undefined;
 		let group: { sequence: bigint; groupEnd: bigint; frameHash: Buffer };
 		try {
 			const parsed = JSON.parse(raw) as Record<string, unknown>;
@@ -896,10 +895,7 @@ export class GuardianReplicator {
 		} catch {
 			return undefined;
 		}
-		// The group names the newest snapshot written, which is the base
-		// only once compaction reached it.
 		if (
-			String(group.sequence) !== base ||
 			group.groupEnd < group.sequence ||
 			group.frameHash.length !== 32 ||
 			replicatedThrough < group.groupEnd
@@ -921,6 +917,7 @@ export class GuardianReplicator {
 		};
 	}
 
+	/** Sign one journal frame as a guardian record (wire 4.2 RECORD). */
 	signRecord(
 		frame: IStoredRecoveryFrame,
 		lease: IWriterLeaseKeys
@@ -1445,6 +1442,24 @@ export class GuardianReplicator {
 		if (quorumHead < from) quorumHead = from;
 
 		const replicatedThrough = this.raiseWatermark(quorumHead);
+		// A pass that completes a snapshot group may be the last before a
+		// restart writes the next one, so the floor it made eligible goes out
+		// now, on a record each guardian holds (answered OK_DUPLICATE). A
+		// guardian that misses it is covered by the next floor, which frees
+		// everything below it too.
+		const completed = this.retainFloor(lease, replicatedThrough);
+		if (completed && completed.sequence !== retainFloor?.sequence) {
+			await Promise.all(
+				this.config.guardians.map(async (entry, index) => {
+					const held = streams[index].provenThrough;
+					const frame = held == null ? undefined : framesBySequence.get(held);
+					if (!frame) return;
+					await entry.client
+						.putState(this.signRecord(frame, lease), completed)
+						.catch(() => undefined);
+				})
+			);
+		}
 		const durable = Number(
 			replicatedThrough > from ? replicatedThrough - from : 0n
 		);

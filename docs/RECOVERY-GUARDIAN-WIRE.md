@@ -552,14 +552,16 @@ nothing.
 
 Retain floor. A PUT_STATE MAY carry `retain_floor`: a sequence F, the
 frame hash of the record at F, and the lease writer key's signature over
-the RETAIN transcript. The writer sends it once F is its journal's retained
-base snapshot and a quorum holds that snapshot's whole page group, so a
+the RETAIN transcript. The writer sends it once F is the newest snapshot
+its journal wrote and a quorum holds that snapshot's whole page group, so a
 restore that downloads from F still starts at a complete snapshot, and no
 takeover can certify a head below F (4.2: a quorum-held record is never
-superseded). A guardian that accepts or duplicates the record, holds the
-record at F with that frame hash, and has not already freed through F
-verifies the signature (`ERR_BAD_SIGNATURE` refuses the whole request),
-deletes every record below F, and stores the state just before F with its
+superseded). The pass that completes the group sends it at once, on a
+record each guardian already holds. A guardian that accepts or duplicates
+the record, holds the record at F with that frame hash, and has not
+already freed through F verifies the signature (`ERR_BAD_SIGNATURE`
+refuses the whole request), deletes every record below F, orphan-archived
+ones included, and stores the state just before F with its
 own receipt signature over it, which is where its open-time walk (5.10)
 resumes. A floor it cannot act on yet (it does not hold F, or the record
 is refused) changes nothing. The freed bytes count before the quota (2.7),
@@ -1189,7 +1191,8 @@ codec stays tractable, and signatures never depend on the envelope.
 33  ERR_QUOTA_EXCEEDED      a hosted guardian's storage quota is exhausted
                             for new namespaces or further records; not a
                             transport condition and not retryable until the
-                            operator raises the quota (2.7)
+                            operator raises the quota (2.7) or a retain
+                            floor (5.2) frees enough
 34  ERR_SET_RETIRED         the namespace was rotated away from this set
                             (5.11); the rotation is attached, and a writer
                             receiving this MUST freeze (5.9)

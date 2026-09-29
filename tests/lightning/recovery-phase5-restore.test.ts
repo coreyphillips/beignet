@@ -1426,7 +1426,48 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 		target.close();
 	});
 
-	it('names a floor only once the quorum holds the base snapshot and every page after it', () => {
+	it('delivers a floor in the pass that makes it eligible', async function (): Promise<void> {
+		this.timeout(30_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		let rep: GuardianReplicator | null = null;
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId,
+			{
+				snapshotIntervalFrames: 4,
+				retainFrom: (): bigint => (rep ? rep.replicatedThrough() + 1n : 1n)
+			}
+		);
+		const manager = new RecoveryManager(storage, { journal });
+		commitTransition(manager, 0);
+		rep = replicatorFor(storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		const base = (): string =>
+			storage.getRecoveryMeta!(JOURNAL_META_KEYS.lastSnapshot)!;
+		const initial = base();
+		// No pass follows the one that replicates the new snapshot, as when a
+		// restart writes the next snapshot at its first transition. Compaction
+		// runs after the pass, as the node's durable-advance hook runs it.
+		for (let i = 1; base() === initial; i++) {
+			expect(i).to.be.below(20);
+			commitTransition(manager, i);
+			await rep.replicatePending(lease);
+			journal.compact();
+		}
+		for (const entry of served) {
+			const page = await entry.client.getState(ROOT.recoveryId, 0n);
+			expect(String(page.records![0].sequence)).to.equal(base());
+		}
+		await shutdown(served);
+		storage.close();
+	});
+
+	it('names a floor only once the quorum holds the snapshot and every page after it', () => {
 		const storage = openStorage();
 		// Never contacted: the floor is judged from local metadata alone.
 		const rep = replicatorFor(
@@ -1448,7 +1489,6 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 			confirmedAt: null
 		};
 		const frameHash = sha('base snapshot');
-		storage.setRecoveryMeta!(JOURNAL_META_KEYS.lastSnapshot, '40');
 		storage.setRecoveryMeta!(
 			META_LAST_SNAPSHOT_GROUP,
 			JSON.stringify({
@@ -1473,10 +1513,6 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 				writer.publicKey
 			)
 		).to.equal(true);
-
-		// A snapshot written but not yet compacted to is not the base.
-		storage.setRecoveryMeta!(JOURNAL_META_KEYS.lastSnapshot, '36');
-		expect(rep.retainFloor(lease, 100n)).to.equal(undefined);
 		storage.close();
 	});
 

@@ -681,7 +681,7 @@ interface IRetainPlan {
 	start: bigint;
 	/** The state just before `start`, where the open-time walk resumes. */
 	checkpoint: GuardianState;
-	/** Content bytes of the records below `start`. */
+	/** Content bytes of the records below `start`, orphans included. */
 	freed: number;
 	/** The floor row's size, new minus old. */
 	rowDelta: number;

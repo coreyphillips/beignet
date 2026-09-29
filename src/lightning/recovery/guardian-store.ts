@@ -798,31 +798,38 @@ export class GuardianStore {
 			.run(recoveryId);
 	}
 
-	/** The content bytes of the records below a sequence (contentBytes' measure). */
+	/**
+	 * The content bytes of the records below a sequence, orphaned ones
+	 * included (contentBytes' measure).
+	 */
 	recordBytesBelow(recoveryId: Buffer, sequenceExclusive: Buffer): number {
-		const columns = CONTENT_COLUMNS.find(
-			([table]) => table === 'guardian_records'
-		)![1];
-		const sum = columns.map((c) => `COALESCE(length(${c}), 0)`).join(' + ');
-		const row = this.db
-			.prepare(
-				`SELECT COALESCE(SUM(${sum}), 0) AS bytes FROM guardian_records
-				WHERE recovery_id = ? AND sequence < ?`
-			)
-			.get(recoveryId, sequenceExclusive) as { bytes: number | bigint };
-		return Number(row.bytes);
+		let total = 0;
+		for (const [table, columns] of CONTENT_COLUMNS) {
+			if (!FREED_TABLES.includes(table)) continue;
+			const sum = columns.map((c) => `COALESCE(length(${c}), 0)`).join(' + ');
+			const row = this.db
+				.prepare(
+					`SELECT COALESCE(SUM(${sum}), 0) AS bytes FROM ${table}
+					WHERE recovery_id = ? AND sequence < ?`
+				)
+				.get(recoveryId, sequenceExclusive) as { bytes: number | bigint };
+			total += Number(row.bytes);
+		}
+		return total;
 	}
 
 	/**
-	 * Free every record below a sequence. Unlike the archive moves this
-	 * keeps nothing: the writer signed that it will never ask for them again.
+	 * Free every record below a sequence, orphaned ones included. Unlike the
+	 * archive moves this keeps nothing: the writer signed that it will never
+	 * ask for them again, and an orphan left behind would still count
+	 * against the quota.
 	 */
 	deleteRecordsBelow(recoveryId: Buffer, sequenceExclusive: Buffer): void {
-		this.db
-			.prepare(
-				'DELETE FROM guardian_records WHERE recovery_id = ? AND sequence < ?'
-			)
-			.run(recoveryId, sequenceExclusive);
+		for (const table of FREED_TABLES) {
+			this.db
+				.prepare(`DELETE FROM ${table} WHERE recovery_id = ? AND sequence < ?`)
+				.run(recoveryId, sequenceExclusive);
+		}
 	}
 
 	// ─────────────── storage accounting ───────────────
@@ -947,3 +954,6 @@ const CONTENT_COLUMNS: ReadonlyArray<[string, string[]]> = [
 	],
 	['guardian_retain_floors', ['recovery_id', 'state', 'issued_at', 'signature']]
 ];
+
+/** The tables a retain floor frees below (wire 5.2). */
+const FREED_TABLES = ['guardian_records', 'guardian_orphan_records'];

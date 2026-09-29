@@ -2231,6 +2231,47 @@ describe('Guardian core: retain floor (issue #1028)', () => {
 		reopened.close();
 	});
 
+	it('frees orphan-archived records below the floor with the live ones', () => {
+		const [a, b, c] = [0, 1, 2].map((index) => makeGuardian(index));
+		const registration = buildRegistration();
+		for (const g of [a, b, c]) g.register(registration);
+		const chain = buildChain(registration.initialState, 2);
+		for (const g of [a, b, c]) {
+			for (const record of chain) g.putState({ record });
+		}
+		// C alone holds 3 and 4, which the takeover moves to its orphan archive.
+		for (const record of buildChain(headOf(c), 2)) c.putState({ record });
+		const acquire = buildAcquire(headOf(a), WRITER_2);
+		const certificates = [a, b].map(
+			(g) => g.acquireEpoch(acquire).certificate as IGuardianTakeoverCertificate
+		);
+		expect(c.syncEpoch({ certificates }).status).to.equal(GuardianStatus.OK);
+		expect(c.listOrphanedRecords(ROOT.recoveryId)).to.have.length(2);
+
+		const later: IGuardianRecord[] = [];
+		let previousHash = headOf(c).logHead.frameHash;
+		for (let sequence = 3n; sequence <= 6n; sequence++) {
+			const record = buildRecord({
+				epoch: 2n,
+				sequence,
+				previousHash,
+				writerSecret: WRITER_2.secret
+			});
+			later.push(record);
+			previousHash = record.frameHash;
+		}
+		for (const record of later.slice(0, 3)) c.putState({ record });
+		const put = c.putState({
+			record: later[3],
+			retainFloor: floorAt(later[2], WRITER_2, 2n)
+		});
+		expect(put.status).to.equal(GuardianStatus.OK);
+		expect(storedSequences(c)).to.deep.equal([5n, 6n]);
+		expect(c.listOrphanedRecords(ROOT.recoveryId)).to.deep.equal([]);
+		expect(c.contentBytes()).to.equal(c.auditContentBytes());
+		for (const g of [a, b, c]) g.close();
+	});
+
 	it('refuses the whole request when the floor signature fails', () => {
 		const guardian = makeGuardian(0);
 		const chain = holdingSeven(guardian);
