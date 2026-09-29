@@ -391,13 +391,22 @@ export class WalletFundingProvider implements IFundingProvider {
 			}
 			// A renewal that ran while the wallet did not list the coin could not
 			// freeze it. The wallet lists it again, so freeze it before this
-			// selection, and any wallet send after it, can pick it.
+			// selection, and any wallet send after it, can pick it. wallet.send
+			// selects against the blacklist alone, so a refusal must abort the
+			// selection rather than let it spend the coin.
 			if (renewed && live.has(key) && !this.wallet.isUtxoFrozen?.(txid, vout)) {
-				await this.wallet.freezeUtxo?.({
+				const res = await this.wallet.freezeUtxo?.({
 					txid,
 					index: vout,
 					tag: WalletFundingProvider.PLEDGE_TAG
 				});
+				if (res?.isErr()) {
+					throw new Error(
+						`Failed to reserve funding input ${key}: ${
+							(res as IResultErr).error.message
+						}`
+					);
+				}
 			}
 		}
 	}

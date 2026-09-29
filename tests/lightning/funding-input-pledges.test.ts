@@ -443,6 +443,54 @@ describe('Funding input pledges', function () {
 		expect(unfrozenLog).to.deep.equal([]);
 	});
 
+	it('a refused re-freeze of a returned coin aborts a funding build (issue #1159)', async function () {
+		const { wallet, utxos, frozen, payment } = makeWallet([100_000, 100_000]);
+		const a = `${utxos[0].tx_hash}:0`;
+		const retained = new bitcoin.Transaction();
+		retained.version = 2;
+		retained.addInput(Buffer.from(utxos[0].tx_hash, 'hex').reverse(), 0);
+		retained.addOutput(payment.output!, 90_000);
+
+		// The renewal runs while the coin is spent, so nothing freezes it.
+		const spent = utxos.splice(0, 1)[0];
+		const provider = new WalletFundingProvider(wallet as never);
+		await provider.pledgeTransactionInputs(retained.toHex());
+		utxos.unshift(spent);
+
+		// Like the real wallet, send spends the first coin the blacklist allows.
+		wallet.send = async () => {
+			const coin = utxos.find((u) => !frozen.has(`${u.tx_hash}:0`))!;
+			const tx = new bitcoin.Transaction();
+			tx.version = 2;
+			tx.addInput(Buffer.from(coin.tx_hash, 'hex').reverse(), 0);
+			tx.addOutput(payment.output!, 90_000);
+			return ok(tx.toHex());
+		};
+		const realFreeze = wallet.freezeUtxo;
+		let failures = 1;
+		wallet.freezeUtxo = async (p) =>
+			failures-- > 0 ? (errResult('storage is down') as never) : realFreeze(p);
+
+		let error = '';
+		try {
+			await provider.buildFundingTransaction(payment.address!, 90_000n);
+		} catch (e) {
+			error = (e as Error).message;
+		}
+		expect(error).to.include(`Failed to reserve funding input ${a}`);
+
+		// Storage recovers: coin A is frozen before the wallet picks.
+		const { txHex } = await provider.buildFundingTransaction(
+			payment.address!,
+			90_000n
+		);
+		const spends = bitcoin.Transaction.fromHex(txHex).ins.map(
+			(i) => `${Buffer.from(i.hash).reverse().toString('hex')}:${i.index}`
+		);
+		expect(spends).to.deep.equal([`${utxos[1].tx_hash}:0`]);
+		expect(frozen.has(a)).to.equal(true);
+	});
+
 	it('an unreadable transaction renews nothing instead of throwing', async function () {
 		const { wallet, frozen } = makeWallet([100_000]);
 		const provider = new WalletFundingProvider(wallet as never);
@@ -523,7 +571,7 @@ describe('Funding input pledges', function () {
 		} catch (e) {
 			selectError = (e as Error).message;
 		}
-		expect(selectError).to.include('insufficient wallet funds');
+		expect(selectError).to.include('Failed to reserve funding input');
 	});
 
 	it('never adopts or unfreezes a user freeze (no tag)', async function () {
