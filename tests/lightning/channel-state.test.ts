@@ -658,7 +658,7 @@ describe('Channel State Machine', function () {
 		it('should reject HTLC below remote minimum', function () {
 			const { opener } = getToNormal();
 			const actions = opener.addHtlc(
-				0n, // below minimum
+				999n, // below the 1000 msat minimum
 				crypto.randomBytes(32),
 				500000,
 				crypto.randomBytes(1366)
@@ -666,6 +666,22 @@ describe('Channel State Machine', function () {
 			const error = findAction(actions, ChannelActionType.ERROR);
 			expect(error).to.exist;
 			expect(error.message).to.contain('below remote minimum');
+		});
+
+		it('should reject a 0 msat HTLC when the remote minimum is 0 (issue #1036)', function () {
+			const { opener } = getToNormal();
+			(opener as any)._state.remoteConfig.htlcMinimumMsat = 0n;
+			const actions = opener.addHtlc(
+				0n,
+				crypto.randomBytes(32),
+				500000,
+				crypto.randomBytes(1366)
+			);
+			const error = findAction(actions, ChannelActionType.ERROR);
+			expect(error).to.exist;
+			expect(error.message).to.contain('must be positive');
+			expect(actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)).to
+				.be.false;
 		});
 
 		it('should reject HTLC exceeding max value in flight', function () {

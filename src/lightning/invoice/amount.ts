@@ -62,8 +62,19 @@ export function msatToHrpAmount(amountMsat: bigint): string {
 
 /**
  * Parse an HRP amount string (digits + optional multiplier) to millisatoshis.
+ * A zero amount is refused: BOLT 11 amounts are positive, and a payer that
+ * took one would offer a 0 msat HTLC that BOLT 2 lets the peer fail the
+ * channel over.
  */
 export function hrpAmountToMsat(amountStr: string): bigint {
+	const amountMsat = parseHrpAmount(amountStr);
+	if (amountMsat === 0n) {
+		throw new Error('Amount must be positive');
+	}
+	return amountMsat;
+}
+
+function parseHrpAmount(amountStr: string): bigint {
 	if (amountStr.length === 0) {
 		throw new Error('Empty amount string');
 	}

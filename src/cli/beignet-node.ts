@@ -9457,6 +9457,15 @@ export class BeignetNode extends EventEmitter {
 
 	decodeInvoice(bolt11: string): DecodedInvoice {
 		const inv = decodeInvoiceInput(bolt11);
+		// Refused here as well as by the engine's send, so a caller that
+		// decodes or validates first learns it before trying to pay.
+		const ours = this.toLnNetwork(this.networkName);
+		if (inv.network !== ours) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_INVOICE,
+				`Invoice is for network "${inv.network}", this node is on "${ours}"`
+			);
+		}
 		const result: DecodedInvoice = {
 			network: inv.network,
 			timestamp: inv.timestamp,
@@ -12112,7 +12121,15 @@ export class BeignetNode extends EventEmitter {
 				  }
 				: undefined;
 
-		const bolt12Invoice = await this.node.requestInvoice(offer, requestOptions);
+		const bolt12Invoice = await this.node
+			.requestInvoice(offer, requestOptions)
+			.catch((err: unknown) => {
+				// An offer for another chain.
+				if (err instanceof InvalidRequestError) {
+					throw new BeignetError(BeignetErrorCode.INVALID_OFFER, err.message);
+				}
+				throw err;
+			});
 		// Re-checked after the await: the request is a round trip to the payee,
 		// and it is the dispatch below, not the request above, that a drain
 		// started meanwhile has to stop.

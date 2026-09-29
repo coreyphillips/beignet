@@ -15962,6 +15962,14 @@ export class LightningNode extends EventEmitter {
 		const redispatching = this.redispatchingRetryContext;
 		this.redispatchingRetryContext = undefined;
 		const invoice = decodeInvoice(invoiceStr);
+		// The payee is found by node id alone, so an invoice for another chain
+		// would pay whichever node holds that key on ours.
+		if (invoice.network !== this.network) {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVALID_INVOICE,
+				`Invoice is for network "${invoice.network}", this node is on "${this.network}"`
+			);
+		}
 
 		// Payment deduplication (Fix 1.4, widened by issue #975): a hash whose
 		// payment completed, or that still has an HTLC out, is not paid again.
@@ -16014,6 +16022,12 @@ export class LightningNode extends EventEmitter {
 				);
 			}
 			paymentAmountMsat = amountMsat;
+		}
+		if (paymentAmountMsat <= 0n) {
+			throw new LightningPaymentError(
+				LightningErrorCode.MISSING_AMOUNT,
+				'amountMsat must be positive'
+			);
 		}
 
 		// Check invoice expiry before attempting payment (Fix 8)
@@ -28303,7 +28317,22 @@ export class LightningNode extends EventEmitter {
 			timeoutMs?: number;
 		}
 	): Promise<IBolt12Invoice> {
-		const request = this.offerManager.requestInvoice(offer, options);
+		// BOLT 12: an offer without offer_chains is for bitcoin mainnet. One
+		// that does not list our chain would be paid on ours to whichever node
+		// holds the issuer's key here.
+		const ours = this.acceptableChainHashes[0] ?? this.chainHash();
+		const offerChains = offer.chains ?? [BITCOIN_CHAIN_HASH];
+		if (!offerChains.some((c) => c.equals(ours))) {
+			throw new InvalidRequestError(
+				"Offer is not for this node's chain: its offer_chains do not include it"
+			);
+		}
+		// The offer manager defaults invreq_chain to the offer's first chain,
+		// which need not be ours when the offer lists several.
+		const request = this.offerManager.requestInvoice(offer, {
+			...options,
+			chain: options?.chain ?? (offer.chains ? ours : undefined)
+		});
 		if (options?.timeoutMs) {
 			return Promise.race([
 				request,

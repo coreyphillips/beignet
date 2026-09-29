@@ -29,10 +29,20 @@ import {
 import { signInvoice } from '../../src/lightning/invoice/signing';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { INodeConfig } from '../../src/lightning/node/types';
-import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
+import {
+	INodeConfig,
+	InvalidRequestError,
+	LightningErrorCode,
+	LightningPaymentError
+} from '../../src/lightning/node/types';
+import {
+	DEFAULT_CHANNEL_CONFIG,
+	REGTEST_CHAIN_HASH,
+	TESTNET_CHAIN_HASH
+} from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
+import { IOffer } from '../../src/lightning/offer/types';
 
 // ─────────────── Helpers ───────────────
 
@@ -46,9 +56,9 @@ function makeKey(label: string): Buffer {
  */
 function craftInvoice(
 	fields: Array<{ type: number; dataWords: number[] }>,
-	privateKey: Buffer
+	privateKey: Buffer,
+	hrp = 'lnbcrt'
 ): string {
-	const hrp = 'lnbcrt';
 	const dataWords: number[] = encodeUintToWords(
 		Math.floor(Date.now() / 1000),
 		TIMESTAMP_WORDS
@@ -286,6 +296,121 @@ describe('BOLT 11 payer safety', function () {
 			});
 			// Passes the feature gate; fails later for lack of any route
 			expect(() => node.sendPayment(inv)).to.throw('No route found');
+			node.destroy();
+		});
+	});
+
+	// ───────── Issue #1036: case, network and zero-amount leniencies ─────────
+
+	describe('case, network and zero amount (issue #1036)', function () {
+		function regtestInvoice(amountMsat?: bigint): string {
+			return encodeInvoice({
+				network: Network.REGTEST,
+				paymentHash: crypto.randomBytes(32),
+				paymentSecret: crypto.randomBytes(32),
+				description: 'issue 1036',
+				amountMsat,
+				payeeNodeKey: getPublicKey(payeeKey),
+				privateKey: payeeKey
+			});
+		}
+
+		it('rejects a string that mixes upper and lower case', function () {
+			const inv = regtestInvoice(1000n);
+			const mixed = inv.slice(0, 20).toUpperCase() + inv.slice(20);
+			expect(() => decodeInvoice(mixed)).to.throw('Mixed-case');
+			// A single case either way still decodes.
+			expect(decodeInvoice(inv.toUpperCase()).network).to.equal(
+				Network.REGTEST
+			);
+		});
+
+		it('rejects a zero amount in the HRP', function () {
+			for (const hrp of ['lnbcrt0m', 'lnbcrt0', 'lnbcrt0p']) {
+				const inv = craftInvoice(
+					[
+						{
+							type: TagType.PAYMENT_HASH,
+							dataWords: bufferToWords(crypto.randomBytes(32))
+						},
+						descriptionField()
+					],
+					payeeKey,
+					hrp
+				);
+				expect(() => decodeInvoice(inv), hrp).to.throw(
+					'Amount must be positive'
+				);
+			}
+		});
+
+		it('refuses to pay an invoice for another network', function () {
+			const node = new LightningNode(makeNodeConfig('payer-network'));
+			node.on('error', () => {});
+			const inv = encodeInvoice({
+				network: Network.TESTNET,
+				paymentHash: crypto.randomBytes(32),
+				paymentSecret: crypto.randomBytes(32),
+				description: 'testnet invoice',
+				amountMsat: 1000n,
+				payeeNodeKey: getPublicKey(payeeKey),
+				privateKey: payeeKey
+			});
+			let caught: unknown;
+			try {
+				node.sendPayment(inv);
+			} catch (err) {
+				caught = err;
+			}
+			expect(caught).to.be.instanceOf(LightningPaymentError);
+			expect((caught as LightningPaymentError).code).to.equal(
+				LightningErrorCode.INVALID_INVOICE
+			);
+			expect((caught as Error).message).to.contain('network "tb"');
+			expect(node.listPayments()).to.have.length(0);
+			node.destroy();
+		});
+
+		it('refuses a zero amountMsat for an amountless invoice', function () {
+			const node = new LightningNode(makeNodeConfig('payer-zero'));
+			node.on('error', () => {});
+			expect(() =>
+				node.sendPayment(regtestInvoice(), undefined, undefined, 0n)
+			).to.throw('amountMsat must be positive');
+			expect(node.listPayments()).to.have.length(0);
+			node.destroy();
+		});
+
+		it("refuses an offer whose offer_chains do not include the node's chain", async function () {
+			const node = new LightningNode(makeNodeConfig('payer-offer'));
+			node.on('error', () => {});
+			const offerManager = node.getOfferManager();
+			const requested: Array<{ chain?: Buffer } | undefined> = [];
+			offerManager.requestInvoice = (_offer, options): Promise<never> => {
+				requested.push(options);
+				return Promise.reject(new Error('not sent in this test'));
+			};
+			const offer = (chains?: Buffer[]): IOffer => ({
+				offerId: crypto.randomBytes(32),
+				description: 'widget',
+				amount: 1000n,
+				...(chains && { chains })
+			});
+
+			// No offer_chains means bitcoin mainnet.
+			for (const chains of [undefined, [TESTNET_CHAIN_HASH]]) {
+				const err = await node.requestInvoice(offer(chains)).catch((e) => e);
+				expect(err).to.be.instanceOf(InvalidRequestError);
+				expect(err.message).to.contain('offer_chains');
+			}
+			expect(requested).to.have.length(0);
+
+			// Listed, though not first: the request names our chain.
+			await node
+				.requestInvoice(offer([TESTNET_CHAIN_HASH, REGTEST_CHAIN_HASH]))
+				.catch(() => undefined);
+			expect(requested).to.have.length(1);
+			expect(requested[0]?.chain?.equals(REGTEST_CHAIN_HASH)).to.equal(true);
 			node.destroy();
 		});
 	});
