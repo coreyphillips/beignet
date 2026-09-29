@@ -11732,10 +11732,22 @@ export class BeignetNode extends EventEmitter {
 		return fields;
 	}
 
+	/**
+	 * An outgoing amount is what left the node, fees included, and it and the
+	 * fee round UP. The balance rounds down, so truncating these too let a send
+	 * paying 20,001.5 sats read -20,001 while the balance fell by 20,002, and
+	 * the history no longer added up to the balance. An MPP record carries the
+	 * invoice amount in amountMsat and what left in sentMsat, so the same
+	 * sentSats the spend ledger charges keeps both shapes reporting the same
+	 * figure. Incoming amounts still round down, as the balance does.
+	 */
 	private toPaymentInfo(p: IPaymentInfo): PaymentInfo {
 		const info: PaymentInfo = {
 			paymentHash: p.paymentHash.toString('hex'),
-			amountSats: Number(p.amountMsat / 1000n),
+			amountSats:
+				p.direction === PaymentDirection.OUTGOING
+					? sentSats(p) ?? spendLimitSats(p.amountMsat)
+					: Number(p.amountMsat / 1000n),
 			status: p.status,
 			direction: p.direction,
 			createdAt: p.createdAt
@@ -11753,9 +11765,9 @@ export class BeignetNode extends EventEmitter {
 		if (p.sentMsat !== undefined && p.sentMsat >= p.amountMsat) {
 			// An MPP record: its route is the first part only, so the fee
 			// is what left the node over what the invoice asked (#1008).
-			info.feeSats = Number((p.sentMsat - p.amountMsat) / 1000n);
+			info.feeSats = spendLimitSats(p.sentMsat - p.amountMsat);
 		} else if (p.route?.totalFeeMsat !== undefined) {
-			info.feeSats = Number(p.route.totalFeeMsat / 1000n);
+			info.feeSats = spendLimitSats(p.route.totalFeeMsat);
 		}
 		if (p.route) {
 			const hops = p.route.hops;

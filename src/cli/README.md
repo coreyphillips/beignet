@@ -890,8 +890,8 @@ interface DecodedInvoice {
 interface PaymentInfo {
   paymentHash: string;      // hex
   preimage?: string;        // hex, present when settled
-  amountSats: number;
-  feeSats?: number;         // routing fee paid (from route)
+  amountSats: number;       // OUTGOING: what left the node, fees included, rounded up
+  feeSats?: number;         // routing fee paid, rounded up
   status: 'PENDING' | 'COMPLETED' | 'FAILED';
   direction: 'OUTGOING' | 'INCOMING';
   failureCode?: number;     // BOLT 4 failure code

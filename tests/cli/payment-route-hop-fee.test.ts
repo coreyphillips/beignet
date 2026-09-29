@@ -130,6 +130,7 @@ describe('route.hops[].feeMsat is the fee each hop kept (#1056)', function () {
 			753
 		);
 		expect(info.route!.hopCount).to.equal(4);
-		expect(info.feeSats).to.equal(0);
+		// 753 msat rounds up to 1 sat: it left the node (#1185).
+		expect(info.feeSats).to.equal(1);
 	});
 });
