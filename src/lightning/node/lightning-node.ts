@@ -15888,6 +15888,10 @@ export class LightningNode extends EventEmitter {
 		policyOverrides?: TPolicyOverrides,
 		metadata?: Record<string, string>
 	): IPaymentInfo {
+		// Taken once, so a send a payment:failed listener starts from inside
+		// this call is not mistaken for the retry.
+		const redispatching = this.redispatchingRetryContext;
+		this.redispatchingRetryContext = undefined;
 		const invoice = decodeInvoice(invoiceStr);
 
 		// Payment deduplication (Fix 1.4, widened by issue #975): a hash whose
@@ -15901,7 +15905,7 @@ export class LightningNode extends EventEmitter {
 		// the retry being re-dispatched was left by a send that ended. This
 		// call's amount, fee cap, ceiling and exclusions replace it (issue #1041).
 		const priorCtx = this.paymentRetryContexts.get(dedupHashHex);
-		if (priorCtx && priorCtx !== this.redispatchingRetryContext) {
+		if (priorCtx && priorCtx !== redispatching) {
 			this.paymentRetryContexts.delete(dedupHashHex);
 		}
 
@@ -16209,8 +16213,16 @@ export class LightningNode extends EventEmitter {
 		metadata?: Record<string, string>
 	): IPaymentInfo {
 		const hashHex = paymentHash.toString('hex');
-		const created = !this.paymentRetryContexts.has(hashHex);
-		if (created) this.paymentRetryContexts.set(hashHex, context);
+		if (!this.paymentRetryContexts.has(hashHex)) {
+			this.paymentRetryContexts.set(hashHex, context);
+		}
+		// By identity: a payment:failed listener may already have started a
+		// new send of the hash, and the context there now is that send's.
+		const release = (): void => {
+			if (this.paymentRetryContexts.get(hashHex) === context) {
+				this.paymentRetryContexts.delete(hashHex);
+			}
+		};
 		try {
 			const payment = this.sendPaymentToRoute(
 				route,
@@ -16220,12 +16232,10 @@ export class LightningNode extends EventEmitter {
 				paymentAmountMsat,
 				metadata
 			);
-			if (created && payment.status === PaymentStatus.FAILED) {
-				this.paymentRetryContexts.delete(hashHex);
-			}
+			if (payment.status === PaymentStatus.FAILED) release();
 			return payment;
 		} catch (err) {
-			if (created) this.paymentRetryContexts.delete(hashHex);
+			release();
 			throw err;
 		}
 	}

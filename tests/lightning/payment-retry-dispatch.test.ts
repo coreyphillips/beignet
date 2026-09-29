@@ -607,6 +607,60 @@ describe('Issue #1041: a BOLT 11 send that ended leaves no context for the next'
 		alice.destroy();
 		bob.destroy();
 	});
+
+	it('a re-send from a payment:failed listener is not taken for the retry', () => {
+		const { alice, bob } = setupPair(924, 925);
+		const invoice = zeroAmountInvoice(alice, bob);
+
+		// The first attempt fails at bob and its retry is refused locally. A
+		// listener hears that refusal and re-sends at the later amount.
+		let restore: (() => void) | undefined;
+		const amounts = recordAttemptAmounts(
+			alice,
+			bob,
+			invoice.paymentHash,
+			() => {
+				restore ??= refuseEveryAdd(alice);
+			}
+		);
+		alice.once('payment:failed', () => {
+			restore!();
+			alice.sendPaymentWithOptions(invoice.bolt11, LATER);
+		});
+		alice.sendPaymentWithOptions(invoice.bolt11, EARLIER);
+
+		expect(amounts.length).to.be.greaterThan(2);
+		expect(amounts.slice(1)).to.deep.equal(
+			amounts.slice(1).map(() => LATER.amountMsat)
+		);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it("a send refused locally leaves a listener re-send's context alone", () => {
+		const { alice, bob } = setupPair(926, 927);
+		const invoice = zeroAmountInvoice(alice, bob);
+		// bob holds the re-send, so it stays PENDING and keeps its context.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(bob as any).handleFinalHopHtlc = (): void => {};
+
+		const restore = refuseEveryAdd(alice);
+		alice.once('payment:failed', () => {
+			restore();
+			alice.sendPaymentWithOptions(invoice.bolt11, LATER);
+		});
+		const refused = alice.sendPaymentWithOptions(invoice.bolt11, EARLIER);
+		expect(refused.status).to.equal(PaymentStatus.FAILED);
+
+		expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+		expect(invoice.hasContext()).to.be.true;
+
+		alice.destroy();
+		bob.destroy();
+	});
 });
 
 describe('Issue #182: failure-embedded channel_update never reaches the graph', () => {
