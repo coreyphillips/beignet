@@ -16197,7 +16197,8 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Seed the retry context for a BOLT 11 attempt and send along the route.
 	 * A context seeded here is removed again when the attempt fails locally
-	 * (an exception, or addHtlc refusing the HTLC): no onion failure will
+	 * (an exception before its record is PENDING, or addHtlc refusing the
+	 * HTLC): no onion failure will
 	 * reach the failure handler, so nothing retries it, and it would hold
 	 * this call's amount, fee cap, ceiling and exclusions against the hash
 	 * until the prune (issue #1041). An existing context is the retry's own,
@@ -16235,7 +16236,12 @@ export class LightningNode extends EventEmitter {
 			if (payment.status === PaymentStatus.FAILED) release();
 			return payment;
 		} catch (err) {
-			release();
+			// A throw from addHtlc (the outbound transport, say) can leave the
+			// HTLC on the channel beside its PENDING record, and a failure of
+			// that HTLC still retries through the context.
+			if (this.payments.get(hashHex)?.status !== PaymentStatus.PENDING) {
+				release();
+			}
 			throw err;
 		}
 	}

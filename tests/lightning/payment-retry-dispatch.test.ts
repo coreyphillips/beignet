@@ -45,6 +45,7 @@ import {
 	AMOUNT_BELOW_MINIMUM
 } from '../../src/lightning/onion/types';
 import { encodeChannelUpdateMessage } from '../../src/lightning/gossip/messages';
+import { MessageType } from '../../src/lightning/message/types';
 import { signChannelUpdate } from '../../src/lightning/gossip/validation';
 import { calculateFee } from '../../src/lightning/gossip/pathfinding';
 
@@ -539,6 +540,35 @@ describe('Issue #1041: a BOLT 11 send that ended leaves no context for the next'
 
 		expect(amounts.length).to.be.greaterThan(1);
 		expect(amounts).to.deep.equal(amounts.map(() => LATER.amountMsat));
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a dispatch that throws once its HTLC is out keeps the context', () => {
+		const { alice, bob } = setupPair(928, 929);
+		const invoice = zeroAmountInvoice(alice, bob);
+
+		// The transport throws as update_add_htlc leaves, after the channel
+		// already holds the HTLC.
+		let thrown = false;
+		alice.prependListener(
+			'message:outbound',
+			(_pubkey: string, type: number) => {
+				if (type !== MessageType.UPDATE_ADD_HTLC || thrown) return;
+				thrown = true;
+				throw new Error('transport failed');
+			}
+		);
+		expect(() =>
+			alice.sendPaymentWithOptions(invoice.bolt11, EARLIER)
+		).to.throw(/transport failed/);
+
+		expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+		expect(alice.getOutgoingHtlcs(invoice.paymentHash).htlcs).to.have.length(1);
+		expect(invoice.hasContext()).to.be.true;
 
 		alice.destroy();
 		bob.destroy();
