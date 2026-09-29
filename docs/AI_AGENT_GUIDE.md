@@ -249,6 +249,11 @@ refused, and the error says whether to lower `maxFeeSats` or the amount;
 `validatePayment(bolt11, amountSats, maxFeeSats)` previews the same
 judgement. `sendToRoute` is judged on what its first hop carries.
 
+External on-chain sends are held to both limits as well: `sendOnchain`, an
+address-targeted `spliceOut` and `sendDirectFunding` on the amount plus the
+fee, `sendMaxOnchain` on the whole sweep. A circular rebalance counts only its
+routing fee, and only against the daily limit.
+
 ## Error Handling
 
 ### Decision tree

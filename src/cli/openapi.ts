@@ -2263,7 +2263,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						amountSats: 'number',
 						satsPerVbyte: 'number?'
 					}),
-					responses: { '200': { description: 'Transaction info' } }
+					responses: {
+						'200': { description: 'Transaction info' },
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: amount + fee over maxPaymentSats or dailySpendLimitSats'
+						}
+					}
 				}
 			},
 			'/send-max': {
@@ -2280,7 +2286,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description: 'Transaction info',
 							content: jsonContent({ $ref: '#/components/schemas/TxInfo' })
 						},
-						'400': { description: 'Invalid address/fee rate or no UTXOs' }
+						'400': { description: 'Invalid address/fee rate or no UTXOs' },
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: the whole sweep over maxPaymentSats or dailySpendLimitSats'
+						}
 					}
 				}
 			},
@@ -2484,7 +2494,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							content: jsonContent({
 								$ref: '#/components/schemas/RebalanceExecutionSummary'
 							})
-						}
+						},
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: the advisor fee budget for the day does not fit the remaining dailySpendLimitSats'
+						},
+						'409': { description: 'SERVICE_DRAINING' }
 					}
 				}
 			},
@@ -2508,7 +2523,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'400': {
 							description: 'No route, fee exceeds maxFeeSats, or invalid params'
-						}
+						},
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: maxFeeSats does not fit the remaining dailySpendLimitSats'
+						},
+						'409': { description: 'SERVICE_DRAINING' }
 					}
 				}
 			},
@@ -3325,7 +3345,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'403': {
 							description:
-								'SPENDING_LIMIT_EXCEEDED: an address-targeted splice-out over dailySpendLimitSats'
+								'SPENDING_LIMIT_EXCEEDED: an address-targeted splice-out over maxPaymentSats or dailySpendLimitSats'
 						},
 						'404': { description: 'CHANNEL_NOT_FOUND' },
 						'409': {

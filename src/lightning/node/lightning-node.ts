@@ -13944,6 +13944,16 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * The per-UTC-day fee budget executeRebalanceRecommendations runs under:
+	 * the one given, else the configured autoRebalance budget, else 1000 sats.
+	 */
+	rebalanceBudgetSatsPerDay(budgetSatsPerDay?: number): number {
+		return (
+			budgetSatsPerDay ?? this.autoRebalanceConfig.budgetSatsPerDay ?? 1_000
+		);
+	}
+
+	/**
 	 * Execute the advisor's rebalance plan under a strict per-UTC-day fee
 	 * budget. Each pair gets a fee cap of min(remaining budget, 0.5% of the
 	 * amount, at least 1 sat); once the day's budget is exhausted the remaining
@@ -13959,10 +13969,9 @@ export class LightningNode extends EventEmitter {
 		}
 		this.rebalanceRunInFlight = true;
 		try {
-			const budgetSats =
-				options?.budgetSatsPerDay ??
-				this.autoRebalanceConfig.budgetSatsPerDay ??
-				1_000;
+			const budgetSats = this.rebalanceBudgetSatsPerDay(
+				options?.budgetSatsPerDay
+			);
 			if (budgetSats < 0) throw new Error('budgetSatsPerDay must be >= 0');
 			const budgetMsat = BigInt(budgetSats) * 1000n;
 

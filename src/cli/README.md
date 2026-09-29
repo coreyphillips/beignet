@@ -84,6 +84,7 @@ const node = await BeignetNode.create({
   backupIntervalMs?: number, // backup interval (default: 6 hours, requires backupPath)
   storageEncryption?: boolean, // encrypt SQLite storage at rest with a seed-derived key (default: true)
   dailySpendLimitSats?: number, // COMBINED LN + on-chain daily spending limit in satoshis (resets at midnight UTC; the day's ledger is persisted and survives a restart); see Spending Limits
+  maxPaymentSats?: number,  // per-payment cap in satoshis for Lightning payments and external on-chain sends; see Spending Limits
   connectTimeoutMs?: number,  // timeout for connectPeer() in ms (default: 15000)
   onError?: (error) => void, // error callback for node:error events
   logLevel?: LogLevel,       // 'debug' | 'info' | 'warn' | 'error' | 'silent' (default: 'info')
@@ -163,7 +164,7 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `closeChannel(channelId, acceptStaleStateRisk?)` | `Promise<{ ok, error? }>` | Cooperative close (`await` it): the payout goes to a wallet-scanned address on the change chain, never to a handed-out receive address. A capsule-restored channel needs `acceptStaleStateRisk: true`, because a mutual close signs the balances that row carries |
 | `forceCloseChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error?, commitmentTxid? }` | Force close; the sweep pays the wallet's change chain, never a handed-out receive address. A capsule-restored channel needs `acceptStaleStateRisk: true` |
 | `spliceIn(channelId, amountSats, feerate)` | `SpliceResult` | Add funds to existing channel |
-| `spliceOut(channelId, amountSats, feerate, destinationAddress?)` | `SpliceResult` | Withdraw funds from channel, to the wallet or an external address. An address-targeted splice-out counts amount + fee against `dailySpendLimitSats` |
+| `spliceOut(channelId, amountSats, feerate, destinationAddress?)` | `SpliceResult` | Withdraw funds from channel, to the wallet or an external address. An address-targeted splice-out counts amount + fee against `maxPaymentSats` and `dailySpendLimitSats` |
 | `listChannels()` | `ChannelInfo[]` | List all channels |
 | `getChannel(channelId)` | `ChannelInfo \| null` | Get specific channel |
 | `updateChannelFee(channelId, feeratePerKw)` | `{ ok: true }` | Update channel COMMITMENT feerate via update_fee (min 253). Not the routing fee policy |
@@ -285,8 +286,8 @@ Entries survive a restart. The queue dispatches the restored ones once some chan
 | `getChannelSuggestions(count?)` | `ChannelSuggestion[]` | Graph-based channel open suggestions scored by connectivity, capacity, freshness, relevance |
 | `getFeeSnapshot()` | `FeeSnapshot \| null` | On-chain fee trend analysis with open/wait recommendation |
 | `getAdvisorRecommendations()` | `AdvisorRecommendations` | Liquidity analysis plus the concrete circular-rebalance plan (read-only) |
-| `rebalanceChannel(fromId, toId, amountSats, maxFeeSats)` | `Promise<RebalanceResult>` | Circular rebalance (self-payment out fromId, back in toId). Aborts without paying if the route fee exceeds `maxFeeSats` |
-| `executeRebalances(budgetSatsPerDay?)` | `Promise<RebalanceExecutionSummary>` | Run the advisor's rebalance plan under a per-UTC-day fee budget (persisted; restarts never overspend the day) |
+| `rebalanceChannel(fromId, toId, amountSats, maxFeeSats)` | `Promise<RebalanceResult>` | Circular rebalance (self-payment out fromId, back in toId). Aborts without paying if the route fee exceeds `maxFeeSats`. The fee counts against `dailySpendLimitSats` |
+| `executeRebalances(budgetSatsPerDay?)` | `Promise<RebalanceExecutionSummary>` | Run the advisor's rebalance plan under a per-UTC-day fee budget (persisted; restarts never overspend the day). The fees count against `dailySpendLimitSats` |
 
 Automatic execution is **off by default**: pass `autoRebalance: { enabled: true, budgetSatsPerDay, minImbalancePct }` and/or `autoTuneFees: { enabled: true, intervalMs, floorPpm, ceilPpm }` in `BeignetNodeOptions` to turn on the periodic rebalance scan and routing-fee (ppm) auto-tuning.
 
@@ -702,6 +703,19 @@ Operational notes:
 > opens/splices/funding, and
 > `bumpFeeOnchain`/`boostOnchain` (fee-only). PSBT building is also not
 > counted (nothing is broadcast). Resets at midnight UTC.
+
+`maxPaymentSats` covers the same external on-chain sends, judged on the same
+figure as the daily limit: `sendOnchain`, an address-targeted `spliceOut` and
+`sendDirectFunding` on the amount plus the fee, and `sendMaxOnchain` on the
+whole sweep. The exclusions above are outside it too.
+
+Circular rebalances (`rebalanceChannel`, `executeRebalances` and their routes)
+are refused with `SERVICE_DRAINING` while the node drains. The amount comes
+back to the node, so only the routing fee counts against the daily limit:
+`rebalanceChannel` is judged on its `maxFeeSats` and `executeRebalances` on
+the day's advisor fee budget, and the day is charged the fee actually paid.
+`maxPaymentSats` does not apply to them. The `autoRebalance` timer runs inside
+the engine and is bounded only by its own `budgetSatsPerDay`.
 
 Every invoice payment (`payInvoice`, `payInvoiceSafe`, `payInvoiceWithRetry`,
 `sendPaymentAsync`, the queue and their routes) is checked and recorded at the
