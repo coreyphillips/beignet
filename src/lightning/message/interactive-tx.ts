@@ -400,6 +400,9 @@ export function encodeTxSignaturesMessage(msg: ITxSignaturesMessage): Buffer {
 	return Buffer.concat(parts);
 }
 
+/** shared_input_signature (type 0) is the only tx_signatures TLV. */
+const TX_SIGNATURES_TLV_TYPES = new Set([0n]);
+
 /**
  * Decode a tx_signatures message payload.
  */
@@ -441,7 +444,11 @@ export function decodeTxSignaturesMessage(
 	const result: ITxSignaturesMessage = { channelId, txid, witnesses };
 
 	if (offset < payload.length) {
-		const { records } = decodeTlvStream(payload, offset);
+		const { records } = decodeTlvStream(
+			payload,
+			offset,
+			TX_SIGNATURES_TLV_TYPES
+		);
 		for (const record of records) {
 			if (record.type === 0n && record.value.length === 64) {
 				result.sharedInputSignature = Buffer.from(record.value);

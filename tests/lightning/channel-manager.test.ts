@@ -1015,6 +1015,27 @@ describe('Channel Manager', function () {
 				ChannelState.NORMAL
 			);
 		});
+
+		it('surfaces peer error and warning text as printable ASCII only', function () {
+			const { alice, channelId } = openAndReadyChannel();
+			const surfaced: string[] = [];
+			alice.on('error', (_cid: Buffer | null, message: string) =>
+				surfaced.push(message)
+			);
+			const data = Buffer.from('bad\n[INFO] forged line\x1b[2J', 'ascii');
+			alice.handleMessage(
+				bobPubkey,
+				1,
+				encodeErrorMessage({ channelId, data })
+			);
+			alice.handleMessage(
+				bobPubkey,
+				17,
+				encodeErrorMessage({ channelId, data })
+			);
+			expect(surfaced).to.include('Remote warning: bad?[INFO] forged line?[2J');
+			expect(surfaced).to.include('Remote error: bad?[INFO] forged line?[2J');
+		});
 	});
 
 	describe('the rest of the v1 handshake reaches the peer (issue 393)', function () {
