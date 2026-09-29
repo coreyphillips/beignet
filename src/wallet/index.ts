@@ -5732,6 +5732,11 @@ export class Wallet {
 			return err(txResponse.error.message);
 		}
 		const txData = txResponse.value.data;
+		// canBoost only reads the height stored at the last refresh. A replacement
+		// for a transaction that has since confirmed is rejected by every node.
+		if ((txData[0]?.result?.confirmations ?? 0) > 0) {
+			return err('Transaction is already confirmed. Unable to RBF.');
+		}
 
 		const wallet = this.data;
 		const addressTypeKeys = objectKeys(EAddressType);
@@ -5794,9 +5799,6 @@ export class Wallet {
 				});
 				if (tx.isErr()) {
 					return err(tx.error.message);
-				}
-				if (tx.value.data[0].data.height > 0) {
-					return err('Transaction is already confirmed. Unable to RBF.');
 				}
 				const txVout = tx.value.data[0].result.vout[input.vout];
 				if (txVout.scriptPubKey?.address) {
