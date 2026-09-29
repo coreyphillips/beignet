@@ -228,6 +228,26 @@ describe('Channel state-machine leniencies (issue #1047)', function () {
 				errorOf(refused.handleUpdateAddHtlc(addMsg(refused, 1_140_001n)))
 			).to.equal('Remote cannot afford HTLC above channel reserve');
 		});
+
+		it('checks each staged fee rate with its own trim set', function () {
+			const channel = makeChannel({
+				channelType: null,
+				remoteFeeratePerKw: 5_002,
+				remoteMsat: 14_480_000n,
+				htlcs: [
+					{
+						amountMsat: 3_869_000n,
+						direction: HtlcDirection.RECEIVED,
+						addRemoteCommitted: true
+					}
+				]
+			});
+			channel.getFullState().pendingFeeratePerKw = 5_000;
+			const actions = channel.handleUpdateAddHtlc(addMsg(channel, 1_000n));
+			expect(errorOf(actions)).to.equal(
+				'Remote cannot afford HTLC above channel reserve'
+			);
+		});
 	});
 
 	describe('handleUpdateFee: the funder pays for untrimmed HTLCs only', function () {

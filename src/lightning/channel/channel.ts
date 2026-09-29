@@ -3478,13 +3478,18 @@ export class Channel {
 			// the builder deducts from the funder separately: one expression, so
 			// the base weight this channel type prices at and the anchor add can
 			// never be applied apart (#403).
-			remoteRequiredMsat += this._remoteFunderLocalCostMsat(
-				Math.max(
-					getLocalCommitmentFeeRate(this._state),
-					getRemoteCommitmentFeeRate(this._state)
-				),
-				[{ amountMsat: msg.amountMsat, direction: HtlcDirection.RECEIVED }]
+			const candidate = [
+				{ amountMsat: msg.amountMsat, direction: HtlcDirection.RECEIVED }
+			];
+			const localCostMsat = this._remoteFunderLocalCostMsat(
+				getLocalCommitmentFeeRate(this._state),
+				candidate
 			);
+			const remoteCostMsat = this._remoteFunderLocalCostMsat(
+				getRemoteCommitmentFeeRate(this._state),
+				candidate
+			);
+			remoteRequiredMsat += bigIntMax(localCostMsat, remoteCostMsat);
 		}
 		if (this._state.remoteBalanceMsat - msg.amountMsat < remoteRequiredMsat) {
 			// BOLT 2 MUST fail: offering an add the SENDER cannot afford above its
