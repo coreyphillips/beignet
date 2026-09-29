@@ -177,6 +177,7 @@ import {
 	BITCOIN_CHAIN_HASH,
 	REGTEST_CHAIN_HASH,
 	SIGNET_CHAIN_HASH,
+	TESTNET_CHAIN_HASH,
 	isAnchorChannel,
 	ChannelState
 } from '../lightning/channel/types';
@@ -2472,6 +2473,7 @@ export class BeignetNode extends EventEmitter {
 		const lnNetwork = this.toLnNetwork(networkName);
 		const coinType = this.toCoinType(networkName);
 		let chainHash = BITCOIN_CHAIN_HASH;
+		if (networkName === 'testnet') chainHash = TESTNET_CHAIN_HASH;
 		if (networkName === 'regtest') chainHash = REGTEST_CHAIN_HASH;
 		if (networkName === 'signet') chainHash = SIGNET_CHAIN_HASH;
 
