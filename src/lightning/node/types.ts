@@ -120,10 +120,10 @@ export interface IFundingProvider {
 	 * stops listing the coin, so a mempool eviction hands the inputs back
 	 * unspent AND unfrozen. Either way a later funding or an ordinary wallet
 	 * send can double-spend the transaction we still owe the network. The node
-	 * calls this once per block and once at startup for every retained
-	 * transaction, so a pledge lives exactly as long as the obligation it
-	 * protects; when the obligation retires the calls stop and the pledge ages
-	 * out as usual.
+	 * calls this when a funding broadcast is authorized, then once per block and
+	 * once at startup for every retained transaction, so a pledge lives exactly
+	 * as long as the obligation it protects; when the obligation retires the
+	 * calls stop and the pledge ages out as usual.
 	 *
 	 * A renewed pledge must outlive the spend of its coin, and a renewal must
 	 * hold an input the wallet does not list yet (a startup before the first

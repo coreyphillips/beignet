@@ -5133,7 +5133,12 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on('funding:authorized', (fundingTxid: Buffer) => {
 			const txidHex = fundingTxid.toString('hex');
 			const entry = this.pendingFundingTxs.get(txidHex);
-			if (entry) entry.phase = 'authorized';
+			if (entry) {
+				entry.phase = 'authorized';
+				// The selection pledge ends once the broadcast spends its coins, so
+				// an eviction before the next block would hand them back unfrozen.
+				this.renewTransactionPledges(entry.txHex);
+			}
 			this.reauthAttempts.delete(txidHex);
 			this.broadcastPendingFundingTx(txidHex);
 		});
