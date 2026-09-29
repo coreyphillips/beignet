@@ -1600,10 +1600,16 @@ export class Transaction {
 				address = outputs[index]?.address ?? '';
 			}
 
+			// Priced as the one output staged below. With no outputs, getTotalFee
+			// assumes one of the wallet's own type, which is 12 vB short for a p2wpkh
+			// wallet sweeping to a p2tr or p2wsh address.
 			const maxAmountResponse = this.getMaxSendAmount({
 				satsPerByte,
 				selectedFeeId: transaction.selectedFeeId,
-				transaction
+				transaction: {
+					...transaction,
+					outputs: address ? [{ address, value: 0, index }] : []
+				}
 			});
 			if (maxAmountResponse.isErr()) {
 				return err(maxAmountResponse.error);
@@ -1768,6 +1774,21 @@ export class Transaction {
 		satsPerByte?: number;
 	}): Promise<Result<ISendTransaction>> {
 		try {
+			if (txid) {
+				// canBoost only reads the height stored at the last refresh, and a
+				// child of a parent that has since confirmed is a pointless self-send
+				// at the boost rate. An unanswered lookup leaves that stored height as
+				// the only gate, as before.
+				const parentRes = await this._wallet.electrum.getTransactions({
+					txHashes: [{ tx_hash: txid }]
+				});
+				const confirmations = parentRes.isOk()
+					? parentRes.value.data[0]?.result?.confirmations ?? 0
+					: 0;
+				if (confirmations > 0) {
+					return err('Transaction is already confirmed. Unable to CPFP.');
+				}
+			}
 			let minFee = this._wallet.feeEstimates.fast;
 			await this.resetSendTransaction();
 			const setupTransactionRes = await this.setupTransaction({
