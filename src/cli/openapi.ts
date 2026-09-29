@@ -4826,7 +4826,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						skippedBudget: { type: 'integer' },
 						feeSpentMsat: {
 							type: 'string',
-							description: 'Fees spent by this run, msat as decimal string'
+							description:
+								'Fees spent by this run, msat as decimal string. An attempt whose wait timed out counts at its fee cap'
 						},
 						budgetRemainingMsat: {
 							type: 'string',

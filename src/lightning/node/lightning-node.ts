@@ -296,6 +296,7 @@ import {
 	IPaymentPreimageEvent,
 	LightningErrorCode,
 	LightningPaymentError,
+	PaymentWaitTimeoutError,
 	InvalidChannelOpenError,
 	ChannelFundingUnavailableError,
 	ChannelFundingUnavailableCode,
@@ -14020,6 +14021,12 @@ export class LightningNode extends EventEmitter {
 						feeMsat: result.feeMsat
 					});
 				} catch (err) {
+					// Its HTLC can still settle, and nothing would charge it then,
+					// so the cap is spent now and the next pair cannot reuse it.
+					if (err instanceof PaymentWaitTimeoutError) {
+						this.recordRebalanceSpend(feeCapMsat);
+						feeSpentThisRunMsat += feeCapMsat;
+					}
 					attempts.push({
 						fromChannelId: plan.fromChannelId,
 						toChannelId: plan.toChannelId,
@@ -29795,7 +29802,11 @@ export class LightningNode extends EventEmitter {
 		return new Promise<IPaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
-				reject(new Error(`waitForPayment timed out after ${timeoutMs}ms`));
+				reject(
+					new PaymentWaitTimeoutError(
+						`waitForPayment timed out after ${timeoutMs}ms`
+					)
+				);
 			}, timeoutMs);
 
 			const cleanup = (): void => {

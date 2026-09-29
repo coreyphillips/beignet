@@ -17,6 +17,7 @@ import { expect } from 'chai';
 import * as bitcoin from 'bitcoinjs-lib';
 import { BeignetNode } from '../../src/cli/beignet-node';
 import { BeignetError } from '../../src/cli/errors';
+import { PaymentWaitTimeoutError } from '../../src/lightning/node/types';
 import { ok } from '../../src/utils/result';
 
 const CHANNEL_A = 'aa'.repeat(32);
@@ -96,6 +97,7 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 		engine: {
 			feeMsat?: bigint;
 			fails?: boolean;
+			timesOut?: boolean;
 			feeSpentMsat?: bigint;
 			budgetSatsPerDay?: number;
 		} = {}
@@ -108,6 +110,11 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 					node.engineCalls++;
 					node.pendingDuringCall.push(node._pendingSpendSats);
 					if (engine.fails) throw new Error('No circular route');
+					if (engine.timesOut) {
+						throw new PaymentWaitTimeoutError(
+							'waitForPayment timed out after 60000ms'
+						);
+					}
 					return {
 						paymentHash: Buffer.alloc(32, 1),
 						amountMsat: 100_000_000n,
@@ -184,6 +191,19 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 		expect(node._dailySpentSats).to.equal(0);
 	});
 
+	it('charges the fee cap when the wait times out with the HTLC out', async () => {
+		const node = rebalancingNode({ daily: 100_000 }, { timesOut: true });
+		let error: unknown;
+		try {
+			await node.rebalanceChannel(CHANNEL_A, CHANNEL_B, 100_000, 5_000);
+		} catch (err) {
+			error = err;
+		}
+		expect(error).to.be.instanceOf(PaymentWaitTimeoutError);
+		expect(node._pendingSpendSats).to.equal(0);
+		expect(node._dailySpentSats).to.equal(5_000);
+	});
+
 	it('leaves maxPaymentSats out of a rebalance', async () => {
 		const node = rebalancingNode({ maxPayment: 1_000 }, { feeMsat: 10_000n });
 		const result = await node.rebalanceChannel(
@@ -236,10 +256,15 @@ describe('Issue #1042: maxPaymentSats on the external on-chain sends', () => {
 	function walletNode(
 		limits: { daily?: number; maxPayment?: number },
 		sweepInputSats = 0
-	): Fake<{ built: number; broadcasts: string[] }> {
+	): Fake<{
+		built: number;
+		broadcasts: string[];
+		pendingAtBroadcast: number[];
+	}> {
 		const node = fakeNode(limits, {
 			built: 0,
 			broadcasts: [] as string[],
+			pendingAtBroadcast: [] as number[],
 			wallet: {
 				rbf: true,
 				feeEstimates: { normal: 2 },
@@ -260,6 +285,7 @@ describe('Issue #1042: maxPaymentSats on the external on-chain sends', () => {
 			},
 			_broadcastRawTx: async (hex: string): Promise<unknown> => {
 				node.broadcasts.push(hex);
+				node.pendingAtBroadcast.push(node._pendingSpendSats);
 				return { txid: 'ab'.repeat(32), hex };
 			}
 		});
@@ -290,10 +316,12 @@ describe('Issue #1042: maxPaymentSats on the external on-chain sends', () => {
 		expect(node.broadcasts).to.deep.equal([]);
 	});
 
-	it('sends within the cap', async () => {
-		const node = walletNode({ maxPayment: 100_000 });
+	it('sends within the cap, reserving nothing without a daily limit', async () => {
+		const node = walletNode({ maxPayment: 100_000 }, 100_000);
 		await node.sendOnchain(REGTEST_ADDRESS, 99_850, 2);
-		expect(node.broadcasts).to.deep.equal(['00']);
+		await node.sendMaxOnchain(REGTEST_ADDRESS, 2);
+		expect(node.broadcasts).to.deep.equal(['00', '00']);
+		expect(node.pendingAtBroadcast).to.deep.equal([0, 0]);
 	});
 
 	it('refuses a sweep over the cap, unbroadcast', async () => {

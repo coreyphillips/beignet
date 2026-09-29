@@ -172,7 +172,8 @@ import {
 	IStructuredLog,
 	IRebalanceExecutionSummary,
 	PaymentDirection,
-	PaymentStatus
+	PaymentStatus,
+	PaymentWaitTimeoutError
 } from '../lightning/node/types';
 import { isAnchorChannel, ChannelState } from '../lightning/channel/types';
 import { isRecencyUnproven } from '../lightning/channel/channel-state';
@@ -462,12 +463,13 @@ export interface BeignetNodeOptions {
 	 * fee). A Lightning payment reserves its amount plus its routing-fee cap
 	 * at admission and is charged its amount plus the fee actually paid when
 	 * it settles (issue #1008); sendToRoute reserves and charges what its
-	 * first hop carries. Excluded by design: consolidateUtxos (self-pay), our
-	 * own channel opens/splices/funding, bumpFeeOnchain/boostOnchain
-	 * (fee-only), and the submarine swap provider's payment of the
-	 * counterparty's invoice, which is bounded by the provider's own per-swap
-	 * fee cap and by the swap-in it is funded from rather than by this
-	 * limit. Resets at midnight UTC.
+	 * first hop carries. A circular rebalance (rebalanceChannel,
+	 * executeRebalances) counts its routing fee only. Excluded by design:
+	 * consolidateUtxos (self-pay), our own channel opens/splices/funding,
+	 * bumpFeeOnchain/boostOnchain (fee-only), and the submarine swap
+	 * provider's payment of the counterparty's invoice, which is bounded by
+	 * the provider's own per-swap fee cap and by the swap-in it is funded
+	 * from rather than by this limit. Resets at midnight UTC.
 	 * NOTE: before v0.3.0 this limit covered Lightning only.
 	 */
 	dailySpendLimitSats?: number;
@@ -477,9 +479,12 @@ export interface BeignetNodeOptions {
 	 * amount plus routing-fee cap exceeds this (issue #1008): the cap is the
 	 * caller's maxFeeSats/maxFeeMsat, or the default of 1% of the amount with
 	 * a 50 sat floor when none is given. Prevents accidental large payments.
-	 * The submarine swap provider's payment of the counterparty's invoice is
-	 * excluded by design: the provider's own per-swap fee cap and the swap-in
-	 * it is funded from bound it.
+	 * External on-chain sends are capped too: sendOnchain, address-targeted
+	 * spliceOut and sendDirectFunding on amount + fee, sendMaxOnchain on the
+	 * whole sweep. Circular rebalances are not capped, since the amount
+	 * comes back. The submarine swap provider's payment of the counterparty's
+	 * invoice is excluded by design: the provider's own per-swap fee cap and
+	 * the swap-in it is funded from bound it.
 	 */
 	maxPaymentSats?: number;
 	/** Timeout for connectPeer() in milliseconds (default: 15000) */
@@ -6391,13 +6396,14 @@ export class BeignetNode extends EventEmitter {
 				param: 'satsPerVbyte'
 			});
 			this._checkSpendLimit(totalSats);
-			this._pendingSpendSats += totalSats;
+			const reserving = this._dailySpendLimitSats !== undefined;
+			if (reserving) this._pendingSpendSats += totalSats;
 			try {
 				const info = await this._broadcastRawTx(result.value);
 				this._recordSpend(totalSats, 'onchain');
 				return info;
 			} finally {
-				this._pendingSpendSats -= totalSats;
+				if (reserving) this._pendingSpendSats -= totalSats;
 			}
 		} finally {
 			await this.wallet.resetSendTransaction();
@@ -6818,13 +6824,14 @@ export class BeignetNode extends EventEmitter {
 			// output, so there is no fee to tell the caller to lower.
 			this._checkMaxPayment(totalSats);
 			this._checkSpendLimit(totalSats);
-			this._pendingSpendSats += totalSats;
+			const reserving = this._dailySpendLimitSats !== undefined;
+			if (reserving) this._pendingSpendSats += totalSats;
 			try {
 				const info = await this._broadcastRawTx(result.value);
 				this._recordSpend(totalSats, 'onchain');
 				return info;
 			} finally {
-				this._pendingSpendSats -= totalSats;
+				if (reserving) this._pendingSpendSats -= totalSats;
 			}
 		} finally {
 			await this.wallet.resetSendTransaction();
@@ -12751,7 +12758,8 @@ export class BeignetNode extends EventEmitter {
 		this._checkDraining();
 		// The amount comes back round the loop, so the fee is all a rebalance
 		// spends. Its cap is judged and held against the daily limit, and the
-		// day is charged the fee the route took.
+		// day is charged the fee the route took, or the cap when the wait
+		// times out.
 		this._checkSpendLimit(maxFeeSats);
 		const reserving = this._dailySpendLimitSats !== undefined;
 		if (reserving) this._pendingSpendSats += maxFeeSats;
@@ -12776,6 +12784,10 @@ export class BeignetNode extends EventEmitter {
 				feeSats: Number(result.feeMsat / 1000n),
 				hops: result.hops
 			};
+		} catch (err) {
+			// The HTLC can still settle, and nothing would charge it then.
+			if (err instanceof PaymentWaitTimeoutError) this._recordSpend(maxFeeSats);
+			throw err;
 		} finally {
 			if (reserving) this._pendingSpendSats -= maxFeeSats;
 		}

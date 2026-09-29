@@ -16,7 +16,10 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { INodeConfig } from '../../src/lightning/node/types';
+import {
+	INodeConfig,
+	PaymentWaitTimeoutError
+} from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
@@ -679,6 +682,26 @@ describe('Advisor Execution (M3 phases 1+2)', function () {
 				expect(summary.budgetRemainingMsat).to.equal(0n);
 				expect(localMsat(alice, abChannelId)).to.equal(abBefore);
 				expect(localMsat(alice, caChannelId)).to.equal(0n);
+			} finally {
+				setup.destroy();
+			}
+		});
+
+		it('counts a timed-out attempt at its fee cap', async function () {
+			const setup = setupCircular();
+			const { alice } = setup;
+			try {
+				alice.rebalanceChannel = async (): Promise<never> => {
+					throw new PaymentWaitTimeoutError(
+						'waitForPayment timed out after 60000ms'
+					);
+				};
+				const summary = await alice.executeRebalanceRecommendations({
+					budgetSatsPerDay: 10
+				});
+				expect(summary.failed).to.equal(1);
+				expect(summary.feeSpentMsat).to.equal(10_000n);
+				expect(summary.budgetRemainingMsat).to.equal(0n);
 			} finally {
 				setup.destroy();
 			}

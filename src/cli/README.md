@@ -714,8 +714,10 @@ are refused with `SERVICE_DRAINING` while the node drains. The amount comes
 back to the node, so only the routing fee counts against the daily limit:
 `rebalanceChannel` is judged on its `maxFeeSats` and `executeRebalances` on
 the day's advisor fee budget, and the day is charged the fee actually paid.
-`maxPaymentSats` does not apply to them. The `autoRebalance` timer runs inside
-the engine and is bounded only by its own `budgetSatsPerDay`.
+A rebalance whose wait times out is charged its fee cap, because its HTLC can
+still settle. `maxPaymentSats` does not apply to them. The `autoRebalance`
+timer runs inside the engine and is bounded only by its own
+`budgetSatsPerDay`.
 
 Every invoice payment (`payInvoice`, `payInvoiceSafe`, `payInvoiceWithRetry`,
 `sendPaymentAsync`, the queue and their routes) is checked and recorded at the
