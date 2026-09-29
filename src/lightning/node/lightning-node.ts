@@ -1172,6 +1172,11 @@ export class LightningNode extends EventEmitter {
 	private _spliceRefusalsReported: Set<string> = new Set();
 	private static readonly REAUTH_RETRY_MS = 10 * 60_000;
 	private paymentRetryContexts: Map<string, IPaymentRetryContext> = new Map();
+	/**
+	 * The context the failure handler is re-dispatching through sendPayment:
+	 * the one existing context a BOLT 11 send continues (issue #1041).
+	 */
+	private redispatchingRetryContext: IPaymentRetryContext | undefined;
 	private mppCleanupTimer: ReturnType<typeof setInterval> | null = null;
 	// Per-HTLC shared secrets for creating encrypted failure messages (keyed by "channelIdHex:htlcId")
 	private receivedHtlcSharedSecrets: Map<string, Buffer> = new Map();
@@ -15892,6 +15897,13 @@ export class LightningNode extends EventEmitter {
 		// the guarantee on the route, and MPP dispatch runs only after this.
 		this.assertHashUnpaid(invoice.paymentHash, 'any-pending');
 		const dedupHashHex = invoice.paymentHash.toString('hex');
+		// Past that check nothing is out for the hash, so a context other than
+		// the retry being re-dispatched was left by a send that ended. This
+		// call's amount, fee cap, ceiling and exclusions replace it (issue #1041).
+		const priorCtx = this.paymentRetryContexts.get(dedupHashHex);
+		if (priorCtx && priorCtx !== this.redispatchingRetryContext) {
+			this.paymentRetryContexts.delete(dedupHashHex);
+		}
 
 		// Absolute outgoing expiry ceiling (issue #737). A retry re-enters here
 		// without the argument; the ceiling it was first sent under rides the
@@ -15911,10 +15923,6 @@ export class LightningNode extends EventEmitter {
 				'payment metadata is too large for the recovery guardians to accept'
 			);
 		}
-		// A context an earlier call left behind (its dispatch threw) is reused
-		// below, so its retries must carry this call's labels, not that call's.
-		const lingeringCtx = this.paymentRetryContexts.get(dedupHashHex);
-		if (lingeringCtx) lingeringCtx.metadata = metadata && { ...metadata };
 
 		const destination = invoice.payeeNodeKey || invoice.recoveredPubkey;
 		if (!destination) {
@@ -16043,9 +16051,13 @@ export class LightningNode extends EventEmitter {
 					'Route fee exceeds maximum'
 				);
 			}
-			const bHashHex = invoice.paymentHash.toString('hex');
-			if (!this.paymentRetryContexts.has(bHashHex)) {
-				this.paymentRetryContexts.set(bHashHex, {
+			return this.dispatchInvoiceRoute(
+				blindedRoute,
+				invoice.paymentHash,
+				finalCltvExpiry,
+				invoice.paymentSecret,
+				paymentAmountMsat,
+				{
 					invoiceStr,
 					excludedChannels: excludedChannels || new Set(),
 					retryCount: 0,
@@ -16055,14 +16067,7 @@ export class LightningNode extends EventEmitter {
 					maxCltvExpiryHeight: cltvCeiling,
 					policyOverrides: overrides,
 					metadata: metadata && { ...metadata }
-				});
-			}
-			return this.sendPaymentToRoute(
-				blindedRoute,
-				invoice.paymentHash,
-				finalCltvExpiry,
-				invoice.paymentSecret,
-				paymentAmountMsat,
+				},
 				metadata
 			);
 		}
@@ -16164,10 +16169,13 @@ export class LightningNode extends EventEmitter {
 			);
 		}
 
-		// Store retry context for this payment
-		const hashHex = invoice.paymentHash.toString('hex');
-		if (!this.paymentRetryContexts.has(hashHex)) {
-			this.paymentRetryContexts.set(hashHex, {
+		return this.dispatchInvoiceRoute(
+			route,
+			invoice.paymentHash,
+			finalCltvExpiry,
+			invoice.paymentSecret,
+			paymentAmountMsat,
+			{
 				invoiceStr,
 				excludedChannels: excludedChannels || new Set(),
 				retryCount: 0,
@@ -16177,17 +16185,49 @@ export class LightningNode extends EventEmitter {
 				maxCltvExpiryHeight: cltvCeiling,
 				policyOverrides: overrides,
 				metadata: metadata && { ...metadata }
-			});
-		}
-
-		return this.sendPaymentToRoute(
-			route,
-			invoice.paymentHash,
-			finalCltvExpiry,
-			invoice.paymentSecret,
-			paymentAmountMsat,
+			},
 			metadata
 		);
+	}
+
+	/**
+	 * Seed the retry context for a BOLT 11 attempt and send along the route.
+	 * A context seeded here is removed again when the attempt fails locally
+	 * (an exception, or addHtlc refusing the HTLC): no onion failure will
+	 * reach the failure handler, so nothing retries it, and it would hold
+	 * this call's amount, fee cap, ceiling and exclusions against the hash
+	 * until the prune (issue #1041). An existing context is the retry's own,
+	 * and the failure handler owns its rollback, as in dispatchBolt12Route.
+	 */
+	private dispatchInvoiceRoute(
+		route: IRoute,
+		paymentHash: Buffer,
+		finalCltvExpiry: number,
+		paymentSecret: Buffer,
+		paymentAmountMsat: bigint,
+		context: IPaymentRetryContext,
+		metadata?: Record<string, string>
+	): IPaymentInfo {
+		const hashHex = paymentHash.toString('hex');
+		const created = !this.paymentRetryContexts.has(hashHex);
+		if (created) this.paymentRetryContexts.set(hashHex, context);
+		try {
+			const payment = this.sendPaymentToRoute(
+				route,
+				paymentHash,
+				finalCltvExpiry,
+				paymentSecret,
+				paymentAmountMsat,
+				metadata
+			);
+			if (created && payment.status === PaymentStatus.FAILED) {
+				this.paymentRetryContexts.delete(hashHex);
+			}
+			return payment;
+		} catch (err) {
+			if (created) this.paymentRetryContexts.delete(hashHex);
+			throw err;
+		}
 	}
 
 	/**
@@ -24011,15 +24051,21 @@ export class LightningNode extends EventEmitter {
 						retryCtx.policyOverrides
 					);
 				} else {
-					retried = this.sendPayment(
-						retryCtx.invoiceStr!,
-						retryCtx.excludedChannels,
-						retryCtx.maxFeeMsat,
-						retryCtx.amountMsat,
-						retryCtx.maxCltvExpiryHeight,
-						retryCtx.policyOverrides,
-						retryCtx.metadata
-					);
+					const outerRedispatch = this.redispatchingRetryContext;
+					this.redispatchingRetryContext = retryCtx;
+					try {
+						retried = this.sendPayment(
+							retryCtx.invoiceStr!,
+							retryCtx.excludedChannels,
+							retryCtx.maxFeeMsat,
+							retryCtx.amountMsat,
+							retryCtx.maxCltvExpiryHeight,
+							retryCtx.policyOverrides,
+							retryCtx.metadata
+						);
+					} finally {
+						this.redispatchingRetryContext = outerRedispatch;
+					}
 				}
 				retried.retryCount = retryCtx.retryCount;
 				return; // Retry dispatched
