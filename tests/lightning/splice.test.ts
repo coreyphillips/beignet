@@ -8277,14 +8277,25 @@ describe('Splice', function () {
 				// Reconnect. Both sides emit channel_reestablish independently (as
 				// real transports do) BEFORE either is delivered — a synchronous
 				// loopback would otherwise deliver the first reestablish before
-				// the second side has sent its own. Capture both, rewire, then
-				// deliver cross-wise; all replays flow through the live loopback.
+				// the second side has sent its own. Both reestablishes are also
+				// delivered before the loopback is rewired: otherwise the first
+				// side's retransmissions reach a peer still awaiting reestablish,
+				// which drops them. The captured retransmissions are replayed
+				// through the live loopback.
 				fromOpener.length = 0;
 				fromAcceptor.length = 0;
 				openerManager.handlePeerReconnected(acceptorPubkey);
 				acceptorManager.handlePeerReconnected(openerPubkey);
 				const openerReest = fromOpener.splice(0);
 				const acceptorReest = fromAcceptor.splice(0);
+				for (const m of openerReest) {
+					acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
+				}
+				for (const m of acceptorReest) {
+					openerManager.handleMessage(acceptorPubkey, m.type, m.payload);
+				}
+				const openerReplay = fromOpener.splice(0);
+				const acceptorReplay = fromAcceptor.splice(0);
 				openerManager.removeAllListeners('message:outbound');
 				acceptorManager.removeAllListeners('message:outbound');
 				connectManagers(
@@ -8293,10 +8304,10 @@ describe('Splice', function () {
 					acceptorManager,
 					acceptorPubkey
 				);
-				for (const m of openerReest) {
+				for (const m of openerReplay) {
 					acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
 				}
-				for (const m of acceptorReest) {
+				for (const m of acceptorReplay) {
 					openerManager.handleMessage(acceptorPubkey, m.type, m.payload);
 				}
 
