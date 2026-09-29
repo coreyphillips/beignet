@@ -933,9 +933,9 @@ interface NodeStats {
   totalPaymentsSent: number;
   totalPaymentsReceived: number;
   totalPaymentsFailed: number;
-  totalSatsSent: number;
+  totalSatsSent: number;    // sum of PaymentInfo.amountSats: fees included, rounded up
   totalSatsReceived: number;
-  totalFeesPaid: number;
+  totalFeesPaid: number;    // sum of PaymentInfo.feeSats, rounded up
   successRate: number;      // 0.0 to 1.0
   uptimeMs: number;
   windowMs?: number;        // present when time window specified
@@ -1028,11 +1028,11 @@ interface EventMessage {
 interface PaymentProof {
   paymentHash: string;      // hex
   preimage: string;         // hex
-  amountSats: number;
+  amountSats: number;       // as PaymentInfo.amountSats
   completedAt: number;      // unix ms
   invoice?: string;         // original BOLT 11 invoice string
   hopCount?: number;
-  feeSats?: number;
+  feeSats?: number;         // as PaymentInfo.feeSats
 }
 
 interface PaymentProofVerification {
