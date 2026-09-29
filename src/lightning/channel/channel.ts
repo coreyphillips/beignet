@@ -5286,6 +5286,15 @@ export class Channel {
 		// Update remote's per-commitment point
 		this._state.remoteCurrentPerCommitmentPoint =
 			this._state.remoteNextPerCommitmentPoint;
+		// The next point keys every commitment we sign from here on, and only
+		// another revoke_and_ack replaces it, so an off-curve one stored here
+		// makes every later signature throw for good. The secret above is
+		// already kept, so the revoked commitment stays punishable.
+		if (!isValidPublicKey(msg.nextPerCommitmentPoint)) {
+			return this._failChannelWithWireError(
+				'revoke_and_ack has an invalid next_per_commitment_point'
+			);
+		}
 		this._state.remoteNextPerCommitmentPoint = msg.nextPerCommitmentPoint;
 
 		// option_taproot: rotate the peer's verification nonce forward in lockstep
@@ -10430,7 +10439,14 @@ export class Channel {
 			!msg.yourLastPerCommitmentSecret.equals(Buffer.alloc(32))
 		) {
 			this._state.dataLossDetected = true;
-			this._state.dlpRemotePerCommitmentPoint = msg.myCurrentPerCommitmentPoint;
+			// Failing the channel over a bad point would broadcast the commitment
+			// this arm forbids, so the point is only dropped. An off-curve one
+			// would throw in the taproot to_remote sweep, which falls back to our
+			// last known point without it.
+			if (isValidPublicKey(msg.myCurrentPerCommitmentPoint)) {
+				this._state.dlpRemotePerCommitmentPoint =
+					msg.myCurrentPerCommitmentPoint;
+			}
 			this._state.recoveryCloseReason = 'local-data-loss';
 			this._state.state = ChannelState.ERRORED;
 			return [

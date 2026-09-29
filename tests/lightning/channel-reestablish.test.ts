@@ -4,7 +4,10 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
-import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import {
+	getPublicKey,
+	isValidPublicKey
+} from '../../src/lightning/crypto/ecdh';
 import { Channel } from '../../src/lightning/channel/channel';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import {
@@ -77,6 +80,16 @@ function getPerCommitmentSecret(
 ): Buffer {
 	const index = MAX_INDEX - commitmentNumber;
 	return generateFromSeed(seed, index);
+}
+
+/** A well-formed compressed encoding whose x has no point on secp256k1. */
+function offCurvePoint(): Buffer {
+	const point = Buffer.alloc(33);
+	point[0] = 0x02;
+	for (let x = 1; ; x++) {
+		point.writeUInt32BE(x, 29);
+		if (!isValidPublicKey(point)) return point;
+	}
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -507,6 +520,79 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			expect(findErrorAction(result)).to.contain(
 				'Invalid per-commitment secret'
 			);
+		});
+	});
+
+	describe('off-curve per-commitment points (issue 1033)', function () {
+		it('fails the channel on a revoke_and_ack whose next point is off the curve', function () {
+			const { opener, acceptor, acceptorSeed } = setupNormalChannels();
+
+			const openerSigs = realCommitmentSigs(opener);
+			opener.signCommitment(openerSigs.signature, openerSigs.htlcSignatures);
+			acceptor.handleCommitmentSigned({
+				channelId: acceptor.getChannelId()!,
+				signature: openerSigs.signature,
+				htlcSignatures: openerSigs.htlcSignatures
+			});
+
+			const secret = getPerCommitmentSecret(acceptorSeed, 0n);
+			const badPoint = offCurvePoint();
+			const result = opener.handleRevokeAndAck({
+				channelId: opener.getChannelId()!,
+				perCommitmentSecret: secret,
+				nextPerCommitmentPoint: badPoint
+			});
+
+			expect(findErrorAction(result)).to.contain('next_per_commitment_point');
+			expect(findSendAction(result, MessageType.ERROR)).to.not.be.null;
+			expect(opener.getState()).to.equal(ChannelState.ERRORED);
+
+			const state = opener.getFullState();
+			expect(state.remoteNextPerCommitmentPoint!.equals(badPoint)).to.be.false;
+			// The revocation itself was genuine and stays on record.
+			expect(state.shaChainStore.getSecret(MAX_INDEX)!.equals(secret)).to.be
+				.true;
+			expect(
+				state.remoteCurrentPerCommitmentPoint!.equals(
+					getPerCommitmentPoint(acceptorSeed, 1n)
+				)
+			).to.be.true;
+		});
+
+		it('keeps the fell-behind hold but drops an off-curve reestablish point', function () {
+			const { opener, openerSeed } = setupNormalChannels();
+			opener.markForReestablish();
+
+			const result = opener.handleReestablish({
+				channelId: opener.getChannelId()!,
+				nextCommitmentNumber: 1n,
+				nextRevocationNumber: 100n,
+				yourLastPerCommitmentSecret: getPerCommitmentSecret(openerSeed, 99n),
+				myCurrentPerCommitmentPoint: offCurvePoint()
+			});
+
+			expect(findErrorAction(result)).to.contain('fell behind');
+			expect(opener.getFullState().dataLossDetected).to.equal(true);
+			expect(opener.getFullState().dlpRemotePerCommitmentPoint).to.be.undefined;
+		});
+
+		it('records a valid reestablish point in the fell-behind arm', function () {
+			const { opener, openerSeed, acceptorSeed } = setupNormalChannels();
+			opener.markForReestablish();
+
+			const peerPoint = getPerCommitmentPoint(acceptorSeed, 99n);
+			opener.handleReestablish({
+				channelId: opener.getChannelId()!,
+				nextCommitmentNumber: 1n,
+				nextRevocationNumber: 100n,
+				yourLastPerCommitmentSecret: getPerCommitmentSecret(openerSeed, 99n),
+				myCurrentPerCommitmentPoint: peerPoint
+			});
+
+			expect(opener.getFullState().dataLossDetected).to.equal(true);
+			expect(
+				opener.getFullState().dlpRemotePerCommitmentPoint!.equals(peerPoint)
+			).to.be.true;
 		});
 	});
 
