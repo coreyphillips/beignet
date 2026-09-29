@@ -1631,7 +1631,8 @@ export class LightningPaymentError extends Error {
 
 /**
  * waitForPayment giving up before the payment resolved. An HTLC it sent can
- * still be out, and still settle.
+ * still be out, and still settle. rebalanceChannel also throws it for a
+ * payment cancelled while its HTLC is out.
  */
 export class PaymentWaitTimeoutError extends Error {}
 

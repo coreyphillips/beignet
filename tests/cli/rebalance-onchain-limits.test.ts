@@ -246,6 +246,26 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 		expect(node._dailySpentSats).to.equal(5_000);
 	});
 
+	it('keeps the fee charged when logging the completed rebalance throws', async () => {
+		const node = Object.assign(
+			rebalancingNode({ daily: 100_000 }, { feeMsat: 1_000_000n }),
+			{
+				logLevel: 'info',
+				logger: {
+					info: (): void => {
+						throw new Error('logger failed');
+					}
+				}
+			}
+		);
+		expect(
+			await settle(() =>
+				node.rebalanceChannel(CHANNEL_A, CHANNEL_B, 100_000, 5_000)
+			)
+		).to.be.instanceOf(Error);
+		expect(node._dailySpentSats).to.equal(1_000);
+	});
+
 	it('keeps the fee cap charged when a teardown cuts the wait short', async () => {
 		const node = rebalancingNode({ daily: 100_000 }, { tornDown: true });
 		await settle(() =>
@@ -296,6 +316,14 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 		const err = await refusal(() => node.executeRebalances());
 		expect(err.code).to.equal('SPENDING_LIMIT_EXCEEDED');
 		expect(node.engineCalls).to.equal(0);
+	});
+
+	it('refuses a configured day budget that is not an integer, before the ledger', async () => {
+		const node = rebalancingNode({ daily: 1_000 }, { budgetSatsPerDay: NaN });
+		const err = await refusal(() => node.executeRebalances());
+		expect(err.code).to.equal('INVALID_PARAMS');
+		expect(node.engineCalls).to.equal(0);
+		expect(node._dailySpentSats).to.equal(0);
 	});
 
 	it('charges the day budget up front and gives back what the run did not spend', async () => {

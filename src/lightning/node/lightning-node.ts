@@ -13885,7 +13885,25 @@ export class LightningNode extends EventEmitter {
 				throw err;
 			}
 		}
-		await this.waitForPayment(invoice.paymentHash, options.timeoutMs ?? 60_000);
+		try {
+			await this.waitForPayment(
+				invoice.paymentHash,
+				options.timeoutMs ?? 60_000
+			);
+		} catch (err) {
+			// A cancelled payment is marked failed with its HTLC still out, and
+			// that HTLC can still settle, so the outcome is as unknown as after
+			// a timeout.
+			if (
+				!(err instanceof PaymentWaitTimeoutError) &&
+				this.hasHtlcInFlight(invoice.paymentHash)
+			) {
+				throw new PaymentWaitTimeoutError(
+					`${(err as Error).message} with its HTLC still in flight`
+				);
+			}
+			throw err;
+		}
 
 		this.emitStructuredLog('payment', 'rebalance_succeeded', {
 			fromChannelId: fromChannelId.toString('hex'),

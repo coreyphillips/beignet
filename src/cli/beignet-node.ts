@@ -171,6 +171,7 @@ import {
 	IHoldInvoiceStateEvent,
 	IStructuredLog,
 	IRebalanceExecutionSummary,
+	IRebalanceResult,
 	PaymentDirection,
 	PaymentStatus,
 	PaymentWaitTimeoutError
@@ -12795,27 +12796,15 @@ export class BeignetNode extends EventEmitter {
 		this._recordSpend(maxFeeSats);
 		this._liveRebalanceChargeSats += maxFeeSats;
 		let spentSats = maxFeeSats;
+		let result: IRebalanceResult;
 		try {
-			const result = await this.node.rebalanceChannel({
+			result = await this.node.rebalanceChannel({
 				fromChannelId: Buffer.from(fromChannelId, 'hex'),
 				toChannelId: Buffer.from(toChannelId, 'hex'),
 				amountSats: BigInt(amountSats),
 				maxFeeSats: BigInt(maxFeeSats)
 			});
 			spentSats = spendLimitSats(result.feeMsat);
-			this.log('info', 'Rebalance completed', {
-				fromChannelId,
-				toChannelId,
-				amountSats,
-				feeMsat: result.feeMsat.toString()
-			});
-			return {
-				paymentHash: result.paymentHash.toString('hex'),
-				amountSats,
-				feeMsat: result.feeMsat.toString(),
-				feeSats: Number(result.feeMsat / 1000n),
-				hops: result.hops
-			};
 		} catch (err) {
 			if (!(err instanceof PaymentWaitTimeoutError)) spentSats = 0;
 			throw err;
@@ -12823,6 +12812,19 @@ export class BeignetNode extends EventEmitter {
 			if (!this.destroyed) this._refundSpend(maxFeeSats - spentSats);
 			this._liveRebalanceChargeSats -= maxFeeSats;
 		}
+		this.log('info', 'Rebalance completed', {
+			fromChannelId,
+			toChannelId,
+			amountSats,
+			feeMsat: result.feeMsat.toString()
+		});
+		return {
+			paymentHash: result.paymentHash.toString('hex'),
+			amountSats,
+			feeMsat: result.feeMsat.toString(),
+			feeSats: Number(result.feeMsat / 1000n),
+			hops: result.hops
+		};
 	}
 
 	/**
@@ -12847,6 +12849,14 @@ export class BeignetNode extends EventEmitter {
 		// budget, which bounds what the run can spend whatever the advisor has
 		// already spent today.
 		const holdSats = this.node.rebalanceBudgetSatsPerDay(budgetSatsPerDay);
+		// With no budget given this is the configured autoRebalance one, which
+		// nothing has checked yet, and a NaN would poison the ledger.
+		if (!Number.isInteger(holdSats) || holdSats < 0) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'autoRebalance.budgetSatsPerDay must be a non-negative integer'
+			);
+		}
 		this._checkSpendLimit(holdSats);
 		this._recordSpend(holdSats);
 		this._liveRebalanceChargeSats += holdSats;

@@ -598,6 +598,36 @@ describe('Advisor Execution (M3 phases 1+2)', function () {
 			}
 		});
 
+		it('reports a cancel with the HTLC still out as a timeout', async function () {
+			const setup = setupCircular();
+			const { alice, abChannelId, caChannelId } = setup;
+			try {
+				// Nothing reaches Bob, so the HTLC stays out.
+				alice.removeAllListeners('message:outbound');
+				const pending = alice.rebalanceChannel({
+					fromChannelId: abChannelId,
+					toChannelId: caChannelId,
+					amountSats: 100_000n,
+					maxFeeSats: 10n,
+					timeoutMs: 10_000
+				});
+				const [sent] = alice
+					.listPayments()
+					.filter((p) => p.direction === 'OUTGOING');
+				alice.failPayment(sent.paymentHash);
+				let error: unknown;
+				try {
+					await pending;
+				} catch (err) {
+					error = err;
+				}
+				expect(alice.hasHtlcInFlight(sent.paymentHash)).to.equal(true);
+				expect(error).to.be.instanceOf(PaymentWaitTimeoutError);
+			} finally {
+				setup.destroy();
+			}
+		});
+
 		it('rejects unusable inputs', async function () {
 			const setup = setupCircular();
 			const { alice, abChannelId, caChannelId } = setup;
