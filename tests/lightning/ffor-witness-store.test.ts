@@ -311,6 +311,15 @@ describe('FFOR witness store and service (Appendix F.5, section 9.6.4)', functio
 		const ledger = ledgerOn(storage);
 		const h = serviceOn(ledger, { maxMailboxes: 1 });
 		const max = 2 ** 32 - 1;
+		// A witness with no header yet has nothing to bound a book against.
+		h.tip.height = 0;
+		expect(
+			provision(
+				h,
+				provisionFor(book(1, 'early', 100).book, { retentionUntil: 388 })
+			).error
+		).to.match(/no chain tip yet/);
+		h.tip.height = 796_000;
 		// The reported fill: T_exp and retention_until at the top of the u32.
 		const far = provision(
 			h,
@@ -345,6 +354,43 @@ describe('FFOR witness store and service (Appendix F.5, section 9.6.4)', functio
 			'EXPIRED'
 		);
 		storage.close();
+	});
+
+	it('releases a far mailbox stored before the horizon on the first block after a restart (issue #1032)', () => {
+		const file = tmpDb();
+		const storage1 = new SqliteStorage(file);
+		storage1.open();
+		const h1 = serviceOn(ledgerOn(storage1), { maxMailboxes: 1 });
+		const max = 2 ** 32 - 1;
+		// A tip at the top of the u32 lets today's checks admit the reported
+		// fill, standing in for a row stored before they existed.
+		h1.tip.height = max - 144 - 5184;
+		const poisoned = provisionFor(book(1, 'far', max - 144).book, {
+			retentionUntil: max
+		});
+		expect(provision(h1, poisoned).ok).to.be.true;
+		storage1.close();
+
+		const storage2 = new SqliteStorage(file);
+		storage2.open();
+		const ledger2 = ledgerOn(storage2);
+		const h2 = serviceOn(ledger2, { maxMailboxes: 1 });
+		expect(ledger2.occupancy().mailboxes).to.equal(1);
+		h2.service.onBlock(796_001);
+		expect(ledger2.mailbox(poisoned.mailboxId.toString('hex'))!.state).to.equal(
+			'EXPIRED'
+		);
+		expect(ledger2.occupancy()).to.include({ mailboxes: 0, reservedBytes: 0 });
+		// A mailbox at the edge of today's bounds survives a 144-block reorg.
+		const edge = provisionFor(book(1, 'edge', 796_000 + 5184).book, {
+			retentionUntil: 796_000 + 7200
+		});
+		expect(provision(h2, edge).ok).to.be.true;
+		h2.service.onBlock(796_000 - 144);
+		expect(ledger2.mailbox(edge.mailboxId.toString('hex'))!.state).to.equal(
+			'PROVISIONED'
+		);
+		storage2.close();
 	});
 
 	it('judges capacity against what it holds, and an unknown mailbox answers like an empty one', () => {

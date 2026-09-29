@@ -483,6 +483,10 @@ export class FforWitnessService {
 		const tip = this.deps.currentHeight();
 		const maxBookBlocks =
 			Channel.MAX_HTLC_CLTV_EXPIRY_DELTA + FF_WITNESS_RETENTION_MARGIN_BLOCKS;
+		if (tip <= 0) {
+			refuse('no chain tip yet');
+			return;
+		}
 		if (tExp <= tip) {
 			refuse('T_exp is not in the future');
 			return;
@@ -722,9 +726,17 @@ export class FforWitnessService {
 				this.releaseBarrier(outKey, 'deadline');
 			}
 		}
+		// A mailbox stored before provisions were bounded can hold a retention
+		// near 2^32. One past the longest span a provision may now ask for goes
+		// too; the extra margin keeps a shallow reorg from dropping an edge row.
+		const horizon =
+			height +
+			Channel.MAX_HTLC_CLTV_EXPIRY_DELTA +
+			2 * FF_WITNESS_RETENTION_MARGIN_BLOCKS +
+			MAX_RETENTION_PAST_T_EXP;
 		for (const m of this.deps.ledger.listMailboxes()) {
 			if (m.state === 'EXPIRED') continue;
-			if (m.retentionUntil < height) {
+			if (m.retentionUntil < height || m.retentionUntil > horizon) {
 				const result = this.deps.ledger.expire(m.id);
 				if (result.outcome === 'applied') {
 					this.deps.log('ffor_witness_expired', { mailboxId: m.id });
