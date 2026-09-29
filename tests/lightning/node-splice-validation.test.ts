@@ -21,6 +21,7 @@ import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	estimateSpliceTxWeight,
+	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../../src/lightning/channel/splice-weight';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
@@ -231,6 +232,52 @@ describe('LightningNode splice validation', function () {
 				ChannelFundingUnavailableCode.CHANNEL_NOT_FOUND
 			);
 		}
+		node.destroy();
+	});
+
+	/**
+	 * Issue #1043: the channel pays a splice's fee from its own balance, so a
+	 * sat/vB figure passed as sat/kw met no wallet guard and went to miners.
+	 * Every entry point refuses above update_fee's ceiling before the channel
+	 * is asked.
+	 */
+	it('refuses a feerate above the update_fee ceiling on every entry point', function () {
+		expect(MAX_SPLICE_FEERATE_PERKW).to.equal(100_000);
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		const channel = (node as any).channelManager.channels.get(
+			channelId.toString('hex')
+		);
+		const p2wpkh = Buffer.concat([
+			Buffer.from([0x00, 0x14]),
+			crypto.randomBytes(20)
+		]);
+		const entryPoints: Array<[string, (feerate: number) => unknown]> = [
+			['spliceQuote', (f): unknown => node.spliceQuote(channelId, 'out', f)],
+			['spliceIn', (f): unknown => node.spliceIn(channelId, 100_000n, f)],
+			[
+				'spliceInWithInputs',
+				(f): unknown =>
+					node.spliceInWithInputs(channelId, 100_000n, [], p2wpkh, f)
+			],
+			['spliceOut', (f): unknown => node.spliceOut(channelId, 10_000n, f)]
+		];
+		for (const [name, call] of entryPoints) {
+			for (const feerate of [MAX_SPLICE_FEERATE_PERKW + 1, 2_500_000]) {
+				expect(() => call(feerate), `${name} ${feerate}`).to.throw(
+					InvalidSpliceError,
+					/fundingFeeratePerkw must be an integer between 1 and 100000/
+				);
+			}
+		}
+		expect(channel.getState()).to.equal(ChannelState.NORMAL);
+		expect(channel.isQuiescing()).to.equal(false);
+
+		// The ceiling itself is admitted.
+		const quote = node.spliceQuote(channelId, 'out', MAX_SPLICE_FEERATE_PERKW);
+		expect(quote.feeSats).to.be.greaterThan(0);
+		expect(node.spliceOut(channelId, 500_000n, MAX_SPLICE_FEERATE_PERKW).ok).to
+			.be.true;
 		node.destroy();
 	});
 

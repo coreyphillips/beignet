@@ -52,6 +52,7 @@ import { IFforIssuerStatusResp } from '../lightning/ffor/issuer-messages';
 import { IOffer } from '../lightning/offer/types';
 import {
 	estimateSpliceTxWeight,
+	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../lightning/channel/splice-weight';
 import {
@@ -1324,6 +1325,49 @@ function requireFinalCltvExpiry(value: unknown): number {
 }
 
 /**
+ * Seconds an invoice may stay payable. The BOLT 11 encoder packs whatever
+ * number it is given, so -1 and NaN go out as 0 and 1.5 as 1: the payer sees
+ * an invoice already expired, or expiring sooner than the one this node
+ * records. A year is LND's ceiling for the same field.
+ */
+const MAX_INVOICE_EXPIRY_SECS = 365 * 24 * 60 * 60;
+
+function requireInvoiceExpiry(value: unknown, field: string): number {
+	if (
+		typeof value !== 'number' ||
+		!Number.isSafeInteger(value) ||
+		value < 1 ||
+		value > MAX_INVOICE_EXPIRY_SECS
+	) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`${field} must be a whole number of seconds between 1 and ` +
+				`${MAX_INVOICE_EXPIRY_SECS}`
+		);
+	}
+	return value;
+}
+
+/**
+ * The BOLT 11 `d` tag's length field counts at most 1023 five-bit words,
+ * which is 639 whole bytes. A longer description needs descriptionHash.
+ */
+const MAX_INVOICE_DESCRIPTION_BYTES = 639;
+
+function requireInvoiceDescription(value: string | undefined): void {
+	if (
+		typeof value === 'string' &&
+		Buffer.byteLength(value, 'utf8') > MAX_INVOICE_DESCRIPTION_BYTES
+	) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`description must be at most ${MAX_INVOICE_DESCRIPTION_BYTES} bytes ` +
+				'of UTF-8; use descriptionHash for a longer one'
+		);
+	}
+}
+
+/**
  * A millisatoshi field that reaches the library as a bigint but is accepted
  * from callers as a number or a decimal string. BigInt() is the only thing
  * that ever validated it, by throwing, so both spellings are checked here
@@ -1455,16 +1499,21 @@ function requireOpenAmounts(amountSats: unknown, pushSats?: unknown): void {
  * writeUInt32BE truncates 1.5 to 1 and throws on 2^32, and both happen after
  * the channel's state machine has moved, so the bound is enforced here.
  */
-function requireU32(value: unknown, field: string, min = 1): number {
+function requireU32(
+	value: unknown,
+	field: string,
+	min = 1,
+	max = 0xffffffff
+): number {
 	if (
 		typeof value !== 'number' ||
 		!Number.isInteger(value) ||
 		value < min ||
-		value > 0xffffffff
+		value > max
 	) {
 		throw new BeignetError(
 			BeignetErrorCode.INVALID_PARAMS,
-			`${field} must be an integer between ${min} and 4294967295`
+			`${field} must be an integer between ${min} and ${max}`
 		);
 	}
 	return value;
@@ -8614,6 +8663,9 @@ export class BeignetNode extends EventEmitter {
 				? BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) *
 				  1000n
 				: undefined;
+		if (expirySecs !== undefined)
+			requireInvoiceExpiry(expirySecs, 'expirySecs');
+		if (!descriptionHash) requireInvoiceDescription(description);
 		const result = this.node.createInvoice({
 			amountMsat,
 			description: descriptionHash ? undefined : description || '',
@@ -8689,6 +8741,11 @@ export class BeignetNode extends EventEmitter {
 				? BigInt(requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')) *
 				  1000n
 				: undefined;
+		// Before the LSP is asked: a refusal after its grant leaves the intent
+		// registered there with no invoice behind it.
+		if (opts.expirySecs !== undefined)
+			requireInvoiceExpiry(opts.expirySecs, 'expirySecs');
+		requireInvoiceDescription(opts.description);
 		let result: Awaited<ReturnType<typeof this.node.createJitInvoice>>;
 		try {
 			result = await this.node.createJitInvoice({
@@ -9322,6 +9379,8 @@ export class BeignetNode extends EventEmitter {
 				? BigInt(requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')) *
 				  1000n
 				: undefined);
+		if (opts.expiry !== undefined) requireInvoiceExpiry(opts.expiry, 'expiry');
+		requireInvoiceDescription(opts.description);
 		const result = this.node.createInvoice({
 			amountMsat,
 			description: opts.description || '',
@@ -11882,7 +11941,7 @@ export class BeignetNode extends EventEmitter {
 		feeratePerkw: number
 	): ReturnType<LightningNode['spliceQuote']> {
 		const idBuf = requireChannelIdHex(channelId);
-		requireU32(feeratePerkw, 'feeratePerkw');
+		requireU32(feeratePerkw, 'feeratePerkw', 1, MAX_SPLICE_FEERATE_PERKW);
 		return fundingOrRefuse(() =>
 			this.node.spliceQuote(idBuf, direction, feeratePerkw)
 		);
@@ -11899,7 +11958,7 @@ export class BeignetNode extends EventEmitter {
 	): SpliceResult {
 		const idBuf = requireChannelIdHex(channelId);
 		requirePositiveSafeInteger(amountSats, 'amountSats');
-		requireU32(feeratePerkw, 'feeratePerkw');
+		requireU32(feeratePerkw, 'feeratePerkw', 1, MAX_SPLICE_FEERATE_PERKW);
 		// fundingUtxos is shape-checked by the node, one copy of the rules; its
 		// InvalidSpliceError converts to INVALID_PARAMS through fundingOrRefuse
 		// like every other splice refusal.
@@ -11919,7 +11978,7 @@ export class BeignetNode extends EventEmitter {
 	): SpliceResult {
 		const idBuf = requireChannelIdHex(channelId);
 		requirePositiveSafeInteger(amountSats, 'amountSats');
-		requireU32(feeratePerkw, 'feeratePerkw');
+		requireU32(feeratePerkw, 'feeratePerkw', 1, MAX_SPLICE_FEERATE_PERKW);
 		let destinationScript: Buffer | undefined;
 		if (destinationAddress !== undefined) {
 			// A provided-but-empty (or non-string) destination is a caller bug,

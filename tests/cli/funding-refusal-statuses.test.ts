@@ -460,12 +460,16 @@ describe('Issue #472: the splice paths guard their arguments too', () => {
 	 * funding_feerate_perkw is a u32 on the wire. writeUInt32BE turns 1.5 into
 	 * 1, quietly repricing the splice, and throws on 2^32 AFTER the channel has
 	 * moved to SPLICING and persisted, which wedges it until a restart. Both
-	 * bounds have to be enforced before any of that runs.
+	 * bounds have to be enforced before any of that runs. Issue #1043: the
+	 * ceiling is update_fee's 100,000 sat/kw, not the u32 limit, since the
+	 * channel pays the fee and no wallet guard ever sees it.
 	 */
 	const BAD_FEERATES: Array<[string, number]> = [
 		['zero', 0],
 		['negative', -1],
 		['fractional', 1.5],
+		['sat/vB-as-sat/kw', 2_500_000],
+		['just above the ceiling', 100_001],
 		['above u32', 0x1_0000_0000],
 		['not finite', Number.POSITIVE_INFINITY]
 	];
@@ -479,7 +483,7 @@ describe('Issue #472: the splice paths guard their arguments too', () => {
 			for (const call of calls) {
 				const err = refusalFrom(call, `${label} feerate`);
 				expect(err.code).to.equal(BeignetErrorCode.INVALID_PARAMS);
-				expect(err.message).to.include('4294967295');
+				expect(err.message).to.include('between 1 and 100000');
 			}
 		});
 	}

@@ -105,10 +105,10 @@ export function validatePositiveBigint(
 export function validateU32(
 	value: number,
 	name: string,
-	{ min = 0 }: { min?: number } = {}
+	{ min = 0, max = 0xffffffff }: { min?: number; max?: number } = {}
 ): string | null {
-	if (!Number.isInteger(value) || value < min || value > 0xffffffff) {
-		return `${name} must be an integer between ${min} and 4294967295, got ${value}`;
+	if (!Number.isInteger(value) || value < min || value > max) {
+		return `${name} must be an integer between ${min} and ${max}, got ${value}`;
 	}
 	return null;
 }
