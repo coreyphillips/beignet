@@ -202,6 +202,19 @@ describe('The v1 handshake refuses ON THE WIRE (issue 393)', function () {
 			);
 		});
 
+		it('an accept_channel whose minimum_depth would never be reached (issue 1034)', function () {
+			const p = pair();
+			const actions = p.opener.handleAcceptChannel({
+				...p.accept,
+				minimumDepth: 0xffffffff
+			});
+			expectWireRefusal(
+				actions,
+				p.opener.getTemporaryChannelId(),
+				/minimum_depth 4294967295 exceeds maximum 144/
+			);
+		});
+
 		it('a zero_conf accept_channel with a non-zero minimum_depth', function () {
 			const p = pair();
 			p.opener.getFullState().channelType = zeroConfType();
