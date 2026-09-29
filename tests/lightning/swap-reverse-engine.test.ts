@@ -235,7 +235,10 @@ async function walletFundedHarness() {
 					vout: built.outputIndex
 				};
 			},
-			pledge: (txHex) => fp.pledgeTransactionInputs(txHex)
+			pledge: async (txHex) => {
+				if (h.wallet.pledgeGate) await h.wallet.pledgeGate();
+				return fp.pledgeTransactionInputs(txHex);
+			}
 		}
 	});
 	return { h, fp, utxos, fundingCoin, coin, frozen, selectOutpoints };
@@ -704,16 +707,24 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			h.chain.height = 1002;
 			let pass = h.engine.onBlock(1002);
 			await settle();
+			// The pass renews the funded row's pledge before it reads the chain.
+			releasePledge();
+			await settle();
 			expect(h.chain.broadcasts).to.have.length(1);
 			releasePledge();
 			await pass;
-			expect(h.wallet.pledged.slice(pledges)).to.deep.equal([r.fundingTxHex]);
+			expect(h.wallet.pledged.slice(pledges)).to.deep.equal([
+				r.fundingTxHex,
+				r.fundingTxHex
+			]);
 			expect(h.chain.broadcasts).to.have.length(2);
 
 			// A cancel that lands while the wallet is pledging keeps the bytes in.
 			h.chain.evict(r.fundingTxid!);
 			h.chain.height = 1003;
 			pass = h.engine.onBlock(1003);
+			await settle();
+			releasePledge();
 			await settle();
 			h.holds.sweep(swap.paymentHash);
 			releasePledge();
@@ -738,8 +749,8 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			await h.engine.onBlock(1001);
 			expect(record(h, swap).state).to.equal('FUNDED');
 
-			// Nothing renews a funded row, so an hour later the wallet's next
-			// selection prunes the spent coin's pledge.
+			// An hour without a block lets the wallet's next selection prune the
+			// spent coin's pledge.
 			utxos.splice(0, 1);
 			(fp as unknown as { pledged: Map<string, number> }).pledged.set(
 				coin,
@@ -767,7 +778,7 @@ describe('Reverse swap provider engine (issue #737)', function () {
 		});
 
 		it('a funding input a reorg hands back is frozen before the block pass renews it (issue #1159)', async function () {
-			const { h, utxos, fundingCoin, coin, frozen, selectOutpoints } =
+			const { h, fp, utxos, fundingCoin, coin, frozen, selectOutpoints } =
 				await walletFundedHarness();
 			const { swap } = await fundedSwap(h);
 			const r = record(h, swap);
@@ -783,28 +794,36 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			]);
 			expect(frozen.has(coin)).to.equal(true);
 
-			// A reorg hands the coin back, and the block pass stalls on its chain
-			// reads before it reaches the swap's renewal.
+			// Blocks keep renewing the funded row's pledge past its TTL.
+			const internals = fp as unknown as {
+				pledged: Map<string, number>;
+				prunePledges(): Promise<void>;
+			};
+			internals.pledged.set(coin, Date.now() - 61 * 60_000);
+			h.chain.height = 1002;
+			await h.engine.onBlock(1002);
+			await internals.prunePledges();
+			expect(frozen.has(coin)).to.equal(true);
+
+			// A reorg hands the coin back before the next block pass reaches the
+			// swap's renewal.
 			utxos.unshift(fundingCoin);
 			h.chain.evict(r.fundingTxid!);
-			let resume: () => void = () => undefined;
-			const reads = new Promise<void>((resolve) => {
-				resume = resolve;
-			});
-			const history = h.chain.getScriptHashHistory.bind(h.chain);
-			h.chain.getScriptHashHistory = async (scriptHash) => {
-				await reads;
-				return history(scriptHash);
-			};
-			h.chain.height = 1002;
-			const pass = h.engine.onBlock(1002);
+			let renew: () => void = () => undefined;
+			h.wallet.pledgeGate = () =>
+				new Promise<void>((resolve) => {
+					renew = resolve;
+				});
+			h.chain.height = 1003;
+			const pass = h.engine.onBlock(1003);
 			await settle();
 			expect(h.chain.broadcasts).to.have.length(1);
 			expect(await selectOutpoints(50_000n)).to.deep.equal([
 				`${utxos[2].tx_hash}:0`
 			]);
 
-			resume();
+			h.wallet.pledgeGate = null;
+			renew();
 			await pass;
 			expect(h.chain.broadcasts).to.have.length(2);
 			expect(h.chain.mempoolHas(r.fundingTxid!)).to.equal(true);
