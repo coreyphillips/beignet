@@ -111,11 +111,23 @@ export function isConnectionError(msg: IErrorMessage): boolean {
 	return msg.channelId.equals(ALL_CHANNELS);
 }
 
+/** Longest error text surfaced locally; the wire allows 65535 bytes. */
+const MAX_ERROR_TEXT_LENGTH = 1024;
+
 /**
- * Get the human-readable error text.
+ * Get the error text in a form safe to log or display.
+ *
+ * BOLT 1: print data verbatim only when it is all printable ASCII. The peer
+ * chooses these bytes, so any other byte becomes '?' rather than reaching a
+ * log as a forged newline or a terminal escape sequence.
  * @param msg - Error message
- * @returns Error text as string
+ * @returns Printable ASCII text, truncated to MAX_ERROR_TEXT_LENGTH
  */
 export function getErrorText(msg: IErrorMessage): string {
-	return msg.data.toString('ascii');
+	const shown = msg.data.subarray(0, MAX_ERROR_TEXT_LENGTH);
+	let text = '';
+	for (const byte of shown) {
+		text += byte >= 0x20 && byte <= 0x7e ? String.fromCharCode(byte) : '?';
+	}
+	return msg.data.length > shown.length ? `${text}...` : text;
 }

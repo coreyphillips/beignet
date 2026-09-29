@@ -592,6 +592,20 @@ export class Peer extends EventEmitter {
 			);
 		}
 
+		// BOLT 1: a peer whose networks share no chain with ours can neither
+		// open a channel nor gossip anything we use. Unchecked when we
+		// advertise no networks of our own.
+		const ours = this.networks;
+		const theirs = this.remoteInit.networks;
+		if (
+			ours &&
+			ours.length > 0 &&
+			theirs &&
+			!theirs.some((chain) => ours.some((o) => o.equals(chain)))
+		) {
+			throw new Error('Peer networks share no chain with ours');
+		}
+
 		this.emit('init', this.remoteInit);
 	}
 

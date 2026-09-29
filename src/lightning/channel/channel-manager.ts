@@ -42,7 +42,8 @@ import {
 import {
 	canScopeWireError,
 	decodeErrorMessage,
-	encodeErrorMessage
+	encodeErrorMessage,
+	getErrorText
 } from '../message/error';
 import { decodeChannelReestablishMessage } from '../message/channel-reestablish';
 import { decodeStfuMessage } from '../message/stfu';
@@ -8472,7 +8473,7 @@ export class ChannelManager extends EventEmitter {
 	private handleErrorMsg(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeErrorMessage(payload);
 		const channelIdHex = msg.channelId.toString('hex');
-		const errorText = msg.data.toString('utf8');
+		const errorText = getErrorText(msg);
 
 		// BOLT 1: an all-zero (or absent) channel_id refers to ALL channels with
 		// the sending node, and every one of them must be failed. Only the
@@ -8580,7 +8581,7 @@ export class ChannelManager extends EventEmitter {
 		// but the text is often the only clue to a protocol disagreement (CLN
 		// reports e.g. "Splice feerate_perkw is too low" this way), so surface it.
 		const msg = decodeErrorMessage(payload);
-		const warningText = msg.data.toString('utf8');
+		const warningText = getErrorText(msg);
 		this.emit('error', msg.channelId, `Remote warning: ${warningText}`);
 	}
 
