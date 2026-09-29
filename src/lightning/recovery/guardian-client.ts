@@ -34,6 +34,7 @@ import {
 	IGuardianRecord,
 	IGuardianRegisterNodeRequest,
 	IGuardianRegisterNodeResponse,
+	IGuardianRetainFloor,
 	IGuardianSyncEpochResponse,
 	IGuardianSyncRecordResponse,
 	IGuardianTakeoverCertificate,
@@ -498,10 +499,18 @@ export class GuardianClient {
 		);
 	}
 
-	async putState(record: IGuardianRecord): Promise<IGuardianPutStateResponse> {
+	async putState(
+		record: IGuardianRecord,
+		retainFloor?: IGuardianRetainFloor
+	): Promise<IGuardianPutStateResponse> {
 		await this.ensureCompatible();
 		return decodePutStateResponse(
-			await this.exchange('put_state', encodePutStateRequest({ record }))
+			await this.exchange(
+				'put_state',
+				encodePutStateRequest(
+					retainFloor ? { record, retainFloor } : { record }
+				)
+			)
 		);
 	}
 

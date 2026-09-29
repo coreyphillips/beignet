@@ -89,6 +89,14 @@ const META_DELTA_BYTES = 'journal_delta_bytes_since_snapshot';
  */
 const META_LAST_SNAPSHOT_WRITTEN = 'journal_last_snapshot_written';
 /**
+ * The newest snapshot WRITTEN as a group, JSON `{ sequence, groupEnd,
+ * frameHash }`: groupEnd is its last page frame, or the snapshot itself
+ * when unpaged. The replicator reads it to tell guardians they may free
+ * the records below the base (guardian-replication.ts retainFloor), which
+ * is only safe once the quorum holds the whole group.
+ */
+export const META_LAST_SNAPSHOT_GROUP = 'journal_last_snapshot_group';
+/**
  * Snapshot content versioning. '2' = snapshots carry the WHOLE
  * channel_key_indices table, including entries whose channel was deleted
  * (the high-water mark that prevents key reuse). Snapshots written before
@@ -196,6 +204,7 @@ const FRAME_DERIVED_META_KEYS = [
 	META_LAST_SNAPSHOT,
 	META_DELTA_BYTES,
 	META_LAST_SNAPSHOT_WRITTEN,
+	META_LAST_SNAPSHOT_GROUP,
 	META_SNAPSHOT_SCHEMA,
 	META_DURABILITY_FLOOR,
 	META_BACKFILL_LOST
@@ -1841,11 +1850,20 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		const dropped = this.fitSnapshotUnderCeiling(frame);
 		const pages = this.pageSnapshotRows(frame);
 		let { frameHash } = this.writeFrame(frame);
+		const snapshotHash = frameHash;
 		for (let i = 0; i < pages.length; i++) {
 			({ frameHash } = this.writeFrame(
 				this.pageFrame(frame, i, frameHash, pages[i])
 			));
 		}
+		this.storage.setRecoveryMeta!(
+			META_LAST_SNAPSHOT_GROUP,
+			JSON.stringify({
+				sequence: sequence.toString(),
+				groupEnd: (sequence + BigInt(pages.length)).toString(),
+				frameHash: snapshotHash.toString('hex')
+			})
+		);
 		if (dropped.length > 0) {
 			this.onFrameCeiling?.({
 				outcome: 'trimmed',

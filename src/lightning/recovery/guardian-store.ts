@@ -85,6 +85,18 @@ export interface IGuardianEpochRow {
 	receiptSignature: Buffer | null;
 }
 
+/**
+ * Where a namespace's stored records begin once the writer's retain floor
+ * freed the ones below (wire 5.2): the state the log stood at just before
+ * the first kept record, and this guardian's receipt signature over it.
+ */
+export interface IGuardianRetainFloorRow {
+	recoveryId: Buffer;
+	state: Buffer;
+	issuedAt: Buffer;
+	signature: Buffer;
+}
+
 export interface IGuardianOrphanRow {
 	recoveryId: Buffer;
 	epoch: Buffer;
@@ -179,6 +191,12 @@ CREATE TABLE IF NOT EXISTS guardian_orphan_records (
 	archived_at BLOB NOT NULL,
 	reason TEXT NOT NULL,
 	PRIMARY KEY (recovery_id, epoch, sequence)
+);
+CREATE TABLE IF NOT EXISTS guardian_retain_floors (
+	recovery_id BLOB PRIMARY KEY,
+	state BLOB NOT NULL,
+	issued_at BLOB NOT NULL,
+	signature BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS guardian_usage (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -741,6 +759,72 @@ export class GuardianStore {
 			.run(recoveryId);
 	}
 
+	// ─────────────── retain floors (wire 5.2) ───────────────
+
+	getRetainFloor(recoveryId: Buffer): IGuardianRetainFloorRow | null {
+		const row = this.db
+			.prepare('SELECT * FROM guardian_retain_floors WHERE recovery_id = ?')
+			.get(recoveryId) as
+			| {
+					recovery_id: Buffer;
+					state: Buffer;
+					issued_at: Buffer;
+					signature: Buffer;
+			  }
+			| undefined;
+		return row
+			? {
+					recoveryId: row.recovery_id,
+					state: row.state,
+					issuedAt: row.issued_at,
+					signature: row.signature
+			  }
+			: null;
+	}
+
+	setRetainFloor(row: IGuardianRetainFloorRow): void {
+		this.db
+			.prepare(
+				`INSERT OR REPLACE INTO guardian_retain_floors (
+					recovery_id, state, issued_at, signature
+				) VALUES (?, ?, ?, ?)`
+			)
+			.run(row.recoveryId, row.state, row.issuedAt, row.signature);
+	}
+
+	deleteRetainFloor(recoveryId: Buffer): void {
+		this.db
+			.prepare('DELETE FROM guardian_retain_floors WHERE recovery_id = ?')
+			.run(recoveryId);
+	}
+
+	/** The content bytes of the records below a sequence (contentBytes' measure). */
+	recordBytesBelow(recoveryId: Buffer, sequenceExclusive: Buffer): number {
+		const columns = CONTENT_COLUMNS.find(
+			([table]) => table === 'guardian_records'
+		)![1];
+		const sum = columns.map((c) => `COALESCE(length(${c}), 0)`).join(' + ');
+		const row = this.db
+			.prepare(
+				`SELECT COALESCE(SUM(${sum}), 0) AS bytes FROM guardian_records
+				WHERE recovery_id = ? AND sequence < ?`
+			)
+			.get(recoveryId, sequenceExclusive) as { bytes: number | bigint };
+		return Number(row.bytes);
+	}
+
+	/**
+	 * Free every record below a sequence. Unlike the archive moves this
+	 * keeps nothing: the writer signed that it will never ask for them again.
+	 */
+	deleteRecordsBelow(recoveryId: Buffer, sequenceExclusive: Buffer): void {
+		this.db
+			.prepare(
+				'DELETE FROM guardian_records WHERE recovery_id = ? AND sequence < ?'
+			)
+			.run(recoveryId, sequenceExclusive);
+	}
+
 	// ─────────────── storage accounting ───────────────
 
 	/**
@@ -776,7 +860,7 @@ export class GuardianStore {
 
 	/**
 	 * The encoded bytes the store holds, measured from the rows: every
-	 * column of every row, summed across the four tables, or across one
+	 * column of every row, summed across the content tables, or across one
 	 * namespace's rows. This is what a hosted guardian's byte quota bounds:
 	 * a record costs exactly its columns, so the cost of a write can be
 	 * known before it happens and the counter re-derived after a restart.
@@ -860,5 +944,6 @@ const CONTENT_COLUMNS: ReadonlyArray<[string, string[]]> = [
 			'receipt_issued_at',
 			'receipt_signature'
 		]
-	]
+	],
+	['guardian_retain_floors', ['recovery_id', 'state', 'issued_at', 'signature']]
 ];

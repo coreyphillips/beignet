@@ -29,6 +29,7 @@ import {
 	parseStateBytes,
 	recordTranscriptHash,
 	registerTranscriptHash,
+	retainTranscriptHash,
 	signTranscript,
 	stateBytes,
 	statesEqual,
@@ -40,6 +41,7 @@ import {
 	IGuardianRecord,
 	IGuardianReceipt,
 	IGuardianRegisterNodeRequest,
+	IGuardianRetainFloor,
 	IGuardianRotateSetRequest,
 	IGuardianGetHeadResponse
 } from './guardian';
@@ -58,6 +60,7 @@ import {
 import { GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES } from './guardian-host';
 import {
 	JOURNAL_META_KEYS,
+	META_LAST_SNAPSHOT_GROUP,
 	chainLostBackfill,
 	storedTipSequence,
 	resolveWatermarkAnchor,
@@ -212,6 +215,7 @@ export interface IGuardianReplicationEvent {
 		| 'record:rejected'
 		| 'record:conflict'
 		| 'record:too-large'
+		| 'record:quota-refused'
 		| 'writer:fenced'
 		| 'writer:supersession-unproven';
 	detail: string;
@@ -264,6 +268,8 @@ interface IGuardianStreamResult {
 	conflictAt: bigint | null;
 	/** The record this guardian refused as larger than it accepts. */
 	tooLargeAt: bigint | null;
+	/** The lowest record this guardian refused because its quota is full. */
+	quotaRefusedAt: bigint | null;
 	requests: number;
 }
 
@@ -277,6 +283,8 @@ export class GuardianReplicator {
 	private readonly advertisedCeilings = new Map<string, number>();
 	/** Too-large refusals already reported, as `guardian:sequence`. */
 	private readonly reportedTooLarge = new Set<string>();
+	/** Guardians whose quota refusal was reported and has not lifted since. */
+	private readonly reportedQuotaRefusal = new Set<string>();
 	/**
 	 * Single-flight over replicatePending. Two overlapping passes would fan
 	 * the same records out twice and, worse, race the watermark: each computes
@@ -862,6 +870,57 @@ export class GuardianReplicator {
 	}
 
 	/** Sign one journal frame as a guardian record (wire 4.2 RECORD). */
+	/**
+	 * The floor guardians may free below (wire 5.2): the journal's retained
+	 * base snapshot, once the quorum holds its whole page group. A restore
+	 * builds on the first record it downloads, so a guardian must never
+	 * keep less than a complete group, and a takeover can never certify
+	 * below a quorum-held record, so nothing freed can be asked for again.
+	 */
+	retainFloor(
+		lease: IWriterLeaseKeys,
+		replicatedThrough: bigint
+	): IGuardianRetainFloor | undefined {
+		const storage = this.config.storage;
+		const base = storage.getRecoveryMeta?.(JOURNAL_META_KEYS.lastSnapshot);
+		const raw = storage.getRecoveryMeta?.(META_LAST_SNAPSHOT_GROUP);
+		if (base == null || raw == null) return undefined;
+		let group: { sequence: bigint; groupEnd: bigint; frameHash: Buffer };
+		try {
+			const parsed = JSON.parse(raw) as Record<string, unknown>;
+			group = {
+				sequence: BigInt(String(parsed.sequence)),
+				groupEnd: BigInt(String(parsed.groupEnd)),
+				frameHash: Buffer.from(String(parsed.frameHash), 'hex')
+			};
+		} catch {
+			return undefined;
+		}
+		// The group names the newest snapshot written, which is the base
+		// only once compaction reached it.
+		if (
+			String(group.sequence) !== base ||
+			group.groupEnd < group.sequence ||
+			group.frameHash.length !== 32 ||
+			replicatedThrough < group.groupEnd
+		) {
+			return undefined;
+		}
+		return {
+			sequence: group.sequence,
+			frameHash: group.frameHash,
+			writerSignature: signTranscript(
+				retainTranscriptHash(this.config.context.guardianSetId, {
+					recoveryId: this.config.recoveryRoot.recoveryId,
+					epoch: lease.epoch,
+					sequence: group.sequence,
+					frameHash: group.frameHash
+				}),
+				lease.writerSecret
+			)
+		};
+	}
+
 	signRecord(
 		frame: IStoredRecoveryFrame,
 		lease: IWriterLeaseKeys
@@ -1118,7 +1177,8 @@ export class GuardianReplicator {
 		frames: IStoredRecoveryFrame[],
 		lease: IWriterLeaseKeys,
 		framesBySequence: Map<bigint, IStoredRecoveryFrame>,
-		tip: bigint
+		tip: bigint,
+		retainFloor: IGuardianRetainFloor | undefined
 	): Promise<IGuardianStreamResult> {
 		const result: IGuardianStreamResult = {
 			provenThrough: null,
@@ -1126,6 +1186,7 @@ export class GuardianReplicator {
 			sawRetired: false,
 			conflictAt: null,
 			tooLargeAt: null,
+			quotaRefusedAt: null,
 			requests: 0
 		};
 		let window = this.pipelineWindow;
@@ -1147,7 +1208,10 @@ export class GuardianReplicator {
 			const responses = await Promise.all(
 				batch.map(async (frame) => {
 					try {
-						return await entry.client.putState(this.signRecord(frame, lease));
+						return await entry.client.putState(
+							this.signRecord(frame, lease),
+							retainFloor
+						);
 					} catch (error) {
 						// A body past the advertised limit plus the envelope
 						// allowance is refused by the transport (HTTP and BOLT 8
@@ -1168,6 +1232,15 @@ export class GuardianReplicator {
 				if (!response) continue;
 				if (response.status === GuardianStatus.ERR_TOO_LARGE) {
 					noteTooLarge(batch[index]);
+				}
+				if (response.status === GuardianStatus.ERR_QUOTA_EXCEEDED) {
+					const sequence = BigInt(batch[index].sequence);
+					if (
+						result.quotaRefusedAt == null ||
+						sequence < result.quotaRefusedAt
+					) {
+						result.quotaRefusedAt = sequence;
+					}
 				}
 				if (response.status === GuardianStatus.ERR_EPOCH_SUPERSEDED) {
 					result.sawSupersession = true;
@@ -1277,17 +1350,27 @@ export class GuardianReplicator {
 			framesBySequence.set(BigInt(frame.sequence), frame);
 		}
 		const tip = BigInt(frames[frames.length - 1].sequence);
+		const retainFloor = this.retainFloor(lease, from);
 
 		const [streams] = await Promise.all([
 			Promise.all(
 				this.config.guardians.map((entry) =>
-					this.streamToGuardian(entry, frames, lease, framesBySequence, tip)
+					this.streamToGuardian(
+						entry,
+						frames,
+						lease,
+						framesBySequence,
+						tip,
+						retainFloor
+					)
 				)
 			),
 			this.readMissingLimits()
 		]);
 
 		for (const [index, stream] of streams.entries()) {
+			const guardian =
+				this.config.guardians[index].expectedGuardianId.toString('hex');
 			if (stream.conflictAt != null) {
 				this.emit({
 					type: 'record:conflict',
@@ -1298,8 +1381,6 @@ export class GuardianReplicator {
 				});
 			}
 			if (stream.tooLargeAt != null) {
-				const guardian =
-					this.config.guardians[index].expectedGuardianId.toString('hex');
 				const key = `${guardian}:${stream.tooLargeAt}`;
 				// Every later pass resends the same record and meets the same
 				// refusal, so each one is reported once, not once per pass.
@@ -1315,6 +1396,24 @@ export class GuardianReplicator {
 						sequence: stream.tooLargeAt
 					});
 				}
+			}
+			// Reported once per episode: every pass meets the same refusal
+			// until the guardian stores something again.
+			if (stream.quotaRefusedAt == null) {
+				if (stream.provenThrough != null) {
+					this.reportedQuotaRefusal.delete(guardian);
+				}
+			} else if (!this.reportedQuotaRefusal.has(guardian)) {
+				this.reportedQuotaRefusal.add(guardian);
+				this.emit({
+					type: 'record:quota-refused',
+					detail:
+						`guardian ${guardian} refused record ${stream.quotaRefusedAt}: ` +
+						`the storage quota it keeps for this guardian set is full, so it ` +
+						`stores nothing more until its operator raises the quota or the ` +
+						`set's writers free records below their retain floors`,
+					sequence: stream.quotaRefusedAt
+				});
 			}
 		}
 

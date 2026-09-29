@@ -42,11 +42,16 @@ import {
 	genesisLogHead,
 	generateWriterKey,
 	GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES,
+	GUARDIAN_REGISTRATION_BYTES,
+	JOURNAL_META_KEYS,
+	META_LAST_SNAPSHOT_GROUP,
 	loadWriterLease,
 	nodeGuardianTransport,
 	registerTranscriptHash,
+	retainTranscriptHash,
 	signAcquisition,
 	signTranscript,
+	verifyTranscript,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
@@ -95,14 +100,16 @@ function bind(served: IServed[]): IBoundGuardianClient[] {
 
 async function serve(
 	index: number,
-	maxCiphertextBytes?: number
+	maxCiphertextBytes?: number,
+	maxContentBytes?: number
 ): Promise<IServed> {
 	const guardian = new ReferenceGuardian({
 		path: ':memory:',
 		guardianSecret: GUARDIAN_SECRETS[index],
 		members: GUARDIAN_IDS,
 		clock,
-		maxCiphertextBytes
+		maxCiphertextBytes,
+		maxContentBytes
 	});
 	const server = new GuardianHttpServer({ guardian });
 	const port = await server.listen(0);
@@ -1349,5 +1356,163 @@ describe('Recovery phase 5: restore past the guardian record limit (issue #1102)
 		await shutdown(served);
 		storage.close();
 		target.close();
+	});
+});
+
+describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
+	function commitTransition(manager: RecoveryManager, i: number): void {
+		expect(
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'payment_preimage',
+						paymentHash: Buffer.alloc(32, i + 1).toString('hex'),
+						preimage: Buffer.alloc(32, i + 1)
+					}
+				],
+				outboundMessages: []
+			}).committed
+		).to.equal(true);
+	}
+
+	it('frees guardian records below the quorum-held base and still restores exactly', async function (): Promise<void> {
+		this.timeout(30_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		let rep: GuardianReplicator | null = null;
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId,
+			{
+				snapshotIntervalFrames: 4,
+				retainFrom: (): bigint => (rep ? rep.replicatedThrough() + 1n : 1n)
+			}
+		);
+		const manager = new RecoveryManager(storage, { journal });
+		commitTransition(manager, 0);
+		rep = replicatorFor(storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		for (let i = 1; i <= 24; i++) {
+			commitTransition(manager, i);
+			await rep.replicatePending(lease);
+			journal.compact();
+		}
+
+		const base = BigInt(
+			storage.getRecoveryMeta!(JOURNAL_META_KEYS.lastSnapshot)!
+		);
+		expect(base > 8n).to.equal(true);
+		for (const entry of served) {
+			const page = await entry.client.getState(ROOT.recoveryId, 0n);
+			const first = page.records![0].sequence;
+			// Freed up to a snapshot the writer compacted to, never past its base.
+			expect(first > 4n).to.equal(true);
+			expect(first <= base).to.equal(true);
+			expect(entry.guardian.contentBytes()).to.equal(
+				entry.guardian.auditContentBytes()
+			);
+		}
+
+		const expectedDump = dumpTables(storage);
+		const target = openStorage();
+		await driverFor(target, bind(served)).restore();
+		expect(dumpTables(target)).to.equal(expectedDump);
+		await shutdown(served);
+		storage.close();
+		target.close();
+	});
+
+	it('names a floor only once the quorum holds the base snapshot and every page after it', () => {
+		const storage = openStorage();
+		// Never contacted: the floor is judged from local metadata alone.
+		const rep = replicatorFor(
+			storage,
+			GUARDIAN_IDS.map((id) => ({
+				client: new GuardianClient({
+					url: 'http://127.0.0.1:1',
+					guardianSetId: SET_ID
+				}),
+				expectedGuardianId: id
+			}))
+		);
+		const writer = generateWriterKey();
+		const lease: IWriterLeaseKeys = {
+			epoch: 3n,
+			writerPublicKey: writer.publicKey,
+			writerSecret: writer.secret,
+			guardianCertificates: [],
+			confirmedAt: null
+		};
+		const frameHash = sha('base snapshot');
+		storage.setRecoveryMeta!(JOURNAL_META_KEYS.lastSnapshot, '40');
+		storage.setRecoveryMeta!(
+			META_LAST_SNAPSHOT_GROUP,
+			JSON.stringify({
+				sequence: '40',
+				groupEnd: '42',
+				frameHash: frameHash.toString('hex')
+			})
+		);
+		expect(rep.retainFloor(lease, 41n)).to.equal(undefined);
+		const floor = rep.retainFloor(lease, 42n)!;
+		expect(floor.sequence).to.equal(40n);
+		expect(floor.frameHash.equals(frameHash)).to.equal(true);
+		expect(
+			verifyTranscript(
+				retainTranscriptHash(SET_ID, {
+					recoveryId: ROOT.recoveryId,
+					epoch: 3n,
+					sequence: 40n,
+					frameHash
+				}),
+				floor.writerSignature,
+				writer.publicKey
+			)
+		).to.equal(true);
+
+		// A snapshot written but not yet compacted to is not the base.
+		storage.setRecoveryMeta!(JOURNAL_META_KEYS.lastSnapshot, '36');
+		expect(rep.retainFloor(lease, 100n)).to.equal(undefined);
+		storage.close();
+	});
+
+	it('reports a guardian whose quota refuses records, once per episode', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([
+			serve(0),
+			serve(1),
+			serve(2, undefined, GUARDIAN_REGISTRATION_BYTES + 100)
+		]);
+		const live = liveNode(2);
+		const events: IGuardianReplicationEvent[] = [];
+		const rep = new GuardianReplicator({
+			storage: live.storage,
+			guardians: bind(served),
+			context: CONTEXT,
+			required: CRASH_V1_PROFILE.required,
+			recoveryRoot: ROOT,
+			clock,
+			onEvent: (event): void => {
+				events.push(event);
+			}
+		});
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		const refusals = (): IGuardianReplicationEvent[] =>
+			events.filter((e) => e.type === 'record:quota-refused');
+
+		expect((await rep.replicatePending(lease)).outcome).to.equal('replicated');
+		expect(refusals()).to.have.length(1);
+		expect(refusals()[0].detail).to.contain(GUARDIAN_IDS[2].toString('hex'));
+
+		commitTransition(live.manager, 50);
+		await rep.replicatePending(lease);
+		expect(refusals()).to.have.length(1);
+		await shutdown(served);
+		live.storage.close();
 	});
 });

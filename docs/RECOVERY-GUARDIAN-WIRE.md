@@ -248,6 +248,8 @@ what it would store crosses the limit, a replay the guardian answers from
 what it already holds costs nothing, and a replaced object costs its new
 encoding minus the old. The count is kept in the store and re-derived from
 its rows at every open, so two hosts on one store admit against one total.
+The quota never deletes on its own; what shrinks a set is its writers'
+retain floors (5.2), which free every record below a quorum-held snapshot.
 
 `transportStatus` is the 2.5 HTTP-layer status, one to one: 200 for every
 well-formed protocol exchange INCLUDING protocol-level rejections (the
@@ -417,6 +419,15 @@ RECORD     tag 'beignet/recovery/record/v1'
   || frameHash(32)
   || ciphertextHash(32)          SHA-256 of the record ciphertext
 
+RETAIN     tag 'beignet/recovery/retain/v1'
+           signed by the writer key of lease.epoch (5.2)
+  PREFIX
+  || recovery_id(32)
+  || epoch(8)                    lease.epoch
+  || sequence(8)                 the first record the guardian keeps: a
+                                 snapshot's
+  || frameHash(32)               that record's frame hash
+
 RECEIPT    tag 'beignet/recovery/receipt/v1'
            signed by the guardian
   PREFIX || guardianId(32) || STATE || issuedAt(8)
@@ -444,7 +455,9 @@ Receipts sign the complete STATE and are cumulative: a receipt whose
 LOGHEAD carries sequence S certifies every stored record from
 ORIGIN.firstSequence through S inclusive, across every intervening writer
 epoch. Records below the origin do not exist for this namespace and no
-receipt ever speaks for them.
+receipt ever speaks for them. Once a guardian accepted a retain floor
+(5.2) it stores the chain from the floor instead; the ORIGIN, and every
+STATE it signs, stay as they were.
 
 What a receipt certifies, precisely: the guardian's canonical state AS OF
 ISSUANCE. A record covered only by a MINORITY of receipts (fewer than
@@ -536,6 +549,24 @@ without waiting for responses. Each request receives its own response;
 there is no batch request in v1. Because receipts are cumulative, a
 client that only reads the last response of a pipelined burst has lost
 nothing.
+
+Retain floor. A PUT_STATE MAY carry `retain_floor`: a sequence F, the
+frame hash of the record at F, and the lease writer key's signature over
+the RETAIN transcript. The writer sends it once F is its journal's retained
+base snapshot and a quorum holds that snapshot's whole page group, so a
+restore that downloads from F still starts at a complete snapshot, and no
+takeover can certify a head below F (4.2: a quorum-held record is never
+superseded). A guardian that accepts or duplicates the record, holds the
+record at F with that frame hash, and has not already freed through F
+verifies the signature (`ERR_BAD_SIGNATURE` refuses the whole request),
+deletes every record below F, and stores the state just before F with its
+own receipt signature over it, which is where its open-time walk (5.10)
+resumes. A floor it cannot act on yet (it does not hold F, or the record
+is refused) changes nothing. The freed bytes count before the quota (2.7),
+so a set already at its quota shrinks. A record below the floor is then
+answered `ERR_SEQUENCE_GAP` with the current state, and a SYNC_EPOCH whose
+certified head lies below it is `ERR_CONFLICT`. SYNC_RECORD never carries
+a floor.
 
 ### 5.3 GET_HEAD
 
@@ -1006,7 +1037,15 @@ message RegisterNodeResponse {
   GuardianState current = 4;           // ERR_ALREADY_REGISTERED
 }
 
-message PutStateRequest  { Record record = 1; }
+message RetainFloor {
+  uint64 sequence         = 1;
+  bytes  frame_hash       = 2;   // 32
+  bytes  writer_signature = 3;   // 64, BIP340 over the RETAIN transcript
+}
+message PutStateRequest {
+  Record      record       = 1;
+  RetainFloor retain_floor = 2;   // optional (5.2); SYNC_RECORD omits it
+}
 message PutStateResponse {
   uint32        status  = 1;
   string        detail  = 2;
