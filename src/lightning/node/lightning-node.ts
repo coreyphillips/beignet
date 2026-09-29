@@ -3524,6 +3524,44 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Fulfill each received HTLC on this channel that a completed incoming
+	 * payment lists in settledHtlcs but that is still COMMITTED. An MPP set
+	 * fulfills every part when its last one arrives, and a part on a channel
+	 * awaiting reestablishment at that moment is refused. The restart
+	 * redispatch never runs for a channel that stayed live.
+	 *
+	 * Gated on durable facts only, so it is safe on every reconnect: a
+	 * fulfilled entry is no longer COMMITTED. Held and FFOR voucher entries
+	 * are left to their own machinery, as the restart redispatch leaves them.
+	 */
+	private fulfillSettledReceivedHtlcs(channelId: Buffer): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const channelHex = channelId.toString('hex');
+		for (const [key, htlc] of [...channel.getFullState().htlcs]) {
+			if (!key.startsWith('received-')) continue;
+			if (htlc.state !== HtlcState.COMMITTED) continue;
+			if (this.isHeldHtlc(channelId, htlc.id)) continue;
+			if (htlc.fforVoucher === true || htlc.fforMismatch === true) continue;
+			const hashHex = htlc.paymentHash.toString('hex');
+			const htlcKey = `${channelHex}:${htlc.id}`;
+			const payment = this.payments.get(hashHex);
+			if (
+				payment?.direction !== PaymentDirection.INCOMING ||
+				payment.status !== PaymentStatus.COMPLETED ||
+				!payment.settledHtlcs?.includes(htlcKey)
+			) {
+				continue;
+			}
+			const preimage = this.preimages.get(hashHex) ?? payment.preimage;
+			if (!preimage) continue;
+			if (this.channelManager.fulfillHtlc(channelId, htlc.id, preimage).ok) {
+				this.cleanupHtlcSharedSecret(htlcKey);
+			}
+		}
+	}
+
 	/** True when this received HTLC is parked awaiting a hold-invoice decision. */
 	private isHeldHtlc(channelId: Buffer, htlcId: bigint): boolean {
 		for (const held of this.heldHtlcs.values()) {
@@ -4230,6 +4268,7 @@ export class LightningNode extends EventEmitter {
 		// event where the restore repair above is not.
 		this.channelManager.on('channel:reestablished', (channelId: Buffer) => {
 			this.settleForwardsOwedUpstream(channelId);
+			this.fulfillSettledReceivedHtlcs(channelId);
 			// A conflict verdict the peer has not yet agreed is re-asked on
 			// every reconnect (issue #760).
 			this.resendSpliceConflicts(channelId.toString('hex'));
@@ -21702,10 +21741,24 @@ export class LightningNode extends EventEmitter {
 			// (Mirrors the single-payment path in fulfillPayment.)
 			this.channelManager.recordPreimage(paymentHash, preimage);
 
-			// Fulfill ALL parts atomically
+			// Fulfill ALL parts atomically. A part whose channel cannot carry the
+			// fulfill (its peer is mid-reconnect) is still listed in settledHtlcs
+			// below, and fulfillSettledReceivedHtlcs sends it on reestablish.
 			for (const p of pending.receivedParts) {
 				p.status = PaymentStatus.COMPLETED;
-				this.channelManager.fulfillHtlc(p.channelId, p.htlcId, preimage);
+				const result = this.channelManager.fulfillHtlc(
+					p.channelId,
+					p.htlcId,
+					preimage
+				);
+				if (!result.ok) {
+					this.emitStructuredLog('htlc', 'mpp_part_fulfill_refused', {
+						paymentHash: hashHex,
+						channelId: p.channelId.toString('hex'),
+						htlcId: p.htlcId.toString(),
+						error: result.error
+					});
+				}
 			}
 			this.pendingMppPayments.delete(hashHex);
 			// Settle here goes straight to fulfillHtlc, so this is the MPP set's
