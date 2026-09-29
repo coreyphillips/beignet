@@ -98,22 +98,49 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 			feeMsat?: bigint;
 			fails?: boolean;
 			timesOut?: boolean;
+			tornDown?: boolean;
+			crossesMidnight?: boolean;
 			feeSpentMsat?: bigint;
 			budgetSatsPerDay?: number;
 		} = {}
-	): Fake<{ engineCalls: number; pendingDuringCall: number[] }> {
+	): Fake<{
+		engineCalls: number;
+		spentDuringCall: number[];
+		persisted: number[];
+		destroyed: boolean;
+		runOptions?: { stopRequested?: () => boolean };
+	}> {
+		/** What the engine does once the call is in flight. */
+		const inFlight = (): void => {
+			node.engineCalls++;
+			node.spentDuringCall.push(node._dailySpentSats);
+			if (engine.crossesMidnight) node._dailySpendResetTime = Date.now() - 1;
+			if (engine.fails) throw new Error('No circular route');
+			if (engine.timesOut) {
+				throw new PaymentWaitTimeoutError(
+					'waitForPayment timed out after 60000ms'
+				);
+			}
+		};
 		const node = fakeNode(limits, {
 			engineCalls: 0,
-			pendingDuringCall: [] as number[],
+			spentDuringCall: [] as number[],
+			persisted: [] as number[],
+			destroyed: false,
+			runOptions: undefined as { stopRequested?: () => boolean } | undefined,
+			storage: {
+				saveMetadata: (_key: string, value: string): void => {
+					node.persisted.push(
+						(JSON.parse(value) as { totalSats: number }).totalSats
+					);
+				}
+			},
 			node: {
 				rebalanceChannel: async (): Promise<unknown> => {
-					node.engineCalls++;
-					node.pendingDuringCall.push(node._pendingSpendSats);
-					if (engine.fails) throw new Error('No circular route');
-					if (engine.timesOut) {
-						throw new PaymentWaitTimeoutError(
-							'waitForPayment timed out after 60000ms'
-						);
+					inFlight();
+					if (engine.tornDown) {
+						node.destroyed = true;
+						throw new Error('Node destroyed');
 					}
 					return {
 						paymentHash: Buffer.alloc(32, 1),
@@ -124,9 +151,13 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 				},
 				rebalanceBudgetSatsPerDay: (given?: number): number =>
 					given ?? engine.budgetSatsPerDay ?? 1_000,
-				executeRebalanceRecommendations: async (): Promise<unknown> => {
-					node.engineCalls++;
-					node.pendingDuringCall.push(node._pendingSpendSats);
+				executeRebalanceRecommendations: async (options: {
+					stopRequested?: () => boolean;
+				}): Promise<unknown> => {
+					node.runOptions = options;
+					inFlight();
+					// A teardown mid-run: the cut-short attempt is not in the summary.
+					if (engine.tornDown) node.destroyed = true;
 					return {
 						attempts: [],
 						succeeded: 1,
@@ -139,6 +170,15 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 			}
 		});
 		return node;
+	}
+
+	async function settle(fn: () => Promise<unknown>): Promise<unknown> {
+		try {
+			await fn();
+		} catch (err) {
+			return err;
+		}
+		return undefined;
 	}
 
 	it('refuses a rebalance while draining, before the engine', async () => {
@@ -161,7 +201,7 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 		expect(node.engineCalls).to.equal(0);
 	});
 
-	it('holds the fee cap in flight and charges the fee paid, rounded up', async () => {
+	it('charges the fee cap up front and gives back what the route did not take', async () => {
 		const node = rebalancingNode({ daily: 100_000 }, { feeMsat: 1_234_500n });
 		const result = await node.rebalanceChannel(
 			CHANNEL_A,
@@ -170,38 +210,45 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 			5_000
 		);
 		expect(result.feeMsat).to.equal('1234500');
-		expect(node.pendingDuringCall).to.deep.equal([5_000]);
+		// Persisted before the engine ran, so a crash keeps it charged.
+		expect(node.spentDuringCall).to.deep.equal([5_000]);
+		expect(node.persisted[0]).to.equal(5_000);
 		expect(node._pendingSpendSats).to.equal(0);
+		// The fee paid, rounded up. The amount returns: only the fee is spent.
 		expect(node._dailySpentSats).to.equal(1_235);
 		expect(node._dailySpentLightningSats).to.equal(1_235);
-		// The amount returns: only the fee is spent.
 		expect(node._dailySpentOnchainSats).to.equal(0);
+		expect(node.persisted[node.persisted.length - 1]).to.equal(1_235);
 	});
 
-	it('gives the hold back and charges nothing when the rebalance fails', async () => {
+	it('gives the whole charge back when the rebalance fails', async () => {
 		const node = rebalancingNode({ daily: 100_000 }, { fails: true });
-		let threw = false;
-		try {
-			await node.rebalanceChannel(CHANNEL_A, CHANNEL_B, 100_000, 5_000);
-		} catch {
-			threw = true;
-		}
-		expect(threw).to.equal(true);
-		expect(node._pendingSpendSats).to.equal(0);
+		expect(
+			await settle(() =>
+				node.rebalanceChannel(CHANNEL_A, CHANNEL_B, 100_000, 5_000)
+			)
+		).to.be.instanceOf(Error);
 		expect(node._dailySpentSats).to.equal(0);
+		expect(node._dailySpentLightningSats).to.equal(0);
 	});
 
-	it('charges the fee cap when the wait times out with the HTLC out', async () => {
+	it('keeps the fee cap charged when the wait times out with the HTLC out', async () => {
 		const node = rebalancingNode({ daily: 100_000 }, { timesOut: true });
-		let error: unknown;
-		try {
-			await node.rebalanceChannel(CHANNEL_A, CHANNEL_B, 100_000, 5_000);
-		} catch (err) {
-			error = err;
-		}
-		expect(error).to.be.instanceOf(PaymentWaitTimeoutError);
-		expect(node._pendingSpendSats).to.equal(0);
+		expect(
+			await settle(() =>
+				node.rebalanceChannel(CHANNEL_A, CHANNEL_B, 100_000, 5_000)
+			)
+		).to.be.instanceOf(PaymentWaitTimeoutError);
 		expect(node._dailySpentSats).to.equal(5_000);
+	});
+
+	it('keeps the fee cap charged when a teardown cuts the wait short', async () => {
+		const node = rebalancingNode({ daily: 100_000 }, { tornDown: true });
+		await settle(() =>
+			node.rebalanceChannel(CHANNEL_A, CHANNEL_B, 100_000, 5_000)
+		);
+		expect(node._dailySpentSats).to.equal(5_000);
+		expect(node.persisted[node.persisted.length - 1]).to.equal(5_000);
 	});
 
 	it('leaves maxPaymentSats out of a rebalance', async () => {
@@ -236,17 +283,50 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 		expect(node.engineCalls).to.equal(0);
 	});
 
-	it('holds the day budget during a run and charges the fees it paid', async () => {
+	it('charges the day budget up front and gives back what the run did not spend', async () => {
 		const node = rebalancingNode(
 			{ daily: 10_000 },
 			{ feeSpentMsat: 2_000_001n }
 		);
 		const summary = await node.executeRebalances(1_500);
 		expect(summary.feeSpentMsat).to.equal('2000001');
-		expect(node.pendingDuringCall).to.deep.equal([1_500]);
+		expect(node.spentDuringCall).to.deep.equal([1_500]);
+		expect(node.persisted[0]).to.equal(1_500);
 		expect(node._pendingSpendSats).to.equal(0);
 		expect(node._dailySpentSats).to.equal(2_001);
 		expect(node._dailySpentLightningSats).to.equal(2_001);
+	});
+
+	it('stops an advisor run once a drain starts', async () => {
+		const node = rebalancingNode({});
+		await node.executeRebalances(1_000);
+		const stopRequested = node.runOptions?.stopRequested;
+		expect(stopRequested?.()).to.equal(false);
+		node._draining = true;
+		expect(stopRequested?.()).to.equal(true);
+	});
+
+	it('keeps the whole day budget charged when a teardown cuts a run short', async () => {
+		const node = rebalancingNode({ daily: 10_000 }, { tornDown: true });
+		await node.executeRebalances(1_500);
+		expect(node._dailySpentSats).to.equal(1_500);
+	});
+
+	it('gives the whole charge back when the engine refuses the run', async () => {
+		const node = rebalancingNode({ daily: 10_000 }, { fails: true });
+		expect(await settle(() => node.executeRebalances(1_500))).to.be.instanceOf(
+			Error
+		);
+		expect(node._dailySpentSats).to.equal(0);
+	});
+
+	it('charges the new day what a run that crossed midnight spent', async () => {
+		const node = rebalancingNode(
+			{ daily: 10_000 },
+			{ feeSpentMsat: 700_000n, crossesMidnight: true }
+		);
+		await node.executeRebalances(1_500);
+		expect(node._dailySpentSats).to.equal(700);
 	});
 });
 

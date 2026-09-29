@@ -707,6 +707,31 @@ describe('Advisor Execution (M3 phases 1+2)', function () {
 			}
 		});
 
+		it('leaves the pairs after a stop request untried', async function () {
+			const setup = setupCircular();
+			const { alice } = setup;
+			try {
+				const plans = alice.planRebalanceRecommendations();
+				alice.planRebalanceRecommendations = (): typeof plans => [
+					plans[0],
+					plans[0]
+				];
+				let calls = 0;
+				alice.rebalanceChannel = async (): Promise<never> => {
+					calls++;
+					throw new Error('No circular route');
+				};
+				const summary = await alice.executeRebalanceRecommendations({
+					budgetSatsPerDay: 10,
+					stopRequested: () => calls > 0
+				});
+				expect(calls).to.equal(1);
+				expect(summary.attempts).to.have.length(1);
+			} finally {
+				setup.destroy();
+			}
+		});
+
 		it('respects spend already persisted for the current UTC day', async function () {
 			const storage = new SqliteStorage(':memory:');
 			storage.open();

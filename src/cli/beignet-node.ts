@@ -9655,6 +9655,25 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
+	 * Gives back what a Lightning charge made up front did not spend, to the
+	 * day it was charged to (the one resetting at `resetTime`) only. Once that
+	 * day has ended its total is gone, and the new day never carried the
+	 * charge. Returns false then. A negative `sats`, a spend above the charge,
+	 * is charged in full.
+	 */
+	private _refundSpend(sats: number, resetTime: number): boolean {
+		if (this._dailySpendLimitSats === undefined) return true;
+		this._resetDailySpendIfNeeded();
+		if (this._dailySpendResetTime !== resetTime) return false;
+		if (sats !== 0) {
+			this._dailySpentSats -= sats;
+			this._dailySpentLightningSats -= sats;
+			this._persistSpendState();
+		}
+		return true;
+	}
+
+	/**
 	 * Reserves the budget one attempt can still spend, and returns the claim
 	 * so its caller can drop that exact attempt again. Appended rather than
 	 * replacing what the hash already holds: see _asyncSpendClaims. Every
@@ -12757,12 +12776,15 @@ export class BeignetNode extends EventEmitter {
 			);
 		this._checkDraining();
 		// The amount comes back round the loop, so the fee is all a rebalance
-		// spends. Its cap is judged and held against the daily limit, and the
-		// day is charged the fee the route took, or the cap when the wait
-		// times out.
+		// spends. The cap is charged before anything is sent, so a crash or a
+		// teardown with the HTLC still out leaves it charged. Once the outcome
+		// is known the day gets back what the route did not take, or all of
+		// it when the rebalance failed. A timed-out wait keeps the cap, since
+		// the HTLC can still settle.
 		this._checkSpendLimit(maxFeeSats);
-		const reserving = this._dailySpendLimitSats !== undefined;
-		if (reserving) this._pendingSpendSats += maxFeeSats;
+		this._recordSpend(maxFeeSats);
+		const chargedUntil = this._dailySpendResetTime;
+		let spentSats = maxFeeSats;
 		try {
 			const result = await this.node.rebalanceChannel({
 				fromChannelId: Buffer.from(fromChannelId, 'hex'),
@@ -12770,7 +12792,7 @@ export class BeignetNode extends EventEmitter {
 				amountSats: BigInt(amountSats),
 				maxFeeSats: BigInt(maxFeeSats)
 			});
-			this._recordSpend(spendLimitSats(result.feeMsat));
+			spentSats = spendLimitSats(result.feeMsat);
 			this.log('info', 'Rebalance completed', {
 				fromChannelId,
 				toChannelId,
@@ -12785,11 +12807,12 @@ export class BeignetNode extends EventEmitter {
 				hops: result.hops
 			};
 		} catch (err) {
-			// The HTLC can still settle, and nothing would charge it then.
-			if (err instanceof PaymentWaitTimeoutError) this._recordSpend(maxFeeSats);
+			if (!(err instanceof PaymentWaitTimeoutError)) spentSats = 0;
 			throw err;
 		} finally {
-			if (reserving) this._pendingSpendSats -= maxFeeSats;
+			if (!this.destroyed) {
+				this._refundSpend(maxFeeSats - spentSats, chargedUntil);
+			}
 		}
 	}
 
@@ -12811,20 +12834,36 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		this._checkDraining();
-		// Held at the whole day's fee budget, which bounds what the run can
-		// spend whatever the advisor has already spent today.
+		// Charged up front as rebalanceChannel is, at the whole day's fee
+		// budget, which bounds what the run can spend whatever the advisor has
+		// already spent today.
 		const holdSats = this.node.rebalanceBudgetSatsPerDay(budgetSatsPerDay);
 		this._checkSpendLimit(holdSats);
-		const reserving = this._dailySpendLimitSats !== undefined;
-		if (reserving) this._pendingSpendSats += holdSats;
+		this._recordSpend(holdSats);
+		const chargedUntil = this._dailySpendResetTime;
+		let spentSats = holdSats;
 		let summary: IRebalanceExecutionSummary;
 		try {
 			summary = await this.node.executeRebalanceRecommendations({
-				budgetSatsPerDay
+				budgetSatsPerDay,
+				stopRequested: () => this._draining
 			});
-			this._recordSpend(spendLimitSats(summary.feeSpentMsat));
+			spentSats = spendLimitSats(summary.feeSpentMsat);
+		} catch (err) {
+			// The engine throws only before it tries a plan.
+			spentSats = 0;
+			throw err;
 		} finally {
-			if (reserving) this._pendingSpendSats -= holdSats;
+			// A teardown can cut a wait short with its HTLC out, which the
+			// summary does not count, so the whole charge stands then.
+			if (
+				!this.destroyed &&
+				!this._refundSpend(holdSats - spentSats, chargedUntil)
+			) {
+				// The run crossed midnight, where the engine's budget started
+				// over. The old day's charge does not cover what it spent since.
+				this._recordSpend(spentSats);
+			}
 		}
 		return {
 			attempts: summary.attempts.map((a) => ({

@@ -13959,11 +13959,14 @@ export class LightningNode extends EventEmitter {
 	 * budget. Each pair gets a fee cap of min(remaining budget, 0.5% of the
 	 * amount, at least 1 sat); once the day's budget is exhausted the remaining
 	 * pairs are skipped, never partially overspent. Failures are recorded and
-	 * do not stop later pairs (they spent nothing).
+	 * do not stop later pairs (they spent nothing). `stopRequested` is asked
+	 * before each pair, and the run ends there, leaving the rest untried, once
+	 * it returns true.
 	 */
 	async executeRebalanceRecommendations(options?: {
 		budgetSatsPerDay?: number;
 		minImbalancePct?: number;
+		stopRequested?: () => boolean;
 	}): Promise<IRebalanceExecutionSummary> {
 		if (this.rebalanceRunInFlight) {
 			throw new Error('a rebalance execution run is already in progress');
@@ -13981,6 +13984,7 @@ export class LightningNode extends EventEmitter {
 			let feeSpentThisRunMsat = 0n;
 
 			for (const plan of plans) {
+				if (options?.stopRequested?.()) break;
 				const remainingMsat = budgetMsat - this.loadRebalanceSpentMsat();
 				// Per-pair cap: never above the remaining daily budget, and never
 				// above 0.5% of the moved amount (min 1 sat so tiny amounts route).

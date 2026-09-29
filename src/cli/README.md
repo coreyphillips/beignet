@@ -710,12 +710,15 @@ figure as the daily limit: `sendOnchain`, an address-targeted `spliceOut` and
 whole sweep. The exclusions above are outside it too.
 
 Circular rebalances (`rebalanceChannel`, `executeRebalances` and their routes)
-are refused with `SERVICE_DRAINING` while the node drains. The amount comes
-back to the node, so only the routing fee counts against the daily limit:
-`rebalanceChannel` is judged on its `maxFeeSats` and `executeRebalances` on
-the day's advisor fee budget, and the day is charged the fee actually paid.
-A rebalance whose wait times out is charged its fee cap, because its HTLC can
-still settle. `maxPaymentSats` does not apply to them. The `autoRebalance`
+are refused with `SERVICE_DRAINING` while the node drains, and a drain that
+starts during an `executeRebalances` run stops the plans it has not tried
+yet. The amount comes back to the node, so only the routing fee counts
+against the daily limit. The day is charged `maxFeeSats` (`rebalanceChannel`)
+or the day's advisor fee budget (`executeRebalances`) when the call starts,
+and gets back what the fees actually paid did not use when it returns. A
+rebalance whose wait times out, or that a shutdown or crash interrupts, keeps
+its fee cap charged, because its HTLC can still settle. `maxPaymentSats` does
+not apply to them. The `autoRebalance`
 timer runs inside the engine and is bounded only by its own
 `budgetSatsPerDay`.
 
