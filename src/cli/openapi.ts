@@ -3460,11 +3460,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Register a webhook for event notifications (persistent across restarts)',
+					description:
+						'The url must be http or https. A loopback, private, or link-local host is refused (403 PRIVATE_NETWORK_REFUSED) unless allowPrivateNetwork is true. Payloads never carry a payment preimage; read it from GET /payment.',
 					tags: ['Webhooks'],
 					requestBody: bodyContent({
 						url: 'string',
 						events: 'string',
-						secret: 'string?'
+						secret: 'string?',
+						allowPrivateNetwork: 'boolean?'
 					}),
 					responses: {
 						'200': {

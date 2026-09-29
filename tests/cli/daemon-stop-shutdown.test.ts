@@ -215,7 +215,8 @@ describe('Webhooks survive a graceful stop (issue 402)', function () {
 		const firstPort = (first.server.address() as AddressInfo).port;
 		const registered = await request(firstPort, 'POST', '/webhooks/register', {
 			url: 'http://127.0.0.1:9/hook',
-			events: ['*']
+			events: ['*'],
+			allowPrivateNetwork: true
 		});
 		expect(registered.status).to.equal(200);
 		await first.stop();

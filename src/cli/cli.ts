@@ -420,11 +420,12 @@ function handleInit(): void {
 		// one here, the same way a fresh one does.
 		const apiToken = mintApiTokenIfAbsent(config);
 		if (apiToken) saveConfig(config);
+		// The seed is printed only when it is created: a scripted re-run
+		// would otherwise copy it into whatever logs its output.
 		output({
 			ok: true,
 			result: {
 				message: 'Config already exists',
-				mnemonic: config.mnemonic,
 				network: config.network,
 				...(apiToken ? { apiToken, note: API_TOKEN_NOTE } : {})
 			}
@@ -1750,7 +1751,7 @@ async function handleWebhooks(): Promise<void> {
 					error: {
 						code: 'INVALID_PARAMS',
 						message:
-							'Usage: beignet webhooks register <url> <event,event,...|*> [--secret <secret>]'
+							'Usage: beignet webhooks register <url> <event,event,...|*> [--secret <secret>] [--allow-private-network]'
 					}
 				});
 				process.exitCode = 1;
@@ -1763,7 +1764,8 @@ async function handleWebhooks(): Promise<void> {
 						.split(',')
 						.map((e) => e.trim())
 						.filter((e) => e.length > 0),
-					secret: parseFlag('--secret')
+					secret: parseFlag('--secret'),
+					allowPrivateNetwork: hasFlag('--allow-private-network') || undefined
 				})
 			);
 		}
@@ -3107,9 +3109,11 @@ Direct funding (a payer's on-chain payment IS this node's channel funding):
                                          is known rather than failing
 
 Webhooks (event push; see also GET /events SSE):
-  webhooks register <url> <events> [--secret S]
-                                         Register a callback URL; <events> is
-                                         comma-separated (or '*' for all)
+  webhooks register <url> <events> [--secret S] [--allow-private-network]
+                                         Register an http(s) callback URL;
+                                         <events> is comma-separated (or '*'
+                                         for all). Loopback and private hosts
+                                         need --allow-private-network
   webhooks unregister <id>               Remove a webhook
   webhooks list                          List registered webhooks
 

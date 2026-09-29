@@ -21,6 +21,12 @@ export interface RateLimitOptions {
 	 * throttle by rotating fake addresses.
 	 */
 	trustedProxies?: string[];
+	/**
+	 * Most client buckets held at once (default 100,000). Past it the least
+	 * recently seen bucket is dropped, so a caller rotating addresses faster
+	 * than buckets refill cannot grow the map without bound.
+	 */
+	maxClients?: number;
 }
 
 /**
@@ -73,17 +79,22 @@ interface TokenBucket {
 
 const DEFAULT_MAX_REQUESTS = 100;
 const DEFAULT_WINDOW_MS = 60_000;
+const DEFAULT_MAX_CLIENTS = 100_000;
 const PRUNE_INTERVAL_MS = 5 * 60_000; // 5 minutes
 
 export class HttpRateLimiter {
+	// Insertion order is recency order: isAllowed moves a key to the end, so
+	// the first entry is always the least recently seen.
 	private buckets = new Map<string, TokenBucket>();
 	private maxRequests: number;
 	private windowMs: number;
+	private maxClients: number;
 	private pruneTimer: ReturnType<typeof setInterval> | null = null;
 
 	constructor(options?: RateLimitOptions) {
 		this.maxRequests = options?.maxRequests ?? DEFAULT_MAX_REQUESTS;
 		this.windowMs = options?.windowMs ?? DEFAULT_WINDOW_MS;
+		this.maxClients = Math.max(1, options?.maxClients ?? DEFAULT_MAX_CLIENTS);
 
 		// Prune stale buckets every 5 minutes
 		this.pruneTimer = setInterval(() => this.prune(), PRUNE_INTERVAL_MS);
@@ -100,10 +111,18 @@ export class HttpRateLimiter {
 		const now = Date.now();
 		let bucket = this.buckets.get(clientKey);
 
-		if (!bucket) {
+		if (bucket) {
+			this.buckets.delete(clientKey);
+		} else {
+			// Dropping a bucket early only hands its key a full one sooner, and
+			// the least recently seen key has refilled the most anyway.
+			if (this.buckets.size >= this.maxClients) {
+				const oldest = this.buckets.keys().next().value;
+				if (oldest !== undefined) this.buckets.delete(oldest);
+			}
 			bucket = { tokens: this.maxRequests, lastRefill: now };
-			this.buckets.set(clientKey, bucket);
 		}
+		this.buckets.set(clientKey, bucket);
 
 		// Refill tokens based on elapsed time
 		const elapsed = now - bucket.lastRefill;
@@ -122,17 +141,17 @@ export class HttpRateLimiter {
 	}
 
 	/**
-	 * Remove stale entries (buckets that have been full/idle for > 2 windows).
+	 * Remove every bucket idle for a full window. Refill tops a bucket up to
+	 * maxRequests within one window, so a fresh bucket for that key is the
+	 * same bucket. The stored token count cannot be consulted instead: it is
+	 * only refilled inside isAllowed, so an idle bucket keeps whatever count
+	 * its last request left.
 	 */
 	prune(): number {
 		const now = Date.now();
-		const staleThreshold = this.windowMs * 2;
 		let pruned = 0;
 		for (const [key, bucket] of this.buckets) {
-			if (
-				now - bucket.lastRefill > staleThreshold &&
-				bucket.tokens >= this.maxRequests - 1
-			) {
+			if (now - bucket.lastRefill >= this.windowMs) {
 				this.buckets.delete(key);
 				pruned++;
 			}
