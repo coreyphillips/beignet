@@ -268,7 +268,8 @@ describe('Direct funding sender: the ownership proof form', () => {
 						offer.txid,
 						offer.vout,
 						offer.amountSat,
-						offer.receiptHash
+						offer.receiptHash,
+						h.request.nodeId
 					)
 				),
 				coin.pubkey,
@@ -331,7 +332,8 @@ describe('Direct funding sender: the ownership proof form', () => {
 			offer.sequence,
 			coin.script,
 			coin.valueSat,
-			offer.receiptHash
+			offer.receiptHash,
+			h.request.nodeId
 		);
 		const sighash = tx.hashForWitnessV0(
 			0,
@@ -363,7 +365,8 @@ describe('Direct funding sender: the ownership proof form', () => {
 			offer.sequence,
 			coin.script,
 			coin.valueSat,
-			offer.receiptHash
+			offer.receiptHash,
+			h.request.nodeId
 		);
 		const sighash = tx.hashForWitnessV1(
 			0,

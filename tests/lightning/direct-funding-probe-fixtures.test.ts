@@ -15,11 +15,13 @@ import {
 	offerFieldProblem,
 	ownershipProblem
 } from '../../src/lightning/direct-funding/receiver/verify';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	buildOffer,
 	FakeDfNode,
 	makeBip86Coin,
-	makeCoin
+	makeCoin,
+	RECEIVER_NODE_ID
 } from './helpers/df-receiver';
 
 interface IProbeFixture {
@@ -85,7 +87,7 @@ describe('Direct funding: captured CLN ownership probe signatures', () => {
 	for (const f of captured.fixtures) {
 		// Captured before the probe named the request (#1044): what CLN signed
 		// is today's probe with only the offer id in its OP_RETURN.
-		it(`${f.kind}: differs from the transaction CLN signed only by the receipt hash`, () => {
+		it(`${f.kind}: differs from the transaction CLN signed only in the OP_RETURN`, () => {
 			const offer = offerFor(f);
 			expect(
 				deriveOfferId(offer.txid, offer.vout, offer.amountSat).toString('hex')
@@ -97,10 +99,16 @@ describe('Direct funding: captured CLN ownership probe signatures', () => {
 				offer.sequence,
 				Buffer.from(f.coinScript, 'hex'),
 				offer.valueSat,
-				offer.receiptHash
+				offer.receiptHash,
+				RECEIVER_NODE_ID
 			);
 			expect(tx.outs[0].script).to.deep.equal(
-				Buffer.concat([Buffer.from([0x6a, 48]), offer.offerId, RECEIPT_HASH])
+				Buffer.concat([
+					Buffer.from([0x6a, 0x4c, 81]),
+					offer.offerId,
+					RECEIPT_HASH,
+					RECEIVER_NODE_ID
+				])
 			);
 			tx.outs[0].script = Buffer.concat([
 				Buffer.from([0x6a, 16]),
@@ -134,7 +142,11 @@ describe('Direct funding: captured CLN ownership probe signatures', () => {
 		it(`${f.kind}: refuses the captured proof, which does not name the request (#1044)`, () => {
 			const offer = decodeDfOffer(encodeDfOffer(offerFor(f)));
 			expect(
-				ownershipProblem(offer, Buffer.from(f.coinScript, 'hex'))
+				ownershipProblem(
+					offer,
+					Buffer.from(f.coinScript, 'hex'),
+					RECEIVER_NODE_ID
+				)
 			).to.equal(
 				f.kind === 'p2tr'
 					? 'invalid taproot ownership probe signature'
@@ -193,7 +205,11 @@ describe('Direct funding: ownership probe binding', () => {
 		it(`${kind}: accepts a probe signed for this offer after a wire round trip`, () => {
 			const { offer, script } = signed();
 			expect(
-				ownershipProblem(decodeDfOffer(encodeDfOffer(offer)), script)
+				ownershipProblem(
+					decodeDfOffer(encodeDfOffer(offer)),
+					script,
+					RECEIVER_NODE_ID
+				)
 			).to.equal(null);
 		});
 
@@ -203,7 +219,15 @@ describe('Direct funding: ownership probe binding', () => {
 			expect(offerFieldProblem(offer, {})).to.contain('offer id');
 			offer.offerId = deriveOfferId(offer.txid, offer.vout, offer.amountSat);
 			expect(offerFieldProblem(offer, {})).to.equal(null);
-			expect(ownershipProblem(offer, script)).not.to.equal(null);
+			expect(ownershipProblem(offer, script, RECEIVER_NODE_ID)).not.to.equal(
+				null
+			);
+		});
+
+		it(`${kind}: rejects the signature when verified by another receiver`, () => {
+			const { offer, script } = signed();
+			const other = getPublicKey(Buffer.alloc(32, 7));
+			expect(ownershipProblem(offer, script, other)).not.to.equal(null);
 		});
 
 		for (const field of [
@@ -222,7 +246,9 @@ describe('Direct funding: ownership probe binding', () => {
 				if (field === 'valueSat') offer.valueSat++;
 				if (field === 'offerId') offer.offerId[0] ^= 1;
 				if (field === 'receiptHash') offer.receiptHash[0] ^= 1;
-				expect(ownershipProblem(offer, script)).not.to.equal(null);
+				expect(ownershipProblem(offer, script, RECEIVER_NODE_ID)).not.to.equal(
+					null
+				);
 			});
 		}
 	}

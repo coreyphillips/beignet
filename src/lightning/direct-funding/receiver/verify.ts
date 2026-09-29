@@ -118,10 +118,11 @@ export function offerFieldProblem(
  * Verify that the key controlling the offered coin signed this offer. Returns
  * the decline reason, or null.
  *
- * Every form is verified over the offer's receipt hash, so a caller must
- * already have checked that hash is the request's own (the engine does, at
- * admission step 5). That is what stops a receiver that was once offered a
- * coin from replaying the proof against another receiver's request.
+ * Every form is verified over the offer's receipt hash and `receiverNodeId`,
+ * which must be this node's own id. A caller must already have checked the
+ * receipt hash is the request's own (the engine does, at admission step 5).
+ * Together they stop a receiver that was once offered a coin from replaying
+ * the proof against another receiver's request.
  *
  * Note what this does NOT buy: a proof prices nothing by itself, since one
  * UTXO can sign for arbitrarily many offers at zero cost. The admission caps
@@ -143,22 +144,24 @@ export function offerFieldProblem(
  */
 export function ownershipProblem(
 	offer: IDfOffer,
-	prevOutScript: Buffer
+	prevOutScript: Buffer,
+	receiverNodeId: Buffer
 ): string | null {
 	const kind = scriptKind(prevOutScript);
 	if (!kind) return 'unsupported input script';
 	if (offer.ownership.messageProof) {
-		return messageProofProblem(offer, prevOutScript, kind);
+		return messageProofProblem(offer, prevOutScript, kind, receiverNodeId);
 	}
 	if (offer.ownership.probeProof) {
-		return probeProofProblem(offer, prevOutScript, kind);
+		return probeProofProblem(offer, prevOutScript, kind, receiverNodeId);
 	}
 	const digest = ownershipDigest(
 		offer.offerId,
 		offer.txid,
 		offer.vout,
 		offer.amountSat,
-		offer.receiptHash
+		offer.receiptHash,
+		receiverNodeId
 	);
 	if (kind === 'p2tr') {
 		// The x-only key comes out of the scriptPubKey, never from the proof:
@@ -191,7 +194,8 @@ export function ownershipProblem(
 function probeProofProblem(
 	offer: IDfOffer,
 	prevOutScript: Buffer,
-	kind: 'p2wpkh' | 'p2tr'
+	kind: 'p2wpkh' | 'p2tr',
+	receiverNodeId: Buffer
 ): string | null {
 	const proof = offer.ownership.probeProof!;
 	if (proof.signature.length !== 64) {
@@ -204,7 +208,8 @@ function probeProofProblem(
 		offer.sequence,
 		prevOutScript,
 		offer.valueSat,
-		offer.receiptHash
+		offer.receiptHash,
+		receiverNodeId
 	);
 	if (kind === 'p2tr') {
 		const outputKey = prevOutScript.subarray(2, 2 + XONLY_PUBKEY_BYTES);
@@ -254,7 +259,8 @@ function probeProofProblem(
 function messageProofProblem(
 	offer: IDfOffer,
 	prevOutScript: Buffer,
-	kind: 'p2wpkh' | 'p2tr'
+	kind: 'p2wpkh' | 'p2tr',
+	receiverNodeId: Buffer
 ): string | null {
 	const proof = offer.ownership.messageProof!;
 	if (proof.pubkey.length !== DF_NODE_ID_BYTES) {
@@ -291,7 +297,8 @@ function messageProofProblem(
 			offer.txid,
 			offer.vout,
 			offer.amountSat,
-			offer.receiptHash
+			offer.receiptHash,
+			receiverNodeId
 		)
 	);
 	return ecdsaVerify(hash, proof.pubkey, proof.signature.subarray(1))

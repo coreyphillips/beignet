@@ -61,6 +61,11 @@ export const LSP_PUBKEY = getPublicKey(
 	crypto.createHash('sha256').update('df-lsp').digest()
 ).toString('hex');
 
+/** The node id a FakeDfNode answers with, and the one buildOffer proves to. */
+export const RECEIVER_NODE_ID = getPublicKey(
+	crypto.createHash('sha256').update('df-receiver').digest()
+);
+
 /** Let every pending microtask and zero-delay timer run. */
 export async function flush(times = 4): Promise<void> {
 	for (let i = 0; i < times; i++) {
@@ -170,7 +175,8 @@ export function signOwnershipProbeLikeAWallet(
 	coin: IDfTestCoin,
 	offerId: Buffer,
 	receiptHash: Buffer,
-	sequence = 0xfffffffd
+	sequence = 0xfffffffd,
+	receiverNodeId = RECEIVER_NODE_ID
 ): { pubkey: Buffer; signature: Buffer } {
 	const { tx, prevouts } = ownershipProbeTransaction(
 		offerId,
@@ -179,7 +185,8 @@ export function signOwnershipProbeLikeAWallet(
 		sequence,
 		coin.script,
 		coin.valueSat,
-		receiptHash
+		receiptHash,
+		receiverNodeId
 	);
 	if (coin.kind === 'p2tr') {
 		const tweaked = taprootTweakPrivateKey(coin.privkey, coin.pubkey);
@@ -211,6 +218,8 @@ export interface IDfOfferOverrides {
 	changeScript?: Buffer;
 	maxTotalFeeSat?: bigint;
 	receiptHash?: Buffer;
+	/** The receiver the proofs name, default `RECEIVER_NODE_ID`. */
+	receiverNodeId?: Buffer;
 	offerId?: Buffer;
 	ownershipSignature?: Buffer;
 	ownershipPubkey?: Buffer;
@@ -235,12 +244,14 @@ export function buildOffer(
 		overrides.offerId ?? deriveOfferId(txid, coin.vout, amountSat);
 	const receiptHash =
 		overrides.receiptHash ?? Buffer.from(record.receiptHash, 'hex');
+	const receiverNodeId = overrides.receiverNodeId ?? RECEIVER_NODE_ID;
 	const digest = ownershipDigest(
 		offerId,
 		txid,
 		coin.vout,
 		amountSat,
-		receiptHash
+		receiptHash,
+		receiverNodeId
 	);
 	const isTaproot = coin.kind === 'p2tr';
 	const messageProof = overrides.messageProof
@@ -248,7 +259,14 @@ export function buildOffer(
 				(typeof overrides.messageProof === 'object' &&
 					overrides.messageProof.privkey) ||
 					coin.privkey,
-				ownershipMessage(offerId, txid, coin.vout, amountSat, receiptHash),
+				ownershipMessage(
+					offerId,
+					txid,
+					coin.vout,
+					amountSat,
+					receiptHash,
+					receiverNodeId
+				),
 				typeof overrides.messageProof === 'object'
 					? overrides.messageProof.header
 					: undefined
@@ -259,7 +277,8 @@ export function buildOffer(
 				coin,
 				offerId,
 				receiptHash,
-				overrides.sequence
+				overrides.sequence,
+				receiverNodeId
 		  )
 		: undefined;
 	const signature =
@@ -463,6 +482,7 @@ export function memoryStorage(): {
 }
 
 export class FakeDfNode implements IDfReceiverDeps {
+	nodeId: Buffer = RECEIVER_NODE_ID;
 	readonly requests: DirectFundingRequestStore;
 	readonly transactions = new Map<string, Buffer>();
 	readonly unspent = new Map<

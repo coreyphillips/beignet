@@ -14,6 +14,7 @@ import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 
 import { BeignetCustomSubtype } from '../../src/lightning/message/custom';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { DirectFundingReceiver } from '../../src/lightning/direct-funding/receiver/engine';
 import {
 	decodeDfOfferAck,
@@ -803,6 +804,27 @@ describe('Direct funding receiver: ownership proof (issue #612)', () => {
 			).to.deep.equal({ attempts: 0 });
 
 			// The payer's own offer of the same coin is still served.
+			await h.sendOffer(buildOffer(h.payer.requestRecord, h.coin, proof));
+			expect(h.lastAck()).to.deep.equal({ accepted: true });
+			expect(h.node.opens).to.have.length(1);
+		});
+
+		it(`a ${form} proof made for another receiver's copy of this request cannot be replayed (#1044)`, async () => {
+			// Our receipt hash is public, so another receiver can sign a request
+			// of its own carrying it. The payer's proof then names our request
+			// and that receiver's node id, and it is resealed to us unchanged.
+			const h = harness();
+			const replayed = buildOffer(h.payer.requestRecord, h.coin, {
+				...proof,
+				receiverNodeId: getPublicKey(crypto.randomBytes(32))
+			});
+			await h.sendOffer(replayed);
+			expect(h.lastAck()?.reason).to.equal(reason);
+			expect(h.node.opens).to.have.length(0);
+			expect(
+				h.node.requests.attemptsFor(h.payer.requestRecord.receiptHash)
+			).to.deep.equal({ attempts: 0 });
+
 			await h.sendOffer(buildOffer(h.payer.requestRecord, h.coin, proof));
 			expect(h.lastAck()).to.deep.equal({ accepted: true });
 			expect(h.node.opens).to.have.length(1);

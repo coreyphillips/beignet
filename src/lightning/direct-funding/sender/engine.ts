@@ -380,14 +380,22 @@ export class DirectFundingSender {
 		txid: Buffer,
 		coin: IDfSenderCoin,
 		amountSat: bigint,
-		receiptHash: Buffer
+		receiptHash: Buffer,
+		receiverNodeId: Buffer
 	): Promise<IDfOffer['ownership']> {
 		if (signer.signOwnershipMessage) {
 			return {
 				pubkey: signer.ownershipPubkey,
 				signature: Buffer.alloc(64),
 				messageProof: await signer.signOwnershipMessage(
-					ownershipMessage(offerId, txid, coin.vout, amountSat, receiptHash)
+					ownershipMessage(
+						offerId,
+						txid,
+						coin.vout,
+						amountSat,
+						receiptHash,
+						receiverNodeId
+					)
 				)
 			};
 		}
@@ -399,7 +407,8 @@ export class DirectFundingSender {
 				this.cfg.sequence,
 				coin.script,
 				coin.valueSat,
-				receiptHash
+				receiptHash,
+				receiverNodeId
 			);
 			const probe = await signer.signOwnershipProbe(tx, prevouts);
 			return {
@@ -415,7 +424,14 @@ export class DirectFundingSender {
 		return {
 			pubkey: signer.ownershipPubkey,
 			signature: signer.signOwnership(
-				ownershipDigest(offerId, txid, coin.vout, amountSat, receiptHash)
+				ownershipDigest(
+					offerId,
+					txid,
+					coin.vout,
+					amountSat,
+					receiptHash,
+					receiverNodeId
+				)
 			)
 		};
 	}
@@ -735,7 +751,8 @@ export class DirectFundingSender {
 				txid,
 				coin,
 				amountSat,
-				env.receiptHash
+				env.receiptHash,
+				env.receiverNodeId
 			)
 		};
 		const offerBody = encodeDfOffer(offer);

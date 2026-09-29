@@ -831,23 +831,30 @@ export function deriveOfferId(
  * (`bitcoinMessageHash` of it, signed compact ECDSA by the coin's key, the
  * P2TR internal key included).
  *
- * The receipt hash names the request being paid. The offer id is derived
- * from the coin and amount alone, so without it a receiver that was offered
- * a coin could replay that proof against anyone else's request.
+ * The receipt hash and the receiver's node id name the request being paid.
+ * The offer id is derived from the coin and amount alone, so without them a
+ * receiver that was offered a coin could replay that proof against anyone
+ * else's request. The receipt hash alone is not enough: it is public, and a
+ * receiver can put another's into a request it signs itself. The node id is
+ * the one the payer checked signed the request, which no other node can be.
  */
 export function ownershipMessage(
 	offerId: Buffer,
 	txid: Buffer,
 	vout: number,
 	amountSat: bigint,
-	receiptHash: Buffer
+	receiptHash: Buffer,
+	receiverNodeId: Buffer
 ): string {
 	fixed(offerId, DF_OFFER_ID_BYTES, 'offer id');
 	fixed(txid, TXID_BYTES, 'txid');
 	fixed(receiptHash, DF_RECEIPT_HASH_BYTES, 'receipt hash');
+	fixed(receiverNodeId, DF_NODE_ID_BYTES, 'receiver node id');
 	return `lfbw-direct-funding-offer:${offerId.toString('hex')}:${txid.toString(
 		'hex'
-	)}:${vout}:${amountSat}:${receiptHash.toString('hex')}`;
+	)}:${vout}:${amountSat}:${receiptHash.toString(
+		'hex'
+	)}:${receiverNodeId.toString('hex')}`;
 }
 
 /** The raw digest form of `ownershipMessage`. */
@@ -856,12 +863,20 @@ export function ownershipDigest(
 	txid: Buffer,
 	vout: number,
 	amountSat: bigint,
-	receiptHash: Buffer
+	receiptHash: Buffer,
+	receiverNodeId: Buffer
 ): Buffer {
 	return crypto
 		.createHash('sha256')
 		.update(
-			ownershipMessage(offerId, txid, vout, amountSat, receiptHash),
+			ownershipMessage(
+				offerId,
+				txid,
+				vout,
+				amountSat,
+				receiptHash,
+				receiverNodeId
+			),
 			'utf8'
 		)
 		.digest();
@@ -876,9 +891,9 @@ export function ownershipDigest(
  * output exists and a transaction spending it is invalid everywhere and
  * forever. Both signature schemes commit to every input, so the signature
  * cannot be lifted into a transaction that omits the poison. The one
- * output is an OP_RETURN of the offer id and then the receipt hash, value
- * zero: the receipt hash binds the probe to one request, as it does
- * `ownershipMessage`.
+ * output is an OP_RETURN of the offer id, the receipt hash and the
+ * receiver's node id, value zero: the last two bind the probe to one request,
+ * as they do `ownershipMessage`.
  *
  * The poison's prevout is defined too (value 0, an OP_RETURN), because a
  * taproot sighash commits to every prevout's value and script.
@@ -890,7 +905,8 @@ export function ownershipProbeTransaction(
 	sequence: number,
 	coinScript: Buffer,
 	coinValueSat: bigint,
-	receiptHash: Buffer
+	receiptHash: Buffer,
+	receiverNodeId: Buffer
 ): {
 	tx: bitcoin.Transaction;
 	prevouts: { scripts: Buffer[]; values: bigint[] };
@@ -898,16 +914,24 @@ export function ownershipProbeTransaction(
 	fixed(offerId, DF_OFFER_ID_BYTES, 'offer id');
 	fixed(txid, TXID_BYTES, 'txid');
 	fixed(receiptHash, DF_RECEIPT_HASH_BYTES, 'receipt hash');
+	fixed(receiverNodeId, DF_NODE_ID_BYTES, 'receiver node id');
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
 	tx.locktime = 0;
 	tx.addInput(Buffer.from(txid).reverse(), vout, sequence);
 	tx.addInput(ownershipProbePoisonTxid(offerId), 0, sequence);
+	// 81 bytes is past a direct push, hence OP_PUSHDATA1 (0x4c). The probe is
+	// never broadcast, so the 80-byte relay policy does not apply.
 	tx.addOutput(
 		Buffer.concat([
-			Buffer.from([0x6a, DF_OFFER_ID_BYTES + DF_RECEIPT_HASH_BYTES]),
+			Buffer.from([
+				0x6a,
+				0x4c,
+				DF_OFFER_ID_BYTES + DF_RECEIPT_HASH_BYTES + DF_NODE_ID_BYTES
+			]),
 			offerId,
-			receiptHash
+			receiptHash,
+			receiverNodeId
 		]),
 		0
 	);

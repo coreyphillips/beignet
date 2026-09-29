@@ -25767,6 +25767,7 @@ export class LightningNode extends EventEmitter {
 		const receiver = new DirectFundingReceiver(
 			{
 				signMessage: (message) => this.signMessage(message),
+				nodeId: Buffer.from(this.getNodeId(), 'hex'),
 				requests,
 				chain: {
 					getTransaction: (txid) =>
