@@ -2374,6 +2374,46 @@ describe('Guardian core: retain floor (issue #1028)', () => {
 		makeGuardian(0, file, (a) => later.push(a)).close();
 		expect(later).to.deep.equal([]);
 	});
+
+	it('rolls back a floor row copied from a state the writer never named', () => {
+		const file = path.join(dir, 'copied.sqlite');
+		const guardian = makeGuardian(0, file);
+		const chain = holdingSeven(guardian);
+		guardian.putState({ record: chain[7], retainFloor: floorAt(chain[4]) });
+		guardian.close();
+		// The head's own receipt as the floor, and every record gone.
+		const raw = new Database(file);
+		const head = raw
+			.prepare(
+				'SELECT state, receipt_issued_at, receipt_signature FROM guardian_namespaces'
+			)
+			.get() as {
+			state: Buffer;
+			receipt_issued_at: Buffer;
+			receipt_signature: Buffer;
+		};
+		raw
+			.prepare(
+				'UPDATE guardian_retain_floors SET state = ?, issued_at = ?, signature = ?'
+			)
+			.run(head.state, head.receipt_issued_at, head.receipt_signature);
+		raw.prepare('DELETE FROM guardian_records').run();
+		raw.close();
+
+		const alarms: IGuardianAlarm[] = [];
+		const reopened = makeGuardian(0, file, (a) => alarms.push(a));
+		expect(alarms.map((a) => a.detail).join(' ')).to.contain(
+			'retain floor does not verify'
+		);
+		const reported = reopened.getHead({
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			recoveryId: ROOT.recoveryId
+		});
+		expect(reported.possiblyStale).to.equal(true);
+		expect((reported.state as GuardianState).logHead.sequence).to.equal(0n);
+		reopened.close();
+	});
 });
 
 describe('Guardian core: INFO', () => {

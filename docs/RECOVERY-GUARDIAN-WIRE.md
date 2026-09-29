@@ -566,16 +566,18 @@ floor back, so the writer relays what it missed from a peer (SYNC_RECORD)
 before streaming to it. The pass that qualifies the group sends it at
 once, on a record each guardian already holds. A guardian that accepts
 or duplicates the record, holds the record at F with that frame hash,
-and has not already freed through F verifies the signature (`ERR_BAD_SIGNATURE`
-refuses the whole request), deletes every record below F, orphan-archived
-ones included, and stores the state just before F with its
-own receipt signature over it, which is where its open-time walk (5.10)
-resumes. A floor it cannot act on yet (it does not hold F, or the record
-is refused) changes nothing. The freed bytes count before the quota (2.7),
-so a set already at its quota shrinks. A record below the floor is then
-answered `ERR_SEQUENCE_GAP` with the current state, and a SYNC_EPOCH whose
-certified head lies below it is `ERR_CONFLICT`. SYNC_RECORD never carries
-a floor.
+written under the current lease, and has not already freed through F
+verifies the signature (`ERR_BAD_SIGNATURE` refuses the whole request),
+deletes every record below F, orphan-archived ones included, and stores
+the state just before F with its own receipt signature over it, together
+with the writer's floor. That is where its open-time walk (5.10) resumes,
+once both signatures verify: the writer's is what tells a floor apart
+from any other state the guardian signed. A floor it cannot act on yet
+(it does not hold F, or the record is refused) changes nothing. The
+freed bytes count before the quota (2.7), so a set already at its quota
+shrinks. A record below the floor is then answered `ERR_SEQUENCE_GAP`
+with the current state, and a SYNC_EPOCH whose certified head lies below
+it is `ERR_CONFLICT`. SYNC_RECORD never carries a floor.
 
 ### 5.3 GET_HEAD
 
@@ -719,9 +721,9 @@ The operation, performed by the CURRENT writer (a confirmed lease):
    writer's barrier never waits on the incoming set before it is ready
 4. SWITCH, in one local transaction: the incoming set becomes the
    configured set, generation becomes g+1, the replication watermark
-   becomes the incoming set's; from here every frame, receipt and
-   capsule is the incoming set's, and the writer's barrier answers to
-   it
+   and retain floor (5.2) become the incoming set's; from here every
+   frame, receipt and capsule is the incoming set's, and the writer's
+   barrier answers to it
 5. ROTATE_SET to every member of the outgoing set (5.11), retried until
    at least one accepts; the outgoing namespace is RETIRED there
 ```

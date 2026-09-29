@@ -21,8 +21,10 @@ import {
 	GuardianClient,
 	GuardianHttpServer,
 	GuardianReplicator,
+	GuardianRotation,
 	GuardianTransportError,
 	IGuardianReplicationEvent,
+	IParsedGuardian,
 	GuardianState,
 	GuardianStatus,
 	IBoundGuardianClient,
@@ -79,6 +81,10 @@ const CONTEXT = { guardianSetId: SET_ID, members: GUARDIAN_IDS };
 const NODE_SECRET = sha('p5-restore-node-secret');
 const ROOT = deriveRecoveryRoot(NODE_SECRET);
 const NODE_ID = getPublicKey(NODE_SECRET);
+const JOURNAL_KEYS = {
+	masterKey: deriveRecoveryMasterKey(NODE_SECRET),
+	nodeId: NODE_ID
+};
 
 let now = 2_000_000_000_000n;
 const clock = (): bigint => ++now;
@@ -209,7 +215,8 @@ function replicatorFor(
 		context: CONTEXT,
 		required: CRASH_V1_PROFILE.required,
 		recoveryRoot: ROOT,
-		clock
+		clock,
+		journalKeys: JOURNAL_KEYS
 	});
 }
 
@@ -1588,6 +1595,124 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 		storage.close();
 	});
 
+	it('catches up a laggard even when each pass adds as much as one window', async function (): Promise<void> {
+		this.timeout(30_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		let rep: GuardianReplicator | null = null;
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId,
+			{
+				snapshotIntervalFrames: 4,
+				retainFrom: (): bigint => (rep ? rep.replicatedThrough() + 1n : 1n)
+			}
+		);
+		const manager = new RecoveryManager(storage, { journal });
+		commitTransition(manager, 0);
+		let lagging = false;
+		rep = new GuardianReplicator({
+			storage,
+			guardians: [
+				...bind(served.slice(0, 2)),
+				dropping(served[2], () => lagging)
+			],
+			context: CONTEXT,
+			required: CRASH_V1_PROFILE.required,
+			recoveryRoot: ROOT,
+			clock,
+			journalKeys: JOURNAL_KEYS,
+			pipelineWindow: 1
+		});
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		lagging = true;
+		for (let i = 1; i <= 4; i++) {
+			commitTransition(manager, i);
+			await rep.replicatePending(lease);
+			journal.compact();
+		}
+		lagging = false;
+		for (let i = 5; i <= 16; i++) {
+			commitTransition(manager, i);
+			await rep.replicatePending(lease);
+			journal.compact();
+		}
+
+		for (const entry of served) {
+			const head = (await entry.client.getHead(ROOT.recoveryId)).state!.logHead
+				.sequence;
+			expect(head).to.equal(rep.replicatedThrough());
+			const page = await entry.client.getState(ROOT.recoveryId, 0n);
+			expect(page.records![0].sequence > 1n).to.equal(true);
+		}
+		await shutdown(served);
+		storage.close();
+	});
+
+	it("carries the incoming set's proven floor through a rotation", async function (): Promise<void> {
+		this.timeout(30_000);
+		const outgoing = await Promise.all([serve(0), serve(1), serve(2)]);
+		const secrets = [4, 5, 6].map((i) => sha(`p5-restore-guardian-${i}`));
+		const ids = secrets.map((secret) => xOnlyFromSecret(secret));
+		const context = {
+			guardianSetId: computeGuardianSetId({
+				...CRASH_V1_PROFILE,
+				guardianIds: ids
+			}),
+			members: ids
+		};
+		const incoming: IServed[] = await Promise.all(
+			secrets.map(async (secret, i) => {
+				const guardian = new ReferenceGuardian({
+					path: ':memory:',
+					guardianSecret: secret,
+					members: ids,
+					clock
+				});
+				const server = new GuardianHttpServer({ guardian });
+				const port = await server.listen(0);
+				return {
+					guardian,
+					server,
+					id: ids[i],
+					client: new GuardianClient({
+						url: `http://127.0.0.1:${port}`,
+						guardianSetId: context.guardianSetId
+					})
+				};
+			})
+		);
+		const setOf = (served: IServed[]): IParsedGuardian[] =>
+			served.map((entry) => ({ guardianId: entry.id, url: entry.client.url }));
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(outgoing));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+
+		const result = await new GuardianRotation({
+			storage: live.storage,
+			recoveryRoot: ROOT,
+			lease,
+			outgoing: {
+				guardians: setOf(outgoing),
+				bound: bind(outgoing),
+				context: CONTEXT
+			},
+			incoming: { guardians: setOf(incoming), bound: bind(incoming), context },
+			required: CRASH_V1_PROFILE.required,
+			clock,
+			journalKeys: JOURNAL_KEYS
+		}).rotate();
+		expect(result.replicator.retainFloor(lease)?.sequence).to.equal(1n);
+		await shutdown([...outgoing, ...incoming]);
+		live.storage.close();
+	});
+
 	it('keeps a proven floor across a restart that writes the next snapshot', async function (): Promise<void> {
 		this.timeout(20_000);
 		const storage = openStorage();
@@ -1605,8 +1730,7 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 			);
 		const journal = journalFor();
 		const manager = new RecoveryManager(storage, { journal });
-		commitTransition(manager, 0);
-		commitTransition(manager, 1);
+		for (let i = 0; i < 3; i++) commitTransition(manager, i);
 		// Full once the frames written so far are stored.
 		const quota =
 			GUARDIAN_REGISTRATION_BYTES +
@@ -1643,7 +1767,7 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 		rep = replicatorFor(storage, guardians);
 		commitTransition(
 			new RecoveryManager(storage, { journal: journalFor() }),
-			2
+			3
 		);
 		expect((await rep.replicatePending(lease)).outcome).to.equal('replicated');
 		for (const entry of served) {
@@ -1680,6 +1804,31 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 			await shutdown(served);
 			live.storage.close();
 		}
+	});
+
+	it('names no floor from a group whose first frame is not a snapshot', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		// Both ends name the delta at 2, exactly as the journal holds it.
+		const delta =
+			live.storage.loadRecoveryFrames!()[1].frameHash.toString('hex');
+		live.storage.setRecoveryMeta!(
+			META_LAST_SNAPSHOT_GROUP,
+			JSON.stringify({
+				sequence: '2',
+				groupEnd: '2',
+				frameHash: delta,
+				endHash: delta
+			})
+		);
+		expect((await rep.replicatePending(lease)).outcome).to.equal('replicated');
+		expect(rep.retainFloor(lease)).to.equal(undefined);
+		await shutdown(served);
+		live.storage.close();
 	});
 
 	it('names no floor from a group whose last frame is not the one it names', async function (): Promise<void> {

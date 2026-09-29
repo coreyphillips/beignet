@@ -88,13 +88,16 @@ export interface IGuardianEpochRow {
 /**
  * Where a namespace's stored records begin once the writer's retain floor
  * freed the ones below (wire 5.2): the state the log stood at just before
- * the first kept record, and this guardian's receipt signature over it.
+ * the first kept record, this guardian's receipt signature over it, and
+ * the writer's signed floor that allowed it.
  */
 export interface IGuardianRetainFloorRow {
 	recoveryId: Buffer;
 	state: Buffer;
 	issuedAt: Buffer;
 	signature: Buffer;
+	frameHash: Buffer;
+	writerSignature: Buffer;
 }
 
 export interface IGuardianOrphanRow {
@@ -196,7 +199,9 @@ CREATE TABLE IF NOT EXISTS guardian_retain_floors (
 	recovery_id BLOB PRIMARY KEY,
 	state BLOB NOT NULL,
 	issued_at BLOB NOT NULL,
-	signature BLOB NOT NULL
+	signature BLOB NOT NULL,
+	frame_hash BLOB NOT NULL,
+	writer_signature BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS guardian_usage (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -770,6 +775,8 @@ export class GuardianStore {
 					state: Buffer;
 					issued_at: Buffer;
 					signature: Buffer;
+					frame_hash: Buffer;
+					writer_signature: Buffer;
 			  }
 			| undefined;
 		return row
@@ -777,7 +784,9 @@ export class GuardianStore {
 					recoveryId: row.recovery_id,
 					state: row.state,
 					issuedAt: row.issued_at,
-					signature: row.signature
+					signature: row.signature,
+					frameHash: row.frame_hash,
+					writerSignature: row.writer_signature
 			  }
 			: null;
 	}
@@ -786,10 +795,18 @@ export class GuardianStore {
 		this.db
 			.prepare(
 				`INSERT OR REPLACE INTO guardian_retain_floors (
-					recovery_id, state, issued_at, signature
-				) VALUES (?, ?, ?, ?)`
+					recovery_id, state, issued_at, signature, frame_hash,
+					writer_signature
+				) VALUES (?, ?, ?, ?, ?, ?)`
 			)
-			.run(row.recoveryId, row.state, row.issuedAt, row.signature);
+			.run(
+				row.recoveryId,
+				row.state,
+				row.issuedAt,
+				row.signature,
+				row.frameHash,
+				row.writerSignature
+			);
 	}
 
 	deleteRetainFloor(recoveryId: Buffer): void {
@@ -952,7 +969,17 @@ const CONTENT_COLUMNS: ReadonlyArray<[string, string[]]> = [
 			'receipt_signature'
 		]
 	],
-	['guardian_retain_floors', ['recovery_id', 'state', 'issued_at', 'signature']]
+	[
+		'guardian_retain_floors',
+		[
+			'recovery_id',
+			'state',
+			'issued_at',
+			'signature',
+			'frame_hash',
+			'writer_signature'
+		]
+	]
 ];
 
 /** The tables a retain floor frees below (wire 5.2). */

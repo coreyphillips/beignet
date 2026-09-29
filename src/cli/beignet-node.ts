@@ -5610,6 +5610,10 @@ export class BeignetNode extends EventEmitter {
 					...bindGuardianSet(incoming, { transportFor })
 				},
 				required: CRASH_V1_PROFILE.required,
+				journalKeys: {
+					masterKey: deriveRecoveryMasterKey(this.nodeSecret()),
+					nodeId: getPublicKey(this.nodeSecret())
+				},
 				onEvent: (event) => this.noteRotationEvent(event),
 				onReplicationEvent: (event) => {
 					this.log('debug', `Rotation replication: ${event.type}`, {

@@ -672,13 +672,18 @@ export const GUARDIAN_REGISTRATION_BYTES =
  */
 export const GUARDIAN_EPOCH_ROW_MAX_BYTES =
 	32 + 8 + 32 + (192 + 8 + 64) + (192 + 8 + 64);
-/** A retain floor row: the recovery_id, the state, its issue time and signature. */
-export const GUARDIAN_RETAIN_FLOOR_BYTES = 32 + 192 + 8 + 64;
+/**
+ * A retain floor row: the recovery_id, the state, its issue time and
+ * signature, and the writer's frame hash and signature.
+ */
+export const GUARDIAN_RETAIN_FLOOR_BYTES = 32 + 192 + 8 + 64 + 32 + 64;
 
 /** What accepting a writer's retain floor would free and store (wire 5.2). */
 interface IRetainPlan {
 	/** The first sequence kept. */
 	start: bigint;
+	/** The writer's floor, kept so the row answers to the writer's key. */
+	floor: IGuardianRetainFloor;
 	/** The state just before `start`, where the open-time walk resumes. */
 	checkpoint: GuardianState;
 	/** Content bytes of the records below `start`, orphans included. */
@@ -1510,8 +1515,11 @@ export class ReferenceGuardian {
 	 * guardian free (wire 5.2), or null when it frees nothing here yet. The
 	 * floor must name a record this guardian holds, above what it already
 	 * freed, by the frame hash it holds there, and carry the current lease's
-	 * signature. A floor this guardian cannot act on is not an error: a
-	 * lagging member meets it before it holds the snapshot.
+	 * signature. That lease must also have written the record, so the floor
+	 * row, which starts at that record's lease, can be checked against the
+	 * writer's signature on every open. A floor this guardian cannot act on
+	 * is not an error: a lagging member meets it before it holds the
+	 * snapshot.
 	 */
 	private retainPlan(
 		ns: IGuardianNamespaceRow,
@@ -1531,7 +1539,14 @@ export class ReferenceGuardian {
 			ns.recoveryId,
 			u64be(floor.sequence - 1n)
 		);
-		if (!kept || !last || !kept.frameHash.equals(floor.frameHash)) return null;
+		if (
+			!kept ||
+			!last ||
+			!kept.frameHash.equals(floor.frameHash) ||
+			readU64be(kept.epoch) !== state.lease.epoch
+		) {
+			return null;
+		}
 		const transcript = retainTranscriptHash(this.guardianSetId, {
 			recoveryId: ns.recoveryId,
 			epoch: state.lease.epoch,
@@ -1550,20 +1565,17 @@ export class ReferenceGuardian {
 				'writer signature over the RETAIN transcript failed'
 			);
 		}
-		const keptLease = this.store.getEpoch(ns.recoveryId, kept.epoch);
-		if (!keptLease) {
-			throw new Error('stored record references an unknown epoch');
-		}
 		const held = this.store.getRetainFloor(ns.recoveryId);
 		return {
 			start: floor.sequence,
+			floor,
 			// The walk's state as it reaches the first kept record: that
 			// record's lease, and the head of the record before it.
 			checkpoint: {
 				recoveryId: Buffer.from(state.recoveryId),
 				lease: {
-					epoch: readU64be(kept.epoch),
-					writerPublicKey: Buffer.from(keptLease.writerPublicKey)
+					epoch: state.lease.epoch,
+					writerPublicKey: Buffer.from(state.lease.writerPublicKey)
 				},
 				origin: state.origin,
 				logHead: {
@@ -1590,7 +1602,9 @@ export class ReferenceGuardian {
 			recoveryId: Buffer.from(recoveryId),
 			state: stateBytes(plan.checkpoint),
 			issuedAt: u64be(receipt.issuedAt),
-			signature: receipt.signature
+			signature: receipt.signature,
+			frameHash: Buffer.from(plan.floor.frameHash),
+			writerSignature: Buffer.from(plan.floor.writerSignature)
 		});
 		charge(plan.rowDelta - plan.freed);
 	}
@@ -2989,8 +3003,11 @@ export class ReferenceGuardian {
 	/**
 	 * The stored retain floor, judged on its own terms like every persisted
 	 * artifact: this guardian's receipt signature over a non-genesis state
-	 * of this namespace from its root-committed origin. Null when none is
-	 * stored; 'invalid' when one is and it does not verify.
+	 * of this namespace from its root-committed origin, and that state's
+	 * writer's RETAIN signature over the record just after it. The writer's
+	 * is what makes it a floor: this guardian signs many states, and any of
+	 * them would otherwise stand in for the records below it. Null when
+	 * none is stored; 'invalid' when one is and it does not verify.
 	 */
 	private storedRetainFloor(
 		recoveryId: Buffer,
@@ -3019,6 +3036,19 @@ export class ReferenceGuardian {
 				),
 				row.signature,
 				this.guardianId
+			) ||
+			!isLen(row.frameHash, 32) ||
+			!isLen(row.writerSignature, 64) ||
+			!validU64(state.logHead.sequence + 1n) ||
+			!this.safeVerify(
+				retainTranscriptHash(this.guardianSetId, {
+					recoveryId,
+					epoch: state.lease.epoch,
+					sequence: state.logHead.sequence + 1n,
+					frameHash: row.frameHash
+				}),
+				row.writerSignature,
+				state.lease.writerPublicKey
 			)
 		) {
 			return 'invalid';

@@ -554,6 +554,30 @@ export function readTipDurability(
 }
 
 /**
+ * The page count a stored frame's snapshot declares (0 when unpaged), or
+ * null when the frame does not decrypt and hash to a snapshot.
+ */
+export function readSnapshotPageCount(
+	row: IStoredRecoveryFrame,
+	masterKey: Buffer,
+	nodeId: Buffer
+): number | null {
+	try {
+		const writerEpoch = BigInt(row.writerEpoch);
+		const plaintext = decryptFrame(
+			deriveFrameKey(masterKey, nodeId, writerEpoch),
+			row.ciphertext,
+			frameAad(nodeId, writerEpoch, BigInt(row.sequence), row.previousFrameHash)
+		);
+		if (!hashFrame(plaintext).equals(row.frameHash)) return null;
+		const snapshot = decodeFrame(plaintext).snapshot;
+		return snapshot ? snapshot.pageFrames ?? 0 : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
  * Decide the mode this journal will actually stamp, enforcing the ONE rule
  * that keeps the wire-safety proof honest: quorum is STICKY.
  *
