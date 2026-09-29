@@ -40,6 +40,7 @@ interface Ledger {
 	_pendingSpendSats: number;
 	_dailySpendResetTime: number;
 	_asyncSpendClaims: Map<string, unknown>;
+	_liveRebalanceChargeSats: number;
 	_draining: boolean;
 	logLevel: string;
 }
@@ -71,6 +72,7 @@ function fakeNode<T extends object>(
 		_pendingSpendSats: 0,
 		_dailySpendResetTime: Date.now() + 24 * 60 * 60 * 1000,
 		_asyncSpendClaims: new Map(),
+		_liveRebalanceChargeSats: 0,
 		_draining: false,
 		logLevel: 'silent'
 	};
@@ -100,6 +102,7 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 			timesOut?: boolean;
 			tornDown?: boolean;
 			crossesMidnight?: boolean;
+			duringCall?: () => void;
 			feeSpentMsat?: bigint;
 			budgetSatsPerDay?: number;
 		} = {}
@@ -115,6 +118,7 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 			node.engineCalls++;
 			node.spentDuringCall.push(node._dailySpentSats);
 			if (engine.crossesMidnight) node._dailySpendResetTime = Date.now() - 1;
+			engine.duringCall?.();
 			if (engine.fails) throw new Error('No circular route');
 			if (engine.timesOut) {
 				throw new PaymentWaitTimeoutError(
@@ -251,6 +255,17 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 		expect(node.persisted[node.persisted.length - 1]).to.equal(5_000);
 	});
 
+	it('charges the new day the fee of a rebalance that crossed midnight', async () => {
+		const node = rebalancingNode(
+			{ daily: 100_000 },
+			{ feeMsat: 500_000n, crossesMidnight: true }
+		);
+		await node.rebalanceChannel(CHANNEL_A, CHANNEL_B, 100_000, 5_000);
+		expect(node._dailySpentSats).to.equal(500);
+		expect(node._dailySpentLightningSats).to.equal(500);
+		expect(node._liveRebalanceChargeSats).to.equal(0);
+	});
+
 	it('leaves maxPaymentSats out of a rebalance', async () => {
 		const node = rebalancingNode({ maxPayment: 1_000 }, { feeMsat: 10_000n });
 		const result = await node.rebalanceChannel(
@@ -327,6 +342,29 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 		);
 		await node.executeRebalances(1_500);
 		expect(node._dailySpentSats).to.equal(700);
+	});
+
+	it('keeps a live run charged on the new day it crosses into', async () => {
+		let concurrent: unknown;
+		const node = rebalancingNode(
+			{ daily: 1_000 },
+			{
+				feeSpentMsat: 500_000n,
+				crossesMidnight: true,
+				duringCall: () => {
+					try {
+						(
+							node as unknown as { _checkSpendLimit(sats: number): void }
+						)._checkSpendLimit(1_000);
+					} catch (err) {
+						concurrent = err;
+					}
+				}
+			}
+		);
+		await node.executeRebalances(1_000);
+		expect(concurrent).to.be.instanceOf(BeignetError);
+		expect(node._dailySpentSats).to.equal(500);
 	});
 });
 

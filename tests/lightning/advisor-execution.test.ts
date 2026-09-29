@@ -28,6 +28,7 @@ import {
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
+import { MessageType } from '../../src/lightning/message/types';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
 	planRebalances,
@@ -556,6 +557,42 @@ describe('Advisor Execution (M3 phases 1+2)', function () {
 				expect(
 					alice.listPayments().filter((p) => p.status === 'PENDING')
 				).to.deep.equal([]);
+			} finally {
+				setup.destroy();
+			}
+		});
+
+		it('waits out a dispatch that throws once its HTLC is out', async function () {
+			const setup = setupCircular();
+			const { alice, abChannelId, caChannelId } = setup;
+			try {
+				alice.prependListener(
+					'message:outbound',
+					(_pubkey: string, type: number) => {
+						if (type === MessageType.UPDATE_ADD_HTLC) {
+							throw new Error('transport failed');
+						}
+					}
+				);
+				let error: unknown;
+				try {
+					await alice.rebalanceChannel({
+						fromChannelId: abChannelId,
+						toChannelId: caChannelId,
+						amountSats: 100_000n,
+						maxFeeSats: 10n,
+						timeoutMs: 50
+					});
+				} catch (err) {
+					error = err;
+				}
+				// Timed out rather than failed, so the fee cap is not given back.
+				expect(error).to.be.instanceOf(PaymentWaitTimeoutError);
+				expect(
+					alice
+						.listPayments()
+						.filter((p) => p.direction === 'OUTGOING' && p.status === 'PENDING')
+				).to.have.length(1);
 			} finally {
 				setup.destroy();
 			}

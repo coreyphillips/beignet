@@ -13864,13 +13864,27 @@ export class LightningNode extends EventEmitter {
 			hops: hops.length
 		});
 
-		this.sendPaymentToRoute(
-			{ hops },
-			invoice.paymentHash,
-			finalCltvExpiry,
-			invoice.paymentSecret,
-			amountMsat
-		);
+		try {
+			this.sendPaymentToRoute(
+				{ hops },
+				invoice.paymentHash,
+				finalCltvExpiry,
+				invoice.paymentSecret,
+				amountMsat
+			);
+		} catch (err) {
+			// A throw from addHtlc (the outbound transport, say) can come with
+			// the HTLC already on the channel beside its record. Unless that
+			// record failed, the HTLC can settle, so its outcome is waited for
+			// rather than reported as a failure.
+			const sent = this.payments.get(invoice.paymentHash.toString('hex'));
+			if (
+				sent?.direction !== PaymentDirection.OUTGOING ||
+				sent.status === PaymentStatus.FAILED
+			) {
+				throw err;
+			}
+		}
 		await this.waitForPayment(invoice.paymentHash, options.timeoutMs ?? 60_000);
 
 		this.emitStructuredLog('payment', 'rebalance_succeeded', {
@@ -14008,12 +14022,13 @@ export class LightningNode extends EventEmitter {
 					});
 					continue;
 				}
+				const maxFeeSats = feeCapMsat / 1000n;
 				try {
 					const result = await this.rebalanceChannel({
 						fromChannelId: Buffer.from(plan.fromChannelId, 'hex'),
 						toChannelId: Buffer.from(plan.toChannelId, 'hex'),
 						amountSats: plan.amountSats,
-						maxFeeSats: feeCapMsat / 1000n
+						maxFeeSats
 					});
 					this.recordRebalanceSpend(result.feeMsat);
 					feeSpentThisRunMsat += result.feeMsat;
@@ -14028,8 +14043,8 @@ export class LightningNode extends EventEmitter {
 					// Its HTLC can still settle, and nothing would charge it then,
 					// so the cap is spent now and the next pair cannot reuse it.
 					if (err instanceof PaymentWaitTimeoutError) {
-						this.recordRebalanceSpend(feeCapMsat);
-						feeSpentThisRunMsat += feeCapMsat;
+						this.recordRebalanceSpend(maxFeeSats * 1000n);
+						feeSpentThisRunMsat += maxFeeSats * 1000n;
 					}
 					attempts.push({
 						fromChannelId: plan.fromChannelId,

@@ -2066,6 +2066,12 @@ export class BeignetNode extends EventEmitter {
 	 * either of them can be the one that settles.
 	 */
 	private readonly _asyncSpendClaims = new Map<string, AsyncSpendClaim[]>();
+	/**
+	 * The up-front charges of the rebalances still running, which a new UTC
+	 * day starts with. In memory only: after a restart the charge stays with
+	 * the day it was persisted to.
+	 */
+	private _liveRebalanceChargeSats = 0;
 	private _maxPaymentSats?: number;
 	/**
 	 * Paid L402 credentials, so a gated API is paid for once rather than per
@@ -9548,6 +9554,15 @@ export class BeignetNode extends EventEmitter {
 			this._dailySpentSats = 0;
 			this._dailySpentLightningSats = 0;
 			this._dailySpentOnchainSats = 0;
+			// A rebalance still out can spend in the new day, so its up-front
+			// charge carries over until _refundSpend settles it.
+			if (
+				this._dailySpendLimitSats !== undefined &&
+				this._liveRebalanceChargeSats > 0
+			) {
+				this._dailySpentSats = this._liveRebalanceChargeSats;
+				this._dailySpentLightningSats = this._liveRebalanceChargeSats;
+			}
 			if (persist) this._persistSpendState();
 		}
 	}
@@ -9655,22 +9670,17 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
-	 * Gives back what a Lightning charge made up front did not spend, to the
-	 * day it was charged to (the one resetting at `resetTime`) only. Once that
-	 * day has ended its total is gone, and the new day never carried the
-	 * charge. Returns false then. A negative `sats`, a spend above the charge,
-	 * is charged in full.
+	 * Gives back what a live rebalance charge did not spend, to whichever day
+	 * carries it now. Called before the charge leaves _liveRebalanceChargeSats,
+	 * so a rollover here still carries it. A negative `sats`, a spend above the
+	 * charge, is charged in full.
 	 */
-	private _refundSpend(sats: number, resetTime: number): boolean {
-		if (this._dailySpendLimitSats === undefined) return true;
-		this._resetDailySpendIfNeeded();
-		if (this._dailySpendResetTime !== resetTime) return false;
-		if (sats !== 0) {
-			this._dailySpentSats -= sats;
-			this._dailySpentLightningSats -= sats;
-			this._persistSpendState();
-		}
-		return true;
+	private _refundSpend(sats: number): void {
+		if (this._dailySpendLimitSats === undefined) return;
+		this._resetDailySpendIfNeeded(false);
+		this._dailySpentSats -= sats;
+		this._dailySpentLightningSats -= sats;
+		this._persistSpendState();
 	}
 
 	/**
@@ -12783,7 +12793,7 @@ export class BeignetNode extends EventEmitter {
 		// the HTLC can still settle.
 		this._checkSpendLimit(maxFeeSats);
 		this._recordSpend(maxFeeSats);
-		const chargedUntil = this._dailySpendResetTime;
+		this._liveRebalanceChargeSats += maxFeeSats;
 		let spentSats = maxFeeSats;
 		try {
 			const result = await this.node.rebalanceChannel({
@@ -12810,9 +12820,8 @@ export class BeignetNode extends EventEmitter {
 			if (!(err instanceof PaymentWaitTimeoutError)) spentSats = 0;
 			throw err;
 		} finally {
-			if (!this.destroyed) {
-				this._refundSpend(maxFeeSats - spentSats, chargedUntil);
-			}
+			if (!this.destroyed) this._refundSpend(maxFeeSats - spentSats);
+			this._liveRebalanceChargeSats -= maxFeeSats;
 		}
 	}
 
@@ -12840,7 +12849,7 @@ export class BeignetNode extends EventEmitter {
 		const holdSats = this.node.rebalanceBudgetSatsPerDay(budgetSatsPerDay);
 		this._checkSpendLimit(holdSats);
 		this._recordSpend(holdSats);
-		const chargedUntil = this._dailySpendResetTime;
+		this._liveRebalanceChargeSats += holdSats;
 		let spentSats = holdSats;
 		let summary: IRebalanceExecutionSummary;
 		try {
@@ -12855,15 +12864,11 @@ export class BeignetNode extends EventEmitter {
 			throw err;
 		} finally {
 			// A teardown can cut a wait short with its HTLC out, which the
-			// summary does not count, so the whole charge stands then.
-			if (
-				!this.destroyed &&
-				!this._refundSpend(holdSats - spentSats, chargedUntil)
-			) {
-				// The run crossed midnight, where the engine's budget started
-				// over. The old day's charge does not cover what it spent since.
-				this._recordSpend(spentSats);
-			}
+			// summary does not count, so the whole charge stands then. A run
+			// that crossed midnight, where the engine's budget started over,
+			// leaves the new day charged all it spent.
+			if (!this.destroyed) this._refundSpend(holdSats - spentSats);
+			this._liveRebalanceChargeSats -= holdSats;
 		}
 		return {
 			attempts: summary.attempts.map((a) => ({
