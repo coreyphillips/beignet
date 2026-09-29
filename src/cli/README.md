@@ -1391,7 +1391,7 @@ All output is JSON. Add `--pretty` for indented output.
 
 ```bash
 beignet init [--network regtest] [--alias mynode]
-beignet start [--port 2112] [--host 0.0.0.0] [--daemon] [--anchors] [--api-token mysecret] \
+beignet start [--port 2112] [--host 0.0.0.0] [--daemon] [--anchors] [--api-token <token>] \
   [--backup-path /path/to/backup.db] [--backup-interval 21600000] \
   [--daily-spend-limit 100000] [--tls-cert /path/cert.pem] [--tls-key /path/key.pem] \
   [--htlc-events] [--log-level info]
@@ -1409,7 +1409,9 @@ carries neither `apiToken` nor `apiKeys` and the environment supplies neither
 `config.json` and printed once, as `apiToken` with a `note` on how to send it;
 an existing token or key set is left alone and never printed. Running `init`
 on a config an older release wrote (mnemonic, no credential) adds a token the
-same way. `beignet start` with no credential at all keeps running but warns
+same way. The mnemonic is printed only by the `init` that creates it; a
+re-run answers `Config already exists` without it. `beignet start` with no
+credential at all keeps running but warns
 on stderr: `authentication is off: any local process can drive this daemon;
 run beignet init or set apiToken`.
 
@@ -2082,6 +2084,10 @@ When any credential is configured, all endpoints require an `Authorization: Bear
 - `GET /openapi.json` -- API discovery
 - `GET /metrics` -- Prometheus scrapers, only with `metricsPublic` (it reports balances)
 
+These still count against the rate limiter when `rateLimit` is configured.
+
+A daemon bound beyond loopback refuses to start when the `apiToken` or any `apiKeys` secret is shorter than 16 characters, unless `insecure` is set: there the credential is the only lock, and the rate limiter is off unless configured. Prefer `BEIGNET_API_TOKEN` or the config file to `--api-token`, whose value any local user can read from the process list.
+
 Every install `beignet init` creates carries an `apiToken` (see [Setup](#setup)). If neither `apiToken` nor `apiKeys` is configured (a config written by hand or by a release before 0.22.0's successor), all endpoints are open to local processes, `GET /mnemonic` excepted (it needs auth, and `admin`), the daemon logs a warning at boot, and three browser guards keep a web page from driving it (issue #1005):
 
 | Guard | Refusal |
@@ -2281,6 +2287,8 @@ Per-HTLC events (`htlc:forwarded`, `htlc:fulfilled`, `htlc:failed`) are relayed 
 
 A keepalive comment (`: keepalive`) is sent every 30 seconds to prevent proxy timeouts.
 
+At most 16 streams per credential (and 64 in all) are open at once; another is refused with 429 `RATE_LIMITED`. A client that stops reading is disconnected once more than 1 MB is waiting for it.
+
 ### Webhooks
 
 For agent frameworks that prefer callbacks over persistent connections, register webhook URLs:
@@ -2302,7 +2310,9 @@ curl -X DELETE http://localhost:2112/webhooks/unregister \
   -d '{"id": "abc123..."}'
 ```
 
-Webhook deliveries are POST requests with JSON body `{ event, data, timestamp }`. When a `secret` is configured, an `X-Webhook-Signature: sha256=<hmac>` header is included for payload verification. Webhooks are persisted to SQLite and survive daemon restarts. Note: HMAC secrets are stored as hashes — re-register with a secret after restart if HMAC verification is needed.
+Webhook deliveries are POST requests with JSON body `{ event, data, timestamp }`. When a `secret` is configured, an `X-Webhook-Signature: sha256=<hmac>` header is included for payload verification. Webhooks and their secrets are persisted to SQLite (the secrets in the encrypted wallet data, and only when storage encryption is on) and survive daemon restarts. A registration stored by an earlier release kept only a hash of its secret, and delivers unsigned until it is registered again.
+
+The `url` must be `http:` or `https:`. A loopback, private (RFC 1918, CGNAT, unique-local) or link-local host is refused with 403 `PRIVATE_NETWORK_REFUSED` unless the request sets `"allowPrivateNetwork": true` (CLI: `--allow-private-network`), the same opt-in as `POST /l402/fetch`. Payloads omit the payment `preimage` that `payment:sent` and `payment:received` carry over SSE; read it from `GET /payment`.
 
 Registering with `"events": ["*"]` matches every relayed event, including the invoice, channel-lifecycle, and (when `--htlc-events` is enabled) HTLC events, plus any event types added in future versions. The event list matches the SSE list above.
 

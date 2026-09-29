@@ -783,8 +783,8 @@ await node.gracefulShutdown();
 - **CORS**: Only enable if needed, specify exact origin
 - **Spending Limits**: Set `dailySpendLimitSats` to cap daily agent spending
 - **Idempotency Keys**: Use `X-Idempotency-Key` header on payment requests to prevent duplicates
-- **Webhook Secrets**: Use HMAC-SHA256 verification (secrets are hashed in storage, never stored plaintext)
-- **Rate Limiting**: Enable `rateLimit` option to protect against runaway agent loops (429 `RATE_LIMITED` response). Health endpoints are exempt; `/metrics` is auth-gated (it reports balances) unless `metricsPublic` is set. Buckets are keyed on the connecting address, so behind a reverse proxy all clients share one bucket unless you list the proxy's IP in `rateLimit.trustedProxies`, which keys on the client address the proxy reports via `X-Forwarded-For`. Never front the daemon with a proxy you do not control when the limiter matters: the header is only trusted from listed addresses.
+- **Webhook Secrets**: Use HMAC-SHA256 verification (the webhook rows hold only a hash; the secret itself is kept in the encrypted wallet data so deliveries stay signed across restarts)
+- **Rate Limiting**: Enable `rateLimit` option to protect against runaway agent loops (429 `RATE_LIMITED` response). Every route counts, the unauthenticated health and spec endpoints included; `/metrics` is auth-gated (it reports balances) unless `metricsPublic` is set. Buckets are keyed on the connecting address, so behind a reverse proxy all clients share one bucket unless you list the proxy's IP in `rateLimit.trustedProxies`, which keys on the client address the proxy reports via `X-Forwarded-For`. Never front the daemon with a proxy you do not control when the limiter matters: the header is only trusted from listed addresses.
 
 ## Mainnet Checklist
 

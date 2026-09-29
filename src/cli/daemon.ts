@@ -24,7 +24,12 @@ import { BeignetError } from './errors';
 import { L402Error } from '../lightning/l402';
 import { ApiResponse, PaymentInfo, RouteHop, SpliceResult } from './types';
 import { getOpenApiSpec } from './openapi';
-import { IWebhookStorage, WebhookManager } from './webhooks';
+import {
+	IWebhookStorage,
+	WEBHOOK_SECRETS_STORAGE_KEY,
+	WebhookManager,
+	webhookTargetRefusal
+} from './webhooks';
 import {
 	HttpRateLimiter,
 	RateLimitOptions,
@@ -69,6 +74,12 @@ export interface DaemonOptions extends BeignetNodeOptions {
 }
 
 const MAX_BODY_BYTES = 1_048_576; // 1 MB
+const MIN_EXPOSED_CREDENTIAL_LENGTH = 16;
+// Open GET /events streams, per credential and in all, and the backlog a
+// stream may hold before it is dropped.
+const SSE_MAX_CLIENTS_PER_KEY = 16;
+const SSE_MAX_CLIENTS = 64;
+const SSE_MAX_BUFFERED_BYTES = 1_048_576;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 // The CachedResponse entries that carry a paymentHash, and the keyed payments
@@ -168,10 +179,17 @@ export async function parseBody(
 	return new Promise((resolve, reject) => {
 		const chunks: Buffer[] = [];
 		let totalBytes = 0;
+		let overLimit = false;
 		req.on('data', (chunk: Buffer) => {
+			if (overLimit) return;
 			totalBytes += chunk.length;
 			if (totalBytes > MAX_BODY_BYTES) {
-				req.destroy();
+				// The rest is read and dropped rather than the socket destroyed,
+				// which reset the connection before the 413 could be written.
+				// Closing right after the answer does the same to a client
+				// still sending: the reset discards the 413 it has not read.
+				overLimit = true;
+				chunks.length = 0;
 				reject(
 					new BeignetError(
 						'BODY_TOO_LARGE',
@@ -183,6 +201,7 @@ export async function parseBody(
 			chunks.push(chunk);
 		});
 		req.on('end', () => {
+			if (overLimit) return;
 			if (chunks.length === 0) {
 				resolve({});
 				return;
@@ -199,7 +218,7 @@ export async function parseBody(
 			}
 		});
 		req.on('error', () => {
-			// Stream was destroyed due to body size limit
+			// The client went away mid-body; no one is left to read the answer.
 			reject(
 				new BeignetError(
 					'BODY_TOO_LARGE',
@@ -833,6 +852,23 @@ async function bootDaemon(
 			`Refusing to bind ${host} without authentication. Configure apiToken or apiKeys, or set insecure: true to accept the risk.`
 		);
 	}
+	// Beyond loopback a guessable credential is the only lock, and the rate
+	// limiter that would slow the guessing is off unless configured.
+	const shortCredential = [
+		opts.apiToken,
+		...(opts.apiKeys ?? []).map((k) => k.key)
+	].some(
+		(secret) =>
+			typeof secret === 'string' &&
+			secret.length > 0 &&
+			secret.length < MIN_EXPOSED_CREDENTIAL_LENGTH
+	);
+	if (!isLoopbackHost && shortCredential && opts.insecure !== true) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			`Refusing to bind ${host} with an apiToken or apiKeys secret shorter than ${MIN_EXPOSED_CREDENTIAL_LENGTH} characters. Use a longer random secret (openssl rand -hex 32), or set insecure: true to accept the risk.`
+		);
+	}
 	if (opts.cors === true && !authenticator.enabled && opts.insecure !== true) {
 		throw new BeignetError(
 			'INVALID_PARAMS',
@@ -1234,7 +1270,21 @@ async function bootDaemon(
 			node.getStorage().saveWebhook(id, url, events, secretHash, createdAt),
 		deleteWebhook: (id) => node.getStorage().deleteWebhook(id),
 		deleteAllWebhooks: () => node.getStorage().deleteAllWebhooks(),
-		loadAllWebhooks: () => node.getStorage().loadAllWebhooks()
+		loadAllWebhooks: () => node.getStorage().loadAllWebhooks(),
+		// With storage encryption off the secrets stay in memory, as the
+		// writer lease keeps its key out of an unencrypted file.
+		saveWebhookSecrets: (secrets) => {
+			const storage = node.getStorage();
+			if (!storage.secretsEncryptedAtRest()) return;
+			storage.saveWalletData(
+				WEBHOOK_SECRETS_STORAGE_KEY,
+				JSON.stringify(secrets)
+			);
+		},
+		loadWebhookSecrets: () => {
+			const raw = node.getStorage().loadWalletData(WEBHOOK_SECRETS_STORAGE_KEY);
+			return raw === null ? null : (JSON.parse(raw) as Record<string, string>);
+		}
 	};
 	const webhookManager = new WebhookManager(webhookStorage);
 	// The node's queue, the one this process runs over the payment_queue
@@ -1449,7 +1499,6 @@ async function bootDaemon(
 		'GET /health': () => success(node.getHealth()),
 		'GET /ready': () => success({ ready: node.isReady() }),
 		'GET /readiness': () => success(node.getMainnetReadiness()),
-		'GET /openapi.json': () => getOpenApiSpec(),
 		'GET /stats': (_body, query) => {
 			const windowMs = parseIntParam(query, 'window', { min: 0 });
 			return success(node.getStats(windowMs));
@@ -3218,14 +3267,17 @@ async function bootDaemon(
 
 		// ── Webhooks ──
 		'POST /webhooks/register': (body) => {
-			const { url, events, secret } = body as {
+			const { url, events, secret, allowPrivateNetwork } = body as {
 				url: string;
 				events: string[];
 				secret?: string;
+				allowPrivateNetwork?: boolean;
 			};
 			if (!url || !events || !Array.isArray(events) || events.length === 0) {
 				return failure('INVALID_PARAMS', 'url and events array required');
 			}
+			const refusal = webhookTargetRefusal(url, allowPrivateNetwork === true);
+			if (refusal) throw refusal;
 			return success(webhookManager.register(url, events, secret));
 		},
 		'DELETE /webhooks/unregister': (body) => {
@@ -3303,7 +3355,21 @@ async function bootDaemon(
 	routes['POST /channel/update-fee'] =
 		routes['POST /channel/update-commitment-feerate'];
 
-	const sseClients: Set<http.ServerResponse> = new Set();
+	// Open event streams, each with the credential it authenticated as.
+	const sseClients = new Map<http.ServerResponse, string>();
+	// Node buffers every frame for a client that stops reading, so one that
+	// has fallen too far behind is dropped instead of written to.
+	const sseWrite = (client: http.ServerResponse, chunk: string): void => {
+		if (client.destroyed) return;
+		if (client.writableLength > SSE_MAX_BUFFERED_BYTES) {
+			client.destroy();
+			return;
+		}
+		client.write(chunk);
+	};
+
+	// Serialized once: the route needs no credential, and the spec is 155 kB.
+	const openApiJson = Buffer.from(JSON.stringify(getOpenApiSpec()));
 
 	const corsOrigin =
 		opts.cors === true ? '*' : typeof opts.cors === 'string' ? opts.cors : null;
@@ -3438,10 +3504,11 @@ async function bootDaemon(
 		// caller-controlled and varying it would mint a fresh bucket per
 		// guess. X-Forwarded-For is honored only from configured
 		// trustedProxies; otherwise a proxy's clients share its bucket.
+		// Auth-exempt routes count too: they are the ones anyone can call.
 		const authExempt =
 			AUTH_EXEMPT_ROUTES.has(routeKey) ||
 			(routeKey === 'GET /metrics' && opts.metricsPublic === true);
-		if (rateLimiter && !authExempt) {
+		if (rateLimiter) {
 			const clientKey = clientKeyForRequest(
 				req.socket.remoteAddress,
 				req.headers['x-forwarded-for'],
@@ -3457,6 +3524,7 @@ async function bootDaemon(
 
 		// ── SSE endpoint ──
 		if (routeKey === 'GET /events') {
+			let streamKey = 'unauthenticated';
 			if (authenticator.enabled) {
 				const auth = authenticator.authenticate(req.headers['authorization']);
 				if (!auth.ok) {
@@ -3479,6 +3547,26 @@ async function bootDaemon(
 					);
 					return;
 				}
+				streamKey = auth.keyName === null ? 'apiToken' : `key:${auth.keyName}`;
+			}
+			const sameKey = [...sseClients.values()].filter(
+				(key) => key === streamKey
+			).length;
+			if (
+				sseClients.size >= SSE_MAX_CLIENTS ||
+				sameKey >= SSE_MAX_CLIENTS_PER_KEY
+			) {
+				res.setHeader('Content-Type', 'application/json');
+				res.statusCode = 429;
+				res.end(
+					JSON.stringify(
+						failure(
+							'RATE_LIMITED',
+							`Too many open event streams (at most ${SSE_MAX_CLIENTS_PER_KEY} per credential, ${SSE_MAX_CLIENTS} in all)`
+						)
+					)
+				);
+				return;
 			}
 			const sseHeaders: Record<string, string> = {
 				'Content-Type': 'text/event-stream',
@@ -3495,10 +3583,10 @@ async function bootDaemon(
 			// SSE comment line: parsers ignore it; flushes headers to the client
 			// immediately instead of buffering until the first event/keepalive.
 			res.write(': connected\n\n');
-			sseClients.add(res);
+			sseClients.set(res, streamKey);
 			// Send keepalive every 30s to prevent proxy timeouts
 			const keepalive = setInterval(() => {
-				res.write(': keepalive\n\n');
+				sseWrite(res, ': keepalive\n\n');
 			}, 30_000);
 			req.on('close', () => {
 				clearInterval(keepalive);
@@ -3590,6 +3678,12 @@ async function bootDaemon(
 		if (routeKey === 'GET /metrics') {
 			res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
 			res.end(node.getMetrics());
+			return;
+		}
+
+		if (routeKey === 'GET /openapi.json') {
+			res.setHeader('Content-Length', openApiJson.length);
+			res.end(openApiJson);
 			return;
 		}
 
@@ -3847,7 +3941,7 @@ async function bootDaemon(
 			// SSE responses hold their sockets open indefinitely; destroy them
 			// so the server can actually finish closing. destroy() fires each
 			// request's close handler, which clears its keepalive interval.
-			for (const client of sseClients) {
+			for (const client of sseClients.keys()) {
 				client.destroy();
 			}
 			sseClients.clear();
@@ -3862,8 +3956,8 @@ async function bootDaemon(
 		node.on(eventName, (data: unknown) => {
 			if (sseClients.size === 0) return;
 			const message = formatSseFrame(eventName, data);
-			for (const client of sseClients) {
-				client.write(message);
+			for (const client of sseClients.keys()) {
+				sseWrite(client, message);
 			}
 		});
 	}

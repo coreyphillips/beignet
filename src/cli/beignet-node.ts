@@ -162,6 +162,7 @@ import {
 } from '../lightning/direct-funding';
 import { directFundingWallet } from './direct-funding';
 import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from './auth';
+import { WEBHOOK_SECRETS_STORAGE_KEY } from './webhooks';
 import {
 	INodeConfig,
 	InvalidRequestError,
@@ -5294,9 +5295,10 @@ export class BeignetNode extends EventEmitter {
 	 * Daemon-local state that lives in the database beside the channel
 	 * state, and must follow the operator into the restored one: persisted
 	 * API-key rotations and revocations (a dropped override resurrects a
-	 * revoked secret), registered webhooks, the payment queue's rows (the
-	 * queue outlives an in-process resume and updates them later, issue
-	 * #978), and the peer addresses just used to retrieve the capsules (so
+	 * revoked secret), registered webhooks and their HMAC secrets, the
+	 * payment queue's rows (the queue outlives an in-process resume and
+	 * updates them later, issue #978), and the peer addresses just used to
+	 * retrieve the capsules (so
 	 * the restored node dials its channel peers on its own), and the daily
 	 * spend ledger (a resume must not hand the day's allowance back, issue
 	 * #977). The auth override is mandatory; the rest is best effort and
@@ -5316,6 +5318,10 @@ export class BeignetNode extends EventEmitter {
 					hook.secretHash,
 					hook.createdAt
 				);
+			}
+			const secrets = from.loadWalletData(WEBHOOK_SECRETS_STORAGE_KEY);
+			if (secrets !== null) {
+				to.saveWalletData(WEBHOOK_SECRETS_STORAGE_KEY, secrets);
 			}
 		} catch (err) {
 			this.log('warn', 'Could not carry webhooks into the restore', {
