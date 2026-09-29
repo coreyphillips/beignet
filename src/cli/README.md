@@ -74,7 +74,7 @@ const node = await BeignetNode.create({
   dataDir?: string,         // SQLite + data dir (default: ~/.beignet/data)
   electrumHost?: string,    // Electrum server host
   electrumPort?: number,    // Electrum server port
-  electrumTls?: boolean,    // use TLS for Electrum
+  electrumTls?: boolean,    // use TLS for Electrum (encrypted, but the server certificate is not verified)
   listenPort?: number,      // listen for inbound Lightning connections
   preferAnchors?: boolean,  // anchor channels (default: true); set false for legacy static_remotekey
   autoBootstrap?: boolean,  // auto-connect to DNS seed peers on start

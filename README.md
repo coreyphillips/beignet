@@ -160,6 +160,7 @@ const res = await Wallet.create({
 ```
 
 - **Failover:** with multiple servers the wallet rotates through them in order on connect/reconnect failure, then through hardcoded fallback peers for the network, with a per-server cooldown so dead servers are not hammered. Inspect `wallet.electrum.currentServer` and `wallet.electrum.rotationCount`.
+- **Certificate verification:** by default a TLS Electrum connection is encrypted but the server certificate is not checked, because the client library dials with `rejectUnauthorized: false`. An on-path attacker can therefore stand in for the server. On Node, pass `tls: withTlsVerification(tls)` to accept only certificates that chain to a trusted CA and match the host, and add `{ fingerprints: ['AB:CD:…'] }` to also accept self-signed servers by SHA-256 fingerprint (`openssl x509 -noout -fingerprint -sha256`). The CLI/daemon and React Native do not verify yet.
 - **Fee source:** `'electrum'` queries only the connected server via `blockchain.estimatefee`, so fee lookups never leak to mempool.space/blocktank over clearnet. `'auto'` prefers Electrum and falls back to HTTP. All remote rates are clamped to 5000 sat/vB.
 - **Networks:** mainnet, testnet, regtest and signet work end to end (wallet, Electrum, CLI/daemon `--network signet`, Lightning chain hash and `tbs` invoice prefix). Signet shares testnet address formats and coin type 1.
 - **BIP21:** `encodeBip21({ address, amountSats?, label?, message? })` builds a `bitcoin:` URI.
