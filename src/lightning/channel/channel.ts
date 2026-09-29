@@ -72,6 +72,7 @@ import {
 	calculateClosingFee,
 	closingTxWeight,
 	closingTxRelayProfile,
+	closingOutputDustLimit,
 	minRelayFeeForWeight
 } from '../chain/closing';
 import {
@@ -7967,7 +7968,7 @@ export class Channel {
 		if (isOpener) {
 			// Reserve our dust limit so an accepted fee can neither drop our output
 			// nor consume it down to a dust remnant.
-			const dust = this._state.localConfig.dustLimitSatoshis;
+			const dust = this.ownClosingOutputDustLimit();
 			if (openerBalanceSat < msg.feeSatoshis + dust) {
 				return this._failChannelWithWireError(
 					`Taproot closing fee ${msg.feeSatoshis} leaves our output below dust (balance ${openerBalanceSat}, dust ${dust})`
@@ -8111,9 +8112,19 @@ export class Channel {
 				this._state.remoteShutdownScript ?? PLACEHOLDER_SHUTDOWN_SCRIPT,
 			localAmount: isOpener ? localSat - feeSatoshis : localSat,
 			remoteAmount: isOpener ? remoteSat : remoteSat - feeSatoshis,
+			localDustLimit: this._state.localConfig.dustLimitSatoshis,
+			remoteDustLimit: this._state.remoteConfig.dustLimitSatoshis,
 			isTaproot: isTaprootChannel(this._state.channelType)
 		});
 		return feePaid >= minRelayFeeForWeight(weight);
+	}
+
+	/** Smallest amount our output keeps in the legacy closing tx. */
+	private ownClosingOutputDustLimit(): bigint {
+		return closingOutputDustLimit(
+			this._state.localShutdownScript ?? PLACEHOLDER_SHUTDOWN_SCRIPT,
+			this._state.localConfig.dustLimitSatoshis
+		);
 	}
 
 	private initClosingFeeRange(idealFee: bigint): void {
@@ -8130,7 +8141,7 @@ export class Channel {
 			? this._state.localBalanceMsat / 1000n
 			: this._state.remoteBalanceMsat / 1000n;
 		if (isOpener) {
-			const dust = this._state.localConfig.dustLimitSatoshis;
+			const dust = this.ownClosingOutputDustLimit();
 			openerBalance = openerBalance > dust ? openerBalance - dust : 0n;
 		}
 		this._state.closingFeeMin = min;
