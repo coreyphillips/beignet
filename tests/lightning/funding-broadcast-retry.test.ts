@@ -418,17 +418,10 @@ describe('Funding broadcast retry', function () {
 		alice.openChannel(bob.getNodeId(), 500_000n);
 		await tick();
 		expect(pendingMap(alice).has(fundingTxidHex)).to.equal(true);
-		// Renewed at authorization, before the broadcast spends the inputs: an
-		// eviction ahead of the first block must find them still pledged
-		// (issue #1159).
-		expect(renewed, 'the authorization renewed its pledges').to.deep.equal([
-			fundingTxHex
-		]);
 
 		alice.handleNewBlock(600);
 		await tick();
 		expect(renewed, 'the retained tx renewed its pledges').to.deep.equal([
-			fundingTxHex,
 			fundingTxHex
 		]);
 
@@ -436,7 +429,7 @@ describe('Funding broadcast retry', function () {
 		// rather than left to time out under the obligation.
 		alice.handleNewBlock(601);
 		await tick();
-		expect(renewed).to.deep.equal([fundingTxHex, fundingTxHex, fundingTxHex]);
+		expect(renewed).to.deep.equal([fundingTxHex, fundingTxHex]);
 
 		alice.destroy();
 		bob.destroy();

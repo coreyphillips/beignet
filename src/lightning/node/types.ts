@@ -116,16 +116,16 @@ export interface IFundingProvider {
 	 *
 	 * A funding (or splice) transaction is retained and retried until it
 	 * CONFIRMS, which can outlast the pledge that reserved its inputs: the
-	 * provider frees a selection pledge on a timeout, and again when the wallet
-	 * stops listing the coin, so a mempool eviction hands the inputs back
-	 * unspent AND unfrozen. Either way a later funding or an ordinary wallet
-	 * send can double-spend the transaction we still owe the network. The node
-	 * calls this when a funding broadcast is authorized, then once per block and
-	 * once at startup for every retained transaction, so a pledge lives exactly
-	 * as long as the obligation it protects; when the obligation retires the
-	 * calls stop and the pledge ages out as usual.
+	 * provider frees a pledge on a timeout, so a broadcast still failing after
+	 * it, or a mempool eviction, hands the inputs back unspent AND unfrozen.
+	 * Either way a later funding or an ordinary wallet send can double-spend
+	 * the transaction we still owe the network. The node calls this once per
+	 * block and once at startup for every retained transaction, so a pledge
+	 * lives exactly as long as the obligation it protects; when the obligation
+	 * retires the calls stop and the pledge ages out as usual.
 	 *
-	 * A renewed pledge must outlive the spend of its coin, and a renewal must
+	 * A pledge must outlive the spend of its coin, renewed yet or not (the
+	 * first renewal can come a block after the broadcast), and a renewal must
 	 * hold an input the wallet does not list yet (a startup before the first
 	 * refresh). A reorg or eviction can hand the coin back between calls, and
 	 * it has to come back frozen.

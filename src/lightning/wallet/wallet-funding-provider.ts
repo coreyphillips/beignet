@@ -162,20 +162,20 @@ export class WalletFundingProvider implements IFundingProvider {
 
 	/**
 	 * Outpoints pledged to an in-flight funding, keyed txid:vout with the
-	 * pledge time. A pledged coin is frozen in the wallet until either the
-	 * funding tx spends it or PLEDGE_TTL_MS passes (the funding session was
-	 * abandoned before broadcast). Pledge freezes persist in the wallet with
-	 * PLEDGE_TAG; on restart, tagged entries this instance does not know are
-	 * adopted with their original timestamp so they age out through the same
-	 * TTL and spent pruning instead of locking coins forever after a crash.
+	 * pledge time. A pledged coin is frozen in the wallet until PLEDGE_TTL_MS
+	 * passes (the funding session was abandoned before broadcast), or, once
+	 * the funding tx spends it, until renewals stop. Pledge freezes persist in
+	 * the wallet with PLEDGE_TAG; on restart, tagged entries this instance
+	 * does not know are adopted with their original timestamp so they age out
+	 * through the same pruning instead of locking coins forever after a crash.
 	 */
 	private pledged = new Map<string, number>();
 	/**
-	 * Pledges last renewed by pledgeTransactionInputs, i.e. held for a
-	 * transaction the node is still obligated to broadcast rather than for a
-	 * funding session that may simply have been abandoned. These outlive the
-	 * spend of their coin: a reorg or eviction can hand it back while the
-	 * transaction is still owed.
+	 * Pledges last renewed by pledgeTransactionInputs, or whose coin a prune
+	 * found spent, i.e. held for a transaction the node is still obligated to
+	 * broadcast rather than for a funding session that may simply have been
+	 * abandoned. These outlive the spend of their coin: a reorg or eviction
+	 * can hand it back while the transaction is still owed.
 	 */
 	private renewedPledges = new Set<string>();
 	private adoptedStale = false;
@@ -346,11 +346,10 @@ export class WalletFundingProvider implements IFundingProvider {
 	}
 
 	/**
-	 * Unfreeze pledges that timed out, and selection pledges whose coin is
-	 * spent. A renewed pledge ends only by timing out or by an explicit
-	 * release: the transaction it is held for is still owed, and a reorg or
-	 * eviction that hands the coin back must find it frozen rather than wait
-	 * for the owner's next renewal.
+	 * Unfreeze pledges that timed out. A pledge ends only by timing out or by
+	 * an explicit release, never by the spend of its coin: the transaction it
+	 * is held for is still owed, and a reorg or eviction that hands the coin
+	 * back must find it frozen rather than wait for the owner's next renewal.
 	 */
 	private async prunePledges(): Promise<void> {
 		this.adoptStalePledges();
@@ -376,9 +375,16 @@ export class WalletFundingProvider implements IFundingProvider {
 			const sep = key.lastIndexOf(':');
 			const txid = key.slice(0, sep);
 			const vout = Number(key.slice(sep + 1));
-			const spent = !renewed && !live.has(key);
-			const expired = now - ts > ttl;
-			if (spent || expired) {
+			// The freeze kept every other spender off the coin, so its spend is
+			// the pledged transaction going out, owed until it confirms. The
+			// owner's first renewal can be a block away, so the pledge carries on
+			// as a renewed one rather than ending here.
+			if (!renewed && !live.has(key)) {
+				this.pledged.set(key, now);
+				this.renewedPledges.add(key);
+				continue;
+			}
+			if (now - ts > ttl) {
 				const released = await this.releasePledge(txid, vout);
 				// A refused unfreeze keeps the coin frozen, so keep the entry
 				// that the next prune retries it from. Forgetting it here would

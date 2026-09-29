@@ -289,7 +289,7 @@ describe('Funding input pledges', function () {
 		expect(outpoints(inputs)).to.include(`${utxos[0].tx_hash}:0`);
 	});
 
-	it('re-freezes an input a mempool eviction handed back', async function () {
+	it('an input a mempool eviction hands back stays pledged before any renewal (issue #1159)', async function () {
 		const { wallet, utxos, frozen, payment } = makeWallet([100_000, 100_000]);
 		const key = `${utxos[0].tx_hash}:0`;
 		const spend = new bitcoin.Transaction();
@@ -305,21 +305,15 @@ describe('Funding input pledges', function () {
 		await provider.buildFundingTransaction(payment.address!, 90_000n);
 		expect(frozen.has(key), 'the built tx pledged its input').to.equal(true);
 
-		// The broadcast landed: the wallet stops listing the coin and the next
-		// selection prunes the pledge as spent.
+		// The broadcast landed: the wallet stops listing the coin, and the next
+		// selection prunes before anything has renewed the pledge.
 		const evicted = utxos.splice(0, 1)[0];
 		await provider.selectSpliceInputs!(50_000n, 1000);
-		expect(frozen.has(key)).to.equal(false);
+		expect(frozen.has(key), 'the spend did not end the pledge').to.equal(true);
 
-		// The funding tx is evicted from the mempool: the coin comes back
-		// unspent AND unfrozen, with the broadcast still owed.
+		// The funding tx is evicted from the mempool with the broadcast still
+		// owed, and a selection runs ahead of the owner's first renewal.
 		utxos.unshift(evicted);
-		await provider.pledgeTransactionInputs(spend.toHex());
-		expect(
-			frozen.has(key),
-			'the renewal re-froze the resurrected coin'
-		).to.equal(true);
-
 		let error = '';
 		try {
 			await provider.selectSpliceInputs!(80_000n, 1000);
@@ -751,15 +745,18 @@ describe('Funding input pledges', function () {
 			await provider.buildFundingTransaction(payment.address!, 90_000n);
 			expect(frozen.has(key)).to.equal(true);
 
-			// The funding confirmed, so the pledge is due to be pruned, but the
-			// wallet refuses the write that would lift it.
+			// The funding confirmed and its last renewal was an hour ago, so the
+			// pledge is due to be pruned, but the wallet refuses the write that
+			// would lift it.
 			utxos.splice(0, 1);
+			await provider.pledgeTransactionInputs(spend.toHex());
+			const pledged = (provider as unknown as { pledged: Map<string, number> })
+				.pledged;
+			pledged.set(key, Date.now() - 61 * 60_000);
 			const realUnfreeze = wallet.unfreezeUtxo;
 			(wallet as { unfreezeUtxo: unknown }).unfreezeUtxo = async () =>
 				errResult('storage is down');
 			await provider.selectSpliceInputs!(50_000n, 1000);
-			const pledged = (provider as unknown as { pledged: Map<string, number> })
-				.pledged;
 			expect(frozen.has(key), 'the coin is still frozen').to.equal(true);
 			expect(pledged.has(key), 'kept for the retry').to.equal(true);
 
