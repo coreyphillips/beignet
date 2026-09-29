@@ -56,6 +56,7 @@ import { Channel, ISpliceWalletInput } from '../channel/channel';
 import { isValidShutdownScript } from '../channel/validation';
 import {
 	estimateSpliceTxWeight,
+	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../channel/splice-weight';
 import {
@@ -12637,7 +12638,8 @@ export class LightningNode extends EventEmitter {
 		// here: encoding happens AFTER the channel has moved to SPLICING and
 		// persisted, so a throw there leaves the channel wedged until restart.
 		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
-			min: 1
+			min: 1,
+			max: MAX_SPLICE_FEERATE_PERKW
 		});
 		if (feeErr) throw new InvalidSpliceError(feeErr);
 		if (fundingUtxos) {
@@ -12809,7 +12811,8 @@ export class LightningNode extends EventEmitter {
 		// Same reason as spliceIn: splice_init encodes the feerate as a u32
 		// AFTER the channel has moved to SPLICING, so a late throw wedges it.
 		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
-			min: 1
+			min: 1,
+			max: MAX_SPLICE_FEERATE_PERKW
 		});
 		if (feeErr) throw new InvalidSpliceError(feeErr);
 		if (!Array.isArray(inputs) || inputs.length === 0) {
@@ -13216,7 +13219,8 @@ export class LightningNode extends EventEmitter {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new InvalidSpliceError(cidErr);
 		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
-			min: 1
+			min: 1,
+			max: MAX_SPLICE_FEERATE_PERKW
 		});
 		if (feeErr) throw new InvalidSpliceError(feeErr);
 		const channel = this.channelManager.getChannel(channelId);
@@ -13306,7 +13310,8 @@ export class LightningNode extends EventEmitter {
 		// here: encoding happens AFTER the channel has moved to SPLICING and
 		// persisted, so a throw there leaves the channel wedged until restart.
 		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
-			min: 1
+			min: 1,
+			max: MAX_SPLICE_FEERATE_PERKW
 		});
 		if (feeErr) throw new InvalidSpliceError(feeErr);
 		if (
