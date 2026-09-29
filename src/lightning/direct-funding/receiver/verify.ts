@@ -118,6 +118,11 @@ export function offerFieldProblem(
  * Verify that the key controlling the offered coin signed this offer. Returns
  * the decline reason, or null.
  *
+ * Every form is verified over the offer's receipt hash, so a caller must
+ * already have checked that hash is the request's own (the engine does, at
+ * admission step 5). That is what stops a receiver that was once offered a
+ * coin from replaying the proof against another receiver's request.
+ *
  * Note what this does NOT buy: a proof prices nothing by itself, since one
  * UTXO can sign for arbitrarily many offers at zero cost. The admission caps
  * bound the work; this bounds the waste, by refusing before a whole channel
@@ -152,7 +157,8 @@ export function ownershipProblem(
 		offer.offerId,
 		offer.txid,
 		offer.vout,
-		offer.amountSat
+		offer.amountSat,
+		offer.receiptHash
 	);
 	if (kind === 'p2tr') {
 		// The x-only key comes out of the scriptPubKey, never from the proof:
@@ -197,7 +203,8 @@ function probeProofProblem(
 		offer.vout,
 		offer.sequence,
 		prevOutScript,
-		offer.valueSat
+		offer.valueSat,
+		offer.receiptHash
 	);
 	if (kind === 'p2tr') {
 		const outputKey = prevOutScript.subarray(2, 2 + XONLY_PUBKEY_BYTES);
@@ -279,7 +286,13 @@ function messageProofProblem(
 		return 'ownership message key does not control the offered coin';
 	}
 	const hash = bitcoinMessageHash(
-		ownershipMessage(offer.offerId, offer.txid, offer.vout, offer.amountSat)
+		ownershipMessage(
+			offer.offerId,
+			offer.txid,
+			offer.vout,
+			offer.amountSat,
+			offer.receiptHash
+		)
 	);
 	return ecdsaVerify(hash, proof.pubkey, proof.signature.subarray(1))
 		? null

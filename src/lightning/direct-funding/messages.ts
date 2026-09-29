@@ -830,18 +830,24 @@ export function deriveOfferId(
  * for P2WPKH, Schnorr for P2TR key path), or as a Bitcoin signed message
  * (`bitcoinMessageHash` of it, signed compact ECDSA by the coin's key, the
  * P2TR internal key included).
+ *
+ * The receipt hash names the request being paid. The offer id is derived
+ * from the coin and amount alone, so without it a receiver that was offered
+ * a coin could replay that proof against anyone else's request.
  */
 export function ownershipMessage(
 	offerId: Buffer,
 	txid: Buffer,
 	vout: number,
-	amountSat: bigint
+	amountSat: bigint,
+	receiptHash: Buffer
 ): string {
 	fixed(offerId, DF_OFFER_ID_BYTES, 'offer id');
 	fixed(txid, TXID_BYTES, 'txid');
+	fixed(receiptHash, DF_RECEIPT_HASH_BYTES, 'receipt hash');
 	return `lfbw-direct-funding-offer:${offerId.toString('hex')}:${txid.toString(
 		'hex'
-	)}:${vout}:${amountSat}`;
+	)}:${vout}:${amountSat}:${receiptHash.toString('hex')}`;
 }
 
 /** The raw digest form of `ownershipMessage`. */
@@ -849,11 +855,15 @@ export function ownershipDigest(
 	offerId: Buffer,
 	txid: Buffer,
 	vout: number,
-	amountSat: bigint
+	amountSat: bigint,
+	receiptHash: Buffer
 ): Buffer {
 	return crypto
 		.createHash('sha256')
-		.update(ownershipMessage(offerId, txid, vout, amountSat), 'utf8')
+		.update(
+			ownershipMessage(offerId, txid, vout, amountSat, receiptHash),
+			'utf8'
+		)
 		.digest();
 }
 
@@ -866,7 +876,9 @@ export function ownershipDigest(
  * output exists and a transaction spending it is invalid everywhere and
  * forever. Both signature schemes commit to every input, so the signature
  * cannot be lifted into a transaction that omits the poison. The one
- * output is an OP_RETURN of the offer id, value zero.
+ * output is an OP_RETURN of the offer id and then the receipt hash, value
+ * zero: the receipt hash binds the probe to one request, as it does
+ * `ownershipMessage`.
  *
  * The poison's prevout is defined too (value 0, an OP_RETURN), because a
  * taproot sighash commits to every prevout's value and script.
@@ -877,20 +889,26 @@ export function ownershipProbeTransaction(
 	vout: number,
 	sequence: number,
 	coinScript: Buffer,
-	coinValueSat: bigint
+	coinValueSat: bigint,
+	receiptHash: Buffer
 ): {
 	tx: bitcoin.Transaction;
 	prevouts: { scripts: Buffer[]; values: bigint[] };
 } {
 	fixed(offerId, DF_OFFER_ID_BYTES, 'offer id');
 	fixed(txid, TXID_BYTES, 'txid');
+	fixed(receiptHash, DF_RECEIPT_HASH_BYTES, 'receipt hash');
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
 	tx.locktime = 0;
 	tx.addInput(Buffer.from(txid).reverse(), vout, sequence);
 	tx.addInput(ownershipProbePoisonTxid(offerId), 0, sequence);
 	tx.addOutput(
-		Buffer.concat([Buffer.from([0x6a, DF_OFFER_ID_BYTES]), offerId]),
+		Buffer.concat([
+			Buffer.from([0x6a, DF_OFFER_ID_BYTES + DF_RECEIPT_HASH_BYTES]),
+			offerId,
+			receiptHash
+		]),
 		0
 	);
 	return {

@@ -169,6 +169,7 @@ export function signOwnershipMessageLikeAWallet(
 export function signOwnershipProbeLikeAWallet(
 	coin: IDfTestCoin,
 	offerId: Buffer,
+	receiptHash: Buffer,
 	sequence = 0xfffffffd
 ): { pubkey: Buffer; signature: Buffer } {
 	const { tx, prevouts } = ownershipProbeTransaction(
@@ -177,7 +178,8 @@ export function signOwnershipProbeLikeAWallet(
 		coin.vout,
 		sequence,
 		coin.script,
-		coin.valueSat
+		coin.valueSat,
+		receiptHash
 	);
 	if (coin.kind === 'p2tr') {
 		const tweaked = taprootTweakPrivateKey(coin.privkey, coin.pubkey);
@@ -231,21 +233,34 @@ export function buildOffer(
 	const txid = Buffer.from(coin.txidHex, 'hex');
 	const offerId =
 		overrides.offerId ?? deriveOfferId(txid, coin.vout, amountSat);
-	const digest = ownershipDigest(offerId, txid, coin.vout, amountSat);
+	const receiptHash =
+		overrides.receiptHash ?? Buffer.from(record.receiptHash, 'hex');
+	const digest = ownershipDigest(
+		offerId,
+		txid,
+		coin.vout,
+		amountSat,
+		receiptHash
+	);
 	const isTaproot = coin.kind === 'p2tr';
 	const messageProof = overrides.messageProof
 		? signOwnershipMessageLikeAWallet(
 				(typeof overrides.messageProof === 'object' &&
 					overrides.messageProof.privkey) ||
 					coin.privkey,
-				ownershipMessage(offerId, txid, coin.vout, amountSat),
+				ownershipMessage(offerId, txid, coin.vout, amountSat, receiptHash),
 				typeof overrides.messageProof === 'object'
 					? overrides.messageProof.header
 					: undefined
 		  )
 		: undefined;
 	const probeProof = overrides.probeProof
-		? signOwnershipProbeLikeAWallet(coin, offerId, overrides.sequence)
+		? signOwnershipProbeLikeAWallet(
+				coin,
+				offerId,
+				receiptHash,
+				overrides.sequence
+		  )
 		: undefined;
 	const signature =
 		overrides.ownershipSignature ??
@@ -265,8 +280,7 @@ export function buildOffer(
 			overrides.changeScript ??
 			bitcoin.payments.p2wpkh({ hash: crypto.randomBytes(20) }).output!,
 		maxTotalFeeSat: overrides.maxTotalFeeSat ?? 2_000n,
-		receiptHash:
-			overrides.receiptHash ?? Buffer.from(record.receiptHash, 'hex'),
+		receiptHash,
 		ownership: {
 			pubkey:
 				overrides.ownershipPubkey ??

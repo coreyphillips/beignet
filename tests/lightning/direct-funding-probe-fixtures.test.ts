@@ -6,6 +6,7 @@ import * as ecc from '@bitcoinerlab/secp256k1';
 import {
 	decodeDfOffer,
 	deriveOfferId,
+	DF_PROBE_POISON_SCRIPT,
 	encodeDfOffer,
 	IDfOffer,
 	ownershipProbeTransaction
@@ -14,6 +15,12 @@ import {
 	offerFieldProblem,
 	ownershipProblem
 } from '../../src/lightning/direct-funding/receiver/verify';
+import {
+	buildOffer,
+	FakeDfNode,
+	makeBip86Coin,
+	makeCoin
+} from './helpers/df-receiver';
 
 interface IProbeFixture {
 	kind: 'p2wpkh' | 'p2tr';
@@ -37,6 +44,8 @@ const captured = JSON.parse(
 	)
 ) as { software: string; network: string; fixtures: IProbeFixture[] };
 
+const RECEIPT_HASH = Buffer.alloc(32, 1);
+
 function offerFor(f: IProbeFixture): IDfOffer {
 	const script = Buffer.from(f.coinScript, 'hex');
 	return {
@@ -48,7 +57,7 @@ function offerFor(f: IProbeFixture): IDfOffer {
 		sequence: f.sequence,
 		changeScript: script,
 		maxTotalFeeSat: 1000n,
-		receiptHash: Buffer.alloc(32, 1),
+		receiptHash: RECEIPT_HASH,
 		ownership: {
 			pubkey:
 				f.kind === 'p2tr'
@@ -74,7 +83,9 @@ describe('Direct funding: captured CLN ownership probe signatures', () => {
 	});
 
 	for (const f of captured.fixtures) {
-		it(`${f.kind}: reconstructs the exact unsigned transaction signed by CLN`, () => {
+		// Captured before the probe named the request (#1044): what CLN signed
+		// is today's probe with only the offer id in its OP_RETURN.
+		it(`${f.kind}: differs from the transaction CLN signed only by the receipt hash`, () => {
 			const offer = offerFor(f);
 			expect(
 				deriveOfferId(offer.txid, offer.vout, offer.amountSat).toString('hex')
@@ -85,8 +96,16 @@ describe('Direct funding: captured CLN ownership probe signatures', () => {
 				offer.vout,
 				offer.sequence,
 				Buffer.from(f.coinScript, 'hex'),
-				offer.valueSat
+				offer.valueSat,
+				offer.receiptHash
 			);
+			expect(tx.outs[0].script).to.deep.equal(
+				Buffer.concat([Buffer.from([0x6a, 48]), offer.offerId, RECEIPT_HASH])
+			);
+			tx.outs[0].script = Buffer.concat([
+				Buffer.from([0x6a, 16]),
+				offer.offerId
+			]);
 			expect(tx.toHex()).to.equal(f.unsignedTx);
 			for (const bytes of [f.unsignedPsbt, f.signedPsbt]) {
 				const psbt = bitcoin.Psbt.fromBase64(bytes);
@@ -106,22 +125,85 @@ describe('Direct funding: captured CLN ownership probe signatures', () => {
 			}
 		});
 
-		it(`${f.kind}: accepts the captured proof after a wire round trip`, () => {
+		it(`${f.kind}: the captured signature is valid over the transaction CLN signed`, () => {
+			expect(
+				capturedSignatureSigns(f, bitcoin.Transaction.fromHex(f.unsignedTx))
+			).to.equal(true);
+		});
+
+		it(`${f.kind}: refuses the captured proof, which does not name the request (#1044)`, () => {
 			const offer = decodeDfOffer(encodeDfOffer(offerFor(f)));
 			expect(
 				ownershipProblem(offer, Buffer.from(f.coinScript, 'hex'))
+			).to.equal(
+				f.kind === 'p2tr'
+					? 'invalid taproot ownership probe signature'
+					: 'invalid ownership probe signature'
+			);
+		});
+
+		it(`${f.kind}: the signature cannot authorize a transaction without the poison input`, () => {
+			const tx = bitcoin.Transaction.fromHex(f.unsignedTx);
+			tx.ins.pop();
+			expect(capturedSignatureSigns(f, tx)).to.equal(false);
+		});
+	}
+});
+
+/** Whether the captured signature verifies for input 0 (the coin) of `tx`. */
+function capturedSignatureSigns(
+	f: IProbeFixture,
+	tx: bitcoin.Transaction
+): boolean {
+	const signature = Buffer.from(f.proof.signature, 'hex');
+	const coinScript = Buffer.from(f.coinScript, 'hex');
+	if (f.kind === 'p2tr') {
+		const digest = tx.hashForWitnessV1(
+			0,
+			[coinScript, DF_PROBE_POISON_SCRIPT].slice(0, tx.ins.length),
+			[Number(f.coinValueSat), 0].slice(0, tx.ins.length),
+			bitcoin.Transaction.SIGHASH_DEFAULT
+		);
+		return ecc.verifySchnorr(digest, coinScript.subarray(2), signature);
+	}
+	const pubkey = Buffer.from(f.proof.pubkey, 'hex');
+	const digest = tx.hashForWitnessV0(
+		0,
+		bitcoin.payments.p2pkh({ pubkey }).output!,
+		Number(f.coinValueSat),
+		bitcoin.Transaction.SIGHASH_ALL
+	);
+	return ecc.verify(digest, pubkey, signature);
+}
+
+// Which fields a probe binds is checked on probes signed here: the captured
+// ones predate the receipt hash, so they fail even with no field changed.
+describe('Direct funding: ownership probe binding', () => {
+	for (const kind of ['p2wpkh', 'p2tr'] as const) {
+		const signed = (): { offer: IDfOffer; script: Buffer } => {
+			const coin = kind === 'p2tr' ? makeBip86Coin() : makeCoin();
+			return {
+				offer: buildOffer(new FakeDfNode().mintRequest(), coin, {
+					probeProof: true
+				}),
+				script: coin.script
+			};
+		};
+
+		it(`${kind}: accepts a probe signed for this offer after a wire round trip`, () => {
+			const { offer, script } = signed();
+			expect(
+				ownershipProblem(decodeDfOffer(encodeDfOffer(offer)), script)
 			).to.equal(null);
 		});
 
-		it(`${f.kind}: rejects a changed amount with either the stale or recomputed offer ID`, () => {
-			const offer = offerFor(f);
+		it(`${kind}: rejects a changed amount with either the stale or recomputed offer ID`, () => {
+			const { offer, script } = signed();
 			offer.amountSat++;
 			expect(offerFieldProblem(offer, {})).to.contain('offer id');
 			offer.offerId = deriveOfferId(offer.txid, offer.vout, offer.amountSat);
 			expect(offerFieldProblem(offer, {})).to.equal(null);
-			expect(
-				ownershipProblem(offer, Buffer.from(f.coinScript, 'hex'))
-			).not.to.equal(null);
+			expect(ownershipProblem(offer, script)).not.to.equal(null);
 		});
 
 		for (const field of [
@@ -129,47 +211,19 @@ describe('Direct funding: captured CLN ownership probe signatures', () => {
 			'vout',
 			'txid',
 			'valueSat',
-			'offerId'
+			'offerId',
+			'receiptHash'
 		] as const) {
-			it(`${f.kind}: rejects a captured signature after changing ${field}`, () => {
-				const offer = offerFor(f);
+			it(`${kind}: rejects the signature after changing ${field}`, () => {
+				const { offer, script } = signed();
 				if (field === 'sequence') offer.sequence--;
 				if (field === 'vout') offer.vout++;
 				if (field === 'txid') offer.txid[0] ^= 1;
 				if (field === 'valueSat') offer.valueSat++;
 				if (field === 'offerId') offer.offerId[0] ^= 1;
-				expect(
-					ownershipProblem(offer, Buffer.from(f.coinScript, 'hex'))
-				).not.to.equal(null);
+				if (field === 'receiptHash') offer.receiptHash[0] ^= 1;
+				expect(ownershipProblem(offer, script)).not.to.equal(null);
 			});
 		}
-
-		it(`${f.kind}: the signature cannot authorize a transaction without the poison input`, () => {
-			const tx = bitcoin.Transaction.fromHex(f.unsignedTx);
-			tx.ins.pop();
-			const signature = Buffer.from(f.proof.signature, 'hex');
-			const coinScript = Buffer.from(f.coinScript, 'hex');
-			if (f.kind === 'p2tr') {
-				const digest = tx.hashForWitnessV1(
-					0,
-					[coinScript],
-					[Number(f.coinValueSat)],
-					bitcoin.Transaction.SIGHASH_DEFAULT
-				);
-				expect(
-					ecc.verifySchnorr(digest, coinScript.subarray(2), signature)
-				).to.equal(false);
-			} else {
-				const pubkey = Buffer.from(f.proof.pubkey, 'hex');
-				const code = bitcoin.payments.p2pkh({ pubkey }).output!;
-				const digest = tx.hashForWitnessV0(
-					0,
-					code,
-					Number(f.coinValueSat),
-					bitcoin.Transaction.SIGHASH_ALL
-				);
-				expect(ecc.verify(digest, pubkey, signature)).to.equal(false);
-			}
-		});
 	}
 });

@@ -735,6 +735,7 @@ describe('Direct funding receiver: ownership proof (issue #612)', () => {
 		forged.ownership.probeProof = signOwnershipProbeLikeAWallet(
 			h.coin,
 			forged.offerId,
+			forged.receiptHash,
 			0xfffffffe
 		);
 		await h.sendOffer(forged);
@@ -749,7 +750,8 @@ describe('Direct funding receiver: ownership proof (issue #612)', () => {
 		});
 		wrongKey.ownership.probeProof = signOwnershipProbeLikeAWallet(
 			{ ...h.coin, privkey: other.privkey, pubkey: other.pubkey },
-			wrongKey.offerId
+			wrongKey.offerId,
+			wrongKey.receiptHash
 		);
 		await h.sendOffer(wrongKey);
 		expect(h.lastAck()?.reason).to.equal(
@@ -776,6 +778,36 @@ describe('Direct funding receiver: ownership proof (issue #612)', () => {
 			'invalid taproot ownership probe signature'
 		);
 	});
+
+	for (const [form, proof, reason] of [
+		['digest', {}, 'invalid ownership signature'],
+		['message', { messageProof: true }, 'invalid ownership message signature'],
+		['probe', { probeProof: true }, 'invalid ownership probe signature']
+	] as const) {
+		it(`a ${form} proof made for another request cannot be replayed against this one (#1044)`, async () => {
+			// Another receiver was offered this coin, so it holds a valid proof.
+			// Relabelled with our receipt hash, it must not reserve the coin or
+			// spend one of the request's lifetime attempts.
+			const h = harness();
+			const elsewhere = new FakeDfNode().mintRequest();
+			const replayed = buildOffer(elsewhere, h.coin, proof);
+			replayed.receiptHash = Buffer.from(
+				h.payer.requestRecord.receiptHash,
+				'hex'
+			);
+			await h.sendOffer(replayed);
+			expect(h.lastAck()?.reason).to.equal(reason);
+			expect(h.node.opens).to.have.length(0);
+			expect(
+				h.node.requests.attemptsFor(h.payer.requestRecord.receiptHash)
+			).to.deep.equal({ attempts: 0 });
+
+			// The payer's own offer of the same coin is still served.
+			await h.sendOffer(buildOffer(h.payer.requestRecord, h.coin, proof));
+			expect(h.lastAck()).to.deep.equal({ accepted: true });
+			expect(h.node.opens).to.have.length(1);
+		});
+	}
 
 	it('a receiver that predates the message form declines on the zeroed digest', async () => {
 		// The odd TLV is invisible to it, so all it sees is a digest signature

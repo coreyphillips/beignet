@@ -1,6 +1,6 @@
 # Direct-funding ownership proofs
 
-A receiver validates the offer's fields and proves control of its named input before starting channel negotiation. Proofs authorize this offer only. The sender separately verifies the complete funding transaction before returning a spendable witness.
+A receiver validates the offer's fields and proves control of its named input before starting channel negotiation. Proofs authorize this offer, for this request, only. The sender separately verifies the complete funding transaction before returning a spendable witness.
 
 The sender selects a signed-message proof when available, then a transaction probe, then the original digest proof. Receivers reject malformed proofs that are present; they do not fall back to a different proof form. Support demonstrated here is specific to the tested signing RPC and coin type. Hardware-wallet or other PSBT signer support requires its own verification.
 
@@ -14,12 +14,14 @@ The sender selects a signed-message proof when available, then a transaction pro
 
 The receiver checks this derivation before checking ownership. Thus the probe's offer ID also binds the requested amount. It also checks the actual previous output's value and script against the offer. Calling the ownership helper alone does not replace these field and chain checks.
 
+The offer ID names the coin and amount, not the request. Every proof form therefore also signs the offer's 32-byte receipt hash, and the receiver verifies it only after checking that hash is the one of the request the offer was sealed to. Without it, a receiver that was once offered a coin could replay the proof against another receiver's request and spend that request's funding attempts.
+
 ## Original digest and signed-message forms
 
 The message is the following UTF-8 string, with lowercase hex and unpadded decimal integers:
 
 ```
-lfbw-direct-funding-offer:<offerId hex>:<txid hex>:<vout>:<amountSat>
+lfbw-direct-funding-offer:<offerId hex>:<txid hex>:<vout>:<amountSat>:<receiptHash hex>
 ```
 
 The original proof signs SHA256 of this message. P2WPKH uses ECDSA with its compressed public key; P2TR uses the script's output key and Schnorr.
@@ -38,7 +40,7 @@ The receiver reconstructs this exact transaction:
 | Input 0                 | Offered txid and vout, empty scriptSig, offered sequence                              |
 | Input 1 hash bytes      | SHA256(UTF-8 `lfbw-direct-funding-poison` concatenated with the raw 16-byte offer ID) |
 | Input 1 vout / sequence | 0 / offered sequence                                                                  |
-| Single output           | 0 sat, script `6a10` followed by the raw offer ID                                     |
+| Single output           | 0 sat, script `6a30` followed by the raw offer ID and the raw receipt hash            |
 
 The first input's txid is converted from display order to transaction byte order. The poison hash bytes are inserted directly, without another reversal. This is plain SHA256 of a domain prefix and offer ID, not the BIP340 tagged-hash construction. Its artificial previous output has value 0 and script `6a0b` followed by UTF-8 `lfbw-poison`. These previous-output fields participate in the P2TR sighash.
 
@@ -50,4 +52,4 @@ For either alternative proof, the legacy 64-byte digest signature field is zeroe
 
 `tests/lightning/fixtures/cln-ownership-probes.json` contains unsigned and signed PSBTs returned by Core Lightning v26.06.1 on regtest for real P2WPKH and P2TR wallet coins. The capture selected one confirmed unreserved coin per kind, constructed the probe, called `reserveinputs` for that coin only, called `signpsbt` with `signonly: [0]`, and released the same reservation block count in a finally block. Neither probe was broadcast.
 
-The fixture tests reconstruct the exact transaction, round-trip the wire proof, verify the external signatures, and reject changed offer/input fields and removal of the poison input. These fixtures establish signer compatibility and proof verification. Channel broadcast and settlement require separate integration tests.
+The capture predates the receipt hash in the OP_RETURN, whose script was then `6a10` followed by the offer ID. The fixture tests check that the transaction built today differs from the captured one only there, verify the external signatures over what CLN signed, and check that the receiver now refuses those proofs and that removing the poison input invalidates them. Rejection of changed offer, input and request fields is tested on probes signed locally. These fixtures establish signer compatibility for this transaction shape. Channel broadcast and settlement require separate integration tests.
