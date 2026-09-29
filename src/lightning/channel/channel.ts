@@ -3478,15 +3478,18 @@ export class Channel {
 			// the builder deducts from the funder separately: one expression, so
 			// the base weight this channel type prices at and the anchor add can
 			// never be applied apart (#403).
-			remoteRequiredMsat +=
-				funderCommitmentCostSats(
-					Math.max(
-						getLocalCommitmentFeeRate(this._state),
-						getRemoteCommitmentFeeRate(this._state)
-					),
-					this._countActiveHtlcs() + 1,
-					this._state.channelType
-				) * 1000n;
+			const candidate = [
+				{ amountMsat: msg.amountMsat, direction: HtlcDirection.RECEIVED }
+			];
+			const localCostMsat = this._remoteFunderLocalCostMsat(
+				getLocalCommitmentFeeRate(this._state),
+				candidate
+			);
+			const remoteCostMsat = this._remoteFunderLocalCostMsat(
+				getRemoteCommitmentFeeRate(this._state),
+				candidate
+			);
+			remoteRequiredMsat += bigIntMax(localCostMsat, remoteCostMsat);
 		}
 		if (this._state.remoteBalanceMsat - msg.amountMsat < remoteRequiredMsat) {
 			// BOLT 2 MUST fail: offering an add the SENDER cannot afford above its
@@ -3875,6 +3878,20 @@ export class Channel {
 	}
 
 	/**
+	 * Whether a settle the peer sends for this offered HTLC arrives before
+	 * the add is committed: still PENDING (in no commitment_signed of ours),
+	 * or signed but not yet revoked for by the peer. BOLT 2 forbids settling
+	 * before the add is irrevocably committed and the peer's revoke_and_ack
+	 * reaches us ahead of any settle it sends after that, so this is never
+	 * an honest peer, and the receiver MUST fail the channel (#1047).
+	 */
+	private _addNotYetCommitted(entry: IHtlcEntry): boolean {
+		return (
+			entry.state === HtlcState.PENDING || entry.addRemoteCommitted === false
+		);
+	}
+
+	/**
 	 * Handle update_fulfill_htlc from remote.
 	 */
 	handleUpdateFulfillHtlc(msg: IUpdateFulfillHtlcMessage): ChannelAction[] {
@@ -3953,6 +3970,12 @@ export class Channel {
 					paymentPreimage: msg.paymentPreimage
 				}
 			];
+		}
+
+		if (this._addNotYetCommitted(entry)) {
+			return this._failChannelWithWireError(
+				'update_fulfill_htlc for an HTLC not yet committed'
+			);
 		}
 
 		entry.state = HtlcState.FULFILLED;
@@ -4230,6 +4253,12 @@ export class Channel {
 			];
 		}
 
+		if (this._addNotYetCommitted(entry)) {
+			return this._failChannelWithWireError(
+				'update_fail_htlc for an HTLC not yet committed'
+			);
+		}
+
 		entry.state = HtlcState.FAILED;
 		// Two-phase: finalize the refund (and delete the entry) only once the
 		// peer has revoked for OUR commitment covering this removal.
@@ -4309,6 +4338,12 @@ export class Channel {
 					malformedCode: msg.failureCode
 				}
 			];
+		}
+
+		if (this._addNotYetCommitted(entry)) {
+			return this._failChannelWithWireError(
+				'update_fail_malformed_htlc for an HTLC not yet committed'
+			);
 		}
 
 		// A malformed-HTLC removal follows the SAME two-phase settlement as a plain
@@ -5725,15 +5760,10 @@ export class Channel {
 		// the opener's own arithmetic, and since issue 404 that refusal fails the
 		// channel outright rather than desyncing it silently, so this arithmetic has
 		// to match the opener's exactly (#403).
-		const activeHtlcCount = this._countActiveHtlcs();
-		const newCost = funderCommitmentCostSats(
-			msg.feeratePerKw,
-			activeHtlcCount,
-			this._state.channelType
-		);
+		const newCostMsat = this._remoteFunderLocalCostMsat(msg.feeratePerKw, []);
 		const reserveMsat = this._state.localConfig.channelReserveSatoshis * 1000n;
 		// Remote is the opener (we are acceptor), so check their balance
-		if (newCost * 1000n > this._state.remoteBalanceMsat - reserveMsat) {
+		if (newCostMsat > this._state.remoteBalanceMsat - reserveMsat) {
 			// BOLT 2: a rate the opener cannot afford above its reserve can never be
 			// applied to the commitment we hold.
 			return this._failChannelWithWireError(
@@ -10616,6 +10646,22 @@ export class Channel {
 			);
 		}
 
+		// The other direction: a peer more than one commitment_signed or
+		// revoke_and_ack behind cannot be levelled by retransmitting our latest
+		// one, and BOLT 2 says to fail the channel. Our current commitment's
+		// secret has never left this node, so the ordinary failure may
+		// broadcast it; a held row stays held through the derived disposition.
+		if (msg.nextCommitmentNumber < this._state.remoteCommitmentNumber) {
+			return this._failChannelWithWireError(
+				'channel_reestablish next_commitment_number is more than one behind'
+			);
+		}
+		if (msg.nextRevocationNumber + 1n < this._state.localCommitmentNumber) {
+			return this._failChannelWithWireError(
+				'channel_reestablish next_revocation_number is more than one behind'
+			);
+		}
+
 		// Collected separately from `actions`: when the peer missed BOTH our
 		// last revoke_and_ack AND our last commitment_signed, BOLT 2 requires
 		// retransmission in the ORIGINAL relative order (lastSentWasRevoke). A
@@ -15241,6 +15287,41 @@ export class Channel {
 				this._state.channelType
 			) * 1000n
 		);
+	}
+
+	/**
+	 * What a peer that funds pays on the commitment WE hold, which is what
+	 * LND, eclair and CLN price a funder's update_add_htlc or update_fee
+	 * against on receipt: every PENDING or COMMITTED entry plus the
+	 * candidates, trimmed at our dust limit under our commitment's direction
+	 * rule. BOLT 3 charges weight only for untrimmed outputs, so counting a
+	 * trimmed one failed an honest funder holding dust HTLCs (#1047).
+	 */
+	private _remoteFunderLocalCostMsat(
+		feeratePerKw: number,
+		candidates: { amountMsat: bigint; direction: HtlcDirection }[]
+	): bigint {
+		const rows: { amount: bigint; direction: HtlcDirection }[] = [];
+		for (const entry of this._state.htlcs.values()) {
+			if (
+				entry.state === HtlcState.PENDING ||
+				entry.state === HtlcState.COMMITTED
+			) {
+				rows.push({
+					amount: entry.amountMsat / 1000n,
+					direction: entry.direction
+				});
+			}
+		}
+		for (const c of candidates) {
+			rows.push({ amount: c.amountMsat / 1000n, direction: c.direction });
+		}
+		const untrimmed = this._countUntrimmedRows(
+			rows,
+			this._state.localConfig.dustLimitSatoshis,
+			feeratePerKw
+		);
+		return this._funderCostMsat(feeratePerKw, untrimmed);
 	}
 
 	/**

@@ -20,6 +20,11 @@ import { MessageType } from '../../src/lightning/message/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { createAcceptorState } from '../../src/lightning/channel/channel-state';
 import { decodeChannelReadyMessage } from '../../src/lightning/message/channel-funding';
+import {
+	decodeCommitmentSignedMessage,
+	decodeRevokeAndAckMessage
+} from '../../src/lightning/message/channel-commitment';
+import { decodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import {
 	INCORRECT_CLTV_EXPIRY,
@@ -28,7 +33,8 @@ import {
 import {
 	seedKey,
 	signerFromSeed,
-	realInitialCommitmentSig
+	realInitialCommitmentSig,
+	realCommitmentSigs
 } from './helpers/real-signing';
 
 function makeBasepoints(seed?: Buffer): IChannelBasepoints {
@@ -180,6 +186,41 @@ function setupChannelWithHtlc(cltvExpiry: number): {
 		crypto.randomBytes(1366)
 	);
 	expect(findErrorAction(addResult)).to.be.null;
+	const addPayload = findSendAction(addResult, MessageType.UPDATE_ADD_HTLC)!;
+	expect(
+		findErrorAction(
+			acceptor.handleUpdateAddHtlc(decodeUpdateAddHtlcMessage(addPayload))
+		)
+	).to.be.null;
+
+	const openerSigs = realCommitmentSigs(opener);
+	const openerCommitment = findSendAction(
+		opener.signCommitment(openerSigs.signature, openerSigs.htlcSignatures),
+		MessageType.COMMITMENT_SIGNED
+	)!;
+	const acceptorRevoke = findSendAction(
+		acceptor.handleCommitmentSigned(
+			decodeCommitmentSignedMessage(openerCommitment)
+		),
+		MessageType.REVOKE_AND_ACK
+	)!;
+	opener.handleRevokeAndAck(decodeRevokeAndAckMessage(acceptorRevoke));
+
+	const acceptorSigs = realCommitmentSigs(acceptor);
+	const acceptorCommitment = findSendAction(
+		acceptor.signCommitment(
+			acceptorSigs.signature,
+			acceptorSigs.htlcSignatures
+		),
+		MessageType.COMMITMENT_SIGNED
+	)!;
+	const openerRevoke = findSendAction(
+		opener.handleCommitmentSigned(
+			decodeCommitmentSignedMessage(acceptorCommitment)
+		),
+		MessageType.REVOKE_AND_ACK
+	)!;
+	acceptor.handleRevokeAndAck(decodeRevokeAndAckMessage(openerRevoke));
 
 	return { opener, acceptor, htlcId };
 }

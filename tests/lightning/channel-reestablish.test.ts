@@ -634,6 +634,75 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			expect(opener.getFullState().dataLossDetected).to.equal(true);
 			expect(opener.getState()).to.equal(ChannelState.ERRORED);
 		});
+
+		// Issue #1047: a peer more than one behind is failed, not replayed to.
+		// Both counters start at 5: the peer is level at next_commitment 6 and
+		// next_revocation 5, and one behind at 5 and 4.
+		const atFive = (): { opener: Channel; openerSeed: Buffer } => {
+			const { opener, openerSeed } = setupNormalChannels();
+			opener.getFullState().localCommitmentNumber = 5n;
+			opener.getFullState().remoteCommitmentNumber = 5n;
+			opener.markForReestablish();
+			return { opener, openerSeed };
+		};
+		const reestablishAt = (
+			opener: Channel,
+			openerSeed: Buffer,
+			nextCommitmentNumber: bigint,
+			nextRevocationNumber: bigint
+		): IChannelReestablishMessage => ({
+			channelId: opener.getChannelId()!,
+			nextCommitmentNumber,
+			nextRevocationNumber,
+			yourLastPerCommitmentSecret: getPerCommitmentSecret(
+				openerSeed,
+				nextRevocationNumber - 1n
+			),
+			myCurrentPerCommitmentPoint: getPublicKey(crypto.randomBytes(32))
+		});
+
+		it('fails the channel on a peer two commitments behind (issue #1047)', function () {
+			const { opener, openerSeed } = atFive();
+			const result = opener.handleReestablish(
+				reestablishAt(opener, openerSeed, 4n, 5n)
+			);
+			expect(findErrorAction(result)).to.contain(
+				'next_commitment_number is more than one behind'
+			);
+			expect(findSendAction(result, MessageType.ERROR)).to.not.be.null;
+			expect(findSendAction(result, MessageType.COMMITMENT_SIGNED)).to.be.null;
+			expect(opener.getState()).to.equal(ChannelState.ERRORED);
+		});
+
+		it('fails the channel on a peer two revocations behind (issue #1047)', function () {
+			const { opener, openerSeed } = atFive();
+			const result = opener.handleReestablish(
+				reestablishAt(opener, openerSeed, 6n, 3n)
+			);
+			expect(findErrorAction(result)).to.contain(
+				'next_revocation_number is more than one behind'
+			);
+			expect(findSendAction(result, MessageType.ERROR)).to.not.be.null;
+			expect(opener.getState()).to.equal(ChannelState.ERRORED);
+		});
+
+		it('still resumes a peer exactly one behind on both counters (issue #1047)', function () {
+			const { opener, openerSeed } = atFive();
+			const result = opener.handleReestablish(
+				reestablishAt(opener, openerSeed, 5n, 4n)
+			);
+			expect(findErrorAction(result)).to.be.null;
+			expect(opener.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('keeps a held row held when failing a peer that is behind (issue #1047)', function () {
+			const { opener, openerSeed } = atFive();
+			opener.getFullState().restoreRecencyUnproven = true;
+			opener.handleReestablish(reestablishAt(opener, openerSeed, 4n, 5n));
+			expect(opener.getState()).to.equal(ChannelState.ERRORED);
+			expect(opener.getRecoveryCloseReason()).to.equal('restore-unproven');
+			expect(opener.hasRecoveryCloseDisposition()).to.equal(true);
+		});
 	});
 
 	describe('handleReestablish — state restoration', function () {

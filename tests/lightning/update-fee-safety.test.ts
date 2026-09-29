@@ -164,12 +164,14 @@ describe('update_fee Balance Drain Protection', () => {
 		// Initial feeratePerKw = 2000
 		const channel = createTestChannel(30_000_000n, 10_000n, 2000);
 
-		// Add 2 active HTLCs to increase the commitment weight
+		// Add 2 active HTLCs to increase the commitment weight. Trimmed HTLCs
+		// add no weight, so each stays above the 12,951 sat offered threshold
+		// at 19,000 sat/kw.
 		const state = (channel as any)._state as IChannelState;
 		state.htlcs.set('offered-0', {
 			id: 0n,
 			direction: HtlcDirection.OFFERED,
-			amountMsat: 1_000_000n,
+			amountMsat: 13_000_000n,
 			paymentHash: crypto.randomBytes(32),
 			cltvExpiry: 500,
 			onionRoutingPacket: Buffer.alloc(1366),
@@ -178,7 +180,7 @@ describe('update_fee Balance Drain Protection', () => {
 		state.htlcs.set('offered-1', {
 			id: 1n,
 			direction: HtlcDirection.OFFERED,
-			amountMsat: 1_000_000n,
+			amountMsat: 13_000_000n,
 			paymentHash: crypto.randomBytes(32),
 			cltvExpiry: 500,
 			onionRoutingPacket: Buffer.alloc(1366),
