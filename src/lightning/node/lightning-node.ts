@@ -3524,6 +3524,69 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Fulfill each received HTLC on this channel that a completed incoming
+	 * payment lists in settledHtlcs but that is still COMMITTED. An MPP set
+	 * fulfills every part when its last one arrives, and a part on a channel
+	 * awaiting reestablishment at that moment is refused. The restart
+	 * redispatch never runs for a channel that stayed live.
+	 *
+	 * Gated on durable facts only, so it is safe on every reconnect: a
+	 * fulfilled entry is no longer COMMITTED. Held and FFOR voucher entries
+	 * are left to their own machinery, as the restart redispatch leaves them.
+	 */
+	private fulfillSettledReceivedHtlcs(channelId: Buffer): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const channelHex = channelId.toString('hex');
+		for (const [key, htlc] of [...channel.getFullState().htlcs]) {
+			if (!key.startsWith('received-')) continue;
+			if (htlc.state !== HtlcState.COMMITTED) continue;
+			if (this.isHeldHtlc(channelId, htlc.id)) continue;
+			if (htlc.fforVoucher === true || htlc.fforMismatch === true) continue;
+			const hashHex = htlc.paymentHash.toString('hex');
+			const htlcKey = `${channelHex}:${htlc.id}`;
+			const payment = this.payments.get(hashHex);
+			if (
+				payment?.direction !== PaymentDirection.INCOMING ||
+				payment.status !== PaymentStatus.COMPLETED ||
+				!payment.settledHtlcs?.includes(htlcKey)
+			) {
+				continue;
+			}
+			const preimage = this.preimages.get(hashHex) ?? payment.preimage;
+			if (!preimage) continue;
+			if (this.channelManager.fulfillHtlc(channelId, htlc.id, preimage).ok) {
+				this.cleanupHtlcSharedSecret(htlcKey);
+			}
+		}
+	}
+
+	/**
+	 * True while a received HTLC this completed payment settled is still
+	 * COMMITTED on a channel that has not gone to chain: the record and its
+	 * preimage are what fulfillSettledReceivedHtlcs reads to send it.
+	 */
+	private owesSettledFulfill(payment: IPaymentInfo): boolean {
+		if (payment.status !== PaymentStatus.COMPLETED) return false;
+		for (const htlcKey of payment.settledHtlcs ?? []) {
+			const [channelHex, htlcId] = htlcKey.split(':');
+			const channelId = Buffer.from(channelHex, 'hex');
+			const channel = this.channelManager.getChannel(channelId);
+			if (!channel || this.channelManager.getMonitor(channelId)) continue;
+			const state = channel.getState();
+			if (
+				state === ChannelState.CLOSED ||
+				state === ChannelState.FORCE_CLOSED
+			) {
+				continue;
+			}
+			const htlc = channel.getFullState().htlcs.get(`received-${htlcId}`);
+			if (htlc?.state === HtlcState.COMMITTED) return true;
+		}
+		return false;
+	}
+
 	/** True when this received HTLC is parked awaiting a hold-invoice decision. */
 	private isHeldHtlc(channelId: Buffer, htlcId: bigint): boolean {
 		for (const held of this.heldHtlcs.values()) {
@@ -4230,6 +4293,7 @@ export class LightningNode extends EventEmitter {
 		// event where the restore repair above is not.
 		this.channelManager.on('channel:reestablished', (channelId: Buffer) => {
 			this.settleForwardsOwedUpstream(channelId);
+			this.fulfillSettledReceivedHtlcs(channelId);
 			// A conflict verdict the peer has not yet agreed is re-asked on
 			// every reconnect (issue #760).
 			this.resendSpliceConflicts(channelId.toString('hex'));
@@ -4480,10 +4544,13 @@ export class LightningNode extends EventEmitter {
 			this.emit('splice:complete', { channelId, fundingTxid });
 			// A settle owed upstream that was still refused at quiescence:ended
 			// (a taproot channel parks updates until splice_locked) is carried
-			// now that the channel is NORMAL again. Deferred: this event fires
-			// from inside a processActions dispatch.
+			// now that the channel is NORMAL again, as is a completed payment's
+			// part. A reconnect that resumed the splice never emitted
+			// channel:reestablished. Deferred: this event fires from inside a
+			// processActions dispatch.
 			setImmediate(() => {
 				this.settleForwardsOwedUpstream(channelId);
+				this.fulfillSettledReceivedHtlcs(channelId);
 			});
 		});
 
@@ -10599,10 +10666,12 @@ export class LightningNode extends EventEmitter {
 		// A COMPLETED or FAILED outgoing record whose HTLC is still
 		// non-terminal (failed by a wall clock while the peer holds it) is
 		// not history yet: its outcome, and the preimage a late fulfil
-		// reveals, still belong to it (#743 audit).
+		// reveals, still belong to it (#743 audit). A COMPLETED incoming record
+		// with a part whose fulfill was refused is still owed that fulfill.
 		const stillLive = (hash: string, payment: IPaymentInfo): boolean =>
-			payment.direction === PaymentDirection.OUTGOING &&
-			!this.getOutgoingHtlcs(Buffer.from(hash, 'hex')).resolved;
+			payment.direction === PaymentDirection.OUTGOING
+				? !this.getOutgoingHtlcs(Buffer.from(hash, 'hex')).resolved
+				: this.owesSettledFulfill(payment);
 
 		const forget = (hash: string, payment: IPaymentInfo): void => {
 			this.payments.delete(hash);
@@ -21702,10 +21771,24 @@ export class LightningNode extends EventEmitter {
 			// (Mirrors the single-payment path in fulfillPayment.)
 			this.channelManager.recordPreimage(paymentHash, preimage);
 
-			// Fulfill ALL parts atomically
+			// Fulfill ALL parts atomically. A part whose channel cannot carry the
+			// fulfill (its peer is mid-reconnect) is still listed in settledHtlcs
+			// below, and fulfillSettledReceivedHtlcs sends it on reestablish.
 			for (const p of pending.receivedParts) {
 				p.status = PaymentStatus.COMPLETED;
-				this.channelManager.fulfillHtlc(p.channelId, p.htlcId, preimage);
+				const result = this.channelManager.fulfillHtlc(
+					p.channelId,
+					p.htlcId,
+					preimage
+				);
+				if (!result.ok) {
+					this.emitStructuredLog('htlc', 'mpp_part_fulfill_refused', {
+						paymentHash: hashHex,
+						channelId: p.channelId.toString('hex'),
+						htlcId: p.htlcId.toString(),
+						error: result.error
+					});
+				}
 			}
 			this.pendingMppPayments.delete(hashHex);
 			// Settle here goes straight to fulfillHtlc, so this is the MPP set's

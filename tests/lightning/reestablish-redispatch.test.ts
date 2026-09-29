@@ -1122,4 +1122,161 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		bob.destroy();
 		alice.destroy();
 	});
+
+	/**
+	 * Part one of a 100k MPP set arrives over alice, whose connection then
+	 * drops. Part two over carol completes the set, and bob's fulfill of part
+	 * one is refused because alice's channel awaits reestablishment. Bob keeps
+	 * no completed record past a prune unless it still owes a fulfill.
+	 */
+	async function refuseMppPartMidReconnect(): Promise<{
+		alice: LightningNode;
+		bob: LightningNode;
+		carol: LightningNode;
+		aliceChannelId: Buffer;
+		paymentHash: Buffer;
+		gate: IWireGate;
+		aliceHtlcs: () => Map<string, { state: HtlcState }>;
+	}> {
+		const CAROL_SEED = 43;
+		const alice = createNode(ALICE_SEED);
+		const bob = new LightningNode({
+			...makeNodeConfig(BOB_SEED),
+			resourceConfig: { maxCompletedPayments: 0 }
+		});
+		bob.on('error', () => {});
+		bob.on('node:error', () => {});
+		const carol = createNode(CAROL_SEED);
+		const dead = { val: false };
+		const gate: IWireGate = { hold: false, queue: [] };
+		wire(alice, bob, dead, gate);
+		wire(carol, bob, dead);
+		const aliceChannelId = openReadyChannel(alice, bob);
+		openReadyChannel(carol, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+		buildDirectGraph(carol, CAROL_SEED, BOB_SEED);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 100_000n,
+			description: 'mpp across a reconnect'
+		});
+		const scid = encodeShortChannelId({
+			block: 500,
+			txIndex: 1,
+			outputIndex: 0
+		});
+		const payPart = (payer: LightningNode, amountMsat: bigint): void => {
+			const finalCltv = (
+				payer as unknown as { paddedFinalCltvExpiry: () => number }
+			).paddedFinalCltvExpiry();
+			payer.sendPaymentToRoute(
+				{
+					hops: [
+						{
+							pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+							shortChannelId: scid,
+							amountToForwardMsat: amountMsat,
+							outgoingCltvValue: finalCltv
+						}
+					]
+				},
+				invoice.paymentHash,
+				finalCltv,
+				invoice.paymentSecret,
+				100_000n
+			);
+		};
+
+		payPart(alice, 60_000n);
+		await settle();
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
+		await settle();
+
+		payPart(carol, 40_000n);
+		await settle();
+		expect(bob.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+		expect(carol.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+		const aliceHtlcs = (): Map<string, { state: HtlcState }> =>
+			bob.getChannelManager().getChannel(aliceChannelId)!.getFullState().htlcs;
+		expect(
+			[...aliceHtlcs().values()].map((h) => h.state),
+			'the refused part is still committed'
+		).to.deep.equal([HtlcState.COMMITTED]);
+		expect(bob.pruneCompletedPayments(), 'a record owing a fulfill').to.equal(
+			0
+		);
+
+		return {
+			alice,
+			bob,
+			carol,
+			aliceChannelId,
+			paymentHash: invoice.paymentHash,
+			gate,
+			aliceHtlcs
+		};
+	}
+
+	it('an MPP part whose channel was reconnecting when the set completed is fulfilled on reestablish (#1031)', async function () {
+		this.timeout(20_000);
+		// The payment is already COMPLETED, so the live reconnect has to send
+		// the fulfill it owes rather than leave the HTLC to the claim
+		// backstop's force close.
+		const { alice, bob, carol, aliceChannelId, paymentHash, gate, aliceHtlcs } =
+			await refuseMppPartMidReconnect();
+
+		gate.hold = true;
+		alice.getChannelManager().handlePeerReconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerReconnected(alice.getNodeId());
+		while (gate.queue.length > 0) {
+			const m = gate.queue.shift()!;
+			m.to.handlePeerMessage(m.from, m.type, m.p);
+		}
+		gate.hold = false;
+		await settle();
+
+		expect(
+			alice.getPayment(paymentHash)!.status,
+			'the part over alice settled after the reconnect'
+		).to.equal(PaymentStatus.COMPLETED);
+		expect(aliceHtlcs().size, 'no HTLC left on the channel').to.equal(0);
+		expect(
+			bob.getChannelManager().getChannel(aliceChannelId)!.getState()
+		).to.equal(ChannelState.NORMAL);
+		expect(bob.pruneCompletedPayments(), 'nothing owed any more').to.equal(1);
+
+		carol.destroy();
+		bob.destroy();
+		alice.destroy();
+	});
+
+	it('an MPP part refused mid-reconnect is fulfilled when a resumed splice completes (#1031)', async function () {
+		this.timeout(20_000);
+		// A reconnect that resumes a splice leaves the channel SPLICING and
+		// never emits channel:reestablished; splice:complete is the first
+		// moment it can carry the fulfill.
+		const { alice, bob, carol, aliceChannelId, gate, aliceHtlcs } =
+			await refuseMppPartMidReconnect();
+		// Only bob's side is modelled; alice never sees the fulfill.
+		gate.hold = true;
+		const channel = bob.getChannelManager().getChannel(aliceChannelId)!;
+		channel.getFullState().state = ChannelState.NORMAL;
+		channel.getFullState().preReestablishState = null;
+		bob.getChannelManager().emit('splice:complete', aliceChannelId);
+		await settle();
+
+		expect(
+			[...aliceHtlcs().values()].map((h) => h.state),
+			'the owed fulfill was sent'
+		).to.not.include(HtlcState.COMMITTED);
+
+		carol.destroy();
+		bob.destroy();
+		alice.destroy();
+	});
 });
