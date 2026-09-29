@@ -4753,6 +4753,8 @@ export class ChannelManager extends EventEmitter {
 			localAmount,
 			remoteAmount,
 			feeAmount: feeSatoshis,
+			localDustLimit: state.localConfig.dustLimitSatoshis,
+			remoteDustLimit: state.remoteConfig.dustLimitSatoshis,
 			// LND builds the taproot coop-close tx RBF-signalled; the sequence
 			// is part of the MuSig2 sighash, so it must match exactly.
 			sequence: isTaprootChannel(state.channelType) ? 0xfffffffd : 0xffffffff
