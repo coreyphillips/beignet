@@ -420,8 +420,8 @@ while its own writer lease is quarantined (the guardian-only lane), so nodes
 that guard each other can restart together. Quotas
 (`BEIGNET_GUARDIAN_MAX_BYTES`, `_MAX_SETS`) refuse new writes rather than
 delete, because pruning a namespace wedges a stranger's node for good. A set
-still shrinks: each writer tells its guardians which snapshot the quorum
-holds, and they free the records below it.
+still shrinks: each writer tells its guardians which snapshot all of them
+hold, and they free the records below it.
 
 #### Rotating guardians
 

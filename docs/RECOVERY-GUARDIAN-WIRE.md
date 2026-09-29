@@ -553,10 +553,14 @@ nothing.
 Retain floor. A PUT_STATE MAY carry `retain_floor`: a sequence F, the
 frame hash of the record at F, and the lease writer key's signature over
 the RETAIN transcript. The writer sends it once F is the newest snapshot
-its journal wrote and a quorum holds that snapshot's whole page group, so a
-restore that downloads from F still starts at a complete snapshot, and no
+its journal wrote and EVERY guardian of the set has receipted that
+snapshot's whole page group, and repeats it on each later record. So a
+restore that downloads from F still starts at a complete snapshot, no
 takeover can certify a head below F (4.2: a quorum-held record is never
-superseded). The pass that completes the group sends it at once, on a
+superseded), and a guardian that falls behind afterwards can still be
+repaired from its peers (5.6). A quorum is not enough: a guardian already
+behind F could never be repaired, and a restore that has lost a quorum
+member needs it. The pass that qualifies the group sends it at once, on a
 record each guardian already holds. A guardian that accepts or duplicates
 the record, holds the record at F with that frame hash, and has not
 already freed through F verifies the signature (`ERR_BAD_SIGNATURE`

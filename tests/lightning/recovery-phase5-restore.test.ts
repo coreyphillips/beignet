@@ -37,21 +37,21 @@ import {
 	RestoreDriver,
 	RestoreRefusedError,
 	computeGuardianSetId,
+	decodePutStateRequest,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
 	genesisLogHead,
 	generateWriterKey,
 	GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES,
+	GUARDIAN_RECORD_OVERHEAD_BYTES,
 	GUARDIAN_REGISTRATION_BYTES,
 	JOURNAL_META_KEYS,
 	META_LAST_SNAPSHOT_GROUP,
 	loadWriterLease,
 	nodeGuardianTransport,
 	registerTranscriptHash,
-	retainTranscriptHash,
 	signAcquisition,
 	signTranscript,
-	verifyTranscript,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
@@ -1376,7 +1376,7 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 		).to.equal(true);
 	}
 
-	it('frees guardian records below the quorum-held base and still restores exactly', async function (): Promise<void> {
+	it('frees guardian records below a snapshot every guardian holds and still restores exactly', async function (): Promise<void> {
 		this.timeout(30_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
@@ -1467,53 +1467,167 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 		storage.close();
 	});
 
-	it('names a floor only once the quorum holds the snapshot and every page after it', () => {
-		const storage = openStorage();
-		// Never contacted: the floor is judged from local metadata alone.
-		const rep = replicatorFor(
-			storage,
-			GUARDIAN_IDS.map((id) => ({
-				client: new GuardianClient({
-					url: 'http://127.0.0.1:1',
-					guardianSetId: SET_ID
-				}),
-				expectedGuardianId: id
-			}))
-		);
-		const writer = generateWriterKey();
-		const lease: IWriterLeaseKeys = {
-			epoch: 3n,
-			writerPublicKey: writer.publicKey,
-			writerSecret: writer.secret,
-			guardianCertificates: [],
-			confirmedAt: null
-		};
-		const frameHash = sha('base snapshot');
-		storage.setRecoveryMeta!(
-			META_LAST_SNAPSHOT_GROUP,
-			JSON.stringify({
-				sequence: '40',
-				groupEnd: '42',
-				frameHash: frameHash.toString('hex')
+	/** A client for `entry` whose PUT_STATE fails whenever `drop` says so. */
+	function dropping(
+		entry: IServed,
+		drop: (body: Buffer) => boolean
+	): IBoundGuardianClient {
+		const transport = nodeGuardianTransport();
+		return {
+			expectedGuardianId: entry.id,
+			client: new GuardianClient({
+				url: entry.client.url,
+				guardianSetId: SET_ID,
+				transport: (url, init) =>
+					url.endsWith('/put_state') && drop(init.body as Buffer)
+						? Promise.reject(new Error('dropped'))
+						: transport(url, init)
 			})
+		};
+	}
+
+	it('frees nothing a lagging guardian needs, so a restore without a quorum member repairs it', async function (): Promise<void> {
+		this.timeout(30_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		let rep: GuardianReplicator | null = null;
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId,
+			{
+				snapshotIntervalFrames: 4,
+				retainFrom: (): bigint => (rep ? rep.replicatedThrough() + 1n : 1n)
+			}
 		);
-		expect(rep.retainFloor(lease, 41n)).to.equal(undefined);
-		const floor = rep.retainFloor(lease, 42n)!;
-		expect(floor.sequence).to.equal(40n);
-		expect(floor.frameHash.equals(frameHash)).to.equal(true);
-		expect(
-			verifyTranscript(
-				retainTranscriptHash(SET_ID, {
-					recoveryId: ROOT.recoveryId,
-					epoch: 3n,
-					sequence: 40n,
-					frameHash
-				}),
-				floor.writerSignature,
-				writer.publicKey
-			)
-		).to.equal(true);
+		const manager = new RecoveryManager(storage, { journal });
+		commitTransition(manager, 0);
+		let lagging = false;
+		rep = replicatorFor(storage, [
+			...bind(served.slice(0, 2)),
+			dropping(served[2], () => lagging)
+		]);
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		lagging = true;
+		for (let i = 1; i <= 16; i++) {
+			commitTransition(manager, i);
+			await rep.replicatePending(lease);
+			journal.compact();
+		}
+
+		const behind = (await served[2].client.getHead(ROOT.recoveryId)).state!
+			.logHead.sequence;
+		for (const entry of served.slice(0, 2)) {
+			const page = await entry.client.getState(ROOT.recoveryId, 0n);
+			expect(page.records![0].sequence <= behind + 1n).to.equal(true);
+		}
+		// Only the one current guardian and the laggard are left.
+		await served[0].server.close();
+		const expectedDump = dumpTables(storage);
+		const target = openStorage();
+		const result = await driverFor(target, bind(served)).restore();
+		expect(result.guardiansRepaired).to.be.at.least(1);
+		expect(dumpTables(target)).to.equal(expectedDump);
+		await shutdown(served);
 		storage.close();
+		target.close();
+	});
+
+	it('keeps a proven floor across a restart that writes the next snapshot', async function (): Promise<void> {
+		this.timeout(20_000);
+		const storage = openStorage();
+		let rep: GuardianReplicator | null = null;
+		const journalFor = (): RecoveryJournal =>
+			new RecoveryJournal(
+				storage,
+				deriveRecoveryMasterKey(NODE_SECRET),
+				NODE_ID,
+				ROOT.recoveryId,
+				{
+					snapshotIntervalFrames: 1,
+					retainFrom: (): bigint => (rep ? rep.replicatedThrough() + 1n : 1n)
+				}
+			);
+		const journal = journalFor();
+		const manager = new RecoveryManager(storage, { journal });
+		commitTransition(manager, 0);
+		commitTransition(manager, 1);
+		// Full once the frames written so far are stored.
+		const quota =
+			GUARDIAN_REGISTRATION_BYTES +
+			storage
+				.loadRecoveryFrames()
+				.reduce(
+					(total, frame) =>
+						total + GUARDIAN_RECORD_OVERHEAD_BYTES + frame.ciphertext.length,
+					0
+				);
+		const served = await Promise.all(
+			[0, 1, 2].map((i) => serve(i, undefined, quota))
+		);
+		let dropFloors = true;
+		const guardians = served.map((entry) =>
+			dropping(
+				entry,
+				(body) =>
+					dropFloors && decodePutStateRequest(body).retainFloor !== undefined
+			)
+		);
+		rep = replicatorFor(storage, guardians);
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		// The floor this pass proves reaches no guardian.
+		expect((await rep.replicatePending(lease)).outcome).to.equal('replicated');
+		journal.compact();
+		for (const entry of served) {
+			expect(entry.guardian.contentBytes()).to.equal(quota);
+		}
+
+		// The restart writes its next snapshot before any pass runs.
+		dropFloors = false;
+		rep = replicatorFor(storage, guardians);
+		commitTransition(
+			new RecoveryManager(storage, { journal: journalFor() }),
+			2
+		);
+		expect((await rep.replicatePending(lease)).outcome).to.equal('replicated');
+		for (const entry of served) {
+			expect(entry.guardian.contentBytes()).to.be.below(quota);
+		}
+		await shutdown(served);
+		storage.close();
+	});
+
+	it('names no floor from snapshot metadata that cannot name a record', async function (): Promise<void> {
+		this.timeout(20_000);
+		for (const sequence of ['0', '-1']) {
+			const served = await Promise.all([serve(0), serve(1), serve(2)]);
+			const live = liveNode(2);
+			const rep = replicatorFor(live.storage, bind(served));
+			const decision = await rep.ensureNamespace();
+			const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+			live.storage.setRecoveryMeta!(
+				META_LAST_SNAPSHOT_GROUP,
+				JSON.stringify({
+					sequence,
+					groupEnd: '2',
+					frameHash: sha('group').toString('hex')
+				})
+			);
+			expect((await rep.replicatePending(lease)).outcome).to.equal(
+				'replicated'
+			);
+			commitTransition(live.manager, 10);
+			expect((await rep.replicatePending(lease)).outcome).to.equal(
+				'replicated'
+			);
+			expect(rep.retainFloor(lease)).to.equal(undefined);
+			await shutdown(served);
+			live.storage.close();
+		}
 	});
 
 	it('reports a guardian whose quota refuses records, once per episode', async function (): Promise<void> {

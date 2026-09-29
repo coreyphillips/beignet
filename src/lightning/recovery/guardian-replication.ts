@@ -81,6 +81,51 @@ const META_PENDING_REGISTRATION = 'guardian_pending_registration_v1';
 export const META_GENERATION = JOURNAL_META_KEYS.generation;
 /** The configured guardian set as it stands, JSON entries (a rotation moves it). */
 export const META_GUARDIAN_SET = 'guardian_set_v1';
+/** The snapshot group every guardian proved it holds (see retainFloor). */
+const META_RETAIN_FLOOR = 'guardian_retain_floor_v1';
+
+interface ISnapshotGroup {
+	sequence: bigint;
+	groupEnd: bigint;
+	frameHash: Buffer;
+}
+
+/**
+ * A stored snapshot group, or null when it cannot name a record or, given a
+ * set id, was not stored for that set.
+ */
+function parseSnapshotGroup(
+	raw: string | null | undefined,
+	guardianSetId?: Buffer
+): ISnapshotGroup | null {
+	if (raw == null) return null;
+	let group: ISnapshotGroup;
+	try {
+		const parsed = JSON.parse(raw) as Record<string, unknown>;
+		if (
+			guardianSetId &&
+			parsed.guardianSetId !== guardianSetId.toString('hex')
+		) {
+			return null;
+		}
+		group = {
+			sequence: BigInt(String(parsed.sequence)),
+			groupEnd: BigInt(String(parsed.groupEnd)),
+			frameHash: Buffer.from(String(parsed.frameHash), 'hex')
+		};
+	} catch {
+		return null;
+	}
+	if (
+		group.sequence < 1n ||
+		group.groupEnd < group.sequence ||
+		group.groupEnd > 0xffffffffffffffffn ||
+		group.frameHash.length !== 32
+	) {
+		return null;
+	}
+	return group;
+}
 
 export const REPLICATION_META_KEYS = {
 	replicatedThrough: META_REPLICATED_THROUGH,
@@ -299,12 +344,14 @@ export class GuardianReplicator {
 		replicatedThrough: string;
 		replicatedThroughHash: string;
 		pendingRegistration: string;
+		retainFloor: string;
 	} {
 		const prefix = this.config.metaKeyPrefix ?? '';
 		return {
 			replicatedThrough: prefix + META_REPLICATED_THROUGH,
 			replicatedThroughHash: prefix + META_REPLICATED_THROUGH_HASH,
-			pendingRegistration: prefix + META_PENDING_REGISTRATION
+			pendingRegistration: prefix + META_PENDING_REGISTRATION,
+			retainFloor: prefix + META_RETAIN_FLOOR
 		};
 	}
 
@@ -870,38 +917,20 @@ export class GuardianReplicator {
 	}
 
 	/**
-	 * The floor guardians may free below (wire 5.2): the newest snapshot the
-	 * journal wrote, once the quorum holds its whole page group. A restore
-	 * builds on the first record it downloads, so a guardian must never
-	 * keep less than a complete group, and a takeover can never certify
-	 * below a quorum-held record, so nothing freed can be asked for again.
-	 * The journal's base need not have reached it yet: the same watermark
-	 * releases that compaction, but only after this pass returns.
+	 * The floor guardians may free below (wire 5.2): the newest snapshot
+	 * group every guardian of this set has proven it holds. A restore builds
+	 * on the first record it downloads, so a guardian must never keep less
+	 * than a complete group. A quorum is not enough: a guardian left behind
+	 * a peer's floor can never be repaired from that peer, and a restore
+	 * that has lost a quorum member needs exactly that repair.
 	 */
-	retainFloor(
-		lease: IWriterLeaseKeys,
-		replicatedThrough: bigint
-	): IGuardianRetainFloor | undefined {
-		const raw = this.config.storage.getRecoveryMeta?.(META_LAST_SNAPSHOT_GROUP);
-		if (raw == null) return undefined;
-		let group: { sequence: bigint; groupEnd: bigint; frameHash: Buffer };
-		try {
-			const parsed = JSON.parse(raw) as Record<string, unknown>;
-			group = {
-				sequence: BigInt(String(parsed.sequence)),
-				groupEnd: BigInt(String(parsed.groupEnd)),
-				frameHash: Buffer.from(String(parsed.frameHash), 'hex')
-			};
-		} catch {
-			return undefined;
-		}
-		if (
-			group.groupEnd < group.sequence ||
-			group.frameHash.length !== 32 ||
-			replicatedThrough < group.groupEnd
-		) {
-			return undefined;
-		}
+	retainFloor(lease: IWriterLeaseKeys): IGuardianRetainFloor | undefined {
+		// Bound to the set that proved it: a rotation's incoming set has not.
+		const group = parseSnapshotGroup(
+			this.config.storage.getRecoveryMeta?.(this.keys.retainFloor),
+			this.config.context.guardianSetId
+		);
+		if (!group) return undefined;
 		return {
 			sequence: group.sequence,
 			frameHash: group.frameHash,
@@ -915,6 +944,42 @@ export class GuardianReplicator {
 				lease.writerSecret
 			)
 		};
+	}
+
+	/**
+	 * Make the journal's newest snapshot group the retain floor once every
+	 * guardian proved in this pass that it holds the whole group. Returns
+	 * whether the floor moved.
+	 */
+	private advanceRetainFloor(streams: IGuardianStreamResult[]): boolean {
+		const storage = this.config.storage;
+		const group = parseSnapshotGroup(
+			storage.getRecoveryMeta?.(META_LAST_SNAPSHOT_GROUP)
+		);
+		if (
+			!group ||
+			streams.some(
+				(stream) =>
+					stream.provenThrough == null || stream.provenThrough < group.groupEnd
+			)
+		) {
+			return false;
+		}
+		const current = parseSnapshotGroup(
+			storage.getRecoveryMeta?.(this.keys.retainFloor),
+			this.config.context.guardianSetId
+		);
+		if (current && current.sequence >= group.sequence) return false;
+		storage.setRecoveryMeta?.(
+			this.keys.retainFloor,
+			JSON.stringify({
+				guardianSetId: this.config.context.guardianSetId.toString('hex'),
+				sequence: group.sequence.toString(),
+				groupEnd: group.groupEnd.toString(),
+				frameHash: group.frameHash.toString('hex')
+			})
+		);
+		return true;
 	}
 
 	/** Sign one journal frame as a guardian record (wire 4.2 RECORD). */
@@ -1347,7 +1412,7 @@ export class GuardianReplicator {
 			framesBySequence.set(BigInt(frame.sequence), frame);
 		}
 		const tip = BigInt(frames[frames.length - 1].sequence);
-		const retainFloor = this.retainFloor(lease, from);
+		const retainFloor = this.retainFloor(lease);
 
 		const [streams] = await Promise.all([
 			Promise.all(
@@ -1441,14 +1506,16 @@ export class GuardianReplicator {
 		if (quorumHead > tip) quorumHead = tip;
 		if (quorumHead < from) quorumHead = from;
 
-		const replicatedThrough = this.raiseWatermark(quorumHead);
-		// A pass that completes a snapshot group may be the last before a
-		// restart writes the next one, so the floor it made eligible goes out
-		// now, on a record each guardian holds (answered OK_DUPLICATE). A
-		// guardian that misses it is covered by the next floor, which frees
-		// everything below it too.
-		const completed = this.retainFloor(lease, replicatedThrough);
-		if (completed && completed.sequence !== retainFloor?.sequence) {
+		// Remembered rather than recomputed: the journal overwrites the group
+		// when it writes its next snapshot, which a restart does before any
+		// pass runs, and every later record carries the remembered floor.
+		const completed = this.advanceRetainFloor(streams)
+			? this.retainFloor(lease)
+			: undefined;
+		// Sent now as well, on a record each guardian holds (answered
+		// OK_DUPLICATE), so a writer that goes idle still frees. Before the
+		// watermark moves, so no reader sees it ahead of this pass's result.
+		if (completed) {
 			await Promise.all(
 				this.config.guardians.map(async (entry, index) => {
 					const held = streams[index].provenThrough;
@@ -1460,6 +1527,7 @@ export class GuardianReplicator {
 				})
 			);
 		}
+		const replicatedThrough = this.raiseWatermark(quorumHead);
 		const durable = Number(
 			replicatedThrough > from ? replicatedThrough - from : 0n
 		);
