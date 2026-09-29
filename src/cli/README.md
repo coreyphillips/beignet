@@ -175,7 +175,7 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `createInvoice(amountSats?, description?, expirySecs?, descriptionHash?)` | `InvoiceInfo` | Create BOLT 11 invoice. Use `descriptionHash` (hex Buffer) for hashed descriptions > 639 bytes — omit `description` when using hash. Returns `paymentSecret` for correlating incoming payments. |
-| `decodeInvoice(bolt11)` | `DecodedInvoice` | Decode any BOLT 11 invoice |
+| `decodeInvoice(bolt11)` | `DecodedInvoice` | Decode a BOLT 11 invoice. One for another network is refused with `INVALID_INVOICE` |
 | `listInvoices()` | `InvoiceInfo[]` | List all created invoices. `status` is `PAID` on a completed receive for the hash, from the in-memory record or, once the engine has pruned it, the database row (one database read per call), so a paid invoice never reads `EXPIRED` or `PENDING` later |
 | `createHoldInvoice({ paymentHash, amountMsat?, amountSats?, description?, expiry?, minFinalCltvExpiry? })` | `InvoiceInfo` | Hold invoice for a caller-supplied `sha256(preimage)`: the preimage stays with the caller and the incoming HTLC parks instead of settling. `minFinalCltvExpiry` is 1..2016 blocks and sets the BOLT 11 `c` tag |
 | `settleHoldInvoice(preimage)` | `{ paymentHash }` | Validate `sha256(preimage)` and fulfill every parked HTLC (all MPP parts) |

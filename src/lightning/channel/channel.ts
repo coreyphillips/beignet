@@ -3185,6 +3185,17 @@ export class Channel {
 			];
 		}
 
+		// BOLT 2: a peer receiving amount_msat 0 may fail the channel, and a
+		// peer advertising htlc_minimum_msat 0 lets the check below pass it.
+		if (amountMsat <= 0n) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'HTLC amount must be positive'
+				}
+			];
+		}
+
 		// Check amount exceeds minimum
 		if (amountMsat < this._state.remoteConfig.htlcMinimumMsat) {
 			return [
