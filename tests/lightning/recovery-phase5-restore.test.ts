@@ -712,6 +712,130 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
+	it('completes a takeover that raced a live append once the third guardian returns', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		// Issue #1040. G3 missed frame N and is down. The live writer's frame
+		// N+1 reaches G1 before this restore's ACQUIRE(N) does, and G2 grants
+		// the ACQUIRE before N+1 arrives there. While G3 is away no takeover
+		// can form: G2 has fixed N as the old epoch's final head, and only G3
+		// could say whether N+1 reached a quorum.
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const clients = served.map((s) => s.client);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		const frames = live.storage.loadRecoveryFrames();
+		for (const frame of frames.slice(0, frames.length - 1)) {
+			const record = rep.signRecord(frame, lease);
+			for (const client of clients) await client.putState(record);
+		}
+		const guardRecord = rep.signRecord(frames[frames.length - 1], lease);
+		for (const client of clients.slice(0, 2)) {
+			expect((await client.putState(guardRecord)).status).to.equal(
+				GuardianStatus.OK
+			);
+		}
+		const guard = (await clients[1].getHead(ROOT.recoveryId))
+			.state as GuardianState;
+		const expectedDump = dumpTables(live.storage);
+		await served[2].server.close();
+
+		const tailHash = Buffer.alloc(32, 88).toString('hex');
+		let tailRecord: ReturnType<typeof rep.signRecord> | undefined;
+		const target = openStorage();
+		const racing = driverFor(target, bind(served));
+		const originalReadHeads = (
+			racing as unknown as { readHeads: () => Promise<unknown> }
+		).readHeads.bind(racing);
+		(racing as unknown as { readHeads: () => Promise<unknown> }).readHeads =
+			async (): Promise<unknown> => {
+				const readings = await originalReadHeads();
+				if (!tailRecord) {
+					live.manager.commit({
+						criticality: RecoveryCriticality.SafetyCritical,
+						mutations: [
+							{
+								type: 'payment_preimage',
+								paymentHash: tailHash,
+								preimage: Buffer.alloc(32, 88)
+							}
+						],
+						outboundMessages: []
+					});
+					const all = live.storage.loadRecoveryFrames();
+					tailRecord = rep.signRecord(all[all.length - 1], lease);
+					expect((await clients[0].putState(tailRecord)).status).to.equal(
+						GuardianStatus.OK
+					);
+				}
+				return readings;
+			};
+		try {
+			await racing.restore();
+			expect.fail('no takeover can form while G3 is down');
+		} catch (error) {
+			expect(error).to.be.instanceOf(RestoreRefusedError);
+			expect((error as RestoreRefusedError).reason).to.equal('cas-exhausted');
+		}
+		const pending = JSON.parse(
+			target.getRecoveryMeta!(RESTORE_META_KEYS.pendingAcquisition) as string
+		) as { newEpoch: string; writerPublicKey: string };
+		const g2 = (await clients[1].getHead(ROOT.recoveryId))
+			.state as GuardianState;
+		expect(g2.lease.writerPublicKey.toString('hex')).to.equal(
+			pending.writerPublicKey
+		);
+		expect(g2.logHead.sequence).to.equal(guard.logHead.sequence);
+		expect((await clients[1].putState(tailRecord!)).status).to.equal(
+			GuardianStatus.ERR_EPOCH_SUPERSEDED
+		);
+		const g1 = (await clients[0].getHead(ROOT.recoveryId))
+			.state as GuardianState;
+		expect(g1.logHead.sequence).to.equal(guard.logHead.sequence + 1n);
+
+		// G3 returns, still one frame short of the guard. Repairing it to
+		// G1's head would leave no guardian able to grant the attempt G2 is
+		// bound to; repairing it to the attempt's own guard completes it.
+		const revived = new GuardianHttpServer({ guardian: served[2].guardian });
+		const revivedPort = await revived.listen(0);
+		const revivedClient = new GuardianClient({
+			url: `http://127.0.0.1:${revivedPort}`,
+			guardianSetId: SET_ID
+		});
+		const result = await driverFor(target, [
+			...bind(served.slice(0, 2)),
+			{ client: revivedClient, expectedGuardianId: served[2].id }
+		]).restore();
+
+		expect(result.lease.epoch).to.equal(BigInt(pending.newEpoch));
+		expect(result.lease.writerPublicKey.toString('hex')).to.equal(
+			pending.writerPublicKey
+		);
+		expect(result.certifiedState.logHead.sequence).to.equal(
+			guard.logHead.sequence
+		);
+		expect(
+			result.certifiedState.logHead.frameHash.equals(guard.logHead.frameHash)
+		).to.equal(true);
+		const g3 = (await revivedClient.getHead(ROOT.recoveryId))
+			.state as GuardianState;
+		expect(g3.lease.epoch).to.equal(result.lease.epoch);
+		expect(g3.logHead.sequence).to.equal(guard.logHead.sequence);
+		// N+1 reached G1 alone, so it is a minority tail and not restored.
+		expect(dumpTables(target)).to.equal(expectedDump);
+		expect(
+			target.loadAllPreimages().some((p) => p.paymentHash === tailHash)
+		).to.equal(false);
+
+		await revived.close();
+		await shutdown(served);
+		live.storage.close();
+		target.close();
+	});
+
 	it('repairs a guardian that missed the takeover and discards its superseded tail', async function (): Promise<void> {
 		// Real guardians over real TCP: the default 2s is not enough under
 		// full-suite load, and a load-sensitive timeout is a flaky test.
