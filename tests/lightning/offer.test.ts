@@ -281,7 +281,7 @@ describe('BOLT 12: Offers', () => {
 				payerKey: pubkey2,
 				offerId: Buffer.alloc(32),
 				amount: 75_000n,
-				features: Buffer.from([0x01]),
+				features: Buffer.from([0x02]),
 				quantity: 3n,
 				chain: crypto.randomBytes(32),
 				payerNote: 'for services',
@@ -397,6 +397,12 @@ describe('BOLT 12: Offers', () => {
 						})
 					)
 				).to.throw('Invoice request requires unknown feature bit 122');
+				// Implemented for init, but not an invreq_features bit.
+				expect(() =>
+					decodeInvoiceRequestTlv(
+						encodeInvoiceRequestTlv({ ...request, features: featureBits(0) })
+					)
+				).to.throw('Invoice request requires unknown feature bit 0');
 				const { request: decoded } = decodeInvoiceRequestTlv(
 					encodeInvoiceRequestTlv({ ...request, features: featureBits(123) })
 				);
@@ -580,10 +586,21 @@ describe('BOLT 12: Offers', () => {
 						encodeInvoiceTlv({ ...invoice, features: featureBits(122) })
 					)
 				).to.throw('Invoice requires unknown feature bit 122');
+				// Implemented for init, but not an invoice_features bit.
+				expect(() =>
+					decodeInvoiceTlv(
+						encodeInvoiceTlv({ ...invoice, features: featureBits(0) })
+					)
+				).to.throw('Invoice requires unknown feature bit 0');
 				const { invoice: decoded } = decodeInvoiceTlv(
 					encodeInvoiceTlv({ ...invoice, features: featureBits(123) })
 				);
 				expect(decoded.features!.equals(featureBits(123))).to.be.true;
+				// MPP/compulsory is the one bit BOLT 12 assigns to invoices.
+				const { invoice: mpp } = decodeInvoiceTlv(
+					encodeInvoiceTlv({ ...invoice, features: featureBits(16) })
+				);
+				expect(mpp.features!.equals(featureBits(16))).to.be.true;
 			});
 
 			it('rejects an invoice_node_id that is not a point', () => {

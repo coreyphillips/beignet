@@ -19,10 +19,7 @@ import {
 	decodeBlindedPayInfos
 } from '../onion/blinded-path';
 import { isValidPublicKey } from '../crypto/ecdh';
-import {
-	FeatureFlags,
-	hasUnsupportedRequiredFeatures
-} from '../features/flags';
+import { Feature, FeatureFlags, implementedFeatures } from '../features/flags';
 import {
 	IOffer,
 	IInvoiceRequest,
@@ -233,19 +230,27 @@ function assertTlvRanges(
 	}
 }
 
-/** Reject a features field carrying an even (required) bit we do not know. */
+/**
+ * BOLT 12 assigns no invreq_features bits and only basic_mpp to
+ * invoice_features, so init-only bits we implement stay unknown here.
+ */
+const INVOICE_REQUEST_KNOWN_FEATURES = FeatureFlags.empty();
+const INVOICE_KNOWN_FEATURES = FeatureFlags.empty();
+INVOICE_KNOWN_FEATURES.setOptional(Feature.BASIC_MPP);
+
+/** Reject a features field carrying an even (required) bit not in `known`. */
 function assertNoUnknownRequiredFeatures(
 	features: Buffer,
+	known: FeatureFlags,
 	field: string
 ): void {
-	const unknownRequired = hasUnsupportedRequiredFeatures(
-		FeatureFlags.empty(),
-		FeatureFlags.fromBuffer(features)
-	);
-	if (unknownRequired.length > 0) {
-		throw new Error(
-			`${field} requires unknown feature bit ${unknownRequired[0]}`
+	const unknownRequired = FeatureFlags.fromBuffer(features)
+		.listSetBits()
+		.find(
+			(bit) => bit % 2 === 0 && !known.hasBit(bit) && !known.hasBit(bit + 1)
 		);
+	if (unknownRequired !== undefined) {
+		throw new Error(`${field} requires unknown feature bit ${unknownRequired}`);
 	}
 }
 
@@ -338,7 +343,11 @@ export function decodeOfferTlv(data: Buffer): {
 	if (currencyVal) offer.currency = decodeStrictUtf8(currencyVal, 'currency');
 	if (amountVal) offer.amount = decodeTruncatedU64(amountVal);
 	if (featuresVal) {
-		assertNoUnknownRequiredFeatures(featuresVal, 'Offer');
+		assertNoUnknownRequiredFeatures(
+			featuresVal,
+			implementedFeatures(),
+			'Offer'
+		);
 		offer.features = featuresVal;
 	}
 	if (expiryVal) offer.absoluteExpiry = decodeTruncatedU64(expiryVal);
@@ -477,7 +486,11 @@ export function decodeInvoiceRequestTlv(data: Buffer): {
 		throw new Error('Invoice request missing required payer_key field');
 	}
 	if (featuresVal) {
-		assertNoUnknownRequiredFeatures(featuresVal, 'Invoice request');
+		assertNoUnknownRequiredFeatures(
+			featuresVal,
+			INVOICE_REQUEST_KNOWN_FEATURES,
+			'Invoice request'
+		);
 	}
 
 	// Compute offerId from the offer TLV records mirrored into the request. Offer
@@ -645,7 +658,11 @@ export function decodeInvoiceTlv(data: Buffer): {
 		throw new Error('Invoice invoice_node_id is not a valid point');
 	}
 	if (featuresVal) {
-		assertNoUnknownRequiredFeatures(featuresVal, 'Invoice');
+		assertNoUnknownRequiredFeatures(
+			featuresVal,
+			INVOICE_KNOWN_FEATURES,
+			'Invoice'
+		);
 	}
 
 	// The mirrored offer_description (type 10) rides in the invoice per the
