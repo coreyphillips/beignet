@@ -188,12 +188,66 @@ export function encodeOfferTlv(offer: IOffer): Buffer {
 	return encodeTlvStream(records);
 }
 
-/** Even TLV types an offer reader understands (unknown even = reject). */
-const OFFER_KNOWN_TYPES = new Set<bigint>(
-	Object.values(OfferTlvType)
+function enumTlvTypes(tlvTypes: object): bigint[] {
+	return Object.values(tlvTypes)
 		.filter((t): t is number => typeof t === 'number')
-		.map((t) => BigInt(t))
-);
+		.map((t) => BigInt(t));
+}
+
+/** Even TLV types an offer reader understands (unknown even = reject). */
+const OFFER_KNOWN_TYPES = new Set<bigint>(enumTlvTypes(OfferTlvType));
+
+/** An invoice_request mirrors the offer's fields ahead of its own. */
+const INVOICE_REQUEST_KNOWN_TYPES = new Set<bigint>([
+	...OFFER_KNOWN_TYPES,
+	...enumTlvTypes(InvoiceRequestTlvType)
+]);
+
+/** An invoice mirrors every invoice_request field ahead of its own. */
+const INVOICE_KNOWN_TYPES = new Set<bigint>([
+	...INVOICE_REQUEST_KNOWN_TYPES,
+	...enumTlvTypes(InvoiceTlvType)
+]);
+
+/**
+ * BOLT 12: every non-signature field must lie in 0..maxType or the
+ * experimental range up to maxExperimental. The signature range (240..1000)
+ * is allowed in both invoice_request and invoice.
+ */
+function assertTlvRanges(
+	records: ITlvRecord[],
+	maxType: bigint,
+	maxExperimental: bigint,
+	message: string
+): void {
+	for (const r of records) {
+		const inRange =
+			r.type <= maxType ||
+			(r.type >= 240n && r.type <= 1000n) ||
+			(r.type >= 1_000_000_000n && r.type <= maxExperimental);
+		if (!inRange) {
+			throw new Error(
+				`${message} TLV type ${r.type} outside the allowed ranges`
+			);
+		}
+	}
+}
+
+/** Reject a features field carrying an even (required) bit we do not know. */
+function assertNoUnknownRequiredFeatures(
+	features: Buffer,
+	field: string
+): void {
+	const unknownRequired = hasUnsupportedRequiredFeatures(
+		FeatureFlags.empty(),
+		FeatureFlags.fromBuffer(features)
+	);
+	if (unknownRequired.length > 0) {
+		throw new Error(
+			`${field} requires unknown feature bit ${unknownRequired[0]}`
+		);
+	}
+}
 
 /** Decode UTF-8 rejecting invalid/truncated sequences (BOLT 12 MUST). */
 const strictUtf8Decoder = new TextDecoder('utf-8', { fatal: true });
@@ -284,16 +338,7 @@ export function decodeOfferTlv(data: Buffer): {
 	if (currencyVal) offer.currency = decodeStrictUtf8(currencyVal, 'currency');
 	if (amountVal) offer.amount = decodeTruncatedU64(amountVal);
 	if (featuresVal) {
-		// Unknown even (required) feature bits make the offer unusable.
-		const unknownRequired = hasUnsupportedRequiredFeatures(
-			FeatureFlags.empty(),
-			FeatureFlags.fromBuffer(featuresVal)
-		);
-		if (unknownRequired.length > 0) {
-			throw new Error(
-				`Offer requires unknown feature bit ${unknownRequired[0]}`
-			);
-		}
+		assertNoUnknownRequiredFeatures(featuresVal, 'Offer');
 		offer.features = featuresVal;
 	}
 	if (expiryVal) offer.absoluteExpiry = decodeTruncatedU64(expiryVal);
@@ -389,13 +434,17 @@ export function encodeInvoiceRequestTlv(
 }
 
 /**
- * Decode an IInvoiceRequest from a TLV stream.
+ * Decode an IInvoiceRequest from a TLV stream, enforcing the BOLT 12 reader
+ * MUSTs on its shape: types confined to 0..159, the signature range and the
+ * experimental range up to 2999999999, unknown even types rejected, and no
+ * unknown even bit in invreq_features.
  */
 export function decodeInvoiceRequestTlv(data: Buffer): {
 	request: IInvoiceRequest;
 	records: ITlvRecord[];
 } {
-	const { records } = decodeTlvStream(data);
+	const { records } = decodeTlvStream(data, 0, INVOICE_REQUEST_KNOWN_TYPES);
+	assertTlvRanges(records, 159n, 2_999_999_999n, 'Invoice request');
 
 	const chainVal = findTlvRecord(records, BigInt(InvoiceRequestTlvType.CHAIN));
 	const amountVal = findTlvRecord(
@@ -426,6 +475,9 @@ export function decodeInvoiceRequestTlv(data: Buffer): {
 
 	if (!payerKeyVal) {
 		throw new Error('Invoice request missing required payer_key field');
+	}
+	if (featuresVal) {
+		assertNoUnknownRequiredFeatures(featuresVal, 'Invoice request');
 	}
 
 	// Compute offerId from the offer TLV records mirrored into the request. Offer
@@ -548,13 +600,17 @@ export function encodeInvoiceTlv(
 }
 
 /**
- * Decode an IBolt12Invoice from a TLV stream.
+ * Decode an IBolt12Invoice from a TLV stream, enforcing the BOLT 12 reader
+ * MUSTs on its shape: types confined to 0..239, the signature range and the
+ * experimental range up to 3999999999, unknown even types rejected, no
+ * unknown even bit in invoice_features, and a valid invoice_node_id point.
  */
 export function decodeInvoiceTlv(data: Buffer): {
 	invoice: IBolt12Invoice;
 	records: ITlvRecord[];
 } {
-	const { records } = decodeTlvStream(data);
+	const { records } = decodeTlvStream(data, 0, INVOICE_KNOWN_TYPES);
+	assertTlvRanges(records, 239n, 3_999_999_999n, 'Invoice');
 
 	const pathsVal = findTlvRecord(records, BigInt(InvoiceTlvType.PATHS));
 	const blindedPayVal = findTlvRecord(
@@ -585,6 +641,12 @@ export function decodeInvoiceTlv(data: Buffer): {
 	if (!nodeIdVal) throw new Error('Invoice missing required node_id field');
 	if (!createdAtVal)
 		throw new Error('Invoice missing required created_at field');
+	if (!isValidPublicKey(nodeIdVal)) {
+		throw new Error('Invoice invoice_node_id is not a valid point');
+	}
+	if (featuresVal) {
+		assertNoUnknownRequiredFeatures(featuresVal, 'Invoice');
+	}
 
 	// The mirrored offer_description (type 10) rides in the invoice per the
 	// BOLT 12 copy-all-invreq-fields rule; use it when present.

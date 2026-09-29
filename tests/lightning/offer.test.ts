@@ -60,6 +60,7 @@ import {
 	TLV_INVOICE_ERROR
 } from '../../src/lightning/offer';
 import { ITlvRecord } from '../../src/lightning/message/tlv';
+import { FeatureFlags } from '../../src/lightning/features/flags';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { OnionMessageManager } from '../../src/lightning/onion-message/manager';
 import { findRouteToBlindedPath } from '../../src/lightning/gossip/pathfinding';
@@ -112,6 +113,18 @@ describe('BOLT 12: Offers', () => {
 		);
 		request.signature = schnorrSign(sigHash, privkey2);
 		return encodeInvoiceRequestTlv(request, offerTlv);
+	}
+
+	function withExtraRecords(tlv: Buffer, extra: ITlvRecord[]): Buffer {
+		const records = [...getTlvRecords(tlv), ...extra];
+		records.sort((a, b) => (a.type < b.type ? -1 : a.type > b.type ? 1 : 0));
+		return Buffer.concat(records.map(encodeTlvRecordRaw));
+	}
+
+	function featureBits(...bits: number[]): Buffer {
+		const flags = FeatureFlags.empty();
+		for (const bit of bits) flags.setBit(bit);
+		return flags.toBuffer();
 	}
 
 	// ── Truncated U64 ───────────────────────────────────────────────
@@ -331,6 +344,65 @@ describe('BOLT 12: Offers', () => {
 			expect(types).to.include(OfferTlvType.DESCRIPTION);
 			expect(types).to.include(InvoiceRequestTlvType.PAYER_KEY);
 		});
+
+		describe('BOLT 12 reader checks (#1037)', () => {
+			const tlv = encodeInvoiceRequestTlv({
+				payerKey: pubkey2,
+				offerId: Buffer.alloc(32)
+			});
+			const extra = (type: bigint): ITlvRecord => ({
+				type,
+				value: Buffer.from([0x01])
+			});
+
+			it('accepts unknown odd fields in the invoice_request ranges', () => {
+				const data = withExtraRecords(tlv, [
+					extra(91n),
+					extra(241n),
+					extra(2_000_000_001n)
+				]);
+				expect(decodeInvoiceRequestTlv(data).records).to.have.length(4);
+			});
+
+			it('rejects an unknown even field', () => {
+				expect(() =>
+					decodeInvoiceRequestTlv(withExtraRecords(tlv, [extra(92n)]))
+				).to.throw('Unknown required TLV type: 92');
+				expect(() =>
+					decodeInvoiceRequestTlv(
+						withExtraRecords(tlv, [extra(2_000_000_002n)])
+					)
+				).to.throw('Unknown required TLV type: 2000000002');
+			});
+
+			it('rejects a field outside the invoice_request ranges', () => {
+				// Invoice types (160..239) and the invoice experimental range.
+				for (const type of [161n, 1001n, 3_000_000_001n]) {
+					expect(() =>
+						decodeInvoiceRequestTlv(withExtraRecords(tlv, [extra(type)]))
+					).to.throw(`TLV type ${type} outside the allowed ranges`);
+				}
+			});
+
+			it('rejects an unknown even bit in invreq_features', () => {
+				const request: IInvoiceRequest = {
+					payerKey: pubkey2,
+					offerId: Buffer.alloc(32)
+				};
+				expect(() =>
+					decodeInvoiceRequestTlv(
+						encodeInvoiceRequestTlv({
+							...request,
+							features: featureBits(122)
+						})
+					)
+				).to.throw('Invoice request requires unknown feature bit 122');
+				const { request: decoded } = decodeInvoiceRequestTlv(
+					encodeInvoiceRequestTlv({ ...request, features: featureBits(123) })
+				);
+				expect(decoded.features!.equals(featureBits(123))).to.be.true;
+			});
+		});
 	});
 
 	// ── Invoice TLV Encode/Decode ───────────────────────────────────
@@ -458,6 +530,73 @@ describe('BOLT 12: Offers', () => {
 			expect(() => decodeInvoiceTlv(data)).to.throw(
 				'missing required payment_hash'
 			);
+		});
+
+		describe('BOLT 12 reader checks (#1037)', () => {
+			const invoice: IBolt12Invoice = {
+				paymentHash: crypto.randomBytes(32),
+				amount: 100_000n,
+				description: 'reader checks',
+				createdAt: BigInt(Math.floor(Date.now() / 1000)),
+				nodeId: pubkey1
+			};
+			const tlv = encodeInvoiceTlv(invoice);
+			const extra = (type: bigint): ITlvRecord => ({
+				type,
+				value: Buffer.from([0x01])
+			});
+
+			it('accepts unknown odd fields in the invoice ranges', () => {
+				const data = withExtraRecords(tlv, [
+					extra(91n),
+					extra(179n),
+					extra(241n),
+					extra(2_000_000_001n),
+					extra(3_000_000_001n)
+				]);
+				expect(decodeInvoiceTlv(data).records).to.have.length(9);
+			});
+
+			it('rejects an unknown even field', () => {
+				expect(() =>
+					decodeInvoiceTlv(withExtraRecords(tlv, [extra(178n)]))
+				).to.throw('Unknown required TLV type: 178');
+				expect(() =>
+					decodeInvoiceTlv(withExtraRecords(tlv, [extra(3_000_000_002n)]))
+				).to.throw('Unknown required TLV type: 3000000002');
+			});
+
+			it('rejects a field outside the invoice ranges', () => {
+				for (const type of [1001n, 4_000_000_001n]) {
+					expect(() =>
+						decodeInvoiceTlv(withExtraRecords(tlv, [extra(type)]))
+					).to.throw(`TLV type ${type} outside the allowed ranges`);
+				}
+			});
+
+			it('rejects an unknown even bit in invoice_features', () => {
+				expect(() =>
+					decodeInvoiceTlv(
+						encodeInvoiceTlv({ ...invoice, features: featureBits(122) })
+					)
+				).to.throw('Invoice requires unknown feature bit 122');
+				const { invoice: decoded } = decodeInvoiceTlv(
+					encodeInvoiceTlv({ ...invoice, features: featureBits(123) })
+				);
+				expect(decoded.features!.equals(featureBits(123))).to.be.true;
+			});
+
+			it('rejects an invoice_node_id that is not a point', () => {
+				const notPoints = [
+					pubkey1.subarray(1), // x-only
+					Buffer.concat([Buffer.from([0x02]), Buffer.alloc(32, 0xff)])
+				];
+				for (const nodeId of notPoints) {
+					expect(() =>
+						decodeInvoiceTlv(encodeInvoiceTlv({ ...invoice, nodeId }))
+					).to.throw('invoice_node_id is not a valid point');
+				}
+			});
 		});
 	});
 
