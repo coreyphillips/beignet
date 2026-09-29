@@ -3094,14 +3094,15 @@ describe('Recovery phase 2: snapshots page what a guardian record cannot hold (i
 		expect(reports).to.deep.equal([]);
 		const frames = journal.loadVerifiedFrames();
 		expect(frames[0].snapshot!.pageFrames).to.equal(frames.length - 1);
-		// Guardians may only free below this snapshot once its last page is
-		// quorum-held (issue #1028), so the group names that page.
+		// Guardians may only free below this snapshot once every one holds its
+		// last page (issue #1028), so the group names that page and its hash.
 		expect(
 			JSON.parse(storage.getRecoveryMeta!('journal_last_snapshot_group')!)
 		).to.deep.equal({
 			sequence: '1',
 			groupEnd: String(frames.length),
-			frameHash: rows[0].frameHash.toString('hex')
+			frameHash: rows[0].frameHash.toString('hex'),
+			endHash: rows[rows.length - 1].frameHash.toString('hex')
 		});
 		// Releases that predate pageFrames restore only schema '2', so they
 		// refuse this rather than restore it without missing pages.

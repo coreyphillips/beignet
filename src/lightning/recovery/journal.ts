@@ -90,10 +90,11 @@ const META_DELTA_BYTES = 'journal_delta_bytes_since_snapshot';
 const META_LAST_SNAPSHOT_WRITTEN = 'journal_last_snapshot_written';
 /**
  * The newest snapshot WRITTEN as a group, JSON `{ sequence, groupEnd,
- * frameHash }`: groupEnd is its last page frame, or the snapshot itself
- * when unpaged. The replicator reads it to tell guardians they may free
- * the records below it (guardian-replication.ts retainFloor), which is
- * only safe once the quorum holds the whole group.
+ * frameHash, endHash }`: groupEnd is its last page frame, or the snapshot
+ * itself when unpaged, and endHash that frame's hash. The replicator reads
+ * it to tell guardians they may free the records below it
+ * (guardian-replication.ts retainFloor), which is only safe once every
+ * guardian holds the whole group.
  */
 export const META_LAST_SNAPSHOT_GROUP = 'journal_last_snapshot_group';
 /**
@@ -1861,7 +1862,8 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			JSON.stringify({
 				sequence: sequence.toString(),
 				groupEnd: (sequence + BigInt(pages.length)).toString(),
-				frameHash: snapshotHash.toString('hex')
+				frameHash: snapshotHash.toString('hex'),
+				endHash: frameHash.toString('hex')
 			})
 		);
 		if (dropped.length > 0) {

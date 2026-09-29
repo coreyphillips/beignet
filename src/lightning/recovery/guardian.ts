@@ -182,9 +182,9 @@ export interface IGuardianRegisterNodeResponse {
 
 /**
  * The writer's retain floor (wire 5.2): the record at `sequence` is a
- * snapshot whose whole group a quorum holds, so the writer will never ask
- * for anything below it again. Signed by the lease's writer key over the
- * RETAIN transcript.
+ * snapshot whose whole group every guardian of the set holds, so the writer
+ * will never ask for anything below it again. Signed by the lease's writer
+ * key over the RETAIN transcript.
  */
 export interface IGuardianRetainFloor {
 	sequence: bigint;

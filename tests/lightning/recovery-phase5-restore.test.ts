@@ -1467,10 +1467,11 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 		storage.close();
 	});
 
-	/** A client for `entry` whose PUT_STATE fails whenever `drop` says so. */
+	/** A client for `entry` whose `verbs` fail whenever `drop` says so. */
 	function dropping(
 		entry: IServed,
-		drop: (body: Buffer) => boolean
+		drop: (body: Buffer) => boolean,
+		verbs = ['/put_state']
 	): IBoundGuardianClient {
 		const transport = nodeGuardianTransport();
 		return {
@@ -1479,7 +1480,7 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 				url: entry.client.url,
 				guardianSetId: SET_ID,
 				transport: (url, init) =>
-					url.endsWith('/put_state') && drop(init.body as Buffer)
+					verbs.some((verb) => url.endsWith(verb)) && drop(init.body as Buffer)
 						? Promise.reject(new Error('dropped'))
 						: transport(url, init)
 			})
@@ -1506,7 +1507,7 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 		let lagging = false;
 		rep = replicatorFor(storage, [
 			...bind(served.slice(0, 2)),
-			dropping(served[2], () => lagging)
+			dropping(served[2], () => lagging, ['/put_state', '/sync_record'])
 		]);
 		const decision = await rep.ensureNamespace();
 		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
@@ -1534,6 +1535,57 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 		await shutdown(served);
 		storage.close();
 		target.close();
+	});
+
+	it('catches up a guardian that missed passes, so floors resume', async function (): Promise<void> {
+		this.timeout(30_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		let rep: GuardianReplicator | null = null;
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId,
+			{
+				snapshotIntervalFrames: 4,
+				retainFrom: (): bigint => (rep ? rep.replicatedThrough() + 1n : 1n)
+			}
+		);
+		const manager = new RecoveryManager(storage, { journal });
+		commitTransition(manager, 0);
+		let lagging = false;
+		rep = replicatorFor(storage, [
+			...bind(served.slice(0, 2)),
+			dropping(served[2], () => lagging)
+		]);
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		// Longer than one pass relays, and past snapshots the journal then
+		// compacts away, so only the peers still hold what it missed.
+		lagging = true;
+		for (let i = 1; i <= 10; i++) {
+			commitTransition(manager, i);
+			await rep.replicatePending(lease);
+			journal.compact();
+		}
+		lagging = false;
+		for (let i = 11; i <= 24; i++) {
+			commitTransition(manager, i);
+			await rep.replicatePending(lease);
+			journal.compact();
+		}
+
+		for (const entry of served) {
+			const head = (await entry.client.getHead(ROOT.recoveryId)).state!.logHead
+				.sequence;
+			expect(head).to.equal(rep.replicatedThrough());
+			const page = await entry.client.getState(ROOT.recoveryId, 0n);
+			expect(page.records![0].sequence > 1n).to.equal(true);
+		}
+		await shutdown(served);
+		storage.close();
 	});
 
 	it('keeps a proven floor across a restart that writes the next snapshot', async function (): Promise<void> {
@@ -1628,6 +1680,40 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 			await shutdown(served);
 			live.storage.close();
 		}
+	});
+
+	it('names no floor from a group whose last frame is not the one it names', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		const [snapshot, next] = live.storage.loadRecoveryFrames!();
+		const group = (endHash: Buffer): string =>
+			JSON.stringify({
+				sequence: '1',
+				groupEnd: '1',
+				frameHash: snapshot.frameHash.toString('hex'),
+				endHash: endHash.toString('hex')
+			});
+		// A group that ran through frame 2, its groupEnd damaged to 1.
+		live.storage.setRecoveryMeta!(
+			META_LAST_SNAPSHOT_GROUP,
+			group(next.frameHash)
+		);
+		expect((await rep.replicatePending(lease)).outcome).to.equal('replicated');
+		expect(rep.retainFloor(lease)).to.equal(undefined);
+
+		live.storage.setRecoveryMeta!(
+			META_LAST_SNAPSHOT_GROUP,
+			group(snapshot.frameHash)
+		);
+		commitTransition(live.manager, 10);
+		expect((await rep.replicatePending(lease)).outcome).to.equal('replicated');
+		expect(rep.retainFloor(lease)?.sequence).to.equal(1n);
+		await shutdown(served);
+		live.storage.close();
 	});
 
 	it('reports a guardian whose quota refuses records, once per episode', async function (): Promise<void> {

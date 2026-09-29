@@ -88,6 +88,8 @@ interface ISnapshotGroup {
 	sequence: bigint;
 	groupEnd: bigint;
 	frameHash: Buffer;
+	/** The hash of the frame at groupEnd, recorded by the journal only. */
+	endHash?: Buffer;
 }
 
 /**
@@ -111,7 +113,11 @@ function parseSnapshotGroup(
 		group = {
 			sequence: BigInt(String(parsed.sequence)),
 			groupEnd: BigInt(String(parsed.groupEnd)),
-			frameHash: Buffer.from(String(parsed.frameHash), 'hex')
+			frameHash: Buffer.from(String(parsed.frameHash), 'hex'),
+			endHash:
+				parsed.endHash == null
+					? undefined
+					: Buffer.from(String(parsed.endHash), 'hex')
 		};
 	} catch {
 		return null;
@@ -120,7 +126,8 @@ function parseSnapshotGroup(
 		group.sequence < 1n ||
 		group.groupEnd < group.sequence ||
 		group.groupEnd > 0xffffffffffffffffn ||
-		group.frameHash.length !== 32
+		group.frameHash.length !== 32 ||
+		(group.endHash !== undefined && group.endHash.length !== 32)
 	) {
 		return null;
 	}
@@ -315,6 +322,8 @@ interface IGuardianStreamResult {
 	tooLargeAt: bigint | null;
 	/** The lowest record this guardian refused because its quota is full. */
 	quotaRefusedAt: bigint | null;
+	/** The head it reported when that lies below this pass's first record. */
+	behindAt: bigint | null;
 	requests: number;
 }
 
@@ -970,6 +979,21 @@ export class GuardianReplicator {
 			this.config.context.guardianSetId
 		);
 		if (current && current.sequence >= group.sequence) return false;
+		// The metadata is a plain row, and a groupEnd short of the last page
+		// would free below a snapshot whose pages no guardian keeps. So both
+		// ends must be frames the journal holds (it never compacts its newest
+		// group).
+		const stored =
+			storage.loadRecoveryFrames?.(Number(group.sequence) - 1) ?? [];
+		const hashAt = (sequence: bigint): Buffer | undefined =>
+			stored.find((frame) => BigInt(frame.sequence) === sequence)?.frameHash;
+		if (
+			!group.endHash ||
+			!hashAt(group.sequence)?.equals(group.frameHash) ||
+			!hashAt(group.groupEnd)?.equals(group.endHash)
+		) {
+			return false;
+		}
 		storage.setRecoveryMeta?.(
 			this.keys.retainFloor,
 			JSON.stringify({
@@ -1249,6 +1273,7 @@ export class GuardianReplicator {
 			conflictAt: null,
 			tooLargeAt: null,
 			quotaRefusedAt: null,
+			behindAt: null,
 			requests: 0
 		};
 		let window = this.pipelineWindow;
@@ -1346,6 +1371,10 @@ export class GuardianReplicator {
 
 			if (result.sawSupersession) return result;
 			if (reported == null) return result;
+			if (reported < BigInt(frames[0].sequence) - 1n) {
+				result.behindAt = reported;
+				return result;
+			}
 			const next = frames.findIndex(
 				(frame) => BigInt(frame.sequence) > (reported as bigint)
 			);
@@ -1361,6 +1390,48 @@ export class GuardianReplicator {
 			cursor = next;
 		}
 		return result;
+	}
+
+	/**
+	 * Relay what a guardian missed in earlier passes from a peer. A pass
+	 * starts at the quorum watermark, so otherwise it answers every later
+	 * record with a gap for good, and no retain floor (which needs every
+	 * guardian) qualifies again. The journal may have compacted those
+	 * frames, but no floor has passed this guardian, so the peers keep them.
+	 * At most pipelineWindow records a pass, because the barrier waits on
+	 * the pass. Returns whether the guardian reached `through`.
+	 */
+	private async catchUp(
+		entry: IBoundGuardianClient,
+		head: bigint,
+		through: bigint
+	): Promise<boolean> {
+		for (const peer of this.config.guardians) {
+			if (peer === entry) continue;
+			const start = head;
+			try {
+				const page = await peer.client.getState(
+					this.config.recoveryRoot.recoveryId,
+					head,
+					this.pipelineWindow
+				);
+				for (const record of page.records ?? []) {
+					if (head >= through || record.sequence !== head + 1n) break;
+					const response = await entry.client.syncRecord(record);
+					if (
+						response.status !== GuardianStatus.OK &&
+						response.status !== GuardianStatus.OK_DUPLICATE
+					) {
+						break;
+					}
+					head = record.sequence;
+				}
+			} catch {
+				// Nothing from this peer this pass.
+			}
+			if (head > start) break;
+		}
+		return head >= through;
 	}
 
 	/**
@@ -1416,16 +1487,26 @@ export class GuardianReplicator {
 
 		const [streams] = await Promise.all([
 			Promise.all(
-				this.config.guardians.map((entry) =>
-					this.streamToGuardian(
-						entry,
-						frames,
-						lease,
-						framesBySequence,
-						tip,
-						retainFloor
-					)
-				)
+				this.config.guardians.map(async (entry) => {
+					const stream = (): Promise<IGuardianStreamResult> =>
+						this.streamToGuardian(
+							entry,
+							frames,
+							lease,
+							framesBySequence,
+							tip,
+							retainFloor
+						);
+					const result = await stream();
+					return result.behindAt != null &&
+						(await this.catchUp(
+							entry,
+							result.behindAt,
+							BigInt(frames[0].sequence) - 1n
+						))
+						? stream()
+						: result;
+				})
 			),
 			this.readMissingLimits()
 		]);

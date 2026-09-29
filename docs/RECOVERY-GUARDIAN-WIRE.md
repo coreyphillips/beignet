@@ -249,7 +249,8 @@ what it already holds costs nothing, and a replaced object costs its new
 encoding minus the old. The count is kept in the store and re-derived from
 its rows at every open, so two hosts on one store admit against one total.
 The quota never deletes on its own; what shrinks a set is its writers'
-retain floors (5.2), which free every record below a quorum-held snapshot.
+retain floors (5.2), which free every record below a snapshot every
+guardian of the set holds.
 
 `transportStatus` is the 2.5 HTTP-layer status, one to one: 200 for every
 well-formed protocol exchange INCLUDING protocol-level rejections (the
@@ -560,10 +561,12 @@ takeover can certify a head below F (4.2: a quorum-held record is never
 superseded), and a guardian that falls behind afterwards can still be
 repaired from its peers (5.6). A quorum is not enough: a guardian already
 behind F could never be repaired, and a restore that has lost a quorum
-member needs it. The pass that qualifies the group sends it at once, on a
-record each guardian already holds. A guardian that accepts or duplicates
-the record, holds the record at F with that frame hash, and has not
-already freed through F verifies the signature (`ERR_BAD_SIGNATURE`
+member needs it. A guardian that missed a pass therefore holds every
+floor back, so the writer relays what it missed from a peer (SYNC_RECORD)
+before streaming to it. The pass that qualifies the group sends it at
+once, on a record each guardian already holds. A guardian that accepts
+or duplicates the record, holds the record at F with that frame hash,
+and has not already freed through F verifies the signature (`ERR_BAD_SIGNATURE`
 refuses the whole request), deletes every record below F, orphan-archived
 ones included, and stores the state just before F with its
 own receipt signature over it, which is where its open-time walk (5.10)
