@@ -105,6 +105,11 @@ describe('Swap ledger (issue #737 phase 2)', function () {
 				...resolved,
 				resolution: { ...resolved.resolution, verifiedThisSession: false }
 			});
+			// So is a stranded mark (issue #1039): the operator cancel it
+			// licenses waits for this process to see the funding absent.
+			expect(
+				swapCodec.decode(swapCodec.encode({ ...record, strandedHeight: 1200 }))
+			).to.deep.equal(record);
 			expect(swapCodec.decode('not json')).to.equal(null);
 			expect(
 				swapCodec.decode(JSON.stringify({ ...record, state: 'NOPE' }))
@@ -183,6 +188,10 @@ describe('Swap ledger (issue #737 phase 2)', function () {
 			expect(swapSourcesFor('reverse', 'REFUNDED')).to.deep.equal([
 				'REFUND_PENDING'
 			]);
+			// A funding that never confirmed ends an exposed row (issue #1039).
+			expect(swapSourcesFor('reverse', 'FAILED').sort()).to.deep.equal(
+				['CREATED', 'EXPOSED', 'FUNDING', 'HELD'].sort()
+			);
 			expect(swapSourcesFor('reverse', 'CREATED')).to.deep.equal([]);
 			expect(
 				swapSourcesFor('submarine', 'PREIMAGE_KNOWN').sort()

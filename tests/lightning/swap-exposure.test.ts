@@ -114,8 +114,14 @@ describe('Swap exposure policy (issue #737 phase 2)', function () {
 		).to.include({ ok: false, reason: 'fee-rate' });
 	});
 
-	it('counts every unresolved row toward concurrency, terminal rows never', function () {
-		const live = [row('CREATED', 1n), row('CREATED', 1n)];
+	it('counts only rows at risk toward concurrency, never an unpaid create (issue #1039)', function () {
+		const live = [
+			...Array.from({ length: 8 }, () => row('CREATED', 1n)),
+			row('CREATED', 1n, 'submarine'),
+			row('FUNDED', 1n, 'submarine'),
+			row('HELD', 1n),
+			row('PAYING', 1n, 'submarine')
+		];
 		expect(
 			evaluateSwapExposure(policy, {
 				direction: 'reverse',
@@ -123,7 +129,7 @@ describe('Swap exposure policy (issue #737 phase 2)', function () {
 				live
 			})
 		).to.include({ ok: true });
-		live.push(row('HELD', 1n));
+		live.push(row('FUNDING_BROADCAST', 1n));
 		expect(
 			evaluateSwapExposure(policy, {
 				direction: 'reverse',

@@ -2740,7 +2740,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/swaps/cancel': {
 				post: {
 					summary:
-						'Cancel a swap before any funds moved: a reverse swap in CREATED or HELD (closes its hold invoice and fails the payer), a submarine swap before PAYING (the peer refunds its own coins at the refund height). Past that a swap resolves on chain by claim or refund. Admin scope',
+						'Cancel a swap before any funds moved: a reverse swap in CREATED or HELD (closes its hold invoice and fails the payer), a submarine swap before PAYING (the peer refunds its own coins at the refund height). Also ends a stranded reverse swap (EXPOSED with strandedHeight set: its funding was absent past the refund height). Past that a swap resolves on chain by claim or refund. Admin scope',
 					tags: ['Swaps'],
 					requestBody: {
 						required: true,
@@ -2765,7 +2765,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'409': {
 							description:
-								'SWAP_NOT_CANCELLABLE: the swap is past CREATED/HELD (reverse) or PAYING (submarine) and resolves on chain'
+								'SWAP_NOT_CANCELLABLE: the swap is past CREATED/HELD (reverse, unless stranded) or PAYING (submarine) and resolves on chain'
 						}
 					}
 				}
