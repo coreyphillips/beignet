@@ -62,7 +62,7 @@ describe('wrong-network and zero-amount payments are refused (#1036)', function 
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-1036-'));
 		node = await BeignetNode.create({
 			mnemonic: MNEMONIC,
-			network: 'testnet',
+			network: 'regtest',
 			dataDir: tmpDir,
 			logLevel: 'silent',
 			rapidGossipSync: false,
@@ -83,16 +83,16 @@ describe('wrong-network and zero-amount payments are refused (#1036)', function 
 		expect(err.code).to.equal('INVALID_INVOICE');
 		expect(err.message).to.contain('network "bc"');
 		expect(
-			node.decodeInvoice(invoiceFor(Network.TESTNET, 1_000n)).network
-		).to.equal(Network.TESTNET);
+			node.decodeInvoice(invoiceFor(Network.REGTEST, 1_000n)).network
+		).to.equal(Network.REGTEST);
 	});
 
 	it('validatePayment fails an invoice for another network', () => {
-		const result = node.validatePayment(invoiceFor(Network.REGTEST, 1_000n));
+		const result = node.validatePayment(invoiceFor(Network.TESTNET, 1_000n));
 		expect(result.status).to.equal('FAIL');
 		const decode = result.checks.find((c) => c.name === 'INVOICE_DECODE');
 		expect(decode?.status).to.equal('FAIL');
-		expect(decode?.message).to.contain('network "bcrt"');
+		expect(decode?.message).to.contain('network "tb"');
 	});
 
 	it('payInvoice refuses an invoice for another network', async () => {
@@ -106,7 +106,7 @@ describe('wrong-network and zero-amount payments are refused (#1036)', function 
 
 	it('payInvoice refuses amountSats 0 on an amountless invoice', async () => {
 		const err = await refusal(() =>
-			node.payInvoice(invoiceFor(Network.TESTNET), 5_000, undefined, 0)
+			node.payInvoice(invoiceFor(Network.REGTEST), 5_000, undefined, 0)
 		);
 		expect(err.code).to.equal('INVALID_PARAMS');
 		expect(err.message).to.contain('amountMsat must be positive');

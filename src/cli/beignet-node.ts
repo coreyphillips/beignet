@@ -173,14 +173,7 @@ import {
 	PaymentDirection,
 	PaymentStatus
 } from '../lightning/node/types';
-import {
-	BITCOIN_CHAIN_HASH,
-	REGTEST_CHAIN_HASH,
-	SIGNET_CHAIN_HASH,
-	TESTNET_CHAIN_HASH,
-	isAnchorChannel,
-	ChannelState
-} from '../lightning/channel/types';
+import { isAnchorChannel, ChannelState } from '../lightning/channel/types';
 import { isRecencyUnproven } from '../lightning/channel/channel-state';
 import type { Channel } from '../lightning/channel/channel';
 import { decode as decodeInvoice } from '../lightning/invoice/decode';
@@ -2472,10 +2465,7 @@ export class BeignetNode extends EventEmitter {
 		const beignetNetwork = this.toBeignetNetwork(networkName);
 		const lnNetwork = this.toLnNetwork(networkName);
 		const coinType = this.toCoinType(networkName);
-		let chainHash = BITCOIN_CHAIN_HASH;
-		if (networkName === 'testnet') chainHash = TESTNET_CHAIN_HASH;
-		if (networkName === 'regtest') chainHash = REGTEST_CHAIN_HASH;
-		if (networkName === 'signet') chainHash = SIGNET_CHAIN_HASH;
+		const chainHash = chainHashForNetwork(lnNetwork);
 
 		// 3. Create on-chain wallet
 		const electrumServer = {
