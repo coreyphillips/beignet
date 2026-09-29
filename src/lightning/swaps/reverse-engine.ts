@@ -1430,11 +1430,12 @@ export class ReverseSwapProvider extends EventEmitter {
 
 	/**
 	 * Put retained funding bytes back out after a reorg or a mempool drop.
-	 * The wallet lists their inputs as unspent again and has already pruned
-	 * the pledge, so they are pledged again before the bytes leave, or a
-	 * failed broadcast leaves them free for another selection. A withheld
-	 * funding is not pledged, so it holds no wallet coins. The hold is judged
-	 * again after the pledge because a cancel can land while the wallet waits.
+	 * The wallet lists their inputs as unspent again, and nothing renews a
+	 * funded row, so the pledge may have timed out. They are pledged again
+	 * before the bytes leave, or a failed broadcast leaves them free for
+	 * another selection. A withheld funding is not pledged, so it holds no
+	 * wallet coins. The hold is judged again after the pledge because a cancel
+	 * can land while the wallet waits.
 	 */
 	private async rebroadcastFunding(record: ISwapRecord): Promise<void> {
 		const txHex = record.fundingTxHex!;

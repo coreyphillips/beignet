@@ -136,6 +136,111 @@ async function fundedSwap(
 	return { swap, ack };
 }
 
+/**
+ * An engine funded through the production WalletFundingProvider, wired the
+ * way the node wires it. The wallet holds three coins and the swap funding
+ * spends the largest.
+ */
+async function walletFundedHarness() {
+	const network = bitcoin.networks.regtest;
+	const key = ECPairFactory(ecc).makeRandom({ network });
+	const pubkey = Buffer.from(key.publicKey);
+	const payment = bitcoin.payments.p2wpkh({ pubkey, network });
+	const parents = [200_000, 100_000, 100_000].map((value) => {
+		const tx = new bitcoin.Transaction();
+		tx.addInput(crypto.randomBytes(32), 0);
+		tx.addOutput(payment.output!, value);
+		return tx;
+	});
+	const utxos = parents.map((tx) => ({
+		address: payment.address!,
+		path: "m/84'/0/0",
+		tx_hash: tx.getId(),
+		tx_pos: 0,
+		value: tx.outs[0].value,
+		height: 900,
+		publicKey: pubkey.toString('hex')
+	}));
+	const fundingCoin = utxos[0];
+	const coin = `${fundingCoin.tx_hash}:0`;
+	const frozen = new Set<string>();
+	const ok = <T>(value: T) => ({ isErr: () => false, value });
+	const wallet = {
+		network: 'regtest',
+		send: async (p: { address: string; amount: number }) => {
+			const tx = new bitcoin.Transaction();
+			tx.version = 2;
+			tx.addInput(Buffer.from(fundingCoin.tx_hash, 'hex').reverse(), 0);
+			tx.addOutput(
+				bitcoin.address.toOutputScript(p.address, network),
+				p.amount
+			);
+			tx.addOutput(payment.output!, 90_000);
+			return ok(tx.toHex());
+		},
+		listUtxos: () => utxos,
+		getPrivateKey: () => key.toWIF(),
+		getChangeAddress: async () => ok({ address: payment.address! }),
+		isUtxoFrozen: (txid: string, index: number) =>
+			frozen.has(`${txid}:${index}`),
+		freezeUtxo: async (p: { txid: string; index: number }) => {
+			// Like the real wallet, an outpoint it does not list cannot be frozen.
+			if (!utxos.some((u) => u.tx_hash === p.txid && u.tx_pos === p.index)) {
+				return {
+					isErr: () => true,
+					error: { message: `UTXO ${p.txid}:${p.index} is not known` }
+				};
+			}
+			frozen.add(`${p.txid}:${p.index}`);
+			return ok('frozen');
+		},
+		unfreezeUtxo: async (p: { txid: string; index: number }) => {
+			frozen.delete(`${p.txid}:${p.index}`);
+			return ok('unfrozen');
+		},
+		electrum: {
+			getTransactions: async (params: {
+				txHashes: Array<{ tx_hash: string }>;
+			}) =>
+				ok({
+					data: params.txHashes.map((t) => ({
+						data: { tx_hash: t.tx_hash },
+						result: {
+							txid: t.tx_hash,
+							hex: parents.find((p) => p.getId() === t.tx_hash)!.toHex()
+						}
+					}))
+				})
+		}
+	};
+	const fp = new WalletFundingProvider(wallet as never);
+	const selectOutpoints = async (amountSat: bigint): Promise<string[]> =>
+		(await fp.selectSpliceInputs(amountSat, 1000)).inputs.map(
+			(i) =>
+				`${bitcoin.Transaction.fromBuffer(i.prevTx).getId()}:${
+					i.prevOutputIndex
+				}`
+		);
+	const h = await harness({
+		deps: {
+			fundOutput: async (address, amountSat, feeRate) => {
+				const built = await fp.buildFundingTransaction(
+					address,
+					amountSat,
+					feeRate
+				);
+				return {
+					txHex: built.txHex,
+					txid: built.txid,
+					vout: built.outputIndex
+				};
+			},
+			pledge: (txHex) => fp.pledgeTransactionInputs(txHex)
+		}
+	});
+	return { h, fp, utxos, fundingCoin, coin, frozen, selectOutpoints };
+}
+
 describe('Reverse swap provider engine (issue #737)', function () {
 	describe('quote and create', function () {
 		it('quotes limits and fees, and refuses the wrong direction or a missing estimate', async function () {
@@ -623,97 +728,8 @@ describe('Reverse swap provider engine (issue #737)', function () {
 		});
 
 		it('a failed reorg rebroadcast keeps its input out of wallet selection (issue #1149)', async function () {
-			const network = bitcoin.networks.regtest;
-			const key = ECPairFactory(ecc).makeRandom({ network });
-			const pubkey = Buffer.from(key.publicKey);
-			const payment = bitcoin.payments.p2wpkh({ pubkey, network });
-			const parents = [200_000, 100_000, 100_000].map((value) => {
-				const tx = new bitcoin.Transaction();
-				tx.addInput(crypto.randomBytes(32), 0);
-				tx.addOutput(payment.output!, value);
-				return tx;
-			});
-			const utxos = parents.map((tx) => ({
-				address: payment.address!,
-				path: "m/84'/0/0",
-				tx_hash: tx.getId(),
-				tx_pos: 0,
-				value: tx.outs[0].value,
-				height: 900,
-				publicKey: pubkey.toString('hex')
-			}));
-			const fundingCoin = utxos[0];
-			const coin = `${fundingCoin.tx_hash}:0`;
-			const frozen = new Set<string>();
-			const ok = <T>(value: T) => ({ isErr: () => false, value });
-			const wallet = {
-				network: 'regtest',
-				// The swap funding spends the largest coin.
-				send: async (p: { address: string; amount: number }) => {
-					const tx = new bitcoin.Transaction();
-					tx.version = 2;
-					tx.addInput(Buffer.from(fundingCoin.tx_hash, 'hex').reverse(), 0);
-					tx.addOutput(
-						bitcoin.address.toOutputScript(p.address, network),
-						p.amount
-					);
-					tx.addOutput(payment.output!, 90_000);
-					return ok(tx.toHex());
-				},
-				listUtxos: () => utxos,
-				getPrivateKey: () => key.toWIF(),
-				getChangeAddress: async () => ok({ address: payment.address! }),
-				isUtxoFrozen: (txid: string, index: number) =>
-					frozen.has(`${txid}:${index}`),
-				freezeUtxo: async (p: { txid: string; index: number }) => {
-					frozen.add(`${p.txid}:${p.index}`);
-					return ok('frozen');
-				},
-				unfreezeUtxo: async (p: { txid: string; index: number }) => {
-					frozen.delete(`${p.txid}:${p.index}`);
-					return ok('unfrozen');
-				},
-				electrum: {
-					getTransactions: async (params: {
-						txHashes: Array<{ tx_hash: string }>;
-					}) =>
-						ok({
-							data: params.txHashes.map((t) => ({
-								data: { tx_hash: t.tx_hash },
-								result: {
-									txid: t.tx_hash,
-									hex: parents.find((p) => p.getId() === t.tx_hash)!.toHex()
-								}
-							}))
-						})
-				}
-			};
-			const fp = new WalletFundingProvider(wallet as never);
-			const selectOutpoints = async (amountSat: bigint): Promise<string[]> =>
-				(await fp.selectSpliceInputs(amountSat, 1000)).inputs.map(
-					(i) =>
-						`${bitcoin.Transaction.fromBuffer(i.prevTx).getId()}:${
-							i.prevOutputIndex
-						}`
-				);
-			// Wired the way the node wires its funding provider.
-			const h = await harness({
-				deps: {
-					fundOutput: async (address, amountSat, feeRate) => {
-						const built = await fp.buildFundingTransaction(
-							address,
-							amountSat,
-							feeRate
-						);
-						return {
-							txHex: built.txHex,
-							txid: built.txid,
-							vout: built.outputIndex
-						};
-					},
-					pledge: (txHex) => fp.pledgeTransactionInputs(txHex)
-				}
-			});
+			const { h, fp, utxos, fundingCoin, coin, frozen, selectOutpoints } =
+				await walletFundedHarness();
 			const { swap } = await fundedSwap(h);
 			const r = record(h, swap);
 			expect(frozen.has(coin)).to.equal(true);
@@ -722,8 +738,13 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			await h.engine.onBlock(1001);
 			expect(record(h, swap).state).to.equal('FUNDED');
 
-			// The wallet sees the spend, and its next selection prunes the pledge.
+			// Nothing renews a funded row, so an hour later the wallet's next
+			// selection prunes the spent coin's pledge.
 			utxos.splice(0, 1);
+			(fp as unknown as { pledged: Map<string, number> }).pledged.set(
+				coin,
+				Date.now() - 61 * 60_000
+			);
 			await selectOutpoints(50_000n);
 			expect(frozen.has(coin)).to.equal(false);
 
@@ -743,6 +764,51 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			await h.engine.onBlock(1003);
 			expect(h.chain.broadcasts).to.have.length(2);
 			expect(h.chain.mempoolHas(r.fundingTxid!)).to.equal(true);
+		});
+
+		it('a funding input a reorg hands back is frozen before the block pass renews it (issue #1159)', async function () {
+			const { h, utxos, fundingCoin, coin, frozen, selectOutpoints } =
+				await walletFundedHarness();
+			const { swap } = await fundedSwap(h);
+			const r = record(h, swap);
+			h.chain.confirm(r.fundingTxid!, 1001);
+			h.chain.height = 1001;
+			await h.engine.onBlock(1001);
+			expect(record(h, swap).state).to.equal('FUNDED');
+
+			// The wallet sees the spend, and its next selection prunes.
+			utxos.splice(0, 1);
+			expect(await selectOutpoints(50_000n)).to.deep.equal([
+				`${utxos[0].tx_hash}:0`
+			]);
+			expect(frozen.has(coin)).to.equal(true);
+
+			// A reorg hands the coin back, and the block pass stalls on its chain
+			// reads before it reaches the swap's renewal.
+			utxos.unshift(fundingCoin);
+			h.chain.evict(r.fundingTxid!);
+			let resume: () => void = () => undefined;
+			const reads = new Promise<void>((resolve) => {
+				resume = resolve;
+			});
+			const history = h.chain.getScriptHashHistory.bind(h.chain);
+			h.chain.getScriptHashHistory = async (scriptHash) => {
+				await reads;
+				return history(scriptHash);
+			};
+			h.chain.height = 1002;
+			const pass = h.engine.onBlock(1002);
+			await settle();
+			expect(h.chain.broadcasts).to.have.length(1);
+			expect(await selectOutpoints(50_000n)).to.deep.equal([
+				`${utxos[2].tx_hash}:0`
+			]);
+
+			resume();
+			await pass;
+			expect(h.chain.broadcasts).to.have.length(2);
+			expect(h.chain.mempoolHas(r.fundingTxid!)).to.equal(true);
+			expect(frozen.has(coin)).to.equal(true);
 		});
 
 		it('reports funding progress over status and confirms to policy', async function () {
