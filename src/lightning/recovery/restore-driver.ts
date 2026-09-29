@@ -842,6 +842,31 @@ export class RestoreDriver {
 		return [...bySigner.values()];
 	}
 
+	/** A guardian that granted this attempt and has not moved past it. */
+	private boundTo(reading: IHeadReading, attempt: IPendingAttempt): boolean {
+		return (
+			reading.state.lease.epoch === attempt.newEpoch &&
+			reading.state.lease.writerPublicKey.equals(attempt.writer.publicKey)
+		);
+	}
+
+	/**
+	 * The attempt's own guard as a repair target, downloaded from a guardian
+	 * whose log ends exactly there: one still at the guard, or one bound to
+	 * the attempt (a takeover keeps the log head, and nothing is written
+	 * under the new key before the lease is installed).
+	 */
+	private guardReading(
+		attempt: IPendingAttempt,
+		pool: IHeadReading[]
+	): IHeadReading | null {
+		const holder =
+			pool.find((reading) =>
+				statesEqual(reading.state, attempt.expectedState)
+			) ?? pool.find((reading) => this.boundTo(reading, attempt));
+		return holder ? { ...holder, state: attempt.expectedState } : null;
+	}
+
 	/**
 	 * Steps 4 and 5: the CAS takeover. An attempt is PERSISTED before it is
 	 * sent and RETRIED IDENTICALLY, because once a guardian accepts an
@@ -865,7 +890,10 @@ export class RestoreDriver {
 		let stalePool = stale;
 		let repaired = 0;
 		let pending = this.loadPending();
+		let bound = false;
 		if (pending) {
+			const resumed = pending;
+			bound = pool.some((reading) => this.boundTo(reading, resumed));
 			this.emit(
 				'epoch:resumed',
 				`resuming the acquisition of epoch ${pending.newEpoch} with its original writer key`
@@ -873,7 +901,15 @@ export class RestoreDriver {
 		}
 
 		for (let attempt = 1; attempt <= this.maxCasAttempts; attempt++) {
-			repaired += await this.repairLaggards(pool, stalePool, expected);
+			// A guardian bound to the pending attempt can grant nothing else, so
+			// the attempt completes over its own guard or not at all. Repairing
+			// laggards toward a newer head would carry them past that guard,
+			// where they can never grant it either (issue #1040).
+			const repairTarget =
+				bound && pending ? this.guardReading(pending, pool) : expected;
+			if (repairTarget) {
+				repaired += await this.repairLaggards(pool, stalePool, repairTarget);
+			}
 			if (!pending) {
 				pending = {
 					expectedState: expected.state,
@@ -943,6 +979,7 @@ export class RestoreDriver {
 				const certified = pending.expectedState;
 				const source =
 					pool.find((reading) => statesEqual(reading.state, certified)) ??
+					repairTarget ??
 					expected;
 				return {
 					lease,
@@ -984,17 +1021,12 @@ export class RestoreDriver {
 			// re-targeting costs no epoch that anyone acknowledged.
 			const acceptedSomewhere =
 				certificates.length > 0 ||
-				pool.some(
-					(reading) =>
-						reading.state.lease.epoch === attemptSoFar.newEpoch &&
-						reading.state.lease.writerPublicKey.equals(
-							attemptSoFar.writer.publicKey
-						)
-				);
+				pool.some((reading) => this.boundTo(reading, attemptSoFar));
 			const guardMoved = !statesEqual(
 				expected.state,
 				attemptSoFar.expectedState
 			);
+			bound = acceptedSomewhere;
 			if (superseded || (!acceptedSomewhere && guardMoved)) {
 				this.emit(
 					'epoch:abandoned',
@@ -1004,6 +1036,7 @@ export class RestoreDriver {
 				);
 				this.clearPending();
 				pending = null;
+				bound = false;
 			}
 		}
 		throw new RestoreRefusedError(
