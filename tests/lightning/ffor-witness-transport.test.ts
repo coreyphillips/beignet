@@ -182,6 +182,7 @@ describe('FFOR receipt witness transport (M9.0)', function () {
 			})
 		);
 		full.on('node:error', () => {});
+		full.handleNewBlock(TIP);
 		new NodeLink(w.r, full);
 		let refused: Error | null = null;
 		try {

@@ -10,6 +10,7 @@
  */
 
 import crypto from 'crypto';
+import { Channel } from '../channel/channel';
 import { sign } from '../crypto/ecdh';
 import { computeHAct, computeHBook, decodeVoucherBook } from './transcript';
 import { sealRecordBody } from './witness-crypto';
@@ -123,6 +124,11 @@ interface IPendingBarrier {
 
 const DEFAULT_MAX_MAILBOXES = 64;
 const DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
+/**
+ * How far past T_exp a mailbox may ask to be kept. R asks for T_exp + 288 by
+ * default, and records fetched after T_exp are audit only.
+ */
+const MAX_RETENTION_PAST_T_EXP = 2016;
 
 export class FforWitnessService {
 	readonly maxMailboxes: number;
@@ -470,8 +476,27 @@ export class FforWitnessService {
 			refuse('activation hash does not match the book');
 			return;
 		}
+		// Anyone may provision, and the reservation is held until
+		// retention_until, so both ends are bounded against the tip. S activates
+		// no epoch whose T_exp is further than MAX_HTLC_CLTV_EXPIRY_DELTA away;
+		// the margin absorbs a witness tip that lags S's.
+		const tip = this.deps.currentHeight();
+		const maxBookBlocks =
+			Channel.MAX_HTLC_CLTV_EXPIRY_DELTA + FF_WITNESS_RETENTION_MARGIN_BLOCKS;
+		if (tExp <= tip) {
+			refuse('T_exp is not in the future');
+			return;
+		}
+		if (tExp > tip + maxBookBlocks) {
+			refuse(`T_exp is more than ${maxBookBlocks} blocks away`);
+			return;
+		}
 		if (manifest.retentionUntil < tExp + FF_WITNESS_RETENTION_MARGIN_BLOCKS) {
 			refuse('retention_until is under T_exp + 144');
+			return;
+		}
+		if (manifest.retentionUntil > tExp + MAX_RETENTION_PAST_T_EXP) {
+			refuse(`retention_until is over T_exp + ${MAX_RETENTION_PAST_T_EXP}`);
 			return;
 		}
 		if (manifest.minReceipts > 0) {

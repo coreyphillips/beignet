@@ -75,6 +75,8 @@ interface IHarness {
 	service: FforWitnessService;
 	sent: { peer: string; type: number; payload: Buffer }[];
 	events: { event: string; data: unknown }[];
+	/** The witness's tip; the default puts T_exp 800_000 4000 blocks out. */
+	tip: { height: number };
 }
 
 function serviceOn(
@@ -83,30 +85,32 @@ function serviceOn(
 ): IHarness {
 	const sent: IHarness['sent'] = [];
 	const events: IHarness['events'] = [];
+	const tip = { height: 796_000 };
 	const service = new FforWitnessService(
 		{ enabled: true, ...cfg },
 		{
 			ledger,
 			nodePrivkey: W_PRIV,
 			nodeId: W_ID,
-			currentHeight: () => 790_100,
+			currentHeight: () => tip.height,
 			send: (peer, type, payload) => sent.push({ peer, type, payload }),
 			log: () => undefined,
 			emit: (event, data) => events.push({ event, data })
 		}
 	);
-	return { service, sent, events };
+	return { service, sent, events, tip };
 }
 
 function book(
 	K: number,
-	seed = 'book'
+	seed = 'book',
+	tExp = 800_000
 ): { book: Buffer; entries: IFforBookEntry[] } {
 	const entries = Array.from({ length: K }, (_, i) => ({
 		k: i + 1,
 		paymentHash: sha256(Buffer.from(`${seed}-${i}`)),
 		amountMsat: 100_000_000n,
-		voucherExpiry: 800_000,
+		voucherExpiry: tExp,
 		settlementDeadline: 798_992,
 		sHtlcId: BigInt(i)
 	}));
@@ -298,6 +302,48 @@ describe('FFOR witness store and service (Appendix F.5, section 9.6.4)', functio
 		// The good one lands, and its hashes may not be provisioned twice.
 		expect(provision(h, provisionFor(good)).ok).to.be.true;
 		expect(refusal(provisionFor(good))).to.match(/already held/);
+		storage.close();
+	});
+
+	it('refuses a book or a retention beyond its horizon, so no mailbox holds a reservation for good (issue #1032)', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const ledger = ledgerOn(storage);
+		const h = serviceOn(ledger, { maxMailboxes: 1 });
+		const max = 2 ** 32 - 1;
+		// The reported fill: T_exp and retention_until at the top of the u32.
+		const far = provision(
+			h,
+			provisionFor(book(1, 'far', max - 144).book, { retentionUntil: max })
+		);
+		expect(far.ok).to.be.false;
+		expect(far.error).to.match(/T_exp is more than 5184 blocks away/);
+		// A near T_exp does not carry an unbounded retention.
+		const kept = provision(
+			h,
+			provisionFor(book(1, 'kept').book, { retentionUntil: max })
+		);
+		expect(kept.error).to.match(/retention_until is over T_exp \+ 2016/);
+		// A book whose T_exp has already come.
+		h.tip.height = 800_000;
+		expect(provision(h, provisionFor(book(1, 'past').book)).error).to.match(
+			/T_exp is not in the future/
+		);
+		expect(h.service.listMailboxes()).to.have.length(0);
+
+		// Both edges are accepted, and the mailbox frees its slot on schedule.
+		h.tip.height = 800_000 - 5184;
+		const edge = provisionFor(book(1, 'edge').book, {
+			retentionUntil: 800_000 + 2016
+		});
+		expect(provision(h, edge).ok).to.be.true;
+		expect(provision(h, provisionFor(book(1, 'next').book)).error).to.match(
+			/cannot reserve/
+		);
+		h.service.onBlock(800_000 + 2017);
+		expect(ledger.mailbox(edge.mailboxId.toString('hex'))!.state).to.equal(
+			'EXPIRED'
+		);
 		storage.close();
 	});
 
