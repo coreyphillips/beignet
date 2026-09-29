@@ -287,6 +287,8 @@ export class FakeWallet {
 	gate: (() => Promise<void>) | null = null;
 	/** Awaited inside pledge: a wallet whose selection lock is busy (tests). */
 	pledgeGate: (() => Promise<void>) | null = null;
+	/** The coin the next build spends; a random outpoint when unset. */
+	nextInput: { hash: Buffer; index: number } | null = null;
 
 	async fundOutput(
 		address: string,
@@ -300,7 +302,8 @@ export class FakeWallet {
 		if (this.gate) await this.gate();
 		const tx = new bitcoin.Transaction();
 		tx.version = 2;
-		tx.addInput(crypto.randomBytes(32), 0, 0xfffffffd);
+		const input = this.nextInput ?? { hash: crypto.randomBytes(32), index: 0 };
+		tx.addInput(input.hash, input.index, 0xfffffffd);
 		tx.addOutput(
 			bitcoin.address.toOutputScript(address, bitcoin.networks.regtest),
 			Number(amountSat - this.shortBy)

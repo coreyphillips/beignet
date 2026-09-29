@@ -16,7 +16,10 @@ export interface ISwapExposurePolicy {
 	maxSwapSat: bigint;
 	/** Sum of principal at risk across every unresolved swap. */
 	maxTotalExposureSat: bigint;
-	/** Unresolved swaps of any state, quoted-but-unpaid ones included. */
+	/**
+	 * Swaps whose principal is at risk at once (isSwapExposure). An unpaid
+	 * create does not count: any peer can make one for free.
+	 */
 	maxConcurrentSwaps: number;
 	/** Wallet balance that must remain after funding, when a balance is known. */
 	feeReserveSat: bigint;
@@ -86,9 +89,11 @@ export function validateSwapExposurePolicy(policy: ISwapExposurePolicy): void {
 }
 
 /**
- * Admission against the caps. Counting rules: every unresolved row counts
- * toward concurrency; only rows whose principal is at risk (isSwapExposure)
- * count toward exposure. The candidate itself is added to both.
+ * Admission against the caps. Only rows whose principal is at risk
+ * (isSwapExposure) count toward concurrency and exposure; the candidate
+ * itself is added to both. The engines judge again right before the step
+ * that commits the provider (a reverse hold admitted, a submarine payment
+ * dispatched), which is where the cap actually binds.
  */
 export function evaluateSwapExposure(
 	policy: ISwapExposurePolicy,
@@ -120,17 +125,20 @@ export function evaluateSwapExposure(
 			detail: `${input.feeRateSatPerVbyte} sat/vB exceeds the ${policy.fundingFeeRateCeilingSatPerVbyte} sat/vB ceiling`
 		};
 	}
-	if (input.live.length + 1 > policy.maxConcurrentSwaps) {
+	let exposedCount = 0;
+	let exposedSat = 0n;
+	for (const r of input.live) {
+		if (isSwapExposure(r, input.resolutionConfirmations ?? 1)) {
+			exposedCount++;
+			exposedSat += BigInt(r.onchainSat);
+		}
+	}
+	if (exposedCount + 1 > policy.maxConcurrentSwaps) {
 		return {
 			ok: false,
 			reason: 'concurrency',
-			detail: `${input.live.length} unresolved swaps already, limit ${policy.maxConcurrentSwaps}`
+			detail: `${exposedCount} swaps at risk already, limit ${policy.maxConcurrentSwaps}`
 		};
-	}
-	let exposedSat = 0n;
-	for (const r of input.live) {
-		if (isSwapExposure(r, input.resolutionConfirmations ?? 1))
-			exposedSat += BigInt(r.onchainSat);
 	}
 	if (exposedSat + amountSat > policy.maxTotalExposureSat) {
 		return {

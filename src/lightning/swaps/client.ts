@@ -85,7 +85,16 @@ export interface IReverseSwapTermsCheck {
 	maxRefundDelta: number;
 	/** The most the client will pay above the on-chain amount. */
 	maxTotalFeeSat: bigint;
+	/**
+	 * Blocks the hold invoice's final CLTV may exceed the refund delta by,
+	 * for the provider's resolution and hold-cancel margins (default 144).
+	 * The final CLTV is how long the payment stays locked if the provider
+	 * never funds.
+	 */
+	maxFinalCltvMargin?: number;
 }
+
+const DEFAULT_FINAL_CLTV_MARGIN = 144;
 
 export type ReverseSwapTermsVerdict =
 	| {
@@ -113,7 +122,8 @@ function bitcoinNetwork(network: Network): bitcoin.Network {
  * the contract rebuilt from the client's own hash and claim key plus the
  * provider's refund key and height must equal the ack's script and address;
  * the invoice must carry that hash for exactly the quoted amount on the
- * expected network; the fee and refund window must be within policy.
+ * expected network; the fee and refund window must be within policy, and the
+ * invoice's final CLTV within the refund delta plus maxFinalCltvMargin.
  */
 export function verifyReverseSwapTerms(
 	check: IReverseSwapTermsCheck
@@ -210,6 +220,15 @@ export function verifyReverseSwapTerms(
 	const expiresAt = invoice.timestamp + (invoice.expiry ?? DEFAULT_EXPIRY);
 	if (terms.invoiceExpiresAt !== expiresAt) {
 		return { ok: false, reason: 'invoice expiry differs from the terms' };
+	}
+	const finalCltv = invoice.minFinalCltvExpiry ?? DEFAULT_MIN_FINAL_CLTV_EXPIRY;
+	const cltvLimit =
+		delta + (check.maxFinalCltvMargin ?? DEFAULT_FINAL_CLTV_MARGIN);
+	if (finalCltv > cltvLimit) {
+		return {
+			ok: false,
+			reason: `invoice final CLTV ${finalCltv} exceeds ${cltvLimit} blocks`
+		};
 	}
 	return {
 		ok: true,
