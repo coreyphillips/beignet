@@ -452,6 +452,15 @@ export const MIN_DUST_LIMIT_SATOSHIS = 354n;
  *  our to_remote output out of every commitment we sign (see FS-1). */
 export const MAX_DUST_LIMIT_SATOSHIS = 1062n;
 
+/** The minimum_depth we advertise as acceptor, and the least a v2 opener
+ *  waits on a funding transaction that can carry the accepter's inputs. */
+export const DEFAULT_MINIMUM_DEPTH = 3;
+
+/** Upper bound on a peer's minimum_depth, matching LDK's max_minimum_depth.
+ *  The funder's coins are locked in the 2-of-2 until that depth, so an
+ *  unbounded value holds them until a force close. */
+export const MAX_MINIMUM_DEPTH = 144;
+
 /** Largest value encodable in a wire u64 field. */
 export const U64_MAX = 0xffffffffffffffffn;
 

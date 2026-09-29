@@ -15,7 +15,8 @@ import {
 	IChannelConfig,
 	IHtlcEntry,
 	IHtlcSnapshotEntry,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	DEFAULT_MINIMUM_DEPTH
 } from './types';
 
 /**
@@ -1267,7 +1268,7 @@ export function createAcceptorState(params: {
 		pushMsat: params.pushMsat,
 		fundingTxid: null,
 		fundingOutputIndex: 0,
-		minimumDepth: 3,
+		minimumDepth: DEFAULT_MINIMUM_DEPTH,
 
 		localConfig: { ...params.localConfig },
 		localBasepoints: params.localBasepoints,

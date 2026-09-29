@@ -95,7 +95,8 @@ import {
 	HtlcState,
 	BITCOIN_CHAIN_HASH,
 	MAX_FUNDING_SATOSHIS,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	DEFAULT_MINIMUM_DEPTH
 } from './types';
 import {
 	IAbandonedLocalAdd,
@@ -16573,11 +16574,22 @@ export class Channel {
 			this._state.channelType &&
 			FeatureFlags.fromBuffer(this._state.channelType).hasFeature(
 				Feature.ZERO_CONF
-			) &&
-			msg.minimumDepth !== 0
+			)
 		) {
-			const reason = `zero_conf accept_channel2 must use minimum_depth 0, got ${msg.minimumDepth}`;
-			return refuse(reason);
+			if (msg.minimumDepth !== 0) {
+				const reason = `zero_conf accept_channel2 must use minimum_depth 0, got ${msg.minimumDepth}`;
+				return refuse(reason);
+			}
+		} else {
+			// BOLT 2: our channel_ready waits for the accepter's minimum_depth.
+			// Never for less than our own default either: until the funding is
+			// buried the accepter can double-spend an input of its own and take
+			// back a balance it has already spent through us. Floored whatever
+			// the accepter funds here, because an RBF can change its share later.
+			this._state.minimumDepth = Math.max(
+				DEFAULT_MINIMUM_DEPTH,
+				msg.minimumDepth
+			);
 		}
 
 		this._state.remoteBasepoints = session.getRemoteBasepoints();
