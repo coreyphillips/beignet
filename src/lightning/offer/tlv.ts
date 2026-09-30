@@ -19,7 +19,7 @@ import {
 	decodeBlindedPayInfos
 } from '../onion/blinded-path';
 import { isValidPublicKey } from '../crypto/ecdh';
-import { Feature, FeatureFlags, implementedFeatures } from '../features/flags';
+import { Feature, FeatureFlags } from '../features/flags';
 import {
 	IOffer,
 	IInvoiceRequest,
@@ -231,9 +231,10 @@ function assertTlvRanges(
 }
 
 /**
- * BOLT 12 assigns no invreq_features bits and only basic_mpp to
- * invoice_features, so init-only bits we implement stay unknown here.
+ * BOLT 12 assigns no offer_features or invreq_features bits and only basic_mpp
+ * to invoice_features, so init-only bits we implement stay unknown here.
  */
+const OFFER_KNOWN_FEATURES = FeatureFlags.empty();
 const INVOICE_REQUEST_KNOWN_FEATURES = FeatureFlags.empty();
 const INVOICE_KNOWN_FEATURES = FeatureFlags.empty();
 INVOICE_KNOWN_FEATURES.setOptional(Feature.BASIC_MPP);
@@ -343,11 +344,7 @@ export function decodeOfferTlv(data: Buffer): {
 	if (currencyVal) offer.currency = decodeStrictUtf8(currencyVal, 'currency');
 	if (amountVal) offer.amount = decodeTruncatedU64(amountVal);
 	if (featuresVal) {
-		assertNoUnknownRequiredFeatures(
-			featuresVal,
-			implementedFeatures(),
-			'Offer'
-		);
+		assertNoUnknownRequiredFeatures(featuresVal, OFFER_KNOWN_FEATURES, 'Offer');
 		offer.features = featuresVal;
 	}
 	if (expiryVal) offer.absoluteExpiry = decodeTruncatedU64(expiryVal);
