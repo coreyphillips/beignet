@@ -302,6 +302,7 @@ Automatic execution is **off by default**: pass `autoRebalance: { enabled: true,
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `backup(destPath)` | `Promise<void>` | Create online backup of SQLite database |
+| `storageFiles()` | `string[]` | The live database, its sidecars and the instance lock (paths `POST /backup` refuses to write over) |
 
 Storage encryption: the SQLite database is encrypted at rest by default with a
 key derived (HKDF-SHA256) from the wallet's BIP39 seed. Sensitive payloads
@@ -2227,7 +2228,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/graph/describe` | `?limit=&offset=` | Paged channel dump (limit defaults to 500, capped at 500) |
 | POST | `/route/query` | `{ destination, amountSats, maxFeeSats? }` | Compute a route WITHOUT sending; hops feed `/payment/send-to-route` |
 | POST | `/payment/send-to-route` | `{ paymentHash, route: { hops }, paymentSecret? }` | Send a payment along an explicit route from `/route/query`. Answers 409 while draining and 403 over a spending limit, judged on what the first hop carries (amount plus every fee); a first hop below the final amount or a negative amount is 400 `INVALID_PARAMS` |
-| POST | `/backup` | `{ destPath }` | Create online database backup |
+| POST | `/backup` | `{ destPath, overwrite? }` | Create online database backup. An existing `destPath` is 400 `INVALID_PARAMS` unless `overwrite: true`; the live database, its sidecars, the instance lock, `config.json` and `daemon.pid` are refused even then |
 | GET | `/backup/scb` | - | Export encrypted static channel backup `{ encoded, channelCount, path }` |
 | POST | `/backup/trigger` | -- | Run the configured scheduled backup now (no-op when `backupPath` unset) |
 | POST | `/message/sign` | `{ message }` | Sign message with the node key (LND-compatible zbase32 signature) |
