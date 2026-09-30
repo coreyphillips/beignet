@@ -28346,6 +28346,11 @@ export class LightningNode extends EventEmitter {
 				"Offer is not for this node's chain: its offer_chains do not include it"
 			);
 		}
+		// The invoice is paid over this node's graph, so a foreign invreq_chain
+		// is refused even when the offer lists it.
+		if (options?.chain && !options.chain.equals(ours)) {
+			throw new InvalidRequestError("Requested chain is not this node's chain");
+		}
 		// The offer manager defaults invreq_chain to the offer's first chain,
 		// which need not be ours when the offer lists several.
 		const request = this.offerManager.requestInvoice(offer, {
