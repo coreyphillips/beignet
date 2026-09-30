@@ -3076,6 +3076,36 @@ export class Wallet {
 	}
 
 	/**
+	 * unfreezeUtxo for an automated freezer: lifts the freeze only while every
+	 * entry on the outpoint still carries tag, and reports unfrozen: false when
+	 * one does not. The check runs under the blacklist lock, so a freeze that
+	 * took the entry over, or one whose write then rolls back, has settled
+	 * before it is read.
+	 * @param {string} txid
+	 * @param {number} index
+	 * @param {string} tag
+	 * @returns {Promise<Result<{ unfrozen: boolean }>>}
+	 */
+	public async unfreezeUtxoIfTagged(params: {
+		txid: string;
+		index: number;
+		tag: string;
+	}): Promise<Result<{ unfrozen: boolean }>> {
+		return this.runBlacklistWrite(async () => {
+			const heldByOther = this._data.blacklistedUtxos.some(
+				(frozen) =>
+					frozen.tx_hash === params.txid &&
+					frozen.tx_pos === params.index &&
+					frozen.freezeTag !== params.tag
+			);
+			if (heldByOther) return ok({ unfrozen: false });
+			const res = await this.unfreezeUtxoLocked(params);
+			if (res.isErr()) return err(res.error);
+			return ok({ unfrozen: true });
+		});
+	}
+
+	/**
 	 * Returns the frozen (blacklisted) UTXO entries. Entries are kept even
 	 * when the underlying outpoint has been spent or is not currently in the
 	 * UTXO set; matching against live UTXOs is by txid + index.
