@@ -28,6 +28,7 @@ import {
 	IGuardianReceipt,
 	IGuardianRecord,
 	IGuardianRegisterNodeRequest,
+	IGuardianRetainFloor,
 	IGuardianTakeoverCertificate,
 	GuardianStatus,
 	ReferenceGuardian,
@@ -38,6 +39,7 @@ import {
 	receiptTranscriptHash,
 	recordTranscriptHash,
 	registerTranscriptHash,
+	retainTranscriptHash,
 	signTranscript,
 	statesEqual,
 	takeoverTranscriptHash,
@@ -2086,6 +2088,331 @@ describe('Guardian core: structural corruption containment', () => {
 		expect(laterAlarms.length).to.equal(0);
 		expect(again.getHead(headRequest()).possiblyStale).to.equal(false);
 		again.close();
+	});
+});
+
+describe('Guardian core: retain floor (issue #1028)', () => {
+	let dir: string;
+	before(() => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-guardian-floor-'));
+	});
+	after(() => {
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	function floorAt(
+		record: IGuardianRecord,
+		writer = WRITER_1,
+		epoch = 1n
+	): IGuardianRetainFloor {
+		return {
+			sequence: record.sequence,
+			frameHash: record.frameHash,
+			writerSignature: signTranscript(
+				retainTranscriptHash(SET_ID, {
+					recoveryId: ROOT.recoveryId,
+					epoch,
+					sequence: record.sequence,
+					frameHash: record.frameHash
+				}),
+				writer.secret
+			)
+		};
+	}
+
+	function storedSequences(guardian: ReferenceGuardian): bigint[] {
+		const page = guardian.getState({
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			recoveryId: ROOT.recoveryId,
+			fromSequence: 0n,
+			maxRecords: 0
+		});
+		expect(page.status).to.equal(GuardianStatus.OK);
+		return (page.records as IGuardianRecord[]).map((r) => r.sequence);
+	}
+
+	/** Registered, holding 1..7 of an eight-record chain. */
+	function holdingSeven(guardian: ReferenceGuardian): IGuardianRecord[] {
+		const registration = buildRegistration();
+		guardian.register(registration);
+		const chain = buildChain(registration.initialState, 8);
+		for (const record of chain.slice(0, 7)) {
+			expect(guardian.putState({ record }).status).to.equal(GuardianStatus.OK);
+		}
+		return chain;
+	}
+
+	it('frees the records below the floor, counts it exactly, and reopens clean', () => {
+		const file = path.join(dir, 'frees.sqlite');
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = makeGuardian(0, file, (a) => alarms.push(a));
+		const chain = holdingSeven(guardian);
+		const before = guardian.contentBytes();
+
+		const put = guardian.putState({
+			record: chain[7],
+			retainFloor: floorAt(chain[4])
+		});
+		expect(put.status).to.equal(GuardianStatus.OK);
+		expect(storedSequences(guardian)).to.deep.equal([5n, 6n, 7n, 8n]);
+		expect(guardian.contentBytes()).to.be.lessThan(before);
+		expect(guardian.contentBytes()).to.equal(guardian.auditContentBytes());
+
+		// A freed record can be neither replayed nor compared: the sender is
+		// steered to the head like any other out-of-place sequence.
+		const freed = guardian.putState({ record: chain[1] });
+		expect(freed.status).to.equal(GuardianStatus.ERR_SEQUENCE_GAP);
+		expect((freed.current as GuardianState).logHead.sequence).to.equal(8n);
+		guardian.close();
+
+		const reopened = makeGuardian(0, file, (a) => alarms.push(a));
+		expect(alarms).to.deep.equal([]);
+		expect(
+			reopened.getHead({
+				protocolVersion: 1,
+				guardianSetId: SET_ID,
+				recoveryId: ROOT.recoveryId
+			}).possiblyStale
+		).to.equal(false);
+		expect(storedSequences(reopened)).to.deep.equal([5n, 6n, 7n, 8n]);
+		const next = buildChain(headOf(reopened), 1)[0];
+		expect(reopened.putState({ record: next }).status).to.equal(
+			GuardianStatus.OK
+		);
+		reopened.close();
+	});
+
+	it('reopens clean over a takeover that happened below the floor', () => {
+		const file = path.join(dir, 'takeover.sqlite');
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = makeGuardian(0, file, (a) => alarms.push(a));
+		const registration = buildRegistration();
+		guardian.register(registration);
+		for (const record of buildChain(registration.initialState, 4)) {
+			guardian.putState({ record });
+		}
+		const acquired = guardian.acquireEpoch(
+			buildAcquire(headOf(guardian), WRITER_2)
+		);
+		expect(acquired.status).to.equal(GuardianStatus.OK);
+		const later: IGuardianRecord[] = [];
+		let previousHash = headOf(guardian).logHead.frameHash;
+		for (let sequence = 5n; sequence <= 8n; sequence++) {
+			const record = buildRecord({
+				epoch: 2n,
+				sequence,
+				previousHash,
+				writerSecret: WRITER_2.secret
+			});
+			later.push(record);
+			previousHash = record.frameHash;
+		}
+		for (const record of later.slice(0, 3)) guardian.putState({ record });
+		const put = guardian.putState({
+			record: later[3],
+			retainFloor: floorAt(later[1], WRITER_2, 2n)
+		});
+		expect(put.status).to.equal(GuardianStatus.OK);
+		expect(storedSequences(guardian)).to.deep.equal([6n, 7n, 8n]);
+		guardian.close();
+
+		const reopened = makeGuardian(0, file, (a) => alarms.push(a));
+		expect(alarms).to.deep.equal([]);
+		const head = reopened.getHead({
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			recoveryId: ROOT.recoveryId
+		});
+		expect(head.possiblyStale).to.equal(false);
+		expect(
+			(head.certificates as IGuardianTakeoverCertificate[]).length
+		).to.equal(1);
+		reopened.close();
+	});
+
+	it('frees orphan-archived records below the floor with the live ones', () => {
+		const [a, b, c] = [0, 1, 2].map((index) => makeGuardian(index));
+		const registration = buildRegistration();
+		for (const g of [a, b, c]) g.register(registration);
+		const chain = buildChain(registration.initialState, 2);
+		for (const g of [a, b, c]) {
+			for (const record of chain) g.putState({ record });
+		}
+		// C alone holds 3 and 4, which the takeover moves to its orphan archive.
+		for (const record of buildChain(headOf(c), 2)) c.putState({ record });
+		const acquire = buildAcquire(headOf(a), WRITER_2);
+		const certificates = [a, b].map(
+			(g) => g.acquireEpoch(acquire).certificate as IGuardianTakeoverCertificate
+		);
+		expect(c.syncEpoch({ certificates }).status).to.equal(GuardianStatus.OK);
+		expect(c.listOrphanedRecords(ROOT.recoveryId)).to.have.length(2);
+
+		const later: IGuardianRecord[] = [];
+		let previousHash = headOf(c).logHead.frameHash;
+		for (let sequence = 3n; sequence <= 6n; sequence++) {
+			const record = buildRecord({
+				epoch: 2n,
+				sequence,
+				previousHash,
+				writerSecret: WRITER_2.secret
+			});
+			later.push(record);
+			previousHash = record.frameHash;
+		}
+		for (const record of later.slice(0, 3)) c.putState({ record });
+		const put = c.putState({
+			record: later[3],
+			retainFloor: floorAt(later[2], WRITER_2, 2n)
+		});
+		expect(put.status).to.equal(GuardianStatus.OK);
+		expect(storedSequences(c)).to.deep.equal([5n, 6n]);
+		expect(c.listOrphanedRecords(ROOT.recoveryId)).to.deep.equal([]);
+		expect(c.contentBytes()).to.equal(c.auditContentBytes());
+		for (const g of [a, b, c]) g.close();
+	});
+
+	it('refuses the whole request when the floor signature fails', () => {
+		const guardian = makeGuardian(0);
+		const chain = holdingSeven(guardian);
+		const put = guardian.putState({
+			record: chain[7],
+			retainFloor: floorAt(chain[4], WRITER_2)
+		});
+		expect(put.status).to.equal(GuardianStatus.ERR_BAD_SIGNATURE);
+		expect(headOf(guardian).logHead.sequence).to.equal(7n);
+		expect(storedSequences(guardian)).to.deep.equal([
+			1n,
+			2n,
+			3n,
+			4n,
+			5n,
+			6n,
+			7n
+		]);
+		guardian.close();
+	});
+
+	it('changes nothing for a floor it does not hold, or holds differently', () => {
+		const guardian = makeGuardian(0);
+		const chain = holdingSeven(guardian);
+		const ahead = guardian.putState({
+			record: chain[7],
+			retainFloor: floorAt(buildChain(headOf(guardian), 2)[1], WRITER_1)
+		});
+		expect(ahead.status).to.equal(GuardianStatus.OK);
+		const different = floorAt(chain[4]);
+		different.frameHash = sha('some other chain');
+		const replay = guardian.putState({
+			record: chain[7],
+			retainFloor: different
+		});
+		expect(replay.status).to.equal(GuardianStatus.OK_DUPLICATE);
+		expect(storedSequences(guardian)).to.have.length(8);
+		guardian.close();
+	});
+
+	it('lets a set at its quota shrink instead of refusing it forever', () => {
+		const probe = makeGuardian(0);
+		const chain = holdingSeven(probe);
+		const limit = probe.contentBytes();
+		probe.close();
+
+		const guardian = new ReferenceGuardian({
+			path: ':memory:',
+			guardianSecret: GUARDIAN_SECRETS[0],
+			members: GUARDIAN_IDS,
+			clock,
+			maxContentBytes: limit
+		});
+		const registration = buildRegistration();
+		guardian.register(registration);
+		for (const record of chain.slice(0, 7)) guardian.putState({ record });
+		expect(guardian.contentBytes()).to.equal(limit);
+
+		expect(guardian.putState({ record: chain[7] }).status).to.equal(
+			GuardianStatus.ERR_QUOTA_EXCEEDED
+		);
+		const put = guardian.putState({
+			record: chain[7],
+			retainFloor: floorAt(chain[4])
+		});
+		expect(put.status).to.equal(GuardianStatus.OK);
+		expect(guardian.contentBytes()).to.be.lessThan(limit);
+		expect(guardian.contentBytes()).to.equal(guardian.auditContentBytes());
+		guardian.close();
+	});
+
+	it('rolls back to the origin, once, when the stored floor does not verify', () => {
+		const file = path.join(dir, 'tampered.sqlite');
+		const guardian = makeGuardian(0, file);
+		const chain = holdingSeven(guardian);
+		guardian.putState({ record: chain[7], retainFloor: floorAt(chain[4]) });
+		guardian.close();
+		const raw = new Database(file);
+		raw
+			.prepare('UPDATE guardian_retain_floors SET signature = ?')
+			.run(Buffer.alloc(64, 7));
+		raw.close();
+
+		const alarms: IGuardianAlarm[] = [];
+		const reopened = makeGuardian(0, file, (a) => alarms.push(a));
+		expect(alarms.map((a) => a.detail).join(' ')).to.contain(
+			'retain floor does not verify'
+		);
+		const head = reopened.getHead({
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			recoveryId: ROOT.recoveryId
+		});
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(0n);
+		expect(storedSequences(reopened)).to.deep.equal([]);
+		reopened.close();
+
+		const later: IGuardianAlarm[] = [];
+		makeGuardian(0, file, (a) => later.push(a)).close();
+		expect(later).to.deep.equal([]);
+	});
+
+	it('rolls back a floor row copied from a state the writer never named', () => {
+		const file = path.join(dir, 'copied.sqlite');
+		const guardian = makeGuardian(0, file);
+		const chain = holdingSeven(guardian);
+		guardian.putState({ record: chain[7], retainFloor: floorAt(chain[4]) });
+		guardian.close();
+		// The head's own receipt as the floor, and every record gone.
+		const raw = new Database(file);
+		const head = raw
+			.prepare(
+				'SELECT state, receipt_issued_at, receipt_signature FROM guardian_namespaces'
+			)
+			.get() as {
+			state: Buffer;
+			receipt_issued_at: Buffer;
+			receipt_signature: Buffer;
+		};
+		raw
+			.prepare(
+				'UPDATE guardian_retain_floors SET state = ?, issued_at = ?, signature = ?'
+			)
+			.run(head.state, head.receipt_issued_at, head.receipt_signature);
+		raw.prepare('DELETE FROM guardian_records').run();
+		raw.close();
+
+		const alarms: IGuardianAlarm[] = [];
+		const reopened = makeGuardian(0, file, (a) => alarms.push(a));
+		expect(alarms.map((a) => a.detail).join(' ')).to.contain(
+			'retain floor does not verify'
+		);
+		const reported = reopened.getHead({
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			recoveryId: ROOT.recoveryId
+		});
+		expect(reported.possiblyStale).to.equal(true);
+		expect((reported.state as GuardianState).logHead.sequence).to.equal(0n);
+		reopened.close();
 	});
 });
 

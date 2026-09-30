@@ -4109,17 +4109,30 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
-	 * A guardian that refuses a record as too large can take nothing after
-	 * it, so in quorum mode the node stops releasing channel updates and in
-	 * async mode its backup stops advancing. Neither shows up anywhere else.
+	 * A guardian that refuses a record as too large, or because its quota
+	 * is full, can take nothing after it, so in quorum mode the node stops
+	 * releasing channel updates and in async mode its backup stops
+	 * advancing. Neither shows up anywhere else.
 	 */
 	private relayRecordTooLarge(event: IGuardianReplicationEvent): void {
-		if (event.type !== 'record:too-large') return;
-		this.log('error', 'Recovery guardian refused an oversized record', {
-			detail: event.detail
-		});
+		if (
+			event.type !== 'record:too-large' &&
+			event.type !== 'record:quota-refused'
+		) {
+			return;
+		}
+		const tooLarge = event.type === 'record:too-large';
+		this.log(
+			'error',
+			tooLarge
+				? 'Recovery guardian refused an oversized record'
+				: 'Recovery guardian refused a record: its quota is full',
+			{ detail: event.detail }
+		);
 		const data = {
-			code: 'RECOVERY_RECORD_TOO_LARGE',
+			code: tooLarge
+				? 'RECOVERY_RECORD_TOO_LARGE'
+				: 'RECOVERY_GUARDIAN_QUOTA_EXCEEDED',
 			message: event.detail,
 			timestamp: Date.now()
 		};
@@ -5642,6 +5655,10 @@ export class BeignetNode extends EventEmitter {
 					...bindGuardianSet(incoming, { transportFor })
 				},
 				required: CRASH_V1_PROFILE.required,
+				journalKeys: {
+					masterKey: deriveRecoveryMasterKey(this.nodeSecret()),
+					nodeId: getPublicKey(this.nodeSecret())
+				},
 				onEvent: (event) => this.noteRotationEvent(event),
 				onReplicationEvent: (event) => {
 					this.log('debug', `Rotation replication: ${event.type}`, {

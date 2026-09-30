@@ -21,7 +21,8 @@
  * Quotas refuse, never delete: pruning a namespace wedges a stranger's node
  * permanently (spec 5.8, the compaction retain floor), so an exhausted quota
  * answers ERR_QUOTA_EXCEEDED and the operator raises it or the writer moves
- * on. The byte quotas bound the encoded content a set stores (every column
+ * on. Only a writer's own signed retain floor frees records (wire 5.2), and
+ * that is what keeps ordinary use under the quota. The byte quotas bound the encoded content a set stores (every column
  * of every row, GuardianStore.contentBytes) and the content each
  * recovery_id stores within it, and are the guardian's own
  * `maxContentBytes` and `maxNamespaceContentBytes`, judged inside each
