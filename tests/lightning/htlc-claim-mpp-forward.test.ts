@@ -71,12 +71,12 @@ function installFakeMonitor(node: LightningNode): {
 	};
 	const cm = node.getChannelManager() as unknown as {
 		monitors: Map<string, unknown>;
-		fulfillHtlc: (...args: unknown[]) => void;
+		fulfillHtlc: (...args: unknown[]) => { ok: boolean };
 	};
 	cm.monitors.set(channelId.toString('hex'), fakeMonitor);
 	// Stub fulfillHtlc — the settle paths call it after recordPreimage; we only
 	// care about the preimage wiring, not the (absent) real channel.
-	cm.fulfillHtlc = () => {};
+	cm.fulfillHtlc = (): { ok: boolean } => ({ ok: true });
 	return { channelId, calls };
 }
 
