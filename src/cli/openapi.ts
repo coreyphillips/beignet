@@ -444,6 +444,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							content: jsonContent({
 								$ref: '#/components/schemas/DirectFundingSendResult'
 							})
+						},
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: the amount plus the fee ceiling is over dailySpendLimitSats. Nothing was spent'
+						},
+						'409': {
+							description:
+								'SERVICE_DRAINING: the node is draining and takes no new payment. Nothing was spent'
 						}
 					}
 				}
