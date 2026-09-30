@@ -1338,8 +1338,8 @@ export class LightningNode extends EventEmitter {
 	 * terminal (FAILED, forward_refused); the refund is owed here and
 	 * retried when the channel reestablishes and on every block, so a live
 	 * reconnect resolves it, not only a restart. Keyed by inbound identity.
-	 * A late hold part turned away as `held_set_complete` (issue #822) is owed
-	 * here too.
+	 * A late hold part turned away as `held_set_complete` (issue #822), and a
+	 * part refused as `settled_row_full` (issue #1189), is owed here too.
 	 */
 	private owedHeldForwardFailures = new Map<
 		string,
@@ -21817,8 +21817,22 @@ export class LightningNode extends EventEmitter {
 			const reason = sharedSecret
 				? createFailureMessage(sharedSecret, TEMPORARY_NODE_FAILURE)
 				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
-			this.cleanupHtlcSharedSecret(secretKey);
-			this.channelManager.failHtlc(channelId, htlcId, reason);
+			// The part never joins the set, so the MPP timeout will not fail it:
+			// a refused fail is owed and retried, and the secret stays until the
+			// fail leaves.
+			const failRefusedPart = (): boolean => {
+				if (!this.channelManager.failHtlc(channelId, htlcId, reason).ok) {
+					return false;
+				}
+				this.cleanupHtlcSharedSecret(secretKey);
+				return true;
+			};
+			if (!failRefusedPart()) {
+				this.owedHeldForwardFailures.set(secretKey, {
+					inChannelIdHex: channelId.toString('hex'),
+					fail: failRefusedPart
+				});
+			}
 			return;
 		}
 

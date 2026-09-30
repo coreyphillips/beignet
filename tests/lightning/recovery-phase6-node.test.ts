@@ -37,6 +37,7 @@ import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
 import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
 import {
 	DEFAULT_CHANNEL_CONFIG,
+	HtlcState,
 	REGTEST_CHAIN_HASH
 } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
@@ -1489,6 +1490,103 @@ describe('Recovery phase 6: the node drives durability', () => {
 		);
 		expectRowsFit(parked.paymentHash);
 		expect(node.getPayment(parked.paymentHash)!.settledHtlcs).to.have.length(7);
+
+		payer.destroy();
+		node.destroy();
+		storage.close();
+	});
+
+	it('fails a part refused for want of room once its channel reconnects (issue #1189)', async function (): Promise<void> {
+		const { node, storage, longestLabel } = nodeUnderCeiling(1_700);
+		const payer = createLoopbackNode('settled-parts-cut', 5);
+		// A link that can drop. Reconnecting holds delivery until both sides
+		// have reset, so neither reestablish arrives early.
+		let cut = false;
+		let hold = false;
+		const queue: Array<() => void> = [];
+		for (const [from, to] of [
+			[node, payer],
+			[payer, node]
+		]) {
+			from.on(
+				'message:outbound',
+				(pubkey: string, type: number, payload: Buffer) => {
+					if (cut || pubkey !== to.getNodeId()) return;
+					const deliver = (): void =>
+						to.handlePeerMessage(from.getNodeId(), type, payload);
+					if (hold) queue.push(deliver);
+					else deliver();
+				}
+			);
+		}
+		node.handleNewBlock(1000);
+		payer.handleNewBlock(1000);
+		const channelId = openReadyChannel(payer, node);
+		const probe = node.createInvoice({
+			amountMsat: 1_000_000n,
+			description: 'parts'
+		});
+		payer.sendPaymentWithOptions(probe.bolt11, {});
+		expect(
+			(await payer.awaitPaymentResolution(probe.paymentHash, 5_000)).status
+		).to.equal(PaymentStatus.COMPLETED);
+		const { hops } = payer.getPayment(probe.paymentHash)!.route!;
+		const receivedHtlcs = (): HtlcState[] =>
+			[
+				...node
+					.getChannelManager()
+					.getChannel(channelId)!
+					.getFullState()
+					.htlcs.entries()
+			]
+				.filter(([key]) => key.startsWith('received-'))
+				.map(([, htlc]) => htlc.state);
+
+		// Labelled first, the row has room for one part. The payer drops
+		// while the second is refused, so the channel cannot carry the fail.
+		const invoice = node.createInvoice({
+			amountMsat: 7_000_000n,
+			description: 'parts'
+		});
+		longestLabel((note) =>
+			node.setPaymentMetadata(invoice.paymentHash, { note })
+		);
+		const payPart = (): void => {
+			payer.sendPaymentToRoute(
+				{
+					hops: hops.map((hop) => ({ ...hop, amountToForwardMsat: 1_000_000n }))
+				},
+				invoice.paymentHash,
+				40,
+				invoice.paymentSecret,
+				7_000_000n
+			);
+		};
+		payPart();
+		const cutOnRefusal = (log: { action: string }): void => {
+			if (log.action !== 'settled_row_full') return;
+			cut = true;
+			node.getChannelManager().handlePeerDisconnected(payer.getNodeId());
+			payer.getChannelManager().handlePeerDisconnected(node.getNodeId());
+		};
+		node.on('log', cutOnRefusal);
+		payPart();
+		node.off('log', cutOnRefusal);
+		expect(cut).to.equal(true);
+		expect(receivedHtlcs()).to.deep.equal([
+			HtlcState.COMMITTED,
+			HtlcState.COMMITTED
+		]);
+
+		// The refused part fails back on reconnect; the one taken waits for
+		// the rest of its set.
+		cut = false;
+		hold = true;
+		node.getChannelManager().handlePeerReconnected(payer.getNodeId());
+		payer.getChannelManager().handlePeerReconnected(node.getNodeId());
+		while (queue.length > 0) queue.shift()!();
+		hold = false;
+		expect(receivedHtlcs()).to.deep.equal([HtlcState.COMMITTED]);
 
 		payer.destroy();
 		node.destroy();
