@@ -59,6 +59,7 @@ import {
 	IRecoveryCommitResult,
 	SafetyTransition
 } from '../../src/lightning/recovery/types';
+import { MPP_TIMEOUT } from '../../src/lightning/onion/types';
 
 function makeSeed(id: number): Buffer {
 	return crypto.createHash('sha256').update(`redispatch-seed-${id}`).digest();
@@ -1626,6 +1627,93 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		).to.deep.equal([]);
 
 		carol.destroy();
+		bob.destroy();
+		alice.destroy();
+	});
+
+	it('an MPP part timed out while its channel was reconnecting is failed on reestablish (#1233)', async function () {
+		this.timeout(20_000);
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED);
+		const dead = { val: false };
+		const gate: IWireGate = { hold: false, queue: [] };
+		wire(alice, bob, dead, gate);
+		alice.handleNewBlock(1000);
+		bob.handleNewBlock(1000);
+		const channelId = openReadyChannel(alice, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 100_000n,
+			description: 'mpp timeout across a reconnect'
+		});
+		const finalCltv = (
+			alice as unknown as { paddedFinalCltvExpiry: () => number }
+		).paddedFinalCltvExpiry();
+		alice.sendPaymentToRoute(
+			{
+				hops: [
+					{
+						pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+						shortChannelId: encodeShortChannelId({
+							block: 500,
+							txIndex: 1,
+							outputIndex: 0
+						}),
+						amountToForwardMsat: 60_000n,
+						outgoingCltvValue: finalCltv
+					}
+				]
+			},
+			invoice.paymentHash,
+			finalCltv,
+			invoice.paymentSecret,
+			100_000n
+		);
+		await settle();
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
+		await settle();
+
+		const pendingMpp = (
+			bob as unknown as {
+				pendingMppPayments: Map<string, { createdAt: number }>;
+			}
+		).pendingMppPayments;
+		pendingMpp.get(invoice.paymentHash.toString('hex'))!.createdAt -= 120_000;
+		bob.failTimedOutMppPayments();
+		const htlcs = (): HtlcState[] =>
+			[
+				...bob.getChannelManager().getChannel(channelId)!.getFullState().htlcs
+			].map(([, htlc]) => htlc.state);
+		expect(pendingMpp.size, 'the timed-out set is dropped').to.equal(0);
+		expect(htlcs(), 'the channel could not carry the fail').to.deep.equal([
+			HtlcState.COMMITTED
+		]);
+		expect(
+			[...sharedSecrets(bob).keys()],
+			'the refused part keeps its shared secret'
+		).to.deep.equal([`${channelId.toString('hex')}:0`]);
+
+		await cycleConnection(alice, bob, gate);
+
+		const payment = alice.getPayment(invoice.paymentHash)!;
+		expect(payment.status).to.equal(PaymentStatus.FAILED);
+		expect(payment.failureCode, 'the payer read the timeout').to.equal(
+			MPP_TIMEOUT
+		);
+		expect(htlcs(), 'no HTLC left on the channel').to.deep.equal([]);
+		expect(sharedSecrets(bob).size, 'no shared secret left').to.equal(0);
+
+		// Past the height the claim backstop would have force-closed at.
+		for (let height = 1001; height <= 1050; height++) {
+			alice.handleNewBlock(height);
+			bob.handleNewBlock(height);
+		}
+		expect(bob.getChannelManager().getChannel(channelId)!.getState()).to.equal(
+			ChannelState.NORMAL
+		);
+
 		bob.destroy();
 		alice.destroy();
 	});
