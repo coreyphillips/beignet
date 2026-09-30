@@ -74,6 +74,8 @@ function makeWallet(values: number[]) {
 		isUtxoFrozen: (txid: string, index: number) =>
 			frozen.has(`${txid}:${index}`),
 		freezeUtxo: async (p: { txid: string; index: number; tag?: string }) => {
+			// Like the real wallet, a second freeze keeps the first one's entry.
+			if (frozen.has(`${p.txid}:${p.index}`)) return ok('already frozen');
 			frozen.set(`${p.txid}:${p.index}`, {
 				tx_hash: p.txid,
 				tx_pos: p.index,
@@ -111,6 +113,11 @@ const outpoints = (
 		const tx = bitcoin.Transaction.fromBuffer(i.prevTx);
 		return `${tx.getId()}:${i.prevOutputIndex}`;
 	});
+
+const asOutpoint = (op: string): { txid: string; vout: number } => {
+	const sep = op.lastIndexOf(':');
+	return { txid: op.slice(0, sep), vout: Number(op.slice(sep + 1)) };
+};
 
 describe('Funding input pledges', function () {
 	it('a coin selected by one funding is never selected by a concurrent one', async function () {
@@ -440,11 +447,6 @@ describe('Funding input pledges', function () {
 	});
 
 	describe('releaseInputPledges (issue #311)', function () {
-		const asOutpoint = (op: string): { txid: string; vout: number } => {
-			const sep = op.lastIndexOf(':');
-			return { txid: op.slice(0, sep), vout: Number(op.slice(sep + 1)) };
-		};
-
 		it('releases a selection pledge so the coin is selectable at once', async function () {
 			const { wallet, unfrozenLog } = makeWallet([100_000, 100_000]);
 			const provider = new WalletFundingProvider(wallet as never);
@@ -621,5 +623,111 @@ describe('Funding input pledges', function () {
 			expect(frozen.has(key)).to.equal(false);
 			expect(pledged.has(key)).to.equal(false);
 		});
+	});
+
+	describe('a pledge only lifts the freeze it placed (issue #1190)', function () {
+		const pledgedOf = (provider: WalletFundingProvider): Map<string, number> =>
+			(provider as unknown as { pledged: Map<string, number> }).pledged;
+
+		const retainedSpending = (
+			utxo: { tx_hash: string; tx_pos: number },
+			output: Buffer
+		): bitcoin.Transaction => {
+			const tx = new bitcoin.Transaction();
+			tx.version = 2;
+			tx.addInput(Buffer.from(utxo.tx_hash, 'hex').reverse(), utxo.tx_pos);
+			tx.addOutput(output, 90_000);
+			return tx;
+		};
+
+		const endings: Array<{
+			name: string;
+			end: (provider: WalletFundingProvider, key: string) => Promise<void>;
+		}> = [
+			{
+				name: 'its TTL passes',
+				end: async (provider, key) => {
+					pledgedOf(provider).set(key, Date.now() - 61 * 60_000);
+					await provider.selectSpliceInputs!(50_000n, 1000);
+				}
+			},
+			{
+				name: 'releaseInputPledges runs',
+				end: (provider, key) => provider.releaseInputPledges([asOutpoint(key)])
+			}
+		];
+
+		for (const { name, end } of endings) {
+			it(`a user freeze from before a renewal survives when ${name}`, async function () {
+				const { wallet, utxos, frozen, unfrozenLog, payment } = makeWallet([
+					100_000, 100_000
+				]);
+				const key = `${utxos[0].tx_hash}:0`;
+				await wallet.freezeUtxo({ txid: utxos[0].tx_hash, index: 0 });
+
+				const provider = new WalletFundingProvider(wallet as never);
+				await provider.pledgeTransactionInputs(
+					retainedSpending(utxos[0], payment.output!).toHex()
+				);
+				expect(pledgedOf(provider).has(key)).to.equal(true);
+
+				await end(provider, key);
+				expect(pledgedOf(provider).has(key), 'the pledge ended').to.equal(
+					false
+				);
+				expect(unfrozenLog).to.not.include(key);
+				expect(frozen.get(key)?.freezeTag, 'the user freeze').to.equal(
+					undefined
+				);
+				expect(frozen.has(key)).to.equal(true);
+			});
+
+			it(`a user freeze added under a record-only pledge survives when ${name}`, async function () {
+				const { wallet, utxos, frozen, unfrozenLog, payment } = makeWallet([
+					100_000, 100_000
+				]);
+				const key = `${utxos[0].tx_hash}:0`;
+				// The renewal's freeze is refused, so the pledge holds the record
+				// alone. The user then freezes the coin themselves.
+				const realFreeze = wallet.freezeUtxo;
+				(wallet as { freezeUtxo: unknown }).freezeUtxo = async () =>
+					errResult('storage is down');
+				const provider = new WalletFundingProvider(wallet as never);
+				await provider
+					.pledgeTransactionInputs(
+						retainedSpending(utxos[0], payment.output!).toHex()
+					)
+					.catch(() => undefined);
+				expect(pledgedOf(provider).has(key)).to.equal(true);
+				expect(frozen.has(key)).to.equal(false);
+				wallet.freezeUtxo = realFreeze;
+				await wallet.freezeUtxo({ txid: utxos[0].tx_hash, index: 0 });
+
+				await end(provider, key);
+				expect(pledgedOf(provider).has(key), 'the pledge ended').to.equal(
+					false
+				);
+				expect(unfrozenLog).to.not.include(key);
+				expect(frozen.has(key)).to.equal(true);
+			});
+
+			it(`a wallet that drops freeze tags still gets its coin back when ${name}`, async function () {
+				const { wallet, utxos, frozen, unfrozenLog, payment } = makeWallet([
+					100_000, 100_000
+				]);
+				const key = `${utxos[0].tx_hash}:0`;
+				const realFreeze = wallet.freezeUtxo;
+				wallet.freezeUtxo = (p) => realFreeze({ txid: p.txid, index: p.index });
+
+				const provider = new WalletFundingProvider(wallet as never);
+				await provider.pledgeTransactionInputs(
+					retainedSpending(utxos[0], payment.output!).toHex()
+				);
+				expect(frozen.get(key)?.freezeTag).to.equal(undefined);
+
+				await end(provider, key);
+				expect(unfrozenLog).to.include(key);
+			});
+		}
 	});
 });
