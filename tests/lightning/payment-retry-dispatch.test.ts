@@ -626,6 +626,45 @@ describe('Issue #1041: a BOLT 11 send that ended leaves no context for the next'
 		bob.destroy();
 	});
 
+	it('a retry refused locally rolls back when the error listener throws', () => {
+		const { alice, bob } = setupPair(972, 973);
+		const invoice = zeroAmountInvoice(alice, bob);
+		const config = alice
+			.getChannelManager()
+			.listChannels()[0]
+			.getFullState().remoteConfig;
+		const maxAcceptedHtlcs = config.maxAcceptedHtlcs;
+		const attempts = failEveryHtlcTemporarily(bob, (attempt) => {
+			if (attempt === 1) config.maxAcceptedHtlcs = 0;
+		});
+		alice.once('node:error', () => {
+			throw new Error('local refusal listener failed');
+		});
+		const failures: IPaymentInfo[] = [];
+		alice.on('payment:failed', (payment) => failures.push(payment));
+
+		const first = alice.sendPaymentWithOptions(invoice.bolt11, EARLIER);
+		const record = alice.getPayment(invoice.paymentHash)!;
+		expect(attempts()).to.equal(1);
+		expect(alice.hasHtlcInFlight(invoice.paymentHash)).to.be.false;
+		expect(record).to.equal(first);
+		expect(record.status).to.equal(PaymentStatus.FAILED);
+		expect(record.retryCount).to.equal(0);
+		expect(record.failureCode).to.equal(TEMPORARY_NODE_FAILURE);
+		expect(record.failureReason).to.contain('local refusal listener failed');
+		expect(failures).to.deep.equal([record]);
+		expect(invoice.hasContext()).to.be.false;
+
+		config.maxAcceptedHtlcs = maxAcceptedHtlcs;
+		expect(() =>
+			alice.sendPaymentWithOptions(invoice.bolt11, LATER)
+		).to.not.throw();
+		expect(attempts()).to.be.greaterThan(1);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
 	it("a re-send is not held to a thrown send's CLTV ceiling", () => {
 		const { alice, bob } = setupPair(920, 921);
 		alice.handleNewBlock(1000);

@@ -24270,7 +24270,10 @@ export class LightningNode extends EventEmitter {
 				// holds the secrets its failure decrypts with, and the failure
 				// retries through this context, so both stay.
 				const retryRecord = this.payments.get(hashHex);
-				if (retryRecord?.status === PaymentStatus.PENDING) {
+				if (
+					retryRecord?.status === PaymentStatus.PENDING &&
+					this.hasHtlcInFlight(payment.paymentHash)
+				) {
 					retryRecord.retryCount = retryCtx.retryCount;
 					this.emitStructuredLog('payment', 'retry_dispatch_threw', {
 						paymentHash: hashHex,
