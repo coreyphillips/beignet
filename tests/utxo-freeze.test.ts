@@ -447,4 +447,22 @@ describe('UTXO freeze durability', function () {
 		) as IUtxo[];
 		expect(persisted).to.have.length(1);
 	});
+
+	it('reports a freeze queued behind another as not created', async () => {
+		// Both calls see the coin unfrozen. Only the one that added the entry may
+		// later treat it as its own to lift.
+		const [first, second] = await Promise.all([
+			wallet.freezeUtxoIfUnfrozen({ txid: utxo.tx_hash, index: utxo.tx_pos }),
+			wallet.freezeUtxoIfUnfrozen({
+				txid: utxo.tx_hash,
+				index: utxo.tx_pos,
+				tag: 'funding-pledge'
+			})
+		]);
+		if (first.isErr()) throw first.error;
+		if (second.isErr()) throw second.error;
+		expect(first.value.created).to.equal(true);
+		expect(second.value.created).to.equal(false);
+		expect(wallet.listFrozenUtxos()[0].freezeTag).to.equal(undefined);
+	});
 });

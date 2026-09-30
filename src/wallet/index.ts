@@ -2899,6 +2899,31 @@ export class Wallet {
 		 *  freezes after a restart without touching user-frozen coins. */
 		tag?: string;
 	}): Promise<Result<string>> {
+		const res = await this.freezeUtxoIfUnfrozen(params);
+		if (res.isErr()) return err(res.error);
+		const outpoint = `${params.txid}:${params.index}`;
+		return ok(
+			res.value.created
+				? `UTXO ${outpoint} frozen.`
+				: `UTXO ${outpoint} is already frozen.`
+		);
+	}
+
+	/**
+	 * freezeUtxo that also reports whether this call added the blacklist
+	 * entry. The answer is decided under the blacklist lock, so a freeze queued
+	 * ahead of this one reports created: false even when the coin was unfrozen
+	 * at the time of the call. A caller that later unfreezes only what it
+	 * created needs this, since unfreezeUtxo lifts every freeze on the outpoint.
+	 * @param {string} txid
+	 * @param {number} index
+	 * @returns {Promise<Result<{ created: boolean }>>}
+	 */
+	public async freezeUtxoIfUnfrozen(params: {
+		txid: string;
+		index: number;
+		tag?: string;
+	}): Promise<Result<{ created: boolean }>> {
 		return this.runBlacklistWrite(() => this.freezeUtxoLocked(params));
 	}
 
@@ -2910,7 +2935,7 @@ export class Wallet {
 		txid: string;
 		index: number;
 		tag?: string;
-	}): Promise<Result<string>> {
+	}): Promise<Result<{ created: boolean }>> {
 		if (typeof txid !== 'string' || !/^[0-9a-fA-F]{64}$/.test(txid)) {
 			return err('txid must be a 64-character hex string.');
 		}
@@ -2923,9 +2948,7 @@ export class Wallet {
 		if (!utxo) {
 			return err(`UTXO ${txid}:${index} is not known to this wallet.`);
 		}
-		if (this.isUtxoFrozen(txid, index)) {
-			return ok(`UTXO ${txid}:${index} is already frozen.`);
-		}
+		if (this.isUtxoFrozen(txid, index)) return ok({ created: false });
 		// keyPair must never be persisted with the frozen entry.
 		const { keyPair, ...frozen } = utxo;
 		void keyPair;
@@ -2950,7 +2973,7 @@ export class Wallet {
 				`Failed to persist the freeze for UTXO ${txid}:${index}: ${saved.error.message}`
 			);
 		}
-		return ok(`UTXO ${txid}:${index} frozen.`);
+		return ok({ created: true });
 	}
 
 	/**
