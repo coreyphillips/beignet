@@ -51,6 +51,10 @@ export function resolveBackupDestination(
 			)}`
 		};
 	}
+	// The backup driver trims filenames before opening them.
+	if (target !== target.trim()) {
+		return { refusal: 'Backup filename must not start or end with whitespace' };
+	}
 	const stat = fs.statSync(target, { throwIfNoEntry: false });
 	// A dangling symlink: SQLite would create whatever it points at.
 	if (!stat && fs.lstatSync(target, { throwIfNoEntry: false })) {

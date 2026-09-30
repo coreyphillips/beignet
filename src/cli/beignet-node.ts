@@ -13894,7 +13894,9 @@ export class BeignetNode extends EventEmitter {
 
 	/** The live database, its sidecars and the instance lock. */
 	storageFiles(): string[] {
-		const dbPath = path.join(this.dataDir, `${this.networkName}.db`);
+		const dbPath = fs.realpathSync.native(
+			path.join(this.dataDir, `${this.networkName}.db`)
+		);
 		return [
 			dbPath,
 			`${dbPath}-wal`,

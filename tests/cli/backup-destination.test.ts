@@ -108,6 +108,22 @@ describe('Backup destination (issue #1230)', () => {
 			});
 		});
 
+		it('refuses filenames the backup driver would trim', () => {
+			const dest = path.join(dir, 'old.db');
+			fs.writeFileSync(dest, '');
+			const spaced = `${dest} \t`;
+			fs.writeFileSync(spaced, '');
+			const link = path.join(dir, 'link.db');
+			fs.symlinkSync(spaced, link);
+			for (const filename of [`${dest} `, link]) {
+				for (const overwrite of [false, true]) {
+					expect(resolveBackupDestination(filename, [dest], overwrite))
+						.to.have.property('refusal')
+						.that.match(/whitespace/);
+				}
+			}
+		});
+
 		it('refuses a protected file even with overwrite, by any path to it', () => {
 			const live = path.join(dir, 'regtest.db');
 			fs.writeFileSync(live, '');
@@ -165,6 +181,10 @@ describe('Backup destination (issue #1230)', () => {
 			fs.mkdirSync(path.join(home, '.beignet'));
 			fs.writeFileSync(path.join(home, '.beignet', 'config.json'), '');
 			dataDir = path.join(home, 'data');
+			fs.mkdirSync(dataDir);
+			const live = path.join(home, 'live.db');
+			fs.writeFileSync(live, '');
+			fs.symlinkSync(live, path.join(dataDir, 'regtest.db'));
 			daemon = await startDaemon({
 				electrumHost: '127.0.0.1',
 				electrumPort: 65529,
@@ -186,13 +206,21 @@ describe('Backup destination (issue #1230)', () => {
 			fs.rmSync(home, { recursive: true, force: true });
 		});
 
-		it('refuses the live database, its WAL and the config even with overwrite', async () => {
+		it('refuses the symlinked live database, its sidecars and the config even with overwrite', async () => {
 			const live = path.join(dataDir, 'regtest.db');
+			const target = fs.realpathSync.native(live);
+			daemon.node.getStorage().checkpoint();
+			expect(fs.statSync(`${target}-wal`).size).to.equal(0);
+			expect(fs.existsSync(`${target}-wal`)).to.equal(true);
+			expect(fs.existsSync(`${target}-shm`)).to.equal(true);
 			const link = path.join(home, 'looks-like-a-backup.db');
 			fs.symlinkSync(live, link);
 			for (const destPath of [
 				live,
-				`${live}-wal`,
+				target,
+				`${target}-wal`,
+				`${target}-shm`,
+				`${target}-journal`,
 				link,
 				path.join(home, '.beignet', 'config.json')
 			]) {
