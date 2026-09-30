@@ -150,6 +150,16 @@ export interface IWalletLike {
 		tag?: string;
 	}): Promise<IResult>;
 	unfreezeUtxo?(params: { txid: string; index: number }): Promise<IResult>;
+	/**
+	 * unfreezeUtxo that leaves the coin frozen (Ok, { unfrozen: false }) once
+	 * an entry without tag stands on it, decided under the wallet's own write
+	 * lock.
+	 */
+	unfreezeUtxoIfTagged?(params: {
+		txid: string;
+		index: number;
+		tag: string;
+	}): Promise<IResult>;
 	listFrozenUtxos?(): Array<{
 		tx_hash: string;
 		tx_pos: number;
@@ -318,11 +328,22 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * no longer lists the outpoint as frozen is released whatever it called the
 	 * refusal ("not frozen" is the answer to a double release). A pledge
 	 * standing on a freeze this provider did not place has nothing to lift.
+	 *
+	 * A user freeze on a coin we froze clears our tag or replaces our entry
+	 * without telling us. Where the wallet offers it, the unfreeze checks the
+	 * tag under the wallet's lock. A read from here could see a takeover whose
+	 * write is still in flight and may yet roll back.
 	 */
 	private async releasePledge(txid: string, vout: number): Promise<boolean> {
 		const key = `${txid}:${vout}`;
 		if (!this.ownedFreezes.has(key)) return true;
-		const res = await this.wallet.unfreezeUtxo?.({ txid, index: vout });
+		const res = this.wallet.unfreezeUtxoIfTagged
+			? await this.wallet.unfreezeUtxoIfTagged({
+					txid,
+					index: vout,
+					tag: WalletFundingProvider.PLEDGE_TAG
+			  })
+			: await this.wallet.unfreezeUtxo?.({ txid, index: vout });
 		const released =
 			!res?.isErr() || this.wallet.isUtxoFrozen?.(txid, vout) === false;
 		if (released) this.ownedFreezes.delete(key);

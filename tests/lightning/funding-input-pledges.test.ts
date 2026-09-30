@@ -1036,5 +1036,159 @@ describe('Funding input pledges', function () {
 				});
 			}
 		}
+
+		describe('a user freeze on a coin the pledge froze survives it (issue #1235)', function () {
+			const userFreezes: Array<{
+				name: string;
+				freeze: () => Promise<void>;
+			}> = [
+				{
+					name: 'freezes it again',
+					freeze: async (): Promise<void> => {
+						const res = await wallet.freezeUtxo({ txid: TXID_X, index: 0 });
+						if (res.isErr()) throw res.error;
+					}
+				},
+				{
+					name: 'unfreezes and refreezes it',
+					freeze: async (): Promise<void> => {
+						const off = await wallet.unfreezeUtxo({ txid: TXID_X, index: 0 });
+						if (off.isErr()) throw off.error;
+						const on = await wallet.freezeUtxo({ txid: TXID_X, index: 0 });
+						if (on.isErr()) throw on.error;
+					}
+				}
+			];
+
+			for (const { name: freezeName, freeze } of userFreezes) {
+				for (const renewed of [false, true]) {
+					for (const { name: endName, end } of endings) {
+						it(`when the user ${freezeName}${
+							renewed ? ', a renewal follows,' : ''
+						} and ${endName}`, async function () {
+							const retained = new bitcoin.Transaction();
+							retained.version = 2;
+							for (const txid of [TXID_X, TXID_Z]) {
+								retained.addInput(Buffer.from(txid, 'hex').reverse(), 0);
+							}
+							retained.addOutput(
+								Buffer.from(`0014${'00'.repeat(20)}`, 'hex'),
+								190_000
+							);
+							const provider = new WalletFundingProvider(wallet as never);
+							await provider.pledgeTransactionInputs(retained.toHex());
+							expect(
+								wallet.listFrozenUtxos().map((f) => f.freezeTag)
+							).to.deep.equal(['funding-pledge', 'funding-pledge']);
+
+							await freeze();
+							if (renewed) {
+								await provider.pledgeTransactionInputs(retained.toHex());
+							}
+
+							await end(provider);
+							expect(
+								wallet.isUtxoFrozen(TXID_X, 0),
+								'the user freeze'
+							).to.equal(true);
+							expect(
+								wallet.isUtxoFrozen(TXID_Z, 0),
+								'the freeze the pledge placed'
+							).to.equal(false);
+						});
+					}
+				}
+			}
+
+			/** A retained transaction spending coin X alone. */
+			const spendingX = (): string => {
+				const tx = new bitcoin.Transaction();
+				tx.version = 2;
+				tx.addInput(Buffer.from(TXID_X, 'hex').reverse(), 0);
+				tx.addOutput(Buffer.from(`0014${'00'.repeat(20)}`, 'hex'), 90_000);
+				return tx.toHex();
+			};
+			const tick = (): Promise<void> =>
+				new Promise((resolve) => setImmediate(resolve));
+
+			for (const { name: endName, end } of endings) {
+				it(`when the user's freeze queues behind the first pledge's and ${endName}`, async function () {
+					const provider = new WalletFundingProvider(wallet as never);
+					// A write for coin Y holds the blacklist lock. The pledge's freeze
+					// of X queues behind it and the user's behind that, so the tag is
+					// cleared before the provider could read it back.
+					let finishY!: () => void;
+					blacklistWrite = new Promise((resolve) => (finishY = resolve));
+					const userY = wallet.freezeUtxo({ txid: TXID_Y, index: 0 });
+					const pledge = provider.pledgeTransactionInputs(spendingX());
+					await tick();
+					const userX = wallet.freezeUtxo({ txid: TXID_X, index: 0 });
+					finishY();
+					const [y, , x] = await Promise.all([userY, pledge, userX]);
+					expect(y.isOk() && x.isOk()).to.equal(true);
+
+					await end(provider);
+					expect(wallet.isUtxoFrozen(TXID_X, 0), 'the user freeze').to.equal(
+						true
+					);
+				});
+
+				it(`when a user freeze storage refuses is in flight as ${endName}`, async function () {
+					const provider = new WalletFundingProvider(wallet as never);
+					await provider.pledgeTransactionInputs(spendingX());
+					let finishX!: () => void;
+					blacklistWrite = new Promise((resolve) => (finishX = resolve));
+					failBlacklistWrite = true;
+					const userX = wallet.freezeUtxo({ txid: TXID_X, index: 0 });
+					await tick();
+					failBlacklistWrite = false;
+					expect(wallet.listFrozenUtxos()[0].freezeTag).to.equal(undefined);
+
+					const ended = end(provider);
+					await tick();
+					finishX();
+					expect((await userX).isErr()).to.equal(true);
+					await ended;
+					expect(
+						wallet.isUtxoFrozen(TXID_X, 0),
+						'the freeze the pledge placed'
+					).to.equal(false);
+				});
+
+				it(`when a renewal queues ahead of a user freeze storage refuses and ${endName}`, async function () {
+					const provider = new WalletFundingProvider(wallet as never);
+					// Stale adoption has already run, so it cannot reclaim the freeze later.
+					await (
+						provider as unknown as { prunePledges(): Promise<void> }
+					).prunePledges();
+					await provider.pledgeTransactionInputs(spendingX());
+					let finishY!: () => void;
+					blacklistWrite = new Promise((resolve) => (finishY = resolve));
+					const userY = wallet.freezeUtxo({ txid: TXID_Y, index: 0 });
+					const renewal = provider.pledgeTransactionInputs(spendingX());
+					await tick();
+					let finishX!: () => void;
+					blacklistWrite = new Promise((resolve) => (finishX = resolve));
+					failBlacklistWrite = true;
+					const userX = wallet.freezeUtxo({ txid: TXID_X, index: 0 });
+					finishY();
+					expect((await userY).isOk()).to.equal(true);
+					await renewal;
+					expect(
+						wallet.listFrozenUtxos().find((f) => f.tx_hash === TXID_X)
+							?.freezeTag
+					).to.equal(undefined);
+					finishX();
+					expect((await userX).isErr()).to.equal(true);
+					failBlacklistWrite = false;
+
+					await end(provider);
+					expect(
+						wallet.isUtxoFrozen(TXID_X, 0),
+						'the freeze the pledge placed'
+					).to.equal(false);
+				});
+			}
+		});
 	});
 });

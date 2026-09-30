@@ -2915,6 +2915,10 @@ export class Wallet {
 	 * ahead of this one reports created: false even when the coin was unfrozen
 	 * at the time of the call. A caller that later unfreezes only what it
 	 * created needs this, since unfreezeUtxo lifts every freeze on the outpoint.
+	 *
+	 * An untagged call on a coin an automated freezer tagged takes that freeze
+	 * over: the tag is cleared and created is true, because the freeze is now
+	 * the caller's and the tagged owner must not lift it.
 	 * @param {string} txid
 	 * @param {number} index
 	 * @returns {Promise<Result<{ created: boolean }>>}
@@ -2948,7 +2952,11 @@ export class Wallet {
 		if (!utxo) {
 			return err(`UTXO ${txid}:${index} is not known to this wallet.`);
 		}
-		if (this.isUtxoFrozen(txid, index)) return ok({ created: false });
+		if (this.isUtxoFrozen(txid, index)) {
+			return tag === undefined
+				? this.untagFrozenUtxo(txid, index)
+				: ok({ created: false });
+		}
 		// keyPair must never be persisted with the frozen entry.
 		const { keyPair, ...frozen } = utxo;
 		void keyPair;
@@ -2969,6 +2977,47 @@ export class Wallet {
 			// caller decide whether it can proceed without the reservation.
 			const at = this._data.blacklistedUtxos.indexOf(entry);
 			if (at !== -1) this._data.blacklistedUtxos.splice(at, 1);
+			return err(
+				`Failed to persist the freeze for UTXO ${txid}:${index}: ${saved.error.message}`
+			);
+		}
+		return ok({ created: true });
+	}
+
+	/**
+	 * Clears the tag on a frozen outpoint's entries. Automated freezers
+	 * recognize their own freezes by the tag, so an entry that kept it would
+	 * be lifted when that freezer lets go, taking the caller's freeze with it.
+	 */
+	private async untagFrozenUtxo(
+		txid: string,
+		index: number
+	): Promise<Result<{ created: boolean }>> {
+		const tagged = this._data.blacklistedUtxos.filter(
+			(frozen) =>
+				frozen.tx_hash === txid &&
+				frozen.tx_pos === index &&
+				frozen.freezeTag !== undefined
+		);
+		if (tagged.length === 0) return ok({ created: false });
+		const untagged = tagged.map((frozen) => {
+			const entry = { ...frozen };
+			delete entry.freezeTag;
+			delete entry.frozenAt;
+			return entry;
+		});
+		const swap = (from: IUtxo[], to: IUtxo[]): void => {
+			this._data.blacklistedUtxos = this._data.blacklistedUtxos.map(
+				(frozen) => to[from.indexOf(frozen)] ?? frozen
+			);
+		};
+		swap(tagged, untagged);
+		const saved = await this.saveWalletData(
+			'blacklistedUtxos',
+			this._data.blacklistedUtxos
+		);
+		if (saved.isErr()) {
+			swap(untagged, tagged);
 			return err(
 				`Failed to persist the freeze for UTXO ${txid}:${index}: ${saved.error.message}`
 			);
@@ -3024,6 +3073,36 @@ export class Wallet {
 			);
 		}
 		return ok(`UTXO ${txid}:${index} unfrozen.`);
+	}
+
+	/**
+	 * unfreezeUtxo for an automated freezer: lifts the freeze only while every
+	 * entry on the outpoint still carries tag, and reports unfrozen: false when
+	 * one does not. The check runs under the blacklist lock, so a freeze that
+	 * took the entry over, or one whose write then rolls back, has settled
+	 * before it is read.
+	 * @param {string} txid
+	 * @param {number} index
+	 * @param {string} tag
+	 * @returns {Promise<Result<{ unfrozen: boolean }>>}
+	 */
+	public async unfreezeUtxoIfTagged(params: {
+		txid: string;
+		index: number;
+		tag: string;
+	}): Promise<Result<{ unfrozen: boolean }>> {
+		return this.runBlacklistWrite(async () => {
+			const heldByOther = this._data.blacklistedUtxos.some(
+				(frozen) =>
+					frozen.tx_hash === params.txid &&
+					frozen.tx_pos === params.index &&
+					frozen.freezeTag !== params.tag
+			);
+			if (heldByOther) return ok({ unfrozen: false });
+			const res = await this.unfreezeUtxoLocked(params);
+			if (res.isErr()) return err(res.error);
+			return ok({ unfrozen: true });
+		});
 	}
 
 	/**
