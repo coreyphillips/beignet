@@ -43,7 +43,8 @@ import {
 	IGuardianRegisterNodeRequest,
 	IGuardianRetainFloor,
 	IGuardianRotateSetRequest,
-	IGuardianGetHeadResponse
+	IGuardianGetHeadResponse,
+	IGuardianGetStateResponse
 } from './guardian';
 import {
 	GuardianProtocolMismatchError,
@@ -1150,7 +1151,8 @@ export class GuardianReplicator {
 				);
 				return proven?.conflictAt === null && proven.head >= groupEnd;
 			});
-			if (!everyHeld) return miss();
+			// A receipt that fails to bind may be a bad response, not the head.
+			if (!everyHeld) return false;
 			this.saveRetainFloor({
 				sequence: floor.sequence,
 				groupEnd,
@@ -1186,17 +1188,28 @@ export class GuardianReplicator {
 		let records: IGuardianRecord[] = [];
 		let nextSnapshot: bigint | null = null;
 		let below = top;
+		let pageSize = Number(FLOOR_SEARCH_STEP);
 		while (below > above) {
 			const start =
 				below - above > FLOOR_SEARCH_STEP ? below - FLOOR_SEARCH_STEP : above;
 			const step: IGuardianRecord[] = [];
 			let cursor = start;
 			while (cursor < below) {
-				const page = await source.client.getState(
-					this.config.recoveryRoot.recoveryId,
-					cursor,
-					Number(below - cursor)
-				);
+				const want = Math.min(pageSize, Number(below - cursor));
+				let page: IGuardianGetStateResponse;
+				try {
+					page = await source.client.getState(
+						this.config.recoveryRoot.recoveryId,
+						cursor,
+						want
+					);
+				} catch (error) {
+					// Records that each fit can still overrun the client's
+					// response cap together.
+					if (want === 1) throw error;
+					pageSize = Math.ceil(want / 2);
+					continue;
+				}
 				const batch = page.records ?? [];
 				if (batch[0]?.sequence !== cursor + 1n) {
 					throw new Error(`guardian does not serve record ${cursor + 1n}`);

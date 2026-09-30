@@ -1602,7 +1602,8 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 	function dropping(
 		entry: IServed,
 		drop: (body: Buffer) => boolean,
-		verbs = ['/put_state']
+		verbs = ['/put_state'],
+		maxResponseBytes?: number
 	): IBoundGuardianClient {
 		const transport = nodeGuardianTransport();
 		return {
@@ -1610,6 +1611,7 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 			client: new GuardianClient({
 				url: entry.client.url,
 				guardianSetId: SET_ID,
+				maxResponseBytes,
 				transport: (url, init) =>
 					verbs.some((verb) => url.endsWith(verb)) && drop(init.body as Buffer)
 						? Promise.reject(new Error('dropped'))
@@ -1950,16 +1952,22 @@ describe('Recovery phase 5: guardian storage shrinks (issue #1028)', () => {
 		}
 
 		// The upgraded writer restarts, and its first transition re-bases
-		// above every record the full guardians hold.
+		// above every record the full guardians hold. Its response cap fits
+		// a record but not a page of them.
 		const floors: bigint[] = [];
 		rep = replicatorFor(
 			storage,
 			served.map((entry) =>
-				dropping(entry, (body) => {
-					const floor = decodePutStateRequest(body).retainFloor;
-					if (floor) floors.push(floor.sequence);
-					return false;
-				})
+				dropping(
+					entry,
+					(body) => {
+						const floor = decodePutStateRequest(body).retainFloor;
+						if (floor) floors.push(floor.sequence);
+						return false;
+					},
+					undefined,
+					2_000
+				)
 			)
 		);
 		commitTransition(
