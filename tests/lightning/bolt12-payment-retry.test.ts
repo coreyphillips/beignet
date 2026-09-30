@@ -40,6 +40,7 @@ import {
 } from '../../src/lightning/offer';
 import { constructBlindedPath } from '../../src/lightning/onion/blinded-path';
 import { MessageType } from '../../src/lightning/message/types';
+import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -611,6 +612,67 @@ describe('BOLT 12 blinded-path fee cap (issue #1001)', () => {
 			'retries re-entered payBolt12Invoice'
 		).to.be.greaterThan(1);
 		expect(caps.map(String)).to.deep.equal(caps.map(() => '10000'));
+
+		alice.destroy();
+		bob.destroy();
+	});
+});
+
+/** The invoice's own two usable paths: its path offered twice. */
+function withTwoPaths(invoice: IBolt12Invoice, features: Buffer): void {
+	invoice.features = features;
+	invoice.paths = [invoice.paths![0], invoice.paths![0]];
+	invoice.blindedPayInfo = [
+		invoice.blindedPayInfo![0],
+		invoice.blindedPayInfo![0]
+	];
+}
+
+describe('BOLT 12 compulsory MPP (issue #1202)', () => {
+	it('refuses an MPP/compulsory invoice before any HTLC leaves', () => {
+		const { alice, bob } = setupPair(970, 971);
+		const invoice = issueBolt12Invoice(bob, 970, 50_000n);
+		const mppCompulsory = FeatureFlags.empty();
+		mppCompulsory.setCompulsory(Feature.BASIC_MPP);
+		withTwoPaths(invoice, mppCompulsory.toBuffer());
+		const adds = recordAdds(alice);
+
+		let error: unknown;
+		try {
+			alice.payBolt12Invoice(invoice);
+		} catch (err) {
+			error = err;
+		}
+		expect(error).to.be.instanceOf(LightningPaymentError);
+		expect((error as LightningPaymentError).code).to.equal(
+			LightningErrorCode.INVALID_INVOICE
+		);
+		expect(adds, 'no update_add_htlc left alice').to.have.length(0);
+		expect(alice.getPayment(invoice.paymentHash)).to.be.undefined;
+		expect(
+			(alice as unknown as { paymentRetryContexts: Map<string, unknown> })
+				.paymentRetryContexts.size,
+			'no retry context'
+		).to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('still pays an MPP/optional invoice as one HTLC', () => {
+		const { alice, bob } = setupPair(972, 973);
+		const invoice = issueBolt12Invoice(bob, 972, 50_000n);
+		const mppOptional = FeatureFlags.empty();
+		mppOptional.setOptional(Feature.BASIC_MPP);
+		withTwoPaths(invoice, mppOptional.toBuffer());
+		const adds = recordAdds(alice);
+
+		alice.payBolt12Invoice(invoice);
+
+		expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+		expect(adds).to.deep.equal([50_000n]);
 
 		alice.destroy();
 		bob.destroy();

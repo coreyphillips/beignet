@@ -28387,6 +28387,9 @@ export class LightningNode extends EventEmitter {
 	 * invoice's other paths; when every usable path is over it the payment is
 	 * refused with FEE_EXCEEDS_MAX before anything is sent. Undefined leaves
 	 * the fee uncapped. The cap is kept for the payment's retries.
+	 *
+	 * An invoice setting the MPP/compulsory feature (bit 16) is refused with
+	 * INVALID_INVOICE, since this node pays a BOLT 12 invoice as one HTLC.
 	 */
 	payBolt12Invoice(
 		invoice: IBolt12Invoice,
@@ -28396,6 +28399,19 @@ export class LightningNode extends EventEmitter {
 	): IPaymentInfo {
 		if (!invoice.paymentHash || !invoice.amount || !invoice.nodeId) {
 			throw new Error('BOLT 12 invoice missing required fields');
+		}
+
+		// BOLT 12 requires an MPP/compulsory invoice to be paid over several
+		// blinded paths, and every dispatch below sends the whole amount as one
+		// HTLC.
+		if (
+			invoice.features &&
+			FeatureFlags.fromBuffer(invoice.features).isCompulsory(Feature.BASIC_MPP)
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVALID_INVOICE,
+				'BOLT 12 invoice requires a multi-part payment, which this node does not send'
+			);
 		}
 
 		// Payment deduplication, as in sendPayment: a hash whose payment
