@@ -740,6 +740,38 @@ describe('Funding input pledges', function () {
 				expect(unfrozenLog).to.include(key);
 			});
 
+			it(`a refused renewal keeps a freeze an unfreeze rollback restored when ${name}`, async function () {
+				const { wallet, utxos, frozen, unfrozenLog, payment } = makeWallet([
+					100_000, 100_000
+				]);
+				const key = `${utxos[0].tx_hash}:0`;
+				const retained = retainedSpending(utxos[0], payment.output!).toHex();
+				const provider = new WalletFundingProvider(wallet as never);
+				// Stale adoption has already run, so it cannot reclaim the freeze later.
+				await (
+					provider as unknown as { prunePledges(): Promise<void> }
+				).prunePledges();
+				await provider.pledgeTransactionInputs(retained);
+				expect(frozen.get(key)?.freezeTag).to.equal('funding-pledge');
+
+				// A user unfreeze has provisionally removed the pledge's entry. Its
+				// write fails and restores the entry ahead of the renewal's queued
+				// freeze, which a refresh that dropped the coin then refuses.
+				const entry = frozen.get(key)!;
+				frozen.delete(key);
+				const realFreeze = wallet.freezeUtxo;
+				(wallet as { freezeUtxo: unknown }).freezeUtxo = async () => {
+					frozen.set(key, entry);
+					return errResult('UTXO is not known to this wallet.');
+				};
+				await provider.pledgeTransactionInputs(retained).catch(() => undefined);
+				wallet.freezeUtxo = realFreeze;
+				expect(frozen.has(key)).to.equal(true);
+
+				await end(provider, key);
+				expect(unfrozenLog).to.include(key);
+			});
+
 			it(`a wallet that drops freeze tags still gets its coin back when ${name}`, async function () {
 				const { wallet, utxos, frozen, unfrozenLog, payment } = makeWallet([
 					100_000, 100_000

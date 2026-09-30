@@ -262,7 +262,12 @@ export class WalletFundingProvider implements IFundingProvider {
 					) === true
 			: res !== undefined && refusal === null;
 		if (owned) this.ownedFreezes.add(key);
-		else this.ownedFreezes.delete(key);
+		// The unfrozen read can equally be an unfreeze that then rolls back and
+		// restores our entry, so a refusal only ends ownership of a coin it left
+		// unfrozen.
+		else if (this.wallet.isUtxoFrozen?.(txid, vout) !== true) {
+			this.ownedFreezes.delete(key);
+		}
 		if (refusal === null || renewed) {
 			this.pledged.set(key, Date.now());
 			if (renewed) this.renewedPledges.add(key);
