@@ -3617,6 +3617,22 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * A splice that a reconnect resumed and that then aborts or reverts
+	 * returns to NORMAL without channel:reestablished or splice:complete, so
+	 * a completed payment's part refused during the reconnect is retried
+	 * here. An abort can also land on a channel still awaiting reestablish,
+	 * which would only refuse the fulfill; the reestablish retries it there.
+	 * Deferred: both events fire from inside a processActions dispatch.
+	 */
+	private fulfillSettledReceivedHtlcsAfterSplice(channelId: Buffer): void {
+		setImmediate(() => {
+			if (this.channelManager.getChannel(channelId)?.canSettleHtlcs()) {
+				this.fulfillSettledReceivedHtlcs(channelId);
+			}
+		});
+	}
+
+	/**
 	 * True while a received HTLC this completed payment settled is still
 	 * COMMITTED on a channel that has not gone to chain: the record and its
 	 * preimage are what fulfillSettledReceivedHtlcs reads to send it.
@@ -4626,6 +4642,7 @@ export class LightningNode extends EventEmitter {
 				}
 				this.notifySpliceAbortedObservers(channelId, reason);
 				this.chainWatcher?.unwatchSpliceInputs(channelId);
+				this.fulfillSettledReceivedHtlcsAfterSplice(channelId);
 			}
 		);
 
@@ -4638,6 +4655,7 @@ export class LightningNode extends EventEmitter {
 			'splice:reverted',
 			(channelId: Buffer, spliceTxid: string, conflictTxid: string) => {
 				this.onSpliceReverted(channelId, spliceTxid, conflictTxid);
+				this.fulfillSettledReceivedHtlcsAfterSplice(channelId);
 			}
 		);
 		// The quiescence handshake behind a conflict revert request completed

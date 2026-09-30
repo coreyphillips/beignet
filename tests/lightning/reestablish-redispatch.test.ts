@@ -1333,6 +1333,36 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		alice.destroy();
 	});
 
+	const spliceExits: Array<[string, unknown[]]> = [
+		['splice:aborted', ['peer aborted']],
+		['splice:reverted', ['aa'.repeat(32), 'bb'.repeat(32)]]
+	];
+	for (const [exit, args] of spliceExits) {
+		it(`an MPP part refused mid-reconnect is fulfilled when a resumed splice exits by ${exit} (#1196)`, async function () {
+			this.timeout(20_000);
+			// The resumed splice returns to NORMAL without splice:complete, and
+			// the reconnect that resumed it never emitted channel:reestablished.
+			const { alice, bob, carol, aliceChannelId, gate, aliceHtlcs } =
+				await refuseMppPartMidReconnect();
+			// Only bob's side is modelled; alice never sees the fulfill.
+			gate.hold = true;
+			const channel = bob.getChannelManager().getChannel(aliceChannelId)!;
+			channel.getFullState().state = ChannelState.NORMAL;
+			channel.getFullState().preReestablishState = null;
+			bob.getChannelManager().emit(exit, aliceChannelId, ...args);
+			await settle();
+
+			expect(
+				[...aliceHtlcs().values()].map((h) => h.state),
+				'the owed fulfill was sent'
+			).to.not.include(HtlcState.COMMITTED);
+
+			carol.destroy();
+			bob.destroy();
+			alice.destroy();
+		});
+	}
+
 	/**
 	 * Bob routes 60k of his own 100k invoice out to alice and back over her
 	 * channel, and alice's connection drops once it commits. Carol pays the
