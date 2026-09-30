@@ -139,6 +139,16 @@ export interface IWalletLike {
 		index: number;
 		tag?: string;
 	}): Promise<IResult>;
+	/**
+	 * freezeUtxo whose Ok value is { created: boolean }: whether this call
+	 * added the entry, decided under the wallet's own write lock. Pledges use
+	 * it to know which freezes are theirs to lift.
+	 */
+	freezeUtxoIfUnfrozen?(params: {
+		txid: string;
+		index: number;
+		tag?: string;
+	}): Promise<IResult>;
 	unfreezeUtxo?(params: { txid: string; index: number }): Promise<IResult>;
 	listFrozenUtxos?(): Array<{
 		tx_hash: string;
@@ -238,29 +248,40 @@ export class WalletFundingProvider implements IFundingProvider {
 		renewed = false
 	): Promise<string | null> {
 		const key = `${txid}:${vout}`;
-		// The wallet answers ok for a coin that is already frozen without adding
-		// an entry, so the freeze is ours only when there was none before it.
-		const frozenBefore = this.wallet.isUtxoFrozen?.(txid, vout) === true;
-		const res = await this.wallet.freezeUtxo?.({
-			txid,
-			index: vout,
-			tag: WalletFundingProvider.PLEDGE_TAG
-		});
+		const params = { txid, index: vout, tag: WalletFundingProvider.PLEDGE_TAG };
+		let res: IResult | undefined;
+		let owned: boolean;
+		if (this.wallet.freezeUtxoIfUnfrozen) {
+			// A freeze queued ahead of ours in the wallet lands between any read
+			// taken from here and our own write, so only the wallet can say
+			// whether this call added the entry. An entry that was already there
+			// leaves ownership as it stood.
+			res = await this.wallet.freezeUtxoIfUnfrozen(params);
+			owned =
+				!res.isErr() &&
+				(res as IResultOk<{ created: boolean }>).value.created === true;
+		} else {
+			// The wallet answers ok for a coin that is already frozen without
+			// adding an entry, so the freeze is ours only when there was none
+			// before it.
+			const frozenBefore = this.wallet.isUtxoFrozen?.(txid, vout) === true;
+			res = await this.wallet.freezeUtxo?.(params);
+			// The freeze read above can be another caller's provisional entry
+			// that its storage write then rolls back, letting ours land after all.
+			// The wallet decides that under its own lock, and our tag on the entry
+			// left standing is the only sign of it this side can read.
+			owned = frozenBefore
+				? this.ownedFreezes.has(key) ||
+				  this.wallet
+						.listFrozenUtxos?.()
+						.some(
+							(f) =>
+								`${f.tx_hash}:${f.tx_pos}` === key &&
+								f.freezeTag === WalletFundingProvider.PLEDGE_TAG
+						) === true
+				: res !== undefined && !res.isErr();
+		}
 		const refusal = res?.isErr() ? (res as IResultErr).error.message : null;
-		// The freeze read above can be another caller's provisional entry that
-		// its storage write then rolls back, letting ours land after all. The
-		// wallet decides that under its own lock, and our tag on the entry left
-		// standing is the only sign of it this side can read.
-		const owned = frozenBefore
-			? this.ownedFreezes.has(key) ||
-			  this.wallet
-					.listFrozenUtxos?.()
-					.some(
-						(f) =>
-							`${f.tx_hash}:${f.tx_pos}` === key &&
-							f.freezeTag === WalletFundingProvider.PLEDGE_TAG
-					) === true
-			: res !== undefined && refusal === null;
 		if (owned) this.ownedFreezes.add(key);
 		// The unfrozen read can equally be an unfreeze that then rolls back and
 		// restores our entry, so a refusal only ends ownership of a coin it left
