@@ -641,6 +641,14 @@ const SWAP_TICK_SWEEP_DEADLINE_MS = 30_000;
  * shift with hex formatting.
  */
 const HELD_FORWARD_ROW_BYTES = 1024;
+/**
+ * Encoded bytes of failureReason a payment row keeps. The reason is free
+ * text (an error message, a caller's string), and the payment metadata
+ * bound reserves this much for it on a row that can still fail.
+ */
+const PAYMENT_FAILURE_REASON_MAX_BYTES = 256;
+/** The widest htlc id or amount a settled incoming row can record. */
+const U64_MAX = 2n ** 64n - 1n;
 /** Metadata key the receiver's async receive grants persist under. */
 const ASYNC_RECEIVE_GRANTS_KEY = 'async_receive_grants';
 /**
@@ -763,6 +771,24 @@ function spliceRefusalCodeFor(result: ChannelResult): SpliceRefusalCode {
 	return result.transient
 		? SpliceRefusalCode.SPLICE_BUSY
 		: SpliceRefusalCode.SPLICE_REFUSED;
+}
+
+/** Bytes a string takes in a journaled row, its quotes included. */
+function jsonBytes(value: string): number {
+	return Buffer.byteLength(JSON.stringify(value), 'utf8');
+}
+
+/** The reason cut to PAYMENT_FAILURE_REASON_MAX_BYTES as a journal encodes it. */
+function boundedFailureReason(reason: string): string {
+	// Every UTF-16 unit encodes to at least one byte.
+	let end = Math.min(reason.length, PAYMENT_FAILURE_REASON_MAX_BYTES);
+	while (
+		jsonBytes(reason.slice(0, end)) - 2 >
+		PAYMENT_FAILURE_REASON_MAX_BYTES
+	) {
+		end--;
+	}
+	return reason.slice(0, end);
 }
 
 /**
@@ -16607,8 +16633,9 @@ export class LightningNode extends EventEmitter {
 			// decrypt and failureCode stays undefined. addHtlc already knows why
 			// (no such channel, peer not connected, insufficient balance); losing
 			// that string is what makes a local failure look like a mystery.
-			payment.failureReason =
-				result.error ?? 'Local failure: could not add HTLC to the channel';
+			payment.failureReason = boundedFailureReason(
+				result.error ?? 'Local failure: could not add HTLC to the channel'
+			);
 			// htlcKey was derived from localHtlcCounter before the add, and a refused
 			// add does not consume that id, so the mapping written above now points
 			// at an id a later unrelated HTLC will take. Drop it in both places, and
@@ -17228,8 +17255,9 @@ export class LightningNode extends EventEmitter {
 			// decrypt and failureCode stays undefined. addHtlc already knows why
 			// (no such channel, peer not connected, insufficient balance); losing
 			// that string is what makes a local failure look like a mystery.
-			payment.failureReason =
-				result.error ?? 'Local failure: could not add HTLC to the channel';
+			payment.failureReason = boundedFailureReason(
+				result.error ?? 'Local failure: could not add HTLC to the channel'
+			);
 			// Same stale-mapping and unpersisted-status cleanup as sendPayment.
 			this.htlcPaymentMap.delete(htlcKey);
 			const failMutations: RecoveryMutation[] = [
@@ -17485,9 +17513,11 @@ export class LightningNode extends EventEmitter {
 				// Part failed to dispatch — mark payment failed
 				payment.status = PaymentStatus.FAILED;
 				payment.completedAt = Date.now();
-				payment.failureReason = `Local failure: MPP part could not be dispatched (${
-					result.error ?? 'unknown reason'
-				})`;
+				payment.failureReason = boundedFailureReason(
+					`Local failure: MPP part could not be dispatched (${
+						result.error ?? 'unknown reason'
+					})`
+				);
 				this.outboundMppPayments.delete(hashHex);
 				// The mapping release and the FAILED record are one journaled
 				// transition, mirroring the single-path local-failure cleanup.
@@ -19513,27 +19543,36 @@ export class LightningNode extends EventEmitter {
 				(h) => h.channelId.equals(channelId) && h.htlcId === htlcId
 			);
 			const parkedMsat = parked.reduce((sum, h) => sum + h.amountMsat, 0n);
-			if (
+			const setComplete =
 				!alreadyParked &&
 				// A set with a settle or cancel partway through was acted on
 				// already, whatever its parked remainder still adds up to.
 				(this.heldResolutions.has(hashHex) ||
 					(finalInvoice?.amountMsat &&
 						finalInvoice.amountMsat > 0n &&
-						parkedMsat >= finalInvoice.amountMsat))
-			) {
-				this.emitStructuredLog('htlc', 'held_set_complete', {
-					paymentHash: hashHex,
-					parkedMsat: parkedMsat.toString(),
-					rejectedMsat: amountMsat.toString()
-				});
-				const reason = sharedSecret
+						parkedMsat >= finalInvoice.amountMsat));
+			// Settlement lists every parked part on the payment row.
+			const rowFull =
+				!alreadyParked && !setComplete && !this.settledRowFits(hashHex);
+			if (setComplete || rowFull) {
+				this.emitStructuredLog(
+					'htlc',
+					setComplete ? 'held_set_complete' : 'settled_row_full',
+					{
+						paymentHash: hashHex,
+						parkedMsat: parkedMsat.toString(),
+						rejectedMsat: amountMsat.toString()
+					}
+				);
+				const reason = !sharedSecret
+					? Buffer.alloc(FAILURE_MESSAGE_LENGTH)
+					: setComplete
 					? createFailureMessage(
 							sharedSecret,
 							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
 							this.incorrectPaymentDetailsData(amountMsat)
 					  )
-					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+					: createFailureMessage(sharedSecret, TEMPORARY_NODE_FAILURE);
 				// Nothing else tracks this part once it is turned away, so a
 				// refused fail is owed and retried, and the secret stays until
 				// the fail leaves.
@@ -21763,6 +21802,23 @@ export class LightningNode extends EventEmitter {
 				channelId: channelId.toString('hex'),
 				htlcId: htlcId.toString()
 			});
+			return;
+		}
+
+		// Settlement lists every part on the payment row. The parts already
+		// here stay pending and fail back at the MPP timeout.
+		if (!this.settledRowFits(hashHex)) {
+			this.emitStructuredLog('htlc', 'settled_row_full', {
+				paymentHash: hashHex,
+				parts: String(pending.receivedParts.length)
+			});
+			const secretKey = `${channelId.toString('hex')}:${htlcId}`;
+			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
+			const reason = sharedSecret
+				? createFailureMessage(sharedSecret, TEMPORARY_NODE_FAILURE)
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			this.cleanupHtlcSharedSecret(secretKey);
+			this.channelManager.failHtlc(channelId, htlcId, reason);
 			return;
 		}
 
@@ -24021,8 +24077,9 @@ export class LightningNode extends EventEmitter {
 					'Remote failure could not be decrypted (no hop HMAC matched)';
 			}
 		} else if (reason.length === 0) {
-			payment.failureReason =
-				localFailureReason ?? 'Peer failed the HTLC with an empty reason';
+			payment.failureReason = boundedFailureReason(
+				localFailureReason ?? 'Peer failed the HTLC with an empty reason'
+			);
 		}
 
 		// PERM|15 is overloaded, so the PERM bit alone does not mean "give up":
@@ -24204,9 +24261,11 @@ export class LightningNode extends EventEmitter {
 				this.payments.set(hashHex, payment);
 				payment.retryCount = retryCtx.retryCount;
 				const detail = err instanceof Error ? err.message : String(err);
-				payment.failureReason = payment.failureReason
-					? `${payment.failureReason}; retry not dispatched: ${detail}`
-					: `Retry not dispatched: ${detail}`;
+				payment.failureReason = boundedFailureReason(
+					payment.failureReason
+						? `${payment.failureReason}; retry not dispatched: ${detail}`
+						: `Retry not dispatched: ${detail}`
+				);
 			}
 		}
 
@@ -24425,9 +24484,9 @@ export class LightningNode extends EventEmitter {
 	 * so one payment row that outgrows a frame stops replication for good.
 	 * Metadata is the part of a row the caller sizes, and it may take half a
 	 * frame: the rest is left for what the payment carries and gains after
-	 * it is labelled (route, shared secrets, preimage, a retry's invoice).
-	 * Given the batches that store the row, as it is written and as it
-	 * settles, each has to fit a frame as well.
+	 * it is labelled (route, shared secrets, preimage, a retry's invoice, a
+	 * failure, received parts). Given the batches that store the row, as it
+	 * is written and as it settles, each has to fit a frame as well.
 	 */
 	private paymentMetadataFits(
 		metadata: Record<string, string>,
@@ -24452,6 +24511,12 @@ export class LightningNode extends EventEmitter {
 	 * The payment_state settlement journals for a row: it adds the preimage,
 	 * the completion time and, for an invoice payment, the invoice string
 	 * from the retry context as metadata._invoice (handleHtlcFulfilled).
+	 *
+	 * A row that has not settled is sized at the widest it can still grow
+	 * to. It can fail first, and settlement keeps the failure fields. An
+	 * incoming row lists every part it settles, and the payer picks how many
+	 * there are, so it is sized with the parts received so far plus one:
+	 * the arrival checks (settledRowFits) refuse a part past that.
 	 */
 	private settledPaymentMutation(
 		payment: IPaymentInfo,
@@ -24459,19 +24524,70 @@ export class LightningNode extends EventEmitter {
 			payment.paymentHash.toString('hex')
 		)?.invoiceStr
 	): RecoveryMutation {
-		return {
-			type: 'payment_state',
-			paymentHash: payment.paymentHash.toString('hex'),
-			payment: {
-				...payment,
-				status: PaymentStatus.COMPLETED,
-				preimage: payment.preimage ?? Buffer.alloc(32),
-				completedAt: Date.now(),
-				...(invoiceStr !== undefined && {
-					metadata: { ...payment.metadata, _invoice: invoiceStr }
-				})
-			}
+		const hashHex = payment.paymentHash.toString('hex');
+		const settled: IPaymentInfo = {
+			...payment,
+			status: PaymentStatus.COMPLETED,
+			preimage: payment.preimage ?? Buffer.alloc(32),
+			completedAt: Date.now(),
+			...(invoiceStr !== undefined && {
+				metadata: { ...payment.metadata, _invoice: invoiceStr }
+			})
 		};
+		if (payment.status !== PaymentStatus.COMPLETED) {
+			// A new failure writes a bounded reason; a longer one already on the
+			// row stays until it is replaced.
+			settled.failureReason =
+				payment.failureReason !== undefined &&
+				boundedFailureReason(payment.failureReason) !== payment.failureReason
+					? payment.failureReason
+					: 'x'.repeat(PAYMENT_FAILURE_REASON_MAX_BYTES);
+			if (payment.direction === PaymentDirection.OUTGOING) {
+				settled.failureCode = 0xffff;
+				// One per onion hop, and fewer than a hundred fit an onion.
+				settled.failureSourceIndex = 0xff;
+				// Giving up drops the retry context, so a fulfill after that keeps
+				// a caller's _invoice where settlement would write the context's.
+				const callerInvoice = payment.metadata?._invoice;
+				if (
+					callerInvoice !== undefined &&
+					invoiceStr !== undefined &&
+					jsonBytes(callerInvoice) > jsonBytes(invoiceStr)
+				) {
+					settled.metadata = payment.metadata;
+				}
+			} else {
+				const received = [
+					...(this.heldHtlcs.get(hashHex) ?? []),
+					...(this.pendingMppPayments.get(hashHex)?.receivedParts ?? [])
+				];
+				settled.settledHtlcs = [
+					...received.map(
+						(part) => `${part.channelId.toString('hex')}:${part.htlcId}`
+					),
+					`${'0'.repeat(64)}:${U64_MAX}`
+				];
+				// An any-amount invoice records what its parts paid.
+				if (payment.amountMsat === 0n) settled.amountMsat = U64_MAX;
+			}
+		}
+		return { type: 'payment_state', paymentHash: hashHex, payment: settled };
+	}
+
+	/**
+	 * Whether a received part can join this payment's settlement: the row
+	 * sized as settledPaymentMutation sizes it, with this part as the one
+	 * more, has to fit a frame. Refusing the part keeps a payer's part
+	 * count from growing the settled row past what a guardian accepts.
+	 */
+	private settledRowFits(hashHex: string): boolean {
+		const room = this.recoveryJournal?.mutationRoom();
+		const payment = this.payments.get(hashHex);
+		return (
+			room === undefined ||
+			payment === undefined ||
+			encodedMutationBytes(this.settledPaymentMutation(payment)) <= room
+		);
 	}
 
 	/**
@@ -29007,7 +29123,9 @@ export class LightningNode extends EventEmitter {
 		payment.status = PaymentStatus.FAILED;
 		payment.completedAt = Date.now();
 		if (payment.failureCode === undefined) {
-			payment.failureReason = reason ?? 'Payment failed locally';
+			payment.failureReason = boundedFailureReason(
+				reason ?? 'Payment failed locally'
+			);
 		}
 		this.paymentRetryContexts.delete(hashHex);
 		this.outboundMppPayments.delete(hashHex);
