@@ -3561,6 +3561,11 @@ export class LightningNode extends EventEmitter {
 	 * Gated on durable facts only, so it is safe on every reconnect: a
 	 * fulfilled entry is no longer COMMITTED. Held and FFOR voucher entries
 	 * are left to their own machinery, as the restart redispatch leaves them.
+	 *
+	 * The record's direction is not checked. Only receive settlement writes
+	 * settledHtlcs, so a listed HTLC is one this node already chose to settle.
+	 * A circular payment's record is OUTGOING, because sendPaymentToRoute
+	 * replaces the invoice's record, and its received parts are still owed.
 	 */
 	private fulfillSettledReceivedHtlcs(channelId: Buffer): void {
 		const channel = this.channelManager.getChannel(channelId);
@@ -3575,8 +3580,7 @@ export class LightningNode extends EventEmitter {
 			const htlcKey = `${channelHex}:${htlc.id}`;
 			const payment = this.payments.get(hashHex);
 			if (
-				payment?.direction !== PaymentDirection.INCOMING ||
-				payment.status !== PaymentStatus.COMPLETED ||
+				payment?.status !== PaymentStatus.COMPLETED ||
 				!payment.settledHtlcs?.includes(htlcKey)
 			) {
 				continue;

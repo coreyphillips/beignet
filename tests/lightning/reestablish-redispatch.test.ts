@@ -35,7 +35,11 @@ import os from 'os';
 import path from 'path';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { Network } from '../../src/lightning/invoice/types';
-import { INodeConfig, PaymentStatus } from '../../src/lightning/node/types';
+import {
+	INodeConfig,
+	PaymentDirection,
+	PaymentStatus
+} from '../../src/lightning/node/types';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IStorageBackend } from '../../src/lightning/storage/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -1284,6 +1288,196 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 			[...aliceHtlcs().values()].map((h) => h.state),
 			'the owed fulfill was sent'
 		).to.not.include(HtlcState.COMMITTED);
+
+		carol.destroy();
+		bob.destroy();
+		alice.destroy();
+	});
+
+	/**
+	 * Bob routes 60k of his own 100k invoice out to alice and back over her
+	 * channel, and alice's connection drops once it commits. Carol pays the
+	 * other 40k, completing the set, and bob's fulfill of the part from alice
+	 * is refused. Bob's record for the hash is his OUTGOING one: a second
+	 * circular part would be refused at send, since bob holds the invoice's
+	 * preimage, so an outside payer is what completes a set bob joined.
+	 */
+	async function refuseCircularMppPartMidReconnect(): Promise<{
+		alice: LightningNode;
+		bob: LightningNode;
+		carol: LightningNode;
+		paymentHash: Buffer;
+		settledKey: string;
+		gate: IWireGate;
+		htlcsWithAlice: () => HtlcState[];
+	}> {
+		const CAROL_SEED = 43;
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED);
+		const carol = createNode(CAROL_SEED);
+		const dead = { val: false };
+		const gate: IWireGate = { hold: false, queue: [] };
+		wire(alice, bob, dead, gate);
+		wire(carol, bob, dead);
+
+		// Bob funds the channel his part leaves on, alice the one it returns on.
+		const outId = openReadyChannel(bob, alice);
+		const inId = openReadyChannel(alice, bob);
+		const outScid = encodeShortChannelId({
+			block: 600,
+			txIndex: 1,
+			outputIndex: 0
+		});
+		const inScid = encodeShortChannelId({
+			block: 600,
+			txIndex: 2,
+			outputIndex: 0
+		});
+		bob.getChannelManager().getChannel(outId)!.getFullState().scidAlias =
+			outScid;
+		alice.registerChannelScid(inId, inScid);
+		openReadyChannel(carol, bob);
+		const carolScid = encodeShortChannelId({
+			block: 600,
+			txIndex: 3,
+			outputIndex: 0
+		});
+
+		const invoice = bob.createInvoice({
+			amountMsat: 100_000n,
+			description: 'circular mpp across a reconnect'
+		});
+		const finalCltv = (
+			bob as unknown as { paddedFinalCltvExpiry: () => number }
+		).paddedFinalCltvExpiry();
+		const bobId = Buffer.from(bob.getNodeId(), 'hex');
+
+		bob.sendPaymentToRoute(
+			{
+				hops: [
+					{
+						pubkey: Buffer.from(alice.getNodeId(), 'hex'),
+						shortChannelId: outScid,
+						amountToForwardMsat: 62_000n,
+						outgoingCltvValue: finalCltv + 40
+					},
+					{
+						pubkey: bobId,
+						shortChannelId: inScid,
+						amountToForwardMsat: 60_000n,
+						outgoingCltvValue: finalCltv
+					}
+				]
+			},
+			invoice.paymentHash,
+			finalCltv,
+			invoice.paymentSecret,
+			100_000n
+		);
+		await settle();
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
+		await settle();
+
+		carol.sendPaymentToRoute(
+			{
+				hops: [
+					{
+						pubkey: bobId,
+						shortChannelId: carolScid,
+						amountToForwardMsat: 40_000n,
+						outgoingCltvValue: finalCltv
+					}
+				]
+			},
+			invoice.paymentHash,
+			finalCltv,
+			invoice.paymentSecret,
+			100_000n
+		);
+		await settle();
+
+		const settledKey = `${inId.toString('hex')}:0`;
+		const payment = bob.getPayment(invoice.paymentHash)!;
+		expect(payment.direction, 'the circular record').to.equal(
+			PaymentDirection.OUTGOING
+		);
+		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+		expect(payment.settledHtlcs).to.include(settledKey);
+		const htlcsWithAlice = (): HtlcState[] =>
+			[outId, inId].flatMap((id) =>
+				[
+					...bob
+						.getChannelManager()
+						.getChannel(id)!
+						.getFullState()
+						.htlcs.values()
+				].map((h) => h.state)
+			);
+		expect(
+			htlcsWithAlice(),
+			'both legs through alice are still committed'
+		).to.deep.equal([HtlcState.COMMITTED, HtlcState.COMMITTED]);
+
+		return {
+			alice,
+			bob,
+			carol,
+			paymentHash: invoice.paymentHash,
+			settledKey,
+			gate,
+			htlcsWithAlice
+		};
+	}
+
+	async function reconnectAliceAndBob(
+		alice: LightningNode,
+		bob: LightningNode,
+		gate: IWireGate
+	): Promise<void> {
+		gate.hold = true;
+		alice.getChannelManager().handlePeerReconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerReconnected(alice.getNodeId());
+		while (gate.queue.length > 0) {
+			const m = gate.queue.shift()!;
+			m.to.handlePeerMessage(m.from, m.type, m.p);
+		}
+		gate.hold = false;
+		await settle();
+	}
+
+	it('a circular MPP part refused mid-reconnect is fulfilled on reestablish (#1193)', async function () {
+		this.timeout(20_000);
+		const { alice, bob, carol, gate, htlcsWithAlice } =
+			await refuseCircularMppPartMidReconnect();
+
+		await reconnectAliceAndBob(alice, bob, gate);
+
+		expect(htlcsWithAlice(), 'both legs through alice settled').to.deep.equal(
+			[]
+		);
+		expect(sharedSecrets(bob).size, 'no shared secret left').to.equal(0);
+
+		carol.destroy();
+		bob.destroy();
+		alice.destroy();
+	});
+
+	it('an outgoing record that does not list the received HTLC leaves it committed (#1193)', async function () {
+		this.timeout(20_000);
+		const { alice, bob, carol, paymentHash, settledKey, gate, htlcsWithAlice } =
+			await refuseCircularMppPartMidReconnect();
+		const payment = bob.getPayment(paymentHash)!;
+		payment.settledHtlcs = payment.settledHtlcs!.filter(
+			(key) => key !== settledKey
+		);
+
+		await reconnectAliceAndBob(alice, bob, gate);
+
+		expect(htlcsWithAlice(), 'nothing authorized the fulfill').to.deep.equal([
+			HtlcState.COMMITTED,
+			HtlcState.COMMITTED
+		]);
 
 		carol.destroy();
 		bob.destroy();
