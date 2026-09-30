@@ -24214,6 +24214,16 @@ export class LightningNode extends EventEmitter {
 				{ type: 'delete_htlc_payment_mapping', htlcKey: key }
 			]);
 			this.emitHtlcResolved(payment.paymentHash, channelId, htlcId, 'failed');
+			// A listener may have ended this payment or sent the hash again
+			// (failPayment, then a fresh send). The hash is then theirs:
+			// deleting its record or retrying through this context would
+			// orphan the new attempt.
+			if (
+				this.payments.get(hashHex) !== payment ||
+				this.paymentRetryContexts.get(hashHex) !== retryCtx
+			) {
+				return;
+			}
 
 			// sendPayment() rejects a second payment for a hash that is still
 			// registered, so unregister the finished attempt before redispatching.
