@@ -143,6 +143,8 @@ export function encodeTxAddInputMessage(msg: ITxAddInputMessage): Buffer {
 	return buf;
 }
 
+const TX_ADD_INPUT_TLV_TYPES = new Set([0n]);
+
 /**
  * Decode a tx_add_input message payload.
  */
@@ -173,18 +175,24 @@ export function decodeTxAddInputMessage(payload: Buffer): ITxAddInputMessage {
 	const sequence = payload.readUInt32BE(offset);
 	offset += 4;
 
-	// Optional TLV stream. We only understand shared_input_txid (type 0, len 32).
+	// Optional TLV stream; only shared_input_txid (type 0) is known.
 	let sharedInputTxid: Buffer | undefined;
-	while (offset + 2 <= payload.length) {
-		const tlvType = payload.readUInt8(offset);
-		offset += 1;
-		const tlvLen = payload.readUInt8(offset);
-		offset += 1;
-		if (offset + tlvLen > payload.length) break;
-		if (tlvType === 0 && tlvLen === 32) {
-			sharedInputTxid = Buffer.from(payload.subarray(offset, offset + 32));
+	if (offset < payload.length) {
+		const { records } = decodeTlvStream(
+			payload,
+			offset,
+			TX_ADD_INPUT_TLV_TYPES
+		);
+		for (const record of records) {
+			if (record.type === 0n) {
+				if (record.value.length !== 32) {
+					throw new Error(
+						`tx_add_input: shared_input_txid must be 32 bytes, got ${record.value.length}`
+					);
+				}
+				sharedInputTxid = record.value;
+			}
 		}
-		offset += tlvLen;
 	}
 
 	return { channelId, serialId, prevTx, prevTxVout, sequence, sharedInputTxid };
