@@ -162,18 +162,20 @@ export class WalletFundingProvider implements IFundingProvider {
 
 	/**
 	 * Outpoints pledged to an in-flight funding, keyed txid:vout with the
-	 * pledge time. A pledged coin is frozen in the wallet until either the
-	 * funding tx spends it or PLEDGE_TTL_MS passes (the funding session was
-	 * abandoned before broadcast). Pledge freezes persist in the wallet with
-	 * PLEDGE_TAG; on restart, tagged entries this instance does not know are
-	 * adopted with their original timestamp so they age out through the same
-	 * TTL and spent pruning instead of locking coins forever after a crash.
+	 * pledge time. A pledged coin is frozen in the wallet until PLEDGE_TTL_MS
+	 * passes (the funding session was abandoned before broadcast), or, once
+	 * the funding tx spends it, until renewals stop. Pledge freezes persist in
+	 * the wallet with PLEDGE_TAG; on restart, tagged entries this instance
+	 * does not know are adopted with their original timestamp so they age out
+	 * through the same pruning instead of locking coins forever after a crash.
 	 */
 	private pledged = new Map<string, number>();
 	/**
-	 * Pledges last renewed by pledgeTransactionInputs, i.e. held for a
-	 * transaction the node is still obligated to broadcast rather than for a
-	 * funding session that may simply have been abandoned.
+	 * Pledges last renewed by pledgeTransactionInputs, or whose coin a prune
+	 * found spent, i.e. held for a transaction the node is still obligated to
+	 * broadcast rather than for a funding session that may simply have been
+	 * abandoned. These outlive the spend of their coin: a reorg or eviction
+	 * can hand it back while the transaction is still owed.
 	 */
 	private renewedPledges = new Set<string>();
 	private adoptedStale = false;
@@ -271,10 +273,12 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * open (IFundingProvider.pledgeTransactionInputs).
 	 *
 	 * Runs under the selection lock, so it can never interleave with the prune
-	 * a selection performs, and only touches coins the wallet still lists as
-	 * unspent: the inputs this transaction already spent need no reservation.
-	 * An input the transaction spent and a later eviction gave back IS listed
-	 * again, and that is precisely the coin this has to re-freeze.
+	 * a selection performs. A coin the wallet lists is frozen now. One it does
+	 * not list (spent already, or not yet seen by a wallet that has not
+	 * refreshed since startup) cannot be frozen, since the wallet refuses an
+	 * outpoint it does not know, so its pledge is only renewed: any freeze the
+	 * wallet still holds for it stays in place, and the next prune freezes it
+	 * if a reorg or eviction brings it back first.
 	 *
 	 * Every input is attempted before a refusal is reported: one coin the
 	 * wallet will not freeze (it dropped out of the UTXO set mid-loop, or the
@@ -291,17 +295,22 @@ export class WalletFundingProvider implements IFundingProvider {
 			return;
 		}
 		return this.runSelection(async () => {
-			const utxos = this.wallet.listUtxos?.();
-			// Same reading as prunePledges: no list, or an empty one, is a wallet
-			// that has not loaded rather than a wallet whose coins are gone. Neither
-			// expires a pledge, so neither needs a renewal.
-			if (!utxos || utxos.length === 0) return;
-			const live = new Set(utxos.map((u) => `${u.tx_hash}:${u.tx_pos}`));
+			// Without a UTXO list nothing ever prunes, so a pledge recorded here
+			// would never be released.
+			if (!this.wallet.listUtxos) return;
+			const live = new Set(
+				this.wallet.listUtxos().map((u) => `${u.tx_hash}:${u.tx_pos}`)
+			);
 			const refused: string[] = [];
 			for (const input of tx.ins) {
 				// Transaction inputs hold the txid in internal byte order.
 				const txid = Buffer.from(input.hash).reverse().toString('hex');
-				if (!live.has(`${txid}:${input.index}`)) continue;
+				const key = `${txid}:${input.index}`;
+				if (!live.has(key)) {
+					this.pledged.set(key, Date.now());
+					this.renewedPledges.add(key);
+					continue;
+				}
 				const refusal = await this.pledge(txid, input.index, true);
 				if (refusal !== null) {
 					refused.push(`${txid}:${input.index}: ${refusal}`);
@@ -336,7 +345,12 @@ export class WalletFundingProvider implements IFundingProvider {
 		}
 	}
 
-	/** Unfreeze pledges whose funding tx spent them or that timed out. */
+	/**
+	 * Unfreeze pledges that timed out. A pledge ends only by timing out or by
+	 * an explicit release, never by the spend of its coin: the transaction it
+	 * is held for is still owed, and a reorg or eviction that hands the coin
+	 * back must find it frozen rather than wait for the owner's next renewal.
+	 */
 	private async prunePledges(): Promise<void> {
 		this.adoptStalePledges();
 		if (this.pledged.size === 0 || !this.wallet.listUtxos) return;
@@ -354,17 +368,24 @@ export class WalletFundingProvider implements IFundingProvider {
 			// the reservation the renewal just made.
 			const ts = this.pledged.get(key);
 			if (ts === undefined) continue;
-			const ttl = this.renewedPledges.has(key)
+			const renewed = this.renewedPledges.has(key);
+			const ttl = renewed
 				? WalletFundingProvider.RENEWED_PLEDGE_TTL_MS
 				: WalletFundingProvider.PLEDGE_TTL_MS;
-			const spent = !live.has(key);
-			const expired = now - ts > ttl;
-			if (spent || expired) {
-				const sep = key.lastIndexOf(':');
-				const released = await this.releasePledge(
-					key.slice(0, sep),
-					Number(key.slice(sep + 1))
-				);
+			const sep = key.lastIndexOf(':');
+			const txid = key.slice(0, sep);
+			const vout = Number(key.slice(sep + 1));
+			// The freeze kept every other spender off the coin, so its spend is
+			// the pledged transaction going out, owed until it confirms. The
+			// owner's first renewal can be a block away, so the pledge carries on
+			// as a renewed one rather than ending here.
+			if (!renewed && !live.has(key)) {
+				this.pledged.set(key, now);
+				this.renewedPledges.add(key);
+				continue;
+			}
+			if (now - ts > ttl) {
+				const released = await this.releasePledge(txid, vout);
 				// A refused unfreeze keeps the coin frozen, so keep the entry
 				// that the next prune retries it from. Forgetting it here would
 				// strand the coin: nothing else in this process knows the freeze
@@ -372,6 +393,26 @@ export class WalletFundingProvider implements IFundingProvider {
 				if (!released) continue;
 				this.pledged.delete(key);
 				this.renewedPledges.delete(key);
+				continue;
+			}
+			// A renewal that ran while the wallet did not list the coin could not
+			// freeze it. The wallet lists it again, so freeze it before this
+			// selection, and any wallet send after it, can pick it. wallet.send
+			// selects against the blacklist alone, so a refusal must abort the
+			// selection rather than let it spend the coin.
+			if (renewed && live.has(key) && !this.wallet.isUtxoFrozen?.(txid, vout)) {
+				const res = await this.wallet.freezeUtxo?.({
+					txid,
+					index: vout,
+					tag: WalletFundingProvider.PLEDGE_TAG
+				});
+				if (res?.isErr()) {
+					throw new Error(
+						`Failed to reserve funding input ${key}: ${
+							(res as IResultErr).error.message
+						}`
+					);
+				}
 			}
 		}
 	}
@@ -620,10 +661,10 @@ export class WalletFundingProvider implements IFundingProvider {
 		const candidates = this.wallet.listUtxos().filter((u) => {
 			// Frozen coins (pledged to an in-flight funding, or frozen by the
 			// user) are excluded from selection; listUtxos itself does not
-			// filter them. A renewal whose freeze the wallet refused is held in
-			// the pledged map alone, and a coin a transaction still owes must
-			// not go to a second selection just because the blacklist write
-			// failed.
+			// filter them. A renewal whose freeze the wallet refused, or that
+			// found the coin unlisted, is held in the pledged map alone, and a
+			// coin a transaction still owes must not go to a second selection
+			// just because the blacklist does not hold it.
 			if (this.wallet.isUtxoFrozen?.(u.tx_hash, u.tx_pos)) return false;
 			if (this.pledged.has(`${u.tx_hash}:${u.tx_pos}`)) return false;
 			try {
