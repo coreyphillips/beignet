@@ -433,6 +433,101 @@ describe('BOLT 12 payment retry (issue #261)', () => {
 		bob.destroy();
 	});
 
+	// Issue #1236: the transport throws as the first update_add_htlc leaves,
+	// after the channel already holds the HTLC.
+	it('a dispatch that throws once its HTLC is out keeps its retry context', () => {
+		const { alice, bob } = setupPair(958, 959);
+		const invoice = issueBolt12Invoice(bob, 958, 50_000n);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const bobAny = bob as any;
+		const realHandler = bobAny.handleFinalHopHtlc.bind(bob);
+		// bob fails the first attempt and settles the retry.
+		let attempts = 0;
+		bobAny.handleFinalHopHtlc = (
+			channelId: Buffer,
+			htlcId: bigint,
+			...rest: unknown[]
+		): void => {
+			if (++attempts > 1) {
+				realHandler(channelId, htlcId, ...rest);
+				return;
+			}
+			const key = `${channelId.toString('hex')}:${htlcId}`;
+			bobAny.channelManager.failHtlc(
+				channelId,
+				htlcId,
+				createFailureMessage(
+					bobAny.receivedHtlcSharedSecrets.get(key),
+					TEMPORARY_NODE_FAILURE
+				)
+			);
+		};
+		let queued: Buffer | undefined;
+		const throwOnAdd = (
+			_pubkey: string,
+			type: number,
+			payload: Buffer
+		): void => {
+			if (type !== MessageType.UPDATE_ADD_HTLC) return;
+			queued = payload;
+			throw new Error('transport failed');
+		};
+		alice.prependListener('message:outbound', throwOnAdd);
+
+		expect(() => alice.payBolt12Invoice(invoice)).to.throw(/transport failed/);
+		expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+		expect(alice.hasHtlcInFlight(invoice.paymentHash)).to.be.true;
+		expect(
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).paymentRetryContexts.has(
+				invoice.paymentHash.toString('hex')
+			)
+		).to.be.true;
+
+		// The transport recovers: the update reaches bob and alice commits it.
+		alice.removeListener('message:outbound', throwOnAdd);
+		bob.handlePeerMessage(
+			alice.getNodeId(),
+			MessageType.UPDATE_ADD_HTLC,
+			queued!
+		);
+		const manager = alice.getChannelManager();
+		manager.autoSignAndSendCommitment(
+			manager.listChannels()[0].getChannelId()!
+		);
+
+		// The temporary failure is retried, not final.
+		expect(attempts).to.equal(2);
+		const settled = alice.getPayment(invoice.paymentHash)!;
+		expect(settled.status).to.equal(PaymentStatus.COMPLETED);
+		expect(settled.retryCount).to.equal(1);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a dispatch that throws before its HTLC is out leaves no retry context', () => {
+		const { alice, bob } = setupPair(962, 963);
+		const invoice = issueBolt12Invoice(bob, 962, 50_000n);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const a = alice as any;
+
+		// The throw comes after the PENDING record is written, before the
+		// channel holds anything.
+		a.channelManager.addHtlc = (): never => {
+			throw new Error('transport failed');
+		};
+
+		expect(() => alice.payBolt12Invoice(invoice)).to.throw(/transport failed/);
+		expect(alice.hasHtlcInFlight(invoice.paymentHash)).to.be.false;
+		expect(a.paymentRetryContexts.size).to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
 	it('a local HTLC refusal after route construction leaves no retry context', () => {
 		const { alice, bob } = setupPair(952, 953);
 		const invoice = issueBolt12Invoice(bob, 952, 50_000n);
