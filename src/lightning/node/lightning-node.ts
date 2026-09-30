@@ -2982,7 +2982,8 @@ export class LightningNode extends EventEmitter {
 				this.emitStructuredLog('channel', 'legacy_v2_depth_raised', {
 					channelId
 				});
-				// A failed write only means the next load raises it again.
+				// A failed write only means the next load, at startup or a live
+				// reload, raises it again.
 				this.persistChannel(Buffer.from(channelId, 'hex'));
 			}
 		}
@@ -4813,6 +4814,8 @@ export class LightningNode extends EventEmitter {
 							);
 						}
 						const channel = new Channel(row.state);
+						// The startup write of the raised depth may not have landed.
+						channel.repairLegacyV2OpenerDepth();
 						const keyIndex = this.storage!.loadChannelKeyIndex(idHex);
 						this.channelManager.restoreChannel(
 							channel,
@@ -7240,6 +7243,8 @@ export class LightningNode extends EventEmitter {
 				row.state.state = this.v2RetainedAttemptState(row.state.v2InFlight);
 			}
 			const channel = new Channel(row.state);
+			// The startup write of the raised depth may not have landed.
+			channel.repairLegacyV2OpenerDepth();
 			const keyIndex = this.storage.loadChannelKeyIndex(idHex);
 			this.channelManager.restoreChannel(channel, row.peerPubkey, keyIndex);
 			this.emitStructuredLog('channel', 'v2_open_resynced_from_disk', {

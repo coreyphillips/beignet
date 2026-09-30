@@ -10281,9 +10281,11 @@ export class Channel {
 		s.minimumDepth = MAX_MINIMUM_DEPTH;
 		// A parked confirmation was stamped against depth 0, and reestablish
 		// or the exchange completing would flush channel_ready from it. The
-		// restored watch stamps it again at the raised depth.
+		// restored watch stamps it again at the raised depth. A row with no
+		// in-flight record parks it in fundingConfirmedLate instead.
 		if (s.v2InFlight) s.v2InFlight.confirmed = false;
 		for (const rec of s.v2PreviousAttempts ?? []) rec.confirmed = false;
+		s.fundingConfirmedLate = undefined;
 		return true;
 	}
 

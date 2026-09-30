@@ -9092,12 +9092,26 @@ describe('a legacy v2 opener row restores at the maximum depth (issue 1197)', fu
 	let dir: string;
 	let dbPath: string;
 	let channelId: Buffer;
+	let peerId: string;
 	let legacy: IChannelState;
+	let acceptorState: IChannelState;
 	let fundingTx: bitcoin.Transaction;
 	let fundingScript: Buffer;
 
 	const clone = (s: IChannelState): IChannelState =>
 		deserializeChannelState(serializeChannelState(s));
+
+	// A restart on the database holding `row`.
+	const restartOn = (
+		row: IChannelState
+	): { opener: LightningNode; storage: SqliteStorage } => {
+		const storage = new SqliteStorage(dbPath);
+		storage.open();
+		storage.saveChannel(channelId.toString('hex'), row, peerId);
+		const opener = new LightningNode(makeNodeConfig(1197, { storage }));
+		opener.on('node:error', () => {});
+		return { opener, storage };
+	};
 
 	before(async function () {
 		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-legacy-depth-1197-'));
@@ -9131,7 +9145,11 @@ describe('a legacy v2 opener row restores at the maximum depth (issue 1197)', fu
 		await settle(
 			() => channel.getState() === ChannelState.AWAITING_CHANNEL_READY
 		);
-		managerOf(opener).handlePeerDisconnected(acceptor.getNodeId());
+		peerId = acceptor.getNodeId();
+		acceptorState = clone(
+			managerOf(acceptor).getChannel(channelId)!.getFullState()
+		);
+		managerOf(opener).handlePeerDisconnected(peerId);
 		managerOf(opener).handleFundingConfirmed(channelId, txidHex);
 		legacy = clone(channel.getFullState());
 		expect(legacy.preReestablishState).to.equal(
@@ -9142,11 +9160,7 @@ describe('a legacy v2 opener row restores at the maximum depth (issue 1197)', fu
 		// What the release before #1034 left on disk: the accepter's depth
 		// never stored.
 		legacy.minimumDepth = 0;
-		storage.saveChannel(
-			channelId.toString('hex'),
-			legacy,
-			acceptor.getNodeId()
-		);
+		storage.saveChannel(channelId.toString('hex'), legacy, peerId);
 		fundingTx = bitcoin.Transaction.fromHex(legacy.v2InFlight!.fundingTxHex);
 		fundingScript = createFundingScript(
 			legacy.localBasepoints.fundingPubkey,
@@ -9205,6 +9219,66 @@ describe('a legacy v2 opener row restores at the maximum depth (issue 1197)', fu
 		).to.not.equal(true);
 		expect(state.localChannelReady).to.equal(false);
 		expect(state.state).to.not.equal(ChannelState.NORMAL);
+		opener.destroy();
+	});
+
+	it('a row with no in-flight record does not ready from its parked stamp', function () {
+		const row = clone(legacy);
+		row.v2InFlight = null;
+		row.v2PreviousAttempts = undefined;
+		row.fundingConfirmedLate = true;
+		const { opener, storage } = restartOn(row);
+		const restored = opener.getChannelManager().getChannel(channelId)!;
+		expect(
+			storage.loadChannel(channelId.toString('hex'))!.state.fundingConfirmedLate
+		).to.not.equal(true);
+
+		// The accepter reconnects.
+		const peer = new Channel(clone(acceptorState));
+		peer.markForReestablish();
+		const actions = restored.handleReestablish(
+			reestablishOf(peer.createReestablish())
+		);
+		expect(findPayload(actions, MessageType.CHANNEL_READY)).to.equal(null);
+		expect(restored.getFullState().localChannelReady).to.equal(false);
+		expect(restored.getState()).to.not.equal(ChannelState.NORMAL);
+		opener.destroy();
+	});
+
+	it('a live reload of a row still at depth 0 raises it again', function () {
+		const row = clone(legacy);
+		row.state = ChannelState.AWAITING_TX_SIGNATURES;
+		row.preReestablishState = null;
+		const { opener, storage } = restartOn(row);
+		const manager = opener.getChannelManager();
+		const reloads: Array<[string, () => void]> = [
+			[
+				'blocked persist resync',
+				(): void =>
+					(
+						opener as unknown as {
+							resyncV2OpenFromDisk(id: Buffer): void;
+						}
+					).resyncV2OpenFromDisk(channelId)
+			],
+			[
+				'abandonment revert',
+				(): void => {
+					manager.emit('channel:abandoned', channelId, 'test');
+				}
+			]
+		];
+		for (const [label, reload] of reloads) {
+			// The startup write of the raised depth did not land.
+			storage.saveChannel(channelId.toString('hex'), row, peerId);
+			const before = manager.getChannel(channelId);
+			reload();
+			const after = manager.getChannel(channelId)!;
+			expect(after, `${label} reloaded the row`).to.not.equal(before);
+			expect(after.getFullState().minimumDepth, label).to.equal(
+				MAX_MINIMUM_DEPTH
+			);
+		}
 		opener.destroy();
 	});
 
