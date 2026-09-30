@@ -405,6 +405,16 @@ describe('BOLT 11 payer safety', function () {
 			}
 			expect(requested).to.have.length(0);
 
+			// A caller-named chain must be ours, even when the offer lists it.
+			const foreign = await node
+				.requestInvoice(offer([REGTEST_CHAIN_HASH, TESTNET_CHAIN_HASH]), {
+					chain: TESTNET_CHAIN_HASH
+				})
+				.catch((e) => e);
+			expect(foreign).to.be.instanceOf(InvalidRequestError);
+			expect(foreign.message).to.contain("not this node's chain");
+			expect(requested).to.have.length(0);
+
 			// Listed, though not first: the request names our chain.
 			await node
 				.requestInvoice(offer([TESTNET_CHAIN_HASH, REGTEST_CHAIN_HASH]))
