@@ -9122,11 +9122,26 @@ describe('a legacy v2 opener row restores at the maximum depth (issue 1197)', fu
 			() => channel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED
 		);
 		channelId = channel.getChannelId()!;
-		// What the release before #1034 left on disk: the accepter's depth
-		// never stored, and its channel_ready already received.
+		const txidHex = Buffer.from(channel.getFullState().fundingTxid!)
+			.reverse()
+			.toString('hex');
+		// The accepter's channel_ready arrives first, then the old watcher's
+		// one-confirmation callback lands while disconnected and is parked.
+		managerOf(acceptor).handleFundingConfirmed(channelId, txidHex);
+		await settle(
+			() => channel.getState() === ChannelState.AWAITING_CHANNEL_READY
+		);
+		managerOf(opener).handlePeerDisconnected(acceptor.getNodeId());
+		managerOf(opener).handleFundingConfirmed(channelId, txidHex);
 		legacy = clone(channel.getFullState());
+		expect(legacy.preReestablishState).to.equal(
+			ChannelState.AWAITING_CHANNEL_READY
+		);
+		expect(legacy.remoteChannelReady).to.equal(true);
+		expect(legacy.v2InFlight!.confirmed).to.equal(true);
+		// What the release before #1034 left on disk: the accepter's depth
+		// never stored.
 		legacy.minimumDepth = 0;
-		legacy.remoteChannelReady = true;
 		storage.saveChannel(
 			channelId.toString('hex'),
 			legacy,
@@ -9160,6 +9175,10 @@ describe('a legacy v2 opener row restores at the maximum depth (issue 1197)', fu
 			storage.loadChannel(idHex)!.state.minimumDepth,
 			'the raised depth is on disk'
 		).to.equal(MAX_MINIMUM_DEPTH);
+		expect(
+			storage.loadChannel(idHex)!.state.v2InFlight!.confirmed,
+			'the stamp parked at depth 0 is dropped'
+		).to.equal(false);
 
 		const watched = (): Map<string, { minimumDepth: number }> =>
 			(
@@ -9211,6 +9230,13 @@ describe('a legacy v2 opener row restores at the maximum depth (issue 1197)', fu
 				s.localChannelReady = true;
 			}),
 			'established'
+		).to.equal(0);
+		expect(
+			raised((s) => {
+				s.localChannelReady = true;
+				s.remoteChannelReady = false;
+			}),
+			'our channel_ready already sent'
 		).to.equal(0);
 		expect(
 			raised((s) => {

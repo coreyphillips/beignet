@@ -10259,23 +10259,31 @@ export class Channel {
 	 * is the deepest one we would have accepted.
 	 *
 	 * Only a row still waiting on the chain: a zero-conf type negotiated its
-	 * 0, and past our channel_ready the depth gates nothing.
+	 * 0, and past our channel_ready the depth gates nothing. A peer ready
+	 * that arrived first leaves the row in AWAITING_CHANNEL_READY.
 	 */
 	repairLegacyV2OpenerDepth(): boolean {
 		const s = this._state;
 		if (s.role !== ChannelRole.OPENER || s.fundingVersion !== 2) return false;
 		if (s.minimumDepth !== 0 || this._isZeroConfChannelType()) return false;
+		if (s.localChannelReady) return false;
 		const st =
 			s.state === ChannelState.AWAITING_REESTABLISH
 				? s.preReestablishState
 				: s.state;
 		if (
 			st !== ChannelState.AWAITING_TX_SIGNATURES &&
-			st !== ChannelState.AWAITING_FUNDING_CONFIRMED
+			st !== ChannelState.AWAITING_FUNDING_CONFIRMED &&
+			st !== ChannelState.AWAITING_CHANNEL_READY
 		) {
 			return false;
 		}
 		s.minimumDepth = MAX_MINIMUM_DEPTH;
+		// A parked confirmation was stamped against depth 0, and reestablish
+		// or the exchange completing would flush channel_ready from it. The
+		// restored watch stamps it again at the raised depth.
+		if (s.v2InFlight) s.v2InFlight.confirmed = false;
+		for (const rec of s.v2PreviousAttempts ?? []) rec.confirmed = false;
 		return true;
 	}
 
