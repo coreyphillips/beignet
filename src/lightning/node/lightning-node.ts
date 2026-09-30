@@ -28872,6 +28872,13 @@ export class LightningNode extends EventEmitter {
 		}
 		const ctx = this.paymentRetryContexts.get(hashHex)!;
 		ctx.bolt12PathIndex = pathIndex;
+		// By identity: a listener run during the send may have failed this
+		// payment and started a new send of the hash, whose context this is.
+		const release = (): void => {
+			if (created && this.paymentRetryContexts.get(hashHex) === ctx) {
+				this.paymentRetryContexts.delete(hashHex);
+			}
+		};
 		try {
 			const payment = this.sendPaymentToRoute(
 				route,
@@ -28882,12 +28889,10 @@ export class LightningNode extends EventEmitter {
 				undefined,
 				invoice.amount
 			);
-			if (created && payment.status === PaymentStatus.FAILED) {
-				this.paymentRetryContexts.delete(hashHex);
-			}
+			if (payment.status === PaymentStatus.FAILED) release();
 			return payment;
 		} catch (err) {
-			if (created) this.paymentRetryContexts.delete(hashHex);
+			release();
 			throw err;
 		}
 	}
