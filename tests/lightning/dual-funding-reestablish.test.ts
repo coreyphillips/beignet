@@ -54,7 +54,8 @@ import {
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
-	MAX_DUST_LIMIT_SATOSHIS
+	MAX_DUST_LIMIT_SATOSHIS,
+	MAX_MINIMUM_DEPTH
 } from '../../src/lightning/channel/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
@@ -9082,5 +9083,147 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		opener2.destroy();
 		acceptor.destroy();
 		fs.rmSync(dir, { recursive: true, force: true });
+	});
+});
+
+describe('a legacy v2 opener row restores at the maximum depth (issue 1197)', function () {
+	this.timeout(20_000);
+
+	let dir: string;
+	let dbPath: string;
+	let channelId: Buffer;
+	let legacy: IChannelState;
+	let fundingTx: bitcoin.Transaction;
+	let fundingScript: Buffer;
+
+	const clone = (s: IChannelState): IChannelState =>
+		deserializeChannelState(serializeChannelState(s));
+
+	before(async function () {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-legacy-depth-1197-'));
+		dbPath = path.join(dir, 'opener.db');
+		const storage = new SqliteStorage(dbPath);
+		storage.open();
+		const opener = new LightningNode(
+			makeNodeConfig(1197, {
+				storage,
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(1198));
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		wireNodes(opener, acceptor);
+		const channel = opener.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(
+			() => channel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		channelId = channel.getChannelId()!;
+		// What the release before #1034 left on disk: the accepter's depth
+		// never stored, and its channel_ready already received.
+		legacy = clone(channel.getFullState());
+		legacy.minimumDepth = 0;
+		legacy.remoteChannelReady = true;
+		storage.saveChannel(
+			channelId.toString('hex'),
+			legacy,
+			acceptor.getNodeId()
+		);
+		fundingTx = bitcoin.Transaction.fromHex(legacy.v2InFlight!.fundingTxHex);
+		fundingScript = createFundingScript(
+			legacy.localBasepoints.fundingPubkey,
+			legacy.remoteBasepoints!.fundingPubkey,
+			bitcoin.networks.regtest
+		).p2wshOutput;
+		opener.destroy();
+		acceptor.destroy();
+	});
+
+	after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+	it('persists the raised depth and one confirmation does not ready the channel', async function () {
+		const backend = new ScriptedChainBackend();
+		backend.transactions.set(fundingTx.getId(), fundingTx.toBuffer());
+		const storage = new SqliteStorage(dbPath);
+		storage.open();
+		const opener = new LightningNode(
+			makeNodeConfig(1197, { storage, chainBackend: backend })
+		);
+		opener.on('node:error', () => {});
+		const idHex = channelId.toString('hex');
+		const restored = opener.getChannelManager().getChannel(channelId)!;
+		expect(restored.getFullState().minimumDepth).to.equal(MAX_MINIMUM_DEPTH);
+		expect(
+			storage.loadChannel(idHex)!.state.minimumDepth,
+			'the raised depth is on disk'
+		).to.equal(MAX_MINIMUM_DEPTH);
+
+		const watched = (): Map<string, { minimumDepth: number }> =>
+			(
+				opener.getChainWatcher() as unknown as {
+					watchedFundings: Map<string, { minimumDepth: number }>;
+				}
+			).watchedFundings;
+		await settle(() => watched().has(idHex));
+		expect(watched().get(idHex)!.minimumDepth).to.equal(MAX_MINIMUM_DEPTH);
+
+		// Mined in the next block, and that header delivered.
+		backend.history.set(computeScriptHash(fundingScript), [
+			{ txid: fundingTx.getId(), height: backend.tipHeight + 1 }
+		]);
+		backend.advanceTo(backend.tipHeight + 1);
+		await opener.getChainWatcher()!.recheckAllWatches();
+		await new Promise((r) => setTimeout(r, 25));
+
+		// The durable stamp the next reestablish would flush channel_ready from.
+		const state = restored.getFullState();
+		expect(
+			state.v2InFlight!.confirmed,
+			'no confirmation recorded'
+		).to.not.equal(true);
+		expect(state.localChannelReady).to.equal(false);
+		expect(state.state).to.not.equal(ChannelState.NORMAL);
+		opener.destroy();
+	});
+
+	it('leaves zero-conf, established and already deeper rows alone', function () {
+		const raised = (mutate: (s: IChannelState) => void): number => {
+			const s = clone(legacy);
+			mutate(s);
+			new Channel(s).repairLegacyV2OpenerDepth();
+			return s.minimumDepth;
+		};
+		const zeroConf = FeatureFlags.fromBuffer(legacy.channelType!);
+		zeroConf.setCompulsory(Feature.SCID_ALIAS);
+		zeroConf.setCompulsory(Feature.ZERO_CONF);
+		expect(
+			raised((s) => {
+				s.channelType = zeroConf.toBuffer();
+			}),
+			'negotiated zero-conf'
+		).to.equal(0);
+		expect(
+			raised((s) => {
+				s.state = ChannelState.NORMAL;
+				s.localChannelReady = true;
+			}),
+			'established'
+		).to.equal(0);
+		expect(
+			raised((s) => {
+				s.minimumDepth = 6;
+			}),
+			'a stored accepter depth'
+		).to.equal(6);
+		expect(
+			raised((s) => {
+				s.state = ChannelState.AWAITING_REESTABLISH;
+				s.preReestablishState = ChannelState.AWAITING_FUNDING_CONFIRMED;
+			}),
+			'a row persisted mid-reestablish is still pending'
+		).to.equal(MAX_MINIMUM_DEPTH);
 	});
 });

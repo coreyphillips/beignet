@@ -97,7 +97,8 @@ import {
 	BITCOIN_CHAIN_HASH,
 	MAX_FUNDING_SATOSHIS,
 	DEFAULT_CHANNEL_CONFIG,
-	DEFAULT_MINIMUM_DEPTH
+	DEFAULT_MINIMUM_DEPTH,
+	MAX_MINIMUM_DEPTH
 } from './types';
 import {
 	IAbandonedLocalAdd,
@@ -10243,6 +10244,39 @@ export class Channel {
 			...this._state.remoteConfig,
 			channelReserveSatoshis: derived
 		};
+	}
+
+	/**
+	 * Raise a legacy v2 opener's funding depth on load. Returns whether it
+	 * changed the row (issue #1197).
+	 *
+	 * Before #1034 handleAcceptChannel2 never stored the accepter's
+	 * minimum_depth, so a non-zero-conf v2 opener persisted mid-open still
+	 * carries the 0 from createOpenerState. Restored as is, one confirmation
+	 * readies the channel, and with the peer's channel_ready already in hand
+	 * it goes NORMAL while a shallow reorg can still let the accepter
+	 * double-spend its inputs. The accepter's request is gone, so the stand-in
+	 * is the deepest one we would have accepted.
+	 *
+	 * Only a row still waiting on the chain: a zero-conf type negotiated its
+	 * 0, and past our channel_ready the depth gates nothing.
+	 */
+	repairLegacyV2OpenerDepth(): boolean {
+		const s = this._state;
+		if (s.role !== ChannelRole.OPENER || s.fundingVersion !== 2) return false;
+		if (s.minimumDepth !== 0 || this._isZeroConfChannelType()) return false;
+		const st =
+			s.state === ChannelState.AWAITING_REESTABLISH
+				? s.preReestablishState
+				: s.state;
+		if (
+			st !== ChannelState.AWAITING_TX_SIGNATURES &&
+			st !== ChannelState.AWAITING_FUNDING_CONFIRMED
+		) {
+			return false;
+		}
+		s.minimumDepth = MAX_MINIMUM_DEPTH;
+		return true;
 	}
 
 	/**

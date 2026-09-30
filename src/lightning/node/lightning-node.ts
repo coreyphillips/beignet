@@ -2961,6 +2961,9 @@ export class LightningNode extends EventEmitter {
 				continue;
 			}
 			const channel = new Channel(state);
+			// Before restoreChainWatches or a resumed exchange can arm a funding
+			// watch from the stored depth (issue #1197).
+			const depthRaised = channel.repairLegacyV2OpenerDepth();
 			const keyIndex = this.storage!.loadChannelKeyIndex(channelId);
 			this.channelManager.restoreChannel(channel, peerPubkey, keyIndex);
 			// This row was read off disk and nothing has checked it against
@@ -2975,6 +2978,13 @@ export class LightningNode extends EventEmitter {
 			// for non-splicing channels, and that reset clears _lastSentBatch,
 			// so bytes restored before it would be silently wiped.
 			this.restoreOutboxRetransmission(channelId, channel);
+			if (depthRaised) {
+				this.emitStructuredLog('channel', 'legacy_v2_depth_raised', {
+					channelId
+				});
+				// A failed write only means the next load raises it again.
+				this.persistChannel(Buffer.from(channelId, 'hex'));
+			}
 		}
 
 		// Restore payments
