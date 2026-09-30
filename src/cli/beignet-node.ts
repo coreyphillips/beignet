@@ -172,8 +172,11 @@ import {
 	IHoldCancelledEvent,
 	IHoldInvoiceStateEvent,
 	IStructuredLog,
+	IRebalanceExecutionSummary,
+	IRebalanceResult,
 	PaymentDirection,
-	PaymentStatus
+	PaymentStatus,
+	PaymentWaitTimeoutError
 } from '../lightning/node/types';
 import { isAnchorChannel, ChannelState } from '../lightning/channel/types';
 import { isRecencyUnproven } from '../lightning/channel/channel-state';
@@ -463,12 +466,13 @@ export interface BeignetNodeOptions {
 	 * fee). A Lightning payment reserves its amount plus its routing-fee cap
 	 * at admission and is charged its amount plus the fee actually paid when
 	 * it settles (issue #1008); sendToRoute reserves and charges what its
-	 * first hop carries. Excluded by design: consolidateUtxos (self-pay), our
-	 * own channel opens/splices/funding, bumpFeeOnchain/boostOnchain
-	 * (fee-only), and the submarine swap provider's payment of the
-	 * counterparty's invoice, which is bounded by the provider's own per-swap
-	 * fee cap and by the swap-in it is funded from rather than by this
-	 * limit. Resets at midnight UTC.
+	 * first hop carries. A circular rebalance (rebalanceChannel,
+	 * executeRebalances) counts its routing fee only. Excluded by design:
+	 * consolidateUtxos (self-pay), our own channel opens/splices/funding,
+	 * bumpFeeOnchain/boostOnchain (fee-only), and the submarine swap
+	 * provider's payment of the counterparty's invoice, which is bounded by
+	 * the provider's own per-swap fee cap and by the swap-in it is funded
+	 * from rather than by this limit. Resets at midnight UTC.
 	 * NOTE: before v0.3.0 this limit covered Lightning only.
 	 */
 	dailySpendLimitSats?: number;
@@ -478,9 +482,12 @@ export interface BeignetNodeOptions {
 	 * amount plus routing-fee cap exceeds this (issue #1008): the cap is the
 	 * caller's maxFeeSats/maxFeeMsat, or the default of 1% of the amount with
 	 * a 50 sat floor when none is given. Prevents accidental large payments.
-	 * The submarine swap provider's payment of the counterparty's invoice is
-	 * excluded by design: the provider's own per-swap fee cap and the swap-in
-	 * it is funded from bound it.
+	 * External on-chain sends are capped too: sendOnchain, address-targeted
+	 * spliceOut and sendDirectFunding on amount + fee, sendMaxOnchain on the
+	 * whole sweep. Circular rebalances are not capped, since the amount
+	 * comes back. The submarine swap provider's payment of the counterparty's
+	 * invoice is excluded by design: the provider's own per-swap fee cap and
+	 * the swap-in it is funded from bound it.
 	 */
 	maxPaymentSats?: number;
 	/** Timeout for connectPeer() in milliseconds (default: 15000) */
@@ -609,6 +616,8 @@ export interface BeignetNodeOptions {
 	 * Automatic circular rebalancing (default DISABLED). When enabled the node
 	 * periodically executes the advisor's rebalance plan, spending at most
 	 * budgetSatsPerDay in routing fees per UTC day. Off unless enabled: true.
+	 * Each run is an executeRebalances call, so drain mode and
+	 * dailySpendLimitSats hold it as they hold a manual one.
 	 */
 	autoRebalance?: {
 		enabled?: boolean;
@@ -1884,6 +1893,8 @@ export class BeignetNode extends EventEmitter {
 	private _sweepRefreshTimer?: ReturnType<typeof setInterval>;
 	/** Background timer waiting for Electrum before fallback-fund recovery (see runFallbackRecoveryWhenConnected). */
 	private _fallbackRecoveryTimer?: ReturnType<typeof setInterval>;
+	/** The autoRebalance timer, run here rather than in the engine (see initNode). */
+	private _autoRebalanceTimer?: ReturnType<typeof setInterval>;
 	/**
 	 * Bound on the cooperative close's wallet-address lookup (issue #542
 	 * review): getNextAvailableAddress can enter an Electrum reconnect whose
@@ -2110,6 +2121,12 @@ export class BeignetNode extends EventEmitter {
 	 * either of them can be the one that settles.
 	 */
 	private readonly _asyncSpendClaims = new Map<string, AsyncSpendClaim[]>();
+	/**
+	 * The up-front charges of the rebalances still running, which a new UTC
+	 * day starts with. In memory only: after a restart the charge stays with
+	 * the day it was persisted to.
+	 */
+	private _liveRebalanceChargeSats = 0;
 	private _maxPaymentSats?: number;
 	/** Tail of the queue _runOnchainSend runs whole on-chain sends through. */
 	private _onchainSendLock: Promise<unknown> = Promise.resolve();
@@ -2945,7 +2962,12 @@ export class BeignetNode extends EventEmitter {
 				  }
 				: {}),
 			peerStorageEnabled: this.peerStorageEnabled,
-			autoRebalance: opts.autoRebalance,
+			// The engine's own timer would skip the drain and the daily limit,
+			// so the node runs it instead (step 11b).
+			autoRebalance: opts.autoRebalance && {
+				...opts.autoRebalance,
+				enabled: false
+			},
 			autoTuneFees: opts.autoTuneFees,
 			watchtowers: opts.watchtowers,
 			recovery: this.recoveryNodeConfig
@@ -3675,6 +3697,19 @@ export class BeignetNode extends EventEmitter {
 		}
 		if (opts.maxPaymentSats !== undefined && opts.maxPaymentSats > 0) {
 			this._maxPaymentSats = opts.maxPaymentSats;
+		}
+
+		// 11b. Automatic rebalancing, through executeRebalances so every run
+		// is held to the drain and charged to the daily ledger loaded above.
+		if (opts.autoRebalance?.enabled === true) {
+			this._autoRebalanceTimer = setInterval(() => {
+				this.executeRebalances().catch((err) => {
+					this.log('warn', 'Automatic rebalance failed', {
+						error: err instanceof Error ? err.message : String(err)
+					});
+				});
+			}, opts.autoRebalance.intervalMs ?? 3_600_000);
+			this._autoRebalanceTimer.unref?.();
 		}
 
 		// 12. Auto-bootstrap peer discovery
@@ -5269,6 +5304,10 @@ export class BeignetNode extends EventEmitter {
 			clearInterval(this._fallbackRecoveryTimer);
 			this._fallbackRecoveryTimer = undefined;
 		}
+		if (this._autoRebalanceTimer) {
+			clearInterval(this._autoRebalanceTimer);
+			this._autoRebalanceTimer = undefined;
+		}
 		// The queue itself stays, and is not stopped: stop() is for good, and
 		// after the resume it serves the rebuilt node over the installed
 		// database through its live storage view (issue #978).
@@ -6423,8 +6462,9 @@ export class BeignetNode extends EventEmitter {
 		amountSats: number,
 		satsPerVbyte?: number
 	): Promise<TxInfo> {
-		// External onchain sends share the daily budget with Lightning
-		// payments. Fail fast on the amount alone before building.
+		// External onchain sends share the per-payment and daily limits with
+		// Lightning payments. Fail fast on the amount alone before building.
+		this._checkMaxPayment(amountSats);
 		this._checkSpendLimit(amountSats);
 		return this._runOnchainSend(async () => {
 			// The staged send is read below (the built fee) and reset on every
@@ -6446,20 +6486,28 @@ export class BeignetNode extends EventEmitter {
 					throw new BeignetError('SEND_FAILED', result.error.message);
 				}
 				// No limit configured: broadcast without touching the budget.
-				if (this._dailySpendLimitSats === undefined) {
+				if (
+					this._dailySpendLimitSats === undefined &&
+					this._maxPaymentSats === undefined
+				) {
 					return await this._broadcastRawTx(result.value);
 				}
 				// Re-check with the real fee included, then reserve the total so
 				// concurrent sends cannot both pass before either records.
 				const totalSats = this._builtOnchainTotalSats(amountSats);
+				this._checkMaxPayment(totalSats, amountSats, {
+					name: 'on-chain fees',
+					param: 'satsPerVbyte'
+				});
 				this._checkSpendLimit(totalSats);
-				this._pendingSpendSats += totalSats;
+				const reserving = this._dailySpendLimitSats !== undefined;
+				if (reserving) this._pendingSpendSats += totalSats;
 				try {
 					const info = await this._broadcastRawTx(result.value);
 					this._recordSpend(totalSats, 'onchain');
 					return info;
 				} finally {
-					this._pendingSpendSats -= totalSats;
+					if (reserving) this._pendingSpendSats -= totalSats;
 				}
 			} finally {
 				await this.wallet.resetSendTransaction();
@@ -6864,12 +6912,15 @@ export class BeignetNode extends EventEmitter {
 					throw new BeignetError('SEND_FAILED', result.error.message);
 				}
 				// No limit configured: broadcast without touching the budget.
-				if (this._dailySpendLimitSats === undefined) {
+				if (
+					this._dailySpendLimitSats === undefined &&
+					this._maxPaymentSats === undefined
+				) {
 					return await this._broadcastRawTx(result.value);
 				}
 				// A sweep drains the entire input value (send amount + fee). Check it
-				// against the shared daily budget BEFORE broadcast; the amount is only
-				// known once the transaction has been built.
+				// against the per-payment and daily limits BEFORE broadcast; the
+				// amount is only known once the transaction has been built.
 				const totalSats = this.wallet.transaction.getTransactionInputValue({
 					inputs: this.wallet.transaction.data.inputs
 				});
@@ -6877,17 +6928,21 @@ export class BeignetNode extends EventEmitter {
 					// Fail closed: never broadcast a sweep the limit cannot account for.
 					throw new BeignetError(
 						'SPENDING_LIMIT_EXCEEDED',
-						'Unable to determine the swept amount for the daily spend limit check; refusing to send'
+						'Unable to determine the swept amount for the spend limit checks; refusing to send'
 					);
 				}
+				// Judged whole: a lower fee rate only moves sats from the fee to the
+				// output, so there is no fee to tell the caller to lower.
+				this._checkMaxPayment(totalSats);
 				this._checkSpendLimit(totalSats);
-				this._pendingSpendSats += totalSats;
+				const reserving = this._dailySpendLimitSats !== undefined;
+				if (reserving) this._pendingSpendSats += totalSats;
 				try {
 					const info = await this._broadcastRawTx(result.value);
 					this._recordSpend(totalSats, 'onchain');
 					return info;
 				} finally {
-					this._pendingSpendSats -= totalSats;
+					if (reserving) this._pendingSpendSats -= totalSats;
 				}
 			} finally {
 				await this.wallet.resetSendTransaction();
@@ -9318,6 +9373,10 @@ export class BeignetNode extends EventEmitter {
 			try {
 				const quote = sender.quote(opts.request, sendOpts);
 				costSats = Number(quote.amountSat + quote.maxTotalFeeSat);
+				this._checkMaxPayment(costSats, Number(quote.amountSat), {
+					name: 'fees',
+					param: 'maxTotalFeeSat'
+				});
 				this._checkSpendLimit(costSats);
 			} catch (err) {
 				throw this.directFundingFailure(err);
@@ -9617,6 +9676,15 @@ export class BeignetNode extends EventEmitter {
 			this._dailySpentSats = 0;
 			this._dailySpentLightningSats = 0;
 			this._dailySpentOnchainSats = 0;
+			// A rebalance still out can spend in the new day, so its up-front
+			// charge carries over until _refundSpend settles it.
+			if (
+				this._dailySpendLimitSats !== undefined &&
+				this._liveRebalanceChargeSats > 0
+			) {
+				this._dailySpentSats = this._liveRebalanceChargeSats;
+				this._dailySpentLightningSats = this._liveRebalanceChargeSats;
+			}
 			if (persist) this._persistSpendState();
 		}
 	}
@@ -9654,9 +9722,14 @@ export class BeignetNode extends EventEmitter {
 	 * The per-payment limit, judged on `spendSats` (amount plus fee cap, issue
 	 * #1008). An amount that is over the limit on its own is refused in the
 	 * words it always was; one that only crosses it with its fee cap is told
-	 * which of the two to lower.
+	 * which of the two to lower. `fees` names that fee and the parameter that
+	 * sets it: a Lightning routing-fee cap unless an on-chain path says so.
 	 */
-	private _checkMaxPayment(spendSats: number, amountSats = spendSats): void {
+	private _checkMaxPayment(
+		spendSats: number,
+		amountSats = spendSats,
+		fees = { name: 'routing fees', param: 'maxFeeSats' }
+	): void {
 		if (this._maxPaymentSats === undefined) return;
 		if (amountSats > this._maxPaymentSats) {
 			throw new BeignetError(
@@ -9669,9 +9742,9 @@ export class BeignetNode extends EventEmitter {
 				'SPENDING_LIMIT_EXCEEDED',
 				`Payment amount ${amountSats} sats plus up to ${
 					spendSats - amountSats
-				} sats in routing fees exceeds per-payment limit of ${
+				} sats in ${fees.name} exceeds per-payment limit of ${
 					this._maxPaymentSats
-				} sats; lower maxFeeSats or the amount`
+				} sats; lower ${fees.param} or the amount`
 			);
 		}
 	}
@@ -9715,6 +9788,20 @@ export class BeignetNode extends EventEmitter {
 		} else {
 			this._dailySpentLightningSats += amountSats;
 		}
+		this._persistSpendState();
+	}
+
+	/**
+	 * Gives back what a live rebalance charge did not spend, to whichever day
+	 * carries it now. Called before the charge leaves _liveRebalanceChargeSats,
+	 * so a rollover here still carries it. A negative `sats`, a spend above the
+	 * charge, is charged in full.
+	 */
+	private _refundSpend(sats: number): void {
+		if (this._dailySpendLimitSats === undefined) return;
+		this._resetDailySpendIfNeeded(false);
+		this._dailySpentSats -= sats;
+		this._dailySpentLightningSats -= sats;
 		this._persistSpendState();
 	}
 
@@ -10234,19 +10321,22 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
-	 * Returns the on-chain amount+fee an external send will subtract from the
-	 * daily budget, computed from the transaction the wallet just built.
-	 * FAIL CLOSED: when a limit is configured and the built fee cannot be
-	 * read as a finite non-negative number, the send is rejected rather than
-	 * checked against an understated total.
+	 * Returns the on-chain amount+fee an external send is judged on by the
+	 * per-payment and daily limits, computed from the transaction the wallet
+	 * just built. FAIL CLOSED: when a limit is configured and the built fee
+	 * cannot be read as a finite non-negative number, the send is rejected
+	 * rather than checked against an understated total.
 	 */
 	private _builtOnchainTotalSats(amountSats: number): number {
 		const feeSats = this.wallet.transaction?.data?.fee;
 		if (!Number.isFinite(feeSats) || feeSats < 0) {
-			if (this._dailySpendLimitSats !== undefined) {
+			if (
+				this._dailySpendLimitSats !== undefined ||
+				this._maxPaymentSats !== undefined
+			) {
 				throw new BeignetError(
 					'SPENDING_LIMIT_EXCEEDED',
-					'Unable to determine the transaction fee for the daily spend limit check; refusing to send'
+					'Unable to determine the transaction fee for the spend limit checks; refusing to send'
 				);
 			}
 			return amountSats;
@@ -12050,9 +12140,9 @@ export class BeignetNode extends EventEmitter {
 		// An address-targeted splice-out is an external send: the destination
 		// receives the full amount and the channel additionally pays the
 		// on-chain fee (the engine declares relative = -(amount + fee), same
-		// fee formula as below), so both count against the shared daily
-		// budget, like sendOnchain (issue #534 review). Wallet-credited
-		// splice-outs stay outside the limit: those funds return to our own
+		// fee formula as below), so both count against the per-payment and
+		// daily limits, like sendOnchain (issue #534 review). Wallet-credited
+		// splice-outs stay outside them: those funds return to our own
 		// wallet. Checked before the engine call (fail fast, like sendOnchain)
 		// and recorded only when the engine accepts the initiation; a splice
 		// that later fails in negotiation holds the budget until the UTC
@@ -12069,6 +12159,10 @@ export class BeignetNode extends EventEmitter {
 				)
 			);
 			externalSpendSats = amountSats + feeSats;
+			this._checkMaxPayment(externalSpendSats, amountSats, {
+				name: 'on-chain fees',
+				param: 'feeratePerkw'
+			});
 			this._checkSpendLimit(externalSpendSats);
 		}
 		const result = fundingOrRefuse(() =>
@@ -12812,12 +12906,33 @@ export class BeignetNode extends EventEmitter {
 				BeignetErrorCode.INVALID_PARAMS,
 				'maxFeeSats must be a non-negative integer'
 			);
-		const result = await this.node.rebalanceChannel({
-			fromChannelId: Buffer.from(fromChannelId, 'hex'),
-			toChannelId: Buffer.from(toChannelId, 'hex'),
-			amountSats: BigInt(amountSats),
-			maxFeeSats: BigInt(maxFeeSats)
-		});
+		this._checkDraining();
+		// The amount comes back round the loop, so the fee is all a rebalance
+		// spends. The cap is charged before anything is sent, so a crash or a
+		// teardown with the HTLC still out leaves it charged. Once the outcome
+		// is known the day gets back what the route did not take, or all of
+		// it when the rebalance failed. A timed-out wait keeps the cap, since
+		// the HTLC can still settle.
+		this._checkSpendLimit(maxFeeSats);
+		this._recordSpend(maxFeeSats);
+		this._liveRebalanceChargeSats += maxFeeSats;
+		let spentSats = maxFeeSats;
+		let result: IRebalanceResult;
+		try {
+			result = await this.node.rebalanceChannel({
+				fromChannelId: Buffer.from(fromChannelId, 'hex'),
+				toChannelId: Buffer.from(toChannelId, 'hex'),
+				amountSats: BigInt(amountSats),
+				maxFeeSats: BigInt(maxFeeSats)
+			});
+			spentSats = spendLimitSats(result.feeMsat);
+		} catch (err) {
+			if (!(err instanceof PaymentWaitTimeoutError)) spentSats = 0;
+			throw err;
+		} finally {
+			if (!this.destroyed) this._refundSpend(maxFeeSats - spentSats);
+			this._liveRebalanceChargeSats -= maxFeeSats;
+		}
 		this.log('info', 'Rebalance completed', {
 			fromChannelId,
 			toChannelId,
@@ -12835,7 +12950,8 @@ export class BeignetNode extends EventEmitter {
 
 	/**
 	 * Execute the advisor's rebalance plan under the per-UTC-day fee budget
-	 * (persisted, so restarts cannot overspend the same day).
+	 * (persisted, so restarts cannot overspend the same day). The fees it
+	 * pays are charged to the daily spend limit too.
 	 */
 	async executeRebalances(
 		budgetSatsPerDay?: number
@@ -12849,9 +12965,42 @@ export class BeignetNode extends EventEmitter {
 				'budgetSatsPerDay must be a non-negative integer'
 			);
 		}
-		const summary = await this.node.executeRebalanceRecommendations({
-			budgetSatsPerDay
-		});
+		this._checkDraining();
+		// Charged up front as rebalanceChannel is, at the whole day's fee
+		// budget, which bounds what the run can spend whatever the advisor has
+		// already spent today.
+		const holdSats = this.node.rebalanceBudgetSatsPerDay(budgetSatsPerDay);
+		// With no budget given this is the configured autoRebalance one, which
+		// nothing has checked yet, and a NaN would poison the ledger.
+		if (!Number.isInteger(holdSats) || holdSats < 0) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'autoRebalance.budgetSatsPerDay must be a non-negative integer'
+			);
+		}
+		this._checkSpendLimit(holdSats);
+		this._recordSpend(holdSats);
+		this._liveRebalanceChargeSats += holdSats;
+		let spentSats = holdSats;
+		let summary: IRebalanceExecutionSummary;
+		try {
+			summary = await this.node.executeRebalanceRecommendations({
+				budgetSatsPerDay,
+				stopRequested: () => this._draining
+			});
+			spentSats = spendLimitSats(summary.feeSpentMsat);
+		} catch (err) {
+			// The engine throws only before it tries a plan.
+			spentSats = 0;
+			throw err;
+		} finally {
+			// A teardown can cut a wait short with its HTLC out, which the
+			// summary does not count, so the whole charge stands then. A run
+			// that crossed midnight, where the engine's budget started over,
+			// leaves the new day charged all it spent.
+			if (!this.destroyed) this._refundSpend(holdSats - spentSats);
+			this._liveRebalanceChargeSats -= holdSats;
+		}
 		return {
 			attempts: summary.attempts.map((a) => ({
 				fromChannelId: a.fromChannelId,
@@ -14135,6 +14284,10 @@ export class BeignetNode extends EventEmitter {
 			clearInterval(this._fallbackRecoveryTimer);
 			this._fallbackRecoveryTimer = undefined;
 		}
+		if (this._autoRebalanceTimer) {
+			clearInterval(this._autoRebalanceTimer);
+			this._autoRebalanceTimer = undefined;
+		}
 		this.paymentQueue?.stop();
 		this.paymentQueue?.removeAllListeners();
 		this.directFundingSender?.stop();
@@ -14186,6 +14339,10 @@ export class BeignetNode extends EventEmitter {
 		if (this._fallbackRecoveryTimer) {
 			clearInterval(this._fallbackRecoveryTimer);
 			this._fallbackRecoveryTimer = undefined;
+		}
+		if (this._autoRebalanceTimer) {
+			clearInterval(this._autoRebalanceTimer);
+			this._autoRebalanceTimer = undefined;
 		}
 		if (this._confirmTimer) {
 			clearTimeout(this._confirmTimer);
