@@ -28842,12 +28842,12 @@ export class LightningNode extends EventEmitter {
 	 *
 	 * The context is registered only after a route was found, and a context
 	 * created HERE is removed again when the dispatch fails locally (an
-	 * exception, or addHtlc refusing the HTLC): a local failure never
-	 * reaches the onion failure handler, so nothing else would clean it up
-	 * and nothing can retry it. A pre-existing context is left alone; during
-	 * a retry the failure handler owns its rollback and give-up behavior.
-	 * The fee cap rides in the context so a retry is held to the same bound
-	 * as the first attempt (issue #1001).
+	 * exception with no HTLC out, or addHtlc refusing the HTLC): a local
+	 * failure never reaches the onion failure handler, so nothing else would
+	 * clean it up and nothing can retry it. A pre-existing context is left
+	 * alone; during a retry the failure handler owns its rollback and give-up
+	 * behavior. The fee cap rides in the context so a retry is held to the
+	 * same bound as the first attempt (issue #1001).
 	 */
 	private dispatchBolt12Route(
 		route: IRoute,
@@ -28892,7 +28892,10 @@ export class LightningNode extends EventEmitter {
 			if (payment.status === PaymentStatus.FAILED) release();
 			return payment;
 		} catch (err) {
-			release();
+			// A throw from addHtlc (the outbound transport, say) can leave the
+			// HTLC on the channel, and a failure of that HTLC still retries
+			// through the context.
+			if (!this.hasHtlcInFlight(invoice.paymentHash)) release();
 			throw err;
 		}
 	}
