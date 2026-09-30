@@ -3540,13 +3540,21 @@ export class LightningNode extends EventEmitter {
 			) {
 				continue;
 			}
+			// A part its completed payment already settled is fulfilled here.
+			// handleIncomingHtlc sheds load and applies its policy fail-backs
+			// before the final hop reads that payment, and failing the part
+			// would lose its value.
+			if (
+				this.fulfillSettledReceivedHtlc(channelId, htlc.id, htlc.paymentHash)
+			) {
+				continue;
+			}
 
 			this.handleIncomingHtlc(
 				channelId,
 				htlc.id,
 				htlc.amountMsat,
-				htlc.paymentHash,
-				true
+				htlc.paymentHash
 			);
 		}
 	}
@@ -3570,27 +3578,42 @@ export class LightningNode extends EventEmitter {
 	private fulfillSettledReceivedHtlcs(channelId: Buffer): void {
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) return;
-		const channelHex = channelId.toString('hex');
 		for (const [key, htlc] of [...channel.getFullState().htlcs]) {
 			if (!key.startsWith('received-')) continue;
 			if (htlc.state !== HtlcState.COMMITTED) continue;
 			if (this.isHeldHtlc(channelId, htlc.id)) continue;
 			if (htlc.fforVoucher === true || htlc.fforMismatch === true) continue;
-			const hashHex = htlc.paymentHash.toString('hex');
-			const htlcKey = `${channelHex}:${htlc.id}`;
-			const payment = this.payments.get(hashHex);
-			if (
-				payment?.status !== PaymentStatus.COMPLETED ||
-				!payment.settledHtlcs?.includes(htlcKey)
-			) {
-				continue;
-			}
-			const preimage = this.preimages.get(hashHex) ?? payment.preimage;
-			if (!preimage) continue;
-			if (this.channelManager.fulfillHtlc(channelId, htlc.id, preimage).ok) {
-				this.cleanupHtlcSharedSecret(htlcKey);
-			}
+			this.fulfillSettledReceivedHtlc(channelId, htlc.id, htlc.paymentHash);
 		}
+	}
+
+	/**
+	 * Fulfill a received HTLC that a completed payment lists in settledHtlcs.
+	 * Returns false when none does or its preimage is gone, and true
+	 * otherwise, even when the fulfill is refused: the part is owed a
+	 * fulfill, never a dispatch. A refused part keeps its shared secret for
+	 * the retry on the next reestablish.
+	 */
+	private fulfillSettledReceivedHtlc(
+		channelId: Buffer,
+		htlcId: bigint,
+		paymentHash: Buffer
+	): boolean {
+		const hashHex = paymentHash.toString('hex');
+		const htlcKey = `${channelId.toString('hex')}:${htlcId}`;
+		const payment = this.payments.get(hashHex);
+		if (
+			payment?.status !== PaymentStatus.COMPLETED ||
+			!payment.settledHtlcs?.includes(htlcKey)
+		) {
+			return false;
+		}
+		const preimage = this.preimages.get(hashHex) ?? payment.preimage;
+		if (!preimage) return false;
+		if (this.channelManager.fulfillHtlc(channelId, htlcId, preimage).ok) {
+			this.cleanupHtlcSharedSecret(htlcKey);
+		}
+		return true;
 	}
 
 	/**
@@ -17553,8 +17576,7 @@ export class LightningNode extends EventEmitter {
 		channelId: Buffer,
 		htlcId: bigint,
 		amountMsat: bigint,
-		paymentHash: Buffer,
-		redispatched = false
+		paymentHash: Buffer
 	): void {
 		this.emitStructuredLog('htlc', 'received', {
 			channelId: channelId.toString('hex'),
@@ -17863,8 +17885,7 @@ export class LightningNode extends EventEmitter {
 				paymentHash,
 				processed.hopPayload,
 				htlcEntry.cltvExpiry,
-				htlcEntry.blindingPoint,
-				redispatched
+				htlcEntry.blindingPoint
 			);
 		} else {
 			// Forward to next hop — pass incoming HTLC details for CLTV/fee enforcement.
@@ -19125,8 +19146,7 @@ export class LightningNode extends EventEmitter {
 		paymentHash: Buffer,
 		hopPayload?: IHopPayload,
 		incomingCltvExpiry?: number,
-		incomingBlindingPoint?: Buffer,
-		redispatched = false
+		incomingBlindingPoint?: Buffer
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		const htlcSecretKey = `${channelId.toString('hex')}:${htlcId}`;
@@ -19153,25 +19173,13 @@ export class LightningNode extends EventEmitter {
 
 		// A completed incoming payment takes no further HTLC for its hash:
 		// fulfilling one debits a second payer and fires the settlement events
-		// again. A fulfill deferred by quiescence reports success without
-		// reaching disk, so an HTLC that completed the payment can come back
-		// through the restart redispatch. Only those are fulfilled, and without
-		// settling the payment a second time.
+		// again. An HTLC the payment itself settled never gets here after a
+		// restart: redispatchUnresolvedReceivedHtlcs fulfills it first.
 		const completed = this.payments.get(hashHex);
 		if (
 			completed?.direction === PaymentDirection.INCOMING &&
 			completed.status === PaymentStatus.COMPLETED
 		) {
-			const settledPreimage = this.preimages.get(hashHex) ?? completed.preimage;
-			if (
-				redispatched &&
-				settledPreimage &&
-				completed.settledHtlcs?.includes(htlcSecretKey)
-			) {
-				this.cleanupHtlcSharedSecret(htlcSecretKey);
-				this.channelManager.fulfillHtlc(channelId, htlcId, settledPreimage);
-				return;
-			}
 			this.emitStructuredLog('htlc', 'payment_already_completed', {
 				paymentHash: hashHex
 			});

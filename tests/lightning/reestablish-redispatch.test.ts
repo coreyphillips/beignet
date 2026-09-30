@@ -1138,7 +1138,9 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 	 * one is refused because alice's channel awaits reestablishment. Bob keeps
 	 * no completed record past a prune unless it still owes a fulfill.
 	 */
-	async function refuseMppPartMidReconnect(): Promise<{
+	async function refuseMppPartMidReconnect(
+		bobStorage?: IStorageBackend
+	): Promise<{
 		alice: LightningNode;
 		bob: LightningNode;
 		carol: LightningNode;
@@ -1150,7 +1152,7 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		const CAROL_SEED = 43;
 		const alice = createNode(ALICE_SEED);
 		const bob = new LightningNode({
-			...makeNodeConfig(BOB_SEED),
+			...makeNodeConfig(BOB_SEED, bobStorage),
 			resourceConfig: { maxCompletedPayments: 0 }
 		});
 		bob.on('error', () => {});
@@ -1266,6 +1268,43 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 
 		carol.destroy();
 		bob.destroy();
+		alice.destroy();
+	});
+
+	it('a settled MPP part is fulfilled, not load-shed, by the restart redispatch (#1194)', async function () {
+		this.timeout(20_000);
+		// A cap of zero sheds every dispatch, so the part settles only if the
+		// redispatch reads the completed payment before the cap.
+		const dbPath = tempDb('redispatch-settled-part');
+		const storage = new SqliteStorage(dbPath);
+		storage.open();
+		const { alice, bob, carol, aliceChannelId, paymentHash } =
+			await refuseMppPartMidReconnect(storage);
+		bob.destroy();
+		alice.removeAllListeners('message:outbound');
+
+		const reopened = new SqliteStorage(dbPath);
+		reopened.open();
+		const restarted = new LightningNode({
+			...makeNodeConfig(BOB_SEED, reopened),
+			maxTotalInFlightHtlcs: 0
+		});
+		restarted.on('error', () => {});
+		restarted.on('node:error', () => {});
+		await reconnect(restarted, alice);
+
+		expect(
+			alice.getPayment(paymentHash)!.status,
+			'the part over alice settled after the restart'
+		).to.equal(PaymentStatus.COMPLETED);
+		expect(
+			restarted.getChannelManager().getChannel(aliceChannelId)!.getFullState()
+				.htlcs.size,
+			'no HTLC left on the channel'
+		).to.equal(0);
+
+		carol.destroy();
+		restarted.destroy();
 		alice.destroy();
 	});
 
