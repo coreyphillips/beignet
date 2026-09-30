@@ -2486,7 +2486,7 @@ async function handleMessage(): Promise<void> {
 }
 
 async function handleBackup(): Promise<void> {
-	const sub = filteredArgs[1];
+	const sub = positionalArgs(undefined, new Set(['--overwrite']))[1];
 	if (sub === 'trigger') {
 		// On-demand encrypted database backup to the configured backupPath.
 		return outputResult(await httpRequest('POST', '/backup/trigger'));

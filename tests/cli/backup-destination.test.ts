@@ -9,6 +9,7 @@
  */
 
 import { expect } from 'chai';
+import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as http from 'http';
 import * as os from 'os';
@@ -250,6 +251,41 @@ describe('Backup destination (issue #1230)', () => {
 				overwrite: true
 			});
 			expect(replaced.status).to.equal(200);
+			expect(header(dest)).to.equal(SQLITE_HEADER);
+		});
+
+		it('reads the path, not the flag, from `beignet backup --overwrite <path>`', async function () {
+			// A full ts-node load of the CLI in a child.
+			this.timeout(120_000);
+			fs.writeFileSync(
+				path.join(home, '.beignet', 'daemon.pid'),
+				JSON.stringify({ pid: process.pid, port })
+			);
+			const dest = path.join(home, 'cli-backup.db');
+			fs.writeFileSync(dest, '');
+			const stdout = await new Promise<string>((resolve, reject) => {
+				const child = spawn(
+					process.execPath,
+					[
+						'-r',
+						'ts-node/register',
+						path.join('src', 'cli', 'cli.ts'),
+						'backup',
+						'--overwrite',
+						dest
+					],
+					{
+						cwd: path.resolve(__dirname, '..', '..'),
+						env: { ...process.env, HOME: home },
+						stdio: ['ignore', 'pipe', 'ignore']
+					}
+				);
+				let out = '';
+				child.stdout.on('data', (chunk: Buffer) => (out += chunk.toString()));
+				child.on('error', reject);
+				child.on('close', () => resolve(out));
+			});
+			expect(JSON.parse(stdout).ok).to.equal(true);
 			expect(header(dest)).to.equal(SQLITE_HEADER);
 		});
 	});
