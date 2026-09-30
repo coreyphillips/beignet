@@ -12,6 +12,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { backupMacPath } from './backup-mac';
 
 export type BackupDestination = { path: string } | { refusal: string };
 
@@ -77,6 +78,17 @@ export function resolveBackupDestination(
 	if (stat && !overwrite) {
 		return {
 			refusal: `destPath already exists: ${target}. Pass overwrite: true to replace it`
+		};
+	}
+	// The backup's MAC is written beside it and gets the same rule.
+	const macPath = backupMacPath(target);
+	const macStat = fs.lstatSync(macPath, { throwIfNoEntry: false });
+	if (macStat && !macStat.isFile()) {
+		return { refusal: `MAC path is not a regular file: ${macPath}` };
+	}
+	if (macStat && !overwrite) {
+		return {
+			refusal: `MAC path already exists: ${macPath}. Pass overwrite: true to replace it`
 		};
 	}
 	return { path: target };

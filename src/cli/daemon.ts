@@ -25,6 +25,7 @@ import { L402Error } from '../lightning/l402';
 import { ApiResponse, PaymentInfo, RouteHop, SpliceResult } from './types';
 import { getOpenApiSpec } from './openapi';
 import { resolveBackupDestination } from './backup-destination';
+import { backupMacPath } from './backup-mac';
 import { configPath, pidPath } from './config';
 import {
 	IWebhookStorage,
@@ -2980,7 +2981,7 @@ async function bootDaemon(
 			);
 			if ('refusal' in dest) return failure('INVALID_PARAMS', dest.refusal);
 			await node.backup(dest.path);
-			return success({ backed_up: true });
+			return success({ backed_up: true, macPath: backupMacPath(dest.path) });
 		},
 		'GET /backup/scb': () => success(node.exportStaticChannelBackup()),
 		// Newest valid SCB returned by a peer via BOLT 1 peer storage. Recovery
