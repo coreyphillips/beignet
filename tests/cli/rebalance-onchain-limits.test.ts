@@ -365,6 +365,20 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 		expect(node._dailySpentSats).to.equal(0);
 	});
 
+	it('keeps the whole charge when the engine throws after reaching its plans', async () => {
+		const node = rebalancingNode(
+			{ daily: 10_000 },
+			{
+				fails: true,
+				duringCall: () => node.runOptions?.stopRequested?.()
+			}
+		);
+		expect(await settle(() => node.executeRebalances(1_500))).to.be.instanceOf(
+			Error
+		);
+		expect(node._dailySpentSats).to.equal(1_500);
+	});
+
 	it('charges the new day what a run that crossed midnight spent', async () => {
 		const node = rebalancingNode(
 			{ daily: 10_000 },

@@ -12982,16 +12982,22 @@ export class BeignetNode extends EventEmitter {
 		this._recordSpend(holdSats);
 		this._liveRebalanceChargeSats += holdSats;
 		let spentSats = holdSats;
+		// The engine asks before each plan. A refusal before the first ask
+		// sent nothing, but a throw after it (a log listener, say) can follow
+		// a paid rebalance, so the whole charge stands then.
+		let reachedPlans = false;
 		let summary: IRebalanceExecutionSummary;
 		try {
 			summary = await this.node.executeRebalanceRecommendations({
 				budgetSatsPerDay,
-				stopRequested: () => this._draining
+				stopRequested: () => {
+					reachedPlans = true;
+					return this._draining;
+				}
 			});
 			spentSats = spendLimitSats(summary.feeSpentMsat);
 		} catch (err) {
-			// The engine throws only before it tries a plan.
-			spentSats = 0;
+			if (!reachedPlans) spentSats = 0;
 			throw err;
 		} finally {
 			// A teardown can cut a wait short with its HTLC out, which the

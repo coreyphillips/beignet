@@ -848,6 +848,46 @@ describe('Advisor Execution (M3 phases 1+2)', function () {
 			}
 		});
 
+		it('spends no more than one budget in a run that crosses midnight', async function () {
+			const setup = setupCircular();
+			const { alice } = setup;
+			const clock = LightningNode as unknown as { currentUtcDay: () => string };
+			const realDay = clock.currentUtcDay;
+			try {
+				const plans = alice.planRebalanceRecommendations();
+				alice.planRebalanceRecommendations = (): typeof plans => [
+					plans[0],
+					plans[0]
+				];
+				clock.currentUtcDay = (): string => '2026-01-01';
+				let calls = 0;
+				alice.rebalanceChannel = async (): Promise<{
+					paymentHash: Buffer;
+					amountMsat: bigint;
+					feeMsat: bigint;
+					hops: number;
+				}> => {
+					calls++;
+					clock.currentUtcDay = (): string => '2026-01-02';
+					return {
+						paymentHash: Buffer.alloc(32, 1),
+						amountMsat: 500_000_000n,
+						feeMsat: 10_000n,
+						hops: 3
+					};
+				};
+				const summary = await alice.executeRebalanceRecommendations({
+					budgetSatsPerDay: 10
+				});
+				expect(calls).to.equal(1);
+				expect(summary.skippedBudget).to.equal(1);
+				expect(summary.feeSpentMsat).to.equal(10_000n);
+			} finally {
+				clock.currentUtcDay = realDay;
+				setup.destroy();
+			}
+		});
+
 		it('leaves the pairs after a stop request untried', async function () {
 			const setup = setupCircular();
 			const { alice } = setup;

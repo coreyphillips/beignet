@@ -14108,7 +14108,15 @@ export class LightningNode extends EventEmitter {
 
 			for (const plan of plans) {
 				if (options?.stopRequested?.()) break;
-				const remainingMsat = budgetMsat - this.loadRebalanceSpentMsat();
+				// A run that crosses midnight finds the new day's budget unspent.
+				// It still spends no more than one budget in all, which is what
+				// BeignetNode holds against its daily spend limit for the run.
+				const dayRemainingMsat = budgetMsat - this.loadRebalanceSpentMsat();
+				const runRemainingMsat = budgetMsat - feeSpentThisRunMsat;
+				const remainingMsat =
+					dayRemainingMsat < runRemainingMsat
+						? dayRemainingMsat
+						: runRemainingMsat;
 				// Per-pair cap: never above the remaining daily budget, and never
 				// above 0.5% of the moved amount (min 1 sat so tiny amounts route).
 				const proportionalCapMsat =
