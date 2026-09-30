@@ -498,6 +498,87 @@ describe('BOLT 12 payment retry (issue #261)', () => {
 		bob.destroy();
 	});
 
+	// Issue #1237: the failed first dispatch returns after the listener's
+	// re-send registered its own context.
+	it('a re-send from a payment:htlc-resolved listener keeps its retry context', () => {
+		const { alice, bob } = setupPair(956, 957);
+		const invoice = issueBolt12Invoice(bob, 956, 50_000n);
+		const hashHex = invoice.paymentHash.toString('hex');
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const bobAny = bob as any;
+		const realHandler = bobAny.handleFinalHopHtlc.bind(bob);
+		// bob fails the first attempt, holds the second and settles the rest.
+		let attempts = 0;
+		let held: { channelId: Buffer; htlcId: bigint } | undefined;
+		bobAny.handleFinalHopHtlc = (
+			channelId: Buffer,
+			htlcId: bigint,
+			...rest: unknown[]
+		): void => {
+			attempts++;
+			if (attempts === 2) {
+				held = { channelId, htlcId };
+				return;
+			}
+			if (attempts === 1) {
+				const key = `${channelId.toString('hex')}:${htlcId}`;
+				bobAny.channelManager.failHtlc(
+					channelId,
+					htlcId,
+					createFailureMessage(
+						bobAny.receivedHtlcSharedSecrets.get(key),
+						TEMPORARY_NODE_FAILURE
+					)
+				);
+				return;
+			}
+			realHandler(channelId, htlcId, ...rest);
+		};
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const contexts = (alice as any).paymentRetryContexts as Map<
+			string,
+			unknown
+		>;
+		let replacementCtx: unknown;
+		alice.once('payment:htlc-resolved', () => {
+			alice.failPayment(invoice.paymentHash);
+			alice.payBolt12Invoice(invoice);
+			replacementCtx = contexts.get(hashHex);
+		});
+
+		alice.payBolt12Invoice(invoice);
+
+		expect(attempts).to.equal(2);
+		const replacement = alice.getPayment(invoice.paymentHash)!;
+		expect(replacement.status).to.equal(PaymentStatus.PENDING);
+		expect(
+			alice
+				.getOutgoingHtlcs(invoice.paymentHash)
+				.htlcs.filter((htlc) => !htlc.terminal)
+		).to.have.length(1);
+		expect(replacementCtx).to.not.be.undefined;
+		expect(contexts.get(hashHex)).to.equal(replacementCtx);
+
+		// The replacement's temporary failure is retried, not final.
+		const key = `${held!.channelId.toString('hex')}:${held!.htlcId}`;
+		bobAny.channelManager.failHtlc(
+			held!.channelId,
+			held!.htlcId,
+			createFailureMessage(
+				bobAny.receivedHtlcSharedSecrets.get(key),
+				TEMPORARY_NODE_FAILURE
+			)
+		);
+
+		expect(attempts).to.equal(3);
+		const settled = alice.getPayment(invoice.paymentHash)!;
+		expect(settled.status).to.equal(PaymentStatus.COMPLETED);
+		expect(settled.retryCount).to.equal(1);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
 	it('rejects a second dispatch while the payment is in flight', () => {
 		const { alice, bob } = setupPair(938, 939);
 		const invoice = issueBolt12Invoice(bob, 938, 50_000n);
