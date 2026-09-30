@@ -574,6 +574,58 @@ describe('Issue #1041: a BOLT 11 send that ended leaves no context for the next'
 		bob.destroy();
 	});
 
+	// Issue #1191: the same throw from an automatic retry.
+	it('a retry that throws once its HTLC is out keeps its record and context', () => {
+		const { alice, bob } = setupPair(970, 971);
+		const invoice = zeroAmountInvoice(alice, bob);
+		const attempts = failEveryHtlcTemporarily(bob);
+
+		// bob fails the first attempt. The transport throws as the retry's
+		// update_add_htlc leaves, after the channel already holds its HTLC.
+		let adds = 0;
+		alice.prependListener(
+			'message:outbound',
+			(_pubkey: string, type: number) => {
+				if (type !== MessageType.UPDATE_ADD_HTLC) return;
+				if (++adds === 2) throw new Error('transport failed');
+			}
+		);
+		const logs: Array<{ action: string; data: Record<string, unknown> }> = [];
+		alice.on('log', (log) => logs.push(log));
+		const first = alice.sendPaymentWithOptions(invoice.bolt11, EARLIER);
+		expect(attempts()).to.equal(1);
+		expect(adds).to.equal(2);
+
+		const live = alice
+			.getOutgoingHtlcs(invoice.paymentHash)
+			.htlcs.filter((htlc) => !htlc.terminal);
+		expect(live).to.have.length(1);
+		const record = alice.getPayment(invoice.paymentHash)!;
+		expect(record, "the retry's record, not the failed attempt's").to.not.equal(
+			first
+		);
+		expect(record.status).to.equal(PaymentStatus.PENDING);
+		expect(record.retryCount).to.equal(1);
+		expect(record.sharedSecrets).to.not.equal(first.sharedSecrets);
+		expect(
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).htlcPaymentMap.get(
+				`${live[0].channelId.toString('hex')}:offered-${live[0].htlcId}`
+			)
+		).to.equal(invoice.paymentHash.toString('hex'));
+		expect(invoice.hasContext()).to.be.true;
+		expect(
+			logs.some(
+				(log) =>
+					log.action === 'retry_dispatch_threw' &&
+					log.data.error === 'transport failed'
+			)
+		).to.be.true;
+
+		alice.destroy();
+		bob.destroy();
+	});
+
 	it("a re-send is not held to a thrown send's CLTV ceiling", () => {
 		const { alice, bob } = setupPair(920, 921);
 		alice.handleNewBlock(1000);

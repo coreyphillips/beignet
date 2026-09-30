@@ -24265,6 +24265,19 @@ export class LightningNode extends EventEmitter {
 				retried.retryCount = retryCtx.retryCount;
 				return; // Retry dispatched
 			} catch (err) {
+				// A throw from addHtlc (the outbound transport, say) can leave the
+				// retry's HTLC on the channel beside its PENDING record. That record
+				// holds the secrets its failure decrypts with, and the failure
+				// retries through this context, so both stay.
+				const retryRecord = this.payments.get(hashHex);
+				if (retryRecord?.status === PaymentStatus.PENDING) {
+					retryRecord.retryCount = retryCtx.retryCount;
+					this.emitStructuredLog('payment', 'retry_dispatch_threw', {
+						paymentHash: hashHex,
+						error: err instanceof Error ? err.message : String(err)
+					});
+					return;
+				}
 				// The retry never left the node. Roll the counter back so
 				// retryCount keeps meaning "retries actually dispatched" (with
 				// exclusions honored by MPP too, an exhausted graph lands here
