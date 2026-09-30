@@ -772,19 +772,24 @@ describe('Funding input pledges', function () {
 				expect(unfrozenLog).to.include(key);
 			});
 
-			it(`a wallet that drops freeze tags still gets its coin back when ${name}`, async function () {
+			it(`a refused renewal without a freeze-state check still releases an untagged freeze when ${name}`, async function () {
 				const { wallet, utxos, frozen, unfrozenLog, payment } = makeWallet([
 					100_000, 100_000
 				]);
 				const key = `${utxos[0].tx_hash}:0`;
 				const realFreeze = wallet.freezeUtxo;
 				wallet.freezeUtxo = (p) => realFreeze({ txid: p.txid, index: p.index });
+				(wallet as { isUtxoFrozen?: unknown }).isUtxoFrozen = undefined;
 
 				const provider = new WalletFundingProvider(wallet as never);
-				await provider.pledgeTransactionInputs(
-					retainedSpending(utxos[0], payment.output!).toHex()
-				);
+				const retained = retainedSpending(utxos[0], payment.output!).toHex();
+				await provider.pledgeTransactionInputs(retained);
 				expect(frozen.get(key)?.freezeTag).to.equal(undefined);
+				const taglessFreeze = wallet.freezeUtxo;
+				(wallet as { freezeUtxo: unknown }).freezeUtxo = async () =>
+					errResult('storage is down');
+				await provider.pledgeTransactionInputs(retained).catch(() => undefined);
+				wallet.freezeUtxo = taglessFreeze;
 
 				await end(provider, key);
 				expect(unfrozenLog).to.include(key);
