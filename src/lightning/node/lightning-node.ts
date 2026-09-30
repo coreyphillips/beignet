@@ -297,6 +297,7 @@ import {
 	IPaymentPreimageEvent,
 	LightningErrorCode,
 	LightningPaymentError,
+	PaymentWaitTimeoutError,
 	InvalidChannelOpenError,
 	ChannelFundingUnavailableError,
 	ChannelFundingUnavailableCode,
@@ -13954,14 +13955,46 @@ export class LightningNode extends EventEmitter {
 			hops: hops.length
 		});
 
-		this.sendPaymentToRoute(
-			{ hops },
-			invoice.paymentHash,
-			finalCltvExpiry,
-			invoice.paymentSecret,
-			amountMsat
-		);
-		await this.waitForPayment(invoice.paymentHash, options.timeoutMs ?? 60_000);
+		try {
+			this.sendPaymentToRoute(
+				{ hops },
+				invoice.paymentHash,
+				finalCltvExpiry,
+				invoice.paymentSecret,
+				amountMsat
+			);
+		} catch (err) {
+			// A throw from addHtlc (the outbound transport, say) can come with
+			// the HTLC already on the channel beside its record. Unless that
+			// record failed, the HTLC can settle, so its outcome is waited for
+			// rather than reported as a failure.
+			const sent = this.payments.get(invoice.paymentHash.toString('hex'));
+			if (
+				sent?.direction !== PaymentDirection.OUTGOING ||
+				sent.status === PaymentStatus.FAILED
+			) {
+				throw err;
+			}
+		}
+		try {
+			await this.waitForPayment(
+				invoice.paymentHash,
+				options.timeoutMs ?? 60_000
+			);
+		} catch (err) {
+			// A cancelled payment is marked failed with its HTLC still out, and
+			// that HTLC can still settle, so the outcome is as unknown as after
+			// a timeout.
+			if (
+				!(err instanceof PaymentWaitTimeoutError) &&
+				this.hasHtlcInFlight(invoice.paymentHash)
+			) {
+				throw new PaymentWaitTimeoutError(
+					`${(err as Error).message} with its HTLC still in flight`
+				);
+			}
+			throw err;
+		}
 
 		this.emitStructuredLog('payment', 'rebalance_succeeded', {
 			fromChannelId: fromChannelId.toString('hex'),
@@ -14035,25 +14068,37 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * The per-UTC-day fee budget executeRebalanceRecommendations runs under:
+	 * the one given, else the configured autoRebalance budget, else 1000 sats.
+	 */
+	rebalanceBudgetSatsPerDay(budgetSatsPerDay?: number): number {
+		return (
+			budgetSatsPerDay ?? this.autoRebalanceConfig.budgetSatsPerDay ?? 1_000
+		);
+	}
+
+	/**
 	 * Execute the advisor's rebalance plan under a strict per-UTC-day fee
 	 * budget. Each pair gets a fee cap of min(remaining budget, 0.5% of the
 	 * amount, at least 1 sat); once the day's budget is exhausted the remaining
 	 * pairs are skipped, never partially overspent. Failures are recorded and
-	 * do not stop later pairs (they spent nothing).
+	 * do not stop later pairs (they spent nothing). `stopRequested` is asked
+	 * before each pair, and the run ends there, leaving the rest untried, once
+	 * it returns true.
 	 */
 	async executeRebalanceRecommendations(options?: {
 		budgetSatsPerDay?: number;
 		minImbalancePct?: number;
+		stopRequested?: () => boolean;
 	}): Promise<IRebalanceExecutionSummary> {
 		if (this.rebalanceRunInFlight) {
 			throw new Error('a rebalance execution run is already in progress');
 		}
 		this.rebalanceRunInFlight = true;
 		try {
-			const budgetSats =
-				options?.budgetSatsPerDay ??
-				this.autoRebalanceConfig.budgetSatsPerDay ??
-				1_000;
+			const budgetSats = this.rebalanceBudgetSatsPerDay(
+				options?.budgetSatsPerDay
+			);
 			if (budgetSats < 0) throw new Error('budgetSatsPerDay must be >= 0');
 			const budgetMsat = BigInt(budgetSats) * 1000n;
 
@@ -14062,7 +14107,16 @@ export class LightningNode extends EventEmitter {
 			let feeSpentThisRunMsat = 0n;
 
 			for (const plan of plans) {
-				const remainingMsat = budgetMsat - this.loadRebalanceSpentMsat();
+				if (options?.stopRequested?.()) break;
+				// A run that crosses midnight finds the new day's budget unspent.
+				// It still spends no more than one budget in all, which is what
+				// BeignetNode holds against its daily spend limit for the run.
+				const dayRemainingMsat = budgetMsat - this.loadRebalanceSpentMsat();
+				const runRemainingMsat = budgetMsat - feeSpentThisRunMsat;
+				const remainingMsat =
+					dayRemainingMsat < runRemainingMsat
+						? dayRemainingMsat
+						: runRemainingMsat;
 				// Per-pair cap: never above the remaining daily budget, and never
 				// above 0.5% of the moved amount (min 1 sat so tiny amounts route).
 				const proportionalCapMsat =
@@ -14085,15 +14139,24 @@ export class LightningNode extends EventEmitter {
 					});
 					continue;
 				}
+				const maxFeeSats = feeCapMsat / 1000n;
+				const capMsat = maxFeeSats * 1000n;
+				// The cap is persisted before anything is sent, so a crash with
+				// the HTLC out leaves it charged. A known outcome gives back what
+				// the route did not take. A timed-out wait keeps the whole cap,
+				// since its HTLC can still settle. After a UTC rollover the old
+				// day keeps the cap, as a give-back would come off the new day.
+				const chargedDay = LightningNode.currentUtcDay();
+				this.recordRebalanceSpend(capMsat);
+				let spentMsat = capMsat;
 				try {
 					const result = await this.rebalanceChannel({
 						fromChannelId: Buffer.from(plan.fromChannelId, 'hex'),
 						toChannelId: Buffer.from(plan.toChannelId, 'hex'),
 						amountSats: plan.amountSats,
-						maxFeeSats: feeCapMsat / 1000n
+						maxFeeSats
 					});
-					this.recordRebalanceSpend(result.feeMsat);
-					feeSpentThisRunMsat += result.feeMsat;
+					spentMsat = result.feeMsat;
 					attempts.push({
 						fromChannelId: plan.fromChannelId,
 						toChannelId: plan.toChannelId,
@@ -14102,6 +14165,7 @@ export class LightningNode extends EventEmitter {
 						feeMsat: result.feeMsat
 					});
 				} catch (err) {
+					if (!(err instanceof PaymentWaitTimeoutError)) spentMsat = 0n;
 					attempts.push({
 						fromChannelId: plan.fromChannelId,
 						toChannelId: plan.toChannelId,
@@ -14109,6 +14173,13 @@ export class LightningNode extends EventEmitter {
 						status: 'FAILED',
 						error: err instanceof Error ? err.message : String(err)
 					});
+				}
+				feeSpentThisRunMsat += spentMsat;
+				if (
+					spentMsat !== capMsat &&
+					LightningNode.currentUtcDay() === chargedDay
+				) {
+					this.recordRebalanceSpend(spentMsat - capMsat);
 				}
 			}
 
@@ -30029,7 +30100,11 @@ export class LightningNode extends EventEmitter {
 		return new Promise<IPaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
-				reject(new Error(`waitForPayment timed out after ${timeoutMs}ms`));
+				reject(
+					new PaymentWaitTimeoutError(
+						`waitForPayment timed out after ${timeoutMs}ms`
+					)
+				);
 			}, timeoutMs);
 
 			const cleanup = (): void => {
