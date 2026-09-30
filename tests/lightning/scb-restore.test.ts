@@ -54,7 +54,14 @@ import {
 	restoreDbFile,
 	performDbRestore
 } from '../../src/cli/restore';
+import {
+	backupMacPath,
+	deriveBackupMacKey,
+	readBackupMac,
+	writeBackupMac
+} from '../../src/cli/backup-mac';
 import { InstanceLockError } from '../../src/cli/instance-lock';
+import Database from 'better-sqlite3';
 
 // Electrum intentionally unreachable: nothing below needs a live chain, and a
 // refused loopback connect returns ECONNREFUSED instantly. Without this the
@@ -1072,6 +1079,35 @@ describe('SCB restore', function () {
 			);
 		}
 
+		const MNEMONIC =
+			'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+		const macKey = deriveBackupMacKey(bip39.mnemonicToSeedSync(MNEMONIC));
+
+		/** A SQLite-headed file with a MAC under macKey, as backup() leaves it. */
+		async function writeBackup(filePath: string, tag: string): Promise<void> {
+			writeSqliteLike(filePath, tag);
+			await writeBackupMac(macKey, filePath);
+		}
+
+		async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
+			try {
+				await promise;
+			} catch (err) {
+				return err as Error;
+			}
+			throw new Error('expected a rejection');
+		}
+
+		/** The live database is exactly as it was, with no restore residue. */
+		function expectUntouched(dbPath: string): void {
+			expect(fs.readFileSync(dbPath).includes('OLD')).to.equal(true);
+			expect(
+				fs
+					.readdirSync(path.dirname(dbPath))
+					.filter((f) => /\.(pre-restore-\d+|restoring)$/.test(f))
+			).to.deep.equal([]);
+		}
+
 		it('isSqliteFile validates the 16-byte header', function () {
 			const good = path.join(tmpDir, 'good.db');
 			writeSqliteLike(good, 'payload');
@@ -1094,14 +1130,15 @@ describe('SCB restore', function () {
 			);
 		});
 
-		it('restoreDbFile preserves the existing db and stale sidecars, then copies', function () {
+		it('restoreDbFile preserves the existing db and stale sidecars, then copies', async function () {
 			const backup = path.join(tmpDir, 'backup.db');
 			const dbPath = path.join(tmpDir, 'mainnet.db');
-			writeSqliteLike(backup, 'NEW');
+			await writeBackup(backup, 'NEW');
 			writeSqliteLike(dbPath, 'OLD');
 			fs.writeFileSync(`${dbPath}-wal`, 'stale-wal');
 
-			const result = restoreDbFile(backup, dbPath, 42);
+			const result = await restoreDbFile(backup, dbPath, { macKey, now: 42 });
+			expect(result.authenticated).to.equal(true);
 			expect(result.preRestorePath).to.equal(`${dbPath}.pre-restore-42`);
 			expect(fs.readFileSync(dbPath).includes('NEW')).to.equal(true);
 			expect(fs.readFileSync(result.preRestorePath!).includes('OLD')).to.equal(
@@ -1110,24 +1147,140 @@ describe('SCB restore', function () {
 			// Old WAL moved aside so it cannot corrupt the restored file.
 			expect(fs.existsSync(`${dbPath}-wal`)).to.equal(false);
 			expect(fs.existsSync(`${result.preRestorePath}-wal`)).to.equal(true);
+			expect(fs.existsSync(`${dbPath}.restoring`)).to.equal(false);
 		});
 
-		it('restoreDbFile refuses a non-SQLite file and leaves the db untouched', function () {
+		it('restoreDbFile refuses a non-SQLite file and leaves the db untouched', async function () {
 			const backup = path.join(tmpDir, 'not-a-db.bin');
 			const dbPath = path.join(tmpDir, 'mainnet.db');
 			fs.writeFileSync(backup, 'garbage');
+			await writeBackupMac(macKey, backup);
 			writeSqliteLike(dbPath, 'OLD');
 
-			expect(() => restoreDbFile(backup, dbPath)).to.throw(/SQLite/);
-			expect(fs.readFileSync(dbPath).includes('OLD')).to.equal(true);
-			expect(fs.existsSync(preRestoreBackupPath(dbPath, 0))).to.equal(false);
+			const err = await rejectionOf(restoreDbFile(backup, dbPath, { macKey }));
+			expect(err.message).to.match(/SQLite/);
+			expectUntouched(dbPath);
 		});
 
-		it('performDbRestore refuses while another live process holds the instance lock', function () {
+		it('restoreDbFile refuses a backup without a MAC unless explicitly allowed', async function () {
+			const backup = path.join(tmpDir, 'legacy.db');
+			const dbPath = path.join(tmpDir, 'mainnet.db');
+			writeSqliteLike(backup, 'NEW');
+			writeSqliteLike(dbPath, 'OLD');
+
+			const err = await rejectionOf(restoreDbFile(backup, dbPath, { macKey }));
+			expect(err.message).to.match(/not authenticated/);
+			expect(err.message).to.include(backupMacPath(backup));
+			expectUntouched(dbPath);
+
+			const result = await restoreDbFile(backup, dbPath, {
+				macKey,
+				allowUnauthenticated: true
+			});
+			expect(result.authenticated).to.equal(false);
+			expect(fs.readFileSync(dbPath).includes('NEW')).to.equal(true);
+		});
+
+		it('restoreDbFile refuses a modified backup, a foreign MAC and a malformed MAC, even when unauthenticated backups are allowed', async function () {
+			const dbPath = path.join(tmpDir, 'mainnet.db');
+			writeSqliteLike(dbPath, 'OLD');
+
+			const modified = path.join(tmpDir, 'modified.db');
+			await writeBackup(modified, 'NEW');
+			fs.appendFileSync(modified, 'x');
+
+			const foreign = path.join(tmpDir, 'foreign.db');
+			writeSqliteLike(foreign, 'NEW');
+			await writeBackupMac(
+				deriveBackupMacKey(bip39.mnemonicToSeedSync(bip39.generateMnemonic())),
+				foreign
+			);
+
+			const malformed = path.join(tmpDir, 'malformed.db');
+			writeSqliteLike(malformed, 'NEW');
+			fs.writeFileSync(backupMacPath(malformed), 'not a mac\n');
+
+			for (const allowUnauthenticated of [false, true]) {
+				for (const [backup, message] of [
+					[modified, /MAC does not match/],
+					[foreign, /MAC does not match/],
+					[malformed, /Malformed backup MAC/]
+				] as const) {
+					const err = await rejectionOf(
+						restoreDbFile(backup, dbPath, { macKey, allowUnauthenticated })
+					);
+					expect(err.message, backup).to.match(message);
+					expectUntouched(dbPath);
+				}
+			}
+		});
+
+		it('a BeignetNode backup restores, and the same backup with an injected plaintext row is refused (#1228)', async function () {
+			this.timeout(60_000);
+			const dataDir = path.join(tmpDir, 'data');
+			const manual = path.join(tmpDir, 'manual.db');
+			const scheduled = path.join(tmpDir, 'scheduled.db');
+			const node = await BeignetNode.create({
+				mnemonic: MNEMONIC,
+				network: 'regtest',
+				dataDir,
+				logLevel: 'silent',
+				rapidGossipSync: false,
+				autoGossipSync: false,
+				backupPath: scheduled,
+				...OFFLINE_ELECTRUM
+			});
+			try {
+				await node.backup(manual);
+				const completed = new Promise<void>((resolve, reject) => {
+					node.once('backup:completed', () => resolve());
+					node.once('backup:failed', (e: { error: string }) =>
+						reject(new Error(e.error))
+					);
+				});
+				node.triggerBackup();
+				await completed;
+			} finally {
+				await node.destroy();
+			}
+			expect(readBackupMac(manual)).to.be.an.instanceOf(Buffer);
+			expect(readBackupMac(scheduled)).to.be.an.instanceOf(Buffer);
+
+			// The attacker keeps the MAC file and edits the database, writing a
+			// plaintext value where storage would have stored ciphertext.
+			const tampered = path.join(tmpDir, 'tampered.db');
+			fs.copyFileSync(manual, tampered);
+			fs.copyFileSync(backupMacPath(manual), backupMacPath(tampered));
+			const db = new Database(tampered);
+			db.prepare(
+				'INSERT OR REPLACE INTO wallet_data (key, value) VALUES (?, ?)'
+			).run('injected', '{"plaintext":true}');
+			db.close();
+
+			const restoreDir = path.join(tmpDir, 'restore');
+			fs.mkdirSync(restoreDir);
+			const dbPath = path.join(restoreDir, 'regtest.db');
+			writeSqliteLike(dbPath, 'OLD');
+			const err = await rejectionOf(
+				restoreDbFile(tampered, dbPath, { macKey })
+			);
+			expect(err.message).to.match(/MAC does not match/);
+			expectUntouched(dbPath);
+
+			for (const backup of [manual, scheduled]) {
+				const result = await restoreDbFile(backup, dbPath, { macKey });
+				expect(result.authenticated).to.equal(true);
+				expect(
+					fs.readFileSync(dbPath).equals(fs.readFileSync(backup))
+				).to.equal(true);
+			}
+		});
+
+		it('performDbRestore refuses while another live process holds the instance lock', async function () {
 			const backup = path.join(tmpDir, 'backup.db');
 			const dbPath = path.join(tmpDir, 'mainnet.db');
 			const lockPath = path.join(tmpDir, 'mainnet.lock');
-			writeSqliteLike(backup, 'NEW');
+			await writeBackup(backup, 'NEW');
 			writeSqliteLike(dbPath, 'OLD');
 			// Simulate a running daemon: a live PID that is not ours (our parent).
 			fs.writeFileSync(
@@ -1139,24 +1292,29 @@ describe('SCB restore', function () {
 				})
 			);
 
-			expect(() => performDbRestore(backup, dbPath, lockPath)).to.throw(
-				InstanceLockError
-			);
+			expect(
+				await rejectionOf(
+					performDbRestore(backup, dbPath, lockPath, { macKey })
+				)
+			).to.be.an.instanceOf(InstanceLockError);
 			expect(fs.readFileSync(dbPath).includes('OLD')).to.equal(true);
 
 			// With the lock free the restore proceeds and releases the lock after.
 			fs.unlinkSync(lockPath);
-			const result = performDbRestore(backup, dbPath, lockPath, 7);
+			const result = await performDbRestore(backup, dbPath, lockPath, {
+				macKey,
+				now: 7
+			});
 			expect(fs.readFileSync(dbPath).includes('NEW')).to.equal(true);
 			expect(result.preRestorePath).to.equal(`${dbPath}.pre-restore-7`);
 			expect(fs.existsSync(lockPath)).to.equal(false);
 		});
 
-		it('performDbRestore fails closed on a lock recorded under another hostname', function () {
+		it('performDbRestore fails closed on a lock recorded under another hostname', async function () {
 			const backup = path.join(tmpDir, 'backup.db');
 			const dbPath = path.join(tmpDir, 'mainnet.db');
 			const lockPath = path.join(tmpDir, 'mainnet.lock');
-			writeSqliteLike(backup, 'NEW');
+			await writeBackup(backup, 'NEW');
 			writeSqliteLike(dbPath, 'OLD');
 
 			// A daemon in another container may still have this data dir open;
@@ -1167,9 +1325,11 @@ describe('SCB restore', function () {
 					lockPath,
 					JSON.stringify({ pid, hostname: 'other-container', createdAt: 1 })
 				);
-				expect(() => performDbRestore(backup, dbPath, lockPath)).to.throw(
-					InstanceLockError
-				);
+				expect(
+					await rejectionOf(
+						performDbRestore(backup, dbPath, lockPath, { macKey })
+					)
+				).to.be.an.instanceOf(InstanceLockError);
 				expect(fs.readFileSync(dbPath).includes('OLD')).to.equal(true);
 				// The live daemon's lock must be left intact, not reclaimed.
 				expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).pid).to.equal(pid);

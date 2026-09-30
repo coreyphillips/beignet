@@ -301,7 +301,7 @@ Automatic execution is **off by default**: pass `autoRebalance: { enabled: true,
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `backup(destPath)` | `Promise<void>` | Create online backup of SQLite database |
+| `backup(destPath)` | `Promise<void>` | Create online backup of SQLite database, with its MAC in `<destPath>.hmac` |
 | `storageFiles()` | `string[]` | The live database, its sidecars and the instance lock (paths `POST /backup` refuses to write over) |
 
 Storage encryption: the SQLite database is encrypted at rest by default with a
@@ -368,7 +368,7 @@ With `peerStorageEnabled` (default true) the node advertises
 | Method / Command | Returns | Description |
 |--------|---------|-------------|
 | `restoreFromScb(encoded)` | `Promise<{ recovering, skipped, channelCount }>` | Recover channels from an SCB blob (daemon: `POST /restore/scb` with `{ encoded }` or `{ path }`; CLI: `beignet restore scb <file>`) |
-| `beignet restore db <backupFile>` | JSON result | Copy a database backup into place (OFFLINE, local CLI operation - no daemon call) |
+| `beignet restore db <backupFile> [--unauthenticated]` | JSON result | Copy an authenticated database backup into place (OFFLINE, local CLI operation - no daemon call) |
 | `restoreFromGuardians()` | `Promise<{ exact, framesApplied, guardiansRepaired, epoch }>` | Restore from guardian replicas and start the node on the restored state (daemon: `POST /recovery/restore` with `{ confirm: true }`; CLI: `beignet recovery restore`) |
 | `restoreFromCapsules({ unfenced? })` | `Promise<{ tier, channelCount, framesApplied, head, newestSeenHead, rejectedCandidates, restartRequired, unfenced?, recovering?, skipped? }>` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session (daemon: `POST /recovery/restore-capsule` with `{ confirm: true }`; CLI: `beignet recovery restore-capsule`). Tier 2 installs the exact state into a fresh database and holds the daemon until a restart; Tier 1 recovers the embedded SCB on the live node |
 
@@ -389,12 +389,21 @@ Three very different restore modes:
 - **DB restore = full state.** `beignet restore db <backupFile>` copies a
   backup made with `backup()` over `<dataDir>/<network>.db`. The node must be
   STOPPED: the command refuses while a daemon holds the wallet's
-  single-instance lock (and holds that lock itself during the copy). The file
-  must be a real SQLite database (16-byte header check), any existing
-  database is preserved at `<db>.pre-restore-<timestamp>` first, and stale
-  `-wal`/`-shm` sidecars are moved aside so they cannot corrupt the restored
-  file. The database is encrypted under the wallet seed, so the node must be
-  started with the same mnemonic that made the backup. WARNING: restoring a
+  single-instance lock (and holds that lock itself during the copy). Every
+  backup is written with an HMAC-SHA256 of the whole file in
+  `<backupFile>.hmac`, under a key derived (HKDF-SHA256, info
+  `beignet-db-backup-mac-v1`) from the wallet seed; keep the two files
+  together. The restore copies the backup next to the database, and refuses
+  it unless that copy is a SQLite database whose MAC matches, so a backup
+  modified by anyone without the mnemonic (or made by another wallet) never
+  replaces the live database. Any existing database is preserved at
+  `<db>.pre-restore-<timestamp>` first, and stale `-wal`/`-shm` sidecars are
+  moved aside so they cannot corrupt the restored file. The database is
+  encrypted under the wallet seed, so the node must be started with the same
+  mnemonic that made the backup. Backups made before backups carried a MAC
+  have no `.hmac` file and are refused; restore one with `--unauthenticated`
+  only when you know it was not modified, then take a fresh backup once the
+  node is running. WARNING: restoring a
   stale database and going online can be unsafe (peers may prove the state
   stale); prefer the most recent backup, and rely on SCB recovery when in
   doubt.
@@ -1959,7 +1968,8 @@ The config file carries the mnemonic and the API token, so everything under
 `~/.beignet` is created owner-only: `~/.beignet` and the data directory are
 `0700`, and `config.json`, `daemon.pid`, the SQLite database with its `-wal`
 and `-shm` sidecars, the instance lock, database backups (`backup()`, the
-scheduled backup, `POST /backup`), restore copies and SCB exports are `0600`.
+scheduled backup, `POST /backup`) and their `.hmac` files, restore copies and
+SCB exports are `0600`.
 The modes are set explicitly rather than trusted to the umask; the CLI also
 sets the process umask to `077` for `init`, `start`, `backup` and `restore`,
 so anything else those commands create is owner-only too. A library host that

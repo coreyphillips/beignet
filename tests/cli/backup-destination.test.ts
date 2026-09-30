@@ -16,6 +16,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { AddressInfo } from 'net';
 import { resolveBackupDestination } from '../../src/cli/backup-destination';
+import { backupMacPath } from '../../src/cli/backup-mac';
 import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
 
 const MNEMONIC =
@@ -107,6 +108,22 @@ describe('Backup destination (issue #1230)', () => {
 			expect(resolveBackupDestination(dest, [], true)).to.deep.equal({
 				path: dest
 			});
+		});
+
+		it('holds the MAC file beside the backup to the same rule (#1228)', () => {
+			const dest = path.join(dir, 'new.db');
+			fs.writeFileSync(backupMacPath(dest), '');
+			expect(resolveBackupDestination(dest, [], false))
+				.to.have.property('refusal')
+				.that.match(/MAC path already exists/);
+			expect(resolveBackupDestination(dest, [], true)).to.deep.equal({
+				path: dest
+			});
+			fs.rmSync(backupMacPath(dest));
+			fs.mkdirSync(backupMacPath(dest));
+			expect(resolveBackupDestination(dest, [], true))
+				.to.have.property('refusal')
+				.that.match(/not a regular file/);
 		});
 
 		it('refuses filenames the backup driver would trim', () => {
@@ -241,6 +258,7 @@ describe('Backup destination (issue #1230)', () => {
 			const first = await post(port, '/backup', { destPath: dest });
 			expect(first.status).to.equal(200);
 			expect(header(dest)).to.equal(SQLITE_HEADER);
+			expect(fs.existsSync(backupMacPath(dest))).to.equal(true);
 
 			const again = await post(port, '/backup', { destPath: dest });
 			expect(again.status).to.equal(400);

@@ -35,6 +35,7 @@ import {
 } from '../types/wallet';
 import { createWalletStorage } from './wallet-storage';
 import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
+import { deriveBackupMacKey, writeBackupMac } from './backup-mac';
 import { nodeStorageView } from './node-storage-view';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
@@ -13888,8 +13889,13 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Database Backup ───────────────
 
+	/** Back up the database to `destPath`, with its MAC in backupMacPath(destPath). */
 	async backup(destPath: string): Promise<void> {
 		await this.storage.backup(destPath);
+		await writeBackupMac(
+			deriveBackupMacKey(bip39.mnemonicToSeedSync(this.mnemonic)),
+			destPath
+		);
 	}
 
 	/** The live database, its sidecars and the instance lock. */
@@ -13908,8 +13914,7 @@ export class BeignetNode extends EventEmitter {
 
 	private performScheduledBackup(): void {
 		if (!this.backupPath || this.destroyed) return;
-		this._backupPromise = this.storage
-			.backup(this.backupPath)
+		this._backupPromise = this.backup(this.backupPath)
 			.then(() => {
 				this.log('info', 'Scheduled backup completed', {
 					path: this.backupPath
