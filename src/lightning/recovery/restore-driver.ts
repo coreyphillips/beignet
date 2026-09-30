@@ -851,6 +851,38 @@ export class RestoreDriver {
 	}
 
 	/**
+	 * Whether some guardian may hold a grant of this attempt. Only a head
+	 * below the attempt's epoch, or at it under another key, rules a
+	 * guardian out. One that is unreachable or answered without a
+	 * verifiable head may have accepted and gone quiet, and granting the
+	 * epoch to a fresh key would leave two keys certified for one epoch
+	 * once it returns (issue #1227). A possibly-stale head counts here: a
+	 * rollback drops every epoch row above the state it keeps, so that
+	 * guardian holds no grant its head does not show.
+	 */
+	private mayBeHeld(
+		attempt: IPendingAttempt,
+		readings: IHeadReading[],
+		stale: IHeadReading[]
+	): boolean {
+		const ruledOut = new Set(
+			[...readings, ...stale]
+				.filter(
+					(reading) =>
+						reading.state.lease.epoch < attempt.newEpoch ||
+						(reading.state.lease.epoch === attempt.newEpoch &&
+							!reading.state.lease.writerPublicKey.equals(
+								attempt.writer.publicKey
+							))
+				)
+				.map((reading) => reading.guardianId.toString('hex'))
+		);
+		return this.config.guardians.some(
+			(guardian) => !ruledOut.has(guardian.expectedGuardianId.toString('hex'))
+		);
+	}
+
+	/**
 	 * The attempt's own guard as a repair target, downloaded from a guardian
 	 * whose log ends exactly there: one still at the guard, or one bound to
 	 * the attempt (a takeover keeps the log head, and nothing is written
@@ -890,10 +922,9 @@ export class RestoreDriver {
 		let stalePool = stale;
 		let repaired = 0;
 		let pending = this.loadPending();
-		let bound = false;
+		let held = false;
 		if (pending) {
-			const resumed = pending;
-			bound = pool.some((reading) => this.boundTo(reading, resumed));
+			held = this.mayBeHeld(pending, pool, stalePool);
 			this.emit(
 				'epoch:resumed',
 				`resuming the acquisition of epoch ${pending.newEpoch} with its original writer key`
@@ -901,12 +932,12 @@ export class RestoreDriver {
 		}
 
 		for (let attempt = 1; attempt <= this.maxCasAttempts; attempt++) {
-			// A guardian bound to the pending attempt can grant nothing else, so
-			// the attempt completes over its own guard or not at all. Repairing
-			// laggards toward a newer head would carry them past that guard,
-			// where they can never grant it either (issue #1040).
+			// A guardian that may hold the pending attempt can grant nothing
+			// else, so the attempt completes over its own guard or not at all.
+			// Repairing laggards toward a newer head would carry them past that
+			// guard, where they can never grant it either (issue #1040).
 			const repairTarget =
-				bound && pending ? this.guardReading(pending, pool) : expected;
+				held && pending ? this.guardReading(pending, pool) : expected;
 			if (repairTarget) {
 				repaired += await this.repairLaggards(pool, stalePool, repairTarget);
 			}
@@ -1014,20 +1045,20 @@ export class RestoreDriver {
 								attemptSoFar.writer.publicKey
 							)))
 			);
-			// Two: NOTHING is bound to it (no certificate collected, and no
-			// guardian is sitting at its epoch and key), while the reconciled
-			// head has moved on. That is the still-live-old-writer case: the
-			// CAS guard is simply stale, nobody accepted the attempt, and
-			// re-targeting costs no epoch that anyone acknowledged.
-			const acceptedSomewhere =
+			// Two: NOTHING can hold it (no certificate collected, and every
+			// guardian's head shows it never granted the attempt), while the
+			// reconciled head has moved on. That is the still-live-old-writer
+			// case: the CAS guard is simply stale, nobody accepted the
+			// attempt, and re-targeting costs no epoch that anyone
+			// acknowledged. A guardian that did not answer proves nothing.
+			held =
 				certificates.length > 0 ||
-				pool.some((reading) => this.boundTo(reading, attemptSoFar));
+				this.mayBeHeld(attemptSoFar, pool, stalePool);
 			const guardMoved = !statesEqual(
 				expected.state,
 				attemptSoFar.expectedState
 			);
-			bound = acceptedSomewhere;
-			if (superseded || (!acceptedSomewhere && guardMoved)) {
+			if (superseded || (!held && guardMoved)) {
 				this.emit(
 					'epoch:abandoned',
 					superseded
@@ -1036,7 +1067,7 @@ export class RestoreDriver {
 				);
 				this.clearPending();
 				pending = null;
-				bound = false;
+				held = false;
 			}
 		}
 		throw new RestoreRefusedError(
