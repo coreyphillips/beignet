@@ -21802,7 +21802,11 @@ export class LightningNode extends EventEmitter {
 					p.htlcId,
 					preimage
 				);
-				if (!result.ok) {
+				if (result.ok) {
+					this.cleanupHtlcSharedSecret(
+						`${p.channelId.toString('hex')}:${p.htlcId}`
+					);
+				} else {
 					this.emitStructuredLog('htlc', 'mpp_part_fulfill_refused', {
 						paymentHash: hashHex,
 						channelId: p.channelId.toString('hex'),

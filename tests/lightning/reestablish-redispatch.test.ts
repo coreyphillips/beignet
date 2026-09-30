@@ -252,6 +252,11 @@ function buildDirectGraph(
 	);
 }
 
+function sharedSecrets(node: LightningNode): Map<string, Buffer> {
+	return (node as unknown as { receivedHtlcSharedSecrets: Map<string, Buffer> })
+		.receivedHtlcSharedSecrets;
+}
+
 function tempDb(prefix: string): string {
 	return path.join(
 		fs.mkdtempSync(path.join(os.tmpdir(), `beignet-${prefix}-`)),
@@ -1207,6 +1212,10 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 			[...aliceHtlcs().values()].map((h) => h.state),
 			'the refused part is still committed'
 		).to.deep.equal([HtlcState.COMMITTED]);
+		expect(
+			[...sharedSecrets(bob).keys()],
+			'only the refused part keeps its shared secret'
+		).to.deep.equal([`${aliceChannelId.toString('hex')}:0`]);
 		expect(bob.pruneCompletedPayments(), 'a record owing a fulfill').to.equal(
 			0
 		);
@@ -1245,6 +1254,7 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 			'the part over alice settled after the reconnect'
 		).to.equal(PaymentStatus.COMPLETED);
 		expect(aliceHtlcs().size, 'no HTLC left on the channel').to.equal(0);
+		expect(sharedSecrets(bob).size, 'no shared secret left').to.equal(0);
 		expect(
 			bob.getChannelManager().getChannel(aliceChannelId)!.getState()
 		).to.equal(ChannelState.NORMAL);
@@ -1274,6 +1284,83 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 			[...aliceHtlcs().values()].map((h) => h.state),
 			'the owed fulfill was sent'
 		).to.not.include(HtlcState.COMMITTED);
+
+		carol.destroy();
+		bob.destroy();
+		alice.destroy();
+	});
+
+	it('a completed MPP leaves no shared secret in memory or storage (#1195)', async function () {
+		this.timeout(20_000);
+		const CAROL_SEED = 43;
+		const storage = new SqliteStorage(tempDb('mpp-secrets'));
+		storage.open();
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED, storage);
+		const carol = createNode(CAROL_SEED);
+		const dead = { val: false };
+		wire(alice, bob, dead);
+		wire(carol, bob, dead);
+		const aliceChannelId = openReadyChannel(alice, bob);
+		const carolChannelId = openReadyChannel(carol, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+		buildDirectGraph(carol, CAROL_SEED, BOB_SEED);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 100_000n,
+			description: 'mpp shared secrets'
+		});
+		const scid = encodeShortChannelId({
+			block: 500,
+			txIndex: 1,
+			outputIndex: 0
+		});
+		const payPart = (payer: LightningNode, amountMsat: bigint): void => {
+			const finalCltv = (
+				payer as unknown as { paddedFinalCltvExpiry: () => number }
+			).paddedFinalCltvExpiry();
+			payer.sendPaymentToRoute(
+				{
+					hops: [
+						{
+							pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+							shortChannelId: scid,
+							amountToForwardMsat: amountMsat,
+							outgoingCltvValue: finalCltv
+						}
+					]
+				},
+				invoice.paymentHash,
+				finalCltv,
+				invoice.paymentSecret,
+				100_000n
+			);
+		};
+
+		payPart(alice, 60_000n);
+		await settle();
+		expect(
+			storage.loadAllHtlcSharedSecrets().length,
+			'the parked part persisted its secret'
+		).to.equal(1);
+
+		payPart(carol, 40_000n);
+		await settle();
+		expect(bob.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+		for (const channelId of [aliceChannelId, carolChannelId]) {
+			expect(
+				bob.getChannelManager().getChannel(channelId)!.getFullState().htlcs
+					.size,
+				'the part was removed from its channel'
+			).to.equal(0);
+		}
+		expect(sharedSecrets(bob).size, 'no secret left in memory').to.equal(0);
+		expect(
+			storage.loadAllHtlcSharedSecrets(),
+			'no secret row left in storage'
+		).to.deep.equal([]);
 
 		carol.destroy();
 		bob.destroy();
