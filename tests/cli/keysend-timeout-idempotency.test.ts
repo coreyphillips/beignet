@@ -281,6 +281,37 @@ describe('keyed POST /keysend after a timeout (#1133)', function () {
 		expect(errorOf(rerun).paymentHash).to.equal(sent[1]);
 	});
 
+	// Issue #1188: a caller's _keysend label must not hide the marker that
+	// says the stored preimage is the sender's own.
+	it('sends again under the key once a relabelled keysend failed', async () => {
+		const request = { ...body, timeoutMs: 50 };
+		const headers = { 'X-Idempotency-Key': `keysend-relabel-${Date.now()}` };
+		const storage = node.getStorage();
+		const dispatch = engine().sendKeysend;
+		engine().sendKeysend = (...args: unknown[]): unknown => {
+			const record = dispatch(...args) as IPaymentInfo;
+			record.preimage = (args[0] as { preimage: Buffer }).preimage;
+			record.metadata = { _keysend: 'true' };
+			storage.savePayment(record.paymentHash.toString('hex'), record);
+			return record;
+		};
+
+		expect((await postKeysend(port, request, headers)).status).to.equal(504);
+		const [first] = sent;
+		node.setPaymentMetadata(first, { _keysend: 'false', label: 'tip' });
+		const labelled = storage.loadPayment(first)!;
+		expect(labelled.metadata).to.deep.equal({ _keysend: 'true', label: 'tip' });
+
+		resolveHtlc(first, 'FAILED');
+		storage.savePayment(first, engine().payments.get(first)!);
+		expect(node.paymentOutcome(first)).to.equal('gone');
+
+		const rerun = await postKeysend(port, request, headers);
+		expect(rerun.status).to.equal(504);
+		expect(sent).to.have.length(2);
+		expect(errorOf(rerun).paymentHash).to.equal(sent[1]);
+	});
+
 	// Issue #1153: stored before the HTLC goes out, so a daemon stopped before
 	// the timeout still leaves the retry after a restart its marker.
 	it('stores the keysend in flight under its hash until the request answers', async () => {

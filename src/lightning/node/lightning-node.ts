@@ -17052,7 +17052,9 @@ export class LightningNode extends EventEmitter {
 				'amountMsat must be positive'
 			);
 		}
-		const paymentMetadata = { _keysend: 'true', ...(metadata || {}) };
+		// The marker goes last so a caller's key of the same name cannot hide
+		// it: it is what says the stored preimage is ours, not proof of payment.
+		const paymentMetadata = { ...(metadata || {}), _keysend: 'true' };
 		if (!this.paymentMetadataFits(paymentMetadata)) {
 			throw new LightningPaymentError(
 				LightningErrorCode.INVALID_KEYSEND,
@@ -24386,6 +24388,13 @@ export class LightningNode extends EventEmitter {
 		const existing = this.payments.get(hashHex);
 		if (existing) {
 			const merged = { ...existing.metadata, ...metadata };
+			// _keysend is the engine's classification, not a label: a caller
+			// neither sets nor clears it.
+			if (existing.metadata?._keysend !== undefined) {
+				merged._keysend = existing.metadata._keysend;
+			} else {
+				delete merged._keysend;
+			}
 			const labelled = { ...existing, metadata: merged };
 			// Settlement replaces a caller's _invoice with the retry's invoice,
 			// so either row can be the larger one.
