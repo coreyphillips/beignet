@@ -332,6 +332,14 @@ export interface IReferenceGuardianConfig {
 	 * sets it per set (guardian-host.ts).
 	 */
 	maxContentBytes?: number;
+	/**
+	 * The same bound on the content one recovery_id stores, so a namespace
+	 * that reaches it cannot spend what the others in the store were left.
+	 * Absent runs unbounded.
+	 */
+	maxNamespaceContentBytes?: number;
+	/** Namespaces REGISTER_NODE may create; absent runs unbounded. */
+	maxNamespaces?: number;
 	/** Advertised GET_STATE page limit; the protocol caps it at 256. */
 	maxRecordsPerGet?: number;
 	/** Unix milliseconds; injectable so tests pin issuedAt. */
@@ -676,19 +684,23 @@ interface IWriteCost {
 	 * replaced (new minus old) at the price of a scan of its rows.
 	 */
 	exact?: boolean;
+	/** True for REGISTER_NODE: an absent row is a namespace this write adds. */
+	opensNamespace?: boolean;
 }
+
+type QuotaScope = 'set' | 'namespace';
 
 /** Thrown inside a write transaction to roll it back at the quota. */
 class QuotaRollback extends Error {
-	constructor() {
+	constructor(readonly scope: QuotaScope) {
 		super('write would cross the content quota');
 	}
 }
 
-function quotaRefusal(): IErr {
+function quotaRefusal(scope: QuotaScope): IErr {
 	return err(
 		GuardianStatus.ERR_QUOTA_EXCEEDED,
-		"this guardian's content quota for the set is exhausted"
+		`this guardian's content quota for the ${scope} is exhausted`
 	);
 }
 
@@ -709,6 +721,8 @@ export class ReferenceGuardian {
 	private readonly maxCiphertextBytes: number;
 	private readonly maxRecordsPerGet: number;
 	private readonly maxContentBytes: number | undefined;
+	private readonly maxNamespaceContentBytes: number | undefined;
+	private readonly maxNamespaces: number | undefined;
 	private readonly clock: () => bigint;
 	private readonly onAlarm?: (alarm: IGuardianAlarm) => void;
 	/**
@@ -765,13 +779,19 @@ export class ReferenceGuardian {
 			throw new Error('maxRecordsPerGet must be between 1 and 256');
 		}
 		this.maxRecordsPerGet = maxRecords;
-		if (
-			config.maxContentBytes !== undefined &&
-			(!Number.isInteger(config.maxContentBytes) || config.maxContentBytes < 0)
-		) {
-			throw new Error('maxContentBytes must be a non-negative integer');
+		for (const limit of [
+			'maxContentBytes',
+			'maxNamespaceContentBytes',
+			'maxNamespaces'
+		] as const) {
+			const value = config[limit];
+			if (value !== undefined && (!Number.isInteger(value) || value < 0)) {
+				throw new Error(`${limit} must be a non-negative integer`);
+			}
 		}
 		this.maxContentBytes = config.maxContentBytes;
+		this.maxNamespaceContentBytes = config.maxNamespaceContentBytes;
+		this.maxNamespaces = config.maxNamespaces;
 		this.clock = config.clock ?? ((): bigint => BigInt(Date.now()));
 		this.onAlarm = config.onAlarm;
 		this.store = new GuardianStore(config.path);
@@ -780,7 +800,7 @@ export class ReferenceGuardian {
 			// The content counter is re-derived from the rows at every open,
 			// after the open-time walk has archived what it archives, so a
 			// restart recovers it exactly and never trusts a stale number.
-			this.store.write(() => this.store.resetUsage(this.store.contentBytes()));
+			this.store.write(() => this.store.resetUsage());
 		} catch (error) {
 			this.store.close();
 			throw error;
@@ -813,19 +833,16 @@ export class ReferenceGuardian {
 	}
 
 	/**
-	 * The encoded bytes this guardian's store holds: the maintained counter
-	 * for the whole store (what the quota is judged against), or a
-	 * measurement of one namespace's rows.
+	 * The encoded bytes this guardian's store holds, in total or under one
+	 * recovery_id: the maintained counters the quotas are judged against.
 	 */
 	contentBytes(recoveryId?: Buffer): number {
-		return this.store.read(() =>
-			recoveryId ? this.store.contentBytes(recoveryId) : this.store.usageBytes()
-		);
+		return this.store.read(() => this.store.usageBytes(recoveryId));
 	}
 
-	/** The counter's truth, measured from every row; for audits and tests. */
-	auditContentBytes(): number {
-		return this.store.read(() => this.store.contentBytes());
+	/** The counters' truth, measured from the rows; for audits and tests. */
+	auditContentBytes(recoveryId?: Buffer): number {
+		return this.store.read(() => this.store.contentBytes(recoveryId));
 	}
 
 	/** Orphan-archive audit view (never served by GET_STATE). */
@@ -1027,7 +1044,8 @@ export class ReferenceGuardian {
 				// conservative early refusal within GUARDIAN_REGISTRATION_BYTES
 				// of the limit, charged exactly from the measurement.
 				delta: (ns): number =>
-					ns && ns.registrationState ? 0 : GUARDIAN_REGISTRATION_BYTES
+					ns && ns.registrationState ? 0 : GUARDIAN_REGISTRATION_BYTES,
+				opensNamespace: true
 			};
 			const outcome = this.fencedWrite(state.recoveryId, cost, (ns) => {
 				if (ns && ns.registrationState) {
@@ -1469,16 +1487,18 @@ export class ReferenceGuardian {
 	 *
 	 * The content quota (issue #710) is judged here too, in this order:
 	 *
-	 *   3b. after retirement and before any row-specific verdict, the
-	 *       write's cost (IWriteCost.delta, judged from the row under this
-	 *       lock) against the counter read under this lock: a write that
-	 *       would cross maxContentBytes is ERR_QUOTA_EXCEEDED. Two writers,
-	 *       in this process or another, therefore never admit against the
-	 *       same starting total, and a retired namespace is told so before
-	 *       it is told about space.
+	 *   3b. after retirement and before any row-specific verdict, a
+	 *       registration that would add a namespace past maxNamespaces,
+	 *       then the write's cost (IWriteCost.delta, judged from the row
+	 *       under this lock) against the counters read under this lock: a
+	 *       write that would cross maxContentBytes for the store, or
+	 *       maxNamespaceContentBytes for its own recovery_id, is
+	 *       ERR_QUOTA_EXCEEDED. Two writers, in this process or another,
+	 *       therefore never admit against the same starting total, and a
+	 *       retired namespace is told so before it is told about space.
 	 *   5.  after the body ran, what it actually wrote (charged exactly by
 	 *       the body, or measured on the namespace's rows) is charged to
-	 *       the counter, and if that real growth would still cross the
+	 *       both counters, and if that real growth would still cross either
 	 *       quota the whole transaction is rolled back: the estimate
 	 *       decides precedence, the measurement is the hard bound.
 	 *
@@ -1506,8 +1526,19 @@ export class ReferenceGuardian {
 						'this namespace was rotated to another guardian set; GET_HEAD carries the rotation'
 					);
 				}
-				const gate = this.quotaGate(cost.delta(ns));
-				if (gate) return gate;
+				if (
+					cost.opensNamespace &&
+					!ns &&
+					this.maxNamespaces !== undefined &&
+					this.store.countNamespaces() >= this.maxNamespaces
+				) {
+					return err(
+						GuardianStatus.ERR_QUOTA_EXCEEDED,
+						`this guardian registers at most ${this.maxNamespaces} namespaces for the set`
+					);
+				}
+				const scope = this.quotaExceeded(recoveryId, cost.delta(ns));
+				if (scope) return quotaRefusal(scope);
 				const before = cost.exact ? 0 : this.store.contentBytes(recoveryId);
 				let written = 0;
 				const result = body(ns, (bytes: number): void => {
@@ -1516,39 +1547,43 @@ export class ReferenceGuardian {
 				if (!cost.exact) {
 					written = this.store.contentBytes(recoveryId) - before;
 				}
-				this.chargeOrRollBack(written);
+				this.chargeOrRollBack(recoveryId, written);
 				return result;
 			});
 		} catch (error) {
-			if (error instanceof QuotaRollback) return quotaRefusal();
+			if (error instanceof QuotaRollback) return quotaRefusal(error.scope);
 			throw error;
 		}
 	}
 
-	/** Inside a write transaction: refuse a cost the counter cannot absorb. */
-	private quotaGate(delta: number): IErr | null {
-		if (this.maxContentBytes === undefined || delta <= 0) return null;
-		if (this.store.usageBytes() + delta > this.maxContentBytes) {
-			return quotaRefusal();
+	/** Inside a write transaction: which quota, if any, a cost would cross. */
+	private quotaExceeded(recoveryId: Buffer, delta: number): QuotaScope | null {
+		if (delta <= 0) return null;
+		if (
+			this.maxContentBytes !== undefined &&
+			this.store.usageBytes() + delta > this.maxContentBytes
+		) {
+			return 'set';
+		}
+		if (
+			this.maxNamespaceContentBytes !== undefined &&
+			this.store.usageBytes(recoveryId) + delta > this.maxNamespaceContentBytes
+		) {
+			return 'namespace';
 		}
 		return null;
 	}
 
 	/**
-	 * Inside a write transaction, after its writes: advance the counter by
+	 * Inside a write transaction, after its writes: advance the counters by
 	 * what was written, or roll the transaction back if that growth crosses
-	 * the quota after all (an estimate below the truth never lands a write).
+	 * a quota after all (an estimate below the truth never lands a write).
 	 */
-	private chargeOrRollBack(written: number): void {
+	private chargeOrRollBack(recoveryId: Buffer, written: number): void {
 		if (written === 0) return;
-		if (
-			written > 0 &&
-			this.maxContentBytes !== undefined &&
-			this.store.usageBytes() + written > this.maxContentBytes
-		) {
-			throw new QuotaRollback();
-		}
-		this.store.chargeUsage(written);
+		const scope = this.quotaExceeded(recoveryId, written);
+		if (scope) throw new QuotaRollback(scope);
+		this.store.chargeUsage(recoveryId, written);
 	}
 
 	/**
@@ -1715,8 +1750,8 @@ export class ReferenceGuardian {
 					ns.rotation !== null && ns.rotation.equals(encoded)
 						? 0
 						: encoded.length - storedBytes;
-				const quota = this.quotaGate(delta);
-				if (quota) return quota;
+				const scope = this.quotaExceeded(request.recoveryId, delta);
+				if (scope) return quotaRefusal(scope);
 				if (ns.rotation !== null) {
 					const stored = decodeRotateSetRequest(ns.rotation);
 					if (ns.rotation.equals(encoded)) {
@@ -1744,7 +1779,7 @@ export class ReferenceGuardian {
 					);
 				}
 				this.store.setRotation(request.recoveryId, encoded);
-				this.chargeOrRollBack(delta);
+				this.chargeOrRollBack(request.recoveryId, delta);
 				return { status: GuardianStatus.OK, rotation: request };
 			});
 			return outcome;

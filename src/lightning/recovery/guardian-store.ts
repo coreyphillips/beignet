@@ -184,6 +184,10 @@ CREATE TABLE IF NOT EXISTS guardian_usage (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
 	content_bytes INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS guardian_namespace_usage (
+	recovery_id BLOB PRIMARY KEY,
+	content_bytes INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS guardian_epochs (
 	recovery_id BLOB NOT NULL,
 	epoch BLOB NOT NULL,
@@ -271,6 +275,13 @@ export class GuardianStore {
 			.prepare('SELECT * FROM guardian_namespaces ORDER BY recovery_id')
 			.all() as INamespaceDbRow[];
 		return rows.map((row) => this.namespaceFromDb(row));
+	}
+
+	countNamespaces(): number {
+		const row = this.db
+			.prepare('SELECT COUNT(*) AS n FROM guardian_namespaces')
+			.get() as { n: number | bigint };
+		return Number(row.n);
 	}
 
 	insertNamespace(row: IGuardianNamespaceRow): void {
@@ -744,34 +755,62 @@ export class GuardianStore {
 	// ─────────────── storage accounting ───────────────
 
 	/**
-	 * The content counter: the encoded bytes the store holds, kept as a row
-	 * of the store itself so every writer, in this process or another,
-	 * reads and advances the same number under the same BEGIN IMMEDIATE it
-	 * writes under. Re-derived from the rows at every open (resetUsage), so
-	 * it is recoverable and can be audited against contentBytes().
+	 * The content counters: the encoded bytes the store holds, in total or
+	 * under one recovery_id, kept as rows of the store itself so every
+	 * writer, in this process or another, reads and advances the same
+	 * numbers under the same BEGIN IMMEDIATE it writes under. Re-derived
+	 * from the rows at every open (resetUsage), so they are recoverable and
+	 * can be audited against contentBytes().
 	 */
-	usageBytes(): number {
-		const row = this.db
-			.prepare('SELECT content_bytes FROM guardian_usage WHERE id = 1')
-			.get() as { content_bytes: number | bigint } | undefined;
+	usageBytes(recoveryId?: Buffer): number {
+		const row = (
+			recoveryId
+				? this.db
+						.prepare(
+							'SELECT content_bytes FROM guardian_namespace_usage WHERE recovery_id = ?'
+						)
+						.get(recoveryId)
+				: this.db
+						.prepare('SELECT content_bytes FROM guardian_usage WHERE id = 1')
+						.get()
+		) as { content_bytes: number | bigint } | undefined;
 		return row ? Number(row.content_bytes) : 0;
 	}
 
-	resetUsage(bytes: number): void {
+	/** Re-derive every counter from the rows; call inside a write. */
+	resetUsage(): void {
 		this.db
 			.prepare(
 				'INSERT OR REPLACE INTO guardian_usage (id, content_bytes) VALUES (1, ?)'
 			)
-			.run(bytes);
+			.run(this.contentBytes());
+		this.db.prepare('DELETE FROM guardian_namespace_usage').run();
+		const perTable = CONTENT_COLUMNS.map(
+			([table, columns]) =>
+				`SELECT recovery_id, ${rowBytesSql(columns)} AS bytes FROM ${table}`
+		).join(' UNION ALL ');
+		this.db
+			.prepare(
+				`INSERT INTO guardian_namespace_usage (recovery_id, content_bytes)
+				SELECT recovery_id, SUM(bytes) FROM (${perTable}) GROUP BY recovery_id`
+			)
+			.run();
 	}
 
-	/** Advance the counter by what a transaction wrote; call inside it. */
-	chargeUsage(delta: number): void {
+	/** Advance the counters by what a transaction wrote; call inside it. */
+	chargeUsage(recoveryId: Buffer, delta: number): void {
 		this.db
 			.prepare(
 				'UPDATE guardian_usage SET content_bytes = content_bytes + ? WHERE id = 1'
 			)
 			.run(delta);
+		this.db
+			.prepare(
+				`INSERT INTO guardian_namespace_usage (recovery_id, content_bytes)
+				VALUES (?, ?) ON CONFLICT (recovery_id)
+				DO UPDATE SET content_bytes = content_bytes + excluded.content_bytes`
+			)
+			.run(recoveryId, delta);
 	}
 
 	/**
@@ -788,7 +827,7 @@ export class GuardianStore {
 		const args = recoveryId ? [recoveryId] : [];
 		let total = 0;
 		for (const [table, columns] of CONTENT_COLUMNS) {
-			const sum = columns.map((c) => `COALESCE(length(${c}), 0)`).join(' + ');
+			const sum = rowBytesSql(columns);
 			const row = this.db
 				.prepare(
 					`SELECT COALESCE(SUM(${sum}), 0) AS bytes FROM ${table}${where}`
@@ -862,3 +901,7 @@ const CONTENT_COLUMNS: ReadonlyArray<[string, string[]]> = [
 		]
 	]
 ];
+
+function rowBytesSql(columns: string[]): string {
+	return columns.map((c) => `COALESCE(length(${c}), 0)`).join(' + ');
+}
