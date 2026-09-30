@@ -251,7 +251,9 @@ minus the old. A set also registers a bounded number of namespaces, and by
 default each namespace's allowance is the set's divided by that number, so
 one namespace never exhausts the room the others in its set were left.
 The counts are kept in the store and re-derived from its rows at every
-open, so two hosts on one store admit against one total.
+open, so two hosts on one store admit against one total. The quota never
+deletes on its own; what shrinks a set is its writers' retain floors (5.2),
+which free every record below a snapshot every guardian of the set holds.
 
 `transportStatus` is the 2.5 HTTP-layer status, one to one: 200 for every
 well-formed protocol exchange INCLUDING protocol-level rejections (the
@@ -421,6 +423,15 @@ RECORD     tag 'beignet/recovery/record/v1'
   || frameHash(32)
   || ciphertextHash(32)          SHA-256 of the record ciphertext
 
+RETAIN     tag 'beignet/recovery/retain/v1'
+           signed by the writer key of lease.epoch (5.2)
+  PREFIX
+  || recovery_id(32)
+  || epoch(8)                    lease.epoch
+  || sequence(8)                 the first record the guardian keeps: a
+                                 snapshot's
+  || frameHash(32)               that record's frame hash
+
 RECEIPT    tag 'beignet/recovery/receipt/v1'
            signed by the guardian
   PREFIX || guardianId(32) || STATE || issuedAt(8)
@@ -448,7 +459,9 @@ Receipts sign the complete STATE and are cumulative: a receipt whose
 LOGHEAD carries sequence S certifies every stored record from
 ORIGIN.firstSequence through S inclusive, across every intervening writer
 epoch. Records below the origin do not exist for this namespace and no
-receipt ever speaks for them.
+receipt ever speaks for them. Once a guardian accepted a retain floor
+(5.2) it stores the chain from the floor instead; the ORIGIN, and every
+STATE it signs, stay as they were.
 
 What a receipt certifies, precisely: the guardian's canonical state AS OF
 ISSUANCE. A record covered only by a MINORITY of receipts (fewer than
@@ -540,6 +553,41 @@ without waiting for responses. Each request receives its own response;
 there is no batch request in v1. Because receipts are cumulative, a
 client that only reads the last response of a pipelined burst has lost
 nothing.
+
+Retain floor. A PUT_STATE MAY carry `retain_floor`: a sequence F, the
+frame hash of the record at F, and the lease writer key's signature over
+the RETAIN transcript. The writer sends it once F is the newest snapshot
+its journal wrote and EVERY guardian of the set has receipted that
+snapshot's whole page group, and repeats it on each later record. So a
+restore that downloads from F still starts at a complete snapshot, no
+takeover can certify a head below F (4.2: a quorum-held record is never
+superseded), and a guardian that falls behind afterwards can still be
+repaired from its peers (5.6). A quorum is not enough: a guardian already
+behind F could never be repaired, and a restore that has lost a quorum
+member needs it. A guardian that missed a pass therefore holds every
+floor back, so the writer relays what it missed from a peer (SYNC_RECORD)
+before streaming to it. The pass that qualifies the group sends it at
+once, on a record each guardian already holds. A guardian at its quota
+answers every new record `ERR_QUOTA_EXCEEDED` without a receipt, and a
+restart's re-base puts the journal's newest group above what it holds, so
+a writer refused for quota names the floor from the guardians' records
+instead: the newest snapshot group, written under the current lease, that
+ends at or below every guardian's GET_HEAD receipt, read back from one of
+them and verified up to a frame hash its journal still holds. It sends that
+floor on the snapshot record itself. A guardian that accepts
+or duplicates the record, holds the record at F with that frame hash,
+written under the current lease, and has not already freed through F
+verifies the signature (`ERR_BAD_SIGNATURE` refuses the whole request),
+deletes every record below F, orphan-archived ones included, and stores
+the state just before F with its own receipt signature over it, together
+with the writer's floor. That is where its open-time walk (5.10) resumes,
+once both signatures verify: the writer's is what tells a floor apart
+from any other state the guardian signed. A floor it cannot act on yet
+(it does not hold F, or the record is refused) changes nothing. The
+freed bytes count before the quota (2.7), so a set already at its quota
+shrinks. A record below the floor is then answered `ERR_SEQUENCE_GAP`
+with the current state, and a SYNC_EPOCH whose certified head lies below
+it is `ERR_CONFLICT`. SYNC_RECORD never carries a floor.
 
 ### 5.3 GET_HEAD
 
@@ -683,9 +731,9 @@ The operation, performed by the CURRENT writer (a confirmed lease):
    writer's barrier never waits on the incoming set before it is ready
 4. SWITCH, in one local transaction: the incoming set becomes the
    configured set, generation becomes g+1, the replication watermark
-   becomes the incoming set's; from here every frame, receipt and
-   capsule is the incoming set's, and the writer's barrier answers to
-   it
+   and retain floor (5.2) become the incoming set's; from here every
+   frame, receipt and capsule is the incoming set's, and the writer's
+   barrier answers to it
 5. ROTATE_SET to every member of the outgoing set (5.11), retried until
    at least one accepts; the outgoing namespace is RETIRED there
 ```
@@ -1010,7 +1058,15 @@ message RegisterNodeResponse {
   GuardianState current = 4;           // ERR_ALREADY_REGISTERED
 }
 
-message PutStateRequest  { Record record = 1; }
+message RetainFloor {
+  uint64 sequence         = 1;
+  bytes  frame_hash       = 2;   // 32
+  bytes  writer_signature = 3;   // 64, BIP340 over the RETAIN transcript
+}
+message PutStateRequest {
+  Record      record       = 1;
+  RetainFloor retain_floor = 2;   // optional (5.2); SYNC_RECORD omits it
+}
 message PutStateResponse {
   uint32        status  = 1;
   string        detail  = 2;
@@ -1154,7 +1210,8 @@ codec stays tractable, and signatures never depend on the envelope.
 33  ERR_QUOTA_EXCEEDED      a hosted guardian's storage quota is exhausted
                             for new namespaces or further records; not a
                             transport condition and not retryable until the
-                            operator raises the quota (2.7)
+                            operator raises the quota (2.7) or a retain
+                            floor (5.2) frees enough
 34  ERR_SET_RETIRED         the namespace was rotated away from this set
                             (5.11); the rotation is attached, and a writer
                             receiving this MUST freeze (5.9)

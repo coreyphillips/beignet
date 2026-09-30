@@ -37,6 +37,7 @@ import {
 	receiptTranscriptHash,
 	recordTranscriptHash,
 	registerTranscriptHash,
+	retainTranscriptHash,
 	signTranscript,
 	stateBytes,
 	statesEqual,
@@ -179,8 +180,22 @@ export interface IGuardianRegisterNodeResponse {
 	current?: GuardianState;
 }
 
+/**
+ * The writer's retain floor (wire 5.2): the record at `sequence` is a
+ * snapshot whose whole group every guardian of the set holds, so the writer
+ * will never ask for anything below it again. Signed by the lease's writer
+ * key over the RETAIN transcript.
+ */
+export interface IGuardianRetainFloor {
+	sequence: bigint;
+	frameHash: Buffer;
+	writerSignature: Buffer;
+}
+
 export interface IGuardianPutStateRequest {
 	record: IGuardianRecord;
+	/** PUT_STATE only; SYNC_RECORD relays records and never frees any. */
+	retainFloor?: IGuardianRetainFloor;
 }
 
 export interface IGuardianPutStateResponse {
@@ -665,6 +680,25 @@ export const GUARDIAN_REGISTRATION_BYTES =
  */
 export const GUARDIAN_EPOCH_ROW_MAX_BYTES =
 	32 + 8 + 32 + (192 + 8 + 64) + (192 + 8 + 64);
+/**
+ * A retain floor row: the recovery_id, the state, its issue time and
+ * signature, and the writer's frame hash and signature.
+ */
+export const GUARDIAN_RETAIN_FLOOR_BYTES = 32 + 192 + 8 + 64 + 32 + 64;
+
+/** What accepting a writer's retain floor would free and store (wire 5.2). */
+interface IRetainPlan {
+	/** The first sequence kept. */
+	start: bigint;
+	/** The writer's floor, kept so the row answers to the writer's key. */
+	floor: IGuardianRetainFloor;
+	/** The state just before `start`, where the open-time walk resumes. */
+	checkpoint: GuardianState;
+	/** Content bytes of the records below `start`, orphans included. */
+	freed: number;
+	/** The floor row's size, new minus old. */
+	rowDelta: number;
+}
 
 /**
  * What a mutating verb costs the store, judged from the namespace row
@@ -1108,6 +1142,8 @@ export class ReferenceGuardian {
 				} else {
 					this.store.insertNamespace(row);
 				}
+				// A new chain starts at its origin.
+				this.store.deleteRetainFloor(state.recoveryId);
 				this.store.insertEpoch({
 					recoveryId: Buffer.from(state.recoveryId),
 					epoch: u64be(state.lease.epoch),
@@ -1157,7 +1193,7 @@ export class ReferenceGuardian {
 	// ─────────────── PUT_STATE and SYNC_RECORD (wire 5.2, 5.6) ───────────────
 
 	putState(request: IGuardianPutStateRequest): IGuardianPutStateResponse {
-		return this.appendRecord(request.record, false);
+		return this.appendRecord(request.record, false, request.retainFloor);
 	}
 
 	/**
@@ -1176,7 +1212,8 @@ export class ReferenceGuardian {
 
 	private appendRecord(
 		record: IGuardianRecord,
-		isSync: boolean
+		isSync: boolean,
+		retainFloor?: IGuardianRetainFloor
 	): IGuardianPutStateResponse {
 		try {
 			const gate = this.versionAndSetProblem(
@@ -1229,12 +1266,25 @@ export class ReferenceGuardian {
 					`ciphertext exceeds the advertised limit of ${this.maxCiphertextBytes} bytes`
 				);
 			}
+			if (
+				retainFloor &&
+				(!validU64(retainFloor.sequence) ||
+					retainFloor.sequence === 0n ||
+					!isLen(retainFloor.frameHash, 32) ||
+					!isLen(retainFloor.writerSignature, 64))
+			) {
+				return err(GuardianStatus.ERR_MALFORMED, 'retain floor malformed');
+			}
 			const ciphertextHash = sha256(record.ciphertext);
 			const quarantine = this.quarantineGate(record.recoveryId);
 			if (quarantine) return quarantine;
 
 			const rowBytes =
 				GUARDIAN_RECORD_OVERHEAD_BYTES + record.ciphertext.length;
+			// Judged once, from the row under the write lock, by the cost
+			// below: what the floor frees has to count before the quota gate,
+			// or a set already at its quota could never shrink.
+			let plan: IRetainPlan | IErr | null = null;
 			const cost: IWriteCost = {
 				// An append inside the stored range is a replay or a conflict,
 				// answered from the stored row; anything else that lands costs
@@ -1243,15 +1293,20 @@ export class ReferenceGuardian {
 					if (!ns || !ns.state || !ns.registrationState) return 0;
 					const held = tryParseState(ns.state);
 					if (!held) return 0;
+					plan = retainFloor ? this.retainPlan(ns, record, retainFloor) : null;
+					const floorGrowth =
+						plan && !('status' in plan) ? plan.rowDelta - plan.freed : 0;
 					const inRange =
 						!isGenesisLogHead(held.logHead) &&
 						record.sequence >= held.origin.firstSequence &&
 						record.sequence <= held.logHead.sequence;
-					return inRange ? 0 : rowBytes;
+					return (inRange ? 0 : rowBytes) + floorGrowth;
 				},
 				exact: true
 			};
 			return this.fencedWrite(record.recoveryId, cost, (ns, charge) => {
+				const planned = plan as IRetainPlan | IErr | null;
+				if (planned && 'status' in planned) return planned;
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -1271,6 +1326,24 @@ export class ReferenceGuardian {
 					);
 				}
 				const state = parseStateBytes(ns.state);
+
+				// A freed record can be neither replayed nor compared; steer the
+				// sender to the head, as for any other out-of-place sequence.
+				const retainedFrom = this.retainedFrom(record.recoveryId, state);
+				if (
+					record.sequence >= state.origin.firstSequence &&
+					record.sequence < retainedFrom
+				) {
+					return {
+						...err(
+							GuardianStatus.ERR_SEQUENCE_GAP,
+							`records below ${retainedFrom} were freed at the writer's retain floor; expected sequence ${
+								state.logHead.sequence + 1n
+							}`
+						),
+						current: state
+					};
+				}
 
 				// Idempotency and conflict detection against the occupied slot.
 				if (
@@ -1322,6 +1395,9 @@ export class ReferenceGuardian {
 								GuardianStatus.ERR_BAD_SIGNATURE,
 								'writer signature over the RECORD transcript failed'
 							);
+						}
+						if (planned) {
+							this.applyRetainFloor(record.recoveryId, planned, charge);
 						}
 						return {
 							status: GuardianStatus.OK_DUPLICATE,
@@ -1429,6 +1505,9 @@ export class ReferenceGuardian {
 					u64be(receipt.issuedAt),
 					receipt.signature
 				);
+				if (planned) {
+					this.applyRetainFloor(record.recoveryId, planned, charge);
+				}
 				return {
 					status: GuardianStatus.OK,
 					receipt: this.toReceipt(newState, receipt.issuedAt, receipt.signature)
@@ -1437,6 +1516,115 @@ export class ReferenceGuardian {
 		} catch (error) {
 			return this.internalError(error);
 		}
+	}
+
+	/**
+	 * The first sequence a namespace still stores: its origin, or where the
+	 * writer's retain floor let the records below go.
+	 */
+	private retainedFrom(recoveryId: Buffer, state: GuardianState): bigint {
+		const row = this.store.getRetainFloor(recoveryId);
+		const floor = row ? tryParseState(row.state) : null;
+		return floor ? floor.logHead.sequence + 1n : state.origin.firstSequence;
+	}
+
+	/**
+	 * Inside the write transaction: what a writer's retain floor lets this
+	 * guardian free (wire 5.2), or null when it frees nothing here yet. The
+	 * floor must name a record this guardian holds, above what it already
+	 * freed, by the frame hash it holds there, and carry the current lease's
+	 * signature. That lease must also have written the record, so the floor
+	 * row, which starts at that record's lease, can be checked against the
+	 * writer's signature on every open. A floor this guardian cannot act on
+	 * is not an error: a lagging member meets it before it holds the
+	 * snapshot.
+	 */
+	private retainPlan(
+		ns: IGuardianNamespaceRow,
+		record: IGuardianRecord,
+		floor: IGuardianRetainFloor
+	): IRetainPlan | IErr | null {
+		if (!ns.state || ns.possiblyStale) return null;
+		const state = parseStateBytes(ns.state);
+		if (record.epoch !== state.lease.epoch) return null;
+		if (isGenesisLogHead(state.logHead)) return null;
+		const start = this.retainedFrom(ns.recoveryId, state);
+		if (floor.sequence <= start || floor.sequence > state.logHead.sequence) {
+			return null;
+		}
+		const kept = this.store.getRecord(ns.recoveryId, u64be(floor.sequence));
+		const last = this.store.getRecord(
+			ns.recoveryId,
+			u64be(floor.sequence - 1n)
+		);
+		if (
+			!kept ||
+			!last ||
+			!kept.frameHash.equals(floor.frameHash) ||
+			readU64be(kept.epoch) !== state.lease.epoch
+		) {
+			return null;
+		}
+		const transcript = retainTranscriptHash(this.guardianSetId, {
+			recoveryId: ns.recoveryId,
+			epoch: state.lease.epoch,
+			sequence: floor.sequence,
+			frameHash: floor.frameHash
+		});
+		if (
+			!this.safeVerify(
+				transcript,
+				floor.writerSignature,
+				state.lease.writerPublicKey
+			)
+		) {
+			return err(
+				GuardianStatus.ERR_BAD_SIGNATURE,
+				'writer signature over the RETAIN transcript failed'
+			);
+		}
+		const held = this.store.getRetainFloor(ns.recoveryId);
+		return {
+			start: floor.sequence,
+			floor,
+			// The walk's state as it reaches the first kept record: that
+			// record's lease, and the head of the record before it.
+			checkpoint: {
+				recoveryId: Buffer.from(state.recoveryId),
+				lease: {
+					epoch: state.lease.epoch,
+					writerPublicKey: Buffer.from(state.lease.writerPublicKey)
+				},
+				origin: state.origin,
+				logHead: {
+					sequence: floor.sequence - 1n,
+					frameHash: Buffer.from(last.frameHash),
+					ciphertextHash: Buffer.from(last.ciphertextHash),
+					recordEpoch: readU64be(last.epoch)
+				}
+			},
+			freed: this.store.recordBytesBelow(ns.recoveryId, u64be(floor.sequence)),
+			rowDelta: held ? 0 : GUARDIAN_RETAIN_FLOOR_BYTES
+		};
+	}
+
+	/** Free the records below the floor and store where the walk resumes. */
+	private applyRetainFloor(
+		recoveryId: Buffer,
+		plan: IRetainPlan,
+		charge: (bytes: number) => void
+	): void {
+		this.store.deleteRecordsBelow(recoveryId, u64be(plan.start));
+		const receipt = this.signReceipt(plan.checkpoint);
+		this.store.setRetainFloor({
+			recoveryId: Buffer.from(recoveryId),
+			state: stateBytes(plan.checkpoint),
+			issuedAt: u64be(receipt.issuedAt),
+			signature: receipt.signature,
+			frameHash: Buffer.from(plan.floor.frameHash),
+			writerSignature: Buffer.from(plan.floor.writerSignature)
+		});
+		charge(plan.rowDelta - plan.freed);
 	}
 
 	/**
@@ -2335,6 +2523,22 @@ export class ReferenceGuardian {
 							'local log is behind the certified head; repair with SYNC_RECORD first'
 						);
 					}
+					if (
+						!isGenesisLogHead(head) &&
+						head.sequence < this.retainedFrom(recoveryId, local)
+					) {
+						// Only a quorum-held snapshot becomes a floor, and a
+						// takeover cannot certify below a quorum-held record.
+						this.alarm(
+							recoveryId,
+							GuardianStatus.ERR_CONFLICT,
+							`certified head ${head.sequence} lies below the writer's retain floor`
+						);
+						return err(
+							GuardianStatus.ERR_CONFLICT,
+							'certified head lies below the retain floor; its records were freed'
+						);
+					}
 					if (!isGenesisLogHead(head)) {
 						const stored = this.store.getRecord(
 							recoveryId,
@@ -2765,6 +2969,7 @@ export class ReferenceGuardian {
 			const hadAnything = ns.state !== null || ns.registrationState !== null;
 			this.store.deleteAllRecords(recoveryId, 'rollback', u64be(this.clock()));
 			this.store.deleteAllEpochs(recoveryId);
+			this.store.deleteRetainFloor(recoveryId);
 			this.store.tombstoneNamespace(recoveryId);
 			if (hadAnything) {
 				this.alarm(
@@ -2831,6 +3036,62 @@ export class ReferenceGuardian {
 	}
 
 	/**
+	 * The stored retain floor, judged on its own terms like every persisted
+	 * artifact: this guardian's receipt signature over a non-genesis state
+	 * of this namespace from its root-committed origin, and that state's
+	 * writer's RETAIN signature over the record just after it. The writer's
+	 * is what makes it a floor: this guardian signs many states, and any of
+	 * them would otherwise stand in for the records below it. Null when
+	 * none is stored; 'invalid' when one is and it does not verify.
+	 */
+	private storedRetainFloor(
+		recoveryId: Buffer,
+		regState: GuardianState
+	): GuardianState | null | 'invalid' {
+		const row = this.store.getRetainFloor(recoveryId);
+		if (!row) return null;
+		const state = tryParseState(row.state);
+		const issuedAt = tryReadU64(row.issuedAt);
+		if (
+			state === null ||
+			issuedAt === null ||
+			!isLen(row.signature, 64) ||
+			!state.recoveryId.equals(recoveryId) ||
+			state.origin.firstSequence !== regState.origin.firstSequence ||
+			!state.origin.previousHash.equals(regState.origin.previousHash) ||
+			state.lease.epoch < regState.lease.epoch ||
+			isGenesisLogHead(state.logHead) ||
+			state.logHead.sequence < regState.origin.firstSequence ||
+			!this.safeVerify(
+				receiptTranscriptHash(
+					this.guardianSetId,
+					this.guardianId,
+					state,
+					issuedAt
+				),
+				row.signature,
+				this.guardianId
+			) ||
+			!isLen(row.frameHash, 32) ||
+			!isLen(row.writerSignature, 64) ||
+			!validU64(state.logHead.sequence + 1n) ||
+			!this.safeVerify(
+				retainTranscriptHash(this.guardianSetId, {
+					recoveryId,
+					epoch: state.lease.epoch,
+					sequence: state.logHead.sequence + 1n,
+					frameHash: row.frameHash
+				}),
+				row.writerSignature,
+				state.lease.writerPublicKey
+			)
+		) {
+			return 'invalid';
+		}
+		return state;
+	}
+
+	/**
 	 * Replay the stored history against the state machine's own rules.
 	 * Returns null when everything through the declared state verifies, or
 	 * the last good checkpoint when something does not.
@@ -2878,9 +3139,17 @@ export class ReferenceGuardian {
 			return fail('registration epoch row missing or corrupt');
 		}
 		const pending = epochRows.slice(1);
+		const floor = this.storedRetainFloor(recoveryId, regState);
+		if (floor === 'invalid') return fail('stored retain floor does not verify');
 
+		/**
+		 * A takeover below the retain floor superseded a head whose records
+		 * were freed, so it is judged on its own signed artifacts alone and
+		 * the replay resumes at the floor.
+		 */
 		const applyTakeover = (
-			row: IGuardianEpochRow
+			row: IGuardianEpochRow,
+			belowFloor: GuardianState | null = null
 		): { checkpoint: GuardianState; reason: string } | null => {
 			const rowEpoch = readU64be(row.epoch);
 			if (walkTarget && rowEpoch > walkTarget.lease.epoch) {
@@ -2901,11 +3170,15 @@ export class ReferenceGuardian {
 				!superseded.recoveryId.equals(recoveryId) ||
 				superseded.origin.firstSequence !== sim.origin.firstSequence ||
 				!superseded.origin.previousHash.equals(sim.origin.previousHash) ||
-				!logHeadsEqual(superseded.logHead, sim.logHead) ||
-				superseded.lease.epoch < sim.lease.epoch ||
 				rowEpoch !== superseded.lease.epoch + 1n ||
-				(superseded.lease.epoch === sim.lease.epoch &&
-					!superseded.lease.writerPublicKey.equals(sim.lease.writerPublicKey))
+				(belowFloor
+					? superseded.logHead.sequence > belowFloor.logHead.sequence
+					: !logHeadsEqual(superseded.logHead, sim.logHead) ||
+					  superseded.lease.epoch < sim.lease.epoch ||
+					  (superseded.lease.epoch === sim.lease.epoch &&
+							!superseded.lease.writerPublicKey.equals(
+								sim.lease.writerPublicKey
+							)))
 			) {
 				return fail('takeover certificate does not extend the replayed state');
 			}
@@ -2927,7 +3200,7 @@ export class ReferenceGuardian {
 					writerPublicKey: Buffer.from(row.writerPublicKey)
 				},
 				origin: sim.origin,
-				logHead: sim.logHead
+				logHead: belowFloor ? superseded.logHead : sim.logHead
 			};
 			const receiptState = tryParseState(row.receiptState);
 			if (receiptState === null || !statesEqual(receiptState, post)) {
@@ -2944,9 +3217,29 @@ export class ReferenceGuardian {
 			) {
 				return fail('stored takeover receipt signature failed');
 			}
-			sim = post;
+			if (!belowFloor) sim = post;
 			return null;
 		};
+
+		if (floor) {
+			const atFloor = epochRows.find(
+				(row) => tryReadU64(row.epoch) === floor.lease.epoch
+			);
+			if (
+				!atFloor ||
+				!atFloor.writerPublicKey.equals(floor.lease.writerPublicKey)
+			) {
+				return fail('retain floor names a lease with no epoch row');
+			}
+			while (
+				pending.length > 0 &&
+				(tryReadU64(pending[0].epoch) as bigint) <= floor.lease.epoch
+			) {
+				const problem = applyTakeover(pending.shift()!, floor);
+				if (problem) return problem;
+			}
+			sim = this.cloneState(floor);
+		}
 
 		for (const record of this.store.iterateRecords(recoveryId)) {
 			if (recordRowProblem(record)) {
@@ -2955,9 +3248,13 @@ export class ReferenceGuardian {
 			}
 			const sequence = readU64be(record.sequence);
 			const recordEpoch = readU64be(record.epoch);
-			if (sequence < regState.origin.firstSequence) {
+			if (
+				sequence < regState.origin.firstSequence ||
+				(floor && sequence <= floor.logHead.sequence)
+			) {
 				// Sequence zero never carries a record, and records below the
-				// origin do not exist for this namespace (wire 4.1).
+				// origin do not exist for this namespace (wire 4.1); the ones
+				// below a retain floor were freed with it.
 				impossibleRows = true;
 				continue;
 			}
@@ -3064,12 +3361,26 @@ export class ReferenceGuardian {
 			'rollback',
 			u64be(this.clock())
 		);
+		// A checkpoint the walk reached from the floor keeps it; one below
+		// it (the floor itself failed, or history before it did) starts the
+		// chain at the origin again, and nothing above that checkpoint is
+		// kept anyway.
+		const floor = this.storedRetainFloor(recoveryId, regState);
+		const keepFloor =
+			floor !== null &&
+			floor !== 'invalid' &&
+			checkpoint.logHead.sequence >= floor.logHead.sequence;
+		if (!keepFloor) this.store.deleteRetainFloor(recoveryId);
 		// Shape sweeps: rows with malformed column widths sort arbitrarily and
 		// can dodge the range operations above; removing them here is what
 		// keeps this rollback IDEMPOTENT instead of re-failing on every open.
 		this.store.archiveRecordsBelow(
 			recoveryId,
-			u64be(regState.origin.firstSequence),
+			u64be(
+				keepFloor
+					? (floor as GuardianState).logHead.sequence + 1n
+					: regState.origin.firstSequence
+			),
 			'rollback',
 			u64be(this.clock())
 		);
