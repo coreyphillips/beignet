@@ -1036,5 +1036,69 @@ describe('Funding input pledges', function () {
 				});
 			}
 		}
+
+		describe('a user freeze on a coin the pledge froze survives it (issue #1235)', function () {
+			const userFreezes: Array<{
+				name: string;
+				freeze: () => Promise<void>;
+			}> = [
+				{
+					name: 'freezes it again',
+					freeze: async (): Promise<void> => {
+						const res = await wallet.freezeUtxo({ txid: TXID_X, index: 0 });
+						if (res.isErr()) throw res.error;
+					}
+				},
+				{
+					name: 'unfreezes and refreezes it',
+					freeze: async (): Promise<void> => {
+						const off = await wallet.unfreezeUtxo({ txid: TXID_X, index: 0 });
+						if (off.isErr()) throw off.error;
+						const on = await wallet.freezeUtxo({ txid: TXID_X, index: 0 });
+						if (on.isErr()) throw on.error;
+					}
+				}
+			];
+
+			for (const { name: freezeName, freeze } of userFreezes) {
+				for (const renewed of [false, true]) {
+					for (const { name: endName, end } of endings) {
+						it(`when the user ${freezeName}${
+							renewed ? ', a renewal follows,' : ''
+						} and ${endName}`, async function () {
+							const retained = new bitcoin.Transaction();
+							retained.version = 2;
+							for (const txid of [TXID_X, TXID_Z]) {
+								retained.addInput(Buffer.from(txid, 'hex').reverse(), 0);
+							}
+							retained.addOutput(
+								Buffer.from(`0014${'00'.repeat(20)}`, 'hex'),
+								190_000
+							);
+							const provider = new WalletFundingProvider(wallet as never);
+							await provider.pledgeTransactionInputs(retained.toHex());
+							expect(
+								wallet.listFrozenUtxos().map((f) => f.freezeTag)
+							).to.deep.equal(['funding-pledge', 'funding-pledge']);
+
+							await freeze();
+							if (renewed) {
+								await provider.pledgeTransactionInputs(retained.toHex());
+							}
+
+							await end(provider);
+							expect(
+								wallet.isUtxoFrozen(TXID_X, 0),
+								'the user freeze'
+							).to.equal(true);
+							expect(
+								wallet.isUtxoFrozen(TXID_Z, 0),
+								'the freeze the pledge placed'
+							).to.equal(false);
+						});
+					}
+				}
+			}
+		});
 	});
 });

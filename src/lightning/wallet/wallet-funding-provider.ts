@@ -195,6 +195,12 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * freeze tag, which a wallet need not persist.
 	 */
 	private ownedFreezes = new Set<string>();
+	/**
+	 * Set once the wallet is seen holding PLEDGE_TAG on an entry. Only then
+	 * does an entry without it mean anything: a wallet that drops tags shows
+	 * every freeze untagged, ours included.
+	 */
+	private walletKeepsTags = false;
 	private adoptedStale = false;
 	private static readonly PLEDGE_TTL_MS = 10 * 60_000;
 	/**
@@ -230,6 +236,34 @@ export class WalletFundingProvider implements IFundingProvider {
 		return run;
 	}
 
+	/** Whether the wallet lists a freeze on key that matches tagged. */
+	private hasFreezeEntry(key: string, tagged: boolean): boolean {
+		return (
+			this.wallet
+				.listFrozenUtxos?.()
+				.some(
+					(f) =>
+						`${f.tx_hash}:${f.tx_pos}` === key &&
+						(f.freezeTag === WalletFundingProvider.PLEDGE_TAG) === tagged
+				) === true
+		);
+	}
+
+	/**
+	 * Whether the freeze on key is still the one this provider placed. A user
+	 * freeze on a coin we froze either takes our entry over (the wallet clears
+	 * the tag) or replaces it (unfreeze, then freeze), and neither tells us. On
+	 * a wallet that keeps tags, an entry without ours is someone else's, so
+	 * ownership ends here without an unfreeze. No entry at all says nothing:
+	 * an unfreeze whose write rolls back restores ours.
+	 */
+	private ownsFreeze(key: string): boolean {
+		if (!this.ownedFreezes.has(key)) return false;
+		if (!this.walletKeepsTags || !this.hasFreezeEntry(key, false)) return true;
+		this.ownedFreezes.delete(key);
+		return false;
+	}
+
 	/**
 	 * Freeze the outpoint and remember when we pledged it. Returns the wallet's
 	 * refusal, or null once the coin is held.
@@ -261,9 +295,9 @@ export class WalletFundingProvider implements IFundingProvider {
 			// behind ours whose storage write then rolls it back.
 			res = await this.wallet.freezeUtxoIfUnfrozen(params);
 			owned = res.isErr()
-				? frozenBefore && this.ownedFreezes.has(key)
+				? frozenBefore && this.ownsFreeze(key)
 				: (res as IResultOk<{ created: boolean }>).value.created === true ||
-				  this.ownedFreezes.has(key);
+				  this.ownsFreeze(key);
 		} else {
 			// The wallet answers ok for a coin that is already frozen without
 			// adding an entry, so the freeze is ours only when there was none
@@ -275,14 +309,7 @@ export class WalletFundingProvider implements IFundingProvider {
 			// The wallet decides that under its own lock, and our tag on the entry
 			// left standing is the only sign of it this side can read.
 			owned = frozenBefore
-				? this.ownedFreezes.has(key) ||
-				  this.wallet
-						.listFrozenUtxos?.()
-						.some(
-							(f) =>
-								`${f.tx_hash}:${f.tx_pos}` === key &&
-								f.freezeTag === WalletFundingProvider.PLEDGE_TAG
-						) === true
+				? this.ownsFreeze(key) || this.hasFreezeEntry(key, true)
 				: res !== undefined && !res.isErr();
 		}
 		const refusal = res?.isErr() ? (res as IResultErr).error.message : null;
@@ -293,6 +320,7 @@ export class WalletFundingProvider implements IFundingProvider {
 		else if (this.wallet.isUtxoFrozen?.(txid, vout) === false) {
 			this.ownedFreezes.delete(key);
 		}
+		if (owned && this.hasFreezeEntry(key, true)) this.walletKeepsTags = true;
 		if (refusal === null || renewed) {
 			this.pledged.set(key, Date.now());
 			if (renewed) this.renewedPledges.add(key);
@@ -321,7 +349,7 @@ export class WalletFundingProvider implements IFundingProvider {
 	 */
 	private async releasePledge(txid: string, vout: number): Promise<boolean> {
 		const key = `${txid}:${vout}`;
-		if (!this.ownedFreezes.has(key)) return true;
+		if (!this.ownsFreeze(key)) return true;
 		const res = await this.wallet.unfreezeUtxo?.({ txid, index: vout });
 		const released =
 			!res?.isErr() || this.wallet.isUtxoFrozen?.(txid, vout) === false;
@@ -396,6 +424,7 @@ export class WalletFundingProvider implements IFundingProvider {
 		const frozen = this.wallet.listFrozenUtxos?.() ?? [];
 		for (const f of frozen) {
 			if (f.freezeTag !== WalletFundingProvider.PLEDGE_TAG) continue;
+			this.walletKeepsTags = true;
 			const key = `${f.tx_hash}:${f.tx_pos}`;
 			this.ownedFreezes.add(key);
 			if (this.pledged.has(key)) continue;
