@@ -711,6 +711,35 @@ describe('Funding input pledges', function () {
 				expect(frozen.has(key)).to.equal(true);
 			});
 
+			it(`a freeze that lands after a rolled-back user freeze is lifted when ${name}`, async function () {
+				const { wallet, utxos, frozen, unfrozenLog, payment } = makeWallet([
+					100_000, 100_000
+				]);
+				const key = `${utxos[0].tx_hash}:0`;
+				// The user's freeze is published before its storage write, which
+				// then fails and rolls it back ahead of the queued pledge freeze.
+				frozen.set(key, { tx_hash: utxos[0].tx_hash, tx_pos: 0 });
+				const realFreeze = wallet.freezeUtxo;
+				wallet.freezeUtxo = (p) => {
+					frozen.delete(key);
+					return realFreeze(p);
+				};
+
+				const provider = new WalletFundingProvider(wallet as never);
+				// Stale adoption has already run, so it cannot claim the freeze later.
+				await (
+					provider as unknown as { prunePledges(): Promise<void> }
+				).prunePledges();
+				await provider.pledgeTransactionInputs(
+					retainedSpending(utxos[0], payment.output!).toHex()
+				);
+				expect(frozen.get(key)?.freezeTag).to.equal('funding-pledge');
+				wallet.freezeUtxo = realFreeze;
+
+				await end(provider, key);
+				expect(unfrozenLog).to.include(key);
+			});
+
 			it(`a wallet that drops freeze tags still gets its coin back when ${name}`, async function () {
 				const { wallet, utxos, frozen, unfrozenLog, payment } = makeWallet([
 					100_000, 100_000

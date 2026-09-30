@@ -247,8 +247,19 @@ export class WalletFundingProvider implements IFundingProvider {
 			tag: WalletFundingProvider.PLEDGE_TAG
 		});
 		const refusal = res?.isErr() ? (res as IResultErr).error.message : null;
+		// The freeze read above can be another caller's provisional entry that
+		// its storage write then rolls back, letting ours land after all. The
+		// wallet decides that under its own lock, and our tag on the entry left
+		// standing is the only sign of it this side can read.
 		const owned = frozenBefore
-			? this.ownedFreezes.has(key)
+			? this.ownedFreezes.has(key) ||
+			  this.wallet
+					.listFrozenUtxos?.()
+					.some(
+						(f) =>
+							`${f.tx_hash}:${f.tx_pos}` === key &&
+							f.freezeTag === WalletFundingProvider.PLEDGE_TAG
+					) === true
 			: res !== undefined && refusal === null;
 		if (owned) this.ownedFreezes.add(key);
 		else this.ownedFreezes.delete(key);
