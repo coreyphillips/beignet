@@ -149,6 +149,8 @@ export interface ISerializedHtlcEntry {
 	commitCoverPending?: boolean;
 	addLocallyRevoked?: boolean;
 	removalLocallyRevoked?: boolean;
+	addRemotelyRevoked?: boolean;
+	addCoverPending?: boolean;
 	/** FFOR Variant D voucher marker (see IHtlcEntry.fforVoucher). */
 	fforVoucher?: boolean;
 	/** FFOR Variant D mismatching-add marker (see IHtlcEntry.fforMismatch). */
@@ -212,6 +214,12 @@ export function serializeHtlcEntry(
 		...(e.removalLocallyRevoked !== undefined
 			? { removalLocallyRevoked: e.removalLocallyRevoked }
 			: {}),
+		...(e.addRemotelyRevoked !== undefined
+			? { addRemotelyRevoked: e.addRemotelyRevoked }
+			: {}),
+		...(e.addCoverPending !== undefined
+			? { addCoverPending: e.addCoverPending }
+			: {}),
 		...(e.addRemoteSigned !== undefined
 			? { addRemoteSigned: e.addRemoteSigned }
 			: {}),
@@ -269,6 +277,12 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 				: {}),
 			...(s.removalLocallyRevoked !== undefined
 				? { removalLocallyRevoked: s.removalLocallyRevoked }
+				: {}),
+			...(s.addRemotelyRevoked !== undefined
+				? { addRemotelyRevoked: s.addRemotelyRevoked }
+				: {}),
+			...(s.addCoverPending !== undefined
+				? { addCoverPending: s.addCoverPending }
 				: {}),
 			...(s.addRemoteSigned !== undefined
 				? { addRemoteSigned: s.addRemoteSigned }

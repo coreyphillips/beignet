@@ -421,7 +421,8 @@ import { createTaprootFundingScript } from '../script/funding-taproot';
 import {
 	isTaprootChannel,
 	isAnchorChannel,
-	hasScidAliasChannelType
+	hasScidAliasChannelType,
+	receivedAddIrrevocablyCommitted
 } from '../channel/types';
 import {
 	createOpenerState,
@@ -3527,7 +3528,7 @@ export class LightningNode extends EventEmitter {
 			if (!key.startsWith('received-')) continue;
 			// Only an irrevocably committed HTLC is safe to act on, and one we
 			// already fulfilled or failed is resolved by definition.
-			if (htlc.state !== HtlcState.COMMITTED) continue;
+			if (!receivedAddIrrevocablyCommitted(htlc)) continue;
 			// Never dispatched in the first place: handleRevokeAndAck still owes it
 			// a dispatch and will emit when the round completes.
 			if (htlc.forwardEmitted !== true) continue;
@@ -18099,7 +18100,7 @@ export class LightningNode extends EventEmitter {
 			// upstream HTLC that is irrevocably committed. An add still PENDING
 			// in either commitment is not yet money S can claim, so revealing
 			// against it would convert a failed payment into free credit for R.
-			if (htlcEntry.state !== HtlcState.COMMITTED) {
+			if (!receivedAddIrrevocablyCommitted(htlcEntry)) {
 				return fail(
 					TEMPORARY_NODE_FAILURE,
 					'upstream HTLC is not irrevocably committed'
