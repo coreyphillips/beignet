@@ -152,6 +152,7 @@ import {
 	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
+	receivedAddIrrevocablyCommitted,
 	scidAliasAnnounceRefusal,
 	validateV2ChannelType
 } from './types';
@@ -3698,6 +3699,9 @@ export class Channel {
 		// behavior) let unrelated triggers sign the peer's own add into its
 		// commitment prematurely — "Bad commit_sig" at the peer.
 		entry.addLocallyRevoked = false;
+		// ...and it is not ours to forward or settle until the peer also
+		// revokes for a commitment of ours that carries it.
+		entry.addRemotelyRevoked = false;
 
 		// Deduct from remote balance provisionally
 		this._state.remoteBalanceMsat -= msg.amountMsat;
@@ -4732,6 +4736,16 @@ export class Channel {
 			) {
 				entry.commitCoverPending = true;
 			}
+			// A peer add is only in this signature once we revoked for it, the
+			// same rule buildRemoteCommitment applies.
+			if (
+				entry.addRemotelyRevoked === false &&
+				entry.addLocallyRevoked !== false &&
+				(entry.state === HtlcState.PENDING ||
+					entry.state === HtlcState.COMMITTED)
+			) {
+				entry.addCoverPending = true;
+			}
 		}
 
 		// Materialize the revocation counter (legacy states lack it) BEFORE
@@ -5391,6 +5405,10 @@ export class Channel {
 					entry.removalRemoteCommitted = true;
 				}
 			}
+			if (entry.addCoverPending === true) {
+				entry.addCoverPending = false;
+				entry.addRemotelyRevoked = true;
+			}
 		}
 
 		// Clean up fulfilled/failed HTLCs and finalize balance changes — but
@@ -5461,7 +5479,9 @@ export class Channel {
 		// Emit HTLC_FORWARDED for committed received HTLCs that haven't been
 		// dispatched yet. This happens AFTER the full commitment round-trip
 		// (commitment_signed → revoke_and_ack both ways), ensuring the HTLC
-		// is fully committed on both sides before we try to settle it.
+		// is fully committed on both sides before we try to settle it. This
+		// revoke_and_ack may answer a commitment that left the add out, so
+		// COMMITTED is not enough (receivedAddIrrevocablyCommitted).
 		//
 		// forwardEmitted makes the dispatch edge-triggered. COMMITTED is not a
 		// "needs dispatching" state: a received HTLC sits in it for the entire
@@ -5475,8 +5495,8 @@ export class Channel {
 		const htlcActions: ChannelAction[] = [];
 		for (const entry of this._state.htlcs.values()) {
 			if (
-				entry.state === HtlcState.COMMITTED &&
 				entry.direction === HtlcDirection.RECEIVED &&
+				receivedAddIrrevocablyCommitted(entry) &&
 				entry.forwardEmitted !== true &&
 				// FFOR section 9.5.1 step 3: a parked voucher is never dispatched,
 				// nor a mismatching add the round's unwind will fail.
