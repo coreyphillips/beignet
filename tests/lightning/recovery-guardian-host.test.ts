@@ -725,7 +725,10 @@ describe('guardian host', () => {
 		client: GuardianClient;
 	}> {
 		await served.close();
-		served = await serve(dir, { maxBytesPerSet: QUOTA });
+		served = await serve(dir, {
+			maxBytesPerSet: QUOTA,
+			maxNamespacesPerSet: 1
+		});
 		const alice = makeWriter('alice');
 		const a = clientFor(served, SET_A);
 		closers.push(a.close);
@@ -822,9 +825,11 @@ describe('guardian host', () => {
 		const alice = makeWriter('alice');
 		const bob = makeWriter('bob');
 		const room = GUARDIAN_HOST_RECORD_OVERHEAD_BYTES + 8192;
+		const quota = 2 * GUARDIAN_HOST_REGISTRATION_BYTES + room + 100;
 		await served.close();
 		served = await serve(dir, {
-			maxBytesPerSet: 2 * GUARDIAN_HOST_REGISTRATION_BYTES + room + 100
+			maxBytesPerSet: quota,
+			maxBytesPerNamespace: quota
 		});
 		const a = clientFor(served, SET_A);
 		const b = clientFor(served, SET_A);
@@ -922,7 +927,8 @@ describe('guardian host', () => {
 			maxBytesPerSet:
 				GUARDIAN_HOST_REGISTRATION_BYTES +
 				encodeRotateSetRequest(rotate).length +
-				100
+				100,
+			maxNamespacesPerSet: 1
 		});
 		const a = clientFor(served, SET_A);
 		closers.push(a.close);
@@ -954,7 +960,10 @@ describe('guardian host', () => {
 		const room = GUARDIAN_HOST_RECORD_OVERHEAD_BYTES + 8192;
 		const quota = 2 * GUARDIAN_HOST_REGISTRATION_BYTES + room + 100;
 		await served.close();
-		served = await serve(dir, { maxBytesPerSet: quota });
+		served = await serve(dir, {
+			maxBytesPerSet: quota,
+			maxBytesPerNamespace: quota
+		});
 		const a = clientFor(served, SET_A);
 		closers.push(a.close);
 		expect(
@@ -968,7 +977,8 @@ describe('guardian host', () => {
 		const twin = new GuardianHost({
 			path: dir,
 			guardianSecret: HOST.guardianSecret,
-			maxBytesPerSet: quota
+			maxBytesPerSet: quota,
+			maxBytesPerNamespace: quota
 		});
 		try {
 			expect(twin.servedSetIds().map(hex)).to.deep.equal([hex(setIdOf(SET_A))]);
@@ -998,7 +1008,8 @@ describe('guardian host', () => {
 		const alice = makeWriter('alice');
 		await served.close();
 		served = await serve(dir, {
-			maxBytesPerSet: GUARDIAN_HOST_REGISTRATION_BYTES + 100
+			maxBytesPerSet: GUARDIAN_HOST_REGISTRATION_BYTES + 100,
+			maxNamespacesPerSet: 1
 		});
 		const a = clientFor(served, SET_A);
 		closers.push(a.close);
@@ -1023,7 +1034,8 @@ describe('guardian host', () => {
 		const smallBytes = encodeRotateSetRequest(small).length;
 		await served.close();
 		served = await serve(dir, {
-			maxBytesPerSet: GUARDIAN_HOST_REGISTRATION_BYTES + smallBytes + 100
+			maxBytesPerSet: GUARDIAN_HOST_REGISTRATION_BYTES + smallBytes + 100,
+			maxNamespacesPerSet: 1
 		});
 		const a = clientFor(served, SET_A);
 		closers.push(a.close);
@@ -1126,5 +1138,112 @@ describe('guardian host', () => {
 		} finally {
 			audit.close();
 		}
+	});
+
+	// ─────────────── one namespace cannot spend another's room (issue #1205) ───────────────
+
+	it("keeps one namespace from exhausting the others' room in its set", async () => {
+		const allowance = 32 * 1024;
+		const options = { maxBytesPerSet: 2 * allowance, maxNamespacesPerSet: 2 };
+		await served.close();
+		served = await serve(dir, options);
+		expect(served.host.status().limits.maxBytesPerNamespace).to.equal(
+			allowance
+		);
+		const alice = makeWriter('alice');
+		const bob = makeWriter('bob');
+		const a = clientFor(served, SET_A);
+		closers.push(a.close);
+		for (const who of [alice, bob]) {
+			expect(
+				(await a.client.register(registration(who, SET_A))).status
+			).to.equal(GuardianStatus.OK);
+		}
+		// Alice takes exactly her allowance, with the set still half empty.
+		const fill = record(
+			alice,
+			SET_A,
+			1n,
+			Buffer.alloc(32),
+			crypto.randomBytes(
+				allowance -
+					GUARDIAN_HOST_REGISTRATION_BYTES -
+					GUARDIAN_HOST_RECORD_OVERHEAD_BYTES
+			)
+		);
+		expect((await a.client.putState(fill)).status).to.equal(GuardianStatus.OK);
+		const more = record(alice, SET_A, 2n, fill.frameHash, Buffer.from([1]));
+		const refused = await a.client.putState(more);
+		expect(refused.status).to.equal(GuardianStatus.ERR_QUOTA_EXCEEDED);
+		expect(refused.detail).to.match(/namespace/);
+		const small = record(
+			bob,
+			SET_A,
+			1n,
+			Buffer.alloc(32),
+			crypto.randomBytes(8192)
+		);
+		expect((await a.client.putState(small)).status).to.equal(GuardianStatus.OK);
+		const used = bytesOfSetA();
+		expect(used).to.equal(
+			allowance +
+				GUARDIAN_HOST_REGISTRATION_BYTES +
+				GUARDIAN_HOST_RECORD_OVERHEAD_BYTES +
+				8192
+		);
+
+		// The per-namespace counters come back from the rows after a restart.
+		a.close();
+		await served.close();
+		served = await serve(dir, options);
+		const again = clientFor(served, SET_A);
+		closers.push(again.close);
+		expect(bytesOfSetA()).to.equal(used);
+		expect((await again.client.putState(more)).status).to.equal(
+			GuardianStatus.ERR_QUOTA_EXCEEDED
+		);
+		const next = record(
+			bob,
+			SET_A,
+			2n,
+			small.frameHash,
+			crypto.randomBytes(8192)
+		);
+		expect((await again.client.putState(next)).status).to.equal(
+			GuardianStatus.OK
+		);
+	});
+
+	it('bounds the namespaces a set registers, refusing rather than deleting', async () => {
+		expect(
+			() =>
+				new GuardianHost({
+					path: dir,
+					guardianSecret: HOST.guardianSecret,
+					maxNamespacesPerSet: 0
+				})
+		).to.throw(/maxNamespacesPerSet/);
+		await served.close();
+		served = await serve(dir, { maxNamespacesPerSet: 2 });
+		const a = clientFor(served, SET_A);
+		closers.push(a.close);
+		const [alice, bob, carol] = ['alice', 'bob', 'carol'].map(makeWriter);
+		for (const who of [alice, bob]) {
+			expect(
+				(await a.client.register(registration(who, SET_A))).status
+			).to.equal(GuardianStatus.OK);
+		}
+		const third = await a.client.register(registration(carol, SET_A));
+		expect(third.status).to.equal(GuardianStatus.ERR_QUOTA_EXCEEDED);
+		expect(third.detail).to.match(/at most 2 namespaces/);
+		expect(
+			served.events.filter((e) => e.type === 'guardian:quota-refused')
+		).to.have.length(1);
+		expect(served.host.status().sets[0].namespaces).to.equal(2);
+		expect(bytesOfSetA()).to.equal(2 * GUARDIAN_HOST_REGISTRATION_BYTES);
+		// A namespace already held takes no new slot.
+		expect(
+			(await a.client.register(registration(alice, SET_A))).status
+		).to.equal(GuardianStatus.OK_DUPLICATE);
 	});
 });
