@@ -1225,6 +1225,12 @@ export class DualFundingSession {
 			return 'to_self_delay must be greater than 0';
 		}
 
+		// Same bound as validateAcceptChannelParams. This value is the CSV
+		// on our own to_local output.
+		if (msg.toSelfDelay > 2016) {
+			return `to_self_delay ${msg.toSelfDelay} exceeds maximum 2016`;
+		}
+
 		// Same bound as validateAcceptChannelParams.
 		if (msg.minimumDepth > MAX_MINIMUM_DEPTH) {
 			return `minimum_depth ${msg.minimumDepth} exceeds maximum ${MAX_MINIMUM_DEPTH}`;
