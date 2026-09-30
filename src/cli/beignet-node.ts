@@ -13892,6 +13892,18 @@ export class BeignetNode extends EventEmitter {
 		await this.storage.backup(destPath);
 	}
 
+	/** The live database, its sidecars and the instance lock. */
+	storageFiles(): string[] {
+		const dbPath = path.join(this.dataDir, `${this.networkName}.db`);
+		return [
+			dbPath,
+			`${dbPath}-wal`,
+			`${dbPath}-shm`,
+			`${dbPath}-journal`,
+			path.join(this.dataDir, `${this.networkName}.lock`)
+		];
+	}
+
 	private performScheduledBackup(): void {
 		if (!this.backupPath || this.destroyed) return;
 		this._backupPromise = this.storage

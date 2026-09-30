@@ -24,6 +24,8 @@ import { BeignetError } from './errors';
 import { L402Error } from '../lightning/l402';
 import { ApiResponse, PaymentInfo, RouteHop, SpliceResult } from './types';
 import { getOpenApiSpec } from './openapi';
+import { resolveBackupDestination } from './backup-destination';
+import { configPath, pidPath } from './config';
 import {
 	IWebhookStorage,
 	WEBHOOK_SECRETS_STORAGE_KEY,
@@ -2959,7 +2961,10 @@ async function bootDaemon(
 
 		// ── Database Backup ──
 		'POST /backup': async (body) => {
-			const { destPath } = body as { destPath: string };
+			const { destPath, overwrite } = body as {
+				destPath: string;
+				overwrite?: boolean;
+			};
 			if (!destPath) return failure('INVALID_PARAMS', 'destPath required');
 			if (
 				destPath.includes('..') ||
@@ -2968,7 +2973,13 @@ async function bootDaemon(
 			) {
 				return failure('INVALID_PARAMS', 'Path traversal not allowed');
 			}
-			await node.backup(destPath);
+			const dest = resolveBackupDestination(
+				destPath,
+				[...node.storageFiles(), configPath(), pidPath()],
+				overwrite === true
+			);
+			if ('refusal' in dest) return failure('INVALID_PARAMS', dest.refusal);
+			await node.backup(dest.path);
 			return success({ backed_up: true });
 		},
 		'GET /backup/scb': () => success(node.exportStaticChannelBackup()),

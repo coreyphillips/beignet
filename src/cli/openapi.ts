@@ -1707,9 +1707,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			},
 			'/backup': {
 				post: {
-					summary: 'Create database backup',
+					summary:
+						'Create database backup. An existing destPath needs overwrite: true; the live database, its sidecars, the instance lock, config.json and daemon.pid are always refused',
 					tags: ['Node'],
-					requestBody: bodyContent({ destPath: 'string' }),
+					requestBody: bodyContent({
+						destPath: 'string',
+						overwrite: 'boolean?'
+					}),
 					responses: { '200': { description: 'Backup result' } }
 				}
 			},

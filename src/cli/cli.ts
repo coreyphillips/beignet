@@ -2520,13 +2520,18 @@ async function handleBackup(): Promise<void> {
 			error: {
 				code: 'INVALID_PARAMS',
 				message:
-					'Usage: beignet backup <destPath> | beignet backup scb [destPath] | beignet backup trigger'
+					'Usage: beignet backup <destPath> [--overwrite] | beignet backup scb [destPath] | beignet backup trigger'
 			}
 		});
 		process.exitCode = 1;
 		return;
 	}
-	return outputResult(await httpRequest('POST', '/backup', { destPath: sub }));
+	return outputResult(
+		await httpRequest('POST', '/backup', {
+			destPath: sub,
+			...(hasFlag('--overwrite') ? { overwrite: true } : {})
+		})
+	);
 }
 
 async function handleGuardian(): Promise<void> {
@@ -2867,7 +2872,8 @@ On-chain:
                                          (public keys only, never private)
   recover-fallback-funds [--fee-rate N]  Sweep funding-key fallback UTXOs into
                                          the wallet
-  backup <destPath>                      Create database backup
+  backup <destPath> [--overwrite]        Create database backup (--overwrite
+                                         to replace an existing file)
   backup trigger                         Run the configured scheduled backup now
   backup scb [destPath]                  Export encrypted static channel backup
   backup peer-retrieved                  Show newest SCB returned by a peer
