@@ -53,6 +53,11 @@ import { Feature } from '../../src/lightning/features/flags';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 
+// The raw module.exports object the node reads its intake verifiers from,
+// so replacing one here is seen there.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const gossipValidation = require('../../src/lightning/gossip/validation');
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 function makeBasepoints(): IChannelBasepoints {
@@ -1922,6 +1927,15 @@ describe('Gossip Sync (Phase 5)', function () {
 				8000,
 				REGTEST_CHAIN_HASH
 			);
+			// Lazy intake verifies channel data too (issue #1024), and signing
+			// 8000 real channels would take minutes of pure-JS work. This test
+			// is about batching, so the intake checks pass everything.
+			const verifiers = {
+				verifyChannelAnnouncement: gossipValidation.verifyChannelAnnouncement,
+				verifyChannelUpdate: gossipValidation.verifyChannelUpdate
+			};
+			gossipValidation.verifyChannelAnnouncement = (): boolean => true;
+			gossipValidation.verifyChannelUpdate = (): boolean => true;
 
 			try {
 				await responder.listen(0, '127.0.0.1');
@@ -1953,6 +1967,7 @@ describe('Gossip Sync (Phase 5)', function () {
 					expect(ch?.update2, scid.toString('hex')).to.not.equal(undefined);
 				}
 			} finally {
+				Object.assign(gossipValidation, verifiers);
 				initiator.destroy();
 				responder.destroy();
 			}
@@ -2006,22 +2021,16 @@ describe('Gossip Sync (Phase 5)', function () {
 				);
 			}
 
-			function sendAnnouncement(scidHex: string, i: number): void {
-				const node1 = Buffer.alloc(33, 0x02);
-				node1[32] = i * 2 + 1;
-				const node2 = Buffer.alloc(33, 0x02);
-				node2[32] = i * 2 + 2;
+			// Signed: lazy intake verifies a new channel (issue #1024).
+			function sendAnnouncement(scidHex: string): void {
 				node.handlePeerMessage(
 					peerPubkey,
 					MessageType.CHANNEL_ANNOUNCEMENT,
-					encodeChannelAnnouncementMessage(
-						makeChannelAnnouncement(
-							Buffer.from(scidHex, 'hex'),
-							node1,
-							node2,
-							REGTEST_CHAIN_HASH
-						)
-					)
+					makeSignedChannelAnnouncement(
+						Buffer.from(scidHex, 'hex'),
+						makeSignedChannelKeys(),
+						REGTEST_CHAIN_HASH
+					).payload
 				);
 			}
 
@@ -2044,7 +2053,7 @@ describe('Gossip Sync (Phase 5)', function () {
 				onQuery = (): void => {
 					channelsAtSecondQuery = node.getGraph().getChannelCount();
 				};
-				sendAnnouncement(queries[0][0], 0);
+				sendAnnouncement(queries[0][0]);
 				sendEnd();
 				// The announcement is still queued, so the query waits.
 				expect(queries).to.have.length(1);
@@ -2062,7 +2071,7 @@ describe('Gossip Sync (Phase 5)', function () {
 				statics.GOSSIP_INTAKE_MAX = 2;
 				try {
 					startSync(1500);
-					for (let i = 0; i < 4; i++) sendAnnouncement(queries[0][i], i);
+					for (let i = 0; i < 4; i++) sendAnnouncement(queries[0][i]);
 					sendEnd();
 					await waitFor(() => queries.length === 2);
 					expect(queries[1]).to.eql(queries[0]);
@@ -2088,9 +2097,9 @@ describe('Gossip Sync (Phase 5)', function () {
 				statics.GOSSIP_INTAKE_MAX = 1;
 				try {
 					startSync(1);
-					sendAnnouncement(queries[0][0], 0);
+					sendAnnouncement(queries[0][0]);
 					// The intake is full, so this is dropped.
-					sendAnnouncement(queries[0][0], 0);
+					sendAnnouncement(queries[0][0]);
 					node.getPeerManager()!.emit('peer:disconnect', peerPubkey);
 					await node.flushGossip();
 					expect(node.getGraph().getChannelCount()).to.equal(1);
