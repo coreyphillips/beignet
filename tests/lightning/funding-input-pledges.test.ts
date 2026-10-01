@@ -1257,5 +1257,60 @@ describe('Funding input pledges', function () {
 				});
 			}
 		});
+
+		describe('a refused renewal keeps its freeze through refused user unfreezes on either side (issue #1267)', function () {
+			for (const { name: endName, end } of endings) {
+				it(`when ${endName}`, async function () {
+					const provider = new WalletFundingProvider(wallet as never);
+					// Stale adoption has already run, so it cannot reclaim the freeze later.
+					await (
+						provider as unknown as { prunePledges(): Promise<void> }
+					).prunePledges();
+					await provider.pledgeTransactionInputs(spendingX());
+					expect(wallet.listFrozenUtxos()[0].freezeTag).to.equal(
+						'funding-pledge'
+					);
+
+					// User unfreeze A holds the lock with its removal showing, so the
+					// renewal reads X as unfrozen and queues behind it. A refresh then
+					// drops X, and user unfreeze B queues behind the renewal. Both
+					// user writes are held and refused.
+					let finishA!: () => void;
+					blacklistWrite = new Promise((resolve) => (finishA = resolve));
+					failBlacklistWrite = true;
+					const userA = wallet.unfreezeUtxo({ txid: TXID_X, index: 0 });
+					await tick();
+					expect(wallet.isUtxoFrozen(TXID_X, 0)).to.equal(false);
+					const renewal = provider.pledgeTransactionInputs(spendingX()).then(
+						() => null,
+						(e: Error) => e
+					);
+					await tick();
+					const at = wallet.data.utxos.findIndex((u) => u.tx_hash === TXID_X);
+					const dropped = wallet.data.utxos.splice(at, 1);
+					let finishB!: () => void;
+					blacklistWrite = new Promise((resolve) => (finishB = resolve));
+					const userB = wallet.unfreezeUtxo({ txid: TXID_X, index: 0 });
+					finishA();
+					expect((await userA).isErr()).to.equal(true);
+					expect((await renewal)?.message).to.match(/not known/);
+					expect(wallet.isUtxoFrozen(TXID_X, 0)).to.equal(false);
+
+					finishB();
+					expect((await userB).isErr()).to.equal(true);
+					expect(wallet.listFrozenUtxos()[0].freezeTag).to.equal(
+						'funding-pledge'
+					);
+					failBlacklistWrite = false;
+					wallet.data.utxos.push(...dropped);
+
+					await end(provider);
+					expect(
+						wallet.isUtxoFrozen(TXID_X, 0),
+						'the freeze the pledge placed'
+					).to.equal(false);
+				});
+			}
+		});
 	});
 });
