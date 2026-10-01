@@ -1820,4 +1820,129 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		bob.destroy();
 		alice.destroy();
 	});
+
+	it('a rejected MPP part still owed its fail is failed after a restart, not reaccumulated (#1265)', async function () {
+		this.timeout(20_000);
+		const CAROL_SEED = 43;
+		const dbPath = tempDb('owed-part-restart');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED, storage1);
+		const carol = createNode(CAROL_SEED);
+		wire(alice, bob, { val: false });
+		wire(carol, bob, { val: false });
+		for (const node of [alice, bob, carol]) node.handleNewBlock(1000);
+		const aliceChannelId = openReadyChannel(alice, bob);
+		openReadyChannel(carol, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+		buildDirectGraph(carol, CAROL_SEED, BOB_SEED);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 100_000n,
+			description: 'mpp total mismatch across a restart'
+		});
+		const payPart = (
+			payer: LightningNode,
+			amountMsat: bigint,
+			totalMsat: bigint
+		): void => {
+			const finalCltv = (
+				payer as unknown as { paddedFinalCltvExpiry: () => number }
+			).paddedFinalCltvExpiry();
+			payer.sendPaymentToRoute(
+				{
+					hops: [
+						{
+							pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+							shortChannelId: encodeShortChannelId({
+								block: 500,
+								txIndex: 1,
+								outputIndex: 0
+							}),
+							amountToForwardMsat: amountMsat,
+							outgoingCltvValue: finalCltv
+						}
+					]
+				},
+				invoice.paymentHash,
+				finalCltv,
+				invoice.paymentSecret,
+				totalMsat
+			);
+		};
+
+		payPart(alice, 60_000n, 100_000n);
+		await settle();
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
+		await settle();
+
+		// The owed row's first write fails; the next block must write it.
+		const saveMetadata = storage1.saveMetadata.bind(storage1);
+		let busy = true;
+		storage1.saveMetadata = (key: string, value: string): void => {
+			if (key === 'owed_part_failures' && busy) {
+				busy = false;
+				throw new Error('SQLITE_BUSY');
+			}
+			saveMetadata(key, value);
+		};
+		payPart(carol, 40_000n, 120_000n);
+		await settle();
+		const carolPayment = carol.getPayment(invoice.paymentHash)!;
+		expect(carolPayment.status).to.equal(PaymentStatus.FAILED);
+		expect(carolPayment.failureCode).to.equal(FINAL_INCORRECT_HTLC_AMOUNT);
+		expect(busy, 'the first owed-row write was refused').to.equal(false);
+		expect(storage1.loadMetadata('owed_part_failures')).to.equal(null);
+		bob.handleNewBlock(1000);
+		bob.destroy();
+
+		const aliceKey = `${aliceChannelId.toString('hex')}:0`;
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		expect(
+			JSON.parse(storage2.loadMetadata('owed_part_failures')!),
+			'the owed fail reached disk'
+		).to.deep.equal([
+			{ key: aliceKey, failureCode: FINAL_INCORRECT_HTLC_AMOUNT }
+		]);
+		alice.removeAllListeners('message:outbound');
+		carol.removeAllListeners('message:outbound');
+		const restarted = createNode(BOB_SEED, storage2);
+		await reconnect(restarted, alice);
+
+		const pendingMpp = (
+			restarted as unknown as { pendingMppPayments: Map<string, unknown> }
+		).pendingMppPayments;
+		expect(pendingMpp.size, 'the rejected part was not reaccumulated').to.equal(
+			0
+		);
+		const alicePayment = alice.getPayment(invoice.paymentHash)!;
+		expect(alicePayment.status).to.equal(PaymentStatus.FAILED);
+		expect(alicePayment.failureCode, 'the payer read the mismatch').to.equal(
+			FINAL_INCORRECT_HTLC_AMOUNT
+		);
+		const aliceChannel = restarted
+			.getChannelManager()
+			.getChannel(aliceChannelId)!;
+		expect(aliceChannel.getFullState().htlcs.size, 'no HTLC left').to.equal(0);
+		expect(sharedSecrets(restarted).size, 'no shared secret left').to.equal(0);
+		expect(storage2.loadAllHtlcSharedSecrets()).to.deep.equal([]);
+		expect(
+			storage2.loadMetadata('owed_part_failures'),
+			'the owed fail is retired on disk'
+		).to.equal('[]');
+
+		// Past the height the claim backstop would have force-closed at.
+		for (let height = 1001; height <= 1050; height++) {
+			alice.handleNewBlock(height);
+			restarted.handleNewBlock(height);
+		}
+		expect(aliceChannel.getState()).to.equal(ChannelState.NORMAL);
+
+		restarted.destroy();
+		carol.destroy();
+		alice.destroy();
+	});
 });
