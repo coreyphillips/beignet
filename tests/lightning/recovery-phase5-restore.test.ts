@@ -2159,6 +2159,33 @@ describe('Recovery phase 5: restore driver', () => {
 		expect(loadWriterLease(target).state).to.equal('missing');
 		expect(target.loadRecoveryFrames()).to.have.length(0);
 
+		// A possibly-stale G3 proves no recency, but its signed grant over N
+		// still completes the lower quorum.
+		const staleG3 = new Proxy(clients[2], {
+			get(t, prop, receiver): unknown {
+				if (prop === 'getHead') {
+					return async (id: Buffer): Promise<unknown> => ({
+						...(await t.getHead(id)),
+						possiblyStale: true
+					});
+				}
+				const value = Reflect.get(t, prop, receiver);
+				return typeof value === 'function' ? value.bind(t) : value;
+			}
+		});
+		const staleTarget = openStorage();
+		try {
+			await driverFor(staleTarget, [
+				...bind(served.slice(0, 2)),
+				{ client: staleG3, expectedGuardianId: served[2].id }
+			]).restore();
+			expect.fail('a stale guardian still certifies the lower head');
+		} catch (error) {
+			expect(error).to.be.instanceOf(RestoreRefusedError);
+			expect((error as RestoreRefusedError).reason).to.equal('conflict');
+		}
+		expect(staleTarget.loadRecoveryFrames()).to.have.length(0);
+
 		// With G3 away the quorum over N is out of sight, so a restore runs
 		// and takes G1 up to N+1. G1 still serves its grant over N, so the
 		// conflict is found again once G3 is back.
@@ -2179,6 +2206,7 @@ describe('Recovery phase 5: restore driver', () => {
 		await shutdown(served);
 		live.storage.close();
 		target.close();
+		staleTarget.close();
 		partial.close();
 		again.close();
 	});

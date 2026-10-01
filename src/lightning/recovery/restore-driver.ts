@@ -46,6 +46,7 @@
  * generation is live.
  */
 
+import { createHash } from 'crypto';
 import { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
 import { withStorageTransaction } from '../storage/transaction';
 import {
@@ -652,7 +653,10 @@ export class RestoreDriver {
 	 * that disagree about one epoch, are outside the crash-fault model. Halt
 	 * and surface them; take no channel action.
 	 */
-	private assertNoConflict(readings: IHeadReading[]): void {
+	private assertNoConflict(
+		readings: IHeadReading[],
+		stale: IHeadReading[]
+	): void {
 		// Records are compared by their OWN position (recordEpoch, sequence),
 		// not by the guardian's current lease, which legitimately differs from
 		// the record epoch after a takeover.
@@ -681,8 +685,11 @@ export class RestoreDriver {
 				`conflicting takeover certificates for epoch ${epoch}; ` +
 					'outside the crash-fault model, halting the restore'
 			);
+		// A possibly-stale head proves no recency, but the certificates it
+		// carries are signed, and a grant it hides can be half of a quorum.
+		const evidence = [...readings, ...stale];
 		const byEpoch = new Map<string, IGuardianTakeoverCertificate[]>();
-		for (const reading of readings) {
+		for (const reading of evidence) {
 			for (const cert of reading.certificates) {
 				const key = cert.newEpoch.toString();
 				const seen = byEpoch.get(key) ?? [];
@@ -697,7 +704,7 @@ export class RestoreDriver {
 		// One key may hold certificates over several heads, and a quorum of
 		// them certifies the highest. A quorum at a lower head would fix a
 		// different final head: two quorums for one epoch.
-		for (const bundle of this.certificateBundles(readings)) {
+		for (const bundle of this.certificateBundles(evidence)) {
 			if (bundle.length < this.config.required) continue;
 			const sequences = bundle
 				.map((cert) => cert.supersededState.logHead.sequence)
@@ -1201,7 +1208,7 @@ export class RestoreDriver {
 				`attempt ${attempt} collected ${certificates.length} of ${this.config.required} certificates`
 			);
 			const refreshed = await this.readHeads();
-			this.assertNoConflict(refreshed.readings);
+			this.assertNoConflict(refreshed.readings, refreshed.stale);
 			pool = refreshed.readings;
 			stalePool = refreshed.stale;
 			expected = this.selectHead(pool);
@@ -1295,7 +1302,7 @@ export class RestoreDriver {
 			);
 		}
 		const { readings, stale } = await this.readHeads();
-		this.assertNoConflict(readings);
+		this.assertNoConflict(readings, stale);
 		const target = this.selectHead(readings);
 		this.emit(
 			'head:adopted',
@@ -1333,7 +1340,15 @@ export class RestoreDriver {
 			const head = cert.supersededState.logHead;
 			if (isGenesisLogHead(head)) continue;
 			const record = records.find((r) => r.sequence === head.sequence);
-			if (!record || !record.frameHash.equals(head.frameHash)) {
+			if (
+				!record ||
+				record.epoch !== head.recordEpoch ||
+				!record.frameHash.equals(head.frameHash) ||
+				!createHash('sha256')
+					.update(record.ciphertext)
+					.digest()
+					.equals(head.ciphertextHash)
+			) {
 				throw new RestoreRefusedError(
 					'conflict',
 					`a takeover certificate's head at sequence ${head.sequence} is not on the certified chain; ` +
