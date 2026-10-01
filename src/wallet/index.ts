@@ -3078,9 +3078,10 @@ export class Wallet {
 	/**
 	 * unfreezeUtxo for an automated freezer: lifts the freeze only while every
 	 * entry on the outpoint still carries tag, and reports unfrozen: false when
-	 * one does not. The check runs under the blacklist lock, so a freeze that
-	 * took the entry over, or one whose write then rolls back, has settled
-	 * before it is read.
+	 * one does not. An outpoint with no entry reports unfrozen: true, since
+	 * nothing is left to lift. The check runs under the blacklist lock, so a
+	 * freeze that took the entry over, or one whose write then rolls back, has
+	 * settled before it is read. An error is a refused write: the entry stands.
 	 * @param {string} txid
 	 * @param {number} index
 	 * @param {string} tag
@@ -3092,11 +3093,13 @@ export class Wallet {
 		tag: string;
 	}): Promise<Result<{ unfrozen: boolean }>> {
 		return this.runBlacklistWrite(async () => {
-			const heldByOther = this._data.blacklistedUtxos.some(
+			const entries = this._data.blacklistedUtxos.filter(
 				(frozen) =>
-					frozen.tx_hash === params.txid &&
-					frozen.tx_pos === params.index &&
-					frozen.freezeTag !== params.tag
+					frozen.tx_hash === params.txid && frozen.tx_pos === params.index
+			);
+			if (entries.length === 0) return ok({ unfrozen: true });
+			const heldByOther = entries.some(
+				(frozen) => frozen.freezeTag !== params.tag
 			);
 			if (heldByOther) return ok({ unfrozen: false });
 			const res = await this.unfreezeUtxoLocked(params);
