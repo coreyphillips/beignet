@@ -2530,7 +2530,8 @@ async function handleBackup(): Promise<void> {
 	}
 	return outputResult(
 		await httpRequest('POST', '/backup', {
-			destPath: sub,
+			// The daemon would resolve a relative path against its own cwd.
+			destPath: nodePath.resolve(sub),
 			...(hasFlag('--overwrite') ? { overwrite: true } : {})
 		})
 	);

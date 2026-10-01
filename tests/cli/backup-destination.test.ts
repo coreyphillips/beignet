@@ -66,6 +66,36 @@ function header(file: string): string {
 	return fs.readFileSync(file).subarray(0, 16).toString('latin1');
 }
 
+const REPO = path.resolve(__dirname, '..', '..');
+
+/** Stdout of `beignet <args>` run from `cwd`: a full ts-node load of the CLI. */
+function runCli(cwd: string, home: string, args: string[]): Promise<string> {
+	return new Promise<string>((resolve, reject) => {
+		const child = spawn(
+			process.execPath,
+			[
+				'-r',
+				require.resolve('ts-node/register'),
+				path.join(REPO, 'src', 'cli', 'cli.ts'),
+				...args
+			],
+			{
+				cwd,
+				env: {
+					...process.env,
+					HOME: home,
+					TS_NODE_PROJECT: path.join(REPO, 'tsconfig.json')
+				},
+				stdio: ['ignore', 'pipe', 'ignore']
+			}
+		);
+		let out = '';
+		child.stdout.on('data', (chunk: Buffer) => (out += chunk.toString()));
+		child.on('error', reject);
+		child.on('close', () => resolve(out));
+	});
+}
+
 describe('Backup destination (issue #1230)', () => {
 	describe('resolveBackupDestination', () => {
 		let dir: string;
@@ -273,7 +303,6 @@ describe('Backup destination (issue #1230)', () => {
 		});
 
 		it('reads the path, not the flag, from `beignet backup --overwrite <path>`', async function () {
-			// A full ts-node load of the CLI in a child.
 			this.timeout(120_000);
 			fs.writeFileSync(
 				path.join(home, '.beignet', 'daemon.pid'),
@@ -281,30 +310,42 @@ describe('Backup destination (issue #1230)', () => {
 			);
 			const dest = path.join(home, 'cli-backup.db');
 			fs.writeFileSync(dest, '');
-			const stdout = await new Promise<string>((resolve, reject) => {
-				const child = spawn(
-					process.execPath,
-					[
-						'-r',
-						'ts-node/register',
-						path.join('src', 'cli', 'cli.ts'),
-						'backup',
-						'--overwrite',
-						dest
-					],
-					{
-						cwd: path.resolve(__dirname, '..', '..'),
-						env: { ...process.env, HOME: home },
-						stdio: ['ignore', 'pipe', 'ignore']
-					}
-				);
-				let out = '';
-				child.stdout.on('data', (chunk: Buffer) => (out += chunk.toString()));
-				child.on('error', reject);
-				child.on('close', () => resolve(out));
-			});
+			const stdout = await runCli(REPO, home, ['backup', '--overwrite', dest]);
 			expect(JSON.parse(stdout).ok).to.equal(true);
 			expect(header(dest)).to.equal(SQLITE_HEADER);
+		});
+
+		it('writes a relative path under the CLI directory, not the daemon one (#1251)', async function () {
+			this.timeout(120_000);
+			fs.writeFileSync(
+				path.join(home, '.beignet', 'daemon.pid'),
+				JSON.stringify({ pid: process.pid, port })
+			);
+			const daemonCwd = path.join(home, 'daemon-cwd');
+			const cliCwd = path.join(home, 'cli-cwd');
+			fs.mkdirSync(daemonCwd);
+			fs.mkdirSync(cliCwd);
+			const cwd = process.cwd();
+			process.chdir(daemonCwd);
+			let stdout: string;
+			try {
+				stdout = await runCli(cliCwd, home, ['backup', 'relative.db']);
+			} finally {
+				process.chdir(cwd);
+			}
+			const dest = path.join(cliCwd, 'relative.db');
+			expect(JSON.parse(stdout)).to.deep.equal({
+				ok: true,
+				result: {
+					backed_up: true,
+					path: dest,
+					macPath: backupMacPath(dest)
+				}
+			});
+			expect(header(dest)).to.equal(SQLITE_HEADER);
+			expect(fs.existsSync(path.join(daemonCwd, 'relative.db'))).to.equal(
+				false
+			);
 		});
 	});
 });

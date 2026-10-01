@@ -1708,7 +1708,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/backup': {
 				post: {
 					summary:
-						'Create database backup, with its seed-derived MAC in <destPath>.hmac (returned as macPath; `beignet restore db` needs it). An existing destPath or MAC file needs overwrite: true; the live database, its sidecars, the instance lock, config.json and daemon.pid are always refused',
+						'Create database backup at the canonical destPath (returned as path; a relative destPath resolves against the working directory of the daemon, not the caller), with its seed-derived MAC in <destPath>.hmac (returned as macPath; `beignet restore db` needs it). An existing destPath or MAC file needs overwrite: true; the live database, its sidecars, the instance lock, config.json and daemon.pid are always refused',
 					tags: ['Node'],
 					requestBody: bodyContent({
 						destPath: 'string',
