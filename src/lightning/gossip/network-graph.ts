@@ -614,10 +614,12 @@ export class NetworkGraph {
 
 	/**
 	 * Whether a channel_update could change the graph at all. False when the
-	 * channel is unknown, or when the held update for that direction is
-	 * verified and not older (the verified-over-unverified takeover is then
-	 * out of reach, so a stale re-send can be refused by its timestamp alone,
-	 * never needing its signature).
+	 * channel is unknown, or when the held update for that direction is not
+	 * older and is verified or signed (the takeover of a signatureless slot
+	 * is then out of reach, so a stale re-send can be refused by its
+	 * timestamp alone, never needing its signature). A signed slot settled
+	 * unverified, such as a valid update the codec cannot re-encode, refuses
+	 * stale re-sends here too (issue #1024).
 	 */
 	wouldAcceptChannelUpdate(msg: IChannelUpdateMessage): boolean {
 		if (gossipTimestampTooFarFuture(msg.timestamp)) return false;
@@ -628,7 +630,7 @@ export class NetworkGraph {
 		const existingVerified =
 			direction === 0 ? channel.update1Verified : channel.update2Verified;
 		if (existing && msg.timestamp <= existing.timestamp) {
-			return existingVerified !== true;
+			return existingVerified !== true && isSignatureless(existing.signature);
 		}
 		return true;
 	}

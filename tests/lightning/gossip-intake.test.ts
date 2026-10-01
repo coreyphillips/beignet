@@ -259,13 +259,44 @@ describe('Gossip pre-verification gates (NetworkGraph)', () => {
 		expect(graph.addChannelAnnouncement(ann.msg, { verified: true })).to.equal(
 			true
 		);
-		// Same for a stale update sitting in an unverified slot.
-		const rgsUpdate = buildUpdate(ann, 5000, 1, REGTEST_CHAIN_HASH);
-		expect(
-			graph.applyChannelUpdate(rgsUpdate.msg, { verified: false })
-		).to.equal(true);
+		// Same for a stale update sitting in a signatureless (RGS) slot.
+		const rgsUpdate = {
+			...buildUpdate(ann, 5000, 1, REGTEST_CHAIN_HASH).msg,
+			signature: Buffer.alloc(64)
+		};
+		expect(graph.applyChannelUpdate(rgsUpdate, { verified: false })).to.equal(
+			true
+		);
 		const signedNotNewer = buildUpdate(ann, 5000, 1, REGTEST_CHAIN_HASH);
 		expect(graph.wouldAcceptChannelUpdate(signedNotNewer.msg)).to.equal(true);
+	});
+
+	it('a stale re-send against a signed unverified slot is refused at the gate (issue #1024)', () => {
+		const graph = new NetworkGraph(REGTEST_CHAIN_HASH);
+		const ann = buildAnnouncement(104, REGTEST_CHAIN_HASH);
+		graph.addChannelAnnouncement(ann.msg, { verified: true });
+		// A validly signed update the codec cannot re-encode settles false.
+		const held = buildUpdate(ann, 2000, 0, REGTEST_CHAIN_HASH);
+		expect(graph.applyChannelUpdate(held.msg, { verified: false })).to.equal(
+			true
+		);
+
+		// Apply refuses an older or equal canonical replay, so the gate must
+		// too, or every stale re-send would pay for a signature check.
+		for (const timestamp of [1000, 2000]) {
+			const replay = buildUpdate(ann, timestamp, 0, REGTEST_CHAIN_HASH);
+			expect(graph.wouldAcceptChannelUpdate(replay.msg)).to.equal(false);
+			expect(graph.applyChannelUpdate(replay.msg, { verified: true })).to.equal(
+				false
+			);
+		}
+		expect(
+			graph.getChannel(ann.msg.shortChannelId)!.update1?.timestamp
+		).to.equal(2000);
+
+		// A newer update still passes.
+		const newer = buildUpdate(ann, 3000, 0, REGTEST_CHAIN_HASH);
+		expect(graph.wouldAcceptChannelUpdate(newer.msg)).to.equal(true);
 	});
 
 	it('wrong chain and disordered node ids never reach verification', () => {
