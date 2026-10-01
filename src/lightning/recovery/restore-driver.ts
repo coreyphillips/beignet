@@ -858,7 +858,9 @@ export class RestoreDriver {
 	 * epoch to a fresh key would leave two keys certified for one epoch
 	 * once it returns (issue #1227). A possibly-stale head counts here: a
 	 * rollback drops every epoch row above the state it keeps, so that
-	 * guardian holds no grant its head does not show.
+	 * guardian holds no grant its head does not show. Every committed member
+	 * counts, configured or not: a caller resuming through a subset cannot
+	 * see whether the member it left out accepted (issue #1255).
 	 */
 	private mayBeHeld(
 		attempt: IPendingAttempt,
@@ -877,8 +879,8 @@ export class RestoreDriver {
 				)
 				.map((reading) => reading.guardianId.toString('hex'))
 		);
-		return this.config.guardians.some(
-			(guardian) => !ruledOut.has(guardian.expectedGuardianId.toString('hex'))
+		return this.config.context.members.some(
+			(member) => !ruledOut.has(member.toString('hex'))
 		);
 	}
 
