@@ -1192,6 +1192,12 @@ export class DualFundingSession {
 			return 'to_self_delay must be greater than 0';
 		}
 
+		// Same bound as validateOpenChannelParams. This value is the CSV
+		// on our own to_local output.
+		if (msg.toSelfDelay > 2016) {
+			return `to_self_delay ${msg.toSelfDelay} exceeds maximum 2016`;
+		}
+
 		if (msg.fundingFeeratePerkw === 0) {
 			return 'funding_feerate must be greater than 0';
 		}
@@ -1223,6 +1229,12 @@ export class DualFundingSession {
 
 		if (msg.toSelfDelay === 0) {
 			return 'to_self_delay must be greater than 0';
+		}
+
+		// Same bound as validateAcceptChannelParams. This value is the CSV
+		// on our own to_local output.
+		if (msg.toSelfDelay > 2016) {
+			return `to_self_delay ${msg.toSelfDelay} exceeds maximum 2016`;
 		}
 
 		// Same bound as validateAcceptChannelParams.

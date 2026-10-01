@@ -84,6 +84,7 @@ const node = await BeignetNode.create({
   backupIntervalMs?: number, // backup interval (default: 6 hours, requires backupPath)
   storageEncryption?: boolean, // encrypt SQLite storage at rest with a seed-derived key (default: true)
   dailySpendLimitSats?: number, // COMBINED LN + on-chain daily spending limit in satoshis (resets at midnight UTC; the day's ledger is persisted and survives a restart); see Spending Limits
+  maxPaymentSats?: number,  // per-payment cap in satoshis for Lightning payments and external on-chain sends; see Spending Limits
   connectTimeoutMs?: number,  // timeout for connectPeer() in ms (default: 15000)
   onError?: (error) => void, // error callback for node:error events
   logLevel?: LogLevel,       // 'debug' | 'info' | 'warn' | 'error' | 'silent' (default: 'info')
@@ -163,7 +164,7 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `closeChannel(channelId, acceptStaleStateRisk?)` | `Promise<{ ok, error? }>` | Cooperative close (`await` it): the payout goes to a wallet-scanned address on the change chain, never to a handed-out receive address. A capsule-restored channel needs `acceptStaleStateRisk: true`, because a mutual close signs the balances that row carries |
 | `forceCloseChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error?, commitmentTxid? }` | Force close; the sweep pays the wallet's change chain, never a handed-out receive address. A capsule-restored channel needs `acceptStaleStateRisk: true` |
 | `spliceIn(channelId, amountSats, feerate)` | `SpliceResult` | Add funds to existing channel |
-| `spliceOut(channelId, amountSats, feerate, destinationAddress?)` | `SpliceResult` | Withdraw funds from channel, to the wallet or an external address. An address-targeted splice-out counts amount + fee against `dailySpendLimitSats` |
+| `spliceOut(channelId, amountSats, feerate, destinationAddress?)` | `SpliceResult` | Withdraw funds from channel, to the wallet or an external address. An address-targeted splice-out counts amount + fee against `maxPaymentSats` and `dailySpendLimitSats` |
 | `listChannels()` | `ChannelInfo[]` | List all channels |
 | `getChannel(channelId)` | `ChannelInfo \| null` | Get specific channel |
 | `updateChannelFee(channelId, feeratePerKw)` | `{ ok: true }` | Update channel COMMITMENT feerate via update_fee (min 253). Not the routing fee policy |
@@ -285,8 +286,8 @@ Entries survive a restart. The queue dispatches the restored ones once some chan
 | `getChannelSuggestions(count?)` | `ChannelSuggestion[]` | Graph-based channel open suggestions scored by connectivity, capacity, freshness, relevance |
 | `getFeeSnapshot()` | `FeeSnapshot \| null` | On-chain fee trend analysis with open/wait recommendation |
 | `getAdvisorRecommendations()` | `AdvisorRecommendations` | Liquidity analysis plus the concrete circular-rebalance plan (read-only) |
-| `rebalanceChannel(fromId, toId, amountSats, maxFeeSats)` | `Promise<RebalanceResult>` | Circular rebalance (self-payment out fromId, back in toId). Aborts without paying if the route fee exceeds `maxFeeSats` |
-| `executeRebalances(budgetSatsPerDay?)` | `Promise<RebalanceExecutionSummary>` | Run the advisor's rebalance plan under a per-UTC-day fee budget (persisted; restarts never overspend the day) |
+| `rebalanceChannel(fromId, toId, amountSats, maxFeeSats)` | `Promise<RebalanceResult>` | Circular rebalance (self-payment out fromId, back in toId). Aborts without paying if the route fee exceeds `maxFeeSats`. The fee counts against `dailySpendLimitSats` |
+| `executeRebalances(budgetSatsPerDay?)` | `Promise<RebalanceExecutionSummary>` | Run the advisor's rebalance plan under a per-UTC-day fee budget (persisted; restarts never overspend the day). The fees count against `dailySpendLimitSats` |
 
 Automatic execution is **off by default**: pass `autoRebalance: { enabled: true, budgetSatsPerDay, minImbalancePct }` and/or `autoTuneFees: { enabled: true, intervalMs, floorPpm, ceilPpm }` in `BeignetNodeOptions` to turn on the periodic rebalance scan and routing-fee (ppm) auto-tuning.
 
@@ -300,7 +301,8 @@ Automatic execution is **off by default**: pass `autoRebalance: { enabled: true,
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `backup(destPath)` | `Promise<void>` | Create online backup of SQLite database |
+| `backup(destPath)` | `Promise<void>` | Create online backup of SQLite database, with its MAC in `<destPath>.hmac` |
+| `storageFiles()` | `string[]` | The live database, its sidecars and the instance lock (paths `POST /backup` refuses to write over) |
 
 Storage encryption: the SQLite database is encrypted at rest by default with a
 key derived (HKDF-SHA256) from the wallet's BIP39 seed. Sensitive payloads
@@ -366,7 +368,7 @@ With `peerStorageEnabled` (default true) the node advertises
 | Method / Command | Returns | Description |
 |--------|---------|-------------|
 | `restoreFromScb(encoded)` | `Promise<{ recovering, skipped, channelCount }>` | Recover channels from an SCB blob (daemon: `POST /restore/scb` with `{ encoded }` or `{ path }`; CLI: `beignet restore scb <file>`) |
-| `beignet restore db <backupFile>` | JSON result | Copy a database backup into place (OFFLINE, local CLI operation - no daemon call) |
+| `beignet restore db <backupFile> [--unauthenticated]` | JSON result | Copy an authenticated database backup into place (OFFLINE, local CLI operation - no daemon call) |
 | `restoreFromGuardians()` | `Promise<{ exact, framesApplied, guardiansRepaired, epoch }>` | Restore from guardian replicas and start the node on the restored state (daemon: `POST /recovery/restore` with `{ confirm: true }`; CLI: `beignet recovery restore`) |
 | `restoreFromCapsules({ unfenced? })` | `Promise<{ tier, channelCount, framesApplied, head, newestSeenHead, rejectedCandidates, restartRequired, unfenced?, recovering?, skipped? }>` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session (daemon: `POST /recovery/restore-capsule` with `{ confirm: true }`; CLI: `beignet recovery restore-capsule`). Tier 2 installs the exact state into a fresh database and holds the daemon until a restart; Tier 1 recovers the embedded SCB on the live node |
 
@@ -387,12 +389,21 @@ Three very different restore modes:
 - **DB restore = full state.** `beignet restore db <backupFile>` copies a
   backup made with `backup()` over `<dataDir>/<network>.db`. The node must be
   STOPPED: the command refuses while a daemon holds the wallet's
-  single-instance lock (and holds that lock itself during the copy). The file
-  must be a real SQLite database (16-byte header check), any existing
-  database is preserved at `<db>.pre-restore-<timestamp>` first, and stale
-  `-wal`/`-shm` sidecars are moved aside so they cannot corrupt the restored
-  file. The database is encrypted under the wallet seed, so the node must be
-  started with the same mnemonic that made the backup. WARNING: restoring a
+  single-instance lock (and holds that lock itself during the copy). Every
+  backup is written with an HMAC-SHA256 of the whole file in
+  `<backupFile>.hmac`, under a key derived (HKDF-SHA256, info
+  `beignet-db-backup-mac-v1`) from the wallet seed; keep the two files
+  together. The restore copies the backup next to the database, and refuses
+  it unless that copy is a SQLite database whose MAC matches, so a backup
+  modified by anyone without the mnemonic (or made by another wallet) never
+  replaces the live database. Any existing database is preserved at
+  `<db>.pre-restore-<timestamp>` first, and stale `-wal`/`-shm` sidecars are
+  moved aside so they cannot corrupt the restored file. The database is
+  encrypted under the wallet seed, so the node must be started with the same
+  mnemonic that made the backup. Backups made before backups carried a MAC
+  have no `.hmac` file and are refused; restore one with `--unauthenticated`
+  only when you know it was not modified, then take a fresh backup once the
+  node is running. WARNING: restoring a
   stale database and going online can be unsafe (peers may prove the state
   stale); prefer the most recent backup, and rely on SCB recovery when in
   doubt.
@@ -419,7 +430,9 @@ keeps the same id. A wallet adds it by resolving the node's URI
 while its own writer lease is quarantined (the guardian-only lane), so nodes
 that guard each other can restart together. Quotas
 (`BEIGNET_GUARDIAN_MAX_BYTES`, `_MAX_SETS`) refuse new writes rather than
-delete, because pruning a namespace wedges a stranger's node for good.
+delete, because pruning a namespace wedges a stranger's node for good. A set
+still shrinks: each writer tells its guardians which snapshot all of them
+hold, and they free the records below it.
 
 #### Rotating guardians
 
@@ -702,6 +715,23 @@ Operational notes:
 > opens/splices/funding, and
 > `bumpFeeOnchain`/`boostOnchain` (fee-only). PSBT building is also not
 > counted (nothing is broadcast). Resets at midnight UTC.
+
+`maxPaymentSats` covers the same external on-chain sends, judged on the same
+figure as the daily limit: `sendOnchain`, an address-targeted `spliceOut` and
+`sendDirectFunding` on the amount plus the fee, and `sendMaxOnchain` on the
+whole sweep. The exclusions above are outside it too.
+
+Circular rebalances (`rebalanceChannel`, `executeRebalances` and their routes)
+are refused with `SERVICE_DRAINING` while the node drains, and a drain that
+starts during an `executeRebalances` run stops the plans it has not tried
+yet. The amount comes back to the node, so only the routing fee counts
+against the daily limit. The day is charged `maxFeeSats` (`rebalanceChannel`)
+or the day's advisor fee budget (`executeRebalances`) when the call starts,
+and gets back what the fees actually paid did not use when it returns. A
+rebalance whose wait times out, or that a shutdown or crash interrupts, keeps
+its fee cap charged, because its HTLC can still settle. `maxPaymentSats` does
+not apply to them. Each `autoRebalance` run is an `executeRebalances` call,
+so all of this holds for it too.
 
 Every invoice payment (`payInvoice`, `payInvoiceSafe`, `payInvoiceWithRetry`,
 `sendPaymentAsync`, the queue and their routes) is checked and recorded at the
@@ -1938,7 +1968,8 @@ The config file carries the mnemonic and the API token, so everything under
 `~/.beignet` is created owner-only: `~/.beignet` and the data directory are
 `0700`, and `config.json`, `daemon.pid`, the SQLite database with its `-wal`
 and `-shm` sidecars, the instance lock, database backups (`backup()`, the
-scheduled backup, `POST /backup`), restore copies and SCB exports are `0600`.
+scheduled backup, `POST /backup`) and their `.hmac` files, restore copies and
+SCB exports are `0600`.
 The modes are set explicitly rather than trusted to the umask; the CLI also
 sets the process umask to `077` for `init`, `start`, `backup` and `restore`,
 so anything else those commands create is owner-only too. A library host that
@@ -1991,7 +2022,7 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_RECOVERY_REESTABLISH_HOLD_MS` | peer-storage mode: how long an unknown channel's `channel_reestablish` is held before the BOLT 1 error goes out, an integer in 0..2147483647 (default: 600000; 0 answers immediately; anything else refuses startup) |
 | `BEIGNET_GUARDIAN_SERVE` | `true` to serve the reference guardian to other beignet nodes over bolt8 sessions at this node's Lightning address (docs/RECOVERY-GUARDIAN-WIRE.md 2.7); needs `BEIGNET_LISTEN_PORT`. Independent of this node's own recovery mode, and kept serving while this node's own writer lease is quarantined |
 | `BEIGNET_GUARDIAN_TOKEN` | Bearer token every guardian session must present; unset runs open (BOLT 8 already encrypts and authenticates the host, so the token is an allow-list) |
-| `BEIGNET_GUARDIAN_MAX_BYTES` | Hard bound on the content one served guardian set may store (its encoded rows; SQLite's overhead comes on top): every write, epoch rows and rotations included, that would cross it is refused with `ERR_QUOTA_EXCEEDED` (default 268435456). Refuses, never deletes |
+| `BEIGNET_GUARDIAN_MAX_BYTES` | Hard bound on the content one served guardian set may store (its encoded rows; SQLite's overhead comes on top): every write, epoch rows and rotations included, that would cross it is refused with `ERR_QUOTA_EXCEEDED` (default 268435456). A set registers at most 8 namespaces, and each may store an eighth of this. Refuses, never deletes |
 | `BEIGNET_GUARDIAN_MAX_SETS` | Guardian sets this node will register (default 16) |
 | `BEIGNET_GUARDIAN_MAX_CIPHERTEXT_BYTES` | Advertised per-record ciphertext limit (default 4194304; protocol cap 16 MiB) |
 | `BEIGNET_RECOVERY_AUTO_APPLY` | peer-storage mode: on a boot whose database is empty, apply the best Recovery Capsule the storage peers return with no operator call and rebuild the node in-process on it (exact `true`/`false`; default off; refused outside peer-storage mode). Cannot fence a previous device that still runs |
@@ -2207,7 +2238,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/graph/describe` | `?limit=&offset=` | Paged channel dump (limit defaults to 500, capped at 500) |
 | POST | `/route/query` | `{ destination, amountSats, maxFeeSats? }` | Compute a route WITHOUT sending; hops feed `/payment/send-to-route` |
 | POST | `/payment/send-to-route` | `{ paymentHash, route: { hops }, paymentSecret? }` | Send a payment along an explicit route from `/route/query`. Answers 409 while draining and 403 over a spending limit, judged on what the first hop carries (amount plus every fee); a first hop below the final amount or a negative amount is 400 `INVALID_PARAMS` |
-| POST | `/backup` | `{ destPath }` | Create online database backup |
+| POST | `/backup` | `{ destPath, overwrite? }` | Create online database backup. An existing `destPath` is 400 `INVALID_PARAMS` unless `overwrite: true`; the live database, its sidecars, the instance lock, `config.json` and `daemon.pid` are refused even then |
 | GET | `/backup/scb` | - | Export encrypted static channel backup `{ encoded, channelCount, path }` |
 | POST | `/backup/trigger` | -- | Run the configured scheduled backup now (no-op when `backupPath` unset) |
 | POST | `/message/sign` | `{ message }` | Sign message with the node key (LND-compatible zbase32 signature) |

@@ -126,6 +126,8 @@ export interface IGuardianRotationConfig {
 	allowUnencryptedSecrets?: boolean;
 	/** Backfill passes before giving up on a set that is not catching up. */
 	maxBackfillPasses?: number;
+	/** The journal's frame keys, which retain floors need (guardian-replication.ts). */
+	journalKeys?: { masterKey: Buffer; nodeId: Buffer };
 }
 
 export interface IRotationResult {
@@ -293,7 +295,8 @@ export class GuardianRotation {
 			onEvent: this.config.onReplicationEvent,
 			allowUnencryptedSecrets: this.config.allowUnencryptedSecrets,
 			metaKeyPrefix: this.prefix(generation),
-			generationOverride: generation
+			generationOverride: generation,
+			journalKeys: this.config.journalKeys
 		});
 		const registered = await incoming.registerExisting(this.config.lease);
 		if (registered.accepted < this.config.required) {
@@ -381,6 +384,19 @@ export class GuardianRotation {
 			storage.deleteRecoveryMeta?.(
 				prefix + REPLICATION_META_KEYS.pendingRegistration
 			);
+			// The incoming set's proven floor goes with its watermark. The
+			// journal may name a newer snapshot by the next pass, so the floor
+			// might never be proven again, and a set at its quota stores
+			// nothing more without it.
+			const floor = storage.getRecoveryMeta!(
+				prefix + REPLICATION_META_KEYS.retainFloor
+			);
+			if (floor != null) {
+				storage.setRecoveryMeta!(REPLICATION_META_KEYS.retainFloor, floor);
+				storage.deleteRecoveryMeta?.(
+					prefix + REPLICATION_META_KEYS.retainFloor
+				);
+			}
 			storage.setRecoveryMeta!(
 				JOURNAL_META_KEYS.generation,
 				generation.toString()
@@ -409,7 +425,8 @@ export class GuardianRotation {
 			recoveryRoot: this.config.recoveryRoot,
 			clock: this.clock,
 			onEvent: this.config.onReplicationEvent,
-			allowUnencryptedSecrets: this.config.allowUnencryptedSecrets
+			allowUnencryptedSecrets: this.config.allowUnencryptedSecrets,
+			journalKeys: this.config.journalKeys
 		});
 		// The journal sizes its next snapshot from this replicator before its
 		// first pass has read any INFO.

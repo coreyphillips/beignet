@@ -35,7 +35,11 @@ import os from 'os';
 import path from 'path';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { Network } from '../../src/lightning/invoice/types';
-import { INodeConfig, PaymentStatus } from '../../src/lightning/node/types';
+import {
+	INodeConfig,
+	PaymentDirection,
+	PaymentStatus
+} from '../../src/lightning/node/types';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IStorageBackend } from '../../src/lightning/storage/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -55,6 +59,10 @@ import {
 	IRecoveryCommitResult,
 	SafetyTransition
 } from '../../src/lightning/recovery/types';
+import {
+	FINAL_INCORRECT_HTLC_AMOUNT,
+	MPP_TIMEOUT
+} from '../../src/lightning/onion/types';
 
 function makeSeed(id: number): Buffer {
 	return crypto.createHash('sha256').update(`redispatch-seed-${id}`).digest();
@@ -250,6 +258,11 @@ function buildDirectGraph(
 		payer.getChannelManager().listChannels()[0].getChannelId()!,
 		scid
 	);
+}
+
+function sharedSecrets(node: LightningNode): Map<string, Buffer> {
+	return (node as unknown as { receivedHtlcSharedSecrets: Map<string, Buffer> })
+		.receivedHtlcSharedSecrets;
 }
 
 function tempDb(prefix: string): string {
@@ -1129,7 +1142,9 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 	 * one is refused because alice's channel awaits reestablishment. Bob keeps
 	 * no completed record past a prune unless it still owes a fulfill.
 	 */
-	async function refuseMppPartMidReconnect(): Promise<{
+	async function refuseMppPartMidReconnect(
+		bobStorage?: IStorageBackend
+	): Promise<{
 		alice: LightningNode;
 		bob: LightningNode;
 		carol: LightningNode;
@@ -1141,7 +1156,7 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		const CAROL_SEED = 43;
 		const alice = createNode(ALICE_SEED);
 		const bob = new LightningNode({
-			...makeNodeConfig(BOB_SEED),
+			...makeNodeConfig(BOB_SEED, bobStorage),
 			resourceConfig: { maxCompletedPayments: 0 }
 		});
 		bob.on('error', () => {});
@@ -1207,6 +1222,10 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 			[...aliceHtlcs().values()].map((h) => h.state),
 			'the refused part is still committed'
 		).to.deep.equal([HtlcState.COMMITTED]);
+		expect(
+			[...sharedSecrets(bob).keys()],
+			'only the refused part keeps its shared secret'
+		).to.deep.equal([`${aliceChannelId.toString('hex')}:0`]);
 		expect(bob.pruneCompletedPayments(), 'a record owing a fulfill').to.equal(
 			0
 		);
@@ -1245,6 +1264,7 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 			'the part over alice settled after the reconnect'
 		).to.equal(PaymentStatus.COMPLETED);
 		expect(aliceHtlcs().size, 'no HTLC left on the channel').to.equal(0);
+		expect(sharedSecrets(bob).size, 'no shared secret left').to.equal(0);
 		expect(
 			bob.getChannelManager().getChannel(aliceChannelId)!.getState()
 		).to.equal(ChannelState.NORMAL);
@@ -1252,6 +1272,43 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 
 		carol.destroy();
 		bob.destroy();
+		alice.destroy();
+	});
+
+	it('a settled MPP part is fulfilled, not load-shed, by the restart redispatch (#1194)', async function () {
+		this.timeout(20_000);
+		// A cap of zero sheds every dispatch, so the part settles only if the
+		// redispatch reads the completed payment before the cap.
+		const dbPath = tempDb('redispatch-settled-part');
+		const storage = new SqliteStorage(dbPath);
+		storage.open();
+		const { alice, bob, carol, aliceChannelId, paymentHash } =
+			await refuseMppPartMidReconnect(storage);
+		bob.destroy();
+		alice.removeAllListeners('message:outbound');
+
+		const reopened = new SqliteStorage(dbPath);
+		reopened.open();
+		const restarted = new LightningNode({
+			...makeNodeConfig(BOB_SEED, reopened),
+			maxTotalInFlightHtlcs: 0
+		});
+		restarted.on('error', () => {});
+		restarted.on('node:error', () => {});
+		await reconnect(restarted, alice);
+
+		expect(
+			alice.getPayment(paymentHash)!.status,
+			'the part over alice settled after the restart'
+		).to.equal(PaymentStatus.COMPLETED);
+		expect(
+			restarted.getChannelManager().getChannel(aliceChannelId)!.getFullState()
+				.htlcs.size,
+			'no HTLC left on the channel'
+		).to.equal(0);
+
+		carol.destroy();
+		restarted.destroy();
 		alice.destroy();
 	});
 
@@ -1277,6 +1334,615 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 
 		carol.destroy();
 		bob.destroy();
+		alice.destroy();
+	});
+
+	const spliceExits: Array<[string, unknown[]]> = [
+		['splice:aborted', ['peer aborted']],
+		['splice:reverted', ['aa'.repeat(32), 'bb'.repeat(32)]]
+	];
+	for (const [exit, args] of spliceExits) {
+		it(`an MPP part refused mid-reconnect is fulfilled when a resumed splice exits by ${exit} (#1196)`, async function () {
+			this.timeout(20_000);
+			// The resumed splice returns to NORMAL without splice:complete, and
+			// the reconnect that resumed it never emitted channel:reestablished.
+			const { alice, bob, carol, aliceChannelId, gate, aliceHtlcs } =
+				await refuseMppPartMidReconnect();
+			// Only bob's side is modelled; alice never sees the fulfill.
+			gate.hold = true;
+			const channel = bob.getChannelManager().getChannel(aliceChannelId)!;
+			channel.getFullState().state = ChannelState.NORMAL;
+			channel.getFullState().preReestablishState = null;
+			bob.getChannelManager().emit(exit, aliceChannelId, ...args);
+			await settle();
+
+			expect(
+				[...aliceHtlcs().values()].map((h) => h.state),
+				'the owed fulfill was sent'
+			).to.not.include(HtlcState.COMMITTED);
+
+			carol.destroy();
+			bob.destroy();
+			alice.destroy();
+		});
+	}
+
+	/**
+	 * Bob routes 60k of his own 100k invoice out to alice and back over her
+	 * channel, and alice's connection drops once it commits. Carol pays the
+	 * other 40k, completing the set, and bob's fulfill of the part from alice
+	 * is refused. Bob's record for the hash is his OUTGOING one: a second
+	 * circular part would be refused at send, since bob holds the invoice's
+	 * preimage, so an outside payer is what completes a set bob joined.
+	 */
+	async function refuseCircularMppPartMidReconnect(): Promise<{
+		alice: LightningNode;
+		bob: LightningNode;
+		carol: LightningNode;
+		paymentHash: Buffer;
+		settledKey: string;
+		gate: IWireGate;
+		htlcsWithAlice: () => HtlcState[];
+	}> {
+		const CAROL_SEED = 43;
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED);
+		const carol = createNode(CAROL_SEED);
+		const dead = { val: false };
+		const gate: IWireGate = { hold: false, queue: [] };
+		wire(alice, bob, dead, gate);
+		wire(carol, bob, dead);
+
+		// Bob funds the channel his part leaves on, alice the one it returns on.
+		const outId = openReadyChannel(bob, alice);
+		const inId = openReadyChannel(alice, bob);
+		const outScid = encodeShortChannelId({
+			block: 600,
+			txIndex: 1,
+			outputIndex: 0
+		});
+		const inScid = encodeShortChannelId({
+			block: 600,
+			txIndex: 2,
+			outputIndex: 0
+		});
+		bob.getChannelManager().getChannel(outId)!.getFullState().scidAlias =
+			outScid;
+		alice.registerChannelScid(inId, inScid);
+		openReadyChannel(carol, bob);
+		const carolScid = encodeShortChannelId({
+			block: 600,
+			txIndex: 3,
+			outputIndex: 0
+		});
+
+		const invoice = bob.createInvoice({
+			amountMsat: 100_000n,
+			description: 'circular mpp across a reconnect'
+		});
+		const finalCltv = (
+			bob as unknown as { paddedFinalCltvExpiry: () => number }
+		).paddedFinalCltvExpiry();
+		const bobId = Buffer.from(bob.getNodeId(), 'hex');
+
+		bob.sendPaymentToRoute(
+			{
+				hops: [
+					{
+						pubkey: Buffer.from(alice.getNodeId(), 'hex'),
+						shortChannelId: outScid,
+						amountToForwardMsat: 62_000n,
+						outgoingCltvValue: finalCltv + 40
+					},
+					{
+						pubkey: bobId,
+						shortChannelId: inScid,
+						amountToForwardMsat: 60_000n,
+						outgoingCltvValue: finalCltv
+					}
+				]
+			},
+			invoice.paymentHash,
+			finalCltv,
+			invoice.paymentSecret,
+			100_000n
+		);
+		await settle();
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
+		await settle();
+
+		carol.sendPaymentToRoute(
+			{
+				hops: [
+					{
+						pubkey: bobId,
+						shortChannelId: carolScid,
+						amountToForwardMsat: 40_000n,
+						outgoingCltvValue: finalCltv
+					}
+				]
+			},
+			invoice.paymentHash,
+			finalCltv,
+			invoice.paymentSecret,
+			100_000n
+		);
+		await settle();
+
+		const settledKey = `${inId.toString('hex')}:0`;
+		const payment = bob.getPayment(invoice.paymentHash)!;
+		expect(payment.direction, 'the circular record').to.equal(
+			PaymentDirection.OUTGOING
+		);
+		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+		expect(payment.settledHtlcs).to.include(settledKey);
+		const htlcsWithAlice = (): HtlcState[] =>
+			[outId, inId].flatMap((id) =>
+				[
+					...bob
+						.getChannelManager()
+						.getChannel(id)!
+						.getFullState()
+						.htlcs.values()
+				].map((h) => h.state)
+			);
+		expect(
+			htlcsWithAlice(),
+			'both legs through alice are still committed'
+		).to.deep.equal([HtlcState.COMMITTED, HtlcState.COMMITTED]);
+
+		return {
+			alice,
+			bob,
+			carol,
+			paymentHash: invoice.paymentHash,
+			settledKey,
+			gate,
+			htlcsWithAlice
+		};
+	}
+
+	async function reconnectAliceAndBob(
+		alice: LightningNode,
+		bob: LightningNode,
+		gate: IWireGate
+	): Promise<void> {
+		gate.hold = true;
+		alice.getChannelManager().handlePeerReconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerReconnected(alice.getNodeId());
+		while (gate.queue.length > 0) {
+			const m = gate.queue.shift()!;
+			m.to.handlePeerMessage(m.from, m.type, m.p);
+		}
+		gate.hold = false;
+		await settle();
+	}
+
+	it('a circular MPP part refused mid-reconnect is fulfilled on reestablish (#1193)', async function () {
+		this.timeout(20_000);
+		const { alice, bob, carol, gate, htlcsWithAlice } =
+			await refuseCircularMppPartMidReconnect();
+
+		await reconnectAliceAndBob(alice, bob, gate);
+
+		expect(htlcsWithAlice(), 'both legs through alice settled').to.deep.equal(
+			[]
+		);
+		expect(sharedSecrets(bob).size, 'no shared secret left').to.equal(0);
+
+		carol.destroy();
+		bob.destroy();
+		alice.destroy();
+	});
+
+	it('an outgoing record that does not list the received HTLC leaves it committed (#1193)', async function () {
+		this.timeout(20_000);
+		const { alice, bob, carol, paymentHash, settledKey, gate, htlcsWithAlice } =
+			await refuseCircularMppPartMidReconnect();
+		const payment = bob.getPayment(paymentHash)!;
+		payment.settledHtlcs = payment.settledHtlcs!.filter(
+			(key) => key !== settledKey
+		);
+
+		await reconnectAliceAndBob(alice, bob, gate);
+
+		expect(htlcsWithAlice(), 'nothing authorized the fulfill').to.deep.equal([
+			HtlcState.COMMITTED,
+			HtlcState.COMMITTED
+		]);
+
+		carol.destroy();
+		bob.destroy();
+		alice.destroy();
+	});
+
+	it('a completed MPP leaves no shared secret in memory or storage (#1195)', async function () {
+		this.timeout(20_000);
+		const CAROL_SEED = 43;
+		const storage = new SqliteStorage(tempDb('mpp-secrets'));
+		storage.open();
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED, storage);
+		const carol = createNode(CAROL_SEED);
+		const dead = { val: false };
+		wire(alice, bob, dead);
+		wire(carol, bob, dead);
+		const aliceChannelId = openReadyChannel(alice, bob);
+		const carolChannelId = openReadyChannel(carol, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+		buildDirectGraph(carol, CAROL_SEED, BOB_SEED);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 100_000n,
+			description: 'mpp shared secrets'
+		});
+		const scid = encodeShortChannelId({
+			block: 500,
+			txIndex: 1,
+			outputIndex: 0
+		});
+		const payPart = (payer: LightningNode, amountMsat: bigint): void => {
+			const finalCltv = (
+				payer as unknown as { paddedFinalCltvExpiry: () => number }
+			).paddedFinalCltvExpiry();
+			payer.sendPaymentToRoute(
+				{
+					hops: [
+						{
+							pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+							shortChannelId: scid,
+							amountToForwardMsat: amountMsat,
+							outgoingCltvValue: finalCltv
+						}
+					]
+				},
+				invoice.paymentHash,
+				finalCltv,
+				invoice.paymentSecret,
+				100_000n
+			);
+		};
+
+		payPart(alice, 60_000n);
+		await settle();
+		expect(
+			storage.loadAllHtlcSharedSecrets().length,
+			'the parked part persisted its secret'
+		).to.equal(1);
+
+		payPart(carol, 40_000n);
+		await settle();
+		expect(bob.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+		for (const channelId of [aliceChannelId, carolChannelId]) {
+			expect(
+				bob.getChannelManager().getChannel(channelId)!.getFullState().htlcs
+					.size,
+				'the part was removed from its channel'
+			).to.equal(0);
+		}
+		expect(sharedSecrets(bob).size, 'no secret left in memory').to.equal(0);
+		expect(
+			storage.loadAllHtlcSharedSecrets(),
+			'no secret row left in storage'
+		).to.deep.equal([]);
+
+		carol.destroy();
+		bob.destroy();
+		alice.destroy();
+	});
+
+	it('an MPP part timed out while its channel was reconnecting is failed on reestablish (#1233)', async function () {
+		this.timeout(20_000);
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED);
+		const dead = { val: false };
+		const gate: IWireGate = { hold: false, queue: [] };
+		wire(alice, bob, dead, gate);
+		alice.handleNewBlock(1000);
+		bob.handleNewBlock(1000);
+		const channelId = openReadyChannel(alice, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 100_000n,
+			description: 'mpp timeout across a reconnect'
+		});
+		const finalCltv = (
+			alice as unknown as { paddedFinalCltvExpiry: () => number }
+		).paddedFinalCltvExpiry();
+		alice.sendPaymentToRoute(
+			{
+				hops: [
+					{
+						pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+						shortChannelId: encodeShortChannelId({
+							block: 500,
+							txIndex: 1,
+							outputIndex: 0
+						}),
+						amountToForwardMsat: 60_000n,
+						outgoingCltvValue: finalCltv
+					}
+				]
+			},
+			invoice.paymentHash,
+			finalCltv,
+			invoice.paymentSecret,
+			100_000n
+		);
+		await settle();
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
+		await settle();
+
+		const pendingMpp = (
+			bob as unknown as {
+				pendingMppPayments: Map<string, { createdAt: number }>;
+			}
+		).pendingMppPayments;
+		pendingMpp.get(invoice.paymentHash.toString('hex'))!.createdAt -= 120_000;
+		bob.failTimedOutMppPayments();
+		const htlcs = (): HtlcState[] =>
+			[
+				...bob.getChannelManager().getChannel(channelId)!.getFullState().htlcs
+			].map(([, htlc]) => htlc.state);
+		expect(pendingMpp.size, 'the timed-out set is dropped').to.equal(0);
+		expect(htlcs(), 'the channel could not carry the fail').to.deep.equal([
+			HtlcState.COMMITTED
+		]);
+		expect(
+			[...sharedSecrets(bob).keys()],
+			'the refused part keeps its shared secret'
+		).to.deep.equal([`${channelId.toString('hex')}:0`]);
+
+		await cycleConnection(alice, bob, gate);
+
+		const payment = alice.getPayment(invoice.paymentHash)!;
+		expect(payment.status).to.equal(PaymentStatus.FAILED);
+		expect(payment.failureCode, 'the payer read the timeout').to.equal(
+			MPP_TIMEOUT
+		);
+		expect(htlcs(), 'no HTLC left on the channel').to.deep.equal([]);
+		expect(sharedSecrets(bob).size, 'no shared secret left').to.equal(0);
+
+		// Past the height the claim backstop would have force-closed at.
+		for (let height = 1001; height <= 1050; height++) {
+			alice.handleNewBlock(height);
+			bob.handleNewBlock(height);
+		}
+		expect(bob.getChannelManager().getChannel(channelId)!.getState()).to.equal(
+			ChannelState.NORMAL
+		);
+
+		bob.destroy();
+		alice.destroy();
+	});
+
+	it('an MPP part dropped by a total mismatch while its channel was reconnecting is failed on reestablish (#1252)', async function () {
+		this.timeout(20_000);
+		const CAROL_SEED = 43;
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED);
+		const carol = createNode(CAROL_SEED);
+		const gate: IWireGate = { hold: false, queue: [] };
+		wire(alice, bob, { val: false }, gate);
+		wire(carol, bob, { val: false });
+		for (const node of [alice, bob, carol]) node.handleNewBlock(1000);
+		const aliceChannelId = openReadyChannel(alice, bob);
+		openReadyChannel(carol, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+		buildDirectGraph(carol, CAROL_SEED, BOB_SEED);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 100_000n,
+			description: 'mpp total mismatch across a reconnect'
+		});
+		const payPart = (
+			payer: LightningNode,
+			amountMsat: bigint,
+			totalMsat: bigint
+		): void => {
+			const finalCltv = (
+				payer as unknown as { paddedFinalCltvExpiry: () => number }
+			).paddedFinalCltvExpiry();
+			payer.sendPaymentToRoute(
+				{
+					hops: [
+						{
+							pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+							shortChannelId: encodeShortChannelId({
+								block: 500,
+								txIndex: 1,
+								outputIndex: 0
+							}),
+							amountToForwardMsat: amountMsat,
+							outgoingCltvValue: finalCltv
+						}
+					]
+				},
+				invoice.paymentHash,
+				finalCltv,
+				invoice.paymentSecret,
+				totalMsat
+			);
+		};
+
+		payPart(alice, 60_000n, 100_000n);
+		await settle();
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
+		await settle();
+
+		payPart(carol, 40_000n, 120_000n);
+		await settle();
+		const carolPayment = carol.getPayment(invoice.paymentHash)!;
+		expect(carolPayment.status).to.equal(PaymentStatus.FAILED);
+		expect(carolPayment.failureCode).to.equal(FINAL_INCORRECT_HTLC_AMOUNT);
+		const pendingMpp = (
+			bob as unknown as { pendingMppPayments: Map<string, unknown> }
+		).pendingMppPayments;
+		const htlcs = (): HtlcState[] =>
+			[
+				...bob.getChannelManager().getChannel(aliceChannelId)!.getFullState()
+					.htlcs
+			].map(([, htlc]) => htlc.state);
+		expect(pendingMpp.size, 'the rejected set is dropped').to.equal(0);
+		expect(htlcs(), 'the channel could not carry the fail').to.deep.equal([
+			HtlcState.COMMITTED
+		]);
+		expect(
+			[...sharedSecrets(bob).keys()],
+			'the refused part keeps its shared secret'
+		).to.deep.equal([`${aliceChannelId.toString('hex')}:0`]);
+
+		await cycleConnection(alice, bob, gate);
+
+		const alicePayment = alice.getPayment(invoice.paymentHash)!;
+		expect(alicePayment.status).to.equal(PaymentStatus.FAILED);
+		expect(alicePayment.failureCode, 'the payer read the mismatch').to.equal(
+			FINAL_INCORRECT_HTLC_AMOUNT
+		);
+		expect(htlcs(), 'no HTLC left on the channel').to.deep.equal([]);
+		expect(sharedSecrets(bob).size, 'no shared secret left').to.equal(0);
+
+		// Past the height the claim backstop would have force-closed at.
+		for (let height = 1001; height <= 1050; height++) {
+			for (const node of [alice, bob, carol]) node.handleNewBlock(height);
+		}
+		expect(
+			bob.getChannelManager().getChannel(aliceChannelId)!.getState()
+		).to.equal(ChannelState.NORMAL);
+
+		carol.destroy();
+		bob.destroy();
+		alice.destroy();
+	});
+
+	it('a rejected MPP part still owed its fail is failed after a restart, not reaccumulated (#1265)', async function () {
+		this.timeout(20_000);
+		const CAROL_SEED = 43;
+		const dbPath = tempDb('owed-part-restart');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED, storage1);
+		const carol = createNode(CAROL_SEED);
+		wire(alice, bob, { val: false });
+		wire(carol, bob, { val: false });
+		for (const node of [alice, bob, carol]) node.handleNewBlock(1000);
+		const aliceChannelId = openReadyChannel(alice, bob);
+		openReadyChannel(carol, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+		buildDirectGraph(carol, CAROL_SEED, BOB_SEED);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 100_000n,
+			description: 'mpp total mismatch across a restart'
+		});
+		const payPart = (
+			payer: LightningNode,
+			amountMsat: bigint,
+			totalMsat: bigint
+		): void => {
+			const finalCltv = (
+				payer as unknown as { paddedFinalCltvExpiry: () => number }
+			).paddedFinalCltvExpiry();
+			payer.sendPaymentToRoute(
+				{
+					hops: [
+						{
+							pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+							shortChannelId: encodeShortChannelId({
+								block: 500,
+								txIndex: 1,
+								outputIndex: 0
+							}),
+							amountToForwardMsat: amountMsat,
+							outgoingCltvValue: finalCltv
+						}
+					]
+				},
+				invoice.paymentHash,
+				finalCltv,
+				invoice.paymentSecret,
+				totalMsat
+			);
+		};
+
+		payPart(alice, 60_000n, 100_000n);
+		await settle();
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
+		await settle();
+
+		// The owed row's first write fails; the next block must write it.
+		const saveMetadata = storage1.saveMetadata.bind(storage1);
+		let busy = true;
+		storage1.saveMetadata = (key: string, value: string): void => {
+			if (key === 'owed_part_failures' && busy) {
+				busy = false;
+				throw new Error('SQLITE_BUSY');
+			}
+			saveMetadata(key, value);
+		};
+		payPart(carol, 40_000n, 120_000n);
+		await settle();
+		const carolPayment = carol.getPayment(invoice.paymentHash)!;
+		expect(carolPayment.status).to.equal(PaymentStatus.FAILED);
+		expect(carolPayment.failureCode).to.equal(FINAL_INCORRECT_HTLC_AMOUNT);
+		expect(busy, 'the first owed-row write was refused').to.equal(false);
+		expect(storage1.loadMetadata('owed_part_failures')).to.equal(null);
+		bob.handleNewBlock(1000);
+		bob.destroy();
+
+		const aliceKey = `${aliceChannelId.toString('hex')}:0`;
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		expect(
+			JSON.parse(storage2.loadMetadata('owed_part_failures')!),
+			'the owed fail reached disk'
+		).to.deep.equal([
+			{ key: aliceKey, failureCode: FINAL_INCORRECT_HTLC_AMOUNT }
+		]);
+		alice.removeAllListeners('message:outbound');
+		carol.removeAllListeners('message:outbound');
+		const restarted = createNode(BOB_SEED, storage2);
+		await reconnect(restarted, alice);
+
+		const pendingMpp = (
+			restarted as unknown as { pendingMppPayments: Map<string, unknown> }
+		).pendingMppPayments;
+		expect(pendingMpp.size, 'the rejected part was not reaccumulated').to.equal(
+			0
+		);
+		const alicePayment = alice.getPayment(invoice.paymentHash)!;
+		expect(alicePayment.status).to.equal(PaymentStatus.FAILED);
+		expect(alicePayment.failureCode, 'the payer read the mismatch').to.equal(
+			FINAL_INCORRECT_HTLC_AMOUNT
+		);
+		const aliceChannel = restarted
+			.getChannelManager()
+			.getChannel(aliceChannelId)!;
+		expect(aliceChannel.getFullState().htlcs.size, 'no HTLC left').to.equal(0);
+		expect(sharedSecrets(restarted).size, 'no shared secret left').to.equal(0);
+		expect(storage2.loadAllHtlcSharedSecrets()).to.deep.equal([]);
+		expect(
+			storage2.loadMetadata('owed_part_failures'),
+			'the owed fail is retired on disk'
+		).to.equal('[]');
+
+		// Past the height the claim backstop would have force-closed at.
+		for (let height = 1001; height <= 1050; height++) {
+			alice.handleNewBlock(height);
+			restarted.handleNewBlock(height);
+		}
+		expect(aliceChannel.getState()).to.equal(ChannelState.NORMAL);
+
+		restarted.destroy();
+		carol.destroy();
 		alice.destroy();
 	});
 });

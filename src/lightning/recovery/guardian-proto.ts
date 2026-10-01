@@ -32,6 +32,7 @@ import {
 	IGuardianRecord,
 	IGuardianRegisterNodeRequest,
 	IGuardianRegisterNodeResponse,
+	IGuardianRetainFloor,
 	IGuardianSyncEpochRequest,
 	IGuardianSyncEpochResponse,
 	IGuardianSyncRecordRequest,
@@ -497,35 +498,96 @@ export function decodeRegisterNodeRequest(
 	return request;
 }
 
+function encodeRetainFloor(floor: IGuardianRetainFloor): Buffer {
+	const writer = new ProtoWriter();
+	writer.uint(1, floor.sequence);
+	writer.bytes(2, floor.frameHash);
+	writer.bytes(3, floor.writerSignature);
+	return writer.finish();
+}
+
+function decodeRetainFloor(buf: Buffer): IGuardianRetainFloor {
+	const floor: IGuardianRetainFloor = {
+		sequence: 0n,
+		frameHash: EMPTY(),
+		writerSignature: EMPTY()
+	};
+	const reader = new ProtoReader(buf);
+	while (!reader.done) {
+		const { field, wireType } = reader.readTag();
+		if (field === 1 && wireType === WIRE_VARINT) {
+			floor.sequence = reader.readVarint();
+		} else if (field === 2 && wireType === WIRE_LEN) {
+			floor.frameHash = reader.readBytes();
+		} else if (field === 3 && wireType === WIRE_LEN) {
+			floor.writerSignature = reader.readBytes();
+		} else {
+			reader.skip(wireType);
+		}
+	}
+	return floor;
+}
+
 export function encodePutStateRequest(
 	request: IGuardianPutStateRequest
 ): Buffer {
 	const writer = new ProtoWriter();
 	writer.message(1, encodeRecord(request.record));
+	writer.message(
+		2,
+		request.retainFloor ? encodeRetainFloor(request.retainFloor) : undefined
+	);
 	return writer.finish();
 }
 
 export function decodePutStateRequest(buf: Buffer): IGuardianPutStateRequest {
 	let record = decodeRecord(EMPTY());
+	let retainFloor: IGuardianRetainFloor | undefined;
 	const reader = new ProtoReader(buf);
 	while (!reader.done) {
 		const { field, wireType } = reader.readTag();
 		if (field === 1 && wireType === WIRE_LEN) {
 			record = decodeRecord(reader.readBytes());
+		} else if (field === 2 && wireType === WIRE_LEN) {
+			retainFloor = decodeRetainFloor(reader.readBytes());
 		} else {
 			reader.skip(wireType);
 		}
 	}
-	return { record };
+	return retainFloor ? { record, retainFloor } : { record };
 }
 
-export const encodeSyncRecordRequest = (
+// Field 2 stays PutStateRequest's retain floor, which SYNC_RECORD never
+// carries, so a guardian that predates the bundle skips field 3 unread.
+export function encodeSyncRecordRequest(
 	request: IGuardianSyncRecordRequest
-): Buffer => encodePutStateRequest(request);
+): Buffer {
+	const writer = new ProtoWriter();
+	writer.message(1, encodeRecord(request.record));
+	for (const cert of request.certificates ?? []) {
+		writer.message(3, encodeTakeoverCertificate(cert));
+	}
+	return writer.finish();
+}
 
-export const decodeSyncRecordRequest = (
+export function decodeSyncRecordRequest(
 	buf: Buffer
-): IGuardianSyncRecordRequest => decodePutStateRequest(buf);
+): IGuardianSyncRecordRequest {
+	let record = decodeRecord(EMPTY());
+	const certificates: IGuardianTakeoverCertificate[] = [];
+	const reader = new ProtoReader(buf);
+	while (!reader.done) {
+		const { field, wireType } = reader.readTag();
+		if (field === 1 && wireType === WIRE_LEN) {
+			record = decodeRecord(reader.readBytes());
+		} else if (field === 3 && wireType === WIRE_LEN) {
+			certificates.push(decodeTakeoverCertificate(reader.readBytes()));
+		} else {
+			reader.skip(wireType);
+		}
+	}
+	return certificates.length > 0 ? { record, certificates } : { record };
+}
 
 export function encodeGetHeadRequest(request: IGuardianGetHeadRequest): Buffer {
 	const writer = new ProtoWriter();

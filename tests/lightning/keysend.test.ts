@@ -544,6 +544,45 @@ describe('Keysend: Send Keysend', () => {
 		expect(result.metadata?.agent).to.equal('test');
 		expect(result.metadata?._keysend).to.equal('true');
 	});
+
+	// Issue #1188: the marker says the stored preimage is the sender's own.
+	it('sendKeysend keeps its _keysend marker over caller metadata and relabels', () => {
+		const { alice, bob } = setupKeysendPair(738, 739);
+
+		const result = alice.sendKeysend({
+			destination: Buffer.from(bob.getNodeId(), 'hex'),
+			amountMsat: 50000n,
+			metadata: { _keysend: 'false', purpose: 'tip' }
+		});
+		expect(result.metadata?._keysend).to.equal('true');
+		expect(result.metadata?.purpose).to.equal('tip');
+
+		alice.setPaymentMetadata(result.paymentHash, {
+			_keysend: 'false',
+			purpose: 'gift'
+		});
+		const relabelled = alice.getPayment(result.paymentHash)!;
+		expect(relabelled.metadata?._keysend).to.equal('true');
+		expect(relabelled.metadata?.purpose).to.equal('gift');
+
+		const received = bob.getPayment(result.paymentHash)!;
+		bob.setPaymentMetadata(result.paymentHash, { note: 'x' });
+		expect(received.metadata?._keysend).to.equal('true');
+	});
+
+	it('setPaymentMetadata cannot mark a payment that is not a keysend', () => {
+		const { alice, bob } = setupKeysendPair(740, 741);
+		const invoice = bob.createInvoice({
+			amountMsat: 50000n,
+			description: 'not a keysend'
+		});
+		const sent = alice.sendPayment(invoice.bolt11);
+
+		alice.setPaymentMetadata(sent.paymentHash, { _keysend: 'true' });
+		expect(alice.getPayment(sent.paymentHash)!.metadata).to.not.have.property(
+			'_keysend'
+		);
+	});
 });
 
 // ─────────────── Section 4: Receive Keysend ───────────────

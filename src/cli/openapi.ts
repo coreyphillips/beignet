@@ -444,6 +444,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							content: jsonContent({
 								$ref: '#/components/schemas/DirectFundingSendResult'
 							})
+						},
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: the amount plus the fee ceiling is over dailySpendLimitSats. Nothing was spent'
+						},
+						'409': {
+							description:
+								'SERVICE_DRAINING: the node is draining and takes no new payment. Nothing was spent'
 						}
 					}
 				}
@@ -1699,9 +1707,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			},
 			'/backup': {
 				post: {
-					summary: 'Create database backup',
+					summary:
+						'Create database backup at the canonical destPath (returned as path; a relative destPath resolves against the working directory of the daemon, not the caller), with its seed-derived MAC in <destPath>.hmac (returned as macPath; `beignet restore db` needs it). An existing destPath or MAC file needs overwrite: true; the live database, its sidecars, the instance lock, config.json and daemon.pid are always refused',
 					tags: ['Node'],
-					requestBody: bodyContent({ destPath: 'string' }),
+					requestBody: bodyContent({
+						destPath: 'string',
+						overwrite: 'boolean?'
+					}),
 					responses: { '200': { description: 'Backup result' } }
 				}
 			},
@@ -2197,7 +2209,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/guardian/status': {
 				get: {
 					summary:
-						"The reference guardian this node serves to OTHER beignet nodes over bolt8 sessions (docs/RECOVERY-GUARDIAN-WIRE.md 2.7): serving false when hosting is off; otherwise the guardian id, whether a bearer token is required, open sessions, requests retained in flight, every served set (id, members, namespaces, bytes stored and on disk, registeredAt), the bytes stored across sets, and the limits (per-record ciphertext, bytes per set, sets). Independent of this node's own recovery mode",
+						"The reference guardian this node serves to OTHER beignet nodes over bolt8 sessions (docs/RECOVERY-GUARDIAN-WIRE.md 2.7): serving false when hosting is off; otherwise the guardian id, whether a bearer token is required, open sessions, requests retained in flight, every served set (id, members, namespaces, bytes stored and on disk, registeredAt), the bytes stored across sets, and the limits (per-record ciphertext, bytes per set, namespaces per set, bytes per namespace, sets). Independent of this node's own recovery mode",
 					tags: ['Node'],
 					responses: {
 						'200': {
@@ -2263,7 +2275,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						amountSats: 'number',
 						satsPerVbyte: 'number?'
 					}),
-					responses: { '200': { description: 'Transaction info' } }
+					responses: {
+						'200': { description: 'Transaction info' },
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: amount + fee over maxPaymentSats or dailySpendLimitSats'
+						}
+					}
 				}
 			},
 			'/send-max': {
@@ -2280,7 +2298,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description: 'Transaction info',
 							content: jsonContent({ $ref: '#/components/schemas/TxInfo' })
 						},
-						'400': { description: 'Invalid address/fee rate or no UTXOs' }
+						'400': { description: 'Invalid address/fee rate or no UTXOs' },
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: the whole sweep over maxPaymentSats or dailySpendLimitSats'
+						}
 					}
 				}
 			},
@@ -2484,7 +2506,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							content: jsonContent({
 								$ref: '#/components/schemas/RebalanceExecutionSummary'
 							})
-						}
+						},
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: the advisor fee budget for the day does not fit the remaining dailySpendLimitSats'
+						},
+						'409': { description: 'SERVICE_DRAINING' }
 					}
 				}
 			},
@@ -2508,6 +2535,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'400': {
 							description: 'No route, fee exceeds maxFeeSats, or invalid params'
+						},
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: maxFeeSats does not fit the remaining dailySpendLimitSats'
+						},
+						'409': {
+							description: 'SERVICE_DRAINING, or NODE_DESTROYED during shutdown'
 						}
 					}
 				}
@@ -3325,7 +3359,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'403': {
 							description:
-								'SPENDING_LIMIT_EXCEEDED: an address-targeted splice-out over dailySpendLimitSats'
+								'SPENDING_LIMIT_EXCEEDED: an address-targeted splice-out over maxPaymentSats or dailySpendLimitSats'
 						},
 						'404': { description: 'CHANNEL_NOT_FOUND' },
 						'409': {
@@ -4809,7 +4843,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						skippedBudget: { type: 'integer' },
 						feeSpentMsat: {
 							type: 'string',
-							description: 'Fees spent by this run, msat as decimal string'
+							description:
+								'Fees spent by this run, msat as decimal string. An attempt whose wait timed out counts at its fee cap'
 						},
 						budgetRemainingMsat: {
 							type: 'string',

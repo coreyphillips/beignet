@@ -97,7 +97,8 @@ import {
 	BITCOIN_CHAIN_HASH,
 	MAX_FUNDING_SATOSHIS,
 	DEFAULT_CHANNEL_CONFIG,
-	DEFAULT_MINIMUM_DEPTH
+	DEFAULT_MINIMUM_DEPTH,
+	MAX_MINIMUM_DEPTH
 } from './types';
 import {
 	IAbandonedLocalAdd,
@@ -151,6 +152,7 @@ import {
 	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
+	receivedAddIrrevocablyCommitted,
 	scidAliasAnnounceRefusal,
 	validateV2ChannelType
 } from './types';
@@ -3697,6 +3699,9 @@ export class Channel {
 		// behavior) let unrelated triggers sign the peer's own add into its
 		// commitment prematurely — "Bad commit_sig" at the peer.
 		entry.addLocallyRevoked = false;
+		// ...and it is not ours to forward or settle until the peer also
+		// revokes for a commitment of ours that carries it.
+		entry.addRemotelyRevoked = false;
 
 		// Deduct from remote balance provisionally
 		this._state.remoteBalanceMsat -= msg.amountMsat;
@@ -4731,6 +4736,16 @@ export class Channel {
 			) {
 				entry.commitCoverPending = true;
 			}
+			// A peer add is only in this signature once we revoked for it, the
+			// same rule buildRemoteCommitment applies.
+			if (
+				entry.addRemotelyRevoked === false &&
+				entry.addLocallyRevoked !== false &&
+				(entry.state === HtlcState.PENDING ||
+					entry.state === HtlcState.COMMITTED)
+			) {
+				entry.addCoverPending = true;
+			}
 		}
 
 		// Materialize the revocation counter (legacy states lack it) BEFORE
@@ -5390,6 +5405,10 @@ export class Channel {
 					entry.removalRemoteCommitted = true;
 				}
 			}
+			if (entry.addCoverPending === true) {
+				entry.addCoverPending = false;
+				entry.addRemotelyRevoked = true;
+			}
 		}
 
 		// Clean up fulfilled/failed HTLCs and finalize balance changes — but
@@ -5460,7 +5479,9 @@ export class Channel {
 		// Emit HTLC_FORWARDED for committed received HTLCs that haven't been
 		// dispatched yet. This happens AFTER the full commitment round-trip
 		// (commitment_signed → revoke_and_ack both ways), ensuring the HTLC
-		// is fully committed on both sides before we try to settle it.
+		// is fully committed on both sides before we try to settle it. This
+		// revoke_and_ack may answer a commitment that left the add out, so
+		// COMMITTED is not enough (receivedAddIrrevocablyCommitted).
 		//
 		// forwardEmitted makes the dispatch edge-triggered. COMMITTED is not a
 		// "needs dispatching" state: a received HTLC sits in it for the entire
@@ -5474,8 +5495,8 @@ export class Channel {
 		const htlcActions: ChannelAction[] = [];
 		for (const entry of this._state.htlcs.values()) {
 			if (
-				entry.state === HtlcState.COMMITTED &&
 				entry.direction === HtlcDirection.RECEIVED &&
+				receivedAddIrrevocablyCommitted(entry) &&
 				entry.forwardEmitted !== true &&
 				// FFOR section 9.5.1 step 3: a parked voucher is never dispatched,
 				// nor a mismatching add the round's unwind will fail.
@@ -10243,6 +10264,49 @@ export class Channel {
 			...this._state.remoteConfig,
 			channelReserveSatoshis: derived
 		};
+	}
+
+	/**
+	 * Raise a legacy v2 opener's funding depth on load. Returns whether it
+	 * changed the row (issue #1197).
+	 *
+	 * Before #1034 handleAcceptChannel2 never stored the accepter's
+	 * minimum_depth, so a non-zero-conf v2 opener persisted mid-open still
+	 * carries the 0 from createOpenerState. Restored as is, one confirmation
+	 * readies the channel, and with the peer's channel_ready already in hand
+	 * it goes NORMAL while a shallow reorg can still let the accepter
+	 * double-spend its inputs. The accepter's request is gone, so the stand-in
+	 * is the deepest one we would have accepted.
+	 *
+	 * Only a row still waiting on the chain: a zero-conf type negotiated its
+	 * 0, and past our channel_ready the depth gates nothing. A peer ready
+	 * that arrived first leaves the row in AWAITING_CHANNEL_READY.
+	 */
+	repairLegacyV2OpenerDepth(): boolean {
+		const s = this._state;
+		if (s.role !== ChannelRole.OPENER || s.fundingVersion !== 2) return false;
+		if (s.minimumDepth !== 0 || this._isZeroConfChannelType()) return false;
+		if (s.localChannelReady) return false;
+		const st =
+			s.state === ChannelState.AWAITING_REESTABLISH
+				? s.preReestablishState
+				: s.state;
+		if (
+			st !== ChannelState.AWAITING_TX_SIGNATURES &&
+			st !== ChannelState.AWAITING_FUNDING_CONFIRMED &&
+			st !== ChannelState.AWAITING_CHANNEL_READY
+		) {
+			return false;
+		}
+		s.minimumDepth = MAX_MINIMUM_DEPTH;
+		// A parked confirmation was stamped against depth 0, and reestablish
+		// or the exchange completing would flush channel_ready from it. The
+		// restored watch stamps it again at the raised depth. A row with no
+		// in-flight record parks it in fundingConfirmedLate instead.
+		if (s.v2InFlight) s.v2InFlight.confirmed = false;
+		for (const rec of s.v2PreviousAttempts ?? []) rec.confirmed = false;
+		s.fundingConfirmedLate = undefined;
+		return true;
 	}
 
 	/**

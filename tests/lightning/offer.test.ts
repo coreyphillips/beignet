@@ -208,7 +208,7 @@ describe('BOLT 12: Offers', () => {
 				description: 'full offer',
 				amount: 100_000n,
 				issuer: 'Test Issuer',
-				features: Buffer.from([0x01, 0x02]),
+				features: Buffer.from([0x02, 0x02]),
 				paths: [makeTestBlindedPath()],
 				issuerId: pubkey1,
 				quantityMax: 10n,
@@ -222,7 +222,7 @@ describe('BOLT 12: Offers', () => {
 			expect(decoded.amount).to.equal(100_000n);
 			expect(decoded.issuer).to.equal('Test Issuer');
 			expect(decoded.features).to.not.be.undefined;
-			expect(decoded.features!.equals(Buffer.from([0x01, 0x02]))).to.be.true;
+			expect(decoded.features!.equals(Buffer.from([0x02, 0x02]))).to.be.true;
 			expect(decoded.paths).to.have.length(1);
 			expect(decoded.issuerId!.equals(pubkey1)).to.be.true;
 			expect(decoded.quantityMax).to.equal(10n);
@@ -249,6 +249,27 @@ describe('BOLT 12: Offers', () => {
 			expect(() => decodeOfferTlv(amountNoDesc)).to.throw(
 				'missing required description'
 			);
+		});
+
+		it('rejects an unknown even bit in offer_features', () => {
+			const offer: IOffer = {
+				offerId: Buffer.alloc(32),
+				description: 'features',
+				issuerId: pubkey1
+			};
+			// Init bits (data_loss_protect, upfront_shutdown_script), but BOLT 12
+			// assigns no offer_features bits.
+			for (const bit of [0, 4]) {
+				expect(() =>
+					decodeOfferTlv(
+						encodeOfferTlv({ ...offer, features: featureBits(bit) })
+					)
+				).to.throw(`Offer requires unknown feature bit ${bit}`);
+			}
+			const { offer: decoded } = decodeOfferTlv(
+				encodeOfferTlv({ ...offer, features: featureBits(5) })
+			);
+			expect(decoded.features!.equals(featureBits(5))).to.be.true;
 		});
 	});
 

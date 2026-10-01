@@ -36,6 +36,7 @@ import {
 	releaseInstanceLock
 } from '../../src/cli/instance-lock';
 import { restoreDbFile } from '../../src/cli/restore';
+import { backupMacPath, writeBackupMac } from '../../src/cli/backup-mac';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 
 const MNEMONIC =
@@ -375,8 +376,10 @@ describe('secret file modes (issue #1004)', function () {
 				// An operator's copy and an older release's live file: both 0644.
 				fs.chmodSync(p, 0o644);
 			}
+			const macKey = Buffer.alloc(32, 1);
+			await writeBackupMac(macKey, backupFile);
 			const result = await withUmask(0o022, () =>
-				restoreDbFile(backupFile, dbPath, 1234)
+				restoreDbFile(backupFile, dbPath, { macKey, now: 1234 })
 			);
 			expect(octal(modeOf(dbPath)), 'restored database').to.equal('0600');
 			expect(result.preRestorePath).to.be.a('string');
@@ -418,6 +421,10 @@ describe('secret file modes (issue #1004)', function () {
 
 					await node.backup(backupDest);
 					expect(octal(modeOf(backupDest)), 'backup').to.equal('0600');
+					expect(
+						octal(modeOf(backupMacPath(backupDest))),
+						'backup MAC'
+					).to.equal('0600');
 
 					const scb = node.exportStaticChannelBackup();
 					expect(octal(modeOf(scb.path)), 'channels.scb').to.equal('0600');

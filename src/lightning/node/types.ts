@@ -797,7 +797,10 @@ export interface IRebalanceExecutionSummary {
 	succeeded: number;
 	failed: number;
 	skippedBudget: number;
-	/** Fees spent by THIS run in msat. */
+	/**
+	 * Fees spent by THIS run in msat. An attempt whose wait timed out counts
+	 * at its fee cap, since its HTLC can still settle.
+	 */
 	feeSpentMsat: bigint;
 	/** Remaining fee budget for the current UTC day in msat. */
 	budgetRemainingMsat: bigint;
@@ -1625,6 +1628,13 @@ export class LightningPaymentError extends Error {
 		this.code = code;
 	}
 }
+
+/**
+ * waitForPayment giving up before the payment resolved. An HTLC it sent can
+ * still be out, and still settle. rebalanceChannel also throws it for a
+ * payment cancelled while its HTLC is out.
+ */
+export class PaymentWaitTimeoutError extends Error {}
 
 /**
  * A request refused for the caller's own arguments: as written it cannot be

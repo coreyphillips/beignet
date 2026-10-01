@@ -16,7 +16,10 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { INodeConfig } from '../../src/lightning/node/types';
+import {
+	INodeConfig,
+	PaymentWaitTimeoutError
+} from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
@@ -25,6 +28,7 @@ import {
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
+import { MessageType } from '../../src/lightning/message/types';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
 	planRebalances,
@@ -558,6 +562,132 @@ describe('Advisor Execution (M3 phases 1+2)', function () {
 			}
 		});
 
+		it('waits out a dispatch that throws once its HTLC is out', async function () {
+			const setup = setupCircular();
+			const { alice, abChannelId, caChannelId } = setup;
+			try {
+				alice.prependListener(
+					'message:outbound',
+					(_pubkey: string, type: number) => {
+						if (type === MessageType.UPDATE_ADD_HTLC) {
+							throw new Error('transport failed');
+						}
+					}
+				);
+				let error: unknown;
+				try {
+					await alice.rebalanceChannel({
+						fromChannelId: abChannelId,
+						toChannelId: caChannelId,
+						amountSats: 100_000n,
+						maxFeeSats: 10n,
+						timeoutMs: 50
+					});
+				} catch (err) {
+					error = err;
+				}
+				// Timed out rather than failed, so the fee cap is not given back.
+				expect(error).to.be.instanceOf(PaymentWaitTimeoutError);
+				expect(
+					alice
+						.listPayments()
+						.filter((p) => p.direction === 'OUTGOING' && p.status === 'PENDING')
+				).to.have.length(1);
+			} finally {
+				setup.destroy();
+			}
+		});
+
+		it('reports a cancel with the HTLC still out as a timeout', async function () {
+			const setup = setupCircular();
+			const { alice, abChannelId, caChannelId } = setup;
+			try {
+				// Nothing reaches Bob, so the HTLC stays out.
+				alice.removeAllListeners('message:outbound');
+				const pending = alice.rebalanceChannel({
+					fromChannelId: abChannelId,
+					toChannelId: caChannelId,
+					amountSats: 100_000n,
+					maxFeeSats: 10n,
+					timeoutMs: 10_000
+				});
+				const [sent] = alice
+					.listPayments()
+					.filter((p) => p.direction === 'OUTGOING');
+				alice.failPayment(sent.paymentHash);
+				let error: unknown;
+				try {
+					await pending;
+				} catch (err) {
+					error = err;
+				}
+				expect(alice.hasHtlcInFlight(sent.paymentHash)).to.equal(true);
+				expect(error).to.be.instanceOf(PaymentWaitTimeoutError);
+			} finally {
+				setup.destroy();
+			}
+		});
+
+		it('refuses a fresh rebalance once a shutdown starts, letting the one out settle (issue #1264)', async function () {
+			const setup = setupCircular();
+			const { alice, bob, charlie, abChannelId, caChannelId } = setup;
+			try {
+				// Alice's messages to Bob wait until released, so the first
+				// HTLC is still out when the shutdown starts.
+				let holding = true;
+				const held: Array<[number, Buffer]> = [];
+				let adds = 0;
+				alice.removeAllListeners('message:outbound');
+				alice.on(
+					'message:outbound',
+					(pubkey: string, type: number, payload: Buffer) => {
+						if (pubkey === charlie.getNodeId()) {
+							charlie.handlePeerMessage(alice.getNodeId(), type, payload);
+							return;
+						}
+						if (type === MessageType.UPDATE_ADD_HTLC) adds++;
+						if (holding) held.push([type, payload]);
+						else bob.handlePeerMessage(alice.getNodeId(), type, payload);
+					}
+				);
+				const options = {
+					fromChannelId: abChannelId,
+					toChannelId: caChannelId,
+					amountSats: 100_000n,
+					maxFeeSats: 10n
+				};
+
+				const first = alice.rebalanceChannel(options);
+				expect(adds).to.equal(1);
+				const shutdown = alice.gracefulShutdown(10_000);
+				let error: unknown;
+				try {
+					await alice.rebalanceChannel(options);
+				} catch (err) {
+					error = err;
+				}
+				expect((error as Error | undefined)?.message).to.equal(
+					'Node destroyed'
+				);
+				expect(adds).to.equal(1);
+				expect(
+					alice.listPayments().filter((p) => p.direction === 'OUTGOING')
+				).to.have.length(1);
+
+				holding = false;
+				for (const [type, payload] of held.splice(0)) {
+					bob.handlePeerMessage(alice.getNodeId(), type, payload);
+				}
+				const result = await first;
+				await shutdown;
+
+				expect(result.feeMsat > 0n, 'the first rebalance settled').to.be.true;
+				expect(adds).to.equal(1);
+			} finally {
+				setup.destroy();
+			}
+		});
+
 		it('rejects unusable inputs', async function () {
 			const setup = setupCircular();
 			const { alice, abChannelId, caChannelId } = setup;
@@ -681,6 +811,217 @@ describe('Advisor Execution (M3 phases 1+2)', function () {
 				expect(localMsat(alice, caChannelId)).to.equal(0n);
 			} finally {
 				setup.destroy();
+			}
+		});
+
+		it('counts a timed-out attempt at its fee cap', async function () {
+			const setup = setupCircular();
+			const { alice } = setup;
+			try {
+				alice.rebalanceChannel = async (): Promise<never> => {
+					throw new PaymentWaitTimeoutError(
+						'waitForPayment timed out after 60000ms'
+					);
+				};
+				const summary = await alice.executeRebalanceRecommendations({
+					budgetSatsPerDay: 10
+				});
+				expect(summary.failed).to.equal(1);
+				expect(summary.feeSpentMsat).to.equal(10_000n);
+				expect(summary.budgetRemainingMsat).to.equal(0n);
+			} finally {
+				setup.destroy();
+			}
+		});
+
+		it('persists each fee cap before dispatch and gives back what the route did not take', async function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const setup = setupCircular(storage);
+			const { alice } = setup;
+			const persisted = (): string =>
+				(
+					JSON.parse(storage.loadMetadata('advisor:rebalance-budget')!) as {
+						spentFeeMsat: string;
+					}
+				).spentFeeMsat;
+			try {
+				let duringCall: string | undefined;
+				alice.rebalanceChannel = async (): Promise<never> => {
+					// What a crash here would leave on disk.
+					duringCall = persisted();
+					throw new Error('No circular route');
+				};
+				const failed = await alice.executeRebalanceRecommendations({
+					budgetSatsPerDay: 10
+				});
+				expect(duringCall).to.equal('10000');
+				expect(failed.feeSpentMsat).to.equal(0n);
+				expect(persisted()).to.equal('0');
+
+				alice.rebalanceChannel = async (): Promise<{
+					paymentHash: Buffer;
+					amountMsat: bigint;
+					feeMsat: bigint;
+					hops: number;
+				}> => {
+					duringCall = persisted();
+					return {
+						paymentHash: Buffer.alloc(32, 1),
+						amountMsat: 500_000_000n,
+						feeMsat: 3_000n,
+						hops: 3
+					};
+				};
+				const settled = await alice.executeRebalanceRecommendations({
+					budgetSatsPerDay: 10
+				});
+				expect(duringCall).to.equal('10000');
+				expect(settled.feeSpentMsat).to.equal(3_000n);
+				expect(persisted()).to.equal('3000');
+			} finally {
+				setup.destroy();
+				storage.close();
+			}
+		});
+
+		it('leaves the fee cap on the day it was charged when the outcome lands after midnight', async function () {
+			const setup = setupCircular();
+			const { alice } = setup;
+			const clock = LightningNode as unknown as { currentUtcDay: () => string };
+			const realDay = clock.currentUtcDay;
+			try {
+				clock.currentUtcDay = (): string => '2026-01-01';
+				alice.rebalanceChannel = async (): Promise<never> => {
+					clock.currentUtcDay = (): string => '2026-01-02';
+					throw new Error('No circular route');
+				};
+				const summary = await alice.executeRebalanceRecommendations({
+					budgetSatsPerDay: 10
+				});
+				// A give-back taken off the new day would leave it more than
+				// its whole budget.
+				expect(summary.budgetRemainingMsat).to.equal(10_000n);
+			} finally {
+				clock.currentUtcDay = realDay;
+				setup.destroy();
+			}
+		});
+
+		it('spends no more than one budget in a run that crosses midnight', async function () {
+			const setup = setupCircular();
+			const { alice } = setup;
+			const clock = LightningNode as unknown as { currentUtcDay: () => string };
+			const realDay = clock.currentUtcDay;
+			try {
+				const plans = alice.planRebalanceRecommendations();
+				alice.planRebalanceRecommendations = (): typeof plans => [
+					plans[0],
+					plans[0]
+				];
+				clock.currentUtcDay = (): string => '2026-01-01';
+				let calls = 0;
+				alice.rebalanceChannel = async (): Promise<{
+					paymentHash: Buffer;
+					amountMsat: bigint;
+					feeMsat: bigint;
+					hops: number;
+				}> => {
+					calls++;
+					clock.currentUtcDay = (): string => '2026-01-02';
+					return {
+						paymentHash: Buffer.alloc(32, 1),
+						amountMsat: 500_000_000n,
+						feeMsat: 10_000n,
+						hops: 3
+					};
+				};
+				const summary = await alice.executeRebalanceRecommendations({
+					budgetSatsPerDay: 10
+				});
+				expect(calls).to.equal(1);
+				expect(summary.skippedBudget).to.equal(1);
+				expect(summary.feeSpentMsat).to.equal(10_000n);
+			} finally {
+				clock.currentUtcDay = realDay;
+				setup.destroy();
+			}
+		});
+
+		it('leaves the pairs after a stop request untried', async function () {
+			const setup = setupCircular();
+			const { alice } = setup;
+			try {
+				const plans = alice.planRebalanceRecommendations();
+				alice.planRebalanceRecommendations = (): typeof plans => [
+					plans[0],
+					plans[0]
+				];
+				let calls = 0;
+				alice.rebalanceChannel = async (): Promise<never> => {
+					calls++;
+					throw new Error('No circular route');
+				};
+				const summary = await alice.executeRebalanceRecommendations({
+					budgetSatsPerDay: 10,
+					stopRequested: () => calls > 0
+				});
+				expect(calls).to.equal(1);
+				expect(summary.attempts).to.have.length(1);
+			} finally {
+				setup.destroy();
+			}
+		});
+
+		it('sends no further pair once a shutdown starts, without a drain (issue #1250)', async function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const setup = setupCircular(storage);
+			const { alice, bob, charlie } = setup;
+			try {
+				const [plan] = alice.planRebalanceRecommendations();
+				const small = { ...plan, amountSats: 100_000n };
+				alice.planRebalanceRecommendations = (): Array<typeof small> => [
+					small,
+					small
+				];
+				// Alice's messages to Bob wait until released, so the first
+				// HTLC is still out when the shutdown starts.
+				let holding = true;
+				const held: Array<[number, Buffer]> = [];
+				let adds = 0;
+				alice.removeAllListeners('message:outbound');
+				alice.on(
+					'message:outbound',
+					(pubkey: string, type: number, payload: Buffer) => {
+						if (pubkey === charlie.getNodeId()) {
+							charlie.handlePeerMessage(alice.getNodeId(), type, payload);
+							return;
+						}
+						if (type === MessageType.UPDATE_ADD_HTLC) adds++;
+						if (holding) held.push([type, payload]);
+						else bob.handlePeerMessage(alice.getNodeId(), type, payload);
+					}
+				);
+
+				const run = alice.executeRebalanceRecommendations({
+					budgetSatsPerDay: 100
+				});
+				expect(adds).to.equal(1);
+				const shutdown = alice.gracefulShutdown(10_000);
+				holding = false;
+				for (const [type, payload] of held.splice(0)) {
+					bob.handlePeerMessage(alice.getNodeId(), type, payload);
+				}
+				const summary = await run;
+				await shutdown;
+
+				expect(summary.attempts).to.have.length(1);
+				expect(summary.attempts[0].status).to.equal('SUCCEEDED');
+				expect(adds).to.equal(1);
+			} finally {
+				setup.destroy();
+				storage.close();
 			}
 		});
 
