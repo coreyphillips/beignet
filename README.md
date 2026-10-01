@@ -160,6 +160,7 @@ const res = await Wallet.create({
 ```
 
 - **Failover:** with multiple servers the wallet rotates through them in order on connect/reconnect failure, then through hardcoded fallback peers for the network, with a per-server cooldown so dead servers are not hammered. Inspect `wallet.electrum.currentServer` and `wallet.electrum.rotationCount`.
+- **Certificate verification:** by default a TLS Electrum connection is encrypted but the server certificate is not checked, because the client library dials with `rejectUnauthorized: false`. An on-path attacker can therefore stand in for the server. On Node, pass `tls: withTlsVerification(tls)` to accept only certificates that chain to a trusted CA and match the host, and add `{ fingerprints: ['AB:CD:…'] }` to also accept self-signed servers by SHA-256 fingerprint (`openssl x509 -noout -fingerprint -sha256`). The CLI/daemon and React Native do not verify yet.
 - **Fee source:** `'electrum'` queries only the connected server via `blockchain.estimatefee`, so fee lookups never leak to mempool.space/blocktank over clearnet. `'auto'` prefers Electrum and falls back to HTTP. All remote rates are clamped to 5000 sat/vB.
 - **Networks:** mainnet, testnet, regtest and signet work end to end (wallet, Electrum, CLI/daemon `--network signet`, Lightning chain hash and `tbs` invoice prefix). Signet shares testnet address formats and coin type 1.
 - **BIP21:** `encodeBip21({ address, amountSats?, label?, message? })` builds a `bitcoin:` URI.
@@ -194,7 +195,7 @@ The full read-only surface works: address generation, gap-limit scanning, Electr
 <details>
 <summary><b>Hardware wallets and external signers (PSBT)</b></summary>
 
-`buildPsbt` runs the normal setup (coin selection, change, fee) but stops before signing, returning a base64 PSBT populated with what a hardware signer needs: `witnessUtxo` (or `nonWitnessUtxo` for legacy p2pkh), `redeemScript` for p2sh-p2wpkh, `tapInternalKey` plus `tapBip32Derivation` for p2tr, and `bip32Derivation` on every wallet input. Works on full and watch-only wallets.
+`buildPsbt` runs the normal setup (coin selection, change, fee) but stops before signing, returning a base64 PSBT populated with what a hardware signer needs: `witnessUtxo` (or `nonWitnessUtxo` for legacy p2pkh), `redeemScript` for p2sh-p2wpkh, `tapInternalKey` plus `tapBip32Derivation` for p2tr, and `bip32Derivation` on every wallet input. The change output carries the same derivation fields, so the signer shows it as change rather than as a second recipient. Works on full and watch-only wallets.
 
 ```typescript
 // 1. Build (never touches private keys)
@@ -205,9 +206,10 @@ const { psbtBase64, fee, vsizeEstimate } = build.value;
 // 2. Sign externally (hardware wallet, HWI, another machine)
 const signedBase64 = await myHardwareWallet.signPsbt(psbtBase64);
 
-// 3. Import: validates a signature on EVERY input, finalizes, does NOT broadcast
+// 3. Import: checks the inputs and outputs are the ones built, validates a
+//    signature on EVERY input, finalizes, does NOT broadcast
 const imported = wallet.importSignedPsbt(signedBase64);
-if (imported.isErr()) return; // missing/invalid signatures are rejected loudly
+if (imported.isErr()) return; // changed outputs, missing/invalid signatures are rejected loudly
 const { txHex, txid } = imported.value;
 
 // 4. Broadcast when ready
@@ -217,9 +219,11 @@ await wallet.broadcastTransaction(txHex);
 const combined = wallet.combinePsbts([copyA, copyB]);
 ```
 
+`importSignedPsbt` finalizes only a PSBT that spends the same inputs to the same outputs as one this wallet instance built (it remembers its 50 most recent builds, in memory). To import a PSBT built elsewhere, or after a restart, pass the unsigned PSBT as the second argument: `wallet.importSignedPsbt(signedBase64, psbtBase64)`. Inputs the signer already finalized are refused, since their signatures cannot be checked.
+
 For watch-only wallets the true master fingerprint is unknowable from an account xpub, so the xpub's parent fingerprint is used: signers should locate keys by derivation path.
 
-Also on the daemon (`POST /psbt/build`, `/psbt/import-signed`, `/psbt/combine`) and the CLI (`beignet psbt build|import-signed|combine`).
+Also on the daemon (`POST /psbt/build`, `/psbt/import-signed`, `/psbt/combine`) and the CLI (`beignet psbt build|import-signed|combine`). A restart forgets the daemon's builds, so the import there takes the unsigned PSBT too: `unsignedPsbtBase64` on the route, a second argument to `beignet psbt import-signed`.
 
 </details>
 
@@ -262,10 +266,11 @@ const signedA = walletA.signPsbtWithOurKey(unsigned);
 const signedB = walletB.signPsbtWithOurKey(unsigned);
 if (signedA.isErr() || signedB.isErr()) return;
 
-// 5. Combine, finalize at threshold, broadcast.
+// 5. Combine, finalize at threshold, broadcast. The coordinator did not build
+//    the PSBT, so it checks the combined one against the unsigned original.
 const combined = coordinator.combinePsbts([signedA.value, signedB.value]);
 if (combined.isErr()) return;
-const finalized = coordinator.importSignedPsbt(combined.value); // 2-of-3 met
+const finalized = coordinator.importSignedPsbt(combined.value, unsigned); // 2-of-3 met
 if (finalized.isErr()) return;
 await coordinator.broadcastTransaction(finalized.value.txHex);
 
@@ -750,7 +755,9 @@ Recommended safeguards in production:
 - Cap exposure with `maxPaymentSats` and `dailySpendLimitSats`. Both count a
   payment's amount plus its routing-fee cap, so the fee cannot slip past them:
   the cap is `maxFeeSats`/`maxFeeMsat` when you pass one, and 1% of the
-  amount (never below 50 sats) when you do not.
+  amount (never below 50 sats) when you do not. Both also cover external
+  on-chain sends (amount plus fee); see the Spending Limits section of
+  `src/cli/README.md`.
 - Call `validatePayment()` before every send.
 - Set `backupPath` for automated database backups, and keep an SCB (`beignet backup scb`).
 - Keep `~/.beignet` and the data directory owner-only. The CLI creates them `0700`/`0600` and tightens an older config on load; check them again after copying files between hosts.

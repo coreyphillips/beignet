@@ -60,6 +60,7 @@ import {
 	TLV_INVOICE_ERROR
 } from '../../src/lightning/offer';
 import { ITlvRecord } from '../../src/lightning/message/tlv';
+import { FeatureFlags } from '../../src/lightning/features/flags';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { OnionMessageManager } from '../../src/lightning/onion-message/manager';
 import { findRouteToBlindedPath } from '../../src/lightning/gossip/pathfinding';
@@ -112,6 +113,18 @@ describe('BOLT 12: Offers', () => {
 		);
 		request.signature = schnorrSign(sigHash, privkey2);
 		return encodeInvoiceRequestTlv(request, offerTlv);
+	}
+
+	function withExtraRecords(tlv: Buffer, extra: ITlvRecord[]): Buffer {
+		const records = [...getTlvRecords(tlv), ...extra];
+		records.sort((a, b) => (a.type < b.type ? -1 : a.type > b.type ? 1 : 0));
+		return Buffer.concat(records.map(encodeTlvRecordRaw));
+	}
+
+	function featureBits(...bits: number[]): Buffer {
+		const flags = FeatureFlags.empty();
+		for (const bit of bits) flags.setBit(bit);
+		return flags.toBuffer();
 	}
 
 	// ── Truncated U64 ───────────────────────────────────────────────
@@ -195,7 +208,7 @@ describe('BOLT 12: Offers', () => {
 				description: 'full offer',
 				amount: 100_000n,
 				issuer: 'Test Issuer',
-				features: Buffer.from([0x01, 0x02]),
+				features: Buffer.from([0x02, 0x02]),
 				paths: [makeTestBlindedPath()],
 				issuerId: pubkey1,
 				quantityMax: 10n,
@@ -209,7 +222,7 @@ describe('BOLT 12: Offers', () => {
 			expect(decoded.amount).to.equal(100_000n);
 			expect(decoded.issuer).to.equal('Test Issuer');
 			expect(decoded.features).to.not.be.undefined;
-			expect(decoded.features!.equals(Buffer.from([0x01, 0x02]))).to.be.true;
+			expect(decoded.features!.equals(Buffer.from([0x02, 0x02]))).to.be.true;
 			expect(decoded.paths).to.have.length(1);
 			expect(decoded.issuerId!.equals(pubkey1)).to.be.true;
 			expect(decoded.quantityMax).to.equal(10n);
@@ -236,6 +249,27 @@ describe('BOLT 12: Offers', () => {
 			expect(() => decodeOfferTlv(amountNoDesc)).to.throw(
 				'missing required description'
 			);
+		});
+
+		it('rejects an unknown even bit in offer_features', () => {
+			const offer: IOffer = {
+				offerId: Buffer.alloc(32),
+				description: 'features',
+				issuerId: pubkey1
+			};
+			// Init bits (data_loss_protect, upfront_shutdown_script), but BOLT 12
+			// assigns no offer_features bits.
+			for (const bit of [0, 4]) {
+				expect(() =>
+					decodeOfferTlv(
+						encodeOfferTlv({ ...offer, features: featureBits(bit) })
+					)
+				).to.throw(`Offer requires unknown feature bit ${bit}`);
+			}
+			const { offer: decoded } = decodeOfferTlv(
+				encodeOfferTlv({ ...offer, features: featureBits(5) })
+			);
+			expect(decoded.features!.equals(featureBits(5))).to.be.true;
 		});
 	});
 
@@ -268,7 +302,7 @@ describe('BOLT 12: Offers', () => {
 				payerKey: pubkey2,
 				offerId: Buffer.alloc(32),
 				amount: 75_000n,
-				features: Buffer.from([0x01]),
+				features: Buffer.from([0x02]),
 				quantity: 3n,
 				chain: crypto.randomBytes(32),
 				payerNote: 'for services',
@@ -330,6 +364,71 @@ describe('BOLT 12: Offers', () => {
 			const types = records.map((r) => Number(r.type));
 			expect(types).to.include(OfferTlvType.DESCRIPTION);
 			expect(types).to.include(InvoiceRequestTlvType.PAYER_KEY);
+		});
+
+		describe('BOLT 12 reader checks (#1037)', () => {
+			const tlv = encodeInvoiceRequestTlv({
+				payerKey: pubkey2,
+				offerId: Buffer.alloc(32)
+			});
+			const extra = (type: bigint): ITlvRecord => ({
+				type,
+				value: Buffer.from([0x01])
+			});
+
+			it('accepts unknown odd fields in the invoice_request ranges', () => {
+				const data = withExtraRecords(tlv, [
+					extra(91n),
+					extra(241n),
+					extra(2_000_000_001n)
+				]);
+				expect(decodeInvoiceRequestTlv(data).records).to.have.length(4);
+			});
+
+			it('rejects an unknown even field', () => {
+				expect(() =>
+					decodeInvoiceRequestTlv(withExtraRecords(tlv, [extra(92n)]))
+				).to.throw('Unknown required TLV type: 92');
+				expect(() =>
+					decodeInvoiceRequestTlv(
+						withExtraRecords(tlv, [extra(2_000_000_002n)])
+					)
+				).to.throw('Unknown required TLV type: 2000000002');
+			});
+
+			it('rejects a field outside the invoice_request ranges', () => {
+				// Invoice types (160..239) and the invoice experimental range.
+				for (const type of [161n, 1001n, 3_000_000_001n]) {
+					expect(() =>
+						decodeInvoiceRequestTlv(withExtraRecords(tlv, [extra(type)]))
+					).to.throw(`TLV type ${type} outside the allowed ranges`);
+				}
+			});
+
+			it('rejects an unknown even bit in invreq_features', () => {
+				const request: IInvoiceRequest = {
+					payerKey: pubkey2,
+					offerId: Buffer.alloc(32)
+				};
+				expect(() =>
+					decodeInvoiceRequestTlv(
+						encodeInvoiceRequestTlv({
+							...request,
+							features: featureBits(122)
+						})
+					)
+				).to.throw('Invoice request requires unknown feature bit 122');
+				// Implemented for init, but not an invreq_features bit.
+				expect(() =>
+					decodeInvoiceRequestTlv(
+						encodeInvoiceRequestTlv({ ...request, features: featureBits(0) })
+					)
+				).to.throw('Invoice request requires unknown feature bit 0');
+				const { request: decoded } = decodeInvoiceRequestTlv(
+					encodeInvoiceRequestTlv({ ...request, features: featureBits(123) })
+				);
+				expect(decoded.features!.equals(featureBits(123))).to.be.true;
+			});
 		});
 	});
 
@@ -458,6 +557,84 @@ describe('BOLT 12: Offers', () => {
 			expect(() => decodeInvoiceTlv(data)).to.throw(
 				'missing required payment_hash'
 			);
+		});
+
+		describe('BOLT 12 reader checks (#1037)', () => {
+			const invoice: IBolt12Invoice = {
+				paymentHash: crypto.randomBytes(32),
+				amount: 100_000n,
+				description: 'reader checks',
+				createdAt: BigInt(Math.floor(Date.now() / 1000)),
+				nodeId: pubkey1
+			};
+			const tlv = encodeInvoiceTlv(invoice);
+			const extra = (type: bigint): ITlvRecord => ({
+				type,
+				value: Buffer.from([0x01])
+			});
+
+			it('accepts unknown odd fields in the invoice ranges', () => {
+				const data = withExtraRecords(tlv, [
+					extra(91n),
+					extra(179n),
+					extra(241n),
+					extra(2_000_000_001n),
+					extra(3_000_000_001n)
+				]);
+				expect(decodeInvoiceTlv(data).records).to.have.length(9);
+			});
+
+			it('rejects an unknown even field', () => {
+				expect(() =>
+					decodeInvoiceTlv(withExtraRecords(tlv, [extra(178n)]))
+				).to.throw('Unknown required TLV type: 178');
+				expect(() =>
+					decodeInvoiceTlv(withExtraRecords(tlv, [extra(3_000_000_002n)]))
+				).to.throw('Unknown required TLV type: 3000000002');
+			});
+
+			it('rejects a field outside the invoice ranges', () => {
+				for (const type of [1001n, 4_000_000_001n]) {
+					expect(() =>
+						decodeInvoiceTlv(withExtraRecords(tlv, [extra(type)]))
+					).to.throw(`TLV type ${type} outside the allowed ranges`);
+				}
+			});
+
+			it('rejects an unknown even bit in invoice_features', () => {
+				expect(() =>
+					decodeInvoiceTlv(
+						encodeInvoiceTlv({ ...invoice, features: featureBits(122) })
+					)
+				).to.throw('Invoice requires unknown feature bit 122');
+				// Implemented for init, but not an invoice_features bit.
+				expect(() =>
+					decodeInvoiceTlv(
+						encodeInvoiceTlv({ ...invoice, features: featureBits(0) })
+					)
+				).to.throw('Invoice requires unknown feature bit 0');
+				const { invoice: decoded } = decodeInvoiceTlv(
+					encodeInvoiceTlv({ ...invoice, features: featureBits(123) })
+				);
+				expect(decoded.features!.equals(featureBits(123))).to.be.true;
+				// MPP/compulsory is the one bit BOLT 12 assigns to invoices.
+				const { invoice: mpp } = decodeInvoiceTlv(
+					encodeInvoiceTlv({ ...invoice, features: featureBits(16) })
+				);
+				expect(mpp.features!.equals(featureBits(16))).to.be.true;
+			});
+
+			it('rejects an invoice_node_id that is not a point', () => {
+				const notPoints = [
+					pubkey1.subarray(1), // x-only
+					Buffer.concat([Buffer.from([0x02]), Buffer.alloc(32, 0xff)])
+				];
+				for (const nodeId of notPoints) {
+					expect(() =>
+						decodeInvoiceTlv(encodeInvoiceTlv({ ...invoice, nodeId }))
+					).to.throw('invoice_node_id is not a valid point');
+				}
+			});
 		});
 	});
 
@@ -1746,6 +1923,63 @@ describe('BOLT 12: Offers', () => {
 			mgr.handleInvoiceRequest(makeSignedRequestTlv({ amount: 1n }, offer));
 			expect(issued).to.equal(0);
 			mgr.destroy();
+		});
+	});
+
+	// ── OfferManager Payer Quantity (#1097) ─────────────────────────
+
+	describe('OfferManager payer quantity (#1097)', () => {
+		const UNIT = 100_000_000n;
+
+		/** The request a payer sends with no options, and the issuer's answer. */
+		async function payDefault(
+			options: Parameters<OfferManager['createOffer']>[0]
+		): Promise<{
+			request: IInvoiceRequest;
+			invoice: IBolt12Invoice | null;
+			errors: string[];
+		}> {
+			const issuer = new OfferManager(privkey1);
+			const errors: string[] = [];
+			issuer.on('invoice:error', (e: IInvoiceError) => errors.push(e.error));
+			const { offer } = issuer.createOffer(options);
+			const payer = new OfferManager(privkey2);
+			let request: IInvoiceRequest | null = null;
+			payer.on('invoice:requested', (r: IInvoiceRequest) => {
+				request = r;
+			});
+			const pending = payer.requestInvoice(offer).catch(() => undefined);
+			const invoice = issuer.handleInvoiceRequest(
+				encodeInvoiceRequestTlv(request!, encodeOfferTlv(offer))
+			);
+			payer.destroy();
+			issuer.destroy();
+			await pending;
+			return { request: request!, invoice, errors };
+		}
+
+		it('sends quantity 1 to an offer with offer_quantity_max', async () => {
+			for (const quantityMax of [10n, 0n]) {
+				const { request, invoice, errors } = await payDefault({
+					description: 'widget',
+					amount: UNIT,
+					quantityMax
+				});
+				expect(request.quantity).to.equal(1n);
+				expect(request.amount).to.equal(UNIT);
+				expect(errors).to.deep.equal([]);
+				expect(invoice!.amount).to.equal(UNIT);
+			}
+		});
+
+		it('sends no quantity to an offer without offer_quantity_max', async () => {
+			const { request, invoice, errors } = await payDefault({
+				description: 'widget',
+				amount: UNIT
+			});
+			expect(request.quantity).to.equal(undefined);
+			expect(errors).to.deep.equal([]);
+			expect(invoice!.amount).to.equal(UNIT);
 		});
 	});
 

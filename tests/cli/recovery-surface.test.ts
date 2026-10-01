@@ -1654,7 +1654,8 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 				expect((await get(portB, '/info', MONITOR_KEY)).status).to.equal(401);
 				const hook = await post(portB, '/webhooks/register', {
 					url: 'http://127.0.0.1:9/hook',
-					events: ['payment:received']
+					events: ['payment:received'],
+					allowPrivateNetwork: true
 				});
 				expect(hook.status, JSON.stringify(hook.body)).to.equal(200);
 
@@ -3026,7 +3027,11 @@ describe('Recovery surface: automatic capsule restore (peer-storage auto-apply, 
 					portB,
 					'POST',
 					'/webhooks/register',
-					{ url: 'http://127.0.0.1:9/hook', events: ['payment:received'] },
+					{
+						url: 'http://127.0.0.1:9/hook',
+						events: ['payment:received'],
+						allowPrivateNetwork: true
+					},
 					ADMIN_KEY
 				);
 				expect(hook.status, JSON.stringify(hook.body)).to.equal(200);

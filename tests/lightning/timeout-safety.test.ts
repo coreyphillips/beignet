@@ -18,7 +18,8 @@ import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig, ILightningError } from '../../src/lightning/node/types';
 import {
 	ChannelState,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	REGTEST_CHAIN_HASH
 } from '../../src/lightning/channel/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
@@ -137,7 +138,8 @@ describe('Phase 6: Timeout Safety Nets', () => {
 
 			const fakeOffer = {
 				offerId: crypto.randomBytes(32),
-				description: 'test offer'
+				description: 'test offer',
+				chains: [REGTEST_CHAIN_HASH]
 			} as any;
 
 			try {
@@ -174,7 +176,8 @@ describe('Phase 6: Timeout Safety Nets', () => {
 
 			const fakeOffer = {
 				offerId: crypto.randomBytes(32),
-				description: 'default timeout test'
+				description: 'default timeout test',
+				chains: [REGTEST_CHAIN_HASH]
 			} as any;
 
 			try {
@@ -197,7 +200,8 @@ describe('Phase 6: Timeout Safety Nets', () => {
 
 			const fakeOffer = {
 				offerId: crypto.randomBytes(32),
-				description: 'descriptive error test'
+				description: 'descriptive error test',
+				chains: [REGTEST_CHAIN_HASH]
 			} as any;
 
 			const timeoutMs = 150;

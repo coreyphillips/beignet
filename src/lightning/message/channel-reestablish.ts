@@ -64,6 +64,12 @@ const TLV_NEXT_FUNDING = 1n;
 const TLV_NEXT_FUNDING_LEGACY = 0n;
 /** option_taproot verification nonce (LND local_nonce convention). */
 const TLV_NEXT_LOCAL_NONCE = 4n;
+const CHANNEL_REESTABLISH_TLV_TYPES = new Set<bigint>([
+	TLV_NEXT_FUNDING_LEGACY,
+	TLV_NEXT_FUNDING,
+	TLV_NEXT_LOCAL_NONCE,
+	FF_REESTABLISH_TLV_TYPE
+]);
 
 /**
  * Encode a `channel_reestablish` message payload.
@@ -160,7 +166,11 @@ export function decodeChannelReestablishMessage(
 	};
 
 	if (offset < payload.length) {
-		const { records } = decodeTlvStream(payload, offset);
+		const { records } = decodeTlvStream(
+			payload,
+			offset,
+			CHANNEL_REESTABLISH_TLV_TYPES
+		);
 		for (const record of records) {
 			// Type 1 = current spec ([txid][retransmit_flags]); type 0 = the
 			// original merged-spec bare txid (legacy peers). Take the txid either

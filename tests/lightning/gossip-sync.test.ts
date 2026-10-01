@@ -1349,7 +1349,7 @@ describe('Gossip Sync (Phase 5)', function () {
 			).to.equal(1);
 		});
 
-		it('lets a deferred announcement take over only a signatureless slot with matching endpoints', function () {
+		it('lets a deferred announcement take over a signatureless slot only with matching endpoints', function () {
 			const graph = new NetworkGraph();
 			const scid = makeScid(104, 1, 0);
 			const keys = makeSignedChannelKeys();
@@ -1406,6 +1406,40 @@ describe('Gossip Sync (Phase 5)', function () {
 				graph.addChannelAnnouncement(verified.msg, { verified: 'deferred' })
 			).to.be.false;
 			expect(graph.getChannel(verifiedScid)!.announcementVerified).to.be.true;
+		});
+
+		it('lets a genuine deferred announcement replace a forged upgrade that failed verification (issue #1106)', function () {
+			const graph = new NetworkGraph();
+			const scid = makeScid(104, 4, 0);
+			const genuine = makeSignedChannelAnnouncement(
+				scid,
+				makeSignedChannelKeys()
+			);
+			graph.addChannelAnnouncement(zeroSigAnnouncement(genuine.msg));
+
+			// Same endpoints, random signatures: takes the RGS slot as deferred.
+			const forged = makeChannelAnnouncement(
+				scid,
+				genuine.msg.nodeId1,
+				genuine.msg.nodeId2
+			);
+			expect(graph.addChannelAnnouncement(forged, { verified: 'deferred' })).to
+				.be.true;
+			expect(graph.getVerifiedChannelAnnouncement(scid)).to.equal(undefined);
+			expect(graph.getChannel(scid)!.announcementVerified).to.be.false;
+
+			// Replaying the failed message changes nothing, so it refuses.
+			expect(graph.addChannelAnnouncement(forged, { verified: 'deferred' })).to
+				.be.false;
+
+			expect(
+				graph.addChannelAnnouncement(genuine.msg, { verified: 'deferred' })
+			).to.be.true;
+			expect(graph.getChannel(scid)!.announcementVerifyDeferred).to.equal(true);
+			const resolved = graph.getVerifiedChannelAnnouncement(scid);
+			expect(resolved).to.not.equal(undefined);
+			expect(resolved!.nodeSignature1.equals(genuine.msg.nodeSignature1)).to.be
+				.true;
 		});
 
 		it('lets a deferred update bypass freshness only over a signatureless slot', function () {

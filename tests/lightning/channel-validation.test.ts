@@ -17,6 +17,7 @@ import {
 	MAX_FUNDING_SATOSHIS,
 	MIN_DUST_LIMIT_SATOSHIS,
 	MAX_DUST_LIMIT_SATOSHIS,
+	MAX_MINIMUM_DEPTH,
 	DEFAULT_CHANNEL_CONFIG,
 	BITCOIN_CHAIN_HASH
 } from '../../src/lightning/channel/types';
@@ -483,6 +484,19 @@ describe('Channel Types and Validation', function () {
 			accept.dustLimitSatoshis = 900_000n;
 			expect(validateAcceptChannelParams(open, accept)).to.contain(
 				'exceeds maximum'
+			);
+		});
+
+		it('should reject a minimum_depth above the maximum (issue 1034)', function () {
+			const open = makeValidOpenMsg();
+			const accept = makeValidAcceptMsg(open);
+			accept.minimumDepth = MAX_MINIMUM_DEPTH;
+			expect(validateAcceptChannelParams(open, accept)).to.equal(null);
+			accept.minimumDepth = MAX_MINIMUM_DEPTH + 1;
+			expect(validateAcceptChannelParams(open, accept)).to.equal(
+				`minimum_depth ${
+					MAX_MINIMUM_DEPTH + 1
+				} exceeds maximum ${MAX_MINIMUM_DEPTH}`
 			);
 		});
 	});

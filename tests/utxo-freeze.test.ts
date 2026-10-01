@@ -447,4 +447,67 @@ describe('UTXO freeze durability', function () {
 		) as IUtxo[];
 		expect(persisted).to.have.length(1);
 	});
+
+	it('reports a freeze queued behind another as not created', async () => {
+		// Both calls see the coin unfrozen. Only the one that added the entry may
+		// later treat it as its own to lift.
+		const [first, second] = await Promise.all([
+			wallet.freezeUtxoIfUnfrozen({ txid: utxo.tx_hash, index: utxo.tx_pos }),
+			wallet.freezeUtxoIfUnfrozen({
+				txid: utxo.tx_hash,
+				index: utxo.tx_pos,
+				tag: 'funding-pledge'
+			})
+		]);
+		if (first.isErr()) throw first.error;
+		if (second.isErr()) throw second.error;
+		expect(first.value.created).to.equal(true);
+		expect(second.value.created).to.equal(false);
+		expect(wallet.listFrozenUtxos()[0].freezeTag).to.equal(undefined);
+	});
+
+	it('an untagged freeze takes over a tagged one', async () => {
+		// The tagged owner lifts only entries that still carry its tag, so the
+		// user's freeze has to clear it to outlive that owner's release.
+		const tagged = await wallet.freezeUtxoIfUnfrozen({
+			txid: utxo.tx_hash,
+			index: utxo.tx_pos,
+			tag: 'funding-pledge'
+		});
+		if (tagged.isErr()) throw tagged.error;
+		const user = await wallet.freezeUtxoIfUnfrozen({
+			txid: utxo.tx_hash,
+			index: utxo.tx_pos
+		});
+		if (user.isErr()) throw user.error;
+		expect(user.value.created).to.equal(true);
+		const frozen = wallet.listFrozenUtxos();
+		expect(frozen).to.have.length(1);
+		expect(frozen[0].freezeTag).to.equal(undefined);
+		expect(frozen[0].frozenAt).to.equal(undefined);
+		const persisted = store.get(
+			'freezedurability-regtest-blacklistedUtxos'
+		) as IUtxo[];
+		expect(persisted).to.have.length(1);
+		expect(persisted[0].freezeTag).to.equal(undefined);
+	});
+
+	it('a takeover storage refuses leaves the tagged freeze as it was', async () => {
+		const tagged = await wallet.freezeUtxo({
+			txid: utxo.tx_hash,
+			index: utxo.tx_pos,
+			tag: 'funding-pledge'
+		});
+		if (tagged.isErr()) throw tagged.error;
+		fail.on = true;
+		const user = await wallet.freezeUtxo({
+			txid: utxo.tx_hash,
+			index: utxo.tx_pos
+		});
+		expect(user.isErr()).to.equal(true);
+		const frozen = wallet.listFrozenUtxos();
+		expect(frozen).to.have.length(1);
+		expect(frozen[0].freezeTag).to.equal('funding-pledge');
+		expect(frozen[0].frozenAt).to.be.a('number');
+	});
 });

@@ -25,13 +25,20 @@ import * as bitcoin from 'bitcoinjs-lib';
 bitcoin.initEccLib(ecc);
 
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
-import { ChannelState } from '../../src/lightning/channel/types';
+import {
+	ChannelState,
+	DEFAULT_MINIMUM_DEPTH,
+	MAX_MINIMUM_DEPTH
+} from '../../src/lightning/channel/types';
 import {
 	Channel,
 	ISpliceWalletInput
 } from '../../src/lightning/channel/channel';
 import { IDualFundingParams } from '../../src/lightning/channel/dual-funding';
-import { decodeAcceptChannel2Message } from '../../src/lightning/message/dual-funding';
+import {
+	decodeAcceptChannel2Message,
+	encodeAcceptChannel2Message
+} from '../../src/lightning/message/dual-funding';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import {
 	IChannelBasepoints,
@@ -150,7 +157,10 @@ interface IHarness {
 	sideB: ISide;
 }
 
-function makeHarness(walletInput: ISpliceWalletInput): IHarness {
+function makeHarness(
+	walletInput: ISpliceWalletInput,
+	rewriteFromB?: (type: number, payload: Buffer) => Buffer
+): IHarness {
 	const sideA = makeSide();
 	const sideB = makeSide();
 	const mgrA = new ChannelManager(sideA.config);
@@ -174,7 +184,11 @@ function makeHarness(walletInput: ISpliceWalletInput): IHarness {
 		mgrB.handleMessage(sideA.pubkey, type, payload)
 	);
 	mgrB.on('message:outbound', (_peer: string, type: number, payload: Buffer) =>
-		mgrA.handleMessage(sideB.pubkey, type, payload)
+		mgrA.handleMessage(
+			sideB.pubkey,
+			type,
+			rewriteFromB ? rewriteFromB(type, payload) : payload
+		)
 	);
 
 	const changeScript = bitcoin.payments.p2wpkh({
@@ -447,6 +461,88 @@ describe('trusted zero-conf v2 open (dual-funded)', function () {
 		expect(acceptorChannel(h)!.getState()).to.equal(
 			ChannelState.AWAITING_FUNDING_CONFIRMED
 		);
+	});
+});
+
+describe("the v2 opener waits for the accepter's minimum_depth (issue 1034)", function () {
+	this.timeout(10_000);
+
+	function acceptDepth(
+		depth: number
+	): (type: number, payload: Buffer) => Buffer {
+		return (type: number, payload: Buffer): Buffer =>
+			type === MessageType.ACCEPT_CHANNEL2
+				? encodeAcceptChannel2Message({
+						...decodeAcceptChannel2Message(payload),
+						minimumDepth: depth
+				  })
+				: payload;
+	}
+
+	/** The depths the opener's funding watches were armed at. */
+	async function openerWatchDepths(depth: number): Promise<number[]> {
+		const h = makeHarness(
+			makeWalletInput(WALLET_UTXO_SATS),
+			acceptDepth(depth)
+		);
+		const depths: number[] = [];
+		h.mgrA.on('watch:funding', (_txid: Buffer, _vout: number, d: number) =>
+			depths.push(d)
+		);
+		const chA = h.mgrA.createDualFundedChannel(
+			h.sideB.pubkey,
+			openerParams(h.sideA)
+		);
+		await settle(
+			() =>
+				chA.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED &&
+				depths.length > 0
+		);
+		expect(h.errors, 'no negotiation errors').to.deep.equal([]);
+		expect(chA.getFullState().minimumDepth).to.equal(depths[0]);
+		return depths;
+	}
+
+	it('adopts a minimum_depth deeper than our default', async function () {
+		const depths = await openerWatchDepths(6);
+		expect(
+			depths.every((d) => d === 6),
+			`watched at ${depths}`
+		).to.equal(true);
+	});
+
+	it('never waits for less than our default', async function () {
+		const depths = await openerWatchDepths(1);
+		expect(
+			depths.every((d) => d === DEFAULT_MINIMUM_DEPTH),
+			`watched at ${depths}`
+		).to.equal(true);
+	});
+
+	it('refuses a minimum_depth above the maximum on the wire', async function () {
+		const h = makeHarness(
+			makeWalletInput(WALLET_UTXO_SATS),
+			acceptDepth(MAX_MINIMUM_DEPTH + 1)
+		);
+		const chA = h.mgrA.createDualFundedChannel(
+			h.sideB.pubkey,
+			openerParams(h.sideA)
+		);
+		await settle(() => h.errors.length > 0 && acceptorChannel(h) === undefined);
+		expect(
+			h.errors.some((e) =>
+				e.startsWith(
+					`A: minimum_depth ${
+						MAX_MINIMUM_DEPTH + 1
+					} exceeds maximum ${MAX_MINIMUM_DEPTH}`
+				)
+			),
+			`opener refused (got: ${h.errors.join(' | ')})`
+		).to.equal(true);
+		expect(chA.getState()).to.not.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(h.broadcasts, 'nothing broadcast').to.have.length(0);
 	});
 });
 

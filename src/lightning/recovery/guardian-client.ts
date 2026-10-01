@@ -34,6 +34,7 @@ import {
 	IGuardianRecord,
 	IGuardianRegisterNodeRequest,
 	IGuardianRegisterNodeResponse,
+	IGuardianRetainFloor,
 	IGuardianSyncEpochResponse,
 	IGuardianSyncRecordResponse,
 	IGuardianTakeoverCertificate,
@@ -80,6 +81,17 @@ export class GuardianTransportError extends Error {
 		super(message);
 		this.name = 'GuardianTransportError';
 		this.httpStatus = httpStatus;
+	}
+}
+
+/** The guardian's INFO is outside our protocol range; carries that INFO. */
+export class GuardianProtocolMismatchError extends GuardianTransportError {
+	readonly info: IGuardianInfoResponse;
+
+	constructor(message: string, info: IGuardianInfoResponse) {
+		super(message);
+		this.name = 'GuardianProtocolMismatchError';
+		this.info = info;
 	}
 }
 
@@ -430,9 +442,10 @@ export class GuardianClient {
 					info.minProtocolVersion > GUARDIAN_PROTOCOL_VERSION ||
 					info.maxProtocolVersion < GUARDIAN_PROTOCOL_VERSION
 				) {
-					throw new GuardianTransportError(
+					throw new GuardianProtocolMismatchError(
 						`guardian supports protocol ${info.minProtocolVersion}..` +
-							`${info.maxProtocolVersion}, not ${GUARDIAN_PROTOCOL_VERSION}`
+							`${info.maxProtocolVersion}, not ${GUARDIAN_PROTOCOL_VERSION}`,
+						info
 					);
 				}
 				return info;
@@ -486,10 +499,18 @@ export class GuardianClient {
 		);
 	}
 
-	async putState(record: IGuardianRecord): Promise<IGuardianPutStateResponse> {
+	async putState(
+		record: IGuardianRecord,
+		retainFloor?: IGuardianRetainFloor
+	): Promise<IGuardianPutStateResponse> {
 		await this.ensureCompatible();
 		return decodePutStateResponse(
-			await this.exchange('put_state', encodePutStateRequest({ record }))
+			await this.exchange(
+				'put_state',
+				encodePutStateRequest(
+					retainFloor ? { record, retainFloor } : { record }
+				)
+			)
 		);
 	}
 
@@ -536,12 +557,24 @@ export class GuardianClient {
 		);
 	}
 
+	/**
+	 * `certificates` is the quorum that granted the guardian's lease, for a
+	 * record of the epoch that lease superseded (wire 5.6).
+	 */
 	async syncRecord(
-		record: IGuardianRecord
+		record: IGuardianRecord,
+		certificates?: IGuardianTakeoverCertificate[]
 	): Promise<IGuardianSyncRecordResponse> {
 		await this.ensureCompatible();
 		return decodeSyncRecordResponse(
-			await this.exchange('sync_record', encodeSyncRecordRequest({ record }))
+			await this.exchange(
+				'sync_record',
+				encodeSyncRecordRequest(
+					certificates && certificates.length > 0
+						? { record, certificates }
+						: { record }
+				)
+			)
 		);
 	}
 
@@ -729,11 +762,13 @@ export function assertDistinctGuardianMembers(
  * answer INFO cannot answer anything else either, so it contributes
  * nothing to any quorum regardless. The returned set names the identities
  * that were positively verified, so unsigned negative answers can be
- * counted only for guardians that proved who they are.
+ * counted only for guardians that proved who they are. `onVerified` sees
+ * each verified guardian's INFO, for callers that need its advertised limits.
  */
 export async function verifyGuardianBindings(
 	bound: IBoundGuardianClient[],
-	context: IGuardianSetContext
+	context: IGuardianSetContext,
+	onVerified?: (key: string, info: IGuardianInfoResponse) => void
 ): Promise<Set<string>> {
 	assertDistinctGuardianMembers(bound, context);
 	const verified = new Set<string>();
@@ -764,6 +799,7 @@ export async function verifyGuardianBindings(
 			);
 		}
 		verified.add(key);
+		onVerified?.(key, info);
 	}
 	return verified;
 }

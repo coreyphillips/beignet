@@ -31,6 +31,16 @@ import {
 
 const WS_ACCEPT_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
+/**
+ * Frame payload and unread-data cap until markEstablished(), so a full pool
+ * of pending strangers holds a few MiB rather than 16 MiB each. The largest
+ * BOLT 8 message on the wire is 65569 bytes, so act 3 and init fit with room
+ * to spare. Unread data needs the cap as well: the Peer has no 'data'
+ * listener while a handshake write flushes, and a client that stops reading
+ * can keep that write pending.
+ */
+export const PRE_HANDSHAKE_MAX_WS_BYTES = 128 * 1024;
+
 /** Compute the Sec-WebSocket-Accept header value for a client key. */
 export function computeWebSocketAccept(secWebSocketKey: string): string {
 	return crypto
@@ -55,6 +65,7 @@ export class WebSocketServerTransport
 	/* eslint-enable brace-style */
 	private socket: net.Socket;
 	private parser: WsFrameParser;
+	private maxFramePayloadBytes: number;
 	private closeSent = false;
 	private closed = false;
 	private closing = false;
@@ -75,11 +86,16 @@ export class WebSocketServerTransport
 		super();
 		this.socket = socket;
 		this.onClosing = opts?.onClosing;
+		this.maxFramePayloadBytes =
+			opts?.maxFramePayloadBytes ?? DEFAULT_MAX_WS_PAYLOAD_BYTES;
 		this.parser = new WsFrameParser({
-			maxPayloadBytes:
-				opts?.maxFramePayloadBytes ?? DEFAULT_MAX_WS_PAYLOAD_BYTES,
+			maxPayloadBytes: Math.min(
+				this.maxFramePayloadBytes,
+				PRE_HANDSHAKE_MAX_WS_BYTES
+			),
 			requireMasked: true // client-to-server frames MUST be masked
 		});
+		this.maxPendingDataBytes = PRE_HANDSHAKE_MAX_WS_BYTES;
 
 		socket.on('data', (chunk: Buffer) => this.handleRawData(chunk));
 		socket.on('close', (hadError: boolean) => {
@@ -135,6 +151,11 @@ export class WebSocketServerTransport
 	setKeepAlive(enable?: boolean, initialDelay?: number): this {
 		this.socket.setKeepAlive(enable, initialDelay);
 		return this;
+	}
+
+	markEstablished(): void {
+		this.parser.setMaxPayloadBytes(this.maxFramePayloadBytes);
+		this.maxPendingDataBytes = WebSocketServerTransport.MAX_PENDING_DATA_BYTES;
 	}
 
 	destroy(error?: Error): this {
@@ -283,7 +304,8 @@ export class WebSocketServerTransport
 export interface IWebSocketServerOptions {
 	/** Only accept upgrades on this path (default: any path). */
 	path?: string;
-	/** Per-frame payload sanity cap in bytes (default 16 MiB). */
+	/** Per-frame payload sanity cap in bytes once the peer is established
+	 *  (default 16 MiB). Before that, at most PRE_HANDSHAKE_MAX_WS_BYTES. */
 	maxFramePayloadBytes?: number;
 	/** Accepted connections still waiting to upgrade, or upgraded and now
 	 *  closing, all addresses together; sockets past it are destroyed on

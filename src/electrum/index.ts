@@ -1296,12 +1296,16 @@ export class Electrum {
 	/**
 	 * Queries Electrum to return the available UTXO's and balance of the provided addresses.
 	 * @param {TUnspentAddressScriptHashData} addresses
+	 * @param {boolean} [rejectFailedEntries] Err when the server answers any
+	 * one script hash with an error, instead of counting it as empty.
 	 * @returns {Promise<Result<IGetUtxosResponse>>}
 	 */
 	async listUnspentAddressScriptHashes({
-		addresses
+		addresses,
+		rejectFailedEntries = false
 	}: {
 		addresses: TUnspentAddressScriptHashData;
+		rejectFailedEntries?: boolean;
 	}): Promise<Result<IGetUtxosResponse>> {
 		try {
 			const addressBatches = splitAddresses(addresses, this.batchLimit);
@@ -1321,6 +1325,10 @@ export class Electrum {
 				if (unspentAddressResult.error) {
 					return err(JSON.stringify(unspentAddressResult?.data ?? ''));
 				}
+				const failed =
+					rejectFailedEntries &&
+					unspentAddressResult.data.find((e) => !Array.isArray(e.result));
+				if (failed) return err(JSON.stringify(failed));
 
 				unspentAddressResult.data.forEach(
 					({ data, result: unspentAddresses }) => {

@@ -67,6 +67,15 @@ export function estimateSpliceTxWeight(opts: {
 }
 
 /**
+ * The highest splice feerate this node initiates at: the 100,000 sat/kw
+ * (400 sat/vB) ceiling update_fee enforces. The channel pays a splice's fee
+ * from its own balance, so the wallet's "fee exceeds half the inputs" guard
+ * never sees it, and a sat/vB figure passed as sat/kw would otherwise go to
+ * miners unchallenged.
+ */
+export const MAX_SPLICE_FEERATE_PERKW = 100_000;
+
+/**
  * Fee in satoshis for a given weight at a feerate in sat per kiloweight.
  */
 export function spliceFeeSats(weight: number, feeratePerKw: number): bigint {

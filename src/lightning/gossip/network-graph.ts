@@ -15,6 +15,7 @@ import {
 	gossipTimestampTooFarFuture,
 	decodeShortChannelId
 } from './types';
+import { encodeChannelAnnouncementMessage } from './messages';
 import {
 	verifyChannelAnnouncementMessage,
 	verifyChannelUpdateMessage,
@@ -30,6 +31,20 @@ const ZERO_SIG = Buffer.alloc(64);
  */
 function isSignatureless(sig: Buffer): boolean {
 	return sig.equals(ZERO_SIG);
+}
+
+/** Whether two channel_announcements carry the same signed content. */
+function sameChannelAnnouncement(
+	a: IChannelAnnouncementMessage,
+	b: IChannelAnnouncementMessage
+): boolean {
+	try {
+		return encodeChannelAnnouncementMessage(a).equals(
+			encodeChannelAnnouncementMessage(b)
+		);
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -126,8 +141,10 @@ export class NetworkGraph {
 	 * inflate graph memory and the gossip tables without ever paying for a
 	 * signature (issue #446). The public graph is well under this; the bound
 	 * only bites on garbage. At the ceiling, verified admissions evict an
-	 * unverified entry (garbage never starves out real data) while
-	 * unverified ones are refused. Static and mutable so tests can pin it
+	 * unverified entry first, then a verified one whose funding is unproven
+	 * (anyone can sign a fabricated channel with keys they generated, issue
+	 * #1105), while unverified admissions are refused. Only funding-proven
+	 * channels are never evicted. Static and mutable so tests can pin it
 	 * (the SERVE_VERIFY_BUDGET_MS pattern).
 	 */
 	static MAX_CHANNELS = 100_000;
@@ -135,12 +152,19 @@ export class NetworkGraph {
 	private _channels: Map<string, IGraphChannel> = new Map();
 	/**
 	 * scidHex of every held channel whose announcement is not settled
-	 * verified: the eviction candidates, indexed so admission at the ceiling
-	 * stays O(1). Invariant: member iff present in _channels with
+	 * verified: the first eviction candidates, indexed so admission at the
+	 * ceiling stays O(1). Invariant: member iff present in _channels with
 	 * announcementVerified !== true; every site that settles a channel's
 	 * announcement provenance or changes _channels membership maintains it.
 	 */
 	private _unverifiedChannels: Set<string> = new Set();
+	/**
+	 * scidHex of every held channel whose announcement is verified but whose
+	 * funding is not proven: the second eviction candidates. Invariant:
+	 * member iff present in _channels with announcementVerified === true and
+	 * fundingVerified !== true, maintained alongside _unverifiedChannels.
+	 */
+	private _unfundedChannels: Set<string> = new Set();
 	/** Start of the current serve-verification budget window (epoch ms). */
 	private _serveVerifyWindowStart = 0;
 	/** Verification time spent in the current window across all queries. */
@@ -164,6 +188,17 @@ export class NetworkGraph {
 	// can delete the persisted gossip_nodes row; the graph itself never
 	// touches storage (issue #447).
 	private readonly _onNodeEvicted?: (nodeIdHex: string) => void;
+	// Fired with the scidHex of every channel that becomes verified with its
+	// funding unproven, so the owner can check the funding output on chain
+	// and report back through markChannelFundingProven (issue #1105).
+	private readonly _onFundingUnproven?: (scidHex: string) => void;
+	// Fired with the scidHex of every channel whose deferred announcement
+	// resolves to failed, so the owner can persist the verdict. A restored
+	// row still marked deferred would block every other candidate until it
+	// is resolved again (issue #1131). Passing verdicts are not reported:
+	// they only save a re-verification, at the cost of a write per resolved
+	// channel.
+	private readonly _onChannelAnnouncementFailed?: (scidHex: string) => void;
 	// Non-null while a ceiling replacement is in flight: removeChannel
 	// deposits GC'd node hexes here instead of reporting them, and the
 	// admission flushes only the ones still absent once the incoming
@@ -178,36 +213,58 @@ export class NetworkGraph {
 			eagerVerify?: boolean;
 			onChannelEvicted?: (scidHex: string) => void;
 			onNodeEvicted?: (nodeIdHex: string) => void;
+			onFundingUnproven?: (scidHex: string) => void;
+			onChannelAnnouncementFailed?: (scidHex: string) => void;
 		} = {}
 	) {
 		this._chainHash = chainHash;
 		this._eagerVerify = opts.eagerVerify === true;
 		this._onChannelEvicted = opts.onChannelEvicted;
 		this._onNodeEvicted = opts.onNodeEvicted;
+		this._onFundingUnproven = opts.onFundingUnproven;
+		this._onChannelAnnouncementFailed = opts.onChannelAnnouncementFailed;
 	}
 
 	/**
-	 * Keep the eviction index in step with a channel's settled announcement
-	 * provenance. Call after any site settles announcementVerified.
+	 * Keep the eviction indexes in step with a channel's settled announcement
+	 * provenance and funding proof. Call after any site settles either.
 	 */
 	private _syncUnverifiedIndex(scidHex: string, channel: IGraphChannel): void {
-		if (channel.announcementVerified === true) {
-			this._unverifiedChannels.delete(scidHex);
-		} else {
+		if (channel.announcementVerified !== true) {
 			this._unverifiedChannels.add(scidHex);
+			this._unfundedChannels.delete(scidHex);
+			return;
+		}
+		this._unverifiedChannels.delete(scidHex);
+		if (channel.fundingVerified === true) {
+			this._unfundedChannels.delete(scidHex);
+		} else if (!this._unfundedChannels.has(scidHex)) {
+			this._unfundedChannels.add(scidHex);
+			// Fires mid-admission, before the endpoints are linked: a throwing
+			// owner must not leave the channel half inserted.
+			try {
+				this._onFundingUnproven?.(scidHex);
+			} catch {
+				// The channel simply stays unproven, hence evictable.
+			}
 		}
 	}
 
-	/**
-	 * Evict one unverified channel to admit a verified one at the ceiling.
-	 * Insertion order makes the victim the oldest unverified entry. Returns
-	 * false when nothing is evictable (every held channel is verified).
-	 * Note the preference, not the ceiling, is best-effort: announcement
-	 * verification proves signatures over keys the message itself carries,
-	 * not UTXO existence, so an attacker who baits serve-time resolution of
-	 * their fabricated announcements makes them unevictable. The ceiling
-	 * still holds absolutely.
-	 */
+	/** Settle a deferred channel announcement by checking its signatures. */
+	private _resolveDeferredAnnouncement(
+		scidHex: string,
+		channel: IGraphChannel
+	): void {
+		channel.announcementVerified = verifyChannelAnnouncementMessage(
+			channel.announcement
+		);
+		channel.announcementVerifyDeferred = undefined;
+		this._syncUnverifiedIndex(scidHex, channel);
+		if (channel.announcementVerified === false) {
+			this._onChannelAnnouncementFailed?.(scidHex);
+		}
+	}
+
 	/**
 	 * Report deferred node evictions once an admission has completed. Only
 	 * nodes still absent are reported: an endpoint the ceiling victim
@@ -225,8 +282,16 @@ export class NetworkGraph {
 		}
 	}
 
-	private _evictOneUnverified(): boolean {
-		const victim = this._unverifiedChannels.values().next();
+	/**
+	 * Evict one channel to admit a verified one at the ceiling: the oldest
+	 * unverified entry, else (when includeUnfunded) the oldest verified entry
+	 * whose funding is unproven. Returns false when nothing is evictable.
+	 */
+	private _evictOne(includeUnfunded: boolean): boolean {
+		let victim = this._unverifiedChannels.values().next();
+		if (victim.done && includeUnfunded) {
+			victim = this._unfundedChannels.values().next();
+		}
 		if (victim.done) return false;
 		const channel = this._channels.get(victim.value);
 		if (channel) {
@@ -234,6 +299,7 @@ export class NetworkGraph {
 		} else {
 			// Defensive: repair a desynced index entry.
 			this._unverifiedChannels.delete(victim.value);
+			this._unfundedChannels.delete(victim.value);
 		}
 		this._onChannelEvicted?.(victim.value);
 		return true;
@@ -279,16 +345,21 @@ export class NetworkGraph {
 			// in place, so the channel becomes servable. Endpoints must match;
 			// existing updates and their provenance flags are preserved. A
 			// deferred candidate (always real-signature, normalizeVerified
-			// downgrades the rest) may only displace a SIGNATURELESS slot:
-			// over a signed slot it could change nothing servability-wise,
-			// and a peer re-serving a known dump against an all-deferred
-			// graph would otherwise "accept" every duplicate and re-trigger a
+			// downgrades the rest) may only displace a SIGNATURELESS slot or
+			// one whose signatures already FAILED (settled false), and never
+			// with the same message: over a pending or verified slot it could
+			// change nothing servability-wise, and a peer re-serving a known
+			// dump would otherwise "accept" every duplicate and re-trigger a
 			// storage write per entry (the issue #437 failure class,
-			// relocated to disk).
+			// relocated to disk). Without the failed-slot case, a forged
+			// upgrade of an RGS slot would block the genuine one forever
+			// (issue #1106).
 			const upgrade =
 				verified === true ||
 				(verified === 'deferred' &&
-					isSignatureless(existing.announcement.nodeSignature1));
+					(isSignatureless(existing.announcement.nodeSignature1) ||
+						(existing.announcementVerified === false &&
+							!sameChannelAnnouncement(existing.announcement, msg))));
 			if (
 				upgrade &&
 				existing.announcementVerified !== true &&
@@ -300,6 +371,7 @@ export class NetworkGraph {
 				existing.features = Buffer.from(msg.features);
 				existing.announcementVerified = pair.verified;
 				existing.announcementVerifyDeferred = pair.deferred;
+				existing.fundingVerified = undefined;
 				this._syncUnverifiedIndex(scidHex, existing);
 				return true;
 			}
@@ -308,14 +380,16 @@ export class NetworkGraph {
 		}
 
 		// Ceiling (issue #446): only new entries are growth (the upgrade path
-		// above settles in place), and only a verified admission may make room
-		// by evicting an unverified entry; unverified ones are refused, so
-		// garbage displaces nothing. Node-eviction reports wait until the
-		// incoming channel is inserted (the victim may share an endpoint).
+		// above settles in place), and only a verified admission may make room;
+		// unverified ones are refused, so garbage displaces nothing. A verified
+		// entry with unproven funding is evictable too, or signed fabrications
+		// would lock real channels out (issue #1105). Node-eviction reports
+		// wait until the incoming channel is inserted (the victim may share an
+		// endpoint).
 		if (this._channels.size >= NetworkGraph.MAX_CHANNELS) {
 			if (verified !== true) return false;
 			this._deferredNodeEvictions = [];
-			if (!this._evictOneUnverified()) {
+			if (!this._evictOne(true)) {
 				this._deferredNodeEvictions = null;
 				return false;
 			}
@@ -474,8 +548,8 @@ export class NetworkGraph {
 	// re-serving a known graph pinned the event loop for the whole dump).
 	// Deferred candidates (issue #443) accept a strict subset of what verified
 	// candidates accept (every deferred takeover additionally requires a
-	// signatureless slot), so mirroring the verified rules keeps these gates
-	// valid upper bounds for both provenances.
+	// signatureless or failed slot), so mirroring the verified rules keeps
+	// these gates valid upper bounds for both provenances.
 
 	/**
 	 * Whether a channel_announcement could change the graph at all. False for
@@ -491,10 +565,11 @@ export class NetworkGraph {
 		if (!existing) {
 			// Ceiling mirror: at the ceiling a new entry is only admissible
 			// (under the most permissive provenance, verified) while an
-			// unverified entry remains evictable.
+			// entry without proven funding remains evictable.
 			return (
 				this._channels.size < NetworkGraph.MAX_CHANNELS ||
-				this._unverifiedChannels.size > 0
+				this._unverifiedChannels.size > 0 ||
+				this._unfundedChannels.size > 0
 			);
 		}
 		return (
@@ -594,15 +669,26 @@ export class NetworkGraph {
 			return undefined;
 		}
 		if (channel.announcementVerifyDeferred === true) {
-			channel.announcementVerified = verifyChannelAnnouncementMessage(
-				channel.announcement
-			);
-			channel.announcementVerifyDeferred = undefined;
-			this._syncUnverifiedIndex(scidHex, channel);
+			this._resolveDeferredAnnouncement(scidHex, channel);
 		}
 		return channel.announcementVerified === true
 			? channel.announcement
 			: undefined;
+	}
+
+	/**
+	 * Record that a verified channel's funding output exists on chain as
+	 * announced, or that the channel is our own (issue #1105). The channel is
+	 * never evicted at the ceiling from then on. False when the SCID is not
+	 * held with a verified announcement.
+	 */
+	markChannelFundingProven(shortChannelId: Buffer): boolean {
+		const scidHex = shortChannelId.toString('hex');
+		const channel = this._channels.get(scidHex);
+		if (!channel || channel.announcementVerified !== true) return false;
+		channel.fundingVerified = true;
+		this._syncUnverifiedIndex(scidHex, channel);
+		return true;
 	}
 
 	/**
@@ -629,6 +715,7 @@ export class NetworkGraph {
 
 		this._channels.delete(scidHex);
 		this._unverifiedChannels.delete(scidHex);
+		this._unfundedChannels.delete(scidHex);
 
 		// Remove from endpoint nodes' channel sets
 		const node1Hex = channel.nodeId1.toString('hex');
@@ -797,23 +884,30 @@ export class NetworkGraph {
 		if (settled2 === null) channel.update2 = undefined;
 		channel.update2Verified = settled2 ?? undefined;
 		channel.update2VerifyDeferred = undefined;
+		// A funding proof only means anything for the announcement it was
+		// checked against.
+		channel.fundingVerified =
+			channel.announcementVerified === true && channel.fundingVerified === true
+				? true
+				: undefined;
 
 		const scidHex = channel.shortChannelId.toString('hex');
 
 		// Ceiling (issue #446): the restore path admits rows with no gates, so
 		// a poisoned store would otherwise re-inflate the graph on every boot.
-		// Same preference as live admission: a verified row may evict an
-		// unverified in-graph entry; an unverified row is dropped, and
-		// reported so its storage row is deleted. A verified row that cannot
-		// be admitted (everything held is verified, reachable only if the
-		// ceiling was lowered between runs) is skipped WITHOUT the report:
-		// provably-signed data is left on disk for a future run rather than
-		// trimmed.
+		// A verified row may evict an unverified in-graph entry; an unverified
+		// row is dropped, and reported so its storage row is deleted. A
+		// verified row that cannot be admitted (everything held is verified,
+		// reachable only if the ceiling was lowered between runs) is skipped
+		// WITHOUT the report: signed data is left on disk for a future run
+		// rather than trimmed. Unlike live admission, a verified row never
+		// displaces another verified one here, since that would only trade one
+		// signed row on disk for another.
 		const isNew = !this._channels.has(scidHex);
 		if (isNew && this._channels.size >= NetworkGraph.MAX_CHANNELS) {
 			if (channel.announcementVerified === true) {
 				this._deferredNodeEvictions = [];
-				if (!this._evictOneUnverified()) {
+				if (!this._evictOne(false)) {
 					this._deferredNodeEvictions = null;
 					return;
 				}
@@ -1042,11 +1136,7 @@ export class NetworkGraph {
 				// checks: 4 announcement, 2 updates, 2 node announcements).
 				const t0 = Date.now();
 				if (channel.announcementVerifyDeferred === true) {
-					channel.announcementVerified = verifyChannelAnnouncementMessage(
-						channel.announcement
-					);
-					channel.announcementVerifyDeferred = undefined;
-					this._syncUnverifiedIndex(scidHex, channel);
+					this._resolveDeferredAnnouncement(scidHex, channel);
 				}
 				// The updates and node announcements of a non-servable channel
 				// are never verified: its endpoint keys are unauthenticated.

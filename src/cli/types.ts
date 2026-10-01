@@ -869,8 +869,9 @@ export interface BeignetConfig {
 	/** Hard bound on the content one guardian set may store (its encoded
 	 *  rows; SQLite's overhead comes on top): every write, epoch rows and
 	 *  rotations included, that would cross it is refused with
-	 *  ERR_QUOTA_EXCEEDED (default 268435456, 256 MiB). Refuses, never
-	 *  deletes. Env: BEIGNET_GUARDIAN_MAX_BYTES. */
+	 *  ERR_QUOTA_EXCEEDED (default 268435456, 256 MiB). A set registers at
+	 *  most 8 namespaces, and each may store an eighth of this. Refuses,
+	 *  never deletes. Env: BEIGNET_GUARDIAN_MAX_BYTES. */
 	guardianMaxBytesPerSet?: number;
 	/** Guardian sets this node will register (default 16). Env:
 	 *  BEIGNET_GUARDIAN_MAX_SETS. */
@@ -971,7 +972,7 @@ export interface EventMessage {
 export interface ApiResponse<T> {
 	ok: boolean;
 	result?: T;
-	error?: { code: string; message: string };
+	error?: { code: string; message: string; paymentHash?: string };
 }
 
 export interface PaymentFilter {

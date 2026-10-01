@@ -25,6 +25,8 @@ import { AUTH_OFF_WARNING, startDaemon } from './daemon';
 import { daemonOptions } from './daemon-options';
 import { defaultDataDirForMnemonic } from './beignet-node';
 import { performDbRestore } from './restore';
+import { deriveBackupMacKey } from './backup-mac';
+import * as bip39 from 'bip39';
 import { InstanceLockError } from './instance-lock';
 import { installProcessFaultHandlers } from './process-faults';
 import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
@@ -420,11 +422,12 @@ function handleInit(): void {
 		// one here, the same way a fresh one does.
 		const apiToken = mintApiTokenIfAbsent(config);
 		if (apiToken) saveConfig(config);
+		// The seed is printed only when it is created: a scripted re-run
+		// would otherwise copy it into whatever logs its output.
 		output({
 			ok: true,
 			result: {
 				message: 'Config already exists',
-				mnemonic: config.mnemonic,
 				network: config.network,
 				...(apiToken ? { apiToken, note: API_TOKEN_NOTE } : {})
 			}
@@ -730,30 +733,33 @@ function readPsbtArg(arg?: string): string | undefined {
 async function handlePsbt(): Promise<void> {
 	const sub = filteredArgs[1];
 	switch (sub) {
-		case 'build':
+		case 'build': {
+			const pos = positionalArgs();
 			return outputResult(
 				await httpRequest('POST', '/psbt/build', {
 					outputs: [
 						{
-							address: filteredArgs[2],
-							amountSats: parseInt(filteredArgs[3], 10)
+							address: pos[2],
+							amountSats: parseInt(pos[3], 10)
 						}
 					],
-					satsPerVbyte: filteredArgs[4]
-						? parseInt(filteredArgs[4], 10)
-						: undefined
+					satsPerVbyte: pos[4] ? parseInt(pos[4], 10) : undefined
 				})
 			);
-		case 'import-signed':
+		}
+		case 'import-signed': {
+			const pos = positionalArgs();
 			return outputResult(
 				await httpRequest('POST', '/psbt/import-signed', {
-					psbtBase64: readPsbtArg(filteredArgs[2])
+					psbtBase64: readPsbtArg(pos[2]),
+					unsignedPsbtBase64: readPsbtArg(pos[3])
 				})
 			);
+		}
 		case 'combine':
 			return outputResult(
 				await httpRequest('POST', '/psbt/combine', {
-					psbts: filteredArgs
+					psbts: positionalArgs()
 						.slice(2)
 						.map((arg) => readPsbtArg(arg))
 						.filter((psbt): psbt is string => !!psbt)
@@ -765,7 +771,7 @@ async function handlePsbt(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet psbt [build <address> <sats> [satsPerVbyte]|import-signed <psbtBase64|file>|combine <psbt|file> <psbt|file> ...]'
+						'Usage: beignet psbt [build <address> <sats> [satsPerVbyte]|import-signed <psbtBase64|file> [unsignedPsbt|file]|combine <psbt|file> <psbt|file> ...]'
 				}
 			});
 			process.exitCode = 1;
@@ -1747,7 +1753,7 @@ async function handleWebhooks(): Promise<void> {
 					error: {
 						code: 'INVALID_PARAMS',
 						message:
-							'Usage: beignet webhooks register <url> <event,event,...|*> [--secret <secret>]'
+							'Usage: beignet webhooks register <url> <event,event,...|*> [--secret <secret>] [--allow-private-network]'
 					}
 				});
 				process.exitCode = 1;
@@ -1760,7 +1766,8 @@ async function handleWebhooks(): Promise<void> {
 						.split(',')
 						.map((e) => e.trim())
 						.filter((e) => e.length > 0),
-					secret: parseFlag('--secret')
+					secret: parseFlag('--secret'),
+					allowPrivateNetwork: hasFlag('--allow-private-network') || undefined
 				})
 			);
 		}
@@ -2481,7 +2488,7 @@ async function handleMessage(): Promise<void> {
 }
 
 async function handleBackup(): Promise<void> {
-	const sub = filteredArgs[1];
+	const sub = positionalArgs(undefined, new Set(['--overwrite']))[1];
 	if (sub === 'trigger') {
 		// On-demand encrypted database backup to the configured backupPath.
 		return outputResult(await httpRequest('POST', '/backup/trigger'));
@@ -2515,13 +2522,19 @@ async function handleBackup(): Promise<void> {
 			error: {
 				code: 'INVALID_PARAMS',
 				message:
-					'Usage: beignet backup <destPath> | beignet backup scb [destPath] | beignet backup trigger'
+					'Usage: beignet backup <destPath> [--overwrite] | beignet backup scb [destPath] | beignet backup trigger'
 			}
 		});
 		process.exitCode = 1;
 		return;
 	}
-	return outputResult(await httpRequest('POST', '/backup', { destPath: sub }));
+	return outputResult(
+		await httpRequest('POST', '/backup', {
+			// The daemon would resolve a relative path against its own cwd.
+			destPath: nodePath.resolve(sub),
+			...(hasFlag('--overwrite') ? { overwrite: true } : {})
+		})
+	);
 }
 
 async function handleGuardian(): Promise<void> {
@@ -2676,12 +2689,16 @@ async function handleRestore(): Promise<void> {
 		// OFFLINE full-state restore: copies a database backup into place. The
 		// daemon must be stopped - the restore holds the same single-instance
 		// lock the daemon takes, so a live node is never overwritten.
-		if (!file) {
+		const backupFile = positionalArgs(
+			undefined,
+			new Set(['--unauthenticated'])
+		)[2];
+		if (!backupFile) {
 			output({
 				ok: false,
 				error: {
 					code: 'INVALID_PARAMS',
-					message: 'Usage: beignet restore db <backupFile>'
+					message: 'Usage: beignet restore db <backupFile> [--unauthenticated]'
 				}
 			});
 			process.exitCode = 1;
@@ -2726,11 +2743,15 @@ async function handleRestore(): Promise<void> {
 		const lockPath = nodePath.join(dataDir, `${network}.lock`);
 		try {
 			ensurePrivateDir(dataDir);
-			const result = performDbRestore(file, dbPath, lockPath);
+			const result = await performDbRestore(backupFile, dbPath, lockPath, {
+				macKey: deriveBackupMacKey(bip39.mnemonicToSeedSync(config.mnemonic)),
+				allowUnauthenticated: hasFlag('--unauthenticated')
+			});
 			output({
 				ok: true,
 				result: {
 					restored: true,
+					authenticated: result.authenticated,
 					dbPath: result.dbPath,
 					preRestorePath: result.preRestorePath,
 					network,
@@ -2843,8 +2864,12 @@ On-chain:
   psbt build <address> <sats> [satsPerVbyte]
                                          Build an UNSIGNED PSBT for an external
                                          signer (hardware wallet)
-  psbt import-signed <psbtBase64|file>   Validate + finalize a signed PSBT;
-                                         returns txid/txHex WITHOUT broadcast
+  psbt import-signed <psbtBase64|file> [unsignedPsbt|file]
+                                         Validate + finalize a signed PSBT;
+                                         returns txid/txHex WITHOUT broadcast.
+                                         Pass the unsigned PSBT from psbt build
+                                         once the daemon has restarted or made
+                                         50 newer builds
   psbt combine <psbt|file> <psbt|file>   Combine partially signed PSBT copies
   transactions [limit]                   List on-chain transactions (newest first)
   utxos                                  List wallet UTXOs (includes frozen flag)
@@ -2858,7 +2883,9 @@ On-chain:
                                          (public keys only, never private)
   recover-fallback-funds [--fee-rate N]  Sweep funding-key fallback UTXOs into
                                          the wallet
-  backup <destPath>                      Create database backup
+  backup <destPath> [--overwrite]        Create database backup, MAC in
+                                         <destPath>.hmac (--overwrite to
+                                         replace existing files)
   backup trigger                         Run the configured scheduled backup now
   backup scb [destPath]                  Export encrypted static channel backup
   backup peer-retrieved                  Show newest SCB returned by a peer
@@ -2866,9 +2893,12 @@ On-chain:
   restore scb <file>                     Restore channels from an SCB (on-chain
                                          recovery only: peers force-close and
                                          funds are swept to the wallet)
-  restore db <backupFile>                Restore a database backup (full state;
+  restore db <backupFile> [--unauthenticated]
+                                         Restore a database backup (full state;
                                          OFFLINE - stop the daemon first; needs
-                                         the same mnemonic, DB is seed-encrypted)
+                                         the same mnemonic and <backupFile>.hmac;
+                                         --unauthenticated accepts a backup made
+                                         before backups carried a MAC)
   recovery status                        Recovery Protocol status: mode, guardian
                                          set, startup gate, durable sequence
   recovery restore                       Restore this node from its guardian
@@ -3100,9 +3130,11 @@ Direct funding (a payer's on-chain payment IS this node's channel funding):
                                          is known rather than failing
 
 Webhooks (event push; see also GET /events SSE):
-  webhooks register <url> <events> [--secret S]
-                                         Register a callback URL; <events> is
-                                         comma-separated (or '*' for all)
+  webhooks register <url> <events> [--secret S] [--allow-private-network]
+                                         Register an http(s) callback URL;
+                                         <events> is comma-separated (or '*'
+                                         for all). Loopback and private hosts
+                                         need --allow-private-network
   webhooks unregister <id>               Remove a webhook
   webhooks list                          List registered webhooks
 

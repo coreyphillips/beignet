@@ -21,9 +21,14 @@ import {
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
 	encodeNodeAnnouncementMessage,
+	decodeNodeAnnouncementMessage,
 	announcedDialableAddresses
 } from '../../src/lightning/gossip/messages';
-import { signNodeAnnouncement } from '../../src/lightning/gossip/validation';
+import {
+	signNodeAnnouncement,
+	verifyNodeAnnouncement,
+	verifyNodeAnnouncementMessage
+} from '../../src/lightning/gossip/validation';
 import {
 	ADDRESS_TYPE_IPV4,
 	ADDRESS_TYPE_TORV2,
@@ -366,6 +371,43 @@ describe('LightningNode: channel peer address capture', function () {
 			timestamp: 2000,
 			addresses: []
 		});
+		h.node.destroy();
+	});
+
+	it('keeps the addresses before an unknown descriptor type (issue #1025)', function () {
+		const h = makeCaptureHarness();
+		// BOLT 7: ignore the first unknown descriptor (and so everything after
+		// it, since its length is unknown) but keep what came before.
+		const head = encodeNodeAnnouncementMessage({
+			signature: Buffer.alloc(64),
+			features: Buffer.alloc(0),
+			timestamp: 1000,
+			nodeId: getPublicKey(h.peerKey),
+			rgbColor: Buffer.from([0, 0, 0]),
+			alias: Buffer.alloc(32),
+			addresses: []
+		}).subarray(0, 138);
+		const ipv4 = (last: number): Buffer =>
+			Buffer.from([ADDRESS_TYPE_IPV4, 203, 0, 113, last, 0x26, 0x07]);
+		const addresses = Buffer.concat([
+			ipv4(7),
+			Buffer.from([42, 0xde, 0xad]),
+			ipv4(8)
+		]);
+		const addrlen = Buffer.alloc(2);
+		addrlen.writeUInt16BE(addresses.length, 0);
+		const payload = Buffer.concat([head, addrlen, addresses]);
+		signNodeAnnouncement(payload, h.peerKey).copy(payload, 0);
+
+		const msg = decodeNodeAnnouncementMessage(payload);
+		expect(msg.addresses).to.deep.equal([ADDR_1]);
+		// Signed over bytes we cannot reproduce, so never served onward.
+		expect(verifyNodeAnnouncement(msg, payload)).to.equal(true);
+		expect(verifyNodeAnnouncementMessage(msg)).to.equal(false);
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(h.node as any).handleNodeAnnouncement(payload);
+		expect(h.announced()).to.deep.equal([{ host: '203.0.113.7', port: 9735 }]);
 		h.node.destroy();
 	});
 

@@ -69,6 +69,69 @@ describe('HttpRateLimiter', () => {
 		limiter.destroy();
 	});
 
+	describe('bucket eviction (issue #1045)', () => {
+		const realNow = Date.now;
+		let now: number;
+
+		beforeEach(() => {
+			now = realNow();
+			Date.now = (): number => now;
+		});
+
+		afterEach(() => {
+			Date.now = realNow;
+		});
+
+		it('prune drops every bucket idle for a window, however many tokens it spent', () => {
+			const limiter = new HttpRateLimiter({ maxRequests: 5, windowMs: 60_000 });
+			for (let i = 0; i < 1000; i++) {
+				limiter.isAllowed(`two-${i}`);
+				limiter.isAllowed(`two-${i}`);
+			}
+			for (let i = 0; i < 6; i++) limiter.isAllowed('drained');
+			expect(limiter.size).to.equal(1001);
+
+			now += 59_999;
+			expect(limiter.prune()).to.equal(0);
+			now += 1;
+			expect(limiter.prune()).to.equal(1001);
+			expect(limiter.size).to.equal(0);
+			limiter.destroy();
+		});
+
+		it('prune keeps a bucket seen within the window', () => {
+			const limiter = new HttpRateLimiter({ maxRequests: 5, windowMs: 60_000 });
+			limiter.isAllowed('old');
+			now += 30_000;
+			limiter.isAllowed('recent');
+			now += 30_000;
+			expect(limiter.prune()).to.equal(1);
+			expect(limiter.size).to.equal(1);
+			limiter.destroy();
+		});
+
+		it('holds at most maxClients buckets, dropping the least recently seen', () => {
+			const limiter = new HttpRateLimiter({
+				maxRequests: 1,
+				windowMs: 60_000,
+				maxClients: 3
+			});
+			for (const key of ['a', 'b', 'c']) {
+				expect(limiter.isAllowed(key)).to.be.true;
+			}
+			// Seen again (and refused), so b is now the least recent.
+			expect(limiter.isAllowed('a')).to.be.false;
+			expect(limiter.isAllowed('d')).to.be.true;
+			expect(limiter.size).to.equal(3);
+			expect(limiter.isAllowed('a')).to.be.false;
+			expect(limiter.isAllowed('c')).to.be.false;
+			// b's bucket was the one dropped, so it starts over.
+			expect(limiter.isAllowed('b')).to.be.true;
+			expect(limiter.size).to.equal(3);
+			limiter.destroy();
+		});
+	});
+
 	it('uses default values when no options provided', () => {
 		const limiter = new HttpRateLimiter();
 		// Should allow at least 100 requests (the default)

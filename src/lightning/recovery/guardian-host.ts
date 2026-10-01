@@ -21,15 +21,23 @@
  * Quotas refuse, never delete: pruning a namespace wedges a stranger's node
  * permanently (spec 5.8, the compaction retain floor), so an exhausted quota
  * answers ERR_QUOTA_EXCEEDED and the operator raises it or the writer moves
- * on. The byte quota bounds the encoded content a set stores (every column
- * of every row, GuardianStore.contentBytes) and is the guardian's own
- * `maxContentBytes`, judged inside each write's BEGIN IMMEDIATE after the
- * retirement check and before the verb's own verdicts, against a counter
- * the store itself keeps: every mutating verb is under it, a replay the
- * guardian answers from what it holds costs nothing, a replaced row costs
- * new minus old, and two hosts opened on one store admit against the same
- * total. The counter is re-derived from the rows at every open. Disk is
- * that content plus SQLite's overhead and is reported alongside it.
+ * on. Only a writer's own signed retain floor frees records (wire 5.2), and
+ * that is what keeps ordinary use under the quota. The byte quotas bound the encoded content a set stores (every column
+ * of every row, GuardianStore.contentBytes) and the content each
+ * recovery_id stores within it, and are the guardian's own
+ * `maxContentBytes` and `maxNamespaceContentBytes`, judged inside each
+ * write's BEGIN IMMEDIATE after the retirement check and before the verb's
+ * own verdicts, against counters the store itself keeps: every mutating
+ * verb is under them, a replay the guardian answers from what it holds
+ * costs nothing, a replaced row costs new minus old, and two hosts opened
+ * on one store admit against the same totals. The counters are re-derived
+ * from the rows at every open. Disk is that content plus SQLite's overhead
+ * and is reported alongside it.
+ *
+ * A set's namespaces are counted too (`maxNamespaces`), and by default each
+ * one's allowance is the set's divided by that count: namespaces sharing a
+ * set's guardians never spend each other's room, however much one of them
+ * writes.
  */
 
 import * as fs from 'fs';
@@ -75,6 +83,7 @@ import {
 export const GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES = 4 * 1024 * 1024;
 export const GUARDIAN_HOST_DEFAULT_MAX_BYTES_PER_SET = 256 * 1024 * 1024;
 export const GUARDIAN_HOST_DEFAULT_MAX_SETS = 16;
+export const GUARDIAN_HOST_DEFAULT_MAX_NAMESPACES_PER_SET = 8;
 const MAX_RECORDS_PER_GET = 256;
 const INDEX_FILE = 'sets.json';
 
@@ -94,6 +103,14 @@ export interface IGuardianHostConfig {
 	maxCiphertextBytes?: number;
 	/** Content a single set may store before writes are refused. Default 256 MiB. */
 	maxBytesPerSet?: number;
+	/** Namespaces (recovery ids) a single set will register. Default 8. */
+	maxNamespacesPerSet?: number;
+	/**
+	 * Content a single namespace may store within its set. Default
+	 * maxBytesPerSet / maxNamespacesPerSet, so a set full of namespaces
+	 * each at its allowance still fits the set.
+	 */
+	maxBytesPerNamespace?: number;
 	/** Sets this host will register. Default 16. */
 	maxSets?: number;
 	maxInFlightPerSession?: number;
@@ -134,6 +151,8 @@ export interface IGuardianHostStatus {
 	limits: {
 		maxCiphertextBytes: number;
 		maxBytesPerSet: number;
+		maxNamespacesPerSet: number;
+		maxBytesPerNamespace: number;
 		maxSets: number;
 	};
 }
@@ -175,6 +194,8 @@ export class GuardianHost implements IGuardianResolver {
 	private readonly authenticate?: (auth: Buffer | undefined) => boolean;
 	private readonly maxCiphertextBytes: number;
 	private readonly maxBytesPerSet: number;
+	private readonly maxNamespacesPerSet: number;
+	private readonly maxBytesPerNamespace: number;
 	private readonly maxSets: number;
 	private readonly clock: () => number;
 	private handled = 0;
@@ -191,6 +212,18 @@ export class GuardianHost implements IGuardianResolver {
 			config.maxCiphertextBytes ?? GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES;
 		this.maxBytesPerSet =
 			config.maxBytesPerSet ?? GUARDIAN_HOST_DEFAULT_MAX_BYTES_PER_SET;
+		this.maxNamespacesPerSet =
+			config.maxNamespacesPerSet ??
+			GUARDIAN_HOST_DEFAULT_MAX_NAMESPACES_PER_SET;
+		if (
+			!Number.isInteger(this.maxNamespacesPerSet) ||
+			this.maxNamespacesPerSet < 1
+		) {
+			throw new Error('maxNamespacesPerSet must be a positive integer');
+		}
+		this.maxBytesPerNamespace =
+			config.maxBytesPerNamespace ??
+			Math.floor(this.maxBytesPerSet / this.maxNamespacesPerSet);
 		this.maxSets = config.maxSets ?? GUARDIAN_HOST_DEFAULT_MAX_SETS;
 		this.clock = config.clock ?? ((): number => Date.now());
 		fs.mkdirSync(config.path, { recursive: true });
@@ -350,7 +383,9 @@ export class GuardianHost implements IGuardianResolver {
 				type: 'guardian:quota-refused',
 				detail: `set ${key} holds ${served.guardian.contentBytes()} of ${
 					this.maxBytesPerSet
-				} bytes; a ${verb} was refused`,
+				} bytes (${this.maxBytesPerNamespace} per namespace, ${
+					this.maxNamespacesPerSet
+				} namespaces); a ${verb} was refused`,
 				setId: key
 			});
 		}
@@ -382,6 +417,8 @@ export class GuardianHost implements IGuardianResolver {
 			limits: {
 				maxCiphertextBytes: this.maxCiphertextBytes,
 				maxBytesPerSet: this.maxBytesPerSet,
+				maxNamespacesPerSet: this.maxNamespacesPerSet,
+				maxBytesPerNamespace: this.maxBytesPerNamespace,
 				maxSets: this.maxSets
 			}
 		};
@@ -460,7 +497,10 @@ export class GuardianHost implements IGuardianResolver {
 			if (outcome.status === GuardianStatus.ERR_QUOTA_EXCEEDED) {
 				this.emit({
 					type: 'guardian:quota-refused',
-					detail: `set ${key} cannot hold a registration within ${this.maxBytesPerSet} bytes`,
+					detail: `set ${key} cannot hold a registration within ${Math.min(
+						this.maxBytesPerSet,
+						this.maxBytesPerNamespace
+					)} bytes`,
 					setId: key
 				});
 			}
@@ -504,6 +544,8 @@ export class GuardianHost implements IGuardianResolver {
 			maxCiphertextBytes: this.maxCiphertextBytes,
 			maxRecordsPerGet: MAX_RECORDS_PER_GET,
 			maxContentBytes: this.maxBytesPerSet,
+			maxNamespaceContentBytes: this.maxBytesPerNamespace,
+			maxNamespaces: this.maxNamespacesPerSet,
 			clock: (): bigint => BigInt(this.clock())
 		});
 		return {

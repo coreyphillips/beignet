@@ -51,6 +51,12 @@ const TLV_CHANNEL_TYPE = 1n;
  * local_nonce convention; pin against LND at interop time.)
  */
 const TLV_NEXT_LOCAL_NONCE = 4n;
+/** Shared by open_channel and accept_channel. */
+const OPEN_ACCEPT_TLV_TYPES = new Set<bigint>([
+	TLV_UPFRONT_SHUTDOWN_SCRIPT,
+	TLV_CHANNEL_TYPE,
+	TLV_NEXT_LOCAL_NONCE
+]);
 
 export interface IOpenChannelMessage {
 	chainHash: Buffer;
@@ -245,7 +251,7 @@ export function decodeOpenChannelMessage(payload: Buffer): IOpenChannelMessage {
 
 	// Parse TLV
 	if (offset < payload.length) {
-		const { records } = decodeTlvStream(payload, offset);
+		const { records } = decodeTlvStream(payload, offset, OPEN_ACCEPT_TLV_TYPES);
 		for (const record of records) {
 			if (record.type === TLV_UPFRONT_SHUTDOWN_SCRIPT) {
 				result.upfrontShutdownScript = record.value;
@@ -385,7 +391,7 @@ export function decodeAcceptChannelMessage(
 	};
 
 	if (offset < payload.length) {
-		const { records } = decodeTlvStream(payload, offset);
+		const { records } = decodeTlvStream(payload, offset, OPEN_ACCEPT_TLV_TYPES);
 		for (const record of records) {
 			if (record.type === TLV_UPFRONT_SHUTDOWN_SCRIPT) {
 				result.upfrontShutdownScript = record.value;

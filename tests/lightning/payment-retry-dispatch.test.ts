@@ -22,6 +22,7 @@ import {
 } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
+	ChannelResult,
 	DEFAULT_CHANNEL_CONFIG,
 	BITCOIN_CHAIN_HASH,
 	REGTEST_CHAIN_HASH
@@ -44,6 +45,7 @@ import {
 	AMOUNT_BELOW_MINIMUM
 } from '../../src/lightning/onion/types';
 import { encodeChannelUpdateMessage } from '../../src/lightning/gossip/messages';
+import { MessageType } from '../../src/lightning/message/types';
 import { signChannelUpdate } from '../../src/lightning/gossip/validation';
 import { calculateFee } from '../../src/lightning/gossip/pathfinding';
 
@@ -308,6 +310,76 @@ describe('Payment retry actually dispatches', () => {
 		alice.destroy();
 		bob.destroy();
 	});
+
+	// Each attempt replaces the record, so the caller's metadata has to ride
+	// the retry context onto every one of them (issue #1152).
+	it('carries the caller metadata onto every attempt', () => {
+		const { alice, bob } = setupPair(908, 909);
+		const invoice = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'labelled'
+		});
+		const seen: Array<Record<string, string> | undefined> = [];
+		const labels = { requestId: 'req-1' };
+		const attempts = failEveryHtlcTemporarily(bob, () => {
+			seen.push(alice.getPayment(invoice.paymentHash)?.metadata);
+			// The caller changing its own object must not relabel a retry.
+			labels.requestId = 'changed';
+		});
+
+		alice.sendPaymentWithOptions(invoice.bolt11, { metadata: labels });
+
+		expect(attempts()).to.be.greaterThan(1);
+		expect(seen).to.have.length(attempts());
+		for (const metadata of seen) {
+			expect(metadata).to.deep.equal({ requestId: 'req-1' });
+		}
+		const failed = alice.getPayment(invoice.paymentHash)!;
+		expect(failed.status).to.equal(PaymentStatus.FAILED);
+		expect(failed.metadata).to.deep.equal({ requestId: 'req-1' });
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it("does not relabel a later send's retries with a failed send's metadata", () => {
+		const { alice, bob } = setupPair(914, 915);
+		const invoice = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'relabelled'
+		});
+		// The first send throws after seeding its retry context.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const a = alice as any;
+		a.findChannelForPeer = (): null => null;
+		a.findLocalChannelByScid = (): null => null;
+		expect(() =>
+			alice.sendPaymentWithOptions(invoice.bolt11, {
+				metadata: { requestId: 'first' }
+			})
+		).to.throw(/No channel to first hop/);
+		delete a.findChannelForPeer;
+		delete a.findLocalChannelByScid;
+
+		const seen: Array<Record<string, string> | undefined> = [];
+		const attempts = failEveryHtlcTemporarily(bob, () => {
+			seen.push(alice.getPayment(invoice.paymentHash)?.metadata);
+		});
+		alice.sendPaymentWithOptions(invoice.bolt11, {
+			metadata: { requestId: 'second' }
+		});
+
+		expect(attempts()).to.be.greaterThan(1);
+		for (const metadata of seen) {
+			expect(metadata).to.deep.equal({ requestId: 'second' });
+		}
+		expect(alice.getPayment(invoice.paymentHash)!.metadata).to.deep.equal({
+			requestId: 'second'
+		});
+
+		alice.destroy();
+		bob.destroy();
+	});
 });
 
 describe('Retry context lifecycle', () => {
@@ -366,6 +438,414 @@ describe('Retry context lifecycle', () => {
 			a.paymentRetryContexts.size,
 			'contexts with a payment record survive'
 		).to.equal(liveContexts);
+
+		alice.destroy();
+		bob.destroy();
+	});
+});
+
+describe('Issue #1041: a BOLT 11 send that ended leaves no context for the next', () => {
+	// The earlier send asks for ten times the later one's amount under a
+	// hundred times its fee cap. This pair carries dust HTLCs only, hence
+	// the small sizes.
+	const EARLIER = { amountMsat: 200_000n, maxFeeMsat: 10_000n };
+	const LATER = { amountMsat: 20_000n, maxFeeMsat: 100n };
+
+	/** Zero-amount invoice from bob, and alice's view of its retry context. */
+	function zeroAmountInvoice(
+		alice: LightningNode,
+		bob: LightningNode
+	): { bolt11: string; paymentHash: Buffer; hasContext: () => boolean } {
+		const invoice = bob.createInvoice({ description: 'zero-amount' });
+		const hashHex = invoice.paymentHash.toString('hex');
+		return {
+			bolt11: invoice.bolt11,
+			paymentHash: invoice.paymentHash,
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			hasContext: () => (alice as any).paymentRetryContexts.has(hashHex)
+		};
+	}
+
+	/** Fail every HTLC at bob and record the amount of each attempt alice sent. */
+	function recordAttemptAmounts(
+		alice: LightningNode,
+		bob: LightningNode,
+		paymentHash: Buffer,
+		onAttempt?: () => void
+	): bigint[] {
+		const amounts: bigint[] = [];
+		failEveryHtlcTemporarily(bob, () => {
+			amounts.push(alice.getPayment(paymentHash)!.amountMsat);
+			onAttempt?.();
+		});
+		return amounts;
+	}
+
+	function refuseEveryAdd(alice: LightningNode): () => void {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const manager = alice.getChannelManager() as any;
+		manager.addHtlc = (): ChannelResult => ({
+			ok: false,
+			actions: [],
+			error: 'refused for the test'
+		});
+		return () => delete manager.addHtlc;
+	}
+
+	function throwNoChannelToHop(alice: LightningNode): () => void {
+		// A route is found over the graph, then no channel can carry it.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const a = alice as any;
+		a.findChannelForPeer = (): null => null;
+		a.findLocalChannelByScid = (): null => null;
+		return () => {
+			delete a.findChannelForPeer;
+			delete a.findLocalChannelByScid;
+		};
+	}
+
+	it('a dispatch that throws drops its context, and a re-send retries at its own amount', () => {
+		const { alice, bob } = setupPair(916, 917);
+		const invoice = zeroAmountInvoice(alice, bob);
+
+		const restore = throwNoChannelToHop(alice);
+		expect(() =>
+			alice.sendPaymentWithOptions(invoice.bolt11, EARLIER)
+		).to.throw(/No channel to first hop/);
+		expect(invoice.hasContext()).to.be.false;
+		restore();
+
+		const amounts = recordAttemptAmounts(alice, bob, invoice.paymentHash);
+		alice.sendPaymentWithOptions(invoice.bolt11, LATER);
+
+		expect(amounts.length).to.be.greaterThan(1);
+		expect(amounts).to.deep.equal(amounts.map(() => LATER.amountMsat));
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a dispatch whose HTLC is refused locally drops its context', () => {
+		const { alice, bob } = setupPair(918, 919);
+		const invoice = zeroAmountInvoice(alice, bob);
+
+		const restore = refuseEveryAdd(alice);
+		const refused = alice.sendPaymentWithOptions(invoice.bolt11, EARLIER);
+		expect(refused.status).to.equal(PaymentStatus.FAILED);
+		expect(invoice.hasContext()).to.be.false;
+		restore();
+
+		const amounts = recordAttemptAmounts(alice, bob, invoice.paymentHash);
+		alice.sendPaymentWithOptions(invoice.bolt11, LATER);
+
+		expect(amounts.length).to.be.greaterThan(1);
+		expect(amounts).to.deep.equal(amounts.map(() => LATER.amountMsat));
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a dispatch that throws once its HTLC is out keeps the context', () => {
+		const { alice, bob } = setupPair(928, 929);
+		const invoice = zeroAmountInvoice(alice, bob);
+
+		// The transport throws as update_add_htlc leaves, after the channel
+		// already holds the HTLC.
+		let thrown = false;
+		alice.prependListener(
+			'message:outbound',
+			(_pubkey: string, type: number) => {
+				if (type !== MessageType.UPDATE_ADD_HTLC || thrown) return;
+				thrown = true;
+				throw new Error('transport failed');
+			}
+		);
+		expect(() =>
+			alice.sendPaymentWithOptions(invoice.bolt11, EARLIER)
+		).to.throw(/transport failed/);
+
+		expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+		expect(alice.getOutgoingHtlcs(invoice.paymentHash).htlcs).to.have.length(1);
+		expect(invoice.hasContext()).to.be.true;
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	// Issue #1191: the same throw from an automatic retry.
+	it('a retry that throws once its HTLC is out keeps its record and context', () => {
+		const { alice, bob } = setupPair(970, 971);
+		const invoice = zeroAmountInvoice(alice, bob);
+		const attempts = failEveryHtlcTemporarily(bob);
+
+		// bob fails the first attempt. The transport throws as the retry's
+		// update_add_htlc leaves, after the channel already holds its HTLC.
+		let adds = 0;
+		alice.prependListener(
+			'message:outbound',
+			(_pubkey: string, type: number) => {
+				if (type !== MessageType.UPDATE_ADD_HTLC) return;
+				if (++adds === 2) throw new Error('transport failed');
+			}
+		);
+		const logs: Array<{ action: string; data: Record<string, unknown> }> = [];
+		alice.on('log', (log) => logs.push(log));
+		const first = alice.sendPaymentWithOptions(invoice.bolt11, EARLIER);
+		expect(attempts()).to.equal(1);
+		expect(adds).to.equal(2);
+
+		const live = alice
+			.getOutgoingHtlcs(invoice.paymentHash)
+			.htlcs.filter((htlc) => !htlc.terminal);
+		expect(live).to.have.length(1);
+		const record = alice.getPayment(invoice.paymentHash)!;
+		expect(record, "the retry's record, not the failed attempt's").to.not.equal(
+			first
+		);
+		expect(record.status).to.equal(PaymentStatus.PENDING);
+		expect(record.retryCount).to.equal(1);
+		expect(record.sharedSecrets).to.not.equal(first.sharedSecrets);
+		expect(
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).htlcPaymentMap.get(
+				`${live[0].channelId.toString('hex')}:offered-${live[0].htlcId}`
+			)
+		).to.equal(invoice.paymentHash.toString('hex'));
+		expect(invoice.hasContext()).to.be.true;
+		expect(
+			logs.some(
+				(log) =>
+					log.action === 'retry_dispatch_threw' &&
+					log.data.error === 'transport failed'
+			)
+		).to.be.true;
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	// Issue #1192: a listener of the failed attempt's resolution replaces
+	// the send before the failed attempt's handler returns.
+	it('a re-send from a payment:htlc-resolved listener keeps its record and context', () => {
+		const { alice, bob } = setupPair(974, 975);
+		const invoice = zeroAmountInvoice(alice, bob);
+		const hashHex = invoice.paymentHash.toString('hex');
+		// bob fails the first attempt and holds every later one.
+		failEveryHtlcTemporarily(bob, () => {
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(bob as any).handleFinalHopHtlc = (): void => {};
+		});
+		let adds = 0;
+		alice.prependListener(
+			'message:outbound',
+			(_pubkey: string, type: number) => {
+				if (type === MessageType.UPDATE_ADD_HTLC) adds++;
+			}
+		);
+		alice.once('payment:htlc-resolved', () => {
+			alice.failPayment(invoice.paymentHash);
+			alice.sendPaymentWithOptions(invoice.bolt11, LATER);
+		});
+
+		alice.sendPaymentWithOptions(invoice.bolt11, EARLIER);
+
+		expect(adds, 'the first attempt and the re-send only').to.equal(2);
+		const live = alice
+			.getOutgoingHtlcs(invoice.paymentHash)
+			.htlcs.filter((htlc) => !htlc.terminal);
+		expect(live).to.have.length(1);
+		const record = alice.getPayment(invoice.paymentHash)!;
+		expect(record.status).to.equal(PaymentStatus.PENDING);
+		expect(record.amountMsat).to.equal(LATER.amountMsat);
+		expect(
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).htlcPaymentMap.get(
+				`${live[0].channelId.toString('hex')}:offered-${live[0].htlcId}`
+			)
+		).to.equal(hashHex);
+		expect(
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).paymentRetryContexts.get(hashHex)?.amountMsat
+		).to.equal(LATER.amountMsat);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a payment failed from a payment:htlc-resolved listener is not retried', () => {
+		const { alice, bob } = setupPair(976, 977);
+		const invoice = zeroAmountInvoice(alice, bob);
+		const attempts = failEveryHtlcTemporarily(bob);
+		alice.once('payment:htlc-resolved', () => {
+			alice.failPayment(invoice.paymentHash);
+		});
+
+		const first = alice.sendPaymentWithOptions(invoice.bolt11, EARLIER);
+
+		expect(attempts()).to.equal(1);
+		const record = alice.getPayment(invoice.paymentHash)!;
+		expect(record).to.equal(first);
+		expect(record.status).to.equal(PaymentStatus.FAILED);
+		expect(invoice.hasContext()).to.be.false;
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a retry refused locally rolls back when the error listener throws', () => {
+		const { alice, bob } = setupPair(972, 973);
+		const invoice = zeroAmountInvoice(alice, bob);
+		const config = alice
+			.getChannelManager()
+			.listChannels()[0]
+			.getFullState().remoteConfig;
+		const maxAcceptedHtlcs = config.maxAcceptedHtlcs;
+		const attempts = failEveryHtlcTemporarily(bob, (attempt) => {
+			if (attempt === 1) config.maxAcceptedHtlcs = 0;
+		});
+		alice.once('node:error', () => {
+			throw new Error('local refusal listener failed');
+		});
+		const failures: IPaymentInfo[] = [];
+		alice.on('payment:failed', (payment) => failures.push(payment));
+
+		const first = alice.sendPaymentWithOptions(invoice.bolt11, EARLIER);
+		const record = alice.getPayment(invoice.paymentHash)!;
+		expect(attempts()).to.equal(1);
+		expect(alice.hasHtlcInFlight(invoice.paymentHash)).to.be.false;
+		expect(record).to.equal(first);
+		expect(record.status).to.equal(PaymentStatus.FAILED);
+		expect(record.retryCount).to.equal(0);
+		expect(record.failureCode).to.equal(TEMPORARY_NODE_FAILURE);
+		expect(record.failureReason).to.contain('local refusal listener failed');
+		expect(failures).to.deep.equal([record]);
+		expect(invoice.hasContext()).to.be.false;
+
+		config.maxAcceptedHtlcs = maxAcceptedHtlcs;
+		expect(() =>
+			alice.sendPaymentWithOptions(invoice.bolt11, LATER)
+		).to.not.throw();
+		expect(attempts()).to.be.greaterThan(1);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it("a re-send is not held to a thrown send's CLTV ceiling", () => {
+		const { alice, bob } = setupPair(920, 921);
+		alice.handleNewBlock(1000);
+		bob.handleNewBlock(1000);
+		const invoice = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'ceiling'
+		});
+
+		const restore = throwNoChannelToHop(alice);
+		expect(() =>
+			alice.sendPaymentWithOptions(invoice.bolt11, {
+				maxCltvExpiryHeight: 1100
+			})
+		).to.throw(/No channel to first hop/);
+		restore();
+
+		// The earlier ceiling is now below the chain; this send set none.
+		alice.handleNewBlock(1200);
+		bob.handleNewBlock(1200);
+		expect(alice.sendPayment(invoice.bolt11).status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a context left by a retry refused locally is replaced by the next send', () => {
+		const { alice, bob } = setupPair(922, 923);
+		const invoice = zeroAmountInvoice(alice, bob);
+
+		// The first attempt reaches bob and fails there. Its retry is refused
+		// by addHtlc, so no onion failure ever ends that payment.
+		let restore: (() => void) | undefined;
+		const amounts = recordAttemptAmounts(
+			alice,
+			bob,
+			invoice.paymentHash,
+			() => {
+				restore ??= refuseEveryAdd(alice);
+			}
+		);
+		alice.sendPaymentWithOptions(invoice.bolt11, EARLIER);
+		expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+		expect(amounts).to.deep.equal([EARLIER.amountMsat]);
+		expect(invoice.hasContext(), 'precondition: the retry left it').to.be.true;
+		restore!();
+
+		amounts.length = 0;
+		alice.sendPaymentWithOptions(invoice.bolt11, LATER);
+
+		expect(amounts.length).to.be.greaterThan(1);
+		expect(amounts).to.deep.equal(amounts.map(() => LATER.amountMsat));
+		expect(alice.getPayment(invoice.paymentHash)!.retryCount).to.equal(
+			amounts.length - 1
+		);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a re-send from a payment:failed listener is not taken for the retry', () => {
+		const { alice, bob } = setupPair(924, 925);
+		const invoice = zeroAmountInvoice(alice, bob);
+
+		// The first attempt fails at bob and its retry is refused locally. A
+		// listener hears that refusal and re-sends at the later amount.
+		let restore: (() => void) | undefined;
+		const amounts = recordAttemptAmounts(
+			alice,
+			bob,
+			invoice.paymentHash,
+			() => {
+				restore ??= refuseEveryAdd(alice);
+			}
+		);
+		alice.once('payment:failed', () => {
+			restore!();
+			alice.sendPaymentWithOptions(invoice.bolt11, LATER);
+		});
+		alice.sendPaymentWithOptions(invoice.bolt11, EARLIER);
+
+		expect(amounts.length).to.be.greaterThan(2);
+		expect(amounts.slice(1)).to.deep.equal(
+			amounts.slice(1).map(() => LATER.amountMsat)
+		);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it("a send refused locally leaves a listener re-send's context alone", () => {
+		const { alice, bob } = setupPair(926, 927);
+		const invoice = zeroAmountInvoice(alice, bob);
+		// bob holds the re-send, so it stays PENDING and keeps its context.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(bob as any).handleFinalHopHtlc = (): void => {};
+
+		const restore = refuseEveryAdd(alice);
+		alice.once('payment:failed', () => {
+			restore();
+			alice.sendPaymentWithOptions(invoice.bolt11, LATER);
+		});
+		const refused = alice.sendPaymentWithOptions(invoice.bolt11, EARLIER);
+		expect(refused.status).to.equal(PaymentStatus.FAILED);
+
+		expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+		expect(invoice.hasContext()).to.be.true;
 
 		alice.destroy();
 		bob.destroy();

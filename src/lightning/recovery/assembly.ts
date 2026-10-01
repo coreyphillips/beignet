@@ -68,6 +68,7 @@ import {
 	RestoreDriver,
 	rotationEntries
 } from './restore-driver';
+import { deriveRecoveryMasterKey } from './journal';
 
 /** One configured guardian: its committed identity and where to reach it. */
 export interface IParsedGuardian {
@@ -411,7 +412,11 @@ export async function buildGuardianRecovery(
 		recoveryRoot: root,
 		clock: config.clock,
 		onEvent: config.onReplicationEvent,
-		allowUnencryptedSecrets: config.allowUnencryptedSecrets
+		allowUnencryptedSecrets: config.allowUnencryptedSecrets,
+		journalKeys: {
+			masterKey: deriveRecoveryMasterKey(config.nodeSecret),
+			nodeId: getPublicKey(config.nodeSecret)
+		}
 	});
 
 	const decision = await replicator.ensureNamespace({

@@ -6,6 +6,9 @@ on:
   push:
     branches: [master]
 
+permissions:
+  contents: read
+
 jobs:
   tests:
     name: Run unit tests
@@ -13,26 +16,27 @@ jobs:
 
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
       - name: Run regtest setup
         run: cd docker && docker compose up --quiet-pull -d
 
+      # A bash /dev/tcp probe rather than wait-for-it, which came unpinned
+      # from the apt mirror.
       - name: Wait for bitcoind
         run: |
-          sudo apt install wait-for-it
-          wait-for-it -h 127.0.0.1 -p 43782 -t 60
+          timeout 60 bash -c 'until (: > /dev/tcp/127.0.0.1/43782) 2>/dev/null; do sleep 1; done'
 
       - name: Set up Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
           cache: 'npm'
 
       # NOT a port check: Docker publishes 60001 the moment the container
-      # starts, so `wait-for-it` returned "available after 0 seconds" while
+      # starts, so a port check returned "available after 0 seconds" while
       # electrs was still starting, and the wallet suite opened its first
       # real connection into a server that was not answering yet. This probe
       # requires a server.version answer and a tip that has caught up with
@@ -94,7 +98,7 @@ jobs:
 
       - name: Dump docker logs on failure
         if: failure()
-        uses: jwalton/gh-docker-logs@v2
+        uses: jwalton/gh-docker-logs@2741064ab9d7af54b0b1ffb6076cf64c16f0220e # v2.2.2
 
   # Its own job rather than another step in `tests`: these eight in-process kill
   # matrices are the most expensive thing in the repo (~9 minutes for 30 tests,
@@ -117,12 +121,12 @@ jobs:
 
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
       - name: Set up Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
           cache: 'npm'
@@ -143,12 +147,12 @@ jobs:
 
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
       - name: Set up Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
           cache: 'npm'
@@ -171,12 +175,12 @@ jobs:
 
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
       - name: Set up Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
           cache: 'npm'
