@@ -3814,7 +3814,10 @@ export class Channel {
 		}
 
 		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
-		const fforSettleRefusal = this._fforUpdateRefusal('settle', htlcId);
+		const fforSettleRefusal = this._fforUpdateRefusal('settle', {
+			id: htlcId,
+			direction: HtlcDirection.RECEIVED
+		});
 		if (fforSettleRefusal) {
 			return [
 				{
@@ -3914,7 +3917,11 @@ export class Channel {
 		}
 
 		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
-		const fforPeerSettleRefusal = this._fforUpdateRefusal('settle', msg.id);
+		// The peer's id names an HTLC we offered.
+		const fforPeerSettleRefusal = this._fforUpdateRefusal('settle', {
+			id: msg.id,
+			direction: HtlcDirection.OFFERED
+		});
 		if (fforPeerSettleRefusal) {
 			return this._failChannelWithWireError(fforPeerSettleRefusal);
 		}
@@ -4047,7 +4054,10 @@ export class Channel {
 		}
 
 		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
-		const fforSettleRefusal = this._fforUpdateRefusal('settle', htlcId);
+		const fforSettleRefusal = this._fforUpdateRefusal('settle', {
+			id: htlcId,
+			direction
+		});
 		if (fforSettleRefusal) {
 			return [
 				{
@@ -4149,7 +4159,10 @@ export class Channel {
 		}
 
 		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
-		const fforSettleRefusal = this._fforUpdateRefusal('settle', htlcId);
+		const fforSettleRefusal = this._fforUpdateRefusal('settle', {
+			id: htlcId,
+			direction: HtlcDirection.RECEIVED
+		});
 		if (fforSettleRefusal) {
 			return [
 				{
@@ -4225,7 +4238,11 @@ export class Channel {
 		}
 
 		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
-		const fforPeerSettleRefusal = this._fforUpdateRefusal('settle', msg.id);
+		// The peer's id names an HTLC we offered.
+		const fforPeerSettleRefusal = this._fforUpdateRefusal('settle', {
+			id: msg.id,
+			direction: HtlcDirection.OFFERED
+		});
 		if (fforPeerSettleRefusal) {
 			return this._failChannelWithWireError(fforPeerSettleRefusal);
 		}
@@ -4313,7 +4330,11 @@ export class Channel {
 		}
 
 		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
-		const fforPeerSettleRefusal = this._fforUpdateRefusal('settle', msg.id);
+		// The peer's id names an HTLC we offered.
+		const fforPeerSettleRefusal = this._fforUpdateRefusal('settle', {
+			id: msg.id,
+			direction: HtlcDirection.OFFERED
+		});
 		if (fforPeerSettleRefusal) {
 			return this._failChannelWithWireError(fforPeerSettleRefusal);
 		}
@@ -22380,8 +22401,9 @@ export class Channel {
 
 	/**
 	 * The refusal an ordinary channel operation earns under the epoch
-	 * freeze, or null. `htlcId` names the S-offered id a settle targets: in
-	 * DRAINING the vouchers' own fulfils and fails are the drain and pass.
+	 * freeze, or null. `settle` names the HTLC a settle targets, by its id
+	 * and its direction on this side: in DRAINING the vouchers' own fulfils
+	 * and fails are the drain and pass.
 	 */
 	private _fforUpdateRefusal(
 		kind:
@@ -22393,7 +22415,7 @@ export class Channel {
 			| 'stfu'
 			| 'shutdown'
 			| 'splice',
-		htlcId?: bigint
+		settle?: { id: bigint; direction: HtlcDirection }
 	): string | null {
 		const any = this._state.ffor;
 		// Section 9.5.1 step 3: a parked voucher is fulfilled or failed only by
@@ -22403,11 +22425,11 @@ export class Channel {
 			any.role === 'R' &&
 			any.state !== FforState.CLOSED &&
 			kind === 'settle' &&
-			htlcId !== undefined &&
+			settle !== undefined &&
 			!this._fforInternalSettle &&
-			this._fforVoucherEntry(any, htlcId) !== undefined
+			this._fforVoucherEntry(any, settle.id, settle.direction) !== undefined
 		) {
-			return `FFOR voucher ${htlcId} is parked: only the epoch's drain or unwind settles it`;
+			return `FFOR voucher ${settle.id} is parked: only the epoch's drain or unwind settles it`;
 		}
 		const f = this._fforLive();
 		if (!f) return null;
@@ -22419,8 +22441,8 @@ export class Channel {
 			// vouchers and the commitment rounds they need, nothing else.
 			if (
 				kind === 'settle' &&
-				htlcId !== undefined &&
-				this._fforVoucherEntry(f, htlcId) !== undefined
+				settle !== undefined &&
+				this._fforVoucherEntry(f, settle.id, settle.direction) !== undefined
 			) {
 				return null;
 			}
@@ -22457,12 +22479,21 @@ export class Channel {
 		return f.role === 'R' ? `received-${id}` : `offered-${id}`;
 	}
 
-	/** The voucher entry an S-offered id names, if it is one of the book's. */
+	/**
+	 * The voucher entry a settle names, if it is one of the book's. HTLC ids
+	 * count per offerer, so an id is a voucher's only in the direction the
+	 * vouchers run on this side (S offered them, R received them): an HTLC R
+	 * offered may carry the same number and is not one.
+	 */
 	private _fforVoucherEntry(
 		f: IFforEpochRecord,
-		htlcId: bigint
+		htlcId: bigint,
+		direction: HtlcDirection
 	): IHtlcEntry | undefined {
 		if (f.sHtlcIdBase === null) return undefined;
+		const voucherDirection =
+			f.role === 'R' ? HtlcDirection.RECEIVED : HtlcDirection.OFFERED;
+		if (direction !== voucherDirection) return undefined;
 		const k = Number(htlcId - f.sHtlcIdBase) + 1;
 		if (k < 1 || k > f.params.maxPayments) return undefined;
 		const entry = this._state.htlcs.get(this._fforVoucherKey(f, k));
