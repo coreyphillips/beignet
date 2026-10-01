@@ -23598,7 +23598,16 @@ export class Channel {
 				`ff_activate epoch_start_height ${msg.epochStartHeight} not within ${FF_EPOCH_START_TOLERANCE_BLOCKS} of tip ${this._currentBlockHeight}`
 			);
 		}
-		const bookError = checkVoucherBook(f.params, this._fforBookContext('S'));
+		// The book checks charge budget_msat to S's balance themselves, and
+		// the voucher round already took it out (addHtlc debits each add, and
+		// the debit stays for as long as the entry does). Every voucher still
+		// on the channel goes back in, so the recheck judges the book against
+		// the balance S held before the round and the value is charged once.
+		const bookCtx = this._fforBookContext('S');
+		for (const voucher of this._fforVoucherEntries(f).values()) {
+			bookCtx.sLocalBalanceMsat += voucher.amountMsat;
+		}
+		const bookError = checkVoucherBook(f.params, bookCtx);
 		if (bookError) {
 			return this._fforAbortLocal(f, FforAbortReason.BOOK_MISMATCH, bookError);
 		}
