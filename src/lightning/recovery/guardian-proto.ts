@@ -557,13 +557,37 @@ export function decodePutStateRequest(buf: Buffer): IGuardianPutStateRequest {
 	return retainFloor ? { record, retainFloor } : { record };
 }
 
-export const encodeSyncRecordRequest = (
+// Field 2 stays PutStateRequest's retain floor, which SYNC_RECORD never
+// carries, so a guardian that predates the bundle skips field 3 unread.
+export function encodeSyncRecordRequest(
 	request: IGuardianSyncRecordRequest
-): Buffer => encodePutStateRequest(request);
+): Buffer {
+	const writer = new ProtoWriter();
+	writer.message(1, encodeRecord(request.record));
+	for (const cert of request.certificates ?? []) {
+		writer.message(3, encodeTakeoverCertificate(cert));
+	}
+	return writer.finish();
+}
 
-export const decodeSyncRecordRequest = (
+export function decodeSyncRecordRequest(
 	buf: Buffer
-): IGuardianSyncRecordRequest => decodePutStateRequest(buf);
+): IGuardianSyncRecordRequest {
+	let record = decodeRecord(EMPTY());
+	const certificates: IGuardianTakeoverCertificate[] = [];
+	const reader = new ProtoReader(buf);
+	while (!reader.done) {
+		const { field, wireType } = reader.readTag();
+		if (field === 1 && wireType === WIRE_LEN) {
+			record = decodeRecord(reader.readBytes());
+		} else if (field === 3 && wireType === WIRE_LEN) {
+			certificates.push(decodeTakeoverCertificate(reader.readBytes()));
+		} else {
+			reader.skip(wireType);
+		}
+	}
+	return certificates.length > 0 ? { record, certificates } : { record };
+}
 
 export function encodeGetHeadRequest(request: IGuardianGetHeadRequest): Buffer {
 	const writer = new ProtoWriter();

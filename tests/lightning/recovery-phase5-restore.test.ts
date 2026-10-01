@@ -28,6 +28,7 @@ import {
 	GuardianState,
 	GuardianStatus,
 	IBoundGuardianClient,
+	IGuardianRecord,
 	IRestoreEvent,
 	IWriterLeaseKeys,
 	RecoveryCriticality,
@@ -39,6 +40,7 @@ import {
 	RestoreDriver,
 	RestoreRefusedError,
 	computeGuardianSetId,
+	decodeAcquireEpochRequest,
 	decodePutStateRequest,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
@@ -1180,16 +1182,166 @@ describe('Recovery phase 5: restore driver', () => {
 		}
 
 		// G1 still holds its certificate over N. A later restore reads it
-		// beside the quorum's over N+1 and follows the quorum.
+		// beside the quorum's over N+1, follows the quorum, and brings G1 up
+		// to N+1 under it (issue #1268), so all three grant the next epoch.
 		const later = openStorage();
 		const next = await driverFor(later, members).restore();
 		expect(next.lease.epoch).to.equal(epoch + 1n);
 		expect(next.certifiedState.logHead.sequence).to.equal(
 			guard.logHead.sequence + 1n
 		);
+		expect(next.certificates.length).to.equal(3);
 		expect(dumpTables(later)).to.equal(dumpTables(live.storage));
 
 		await revived.close();
+		await shutdown(served);
+		live.storage.close();
+		target.close();
+		later.close();
+	});
+
+	it('restores a takeover an old-writer append split between a retargeted round', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		// Issue #1268. G1 grants the attempt over N; the live writer takes
+		// G2 and G3 to N+1, and the retargeted round is split by one more
+		// append landing on G3 between G2's grant and its own: G1 granted
+		// over N, G2 over N+1, G3 still under the old lease at N+2.
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const clients = served.map((s) => s.client);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		const guard = (await clients[0].getHead(ROOT.recoveryId))
+			.state as GuardianState;
+
+		const acquireLost = (index: number): IBoundGuardianClient => ({
+			expectedGuardianId: served[index].id,
+			client: new GuardianClient({
+				url: served[index].client.url,
+				guardianSetId: SET_ID,
+				transport: async (
+					url,
+					init
+				): Promise<{ status: number; body: Buffer }> => {
+					if (url.endsWith('/acquire_epoch')) {
+						throw new GuardianTransportError('acquire lost in transit');
+					}
+					return nodeGuardianTransport()(url, init);
+				}
+			})
+		});
+		const target = openStorage();
+		try {
+			await driverFor(target, [
+				{ expectedGuardianId: served[0].id, client: clients[0] },
+				acquireLost(1),
+				acquireLost(2)
+			]).restore();
+			expect.fail('the takeover cannot complete against one guardian');
+		} catch (error) {
+			expect((error as RestoreRefusedError).reason).to.equal('cas-exhausted');
+		}
+		const pending = JSON.parse(
+			target.getRecoveryMeta!(RESTORE_META_KEYS.pendingAcquisition) as string
+		) as { newEpoch: string; writerPublicKey: string };
+		const epoch = BigInt(pending.newEpoch);
+
+		const append = (n: number): IGuardianRecord => {
+			live.manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'payment_preimage',
+						paymentHash: Buffer.alloc(32, n).toString('hex'),
+						preimage: Buffer.alloc(32, n)
+					}
+				],
+				outboundMessages: []
+			});
+			const all = live.storage.loadRecoveryFrames();
+			return rep.signRecord(all[all.length - 1], lease);
+		};
+		const tail = append(81);
+		for (const client of clients.slice(1)) {
+			expect((await client.putState(tail)).status).to.equal(GuardianStatus.OK);
+		}
+		const certifiedDump = dumpTables(live.storage);
+		const late = append(82);
+
+		// G3 takes the late append just before it handles the retargeted
+		// round, after G2 has already granted over N+1.
+		let injected = false;
+		const splitting: IBoundGuardianClient = {
+			expectedGuardianId: served[2].id,
+			client: new GuardianClient({
+				url: served[2].client.url,
+				guardianSetId: SET_ID,
+				transport: async (
+					url,
+					init
+				): Promise<{ status: number; body: Buffer }> => {
+					if (
+						url.endsWith('/acquire_epoch') &&
+						!injected &&
+						decodeAcquireEpochRequest(init.body as Buffer).expectedState.logHead
+							.sequence ===
+							guard.logHead.sequence + 1n
+					) {
+						injected = true;
+						expect(
+							served[2].guardian.putState({ record: late }).status
+						).to.equal(GuardianStatus.OK);
+					}
+					return nodeGuardianTransport()(url, init);
+				}
+			})
+		};
+		const events: IRestoreEvent[] = [];
+		const result = await driverFor(
+			target,
+			[...bind(served.slice(0, 2)), splitting],
+			events
+		).restore();
+		expect(injected).to.equal(true);
+		expect(events.some((e) => e.type === 'epoch:retargeted')).to.equal(true);
+		expect(result.lease.epoch).to.equal(epoch);
+		expect(result.lease.writerPublicKey.toString('hex')).to.equal(
+			pending.writerPublicKey
+		);
+		expect(result.certifiedState.logHead.sequence).to.equal(
+			guard.logHead.sequence + 1n
+		);
+		expect(dumpTables(target)).to.equal(certifiedDump);
+
+		// Every guardian is on the new lease over N+1, and G3's N+2, which
+		// never reached a quorum, is gone from its log.
+		for (const client of clients) {
+			const head = await client.getHead(ROOT.recoveryId);
+			const state = head.state as GuardianState;
+			expect(state.lease.epoch).to.equal(epoch);
+			expect(state.lease.writerPublicKey.toString('hex')).to.equal(
+				pending.writerPublicKey
+			);
+			expect(state.logHead.sequence).to.equal(guard.logHead.sequence + 1n);
+		}
+		const above = await clients[2].getState(
+			ROOT.recoveryId,
+			guard.logHead.sequence + 1n,
+			8
+		);
+		expect(above.records ?? []).to.have.length(0);
+
+		// The set is whole again: all three grant the next takeover.
+		const later = openStorage();
+		const next = await driverFor(later, bind(served)).restore();
+		expect(next.lease.epoch).to.equal(epoch + 1n);
+		expect(next.certificates.length).to.equal(3);
+		expect(dumpTables(later)).to.equal(certifiedDump);
+
 		await shutdown(served);
 		live.storage.close();
 		target.close();
@@ -1734,6 +1886,75 @@ describe('Recovery phase 5: restore driver', () => {
 			expect((error as RestoreRefusedError).reason).to.equal('conflict');
 		}
 		// Nothing was written to the target: no channel action, no lease.
+		expect(loadWriterLease(target).state).to.equal('missing');
+		expect(target.loadRecoveryFrames()).to.have.length(0);
+		await shutdown(served);
+		live.storage.close();
+		target.close();
+	});
+
+	it('halts when a quorum fixed a lower head than another grant of the same key', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		// G1 and G3 grant one key over N; G2, after one more append, grants
+		// the same key over N+1. The quorum over N fixes one final head and
+		// G1 with G2 another, so the epoch has two (issue #1268).
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const clients = served.map((s) => s.client);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		const writer = generateWriterKey();
+		const grant = async (index: number): Promise<void> => {
+			const guard = (await clients[index].getHead(ROOT.recoveryId))
+				.state as GuardianState;
+			const response = await clients[index].acquireEpoch({
+				protocolVersion: 1,
+				guardianSetId: SET_ID,
+				expectedState: guard,
+				newEpoch: lease.epoch + 1n,
+				newWriterPublicKey: writer.publicKey,
+				...signAcquisition(
+					SET_ID,
+					guard,
+					lease.epoch + 1n,
+					writer,
+					ROOT.rootSecret
+				)
+			});
+			expect(response.status).to.equal(GuardianStatus.OK);
+		};
+		await grant(0);
+		await grant(2);
+		live.manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, 83).toString('hex'),
+					preimage: Buffer.alloc(32, 83)
+				}
+			],
+			outboundMessages: []
+		});
+		const all = live.storage.loadRecoveryFrames();
+		const tail = rep.signRecord(all[all.length - 1], lease);
+		expect((await clients[1].putState(tail)).status).to.equal(
+			GuardianStatus.OK
+		);
+		await grant(1);
+
+		const target = openStorage();
+		try {
+			await driverFor(target, bind(served)).restore();
+			expect.fail('two final heads for one epoch must halt the restore');
+		} catch (error) {
+			expect(error).to.be.instanceOf(RestoreRefusedError);
+			expect((error as RestoreRefusedError).reason).to.equal('conflict');
+		}
 		expect(loadWriterLease(target).state).to.equal('missing');
 		expect(target.loadRecoveryFrames()).to.have.length(0);
 		await shutdown(served);
