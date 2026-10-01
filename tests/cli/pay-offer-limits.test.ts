@@ -21,8 +21,11 @@ import { BeignetNode } from '../../src/cli/beignet-node';
 import { startDaemon } from '../../src/cli/daemon';
 import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
 import {
+	IPaymentInfo,
 	LightningErrorCode,
-	LightningPaymentError
+	LightningPaymentError,
+	PaymentDirection,
+	PaymentStatus
 } from '../../src/lightning/node/types';
 import {
 	DEFAULT_MIN_FINAL_CLTV_EXPIRY,
@@ -145,6 +148,49 @@ const refusalOf = async (attempt: Promise<unknown>): Promise<string> => {
 		return err instanceof Error ? err.message : String(err);
 	}
 };
+
+/** POST /offer/pay with the body, and the status and parsed envelope it got. */
+const postOfferPay = (
+	port: number,
+	body: Record<string, unknown>,
+	headers: Record<string, string> = {}
+): Promise<{ status: number; body: Record<string, unknown> }> =>
+	new Promise((resolve, reject) => {
+		const payload = JSON.stringify(body);
+		const req = http.request(
+			{
+				hostname: '127.0.0.1',
+				port,
+				path: '/offer/pay',
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+					'Content-Length': Buffer.byteLength(payload),
+					...headers
+				}
+			},
+			(res) => {
+				const chunks: Buffer[] = [];
+				res.on('data', (chunk: Buffer) => chunks.push(chunk));
+				res.on('end', () => {
+					try {
+						resolve({
+							status: res.statusCode!,
+							body: JSON.parse(Buffer.concat(chunks).toString())
+						});
+					} catch {
+						resolve({ status: res.statusCode!, body: {} });
+					}
+				});
+			}
+		);
+		req.on('error', reject);
+		req.write(payload);
+		req.end();
+	});
+
+const errorCode = (body: Record<string, unknown>): string =>
+	(body.error as { code: string }).code;
 
 /** Waits for state a payment in flight reaches a few microtasks from now. */
 const waitFor = async (
@@ -557,41 +603,7 @@ describe('POST /offer/pay admission (#529)', function () {
 	const post = (
 		body: Record<string, unknown>
 	): Promise<{ status: number; body: Record<string, unknown> }> =>
-		new Promise((resolve, reject) => {
-			const payload = JSON.stringify(body);
-			const req = http.request(
-				{
-					hostname: '127.0.0.1',
-					port,
-					path: '/offer/pay',
-					method: 'POST',
-					headers: {
-						'Content-Type': 'application/json',
-						'Content-Length': Buffer.byteLength(payload)
-					}
-				},
-				(res) => {
-					const chunks: Buffer[] = [];
-					res.on('data', (chunk: Buffer) => chunks.push(chunk));
-					res.on('end', () => {
-						try {
-							resolve({
-								status: res.statusCode!,
-								body: JSON.parse(Buffer.concat(chunks).toString())
-							});
-						} catch {
-							resolve({ status: res.statusCode!, body: {} });
-						}
-					});
-				}
-			);
-			req.on('error', reject);
-			req.write(payload);
-			req.end();
-		});
-
-	const errorCode = (body: Record<string, unknown>): string =>
-		(body.error as { code: string }).code;
+		postOfferPay(port, body);
 
 	before(async () => {
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-pay-offer-api-'));
@@ -711,5 +723,424 @@ describe('POST /offer/pay admission (#529)', function () {
 		expect(payee.requests).to.have.length(0);
 		expect(payee.dispatched).to.have.length(0);
 		expect(pending()).to.equal(0);
+	});
+});
+
+// Issue #1094: a keyed POST /offer/pay that timed out with its HTLC still out
+// cached nothing, so the same key and body asked the payee for a fresh
+// invoice, under a fresh hash the engine's duplicate refusal cannot tie to
+// the first, and paid again. The payee here answers every request with a new
+// hash, as a real one does, and the dispatch leaves a PENDING record with an
+// HTLC out until the test settles or fails it.
+describe('keyed POST /offer/pay after a timeout (#1094)', function () {
+	this.timeout(30_000);
+
+	let tmpDir: string;
+	let server: http.Server;
+	let node: BeignetNode;
+	let port: number;
+
+	/** The hashes the payee issued, one per invoice request. */
+	let issued: string[];
+	/** Hashes with an HTLC still out. */
+	let htlcsOut: Set<string>;
+
+	type Engine = StubbedEngine & {
+		payments: Map<string, IPaymentInfo>;
+		hasHtlcInFlight: (paymentHash: Buffer) => boolean;
+	};
+	const engine = (): Engine => internals(node).node as Engine;
+
+	/** The daemon's idempotency cache sweep, run by hand instead of on its timer. */
+	let sweepIdempotency: (() => void) | undefined;
+
+	before(async () => {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-offer-1094-'));
+		const realSetInterval = global.setInterval;
+		global.setInterval = ((fn: () => void, ...rest: unknown[]) => {
+			if (String(fn).includes('idempotencyCache')) sweepIdempotency = fn;
+			return (realSetInterval as (...args: unknown[]) => unknown)(fn, ...rest);
+		}) as unknown as typeof setInterval;
+		try {
+			({ server, node } = await startDaemon({
+				mnemonic: MNEMONIC,
+				network: 'regtest',
+				dataDir: tmpDir,
+				logLevel: 'silent',
+				rapidGossipSync: false,
+				autoGossipSync: false,
+				daemonPort: 0,
+				...OFFLINE_ELECTRUM
+			}));
+		} finally {
+			global.setInterval = realSetInterval;
+		}
+		port = (server.address() as AddressInfo).port;
+	});
+
+	after(async () => {
+		server?.close();
+		await node?.destroy();
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	beforeEach(() => {
+		issued = [];
+		htlcsOut = new Set();
+		const e = engine();
+		e.requestInvoice = async (): Promise<unknown> => {
+			const paymentHash = crypto.randomBytes(32);
+			issued.push(paymentHash.toString('hex'));
+			return {
+				paymentHash,
+				amount: 1_000_000n,
+				description: 'stubbed offer invoice',
+				createdAt: BigInt(Math.floor(Date.now() / 1000)),
+				nodeId: crypto.randomBytes(33)
+			};
+		};
+		e.payBolt12Invoice = (...args: unknown[]): unknown => {
+			const paymentHash = (args[0] as { paymentHash: Buffer }).paymentHash;
+			const record: IPaymentInfo = {
+				paymentHash,
+				amountMsat: 1_000_000n,
+				status: PaymentStatus.PENDING,
+				direction: PaymentDirection.OUTGOING,
+				createdAt: Date.now()
+			};
+			e.payments.set(paymentHash.toString('hex'), record);
+			htlcsOut.add(paymentHash.toString('hex'));
+			return record;
+		};
+		e.hasHtlcInFlight = (hash: Buffer): boolean =>
+			htlcsOut.has(hash.toString('hex'));
+	});
+
+	/** The HTLC resolves: the record ends and the engine event fires. */
+	const resolveHtlc = (
+		hashHex: string,
+		status: 'COMPLETED' | 'FAILED'
+	): void => {
+		const record = engine().payments.get(hashHex)!;
+		record.status =
+			status === 'COMPLETED' ? PaymentStatus.COMPLETED : PaymentStatus.FAILED;
+		record.completedAt = Date.now();
+		htlcsOut.delete(hashHex);
+		engine().emit(
+			status === 'COMPLETED' ? 'payment:sent' : 'payment:failed',
+			record
+		);
+	};
+
+	it('does not request a new invoice while the first payment is out, and answers it once settled', async () => {
+		const body = { offer: offerString(node, 'times out'), timeoutMs: 50 };
+		const headers = { 'X-Idempotency-Key': `offer-timeout-${Date.now()}` };
+
+		const timedOut = await postOfferPay(port, body, headers);
+		expect(timedOut.status).to.equal(504);
+		expect(errorCode(timedOut.body)).to.equal('PAYMENT_TIMEOUT');
+		expect(issued).to.have.length(1);
+		const [first] = issued;
+		expect(
+			(timedOut.body.error as { paymentHash?: string }).paymentHash,
+			'the timeout names the payment to look up'
+		).to.equal(first);
+
+		const retried = await postOfferPay(port, body, headers);
+		expect(retried.status).to.equal(409);
+		expect(errorCode(retried.body)).to.equal('DUPLICATE_PAYMENT');
+		expect(
+			(retried.body.error as { paymentHash?: string }).paymentHash
+		).to.equal(first);
+		expect(
+			issued,
+			'the retry asked the payee for another invoice'
+		).to.have.length(1);
+
+		resolveHtlc(first, 'COMPLETED');
+		const settled = await postOfferPay(port, body, headers);
+		expect(settled.status).to.equal(200);
+		const result = settled.body.result as {
+			paymentHash: string;
+			status: string;
+		};
+		expect(result.paymentHash).to.equal(first);
+		expect(result.status).to.equal('COMPLETED');
+		expect(issued).to.have.length(1);
+
+		// The settled answer holds.
+		const again = await postOfferPay(port, body, headers);
+		expect(again).to.deep.equal(settled);
+		expect(issued).to.have.length(1);
+	});
+
+	it('pays again under the key once the timed-out payment failed', async () => {
+		const body = { offer: offerString(node, 'fails later'), timeoutMs: 50 };
+		const headers = { 'X-Idempotency-Key': `offer-fails-${Date.now()}` };
+
+		expect((await postOfferPay(port, body, headers)).status).to.equal(504);
+		const [first] = issued;
+		resolveHtlc(first, 'FAILED');
+
+		// Nothing sent for the first can settle now, so the retry is a new
+		// attempt: a new invoice under a new hash.
+		const rerun = await postOfferPay(port, body, headers);
+		expect(rerun.status).to.equal(504);
+		expect(issued).to.have.length(2);
+		expect((rerun.body.error as { paymentHash?: string }).paymentHash).to.equal(
+			issued[1]
+		);
+		expect(issued[1]).to.not.equal(first);
+	});
+
+	it('keeps the timeout past the idempotency TTL while the payment is out', async () => {
+		const body = { offer: offerString(node, 'outlives ttl'), timeoutMs: 50 };
+		const headers = { 'X-Idempotency-Key': `offer-ttl-${Date.now()}` };
+
+		expect((await postOfferPay(port, body, headers)).status).to.equal(504);
+		expect(sweepIdempotency, 'the cache sweep was captured').to.be.a(
+			'function'
+		);
+		const realNow = Date.now;
+		const later = realNow() + 25 * 60 * 60 * 1000;
+		Date.now = (): number => later;
+		try {
+			sweepIdempotency!();
+		} finally {
+			Date.now = realNow;
+		}
+
+		const retried = await postOfferPay(port, body, headers);
+		expect(retried.status).to.equal(409);
+		expect(errorCode(retried.body)).to.equal('DUPLICATE_PAYMENT');
+		expect(issued).to.have.length(1);
+	});
+});
+
+// Issue #1132: the #1094 timeout marker lived in the daemon's memory only, so
+// after a restart the same key and body asked the payee for a fresh invoice
+// while the first HTLC could still settle. Each start below is a new daemon
+// over the same data dir; the stubbed engine is handed the payment records and
+// the HTLCs still out, as a restored node would report them.
+describe('keyed POST /offer/pay across a daemon restart (#1132)', function () {
+	this.timeout(60_000);
+
+	let tmpDir: string;
+	let server: http.Server | undefined;
+	let node: BeignetNode | undefined;
+	let port: number;
+
+	/** The hashes the payee issued, one per invoice request, across restarts. */
+	const issued: string[] = [];
+	/** Hashes with an HTLC still out. */
+	const htlcsOut = new Set<string>();
+	/** Every payment record the engine made, as a restart restores them. */
+	const records = new Map<string, IPaymentInfo>();
+
+	type Engine = StubbedEngine & {
+		payments: Map<string, IPaymentInfo>;
+		hasHtlcInFlight: (paymentHash: Buffer) => boolean;
+	};
+
+	const noop = (): void => undefined;
+
+	const start = async (): Promise<void> => {
+		({ server, node } = await startDaemon({
+			mnemonic: MNEMONIC,
+			network: 'regtest',
+			dataDir: tmpDir,
+			logLevel: 'silent',
+			// A stopped daemon's handler that times out later fails to write
+			// to its closed database, which would otherwise print.
+			logger: { debug: noop, info: noop, warn: noop, error: noop },
+			rapidGossipSync: false,
+			autoGossipSync: false,
+			daemonPort: 0,
+			...OFFLINE_ELECTRUM
+		}));
+		port = (server.address() as AddressInfo).port;
+		const e = internals(node).node as Engine;
+		for (const [hash, record] of records) e.payments.set(hash, record);
+		e.requestInvoice = async (): Promise<unknown> => {
+			const paymentHash = crypto.randomBytes(32);
+			issued.push(paymentHash.toString('hex'));
+			return {
+				paymentHash,
+				amount: 1_000_000n,
+				description: 'stubbed offer invoice',
+				createdAt: BigInt(Math.floor(Date.now() / 1000)),
+				nodeId: crypto.randomBytes(33)
+			};
+		};
+		e.payBolt12Invoice = (...args: unknown[]): unknown => {
+			const paymentHash = (args[0] as { paymentHash: Buffer }).paymentHash;
+			const record: IPaymentInfo = {
+				paymentHash,
+				amountMsat: 1_000_000n,
+				status: PaymentStatus.PENDING,
+				direction: PaymentDirection.OUTGOING,
+				createdAt: Date.now()
+			};
+			records.set(paymentHash.toString('hex'), record);
+			e.payments.set(paymentHash.toString('hex'), record);
+			htlcsOut.add(paymentHash.toString('hex'));
+			return record;
+		};
+		e.hasHtlcInFlight = (hash: Buffer): boolean =>
+			htlcsOut.has(hash.toString('hex'));
+	};
+
+	const restart = async (): Promise<void> => {
+		server!.close();
+		await node!.destroy();
+		await start();
+	};
+
+	/** The markers the daemon has stored, by cache key. */
+	const storedMarkers = (): Record<string, { paymentHash: string }> =>
+		JSON.parse(
+			node!.getStorage().loadWalletData('daemon:payment-timeout-markers:v1') ??
+				'{}'
+		);
+
+	before(async () => {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-offer-1132-'));
+		await start();
+	});
+
+	after(async () => {
+		server?.close();
+		await node?.destroy();
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	it('answers a retry after a restart from the first payment, without a new invoice', async () => {
+		const body = { offer: offerString(node!, 'restarts'), timeoutMs: 50 };
+		const headers = { 'X-Idempotency-Key': `offer-restart-${Date.now()}` };
+
+		expect((await postOfferPay(port, body, headers)).status).to.equal(504);
+		expect(issued).to.have.length(1);
+		const [first] = issued;
+
+		await restart();
+		const retried = await postOfferPay(port, body, headers);
+		expect(retried.status).to.equal(409);
+		expect(errorCode(retried.body)).to.equal('DUPLICATE_PAYMENT');
+		expect(
+			(retried.body.error as { paymentHash?: string }).paymentHash
+		).to.equal(first);
+		expect(
+			issued,
+			'the retry asked the payee for another invoice'
+		).to.have.length(1);
+
+		const otherBody = await postOfferPay(
+			port,
+			{ ...body, timeoutMs: 60 },
+			headers
+		);
+		expect(errorCode(otherBody.body)).to.equal('IDEMPOTENCY_CONFLICT');
+
+		const record = records.get(first)!;
+		record.status = PaymentStatus.COMPLETED;
+		record.completedAt = Date.now();
+		htlcsOut.delete(first);
+		const settled = await postOfferPay(port, body, headers);
+		expect(settled.status).to.equal(200);
+		expect(
+			(settled.body.result as { paymentHash: string }).paymentHash
+		).to.equal(first);
+
+		// The settled answer survives the next restart too, even after another
+		// key's timeout has rewritten the stored markers.
+		const other = await postOfferPay(
+			port,
+			{ offer: offerString(node!, 'another key'), timeoutMs: 50 },
+			{ 'X-Idempotency-Key': `offer-restart-other-${Date.now()}` }
+		);
+		expect(other.status).to.equal(504);
+		await restart();
+		const again = await postOfferPay(port, body, headers);
+		expect(again).to.deep.equal(settled);
+		expect(issued).to.have.length(2);
+	});
+
+	// Issue #1153: the marker was written only when the route's timeout fired,
+	// so a daemon stopped before it left none, and the retry after the restart
+	// asked the payee for a fresh invoice while the first HTLC could settle.
+	it('answers a retry after a stop mid-payment from the first payment (#1153)', async () => {
+		// Long enough for the stop below to come first.
+		const body = {
+			offer: offerString(node!, 'stops mid-payment'),
+			timeoutMs: 3_000
+		};
+		const headers = { 'X-Idempotency-Key': `offer-stop-${Date.now()}` };
+		const cacheKey = `POST /offer/pay:${headers['X-Idempotency-Key']}`;
+		const before = issued.length;
+
+		const e = internals(node!).node;
+		const dispatch = e.payBolt12Invoice;
+		let storedAtDispatch: string | undefined;
+		e.payBolt12Invoice = (...args: unknown[]): unknown => {
+			storedAtDispatch = storedMarkers()[cacheKey]?.paymentHash;
+			return dispatch(...args);
+		};
+		const firstReply = postOfferPay(port, body, headers);
+		await waitFor(() => issued.length > before, 'the dispatch');
+		const first = issued[before];
+		await waitFor(() => htlcsOut.has(first), 'the HTLC');
+		expect(storedAtDispatch, 'stored before the HTLC went out').to.equal(first);
+
+		// Stopped with the handler still waiting on the payment.
+		await restart();
+		const retried = await postOfferPay(port, body, headers);
+		expect(retried.status).to.equal(409);
+		expect(errorCode(retried.body)).to.equal('DUPLICATE_PAYMENT');
+		expect(
+			(retried.body.error as { paymentHash?: string }).paymentHash
+		).to.equal(first);
+		expect(
+			issued,
+			'the retry asked the payee for another invoice'
+		).to.have.length(before + 1);
+
+		// The stopped daemon's handler still times out in this process; waited
+		// for so its timer does not outlive the test.
+		await firstReply;
+
+		const record = records.get(first)!;
+		record.status = PaymentStatus.COMPLETED;
+		record.completedAt = Date.now();
+		htlcsOut.delete(first);
+		const settled = await postOfferPay(port, body, headers);
+		expect(settled.status).to.equal(200);
+		expect(
+			(settled.body.result as { paymentHash: string }).paymentHash
+		).to.equal(first);
+		expect(issued).to.have.length(before + 1);
+	});
+
+	it('drops the stored in-flight payment once the request answers (#1153)', async () => {
+		const headers = { 'X-Idempotency-Key': `offer-answers-${Date.now()}` };
+		const cacheKey = `POST /offer/pay:${headers['X-Idempotency-Key']}`;
+		const before = issued.length;
+
+		const reply = postOfferPay(
+			port,
+			{ offer: offerString(node!, 'answers'), timeoutMs: 60_000 },
+			headers
+		);
+		await waitFor(() => issued.length > before, 'the dispatch');
+		const hash = issued[before];
+		await waitFor(() => htlcsOut.has(hash), 'the HTLC');
+		expect(storedMarkers()[cacheKey]?.paymentHash).to.equal(hash);
+
+		const record = records.get(hash)!;
+		record.status = PaymentStatus.COMPLETED;
+		record.completedAt = Date.now();
+		htlcsOut.delete(hash);
+		internals(node!).node.emit('payment:sent', record);
+		expect((await reply).status).to.equal(200);
+		expect(storedMarkers()).to.not.have.property(cacheKey);
 	});
 });

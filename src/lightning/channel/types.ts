@@ -276,6 +276,17 @@ export interface IHtlcEntry {
 	 * commitment_signed. While false, buildRemoteCommitment still includes the
 	 * HTLC.
 	 *
+	 * addRemotelyRevoked (RECEIVED entries the peer added): false from
+	 * handleUpdateAddHtlc until the peer's revoke_and_ack for a
+	 * commitment_signed of ours that carries the add. Only then is the add in
+	 * a commitment of the peer's that it cannot go back on, so only then may
+	 * we forward or settle it (see receivedAddIrrevocablyCommitted).
+	 *
+	 * addCoverPending: the same stamp as commitCoverPending, for that one
+	 * phase. It is kept apart because we may remove a received add before the
+	 * peer's answering revoke_and_ack, and a shared stamp would then promote
+	 * our unsigned removal instead.
+	 *
 	 * All are optional: absent (legacy persisted states and hand-built
 	 * fixtures) means "already committed/revoked" — the pre-two-phase behavior.
 	 */
@@ -284,6 +295,8 @@ export interface IHtlcEntry {
 	commitCoverPending?: boolean;
 	addLocallyRevoked?: boolean;
 	removalLocallyRevoked?: boolean;
+	addRemotelyRevoked?: boolean;
+	addCoverPending?: boolean;
 
 	/**
 	 * OFFERED entries: false from addHtlc until a commitment_signed we accepted
@@ -407,6 +420,21 @@ export interface IHtlcEntry {
 }
 
 /**
+ * Whether a received add is irrevocably committed (BOLT 2): we revoked for
+ * the peer's commitment_signed that covers it, and the peer revoked for ours.
+ * Nothing may forward or settle it before then. COMMITTED alone does not say
+ * this, because signCommitment flips every PENDING entry, including a peer add
+ * the commitment it signs leaves out.
+ */
+export function receivedAddIrrevocablyCommitted(entry: IHtlcEntry): boolean {
+	return (
+		entry.state === HtlcState.COMMITTED &&
+		entry.addLocallyRevoked !== false &&
+		entry.addRemotelyRevoked !== false
+	);
+}
+
+/**
  * Minimal record of one HTLC as it appeared in a specific (now potentially
  * revoked) remote commitment — enough to reconstruct its output witness script
  * for a penalty sweep after the live HTLC has been settled and forgotten.
@@ -451,6 +479,15 @@ export const MIN_DUST_LIMIT_SATOSHIS = 354n;
  *  "too-small-to-create" threshold: an unbounded value lets an acceptor trim
  *  our to_remote output out of every commitment we sign (see FS-1). */
 export const MAX_DUST_LIMIT_SATOSHIS = 1062n;
+
+/** The minimum_depth we advertise as acceptor, and the least a v2 opener
+ *  waits on a funding transaction that can carry the accepter's inputs. */
+export const DEFAULT_MINIMUM_DEPTH = 3;
+
+/** Upper bound on a peer's minimum_depth, matching LDK's max_minimum_depth.
+ *  The funder's coins are locked in the 2-of-2 until that depth, so an
+ *  unbounded value holds them until a force close. */
+export const MAX_MINIMUM_DEPTH = 144;
 
 /** Largest value encodable in a wire u64 field. */
 export const U64_MAX = 0xffffffffffffffffn;

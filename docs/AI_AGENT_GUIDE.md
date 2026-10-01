@@ -249,6 +249,11 @@ refused, and the error says whether to lower `maxFeeSats` or the amount;
 `validatePayment(bolt11, amountSats, maxFeeSats)` previews the same
 judgement. `sendToRoute` is judged on what its first hop carries.
 
+External on-chain sends are held to both limits as well: `sendOnchain`, an
+address-targeted `spliceOut` and `sendDirectFunding` on the amount plus the
+fee, `sendMaxOnchain` on the whole sweep. A circular rebalance counts only its
+routing fee, and only against the daily limit.
+
 ## Error Handling
 
 ### Decision tree
@@ -664,7 +669,8 @@ What the client guarantees before any payment leaves:
   A macaroon that cannot be sent back in a header (one carrying whitespace, which
   base64 decoding would happily ignore) is refused before paying, not after.
 - The challenge came from the origin you asked for. A redirect to another origin
-  is not paid unless you pass `allowCrossOriginChallenge: true`.
+  is not paid unless you pass `allowCrossOriginChallenge: true`, and even then
+  only for a GET or HEAD request.
 - Both halves of the challenge come from the SAME entry in the
   `WWW-Authenticate` header, so a reflected or multi-scheme header cannot pair a
   macaroon with someone else's invoice.
@@ -734,7 +740,14 @@ those routes.
 
 A BOLT 12 offer payment needs the key more than a BOLT 11 one: every
 `POST /offer/pay` asks the payee for a fresh invoice with a fresh payment hash,
-so nothing but the key can tell a retry from a new payment.
+so nothing but the key can tell a retry from a new payment. That holds after a
+`504 PAYMENT_TIMEOUT` too, whose error carries the `paymentHash`: a keyed retry
+answers `200` with the payment once it completed and `409 DUPLICATE_PAYMENT`
+while an HTLC for it can still settle, and asks for a new invoice only once
+nothing sent for the first can (issue #1094). A keyed `POST /keysend` that
+timed out is answered the same way, since a rerun would pick a fresh preimage
+(issue #1133). Query `GET /payment?paymentHash=...` rather than retrying in a
+loop.
 
 The same applies to the on-chain sends: a retried `POST /send` that carries the
 key of a send already broadcast returns that broadcast's txid instead of
@@ -775,8 +788,8 @@ await node.gracefulShutdown();
 - **CORS**: Only enable if needed, specify exact origin
 - **Spending Limits**: Set `dailySpendLimitSats` to cap daily agent spending
 - **Idempotency Keys**: Use `X-Idempotency-Key` header on payment requests to prevent duplicates
-- **Webhook Secrets**: Use HMAC-SHA256 verification (secrets are hashed in storage, never stored plaintext)
-- **Rate Limiting**: Enable `rateLimit` option to protect against runaway agent loops (429 `RATE_LIMITED` response). Health endpoints are exempt; `/metrics` is auth-gated (it reports balances) unless `metricsPublic` is set. Buckets are keyed on the connecting address, so behind a reverse proxy all clients share one bucket unless you list the proxy's IP in `rateLimit.trustedProxies`, which keys on the client address the proxy reports via `X-Forwarded-For`. Never front the daemon with a proxy you do not control when the limiter matters: the header is only trusted from listed addresses.
+- **Webhook Secrets**: Use HMAC-SHA256 verification (the webhook rows hold only a hash; the secret itself is kept in the encrypted wallet data so deliveries stay signed across restarts)
+- **Rate Limiting**: Enable `rateLimit` option to protect against runaway agent loops (429 `RATE_LIMITED` response). Every route counts, the unauthenticated health and spec endpoints included; `/metrics` is auth-gated (it reports balances) unless `metricsPublic` is set. Buckets are keyed on the connecting address, so behind a reverse proxy all clients share one bucket unless you list the proxy's IP in `rateLimit.trustedProxies`, which keys on the client address the proxy reports via `X-Forwarded-For`. Never front the daemon with a proxy you do not control when the limiter matters: the header is only trusted from listed addresses.
 
 ## Mainnet Checklist
 

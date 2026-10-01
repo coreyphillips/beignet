@@ -138,7 +138,9 @@ import {
 	MIN_DUST_LIMIT_SATOSHIS,
 	MAX_DUST_LIMIT_SATOSHIS,
 	MAX_ACCEPTED_HTLCS,
-	MAX_FUNDING_SATOSHIS
+	MAX_FUNDING_SATOSHIS,
+	DEFAULT_MINIMUM_DEPTH,
+	MAX_MINIMUM_DEPTH
 } from './types';
 import { IChannelBasepoints } from '../keys/derivation';
 import { ILeaseRates } from '../gossip/types';
@@ -597,7 +599,7 @@ export class DualFundingSession {
 			dustLimitSatoshis: localParams.dustLimitSatoshis,
 			maxHtlcValueInFlightMsat: localParams.maxHtlcValueInFlightMsat,
 			htlcMinimumMsat: localParams.htlcMinimumMsat,
-			minimumDepth: localParams.minimumDepth ?? 3,
+			minimumDepth: localParams.minimumDepth ?? DEFAULT_MINIMUM_DEPTH,
 			toSelfDelay: localParams.toSelfDelay,
 			maxAcceptedHtlcs: localParams.maxAcceptedHtlcs,
 			fundingPubkey: localParams.localBasepoints.fundingPubkey,
@@ -1190,6 +1192,12 @@ export class DualFundingSession {
 			return 'to_self_delay must be greater than 0';
 		}
 
+		// Same bound as validateOpenChannelParams. This value is the CSV
+		// on our own to_local output.
+		if (msg.toSelfDelay > 2016) {
+			return `to_self_delay ${msg.toSelfDelay} exceeds maximum 2016`;
+		}
+
 		if (msg.fundingFeeratePerkw === 0) {
 			return 'funding_feerate must be greater than 0';
 		}
@@ -1221,6 +1229,17 @@ export class DualFundingSession {
 
 		if (msg.toSelfDelay === 0) {
 			return 'to_self_delay must be greater than 0';
+		}
+
+		// Same bound as validateAcceptChannelParams. This value is the CSV
+		// on our own to_local output.
+		if (msg.toSelfDelay > 2016) {
+			return `to_self_delay ${msg.toSelfDelay} exceeds maximum 2016`;
+		}
+
+		// Same bound as validateAcceptChannelParams.
+		if (msg.minimumDepth > MAX_MINIMUM_DEPTH) {
+			return `minimum_depth ${msg.minimumDepth} exceeds maximum ${MAX_MINIMUM_DEPTH}`;
 		}
 
 		if (msg.fundingPubkey.length !== 33) {

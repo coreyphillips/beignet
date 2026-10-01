@@ -116,6 +116,13 @@ export enum BeignetErrorCode {
 export class BeignetError extends Error {
 	code: BeignetErrorCode | string;
 	failureCode?: number;
+	/**
+	 * The payment the error is about, hex. Set on PAYMENT_TIMEOUT, and on the
+	 * daemon's DUPLICATE_PAYMENT for a keyed offer retry: an offer or keysend
+	 * caller never saw the hash, and needs it to look the payment up before
+	 * deciding to pay again (issue #1094).
+	 */
+	paymentHash?: string;
 
 	constructor(
 		code: BeignetErrorCode | string,
@@ -128,12 +135,23 @@ export class BeignetError extends Error {
 		this.failureCode = failureCode;
 	}
 
-	toJSON(): { code: string; message: string; failureCode?: number } {
-		const json: { code: string; message: string; failureCode?: number } = {
+	toJSON(): {
+		code: string;
+		message: string;
+		failureCode?: number;
+		paymentHash?: string;
+	} {
+		const json: {
+			code: string;
+			message: string;
+			failureCode?: number;
+			paymentHash?: string;
+		} = {
 			code: this.code,
 			message: this.message
 		};
 		if (this.failureCode !== undefined) json.failureCode = this.failureCode;
+		if (this.paymentHash !== undefined) json.paymentHash = this.paymentHash;
 		return json;
 	}
 }

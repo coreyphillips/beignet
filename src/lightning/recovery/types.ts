@@ -296,6 +296,10 @@ export interface EncryptedRecoveryFrame {
  * journaled. A reconstruction therefore restores post-snapshot rows as
  * pending_send, which errs toward retransmission: the safe direction, since
  * peers treat replays idempotently.
+ *
+ * Size note: a snapshot that would exceed the guardians' record limit omits
+ * the oldest forwarding events and failed payment records instead
+ * (fitSnapshotUnderCeiling in journal.ts), so those two may be partial.
  */
 export interface RecoverySnapshot {
 	/**
@@ -307,6 +311,13 @@ export interface RecoverySnapshot {
 	 * written before the field existed.
 	 */
 	schemaVersion?: string;
+	/**
+	 * Set when the per-payment rows did not fit one guardian record: they
+	 * follow in the next `pageFrames` frames as ordinary upserts, and the
+	 * snapshot is whole only with every one of them (see
+	 * pageSnapshotRows in journal.ts).
+	 */
+	pageFrames?: number;
 	channels: Array<{
 		channelId: string;
 		state: import('../channel/channel-state').IChannelState;
@@ -352,7 +363,11 @@ export interface IRecoveryJournalSink {
 	 * this delta) already sees the stamped rows.
 	 */
 	nextSequence(): bigint;
-	/** Returns the sequence of the frame that carries this transition. */
+	/**
+	 * Returns the sequence of the frame that carries this transition. For a
+	 * bootstrap or re-base snapshot that spilled into page frames, that is
+	 * the last page, since the transition's rows may sit in any of them.
+	 */
 	appendFrame(
 		mutations: RecoveryMutation[],
 		outboundMessages: RecoveryOutboundMessage[]

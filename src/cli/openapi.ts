@@ -444,6 +444,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							content: jsonContent({
 								$ref: '#/components/schemas/DirectFundingSendResult'
 							})
+						},
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: the amount plus the fee ceiling is over dailySpendLimitSats. Nothing was spent'
+						},
+						'409': {
+							description:
+								'SERVICE_DRAINING: the node is draining and takes no new payment. Nothing was spent'
 						}
 					}
 				}
@@ -742,7 +750,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/channel/forceclose': {
 				post: {
 					summary:
-						'Force close a channel (returns commitment txid). A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because its recency cannot be proven: the node refuses to broadcast such a commitment on its own initiative, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path. Waiting for the peer to close is the safe outcome; the flag is the labelled way to accept the risk anyway. Once any channel reports restoreRevokedRisk on /recovery/status (its peer has shown in channel_reestablish that it already holds the revocation for the stored commitment), the force close is refused with FORCE_CLOSE_REVOKED (409) whatever the flag says: there is no risk left to accept; wait for the peer to force close',
+						'Force close a channel (returns commitment txid). A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because its recency cannot be proven: the node refuses to broadcast such a commitment on its own initiative, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path. Waiting for the peer to close is the safe outcome; the flag is the labelled way to accept the risk anyway. Every channel needs the flag while /recovery/status reports the gate fenced or quarantined (issue #1013): a fenced device was taken over by another restored from the same seed, whose channel updates revoked the commitments this one stores, and a quarantined one cannot yet show that no takeover happened. Once any channel reports restoreRevokedRisk on /recovery/status (its peer has shown in channel_reestablish that it already holds the revocation for the stored commitment), the force close is refused with FORCE_CLOSE_REVOKED (409) whatever the flag says: there is no risk left to accept; wait for the peer to force close',
 					tags: ['Channels'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -1063,12 +1071,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								allowCrossOriginChallenge: {
 									type: 'boolean',
 									description:
-										'Unsafe: pay a challenge served from a different origin than requested, after a redirect'
+										'Unsafe: pay a challenge served from a different origin than requested, after a redirect. Only GET and HEAD requests qualify'
 								},
 								allowPrivateNetwork: {
 									type: 'boolean',
 									description:
-										'Permit a target on a private, loopback, or link-local host, which is refused by default because this endpoint fetches on behalf of the caller from the node machine'
+										'Permit a target on a private, loopback, or link-local host, which is refused by default (for redirect targets too, before they are requested) because this endpoint fetches on behalf of the caller from the node machine'
 								}
 							}
 						})
@@ -1699,9 +1707,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			},
 			'/backup': {
 				post: {
-					summary: 'Create database backup',
+					summary:
+						'Create database backup at the canonical destPath (returned as path; a relative destPath resolves against the working directory of the daemon, not the caller), with its seed-derived MAC in <destPath>.hmac (returned as macPath; `beignet restore db` needs it). An existing destPath or MAC file needs overwrite: true; the live database, its sidecars, the instance lock, config.json and daemon.pid are always refused',
 					tags: ['Node'],
-					requestBody: bodyContent({ destPath: 'string' }),
+					requestBody: bodyContent({
+						destPath: 'string',
+						overwrite: 'boolean?'
+					}),
 					responses: { '200': { description: 'Backup result' } }
 				}
 			},
@@ -1995,7 +2007,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ffor/recover': {
 				post: {
 					summary:
-						'R, back online: fetch every provisioned witness, credit each record that verifies, then close the epoch cooperatively when S is there and ACTIVE, or force-close with every known preimage when forceCloseIfUnreachable is true and S is not. Returns what was learned and what was done. On a channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret, forceCloseIfUnreachable also needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for, since it publishes the same commitment (issue #908)',
+						'R, back online: fetch every provisioned witness, credit each record that verifies, then close the epoch cooperatively when S is there and ACTIVE, or force-close with every known preimage when forceCloseIfUnreachable is true and S is not. Returns what was learned and what was done. On a channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret, forceCloseIfUnreachable also needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for, since it publishes the same commitment (issue #908). So does any channel while the recovery gate is fenced or quarantined (issue #1013)',
 					tags: ['FFOR'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -2019,7 +2031,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ffor/enforce': {
 				post: {
 					summary:
-						'R: force-close the channel carrying every known preimage; each settled voucher claims through its setup-time HTLC-success signature. The remedy when S will not answer ff_close or contradicted the epoch. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for: its recency cannot be proven, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path (issue #908)',
+						'R: force-close the channel carrying every known preimage; each settled voucher claims through its setup-time HTLC-success signature. The remedy when S will not answer ff_close or contradicted the epoch. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for: its recency cannot be proven, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path (issue #908). So does any channel while the recovery gate is fenced or quarantined (issue #1013)',
 					tags: ['FFOR'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -2197,7 +2209,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/guardian/status': {
 				get: {
 					summary:
-						"The reference guardian this node serves to OTHER beignet nodes over bolt8 sessions (docs/RECOVERY-GUARDIAN-WIRE.md 2.7): serving false when hosting is off; otherwise the guardian id, whether a bearer token is required, open sessions, requests retained in flight, every served set (id, members, namespaces, bytes stored and on disk, registeredAt), the bytes stored across sets, and the limits (per-record ciphertext, bytes per set, sets). Independent of this node's own recovery mode",
+						"The reference guardian this node serves to OTHER beignet nodes over bolt8 sessions (docs/RECOVERY-GUARDIAN-WIRE.md 2.7): serving false when hosting is off; otherwise the guardian id, whether a bearer token is required, open sessions, requests retained in flight, every served set (id, members, namespaces, bytes stored and on disk, registeredAt), the bytes stored across sets, and the limits (per-record ciphertext, bytes per set, namespaces per set, bytes per namespace, sets). Independent of this node's own recovery mode",
 					tags: ['Node'],
 					responses: {
 						'200': {
@@ -2263,7 +2275,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						amountSats: 'number',
 						satsPerVbyte: 'number?'
 					}),
-					responses: { '200': { description: 'Transaction info' } }
+					responses: {
+						'200': { description: 'Transaction info' },
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: amount + fee over maxPaymentSats or dailySpendLimitSats'
+						}
+					}
 				}
 			},
 			'/send-max': {
@@ -2280,7 +2298,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description: 'Transaction info',
 							content: jsonContent({ $ref: '#/components/schemas/TxInfo' })
 						},
-						'400': { description: 'Invalid address/fee rate or no UTXOs' }
+						'400': { description: 'Invalid address/fee rate or no UTXOs' },
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: the whole sweep over maxPaymentSats or dailySpendLimitSats'
+						}
 					}
 				}
 			},
@@ -2381,13 +2403,17 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/psbt/import-signed': {
 				post: {
 					summary:
-						'Validate and finalize an externally signed PSBT; returns { txid, txHex } WITHOUT broadcasting',
+						'Validate and finalize an externally signed PSBT; returns { txid, txHex } WITHOUT broadcasting. The node remembers only its 50 most recent builds, in memory; for an older build or one from before a restart, pass unsignedPsbtBase64 (the PSBT /psbt/build returned)',
 					tags: ['Node'],
-					requestBody: bodyContent({ psbtBase64: 'string' }),
+					requestBody: bodyContent({
+						psbtBase64: 'string',
+						unsignedPsbtBase64: 'string?'
+					}),
 					responses: {
 						'200': { description: 'Finalized transaction (not broadcast)' },
 						'400': {
-							description: 'PSBT_IMPORT_FAILED (missing/invalid signatures)'
+							description:
+								'PSBT_IMPORT_FAILED (missing/invalid signatures, an input already finalized, or inputs/outputs that differ from unsignedPsbtBase64 or, without it, from every PSBT this node remembers building)'
 						}
 					}
 				}
@@ -2480,7 +2506,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							content: jsonContent({
 								$ref: '#/components/schemas/RebalanceExecutionSummary'
 							})
-						}
+						},
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: the advisor fee budget for the day does not fit the remaining dailySpendLimitSats'
+						},
+						'409': { description: 'SERVICE_DRAINING' }
 					}
 				}
 			},
@@ -2504,6 +2535,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'400': {
 							description: 'No route, fee exceeds maxFeeSats, or invalid params'
+						},
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: maxFeeSats does not fit the remaining dailySpendLimitSats'
+						},
+						'409': {
+							description: 'SERVICE_DRAINING, or NODE_DESTROYED during shutdown'
 						}
 					}
 				}
@@ -2736,7 +2774,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/swaps/cancel': {
 				post: {
 					summary:
-						'Cancel a swap before any funds moved: a reverse swap in CREATED or HELD (closes its hold invoice and fails the payer), a submarine swap before PAYING (the peer refunds its own coins at the refund height). Past that a swap resolves on chain by claim or refund. Admin scope',
+						'Cancel a swap before any funds moved: a reverse swap in CREATED or HELD (closes its hold invoice and fails the payer), a submarine swap before PAYING (the peer refunds its own coins at the refund height). Also ends a stranded reverse swap (EXPOSED with strandedHeight set: its funding was absent past the refund height). Past that a swap resolves on chain by claim or refund. Admin scope',
 					tags: ['Swaps'],
 					requestBody: {
 						required: true,
@@ -2761,7 +2799,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'409': {
 							description:
-								'SWAP_NOT_CANCELLABLE: the swap is past CREATED/HELD (reverse) or PAYING (submarine) and resolves on chain'
+								'SWAP_NOT_CANCELLABLE: the swap is past CREATED/HELD (reverse, unless stranded) or PAYING (submarine) and resolves on chain'
 						}
 					}
 				}
@@ -3321,7 +3359,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'403': {
 							description:
-								'SPENDING_LIMIT_EXCEEDED: an address-targeted splice-out over dailySpendLimitSats'
+								'SPENDING_LIMIT_EXCEEDED: an address-targeted splice-out over maxPaymentSats or dailySpendLimitSats'
 						},
 						'404': { description: 'CHANNEL_NOT_FOUND' },
 						'409': {
@@ -3443,7 +3481,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'409': {
 							description:
-								'FEE_EXCEEDS_MAX, every route costs more than maxFeeSats / maxFeeMsat; nothing was sent'
+								'FEE_EXCEEDS_MAX, every route costs more than maxFeeSats / maxFeeMsat; nothing was sent. DUPLICATE_PAYMENT, with error.paymentHash, for a keyed retry of a timed-out payment that can still settle'
+						},
+						'504': {
+							description:
+								'PAYMENT_TIMEOUT, with error.paymentHash. A keyed retry does not request a new invoice while that payment can still settle, and answers 200 once it completed'
 						}
 					}
 				}
@@ -3452,11 +3494,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Register a webhook for event notifications (persistent across restarts)',
+					description:
+						'The url must be http or https. A loopback, private, or link-local host is refused (403 PRIVATE_NETWORK_REFUSED) unless allowPrivateNetwork is true. Payloads never carry a payment preimage; read it from GET /payment.',
 					tags: ['Webhooks'],
 					requestBody: bodyContent({
 						url: 'string',
 						events: 'string',
-						secret: 'string?'
+						secret: 'string?',
+						allowPrivateNetwork: 'boolean?'
 					}),
 					responses: {
 						'200': {
@@ -3666,6 +3711,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								message: {
 									type: 'string',
 									description: 'Human-readable error message'
+								},
+								paymentHash: {
+									type: 'string',
+									description:
+										'The payment the error is about, hex (PAYMENT_TIMEOUT, and DUPLICATE_PAYMENT on a keyed /offer/pay retry)'
 								}
 							},
 							description: 'Error details (present when ok=false)'
@@ -4793,7 +4843,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						skippedBudget: { type: 'integer' },
 						feeSpentMsat: {
 							type: 'string',
-							description: 'Fees spent by this run, msat as decimal string'
+							description:
+								'Fees spent by this run, msat as decimal string. An attempt whose wait timed out counts at its fee cap'
 						},
 						budgetRemainingMsat: {
 							type: 'string',

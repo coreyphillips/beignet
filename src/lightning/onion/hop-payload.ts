@@ -128,6 +128,22 @@ export function encodeHopPayload(payload: IHopPayload): Buffer {
 }
 
 /**
+ * A hop payload BOLT 4 answers with invalid_onion_payload. `tlvType` and
+ * `offset` (into the TLV stream) name the offending record, or are 0 when
+ * the failure is not one record's.
+ */
+export class InvalidOnionPayloadError extends Error {
+	constructor(
+		message: string,
+		readonly tlvType = 0,
+		readonly offset = 0
+	) {
+		super(message);
+		this.name = 'InvalidOnionPayloadError';
+	}
+}
+
+/**
  * Decode a hop payload from a buffer at the given offset.
  * Returns the decoded payload and total bytes consumed (including length prefix).
  */
@@ -146,19 +162,22 @@ export function decodeHopPayload(
 
 	const payloadEnd = offset + Number(payloadLength);
 	if (payloadEnd > buf.length) {
-		throw new Error('Hop payload extends beyond buffer');
+		throw new InvalidOnionPayloadError('Hop payload extends beyond buffer');
 	}
 	// BOLT 4: a length of 0 or 1 is the legacy/reserved form and is invalid for
 	// a TLV hop payload — reject as invalid_onion_payload rather than parse an
 	// empty/garbage TLV stream.
 	if (payloadLength < 2n) {
-		throw new Error(
+		throw new InvalidOnionPayloadError(
 			`Invalid hop payload length ${payloadLength} (invalid_onion_payload)`
 		);
 	}
+	const streamStart = offset;
 
 	let amountToForwardMsat = 0n;
 	let outgoingCltvValue = 0;
+	let hasAmountToForward = false;
+	let hasOutgoingCltv = false;
 	let shortChannelId: Buffer | undefined;
 	let paymentSecret: Buffer | undefined;
 	let totalMsat: bigint | undefined;
@@ -169,16 +188,19 @@ export function decodeHopPayload(
 
 	let prevTlvType: number | undefined;
 	while (offset < payloadEnd) {
+		const recordOffset = offset - streamStart;
 		// Read TLV type
 		const typeResult = decodeBigSize(buf, offset);
 		offset += typeResult.bytesRead;
 		const tlvType = Number(typeResult.value);
+		const invalid = (message: string): InvalidOnionPayloadError =>
+			new InvalidOnionPayloadError(message, tlvType, recordOffset);
 
 		// BOLT 1/4: TLV records MUST be strictly increasing by type (this also
 		// rejects duplicates). A misordered/duplicate stream is
 		// invalid_onion_payload.
 		if (prevTlvType !== undefined && tlvType <= prevTlvType) {
-			throw new Error(
+			throw invalid(
 				`Hop payload TLV type ${tlvType} out of order after ${prevTlvType} (invalid_onion_payload)`
 			);
 		}
@@ -190,7 +212,7 @@ export function decodeHopPayload(
 		const tlvLength = Number(lengthResult.value);
 
 		if (offset + tlvLength > payloadEnd) {
-			throw new Error('Hop payload TLV extends beyond the payload');
+			throw invalid('Hop payload TLV extends beyond the payload');
 		}
 		const tlvValue = buf.subarray(offset, offset + tlvLength);
 		offset += tlvLength;
@@ -198,19 +220,27 @@ export function decodeHopPayload(
 		switch (tlvType) {
 			case 2:
 				amountToForwardMsat = decodeTruncatedUint(tlvValue);
+				hasAmountToForward = true;
 				break;
 			case 4:
 				outgoingCltvValue = Number(decodeTruncatedUint(tlvValue));
+				hasOutgoingCltv = true;
 				break;
 			case 6:
+				if (tlvLength !== 8) {
+					throw invalid(`short_channel_id must be 8 bytes, got ${tlvLength}`);
+				}
 				shortChannelId = Buffer.from(tlvValue);
 				break;
 			case 8:
 				// payment_data: 32-byte payment_secret + remaining bytes as tu64 total_msat
-				if (tlvValue.length >= 32) {
-					paymentSecret = Buffer.from(tlvValue.subarray(0, 32));
-					totalMsat = decodeTruncatedUint(tlvValue.subarray(32));
+				if (tlvLength < 32) {
+					throw invalid(
+						`payment_data must be at least 32 bytes, got ${tlvLength}`
+					);
 				}
+				paymentSecret = Buffer.from(tlvValue.subarray(0, 32));
+				totalMsat = decodeTruncatedUint(tlvValue.subarray(32));
 				break;
 			case 10:
 				// encrypted_recipient_data (blinded hop)
@@ -218,6 +248,9 @@ export function decodeHopPayload(
 				break;
 			case 12:
 				// blinding_point (33 bytes)
+				if (tlvLength !== 33) {
+					throw invalid(`blinding_point must be 33 bytes, got ${tlvLength}`);
+				}
 				blindingPoint = Buffer.from(tlvValue);
 				break;
 			case 18:
@@ -231,9 +264,7 @@ export function decodeHopPayload(
 					customRecords.set(tlvType, Buffer.from(tlvValue));
 				} else if (tlvType % 2 === 0) {
 					// Unknown even types are an error per BOLT spec
-					throw new Error(
-						`Unknown required TLV type ${tlvType} in hop payload`
-					);
+					throw invalid(`Unknown required TLV type ${tlvType} in hop payload`);
 				} else {
 					// Unknown odd types are stored as custom records
 					if (!customRecords) customRecords = new Map();
@@ -243,7 +274,26 @@ export function decodeHopPayload(
 		}
 	}
 
+	// BOLT 4: a cleartext payload and a blinded final payload need both
+	// amount fields, and a blinded intermediate payload carries neither.
+	// Absent they would read as 0, turning a malformed forward into a 0-msat
+	// add refused for the wrong reason.
+	if (hasAmountToForward !== hasOutgoingCltv || !encryptedRecipientData) {
+		if (!hasAmountToForward) {
+			throw new InvalidOnionPayloadError('Hop payload lacks amt_to_forward', 2);
+		}
+		if (!hasOutgoingCltv) {
+			throw new InvalidOnionPayloadError(
+				'Hop payload lacks outgoing_cltv_value',
+				4
+			);
+		}
+	}
+
 	const result: IHopPayload = { amountToForwardMsat, outgoingCltvValue };
+	if (!hasAmountToForward && !hasOutgoingCltv) {
+		result.omitForwardAmounts = true;
+	}
 	if (shortChannelId) {
 		result.shortChannelId = shortChannelId;
 	}

@@ -35,6 +35,7 @@ import {
 } from '../types/wallet';
 import { createWalletStorage } from './wallet-storage';
 import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
+import { deriveBackupMacKey, writeBackupMac } from './backup-mac';
 import { nodeStorageView } from './node-storage-view';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
@@ -52,6 +53,7 @@ import { IFforIssuerStatusResp } from '../lightning/ffor/issuer-messages';
 import { IOffer } from '../lightning/offer/types';
 import {
 	estimateSpliceTxWeight,
+	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../lightning/channel/splice-weight';
 import {
@@ -65,6 +67,7 @@ import {
 import { ILightningError, IPaymentInfo } from '../lightning/node/types';
 import { IInvoiceInfo } from '../lightning/storage/types';
 import { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
+import { normalizeHexPubkey } from '../lightning/validation';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
 import { SqliteStorage } from '../lightning/storage/sqlite-storage';
 import { deriveStorageKey } from '../lightning/storage/encryption';
@@ -137,6 +140,7 @@ import {
 	JOURNAL_META_KEYS,
 	REPLICATION_META_KEYS,
 	IRotationEvent,
+	IGuardianReplicationEvent,
 	isOnionV3Hostname,
 	parseBolt8GuardianUrl
 } from '../lightning/recovery';
@@ -159,6 +163,7 @@ import {
 } from '../lightning/direct-funding';
 import { directFundingWallet } from './direct-funding';
 import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from './auth';
+import { WEBHOOK_SECRETS_STORAGE_KEY } from './webhooks';
 import {
 	INodeConfig,
 	InvalidRequestError,
@@ -168,16 +173,13 @@ import {
 	IHoldCancelledEvent,
 	IHoldInvoiceStateEvent,
 	IStructuredLog,
+	IRebalanceExecutionSummary,
+	IRebalanceResult,
 	PaymentDirection,
-	PaymentStatus
+	PaymentStatus,
+	PaymentWaitTimeoutError
 } from '../lightning/node/types';
-import {
-	BITCOIN_CHAIN_HASH,
-	REGTEST_CHAIN_HASH,
-	SIGNET_CHAIN_HASH,
-	isAnchorChannel,
-	ChannelState
-} from '../lightning/channel/types';
+import { isAnchorChannel, ChannelState } from '../lightning/channel/types';
 import { isRecencyUnproven } from '../lightning/channel/channel-state';
 import type { Channel } from '../lightning/channel/channel';
 import { decode as decodeInvoice } from '../lightning/invoice/decode';
@@ -302,6 +304,9 @@ export interface BeignetNodeOptions {
 	 * Opt-in and additive: coexists with the TCP listener on listenPort.
 	 */
 	websocketPort?: number;
+	/** Inbound peer connections (default 125); once this many are up, only
+	 *  peers holding a channel with this node are admitted. */
+	maxInboundPeers?: number;
 	preferAnchors?: boolean;
 	/**
 	 * option_wumbo (large_channels, default false): advertise the bit and lift
@@ -462,12 +467,13 @@ export interface BeignetNodeOptions {
 	 * fee). A Lightning payment reserves its amount plus its routing-fee cap
 	 * at admission and is charged its amount plus the fee actually paid when
 	 * it settles (issue #1008); sendToRoute reserves and charges what its
-	 * first hop carries. Excluded by design: consolidateUtxos (self-pay), our
-	 * own channel opens/splices/funding, bumpFeeOnchain/boostOnchain
-	 * (fee-only), and the submarine swap provider's payment of the
-	 * counterparty's invoice, which is bounded by the provider's own per-swap
-	 * fee cap and by the swap-in it is funded from rather than by this
-	 * limit. Resets at midnight UTC.
+	 * first hop carries. A circular rebalance (rebalanceChannel,
+	 * executeRebalances) counts its routing fee only. Excluded by design:
+	 * consolidateUtxos (self-pay), our own channel opens/splices/funding,
+	 * bumpFeeOnchain/boostOnchain (fee-only), and the submarine swap
+	 * provider's payment of the counterparty's invoice, which is bounded by
+	 * the provider's own per-swap fee cap and by the swap-in it is funded
+	 * from rather than by this limit. Resets at midnight UTC.
 	 * NOTE: before v0.3.0 this limit covered Lightning only.
 	 */
 	dailySpendLimitSats?: number;
@@ -477,9 +483,12 @@ export interface BeignetNodeOptions {
 	 * amount plus routing-fee cap exceeds this (issue #1008): the cap is the
 	 * caller's maxFeeSats/maxFeeMsat, or the default of 1% of the amount with
 	 * a 50 sat floor when none is given. Prevents accidental large payments.
-	 * The submarine swap provider's payment of the counterparty's invoice is
-	 * excluded by design: the provider's own per-swap fee cap and the swap-in
-	 * it is funded from bound it.
+	 * External on-chain sends are capped too: sendOnchain, address-targeted
+	 * spliceOut and sendDirectFunding on amount + fee, sendMaxOnchain on the
+	 * whole sweep. Circular rebalances are not capped, since the amount
+	 * comes back. The submarine swap provider's payment of the counterparty's
+	 * invoice is excluded by design: the provider's own per-swap fee cap and
+	 * the swap-in it is funded from bound it.
 	 */
 	maxPaymentSats?: number;
 	/** Timeout for connectPeer() in milliseconds (default: 15000) */
@@ -608,6 +617,8 @@ export interface BeignetNodeOptions {
 	 * Automatic circular rebalancing (default DISABLED). When enabled the node
 	 * periodically executes the advisor's rebalance plan, spending at most
 	 * budgetSatsPerDay in routing fees per UTC day. Off unless enabled: true.
+	 * Each run is an executeRebalances call, so drain mode and
+	 * dailySpendLimitSats hold it as they hold a manual one.
 	 */
 	autoRebalance?: {
 		enabled?: boolean;
@@ -1325,6 +1336,49 @@ function requireFinalCltvExpiry(value: unknown): number {
 }
 
 /**
+ * Seconds an invoice may stay payable. The BOLT 11 encoder packs whatever
+ * number it is given, so -1 and NaN go out as 0 and 1.5 as 1: the payer sees
+ * an invoice already expired, or expiring sooner than the one this node
+ * records. A year is LND's ceiling for the same field.
+ */
+const MAX_INVOICE_EXPIRY_SECS = 365 * 24 * 60 * 60;
+
+function requireInvoiceExpiry(value: unknown, field: string): number {
+	if (
+		typeof value !== 'number' ||
+		!Number.isSafeInteger(value) ||
+		value < 1 ||
+		value > MAX_INVOICE_EXPIRY_SECS
+	) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`${field} must be a whole number of seconds between 1 and ` +
+				`${MAX_INVOICE_EXPIRY_SECS}`
+		);
+	}
+	return value;
+}
+
+/**
+ * The BOLT 11 `d` tag's length field counts at most 1023 five-bit words,
+ * which is 639 whole bytes. A longer description needs descriptionHash.
+ */
+const MAX_INVOICE_DESCRIPTION_BYTES = 639;
+
+function requireInvoiceDescription(value: string | undefined): void {
+	if (
+		typeof value === 'string' &&
+		Buffer.byteLength(value, 'utf8') > MAX_INVOICE_DESCRIPTION_BYTES
+	) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`description must be at most ${MAX_INVOICE_DESCRIPTION_BYTES} bytes ` +
+				'of UTF-8; use descriptionHash for a longer one'
+		);
+	}
+}
+
+/**
  * A millisatoshi field that reaches the library as a bigint but is accepted
  * from callers as a number or a decimal string. BigInt() is the only thing
  * that ever validated it, by throwing, so both spellings are checked here
@@ -1456,16 +1510,21 @@ function requireOpenAmounts(amountSats: unknown, pushSats?: unknown): void {
  * writeUInt32BE truncates 1.5 to 1 and throws on 2^32, and both happen after
  * the channel's state machine has moved, so the bound is enforced here.
  */
-function requireU32(value: unknown, field: string, min = 1): number {
+function requireU32(
+	value: unknown,
+	field: string,
+	min = 1,
+	max = 0xffffffff
+): number {
 	if (
 		typeof value !== 'number' ||
 		!Number.isInteger(value) ||
 		value < min ||
-		value > 0xffffffff
+		value > max
 	) {
 		throw new BeignetError(
 			BeignetErrorCode.INVALID_PARAMS,
-			`${field} must be an integer between ${min} and 4294967295`
+			`${field} must be an integer between ${min} and ${max}`
 		);
 	}
 	return value;
@@ -1735,6 +1794,32 @@ const SECRET_MISSING_FORCE_CLOSE_REFUSAL =
 	'the peer to close is the safe outcome. Set acceptStaleStateRisk: true ' +
 	'to force close anyway.';
 
+/**
+ * The same acknowledgement for a whole device rather than one channel
+ * (issue #1013). A fenced device was taken over by another holding the
+ * same seed, and every update that device made revoked a commitment this
+ * one still stores, so its force close is normally a revoked broadcast.
+ */
+const SUPERSEDED_FORCE_CLOSE_REFUSAL =
+	'This device was superseded: another device restored this node from ' +
+	'the same seed and took over its channels, so this one is fenced. ' +
+	'Every channel update the other device has made revoked a commitment ' +
+	'this device still stores. If it has used this channel, force closing ' +
+	'here publishes a revoked commitment and the whole channel balance is ' +
+	'lost to the justice path. Close the channel from the device that took ' +
+	'over, or wait for the peer to close. Set acceptStaleStateRisk: true to ' +
+	'force close anyway.';
+
+const UNCONFIRMED_OWNER_FORCE_CLOSE_REFUSAL =
+	'This device has not confirmed with its guardians that it still owns ' +
+	"this node's channels (the recovery gate is quarantined), so another " +
+	'device restored from the same seed may have taken them over. If one ' +
+	'has and has used this channel, force closing publishes a revoked ' +
+	'commitment and the whole channel balance is lost to the justice path. ' +
+	'Waiting for the guardians to confirm this device, or for the peer to ' +
+	'close, is the safe outcome. Set acceptStaleStateRisk: true to force ' +
+	'close anyway.';
+
 interface IRecencyHold {
 	restoreRecencyUnproven?: true;
 	reestablishRecencyUnproven?: true;
@@ -1809,6 +1894,8 @@ export class BeignetNode extends EventEmitter {
 	private _sweepRefreshTimer?: ReturnType<typeof setInterval>;
 	/** Background timer waiting for Electrum before fallback-fund recovery (see runFallbackRecoveryWhenConnected). */
 	private _fallbackRecoveryTimer?: ReturnType<typeof setInterval>;
+	/** The autoRebalance timer, run here rather than in the engine (see initNode). */
+	private _autoRebalanceTimer?: ReturnType<typeof setInterval>;
 	/**
 	 * Bound on the cooperative close's wallet-address lookup (issue #542
 	 * review): getNextAvailableAddress can enter an Electrum reconnect whose
@@ -2035,7 +2122,15 @@ export class BeignetNode extends EventEmitter {
 	 * either of them can be the one that settles.
 	 */
 	private readonly _asyncSpendClaims = new Map<string, AsyncSpendClaim[]>();
+	/**
+	 * The up-front charges of the rebalances still running, which a new UTC
+	 * day starts with. In memory only: after a restart the charge stays with
+	 * the day it was persisted to.
+	 */
+	private _liveRebalanceChargeSats = 0;
 	private _maxPaymentSats?: number;
+	/** Tail of the queue _runOnchainSend runs whole on-chain sends through. */
+	private _onchainSendLock: Promise<unknown> = Promise.resolve();
 	/**
 	 * Paid L402 credentials, so a gated API is paid for once rather than per
 	 * request. In memory by design: a credential is a bearer token for paid
@@ -2440,9 +2535,7 @@ export class BeignetNode extends EventEmitter {
 		const beignetNetwork = this.toBeignetNetwork(networkName);
 		const lnNetwork = this.toLnNetwork(networkName);
 		const coinType = this.toCoinType(networkName);
-		let chainHash = BITCOIN_CHAIN_HASH;
-		if (networkName === 'regtest') chainHash = REGTEST_CHAIN_HASH;
-		if (networkName === 'signet') chainHash = SIGNET_CHAIN_HASH;
+		const chainHash = chainHashForNetwork(lnNetwork);
 
 		// 3. Create on-chain wallet
 		const electrumServer = {
@@ -2843,6 +2936,7 @@ export class BeignetNode extends EventEmitter {
 			sweepDestinationScript,
 			socks5Proxy,
 			socks5ProxyScope,
+			maxInboundPeers: opts.maxInboundPeers,
 			...(opts.guardianServe
 				? {
 						guardianHost: {
@@ -2869,7 +2963,12 @@ export class BeignetNode extends EventEmitter {
 				  }
 				: {}),
 			peerStorageEnabled: this.peerStorageEnabled,
-			autoRebalance: opts.autoRebalance,
+			// The engine's own timer would skip the drain and the daily limit,
+			// so the node runs it instead (step 11b).
+			autoRebalance: opts.autoRebalance && {
+				...opts.autoRebalance,
+				enabled: false
+			},
 			autoTuneFees: opts.autoTuneFees,
 			watchtowers: opts.watchtowers,
 			recovery: this.recoveryNodeConfig
@@ -3601,6 +3700,19 @@ export class BeignetNode extends EventEmitter {
 			this._maxPaymentSats = opts.maxPaymentSats;
 		}
 
+		// 11b. Automatic rebalancing, through executeRebalances so every run
+		// is held to the drain and charged to the daily ledger loaded above.
+		if (opts.autoRebalance?.enabled === true) {
+			this._autoRebalanceTimer = setInterval(() => {
+				this.executeRebalances().catch((err) => {
+					this.log('warn', 'Automatic rebalance failed', {
+						error: err instanceof Error ? err.message : String(err)
+					});
+				});
+			}, opts.autoRebalance.intervalMs ?? 3_600_000);
+			this._autoRebalanceTimer.unref?.();
+		}
+
 		// 12. Auto-bootstrap peer discovery
 		if (opts.autoBootstrap) {
 			this.node.connectToSeeds().catch(() => {
@@ -3992,8 +4104,43 @@ export class BeignetNode extends EventEmitter {
 				this.log('debug', `Recovery replication: ${event.type}`, {
 					detail: event.detail
 				});
+				this.relayRecordTooLarge(event);
 			}
 		});
+	}
+
+	/**
+	 * A guardian that refuses a record as too large, or because its quota
+	 * is full, can take nothing after it, so in quorum mode the node stops
+	 * releasing channel updates and in async mode its backup stops
+	 * advancing. Neither shows up anywhere else.
+	 */
+	private relayRecordTooLarge(event: IGuardianReplicationEvent): void {
+		if (
+			event.type !== 'record:too-large' &&
+			event.type !== 'record:quota-refused'
+		) {
+			return;
+		}
+		const tooLarge = event.type === 'record:too-large';
+		this.log(
+			'error',
+			tooLarge
+				? 'Recovery guardian refused an oversized record'
+				: 'Recovery guardian refused a record: its quota is full',
+			{ detail: event.detail }
+		);
+		const data = {
+			code: tooLarge
+				? 'RECOVERY_RECORD_TOO_LARGE'
+				: 'RECOVERY_GUARDIAN_QUOTA_EXCEEDED',
+			message: event.detail,
+			timestamp: Date.now()
+		};
+		// Reported once per record, so a boot-time refusal must also reach
+		// the callback, which exists before any listener can attach.
+		this._bootOpts?.onError?.(data);
+		this.emit('node:error', data);
 	}
 
 	/**
@@ -5171,6 +5318,10 @@ export class BeignetNode extends EventEmitter {
 			clearInterval(this._fallbackRecoveryTimer);
 			this._fallbackRecoveryTimer = undefined;
 		}
+		if (this._autoRebalanceTimer) {
+			clearInterval(this._autoRebalanceTimer);
+			this._autoRebalanceTimer = undefined;
+		}
 		// The queue itself stays, and is not stopped: stop() is for good, and
 		// after the resume it serves the rebuilt node over the installed
 		// database through its live storage view (issue #978).
@@ -5197,9 +5348,10 @@ export class BeignetNode extends EventEmitter {
 	 * Daemon-local state that lives in the database beside the channel
 	 * state, and must follow the operator into the restored one: persisted
 	 * API-key rotations and revocations (a dropped override resurrects a
-	 * revoked secret), registered webhooks, the payment queue's rows (the
-	 * queue outlives an in-process resume and updates them later, issue
-	 * #978), and the peer addresses just used to retrieve the capsules (so
+	 * revoked secret), registered webhooks and their HMAC secrets, the
+	 * payment queue's rows (the queue outlives an in-process resume and
+	 * updates them later, issue #978), and the peer addresses just used to
+	 * retrieve the capsules (so
 	 * the restored node dials its channel peers on its own), and the daily
 	 * spend ledger (a resume must not hand the day's allowance back, issue
 	 * #977). The auth override is mandatory; the rest is best effort and
@@ -5219,6 +5371,10 @@ export class BeignetNode extends EventEmitter {
 					hook.secretHash,
 					hook.createdAt
 				);
+			}
+			const secrets = from.loadWalletData(WEBHOOK_SECRETS_STORAGE_KEY);
+			if (secrets !== null) {
+				to.saveWalletData(WEBHOOK_SECRETS_STORAGE_KEY, secrets);
 			}
 		} catch (err) {
 			this.log('warn', 'Could not carry webhooks into the restore', {
@@ -5500,11 +5656,16 @@ export class BeignetNode extends EventEmitter {
 					...bindGuardianSet(incoming, { transportFor })
 				},
 				required: CRASH_V1_PROFILE.required,
+				journalKeys: {
+					masterKey: deriveRecoveryMasterKey(this.nodeSecret()),
+					nodeId: getPublicKey(this.nodeSecret())
+				},
 				onEvent: (event) => this.noteRotationEvent(event),
 				onReplicationEvent: (event) => {
 					this.log('debug', `Rotation replication: ${event.type}`, {
 						detail: event.detail
 					});
+					this.relayRecordTooLarge(event);
 				}
 			});
 		} catch (error) {
@@ -6301,51 +6462,75 @@ export class BeignetNode extends EventEmitter {
 		return result.value.addressIndex.address;
 	}
 
+	/**
+	 * Run one on-chain send after every send queued before it has finished,
+	 * through broadcast or the PSBT return. The wallet stages every send in
+	 * its one shared transaction and each send resets it on the way in and
+	 * out, so two sends that overlap read and reset each other's outputs and
+	 * fee (issue #1054).
+	 */
+	private _runOnchainSend<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this._onchainSendLock.then(fn, fn);
+		this._onchainSendLock = run.catch(() => undefined);
+		return run;
+	}
+
 	async sendOnchain(
 		address: string,
 		amountSats: number,
 		satsPerVbyte?: number
 	): Promise<TxInfo> {
-		// External onchain sends share the daily budget with Lightning
-		// payments. Fail fast on the amount alone before building.
+		// External onchain sends share the per-payment and daily limits with
+		// Lightning payments. Fail fast on the amount alone before building.
+		this._checkMaxPayment(amountSats);
 		this._checkSpendLimit(amountSats);
-		// The staged send is read below (the built fee) and reset on every
-		// way out, as _boostRbf does: what one send staged must not outlive
-		// it (#1002).
-		try {
-			// wallet.send with broadcast:true resolves to the txid, not the raw
-			// hex, so build first (broadcast:false returns the hex) and broadcast
-			// separately to report both txid and hex. rbf must be passed per-send:
-			// the wallet-level flag does not propagate into setupTransaction.
-			const result = await this.wallet.send({
-				address,
-				amount: amountSats,
-				broadcast: false,
-				rbf: this.wallet.rbf,
-				...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
-			});
-			if (result.isErr()) {
-				throw new BeignetError('SEND_FAILED', result.error.message);
-			}
-			// No limit configured: broadcast without touching the budget.
-			if (this._dailySpendLimitSats === undefined) {
-				return await this._broadcastRawTx(result.value);
-			}
-			// Re-check with the real fee included, then reserve the total so
-			// concurrent sends cannot both pass before either records.
-			const totalSats = this._builtOnchainTotalSats(amountSats);
-			this._checkSpendLimit(totalSats);
-			this._pendingSpendSats += totalSats;
+		return this._runOnchainSend(async () => {
+			// The staged send is read below (the built fee) and reset on every
+			// way out, as _boostRbf does: what one send staged must not outlive
+			// it (#1002).
 			try {
-				const info = await this._broadcastRawTx(result.value);
-				this._recordSpend(totalSats, 'onchain');
-				return info;
+				// wallet.send with broadcast:true resolves to the txid, not the raw
+				// hex, so build first (broadcast:false returns the hex) and broadcast
+				// separately to report both txid and hex. rbf must be passed per-send:
+				// the wallet-level flag does not propagate into setupTransaction.
+				const result = await this.wallet.send({
+					address,
+					amount: amountSats,
+					broadcast: false,
+					rbf: this.wallet.rbf,
+					...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
+				});
+				if (result.isErr()) {
+					throw new BeignetError('SEND_FAILED', result.error.message);
+				}
+				// No limit configured: broadcast without touching the budget.
+				if (
+					this._dailySpendLimitSats === undefined &&
+					this._maxPaymentSats === undefined
+				) {
+					return await this._broadcastRawTx(result.value);
+				}
+				// Re-check with the real fee included, then reserve the total so
+				// concurrent sends cannot both pass before either records.
+				const totalSats = this._builtOnchainTotalSats(amountSats);
+				this._checkMaxPayment(totalSats, amountSats, {
+					name: 'on-chain fees',
+					param: 'satsPerVbyte'
+				});
+				this._checkSpendLimit(totalSats);
+				const reserving = this._dailySpendLimitSats !== undefined;
+				if (reserving) this._pendingSpendSats += totalSats;
+				try {
+					const info = await this._broadcastRawTx(result.value);
+					this._recordSpend(totalSats, 'onchain');
+					return info;
+				} finally {
+					if (reserving) this._pendingSpendSats -= totalSats;
+				}
 			} finally {
-				this._pendingSpendSats -= totalSats;
+				await this.wallet.resetSendTransaction();
 			}
-		} finally {
-			await this.wallet.resetSendTransaction();
-		}
+		});
 	}
 
 	/**
@@ -6371,53 +6556,72 @@ export class BeignetNode extends EventEmitter {
 			}
 		}
 		this._validateFeeRate(satsPerVbyte);
-		// Everything the later steps need (import-signed, combine) is in the
-		// PSBT itself; none of them reads the staged send, so it is reset here.
-		try {
-			const result = await this.wallet.buildPsbt({
-				txs: outputs.map((o) => ({ address: o.address, amount: o.amountSats })),
-				rbf: this.wallet.rbf,
-				...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
-			});
-			if (result.isErr()) {
-				throw new BeignetError('PSBT_BUILD_FAILED', result.error.message);
+		return this._runOnchainSend(async () => {
+			// Everything the later steps need (import-signed, combine) is in the
+			// PSBT itself; none of them reads the staged send, so it is reset here.
+			try {
+				const result = await this.wallet.buildPsbt({
+					txs: outputs.map((o) => ({
+						address: o.address,
+						amount: o.amountSats
+					})),
+					rbf: this.wallet.rbf,
+					...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
+				});
+				if (result.isErr()) {
+					throw new BeignetError('PSBT_BUILD_FAILED', result.error.message);
+				}
+				const built = result.value;
+				return {
+					psbtBase64: built.psbtBase64,
+					feeSats: built.fee,
+					vsizeEstimate: built.vsizeEstimate,
+					satsPerVbyte: built.satsPerByte,
+					inputs: built.inputs.map((input) => ({
+						txid: input.tx_hash,
+						vout: input.tx_pos,
+						address: input.address,
+						valueSats: input.value,
+						path: input.path
+					})),
+					outputs: built.outputs.map((output) => ({
+						address: output.address,
+						valueSats: output.value
+					}))
+				};
+			} finally {
+				await this.wallet.resetSendTransaction();
 			}
-			const built = result.value;
-			return {
-				psbtBase64: built.psbtBase64,
-				feeSats: built.fee,
-				vsizeEstimate: built.vsizeEstimate,
-				satsPerVbyte: built.satsPerByte,
-				inputs: built.inputs.map((input) => ({
-					txid: input.tx_hash,
-					vout: input.tx_pos,
-					address: input.address,
-					valueSats: input.value,
-					path: input.path
-				})),
-				outputs: built.outputs.map((output) => ({
-					address: output.address,
-					valueSats: output.value
-				}))
-			};
-		} finally {
-			await this.wallet.resetSendTransaction();
-		}
+		});
 	}
 
 	/**
 	 * Validates and finalizes an externally signed PSBT. Returns the raw
 	 * transaction WITHOUT broadcasting; use sendRawTransaction-style flows or
-	 * the wallet broadcast explicitly.
+	 * the wallet broadcast explicitly. The wallet remembers only its recent
+	 * builds, in memory, so a PSBT built before a restart is imported against
+	 * unsignedPsbtBase64, the PSBT buildPsbt returned.
 	 */
-	importSignedPsbt(psbtBase64: string): PsbtImportInfo {
+	importSignedPsbt(
+		psbtBase64: string,
+		unsignedPsbtBase64?: string
+	): PsbtImportInfo {
 		if (!psbtBase64 || typeof psbtBase64 !== 'string') {
 			throw new BeignetError(
 				BeignetErrorCode.INVALID_PARAMS,
 				'psbtBase64 required'
 			);
 		}
-		const result = this.wallet.importSignedPsbt(psbtBase64);
+		if (
+			unsignedPsbtBase64 !== undefined &&
+			typeof unsignedPsbtBase64 !== 'string'
+		) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'unsignedPsbtBase64 must be a string'
+			);
+		}
+		const result = this.wallet.importSignedPsbt(psbtBase64, unsignedPsbtBase64);
 		if (result.isErr()) {
 			throw new BeignetError('PSBT_IMPORT_FAILED', result.error.message);
 		}
@@ -6712,47 +6916,56 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		this._validateFeeRate(satsPerVbyte);
-		// The staged send is read below (the swept inputs) and reset on every
-		// way out, as _boostRbf does (#1002).
-		try {
-			const result = await this.wallet.sendMax({
-				address,
-				satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
-				rbf: this.wallet.rbf,
-				broadcast: false
-			});
-			if (result.isErr()) {
-				throw new BeignetError('SEND_FAILED', result.error.message);
-			}
-			// No limit configured: broadcast without touching the budget.
-			if (this._dailySpendLimitSats === undefined) {
-				return await this._broadcastRawTx(result.value);
-			}
-			// A sweep drains the entire input value (send amount + fee). Check it
-			// against the shared daily budget BEFORE broadcast; the amount is only
-			// known once the transaction has been built.
-			const totalSats = this.wallet.transaction.getTransactionInputValue({
-				inputs: this.wallet.transaction.data.inputs
-			});
-			if (totalSats <= 0) {
-				// Fail closed: never broadcast a sweep the limit cannot account for.
-				throw new BeignetError(
-					'SPENDING_LIMIT_EXCEEDED',
-					'Unable to determine the swept amount for the daily spend limit check; refusing to send'
-				);
-			}
-			this._checkSpendLimit(totalSats);
-			this._pendingSpendSats += totalSats;
+		return this._runOnchainSend(async () => {
+			// The staged send is read below (the swept inputs) and reset on every
+			// way out, as _boostRbf does (#1002).
 			try {
-				const info = await this._broadcastRawTx(result.value);
-				this._recordSpend(totalSats, 'onchain');
-				return info;
+				const result = await this.wallet.sendMax({
+					address,
+					satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
+					rbf: this.wallet.rbf,
+					broadcast: false
+				});
+				if (result.isErr()) {
+					throw new BeignetError('SEND_FAILED', result.error.message);
+				}
+				// No limit configured: broadcast without touching the budget.
+				if (
+					this._dailySpendLimitSats === undefined &&
+					this._maxPaymentSats === undefined
+				) {
+					return await this._broadcastRawTx(result.value);
+				}
+				// A sweep drains the entire input value (send amount + fee). Check it
+				// against the per-payment and daily limits BEFORE broadcast; the
+				// amount is only known once the transaction has been built.
+				const totalSats = this.wallet.transaction.getTransactionInputValue({
+					inputs: this.wallet.transaction.data.inputs
+				});
+				if (totalSats <= 0) {
+					// Fail closed: never broadcast a sweep the limit cannot account for.
+					throw new BeignetError(
+						'SPENDING_LIMIT_EXCEEDED',
+						'Unable to determine the swept amount for the spend limit checks; refusing to send'
+					);
+				}
+				// Judged whole: a lower fee rate only moves sats from the fee to the
+				// output, so there is no fee to tell the caller to lower.
+				this._checkMaxPayment(totalSats);
+				this._checkSpendLimit(totalSats);
+				const reserving = this._dailySpendLimitSats !== undefined;
+				if (reserving) this._pendingSpendSats += totalSats;
+				try {
+					const info = await this._broadcastRawTx(result.value);
+					this._recordSpend(totalSats, 'onchain');
+					return info;
+				} finally {
+					if (reserving) this._pendingSpendSats -= totalSats;
+				}
 			} finally {
-				this._pendingSpendSats -= totalSats;
+				await this.wallet.resetSendTransaction();
 			}
-		} finally {
-			await this.wallet.resetSendTransaction();
-		}
+		});
 	}
 
 	/**
@@ -6815,91 +7028,95 @@ export class BeignetNode extends EventEmitter {
 		txid: string,
 		satsPerVbyte?: number
 	): Promise<BoostResult> {
-		const setup = await this.wallet.transaction.setupRbf({ txid });
-		if (setup.isErr()) {
-			await this.wallet.resetSendTransaction();
-			throw new BeignetError(
-				BeignetErrorCode.NOT_BOOSTABLE,
-				setup.error.message
-			);
-		}
-		try {
-			// setupRbf defaults to the fast feerate; apply a requested rate through
-			// updateFee so the wallet's fee-overpayment guards run.
-			if (satsPerVbyte !== undefined) {
-				const feeRes = this.wallet.transaction.updateFee({
-					satsPerByte: satsPerVbyte
-				});
-				if (feeRes.isErr()) {
-					throw new BeignetError(
-						BeignetErrorCode.INVALID_PARAMS,
-						feeRes.error.message
-					);
-				}
-			}
-			// BIP 125 rule 3/4: the replacement must pay strictly more than the
-			// original fee or the network rejects it; fail with a clear message
-			// instead of a broadcast error.
-			const original =
-				this.wallet.unconfirmedTransactions[txid] ??
-				this.wallet.transactions[txid];
-			const originalFeeSats = original ? btcToSats(original.fee) : 0;
-			const newFeeSats = this.wallet.transaction.data.fee;
-			if (newFeeSats <= originalFeeSats) {
+		return this._runOnchainSend(async () => {
+			const setup = await this.wallet.transaction.setupRbf({ txid });
+			if (setup.isErr()) {
+				await this.wallet.resetSendTransaction();
 				throw new BeignetError(
-					BeignetErrorCode.INVALID_PARAMS,
-					`Replacement fee ${newFeeSats} sats does not exceed the original fee ${originalFeeSats} sats; raise satsPerVbyte`
+					BeignetErrorCode.NOT_BOOSTABLE,
+					setup.error.message
 				);
 			}
-			const createRes = await this.wallet.transaction.createTransaction();
-			if (createRes.isErr()) {
-				throw new BeignetError('SEND_FAILED', createRes.error.message);
+			try {
+				// setupRbf defaults to the fast feerate; apply a requested rate through
+				// updateFee so the wallet's fee-overpayment guards run.
+				if (satsPerVbyte !== undefined) {
+					const feeRes = this.wallet.transaction.updateFee({
+						satsPerByte: satsPerVbyte
+					});
+					if (feeRes.isErr()) {
+						throw new BeignetError(
+							BeignetErrorCode.INVALID_PARAMS,
+							feeRes.error.message
+						);
+					}
+				}
+				// BIP 125 rule 3/4: the replacement must pay strictly more than the
+				// original fee or the network rejects it; fail with a clear message
+				// instead of a broadcast error.
+				const original =
+					this.wallet.unconfirmedTransactions[txid] ??
+					this.wallet.transactions[txid];
+				const originalFeeSats = original ? btcToSats(original.fee) : 0;
+				const newFeeSats = this.wallet.transaction.data.fee;
+				if (newFeeSats <= originalFeeSats) {
+					throw new BeignetError(
+						BeignetErrorCode.INVALID_PARAMS,
+						`Replacement fee ${newFeeSats} sats does not exceed the original fee ${originalFeeSats} sats; raise satsPerVbyte`
+					);
+				}
+				const createRes = await this.wallet.transaction.createTransaction();
+				if (createRes.isErr()) {
+					throw new BeignetError('SEND_FAILED', createRes.error.message);
+				}
+				const info = await this._broadcastRawTx(createRes.value.hex);
+				await this._recordBoost(txid, info.txid, EBoostType.rbf, newFeeSats);
+				return {
+					...info,
+					boostType: 'rbf',
+					feeSats: newFeeSats,
+					originalTxid: txid
+				};
+			} finally {
+				await this.wallet.resetSendTransaction();
 			}
-			const info = await this._broadcastRawTx(createRes.value.hex);
-			await this._recordBoost(txid, info.txid, EBoostType.rbf, newFeeSats);
-			return {
-				...info,
-				boostType: 'rbf',
-				feeSats: newFeeSats,
-				originalTxid: txid
-			};
-		} finally {
-			await this.wallet.resetSendTransaction();
-		}
+		});
 	}
 
 	private async _boostCpfp(
 		txid: string,
 		satsPerVbyte?: number
 	): Promise<BoostResult> {
-		const setup = await this.wallet.transaction.setupCpfp({
-			txid,
-			...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
-		});
-		if (setup.isErr()) {
-			await this.wallet.resetSendTransaction();
-			throw new BeignetError(
-				BeignetErrorCode.NOT_BOOSTABLE,
-				setup.error.message
-			);
-		}
-		try {
-			const feeSats = setup.value.fee;
-			const createRes = await this.wallet.transaction.createTransaction();
-			if (createRes.isErr()) {
-				throw new BeignetError('SEND_FAILED', createRes.error.message);
+		return this._runOnchainSend(async () => {
+			const setup = await this.wallet.transaction.setupCpfp({
+				txid,
+				...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
+			});
+			if (setup.isErr()) {
+				await this.wallet.resetSendTransaction();
+				throw new BeignetError(
+					BeignetErrorCode.NOT_BOOSTABLE,
+					setup.error.message
+				);
 			}
-			const info = await this._broadcastRawTx(createRes.value.hex);
-			await this._recordBoost(txid, info.txid, EBoostType.cpfp, feeSats);
-			return {
-				...info,
-				boostType: 'cpfp',
-				feeSats,
-				originalTxid: txid
-			};
-		} finally {
-			await this.wallet.resetSendTransaction();
-		}
+			try {
+				const feeSats = setup.value.fee;
+				const createRes = await this.wallet.transaction.createTransaction();
+				if (createRes.isErr()) {
+					throw new BeignetError('SEND_FAILED', createRes.error.message);
+				}
+				const info = await this._broadcastRawTx(createRes.value.hex);
+				await this._recordBoost(txid, info.txid, EBoostType.cpfp, feeSats);
+				return {
+					...info,
+					boostType: 'cpfp',
+					feeSats,
+					originalTxid: txid
+				};
+			} finally {
+				await this.wallet.resetSendTransaction();
+			}
+		});
 	}
 
 	/** Record a broadcast boost; bookkeeping failure must not fail the bump. */
@@ -6955,24 +7172,26 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		const address = await this.getNewAddress();
-		// The staged send is read below (the fee) and reset on every way out,
-		// as _boostRbf does (#1002).
-		try {
-			const result = await this.wallet.sendMax({
-				address,
-				satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
-				rbf: this.wallet.rbf,
-				broadcast: false
-			});
-			if (result.isErr()) {
-				throw new BeignetError('SEND_FAILED', result.error.message);
+		return this._runOnchainSend(async () => {
+			// The staged send is read below (the fee) and reset on every way out,
+			// as _boostRbf does (#1002).
+			try {
+				const result = await this.wallet.sendMax({
+					address,
+					satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
+					rbf: this.wallet.rbf,
+					broadcast: false
+				});
+				if (result.isErr()) {
+					throw new BeignetError('SEND_FAILED', result.error.message);
+				}
+				const feeSats = this.wallet.transaction.data.fee;
+				const info = await this._broadcastRawTx(result.value);
+				return { ...info, utxosConsolidated: utxoCount, address, feeSats };
+			} finally {
+				await this.wallet.resetSendTransaction();
 			}
-			const feeSats = this.wallet.transaction.data.fee;
-			const info = await this._broadcastRawTx(result.value);
-			return { ...info, utxosConsolidated: utxoCount, address, feeSats };
-		} finally {
-			await this.wallet.resetSendTransaction();
-		}
+		});
 	}
 
 	async refreshWallet(): Promise<void> {
@@ -7157,6 +7376,8 @@ export class BeignetNode extends EventEmitter {
 		port?: number,
 		transport?: IPeerTransportOptions
 	): Promise<PeerInfo> {
+		// listPeers reports the lowercase key the node registers the peer under.
+		pubkey = normalizeHexPubkey(pubkey);
 		// Where we are dialing, for error messages: explicit host:port, or the
 		// gossip/DNS resolution the library performs when both are omitted.
 		const target =
@@ -8111,7 +8332,8 @@ export class BeignetNode extends EventEmitter {
 	forceCloseChannel(
 		channelId: string,
 		// The labelled risk acknowledgement RECOVERY-PROTOCOL 5.6 asks for
-		// (issues #469 and #907). Required for either recency hold: this node refuses to
+		// (issues #469 and #907). Required for either recency hold, and on a
+		// fenced or quarantined device (issue #1013): this node refuses to
 		// broadcast such a commitment on its own initiative because the peer
 		// may already hold a revocation for it, and an operator command is the
 		// documented exit. It should be a decision, not a default, so the
@@ -8215,6 +8437,17 @@ export class BeignetNode extends EventEmitter {
 		acceptStaleStateRisk: boolean
 	): void {
 		if (acceptStaleStateRisk === true) return;
+		// Ahead of the per-channel holds: a takeover puts every channel at
+		// risk at once, and no channel row records it.
+		const ownership = this.node.getRecoveryOwnershipHold();
+		if (ownership !== null) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				ownership === 'superseded'
+					? SUPERSEDED_FORCE_CLOSE_REFUSAL
+					: UNCONFIRMED_OWNER_FORCE_CLOSE_REFUSAL
+			);
+		}
 		const hold = this.recencyHold(channelId);
 		// One refusal per origin, in the engine's own precedence
 		// (recencyHoldOrigin): the local fault first, because it is the only
@@ -8539,6 +8772,9 @@ export class BeignetNode extends EventEmitter {
 				? BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) *
 				  1000n
 				: undefined;
+		if (expirySecs !== undefined)
+			requireInvoiceExpiry(expirySecs, 'expirySecs');
+		if (!descriptionHash) requireInvoiceDescription(description);
 		const result = this.node.createInvoice({
 			amountMsat,
 			description: descriptionHash ? undefined : description || '',
@@ -8614,6 +8850,11 @@ export class BeignetNode extends EventEmitter {
 				? BigInt(requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')) *
 				  1000n
 				: undefined;
+		// Before the LSP is asked: a refusal after its grant leaves the intent
+		// registered there with no invoice behind it.
+		if (opts.expirySecs !== undefined)
+			requireInvoiceExpiry(opts.expirySecs, 'expirySecs');
+		requireInvoiceDescription(opts.description);
 		let result: Awaited<ReturnType<typeof this.node.createJitInvoice>>;
 		try {
 			result = await this.node.createJitInvoice({
@@ -9150,6 +9391,10 @@ export class BeignetNode extends EventEmitter {
 			try {
 				const quote = sender.quote(opts.request, sendOpts);
 				costSats = Number(quote.amountSat + quote.maxTotalFeeSat);
+				this._checkMaxPayment(costSats, Number(quote.amountSat), {
+					name: 'fees',
+					param: 'maxTotalFeeSat'
+				});
 				this._checkSpendLimit(costSats);
 			} catch (err) {
 				throw this.directFundingFailure(err);
@@ -9247,6 +9492,8 @@ export class BeignetNode extends EventEmitter {
 				? BigInt(requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')) *
 				  1000n
 				: undefined);
+		if (opts.expiry !== undefined) requireInvoiceExpiry(opts.expiry, 'expiry');
+		requireInvoiceDescription(opts.description);
 		const result = this.node.createInvoice({
 			amountMsat,
 			description: opts.description || '',
@@ -9374,6 +9621,15 @@ export class BeignetNode extends EventEmitter {
 
 	decodeInvoice(bolt11: string): DecodedInvoice {
 		const inv = decodeInvoiceInput(bolt11);
+		// Refused here as well as by the engine's send, so a caller that
+		// decodes or validates first learns it before trying to pay.
+		const ours = this.toLnNetwork(this.networkName);
+		if (inv.network !== ours) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_INVOICE,
+				`Invoice is for network "${inv.network}", this node is on "${ours}"`
+			);
+		}
 		const result: DecodedInvoice = {
 			network: inv.network,
 			timestamp: inv.timestamp,
@@ -9438,6 +9694,15 @@ export class BeignetNode extends EventEmitter {
 			this._dailySpentSats = 0;
 			this._dailySpentLightningSats = 0;
 			this._dailySpentOnchainSats = 0;
+			// A rebalance still out can spend in the new day, so its up-front
+			// charge carries over until _refundSpend settles it.
+			if (
+				this._dailySpendLimitSats !== undefined &&
+				this._liveRebalanceChargeSats > 0
+			) {
+				this._dailySpentSats = this._liveRebalanceChargeSats;
+				this._dailySpentLightningSats = this._liveRebalanceChargeSats;
+			}
 			if (persist) this._persistSpendState();
 		}
 	}
@@ -9475,9 +9740,14 @@ export class BeignetNode extends EventEmitter {
 	 * The per-payment limit, judged on `spendSats` (amount plus fee cap, issue
 	 * #1008). An amount that is over the limit on its own is refused in the
 	 * words it always was; one that only crosses it with its fee cap is told
-	 * which of the two to lower.
+	 * which of the two to lower. `fees` names that fee and the parameter that
+	 * sets it: a Lightning routing-fee cap unless an on-chain path says so.
 	 */
-	private _checkMaxPayment(spendSats: number, amountSats = spendSats): void {
+	private _checkMaxPayment(
+		spendSats: number,
+		amountSats = spendSats,
+		fees = { name: 'routing fees', param: 'maxFeeSats' }
+	): void {
 		if (this._maxPaymentSats === undefined) return;
 		if (amountSats > this._maxPaymentSats) {
 			throw new BeignetError(
@@ -9490,9 +9760,9 @@ export class BeignetNode extends EventEmitter {
 				'SPENDING_LIMIT_EXCEEDED',
 				`Payment amount ${amountSats} sats plus up to ${
 					spendSats - amountSats
-				} sats in routing fees exceeds per-payment limit of ${
+				} sats in ${fees.name} exceeds per-payment limit of ${
 					this._maxPaymentSats
-				} sats; lower maxFeeSats or the amount`
+				} sats; lower ${fees.param} or the amount`
 			);
 		}
 	}
@@ -9536,6 +9806,20 @@ export class BeignetNode extends EventEmitter {
 		} else {
 			this._dailySpentLightningSats += amountSats;
 		}
+		this._persistSpendState();
+	}
+
+	/**
+	 * Gives back what a live rebalance charge did not spend, to whichever day
+	 * carries it now. Called before the charge leaves _liveRebalanceChargeSats,
+	 * so a rollover here still carries it. A negative `sats`, a spend above the
+	 * charge, is charged in full.
+	 */
+	private _refundSpend(sats: number): void {
+		if (this._dailySpendLimitSats === undefined) return;
+		this._resetDailySpendIfNeeded(false);
+		this._dailySpentSats -= sats;
+		this._dailySpentLightningSats -= sats;
 		this._persistSpendState();
 	}
 
@@ -10007,7 +10291,8 @@ export class BeignetNode extends EventEmitter {
 	/**
 	 * What the node knows of a stored claim's payment at boot: 'settled' when
 	 * the HTLC view or the durable row reports the hash paid, judged the way
-	 * the engine judges a duplicate (#975); 'live' while the record is
+	 * the engine judges a duplicate (#975) except that a keysend row's own
+	 * preimage is not proof (#1161); 'live' while the record is
 	 * PENDING or an HTLC is still out for it; 'gone' otherwise. A durable row
 	 * that cannot be read is logged and reads as live: a reservation kept too
 	 * long is the safe side of that error.
@@ -10025,7 +10310,10 @@ export class BeignetNode extends EventEmitter {
 			if (
 				durable?.direction === PaymentDirection.OUTGOING &&
 				(durable.status === PaymentStatus.COMPLETED ||
-					durable.preimage !== undefined ||
+					// A keysend row holds the preimage its sender picked before the
+					// HTLC went out. A learned one is saved as its own row first.
+					(durable.preimage !== undefined &&
+						durable.metadata?._keysend !== 'true') ||
 					this.storage.loadPreimage(paymentHashHex) !== null)
 			) {
 				return 'settled';
@@ -10051,19 +10339,22 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
-	 * Returns the on-chain amount+fee an external send will subtract from the
-	 * daily budget, computed from the transaction the wallet just built.
-	 * FAIL CLOSED: when a limit is configured and the built fee cannot be
-	 * read as a finite non-negative number, the send is rejected rather than
-	 * checked against an understated total.
+	 * Returns the on-chain amount+fee an external send is judged on by the
+	 * per-payment and daily limits, computed from the transaction the wallet
+	 * just built. FAIL CLOSED: when a limit is configured and the built fee
+	 * cannot be read as a finite non-negative number, the send is rejected
+	 * rather than checked against an understated total.
 	 */
 	private _builtOnchainTotalSats(amountSats: number): number {
 		const feeSats = this.wallet.transaction?.data?.fee;
 		if (!Number.isFinite(feeSats) || feeSats < 0) {
-			if (this._dailySpendLimitSats !== undefined) {
+			if (
+				this._dailySpendLimitSats !== undefined ||
+				this._maxPaymentSats !== undefined
+			) {
 				throw new BeignetError(
 					'SPENDING_LIMIT_EXCEEDED',
-					'Unable to determine the transaction fee for the daily spend limit check; refusing to send'
+					'Unable to determine the transaction fee for the spend limit checks; refusing to send'
 				);
 			}
 			return amountSats;
@@ -10466,12 +10757,14 @@ export class BeignetNode extends EventEmitter {
 	): BeignetError {
 		const failed = this.node.failPaymentUnlessInFlight(paymentHash);
 		if (failed && claim) this._releaseAsyncSpendClaim(claim);
-		return new BeignetError(
+		const err = new BeignetError(
 			'PAYMENT_TIMEOUT',
 			failed
 				? `${what} timed out after ${timeoutMs}ms`
 				: `${what} timed out after ${timeoutMs}ms; an HTLC is still in flight and the payment stays PENDING until it resolves; no further route is tried after the timeout`
 		);
+		err.paymentHash = paymentHash.toString('hex');
+		return err;
 	}
 
 	/**
@@ -10486,6 +10779,11 @@ export class BeignetNode extends EventEmitter {
 	private _toBeignetPaymentError(err: unknown): BeignetError {
 		if (err instanceof BeignetError) return err;
 		const msg = err instanceof Error ? err.message : String(err);
+		// The caller's own arguments, such as metadata the recovery guardians
+		// could not hold.
+		if (err instanceof InvalidRequestError) {
+			return new BeignetError(BeignetErrorCode.INVALID_PARAMS, msg);
+		}
 		let code = 'PAYMENT_FAILED';
 		if (err instanceof Error && 'code' in err) {
 			const lpErr = err as { code: string };
@@ -10574,17 +10872,6 @@ export class BeignetNode extends EventEmitter {
 			maxFeeMsat
 		);
 
-		// Store metadata on the payment if provided. Guarded, because nothing
-		// between the claim above and the executor below may strand it.
-		try {
-			if (metadata) {
-				this.node.setPaymentMetadata(decoded.paymentHash, metadata);
-			}
-		} catch (err: unknown) {
-			if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
-			throw err;
-		}
-
 		return new Promise<PaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
@@ -10633,12 +10920,16 @@ export class BeignetNode extends EventEmitter {
 			this.node.on('payment:failed', onFailed);
 
 			try {
+				// The metadata rides the send, which creates the record it belongs
+				// on; setPaymentMetadata only labels a record that already exists.
 				this.node.sendPayment(
 					bolt11,
 					undefined,
 					maxFeeMsat,
 					amountMsat,
-					maxCltvExpiryHeight
+					maxCltvExpiryHeight,
+					undefined,
+					metadata
 				);
 			} catch (err: unknown) {
 				cleanup();
@@ -10881,15 +11172,14 @@ export class BeignetNode extends EventEmitter {
 
 		let result: IPaymentInfo;
 		try {
-			if (metadata) {
-				this.node.setPaymentMetadata(decoded.paymentHash, metadata);
-			}
 			result = this.node.sendPayment(
 				bolt11,
 				undefined,
 				maxFeeMsat,
 				amountMsat,
-				maxCltvExpiryHeight
+				maxCltvExpiryHeight,
+				undefined,
+				metadata
 			);
 		} catch (err: unknown) {
 			// A payment that never started holds no capacity. Matched by
@@ -10922,13 +11212,16 @@ export class BeignetNode extends EventEmitter {
 
 	/**
 	 * Send a keysend (spontaneous) payment — blocks until settled or timeout.
+	 * `onPaymentHash` is called with the payment hash before the HTLC goes
+	 * out; a throw from it refuses the payment.
 	 */
 	async sendKeysend(
 		pubkey: string,
 		amountSats: number,
 		timeoutMs = 60_000,
 		maxFeeSats?: number,
-		metadata?: Record<string, string>
+		metadata?: Record<string, string>,
+		onPaymentHash?: (paymentHash: string) => void
 	): Promise<PaymentInfo> {
 		this._checkDraining();
 		// Guarded before the accounting for the same reason payInvoice is: the
@@ -10938,12 +11231,13 @@ export class BeignetNode extends EventEmitter {
 			BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) * 1000n;
 		// The caller's cap, or the default for the amount (#1008).
 		const maxFeeMsat = resolveMaxFeeMsat(maxFeeSats, undefined, amountMsat);
+		const preimage = crypto.randomBytes(32);
+		onPaymentHash?.(crypto.createHash('sha256').update(preimage).digest('hex'));
 		// This attempt's claim on the daily budget, charged by the
 		// payment:sent handler in create() as payInvoice's is (issue #977).
-		// The engine picks a keysend's preimage, so the hash is unknown until
-		// the send returns; the claim is opened under a provisional key so
-		// that its reservation holds across the call, and moved under the
-		// hash after it. A keysend that never started holds no capacity.
+		// The claim is opened under a provisional key so that its reservation
+		// holds across the call, and moved under the hash after it. A keysend
+		// that never started holds no capacity.
 		const provisionalKey = `keysend:${crypto.randomBytes(8).toString('hex')}`;
 		const claim = this._admitLightningSpend(
 			provisionalKey,
@@ -10958,7 +11252,8 @@ export class BeignetNode extends EventEmitter {
 				destination,
 				amountMsat,
 				maxFeeMsat,
-				metadata
+				metadata,
+				preimage
 			});
 		} catch (err: unknown) {
 			if (claim) this._closeAsyncSpendClaim(provisionalKey, claim);
@@ -11127,6 +11422,19 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
+	 * Where an outgoing payment stands, judged as the engine judges a
+	 * duplicate (#975): 'settled' once paid, 'live' while its record is
+	 * PENDING or an HTLC is still out for it, 'gone' when nothing sent for it
+	 * can settle any more. A durable row that cannot be read reads as live.
+	 */
+	paymentOutcome(paymentHash: string): 'settled' | 'live' | 'gone' {
+		return this._spendClaimOutcomeAtBoot(
+			Buffer.from(paymentHash, 'hex'),
+			paymentHash
+		);
+	}
+
+	/**
 	 * The in-memory record only. The pay paths read this, not getPayment: a
 	 * fresh NO_ROUTE or FEE_EXCEEDS_MAX on a hash with a days-old FAILED row
 	 * is this attempt's outcome, and the row is an earlier attempt's, so
@@ -11270,6 +11578,11 @@ export class BeignetNode extends EventEmitter {
 		const result = await l402Fetch(url, init, {
 			...options,
 			credentials: this._l402Credentials,
+			// Vetting only the final URL would be too late: by then fetch has
+			// already sent the caller's request, body included, to whatever the
+			// redirect named.
+			checkRedirect: (target) =>
+				this._assertL402TargetAllowed(target, options.allowPrivateNetwork),
 			payer: {
 				payInvoice: async (
 					bolt11: string,
@@ -11290,15 +11603,6 @@ export class BeignetNode extends EventEmitter {
 				}
 			}
 		});
-		// A redirect can land on a host the caller never named. The paid path
-		// already refuses cross-origin challenges, but an unpaid response that
-		// followed a redirect to a private target must not be relayed either.
-		if (result.response.url) {
-			this._assertL402TargetAllowed(
-				result.response.url,
-				options.allowPrivateNetwork
-			);
-		}
 		// The body is relayed to the daemon caller, so its size has to be
 		// bounded here. Refuse a response that declares itself too large, and
 		// stream-read the rest under the cap (a server can lie about
@@ -11781,7 +12085,7 @@ export class BeignetNode extends EventEmitter {
 		feeratePerkw: number
 	): ReturnType<LightningNode['spliceQuote']> {
 		const idBuf = requireChannelIdHex(channelId);
-		requireU32(feeratePerkw, 'feeratePerkw');
+		requireU32(feeratePerkw, 'feeratePerkw', 1, MAX_SPLICE_FEERATE_PERKW);
 		return fundingOrRefuse(() =>
 			this.node.spliceQuote(idBuf, direction, feeratePerkw)
 		);
@@ -11798,7 +12102,7 @@ export class BeignetNode extends EventEmitter {
 	): SpliceResult {
 		const idBuf = requireChannelIdHex(channelId);
 		requirePositiveSafeInteger(amountSats, 'amountSats');
-		requireU32(feeratePerkw, 'feeratePerkw');
+		requireU32(feeratePerkw, 'feeratePerkw', 1, MAX_SPLICE_FEERATE_PERKW);
 		// fundingUtxos is shape-checked by the node, one copy of the rules; its
 		// InvalidSpliceError converts to INVALID_PARAMS through fundingOrRefuse
 		// like every other splice refusal.
@@ -11818,7 +12122,7 @@ export class BeignetNode extends EventEmitter {
 	): SpliceResult {
 		const idBuf = requireChannelIdHex(channelId);
 		requirePositiveSafeInteger(amountSats, 'amountSats');
-		requireU32(feeratePerkw, 'feeratePerkw');
+		requireU32(feeratePerkw, 'feeratePerkw', 1, MAX_SPLICE_FEERATE_PERKW);
 		let destinationScript: Buffer | undefined;
 		if (destinationAddress !== undefined) {
 			// A provided-but-empty (or non-string) destination is a caller bug,
@@ -11854,9 +12158,9 @@ export class BeignetNode extends EventEmitter {
 		// An address-targeted splice-out is an external send: the destination
 		// receives the full amount and the channel additionally pays the
 		// on-chain fee (the engine declares relative = -(amount + fee), same
-		// fee formula as below), so both count against the shared daily
-		// budget, like sendOnchain (issue #534 review). Wallet-credited
-		// splice-outs stay outside the limit: those funds return to our own
+		// fee formula as below), so both count against the per-payment and
+		// daily limits, like sendOnchain (issue #534 review). Wallet-credited
+		// splice-outs stay outside them: those funds return to our own
 		// wallet. Checked before the engine call (fail fast, like sendOnchain)
 		// and recorded only when the engine accepts the initiation; a splice
 		// that later fails in negotiation holds the budget until the UTC
@@ -11873,6 +12177,10 @@ export class BeignetNode extends EventEmitter {
 				)
 			);
 			externalSpendSats = amountSats + feeSats;
+			this._checkMaxPayment(externalSpendSats, amountSats, {
+				name: 'on-chain fees',
+				param: 'feeratePerkw'
+			});
 			this._checkSpendLimit(externalSpendSats);
 		}
 		const result = fundingOrRefuse(() =>
@@ -11973,14 +12281,17 @@ export class BeignetNode extends EventEmitter {
 	 * maxFeeSats OR maxFeeMsat, never both, exactly as payInvoice takes it
 	 * (issue #998); it bounds the public hops plus the invoice's own
 	 * blinded-path fee, which the payee writes (issue #1001). Without a cap
-	 * the fee is unbounded.
+	 * the fee is unbounded. `onPaymentHash` is called with the invoice's
+	 * payment hash before the HTLC goes out; a throw from it refuses the
+	 * payment.
 	 */
 	async payOffer(
 		offerStr: string,
 		amountSats?: number,
 		timeoutMs = 60_000,
 		maxFeeSats?: number,
-		maxFeeMsatCap?: number | string
+		maxFeeMsatCap?: number | string,
+		onPaymentHash?: (paymentHash: string) => void
 	): Promise<PaymentInfo> {
 		// Paying an offer spends outbound liquidity exactly as payInvoice does,
 		// so it runs the same admission: drain mode, both spending limits, a
@@ -12009,12 +12320,21 @@ export class BeignetNode extends EventEmitter {
 				  }
 				: undefined;
 
-		const bolt12Invoice = await this.node.requestInvoice(offer, requestOptions);
+		const bolt12Invoice = await this.node
+			.requestInvoice(offer, requestOptions)
+			.catch((err: unknown) => {
+				// An offer for another chain.
+				if (err instanceof InvalidRequestError) {
+					throw new BeignetError(BeignetErrorCode.INVALID_OFFER, err.message);
+				}
+				throw err;
+			});
 		// Re-checked after the await: the request is a round trip to the payee,
 		// and it is the dispatch below, not the request above, that a drain
 		// started meanwhile has to stop.
 		this._checkDraining();
 		const paymentHashHex = bolt12Invoice.paymentHash.toString('hex');
+		onPaymentHash?.(paymentHashHex);
 
 		// What payBolt12Invoice will actually pay is the invoice's own amount:
 		// the payee prices the offer, and there is nothing else to pay (an
@@ -12604,12 +12924,41 @@ export class BeignetNode extends EventEmitter {
 				BeignetErrorCode.INVALID_PARAMS,
 				'maxFeeSats must be a non-negative integer'
 			);
-		const result = await this.node.rebalanceChannel({
-			fromChannelId: Buffer.from(fromChannelId, 'hex'),
-			toChannelId: Buffer.from(toChannelId, 'hex'),
-			amountSats: BigInt(amountSats),
-			maxFeeSats: BigInt(maxFeeSats)
-		});
+		this._checkDraining();
+		// A shutdown waits on any backup in flight before the engine learns of
+		// it, so the engine would still send.
+		if (this.destroyed) {
+			throw new BeignetError(
+				BeignetErrorCode.NODE_DESTROYED,
+				'Node is shutting down; no new rebalances accepted'
+			);
+		}
+		// The amount comes back round the loop, so the fee is all a rebalance
+		// spends. The cap is charged before anything is sent, so a crash or a
+		// teardown with the HTLC still out leaves it charged. Once the outcome
+		// is known the day gets back what the route did not take, or all of
+		// it when the rebalance failed. A timed-out wait keeps the cap, since
+		// the HTLC can still settle.
+		this._checkSpendLimit(maxFeeSats);
+		this._recordSpend(maxFeeSats);
+		this._liveRebalanceChargeSats += maxFeeSats;
+		let spentSats = maxFeeSats;
+		let result: IRebalanceResult;
+		try {
+			result = await this.node.rebalanceChannel({
+				fromChannelId: Buffer.from(fromChannelId, 'hex'),
+				toChannelId: Buffer.from(toChannelId, 'hex'),
+				amountSats: BigInt(amountSats),
+				maxFeeSats: BigInt(maxFeeSats)
+			});
+			spentSats = spendLimitSats(result.feeMsat);
+		} catch (err) {
+			if (!(err instanceof PaymentWaitTimeoutError)) spentSats = 0;
+			throw err;
+		} finally {
+			if (!this.destroyed) this._refundSpend(maxFeeSats - spentSats);
+			this._liveRebalanceChargeSats -= maxFeeSats;
+		}
 		this.log('info', 'Rebalance completed', {
 			fromChannelId,
 			toChannelId,
@@ -12627,7 +12976,8 @@ export class BeignetNode extends EventEmitter {
 
 	/**
 	 * Execute the advisor's rebalance plan under the per-UTC-day fee budget
-	 * (persisted, so restarts cannot overspend the same day).
+	 * (persisted, so restarts cannot overspend the same day). The fees it
+	 * pays are charged to the daily spend limit too.
 	 */
 	async executeRebalances(
 		budgetSatsPerDay?: number
@@ -12641,9 +12991,50 @@ export class BeignetNode extends EventEmitter {
 				'budgetSatsPerDay must be a non-negative integer'
 			);
 		}
-		const summary = await this.node.executeRebalanceRecommendations({
-			budgetSatsPerDay
-		});
+		this._checkDraining();
+		// Charged up front as rebalanceChannel is, at the whole day's fee
+		// budget, which bounds what the run can spend whatever the advisor has
+		// already spent today.
+		const holdSats = this.node.rebalanceBudgetSatsPerDay(budgetSatsPerDay);
+		// With no budget given this is the configured autoRebalance one, which
+		// nothing has checked yet, and a NaN would poison the ledger.
+		if (!Number.isInteger(holdSats) || holdSats < 0) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'autoRebalance.budgetSatsPerDay must be a non-negative integer'
+			);
+		}
+		this._checkSpendLimit(holdSats);
+		this._recordSpend(holdSats);
+		this._liveRebalanceChargeSats += holdSats;
+		let spentSats = holdSats;
+		// The engine asks before each plan. A refusal before the first ask
+		// sent nothing, but a throw after it (a log listener, say) can follow
+		// a paid rebalance, so the whole charge stands then.
+		let reachedPlans = false;
+		let summary: IRebalanceExecutionSummary;
+		try {
+			summary = await this.node.executeRebalanceRecommendations({
+				budgetSatsPerDay,
+				stopRequested: () => {
+					reachedPlans = true;
+					// A shutdown sets destroyed without draining, and reaches the
+					// engine only after any backup in flight has finished.
+					return this._draining || this.destroyed;
+				}
+			});
+			spentSats = spendLimitSats(summary.feeSpentMsat);
+		} catch (err) {
+			if (!reachedPlans) spentSats = 0;
+			throw err;
+		} finally {
+			// A teardown can cut a wait short with its HTLC out, which the
+			// summary does not count, so the whole charge stands then. A run
+			// that crossed midnight, where the engine's budget started over,
+			// leaves the new day charged all it spent.
+			if (!this.destroyed) this._refundSpend(holdSats - spentSats);
+			this._liveRebalanceChargeSats -= holdSats;
+		}
 		return {
 			attempts: summary.attempts.map((a) => ({
 				fromChannelId: a.fromChannelId,
@@ -13066,7 +13457,14 @@ export class BeignetNode extends EventEmitter {
 		paymentHash: string,
 		metadata: Record<string, string>
 	): void {
-		this.node.setPaymentMetadata(Buffer.from(paymentHash, 'hex'), metadata);
+		try {
+			this.node.setPaymentMetadata(Buffer.from(paymentHash, 'hex'), metadata);
+		} catch (err: unknown) {
+			if (err instanceof InvalidRequestError) {
+				throw new BeignetError(BeignetErrorCode.INVALID_PARAMS, err.message);
+			}
+			throw err;
+		}
 	}
 
 	// ─────────────── Payment Queue ───────────────
@@ -13501,14 +13899,32 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Database Backup ───────────────
 
+	/** Back up the database to `destPath`, with its MAC in backupMacPath(destPath). */
 	async backup(destPath: string): Promise<void> {
 		await this.storage.backup(destPath);
+		await writeBackupMac(
+			deriveBackupMacKey(bip39.mnemonicToSeedSync(this.mnemonic)),
+			destPath
+		);
+	}
+
+	/** The live database, its sidecars and the instance lock. */
+	storageFiles(): string[] {
+		const dbPath = fs.realpathSync.native(
+			path.join(this.dataDir, `${this.networkName}.db`)
+		);
+		return [
+			dbPath,
+			`${dbPath}-wal`,
+			`${dbPath}-shm`,
+			`${dbPath}-journal`,
+			path.join(this.dataDir, `${this.networkName}.lock`)
+		];
 	}
 
 	private performScheduledBackup(): void {
 		if (!this.backupPath || this.destroyed) return;
-		this._backupPromise = this.storage
-			.backup(this.backupPath)
+		this._backupPromise = this.backup(this.backupPath)
 			.then(() => {
 				this.log('info', 'Scheduled backup completed', {
 					path: this.backupPath
@@ -13920,6 +14336,10 @@ export class BeignetNode extends EventEmitter {
 			clearInterval(this._fallbackRecoveryTimer);
 			this._fallbackRecoveryTimer = undefined;
 		}
+		if (this._autoRebalanceTimer) {
+			clearInterval(this._autoRebalanceTimer);
+			this._autoRebalanceTimer = undefined;
+		}
 		this.paymentQueue?.stop();
 		this.paymentQueue?.removeAllListeners();
 		this.directFundingSender?.stop();
@@ -13971,6 +14391,10 @@ export class BeignetNode extends EventEmitter {
 		if (this._fallbackRecoveryTimer) {
 			clearInterval(this._fallbackRecoveryTimer);
 			this._fallbackRecoveryTimer = undefined;
+		}
+		if (this._autoRebalanceTimer) {
+			clearInterval(this._autoRebalanceTimer);
+			this._autoRebalanceTimer = undefined;
 		}
 		if (this._confirmTimer) {
 			clearTimeout(this._confirmTimer);

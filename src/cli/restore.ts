@@ -8,12 +8,16 @@
  * neither be running nor start mid-restore.
  *
  * The database is encrypted at rest under a seed-derived key, so a restored
- * file is only readable by a node running with the same mnemonic.
+ * file is only readable by a node running with the same mnemonic. That key
+ * gives no integrity (plaintext rows are accepted), so the backup must also
+ * carry a MAC under the same seed (see backup-mac.ts).
  */
 
+import { timingSafeEqual } from 'crypto';
 import * as fs from 'fs';
 import { acquireInstanceLock, releaseInstanceLock } from './instance-lock';
 import { SECRET_FILE_MODE, tightenMode } from './fs-utils';
+import { backupMacPath, fileMac, readBackupMac } from './backup-mac';
 
 /** First 16 bytes of every SQLite 3 database file. */
 export const SQLITE_HEADER = Buffer.from('SQLite format 3\0', 'ascii');
@@ -46,31 +50,50 @@ export function preRestoreBackupPath(
 	return `${dbPath}.pre-restore-${now}`;
 }
 
+export interface IDbRestoreOptions {
+	/** The wallet's backup MAC key (deriveBackupMacKey). */
+	macKey: Buffer;
+	/**
+	 * Accept a backup with no MAC file, as made before backups were
+	 * authenticated. A MAC file that is present must still match.
+	 */
+	allowUnauthenticated?: boolean;
+	now?: number;
+}
+
 export interface IDbRestoreResult {
 	dbPath: string;
 	/** Where the pre-existing database was preserved; null if none existed. */
 	preRestorePath: string | null;
+	/** False only for a backup restored without a MAC. */
+	authenticated: boolean;
 }
 
 /**
- * Copy a validated SQLite backup over the node's database file.
+ * Copy an authenticated SQLite backup over the node's database file.
  *
- * Never destroys data: an existing database (and its -wal/-shm sidecars,
- * which belong to the OLD file and would corrupt the restored one if left
- * behind) is moved to a pre-restore path first, and any failure throws before
- * the copy touches the live path.
+ * The backup is copied next to the database and checked there, so the bytes
+ * that are verified are the bytes that go live. Never destroys data: an
+ * existing database (and its -wal/-shm sidecars, which belong to the OLD file
+ * and would corrupt the restored one if left behind) is moved to a
+ * pre-restore path first, and any failure throws before the live path is
+ * touched.
  */
-export function restoreDbFile(
+export async function restoreDbFile(
 	backupFile: string,
 	dbPath: string,
-	now: number = Date.now()
-): IDbRestoreResult {
+	opts: IDbRestoreOptions
+): Promise<IDbRestoreResult> {
+	const now = opts.now ?? Date.now();
 	if (!fs.existsSync(backupFile)) {
 		throw new Error(`Backup file not found: ${backupFile}`);
 	}
-	if (!isSqliteFile(backupFile)) {
+	const expectedMac = readBackupMac(backupFile);
+	if (!expectedMac && !opts.allowUnauthenticated) {
 		throw new Error(
-			`Not a SQLite database (missing 'SQLite format 3' header): ${backupFile}`
+			`Backup is not authenticated: ${backupMacPath(backupFile)} not found. ` +
+				'Backups made before this release have no MAC; restore one only if ' +
+				'you are sure it was not modified, with --unauthenticated.'
 		);
 	}
 
@@ -78,28 +101,50 @@ export function restoreDbFile(
 	// destination the SOURCE's bits, so a backup an operator saved as 0644
 	// would otherwise become a 0644 live database, and the pre-restore copy
 	// keeps whatever an older release left on the file it came from.
+	const staged = `${dbPath}.restoring`;
+	fs.copyFileSync(backupFile, staged);
+	tightenMode(staged, SECRET_FILE_MODE);
 	let preRestorePath: string | null = null;
-	if (fs.existsSync(dbPath)) {
-		preRestorePath = preRestoreBackupPath(dbPath, now);
-		fs.copyFileSync(dbPath, preRestorePath);
-		tightenMode(preRestorePath, SECRET_FILE_MODE);
-	}
-	// Stale WAL/SHM sidecars pair with the OLD database; replayed against the
-	// restored file they corrupt it. Preserve them next to the pre-restore copy.
-	for (const suffix of ['-wal', '-shm']) {
-		const sidecar = `${dbPath}${suffix}`;
-		if (fs.existsSync(sidecar)) {
-			if (preRestorePath) {
-				fs.renameSync(sidecar, `${preRestorePath}${suffix}`);
-				tightenMode(`${preRestorePath}${suffix}`, SECRET_FILE_MODE);
-			} else {
-				fs.unlinkSync(sidecar);
+	try {
+		if (!isSqliteFile(staged)) {
+			throw new Error(
+				`Not a SQLite database (missing 'SQLite format 3' header): ${backupFile}`
+			);
+		}
+		if (
+			expectedMac &&
+			!timingSafeEqual(await fileMac(opts.macKey, staged), expectedMac)
+		) {
+			throw new Error(
+				`Backup MAC does not match: ${backupFile} was modified after it ` +
+					'was made, or was made by a different wallet.'
+			);
+		}
+
+		if (fs.existsSync(dbPath)) {
+			preRestorePath = preRestoreBackupPath(dbPath, now);
+			fs.copyFileSync(dbPath, preRestorePath);
+			tightenMode(preRestorePath, SECRET_FILE_MODE);
+		}
+		// Stale WAL/SHM sidecars pair with the OLD database; replayed against the
+		// restored file they corrupt it. Preserve them next to the pre-restore copy.
+		for (const suffix of ['-wal', '-shm']) {
+			const sidecar = `${dbPath}${suffix}`;
+			if (fs.existsSync(sidecar)) {
+				if (preRestorePath) {
+					fs.renameSync(sidecar, `${preRestorePath}${suffix}`);
+					tightenMode(`${preRestorePath}${suffix}`, SECRET_FILE_MODE);
+				} else {
+					fs.unlinkSync(sidecar);
+				}
 			}
 		}
+		fs.renameSync(staged, dbPath);
+	} catch (err) {
+		fs.rmSync(staged, { force: true });
+		throw err;
 	}
-	fs.copyFileSync(backupFile, dbPath);
-	tightenMode(dbPath, SECRET_FILE_MODE);
-	return { dbPath, preRestorePath };
+	return { dbPath, preRestorePath, authenticated: expectedMac !== null };
 }
 
 /**
@@ -110,15 +155,15 @@ export function restoreDbFile(
  * from the host against a container's data dir): liveness cannot be verified
  * from here, so the lock is refused rather than reclaimed.
  */
-export function performDbRestore(
+export async function performDbRestore(
 	backupFile: string,
 	dbPath: string,
 	lockPath: string,
-	now: number = Date.now()
-): IDbRestoreResult {
+	opts: IDbRestoreOptions
+): Promise<IDbRestoreResult> {
 	acquireInstanceLock(lockPath);
 	try {
-		return restoreDbFile(backupFile, dbPath, now);
+		return await restoreDbFile(backupFile, dbPath, opts);
 	} finally {
 		releaseInstanceLock(lockPath);
 	}

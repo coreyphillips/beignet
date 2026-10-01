@@ -420,6 +420,33 @@ export function recordTranscriptHash(
 	);
 }
 
+export interface RetainFields {
+	recoveryId: Buffer;
+	/** The lease epoch whose writer key signs. */
+	epoch: bigint;
+	/** The first sequence the guardian keeps: a snapshot's. */
+	sequence: bigint;
+	/** That snapshot record's frame hash. */
+	frameHash: Buffer;
+}
+
+/** RETAIN: the writer's retain floor (wire 5.2), signed by the writer key of lease.epoch. */
+export function retainTranscriptHash(
+	guardianSetId: Buffer,
+	fields: RetainFields
+): Buffer {
+	return guardianTaggedHash(
+		'beignet/recovery/retain/v1',
+		Buffer.concat([
+			prefixBytes(guardianSetId),
+			expect32('recoveryId', fields.recoveryId),
+			u64(fields.epoch),
+			u64(fields.sequence),
+			expect32('frameHash', fields.frameHash)
+		])
+	);
+}
+
 /** RECEIPT: PREFIX || guardianId || STATE || issuedAt, signed by the guardian. */
 export function receiptTranscriptHash(
 	guardianSetId: Buffer,

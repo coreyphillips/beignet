@@ -238,13 +238,17 @@ export interface IFforEpochRecord {
  * Whether and on what terms this node answers ff_init as S (section 3: an
  * LSP is a role a peer opts into, never a node class). Absent means the
  * library default, which answers; a daemon passes `enabled: false` unless
- * the operator opted in.
+ * the operator opted in. Policy or not, S refuses an epoch whose T_exp is
+ * more than Channel.MAX_HTLC_CLTV_EXPIRY_DELTA blocks away.
  */
 export interface IFforSettlePolicy {
 	enabled: boolean;
 	/** Refuse a book whose budget exceeds this. */
 	maxBudgetMsat?: bigint;
-	/** Refuse an epoch whose T_exp is more than this many blocks away. */
+	/**
+	 * Refuse an epoch whose T_exp is more than this many blocks away; only
+	 * tightens Channel.MAX_HTLC_CLTV_EXPIRY_DELTA.
+	 */
 	maxEpochBlocks?: number;
 	/** Refuse fee terms below these floors (section 7.6, fee_S). */
 	minFeeBaseMsat?: number;

@@ -30,6 +30,8 @@
  * decode.
  */
 
+import { decodeTlvStream } from './tlv';
+
 // ---- Interfaces ----
 
 export interface ISpliceMessage {
@@ -378,6 +380,9 @@ export interface IStartBatchMessage {
 	messageType?: number;
 }
 
+const START_BATCH_TLV_MESSAGE_TYPE = 1n;
+const START_BATCH_TLV_TYPES = new Set<bigint>([START_BATCH_TLV_MESSAGE_TYPE]);
+
 export function encodeStartBatchMessage(msg: IStartBatchMessage): Buffer {
 	if (msg.channelId.length !== 32) {
 		throw new Error(`Channel ID must be 32 bytes, got ${msg.channelId.length}`);
@@ -404,24 +409,15 @@ export function decodeStartBatchMessage(payload: Buffer): IStartBatchMessage {
 		channelId: Buffer.from(payload.subarray(0, 32)),
 		batchSize: payload.readUInt16BE(32)
 	};
-	// TLV stream: only type 1 (message_type, u16) is known; unknown odd types
-	// are skipped, unknown even types reject per BOLT 1.
-	let offset = 34;
-	while (offset + 2 <= payload.length) {
-		const type = payload[offset];
-		const len = payload[offset + 1];
-		if (offset + 2 + len > payload.length) {
-			throw new Error('start_batch: truncated TLV record');
-		}
-		if (type === 1) {
-			if (len !== 2) {
+	// TLV stream: only type 1 (message_type, u16) is known.
+	const { records } = decodeTlvStream(payload, 34, START_BATCH_TLV_TYPES);
+	for (const record of records) {
+		if (record.type === START_BATCH_TLV_MESSAGE_TYPE) {
+			if (record.value.length !== 2) {
 				throw new Error(`start_batch: message_type TLV must be 2 bytes`);
 			}
-			msg.messageType = payload.readUInt16BE(offset + 2);
-		} else if (type % 2 === 0) {
-			throw new Error(`start_batch: unknown required TLV type ${type}`);
+			msg.messageType = record.value.readUInt16BE(0);
 		}
-		offset += 2 + len;
 	}
 	return msg;
 }

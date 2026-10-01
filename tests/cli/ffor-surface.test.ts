@@ -823,6 +823,187 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 		}
 	});
 
+	/**
+	 * Put the shared node in one recovery state until the returned function
+	 * runs: superseded at runtime (the barrier's latch), or a startup gate
+	 * that is fenced or still quarantined. Only what the node reads to decide
+	 * is swapped, without the hard freeze, so the daemon stays reachable.
+	 */
+	function withRecoveryState(
+		kind: 'barrier-fenced' | 'fenced' | 'quarantined'
+	): () => void {
+		const inner = daemon.node.getNode() as unknown as {
+			_barrierFenced: boolean;
+			recoveryGate: unknown;
+		};
+		const previous = {
+			fenced: inner._barrierFenced,
+			gate: inner.recoveryGate
+		};
+		if (kind === 'barrier-fenced') {
+			inner._barrierFenced = true;
+		} else {
+			inner.recoveryGate = {
+				getState: (): string => kind,
+				permitsPeerTraffic: (): boolean => false,
+				reportBlocked: (): void => undefined
+			};
+		}
+		return (): void => {
+			inner._barrierFenced = previous.fenced;
+			inner.recoveryGate = previous.gate;
+		};
+	}
+
+	it('all force-close routes demand the acknowledgement on a fenced or quarantined device (issue #1013)', async () => {
+		const inner = daemon.node.getNode();
+		const { ChannelState } = require('../../src/lightning/channel/types');
+		const forceClose = sinon.spy(inner.getChannelManager(), 'forceClose');
+		const recover = sinon.spy(inner, 'rescueFforEpoch');
+		try {
+			for (const kind of ['barrier-fenced', 'fenced', 'quarantined'] as const) {
+				// No hold of its own: the device is the whole reason. Disconnected,
+				// as every channel on a frozen device is, so /ffor/recover reaches
+				// its force close rather than the cooperative path.
+				const fx = installChannel(false);
+				inner.getChannelManager().getChannel(fx.idBuf)!.getFullState().state =
+					ChannelState.AWAITING_REESTABLISH;
+				const restore = withRecoveryState(kind);
+				try {
+					expect(inner.getRecoveryOwnershipHold()).to.equal(
+						kind === 'quarantined' ? 'unconfirmed' : 'superseded'
+					);
+					for (const route of [
+						'/ffor/recover',
+						'/ffor/enforce',
+						'/channel/forceclose'
+					]) {
+						const body = {
+							channelId: fx.channelId,
+							...(route === '/ffor/recover'
+								? { forceCloseIfUnreachable: true }
+								: {})
+						};
+						for (const flag of [undefined, false, 'true', 1]) {
+							forceClose.resetHistory();
+							recover.resetHistory();
+							const res = await request(portOf(daemon), 'POST', route, {
+								...body,
+								...(flag === undefined ? {} : { acceptStaleStateRisk: flag })
+							});
+							const label = `${kind} ${route} ${JSON.stringify(flag)}`;
+							expect(res.status, label).to.equal(400);
+							expect(errorOf(res).code, label).to.equal('INVALID_PARAMS');
+							const message = errorOf(res).message ?? '';
+							expect(message, label).to.match(/acceptStaleStateRisk/);
+							expect(message, label).to.match(
+								kind === 'quarantined'
+									? /has not confirmed with its guardians/
+									: /This device was superseded/
+							);
+							expect(message, label).to.not.match(/Recovery Capsule/);
+							expect(forceClose.called, `${label}: no commitment`).to.equal(
+								false
+							);
+							expect(recover.called, `${label}: no recovery`).to.equal(false);
+						}
+						forceClose.resetHistory();
+						const accepted = await request(portOf(daemon), 'POST', route, {
+							...body,
+							acceptStaleStateRisk: true
+						});
+						// The fixture has no remote commitment signature, as above.
+						expect(accepted.status, `${kind} ${route}`).to.equal(
+							route === '/channel/forceclose' ? 500 : 200
+						);
+						expect(errorOf(accepted).message ?? '').to.not.match(
+							/acceptStaleStateRisk/
+						);
+						expect(
+							forceClose.calledOnce,
+							`${kind} ${route}: acknowledged engine exit`
+						).to.equal(true);
+					}
+				} finally {
+					restore();
+					fx.remove();
+				}
+			}
+		} finally {
+			recover.restore();
+			forceClose.restore();
+		}
+	});
+
+	it('rechecks a fence that latches during witness retrieval before force closing (issue #1013)', async () => {
+		const inner = daemon.node.getNode();
+		const { ChannelState } = require('../../src/lightning/channel/types');
+		for (const flag of [undefined, 'true', true]) {
+			const fx = installChannel(false);
+			inner.getChannelManager().getChannel(fx.idBuf)!.getFullState().state =
+				ChannelState.AWAITING_REESTABLISH;
+			fx.record.witnesses = [
+				{
+					witnessNodeId: fx.record.remoteNodeId,
+					mailboxId: crypto.randomBytes(32),
+					fetchPrivkey: crypto.randomBytes(32),
+					encPrivkey: crypto.randomBytes(32),
+					retentionUntil: 802_000,
+					minReceipts: 1,
+					manifestWire: Buffer.alloc(0),
+					ackedAt: 1
+				}
+			];
+			let release!: () => void;
+			let entered!: () => void;
+			const waiting = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const started = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			const fetch = sinon
+				.stub(inner, 'fetchFforWitnessRecords')
+				.callsFake(async () => {
+					entered();
+					await waiting;
+					return [];
+				});
+			const forceClose = sinon.spy(inner.getChannelManager(), 'forceClose');
+			let restore = (): void => undefined;
+			try {
+				// The daemon's preflight passes: the device is not fenced yet.
+				const pending = request(portOf(daemon), 'POST', '/ffor/recover', {
+					channelId: fx.channelId,
+					forceCloseIfUnreachable: true,
+					...(flag === undefined ? {} : { acceptStaleStateRisk: flag })
+				});
+				await started;
+				restore = withRecoveryState('barrier-fenced');
+				release();
+				const result = await pending;
+				if (flag === true) {
+					expect(result.status).to.equal(200);
+					expect(forceClose.calledOnce).to.equal(true);
+				} else {
+					expect(result.status).to.equal(400);
+					expect(errorOf(result).code).to.equal('INVALID_PARAMS');
+					expect(errorOf(result).message).to.match(
+						/This device was superseded/
+					);
+					expect(errorOf(result).message).to.match(/acceptStaleStateRisk/);
+					expect(forceClose.called).to.equal(false);
+				}
+			} finally {
+				release();
+				restore();
+				fetch.restore();
+				forceClose.restore();
+				fx.remove();
+			}
+		}
+	});
+
 	it('ffor:enforce reports both hold origins independently', async () => {
 		const held = installChannel(true);
 		const reestablish = installChannel('reestablish');

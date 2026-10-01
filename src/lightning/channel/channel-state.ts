@@ -15,7 +15,8 @@ import {
 	IChannelConfig,
 	IHtlcEntry,
 	IHtlcSnapshotEntry,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	DEFAULT_MINIMUM_DEPTH
 } from './types';
 
 /**
@@ -447,6 +448,23 @@ export interface IChannelState {
 	 * reclaims formerly-in-flight HTLC value the penalty was meant to confiscate.
 	 */
 	revokedHtlcSnapshots?: Map<string, IHtlcSnapshotEntry[]>;
+
+	/**
+	 * Watchtower: the remote commitment transactions we signed that the peer
+	 * has not revoked yet, keyed by the per-commitment point (hex) each uses.
+	 * The revoke_and_ack that reveals a point's secret is when the tower
+	 * needs that exact tx, which may be after a restart, so this persists.
+	 * While a splice is pending a point is signed over both funding outputs,
+	 * so it holds one tx for each.
+	 */
+	watchtowerRemoteCommitmentTxs?: Map<string, Buffer[]>;
+
+	/**
+	 * Watchtower: revoked peer commitments whose tower hand-off failed, each
+	 * with the secret that revoked it. Retried on the next revoke_and_ack and
+	 * on restore; until one succeeds this is the only copy.
+	 */
+	watchtowerBackupsOwed?: Array<{ perCommitmentSecret: Buffer; tx: Buffer }>;
 
 	/** Cached remote signature on our latest commitment */
 	remoteCommitmentSignature: Buffer | null;
@@ -1250,7 +1268,7 @@ export function createAcceptorState(params: {
 		pushMsat: params.pushMsat,
 		fundingTxid: null,
 		fundingOutputIndex: 0,
-		minimumDepth: 3,
+		minimumDepth: DEFAULT_MINIMUM_DEPTH,
 
 		localConfig: { ...params.localConfig },
 		localBasepoints: params.localBasepoints,

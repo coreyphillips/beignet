@@ -72,6 +72,7 @@ import {
 	calculateClosingFee,
 	closingTxWeight,
 	closingTxRelayProfile,
+	closingOutputDustLimit,
 	minRelayFeeForWeight
 } from '../chain/closing';
 import {
@@ -95,7 +96,9 @@ import {
 	HtlcState,
 	BITCOIN_CHAIN_HASH,
 	MAX_FUNDING_SATOSHIS,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	DEFAULT_MINIMUM_DEPTH,
+	MAX_MINIMUM_DEPTH
 } from './types';
 import {
 	IAbandonedLocalAdd,
@@ -149,6 +152,7 @@ import {
 	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
+	receivedAddIrrevocablyCommitted,
 	scidAliasAnnounceRefusal,
 	validateV2ChannelType
 } from './types';
@@ -1024,11 +1028,8 @@ export class Channel {
 		revocationIndex: bigint;
 		secretIndex: bigint;
 	} | null = null;
-	// Watchtower: the remote commitment transactions we have signed, keyed by the
-	// per-commitment point they use, so that when the peer later reveals that
-	// point's secret (revoke_and_ack) we can ship the exact revoked tx to a tower.
-	// In-memory only and bounded; unrevoked states number at most a couple.
-	private _remoteCommitmentTxCache = new Map<string, string>();
+	// Bound on state.watchtowerRemoteCommitmentTxs; unrevoked states number at
+	// most a couple.
 	private static readonly REVOKED_TX_CACHE_MAX = 8;
 	// We dropped an unresumable splice on disconnect/restart, but the peer may
 	// still hold its in-flight copy (CLN never forgets one on its own — it blocks
@@ -1999,6 +2000,10 @@ export class Channel {
 			partialSignatureWithNonce: taproot ? partialSignatureWithNonce : undefined
 		};
 
+		this._cacheRemoteCommitmentForWatchtower(
+			this._state.remoteCurrentPerCommitmentPoint,
+			0n
+		);
 		this._state.state = ChannelState.SENT_FUNDING_CREATED;
 		return [
 			sendMsg(MessageType.FUNDING_CREATED, encodeFundingCreatedMessage(msg))
@@ -2548,6 +2553,10 @@ export class Channel {
 			partialSignatureWithNonce: taproot ? partialSignatureWithNonce : undefined
 		};
 
+		this._cacheRemoteCommitmentForWatchtower(
+			this._state.remoteCurrentPerCommitmentPoint,
+			0n
+		);
 		this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 
 		const actions: ChannelAction[] = [
@@ -3179,6 +3188,17 @@ export class Channel {
 			];
 		}
 
+		// BOLT 2: a peer receiving amount_msat 0 may fail the channel, and a
+		// peer advertising htlc_minimum_msat 0 lets the check below pass it.
+		if (amountMsat <= 0n) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'HTLC amount must be positive'
+				}
+			];
+		}
+
 		// Check amount exceeds minimum
 		if (amountMsat < this._state.remoteConfig.htlcMinimumMsat) {
 			return [
@@ -3460,15 +3480,18 @@ export class Channel {
 			// the builder deducts from the funder separately: one expression, so
 			// the base weight this channel type prices at and the anchor add can
 			// never be applied apart (#403).
-			remoteRequiredMsat +=
-				funderCommitmentCostSats(
-					Math.max(
-						getLocalCommitmentFeeRate(this._state),
-						getRemoteCommitmentFeeRate(this._state)
-					),
-					this._countActiveHtlcs() + 1,
-					this._state.channelType
-				) * 1000n;
+			const candidate = [
+				{ amountMsat: msg.amountMsat, direction: HtlcDirection.RECEIVED }
+			];
+			const localCostMsat = this._remoteFunderLocalCostMsat(
+				getLocalCommitmentFeeRate(this._state),
+				candidate
+			);
+			const remoteCostMsat = this._remoteFunderLocalCostMsat(
+				getRemoteCommitmentFeeRate(this._state),
+				candidate
+			);
+			remoteRequiredMsat += bigIntMax(localCostMsat, remoteCostMsat);
 		}
 		if (this._state.remoteBalanceMsat - msg.amountMsat < remoteRequiredMsat) {
 			// BOLT 2 MUST fail: offering an add the SENDER cannot afford above its
@@ -3676,6 +3699,9 @@ export class Channel {
 		// behavior) let unrelated triggers sign the peer's own add into its
 		// commitment prematurely — "Bad commit_sig" at the peer.
 		entry.addLocallyRevoked = false;
+		// ...and it is not ours to forward or settle until the peer also
+		// revokes for a commitment of ours that carries it.
+		entry.addRemotelyRevoked = false;
 
 		// Deduct from remote balance provisionally
 		this._state.remoteBalanceMsat -= msg.amountMsat;
@@ -3857,6 +3883,20 @@ export class Channel {
 	}
 
 	/**
+	 * Whether a settle the peer sends for this offered HTLC arrives before
+	 * the add is committed: still PENDING (in no commitment_signed of ours),
+	 * or signed but not yet revoked for by the peer. BOLT 2 forbids settling
+	 * before the add is irrevocably committed and the peer's revoke_and_ack
+	 * reaches us ahead of any settle it sends after that, so this is never
+	 * an honest peer, and the receiver MUST fail the channel (#1047).
+	 */
+	private _addNotYetCommitted(entry: IHtlcEntry): boolean {
+		return (
+			entry.state === HtlcState.PENDING || entry.addRemoteCommitted === false
+		);
+	}
+
+	/**
 	 * Handle update_fulfill_htlc from remote.
 	 */
 	handleUpdateFulfillHtlc(msg: IUpdateFulfillHtlcMessage): ChannelAction[] {
@@ -3935,6 +3975,12 @@ export class Channel {
 					paymentPreimage: msg.paymentPreimage
 				}
 			];
+		}
+
+		if (this._addNotYetCommitted(entry)) {
+			return this._failChannelWithWireError(
+				'update_fulfill_htlc for an HTLC not yet committed'
+			);
 		}
 
 		entry.state = HtlcState.FULFILLED;
@@ -4212,6 +4258,12 @@ export class Channel {
 			];
 		}
 
+		if (this._addNotYetCommitted(entry)) {
+			return this._failChannelWithWireError(
+				'update_fail_htlc for an HTLC not yet committed'
+			);
+		}
+
 		entry.state = HtlcState.FAILED;
 		// Two-phase: finalize the refund (and delete the entry) only once the
 		// peer has revoked for OUR commitment covering this removal.
@@ -4287,9 +4339,16 @@ export class Channel {
 				{
 					type: ChannelActionType.HTLC_FAILED,
 					htlcId: msg.id,
-					reason: replayReason
+					reason: replayReason,
+					malformedCode: msg.failureCode
 				}
 			];
+		}
+
+		if (this._addNotYetCommitted(entry)) {
+			return this._failChannelWithWireError(
+				'update_fail_malformed_htlc for an HTLC not yet committed'
+			);
 		}
 
 		// A malformed-HTLC removal follows the SAME two-phase settlement as a plain
@@ -4314,7 +4373,8 @@ export class Channel {
 			{
 				type: ChannelActionType.HTLC_FAILED,
 				htlcId: msg.id,
-				reason
+				reason,
+				malformedCode: msg.failureCode
 			}
 		];
 	}
@@ -4365,35 +4425,49 @@ export class Channel {
 	}
 
 	/**
-	 * Cache the remote commitment tx we just signed, keyed by its per-commitment
-	 * point, mirroring the manager's build (remoteNextPerCommitmentPoint, number
-	 * +1). Taproot commitments are cached too: they feed the version-1 (schnorr)
-	 * justice kit. Never throws: a cache miss only forfeits a pre-emptive tower
-	 * ship, it must not break commitment signing.
+	 * Cache the remote commitment tx we signed at `commitmentNumber`, keyed by
+	 * its per-commitment point, so the revoke_and_ack that later reveals that
+	 * point's secret can hand the exact tx to a watchtower. Taproot commitments
+	 * are cached too: they feed the version-1 (schnorr) justice kit. Never
+	 * throws: a cache miss only forfeits a pre-emptive tower ship, it must not
+	 * break commitment signing.
+	 *
+	 * `spliced` is the pending splice's view: its tx joins the one cached for
+	 * the current funding under the same point.
 	 */
-	private _cacheRemoteCommitmentForWatchtower(): void {
+	private _cacheRemoteCommitmentForWatchtower(
+		point: Buffer | null,
+		commitmentNumber: bigint,
+		spliced?: IChannelState
+	): void {
 		try {
-			if (!this._state.remoteBasepoints || !this._state.fundingTxid) return;
-			const point =
-				this._state.remoteNextPerCommitmentPoint ||
-				this._state.remoteCurrentPerCommitmentPoint;
-			if (!point) return;
-			const built = buildRemoteCommitment(
-				this._state,
-				point,
-				this._state.remoteCommitmentNumber + 1n
-			);
-			this._remoteCommitmentTxCache.set(
-				point.toString('hex'),
-				built.result.tx.toBuffer().toString('hex')
-			);
+			const view = spliced ?? this._state;
+			if (!point || !view.remoteBasepoints || !view.fundingTxid) {
+				return;
+			}
+			const built = buildRemoteCommitment(view, point, commitmentNumber);
+			const cache = (this._state.watchtowerRemoteCommitmentTxs ??= new Map<
+				string,
+				Buffer[]
+			>());
+			const key = point.toString('hex');
+			// Anything else under the point is a signature since replaced, or a
+			// splice attempt that never locked, so only the current funding's tx
+			// survives a splice-side write.
+			const current = this._state.fundingTxid;
+			const kept =
+				spliced && current
+					? (cache.get(key) ?? []).filter(
+							(tx) =>
+								bitcoin.Transaction.fromBuffer(tx).ins[0]?.hash.equals(current)
+					  )
+					: [];
+			cache.set(key, [...kept, built.result.tx.toBuffer()]);
 			// Bound the cache: only unrevoked states matter and there are few.
-			while (
-				this._remoteCommitmentTxCache.size > Channel.REVOKED_TX_CACHE_MAX
-			) {
-				const oldest = this._remoteCommitmentTxCache.keys().next().value;
+			while (cache.size > Channel.REVOKED_TX_CACHE_MAX) {
+				const oldest = cache.keys().next().value;
 				if (oldest === undefined) break;
-				this._remoteCommitmentTxCache.delete(oldest);
+				cache.delete(oldest);
 			}
 		} catch {
 			// Best-effort cache; ignore.
@@ -4401,17 +4475,87 @@ export class Channel {
 	}
 
 	/**
-	 * Given a per-commitment secret the peer just revealed, return (and forget)
-	 * the revoked remote commitment tx we cached for that state, or null if we
-	 * never signed it (e.g. the initial funding commitment).
+	 * Cache the peer's latest signed commitment if a restored row has no entry
+	 * for it. Rows written before the cache was persisted have none, and the
+	 * revoke_and_ack that retires that commitment would go without a backup.
+	 * The tx is rebuilt from the row, which describes the signed commitment
+	 * only while no update is pending, so a row that owes a signature is left
+	 * alone.
+	 *
+	 * A pending splice signed the same point over its own funding, and rows
+	 * written before that side was cached hold only the current funding's tx,
+	 * so the splice side is checked on its own.
 	 */
-	takeRevokedCommitmentTx(perCommitmentSecret: Buffer): Buffer | null {
+	repairWatchtowerCommitmentCache(): void {
+		if (this._state.needsCommitment) return;
+		const point = this.isAwaitingRemoteRevocation()
+			? this._state.remoteNextPerCommitmentPoint
+			: this._state.remoteCurrentPerCommitmentPoint;
+		if (!point) return;
+		const key = point.toString('hex');
+		if (!this._state.watchtowerRemoteCommitmentTxs?.has(key)) {
+			this._cacheRemoteCommitmentForWatchtower(
+				point,
+				this._state.remoteCommitmentNumber
+			);
+		}
+		const spliced = this._state.spliceInFlight ? this._splicedState() : null;
+		const spliceFunding = spliced?.fundingTxid;
+		if (!spliced || !spliceFunding) return;
+		const spliceCached = (
+			this._state.watchtowerRemoteCommitmentTxs?.get(key) ?? []
+		).some((tx) => {
+			try {
+				return bitcoin.Transaction.fromBuffer(tx).ins[0]?.hash.equals(
+					spliceFunding
+				);
+			} catch {
+				return false;
+			}
+		});
+		if (!spliceCached) {
+			this._cacheRemoteCommitmentForWatchtower(
+				point,
+				this._state.remoteCommitmentNumber,
+				spliced
+			);
+		}
+	}
+
+	/**
+	 * Given a per-commitment secret the peer just revealed, return (and forget)
+	 * the revoked remote commitment txs we cached for that state, one per
+	 * funding output it was signed over. Empty if we never cached it (an older
+	 * row restored with a commitment in flight or an update pending).
+	 */
+	takeRevokedCommitmentTxs(perCommitmentSecret: Buffer): Buffer[] {
 		const pointHex =
 			perCommitmentPointFromSecret(perCommitmentSecret).toString('hex');
-		const txHex = this._remoteCommitmentTxCache.get(pointHex);
-		if (!txHex) return null;
-		this._remoteCommitmentTxCache.delete(pointHex);
-		return Buffer.from(txHex, 'hex');
+		const cache = this._state.watchtowerRemoteCommitmentTxs;
+		const txs = cache?.get(pointHex) ?? [];
+		cache?.delete(pointHex);
+		return txs;
+	}
+
+	/**
+	 * Keep a revoked commitment whose tower hand-off failed, with the secret
+	 * that revoked it, until takeOwedWatchtowerBackups hands it out again.
+	 */
+	oweWatchtowerBackup(perCommitmentSecret: Buffer, tx: Buffer): void {
+		(this._state.watchtowerBackupsOwed ??= []).push({
+			perCommitmentSecret,
+			tx
+		});
+	}
+
+	/** Return (and forget) every revoked commitment still owed to the towers. */
+	takeOwedWatchtowerBackups(): Array<{
+		perCommitmentSecret: Buffer;
+		tx: Buffer;
+	}> {
+		const owed = this._state.watchtowerBackupsOwed ?? [];
+		this._state.watchtowerBackupsOwed = undefined;
+		return owed;
 	}
 
 	/**
@@ -4532,7 +4676,21 @@ export class Channel {
 
 		// Watchtower: cache the remote commitment tx we just committed the peer to,
 		// keyed by its per-commitment point, for pre-emptive justice on breach.
-		this._cacheRemoteCommitmentForWatchtower();
+		const signedPoint =
+			this._state.remoteNextPerCommitmentPoint ||
+			this._state.remoteCurrentPerCommitmentPoint;
+		this._cacheRemoteCommitmentForWatchtower(
+			signedPoint,
+			this._state.remoteCommitmentNumber + 1n
+		);
+		const splicedView = spliceBatch ? this._splicedState() : null;
+		if (splicedView) {
+			this._cacheRemoteCommitmentForWatchtower(
+				signedPoint,
+				this._state.remoteCommitmentNumber + 1n,
+				splicedView
+			);
+		}
 
 		// A staged update_fee that is signable here (opener always; acceptor
 		// once the fee round reached it — see getRemoteCommitmentFeeRate) is
@@ -4577,6 +4735,16 @@ export class Channel {
 					entry.state === HtlcState.FAILED)
 			) {
 				entry.commitCoverPending = true;
+			}
+			// A peer add is only in this signature once we revoked for it, the
+			// same rule buildRemoteCommitment applies.
+			if (
+				entry.addRemotelyRevoked === false &&
+				entry.addLocallyRevoked !== false &&
+				(entry.state === HtlcState.PENDING ||
+					entry.state === HtlcState.COMMITTED)
+			) {
+				entry.addCoverPending = true;
 			}
 		}
 
@@ -5181,6 +5349,15 @@ export class Channel {
 		// Update remote's per-commitment point
 		this._state.remoteCurrentPerCommitmentPoint =
 			this._state.remoteNextPerCommitmentPoint;
+		// The next point keys every commitment we sign from here on, and only
+		// another revoke_and_ack replaces it, so an off-curve one stored here
+		// makes every later signature throw for good. The secret above is
+		// already kept, so the revoked commitment stays punishable.
+		if (!isValidPublicKey(msg.nextPerCommitmentPoint)) {
+			return this._failChannelWithWireError(
+				'revoke_and_ack has an invalid next_per_commitment_point'
+			);
+		}
 		this._state.remoteNextPerCommitmentPoint = msg.nextPerCommitmentPoint;
 
 		// option_taproot: rotate the peer's verification nonce forward in lockstep
@@ -5227,6 +5404,10 @@ export class Channel {
 				} else {
 					entry.removalRemoteCommitted = true;
 				}
+			}
+			if (entry.addCoverPending === true) {
+				entry.addCoverPending = false;
+				entry.addRemotelyRevoked = true;
 			}
 		}
 
@@ -5298,7 +5479,9 @@ export class Channel {
 		// Emit HTLC_FORWARDED for committed received HTLCs that haven't been
 		// dispatched yet. This happens AFTER the full commitment round-trip
 		// (commitment_signed → revoke_and_ack both ways), ensuring the HTLC
-		// is fully committed on both sides before we try to settle it.
+		// is fully committed on both sides before we try to settle it. This
+		// revoke_and_ack may answer a commitment that left the add out, so
+		// COMMITTED is not enough (receivedAddIrrevocablyCommitted).
 		//
 		// forwardEmitted makes the dispatch edge-triggered. COMMITTED is not a
 		// "needs dispatching" state: a received HTLC sits in it for the entire
@@ -5312,8 +5495,8 @@ export class Channel {
 		const htlcActions: ChannelAction[] = [];
 		for (const entry of this._state.htlcs.values()) {
 			if (
-				entry.state === HtlcState.COMMITTED &&
 				entry.direction === HtlcDirection.RECEIVED &&
+				receivedAddIrrevocablyCommitted(entry) &&
 				entry.forwardEmitted !== true &&
 				// FFOR section 9.5.1 step 3: a parked voucher is never dispatched,
 				// nor a mismatching add the round's unwind will fail.
@@ -5598,15 +5781,10 @@ export class Channel {
 		// the opener's own arithmetic, and since issue 404 that refusal fails the
 		// channel outright rather than desyncing it silently, so this arithmetic has
 		// to match the opener's exactly (#403).
-		const activeHtlcCount = this._countActiveHtlcs();
-		const newCost = funderCommitmentCostSats(
-			msg.feeratePerKw,
-			activeHtlcCount,
-			this._state.channelType
-		);
+		const newCostMsat = this._remoteFunderLocalCostMsat(msg.feeratePerKw, []);
 		const reserveMsat = this._state.localConfig.channelReserveSatoshis * 1000n;
 		// Remote is the opener (we are acceptor), so check their balance
-		if (newCost * 1000n > this._state.remoteBalanceMsat - reserveMsat) {
+		if (newCostMsat > this._state.remoteBalanceMsat - reserveMsat) {
 			// BOLT 2: a rate the opener cannot afford above its reserve can never be
 			// applied to the commitment we hold.
 			return this._failChannelWithWireError(
@@ -7841,7 +8019,7 @@ export class Channel {
 		if (isOpener) {
 			// Reserve our dust limit so an accepted fee can neither drop our output
 			// nor consume it down to a dust remnant.
-			const dust = this._state.localConfig.dustLimitSatoshis;
+			const dust = this.ownClosingOutputDustLimit();
 			if (openerBalanceSat < msg.feeSatoshis + dust) {
 				return this._failChannelWithWireError(
 					`Taproot closing fee ${msg.feeSatoshis} leaves our output below dust (balance ${openerBalanceSat}, dust ${dust})`
@@ -7985,9 +8163,19 @@ export class Channel {
 				this._state.remoteShutdownScript ?? PLACEHOLDER_SHUTDOWN_SCRIPT,
 			localAmount: isOpener ? localSat - feeSatoshis : localSat,
 			remoteAmount: isOpener ? remoteSat : remoteSat - feeSatoshis,
+			localDustLimit: this._state.localConfig.dustLimitSatoshis,
+			remoteDustLimit: this._state.remoteConfig.dustLimitSatoshis,
 			isTaproot: isTaprootChannel(this._state.channelType)
 		});
 		return feePaid >= minRelayFeeForWeight(weight);
+	}
+
+	/** Smallest amount our output keeps in the legacy closing tx. */
+	private ownClosingOutputDustLimit(): bigint {
+		return closingOutputDustLimit(
+			this._state.localShutdownScript ?? PLACEHOLDER_SHUTDOWN_SCRIPT,
+			this._state.localConfig.dustLimitSatoshis
+		);
 	}
 
 	private initClosingFeeRange(idealFee: bigint): void {
@@ -8004,7 +8192,7 @@ export class Channel {
 			? this._state.localBalanceMsat / 1000n
 			: this._state.remoteBalanceMsat / 1000n;
 		if (isOpener) {
-			const dust = this._state.localConfig.dustLimitSatoshis;
+			const dust = this.ownClosingOutputDustLimit();
 			openerBalance = openerBalance > dust ? openerBalance - dust : 0n;
 		}
 		this._state.closingFeeMin = min;
@@ -10079,6 +10267,49 @@ export class Channel {
 	}
 
 	/**
+	 * Raise a legacy v2 opener's funding depth on load. Returns whether it
+	 * changed the row (issue #1197).
+	 *
+	 * Before #1034 handleAcceptChannel2 never stored the accepter's
+	 * minimum_depth, so a non-zero-conf v2 opener persisted mid-open still
+	 * carries the 0 from createOpenerState. Restored as is, one confirmation
+	 * readies the channel, and with the peer's channel_ready already in hand
+	 * it goes NORMAL while a shallow reorg can still let the accepter
+	 * double-spend its inputs. The accepter's request is gone, so the stand-in
+	 * is the deepest one we would have accepted.
+	 *
+	 * Only a row still waiting on the chain: a zero-conf type negotiated its
+	 * 0, and past our channel_ready the depth gates nothing. A peer ready
+	 * that arrived first leaves the row in AWAITING_CHANNEL_READY.
+	 */
+	repairLegacyV2OpenerDepth(): boolean {
+		const s = this._state;
+		if (s.role !== ChannelRole.OPENER || s.fundingVersion !== 2) return false;
+		if (s.minimumDepth !== 0 || this._isZeroConfChannelType()) return false;
+		if (s.localChannelReady) return false;
+		const st =
+			s.state === ChannelState.AWAITING_REESTABLISH
+				? s.preReestablishState
+				: s.state;
+		if (
+			st !== ChannelState.AWAITING_TX_SIGNATURES &&
+			st !== ChannelState.AWAITING_FUNDING_CONFIRMED &&
+			st !== ChannelState.AWAITING_CHANNEL_READY
+		) {
+			return false;
+		}
+		s.minimumDepth = MAX_MINIMUM_DEPTH;
+		// A parked confirmation was stamped against depth 0, and reestablish
+		// or the exchange completing would flush channel_ready from it. The
+		// restored watch stamps it again at the raised depth. A row with no
+		// in-flight record parks it in fundingConfirmedLate instead.
+		if (s.v2InFlight) s.v2InFlight.confirmed = false;
+		for (const rec of s.v2PreviousAttempts ?? []) rec.confirmed = false;
+		s.fundingConfirmedLate = undefined;
+		return true;
+	}
+
+	/**
 	 * Refuse to resume a restored v2 open whose commitment #0 could never be
 	 * broadcast, on load. Returns whether it tore one down (issue #387).
 	 *
@@ -10325,7 +10556,14 @@ export class Channel {
 			!msg.yourLastPerCommitmentSecret.equals(Buffer.alloc(32))
 		) {
 			this._state.dataLossDetected = true;
-			this._state.dlpRemotePerCommitmentPoint = msg.myCurrentPerCommitmentPoint;
+			// Failing the channel over a bad point would broadcast the commitment
+			// this arm forbids, so the point is only dropped. An off-curve one
+			// would throw in the taproot to_remote sweep, which falls back to our
+			// last known point without it.
+			if (isValidPublicKey(msg.myCurrentPerCommitmentPoint)) {
+				this._state.dlpRemotePerCommitmentPoint =
+					msg.myCurrentPerCommitmentPoint;
+			}
 			this._state.recoveryCloseReason = 'local-data-loss';
 			this._state.state = ChannelState.ERRORED;
 			return [
@@ -10469,6 +10707,22 @@ export class Channel {
 			// Peer expects a revocation we've never created — irrecoverable
 			return this._heldReestablishGapFailure(
 				'Remote expects future revocation we have not sent'
+			);
+		}
+
+		// The other direction: a peer more than one commitment_signed or
+		// revoke_and_ack behind cannot be levelled by retransmitting our latest
+		// one, and BOLT 2 says to fail the channel. Our current commitment's
+		// secret has never left this node, so the ordinary failure may
+		// broadcast it; a held row stays held through the derived disposition.
+		if (msg.nextCommitmentNumber < this._state.remoteCommitmentNumber) {
+			return this._failChannelWithWireError(
+				'channel_reestablish next_commitment_number is more than one behind'
+			);
+		}
+		if (msg.nextRevocationNumber + 1n < this._state.localCommitmentNumber) {
+			return this._failChannelWithWireError(
+				'channel_reestablish next_revocation_number is more than one behind'
 			);
 		}
 
@@ -13522,6 +13776,11 @@ export class Channel {
 			this._state.remoteCurrentPerCommitmentPoint,
 			this._state.remoteCommitmentNumber
 		);
+		this._cacheRemoteCommitmentForWatchtower(
+			this._state.remoteCurrentPerCommitmentPoint,
+			this._state.remoteCommitmentNumber,
+			spliced
+		);
 		this._spliceSentCommitment = true;
 		// From this point the splice MUST survive a disconnect or restart (the
 		// peer holds our commitment_signed and will demand the exchange resume on
@@ -15095,6 +15354,41 @@ export class Channel {
 	}
 
 	/**
+	 * What a peer that funds pays on the commitment WE hold, which is what
+	 * LND, eclair and CLN price a funder's update_add_htlc or update_fee
+	 * against on receipt: every PENDING or COMMITTED entry plus the
+	 * candidates, trimmed at our dust limit under our commitment's direction
+	 * rule. BOLT 3 charges weight only for untrimmed outputs, so counting a
+	 * trimmed one failed an honest funder holding dust HTLCs (#1047).
+	 */
+	private _remoteFunderLocalCostMsat(
+		feeratePerKw: number,
+		candidates: { amountMsat: bigint; direction: HtlcDirection }[]
+	): bigint {
+		const rows: { amount: bigint; direction: HtlcDirection }[] = [];
+		for (const entry of this._state.htlcs.values()) {
+			if (
+				entry.state === HtlcState.PENDING ||
+				entry.state === HtlcState.COMMITTED
+			) {
+				rows.push({
+					amount: entry.amountMsat / 1000n,
+					direction: entry.direction
+				});
+			}
+		}
+		for (const c of candidates) {
+			rows.push({ amount: c.amountMsat / 1000n, direction: c.direction });
+		}
+		const untrimmed = this._countUntrimmedRows(
+			rows,
+			this._state.localConfig.dustLimitSatoshis,
+			feeratePerKw
+		);
+		return this._funderCostMsat(feeratePerKw, untrimmed);
+	}
+
+	/**
 	 * The view of OUR commitment a conforming peer holds when it decides
 	 * whether it may offer us an add, for the case where WE fund: eclair's
 	 * canSendAdd reduces remoteCommit.spec with remoteChanges.acked and
@@ -16447,11 +16741,22 @@ export class Channel {
 			this._state.channelType &&
 			FeatureFlags.fromBuffer(this._state.channelType).hasFeature(
 				Feature.ZERO_CONF
-			) &&
-			msg.minimumDepth !== 0
+			)
 		) {
-			const reason = `zero_conf accept_channel2 must use minimum_depth 0, got ${msg.minimumDepth}`;
-			return refuse(reason);
+			if (msg.minimumDepth !== 0) {
+				const reason = `zero_conf accept_channel2 must use minimum_depth 0, got ${msg.minimumDepth}`;
+				return refuse(reason);
+			}
+		} else {
+			// BOLT 2: our channel_ready waits for the accepter's minimum_depth.
+			// Never for less than our own default either: until the funding is
+			// buried the accepter can double-spend an input of its own and take
+			// back a balance it has already spent through us. Floored whatever
+			// the accepter funds here, because an RBF can change its share later.
+			this._state.minimumDepth = Math.max(
+				DEFAULT_MINIMUM_DEPTH,
+				msg.minimumDepth
+			);
 		}
 
 		this._state.remoteBasepoints = session.getRemoteBasepoints();
@@ -18752,6 +19057,10 @@ export class Channel {
 			);
 		}
 		this._v2SentCommitment = true;
+		this._cacheRemoteCommitmentForWatchtower(
+			this._state.remoteCurrentPerCommitmentPoint,
+			0n
+		);
 		const msg: ICommitmentSignedMessage = {
 			channelId: this._state.channelId!,
 			signature,
@@ -20434,6 +20743,15 @@ export class Channel {
 		// A v2 opening commitment (#0) carries no HTLCs.
 		this._state.remoteHtlcSignatures = [];
 		this._restoreV2RecordSnapshot(record);
+		// Every attempt shares the peer's point #0, so the watchtower entry
+		// under it describes whichever attempt was signed last. Re-cache it
+		// for the attempt that can now actually be revoked.
+		if (this._state.remoteCommitmentNumber === 0n) {
+			this._cacheRemoteCommitmentForWatchtower(
+				this._state.remoteCurrentPerCommitmentPoint,
+				0n
+			);
+		}
 	}
 
 	/**
@@ -22609,6 +22927,17 @@ export class Channel {
 			return refuse(
 				FforAbortReason.TERMS_REFUSED,
 				'settlement_deadline is not in the future'
+			);
+		}
+		// The vouchers are our own offered HTLCs on preimages only we hold, and
+		// only ff_close or T_exp releases them (ACTIVE has no timeout). With any
+		// host policy or none, they may not reach past the horizon we accept on
+		// a received HTLC.
+		const epochBlocks = params.voucherExpiry - this._currentBlockHeight;
+		if (epochBlocks > Channel.MAX_HTLC_CLTV_EXPIRY_DELTA) {
+			return refuse(
+				FforAbortReason.TERMS_REFUSED,
+				`epoch of ${epochBlocks} blocks exceeds the ${Channel.MAX_HTLC_CLTV_EXPIRY_DELTA}-block voucher horizon`
 			);
 		}
 		if (

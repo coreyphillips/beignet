@@ -11,10 +11,15 @@
  */
 
 import crypto from 'crypto';
-import { ecdh, pointMultiply } from '../crypto/ecdh';
+import { ecdh, isValidPublicKey, pointMultiply } from '../crypto/ecdh';
+import { encodeBigSize } from '../message/codec';
 import {
 	IOnionPacket,
 	IProcessedOnion,
+	INVALID_ONION_HMAC,
+	INVALID_ONION_KEY,
+	INVALID_ONION_PAYLOAD,
+	INVALID_ONION_VERSION,
 	ONION_VERSION,
 	ROUTING_INFO_LENGTH
 } from './types';
@@ -23,11 +28,31 @@ import {
 	deriveHopKeys,
 	generateCipherStream
 } from './sphinx-crypto';
-import { decodeHopPayload } from './hop-payload';
+import { decodeHopPayload, InvalidOnionPayloadError } from './hop-payload';
+
+/**
+ * An onion this node cannot process, with the BOLT 4 failure to answer it
+ * with. `sharedSecret` is set only when the onion itself was sound and its
+ * payload was not (invalid_onion_payload): that failure goes back in an
+ * update_fail_htlc under the secret. The BADONION codes have no secret and
+ * go back in update_fail_malformed_htlc.
+ */
+export class OnionProcessingError extends Error {
+	constructor(
+		message: string,
+		readonly failureCode: number,
+		readonly failureData: Buffer = Buffer.alloc(0),
+		readonly sharedSecret?: Buffer
+	) {
+		super(message);
+		this.name = 'OnionProcessingError';
+	}
+}
 
 /**
  * Process (peel) one layer of an onion packet.
  * Returns the decoded hop payload and the next onion packet to forward.
+ * Throws OnionProcessingError.
  */
 export function processOnionPacket(
 	packet: IOnionPacket,
@@ -35,14 +60,24 @@ export function processOnionPacket(
 	associatedData?: Buffer
 ): IProcessedOnion {
 	if (packet.version !== ONION_VERSION) {
-		throw new Error(`Invalid onion version: ${packet.version}`);
+		throw new OnionProcessingError(
+			`Invalid onion version: ${packet.version}`,
+			INVALID_ONION_VERSION
+		);
 	}
 	// Payment onions are exactly 1366 bytes on the wire; the large onion
 	// form exists for onion messages only, and decodeOnionPacket now admits
 	// both sizes, so pin the payment path here.
 	if (packet.routingInfo.length !== ROUTING_INFO_LENGTH) {
-		throw new Error(
-			`Payment onion routing info must be 1300 bytes, got ${packet.routingInfo.length}`
+		throw new OnionProcessingError(
+			`Payment onion routing info must be 1300 bytes, got ${packet.routingInfo.length}`,
+			INVALID_ONION_HMAC
+		);
+	}
+	if (!isValidPublicKey(packet.ephemeralKey)) {
+		throw new OnionProcessingError(
+			'Onion ephemeral key is not a valid point',
+			INVALID_ONION_KEY
 		);
 	}
 
@@ -60,7 +95,10 @@ export function processOnionPacket(
 	const expectedHmac = hmacCalc.digest();
 
 	if (!packet.hmac.equals(expectedHmac)) {
-		throw new Error('HMAC verification failed');
+		throw new OnionProcessingError(
+			'HMAC verification failed',
+			INVALID_ONION_HMAC
+		);
 	}
 
 	// Decrypt routing info using a 2x-length stream.
@@ -76,7 +114,24 @@ export function processOnionPacket(
 	}
 
 	// Decode hop payload from the decrypted extended routing info
-	const { payload: hopPayload, bytesRead } = decodeHopPayload(extended, 0);
+	let decoded: ReturnType<typeof decodeHopPayload>;
+	try {
+		decoded = decodeHopPayload(extended, 0);
+	} catch (err) {
+		const record =
+			err instanceof InvalidOnionPayloadError
+				? err
+				: new InvalidOnionPayloadError((err as Error).message);
+		const offset = Buffer.alloc(2);
+		offset.writeUInt16BE(Math.min(record.offset, 0xffff), 0);
+		throw new OnionProcessingError(
+			record.message,
+			INVALID_ONION_PAYLOAD,
+			Buffer.concat([encodeBigSize(BigInt(record.tlvType)), offset]),
+			sharedSecret
+		);
+	}
+	const { payload: hopPayload, bytesRead } = decoded;
 
 	// Extract next HMAC (immediately after the hop payload)
 	const nextHmac = Buffer.from(extended.subarray(bytesRead, bytesRead + 32));

@@ -29,6 +29,7 @@ export function daemonOptions(
 		feeEstimationSource: config.feeEstimationSource,
 		listenPort: config.listenPort,
 		websocketPort: config.websocketPort,
+		maxInboundPeers: config.maxInboundPeers,
 		daemonPort,
 		daemonHost: config.daemonHost,
 		preferAnchors: config.preferAnchors,

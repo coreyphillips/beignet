@@ -1487,6 +1487,64 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			).to.equal(null);
 		});
 
+		it('bounds the acceptor to_self_delay at 2016 on the wire (issue 1198)', () => {
+			// The acceptor's to_self_delay is the CSV on the opener's to_local.
+			// v1 has always capped it at 2016; v2 let a u16 65535 through.
+			const refused = openOpenerChannel(200_000n, { toSelfDelay: 2017 });
+			expect(refusalOf(refused.actions)).to.match(
+				/to_self_delay 2017 exceeds maximum 2016/
+			);
+			expect(
+				refused.actions.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						a.messageType === MessageType.ERROR
+				),
+				'the refusal went out on the wire'
+			).to.be.true;
+			expect(
+				refused.channel.getFullState().remoteConfig.toSelfDelay
+			).to.not.equal(2017);
+
+			const accepted = openOpenerChannel(200_000n, { toSelfDelay: 2016 });
+			expect(refusalOf(accepted.actions)).to.equal(null);
+			expect(accepted.channel.getFullState().remoteConfig.toSelfDelay).to.equal(
+				2016
+			);
+		});
+
+		it('bounds the opener to_self_delay at 2016 on the wire (issue 1232)', () => {
+			// The opener's to_self_delay is the CSV on the acceptor's to_local.
+			const refused = openAcceptorChannel({
+				fundingSatoshis: 200_000n,
+				toSelfDelay: 2017
+			});
+			expect(refusalOf(refused.actions)).to.match(
+				/to_self_delay 2017 exceeds maximum 2016/
+			);
+			expect(
+				refused.actions.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						a.messageType === MessageType.ERROR
+				),
+				'the refusal went out on the wire'
+			).to.be.true;
+			expect(refused.channel.getFullState().remoteConfig.toSelfDelay).to.equal(
+				DEFAULT_CHANNEL_CONFIG.toSelfDelay
+			);
+			expect(refused.channel.getFullState().dualFundingSession).to.equal(null);
+
+			const accepted = openAcceptorChannel({
+				fundingSatoshis: 200_000n,
+				toSelfDelay: 2016
+			});
+			expect(refusalOf(accepted.actions)).to.equal(null);
+			expect(accepted.channel.getFullState().remoteConfig.toSelfDelay).to.equal(
+				2016
+			);
+		});
+
 		it('refuses a v2 open whose commitment #0 would have no outputs (issue 379)', () => {
 			// open_channel2 and accept_channel2 inherit accept_channel's
 			// requirements, so BOLT 2's two receiver MUST-fails on the initial

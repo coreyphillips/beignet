@@ -29,6 +29,7 @@ import {
 	ChannelFundingUnavailableCode,
 	ChannelFundingUnavailableError,
 	InvalidPeerConnectError,
+	InvalidRequestError,
 	InvalidSpliceError
 } from '../../src/lightning/node/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -459,12 +460,16 @@ describe('Issue #472: the splice paths guard their arguments too', () => {
 	 * funding_feerate_perkw is a u32 on the wire. writeUInt32BE turns 1.5 into
 	 * 1, quietly repricing the splice, and throws on 2^32 AFTER the channel has
 	 * moved to SPLICING and persisted, which wedges it until a restart. Both
-	 * bounds have to be enforced before any of that runs.
+	 * bounds have to be enforced before any of that runs. Issue #1043: the
+	 * ceiling is update_fee's 100,000 sat/kw, not the u32 limit, since the
+	 * channel pays the fee and no wallet guard ever sees it.
 	 */
 	const BAD_FEERATES: Array<[string, number]> = [
 		['zero', 0],
 		['negative', -1],
 		['fractional', 1.5],
+		['sat/vB-as-sat/kw', 2_500_000],
+		['just above the ceiling', 100_001],
 		['above u32', 0x1_0000_0000],
 		['not finite', Number.POSITIVE_INFINITY]
 	];
@@ -478,7 +483,7 @@ describe('Issue #472: the splice paths guard their arguments too', () => {
 			for (const call of calls) {
 				const err = refusalFrom(call, `${label} feerate`);
 				expect(err.code).to.equal(BeignetErrorCode.INVALID_PARAMS);
-				expect(err.message).to.include('4294967295');
+				expect(err.message).to.include('between 1 and 100000');
 			}
 		});
 	}
@@ -555,6 +560,25 @@ describe('Issue #471: the grab-bag codes stop swallowing caller refusals', () =>
 			);
 			expect(statusForErrorCode((err as BeignetError).code)).to.equal(502);
 		}
+	});
+});
+
+describe('Issue #1134: payment metadata the guardians cannot hold', () => {
+	it('answers INVALID_PARAMS with the reason, not a scrubbed 500', () => {
+		const message =
+			'payment metadata is too large for the recovery guardians to accept';
+		const bn = nodeWithEngine({
+			setPaymentMetadata: (): never => {
+				throw new InvalidRequestError(message);
+			}
+		});
+		const err = refusalFrom(
+			() => bn.setPaymentMetadata('ab'.repeat(32), { note: 'x' }),
+			'setPaymentMetadata'
+		);
+		expect(err.code).to.equal(BeignetErrorCode.INVALID_PARAMS);
+		expect(err.message).to.equal(message);
+		expect(statusForErrorCode(err.code)).to.equal(400);
 	});
 });
 
@@ -801,6 +825,37 @@ describe('Issue #474: the payment and invoice paths guard before BigInt()', () =
 		expect(err.code).to.equal(BeignetErrorCode.NO_ROUTE);
 		// A payment that never started holds no capacity.
 		expect(pendingOf(bn)).to.equal(0);
+	});
+
+	it('payInvoice and sendPaymentAsync refuse oversized metadata as INVALID_PARAMS (issue #1134)', async () => {
+		const metadata = { note: 'x' };
+		const bn = payingNode({
+			on: (): void => {},
+			removeListener: (): void => {},
+			// The engine judges the metadata with the send (issue #1152).
+			sendPayment: (...args: unknown[]): never => {
+				expect(args[6]).to.equal(metadata);
+				throw new InvalidRequestError(
+					'payment metadata is too large for the recovery guardians to accept'
+				);
+			}
+		});
+		for (const [name, pay] of [
+			[
+				'payInvoice',
+				(): Promise<unknown> =>
+					bn.payInvoice(BOLT11, 60_000, undefined, undefined, metadata)
+			],
+			[
+				'sendPaymentAsync',
+				async (): Promise<unknown> =>
+					bn.sendPaymentAsync(BOLT11, undefined, undefined, metadata)
+			]
+		] as Array<[string, () => Promise<unknown>]>) {
+			const err = await asyncRefusalFrom(pay, name);
+			expect(err.code, name).to.equal(BeignetErrorCode.INVALID_PARAMS);
+			expect(pendingOf(bn), name).to.equal(0);
+		}
 	});
 
 	it('sendKeysend releases the reservation when the send throws', async () => {

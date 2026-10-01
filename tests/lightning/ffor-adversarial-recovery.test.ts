@@ -75,7 +75,7 @@ function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	};
 }
 
-const TIP = 790_000;
+const TIP = 795_000;
 const T_EXP = 800_000;
 const D_DEADLINE = 798_992;
 

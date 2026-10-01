@@ -1033,6 +1033,14 @@ describe('BeignetNode new methods', () => {
 		const rawTxId =
 			'c5e16610ec61535498f672f71653242a05f80b7e7e080b8b86badb49737f0efa';
 
+		// Inherit the prototype so internal helpers (_broadcastRawTx) resolve.
+		// Object.create skips field initializers, so the send lock is set here.
+		const nodeWith = (wallet: unknown): BeignetNode =>
+			Object.assign(Object.create(BeignetNode.prototype), {
+				wallet,
+				_onchainSendLock: Promise.resolve()
+			}) as unknown as BeignetNode;
+
 		it('builds without broadcast, then broadcasts the hex', async () => {
 			const { ok } = require('../../src/utils/result');
 			const calls: Record<string, unknown>[] = [];
@@ -1052,11 +1060,7 @@ describe('BeignetNode new methods', () => {
 					}
 				}
 			};
-			// Inherit the prototype so internal helpers (_broadcastRawTx) resolve.
-			const result = await BeignetNode.prototype.sendOnchain.call(
-				Object.assign(Object.create(BeignetNode.prototype), {
-					wallet: fakeWallet
-				}) as unknown as BeignetNode,
+			const result = await nodeWith(fakeWallet).sendOnchain(
 				'bcrt1qexample',
 				200000,
 				2
@@ -1082,18 +1086,125 @@ describe('BeignetNode new methods', () => {
 				}
 			};
 			try {
-				await BeignetNode.prototype.sendOnchain.call(
-					Object.assign(Object.create(BeignetNode.prototype), {
-						wallet: fakeWallet
-					}) as unknown as BeignetNode,
-					'bcrt1qexample',
-					200000
-				);
+				await nodeWith(fakeWallet).sendOnchain('bcrt1qexample', 200000);
 				expect.fail('Should have thrown');
 			} catch (e: unknown) {
 				expect((e as BeignetError).code).to.equal('SEND_FAILED');
 				expect((e as BeignetError).message).to.include('electrum rejected');
 			}
+		});
+
+		describe('overlapping sends (#1054)', () => {
+			const bitcoin = require('bitcoinjs-lib');
+			const network = bitcoin.networks.regtest;
+			const addressFor = (fill: number): string =>
+				bitcoin.payments.p2wpkh({ hash: Buffer.alloc(20, fill), network })
+					.address;
+
+			/**
+			 * Stages every send in one shared transaction, the way the wallet
+			 * does: send resets it on entry, stages its output, and builds only
+			 * after an await (the persist), so a send that starts in that window
+			 * replaces the first one's output.
+			 */
+			const stagingWallet = (
+				failFor?: string
+			): {
+				wallet: unknown;
+				gates: Array<() => void>;
+				broadcasts: string[][];
+			} => {
+				const { ok, err } = require('../../src/utils/result');
+				const gates: Array<() => void> = [];
+				const broadcasts: string[][] = [];
+				let staged: Array<{ address: string; value: number }> = [];
+				const wallet = {
+					send: async (opts: {
+						address: string;
+						amount: number;
+					}): Promise<unknown> => {
+						staged = [{ address: opts.address, value: opts.amount }];
+						await new Promise<void>((resolve) => gates.push(resolve));
+						if (opts.address === failFor) return err('insufficient funds');
+						const tx = new bitcoin.Transaction();
+						tx.addInput(Buffer.alloc(32, broadcasts.length + 1), 0);
+						for (const output of staged) {
+							tx.addOutput(
+								bitcoin.address.toOutputScript(output.address, network),
+								output.value
+							);
+						}
+						return ok(tx.toHex());
+					},
+					resetSendTransaction: async (): Promise<unknown> => {
+						staged = [];
+						return ok('reset');
+					},
+					electrum: {
+						broadcastTransaction: async (opts: {
+							rawTx: string;
+						}): Promise<unknown> => {
+							const tx = bitcoin.Transaction.fromHex(opts.rawTx);
+							broadcasts.push(
+								tx.outs.map((out: { script: Buffer }) =>
+									bitcoin.address.fromOutputScript(out.script, network)
+								)
+							);
+							return ok(tx.getId());
+						}
+					}
+				};
+				return { wallet, gates, broadcasts };
+			};
+
+			/** Opens the wallet's persist gates one at a time until all settle. */
+			const drain = async (
+				gates: Array<() => void>,
+				sends: Promise<unknown>[]
+			): Promise<PromiseSettledResult<unknown>[]> => {
+				let done = false;
+				const settled = Promise.allSettled(sends).then((results) => {
+					done = true;
+					return results;
+				});
+				while (!done) {
+					await new Promise((resolve) => setImmediate(resolve));
+					gates.shift()?.();
+				}
+				return settled;
+			};
+
+			it('each broadcast carries only its own recipient', async () => {
+				const first = addressFor(1);
+				const second = addressFor(2);
+				const { wallet, gates, broadcasts } = stagingWallet();
+				const node = nodeWith(wallet);
+				const results = await drain(gates, [
+					node.sendOnchain(first, 10_000),
+					node.sendOnchain(second, 20_000)
+				]);
+				expect(results.map((r) => r.status)).to.deep.equal([
+					'fulfilled',
+					'fulfilled'
+				]);
+				expect(broadcasts).to.deep.equal([[first], [second]]);
+			});
+
+			it('a failed send does not hold up the one queued behind it', async () => {
+				const first = addressFor(1);
+				const second = addressFor(2);
+				const { wallet, gates, broadcasts } = stagingWallet(first);
+				const node = nodeWith(wallet);
+				const results = await drain(gates, [
+					node.sendOnchain(first, 10_000),
+					node.sendOnchain(second, 20_000)
+				]);
+				expect(results.map((r) => r.status)).to.deep.equal([
+					'rejected',
+					'fulfilled'
+				]);
+				expect(broadcasts).to.deep.equal([[second]]);
+			});
 		});
 	});
 
@@ -1246,11 +1357,12 @@ describe('Payment Fee Safety', () => {
 		const {
 			LightningNode
 		} = require('../../src/lightning/node/lightning-node');
-		// sendPayment(invoiceStr, excludedChannels?, maxFeeMsat?, amountMsat?, maxCltvExpiryHeight?, policyOverrides?)
+		// sendPayment(invoiceStr, excludedChannels?, maxFeeMsat?, amountMsat?, maxCltvExpiryHeight?, policyOverrides?, metadata?)
 		expect(typeof LightningNode.prototype.sendPayment).to.equal('function');
-		// Verify it accepts 6 params (invoiceStr, excludedChannels, maxFeeMsat,
-		// amountMsat, maxCltvExpiryHeight, policyOverrides; the last since #1056)
-		expect(LightningNode.prototype.sendPayment.length).to.equal(6);
+		// Verify it accepts 7 params (invoiceStr, excludedChannels, maxFeeMsat,
+		// amountMsat, maxCltvExpiryHeight, policyOverrides since #1056,
+		// metadata since #1152)
+		expect(LightningNode.prototype.sendPayment.length).to.equal(7);
 	});
 
 	it('sendPayment is backward compatible without maxFeeMsat', () => {

@@ -74,7 +74,7 @@ const node = await BeignetNode.create({
   dataDir?: string,         // SQLite + data dir (default: ~/.beignet/data)
   electrumHost?: string,    // Electrum server host
   electrumPort?: number,    // Electrum server port
-  electrumTls?: boolean,    // use TLS for Electrum
+  electrumTls?: boolean,    // use TLS for Electrum (encrypted, but the server certificate is not verified)
   listenPort?: number,      // listen for inbound Lightning connections
   preferAnchors?: boolean,  // anchor channels (default: true); set false for legacy static_remotekey
   autoBootstrap?: boolean,  // auto-connect to DNS seed peers on start
@@ -84,6 +84,7 @@ const node = await BeignetNode.create({
   backupIntervalMs?: number, // backup interval (default: 6 hours, requires backupPath)
   storageEncryption?: boolean, // encrypt SQLite storage at rest with a seed-derived key (default: true)
   dailySpendLimitSats?: number, // COMBINED LN + on-chain daily spending limit in satoshis (resets at midnight UTC; the day's ledger is persisted and survives a restart); see Spending Limits
+  maxPaymentSats?: number,  // per-payment cap in satoshis for Lightning payments and external on-chain sends; see Spending Limits
   connectTimeoutMs?: number,  // timeout for connectPeer() in ms (default: 15000)
   onError?: (error) => void, // error callback for node:error events
   logLevel?: LogLevel,       // 'debug' | 'info' | 'warn' | 'error' | 'silent' (default: 'info')
@@ -119,7 +120,7 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `listBoostableTransactions()` | `BoostableTransactions` | Unconfirmed wallet txs eligible for RBF and/or CPFP |
 | `consolidateUtxos(satsPerVbyte?)` | `Promise<ConsolidateResult>` | Merge all UTXOs into one output at a fresh wallet address (send-max-to-self) |
 | `buildPsbt(outputs, satsPerVbyte?)` | `Promise<PsbtBuildInfo>` | Build an UNSIGNED PSBT for an external signer (hardware wallet); nothing is signed or broadcast |
-| `importSignedPsbt(psbtBase64)` | `PsbtImportInfo` | Validate + finalize an externally signed PSBT; returns `{ txid, txHex }` WITHOUT broadcasting |
+| `importSignedPsbt(psbtBase64, unsignedPsbtBase64?)` | `PsbtImportInfo` | Validate + finalize an externally signed PSBT that this node built (same inputs and outputs), or that matches `unsignedPsbtBase64` (needed after a restart); returns `{ txid, txHex }` WITHOUT broadcasting |
 | `combinePsbts(psbts)` | `{ psbtBase64 }` | Combine partially signed copies of the same PSBT (multi-party signing) |
 | `refreshWallet()` | `Promise<void>` | Sync UTXOs from Electrum (incremental: wallet state persists in the node's SQLite DB across restarts) |
 | `listUtxos()` | `UtxoInfo[]` | Wallet UTXOs; each entry carries a `frozen` flag |
@@ -163,7 +164,7 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `closeChannel(channelId, acceptStaleStateRisk?)` | `Promise<{ ok, error? }>` | Cooperative close (`await` it): the payout goes to a wallet-scanned address on the change chain, never to a handed-out receive address. A capsule-restored channel needs `acceptStaleStateRisk: true`, because a mutual close signs the balances that row carries |
 | `forceCloseChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error?, commitmentTxid? }` | Force close; the sweep pays the wallet's change chain, never a handed-out receive address. A capsule-restored channel needs `acceptStaleStateRisk: true` |
 | `spliceIn(channelId, amountSats, feerate)` | `SpliceResult` | Add funds to existing channel |
-| `spliceOut(channelId, amountSats, feerate, destinationAddress?)` | `SpliceResult` | Withdraw funds from channel, to the wallet or an external address. An address-targeted splice-out counts amount + fee against `dailySpendLimitSats` |
+| `spliceOut(channelId, amountSats, feerate, destinationAddress?)` | `SpliceResult` | Withdraw funds from channel, to the wallet or an external address. An address-targeted splice-out counts amount + fee against `maxPaymentSats` and `dailySpendLimitSats` |
 | `listChannels()` | `ChannelInfo[]` | List all channels |
 | `getChannel(channelId)` | `ChannelInfo \| null` | Get specific channel |
 | `updateChannelFee(channelId, feeratePerKw)` | `{ ok: true }` | Update channel COMMITMENT feerate via update_fee (min 253). Not the routing fee policy |
@@ -175,7 +176,7 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `createInvoice(amountSats?, description?, expirySecs?, descriptionHash?)` | `InvoiceInfo` | Create BOLT 11 invoice. Use `descriptionHash` (hex Buffer) for hashed descriptions > 639 bytes — omit `description` when using hash. Returns `paymentSecret` for correlating incoming payments. |
-| `decodeInvoice(bolt11)` | `DecodedInvoice` | Decode any BOLT 11 invoice |
+| `decodeInvoice(bolt11)` | `DecodedInvoice` | Decode a BOLT 11 invoice. One for another network is refused with `INVALID_INVOICE` |
 | `listInvoices()` | `InvoiceInfo[]` | List all created invoices. `status` is `PAID` on a completed receive for the hash, from the in-memory record or, once the engine has pruned it, the database row (one database read per call), so a paid invoice never reads `EXPIRED` or `PENDING` later |
 | `createHoldInvoice({ paymentHash, amountMsat?, amountSats?, description?, expiry?, minFinalCltvExpiry? })` | `InvoiceInfo` | Hold invoice for a caller-supplied `sha256(preimage)`: the preimage stays with the caller and the incoming HTLC parks instead of settling. `minFinalCltvExpiry` is 1..2016 blocks and sets the BOLT 11 `c` tag |
 | `settleHoldInvoice(preimage)` | `{ paymentHash }` | Validate `sha256(preimage)` and fulfill every parked HTLC (all MPP parts) |
@@ -217,8 +218,9 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | `cancelPayment(paymentHash)` | `{ ok: true }` | Cancel a pending outbound payment (marks as FAILED). The HTLC cannot be retracted, so a cancelled payment keeps holding its amount against the daily limit until that HTLC settles or fails back, or the 24h window ends; `getDailySpendInfo().pendingSats` shows what is held. |
 | `listPayments(filter?)` | `PaymentInfo[]` | List payments sorted by createdAt desc. Filter by `status`, `direction`, `since`, `limit`, `offset`, `metadataKey`, `metadataValue`. Reads through to the node database: a completed or failed payment stays listed with its status after the engine prunes its in-memory record (24 hours after completion, oldest first past 10,000), however long the node has been running. A database read that fails fails the call rather than returning a shorter list. |
 | `getPayment(paymentHash)` | `PaymentInfo \| null` | Get specific payment: the in-memory record, else its database row, so a payment is found however long ago it completed |
+| `paymentOutcome(paymentHash)` | `'settled' \| 'live' \| 'gone'` | Where an outgoing payment stands, judged as the engine judges a duplicate: `settled` once paid, `live` while its record is `PENDING` or an HTLC for it can still settle, `gone` otherwise, when paying again cannot pay twice |
 | `setPaymentMetadata(paymentHash, metadata)` | `void` | Attach key-value metadata to an existing payment |
-| `sendKeysend(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Spontaneous payment (no invoice). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. Without `maxFeeSats` the routing fee is capped at 1% of the amount, never below 50 sats; the spending limits count the amount plus the cap. |
+| `sendKeysend(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?, onPaymentHash?)` | `Promise<PaymentInfo>` | Spontaneous payment (no invoice). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. Without `maxFeeSats` the routing fee is capped at 1% of the amount, never below 50 sats; the spending limits count the amount plus the cap. `onPaymentHash(hash)` is called before the HTLC goes out; a throw from it refuses the payment. |
 | `sendKeysendSafe(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Like `sendKeysend` but **never throws** — resolves with `status: 'FAILED'` instead. |
 
 #### BOLT 12 Offers
@@ -228,7 +230,7 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | `createOffer({ description, amountSats?, issuer? })` | `OfferInfo` | Create a reusable BOLT 12 offer |
 | `decodeOfferString(offerStr)` | `OfferInfo` | Decode a BOLT 12 offer string without paying |
 | `listOffers()` | `OfferInfo[]` | List local offers |
-| `payOffer(offerStr, amountSats?, timeoutMs?, maxFeeSats?, maxFeeMsat?)` | `Promise<PaymentInfo>` | Pay a BOLT 12 offer (requests invoice, then pays). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. Drain mode and the spending limits apply to the returned invoice's amount. `maxFeeSats` / `maxFeeMsat` cap the routing fee exactly as `payInvoice`'s do (one or the other; both at once is `INVALID_PARAMS`, judged before the invoice is requested). The cap covers the public hops plus the invoice's own blinded-path fee, which the payee writes into the invoice and which is otherwise paid unbounded (#1001); an invoice path over the cap is skipped for the invoice's other paths, and when none fits the payment is refused with `FEE_EXCEEDS_MAX` and nothing is sent |
+| `payOffer(offerStr, amountSats?, timeoutMs?, maxFeeSats?, maxFeeMsat?, onPaymentHash?)` | `Promise<PaymentInfo>` | Pay a BOLT 12 offer (requests invoice, then pays). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. Drain mode and the spending limits apply to the returned invoice's amount. `maxFeeSats` / `maxFeeMsat` cap the routing fee exactly as `payInvoice`'s do (one or the other; both at once is `INVALID_PARAMS`, judged before the invoice is requested). The cap covers the public hops plus the invoice's own blinded-path fee, which the payee writes into the invoice and which is otherwise paid unbounded (#1001); an invoice path over the cap is skipped for the invoice's other paths, and when none fits the payment is refused with `FEE_EXCEEDS_MAX` and nothing is sent. `onPaymentHash(hash)` is called with the invoice's hash before the HTLC goes out; a throw from it refuses the payment |
 
 #### Channel Readiness
 
@@ -284,8 +286,8 @@ Entries survive a restart. The queue dispatches the restored ones once some chan
 | `getChannelSuggestions(count?)` | `ChannelSuggestion[]` | Graph-based channel open suggestions scored by connectivity, capacity, freshness, relevance |
 | `getFeeSnapshot()` | `FeeSnapshot \| null` | On-chain fee trend analysis with open/wait recommendation |
 | `getAdvisorRecommendations()` | `AdvisorRecommendations` | Liquidity analysis plus the concrete circular-rebalance plan (read-only) |
-| `rebalanceChannel(fromId, toId, amountSats, maxFeeSats)` | `Promise<RebalanceResult>` | Circular rebalance (self-payment out fromId, back in toId). Aborts without paying if the route fee exceeds `maxFeeSats` |
-| `executeRebalances(budgetSatsPerDay?)` | `Promise<RebalanceExecutionSummary>` | Run the advisor's rebalance plan under a per-UTC-day fee budget (persisted; restarts never overspend the day) |
+| `rebalanceChannel(fromId, toId, amountSats, maxFeeSats)` | `Promise<RebalanceResult>` | Circular rebalance (self-payment out fromId, back in toId). Aborts without paying if the route fee exceeds `maxFeeSats`. The fee counts against `dailySpendLimitSats` |
+| `executeRebalances(budgetSatsPerDay?)` | `Promise<RebalanceExecutionSummary>` | Run the advisor's rebalance plan under a per-UTC-day fee budget (persisted; restarts never overspend the day). The fees count against `dailySpendLimitSats` |
 
 Automatic execution is **off by default**: pass `autoRebalance: { enabled: true, budgetSatsPerDay, minImbalancePct }` and/or `autoTuneFees: { enabled: true, intervalMs, floorPpm, ceilPpm }` in `BeignetNodeOptions` to turn on the periodic rebalance scan and routing-fee (ppm) auto-tuning.
 
@@ -299,7 +301,8 @@ Automatic execution is **off by default**: pass `autoRebalance: { enabled: true,
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `backup(destPath)` | `Promise<void>` | Create online backup of SQLite database |
+| `backup(destPath)` | `Promise<void>` | Create online backup of SQLite database, with its MAC in `<destPath>.hmac` |
+| `storageFiles()` | `string[]` | The live database, its sidecars and the instance lock (paths `POST /backup` refuses to write over) |
 
 Storage encryption: the SQLite database is encrypted at rest by default with a
 key derived (HKDF-SHA256) from the wallet's BIP39 seed. Sensitive payloads
@@ -365,7 +368,7 @@ With `peerStorageEnabled` (default true) the node advertises
 | Method / Command | Returns | Description |
 |--------|---------|-------------|
 | `restoreFromScb(encoded)` | `Promise<{ recovering, skipped, channelCount }>` | Recover channels from an SCB blob (daemon: `POST /restore/scb` with `{ encoded }` or `{ path }`; CLI: `beignet restore scb <file>`) |
-| `beignet restore db <backupFile>` | JSON result | Copy a database backup into place (OFFLINE, local CLI operation - no daemon call) |
+| `beignet restore db <backupFile> [--unauthenticated]` | JSON result | Copy an authenticated database backup into place (OFFLINE, local CLI operation - no daemon call) |
 | `restoreFromGuardians()` | `Promise<{ exact, framesApplied, guardiansRepaired, epoch }>` | Restore from guardian replicas and start the node on the restored state (daemon: `POST /recovery/restore` with `{ confirm: true }`; CLI: `beignet recovery restore`) |
 | `restoreFromCapsules({ unfenced? })` | `Promise<{ tier, channelCount, framesApplied, head, newestSeenHead, rejectedCandidates, restartRequired, unfenced?, recovering?, skipped? }>` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session (daemon: `POST /recovery/restore-capsule` with `{ confirm: true }`; CLI: `beignet recovery restore-capsule`). Tier 2 installs the exact state into a fresh database and holds the daemon until a restart; Tier 1 recovers the embedded SCB on the live node |
 
@@ -386,12 +389,21 @@ Three very different restore modes:
 - **DB restore = full state.** `beignet restore db <backupFile>` copies a
   backup made with `backup()` over `<dataDir>/<network>.db`. The node must be
   STOPPED: the command refuses while a daemon holds the wallet's
-  single-instance lock (and holds that lock itself during the copy). The file
-  must be a real SQLite database (16-byte header check), any existing
-  database is preserved at `<db>.pre-restore-<timestamp>` first, and stale
-  `-wal`/`-shm` sidecars are moved aside so they cannot corrupt the restored
-  file. The database is encrypted under the wallet seed, so the node must be
-  started with the same mnemonic that made the backup. WARNING: restoring a
+  single-instance lock (and holds that lock itself during the copy). Every
+  backup is written with an HMAC-SHA256 of the whole file in
+  `<backupFile>.hmac`, under a key derived (HKDF-SHA256, info
+  `beignet-db-backup-mac-v1`) from the wallet seed; keep the two files
+  together. The restore copies the backup next to the database, and refuses
+  it unless that copy is a SQLite database whose MAC matches, so a backup
+  modified by anyone without the mnemonic (or made by another wallet) never
+  replaces the live database. Any existing database is preserved at
+  `<db>.pre-restore-<timestamp>` first, and stale `-wal`/`-shm` sidecars are
+  moved aside so they cannot corrupt the restored file. The database is
+  encrypted under the wallet seed, so the node must be started with the same
+  mnemonic that made the backup. Backups made before backups carried a MAC
+  have no `.hmac` file and are refused; restore one with `--unauthenticated`
+  only when you know it was not modified, then take a fresh backup once the
+  node is running. WARNING: restoring a
   stale database and going online can be unsafe (peers may prove the state
   stale); prefer the most recent backup, and rely on SCB recovery when in
   doubt.
@@ -418,7 +430,9 @@ keeps the same id. A wallet adds it by resolving the node's URI
 while its own writer lease is quarantined (the guardian-only lane), so nodes
 that guard each other can restart together. Quotas
 (`BEIGNET_GUARDIAN_MAX_BYTES`, `_MAX_SETS`) refuse new writes rather than
-delete, because pruning a namespace wedges a stranger's node for good.
+delete, because pruning a namespace wedges a stranger's node for good. A set
+still shrinks: each writer tells its guardians which snapshot all of them
+hold, and they free the records below it.
 
 #### Rotating guardians
 
@@ -586,6 +600,14 @@ Operational notes:
   `BEIGNET_RECOVERY_LEASE_CHECK_MS` (default 300000; 0 disables) so a device
   superseded while parked reports `fenced` within that window instead of at
   its next commit or restart. An outage never changes the gate.
+- A fenced device was taken over by another restored from the same seed,
+  and every update that device made revoked a commitment this one still
+  stores. So while the gate is `fenced`, and while it is `quarantined`
+  (where a takeover cannot yet be ruled out), every force close route
+  (`/channel/forceclose`, `/ffor/enforce`, `/ffor/recover` with
+  `forceCloseIfUnreachable`) is refused without `acceptStaleStateRisk: true`
+  (issue #1013). Close from the device that took over instead, or let the
+  peer close.
 - Restore-from-nothing: start the daemon with the same mnemonic, the same
   guardian set, and a FRESH data dir. The boot detects the namespace on the
   guardians and holds in a restore-pending state where only
@@ -693,6 +715,23 @@ Operational notes:
 > opens/splices/funding, and
 > `bumpFeeOnchain`/`boostOnchain` (fee-only). PSBT building is also not
 > counted (nothing is broadcast). Resets at midnight UTC.
+
+`maxPaymentSats` covers the same external on-chain sends, judged on the same
+figure as the daily limit: `sendOnchain`, an address-targeted `spliceOut` and
+`sendDirectFunding` on the amount plus the fee, and `sendMaxOnchain` on the
+whole sweep. The exclusions above are outside it too.
+
+Circular rebalances (`rebalanceChannel`, `executeRebalances` and their routes)
+are refused with `SERVICE_DRAINING` while the node drains, and a drain that
+starts during an `executeRebalances` run stops the plans it has not tried
+yet. The amount comes back to the node, so only the routing fee counts
+against the daily limit. The day is charged `maxFeeSats` (`rebalanceChannel`)
+or the day's advisor fee budget (`executeRebalances`) when the call starts,
+and gets back what the fees actually paid did not use when it returns. A
+rebalance whose wait times out, or that a shutdown or crash interrupts, keeps
+its fee cap charged, because its HTLC can still settle. `maxPaymentSats` does
+not apply to them. Each `autoRebalance` run is an `executeRebalances` call,
+so all of this holds for it too.
 
 Every invoice payment (`payInvoice`, `payInvoiceSafe`, `payInvoiceWithRetry`,
 `sendPaymentAsync`, the queue and their routes) is checked and recorded at the
@@ -1229,7 +1268,7 @@ not repeat a 4xx unchanged.
 | `INSTANCE_ALREADY_RUNNING` | Wallet | n/a | Another instance holds the data-dir lock (startup only, never over HTTP) |
 | `PAYMENT_FAILED` | Payments | 502 | Lightning payment failed |
 | `FEE_EXCEEDS_MAX` | Payments | 409 | Every route costs more than the caller's `maxFeeSats` / `maxFeeMsat`; nothing was sent (permanent: the same request meets the same cap) |
-| `PAYMENT_TIMEOUT` | Payments | 504 | Payment did not settle within timeout. The payment is failed only when no HTLC is out for it; with one still in flight the record stays `PENDING` until it resolves, no further route is tried, and the record is failed when the HTLC fails or its on-chain timeout resolves; the message says so (issue #976) |
+| `PAYMENT_TIMEOUT` | Payments | 504 | Payment did not settle within timeout. The payment is failed only when no HTLC is out for it; with one still in flight the record stays `PENDING` until it resolves, no further route is tried, and the record is failed when the HTLC fails or its on-chain timeout resolves; the message says so (issue #976). The error carries the payment's `paymentHash` (issue #1094) |
 | `INVOICE_EXPIRED` | Payments | 410 | Invoice has expired |
 | `NO_ROUTE` | Payments | 502 | No route found to destination |
 | `INVALID_INVOICE` | Payments | 400 | BOLT 11 string failed to parse |
@@ -1382,7 +1421,7 @@ All output is JSON. Add `--pretty` for indented output.
 
 ```bash
 beignet init [--network regtest] [--alias mynode]
-beignet start [--port 2112] [--host 0.0.0.0] [--daemon] [--anchors] [--api-token mysecret] \
+beignet start [--port 2112] [--host 0.0.0.0] [--daemon] [--anchors] [--api-token <token>] \
   [--backup-path /path/to/backup.db] [--backup-interval 21600000] \
   [--daily-spend-limit 100000] [--tls-cert /path/cert.pem] [--tls-key /path/key.pem] \
   [--htlc-events] [--log-level info]
@@ -1400,7 +1439,9 @@ carries neither `apiToken` nor `apiKeys` and the environment supplies neither
 `config.json` and printed once, as `apiToken` with a `note` on how to send it;
 an existing token or key set is left alone and never printed. Running `init`
 on a config an older release wrote (mnemonic, no credential) adds a token the
-same way. `beignet start` with no credential at all keeps running but warns
+same way. The mnemonic is printed only by the `init` that creates it; a
+re-run answers `Config already exists` without it. `beignet start` with no
+credential at all keeps running but warns
 on stderr: `authentication is off: any local process can drive this daemon;
 run beignet init or set apiToken`.
 
@@ -1502,8 +1543,10 @@ beignet consolidate [satsPerVbyte]
 beignet psbt build <address> <sats> [satsPerVbyte]
 # Unsigned PSBT for a hardware wallet: {"ok":true,"result":{"psbtBase64":"cHNi...","feeSats":418,...}}
 
-beignet psbt import-signed <psbtBase64|file>
+beignet psbt import-signed <psbtBase64|file> [unsignedPsbt|file]
 # Validate + finalize (no broadcast): {"ok":true,"result":{"txid":"ab12...","txHex":"0200..."}}
+# The daemon remembers its 50 most recent builds, in memory only. After a
+# restart (or 50 newer builds), pass the unsigned PSBT from `psbt build` too.
 
 beignet psbt combine <psbt|file> <psbt|file>
 # {"ok":true,"result":{"psbtBase64":"cHNi..."}}
@@ -1925,7 +1968,8 @@ The config file carries the mnemonic and the API token, so everything under
 `~/.beignet` is created owner-only: `~/.beignet` and the data directory are
 `0700`, and `config.json`, `daemon.pid`, the SQLite database with its `-wal`
 and `-shm` sidecars, the instance lock, database backups (`backup()`, the
-scheduled backup, `POST /backup`), restore copies and SCB exports are `0600`.
+scheduled backup, `POST /backup`) and their `.hmac` files, restore copies and
+SCB exports are `0600`.
 The modes are set explicitly rather than trusted to the umask; the CLI also
 sets the process umask to `077` for `init`, `start`, `backup` and `restore`,
 so anything else those commands create is owner-only too. A library host that
@@ -1952,6 +1996,7 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_ELECTRUM_PORT` | Electrum server port |
 | `BEIGNET_ELECTRUM_TLS` | `true` or `false` |
 | `BEIGNET_LISTEN_PORT` | Lightning listen port |
+| `BEIGNET_MAX_INBOUND_PEERS` | Inbound peer connections (default 125); once this many are up, only peers holding a channel with this node are admitted |
 | `BEIGNET_DAEMON_HOST` | HTTP daemon bind address (default: `127.0.0.1`) |
 | `BEIGNET_DAEMON_PORT` | HTTP daemon port |
 | `BEIGNET_PREFER_ANCHORS` | `true` to prefer anchor channels |
@@ -1977,7 +2022,7 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_RECOVERY_REESTABLISH_HOLD_MS` | peer-storage mode: how long an unknown channel's `channel_reestablish` is held before the BOLT 1 error goes out, an integer in 0..2147483647 (default: 600000; 0 answers immediately; anything else refuses startup) |
 | `BEIGNET_GUARDIAN_SERVE` | `true` to serve the reference guardian to other beignet nodes over bolt8 sessions at this node's Lightning address (docs/RECOVERY-GUARDIAN-WIRE.md 2.7); needs `BEIGNET_LISTEN_PORT`. Independent of this node's own recovery mode, and kept serving while this node's own writer lease is quarantined |
 | `BEIGNET_GUARDIAN_TOKEN` | Bearer token every guardian session must present; unset runs open (BOLT 8 already encrypts and authenticates the host, so the token is an allow-list) |
-| `BEIGNET_GUARDIAN_MAX_BYTES` | Hard bound on the content one served guardian set may store (its encoded rows; SQLite's overhead comes on top): every write, epoch rows and rotations included, that would cross it is refused with `ERR_QUOTA_EXCEEDED` (default 268435456). Refuses, never deletes |
+| `BEIGNET_GUARDIAN_MAX_BYTES` | Hard bound on the content one served guardian set may store (its encoded rows; SQLite's overhead comes on top): every write, epoch rows and rotations included, that would cross it is refused with `ERR_QUOTA_EXCEEDED` (default 268435456). A set registers at most 8 namespaces, and each may store an eighth of this. Refuses, never deletes |
 | `BEIGNET_GUARDIAN_MAX_SETS` | Guardian sets this node will register (default 16) |
 | `BEIGNET_GUARDIAN_MAX_CIPHERTEXT_BYTES` | Advertised per-record ciphertext limit (default 4194304; protocol cap 16 MiB) |
 | `BEIGNET_RECOVERY_AUTO_APPLY` | peer-storage mode: on a boot whose database is empty, apply the best Recovery Capsule the storage peers return with no operator call and rebuild the node in-process on it (exact `true`/`false`; default off; refused outside peer-storage mode). Cannot fence a previous device that still runs |
@@ -2000,8 +2045,8 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_SWAP_FEE_PPM` | Proportional part of the swap fee in millionths of the on-chain amount (default 0). The quoted funding miner fee is added to both |
 | `BEIGNET_SWAP_MIN_SAT` / `BEIGNET_SWAP_MAX_SAT` | Smallest and largest on-chain amount served (defaults 10000 / 1000000) |
 | `BEIGNET_SWAP_MAX_EXPOSURE_SAT` | Most principal this node will have at risk on chain across unresolved swaps at once (default 5000000) |
-| `BEIGNET_SWAP_MAX_CONCURRENT` | Unresolved swaps allowed at once, unpaid ones included (default 8) |
-| `BEIGNET_SWAP_REFUND_DELTA_BLOCKS` | Blocks from create to the contract's refund height (default 144). The hold invoice's final CLTV is derived from it so a paid hold always outlives the refund |
+| `BEIGNET_SWAP_MAX_CONCURRENT` | Swaps with principal at risk allowed at once (default 8); an unpaid create does not count |
+| `BEIGNET_SWAP_REFUND_DELTA_BLOCKS` | Blocks from create to the contract's refund height (default 144; a client may prefer another within the provider's bounds). The hold invoice's final CLTV is derived from the swap's delta so a paid hold always outlives the refund |
 | `BEIGNET_SWAP_FUNDING_CONFS` / `BEIGNET_SWAP_RESOLUTION_CONFS` | Depth the funding needs before it counts, and depth a claim or refund needs before it is the outcome (defaults 1 / 3). A claim settles the hold at any depth, the mempool included; a refund cancels it only at this depth. Both directions share these |
 | `BEIGNET_SWAP_SUBMARINE` | With `BEIGNET_SWAPS=true`, also serve the submarine direction (issue #743): a peer locks coins in a P2WSH contract whose preimage branch is this node's, this node pays the peer's own invoice once the funding has confirmed to `BEIGNET_SWAP_FUNDING_CONFS` and been re-verified unspent, with every HTLC bound to the refund height minus the claim margins, and claims the coins with the preimage. Exact `true`/`false`, default off: the node pays out Lightning funds against a contract it must then claim. The fee terms and exposure caps above apply to both directions |
 | `BEIGNET_SWAP_CLAIM_SAFETY_BLOCKS` | Blocks between the last possible outgoing HTLC expiry and the peer's refund height, for a late preimage to be claimed and confirmed (default 24) |
@@ -2055,7 +2100,7 @@ CLI flags > environment variables > config file > defaults.
 
 The daemon exposes these endpoints on `127.0.0.1:2112` (configurable via `daemonHost`/`daemonPort`). All POST endpoints accept JSON bodies. HTTPS is supported when started with `--tls-cert` and `--tls-key`. A malformed request (an unparseable request target, or a `Host` header that is not a valid host) answers `400 INVALID_PARAMS` and never terminates the process; `beignet start` also logs any unhandled rejection or uncaught exception with its stack and keeps running.
 
-These endpoints support the `X-Idempotency-Key` header (24h cache): `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/splice-out`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`. A repeat with the same key and body returns the cached response; the same key with a different body returns `409 IDEMPOTENCY_CONFLICT`. A thrown error is not cached, so a keyed retry after one runs again. Any other `POST` that carries the header answers `400 INVALID_PARAMS` without running. The cache is in memory, so it does not survive a daemon restart.
+These endpoints support the `X-Idempotency-Key` header (24h cache): `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/splice-out`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`. A repeat with the same key and body returns the cached response; the same key with a different body returns `409 IDEMPOTENCY_CONFLICT`. A thrown error is not cached, so a keyed retry after one runs again, with one exception: a keyed `/offer/pay` or `/keysend` that answered `PAYMENT_TIMEOUT` is remembered by its payment hash, because a rerun would pay under a fresh hash (a new invoice, a new preimage) and could pay twice (issues #1094, #1133). A retry of it answers `200` with the payment once it completed, `409 DUPLICATE_PAYMENT` carrying `paymentHash` while an HTLC for it can still settle, and runs again only once nothing sent for it can. Any other `POST` that carries the header answers `400 INVALID_PARAMS` without running. The cache is in memory, so it does not survive a daemon restart, except for these payment hashes: a keyed `/offer/pay` or `/keysend` stores its hash before the HTLC goes out and keeps it after a `PAYMENT_TIMEOUT`, so a retry after a restart or a crash is answered the same way (issues #1132, #1153). A hash that cannot be stored refuses the payment with `503 NOT_PERSISTED`, and nothing is sent.
 
 ### Authentication
 
@@ -2069,6 +2114,10 @@ When any credential is configured, all endpoints require an `Authorization: Bear
 - `GET /health`, `GET /ready` -- monitoring tools
 - `GET /openapi.json` -- API discovery
 - `GET /metrics` -- Prometheus scrapers, only with `metricsPublic` (it reports balances)
+
+These still count against the rate limiter when `rateLimit` is configured.
+
+A daemon bound beyond loopback refuses to start when the `apiToken` or any `apiKeys` secret is shorter than 16 characters, unless `insecure` is set: there the credential is the only lock, and the rate limiter is off unless configured. Prefer `BEIGNET_API_TOKEN` or the config file to `--api-token`, whose value any local user can read from the process list.
 
 Every install `beignet init` creates carries an `apiToken` (see [Setup](#setup)). If neither `apiToken` nor `apiKeys` is configured (a config written by hand or by a release before 0.22.0's successor), all endpoints are open to local processes, `GET /mnemonic` excepted (it needs auth, and `admin`), the daemon logs a warning at boot, and three browser guards keep a web page from driving it (issue #1005):
 
@@ -2134,7 +2183,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/transactions/boostable` | -- | Unconfirmed txs eligible for RBF/CPFP, by method |
 | POST | `/consolidate` | `{ satsPerVbyte? }` | Merge all UTXOs into one output at a fresh wallet address |
 | POST | `/psbt/build` | `{ outputs, satsPerVbyte? }` | Build an UNSIGNED PSBT for an external signer |
-| POST | `/psbt/import-signed` | `{ psbtBase64 }` | Validate + finalize a signed PSBT (no broadcast) |
+| POST | `/psbt/import-signed` | `{ psbtBase64, unsignedPsbtBase64? }` | Validate + finalize a signed PSBT this node built, or one matching `unsignedPsbtBase64` (no broadcast) |
 | POST | `/psbt/combine` | `{ psbts }` | Combine partially signed PSBT copies |
 | POST | `/utxo/freeze` | `{ txid, index }` | Freeze a UTXO: excluded from all coin selection until unfrozen |
 | POST | `/utxo/unfreeze` | `{ txid, index }` | Unfreeze a previously frozen UTXO |
@@ -2164,7 +2213,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/jit/quote` | `?lspPubkey=&amountSats=&targetRemainingInboundSat=` | Price a JIT receive at that LSP without registering an intent: `accepted`, a plain-language `reason` when declined, `flatFeeSat`, `feePpm`, `feeSats` on this amount, `fundingSats` the LSP would front, `maxClientFundingSats`, and `withinCeilings` against this node's own limits. The LSP must be connected (409 `PEER_NOT_CONNECTED`, 504 `JIT_TIMEOUT`). Readonly scope |
 | GET | `/swaps/status` | -- | Swap provider (issues #737 and #743): `enabled`, and when on the fee terms, exposure caps, timing, reverse swaps per state and `exposedSat` at risk on chain; `submarine` reports the on-chain to Lightning direction the same way (`enabled: false` when it is off). Readonly scope |
 | GET | `/swaps` | `?id=<hex>` | The swap ledger (or one swap) in both directions (`direction` is `reverse` or `submarine`): state, contract terms, funding, payment, claim, refund and resolution facts; amounts as decimal strings, no private key. Readonly scope |
-| POST | `/swaps/cancel` | `{ id }` | Cancel a swap before any funds moved: a reverse swap in CREATED or HELD (closes its hold invoice), a submarine swap before PAYING (the peer refunds its own coins at the refund height). Answers `{ id, cancelled: true }`; past that a swap resolves on chain by claim or refund (409 `SWAP_NOT_CANCELLABLE`). Admin scope |
+| POST | `/swaps/cancel` | `{ id }` | Cancel a swap before any funds moved: a reverse swap in CREATED or HELD (closes its hold invoice), a submarine swap before PAYING (the peer refunds its own coins at the refund height). Also ends a stranded reverse swap: EXPOSED, with `strandedHeight` set because this process found its funding absent past the refund height; the operator vouches the funding will not confirm, and spending its inputs makes sure. Answers `{ id, cancelled: true }`; past that a swap resolves on chain by claim or refund (409 `SWAP_NOT_CANCELLABLE`). Admin scope |
 | POST | `/direct-funding/configure` | `{ lspPubkey?, lspHost?, lspPort?, targetInboundSat?, trusted?, allowSplice?, allowUnpairedSplice?, unpairedSpliceDepth?, minAmountSat? }` | Set the direct-funding policy. A partial MERGE, never a replace: a field the body does not name keeps its value. `trusted` lets an open go zero-conf; `allowSplice` lets a paired payer grow the existing channel with the liquidity peer instead of opening a second one; `allowUnpairedSplice` lets an anonymous payer do the same when its coin is confirmed, with a splice that locks at `unpairedSpliceDepth` confirmations (1..2016, default 3) rather than at broadcast, whatever the channel type (an anonymous payer with an unconfirmed coin still gets a new confirmed channel). While a splice with the liquidity peer is still confirming, every further offer is declined before the payer's witness leaves, so the payer falls back to a plain send. The three switches must be booleans (400 `INVALID_PARAMS` otherwise). `minAmountSat` clamps up to the 5000 sat floor and the response reports the clamped value. Returns the full effective config |
 | GET | `/direct-funding/config` | -- | Read the effective policy, `allowUnpairedSplice` and `unpairedSpliceDepth` included; `lspPubkey` is null when no liquidity peer is set, in which case no offer is served |
 | POST | `/direct-funding/request` | `{ host?, port?, amountSats? }` | Mint a payment request: returns `{ paymentHash, expiresAt, request }`, where `request` is the base64url envelope a payer pays (BIP 21 parameter `bgnq`). `host`/`port` are the address a payer can reach this node on and are used exactly as given |
@@ -2189,7 +2238,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/graph/describe` | `?limit=&offset=` | Paged channel dump (limit defaults to 500, capped at 500) |
 | POST | `/route/query` | `{ destination, amountSats, maxFeeSats? }` | Compute a route WITHOUT sending; hops feed `/payment/send-to-route` |
 | POST | `/payment/send-to-route` | `{ paymentHash, route: { hops }, paymentSecret? }` | Send a payment along an explicit route from `/route/query`. Answers 409 while draining and 403 over a spending limit, judged on what the first hop carries (amount plus every fee); a first hop below the final amount or a negative amount is 400 `INVALID_PARAMS` |
-| POST | `/backup` | `{ destPath }` | Create online database backup |
+| POST | `/backup` | `{ destPath, overwrite? }` | Create online database backup. An existing `destPath` is 400 `INVALID_PARAMS` unless `overwrite: true`; the live database, its sidecars, the instance lock, `config.json` and `daemon.pid` are refused even then |
 | GET | `/backup/scb` | - | Export encrypted static channel backup `{ encoded, channelCount, path }` |
 | POST | `/backup/trigger` | -- | Run the configured scheduled backup now (no-op when `backupPath` unset) |
 | POST | `/message/sign` | `{ message }` | Sign message with the node key (LND-compatible zbase32 signature) |
@@ -2208,7 +2257,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/payment/wait` | `{ paymentHash, timeoutMs? }` | Wait for payment to settle (default 60s) |
 | POST | `/offer/create` | `{ description, amountSats?, issuer? }` | Create BOLT 12 offer |
 | POST | `/offer/decode` | `{ offer }` | Decode a BOLT 12 offer string |
-| POST | `/offer/pay` | `{ offer, amountSats?, timeoutMs?, maxFeeSats?, maxFeeMsat? }` | Pay BOLT 12 offer. Answers 409 while draining and 403 over a spending limit, judged on the invoice the payee returns. `maxFeeSats` or `maxFeeMsat` (a number or a decimal string) caps the routing fee, including the invoice's own blinded-path fee; over the cap answers 409 `FEE_EXCEEDS_MAX` with nothing sent; both at once is 400 `INVALID_PARAMS`. |
+| POST | `/offer/pay` | `{ offer, amountSats?, timeoutMs?, maxFeeSats?, maxFeeMsat? }` | Pay BOLT 12 offer. Answers 409 while draining and 403 over a spending limit, judged on the invoice the payee returns. `maxFeeSats` or `maxFeeMsat` (a number or a decimal string) caps the routing fee, including the invoice's own blinded-path fee; over the cap answers 409 `FEE_EXCEEDS_MAX` with nothing sent; both at once is 400 `INVALID_PARAMS`. A 504 `PAYMENT_TIMEOUT` carries the `paymentHash` to query with `GET /payment`; a keyed retry of it does not request a new invoice while that payment can still settle (issue #1094). |
 | GET | `/payment/proof` | `?paymentHash=<hex>` | Cryptographic payment proof (preimage, invoice, route) |
 | GET | `/payment/verify-proof` | `?paymentHash=<hex>` | Verify proof: `sha256(preimage) === paymentHash` |
 | GET | `/node/uri` | `?host=<addr>` | Node connection URI (`pubkey@host:port`). Optional external host override. |
@@ -2225,7 +2274,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/queue/add` | `{ bolt11, priority?, amountSats?, maxFeeSats?, metadata? }` | Enqueue payment. Dispatched through `/invoice/pay-safe`, with the same default fee cap and limits |
 | GET | `/queue` | -- | List payment queue |
 | POST | `/queue/cancel` | `{ id }` | Cancel queued payment |
-| POST | `/keysend` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Spontaneous payment (no invoice). Blocks until settled. Without `maxFeeSats` the fee is capped at 1% of the amount, never below 50 sats; the spending limits count the amount plus the cap. |
+| POST | `/keysend` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Spontaneous payment (no invoice). Blocks until settled. Without `maxFeeSats` the fee is capped at 1% of the amount, never below 50 sats; the spending limits count the amount plus the cap. A 504 `PAYMENT_TIMEOUT` carries the `paymentHash` to query with `GET /payment`; a keyed retry of it does not send again while that payment can still settle (issue #1133). |
 | POST | `/keysend/safe` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Keysend that never errors — resolves with `status: 'FAILED'` instead. |
 | GET | `/spend-limit` | -- | COMBINED LN + on-chain daily spend limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, pendingSats, resetsAt, spentSats }` (`spentSats` mirrors `totalSats` for back-compat; `pendingSats` is what in-flight payments hold and `remainingSats` subtracts it). Persisted: the figures survive a restart within the UTC day, and a payment that settles after a timeout or a restart is still counted once |
 | GET | `/auth/keys` | -- | List named API keys: names, scopes, revoked/expired flags, expiresAt/rotatedAt (never secrets; admin scope) |
@@ -2269,6 +2318,8 @@ Per-HTLC events (`htlc:forwarded`, `htlc:fulfilled`, `htlc:failed`) are relayed 
 
 A keepalive comment (`: keepalive`) is sent every 30 seconds to prevent proxy timeouts.
 
+At most 16 streams per credential (and 64 in all) are open at once; another is refused with 429 `RATE_LIMITED`. A client that stops reading is disconnected once more than 1 MB is waiting for it.
+
 ### Webhooks
 
 For agent frameworks that prefer callbacks over persistent connections, register webhook URLs:
@@ -2290,7 +2341,9 @@ curl -X DELETE http://localhost:2112/webhooks/unregister \
   -d '{"id": "abc123..."}'
 ```
 
-Webhook deliveries are POST requests with JSON body `{ event, data, timestamp }`. When a `secret` is configured, an `X-Webhook-Signature: sha256=<hmac>` header is included for payload verification. Webhooks are persisted to SQLite and survive daemon restarts. Note: HMAC secrets are stored as hashes — re-register with a secret after restart if HMAC verification is needed.
+Webhook deliveries are POST requests with JSON body `{ event, data, timestamp }`. When a `secret` is configured, an `X-Webhook-Signature: sha256=<hmac>` header is included for payload verification. Webhooks and their secrets are persisted to SQLite (the secrets in the encrypted wallet data, and only when storage encryption is on) and survive daemon restarts. A registration stored by an earlier release kept only a hash of its secret, and delivers unsigned until it is registered again.
+
+The `url` must be `http:` or `https:`. A loopback, private (RFC 1918, CGNAT, unique-local) or link-local host is refused with 403 `PRIVATE_NETWORK_REFUSED` unless the request sets `"allowPrivateNetwork": true` (CLI: `--allow-private-network`), the same opt-in as `POST /l402/fetch`. Payloads omit the payment `preimage` that `payment:sent` and `payment:received` carry over SSE; read it from `GET /payment`.
 
 Registering with `"events": ["*"]` matches every relayed event, including the invoice, channel-lifecycle, and (when `--htlc-events` is enabled) HTLC events, plus any event types added in future versions. The event list matches the SSE list above.
 

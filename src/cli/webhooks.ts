@@ -8,6 +8,41 @@
 import * as http from 'http';
 import * as https from 'https';
 import * as crypto from 'crypto';
+import { BeignetError } from './errors';
+import { isPrivateNetworkUrl } from '../lightning/l402';
+
+/** wallet_data key the daemon keeps raw webhook HMAC secrets under. */
+export const WEBHOOK_SECRETS_STORAGE_KEY = 'daemon:webhook-secrets:v1';
+
+/**
+ * Why a URL cannot be a webhook target, or null when it can. Only http and
+ * https are delivered. A loopback, private or link-local host is reachable
+ * only from this machine, so it takes the same opt-in as POST /l402/fetch.
+ */
+export function webhookTargetRefusal(
+	url: string,
+	allowPrivateNetwork: boolean
+): BeignetError | null {
+	let protocol: string;
+	try {
+		protocol = new URL(url).protocol;
+	} catch {
+		return new BeignetError('INVALID_PARAMS', 'Webhook url is not a valid URL');
+	}
+	if (protocol !== 'http:' && protocol !== 'https:') {
+		return new BeignetError(
+			'INVALID_PARAMS',
+			`Webhook url must be http or https, got ${protocol}`
+		);
+	}
+	if (!allowPrivateNetwork && isPrivateNetworkUrl(url)) {
+		return new BeignetError(
+			'PRIVATE_NETWORK_REFUSED',
+			'Webhook url names a private, loopback, or link-local host; pass allowPrivateNetwork to permit it'
+		);
+	}
+	return null;
+}
 
 export interface WebhookRegistration {
 	id: string;
@@ -34,11 +69,42 @@ export interface IWebhookStorage {
 		secretHash?: string;
 		createdAt: number;
 	}>;
+	/**
+	 * Raw HMAC secrets by webhook id, so deliveries after a restart are still
+	 * signed. Optional: without them a secret lasts for the process only.
+	 * Back them with storage that is encrypted at rest; the webhook rows are
+	 * not.
+	 */
+	saveWebhookSecrets?(secrets: Record<string, string>): void;
+	loadWebhookSecrets?(): Record<string, string> | null;
 }
 
 interface WebhookEntry extends WebhookRegistration {
 	// internal: secretHash for storage (not the raw secret)
 	secretHash?: string;
+}
+
+function sha256Hex(value: string): string {
+	return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+/**
+ * The event without a top-level preimage (payment:sent, payment:received).
+ * A webhook URL is only as private as whoever registered it, and plain http
+ * is allowed; the preimage stays available from GET /payment.
+ */
+function withoutPreimage(data: unknown): unknown {
+	if (
+		typeof data !== 'object' ||
+		data === null ||
+		Array.isArray(data) ||
+		!('preimage' in data)
+	) {
+		return data;
+	}
+	const copy: Record<string, unknown> = { ...data };
+	delete copy.preimage;
+	return copy;
 }
 
 const DELIVERY_TIMEOUT_MS = 5000;
@@ -55,16 +121,21 @@ export class WebhookManager {
 		// Restore persisted webhooks
 		if (this.storage) {
 			try {
+				const secrets = this.loadSecrets();
 				for (const row of this.storage.loadAllWebhooks()) {
+					const secret = secrets[row.id];
 					this.webhooks.set(row.id, {
 						id: row.id,
 						url: row.url,
 						events: row.events,
+						// A registration stored before secrets were kept has only
+						// the hash, and delivers unsigned until re-registered.
+						secret:
+							typeof secret === 'string' && sha256Hex(secret) === row.secretHash
+								? secret
+								: undefined,
 						secretHash: row.secretHash,
 						createdAt: row.createdAt
-						// Note: raw secret is NOT recoverable from hash — webhook
-						// signature verification won't work after restart. The agent
-						// should re-register with a secret if HMAC is needed.
 					});
 				}
 			} catch {
@@ -88,11 +159,13 @@ export class WebhookManager {
 		if (!url || !events || events.length === 0) {
 			throw new Error('url and at least one event type are required');
 		}
+		// Any other scheme was posted as plain http to the URL's host, or to
+		// localhost:80 when it had none (file:).
+		const refusal = webhookTargetRefusal(url, true);
+		if (refusal) throw refusal;
 
 		const id = crypto.randomBytes(16).toString('hex');
-		const secretHash = secret
-			? crypto.createHash('sha256').update(secret).digest('hex')
-			: undefined;
+		const secretHash = secret ? sha256Hex(secret) : undefined;
 		const entry: WebhookEntry = {
 			id,
 			url,
@@ -107,6 +180,7 @@ export class WebhookManager {
 		if (this.storage) {
 			try {
 				this.storage.saveWebhook(id, url, events, secretHash, entry.createdAt);
+				if (secret) this.saveSecrets();
 			} catch {
 				// Best-effort — webhook still works in-memory
 			}
@@ -120,11 +194,13 @@ export class WebhookManager {
 	 * @returns true if the webhook was found and removed
 	 */
 	unregister(id: string): boolean {
+		const secret = this.webhooks.get(id)?.secret;
 		const deleted = this.webhooks.delete(id);
 		this.holdDeliveries.delete(id);
 		if (deleted && this.storage) {
 			try {
 				this.storage.deleteWebhook(id);
+				if (secret) this.saveSecrets();
 			} catch {
 				// Best-effort
 			}
@@ -151,7 +227,7 @@ export class WebhookManager {
 			// Snapshot once so queued deliveries and retries preserve the event identity.
 			payload = JSON.stringify({
 				event: eventType,
-				data,
+				data: withoutPreimage(data),
 				timestamp: Date.now()
 			});
 		} catch {
@@ -208,10 +284,29 @@ export class WebhookManager {
 		if (this.storage) {
 			try {
 				this.storage.deleteAllWebhooks();
+				this.saveSecrets();
 			} catch {
 				// Best-effort
 			}
 		}
+	}
+
+	/** Unreadable secrets cost the signatures, not the registrations. */
+	private loadSecrets(): Record<string, unknown> {
+		try {
+			const secrets = this.storage?.loadWebhookSecrets?.();
+			return typeof secrets === 'object' && secrets !== null ? secrets : {};
+		} catch {
+			return {};
+		}
+	}
+
+	private saveSecrets(): void {
+		const secrets: Record<string, string> = {};
+		for (const webhook of this.webhooks.values()) {
+			if (webhook.secret) secrets[webhook.id] = webhook.secret;
+		}
+		this.storage?.saveWebhookSecrets?.(secrets);
 	}
 
 	private holdPaymentHash(
@@ -255,6 +350,10 @@ export class WebhookManager {
 		payload: string
 	): Promise<void> {
 		const url = new URL(webhook.url);
+		// A row stored before register() checked the scheme.
+		if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+			throw new Error(`Webhook url scheme ${url.protocol} is not delivered`);
+		}
 		const isHttps = url.protocol === 'https:';
 		const lib = isHttps ? https : http;
 

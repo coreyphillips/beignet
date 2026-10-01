@@ -42,6 +42,11 @@ const TLV_SPLICE_INFO = 1n;
 const TLV_PARTIAL_SIG_WITH_NONCE = 2n;
 /** option_taproot: next per-commitment verification nonce in revoke_and_ack. */
 const TLV_NEXT_LOCAL_NONCE = 4n;
+const COMMITMENT_SIGNED_TLV_TYPES = new Set<bigint>([
+	TLV_SPLICE_INFO,
+	TLV_PARTIAL_SIG_WITH_NONCE
+]);
+const REVOKE_AND_ACK_TLV_TYPES = new Set<bigint>([TLV_NEXT_LOCAL_NONCE]);
 
 export interface IRevokeAndAckMessage {
 	channelId: Buffer;
@@ -147,7 +152,11 @@ export function decodeCommitmentSignedMessage(
 	let fundingTxid: Buffer | undefined;
 	let partialSignatureWithNonce: Buffer | undefined;
 	if (offset < payload.length) {
-		const { records } = decodeTlvStream(payload, offset);
+		const { records } = decodeTlvStream(
+			payload,
+			offset,
+			COMMITMENT_SIGNED_TLV_TYPES
+		);
 		for (const record of records) {
 			if (record.type === TLV_SPLICE_INFO && record.value.length === 32) {
 				fundingTxid = Buffer.from(record.value);
@@ -214,7 +223,11 @@ export function decodeRevokeAndAckMessage(
 	// option_taproot: parse the optional next_local_nonce TLV (type 4).
 	let nextLocalNonce: Buffer | undefined;
 	if (payload.length > REVOKE_AND_ACK_LENGTH) {
-		const { records } = decodeTlvStream(payload, REVOKE_AND_ACK_LENGTH);
+		const { records } = decodeTlvStream(
+			payload,
+			REVOKE_AND_ACK_LENGTH,
+			REVOKE_AND_ACK_TLV_TYPES
+		);
 		for (const record of records) {
 			if (record.type === TLV_NEXT_LOCAL_NONCE && record.value.length === 66) {
 				nextLocalNonce = Buffer.from(record.value);

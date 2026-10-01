@@ -1,6 +1,6 @@
 {
   "name": "beignet",
-  "version": "0.23.1",
+  "version": "0.24.1",
   "description": "A self-custodial, JS Bitcoin wallet + Lightning Network management library.",
   "main": "dist/index.js",
   "bin": {
@@ -79,7 +79,7 @@
   "author": "coreyphillips",
   "license": "MIT",
   "overrides": {
-    "axios": "0.33.0",
+    "axios": "0.34.0",
     "js-yaml": "4.3.2",
     "serialize-javascript": "7.0.7"
   },

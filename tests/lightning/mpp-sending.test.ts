@@ -55,6 +55,7 @@ import {
 	deserializePaymentInfo,
 	serializePaymentInfo
 } from '../../src/lightning/storage/serialization';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 
 // ─────────────── Helpers ───────────────
 
@@ -885,6 +886,88 @@ describe('MPP Sending (Phase 5)', function () {
 
 			alice.destroy();
 			bob.destroy();
+		});
+
+		it('the payee records the amount an any-amount invoice settled for (#1093)', async function () {
+			// An any-amount invoice's record starts at 0n and used to stay there
+			// through settlement, whether it settled as one HTLC or an MPP set.
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = new LightningNode({
+				...makeNodeConfig(88),
+				htlcBasepointSecret: htlcSecretFor(88)
+			});
+			alice.on('error', () => {});
+			const bob = new LightningNode({
+				...makeNodeConfig(89),
+				htlcBasepointSecret: htlcSecretFor(89),
+				storage
+			});
+			bob.on('error', () => {});
+			connectNodes(alice, bob);
+
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+
+			const settledEvents = new Map<string, bigint>();
+			bob.on(
+				'invoice:settled',
+				(e: { paymentHash: Buffer; amountMsat: bigint }) => {
+					settledEvents.set(e.paymentHash.toString('hex'), e.amountMsat);
+				}
+			);
+
+			const pay = async (
+				invoiceAmountMsat: bigint | undefined,
+				payAmountMsat: bigint
+			): Promise<Buffer> => {
+				const invoice = bob.createInvoice({
+					description: 'receive amount',
+					amountMsat: invoiceAmountMsat
+				});
+				alice.sendPayment(
+					invoice.bolt11,
+					undefined,
+					undefined,
+					invoiceAmountMsat === undefined ? payAmountMsat : undefined
+				);
+				await new Promise((r) => setTimeout(r, 50));
+				return invoice.paymentHash;
+			};
+
+			const cases: Array<[string, Buffer, bigint, number]> = [
+				// Fits one channel: settles as a single HTLC.
+				['single part', await pay(undefined, 50_000_000n), 50_000_000n, 1],
+				// Fits neither channel alone: settles as a two-part set.
+				['mpp', await pay(undefined, 250_000_000n), 250_000_000n, 2],
+				// A fixed-amount invoice keeps the amount it was issued for.
+				['fixed amount', await pay(40_000_000n, 40_000_000n), 40_000_000n, 1]
+			];
+
+			for (const [label, hash, amountMsat, parts] of cases) {
+				const hex = hash.toString('hex');
+				const record = bob.getPayment(hash)!;
+				expect(record.status, label).to.equal(PaymentStatus.COMPLETED);
+				expect(record.settledHtlcs, label).to.have.length(parts);
+				expect(record.amountMsat, `${label} record`).to.equal(amountMsat);
+				expect(
+					storage.loadPayment(hex)!.amountMsat,
+					`${label} persisted`
+				).to.equal(amountMsat);
+				expect(settledEvents.get(hex), `${label} invoice:settled`).to.equal(
+					amountMsat
+				);
+			}
+
+			alice.destroy();
+			bob.destroy();
+			storage.close();
 		});
 
 		it('a routing hint whose forwarding node is the sender cannot bypass the local capacity bound (#254)', function () {

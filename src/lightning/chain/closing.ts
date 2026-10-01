@@ -23,6 +23,12 @@ export interface IClosingTxParams {
 	remoteAmount: bigint;
 	feeAmount: bigint;
 	/**
+	 * dust_limit_satoshis each output's owner advertised at open. See
+	 * closingOutputDustLimit; omitted, the script-type table applies.
+	 */
+	localDustLimit?: bigint;
+	remoteDustLimit?: bigint;
+	/**
 	 * nSequence for the funding input. Defaults to 0xffffffff (legacy BOLT 2
 	 * closing tx). Simple-taproot channels MUST pass 0xfffffffd — LND builds
 	 * the taproot coop-close tx RBF-signalled, and a different sequence
@@ -77,11 +83,16 @@ export function buildClosingTx(params: IClosingTxParams): IClosingTxResult {
 	}
 	const outputs: IOutputEntry[] = [];
 
-	// Determine dust limit based on script type
-	const localDust = getDustLimit(localScriptPubkey);
-	const remoteDust = getDustLimit(remoteScriptPubkey);
+	const localDust = closingOutputDustLimit(
+		localScriptPubkey,
+		params.localDustLimit
+	);
+	const remoteDust = closingOutputDustLimit(
+		remoteScriptPubkey,
+		params.remoteDustLimit
+	);
 
-	if (localAmount >= BigInt(localDust)) {
+	if (localAmount >= localDust) {
 		outputs.push({
 			script: localScriptPubkey,
 			value: localAmount,
@@ -89,7 +100,7 @@ export function buildClosingTx(params: IClosingTxParams): IClosingTxResult {
 		});
 	}
 
-	if (remoteAmount >= BigInt(remoteDust)) {
+	if (remoteAmount >= remoteDust) {
 		outputs.push({
 			script: remoteScriptPubkey,
 			value: remoteAmount,
@@ -186,6 +197,9 @@ export interface IClosingRelayParams {
 	remoteScriptPubkey: Buffer;
 	localAmount: bigint;
 	remoteAmount: bigint;
+	/** As on IClosingTxParams. */
+	localDustLimit?: bigint;
+	remoteDustLimit?: bigint;
 	isTaproot?: boolean;
 }
 
@@ -206,11 +220,17 @@ export function closingTxRelayProfile(params: IClosingRelayParams): {
 } {
 	const scriptLens: number[] = [];
 	let outputTotal = 0n;
-	if (params.localAmount >= BigInt(getDustLimit(params.localScriptPubkey))) {
+	if (
+		params.localAmount >=
+		closingOutputDustLimit(params.localScriptPubkey, params.localDustLimit)
+	) {
 		scriptLens.push(params.localScriptPubkey.length);
 		outputTotal += params.localAmount;
 	}
-	if (params.remoteAmount >= BigInt(getDustLimit(params.remoteScriptPubkey))) {
+	if (
+		params.remoteAmount >=
+		closingOutputDustLimit(params.remoteScriptPubkey, params.remoteDustLimit)
+	) {
 		scriptLens.push(params.remoteScriptPubkey.length);
 		outputTotal += params.remoteAmount;
 	}
@@ -266,36 +286,58 @@ export function isOpReturnScript(scriptPubkey: Buffer): boolean {
  */
 export function isDustOutput(scriptPubkey: Buffer, amountSat: bigint): boolean {
 	if (isOpReturnScript(scriptPubkey)) return false;
+	return amountSat < relayDustThreshold(scriptPubkey);
+}
 
-	let threshold: bigint;
+function relayDustThreshold(scriptPubkey: Buffer): bigint {
 	if (
 		scriptPubkey.length === 25 &&
 		scriptPubkey[0] === 0x76 &&
 		scriptPubkey[1] === 0xa9
 	) {
-		threshold = 546n; // P2PKH
-	} else if (
+		return 546n; // P2PKH
+	}
+	if (
 		scriptPubkey.length === 23 &&
 		scriptPubkey[0] === 0xa9 &&
 		scriptPubkey[1] === 0x14
 	) {
-		threshold = 540n; // P2SH
-	} else if (
+		return 540n; // P2SH
+	}
+	if (
 		scriptPubkey.length === 22 &&
 		scriptPubkey[0] === 0x00 &&
 		scriptPubkey[1] === 0x14
 	) {
-		threshold = 294n; // P2WPKH
-	} else if (
+		return 294n; // P2WPKH
+	}
+	if (
 		scriptPubkey.length === 34 &&
 		scriptPubkey[0] === 0x00 &&
 		scriptPubkey[1] === 0x20
 	) {
-		threshold = 330n; // P2WSH
-	} else {
-		threshold = 354n; // P2TR / other witness programs (conservative)
+		return 330n; // P2WSH
 	}
-	return amountSat < threshold;
+	return 354n; // P2TR / other witness programs (conservative)
+}
+
+/**
+ * Smallest amount a legacy (closing_signed) closing output keeps.
+ *
+ * Each output is trimmed at its owner's dust_limit_satoshis, as LND does. The
+ * peer's signature covers the outputs it built, so any other threshold fails
+ * the signature check whenever an output lands between the two. The script's
+ * relay threshold still applies on top: a limit below 546 would otherwise keep
+ * a P2PKH output no mempool relays, and BOLT 2 has the channel fail rather
+ * than sign that.
+ */
+export function closingOutputDustLimit(
+	scriptPubkey: Buffer,
+	ownerDustLimit: bigint | undefined
+): bigint {
+	if (ownerDustLimit === undefined) return BigInt(getDustLimit(scriptPubkey));
+	const relay = relayDustThreshold(scriptPubkey);
+	return ownerDustLimit > relay ? ownerDustLimit : relay;
 }
 
 export interface ISimpleClosingTxParams {
@@ -427,7 +469,9 @@ export function estimateSimpleCloseFee(
 }
 
 /**
- * Get the dust limit for a given script type.
+ * Trim threshold for callers that pass no negotiated dust limit, which leaves
+ * only the simple-close relay estimate. It is not the BOLT 3 table (P2WSH and
+ * P2TR get 546), so a legacy closing tx must never be built from it.
  */
 function getDustLimit(scriptPubkey: Buffer): number {
 	// P2WPKH is 22 bytes (OP_0 <20-byte-hash>)

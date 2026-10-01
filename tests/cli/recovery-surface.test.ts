@@ -1654,7 +1654,8 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 				expect((await get(portB, '/info', MONITOR_KEY)).status).to.equal(401);
 				const hook = await post(portB, '/webhooks/register', {
 					url: 'http://127.0.0.1:9/hook',
-					events: ['payment:received']
+					events: ['payment:received'],
+					allowPrivateNetwork: true
 				});
 				expect(hook.status, JSON.stringify(hook.body)).to.equal(200);
 
@@ -2590,6 +2591,68 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 				expect((fencedReady.body.result as { ready: boolean }).ready).to.equal(
 					false
 				);
+
+				// Its force close is the only exit it has, and B has been
+				// revoking what A stores, so the exit asks for the label even on
+				// a channel with no hold of its own (issue #1013).
+				const {
+					createOpenerState
+				} = require('../../src/lightning/channel/channel-state');
+				const { Channel } = require('../../src/lightning/channel/channel');
+				const {
+					ChannelState,
+					DEFAULT_CHANNEL_CONFIG
+				} = require('../../src/lightning/channel/types');
+				const { getPublicKey } = require('../../src/lightning/crypto/ecdh');
+				const point = getPublicKey(crypto.randomBytes(32));
+				const bp = {
+					fundingPubkey: point,
+					revocationBasepoint: point,
+					paymentBasepoint: point,
+					delayedPaymentBasepoint: point,
+					htlcBasepoint: point,
+					firstPerCommitmentPoint: point
+				};
+				const state = createOpenerState({
+					temporaryChannelId: crypto.randomBytes(32),
+					fundingSatoshis: 100_000n,
+					pushMsat: 0n,
+					localConfig: DEFAULT_CHANNEL_CONFIG,
+					localBasepoints: bp,
+					localPerCommitmentSeed: crypto.randomBytes(32)
+				});
+				state.state = ChannelState.NORMAL;
+				state.channelId = crypto.randomBytes(32);
+				state.fundingTxid = crypto.randomBytes(32);
+				state.remoteBasepoints = bp;
+				const nodeA = deviceA.node.getNode();
+				nodeA
+					.getChannelManager()
+					.restoreChannel(
+						new Channel(state),
+						crypto.randomBytes(33).toString('hex')
+					);
+				expect(nodeA.getRecoveryOwnershipHold()).to.equal('superseded');
+				const fencedClose = await request(
+					portA,
+					'POST',
+					'/channel/forceclose',
+					{
+						channelId: state.channelId.toString('hex')
+					}
+				);
+				expect(fencedClose.status).to.equal(400);
+				expect((fencedClose.body.error as { code: string }).code).to.equal(
+					'INVALID_PARAMS'
+				);
+				const fencedMessage = (fencedClose.body.error as { message: string })
+					.message;
+				expect(fencedMessage).to.match(/This device was superseded/);
+				expect(fencedMessage).to.match(/acceptStaleStateRisk/);
+				expect(
+					nodeA.getChannelManager().getChannel(state.channelId)!.getState(),
+					'nothing was broadcast'
+				).to.not.equal(ChannelState.FORCE_CLOSED);
 			} finally {
 				await deviceB.stop();
 				await deviceA.stop();
@@ -2964,7 +3027,11 @@ describe('Recovery surface: automatic capsule restore (peer-storage auto-apply, 
 					portB,
 					'POST',
 					'/webhooks/register',
-					{ url: 'http://127.0.0.1:9/hook', events: ['payment:received'] },
+					{
+						url: 'http://127.0.0.1:9/hook',
+						events: ['payment:received'],
+						allowPrivateNetwork: true
+					},
 					ADMIN_KEY
 				);
 				expect(hook.status, JSON.stringify(hook.body)).to.equal(200);

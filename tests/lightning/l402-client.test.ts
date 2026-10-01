@@ -14,6 +14,8 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import http from 'http';
+import { AddressInfo } from 'net';
 import {
 	buildL402AuthorizationHeader,
 	isHeaderSafeMacaroon,
@@ -27,6 +29,7 @@ import {
 } from '../../src/lightning/l402/macaroon';
 import {
 	defaultFeeCapSats,
+	FetchLike,
 	isPrivateNetworkUrl,
 	L402Error,
 	l402Fetch,
@@ -871,6 +874,370 @@ describe('l402Fetch payment safety', () => {
 		expect(payer.payments).to.equal(1);
 	});
 
+	it('sends a cross-origin credential to its issuer, never the redirector', async () => {
+		const pair = makeChallengePair(1_000n);
+		const seen: Array<{ at: 'a' | 'b'; authorization?: string }> = [];
+		const b = http.createServer((req, res) => {
+			seen.push({ at: 'b', authorization: req.headers.authorization });
+			const parsed = parseL402AuthorizationHeader(
+				req.headers.authorization ?? ''
+			);
+			if (parsed?.preimage === pair.preimage.toString('hex')) {
+				res.end('paid content');
+				return;
+			}
+			res.writeHead(402, {
+				'WWW-Authenticate': `L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`
+			});
+			res.end('payment required');
+		});
+		const a = http.createServer((req, res) => {
+			seen.push({ at: 'a', authorization: req.headers.authorization });
+			res.writeHead(302, { Location: `${bOrigin}/pay` });
+			res.end();
+		});
+		const listen = async (server: http.Server): Promise<string> => {
+			await new Promise<void>((resolve) =>
+				server.listen(0, '127.0.0.1', resolve)
+			);
+			return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+		};
+		const bOrigin = await listen(b);
+		const aOrigin = await listen(a);
+
+		try {
+			// Once with fetch following redirects itself, once hop by hop.
+			for (const checkRedirect of [undefined, (): void => {}]) {
+				seen.length = 0;
+				const payer = recordingPayer(pair.preimage);
+				const store = new MemoryL402CredentialStore();
+				const options = {
+					payer,
+					maxPriceSats: 10,
+					credentials: store,
+					allowCrossOriginChallenge: true,
+					checkRedirect
+				};
+
+				const paid = await l402Fetch(`${aOrigin}/start`, {}, options);
+				expect(seen.map((r) => [r.at, Boolean(r.authorization)])).to.deep.equal(
+					[
+						['a', false],
+						['b', false],
+						['b', true]
+					]
+				);
+				expect(paid.paid).to.equal(true);
+				expect(await paid.response.text()).to.equal('paid content');
+				expect(store.get(bOrigin)).to.not.equal(undefined);
+				expect(store.get(aOrigin)).to.equal(undefined);
+
+				// A later call finds the credential under B and reuses it there.
+				seen.length = 0;
+				const reused = await l402Fetch(`${aOrigin}/start`, {}, options);
+				expect(reused.paid).to.equal(false);
+				expect(await reused.response.text()).to.equal('paid content');
+				expect(payer.payments).to.equal(1);
+				expect(seen.map((r) => [r.at, Boolean(r.authorization)])).to.deep.equal(
+					[
+						['a', false],
+						['b', false],
+						['b', true]
+					]
+				);
+			}
+		} finally {
+			for (const server of [a, b]) {
+				server.closeAllConnections();
+				server.close();
+			}
+		}
+	});
+
+	it('refuses a cross-origin challenge to a POST, whose body a redirect may have dropped', async () => {
+		const pair = makeChallengePair(1_000n);
+		const payer = recordingPayer(pair.preimage);
+		let error: unknown;
+		try {
+			await l402Fetch(
+				'https://trusted.example/x',
+				{ method: 'POST', body: 'secret-body' },
+				{
+					payer,
+					maxPriceSats: 10,
+					allowCrossOriginChallenge: true,
+					fetchImpl: fixedChallengeServer(
+						`L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`,
+						'https://other.example/pay'
+					)
+				}
+			);
+		} catch (err) {
+			error = err;
+		}
+		expect((error as L402Error).code).to.equal('CROSS_ORIGIN_CHALLENGE');
+		expect(payer.payments).to.equal(0);
+	});
+
+	it('replaces a cross-origin credential its issuer rejects with 401', async () => {
+		const pair = makeChallengePair(1_000n);
+		const payer = recordingPayer(pair.preimage);
+		const store = new MemoryL402CredentialStore();
+		store.set({
+			scope: 'https://issuer.example',
+			macaroon: makeMacaroon(crypto.randomBytes(32)),
+			preimage: crypto.randomBytes(32).toString('hex'),
+			paymentHash: crypto.randomBytes(32).toString('hex'),
+			amountSats: 1,
+			createdAt: Date.now(),
+			scheme: 'L402'
+		});
+		const challenge = `L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`;
+		// Every request ends at the issuer: unauthenticated ones are
+		// challenged, and only the fresh credential is accepted.
+		const fetchImpl: FetchLike = async (_url, init) => {
+			const authorization = init?.headers?.Authorization;
+			const status = !authorization
+				? 402
+				: authorization.includes(pair.preimage.toString('hex'))
+				? 200
+				: 401;
+			return {
+				status,
+				url: 'https://issuer.example/pay',
+				headers: {
+					get: (name: string): string | null =>
+						status === 402 && name.toLowerCase() === 'www-authenticate'
+							? challenge
+							: null
+				},
+				text: async (): Promise<string> => ''
+			};
+		};
+
+		const result = await l402Fetch(
+			'https://redirector.example/x',
+			{},
+			{
+				payer,
+				maxPriceSats: 10,
+				credentials: store,
+				allowCrossOriginChallenge: true,
+				fetchImpl
+			}
+		);
+		expect(result.response.status).to.equal(200);
+		expect(result.paid).to.equal(true);
+		expect(store.get('https://issuer.example')?.preimage).to.equal(
+			pair.preimage.toString('hex')
+		);
+	});
+
+	it('keeps a cross-origin credential when a redirect past its issuer ends in 401', async () => {
+		const pair = makeChallengePair(1_000n);
+		const payer = recordingPayer(pair.preimage);
+		const store = new MemoryL402CredentialStore();
+		const heldPreimage = crypto.randomBytes(32).toString('hex');
+		store.set({
+			scope: 'https://issuer.example',
+			macaroon: makeMacaroon(crypto.randomBytes(32)),
+			preimage: heldPreimage,
+			paymentHash: crypto.randomBytes(32).toString('hex'),
+			amountSats: 1,
+			createdAt: Date.now(),
+			scheme: 'L402'
+		});
+		const challenge = `L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`;
+		// Unauthenticated requests end at the issuer's challenge. The issuer
+		// accepts the held credential and redirects to another origin, which
+		// answers 401 because the hop stripped the credential.
+		const fetchImpl: FetchLike = async (_url, init) => {
+			const authenticated = Boolean(init?.headers?.Authorization);
+			return {
+				status: authenticated ? 401 : 402,
+				url: authenticated
+					? 'https://downstream.example/x'
+					: 'https://issuer.example/pay',
+				headers: {
+					get: (name: string): string | null =>
+						!authenticated && name.toLowerCase() === 'www-authenticate'
+							? challenge
+							: null
+				},
+				text: async (): Promise<string> => ''
+			};
+		};
+
+		const result = await l402Fetch(
+			'https://redirector.example/x',
+			{},
+			{
+				payer,
+				maxPriceSats: 10,
+				credentials: store,
+				allowCrossOriginChallenge: true,
+				fetchImpl
+			}
+		);
+		expect(result.response.status).to.equal(401);
+		expect(result.paid).to.equal(false);
+		expect(payer.payments).to.equal(0);
+		expect(store.get('https://issuer.example')?.preimage).to.equal(
+			heldPreimage
+		);
+	});
+
+	describe('a credential a redirect kept from the responder', () => {
+		const servers: http.Server[] = [];
+		const seen: Array<[string, boolean]> = [];
+
+		/** Serve `handler` on its own origin, recording each request. */
+		async function serve(
+			name: string,
+			handler: (req: http.IncomingMessage, res: http.ServerResponse) => void
+		): Promise<string> {
+			const server = http.createServer((req, res) => {
+				seen.push([`${name}${req.url}`, Boolean(req.headers.authorization)]);
+				handler(req, res);
+			});
+			servers.push(server);
+			await new Promise<void>((resolve) =>
+				server.listen(0, '127.0.0.1', resolve)
+			);
+			return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+		}
+
+		function hold(
+			store: MemoryL402CredentialStore,
+			scope: string,
+			pair: ReturnType<typeof makeChallengePair>
+		): void {
+			store.set({
+				scope,
+				macaroon: pair.macaroon,
+				preimage: pair.preimage.toString('hex'),
+				paymentHash: pair.paymentHash.toString('hex'),
+				amountSats: 1,
+				createdAt: Date.now(),
+				scheme: 'L402'
+			});
+		}
+
+		/** 200 for the held credential, the replacement's challenge otherwise. */
+		function gate(
+			held: ReturnType<typeof makeChallengePair>,
+			replacement: ReturnType<typeof makeChallengePair>,
+			req: http.IncomingMessage,
+			res: http.ServerResponse
+		): void {
+			const parsed = parseL402AuthorizationHeader(
+				req.headers.authorization ?? ''
+			);
+			if (parsed?.preimage === held.preimage.toString('hex')) {
+				res.end('paid content');
+				return;
+			}
+			res.writeHead(402, {
+				'WWW-Authenticate': `L402 macaroon="${replacement.macaroon}", invoice="${replacement.invoice}"`
+			});
+			res.end('payment required');
+		}
+
+		beforeEach(() => {
+			seen.length = 0;
+		});
+
+		afterEach(() => {
+			for (const server of servers.splice(0)) {
+				server.closeAllConnections();
+				server.close();
+			}
+		});
+
+		it('keeps it when the redirect ends at another origin', async () => {
+			const held = makeChallengePair(1_000n);
+			const replacement = makeChallengePair(1_000n);
+			const bOrigin = await serve('b', (req, res) =>
+				gate(held, replacement, req, res)
+			);
+			const aOrigin = await serve('a', (_req, res) => {
+				res.writeHead(302, { Location: `${bOrigin}/pay` });
+				res.end();
+			});
+
+			// Once with fetch following redirects itself, once hop by hop.
+			for (const checkRedirect of [undefined, (): void => {}]) {
+				seen.length = 0;
+				const payer = recordingPayer(replacement.preimage);
+				const store = new MemoryL402CredentialStore();
+				hold(store, aOrigin, held);
+
+				let error: unknown;
+				try {
+					await l402Fetch(
+						`${aOrigin}/start`,
+						{},
+						{ payer, maxPriceSats: 10, credentials: store, checkRedirect }
+					);
+				} catch (err) {
+					error = err;
+				}
+				expect((error as L402Error).code).to.equal('CROSS_ORIGIN_CHALLENGE');
+				expect(seen).to.deep.equal([
+					['a/start', true],
+					['b/pay', false]
+				]);
+				expect(payer.payments).to.equal(0);
+				expect(store.get(aOrigin)?.preimage).to.equal(
+					held.preimage.toString('hex')
+				);
+			}
+		});
+
+		it('keeps it when the redirect passes through another origin and back', async () => {
+			const held = makeChallengePair(1_000n);
+			const replacement = makeChallengePair(1_000n);
+			let cOrigin = '';
+			const bOrigin = await serve('b', (req, res) => {
+				if (req.url === '/start') {
+					res.writeHead(302, { Location: `${cOrigin}/hop` });
+					res.end();
+					return;
+				}
+				gate(held, replacement, req, res);
+			});
+			cOrigin = await serve('c', (_req, res) => {
+				res.writeHead(302, { Location: `${bOrigin}/pay` });
+				res.end();
+			});
+			const payer = recordingPayer(replacement.preimage);
+			const store = new MemoryL402CredentialStore();
+			hold(store, bOrigin, held);
+
+			const result = await l402Fetch(
+				`${bOrigin}/start`,
+				{},
+				{
+					payer,
+					maxPriceSats: 10,
+					credentials: store,
+					checkRedirect: () => {}
+				}
+			);
+			expect(seen.slice(0, 3)).to.deep.equal([
+				['b/start', true],
+				['c/hop', false],
+				['b/pay', false]
+			]);
+			expect(result.response.status).to.equal(402);
+			expect(result.paid).to.equal(false);
+			expect(payer.payments).to.equal(0);
+			expect(store.get(bOrigin)?.preimage).to.equal(
+				held.preimage.toString('hex')
+			);
+		});
+	});
+
 	it('rejects a preimage that does not open the invoice hash', async () => {
 		const pair = makeChallengePair(1_000n);
 		const payer = recordingPayer(crypto.randomBytes(32)); // wrong preimage
@@ -1072,6 +1439,54 @@ describe('L402 concurrent calls and result hygiene', () => {
 		expect(a.amountPaidSats + b.amountPaidSats).to.equal(3);
 	});
 
+	it('keeps a credential another call paid for while a rejected one was in flight', async () => {
+		const server = createMockL402Server({ priceSats: 3 });
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => (release = resolve));
+		let calls = 0;
+		// Hold only the first request, so the second call pays and stores its
+		// credential before the first call's rejection comes back.
+		const fetchImpl: typeof server.fetchImpl = async (url, init) => {
+			const first = ++calls === 1;
+			const response = await server.fetchImpl(url, init);
+			if (first) await held;
+			return response;
+		};
+		const store = new MemoryL402CredentialStore();
+		const scope = credentialScope('https://mock.example');
+		store.set({
+			scope,
+			macaroon: makeMacaroon(crypto.randomBytes(32)),
+			preimage: crypto.randomBytes(32).toString('hex'),
+			paymentHash: crypto.randomBytes(32).toString('hex'),
+			amountSats: 1,
+			createdAt: Date.now(),
+			scheme: 'L402'
+		});
+		const opts = {
+			payer: server.payer,
+			maxPriceSats: 10,
+			credentials: store,
+			fetchImpl
+		};
+
+		const stale = l402Fetch('https://mock.example/data', {}, opts);
+		const paying = await l402Fetch('https://mock.example/data', {}, opts);
+		expect(paying.paid).to.equal(true);
+		release();
+		const result = await stale;
+
+		expect(result.response.status).to.equal(200);
+		expect(result.paid).to.equal(false);
+		expect(server.payer.payments).to.equal(1);
+		expect(result.credential?.paymentHash).to.equal(
+			paying.credential?.paymentHash
+		);
+		expect(store.get(scope)?.paymentHash).to.equal(
+			paying.credential?.paymentHash
+		);
+	});
+
 	it('does not report a credential this call already dropped', async () => {
 		const store = new MemoryL402CredentialStore();
 		store.set({
@@ -1206,6 +1621,310 @@ describe('isPrivateNetworkUrl', () => {
 			'https://[2001:db8::1]/x'
 		]) {
 			expect(isPrivateNetworkUrl(url), url).to.equal(false);
+		}
+	});
+});
+
+// ─────────────── Redirects are vetted hop by hop ───────────────
+
+describe('l402Fetch checkRedirect', () => {
+	interface IRecordedRequest {
+		url: string;
+		method?: string;
+		body?: string;
+		headers: Record<string, string>;
+		redirect?: string;
+	}
+
+	/**
+	 * Answers each URL with the [status, Location] in `redirects`, a 402 with
+	 * `challenge` when the request carries no Authorization and one is set, and
+	 * 200 otherwise.
+	 */
+	function redirectServer(
+		redirects: Record<string, [number, string]>,
+		challenge?: string
+	): { fetchImpl: FetchLike; requests: IRecordedRequest[] } {
+		const requests: IRecordedRequest[] = [];
+		const fetchImpl: FetchLike = async (url, init) => {
+			const headers = init?.headers ?? {};
+			requests.push({
+				url,
+				method: init?.method,
+				body: init?.body,
+				headers,
+				redirect: init?.redirect
+			});
+			if (challenge && !headers.Authorization) {
+				return {
+					status: 402,
+					url,
+					headers: {
+						get: (name: string): string | null =>
+							name.toLowerCase() === 'www-authenticate' ? challenge : null
+					},
+					text: async (): Promise<string> => 'payment required'
+				};
+			}
+			const hop = redirects[url];
+			return {
+				status: hop ? hop[0] : 200,
+				url,
+				headers: {
+					get: (name: string): string | null =>
+						hop && name.toLowerCase() === 'location' ? hop[1] : null
+				},
+				text: async (): Promise<string> => 'content'
+			};
+		};
+		return { fetchImpl, requests };
+	}
+
+	const refusePrivate = (target: string): void => {
+		if (isPrivateNetworkUrl(target)) throw new Error(`refused ${target}`);
+	};
+
+	async function rejection(promise: Promise<unknown>): Promise<Error> {
+		try {
+			await promise;
+		} catch (err) {
+			return err as Error;
+		}
+		throw new Error('expected a rejection');
+	}
+
+	it('refuses a redirect into a private target before requesting it', async () => {
+		const { fetchImpl, requests } = redirectServer({
+			'https://attacker.example/x': [
+				307,
+				'http://169.254.169.254/latest/api/token'
+			]
+		});
+		const error = await rejection(
+			l402Fetch(
+				'https://attacker.example/x',
+				{ method: 'POST', body: 'payload' },
+				{ maxPriceSats: 10, fetchImpl, checkRedirect: refusePrivate }
+			)
+		);
+		expect(error.message).to.contain('169.254.169.254');
+		expect(requests.map((r) => r.url)).to.deep.equal([
+			'https://attacker.example/x'
+		]);
+		expect(requests[0].redirect).to.equal('manual');
+	});
+
+	it('vets the redirect on the paid retry too', async () => {
+		const pair = makeChallengePair(1_000n);
+		const { fetchImpl, requests } = redirectServer(
+			{ 'https://api.example/x': [307, 'http://127.0.0.1:2112/admin'] },
+			`L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`
+		);
+		let payments = 0;
+		const error = await rejection(
+			l402Fetch(
+				'https://api.example/x',
+				{},
+				{
+					maxPriceSats: 10,
+					fetchImpl,
+					checkRedirect: refusePrivate,
+					payer: {
+						payInvoice: async (): Promise<{ preimage: Buffer }> => {
+							payments++;
+							return { preimage: pair.preimage };
+						}
+					}
+				}
+			)
+		);
+		expect(error.message).to.contain('127.0.0.1');
+		expect(payments).to.equal(1);
+		expect(requests.map((r) => r.url)).to.deep.equal([
+			'https://api.example/x',
+			'https://api.example/x'
+		]);
+	});
+
+	it('rewrites each hop the way fetch would', async () => {
+		const { fetchImpl, requests } = redirectServer({
+			'https://api.example/a': [307, '/b'],
+			'https://api.example/b': [302, 'https://api.example/c']
+		});
+		const result = await l402Fetch(
+			'https://api.example/a',
+			{
+				method: 'post',
+				body: 'payload',
+				headers: { 'Content-Type': 'application/json', 'X-Keep': '1' }
+			},
+			{ maxPriceSats: 10, fetchImpl, checkRedirect: refusePrivate }
+		);
+		expect(result.response.status).to.equal(200);
+		expect(result.response.url).to.equal('https://api.example/c');
+		// 307 keeps the method and body, against a relative Location.
+		expect(requests[1]).to.include({
+			url: 'https://api.example/b',
+			method: 'post',
+			body: 'payload'
+		});
+		expect(requests[1].headers).to.have.property('Content-Type');
+		// 302 turns a POST into a GET and drops the body with its headers.
+		expect(requests[2]).to.include({ method: 'GET', body: undefined });
+		expect(requests[2].headers).to.deep.equal({ 'X-Keep': '1' });
+	});
+
+	it('keeps a credential off a hop to another origin', async () => {
+		const pair = makeChallengePair(1_000n);
+		const store = new MemoryL402CredentialStore();
+		store.set({
+			scope: 'https://api.example',
+			macaroon: pair.macaroon,
+			preimage: pair.preimage.toString('hex'),
+			paymentHash: pair.paymentHash.toString('hex'),
+			amountSats: 1,
+			createdAt: Date.now(),
+			scheme: 'L402'
+		});
+		const { fetchImpl, requests } = redirectServer({
+			'https://api.example/a': [308, '/b'],
+			'https://api.example/b': [308, 'https://cdn.example/c']
+		});
+		await l402Fetch(
+			'https://api.example/a',
+			{},
+			{
+				maxPriceSats: 10,
+				fetchImpl,
+				credentials: store,
+				checkRedirect: refusePrivate
+			}
+		);
+		expect(requests.map((r) => Boolean(r.headers.Authorization))).to.deep.equal(
+			[true, true, false]
+		);
+	});
+
+	it('sees a cross-origin challenge from a fetch that reports no final URL', async () => {
+		const pair = makeChallengePair(1_000n);
+		const challenge = `L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`;
+		const requests: Array<[string, boolean]> = [];
+		// A redirects to B, which challenges. No response carries a url.
+		const fetchImpl: FetchLike = async (url, init) => {
+			const authorized = Boolean(init?.headers?.Authorization);
+			requests.push([url, authorized]);
+			const atA = url === 'https://a.example/x';
+			const status = atA ? 302 : authorized ? 200 : 402;
+			return {
+				status,
+				headers: {
+					get: (name: string): string | null => {
+						const lower = name.toLowerCase();
+						if (atA && lower === 'location') return 'https://b.example/pay';
+						if (status === 402 && lower === 'www-authenticate') {
+							return challenge;
+						}
+						return null;
+					}
+				},
+				text: async (): Promise<string> => ''
+			};
+		};
+		let payments = 0;
+		const options = {
+			maxPriceSats: 10,
+			fetchImpl,
+			checkRedirect: refusePrivate,
+			payer: {
+				payInvoice: async (): Promise<{ preimage: Buffer }> => {
+					payments++;
+					return { preimage: pair.preimage };
+				}
+			}
+		};
+
+		const error = await rejection(
+			l402Fetch('https://a.example/x', {}, options)
+		);
+		expect((error as L402Error).code).to.equal('CROSS_ORIGIN_CHALLENGE');
+		expect(payments).to.equal(0);
+
+		requests.length = 0;
+		const result = await l402Fetch(
+			'https://a.example/x',
+			{},
+			{ ...options, allowCrossOriginChallenge: true }
+		);
+		expect(result.paid).to.equal(true);
+		expect(result.response.status).to.equal(200);
+		expect(requests).to.deep.equal([
+			['https://a.example/x', false],
+			['https://b.example/pay', false],
+			['https://b.example/pay', true]
+		]);
+	});
+
+	it('gives up after 20 redirects', async () => {
+		const { fetchImpl, requests } = redirectServer({
+			'https://loop.example/a': [302, '/a']
+		});
+		const error = await rejection(
+			l402Fetch(
+				'https://loop.example/a',
+				{},
+				{ maxPriceSats: 10, fetchImpl, checkRedirect: refusePrivate }
+			)
+		);
+		expect(error.message).to.contain('more than 20 redirects');
+		expect(requests).to.have.length(21);
+	});
+
+	it('holds with the global fetch, which never reaches a refused hop', async () => {
+		const hits: string[] = [];
+		const server = http.createServer((req, res) => {
+			hits.push(`${req.method} ${req.url}`);
+			if (req.url === '/start') {
+				res.writeHead(307, { Location: '/internal' });
+				res.end('moved');
+				return;
+			}
+			res.end('internal');
+		});
+		await new Promise<void>((resolve) =>
+			server.listen(0, '127.0.0.1', resolve)
+		);
+		const start = `http://127.0.0.1:${
+			(server.address() as AddressInfo).port
+		}/start`;
+		try {
+			const error = await rejection(
+				l402Fetch(
+					start,
+					{ method: 'POST', body: 'payload' },
+					{
+						maxPriceSats: 10,
+						checkRedirect: (target) => {
+							if (new URL(target).pathname === '/internal') {
+								throw new Error('refused');
+							}
+						}
+					}
+				)
+			);
+			expect(error.message).to.equal('refused');
+			expect(hits).to.deep.equal(['POST /start']);
+
+			// A permitted hop is followed and its response returned.
+			const result = await l402Fetch(
+				start,
+				{ method: 'POST', body: 'payload' },
+				{ maxPriceSats: 10, checkRedirect: () => {} }
+			);
+			expect(await result.response.text()).to.equal('internal');
+			expect(hits.slice(1)).to.deep.equal(['POST /start', 'POST /internal']);
+		} finally {
+			server.closeAllConnections();
+			server.close();
 		}
 	});
 });

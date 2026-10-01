@@ -130,7 +130,9 @@ describe('beignet init mints an API token (issue #1005)', function () {
 			`second init failed. stderr: ${second.stderr}`
 		).to.equal(0);
 		expect(second.result.message).to.equal('Config already exists');
-		expect(second.result.mnemonic).to.equal(first.result.mnemonic);
+		// The seed is shown only by the init that creates it (issue #1045).
+		expect(second.result).to.not.have.property('mnemonic');
+		expect(second.stdout).to.not.include(String(first.result.mnemonic));
 		// The token exists, so it is neither replaced nor shown again.
 		expect(second.result).to.not.have.property('apiToken');
 		expect(readConfig().apiToken).to.equal(first.result.apiToken);
@@ -167,7 +169,7 @@ describe('beignet init mints an API token (issue #1005)', function () {
 		const init = await runInit(home);
 		expect(init.code, `init failed. stderr: ${init.stderr}`).to.equal(0);
 		expect(init.result.message).to.equal('Config already exists');
-		expect(init.result.mnemonic).to.equal(MNEMONIC);
+		expect(init.stdout).to.not.include(MNEMONIC);
 		expect(init.result.apiToken).to.match(/^[0-9a-f]{64}$/);
 		const saved = readConfig();
 		expect(saved.apiToken).to.equal(init.result.apiToken);

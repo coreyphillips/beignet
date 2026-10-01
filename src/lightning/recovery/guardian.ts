@@ -37,6 +37,7 @@ import {
 	receiptTranscriptHash,
 	recordTranscriptHash,
 	registerTranscriptHash,
+	retainTranscriptHash,
 	signTranscript,
 	stateBytes,
 	statesEqual,
@@ -179,8 +180,22 @@ export interface IGuardianRegisterNodeResponse {
 	current?: GuardianState;
 }
 
+/**
+ * The writer's retain floor (wire 5.2): the record at `sequence` is a
+ * snapshot whose whole group every guardian of the set holds, so the writer
+ * will never ask for anything below it again. Signed by the lease's writer
+ * key over the RETAIN transcript.
+ */
+export interface IGuardianRetainFloor {
+	sequence: bigint;
+	frameHash: Buffer;
+	writerSignature: Buffer;
+}
+
 export interface IGuardianPutStateRequest {
 	record: IGuardianRecord;
+	/** PUT_STATE only; SYNC_RECORD relays records and never frees any. */
+	retainFloor?: IGuardianRetainFloor;
 }
 
 export interface IGuardianPutStateResponse {
@@ -249,6 +264,11 @@ export interface IGuardianAcquireEpochResponse {
 
 export interface IGuardianSyncRecordRequest {
 	record: IGuardianRecord;
+	/**
+	 * The quorum that granted this guardian's lease, when the record belongs
+	 * to the epoch that lease superseded (wire 5.6).
+	 */
+	certificates?: IGuardianTakeoverCertificate[];
 }
 
 export interface IGuardianSyncRecordResponse {
@@ -332,6 +352,14 @@ export interface IReferenceGuardianConfig {
 	 * sets it per set (guardian-host.ts).
 	 */
 	maxContentBytes?: number;
+	/**
+	 * The same bound on the content one recovery_id stores, so a namespace
+	 * that reaches it cannot spend what the others in the store were left.
+	 * Absent runs unbounded.
+	 */
+	maxNamespaceContentBytes?: number;
+	/** Namespaces REGISTER_NODE may create; absent runs unbounded. */
+	maxNamespaces?: number;
 	/** Advertised GET_STATE page limit; the protocol caps it at 256. */
 	maxRecordsPerGet?: number;
 	/** Unix milliseconds; injectable so tests pin issuedAt. */
@@ -364,6 +392,21 @@ function logHeadsEqual(a: LogHead, b: LogHead): boolean {
 		a.frameHash.equals(b.frameHash) &&
 		a.ciphertextHash.equals(b.ciphertextHash)
 	);
+}
+
+/** Two states of one lease and origin, whatever their log heads. */
+function sameLease(a: GuardianState, b: GuardianState): boolean {
+	return statesEqual({ ...a, logHead: b.logHead }, b);
+}
+
+/** A verified quorum of takeover certificates (wire 5.7 steps 1 to 6). */
+interface ITakeoverBundle {
+	/** The superseded state at the highest head any signer granted over. */
+	certified: GuardianState;
+	/** Every head the signers granted over, the certified one included. */
+	heads: LogHead[];
+	newEpoch: bigint;
+	newWriterPublicKey: Buffer;
 }
 
 /**
@@ -657,6 +700,25 @@ export const GUARDIAN_REGISTRATION_BYTES =
  */
 export const GUARDIAN_EPOCH_ROW_MAX_BYTES =
 	32 + 8 + 32 + (192 + 8 + 64) + (192 + 8 + 64);
+/**
+ * A retain floor row: the recovery_id, the state, its issue time and
+ * signature, and the writer's frame hash and signature.
+ */
+export const GUARDIAN_RETAIN_FLOOR_BYTES = 32 + 192 + 8 + 64 + 32 + 64;
+
+/** What accepting a writer's retain floor would free and store (wire 5.2). */
+interface IRetainPlan {
+	/** The first sequence kept. */
+	start: bigint;
+	/** The writer's floor, kept so the row answers to the writer's key. */
+	floor: IGuardianRetainFloor;
+	/** The state just before `start`, where the open-time walk resumes. */
+	checkpoint: GuardianState;
+	/** Content bytes of the records below `start`, orphans included. */
+	freed: number;
+	/** The floor row's size, new minus old. */
+	rowDelta: number;
+}
 
 /**
  * What a mutating verb costs the store, judged from the namespace row
@@ -676,19 +738,23 @@ interface IWriteCost {
 	 * replaced (new minus old) at the price of a scan of its rows.
 	 */
 	exact?: boolean;
+	/** True for REGISTER_NODE: an absent row is a namespace this write adds. */
+	opensNamespace?: boolean;
 }
+
+type QuotaScope = 'set' | 'namespace';
 
 /** Thrown inside a write transaction to roll it back at the quota. */
 class QuotaRollback extends Error {
-	constructor() {
+	constructor(readonly scope: QuotaScope) {
 		super('write would cross the content quota');
 	}
 }
 
-function quotaRefusal(): IErr {
+function quotaRefusal(scope: QuotaScope): IErr {
 	return err(
 		GuardianStatus.ERR_QUOTA_EXCEEDED,
-		"this guardian's content quota for the set is exhausted"
+		`this guardian's content quota for the ${scope} is exhausted`
 	);
 }
 
@@ -709,6 +775,8 @@ export class ReferenceGuardian {
 	private readonly maxCiphertextBytes: number;
 	private readonly maxRecordsPerGet: number;
 	private readonly maxContentBytes: number | undefined;
+	private readonly maxNamespaceContentBytes: number | undefined;
+	private readonly maxNamespaces: number | undefined;
 	private readonly clock: () => bigint;
 	private readonly onAlarm?: (alarm: IGuardianAlarm) => void;
 	/**
@@ -765,13 +833,19 @@ export class ReferenceGuardian {
 			throw new Error('maxRecordsPerGet must be between 1 and 256');
 		}
 		this.maxRecordsPerGet = maxRecords;
-		if (
-			config.maxContentBytes !== undefined &&
-			(!Number.isInteger(config.maxContentBytes) || config.maxContentBytes < 0)
-		) {
-			throw new Error('maxContentBytes must be a non-negative integer');
+		for (const limit of [
+			'maxContentBytes',
+			'maxNamespaceContentBytes',
+			'maxNamespaces'
+		] as const) {
+			const value = config[limit];
+			if (value !== undefined && (!Number.isInteger(value) || value < 0)) {
+				throw new Error(`${limit} must be a non-negative integer`);
+			}
 		}
 		this.maxContentBytes = config.maxContentBytes;
+		this.maxNamespaceContentBytes = config.maxNamespaceContentBytes;
+		this.maxNamespaces = config.maxNamespaces;
 		this.clock = config.clock ?? ((): bigint => BigInt(Date.now()));
 		this.onAlarm = config.onAlarm;
 		this.store = new GuardianStore(config.path);
@@ -780,7 +854,7 @@ export class ReferenceGuardian {
 			// The content counter is re-derived from the rows at every open,
 			// after the open-time walk has archived what it archives, so a
 			// restart recovers it exactly and never trusts a stale number.
-			this.store.write(() => this.store.resetUsage(this.store.contentBytes()));
+			this.store.write(() => this.store.resetUsage());
 		} catch (error) {
 			this.store.close();
 			throw error;
@@ -813,19 +887,16 @@ export class ReferenceGuardian {
 	}
 
 	/**
-	 * The encoded bytes this guardian's store holds: the maintained counter
-	 * for the whole store (what the quota is judged against), or a
-	 * measurement of one namespace's rows.
+	 * The encoded bytes this guardian's store holds, in total or under one
+	 * recovery_id: the maintained counters the quotas are judged against.
 	 */
 	contentBytes(recoveryId?: Buffer): number {
-		return this.store.read(() =>
-			recoveryId ? this.store.contentBytes(recoveryId) : this.store.usageBytes()
-		);
+		return this.store.read(() => this.store.usageBytes(recoveryId));
 	}
 
-	/** The counter's truth, measured from every row; for audits and tests. */
-	auditContentBytes(): number {
-		return this.store.read(() => this.store.contentBytes());
+	/** The counters' truth, measured from the rows; for audits and tests. */
+	auditContentBytes(recoveryId?: Buffer): number {
+		return this.store.read(() => this.store.contentBytes(recoveryId));
 	}
 
 	/** Orphan-archive audit view (never served by GET_STATE). */
@@ -1027,7 +1098,8 @@ export class ReferenceGuardian {
 				// conservative early refusal within GUARDIAN_REGISTRATION_BYTES
 				// of the limit, charged exactly from the measurement.
 				delta: (ns): number =>
-					ns && ns.registrationState ? 0 : GUARDIAN_REGISTRATION_BYTES
+					ns && ns.registrationState ? 0 : GUARDIAN_REGISTRATION_BYTES,
+				opensNamespace: true
 			};
 			const outcome = this.fencedWrite(state.recoveryId, cost, (ns) => {
 				if (ns && ns.registrationState) {
@@ -1090,6 +1162,8 @@ export class ReferenceGuardian {
 				} else {
 					this.store.insertNamespace(row);
 				}
+				// A new chain starts at its origin.
+				this.store.deleteRetainFloor(state.recoveryId);
 				this.store.insertEpoch({
 					recoveryId: Buffer.from(state.recoveryId),
 					epoch: u64be(state.lease.epoch),
@@ -1139,7 +1213,7 @@ export class ReferenceGuardian {
 	// ─────────────── PUT_STATE and SYNC_RECORD (wire 5.2, 5.6) ───────────────
 
 	putState(request: IGuardianPutStateRequest): IGuardianPutStateResponse {
-		return this.appendRecord(request.record, false);
+		return this.appendRecord(request.record, false, request.retainFloor);
 	}
 
 	/**
@@ -1149,7 +1223,12 @@ export class ReferenceGuardian {
 	 * ever appends at the current state; there is no insert-behind-head.
 	 */
 	syncRecord(request: IGuardianSyncRecordRequest): IGuardianSyncRecordResponse {
-		const result = this.appendRecord(request.record, true);
+		const result = this.appendRecord(
+			request.record,
+			true,
+			undefined,
+			request.certificates
+		);
 		const response: IGuardianSyncRecordResponse = { status: result.status };
 		if (result.detail !== undefined) response.detail = result.detail;
 		if (result.receipt) response.receipt = result.receipt;
@@ -1158,7 +1237,9 @@ export class ReferenceGuardian {
 
 	private appendRecord(
 		record: IGuardianRecord,
-		isSync: boolean
+		isSync: boolean,
+		retainFloor?: IGuardianRetainFloor,
+		certificates?: IGuardianTakeoverCertificate[]
 	): IGuardianPutStateResponse {
 		try {
 			const gate = this.versionAndSetProblem(
@@ -1211,12 +1292,37 @@ export class ReferenceGuardian {
 					`ciphertext exceeds the advertised limit of ${this.maxCiphertextBytes} bytes`
 				);
 			}
+			if (
+				retainFloor &&
+				(!validU64(retainFloor.sequence) ||
+					retainFloor.sequence === 0n ||
+					!isLen(retainFloor.frameHash, 32) ||
+					!isLen(retainFloor.writerSignature, 64))
+			) {
+				return err(GuardianStatus.ERR_MALFORMED, 'retain floor malformed');
+			}
+			let bundle: ITakeoverBundle | null = null;
+			if (isSync && certificates && certificates.length > 0) {
+				const verified = this.takeoverBundle(certificates);
+				if ('status' in verified) return verified;
+				if (!verified.certified.recoveryId.equals(record.recoveryId)) {
+					return err(
+						GuardianStatus.ERR_CERT_MISMATCH,
+						'certificates belong to a different recovery_id'
+					);
+				}
+				bundle = verified;
+			}
 			const ciphertextHash = sha256(record.ciphertext);
 			const quarantine = this.quarantineGate(record.recoveryId);
 			if (quarantine) return quarantine;
 
 			const rowBytes =
 				GUARDIAN_RECORD_OVERHEAD_BYTES + record.ciphertext.length;
+			// Judged once, from the row under the write lock, by the cost
+			// below: what the floor frees has to count before the quota gate,
+			// or a set already at its quota could never shrink.
+			let plan: IRetainPlan | IErr | null = null;
 			const cost: IWriteCost = {
 				// An append inside the stored range is a replay or a conflict,
 				// answered from the stored row; anything else that lands costs
@@ -1225,15 +1331,20 @@ export class ReferenceGuardian {
 					if (!ns || !ns.state || !ns.registrationState) return 0;
 					const held = tryParseState(ns.state);
 					if (!held) return 0;
+					plan = retainFloor ? this.retainPlan(ns, record, retainFloor) : null;
+					const floorGrowth =
+						plan && !('status' in plan) ? plan.rowDelta - plan.freed : 0;
 					const inRange =
 						!isGenesisLogHead(held.logHead) &&
 						record.sequence >= held.origin.firstSequence &&
 						record.sequence <= held.logHead.sequence;
-					return inRange ? 0 : rowBytes;
+					return (inRange ? 0 : rowBytes) + floorGrowth;
 				},
 				exact: true
 			};
 			return this.fencedWrite(record.recoveryId, cost, (ns, charge) => {
+				const planned = plan as IRetainPlan | IErr | null;
+				if (planned && 'status' in planned) return planned;
 				if (!ns) {
 					return err(
 						GuardianStatus.ERR_UNKNOWN_NODE,
@@ -1253,6 +1364,24 @@ export class ReferenceGuardian {
 					);
 				}
 				const state = parseStateBytes(ns.state);
+
+				// A freed record can be neither replayed nor compared; steer the
+				// sender to the head, as for any other out-of-place sequence.
+				const retainedFrom = this.retainedFrom(record.recoveryId, state);
+				if (
+					record.sequence >= state.origin.firstSequence &&
+					record.sequence < retainedFrom
+				) {
+					return {
+						...err(
+							GuardianStatus.ERR_SEQUENCE_GAP,
+							`records below ${retainedFrom} were freed at the writer's retain floor; expected sequence ${
+								state.logHead.sequence + 1n
+							}`
+						),
+						current: state
+					};
+				}
 
 				// Idempotency and conflict detection against the occupied slot.
 				if (
@@ -1305,6 +1434,9 @@ export class ReferenceGuardian {
 								'writer signature over the RECORD transcript failed'
 							);
 						}
+						if (planned) {
+							this.applyRetainFloor(record.recoveryId, planned, charge);
+						}
 						return {
 							status: GuardianStatus.OK_DUPLICATE,
 							receipt: this.storedReceipt(ns)
@@ -1326,6 +1458,11 @@ export class ReferenceGuardian {
 				}
 
 				if (record.epoch !== state.lease.epoch) {
+					const extended =
+						bundle && record.epoch < state.lease.epoch
+							? this.extendGrant(state, record, ciphertextHash, bundle, charge)
+							: null;
+					if (extended) return extended;
 					return {
 						...err(
 							GuardianStatus.ERR_EPOCH_SUPERSEDED,
@@ -1411,6 +1548,9 @@ export class ReferenceGuardian {
 					u64be(receipt.issuedAt),
 					receipt.signature
 				);
+				if (planned) {
+					this.applyRetainFloor(record.recoveryId, planned, charge);
+				}
 				return {
 					status: GuardianStatus.OK,
 					receipt: this.toReceipt(newState, receipt.issuedAt, receipt.signature)
@@ -1419,6 +1559,250 @@ export class ReferenceGuardian {
 		} catch (error) {
 			return this.internalError(error);
 		}
+	}
+
+	/**
+	 * SYNC_RECORD with a takeover bundle (wire 5.6). A guardian that granted
+	 * its lease over a lower head of the superseded epoch than the quorum
+	 * certified takes that epoch's records up to the certified head. Its own
+	 * certificate keeps the head it was granted over: rewriting it would hide
+	 * a quorum at that head that a later bundle needs to see as a conflict.
+	 * Null when the bundle does not apply: the record is then fenced like any
+	 * other.
+	 */
+	private extendGrant(
+		state: GuardianState,
+		record: IGuardianRecord,
+		ciphertextHash: Buffer,
+		bundle: ITakeoverBundle,
+		charge: (bytes: number) => void
+	): IGuardianPutStateResponse | null {
+		const recoveryId = record.recoveryId;
+		const certified = bundle.certified;
+		if (
+			bundle.newEpoch !== state.lease.epoch ||
+			!bundle.newWriterPublicKey.equals(state.lease.writerPublicKey) ||
+			record.epoch !== certified.lease.epoch ||
+			record.sequence > certified.logHead.sequence
+		) {
+			return null;
+		}
+		// Nothing may have been written under the lease since the grant: its
+		// head is the one this guardian's certificate fixed, or a record of
+		// the superseded epoch an earlier extension took.
+		const row = this.store.getEpoch(recoveryId, u64be(state.lease.epoch));
+		const granted = row ? tryParseState(row.certSupersededState) : null;
+		if (
+			!row ||
+			!granted ||
+			!row.writerPublicKey.equals(state.lease.writerPublicKey) ||
+			!sameLease(granted, certified) ||
+			(!logHeadsEqual(granted.logHead, state.logHead) &&
+				state.logHead.recordEpoch !== certified.lease.epoch)
+		) {
+			return null;
+		}
+		const transcript = recordTranscriptHash(this.guardianSetId, {
+			recoveryId,
+			epoch: record.epoch,
+			sequence: record.sequence,
+			previousHash: record.previousHash,
+			frameHash: record.frameHash,
+			ciphertextHash
+		});
+		if (
+			!this.safeVerify(
+				transcript,
+				record.writerSignature,
+				certified.lease.writerPublicKey
+			)
+		) {
+			return err(
+				GuardianStatus.ERR_BAD_SIGNATURE,
+				'writer signature over the RECORD transcript failed'
+			);
+		}
+		const genesis = isGenesisLogHead(state.logHead);
+		const expectedSequence = genesis
+			? state.origin.firstSequence
+			: state.logHead.sequence + 1n;
+		const expectedPrevious = genesis
+			? state.origin.previousHash
+			: state.logHead.frameHash;
+		if (record.sequence !== expectedSequence) {
+			return {
+				...err(
+					GuardianStatus.ERR_SEQUENCE_GAP,
+					`expected sequence ${expectedSequence}`
+				),
+				current: state
+			};
+		}
+		if (!record.previousHash.equals(expectedPrevious)) {
+			return {
+				...err(
+					GuardianStatus.ERR_PREV_HASH_MISMATCH,
+					'previousHash does not extend the current head'
+				),
+				current: state
+			};
+		}
+		const head: LogHead = {
+			sequence: record.sequence,
+			frameHash: Buffer.from(record.frameHash),
+			ciphertextHash,
+			recordEpoch: record.epoch
+		};
+		for (const named of bundle.heads) {
+			if (named.sequence > record.sequence) continue;
+			if (named.sequence < record.sequence) {
+				const problem = this.headOffLog(recoveryId, state, named);
+				if (problem) return problem;
+			} else if (!logHeadsEqual(named, head)) {
+				this.alarm(
+					recoveryId,
+					GuardianStatus.ERR_CONFLICT,
+					`certified head conflicts with the relayed record at sequence ${head.sequence}`
+				);
+				return err(
+					GuardianStatus.ERR_CONFLICT,
+					'certified head conflicts with the relayed record'
+				);
+			}
+		}
+
+		this.store.insertRecord({
+			recoveryId: Buffer.from(recoveryId),
+			sequence: u64be(record.sequence),
+			epoch: u64be(record.epoch),
+			previousHash: Buffer.from(record.previousHash),
+			frameHash: Buffer.from(record.frameHash),
+			ciphertextHash,
+			ciphertext: Buffer.from(record.ciphertext),
+			writerSignature: Buffer.from(record.writerSignature)
+		});
+		charge(GUARDIAN_RECORD_OVERHEAD_BYTES + record.ciphertext.length);
+		const newState: GuardianState = { ...state, logHead: head };
+		const receipt = this.signReceipt(newState);
+		this.store.updateNamespaceState(
+			recoveryId,
+			stateBytes(newState),
+			u64be(receipt.issuedAt),
+			receipt.signature
+		);
+		return {
+			status: GuardianStatus.OK,
+			receipt: this.toReceipt(newState, receipt.issuedAt, receipt.signature)
+		};
+	}
+
+	/**
+	 * The first sequence a namespace still stores: its origin, or where the
+	 * writer's retain floor let the records below go.
+	 */
+	private retainedFrom(recoveryId: Buffer, state: GuardianState): bigint {
+		const row = this.store.getRetainFloor(recoveryId);
+		const floor = row ? tryParseState(row.state) : null;
+		return floor ? floor.logHead.sequence + 1n : state.origin.firstSequence;
+	}
+
+	/**
+	 * Inside the write transaction: what a writer's retain floor lets this
+	 * guardian free (wire 5.2), or null when it frees nothing here yet. The
+	 * floor must name a record this guardian holds, above what it already
+	 * freed, by the frame hash it holds there, and carry the current lease's
+	 * signature. That lease must also have written the record, so the floor
+	 * row, which starts at that record's lease, can be checked against the
+	 * writer's signature on every open. A floor this guardian cannot act on
+	 * is not an error: a lagging member meets it before it holds the
+	 * snapshot.
+	 */
+	private retainPlan(
+		ns: IGuardianNamespaceRow,
+		record: IGuardianRecord,
+		floor: IGuardianRetainFloor
+	): IRetainPlan | IErr | null {
+		if (!ns.state || ns.possiblyStale) return null;
+		const state = parseStateBytes(ns.state);
+		if (record.epoch !== state.lease.epoch) return null;
+		if (isGenesisLogHead(state.logHead)) return null;
+		const start = this.retainedFrom(ns.recoveryId, state);
+		if (floor.sequence <= start || floor.sequence > state.logHead.sequence) {
+			return null;
+		}
+		const kept = this.store.getRecord(ns.recoveryId, u64be(floor.sequence));
+		const last = this.store.getRecord(
+			ns.recoveryId,
+			u64be(floor.sequence - 1n)
+		);
+		if (
+			!kept ||
+			!last ||
+			!kept.frameHash.equals(floor.frameHash) ||
+			readU64be(kept.epoch) !== state.lease.epoch
+		) {
+			return null;
+		}
+		const transcript = retainTranscriptHash(this.guardianSetId, {
+			recoveryId: ns.recoveryId,
+			epoch: state.lease.epoch,
+			sequence: floor.sequence,
+			frameHash: floor.frameHash
+		});
+		if (
+			!this.safeVerify(
+				transcript,
+				floor.writerSignature,
+				state.lease.writerPublicKey
+			)
+		) {
+			return err(
+				GuardianStatus.ERR_BAD_SIGNATURE,
+				'writer signature over the RETAIN transcript failed'
+			);
+		}
+		const held = this.store.getRetainFloor(ns.recoveryId);
+		return {
+			start: floor.sequence,
+			floor,
+			// The walk's state as it reaches the first kept record: that
+			// record's lease, and the head of the record before it.
+			checkpoint: {
+				recoveryId: Buffer.from(state.recoveryId),
+				lease: {
+					epoch: state.lease.epoch,
+					writerPublicKey: Buffer.from(state.lease.writerPublicKey)
+				},
+				origin: state.origin,
+				logHead: {
+					sequence: floor.sequence - 1n,
+					frameHash: Buffer.from(last.frameHash),
+					ciphertextHash: Buffer.from(last.ciphertextHash),
+					recordEpoch: readU64be(last.epoch)
+				}
+			},
+			freed: this.store.recordBytesBelow(ns.recoveryId, u64be(floor.sequence)),
+			rowDelta: held ? 0 : GUARDIAN_RETAIN_FLOOR_BYTES
+		};
+	}
+
+	/** Free the records below the floor and store where the walk resumes. */
+	private applyRetainFloor(
+		recoveryId: Buffer,
+		plan: IRetainPlan,
+		charge: (bytes: number) => void
+	): void {
+		this.store.deleteRecordsBelow(recoveryId, u64be(plan.start));
+		const receipt = this.signReceipt(plan.checkpoint);
+		this.store.setRetainFloor({
+			recoveryId: Buffer.from(recoveryId),
+			state: stateBytes(plan.checkpoint),
+			issuedAt: u64be(receipt.issuedAt),
+			signature: receipt.signature,
+			frameHash: Buffer.from(plan.floor.frameHash),
+			writerSignature: Buffer.from(plan.floor.writerSignature)
+		});
+		charge(plan.rowDelta - plan.freed);
 	}
 
 	/**
@@ -1469,16 +1853,18 @@ export class ReferenceGuardian {
 	 *
 	 * The content quota (issue #710) is judged here too, in this order:
 	 *
-	 *   3b. after retirement and before any row-specific verdict, the
-	 *       write's cost (IWriteCost.delta, judged from the row under this
-	 *       lock) against the counter read under this lock: a write that
-	 *       would cross maxContentBytes is ERR_QUOTA_EXCEEDED. Two writers,
-	 *       in this process or another, therefore never admit against the
-	 *       same starting total, and a retired namespace is told so before
-	 *       it is told about space.
+	 *   3b. after retirement and before any row-specific verdict, a
+	 *       registration that would add a namespace past maxNamespaces,
+	 *       then the write's cost (IWriteCost.delta, judged from the row
+	 *       under this lock) against the counters read under this lock: a
+	 *       write that would cross maxContentBytes for the store, or
+	 *       maxNamespaceContentBytes for its own recovery_id, is
+	 *       ERR_QUOTA_EXCEEDED. Two writers, in this process or another,
+	 *       therefore never admit against the same starting total, and a
+	 *       retired namespace is told so before it is told about space.
 	 *   5.  after the body ran, what it actually wrote (charged exactly by
 	 *       the body, or measured on the namespace's rows) is charged to
-	 *       the counter, and if that real growth would still cross the
+	 *       both counters, and if that real growth would still cross either
 	 *       quota the whole transaction is rolled back: the estimate
 	 *       decides precedence, the measurement is the hard bound.
 	 *
@@ -1506,8 +1892,19 @@ export class ReferenceGuardian {
 						'this namespace was rotated to another guardian set; GET_HEAD carries the rotation'
 					);
 				}
-				const gate = this.quotaGate(cost.delta(ns));
-				if (gate) return gate;
+				if (
+					cost.opensNamespace &&
+					!ns &&
+					this.maxNamespaces !== undefined &&
+					this.store.countNamespaces() >= this.maxNamespaces
+				) {
+					return err(
+						GuardianStatus.ERR_QUOTA_EXCEEDED,
+						`this guardian registers at most ${this.maxNamespaces} namespaces for the set`
+					);
+				}
+				const scope = this.quotaExceeded(recoveryId, cost.delta(ns));
+				if (scope) return quotaRefusal(scope);
 				const before = cost.exact ? 0 : this.store.contentBytes(recoveryId);
 				let written = 0;
 				const result = body(ns, (bytes: number): void => {
@@ -1516,39 +1913,43 @@ export class ReferenceGuardian {
 				if (!cost.exact) {
 					written = this.store.contentBytes(recoveryId) - before;
 				}
-				this.chargeOrRollBack(written);
+				this.chargeOrRollBack(recoveryId, written);
 				return result;
 			});
 		} catch (error) {
-			if (error instanceof QuotaRollback) return quotaRefusal();
+			if (error instanceof QuotaRollback) return quotaRefusal(error.scope);
 			throw error;
 		}
 	}
 
-	/** Inside a write transaction: refuse a cost the counter cannot absorb. */
-	private quotaGate(delta: number): IErr | null {
-		if (this.maxContentBytes === undefined || delta <= 0) return null;
-		if (this.store.usageBytes() + delta > this.maxContentBytes) {
-			return quotaRefusal();
+	/** Inside a write transaction: which quota, if any, a cost would cross. */
+	private quotaExceeded(recoveryId: Buffer, delta: number): QuotaScope | null {
+		if (delta <= 0) return null;
+		if (
+			this.maxContentBytes !== undefined &&
+			this.store.usageBytes() + delta > this.maxContentBytes
+		) {
+			return 'set';
+		}
+		if (
+			this.maxNamespaceContentBytes !== undefined &&
+			this.store.usageBytes(recoveryId) + delta > this.maxNamespaceContentBytes
+		) {
+			return 'namespace';
 		}
 		return null;
 	}
 
 	/**
-	 * Inside a write transaction, after its writes: advance the counter by
+	 * Inside a write transaction, after its writes: advance the counters by
 	 * what was written, or roll the transaction back if that growth crosses
-	 * the quota after all (an estimate below the truth never lands a write).
+	 * a quota after all (an estimate below the truth never lands a write).
 	 */
-	private chargeOrRollBack(written: number): void {
+	private chargeOrRollBack(recoveryId: Buffer, written: number): void {
 		if (written === 0) return;
-		if (
-			written > 0 &&
-			this.maxContentBytes !== undefined &&
-			this.store.usageBytes() + written > this.maxContentBytes
-		) {
-			throw new QuotaRollback();
-		}
-		this.store.chargeUsage(written);
+		const scope = this.quotaExceeded(recoveryId, written);
+		if (scope) throw new QuotaRollback(scope);
+		this.store.chargeUsage(recoveryId, written);
 	}
 
 	/**
@@ -1715,8 +2116,8 @@ export class ReferenceGuardian {
 					ns.rotation !== null && ns.rotation.equals(encoded)
 						? 0
 						: encoded.length - storedBytes;
-				const quota = this.quotaGate(delta);
-				if (quota) return quota;
+				const scope = this.quotaExceeded(request.recoveryId, delta);
+				if (scope) return quotaRefusal(scope);
 				if (ns.rotation !== null) {
 					const stored = decodeRotateSetRequest(ns.rotation);
 					if (ns.rotation.equals(encoded)) {
@@ -1744,7 +2145,7 @@ export class ReferenceGuardian {
 					);
 				}
 				this.store.setRotation(request.recoveryId, encoded);
-				this.chargeOrRollBack(delta);
+				this.chargeOrRollBack(request.recoveryId, delta);
 				return { status: GuardianStatus.OK, rotation: request };
 			});
 			return outcome;
@@ -2102,133 +2503,234 @@ export class ReferenceGuardian {
 
 	// ─────────────── SYNC_EPOCH (wire 5.7) ───────────────
 
-	syncEpoch(request: IGuardianSyncEpochRequest): IGuardianSyncEpochResponse {
-		try {
-			const certs = request.certificates;
-			if (!Array.isArray(certs) || certs.length === 0) {
-				return err(GuardianStatus.ERR_MALFORMED, 'certificate bundle is empty');
+	/**
+	 * Whether a head a takeover certificate names lies on this guardian's
+	 * log, which reaches at least its sequence: null when it does,
+	 * ERR_CONFLICT (alarmed) when its records were freed or another record
+	 * holds its position.
+	 */
+	private headOffLog(
+		recoveryId: Buffer,
+		local: GuardianState,
+		head: LogHead
+	): IErr | null {
+		if (isGenesisLogHead(head) || logHeadsEqual(local.logHead, head)) {
+			return null;
+		}
+		if (head.sequence < this.retainedFrom(recoveryId, local)) {
+			// Only a quorum-held snapshot becomes a floor, and a takeover
+			// cannot certify below a quorum-held record.
+			this.alarm(
+				recoveryId,
+				GuardianStatus.ERR_CONFLICT,
+				`certified head ${head.sequence} lies below the writer's retain floor`
+			);
+			return err(
+				GuardianStatus.ERR_CONFLICT,
+				'certified head lies below the retain floor; its records were freed'
+			);
+		}
+		const stored = this.store.getRecord(recoveryId, u64be(head.sequence));
+		if (!stored) {
+			throw new Error(
+				'stored log is missing the certified sequence inside its own range'
+			);
+		}
+		if (
+			!stored.frameHash.equals(head.frameHash) ||
+			!stored.ciphertextHash.equals(head.ciphertextHash) ||
+			readU64be(stored.epoch) !== head.recordEpoch
+		) {
+			this.alarm(
+				recoveryId,
+				GuardianStatus.ERR_CONFLICT,
+				`certified head conflicts with the stored record at sequence ${head.sequence}`
+			);
+			return err(
+				GuardianStatus.ERR_CONFLICT,
+				'certified head conflicts with a stored record'
+			);
+		}
+		return null;
+	}
+
+	/** Whether a head lies on this guardian's stored log, without alarming. */
+	private headOnLog(recoveryId: Buffer, head: LogHead): boolean {
+		if (isGenesisLogHead(head)) return true;
+		const stored = this.store.getRecord(recoveryId, u64be(head.sequence));
+		return (
+			stored !== null &&
+			recordRowProblem(stored) === null &&
+			stored.frameHash.equals(head.frameHash) &&
+			stored.ciphertextHash.equals(head.ciphertextHash) &&
+			readU64be(stored.epoch) === head.recordEpoch
+		);
+	}
+
+	/**
+	 * SYNC_EPOCH steps 1 to 6 (wire 5.7), shared with the bundle SYNC_RECORD
+	 * may carry (5.6). Signers may have granted one key over different heads
+	 * of the superseded lease, when a resumed acquisition moved its guard.
+	 * Every signer is fenced at its own head, so no record above the highest
+	 * of them reached a quorum, and that head is the one certified.
+	 */
+	private takeoverBundle(
+		certs: IGuardianTakeoverCertificate[]
+	): ITakeoverBundle | IErr {
+		if (!Array.isArray(certs) || certs.length === 0) {
+			return err(GuardianStatus.ERR_MALFORMED, 'certificate bundle is empty');
+		}
+		if (certs.length > CRASH_V1_PROFILE.total) {
+			return err(
+				GuardianStatus.ERR_MALFORMED,
+				'more certificates than guardians in the set'
+			);
+		}
+		for (const cert of certs) {
+			const shape = this.stateShapeProblem(cert.supersededState);
+			if (shape) return err(GuardianStatus.ERR_MALFORMED, shape);
+			if (!isLen(cert.guardianId, 32)) {
+				return err(GuardianStatus.ERR_MALFORMED, 'guardianId must be 32 bytes');
 			}
-			if (certs.length > CRASH_V1_PROFILE.total) {
+			if (!isLen(cert.newWriterPublicKey, 32)) {
 				return err(
 					GuardianStatus.ERR_MALFORMED,
-					'more certificates than guardians in the set'
+					'new writer public key must be 32 bytes'
 				);
 			}
-			for (const cert of certs) {
-				const shape = this.stateShapeProblem(cert.supersededState);
-				if (shape) return err(GuardianStatus.ERR_MALFORMED, shape);
-				if (!isLen(cert.guardianId, 32)) {
-					return err(
-						GuardianStatus.ERR_MALFORMED,
-						'guardianId must be 32 bytes'
-					);
-				}
-				if (!isLen(cert.newWriterPublicKey, 32)) {
-					return err(
-						GuardianStatus.ERR_MALFORMED,
-						'new writer public key must be 32 bytes'
-					);
-				}
-				if (!isLen(cert.signature, 64)) {
-					return err(
-						GuardianStatus.ERR_MALFORMED,
-						'signature must be 64 bytes'
-					);
-				}
-				if (!validU64(cert.newEpoch) || cert.newEpoch === 0n) {
-					return err(
-						GuardianStatus.ERR_MALFORMED,
-						'newEpoch must be a nonzero u64'
-					);
-				}
-				if (!validU64(cert.issuedAt)) {
-					return err(GuardianStatus.ERR_MALFORMED, 'issuedAt must be a u64');
-				}
+			if (!isLen(cert.signature, 64)) {
+				return err(GuardianStatus.ERR_MALFORMED, 'signature must be 64 bytes');
 			}
-			const reference = certs[0];
-			const referenceSuperseded = stateBytes(reference.supersededState);
+			if (!validU64(cert.newEpoch) || cert.newEpoch === 0n) {
+				return err(
+					GuardianStatus.ERR_MALFORMED,
+					'newEpoch must be a nonzero u64'
+				);
+			}
+			if (!validU64(cert.issuedAt)) {
+				return err(GuardianStatus.ERR_MALFORMED, 'issuedAt must be a u64');
+			}
+		}
+		const reference = certs[0];
 
-			// Step 1: identical protocol_version, guardian_set_id, recovery_id,
-			// superseded STATE, newEpoch and newWriterPublicKey everywhere.
-			for (const cert of certs) {
-				if (
-					cert.protocolVersion !== reference.protocolVersion ||
-					!cert.guardianSetId.equals(reference.guardianSetId) ||
-					!stateBytes(cert.supersededState).equals(referenceSuperseded) ||
-					cert.newEpoch !== reference.newEpoch ||
-					!cert.newWriterPublicKey.equals(reference.newWriterPublicKey)
-				) {
-					return err(
-						GuardianStatus.ERR_CERT_MISMATCH,
-						'certificates disagree about the takeover'
-					);
-				}
-			}
-			if (reference.protocolVersion !== GUARDIAN_PROTOCOL_VERSION) {
-				return err(
-					GuardianStatus.ERR_UNSUPPORTED_VERSION,
-					`protocol_version ${reference.protocolVersion} outside supported range 1..1`
-				);
-			}
-			// Step 2: the set is served here.
-			if (!reference.guardianSetId.equals(this.guardianSetId)) {
-				return err(
-					GuardianStatus.ERR_UNKNOWN_SET,
-					'guardian_set_id is not served by this guardian'
-				);
-			}
-			// Step 3: every signer is a distinct member of the committed set.
-			for (const cert of certs) {
-				if (!this.members.some((m) => m.equals(cert.guardianId))) {
-					return err(
-						GuardianStatus.ERR_CERT_MISMATCH,
-						'certificate signer is not a member of the guardian set'
-					);
-				}
-			}
-			for (let i = 0; i < certs.length; i++) {
-				for (let j = i + 1; j < certs.length; j++) {
-					if (certs[i].guardianId.equals(certs[j].guardianId)) {
-						return err(
-							GuardianStatus.ERR_CERT_MISMATCH,
-							'duplicate certificate signer'
-						);
-					}
-				}
-			}
-			// Step 4: every signature verifies over the TAKEOVER transcript.
-			for (const cert of certs) {
-				const transcript = takeoverTranscriptHash(
-					this.guardianSetId,
-					cert.guardianId,
-					cert.supersededState,
-					cert.newEpoch,
-					cert.newWriterPublicKey,
-					cert.issuedAt
-				);
-				if (!this.safeVerify(transcript, cert.signature, cert.guardianId)) {
-					return err(
-						GuardianStatus.ERR_BAD_SIGNATURE,
-						'certificate signature failed'
-					);
-				}
-			}
-			// Step 5: threshold.
-			if (certs.length < this.required) {
-				return err(
-					GuardianStatus.ERR_INSUFFICIENT_CERTS,
-					`takeover requires ${this.required} distinct certificates`
-				);
-			}
-			// Step 6: epoch continuity inside the bundle.
-			if (reference.newEpoch !== reference.supersededState.lease.epoch + 1n) {
+		// Step 1: identical protocol_version, guardian_set_id, recovery_id,
+		// superseded lease and origin, newEpoch and newWriterPublicKey
+		// everywhere. The superseded log heads may differ.
+		for (const cert of certs) {
+			if (
+				cert.protocolVersion !== reference.protocolVersion ||
+				!cert.guardianSetId.equals(reference.guardianSetId) ||
+				!sameLease(cert.supersededState, reference.supersededState) ||
+				cert.newEpoch !== reference.newEpoch ||
+				!cert.newWriterPublicKey.equals(reference.newWriterPublicKey)
+			) {
 				return err(
 					GuardianStatus.ERR_CERT_MISMATCH,
-					'newEpoch must equal the certified lease epoch + 1'
+					'certificates disagree about the takeover'
 				);
 			}
+		}
+		const heads = certs
+			.map((cert) => cert.supersededState.logHead)
+			.sort((a, b) =>
+				a.sequence < b.sequence ? -1 : a.sequence > b.sequence ? 1 : 0
+			);
+		for (let i = 1; i < heads.length; i++) {
+			if (
+				heads[i].sequence === heads[i - 1].sequence &&
+				!logHeadsEqual(heads[i], heads[i - 1])
+			) {
+				return err(
+					GuardianStatus.ERR_CERT_MISMATCH,
+					'certificates name two different records at one sequence'
+				);
+			}
+		}
+		if (reference.protocolVersion !== GUARDIAN_PROTOCOL_VERSION) {
+			return err(
+				GuardianStatus.ERR_UNSUPPORTED_VERSION,
+				`protocol_version ${reference.protocolVersion} outside supported range 1..1`
+			);
+		}
+		// Step 2: the set is served here.
+		if (!reference.guardianSetId.equals(this.guardianSetId)) {
+			return err(
+				GuardianStatus.ERR_UNKNOWN_SET,
+				'guardian_set_id is not served by this guardian'
+			);
+		}
+		// Step 3: every signer is a distinct member of the committed set.
+		for (const cert of certs) {
+			if (!this.members.some((m) => m.equals(cert.guardianId))) {
+				return err(
+					GuardianStatus.ERR_CERT_MISMATCH,
+					'certificate signer is not a member of the guardian set'
+				);
+			}
+		}
+		for (let i = 0; i < certs.length; i++) {
+			for (let j = i + 1; j < certs.length; j++) {
+				if (certs[i].guardianId.equals(certs[j].guardianId)) {
+					return err(
+						GuardianStatus.ERR_CERT_MISMATCH,
+						'duplicate certificate signer'
+					);
+				}
+			}
+		}
+		// Step 4: every signature verifies over the TAKEOVER transcript.
+		for (const cert of certs) {
+			const transcript = takeoverTranscriptHash(
+				this.guardianSetId,
+				cert.guardianId,
+				cert.supersededState,
+				cert.newEpoch,
+				cert.newWriterPublicKey,
+				cert.issuedAt
+			);
+			if (!this.safeVerify(transcript, cert.signature, cert.guardianId)) {
+				return err(
+					GuardianStatus.ERR_BAD_SIGNATURE,
+					'certificate signature failed'
+				);
+			}
+		}
+		// Step 5: threshold. A quorum of signers at a head below the highest
+		// would certify a lower final head than the bundle as a whole: two
+		// quorums for one epoch, which is a conflict, not a takeover.
+		if (certs.length < this.required) {
+			return err(
+				GuardianStatus.ERR_INSUFFICIENT_CERTS,
+				`takeover requires ${this.required} distinct certificates`
+			);
+		}
+		const highest = heads[heads.length - 1];
+		if (heads[this.required - 1].sequence !== highest.sequence) {
+			return err(
+				GuardianStatus.ERR_CERT_MISMATCH,
+				'a quorum of the certificates fixes a lower head than another signer granted over'
+			);
+		}
+		// Step 6: epoch continuity inside the bundle.
+		if (reference.newEpoch !== reference.supersededState.lease.epoch + 1n) {
+			return err(
+				GuardianStatus.ERR_CERT_MISMATCH,
+				'newEpoch must equal the certified lease epoch + 1'
+			);
+		}
+		return {
+			certified: { ...reference.supersededState, logHead: highest },
+			heads,
+			newEpoch: reference.newEpoch,
+			newWriterPublicKey: reference.newWriterPublicKey
+		};
+	}
 
-			const certified = reference.supersededState;
+	syncEpoch(request: IGuardianSyncEpochRequest): IGuardianSyncEpochResponse {
+		try {
+			const bundle = this.takeoverBundle(request.certificates);
+			if ('status' in bundle) return bundle;
+			const certified = bundle.certified;
 			const recoveryId = certified.recoveryId;
 			const quarantine = this.quarantineGate(recoveryId);
 			if (quarantine) return quarantine;
@@ -2291,41 +2793,18 @@ export class ReferenceGuardian {
 						'certified lease conflicts with the local lease at the same epoch'
 					);
 				}
-				// Step 8: the local log must contain the certified head.
+				// Step 8: the local log must contain the certified head, and
+				// every lower head a signer granted over must lie on it.
 				const head = certified.logHead;
-				if (!logHeadsEqual(local.logHead, head)) {
-					if (local.logHead.sequence < head.sequence) {
-						return err(
-							GuardianStatus.ERR_HEAD_UNKNOWN,
-							'local log is behind the certified head; repair with SYNC_RECORD first'
-						);
-					}
-					if (!isGenesisLogHead(head)) {
-						const stored = this.store.getRecord(
-							recoveryId,
-							u64be(head.sequence)
-						);
-						if (!stored) {
-							throw new Error(
-								'stored log is missing the certified sequence inside its own range'
-							);
-						}
-						if (
-							!stored.frameHash.equals(head.frameHash) ||
-							!stored.ciphertextHash.equals(head.ciphertextHash) ||
-							readU64be(stored.epoch) !== head.recordEpoch
-						) {
-							this.alarm(
-								recoveryId,
-								GuardianStatus.ERR_CONFLICT,
-								`certified head conflicts with the stored record at sequence ${head.sequence}`
-							);
-							return err(
-								GuardianStatus.ERR_CONFLICT,
-								'certified head conflicts with a stored record'
-							);
-						}
-					}
+				if (local.logHead.sequence < head.sequence) {
+					return err(
+						GuardianStatus.ERR_HEAD_UNKNOWN,
+						'local log is behind the certified head; repair with SYNC_RECORD first'
+					);
+				}
+				for (const named of bundle.heads) {
+					const problem = this.headOffLog(recoveryId, local, named);
+					if (problem) return problem;
 				}
 
 				// Adopt: discard the minority tail above the certified head into
@@ -2339,14 +2818,14 @@ export class ReferenceGuardian {
 				);
 				const ownCert = this.signCertificate(
 					certified,
-					reference.newEpoch,
-					reference.newWriterPublicKey
+					bundle.newEpoch,
+					bundle.newWriterPublicKey
 				);
 				const newState: GuardianState = {
 					recoveryId: Buffer.from(recoveryId),
 					lease: {
-						epoch: reference.newEpoch,
-						writerPublicKey: Buffer.from(reference.newWriterPublicKey)
+						epoch: bundle.newEpoch,
+						writerPublicKey: Buffer.from(bundle.newWriterPublicKey)
 					},
 					origin: local.origin,
 					logHead: head
@@ -2354,8 +2833,8 @@ export class ReferenceGuardian {
 				const receipt = this.signReceipt(newState);
 				this.store.insertEpoch({
 					recoveryId: Buffer.from(recoveryId),
-					epoch: u64be(reference.newEpoch),
-					writerPublicKey: Buffer.from(reference.newWriterPublicKey),
+					epoch: u64be(bundle.newEpoch),
+					writerPublicKey: Buffer.from(bundle.newWriterPublicKey),
 					certSupersededState: stateBytes(certified),
 					certIssuedAt: u64be(ownCert.issuedAt),
 					certSignature: ownCert.signature,
@@ -2376,8 +2855,8 @@ export class ReferenceGuardian {
 						guardianSetId: Buffer.from(this.guardianSetId),
 						guardianId: Buffer.from(this.guardianId),
 						supersededState: certified,
-						newEpoch: reference.newEpoch,
-						newWriterPublicKey: Buffer.from(reference.newWriterPublicKey),
+						newEpoch: bundle.newEpoch,
+						newWriterPublicKey: Buffer.from(bundle.newWriterPublicKey),
 						issuedAt: ownCert.issuedAt,
 						signature: Buffer.from(ownCert.signature)
 					},
@@ -2730,6 +3209,7 @@ export class ReferenceGuardian {
 			const hadAnything = ns.state !== null || ns.registrationState !== null;
 			this.store.deleteAllRecords(recoveryId, 'rollback', u64be(this.clock()));
 			this.store.deleteAllEpochs(recoveryId);
+			this.store.deleteRetainFloor(recoveryId);
 			this.store.tombstoneNamespace(recoveryId);
 			if (hadAnything) {
 				this.alarm(
@@ -2796,6 +3276,62 @@ export class ReferenceGuardian {
 	}
 
 	/**
+	 * The stored retain floor, judged on its own terms like every persisted
+	 * artifact: this guardian's receipt signature over a non-genesis state
+	 * of this namespace from its root-committed origin, and that state's
+	 * writer's RETAIN signature over the record just after it. The writer's
+	 * is what makes it a floor: this guardian signs many states, and any of
+	 * them would otherwise stand in for the records below it. Null when
+	 * none is stored; 'invalid' when one is and it does not verify.
+	 */
+	private storedRetainFloor(
+		recoveryId: Buffer,
+		regState: GuardianState
+	): GuardianState | null | 'invalid' {
+		const row = this.store.getRetainFloor(recoveryId);
+		if (!row) return null;
+		const state = tryParseState(row.state);
+		const issuedAt = tryReadU64(row.issuedAt);
+		if (
+			state === null ||
+			issuedAt === null ||
+			!isLen(row.signature, 64) ||
+			!state.recoveryId.equals(recoveryId) ||
+			state.origin.firstSequence !== regState.origin.firstSequence ||
+			!state.origin.previousHash.equals(regState.origin.previousHash) ||
+			state.lease.epoch < regState.lease.epoch ||
+			isGenesisLogHead(state.logHead) ||
+			state.logHead.sequence < regState.origin.firstSequence ||
+			!this.safeVerify(
+				receiptTranscriptHash(
+					this.guardianSetId,
+					this.guardianId,
+					state,
+					issuedAt
+				),
+				row.signature,
+				this.guardianId
+			) ||
+			!isLen(row.frameHash, 32) ||
+			!isLen(row.writerSignature, 64) ||
+			!validU64(state.logHead.sequence + 1n) ||
+			!this.safeVerify(
+				retainTranscriptHash(this.guardianSetId, {
+					recoveryId,
+					epoch: state.lease.epoch,
+					sequence: state.logHead.sequence + 1n,
+					frameHash: row.frameHash
+				}),
+				row.writerSignature,
+				state.lease.writerPublicKey
+			)
+		) {
+			return 'invalid';
+		}
+		return state;
+	}
+
+	/**
 	 * Replay the stored history against the state machine's own rules.
 	 * Returns null when everything through the declared state verifies, or
 	 * the last good checkpoint when something does not.
@@ -2843,9 +3379,17 @@ export class ReferenceGuardian {
 			return fail('registration epoch row missing or corrupt');
 		}
 		const pending = epochRows.slice(1);
+		const floor = this.storedRetainFloor(recoveryId, regState);
+		if (floor === 'invalid') return fail('stored retain floor does not verify');
 
+		/**
+		 * A takeover below the retain floor superseded a head whose records
+		 * were freed, so it is judged on its own signed artifacts alone and
+		 * the replay resumes at the floor.
+		 */
 		const applyTakeover = (
-			row: IGuardianEpochRow
+			row: IGuardianEpochRow,
+			belowFloor: GuardianState | null = null
 		): { checkpoint: GuardianState; reason: string } | null => {
 			const rowEpoch = readU64be(row.epoch);
 			if (walkTarget && rowEpoch > walkTarget.lease.epoch) {
@@ -2862,15 +3406,25 @@ export class ReferenceGuardian {
 			) {
 				return fail('takeover epoch row is missing its artifacts');
 			}
+			// A grant extended to a quorum's higher head (wire 5.6) keeps its
+			// certificate below the superseded epoch's records it then took.
+			const extended =
+				superseded.lease.epoch === sim.lease.epoch &&
+				superseded.logHead.sequence < sim.logHead.sequence &&
+				this.headOnLog(recoveryId, superseded.logHead);
 			if (
 				!superseded.recoveryId.equals(recoveryId) ||
 				superseded.origin.firstSequence !== sim.origin.firstSequence ||
 				!superseded.origin.previousHash.equals(sim.origin.previousHash) ||
-				!logHeadsEqual(superseded.logHead, sim.logHead) ||
-				superseded.lease.epoch < sim.lease.epoch ||
 				rowEpoch !== superseded.lease.epoch + 1n ||
-				(superseded.lease.epoch === sim.lease.epoch &&
-					!superseded.lease.writerPublicKey.equals(sim.lease.writerPublicKey))
+				(belowFloor
+					? superseded.logHead.sequence > belowFloor.logHead.sequence
+					: (!logHeadsEqual(superseded.logHead, sim.logHead) && !extended) ||
+					  superseded.lease.epoch < sim.lease.epoch ||
+					  (superseded.lease.epoch === sim.lease.epoch &&
+							!superseded.lease.writerPublicKey.equals(
+								sim.lease.writerPublicKey
+							)))
 			) {
 				return fail('takeover certificate does not extend the replayed state');
 			}
@@ -2892,7 +3446,7 @@ export class ReferenceGuardian {
 					writerPublicKey: Buffer.from(row.writerPublicKey)
 				},
 				origin: sim.origin,
-				logHead: sim.logHead
+				logHead: superseded.logHead
 			};
 			const receiptState = tryParseState(row.receiptState);
 			if (receiptState === null || !statesEqual(receiptState, post)) {
@@ -2909,9 +3463,29 @@ export class ReferenceGuardian {
 			) {
 				return fail('stored takeover receipt signature failed');
 			}
-			sim = post;
+			if (!belowFloor) sim = { ...post, logHead: sim.logHead };
 			return null;
 		};
+
+		if (floor) {
+			const atFloor = epochRows.find(
+				(row) => tryReadU64(row.epoch) === floor.lease.epoch
+			);
+			if (
+				!atFloor ||
+				!atFloor.writerPublicKey.equals(floor.lease.writerPublicKey)
+			) {
+				return fail('retain floor names a lease with no epoch row');
+			}
+			while (
+				pending.length > 0 &&
+				(tryReadU64(pending[0].epoch) as bigint) <= floor.lease.epoch
+			) {
+				const problem = applyTakeover(pending.shift()!, floor);
+				if (problem) return problem;
+			}
+			sim = this.cloneState(floor);
+		}
 
 		for (const record of this.store.iterateRecords(recoveryId)) {
 			if (recordRowProblem(record)) {
@@ -2920,9 +3494,13 @@ export class ReferenceGuardian {
 			}
 			const sequence = readU64be(record.sequence);
 			const recordEpoch = readU64be(record.epoch);
-			if (sequence < regState.origin.firstSequence) {
+			if (
+				sequence < regState.origin.firstSequence ||
+				(floor && sequence <= floor.logHead.sequence)
+			) {
 				// Sequence zero never carries a record, and records below the
-				// origin do not exist for this namespace (wire 4.1).
+				// origin do not exist for this namespace (wire 4.1); the ones
+				// below a retain floor were freed with it.
 				impossibleRows = true;
 				continue;
 			}
@@ -3029,12 +3607,26 @@ export class ReferenceGuardian {
 			'rollback',
 			u64be(this.clock())
 		);
+		// A checkpoint the walk reached from the floor keeps it; one below
+		// it (the floor itself failed, or history before it did) starts the
+		// chain at the origin again, and nothing above that checkpoint is
+		// kept anyway.
+		const floor = this.storedRetainFloor(recoveryId, regState);
+		const keepFloor =
+			floor !== null &&
+			floor !== 'invalid' &&
+			checkpoint.logHead.sequence >= floor.logHead.sequence;
+		if (!keepFloor) this.store.deleteRetainFloor(recoveryId);
 		// Shape sweeps: rows with malformed column widths sort arbitrarily and
 		// can dodge the range operations above; removing them here is what
 		// keeps this rollback IDEMPOTENT instead of re-failing on every open.
 		this.store.archiveRecordsBelow(
 			recoveryId,
-			u64be(regState.origin.firstSequence),
+			u64be(
+				keepFloor
+					? (floor as GuardianState).logHead.sequence + 1n
+					: regState.origin.firstSequence
+			),
 			'rollback',
 			u64be(this.clock())
 		);

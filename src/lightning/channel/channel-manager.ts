@@ -42,10 +42,12 @@ import {
 import {
 	canScopeWireError,
 	decodeErrorMessage,
-	encodeErrorMessage
+	encodeErrorMessage,
+	getErrorText
 } from '../message/error';
 import { decodeChannelReestablishMessage } from '../message/channel-reestablish';
 import { decodeStfuMessage } from '../message/stfu';
+import { normalizeHexPubkey } from '../validation';
 import {
 	decodeSpliceMessage,
 	decodeSpliceAckMessage,
@@ -489,7 +491,9 @@ export interface IChannelManagerConfig {
  * - 'channel:closed' (channelId: Buffer)
  * - 'htlc:forwarded' (channelId: Buffer, htlcId: bigint, amountMsat: bigint, paymentHash: Buffer)
  * - 'htlc:fulfilled' (channelId: Buffer, htlcId: bigint, preimage: Buffer)
- * - 'htlc:failed' (channelId: Buffer, htlcId: bigint, reason: Buffer)
+ * - 'htlc:failed' (channelId: Buffer, htlcId: bigint, reason: Buffer,
+ *   malformedCode?: number): malformedCode is set only for
+ *   update_fail_malformed_htlc
  * - 'htlc:claimed-onchain' (channelId: Buffer, paymentHash: Buffer, preimage: Buffer,
  *   claimTxid: string): a confirmed spend of a received HTLC output revealed
  *   its preimage; repeats when the spend is re-reported
@@ -1238,6 +1242,7 @@ export class ChannelManager extends EventEmitter {
 		fundingSatoshis: bigint,
 		pushMsat?: bigint
 	): Channel | null {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
 		if (!this.zeroConfManager.canOpenZeroConfTo(peerPubkey)) {
 			this.emit('error', null, 'Peer is not trusted for zero-conf channels');
 			return null;
@@ -1312,6 +1317,7 @@ export class ChannelManager extends EventEmitter {
 		beforeNegotiate?: (temporaryChannelId: Buffer) => void,
 		opts?: { trusted?: boolean }
 	): Channel {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
 		// Verify peer is connected before creating channel state
 		if (this.peerManager && !this.peerManager.getPeer(peerPubkey)) {
 			throw new Error(`Not connected to peer ${peerPubkey}`);
@@ -2525,6 +2531,9 @@ export class ChannelManager extends EventEmitter {
 		keyIndex?: number | null,
 		perChannelKeys?: IPerChannelKeys | null
 	): void {
+		// Rows written before opens lowercased the caller's pubkey can carry
+		// any case, and inbound connections register the lowercase form.
+		peerPubkey = normalizeHexPubkey(peerPubkey);
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
 		}
@@ -2618,9 +2627,18 @@ export class ChannelManager extends EventEmitter {
 					channel.getFullState().v2InFlight != null)
 			) {
 				this._rollbackForReestablish(channel);
+				// After the rollback, which can drop the only pending update.
+				channel.repairWatchtowerCommitmentCache();
 			}
 			this.channels.set(channelId.toString('hex'), channel);
 			this.channelPeers.set(channelId.toString('hex'), peerPubkey);
+			// After registering: the listener looks the channel up.
+			this._handOffRevokedCommitments(
+				channelId,
+				peerPubkey,
+				channel,
+				channel.takeOwedWatchtowerBackups()
+			);
 			// Reported only now: a listener persists the disposal, and both the
 			// channel and its peer mapping have to be registered before it can.
 			if (disposition !== 'none') {
@@ -2694,6 +2712,7 @@ export class ChannelManager extends EventEmitter {
 	 * Get all channels for a specific peer.
 	 */
 	getChannelsByPeer(peerPubkey: string): Channel[] {
+		peerPubkey = normalizeHexPubkey(peerPubkey);
 		const result: Channel[] = [];
 		for (const [id, channel] of this.channels) {
 			if (this.channelPeers.get(id) === peerPubkey) {
@@ -4303,6 +4322,30 @@ export class ChannelManager extends EventEmitter {
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
+		// Watchtower: hand the revoked tx over before the revoke is applied, so
+		// the tower backlog is on disk before the persist that records the
+		// revocation. A crash in between leaves the row unrevoked and the peer
+		// resends revoke_and_ack. A cache hit proves the secret belongs to a
+		// commitment we signed, so the backup is valid even if the channel then
+		// rejects the message. Nothing of the revoke is applied yet, so a
+		// listener that re-enters acts as if it ran before the message arrived.
+		// Earlier hand-offs that failed go first.
+		const revChannelId = channel.getChannelId();
+		if (revChannelId) {
+			const revoked = channel.takeOwedWatchtowerBackups();
+			for (const tx of channel.takeRevokedCommitmentTxs(
+				msg.perCommitmentSecret
+			)) {
+				revoked.push({ perCommitmentSecret: msg.perCommitmentSecret, tx });
+			}
+			this._handOffRevokedCommitments(
+				revChannelId,
+				peerPubkey,
+				channel,
+				revoked
+			);
+		}
+
 		const actions = channel.handleRevokeAndAck(msg);
 		const hadError = actions.some((a) => a.type === ChannelActionType.ERROR);
 
@@ -4329,25 +4372,6 @@ export class ChannelManager extends EventEmitter {
 		}
 
 		this.processActions(peerPubkey, channel, actions);
-
-		// Watchtower: on a clean revocation, hand the just-revoked remote
-		// commitment tx (if we cached it) to any listener so it can ship justice
-		// data to towers before the peer can broadcast the breach.
-		if (!hadError) {
-			const revokedTx = channel.takeRevokedCommitmentTx(
-				msg.perCommitmentSecret
-			);
-			const revChannelId = channel.getChannelId();
-			if (revokedTx && revChannelId) {
-				this.emit(
-					'watchtower:backup',
-					revChannelId,
-					peerPubkey,
-					msg.perCommitmentSecret,
-					revokedTx
-				);
-			}
-		}
 
 		const channelId = channel.getChannelId();
 
@@ -4730,6 +4754,8 @@ export class ChannelManager extends EventEmitter {
 			localAmount,
 			remoteAmount,
 			feeAmount: feeSatoshis,
+			localDustLimit: state.localConfig.dustLimitSatoshis,
+			remoteDustLimit: state.remoteConfig.dustLimitSatoshis,
 			// LND builds the taproot coop-close tx RBF-signalled; the sequence
 			// is part of the MuSig2 sighash, so it must match exactly.
 			sequence: isTaprootChannel(state.channelType) ? 0xfffffffd : 0xffffffff
@@ -8447,7 +8473,7 @@ export class ChannelManager extends EventEmitter {
 	private handleErrorMsg(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeErrorMessage(payload);
 		const channelIdHex = msg.channelId.toString('hex');
-		const errorText = msg.data.toString('utf8');
+		const errorText = getErrorText(msg);
 
 		// BOLT 1: an all-zero (or absent) channel_id refers to ALL channels with
 		// the sending node, and every one of them must be failed. Only the
@@ -8555,7 +8581,7 @@ export class ChannelManager extends EventEmitter {
 		// but the text is often the only clue to a protocol disagreement (CLN
 		// reports e.g. "Splice feerate_perkw is too low" this way), so surface it.
 		const msg = decodeErrorMessage(payload);
-		const warningText = msg.data.toString('utf8');
+		const warningText = getErrorText(msg);
 		this.emit('error', msg.channelId, `Remote warning: ${warningText}`);
 	}
 
@@ -9328,13 +9354,26 @@ export class ChannelManager extends EventEmitter {
 					break;
 				}
 				case ChannelActionType.HTLC_FORWARDED:
-					this.emit(
-						'htlc:forwarded',
-						channel.getChannelId(),
-						action.htlcId,
-						action.amountMsat,
-						action.paymentHash
-					);
+					// Contained per HTLC: the event is edge-triggered and not
+					// re-emitted until a restart, so a throw here would strand
+					// every later HTLC in the batch until its CLTV backstop.
+					try {
+						this.emit(
+							'htlc:forwarded',
+							channel.getChannelId(),
+							action.htlcId,
+							action.amountMsat,
+							action.paymentHash
+						);
+					} catch (err) {
+						this.emitContained(
+							'error',
+							channel.getChannelId(),
+							`htlc:forwarded handler threw for HTLC ${action.htlcId}: ${
+								err instanceof Error ? err.message : String(err)
+							}`
+						);
+					}
 					break;
 				case ChannelActionType.HTLC_FULFILLED:
 					this.emit(
@@ -9349,7 +9388,8 @@ export class ChannelManager extends EventEmitter {
 						'htlc:failed',
 						channel.getChannelId(),
 						action.htlcId,
-						action.reason
+						action.reason,
+						action.malformedCode
 					);
 					break;
 				case ChannelActionType.WATCH_FUNDING:
@@ -10139,6 +10179,32 @@ export class ChannelManager extends EventEmitter {
 			channelIdHex,
 			detached.batches.length
 		);
+	}
+
+	/**
+	 * Emit watchtower:backup for each revoked commitment. A listener throws
+	 * when the backup did not reach durable storage, and the channel then
+	 * keeps that tx as owed, so the next revoke_and_ack or restore retries it.
+	 */
+	private _handOffRevokedCommitments(
+		channelId: Buffer,
+		peerPubkey: string,
+		channel: Channel,
+		revoked: Array<{ perCommitmentSecret: Buffer; tx: Buffer }>
+	): void {
+		for (const { perCommitmentSecret, tx } of revoked) {
+			try {
+				this.emit(
+					'watchtower:backup',
+					channelId,
+					peerPubkey,
+					perCommitmentSecret,
+					tx
+				);
+			} catch {
+				channel.oweWatchtowerBackup(perCommitmentSecret, tx);
+			}
+		}
 	}
 
 	/**

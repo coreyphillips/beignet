@@ -842,11 +842,12 @@ export class Transaction {
 				if (!keyPair) {
 					return err('Unable to derive keyPair.');
 				}
-				await this.addInput({
+				const addRes = await this.addInput({
 					psbt,
 					keyPair,
 					input
 				});
+				if (addRes.isErr()) return err(addRes.error.message);
 			}
 		} catch (e) {
 			return err(e);
@@ -931,11 +932,105 @@ export class Transaction {
 				inputs: transactionData.inputs
 			});
 			if (metadataRes.isErr()) return err(metadataRes.error.message);
+			const changeRes = await this.addChangeOutputMetadata(psbt);
+			if (changeRes.isErr()) return err(changeRes.error.message);
 			return ok(psbt);
 		} catch (e) {
 			return err(e);
 		}
 	};
+
+	/**
+	 * Attaches the key derivation (and redeemScript, witnessScript or
+	 * tapInternalKey) to every output paying one of this wallet's change
+	 * addresses. A hardware signer shows an output it cannot derive as a
+	 * payment, so without this the change looks like a second recipient and
+	 * a change output rewritten in transit looks no different.
+	 * @param {Psbt} psbt
+	 * @returns {Promise<Result<string>>}
+	 * @private
+	 */
+	private async addChangeOutputMetadata(psbt: Psbt): Promise<Result<string>> {
+		try {
+			const { changeAddresses, changeAddressIndex } = this._wallet.data;
+			const changePaths = new Map<string, string>();
+			for (const addresses of Object.values(changeAddresses)) {
+				for (const { address, path } of Object.values(addresses ?? {})) {
+					changePaths.set(address, path);
+				}
+			}
+			for (const { address, path } of Object.values(changeAddressIndex)) {
+				if (address && path) changePaths.set(address, path);
+			}
+			// A wallet that has not set a type's change index yet gets that
+			// type's change address generated on the fly, and neither map above
+			// holds it.
+			for (const type of this._wallet.addressTypesToMonitor) {
+				const fallbackRes = await this._wallet.getChangeAddress(type);
+				if (fallbackRes.isErr()) return err(fallbackRes.error.message);
+				changePaths.set(fallbackRes.value.address, fallbackRes.value.path);
+			}
+			const network = getBitcoinJsNetwork(this._wallet.network);
+			const masterFingerprint = this._wallet.getMasterFingerprint();
+			psbt.txOutputs.forEach((output, index) => {
+				const path = changePaths.get(output.address ?? '');
+				if (!output.address || !path) return;
+				const mismatch = new Error(
+					`Change output ${index} does not match the key at ${path}.`
+				);
+				const { type } = getAddressInfo(output.address);
+				if (type === 'p2wsh') {
+					const paymentRes = this._wallet.getMultisigPayment(path);
+					if (paymentRes.isErr()) throw paymentRes.error;
+					if (!paymentRes.value.output.equals(output.script)) throw mismatch;
+					psbt.updateOutput(index, {
+						witnessScript: paymentRes.value.witnessScript,
+						bip32Derivation: paymentRes.value.derivations
+					});
+					return;
+				}
+				const publicNodeRes = this._wallet.derivePublicNode(path);
+				if (publicNodeRes.isErr()) throw publicNodeRes.error;
+				const pubkey = publicNodeRes.value.publicKey;
+				const originPath = this._wallet.mapPathToKeyOrigin(path);
+				if (type === 'p2tr') {
+					const p2tr = getTapRootAddressFromPublicKey({
+						publicKey: pubkey,
+						network
+					});
+					if (p2tr.isErr()) throw new Error(p2tr.error.message);
+					if (!p2tr.value.output.equals(output.script)) throw mismatch;
+					psbt.updateOutput(index, {
+						tapInternalKey: p2tr.value.internalPubkey,
+						tapBip32Derivation: [
+							{
+								masterFingerprint,
+								path: originPath,
+								pubkey: toXOnly(pubkey),
+								leafHashes: []
+							}
+						]
+					});
+					return;
+				}
+				const p2wpkh = bitcoin.payments.p2wpkh({ pubkey, network });
+				const payment =
+					type === 'p2sh'
+						? bitcoin.payments.p2sh({ redeem: p2wpkh, network })
+						: type === 'p2pkh'
+						? bitcoin.payments.p2pkh({ pubkey, network })
+						: p2wpkh;
+				if (!payment.output?.equals(output.script)) throw mismatch;
+				psbt.updateOutput(index, {
+					...(type === 'p2sh' ? { redeemScript: p2wpkh.output } : {}),
+					bip32Derivation: [{ masterFingerprint, path: originPath, pubkey }]
+				});
+			});
+			return ok('Change output metadata added.');
+		} catch (e) {
+			return err(e);
+		}
+	}
 
 	/**
 	 * Attaches bip32Derivation (tapBip32Derivation for p2tr) to each PSBT
@@ -1020,25 +1115,75 @@ export class Transaction {
 	 * (Ledger 2.x, Trezor >= 2.3.5) require non_witness_utxo alongside
 	 * witness_utxo to verify input amounts. Returns {} when the backend
 	 * cannot supply it (witness_utxo alone remains BIP 174-valid), so
-	 * offline builds still succeed.
-	 * @param {string} txHash
-	 * @returns {Promise<{ nonWitnessUtxo: Buffer } | Record<string, never>>}
+	 * offline builds still succeed. Errs when the transaction it supplies
+	 * contradicts the input (see checkPrevTx).
+	 * @param {IUtxo} input
+	 * @param {Buffer} script
+	 * @returns {Promise<Result<{ nonWitnessUtxo: Buffer } | Record<string, never>>>}
 	 * @private
 	 */
 	private async nonWitnessUtxoField(
-		txHash: string
-	): Promise<{ nonWitnessUtxo: Buffer } | Record<string, never>> {
+		input: IUtxo,
+		script: Buffer
+	): Promise<Result<{ nonWitnessUtxo: Buffer } | Record<string, never>>> {
+		let hex: string | undefined;
 		try {
 			const transaction = await this._wallet.electrum.getTransactions({
-				txHashes: [{ tx_hash: txHash }]
+				txHashes: [{ tx_hash: input.tx_hash }]
 			});
-			if (transaction.isErr()) return {};
-			const hex = transaction.value.data[0]?.result?.hex;
-			if (!hex) return {};
-			return { nonWitnessUtxo: Buffer.from(hex, 'hex') };
+			if (transaction.isErr()) return ok({});
+			hex = transaction.value.data[0]?.result?.hex;
 		} catch {
-			return {};
+			return ok({});
 		}
+		if (!hex) return ok({});
+		const prevTxRes = this.checkPrevTx({ hex, input, script });
+		if (prevTxRes.isErr()) return err(prevTxRes.error.message);
+		return ok({ nonWitnessUtxo: prevTxRes.value });
+	}
+
+	/**
+	 * Refuses a previous transaction unless it is the one the input spends and
+	 * its output at tx_pos pays input.value to script. Fee and change are
+	 * computed from input.value, which the server reported, but once
+	 * non_witness_utxo is attached the signature commits to the value in this
+	 * transaction. A server that under-reported a coin would otherwise get a
+	 * valid transaction that pays the difference as fee.
+	 * @param {string} hex
+	 * @param {IUtxo} input
+	 * @param {Buffer} script
+	 * @returns {Result<Buffer>} the raw previous transaction
+	 * @private
+	 */
+	private checkPrevTx({
+		hex,
+		input,
+		script
+	}: {
+		hex: string;
+		input: IUtxo;
+		script: Buffer;
+	}): Result<Buffer> {
+		const outpoint = `${input.tx_hash}:${input.tx_pos}`;
+		let prevTx: bitcoin.Transaction;
+		try {
+			prevTx = bitcoin.Transaction.fromHex(hex);
+		} catch {
+			return err(`Previous transaction for ${outpoint} could not be parsed.`);
+		}
+		if (prevTx.getId() !== input.tx_hash) {
+			return err(`Previous transaction for ${outpoint} has a different txid.`);
+		}
+		const prevOut = prevTx.outs[input.tx_pos];
+		if (!prevOut || !prevOut.script.equals(script)) {
+			return err(`Output ${outpoint} does not pay this input's address.`);
+		}
+		if (prevOut.value !== input.value) {
+			return err(
+				`Output ${outpoint} holds ${prevOut.value} sats, not the ${input.value} the server reported.`
+			);
+		}
+		return ok(Buffer.from(hex, 'hex'));
 	}
 
 	addInput = async ({
@@ -1074,6 +1219,8 @@ export class Transaction {
 						`Multisig script for path ${input.path} does not produce address ${input.address}.`
 					);
 				}
+				const prevTxRes = await this.nonWitnessUtxoField(input, output);
+				if (prevTxRes.isErr()) return err(prevTxRes.error.message);
 				psbt.addInput({
 					hash: input.tx_hash,
 					index: input.tx_pos,
@@ -1082,7 +1229,7 @@ export class Transaction {
 						value: input.value
 					},
 					witnessScript,
-					...(await this.nonWitnessUtxoField(input.tx_hash))
+					...prevTxRes.value
 				});
 				return ok('Success');
 			}
@@ -1099,6 +1246,8 @@ export class Transaction {
 				if (!p2wpkh?.output) {
 					return err('p2wpkh.output is undefined.');
 				}
+				const prevTxRes = await this.nonWitnessUtxoField(input, p2wpkh.output);
+				if (prevTxRes.isErr()) return err(prevTxRes.error.message);
 				psbt.addInput({
 					hash: input.tx_hash,
 					index: input.tx_pos,
@@ -1106,7 +1255,7 @@ export class Transaction {
 						script: p2wpkh.output,
 						value: input.value
 					},
-					...(await this.nonWitnessUtxoField(input.tx_hash))
+					...prevTxRes.value
 				});
 			}
 
@@ -1122,6 +1271,8 @@ export class Transaction {
 				if (!p2sh?.redeem) {
 					return err('p2sh.redeem.output is undefined.');
 				}
+				const prevTxRes = await this.nonWitnessUtxoField(input, p2sh.output);
+				if (prevTxRes.isErr()) return err(prevTxRes.error.message);
 				psbt.addInput({
 					hash: input.tx_hash,
 					index: input.tx_pos,
@@ -1130,11 +1281,18 @@ export class Transaction {
 						value: input.value
 					},
 					redeemScript: p2sh.redeem.output,
-					...(await this.nonWitnessUtxoField(input.tx_hash))
+					...prevTxRes.value
 				});
 			}
 
 			if (type === 'p2pkh') {
+				const p2pkh = bitcoin.payments.p2pkh({
+					pubkey: keyPair.publicKey,
+					network
+				});
+				if (!p2pkh?.output) {
+					return err('p2pkh.output is undefined.');
+				}
 				const transaction = await this._wallet.electrum.getTransactions({
 					txHashes: [{ tx_hash: input.tx_hash }]
 				});
@@ -1142,11 +1300,16 @@ export class Transaction {
 					return err(transaction.error.message);
 				}
 				const hex = transaction.value.data[0].result.hex;
-				const nonWitnessUtxo = Buffer.from(hex, 'hex');
+				const prevTxRes = this.checkPrevTx({
+					hex,
+					input,
+					script: p2pkh.output
+				});
+				if (prevTxRes.isErr()) return err(prevTxRes.error.message);
 				psbt.addInput({
 					hash: input.tx_hash,
 					index: input.tx_pos,
-					nonWitnessUtxo
+					nonWitnessUtxo: prevTxRes.value
 				});
 			}
 
@@ -1437,10 +1600,16 @@ export class Transaction {
 				address = outputs[index]?.address ?? '';
 			}
 
+			// Priced as the one output staged below. With no outputs, getTotalFee
+			// assumes one of the wallet's own type, which is 12 vB short for a p2wpkh
+			// wallet sweeping to a p2tr or p2wsh address.
 			const maxAmountResponse = this.getMaxSendAmount({
 				satsPerByte,
 				selectedFeeId: transaction.selectedFeeId,
-				transaction
+				transaction: {
+					...transaction,
+					outputs: address ? [{ address, value: 0, index }] : []
+				}
 			});
 			if (maxAmountResponse.isErr()) {
 				return err(maxAmountResponse.error);
@@ -1605,6 +1774,21 @@ export class Transaction {
 		satsPerByte?: number;
 	}): Promise<Result<ISendTransaction>> {
 		try {
+			if (txid) {
+				// canBoost only reads the height stored at the last refresh, and a
+				// child of a parent that has since confirmed is a pointless self-send
+				// at the boost rate. An unanswered lookup leaves that stored height as
+				// the only gate, as before.
+				const parentRes = await this._wallet.electrum.getTransactions({
+					txHashes: [{ tx_hash: txid }]
+				});
+				const confirmations = parentRes.isOk()
+					? parentRes.value.data[0]?.result?.confirmations ?? 0
+					: 0;
+				if (confirmations > 0) {
+					return err('Transaction is already confirmed. Unable to CPFP.');
+				}
+			}
 			let minFee = this._wallet.feeEstimates.fast;
 			await this.resetSendTransaction();
 			const setupTransactionRes = await this.setupTransaction({
