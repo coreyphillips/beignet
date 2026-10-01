@@ -1703,15 +1703,24 @@ describe('Gossip intake queue (LightningNode)', () => {
 
 	describe('funding checks (issue #1105)', () => {
 		const savedCap = NetworkGraph.MAX_CHANNELS;
+		const pacing = LightningNode as unknown as {
+			GOSSIP_FUNDING_CHECK_INTERVAL_MS: number;
+		};
+		const savedInterval = pacing.GOSSIP_FUNDING_CHECK_INTERVAL_MS;
+		beforeEach(() => {
+			// Unpaced unless a test says otherwise: these count lookups, not time.
+			pacing.GOSSIP_FUNDING_CHECK_INTERVAL_MS = 0;
+		});
 		afterEach(() => {
 			NetworkGraph.MAX_CHANNELS = savedCap;
+			pacing.GOSSIP_FUNDING_CHECK_INTERVAL_MS = savedInterval;
 		});
 
-		const eagerNode = (backend?: IChainBackend): void => {
+		const eagerNode = (backend?: IChainBackend, eager = true): void => {
 			node.destroy();
 			storage = new SqliteStorage(dbPath);
 			storage.open();
-			node = new LightningNode(makeConfig(true));
+			node = new LightningNode(makeConfig(eager));
 			if (backend) {
 				(node as unknown as { _chainBackend: IChainBackend })._chainBackend =
 					backend;
@@ -1836,6 +1845,46 @@ describe('Gossip intake queue (LightningNode)', () => {
 			node.handleNewBlock(1011);
 			await settleFundingChecks();
 			expect(channel.fundingVerified).to.equal(true);
+		});
+
+		it('lazy intake queues a lookup per new channel, and the lookups are paced (issue #1024)', async () => {
+			pacing.GOSSIP_FUNDING_CHECK_INTERVAL_MS = 300;
+			const first = buildAnnouncement(940, REGTEST_CHAIN_HASH);
+			const second = buildAnnouncement(941, REGTEST_CHAIN_HASH);
+			const backend = fundingBackend([
+				{ ann: first, txid: 'a1'.repeat(32) },
+				{ ann: second, txid: 'a2'.repeat(32) }
+			]);
+			const answer = backend.listUnspent!;
+			const lookups: number[] = [];
+			backend.listUnspent = (scriptHash: string): Promise<TUnspent> => {
+				lookups.push(Date.now());
+				return answer(scriptHash);
+			};
+			eagerNode(backend, false);
+			feedChannel(first);
+			feedChannel(second);
+			await node.flushGossip();
+			for (let i = 0; i < 100 && lookups.length < 1; i++) {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			}
+			// The first lookup runs at once; the second waits out the gap.
+			for (let i = 0; i < 50; i++) {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			}
+			expect(lookups).to.have.length(1);
+			const internals = node as unknown as { gossipFundingChecking: boolean };
+			const deadline = Date.now() + 5_000;
+			while (internals.gossipFundingChecking && Date.now() < deadline) {
+				await new Promise<void>((resolve) => setTimeout(resolve, 20));
+			}
+			expect(lookups).to.have.length(2);
+			expect(lookups[1] - lookups[0]).to.be.at.least(250);
+			for (const ann of [first, second]) {
+				expect(
+					graphOf(node).getChannel(ann.msg.shortChannelId)!.fundingVerified
+				).to.equal(true);
+			}
 		});
 	});
 });

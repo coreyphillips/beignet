@@ -1091,6 +1091,17 @@ export class LightningNode extends EventEmitter {
 	 */
 	private gossipFundingQueue: Set<string> = new Set();
 	private gossipFundingChecking = false;
+	/**
+	 * Least gap between two funding lookups, each a listunspent plus at most
+	 * one merkle proof. Since issue #1024 lazy intake verifies every new SCID,
+	 * so a first sync without RGS queues a lookup per channel. Unpaced, the
+	 * one-at-a-time loop runs at the server's round trip, which holds an
+	 * ElectrumX session (cost about 1 per listunspent, decaying about 1 per
+	 * second) in the server's throttle for the whole backlog, slowing the
+	 * node's own chain requests on that session. One lookup a second stays
+	 * close to that decay. Proofs persist, so each channel pays once.
+	 */
+	private static readonly GOSSIP_FUNDING_CHECK_INTERVAL_MS = 1_000;
 	/** Our own node_announcement (cached so we can re-broadcast it for propagation). */
 	private _ownNodeAnnouncement?: Buffer;
 	/** Our own channel_announcement + channel_update per channel, cached for re-broadcast. */
@@ -15560,12 +15571,13 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Check queued channels' funding outputs on chain, one at a time (issue
-	 * #1105). A signature only proves keys the announcement carries, so this
-	 * is what separates a real channel, kept at the graph ceiling from then
-	 * on, from a fabricated or closed one, which is dropped. Without an answer
-	 * the pass stops until the next block, and the channel goes to the back
-	 * of the queue so one failing lookup cannot hold up the rest.
+	 * Check queued channels' funding outputs on chain, one at a time and
+	 * paced (issue #1105). A signature only proves keys the announcement
+	 * carries, so this is what separates a real channel, kept at the graph
+	 * ceiling from then on, from a fabricated or closed one, which is
+	 * dropped. Without an answer the pass stops until the next block, and the
+	 * channel goes to the back of the queue so one failing lookup cannot hold
+	 * up the rest.
 	 */
 	private checkGossipFunding(): void {
 		if (this.gossipFundingChecking || this.gossipFundingQueue.size === 0) {
@@ -15582,7 +15594,19 @@ export class LightningNode extends EventEmitter {
 	}
 
 	private async runGossipFundingChecks(): Promise<void> {
+		let looked = false;
 		while (!this._destroyed) {
+			// Paced, see GOSSIP_FUNDING_CHECK_INTERVAL_MS. The queue head is
+			// read after the wait, since the graph may have moved meanwhile.
+			const intervalMs = LightningNode.GOSSIP_FUNDING_CHECK_INTERVAL_MS;
+			if (looked && intervalMs > 0) {
+				await new Promise<void>((resolve) => {
+					const timer = setTimeout(resolve, intervalMs);
+					timer.unref?.();
+				});
+				if (this._destroyed) return;
+			}
+			looked = false;
 			const backend = this._chainBackend;
 			const next = this.gossipFundingQueue.values().next();
 			if (!backend || next.done) return;
@@ -15602,6 +15626,7 @@ export class LightningNode extends EventEmitter {
 				channel.announcement,
 				this.currentBlockHeight
 			);
+			looked = true;
 			if (this._destroyed) return;
 			// Evicted, pruned or replaced while the lookup ran. A replacement
 			// queued itself, and that entry is not this lookup's to clear.
