@@ -196,6 +196,7 @@ import {
 	PaymentQueue
 } from './payment-queue';
 import {
+	ListenerProblem,
 	NodeInfo,
 	PeerInfo,
 	ChannelInfo,
@@ -956,6 +957,34 @@ function sentSats(info: IPaymentInfo): number | undefined {
 		return undefined;
 	}
 	return spendLimitSats(info.amountMsat);
+}
+
+/**
+ * A payment's amount as every public surface reports it (history, proof,
+ * stats): an outgoing amount is what left the node, fees included, rounded
+ * UP; an incoming amount rounds down, as the balance does (issue #1185).
+ * Truncating the outgoing figure let a send paying 20,001.5 sats from a
+ * 50,000 sat balance read 20,001 while the balance fell to 29,998. Rounding
+ * up makes one send agree with the balance when the balance held whole sats
+ * before it; sub-sat remainders across several sends can still differ from
+ * the balance by a sat, which only msat figures reconcile exactly.
+ */
+function paymentAmountSats(info: IPaymentInfo): number {
+	return info.direction === PaymentDirection.OUTGOING
+		? sentSats(info) ?? spendLimitSats(info.amountMsat)
+		: Number(info.amountMsat / 1000n);
+}
+
+/**
+ * The routing fee a payment paid, in msat, or undefined when the record does
+ * not say. An MPP record's route is its first part only, so its fee is what
+ * left the node over what the invoice asked (#1008).
+ */
+function paymentFeeMsat(info: IPaymentInfo): bigint | undefined {
+	if (info.sentMsat !== undefined && info.sentMsat >= info.amountMsat) {
+		return info.sentMsat - info.amountMsat;
+	}
+	return info.route?.totalFeeMsat;
 }
 
 /**
@@ -1828,6 +1857,21 @@ interface IRecencyHold {
 	reestablishSecretMissing?: true;
 }
 
+/** The inbound listeners a node can be asked to bind. */
+type ListenerKind = 'tcp' | 'websocket';
+
+const LISTENER_HELD_MESSAGE =
+	'held by the startup quarantine until writer ownership is confirmed ' +
+	'and any startup repair is receipted; it binds then';
+
+const LISTENER_FENCED_MESSAGE =
+	'this node is fenced: another device owns its recovery namespace, so ' +
+	'the listener stays down';
+
+function listenerLabel(kind: ListenerKind): string {
+	return kind === 'tcp' ? 'Lightning listener' : 'WebSocket listener';
+}
+
 export class BeignetNode extends EventEmitter {
 	private fforReceiveService?: FforReceiveService;
 	private offlineReceive?: OfflineReceive;
@@ -2080,8 +2124,21 @@ export class BeignetNode extends EventEmitter {
 	private electrumServerCount = 1;
 	private _failoverInProgress = false;
 	private _backupPromise?: Promise<void>;
+	/** The TCP listener's port, set only once the bind succeeded. */
 	private _listenPort?: number;
 	private _websocketPort?: number;
+	/** The TCP port asked for, bound or not. */
+	private _requestedListenPort?: number;
+	/** Why a configured listener is not bound (issues #861 and #933). */
+	private _listenError?: ListenerProblem;
+	private _websocketListenError?: ListenerProblem;
+	/** One bind attempt in flight per listener kind. */
+	private _listenBinds: Partial<Record<ListenerKind, Promise<void>>> = {};
+	/**
+	 * Bumped whenever the node's listener state is reset (a rebuild tears
+	 * the node down), so an attempt that outlived its node records nothing.
+	 */
+	private _listenEpoch = 0;
 	private _connectTimeoutMs = 15_000;
 	private _dailySpendLimitSats?: number;
 	// The daily ledger (issue #977). _dailySpentSats is the combined LN +
@@ -3487,6 +3544,9 @@ export class BeignetNode extends EventEmitter {
 		// Forward node:ready event
 		this.node.on('node:ready', () => {
 			this.log('info', 'Node ready');
+			// node:ready waits for a startup repair's receipt, which can land
+			// after the gate confirmed: a listener held by it binds now.
+			this.bindHeldListeners();
 			this.emit('node:ready');
 		});
 
@@ -3667,22 +3727,18 @@ export class BeignetNode extends EventEmitter {
 			}
 		}
 
-		// 10. Start listening if port specified
+		// 10. Start listening if port specified. Non-fatal: a refused bind is
+		// recorded, and a guardian mode's startup quarantine holds the bind
+		// until writer ownership is confirmed (bindHeldListeners). The reset
+		// comes first because an in-process rebuild runs this again on a
+		// fresh node.
+		this.resetListenerState();
 		if (opts.listenPort) {
-			try {
-				await this.node.listen(opts.listenPort);
-				this._listenPort = opts.listenPort;
-			} catch {
-				// Non-fatal
-			}
+			this._requestedListenPort = opts.listenPort;
+			await this.bindListener('tcp', opts.listenPort);
 		}
 		if (opts.websocketPort) {
-			try {
-				await this.node.listenWebSocket(opts.websocketPort);
-				this._websocketPort = opts.websocketPort;
-			} catch {
-				// Non-fatal
-			}
+			await this.bindListener('websocket', opts.websocketPort);
 		}
 
 		// 11. Connect timeout + Daily spending limit
@@ -4164,6 +4220,9 @@ export class BeignetNode extends EventEmitter {
 					});
 					this.startRecoveryLeaseCheck();
 					this.resumeRotationWork();
+					// The quarantine refused the step-10 bind; nothing else
+					// binds it once the gate opens (issue #933).
+					this.bindHeldListeners();
 					return;
 				}
 				if (outcome.state === 'fenced') {
@@ -4199,6 +4258,9 @@ export class BeignetNode extends EventEmitter {
 	 */
 	private relayRecoveryFenced(supersededBy: GuardianState | undefined): void {
 		this.stopRecoveryLeaseCheck();
+		// The fence closed every listener and a held one never binds: say so
+		// rather than report one bound or held forever.
+		this.fenceListeners();
 		if (this._recoveryFenceRelayed) return;
 		this._recoveryFenceRelayed = true;
 		this.emit('recovery:fenced', {
@@ -5328,6 +5390,9 @@ export class BeignetNode extends EventEmitter {
 		// after the resume it serves the rebuilt node over the installed
 		// database through its live storage view (issue #978).
 		this.paymentQueue?.removeAllListeners();
+		// The node's listeners close with it; a bind still in flight on it
+		// records nothing.
+		this.resetListenerState();
 		this.node.destroy();
 		// The node's destroy() closes only its view of the database (issue
 		// #958); the swap needs the file itself closed, as it was when the
@@ -5712,7 +5777,9 @@ export class BeignetNode extends EventEmitter {
 				'no-quorum': 'ROTATION_NO_QUORUM',
 				'not-catching-up': 'ROTATION_NOT_CATCHING_UP',
 				'same-set': 'INVALID_PARAMS',
-				malformed: 'INVALID_PARAMS'
+				malformed: 'INVALID_PARAMS',
+				// A lost journal: a retry never heals it, a restore does.
+				'journal-behind': 'ROTATION_UNAVAILABLE'
 			};
 			return new BeignetError(code[error.reason], error.message);
 		}
@@ -5795,14 +5862,23 @@ export class BeignetNode extends EventEmitter {
 
 	/**
 	 * The guardian this node serves to others (issue #699), for the status
-	 * route: `serving` false when hosting is off.
+	 * route: `serving` false when hosting is off. A guardian is dialled at
+	 * this node's Lightning address, so hosting without a bound TCP listener
+	 * serves nobody: `serving` is false then too, the host fields still say
+	 * what is held, and `listenError` says why (issue #861).
 	 */
 	getGuardianHostSurfaceStatus(): {
 		serving: boolean;
+		listenError?: ListenerProblem;
 	} & Partial<IGuardianHostStatus> {
 		const status = this.node?.getGuardianHostStatus() ?? null;
 		if (!status) return { serving: false };
-		return { serving: true, ...status };
+		const serving = this._listenPort !== undefined && this.node.isListening();
+		return {
+			serving,
+			...status,
+			...(this._listenError ? { listenError: { ...this._listenError } } : {})
+		};
 	}
 
 	/**
@@ -6111,8 +6187,15 @@ export class BeignetNode extends EventEmitter {
 			peerCount: info.peerCount,
 			listening: this.node.isListening()
 		};
+		if (this._requestedListenPort !== undefined) {
+			result.listenPort = this._requestedListenPort;
+		}
+		if (this._listenError) result.listenError = { ...this._listenError };
 		if (this._websocketPort !== undefined) {
 			result.websocketPort = this._websocketPort;
+		}
+		if (this._websocketListenError) {
+			result.websocketListenError = { ...this._websocketListenError };
 		}
 		return result;
 	}
@@ -11678,18 +11761,23 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	getPaymentProof(paymentHash: string): PaymentProof | null {
-		const proof = this.node.getPaymentProof(Buffer.from(paymentHash, 'hex'));
-		if (!proof) return null;
+		const hash = Buffer.from(paymentHash, 'hex');
+		const proof = this.node.getPaymentProof(hash);
+		// The proof is built from this record, so both exist or neither does.
+		// The sats come from the record, as getPayment's do: the proof carries
+		// only amountMsat and a route, which for an MPP send are the invoice
+		// amount and the first part.
+		const record = this.node.getPayment(hash);
+		if (!proof || !record) return null;
+		const feeMsat = paymentFeeMsat(record);
 		return {
 			paymentHash: proof.paymentHash.toString('hex'),
 			preimage: proof.preimage.toString('hex'),
-			amountSats: Number(proof.amountMsat / 1000n),
+			amountSats: paymentAmountSats(record),
 			completedAt: proof.completedAt,
 			invoice: proof.invoice,
 			hopCount: proof.route?.hops.length,
-			feeSats: proof.route
-				? Number(proof.route.totalFeeMsat / 1000n)
-				: undefined
+			feeSats: feeMsat !== undefined ? spendLimitSats(feeMsat) : undefined
 		};
 	}
 
@@ -11842,10 +11930,14 @@ export class BeignetNode extends EventEmitter {
 		return fields;
 	}
 
+	/**
+	 * The amount and fee come from paymentAmountSats and paymentFeeMsat, which
+	 * the proof and the stats share, so every surface reports one figure.
+	 */
 	private toPaymentInfo(p: IPaymentInfo): PaymentInfo {
 		const info: PaymentInfo = {
 			paymentHash: p.paymentHash.toString('hex'),
-			amountSats: Number(p.amountMsat / 1000n),
+			amountSats: paymentAmountSats(p),
 			status: p.status,
 			direction: p.direction,
 			createdAt: p.createdAt
@@ -11860,13 +11952,8 @@ export class BeignetNode extends EventEmitter {
 			// FAILED payment with nothing at all to explain it.
 			info.failureDescription = p.failureReason;
 		}
-		if (p.sentMsat !== undefined && p.sentMsat >= p.amountMsat) {
-			// An MPP record: its route is the first part only, so the fee
-			// is what left the node over what the invoice asked (#1008).
-			info.feeSats = Number((p.sentMsat - p.amountMsat) / 1000n);
-		} else if (p.route?.totalFeeMsat !== undefined) {
-			info.feeSats = Number(p.route.totalFeeMsat / 1000n);
-		}
+		const feeMsat = paymentFeeMsat(p);
+		if (feeMsat !== undefined) info.feeSats = spendLimitSats(feeMsat);
 		if (p.route) {
 			const hops = p.route.hops;
 			info.route = {
@@ -12971,7 +13058,7 @@ export class BeignetNode extends EventEmitter {
 			paymentHash: result.paymentHash.toString('hex'),
 			amountSats,
 			feeMsat: result.feeMsat.toString(),
-			feeSats: Number(result.feeMsat / 1000n),
+			feeSats: spendLimitSats(result.feeMsat),
 			hops: result.hops
 		};
 	}
@@ -13736,13 +13823,14 @@ export class BeignetNode extends EventEmitter {
 
 			if (p.direction === 'OUTGOING' && p.status === 'COMPLETED') {
 				sent++;
-				satsSent += Number(p.amountMsat / 1000n);
-				if (p.route?.totalFeeMsat !== undefined) {
-					const fee = Number(p.route.totalFeeMsat / 1000n);
-					feesPaid += fee;
+				// The same figures getPayment reports: what left the node, and
+				// for MPP the fee over every part, not the first (#1185).
+				satsSent += paymentAmountSats(p);
+				const feeMsat = paymentFeeMsat(p);
+				if (feeMsat !== undefined) {
+					feesPaid += spendLimitSats(feeMsat);
 					if (p.amountMsat > 0n) {
-						totalFeePct +=
-							(Number(p.route.totalFeeMsat) / Number(p.amountMsat)) * 100;
+						totalFeePct += (Number(feeMsat) / Number(p.amountMsat)) * 100;
 						feePctCount++;
 					}
 				}
@@ -14293,6 +14381,215 @@ export class BeignetNode extends EventEmitter {
 		source: 'scb' | 'capsule';
 	} | null {
 		return this._peerRetrievedScb;
+	}
+
+	// ─────────────── Inbound listeners ───────────────
+
+	/**
+	 * Forget every listener fact about the previous node: an in-process
+	 * rebuild (capsule restore resume, guardian restore) runs step 10 again
+	 * on a fresh node, and a stale `_listenPort` would still hand out a URI
+	 * nobody answers.
+	 */
+	private resetListenerState(): void {
+		this._listenEpoch++;
+		this._listenPort = undefined;
+		this._websocketPort = undefined;
+		this._requestedListenPort = undefined;
+		this._listenError = undefined;
+		this._websocketListenError = undefined;
+		this._listenBinds = {};
+	}
+
+	/**
+	 * Bind one configured listener, recording why when it does not bind.
+	 * Concurrent callers share the attempt in flight: a second bind of the
+	 * same port would fail on this node's own socket.
+	 */
+	private bindListener(kind: ListenerKind, port: number): Promise<void> {
+		const inFlight = this._listenBinds[kind];
+		if (inFlight) return inFlight;
+		const attempt: Promise<void> = this.attemptListen(kind, port).finally(
+			() => {
+				if (this._listenBinds[kind] === attempt) {
+					delete this._listenBinds[kind];
+				}
+			}
+		);
+		this._listenBinds[kind] = attempt;
+		return attempt;
+	}
+
+	private async attemptListen(kind: ListenerKind, port: number): Promise<void> {
+		const node = this.node;
+		const epoch = this._listenEpoch;
+		// The node can be torn down or replaced while the bind is in flight;
+		// the outcome then belongs to nobody.
+		const stale = (): boolean =>
+			this.destroyed || this.node !== node || this._listenEpoch !== epoch;
+		try {
+			if (kind === 'tcp') await node.listen(port);
+			else await node.listenWebSocket(port);
+		} catch (err) {
+			if (stale()) return;
+			const problem = this.classifyListenFailure(node, port, err);
+			const held = this.listenerProblem(kind)?.state === 'held';
+			this.setListenerProblem(kind, problem);
+			if (problem.state === 'failed') {
+				this.reportListenFailed(node, kind, problem);
+			} else if (problem.state === 'held' && !held) {
+				this.log(
+					'info',
+					`${listenerLabel(kind)} on port ${port} is held until ` +
+						'writer ownership is confirmed'
+				);
+			}
+			return;
+		}
+		if (stale()) return;
+		if (this.nodeFenced(node)) {
+			// A fence that landed as the bind resolved has closed it again.
+			this.setListenerProblem(kind, {
+				port,
+				state: 'fenced',
+				message: LISTENER_FENCED_MESSAGE
+			});
+			return;
+		}
+		const wasHeld = this.listenerProblem(kind)?.state === 'held';
+		if (kind === 'tcp') this._listenPort = port;
+		else this._websocketPort = port;
+		this.setListenerProblem(kind, undefined);
+		if (wasHeld) {
+			this.log('info', `${listenerLabel(kind)} bound on port ${port}`);
+		}
+	}
+
+	/**
+	 * An OS error code is a failed bind. The startup quarantine's refusal
+	 * (code STARTUP_QUARANTINE) is a hold that lifts once writer ownership
+	 * is confirmed, unless the node is fenced, when it never lifts.
+	 */
+	private classifyListenFailure(
+		node: LightningNode,
+		port: number,
+		err: unknown
+	): ListenerProblem {
+		const message = err instanceof Error ? err.message : String(err);
+		const rawCode =
+			err !== null && typeof err === 'object' && 'code' in err
+				? (err as { code: unknown }).code
+				: undefined;
+		const code = typeof rawCode === 'string' ? rawCode : undefined;
+		const errno = code !== 'STARTUP_QUARANTINE' ? code : undefined;
+		if (errno === undefined && this.nodeFenced(node)) {
+			return { port, state: 'fenced', message: LISTENER_FENCED_MESSAGE };
+		}
+		if (code === 'STARTUP_QUARANTINE') {
+			return { port, state: 'held', message: LISTENER_HELD_MESSAGE };
+		}
+		return { port, state: 'failed', message, ...(errno ? { errno } : {}) };
+	}
+
+	/**
+	 * Raise a failed bind as node:error LISTEN_FAILED through the node's own
+	 * funnel, which logs it and keeps it in the action log (GET
+	 * /logs?category=error) before onError and the relay see it. A throwing
+	 * observer must not turn a non-fatal bind into a boot failure: the state
+	 * is recorded either way.
+	 */
+	private reportListenFailed(
+		node: LightningNode,
+		kind: ListenerKind,
+		problem: ListenerProblem
+	): void {
+		try {
+			const hosting =
+				kind === 'tcp' && node.getGuardianHostStatus() !== null
+					? ' and the guardian this node hosts is unreachable'
+					: '';
+			node.emit('node:error', {
+				code: 'LISTEN_FAILED',
+				message:
+					`${listenerLabel(kind)} could not bind port ${problem.port}: ` +
+					`${problem.message}; inbound peers cannot connect${hosting}`,
+				timestamp: Date.now()
+			});
+		} catch {
+			// An observer threw; the failure is recorded on /info.
+		}
+	}
+
+	private nodeFenced(node: LightningNode): boolean {
+		try {
+			return (
+				node.getRecoveryGateState() === 'fenced' ||
+				node.getRecoveryStatus().fenced
+			);
+		} catch {
+			// A status read that throws must not turn a bind outcome into a
+			// boot failure; the fence relay still records it.
+			return false;
+		}
+	}
+
+	private listenerProblem(kind: ListenerKind): ListenerProblem | undefined {
+		return kind === 'tcp' ? this._listenError : this._websocketListenError;
+	}
+
+	private setListenerProblem(
+		kind: ListenerKind,
+		problem: ListenerProblem | undefined
+	): void {
+		if (kind === 'tcp') this._listenError = problem;
+		else this._websocketListenError = problem;
+	}
+
+	/**
+	 * Retry every listener the startup quarantine held. Runs when the gate
+	 * confirms and on node:ready (which waits for a startup repair's
+	 * receipt); an attempt made while the quarantine still holds records
+	 * the hold again, and a fenced node never binds. Never throws: it runs
+	 * inside event relays.
+	 */
+	private bindHeldListeners(): void {
+		if (this.destroyed || !this.node) return;
+		const held: Array<[ListenerKind, number]> = [];
+		for (const kind of ['tcp', 'websocket'] as const) {
+			const problem = this.listenerProblem(kind);
+			if (problem?.state === 'held') held.push([kind, problem.port]);
+		}
+		if (held.length === 0) return;
+		if (this.nodeFenced(this.node)) {
+			this.fenceListeners();
+			return;
+		}
+		for (const [kind, port] of held) {
+			void this.bindListener(kind, port).catch(() => undefined);
+		}
+	}
+
+	/**
+	 * A fenced node's listeners stay down: the hard freeze closed any bound
+	 * one before the fence was relayed, and a held one never binds. Record
+	 * both as fenced, and forget the bound port so no URI is handed out for
+	 * a socket nobody answers. A failed bind keeps its OS error.
+	 */
+	private fenceListeners(): void {
+		for (const kind of ['tcp', 'websocket'] as const) {
+			const problem = this.listenerProblem(kind);
+			const bound = kind === 'tcp' ? this._listenPort : this._websocketPort;
+			const port =
+				bound ?? (problem?.state === 'held' ? problem.port : undefined);
+			if (port === undefined) continue;
+			if (kind === 'tcp') this._listenPort = undefined;
+			else this._websocketPort = undefined;
+			this.setListenerProblem(kind, {
+				port,
+				state: 'fenced',
+				message: LISTENER_FENCED_MESSAGE
+			});
+		}
 	}
 
 	// ─────────────── Node URI ───────────────

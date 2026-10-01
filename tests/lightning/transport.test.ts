@@ -587,4 +587,84 @@ describe('Lightning Transport (BOLT 8)', function () {
 			expect(() => transport.encryptPacket(oversizedPayload)).to.throw();
 		});
 	});
+
+	describe('Gossip write backpressure (issue #969)', function () {
+		const { Peer } = require('../../src/lightning/transport/peer');
+		const { MessageType } = require('../../src/lightning/message/types');
+		const MB = 1024 * 1024;
+		// reply_short_channel_ids_end: chain_hash, full_information = 1.
+		const END = Buffer.concat([Buffer.alloc(32, 0xab), Buffer.from([1])]);
+
+		/** A ready connection with this many bytes already buffered. */
+		function saturatedPeer(buffered: number): {
+			send: (type: number, payload: Buffer) => void;
+			written: { type: number; payload: Buffer }[];
+		} {
+			const peer = new Peer({
+				localPrivateKey: crypto.randomBytes(32),
+				remotePublicKey: getPublicKey(crypto.randomBytes(32)),
+				host: '127.0.0.1',
+				port: 9735
+			});
+			const written: { type: number; payload: Buffer }[] = [];
+			Object.assign(peer, {
+				state: 'ready',
+				transport: { encryptPacket: (message: Buffer): Buffer => message },
+				socket: {
+					writableLength: buffered,
+					write: (data: Buffer): boolean => {
+						written.push({
+							type: data.readUInt16BE(0),
+							payload: data.subarray(2)
+						});
+						return false;
+					}
+				}
+			});
+			return {
+				send: (type, payload): void => peer.sendMessage(type, payload),
+				written
+			};
+		}
+
+		it('drops broadcast gossip but not the sync replies', function () {
+			const { send, written } = saturatedPeer(4 * MB + 1);
+			send(MessageType.CHANNEL_ANNOUNCEMENT, Buffer.alloc(8));
+			send(MessageType.CHANNEL_UPDATE, Buffer.alloc(8));
+			send(MessageType.NODE_ANNOUNCEMENT, Buffer.alloc(8));
+			send(MessageType.REPLY_SHORT_CHANNEL_IDS_END, END);
+			send(MessageType.REPLY_CHANNEL_RANGE, Buffer.alloc(8));
+
+			expect(written.map((w) => w.type)).to.eql([
+				MessageType.REPLY_SHORT_CHANNEL_IDS_END,
+				MessageType.REPLY_CHANNEL_RANGE
+			]);
+			// The gossip ahead of the marker may be gone, so it is not whole.
+			expect(written[0].payload.subarray(0, 32)).to.eql(END.subarray(0, 32));
+			expect(written[0].payload[32]).to.equal(0);
+			expect(END[32]).to.equal(1);
+		});
+
+		it('keeps full_information when nothing was dropped', function () {
+			const { send, written } = saturatedPeer(4 * MB);
+			send(MessageType.CHANNEL_ANNOUNCEMENT, Buffer.alloc(8));
+			send(MessageType.REPLY_SHORT_CHANNEL_IDS_END, END);
+
+			expect(written.map((w) => w.type)).to.eql([
+				MessageType.CHANNEL_ANNOUNCEMENT,
+				MessageType.REPLY_SHORT_CHANNEL_IDS_END
+			]);
+			expect(written[1].payload[32]).to.equal(1);
+		});
+
+		it('drops sync replies too once 1 MB past the gossip cap', function () {
+			const { send, written } = saturatedPeer(5 * MB + 1);
+			for (let i = 0; i < 100; i++) {
+				send(MessageType.REPLY_CHANNEL_RANGE, Buffer.alloc(60_000));
+			}
+			send(MessageType.REPLY_SHORT_CHANNEL_IDS_END, END);
+
+			expect(written).to.eql([]);
+		});
+	});
 });

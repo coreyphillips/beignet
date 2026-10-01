@@ -1065,6 +1065,12 @@ export class LightningNode extends EventEmitter {
 	private readonly forwardingPolicyGraceMs: number;
 	private gossipSyncManagers: Map<string, GossipSyncManager> = new Map();
 	/**
+	 * A sync lost gossip and its connection closed before a sync fetched it
+	 * again. The next sync started asks for every channel, since the holes
+	 * may be dropped updates that getMissingSCIDs cannot see.
+	 */
+	private gossipRepairPending = false;
+	/**
 	 * Broadcast gossip intake (beignet issue #437). Announcements and updates
 	 * are queued here and verified in time-budgeted slices off the event loop,
 	 * because a peer serving a full graph dump carries hundreds of thousands
@@ -6760,15 +6766,20 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Public networking entry points refuse loudly while the gate is closed,
 	 * rather than parking: a fenced gate never opens, and a parked promise
-	 * on a fenced node would hang its caller forever.
+	 * on a fenced node would hang its caller forever. The refusal carries
+	 * code STARTUP_QUARANTINE so a caller can tell it from a transport
+	 * failure without matching the message (issue #933).
 	 */
 	private assertPeerContactPermitted(operation: string): void {
 		if (this.recoveryPermitsPeerTraffic()) return;
 		this.recoveryGate?.reportBlocked(
 			`refused ${operation} while ${this.getRecoveryGateState()}`
 		);
-		throw new Error(
-			`Startup quarantine: ${operation} is refused until writer ownership is confirmed (gate is ${this.getRecoveryGateState()})`
+		throw Object.assign(
+			new Error(
+				`Startup quarantine: ${operation} is refused until writer ownership is confirmed (gate is ${this.getRecoveryGateState()})`
+			),
+			{ code: 'STARTUP_QUARANTINE' }
 		);
 	}
 
@@ -6848,6 +6859,9 @@ export class LightningNode extends EventEmitter {
 		this.peerManager.on('peer:disconnect', (pubkey: string) => {
 			this.guardianHost?.sessionClosed(pubkey);
 			this.channelManager.handlePeerDisconnected(pubkey);
+			if (this.gossipSyncManagers.get(pubkey)?.repairPending) {
+				this.gossipRepairPending = true;
+			}
 			this.gossipSyncManagers.delete(pubkey);
 			this.rateLimiter.removePeer(pubkey);
 			this.notifyPeerDisconnectObservers(pubkey);
@@ -15443,8 +15457,20 @@ export class LightningNode extends EventEmitter {
 				if (syncMgr) {
 					const msg = decodeReplyShortChannelIdsEndMessage(payload);
 					const responses = syncMgr.handleReplyShortChannelIdsEnd(msg);
-					for (const resp of responses) {
-						this.emitOutbound(pubkey, resp.type, resp.payload);
+					// The batch this marker closes may still be queued. A fast
+					// peer's next reply would land behind it and overflow the
+					// intake, so the next query waits for the intake to drain.
+					if (responses.length > 0) {
+						void this.flushGossip().then(() => {
+							if (this.gossipSyncManagers.get(pubkey) !== syncMgr) return;
+							try {
+								for (const resp of responses) {
+									this.emitOutbound(pubkey, resp.type, resp.payload);
+								}
+							} catch {
+								// Peer disconnected while the intake drained.
+							}
+						});
 					}
 				}
 				break;
@@ -15498,6 +15524,7 @@ export class LightningNode extends EventEmitter {
 				});
 			}
 			this.gossipIntakeDropped++;
+			this.gossipSyncManagers.get(pubkey)?.noteIntakeLoss();
 			return;
 		}
 		this.gossipIntake.push({ pubkey, type, payload });
@@ -15670,10 +15697,12 @@ export class LightningNode extends EventEmitter {
 	initiateGossipSync(pubkey: string): void {
 		pubkey = normalizeHexPubkey(pubkey);
 		const mgr = this.getOrCreateSyncManager(pubkey);
-		const messages = mgr.initiateSync();
+		const messages = mgr.initiateSync(this.gossipRepairPending);
 		for (const msg of messages) {
 			this.emitOutbound(pubkey, msg.type, msg.payload);
 		}
+		// The manager holds the repair now. Its disconnect hands it back.
+		this.gossipRepairPending = false;
 	}
 
 	/**
