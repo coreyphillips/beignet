@@ -46,7 +46,7 @@ export type IDfWallet = Pick<
 	| 'listUtxos'
 	| 'isUtxoFrozen'
 	| 'listFrozenUtxos'
-	| 'freezeUtxo'
+	| 'freezeUtxoIfUnfrozen'
 	| 'unfreezeUtxo'
 	| 'getPrivateKey'
 	| 'getChangeAddress'
@@ -303,12 +303,14 @@ export function directFundingWallet(
 			// against when this payer took it. Anyone else's is a coin withheld from
 			// us, and the wallet's Ok would otherwise read as our own.
 			if (held) return held.freezeTag === DF_FREEZE_TAG;
-			const result = await wallet.freezeUtxo({
+			// No entry here can still mean one under the wallet's lock: a freeze
+			// queued ahead of this call creates it first, and it is not ours.
+			const result = await wallet.freezeUtxoIfUnfrozen({
 				txid: txidHex,
 				index: vout,
 				tag: DF_FREEZE_TAG
 			});
-			return result.isOk();
+			return result.isOk() && result.value.created;
 		},
 
 		async unfreezeUtxo(txidHex: string, vout: number): Promise<boolean> {
