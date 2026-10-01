@@ -1077,6 +1077,125 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
+	it('moves a held attempt to the head a quorum advanced to, keeping its key', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		// Issue #1256. G1 accepts the acquisition over N and drops off; the
+		// live writer then takes both G2 and G3 to N+1, so no quorum can
+		// ever grant the attempt over N again.
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const clients = served.map((s) => s.client);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		const guard = (await clients[0].getHead(ROOT.recoveryId))
+			.state as GuardianState;
+
+		const acquireLost = (index: number): IBoundGuardianClient => ({
+			expectedGuardianId: served[index].id,
+			client: new GuardianClient({
+				url: served[index].client.url,
+				guardianSetId: SET_ID,
+				transport: async (
+					url,
+					init
+				): Promise<{ status: number; body: Buffer }> => {
+					if (url.endsWith('/acquire_epoch')) {
+						throw new GuardianTransportError('acquire lost in transit');
+					}
+					return nodeGuardianTransport()(url, init);
+				}
+			})
+		});
+		const target = openStorage();
+		try {
+			await driverFor(target, [
+				{ expectedGuardianId: served[0].id, client: clients[0] },
+				acquireLost(1),
+				acquireLost(2)
+			]).restore();
+			expect.fail('the takeover cannot complete against one guardian');
+		} catch (error) {
+			expect((error as RestoreRefusedError).reason).to.equal('cas-exhausted');
+		}
+		const pending = JSON.parse(
+			target.getRecoveryMeta!(RESTORE_META_KEYS.pendingAcquisition) as string
+		) as { newEpoch: string; writerPublicKey: string };
+		const epoch = BigInt(pending.newEpoch);
+		expect(epoch).to.equal(guard.lease.epoch + 1n);
+
+		await served[0].server.close();
+		live.manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, 79).toString('hex'),
+					preimage: Buffer.alloc(32, 79)
+				}
+			],
+			outboundMessages: []
+		});
+		const all = live.storage.loadRecoveryFrames();
+		const tail = rep.signRecord(all[all.length - 1], lease);
+		for (const client of clients.slice(1)) {
+			expect((await client.putState(tail)).status).to.equal(GuardianStatus.OK);
+		}
+
+		// Every member is back. The attempt keeps its epoch and key and is
+		// granted over N+1, which the restore therefore includes.
+		const revived = new GuardianHttpServer({ guardian: served[0].guardian });
+		const revivedPort = await revived.listen(0);
+		const revivedClient = new GuardianClient({
+			url: `http://127.0.0.1:${revivedPort}`,
+			guardianSetId: SET_ID
+		});
+		const members: IBoundGuardianClient[] = [
+			{ client: revivedClient, expectedGuardianId: served[0].id },
+			...bind(served.slice(1))
+		];
+		const events: IRestoreEvent[] = [];
+		const result = await driverFor(target, members, events).restore();
+		expect(events.some((e) => e.type === 'epoch:retargeted')).to.equal(true);
+		expect(events.some((e) => e.type === 'epoch:abandoned')).to.equal(false);
+		expect(result.lease.epoch).to.equal(epoch);
+		expect(result.lease.writerPublicKey.toString('hex')).to.equal(
+			pending.writerPublicKey
+		);
+		expect(result.certifiedState.logHead.sequence).to.equal(
+			guard.logHead.sequence + 1n
+		);
+		expect(dumpTables(target)).to.equal(dumpTables(live.storage));
+		for (const client of [revivedClient, ...clients.slice(1)]) {
+			const head = await client.getHead(ROOT.recoveryId);
+			for (const cert of head.certificates ?? []) {
+				if (cert.newEpoch !== epoch) continue;
+				expect(cert.newWriterPublicKey.toString('hex')).to.equal(
+					pending.writerPublicKey
+				);
+			}
+		}
+
+		// G1 still holds its certificate over N. A later restore reads it
+		// beside the quorum's over N+1 and follows the quorum.
+		const later = openStorage();
+		const next = await driverFor(later, members).restore();
+		expect(next.lease.epoch).to.equal(epoch + 1n);
+		expect(next.certifiedState.logHead.sequence).to.equal(
+			guard.logHead.sequence + 1n
+		);
+		expect(dumpTables(later)).to.equal(dumpTables(live.storage));
+
+		await revived.close();
+		await shutdown(served);
+		live.storage.close();
+		target.close();
+		later.close();
+	});
+
 	it('repairs a guardian that missed the takeover and discards its superseded tail', async function (): Promise<void> {
 		// Real guardians over real TCP: the default 2s is not enough under
 		// full-suite load, and a load-sensitive timeout is a flaky test.

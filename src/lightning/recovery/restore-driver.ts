@@ -240,6 +240,7 @@ export interface IRestoreEvent {
 		| 'epoch:cas-retry'
 		| 'epoch:resumed'
 		| 'epoch:abandoned'
+		| 'epoch:retargeted'
 		| 'set:rotated'
 		| 'set:retired-unproven'
 		| 'frames:downloaded'
@@ -288,11 +289,11 @@ interface IPendingAttempt {
  *
  * An acquisition stops being a local decision the moment a guardian accepts
  * it: that guardian is now bound to this exact (epoch, writer key), and the
- * only way to finish the takeover is to present the IDENTICAL request
- * again, which the protocol answers idempotently with the stored
- * certificate. Generating a fresh key on retry instead would strand the
- * accepted epoch and chase the log upward one guardian at a time, burning
- * an epoch per attempt and never assembling a quorum.
+ * takeover can only finish under them, by presenting the IDENTICAL request
+ * again (answered idempotently with the stored certificate) or the same
+ * epoch and key over a newer guard. Generating a fresh key on retry instead
+ * would strand the accepted epoch and chase the log upward one guardian at
+ * a time, burning an epoch per attempt and never assembling a quorum.
  */
 interface IPersistedAcquisitionV1 {
 	version: 1;
@@ -300,6 +301,26 @@ interface IPersistedAcquisitionV1 {
 	newEpoch: string;
 	writerSecret: string;
 	writerPublicKey: string;
+}
+
+/**
+ * Whether two certificates for one epoch can both come from honest
+ * guardians: the same takeover, or one writer key granted the epoch over
+ * two heads of the same superseded lease. The second happens when a
+ * resumed attempt keeps its key and moves to a newer guard (issue #1256).
+ */
+function certificatesAgree(
+	a: IGuardianTakeoverCertificate,
+	b: IGuardianTakeoverCertificate
+): boolean {
+	if (!a.newWriterPublicKey.equals(b.newWriterPublicKey)) return false;
+	const left = a.supersededState;
+	const right = b.supersededState;
+	return (
+		statesEqual(left, right) ||
+		(left.logHead.sequence !== right.logHead.sequence &&
+			statesEqual({ ...left, logHead: right.logHead }, right))
+	);
 }
 
 export class RestoreDriver {
@@ -624,28 +645,33 @@ export class RestoreDriver {
 			}
 			if (!seen) byPosition.set(key, reading.state);
 		}
-		const byEpoch = new Map<string, IGuardianTakeoverCertificate>();
+		const conflict = (epoch: bigint): RestoreRefusedError =>
+			new RestoreRefusedError(
+				'conflict',
+				`conflicting takeover certificates for epoch ${epoch}; ` +
+					'outside the crash-fault model, halting the restore'
+			);
+		const byEpoch = new Map<string, IGuardianTakeoverCertificate[]>();
 		for (const reading of readings) {
 			for (const cert of reading.certificates) {
 				const key = cert.newEpoch.toString();
-				const seen = byEpoch.get(key);
-				if (
-					seen &&
-					(!stateBytes(seen.supersededState).equals(
-						stateBytes(cert.supersededState)
-					) ||
-						// Two valid certificates granting ONE epoch to different
-						// writer keys is exactly the conflict this check exists for.
-						!seen.newWriterPublicKey.equals(cert.newWriterPublicKey))
-				) {
-					throw new RestoreRefusedError(
-						'conflict',
-						`conflicting takeover certificates for epoch ${cert.newEpoch}; ` +
-							'outside the crash-fault model, halting the restore'
-					);
+				const seen = byEpoch.get(key) ?? [];
+				// Two valid certificates granting ONE epoch to different writer
+				// keys is exactly the conflict this check exists for.
+				if (seen.some((other) => !certificatesAgree(other, cert))) {
+					throw conflict(cert.newEpoch);
 				}
-				if (!seen) byEpoch.set(key, cert);
+				byEpoch.set(key, [...seen, cert]);
 			}
+		}
+		// One key may hold certificates over several heads, but a guardian
+		// grants an epoch once, so only one of those heads can gather a quorum.
+		const quorumEpochs = new Set<string>();
+		for (const bundle of this.certificateBundles(readings)) {
+			if (bundle.length < this.config.required) continue;
+			const key = bundle[0].newEpoch.toString();
+			if (quorumEpochs.has(key)) throw conflict(bundle[0].newEpoch);
+			quorumEpochs.add(key);
 		}
 	}
 
@@ -842,12 +868,59 @@ export class RestoreDriver {
 		return [...bySigner.values()];
 	}
 
+	/** A state that granted the attempt's epoch and key over `guard`. */
+	private grantedOver(
+		state: GuardianState,
+		attempt: IPendingAttempt,
+		guard: GuardianState
+	): boolean {
+		return statesEqual(state, {
+			...guard,
+			lease: {
+				epoch: attempt.newEpoch,
+				writerPublicKey: attempt.writer.publicKey
+			}
+		});
+	}
+
 	/** A guardian that granted this attempt and has not moved past it. */
 	private boundTo(reading: IHeadReading, attempt: IPendingAttempt): boolean {
-		return (
-			reading.state.lease.epoch === attempt.newEpoch &&
-			reading.state.lease.writerPublicKey.equals(attempt.writer.publicKey)
+		return this.grantedOver(reading.state, attempt, attempt.expectedState);
+	}
+
+	/**
+	 * How many committed members may still grant the attempt's epoch and key
+	 * over `guard`. A head rules a member out once it granted the epoch over
+	 * another head, moved past the guard, or left the guard's epoch for
+	 * another takeover; one below the guard can still be repaired up to it,
+	 * and one without a head may be either.
+	 */
+	private mayGrant(
+		attempt: IPendingAttempt,
+		guard: GuardianState,
+		readings: IHeadReading[],
+		stale: IHeadReading[]
+	): number {
+		const canGrant = (state: GuardianState): boolean => {
+			if (state.lease.epoch === attempt.newEpoch) {
+				return this.grantedOver(state, attempt, guard);
+			}
+			if (state.lease.epoch === guard.lease.epoch) {
+				return (
+					statesEqual(state, guard) ||
+					state.logHead.sequence < guard.logHead.sequence
+				);
+			}
+			return state.lease.epoch < guard.lease.epoch;
+		};
+		const ruledOut = new Set(
+			[...readings, ...stale]
+				.filter((reading) => !canGrant(reading.state))
+				.map((reading) => reading.guardianId.toString('hex'))
 		);
+		return this.config.context.members.filter(
+			(member) => !ruledOut.has(member.toString('hex'))
+		).length;
 	}
 
 	/**
@@ -906,7 +979,8 @@ export class RestoreDriver {
 	 * sent and RETRIED IDENTICALLY, because once a guardian accepts an
 	 * acquisition it is bound to that exact (epoch, writer key) and answers
 	 * the repeat with its stored certificate. Only evidence that a DIFFERENT
-	 * acquisition reached quorum retires a pending one.
+	 * acquisition reached quorum retires a pending one. Its guard may move to
+	 * a newer head of the same epoch; its epoch and key never do.
 	 */
 	private async acquireEpoch(
 		target: IHeadReading,
@@ -935,9 +1009,9 @@ export class RestoreDriver {
 
 		for (let attempt = 1; attempt <= this.maxCasAttempts; attempt++) {
 			// A guardian that may hold the pending attempt can grant nothing
-			// else, so the attempt completes over its own guard or not at all.
-			// Repairing laggards toward a newer head would carry them past that
-			// guard, where they can never grant it either (issue #1040).
+			// else, so this round completes it over its own guard or not at
+			// all. Repairing laggards toward a newer head would carry them past
+			// that guard, where they can never grant it either (issue #1040).
 			const repairTarget =
 				held && pending ? this.guardReading(pending, pool) : expected;
 			if (repairTarget) {
@@ -1032,9 +1106,9 @@ export class RestoreDriver {
 			pool = refreshed.readings;
 			stalePool = refreshed.stale;
 			expected = this.selectHead(pool);
-			// A pending acquisition is kept and retried VERBATIM while any
-			// guardian might be bound to it, which is what makes a partial
-			// acceptance recoverable. It is retired in exactly two cases.
+			// A pending acquisition keeps its epoch and key while any guardian
+			// might be bound to it, which is what makes a partial acceptance
+			// recoverable. It is retired in exactly two cases.
 			const attemptSoFar = pending as IPendingAttempt;
 			// One: a quorum-certified takeover superseded it, so it can never
 			// complete no matter how often it is retried.
@@ -1070,6 +1144,31 @@ export class RestoreDriver {
 				this.clearPending();
 				pending = null;
 				held = false;
+			} else if (
+				guardMoved &&
+				expected.state.lease.epoch + 1n === attemptSoFar.newEpoch &&
+				this.mayGrant(
+					attemptSoFar,
+					attemptSoFar.expectedState,
+					pool,
+					stalePool
+				) < this.config.required &&
+				this.mayGrant(attemptSoFar, expected.state, pool, stalePool) >=
+					this.config.required
+			) {
+				// Held, but too few members can still grant its guard: the old
+				// writer moved the rest past it (issue #1256). The same epoch
+				// and key move to the reconciled head instead, so no other key
+				// is ever granted the epoch. A guardian grants an epoch once,
+				// so the old guard and the new one cannot both reach a quorum.
+				pending = { ...attemptSoFar, expectedState: expected.state };
+				this.savePending(pending);
+				this.emit(
+					'epoch:retargeted',
+					`epoch ${attemptSoFar.newEpoch} can no longer be granted over sequence ` +
+						`${attemptSoFar.expectedState.logHead.sequence}; keeping its writer key ` +
+						`over sequence ${expected.state.logHead.sequence}`
+				);
 			}
 		}
 		throw new RestoreRefusedError(

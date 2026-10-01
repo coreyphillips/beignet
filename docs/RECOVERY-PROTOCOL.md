@@ -634,7 +634,13 @@ Head reconciliation and stale-guardian repair (revision 3). "Reconcile the highe
 6. two distinct records at the same (epoch, sequence), or conflicting
    takeover certificates for one epoch: outside the crash-fault model
    (a Byzantine writer or guardian). Halt the restore, surface both
-   artifacts to the operator, take no channel action.
+   artifacts to the operator, take no channel action. Certificates
+   granting one epoch to ONE writer key over two heads of the same
+   superseded lease do not conflict: a resumed acquisition keeps its
+   epoch and key and moves its guard to the adopted head once too few
+   guardians can still grant the old one. A guardian grants an epoch
+   once, so only one of those heads can gather a quorum; two that do
+   are a conflict.
 ```
 
 Rotation comes before all of this (wire 5.9, 5.11; issue #714). The set the restore device reads may have retired the namespace in favour of another, and the retirement is accepted by as few as one member, so step 1 also checks every answer for a root-signed rotation that verifies and, finding one, ends the restore with a `rotated` outcome carrying the incoming set before any head is adopted or any repair or takeover is sent; an `ERR_SET_RETIRED` answer to the takeover re-reads the heads and verifies the rotation before any certificate quorum is counted. The device then restores from the incoming set.
