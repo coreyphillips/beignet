@@ -12,12 +12,14 @@ import {
 	ChannelCloseReason
 } from '../channel/channel-state';
 import {
+	FF_CONCURRENT_VERSION,
 	FforAbortReason,
 	FforRole,
 	FforSlotState,
 	FforState,
 	IFforEpochRecord
 } from '../ffor/types';
+import { fforTranscriptConcurrentVersion } from '../ffor/messages';
 import { ShaChainStore, IShaChainEntry } from '../keys/shachain';
 import { IChannelBasepoints } from '../keys/derivation';
 import {
@@ -1108,6 +1110,8 @@ export interface ISerializedFforEpoch {
 		voucherAmountsMsat: string[];
 		witnessPeers?: string[];
 		hashChain?: boolean;
+		/** ff_init TLV 17 as requested; absent when the TLV was. */
+		concurrentVersion?: number;
 	};
 	remoteNodeId: string;
 	initWire: string;
@@ -1151,6 +1155,12 @@ export interface ISerializedFforEpoch {
 	abortReason: number | null;
 	closeSent: boolean;
 	activationMismatch: boolean;
+	/**
+	 * The selected profile (see IFforEpochRecord.concurrentVersion). Written
+	 * only for a concurrent epoch, so a baseline record serializes to the
+	 * bytes it always did; absent reads as baseline.
+	 */
+	concurrentVersion?: number;
 }
 
 export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
@@ -1175,7 +1185,10 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 			...(f.params.witnessPeers
 				? { witnessPeers: f.params.witnessPeers.map((p) => p.toString('hex')) }
 				: {}),
-			...(f.params.hashChain ? { hashChain: true } : {})
+			...(f.params.hashChain ? { hashChain: true } : {}),
+			...(f.params.concurrentVersion !== undefined
+				? { concurrentVersion: f.params.concurrentVersion }
+				: {})
 		},
 		remoteNodeId: f.remoteNodeId.toString('hex'),
 		initWire: f.initWire.toString('hex'),
@@ -1216,13 +1229,67 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 		unwindOwed: f.unwindOwed,
 		abortReason: f.abortReason,
 		closeSent: f.closeSent,
-		activationMismatch: f.activationMismatch
+		activationMismatch: f.activationMismatch,
+		...(f.concurrentVersion === FF_CONCURRENT_VERSION
+			? { concurrentVersion: FF_CONCURRENT_VERSION }
+			: {})
+	};
+}
+
+/**
+ * The selected profile of a stored epoch, checked against the transcript
+ * it was persisted with (CONCURRENT-RECEIVE.md section 1.1: the version is
+ * never inferred from features, connection status or preferences, and
+ * section 8: it is compared with the persisted setup bytes).
+ *
+ * The stored field and the stored ff_init and ff_accept must tell one
+ * story: a request and its exact echo beside a selected version, or no
+ * TLV 17 in either beside none. When they do not (a row a build without
+ * the field rewrote, a damaged row), the record is never read as a
+ * baseline epoch: it is concurrent if either source says so, and
+ * `mismatch` is set so the caller raises activationMismatch, which stops
+ * new work on both sides and leaves the vouchers and every existing
+ * obligation in place. A record whose wires do not decode and whose field
+ * is absent is left alone; there is nothing to compare.
+ */
+function storedConcurrentVersion(
+	storedField: number | undefined,
+	requestedField: number | undefined,
+	initWire: Buffer,
+	acceptWire: Buffer | null
+): { selected: 0 | 1; mismatch: boolean } {
+	const stored = storedField === FF_CONCURRENT_VERSION;
+	const transcript = fforTranscriptConcurrentVersion(initWire, acceptWire);
+	if (transcript === null) {
+		return { selected: stored ? 1 : 0, mismatch: stored };
+	}
+	const { requested, echoed } = transcript;
+	const accepted = acceptWire !== null;
+	const selectedOnWire =
+		accepted &&
+		requested === FF_CONCURRENT_VERSION &&
+		echoed === FF_CONCURRENT_VERSION;
+	const consistent =
+		selectedOnWire === stored &&
+		requested === requestedField &&
+		(!accepted || echoed === requested);
+	return {
+		selected: stored || selectedOnWire ? 1 : 0,
+		mismatch: !consistent
 	};
 }
 
 export function deserializeFforEpoch(
 	s: ISerializedFforEpoch
 ): IFforEpochRecord {
+	const initWire = Buffer.from(s.initWire, 'hex');
+	const acceptWire = hexToBuf(s.acceptWire);
+	const concurrent = storedConcurrentVersion(
+		s.concurrentVersion,
+		s.params.concurrentVersion,
+		initWire,
+		acceptWire
+	);
 	return {
 		role: s.role as FforRole,
 		state: s.state as FforState,
@@ -1248,11 +1315,14 @@ export function deserializeFforEpoch(
 						)
 				  }
 				: {}),
-			...(s.params.hashChain ? { hashChain: true } : {})
+			...(s.params.hashChain ? { hashChain: true } : {}),
+			...(s.params.concurrentVersion !== undefined
+				? { concurrentVersion: s.params.concurrentVersion }
+				: {})
 		},
 		remoteNodeId: Buffer.from(s.remoteNodeId, 'hex'),
-		initWire: Buffer.from(s.initWire, 'hex'),
-		acceptWire: hexToBuf(s.acceptWire),
+		initWire,
+		acceptWire,
 		sCommitmentNumber:
 			s.sCommitmentNumber === null ? null : strToBigint(s.sCommitmentNumber),
 		sHtlcIdBase: s.sHtlcIdBase === null ? null : strToBigint(s.sHtlcIdBase),
@@ -1292,7 +1362,10 @@ export function deserializeFforEpoch(
 				? null
 				: (s.abortReason as FforAbortReason),
 		closeSent: s.closeSent === true,
-		activationMismatch: s.activationMismatch === true
+		activationMismatch: s.activationMismatch === true || concurrent.mismatch,
+		...(concurrent.selected === FF_CONCURRENT_VERSION
+			? { concurrentVersion: FF_CONCURRENT_VERSION }
+			: {})
 	};
 }
 

@@ -6036,6 +6036,51 @@ export class ChannelManager extends EventEmitter {
 		);
 	}
 
+	/**
+	 * Where a peer's init features are read from when no peer manager holds
+	 * them. A test seam: the loopback harnesses drive two managers with no
+	 * transport, so nothing ever records an init exchange. Null (the
+	 * default) reads the peer manager; a source answering null is a peer
+	 * whose init is unknown.
+	 */
+	private fforPeerFeatureSource:
+		| ((peerPubkey: string) => FeatureFlags | null)
+		| null = null;
+
+	setFforPeerFeatureSource(
+		source: ((peerPubkey: string) => FeatureFlags | null) | null
+	): void {
+		this.fforPeerFeatureSource = source;
+	}
+
+	/**
+	 * Whether the current init exchange negotiated concurrent receive
+	 * (CONCURRENT-RECEIVE.md section 1.1): each side advertised either bit
+	 * of option_ff_receive (560/561) and either bit of option_ff_concurrent
+	 * (562/563). Unlike peerSupportsFfor this is FALSE when the peer's init
+	 * is unknown: an advertisement that was not seen selects nothing, and
+	 * the reconnect check of section 8 must not pass on a guess.
+	 */
+	private peerNegotiatedFforConcurrent(peerPubkey: string): boolean {
+		const local = this.config.localFeatures;
+		if (
+			!local ||
+			!local.hasFeature(Feature.OPTION_FF_RECEIVE) ||
+			!local.hasFeature(Feature.OPTION_FF_CONCURRENT)
+		) {
+			return false;
+		}
+		const remote = this.fforPeerFeatureSource
+			? this.fforPeerFeatureSource(peerPubkey)
+			: this.peerManager?.getPeer(peerPubkey)?.getRemoteInit()?.features ??
+			  null;
+		if (!remote) return false;
+		return (
+			remote.hasFeature(Feature.OPTION_FF_RECEIVE) &&
+			remote.hasFeature(Feature.OPTION_FF_CONCURRENT)
+		);
+	}
+
 	/** Hand the channel its peer's node id and our node-key signer. */
 	/** S's terms for answering ff_init (issue #729); null answers on any. */
 	private fforSettlePolicy: IFforSettlePolicy | null = null;
@@ -6055,7 +6100,8 @@ export class ChannelManager extends EventEmitter {
 			signFn: nodeKey
 				? (digest: Buffer): Buffer => signWithNodeKey(digest, nodeKey)
 				: null,
-			nodePrivateKey: nodeKey
+			nodePrivateKey: nodeKey,
+			concurrentNegotiated: this.peerNegotiatedFforConcurrent(peerPubkey)
 		});
 	}
 
@@ -6277,6 +6323,15 @@ export class ChannelManager extends EventEmitter {
 			feeBaseMsat: number;
 			feeProportionalMillionths: number;
 			epochId?: Buffer;
+			/** TLV 13: the peers delegated HTLCs may reach S from. */
+			witnessPeers?: Buffer[];
+			/** TLV 15: hash-chained vouchers; uniform amounts only. */
+			hashChain?: boolean;
+			/**
+			 * TLV 17: ask for concurrent receive version 1. The channel
+			 * refuses unless both feature pairs are negotiated with the peer.
+			 */
+			concurrent?: boolean;
 		}
 	): ChannelResult {
 		const peerPubkey = this.channelPeers.get(channelId.toString('hex'));

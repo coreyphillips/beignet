@@ -172,6 +172,7 @@ import {
 	FF_ACTIVATE_TYPE,
 	FF_CLOSE_ACK_TYPE,
 	FF_CLOSE_TYPE,
+	FF_CONCURRENT_VERSION,
 	FF_EPOCH_START_TOLERANCE_BLOCKS,
 	FF_INIT_TYPE,
 	FforAbortReason,
@@ -22859,6 +22860,12 @@ export class Channel {
 		witnessPeers?: Buffer[];
 		/** TLV 15: hash-chained vouchers (section 9.5.4); uniform amounts only. */
 		hashChain?: boolean;
+		/**
+		 * TLV 17: ask for the concurrent receive profile, version 1
+		 * (CONCURRENT-RECEIVE.md section 1.1). Selected only by S's exact
+		 * signed echo; independent hashes only.
+		 */
+		concurrent?: boolean;
 	}): ChannelAction[] {
 		const pre = this._fforSetupPreconditionError();
 		if (pre) {
@@ -22869,6 +22876,27 @@ export class Channel {
 					cleanup: 'none'
 				}
 			];
+		}
+		if (request.concurrent) {
+			// CONCURRENT-RECEIVE.md section 1.1: both feature pairs on both
+			// sides before the request, and section 1: no hash chain. Refused
+			// here rather than sent for S to refuse: an ff_init burns its
+			// epoch id.
+			const concurrentRefusal =
+				this._fforCtx?.concurrentNegotiated !== true
+					? 'option_ff_concurrent is not negotiated with this peer'
+					: request.hashChain
+					? 'the concurrent profile takes independent hashes, not a hash chain (CONCURRENT-RECEIVE.md section 1)'
+					: null;
+			if (concurrentRefusal) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: `Cannot start FFOR epoch: ${concurrentRefusal}`,
+						cleanup: 'none'
+					}
+				];
+			}
 		}
 		if (
 			request.hashChain &&
@@ -22900,7 +22928,10 @@ export class Channel {
 			...(request.witnessPeers && request.witnessPeers.length > 0
 				? { witnessPeers: request.witnessPeers.map((p) => Buffer.from(p)) }
 				: {}),
-			...(request.hashChain ? { hashChain: true } : {})
+			...(request.hashChain ? { hashChain: true } : {}),
+			...(request.concurrent
+				? { concurrentVersion: FF_CONCURRENT_VERSION }
+				: {})
 		};
 		const bookError = checkVoucherBook(params, this._fforBookContext('R'));
 		if (bookError) {
@@ -23182,6 +23213,39 @@ export class Channel {
 				);
 			}
 		}
+		// CONCURRENT-RECEIVE.md section 1.1: a request for the concurrent
+		// profile (TLV 17) is refused unless both feature pairs are negotiated,
+		// the profile is the one version 1 defines (Variant D, checked above,
+		// and independent hashes), the value is the one we select, and this
+		// peer offers it. Never answered as a baseline epoch instead: the
+		// refusal burns the epoch id, and a baseline attempt is a new epoch.
+		const concurrent = msg.concurrentVersion !== undefined;
+		if (concurrent) {
+			if (ctx.concurrentNegotiated !== true) {
+				return refuse(
+					FforAbortReason.TERMS_REFUSED,
+					'concurrent_version requested without option_ff_receive and option_ff_concurrent negotiated'
+				);
+			}
+			if (msg.hashChain) {
+				return refuse(
+					FforAbortReason.TERMS_REFUSED,
+					'the concurrent profile takes no hash chain (ff_init TLV 15 must be absent)'
+				);
+			}
+			if (msg.concurrentVersion !== FF_CONCURRENT_VERSION) {
+				return refuse(
+					FforAbortReason.TERMS_REFUSED,
+					`concurrent_version ${msg.concurrentVersion} not supported`
+				);
+			}
+			if (policy?.allowConcurrent !== true) {
+				return refuse(
+					FforAbortReason.TERMS_REFUSED,
+					'concurrent receive not offered by this peer'
+				);
+			}
+		}
 		const params: IFforEpochParams = {
 			variant: msg.variant,
 			budgetMsat: msg.budgetMsat,
@@ -23195,7 +23259,8 @@ export class Channel {
 			rPerCommitmentPoints: msg.rPerCommitmentPoints,
 			voucherAmountsMsat: msg.voucherAmountsMsat,
 			...(msg.witnessPeers ? { witnessPeers: msg.witnessPeers } : {}),
-			...(msg.hashChain ? { hashChain: true } : {})
+			...(msg.hashChain ? { hashChain: true } : {}),
+			...(concurrent ? { concurrentVersion: msg.concurrentVersion } : {})
 		};
 		const bookError = checkVoucherBook(params, this._fforBookContext('S'));
 		if (bookError) return refuse(FforAbortReason.TERMS_REFUSED, bookError);
@@ -23253,7 +23318,10 @@ export class Channel {
 				paymentHashes: hashes,
 				sHtlcIdBase,
 				voucherAmountsMsat: params.voucherAmountsMsat,
-				initHash: tInit
+				initHash: tInit,
+				// The exact signed echo is the only thing that selects the
+				// concurrent profile (CONCURRENT-RECEIVE.md section 1.1).
+				...(concurrent ? { concurrentVersion: FF_CONCURRENT_VERSION } : {})
 			})
 		);
 		if (!acceptBody) {
@@ -23268,6 +23336,9 @@ export class Channel {
 			initWire
 		);
 		f.acceptWire = acceptWire;
+		// Selected with the transcript it rides in: on the record before the
+		// persist that precedes ff_accept.
+		if (concurrent) f.concurrentVersion = FF_CONCURRENT_VERSION;
 		f.sCommitmentNumber = this._state.localCommitmentNumber;
 		f.sHtlcIdBase = sHtlcIdBase;
 		f.paymentHashes = hashes;
@@ -23391,6 +23462,30 @@ export class Channel {
 				'ff_accept TLV 11 is not the digest of our ff_init'
 			);
 		}
+		// CONCURRENT-RECEIVE.md section 1.1: the concurrent profile is selected
+		// by S's exact signed echo of the value we requested and by nothing
+		// else. An echo we did not ask for is a violation; a missing or
+		// different one is a refusal of the terms (an older S ignores the odd
+		// TLV and answers without it). Either way the setup aborts and its
+		// epoch id is spent: it never continues as a baseline epoch.
+		const requestedVersion = f.params.concurrentVersion;
+		if (requestedVersion === undefined) {
+			if (msg.concurrentVersion !== undefined) {
+				return this._fforAbortLocal(
+					f,
+					FforAbortReason.PROTOCOL_ERROR,
+					'ff_accept echoes a concurrent_version we did not request'
+				);
+			}
+		} else if (msg.concurrentVersion !== requestedVersion) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.TERMS_REFUSED,
+				msg.concurrentVersion === undefined
+					? 'ff_accept lacks the concurrent_version echo'
+					: `ff_accept echoes concurrent_version ${msg.concurrentVersion}, not the ${requestedVersion} requested`
+			);
+		}
 		const K = f.params.maxPayments;
 		if (
 			msg.voucherAmountsMsat.length !== K ||
@@ -23482,6 +23577,10 @@ export class Channel {
 			);
 		}
 		f.acceptWire = acceptWire;
+		// The exact echo of the one version we request, checked above.
+		if (requestedVersion === FF_CONCURRENT_VERSION) {
+			f.concurrentVersion = FF_CONCURRENT_VERSION;
+		}
 		f.sCommitmentNumber = msg.sCommitmentNumber;
 		f.sHtlcIdBase = msg.sHtlcIdBase;
 		f.paymentHashes = msg.paymentHashes;

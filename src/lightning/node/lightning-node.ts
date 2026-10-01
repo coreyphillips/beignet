@@ -1787,6 +1787,27 @@ export class LightningNode extends EventEmitter {
 			localFeatures.clearBit(Feature.ASYNC_RECEIVE_SERVICE);
 			localFeatures.clearBit(Feature.ASYNC_RECEIVE_SERVICE + 1);
 		}
+		// FFOR concurrent receive (CONCURRENT-RECEIVE.md section 1.1): the
+		// optional bit is advertised only when the node opts in, and it
+		// depends on option_ff_receive (and on option_quiesce, which every
+		// activation runs under). Cleared explicitly otherwise, so a
+		// caller-supplied feature set cannot advertise an extension this node
+		// has not turned on: the spec forbids advertising it by default until
+		// the whole version is implemented.
+		if (config.fforConcurrent?.enabled) {
+			if (
+				!localFeatures.hasFeature(Feature.OPTION_FF_RECEIVE) ||
+				!localFeatures.hasFeature(Feature.QUIESCE)
+			) {
+				throw new Error(
+					'fforConcurrent needs option_ff_receive and option_quiesce in the feature set'
+				);
+			}
+			localFeatures.setOptional(Feature.OPTION_FF_CONCURRENT);
+		} else {
+			localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT);
+			localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT + 1);
+		}
 		this.localFeatures = localFeatures;
 
 		this.channelManager = new ChannelManager({
@@ -18429,6 +18450,12 @@ export class LightningNode extends EventEmitter {
 			witnessPeers?: Buffer[];
 			/** TLV 15: hash-chained vouchers (section 9.5.4); uniform amounts. */
 			hashChain?: boolean;
+			/**
+			 * TLV 17: ask for concurrent receive version 1
+			 * (CONCURRENT-RECEIVE.md section 1.1). Refused unless both sides
+			 * advertised option_ff_concurrent; selected only by S's echo.
+			 */
+			concurrent?: boolean;
 		}
 	): ChannelResult {
 		return this.channelManager.initiateFforEpoch(
@@ -28193,6 +28220,7 @@ export class LightningNode extends EventEmitter {
 			directFunding?: INodeConfig['directFunding'];
 			swaps?: INodeConfig['swaps'];
 			fforSettle?: INodeConfig['fforSettle'];
+			fforConcurrent?: INodeConfig['fforConcurrent'];
 			fforWitness?: INodeConfig['fforWitness'];
 			fforIssuer?: INodeConfig['fforIssuer'];
 			leaseRates?: import('../gossip/types').ILeaseRates;
@@ -28262,6 +28290,7 @@ export class LightningNode extends EventEmitter {
 			directFunding: options?.directFunding,
 			swaps: options?.swaps,
 			fforSettle: options?.fforSettle,
+			fforConcurrent: options?.fforConcurrent,
 			fforWitness: options?.fforWitness,
 			fforIssuer: options?.fforIssuer,
 			leaseRates: options?.leaseRates,
