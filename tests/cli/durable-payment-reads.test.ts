@@ -331,7 +331,8 @@ describe('Pruned payments stay readable from their durable rows (issue #1063)', 
 			expect(listed.get(h)).to.include({
 				status: 'COMPLETED',
 				direction: 'OUTGOING',
-				amountSats: 1_000,
+				// What left the node, fees included (#1185).
+				amountSats: 1_003,
 				feeSats: 3
 			});
 		}

@@ -958,6 +958,34 @@ function sentSats(info: IPaymentInfo): number | undefined {
 }
 
 /**
+ * A payment's amount as every public surface reports it (history, proof,
+ * stats): an outgoing amount is what left the node, fees included, rounded
+ * UP; an incoming amount rounds down, as the balance does (issue #1185).
+ * Truncating the outgoing figure let a send paying 20,001.5 sats from a
+ * 50,000 sat balance read 20,001 while the balance fell to 29,998. Rounding
+ * up makes one send agree with the balance when the balance held whole sats
+ * before it; sub-sat remainders across several sends can still differ from
+ * the balance by a sat, which only msat figures reconcile exactly.
+ */
+function paymentAmountSats(info: IPaymentInfo): number {
+	return info.direction === PaymentDirection.OUTGOING
+		? sentSats(info) ?? spendLimitSats(info.amountMsat)
+		: Number(info.amountMsat / 1000n);
+}
+
+/**
+ * The routing fee a payment paid, in msat, or undefined when the record does
+ * not say. An MPP record's route is its first part only, so its fee is what
+ * left the node over what the invoice asked (#1008).
+ */
+function paymentFeeMsat(info: IPaymentInfo): bigint | undefined {
+	if (info.sentMsat !== undefined && info.sentMsat >= info.amountMsat) {
+		return info.sentMsat - info.amountMsat;
+	}
+	return info.route?.totalFeeMsat;
+}
+
+/**
  * Whether a payment record marks its invoice paid: a completed receive for
  * the hash. Null and undefined (no record) read as unpaid.
  */
@@ -5747,7 +5775,9 @@ export class BeignetNode extends EventEmitter {
 				'no-quorum': 'ROTATION_NO_QUORUM',
 				'not-catching-up': 'ROTATION_NOT_CATCHING_UP',
 				'same-set': 'INVALID_PARAMS',
-				malformed: 'INVALID_PARAMS'
+				malformed: 'INVALID_PARAMS',
+				// A lost journal: a retry never heals it, a restore does.
+				'journal-behind': 'ROTATION_UNAVAILABLE'
 			};
 			return new BeignetError(code[error.reason], error.message);
 		}
@@ -11729,18 +11759,23 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	getPaymentProof(paymentHash: string): PaymentProof | null {
-		const proof = this.node.getPaymentProof(Buffer.from(paymentHash, 'hex'));
-		if (!proof) return null;
+		const hash = Buffer.from(paymentHash, 'hex');
+		const proof = this.node.getPaymentProof(hash);
+		// The proof is built from this record, so both exist or neither does.
+		// The sats come from the record, as getPayment's do: the proof carries
+		// only amountMsat and a route, which for an MPP send are the invoice
+		// amount and the first part.
+		const record = this.node.getPayment(hash);
+		if (!proof || !record) return null;
+		const feeMsat = paymentFeeMsat(record);
 		return {
 			paymentHash: proof.paymentHash.toString('hex'),
 			preimage: proof.preimage.toString('hex'),
-			amountSats: Number(proof.amountMsat / 1000n),
+			amountSats: paymentAmountSats(record),
 			completedAt: proof.completedAt,
 			invoice: proof.invoice,
 			hopCount: proof.route?.hops.length,
-			feeSats: proof.route
-				? Number(proof.route.totalFeeMsat / 1000n)
-				: undefined
+			feeSats: feeMsat !== undefined ? spendLimitSats(feeMsat) : undefined
 		};
 	}
 
@@ -11893,10 +11928,14 @@ export class BeignetNode extends EventEmitter {
 		return fields;
 	}
 
+	/**
+	 * The amount and fee come from paymentAmountSats and paymentFeeMsat, which
+	 * the proof and the stats share, so every surface reports one figure.
+	 */
 	private toPaymentInfo(p: IPaymentInfo): PaymentInfo {
 		const info: PaymentInfo = {
 			paymentHash: p.paymentHash.toString('hex'),
-			amountSats: Number(p.amountMsat / 1000n),
+			amountSats: paymentAmountSats(p),
 			status: p.status,
 			direction: p.direction,
 			createdAt: p.createdAt
@@ -11911,13 +11950,8 @@ export class BeignetNode extends EventEmitter {
 			// FAILED payment with nothing at all to explain it.
 			info.failureDescription = p.failureReason;
 		}
-		if (p.sentMsat !== undefined && p.sentMsat >= p.amountMsat) {
-			// An MPP record: its route is the first part only, so the fee
-			// is what left the node over what the invoice asked (#1008).
-			info.feeSats = Number((p.sentMsat - p.amountMsat) / 1000n);
-		} else if (p.route?.totalFeeMsat !== undefined) {
-			info.feeSats = Number(p.route.totalFeeMsat / 1000n);
-		}
+		const feeMsat = paymentFeeMsat(p);
+		if (feeMsat !== undefined) info.feeSats = spendLimitSats(feeMsat);
 		if (p.route) {
 			const hops = p.route.hops;
 			info.route = {
@@ -13022,7 +13056,7 @@ export class BeignetNode extends EventEmitter {
 			paymentHash: result.paymentHash.toString('hex'),
 			amountSats,
 			feeMsat: result.feeMsat.toString(),
-			feeSats: Number(result.feeMsat / 1000n),
+			feeSats: spendLimitSats(result.feeMsat),
 			hops: result.hops
 		};
 	}
@@ -13787,13 +13821,14 @@ export class BeignetNode extends EventEmitter {
 
 			if (p.direction === 'OUTGOING' && p.status === 'COMPLETED') {
 				sent++;
-				satsSent += Number(p.amountMsat / 1000n);
-				if (p.route?.totalFeeMsat !== undefined) {
-					const fee = Number(p.route.totalFeeMsat / 1000n);
-					feesPaid += fee;
+				// The same figures getPayment reports: what left the node, and
+				// for MPP the fee over every part, not the first (#1185).
+				satsSent += paymentAmountSats(p);
+				const feeMsat = paymentFeeMsat(p);
+				if (feeMsat !== undefined) {
+					feesPaid += spendLimitSats(feeMsat);
 					if (p.amountMsat > 0n) {
-						totalFeePct +=
-							(Number(p.route.totalFeeMsat) / Number(p.amountMsat)) * 100;
+						totalFeePct += (Number(feeMsat) / Number(p.amountMsat)) * 100;
 						feePctCount++;
 					}
 				}
