@@ -98,6 +98,7 @@ import { MissionControl } from '../gossip/mission-control';
 import {
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
+	IGraphChannel,
 	INodeAnnouncementMessage,
 	INodeAddress,
 	IRoute,
@@ -693,6 +694,15 @@ const ZERO_CONF_TRUSTED_PEERS_KEY = 'zero_conf_trusted_peers';
  * `<channelIdHex>:<htlcId>`. Rewritten whole on every change.
  */
 const OWED_PART_FAILURES_KEY = 'owed_part_failures';
+/**
+ * Metadata key set once the stored gossip rows have been cleared of the
+ * zero-signature forgeries older lazy intake saved (issue #1024, see
+ * NetworkGraph.dropLegacyUnsignedUpdates). Absent until the first boot of a
+ * version that verifies every update at intake; '1' from then on, after
+ * which a signatureless update row can only be RGS data and is kept.
+ */
+const GOSSIP_LEGACY_UNSIGNED_UPDATES_DROPPED_KEY =
+	'gossip_legacy_unsigned_updates_dropped';
 /** Default wait for an LSP's answer to a registration request. */
 const ASYNC_GRANT_REQUEST_TIMEOUT_MS = 30_000;
 /** Grants kept per LSP (newest first); older ones are dropped. */
@@ -3425,7 +3435,9 @@ export class LightningNode extends EventEmitter {
 		// it surfaces as a node that takes minutes to start rather than as a
 		// node that stalls.
 		const staleRowDeletes: Array<() => void> = [];
-		for (const channel of this.storage.loadAllGossipChannels()) {
+		const gossipRows = this.storage.loadAllGossipChannels();
+		this.dropLegacyUnsignedGossipUpdates(gossipRows);
+		for (const channel of gossipRows) {
 			const ts1 =
 				channel.update1 &&
 				!gossipTimestampTooFarFuture(channel.update1.timestamp)
@@ -4354,6 +4366,40 @@ export class LightningNode extends EventEmitter {
 				timestamp: Date.now()
 			} as ILightningError);
 		}
+	}
+
+	/**
+	 * Clear stored gossip rows of the zero-signature update forgeries older
+	 * lazy intake saved (issue #1024), once per database. The repaired rows
+	 * are written back and the marker is stored in the same transaction, so
+	 * an interrupted pass runs again on the next boot. After it, restore
+	 * keeps a signatureless update flagged false, which only RGS still
+	 * writes, instead of dropping RGS policy on every restart. Rows are
+	 * repaired in memory either way, so a failed write only delays the
+	 * persisted repair.
+	 */
+	private dropLegacyUnsignedGossipUpdates(rows: IGraphChannel[]): void {
+		const storage = this.storage;
+		if (
+			!storage ||
+			storage.loadMetadata(GOSSIP_LEGACY_UNSIGNED_UPDATES_DROPPED_KEY) !== null
+		) {
+			return;
+		}
+		const repaired: IGraphChannel[] = [];
+		for (const row of rows) {
+			if (NetworkGraph.dropLegacyUnsignedUpdates(row)) repaired.push(row);
+		}
+		this.safeStorage(
+			() =>
+				withStorageTransaction(storage, () => {
+					for (const row of repaired) {
+						storage.saveGossipChannel(row.shortChannelId.toString('hex'), row);
+					}
+					storage.saveMetadata(GOSSIP_LEGACY_UNSIGNED_UPDATES_DROPPED_KEY, '1');
+				}),
+			'dropLegacyUnsignedGossipUpdates'
+		);
 	}
 
 	// ─────────────── Setup ───────────────

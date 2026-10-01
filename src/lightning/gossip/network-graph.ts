@@ -98,12 +98,12 @@ function sanitizeSlot(
 /**
  * Settle a restored update slot in either mode: pathfinding reads every
  * update slot, so unlike an announcement it cannot wait deferred for a
- * gossip query (issue #1024). Returns null for a slot to drop rather than
- * leave routable: a signed update with unresolved provenance that fails, or
- * a signatureless one flagged false. Lazy intake stored a peer's
- * zero-signature forgery as false, and RGS data saved that way comes back
- * from the snapshot. An unflagged signatureless slot predates lazy intake,
- * when every peer update was verified, so it is RGS data and stays.
+ * gossip query (issue #1024). Returns null for a signed update with
+ * unresolved provenance that fails, a slot to drop rather than leave
+ * routable. A signatureless slot is RGS data and stays, flagged false or
+ * unflagged: intake now refuses an unsigned peer update, and the
+ * zero-signature forgeries older lazy intake saved as false are removed
+ * once per database by NetworkGraph.dropLegacyUnsignedUpdates.
  */
 function settleRestoredUpdate(
 	update: IChannelUpdateMessage,
@@ -111,11 +111,9 @@ function settleRestoredUpdate(
 	nodeId1: Buffer,
 	nodeId2: Buffer
 ): boolean | null {
-	const signatureless = isSignatureless(update.signature);
-	if (verified === false && signatureless) return null;
 	if (verified !== undefined) return verified;
 	if (verifyChannelUpdateMessage(update, nodeId1, nodeId2)) return true;
-	return signatureless ? false : null;
+	return isSignatureless(update.signature) ? false : null;
 }
 
 export class NetworkGraph {
@@ -206,6 +204,41 @@ export class NetworkGraph {
 	// persisted row of an endpoint the victim shares with the admitted
 	// channel.
 	private _deferredNodeEvictions: string[] | null = null;
+
+	/**
+	 * One-time upgrade step for a stored row (issue #1024): drop each
+	 * signatureless update slot flagged false. Before intake verified every
+	 * update, lazy mode saved a peer's zero-signature forgery in exactly that
+	 * shape, alongside RGS updates saved the same way, and the two cannot be
+	 * told apart. Intake now refuses the forgery, so the owner runs this once
+	 * over the rows saved before the upgrade, persists the result, and from
+	 * then on restore keeps that shape as RGS data. Returns whether the row
+	 * changed.
+	 */
+	static dropLegacyUnsignedUpdates(channel: IGraphChannel): boolean {
+		let changed = false;
+		if (
+			channel.update1 &&
+			channel.update1Verified === false &&
+			isSignatureless(channel.update1.signature)
+		) {
+			channel.update1 = undefined;
+			channel.update1Verified = undefined;
+			channel.update1VerifyDeferred = undefined;
+			changed = true;
+		}
+		if (
+			channel.update2 &&
+			channel.update2Verified === false &&
+			isSignatureless(channel.update2.signature)
+		) {
+			channel.update2 = undefined;
+			channel.update2Verified = undefined;
+			channel.update2VerifyDeferred = undefined;
+			changed = true;
+		}
+		return changed;
+	}
 
 	constructor(
 		chainHash: Buffer = BITCOIN_CHAIN_HASH,
