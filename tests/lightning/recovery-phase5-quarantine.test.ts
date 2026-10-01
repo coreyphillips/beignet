@@ -609,6 +609,10 @@ describe('Recovery phase 5: startup quarantine', () => {
 				listenErr = err;
 			}
 			expect(String(listenErr)).to.match(/quarantine/i);
+			// Typed, so the daemon can tell a hold from a failed bind (#933).
+			expect((listenErr as { code?: string }).code).to.equal(
+				'STARTUP_QUARANTINE'
+			);
 			let dialErr: unknown;
 			try {
 				await a.connectPeer(bPub, '127.0.0.1', 1);
@@ -695,6 +699,9 @@ describe('Recovery phase 5: startup quarantine', () => {
 				fencedListen = err;
 			}
 			expect(String(fencedListen)).to.match(/quarantine/i);
+			expect((fencedListen as { code?: string }).code).to.equal(
+				'STARTUP_QUARANTINE'
+			);
 			await new Promise((r) => setTimeout(r, 200));
 			expect(received.length).to.equal(receivedBeforeFreeze);
 		} finally {

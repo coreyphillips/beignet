@@ -175,6 +175,7 @@ describe('OpenAPI Spec Completeness', () => {
 
 	const expectedSchemas = [
 		'NodeInfo',
+		'ListenerProblem',
 		'BalanceInfo',
 		'HealthInfo',
 		'PeerInfo',
