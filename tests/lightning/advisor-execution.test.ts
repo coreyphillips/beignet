@@ -913,6 +913,58 @@ describe('Advisor Execution (M3 phases 1+2)', function () {
 			}
 		});
 
+		it('sends no further pair once a shutdown starts, without a drain (issue #1250)', async function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const setup = setupCircular(storage);
+			const { alice, bob, charlie } = setup;
+			try {
+				const [plan] = alice.planRebalanceRecommendations();
+				const small = { ...plan, amountSats: 100_000n };
+				alice.planRebalanceRecommendations = (): Array<typeof small> => [
+					small,
+					small
+				];
+				// Alice's messages to Bob wait until released, so the first
+				// HTLC is still out when the shutdown starts.
+				let holding = true;
+				const held: Array<[number, Buffer]> = [];
+				let adds = 0;
+				alice.removeAllListeners('message:outbound');
+				alice.on(
+					'message:outbound',
+					(pubkey: string, type: number, payload: Buffer) => {
+						if (pubkey === charlie.getNodeId()) {
+							charlie.handlePeerMessage(alice.getNodeId(), type, payload);
+							return;
+						}
+						if (type === MessageType.UPDATE_ADD_HTLC) adds++;
+						if (holding) held.push([type, payload]);
+						else bob.handlePeerMessage(alice.getNodeId(), type, payload);
+					}
+				);
+
+				const run = alice.executeRebalanceRecommendations({
+					budgetSatsPerDay: 100
+				});
+				expect(adds).to.equal(1);
+				const shutdown = alice.gracefulShutdown(10_000);
+				holding = false;
+				for (const [type, payload] of held.splice(0)) {
+					bob.handlePeerMessage(alice.getNodeId(), type, payload);
+				}
+				const summary = await run;
+				await shutdown;
+
+				expect(summary.attempts).to.have.length(1);
+				expect(summary.attempts[0].status).to.equal('SUCCEEDED');
+				expect(adds).to.equal(1);
+			} finally {
+				setup.destroy();
+				storage.close();
+			}
+		});
+
 		it('respects spend already persisted for the current UTC day', async function () {
 			const storage = new SqliteStorage(':memory:');
 			storage.open();

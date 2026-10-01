@@ -14086,7 +14086,7 @@ export class LightningNode extends EventEmitter {
 	 * pairs are skipped, never partially overspent. Failures are recorded and
 	 * do not stop later pairs (they spent nothing). `stopRequested` is asked
 	 * before each pair, and the run ends there, leaving the rest untried, once
-	 * it returns true.
+	 * it returns true. A shutdown or destroy ends the run the same way.
 	 */
 	async executeRebalanceRecommendations(options?: {
 		budgetSatsPerDay?: number;
@@ -14109,7 +14109,7 @@ export class LightningNode extends EventEmitter {
 			let feeSpentThisRunMsat = 0n;
 
 			for (const plan of plans) {
-				if (options?.stopRequested?.()) break;
+				if (this._destroyed || options?.stopRequested?.()) break;
 				// A run that crosses midnight finds the new day's budget unspent.
 				// It still spends no more than one budget in all, which is what
 				// BeignetNode holds against its daily spend limit for the run.
