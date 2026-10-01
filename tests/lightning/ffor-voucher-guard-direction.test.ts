@@ -21,6 +21,10 @@ import {
 } from '../../src/lightning/channel/channel-manager';
 import { Channel } from '../../src/lightning/channel/channel';
 import {
+	ChannelAction,
+	ChannelActionType
+} from '../../src/lightning/channel/channel-actions';
+import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
 	HtlcState
@@ -278,6 +282,27 @@ function offer(
 	return { id, preimage };
 }
 
+/**
+ * A peer that does not apply the setup admission barrier (issue #1289: an
+ * older build, or one that misbehaves) offers an ordinary HTLC while the
+ * setup runs. Its channel lets this one add through as if it were the
+ * epoch's own; the other side does not refuse a peer add during the setup.
+ */
+function offerPastBarrier(
+	pair: IPair,
+	from: Side,
+	amountMsat: bigint
+): { id: bigint; preimage: Buffer } {
+	const channel = from === 'S' ? pair.sChannel : pair.rChannel;
+	const gate = channel as unknown as { _fforInternalAdd: boolean };
+	gate._fforInternalAdd = true;
+	try {
+		return offer(pair, from, amountMsat);
+	} finally {
+		gate._fforInternalAdd = false;
+	}
+}
+
 /** An ordinary payment, offered and fulfilled, both rounds complete. */
 function pay(pair: IPair, from: Side, amountMsat: bigint): void {
 	const { id, preimage } = offer(pair, from, amountMsat);
@@ -334,17 +359,21 @@ function settle(pair: IPair, how: Settle, id: bigint, preimage: Buffer): void {
  * R holds parked vouchers of an ABORTED epoch whose unwind is in flight,
  * beside an ordinary HTLC it offered under a voucher's id.
  */
-function expectCollision(pair: IPair, id: bigint): void {
+function expectCollision(
+	pair: IPair,
+	id: bigint,
+	parked = AMOUNTS.length
+): void {
 	const r = record(pair.rChannel);
 	expect(r.state, why(pair)).to.equal(FforState.ABORTED);
 	expect(id >= r.sHtlcIdBase!).to.be.true;
-	expect(id < r.sHtlcIdBase! + BigInt(AMOUNTS.length)).to.be.true;
+	expect(id < r.sHtlcIdBase! + BigInt(parked)).to.be.true;
 	const htlcs = pair.rChannel.getFullState().htlcs;
 	expect(htlcs.get(`received-${id}`)?.fforVoucher).to.equal(true);
 	const ordinary = htlcs.get(`offered-${id}`);
 	expect(ordinary?.state).to.equal(HtlcState.COMMITTED);
 	expect(ordinary?.fforVoucher).to.not.equal(true);
-	expect(vouchers(pair.rChannel).length).to.equal(AMOUNTS.length);
+	expect(vouchers(pair.rChannel).length).to.equal(parked);
 	expect(pair.link.inFlight('R')).to.include(MessageType.UPDATE_FAIL_HTLC);
 }
 
@@ -354,7 +383,8 @@ function expectSettledAndUnwound(
 	how: Settle,
 	id: bigint,
 	rBalanceBefore: bigint,
-	seen: { fulfilled: bigint[]; failed: bigint[] }
+	seen: { fulfilled: bigint[]; failed: bigint[] },
+	parked = AMOUNTS.length
 ): void {
 	expect(pair.rErrors, why(pair)).to.deep.equal([]);
 	expect(pair.rChannel.getState()).to.equal(ChannelState.NORMAL);
@@ -365,7 +395,7 @@ function expectSettledAndUnwound(
 	else expect(seen).to.deep.equal({ fulfilled: [], failed: [id] });
 	// The vouchers were not touched by it: still parked, the unwind's
 	// update_fail_htlc for each still in flight.
-	expect(vouchers(pair.rChannel).length).to.equal(AMOUNTS.length);
+	expect(vouchers(pair.rChannel).length).to.equal(parked);
 
 	pair.link.release('R');
 	expect(pair.rErrors, why(pair)).to.deep.equal([]);
@@ -438,33 +468,49 @@ describe('FFOR Variant D: voucher settle ids are read in their own direction', f
 		});
 	}
 
-	it("R, a payment racing the voucher round: the setup aborts, and S's fulfil crosses the unwind", () => {
+	it("R, a payment racing a voucher round that failed: S's fulfil crosses the unwind", () => {
+		// R can no longer fail the round with a payment of its own: from
+		// ff_init on its adds are refused until the epoch is ACTIVE or over
+		// (the setup barrier, issue #1289), and no peer can make R offer one.
+		// A round that fails on S's side still leaves R here: S's last voucher
+		// add is refused locally, so S aborts with reason 5 behind the adds
+		// it did send and ahead of their commitment_signed.
 		const pair = fundedPair();
 		const seen = watchSettles(pair);
 		const rBalanceBefore = pair.rChannel.getFullState().localBalanceMsat;
+		const parked = AMOUNTS.length - 1;
+		const sAdd = pair.sChannel.addHtlc.bind(pair.sChannel);
+		let sAdds = 0;
+		(pair.sChannel as unknown as { addHtlc: Channel['addHtlc'] }).addHtlc = (
+			...args
+		): ChannelAction[] =>
+			++sAdds === AMOUNTS.length
+				? [{ type: ChannelActionType.ERROR, message: 'voucher add refused' }]
+				: sAdd(...args);
 		pair.link.holdAt = (from, type): boolean =>
 			from === 'S' && type === MessageType.COMMITMENT_SIGNED;
 		const init = pair.rManager.initiateFforEpoch(pair.channelId, terms());
 		expect(init.ok, init.error).to.equal(true);
 		pair.link.holdAt = null;
-		// NEGOTIATING freezes nothing either. The payment's output fails the
-		// section 9.5.1 step 5 count, so the round ends in abort reason 5.
-		expect(record(pair.rChannel).state).to.equal(FforState.NEGOTIATING);
+		expect(record(pair.sChannel).state).to.equal(FforState.ABORTED);
+		expect(record(pair.rChannel).state, why(pair)).to.equal(FforState.ABORTED);
+		expect(record(pair.rChannel).abortReason, why(pair)).to.equal(
+			FforAbortReason.VOUCHER_ROUND_FAILED
+		);
+		expect(vouchers(pair.rChannel).length).to.equal(parked);
+		// The abort lifted the barrier and the round is still open: R pays.
 		const { id, preimage } = offer(pair, 'R', ORDINARY_MSAT);
 		pair.link.holdAt = (from, type): boolean =>
 			from === 'R' && type === MessageType.UPDATE_FAIL_HTLC;
 		pair.link.release('S');
 		pair.link.holdAt = null;
-		expect(record(pair.rChannel).abortReason, why(pair)).to.equal(
-			FforAbortReason.VOUCHER_ROUND_FAILED
-		);
-		expectCollision(pair, id);
+		expectCollision(pair, id, parked);
 		// The abort's own notification; nothing else may follow it.
 		expect(pair.rErrors.length).to.equal(1);
 		pair.rErrors.length = 0;
 
 		settle(pair, 'fulfils', id, preimage);
-		expectSettledAndUnwound(pair, 'fulfils', id, rBalanceBefore, seen);
+		expectSettledAndUnwound(pair, 'fulfils', id, rBalanceBefore, seen, parked);
 	});
 
 	it("S, epoch DRAINING: settling an HTLC R offered under a voucher's id is not the drain", () => {
@@ -473,7 +519,10 @@ describe('FFOR Variant D: voucher settle ids are read in their own direction', f
 		pay(pair, 'S', 300_000_000n);
 		pair.link.log.length = 0;
 		pair.sErrors.length = 0;
-		// R makes two small payments while the voucher round is in flight.
+		// R makes two small payments while the voucher round is in flight. An
+		// R of this build refuses them itself (the setup barrier, issue
+		// #1289); S does not refuse a peer add during the setup, so an R
+		// without the barrier still puts S here.
 		// Both are dust: they add no output, so the section 9.5.1 step 5 count
 		// does not see them. S settles the first (id 0, no voucher's); the
 		// second (id 1, the first voucher's number) is still on the channel
@@ -483,9 +532,9 @@ describe('FFOR Variant D: voucher settle ids are read in their own direction', f
 		const init = pair.rManager.initiateFforEpoch(pair.channelId, terms());
 		expect(init.ok, init.error).to.equal(true);
 		pair.link.holdAt = null;
-		const first = offer(pair, 'R', DUST_MSAT);
+		const first = offerPastBarrier(pair, 'R', DUST_MSAT);
 		pair.link.release('S', 2);
-		const second = offer(pair, 'R', DUST_MSAT);
+		const second = offerPastBarrier(pair, 'R', DUST_MSAT);
 		pair.link.release('S', 1);
 		settle(pair, 'fulfils', first.id, first.preimage);
 		pair.link.release('S');

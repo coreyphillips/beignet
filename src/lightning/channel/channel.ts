@@ -885,6 +885,11 @@ export class Channel {
 	 */
 	private _fforInternalSettle = false;
 	/**
+	 * FFOR: set while handleFforInit offers the epoch's own vouchers; every
+	 * other add of ours is refused while the setup runs.
+	 */
+	private _fforInternalAdd = false;
+	/**
 	 * FFOR (R, DRAINING): BOLT 2 retransmissions of the drain (the fulfils,
 	 * fails and commitment_signed) held back because the peer reestablished
 	 * reporting ACTIVE; released when its ff_close_ack arrives. Memory-only.
@@ -3148,8 +3153,10 @@ export class Channel {
 			];
 		}
 
-		// FFOR section 7.5.5: no ordinary update from ACTIVATING on.
-		const fforAddRefusal = this._fforUpdateRefusal('add');
+		// FFOR: no ordinary add of ours from the first setup message (the
+		// setup barrier, issue #1289), and no ordinary update from ACTIVATING
+		// on (section 7.5.5).
+		const fforAddRefusal = this._fforLocalAddRefusal();
 		if (fforAddRefusal) {
 			return [
 				{
@@ -3421,6 +3428,9 @@ export class Channel {
 
 		// FFOR section 7.5.5: from ACTIVATING on neither side may add. The
 		// freeze is durable and the peer signed it, so a violation is provable.
+		// The setup barrier before it is local only (_fforSetupAddRefusal): a
+		// peer add in NEGOTIATING is a voucher or fails the round, and neither
+		// is answered on the wire here.
 		const fforPeerAddRefusal = this._fforUpdateRefusal('add');
 		if (fforPeerAddRefusal) {
 			return this._failChannelWithWireError(fforPeerAddRefusal);
@@ -13923,7 +13933,7 @@ export class Channel {
 	 * and the adds cannot happen inside one synchronous drive.
 	 */
 	canOfferHtlcSet(amounts: bigint[]): boolean {
-		if (amounts.length > 0 && this._fforUpdateRefusal('add')) return false;
+		if (amounts.length > 0 && this._fforLocalAddRefusal()) return false;
 		if (amounts.length === 0) return true;
 		if (this._state.restoreRevokedRisk === true) return false;
 		if (
@@ -13969,6 +13979,11 @@ export class Channel {
 		lookThroughReestablish = false,
 		reservationHint = false
 	): boolean {
+		// The reservation hint describes a frozen channel for a voucher
+		// invoice, which names S through it while the epoch is ACTIVE. No
+		// voucher invoice exists before ACTIVE and a setup may still abort,
+		// so the setup barrier answers the hint as it answers everything else.
+		if (this._fforSetupAddRefusal()) return false;
 		if (!reservationHint && this._fforUpdateRefusal('add')) return false;
 		if (this._state.restoreRevokedRisk === true) return false;
 		if (isRecencyUnproven(this._state)) return false;
@@ -22400,6 +22415,48 @@ export class Channel {
 	}
 
 	/**
+	 * The setup admission barrier: the refusal an add of OURS earns while the
+	 * epoch is NEGOTIATING or VOUCHERS_COMMITTED, or null.
+	 *
+	 * Setup starts on an idle channel (section 9.5.1 step 1) and the
+	 * activation binds the commitments the voucher round leaves. An ordinary
+	 * add interleaved with that round rides into the epoch under the freeze
+	 * when it is dust (step 5 counts outputs), fails the count when it is
+	 * not, and either way moves the commitment numbers ff_accept and
+	 * ff_activate bind (issue #1289). So from the first setup message only
+	 * the epoch's own voucher adds pass, until the epoch is ACTIVATING (the
+	 * section 7.5.5 freeze takes over) or ABORTED or CLOSED (nothing is
+	 * refused).
+	 *
+	 * Local only, and adds only. The peer's adds are not judged here: R must
+	 * take S's vouchers, and a stray one fails the round as before. Settles,
+	 * commitments and revocations are not judged either, so whatever is on
+	 * the channel can still be finished.
+	 */
+	private _fforSetupAddRefusal(): string | null {
+		const f = this._fforLive();
+		if (!f) return null;
+		if (
+			f.state !== FforState.NEGOTIATING &&
+			f.state !== FforState.VOUCHERS_COMMITTED
+		) {
+			return null;
+		}
+		// The epoch's own vouchers, which S offers while NEGOTIATING.
+		if (f.state === FforState.NEGOTIATING && this._fforInternalAdd) {
+			return null;
+		}
+		return `FFOR epoch is ${
+			FforState[f.state]
+		}: no ordinary add while the setup runs`;
+	}
+
+	/** What refuses an add of ours: the setup barrier, then the epoch freeze. */
+	private _fforLocalAddRefusal(): string | null {
+		return this._fforSetupAddRefusal() ?? this._fforUpdateRefusal('add');
+	}
+
+	/**
 	 * The refusal an ordinary channel operation earns under the epoch
 	 * freeze, or null. `settle` names the HTLC a settle targets, by its id
 	 * and its direction on this side: in DRAINING the vouchers' own fulfils
@@ -23039,39 +23096,52 @@ export class Channel {
 			sendMsg(MessageType.FF_ACCEPT, acceptBody)
 		];
 		// Step 3: the K adds, in k order, each with the section 9.5.1 onion.
-		for (const entry of this._fforBook(f)) {
-			const expectedId = this._state.localHtlcCounter;
-			const onion = buildVoucherOnion({
-				recipientNodeId: ctx.remoteNodeId,
-				epochId: msg.epochId,
-				k: entry.k,
-				amountMsat: entry.amountMsat,
-				voucherExpiry: entry.voucherExpiry,
-				paymentHash: entry.paymentHash
-			});
-			const addActions = this.addHtlc(
-				entry.amountMsat,
-				entry.paymentHash,
-				entry.voucherExpiry,
-				onion
-			);
-			const failed =
-				addActions.some((a) => a.type === ChannelActionType.ERROR) ||
-				expectedId !== entry.sHtlcId;
-			if (failed) {
-				const err = addActions.find((a) => a.type === ChannelActionType.ERROR);
-				const text =
-					err && err.type === ChannelActionType.ERROR
-						? err.message
-						: 'voucher id diverged from s_htlc_id_base';
-				actions.push(
-					...this._fforAbortLocal(f, FforAbortReason.VOUCHER_ROUND_FAILED, text)
+		// The record is NEGOTIATING already, so the setup barrier stands: these
+		// are the epoch's own adds and the only ones it lets through.
+		this._fforInternalAdd = true;
+		try {
+			for (const entry of this._fforBook(f)) {
+				const expectedId = this._state.localHtlcCounter;
+				const onion = buildVoucherOnion({
+					recipientNodeId: ctx.remoteNodeId,
+					epochId: msg.epochId,
+					k: entry.k,
+					amountMsat: entry.amountMsat,
+					voucherExpiry: entry.voucherExpiry,
+					paymentHash: entry.paymentHash
+				});
+				const addActions = this.addHtlc(
+					entry.amountMsat,
+					entry.paymentHash,
+					entry.voucherExpiry,
+					onion
 				);
-				return actions;
+				const failed =
+					addActions.some((a) => a.type === ChannelActionType.ERROR) ||
+					expectedId !== entry.sHtlcId;
+				if (failed) {
+					const err = addActions.find(
+						(a) => a.type === ChannelActionType.ERROR
+					);
+					const text =
+						err && err.type === ChannelActionType.ERROR
+							? err.message
+							: 'voucher id diverged from s_htlc_id_base';
+					actions.push(
+						...this._fforAbortLocal(
+							f,
+							FforAbortReason.VOUCHER_ROUND_FAILED,
+							text
+						)
+					);
+					return actions;
+				}
+				const added = this._state.htlcs.get(`offered-${entry.sHtlcId}`);
+				if (added) added.fforVoucher = true;
+				actions.push(...addActions);
 			}
-			const added = this._state.htlcs.get(`offered-${entry.sHtlcId}`);
-			if (added) added.fforVoucher = true;
-			actions.push(...addActions);
+		} finally {
+			this._fforInternalAdd = false;
 		}
 		return actions;
 	}
