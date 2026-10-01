@@ -21882,26 +21882,42 @@ export class LightningNode extends EventEmitter {
 			// total is now ambiguous, keeping parked parts alive locks the
 			// payer's funds until the MPP timeout, and a sender could keep
 			// injecting mismatched parts to hold state open indefinitely.
-			for (const p of pending.receivedParts) {
-				if (p.status !== PaymentStatus.PENDING) continue;
-				p.status = PaymentStatus.FAILED;
-				const partKey = `${p.channelId.toString('hex')}:${p.htlcId}`;
+			// The set is dropped below, so a refused fail is owed and retried,
+			// and each secret stays until its fail leaves.
+			const failMismatchedPart = (
+				partChannelId: Buffer,
+				partHtlcId: bigint
+			): void => {
+				const partKey = `${partChannelId.toString('hex')}:${partHtlcId}`;
 				const partSecret = this.receivedHtlcSharedSecrets.get(partKey);
 				const partReason = partSecret
 					? createFailureMessage(partSecret, FINAL_INCORRECT_HTLC_AMOUNT)
 					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
-				this.cleanupHtlcSharedSecret(partKey);
-				this.channelManager.failHtlc(p.channelId, p.htlcId, partReason);
+				const fail = (): boolean => {
+					if (
+						!this.channelManager.failHtlc(partChannelId, partHtlcId, partReason)
+							.ok
+					) {
+						return false;
+					}
+					this.cleanupHtlcSharedSecret(partKey);
+					return true;
+				};
+				if (!fail()) {
+					this.owedHeldForwardFailures.set(partKey, {
+						inChannelIdHex: partChannelId.toString('hex'),
+						fail
+					});
+				}
+			};
+			for (const p of pending.receivedParts) {
+				if (p.status !== PaymentStatus.PENDING) continue;
+				p.status = PaymentStatus.FAILED;
+				failMismatchedPart(p.channelId, p.htlcId);
 			}
 			this.pendingMppPayments.delete(hashHex);
 			this.clearJitSkim(hashHex);
-			const secretKey = `${channelId.toString('hex')}:${htlcId}`;
-			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
-			const reason = sharedSecret
-				? createFailureMessage(sharedSecret, FINAL_INCORRECT_HTLC_AMOUNT)
-				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
-			this.cleanupHtlcSharedSecret(secretKey);
-			this.channelManager.failHtlc(channelId, htlcId, reason);
+			failMismatchedPart(channelId, htlcId);
 			return;
 		}
 
