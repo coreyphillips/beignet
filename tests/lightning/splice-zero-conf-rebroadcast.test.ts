@@ -662,4 +662,41 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 		expect(refused()).to.have.length(2);
 		fx.destroy();
 	});
+
+	// Issue #921: Bitcoin Core 28 renamed "Transaction already in block
+	// chain" to "Transaction outputs already in utxo set". Every block
+	// between the splice's first confirmation and the lock re-sends it, and
+	// each answer says the splice is mined, not refused.
+	it('a mined splice answered in the Core 28+ wording is not reported as refused', async () => {
+		const fx = await setup(7575);
+		const errors: ILightningError[] = [];
+		fx.alice.on('node:error', (e: ILightningError) => errors.push(e));
+		(
+			fx.alice as unknown as { authorizedSpliceBroadcasts: Set<string> }
+		).authorizedSpliceBroadcasts.add(fx.channelId.toString('hex'));
+		// Count the attempts, refused ones included, so the test cannot pass
+		// on a driver that never re-sent anything.
+		const attempts: string[] = [];
+		const send = fx.backend.broadcastTransaction.bind(fx.backend);
+		fx.backend.broadcastTransaction = async (hex: string): Promise<string> => {
+			attempts.push(hex);
+			return send(hex);
+		};
+		fx.backend.failBroadcasts = true;
+		fx.backend.failReason =
+			'Broadcast failed: Transaction outputs already in utxo set';
+		fx.alice.handleNewBlock(150);
+		await tick();
+		fx.backend.failReason = 'Transaction already in block chain';
+		fx.alice.handleNewBlock(151);
+		await tick();
+		expect(
+			attempts.filter((hex) => hex === fx.spliceTx.toHex()),
+			'the splice was re-sent on both blocks'
+		).to.have.length(2);
+		expect(
+			errors.filter((e) => e.code === 'SPLICE_BROADCAST_REFUSED')
+		).to.have.length(0);
+		fx.destroy();
+	});
 });

@@ -7508,11 +7508,11 @@ export class LightningNode extends EventEmitter {
 				channelId: idHex,
 				error: reason
 			});
-			// A transaction the network already has is the outcome wanted,
-			// not a refusal; funding:confirmed retires the obligation.
-			if (/already in block ?chain|already known|txn-already/i.test(reason)) {
-				return;
-			}
+			// A transaction the network already has, mined or in the mempool,
+			// is the outcome wanted, not a refusal; funding:confirmed retires
+			// the obligation. Core 28+ words the mined case "outputs already
+			// in utxo set" (issue #921).
+			if (isDuplicateBroadcastRejection(reason)) return;
 			let txid: string;
 			try {
 				txid = bitcoin.Transaction.fromHex(txHex).getId();
@@ -7711,8 +7711,8 @@ export class LightningNode extends EventEmitter {
 				const displayTxid = Buffer.from(txidHex, 'hex')
 					.reverse()
 					.toString('hex');
-				const channelIdHex =
-					this.fundingChannelIdFor(txidHex)?.toString('hex') ?? null;
+				const { channelId } = this._describeBroadcastTxid(displayTxid);
+				const channelIdHex = channelId?.toString('hex') ?? null;
 				this.emitStructuredLog('chain', 'funding_broadcast_failed', {
 					channelId: channelIdHex,
 					txid: displayTxid,
@@ -7725,19 +7725,6 @@ export class LightningNode extends EventEmitter {
 					timestamp: Date.now()
 				} as ILightningError);
 			});
-	}
-
-	/**
-	 * The id of the channel a retained funding tx (internal byte order hex)
-	 * belongs to, or null when no channel holds it any more.
-	 */
-	private fundingChannelIdFor(txidHex: string): Buffer | null {
-		for (const channel of this.channelManager.listChannels()) {
-			const state = channel.getFullState();
-			if (state.fundingTxid?.toString('hex') !== txidHex) continue;
-			return state.channelId ?? state.temporaryChannelId;
-		}
-		return null;
 	}
 
 	/**
