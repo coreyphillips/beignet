@@ -1150,7 +1150,7 @@ export class DirectFundingReceiver extends EventEmitter {
 		}
 
 		// 11. The payer controls the coin.
-		const ownership = ownershipProblem(offer, script);
+		const ownership = ownershipProblem(offer, script, this.deps.nodeId);
 		if (ownership) {
 			decline(ownership);
 			return;

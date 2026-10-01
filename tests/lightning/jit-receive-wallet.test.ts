@@ -142,11 +142,16 @@ function isMintedScid(scid: Buffer): boolean {
 	return scid.readUIntBE(0, 3) === JIT_INTERCEPT_SCID_BLOCK;
 }
 
-/** A NORMAL channel with inbound, so a blinded path can be built from it. */
+/**
+ * A NORMAL channel, so a blinded path can be built from it. `receivableMsat`
+ * is what the peer can send us above the reserve we hold it to (issue
+ * #1061); by default the channel carries no inbound at all.
+ */
 function injectNormalChannel(
 	node: LightningNode,
 	peerHex?: string,
-	channelState: ChannelState = ChannelState.NORMAL
+	channelState: ChannelState = ChannelState.NORMAL,
+	receivableMsat = 0n
 ): void {
 	const channelId = crypto.randomBytes(32);
 	const peerPubkey = peerHex
@@ -164,6 +169,12 @@ function injectNormalChannel(
 	});
 	state.state = channelState;
 	state.channelId = channelId;
+	if (receivableMsat > 0n) {
+		const remoteMsat =
+			receivableMsat + DEFAULT_CHANNEL_CONFIG.channelReserveSatoshis * 1000n;
+		state.remoteBalanceMsat = remoteMsat;
+		state.localBalanceMsat = state.fundingSatoshis * 1000n - remoteMsat;
+	}
 	// The SCID a peer resolves is the alias the PEER sent us (BOLT 2).
 	state.remoteScidAlias = encodeShortChannelId({
 		block: 800000,
@@ -458,6 +469,109 @@ describe('JIT receive wallet side (issue #595)', function () {
 		expect(record.jitFee).to.deep.equal({ flatFeeSat: 2, feePpm: 1000 });
 		expect(result.flatFeeSat).to.equal(2n);
 		expect(result.feePpm).to.equal(1000);
+		// With no other channel the whole amount has to cross the LSP, so the
+		// intent keeps its wait-for-the-set protection on all of it.
+		const [intent] = pair.alice.getJitReceiveManager()!.listIntents();
+		expect(intent.expectedTotalMsat).to.equal(1_000_000n);
+	});
+
+	// Issue #1061. The invoice advertises every usable channel, so a payer
+	// that can reach one with another peer (the old primary after a switch,
+	// which is also the payer that splits this way with certainty) delivers
+	// part of the amount over it and only the rest through the intercept
+	// hint. An intent bound to the full amount then waits at the LSP for
+	// parts that never come, and every attempt fails after the aggregation
+	// window as temporary_channel_failure.
+	it('declares only the share that must cross the LSP when another channel carries inbound', async () => {
+		const pair = nodePair();
+		open.push(pair);
+		const oldPrimary = getPublicKey(
+			crypto.createHash('sha256').update('jit3b-old-primary').digest()
+		).toString('hex');
+		// 13,000 sat receivable above the reserve, as in the report.
+		injectNormalChannel(pair.bob, oldPrimary, ChannelState.NORMAL, 13_000_000n);
+		const result = await pair.bob.createJitInvoice({
+			lspPubkeyHex: pair.alice.getNodeId(),
+			amountMsat: 20_000_000n,
+			description: 'after switching primaries'
+		});
+		const hops = (decode(result.bolt11).routingHints ?? []).flat();
+		expect(
+			hops.map((hop) => hop.pubkey.toString('hex')),
+			'the old channel and the intercept are both advertised'
+		).to.have.members([oldPrimary, pair.alice.getNodeId()]);
+		const [intent] = pair.alice.getJitReceiveManager()!.listIntents();
+		expect(
+			intent.expectedTotalMsat,
+			'the 7,000 sat the other channel cannot take'
+		).to.equal(7_000_000n);
+		expect(
+			intent.maxAmountMsat,
+			'the cap still admits the whole amount through the LSP'
+		).to.equal(20_000_000n);
+	});
+
+	it('declares no total when the other channels could carry the whole amount', async () => {
+		const pair = nodePair();
+		open.push(pair);
+		for (const [label, receivableMsat] of [
+			['jit3b-peer-a', 12_000_000n],
+			['jit3b-peer-b', 13_000_000n]
+		] as const) {
+			injectNormalChannel(
+				pair.bob,
+				getPublicKey(
+					crypto.createHash('sha256').update(label).digest()
+				).toString('hex'),
+				ChannelState.NORMAL,
+				receivableMsat
+			);
+		}
+		const result = await pair.bob.createJitInvoice({
+			lspPubkeyHex: pair.alice.getNodeId(),
+			amountMsat: 20_000_000n,
+			description: 'covered twice over'
+		});
+		const [intent] = pair.alice.getJitReceiveManager()!.listIntents();
+		expect(
+			intent.expectedTotalMsat,
+			'unknown: the LSP funds on the first part it holds'
+		).to.equal(undefined);
+		expect(intent.maxAmountMsat).to.equal(20_000_000n);
+		const hops = (decode(result.bolt11).routingHints ?? []).flat();
+		expect(
+			hops.some((hop) => hop.shortChannelId.equals(result.interceptScid)),
+			'the intercept hint is still on the invoice'
+		).to.equal(true);
+	});
+
+	it('keeps the full amount when no other channel can receive', async () => {
+		const pair = nodePair();
+		open.push(pair);
+		// One usable channel with nothing to receive on it, and one that could
+		// receive but is not advertised (no adds after shutdown): neither
+		// takes anything off the LSP's share.
+		injectNormalChannel(
+			pair.bob,
+			getPublicKey(
+				crypto.createHash('sha256').update('jit3b-drained').digest()
+			).toString('hex')
+		);
+		injectNormalChannel(
+			pair.bob,
+			getPublicKey(
+				crypto.createHash('sha256').update('jit3b-closing').digest()
+			).toString('hex'),
+			ChannelState.SHUTTING_DOWN,
+			50_000_000n
+		);
+		await pair.bob.createJitInvoice({
+			lspPubkeyHex: pair.alice.getNodeId(),
+			amountMsat: 20_000_000n,
+			description: 'nothing else receives'
+		});
+		const [intent] = pair.alice.getJitReceiveManager()!.listIntents();
+		expect(intent.expectedTotalMsat).to.equal(20_000_000n);
 	});
 
 	// The intent still stands, so a payment that outgrows the channel is held
@@ -467,7 +581,12 @@ describe('JIT receive wallet side (issue #595)', function () {
 	it('routes over an existing usable channel with the LSP rather than the intercept hint', async () => {
 		const pair = nodePair();
 		open.push(pair);
-		injectNormalChannel(pair.bob, pair.alice.getNodeId());
+		injectNormalChannel(
+			pair.bob,
+			pair.alice.getNodeId(),
+			ChannelState.NORMAL,
+			3_000_000n
+		);
 		const result = await pair.bob.createJitInvoice({
 			lspPubkeyHex: pair.alice.getNodeId(),
 			amountMsat: 5_000_000n,
@@ -493,6 +612,11 @@ describe('JIT receive wallet side (issue #595)', function () {
 			result.paymentHash.toString('hex')
 		) as IInvoiceInfo;
 		expect(record.jitFee, 'and the fee allowance').to.not.equal(undefined);
+		// What arrives over the home channel lands at the LSP either way, so
+		// its inbound is not "other" inbound (issue #1061): the intent keeps
+		// the whole amount.
+		const [intent] = pair.alice.getJitReceiveManager()!.listIntents();
+		expect(intent.expectedTotalMsat).to.equal(5_000_000n);
 	});
 
 	// A home channel mid-splice is still the home channel. The intercept hint

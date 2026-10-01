@@ -334,6 +334,53 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 		expect(forwards[0].equals(channels[0].channelId)).to.equal(true);
 	});
 
+	// Issue #1061: a wallet whose invoice also advertises a channel with
+	// another peer declares only the share that must cross the LSP, and none
+	// when that channel could carry the whole amount. The engine's side is to
+	// fund on the first part it holds when the intent names no total, sized
+	// from that part, instead of waiting for a total that arrives elsewhere.
+	it('funds on the first intercepted part when the intent names no total', async function () {
+		const pair = nodePair();
+		open.push(pair);
+		const { alice, bob } = pair;
+		const paymentHash = crypto.randomBytes(32);
+		// A 20,000 sat receive of which 13,000 go over the wallet's other
+		// channel: only 7,000 ever reach the intercept scid.
+		const ack = registerIntent(pair, {
+			paymentHash,
+			maxAmountMsat: 20_000_000n,
+			targetRemainingInboundSat: 0n
+		});
+		expect(ack.accepted).to.equal(true);
+
+		const forwards: bigint[] = [];
+		alice.on('htlc:forward', (_in: Buffer, _out: Buffer, amountMsat: bigint) =>
+			forwards.push(amountMsat)
+		);
+		const forwarded = new Promise<void>((resolve, reject) => {
+			alice.once('jit:forwarded', () => resolve());
+			alice.once('jit:failed', (d: { reason: string }) =>
+				reject(new Error(d.reason))
+			);
+		});
+		driveForward(alice, ack.interceptScid, {
+			paymentHash,
+			amountMsat: 7_000_000n
+		});
+		await forwarded;
+
+		const channels = alice.listChannels();
+		expect(channels, 'funded on the partial, not timed out').to.have.length(1);
+		// 7000 sat held + no target inbound + the 10000 buffer.
+		expect(channels[0].fundingSatoshis).to.equal(17_000n);
+		expect(forwards).to.deep.equal([7_000_000n]);
+		expect(bob.listChannels()).to.have.length(1);
+		expect(
+			alice.getJitReceiveManager()!.listIntents(),
+			'the intent is spent by the forward'
+		).to.have.length(0);
+	});
+
 	it('hop mode: the forwarding path records the inbound value, and the full amount is forwarded', async function () {
 		// driveForward delivers 100_000 msat above the onion amount, the way a
 		// sender paying the hint's fee would. With a 50 sat opening fee that
@@ -517,6 +564,16 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 		expect(quote.withinCeilings).to.equal(true);
 		expect(alice.getJitReceiveManager()!.listIntents()).to.have.length(0);
 		expect(alice.listChannels()).to.have.length(0);
+	});
+
+	it('matches a quote reply to an upper-case LSP pubkey', async function () {
+		const pair = nodePair();
+		open.push(pair);
+		const quote = await pair.bob.requestJitQuote(
+			pair.alice.getNodeId().toUpperCase(),
+			{ timeoutMs: 1_000 }
+		);
+		expect(quote.accepted).to.equal(true);
 	});
 
 	it('declines a quote the LSP cannot front from its on-chain funds', async function () {

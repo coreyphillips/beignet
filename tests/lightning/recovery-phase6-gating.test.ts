@@ -236,6 +236,15 @@ function forwardAction(htlcId: bigint): ChannelAction {
 	} as ChannelAction;
 }
 
+/** An action whose observer can throw out of the batch (htlc:forwarded's cannot). */
+function fulfilledAction(htlcId: bigint): ChannelAction {
+	return {
+		type: ChannelActionType.HTLC_FULFILLED,
+		htlcId,
+		paymentPreimage: crypto.randomBytes(32)
+	} as ChannelAction;
+}
+
 /** Let the barrier's promise callbacks run. */
 async function settle(): Promise<void> {
 	await new Promise((resolve) => setImmediate(resolve));
@@ -647,7 +656,7 @@ describe('Recovery phase 6: a partial dispatch takes its queue with it', () => {
 		dispatch(harness.manager, channel, [
 			{ type: ChannelActionType.PERSIST_STATE },
 			send(MessageType.REVOKE_AND_ACK),
-			forwardAction(1n)
+			fulfilledAction(1n)
 		]);
 		harness.nextFrame = 2n;
 		dispatch(harness.manager, channel, [
@@ -656,7 +665,7 @@ describe('Recovery phase 6: a partial dispatch takes its queue with it', () => {
 		]);
 		expect(harness.sent).to.have.length(0);
 
-		harness.manager.on('htlc:forwarded', () => {
+		harness.manager.on('htlc:fulfilled', () => {
 			throw new Error('observer exploded');
 		});
 		harness.barrier.advance(2n);
@@ -687,15 +696,17 @@ describe('Recovery phase 6: a partial dispatch takes its queue with it', () => {
 		const harness = makeHarness();
 		const channel = stubChannel(crypto.randomBytes(32));
 		const seen: bigint[] = [];
+		harness.manager.on('htlc:fulfilled', () => {
+			throw new Error('first observer exploded');
+		});
 		harness.manager.on('htlc:forwarded', (_id: Buffer, htlcId: bigint) => {
 			seen.push(htlcId);
-			if (htlcId === 1n) throw new Error('first observer exploded');
 		});
 
 		dispatch(harness.manager, channel, [
 			{ type: ChannelActionType.PERSIST_STATE },
 			send(MessageType.REVOKE_AND_ACK),
-			forwardAction(1n),
+			fulfilledAction(1n),
 			forwardAction(2n)
 		]);
 		harness.barrier.advance(1n);
@@ -704,7 +715,7 @@ describe('Recovery phase 6: a partial dispatch takes its queue with it', () => {
 		// forwardEmitted was set while the batch was BUILT and is already on
 		// disk, so a forward skipped here is never emitted by any later
 		// commitment round and the HTLC sits unforwarded until its CLTV.
-		expect(seen).to.deep.equal([1n, 2n]);
+		expect(seen).to.deep.equal([2n]);
 		expect(harness.dispatchFailed).to.have.length(1);
 		expect(harness.dispatchFailed[0].dropped).to.equal(1);
 	});

@@ -75,7 +75,7 @@ async function waitFor(
 	}
 }
 
-const TIP = 790_000;
+const TIP = 795_000;
 
 describe('FFOR Variant D over a real PeerManager connection', function () {
 	this.timeout(60_000);

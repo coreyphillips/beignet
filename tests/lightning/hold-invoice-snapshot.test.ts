@@ -247,12 +247,15 @@ describe('Hold invoice snapshot (issue #737 phase 2)', function () {
 	it('refuses a further part once the parked set covers the invoice', function () {
 		const alice = createNode(TAG, 11);
 		const bob = createNode(TAG, 12);
+		const carol = createNode(TAG, 40);
 		connectNodes(alice, bob);
-		alice.handleNewBlock(1000);
-		bob.handleNewBlock(1000);
+		connectNodes(carol, bob);
+		for (const node of [alice, bob, carol]) node.handleNewBlock(1000);
 		const ch1 = openReadyChannel(alice, bob, 100_000n);
 		const ch2 = openReadyChannel(alice, bob, 100_000n);
+		const carolChannel = openReadyChannel(carol, bob, 100_000n);
 		buildGraph(alice, bob, [ch1, ch2], 100_000_000n);
+		buildGraph(carol, bob, [carolChannel], 100_000_000n);
 
 		const { hash } = makeExternalHash();
 		const totalMsat = 90_000_000n;
@@ -263,8 +266,13 @@ describe('Hold invoice snapshot (issue #737 phase 2)', function () {
 			paymentHash: hash
 		});
 		const bobPubkey = Buffer.from(bob.getNodeId(), 'hex');
-		const sendPart = (i: number, amountMsat: bigint, cltv: number): void => {
-			alice.sendPaymentToRoute(
+		const sendPart = (
+			payer: LightningNode,
+			i: number,
+			amountMsat: bigint,
+			cltv: number
+		): void => {
+			payer.sendPaymentToRoute(
 				{
 					hops: [
 						{
@@ -281,16 +289,21 @@ describe('Hold invoice snapshot (issue #737 phase 2)', function () {
 				totalMsat
 			);
 		};
-		sendPart(0, totalMsat / 2n, 200);
-		sendPart(1, totalMsat / 2n, 200);
+		sendPart(alice, 0, totalMsat / 2n, 200);
+		sendPart(alice, 1, totalMsat / 2n, 200);
 		let snap = bob.getHeldInvoiceSnapshot(hash)!;
 		expect(snap.complete).to.equal(true);
 		expect(snap.parts).to.have.length(2);
 		expect(snap.cancelHeight).to.equal(1200 - HELD_HTLC_EXPIRY_MARGIN);
 
 		// A late 1 msat part with a short expiry would drag the whole set
-		// into the sweeper's margin: it is failed back, never parked.
-		sendPart(0, 1n, 40);
+		// into the sweeper's margin. Alice's own node refuses to send it,
+		// since her parts out already reach the total (issue #990); the
+		// receiver's rule is for a payer that has no such bound, so carol's
+		// late part reaches bob, who fails it back, never parks it.
+		expect(() => sendPart(alice, 0, 1n, 40)).to.throw(/already in flight/);
+		sendPart(carol, 0, 1n, 40);
+		expect(carol.getPayment(hash)!.status).to.equal(PaymentStatus.FAILED);
 		snap = bob.getHeldInvoiceSnapshot(hash)!;
 		expect(snap.parts).to.have.length(2);
 		expect(snap.committedMsat).to.equal(totalMsat);

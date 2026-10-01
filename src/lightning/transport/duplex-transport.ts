@@ -39,6 +39,12 @@ export interface IDuplexTransport extends EventEmitter {
 	 * emitted as 'error' (if listeners exist) and 'close' reports hadError.
 	 */
 	destroy(error?: Error): this;
+	/**
+	 * Called once the BOLT 8 handshake and init exchange complete on an
+	 * accepted connection. A transport that holds an unauthenticated peer to
+	 * tighter limits lifts them here.
+	 */
+	markEstablished?(): void;
 	/** Remote endpoint info, when known (used for inbound peer bookkeeping). */
 	readonly remoteAddress?: string;
 	readonly remotePort?: number;

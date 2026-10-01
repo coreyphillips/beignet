@@ -761,9 +761,9 @@ describe('watchtower v1 kit against a REAL revoked taproot commitment', function
 		exchangeOnce(pair.opener, pair.acceptor, true);
 		const secret = exchangeOnce(pair.opener, pair.acceptor, true);
 
-		const revokedBuf = pair.opener.takeRevokedCommitmentTx(secret);
-		expect(revokedBuf, 'taproot revoked tx cached').to.not.be.null;
-		const revoked = bitcoin.Transaction.fromBuffer(revokedBuf!);
+		const revokedBufs = pair.opener.takeRevokedCommitmentTxs(secret);
+		expect(revokedBufs, 'taproot revoked tx cached').to.have.length(1);
+		const revoked = bitcoin.Transaction.fromBuffer(revokedBufs[0]);
 		const point = perCommitmentPointFromSecret(secret);
 		const toLocal = buildTaprootToLocalOutput(
 			deriveRevocationPubkey(state.localBasepoints.revocationBasepoint, point),

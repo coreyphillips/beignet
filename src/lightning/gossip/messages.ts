@@ -269,7 +269,11 @@ export function decodeNodeAnnouncementMessage(
 	offset += 2;
 	const addresses: INodeAddress[] = [];
 	const addrEnd = offset + addrlen;
-	while (offset < addrEnd) {
+	// BOLT 7: ignore the first descriptor of an unknown type, and everything
+	// after it, since its length cannot be known. The addresses before it are
+	// kept. Such a message can never re-encode to its signed bytes, so the
+	// graph's byte-identity check keeps it off gossip replies.
+	while (offset < addrEnd && isKnownAddressType(payload[offset])) {
 		const { address, bytesRead } = decodeNodeAddress(payload, offset);
 		addresses.push(address);
 		offset += bytesRead;
@@ -519,6 +523,16 @@ export function encodeNodeAddress(addr: INodeAddress): Buffer {
 		default:
 			throw new Error(`Unknown address type: ${addr.type}`);
 	}
+}
+
+function isKnownAddressType(type: number): boolean {
+	return (
+		type === ADDRESS_TYPE_IPV4 ||
+		type === ADDRESS_TYPE_IPV6 ||
+		type === ADDRESS_TYPE_TORV2 ||
+		type === ADDRESS_TYPE_TORV3 ||
+		type === ADDRESS_TYPE_DNS
+	);
 }
 
 export function decodeNodeAddress(

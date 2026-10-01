@@ -34,8 +34,12 @@ import {
 	TMessageDataMap
 } from '../types/wallet';
 import { createWalletStorage } from './wallet-storage';
+import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
+import { deriveBackupMacKey, writeBackupMac } from './backup-mac';
+import { nodeStorageView } from './node-storage-view';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
+import { CommitmentType, OutputType } from '../lightning/chain/types';
 import { DF_DEFAULT_UNPAIRED_SPLICE_DEPTH } from '../lightning/direct-funding/receiver/types';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX as DF_UNPAIRED_SPLICE_DEPTH_MAX } from '../lightning/message/splice';
 import {
@@ -49,6 +53,7 @@ import { IFforIssuerStatusResp } from '../lightning/ffor/issuer-messages';
 import { IOffer } from '../lightning/offer/types';
 import {
 	estimateSpliceTxWeight,
+	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../lightning/channel/splice-weight';
 import {
@@ -59,8 +64,10 @@ import {
 	MemoryL402CredentialStore,
 	readCappedBody
 } from '../lightning/l402';
-import { IPaymentInfo } from '../lightning/node/types';
+import { ILightningError, IPaymentInfo } from '../lightning/node/types';
+import { IInvoiceInfo } from '../lightning/storage/types';
 import { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
+import { normalizeHexPubkey } from '../lightning/validation';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
 import { SqliteStorage } from '../lightning/storage/sqlite-storage';
 import { deriveStorageKey } from '../lightning/storage/encryption';
@@ -133,10 +140,14 @@ import {
 	JOURNAL_META_KEYS,
 	REPLICATION_META_KEYS,
 	IRotationEvent,
+	IGuardianReplicationEvent,
 	isOnionV3Hostname,
 	parseBolt8GuardianUrl
 } from '../lightning/recovery';
-import { socks5SocketFactory } from '../lightning/transport/peer-manager';
+import {
+	Socks5ProxyScope,
+	socks5SocketFactory
+} from '../lightning/transport/peer-manager';
 import { parsePeerUri } from '../lightning/transport/peer-uri';
 import { getPublicKey } from '../lightning/crypto/ecdh';
 import {
@@ -152,6 +163,7 @@ import {
 } from '../lightning/direct-funding';
 import { directFundingWallet } from './direct-funding';
 import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from './auth';
+import { WEBHOOK_SECRETS_STORAGE_KEY } from './webhooks';
 import {
 	INodeConfig,
 	InvalidRequestError,
@@ -159,15 +171,17 @@ import {
 	ChannelFundingUnavailableCode,
 	SpliceRefusalCode,
 	IHoldCancelledEvent,
-	IHoldInvoiceStateEvent
+	IHoldInvoiceStateEvent,
+	IStructuredLog,
+	IRebalanceExecutionSummary,
+	IRebalanceResult,
+	PaymentDirection,
+	PaymentStatus,
+	PaymentWaitTimeoutError
 } from '../lightning/node/types';
-import {
-	BITCOIN_CHAIN_HASH,
-	REGTEST_CHAIN_HASH,
-	SIGNET_CHAIN_HASH,
-	isAnchorChannel,
-	ChannelState
-} from '../lightning/channel/types';
+import { isAnchorChannel, ChannelState } from '../lightning/channel/types';
+import { isRecencyUnproven } from '../lightning/channel/channel-state';
+import type { Channel } from '../lightning/channel/channel';
 import { decode as decodeInvoice } from '../lightning/invoice/decode';
 import { decodeOffer } from '../lightning/offer/decode';
 import {
@@ -176,7 +190,11 @@ import {
 	describeFailureCode,
 	isRetryableError
 } from './errors';
-import { PaymentQueue } from './payment-queue';
+import {
+	IPaymentQueueStorage,
+	InterruptedPaymentOutcome,
+	PaymentQueue
+} from './payment-queue';
 import {
 	NodeInfo,
 	PeerInfo,
@@ -286,6 +304,9 @@ export interface BeignetNodeOptions {
 	 * Opt-in and additive: coexists with the TCP listener on listenPort.
 	 */
 	websocketPort?: number;
+	/** Inbound peer connections (default 125); once this many are up, only
+	 *  peers holding a channel with this node are admitted. */
+	maxInboundPeers?: number;
 	preferAnchors?: boolean;
 	/**
 	 * option_wumbo (large_channels, default false): advertise the bit and lift
@@ -417,6 +438,10 @@ export interface BeignetNodeOptions {
 		message: string;
 		timestamp: number;
 		channelId?: string;
+		/** The transaction a broadcast error is about, display order (issue #1062). */
+		txid?: string;
+		/** The node still holds that transaction and rebroadcasts it every block. */
+		retained?: boolean;
 	}) => void;
 	/** Log level (default 'info'). Set to 'silent' to suppress. */
 	logLevel?: LogLevel;
@@ -436,15 +461,35 @@ export interface BeignetNodeOptions {
 	backupIntervalMs?: number;
 	/**
 	 * COMBINED daily spending limit in satoshis, shared by Lightning payments
-	 * (payInvoice/sendKeysend/sendPaymentAsync) AND external on-chain sends
-	 * (sendOnchain and sendMaxOnchain, address-targeted spliceOut and
-	 * sendDirectFunding, counted as amount + fee). Excluded by design:
-	 * consolidateUtxos (self-pay), our own channel opens/splices/funding, and
-	 * bumpFeeOnchain/boostOnchain (fee-only). Resets at midnight UTC.
+	 * (payInvoice, sendPaymentAsync, sendKeysend, payOffer, sendToRoute and
+	 * the queue) AND external on-chain sends (sendOnchain and sendMaxOnchain,
+	 * address-targeted spliceOut and sendDirectFunding, counted as amount +
+	 * fee). A Lightning payment reserves its amount plus its routing-fee cap
+	 * at admission and is charged its amount plus the fee actually paid when
+	 * it settles (issue #1008); sendToRoute reserves and charges what its
+	 * first hop carries. A circular rebalance (rebalanceChannel,
+	 * executeRebalances) counts its routing fee only. Excluded by design:
+	 * consolidateUtxos (self-pay), our own channel opens/splices/funding,
+	 * bumpFeeOnchain/boostOnchain (fee-only), and the submarine swap
+	 * provider's payment of the counterparty's invoice, which is bounded by
+	 * the provider's own per-swap fee cap and by the swap-in it is funded
+	 * from rather than by this limit. Resets at midnight UTC.
 	 * NOTE: before v0.3.0 this limit covered Lightning only.
 	 */
 	dailySpendLimitSats?: number;
-	/** Maximum amount in satoshis for a single payment. Rejects any payInvoice/sendKeysend/sendPaymentAsync call exceeding this. Prevents accidental large payments. */
+	/**
+	 * Maximum amount in satoshis for a single payment. Rejects any
+	 * payInvoice/sendPaymentAsync/sendKeysend/payOffer/sendToRoute call whose
+	 * amount plus routing-fee cap exceeds this (issue #1008): the cap is the
+	 * caller's maxFeeSats/maxFeeMsat, or the default of 1% of the amount with
+	 * a 50 sat floor when none is given. Prevents accidental large payments.
+	 * External on-chain sends are capped too: sendOnchain, address-targeted
+	 * spliceOut and sendDirectFunding on amount + fee, sendMaxOnchain on the
+	 * whole sweep. Circular rebalances are not capped, since the amount
+	 * comes back. The submarine swap provider's payment of the counterparty's
+	 * invoice is excluded by design: the provider's own per-swap fee cap and
+	 * the swap-in it is funded from bound it.
+	 */
 	maxPaymentSats?: number;
 	/** Timeout for connectPeer() in milliseconds (default: 15000) */
 	connectTimeoutMs?: number;
@@ -454,6 +499,15 @@ export interface BeignetNodeOptions {
 	 * an onion address. Needs a running Tor daemon/Tor Browser on that port.
 	 */
 	torProxy?: string;
+	/**
+	 * Use torProxy for `.onion` peers only and dial public clearnet peers
+	 * directly (LND's `tor.skip-proxy-for-clearnet-targets`, "hybrid mode").
+	 * Without it every public peer rides the proxy. Private and loopback hosts
+	 * are dialed directly either way. Needs torProxy: startup is refused when
+	 * this is set without one, since it only chooses which hosts use the
+	 * configured proxy. Applies to peer dials and watchtower connections.
+	 */
+	torProxyOnionOnly?: boolean;
 	/**
 	 * Addresses to advertise in our node_announcement so remote peers can
 	 * discover and dial us, as "host[:port]" strings (port defaults to 9735).
@@ -563,6 +617,8 @@ export interface BeignetNodeOptions {
 	 * Automatic circular rebalancing (default DISABLED). When enabled the node
 	 * periodically executes the advisor's rebalance plan, spending at most
 	 * budgetSatsPerDay in routing fees per UTC day. Off unless enabled: true.
+	 * Each run is an executeRebalances call, so drain mode and
+	 * dailySpendLimitSats hold it as they hold a manual one.
 	 */
 	autoRebalance?: {
 		enabled?: boolean;
@@ -683,13 +739,6 @@ function sameGuardianIds(a: string[], b: string[]): boolean {
 	return sortedA.every((id, i) => id === sortedB[i]);
 }
 
-/** Write through a temp file and rename, so a crash never leaves a torn file. */
-function writeFileAtomic(filePath: string, content: string): void {
-	const tmp = `${filePath}.tmp`;
-	fs.writeFileSync(tmp, content);
-	fs.renameSync(tmp, filePath);
-}
-
 const RESTORE_ERROR_CODES: Record<RestoreRefusedError['reason'], string> = {
 	'no-quorum': 'RESTORE_NO_QUORUM',
 	'unknown-namespace': 'RESTORE_UNKNOWN_NAMESPACE',
@@ -775,6 +824,33 @@ export function parseScid(scid: string): Buffer {
 }
 
 /**
+ * The BeignetError code for each LightningErrorCode the engine throws out of a
+ * send, as payInvoice has always mapped them. Every public payment method
+ * routes an engine refusal through this table (issue #991), so a refusal
+ * carries the same code, and over HTTP the same status, whichever method or
+ * route it came in by.
+ */
+export const ENGINE_PAYMENT_ERROR_CODES: Readonly<Record<string, string>> = {
+	NO_ROUTE: 'NO_ROUTE',
+	DUPLICATE_PAYMENT: 'DUPLICATE_PAYMENT',
+	NO_CHANNEL_TO_HOP: 'PEER_NOT_CONNECTED',
+	// The caller's own bounds (#751, #1001): their codes, not a generic
+	// failure, so a swap provider can tell "no route under the refund height"
+	// from "no route at all", and a fee refusal answers 409 as the rebalance
+	// path's always has, rather than the 502 PAYMENT_FAILED that told
+	// payInvoiceWithRetry and every daemon client to retry a cap that the
+	// same request meets again.
+	FEE_EXCEEDS_MAX: 'FEE_EXCEEDS_MAX',
+	CLTV_EXCEEDS_MAX: 'CLTV_EXCEEDS_MAX',
+	MISSING_AMOUNT: 'INVALID_PARAMS',
+	INVALID_INVOICE: 'INVALID_PARAMS',
+	// A keysend refused for its own arguments (a destination that is not a
+	// 33-byte key, a zero amount): the caller's problem, as MISSING_AMOUNT is.
+	INVALID_KEYSEND: 'INVALID_PARAMS',
+	INVOICE_EXPIRED: 'INVOICE_EXPIRED'
+};
+
+/**
  * Decode a user-supplied BOLT 11 string. The parser throws plain Error, which
  * the daemon scrubs to a generic 500 and logs as an unhandled server fault;
  * a typed INVALID_INVOICE keeps the parser's message and answers 400.
@@ -806,6 +882,22 @@ export function spendLimitSats(amountMsat: bigint): number {
 }
 
 /**
+ * The fee hop `i` of a route kept, in msat: what it received (its own
+ * amountToForwardMsat, the amount the previous node forwards TO it) less what
+ * it forwarded to the next hop. The final hop keeps nothing, and a record
+ * whose hop amounts are missing reports 0 rather than a NaN (issue #1056).
+ */
+export function hopFeeMsat(
+	hops: ReadonlyArray<{ amountToForwardMsat?: bigint }>,
+	i: number
+): number {
+	const received = hops[i]?.amountToForwardMsat;
+	const forwarded = hops[i + 1]?.amountToForwardMsat;
+	if (typeof received !== 'bigint' || typeof forwarded !== 'bigint') return 0;
+	return received > forwarded ? Number(received - forwarded) : 0;
+}
+
+/**
  * The amount an invoice payment has to be admitted and accounted for, in sats.
  *
  * The ENCODED amount wins wherever the invoice carries one, because that is
@@ -824,6 +916,52 @@ export function paymentSpendSats(
 	return amountMsat !== undefined
 		? spendLimitSats(amountMsat)
 		: amountSats ?? 0;
+}
+
+/**
+ * What a Lightning payment has to be admitted for, in sats: the amount that
+ * will be paid plus the routing-fee cap the send carries, rounded up together
+ * (issue #1008). The fee is money that leaves the node exactly as the amount
+ * is, and a cap that both limits never saw let a hostile route hint charge a
+ * 4.29M sat fee on a 1 sat invoice. Zero means there is nothing to admit: an
+ * amountless invoice with no usable override, which the engine refuses.
+ */
+export function paymentAdmissionSats(
+	payAmountMsat: bigint | undefined,
+	maxFeeMsat: bigint
+): number {
+	if (payAmountMsat === undefined || payAmountMsat <= 0n) return 0;
+	return spendLimitSats(payAmountMsat + maxFeeMsat);
+}
+
+/**
+ * What a settled payment actually cost, in sats, for the ledger to charge in
+ * place of the reservation (issue #1008); undefined when the record cannot
+ * say, in which case the reservation (amount plus fee cap) stands.
+ *
+ * A single-path, keysend or BOLT 12 record carries the first-hop amount, fees
+ * included, in amountMsat. An MPP record carries the invoice amount there and
+ * the sum of its parts' first-hop amounts in sentMsat. An MPP record written
+ * before sentMsat existed shows as a route (its first part) whose total
+ * differs from the amount, and nothing in it says what the other parts cost.
+ */
+function sentSats(info: IPaymentInfo): number | undefined {
+	if (info.sentMsat !== undefined) return spendLimitSats(info.sentMsat);
+	if (
+		info.route?.totalAmountMsat !== undefined &&
+		info.route.totalAmountMsat !== info.amountMsat
+	) {
+		return undefined;
+	}
+	return spendLimitSats(info.amountMsat);
+}
+
+/**
+ * Whether a payment record marks its invoice paid: a completed receive for
+ * the hash. Null and undefined (no record) read as unpaid.
+ */
+function settlesInvoice(p: IPaymentInfo | null | undefined): boolean {
+	return p?.status === 'COMPLETED' && p.direction === 'INCOMING';
 }
 
 /**
@@ -965,6 +1103,14 @@ export function jsonToRouteHops(hops: RouteHop[]): Array<{
 				`Route hop ${idx}: amountToForwardMsat must be a decimal string`
 			);
 		}
+		// BigInt('-1') parses. A negative first hop would have reached the
+		// spend accounting as a credit (issue #1017).
+		if (amountToForwardMsat < 0n) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				`Route hop ${idx}: amountToForwardMsat must not be negative`
+			);
+		}
 		if (
 			typeof hop.outgoingCltvValue !== 'number' ||
 			!Number.isInteger(hop.outgoingCltvValue) ||
@@ -988,7 +1134,11 @@ export function jsonToRouteHops(hops: RouteHop[]): Array<{
 const GRAPH_DESCRIBE_MAX_LIMIT = 500;
 
 /**
- * One dispatched async payment attempt's claim on the daily budget.
+ * One dispatched Lightning payment attempt's claim on the daily budget,
+ * whichever path sent it: payInvoice, sendKeysend, payOffer,
+ * sendPaymentAsync and sendToRoute all open one at admission, and the
+ * payment:sent handler in create() charges it when the payment settles
+ * (issue #977).
  *
  * A claim has two lifetimes. Its RESERVATION holds `sats` in
  * _pendingSpendSats so nothing else is admitted against capacity this attempt
@@ -998,20 +1148,35 @@ const GRAPH_DESCRIBE_MAX_LIMIT = 500;
  * charged to the day it lands on.
  */
 export interface AsyncSpendClaim {
+	/**
+	 * The amount plus the routing-fee cap the attempt was admitted for
+	 * (issue #1008); for sendToRoute, what its first hop carries. The
+	 * settlement charges what was actually sent when the record says, and
+	 * this otherwise.
+	 */
 	sats: number;
 	/** Epoch ms at which the reservation lapses (see the TTL below). */
 	expiresAt: number;
 	/** Whether `sats` is still counted in _pendingSpendSats. */
 	reserved: boolean;
+	/**
+	 * Set on the claims a hash still holds once a settlement of that hash has
+	 * been charged to another of them. A boot reconciliation can only tell
+	 * that the hash settled, not how many times, so it charges nothing for a
+	 * hash whose claims all carry this; an in-process settlement report still
+	 * charges one claim per report (issue #977).
+	 */
+	settled?: boolean;
 }
 
 /**
  * How long a dispatched async payment keeps HOLDING daily budget. The hold has
  * to outlive the payment's own FAILED report: BOLT 2 has no way to retract an
- * update_add_htlc, so cancelPayment(), the engine's stuck-payment sweep and its
- * expired-invoice sweep all mark a payment failed while its HTLC is still live,
- * and the engine deliberately completes such a payment when the preimage turns
- * up. One full daily window is where the hold ends, because by then the budget
+ * update_add_htlc, so cancelPayment() marks a payment failed while its HTLC is
+ * still live (the payment timeouts and the expired-invoice sweep leave such a
+ * payment PENDING since #976), and the engine deliberately completes such a
+ * payment when the preimage turns up. One full daily window is where the hold
+ * ends, because by then the budget
  * the payment was admitted against has itself rolled over.
  *
  * This is emphatically not a claim that the HTLC is dead by then — routing
@@ -1033,6 +1198,32 @@ export const ASYNC_SPEND_CLAIM_TTL_MS = 24 * 60 * 60 * 1000;
  * the one direction a spending limit must never fail in.
  */
 export const MAX_ASYNC_SPEND_CLAIMS = 4096;
+
+/**
+ * Metadata key of the persisted daily spend ledger (issue #977): the day's
+ * counters and every open claim, written after each mutation and read back
+ * at boot, so a restart within the UTC day neither forgets what the day
+ * already spent nor loses the claim a settlement still has to charge.
+ */
+export const DAILY_SPEND_STATE_KEY = 'daemon:daily-spend:v1';
+
+/** The row under DAILY_SPEND_STATE_KEY. */
+export interface PersistedDailySpendState {
+	/** Epoch ms of the next midnight UTC, when the counters go back to zero. */
+	resetTime: number;
+	totalSats: number;
+	lightningSats: number;
+	onchainSats: number;
+	/** paymentHash hex -> that hash's claims, oldest first. */
+	claims: Record<string, AsyncSpendClaim[]>;
+}
+
+/** Epoch ms of the next midnight UTC, when the daily counters reset. */
+const nextUtcMidnight = (): number => {
+	const next = new Date();
+	next.setUTCHours(24, 0, 0, 0);
+	return next.getTime();
+};
 
 /**
  * Direct-funding offers remembered as charged to the daily budget. Only a
@@ -1145,6 +1336,49 @@ function requireFinalCltvExpiry(value: unknown): number {
 }
 
 /**
+ * Seconds an invoice may stay payable. The BOLT 11 encoder packs whatever
+ * number it is given, so -1 and NaN go out as 0 and 1.5 as 1: the payer sees
+ * an invoice already expired, or expiring sooner than the one this node
+ * records. A year is LND's ceiling for the same field.
+ */
+const MAX_INVOICE_EXPIRY_SECS = 365 * 24 * 60 * 60;
+
+function requireInvoiceExpiry(value: unknown, field: string): number {
+	if (
+		typeof value !== 'number' ||
+		!Number.isSafeInteger(value) ||
+		value < 1 ||
+		value > MAX_INVOICE_EXPIRY_SECS
+	) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`${field} must be a whole number of seconds between 1 and ` +
+				`${MAX_INVOICE_EXPIRY_SECS}`
+		);
+	}
+	return value;
+}
+
+/**
+ * The BOLT 11 `d` tag's length field counts at most 1023 five-bit words,
+ * which is 639 whole bytes. A longer description needs descriptionHash.
+ */
+const MAX_INVOICE_DESCRIPTION_BYTES = 639;
+
+function requireInvoiceDescription(value: string | undefined): void {
+	if (
+		typeof value === 'string' &&
+		Buffer.byteLength(value, 'utf8') > MAX_INVOICE_DESCRIPTION_BYTES
+	) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`description must be at most ${MAX_INVOICE_DESCRIPTION_BYTES} bytes ` +
+				'of UTF-8; use descriptionHash for a longer one'
+		);
+	}
+}
+
+/**
  * A millisatoshi field that reaches the library as a bigint but is accepted
  * from callers as a number or a decimal string. BigInt() is the only thing
  * that ever validated it, by throwing, so both spellings are checked here
@@ -1160,6 +1394,70 @@ function requireMsatValue(value: number | string, field: string): bigint {
 	throw new BeignetError(
 		BeignetErrorCode.INVALID_PARAMS,
 		`${field} must be a whole number of millisatoshis, or a string of digits`
+	);
+}
+
+/**
+ * The routing-fee cap a payment carries when its caller passes none (issue
+ * #1008): 1% of the amount, rounded up to the msat, and never below 50 sats
+ * so that small payments still route. Before this the pay paths handed the
+ * engine no cap at all, and a route hint carrying a u32 fee_base_msat of
+ * 0xffffffff routed a 4.29M sat fee that neither spending limit ever saw.
+ *
+ * The default lives here and not in the engine: LightningNode keeps
+ * `undefined` as uncapped for library callers.
+ */
+export const DEFAULT_MAX_FEE_PPM = 10_000;
+export const DEFAULT_MAX_FEE_FLOOR_SATS = 50;
+
+export function defaultMaxFeeMsat(amountMsat: bigint): bigint {
+	const proportional =
+		(amountMsat * BigInt(DEFAULT_MAX_FEE_PPM) + 999_999n) / 1_000_000n;
+	const floor = BigInt(DEFAULT_MAX_FEE_FLOOR_SATS) * 1000n;
+	return proportional > floor ? proportional : floor;
+}
+
+/**
+ * The caller's fee cap in msat, from whole sats or from an exact msat figure,
+ * or undefined when the caller gave none. Both at once is refused rather than
+ * reconciled: a caller that sent two caps has a bug, and silently picking one
+ * would hide it (issue #998).
+ */
+function explicitMaxFeeMsat(
+	maxFeeSats: number | undefined,
+	maxFeeMsat: number | string | undefined
+): bigint | undefined {
+	if (maxFeeSats !== undefined && maxFeeMsat !== undefined) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			'maxFeeSats and maxFeeMsat are mutually exclusive'
+		);
+	}
+	if (maxFeeMsat !== undefined)
+		return requireMsatValue(maxFeeMsat, 'maxFeeMsat');
+	if (maxFeeSats !== undefined) {
+		return (
+			BigInt(requireNonNegativeSafeInteger(maxFeeSats, 'maxFeeSats')) * 1000n
+		);
+	}
+	return undefined;
+}
+
+/**
+ * The fee cap a payment of `amountMsat` is sent under: the caller's when one
+ * was given, else the default for that amount (issue #1008). Never undefined,
+ * so no pay path can reach the engine uncapped by omission. With no amount to
+ * size it (an amountless invoice with no override, which the engine refuses)
+ * the default is its floor.
+ */
+function resolveMaxFeeMsat(
+	maxFeeSats: number | undefined,
+	maxFeeMsat: number | string | undefined,
+	amountMsat: bigint | undefined
+): bigint {
+	return (
+		explicitMaxFeeMsat(maxFeeSats, maxFeeMsat) ??
+		defaultMaxFeeMsat(amountMsat ?? 0n)
 	);
 }
 
@@ -1212,16 +1510,21 @@ function requireOpenAmounts(amountSats: unknown, pushSats?: unknown): void {
  * writeUInt32BE truncates 1.5 to 1 and throws on 2^32, and both happen after
  * the channel's state machine has moved, so the bound is enforced here.
  */
-function requireU32(value: unknown, field: string, min = 1): number {
+function requireU32(
+	value: unknown,
+	field: string,
+	min = 1,
+	max = 0xffffffff
+): number {
 	if (
 		typeof value !== 'number' ||
 		!Number.isInteger(value) ||
 		value < min ||
-		value > 0xffffffff
+		value > max
 	) {
 		throw new BeignetError(
 			BeignetErrorCode.INVALID_PARAMS,
-			`${field} must be an integer between ${min} and 4294967295`
+			`${field} must be an integer between ${min} and ${max}`
 		);
 	}
 	return value;
@@ -1425,6 +1728,37 @@ function isHeldRestore(ch: {
 	);
 }
 
+/** States a channel never takes a new HTLC from again. */
+const CLOSING_CHANNEL_STATES: ReadonlySet<ChannelState> = new Set([
+	ChannelState.SHUTTING_DOWN,
+	ChannelState.NEGOTIATING_CLOSING,
+	ChannelState.CLOSED,
+	ChannelState.FORCE_CLOSED,
+	ChannelState.ERRORED
+]);
+
+/**
+ * Whether a channel can still come to take a new HTLC (issue #967): one that
+ * is closing, closed or failed cannot, looked through a pending reestablish,
+ * and neither can one under a recency hold, which ends only in a close.
+ */
+function canBecomeUsable(channel: Channel): boolean {
+	const st = channel.getFullState();
+	const effective =
+		st.state === ChannelState.AWAITING_REESTABLISH && st.preReestablishState
+			? st.preReestablishState
+			: st.state;
+	return !CLOSING_CHANNEL_STATES.has(effective) && !isRecencyUnproven(st);
+}
+
+/**
+ * Private trigger for the pay-readiness wait: a channel closed, failed or
+ * went away, so "no live channel left" may now hold (issue #967). A symbol,
+ * so it is no public event, and shutdown's removeAllListeners() takes its
+ * listeners with the rest.
+ */
+const CHANNELS_CHANGED = Symbol('channels-changed');
+
 /**
  * The refusal an operator force close of a capsule-restored channel gets
  * without the labelled acknowledgement RECOVERY-PROTOCOL 5.6 asks for
@@ -1460,6 +1794,32 @@ const SECRET_MISSING_FORCE_CLOSE_REFUSAL =
 	'the peer to close is the safe outcome. Set acceptStaleStateRisk: true ' +
 	'to force close anyway.';
 
+/**
+ * The same acknowledgement for a whole device rather than one channel
+ * (issue #1013). A fenced device was taken over by another holding the
+ * same seed, and every update that device made revoked a commitment this
+ * one still stores, so its force close is normally a revoked broadcast.
+ */
+const SUPERSEDED_FORCE_CLOSE_REFUSAL =
+	'This device was superseded: another device restored this node from ' +
+	'the same seed and took over its channels, so this one is fenced. ' +
+	'Every channel update the other device has made revoked a commitment ' +
+	'this device still stores. If it has used this channel, force closing ' +
+	'here publishes a revoked commitment and the whole channel balance is ' +
+	'lost to the justice path. Close the channel from the device that took ' +
+	'over, or wait for the peer to close. Set acceptStaleStateRisk: true to ' +
+	'force close anyway.';
+
+const UNCONFIRMED_OWNER_FORCE_CLOSE_REFUSAL =
+	'This device has not confirmed with its guardians that it still owns ' +
+	"this node's channels (the recovery gate is quarantined), so another " +
+	'device restored from the same seed may have taken them over. If one ' +
+	'has and has used this channel, force closing publishes a revoked ' +
+	'commitment and the whole channel balance is lost to the justice path. ' +
+	'Waiting for the guardians to confirm this device, or for the peer to ' +
+	'close, is the safe outcome. Set acceptStaleStateRisk: true to force ' +
+	'close anyway.';
+
 interface IRecencyHold {
 	restoreRecencyUnproven?: true;
 	reestablishRecencyUnproven?: true;
@@ -1484,7 +1844,11 @@ export class BeignetNode extends EventEmitter {
 		this.offlineReceiveTimer = undefined;
 	}
 	getFforReceiveService(): FforReceiveService {
-		if (!this.fforReceiveService) throw new Error('Wallet is not running');
+		if (!this.fforReceiveService)
+			throw new BeignetError(
+				'RECEIVE_UNAVAILABLE',
+				'Automatic receiving is unavailable.'
+			);
 		return this.fforReceiveService;
 	}
 	// ─── Typed event overloads ───
@@ -1518,12 +1882,20 @@ export class BeignetNode extends EventEmitter {
 	private wallet!: Wallet;
 	private node!: LightningNode;
 	private storage!: SqliteStorage;
+	/**
+	 * The fenced view of the database the current node was built on (issue
+	 * #958). Kept so shutdown can fence it even when the node's own teardown
+	 * throws before its close.
+	 */
+	private _nodeStorageView?: SqliteStorage;
 	/** Wallet-owned output script that force-close sweeps pay into. */
 	private sweepDestinationScript?: Buffer;
 	/** Background timer retrying wallet sweep-address resolution (see scheduleSweepAddressRefresh). */
 	private _sweepRefreshTimer?: ReturnType<typeof setInterval>;
 	/** Background timer waiting for Electrum before fallback-fund recovery (see runFallbackRecoveryWhenConnected). */
 	private _fallbackRecoveryTimer?: ReturnType<typeof setInterval>;
+	/** The autoRebalance timer, run here rather than in the engine (see initNode). */
+	private _autoRebalanceTimer?: ReturnType<typeof setInterval>;
 	/**
 	 * Bound on the cooperative close's wallet-address lookup (issue #542
 	 * review): getNextAvailableAddress can enter an Electrum reconnect whose
@@ -1710,30 +2082,40 @@ export class BeignetNode extends EventEmitter {
 	private _websocketPort?: number;
 	private _connectTimeoutMs = 15_000;
 	private _dailySpendLimitSats?: number;
-	// _dailySpentSats is the combined LN + onchain total; the two source
-	// counters below only feed the GET /spend-limit breakdown.
+	// The daily ledger (issue #977). _dailySpentSats is the combined LN +
+	// onchain total; the two source counters below only feed the
+	// GET /spend-limit breakdown. Every field down to _asyncSpendClaims is
+	// persisted under DAILY_SPEND_STATE_KEY after each mutation and restored
+	// at boot, so a restart within the UTC day resumes the day where it was.
 	private _dailySpentSats = 0;
 	private _dailySpentLightningSats = 0;
 	private _dailySpentOnchainSats = 0;
 	private _dailySpendResetTime = 0;
 	private _pendingSpendSats = 0;
 	/**
-	 * paymentHash hex -> the budget claim of every async attempt dispatched for
-	 * that hash, oldest first. A payment submitted through the fire-and-forget
-	 * path returns before it settles and so has no local listener to release
-	 * its reservation; the forwarding payment:sent handler installed in
-	 * create() charges one claim per settlement, which keeps the listener count
-	 * constant no matter how many async payments are in flight.
+	 * paymentHash hex -> the budget claim of every Lightning payment attempt
+	 * dispatched for that hash, oldest first, whichever path sent it. A
+	 * blocking call's own listener may be gone by the time the settlement
+	 * lands (a timeout with the HTLC still out, or a restart), so no path
+	 * charges its own settlement: the forwarding payment:sent handler
+	 * installed in create() charges one claim per settlement, from this
+	 * ledger, which is persisted (issue #977). That also keeps the listener
+	 * count constant no matter how many payments are in flight.
 	 *
 	 * A claim's sats stay counted in _pendingSpendSats until its reservation is
-	 * released, and a payment reporting FAILED does NOT release it: the HTLC
-	 * cannot be retracted and the engine completes the payment if the preimage
-	 * turns up, so freeing the budget there let a caller cancel a live payment
-	 * to win its daily allowance back and spend it twice. A reservation ends
-	 * only when a settlement charges it, when the engine reported dispatching
-	 * nothing, or when it expires (ASYNC_SPEND_CLAIM_TTL_MS). The record itself
-	 * outlives the reservation so that a settlement arriving afterwards is
-	 * still charged, to the day it arrives on.
+	 * released, and a payment reporting FAILED does NOT release it while an
+	 * HTLC is still out: the HTLC cannot be retracted and the engine completes
+	 * the payment if the preimage turns up, so freeing the budget there let a
+	 * caller cancel a live payment to win its daily allowance back and spend
+	 * it twice. A reservation ends when a settlement charges it (the hash's
+	 * other claims release with it, since the engine reports one settlement
+	 * per hash and refuses a re-send of a paid hash), when a failure report
+	 * arrives with nothing in flight for the hash any more (the payment:failed
+	 * handler in create(), so the release does not depend on a listener that
+	 * a timeout or a restart may have removed), or when it expires
+	 * (ASYNC_SPEND_CLAIM_TTL_MS). The record itself outlives the reservation
+	 * so that a settlement arriving afterwards is still charged, to the day
+	 * it arrives on.
 	 *
 	 * One claim per ATTEMPT, not per hash: a resubmission dispatched while an
 	 * earlier attempt's HTLC may still be out there is a second live claim, and
@@ -1741,13 +2123,14 @@ export class BeignetNode extends EventEmitter {
 	 */
 	private readonly _asyncSpendClaims = new Map<string, AsyncSpendClaim[]>();
 	/**
-	 * paymentHash hex -> how many blocking sends (payInvoice) currently own that
-	 * hash's spend accounting. Their own listener records the settlement, so the
-	 * forwarding handler in create() must not charge an async claim for the same
-	 * event. Held only for as long as the listener is installed.
+	 * The up-front charges of the rebalances still running, which a new UTC
+	 * day starts with. In memory only: after a restart the charge stays with
+	 * the day it was persisted to.
 	 */
-	private readonly _blockingPaymentHashes = new Map<string, number>();
+	private _liveRebalanceChargeSats = 0;
 	private _maxPaymentSats?: number;
+	/** Tail of the queue _runOnchainSend runs whole on-chain sends through. */
+	private _onchainSendLock: Promise<unknown> = Promise.resolve();
 	/**
 	 * Paid L402 credentials, so a gated API is paid for once rather than per
 	 * request. In memory by design: a credential is a bearer token for paid
@@ -1829,11 +2212,20 @@ export class BeignetNode extends EventEmitter {
 		// An explicit dataDir is respected as-is (one wallet per dataDir).
 		const dataDir = opts.dataDir || defaultDataDirForMnemonic(mnemonic);
 
-		// Ensure data directory exists
-		fs.mkdirSync(dataDir, { recursive: true });
+		// Owner-only data directory (issue #1004): the database's lookup
+		// columns are plaintext, and mkdir leaves an existing directory's bits
+		// alone, so one created by an older release under umask 022 is
+		// tightened here. A refused chmod is logged once the logger is wired.
+		const dirMode = ensurePrivateDir(dataDir);
 
 		const instance = new BeignetNode(mnemonic, networkName, dataDir);
 		await instance.init(opts);
+		if (dirMode.error) {
+			instance.log('warn', 'Could not restrict data directory permissions', {
+				dataDir,
+				error: dirMode.error.message
+			});
+		}
 		return instance;
 	}
 
@@ -1964,6 +2356,15 @@ export class BeignetNode extends EventEmitter {
 			if (refusal !== null) {
 				throw new BeignetError('INVALID_PARAMS', `jitReceive: ${refusal}`);
 			}
+		}
+		// Refused before the lock, storage or Electrum are touched (issue
+		// #963): the switch only narrows which hosts use the proxy, so with no
+		// proxy configured it is a misconfiguration and not a no-op.
+		if (opts.torProxyOnionOnly && !opts.torProxy) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'torProxyOnionOnly needs torProxy: it only chooses which hosts use the configured proxy'
+			);
 		}
 		const networkName = this.networkName;
 
@@ -2134,9 +2535,7 @@ export class BeignetNode extends EventEmitter {
 		const beignetNetwork = this.toBeignetNetwork(networkName);
 		const lnNetwork = this.toLnNetwork(networkName);
 		const coinType = this.toCoinType(networkName);
-		let chainHash = BITCOIN_CHAIN_HASH;
-		if (networkName === 'regtest') chainHash = REGTEST_CHAIN_HASH;
-		if (networkName === 'signet') chainHash = SIGNET_CHAIN_HASH;
+		const chainHash = chainHashForNetwork(lnNetwork);
 
 		// 3. Create on-chain wallet
 		const electrumServer = {
@@ -2283,11 +2682,17 @@ export class BeignetNode extends EventEmitter {
 			if (!proxyHost || !Number.isFinite(port)) {
 				throw new BeignetError(
 					'INVALID_PARAMS',
-					`Invalid torProxy "${opts.torProxy}" — expected "host:port"`
+					`Invalid torProxy "${opts.torProxy}": expected "host:port"`
 				);
 			}
 			socks5Proxy = { host: proxyHost, port };
 		}
+		// Hybrid mode (issue #963): the proxy serves .onion peers only and
+		// public clearnet peers are dialed directly. Private and loopback
+		// hosts are direct under either scope.
+		const socks5ProxyScope: Socks5ProxyScope = opts.torProxyOnionOnly
+			? 'onion'
+			: 'all';
 
 		// Parse addresses to advertise in our node_announcement (BOLT 7).
 		let announcedAddresses: INodeAddress[] | undefined;
@@ -2324,10 +2729,16 @@ export class BeignetNode extends EventEmitter {
 			});
 		}
 
+		// A fenced view, not the database itself: the node's destroy() closes
+		// it, and the database stays open for the wallet, which stops after
+		// the node and still writes (issue #958). Every path that builds a
+		// node comes through here, so each gets a fresh view of the database
+		// it runs on.
+		this._nodeStorageView = nodeStorageView(this.storage);
 		this.node = LightningNode.fromMnemonic(this.mnemonic, {
 			coinType,
 			network: lnNetwork,
-			storage: this.storage,
+			storage: this._nodeStorageView,
 			// Issue #906: fence fresh indices during active auto-apply or a
 			// rebuild, and while the node's block height is zero.
 			newChannelsRefused: (): string | null => this.newChannelRefusal(),
@@ -2524,6 +2935,8 @@ export class BeignetNode extends EventEmitter {
 			logger: this.logger,
 			sweepDestinationScript,
 			socks5Proxy,
+			socks5ProxyScope,
+			maxInboundPeers: opts.maxInboundPeers,
 			...(opts.guardianServe
 				? {
 						guardianHost: {
@@ -2550,7 +2963,12 @@ export class BeignetNode extends EventEmitter {
 				  }
 				: {}),
 			peerStorageEnabled: this.peerStorageEnabled,
-			autoRebalance: opts.autoRebalance,
+			// The engine's own timer would skip the drain and the daily limit,
+			// so the node runs it instead (step 11b).
+			autoRebalance: opts.autoRebalance && {
+				...opts.autoRebalance,
+				enabled: false
+			},
 			autoTuneFees: opts.autoTuneFees,
 			watchtowers: opts.watchtowers,
 			recovery: this.recoveryNodeConfig
@@ -2588,34 +3006,7 @@ export class BeignetNode extends EventEmitter {
 		}
 
 		// Forward errors to callback or absorb to prevent process crash
-		this.node.on(
-			'node:error',
-			(err: {
-				code: string;
-				message: string;
-				timestamp: number;
-				channelId?: Buffer;
-			}) => {
-				if (opts.onError) {
-					opts.onError({
-						code: err.code,
-						message: err.message,
-						timestamp: err.timestamp,
-						channelId: err.channelId ? err.channelId.toString('hex') : undefined
-					});
-				}
-				// Carry the channel id, as onError already does. Without it a
-				// subscriber (SSE, webhooks) cannot tell which channel an error
-				// belongs to, so an error raised while a channel is being opened
-				// is indistinguishable from an unrelated one on another channel.
-				this.emit('node:error', {
-					code: err.code,
-					message: err.message,
-					timestamp: err.timestamp,
-					channelId: err.channelId ? err.channelId.toString('hex') : undefined
-				});
-			}
-		);
+		this.wireNodeErrorRelay(opts.onError);
 
 		// Forward payment events with JSON-safe types + structured logging
 		this.node.on('payment:received', (info: IPaymentInfo) => {
@@ -2628,9 +3019,17 @@ export class BeignetNode extends EventEmitter {
 		});
 		this.node.on('payment:sent', (info: IPaymentInfo) => {
 			const pi = this.toPaymentInfo(info);
-			// Before the forward, so a subscriber reading the daily spend from
-			// this event sees the settled payment already counted.
-			this._chargeAsyncSpendClaim(pi.paymentHash);
+			// The one place a Lightning settlement is charged to the daily
+			// budget (issue #977): every pay path opened a claim at admission,
+			// and this handler is registered before any of their listeners, so
+			// the spend is counted before a blocking caller resolves, and
+			// before the forward, so a subscriber reading the daily spend from
+			// this event sees the settled payment already counted. Charged at
+			// what actually left the node, fees included, where the record
+			// says; the reservation (amount plus fee cap) otherwise (#1008).
+			this._chargeAsyncSpendClaim(pi.paymentHash, {
+				actualSats: sentSats(info)
+			});
 			this.log('info', 'Payment sent', {
 				paymentHash: pi.paymentHash,
 				amountSats: pi.amountSats,
@@ -2640,11 +3039,16 @@ export class BeignetNode extends EventEmitter {
 		});
 		this.node.on('payment:failed', (info: IPaymentInfo) => {
 			const pi = this.toPaymentInfo(info);
-			// Deliberately no spend accounting here. A failure report is not the
-			// end of an async payment's claim on the daily budget: the HTLC it
-			// dispatched cannot be withdrawn and can still be fulfilled, so the
-			// claim runs until a settlement charges it or it expires. See
-			// _asyncSpendClaims.
+			// The one place a failure report touches the daily budget (issue
+			// #977). A failure is not the end of a claim while an HTLC is
+			// still out: it cannot be withdrawn and can still be fulfilled, so
+			// the claim runs on. Once nothing is in flight for the hash (the
+			// engine gave up after its last HTLC failed back, or refused before
+			// dispatching) nothing can settle under it any more, and every
+			// reservation under the hash goes; the records stay. Here rather
+			// than in the pay paths' own listeners: those are gone after a
+			// timeout with the HTLC out, and sendPaymentAsync never had one.
+			this._releaseAsyncSpendClaimsUnlessInFlight(info.paymentHash);
 			// A bare failure code cannot be acted on: the same code means very
 			// different things depending on WHICH hop returned it. Log the erring hop
 			// and the channel it was asked to forward over, so a route failure can be
@@ -2670,6 +3074,80 @@ export class BeignetNode extends EventEmitter {
 			this.refreshStaticChannelBackup();
 			this.emit('channel:ready', { channelId });
 		});
+		// A channel that can take a new HTLC again (issue #967): it reached
+		// NORMAL on channel_ready, or finished reestablishing on a reconnect.
+		// node:ready fires once the peers' init handshakes are done, before
+		// any reestablish, so the payment queues wait for this instead.
+		const usableNode = this.node;
+		// Out of the channel manager's dispatch turn: a payment the event
+		// releases must not be sent from inside the message handler that is
+		// still finishing the reestablish or the splice lock.
+		const deferEmit = (emit: () => void): void => {
+			setImmediate(() => {
+				if (this.destroyed || this._resuming || this.node !== usableNode) {
+					return;
+				}
+				try {
+					emit();
+				} catch (err: unknown) {
+					try {
+						this.log('warn', 'A payment-readiness listener failed', {
+							error: err instanceof Error ? err.message : String(err)
+						});
+					} catch {
+						// A throwing log listener must not crash the process
+						// from a timer callback either.
+					}
+				}
+			});
+		};
+		const announceUsable = (channelId: Buffer): void =>
+			deferEmit(() => {
+				const channel = usableNode.getChannelManager().getChannel(channelId);
+				if (!channel?.acceptsNewHtlcs()) return;
+				this.emit('channel:usable', { channelId: channelId.toString('hex') });
+			});
+		this.node.on('channel:ready', (data: { channelId: Buffer }) =>
+			announceUsable(data.channelId)
+		);
+		this.node
+			.getChannelManager()
+			.on('channel:reestablished', (channelId: Buffer) =>
+				announceUsable(channelId)
+			);
+		// A splice that locks, or one that unwinds, can leave the channel
+		// usable where the reestablish could not (still SPLICING then, or a
+		// taproot channel parked until splice_locked). One channel grown by
+		// splice is the whole of a typical wallet.
+		for (const event of [
+			'splice:complete',
+			'splice:aborted',
+			'splice:reverted'
+		]) {
+			this.node.on(event, (data: { channelId: Buffer }) =>
+				announceUsable(data.channelId)
+			);
+		}
+		// The funding quarantine lifting says so only in its structured log.
+		this.node.on('log', (entry: IStructuredLog) => {
+			if (entry?.action !== 'funding_missing_quarantine_lifted') return;
+			const idHex = entry.data?.channelId;
+			if (typeof idHex === 'string') announceUsable(Buffer.from(idHex, 'hex'));
+		});
+		// A channel that closed, failed or went away may have been the last
+		// live one; the pay-readiness wait then stops waiting.
+		const channelsChanged = (): void =>
+			deferEmit(() => this.emit(CHANNELS_CHANGED));
+		for (const event of [
+			'channel:pending-close',
+			'channel:force-closing',
+			'channel:closed',
+			'channel:voided',
+			'channel:aborted'
+		]) {
+			this.node.on(event, channelsChanged);
+		}
+		this.node.getChannelManager().on('channel:errored', channelsChanged);
 		this.node.on('channel:closed', (data: { channelId: Buffer }) => {
 			const channelId = data.channelId.toString('hex');
 			this.log('info', 'Channel closed', { channelId });
@@ -3214,10 +3692,25 @@ export class BeignetNode extends EventEmitter {
 			opts.dailySpendLimitSats > 0
 		) {
 			this._dailySpendLimitSats = opts.dailySpendLimitSats;
-			this._resetDailySpendIfNeeded();
+			// After the node is built (step 6): the ledger's claims are
+			// reconciled against what it knows of their payments.
+			this._loadSpendState();
 		}
 		if (opts.maxPaymentSats !== undefined && opts.maxPaymentSats > 0) {
 			this._maxPaymentSats = opts.maxPaymentSats;
+		}
+
+		// 11b. Automatic rebalancing, through executeRebalances so every run
+		// is held to the drain and charged to the daily ledger loaded above.
+		if (opts.autoRebalance?.enabled === true) {
+			this._autoRebalanceTimer = setInterval(() => {
+				this.executeRebalances().catch((err) => {
+					this.log('warn', 'Automatic rebalance failed', {
+						error: err instanceof Error ? err.message : String(err)
+					});
+				});
+			}, opts.autoRebalance.intervalMs ?? 3_600_000);
+			this._autoRebalanceTimer.unref?.();
 		}
 
 		// 12. Auto-bootstrap peer discovery
@@ -3611,8 +4104,43 @@ export class BeignetNode extends EventEmitter {
 				this.log('debug', `Recovery replication: ${event.type}`, {
 					detail: event.detail
 				});
+				this.relayRecordTooLarge(event);
 			}
 		});
+	}
+
+	/**
+	 * A guardian that refuses a record as too large, or because its quota
+	 * is full, can take nothing after it, so in quorum mode the node stops
+	 * releasing channel updates and in async mode its backup stops
+	 * advancing. Neither shows up anywhere else.
+	 */
+	private relayRecordTooLarge(event: IGuardianReplicationEvent): void {
+		if (
+			event.type !== 'record:too-large' &&
+			event.type !== 'record:quota-refused'
+		) {
+			return;
+		}
+		const tooLarge = event.type === 'record:too-large';
+		this.log(
+			'error',
+			tooLarge
+				? 'Recovery guardian refused an oversized record'
+				: 'Recovery guardian refused a record: its quota is full',
+			{ detail: event.detail }
+		);
+		const data = {
+			code: tooLarge
+				? 'RECOVERY_RECORD_TOO_LARGE'
+				: 'RECOVERY_GUARDIAN_QUOTA_EXCEEDED',
+			message: event.detail,
+			timestamp: Date.now()
+		};
+		// Reported once per record, so a boot-time refusal must also reach
+		// the callback, which exists before any listener can attach.
+		this._bootOpts?.onError?.(data);
+		this.emit('node:error', data);
 	}
 
 	/**
@@ -4330,8 +4858,8 @@ export class BeignetNode extends EventEmitter {
 			}
 			if (resume) this._resuming = true;
 			else this._restartRequired = true;
-			// Tear the running node down (its destroy closes the database), then
-			// swap the files through the same path a crashed swap resumes on.
+			// Tear the running node down and close the database, then swap the
+			// files through the same path a crashed swap resumes on.
 			this.teardownNodeForRestart();
 			try {
 				this.finishStagedCapsuleRestore(dbPath);
@@ -4432,6 +4960,20 @@ export class BeignetNode extends EventEmitter {
 			}
 			this._resuming = false;
 			this._bootTargetEmpty = false;
+			// The queue's wait to start was bound to the node just torn down;
+			// the rebuilt node gets its own. start() runs once, so a queue
+			// already started only looks at its held entries again (issue
+			// #978).
+			if (this.paymentQueue) {
+				this.whenReadyToPay(() => {
+					this.paymentQueue?.start();
+					// An entry whose outcome the torn-down node could not
+					// answer is asked about again on the rebuilt one (issue
+					// #976).
+					this.paymentQueue?.resettle();
+					this.paymentQueue?.poke();
+				});
+			}
 			// The candidates served their purpose; a fresh boot would hold
 			// none, and the peers re-send on their next connect anyway.
 			this._peerRetrievedCapsules.clear();
@@ -4776,8 +5318,23 @@ export class BeignetNode extends EventEmitter {
 			clearInterval(this._fallbackRecoveryTimer);
 			this._fallbackRecoveryTimer = undefined;
 		}
+		if (this._autoRebalanceTimer) {
+			clearInterval(this._autoRebalanceTimer);
+			this._autoRebalanceTimer = undefined;
+		}
+		// The queue itself stays, and is not stopped: stop() is for good, and
+		// after the resume it serves the rebuilt node over the installed
+		// database through its live storage view (issue #978).
 		this.paymentQueue?.removeAllListeners();
 		this.node.destroy();
+		// The node's destroy() closes only its view of the database (issue
+		// #958); the swap needs the file itself closed, as it was when the
+		// node closed the database directly.
+		try {
+			this.storage.close();
+		} catch {
+			// best-effort, as the node's own close was
+		}
 		void (this.wallet as Wallet | undefined)?.stop().catch(() => {
 			/* best effort */
 		});
@@ -4791,10 +5348,14 @@ export class BeignetNode extends EventEmitter {
 	 * Daemon-local state that lives in the database beside the channel
 	 * state, and must follow the operator into the restored one: persisted
 	 * API-key rotations and revocations (a dropped override resurrects a
-	 * revoked secret), registered webhooks, and the peer addresses just
-	 * used to retrieve the capsules (so the restored node dials its channel
-	 * peers on its own). The auth override is mandatory; the rest is best
-	 * effort and logged.
+	 * revoked secret), registered webhooks and their HMAC secrets, the
+	 * payment queue's rows (the queue outlives an in-process resume and
+	 * updates them later, issue #978), and the peer addresses just used to
+	 * retrieve the capsules (so
+	 * the restored node dials its channel peers on its own), and the daily
+	 * spend ledger (a resume must not hand the day's allowance back, issue
+	 * #977). The auth override is mandatory; the rest is best effort and
+	 * logged.
 	 */
 	private carryDaemonState(from: SqliteStorage, to: SqliteStorage): void {
 		const overrides = from.loadWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY);
@@ -4811,8 +5372,31 @@ export class BeignetNode extends EventEmitter {
 					hook.createdAt
 				);
 			}
+			const secrets = from.loadWalletData(WEBHOOK_SECRETS_STORAGE_KEY);
+			if (secrets !== null) {
+				to.saveWalletData(WEBHOOK_SECRETS_STORAGE_KEY, secrets);
+			}
 		} catch (err) {
 			this.log('warn', 'Could not carry webhooks into the restore', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+		try {
+			for (const row of from.loadAllQueueEntries()) {
+				// saveQueueEntry writes the columns an enqueue sets; the
+				// outcome columns follow as the queue records them.
+				to.saveQueueEntry(row);
+				if (row.error !== undefined || row.completedAt !== undefined) {
+					to.updateQueueEntryStatus(
+						row.id,
+						row.status,
+						row.error,
+						row.completedAt
+					);
+				}
+			}
+		} catch (err) {
+			this.log('warn', 'Could not carry the payment queue into the restore', {
 				error: err instanceof Error ? err.message : String(err)
 			});
 		}
@@ -4824,6 +5408,16 @@ export class BeignetNode extends EventEmitter {
 			this.log('warn', 'Could not carry peer addresses into the restore', {
 				error: err instanceof Error ? err.message : String(err)
 			});
+		}
+		try {
+			const spend = from.loadMetadata(DAILY_SPEND_STATE_KEY);
+			if (spend !== null) to.saveMetadata(DAILY_SPEND_STATE_KEY, spend);
+		} catch (err) {
+			this.log(
+				'warn',
+				'Could not carry the daily spend ledger into the restore',
+				{ error: err instanceof Error ? err.message : String(err) }
+			);
 		}
 	}
 
@@ -5062,11 +5656,16 @@ export class BeignetNode extends EventEmitter {
 					...bindGuardianSet(incoming, { transportFor })
 				},
 				required: CRASH_V1_PROFILE.required,
+				journalKeys: {
+					masterKey: deriveRecoveryMasterKey(this.nodeSecret()),
+					nodeId: getPublicKey(this.nodeSecret())
+				},
 				onEvent: (event) => this.noteRotationEvent(event),
 				onReplicationEvent: (event) => {
 					this.log('debug', `Rotation replication: ${event.type}`, {
 						detail: event.detail
 					});
+					this.relayRecordTooLarge(event);
 				}
 			});
 		} catch (error) {
@@ -5571,10 +6170,22 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
-	 * Sum of local balances in force-closed / closing channels — funds being
+	 * Sum of local balances in force-closed / closing channels: funds being
 	 * recovered on-chain (claimable, possibly still timelocked), which are not
 	 * counted as live lightning balance and not yet in the wallet. Surfaces
 	 * funds that would otherwise be invisible after a force-close.
+	 *
+	 * "Not yet in the wallet" is checked, not assumed (issue #1065): the
+	 * wallet balance counts the sweep of our balance output from its mempool
+	 * sighting on, while the channel stays FORCE_CLOSED until every tracked
+	 * output is IRREVOCABLE_DEPTH deep, so the same sats used to be reported
+	 * here and in onchainBalanceSats for 100+ blocks. A FORCE_CLOSED channel
+	 * leaves this figure in the same read in which the wallet history first
+	 * holds that sweep, never earlier. The test is re-derived on every read,
+	 * so a sweep the wallet drops again (evicted, replaced by a version it has
+	 * not seen, a restart before its first sync) puts the channel back here
+	 * in that read. SHUTTING_DOWN and NEGOTIATING_CLOSING are counted whole,
+	 * as before.
 	 */
 	private getPendingCloseBalanceSats(): number {
 		const recovering = new Set<ChannelState>([
@@ -5584,11 +6195,72 @@ export class BeignetNode extends EventEmitter {
 		]);
 		let totalMsat = 0n;
 		for (const ch of this.node.listChannels()) {
-			if (recovering.has(ch.state)) {
-				totalMsat += ch.localBalanceMsat;
+			if (!recovering.has(ch.state)) continue;
+			if (
+				ch.state === ChannelState.FORCE_CLOSED &&
+				this.isForceCloseBalanceInWallet(ch.channelId)
+			) {
+				continue;
 			}
+			totalMsat += ch.localBalanceMsat;
 		}
 		return Number(totalMsat / 1000n);
+	}
+
+	/**
+	 * True once the wallet history holds the sweep of our balance output on
+	 * the force-close commitment the monitor classified: our to_remote on any
+	 * of the peer's commitments, our commitment to_local on ours (a
+	 * second-level HTLC to_local is an HTLC resolution, not the balance).
+	 * HTLC outputs resolve separately and are no part of localBalanceMsat, so
+	 * they play no part here. The sweep is the spend the monitor saw
+	 * (resolutionTxid), else the sweep it built (sweepTxHex). The history
+	 * entry is the test rather than a UTXO because a later wallet spend
+	 * removes the UTXO but not the entry; a ghosted entry (exists false) is
+	 * one the wallet no longer observes. No monitor, no classified
+	 * commitment, no balance output or no sweep yet means the funds are
+	 * still pending close.
+	 */
+	private isForceCloseBalanceInWallet(channelId: Buffer): boolean {
+		const monitor = this.node.getChannelManager().getMonitor(channelId);
+		const broadcast = monitor?.getFullState().commitmentBroadcast;
+		if (!monitor || !broadcast) return false;
+		let balanceOutputType: OutputType;
+		switch (broadcast.commitmentType) {
+			case CommitmentType.OUR_COMMITMENT:
+				balanceOutputType = OutputType.TO_LOCAL;
+				break;
+			case CommitmentType.THEIR_CURRENT_COMMITMENT:
+			case CommitmentType.THEIR_REVOKED_COMMITMENT:
+			case CommitmentType.THEIR_FUTURE_COMMITMENT:
+				balanceOutputType = OutputType.TO_REMOTE;
+				break;
+			default:
+				return false;
+		}
+		const balanceOutput = monitor
+			.getTrackedOutputs()
+			.find(
+				(o) =>
+					o.txid === broadcast.txid &&
+					o.outputType === balanceOutputType &&
+					!o.isSecondLevelHtlc
+			);
+		if (!balanceOutput) return false;
+		let sweepTxid = balanceOutput.resolutionTxid;
+		if (!sweepTxid && balanceOutput.sweepTxHex) {
+			const bitcoin = require('bitcoinjs-lib');
+			try {
+				sweepTxid = bitcoin.Transaction.fromHex(
+					balanceOutput.sweepTxHex
+				).getId();
+			} catch {
+				return false;
+			}
+		}
+		if (!sweepTxid) return false;
+		const entry = this.wallet.transactions[sweepTxid];
+		return entry !== undefined && entry.exists !== false;
 	}
 
 	/**
@@ -5650,41 +6322,61 @@ export class BeignetNode extends EventEmitter {
 	 * Best-effort derivation of a wallet-owned output script for force-close
 	 * sweeps. Returns undefined if the wallet can't produce an address yet
 	 * (e.g. Electrum not connected). Never throws.
+	 *
+	 * Both legs pay the wallet's internal (change) chain, never the receive
+	 * chain (issue #1064). A receive address is what getNewAddress and
+	 * POST /address/new hand out to payers and what a saved receive request
+	 * holds, and the next unused receive address is exactly the one handed
+	 * out most recently and not yet paid, so a close payout sent there read
+	 * as the payer paying that request: wallet-core marked the request partly
+	 * paid (or paid) and dropped the payout's own row. No request, route or
+	 * API ever hands out a change address, so a payout on the change chain
+	 * can never be mistaken for a request's payment. It is still an address
+	 * the wallet scans, so the payout sits in the balance and in the
+	 * transaction list as its own received row.
 	 */
 	private async resolveWalletSweepScript(): Promise<Buffer | undefined> {
-		// Preferred: the current unused wallet address. This requires Electrum
-		// to gap-scan for the next unused index.
+		// Preferred: the next unused change address. This requires Electrum
+		// to gap-scan for the next unused change index.
 		const fresh = await this.resolveCurrentWalletAddressScript();
 		if (fresh) return fresh;
-		// Fallback: deterministically derive a wallet-owned address (index 0) with
-		// NO network dependency. Reusing index 0 is a minor privacy tradeoff, but
-		// it guarantees force-close sweeps always target a wallet-scanned address
-		// rather than the invisible funding-key P2WPKH — even when Electrum is down
-		// at startup, which is exactly when an offline force-close is detected on
-		// restart and a sweep gets built. recoverFallbackFunds remains a safety net
-		// for funds stranded by older sessions. (The cooperative-close path
-		// deliberately does NOT use this leg: on a mature wallet index 0 can
-		// sit outside the 20-address scan window behind the current index, and
-		// nothing rescues it, so the close chain prefers its cached script and
-		// then the rescuable funding key instead; issue #542 review.)
+		// Fallback: the wallet's stored change address, read locally with NO
+		// network dependency. It guarantees force-close sweeps always target a
+		// wallet-scanned address rather than the invisible funding-key P2WPKH,
+		// even when Electrum is down at startup, which is exactly when an
+		// offline force-close is detected on restart and a sweep gets built.
+		// The stored change index is the one normal sends take their change
+		// from, so it always sits inside the change scan window
+		// (updateAddressIndexes clamps it there). Not a fixed change index 0:
+		// on a used wallet it can sit outside that window, the same reason
+		// receive index 0 was kept out of the cooperative close chain (issue
+		// #542 review). The one side effect is address reuse: a send that is
+		// still unconfirmed at the next refresh took its change from this same
+		// index, so the sweep can share the address with it. That is a
+		// privacy tradeoff only; both outputs are the wallet's. recoverFallbackFunds
+		// remains a safety net for funds stranded by older sessions.
 		const bitcoin = require('bitcoinjs-lib');
 		try {
-			const address = await this.wallet.getAddress({ index: '0' });
-			if (address) {
+			const change = await this.wallet.getChangeAddress();
+			if (change.isOk() && change.value?.address) {
 				return bitcoin.address.toOutputScript(
-					address,
+					change.value.address,
 					this.getBitcoinNetwork()
 				);
 			}
 		} catch {
-			// give up — caller keeps the funding-key fallback + background refresh
+			// give up: caller keeps the funding-key fallback + background refresh
 		}
 		return undefined;
 	}
 
 	/**
-	 * The current unused wallet address as an output script, or undefined when
+	 * The next unused change address as an output script, or undefined when
 	 * the wallet cannot produce one (Electrum needed for the gap scan).
+	 * The change chain, never the receive chain: see resolveWalletSweepScript
+	 * (issue #1064). The lookup is the same getNextAvailableAddress call that
+	 * gap-scans both chains, so the Electrum dependency and the timeouts the
+	 * callers wrap around it are unchanged; only the chain read out differs.
 	 */
 	private async resolveCurrentWalletAddressScript(): Promise<
 		Buffer | undefined
@@ -5694,7 +6386,7 @@ export class BeignetNode extends EventEmitter {
 			const res = await this.wallet.getNextAvailableAddress();
 			if (res.isOk()) {
 				return bitcoin.address.toOutputScript(
-					res.value.addressIndex.address,
+					res.value.changeAddressIndex.address,
 					this.getBitcoinNetwork()
 				) as Buffer;
 			}
@@ -5770,49 +6462,75 @@ export class BeignetNode extends EventEmitter {
 		return result.value.addressIndex.address;
 	}
 
+	/**
+	 * Run one on-chain send after every send queued before it has finished,
+	 * through broadcast or the PSBT return. The wallet stages every send in
+	 * its one shared transaction and each send resets it on the way in and
+	 * out, so two sends that overlap read and reset each other's outputs and
+	 * fee (issue #1054).
+	 */
+	private _runOnchainSend<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this._onchainSendLock.then(fn, fn);
+		this._onchainSendLock = run.catch(() => undefined);
+		return run;
+	}
+
 	async sendOnchain(
 		address: string,
 		amountSats: number,
 		satsPerVbyte?: number
 	): Promise<TxInfo> {
-		// External onchain sends share the daily budget with Lightning
-		// payments. Fail fast on the amount alone before building.
+		// External onchain sends share the per-payment and daily limits with
+		// Lightning payments. Fail fast on the amount alone before building.
+		this._checkMaxPayment(amountSats);
 		this._checkSpendLimit(amountSats);
-		// wallet.send with broadcast:true resolves to the txid, not the raw
-		// hex, so build first (broadcast:false returns the hex) and broadcast
-		// separately to report both txid and hex. rbf must be passed per-send:
-		// the wallet-level flag does not propagate into setupTransaction.
-		const result = await this.wallet.send({
-			address,
-			amount: amountSats,
-			broadcast: false,
-			rbf: this.wallet.rbf,
-			...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
+		return this._runOnchainSend(async () => {
+			// The staged send is read below (the built fee) and reset on every
+			// way out, as _boostRbf does: what one send staged must not outlive
+			// it (#1002).
+			try {
+				// wallet.send with broadcast:true resolves to the txid, not the raw
+				// hex, so build first (broadcast:false returns the hex) and broadcast
+				// separately to report both txid and hex. rbf must be passed per-send:
+				// the wallet-level flag does not propagate into setupTransaction.
+				const result = await this.wallet.send({
+					address,
+					amount: amountSats,
+					broadcast: false,
+					rbf: this.wallet.rbf,
+					...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
+				});
+				if (result.isErr()) {
+					throw new BeignetError('SEND_FAILED', result.error.message);
+				}
+				// No limit configured: broadcast without touching the budget.
+				if (
+					this._dailySpendLimitSats === undefined &&
+					this._maxPaymentSats === undefined
+				) {
+					return await this._broadcastRawTx(result.value);
+				}
+				// Re-check with the real fee included, then reserve the total so
+				// concurrent sends cannot both pass before either records.
+				const totalSats = this._builtOnchainTotalSats(amountSats);
+				this._checkMaxPayment(totalSats, amountSats, {
+					name: 'on-chain fees',
+					param: 'satsPerVbyte'
+				});
+				this._checkSpendLimit(totalSats);
+				const reserving = this._dailySpendLimitSats !== undefined;
+				if (reserving) this._pendingSpendSats += totalSats;
+				try {
+					const info = await this._broadcastRawTx(result.value);
+					this._recordSpend(totalSats, 'onchain');
+					return info;
+				} finally {
+					if (reserving) this._pendingSpendSats -= totalSats;
+				}
+			} finally {
+				await this.wallet.resetSendTransaction();
+			}
 		});
-		if (result.isErr()) {
-			throw new BeignetError('SEND_FAILED', result.error.message);
-		}
-		// No limit configured: broadcast without touching the budget.
-		if (this._dailySpendLimitSats === undefined) {
-			return this._broadcastRawTx(result.value);
-		}
-		// Re-check with the real fee included, then reserve the total so
-		// concurrent sends cannot both pass before either records.
-		const totalSats = this._builtOnchainTotalSats(amountSats);
-		try {
-			this._checkSpendLimit(totalSats);
-		} catch (e) {
-			await this.wallet.resetSendTransaction();
-			throw e;
-		}
-		this._pendingSpendSats += totalSats;
-		try {
-			const info = await this._broadcastRawTx(result.value);
-			this._recordSpend(totalSats, 'onchain');
-			return info;
-		} finally {
-			this._pendingSpendSats -= totalSats;
-		}
 	}
 
 	/**
@@ -5838,47 +6556,72 @@ export class BeignetNode extends EventEmitter {
 			}
 		}
 		this._validateFeeRate(satsPerVbyte);
-		const result = await this.wallet.buildPsbt({
-			txs: outputs.map((o) => ({ address: o.address, amount: o.amountSats })),
-			rbf: this.wallet.rbf,
-			...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
+		return this._runOnchainSend(async () => {
+			// Everything the later steps need (import-signed, combine) is in the
+			// PSBT itself; none of them reads the staged send, so it is reset here.
+			try {
+				const result = await this.wallet.buildPsbt({
+					txs: outputs.map((o) => ({
+						address: o.address,
+						amount: o.amountSats
+					})),
+					rbf: this.wallet.rbf,
+					...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
+				});
+				if (result.isErr()) {
+					throw new BeignetError('PSBT_BUILD_FAILED', result.error.message);
+				}
+				const built = result.value;
+				return {
+					psbtBase64: built.psbtBase64,
+					feeSats: built.fee,
+					vsizeEstimate: built.vsizeEstimate,
+					satsPerVbyte: built.satsPerByte,
+					inputs: built.inputs.map((input) => ({
+						txid: input.tx_hash,
+						vout: input.tx_pos,
+						address: input.address,
+						valueSats: input.value,
+						path: input.path
+					})),
+					outputs: built.outputs.map((output) => ({
+						address: output.address,
+						valueSats: output.value
+					}))
+				};
+			} finally {
+				await this.wallet.resetSendTransaction();
+			}
 		});
-		if (result.isErr()) {
-			throw new BeignetError('PSBT_BUILD_FAILED', result.error.message);
-		}
-		const built = result.value;
-		return {
-			psbtBase64: built.psbtBase64,
-			feeSats: built.fee,
-			vsizeEstimate: built.vsizeEstimate,
-			satsPerVbyte: built.satsPerByte,
-			inputs: built.inputs.map((input) => ({
-				txid: input.tx_hash,
-				vout: input.tx_pos,
-				address: input.address,
-				valueSats: input.value,
-				path: input.path
-			})),
-			outputs: built.outputs.map((output) => ({
-				address: output.address,
-				valueSats: output.value
-			}))
-		};
 	}
 
 	/**
 	 * Validates and finalizes an externally signed PSBT. Returns the raw
 	 * transaction WITHOUT broadcasting; use sendRawTransaction-style flows or
-	 * the wallet broadcast explicitly.
+	 * the wallet broadcast explicitly. The wallet remembers only its recent
+	 * builds, in memory, so a PSBT built before a restart is imported against
+	 * unsignedPsbtBase64, the PSBT buildPsbt returned.
 	 */
-	importSignedPsbt(psbtBase64: string): PsbtImportInfo {
+	importSignedPsbt(
+		psbtBase64: string,
+		unsignedPsbtBase64?: string
+	): PsbtImportInfo {
 		if (!psbtBase64 || typeof psbtBase64 !== 'string') {
 			throw new BeignetError(
 				BeignetErrorCode.INVALID_PARAMS,
 				'psbtBase64 required'
 			);
 		}
-		const result = this.wallet.importSignedPsbt(psbtBase64);
+		if (
+			unsignedPsbtBase64 !== undefined &&
+			typeof unsignedPsbtBase64 !== 'string'
+		) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'unsignedPsbtBase64 must be a string'
+			);
+		}
+		const result = this.wallet.importSignedPsbt(psbtBase64, unsignedPsbtBase64);
 		if (result.isErr()) {
 			throw new BeignetError('PSBT_IMPORT_FAILED', result.error.message);
 		}
@@ -6173,47 +6916,56 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		this._validateFeeRate(satsPerVbyte);
-		const result = await this.wallet.sendMax({
-			address,
-			satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
-			rbf: this.wallet.rbf,
-			broadcast: false
+		return this._runOnchainSend(async () => {
+			// The staged send is read below (the swept inputs) and reset on every
+			// way out, as _boostRbf does (#1002).
+			try {
+				const result = await this.wallet.sendMax({
+					address,
+					satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
+					rbf: this.wallet.rbf,
+					broadcast: false
+				});
+				if (result.isErr()) {
+					throw new BeignetError('SEND_FAILED', result.error.message);
+				}
+				// No limit configured: broadcast without touching the budget.
+				if (
+					this._dailySpendLimitSats === undefined &&
+					this._maxPaymentSats === undefined
+				) {
+					return await this._broadcastRawTx(result.value);
+				}
+				// A sweep drains the entire input value (send amount + fee). Check it
+				// against the per-payment and daily limits BEFORE broadcast; the
+				// amount is only known once the transaction has been built.
+				const totalSats = this.wallet.transaction.getTransactionInputValue({
+					inputs: this.wallet.transaction.data.inputs
+				});
+				if (totalSats <= 0) {
+					// Fail closed: never broadcast a sweep the limit cannot account for.
+					throw new BeignetError(
+						'SPENDING_LIMIT_EXCEEDED',
+						'Unable to determine the swept amount for the spend limit checks; refusing to send'
+					);
+				}
+				// Judged whole: a lower fee rate only moves sats from the fee to the
+				// output, so there is no fee to tell the caller to lower.
+				this._checkMaxPayment(totalSats);
+				this._checkSpendLimit(totalSats);
+				const reserving = this._dailySpendLimitSats !== undefined;
+				if (reserving) this._pendingSpendSats += totalSats;
+				try {
+					const info = await this._broadcastRawTx(result.value);
+					this._recordSpend(totalSats, 'onchain');
+					return info;
+				} finally {
+					if (reserving) this._pendingSpendSats -= totalSats;
+				}
+			} finally {
+				await this.wallet.resetSendTransaction();
+			}
 		});
-		if (result.isErr()) {
-			throw new BeignetError('SEND_FAILED', result.error.message);
-		}
-		// No limit configured: broadcast without touching the budget.
-		if (this._dailySpendLimitSats === undefined) {
-			return this._broadcastRawTx(result.value);
-		}
-		// A sweep drains the entire input value (send amount + fee). Check it
-		// against the shared daily budget BEFORE broadcast; the amount is only
-		// known once the transaction has been built.
-		const totalSats = this.wallet.transaction.getTransactionInputValue({
-			inputs: this.wallet.transaction.data.inputs
-		});
-		if (totalSats <= 0) {
-			// Fail closed: never broadcast a sweep the limit cannot account for.
-			await this.wallet.resetSendTransaction();
-			throw new BeignetError(
-				'SPENDING_LIMIT_EXCEEDED',
-				'Unable to determine the swept amount for the daily spend limit check; refusing to send'
-			);
-		}
-		try {
-			this._checkSpendLimit(totalSats);
-		} catch (e) {
-			await this.wallet.resetSendTransaction();
-			throw e;
-		}
-		this._pendingSpendSats += totalSats;
-		try {
-			const info = await this._broadcastRawTx(result.value);
-			this._recordSpend(totalSats, 'onchain');
-			return info;
-		} finally {
-			this._pendingSpendSats -= totalSats;
-		}
 	}
 
 	/**
@@ -6276,91 +7028,95 @@ export class BeignetNode extends EventEmitter {
 		txid: string,
 		satsPerVbyte?: number
 	): Promise<BoostResult> {
-		const setup = await this.wallet.transaction.setupRbf({ txid });
-		if (setup.isErr()) {
-			await this.wallet.resetSendTransaction();
-			throw new BeignetError(
-				BeignetErrorCode.NOT_BOOSTABLE,
-				setup.error.message
-			);
-		}
-		try {
-			// setupRbf defaults to the fast feerate; apply a requested rate through
-			// updateFee so the wallet's fee-overpayment guards run.
-			if (satsPerVbyte !== undefined) {
-				const feeRes = this.wallet.transaction.updateFee({
-					satsPerByte: satsPerVbyte
-				});
-				if (feeRes.isErr()) {
-					throw new BeignetError(
-						BeignetErrorCode.INVALID_PARAMS,
-						feeRes.error.message
-					);
-				}
-			}
-			// BIP 125 rule 3/4: the replacement must pay strictly more than the
-			// original fee or the network rejects it; fail with a clear message
-			// instead of a broadcast error.
-			const original =
-				this.wallet.unconfirmedTransactions[txid] ??
-				this.wallet.transactions[txid];
-			const originalFeeSats = original ? btcToSats(original.fee) : 0;
-			const newFeeSats = this.wallet.transaction.data.fee;
-			if (newFeeSats <= originalFeeSats) {
+		return this._runOnchainSend(async () => {
+			const setup = await this.wallet.transaction.setupRbf({ txid });
+			if (setup.isErr()) {
+				await this.wallet.resetSendTransaction();
 				throw new BeignetError(
-					BeignetErrorCode.INVALID_PARAMS,
-					`Replacement fee ${newFeeSats} sats does not exceed the original fee ${originalFeeSats} sats; raise satsPerVbyte`
+					BeignetErrorCode.NOT_BOOSTABLE,
+					setup.error.message
 				);
 			}
-			const createRes = await this.wallet.transaction.createTransaction();
-			if (createRes.isErr()) {
-				throw new BeignetError('SEND_FAILED', createRes.error.message);
+			try {
+				// setupRbf defaults to the fast feerate; apply a requested rate through
+				// updateFee so the wallet's fee-overpayment guards run.
+				if (satsPerVbyte !== undefined) {
+					const feeRes = this.wallet.transaction.updateFee({
+						satsPerByte: satsPerVbyte
+					});
+					if (feeRes.isErr()) {
+						throw new BeignetError(
+							BeignetErrorCode.INVALID_PARAMS,
+							feeRes.error.message
+						);
+					}
+				}
+				// BIP 125 rule 3/4: the replacement must pay strictly more than the
+				// original fee or the network rejects it; fail with a clear message
+				// instead of a broadcast error.
+				const original =
+					this.wallet.unconfirmedTransactions[txid] ??
+					this.wallet.transactions[txid];
+				const originalFeeSats = original ? btcToSats(original.fee) : 0;
+				const newFeeSats = this.wallet.transaction.data.fee;
+				if (newFeeSats <= originalFeeSats) {
+					throw new BeignetError(
+						BeignetErrorCode.INVALID_PARAMS,
+						`Replacement fee ${newFeeSats} sats does not exceed the original fee ${originalFeeSats} sats; raise satsPerVbyte`
+					);
+				}
+				const createRes = await this.wallet.transaction.createTransaction();
+				if (createRes.isErr()) {
+					throw new BeignetError('SEND_FAILED', createRes.error.message);
+				}
+				const info = await this._broadcastRawTx(createRes.value.hex);
+				await this._recordBoost(txid, info.txid, EBoostType.rbf, newFeeSats);
+				return {
+					...info,
+					boostType: 'rbf',
+					feeSats: newFeeSats,
+					originalTxid: txid
+				};
+			} finally {
+				await this.wallet.resetSendTransaction();
 			}
-			const info = await this._broadcastRawTx(createRes.value.hex);
-			await this._recordBoost(txid, info.txid, EBoostType.rbf, newFeeSats);
-			return {
-				...info,
-				boostType: 'rbf',
-				feeSats: newFeeSats,
-				originalTxid: txid
-			};
-		} finally {
-			await this.wallet.resetSendTransaction();
-		}
+		});
 	}
 
 	private async _boostCpfp(
 		txid: string,
 		satsPerVbyte?: number
 	): Promise<BoostResult> {
-		const setup = await this.wallet.transaction.setupCpfp({
-			txid,
-			...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
-		});
-		if (setup.isErr()) {
-			await this.wallet.resetSendTransaction();
-			throw new BeignetError(
-				BeignetErrorCode.NOT_BOOSTABLE,
-				setup.error.message
-			);
-		}
-		try {
-			const feeSats = setup.value.fee;
-			const createRes = await this.wallet.transaction.createTransaction();
-			if (createRes.isErr()) {
-				throw new BeignetError('SEND_FAILED', createRes.error.message);
+		return this._runOnchainSend(async () => {
+			const setup = await this.wallet.transaction.setupCpfp({
+				txid,
+				...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
+			});
+			if (setup.isErr()) {
+				await this.wallet.resetSendTransaction();
+				throw new BeignetError(
+					BeignetErrorCode.NOT_BOOSTABLE,
+					setup.error.message
+				);
 			}
-			const info = await this._broadcastRawTx(createRes.value.hex);
-			await this._recordBoost(txid, info.txid, EBoostType.cpfp, feeSats);
-			return {
-				...info,
-				boostType: 'cpfp',
-				feeSats,
-				originalTxid: txid
-			};
-		} finally {
-			await this.wallet.resetSendTransaction();
-		}
+			try {
+				const feeSats = setup.value.fee;
+				const createRes = await this.wallet.transaction.createTransaction();
+				if (createRes.isErr()) {
+					throw new BeignetError('SEND_FAILED', createRes.error.message);
+				}
+				const info = await this._broadcastRawTx(createRes.value.hex);
+				await this._recordBoost(txid, info.txid, EBoostType.cpfp, feeSats);
+				return {
+					...info,
+					boostType: 'cpfp',
+					feeSats,
+					originalTxid: txid
+				};
+			} finally {
+				await this.wallet.resetSendTransaction();
+			}
+		});
 	}
 
 	/** Record a broadcast boost; bookkeeping failure must not fail the bump. */
@@ -6416,18 +7172,26 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		const address = await this.getNewAddress();
-		const result = await this.wallet.sendMax({
-			address,
-			satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
-			rbf: this.wallet.rbf,
-			broadcast: false
+		return this._runOnchainSend(async () => {
+			// The staged send is read below (the fee) and reset on every way out,
+			// as _boostRbf does (#1002).
+			try {
+				const result = await this.wallet.sendMax({
+					address,
+					satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
+					rbf: this.wallet.rbf,
+					broadcast: false
+				});
+				if (result.isErr()) {
+					throw new BeignetError('SEND_FAILED', result.error.message);
+				}
+				const feeSats = this.wallet.transaction.data.fee;
+				const info = await this._broadcastRawTx(result.value);
+				return { ...info, utxosConsolidated: utxoCount, address, feeSats };
+			} finally {
+				await this.wallet.resetSendTransaction();
+			}
 		});
-		if (result.isErr()) {
-			throw new BeignetError('SEND_FAILED', result.error.message);
-		}
-		const feeSats = this.wallet.transaction.data.fee;
-		const info = await this._broadcastRawTx(result.value);
-		return { ...info, utxosConsolidated: utxoCount, address, feeSats };
 	}
 
 	async refreshWallet(): Promise<void> {
@@ -6612,6 +7376,8 @@ export class BeignetNode extends EventEmitter {
 		port?: number,
 		transport?: IPeerTransportOptions
 	): Promise<PeerInfo> {
+		// listPeers reports the lowercase key the node registers the peer under.
+		pubkey = normalizeHexPubkey(pubkey);
 		// Where we are dialing, for error messages: explicit host:port, or the
 		// gossip/DNS resolution the library performs when both are omitted.
 		const target =
@@ -6924,17 +7690,24 @@ export class BeignetNode extends EventEmitter {
 		// funding-key script was invisible to the wallet: the payout sat
 		// confirmed on-chain while the balance read zero until
 		// recoverFallbackFunds swept it, a second transaction and fee. The
-		// chain: the current unused wallet address (BOUNDED, because the
-		// lookup can enter an Electrum handshake with no timeout of its own
-		// and the close must reach the engine regardless), then the sweep
-		// script resolved at startup, then the funding-key P2WPKH that
-		// recoverFallbackFunds can still rescue. The index-0 leg the
-		// force-close startup resolution uses is deliberately NOT in this
-		// chain: on a mature wallet index 0 can sit outside the 20-address
-		// scan window behind the current index and nothing rescues it, which
-		// would recreate the invisible payout this change removes (issue #542
-		// review). Every leg is derived locally from our own keys, so the
-		// chain always terminates in a script we control.
+		// chain: the next unused CHANGE address (BOUNDED, because the lookup
+		// can enter an Electrum handshake with no timeout of its own and the
+		// close must reach the engine regardless), then the sweep script
+		// resolved at startup (also on the change chain), then the
+		// funding-key P2WPKH that recoverFallbackFunds can still rescue. The
+		// change chain, never the receive chain (issue #1064): the next
+		// unused receive address is the one most recently handed out to a
+		// payer by getNewAddress / POST /address/new and not yet paid, so a
+		// payout there read as that receive request being paid, while no
+		// request or route ever hands out a change address. The offline leg
+		// the force-close startup resolution uses (the stored change address;
+		// receive index 0 before issue #1064) is deliberately NOT in this
+		// chain: index 0 could sit outside the 20-address scan window behind
+		// the current index with nothing to rescue it, which would recreate
+		// the invisible payout this change removes (issue #542 review), and
+		// the startup script already covers an Electrum outage at close
+		// time. Every leg is derived locally from our own keys, so the chain
+		// always terminates in a script we control.
 		let scriptPubkey = await this.boundedCurrentWalletAddressScript();
 		if (!scriptPubkey) scriptPubkey = this.sweepDestinationScript;
 		if (!scriptPubkey) {
@@ -7559,7 +8332,8 @@ export class BeignetNode extends EventEmitter {
 	forceCloseChannel(
 		channelId: string,
 		// The labelled risk acknowledgement RECOVERY-PROTOCOL 5.6 asks for
-		// (issues #469 and #907). Required for either recency hold: this node refuses to
+		// (issues #469 and #907). Required for either recency hold, and on a
+		// fenced or quarantined device (issue #1013): this node refuses to
 		// broadcast such a commitment on its own initiative because the peer
 		// may already hold a revocation for it, and an operator command is the
 		// documented exit. It should be a decision, not a default, so the
@@ -7663,6 +8437,17 @@ export class BeignetNode extends EventEmitter {
 		acceptStaleStateRisk: boolean
 	): void {
 		if (acceptStaleStateRisk === true) return;
+		// Ahead of the per-channel holds: a takeover puts every channel at
+		// risk at once, and no channel row records it.
+		const ownership = this.node.getRecoveryOwnershipHold();
+		if (ownership !== null) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				ownership === 'superseded'
+					? SUPERSEDED_FORCE_CLOSE_REFUSAL
+					: UNCONFIRMED_OWNER_FORCE_CLOSE_REFUSAL
+			);
+		}
 		const hold = this.recencyHold(channelId);
 		// One refusal per origin, in the engine's own precedence
 		// (recencyHoldOrigin): the local fault first, because it is the only
@@ -7823,6 +8608,38 @@ export class BeignetNode extends EventEmitter {
 		};
 	}
 
+	/**
+	 * Relay the engine's node:error to the onError callback and to this
+	 * emitter (SSE, webhooks), JSON-safe. The channel id rides as hex, as
+	 * onError always did: without it a subscriber cannot tell which channel
+	 * an error belongs to, so an error raised while a channel is being
+	 * opened is indistinguishable from an unrelated one. txid and retained
+	 * (issue #1062) ride whenever the engine set them, so a broadcast
+	 * failure names its transaction and says whether the node is still
+	 * re-sending it.
+	 */
+	private wireNodeErrorRelay(onError: BeignetNodeOptions['onError']): void {
+		this.node.on('node:error', (err: ILightningError) => {
+			const data: {
+				code: string;
+				message: string;
+				timestamp: number;
+				channelId?: string;
+				txid?: string;
+				retained?: boolean;
+			} = {
+				code: err.code,
+				message: err.message,
+				timestamp: err.timestamp,
+				channelId: err.channelId ? err.channelId.toString('hex') : undefined
+			};
+			if (err.txid !== undefined) data.txid = err.txid;
+			if (err.retained !== undefined) data.retained = err.retained;
+			if (onError) onError(data);
+			this.emit('node:error', data);
+		});
+	}
+
 	private toChannelInfo(ch: {
 		channelId: Buffer;
 		peerPubkey: string;
@@ -7837,6 +8654,8 @@ export class BeignetNode extends EventEmitter {
 		feeratePerKw?: number;
 		htlcCount?: number;
 		pendingSpliceLocalBalanceMsat?: bigint;
+		pendingSpliceTxid?: string;
+		previousFundingTxids?: string[];
 		htlcUsable?: boolean;
 		restoreRecencyUnproven?: boolean;
 		reestablishRecencyUnproven?: boolean;
@@ -7897,6 +8716,13 @@ export class BeignetNode extends EventEmitter {
 			info.pendingSpliceLocalBalanceSats = Number(
 				ch.pendingSpliceLocalBalanceMsat / 1000n
 			);
+		// The splice txid and the retired fundings (issue #1060): a wallet
+		// matches its own deposits against them, so a channel's splice is
+		// not shown as a send. Already display order from the node layer.
+		if (ch.pendingSpliceTxid !== undefined)
+			info.pendingSpliceTxid = ch.pendingSpliceTxid;
+		if (ch.previousFundingTxids && ch.previousFundingTxids.length > 0)
+			info.previousFundingTxids = [...ch.previousFundingTxids];
 		// The dashboard's Send gating reads these off the wire; dropping them
 		// here re-parked every mid-splice channel in the UI while the daemon
 		// happily paid through the window.
@@ -7946,6 +8772,9 @@ export class BeignetNode extends EventEmitter {
 				? BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) *
 				  1000n
 				: undefined;
+		if (expirySecs !== undefined)
+			requireInvoiceExpiry(expirySecs, 'expirySecs');
+		if (!descriptionHash) requireInvoiceDescription(description);
 		const result = this.node.createInvoice({
 			amountMsat,
 			description: descriptionHash ? undefined : description || '',
@@ -8021,6 +8850,11 @@ export class BeignetNode extends EventEmitter {
 				? BigInt(requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')) *
 				  1000n
 				: undefined;
+		// Before the LSP is asked: a refusal after its grant leaves the intent
+		// registered there with no invoice behind it.
+		if (opts.expirySecs !== undefined)
+			requireInvoiceExpiry(opts.expirySecs, 'expirySecs');
+		requireInvoiceDescription(opts.description);
 		let result: Awaited<ReturnType<typeof this.node.createJitInvoice>>;
 		try {
 			result = await this.node.createJitInvoice({
@@ -8557,6 +9391,10 @@ export class BeignetNode extends EventEmitter {
 			try {
 				const quote = sender.quote(opts.request, sendOpts);
 				costSats = Number(quote.amountSat + quote.maxTotalFeeSat);
+				this._checkMaxPayment(costSats, Number(quote.amountSat), {
+					name: 'fees',
+					param: 'maxTotalFeeSat'
+				});
 				this._checkSpendLimit(costSats);
 			} catch (err) {
 				throw this.directFundingFailure(err);
@@ -8654,6 +9492,8 @@ export class BeignetNode extends EventEmitter {
 				? BigInt(requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')) *
 				  1000n
 				: undefined);
+		if (opts.expiry !== undefined) requireInvoiceExpiry(opts.expiry, 'expiry');
+		requireInvoiceDescription(opts.description);
 		const result = this.node.createInvoice({
 			amountMsat,
 			description: opts.description || '',
@@ -8781,6 +9621,15 @@ export class BeignetNode extends EventEmitter {
 
 	decodeInvoice(bolt11: string): DecodedInvoice {
 		const inv = decodeInvoiceInput(bolt11);
+		// Refused here as well as by the engine's send, so a caller that
+		// decodes or validates first learns it before trying to pay.
+		const ours = this.toLnNetwork(this.networkName);
+		if (inv.network !== ours) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_INVOICE,
+				`Invoice is for network "${inv.network}", this node is on "${ours}"`
+			);
+		}
 		const result: DecodedInvoice = {
 			network: inv.network,
 			timestamp: inv.timestamp,
@@ -8832,20 +9681,39 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Spending Limits ───────────────
 
-	private _resetDailySpendIfNeeded(): void {
-		const now = Date.now();
-		if (now >= this._dailySpendResetTime) {
-			// Reset at next midnight UTC
-			const tomorrow = new Date();
-			tomorrow.setUTCHours(24, 0, 0, 0);
-			this._dailySpendResetTime = tomorrow.getTime();
+	/**
+	 * Zeroes the counters once the day has ended. The reset is written on its
+	 * own unless the caller writes the ledger right after it (persist false,
+	 * from _recordSpend and _loadSpendState), so a rollover inside a mutation
+	 * is one write with the mutation rather than a zeroed row followed by the
+	 * real one.
+	 */
+	private _resetDailySpendIfNeeded(persist = true): void {
+		if (Date.now() >= this._dailySpendResetTime) {
+			this._dailySpendResetTime = nextUtcMidnight();
 			this._dailySpentSats = 0;
 			this._dailySpentLightningSats = 0;
 			this._dailySpentOnchainSats = 0;
+			// A rebalance still out can spend in the new day, so its up-front
+			// charge carries over until _refundSpend settles it.
+			if (
+				this._dailySpendLimitSats !== undefined &&
+				this._liveRebalanceChargeSats > 0
+			) {
+				this._dailySpentSats = this._liveRebalanceChargeSats;
+				this._dailySpentLightningSats = this._liveRebalanceChargeSats;
+			}
+			if (persist) this._persistSpendState();
 		}
 	}
 
-	private _checkSpendLimit(amountSats: number): void {
+	/**
+	 * The daily limit, judged on `spendSats`: what the request can cost in
+	 * full, which for a Lightning payment is its amount plus its fee cap
+	 * (issue #1008). `amountSats` is the amount alone, so the refusal can say
+	 * how much of the request is the fee allowance.
+	 */
+	private _checkSpendLimit(spendSats: number, amountSats = spendSats): void {
 		if (this._dailySpendLimitSats === undefined) return;
 		this._resetDailySpendIfNeeded();
 		// An async payment holds its claim past its own failure report, so the
@@ -8853,16 +9721,33 @@ export class BeignetNode extends EventEmitter {
 		// budget for good.
 		this._expireAsyncSpendClaims();
 		const effectiveSpent = this._dailySpentSats + this._pendingSpendSats;
-		if (effectiveSpent + amountSats > this._dailySpendLimitSats) {
+		if (effectiveSpent + spendSats > this._dailySpendLimitSats) {
 			const remaining = Math.max(0, this._dailySpendLimitSats - effectiveSpent);
+			const requested =
+				spendSats > amountSats
+					? `${spendSats} sats (${amountSats} sats plus up to ${
+							spendSats - amountSats
+					  } sats in routing fees; lower maxFeeSats or the amount)`
+					: `${spendSats} sats`;
 			throw new BeignetError(
 				'SPENDING_LIMIT_EXCEEDED',
-				`Daily spend limit exceeded. Limit: ${this._dailySpendLimitSats} sats, spent: ${this._dailySpentSats} sats, remaining: ${remaining} sats, requested: ${amountSats} sats`
+				`Daily spend limit exceeded. Limit: ${this._dailySpendLimitSats} sats, spent: ${this._dailySpentSats} sats, remaining: ${remaining} sats, requested: ${requested}`
 			);
 		}
 	}
 
-	private _checkMaxPayment(amountSats: number): void {
+	/**
+	 * The per-payment limit, judged on `spendSats` (amount plus fee cap, issue
+	 * #1008). An amount that is over the limit on its own is refused in the
+	 * words it always was; one that only crosses it with its fee cap is told
+	 * which of the two to lower. `fees` names that fee and the parameter that
+	 * sets it: a Lightning routing-fee cap unless an on-chain path says so.
+	 */
+	private _checkMaxPayment(
+		spendSats: number,
+		amountSats = spendSats,
+		fees = { name: 'routing fees', param: 'maxFeeSats' }
+	): void {
 		if (this._maxPaymentSats === undefined) return;
 		if (amountSats > this._maxPaymentSats) {
 			throw new BeignetError(
@@ -8870,6 +9755,38 @@ export class BeignetNode extends EventEmitter {
 				`Payment amount ${amountSats} sats exceeds per-payment limit of ${this._maxPaymentSats} sats`
 			);
 		}
+		if (spendSats > this._maxPaymentSats) {
+			throw new BeignetError(
+				'SPENDING_LIMIT_EXCEEDED',
+				`Payment amount ${amountSats} sats plus up to ${
+					spendSats - amountSats
+				} sats in ${fees.name} exceeds per-payment limit of ${
+					this._maxPaymentSats
+				} sats; lower ${fees.param} or the amount`
+			);
+		}
+	}
+
+	/**
+	 * The admission every Lightning pay path runs once its arguments are
+	 * converted (issue #1008): the per-payment and daily limits judged on the
+	 * amount plus the fee cap, and a claim reserving that sum for the
+	 * in-flight window. Returns the claim, or undefined when there is nothing
+	 * to admit (no amount) or no daily limit is configured. Callers convert
+	 * and validate BEFORE this, since a refusal thrown after the claim would
+	 * strand the reservation (issue #474).
+	 */
+	private _admitLightningSpend(
+		claimKey: string,
+		payAmountMsat: bigint | undefined,
+		maxFeeMsat: bigint
+	): AsyncSpendClaim | undefined {
+		const spendSats = paymentAdmissionSats(payAmountMsat, maxFeeMsat);
+		if (spendSats === 0) return undefined;
+		const amountSats = spendLimitSats(payAmountMsat ?? 0n);
+		this._checkMaxPayment(spendSats, amountSats);
+		this._checkSpendLimit(spendSats, amountSats);
+		return this._openAsyncSpendClaim(claimKey, spendSats);
 	}
 
 	private _recordSpend(
@@ -8882,23 +9799,39 @@ export class BeignetNode extends EventEmitter {
 		// it to the expired day's total means the next _resetDailySpendIfNeeded
 		// (whichever of a check or a read happens to run first) erases it. That
 		// made a read-only getDailySpendInfo decide whether the spend counted.
-		this._resetDailySpendIfNeeded();
+		this._resetDailySpendIfNeeded(false);
 		this._dailySpentSats += amountSats;
 		if (source === 'onchain') {
 			this._dailySpentOnchainSats += amountSats;
 		} else {
 			this._dailySpentLightningSats += amountSats;
 		}
+		this._persistSpendState();
 	}
 
 	/**
-	 * Reserves the budget one async attempt can still spend, and returns the
-	 * claim so its caller can drop that exact attempt again. Appended rather
-	 * than replacing what the hash already holds: see _asyncSpendClaims.
+	 * Gives back what a live rebalance charge did not spend, to whichever day
+	 * carries it now. Called before the charge leaves _liveRebalanceChargeSats,
+	 * so a rollover here still carries it. A negative `sats`, a spend above the
+	 * charge, is charged in full.
+	 */
+	private _refundSpend(sats: number): void {
+		if (this._dailySpendLimitSats === undefined) return;
+		this._resetDailySpendIfNeeded(false);
+		this._dailySpentSats -= sats;
+		this._dailySpentLightningSats -= sats;
+		this._persistSpendState();
+	}
+
+	/**
+	 * Reserves the budget one attempt can still spend, and returns the claim
+	 * so its caller can drop that exact attempt again. Appended rather than
+	 * replacing what the hash already holds: see _asyncSpendClaims. Every
+	 * Lightning pay path opens one at admission (issue #977).
 	 *
 	 * Nothing is claimed when no daily limit is configured. _pendingSpendSats
 	 * is then read by nobody and _recordSpend does nothing, so a claim could
-	 * only grow the ledger — and eventually refuse submissions — on behalf of
+	 * only grow the ledger, and eventually refuse submissions, on behalf of
 	 * accounting that does not exist.
 	 */
 	private _openAsyncSpendClaim(
@@ -8929,7 +9862,33 @@ export class BeignetNode extends EventEmitter {
 		if (claims) claims.push(claim);
 		else this._asyncSpendClaims.set(paymentHashHex, [claim]);
 		this._pendingSpendSats += amountSats;
+		this._persistSpendState();
 		return claim;
+	}
+
+	/**
+	 * Moves one claim from the provisional key sendKeysend opened it under to
+	 * the hash the engine chose for it. The engine picks a keysend's preimage,
+	 * so its hash is unknown until the send returns, while the reservation has
+	 * to hold from admission onwards; a provisional key is never a payment
+	 * hash, so no settlement can charge the claim before the move, and a boot
+	 * drops any such key it finds persisted.
+	 */
+	private _rekeyAsyncSpendClaim(
+		fromKey: string,
+		toKey: string,
+		claim: AsyncSpendClaim
+	): void {
+		const from = this._asyncSpendClaims.get(fromKey);
+		if (from) {
+			const index = from.indexOf(claim);
+			if (index !== -1) from.splice(index, 1);
+			if (from.length === 0) this._asyncSpendClaims.delete(fromKey);
+		}
+		const to = this._asyncSpendClaims.get(toKey);
+		if (to) to.push(claim);
+		else this._asyncSpendClaims.set(toKey, [claim]);
+		this._persistSpendState();
 	}
 
 	/**
@@ -8949,65 +9908,120 @@ export class BeignetNode extends EventEmitter {
 		if (index === -1) return;
 		claims.splice(index, 1);
 		if (claims.length === 0) this._asyncSpendClaims.delete(paymentHashHex);
-		this._releaseAsyncSpendClaim(claim);
+		this._releaseClaimReservation(claim);
+		this._persistSpendState();
 	}
 
 	/**
 	 * Gives one claim's reservation back while keeping its record. For a claim
 	 * whose window has passed, and for one the engine reported dispatching
-	 * nothing for: neither should go on pinning daily budget, and neither is
-	 * proof that no HTLC behind it will ever settle.
+	 * nothing for, or gave up on with nothing out: none should go on pinning
+	 * daily budget, and none is proof that no HTLC behind it will ever
+	 * settle.
 	 */
 	private _releaseAsyncSpendClaim(claim: AsyncSpendClaim): void {
-		if (!claim.reserved) return;
+		if (this._releaseClaimReservation(claim)) this._persistSpendState();
+	}
+
+	/** _releaseAsyncSpendClaim without the write; true when it released. */
+	private _releaseClaimReservation(claim: AsyncSpendClaim): boolean {
+		if (!claim.reserved) return false;
 		claim.reserved = false;
 		this._pendingSpendSats -= claim.sats;
+		return true;
 	}
 
 	/**
-	 * Charges one async attempt against the daily budget when a payment
-	 * settles. Exactly one claim per settlement: a hash can carry several live
-	 * attempts, each able to settle on its own, and a repeat terminal event for
-	 * a hash with nothing left to charge is a no-op.
-	 *
-	 * A no-op too while a blocking caller owns the hash, since payInvoice's own
-	 * listener records that settlement itself.
+	 * What a payment:failed report does to the hash's claims. Every
+	 * reservation under the hash goes when nothing is in flight for it any
+	 * more (the engine gave up after its last HTLC failed back, or refused
+	 * before dispatching): a failed HTLC counts as in flight only until its
+	 * removal is irrevocable, and the engine gives up only after that (issue
+	 * #989), so the give-up report itself sees none. The records stay, for a
+	 * settlement that still arrives and for the boot reconciliation. With an
+	 * HTLC still in flight (a cancelPayment on a live HTLC) every claim stays
+	 * whole: the HTLC cannot be retracted, and its settle charges a claim.
+	 * Nothing is asked of the engine for a hash that holds no reservation.
 	 */
-	private _chargeAsyncSpendClaim(paymentHashHex: string): void {
-		if (this._blockingPaymentHashes.has(paymentHashHex)) return;
+	private _releaseAsyncSpendClaimsUnlessInFlight(paymentHash: Buffer): void {
+		const claims = this._asyncSpendClaims.get(paymentHash.toString('hex'));
+		if (!claims || !claims.some((claim) => claim.reserved)) return;
+		if (this.node.hasHtlcInFlight(paymentHash)) return;
+		let released = false;
+		for (const claim of claims) {
+			released = this._releaseClaimReservation(claim) || released;
+		}
+		if (released) this._persistSpendState();
+	}
+
+	/**
+	 * Charges one attempt against the daily budget when a payment settles.
+	 * Exactly one claim per settlement report, and a repeat terminal event
+	 * for a hash with nothing left to charge is a no-op. The engine reports
+	 * one settlement per hash and refuses a re-send of a paid hash (#975), so
+	 * nothing can ever charge the hash's other claims: their reservations go
+	 * in the same write, and they stay as records marked settled so that the
+	 * boot reconciliation (see _loadSpendState) does not charge the hash
+	 * again.
+	 *
+	 * With `claim`, that claim and no other: a keysend settled inside the
+	 * send charges the claim it opened, and this is a no-op when the handler
+	 * in create() already charged it. Otherwise the oldest claim still
+	 * holding budget, so a settlement frees a reservation wherever there is
+	 * one to free, failing that the oldest record: a settlement whose
+	 * reservation lapsed first still spent the money, and the day it lands on
+	 * is the day that has to carry it. A claim not yet marked settled is
+	 * preferred at each step, so a boot charge lands on the attempt it
+	 * belongs to.
+	 *
+	 * With `actualSats`, the day is charged that, what actually left the
+	 * node, rather than the claim's reservation of amount plus fee cap
+	 * (issue #1008). An actual above the reservation is charged in full and
+	 * logged: it is what a claim persisted by a version that reserved the
+	 * amount alone looks like once its payment settles with a fee.
+	 */
+	private _chargeAsyncSpendClaim(
+		paymentHashHex: string,
+		opts: { claim?: AsyncSpendClaim; actualSats?: number } = {}
+	): void {
+		const { claim, actualSats } = opts;
 		this._expireAsyncSpendClaims();
 		const claims = this._asyncSpendClaims.get(paymentHashHex);
 		if (!claims || claims.length === 0) return;
-		// The oldest claim still holding budget, so a settlement frees a
-		// reservation wherever there is one to free. Failing that the oldest
-		// record: a settlement whose reservation lapsed first still spent the
-		// money, and the day it lands on is the day that has to carry it.
-		const reserved = claims.findIndex((entry) => entry.reserved);
-		const [claim] = claims.splice(reserved === -1 ? 0 : reserved, 1);
+		let index: number;
+		if (claim) {
+			index = claims.indexOf(claim);
+			if (index === -1) return;
+		} else {
+			const rank = (entry: AsyncSpendClaim): number =>
+				(entry.reserved ? 0 : 2) + (entry.settled ? 1 : 0);
+			index = 0;
+			for (let i = 1; i < claims.length; i++) {
+				if (rank(claims[i]) < rank(claims[index])) index = i;
+			}
+		}
+		const [charged] = claims.splice(index, 1);
+		for (const rest of claims) {
+			rest.settled = true;
+			this._releaseClaimReservation(rest);
+		}
 		if (claims.length === 0) this._asyncSpendClaims.delete(paymentHashHex);
 		// Released before the spend is recorded, so a concurrent
-		// _checkSpendLimit never sees the same sats counted twice.
-		this._releaseAsyncSpendClaim(claim);
-		this._recordSpend(claim.sats);
-	}
-
-	/**
-	 * Marks a hash whose spend accounting a blocking send owns, for as long as
-	 * that send's own listener is installed. Counted, so the first of two
-	 * overlapping calls to finish does not unmark the hash under the second.
-	 */
-	private _acquireBlockingPayment(paymentHashHex: string): void {
-		this._blockingPaymentHashes.set(
-			paymentHashHex,
-			(this._blockingPaymentHashes.get(paymentHashHex) ?? 0) + 1
-		);
-	}
-
-	private _releaseBlockingPayment(paymentHashHex: string): void {
-		const held = this._blockingPaymentHashes.get(paymentHashHex);
-		if (held === undefined) return;
-		if (held > 1) this._blockingPaymentHashes.set(paymentHashHex, held - 1);
-		else this._blockingPaymentHashes.delete(paymentHashHex);
+		// _checkSpendLimit never sees the same sats counted twice. The record
+		// is the one write for all of it.
+		this._releaseClaimReservation(charged);
+		if (actualSats !== undefined && actualSats > charged.sats) {
+			this.log(
+				'warn',
+				'Payment settled above its reservation; charged in full',
+				{
+					paymentHash: paymentHashHex,
+					reservedSats: charged.sats,
+					sentSats: actualSats
+				}
+			);
+		}
+		this._recordSpend(actualSats ?? charged.sats);
 	}
 
 	/**
@@ -9015,15 +10029,17 @@ export class BeignetNode extends EventEmitter {
 	 * wherever the ledger is read or written, so the accounting needs no timer
 	 * of its own. The records stay: see _releaseAsyncSpendClaim.
 	 */
-	private _expireAsyncSpendClaims(): void {
+	private _expireAsyncSpendClaims(persist = true): void {
 		const now = Date.now();
+		let released = false;
 		for (const claims of this._asyncSpendClaims.values()) {
 			for (const claim of claims) {
 				if (claim.reserved && claim.expiresAt <= now) {
-					this._releaseAsyncSpendClaim(claim);
+					released = this._releaseClaimReservation(claim) || released;
 				}
 			}
 		}
+		if (released && persist) this._persistSpendState();
 	}
 
 	private _countAsyncSpendClaims(): number {
@@ -9046,6 +10062,7 @@ export class BeignetNode extends EventEmitter {
 	private _pruneAsyncSpendClaims(target: number): number {
 		let count = this._countAsyncSpendClaims();
 		if (count <= target) return count;
+		const before = count;
 		// Map iteration is insertion-ordered, so this walks the hashes oldest
 		// first, and each hash's own claims oldest first within it.
 		for (const [paymentHashHex, claims] of this._asyncSpendClaims) {
@@ -9060,23 +10077,284 @@ export class BeignetNode extends EventEmitter {
 			if (claims.length === 0) this._asyncSpendClaims.delete(paymentHashHex);
 			if (count <= target) break;
 		}
+		if (count < before) this._persistSpendState();
 		return count;
 	}
 
 	/**
-	 * Returns the on-chain amount+fee an external send will subtract from the
-	 * daily budget, computed from the transaction the wallet just built.
-	 * FAIL CLOSED: when a limit is configured and the built fee cannot be
-	 * read as a finite non-negative number, the send is rejected rather than
-	 * checked against an understated total.
+	 * Writes the ledger (the day's counters and every open claim) under
+	 * DAILY_SPEND_STATE_KEY, after every mutation, so a restart within the
+	 * UTC day resumes the day's total and the claims still waiting on a
+	 * settlement (issue #977). Nothing is written when no limit is
+	 * configured: the ledger is then read by nobody. A write that fails is
+	 * logged and does not fail the payment that caused it; the next mutation
+	 * writes the whole ledger again.
+	 */
+	private _persistSpendState(): void {
+		if (this._dailySpendLimitSats === undefined) return;
+		// A daemon that has not opened its database has nowhere to write.
+		const storage = this.storage as SqliteStorage | undefined;
+		if (!storage) return;
+		const claims: PersistedDailySpendState['claims'] = {};
+		for (const [paymentHashHex, list] of this._asyncSpendClaims) {
+			if (list.length > 0) claims[paymentHashHex] = list;
+		}
+		const state: PersistedDailySpendState = {
+			resetTime: this._dailySpendResetTime,
+			totalSats: this._dailySpentSats,
+			lightningSats: this._dailySpentLightningSats,
+			onchainSats: this._dailySpentOnchainSats,
+			claims
+		};
+		try {
+			storage.saveMetadata(DAILY_SPEND_STATE_KEY, JSON.stringify(state));
+		} catch (err) {
+			this.log('warn', 'Could not persist the daily spend ledger', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
+	/**
+	 * Restores the ledger persisted under DAILY_SPEND_STATE_KEY, at boot and
+	 * again when initNode runs for a resumed or restored database (issue
+	 * #977). What the process held in memory is dropped first: the row is
+	 * the ledger from here on.
+	 *
+	 * The day's counters are adopted when the stored day has not ended (now
+	 * is before its resetTime) and that resetTime is no later than the next
+	 * midnight UTC from now (a row written under a clock set into the future
+	 * would otherwise keep the counters from ever resetting once the clock
+	 * is corrected); any other row starts the day at zero, as the midnight
+	 * reset would have. Each stored claim is then reconciled with what the
+	 * node knows of its hash, since the settlement it waits on may have
+	 * landed, or become impossible, while the process was down:
+	 * - the payment settled (its OUTGOING record is COMPLETED, in memory or
+	 *   in the durable row, or a preimage is known): the hash's claims come
+	 *   back without their reservations, since nothing can settle under them
+	 *   any more, and one claim not yet marked settled is charged now, as the
+	 *   payment:sent handler would have and at the same figure (the amount
+	 *   plus the fee the record says was paid, the reservation when it cannot
+	 *   say; issue #1008), the rest being marked settled so that no later
+	 *   boot charges the same settlement again;
+	 * - the record is FAILED or gone and no HTLC is in flight for the hash:
+	 *   nothing can settle under the claim any more, so it is dropped and
+	 *   its reservation is not restored;
+	 * - otherwise (the record is PENDING, or an HTLC is still out) the claim
+	 *   is restored as stored, reservation and expiry included, so the settle
+	 *   charges it and the expiry sweep or the give-up report releases it.
+	 * Every claim is back in the ledger before anything is charged, so no
+	 * write during the restore is a partial ledger. A row that cannot be read
+	 * or parsed is logged and starts the day at zero with no claims; a claim
+	 * that fails the shape check is dropped.
+	 */
+	private _loadSpendState(): void {
+		for (const claims of this._asyncSpendClaims.values()) {
+			for (const claim of claims) this._releaseClaimReservation(claim);
+		}
+		this._asyncSpendClaims.clear();
+		this._dailySpendResetTime = 0;
+		this._dailySpentSats = 0;
+		this._dailySpentLightningSats = 0;
+		this._dailySpentOnchainSats = 0;
+
+		let stored: Partial<PersistedDailySpendState> | undefined;
+		try {
+			const raw = this.storage.loadMetadata(DAILY_SPEND_STATE_KEY);
+			if (raw) stored = JSON.parse(raw) as Partial<PersistedDailySpendState>;
+		} catch (err) {
+			this.log(
+				'warn',
+				'Could not read the persisted daily spend ledger; the day starts at zero',
+				{ error: err instanceof Error ? err.message : String(err) }
+			);
+		}
+		const nonNegative = (value: unknown): value is number =>
+			typeof value === 'number' && Number.isFinite(value) && value >= 0;
+		if (
+			stored &&
+			nonNegative(stored.resetTime) &&
+			Date.now() < stored.resetTime &&
+			stored.resetTime <= nextUtcMidnight() &&
+			nonNegative(stored.totalSats) &&
+			nonNegative(stored.lightningSats) &&
+			nonNegative(stored.onchainSats)
+		) {
+			this._dailySpendResetTime = stored.resetTime;
+			this._dailySpentSats = stored.totalSats;
+			this._dailySpentLightningSats = stored.lightningSats;
+			this._dailySpentOnchainSats = stored.onchainSats;
+		} else {
+			// Written with the rest of the restore below.
+			this._resetDailySpendIfNeeded(false);
+		}
+
+		const isClaim = (value: unknown): value is AsyncSpendClaim => {
+			const entry = value as Partial<AsyncSpendClaim> | null;
+			return (
+				typeof entry === 'object' &&
+				entry !== null &&
+				nonNegative(entry.sats) &&
+				typeof entry.expiresAt === 'number' &&
+				Number.isFinite(entry.expiresAt) &&
+				typeof entry.reserved === 'boolean' &&
+				(entry.settled === undefined || typeof entry.settled === 'boolean')
+			);
+		};
+		let restored = 0;
+		let charged = 0;
+		let dropped = 0;
+		const toCharge: string[] = [];
+		const rows =
+			stored?.claims && typeof stored.claims === 'object'
+				? Object.entries(stored.claims)
+				: [];
+		for (const [paymentHashHex, list] of rows) {
+			const total = Array.isArray(list) ? list.length : 0;
+			const claims = Array.isArray(list) ? list.filter(isClaim) : [];
+			dropped += total - claims.length;
+			if (claims.length === 0) continue;
+			if (!/^[0-9a-f]{64}$/.test(paymentHashHex)) {
+				dropped += claims.length;
+				continue;
+			}
+			const paymentHash = Buffer.from(paymentHashHex, 'hex');
+			const outcome = this._spendClaimOutcomeAtBoot(
+				paymentHash,
+				paymentHashHex
+			);
+			if (outcome === 'gone') {
+				dropped += claims.length;
+				continue;
+			}
+			// Copied field by field: only the claim's own fields come back
+			// from disk. A settled hash's claims come back unreserved.
+			const kept = claims.map(
+				(entry): AsyncSpendClaim => ({
+					sats: entry.sats,
+					expiresAt: entry.expiresAt,
+					reserved: entry.reserved && outcome !== 'settled',
+					...(entry.settled ? { settled: true } : {})
+				})
+			);
+			this._asyncSpendClaims.set(paymentHashHex, kept);
+			for (const entry of kept) {
+				if (entry.reserved) this._pendingSpendSats += entry.sats;
+			}
+			restored += kept.length;
+			if (outcome === 'settled' && kept.some((entry) => !entry.settled)) {
+				toCharge.push(paymentHashHex);
+			}
+		}
+		// Only once every claim is back, so each charge writes the whole
+		// ledger. Charged at what the record says left the node, as a live
+		// settle is; the reservation (amount plus fee cap) only when no record
+		// can say (issue #1008).
+		for (const paymentHashHex of toCharge) {
+			const record = this._settledRecordAtBoot(paymentHashHex);
+			this._chargeAsyncSpendClaim(paymentHashHex, {
+				actualSats: record ? sentSats(record) : undefined
+			});
+			charged++;
+		}
+		this._expireAsyncSpendClaims(false);
+		this._persistSpendState();
+		if (stored) {
+			this.log('info', 'Daily spend ledger restored', {
+				spentSats: this._dailySpentSats,
+				resetsAt: this._dailySpendResetTime,
+				claimsRestored: restored,
+				settledWhileDown: charged,
+				claimsDropped: dropped
+			});
+		}
+	}
+
+	/**
+	 * The record of a hash the boot reconciliation is about to charge, for
+	 * the figure to charge it at: the in-memory record when the engine still
+	 * holds one, else the durable row. Undefined when neither can be read,
+	 * which charges the reservation (issue #1008).
+	 */
+	private _settledRecordAtBoot(
+		paymentHashHex: string
+	): IPaymentInfo | undefined {
+		const inMemory = this.node.getPayment(Buffer.from(paymentHashHex, 'hex'));
+		if (inMemory) return inMemory;
+		try {
+			return this.storage.loadPayment(paymentHashHex) ?? undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * What the node knows of a stored claim's payment at boot: 'settled' when
+	 * the HTLC view or the durable row reports the hash paid, judged the way
+	 * the engine judges a duplicate (#975) except that a keysend row's own
+	 * preimage is not proof (#1161); 'live' while the record is
+	 * PENDING or an HTLC is still out for it; 'gone' otherwise. A durable row
+	 * that cannot be read is logged and reads as live: a reservation kept too
+	 * long is the safe side of that error.
+	 */
+	private _spendClaimOutcomeAtBoot(
+		paymentHash: Buffer,
+		paymentHashHex: string
+	): 'settled' | 'live' | 'gone' {
+		const view = this.node.getOutgoingHtlcs(paymentHash);
+		if (view.preimage || view.status === PaymentStatus.COMPLETED) {
+			return 'settled';
+		}
+		try {
+			const durable = this.storage.loadPayment(paymentHashHex);
+			if (
+				durable?.direction === PaymentDirection.OUTGOING &&
+				(durable.status === PaymentStatus.COMPLETED ||
+					// A keysend row holds the preimage its sender picked before the
+					// HTLC went out. A learned one is saved as its own row first.
+					(durable.preimage !== undefined &&
+						durable.metadata?._keysend !== 'true') ||
+					this.storage.loadPreimage(paymentHashHex) !== null)
+			) {
+				return 'settled';
+			}
+		} catch (err) {
+			this.log(
+				'warn',
+				'Could not read a payment record for the daily spend ledger; keeping its claim',
+				{
+					paymentHash: paymentHashHex,
+					error: err instanceof Error ? err.message : String(err)
+				}
+			);
+			return 'live';
+		}
+		if (
+			view.status === PaymentStatus.PENDING ||
+			this.node.hasHtlcInFlight(paymentHash)
+		) {
+			return 'live';
+		}
+		return 'gone';
+	}
+
+	/**
+	 * Returns the on-chain amount+fee an external send is judged on by the
+	 * per-payment and daily limits, computed from the transaction the wallet
+	 * just built. FAIL CLOSED: when a limit is configured and the built fee
+	 * cannot be read as a finite non-negative number, the send is rejected
+	 * rather than checked against an understated total.
 	 */
 	private _builtOnchainTotalSats(amountSats: number): number {
 		const feeSats = this.wallet.transaction?.data?.fee;
 		if (!Number.isFinite(feeSats) || feeSats < 0) {
-			if (this._dailySpendLimitSats !== undefined) {
+			if (
+				this._dailySpendLimitSats !== undefined ||
+				this._maxPaymentSats !== undefined
+			) {
 				throw new BeignetError(
 					'SPENDING_LIMIT_EXCEEDED',
-					'Unable to determine the transaction fee for the daily spend limit check; refusing to send'
+					'Unable to determine the transaction fee for the spend limit checks; refusing to send'
 				);
 			}
 			return amountSats;
@@ -9088,19 +10366,31 @@ export class BeignetNode extends EventEmitter {
 		limitSats: number | null;
 		spentSats: number;
 		remainingSats: number;
+		pendingSats: number;
 		resetsAt: number;
 		totalSats: number;
 		lightningSats: number;
 		onchainSats: number;
 	} {
 		this._resetDailySpendIfNeeded();
+		// The same sweep _checkSpendLimit runs, so the reservation reported is
+		// the one the next admission is judged against.
+		this._expireAsyncSpendClaims();
 		const limit = this._dailySpendLimitSats ?? null;
+		const pendingSats = this._pendingSpendSats;
 		return {
 			// Back-compat fields (spentSats == totalSats):
 			limitSats: limit,
 			spentSats: this._dailySpentSats,
+			// What the next admission can still pass: the day's total and the
+			// budget in-flight payments still hold both count against it.
 			remainingSats:
-				limit !== null ? Math.max(0, limit - this._dailySpentSats) : Infinity,
+				limit !== null
+					? Math.max(0, limit - this._dailySpentSats - pendingSats)
+					: Infinity,
+			// Held by payments still in flight (issue #977): a claim opened at
+			// admission that no settlement, failure or expiry has released.
+			pendingSats,
 			resetsAt: this._dailySpendResetTime,
 			// Breakdown: the limit is a single combined LN + onchain budget.
 			totalSats: this._dailySpentSats,
@@ -9145,12 +10435,22 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── Payment Validation ───────────────
 
 	/**
-	 * Pre-flight validation: checks whether a payment is likely to succeed.
-	 * Combines invoice decoding, amount limits, spending limits, channel capacity,
-	 * invoice expiry, and route availability into a single structured response.
-	 * Never throws — always returns a PaymentValidation result.
+	 * Pre-flight validation: checks whether a BOLT 11 payment is likely to
+	 * succeed. Combines invoice decoding, amount limits, spending limits,
+	 * channel capacity, invoice expiry, and route availability into a single
+	 * structured response. Never throws: it always returns a
+	 * PaymentValidation result.
+	 *
+	 * The limit checks are judged as payInvoice judges them (issue #1008): on
+	 * the amount plus the routing-fee cap, `maxFeeSats` when given and the
+	 * default for the amount otherwise. Previews BOLT 11 payments only; it
+	 * says nothing about keysend, offers or sendToRoute.
 	 */
-	validatePayment(bolt11: string, amountSats?: number): PaymentValidation {
+	validatePayment(
+		bolt11: string,
+		amountSats?: number,
+		maxFeeSats?: number
+	): PaymentValidation {
 		const checks: PaymentValidationCheck[] = [];
 		let decoded: ReturnType<typeof decodeInvoice> | null = null;
 		let decodedInfo: DecodedInvoice | undefined;
@@ -9228,6 +10528,28 @@ export class BeignetNode extends EventEmitter {
 		}
 
 		if (effectiveAmountSats !== undefined && effectiveAmountSats > 0) {
+			// The fee cap payInvoice would send under, and the amount plus that
+			// cap, which is what both limits are judged on (issue #1008). A cap
+			// that payInvoice would refuse is previewed as the default rather
+			// than thrown on: this method never throws.
+			const payAmountMsat =
+				decoded.amountMsat ??
+				(Number.isSafeInteger(amountSats) && amountSats! > 0
+					? BigInt(amountSats!) * 1000n
+					: undefined);
+			const capMsat =
+				maxFeeSats !== undefined &&
+				Number.isSafeInteger(maxFeeSats) &&
+				maxFeeSats >= 0
+					? BigInt(maxFeeSats) * 1000n
+					: defaultMaxFeeMsat(payAmountMsat ?? 0n);
+			const admissionSats =
+				payAmountMsat !== undefined
+					? spendLimitSats(payAmountMsat + capMsat)
+					: effectiveAmountSats;
+			const feeCapSats = admissionSats - effectiveAmountSats;
+			const withFees = `Amount ${effectiveAmountSats} sats plus up to ${feeCapSats} sats in routing fees`;
+
 			// 4. Per-payment limit
 			if (
 				this._maxPaymentSats !== undefined &&
@@ -9238,11 +10560,20 @@ export class BeignetNode extends EventEmitter {
 					status: 'FAIL',
 					message: `Amount ${effectiveAmountSats} sats exceeds per-payment limit of ${this._maxPaymentSats} sats`
 				});
+			} else if (
+				this._maxPaymentSats !== undefined &&
+				admissionSats > this._maxPaymentSats
+			) {
+				checks.push({
+					name: 'MAX_PAYMENT',
+					status: 'FAIL',
+					message: `${withFees} exceeds per-payment limit of ${this._maxPaymentSats} sats; lower maxFeeSats or the amount`
+				});
 			} else if (this._maxPaymentSats !== undefined) {
 				checks.push({
 					name: 'MAX_PAYMENT',
 					status: 'OK',
-					message: `Within per-payment limit (${this._maxPaymentSats} sats)`
+					message: `Within per-payment limit (${this._maxPaymentSats} sats) with up to ${feeCapSats} sats in routing fees`
 				});
 			}
 
@@ -9263,11 +10594,17 @@ export class BeignetNode extends EventEmitter {
 						status: 'FAIL',
 						message: `Amount ${effectiveAmountSats} sats exceeds daily remaining of ${remaining} sats`
 					});
+				} else if (admissionSats > remaining) {
+					checks.push({
+						name: 'DAILY_LIMIT',
+						status: 'FAIL',
+						message: `${withFees} exceeds daily remaining of ${remaining} sats; lower maxFeeSats or the amount`
+					});
 				} else {
 					checks.push({
 						name: 'DAILY_LIMIT',
 						status: 'OK',
-						message: `Within daily limit (${remaining} sats remaining)`
+						message: `Within daily limit (${remaining} sats remaining) with up to ${feeCapSats} sats in routing fees`
 					});
 				}
 			}
@@ -9392,103 +10729,157 @@ export class BeignetNode extends EventEmitter {
 		return height + cltvLimit;
 	}
 
+	/**
+	 * The PAYMENT_TIMEOUT a blocking payment rejects with once its wait is
+	 * over, after failing the record only when nothing is out for it (issue
+	 * #976). BOLT 2 has no way to retract an update_add_htlc: an HTLC still
+	 * offered can settle after the clock, so such a record stays PENDING
+	 * until it resolves rather than reading FAILED in between, and the
+	 * message says so, because a caller that reads a timeout as a failure
+	 * and pays again is refused (#975) but must not be told it failed. No
+	 * further route is tried for it: the engine freezes its retries, so a
+	 * later update_fail_htlc ends it (FAILED, payment:failed) rather than
+	 * dispatching a retry outside this call's admission and accounting; an
+	 * HTLC whose on-chain timeout resolves ends it the same way. A ghost
+	 * record, with no HTLC out, is failed as before, and the caller's claim
+	 * on the daily budget follows the record (issue #977): a failed ghost
+	 * dispatched nothing that could settle under it, so its reservation
+	 * goes (the record stays, as for a failure the engine reports by
+	 * return); with an HTLC still out the claim stays whole, for the
+	 * payment:sent handler in create() to charge when the HTLC settles, or
+	 * the expiry sweep to release.
+	 */
+	private _paymentTimeout(
+		paymentHash: Buffer,
+		what: 'Payment' | 'Keysend',
+		timeoutMs: number,
+		claim?: AsyncSpendClaim
+	): BeignetError {
+		const failed = this.node.failPaymentUnlessInFlight(paymentHash);
+		if (failed && claim) this._releaseAsyncSpendClaim(claim);
+		const err = new BeignetError(
+			'PAYMENT_TIMEOUT',
+			failed
+				? `${what} timed out after ${timeoutMs}ms`
+				: `${what} timed out after ${timeoutMs}ms; an HTLC is still in flight and the payment stays PENDING until it resolves; no further route is tried after the timeout`
+		);
+		err.paymentHash = paymentHash.toString('hex');
+		return err;
+	}
+
+	/**
+	 * The BeignetError for a refusal the engine threw out of a send: its
+	 * LightningErrorCode through ENGINE_PAYMENT_ERROR_CODES, or, for an
+	 * untyped throw, the code its message implies. One mapping for every
+	 * payment method (issue #991): sendPaymentAsync used to let the engine's
+	 * LightningPaymentError through untouched, and the daemon, seeing no
+	 * BeignetError, answered PAYMENT_FAILED with a 502 that told an agent to
+	 * retry a payment that was already made. A BeignetError passes through.
+	 */
+	private _toBeignetPaymentError(err: unknown): BeignetError {
+		if (err instanceof BeignetError) return err;
+		const msg = err instanceof Error ? err.message : String(err);
+		// The caller's own arguments, such as metadata the recovery guardians
+		// could not hold.
+		if (err instanceof InvalidRequestError) {
+			return new BeignetError(BeignetErrorCode.INVALID_PARAMS, msg);
+		}
+		let code = 'PAYMENT_FAILED';
+		if (err instanceof Error && 'code' in err) {
+			const lpErr = err as { code: string };
+			code = ENGINE_PAYMENT_ERROR_CODES[lpErr.code] || 'PAYMENT_FAILED';
+		} else if (msg.includes('No route found')) {
+			code = 'NO_ROUTE';
+		} else if (msg.includes('already in flight')) {
+			code = 'DUPLICATE_PAYMENT';
+		} else if (
+			msg.includes('No channel to first hop') ||
+			msg.includes('Peer not found')
+		) {
+			code = 'PEER_NOT_CONNECTED';
+		}
+		return new BeignetError(code, msg);
+	}
+
+	/**
+	 * Pay a BOLT 11 invoice and wait for its outcome, at most timeoutMs. At
+	 * the timeout the payment is failed only when no HTLC is out for it; with
+	 * one still in flight the record stays PENDING until that HTLC resolves,
+	 * and the PAYMENT_TIMEOUT says so (issue #976). A hash that was paid or
+	 * still has an HTLC out is refused as DUPLICATE_PAYMENT (#975).
+	 *
+	 * The fee cap is maxFeeSats OR maxFeeMsat, never both: maxFeeMsat lets a
+	 * caller cap at an exact quote such as estimatePayment's estimatedFeeMsat
+	 * (issue #998).
+	 */
 	async payInvoice(
 		bolt11: string,
 		timeoutMs = 60_000,
 		maxFeeSats?: number,
 		amountSats?: number,
 		metadata?: Record<string, string>,
-		cltvLimit?: number
+		cltvLimit?: number,
+		maxFeeMsatCap?: number | string
 	): Promise<PaymentInfo> {
 		this._checkDraining();
 		// Decode to get paymentHash for event matching
 		const decoded = decodeInvoiceInput(bolt11);
 		const paymentHashHex = decoded.paymentHash.toString('hex');
 
-		// Per-payment and daily spending limit checks, applied to what the engine
-		// will actually pay rather than to what the caller asked for (#528).
-		const spendAmountSats = paymentSpendSats(decoded.amountMsat, amountSats);
 		// Converted BEFORE the spend accounting below, not after it. Every
 		// decrement of _pendingSpendSats lives inside the Promise executor
 		// further down, which a RangeError out of BigInt() never reaches: the
 		// counter would stay raised for the life of the process, and once it
 		// passed dailySpendLimit _checkSpendLimit would refuse every real
 		// payment until the daemon restarted (issue #474).
-		const maxFeeMsat =
-			maxFeeSats !== undefined
-				? BigInt(requireNonNegativeSafeInteger(maxFeeSats, 'maxFeeSats')) *
-				  1000n
-				: undefined;
 		const amountMsat =
 			amountSats !== undefined
 				? BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) *
 				  1000n
 				: undefined;
+		// What the engine will actually pay rather than what the caller asked
+		// for (#528), and the fee cap on top of it: the caller's, or the
+		// default for that amount (#1008).
+		const payAmountMsat = decoded.amountMsat ?? amountMsat;
+		const maxFeeMsat = resolveMaxFeeMsat(
+			maxFeeSats,
+			maxFeeMsatCap,
+			payAmountMsat
+		);
 		// Judged here, before any reservation, for the same reason as the
 		// conversions above: a refused bound must leave nothing raised.
 		const maxCltvExpiryHeight = this._cltvCeiling(cltvLimit);
 
-		if (spendAmountSats > 0) {
-			this._checkMaxPayment(spendAmountSats);
-			this._checkSpendLimit(spendAmountSats);
-			this._pendingSpendSats += spendAmountSats;
-		}
-
-		// This call owns the hash's spend accounting for as long as its own
-		// listener is installed: the forwarding handler in create() would
-		// otherwise charge an async claim for the settlement the listener
-		// records, counting one payment twice.
+		// This attempt's claim on the daily budget, opened before the send and
+		// charged by the payment:sent handler in create() rather than by the
+		// listener below, which may be gone by the time the settlement lands
+		// (a timeout with the HTLC still out, or a restart): one persisted
+		// ledger, one charger (issue #977). Its reservation is held for the
+		// whole in-flight window, which is what stops two concurrent payments
+		// both passing the daily limit before either is charged.
 		//
-		// The claims a fire-and-forget attempt on this hash already holds stay
-		// where they are, reservations and all. This attempt adds an HTLC to
-		// the ones already out there rather than replacing them, and the engine
-		// reports at most one of them settling (it emits nothing further for a
-		// hash it has marked completed), so the rest have to go on holding
-		// budget on their own account.
-		this._acquireBlockingPayment(paymentHashHex);
-		let blockingReleased = false;
-		const releaseBlockingPayment = (): void => {
-			if (blockingReleased) return;
-			blockingReleased = true;
-			this._releaseBlockingPayment(paymentHashHex);
-		};
-
-		// One release shared by every exit, and idempotent, because more than
-		// one can run for a single payment (a timeout followed by a late
-		// payment:failed). The reservation is deliberately held for the whole
-		// in-flight window: it is what stops two concurrent payments both
-		// passing the daily limit before either records a spend, so this must
-		// never become a `finally` around the synchronous body.
-		let released = false;
-		const releaseReservation = (): void => {
-			if (spendAmountSats <= 0 || released) return;
-			released = true;
-			this._pendingSpendSats -= spendAmountSats;
-		};
-
-		// Store metadata on the payment if provided. Guarded, because nothing
-		// between the reservation above and the executor below may strand it.
-		try {
-			if (metadata) {
-				this.node.setPaymentMetadata(decoded.paymentHash, metadata);
-			}
-		} catch (err: unknown) {
-			releaseReservation();
-			releaseBlockingPayment();
-			throw err;
-		}
+		// The claims an earlier attempt on this hash already holds stay where
+		// they are, reservations and all. The engine refuses this attempt
+		// while any HTLC of that one is still out or once it paid (#975);
+		// when it does dispatch, its HTLC is a new one beside the resolved
+		// ones rather than a replacement, and the engine reports at most one
+		// settlement for the hash (it emits nothing further for a hash it has
+		// marked completed), so the rest have to go on holding budget on
+		// their own account.
+		const claim = this._admitLightningSpend(
+			paymentHashHex,
+			payAmountMsat,
+			maxFeeMsat
+		);
 
 		return new Promise<PaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
-				releaseReservation();
-				// Clean up the ghost payment to free channel capacity
-				this.node.failPayment(decoded.paymentHash);
+				// A ghost payment is failed to free its capacity, and its
+				// claim's reservation with it; one with an HTLC still out stays
+				// PENDING (issue #976) and keeps its claim for the settle.
 				reject(
-					new BeignetError(
-						'PAYMENT_TIMEOUT',
-						`Payment timed out after ${timeoutMs}ms`
-					)
+					this._paymentTimeout(decoded.paymentHash, 'Payment', timeoutMs, claim)
 				);
 			}, timeoutMs);
 
@@ -9496,26 +10887,21 @@ export class BeignetNode extends EventEmitter {
 				clearTimeout(timer);
 				this.node.removeListener('payment:sent', onSent);
 				this.node.removeListener('payment:failed', onFailed);
-				// Safe here rather than after the accounting below: the handler
-				// in create() is registered first, so it has already seen this
-				// same event and declined to charge for it.
-				releaseBlockingPayment();
 			};
 
 			const onSent = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					// Released before the spend is recorded, so a concurrent
-					// _checkSpendLimit never sees the same sats counted twice.
-					releaseReservation();
-					if (spendAmountSats > 0) this._recordSpend(spendAmountSats);
+					// Already charged: the handler in create() is registered
+					// first, so it charged the claim before this listener ran.
 					resolve(this.toPaymentInfo(info));
 				}
 			};
 			const onFailed = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					releaseReservation();
+					// The handler in create() ran first and released the claim
+					// if nothing is out for the hash any more.
 					const failDesc =
 						info.failureCode !== undefined
 							? describeFailureCode(info.failureCode)
@@ -9534,12 +10920,16 @@ export class BeignetNode extends EventEmitter {
 			this.node.on('payment:failed', onFailed);
 
 			try {
+				// The metadata rides the send, which creates the record it belongs
+				// on; setPaymentMetadata only labels a record that already exists.
 				this.node.sendPayment(
 					bolt11,
 					undefined,
 					maxFeeMsat,
 					amountMsat,
-					maxCltvExpiryHeight
+					maxCltvExpiryHeight,
+					undefined,
+					metadata
 				);
 			} catch (err: unknown) {
 				cleanup();
@@ -9547,48 +10937,28 @@ export class BeignetNode extends EventEmitter {
 				// the reservation outlived every refused send (no route, a
 				// duplicate, a peer that is gone) and ratcheted the counter up
 				// until the daily limit refused real payments (issue #474).
-				releaseReservation();
-				const msg = err instanceof Error ? err.message : String(err);
-				// Use typed error code if available, fall back to string matching
-				let code = 'PAYMENT_FAILED';
-				if (err instanceof Error && 'code' in err) {
-					const lpErr = err as { code: string };
-					const codeMap: Record<string, string> = {
-						NO_ROUTE: 'NO_ROUTE',
-						DUPLICATE_PAYMENT: 'DUPLICATE_PAYMENT',
-						NO_CHANNEL_TO_HOP: 'PEER_NOT_CONNECTED',
-						FEE_EXCEEDS_MAX: 'PAYMENT_FAILED',
-						// The caller's own bound (#751): its code, not a generic
-						// failure, so a swap provider can tell "no route under the
-						// refund height" from "no route at all".
-						CLTV_EXCEEDS_MAX: 'CLTV_EXCEEDS_MAX',
-						MISSING_AMOUNT: 'INVALID_PARAMS',
-						INVALID_INVOICE: 'INVALID_PARAMS',
-						INVOICE_EXPIRED: 'INVOICE_EXPIRED'
-					};
-					code = codeMap[lpErr.code] || 'PAYMENT_FAILED';
-				} else {
-					if (msg.includes('No route found')) code = 'NO_ROUTE';
-					else if (msg.includes('already in flight'))
-						code = 'DUPLICATE_PAYMENT';
-					else if (
-						msg.includes('No channel to first hop') ||
-						msg.includes('Peer not found')
-					)
-						code = 'PEER_NOT_CONNECTED';
-				}
-				reject(new BeignetError(code, msg));
+				if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
+				reject(this._toBeignetPaymentError(err));
 			}
 		});
 	}
 
+	/**
+	 * payInvoice that never throws. A refused or failed payment comes back
+	 * as the hash's existing record when there is one: after a timeout with
+	 * an HTLC still out, the PENDING record, which stays PENDING until the
+	 * HTLC resolves (issue #976); for a duplicate refusal, the record the
+	 * engine refused from, the durable row included (#975). Otherwise a
+	 * synthetic FAILED record whose failureDescription carries the code.
+	 */
 	async payInvoiceSafe(
 		bolt11: string,
 		timeoutMs = 60_000,
 		maxFeeSats?: number,
 		amountSats?: number,
 		metadata?: Record<string, string>,
-		cltvLimit?: number
+		cltvLimit?: number,
+		maxFeeMsat?: number | string
 	): Promise<PaymentInfo> {
 		try {
 			return await this.payInvoice(
@@ -9597,7 +10967,8 @@ export class BeignetNode extends EventEmitter {
 				maxFeeSats,
 				amountSats,
 				metadata,
-				cltvLimit
+				cltvLimit,
+				maxFeeMsat
 			);
 		} catch (err: unknown) {
 			// Extract payment hash if possible (bolt11 itself may be invalid)
@@ -9614,9 +10985,11 @@ export class BeignetNode extends EventEmitter {
 				/* bolt11 is malformed — use defaults */
 			}
 
-			// Return persisted record if available
+			// Return persisted record if available: the in-memory one, or for
+			// a duplicate refusal the durable row the engine refused from.
 			if (hashHex !== 'unknown') {
-				const existing = this.getPayment(hashHex);
+				const existing =
+					this.livePayment(hashHex) ?? this.durablePaymentFor(err, hashHex);
 				if (existing) return existing;
 			}
 
@@ -9660,7 +11033,9 @@ export class BeignetNode extends EventEmitter {
 
 				// Don't retry permanent failures
 				if (!isRetryableError(err)) {
-					const pi = this.getPayment(paymentHashHex);
+					const pi =
+						this.livePayment(paymentHashHex) ??
+						this.durablePaymentFor(err, paymentHashHex);
 					if (pi) return { ...pi, attempts: attempt };
 					return {
 						paymentHash: paymentHashHex,
@@ -9699,7 +11074,7 @@ export class BeignetNode extends EventEmitter {
 
 				// Check drain mode before retrying
 				if (this._draining) {
-					const pi = this.getPayment(paymentHashHex);
+					const pi = this.livePayment(paymentHashHex);
 					if (pi) return { ...pi, attempts: attempt };
 					return {
 						paymentHash: paymentHashHex,
@@ -9720,7 +11095,7 @@ export class BeignetNode extends EventEmitter {
 					const amountSats = Number(decoded.amountMsat / 1000n);
 					const check = this.canSend(amountSats);
 					if (!check.canSend) {
-						const pi = this.getPayment(paymentHashHex);
+						const pi = this.livePayment(paymentHashHex);
 						if (pi) return { ...pi, attempts: attempt };
 						return {
 							paymentHash: paymentHashHex,
@@ -9737,7 +11112,7 @@ export class BeignetNode extends EventEmitter {
 		}
 
 		// All retries exhausted
-		const pi = this.getPayment(paymentHashHex);
+		const pi = this.livePayment(paymentHashHex);
 		if (pi) return { ...pi, attempts: maxRetries + 1 };
 		return {
 			paymentHash: paymentHashHex,
@@ -9768,21 +11143,18 @@ export class BeignetNode extends EventEmitter {
 		this._checkDraining();
 		const decoded = decodeInvoiceInput(bolt11);
 		const paymentHashHex = decoded.paymentHash.toString('hex');
-		// Admitted on what the engine will pay, not on the caller's override.
-		const spendAmountSats = paymentSpendSats(decoded.amountMsat, amountSats);
 		// Converted BEFORE the spend accounting below, for the reason
 		// payInvoice's copy documents: a RangeError out of BigInt() must not
 		// leave the reservation raised for the life of the process (issue #474).
-		const maxFeeMsat =
-			maxFeeSats !== undefined
-				? BigInt(requireNonNegativeSafeInteger(maxFeeSats, 'maxFeeSats')) *
-				  1000n
-				: undefined;
 		const amountMsat =
 			amountSats !== undefined
 				? BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) *
 				  1000n
 				: undefined;
+		// Admitted on what the engine will pay, not on the caller's override
+		// (#528), plus the fee cap: the caller's, or the default (#1008).
+		const payAmountMsat = decoded.amountMsat ?? amountMsat;
+		const maxFeeMsat = resolveMaxFeeMsat(maxFeeSats, undefined, payAmountMsat);
 		const maxCltvExpiryHeight = this._cltvCeiling(cltvLimit);
 
 		// This attempt's own claim, opened BEFORE the send both because a later
@@ -9792,37 +11164,31 @@ export class BeignetNode extends EventEmitter {
 		// create() has to find a claim for. A resubmission of a hash whose
 		// earlier attempt may still be live gets a claim of its own rather than
 		// replacing that one: either attempt can be the one that settles.
-		let claim: AsyncSpendClaim | undefined;
-		if (spendAmountSats > 0) {
-			this._checkMaxPayment(spendAmountSats);
-			this._checkSpendLimit(spendAmountSats);
-			claim = this._openAsyncSpendClaim(paymentHashHex, spendAmountSats);
-		}
+		const claim = this._admitLightningSpend(
+			paymentHashHex,
+			payAmountMsat,
+			maxFeeMsat
+		);
 
 		let result: IPaymentInfo;
 		try {
-			if (metadata) {
-				this.node.setPaymentMetadata(decoded.paymentHash, metadata);
-			}
 			result = this.node.sendPayment(
 				bolt11,
 				undefined,
 				maxFeeMsat,
 				amountMsat,
-				maxCltvExpiryHeight
+				maxCltvExpiryHeight,
+				undefined,
+				metadata
 			);
 		} catch (err: unknown) {
 			// A payment that never started holds no capacity. Matched by
 			// identity, so a refused duplicate frees only this submission's
 			// claim and leaves the in-flight attempt's alone.
 			if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
-			if (
-				err instanceof Error &&
-				(err as { code?: string }).code === 'CLTV_EXCEEDS_MAX'
-			) {
-				throw new BeignetError('CLTV_EXCEEDS_MAX', err.message);
-			}
-			throw err;
+			// With its own code (issue #991): a duplicate answers 409 over
+			// HTTP, not the retryable 502 an unmapped throw was flattened to.
+			throw this._toBeignetPaymentError(err);
 		}
 		// Not every refusal throws. An expired invoice, a locally refused
 		// addHtlc and an undispatchable MPP part all RETURN a failed payment,
@@ -9846,13 +11212,16 @@ export class BeignetNode extends EventEmitter {
 
 	/**
 	 * Send a keysend (spontaneous) payment — blocks until settled or timeout.
+	 * `onPaymentHash` is called with the payment hash before the HTLC goes
+	 * out; a throw from it refuses the payment.
 	 */
 	async sendKeysend(
 		pubkey: string,
 		amountSats: number,
 		timeoutMs = 60_000,
 		maxFeeSats?: number,
-		metadata?: Record<string, string>
+		metadata?: Record<string, string>,
+		onPaymentHash?: (paymentHash: string) => void
 	): Promise<PaymentInfo> {
 		this._checkDraining();
 		// Guarded before the accounting for the same reason payInvoice is: the
@@ -9860,23 +11229,21 @@ export class BeignetNode extends EventEmitter {
 		// to leave _pendingSpendSats permanently raised (issue #474).
 		const amountMsat =
 			BigInt(requireNonNegativeSafeInteger(amountSats, 'amountSats')) * 1000n;
-		const maxFeeMsat =
-			maxFeeSats !== undefined
-				? BigInt(requireNonNegativeSafeInteger(maxFeeSats, 'maxFeeSats')) *
-				  1000n
-				: undefined;
-		this._checkMaxPayment(amountSats);
-		this._checkSpendLimit(amountSats);
-		this._pendingSpendSats += amountSats;
-		// Idempotent, and shared by every exit, for the reason payInvoice's
-		// copy documents: the reservation is held for the whole in-flight
-		// window, and a keysend that never started holds no capacity.
-		let released = false;
-		const releaseReservation = (): void => {
-			if (released) return;
-			released = true;
-			this._pendingSpendSats -= amountSats;
-		};
+		// The caller's cap, or the default for the amount (#1008).
+		const maxFeeMsat = resolveMaxFeeMsat(maxFeeSats, undefined, amountMsat);
+		const preimage = crypto.randomBytes(32);
+		onPaymentHash?.(crypto.createHash('sha256').update(preimage).digest('hex'));
+		// This attempt's claim on the daily budget, charged by the
+		// payment:sent handler in create() as payInvoice's is (issue #977).
+		// The claim is opened under a provisional key so that its reservation
+		// holds across the call, and moved under the hash after it. A keysend
+		// that never started holds no capacity.
+		const provisionalKey = `keysend:${crypto.randomBytes(8).toString('hex')}`;
+		const claim = this._admitLightningSpend(
+			provisionalKey,
+			amountMsat,
+			maxFeeMsat
+		);
 		const destination = Buffer.from(pubkey, 'hex');
 
 		let result: IPaymentInfo;
@@ -9885,31 +11252,41 @@ export class BeignetNode extends EventEmitter {
 				destination,
 				amountMsat,
 				maxFeeMsat,
-				metadata
+				metadata,
+				preimage
 			});
 		} catch (err: unknown) {
-			releaseReservation();
-			throw err;
+			if (claim) this._closeAsyncSpendClaim(provisionalKey, claim);
+			throw this._toBeignetPaymentError(err);
 		}
 		const paymentHashHex = result.paymentHash.toString('hex');
+		if (claim) {
+			this._rekeyAsyncSpendClaim(provisionalKey, paymentHashHex, claim);
+		}
 
-		// If already settled synchronously
+		// Settled or failed inside the call: the handler in create() saw that
+		// event before the claim carried this hash, so the claim is charged,
+		// or its reservation released, here. By identity, so a repeat of the
+		// event later finds nothing left under this claim.
 		if (result.status !== 'PENDING') {
-			releaseReservation();
-			if (result.status === 'COMPLETED') this._recordSpend(amountSats);
+			if (claim) {
+				if (result.status === 'COMPLETED') {
+					this._chargeAsyncSpendClaim(paymentHashHex, {
+						claim,
+						actualSats: sentSats(result)
+					});
+				} else {
+					this._releaseAsyncSpendClaim(claim);
+				}
+			}
 			return this.toPaymentInfo(result);
 		}
 
 		return new Promise<PaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
-				releaseReservation();
-				this.node.failPayment(result.paymentHash);
 				reject(
-					new BeignetError(
-						'PAYMENT_TIMEOUT',
-						`Keysend timed out after ${timeoutMs}ms`
-					)
+					this._paymentTimeout(result.paymentHash, 'Keysend', timeoutMs, claim)
 				);
 			}, timeoutMs);
 
@@ -9922,15 +11299,16 @@ export class BeignetNode extends EventEmitter {
 			const onSent = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					releaseReservation();
-					this._recordSpend(amountSats);
+					// Already charged by the handler in create(), which is
+					// registered first.
 					resolve(this.toPaymentInfo(info));
 				}
 			};
 			const onFailed = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					releaseReservation();
+					// The handler in create() ran first and released the claim
+					// if nothing is out for the hash any more.
 					const failDesc =
 						info.failureCode !== undefined
 							? describeFailureCode(info.failureCode)
@@ -9982,8 +11360,17 @@ export class BeignetNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Every payment the node has a record of, newest first (issue #1063).
+	 * The engine keeps a completed or failed record in memory for 24 hours
+	 * (oldest first past 10,000) while its durable row stays, so the rows
+	 * are read under the map on every call: the live record wins where both
+	 * exist, the row stands in where the map has forgotten. A wallet must
+	 * never show less than it already knew, so a row set that cannot be
+	 * read fails the call rather than answering with the map alone.
+	 */
 	listPayments(filter?: PaymentFilter): PaymentInfo[] {
-		let payments = this.node.listPayments().map((p) => this.toPaymentInfo(p));
+		let payments = this.paymentRecords().map((p) => this.toPaymentInfo(p));
 
 		// Sort by createdAt descending (newest first)
 		payments.sort((a, b) => b.createdAt - a.createdAt);
@@ -10020,10 +11407,87 @@ export class BeignetNode extends EventEmitter {
 		return payments;
 	}
 
+	/**
+	 * The record for a hash: the in-memory one, else its durable row, in the
+	 * order _settledRecordAtBoot reads them (issue #1063). Null when neither
+	 * exists. A row that cannot be read throws rather than reading as absent:
+	 * a NOT_FOUND for a payment the caller already knew is the answer this
+	 * exists to prevent.
+	 */
 	getPayment(paymentHash: string): PaymentInfo | null {
+		const live = this.livePayment(paymentHash);
+		if (live) return live;
+		const durable = this.storage.loadPayment(paymentHash);
+		return durable ? this.toPaymentInfo(durable) : null;
+	}
+
+	/**
+	 * Where an outgoing payment stands, judged as the engine judges a
+	 * duplicate (#975): 'settled' once paid, 'live' while its record is
+	 * PENDING or an HTLC is still out for it, 'gone' when nothing sent for it
+	 * can settle any more. A durable row that cannot be read reads as live.
+	 */
+	paymentOutcome(paymentHash: string): 'settled' | 'live' | 'gone' {
+		return this._spendClaimOutcomeAtBoot(
+			Buffer.from(paymentHash, 'hex'),
+			paymentHash
+		);
+	}
+
+	/**
+	 * The in-memory record only. The pay paths read this, not getPayment: a
+	 * fresh NO_ROUTE or FEE_EXCEEDS_MAX on a hash with a days-old FAILED row
+	 * is this attempt's outcome, and the row is an earlier attempt's, so
+	 * falling through to the row would report the old failure as the new
+	 * one. They take the row only for a DUPLICATE_PAYMENT refusal, through
+	 * durablePaymentFor, where the row is what the engine refused from.
+	 */
+	private livePayment(paymentHash: string): PaymentInfo | null {
 		const p = this.node.getPayment(Buffer.from(paymentHash, 'hex'));
-		if (!p) return null;
-		return this.toPaymentInfo(p);
+		return p ? this.toPaymentInfo(p) : null;
+	}
+
+	/**
+	 * The durable rows under the in-memory map, keyed by hash, the live
+	 * record winning. One storage read per call; a row set that cannot be
+	 * read throws.
+	 */
+	private paymentRecords(): IPaymentInfo[] {
+		const byHash = new Map<string, IPaymentInfo>();
+		for (const { paymentHash, payment } of this.storage.loadAllPayments()) {
+			byHash.set(paymentHash, payment);
+		}
+		for (const p of this.node.listPayments()) {
+			byHash.set(p.paymentHash.toString('hex'), p);
+		}
+		return [...byHash.values()];
+	}
+
+	/**
+	 * The durable record behind a DUPLICATE_PAYMENT refusal whose in-memory
+	 * record is gone (issue #975). The in-memory record is pruned 24 hours
+	 * after completion (oldest first past the size cap) while the row stays,
+	 * and the engine refuses to pay a hash whose row says it was paid, so a
+	 * refused re-send of a pruned paid invoice answers with its COMPLETED
+	 * record rather than a synthetic failure. Null for any other error: a
+	 * fresh NO_ROUTE or FEE_EXCEEDS_MAX on a hash with a days-old FAILED row
+	 * is this attempt's outcome, and the row is an earlier attempt's. A row
+	 * that cannot be read (the database is closed) is no record, so the safe
+	 * callers still never throw.
+	 */
+	private durablePaymentFor(err: unknown, hashHex: string): PaymentInfo | null {
+		if (
+			!(err instanceof BeignetError) ||
+			err.code !== BeignetErrorCode.DUPLICATE_PAYMENT
+		) {
+			return null;
+		}
+		try {
+			const durable = this.storage.loadPayment(hashHex);
+			return durable ? this.toPaymentInfo(durable) : null;
+		} catch {
+			return null;
+		}
 	}
 
 	/** Settled forwards, newest first. Msat values as strings (JSON-safe). */
@@ -10114,6 +11578,11 @@ export class BeignetNode extends EventEmitter {
 		const result = await l402Fetch(url, init, {
 			...options,
 			credentials: this._l402Credentials,
+			// Vetting only the final URL would be too late: by then fetch has
+			// already sent the caller's request, body included, to whatever the
+			// redirect named.
+			checkRedirect: (target) =>
+				this._assertL402TargetAllowed(target, options.allowPrivateNetwork),
 			payer: {
 				payInvoice: async (
 					bolt11: string,
@@ -10134,15 +11603,6 @@ export class BeignetNode extends EventEmitter {
 				}
 			}
 		});
-		// A redirect can land on a host the caller never named. The paid path
-		// already refuses cross-origin challenges, but an unpaid response that
-		// followed a redirect to a private target must not be relayed either.
-		if (result.response.url) {
-			this._assertL402TargetAllowed(
-				result.response.url,
-				options.allowPrivateNetwork
-			);
-		}
 		// The body is relayed to the daemon caller, so its size has to be
 		// bounded here. Refuse a response that declares itself too large, and
 		// stream-read the rest under the cap (a server can lie about
@@ -10398,18 +11858,28 @@ export class BeignetNode extends EventEmitter {
 			// FAILED payment with nothing at all to explain it.
 			info.failureDescription = p.failureReason;
 		}
-		if (p.route?.totalFeeMsat !== undefined) {
+		if (p.sentMsat !== undefined && p.sentMsat >= p.amountMsat) {
+			// An MPP record: its route is the first part only, so the fee
+			// is what left the node over what the invoice asked (#1008).
+			info.feeSats = Number((p.sentMsat - p.amountMsat) / 1000n);
+		} else if (p.route?.totalFeeMsat !== undefined) {
 			info.feeSats = Number(p.route.totalFeeMsat / 1000n);
 		}
 		if (p.route) {
+			const hops = p.route.hops;
 			info.route = {
-				hops: p.route.hops.map((h) => ({
+				hops: hops.map((h, i) => ({
 					pubkey: h.pubkey.toString('hex'),
 					shortChannelId: h.shortChannelId.toString('hex'),
-					feeMsat: h.feeBaseMsat
+					// The fee this hop kept: what it received less what it
+					// forwarded to the next hop. The final hop keeps nothing.
+					// This reported the hop's fee_base_msat before, so a route
+					// paying 753 msat over 0-base hops read 0 at every hop
+					// (issue #1056).
+					feeMsat: hopFeeMsat(hops, i)
 				})),
 				totalFeeMsat: Number(p.route.totalFeeMsat),
-				hopCount: p.route.hops.length
+				hopCount: hops.length
 			};
 		}
 		if (p.metadata) info.metadata = p.metadata;
@@ -10615,7 +12085,7 @@ export class BeignetNode extends EventEmitter {
 		feeratePerkw: number
 	): ReturnType<LightningNode['spliceQuote']> {
 		const idBuf = requireChannelIdHex(channelId);
-		requireU32(feeratePerkw, 'feeratePerkw');
+		requireU32(feeratePerkw, 'feeratePerkw', 1, MAX_SPLICE_FEERATE_PERKW);
 		return fundingOrRefuse(() =>
 			this.node.spliceQuote(idBuf, direction, feeratePerkw)
 		);
@@ -10632,7 +12102,7 @@ export class BeignetNode extends EventEmitter {
 	): SpliceResult {
 		const idBuf = requireChannelIdHex(channelId);
 		requirePositiveSafeInteger(amountSats, 'amountSats');
-		requireU32(feeratePerkw, 'feeratePerkw');
+		requireU32(feeratePerkw, 'feeratePerkw', 1, MAX_SPLICE_FEERATE_PERKW);
 		// fundingUtxos is shape-checked by the node, one copy of the rules; its
 		// InvalidSpliceError converts to INVALID_PARAMS through fundingOrRefuse
 		// like every other splice refusal.
@@ -10652,7 +12122,7 @@ export class BeignetNode extends EventEmitter {
 	): SpliceResult {
 		const idBuf = requireChannelIdHex(channelId);
 		requirePositiveSafeInteger(amountSats, 'amountSats');
-		requireU32(feeratePerkw, 'feeratePerkw');
+		requireU32(feeratePerkw, 'feeratePerkw', 1, MAX_SPLICE_FEERATE_PERKW);
 		let destinationScript: Buffer | undefined;
 		if (destinationAddress !== undefined) {
 			// A provided-but-empty (or non-string) destination is a caller bug,
@@ -10688,9 +12158,9 @@ export class BeignetNode extends EventEmitter {
 		// An address-targeted splice-out is an external send: the destination
 		// receives the full amount and the channel additionally pays the
 		// on-chain fee (the engine declares relative = -(amount + fee), same
-		// fee formula as below), so both count against the shared daily
-		// budget, like sendOnchain (issue #534 review). Wallet-credited
-		// splice-outs stay outside the limit: those funds return to our own
+		// fee formula as below), so both count against the per-payment and
+		// daily limits, like sendOnchain (issue #534 review). Wallet-credited
+		// splice-outs stay outside them: those funds return to our own
 		// wallet. Checked before the engine call (fail fast, like sendOnchain)
 		// and recorded only when the engine accepts the initiation; a splice
 		// that later fails in negotiation holds the budget until the UTC
@@ -10707,6 +12177,10 @@ export class BeignetNode extends EventEmitter {
 				)
 			);
 			externalSpendSats = amountSats + feeSats;
+			this._checkMaxPayment(externalSpendSats, amountSats, {
+				name: 'on-chain fees',
+				param: 'feeratePerkw'
+			});
 			this._checkSpendLimit(externalSpendSats);
 		}
 		const result = fundingOrRefuse(() =>
@@ -10802,10 +12276,22 @@ export class BeignetNode extends EventEmitter {
 			.map(({ offer, encoded }) => this.toOfferInfo(offer, encoded));
 	}
 
+	/**
+	 * Pay a BOLT 12 offer: request its invoice, then pay that. The fee cap is
+	 * maxFeeSats OR maxFeeMsat, never both, exactly as payInvoice takes it
+	 * (issue #998); it bounds the public hops plus the invoice's own
+	 * blinded-path fee, which the payee writes (issue #1001). Without a cap
+	 * the fee is unbounded. `onPaymentHash` is called with the invoice's
+	 * payment hash before the HTLC goes out; a throw from it refuses the
+	 * payment.
+	 */
 	async payOffer(
 		offerStr: string,
 		amountSats?: number,
-		timeoutMs = 60_000
+		timeoutMs = 60_000,
+		maxFeeSats?: number,
+		maxFeeMsatCap?: number | string,
+		onPaymentHash?: (paymentHash: string) => void
 	): Promise<PaymentInfo> {
 		// Paying an offer spends outbound liquidity exactly as payInvoice does,
 		// so it runs the same admission: drain mode, both spending limits, a
@@ -10814,6 +12300,13 @@ export class BeignetNode extends EventEmitter {
 		// go asking a payee for an invoice.
 		this._checkDraining();
 		const offer = decodeOfferInput(offerStr);
+
+		// Converted BEFORE the invoice request and before any reservation, as
+		// payInvoice does: a refused cap must leave nothing raised and must
+		// not have asked the payee for an invoice it will never pay (issue
+		// #474). The default cap is sized on the invoice's amount, which the
+		// payee has not priced yet, so it is resolved after the request.
+		const callerMaxFeeMsat = explicitMaxFeeMsat(maxFeeSats, maxFeeMsatCap);
 
 		// Request invoice from the offer. Guarded before BigInt(): a fractional
 		// amount threw an uncaught RangeError that shipped as a scrubbed 500
@@ -10827,53 +12320,52 @@ export class BeignetNode extends EventEmitter {
 				  }
 				: undefined;
 
-		const bolt12Invoice = await this.node.requestInvoice(offer, requestOptions);
+		const bolt12Invoice = await this.node
+			.requestInvoice(offer, requestOptions)
+			.catch((err: unknown) => {
+				// An offer for another chain.
+				if (err instanceof InvalidRequestError) {
+					throw new BeignetError(BeignetErrorCode.INVALID_OFFER, err.message);
+				}
+				throw err;
+			});
 		// Re-checked after the await: the request is a round trip to the payee,
 		// and it is the dispatch below, not the request above, that a drain
 		// started meanwhile has to stop.
 		this._checkDraining();
 		const paymentHashHex = bolt12Invoice.paymentHash.toString('hex');
+		onPaymentHash?.(paymentHashHex);
 
 		// What payBolt12Invoice will actually pay is the invoice's own amount:
 		// the payee prices the offer, and there is nothing else to pay (an
 		// amountless BOLT 12 invoice is refused outright). Admitting on the
 		// caller's amountSats instead is the precedence #528 removed from the
-		// BOLT 11 paths, so the shared helper decides it here too.
-		const spendAmountSats = paymentSpendSats(bolt12Invoice.amount, amountSats);
+		// BOLT 11 paths, so the same rule decides it here too. The fee cap on
+		// top of it is the caller's, or the default for that amount (#1008).
+		const payAmountMsat = bolt12Invoice.amount ?? requestOptions?.amount;
+		const maxFeeMsat =
+			callerMaxFeeMsat ?? defaultMaxFeeMsat(payAmountMsat ?? 0n);
 
-		if (spendAmountSats > 0) {
-			this._checkMaxPayment(spendAmountSats);
-			this._checkSpendLimit(spendAmountSats);
-			this._pendingSpendSats += spendAmountSats;
-		}
-
-		// This call owns the hash's spend accounting for as long as its own
-		// listener is installed, for the reason payInvoice's copy documents:
-		// the forwarding handler in create() would otherwise charge an async
-		// claim on this hash for the settlement the listener below records.
-		this._acquireBlockingPayment(paymentHashHex);
-
-		// One release shared by every exit, and idempotent, because more than
-		// one can run for a single payment (a timeout followed by a late
-		// payment:failed). Held for the whole in-flight window: it is what
-		// stops two concurrent offer payments both passing the daily limit
-		// before either records a spend.
-		let released = false;
-		const releaseReservation = (): void => {
-			if (spendAmountSats <= 0 || released) return;
-			released = true;
-			this._pendingSpendSats -= spendAmountSats;
-		};
+		// This attempt's claim on the daily budget, charged by the payment:sent
+		// handler in create() rather than by the listener below, for the
+		// reason payInvoice's copy documents (issue #977). Held for the whole
+		// in-flight window: it is what stops two concurrent offer payments
+		// both passing the daily limit before either is charged.
+		const claim = this._admitLightningSpend(
+			paymentHashHex,
+			payAmountMsat,
+			maxFeeMsat
+		);
 
 		return new Promise<PaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
-				releaseReservation();
-				this.node.failPayment(bolt12Invoice.paymentHash);
 				reject(
-					new BeignetError(
-						'PAYMENT_TIMEOUT',
-						`Payment timed out after ${timeoutMs}ms`
+					this._paymentTimeout(
+						bolt12Invoice.paymentHash,
+						'Payment',
+						timeoutMs,
+						claim
 					)
 				);
 			}, timeoutMs);
@@ -10882,26 +12374,21 @@ export class BeignetNode extends EventEmitter {
 				clearTimeout(timer);
 				this.node.removeListener('payment:sent', onSent);
 				this.node.removeListener('payment:failed', onFailed);
-				// Safe here rather than after the accounting below: the handler
-				// in create() is registered first, so it has already seen this
-				// same event and declined to charge for it.
-				this._releaseBlockingPayment(paymentHashHex);
 			};
 
 			const onSent = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					// Released before the spend is recorded, so a concurrent
-					// _checkSpendLimit never sees the same sats counted twice.
-					releaseReservation();
-					if (spendAmountSats > 0) this._recordSpend(spendAmountSats);
+					// Already charged by the handler in create(), which is
+					// registered first.
 					resolve(this.toPaymentInfo(info));
 				}
 			};
 			const onFailed = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					releaseReservation();
+					// The handler in create() ran first and released the claim
+					// if nothing is out for the hash any more.
 					const failDesc =
 						info.failureCode !== undefined
 							? describeFailureCode(info.failureCode)
@@ -10920,16 +12407,15 @@ export class BeignetNode extends EventEmitter {
 			this.node.on('payment:failed', onFailed);
 
 			try {
-				this.node.payBolt12Invoice(bolt12Invoice);
+				this.node.payBolt12Invoice(bolt12Invoice, undefined, maxFeeMsat);
 			} catch (err: unknown) {
 				cleanup();
 				// A payment that never started holds no capacity. Without this a
 				// refused dispatch (no route, a duplicate, a missing amount)
 				// ratcheted the counter up until the daily limit refused real
 				// payments, as it did on the BOLT 11 path (issue #474).
-				releaseReservation();
-				const msg = err instanceof Error ? err.message : String(err);
-				reject(new BeignetError('PAYMENT_FAILED', msg));
+				if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
+				reject(this._toBeignetPaymentError(err));
 			}
 		});
 	}
@@ -10957,9 +12443,52 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Invoices (List) ───────────────
 
+	/**
+	 * An invoice with its status: PAID on a completed receive for its hash,
+	 * from the in-memory record or, once that is pruned, the durable row
+	 * (issue #1063); EXPIRED past its expiry otherwise; PENDING until then.
+	 */
 	getInvoice(paymentHash: string): InvoiceInfo | null {
 		const inv = this.node.getInvoice(paymentHash);
 		if (!inv) return null;
+		const live = this.node.getPayment(Buffer.from(inv.paymentHash, 'hex'));
+		const paid = live
+			? settlesInvoice(live)
+			: settlesInvoice(this.storage.loadPayment(inv.paymentHash));
+		return this.toInvoiceInfo(inv, paid);
+	}
+
+	/**
+	 * Every invoice with its status, judged as getInvoice judges one. The
+	 * durable rows are read at most once per call, for the invoices the map
+	 * has no record of; a wallet polls this every few seconds, and a row
+	 * lookup per invoice would not scale with its history.
+	 */
+	listInvoices(): InvoiceInfo[] {
+		let durablePaid: Set<string> | undefined;
+		return this.node.listInvoices().map((inv) => {
+			const live = this.node.getPayment(Buffer.from(inv.paymentHash, 'hex'));
+			let paid: boolean;
+			if (live) {
+				paid = settlesInvoice(live);
+			} else {
+				if (!durablePaid) durablePaid = this.durablePaidHashes();
+				paid = durablePaid.has(inv.paymentHash);
+			}
+			return this.toInvoiceInfo(inv, paid);
+		});
+	}
+
+	/** The hashes whose durable row is a completed receive. */
+	private durablePaidHashes(): Set<string> {
+		const paid = new Set<string>();
+		for (const { paymentHash, payment } of this.storage.loadAllPayments()) {
+			if (settlesInvoice(payment)) paid.add(paymentHash);
+		}
+		return paid;
+	}
+
+	private toInvoiceInfo(inv: IInvoiceInfo, paid: boolean): InvoiceInfo {
 		const info: InvoiceInfo = {
 			bolt11: inv.bolt11,
 			paymentHash: inv.paymentHash
@@ -10970,13 +12499,7 @@ export class BeignetNode extends EventEmitter {
 		if (inv.description) info.description = inv.description;
 		if (inv.expiry !== undefined) info.expiry = inv.expiry;
 		if (inv.createdAt !== undefined) info.createdAt = inv.createdAt;
-		// Derive status
-		const payment = this.node.getPayment(Buffer.from(inv.paymentHash, 'hex'));
-		if (
-			payment &&
-			payment.status === 'COMPLETED' &&
-			payment.direction === 'INCOMING'
-		) {
+		if (paid) {
 			info.status = 'PAID';
 		} else if (
 			inv.createdAt !== undefined &&
@@ -10988,39 +12511,6 @@ export class BeignetNode extends EventEmitter {
 			info.status = 'PENDING';
 		}
 		return info;
-	}
-
-	listInvoices(): InvoiceInfo[] {
-		return this.node.listInvoices().map((inv) => {
-			const info: InvoiceInfo = {
-				bolt11: inv.bolt11,
-				paymentHash: inv.paymentHash
-			};
-			if (inv.amountMsat !== undefined) {
-				info.amountSats = Number(inv.amountMsat / 1000n);
-			}
-			if (inv.description) info.description = inv.description;
-			if (inv.expiry !== undefined) info.expiry = inv.expiry;
-			if (inv.createdAt !== undefined) info.createdAt = inv.createdAt;
-			// Derive status from payment map + expiry
-			const payment = this.node.getPayment(Buffer.from(inv.paymentHash, 'hex'));
-			if (
-				payment &&
-				payment.status === 'COMPLETED' &&
-				payment.direction === 'INCOMING'
-			) {
-				info.status = 'PAID';
-			} else if (
-				inv.createdAt !== undefined &&
-				inv.expiry !== undefined &&
-				Date.now() / 1000 > inv.createdAt + inv.expiry
-			) {
-				info.status = 'EXPIRED';
-			} else {
-				info.status = 'PENDING';
-			}
-			return info;
-		});
 	}
 
 	// ─────────────── Health ───────────────
@@ -11434,12 +12924,41 @@ export class BeignetNode extends EventEmitter {
 				BeignetErrorCode.INVALID_PARAMS,
 				'maxFeeSats must be a non-negative integer'
 			);
-		const result = await this.node.rebalanceChannel({
-			fromChannelId: Buffer.from(fromChannelId, 'hex'),
-			toChannelId: Buffer.from(toChannelId, 'hex'),
-			amountSats: BigInt(amountSats),
-			maxFeeSats: BigInt(maxFeeSats)
-		});
+		this._checkDraining();
+		// A shutdown waits on any backup in flight before the engine learns of
+		// it, so the engine would still send.
+		if (this.destroyed) {
+			throw new BeignetError(
+				BeignetErrorCode.NODE_DESTROYED,
+				'Node is shutting down; no new rebalances accepted'
+			);
+		}
+		// The amount comes back round the loop, so the fee is all a rebalance
+		// spends. The cap is charged before anything is sent, so a crash or a
+		// teardown with the HTLC still out leaves it charged. Once the outcome
+		// is known the day gets back what the route did not take, or all of
+		// it when the rebalance failed. A timed-out wait keeps the cap, since
+		// the HTLC can still settle.
+		this._checkSpendLimit(maxFeeSats);
+		this._recordSpend(maxFeeSats);
+		this._liveRebalanceChargeSats += maxFeeSats;
+		let spentSats = maxFeeSats;
+		let result: IRebalanceResult;
+		try {
+			result = await this.node.rebalanceChannel({
+				fromChannelId: Buffer.from(fromChannelId, 'hex'),
+				toChannelId: Buffer.from(toChannelId, 'hex'),
+				amountSats: BigInt(amountSats),
+				maxFeeSats: BigInt(maxFeeSats)
+			});
+			spentSats = spendLimitSats(result.feeMsat);
+		} catch (err) {
+			if (!(err instanceof PaymentWaitTimeoutError)) spentSats = 0;
+			throw err;
+		} finally {
+			if (!this.destroyed) this._refundSpend(maxFeeSats - spentSats);
+			this._liveRebalanceChargeSats -= maxFeeSats;
+		}
 		this.log('info', 'Rebalance completed', {
 			fromChannelId,
 			toChannelId,
@@ -11457,7 +12976,8 @@ export class BeignetNode extends EventEmitter {
 
 	/**
 	 * Execute the advisor's rebalance plan under the per-UTC-day fee budget
-	 * (persisted, so restarts cannot overspend the same day).
+	 * (persisted, so restarts cannot overspend the same day). The fees it
+	 * pays are charged to the daily spend limit too.
 	 */
 	async executeRebalances(
 		budgetSatsPerDay?: number
@@ -11471,9 +12991,50 @@ export class BeignetNode extends EventEmitter {
 				'budgetSatsPerDay must be a non-negative integer'
 			);
 		}
-		const summary = await this.node.executeRebalanceRecommendations({
-			budgetSatsPerDay
-		});
+		this._checkDraining();
+		// Charged up front as rebalanceChannel is, at the whole day's fee
+		// budget, which bounds what the run can spend whatever the advisor has
+		// already spent today.
+		const holdSats = this.node.rebalanceBudgetSatsPerDay(budgetSatsPerDay);
+		// With no budget given this is the configured autoRebalance one, which
+		// nothing has checked yet, and a NaN would poison the ledger.
+		if (!Number.isInteger(holdSats) || holdSats < 0) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'autoRebalance.budgetSatsPerDay must be a non-negative integer'
+			);
+		}
+		this._checkSpendLimit(holdSats);
+		this._recordSpend(holdSats);
+		this._liveRebalanceChargeSats += holdSats;
+		let spentSats = holdSats;
+		// The engine asks before each plan. A refusal before the first ask
+		// sent nothing, but a throw after it (a log listener, say) can follow
+		// a paid rebalance, so the whole charge stands then.
+		let reachedPlans = false;
+		let summary: IRebalanceExecutionSummary;
+		try {
+			summary = await this.node.executeRebalanceRecommendations({
+				budgetSatsPerDay,
+				stopRequested: () => {
+					reachedPlans = true;
+					// A shutdown sets destroyed without draining, and reaches the
+					// engine only after any backup in flight has finished.
+					return this._draining || this.destroyed;
+				}
+			});
+			spentSats = spendLimitSats(summary.feeSpentMsat);
+		} catch (err) {
+			if (!reachedPlans) spentSats = 0;
+			throw err;
+		} finally {
+			// A teardown can cut a wait short with its HTLC out, which the
+			// summary does not count, so the whole charge stands then. A run
+			// that crossed midnight, where the engine's budget started over,
+			// leaves the new day charged all it spent.
+			if (!this.destroyed) this._refundSpend(holdSats - spentSats);
+			this._liveRebalanceChargeSats -= holdSats;
+		}
 		return {
 			attempts: summary.attempts.map((a) => ({
 				fromChannelId: a.fromChannelId,
@@ -11506,11 +13067,18 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── Route Estimation & Probing ───────────────
 
 	estimateRouteFee(bolt11: string, amountSats?: number): RouteEstimate | null {
-		return this.node.estimateRouteFee(bolt11, amountSats);
+		const estimate = this.node.estimateRouteFee(bolt11, amountSats);
+		if (!estimate) return null;
+		return { ...estimate, feeMsat: estimate.feeMsat.toString() };
 	}
 
 	estimatePayment(bolt11: string, amountSats?: number): PaymentEstimate | null {
-		return this.node.estimatePayment(bolt11, amountSats);
+		const estimate = this.node.estimatePayment(bolt11, amountSats);
+		if (!estimate) return null;
+		return {
+			...estimate,
+			estimatedFeeMsat: estimate.estimatedFeeMsat.toString()
+		};
 	}
 
 	probeRoute(
@@ -11519,13 +13087,18 @@ export class BeignetNode extends EventEmitter {
 	): {
 		success: boolean;
 		feeSats?: number;
+		feeMsat?: string;
 		hops?: number;
 		path?: Array<{ pubkey: string; shortChannelId: string }>;
 	} {
-		const result = this.node.probeRoute(destination, amountSats);
-		if (!result.path) return result;
+		const { feeMsat, ...result } = this.node.probeRoute(
+			destination,
+			amountSats
+		);
+		if (feeMsat === undefined || !result.path) return result;
 		return {
 			...result,
+			feeMsat: feeMsat.toString(),
 			path: result.path.map((hop) => ({
 				pubkey: hop.pubkey,
 				shortChannelId: formatScid(Buffer.from(hop.shortChannelId, 'hex'))
@@ -11708,6 +13281,13 @@ export class BeignetNode extends EventEmitter {
 	/**
 	 * Send a payment along an explicit route (from queryRoute / POST
 	 * /route/query). paymentSecret is required by most modern invoices.
+	 *
+	 * Admitted like every other pay path (issue #1017): drain mode, the
+	 * per-payment and daily limits, and a claim on the daily budget, all on
+	 * what the first hop carries, which is exactly what leaves this node. No
+	 * fee cap sits on top, since the route spells its fee out. Before this
+	 * the route ran only the drain check, and its settlement, finding no
+	 * claim, was never charged.
 	 */
 	sendToRoute(
 		paymentHash: string,
@@ -11738,16 +13318,39 @@ export class BeignetNode extends EventEmitter {
 		this._checkDraining();
 		const hops = jsonToRouteHops(route.hops);
 		const finalHop = hops[hops.length - 1];
+		// The claim is keyed the way the settlement will look it up: the
+		// engine reports the hash as lowercase hex, and the regex above admits
+		// uppercase.
+		const paymentHashHex = paymentHash.toLowerCase();
+		// The wire amount is what the first hop is asked to carry.
+		const sentMsat = hops[0].amountToForwardMsat;
+		if (sentMsat < finalHop.amountToForwardMsat) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'route.hops[0].amountToForwardMsat must cover the final hop: the first hop carries the amount plus every fee'
+			);
+		}
+		// The engine records the route it is handed, so the totals ride along
+		// and the record reports a real fee rather than NaN.
+		const wireRoute = {
+			hops,
+			totalAmountMsat: sentMsat,
+			totalFeeMsat: sentMsat - finalHop.amountToForwardMsat,
+			totalCltvDelta: hops[0].outgoingCltvValue
+		};
+		const claim = this._admitLightningSpend(paymentHashHex, sentMsat, 0n);
+		let payment: IPaymentInfo;
 		try {
-			const payment = this.node.sendPaymentToRoute(
-				{ hops },
-				Buffer.from(paymentHash, 'hex'),
+			payment = this.node.sendPaymentToRoute(
+				wireRoute,
+				Buffer.from(paymentHashHex, 'hex'),
 				finalHop.outgoingCltvValue,
 				paymentSecret ? Buffer.from(paymentSecret, 'hex') : undefined,
 				finalHop.amountToForwardMsat
 			);
-			return this.toPaymentInfo(payment);
 		} catch (err) {
+			// A payment that never started holds no capacity (issue #474).
+			if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
 			if (err instanceof BeignetError) throw err;
 			// Surface library payment errors (NO_CHANNEL_TO_HOP, ...) by code
 			const code =
@@ -11759,6 +13362,14 @@ export class BeignetNode extends EventEmitter {
 				err instanceof Error ? err.message : String(err)
 			);
 		}
+		// A refusal the engine reports by return dispatched nothing, so the
+		// reservation goes; the record stays, as sendPaymentAsync's does. A
+		// settlement inside the call was charged by the handler in create(),
+		// which found the claim under this hash.
+		if (claim && payment.status === PaymentStatus.FAILED) {
+			this._releaseAsyncSpendClaim(claim);
+		}
+		return this.toPaymentInfo(payment);
 	}
 
 	// ─────────────── Channel Readiness Helpers ───────────────
@@ -11846,22 +13457,239 @@ export class BeignetNode extends EventEmitter {
 		paymentHash: string,
 		metadata: Record<string, string>
 	): void {
-		this.node.setPaymentMetadata(Buffer.from(paymentHash, 'hex'), metadata);
+		try {
+			this.node.setPaymentMetadata(Buffer.from(paymentHash, 'hex'), metadata);
+		} catch (err: unknown) {
+			if (err instanceof InvalidRequestError) {
+				throw new BeignetError(BeignetErrorCode.INVALID_PARAMS, err.message);
+			}
+			throw err;
+		}
 	}
 
 	// ─────────────── Payment Queue ───────────────
 
-	private getPaymentQueue(): PaymentQueue {
+	/**
+	 * How a payment the payment queue was dispatching ended, from this
+	 * node's own record for its invoice: one the process stopped during
+	 * (issue #967), or one whose HTLC was still out when the queue's own
+	 * payment timeout fired (issue #976). The queue's resolver for such an
+	 * entry: it must know this before sending the invoice again or recording
+	 * a verdict. The engine refuses to pay a hash that was paid or still has
+	 * an HTLC out (#975), so a re-send can no longer pay twice, but it would
+	 * come back from payInvoiceSafe as the old record, PENDING while its
+	 * HTLC is out; this resolver waits for the outcome instead.
+	 *
+	 * Resolves once every HTLC the node offered for the hash is terminal,
+	 * which for one stuck at a peer can take until its expiry. 'completed'
+	 * when the preimage is known or the record says COMPLETED; 'unpaid'
+	 * otherwise, since the PENDING record is committed before any HTLC is
+	 * offered and the HTLC view covers offered HTLCs even without a record:
+	 * resolved with no preimage means nothing was paid. The in-memory record
+	 * and preimage are pruned 24 hours after completion (and oldest first past
+	 * the size cap), and the cleanup tick can run before this does, so the
+	 * durable record is read before answering 'unpaid': pruning leaves it on
+	 * disk. Throws while there is no node to ask (restore pending, a capsule
+	 * restore rebuilding it, a restart required, destroyed) or the durable
+	 * record cannot be read; the queue then leaves the entry for the next
+	 * start.
+	 */
+	async resolveInterruptedPayment(
+		bolt11: string
+	): Promise<InterruptedPaymentOutcome> {
+		if (this.destroyed) {
+			throw new BeignetError(
+				BeignetErrorCode.NODE_DESTROYED,
+				'Node is shut down; an interrupted payment is settled at the next start'
+			);
+		}
+		if (this._restorePending || this._resuming) {
+			throw new BeignetError(
+				'NODE_RESTORE_PENDING',
+				'No node is running yet to settle an interrupted payment against'
+			);
+		}
+		if (this._restartRequired) {
+			throw new BeignetError(
+				'NODE_RESTART_REQUIRED',
+				'A capsule restore replaced this database; an interrupted payment ' +
+					'is settled after the restart'
+			);
+		}
+		let paymentHash: Buffer;
+		try {
+			// The decoder sendPayment uses. A string it cannot decode never
+			// reached an HTLC, and sending it again fails it as before.
+			paymentHash = decodeInvoice(bolt11).paymentHash;
+		} catch {
+			return { status: 'unpaid' };
+		}
+		const hashHex = paymentHash.toString('hex');
+		const view = await this.node.awaitPaymentResolution(paymentHash);
+		if (view.preimage || view.status === PaymentStatus.COMPLETED) {
+			return { status: 'completed', paymentHash: hashHex };
+		}
+		// Only an OUTGOING record counts: the preimage store alone also holds
+		// this node's own invoices' preimages. A read that throws propagates,
+		// so the entry waits rather than being sent on a guess.
+		const durable = this.storage.loadPayment(hashHex);
+		if (
+			durable?.direction === PaymentDirection.OUTGOING &&
+			(durable.status === PaymentStatus.COMPLETED ||
+				durable.preimage !== undefined)
+		) {
+			return { status: 'completed', paymentHash: hashHex };
+		}
+		return { status: 'unpaid' };
+	}
+
+	/**
+	 * True when a new HTLC can go out now: some channel accepts one, or no
+	 * channel can ever come to (none at all, or only closing, closed or held
+	 * ones), where waiting would never end and a payment fails on its own
+	 * terms (issue #967).
+	 */
+	private canCarryHtlc(): boolean {
+		const live = this.node
+			.getChannelManager()
+			.listChannels()
+			.filter(canBecomeUsable);
+		return live.length === 0 || live.some((ch) => ch.acceptsNewHtlcs());
+	}
+
+	/**
+	 * Run `run` once this node can pay: after a pending guardian restore has
+	 * built the node, once the node is ready, and once some channel can carry
+	 * an HTLC. node:ready alone comes after the peers' init handshakes and
+	 * before any channel_reestablish, when every restored channel still
+	 * refuses new HTLCs: a payment sent then fails for want of a route, and
+	 * one held back by canSend waits for the next enqueue. Never while a
+	 * capsule restore rebuilds the node or a restart is required, and never
+	 * after shutdown. The payment queues start here (issue #967).
+	 */
+	whenReadyToPay(run: () => void): void {
+		if (this.destroyed) return;
+		if (this._restorePending) {
+			// Shutdown removes every listener, so this cannot outlive the node.
+			this.once('recovery:restored', () => this.whenReadyToPay(run));
+			return;
+		}
+		if (this._resuming || this._restartRequired) return;
+		const node = this.node;
+		// Bound to the node it was asked about: a capsule restore that
+		// rebuilds the node retires the wait.
+		const live = (): boolean =>
+			!this.destroyed &&
+			!this._resuming &&
+			!this._restartRequired &&
+			this.node === node;
+		let ready: Promise<void>;
+		try {
+			ready = node.waitForReady(BeignetNode.MAX_TIMER_MS);
+		} catch {
+			return;
+		}
+		ready
+			.then(
+				() => {
+					if (!live()) return;
+					if (this.canCarryHtlc()) {
+						run();
+						return;
+					}
+					// Looked at again when a channel becomes usable, and when one
+					// closes or goes away, which can leave no live channel.
+					// Shutdown removes every listener, so this cannot outlive
+					// the node; a retired wait removes itself on the next event.
+					const recheck = (): void => {
+						if (live() && !this.canCarryHtlc()) return;
+						this.removeListener('channel:usable', recheck);
+						this.removeListener(CHANNELS_CHANGED, recheck);
+						if (live()) run();
+					};
+					this.on('channel:usable', recheck);
+					this.on(CHANNELS_CHANGED, recheck);
+				},
+				() => {
+					// Destroyed (a shutdown, or a capsule restore rebuilding the
+					// node) before it was ready: nothing to start.
+				}
+			)
+			.catch((err: unknown) => {
+				try {
+					this.log('warn', 'Starting the payment queue failed', {
+						error: err instanceof Error ? err.message : String(err)
+					});
+				} catch {
+					// A throwing log listener must not become an unhandled
+					// rejection either.
+				}
+			});
+	}
+
+	/**
+	 * The one payment queue this process runs over the payment_queue table
+	 * (issue #978), built on first use. The daemon's routes under /queue and
+	 * enqueuePayment/listQueue/cancelQueuedPayment all serve this instance:
+	 * a second queue over the same table would restore and dispatch the same
+	 * rows. It persists through the node's CURRENT storage, so it survives an
+	 * in-process capsule resume that replaces the database.
+	 */
+	getPaymentQueue(): PaymentQueue {
 		if (!this.paymentQueue) {
 			this.paymentQueue = new PaymentQueue(
 				(bolt11, timeout, maxFee, amount, meta) =>
 					this.payInvoiceSafe(bolt11, timeout, maxFee, amount, meta),
-				(amount) => this.canSend(amount),
-				undefined,
-				this.storage
+				// No node yet (a guardian restore pending): no capacity, for
+				// now, rather than a throw (issue #967).
+				(amount) =>
+					(this.node as LightningNode | undefined)
+						? this.canSend(amount)
+						: { canSend: false, availableSats: 0 },
+				{
+					// A restored entry that was in flight is settled against
+					// the node's record before anything sends it again (issue
+					// #967).
+					resolveInterrupted: (b) => this.resolveInterruptedPayment(b),
+					// The capacity check for an entry whose amount is only in
+					// its invoice uses that amount, rounded up to whole sats
+					// as payInvoice admits it (issue #981). A string that does
+					// not decode throws, which the queue takes as no amount.
+					invoiceAmountSats: (b) =>
+						paymentSpendSats(decodeInvoiceInput(b).amountMsat)
+				},
+				this.liveQueueStorage()
 			);
+			// First built after shutdown began, while the database stays open
+			// for the wallet: the rows it restored must not dispatch against
+			// the stopped node and persist 'failed' (issue #958). Otherwise
+			// they dispatch once the node can pay, not on the next enqueue(),
+			// and one held back by canSend is looked at again whenever a
+			// channel can carry HTLCs again (issue #967).
+			if (this.destroyed) {
+				this.paymentQueue.stop();
+			} else {
+				this.whenReadyToPay(() => this.paymentQueue?.start());
+				this.on('channel:usable', () => this.paymentQueue?.poke());
+			}
 		}
 		return this.paymentQueue;
+	}
+
+	/**
+	 * The payment queue's view of storage: this.storage on every call, never
+	 * the handle the queue was built over. A capsule resume closes that
+	 * handle and installs a new one, and a write to the closed one throws
+	 * (issue #978).
+	 */
+	private liveQueueStorage(): IPaymentQueueStorage {
+		return {
+			saveQueueEntry: (entry) => this.storage.saveQueueEntry(entry),
+			updateQueueEntryStatus: (id, status, error, completedAt) =>
+				this.storage.updateQueueEntryStatus(id, status, error, completedAt),
+			deleteQueueEntry: (id) => this.storage.deleteQueueEntry(id),
+			loadAllQueueEntries: () => this.storage.loadAllQueueEntries()
+		};
 	}
 
 	enqueuePayment(
@@ -12071,14 +13899,32 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Database Backup ───────────────
 
+	/** Back up the database to `destPath`, with its MAC in backupMacPath(destPath). */
 	async backup(destPath: string): Promise<void> {
 		await this.storage.backup(destPath);
+		await writeBackupMac(
+			deriveBackupMacKey(bip39.mnemonicToSeedSync(this.mnemonic)),
+			destPath
+		);
+	}
+
+	/** The live database, its sidecars and the instance lock. */
+	storageFiles(): string[] {
+		const dbPath = fs.realpathSync.native(
+			path.join(this.dataDir, `${this.networkName}.db`)
+		);
+		return [
+			dbPath,
+			`${dbPath}-wal`,
+			`${dbPath}-shm`,
+			`${dbPath}-journal`,
+			path.join(this.dataDir, `${this.networkName}.lock`)
+		];
 	}
 
 	private performScheduledBackup(): void {
 		if (!this.backupPath || this.destroyed) return;
-		this._backupPromise = this.storage
-			.backup(this.backupPath)
+		this._backupPromise = this.backup(this.backupPath)
 			.then(() => {
 				this.log('info', 'Scheduled backup completed', {
 					path: this.backupPath
@@ -12133,9 +13979,9 @@ export class BeignetNode extends EventEmitter {
 		const encoded = encodeScb(backup, seed);
 		const scbPath = path.join(this.dataDir, 'channels.scb');
 		// Atomic write: a crash mid-write must never leave a truncated backup.
-		const tmpPath = `${scbPath}.tmp`;
-		fs.writeFileSync(tmpPath, encoded);
-		fs.renameSync(tmpPath, scbPath);
+		// Owner-only: the blob is seed-encrypted, but it still names every
+		// channel and peer of this wallet (issue #1004).
+		writeFileAtomic(scbPath, encoded);
 		return { encoded, channelCount: data.channels.length, path: scbPath };
 	}
 
@@ -12462,7 +14308,11 @@ export class BeignetNode extends EventEmitter {
 		return this.node;
 	}
 
-	/** Access the underlying SqliteStorage — used by daemon for webhook/queue persistence. */
+	/**
+	 * The node's current SqliteStorage. An in-process capsule resume closes
+	 * it and installs a new one, so anything that persists through it reads
+	 * this on every call instead of keeping the handle (issue #978).
+	 */
 	getStorage(): SqliteStorage {
 		return this.storage;
 	}
@@ -12486,6 +14336,11 @@ export class BeignetNode extends EventEmitter {
 			clearInterval(this._fallbackRecoveryTimer);
 			this._fallbackRecoveryTimer = undefined;
 		}
+		if (this._autoRebalanceTimer) {
+			clearInterval(this._autoRebalanceTimer);
+			this._autoRebalanceTimer = undefined;
+		}
+		this.paymentQueue?.stop();
 		this.paymentQueue?.removeAllListeners();
 		this.directFundingSender?.stop();
 		if (this._confirmTimer) {
@@ -12500,16 +14355,18 @@ export class BeignetNode extends EventEmitter {
 				/* best-effort: backup errors already surface via backup:failed */
 			});
 		}
-		// A restore-pending daemon never built the node or the wallet.
-		await (this.node as LightningNode | undefined)?.gracefulShutdown(timeoutMs);
-		this.storage.close();
-		this.removeAllListeners();
+		// A restore-pending daemon never built the node or the wallet. The
+		// node closes only its view of the database: the wallet writes
+		// through the database too, and its stop() waits for a refresh in
+		// flight and its queued writes. The node stops first, since its chain
+		// backend and funding provider use the wallet (issue #958).
 		try {
-			await (this.wallet as Wallet | undefined)?.stop();
-		} catch {
-			// Ignore shutdown errors
+			await (this.node as LightningNode | undefined)?.gracefulShutdown(
+				timeoutMs
+			);
+		} finally {
+			await this.stopWalletAndCloseStorage();
 		}
-		this.releaseLock();
 	}
 
 	async destroy(): Promise<void> {
@@ -12535,23 +14392,54 @@ export class BeignetNode extends EventEmitter {
 			clearInterval(this._fallbackRecoveryTimer);
 			this._fallbackRecoveryTimer = undefined;
 		}
+		if (this._autoRebalanceTimer) {
+			clearInterval(this._autoRebalanceTimer);
+			this._autoRebalanceTimer = undefined;
+		}
 		if (this._confirmTimer) {
 			clearTimeout(this._confirmTimer);
 			this._confirmTimer = undefined;
 		}
 		this.stopRecoveryLeaseCheck();
 		this.clearAutoApplyTimers();
+		this.paymentQueue?.stop();
 		this.paymentQueue?.removeAllListeners();
 		this.directFundingSender?.stop();
 		// A restore-pending daemon never built the node or the wallet; the
 		// definite-assignment assertions on the fields do not change that.
-		(this.node as LightningNode | undefined)?.destroy();
-		this.storage.close();
+		// The node closes only its view of the database, as in
+		// gracefulShutdown (issue #958).
+		try {
+			(this.node as LightningNode | undefined)?.destroy();
+		} finally {
+			await this.stopWalletAndCloseStorage();
+		}
+	}
+
+	/**
+	 * The shared tail of gracefulShutdown and destroy, run after the node
+	 * has stopped and fenced its view of the database: the wallet, then the
+	 * database, then the lock. The wallet stops before the close so the
+	 * writes its stop() waits for land (issue #958). Listeners go first, so
+	 * nothing the wallet reports while it stops reaches the daemon's SSE or
+	 * webhook subscribers.
+	 */
+	private async stopWalletAndCloseStorage(): Promise<void> {
+		// The node's destroy() fences its view in its own close. A teardown
+		// step that throws before that close would leave every reference the
+		// node's subsystems hold writable while the wallet stops, so fence it
+		// here too. The close is idempotent (issue #958).
+		this._nodeStorageView?.close();
 		this.removeAllListeners();
 		try {
 			await (this.wallet as Wallet | undefined)?.stop();
 		} catch {
 			// Ignore shutdown errors
+		}
+		try {
+			this.storage.close();
+		} catch {
+			// best-effort: the lock must still be released
 		}
 		this.releaseLock();
 	}

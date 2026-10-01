@@ -30,6 +30,7 @@ import {
 	validatePsbtSignature,
 	Wallet
 } from '../src';
+import { getDefaultSendTransaction } from '../src/shapes/wallet';
 import { startDaemon } from '../src/cli/daemon';
 import { BeignetNode } from '../src/cli/beignet-node';
 import { BeignetError } from '../src/cli/errors';
@@ -129,6 +130,40 @@ const signExternally = (psbtBase64: string): string => {
 		}
 	}
 	return psbt.toBase64();
+};
+
+/** Index of the output that does not pay RECIPIENT: the change. */
+const changeIndexOf = (psbt: bitcoin.Psbt): number => {
+	const index = psbt.txOutputs.findIndex((o) => o.address !== RECIPIENT);
+	expect(index, 'change output').to.not.equal(-1);
+	return index;
+};
+
+/** Rebuilds a PSBT with one output paying a different script, keeping every
+ *  input and its signer metadata: what a compromised host or transport hands
+ *  the signer. */
+const rewriteOutput = (
+	psbtBase64: string,
+	outputIndex: number,
+	script: Buffer
+): string => {
+	const built = bitcoin.Psbt.fromBase64(psbtBase64, { network: regtest });
+	const tampered = new bitcoin.Psbt({ network: regtest });
+	built.txInputs.forEach((txInput, i) => {
+		tampered.addInput({
+			hash: txInput.hash,
+			index: txInput.index,
+			sequence: txInput.sequence,
+			...built.data.inputs[i]
+		});
+	});
+	built.txOutputs.forEach((output, i) => {
+		tampered.addOutput({
+			script: i === outputIndex ? script : output.script,
+			value: output.value
+		});
+	});
+	return tampered.toBase64();
 };
 
 const createWallet = async (
@@ -242,6 +277,86 @@ describe('External-Signer PSBT Flow', function () {
 			});
 		});
 
+		it('marks the change output with its bip32Derivation and leaves the recipient bare', async () => {
+			const res = await wallet.buildPsbt({
+				address: RECIPIENT,
+				amount: 50000,
+				satsPerByte: 2,
+				shuffleOutputs: false
+			});
+			if (res.isErr()) throw res.error;
+			const psbt = bitcoin.Psbt.fromBase64(res.value.psbtBase64, {
+				network: regtest
+			});
+			const recipientIndex = psbt.txOutputs.findIndex(
+				(o) => o.address === RECIPIENT
+			);
+			expect(psbt.data.outputs[recipientIndex].bip32Derivation).to.be.undefined;
+			const changeIndex = changeIndexOf(psbt);
+			const derivation = psbt.data.outputs[changeIndex].bip32Derivation;
+			expect(derivation).to.have.length(1);
+			expect(derivation![0].path).to.match(/^m\/84'\/1'\/0'\/1\/\d+$/);
+			expect(derivation![0].masterFingerprint.toString('hex')).to.equal(
+				Buffer.from(root.fingerprint).toString('hex')
+			);
+			// The derivation must produce the very script the output pays.
+			const p2wpkh = bitcoin.payments.p2wpkh({
+				pubkey: root.derivePath(derivation![0].path).publicKey,
+				network: regtest
+			});
+			expect(
+				p2wpkh.output!.equals(psbt.txOutputs[changeIndex].script)
+			).to.equal(true);
+		});
+
+		it('marks the change output generated for a wallet with no change index yet', async () => {
+			const res = await Wallet.create({
+				mnemonic: MNEMONIC,
+				network,
+				addressType: EAddressType.p2wpkh,
+				electrumOptions,
+				disableRefreshOnCreate: true
+			});
+			if (res.isErr()) throw res.error;
+			const freshWallet = res.value;
+			createdWallets.push(freshWallet);
+			expect(freshWallet.data.changeAddressIndex.p2wpkh.address).to.equal('');
+			const psbtRes = await freshWallet.transaction.createUnsignedPsbt({
+				transactionData: {
+					...getDefaultSendTransaction(),
+					inputs: [await makeUtxo(freshWallet, { index: 0, value: 60000 })],
+					outputs: [{ address: RECIPIENT, value: 20000, index: 0 }],
+					fee: 500
+				},
+				shuffleOutputs: false
+			});
+			if (psbtRes.isErr()) throw psbtRes.error;
+			const psbt = psbtRes.value;
+			const derivation = psbt.data.outputs[changeIndexOf(psbt)].bip32Derivation;
+			expect(derivation).to.have.length(1);
+			expect(derivation![0].path).to.equal("m/84'/1'/0'/1/0");
+
+			// Change of another type, also generated on the fly.
+			const p2trChange = await freshWallet.getChangeAddress(EAddressType.p2tr);
+			if (p2trChange.isErr()) throw p2trChange.error;
+			const p2trRes = await freshWallet.transaction.createUnsignedPsbt({
+				transactionData: {
+					...getDefaultSendTransaction(),
+					inputs: [await makeUtxo(freshWallet, { index: 0, value: 60000 })],
+					outputs: [{ address: RECIPIENT, value: 20000, index: 0 }],
+					changeAddress: p2trChange.value.address,
+					fee: 500
+				},
+				shuffleOutputs: false
+			});
+			if (p2trRes.isErr()) throw p2trRes.error;
+			const tapDerivation =
+				p2trRes.value.data.outputs[changeIndexOf(p2trRes.value)]
+					.tapBip32Derivation;
+			expect(tapDerivation).to.have.length(1);
+			expect(tapDerivation![0].path).to.equal("m/86'/1'/0'/1/0");
+		});
+
 		it('includes redeemScript for p2sh-p2wpkh inputs', async () => {
 			const p2shWallet = await createWallet(EAddressType.p2sh);
 			p2shWallet.data.utxos.push(
@@ -263,6 +378,19 @@ describe('External-Signer PSBT Flow', function () {
 			});
 			expect(psbt.data.inputs[0].redeemScript).to.not.be.undefined;
 			expect(psbt.data.inputs[0].bip32Derivation).to.have.length(1);
+			const changeIndex = changeIndexOf(psbt);
+			const change = psbt.data.outputs[changeIndex];
+			const p2sh = bitcoin.payments.p2sh({
+				redeem: bitcoin.payments.p2wpkh({
+					pubkey: root.derivePath(change.bip32Derivation![0].path).publicKey,
+					network: regtest
+				}),
+				network: regtest
+			});
+			expect(change.redeemScript!.equals(p2sh.redeem!.output!)).to.equal(true);
+			expect(p2sh.output!.equals(psbt.txOutputs[changeIndex].script)).to.equal(
+				true
+			);
 		});
 
 		it('includes nonWitnessUtxo for legacy p2pkh inputs', async () => {
@@ -304,6 +432,9 @@ describe('External-Signer PSBT Flow', function () {
 				});
 				expect(psbt.data.inputs[0].nonWitnessUtxo).to.not.be.undefined;
 				expect(psbt.data.inputs[0].bip32Derivation).to.have.length(1);
+				expect(
+					psbt.data.outputs[changeIndexOf(psbt)].bip32Derivation
+				).to.have.length(1);
 			} finally {
 				electrum.getTransactions = originalGetTransactions;
 			}
@@ -341,6 +472,15 @@ describe('External-Signer PSBT Flow', function () {
 			expect(input.tapBip32Derivation![0].pubkey.toString('hex')).to.equal(
 				expected
 			);
+			const change = psbt.data.outputs[changeIndexOf(psbt)];
+			expect(change.tapBip32Derivation).to.have.length(1);
+			const changePath = change.tapBip32Derivation![0].path;
+			expect(changePath).to.match(/^m\/86'\/1'\/0'\/1\/\d+$/);
+			expect(
+				change.tapInternalKey!.equals(
+					root.derivePath(changePath).publicKey.subarray(1)
+				)
+			).to.equal(true);
 		});
 
 		it('fails when there are no UTXOs', async () => {
@@ -440,6 +580,105 @@ describe('External-Signer PSBT Flow', function () {
 		it('rejects garbage input', () => {
 			expect(watchOnly.importSignedPsbt('not-a-psbt').isErr()).to.equal(true);
 			expect(watchOnly.importSignedPsbt('').isErr()).to.equal(true);
+		});
+
+		it('rejects a validly signed PSBT whose change output was rewritten', () => {
+			const built = bitcoin.Psbt.fromBase64(builtBase64, { network: regtest });
+			const attacker = bitcoin.payments.p2wpkh({
+				pubkey: bip32.fromSeed(Buffer.alloc(32, 9), regtest).publicKey,
+				network: regtest
+			}).output!;
+			const signed = signExternally(
+				rewriteOutput(builtBase64, changeIndexOf(built), attacker)
+			);
+			const res = watchOnly.importSignedPsbt(signed);
+			expect(res.isErr()).to.equal(true);
+			if (res.isErr()) {
+				expect(res.error.message).to.include(
+					'does not match any this wallet built'
+				);
+			}
+		});
+
+		it('rejects a PSBT whose input claims a different previous output', () => {
+			const psbt = bitcoin.Psbt.fromBase64(builtBase64, { network: regtest });
+			psbt.data.inputs[0].witnessUtxo!.value -= 1000;
+			const res = watchOnly.importSignedPsbt(signExternally(psbt.toBase64()));
+			expect(res.isErr()).to.equal(true);
+			if (res.isErr()) {
+				expect(res.error.message).to.include(
+					'Input 0 claims a different previous output'
+				);
+			}
+		});
+
+		it('rejects an input whose witnessUtxo and nonWitnessUtxo disagree', () => {
+			const key = root.derivePath("m/84'/1'/0'/0/0");
+			const script = bitcoin.payments.p2wpkh({
+				pubkey: key.publicKey,
+				network: regtest
+			}).output!;
+			const parent = new bitcoin.Transaction();
+			parent.addInput(Buffer.alloc(32, 7), 0);
+			parent.addOutput(script, 10000);
+			const unsigned = new bitcoin.Psbt({ network: regtest });
+			unsigned.addInput({
+				hash: parent.getId(),
+				index: 0,
+				witnessUtxo: { script, value: 9000 }
+			});
+			unsigned.addOutput({ script, value: 8000 });
+			const signed = bitcoin.Psbt.fromBase64(unsigned.toBase64(), {
+				network: regtest
+			});
+			signed.updateInput(0, { nonWitnessUtxo: parent.toBuffer() });
+			signed.signInput(0, key);
+			const res = watchOnly.importSignedPsbt(
+				signed.toBase64(),
+				unsigned.toBase64()
+			);
+			expect(res.isErr()).to.equal(true);
+			if (res.isErr()) {
+				expect(res.error.message).to.include('two different records');
+			}
+		});
+
+		it('rejects an input the signer already finalized', () => {
+			const psbt = bitcoin.Psbt.fromBase64(signExternally(builtBase64), {
+				network: regtest
+			});
+			psbt.finalizeAllInputs();
+			const res = watchOnly.importSignedPsbt(psbt.toBase64());
+			expect(res.isErr()).to.equal(true);
+			if (res.isErr()) {
+				expect(res.error.message).to.include('Input 0 is already finalized');
+			}
+		});
+
+		it('another instance imports only against the unsigned PSBT', async () => {
+			const other = await createWatchOnlyWallet();
+			const signed = signExternally(builtBase64);
+			const refused = other.importSignedPsbt(signed);
+			expect(refused.isErr()).to.equal(true);
+			if (refused.isErr()) {
+				expect(refused.error.message).to.include('built elsewhere');
+			}
+			const imported = other.importSignedPsbt(signed, builtBase64);
+			if (imported.isErr()) throw imported.error;
+			const tampered = signExternally(
+				rewriteOutput(
+					builtBase64,
+					0,
+					Buffer.from('0014' + '11'.repeat(20), 'hex')
+				)
+			);
+			const res = other.importSignedPsbt(tampered, builtBase64);
+			expect(res.isErr()).to.equal(true);
+			if (res.isErr()) {
+				expect(res.error.message).to.include(
+					'does not spend the same inputs to the same outputs'
+				);
+			}
 		});
 
 		it('broadcastTransaction is exposed and fails gracefully offline', async () => {
@@ -651,6 +890,72 @@ describe('Daemon PSBT routes (offline validation paths)', function () {
 		expect(res.body.ok).to.equal(false);
 		expect((res.body.error as { code: string }).code).to.equal(
 			'PSBT_IMPORT_FAILED'
+		);
+	});
+
+	it('POST /psbt/import-signed imports a PSBT it does not remember only against the unsigned PSBT', async () => {
+		// Stands in for a PSBT built before a daemon restart: the node has no
+		// record of it.
+		const key = bip32
+			.fromSeed(bip39.mnemonicToSeedSync(MNEMONIC), regtest)
+			.derivePath("m/84'/1'/0'/0/0");
+		const script = bitcoin.payments.p2wpkh({
+			pubkey: key.publicKey,
+			network: regtest
+		}).output!;
+		const buildUnsigned = (outputValue: number): bitcoin.Psbt => {
+			const psbt = new bitcoin.Psbt({ network: regtest });
+			psbt.addInput({
+				hash: Buffer.alloc(32, 5),
+				index: 0,
+				witnessUtxo: { script, value: 10000 }
+			});
+			psbt.addOutput({ address: RECIPIENT, value: outputValue });
+			return psbt;
+		};
+		const unsigned = buildUnsigned(9000);
+		const unsignedBase64 = unsigned.toBase64();
+		const signed = unsigned.signInput(0, key).toBase64();
+
+		const refused = await httpJson('POST', '/psbt/import-signed', {
+			psbtBase64: signed
+		});
+		expect(refused.body.ok).to.equal(false);
+		expect((refused.body.error as { message: string }).message).to.include(
+			'does not match any this wallet built'
+		);
+
+		const mismatched = await httpJson('POST', '/psbt/import-signed', {
+			psbtBase64: signed,
+			unsignedPsbtBase64: buildUnsigned(8000).toBase64()
+		});
+		expect(mismatched.body.ok).to.equal(false);
+		expect((mismatched.body.error as { message: string }).message).to.include(
+			'does not spend the same inputs to the same outputs'
+		);
+
+		const imported = await httpJson('POST', '/psbt/import-signed', {
+			psbtBase64: signed,
+			unsignedPsbtBase64: unsignedBase64
+		});
+		expect(imported.body.ok).to.equal(true);
+		const { txid, txHex } = imported.body.result as {
+			txid: string;
+			txHex: string;
+		};
+		const tx = bitcoin.Transaction.fromHex(txHex);
+		expect(tx.getId()).to.equal(txid);
+		expect(tx.outs[0].value).to.equal(9000);
+	});
+
+	it('POST /psbt/import-signed rejects a non-string unsignedPsbtBase64', async () => {
+		const res = await httpJson('POST', '/psbt/import-signed', {
+			psbtBase64: 'cHNidP8=',
+			unsignedPsbtBase64: 42
+		});
+		expect(res.body.ok).to.equal(false);
+		expect((res.body.error as { code: string }).code).to.equal(
+			'INVALID_PARAMS'
 		);
 	});
 

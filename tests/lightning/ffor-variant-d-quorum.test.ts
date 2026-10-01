@@ -37,7 +37,7 @@ import {
 	waitFor
 } from './helpers/chaos-quorum';
 
-const TIP = 790_000;
+const TIP = 795_000;
 const T_EXP = 800_000;
 const D_DEADLINE = 798_992;
 const AMOUNTS = [1_000_000n, 546_250n, 2_000_000n];

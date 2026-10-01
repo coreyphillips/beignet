@@ -24,7 +24,9 @@
  *                      is cancelled
  *   EXPOSED            the node's own sweeper cancelled the hold while our
  *                      coins were on chain: keep watching, refund recovers
- *                      the coins, a late claim still records its preimage
+ *                      the coins, a late claim still records its preimage;
+ *                      a funding still absent past the refund height fails
+ *                      once an input is spent elsewhere, or by operator cancel
  *
  * Rules the engine never breaks: a hold is never cancelled because the refund
  * height passed or a refund was broadcast; a claim beats a pending refund; a
@@ -406,10 +408,23 @@ export class ReverseSwapProvider extends EventEmitter {
 			).length;
 	}
 
-	/** Operator cancel: only before any funds moved. */
+	/**
+	 * Operator cancel: only before any funds moved, or for an EXPOSED row
+	 * whose funding this process found absent past the refund height. The
+	 * operator vouches the bytes will not confirm (spending their inputs
+	 * makes sure), since the chain cannot prove it.
+	 */
 	cancel(swapIdHex: string): { ok: boolean; reason?: string } {
 		const record = this.deps.ledger.get(swapIdHex);
 		if (!record) return { ok: false, reason: 'unknown swap' };
+		if (record.state === 'EXPOSED' && record.strandedHeight !== undefined) {
+			return this.endStranded(
+				record,
+				'operator cancel: funding never confirmed'
+			)
+				? { ok: true }
+				: { ok: false, reason: 'swap moved' };
+		}
 		if (record.state !== 'CREATED' && record.state !== 'HELD') {
 			return { ok: false, reason: `swap is ${record.state}` };
 		}
@@ -740,8 +755,11 @@ export class ReverseSwapProvider extends EventEmitter {
 		let bolt11: string;
 		let invoiceExpiresAt: number;
 		try {
+			// The swap's own delta, not the default: admission needs the
+			// payer's HTLCs to outlive THIS refund height.
 			const minFinalCltvExpiry =
-				this.config.refundDeltaBlocks +
+				refundHeight -
+				height +
 				this.config.resolutionSafetyBlocks +
 				this.config.holdCancelSafetyBlocks +
 				HOLD_CLTV_PADDING;
@@ -828,12 +846,14 @@ export class ReverseSwapProvider extends EventEmitter {
 			return;
 		}
 		if (record && record.peerNodeIdHex === peer) {
-			// Bytes travel only once a broadcast was attempted: signed bytes
-			// that never left (a refused first broadcast, a FUNDING row) are
-			// a valid, relayable transaction the payer must never be handed.
+			// Bytes travel only once the chain has confirmed them. Bytes that
+			// never relayed are a valid transaction the payer could put out
+			// after the hold is cancelled, funding a claim nothing pays for,
+			// and no cancel can take back bytes already handed over.
 			const fundingTx =
 				record.fundingTxHex &&
 				record.fundingBroadcastAttemptedAt !== undefined &&
+				record.fundingHeight !== undefined &&
 				record.fundingTxHex.length / 2 <= SWAP_MAX_FUNDING_TX_BYTES
 					? Buffer.from(record.fundingTxHex, 'hex')
 					: undefined;
@@ -1206,6 +1226,27 @@ export class ReverseSwapProvider extends EventEmitter {
 		}
 	}
 
+	/** Why the funding bytes must not be put out now, judged live. */
+	private broadcastProblem(record: ISwapRecord): string | undefined {
+		const snapshot = this.deps.heldSnapshot(
+			Buffer.from(record.paymentHashHex, 'hex')
+		);
+		return !snapshot || snapshot.state !== 'ACCEPTED' || !snapshot.complete
+			? `hold is ${snapshot ? snapshot.state : 'gone'} at broadcast time`
+			: this.admissionProblem(record, snapshot, this.deps.currentHeight());
+	}
+
+	private withholdFunding(record: ISwapRecord, problem: string): void {
+		const lastError = `broadcast withheld: ${problem}`;
+		if (record.lastError === lastError) return;
+		this.deps.ledger.patch(record.id, { lastError });
+		this.deps.log('swap_broadcast_withheld', {
+			swapId: record.id,
+			state: record.state,
+			reason: problem
+		});
+	}
+
 	private async processFunding(record: ISwapRecord): Promise<void> {
 		let current = record;
 		if (current.state === 'HELD') {
@@ -1316,13 +1357,7 @@ export class ReverseSwapProvider extends EventEmitter {
 				await this.dropUnsentFunding(current);
 				return;
 			}
-			const snapshot = this.deps.heldSnapshot(
-				Buffer.from(current.paymentHashHex, 'hex')
-			);
-			const problem =
-				!snapshot || snapshot.state !== 'ACCEPTED' || !snapshot.complete
-					? `hold is ${snapshot ? snapshot.state : 'gone'} at broadcast time`
-					: this.admissionProblem(current, snapshot, this.deps.currentHeight());
+			const problem = this.broadcastProblem(current);
 			if (problem) {
 				const moved = this.deps.ledger.move(current.id, 'FAILED', {
 					failureReason: `broadcast refused: ${problem}`
@@ -1345,6 +1380,17 @@ export class ReverseSwapProvider extends EventEmitter {
 			});
 			if (marked.outcome !== 'applied') return;
 			current = marked.record!;
+		} else if (!(await this.fundingSeenOnChain(current))) {
+			// Every retry is judged the same way: bytes that first relay past
+			// the funding margin, or as the sweeper cancels the hold, fund a
+			// claim nothing pays for. They may be out already, so they are
+			// kept, the hold is left parked for a claim to settle, and the
+			// chain is still read on every pass.
+			const problem = this.broadcastProblem(current);
+			if (problem) {
+				this.withholdFunding(current, problem);
+				return;
+			}
 		}
 		try {
 			await this.deps.broadcast(current.fundingTxHex!);
@@ -1398,6 +1444,42 @@ export class ReverseSwapProvider extends EventEmitter {
 			return `funding output pays ${out.value} sat, expected ${record.onchainSat}`;
 		}
 		return undefined;
+	}
+
+	/**
+	 * Put retained funding bytes back out after a reorg or a mempool drop.
+	 * The wallet lists their inputs as unspent again and has already pruned
+	 * the pledge, so they are pledged again before the bytes leave, or a
+	 * failed broadcast leaves them free for another selection. A withheld
+	 * funding is not pledged, so it holds no wallet coins. The hold is judged
+	 * again after the pledge because a cancel can land while the wallet waits.
+	 */
+	private async rebroadcastFunding(record: ISwapRecord): Promise<void> {
+		const txHex = record.fundingTxHex!;
+		let problem = this.broadcastProblem(record);
+		if (!problem) {
+			try {
+				await this.deps.pledge?.(txHex);
+			} catch (err) {
+				this.deps.log('swap_pledge_failed', {
+					swapId: record.id,
+					error: err instanceof Error ? err.message : String(err)
+				});
+			}
+			problem = this.broadcastProblem(record);
+			// Nothing renews a withheld row, so the coins it just froze would
+			// stay frozen until a prune.
+			if (problem) await this.release(txHex);
+		}
+		if (problem) {
+			this.withholdFunding(record, problem);
+			return;
+		}
+		try {
+			await this.deps.broadcast(txHex);
+		} catch {
+			/* retried next block */
+		}
 	}
 
 	private async processWatched(record: ISwapRecord): Promise<void> {
@@ -1491,15 +1573,10 @@ export class ReverseSwapProvider extends EventEmitter {
 				swapId: current.id,
 				previousHeight: observation.funding.previousHeight
 			});
-			// Rebroadcast our own bytes; the state clock only moves forward
-			// again once the chain confirms them.
-			if (current.fundingTxHex) {
-				try {
-					await this.deps.broadcast(current.fundingTxHex);
-				} catch {
-					/* retried next block */
-				}
-			}
+			// Rebroadcast our own bytes, judged like any funding retry: after a
+			// cancelled hold nothing pays for the claim they would enable. The
+			// state clock only moves forward again once the chain confirms them.
+			if (current.fundingTxHex) await this.rebroadcastFunding(current);
 			const patched = this.deps.ledger.patch(current.id, {
 				fundingHeight: undefined
 			});
@@ -1507,13 +1584,32 @@ export class ReverseSwapProvider extends EventEmitter {
 		} else if (
 			observation.funding.kind === 'absent' &&
 			current.fundingTxHex &&
-			current.state === 'FUNDING_BROADCAST'
+			(current.state === 'FUNDING_BROADCAST' ||
+				current.state === 'FUNDED' ||
+				current.state === 'REFUND_PENDING')
 		) {
-			// Not seen yet: the broadcast may not have propagated.
-			try {
-				await this.deps.broadcast(current.fundingTxHex);
-			} catch {
-				/* retried next block */
+			// Not seen yet: the broadcast may not have propagated, or the
+			// mempool dropped it. A funded row lands here once a reorg has
+			// cleared its height, so this is also where a failed reorg
+			// rebroadcast is retried. Judged like any funding retry. EXPOSED
+			// is left out: its hold is gone, so every retry would be withheld.
+			await this.rebroadcastFunding(current);
+		}
+
+		if (current.state === 'EXPOSED') {
+			if (
+				observation.funding.kind === 'absent' &&
+				height > current.refundHeight + this.config.resolutionSafetyBlocks &&
+				(await this.contractUnpaid(current))
+			) {
+				await this.processStranded(current, height);
+				return;
+			}
+			if (current.strandedHeight !== undefined) {
+				const patched = this.deps.ledger.patch(current.id, {
+					strandedHeight: undefined
+				});
+				if (patched.outcome === 'applied') current = patched.record!;
 			}
 		}
 
@@ -1578,6 +1674,82 @@ export class ReverseSwapProvider extends EventEmitter {
 		) {
 			await this.pursueRefund(current, observation);
 		}
+	}
+
+	/**
+	 * An EXPOSED row whose funding the chain does not show past the refund
+	 * height and the resolution margin. Its hold is gone and its inputs are
+	 * no longer renewed, so the wallet is free to spend them. The row ends on
+	 * proof the bytes can never confirm (one of those inputs spent elsewhere);
+	 * an empty answer from the backend is not proof, so short of that the row
+	 * is only marked, which lets the operator end it.
+	 */
+	private async processStranded(
+		record: ISwapRecord,
+		height: number
+	): Promise<void> {
+		let conflict: string | undefined;
+		if (record.fundingTxHex) {
+			try {
+				conflict = await this.deps.resolver.conflictingSpend(
+					bitcoin.Transaction.fromHex(record.fundingTxHex)
+				);
+			} catch (err) {
+				this.deps.log('swap_conflict_lookup_failed', {
+					swapId: record.id,
+					error: err instanceof Error ? err.message : String(err)
+				});
+			}
+		}
+		if (conflict) {
+			this.endStranded(
+				record,
+				`funding never confirmed and ${conflict} spent its input`
+			);
+			return;
+		}
+		const live = this.deps.ledger.get(record.id);
+		if (live?.state !== 'EXPOSED' || live.strandedHeight !== undefined) return;
+		const patched = this.deps.ledger.patch(record.id, {
+			strandedHeight: height
+		});
+		if (patched.outcome === 'applied') {
+			this.deps.log('swap_stranded', {
+				swapId: record.id,
+				fundingTxid: record.fundingTxid,
+				refundHeight: record.refundHeight
+			});
+		}
+	}
+
+	/**
+	 * Nothing on chain pays the contract. A funding malleated through a
+	 * legacy input confirms under another txid, so the recorded one reads
+	 * absent and its input spent elsewhere while the coins sit in the
+	 * contract.
+	 */
+	private async contractUnpaid(record: ISwapRecord): Promise<boolean> {
+		const discovered = await this.deps.resolver.observe({
+			htlc: htlcOf(record)
+		});
+		return discovered.candidates.length === 0;
+	}
+
+	/**
+	 * EXPOSED -> FAILED for a funding that never confirmed: the bytes are
+	 * erased and whatever inputs they still pledge are released.
+	 */
+	private endStranded(record: ISwapRecord, reason: string): boolean {
+		const moved = this.deps.ledger.move(record.id, 'FAILED', {
+			failureReason: reason,
+			fundingTxHex: undefined,
+			strandedHeight: undefined
+		});
+		if (moved.outcome !== 'applied') return false;
+		if (record.fundingTxHex) void this.release(record.fundingTxHex);
+		this.deps.log('swap_stranded_failed', { swapId: record.id, reason });
+		this.emitSwap('swap:failed', moved.record!, { reason });
+		return true;
 	}
 
 	private async onClaim(

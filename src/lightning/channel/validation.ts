@@ -13,6 +13,7 @@ import {
 	MAX_FUNDING_SATOSHIS,
 	MIN_DUST_LIMIT_SATOSHIS,
 	MAX_DUST_LIMIT_SATOSHIS,
+	MAX_MINIMUM_DEPTH,
 	U64_MAX
 } from './types';
 import { funderCommitmentCostSats } from './commitment-builder';
@@ -370,6 +371,10 @@ export function validateAcceptChannelParams(
 	// to_self_delay must be <= 2016
 	if (accept.toSelfDelay > 2016) {
 		return `to_self_delay ${accept.toSelfDelay} exceeds maximum 2016`;
+	}
+
+	if (accept.minimumDepth > MAX_MINIMUM_DEPTH) {
+		return `minimum_depth ${accept.minimumDepth} exceeds maximum ${MAX_MINIMUM_DEPTH}`;
 	}
 
 	// funding_pubkey must be 33 bytes

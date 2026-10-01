@@ -13,7 +13,12 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { INodeConfig, PaymentStatus } from '../../src/lightning/node/types';
+import {
+	INodeConfig,
+	LightningErrorCode,
+	LightningPaymentError,
+	PaymentStatus
+} from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
@@ -34,6 +39,8 @@ import {
 	IBolt12Invoice
 } from '../../src/lightning/offer';
 import { constructBlindedPath } from '../../src/lightning/onion/blinded-path';
+import { MessageType } from '../../src/lightning/message/types';
+import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -97,7 +104,8 @@ function createNode(seedId: number): LightningNode {
 
 function setupPair(
 	aliceSeed: number,
-	bobSeed: number
+	bobSeed: number,
+	channelSats = 1_000_000n
 ): { alice: LightningNode; bob: LightningNode } {
 	const alice = createNode(aliceSeed);
 	const bob = createNode(bobSeed);
@@ -113,7 +121,7 @@ function setupPair(
 		}
 	});
 
-	const channel = alice.openChannel(bob.getNodeId(), 1_000_000n);
+	const channel = alice.openChannel(bob.getNodeId(), channelSats);
 	const channelId = alice.createFunding(
 		channel,
 		crypto.randomBytes(32),
@@ -425,6 +433,101 @@ describe('BOLT 12 payment retry (issue #261)', () => {
 		bob.destroy();
 	});
 
+	// Issue #1236: the transport throws as the first update_add_htlc leaves,
+	// after the channel already holds the HTLC.
+	it('a dispatch that throws once its HTLC is out keeps its retry context', () => {
+		const { alice, bob } = setupPair(958, 959);
+		const invoice = issueBolt12Invoice(bob, 958, 50_000n);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const bobAny = bob as any;
+		const realHandler = bobAny.handleFinalHopHtlc.bind(bob);
+		// bob fails the first attempt and settles the retry.
+		let attempts = 0;
+		bobAny.handleFinalHopHtlc = (
+			channelId: Buffer,
+			htlcId: bigint,
+			...rest: unknown[]
+		): void => {
+			if (++attempts > 1) {
+				realHandler(channelId, htlcId, ...rest);
+				return;
+			}
+			const key = `${channelId.toString('hex')}:${htlcId}`;
+			bobAny.channelManager.failHtlc(
+				channelId,
+				htlcId,
+				createFailureMessage(
+					bobAny.receivedHtlcSharedSecrets.get(key),
+					TEMPORARY_NODE_FAILURE
+				)
+			);
+		};
+		let queued: Buffer | undefined;
+		const throwOnAdd = (
+			_pubkey: string,
+			type: number,
+			payload: Buffer
+		): void => {
+			if (type !== MessageType.UPDATE_ADD_HTLC) return;
+			queued = payload;
+			throw new Error('transport failed');
+		};
+		alice.prependListener('message:outbound', throwOnAdd);
+
+		expect(() => alice.payBolt12Invoice(invoice)).to.throw(/transport failed/);
+		expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+		expect(alice.hasHtlcInFlight(invoice.paymentHash)).to.be.true;
+		expect(
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).paymentRetryContexts.has(
+				invoice.paymentHash.toString('hex')
+			)
+		).to.be.true;
+
+		// The transport recovers: the update reaches bob and alice commits it.
+		alice.removeListener('message:outbound', throwOnAdd);
+		bob.handlePeerMessage(
+			alice.getNodeId(),
+			MessageType.UPDATE_ADD_HTLC,
+			queued!
+		);
+		const manager = alice.getChannelManager();
+		manager.autoSignAndSendCommitment(
+			manager.listChannels()[0].getChannelId()!
+		);
+
+		// The temporary failure is retried, not final.
+		expect(attempts).to.equal(2);
+		const settled = alice.getPayment(invoice.paymentHash)!;
+		expect(settled.status).to.equal(PaymentStatus.COMPLETED);
+		expect(settled.retryCount).to.equal(1);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a dispatch that throws before its HTLC is out leaves no retry context', () => {
+		const { alice, bob } = setupPair(962, 963);
+		const invoice = issueBolt12Invoice(bob, 962, 50_000n);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const a = alice as any;
+
+		// The throw comes after the PENDING record is written, before the
+		// channel holds anything.
+		a.channelManager.addHtlc = (): never => {
+			throw new Error('transport failed');
+		};
+
+		expect(() => alice.payBolt12Invoice(invoice)).to.throw(/transport failed/);
+		expect(alice.hasHtlcInFlight(invoice.paymentHash)).to.be.false;
+		expect(a.paymentRetryContexts.size).to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
 	it('a local HTLC refusal after route construction leaves no retry context', () => {
 		const { alice, bob } = setupPair(952, 953);
 		const invoice = issueBolt12Invoice(bob, 952, 50_000n);
@@ -450,7 +553,7 @@ describe('BOLT 12 payment retry (issue #261)', () => {
 		bob.destroy();
 	});
 
-	it('fails a pending BOLT 12 payment once its invoice expires', () => {
+	it('fails a pending BOLT 12 payment once its invoice expires, unless its HTLC is still out', () => {
 		const { alice, bob } = setupPair(954, 955);
 		const invoice = issueBolt12Invoice(bob, 954, 50_000n);
 		// Issued two hours ago with a one-hour expiry.
@@ -459,22 +562,113 @@ describe('BOLT 12 payment retry (issue #261)', () => {
 		// Bob parks the HTLC so the payment stays PENDING past its expiry.
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		(bob as any).handleFinalHopHtlc = (): void => {};
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const a = alice as any;
 
 		alice.payBolt12Invoice(invoice);
 		expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
 			PaymentStatus.PENDING
 		);
 
-		// The expiry scanner previously only understood BOLT 11 invoice
-		// strings, so a BOLT 12 context was silently skipped here forever.
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		(alice as any).scanExpiredPendingPayments();
+		// The HTLC bob holds can still settle whatever the invoice says, so
+		// the scanner leaves the payment PENDING, context and all (issue #976).
+		a.scanExpiredPendingPayments();
+		expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+		expect(a.paymentRetryContexts.size).to.equal(1);
+
+		// With nothing out for the hash, the BOLT 12 expiry fails it. The
+		// scanner previously only understood BOLT 11 invoice strings, so a
+		// BOLT 12 context was silently skipped here forever.
+		a.hasHtlcInFlight = (): boolean => false;
+		a.scanExpiredPendingPayments();
 
 		const payment = alice.getPayment(invoice.paymentHash)!;
 		expect(payment.status).to.equal(PaymentStatus.FAILED);
 		expect(payment.failureReason ?? '').to.contain('expired');
+		expect(a.paymentRetryContexts.size).to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	// Issue #1237: the failed first dispatch returns after the listener's
+	// re-send registered its own context.
+	it('a re-send from a payment:htlc-resolved listener keeps its retry context', () => {
+		const { alice, bob } = setupPair(956, 957);
+		const invoice = issueBolt12Invoice(bob, 956, 50_000n);
+		const hashHex = invoice.paymentHash.toString('hex');
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		expect((alice as any).paymentRetryContexts.size).to.equal(0);
+		const bobAny = bob as any;
+		const realHandler = bobAny.handleFinalHopHtlc.bind(bob);
+		// bob fails the first attempt, holds the second and settles the rest.
+		let attempts = 0;
+		let held: { channelId: Buffer; htlcId: bigint } | undefined;
+		bobAny.handleFinalHopHtlc = (
+			channelId: Buffer,
+			htlcId: bigint,
+			...rest: unknown[]
+		): void => {
+			attempts++;
+			if (attempts === 2) {
+				held = { channelId, htlcId };
+				return;
+			}
+			if (attempts === 1) {
+				const key = `${channelId.toString('hex')}:${htlcId}`;
+				bobAny.channelManager.failHtlc(
+					channelId,
+					htlcId,
+					createFailureMessage(
+						bobAny.receivedHtlcSharedSecrets.get(key),
+						TEMPORARY_NODE_FAILURE
+					)
+				);
+				return;
+			}
+			realHandler(channelId, htlcId, ...rest);
+		};
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const contexts = (alice as any).paymentRetryContexts as Map<
+			string,
+			unknown
+		>;
+		let replacementCtx: unknown;
+		alice.once('payment:htlc-resolved', () => {
+			alice.failPayment(invoice.paymentHash);
+			alice.payBolt12Invoice(invoice);
+			replacementCtx = contexts.get(hashHex);
+		});
+
+		alice.payBolt12Invoice(invoice);
+
+		expect(attempts).to.equal(2);
+		const replacement = alice.getPayment(invoice.paymentHash)!;
+		expect(replacement.status).to.equal(PaymentStatus.PENDING);
+		expect(
+			alice
+				.getOutgoingHtlcs(invoice.paymentHash)
+				.htlcs.filter((htlc) => !htlc.terminal)
+		).to.have.length(1);
+		expect(replacementCtx).to.not.be.undefined;
+		expect(contexts.get(hashHex)).to.equal(replacementCtx);
+
+		// The replacement's temporary failure is retried, not final.
+		const key = `${held!.channelId.toString('hex')}:${held!.htlcId}`;
+		bobAny.channelManager.failHtlc(
+			held!.channelId,
+			held!.htlcId,
+			createFailureMessage(
+				bobAny.receivedHtlcSharedSecrets.get(key),
+				TEMPORARY_NODE_FAILURE
+			)
+		);
+
+		expect(attempts).to.equal(3);
+		const settled = alice.getPayment(invoice.paymentHash)!;
+		expect(settled.status).to.equal(PaymentStatus.COMPLETED);
+		expect(settled.retryCount).to.equal(1);
 
 		alice.destroy();
 		bob.destroy();
@@ -495,6 +689,166 @@ describe('BOLT 12 payment retry (issue #261)', () => {
 		expect(() => alice.payBolt12Invoice(invoice)).to.throw(
 			/already in flight/i
 		);
+
+		alice.destroy();
+		bob.destroy();
+	});
+});
+
+/**
+ * Bob's invoice path is a grafted one for alice (bob, not alice, introduces
+ * it), so the payinfo fee is added to what alice sends and never inverted
+ * away. Rewrite the payee-written fee on the invoice alice is handed. Bob is
+ * also the recipient here, so a payment carrying this fee would overpay him
+ * and be refused: these tests only ever judge the cap, never a settlement
+ * (blinded-fee-cap.test.ts pays through a relaying introduction node).
+ */
+function setBlindedFee(invoice: IBolt12Invoice, feeBaseMsat: number): void {
+	invoice.blindedPayInfo = invoice.blindedPayInfo!.map((info) => ({
+		...info,
+		feeBaseMsat,
+		feeProportionalMillionths: 0,
+		htlcMaximumMsat: 100_000_000_000n
+	}));
+}
+
+/** update_add_htlc amounts alice puts on the wire from now on. */
+function recordAdds(alice: LightningNode): bigint[] {
+	const adds: bigint[] = [];
+	alice.on('message:outbound', (_pk: string, type: number, payload: Buffer) => {
+		if (type === MessageType.UPDATE_ADD_HTLC) {
+			adds.push(payload.readBigUInt64BE(40));
+		}
+	});
+	return adds;
+}
+
+describe('BOLT 12 blinded-path fee cap (issue #1001)', () => {
+	it('refuses a payee-written blinded fee over the cap before any HTLC leaves', () => {
+		// The largest fee the u32 payinfo fields express; the channel is sized
+		// so the router finds the route and it is the cap that refuses.
+		const { alice, bob } = setupPair(960, 961, 10_000_000n);
+		const invoice = issueBolt12Invoice(bob, 960, 50_000n);
+		invoice.blindedPayInfo = invoice.blindedPayInfo!.map((info) => ({
+			...info,
+			feeBaseMsat: 0xffffffff,
+			feeProportionalMillionths: 0xffffffff,
+			htlcMaximumMsat: 100_000_000_000n
+		}));
+		const adds = recordAdds(alice);
+
+		let error: unknown;
+		try {
+			alice.payBolt12Invoice(invoice, undefined, 1_000n);
+		} catch (err) {
+			error = err;
+		}
+		expect(error).to.be.instanceOf(LightningPaymentError);
+		expect((error as LightningPaymentError).code).to.equal(
+			LightningErrorCode.FEE_EXCEEDS_MAX
+		);
+		expect(adds, 'no update_add_htlc left alice').to.have.length(0);
+		expect(alice.getPayment(invoice.paymentHash)).to.be.undefined;
+		expect(
+			(
+				alice as unknown as { paymentRetryContexts: Map<string, unknown> }
+			).paymentRetryContexts.has(invoice.paymentHash.toString('hex')),
+			'no retry context'
+		).to.equal(false);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a retry keeps the fee cap', () => {
+		const { alice, bob } = setupPair(966, 967);
+		const invoice = issueBolt12Invoice(bob, 966, 50_000n);
+		setBlindedFee(invoice, 10_000);
+		const attempts = failEveryHtlcTemporarily(bob);
+
+		// Every re-entry into payBolt12Invoice, the first call included.
+		const caps: Array<bigint | undefined> = [];
+		const real = alice.payBolt12Invoice.bind(alice);
+		alice.payBolt12Invoice = (
+			inv: IBolt12Invoice,
+			excluded?: Set<string>,
+			maxFeeMsat?: bigint
+		): ReturnType<LightningNode['payBolt12Invoice']> => {
+			caps.push(maxFeeMsat);
+			return real(inv, excluded, maxFeeMsat);
+		};
+
+		alice.payBolt12Invoice(invoice, undefined, 10_000n);
+
+		// Not every re-entry dispatches (the last one finds nothing left to
+		// try), so the count is judged against re-entries, not HTLCs.
+		expect(attempts(), 'the payment was retried').to.be.greaterThan(1);
+		expect(
+			caps.length,
+			'retries re-entered payBolt12Invoice'
+		).to.be.greaterThan(1);
+		expect(caps.map(String)).to.deep.equal(caps.map(() => '10000'));
+
+		alice.destroy();
+		bob.destroy();
+	});
+});
+
+/** The invoice's own two usable paths: its path offered twice. */
+function withTwoPaths(invoice: IBolt12Invoice, features: Buffer): void {
+	invoice.features = features;
+	invoice.paths = [invoice.paths![0], invoice.paths![0]];
+	invoice.blindedPayInfo = [
+		invoice.blindedPayInfo![0],
+		invoice.blindedPayInfo![0]
+	];
+}
+
+describe('BOLT 12 compulsory MPP (issue #1202)', () => {
+	it('refuses an MPP/compulsory invoice before any HTLC leaves', () => {
+		const { alice, bob } = setupPair(970, 971);
+		const invoice = issueBolt12Invoice(bob, 970, 50_000n);
+		const mppCompulsory = FeatureFlags.empty();
+		mppCompulsory.setCompulsory(Feature.BASIC_MPP);
+		withTwoPaths(invoice, mppCompulsory.toBuffer());
+		const adds = recordAdds(alice);
+
+		let error: unknown;
+		try {
+			alice.payBolt12Invoice(invoice);
+		} catch (err) {
+			error = err;
+		}
+		expect(error).to.be.instanceOf(LightningPaymentError);
+		expect((error as LightningPaymentError).code).to.equal(
+			LightningErrorCode.INVALID_INVOICE
+		);
+		expect(adds, 'no update_add_htlc left alice').to.have.length(0);
+		expect(alice.getPayment(invoice.paymentHash)).to.be.undefined;
+		expect(
+			(alice as unknown as { paymentRetryContexts: Map<string, unknown> })
+				.paymentRetryContexts.size,
+			'no retry context'
+		).to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('still pays an MPP/optional invoice as one HTLC', () => {
+		const { alice, bob } = setupPair(972, 973);
+		const invoice = issueBolt12Invoice(bob, 972, 50_000n);
+		const mppOptional = FeatureFlags.empty();
+		mppOptional.setOptional(Feature.BASIC_MPP);
+		withTwoPaths(invoice, mppOptional.toBuffer());
+		const adds = recordAdds(alice);
+
+		alice.payBolt12Invoice(invoice);
+
+		expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
+		);
+		expect(adds).to.deep.equal([50_000n]);
 
 		alice.destroy();
 		bob.destroy();

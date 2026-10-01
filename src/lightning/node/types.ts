@@ -10,7 +10,7 @@ import { IRoutingHintHop, Network } from '../invoice/types';
 import { IBolt12Invoice } from '../offer/types';
 import { IChannelConfig, ChannelState } from '../channel/types';
 import { IChannelBasepoints } from '../keys/derivation';
-import { IRoute, INodeAddress } from '../gossip/types';
+import { IRoute, INodeAddress, IChannelUpdateMessage } from '../gossip/types';
 import { FeatureFlags } from '../features/flags';
 import { IStorageBackend, IInvoiceInfo } from '../storage/types';
 import { IChainBackend } from '../chain/chain-watcher';
@@ -18,6 +18,7 @@ import { ILogger } from '../../logger';
 import { IPerChannelKeys } from '../channel/channel-manager';
 import { SignerFactory } from '../keys/signer';
 import { WebSocketConstructor } from '../transport/websocket';
+import { Socks5ProxyScope } from '../transport/peer-manager';
 import { GuardianStartupGate } from '../recovery/startup-gate';
 import { DurabilityBarrier } from '../recovery/durability-barrier';
 import { IGuardianHostConfig } from '../recovery/guardian-host';
@@ -333,6 +334,9 @@ export interface INodeConfig {
 	fforSettle?: import('../ffor/types').IFforSettlePolicy;
 	/** Max reconnect delay in ms */
 	maxReconnectDelay?: number;
+	/** Inbound peer connections (default 125). Once this many are up, only
+	 *  peers holding a channel with this node are admitted. */
+	maxInboundPeers?: number;
 	/** Resource management config */
 	resourceConfig?: IResourceConfig;
 	/** Storage backend for persistence */
@@ -546,6 +550,16 @@ export interface INodeConfig {
 	announcedAddresses?: INodeAddress[];
 	/** SOCKS5 proxy for outbound peer connections (e.g. Tor on 127.0.0.1:9050) */
 	socks5Proxy?: { host: string; port: number };
+	/**
+	 * Which destinations ride socks5Proxy (default 'all'). 'all' sends every
+	 * public host through it; 'onion' sends only .onion hosts through it and
+	 * dials public clearnet directly (LND's tor.skip-proxy-for-clearnet-targets,
+	 * "hybrid mode"). Private and loopback hosts are always dialed directly.
+	 * Applies to peer dials and watchtower connections alike; it has no effect
+	 * without socks5Proxy, since .onion then falls back to 127.0.0.1:9050 and
+	 * everything else is direct already.
+	 */
+	socks5ProxyScope?: Socks5ProxyScope;
 	/**
 	 * WebSocket constructor for outbound WS peer connections. Defaults to the
 	 * in-repo RFC-cased Node client under Node (CLN's ws listener rejects the
@@ -783,7 +797,10 @@ export interface IRebalanceExecutionSummary {
 	succeeded: number;
 	failed: number;
 	skippedBudget: number;
-	/** Fees spent by THIS run in msat. */
+	/**
+	 * Fees spent by THIS run in msat. An attempt whose wait timed out counts
+	 * at its fee cap, since its HTLC can still settle.
+	 */
 	feeSpentMsat: bigint;
 	/** Remaining fee budget for the current UTC day in msat. */
 	budgetRemainingMsat: bigint;
@@ -804,6 +821,15 @@ export interface IPaymentInfo {
 	paymentHash: Buffer;
 	preimage?: Buffer;
 	amountMsat: bigint;
+	/**
+	 * The msat that left this node, fees included, when amountMsat is not
+	 * that figure. A single-path send records its first-hop amount in
+	 * amountMsat, so it needs nothing here; an MPP send records the invoice
+	 * amount there and the sum of its parts' first-hop amounts here, written
+	 * with the record's first persist. A part refused at dispatch is not
+	 * subtracted, so this can overstate by that part.
+	 */
+	sentMsat?: bigint;
 	status: PaymentStatus;
 	direction: PaymentDirection;
 	route?: IRoute;
@@ -882,12 +908,32 @@ export interface IPaymentRetryContext {
 	 * before the HTLC is added. Preserved across retries.
 	 */
 	maxCltvExpiryHeight?: number;
+	/**
+	 * Channel policies this payment's own failures taught us (issue #1056):
+	 * the signed channel_update a fee_insufficient, incorrect_cltv_expiry or
+	 * amount_below_minimum failure carried, verified against the erring hop
+	 * and its outgoing channel. Keyed by SCID plus direction bit
+	 * (policyOverrideKey), one per edge, read by this payment's retries and
+	 * by nothing else: BOLT 4 lets the origin use such an update for the
+	 * same payment and forbids applying it to the network graph (issue
+	 * #182). A retry routes over the re-priced channel instead of excluding
+	 * it.
+	 */
+	policyOverrides?: Map<string, IChannelUpdateMessage>;
+	/** Caller metadata, carried onto the record every attempt creates. */
+	metadata?: Record<string, string>;
 }
 
 /** Options-object form of sendPayment's positional arguments. */
 export interface ISendPaymentOptions {
 	excludedChannels?: Set<string>;
 	maxFeeMsat?: bigint;
+	/**
+	 * Channel policies to route with in place of the graph's, keyed as
+	 * IPaymentRetryContext.policyOverrides. Scoped to this payment; the
+	 * graph is not touched.
+	 */
+	policyOverrides?: Map<string, IChannelUpdateMessage>;
 	/** Amount for an amount-less invoice. */
 	amountMsat?: bigint;
 	/**
@@ -898,6 +944,12 @@ export interface ISendPaymentOptions {
 	 * on-chain refund height less its claim margin.
 	 */
 	maxCltvExpiryHeight?: number;
+	/**
+	 * Labels stored on the payment record, as setPaymentMetadata stores them.
+	 * Refused with an InvalidRequestError, before anything is sent, when they
+	 * are too large for the recovery guardians to accept.
+	 */
+	metadata?: Record<string, string>;
 }
 
 export interface ICreateInvoiceOptions {
@@ -1005,6 +1057,20 @@ export interface IChannelInfo {
 	 * localBalanceMsat stays pre-splice until splice_locked.
 	 */
 	pendingSpliceLocalBalanceMsat?: bigint;
+	/**
+	 * The in-flight splice's transaction id (display byte order, like
+	 * fundingTxid). Present exactly when pendingSpliceLocalBalanceMsat is:
+	 * the splice is past its point of no return and not yet adopted, so a
+	 * wallet can recognise the transaction moving its own coins as this
+	 * channel's rather than as a send (issue #1060).
+	 */
+	pendingSpliceTxid?: string;
+	/**
+	 * Funding txids this channel ran on before fundingTxid, oldest first
+	 * (display byte order), one per adopted splice. Absent on a channel
+	 * that has never been spliced (issue #1060).
+	 */
+	previousFundingTxids?: string[];
 	/**
 	 * Whether the channel will accept a NEW HTLC: it can carry traffic right
 	 * now (NORMAL, or ECDSA pending-lock mid-splice with pay-during-splice
@@ -1196,6 +1262,20 @@ export interface ILightningError {
 	channelId?: Buffer;
 	message: string;
 	timestamp: number;
+	/**
+	 * The transaction a broadcast error is about (display byte order), when
+	 * the watcher could name it (issue #1062). Carried by BROADCAST_FAILED,
+	 * BROADCAST_PERMANENT_FAILURE and SPLICE_BROADCAST_REFUSED.
+	 */
+	txid?: string;
+	/**
+	 * True when the node itself still holds this transaction and re-sends
+	 * it on every block (a pending funding, an in-flight or adopted but
+	 * unconfirmed splice), so the watcher's own queue giving up on it is not
+	 * the end of the attempt. False when that queue was the only driver (a
+	 * close, a sweep) or the transaction is not one this node tracks.
+	 */
+	retained?: boolean;
 }
 
 export interface IPaymentPart {
@@ -1526,6 +1606,13 @@ export interface IKeysendOptions {
 	customRecords?: Map<number, Buffer>;
 	/** Payment metadata (optional) */
 	metadata?: Record<string, string>;
+	/**
+	 * The 32-byte preimage to pay under (optional; a fresh random one by
+	 * default). A caller that must record the payment hash before the HTLC
+	 * goes out picks it. One whose hash was already paid or is in flight is
+	 * refused with DUPLICATE_PAYMENT.
+	 */
+	preimage?: Buffer;
 }
 
 /**
@@ -1541,6 +1628,13 @@ export class LightningPaymentError extends Error {
 		this.code = code;
 	}
 }
+
+/**
+ * waitForPayment giving up before the payment resolved. An HTLC it sent can
+ * still be out, and still settle. rebalanceChannel also throws it for a
+ * payment cancelled while its HTLC is out.
+ */
+export class PaymentWaitTimeoutError extends Error {}
 
 /**
  * A request refused for the caller's own arguments: as written it cannot be
@@ -1736,6 +1830,9 @@ export interface IPaymentEstimate {
 	routeQuality: 'HIGH' | 'MEDIUM' | 'LOW';
 	warning?: string;
 	alternativeAvailable: boolean;
+	/** Route fee rounded UP to whole sats, so it is safe to pass as maxFeeSats. */
 	estimatedFeeSats: number;
+	/** The exact route fee. */
+	estimatedFeeMsat: bigint;
 	hopCount: number;
 }

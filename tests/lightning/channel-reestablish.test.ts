@@ -4,7 +4,10 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
-import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import {
+	getPublicKey,
+	isValidPublicKey
+} from '../../src/lightning/crypto/ecdh';
 import { Channel } from '../../src/lightning/channel/channel';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import {
@@ -77,6 +80,16 @@ function getPerCommitmentSecret(
 ): Buffer {
 	const index = MAX_INDEX - commitmentNumber;
 	return generateFromSeed(seed, index);
+}
+
+/** A well-formed compressed encoding whose x has no point on secp256k1. */
+function offCurvePoint(): Buffer {
+	const point = Buffer.alloc(33);
+	point[0] = 0x02;
+	for (let x = 1; ; x++) {
+		point.writeUInt32BE(x, 29);
+		if (!isValidPublicKey(point)) return point;
+	}
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -510,6 +523,79 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 		});
 	});
 
+	describe('off-curve per-commitment points (issue 1033)', function () {
+		it('fails the channel on a revoke_and_ack whose next point is off the curve', function () {
+			const { opener, acceptor, acceptorSeed } = setupNormalChannels();
+
+			const openerSigs = realCommitmentSigs(opener);
+			opener.signCommitment(openerSigs.signature, openerSigs.htlcSignatures);
+			acceptor.handleCommitmentSigned({
+				channelId: acceptor.getChannelId()!,
+				signature: openerSigs.signature,
+				htlcSignatures: openerSigs.htlcSignatures
+			});
+
+			const secret = getPerCommitmentSecret(acceptorSeed, 0n);
+			const badPoint = offCurvePoint();
+			const result = opener.handleRevokeAndAck({
+				channelId: opener.getChannelId()!,
+				perCommitmentSecret: secret,
+				nextPerCommitmentPoint: badPoint
+			});
+
+			expect(findErrorAction(result)).to.contain('next_per_commitment_point');
+			expect(findSendAction(result, MessageType.ERROR)).to.not.be.null;
+			expect(opener.getState()).to.equal(ChannelState.ERRORED);
+
+			const state = opener.getFullState();
+			expect(state.remoteNextPerCommitmentPoint!.equals(badPoint)).to.be.false;
+			// The revocation itself was genuine and stays on record.
+			expect(state.shaChainStore.getSecret(MAX_INDEX)!.equals(secret)).to.be
+				.true;
+			expect(
+				state.remoteCurrentPerCommitmentPoint!.equals(
+					getPerCommitmentPoint(acceptorSeed, 1n)
+				)
+			).to.be.true;
+		});
+
+		it('keeps the fell-behind hold but drops an off-curve reestablish point', function () {
+			const { opener, openerSeed } = setupNormalChannels();
+			opener.markForReestablish();
+
+			const result = opener.handleReestablish({
+				channelId: opener.getChannelId()!,
+				nextCommitmentNumber: 1n,
+				nextRevocationNumber: 100n,
+				yourLastPerCommitmentSecret: getPerCommitmentSecret(openerSeed, 99n),
+				myCurrentPerCommitmentPoint: offCurvePoint()
+			});
+
+			expect(findErrorAction(result)).to.contain('fell behind');
+			expect(opener.getFullState().dataLossDetected).to.equal(true);
+			expect(opener.getFullState().dlpRemotePerCommitmentPoint).to.be.undefined;
+		});
+
+		it('records a valid reestablish point in the fell-behind arm', function () {
+			const { opener, openerSeed, acceptorSeed } = setupNormalChannels();
+			opener.markForReestablish();
+
+			const peerPoint = getPerCommitmentPoint(acceptorSeed, 99n);
+			opener.handleReestablish({
+				channelId: opener.getChannelId()!,
+				nextCommitmentNumber: 1n,
+				nextRevocationNumber: 100n,
+				yourLastPerCommitmentSecret: getPerCommitmentSecret(openerSeed, 99n),
+				myCurrentPerCommitmentPoint: peerPoint
+			});
+
+			expect(opener.getFullState().dataLossDetected).to.equal(true);
+			expect(
+				opener.getFullState().dlpRemotePerCommitmentPoint!.equals(peerPoint)
+			).to.be.true;
+		});
+	});
+
 	describe('handleReestablish — irrecoverable gaps', function () {
 		it('should error on future commitment gap', function () {
 			const { opener } = setupNormalChannels();
@@ -547,6 +633,75 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			expect(findErrorAction(result)).to.contain('fell behind');
 			expect(opener.getFullState().dataLossDetected).to.equal(true);
 			expect(opener.getState()).to.equal(ChannelState.ERRORED);
+		});
+
+		// Issue #1047: a peer more than one behind is failed, not replayed to.
+		// Both counters start at 5: the peer is level at next_commitment 6 and
+		// next_revocation 5, and one behind at 5 and 4.
+		const atFive = (): { opener: Channel; openerSeed: Buffer } => {
+			const { opener, openerSeed } = setupNormalChannels();
+			opener.getFullState().localCommitmentNumber = 5n;
+			opener.getFullState().remoteCommitmentNumber = 5n;
+			opener.markForReestablish();
+			return { opener, openerSeed };
+		};
+		const reestablishAt = (
+			opener: Channel,
+			openerSeed: Buffer,
+			nextCommitmentNumber: bigint,
+			nextRevocationNumber: bigint
+		): IChannelReestablishMessage => ({
+			channelId: opener.getChannelId()!,
+			nextCommitmentNumber,
+			nextRevocationNumber,
+			yourLastPerCommitmentSecret: getPerCommitmentSecret(
+				openerSeed,
+				nextRevocationNumber - 1n
+			),
+			myCurrentPerCommitmentPoint: getPublicKey(crypto.randomBytes(32))
+		});
+
+		it('fails the channel on a peer two commitments behind (issue #1047)', function () {
+			const { opener, openerSeed } = atFive();
+			const result = opener.handleReestablish(
+				reestablishAt(opener, openerSeed, 4n, 5n)
+			);
+			expect(findErrorAction(result)).to.contain(
+				'next_commitment_number is more than one behind'
+			);
+			expect(findSendAction(result, MessageType.ERROR)).to.not.be.null;
+			expect(findSendAction(result, MessageType.COMMITMENT_SIGNED)).to.be.null;
+			expect(opener.getState()).to.equal(ChannelState.ERRORED);
+		});
+
+		it('fails the channel on a peer two revocations behind (issue #1047)', function () {
+			const { opener, openerSeed } = atFive();
+			const result = opener.handleReestablish(
+				reestablishAt(opener, openerSeed, 6n, 3n)
+			);
+			expect(findErrorAction(result)).to.contain(
+				'next_revocation_number is more than one behind'
+			);
+			expect(findSendAction(result, MessageType.ERROR)).to.not.be.null;
+			expect(opener.getState()).to.equal(ChannelState.ERRORED);
+		});
+
+		it('still resumes a peer exactly one behind on both counters (issue #1047)', function () {
+			const { opener, openerSeed } = atFive();
+			const result = opener.handleReestablish(
+				reestablishAt(opener, openerSeed, 5n, 4n)
+			);
+			expect(findErrorAction(result)).to.be.null;
+			expect(opener.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('keeps a held row held when failing a peer that is behind (issue #1047)', function () {
+			const { opener, openerSeed } = atFive();
+			opener.getFullState().restoreRecencyUnproven = true;
+			opener.handleReestablish(reestablishAt(opener, openerSeed, 4n, 5n));
+			expect(opener.getState()).to.equal(ChannelState.ERRORED);
+			expect(opener.getRecoveryCloseReason()).to.equal('restore-unproven');
+			expect(opener.hasRecoveryCloseDisposition()).to.equal(true);
 		});
 	});
 
@@ -1160,6 +1315,13 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			const state = channel.getFullState();
 			state.localBalanceMsat = 1_200_000n;
 			state.role = ChannelRole.ACCEPTOR;
+			// The row was serialised from the OPENER, so its remote balance is
+			// the original acceptor's push amount. With the role flipped the
+			// peer is the funder, and the ceiling now also asks whether that
+			// funder can pay the commitment fee for one more HTLC (issue
+			// #1020); give it the rest of the capacity so only our own dust
+			// floor binds, which is what this case pins.
+			state.remoteBalanceMsat = 148_800_000n;
 			expect(channel.getSpendableOutboundMsat()).to.equal(138_000n);
 		});
 

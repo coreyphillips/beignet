@@ -40,10 +40,10 @@ const FIXED_LENGTH_TAG_WORDS: Partial<Record<TagType, number>> = {
  * Decode a BOLT 11 invoice string into a structured object.
  */
 export function decode(invoiceString: string): IInvoice {
-	// Bech32 is case-insensitive; normalize to lowercase
-	const lower = invoiceString.toLowerCase();
-
-	const decoded = bech32.decode(lower, BECH32_MAX_LIMIT);
+	// Passed as given: the library accepts an all-upper or all-lower string
+	// and rejects a mixed-case one, as BIP 173 requires. Lowercasing first
+	// defeated that check.
+	const decoded = bech32.decode(invoiceString, BECH32_MAX_LIMIT);
 	const { prefix, words } = decoded;
 
 	// Parse HRP → network + optional amount

@@ -4,6 +4,7 @@ export * from './watch-only';
 export * from './multisig';
 export * from './helpers';
 export * from './electrum';
+export * from './tls-verification';
 export * from './fees';
 export * from './derivation-path';
 export * from './descriptors';

@@ -3104,12 +3104,14 @@ describe('Lightning Node', function () {
 				]
 			);
 			const processed = {
+				// A blinded intermediate payload carries no cleartext forwarding
+				// fields (BOLT 4), which is how the decoder reports it.
 				hopPayload: {
-					shortChannelId: outScid,
 					blindingPoint: path.blindingPoint,
 					encryptedRecipientData: path.blindedHops[0].encryptedData,
-					amountToForwardMsat: 100_000n,
-					outgoingCltvValue: 500_000
+					amountToForwardMsat: 0n,
+					outgoingCltvValue: 0,
+					omitForwardAmounts: true
 				},
 				nextPacket: {
 					version: 0,

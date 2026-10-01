@@ -49,6 +49,7 @@ import {
 } from '../onion/blinded-path';
 import { OnionMessageManager } from '../onion-message/manager';
 import { getPublicKey } from '../crypto/ecdh';
+import { BITCOIN_CHAIN_HASH } from '../channel/types';
 
 /** TLV type for BOLT 12 invoice request in onion messages */
 export const TLV_INVOICE_REQUEST = 64;
@@ -57,11 +58,15 @@ export const TLV_INVOICE = 66;
 /** TLV type for BOLT 12 invoice error in onion messages */
 export const TLV_INVOICE_ERROR = 68;
 
+/** BOLT 12: an invoice without invoice_relative_expiry expires after 7200s. */
+const DEFAULT_INVOICE_RELATIVE_EXPIRY = 7200;
+
 /** Issued invoices carry relativeExpiry 7200s; keep the preimage for the
  *  invoice's life plus an hour of grace for an HTLC in flight at expiry. */
 const INVOICE_PREIMAGE_TTL_MS = (7200 + 3600) * 1000;
 /** Hard cap on retained preimages: requests are remote-driven. */
 const MAX_INVOICE_PREIMAGES = 10_000;
+const MAX_U64 = 0xffff_ffff_ffff_ffffn;
 
 // BOLT 12 signature tags are "lightning" || messagename || fieldname (the field
 // is always the "signature" field, type 240). A bare "lightning" tag made every
@@ -202,6 +207,16 @@ export class OfferManager extends EventEmitter {
 			 * invoices that arrive without a reply-path binding.
 			 */
 			offerIdHex: string;
+			/** The offer requested: it names who may sign the invoice. */
+			offer: IOffer;
+			/**
+			 * The final blinded node id of the offer path this request was sent
+			 * through. An offer without an issuer id is answered under this key,
+			 * not under the terminal of any other path it lists.
+			 */
+			terminalNodeId?: Buffer;
+			/** The invreq_amount we sent; the invoice must charge exactly this. */
+			amountMsat: bigint;
 			/**
 			 * The signed invreq records we sent, retained so the invoice's
 			 * mirrored fields can be checked (BOLT 12: the reader MUST reject an
@@ -636,16 +651,26 @@ export class OfferManager extends EventEmitter {
 		// quantity when the offer prices a unit; sending the unit price with a
 		// quantity above one is rejected by a spec reader.
 		const quantity = options?.quantity ?? 1n;
+		const amountMsat =
+			options?.amount ??
+			(offer.amount !== undefined ? offer.amount * quantity : undefined);
+		// BOLT 12 requires invreq_amount when the offer has none, and it is
+		// what the returned invoice's amount is held to.
+		if (amountMsat === undefined) {
+			throw new Error('Amount required: the offer does not set one');
+		}
 		const request: IInvoiceRequest = {
 			payerKey: payerPubkey,
 			offerId: offer.offerId,
-			amount:
-				options?.amount ??
-				(offer.amount !== undefined ? offer.amount * quantity : undefined),
+			amount: amountMsat,
 			metadata: crypto.randomBytes(32)
 		};
 
-		if (options?.quantity !== undefined) request.quantity = options.quantity;
+		// BOLT 12: an offer with offer_quantity_max requires invreq_quantity,
+		// even for a single unit.
+		if (options?.quantity !== undefined || offer.quantityMax !== undefined) {
+			request.quantity = quantity;
+		}
 		if (options?.payerNote) request.payerNote = options.payerNote;
 		// BOLT 12: invreq_chain MUST name the chain unless it is bitcoin
 		// mainnet. Default it from the offer's own chains — omitting it on
@@ -676,6 +701,7 @@ export class OfferManager extends EventEmitter {
 
 		// If we have an onion message manager and the offer has paths or issuer_id, send via onion
 		let replyPathId: Buffer | undefined;
+		let terminalNodeId: Buffer | undefined;
 		if (this.onionMessageManager && (offer.paths || offer.issuerId)) {
 			const messageData = new Map<number, Buffer>();
 			messageData.set(TLV_INVOICE_REQUEST, signedRequestTlv);
@@ -699,12 +725,15 @@ export class OfferManager extends EventEmitter {
 			// onion messages are ALWAYS blinded (every hop payload carries
 			// encrypted_data and the sphinx layer is addressed to blinded node
 			// ids), so a raw unblinded send is silently dropped by CLN/LND.
+			const offerPath =
+				offer.paths && offer.paths.length > 0 ? offer.paths[0] : undefined;
+			terminalNodeId =
+				offerPath?.blindedHops[offerPath.blindedHops.length - 1]?.blindedNodeId;
 			const sendPath =
-				offer.paths && offer.paths.length > 0
-					? offer.paths[0]
-					: offer.issuerId
+				offerPath ??
+				(offer.issuerId
 					? constructBlindedPath(crypto.randomBytes(32), [offer.issuerId], [{}])
-					: null;
+					: null);
 			if (sendPath) {
 				// The request is handed straight to the introduction node.
 				if (this.connectFirstHop) {
@@ -742,7 +771,10 @@ export class OfferManager extends EventEmitter {
 				timer,
 				sentRecords,
 				replyPathId,
-				offerIdHex: offer.offerId.toString('hex')
+				offerIdHex: offer.offerId.toString('hex'),
+				offer,
+				terminalNodeId,
+				amountMsat
 			});
 		});
 	}
@@ -838,6 +870,22 @@ export class OfferManager extends EventEmitter {
 			}
 		}
 
+		// Delegated offers too (spec section 9.7.3 answers only requests that
+		// pass BOLT 12's checks): a policy prices by the requested amount, so
+		// an underpaying request would otherwise buy a cheaper slot.
+		const terms = this.invoiceRequestTerms(matchedOffer, request);
+		if ('error' in terms) {
+			const error: IInvoiceError = { error: terms.error };
+			if (replyPath && this.onionMessageManager) {
+				const errData = encodeInvoiceErrorTlv(error);
+				const messageData = new Map<number, Buffer>();
+				messageData.set(TLV_INVOICE_ERROR, errData);
+				this.onionMessageManager.sendReply(replyPath, messageData);
+			}
+			this.emit('invoice:error', error);
+			return null;
+		}
+
 		// A delegated offer (spec section 9.7): the policy decides the hash,
 		// the amount, the paths and the key. It never mints a preimage here.
 		const policy = this.offers.get(matchedOfferIdHex!)?.policy;
@@ -855,22 +903,7 @@ export class OfferManager extends EventEmitter {
 				replyPath
 			);
 		}
-
-		// Validate amount
-		const amount = request.amount ?? matchedOffer.amount;
-		if (amount === undefined) {
-			const error: IInvoiceError = {
-				error: 'Amount required but not specified'
-			};
-			if (replyPath && this.onionMessageManager) {
-				const errData = encodeInvoiceErrorTlv(error);
-				const messageData = new Map<number, Buffer>();
-				messageData.set(TLV_INVOICE_ERROR, errData);
-				this.onionMessageManager.sendReply(replyPath, messageData);
-			}
-			this.emit('invoice:error', error);
-			return null;
-		}
+		const amount = terms.amount;
 
 		// Create invoice
 		const preimage = crypto.randomBytes(32);
@@ -996,6 +1029,54 @@ export class OfferManager extends EventEmitter {
 		return invoice;
 	}
 
+	/**
+	 * BOLT 12 issuer checks of an invoice_request against the terms of an
+	 * offer we answer, and the amount to invoice: invreq_amount,
+	 * never below the offer's price times the quantity, or that price when
+	 * the request names no amount.
+	 */
+	private invoiceRequestTerms(
+		offer: IOffer,
+		request: IInvoiceRequest
+	): { amount: bigint } | { error: string } {
+		// No offer_chains means bitcoin only; no invreq_chain means bitcoin.
+		const chain = request.chain ?? BITCOIN_CHAIN_HASH;
+		const chains = offer.chains ?? [BITCOIN_CHAIN_HASH];
+		if (!chains.some((c) => c.equals(chain))) return { error: 'Wrong chain' };
+
+		if (offer.quantityMax === undefined) {
+			if (request.quantity !== undefined) {
+				return { error: 'Offer does not take a quantity' };
+			}
+		} else if (request.quantity === undefined) {
+			return { error: 'Quantity required' };
+		} else if (
+			// A zero quantity prices the request at nothing; a zero
+			// offer_quantity_max means no upper limit.
+			request.quantity === 0n ||
+			(offer.quantityMax !== 0n && request.quantity > offer.quantityMax)
+		) {
+			return { error: 'Invalid quantity' };
+		}
+
+		const expected =
+			offer.amount === undefined
+				? undefined
+				: offer.amount * (request.quantity ?? 1n);
+		if (request.amount === undefined) {
+			if (expected === undefined) {
+				return { error: 'Amount required but not specified' };
+			}
+			// invoice_amount is a u64 on the wire; encoding a larger one throws.
+			if (expected > MAX_U64) return { error: 'Amount too large' };
+			return { amount: expected };
+		}
+		if (expected !== undefined && request.amount < expected) {
+			return { error: 'Amount below the offer price' };
+		}
+		return { amount: request.amount };
+	}
+
 	private answerByPolicy(
 		policy: IssuancePolicy,
 		ctx: IIssuanceContext,
@@ -1059,13 +1140,16 @@ export class OfferManager extends EventEmitter {
 	/**
 	 * BOLT 12 signer rule for the payer: an offer with offer_issuer_id is
 	 * answered under that key; a path-terminal offer (paths, no issuer id)
-	 * is answered under the final blinded_node_id of one of its paths.
+	 * is answered under the final blinded_node_id of the path the request was
+	 * sent to, or of one of its paths when that is not known.
 	 */
 	private invoiceSignerMatchesOffer(
 		invoice: IBolt12Invoice,
-		offer: IOffer
+		offer: IOffer,
+		terminalNodeId?: Buffer
 	): boolean {
 		if (offer.issuerId) return invoice.nodeId.equals(offer.issuerId);
+		if (terminalNodeId) return invoice.nodeId.equals(terminalNodeId);
 		if (offer.paths && offer.paths.length > 0) {
 			return offer.paths.some((p) => {
 				const last = p.blindedHops[p.blindedHops.length - 1];
@@ -1211,13 +1295,19 @@ export class OfferManager extends EventEmitter {
 
 		// BOLT 12 reader checks (S-4.H3), split in two. The request-independent
 		// part — the signature commits to the FULL record set (mirrored +
-		// unknown fields included), and the invoice MUST carry blinded payment
-		// paths with exactly one payinfo per path — is memoized so candidate
-		// scanning runs it once. The per-request part checks the invoice's
-		// invreq-range fields byte-match the records THAT request sent.
+		// unknown fields included), the invoice MUST carry blinded payment
+		// paths with exactly one payinfo per path, and it must not have
+		// expired — is memoized so candidate scanning runs it once. The
+		// per-request part checks the invoice's invreq-range fields
+		// byte-match the records THAT request sent, that it charges exactly
+		// the amount that request asked for, and that its signer is the one
+		// the offer designates.
 		let globalReasonMemo: string | null | undefined;
 		const globalReason = (): string | null => {
 			if (globalReasonMemo !== undefined) return globalReasonMemo;
+			const expiresAt =
+				invoice.createdAt +
+				BigInt(invoice.relativeExpiry ?? DEFAULT_INVOICE_RELATIVE_EXPIRY);
 			if (!this.verifyInvoiceSignature(invoice, records)) {
 				globalReasonMemo = 'invalid invoice signature';
 			} else if (!invoice.paths || invoice.paths.length === 0) {
@@ -1227,6 +1317,8 @@ export class OfferManager extends EventEmitter {
 				invoice.blindedPayInfo.length !== invoice.paths.length
 			) {
 				globalReasonMemo = 'invoice_blindedpay must carry one payinfo per path';
+			} else if (BigInt(Math.floor(Date.now() / 1000)) > expiresAt) {
+				globalReasonMemo = 'invoice has expired';
 			} else {
 				globalReasonMemo = null;
 			}
@@ -1244,16 +1336,29 @@ export class OfferManager extends EventEmitter {
 			}
 			return null;
 		};
-		const validateAgainstSent = (sentRecords?: ITlvRecord[]): string | null =>
-			globalReason() ?? mirrorReason(sentRecords);
+		type Pending = NonNullable<
+			ReturnType<(typeof this.pendingInvoiceRequests)['get']>
+		>;
+		const validateAgainstSent = (pending: Pending): string | null => {
+			const reason = globalReason() ?? mirrorReason(pending.sentRecords);
+			if (reason) return reason;
+			if (invoice.amount !== pending.amountMsat) {
+				return `invoice_amount ${invoice.amount} msat is not the requested ${pending.amountMsat} msat`;
+			}
+			if (
+				!this.invoiceSignerMatchesOffer(
+					invoice,
+					pending.offer,
+					pending.terminalNodeId
+				)
+			) {
+				return 'invoice_node_id is not the signer the offer designates';
+			}
+			return null;
+		};
 
-		const settle = (
-			requestIdHex: string,
-			pending: NonNullable<
-				ReturnType<(typeof this.pendingInvoiceRequests)['get']>
-			>
-		): void => {
-			const reason = validateAgainstSent(pending.sentRecords);
+		const settle = (requestIdHex: string, pending: Pending): void => {
+			const reason = validateAgainstSent(pending);
 			clearTimeout(pending.timer);
 			this.pendingInvoiceRequests.delete(requestIdHex);
 			if (reason) {
@@ -1318,7 +1423,7 @@ export class OfferManager extends EventEmitter {
 			);
 			if (!descMatch || !issuerMatch) continue;
 			sawCompatibleOffer = true;
-			if (validateAgainstSent(pending.sentRecords) !== null) continue;
+			if (validateAgainstSent(pending) !== null) continue;
 			settle(requestIdHex, pending);
 			return;
 		}

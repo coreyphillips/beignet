@@ -56,6 +56,7 @@ import { Channel, ISpliceWalletInput } from '../channel/channel';
 import { isValidShutdownScript } from '../channel/validation';
 import {
 	estimateSpliceTxWeight,
+	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../channel/splice-weight';
 import {
@@ -74,7 +75,8 @@ import {
 	PeerManager,
 	IPeerDialOptions,
 	IPeerInfo,
-	PeerDialCancelledError
+	PeerDialCancelledError,
+	Socks5ProxyScope
 } from '../transport/peer-manager';
 import { IPeerTransportOptions } from '../transport/duplex-transport';
 import { parseWebSocketUrl } from '../transport/websocket';
@@ -84,7 +86,9 @@ import {
 	findMultiPathRoute,
 	findRouteToBlindedPath,
 	calculateFee,
-	ILocalChannelEdge
+	ILocalChannelEdge,
+	TPolicyOverrides,
+	policyOverrideKey
 } from '../gossip/pathfinding';
 import {
 	applyRapidGossipSnapshot,
@@ -102,6 +106,8 @@ import {
 	ADDRESS_TYPE_TORV2,
 	ADDRESS_TYPE_TORV3,
 	DEFAULT_PRUNE_MAX_AGE,
+	CHANNEL_FLAG_DIRECTION,
+	CHANNEL_FLAG_DISABLED,
 	gossipTimestampTooFarFuture
 } from '../gossip/types';
 import {
@@ -134,12 +140,17 @@ import {
 	encodeOnionPacket,
 	decodeOnionPacket
 } from '../onion/construct';
-import { processOnionPacket, isFinalHop } from '../onion/process';
+import {
+	processOnionPacket,
+	isFinalHop,
+	OnionProcessingError
+} from '../onion/process';
 import { computeSharedSecrets } from '../onion/sphinx-crypto';
 import {
 	createFailureMessage,
 	wrapFailureMessage,
 	decryptFailureMessage,
+	extractChannelUpdate,
 	FAILURE_MESSAGE_LENGTH
 } from '../onion/failures';
 import {
@@ -150,6 +161,7 @@ import {
 	FINAL_INCORRECT_HTLC_AMOUNT,
 	INVALID_ONION_HMAC,
 	INVALID_ONION_BLINDING,
+	INVALID_ONION_PAYLOAD,
 	PERMANENT_CHANNEL_FAILURE,
 	UNKNOWN_NEXT_PEER,
 	REQUIRED_CHANNEL_FEATURE_MISSING,
@@ -285,6 +297,7 @@ import {
 	IPaymentPreimageEvent,
 	LightningErrorCode,
 	LightningPaymentError,
+	PaymentWaitTimeoutError,
 	InvalidChannelOpenError,
 	ChannelFundingUnavailableError,
 	ChannelFundingUnavailableCode,
@@ -320,6 +333,7 @@ import {
 } from './funding-selection';
 import {
 	validateHexPubkey,
+	normalizeHexPubkey,
 	validateBuffer,
 	validateBufferMinMax,
 	validatePositiveBigint,
@@ -343,6 +357,8 @@ import {
 	RecoveryManager,
 	RecoveryCriticality,
 	RecoveryMutation,
+	IRecoveryCommitResult,
+	assertMutationEncodable,
 	GuardianStartupGate,
 	DurabilityBarrier,
 	IBarrierLatency,
@@ -354,6 +370,7 @@ import {
 	RecoveryJournal,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
+	encodedMutationBytes,
 	journalSupported,
 	loadWriterLease,
 	composeRecoveryCapsule,
@@ -367,6 +384,7 @@ import {
 import { FeatureFlags, Feature } from '../features/flags';
 import {
 	ChainWatcher,
+	classifyAnnouncedChannelFunding,
 	classifyRemoteFundingInput,
 	computeScriptHash
 } from '../chain/chain-watcher';
@@ -404,7 +422,8 @@ import { createTaprootFundingScript } from '../script/funding-taproot';
 import {
 	isTaprootChannel,
 	isAnchorChannel,
-	hasScidAliasChannelType
+	hasScidAliasChannelType,
+	receivedAddIrrevocablyCommitted
 } from '../channel/types';
 import {
 	createOpenerState,
@@ -601,6 +620,15 @@ const GOSSIP_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
  * would close the channel). Mirrors the safety margin used for forwarded HTLCs.
  */
 export const HELD_HTLC_EXPIRY_MARGIN = 18;
+/**
+ * Blocks between our chain tip and the lowest outgoing cltv_expiry a forward
+ * may carry (issue #1009). An onward HTLC whose expiry has passed, or sits
+ * this close to the tip, is failed upstream with expiry_too_soon rather than
+ * offered downstream: the downstream cannot take it safely, and a peer that
+ * answers the offer by failing the channel would cost us the outgoing
+ * channel. LND's OutgoingCltvRejectDelta defaults to the same 3 blocks.
+ */
+export const OUTGOING_CLTV_REJECT_DELTA = 3;
 /** awaitPaymentResolution re-reads the HTLC view on this clock (#737). */
 const PAYMENT_RESOLUTION_POLL_MS = 250;
 /**
@@ -616,6 +644,14 @@ const SWAP_TICK_SWEEP_DEADLINE_MS = 30_000;
  * shift with hex formatting.
  */
 const HELD_FORWARD_ROW_BYTES = 1024;
+/**
+ * Encoded bytes of failureReason a payment row keeps. The reason is free
+ * text (an error message, a caller's string), and the payment metadata
+ * bound reserves this much for it on a row that can still fail.
+ */
+const PAYMENT_FAILURE_REASON_MAX_BYTES = 256;
+/** The widest htlc id or amount a settled incoming row can record. */
+const U64_MAX = 2n ** 64n - 1n;
 /** Metadata key the receiver's async receive grants persist under. */
 const ASYNC_RECEIVE_GRANTS_KEY = 'async_receive_grants';
 /**
@@ -652,6 +688,12 @@ const CHANNEL_KEY_INDEX_ALLOCATED_KEY = 'channel_key_index_allocated';
  * pubkeys, rewritten whole on every change.
  */
 const ZERO_CONF_TRUSTED_PEERS_KEY = 'zero_conf_trusted_peers';
+/**
+ * Metadata key the owed fails of rejected MPP parts persist under (issue
+ * #1265): a JSON array of `{ key, failureCode }`, the key being the part's
+ * `<channelIdHex>:<htlcId>`. Rewritten whole on every change.
+ */
+const OWED_PART_FAILURES_KEY = 'owed_part_failures';
 /** Default wait for an LSP's answer to a registration request. */
 const ASYNC_GRANT_REQUEST_TIMEOUT_MS = 30_000;
 /** Grants kept per LSP (newest first); older ones are dropped. */
@@ -738,6 +780,24 @@ function spliceRefusalCodeFor(result: ChannelResult): SpliceRefusalCode {
 	return result.transient
 		? SpliceRefusalCode.SPLICE_BUSY
 		: SpliceRefusalCode.SPLICE_REFUSED;
+}
+
+/** Bytes a string takes in a journaled row, its quotes included. */
+function jsonBytes(value: string): number {
+	return Buffer.byteLength(JSON.stringify(value), 'utf8');
+}
+
+/** The reason cut to PAYMENT_FAILURE_REASON_MAX_BYTES as a journal encodes it. */
+function boundedFailureReason(reason: string): string {
+	// Every UTF-16 unit encodes to at least one byte.
+	let end = Math.min(reason.length, PAYMENT_FAILURE_REASON_MAX_BYTES);
+	while (
+		jsonBytes(reason.slice(0, end)) - 2 >
+		PAYMENT_FAILURE_REASON_MAX_BYTES
+	) {
+		end--;
+	}
+	return reason.slice(0, end);
 }
 
 /**
@@ -854,6 +914,12 @@ export class LightningNode extends EventEmitter {
 	// rows remain, and the payee and every hop can know the preimage, so a
 	// keysend or an invoice on the hash would write over the row.
 	private prunedOutgoingHashes: Set<string> = new Set();
+	// The PAID subset of those (COMPLETED, or FAILED with the preimage
+	// recorded). The senders refuse these after the record and preimage are
+	// gone (issue #975): the durable row answers on a node with storage, this
+	// set on one without. A pruned FAILED hash is not here: it stays
+	// retryable.
+	private prunedCompletedOutgoingHashes: Set<string> = new Set();
 	private scidToChannelId: Map<string, Buffer> = new Map();
 	private htlcPaymentMap: Map<string, string> = new Map(); // "channelId:htlcId" → paymentHash hex
 	// For forwarded HTLCs: maps "outChannelId:outHtlcId" → { inChannelId, inHtlcId }
@@ -874,6 +940,28 @@ export class LightningNode extends EventEmitter {
 			failReason?: Buffer;
 			/** Whether `failReason` is a complete failure message already. */
 			failPreWrapped?: boolean;
+		}
+	> = new Map();
+	/**
+	 * Failures of this node's own outgoing HTLCs held back until the failed
+	 * HTLC's removal is irrevocable (issue #989), keyed like htlcPaymentMap
+	 * ("channelIdHex:offered-<htlcId>"). Parked by handleHtlcFailed, settled
+	 * by drainRetriesAwaitingRemoval on the revoke_and_ack that completes the
+	 * removal, dropped by handleHtlcFulfilled when the HTLC is fulfilled
+	 * after all. Memory-only, like a forward's held failReason: a restart
+	 * inside the window loses the parked failure and with it the retry
+	 * attempt, never a payment. The removal still completes on reestablish;
+	 * a fail the peer retransmits is parked and settled anew (on the give-up
+	 * path, the retry context being memory too), and one it does not
+	 * retransmit leaves the record PENDING for scanStuckPayments.
+	 */
+	private retriesAwaitingRemoval: Map<
+		string,
+		{
+			channelId: Buffer;
+			htlcId: bigint;
+			reason: Buffer;
+			localFailureReason?: string;
 		}
 	> = new Map();
 	// Payment secret for receiving: paymentHashHex → paymentSecret
@@ -987,6 +1075,13 @@ export class LightningNode extends EventEmitter {
 	private gossipIntakeDropped = 0;
 	private static readonly GOSSIP_INTAKE_MAX = 30_000;
 	private static readonly GOSSIP_INTAKE_SLICE_MS = 10;
+	/**
+	 * SCIDs of verified graph channels whose funding output is still to be
+	 * checked on chain, oldest first (issue #1105). Only filled when the chain
+	 * backend can answer the check.
+	 */
+	private gossipFundingQueue: Set<string> = new Set();
+	private gossipFundingChecking = false;
 	/** Our own node_announcement (cached so we can re-broadcast it for propagation). */
 	private _ownNodeAnnouncement?: Buffer;
 	/** Our own channel_announcement + channel_update per channel, cached for re-broadcast. */
@@ -1104,8 +1199,20 @@ export class LightningNode extends EventEmitter {
 	 * because a local frame is not a quorum-durable one.
 	 */
 	private authorizedSpliceBroadcasts: Set<string> = new Set();
+	/**
+	 * SPLICE_BROADCAST_REFUSED already raised this process, keyed
+	 * `${txid}:${reason}` (issue #1062): the per-block re-send repeats the
+	 * same refusal until the splice confirms, and one report per reason is
+	 * the useful number.
+	 */
+	private _spliceRefusalsReported: Set<string> = new Set();
 	private static readonly REAUTH_RETRY_MS = 10 * 60_000;
 	private paymentRetryContexts: Map<string, IPaymentRetryContext> = new Map();
+	/**
+	 * The context the failure handler is re-dispatching through sendPayment:
+	 * the one existing context a BOLT 11 send continues (issue #1041).
+	 */
+	private redispatchingRetryContext: IPaymentRetryContext | undefined;
 	private mppCleanupTimer: ReturnType<typeof setInterval> | null = null;
 	// Per-HTLC shared secrets for creating encrypted failure messages (keyed by "channelIdHex:htlcId")
 	private receivedHtlcSharedSecrets: Map<string, Buffer> = new Map();
@@ -1240,13 +1347,19 @@ export class LightningNode extends EventEmitter {
 	 * terminal (FAILED, forward_refused); the refund is owed here and
 	 * retried when the channel reestablishes and on every block, so a live
 	 * reconnect resolves it, not only a restart. Keyed by inbound identity.
-	 * A late hold part turned away as `held_set_complete` (issue #822) is owed
-	 * here too.
+	 * A late hold part turned away as `held_set_complete` (issue #822), a
+	 * part refused as `settled_row_full` (issue #1189), and an MPP part failed
+	 * at the MPP timeout (issue #1233), is owed here too. An MPP part's entry
+	 * carries its failure code and is persisted (issue #1265): nothing else
+	 * durable says the part was rejected, and the restore repair would put
+	 * it into a new set.
 	 */
 	private owedHeldForwardFailures = new Map<
 		string,
-		{ inChannelIdHex: string; fail: () => boolean }
+		{ inChannelIdHex: string; fail: () => boolean; failureCode?: number }
 	>();
+	/** The last `owed_part_failures` write failed; every block retries it. */
+	private owedPartFailuresUnsaved = false;
 	private graphPruneTimer: ReturnType<typeof setInterval> | null = null;
 	private _chainBackend: import('../chain/chain-watcher').IChainBackend | null =
 		null;
@@ -1318,6 +1431,9 @@ export class LightningNode extends EventEmitter {
 	private largeChannels: boolean;
 	// SOCKS5 proxy config, kept for connect-by-node-id Tor address gating
 	private socks5Proxy: { host: string; port: number } | null;
+	// Which hosts ride socks5Proxy: 'all' or 'onion' (issue #963). Threaded to
+	// the peer manager and the watchtower client, which share one table.
+	private socks5ProxyScope: Socks5ProxyScope;
 	/**
 	 * The reference guardian this node serves to OTHER nodes over bolt8
 	 * sessions (wire 2.7, issue #699), or null. Unrelated to this node's own
@@ -1454,7 +1570,23 @@ export class LightningNode extends EventEmitter {
 								});
 							},
 							snapshotIntervalFrames: config.recovery.snapshotIntervalFrames,
-							snapshotIntervalBytes: config.recovery.snapshotIntervalBytes
+							snapshotIntervalBytes: config.recovery.snapshotIntervalBytes,
+							maxFrameCiphertextBytes: barrier
+								? (): number => barrier.maxRecordBytes()
+								: undefined,
+							onFrameCeiling: ({ outcome, detail }): void => {
+								this.logger?.warn(`recovery journal: ${detail}`);
+								// Deferred out of the commit's open transaction, as above.
+								setImmediate(() => {
+									this.emitStructuredLog(
+										'channel',
+										outcome === 'trimmed'
+											? 'recovery_snapshot_trimmed'
+											: 'recovery_frame_oversized',
+										{ detail }
+									);
+								});
+							}
 						}
 				  )
 				: undefined;
@@ -1563,6 +1695,7 @@ export class LightningNode extends EventEmitter {
 		this.paymentBasepointSecret = config.paymentBasepointSecret;
 		this.feeEstimator = config.feeEstimator || null;
 		this.socks5Proxy = config.socks5Proxy ?? null;
+		this.socks5ProxyScope = config.socks5ProxyScope ?? 'all';
 		this.initWatchtowerClient(config.watchtowers ?? []);
 		this.logger = config.logger ?? noopLogger;
 		if (durabilityRefusal) {
@@ -1781,6 +1914,7 @@ export class LightningNode extends EventEmitter {
 			// Ceiling evictions (issue #446) must reach disk, or the evicted
 			// rows re-inflate the graph on the next restore.
 			onChannelEvicted: (scidHex) => {
+				this.gossipFundingQueue.delete(scidHex);
 				if (typeof this.storage?.deleteGossipChannel === 'function') {
 					this.safeStorage(
 						() => this.storage!.deleteGossipChannel!(scidHex),
@@ -1804,6 +1938,25 @@ export class LightningNode extends EventEmitter {
 					this.safeStorage(
 						() => this.storage!.deleteGossipNode!(nodeIdHex),
 						'deleteGossipNode'
+					);
+				}
+			},
+			onFundingUnproven: (scidHex): void => {
+				const backend = this._chainBackend;
+				if (!backend?.listUnspent || !backend.getTransactionMerkleProof) {
+					return;
+				}
+				this.gossipFundingQueue.add(scidHex);
+				this.checkGossipFunding();
+			},
+			// The failed verdict is what lets a different announcement replace
+			// this one, so it has to outlive a restart (issue #1131).
+			onChannelAnnouncementFailed: (scidHex): void => {
+				const channel = this.graph.getChannel(Buffer.from(scidHex, 'hex'));
+				if (channel) {
+					this.safeStorage(
+						() => this.storage!.saveGossipChannel(scidHex, channel),
+						'saveGossipChannel'
 					);
 				}
 			}
@@ -2108,7 +2261,11 @@ export class LightningNode extends EventEmitter {
 				networks: config.chainHashes,
 				autoReconnect: this.autoReconnect,
 				maxReconnectDelay: config.maxReconnectDelay,
+				maxInboundPeers: config.maxInboundPeers,
+				isChannelPeer: (pubkey): boolean =>
+					this.channelManager.getChannelsByPeer(pubkey).length > 0,
 				socks5Proxy: config.socks5Proxy,
+				socks5ProxyScope: this.socks5ProxyScope,
 				webSocketImpl: config.webSocketImpl
 			});
 			this.channelManager.attachToPeerManager(this.peerManager);
@@ -2819,6 +2976,9 @@ export class LightningNode extends EventEmitter {
 				continue;
 			}
 			const channel = new Channel(state);
+			// Before restoreChainWatches or a resumed exchange can arm a funding
+			// watch from the stored depth (issue #1197).
+			const depthRaised = channel.repairLegacyV2OpenerDepth();
 			const keyIndex = this.storage!.loadChannelKeyIndex(channelId);
 			this.channelManager.restoreChannel(channel, peerPubkey, keyIndex);
 			// This row was read off disk and nothing has checked it against
@@ -2833,6 +2993,14 @@ export class LightningNode extends EventEmitter {
 			// for non-splicing channels, and that reset clears _lastSentBatch,
 			// so bytes restored before it would be silently wiped.
 			this.restoreOutboxRetransmission(channelId, channel);
+			if (depthRaised) {
+				this.emitStructuredLog('channel', 'legacy_v2_depth_raised', {
+					channelId
+				});
+				// A failed write only means the next load, at startup or a live
+				// reload, raises it again.
+				this.persistChannel(Buffer.from(channelId, 'hex'));
+			}
 		}
 
 		// Restore payments
@@ -2897,6 +3065,32 @@ export class LightningNode extends EventEmitter {
 		// Restore HTLC shared secrets (for failure decryption after crash)
 		for (const { key, secret } of this.storage.loadAllHtlcSharedSecrets()) {
 			this.receivedHtlcSharedSecrets.set(key, secret);
+		}
+
+		// Rejected MPP parts still owed their fail. Back before any channel
+		// reestablishes, so the restore repair leaves them to the owed retry.
+		const owedPartsJson = this.storage.loadMetadata(OWED_PART_FAILURES_KEY);
+		if (owedPartsJson) {
+			try {
+				const parsed = JSON.parse(owedPartsJson) as Array<{
+					key: string;
+					failureCode: number;
+				}>;
+				for (const { key, failureCode } of parsed) {
+					const [channelIdHex, htlcId] = key.split(':');
+					this.owedHeldForwardFailures.set(key, {
+						inChannelIdHex: channelIdHex,
+						fail: this.rejectedPartFail(
+							Buffer.from(channelIdHex, 'hex'),
+							BigInt(htlcId),
+							failureCode
+						),
+						failureCode
+					});
+				}
+			} catch {
+				/* ignore corrupted owed-part metadata */
+			}
 		}
 
 		// Restore per-channel routing-policy overrides
@@ -3050,7 +3244,7 @@ export class LightningNode extends EventEmitter {
 							typeof pubkey === 'string' &&
 							validateHexPubkey(pubkey, 'pubkeyHex') === null
 						) {
-							this.channelManager.addTrustedPeer(pubkey);
+							this.channelManager.addTrustedPeer(normalizeHexPubkey(pubkey));
 						}
 					}
 				}
@@ -3372,7 +3566,7 @@ export class LightningNode extends EventEmitter {
 			if (!key.startsWith('received-')) continue;
 			// Only an irrevocably committed HTLC is safe to act on, and one we
 			// already fulfilled or failed is resolved by definition.
-			if (htlc.state !== HtlcState.COMMITTED) continue;
+			if (!receivedAddIrrevocablyCommitted(htlc)) continue;
 			// Never dispatched in the first place: handleRevokeAndAck still owes it
 			// a dispatch and will emit when the round completes.
 			if (htlc.forwardEmitted !== true) continue;
@@ -3387,6 +3581,16 @@ export class LightningNode extends EventEmitter {
 			// An FFOR voucher (section 9.5.1): the epoch's drain or unwind
 			// resolves it, never the onion path. Same for a mismatching add.
 			if (htlc.fforVoucher === true || htlc.fforMismatch === true) continue;
+			// Rejected before the restart and still owed its fail: the owed
+			// retry carries it, and a dispatch would put a rejected MPP part
+			// back into a new set (issue #1265).
+			if (
+				this.owedHeldForwardFailures.has(
+					`${channelId.toString('hex')}:${htlc.id}`
+				)
+			) {
+				continue;
+			}
 			// Held by the JIT engine before the restart, and already owed a
 			// refund by the restored-hold queue. Dispatching it again would
 			// forward a payment the sweep is about to fail upstream.
@@ -3398,15 +3602,121 @@ export class LightningNode extends EventEmitter {
 			) {
 				continue;
 			}
+			// A part its completed payment already settled is fulfilled here.
+			// handleIncomingHtlc sheds load and applies its policy fail-backs
+			// before the final hop reads that payment, and failing the part
+			// would lose its value.
+			if (
+				this.fulfillSettledReceivedHtlc(channelId, htlc.id, htlc.paymentHash)
+			) {
+				continue;
+			}
 
 			this.handleIncomingHtlc(
 				channelId,
 				htlc.id,
 				htlc.amountMsat,
-				htlc.paymentHash,
-				true
+				htlc.paymentHash
 			);
 		}
+	}
+
+	/**
+	 * Fulfill each received HTLC on this channel that a completed incoming
+	 * payment lists in settledHtlcs but that is still COMMITTED. An MPP set
+	 * fulfills every part when its last one arrives, and a part on a channel
+	 * awaiting reestablishment at that moment is refused. The restart
+	 * redispatch never runs for a channel that stayed live.
+	 *
+	 * Gated on durable facts only, so it is safe on every reconnect: a
+	 * fulfilled entry is no longer COMMITTED. Held and FFOR voucher entries
+	 * are left to their own machinery, as the restart redispatch leaves them.
+	 *
+	 * The record's direction is not checked. Only receive settlement writes
+	 * settledHtlcs, so a listed HTLC is one this node already chose to settle.
+	 * A circular payment's record is OUTGOING, because sendPaymentToRoute
+	 * replaces the invoice's record, and its received parts are still owed.
+	 */
+	private fulfillSettledReceivedHtlcs(channelId: Buffer): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		for (const [key, htlc] of [...channel.getFullState().htlcs]) {
+			if (!key.startsWith('received-')) continue;
+			if (htlc.state !== HtlcState.COMMITTED) continue;
+			if (this.isHeldHtlc(channelId, htlc.id)) continue;
+			if (htlc.fforVoucher === true || htlc.fforMismatch === true) continue;
+			this.fulfillSettledReceivedHtlc(channelId, htlc.id, htlc.paymentHash);
+		}
+	}
+
+	/**
+	 * Fulfill a received HTLC that a completed payment lists in settledHtlcs.
+	 * Returns false when none does or its preimage is gone, and true
+	 * otherwise, even when the fulfill is refused: the part is owed a
+	 * fulfill, never a dispatch. A refused part keeps its shared secret for
+	 * the retry on the next reestablish.
+	 */
+	private fulfillSettledReceivedHtlc(
+		channelId: Buffer,
+		htlcId: bigint,
+		paymentHash: Buffer
+	): boolean {
+		const hashHex = paymentHash.toString('hex');
+		const htlcKey = `${channelId.toString('hex')}:${htlcId}`;
+		const payment = this.payments.get(hashHex);
+		if (
+			payment?.status !== PaymentStatus.COMPLETED ||
+			!payment.settledHtlcs?.includes(htlcKey)
+		) {
+			return false;
+		}
+		const preimage = this.preimages.get(hashHex) ?? payment.preimage;
+		if (!preimage) return false;
+		if (this.channelManager.fulfillHtlc(channelId, htlcId, preimage).ok) {
+			this.cleanupHtlcSharedSecret(htlcKey);
+		}
+		return true;
+	}
+
+	/**
+	 * A splice that a reconnect resumed and that then aborts or reverts
+	 * returns to NORMAL without channel:reestablished or splice:complete, so
+	 * a completed payment's part refused during the reconnect is retried
+	 * here. An abort can also land on a channel still awaiting reestablish,
+	 * which would only refuse the fulfill; the reestablish retries it there.
+	 * Deferred: both events fire from inside a processActions dispatch.
+	 */
+	private fulfillSettledReceivedHtlcsAfterSplice(channelId: Buffer): void {
+		setImmediate(() => {
+			if (this.channelManager.getChannel(channelId)?.canSettleHtlcs()) {
+				this.fulfillSettledReceivedHtlcs(channelId);
+			}
+		});
+	}
+
+	/**
+	 * True while a received HTLC this completed payment settled is still
+	 * COMMITTED on a channel that has not gone to chain: the record and its
+	 * preimage are what fulfillSettledReceivedHtlcs reads to send it.
+	 */
+	private owesSettledFulfill(payment: IPaymentInfo): boolean {
+		if (payment.status !== PaymentStatus.COMPLETED) return false;
+		for (const htlcKey of payment.settledHtlcs ?? []) {
+			const [channelHex, htlcId] = htlcKey.split(':');
+			const channelId = Buffer.from(channelHex, 'hex');
+			const channel = this.channelManager.getChannel(channelId);
+			if (!channel || this.channelManager.getMonitor(channelId)) continue;
+			const state = channel.getState();
+			if (
+				state === ChannelState.CLOSED ||
+				state === ChannelState.FORCE_CLOSED
+			) {
+				continue;
+			}
+			const htlc = channel.getFullState().htlcs.get(`received-${htlcId}`);
+			if (htlc?.state === HtlcState.COMMITTED) return true;
+		}
+		return false;
 	}
 
 	/** True when this received HTLC is parked awaiting a hold-invoice decision. */
@@ -3570,15 +3880,27 @@ export class LightningNode extends EventEmitter {
 		}
 		// Whatever the caller staged for this transition (preimage before a
 		// fulfill, linkage before a forward) commits with it or not at all.
-		const staged = this.takeStagedMutations();
-		mutations.push(...staged);
+		const { encodable, dropped } = this.dropUnencodable(
+			this.takeStagedMutations()
+		);
+		mutations.push(...encodable);
 
-		const result = this.recovery.commit({
-			criticality: RecoveryCriticality.SafetyCritical,
-			mutations,
-			outboundMessages: request?.outbound ?? [],
-			reportedByCaller: true
-		});
+		// A dropped mutation can never commit, so the transition that carried
+		// it fails as a whole: its sends are the action that depended on it.
+		const result: IRecoveryCommitResult =
+			dropped.length > 0
+				? {
+						committed: false,
+						released: [],
+						error: new Error('a staged mutation cannot be encoded'),
+						frameSequence: null
+				  }
+				: this.recovery.commit({
+						criticality: RecoveryCriticality.SafetyCritical,
+						mutations,
+						outboundMessages: request?.outbound ?? [],
+						reportedByCaller: true
+				  });
 
 		if (request) {
 			request.committed = result.committed;
@@ -3605,7 +3927,7 @@ export class LightningNode extends EventEmitter {
 				this.dirtyMonitors.add(channelIdHex);
 				this.monitorsAwaitingChannel.add(channelIdHex);
 			}
-			if (staged.length) this.stagedMutations.unshift(...staged);
+			if (encodable.length) this.stagedMutations.unshift(...encodable);
 			// A failed persist of a TERMINAL state has no later transition to
 			// ride; arm the per-block retry so the close (and its closeReason)
 			// still reaches disk once storage recovers.
@@ -3617,6 +3939,7 @@ export class LightningNode extends EventEmitter {
 			) {
 				this._failedTerminalPersists.add(channelIdHex);
 			}
+			for (const error of dropped) this.emit('node:error', error);
 			this.emit('node:error', {
 				code: 'PERSISTENCE_ERROR',
 				channelId,
@@ -3728,23 +4051,57 @@ export class LightningNode extends EventEmitter {
 		return this.stagedMutations.splice(0, this.stagedMutations.length);
 	}
 
+	/**
+	 * Split off every mutation that cannot be encoded. Such a mutation fails
+	 * every commit it joins, so requeueing it the way a storage failure is
+	 * requeued would sink every later channel persist until restart.
+	 *
+	 * The caller emits the returned errors only once the encodable rest is
+	 * committed or back on the stage, so a throwing listener cannot lose them.
+	 */
+	private dropUnencodable(mutations: RecoveryMutation[]): {
+		encodable: RecoveryMutation[];
+		dropped: ILightningError[];
+	} {
+		const encodable: RecoveryMutation[] = [];
+		const dropped: ILightningError[] = [];
+		for (const mutation of mutations) {
+			try {
+				assertMutationEncodable(mutation);
+				encodable.push(mutation);
+			} catch (error) {
+				const reason = (error as Error).message;
+				dropped.push({
+					code: 'PERSISTENCE_ERROR',
+					message: `Dropped a staged ${mutation.type} mutation that cannot be encoded: ${reason}`,
+					timestamp: Date.now()
+				} as ILightningError);
+			}
+		}
+		return { encodable, dropped };
+	}
+
 	/** Commit any mutations no channel transition picked up. */
 	private flushStagedMutations(): void {
-		const mutations = this.takeStagedMutations();
-		if (mutations.length === 0 || !this.recovery) return;
-		const result = this.recovery.commit({
-			criticality: RecoveryCriticality.SafetyCritical,
-			mutations,
-			outboundMessages: []
-		});
-		if (!result.committed) {
-			// Keep them staged so the next transition (or the next flush)
-			// retries, rather than silently dropping writes the caller believes
-			// it made. The failure itself is surfaced by the manager's onError
-			// hook; what must not happen is a preimage for value already paid
-			// downstream evaporating because one standalone commit failed.
-			this.stagedMutations.unshift(...mutations);
+		const { encodable: mutations, dropped } = this.dropUnencodable(
+			this.takeStagedMutations()
+		);
+		if (mutations.length > 0 && this.recovery) {
+			const result = this.recovery.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations,
+				outboundMessages: []
+			});
+			if (!result.committed) {
+				// Keep them staged so the next transition (or the next flush)
+				// retries, rather than silently dropping writes the caller believes
+				// it made. The failure itself is surfaced by the manager's onError
+				// hook; what must not happen is a preimage for value already paid
+				// downstream evaporating because one standalone commit failed.
+				this.stagedMutations.unshift(...mutations);
+			}
 		}
+		for (const error of dropped) this.emit('node:error', error);
 	}
 
 	/**
@@ -4068,6 +4425,7 @@ export class LightningNode extends EventEmitter {
 		// event where the restore repair above is not.
 		this.channelManager.on('channel:reestablished', (channelId: Buffer) => {
 			this.settleForwardsOwedUpstream(channelId);
+			this.fulfillSettledReceivedHtlcs(channelId);
 			// A conflict verdict the peer has not yet agreed is re-asked on
 			// every reconnect (issue #760).
 			this.resendSpliceConflicts(channelId.toString('hex'));
@@ -4256,6 +4614,16 @@ export class LightningNode extends EventEmitter {
 			const resolvedIdHex = channelId.toString('hex');
 			this._recoveryCloseRequested.delete(resolvedIdHex);
 			this._lastCloseBroadcast.delete(resolvedIdHex);
+			// A failure parked on this channel until its removal round
+			// completed (issue #989) never completes off chain now: the
+			// chain machinery owns its HTLC (handleOnChainOutputResolved
+			// fails the record when the timeout path wins, the preimage
+			// path completes it) and the stuck-payment sweep the rest.
+			for (const key of this.retriesAwaitingRemoval.keys()) {
+				if (key.startsWith(`${resolvedIdHex}:offered-`)) {
+					this.retriesAwaitingRemoval.delete(key);
+				}
+			}
 			for (const [txid, idHex] of this._pendingCloseTxids) {
 				if (idHex === resolvedIdHex) this._pendingCloseTxids.delete(txid);
 			}
@@ -4308,10 +4676,13 @@ export class LightningNode extends EventEmitter {
 			this.emit('splice:complete', { channelId, fundingTxid });
 			// A settle owed upstream that was still refused at quiescence:ended
 			// (a taproot channel parks updates until splice_locked) is carried
-			// now that the channel is NORMAL again. Deferred: this event fires
-			// from inside a processActions dispatch.
+			// now that the channel is NORMAL again, as is a completed payment's
+			// part. A reconnect that resumed the splice never emitted
+			// channel:reestablished. Deferred: this event fires from inside a
+			// processActions dispatch.
 			setImmediate(() => {
 				this.settleForwardsOwedUpstream(channelId);
+				this.fulfillSettledReceivedHtlcs(channelId);
 			});
 		});
 
@@ -4333,6 +4704,7 @@ export class LightningNode extends EventEmitter {
 				}
 				this.notifySpliceAbortedObservers(channelId, reason);
 				this.chainWatcher?.unwatchSpliceInputs(channelId);
+				this.fulfillSettledReceivedHtlcsAfterSplice(channelId);
 			}
 		);
 
@@ -4345,6 +4717,7 @@ export class LightningNode extends EventEmitter {
 			'splice:reverted',
 			(channelId: Buffer, spliceTxid: string, conflictTxid: string) => {
 				this.onSpliceReverted(channelId, spliceTxid, conflictTxid);
+				this.fulfillSettledReceivedHtlcsAfterSplice(channelId);
 			}
 		);
 		// The quiescence handshake behind a conflict revert request completed
@@ -4492,6 +4865,8 @@ export class LightningNode extends EventEmitter {
 							);
 						}
 						const channel = new Channel(row.state);
+						// The startup write of the raised depth may not have landed.
+						channel.repairLegacyV2OpenerDepth();
 						const keyIndex = this.storage!.loadChannelKeyIndex(idHex);
 						this.channelManager.restoreChannel(
 							channel,
@@ -4871,16 +5246,30 @@ export class LightningNode extends EventEmitter {
 
 		this.channelManager.on(
 			'htlc:failed',
-			(channelId: Buffer, htlcId: bigint, reason: Buffer) => {
-				this.handleHtlcFailed(channelId, htlcId, reason);
+			(
+				channelId: Buffer,
+				htlcId: bigint,
+				reason: Buffer,
+				malformedCode?: number
+			) => {
+				this.handleHtlcFailed(
+					channelId,
+					htlcId,
+					reason,
+					undefined,
+					malformedCode
+				);
 				this.emit('htlc:failed', { channelId, htlcId });
 			}
 		);
 
 		// A commitment round completed on this channel: any upstream refund
-		// held back on it as the outgoing leg may now be owed (issue #623).
+		// held back on it as the outgoing leg may now be owed (issue #623),
+		// and any own-payment failure parked on it may now be settled, and
+		// the payment retried (issue #989).
 		this.channelManager.on('commitment:revoked', (channelId: Buffer) => {
 			this.drainForwardsAwaitingRemoval(channelId);
+			this.drainRetriesAwaitingRemoval(channelId);
 		});
 
 		// An offered HTLC the channel dropped on a held restore rather than
@@ -5068,6 +5457,16 @@ export class LightningNode extends EventEmitter {
 					this.graph.addChannelAnnouncement(annMsg, {
 						verified: announcementValid
 					});
+					// Our own funding output needs no chain lookup to prove it. A
+					// row held under this SCID with other endpoints is someone
+					// else's and refused ours, so it gets no such pass.
+					const held = this.graph.getChannel(annMsg.shortChannelId);
+					if (
+						held?.nodeId1.equals(annMsg.nodeId1) &&
+						held.nodeId2.equals(annMsg.nodeId2)
+					) {
+						this.graph.markChannelFundingProven(annMsg.shortChannelId);
+					}
 					const updateMsg = decodeChannelUpdateMessage(signedChannelUpdate);
 					let updateValid = false;
 					try {
@@ -5964,6 +6363,23 @@ export class LightningNode extends EventEmitter {
 		return this.recoveryGate ? this.recoveryGate.getState() : 'disabled';
 	}
 
+	/**
+	 * Why this device cannot show it still owns the channel state it stores,
+	 * or null when it can (or runs without guardians). 'superseded' once a
+	 * newer writer is proven, by the startup gate or by the barrier at
+	 * runtime: the device that replaced this one revoked a stored commitment
+	 * with every update it made. 'unconfirmed' while the gate is still
+	 * quarantined, where that takeover is possible but unproven. The
+	 * operator's force close stays admitted under either, but only as the
+	 * labelled decision the daemon asks for (issue #1013).
+	 */
+	getRecoveryOwnershipHold(): 'superseded' | 'unconfirmed' | null {
+		const gate = this.getRecoveryGateState();
+		if (this._barrierFenced || gate === 'fenced') return 'superseded';
+		if (gate === 'quarantined') return 'unconfirmed';
+		return null;
+	}
+
 	// ─────────────── Guardian-set rotation (wire 5.9, issue #701) ───────────────
 
 	/**
@@ -6463,7 +6879,7 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
-		const peerAddresses = this.storage.loadAllPeerAddresses();
+		const peerAddresses = this.loadPeerAddresses();
 		const channelPeers = new Set<string>();
 
 		// Only reconnect peers that have channels needing reestablishment, or
@@ -6580,6 +6996,28 @@ export class LightningNode extends EventEmitter {
 			this._reconnectTimers.add(timer);
 			delay += STAGGER_MS;
 		}
+	}
+
+	/**
+	 * Stored peer addresses under the lowercase key every live map uses.
+	 * Rows written before connectPeer lowercased its argument can carry any
+	 * case; where a peer has both, the lowercase row is the newer write.
+	 */
+	private loadPeerAddresses(): Array<{
+		pubkey: string;
+		host: string;
+		port: number;
+	}> {
+		const byPubkey = new Map<
+			string,
+			{ pubkey: string; host: string; port: number }
+		>();
+		for (const row of this.storage!.loadAllPeerAddresses()) {
+			const pubkey = normalizeHexPubkey(row.pubkey);
+			if (row.pubkey !== pubkey && byPubkey.has(pubkey)) continue;
+			byPubkey.set(pubkey, { pubkey, host: row.host, port: row.port });
+		}
+		return [...byPubkey.values()];
 	}
 
 	private emitReady(): void {
@@ -6856,6 +7294,8 @@ export class LightningNode extends EventEmitter {
 				row.state.state = this.v2RetainedAttemptState(row.state.v2InFlight);
 			}
 			const channel = new Channel(row.state);
+			// The startup write of the raised depth may not have landed.
+			channel.repairLegacyV2OpenerDepth();
 			const keyIndex = this.storage.loadChannelKeyIndex(idHex);
 			this.channelManager.restoreChannel(channel, row.peerPubkey, keyIndex);
 			this.emitStructuredLog('channel', 'v2_open_resynced_from_disk', {
@@ -7060,13 +7500,105 @@ export class LightningNode extends EventEmitter {
 	 */
 	private rebroadcastAuthorizedSplice(idHex: string, txHex: string): void {
 		if (!this._chainBackend) return;
-		this._chainBackend.broadcastTransaction(txHex).catch(() => {
+		this._chainBackend.broadcastTransaction(txHex).catch((err) => {
+			const reason = (err as Error)?.message ?? String(err);
 			// Already in mempool or confirmed, or a backend hiccup. The watch
 			// on the new funding output reports the confirmation either way.
 			this.emitStructuredLog('chain', 'splice_rebroadcast_failed', {
-				channelId: idHex
+				channelId: idHex,
+				error: reason
 			});
+			// A transaction the network already has is the outcome wanted,
+			// not a refusal; funding:confirmed retires the obligation.
+			if (/already in block ?chain|already known|txn-already/i.test(reason)) {
+				return;
+			}
+			let txid: string;
+			try {
+				txid = bitcoin.Transaction.fromHex(txHex).getId();
+			} catch {
+				return;
+			}
+			// Once per (txid, reason), issue #1062: the same refusal repeats on
+			// every block for as long as the obligation stands, and the log
+			// line above already carries each repeat.
+			const key = `${txid}:${reason}`;
+			if (this._spliceRefusalsReported.has(key)) return;
+			this._spliceRefusalsReported.add(key);
+			this.emit('node:error', {
+				code: 'SPLICE_BROADCAST_REFUSED',
+				channelId: Buffer.from(idHex, 'hex'),
+				txid,
+				retained: true,
+				message: `splice ${txid} refused by the chain backend: ${reason}; the node still holds the transaction and rebroadcasts it on every block until it confirms`,
+				timestamp: Date.now()
+			} as ILightningError);
 		});
+	}
+
+	/**
+	 * What the node knows about a transaction the watcher reports on (issue
+	 * #1062): the channel it belongs to, and whether the node itself still
+	 * holds the bytes and re-sends them on every block. The retained sources
+	 * are exactly the block-driven obligations, pendingFundingTxs and the two
+	 * splice lists retryPendingSpliceBroadcasts walks. A close txid names its
+	 * channel, but the watcher's queue was its only driver. The txid arrives
+	 * in display order (the watcher's getId); channel state holds internal
+	 * order.
+	 */
+	private _describeBroadcastTxid(txid: string | undefined): {
+		txid?: string;
+		channelId?: Buffer;
+		retained: boolean;
+	} {
+		if (!txid) return { retained: false };
+		const internal = Buffer.from(txid, 'hex').reverse();
+		const internalHex = internal.toString('hex');
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			const id = state.channelId ?? state.temporaryChannelId;
+			const channelId = id ? Buffer.from(id) : undefined;
+			const inflight = state.spliceInFlight;
+			if (inflight?.spliceTxid?.equals(internal)) {
+				return {
+					txid,
+					channelId,
+					retained: inflight.fullySigned === true && !!inflight.spliceTxHex
+				};
+			}
+			if (
+				(state.unconfirmedSpliceTxs ?? []).some(
+					(e) => e.txid.equals(internal) && !!e.txHex
+				)
+			) {
+				return { txid, channelId, retained: true };
+			}
+			if (state.fundingTxid?.equals(internal)) {
+				return {
+					txid,
+					channelId,
+					retained: this.pendingFundingTxs.has(internalHex)
+				};
+			}
+		}
+		const closeIdHex = this._pendingCloseTxids.get(txid);
+		if (closeIdHex !== undefined) {
+			return {
+				txid,
+				channelId: Buffer.from(closeIdHex, 'hex'),
+				retained: false
+			};
+		}
+		if (this.pendingFundingTxs.has(internalHex))
+			return { txid, retained: true };
+		return { txid, retained: false };
+	}
+
+	/** The watcher's message, plus what happens next when the node still holds the tx. */
+	private _broadcastErrorMessage(message: string, retained: boolean): string {
+		return retained
+			? `${message}; the node still holds this transaction and rebroadcasts it on every block until it confirms`
+			: message;
 	}
 
 	/**
@@ -7548,7 +8080,7 @@ export class LightningNode extends EventEmitter {
 		// One persisted address per peer (upserted on connect); map to 'host:port'.
 		const peerAddresses = new Map<string, string[]>();
 		if (this.storage) {
-			for (const addr of this.storage.loadAllPeerAddresses()) {
+			for (const addr of this.loadPeerAddresses()) {
 				const list = peerAddresses.get(addr.pubkey) ?? [];
 				list.push(`${addr.host}:${addr.port}`);
 				peerAddresses.set(addr.pubkey, list);
@@ -7945,7 +8477,8 @@ export class LightningNode extends EventEmitter {
 			network: btcNetwork,
 			towers,
 			store,
-			socks5Proxy: this.socks5Proxy ?? undefined
+			socks5Proxy: this.socks5Proxy ?? undefined,
+			socks5ProxyScope: this.socks5ProxyScope
 		});
 		this.watchtowerClient.on('log', (entry: Record<string, unknown>) => {
 			const event = String(entry.event ?? 'log');
@@ -7957,6 +8490,9 @@ export class LightningNode extends EventEmitter {
 	 * Assemble the justice context for a revoked remote commitment and ship it to
 	 * the towers. Combines the channel's static params with the per-channel
 	 * signing secrets and our sweep destination.
+	 *
+	 * Throws when a tower update could not be written to the store, which
+	 * tells the channel manager to keep the revoked tx and retry.
 	 */
 	private backupRevokedStateToTowers(
 		channelId: Buffer,
@@ -7965,6 +8501,7 @@ export class LightningNode extends EventEmitter {
 	): void {
 		const client = this.watchtowerClient;
 		if (!client || !client.enabled) return;
+		let ctx: IJusticeContext;
 		try {
 			const channel = this.channelManager.getChannel(channelId);
 			if (!channel) return;
@@ -7977,7 +8514,7 @@ export class LightningNode extends EventEmitter {
 			const paymentBasepointSecret =
 				perCh?.paymentBasepointSecret ?? this.paymentBasepointSecret;
 			const btcNetwork = this.getBitcoinNetwork();
-			const ctx: IJusticeContext = {
+			ctx = {
 				channelId: channelId.toString('hex'),
 				revokedTx: bitcoin.Transaction.fromBuffer(revokedTx),
 				perCommitmentSecret,
@@ -7998,12 +8535,15 @@ export class LightningNode extends EventEmitter {
 				leaseExpiry: state.leaseExpiry,
 				leaseCommitBlockheight: state.leaseCommitBlockheight
 			};
-			client.backupRevokedState(ctx);
 		} catch (err) {
 			this.emitStructuredLog('watchtower', 'backup_context_failed', {
 				channelId: channelId.toString('hex'),
 				error: err instanceof Error ? err.message : String(err)
 			});
+			return;
+		}
+		if (!client.backupRevokedState(ctx)) {
+			throw new Error('watchtower backup was not queued for every tower');
 		}
 	}
 
@@ -8199,6 +8739,7 @@ export class LightningNode extends EventEmitter {
 		this.assertPeerContactPermitted('connectPeer');
 		const pubkeyErr = validateHexPubkey(pubkey, 'pubkey');
 		if (pubkeyErr) throw new InvalidPeerConnectError(pubkeyErr);
+		pubkey = normalizeHexPubkey(pubkey);
 		if (transport?.type === 'ws' && transport.url !== undefined) {
 			// Derive the dial address from the explicit URL (and reject a
 			// mismatched host/port pair to avoid ambiguous bookkeeping).
@@ -8530,27 +9071,40 @@ export class LightningNode extends EventEmitter {
 		// The watcher owns the broadcast; surface its failures under the code
 		// consumers already watch for. It re-queues and retries on the next
 		// block, so this is a warning rather than a terminal outcome.
-		this.chainWatcher.on('broadcast:failure', (err: Error) => {
+		this.chainWatcher.on('broadcast:failure', (err: Error, txid?: string) => {
+			const about = this._describeBroadcastTxid(txid);
 			this.emit('node:error', {
 				code: 'BROADCAST_FAILED',
-				message: err.message,
+				...about,
+				message: this._broadcastErrorMessage(err.message, about.retained),
 				timestamp: Date.now()
 			} as ILightningError);
 		});
 		// The watcher's own retries ran out and it drops the transaction from
 		// its list (issue #756). The block-driven obligations (pending fundings,
 		// pending splices) keep re-asking regardless; anything else ends here,
-		// so the end is reported instead of vanishing.
-		this.chainWatcher.on('broadcast:permanent_failure', (err: Error) => {
-			this.emitStructuredLog('chain', 'broadcast_permanent_failure', {
-				error: err.message
-			});
-			this.emit('node:error', {
-				code: 'BROADCAST_PERMANENT_FAILURE',
-				message: err.message,
-				timestamp: Date.now()
-			} as ILightningError);
-		});
+		// so the end is reported instead of vanishing. The txid, the channel
+		// and whether the node still holds the transaction ride along (issue
+		// #1062) so a consumer can tell a dropped sweep from a splice the node
+		// is still re-sending every block.
+		this.chainWatcher.on(
+			'broadcast:permanent_failure',
+			(err: Error, txid?: string) => {
+				const about = this._describeBroadcastTxid(txid);
+				this.emitStructuredLog('chain', 'broadcast_permanent_failure', {
+					error: err.message,
+					txid: about.txid,
+					channelId: about.channelId?.toString('hex'),
+					retained: about.retained
+				});
+				this.emit('node:error', {
+					code: 'BROADCAST_PERMANENT_FAILURE',
+					...about,
+					message: this._broadcastErrorMessage(err.message, about.retained),
+					timestamp: Date.now()
+				} as ILightningError);
+			}
+		);
 		// Wire watch:output:requested — handle sweep output watching after force-close
 		this.chainWatcher.on(
 			'watch:output:requested',
@@ -9849,7 +10403,7 @@ export class LightningNode extends EventEmitter {
 	addTrustedPeer(pubkeyHex: string): void {
 		const pubkeyErr = validateHexPubkey(pubkeyHex, 'pubkeyHex');
 		if (pubkeyErr) throw new Error(pubkeyErr);
-		this.channelManager.addTrustedPeer(pubkeyHex);
+		this.channelManager.addTrustedPeer(normalizeHexPubkey(pubkeyHex));
 		this.persistTrustedPeers();
 	}
 
@@ -9857,7 +10411,7 @@ export class LightningNode extends EventEmitter {
 	 * Remove a peer from the zero-conf trusted set.
 	 */
 	removeTrustedPeer(pubkeyHex: string): void {
-		this.channelManager.removeTrustedPeer(pubkeyHex);
+		this.channelManager.removeTrustedPeer(normalizeHexPubkey(pubkeyHex));
 		this.persistTrustedPeers();
 	}
 
@@ -10182,11 +10736,13 @@ export class LightningNode extends EventEmitter {
 		this.preimages.clear();
 		this.prunedKeysendHashes.clear();
 		this.prunedOutgoingHashes.clear();
+		this.prunedCompletedOutgoingHashes.clear();
 		this.paymentSecrets.clear();
 		this.invoices.clear();
 		this.scidToChannelId.clear();
 		this.htlcPaymentMap.clear();
 		this.forwardedHtlcs.clear();
+		this.retriesAwaitingRemoval.clear();
 		this.gossipSyncManagers.clear();
 		this.pendingMppPayments.clear();
 		this.pendingFundingTxs.clear();
@@ -10286,10 +10842,12 @@ export class LightningNode extends EventEmitter {
 		// A COMPLETED or FAILED outgoing record whose HTLC is still
 		// non-terminal (failed by a wall clock while the peer holds it) is
 		// not history yet: its outcome, and the preimage a late fulfil
-		// reveals, still belong to it (#743 audit).
+		// reveals, still belong to it (#743 audit). A COMPLETED incoming record
+		// with a part whose fulfill was refused is still owed that fulfill.
 		const stillLive = (hash: string, payment: IPaymentInfo): boolean =>
-			payment.direction === PaymentDirection.OUTGOING &&
-			!this.getOutgoingHtlcs(Buffer.from(hash, 'hex')).resolved;
+			payment.direction === PaymentDirection.OUTGOING
+				? !this.getOutgoingHtlcs(Buffer.from(hash, 'hex')).resolved
+				: this.owesSettledFulfill(payment);
 
 		const forget = (hash: string, payment: IPaymentInfo): void => {
 			this.payments.delete(hash);
@@ -10303,6 +10861,12 @@ export class LightningNode extends EventEmitter {
 			}
 			if (payment.direction === PaymentDirection.OUTGOING) {
 				this.prunedOutgoingHashes.add(hash);
+				if (
+					payment.status === PaymentStatus.COMPLETED ||
+					payment.preimage !== undefined
+				) {
+					this.prunedCompletedOutgoingHashes.add(hash);
+				}
 			}
 			pruned++;
 		};
@@ -10483,6 +11047,7 @@ export class LightningNode extends EventEmitter {
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
 		if (pubkeyErr) throw new InvalidChannelOpenError(pubkeyErr);
+		peerPubkey = normalizeHexPubkey(peerPubkey);
 		const satsErr = validatePositiveBigint(fundingSatoshis, 'fundingSatoshis');
 		if (satsErr) throw new InvalidChannelOpenError(satsErr);
 		if (pushMsat !== undefined && pushMsat > fundingSatoshis * 1000n) {
@@ -10747,6 +11312,7 @@ export class LightningNode extends EventEmitter {
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
 		if (pubkeyErr) throw new InvalidChannelOpenError(pubkeyErr);
+		peerPubkey = normalizeHexPubkey(peerPubkey);
 		const satsErr = validatePositiveBigint(
 			params.fundingSatoshis,
 			'fundingSatoshis'
@@ -12247,7 +12813,8 @@ export class LightningNode extends EventEmitter {
 		// here: encoding happens AFTER the channel has moved to SPLICING and
 		// persisted, so a throw there leaves the channel wedged until restart.
 		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
-			min: 1
+			min: 1,
+			max: MAX_SPLICE_FEERATE_PERKW
 		});
 		if (feeErr) throw new InvalidSpliceError(feeErr);
 		if (fundingUtxos) {
@@ -12419,7 +12986,8 @@ export class LightningNode extends EventEmitter {
 		// Same reason as spliceIn: splice_init encodes the feerate as a u32
 		// AFTER the channel has moved to SPLICING, so a late throw wedges it.
 		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
-			min: 1
+			min: 1,
+			max: MAX_SPLICE_FEERATE_PERKW
 		});
 		if (feeErr) throw new InvalidSpliceError(feeErr);
 		if (!Array.isArray(inputs) || inputs.length === 0) {
@@ -12826,7 +13394,8 @@ export class LightningNode extends EventEmitter {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new InvalidSpliceError(cidErr);
 		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
-			min: 1
+			min: 1,
+			max: MAX_SPLICE_FEERATE_PERKW
 		});
 		if (feeErr) throw new InvalidSpliceError(feeErr);
 		const channel = this.channelManager.getChannel(channelId);
@@ -12916,7 +13485,8 @@ export class LightningNode extends EventEmitter {
 		// here: encoding happens AFTER the channel has moved to SPLICING and
 		// persisted, so a throw there leaves the channel wedged until restart.
 		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
-			min: 1
+			min: 1,
+			max: MAX_SPLICE_FEERATE_PERKW
 		});
 		if (feeErr) throw new InvalidSpliceError(feeErr);
 		if (
@@ -13312,6 +13882,7 @@ export class LightningNode extends EventEmitter {
 		maxFeeSats: bigint;
 		timeoutMs?: number;
 	}): Promise<IRebalanceResult> {
+		if (this._destroyed) throw new Error('Node destroyed');
 		const { fromChannelId, toChannelId, amountSats, maxFeeSats } = options;
 		const cidErr =
 			validateBuffer(fromChannelId, 32, 'fromChannelId') ||
@@ -13473,14 +14044,46 @@ export class LightningNode extends EventEmitter {
 			hops: hops.length
 		});
 
-		this.sendPaymentToRoute(
-			{ hops },
-			invoice.paymentHash,
-			finalCltvExpiry,
-			invoice.paymentSecret,
-			amountMsat
-		);
-		await this.waitForPayment(invoice.paymentHash, options.timeoutMs ?? 60_000);
+		try {
+			this.sendPaymentToRoute(
+				{ hops },
+				invoice.paymentHash,
+				finalCltvExpiry,
+				invoice.paymentSecret,
+				amountMsat
+			);
+		} catch (err) {
+			// A throw from addHtlc (the outbound transport, say) can come with
+			// the HTLC already on the channel beside its record. Unless that
+			// record failed, the HTLC can settle, so its outcome is waited for
+			// rather than reported as a failure.
+			const sent = this.payments.get(invoice.paymentHash.toString('hex'));
+			if (
+				sent?.direction !== PaymentDirection.OUTGOING ||
+				sent.status === PaymentStatus.FAILED
+			) {
+				throw err;
+			}
+		}
+		try {
+			await this.waitForPayment(
+				invoice.paymentHash,
+				options.timeoutMs ?? 60_000
+			);
+		} catch (err) {
+			// A cancelled payment is marked failed with its HTLC still out, and
+			// that HTLC can still settle, so the outcome is as unknown as after
+			// a timeout.
+			if (
+				!(err instanceof PaymentWaitTimeoutError) &&
+				this.hasHtlcInFlight(invoice.paymentHash)
+			) {
+				throw new PaymentWaitTimeoutError(
+					`${(err as Error).message} with its HTLC still in flight`
+				);
+			}
+			throw err;
+		}
 
 		this.emitStructuredLog('payment', 'rebalance_succeeded', {
 			fromChannelId: fromChannelId.toString('hex'),
@@ -13554,25 +14157,37 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * The per-UTC-day fee budget executeRebalanceRecommendations runs under:
+	 * the one given, else the configured autoRebalance budget, else 1000 sats.
+	 */
+	rebalanceBudgetSatsPerDay(budgetSatsPerDay?: number): number {
+		return (
+			budgetSatsPerDay ?? this.autoRebalanceConfig.budgetSatsPerDay ?? 1_000
+		);
+	}
+
+	/**
 	 * Execute the advisor's rebalance plan under a strict per-UTC-day fee
 	 * budget. Each pair gets a fee cap of min(remaining budget, 0.5% of the
 	 * amount, at least 1 sat); once the day's budget is exhausted the remaining
 	 * pairs are skipped, never partially overspent. Failures are recorded and
-	 * do not stop later pairs (they spent nothing).
+	 * do not stop later pairs (they spent nothing). `stopRequested` is asked
+	 * before each pair, and the run ends there, leaving the rest untried, once
+	 * it returns true. A shutdown or destroy ends the run the same way.
 	 */
 	async executeRebalanceRecommendations(options?: {
 		budgetSatsPerDay?: number;
 		minImbalancePct?: number;
+		stopRequested?: () => boolean;
 	}): Promise<IRebalanceExecutionSummary> {
 		if (this.rebalanceRunInFlight) {
 			throw new Error('a rebalance execution run is already in progress');
 		}
 		this.rebalanceRunInFlight = true;
 		try {
-			const budgetSats =
-				options?.budgetSatsPerDay ??
-				this.autoRebalanceConfig.budgetSatsPerDay ??
-				1_000;
+			const budgetSats = this.rebalanceBudgetSatsPerDay(
+				options?.budgetSatsPerDay
+			);
 			if (budgetSats < 0) throw new Error('budgetSatsPerDay must be >= 0');
 			const budgetMsat = BigInt(budgetSats) * 1000n;
 
@@ -13581,7 +14196,16 @@ export class LightningNode extends EventEmitter {
 			let feeSpentThisRunMsat = 0n;
 
 			for (const plan of plans) {
-				const remainingMsat = budgetMsat - this.loadRebalanceSpentMsat();
+				if (this._destroyed || options?.stopRequested?.()) break;
+				// A run that crosses midnight finds the new day's budget unspent.
+				// It still spends no more than one budget in all, which is what
+				// BeignetNode holds against its daily spend limit for the run.
+				const dayRemainingMsat = budgetMsat - this.loadRebalanceSpentMsat();
+				const runRemainingMsat = budgetMsat - feeSpentThisRunMsat;
+				const remainingMsat =
+					dayRemainingMsat < runRemainingMsat
+						? dayRemainingMsat
+						: runRemainingMsat;
 				// Per-pair cap: never above the remaining daily budget, and never
 				// above 0.5% of the moved amount (min 1 sat so tiny amounts route).
 				const proportionalCapMsat =
@@ -13604,15 +14228,24 @@ export class LightningNode extends EventEmitter {
 					});
 					continue;
 				}
+				const maxFeeSats = feeCapMsat / 1000n;
+				const capMsat = maxFeeSats * 1000n;
+				// The cap is persisted before anything is sent, so a crash with
+				// the HTLC out leaves it charged. A known outcome gives back what
+				// the route did not take. A timed-out wait keeps the whole cap,
+				// since its HTLC can still settle. After a UTC rollover the old
+				// day keeps the cap, as a give-back would come off the new day.
+				const chargedDay = LightningNode.currentUtcDay();
+				this.recordRebalanceSpend(capMsat);
+				let spentMsat = capMsat;
 				try {
 					const result = await this.rebalanceChannel({
 						fromChannelId: Buffer.from(plan.fromChannelId, 'hex'),
 						toChannelId: Buffer.from(plan.toChannelId, 'hex'),
 						amountSats: plan.amountSats,
-						maxFeeSats: feeCapMsat / 1000n
+						maxFeeSats
 					});
-					this.recordRebalanceSpend(result.feeMsat);
-					feeSpentThisRunMsat += result.feeMsat;
+					spentMsat = result.feeMsat;
 					attempts.push({
 						fromChannelId: plan.fromChannelId,
 						toChannelId: plan.toChannelId,
@@ -13621,6 +14254,7 @@ export class LightningNode extends EventEmitter {
 						feeMsat: result.feeMsat
 					});
 				} catch (err) {
+					if (!(err instanceof PaymentWaitTimeoutError)) spentMsat = 0n;
 					attempts.push({
 						fromChannelId: plan.fromChannelId,
 						toChannelId: plan.toChannelId,
@@ -13628,6 +14262,13 @@ export class LightningNode extends EventEmitter {
 						status: 'FAILED',
 						error: err instanceof Error ? err.message : String(err)
 					});
+				}
+				feeSpentThisRunMsat += spentMsat;
+				if (
+					spentMsat !== capMsat &&
+					LightningNode.currentUtcDay() === chargedDay
+				) {
+					this.recordRebalanceSpend(spentMsat - capMsat);
 				}
 			}
 
@@ -13766,8 +14407,27 @@ export class LightningNode extends EventEmitter {
 			info.fundingOutputIndex = state.fundingOutputIndex;
 		}
 		const pendingSplice = channel.getPendingSpliceLocalBalanceMsat();
-		if (pendingSplice !== null)
+		if (pendingSplice !== null) {
 			info.pendingSpliceLocalBalanceMsat = pendingSplice;
+			// Same branch, same presence rule (issue #1060): the getter answers
+			// non-null exactly when spliceInFlight is set, and the wallet that
+			// sees this transaction spend its coins needs the channel to own
+			// it before the adoption moves fundingTxid onto it.
+			const inflight = state.spliceInFlight;
+			if (inflight) {
+				info.pendingSpliceTxid = Buffer.from(inflight.spliceTxid)
+					.reverse()
+					.toString('hex');
+			}
+		}
+		// The fundings a splice has retired, oldest first (issue #1060): a
+		// deposit that funded this channel stays this channel's after the
+		// channel has moved on. Display order like fundingTxid.
+		if (state.previousFundingTxids && state.previousFundingTxids.length > 0) {
+			info.previousFundingTxids = state.previousFundingTxids.map((t) =>
+				Buffer.from(t).reverse().toString('hex')
+			);
+		}
 		info.htlcUsable = channel.acceptsNewHtlcs();
 		// The reason a NORMAL channel can still answer false, so a consumer can
 		// tell "mid-splice and parked" from "restored and held" (issue #469) and
@@ -14892,6 +15552,77 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Check queued channels' funding outputs on chain, one at a time (issue
+	 * #1105). A signature only proves keys the announcement carries, so this
+	 * is what separates a real channel, kept at the graph ceiling from then
+	 * on, from a fabricated or closed one, which is dropped. Without an answer
+	 * the pass stops until the next block, and the channel goes to the back
+	 * of the queue so one failing lookup cannot hold up the rest.
+	 */
+	private checkGossipFunding(): void {
+		if (this.gossipFundingChecking || this.gossipFundingQueue.size === 0) {
+			return;
+		}
+		this.gossipFundingChecking = true;
+		// Deferred: the caller may still be settling the channel (our own is
+		// marked proven right after it is added).
+		setImmediate(() => {
+			void this.runGossipFundingChecks().finally(() => {
+				this.gossipFundingChecking = false;
+			});
+		});
+	}
+
+	private async runGossipFundingChecks(): Promise<void> {
+		while (!this._destroyed) {
+			const backend = this._chainBackend;
+			const next = this.gossipFundingQueue.values().next();
+			if (!backend || next.done) return;
+			const scidHex = next.value;
+			const scid = Buffer.from(scidHex, 'hex');
+			const channel = this.graph.getChannel(scid);
+			if (
+				!channel ||
+				channel.announcementVerified !== true ||
+				channel.fundingVerified === true
+			) {
+				this.gossipFundingQueue.delete(scidHex);
+				continue;
+			}
+			const verdict = await classifyAnnouncedChannelFunding(
+				backend,
+				channel.announcement,
+				this.currentBlockHeight
+			);
+			if (this._destroyed) return;
+			// Evicted, pruned or replaced while the lookup ran. A replacement
+			// queued itself, and that entry is not this lookup's to clear.
+			if (this.graph.getChannel(scid) !== channel) continue;
+			this.gossipFundingQueue.delete(scidHex);
+			if (verdict === 'unavailable') {
+				this.gossipFundingQueue.add(scidHex);
+				return;
+			}
+			if (verdict === 'proven') {
+				if (this.graph.markChannelFundingProven(scid)) {
+					this.safeStorage(
+						() => this.storage!.saveGossipChannel(scidHex, channel),
+						'saveGossipChannel'
+					);
+				}
+			} else if (verdict === 'refuted') {
+				this.graph.removeChannel(scid);
+				if (typeof this.storage?.deleteGossipChannel === 'function') {
+					this.safeStorage(
+						() => this.storage!.deleteGossipChannel!(scidHex),
+						'deleteGossipChannel'
+					);
+				}
+			}
+		}
+	}
+
 	private getOrCreateSyncManager(pubkey: string): GossipSyncManager {
 		let mgr = this.gossipSyncManagers.get(pubkey);
 		if (!mgr) {
@@ -14905,6 +15636,7 @@ export class LightningNode extends EventEmitter {
 	 * Initiate gossip sync with a connected peer.
 	 */
 	initiateGossipSync(pubkey: string): void {
+		pubkey = normalizeHexPubkey(pubkey);
 		const mgr = this.getOrCreateSyncManager(pubkey);
 		const messages = mgr.initiateSync();
 		for (const msg of messages) {
@@ -14916,6 +15648,7 @@ export class LightningNode extends EventEmitter {
 	 * Get gossip sync state for a peer.
 	 */
 	getGossipSyncState(pubkey: string): string | null {
+		pubkey = normalizeHexPubkey(pubkey);
 		const mgr = this.gossipSyncManagers.get(pubkey);
 		return mgr ? mgr.getState() : null;
 	}
@@ -15471,18 +16204,37 @@ export class LightningNode extends EventEmitter {
 		excludedChannels?: Set<string>,
 		maxFeeMsat?: bigint,
 		amountMsat?: bigint,
-		maxCltvExpiryHeight?: number
+		maxCltvExpiryHeight?: number,
+		policyOverrides?: TPolicyOverrides,
+		metadata?: Record<string, string>
 	): IPaymentInfo {
+		// Taken once, so a send a payment:failed listener starts from inside
+		// this call is not mistaken for the retry.
+		const redispatching = this.redispatchingRetryContext;
+		this.redispatchingRetryContext = undefined;
 		const invoice = decodeInvoice(invoiceStr);
-
-		// Payment deduplication: reject duplicate in-flight payments (Fix 1.4)
-		const dedupHashHex = invoice.paymentHash.toString('hex');
-		const existingPayment = this.payments.get(dedupHashHex);
-		if (existingPayment && existingPayment.status === PaymentStatus.PENDING) {
+		// The payee is found by node id alone, so an invoice for another chain
+		// would pay whichever node holds that key on ours.
+		if (invoice.network !== this.network) {
 			throw new LightningPaymentError(
-				LightningErrorCode.DUPLICATE_PAYMENT,
-				'Payment already in flight for this invoice'
+				LightningErrorCode.INVALID_INVOICE,
+				`Invoice is for network "${invoice.network}", this node is on "${this.network}"`
 			);
+		}
+
+		// Payment deduplication (Fix 1.4, widened by issue #975): a hash whose
+		// payment completed, or that still has an HTLC out, is not paid again.
+		// Early and direction-agnostic (a PENDING record of either direction
+		// refuses, as it always has); sendPaymentToRoute repeats the check as
+		// the guarantee on the route, and MPP dispatch runs only after this.
+		this.assertHashUnpaid(invoice.paymentHash, 'any-pending');
+		const dedupHashHex = invoice.paymentHash.toString('hex');
+		// Past that check nothing is out for the hash, so a context other than
+		// the retry being re-dispatched was left by a send that ended. This
+		// call's amount, fee cap, ceiling and exclusions replace it (issue #1041).
+		const priorCtx = this.paymentRetryContexts.get(dedupHashHex);
+		if (priorCtx && priorCtx !== redispatching) {
+			this.paymentRetryContexts.delete(dedupHashHex);
 		}
 
 		// Absolute outgoing expiry ceiling (issue #737). A retry re-enters here
@@ -15492,6 +16244,17 @@ export class LightningNode extends EventEmitter {
 			maxCltvExpiryHeight ??
 			this.paymentRetryContexts.get(dedupHashHex)?.maxCltvExpiryHeight;
 		if (cltvCeiling !== undefined) this.validateCltvCeiling(cltvCeiling);
+		// The channel policies this payment's own failures taught us ride the
+		// context the same way (issue #1056), so a retry re-prices the hops
+		// it learned about instead of excluding them.
+		const overrides =
+			policyOverrides ??
+			this.paymentRetryContexts.get(dedupHashHex)?.policyOverrides;
+		if (metadata && !this.paymentMetadataFits(metadata)) {
+			throw new InvalidRequestError(
+				'payment metadata is too large for the recovery guardians to accept'
+			);
+		}
 
 		const destination = invoice.payeeNodeKey || invoice.recoveredPubkey;
 		if (!destination) {
@@ -15511,6 +16274,12 @@ export class LightningNode extends EventEmitter {
 			}
 			paymentAmountMsat = amountMsat;
 		}
+		if (paymentAmountMsat <= 0n) {
+			throw new LightningPaymentError(
+				LightningErrorCode.MISSING_AMOUNT,
+				'amountMsat must be positive'
+			);
+		}
 
 		// Check invoice expiry before attempting payment (Fix 8)
 		const expiryTimestamp =
@@ -15525,9 +16294,26 @@ export class LightningNode extends EventEmitter {
 					expiryTimestamp * 1000
 				).toISOString()}`,
 				createdAt: Date.now(),
-				completedAt: Date.now()
+				completedAt: Date.now(),
+				...(metadata && { metadata: { ...metadata } })
 			};
-			this.payments.set(invoice.paymentHash.toString('hex'), payment);
+			const expiredHashHex = invoice.paymentHash.toString('hex');
+			if (
+				metadata &&
+				!this.paymentMetadataFits(metadata, [
+					{ type: 'payment_state', paymentHash: expiredHashHex, payment }
+				])
+			) {
+				throw new InvalidRequestError(
+					'payment metadata is too large for the recovery guardians to accept'
+				);
+			}
+			this.payments.set(expiredHashHex, payment);
+			// A retry that lands here (the invoice expired between attempts)
+			// is over: its context would otherwise linger until prune, and
+			// the record went unpersisted (issue #976).
+			this.paymentRetryContexts.delete(expiredHashHex);
+			this.persistPayment(invoice.paymentHash);
 			this.emit('payment:failed', payment);
 			return payment;
 		}
@@ -15576,7 +16362,8 @@ export class LightningNode extends EventEmitter {
 				excludedChannels,
 				this.missionControl,
 				this.getLocalChannelEdges(),
-				cltvBudget
+				cltvBudget,
+				overrides
 			);
 			if (!blindedRoute) {
 				throw new LightningPaymentError(
@@ -15588,34 +16375,38 @@ export class LightningNode extends EventEmitter {
 			// send removes our own introduction fee on the wire, so a
 			// genuinely zero-fee payment must pass maxFeeMsat 0 (issue #550
 			// review). prepareSelfIntroSend also validates the path, so an
-			// unusable self-intro path fails here by name.
+			// unusable self-intro path fails here by name. A grafted route is
+			// judged on what leaves us beyond what the recipient receives:
+			// that includes the payee-written blinded fee, which the route's
+			// reported fee used to leave out (issue #1001).
 			const selfIntroForCap = this.prepareSelfIntroSend(blindedRoute);
 			const effectiveFeeMsat =
-				selfIntroForCap?.wireRoute.totalFeeMsat ?? blindedRoute.totalFeeMsat;
+				selfIntroForCap?.wireRoute.totalFeeMsat ??
+				blindedRoute.totalAmountMsat - paymentAmountMsat;
 			if (maxFeeMsat !== undefined && effectiveFeeMsat > maxFeeMsat) {
 				throw new LightningPaymentError(
 					LightningErrorCode.FEE_EXCEEDS_MAX,
 					'Route fee exceeds maximum'
 				);
 			}
-			const bHashHex = invoice.paymentHash.toString('hex');
-			if (!this.paymentRetryContexts.has(bHashHex)) {
-				this.paymentRetryContexts.set(bHashHex, {
+			return this.dispatchInvoiceRoute(
+				blindedRoute,
+				invoice.paymentHash,
+				finalCltvExpiry,
+				invoice.paymentSecret,
+				paymentAmountMsat,
+				{
 					invoiceStr,
 					excludedChannels: excludedChannels || new Set(),
 					retryCount: 0,
 					maxRetries: this.maxPaymentRetries,
 					maxFeeMsat,
 					amountMsat,
-					maxCltvExpiryHeight: cltvCeiling
-				});
-			}
-			return this.sendPaymentToRoute(
-				blindedRoute,
-				invoice.paymentHash,
-				finalCltvExpiry,
-				invoice.paymentSecret,
-				paymentAmountMsat
+					maxCltvExpiryHeight: cltvCeiling,
+					policyOverrides: overrides,
+					metadata: metadata && { ...metadata }
+				},
+				metadata
 			);
 		}
 
@@ -15632,7 +16423,8 @@ export class LightningNode extends EventEmitter {
 			cltvBudget,
 			invoice.routingHints,
 			undefined,
-			localChannels
+			localChannels,
+			overrides
 		);
 		// The router can bound our first hop looser than what addHtlc enforces
 		// (a graph update's advertised maximum, or a race against in-flight
@@ -15675,7 +16467,8 @@ export class LightningNode extends EventEmitter {
 				undefined,
 				localChannels,
 				excludedChannels,
-				cltvBudget
+				cltvBudget,
+				overrides
 			);
 			if (multiRoute) {
 				if (maxFeeMsat !== undefined && multiRoute.totalFeeMsat > maxFeeMsat) {
@@ -15686,11 +16479,16 @@ export class LightningNode extends EventEmitter {
 				}
 				return this.sendPaymentMpp(
 					invoiceStr,
-					invoice,
+					{
+						paymentHash: invoice.paymentHash,
+						paymentSecret: invoice.paymentSecret,
+						amountMsat: paymentAmountMsat
+					},
 					multiRoute,
 					finalCltvExpiry,
 					excludedChannels,
-					cltvCeiling
+					cltvCeiling,
+					metadata
 				);
 			}
 		}
@@ -15709,27 +16507,77 @@ export class LightningNode extends EventEmitter {
 			);
 		}
 
-		// Store retry context for this payment
-		const hashHex = invoice.paymentHash.toString('hex');
-		if (!this.paymentRetryContexts.has(hashHex)) {
-			this.paymentRetryContexts.set(hashHex, {
+		return this.dispatchInvoiceRoute(
+			route,
+			invoice.paymentHash,
+			finalCltvExpiry,
+			invoice.paymentSecret,
+			paymentAmountMsat,
+			{
 				invoiceStr,
 				excludedChannels: excludedChannels || new Set(),
 				retryCount: 0,
 				maxRetries: this.maxPaymentRetries,
 				maxFeeMsat,
 				amountMsat,
-				maxCltvExpiryHeight: cltvCeiling
-			});
-		}
-
-		return this.sendPaymentToRoute(
-			route,
-			invoice.paymentHash,
-			finalCltvExpiry,
-			invoice.paymentSecret,
-			paymentAmountMsat
+				maxCltvExpiryHeight: cltvCeiling,
+				policyOverrides: overrides,
+				metadata: metadata && { ...metadata }
+			},
+			metadata
 		);
+	}
+
+	/**
+	 * Seed the retry context for a BOLT 11 attempt and send along the route.
+	 * A context seeded here is removed again when the attempt fails locally
+	 * (an exception before its record is PENDING, or addHtlc refusing the
+	 * HTLC): no onion failure will
+	 * reach the failure handler, so nothing retries it, and it would hold
+	 * this call's amount, fee cap, ceiling and exclusions against the hash
+	 * until the prune (issue #1041). An existing context is the retry's own,
+	 * and the failure handler owns its rollback, as in dispatchBolt12Route.
+	 */
+	private dispatchInvoiceRoute(
+		route: IRoute,
+		paymentHash: Buffer,
+		finalCltvExpiry: number,
+		paymentSecret: Buffer,
+		paymentAmountMsat: bigint,
+		context: IPaymentRetryContext,
+		metadata?: Record<string, string>
+	): IPaymentInfo {
+		const hashHex = paymentHash.toString('hex');
+		if (!this.paymentRetryContexts.has(hashHex)) {
+			this.paymentRetryContexts.set(hashHex, context);
+		}
+		// By identity: a payment:failed listener may already have started a
+		// new send of the hash, and the context there now is that send's.
+		const release = (): void => {
+			if (this.paymentRetryContexts.get(hashHex) === context) {
+				this.paymentRetryContexts.delete(hashHex);
+			}
+		};
+		try {
+			const payment = this.sendPaymentToRoute(
+				route,
+				paymentHash,
+				finalCltvExpiry,
+				paymentSecret,
+				paymentAmountMsat,
+				metadata
+			);
+			if (payment.status === PaymentStatus.FAILED) release();
+			return payment;
+		} catch (err) {
+			// A throw from addHtlc (the outbound transport, say) can leave the
+			// HTLC on the channel beside its PENDING record, and a failure of
+			// that HTLC still retries through the context.
+			if (this.payments.get(hashHex)?.status !== PaymentStatus.PENDING) {
+				release();
+			}
+			throw err;
+		}
 	}
 
 	/**
@@ -15746,7 +16594,9 @@ export class LightningNode extends EventEmitter {
 			options.excludedChannels,
 			options.maxFeeMsat,
 			options.amountMsat,
-			options.maxCltvExpiryHeight
+			options.maxCltvExpiryHeight,
+			options.policyOverrides,
+			options.metadata
 		);
 	}
 
@@ -15764,11 +16614,32 @@ export class LightningNode extends EventEmitter {
 		paymentHash: Buffer,
 		finalCltvExpiry: number,
 		paymentSecret?: Buffer,
-		totalMsat?: bigint
+		totalMsat?: bigint,
+		metadata?: Record<string, string>
 	): IPaymentInfo {
 		if (route.hops.length === 0) {
 			throw new Error('Route must have at least one hop');
 		}
+
+		// The guarantee behind the senders' early refusal, and the only check
+		// on the explicit-route entry (POST /payment/send-to-route): a paid
+		// hash, or one with an HTLC out, is not paid again (issue #975). Only
+		// an OUTGOING PENDING record counts as in flight here: a circular
+		// rebalance sends to its own fresh invoice, whose record is INCOMING
+		// PENDING. A part of an MPP set (total_msat above what the final hop
+		// receives) joins the parts already out for the hash, so no offered
+		// HTLC or PENDING record counts as in flight for it, until the parts
+		// already out reach total_msat (issue #990); a paid hash refuses a
+		// part all the same.
+		const finalAmountMsat =
+			route.hops[route.hops.length - 1].amountToForwardMsat;
+		this.assertHashUnpaid(
+			paymentHash,
+			totalMsat !== undefined && totalMsat > finalAmountMsat
+				? 'mpp-part'
+				: 'outgoing-pending',
+			totalMsat
+		);
 
 		// BOLT 4 self-introduction (issue #550): a blinded path can name US as
 		// its introduction node; the routine case is an unannounced node's
@@ -15909,13 +16780,42 @@ export class LightningNode extends EventEmitter {
 				totalFeeMsat: bigint;
 			},
 			sharedSecrets,
-			createdAt: Date.now()
+			createdAt: Date.now(),
+			...(metadata && { metadata: { ...metadata } })
 		};
+		const htlcId = outChannel.getFullState().localHtlcCounter;
+		const htlcKey = `${channelId.toString('hex')}:offered-${htlcId}`;
+		// The labelled row has to fit a frame with the route it now carries,
+		// both beside its HTLC mapping and as settlement will journal it.
+		if (
+			metadata &&
+			!this.paymentMetadataFits(
+				metadata,
+				[
+					{
+						type: 'payment_state',
+						paymentHash: paymentHash.toString('hex'),
+						payment
+					},
+					{
+						type: 'htlc_payment_mapping',
+						htlcKey,
+						paymentHash: paymentHash.toString('hex')
+					}
+				],
+				[this.settledPaymentMutation(payment)]
+			)
+		) {
+			// sendPayment seeded a retry context for this attempt. Left behind,
+			// a later send of the hash would retry with the refused labels.
+			this.paymentRetryContexts.delete(paymentHash.toString('hex'));
+			throw new InvalidRequestError(
+				'payment metadata is too large for the recovery guardians to accept'
+			);
+		}
 		this.payments.set(paymentHash.toString('hex'), payment);
 
 		// Track offered HTLC → payment mapping
-		const htlcId = outChannel.getFullState().localHtlcCounter;
-		const htlcKey = `${channelId.toString('hex')}:offered-${htlcId}`;
 		this.htlcPaymentMap.set(htlcKey, paymentHash.toString('hex'));
 		{
 			const mutations: RecoveryMutation[] = [
@@ -15953,8 +16853,9 @@ export class LightningNode extends EventEmitter {
 			// decrypt and failureCode stays undefined. addHtlc already knows why
 			// (no such channel, peer not connected, insufficient balance); losing
 			// that string is what makes a local failure look like a mystery.
-			payment.failureReason =
-				result.error ?? 'Local failure: could not add HTLC to the channel';
+			payment.failureReason = boundedFailureReason(
+				result.error ?? 'Local failure: could not add HTLC to the channel'
+			);
 			// htlcKey was derived from localHtlcCounter before the add, and a refused
 			// add does not consume that id, so the mapping written above now points
 			// at an id a later unrelated HTLC will take. Drop it in both places, and
@@ -16171,14 +17072,196 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Re-price a hop from the channel_update its failure carries (issue
+	 * #1056). fee_insufficient, incorrect_cltv_expiry and
+	 * amount_below_minimum mean the erring node holds a policy for its
+	 * outgoing channel other than the one we routed with, and the failure
+	 * says which. BOLT 4 lets the origin consider that update when retrying
+	 * this payment and forbids applying it to the network graph, since any
+	 * hop can forge one for any channel (issue #182). So the update is kept
+	 * on the retry context, scoped to this payment, once it passes the
+	 * checks that bind it to the route: it decodes, it names the erring
+	 * hop's outgoing channel, it is for our chain, its direction bit is the
+	 * erring node's side and the erring node signed it. The retry then
+	 * routes over that channel at its real price instead of excluding it;
+	 * the payment's fee cap still bounds the re-priced route.
+	 *
+	 * Returns true when an override was stored. Returns false, so the caller
+	 * excludes the channel as before, when there is no usable update or when
+	 * it changes nothing against the policy this attempt routed with: a node
+	 * refusing the very policy it advertises (an inbound fee we cannot see,
+	 * for instance) will not accept it on a retry either. One override per
+	 * edge, so the retry budget bounds their number.
+	 */
+	private notePolicyFailureUpdate(
+		ctx: IPaymentRetryContext | undefined,
+		payment: IPaymentInfo,
+		failureData: Buffer | undefined,
+		route: IPaymentInfo['route']
+	): boolean {
+		if (!ctx || !route || !failureData) return false;
+		const code = payment.failureCode;
+		const index = payment.failureSourceIndex;
+		if (code === undefined || index === undefined) return false;
+		if (
+			code !== FEE_INSUFFICIENT &&
+			code !== INCORRECT_CLTV_EXPIRY &&
+			code !== AMOUNT_BELOW_MINIMUM
+		) {
+			return false;
+		}
+		const erringHop = route.hops[index];
+		const outgoingHop = route.hops[index + 1];
+		if (!erringHop || !outgoingHop) return false;
+		// A blinded hop's SCID is opaque (zeroed): nothing to re-price.
+		if (outgoingHop.shortChannelId.equals(Buffer.alloc(8))) return false;
+
+		const payload = extractChannelUpdate(code, failureData);
+		if (!payload) return false;
+		let update: IChannelUpdateMessage;
+		try {
+			update = decodeChannelUpdateMessage(payload);
+		} catch {
+			return false;
+		}
+		const scidHex = outgoingHop.shortChannelId.toString('hex');
+		if (update.shortChannelId.toString('hex') !== scidHex) return false;
+		if (!update.chainHash.equals(this.chainHash())) return false;
+		// A disabled channel is not re-priced, it is routed around as before.
+		if ((update.channelFlags & CHANNEL_FLAG_DISABLED) !== 0) return false;
+
+		// The channel's endpoints in BOLT 7 order: the graph's when it
+		// announced the channel (and the route must agree with them), else
+		// the route's own pair (a hint edge).
+		const known = this.graph.getChannel(outgoingHop.shortChannelId);
+		let nodeId1: Buffer;
+		let nodeId2: Buffer;
+		if (known) {
+			nodeId1 = known.nodeId1;
+			nodeId2 = known.nodeId2;
+			const isEndpoint = (pubkey: Buffer): boolean =>
+				pubkey.equals(nodeId1) || pubkey.equals(nodeId2);
+			if (!isEndpoint(erringHop.pubkey) || !isEndpoint(outgoingHop.pubkey)) {
+				return false;
+			}
+		} else {
+			const erringIsLesser =
+				Buffer.compare(erringHop.pubkey, outgoingHop.pubkey) < 0;
+			nodeId1 = erringIsLesser ? erringHop.pubkey : outgoingHop.pubkey;
+			nodeId2 = erringIsLesser ? outgoingHop.pubkey : erringHop.pubkey;
+		}
+		const direction = update.channelFlags & CHANNEL_FLAG_DIRECTION;
+		const signer = direction === 0 ? nodeId1 : nodeId2;
+		if (!signer.equals(erringHop.pubkey)) return false;
+		if (!verifyChannelUpdate(update, payload, nodeId1, nodeId2)) return false;
+
+		// What this attempt routed with: the override an earlier failure of
+		// this payment stored, else the graph's policy for the erring node's
+		// side, else (a hint edge) the fee and delta the route recorded.
+		const key = policyOverrideKey(scidHex, direction);
+		const routedWith =
+			ctx.policyOverrides?.get(key) ??
+			(known ? (direction === 0 ? known.update1 : known.update2) : undefined);
+		const unchanged = routedWith
+			? routedWith.feeBaseMsat === update.feeBaseMsat &&
+			  routedWith.feeProportionalMillionths ===
+					update.feeProportionalMillionths &&
+			  routedWith.cltvExpiryDelta === update.cltvExpiryDelta &&
+			  routedWith.htlcMinimumMsat === update.htlcMinimumMsat &&
+			  routedWith.htlcMaximumMsat === update.htlcMaximumMsat
+			: erringHop.feeBaseMsat === update.feeBaseMsat &&
+			  erringHop.feeProportionalMillionths ===
+					update.feeProportionalMillionths &&
+			  outgoingHop.cltvExpiryDelta === update.cltvExpiryDelta;
+		if (unchanged) return false;
+
+		if (!ctx.policyOverrides) ctx.policyOverrides = new Map();
+		ctx.policyOverrides.set(key, update);
+		this.emitStructuredLog('payment', 'retry_repriced', {
+			paymentHash: payment.paymentHash.toString('hex'),
+			failureCode: code,
+			failureSourceIndex: index,
+			node: erringHop.pubkey.toString('hex'),
+			shortChannelId: scidHex,
+			direction,
+			feeBaseMsat: update.feeBaseMsat,
+			feeProportionalMillionths: update.feeProportionalMillionths,
+			cltvExpiryDelta: update.cltvExpiryDelta,
+			htlcMinimumMsat: update.htlcMinimumMsat.toString(),
+			timestamp: update.timestamp
+		});
+		return true;
+	}
+
+	/**
+	 * First-hop diversification for a retry after a retry (issue #1056).
+	 * The failed route's first hop, our own channel, is excluded only when
+	 * the failure implicates it (source index 0, or a failure we could not
+	 * decrypt or read) AND another of our channels can carry the route's
+	 * total on its own. It used to be excluded on every second retry
+	 * whatever the failure said, which on a wallet with one channel able to
+	 * carry the payment excluded that channel and ended the payment with
+	 * NO_ROUTE while a retry over it was still worth making.
+	 */
+	private diversifyFirstHop(
+		ctx: IPaymentRetryContext,
+		payment: IPaymentInfo,
+		route: IRoute
+	): void {
+		if (route.hops.length === 0) return;
+		const sourceIndex = payment.failureSourceIndex;
+		// The first hop did its part; the culpable channel is excluded already.
+		if (sourceIndex !== undefined && sourceIndex !== 0) return;
+		const firstHopScid = route.hops[0].shortChannelId.toString('hex');
+		const alternative = this.getLocalChannelEdges().find((edge) => {
+			const scid = edge.shortChannelId.toString('hex');
+			return (
+				scid !== firstHopScid &&
+				!ctx.excludedChannels.has(scid) &&
+				edge.outboundMsat >= route.totalAmountMsat
+			);
+		});
+		if (!alternative) {
+			this.emitStructuredLog('payment', 'first_hop_kept', {
+				paymentHash: payment.paymentHash.toString('hex'),
+				shortChannelId: firstHopScid,
+				failureSourceIndex: sourceIndex,
+				totalAmountMsat: route.totalAmountMsat.toString(),
+				reason: 'no other local channel can carry the payment'
+			});
+			return;
+		}
+		ctx.excludedChannels.add(firstHopScid);
+	}
+
+	/**
 	 * Send a keysend (spontaneous) payment — bLIP-0003.
 	 *
 	 * The sender generates a random preimage, includes it in the final hop
 	 * via TLV type 5482373484, and the recipient extracts + verifies it.
 	 */
 	sendKeysend(options: IKeysendOptions): IPaymentInfo {
-		// A fresh preimage per call, so each keysend is its own payment.
-		return this.dispatchKeysend(options, crypto.randomBytes(32));
+		if (options.preimage !== undefined) {
+			if (options.preimage.length !== 32) {
+				throw new LightningPaymentError(
+					LightningErrorCode.INVALID_KEYSEND,
+					'preimage must be 32 bytes'
+				);
+			}
+			// dispatchKeysend refuses only a PENDING record, which a random
+			// preimage never meets again. A reused one would pay a second time
+			// under a hash the first payee already knows the preimage of.
+			this.assertHashUnpaid(
+				crypto.createHash('sha256').update(options.preimage).digest(),
+				'any-pending'
+			);
+		}
+		// A fresh preimage per call unless the caller picked one, so each
+		// keysend is its own payment.
+		return this.dispatchKeysend(
+			options,
+			options.preimage ?? crypto.randomBytes(32)
+		);
 	}
 
 	/**
@@ -16192,7 +17275,8 @@ export class LightningNode extends EventEmitter {
 	private dispatchKeysend(
 		options: IKeysendOptions,
 		preimage: Buffer,
-		excludedChannels?: Set<string>
+		excludedChannels?: Set<string>,
+		policyOverrides?: TPolicyOverrides
 	): IPaymentInfo {
 		const {
 			destination,
@@ -16213,6 +17297,15 @@ export class LightningNode extends EventEmitter {
 			throw new LightningPaymentError(
 				LightningErrorCode.INVALID_KEYSEND,
 				'amountMsat must be positive'
+			);
+		}
+		// The marker goes last so a caller's key of the same name cannot hide
+		// it: it is what says the stored preimage is ours, not proof of payment.
+		const paymentMetadata = { ...(metadata || {}), _keysend: 'true' };
+		if (!this.paymentMetadataFits(paymentMetadata)) {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVALID_KEYSEND,
+				'metadata is too large for the recovery guardians to accept'
 			);
 		}
 
@@ -16243,7 +17336,8 @@ export class LightningNode extends EventEmitter {
 			undefined,
 			undefined,
 			undefined,
-			this.getLocalChannelEdges()
+			this.getLocalChannelEdges(),
+			policyOverrides
 		);
 		if (!route) {
 			throw new LightningPaymentError(
@@ -16257,21 +17351,6 @@ export class LightningNode extends EventEmitter {
 				LightningErrorCode.FEE_EXCEEDS_MAX,
 				'Route fee exceeds maximum'
 			);
-		}
-
-		// A keysend has no invoice to re-pay, so record what a retry needs to
-		// replay it: the same preimage, and therefore the same payment hash.
-		// Registered only after the route and fee checks pass, mirroring
-		// sendPayment: a dispatch that throws above must not leave a context
-		// behind for a payment that never existed.
-		if (!this.paymentRetryContexts.has(hashHex)) {
-			this.paymentRetryContexts.set(hashHex, {
-				keysend: { options, preimage },
-				excludedChannels: excludedChannels ?? new Set(),
-				retryCount: 0,
-				maxRetries: this.maxPaymentRetries,
-				maxFeeMsat
-			});
 		}
 
 		const hops = route.hops;
@@ -16343,26 +17422,44 @@ export class LightningNode extends EventEmitter {
 			route: route as IPaymentInfo['route'],
 			sharedSecrets,
 			createdAt: Date.now(),
-			metadata: { _keysend: 'true', ...(metadata || {}) }
+			metadata: paymentMetadata
 		};
-		this.payments.set(hashHex, payment);
-
-		// Track offered HTLC → payment mapping
 		const htlcId = outChannel.getFullState().localHtlcCounter;
 		const htlcKey = `${channelId.toString('hex')}:offered-${htlcId}`;
-		this.htlcPaymentMap.set(htlcKey, hashHex);
-		{
-			const mutations: RecoveryMutation[] = [
-				{ type: 'htlc_payment_mapping', htlcKey, paymentHash: hashHex }
-			];
-			const paymentMutation = this.paymentMutation(paymentHash);
-			if (paymentMutation) mutations.unshift(paymentMutation);
-			this.commitMutations(
-				'persist payment + HTLC mapping',
-				mutations,
-				RecoveryCriticality.SafetyCritical
+		const mutations: RecoveryMutation[] = [
+			{ type: 'payment_state', paymentHash: hashHex, payment },
+			{ type: 'htlc_payment_mapping', htlcKey, paymentHash: hashHex }
+		];
+		if (
+			!this.paymentMetadataFits(paymentMetadata, mutations, [
+				this.settledPaymentMutation(payment)
+			])
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVALID_KEYSEND,
+				'metadata is too large for the recovery guardians to accept'
 			);
 		}
+
+		// A keysend has no invoice to re-pay, so record what a retry needs to
+		// replay it: the same preimage, and therefore the same payment hash.
+		if (!this.paymentRetryContexts.has(hashHex)) {
+			this.paymentRetryContexts.set(hashHex, {
+				keysend: { options, preimage },
+				excludedChannels: excludedChannels ?? new Set(),
+				retryCount: 0,
+				maxRetries: this.maxPaymentRetries,
+				maxFeeMsat,
+				policyOverrides
+			});
+		}
+		this.payments.set(hashHex, payment);
+		this.htlcPaymentMap.set(htlcKey, hashHex);
+		this.commitMutations(
+			'persist payment + HTLC mapping',
+			mutations,
+			RecoveryCriticality.SafetyCritical
+		);
 
 		const result = this.channelManager.addHtlc(
 			channelId,
@@ -16378,8 +17475,9 @@ export class LightningNode extends EventEmitter {
 			// decrypt and failureCode stays undefined. addHtlc already knows why
 			// (no such channel, peer not connected, insufficient balance); losing
 			// that string is what makes a local failure look like a mystery.
-			payment.failureReason =
-				result.error ?? 'Local failure: could not add HTLC to the channel';
+			payment.failureReason = boundedFailureReason(
+				result.error ?? 'Local failure: could not add HTLC to the channel'
+			);
 			// Same stale-mapping and unpersisted-status cleanup as sendPayment.
 			this.htlcPaymentMap.delete(htlcKey);
 			const failMutations: RecoveryMutation[] = [
@@ -16403,7 +17501,10 @@ export class LightningNode extends EventEmitter {
 		invoice: {
 			paymentHash: Buffer;
 			paymentSecret?: Buffer;
-			amountMsat?: bigint;
+			// The amount being paid, not the invoice field: a zero-amount
+			// invoice has none, and this becomes the record's amount and every
+			// part's total_msat.
+			amountMsat: bigint;
 		},
 		multiRoute: {
 			parts: Array<{
@@ -16425,23 +17526,57 @@ export class LightningNode extends EventEmitter {
 		},
 		_finalCltvExpiry: number,
 		excludedChannels?: Set<string>,
-		maxCltvExpiryHeight?: number
+		maxCltvExpiryHeight?: number,
+		metadata?: Record<string, string>
 	): IPaymentInfo {
 		const paymentHash = invoice.paymentHash;
 		const hashHex = paymentHash.toString('hex');
-		const totalMsat = invoice.amountMsat!;
+		const totalMsat = invoice.amountMsat;
 
 		// Create a single payment record, journaled BEFORE any part leaves,
 		// as the single-path send does: a restart mid-flight must find the
 		// record, or the parts' outcome (and the preimage) has no owner
-		// (#743 audit).
+		// (#743 audit). sentMsat is the sum of the parts' first-hop amounts,
+		// the invoice amount plus every part's fees: it is written here, with
+		// the first persist, because settledHtlcs holds incoming-side keys
+		// with no amounts and the MPP state is not restored at boot, so it
+		// cannot be summed at settlement (issue #1008).
 		const payment: IPaymentInfo = {
 			paymentHash,
 			amountMsat: totalMsat,
+			sentMsat: multiRoute.totalAmountMsat,
 			status: PaymentStatus.PENDING,
 			direction: PaymentDirection.OUTGOING,
-			createdAt: Date.now()
+			createdAt: Date.now(),
+			...(metadata && { metadata: { ...metadata } })
 		};
+		// Dispatch gives the row a part's route and secrets, and settlement
+		// adds the preimage and invoice. The row has to fit a frame with any
+		// part's route before a part leaves, both as labelled and as settled.
+		// Settlement writes the invoice of a context left by an earlier
+		// attempt, since that context is kept below.
+		const settledInvoice =
+			this.paymentRetryContexts.get(hashHex)?.invoiceStr ?? invoiceStr;
+		if (
+			metadata &&
+			!multiRoute.parts.every((part) => {
+				const labelled: IPaymentInfo = {
+					...payment,
+					cltvBaseHeight: this.cltvBaseHeight(paymentHash),
+					route: part as IPaymentInfo['route'],
+					sharedSecrets: part.hops.map(() => Buffer.alloc(32))
+				};
+				return this.paymentMetadataFits(
+					metadata,
+					[{ type: 'payment_state', paymentHash: hashHex, payment: labelled }],
+					[this.settledPaymentMutation(labelled, settledInvoice)]
+				);
+			})
+		) {
+			throw new InvalidRequestError(
+				'payment metadata is too large for the recovery guardians to accept'
+			);
+		}
 		this.payments.set(hashHex, payment);
 		{
 			const paymentMutation = this.paymentMutation(paymentHash);
@@ -16463,7 +17598,8 @@ export class LightningNode extends EventEmitter {
 				excludedChannels: excludedChannels ?? new Set(),
 				retryCount: 0,
 				maxRetries: this.maxPaymentRetries,
-				maxCltvExpiryHeight
+				maxCltvExpiryHeight,
+				metadata: metadata && { ...metadata }
 			});
 		}
 
@@ -16597,9 +17733,11 @@ export class LightningNode extends EventEmitter {
 				// Part failed to dispatch — mark payment failed
 				payment.status = PaymentStatus.FAILED;
 				payment.completedAt = Date.now();
-				payment.failureReason = `Local failure: MPP part could not be dispatched (${
-					result.error ?? 'unknown reason'
-				})`;
+				payment.failureReason = boundedFailureReason(
+					`Local failure: MPP part could not be dispatched (${
+						result.error ?? 'unknown reason'
+					})`
+				);
 				this.outboundMppPayments.delete(hashHex);
 				// The mapping release and the FAILED record are one journaled
 				// transition, mirroring the single-path local-failure cleanup.
@@ -16631,8 +17769,7 @@ export class LightningNode extends EventEmitter {
 		channelId: Buffer,
 		htlcId: bigint,
 		amountMsat: bigint,
-		paymentHash: Buffer,
-		redispatched = false
+		paymentHash: Buffer
 	): void {
 		this.emitStructuredLog('htlc', 'received', {
 			channelId: channelId.toString('hex'),
@@ -16682,19 +17819,20 @@ export class LightningNode extends EventEmitter {
 
 		const onionBuf = htlcEntry.onionRoutingPacket;
 
-		// Route blinding: if this HTLC arrived with a blinding_point (we are a
-		// downstream blinded hop, not the introduction node), the sender encrypted
-		// our onion layer to our blinded node id, so we must peel it with the
-		// matching blinded private key. The introduction node has no message-level
-		// blinding_point (it receives it inside the onion as TLV 12) and so keeps
-		// using its real key.
-		const onionPrivkey = htlcEntry.blindingPoint
-			? deriveBlindedPrivkey(htlcEntry.blindingPoint, this.nodePrivkey)
-			: this.nodePrivkey;
-
 		let onionPacket;
 		let processed;
 		try {
+			// Route blinding: if this HTLC arrived with a blinding_point (we are a
+			// downstream blinded hop, not the introduction node), the sender
+			// encrypted our onion layer to our blinded node id, so we must peel it
+			// with the matching blinded private key. The introduction node has no
+			// message-level blinding_point (it receives it inside the onion as TLV
+			// 12) and so keeps using its real key. Inside the try: a blinding
+			// point that is not a curve point must fail this HTLC, not throw out
+			// of the batch that dispatches its siblings.
+			const onionPrivkey = htlcEntry.blindingPoint
+				? deriveBlindedPrivkey(htlcEntry.blindingPoint, this.nodePrivkey)
+				: this.nodePrivkey;
 			onionPacket = decodeOnionPacket(onionBuf);
 			processed = processOnionPacket(onionPacket, onionPrivkey, paymentHash);
 		} catch (err) {
@@ -16719,12 +17857,30 @@ export class LightningNode extends EventEmitter {
 				);
 				return;
 			}
-			// BOLT 4: INVALID_ONION_HMAC — we can't decrypt, so use a zero shared secret
-			// (the sender will not be able to decrypt this, but it's the best we can do)
-			this.channelManager.failHtlc(
+			// BOLT 4: a sound onion whose payload is invalid is answered under the
+			// sender's shared secret (invalid_onion_payload). Every other failure
+			// is a BADONION code with no secret to encrypt under, which only
+			// update_fail_malformed_htlc can carry; the upstream hop turns it
+			// into a failure the sender can read.
+			if (err instanceof OnionProcessingError && err.sharedSecret) {
+				this.channelManager.failHtlc(
+					channelId,
+					htlcId,
+					createFailureMessage(
+						err.sharedSecret,
+						err.failureCode,
+						err.failureData
+					)
+				);
+				return;
+			}
+			this.channelManager.failMalformedHtlc(
 				channelId,
 				htlcId,
-				createFailureMessage(Buffer.alloc(32), INVALID_ONION_HMAC)
+				crypto.createHash('sha256').update(onionBuf).digest(),
+				err instanceof OnionProcessingError
+					? err.failureCode
+					: INVALID_ONION_HMAC
 			);
 			return;
 		}
@@ -16817,6 +17973,40 @@ export class LightningNode extends EventEmitter {
 			policyCode = finalHop
 				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 				: TEMPORARY_CHANNEL_FAILURE;
+		} else if (channel.receivedHtlcExpiredOnArrival(htlcId)) {
+			// Admitted with a cltv_expiry at or below our tip (issue #1009):
+			// never settled or forwarded, failed back with the code the
+			// timeout scan uses for an inbound HTLC at its deadline. The
+			// channel used to be failed for this; the add turns on state the
+			// peer cannot see (our tip), so it is a fail-back like the horizon.
+			// Logged like the restore refusals: the old close was diagnosed
+			// from nothing but a force-close, and this is the same event class.
+			this.emitStructuredLog('htlc', 'refused_expired_on_arrival', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				cltvExpiry: htlcEntry.cltvExpiry,
+				height: this.currentBlockHeight,
+				finalHop
+			});
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: EXPIRY_TOO_SOON;
+		} else if (channel.receivedHtlcExceedsFunderFee(htlcId)) {
+			// We fund the channel and this add was admitted inside the
+			// funder-fee band (issue #1020): by the sender's own arithmetic our
+			// commitment fee could not be met above our reserve once it was in,
+			// but our output survived, so the channel took it rather than
+			// failing. Settling it would keep paying that fee out of our
+			// reserve; failing it back returns the peer's value and the fee
+			// weight in one removal round. Same answers as the dust arm above.
+			this.emitStructuredLog('htlc', 'refused_funder_fee', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				finalHop
+			});
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: TEMPORARY_CHANNEL_FAILURE;
 		} else if (
 			this.currentBlockHeight > 0 &&
 			htlcEntry.cltvExpiry >
@@ -16888,8 +18078,7 @@ export class LightningNode extends EventEmitter {
 				paymentHash,
 				processed.hopPayload,
 				htlcEntry.cltvExpiry,
-				htlcEntry.blindingPoint,
-				redispatched
+				htlcEntry.blindingPoint
 			);
 		} else {
 			// Forward to next hop — pass incoming HTLC details for CLTV/fee enforcement.
@@ -16998,7 +18187,7 @@ export class LightningNode extends EventEmitter {
 			// upstream HTLC that is irrevocably committed. An add still PENDING
 			// in either commitment is not yet money S can claim, so revealing
 			// against it would convert a failed payment into free credit for R.
-			if (htlcEntry.state !== HtlcState.COMMITTED) {
+			if (!receivedAddIrrevocablyCommitted(htlcEntry)) {
 				return fail(
 					TEMPORARY_NODE_FAILURE,
 					'upstream HTLC is not irrevocably committed'
@@ -17541,7 +18730,10 @@ export class LightningNode extends EventEmitter {
 		channelIdHex: string,
 		opts: {
 			forceCloseIfUnreachable?: boolean;
-			/** Required to force-close a channel with either recency hold. */
+			/**
+			 * Required to force-close a channel with a recency hold, or on a
+			 * device with a getRecoveryOwnershipHold.
+			 */
 			acceptStaleStateRisk?: boolean;
 			destinationScript?: Buffer;
 			timeoutMs?: number;
@@ -17596,6 +18788,16 @@ export class LightningNode extends EventEmitter {
 				throw new InvalidRequestError(
 					'Force closing a channel with unproven recency requires ' +
 						'acceptStaleStateRisk: true'
+				);
+			}
+			// So can a fence: the barrier latches whenever a newer writer shows up.
+			if (
+				this.getRecoveryOwnershipHold() !== null &&
+				opts.acceptStaleStateRisk !== true
+			) {
+				throw new InvalidRequestError(
+					'Force closing on a device that cannot show it still owns its ' +
+						'channels requires acceptStaleStateRisk: true'
 				);
 			}
 			const res = this.channelManager.forceClose(
@@ -18137,8 +19339,7 @@ export class LightningNode extends EventEmitter {
 		paymentHash: Buffer,
 		hopPayload?: IHopPayload,
 		incomingCltvExpiry?: number,
-		incomingBlindingPoint?: Buffer,
-		redispatched = false
+		incomingBlindingPoint?: Buffer
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		const htlcSecretKey = `${channelId.toString('hex')}:${htlcId}`;
@@ -18165,25 +19366,13 @@ export class LightningNode extends EventEmitter {
 
 		// A completed incoming payment takes no further HTLC for its hash:
 		// fulfilling one debits a second payer and fires the settlement events
-		// again. A fulfill deferred by quiescence reports success without
-		// reaching disk, so an HTLC that completed the payment can come back
-		// through the restart redispatch. Only those are fulfilled, and without
-		// settling the payment a second time.
+		// again. An HTLC the payment itself settled never gets here after a
+		// restart: redispatchUnresolvedReceivedHtlcs fulfills it first.
 		const completed = this.payments.get(hashHex);
 		if (
 			completed?.direction === PaymentDirection.INCOMING &&
 			completed.status === PaymentStatus.COMPLETED
 		) {
-			const settledPreimage = this.preimages.get(hashHex) ?? completed.preimage;
-			if (
-				redispatched &&
-				settledPreimage &&
-				completed.settledHtlcs?.includes(htlcSecretKey)
-			) {
-				this.cleanupHtlcSharedSecret(htlcSecretKey);
-				this.channelManager.fulfillHtlc(channelId, htlcId, settledPreimage);
-				return;
-			}
 			this.emitStructuredLog('htlc', 'payment_already_completed', {
 				paymentHash: hashHex
 			});
@@ -18293,7 +19482,13 @@ export class LightningNode extends EventEmitter {
 					RecoveryCriticality.SafetyCritical
 				);
 			}
-			this.fulfillPayment(channelId, htlcId, paymentHash, keysendPreimage);
+			this.fulfillPayment(
+				channelId,
+				htlcId,
+				paymentHash,
+				keysendPreimage,
+				amountMsat
+			);
 			return;
 		}
 
@@ -18553,27 +19748,36 @@ export class LightningNode extends EventEmitter {
 				(h) => h.channelId.equals(channelId) && h.htlcId === htlcId
 			);
 			const parkedMsat = parked.reduce((sum, h) => sum + h.amountMsat, 0n);
-			if (
+			const setComplete =
 				!alreadyParked &&
 				// A set with a settle or cancel partway through was acted on
 				// already, whatever its parked remainder still adds up to.
 				(this.heldResolutions.has(hashHex) ||
 					(finalInvoice?.amountMsat &&
 						finalInvoice.amountMsat > 0n &&
-						parkedMsat >= finalInvoice.amountMsat))
-			) {
-				this.emitStructuredLog('htlc', 'held_set_complete', {
-					paymentHash: hashHex,
-					parkedMsat: parkedMsat.toString(),
-					rejectedMsat: amountMsat.toString()
-				});
-				const reason = sharedSecret
+						parkedMsat >= finalInvoice.amountMsat));
+			// Settlement lists every parked part on the payment row.
+			const rowFull =
+				!alreadyParked && !setComplete && !this.settledRowFits(hashHex);
+			if (setComplete || rowFull) {
+				this.emitStructuredLog(
+					'htlc',
+					setComplete ? 'held_set_complete' : 'settled_row_full',
+					{
+						paymentHash: hashHex,
+						parkedMsat: parkedMsat.toString(),
+						rejectedMsat: amountMsat.toString()
+					}
+				);
+				const reason = !sharedSecret
+					? Buffer.alloc(FAILURE_MESSAGE_LENGTH)
+					: setComplete
 					? createFailureMessage(
 							sharedSecret,
 							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
 							this.incorrectPaymentDetailsData(amountMsat)
 					  )
-					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+					: createFailureMessage(sharedSecret, TEMPORARY_NODE_FAILURE);
 				// Nothing else tracks this part once it is turned away, so a
 				// refused fail is owed and retried, and the secret stays until
 				// the fail leaves.
@@ -18623,7 +19827,13 @@ export class LightningNode extends EventEmitter {
 			paymentHash: hashHex,
 			amountMsat: amountMsat.toString()
 		});
-		this.fulfillPayment(channelId, htlcId, paymentHash, preimage!);
+		this.fulfillPayment(
+			channelId,
+			htlcId,
+			paymentHash,
+			preimage!,
+			partAmountMsat
+		);
 	}
 
 	/**
@@ -18848,6 +20058,7 @@ export class LightningNode extends EventEmitter {
 			outcome: 'settle'
 		});
 		if (!settledSet) return false;
+		const settledMsat = settledSet.reduce((sum, h) => sum + h.amountMsat, 0n);
 
 		const payment = this.payments.get(hashHex);
 		if (payment) {
@@ -18857,6 +20068,8 @@ export class LightningNode extends EventEmitter {
 			payment.settledHtlcs = held.map(
 				(h) => `${h.channelId.toString('hex')}:${h.htlcId}`
 			);
+			// 0n is an any-amount invoice that had no payment until now.
+			if (payment.amountMsat === 0n) payment.amountMsat = settledMsat;
 			this.safeStorage(
 				() => this.persistPayment(paymentHash),
 				'persistPayment'
@@ -18871,7 +20084,7 @@ export class LightningNode extends EventEmitter {
 		const event: IHoldInvoiceStateEvent = {
 			paymentHash,
 			state: 'SETTLED',
-			heldAmountMsat: settledSet.reduce((sum, h) => sum + h.amountMsat, 0n),
+			heldAmountMsat: settledMsat,
 			htlcCount: settledSet.length,
 			...this.heldSetExpiry(hashHex, settledSet)
 		};
@@ -19528,6 +20741,7 @@ export class LightningNode extends EventEmitter {
 	 * receiver never assumes support.
 	 */
 	peerAdvertisesAsyncReceive(pubkeyHex: string): boolean {
+		pubkeyHex = normalizeHexPubkey(pubkeyHex);
 		const init = this.peerManager?.getPeer(pubkeyHex)?.getRemoteInit();
 		if (init) return init.features.hasFeature(Feature.ASYNC_RECEIVE_SERVICE);
 		const ann = this.graph.getVerifiedNodeAnnouncement(
@@ -19557,6 +20771,7 @@ export class LightningNode extends EventEmitter {
 			timeoutMs?: number;
 		} = {}
 	): Promise<IReceiverGrant> {
+		lspNodeIdHex = normalizeHexPubkey(lspNodeIdHex);
 		if (!this.peerAdvertisesAsyncReceive(lspNodeIdHex)) {
 			throw new Error(
 				`peer ${lspNodeIdHex} does not advertise the async receive service (feature bit ${
@@ -19738,6 +20953,7 @@ export class LightningNode extends EventEmitter {
 
 	/** Receiver: drop every grant held for an LSP. */
 	forgetAsyncReceiveGrant(lspNodeIdHex: string): boolean {
+		lspNodeIdHex = normalizeHexPubkey(lspNodeIdHex);
 		const had = this.asyncReceiveGrants.delete(lspNodeIdHex);
 		if (had) this.persistAsyncReceiveGrants();
 		return had;
@@ -20208,6 +21424,7 @@ export class LightningNode extends EventEmitter {
 	> {
 		const pubkeyErr = validateHexPubkey(lspPubkeyHex, 'lspPubkeyHex');
 		if (pubkeyErr) throw new Error(pubkeyErr);
+		lspPubkeyHex = normalizeHexPubkey(lspPubkeyHex);
 		const maxAmountMsat = params.maxAmountMsat ?? JIT_RECEIVE_DEFAULT_MAX_MSAT;
 		if (maxAmountMsat <= 0n) {
 			throw new Error('maxAmountMsat must be positive');
@@ -20298,6 +21515,7 @@ export class LightningNode extends EventEmitter {
 	}> {
 		const pubkeyErr = validateHexPubkey(lspPubkeyHex, 'lspPubkeyHex');
 		if (pubkeyErr) throw new Error(pubkeyErr);
+		lspPubkeyHex = normalizeHexPubkey(lspPubkeyHex);
 		if (params.maxAmountMsat <= 0n) {
 			throw new Error('maxAmountMsat must be positive');
 		}
@@ -20400,6 +21618,11 @@ export class LightningNode extends EventEmitter {
 	 * opening fee. In hop mode (`feeMode: 'hop'`) the hint carries the fee
 	 * terms instead, the sender pays them, and the invoice needs no allowance:
 	 * a receiver-pays fee becomes a sender-pays one.
+	 *
+	 * The total the intent declares is only the share of the amount that has
+	 * to cross the LSP: the invoice also advertises every other usable channel
+	 * of ours, and what those can receive never reaches the LSP (issue #1061,
+	 * jitShareCrossingLspMsat).
 	 */
 	async createJitInvoice(opts: {
 		lspPubkeyHex: string;
@@ -20426,6 +21649,7 @@ export class LightningNode extends EventEmitter {
 			feeMode: JitFeeMode;
 		}
 	> {
+		const lspPubkeyHex = normalizeHexPubkey(opts.lspPubkeyHex);
 		const expiry = opts.expiry ?? JIT_RECEIVE_DEFAULT_EXPIRY_SECONDS;
 		const maxAmountMsat =
 			opts.amountMsat ?? opts.maxAmountMsat ?? JIT_RECEIVE_DEFAULT_MAX_MSAT;
@@ -20442,7 +21666,7 @@ export class LightningNode extends EventEmitter {
 		// Asked of the SAME predicate the hint decision below uses: over an
 		// existing usable channel the payment needs no new channel at all and
 		// nothing here applies.
-		if (!this.liveChannelWith(opts.lspPubkeyHex)) {
+		if (!this.liveChannelWith(lspPubkeyHex)) {
 			const refusal = this.channelManager.newChannelRefusal();
 			if (refusal) {
 				throw new Error(
@@ -20451,11 +21675,17 @@ export class LightningNode extends EventEmitter {
 				);
 			}
 		}
-		const grant = await this.requestJitReceive(opts.lspPubkeyHex, {
+		// The total the LSP waits for before it funds is the share of the
+		// amount that has to come through it, not the whole invoice (issue
+		// #1061, jitShareCrossingLspMsat); an amount-less invoice declares
+		// none, as before.
+		const expectedTotalMsat =
+			opts.amountMsat !== undefined
+				? this.jitShareCrossingLspMsat(lspPubkeyHex, opts.amountMsat)
+				: undefined;
+		const grant = await this.requestJitReceive(lspPubkeyHex, {
 			maxAmountMsat,
-			...(opts.amountMsat !== undefined
-				? { expectedTotalMsat: opts.amountMsat }
-				: {}),
+			...(expectedTotalMsat !== undefined ? { expectedTotalMsat } : {}),
 			targetRemainingInboundSat: opts.targetRemainingInboundSat ?? 0n,
 			expirySeconds: expiry,
 			...(opts.maxFlatFeeSat !== undefined
@@ -20476,7 +21706,7 @@ export class LightningNode extends EventEmitter {
 		// A channel mid-splice counts: it is still the home channel, it still
 		// receives under its pre-splice scid, and an intercept hint minted
 		// while it splices is the same second channel by another door.
-		const existing = this.liveChannelWith(opts.lspPubkeyHex);
+		const existing = this.liveChannelWith(lspPubkeyHex);
 		const result = this.createInvoice({
 			amountMsat: opts.amountMsat,
 			description: opts.description ?? '',
@@ -20488,6 +21718,13 @@ export class LightningNode extends EventEmitter {
 			// only the fee owed on what actually arrives. Hop mode records no
 			// allowance at all: the forward is the full amount, and an allowance
 			// would let a short HTLC settle for a fee nobody is deducting.
+			//
+			// The declared total is the payer's onion total_msat: the full
+			// invoice amount however its parts route. The LSP skims the flat
+			// fee plus the ppm of what it actually forwards, which is at most
+			// that, and the intent's expectedTotalMsat plays no part in either
+			// figure, so a lowered or omitted total leaves the allowance at
+			// exactly the fee owed (admitJitSkim).
 			...(grant.feeMode === 'skim'
 				? {
 						jitFeeAllowance: {
@@ -20504,6 +21741,71 @@ export class LightningNode extends EventEmitter {
 			feePpm: grant.feePpm,
 			feeMode: grant.feeMode
 		};
+	}
+
+	/**
+	 * The share of a fixed-amount JIT invoice that has to arrive through the
+	 * LSP, which is the total its intent must declare (issue #1061), or
+	 * undefined when the other channels could carry all of it.
+	 *
+	 * createInvoice puts a hint on the invoice for EVERY usable channel, so a
+	 * payer that can reach one with another peer may deliver part of the
+	 * amount over it and only the rest through the intercept hint. The LSP
+	 * funds once the parts it holds reach the declared total, and a total the
+	 * other channel absorbs part of is never reached: the held parts time out
+	 * (aggregationTimeoutMs) as temporary_channel_failure, every attempt.
+	 * Switching primaries leaves a wallet in exactly this state, since the
+	 * channel with the old primary stays open, and the old primary itself is
+	 * the payer that splits this way with certainty.
+	 *
+	 * So the total declared is the amount minus what those other channels can
+	 * receive, and no total at all (0 on the wire, "unknown") once they could
+	 * carry the whole amount: the LSP then funds on the first intercepted part
+	 * and this node's own final-hop MPP accumulation joins it with the parts
+	 * that came the other way. Receivable is the peer's balance above the
+	 * reserve we hold it to, the figure the daemon's canReceive uses, counted
+	 * only for a channel the invoice will actually advertise (the predicate
+	 * getPrivateChannelRoutingHints applies). A channel with the LSP itself is
+	 * not "other": what arrives over it lands at the LSP either way, and a
+	 * part that outgrows it is answered with a splice, not a wait.
+	 *
+	 * The trade-off, since the two failure modes are not symmetric: with the
+	 * total lowered or omitted, a payer that splits ACROSS the intercept hint
+	 * itself loses its late parts. The held set is consumed when the funding
+	 * starts, a part arriving while it runs is refused, and the intent is gone
+	 * once the forward is placed, so only one part can cross the LSP and the
+	 * payer sees that attempt fail and retries. The mismatch above is worse:
+	 * deterministic, and it fails every attempt that touches the other
+	 * channel. Dropping the other hints from a JIT invoice instead would not
+	 * help: the payer adjacent to this node (the old primary, as reported)
+	 * needs no hint to pay over its own channel, and a public channel is in
+	 * every payer's graph regardless.
+	 *
+	 * Erring high on what the other channels can carry is the safe side (the
+	 * reserve is the only deduction; the funder's commitment fee and the
+	 * in-flight ceilings are not): it lowers the total, and a total that is
+	 * too low costs a retry where one that is too high fails every time.
+	 */
+	private jitShareCrossingLspMsat(
+		lspPubkeyHex: string,
+		amountMsat: bigint
+	): bigint | undefined {
+		let otherInboundMsat = 0n;
+		for (const channel of this.channelManager.listChannels()) {
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			if (this.channelManager.getPeerForChannel(channelId) === lspPubkeyHex) {
+				continue;
+			}
+			if (!this.buildRoutingHintForChannel(channel)) continue;
+			const state = channel.getFullState();
+			const receivableMsat =
+				state.remoteBalanceMsat -
+				state.localConfig.channelReserveSatoshis * 1000n;
+			if (receivableMsat > 0n) otherInboundMsat += receivableMsat;
+		}
+		const share = amountMsat - otherInboundMsat;
+		return share > 0n ? share : undefined;
 	}
 
 	/**
@@ -20670,23 +21972,15 @@ export class LightningNode extends EventEmitter {
 			for (const p of pending.receivedParts) {
 				if (p.status !== PaymentStatus.PENDING) continue;
 				p.status = PaymentStatus.FAILED;
-				const partKey = `${p.channelId.toString('hex')}:${p.htlcId}`;
-				const partSecret = this.receivedHtlcSharedSecrets.get(partKey);
-				const partReason = partSecret
-					? createFailureMessage(partSecret, FINAL_INCORRECT_HTLC_AMOUNT)
-					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
-				this.cleanupHtlcSharedSecret(partKey);
-				this.channelManager.failHtlc(p.channelId, p.htlcId, partReason);
+				this.failRejectedMppPart(
+					p.channelId,
+					p.htlcId,
+					FINAL_INCORRECT_HTLC_AMOUNT
+				);
 			}
 			this.pendingMppPayments.delete(hashHex);
 			this.clearJitSkim(hashHex);
-			const secretKey = `${channelId.toString('hex')}:${htlcId}`;
-			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
-			const reason = sharedSecret
-				? createFailureMessage(sharedSecret, FINAL_INCORRECT_HTLC_AMOUNT)
-				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
-			this.cleanupHtlcSharedSecret(secretKey);
-			this.channelManager.failHtlc(channelId, htlcId, reason);
+			this.failRejectedMppPart(channelId, htlcId, FINAL_INCORRECT_HTLC_AMOUNT);
 			return;
 		}
 
@@ -20705,6 +21999,37 @@ export class LightningNode extends EventEmitter {
 				channelId: channelId.toString('hex'),
 				htlcId: htlcId.toString()
 			});
+			return;
+		}
+
+		// Settlement lists every part on the payment row. The parts already
+		// here stay pending and fail back at the MPP timeout.
+		if (!this.settledRowFits(hashHex)) {
+			this.emitStructuredLog('htlc', 'settled_row_full', {
+				paymentHash: hashHex,
+				parts: String(pending.receivedParts.length)
+			});
+			const secretKey = `${channelId.toString('hex')}:${htlcId}`;
+			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
+			const reason = sharedSecret
+				? createFailureMessage(sharedSecret, TEMPORARY_NODE_FAILURE)
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			// The part never joins the set, so the MPP timeout will not fail it:
+			// a refused fail is owed and retried, and the secret stays until the
+			// fail leaves.
+			const failRefusedPart = (): boolean => {
+				if (!this.channelManager.failHtlc(channelId, htlcId, reason).ok) {
+					return false;
+				}
+				this.cleanupHtlcSharedSecret(secretKey);
+				return true;
+			};
+			if (!failRefusedPart()) {
+				this.owedHeldForwardFailures.set(secretKey, {
+					inChannelIdHex: channelId.toString('hex'),
+					fail: failRefusedPart
+				});
+			}
 			return;
 		}
 
@@ -20734,10 +22059,28 @@ export class LightningNode extends EventEmitter {
 			// (Mirrors the single-payment path in fulfillPayment.)
 			this.channelManager.recordPreimage(paymentHash, preimage);
 
-			// Fulfill ALL parts atomically
+			// Fulfill ALL parts atomically. A part whose channel cannot carry the
+			// fulfill (its peer is mid-reconnect) is still listed in settledHtlcs
+			// below, and fulfillSettledReceivedHtlcs sends it on reestablish.
 			for (const p of pending.receivedParts) {
 				p.status = PaymentStatus.COMPLETED;
-				this.channelManager.fulfillHtlc(p.channelId, p.htlcId, preimage);
+				const result = this.channelManager.fulfillHtlc(
+					p.channelId,
+					p.htlcId,
+					preimage
+				);
+				if (result.ok) {
+					this.cleanupHtlcSharedSecret(
+						`${p.channelId.toString('hex')}:${p.htlcId}`
+					);
+				} else {
+					this.emitStructuredLog('htlc', 'mpp_part_fulfill_refused', {
+						paymentHash: hashHex,
+						channelId: p.channelId.toString('hex'),
+						htlcId: p.htlcId.toString(),
+						error: result.error
+					});
+				}
 			}
 			this.pendingMppPayments.delete(hashHex);
 			// Settle here goes straight to fulfillHtlc, so this is the MPP set's
@@ -20752,6 +22095,9 @@ export class LightningNode extends EventEmitter {
 				payment.settledHtlcs = pending.receivedParts.map(
 					(p) => `${p.channelId.toString('hex')}:${p.htlcId}`
 				);
+				// An any-amount invoice's record holds 0n until paid, so the
+				// settled parts are the only source of what it received.
+				if (payment.amountMsat === 0n) payment.amountMsat = totalReceived;
 				this.persistPayment(paymentHash);
 				this.emit('payment:received', payment);
 				this.emitInvoiceSettled(paymentHash, payment);
@@ -20770,16 +22116,7 @@ export class LightningNode extends EventEmitter {
 				for (const part of pending.receivedParts) {
 					if (part.status === PaymentStatus.PENDING) {
 						part.status = PaymentStatus.FAILED;
-						const htlcSecretKey = `${part.channelId.toString('hex')}:${
-							part.htlcId
-						}`;
-						const sharedSecret =
-							this.receivedHtlcSharedSecrets.get(htlcSecretKey);
-						const reason = sharedSecret
-							? createFailureMessage(sharedSecret, MPP_TIMEOUT)
-							: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
-						this.cleanupHtlcSharedSecret(htlcSecretKey);
-						this.channelManager.failHtlc(part.channelId, part.htlcId, reason);
+						this.failRejectedMppPart(part.channelId, part.htlcId, MPP_TIMEOUT);
 					}
 				}
 				this.pendingMppPayments.delete(hashHex);
@@ -20788,11 +22125,77 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Fail a part of an MPP set this node dropped. Nothing else tracks the
+	 * part once its set is gone, so a refused fail is owed and retried, and
+	 * the secret stays until the fail leaves. The debt is persisted: after a
+	 * restart the part would otherwise look unresolved to the restore repair.
+	 */
+	private failRejectedMppPart(
+		channelId: Buffer,
+		htlcId: bigint,
+		failureCode: number
+	): void {
+		const fail = this.rejectedPartFail(channelId, htlcId, failureCode);
+		if (fail()) return;
+		this.owedHeldForwardFailures.set(`${channelId.toString('hex')}:${htlcId}`, {
+			inChannelIdHex: channelId.toString('hex'),
+			fail,
+			failureCode
+		});
+		this.persistOwedPartFailures();
+	}
+
+	/** A rejected MPP part's fail: true once the channel takes it. */
+	private rejectedPartFail(
+		channelId: Buffer,
+		htlcId: bigint,
+		failureCode: number
+	): () => boolean {
+		const secretKey = `${channelId.toString('hex')}:${htlcId}`;
+		return (): boolean => {
+			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
+			const reason = sharedSecret
+				? createFailureMessage(sharedSecret, failureCode)
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			if (!this.channelManager.failHtlc(channelId, htlcId, reason).ok) {
+				return false;
+			}
+			this.cleanupHtlcSharedSecret(secretKey);
+			return true;
+		};
+	}
+
+	/** Persist the owed fails that carry a failure code (issue #1265). */
+	private persistOwedPartFailures(): void {
+		if (!this.storage) return;
+		const rows: Array<{ key: string; failureCode: number }> = [];
+		for (const [key, owed] of this.owedHeldForwardFailures) {
+			if (owed.failureCode !== undefined) {
+				rows.push({ key, failureCode: owed.failureCode });
+			}
+		}
+		this.owedPartFailuresUnsaved = !this.safeStorage(
+			() =>
+				this.storage!.saveMetadata(
+					OWED_PART_FAILURES_KEY,
+					JSON.stringify(rows)
+				),
+			'persistOwedPartFailures'
+		);
+	}
+
+	/**
+	 * receivedMsat is the settled HTLC's payment amount. It replaces the
+	 * record's amount only when that is 0n, which is an any-amount invoice
+	 * that has not been paid yet.
+	 */
 	private fulfillPayment(
 		channelId: Buffer,
 		htlcId: bigint,
 		paymentHash: Buffer,
-		preimage: Buffer
+		preimage: Buffer,
+		receivedMsat: bigint
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		// Clean up shared secret on fulfillment
@@ -20813,6 +22216,7 @@ export class LightningNode extends EventEmitter {
 			payment.status = PaymentStatus.COMPLETED;
 			payment.completedAt = Date.now();
 			payment.settledHtlcs = [`${channelId.toString('hex')}:${htlcId}`];
+			if (payment.amountMsat === 0n) payment.amountMsat = receivedMsat;
 		}
 
 		// Persist BEFORE sending fulfill message: on crash, reestablish
@@ -20897,9 +22301,19 @@ export class LightningNode extends EventEmitter {
 		let blindedOutAmount: bigint | undefined;
 		let blindedOutCltv: number | undefined;
 		let blindedMaxCltv: number | undefined;
+		let blindedMinMsat: bigint | undefined;
+		// BOLT 4: a blinded intermediate payload carries only
+		// encrypted_recipient_data and current_path_key; the forwarding terms
+		// come from the encrypted payment_relay, never from cleartext.
+		let blindedCleartextFields = false;
 		const effectiveBlindingPoint =
 			hopPayload.blindingPoint ?? incomingBlindingPoint;
 		if (effectiveBlindingPoint && hopPayload.encryptedRecipientData) {
+			blindedCleartextFields =
+				hopPayload.omitForwardAmounts !== true ||
+				hopPayload.shortChannelId !== undefined ||
+				hopPayload.paymentSecret !== undefined ||
+				hopPayload.totalAmountMsat !== undefined;
 			try {
 				const { hopData, nextBlindingKey } = processBlindedHop(
 					effectiveBlindingPoint,
@@ -20926,6 +22340,7 @@ export class LightningNode extends EventEmitter {
 					blindedOutCltv = incomingCltvExpiry - relay.cltvExpiryDelta;
 				}
 				blindedMaxCltv = hopData.paymentConstraints?.maxCltvExpiry;
+				blindedMinMsat = hopData.paymentConstraints?.htlcMinimumMsat;
 			} catch {
 				outgoingScid = undefined;
 			}
@@ -20985,6 +22400,16 @@ export class LightningNode extends EventEmitter {
 			return true;
 		};
 
+		if (blindedCleartextFields) {
+			this.emitStructuredLog('htlc', 'blinded_payload_cleartext_fields', {
+				paymentHash: paymentHash.toString('hex'),
+				inChannelId: inChannelId.toString('hex'),
+				inHtlcId: Number(inHtlcId)
+			});
+			failIncoming(INVALID_ONION_PAYLOAD);
+			return;
+		}
+
 		// Forwarding opt-out: a node that does not want to be a routing hop
 		// declines every forward up front, before any onward lookup or policy
 		// work. temporary_node_failure is the correct code: this is a node-wide
@@ -21015,6 +22440,32 @@ export class LightningNode extends EventEmitter {
 			outgoingScid: outgoingScid?.toString('hex'),
 			blinded: isBlindedForward
 		});
+
+		// The outgoing expiry against OUR chain tip (issue #1009). The delta
+		// checks further down relate the outgoing expiry only to the incoming
+		// one, so an onion whose outgoing_cltv_value already lay in the past,
+		// under an incoming HTLC generous enough to cover our delta, was
+		// relayed as it was: a downstream that refuses it costs the payer a
+		// retry, and one that fails its channel over it costs us the outgoing
+		// channel. Judged before the SCID lookup so that a JIT intercept and an
+		// async hold never park an HTLC that could not be forwarded now either.
+		// A blinded hop answers invalid_onion_blinding through failIncoming.
+		if (
+			this.currentBlockHeight > 0 &&
+			forwardCltv <= this.currentBlockHeight + OUTGOING_CLTV_REJECT_DELTA
+		) {
+			this.emitStructuredLog('htlc', 'forward_expiry_too_soon', {
+				paymentHash: paymentHash.toString('hex'),
+				inChannelId: inChannelId.toString('hex'),
+				inHtlcId: Number(inHtlcId),
+				incomingCltvExpiry,
+				outgoingCltvExpiry: forwardCltv,
+				height: this.currentBlockHeight,
+				stage: 'judged'
+			});
+			failIncoming(EXPIRY_TOO_SOON);
+			return;
+		}
 
 		if (!outgoingScid) {
 			failIncoming(UNKNOWN_NEXT_PEER);
@@ -21096,6 +22547,11 @@ export class LightningNode extends EventEmitter {
 				failIncoming(INCORRECT_CLTV_EXPIRY, {
 					cltvExpiry: forwardCltv
 				});
+				return;
+			}
+			// BOLT 4 payment_constraints: the incoming amount, not the forwarded one.
+			if (blindedMinMsat !== undefined && incomingAmountMsat < blindedMinMsat) {
+				failIncoming(AMOUNT_BELOW_MINIMUM, { htlcMsat: incomingAmountMsat });
 				return;
 			}
 			// Fee enforcement: the relay fee the receiver wrote into the path must
@@ -21410,6 +22866,7 @@ export class LightningNode extends EventEmitter {
 	 * dropped: there is nothing left to fail.
 	 */
 	private retryOwedHeldForwardFailures(inChannelIdHex?: string): void {
+		let retiredPersisted = false;
 		for (const [key, owed] of this.owedHeldForwardFailures) {
 			if (inChannelIdHex && owed.inChannelIdHex !== inChannelIdHex) continue;
 			const [chanHex, htlcId] = key.split(':');
@@ -21428,6 +22885,7 @@ export class LightningNode extends EventEmitter {
 			) {
 				this.owedHeldForwardFailures.delete(key);
 				this.cleanupHtlcSharedSecret(key);
+				retiredPersisted ||= owed.failureCode !== undefined;
 				continue;
 			}
 			const htlc = channel?.getFullState().htlcs.get(`received-${htlcId}`);
@@ -21437,7 +22895,11 @@ export class LightningNode extends EventEmitter {
 					htlc.state === HtlcState.PENDING);
 			if (!stillCommitted || owed.fail()) {
 				this.owedHeldForwardFailures.delete(key);
+				retiredPersisted ||= owed.failureCode !== undefined;
 			}
+		}
+		if (retiredPersisted || this.owedPartFailuresUnsaved) {
+			this.persistOwedPartFailures();
 		}
 	}
 
@@ -21499,6 +22961,32 @@ export class LightningNode extends EventEmitter {
 		part: IHeldJitPart,
 		refundOwner: 'engine' | 'caller' = 'engine'
 	): ForwardPlacement {
+		// The tip may have moved since the forward was judged (issue #1009): a
+		// JIT part held for a splice, a held forward its receiver releases and
+		// a redispatched hold all reach this method later, sometimes many
+		// blocks later. Re-judged here, before the linkage is recorded and
+		// before the add, with the same fail-back and the same single-owner
+		// refund rule as a refused add below. Ahead of the hold-for-splice hook
+		// on purpose: a stale expiry is not a liquidity shortfall, and a splice
+		// would only make it staler.
+		if (
+			this.currentBlockHeight > 0 &&
+			part.forwardCltv <= this.currentBlockHeight + OUTGOING_CLTV_REJECT_DELTA
+		) {
+			this.emitStructuredLog('htlc', 'forward_expiry_too_soon', {
+				paymentHash: part.paymentHash.toString('hex'),
+				inChannelId: part.inChannelId.toString('hex'),
+				inHtlcId: Number(part.inHtlcId),
+				incomingCltvExpiry: part.incomingCltvExpiry,
+				outgoingCltvExpiry: part.forwardCltv,
+				height: this.currentBlockHeight,
+				stage: 'placement'
+			});
+			if (!part.failIncoming(EXPIRY_TOO_SOON) && refundOwner === 'engine') {
+				this.jitReceiveManager?.owedUpstreamFailure(part);
+			}
+			return 'refused';
+		}
 		const nextOnionBuf = encodeOnionPacket(part.nextPacket);
 		const outChannel = this.channelManager.getChannel(outChannelId);
 		const outHtlcId = outChannel
@@ -21686,6 +23174,7 @@ export class LightningNode extends EventEmitter {
 	): void {
 		if (outputType !== OutputType.OFFERED_HTLC) return;
 		if (!channelId || !paymentHash) return;
+		const hashHex = paymentHash.toString('hex');
 		// Our own outgoing payment's HTLC resolved on chain (issue #737): the
 		// resolution watcher learns it here whether the preimage was found or
 		// the timeout path won.
@@ -21693,9 +23182,18 @@ export class LightningNode extends EventEmitter {
 			htlcId !== undefined &&
 			this.htlcPaymentMap.get(
 				`${channelId.toString('hex')}:offered-${htlcId}`
-			) === paymentHash.toString('hex')
+			) === hashHex
 		) {
 			this.emitHtlcResolved(paymentHash, channelId, htlcId, 'onchain-resolved');
+			// With no preimage the timeout path won for this HTLC (a preimage
+			// resolution is handleOnChainPreimageLearned's). Nothing else
+			// fails a PENDING record whose channel left NORMAL: the expiry
+			// backstop skips such channels and the stuck-payment sweep counts
+			// the kept entry as active. So the payment is failed here, unless
+			// another HTLC of it is still out (issue #976).
+			if (!this.preimages.has(hashHex)) {
+				this.failPaymentUnlessInFlight(paymentHash, 'HTLC timed out on chain');
+			}
 		}
 		// A known preimage means the downstream DID settle; the fulfill path
 		// (handleOnChainPreimageLearned / handleHtlcFulfilled) owns the inbound leg.
@@ -21792,6 +23290,11 @@ export class LightningNode extends EventEmitter {
 
 		// Check if this is a forwarded HTLC — propagate fulfillment upstream
 		const outKey = `${channelId.toString('hex')}:offered-${htlcId}`;
+		// A failure parked on this HTLC until its removal round completed
+		// (issue #989) is void: the peer fulfilled it after all (a disconnect
+		// before our revocation rolled the fail back, and the peer
+		// retransmitted a fulfil). The payment completes below, no retry.
+		this.retriesAwaitingRemoval.delete(outKey);
 		const forward = this.forwardedHtlcs.get(outKey);
 		if (forward) {
 			// FFOR receipt witness (section 9.6.5): a delegated fulfil is
@@ -22235,6 +23738,59 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * A commitment round completed on this channel: settle any own-payment
+	 * failure parked on it whose removal is now irrevocable (issue #989),
+	 * which retries the payment or gives it up.
+	 *
+	 * The peer's revoke_and_ack is the one event that makes a removal
+	 * irrevocable, and handleRevokeAndAck's settlement loop drops the entry
+	 * from the channel in that same step, so a parked HTLC gone from a
+	 * channel that still carries updates off chain (NORMAL, SHUTTING_DOWN or
+	 * the ECDSA splice pending-lock window, the states in which the channel
+	 * processes a revoke_and_ack; that loop is the only off-chain deletion
+	 * of an offered FAILED entry) has completed its removal, as has one
+	 * still present with both phase flags set. An entry
+	 * rolled back to COMMITTED by a disconnect stays parked: the peer's
+	 * retransmitted fail parks it again, or its fulfil drops it in
+	 * handleHtlcFulfilled. A channel that went to chain never fires this;
+	 * its HTLC is the monitor's, and channel:resolved drops the parked entry.
+	 *
+	 * Each entry is unparked before it is settled: the settlement may
+	 * dispatch the retry on this very channel, and that round re-enters here.
+	 */
+	private drainRetriesAwaitingRemoval(channelId: Buffer): void {
+		const channelIdHex = channelId.toString('hex');
+		const prefix = `${channelIdHex}:offered-`;
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const state = channel.getFullState();
+		// The same states in which handleRevokeAndAck accepts the message.
+		const liveOffChain =
+			this.channelManager.getMonitor(channelId) === undefined &&
+			(state.state === ChannelState.NORMAL ||
+				state.state === ChannelState.SHUTTING_DOWN ||
+				channel.isSplicePendingLock());
+		for (const [key, parked] of [...this.retriesAwaitingRemoval]) {
+			if (!key.startsWith(prefix)) continue;
+			// A retry dispatched below can complete its own round inside this
+			// call, and that nested drain may have settled this entry already.
+			if (!this.retriesAwaitingRemoval.has(key)) continue;
+			const htlc = state.htlcs.get(key.slice(channelIdHex.length + 1));
+			const irrevocable = htlc
+				? LightningNode.isOfferedFailIrrevocable(htlc)
+				: liveOffChain;
+			if (!irrevocable) continue;
+			this.retriesAwaitingRemoval.delete(key);
+			this.settleOwnPaymentFailure(
+				parked.channelId,
+				parked.htlcId,
+				parked.reason,
+				parked.localFailureReason
+			);
+		}
+	}
+
+	/**
 	 * Propagate a downstream failure to the inbound leg it refunds. Mirror
 	 * of settleForwardUpstream, with the same discipline (issue 297): the
 	 * forward linkage is consumed ONLY when the inbound channel actually
@@ -22542,6 +24098,51 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
+	/**
+	 * The BADONION code of an update_fail_malformed_htlc, which the channel
+	 * layer surfaces as the synthetic reason [failure_code][0x0000]; undefined
+	 * for any other reason.
+	 */
+	private static malformedFailureCode(reason: Buffer): number | undefined {
+		if (
+			reason.length === 4 &&
+			(reason.readUInt16BE(0) & 0x8000) !== 0 &&
+			reason.readUInt16BE(2) === 0
+		) {
+			return reason.readUInt16BE(0);
+		}
+		return undefined;
+	}
+
+	/**
+	 * BOLT 2: a forward failed downstream by update_fail_malformed_htlc is
+	 * failed upstream with a failure WE originate, carrying the downstream's
+	 * code and the sha256 of the onion we forwarded. The synthetic 4-byte
+	 * reason is not an onion failure: wrapped, it reaches the sender as bytes
+	 * no hop's key decrypts, and an unreadable failure penalises every hop on
+	 * the route. Undefined when the inbound shared secret is gone (the reason
+	 * then relays as before).
+	 */
+	private originateMalformedForwardFailure(
+		outChannelId: Buffer,
+		outHtlcId: bigint,
+		forward: { inChannelId: Buffer; inHtlcId: bigint },
+		code: number
+	): Buffer | undefined {
+		const sharedSecret = this.receivedHtlcSharedSecrets.get(
+			`${forward.inChannelId.toString('hex')}:${forward.inHtlcId}`
+		);
+		if (!sharedSecret) return undefined;
+		const onion = this.channelManager
+			.getChannel(outChannelId)
+			?.getFullState()
+			.htlcs.get(`offered-${outHtlcId}`)?.onionRoutingPacket;
+		const sha256OfOnion = onion
+			? crypto.createHash('sha256').update(onion).digest()
+			: Buffer.alloc(32);
+		return createFailureMessage(sharedSecret, code, sha256OfOnion);
+	}
+
 	private handleHtlcFailed(
 		channelId: Buffer,
 		htlcId: bigint,
@@ -22551,7 +24152,9 @@ export class LightningNode extends EventEmitter {
 		 * peer: `reason` is then already a complete failure message (or empty)
 		 * and this string is the human-readable cause.
 		 */
-		localFailureReason?: string
+		localFailureReason?: string,
+		/** The failure_code, when the peer failed it by update_fail_malformed_htlc. */
+		malformedCode?: number
 	): void {
 		// Check if this is a forwarded HTLC — wrap and propagate failure upstream
 		const outKey = `${channelId.toString('hex')}:offered-${htlcId}`;
@@ -22573,13 +24176,25 @@ export class LightningNode extends EventEmitter {
 			// settleForwardsOwedUpstream retries it, and a downstream that
 			// never finishes the round is force-closed out by
 			// scanForwardTimeouts at the forward-timeout margin.
+			const originated =
+				malformedCode !== undefined
+					? this.originateMalformedForwardFailure(
+							channelId,
+							htlcId,
+							forward,
+							malformedCode
+					  )
+					: undefined;
+			const upstreamReason = originated ?? reason;
+			const preWrapped =
+				originated !== undefined || localFailureReason !== undefined;
 			const inboundHash = this.forwardPaymentHash(forward);
 			if (
 				inboundHash &&
 				!this.isOutgoingLegTerminallyFailed(outKey, inboundHash)
 			) {
-				forward.failReason = reason;
-				forward.failPreWrapped = localFailureReason !== undefined;
+				forward.failReason = upstreamReason;
+				forward.failPreWrapped = preWrapped;
 				this.emitStructuredLog('htlc', 'forward_fail_deferred', {
 					inChannelId: forward.inChannelId.toString('hex'),
 					inHtlcId: Number(forward.inHtlcId),
@@ -22593,19 +24208,101 @@ export class LightningNode extends EventEmitter {
 				forward,
 				channelId,
 				htlcId,
-				reason,
-				localFailureReason !== undefined
+				upstreamReason,
+				preWrapped
 			);
 			return;
 		}
 
+		// Our own payment: BOLT 2 fund safety again (issue #989), the rule the
+		// forward above follows. The peer's update_fail_htlc starts a
+		// removal; it does not end the attempt. Until the peer's
+		// revoke_and_ack covers our commitment without the HTLC, the peer's
+		// last signed commitment still carries the offered output, so a hop
+		// that failed early and later learns the preimage (from the retry's
+		// route, say) can go to chain with it and claim the first HTLC while
+		// the retry settles too; and until we revoke for the peer's covering
+		// commitment, a disconnect rolls the entry back to COMMITTED
+		// (markForReestablish) and the peer may retransmit a fulfil instead.
+		// LND hands a fail to its switch only after that revocation. So while
+		// the channel still holds the entry as a provisional FAILED, the
+		// failure is parked, its mapping kept so the HTLC view reads it as
+		// in flight (a re-send is refused until then), and the removal round
+		// decides: drainRetriesAwaitingRemoval settles it on the
+		// revoke_and_ack that completes the removal, handleHtlcFulfilled
+		// drops it if the HTLC is fulfilled after all, and a re-fail after a
+		// rollback parks it again. An entry already irrevocable, or gone from
+		// the channel (the settlement loop dropped it before a reestablish
+		// replay of the fail arrived, or the failure was generated here for
+		// an add the channel abandoned, which has no entry to wait on), is
+		// settled at once.
+		const hashHex = this.htlcPaymentMap.get(outKey);
+		if (!hashHex) return;
+		const owned = this.payments.get(hashHex);
+		if (!owned || owned.direction !== PaymentDirection.OUTGOING) return;
+		const entry = this.channelManager
+			.getChannel(channelId)
+			?.getFullState()
+			.htlcs.get(`offered-${htlcId}`);
+		if (
+			entry &&
+			entry.state === HtlcState.FAILED &&
+			!LightningNode.isOfferedFailIrrevocable(entry)
+		) {
+			this.retriesAwaitingRemoval.set(outKey, {
+				channelId,
+				htlcId,
+				reason,
+				localFailureReason
+			});
+			this.emitStructuredLog('payment', 'retry_deferred', {
+				paymentHash: hashHex,
+				channelId: channelId.toString('hex'),
+				htlcId: Number(htlcId)
+			});
+			return;
+		}
+		this.settleOwnPaymentFailure(channelId, htlcId, reason, localFailureReason);
+	}
+
+	/**
+	 * Settle one failed HTLC of this node's own outgoing payment: record the
+	 * failure, release the attempt's mapping, and retry the payment or give
+	 * it up. Reached from handleHtlcFailed once the failed HTLC's removal is
+	 * irrevocable, or from drainRetriesAwaitingRemoval when the removal
+	 * round completes later (issue #989); one body, so the two cannot
+	 * diverge.
+	 *
+	 * `localFailureReason` is set when the failure was generated HERE rather
+	 * than returned by the peer: `reason` is then already a complete failure
+	 * message (or empty) and this string is the human-readable cause.
+	 */
+	private settleOwnPaymentFailure(
+		channelId: Buffer,
+		htlcId: bigint,
+		reason: Buffer,
+		localFailureReason?: string
+	): void {
 		// Find the payment associated with this HTLC
-		const key = outKey;
+		const key = `${channelId.toString('hex')}:offered-${htlcId}`;
 		const hashHex = this.htlcPaymentMap.get(key);
 		if (!hashHex) return;
 
 		const payment = this.payments.get(hashHex);
 		if (!payment || payment.direction !== PaymentDirection.OUTGOING) return;
+
+		// The hash is paid: another HTLC of it settled while this one's
+		// removal ran. This attempt is over, but the record says what the
+		// preimage proves, so only the attempt's mapping is released and its
+		// resolution reported; the record is not failed.
+		if (payment.status === PaymentStatus.COMPLETED) {
+			this.htlcPaymentMap.delete(key);
+			this.commitMutations('release failed HTLC mapping', [
+				{ type: 'delete_htlc_payment_mapping', htlcKey: key }
+			]);
+			this.emitHtlcResolved(payment.paymentHash, channelId, htlcId, 'failed');
+			return;
+		}
 
 		// MPP: every part is a distinct onion, so a returned failure decrypts
 		// only with the secrets of the part it came back on, and its culpable
@@ -22630,12 +24327,9 @@ export class LightningNode extends EventEmitter {
 		// compliant blinded peer's invalid_onion_blinding was unreadable, the
 		// broken path was never excluded, and the retry hammered it while a
 		// working path sat unused (issue #550 review).
-		if (
-			reason.length === 4 &&
-			(reason.readUInt16BE(0) & 0x8000) !== 0 &&
-			reason.readUInt16BE(2) === 0
-		) {
-			payment.failureCode = reason.readUInt16BE(0);
+		const malformedCode = LightningNode.malformedFailureCode(reason);
+		if (malformedCode !== undefined) {
+			payment.failureCode = malformedCode;
 			payment.failureSourceIndex = 0;
 		} else if (failureSecrets && reason.length > 0) {
 			const result = decryptFailureMessage(failureSecrets, reason);
@@ -22651,8 +24345,9 @@ export class LightningNode extends EventEmitter {
 					'Remote failure could not be decrypted (no hop HMAC matched)';
 			}
 		} else if (reason.length === 0) {
-			payment.failureReason =
-				localFailureReason ?? 'Peer failed the HTLC with an empty reason';
+			payment.failureReason = boundedFailureReason(
+				localFailureReason ?? 'Peer failed the HTLC with an empty reason'
+			);
 		}
 
 		// PERM|15 is overloaded, so the PERM bit alone does not mean "give up":
@@ -22666,13 +24361,8 @@ export class LightningNode extends EventEmitter {
 			failureRoute
 		);
 
-		// Record failure in MissionControl for future pathfinding. Skipped for
-		// height skew: no channel misbehaved, our expiry was stale, so penalising
-		// the route would degrade pathfinding over an innocent channel.
-		const culpableScid = this.getCulpableHopScid(payment, failureRoute);
-		if (culpableScid && !heightSkew) {
-			this.missionControl.recordFailure(culpableScid, payment.amountMsat);
-		}
+		const retryCtx = this.paymentRetryContexts.get(hashHex);
+		const maxRetries = retryCtx?.maxRetries ?? this.maxPaymentRetries;
 
 		// A channel_update embedded in the failure is NOT applied to the graph.
 		// BOLT 4: the origin node MAY consider it when calculating routes to
@@ -22684,14 +24374,40 @@ export class LightningNode extends EventEmitter {
 		// channel, and graph contents are served onward via gossip queries.
 		// LDK dropped this handling for the same reason, and peers are
 		// transitioning away from embedding updates at all (we send len 0
-		// ourselves since #177). Routing around the failure is handled by the
-		// MissionControl penalty above and the retry's excludedChannels below;
-		// fresh policy arrives via ordinary gossip.
+		// ourselves since #177). The one use BOLT 4 allows is what
+		// notePolicyFailureUpdate makes of it (issue #1056): a fee_insufficient,
+		// incorrect_cltv_expiry or amount_below_minimum failure whose update
+		// is bound to the route (right channel, right side, signed by the
+		// erring node) is a price, not a fault. The update rides THIS
+		// payment's retry context, its retries route over the channel at that
+		// price, and nothing else reads it. Every other failure is routed
+		// around by the MissionControl penalty and the retry's
+		// excludedChannels below; fresh policy arrives via ordinary gossip.
+		// An MPP part is never auto-retried (see below), so its failure is
+		// not re-priced either: the penalty and exclusion apply as before.
+		const repriced =
+			!heightSkew &&
+			!mppState &&
+			this.notePolicyFailureUpdate(
+				retryCtx,
+				payment,
+				failureData,
+				failureRoute
+			);
+
+		// Record failure in MissionControl for future pathfinding. Skipped for
+		// height skew: no channel misbehaved, our expiry was stale, so penalising
+		// the route would degrade pathfinding over an innocent channel. Skipped
+		// for a re-priced hop for the same reason: our copy of its policy was
+		// stale, not the channel, and a penalty would steer the retry off the
+		// one channel whose price we now know.
+		const culpableScid = this.getCulpableHopScid(payment, failureRoute);
+		if (culpableScid && !heightSkew && !repriced) {
+			this.missionControl.recordFailure(culpableScid, payment.amountMsat);
+		}
 
 		// Attempt payment retry for temporary failures, plus the height-skew case
 		// detected above.
-		const retryCtx = this.paymentRetryContexts.get(hashHex);
-		const maxRetries = retryCtx?.maxRetries ?? this.maxPaymentRetries;
 
 		// A failure INSIDE the blinded segment of a BOLT 12 payment implicates
 		// the blinded path rather than any public channel: its hops are opaque
@@ -22726,21 +24442,18 @@ export class LightningNode extends EventEmitter {
 		) {
 			// Exclude the failing channel's SCID from future routes. Skipped for
 			// height skew: the route is fine, our expiry was stale, and banning a
-			// healthy channel would push the retry onto a worse path.
-			if (culpableScid && !heightSkew) {
+			// healthy channel would push the retry onto a worse path. Skipped
+			// for a re-priced hop: the retry takes it at its real price.
+			if (culpableScid && !heightSkew && !repriced) {
 				retryCtx.excludedChannels.add(culpableScid);
 			}
 
-			// First-hop diversification: also exclude previous first hop on retries
-			if (
-				!heightSkew &&
-				retryCtx.retryCount > 0 &&
-				payment.route &&
-				payment.route.hops.length > 0
-			) {
-				retryCtx.excludedChannels.add(
-					payment.route.hops[0].shortChannelId.toString('hex')
-				);
+			// First-hop diversification: a retry after a retry also excludes
+			// the failed route's first hop, but only when the failure
+			// implicates that hop and another channel of ours can carry the
+			// payment (issue #1056).
+			if (!heightSkew && retryCtx.retryCount > 0 && payment.route) {
+				this.diversifyFirstHop(retryCtx, payment, payment.route);
 			}
 
 			retryCtx.retryCount++;
@@ -22755,6 +24468,16 @@ export class LightningNode extends EventEmitter {
 				{ type: 'delete_htlc_payment_mapping', htlcKey: key }
 			]);
 			this.emitHtlcResolved(payment.paymentHash, channelId, htlcId, 'failed');
+			// A listener may have ended this payment or sent the hash again
+			// (failPayment, then a fresh send). The hash is then theirs:
+			// deleting its record or retrying through this context would
+			// orphan the new attempt.
+			if (
+				this.payments.get(hashHex) !== payment ||
+				this.paymentRetryContexts.get(hashHex) !== retryCtx
+			) {
+				return;
+			}
 
 			// sendPayment() rejects a second payment for a hash that is still
 			// registered, so unregister the finished attempt before redispatching.
@@ -22776,25 +24499,52 @@ export class LightningNode extends EventEmitter {
 					retried = this.dispatchKeysend(
 						retryCtx.keysend.options,
 						retryCtx.keysend.preimage,
-						retryCtx.excludedChannels
+						retryCtx.excludedChannels,
+						retryCtx.policyOverrides
 					);
 				} else if (retryCtx.bolt12Invoice) {
 					retried = this.payBolt12Invoice(
 						retryCtx.bolt12Invoice,
-						retryCtx.excludedChannels
-					);
-				} else {
-					retried = this.sendPayment(
-						retryCtx.invoiceStr!,
 						retryCtx.excludedChannels,
 						retryCtx.maxFeeMsat,
-						retryCtx.amountMsat,
-						retryCtx.maxCltvExpiryHeight
+						retryCtx.policyOverrides
 					);
+				} else {
+					const outerRedispatch = this.redispatchingRetryContext;
+					this.redispatchingRetryContext = retryCtx;
+					try {
+						retried = this.sendPayment(
+							retryCtx.invoiceStr!,
+							retryCtx.excludedChannels,
+							retryCtx.maxFeeMsat,
+							retryCtx.amountMsat,
+							retryCtx.maxCltvExpiryHeight,
+							retryCtx.policyOverrides,
+							retryCtx.metadata
+						);
+					} finally {
+						this.redispatchingRetryContext = outerRedispatch;
+					}
 				}
 				retried.retryCount = retryCtx.retryCount;
 				return; // Retry dispatched
 			} catch (err) {
+				// A throw from addHtlc (the outbound transport, say) can leave the
+				// retry's HTLC on the channel beside its PENDING record. That record
+				// holds the secrets its failure decrypts with, and the failure
+				// retries through this context, so both stay.
+				const retryRecord = this.payments.get(hashHex);
+				if (
+					retryRecord?.status === PaymentStatus.PENDING &&
+					this.hasHtlcInFlight(payment.paymentHash)
+				) {
+					retryRecord.retryCount = retryCtx.retryCount;
+					this.emitStructuredLog('payment', 'retry_dispatch_threw', {
+						paymentHash: hashHex,
+						error: err instanceof Error ? err.message : String(err)
+					});
+					return;
+				}
 				// The retry never left the node. Roll the counter back so
 				// retryCount keeps meaning "retries actually dispatched" (with
 				// exclusions honored by MPP too, an exhausted graph lands here
@@ -22805,9 +24555,11 @@ export class LightningNode extends EventEmitter {
 				this.payments.set(hashHex, payment);
 				payment.retryCount = retryCtx.retryCount;
 				const detail = err instanceof Error ? err.message : String(err);
-				payment.failureReason = payment.failureReason
-					? `${payment.failureReason}; retry not dispatched: ${detail}`
-					: `Retry not dispatched: ${detail}`;
+				payment.failureReason = boundedFailureReason(
+					payment.failureReason
+						? `${payment.failureReason}; retry not dispatched: ${detail}`
+						: `Retry not dispatched: ${detail}`
+				);
 			}
 		}
 
@@ -22981,7 +24733,9 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Set or update metadata on a payment (for agent labeling).
+	 * Set or update metadata on a payment (for agent labeling). Refused with
+	 * an InvalidRequestError, the payment untouched, when the labelled row
+	 * would be too large for the recovery guardians to accept.
 	 */
 	setPaymentMetadata(
 		paymentHash: Buffer,
@@ -22990,11 +24744,144 @@ export class LightningNode extends EventEmitter {
 		const hashHex = paymentHash.toString('hex');
 		const existing = this.payments.get(hashHex);
 		if (existing) {
-			existing.metadata = { ...existing.metadata, ...metadata };
+			const merged = { ...existing.metadata, ...metadata };
+			// _keysend is the engine's classification, not a label: a caller
+			// neither sets nor clears it.
+			if (existing.metadata?._keysend !== undefined) {
+				merged._keysend = existing.metadata._keysend;
+			} else {
+				delete merged._keysend;
+			}
+			const labelled = { ...existing, metadata: merged };
+			// Settlement replaces a caller's _invoice with the retry's invoice,
+			// so either row can be the larger one.
+			if (
+				!this.paymentMetadataFits(
+					merged,
+					[{ type: 'payment_state', paymentHash: hashHex, payment: labelled }],
+					[this.settledPaymentMutation(labelled)]
+				)
+			) {
+				throw new InvalidRequestError(
+					'payment metadata is too large for the recovery guardians to accept'
+				);
+			}
+			existing.metadata = merged;
 			this.commitMutations('savePaymentMetadata', [
 				{ type: 'payment_state', paymentHash: hashHex, payment: existing }
 			]);
 		}
+	}
+
+	/**
+	 * A guardian refuses a record over its limit, and every record after it,
+	 * so one payment row that outgrows a frame stops replication for good.
+	 * Metadata is the part of a row the caller sizes, and it may take half a
+	 * frame: the rest is left for what the payment carries and gains after
+	 * it is labelled (route, shared secrets, preimage, a retry's invoice, a
+	 * failure, received parts). Given the batches that store the row, as it
+	 * is written and as it settles, each has to fit a frame as well.
+	 */
+	private paymentMetadataFits(
+		metadata: Record<string, string>,
+		...batches: RecoveryMutation[][]
+	): boolean {
+		const room = this.recoveryJournal?.mutationRoom();
+		if (room === undefined) return true;
+		if (Buffer.byteLength(JSON.stringify(metadata), 'utf8') > room / 2) {
+			return false;
+		}
+		return batches.every(
+			(mutations) =>
+				mutations.reduce(
+					(bytes, mutation, index) =>
+						bytes + encodedMutationBytes(mutation) + (index === 0 ? 0 : 1),
+					0
+				) <= room
+		);
+	}
+
+	/**
+	 * The payment_state settlement journals for a row: it adds the preimage,
+	 * the completion time and, for an invoice payment, the invoice string
+	 * from the retry context as metadata._invoice (handleHtlcFulfilled).
+	 *
+	 * A row that has not settled is sized at the widest it can still grow
+	 * to. It can fail first, and settlement keeps the failure fields. An
+	 * incoming row lists every part it settles, and the payer picks how many
+	 * there are, so it is sized with the parts received so far plus one:
+	 * the arrival checks (settledRowFits) refuse a part past that.
+	 */
+	private settledPaymentMutation(
+		payment: IPaymentInfo,
+		invoiceStr = this.paymentRetryContexts.get(
+			payment.paymentHash.toString('hex')
+		)?.invoiceStr
+	): RecoveryMutation {
+		const hashHex = payment.paymentHash.toString('hex');
+		const settled: IPaymentInfo = {
+			...payment,
+			status: PaymentStatus.COMPLETED,
+			preimage: payment.preimage ?? Buffer.alloc(32),
+			completedAt: Date.now(),
+			...(invoiceStr !== undefined && {
+				metadata: { ...payment.metadata, _invoice: invoiceStr }
+			})
+		};
+		if (payment.status !== PaymentStatus.COMPLETED) {
+			// A new failure writes a bounded reason; a longer one already on the
+			// row stays until it is replaced.
+			settled.failureReason =
+				payment.failureReason !== undefined &&
+				boundedFailureReason(payment.failureReason) !== payment.failureReason
+					? payment.failureReason
+					: 'x'.repeat(PAYMENT_FAILURE_REASON_MAX_BYTES);
+			if (payment.direction === PaymentDirection.OUTGOING) {
+				settled.failureCode = 0xffff;
+				// One per onion hop, and fewer than a hundred fit an onion.
+				settled.failureSourceIndex = 0xff;
+				// Giving up drops the retry context, so a fulfill after that keeps
+				// a caller's _invoice where settlement would write the context's.
+				const callerInvoice = payment.metadata?._invoice;
+				if (
+					callerInvoice !== undefined &&
+					invoiceStr !== undefined &&
+					jsonBytes(callerInvoice) > jsonBytes(invoiceStr)
+				) {
+					settled.metadata = payment.metadata;
+				}
+			} else {
+				const received = [
+					...(this.heldHtlcs.get(hashHex) ?? []),
+					...(this.pendingMppPayments.get(hashHex)?.receivedParts ?? [])
+				];
+				settled.settledHtlcs = [
+					...received.map(
+						(part) => `${part.channelId.toString('hex')}:${part.htlcId}`
+					),
+					`${'0'.repeat(64)}:${U64_MAX}`
+				];
+				// An any-amount invoice records what its parts paid.
+				if (payment.amountMsat === 0n) settled.amountMsat = U64_MAX;
+			}
+		}
+		return { type: 'payment_state', paymentHash: hashHex, payment: settled };
+	}
+
+	/**
+	 * Whether a received part can join this payment's settlement: the row
+	 * sized as settledPaymentMutation sizes it, with this part as the one
+	 * more, has to fit a frame. Refusing the part keeps a payer's part
+	 * count from growing the settled row past what a guardian accepts.
+	 */
+	private settledRowFits(hashHex: string): boolean {
+		const room = this.recoveryJournal?.mutationRoom();
+		const payment = this.payments.get(hashHex);
+		return (
+			room === undefined ||
+			payment === undefined ||
+			encodedMutationBytes(this.settledPaymentMutation(payment)) <= room
+		);
 	}
 
 	/**
@@ -23003,7 +24890,12 @@ export class LightningNode extends EventEmitter {
 	estimateRouteFee(
 		bolt11: string,
 		amountSats?: number
-	): { feeSats: number; hops: number; cltvDelta: number } | null {
+	): {
+		feeSats: number;
+		feeMsat: bigint;
+		hops: number;
+		cltvDelta: number;
+	} | null {
 		try {
 			const decoded = decodeInvoice(bolt11);
 			// Same precedence sendPayment applies (see estimatePayment).
@@ -23032,7 +24924,11 @@ export class LightningNode extends EventEmitter {
 			);
 			if (!route) return null;
 			return {
-				feeSats: Number(route.totalFeeMsat / 1000n),
+				// Rounded UP: a caller caps the payment at this figure, and the cap
+				// is enforced in msat, so a floored quote refuses its own route
+				// (issue #998).
+				feeSats: Number((route.totalFeeMsat + 999n) / 1000n),
+				feeMsat: route.totalFeeMsat,
 				hops: route.hops.length,
 				cltvDelta: route.totalCltvDelta
 			};
@@ -23104,7 +25000,10 @@ export class LightningNode extends EventEmitter {
 
 			const successPct = Math.round(successProbability * 100);
 			const hopCount = route.hops.length;
-			const feeSats = Number(route.totalFeeMsat / 1000n);
+			// Rounded UP, like estimateRouteFee: maxFeeSats is whole sats checked
+			// against the route in msat, so a cap equal to a floored quote refused
+			// the very route it priced (issue #998).
+			const feeSats = Number((route.totalFeeMsat + 999n) / 1000n);
 
 			// Route quality based on hop count and probability
 			let routeQuality: 'HIGH' | 'MEDIUM' | 'LOW' = 'HIGH';
@@ -23152,6 +25051,7 @@ export class LightningNode extends EventEmitter {
 				warning,
 				alternativeAvailable,
 				estimatedFeeSats: feeSats,
+				estimatedFeeMsat: route.totalFeeMsat,
 				hopCount
 			};
 		} catch {
@@ -23173,6 +25073,7 @@ export class LightningNode extends EventEmitter {
 	): {
 		success: boolean;
 		feeSats?: number;
+		feeMsat?: bigint;
 		hops?: number;
 		path?: Array<{ pubkey: string; shortChannelId: string }>;
 	} {
@@ -23207,7 +25108,9 @@ export class LightningNode extends EventEmitter {
 
 			return {
 				success: true,
-				feeSats: Number(route.totalFeeMsat / 1000n),
+				// Rounded up for the same reason as estimateRouteFee (issue #998).
+				feeSats: Number((route.totalFeeMsat + 999n) / 1000n),
+				feeMsat: route.totalFeeMsat,
 				hops: route.hops.length,
 				// A hop's shortChannelId is the channel used to REACH it, so this is
 				// exactly the set of SCIDs the onion will name. Surfacing them is what
@@ -23375,6 +25278,7 @@ export class LightningNode extends EventEmitter {
 		if (!this.peerManager) {
 			throw new Error('Networking is not enabled on this node');
 		}
+		peerPubkeyHex = normalizeHexPubkey(peerPubkeyHex);
 		const envelope = encodeCustomMessage(subtype, payload);
 		this.peerManager.sendToPeer(
 			peerPubkeyHex,
@@ -24286,6 +26190,7 @@ export class LightningNode extends EventEmitter {
 		const receiver = new DirectFundingReceiver(
 			{
 				signMessage: (message) => this.signMessage(message),
+				nodeId: Buffer.from(this.getNodeId(), 'hex'),
 				requests,
 				chain: {
 					getTransaction: (txid) =>
@@ -25071,6 +26976,8 @@ export class LightningNode extends EventEmitter {
 		this.retryFailedTerminalPersists();
 		this.retrySpliceCloseRedrives();
 		this.retryPendingOutputWatches();
+		// Funding checks a backend outage paused (issue #1105).
+		this.checkGossipFunding();
 		// Re-CPFP any stuck anchor force-close commitment at the current live feerate
 		// so a fee spike after the original broadcast cannot pin the package (M1).
 		this.channelManager.reCpfpStuckCommitments(
@@ -25521,8 +27428,10 @@ export class LightningNode extends EventEmitter {
 	 *
 	 * The operator's own force close (reason 'user') stays admitted: it is
 	 * 5.6's labelled escape hatch, and the only exit a fenced node has. The
-	 * one refusal that covers 'user' as well is forceCloseRevokedRefusal
-	 * (issue #905), which names a certainty rather than a risk.
+	 * label is the daemon's acceptStaleStateRisk, asked for while
+	 * getRecoveryOwnershipHold is set (issue #1013). The one refusal that
+	 * covers 'user' as well is forceCloseRevokedRefusal (issue #905), which
+	 * names a certainty rather than a risk.
 	 */
 	private skipAutoCloseRecoveryGated(
 		channelId: Buffer,
@@ -25699,8 +27608,18 @@ export class LightningNode extends EventEmitter {
 					paymentHashHex !== undefined &&
 					this.heldInvoiceHashes.has(paymentHashHex) &&
 					resolution?.outcome !== 'settle';
+				// An add admitted past its expiry (issue #1009) is failed back
+				// by the policy block, never settled, so holding its preimage
+				// is no claim: every invoice we ever issued has its preimage
+				// here, and such an entry is inside the claim buffer by
+				// definition. Without this arm a block landing while the peer
+				// still owes the ack of our fail-back closed the very channel
+				// the fail-back keeps open. A genuinely FULFILLED one is claimed.
+				const expiredUnclaimed =
+					htlc.expiredOnArrival === true && htlc.state !== HtlcState.FULFILLED;
 				const haveClaim =
 					!parkedHold &&
+					!expiredUnclaimed &&
 					(htlc.state === HtlcState.FULFILLED ||
 						(paymentHashHex !== undefined &&
 							this.preimages.has(paymentHashHex)));
@@ -26200,6 +28119,8 @@ export class LightningNode extends EventEmitter {
 			feeEstimator?: IFeeEstimator;
 			logger?: ILogger;
 			socks5Proxy?: { host: string; port: number };
+			socks5ProxyScope?: Socks5ProxyScope;
+			maxInboundPeers?: number;
 			webSocketImpl?: import('../transport/websocket').WebSocketConstructor;
 			preferAnchors?: boolean;
 			largeChannels?: boolean;
@@ -26296,6 +28217,8 @@ export class LightningNode extends EventEmitter {
 			feeEstimator: options?.feeEstimator,
 			logger: options?.logger,
 			socks5Proxy: options?.socks5Proxy,
+			socks5ProxyScope: options?.socks5ProxyScope,
+			maxInboundPeers: options?.maxInboundPeers,
 			webSocketImpl: options?.webSocketImpl,
 			preferAnchors: options?.preferAnchors,
 			largeChannels: options?.largeChannels,
@@ -26823,7 +28746,27 @@ export class LightningNode extends EventEmitter {
 			timeoutMs?: number;
 		}
 	): Promise<IBolt12Invoice> {
-		const request = this.offerManager.requestInvoice(offer, options);
+		// BOLT 12: an offer without offer_chains is for bitcoin mainnet. One
+		// that does not list our chain would be paid on ours to whichever node
+		// holds the issuer's key here.
+		const ours = this.acceptableChainHashes[0] ?? this.chainHash();
+		const offerChains = offer.chains ?? [BITCOIN_CHAIN_HASH];
+		if (!offerChains.some((c) => c.equals(ours))) {
+			throw new InvalidRequestError(
+				"Offer is not for this node's chain: its offer_chains do not include it"
+			);
+		}
+		// The invoice is paid over this node's graph, so a foreign invreq_chain
+		// is refused even when the offer lists it.
+		if (options?.chain && !options.chain.equals(ours)) {
+			throw new InvalidRequestError("Requested chain is not this node's chain");
+		}
+		// The offer manager defaults invreq_chain to the offer's first chain,
+		// which need not be ours when the offer lists several.
+		const request = this.offerManager.requestInvoice(offer, {
+			...options,
+			chain: options?.chain ?? (offer.chains ? ours : undefined)
+		});
 		if (options?.timeoutMs) {
 			return Promise.race([
 				request,
@@ -26846,26 +28789,46 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Pay a BOLT 12 invoice by extracting payment info and delegating to sendPayment.
 	 * This creates a BOLT 11-like payment flow using the BOLT 12 invoice details.
+	 *
+	 * `maxFeeMsat` caps the fee actually paid, as sendPayment's does: the
+	 * public hops plus the invoice's own blinded-path fee, which the payee
+	 * writes and which used to be paid uncapped and unreported (issue
+	 * #1001). A blinded path over the cap is skipped in favour of the
+	 * invoice's other paths; when every usable path is over it the payment is
+	 * refused with FEE_EXCEEDS_MAX before anything is sent. Undefined leaves
+	 * the fee uncapped. The cap is kept for the payment's retries.
+	 *
+	 * An invoice setting the MPP/compulsory feature (bit 16) is refused with
+	 * INVALID_INVOICE, since this node pays a BOLT 12 invoice as one HTLC.
 	 */
 	payBolt12Invoice(
 		invoice: IBolt12Invoice,
-		excludedChannels?: Set<string>
+		excludedChannels?: Set<string>,
+		maxFeeMsat?: bigint,
+		policyOverrides?: TPolicyOverrides
 	): IPaymentInfo {
 		if (!invoice.paymentHash || !invoice.amount || !invoice.nodeId) {
 			throw new Error('BOLT 12 invoice missing required fields');
 		}
 
-		// Payment deduplication, as in sendPayment: a second dispatch for a
-		// hash still in flight would fight the first attempt's retry context
-		// and in-flight record.
-		const dedupHashHex = invoice.paymentHash.toString('hex');
-		const existingPayment = this.payments.get(dedupHashHex);
-		if (existingPayment && existingPayment.status === PaymentStatus.PENDING) {
+		// BOLT 12 requires an MPP/compulsory invoice to be paid over several
+		// blinded paths, and every dispatch below sends the whole amount as one
+		// HTLC.
+		if (
+			invoice.features &&
+			FeatureFlags.fromBuffer(invoice.features).isCompulsory(Feature.BASIC_MPP)
+		) {
 			throw new LightningPaymentError(
-				LightningErrorCode.DUPLICATE_PAYMENT,
-				'Payment already in flight for this invoice'
+				LightningErrorCode.INVALID_INVOICE,
+				'BOLT 12 invoice requires a multi-part payment, which this node does not send'
 			);
 		}
+
+		// Payment deduplication, as in sendPayment: a hash whose payment
+		// completed, or that still has an HTLC out, is not paid again (issue
+		// #975), and a second dispatch for a hash still in flight would fight
+		// the first attempt's retry context and in-flight record.
+		this.assertHashUnpaid(invoice.paymentHash, 'any-pending');
 
 		const destination = invoice.nodeId;
 		const amountMsat = invoice.amount;
@@ -26884,6 +28847,7 @@ export class LightningNode extends EventEmitter {
 			)?.bolt12ExcludedPathIndices;
 			let blindedRoute: IRoute | null = null;
 			let pathIndex = 0;
+			let overCap = false;
 			for (let i = 0; i < invoice.paths.length && !blindedRoute; i++) {
 				if (excludedPaths?.has(i)) continue;
 				const payInfo = invoice.blindedPayInfo?.[i] ?? {
@@ -26906,7 +28870,9 @@ export class LightningNode extends EventEmitter {
 					// Our own channels: a direct channel to the introduction node must
 					// be routable even when it never entered the public gossip graph
 					// (private channels; a fresh interop channel paying a CLN offer).
-					this.getLocalChannelEdges()
+					this.getLocalChannelEdges(),
+					undefined,
+					policyOverrides
 				);
 				// A self-introduction path is accepted by route construction as
 				// the bare tail BEFORE its decryption, constraints or channel
@@ -26915,8 +28881,9 @@ export class LightningNode extends EventEmitter {
 				// another usable path (issue #550 review). Validate now and
 				// keep scanning on a typed local refusal.
 				if (blindedRoute) {
+					let selfIntro: { wireRoute: { totalFeeMsat: bigint } } | null;
 					try {
-						this.prepareSelfIntroSend(blindedRoute);
+						selfIntro = this.prepareSelfIntroSend(blindedRoute);
 					} catch (err) {
 						if (
 							err instanceof LightningPaymentError &&
@@ -26928,10 +28895,31 @@ export class LightningNode extends EventEmitter {
 						}
 						throw err;
 					}
+					// The fee this path would actually cost: a self-introduction
+					// send sheds our own introduction fee on the wire; a grafted
+					// route pays the public hops plus the path's blinded fee
+					// (issue #1001). A path over the cap is skipped, not fatal:
+					// the invoice may advertise a cheaper one.
+					if (maxFeeMsat !== undefined) {
+						const feeMsat =
+							selfIntro?.wireRoute.totalFeeMsat ??
+							blindedRoute.totalAmountMsat - amountMsat;
+						if (feeMsat > maxFeeMsat) {
+							overCap = true;
+							blindedRoute = null;
+							continue;
+						}
+					}
 				}
 				if (blindedRoute) pathIndex = i;
 			}
 			if (!blindedRoute) {
+				if (overCap) {
+					throw new LightningPaymentError(
+						LightningErrorCode.FEE_EXCEEDS_MAX,
+						'Route fee exceeds maximum'
+					);
+				}
 				throw new Error('No route to BOLT 12 blinded path introduction node');
 			}
 			return this.dispatchBolt12Route(
@@ -26939,7 +28927,9 @@ export class LightningNode extends EventEmitter {
 				invoice,
 				finalCltvExpiry,
 				excludedChannels,
-				pathIndex
+				pathIndex,
+				maxFeeMsat,
+				policyOverrides
 			);
 		}
 
@@ -26955,17 +28945,27 @@ export class LightningNode extends EventEmitter {
 			undefined,
 			undefined,
 			undefined,
-			this.getLocalChannelEdges()
+			this.getLocalChannelEdges(),
+			policyOverrides
 		);
 		if (!route) {
 			throw new Error('No route found to BOLT 12 invoice destination');
+		}
+		if (maxFeeMsat !== undefined && route.totalFeeMsat > maxFeeMsat) {
+			throw new LightningPaymentError(
+				LightningErrorCode.FEE_EXCEEDS_MAX,
+				'Route fee exceeds maximum'
+			);
 		}
 
 		return this.dispatchBolt12Route(
 			route,
 			invoice,
 			finalCltvExpiry,
-			excludedChannels
+			excludedChannels,
+			undefined,
+			maxFeeMsat,
+			policyOverrides
 		);
 	}
 
@@ -26980,17 +28980,21 @@ export class LightningNode extends EventEmitter {
 	 *
 	 * The context is registered only after a route was found, and a context
 	 * created HERE is removed again when the dispatch fails locally (an
-	 * exception, or addHtlc refusing the HTLC): a local failure never
-	 * reaches the onion failure handler, so nothing else would clean it up
-	 * and nothing can retry it. A pre-existing context is left alone; during
-	 * a retry the failure handler owns its rollback and give-up behavior.
+	 * exception with no HTLC out, or addHtlc refusing the HTLC): a local
+	 * failure never reaches the onion failure handler, so nothing else would
+	 * clean it up and nothing can retry it. A pre-existing context is left
+	 * alone; during a retry the failure handler owns its rollback and give-up
+	 * behavior. The fee cap rides in the context so a retry is held to the
+	 * same bound as the first attempt (issue #1001).
 	 */
 	private dispatchBolt12Route(
 		route: IRoute,
 		invoice: IBolt12Invoice,
 		finalCltvExpiry: number,
 		excludedChannels?: Set<string>,
-		pathIndex?: number
+		pathIndex?: number,
+		maxFeeMsat?: bigint,
+		policyOverrides?: TPolicyOverrides
 	): IPaymentInfo {
 		const hashHex = invoice.paymentHash.toString('hex');
 		const created = !this.paymentRetryContexts.has(hashHex);
@@ -26999,11 +29003,20 @@ export class LightningNode extends EventEmitter {
 				bolt12Invoice: invoice,
 				excludedChannels: excludedChannels ?? new Set(),
 				retryCount: 0,
-				maxRetries: this.maxPaymentRetries
+				maxRetries: this.maxPaymentRetries,
+				maxFeeMsat,
+				policyOverrides
 			});
 		}
 		const ctx = this.paymentRetryContexts.get(hashHex)!;
 		ctx.bolt12PathIndex = pathIndex;
+		// By identity: a listener run during the send may have failed this
+		// payment and started a new send of the hash, whose context this is.
+		const release = (): void => {
+			if (created && this.paymentRetryContexts.get(hashHex) === ctx) {
+				this.paymentRetryContexts.delete(hashHex);
+			}
+		};
 		try {
 			const payment = this.sendPaymentToRoute(
 				route,
@@ -27014,12 +29027,13 @@ export class LightningNode extends EventEmitter {
 				undefined,
 				invoice.amount
 			);
-			if (created && payment.status === PaymentStatus.FAILED) {
-				this.paymentRetryContexts.delete(hashHex);
-			}
+			if (payment.status === PaymentStatus.FAILED) release();
 			return payment;
 		} catch (err) {
-			if (created) this.paymentRetryContexts.delete(hashHex);
+			// A throw from addHtlc (the outbound transport, say) can leave the
+			// HTLC on the channel, and a failure of that HTLC still retries
+			// through the context.
+			if (!this.hasHtlcInFlight(invoice.paymentHash)) release();
 			throw err;
 		}
 	}
@@ -27411,7 +29425,9 @@ export class LightningNode extends EventEmitter {
 		payment.status = PaymentStatus.FAILED;
 		payment.completedAt = Date.now();
 		if (payment.failureCode === undefined) {
-			payment.failureReason = reason ?? 'Payment failed locally';
+			payment.failureReason = boundedFailureReason(
+				reason ?? 'Payment failed locally'
+			);
 		}
 		this.paymentRetryContexts.delete(hashHex);
 		this.outboundMppPayments.delete(hashHex);
@@ -27423,6 +29439,218 @@ export class LightningNode extends EventEmitter {
 			status: payment.status,
 			failureCode: payment.failureCode
 		});
+	}
+
+	/**
+	 * Fail a payment by its hash unless an HTLC offered for it can still
+	 * settle (issue #976). A wall clock is not an outcome: BOLT 2 has no way
+	 * to retract an update_add_htlc, so a record failed at a timeout while
+	 * its HTLC was still out lied until the HTLC resolved, and a payee who
+	 * settled after the clock turned that FAILED back into COMPLETED. While
+	 * hasHtlcInFlight the record is left PENDING with its retries frozen (the
+	 * HTLCs out get their outcome; no further route is tried), nothing is
+	 * emitted, and false is returned; otherwise this is failPayment, and
+	 * true is returned. The ghost case (a PENDING record with no HTLC out, a send
+	 * that never dispatched or whose HTLCs all resolved without a verdict)
+	 * still fails here; scanStuckPayments sweeps such a record after ten
+	 * minutes in any case.
+	 */
+	failPaymentUnlessInFlight(paymentHash: Buffer, reason?: string): boolean {
+		if (this.hasHtlcInFlight(paymentHash)) {
+			// The caller has given up on this payment: the HTLCs already out
+			// get their outcome, but no further route is tried. A retry the
+			// peer's later update_fail_htlc would dispatch runs outside every
+			// admission the caller made (drain, spending limits, a queue
+			// slot) with nothing charging its settlement, so the retry budget
+			// is frozen at what was used; the context itself stays for the
+			// expiry scanner. A later fail then lands on the give-up path:
+			// record FAILED, payment:failed.
+			const ctx = this.paymentRetryContexts.get(paymentHash.toString('hex'));
+			if (ctx) ctx.maxRetries = ctx.retryCount;
+			return false;
+		}
+		this.failPayment(paymentHash, reason);
+		return true;
+	}
+
+	/**
+	 * Whether an HTLC this node offered for the hash can still settle (issue
+	 * #976): one that is 'offered', 'onchain-pending' on a channel that went
+	 * to chain, or 'failed' but not yet terminal, in the getOutgoingHtlcs
+	 * view. A failed HTLC counts until its removal is irrevocable (issue
+	 * #989): until the peer's revoke_and_ack covers our commitment without
+	 * it, the peer's last signed commitment still carries it, and until we
+	 * revoke for the peer's covering commitment a disconnect rolls it back
+	 * to COMMITTED and the peer may fulfil it after all. Once terminal it
+	 * does not count: a peer that failed it cannot fulfil it. The one
+	 * predicate behind assertHashUnpaid's in-flight refusal and
+	 * failPaymentUnlessInFlight, so the two cannot drift.
+	 */
+	hasHtlcInFlight(paymentHash: Buffer): boolean {
+		return LightningNode.viewHasHtlcInFlight(
+			this.getOutgoingHtlcs(paymentHash)
+		);
+	}
+
+	/** hasHtlcInFlight over a view already built, so a send scans once. */
+	private static viewHasHtlcInFlight(
+		view: IOutgoingPaymentResolution
+	): boolean {
+		return view.htlcs.some(LightningNode.htlcViewInFlight);
+	}
+
+	/**
+	 * The sum of the amounts of the HTLCs in the view that can still settle
+	 * (issue #990): first-hop amounts, fee inclusive, as the channels carry
+	 * them. What an MPP part through sendPaymentToRoute is bounded by.
+	 */
+	private static viewAmountInFlight(view: IOutgoingPaymentResolution): bigint {
+		return view.htlcs
+			.filter(LightningNode.htlcViewInFlight)
+			.reduce((sum, h) => sum + h.amountMsat, 0n);
+	}
+
+	/**
+	 * A 'failed' view counts until it is terminal (issue #989): the peer's
+	 * last signed commitment carries the HTLC until its revoke_and_ack for
+	 * the removal, and a disconnect before this node's own revocation rolls
+	 * the fail back.
+	 */
+	private static htlcViewInFlight(h: IOutgoingHtlcView): boolean {
+		return (
+			h.state === 'offered' ||
+			h.state === 'onchain-pending' ||
+			(h.state === 'failed' && !h.terminal)
+		);
+	}
+
+	/**
+	 * Refuse to send for a hash this node must not pay again (issue #975).
+	 * Judged from what the HTLCs did, not from the record's status alone: a
+	 * COMPLETED or FAILED record used to pass the dedup check, so paying the
+	 * same invoice twice paid twice, and a record FAILED by a wall clock
+	 * (failPayment on a timeout) while its HTLC was still offered got a
+	 * second HTLC beside the first, which could still settle.
+	 *
+	 * Refused, in this order, all as DUPLICATE_PAYMENT:
+	 * - completed: the HTLC view knows the preimage or the OUTGOING record is
+	 *   COMPLETED. The view reports a preimage only for a hash this node
+	 *   offered an HTLC for or holds an OUTGOING record for, so the preimage
+	 *   of this node's own invoice does not read as a payment made;
+	 * - in flight: some offered HTLC for the hash is not terminal ('offered',
+	 *   'onchain-pending' on a channel that went to chain, or 'failed' with
+	 *   a removal not yet irrevocable, issue #989), or the in-memory record
+	 *   is PENDING (a record exists before any HTLC does). The automatic
+	 *   retry is dispatched only once the failed HTLC's removal is
+	 *   irrevocable (drainRetriesAwaitingRemoval), when no such view is
+	 *   left for it, so it is never refused here;
+	 * - completed, after a prune: the in-memory record and preimage are
+	 *   pruned 24 hours after completion (and oldest first past the size
+	 *   cap). A node without storage remembers the pruned paid hashes in
+	 *   prunedCompletedOutgoingHashes; a node with storage still has the
+	 *   row, read below;
+	 * - completed, from storage: an OUTGOING row that is COMPLETED, carries
+	 *   a preimage, or has a preimage row beside it. The preimage row is
+	 *   committed first and SafetyCritical, so a settle whose record commit
+	 *   failed leaves the row next to a PENDING record. Only an OUTGOING row
+	 *   consults it: the preimage store also holds this node's own
+	 *   invoices' preimages, as for the payment queue's resolver (#967).
+	 *   Two synchronous reads at most per send. A read that throws (the
+	 *   database is closed) fails the send closed with a plain Error: a send
+	 *   that cannot check its record must not go out.
+	 *
+	 * `inFlight` says what counts as in flight, the completed rules being
+	 * the same for every caller:
+	 * - 'any-pending': an outstanding HTLC, or a PENDING record of either
+	 *   direction. sendPayment and payBolt12Invoice, the rule they always
+	 *   had (createInvoice's INCOMING PENDING record refuses a payment to
+	 *   this node's own invoice);
+	 * - 'outgoing-pending': an outstanding HTLC, or an OUTGOING PENDING
+	 *   record. A single-part sendPaymentToRoute, which a circular rebalance
+	 *   calls with its own fresh invoice;
+	 * - 'mpp-part': the parts already out, once they reach the set's total
+	 *   (issue #990). A part of an MPP set sent through sendPaymentToRoute
+	 *   joins the sibling parts already out for the hash, which is what an
+	 *   HTLC set is (BOLT 4), so an offered HTLC or a PENDING record does
+	 *   not refuse it on its own. It is refused once the amounts of the
+	 *   non-terminal HTLCs out for the hash ('offered' or 'onchain-pending')
+	 *   already reach `totalMsat`, the set's total_msat: the payee fulfils
+	 *   every part once it holds total_msat, so a part beyond that (a third
+	 *   part added to a two-part set, or a re-send that mistook totalMsat
+	 *   for the route total) overpays. The view carries first-hop amounts,
+	 *   fee inclusive, so the bound is conservative: it can only refuse a
+	 *   legitimate last part when the fees already paid on the earlier
+	 *   parts reach that part's amount. No caller in src/ reaches this arm
+	 *   (each passes totalMsat equal to the final hop's amount); a library
+	 *   caller does.
+	 *
+	 * `totalMsat` is read for 'mpp-part' only.
+	 */
+	private assertHashUnpaid(
+		paymentHash: Buffer,
+		inFlight: 'any-pending' | 'outgoing-pending' | 'mpp-part',
+		totalMsat?: bigint
+	): void {
+		const hashHex = paymentHash.toString('hex');
+		const completed = (): LightningPaymentError =>
+			new LightningPaymentError(
+				LightningErrorCode.DUPLICATE_PAYMENT,
+				'Payment already completed for this invoice'
+			);
+		const view = this.getOutgoingHtlcs(paymentHash);
+		if (
+			view.preimage ||
+			view.status === PaymentStatus.COMPLETED ||
+			this.prunedCompletedOutgoingHashes.has(hashHex)
+		) {
+			throw completed();
+		}
+		const existingPayment = this.payments.get(hashHex);
+		if (
+			inFlight !== 'mpp-part' &&
+			(LightningNode.viewHasHtlcInFlight(view) ||
+				(existingPayment?.status === PaymentStatus.PENDING &&
+					(inFlight === 'any-pending' ||
+						existingPayment.direction === PaymentDirection.OUTGOING)))
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.DUPLICATE_PAYMENT,
+				'Payment already in flight for this invoice'
+			);
+		}
+		if (
+			inFlight === 'mpp-part' &&
+			totalMsat !== undefined &&
+			LightningNode.viewAmountInFlight(view) >= totalMsat
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.DUPLICATE_PAYMENT,
+				'Payment already in flight for this invoice: the MPP parts out already reach its total'
+			);
+		}
+		if (!this.storage) return;
+		let durable: IPaymentInfo | null;
+		let durablePreimage: Buffer | null = null;
+		try {
+			durable = this.storage.loadPayment(hashHex);
+			if (durable?.direction === PaymentDirection.OUTGOING) {
+				durablePreimage = this.storage.loadPreimage(hashHex);
+			}
+		} catch (err) {
+			throw new Error(
+				`payment record could not be read: ${
+					err instanceof Error ? err.message : String(err)
+				}`
+			);
+		}
+		if (
+			durable?.direction === PaymentDirection.OUTGOING &&
+			(durable.status === PaymentStatus.COMPLETED ||
+				durable.preimage !== undefined ||
+				durablePreimage !== null)
+		) {
+			throw completed();
+		}
 	}
 
 	/**
@@ -27691,8 +29919,17 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Scan for stuck PENDING outbound payments with no corresponding HTLC.
-	 * Fails payments that have been PENDING for >10 minutes with no active HTLC.
+	 * Scan for stuck PENDING outbound payments with no corresponding HTLC: a
+	 * payment PENDING for over ten minutes with no PENDING or COMMITTED
+	 * offered HTLC is failed, unless an HTLC of it can still settle
+	 * (failPaymentUnlessInFlight, issue #989). A fail whose removal is not
+	 * yet irrevocable (the peer withholding its revoke_and_ack, or offline
+	 * since our own revocation) and an HTLC awaiting its on-chain outcome
+	 * both keep the record PENDING with the retry budget frozen; the round,
+	 * or the chain, settles it, and the sweep fails it once nothing is out.
+	 * Failing it here instead emitted payment:failed with the HTLC still in
+	 * flight, which the CLI's spend ledger cannot release on, and the give-up
+	 * that followed the round had nothing left to report.
 	 */
 	private scanStuckPayments(): void {
 		const TEN_MINUTES = 10 * 60 * 1000;
@@ -27724,7 +29961,7 @@ export class LightningNode extends EventEmitter {
 			if (activeHtlcHashes.has(hashHex)) continue;
 
 			// No active HTLC and payment older than 10 min → fail
-			this.failPayment(
+			this.failPaymentUnlessInFlight(
 				payment.paymentHash,
 				'Stuck payment swept: no active HTLC after 10 minutes'
 			);
@@ -27735,7 +29972,8 @@ export class LightningNode extends EventEmitter {
 	 * Scan for PENDING outbound payments whose invoice has expired. The
 	 * expiry comes from the retry context's payment source: the decoded
 	 * BOLT 11 invoice string, or the BOLT 12 invoice's created_at plus
-	 * relative_expiry. A keysend has no invoice and therefore no expiry.
+	 * relative_expiry. A keysend has no invoice and therefore no expiry. A
+	 * payment with an HTLC still out is left PENDING (issue #976).
 	 */
 	private scanExpiredPendingPayments(): void {
 		const now = Math.floor(Date.now() / 1000);
@@ -27761,9 +29999,12 @@ export class LightningNode extends EventEmitter {
 				}
 			}
 			if (expiryTimestamp !== undefined && now > expiryTimestamp) {
-				this.failPayment(
+				// An HTLC still out for it can settle whatever the invoice's
+				// expiry says (the payee decides), so such a payment stays
+				// PENDING until the HTLC resolves (issue #976).
+				this.failPaymentUnlessInFlight(
 					payment.paymentHash,
-					'Invoice expired while the payment was still in flight'
+					'Invoice expired while the payment was still pending'
 				);
 			}
 		}
@@ -27846,11 +30087,20 @@ export class LightningNode extends EventEmitter {
 		return new Promise<IPaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
-				this.failPayment(
+				// Failed only when nothing is out for it: an HTLC still offered
+				// can settle after this clock, and the record stays PENDING
+				// until it resolves (issue #976).
+				const failed = this.failPaymentUnlessInFlight(
 					invoice.paymentHash,
 					`No resolution within the ${timeoutMs}ms wait window`
 				);
-				reject(new Error(`Payment timed out after ${timeoutMs}ms`));
+				reject(
+					new Error(
+						failed
+							? `Payment timed out after ${timeoutMs}ms`
+							: `Payment timed out after ${timeoutMs}ms; an HTLC is still in flight and the payment stays PENDING until it resolves; no further route is tried after the timeout`
+					)
+				);
 			}, timeoutMs);
 
 			const cleanup = (): void => {
@@ -27996,7 +30246,11 @@ export class LightningNode extends EventEmitter {
 		return new Promise<IPaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
-				reject(new Error(`waitForPayment timed out after ${timeoutMs}ms`));
+				reject(
+					new PaymentWaitTimeoutError(
+						`waitForPayment timed out after ${timeoutMs}ms`
+					)
+				);
 			}, timeoutMs);
 
 			const cleanup = (): void => {

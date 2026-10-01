@@ -189,10 +189,10 @@ function stalledAdd(
 	filter.allow = (from: string, type: number): boolean => {
 		if (from !== bobId) return true;
 		if (!signsTheAdd) return type !== MessageType.COMMITMENT_SIGNED;
-		// The add round completes, and Bob then fails an HTLC he has no invoice
-		// for. Drop that removal and everything after it, so the add is left
-		// signed in and unresolved: an ordinary stall.
-		if (type === MessageType.UPDATE_FAIL_HTLC) failSeen = true;
+		// The add round completes, and Bob then fails an HTLC whose onion he
+		// cannot read. Drop that removal and everything after it, so the add is
+		// left signed in and unresolved: an ordinary stall.
+		if (type === MessageType.UPDATE_FAIL_MALFORMED_HTLC) failSeen = true;
 		return !failSeen;
 	};
 
@@ -494,9 +494,9 @@ describe('The force-close rebuild and an unsigned add (issue #643)', function ()
 		let signedRounds = 0;
 		filter.allow = (from: string, type: number): boolean => {
 			if (from !== bobId) return true;
-			// Bob has no invoice for either add. Holding his removals back leaves
-			// both entries in place to rebuild.
-			if (type === MessageType.UPDATE_FAIL_HTLC) return false;
+			// Bob cannot read either add's onion. Holding his removals back
+			// leaves both entries in place to rebuild.
+			if (type === MessageType.UPDATE_FAIL_MALFORMED_HTLC) return false;
 			if (type !== MessageType.COMMITMENT_SIGNED) return true;
 			// Only the first add's round is signed in. The second stalls between
 			// Bob's revoke_and_ack and the commitment_signed that would cover it.

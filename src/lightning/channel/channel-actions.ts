@@ -200,6 +200,12 @@ export interface IHtlcFailedAction {
 	type: ChannelActionType.HTLC_FAILED;
 	htlcId: bigint;
 	reason: Buffer;
+	/**
+	 * The failure_code of an update_fail_malformed_htlc, whose `reason` is a
+	 * synthetic [code][0x0000]. Carried apart from `reason` because an
+	 * update_fail_htlc reason is opaque peer bytes and can take the same shape.
+	 */
+	malformedCode?: number;
 }
 
 export interface IForceCloseAction {

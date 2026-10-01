@@ -46,6 +46,7 @@ import { DirectFundingError } from '../../src/lightning/direct-funding/types';
 const TXID = Buffer.alloc(32, 0xa1);
 const OFFER_ID = deriveOfferId(TXID, 1, 250_000n);
 const RECEIPT_HASH = Buffer.alloc(32, 0xb2);
+const RECEIVER_NODE_ID = getPublicKey(Buffer.alloc(32, 0x51));
 const OWNER_PUBKEY = getPublicKey(Buffer.alloc(32, 0x21));
 const LOCAL_FUNDING = getPublicKey(Buffer.alloc(32, 0x31));
 const REMOTE_FUNDING = getPublicKey(Buffer.alloc(32, 0x41));
@@ -229,7 +230,9 @@ describe('Direct funding: protocol messages', () => {
 				1,
 				0xfffffffd,
 				script,
-				400_000n
+				400_000n,
+				RECEIPT_HASH,
+				RECEIVER_NODE_ID
 			);
 			const b = ownershipProbeTransaction(
 				OFFER_ID,
@@ -237,7 +240,9 @@ describe('Direct funding: protocol messages', () => {
 				1,
 				0xfffffffd,
 				script,
-				400_000n
+				400_000n,
+				RECEIPT_HASH,
+				RECEIVER_NODE_ID
 			);
 			expect(a.tx.toBuffer()).to.deep.equal(b.tx.toBuffer());
 			expect(a.tx.ins).to.have.length(2);
@@ -251,10 +256,15 @@ describe('Direct funding: protocol messages', () => {
 			expect(a.tx.ins[1].index).to.equal(0);
 			expect(a.tx.outs).to.have.length(1);
 			expect(a.tx.outs[0].value).to.equal(0);
-			expect(a.tx.outs[0].script.subarray(0, 2)).to.deep.equal(
-				Buffer.from([0x6a, 16])
+			// The OP_RETURN names the offer and then the request it pays.
+			expect(a.tx.outs[0].script).to.deep.equal(
+				Buffer.concat([
+					Buffer.from([0x6a, 0x4c, 81]),
+					OFFER_ID,
+					RECEIPT_HASH,
+					RECEIVER_NODE_ID
+				])
 			);
-			expect(a.tx.outs[0].script.subarray(2)).to.deep.equal(OFFER_ID);
 			expect(a.prevouts.scripts[1]).to.deep.equal(DF_PROBE_POISON_SCRIPT);
 			expect(a.prevouts.values).to.deep.equal([400_000n, 0n]);
 			// A different offer id is a different poison, so a probe signature
@@ -266,9 +276,37 @@ describe('Direct funding: protocol messages', () => {
 					1,
 					0xfffffffd,
 					script,
-					400_000n
+					400_000n,
+					RECEIPT_HASH,
+					RECEIVER_NODE_ID
 				).tx.ins[1].hash
 			).to.not.deep.equal(a.tx.ins[1].hash);
+			// Nor across requests: another receipt hash is another transaction.
+			expect(
+				ownershipProbeTransaction(
+					OFFER_ID,
+					TXID,
+					1,
+					0xfffffffd,
+					script,
+					400_000n,
+					Buffer.alloc(32, 0xb3),
+					RECEIVER_NODE_ID
+				).tx.toBuffer()
+			).to.not.deep.equal(a.tx.toBuffer());
+			// Nor across receivers carrying the same public receipt hash.
+			expect(
+				ownershipProbeTransaction(
+					OFFER_ID,
+					TXID,
+					1,
+					0xfffffffd,
+					script,
+					400_000n,
+					RECEIPT_HASH,
+					OWNER_PUBKEY
+				).tx.toBuffer()
+			).to.not.deep.equal(a.tx.toBuffer());
 		});
 
 		it('requires the receipt hash', () => {
@@ -508,16 +546,34 @@ describe('Direct funding: protocol messages', () => {
 			// bitcoin-cli signmessage / verifymessage envelope: varstr prefix,
 			// varstr message, SHA256d. The same hash LND's SignMessageWithAddr
 			// signs (checked against lnd 0.20 for both address kinds).
-			const message = ownershipMessage(OFFER_ID, TXID, 1, 250_000n);
-			expect(ownershipDigest(OFFER_ID, TXID, 1, 250_000n)).to.deep.equal(
+			const message = ownershipMessage(
+				OFFER_ID,
+				TXID,
+				1,
+				250_000n,
+				RECEIPT_HASH,
+				RECEIVER_NODE_ID
+			);
+			expect(
+				ownershipDigest(
+					OFFER_ID,
+					TXID,
+					1,
+					250_000n,
+					RECEIPT_HASH,
+					RECEIVER_NODE_ID
+				)
+			).to.deep.equal(
 				crypto.createHash('sha256').update(message, 'utf8').digest()
 			);
 			const prefix = Buffer.from('Bitcoin Signed Message:\n', 'utf8');
 			const body = Buffer.from(message, 'utf8');
+			// Past 252 bytes, so its length takes the three-byte form.
+			expect(body.length).to.be.greaterThan(252);
 			const envelope = Buffer.concat([
 				Buffer.from([prefix.length]),
 				prefix,
-				Buffer.from([body.length]),
+				Buffer.from([0xfd, body.length & 0xff, body.length >> 8]),
 				body
 			]);
 			const expected = crypto
@@ -525,34 +581,44 @@ describe('Direct funding: protocol messages', () => {
 				.update(crypto.createHash('sha256').update(envelope).digest())
 				.digest();
 			expect(bitcoinMessageHash(message)).to.deep.equal(expected);
-			// A message past 252 bytes takes the three-byte length form.
-			const long = 'x'.repeat(300);
-			const longEnvelope = Buffer.concat([
+			// A message up to 252 bytes takes the one-byte length form.
+			const short = 'x'.repeat(200);
+			const shortEnvelope = Buffer.concat([
 				Buffer.from([prefix.length]),
 				prefix,
-				Buffer.from([0xfd, 300 & 0xff, 300 >> 8]),
-				Buffer.from(long, 'utf8')
+				Buffer.from([200]),
+				Buffer.from(short, 'utf8')
 			]);
-			expect(bitcoinMessageHash(long)).to.deep.equal(
+			expect(bitcoinMessageHash(short)).to.deep.equal(
 				crypto
 					.createHash('sha256')
-					.update(crypto.createHash('sha256').update(longEnvelope).digest())
+					.update(crypto.createHash('sha256').update(shortEnvelope).digest())
 					.digest()
 			);
 		});
 
-		it('matches the draft ownership digest', () => {
+		it('matches the draft ownership digest, with the request binding appended', () => {
+			// The draft signs only the coin and amount (via the offer id). The
+			// receipt hash and receiver node id are what stop a receiver
+			// replaying a payer's proof against another receiver's request
+			// (#1044).
 			const expected = crypto
 				.createHash('sha256')
 				.update(
 					`lfbw-direct-funding-offer:${OFFER_ID.toString('hex')}:` +
-						`${TXID.toString('hex')}:1:250000`,
+						`${TXID.toString('hex')}:1:250000:${RECEIPT_HASH.toString(
+							'hex'
+						)}:${RECEIVER_NODE_ID.toString('hex')}`,
 					'utf8'
 				)
 				.digest();
-			expect(ownershipDigest(OFFER_ID, TXID, 1, 250_000n)).to.deep.equal(
-				expected
-			);
+			const digest = (receiptHash: Buffer, nodeId: Buffer): Buffer =>
+				ownershipDigest(OFFER_ID, TXID, 1, 250_000n, receiptHash, nodeId);
+			expect(digest(RECEIPT_HASH, RECEIVER_NODE_ID)).to.deep.equal(expected);
+			expect(
+				digest(Buffer.alloc(32, 0xb3), RECEIVER_NODE_ID)
+			).to.not.deep.equal(expected);
+			expect(digest(RECEIPT_HASH, OWNER_PUBKEY)).to.not.deep.equal(expected);
 		});
 
 		it('matches the draft attestation string', () => {

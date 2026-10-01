@@ -179,8 +179,9 @@ describe('broadcast:tx single dispatch', () => {
 	it('still surfaces BROADCAST_FAILED when the backend genuinely rejects', async () => {
 		// A refusal that means the tx can never be on the network.
 		backend.refusal = 'bad-txns-inputs-missingorspent';
+		const tx = makeSweepTx();
 
-		node.getChannelManager().emit('broadcast:tx', makeSweepTx().toBuffer());
+		node.getChannelManager().emit('broadcast:tx', tx.toBuffer());
 		await new Promise((resolve) => setTimeout(resolve, 30));
 
 		expect(backend.broadcasts.length, 'one attempt was made').to.equal(1);
@@ -188,6 +189,12 @@ describe('broadcast:tx single dispatch', () => {
 			errors.filter((e) => e.code === 'BROADCAST_FAILED'),
 			'the genuine failure is still reported'
 		).to.have.length(1);
+		// Issue #1062: the failure names the transaction. A sweep is nothing
+		// the node re-sends on its own, and it belongs to no channel here.
+		const failure = errors.find((e) => e.code === 'BROADCAST_FAILED')!;
+		expect(failure.txid).to.equal(tx.getId());
+		expect(failure.retained).to.equal(false);
+		expect(failure).to.not.have.property('channelId');
 	});
 
 	it('does not raise BROADCAST_FAILED for a tx the mempool already holds (issue #921)', async () => {
@@ -205,5 +212,53 @@ describe('broadcast:tx single dispatch', () => {
 			errors.filter((e) => e.code === 'BROADCAST_FAILED'),
 			'a duplicate answer is not a failure'
 		).to.have.length(0);
+	});
+
+	// Issue #1062: when the watcher gives up, the report has to say which
+	// transaction, whose channel, and whether anything else will keep trying.
+	it('a permanent failure for a transaction nobody tracks carries the txid, no channel, not retained', () => {
+		const txid = makeSweepTx().getId();
+		node
+			.getChainWatcher()!
+			.emit(
+				'broadcast:permanent_failure',
+				new Error(`Broadcast permanently failed after 12 retries: ${txid}`),
+				txid
+			);
+		const err = errors.find((e) => e.code === 'BROADCAST_PERMANENT_FAILURE')!;
+		expect(err.txid).to.equal(txid);
+		expect(err.retained).to.equal(false);
+		expect(err).to.not.have.property('channelId');
+		expect(err.message).to.not.match(/rebroadcasts it on every block/);
+	});
+
+	it('a permanent failure for a recorded close names its channel and is not retained', () => {
+		const txid = makeSweepTx().getId();
+		const idHex = 'cd'.repeat(32);
+		// The close txid map is keyed in display order, as the watcher reports.
+		(
+			node as unknown as { _pendingCloseTxids: Map<string, string> }
+		)._pendingCloseTxids.set(txid, idHex);
+		node
+			.getChainWatcher()!
+			.emit(
+				'broadcast:permanent_failure',
+				new Error('retries exhausted'),
+				txid
+			);
+		const err = errors.find((e) => e.code === 'BROADCAST_PERMANENT_FAILURE')!;
+		expect(err.txid).to.equal(txid);
+		expect(err.channelId!.toString('hex')).to.equal(idHex);
+		expect(err.retained).to.equal(false);
+	});
+
+	it('a watcher that names no transaction is still reported, without a txid', () => {
+		node
+			.getChainWatcher()!
+			.emit('broadcast:permanent_failure', new Error('retries exhausted'));
+		const err = errors.find((e) => e.code === 'BROADCAST_PERMANENT_FAILURE')!;
+		expect(err.message).to.equal('retries exhausted');
+		expect(err.txid).to.equal(undefined);
+		expect(err.retained).to.equal(false);
 	});
 });

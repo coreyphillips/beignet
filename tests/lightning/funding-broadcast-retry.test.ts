@@ -289,6 +289,63 @@ describe('Funding broadcast retry', function () {
 		bob.destroy();
 	});
 
+	// Issue #1062: the watcher giving up on a funding the node still owes is
+	// not the end of the attempt, and the report has to say so, naming the
+	// transaction and the channel it funds.
+	it('a permanent broadcast failure for an owed funding names the channel and says the node keeps re-sending it', async function () {
+		let fundingTxidHex = '';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				fundingTxidHex = built.txid.toString('hex');
+				return built;
+			},
+			broadcastTransaction: async (txHex) =>
+				bitcoin.Transaction.fromHex(txHex).getId()
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(1062, {
+				fundingProvider: provider,
+				chainBackend: new ControlledBackend()
+			})
+		);
+		const bob = new LightningNode(makeNodeConfig(1063));
+		const errors: ILightningError[] = [];
+		alice.on('node:error', (e: ILightningError) => errors.push(e));
+		bob.on('node:error', () => {});
+		connectNodes(alice, bob);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		expect(pendingMap(alice).has(fundingTxidHex)).to.equal(true);
+
+		// The watcher reports in display order; the obligation is keyed in
+		// internal order, and the node has to bridge the two.
+		const displayTxid = Buffer.from(fundingTxidHex, 'hex')
+			.reverse()
+			.toString('hex');
+		alice
+			.getChainWatcher()!
+			.emit(
+				'broadcast:permanent_failure',
+				new Error(
+					`Broadcast permanently failed after 12 retries: ${displayTxid}`
+				),
+				displayTxid
+			);
+		const err = errors.find((e) => e.code === 'BROADCAST_PERMANENT_FAILURE')!;
+		expect(err.txid).to.equal(displayTxid);
+		expect(err.retained).to.equal(true);
+		const channel = alice
+			.listChannels()
+			.find((c) => c.fundingTxid === displayTxid)!;
+		expect(err.channelId!.equals(channel.channelId)).to.equal(true);
+		expect(err.message).to.match(/rebroadcasts it on every block/);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
 	it('a stranded obligation is re-adopted from the channel row on the next block', async function () {
 		// A disconnect purges a channel's barrier-held batch, and for a v2
 		// open that suffix can be the tx_signatures release plus the funding

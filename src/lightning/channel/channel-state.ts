@@ -15,7 +15,8 @@ import {
 	IChannelConfig,
 	IHtlcEntry,
 	IHtlcSnapshotEntry,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	DEFAULT_MINIMUM_DEPTH
 } from './types';
 
 /**
@@ -448,6 +449,23 @@ export interface IChannelState {
 	 */
 	revokedHtlcSnapshots?: Map<string, IHtlcSnapshotEntry[]>;
 
+	/**
+	 * Watchtower: the remote commitment transactions we signed that the peer
+	 * has not revoked yet, keyed by the per-commitment point (hex) each uses.
+	 * The revoke_and_ack that reveals a point's secret is when the tower
+	 * needs that exact tx, which may be after a restart, so this persists.
+	 * While a splice is pending a point is signed over both funding outputs,
+	 * so it holds one tx for each.
+	 */
+	watchtowerRemoteCommitmentTxs?: Map<string, Buffer[]>;
+
+	/**
+	 * Watchtower: revoked peer commitments whose tower hand-off failed, each
+	 * with the secret that revoked it. Retried on the next revoke_and_ack and
+	 * on restore; until one succeeds this is the only copy.
+	 */
+	watchtowerBackupsOwed?: Array<{ perCommitmentSecret: Buffer; tx: Buffer }>;
+
 	/** Cached remote signature on our latest commitment */
 	remoteCommitmentSignature: Buffer | null;
 	remoteHtlcSignatures: Buffer[];
@@ -646,6 +664,25 @@ export interface IChannelState {
 	 * (treated as null).
 	 */
 	spliceInFlight?: ISpliceInFlight | null;
+	/**
+	 * Set once a splice has been adopted (completeSplice), never cleared: the
+	 * channel's funding has moved at least once. The funder-fee guard (issue
+	 * #1020) reads it for eclair's climb-out branch: on a channel that has
+	 * been spliced, with fewer than 5 HTLCs in the map, eclair offers an add
+	 * while the funder's balance exceeds the fee, reserve or not, so that a
+	 * funder a splice-out left short of its reserve can climb back out.
+	 * Persisted.
+	 */
+	hasBeenSpliced?: boolean;
+	/**
+	 * Every funding txid this channel ran on before fundingTxid, oldest first
+	 * (internal byte order), one entry per adopted splice (issue #1060). A
+	 * wallet whose own deposit is the on-chain side of a splice matches that
+	 * transaction against the channel's fundings; once the channel has moved
+	 * on, the spent funding is only known here. Persisted; absent on rows
+	 * written before the field existed and on a never-spliced channel.
+	 */
+	previousFundingTxids?: Buffer[];
 	/**
 	 * Issue #764: the splice (txid in internal byte order) that the commitment
 	 * this FORCE_CLOSED channel broadcast spends, when the chain had that
@@ -1231,7 +1268,7 @@ export function createAcceptorState(params: {
 		pushMsat: params.pushMsat,
 		fundingTxid: null,
 		fundingOutputIndex: 0,
-		minimumDepth: 3,
+		minimumDepth: DEFAULT_MINIMUM_DEPTH,
 
 		localConfig: { ...params.localConfig },
 		localBasepoints: params.localBasepoints,

@@ -240,7 +240,7 @@ export function publishChannel(
 	y.registerChannelScid(channelId, scid);
 }
 
-export const TIP = 790_000;
+export const TIP = 795_000;
 export const T_EXP = 800_000;
 export const D_DEADLINE = 798_992;
 export const AMOUNTS = [1_000_000n, 546_250n, 2_000_000n];

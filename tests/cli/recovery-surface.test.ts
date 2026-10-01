@@ -18,6 +18,12 @@ import { AddressInfo } from 'net';
 import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
 import { resolveConfig } from '../../src/cli/config';
 import { BeignetError } from '../../src/cli/errors';
+import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from '../../src/cli/auth';
+import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
+import {
+	DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+	Network
+} from '../../src/lightning/invoice/types';
 import {
 	GuardianHttpServer,
 	ReferenceGuardian,
@@ -48,6 +54,20 @@ const MNEMONIC =
 
 const sha = (s: string): Buffer =>
 	crypto.createHash('sha256').update(s).digest();
+
+/** An invoice from somebody else, for the payment queue. */
+const invoiceFrom = (description: string): string =>
+	encodeInvoice({
+		network: Network.REGTEST,
+		amountMsat: 1_000_000n,
+		timestamp: Math.floor(Date.now() / 1000),
+		paymentHash: crypto.randomBytes(32),
+		paymentSecret: crypto.randomBytes(32),
+		description,
+		expiry: 3600,
+		minFinalCltvExpiry: DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+		privateKey: sha(`payee-${description}`)
+	});
 
 const NODE_SECRET = deriveLightningKeysFromMnemonic(
 	MNEMONIC,
@@ -1634,7 +1654,8 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 				expect((await get(portB, '/info', MONITOR_KEY)).status).to.equal(401);
 				const hook = await post(portB, '/webhooks/register', {
 					url: 'http://127.0.0.1:9/hook',
-					events: ['payment:received']
+					events: ['payment:received'],
+					allowPrivateNetwork: true
 				});
 				expect(hook.status, JSON.stringify(hook.body)).to.equal(200);
 
@@ -1714,6 +1735,22 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 				deviceB.node.on('recovery:restored', (data) =>
 					restored.push(data as Record<string, unknown>)
 				);
+				// The swap moves the database file, so the teardown closes it
+				// first. The node's destroy() closes only its view of the
+				// database now (issue #958), so the teardown closes the file
+				// itself.
+				const database = deviceB.node.getStorage() as unknown as {
+					db: { open: boolean };
+				};
+				const swapper = deviceB.node as unknown as {
+					finishStagedCapsuleRestore: (dbPath: string) => void;
+				};
+				const swap = swapper.finishStagedCapsuleRestore.bind(deviceB.node);
+				let openAtSwap: boolean | undefined;
+				swapper.finishStagedCapsuleRestore = (dbPath: string): void => {
+					openAtSwap = database.db.open;
+					swap(dbPath);
+				};
 				const res = await post(portB, '/recovery/restore-capsule', {
 					confirm: true
 				});
@@ -1726,6 +1763,7 @@ describe('Recovery surface: capsule restore in peer-storage mode', () => {
 					head: { writerEpoch: string; latestSequence: string };
 				};
 				report = result;
+				expect(openAtSwap).to.equal(false);
 				expect(result.tier).to.equal(2);
 				expect(result.framesApplied).to.be.at.least(1);
 				expect(result.rejectedCandidates).to.equal(1);
@@ -2553,6 +2591,68 @@ describe('Recovery surface: guardian quorum lifecycle over REST', () => {
 				expect((fencedReady.body.result as { ready: boolean }).ready).to.equal(
 					false
 				);
+
+				// Its force close is the only exit it has, and B has been
+				// revoking what A stores, so the exit asks for the label even on
+				// a channel with no hold of its own (issue #1013).
+				const {
+					createOpenerState
+				} = require('../../src/lightning/channel/channel-state');
+				const { Channel } = require('../../src/lightning/channel/channel');
+				const {
+					ChannelState,
+					DEFAULT_CHANNEL_CONFIG
+				} = require('../../src/lightning/channel/types');
+				const { getPublicKey } = require('../../src/lightning/crypto/ecdh');
+				const point = getPublicKey(crypto.randomBytes(32));
+				const bp = {
+					fundingPubkey: point,
+					revocationBasepoint: point,
+					paymentBasepoint: point,
+					delayedPaymentBasepoint: point,
+					htlcBasepoint: point,
+					firstPerCommitmentPoint: point
+				};
+				const state = createOpenerState({
+					temporaryChannelId: crypto.randomBytes(32),
+					fundingSatoshis: 100_000n,
+					pushMsat: 0n,
+					localConfig: DEFAULT_CHANNEL_CONFIG,
+					localBasepoints: bp,
+					localPerCommitmentSeed: crypto.randomBytes(32)
+				});
+				state.state = ChannelState.NORMAL;
+				state.channelId = crypto.randomBytes(32);
+				state.fundingTxid = crypto.randomBytes(32);
+				state.remoteBasepoints = bp;
+				const nodeA = deviceA.node.getNode();
+				nodeA
+					.getChannelManager()
+					.restoreChannel(
+						new Channel(state),
+						crypto.randomBytes(33).toString('hex')
+					);
+				expect(nodeA.getRecoveryOwnershipHold()).to.equal('superseded');
+				const fencedClose = await request(
+					portA,
+					'POST',
+					'/channel/forceclose',
+					{
+						channelId: state.channelId.toString('hex')
+					}
+				);
+				expect(fencedClose.status).to.equal(400);
+				expect((fencedClose.body.error as { code: string }).code).to.equal(
+					'INVALID_PARAMS'
+				);
+				const fencedMessage = (fencedClose.body.error as { message: string })
+					.message;
+				expect(fencedMessage).to.match(/This device was superseded/);
+				expect(fencedMessage).to.match(/acceptStaleStateRisk/);
+				expect(
+					nodeA.getChannelManager().getChannel(state.channelId)!.getState(),
+					'nothing was broadcast'
+				).to.not.equal(ChannelState.FORCE_CLOSED);
 			} finally {
 				await deviceB.stop();
 				await deviceA.stop();
@@ -2852,6 +2952,158 @@ describe('Recovery surface: automatic capsule restore (peer-storage auto-apply, 
 				expect(status.state).to.equal('running');
 				expect(status.autoApply.enabled).to.equal(true);
 				expect(status.autoApply.phase).to.equal('idle');
+			} finally {
+				await deviceB.stop();
+			}
+		} finally {
+			fs.rmSync(dirA, { recursive: true, force: true });
+			fs.rmSync(dirB, { recursive: true, force: true });
+		}
+	});
+
+	// Issue #978: the daemon took node.getStorage() once at boot for its
+	// queue, its webhooks and its auth-key overrides. The in-process rebuild
+	// closes that handle and installs the restored database, so everything
+	// those wrote afterwards went to the closed handle: the queue's writes
+	// vanished silently, a rotation threw.
+	it('keeps the queue, webhooks and auth overrides on the live database after the in-process rebuild', async function (): Promise<void> {
+		this.timeout(120_000);
+		const dirA = tmpDir('auto-live-a');
+		const dirB = tmpDir('auto-live-b');
+		const SHOP_KEY = 'd'.repeat(64);
+		const optsB = {
+			...OFFLINE,
+			dataDir: dirB,
+			...AUTO,
+			apiKeys: [{ name: 'shop', key: SHOP_KEY, scopes: ['invoice' as const] }]
+		};
+		const queueIds = async (port: number): Promise<string[]> => {
+			const res = await request(port, 'GET', '/queue', undefined, ADMIN_KEY);
+			expect(res.status).to.equal(200);
+			return (res.body.result as Array<{ id: string }>).map((e) => e.id).sort();
+		};
+		try {
+			const { inline } = await composeSource(dirA, 'live storage probe');
+			let deviceB = await startDaemon(optsB);
+			let portB = portOf(deviceB);
+			let beforeId = '';
+			let afterId = '';
+			let hookId = '';
+			let rotatedKey = '';
+			try {
+				// With no channel, canSend holds an entry with an amount back,
+				// so the rows stay queued throughout.
+				const before = await request(
+					portB,
+					'POST',
+					'/queue/add',
+					{ bolt11: invoiceFrom('before the resume'), amountSats: 1000 },
+					ADMIN_KEY
+				);
+				expect(before.status, JSON.stringify(before.body)).to.equal(200);
+				beforeId = (before.body.result as { id: string }).id;
+
+				const restored = waitForEvent<{ resumed: boolean }>(
+					deviceB,
+					'recovery:restored',
+					60_000
+				);
+				retrieved(deviceB, PEER_A, inline);
+				expect((await restored).resumed).to.equal(true);
+				expect((await statusOf(portB)).state).to.equal('running');
+
+				// Every write after the rebuild lands on the installed
+				// database.
+				const after = await request(
+					portB,
+					'POST',
+					'/queue/add',
+					{ bolt11: invoiceFrom('after the resume'), amountSats: 1000 },
+					ADMIN_KEY
+				);
+				expect(after.status, JSON.stringify(after.body)).to.equal(200);
+				afterId = (after.body.result as { id: string }).id;
+				const hook = await request(
+					portB,
+					'POST',
+					'/webhooks/register',
+					{
+						url: 'http://127.0.0.1:9/hook',
+						events: ['payment:received'],
+						allowPrivateNetwork: true
+					},
+					ADMIN_KEY
+				);
+				expect(hook.status, JSON.stringify(hook.body)).to.equal(200);
+				hookId = (hook.body.result as { id: string }).id;
+				const rotated = await request(
+					portB,
+					'POST',
+					'/auth/keys/rotate',
+					{ name: 'shop' },
+					ADMIN_KEY
+				);
+				expect(rotated.status, JSON.stringify(rotated.body)).to.equal(200);
+				rotatedKey = (rotated.body.result as { key: string }).key;
+
+				const live = deviceB.node.getStorage();
+				const rows = live.loadAllQueueEntries();
+				expect(rows.map((r) => r.id).sort()).to.deep.equal(
+					[beforeId, afterId].sort()
+				);
+				expect(rows.map((r) => r.status)).to.deep.equal(['queued', 'queued']);
+				expect(live.loadAllWebhooks().map((h) => h.id)).to.deep.equal([hookId]);
+				const overrides = JSON.parse(
+					live.loadWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY) ?? 'null'
+				) as Record<string, { keyDigest?: string }> | null;
+				expect(overrides?.shop?.keyDigest).to.equal(
+					sha(rotatedKey).toString('hex')
+				);
+				// One queue serves the routes and the node alike.
+				expect(await queueIds(portB)).to.deep.equal([beforeId, afterId].sort());
+				expect(
+					deviceB.node
+						.listQueue()
+						.map((e) => e.id)
+						.sort()
+				).to.deep.equal([beforeId, afterId].sort());
+			} finally {
+				await deviceB.stop();
+			}
+
+			// A plain restart on the installed database holds all of it.
+			deviceB = await startDaemon(optsB);
+			portB = portOf(deviceB);
+			try {
+				expect(await queueIds(portB)).to.deep.equal([beforeId, afterId].sort());
+				const hooks = await request(
+					portB,
+					'GET',
+					'/webhooks',
+					undefined,
+					ADMIN_KEY
+				);
+				expect(
+					(hooks.body.result as Array<{ id: string }>).map((h) => h.id)
+				).to.deep.equal([hookId]);
+				const withRotated = await request(
+					portB,
+					'POST',
+					'/invoice/create',
+					{ amountSats: 5, description: 'rotated key' },
+					rotatedKey
+				);
+				expect(withRotated.status, JSON.stringify(withRotated.body)).to.equal(
+					200
+				);
+				const withOld = await request(
+					portB,
+					'POST',
+					'/invoice/create',
+					{ amountSats: 5, description: 'config key' },
+					SHOP_KEY
+				);
+				expect(withOld.status).to.equal(401);
 			} finally {
 				await deviceB.stop();
 			}

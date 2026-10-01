@@ -128,6 +128,19 @@ export interface ChannelInfo {
 	 * localBalanceSats stays pre-splice until splice_locked.
 	 */
 	pendingSpliceLocalBalanceSats?: number;
+	/**
+	 * The in-flight splice's txid (display byte order, like fundingTxid).
+	 * Present exactly when pendingSpliceLocalBalanceSats is, so a wallet can
+	 * tell the transaction moving its coins is this channel's splice and not
+	 * a send (issue #1060).
+	 */
+	pendingSpliceTxid?: string;
+	/**
+	 * Funding txids this channel ran on before fundingTxid, oldest first
+	 * (display byte order), one per adopted splice. Absent on a channel that
+	 * has never been spliced (issue #1060).
+	 */
+	previousFundingTxids?: string[];
 	/** Whether the channel will accept a NEW HTLC (0.6.0+). */
 	htlcUsable?: boolean;
 	/**
@@ -215,6 +228,10 @@ export interface ChannelPolicyInfo {
 export interface PaymentRouteHop {
 	pubkey: string;
 	shortChannelId: string;
+	/**
+	 * The fee this hop kept, in msat: what it received less what it
+	 * forwarded. 0 at the final hop. The hops' fees sum to totalFeeMsat.
+	 */
 	feeMsat: number;
 }
 
@@ -704,6 +721,10 @@ export interface BeignetConfig {
 	/** Accept inbound Lightning peers over WebSocket on this port (opt-in;
 	 *  coexists with the TCP listener on listenPort). */
 	websocketPort?: number;
+	/** Inbound peer connections (default 125); once this many are up, only
+	 *  peers holding a channel with this node are admitted. Env:
+	 *  BEIGNET_MAX_INBOUND_PEERS. */
+	maxInboundPeers?: number;
 	daemonPort?: number;
 	daemonHost?: string;
 	preferAnchors?: boolean;
@@ -728,6 +749,11 @@ export interface BeignetConfig {
 	tlsKey?: string;
 	/** SOCKS5 proxy as "host:port" for outbound Lightning peer connections (e.g. Tor). */
 	torProxy?: string;
+	/** Use torProxy for `.onion` peers only and dial public clearnet peers
+	 *  directly (LND's `tor.skip-proxy-for-clearnet-targets`, "hybrid mode").
+	 *  Private and loopback hosts are always dialed directly. Needs torProxy.
+	 *  Env: BEIGNET_TOR_PROXY_ONION_ONLY (exactly `true`/`false`). */
+	torProxyOnionOnly?: boolean;
 	/** Addresses to advertise in node_announcement, as "host[:port]" strings
 	 *  (IPv4, "[ipv6]:port", Tor v3 ".onion", or DNS hostname). */
 	announceAddresses?: string[];
@@ -811,7 +837,9 @@ export interface BeignetConfig {
 	 *  default: being a settlement peer locks liquidity for the whole epoch.
 	 *  Env: BEIGNET_FFOR_SETTLE (exact true/false), with
 	 *  BEIGNET_FFOR_MAX_BUDGET_MSAT, BEIGNET_FFOR_MAX_EPOCH_BLOCKS,
-	 *  BEIGNET_FFOR_FEE_BASE_MSAT and BEIGNET_FFOR_FEE_PPM as the terms floor. */
+	 *  BEIGNET_FFOR_FEE_BASE_MSAT and BEIGNET_FFOR_FEE_PPM as the terms floor.
+	 *  An epoch reaching more than 5040 blocks past the tip is refused
+	 *  whatever maxEpochBlocks says. */
 	fforSettle?: {
 		enabled: boolean;
 		maxBudgetMsat?: string | number;
@@ -839,8 +867,9 @@ export interface BeignetConfig {
 	/** Hard bound on the content one guardian set may store (its encoded
 	 *  rows; SQLite's overhead comes on top): every write, epoch rows and
 	 *  rotations included, that would cross it is refused with
-	 *  ERR_QUOTA_EXCEEDED (default 268435456, 256 MiB). Refuses, never
-	 *  deletes. Env: BEIGNET_GUARDIAN_MAX_BYTES. */
+	 *  ERR_QUOTA_EXCEEDED (default 268435456, 256 MiB). A set registers at
+	 *  most 8 namespaces, and each may store an eighth of this. Refuses,
+	 *  never deletes. Env: BEIGNET_GUARDIAN_MAX_BYTES. */
 	guardianMaxBytesPerSet?: number;
 	/** Guardian sets this node will register (default 16). Env:
 	 *  BEIGNET_GUARDIAN_MAX_SETS. */
@@ -941,7 +970,7 @@ export interface EventMessage {
 export interface ApiResponse<T> {
 	ok: boolean;
 	result?: T;
-	error?: { code: string; message: string };
+	error?: { code: string; message: string; paymentHash?: string };
 }
 
 export interface PaymentFilter {
@@ -985,7 +1014,10 @@ export interface ForwardingSummaryInfo {
 }
 
 export interface RouteEstimate {
+	/** Route fee rounded UP to whole sats, so it is safe to pass as maxFeeSats. */
 	feeSats: number;
+	/** The exact route fee, as a decimal string (bigint in the library). */
+	feeMsat: string;
 	hops: number;
 	cltvDelta: number;
 }
@@ -1197,7 +1229,10 @@ export interface PaymentEstimate {
 	routeQuality: 'HIGH' | 'MEDIUM' | 'LOW';
 	warning?: string;
 	alternativeAvailable: boolean;
+	/** Route fee rounded UP to whole sats, so it is safe to pass as maxFeeSats. */
 	estimatedFeeSats: number;
+	/** The exact route fee, as a decimal string (bigint in the library). */
+	estimatedFeeMsat: string;
 	hopCount: number;
 }
 
@@ -1307,6 +1342,13 @@ export interface BeignetNodeEvents {
 	'onchain:rbf': (data: { txids: string[] }) => void;
 	'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
 	'channel:ready': (data: { channelId: string }) => void;
+	/**
+	 * The channel can take a new HTLC again: it reached NORMAL on
+	 * channel_ready, finished reestablishing on a reconnect, a splice locked
+	 * or unwound, or its funding quarantine lifted. Fires on every reconnect.
+	 * The payment queues start and retry on it (issue #967).
+	 */
+	'channel:usable': (data: { channelId: string }) => void;
 	'channel:pending-close': (data: {
 		channelId: string;
 		initiator: 'local' | 'remote';
@@ -1364,6 +1406,19 @@ export interface BeignetNodeEvents {
 		 * one field that says which open just failed.
 		 */
 		channelId?: string;
+		/**
+		 * The transaction a broadcast error is about (display byte order):
+		 * BROADCAST_FAILED, BROADCAST_PERMANENT_FAILURE and
+		 * SPLICE_BROADCAST_REFUSED carry it when the watcher could name it
+		 * (issue #1062).
+		 */
+		txid?: string;
+		/**
+		 * True when the node still holds that transaction and rebroadcasts it
+		 * on every block (a pending funding or an unconfirmed splice), so the
+		 * watcher's retry queue giving up is not the end of the attempt.
+		 */
+		retained?: boolean;
 	}) => void;
 	'node:ready': () => void;
 	log: (entry: {

@@ -241,6 +241,8 @@ export interface IDfSpliceTxSigsNeeded {
 export interface IDfReceiverDeps {
 	/** Sign with the node identity key; zbase32, i.e. LightningNode.signMessage. */
 	signMessage(message: string): string;
+	/** This node's identity key, the one its requests name. Proofs must name it. */
+	nodeId: Buffer;
 	/** Requests this node minted (4A). A session exists only for one of these. */
 	requests: DirectFundingRequestStore;
 	chain: IDfChainSource;

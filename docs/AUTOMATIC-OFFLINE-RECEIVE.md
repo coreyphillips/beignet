@@ -59,7 +59,11 @@ opens a channel to obtain inbound liquidity.
   mode it does not contact the peer at all, and returns `minAmountSat`, the
   configured direct-funding minimum (5000 sats by default). An amount under the
   applicable minimum is refused with `AMOUNT_TOO_SMALL` naming it. The peer must
-  be connected in either mode, otherwise `RECEIVE_UNAVAILABLE`.
+  be connected in either mode, otherwise `RECEIVE_UNAVAILABLE`. In `bolt11`
+  mode, a peer that refuses (for example one that does not run the settlement
+  role) or does not answer within 15 seconds is also reported as a 409
+  `RECEIVE_UNAVAILABLE`, carrying the peer's own message when it gave one, and
+  `POST /receive/invoice` answers the same way.
 - `POST /receive/invoice` takes `peer`, `amountSats`, `description`, `quote`,
   and a stable `requestId` (16 to 160 letters, digits, underscores or hyphens).
   Use the same id on retries, including after a lost response. In `bolt11` mode

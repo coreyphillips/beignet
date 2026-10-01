@@ -34,6 +34,7 @@ import {
 import {
 	TEMPORARY_CHANNEL_FAILURE,
 	EXPIRY_TOO_FAR,
+	EXPIRY_TOO_SOON,
 	INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 } from '../../src/lightning/onion/types';
 import {
@@ -730,6 +731,146 @@ describe('Policy fail-backs and quiescence parking (issues 410/411)', function (
 		expect(decrypted!.failure.failureCode).to.equal(EXPIRY_TOO_FAR);
 		expect(channel.getState(), 'the channel survives').to.not.equal(
 			ChannelState.ERRORED
+		);
+	});
+
+	it('a FORWARDING node answers expiry_too_soon for an add admitted past its expiry (issue #1009)', function () {
+		// Same fixture as the horizon case, with the entry stamped the way
+		// handleUpdateAddHtlc stamps an add whose cltv_expiry was at or below
+		// our tip. The channel used to be failed for this.
+		const node = createNode(11);
+		const nodePrivkey = makeNodeConfig(11).nodePrivateKey;
+		const state = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 1_000_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(makeSeed(11)),
+			localPerCommitmentSeed: crypto.randomBytes(32)
+		});
+		const channelId = crypto.randomBytes(32);
+		state.channelId = channelId;
+		state.state = ChannelState.NORMAL;
+		const channel = new Channel(state);
+		const cm = node.getChannelManager();
+		cm.restoreChannel(channel, crypto.randomBytes(33).toString('hex'));
+		(
+			node as unknown as { currentBlockHeight: number }
+		).currentBlockHeight = 500;
+
+		const failHtlcCalls: Array<{ reason: Buffer }> = [];
+		(cm as unknown as { failHtlc: unknown }).failHtlc = (
+			_c: Buffer,
+			_id: bigint,
+			reason: Buffer
+		): void => {
+			failHtlcCalls.push({ reason });
+		};
+
+		const paymentHash = crypto.randomBytes(32);
+		const sessionKey = crypto.randomBytes(32);
+		const hops = [
+			{
+				pubkey: getPublicKey(nodePrivkey),
+				payload: {
+					amountToForwardMsat: 1_000_000n,
+					outgoingCltvValue: 360,
+					shortChannelId: Buffer.alloc(8, 7)
+				}
+			},
+			{
+				pubkey: getPublicKey(crypto.randomBytes(32)),
+				payload: {
+					amountToForwardMsat: 1_000_000n,
+					outgoingCltvValue: 360
+				}
+			}
+		];
+		const packet = constructOnionPacket(sessionKey, hops, paymentHash);
+		const { sharedSecrets } = computeSharedSecrets(
+			sessionKey,
+			hops.map((h) => h.pubkey)
+		);
+
+		state.htlcs.set('received-0', {
+			id: 0n,
+			amountMsat: 1_000_000n,
+			paymentHash,
+			cltvExpiry: 400,
+			onionRoutingPacket: encodeOnionPacket(packet),
+			direction: HtlcDirection.RECEIVED,
+			state: HtlcState.COMMITTED,
+			expiredOnArrival: true
+		});
+
+		(
+			node as unknown as {
+				handleIncomingHtlc: (
+					c: Buffer,
+					i: bigint,
+					a: bigint,
+					h: Buffer
+				) => void;
+			}
+		).handleIncomingHtlc(channelId, 0n, 1_000_000n, paymentHash);
+
+		expect(failHtlcCalls, 'failed back').to.have.length(1);
+		const decrypted = decryptFailureMessage(
+			[sharedSecrets[0]],
+			failHtlcCalls[0].reason
+		);
+		expect(decrypted, 'failure decrypts').to.not.be.null;
+		expect(decrypted!.failure.failureCode).to.equal(EXPIRY_TOO_SOON);
+		// [u16 len=0]: the UPDATE-flagged shape, so the payer can read it.
+		expect(decrypted!.failure.failureData.length).to.equal(2);
+		expect(channel.getState(), 'the channel survives').to.not.equal(
+			ChannelState.ERRORED
+		);
+	});
+
+	it('fails a final-hop add admitted past its expiry back, not the channel (issue #1009)', function () {
+		const alice = createNode(12);
+		const bob = createNode(13);
+		connectNodes(alice, bob);
+		const channelId = openReadyChannel(alice, bob);
+		buildGraph(alice, bob, [channelId]);
+
+		// The mirror image of the far-future case: Alice builds absolute
+		// expiries from her tip, and Bob's tip is far AHEAD of it, so every
+		// expiry she offers is already in Bob's past.
+		alice.handleNewBlock(500);
+		bob.handleNewBlock(6_000);
+
+		const invPast = bob.createInvoice({
+			amountMsat: 1_000_000n,
+			description: 'expired-on-arrival'
+		});
+		alice.sendPayment(invPast.bolt11);
+
+		// BOLT 4: expiry_too_soon is a forwarding-only error; the final node
+		// answers incorrect_or_unknown_payment_details instead.
+		const failed = alice.getPayment(invPast.paymentHash)!;
+		expect(failed.status).to.equal(PaymentStatus.FAILED);
+		expect(failed.failureCode).to.equal(INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS);
+		expect(
+			bob.getPayment(invPast.paymentHash)?.status,
+			'never settled'
+		).to.not.equal(PaymentStatus.COMPLETED);
+
+		const bobChannel = bob.getChannelManager().getChannel(channelId)!;
+		expect(bobChannel.getState(), 'the channel survives').to.equal(
+			ChannelState.NORMAL
+		);
+
+		// With the views level again, the same channel still settles.
+		alice.handleNewBlock(6_000);
+		const invOk = bob.createInvoice({
+			amountMsat: 1_000_000n,
+			description: 'expiry-fine'
+		});
+		alice.sendPayment(invOk.bolt11);
+		expect(alice.getPayment(invOk.paymentHash)!.status).to.equal(
+			PaymentStatus.COMPLETED
 		);
 	});
 

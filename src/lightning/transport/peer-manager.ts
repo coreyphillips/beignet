@@ -24,6 +24,7 @@ import {
 } from './websocket';
 import { WebSocketServer } from './websocket-server';
 import { NodeWebSocket } from './websocket-node-client';
+import { normalizeHexPubkey } from '../validation';
 
 /**
  * Default WS client for outbound peers when none is injected. Under Node the
@@ -48,7 +49,12 @@ const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1_000; // 1 second
 // drops (a "flapping" peer — e.g. a closing channel, or an unstable Tor circuit)
 // resets the backoff every cycle and reconnects in a tight 1s loop forever.
 const STABLE_CONNECTION_MS = 60_000;
-const DEFAULT_TOR_PROXY = { host: '127.0.0.1', port: 9050 };
+/**
+ * Where `.onion` dials go when no SOCKS5 proxy is configured: Tor's default
+ * SOCKS port on the local host. Shared with the watchtower client so both
+ * dial paths agree on the fallback.
+ */
+export const DEFAULT_TOR_PROXY = { host: '127.0.0.1', port: 9050 };
 // Cap on gossip-announced reconnect candidates kept per peer. Announcements
 // are peer-controlled input; without a cap a peer could make every reconnect
 // round crawl through a long list of dead addresses.
@@ -96,6 +102,79 @@ export function isPrivateOrLoopbackHost(host: string): boolean {
 }
 
 /**
+ * The key an inbound source address counts under for
+ * maxPendingInboundPerAddress, or null when it is not limited. Private and
+ * loopback sources are not: a Tor onion service, a reverse proxy or a
+ * container gateway hands every peer it carries to us from one such address.
+ * IPv6 keys on the /64, since a single host is routinely given a whole /64.
+ */
+export function inboundAddressKey(address: string | undefined): string | null {
+	if (!address || isPrivateOrLoopbackHost(address)) return null;
+	const a = address.toLowerCase();
+	const mapped = a.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+	if (mapped) return mapped[1];
+	if (!a.includes(':')) return a;
+	const [head, tail] = a.split('::');
+	const front = head ? head.split(':') : [];
+	const back = tail ? tail.split(':') : [];
+	const groups =
+		tail === undefined
+			? front
+			: [
+					...front,
+					...new Array<string>(
+						Math.max(0, 8 - front.length - back.length)
+					).fill('0'),
+					...back
+			  ];
+	const prefix = groups.slice(0, 4).map((g) => parseInt(g, 16).toString(16));
+	return `${prefix.join(':')}::/64`;
+}
+
+/**
+ * Which destinations a configured SOCKS5 proxy is used for (issue #963).
+ *
+ * - `'all'`: every public host rides the proxy (privacy: the node's clearnet
+ *   address is never revealed to a public peer). Today's behaviour and the
+ *   default.
+ * - `'onion'`: only `.onion` hosts ride the proxy; public clearnet hosts are
+ *   dialed directly. What LND calls `tor.skip-proxy-for-clearnet-targets`
+ *   ("hybrid mode"): Tor is reachable, at a non-default address if need be,
+ *   without paying its latency on every clearnet peer.
+ *
+ * Private and loopback hosts are dialed directly under either scope, because
+ * Tor refuses them (see isPrivateOrLoopbackHost).
+ */
+export type Socks5ProxyScope = 'all' | 'onion';
+
+/**
+ * The proxy an outbound dial to `host` goes through, or undefined for a direct
+ * dial. One table for every place that picks a proxy (peer dials, watchtower
+ * connections), so the two cannot drift:
+ *
+ *   destination        | proxy unset      | proxy, scope 'all' | proxy, scope 'onion'
+ *   .onion             | DEFAULT_TOR_PROXY | proxy              | proxy
+ *   private / loopback | direct           | direct             | direct
+ *   public clearnet    | direct           | proxy              | direct
+ *
+ * `.onion` always needs a proxy because the name resolves nowhere else, so an
+ * unset proxy falls back to Tor's default local SOCKS port rather than
+ * failing on DNS. Private and loopback hosts never ride the proxy: Tor rejects
+ * them, so proxying a LAN or localhost peer would only ever fail.
+ */
+export function selectOutboundProxy(
+	host: string,
+	proxy: { host: string; port: number } | undefined,
+	scope: Socks5ProxyScope = 'all'
+): { host: string; port: number } | undefined {
+	if (host.trim().toLowerCase().endsWith('.onion')) {
+		return proxy ?? DEFAULT_TOR_PROXY;
+	}
+	if (isPrivateOrLoopbackHost(host)) return undefined;
+	return scope === 'onion' ? undefined : proxy;
+}
+
+/**
  * A socket factory that dials through a SOCKS5 proxy (Tor), shared by the
  * peer manager and by guardian sessions to onion hosts (recovery
  * guardian-bolt8.ts). Tor circuit establishment can hang for minutes;
@@ -128,14 +207,35 @@ export interface IPeerManagerOptions {
 	autoReconnect?: boolean;
 	/** Max reconnect delay in ms (default 5 min) */
 	maxReconnectDelay?: number;
-	/** SOCKS5 proxy for ALL outbound connections (e.g. Tor on 127.0.0.1:9050).
-	 *  When not set, .onion addresses auto-route through 127.0.0.1:9050. */
+	/** SOCKS5 proxy for outbound connections (e.g. Tor on 127.0.0.1:9050).
+	 *  Which hosts use it is decided by socks5ProxyScope; private and
+	 *  loopback hosts never do. When not set, .onion addresses auto-route
+	 *  through 127.0.0.1:9050 and everything else is dialed directly. */
 	socks5Proxy?: { host: string; port: number };
+	/** Which destinations ride socks5Proxy (default 'all'): 'all' proxies
+	 *  every public host, 'onion' proxies .onion hosts only and dials public
+	 *  clearnet directly. See selectOutboundProxy for the full table. */
+	socks5ProxyScope?: Socks5ProxyScope;
 	/** SOCKS5 connect/negotiation timeout in ms (default 20000). Lower it when a
 	 *  fast failure is preferable to waiting out a stalled/filtered proxy. */
 	socks5TimeoutMs?: number;
-	/** Maximum number of inbound peer connections (default 125) */
+	/** Maximum number of inbound peer connections (default 125). A peer
+	 *  isChannelPeer approves is admitted past it. */
 	maxInboundPeers?: number;
+	/**
+	 * Peers we hold a channel with. They are admitted inbound even at
+	 * maxInboundPeers, so strangers filling the slots cannot lock them out.
+	 */
+	isChannelPeer?: (pubkey: string) => boolean;
+	/** Inbound handshakes in flight at once, all addresses together
+	 *  (default 50). Sockets past it are destroyed on accept. */
+	maxPendingInbound?: number;
+	/** Inbound handshakes in flight at once from one public source address
+	 *  (default 4); see inboundAddressKey. */
+	maxPendingInboundPerAddress?: number;
+	/** Hard deadline in ms for an inbound connection to finish the Noise
+	 *  handshake and init exchange (default 10000). */
+	inboundHandshakeTimeoutMs?: number;
 	/**
 	 * Maximum inbound connections admitted into the guardian-only lane while
 	 * the connection gate is closed (default 32). Counted apart from
@@ -268,8 +368,15 @@ export class PeerManager extends EventEmitter {
 	private server: net.Server | null = null;
 	private wsServer: WebSocketServer | null = null;
 	private socks5Proxy?: { host: string; port: number };
+	private socks5ProxyScope: Socks5ProxyScope;
 	private socks5TimeoutMs: number;
 	private maxInboundPeers: number;
+	private isChannelPeer?: (pubkey: string) => boolean;
+	private maxPendingInbound: number;
+	private maxPendingInboundPerAddress: number;
+	private inboundHandshakeTimeoutMs: number;
+	/** Inbound handshakes in flight, with the inboundAddressKey of each. */
+	private pendingInbound = new Map<Peer, string | null>();
 	private maxLanePeers: number;
 	/**
 	 * Lane peers (recovery 5.6 exception, issue #699 D6): inbound connections
@@ -296,8 +403,18 @@ export class PeerManager extends EventEmitter {
 		this.maxReconnectDelay =
 			options.maxReconnectDelay ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
 		this.socks5Proxy = options.socks5Proxy;
+		this.socks5ProxyScope = options.socks5ProxyScope ?? 'all';
 		this.socks5TimeoutMs = options.socks5TimeoutMs ?? 20_000;
 		this.maxInboundPeers = options.maxInboundPeers ?? 125;
+		// NaN would silently disable the cap: `count >= NaN` is never true.
+		if (!Number.isInteger(this.maxInboundPeers) || this.maxInboundPeers < 0) {
+			throw new Error('maxInboundPeers must be a non-negative integer');
+		}
+		this.isChannelPeer = options.isChannelPeer;
+		this.maxPendingInbound = options.maxPendingInbound ?? 50;
+		this.maxPendingInboundPerAddress = options.maxPendingInboundPerAddress ?? 4;
+		this.inboundHandshakeTimeoutMs =
+			options.inboundHandshakeTimeoutMs ?? 10_000;
 		this.maxLanePeers = options.maxLanePeers ?? 32;
 		this.webSocketImpl = options.webSocketImpl;
 	}
@@ -319,6 +436,8 @@ export class PeerManager extends EventEmitter {
 		transport?: IPeerTransportOptions,
 		options: IPeerDialOptions = {}
 	): Promise<void> {
+		// The same key an inbound connection from this peer registers under.
+		pubkey = normalizeHexPubkey(pubkey);
 		const cancelGeneration = this.cancelGenerations.get(pubkey) ?? 0;
 		if (options.reconnect !== false) {
 			this.noReconnectPeers.delete(pubkey);
@@ -460,16 +579,18 @@ export class PeerManager extends EventEmitter {
 			createSocket = (): Promise<IDuplexTransport> =>
 				connectWebSocket(url, { webSocketImpl });
 		} else {
-			// Route selection for the outbound socket:
-			//   .onion           → always via Tor (explicit proxy, else the default)
-			//   private/loopback → always direct; Tor rejects these, so proxying a
-			//                      LAN or localhost peer would only ever fail
-			//   public clearnet  → via the configured proxy (privacy), else direct
-			const proxy = host.endsWith('.onion')
-				? this.socks5Proxy ?? DEFAULT_TOR_PROXY
-				: isPrivateOrLoopbackHost(host)
-				? undefined
-				: this.socks5Proxy;
+			// Route selection for the outbound socket (selectOutboundProxy):
+			//   .onion           -> always via Tor (explicit proxy, else the default)
+			//   private/loopback -> always direct; Tor rejects these, so proxying a
+			//                       LAN or localhost peer would only ever fail
+			//   public clearnet  -> via the configured proxy under scope 'all'
+			//                       (privacy), direct under scope 'onion' or
+			//                       when no proxy is set
+			const proxy = selectOutboundProxy(
+				host,
+				this.socks5Proxy,
+				this.socks5ProxyScope
+			);
 			createSocket = proxy
 				? this.buildSocks5Factory(proxy, timeoutMs)
 				: undefined;
@@ -754,6 +875,7 @@ export class PeerManager extends EventEmitter {
 	 * Disconnect from a peer.
 	 */
 	disconnectPeer(pubkey: string): void {
+		pubkey = normalizeHexPubkey(pubkey);
 		const lanePeer = this.lanePeers.get(pubkey);
 		if (lanePeer) {
 			lanePeer.disconnect();
@@ -1048,6 +1170,7 @@ export class PeerManager extends EventEmitter {
 	 * Send a message to a specific peer.
 	 */
 	sendToPeer(pubkey: string, type: number, payload: Buffer): void {
+		pubkey = normalizeHexPubkey(pubkey);
 		const lanePeer = this.lanePeers.get(pubkey);
 		if (lanePeer) {
 			// Lane traffic answers to the lane gate, not the outbound gate:
@@ -1079,7 +1202,7 @@ export class PeerManager extends EventEmitter {
 	 * Get a connected peer by pubkey.
 	 */
 	getPeer(pubkey: string): Peer | undefined {
-		return this.peers.get(pubkey);
+		return this.peers.get(normalizeHexPubkey(pubkey));
 	}
 
 	/**
@@ -1106,7 +1229,7 @@ export class PeerManager extends EventEmitter {
 	 * Get a stored peer address.
 	 */
 	getPeerAddress(pubkey: string): { host: string; port: number } | undefined {
-		return this.peerAddresses.get(pubkey);
+		return this.peerAddresses.get(normalizeHexPubkey(pubkey));
 	}
 
 	/**
@@ -1244,7 +1367,12 @@ export class PeerManager extends EventEmitter {
 		if (this.wsServer) {
 			throw new Error('Already listening for WebSocket peers');
 		}
-		const server = new WebSocketServer();
+		const server = new WebSocketServer({
+			maxPendingUpgrades: this.maxPendingInbound,
+			maxPendingUpgradesPerAddress: this.maxPendingInboundPerAddress,
+			upgradeAddressKey: inboundAddressKey,
+			upgradeTimeoutMs: this.inboundHandshakeTimeoutMs
+		});
 		server.on('connection', (transport: IDuplexTransport) => {
 			this.handleInboundConnection(transport);
 		});
@@ -1345,6 +1473,20 @@ export class PeerManager extends EventEmitter {
 			socket.destroy();
 			return;
 		}
+		// A handshake holds a socket and a Peer until it completes or hits
+		// its deadline, and counts toward no other cap until it completes.
+		const addressKey = inboundAddressKey(socket.remoteAddress);
+		let pendingFromAddress = 0;
+		for (const key of this.pendingInbound.values()) {
+			if (addressKey !== null && key === addressKey) pendingFromAddress++;
+		}
+		if (
+			this.pendingInbound.size >= this.maxPendingInbound ||
+			pendingFromAddress >= this.maxPendingInboundPerAddress
+		) {
+			socket.destroy();
+			return;
+		}
 		// Quarantined or fenced (recovery 5.6): destroy the socket BEFORE
 		// the BOLT 8 handshake, so a node that cannot prove writer ownership
 		// never exchanges channel state with anyone. The one exception is the
@@ -1362,10 +1504,6 @@ export class PeerManager extends EventEmitter {
 				return;
 			}
 			lane = true;
-		} else if (this.inboundPeerCount >= this.maxInboundPeers) {
-			// Reject if at inbound peer limit
-			socket.destroy();
-			return;
 		}
 
 		// Create peer with placeholder pubkey — discovered during Noise handshake
@@ -1376,6 +1514,7 @@ export class PeerManager extends EventEmitter {
 			port: socket.remotePort || 0,
 			localFeatures: this.localFeatures,
 			networks: this.networks,
+			handshakeTimeout: this.inboundHandshakeTimeoutMs,
 			// Held until bring-up completes; see the outbound twin. For
 			// inbound this also closes the harder gap: the drain runs
 			// before acceptInbound() resolves, when no listener is even
@@ -1386,6 +1525,7 @@ export class PeerManager extends EventEmitter {
 
 		// Visible to freezeConnections() while the handshake is in flight.
 		this.pendingPeers.add(peer);
+		this.pendingInbound.set(peer, addressKey);
 
 		// Identity is unknown until Noise completes, so a disconnectPeer()
 		// during the handshake has nothing pubkey-addressable to abort.
@@ -1397,6 +1537,7 @@ export class PeerManager extends EventEmitter {
 			.acceptInbound(socket)
 			.then(() => {
 				this.pendingPeers.delete(peer);
+				this.pendingInbound.delete(peer);
 				// Recheck AFTER the handshake: a freeze that landed
 				// mid-establishment must win over registration.
 				if (this.connectionsDisabled()) {
@@ -1421,6 +1562,16 @@ export class PeerManager extends EventEmitter {
 				}
 				const pubkey = peer.remotePublicKey.toString('hex');
 				if ((this.lastCancelEraByPubkey.get(pubkey) ?? 0) > acceptEra) {
+					peer.disconnect();
+					return;
+				}
+				// The cap is applied here, once identity is known, and not
+				// on accept: a stranger holding every slot must not keep a
+				// channel peer from reconnecting.
+				if (
+					this.inboundPeerCount >= this.maxInboundPeers &&
+					!this.admitsPastInboundCap(pubkey)
+				) {
 					peer.disconnect();
 					return;
 				}
@@ -1519,7 +1670,18 @@ export class PeerManager extends EventEmitter {
 			.catch(() => {
 				// Handshake/init failed — socket already cleaned up by Peer
 				this.pendingPeers.delete(peer);
+				this.pendingInbound.delete(peer);
 			});
+	}
+
+	/** A throwing isChannelPeer admits nothing. Letting the throw escape
+	 *  would land in the handshake-failure catch, which never disconnects. */
+	private admitsPastInboundCap(pubkey: string): boolean {
+		try {
+			return this.isChannelPeer?.(pubkey) ?? false;
+		} catch {
+			return false;
+		}
 	}
 
 	private dispatchPeerMessage(

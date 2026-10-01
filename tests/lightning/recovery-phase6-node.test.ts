@@ -23,9 +23,23 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
-import { INodeConfig } from '../../src/lightning/node/types';
+import {
+	INodeConfig,
+	IPaymentInfo,
+	InvalidRequestError,
+	LightningErrorCode,
+	LightningPaymentError,
+	PaymentDirection,
+	PaymentStatus
+} from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
-import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
+import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
+import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
+import {
+	DEFAULT_CHANNEL_CONFIG,
+	HtlcState,
+	REGTEST_CHAIN_HASH
+} from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IStorageBackend } from '../../src/lightning/storage/types';
@@ -48,7 +62,18 @@ import {
 	deriveRecoveryRoot,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
+import { encodedMutationBytes } from '../../src/lightning/recovery/frame-codec';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import {
+	IChannelAnnouncementMessage,
+	IChannelUpdateMessage,
+	encodeShortChannelId
+} from '../../src/lightning/gossip/types';
+import {
+	connectNodes,
+	createNode as createLoopbackNode,
+	openReadyChannel
+} from './helpers/loopback-nodes';
 
 const sha = (s: string): Buffer =>
 	crypto.createHash('sha256').update(s).digest();
@@ -60,6 +85,18 @@ const SET_ID = computeGuardianSetId({
 	guardianIds: GUARDIAN_IDS
 });
 const CONTEXT = { guardianSetId: SET_ID, members: GUARDIAN_IDS };
+
+/**
+ * Encoded bytes the widest failure adds to an outgoing payment row: a
+ * failure code, a hop index and a reason at the 256 bytes a row keeps.
+ * Its braces go and a comma joins it to the row.
+ */
+const WIDEST_FAILURE_BYTES =
+	JSON.stringify({
+		failureCode: 0xffff,
+		failureSourceIndex: 0xff,
+		failureReason: 'x'.repeat(256)
+	}).length - 1;
 
 let now = 2_220_000_000_000n;
 const clock = (): bigint => ++now;
@@ -180,6 +217,63 @@ function openStorage(): SqliteStorage {
 	return storage;
 }
 
+function addTenHopRoute(
+	payer: LightningNode,
+	firstHop: LightningNode,
+	channelId: Buffer
+): Buffer {
+	const nodes = [
+		Buffer.from(payer.getNodeId(), 'hex'),
+		Buffer.from(firstHop.getNodeId(), 'hex')
+	];
+	for (let i = 2; i <= 10; i++) {
+		nodes.push(getPublicKey(sha(`keysend-route-${i}`)));
+	}
+
+	for (let i = 0; i < 10; i++) {
+		const shortChannelId = encodeShortChannelId({
+			block: 700,
+			txIndex: i + 1,
+			outputIndex: 0
+		});
+		const [nodeId1, nodeId2] =
+			Buffer.compare(nodes[i], nodes[i + 1]) < 0
+				? [nodes[i], nodes[i + 1]]
+				: [nodes[i + 1], nodes[i]];
+		const announcement: IChannelAnnouncementMessage = {
+			nodeSignature1: Buffer.alloc(64),
+			nodeSignature2: Buffer.alloc(64),
+			bitcoinSignature1: Buffer.alloc(64),
+			bitcoinSignature2: Buffer.alloc(64),
+			features: Buffer.alloc(0),
+			chainHash: REGTEST_CHAIN_HASH,
+			shortChannelId,
+			nodeId1,
+			nodeId2,
+			bitcoinKey1: Buffer.alloc(33, 2),
+			bitcoinKey2: Buffer.alloc(33, 3)
+		};
+		payer.getGraph().addChannelAnnouncement(announcement);
+		const update: IChannelUpdateMessage = {
+			signature: Buffer.alloc(64),
+			chainHash: REGTEST_CHAIN_HASH,
+			shortChannelId,
+			timestamp: Math.floor(Date.now() / 1000),
+			messageFlags: 1,
+			channelFlags: 0,
+			cltvExpiryDelta: 40,
+			htlcMinimumMsat: 1_000n,
+			feeBaseMsat: 1_000,
+			feeProportionalMillionths: 1,
+			htlcMaximumMsat: 1_000_000_000n
+		};
+		payer.getGraph().applyChannelUpdate(update);
+		payer.getGraph().applyChannelUpdate({ ...update, channelFlags: 1 });
+		if (i === 0) payer.registerChannelScid(channelId, shortChannelId);
+	}
+	return nodes[10];
+}
+
 function replicatorFor(
 	storage: IStorageBackend,
 	guardians: IBoundGuardianClient[]
@@ -217,6 +311,80 @@ async function waitFor(
 		if (Date.now() > deadline) throw new Error('waitFor timed out');
 		await new Promise((resolve) => setTimeout(resolve, 25));
 	}
+}
+
+/**
+ * A node whose guardians take records up to `ceiling` bytes, and readers of
+ * what it journals. No lease, so nothing is ever sent to the guardians.
+ */
+function nodeUnderCeiling(ceiling: number): {
+	node: LightningNode;
+	storage: SqliteStorage;
+	room: number;
+	rowBytes: (paymentHash: Buffer) => number[];
+	longestLabel: (label: (value: string) => void) => string;
+} {
+	const storage = openStorage();
+	const replicator = replicatorFor(
+		storage,
+		GUARDIAN_IDS.map((id) => ({
+			client: new GuardianClient({
+				url: 'http://127.0.0.1:9',
+				guardianSetId: SET_ID
+			}),
+			expectedGuardianId: id
+		}))
+	);
+	replicator.maxRecordBytes = (): number => ceiling;
+	const node = createNode(storage, {
+		enabled: true,
+		durability: 'async-remote',
+		barrier: barrierFor(replicator, () => null, 'async-remote')
+	});
+	const room = (
+		node as unknown as {
+			recoveryJournal: { mutationRoom(): number };
+		}
+	).recoveryJournal.mutationRoom();
+	const journal = new RecoveryJournal(
+		storage,
+		deriveRecoveryMasterKey(NODE_SECRET),
+		NODE_ID,
+		ROOT.recoveryId
+	);
+	return {
+		node,
+		storage,
+		room,
+		// Encoded bytes of every payment_state journaled for the hash.
+		rowBytes: (paymentHash): number[] => {
+			const bytes: number[] = [];
+			for (const frame of journal.loadVerifiedFrames()) {
+				for (const mutation of frame.mutations) {
+					if (
+						mutation.type === 'payment_state' &&
+						mutation.paymentHash === paymentHash.toString('hex')
+					) {
+						bytes.push(encodedMutationBytes(mutation));
+					}
+				}
+			}
+			return bytes;
+		},
+		// The longest value `label` takes: it refuses every longer one.
+		longestLabel: (label): string => {
+			for (let length = Math.floor(room / 2); length >= 0; length--) {
+				const value = 'x'.repeat(length);
+				try {
+					label(value);
+					return value;
+				} catch (err) {
+					if (!(err instanceof InvalidRequestError)) throw err;
+				}
+			}
+			throw new Error('no label fits');
+		}
+	};
 }
 
 // ─────────────── Tests ───────────────
@@ -455,6 +623,973 @@ describe('Recovery phase 6: the node drives durability', () => {
 
 		node.destroy();
 		await shutdown(served);
+		storage.close();
+	});
+
+	it('holds snapshots under the record limit the guardian set advertises (issue #1014)', async function (): Promise<void> {
+		const storage = openStorage();
+		for (let i = 0; i < 20; i++) {
+			storage.saveForwardingEvent({
+				settledAt: 1_700_000_000_000 + i,
+				inChannelId: Buffer.alloc(32, 1).toString('hex'),
+				outChannelId: Buffer.alloc(32, 2).toString('hex'),
+				amountInMsat: 1_001_000n,
+				amountOutMsat: 1_000_000n,
+				feeMsat: 1_000n
+			});
+		}
+		// No lease, so nothing is ever sent to these endpoints.
+		const replicator = replicatorFor(
+			storage,
+			GUARDIAN_IDS.map((id) => ({
+				client: new GuardianClient({
+					url: 'http://127.0.0.1:9',
+					guardianSetId: SET_ID
+				}),
+				expectedGuardianId: id
+			}))
+		);
+		replicator.maxRecordBytes = (): number => 64;
+		const barrier = barrierFor(replicator, () => null, 'async-remote');
+		const node = createNode(storage, {
+			enabled: true,
+			durability: 'async-remote',
+			barrier
+		});
+		const actions: string[] = [];
+		node.on('log', (log: { action: string }) => actions.push(log.action));
+
+		expect(
+			(node as unknown as { recovery: RecoveryManager }).recovery.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'payment_preimage',
+						paymentHash: sha('limited').toString('hex'),
+						preimage: sha('limited-preimage')
+					}
+				],
+				outboundMessages: []
+			}).committed
+		).to.equal(true);
+		await waitFor(() => actions.includes('recovery_frame_oversized'));
+		expect(actions).to.include('recovery_snapshot_trimmed');
+
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId
+		);
+		const [snapshot] = journal.loadVerifiedFrames();
+		expect(snapshot.snapshot!.forwardingEvents).to.have.length(0);
+		node.destroy();
+		storage.close();
+	});
+
+	it('refuses oversized payment metadata and routed keysend state (issue #1134)', async function (): Promise<void> {
+		const CEILING = 5_000;
+		const storage = openStorage();
+		// No lease, so nothing is ever sent to these endpoints.
+		const replicator = replicatorFor(
+			storage,
+			GUARDIAN_IDS.map((id) => ({
+				client: new GuardianClient({
+					url: 'http://127.0.0.1:9',
+					guardianSetId: SET_ID
+				}),
+				expectedGuardianId: id
+			}))
+		);
+		replicator.maxRecordBytes = (): number => CEILING;
+		const barrier = barrierFor(replicator, () => null, 'async-remote');
+		const node = createNode(storage, {
+			enabled: true,
+			durability: 'async-remote',
+			barrier
+		});
+		const actions: string[] = [];
+		node.on('log', (log: { action: string }) => actions.push(log.action));
+
+		const hash = sha('labelled');
+		const payment: IPaymentInfo = {
+			paymentHash: hash,
+			preimage: sha('labelled-preimage'),
+			amountMsat: 1_000_000n,
+			status: PaymentStatus.COMPLETED,
+			direction: PaymentDirection.OUTGOING,
+			createdAt: 1_700_000_000_000,
+			completedAt: 1_700_000_001_000
+		};
+		storage.savePayment(hash.toString('hex'), payment);
+		(node as unknown as { payments: Map<string, IPaymentInfo> }).payments.set(
+			hash.toString('hex'),
+			payment
+		);
+
+		// Larger than an empty page on its own: before, it was saved, and the
+		// bootstrap snapshot's page carrying it was refused by every guardian.
+		expect(() =>
+			node.setPaymentMetadata(hash, { note: 'x'.repeat(10_000) })
+		).to.throw(InvalidRequestError, /too large/);
+		// Would fit a frame today, but leaves no room for the row to grow.
+		expect(() =>
+			node.setPaymentMetadata(hash, { note: 'x'.repeat(3_000) })
+		).to.throw(InvalidRequestError, /too large/);
+		expect(node.getPayment(hash)!.metadata).to.equal(undefined);
+		expect(storage.loadPayment(hash.toString('hex'))!.metadata).to.equal(
+			undefined
+		);
+		expect(storage.loadRecoveryFrames()).to.have.length(0);
+
+		// Keysend takes caller metadata into its row too.
+		expect(() =>
+			node.sendKeysend({
+				destination: getPublicKey(sha('keysend-payee')),
+				amountMsat: 1_000n,
+				metadata: { note: 'x'.repeat(10_000) }
+			})
+		)
+			.to.throw(LightningPaymentError, /too large/)
+			.with.property('code', LightningErrorCode.INVALID_KEYSEND);
+
+		// A label that fits lands, and the bootstrap snapshot it triggers stays
+		// under the limit.
+		node.setPaymentMetadata(hash, { note: 'coffee' });
+		const frames = storage.loadRecoveryFrames();
+		expect(frames).to.not.have.length(0);
+		for (const frame of frames) {
+			expect(frame.ciphertext.length).to.be.at.most(CEILING);
+		}
+		expect(storage.loadPayment(hash.toString('hex'))!.metadata).to.deep.equal({
+			note: 'coffee'
+		});
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(actions).to.not.include('recovery_frame_oversized');
+		const firstHop = createLoopbackNode('keysend-frame-limit', 2);
+		connectNodes(node, firstHop);
+		const channelId = openReadyChannel(node, firstHop);
+		const destination = addTenHopRoute(node, firstHop, channelId);
+		const beforeCounter = node
+			.getChannelManager()
+			.getChannel(channelId)!
+			.getFullState().localHtlcCounter;
+		const beforeFrames = storage.loadRecoveryFrames().length;
+		const internals = node as unknown as {
+			paymentRetryContexts: Map<string, unknown>;
+			htlcPaymentMap: Map<string, string>;
+		};
+		const beforePayments = node.listPayments().length;
+
+		expect(() =>
+			node.sendKeysend({
+				destination,
+				amountMsat: 1_000n,
+				metadata: { note: 'x'.repeat(2_000) }
+			})
+		)
+			.to.throw(LightningPaymentError, /too large/)
+			.with.property('code', LightningErrorCode.INVALID_KEYSEND);
+		expect(node.listPayments()).to.have.length(beforePayments);
+		expect(internals.paymentRetryContexts.size).to.equal(0);
+		expect(internals.htlcPaymentMap.size).to.equal(0);
+		expect(
+			node.getChannelManager().getChannel(channelId)!.getFullState()
+				.localHtlcCounter
+		).to.equal(beforeCounter);
+		expect(storage.loadRecoveryFrames()).to.have.length(beforeFrames);
+
+		firstHop.destroy();
+		node.destroy();
+		storage.close();
+	});
+
+	it('labels, stores and journals a first invoice payment, and refuses metadata over the ceiling (issue #1152)', async function (): Promise<void> {
+		const CEILING = 5_000;
+		const storage = openStorage();
+		// No lease, so nothing is ever sent to these endpoints.
+		const replicator = replicatorFor(
+			storage,
+			GUARDIAN_IDS.map((id) => ({
+				client: new GuardianClient({
+					url: 'http://127.0.0.1:9',
+					guardianSetId: SET_ID
+				}),
+				expectedGuardianId: id
+			}))
+		);
+		replicator.maxRecordBytes = (): number => CEILING;
+		const barrier = barrierFor(replicator, () => null, 'async-remote');
+		const node = createNode(storage, {
+			enabled: true,
+			durability: 'async-remote',
+			barrier
+		});
+		const payee = createLoopbackNode('first-invoice-metadata', 2);
+		connectNodes(node, payee);
+		node.handleNewBlock(1000);
+		payee.handleNewBlock(1000);
+		const channelId = openReadyChannel(node, payee);
+		const farPayee = addTenHopRoute(node, payee, channelId);
+
+		// A hash with no record yet: the send creates it, labels and all.
+		const invoice = payee.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'first'
+		});
+		const hashHex = invoice.paymentHash.toString('hex');
+		expect(node.getPayment(invoice.paymentHash)).to.equal(undefined);
+		node.sendPaymentWithOptions(invoice.bolt11, {
+			metadata: { requestId: 'req-1' }
+		});
+		const resolution = await node.awaitPaymentResolution(
+			invoice.paymentHash,
+			5_000
+		);
+		expect(resolution.status).to.equal(PaymentStatus.COMPLETED);
+		expect(node.getPayment(invoice.paymentHash)!.metadata).to.include({
+			requestId: 'req-1'
+		});
+		expect(storage.loadPayment(hashHex)!.metadata).to.include({
+			requestId: 'req-1'
+		});
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId
+		);
+		const journaled: IPaymentInfo[] = [];
+		for (const frame of journal.loadVerifiedFrames()) {
+			for (const mutation of frame.mutations) {
+				if (
+					mutation.type === 'payment_state' &&
+					mutation.paymentHash === hashHex
+				) {
+					journaled.push(mutation.payment);
+				}
+			}
+			for (const row of frame.snapshot?.payments ?? []) {
+				if (row.paymentHash === hashHex) journaled.push(row.payment);
+			}
+		}
+		// From the PENDING row written before the HTLC left, on.
+		expect(journaled.map((p) => p.status)).to.include(PaymentStatus.PENDING);
+		for (const payment of journaled) {
+			expect(payment.metadata).to.include({ requestId: 'req-1' });
+		}
+
+		const htlcCounter = (): bigint =>
+			node.getChannelManager().getChannel(channelId)!.getFullState()
+				.localHtlcCounter;
+		const beforeCounter = htlcCounter();
+		const beforeFrames = storage.loadRecoveryFrames().length;
+		const beforePayments = node.listPayments().length;
+
+		// Too large for any row: refused before a record or an HTLC exists.
+		const second = payee.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'second'
+		});
+		expect(() =>
+			node.sendPaymentWithOptions(second.bolt11, {
+				metadata: { note: 'x'.repeat(10_000) }
+			})
+		).to.throw(InvalidRequestError, /too large/);
+
+		// Fits the metadata half of a frame, but not beside a ten-hop route.
+		const room = (
+			node as unknown as {
+				recoveryJournal: { mutationRoom(): number };
+			}
+		).recoveryJournal.mutationRoom();
+		const farHash = sha('far-invoice-preimage');
+		const farInvoice = encodeInvoice({
+			network: Network.REGTEST,
+			amountMsat: 1_000n,
+			paymentHash: farHash,
+			paymentSecret: sha('far-invoice-secret'),
+			description: 'far',
+			privateKey: sha('keysend-route-10')
+		});
+		expect(getPublicKey(sha('keysend-route-10'))).to.deep.equal(farPayee);
+		expect(() =>
+			node.sendPaymentWithOptions(farInvoice, {
+				metadata: { note: 'x'.repeat(Math.floor(room / 2) - 20) }
+			})
+		).to.throw(InvalidRequestError, /too large/);
+		// A later send of the hash must not retry with the refused labels.
+		expect(
+			(
+				node as unknown as { paymentRetryContexts: Map<string, unknown> }
+			).paymentRetryContexts.has(farHash.toString('hex'))
+		).to.equal(false);
+
+		// The same labels over ten-hop MPP parts, refused before a part leaves.
+		const part = {
+			hops: Array.from({ length: 10 }, () => ({
+				pubkey: farPayee,
+				shortChannelId: Buffer.alloc(8),
+				amountToForwardMsat: 500n,
+				outgoingCltvValue: 400,
+				cltvExpiryDelta: 40,
+				feeBaseMsat: 1_000,
+				feeProportionalMillionths: 1
+			})),
+			totalAmountMsat: 500n,
+			totalCltvDelta: 400,
+			totalFeeMsat: 0n
+		};
+		expect(() =>
+			(
+				node as unknown as {
+					sendPaymentMpp(...args: unknown[]): IPaymentInfo;
+				}
+			).sendPaymentMpp(
+				farInvoice,
+				{
+					paymentHash: farHash,
+					paymentSecret: sha('far-invoice-secret'),
+					amountMsat: 1_000n
+				},
+				{ parts: [part, part], totalAmountMsat: 1_000n, totalFeeMsat: 0n },
+				40,
+				undefined,
+				undefined,
+				{ note: 'x'.repeat(Math.floor(room / 2) - 20) }
+			)
+		).to.throw(InvalidRequestError, /too large/);
+
+		expect(node.getPayment(second.paymentHash)).to.equal(undefined);
+		expect(node.getPayment(farHash)).to.equal(undefined);
+		expect(node.listPayments()).to.have.length(beforePayments);
+		expect(htlcCounter()).to.equal(beforeCounter);
+		expect(storage.loadRecoveryFrames()).to.have.length(beforeFrames);
+
+		payee.destroy();
+		node.destroy();
+		storage.close();
+	});
+
+	it('refuses metadata that pushes an expired invoice payment row over the ceiling (issue #1152)', async function (): Promise<void> {
+		const storage = openStorage();
+		// No lease, so nothing is ever sent to these endpoints.
+		const replicator = replicatorFor(
+			storage,
+			GUARDIAN_IDS.map((id) => ({
+				client: new GuardianClient({
+					url: 'http://127.0.0.1:9',
+					guardianSetId: SET_ID
+				}),
+				expectedGuardianId: id
+			}))
+		);
+		replicator.maxRecordBytes = (): number => 700;
+		const barrier = barrierFor(replicator, () => null, 'async-remote');
+		const node = createNode(storage, {
+			enabled: true,
+			durability: 'async-remote',
+			barrier
+		});
+		const room = (
+			node as unknown as {
+				recoveryJournal: { mutationRoom(): number };
+			}
+		).recoveryJournal.mutationRoom();
+		const hash = sha('expired-invoice-preimage');
+		const expired = encodeInvoice({
+			network: Network.REGTEST,
+			amountMsat: 1_000n,
+			paymentHash: hash,
+			paymentSecret: sha('expired-invoice-secret'),
+			description: 'expired',
+			timestamp: Math.floor(Date.now() / 1000) - 7_200,
+			expiry: 60,
+			privateKey: sha('expired-invoice-payee')
+		});
+
+		// Fits the metadata half of a frame, but not beside the FAILED row.
+		expect(() =>
+			node.sendPaymentWithOptions(expired, {
+				metadata: { note: 'x'.repeat(Math.floor(room / 2) - 20) }
+			})
+		).to.throw(InvalidRequestError, /too large/);
+		expect(node.getPayment(hash)).to.equal(undefined);
+		expect(storage.loadRecoveryFrames()).to.have.length(0);
+
+		node.destroy();
+		storage.close();
+	});
+
+	it('sizes payment metadata against the row settlement journals (issue #1160)', async function (): Promise<void> {
+		// Small enough that a direct payment's labels can fill what its
+		// PENDING batch or row leaves of the room without breaking the
+		// half-frame rule.
+		const CEILING = 2_000;
+		const storage = openStorage();
+		// No lease, so nothing is ever sent to these endpoints.
+		const replicator = replicatorFor(
+			storage,
+			GUARDIAN_IDS.map((id) => ({
+				client: new GuardianClient({
+					url: 'http://127.0.0.1:9',
+					guardianSetId: SET_ID
+				}),
+				expectedGuardianId: id
+			}))
+		);
+		replicator.maxRecordBytes = (): number => CEILING;
+		const barrier = barrierFor(replicator, () => null, 'async-remote');
+		const node = createNode(storage, {
+			enabled: true,
+			durability: 'async-remote',
+			barrier
+		});
+		const payee = createLoopbackNode('settled-metadata', 2);
+		connectNodes(node, payee);
+		node.handleNewBlock(1000);
+		payee.handleNewBlock(1000);
+		const channelId = openReadyChannel(node, payee);
+		const room = (
+			node as unknown as {
+				recoveryJournal: { mutationRoom(): number };
+			}
+		).recoveryJournal.mutationRoom();
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId
+		);
+		// Encoded bytes of the batch written before the HTLC left (the
+		// PENDING row and its mapping) and of the row settlement wrote.
+		const journaledBytes = (
+			hashHex: string
+		): { pending: number; settled: number } => {
+			const bytes = { pending: 0, settled: 0 };
+			for (const frame of journal.loadVerifiedFrames()) {
+				for (const mutation of frame.mutations) {
+					if (
+						mutation.type === 'htlc_payment_mapping' &&
+						mutation.paymentHash === hashHex
+					) {
+						bytes.pending = frame.mutations.reduce(
+							(sum, m, index) =>
+								sum + encodedMutationBytes(m) + (index === 0 ? 0 : 1),
+							0
+						);
+					}
+					if (
+						mutation.type === 'payment_state' &&
+						mutation.paymentHash === hashHex &&
+						mutation.payment.status === PaymentStatus.COMPLETED
+					) {
+						bytes.settled = encodedMutationBytes(mutation);
+					}
+				}
+			}
+			return bytes;
+		};
+		// Every invoice has this amount and description, so its rows differ
+		// from the probe's only by the length of the note.
+		const newInvoice = (): { bolt11: string; paymentHash: Buffer } =>
+			payee.createInvoice({ amountMsat: 5_000_000n, description: 'settled' });
+
+		const probe = newInvoice();
+		node.sendPaymentWithOptions(probe.bolt11, { metadata: { note: '' } });
+		expect(
+			(await node.awaitPaymentResolution(probe.paymentHash, 5_000)).status
+		).to.equal(PaymentStatus.COMPLETED);
+		const unlabelled = journaledBytes(probe.paymentHash.toString('hex'));
+
+		const htlcCounter = (): bigint =>
+			node.getChannelManager().getChannel(channelId)!.getFullState()
+				.localHtlcCounter;
+		const beforeCounter = htlcCounter();
+		const beforeFrames = storage.loadRecoveryFrames().length;
+
+		// The PENDING batch fills the room exactly, and settlement adds the
+		// preimage and the invoice: refused before a record or an HTLC exists.
+		const overflowing = newInvoice();
+		expect(overflowing.bolt11).to.have.length(probe.bolt11.length);
+		const overflowNote = 'x'.repeat(room - unlabelled.pending);
+		expect(JSON.stringify({ note: overflowNote }).length).to.be.at.most(
+			room / 2
+		);
+		expect(unlabelled.settled + overflowNote.length).to.be.above(room);
+		expect(() =>
+			node.sendPaymentWithOptions(overflowing.bolt11, {
+				metadata: { note: overflowNote }
+			})
+		).to.throw(InvalidRequestError, /too large/);
+		expect(node.getPayment(overflowing.paymentHash)).to.equal(undefined);
+		expect(htlcCounter()).to.equal(beforeCounter);
+		expect(storage.loadRecoveryFrames()).to.have.length(beforeFrames);
+
+		// The same labels on an MPP part's row, refused before a part leaves.
+		const mpp = newInvoice();
+		const route = node.getPayment(probe.paymentHash)!.route!;
+		expect(() =>
+			(
+				node as unknown as {
+					sendPaymentMpp(...args: unknown[]): IPaymentInfo;
+				}
+			).sendPaymentMpp(
+				mpp.bolt11,
+				{ paymentHash: mpp.paymentHash, amountMsat: 5_000_000n },
+				{
+					parts: [route],
+					totalAmountMsat: route.totalAmountMsat,
+					totalFeeMsat: route.totalFeeMsat
+				},
+				40,
+				undefined,
+				undefined,
+				{ note: overflowNote }
+			)
+		).to.throw(InvalidRequestError, /too large/);
+		expect(node.getPayment(mpp.paymentHash)).to.equal(undefined);
+		expect(htlcCounter()).to.equal(beforeCounter);
+		expect(storage.loadRecoveryFrames()).to.have.length(beforeFrames);
+
+		// Settles into exactly the room, with the widest failure it could
+		// keep first (issue #1189), so it is sent. The payee holds it, and
+		// while it is PENDING a further label would overflow the settled row,
+		// so that is refused.
+		const preimage = sha('settled-metadata-preimage');
+		const fitting = payee.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'settled',
+			hold: true,
+			paymentHash: crypto.createHash('sha256').update(preimage).digest()
+		});
+		expect(fitting.bolt11).to.have.length(probe.bolt11.length);
+		const fittingNote = 'x'.repeat(
+			room - unlabelled.settled - WIDEST_FAILURE_BYTES
+		);
+		node.sendPaymentWithOptions(fitting.bolt11, {
+			metadata: { note: fittingNote }
+		});
+		expect(node.getPayment(fitting.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+		expect(() =>
+			node.setPaymentMetadata(fitting.paymentHash, { more: 'x' })
+		).to.throw(InvalidRequestError, /too large/);
+		// Settlement would replace a caller's _invoice with the invoice paid,
+		// but a failure first drops the retry context and keeps it, so the
+		// settled row is sized with the longer of the two (issue #1189) and
+		// a long one overflows it along with the labelled row.
+		const labelledBytes = (invoice: string): number =>
+			encodedMutationBytes({
+				type: 'payment_state',
+				paymentHash: fitting.paymentHash.toString('hex'),
+				payment: {
+					...node.getPayment(fitting.paymentHash)!,
+					metadata: { note: fittingNote, _invoice: invoice }
+				}
+			});
+		const longInvoice = 'x'.repeat(room + 1 - labelledBytes(''));
+		expect(labelledBytes(longInvoice)).to.equal(room + 1);
+		expect(() =>
+			node.setPaymentMetadata(fitting.paymentHash, { _invoice: longInvoice })
+		).to.throw(InvalidRequestError, /too large/);
+
+		// An MPP part's row also carries the sum the parts send.
+		const mppLabelledBytes = (metadata: Record<string, string>): number =>
+			encodedMutationBytes({
+				type: 'payment_state',
+				paymentHash: mpp.paymentHash.toString('hex'),
+				payment: {
+					...node.getPayment(fitting.paymentHash)!,
+					paymentHash: mpp.paymentHash,
+					sentMsat: route.totalAmountMsat,
+					metadata
+				}
+			});
+		const sendMpp = (
+			invoiceStr: string,
+			metadata?: Record<string, string>,
+			maxCltvExpiryHeight?: number
+		): IPaymentInfo =>
+			(
+				node as unknown as {
+					sendPaymentMpp(...args: unknown[]): IPaymentInfo;
+				}
+			).sendPaymentMpp(
+				invoiceStr,
+				{ paymentHash: mpp.paymentHash, amountMsat: 5_000_000n },
+				{
+					parts: [route],
+					totalAmountMsat: route.totalAmountMsat,
+					totalFeeMsat: route.totalFeeMsat
+				},
+				40,
+				undefined,
+				maxCltvExpiryHeight,
+				metadata
+			);
+		// A caller's _invoice that overflows the labelled part row, and the
+		// settled one with it, as above.
+		const mppCallerInvoice = 'x'.repeat(
+			room + 1 - mppLabelledBytes({ _invoice: '' })
+		);
+		expect(mppLabelledBytes({ _invoice: mppCallerInvoice })).to.equal(room + 1);
+		expect(() => sendMpp(mpp.bolt11, { _invoice: mppCallerInvoice })).to.throw(
+			InvalidRequestError,
+			/too large/
+		);
+		// An attempt refused locally leaves its retry context, and settlement
+		// writes that context's invoice, here one byte longer than this send's.
+		expect(sendMpp(`${mpp.bolt11}x`, undefined, 1).status).to.equal(
+			PaymentStatus.FAILED
+		);
+		const sentMsatBytes =
+			mppLabelledBytes({ note: fittingNote, _invoice: '' }) - labelledBytes('');
+		expect(() =>
+			sendMpp(mpp.bolt11, { note: fittingNote.slice(sentMsatBytes) })
+		).to.throw(InvalidRequestError, /too large/);
+
+		expect(payee.settleHeldHtlc(fitting.paymentHash, preimage)).to.equal(true);
+		expect(
+			(await node.awaitPaymentResolution(fitting.paymentHash, 5_000)).status
+		).to.equal(PaymentStatus.COMPLETED);
+		expect(node.getPayment(fitting.paymentHash)!.metadata).to.deep.equal({
+			note: fittingNote,
+			_invoice: fitting.bolt11
+		});
+		expect(
+			journaledBytes(fitting.paymentHash.toString('hex')).settled
+		).to.equal(room - WIDEST_FAILURE_BYTES);
+
+		payee.destroy();
+		node.destroy();
+		storage.close();
+	});
+
+	it('keeps a labelled payment that fails and then settles inside the room (issue #1189)', async function (): Promise<void> {
+		const { node, storage, room, rowBytes, longestLabel } =
+			nodeUnderCeiling(2_000);
+		const payee = createLoopbackNode('failure-fields', 3);
+		connectNodes(node, payee);
+		node.handleNewBlock(1000);
+		payee.handleNewBlock(1000);
+		openReadyChannel(node, payee);
+		const probe = payee.createInvoice({
+			amountMsat: 5_000_000n,
+			description: 'failed first'
+		});
+		node.sendPaymentWithOptions(probe.bolt11, {});
+		expect(
+			(await node.awaitPaymentResolution(probe.paymentHash, 5_000)).status
+		).to.equal(PaymentStatus.COMPLETED);
+		const route = node.getPayment(probe.paymentHash)!.route!;
+		const holdInvoice = (
+			preimage: Buffer
+		): { bolt11: string; paymentHash: Buffer } =>
+			payee.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'failed first',
+				hold: true,
+				paymentHash: crypto.createHash('sha256').update(preimage).digest()
+			});
+
+		// Two parts for a one-part invoice: the payee parks the first and
+		// refuses the second, so the payment fails with a code and a hop
+		// index before the parked part is fulfilled. Failing drops the retry
+		// context, so the fulfill keeps the caller's _invoice as labelled.
+		const partsPreimage = sha('failure-fields-parts');
+		const parts = holdInvoice(partsPreimage);
+		const callerInvoice = longestLabel((_invoice) =>
+			(
+				node as unknown as {
+					sendPaymentMpp(...args: unknown[]): IPaymentInfo;
+				}
+			).sendPaymentMpp(
+				parts.bolt11,
+				{
+					paymentHash: parts.paymentHash,
+					paymentSecret: decodeInvoice(parts.bolt11).paymentSecret,
+					amountMsat: 5_000_000n
+				},
+				{
+					parts: [route, route],
+					totalAmountMsat: 10_000_000n,
+					totalFeeMsat: 0n
+				},
+				40,
+				undefined,
+				undefined,
+				{ _invoice }
+			)
+		);
+		expect(callerInvoice.length).to.be.above(parts.bolt11.length);
+		expect(node.getPayment(parts.paymentHash)).to.include({
+			status: PaymentStatus.FAILED,
+			failureCode: 0x400f,
+			failureSourceIndex: 0
+		});
+		expect(payee.settleHeldHtlc(parts.paymentHash, partsPreimage)).to.equal(
+			true
+		);
+		const partsRows = rowBytes(parts.paymentHash);
+		expect(partsRows).to.not.have.length(0);
+		for (const bytes of partsRows) expect(bytes).to.be.at.most(room);
+		expect(node.getPayment(parts.paymentHash)).to.include({
+			status: PaymentStatus.COMPLETED,
+			failureCode: 0x400f,
+			failureSourceIndex: 0
+		});
+		expect(node.getPayment(parts.paymentHash)!.metadata).to.deep.equal({
+			_invoice: callerInvoice
+		});
+
+		// A caller's reason is cut to the bytes a row reserves for it.
+		const reasonPreimage = sha('failure-fields-reason');
+		const reason = holdInvoice(reasonPreimage);
+		node.sendPaymentWithOptions(reason.bolt11, {});
+		expect(node.getPayment(reason.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+		longestLabel((note) =>
+			node.setPaymentMetadata(reason.paymentHash, { note })
+		);
+		node.failPayment(reason.paymentHash, 'y'.repeat(10_000));
+		expect(payee.settleHeldHtlc(reason.paymentHash, reasonPreimage)).to.equal(
+			true
+		);
+		const reasonRows = rowBytes(reason.paymentHash);
+		expect(reasonRows).to.not.have.length(0);
+		for (const bytes of reasonRows) expect(bytes).to.be.at.most(room);
+		expect(node.getPayment(reason.paymentHash)).to.include({
+			status: PaymentStatus.COMPLETED,
+			failureReason: 'y'.repeat(256)
+		});
+
+		payee.destroy();
+		node.destroy();
+		storage.close();
+	});
+
+	it('keeps a labelled incoming payment inside the room whatever its part count (issue #1189)', async function (): Promise<void> {
+		// Small enough that the settled row, not the half-frame rule, is what
+		// bounds a label, and large enough for seven parts unlabelled.
+		const { node, storage, room, rowBytes, longestLabel } =
+			nodeUnderCeiling(1_700);
+		const payer = createLoopbackNode('settled-parts', 4);
+		connectNodes(node, payer);
+		node.handleNewBlock(1000);
+		payer.handleNewBlock(1000);
+		openReadyChannel(payer, node);
+		const actions: string[] = [];
+		node.on('log', (log: { action: string }) => actions.push(log.action));
+		// Parts refused for want of room since the last call.
+		const refusedParts = (): number =>
+			actions.splice(0).filter((action) => action === 'settled_row_full')
+				.length;
+		const probe = node.createInvoice({
+			amountMsat: 1_000_000n,
+			description: 'parts'
+		});
+		payer.sendPaymentWithOptions(probe.bolt11, {});
+		expect(
+			(await payer.awaitPaymentResolution(probe.paymentHash, 5_000)).status
+		).to.equal(PaymentStatus.COMPLETED);
+		const route = payer.getPayment(probe.paymentHash)!.route!;
+		// Seven 1,000 sat parts of a 7,000 sat invoice.
+		const payInParts = (invoice: {
+			bolt11: string;
+			paymentHash: Buffer;
+		}): IPaymentInfo =>
+			(
+				payer as unknown as {
+					sendPaymentMpp(...args: unknown[]): IPaymentInfo;
+				}
+			).sendPaymentMpp(
+				invoice.bolt11,
+				{
+					paymentHash: invoice.paymentHash,
+					paymentSecret: decodeInvoice(invoice.bolt11).paymentSecret,
+					amountMsat: 7_000_000n
+				},
+				{
+					parts: Array(7).fill({
+						...route,
+						hops: route.hops.map((hop) => ({
+							...hop,
+							amountToForwardMsat: 1_000_000n
+						})),
+						totalAmountMsat: 1_000_000n,
+						totalFeeMsat: 0n
+					}),
+					totalAmountMsat: 7_000_000n,
+					totalFeeMsat: 0n
+				},
+				40
+			);
+		const expectRowsFit = (paymentHash: Buffer): void => {
+			const rows = rowBytes(paymentHash);
+			expect(rows).to.not.have.length(0);
+			for (const bytes of rows) expect(bytes).to.be.at.most(room);
+		};
+
+		const holdInvoice = (
+			preimage: Buffer
+		): { bolt11: string; paymentHash: Buffer } =>
+			node.createInvoice({
+				amountMsat: 7_000_000n,
+				description: 'parts',
+				hold: true,
+				paymentHash: crypto.createHash('sha256').update(preimage).digest()
+			});
+
+		// Labelled first, the row has room for one part: the node takes the
+		// first and refuses the rest rather than settle them into it.
+		const labelledFirst = node.createInvoice({
+			amountMsat: 7_000_000n,
+			description: 'parts'
+		});
+		longestLabel((note) =>
+			node.setPaymentMetadata(labelledFirst.paymentHash, { note })
+		);
+		payInParts(labelledFirst);
+		expectRowsFit(labelledFirst.paymentHash);
+		expect(node.getPayment(labelledFirst.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+		expect(refusedParts()).to.equal(6);
+
+		// A hold invoice labelled first parks only the part its row has
+		// room for.
+		const heldPreimage = sha('settled-parts-held');
+		const heldFirst = holdInvoice(heldPreimage);
+		longestLabel((note) =>
+			node.setPaymentMetadata(heldFirst.paymentHash, { note })
+		);
+		payInParts(heldFirst);
+		expect(refusedParts()).to.equal(6);
+		expect(node.settleHeldHtlc(heldFirst.paymentHash, heldPreimage)).to.equal(
+			true
+		);
+		expectRowsFit(heldFirst.paymentHash);
+		expect(node.getPayment(heldFirst.paymentHash)!.settledHtlcs).to.have.length(
+			1
+		);
+
+		// Parked first, a label is sized with the parts already there, and
+		// all seven settle into the row.
+		const parkedPreimage = sha('settled-parts-parked');
+		const parked = holdInvoice(parkedPreimage);
+		payInParts(parked);
+		expect(refusedParts()).to.equal(0);
+		longestLabel((note) =>
+			node.setPaymentMetadata(parked.paymentHash, { note })
+		);
+		expect(node.settleHeldHtlc(parked.paymentHash, parkedPreimage)).to.equal(
+			true
+		);
+		expectRowsFit(parked.paymentHash);
+		expect(node.getPayment(parked.paymentHash)!.settledHtlcs).to.have.length(7);
+
+		payer.destroy();
+		node.destroy();
+		storage.close();
+	});
+
+	it('fails a part refused for want of room once its channel reconnects (issue #1189)', async function (): Promise<void> {
+		const { node, storage, longestLabel } = nodeUnderCeiling(1_700);
+		const payer = createLoopbackNode('settled-parts-cut', 5);
+		// A link that can drop. Reconnecting holds delivery until both sides
+		// have reset, so neither reestablish arrives early.
+		let cut = false;
+		let hold = false;
+		const queue: Array<() => void> = [];
+		for (const [from, to] of [
+			[node, payer],
+			[payer, node]
+		]) {
+			from.on(
+				'message:outbound',
+				(pubkey: string, type: number, payload: Buffer) => {
+					if (cut || pubkey !== to.getNodeId()) return;
+					const deliver = (): void =>
+						to.handlePeerMessage(from.getNodeId(), type, payload);
+					if (hold) queue.push(deliver);
+					else deliver();
+				}
+			);
+		}
+		node.handleNewBlock(1000);
+		payer.handleNewBlock(1000);
+		const channelId = openReadyChannel(payer, node);
+		const probe = node.createInvoice({
+			amountMsat: 1_000_000n,
+			description: 'parts'
+		});
+		payer.sendPaymentWithOptions(probe.bolt11, {});
+		expect(
+			(await payer.awaitPaymentResolution(probe.paymentHash, 5_000)).status
+		).to.equal(PaymentStatus.COMPLETED);
+		const { hops } = payer.getPayment(probe.paymentHash)!.route!;
+		const receivedHtlcs = (): HtlcState[] =>
+			[
+				...node
+					.getChannelManager()
+					.getChannel(channelId)!
+					.getFullState()
+					.htlcs.entries()
+			]
+				.filter(([key]) => key.startsWith('received-'))
+				.map(([, htlc]) => htlc.state);
+
+		// Labelled first, the row has room for one part. The payer drops
+		// while the second is refused, so the channel cannot carry the fail.
+		const invoice = node.createInvoice({
+			amountMsat: 7_000_000n,
+			description: 'parts'
+		});
+		longestLabel((note) =>
+			node.setPaymentMetadata(invoice.paymentHash, { note })
+		);
+		const payPart = (): void => {
+			payer.sendPaymentToRoute(
+				{
+					hops: hops.map((hop) => ({ ...hop, amountToForwardMsat: 1_000_000n }))
+				},
+				invoice.paymentHash,
+				40,
+				invoice.paymentSecret,
+				7_000_000n
+			);
+		};
+		payPart();
+		const cutOnRefusal = (log: { action: string }): void => {
+			if (log.action !== 'settled_row_full') return;
+			cut = true;
+			node.getChannelManager().handlePeerDisconnected(payer.getNodeId());
+			payer.getChannelManager().handlePeerDisconnected(node.getNodeId());
+		};
+		node.on('log', cutOnRefusal);
+		payPart();
+		node.off('log', cutOnRefusal);
+		expect(cut).to.equal(true);
+		expect(receivedHtlcs()).to.deep.equal([
+			HtlcState.COMMITTED,
+			HtlcState.COMMITTED
+		]);
+
+		// The refused part fails back on reconnect; the one taken waits for
+		// the rest of its set.
+		cut = false;
+		hold = true;
+		node.getChannelManager().handlePeerReconnected(payer.getNodeId());
+		payer.getChannelManager().handlePeerReconnected(node.getNodeId());
+		while (queue.length > 0) queue.shift()!();
+		hold = false;
+		expect(receivedHtlcs()).to.deep.equal([HtlcState.COMMITTED]);
+
+		payer.destroy();
+		node.destroy();
 		storage.close();
 	});
 });

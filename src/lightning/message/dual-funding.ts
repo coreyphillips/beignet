@@ -59,6 +59,21 @@ const TLV_CHANNEL_TYPE = 1n;
 const TLV_REQUEST_FUNDS = 3n;
 /** will_fund TLV in accept_channel2. */
 const TLV_WILL_FUND = 3n;
+// upfront_shutdown_script binds the receiver only once
+// option_upfront_shutdown_script is negotiated, and we never advertise it, so
+// the record is accepted and ignored. require_confirmed_inputs (2) is left
+// unknown: the initial v2 open does not honour it.
+const TLV_UPFRONT_SHUTDOWN_SCRIPT = 0n;
+const OPEN_CHANNEL2_TLV_TYPES = new Set<bigint>([
+	TLV_UPFRONT_SHUTDOWN_SCRIPT,
+	TLV_CHANNEL_TYPE,
+	TLV_REQUEST_FUNDS
+]);
+const ACCEPT_CHANNEL2_TLV_TYPES = new Set<bigint>([
+	TLV_UPFRONT_SHUTDOWN_SCRIPT,
+	TLV_CHANNEL_TYPE,
+	TLV_WILL_FUND
+]);
 
 /** Buyer's lease request, carried in open_channel2 (bLIP-0051). */
 export interface IRequestFunds {
@@ -325,7 +340,11 @@ export function decodeOpenChannel2Message(
 
 	// Parse TLV
 	if (offset < payload.length) {
-		const { records } = decodeTlvStream(payload, offset);
+		const { records } = decodeTlvStream(
+			payload,
+			offset,
+			OPEN_CHANNEL2_TLV_TYPES
+		);
 		for (const record of records) {
 			if (record.type === TLV_CHANNEL_TYPE) {
 				result.channelType = record.value;
@@ -473,7 +492,11 @@ export function decodeAcceptChannel2Message(
 	};
 
 	if (offset < payload.length) {
-		const { records } = decodeTlvStream(payload, offset);
+		const { records } = decodeTlvStream(
+			payload,
+			offset,
+			ACCEPT_CHANNEL2_TLV_TYPES
+		);
 		for (const record of records) {
 			if (record.type === TLV_CHANNEL_TYPE) {
 				result.channelType = record.value;
