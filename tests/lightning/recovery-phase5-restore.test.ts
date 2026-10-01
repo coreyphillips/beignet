@@ -971,6 +971,112 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
+	it('keeps an attempt a member left out of the configured guardians may hold', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		// Issue #1255. As in #1227, G1 accepts the acquisition and G2 moves
+		// past the guard, but the resume configures only G2 and G3. G1 is
+		// still a committed member, so its possible grant still counts.
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const clients = served.map((s) => s.client);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		const guard = (await clients[0].getHead(ROOT.recoveryId))
+			.state as GuardianState;
+		const expectedDump = dumpTables(live.storage);
+
+		const acquireLost = (index: number): IBoundGuardianClient => ({
+			expectedGuardianId: served[index].id,
+			client: new GuardianClient({
+				url: served[index].client.url,
+				guardianSetId: SET_ID,
+				transport: async (
+					url,
+					init
+				): Promise<{ status: number; body: Buffer }> => {
+					if (url.endsWith('/acquire_epoch')) {
+						throw new GuardianTransportError('acquire lost in transit');
+					}
+					return nodeGuardianTransport()(url, init);
+				}
+			})
+		});
+		const target = openStorage();
+		try {
+			await driverFor(target, [
+				{ expectedGuardianId: served[0].id, client: clients[0] },
+				acquireLost(1),
+				acquireLost(2)
+			]).restore();
+			expect.fail('the takeover cannot complete against one guardian');
+		} catch (error) {
+			expect((error as RestoreRefusedError).reason).to.equal('cas-exhausted');
+		}
+		const pending = JSON.parse(
+			target.getRecoveryMeta!(RESTORE_META_KEYS.pendingAcquisition) as string
+		) as { newEpoch: string; writerPublicKey: string };
+		const epoch = BigInt(pending.newEpoch);
+		expect(epoch).to.equal(guard.lease.epoch + 1n);
+
+		live.manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, 78).toString('hex'),
+					preimage: Buffer.alloc(32, 78)
+				}
+			],
+			outboundMessages: []
+		});
+		const all = live.storage.loadRecoveryFrames();
+		expect(
+			(await clients[1].putState(rep.signRecord(all[all.length - 1], lease)))
+				.status
+		).to.equal(GuardianStatus.OK);
+
+		const events: IRestoreEvent[] = [];
+		try {
+			await driverFor(target, bind(served.slice(1)), events).restore();
+			expect.fail('the attempt G1 may hold must not be abandoned');
+		} catch (error) {
+			expect((error as RestoreRefusedError).reason).to.equal('cas-exhausted');
+		}
+		expect(events.some((e) => e.type === 'epoch:abandoned')).to.equal(false);
+		const kept = JSON.parse(
+			target.getRecoveryMeta!(RESTORE_META_KEYS.pendingAcquisition) as string
+		) as { newEpoch: string; writerPublicKey: string };
+		expect(kept).to.deep.equal(pending);
+		for (const client of clients) {
+			const head = await client.getHead(ROOT.recoveryId);
+			for (const cert of head.certificates ?? []) {
+				if (cert.newEpoch !== epoch) continue;
+				expect(cert.newWriterPublicKey.toString('hex')).to.equal(
+					pending.writerPublicKey
+				);
+			}
+		}
+
+		// With G1 configured again the attempt completes over its guard.
+		const result = await driverFor(target, bind(served)).restore();
+		expect(result.lease.epoch).to.equal(epoch);
+		expect(result.lease.writerPublicKey.toString('hex')).to.equal(
+			pending.writerPublicKey
+		);
+		expect(result.certifiedState.logHead.sequence).to.equal(
+			guard.logHead.sequence
+		);
+		expect(dumpTables(target)).to.equal(expectedDump);
+
+		await shutdown(served);
+		live.storage.close();
+		target.close();
+	});
+
 	it('repairs a guardian that missed the takeover and discards its superseded tail', async function (): Promise<void> {
 		// Real guardians over real TCP: the default 2s is not enough under
 		// full-suite load, and a load-sensitive timeout is a flaky test.
