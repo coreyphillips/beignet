@@ -20,6 +20,7 @@ import { decodeTlvStream, encodeTlvStream, ITlvRecord } from './tlv';
 
 /** Well-known TLV types in init message */
 const INIT_TLV_NETWORKS = 1n;
+const INIT_TLV_TYPES = new Set<bigint>([INIT_TLV_NETWORKS]);
 
 export interface IInitMessage {
 	features: FeatureFlags;
@@ -110,7 +111,7 @@ export function decodeInitMessage(payload: Buffer): IInitMessage {
 
 	// Parse TLV records if there's remaining data
 	if (offset < payload.length) {
-		const { records } = decodeTlvStream(payload, offset);
+		const { records } = decodeTlvStream(payload, offset, INIT_TLV_TYPES);
 		for (const record of records) {
 			if (record.type === INIT_TLV_NETWORKS) {
 				const networks: Buffer[] = [];

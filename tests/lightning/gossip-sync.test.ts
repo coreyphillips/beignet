@@ -646,6 +646,115 @@ describe('Gossip Sync (Phase 5)', function () {
 		});
 	});
 
+	describe('GossipSyncManager — unsolicited and oversized range replies (issue #1023)', function () {
+		const MAX_RANGE_REPLY_SCIDS = 200_000;
+
+		function rangeReply(
+			scids: Buffer[],
+			syncComplete: boolean,
+			chainHash = BITCOIN_CHAIN_HASH
+		): {
+			chainHash: Buffer;
+			firstBlocknum: number;
+			numberOfBlocks: number;
+			syncComplete: boolean;
+			encodedShortIds: Buffer;
+		} {
+			return {
+				chainHash,
+				firstBlocknum: 0,
+				numberOfBlocks: 0xffffffff,
+				syncComplete,
+				encodedShortIds: encodeShortChannelIds(scids)
+			};
+		}
+
+		function uniqueScids(start: number, count: number): Buffer[] {
+			const scids: Buffer[] = [];
+			for (let i = start; i < start + count; i++) {
+				scids.push(makeScid(100_000 + Math.floor(i / 1000), i % 1000, 0));
+			}
+			return scids;
+		}
+
+		it('ignores a reply when no range query is outstanding', function () {
+			const mgr = new GossipSyncManager(new NetworkGraph());
+			const scids = [makeScid(100, 1, 0), makeScid(200, 2, 0)];
+
+			expect(mgr.handleReplyChannelRange(rangeReply(scids, false))).to.eql([]);
+			expect(mgr.handleReplyChannelRange(rangeReply(scids, true))).to.eql([]);
+			expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+		});
+
+		it('ignores a reply after the final range reply', function () {
+			const mgr = new GossipSyncManager(new NetworkGraph());
+			mgr.initiateSync();
+			mgr.handleReplyChannelRange(rangeReply([makeScid(100, 1, 0)], true));
+			expect(mgr.getState()).to.equal(GossipSyncState.AWAITING_SCID_REPLY);
+
+			const late = mgr.handleReplyChannelRange(
+				rangeReply([makeScid(200, 2, 0)], true)
+			);
+			expect(late).to.eql([]);
+			expect(mgr.getState()).to.equal(GossipSyncState.AWAITING_SCID_REPLY);
+		});
+
+		it('ignores a reply for another chain', function () {
+			const mgr = new GossipSyncManager(new NetworkGraph());
+			mgr.initiateSync();
+
+			const out = mgr.handleReplyChannelRange(
+				rangeReply([makeScid(100, 1, 0)], true, REGTEST_CHAIN_HASH)
+			);
+			expect(out).to.eql([]);
+			expect(mgr.getState()).to.equal(GossipSyncState.AWAITING_RANGE_REPLY);
+		});
+
+		it('abandons the sync once the peer offers too many SCIDs', function () {
+			const mgr = new GossipSyncManager(new NetworkGraph());
+			mgr.initiateSync();
+
+			let sent = 0;
+			while (sent <= MAX_RANGE_REPLY_SCIDS) {
+				expect(mgr.getState()).to.equal(GossipSyncState.AWAITING_RANGE_REPLY);
+				mgr.handleReplyChannelRange(rangeReply(uniqueScids(sent, 8000), false));
+				sent += 8000;
+			}
+			expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+
+			// The rest of the stream, final reply included, is ignored.
+			const out = mgr.handleReplyChannelRange(
+				rangeReply(uniqueScids(sent, 10), true)
+			);
+			expect(out).to.eql([]);
+			expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+		});
+
+		it('queries a re-sent SCID once', function () {
+			const mgr = new GossipSyncManager(new NetworkGraph());
+			mgr.initiateSync();
+
+			const chunk = uniqueScids(0, 8000);
+			for (let i = 0; i < 3; i++) {
+				mgr.handleReplyChannelRange(rangeReply(chunk, false));
+			}
+			expect(mgr.getState()).to.equal(GossipSyncState.AWAITING_RANGE_REPLY);
+
+			const out = mgr.handleReplyChannelRange(rangeReply([], true));
+			expect(out.length).to.equal(1);
+			const query = decodeQueryShortChannelIdsMessage(out[0].payload);
+			expect(decodeShortChannelIds(query.encodedShortIds).length).to.equal(
+				8000
+			);
+			// One query batch in total: the duplicates were never queued.
+			mgr.handleReplyShortChannelIdsEnd({
+				chainHash: BITCOIN_CHAIN_HASH,
+				complete: true
+			});
+			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
+		});
+	});
+
 	describe('GossipSyncManager — Responding Side', function () {
 		it('should respond to query_channel_range with matching channels', function () {
 			const graph = new NetworkGraph();
@@ -1237,7 +1346,7 @@ describe('Gossip Sync (Phase 5)', function () {
 			).to.equal(1);
 		});
 
-		it('lets a deferred announcement take over only a signatureless slot with matching endpoints', function () {
+		it('lets a deferred announcement take over a signatureless slot only with matching endpoints', function () {
 			const graph = new NetworkGraph();
 			const scid = makeScid(104, 1, 0);
 			const keys = makeSignedChannelKeys();
@@ -1294,6 +1403,40 @@ describe('Gossip Sync (Phase 5)', function () {
 				graph.addChannelAnnouncement(verified.msg, { verified: 'deferred' })
 			).to.be.false;
 			expect(graph.getChannel(verifiedScid)!.announcementVerified).to.be.true;
+		});
+
+		it('lets a genuine deferred announcement replace a forged upgrade that failed verification (issue #1106)', function () {
+			const graph = new NetworkGraph();
+			const scid = makeScid(104, 4, 0);
+			const genuine = makeSignedChannelAnnouncement(
+				scid,
+				makeSignedChannelKeys()
+			);
+			graph.addChannelAnnouncement(zeroSigAnnouncement(genuine.msg));
+
+			// Same endpoints, random signatures: takes the RGS slot as deferred.
+			const forged = makeChannelAnnouncement(
+				scid,
+				genuine.msg.nodeId1,
+				genuine.msg.nodeId2
+			);
+			expect(graph.addChannelAnnouncement(forged, { verified: 'deferred' })).to
+				.be.true;
+			expect(graph.getVerifiedChannelAnnouncement(scid)).to.equal(undefined);
+			expect(graph.getChannel(scid)!.announcementVerified).to.be.false;
+
+			// Replaying the failed message changes nothing, so it refuses.
+			expect(graph.addChannelAnnouncement(forged, { verified: 'deferred' })).to
+				.be.false;
+
+			expect(
+				graph.addChannelAnnouncement(genuine.msg, { verified: 'deferred' })
+			).to.be.true;
+			expect(graph.getChannel(scid)!.announcementVerifyDeferred).to.equal(true);
+			const resolved = graph.getVerifiedChannelAnnouncement(scid);
+			expect(resolved).to.not.equal(undefined);
+			expect(resolved!.nodeSignature1.equals(genuine.msg.nodeSignature1)).to.be
+				.true;
 		});
 
 		it('lets a deferred update bypass freshness only over a signatureless slot', function () {
@@ -1668,6 +1811,45 @@ describe('Gossip Sync (Phase 5)', function () {
 			// Should respond with reply_channel_range
 			expect(outbound.length).to.equal(1);
 			expect(outbound[0].type).to.equal(MessageType.REPLY_CHANNEL_RANGE);
+			node.destroy();
+		});
+
+		it('ignores reply_channel_range from a peer we never queried (issue #1023)', function () {
+			const node = makeNode();
+			const outbound: number[] = [];
+			node.on('message:outbound', (_pubkey: string, type: number) => {
+				outbound.push(type);
+			});
+			const peerPubkey = 'aa'.repeat(33);
+
+			// A query from the peer is what gives it a sync manager on our side.
+			node.handlePeerMessage(
+				peerPubkey,
+				MessageType.QUERY_CHANNEL_RANGE,
+				encodeQueryChannelRangeMessage({
+					chainHash: REGTEST_CHAIN_HASH,
+					firstBlocknum: 0,
+					numberOfBlocks: 0xffffffff
+				})
+			);
+			outbound.length = 0;
+
+			node.handlePeerMessage(
+				peerPubkey,
+				MessageType.REPLY_CHANNEL_RANGE,
+				encodeReplyChannelRangeMessage({
+					chainHash: REGTEST_CHAIN_HASH,
+					firstBlocknum: 0,
+					numberOfBlocks: 0xffffffff,
+					syncComplete: true,
+					encodedShortIds: encodeShortChannelIds([makeScid(100, 1, 0)])
+				})
+			);
+
+			expect(outbound).to.eql([]);
+			expect(node.getGossipSyncState(peerPubkey)).to.equal(
+				GossipSyncState.IDLE
+			);
 			node.destroy();
 		});
 

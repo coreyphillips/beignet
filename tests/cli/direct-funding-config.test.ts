@@ -25,6 +25,7 @@ import { AddressInfo } from 'net';
 import { resolveConfig } from '../../src/cli/config';
 import { startDaemon, statusForErrorCode } from '../../src/cli/daemon';
 import { BeignetError } from '../../src/cli/errors';
+import { getOpenApiSpec } from '../../src/cli/openapi';
 import {
 	decodeRequestEnvelope,
 	requestFromBip21,
@@ -80,6 +81,20 @@ function httpCall(
 
 const errorOf = (json: Record<string, unknown>): { code: string } =>
 	json.error as { code: string };
+
+/** What the spec says /direct-funding/send answers with this status. */
+function documentedSendResponse(status: number): string {
+	const spec = getOpenApiSpec() as unknown as {
+		paths: Record<
+			string,
+			{ post: { responses: Record<string, { description?: string }> } }
+		>;
+	};
+	return (
+		spec.paths['/direct-funding/send'].post.responses[String(status)]
+			?.description ?? ''
+	);
+}
 
 describe('resolveConfig direct funding', () => {
 	afterEach(() => {
@@ -526,13 +541,15 @@ describe('direct funding under the node-wide payment gates', function () {
 		const request = await mintedRequest();
 		daemon.node.setDraining(true);
 		try {
-			const { json } = await call('POST', '/direct-funding/send', {
+			const { json, status } = await call('POST', '/direct-funding/send', {
 				request,
 				amountSats: 50_000
 			});
 			// /stop closes storage and networking once the drain poll comes back
 			// empty, and this exchange would still have been running inside it.
 			expect(errorOf(json).code).to.equal('SERVICE_DRAINING');
+			expect(status).to.equal(409);
+			expect(documentedSendResponse(status)).to.include('SERVICE_DRAINING');
 		} finally {
 			daemon.node.setDraining(false);
 		}
@@ -540,13 +557,17 @@ describe('direct funding under the node-wide payment gates', function () {
 
 	it('counts a direct-funding send against the daily spend limit', async () => {
 		const request = await mintedRequest();
-		const { json } = await call('POST', '/direct-funding/send', {
+		const { json, status } = await call('POST', '/direct-funding/send', {
 			request,
 			amountSats: 50_000
 		});
 		// The receiver is a stranger's channel: the money leaves, exactly as it
 		// does on an address-targeted splice-out.
 		expect(errorOf(json).code).to.equal('SPENDING_LIMIT_EXCEEDED');
+		expect(status).to.equal(403);
+		expect(documentedSendResponse(status)).to.include(
+			'SPENDING_LIMIT_EXCEEDED'
+		);
 	});
 
 	it('is quiet about the amount a fixed-amount request names', async () => {

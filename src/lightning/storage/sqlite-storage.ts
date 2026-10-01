@@ -6,6 +6,7 @@
  */
 
 import Database from 'better-sqlite3';
+import * as fs from 'fs';
 import {
 	IStorageBackend,
 	IInvoiceInfo,
@@ -43,6 +44,25 @@ import {
 	StorageEncryptedError
 } from './encryption';
 
+/** Owner read/write only: the mode for a file holding this wallet's data. */
+const OWNER_ONLY_FILE_MODE = 0o600;
+
+/**
+ * chmod `filePath` to 0600 when it exists and any group/other bit is set.
+ * Never throws: a missing sidecar and a filesystem that refuses chmod both
+ * leave the file as it is.
+ */
+function restrictFileMode(filePath: string): void {
+	try {
+		const current = fs.statSync(filePath).mode & 0o777;
+		if ((current & ~OWNER_ONLY_FILE_MODE) !== 0) {
+			fs.chmodSync(filePath, OWNER_ONLY_FILE_MODE);
+		}
+	} catch {
+		// Missing sidecar, or a filesystem without permission bits.
+	}
+}
+
 export class SqliteStorage implements IStorageBackend {
 	private db: Database.Database;
 	private readonly dbPath: string;
@@ -70,6 +90,29 @@ export class SqliteStorage implements IStorageBackend {
 		this.dbPath = dbPath;
 		this.onCorruptRow = onCorruptRow;
 		this.encryptionKey = opts?.encryptionKey;
+		// Before open() switches on WAL: SQLite creates the -wal and -shm
+		// sidecars with the database file's own bits, so tightening the main
+		// file first covers them from the start.
+		this._restrictFileModes();
+	}
+
+	/**
+	 * Owner-only permissions on the database file and its WAL/shm sidecars
+	 * (issue #1004). Values are encrypted at rest, but the lookup columns
+	 * (payment hashes, channel ids, peer pubkeys, gossip, the action log) are
+	 * plaintext, and better-sqlite3 creates the file under the process umask,
+	 * 0644 on a typical host. Only a file looser than 0600 is touched, so a
+	 * deliberately read-only database stays read-only. Best effort: a chmod
+	 * refused by a read-only or foreign filesystem must not stop the node,
+	 * and this class has no logger to warn through; the CLI's umask and the
+	 * data-directory check in BeignetNode carry the operator-facing signal.
+	 * POSIX bits mean nothing on Windows, so nothing is done there.
+	 */
+	private _restrictFileModes(): void {
+		if (this.dbPath === ':memory:' || process.platform === 'win32') return;
+		for (const suffix of ['', '-wal', '-shm']) {
+			restrictFileMode(`${this.dbPath}${suffix}`);
+		}
 	}
 
 	/**
@@ -142,6 +185,8 @@ export class SqliteStorage implements IStorageBackend {
 		if (this.encryptionKey) {
 			this._encryptExistingData();
 		}
+		// The sidecars exist now; any left by an older release are tightened.
+		this._restrictFileModes();
 	}
 
 	/**
@@ -161,6 +206,9 @@ export class SqliteStorage implements IStorageBackend {
 	 */
 	async backup(destPath: string): Promise<void> {
 		await this.db.backup(destPath);
+		// A backup is a copy of this database, plaintext lookup columns
+		// included, created by SQLite under the process umask (issue #1004).
+		if (process.platform !== 'win32') restrictFileMode(destPath);
 	}
 
 	// ─── Schema ───

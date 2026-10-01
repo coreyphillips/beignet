@@ -325,6 +325,42 @@ export class SwapChainResolver {
 		};
 	}
 
+	/**
+	 * The txid of another transaction, confirmed to the resolution depth,
+	 * that spends one of `tx`'s inputs: proof `tx` can never confirm. An
+	 * answer of undefined proves nothing, since the backend may simply not
+	 * have shown the conflict.
+	 */
+	async conflictingSpend(tx: bitcoin.Transaction): Promise<string | undefined> {
+		const txid = tx.getId();
+		const height = this.source.currentHeight();
+		for (const input of tx.ins) {
+			const parent = await this.fetch(
+				Buffer.from(input.hash).reverse().toString('hex')
+			);
+			const spent = parent.outs[input.index];
+			if (!spent) continue;
+			const history = await this.source.getScriptHashHistory(
+				computeScriptHash(spent.script)
+			);
+			for (const entry of history) {
+				if (entry.txid === txid || entry.height <= 0) continue;
+				if (height - entry.height + 1 < this.policy.resolutionConfirmations) {
+					continue;
+				}
+				const other = await this.fetch(entry.txid);
+				if (
+					other.ins.some(
+						(i) => i.hash.equals(input.hash) && i.index === input.index
+					)
+				) {
+					return entry.txid;
+				}
+			}
+		}
+		return undefined;
+	}
+
 	/** Fetch by txid and refuse bytes that do not hash to it. */
 	private async fetch(txid: string): Promise<bitcoin.Transaction> {
 		const cached = this.txCache.get(txid);

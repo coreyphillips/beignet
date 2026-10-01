@@ -32,7 +32,7 @@ import {
 	serializeChannelState
 } from '../../src/lightning/storage/serialization';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { INodeConfig } from '../../src/lightning/node/types';
+import { ILightningError, INodeConfig } from '../../src/lightning/node/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Network } from '../../src/lightning/invoice/types';
@@ -137,6 +137,36 @@ const complete = (channel: Channel): void =>
 
 const display = (b: Buffer): string => Buffer.from(b).reverse().toString('hex');
 
+const hexOf = (list: Buffer[] | undefined): string[] | undefined =>
+	list?.map((b) => b.toString('hex'));
+
+/** A fully signed in-flight record at its point of no return for `spliceTx`. */
+function inflightFor(
+	spliceTx: bitcoin.Transaction
+): NonNullable<ReturnType<Channel['getFullState']>['spliceInFlight']> {
+	return {
+		spliceTxid: Buffer.from(spliceTx.getHash()),
+		newFundingOutputIndex: 0,
+		newFundingSatoshis: 999_000n,
+		spliceTxHex: spliceTx.toHex(),
+		fullySigned: true,
+		isInitiator: true,
+		localRelativeSatoshis: 0n,
+		remoteRelativeSatoshis: 0n,
+		remoteFundingPubkey: makeBasepoints(Buffer.alloc(32, 9)).fundingPubkey,
+		ourSharedInputSig: Buffer.alloc(64),
+		ourWalletWitnesses: [],
+		ourWalletInputIndices: [],
+		inputPrevouts: [],
+		remoteCommitmentSig: crypto.randomBytes(64),
+		sentTxSignatures: true,
+		receivedTxSignatures: true,
+		localSpliceLocked: false,
+		remoteSpliceLocked: false,
+		confirmed: false
+	};
+}
+
 describe('Zero-conf splice broadcast obligation (issue #756)', () => {
 	it('adoption at zero confirmations keeps the signed tx, and the rebroadcast builder still finds it', () => {
 		const { channel, spliceTx, spliceTxid } = splicingChannel({
@@ -225,12 +255,59 @@ describe('Zero-conf splice broadcast obligation (issue #756)', () => {
 			[]
 		);
 	});
+
+	// Issue #1060: the funding a splice retires stays on the channel, so a
+	// wallet that sees that outpoint spent still knows whose it was.
+	it('adoption records the retired funding, and a second splice appends to it', () => {
+		const { channel, spliceTxid } = splicingChannel({ zeroConf: true });
+		const original = channel.getFullState().fundingTxid!.toString('hex');
+		expect(channel.getFullState().previousFundingTxids).to.equal(undefined);
+		complete(channel);
+		const once = channel.getFullState();
+		expect(once.fundingTxid!.equals(spliceTxid)).to.equal(true);
+		expect(hexOf(once.previousFundingTxids)).to.deep.equal([original]);
+
+		// A second splice on the new funding: exactly one more entry, oldest
+		// first, and the current funding is never in the list.
+		const second = spliceTxFor(once.fundingTxid!);
+		once.spliceInFlight = inflightFor(second);
+		complete(channel);
+		const twice = channel.getFullState();
+		expect(twice.fundingTxid!.equals(second.getHash())).to.equal(true);
+		expect(hexOf(twice.previousFundingTxids)).to.deep.equal([
+			original,
+			spliceTxid.toString('hex')
+		]);
+	});
+
+	it('the retired fundings round-trip through the serialized state; an older row reads as none', () => {
+		const { channel } = splicingChannel({ zeroConf: true });
+		const original = channel.getFullState().fundingTxid!.toString('hex');
+		complete(channel);
+		const restored = deserializeChannelState(
+			JSON.parse(JSON.stringify(serializeChannelState(channel.getFullState())))
+		);
+		expect(hexOf(restored.previousFundingTxids)).to.deep.equal([original]);
+		expect(Buffer.isBuffer(restored.previousFundingTxids![0])).to.equal(true);
+		// A row written before the field existed carries no list.
+		const legacy = serializeChannelState(channel.getFullState());
+		delete (legacy as { previousFundingTxids?: unknown }).previousFundingTxids;
+		expect(deserializeChannelState(legacy).previousFundingTxids).to.equal(
+			undefined
+		);
+		// A never-spliced channel writes no list either.
+		const fresh = splicingChannel({ zeroConf: true }).channel;
+		expect(
+			JSON.parse(JSON.stringify(serializeChannelState(fresh.getFullState())))
+		).to.not.have.property('previousFundingTxids');
+	});
 });
 
 /** A backend that records broadcasts and can be told to refuse them. */
 class ControlledBackend implements IChainBackend {
 	broadcasts: string[] = [];
 	failBroadcasts = false;
+	failReason = 'bad-txns-inputs-missingorspent';
 	async subscribeToHeaders(): Promise<void> {}
 	async subscribeToScriptHash(): Promise<void> {}
 	async getScriptHashHistory(): Promise<
@@ -242,7 +319,7 @@ class ControlledBackend implements IChainBackend {
 		throw new Error('not needed');
 	}
 	async broadcastTransaction(hex: string): Promise<string> {
-		if (this.failBroadcasts) throw new Error('bad-txns-inputs-missingorspent');
+		if (this.failBroadcasts) throw new Error(this.failReason);
 		this.broadcasts.push(hex);
 		return bitcoin.Transaction.fromHex(hex).getId();
 	}
@@ -297,6 +374,8 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 		channelId: Buffer;
 		backend: ControlledBackend;
 		spliceTx: bitcoin.Transaction;
+		/** The funding the grafted splice retired, internal byte order. */
+		originalFundingTxid: Buffer;
 		destroy: () => void;
 	}> {
 		const backend = new ControlledBackend();
@@ -361,6 +440,7 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 			remoteSpliceLocked: false,
 			confirmed: false
 		};
+		const originalFundingTxid = Buffer.from(raw.fundingTxid!);
 		complete(ch);
 		expect(ch.getFullState().spliceInFlight).to.equal(null);
 		return {
@@ -369,6 +449,7 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 			channelId,
 			backend,
 			spliceTx,
+			originalFundingTxid,
 			destroy: (): void => {
 				alice.destroy();
 				bob.destroy();
@@ -431,6 +512,154 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 			.getChainWatcher()!
 			.emit('broadcast:permanent_failure', new Error('retries exhausted'));
 		expect(errors.map((e) => e.code)).to.include('BROADCAST_PERMANENT_FAILURE');
+		fx.destroy();
+	});
+
+	// Issue #1060: the channel listing has to tell the wallet which
+	// transactions are this channel's, before the lock (pendingSpliceTxid)
+	// and after it (previousFundingTxids), display order like fundingTxid.
+	it('listChannels reports the retired funding after adoption and the in-flight splice txid before it', async () => {
+		const fx = await setup(7567);
+		const listed = (): ReturnType<LightningNode['listChannels']>[number] =>
+			fx.alice.listChannels().find((c) => c.channelId.equals(fx.channelId))!;
+		const after = listed();
+		expect(after.fundingTxid).to.equal(fx.spliceTx.getId());
+		expect(after.previousFundingTxids).to.deep.equal([
+			display(fx.originalFundingTxid)
+		]);
+		expect(after.pendingSpliceLocalBalanceMsat).to.equal(undefined);
+		expect(after).to.not.have.property('pendingSpliceTxid');
+
+		// A second splice at its point of no return: the txid is present
+		// exactly when the pending balance is, and the list is untouched
+		// until this one is adopted too.
+		const raw = fx.alice
+			.getChannelManager()
+			.getChannel(fx.channelId)!
+			.getFullState();
+		const second = spliceTxFor(raw.fundingTxid!);
+		raw.spliceInFlight = inflightFor(second);
+		const mid = listed();
+		expect(mid.pendingSpliceLocalBalanceMsat).to.not.equal(undefined);
+		expect(mid.pendingSpliceTxid).to.equal(second.getId());
+		expect(mid.previousFundingTxids).to.deep.equal([
+			display(fx.originalFundingTxid)
+		]);
+		fx.destroy();
+	});
+
+	// Issue #1062: the watcher giving up on a splice the node still re-sends
+	// every block is not the end of the attempt, and the report says which
+	// transaction, whose channel, and that the node is still on it.
+	it('a permanent failure for an adopted but unconfirmed splice names the txid and channel, retained', async () => {
+		const fx = await setup(7569);
+		const errors: ILightningError[] = [];
+		fx.alice.on('node:error', (e: ILightningError) => errors.push(e));
+		const txid = fx.spliceTx.getId();
+		fx.alice
+			.getChainWatcher()!
+			.emit(
+				'broadcast:permanent_failure',
+				new Error(`Broadcast permanently failed after 12 retries: ${txid}`),
+				txid
+			);
+		const err = errors.find((e) => e.code === 'BROADCAST_PERMANENT_FAILURE')!;
+		expect(err.txid).to.equal(txid);
+		expect(err.channelId!.equals(fx.channelId)).to.equal(true);
+		expect(err.retained).to.equal(true);
+		expect(err.message).to.match(/rebroadcasts it on every block/);
+		fx.destroy();
+	});
+
+	it('a permanent failure for a fully signed in-flight splice is retained; an unsigned record names the channel only', async () => {
+		const fx = await setup(7571);
+		const errors: ILightningError[] = [];
+		fx.alice.on('node:error', (e: ILightningError) => errors.push(e));
+		const raw = fx.alice
+			.getChannelManager()
+			.getChannel(fx.channelId)!
+			.getFullState();
+		const second = spliceTxFor(raw.fundingTxid!);
+		raw.spliceInFlight = inflightFor(second);
+		const watcher = fx.alice.getChainWatcher()!;
+		watcher.emit(
+			'broadcast:permanent_failure',
+			new Error('retries exhausted'),
+			second.getId()
+		);
+		const signed = errors.find(
+			(e) => e.code === 'BROADCAST_PERMANENT_FAILURE'
+		)!;
+		expect(signed.txid).to.equal(second.getId());
+		expect(signed.channelId!.equals(fx.channelId)).to.equal(true);
+		expect(signed.retained).to.equal(true);
+		// Not fully signed: the per-block driver does not owe it, so nothing
+		// re-sends it, but it is still this channel's transaction.
+		raw.spliceInFlight.fullySigned = false;
+		errors.length = 0;
+		watcher.emit(
+			'broadcast:permanent_failure',
+			new Error('retries exhausted'),
+			second.getId()
+		);
+		const unsigned = errors.find(
+			(e) => e.code === 'BROADCAST_PERMANENT_FAILURE'
+		)!;
+		expect(unsigned.channelId!.equals(fx.channelId)).to.equal(true);
+		expect(unsigned.retained).to.equal(false);
+		expect(unsigned.message).to.not.match(/rebroadcasts it on every block/);
+		fx.destroy();
+	});
+
+	it('a refused rebroadcast raises SPLICE_BROADCAST_REFUSED once per txid and reason, with the backend message', async () => {
+		const fx = await setup(7573);
+		const errors: ILightningError[] = [];
+		fx.alice.on('node:error', (e: ILightningError) => errors.push(e));
+		const logs: Array<{ action: string; data: Record<string, unknown> }> = [];
+		fx.alice.on('log', (l: { action: string; data: Record<string, unknown> }) =>
+			logs.push(l)
+		);
+		const refused = (): ILightningError[] =>
+			errors.filter((e) => e.code === 'SPLICE_BROADCAST_REFUSED');
+		// The barrier answered for this splice in this process, so the
+		// per-block driver re-sends straight at the backend.
+		(
+			fx.alice as unknown as { authorizedSpliceBroadcasts: Set<string> }
+		).authorizedSpliceBroadcasts.add(fx.channelId.toString('hex'));
+		fx.backend.failBroadcasts = true;
+		fx.alice.handleNewBlock(150);
+		await tick();
+		expect(refused()).to.have.length(1);
+		const first = refused()[0];
+		expect(first.txid).to.equal(fx.spliceTx.getId());
+		expect(first.channelId!.equals(fx.channelId)).to.equal(true);
+		expect(first.retained).to.equal(true);
+		expect(first.message).to.include('bad-txns-inputs-missingorspent');
+		expect(first.message).to.match(/rebroadcasts it on every block/);
+		// The log line carries the backend's reason too, not just the channel.
+		const logged = logs.find((l) => l.action === 'splice_rebroadcast_failed')!;
+		expect(logged.data.error).to.equal('bad-txns-inputs-missingorspent');
+		expect(logged.data.channelId).to.equal(fx.channelId.toString('hex'));
+		// The same refusal on the next block: the log repeats, the error
+		// does not.
+		fx.alice.handleNewBlock(151);
+		await tick();
+		expect(refused()).to.have.length(1);
+		expect(
+			logs.filter((l) => l.action === 'splice_rebroadcast_failed')
+		).to.have.length(2);
+		// A different reason is a different report.
+		fx.backend.failReason = 'min relay fee not met';
+		fx.alice.handleNewBlock(152);
+		await tick();
+		expect(refused()).to.have.length(2);
+		expect(refused()[1].message).to.include('min relay fee not met');
+		// The network already having the transaction is the outcome wanted,
+		// never a refusal.
+		fx.backend.failReason = 'txn-already-in-mempool';
+		fx.alice.handleNewBlock(153);
+		await tick();
+		expect(refused()).to.have.length(2);
 		fx.destroy();
 	});
 });

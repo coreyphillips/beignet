@@ -1,7 +1,12 @@
 import * as http from 'http';
 import * as crypto from 'crypto';
 import { expect } from 'chai';
-import { WebhookManager } from '../../src/cli/webhooks';
+import {
+	IWebhookStorage,
+	WebhookManager,
+	webhookTargetRefusal
+} from '../../src/cli/webhooks';
+import { BeignetError } from '../../src/cli/errors';
 
 interface ReceivedRequest {
 	body: Record<string, unknown>;
@@ -369,5 +374,126 @@ describe('WebhookManager', () => {
 				expect(receivedRequests).to.have.length(1);
 			});
 		}
+	});
+
+	describe('delivery targets and payloads (issue #1045)', () => {
+		it('register() refuses a url that is not http or https', () => {
+			for (const url of ['file:///etc/passwd', 'ftp://example.com/x', 'nope']) {
+				expect(() => manager.register(url, ['*']), url)
+					.to.throw(BeignetError)
+					.with.property('code', 'INVALID_PARAMS');
+			}
+			expect(manager.size).to.equal(0);
+		});
+
+		it('webhookTargetRefusal refuses private hosts unless allowed', () => {
+			for (const url of [
+				'http://127.0.0.1:8080/hook',
+				'http://localhost/hook',
+				'http://169.254.169.254/latest',
+				'http://10.1.2.3/hook',
+				'http://[::1]/hook'
+			]) {
+				expect(webhookTargetRefusal(url, false)?.code, url).to.equal(
+					'PRIVATE_NETWORK_REFUSED'
+				);
+				expect(webhookTargetRefusal(url, true), url).to.equal(null);
+			}
+			expect(
+				webhookTargetRefusal('https://hooks.example.com/x', false)
+			).to.equal(null);
+			expect(webhookTargetRefusal('file:///etc/passwd', true)?.code).to.equal(
+				'INVALID_PARAMS'
+			);
+		});
+
+		it('dispatch() leaves the preimage out of the payload', async () => {
+			manager.register(`http://127.0.0.1:${serverPort}/hook`, ['*']);
+			manager.dispatch('payment:sent', {
+				paymentHash: 'ab'.repeat(32),
+				preimage: 'cd'.repeat(32),
+				amountSats: 10
+			});
+			await waitForRequests(1);
+			expect(receivedRequests[0].payload).to.not.include('cd'.repeat(32));
+			expect(receivedRequests[0].body.data).to.deep.equal({
+				paymentHash: 'ab'.repeat(32),
+				amountSats: 10
+			});
+		});
+
+		it('a secret kept by the storage still signs after a restart', async () => {
+			const rows = new Map<
+				string,
+				{
+					id: string;
+					url: string;
+					events: string[];
+					secretHash?: string;
+					createdAt: number;
+				}
+			>();
+			let secrets: Record<string, string> | null = null;
+			const storage: IWebhookStorage = {
+				saveWebhook: (id, url, events, secretHash, createdAt) =>
+					rows.set(id, { id, url, events, secretHash, createdAt: createdAt! }),
+				deleteWebhook: (id) => rows.delete(id),
+				deleteAllWebhooks: () => rows.clear(),
+				loadAllWebhooks: () => [...rows.values()],
+				saveWebhookSecrets: (s) => {
+					secrets = { ...s };
+				},
+				loadWebhookSecrets: () => secrets
+			};
+			const secret = 'restart-secret';
+			const first = new WebhookManager(storage);
+			const kept = first.register(
+				`http://127.0.0.1:${serverPort}/hook`,
+				['*'],
+				secret
+			);
+			const dropped = first.register(
+				`http://127.0.0.1:${serverPort}/other`,
+				['channel:ready'],
+				'other-secret'
+			);
+			first.unregister(dropped.id);
+			expect(secrets).to.deep.equal({ [kept.id]: secret });
+
+			const restarted = new WebhookManager(storage);
+			restarted.dispatch('channel:ready', { channelId: 'abc' });
+			await waitForRequests(1);
+			const expected = crypto
+				.createHmac('sha256', secret)
+				.update(receivedRequests[0].payload)
+				.digest('hex');
+			expect(receivedRequests[0].headers['x-webhook-signature']).to.equal(
+				`sha256=${expected}`
+			);
+			restarted.clear();
+			expect(secrets).to.deep.equal({});
+		});
+
+		it('unreadable secrets cost the signatures, not the registrations', () => {
+			const storage: IWebhookStorage = {
+				saveWebhook: () => undefined,
+				deleteWebhook: () => undefined,
+				deleteAllWebhooks: () => undefined,
+				loadAllWebhooks: () => [
+					{
+						id: 'kept',
+						url: 'https://hooks.example.com/x',
+						events: ['*'],
+						secretHash: 'ab'.repeat(32),
+						createdAt: 1
+					}
+				],
+				loadWebhookSecrets: () => {
+					throw new SyntaxError('Unexpected token');
+				}
+			};
+			const restored = new WebhookManager(storage);
+			expect(restored.list().map((w) => w.id)).to.deep.equal(['kept']);
+		});
 	});
 });

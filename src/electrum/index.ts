@@ -66,12 +66,34 @@ import {
 const DISCONNECTED_ERROR = 'Electrum instance is disconnected.';
 
 /**
+ * The constructor and connectToElectrum both accept one server or a list of
+ * them; every consumer wants the list.
+ */
+function toServerList(servers?: TServer | TServer[]): TServer[] {
+	if (!servers) return [];
+	return Array.isArray(servers) ? servers : [servers];
+}
+
+/**
  * A well formed script hash used only to ask a server whether it is still
  * answering. It addresses nothing; the balance in the reply is discarded. The
  * same value rn-electrum-client uses for its own post-connect probe.
  */
 const LIVENESS_SCRIPT_HASH =
 	'77ca78f9a84b48041ad71f7cc6ff6c33460c25f0cb99f558f9813ed9e63727dd';
+
+/**
+ * Bitcoin Core's "not found" from a node without a txindex, in the current
+ * wording ("... Use -txindex or provide a block hash ...") and the one before
+ * 0.17 ("... Use -txindex to enable ..."), as electrs relays it: unchanged, at
+ * the start of the message (issue #871). Anchored on purpose. The loose prefix
+ * would also match Core's "Blockchain transactions are still in the process
+ * of being indexed", which a node with a txindex gives for every confirmed
+ * transaction until its index is built. And a server that wraps the daemon
+ * error in its own text requires a txindex, so pointed at a node without one
+ * it reports every confirmed transaction as missing.
+ */
+const NO_TXINDEX_MISS = /^No such mempool transaction\. Use -txindex/;
 
 type TScriptHashSubscription = {
 	callbacks: Set<(data: TSubscribedReceive) => void>;
@@ -656,13 +678,12 @@ export class Electrum {
 		servers?: TServer | TServer[];
 		disableRegtestCheck?: boolean;
 	}): Promise<Result<TConnectToElectrumRes>> {
-		let customPeers = servers
-			? Array.isArray(servers)
-				? servers
-				: [servers]
-			: [];
-		// @ts-ignore
-		customPeers = customPeers.length ? customPeers : this?.servers ?? [];
+		// The instance's own servers may be a single object too (#980), so the
+		// fallback is normalized the same way as the argument.
+		const givenPeers = toServerList(servers);
+		const customPeers = givenPeers.length
+			? givenPeers
+			: toServerList(this.servers);
 		const electrumNetwork = getElectrumNetwork(network);
 		if (
 			!disableRegtestCheck &&
@@ -694,6 +715,18 @@ export class Electrum {
 				}
 				lastError = String(startResponse.error);
 				continue;
+			}
+			// disconnect() may have landed during the dial. It released this
+			// instance's hold and withdrew it from the routers, and it does not
+			// wait for the attempt it interrupted, so recording the server now
+			// would put a stopped instance back into connectedServers, where
+			// isOurPeer would keep vouching for the peer on behalf of a wallet
+			// that has stopped, with nothing left to release the entry. The
+			// socket the dial built is taken back down and nothing is recorded:
+			// the candidate did connect, so it is not charged a failure either.
+			if (this._disconnected) {
+				await electrum.stop({ network: electrumNetwork });
+				return err(DISCONNECTED_ERROR);
 			}
 			this.recordServerSuccess(candidate, electrumNetwork);
 			connected = true;
@@ -757,7 +790,13 @@ export class Electrum {
 		// stopped. Take it back down, and announce nothing: disconnect()
 		// publishes nothing itself, and a connected event for a stopped wallet
 		// is a lie its consumers act on.
+		// The hold is released as well. The candidate loop records a server
+		// only after it saw the flag clear, so nothing should be held here
+		// today, but an await that lands between that record and this check
+		// would let disconnect() slip in after the record, and a hold that
+		// outlives disconnect() is released by nobody.
 		if (this._disconnected) {
+			this.holdConnectedServer(null, null);
 			await electrum.stop({ network: electrumNetwork });
 			return err(DISCONNECTED_ERROR);
 		}
@@ -1257,12 +1296,16 @@ export class Electrum {
 	/**
 	 * Queries Electrum to return the available UTXO's and balance of the provided addresses.
 	 * @param {TUnspentAddressScriptHashData} addresses
+	 * @param {boolean} [rejectFailedEntries] Err when the server answers any
+	 * one script hash with an error, instead of counting it as empty.
 	 * @returns {Promise<Result<IGetUtxosResponse>>}
 	 */
 	async listUnspentAddressScriptHashes({
-		addresses
+		addresses,
+		rejectFailedEntries = false
 	}: {
 		addresses: TUnspentAddressScriptHashData;
+		rejectFailedEntries?: boolean;
 	}): Promise<Result<IGetUtxosResponse>> {
 		try {
 			const addressBatches = splitAddresses(addresses, this.batchLimit);
@@ -1282,6 +1325,10 @@ export class Electrum {
 				if (unspentAddressResult.error) {
 					return err(JSON.stringify(unspentAddressResult?.data ?? ''));
 				}
+				const failed =
+					rejectFailedEntries &&
+					unspentAddressResult.data.find((e) => !Array.isArray(e.result));
+				if (failed) return err(JSON.stringify(failed));
 
 				unspentAddressResult.data.forEach(
 					({ data, result: unspentAddresses }) => {
@@ -1744,6 +1791,31 @@ export class Electrum {
 			return false;
 		}
 		return true;
+	}
+
+	/**
+	 * Whether the server relays a node without a txindex saying it has no such
+	 * transaction (issue #871). Such a node searches only its mempool. electrs,
+	 * which needs no txindex, first looks the transaction up in its own index
+	 * and hands the node the block it finds there, so from electrs this answer
+	 * means: in no block electrs has indexed, and not in the mempool.
+	 *
+	 * transactionExists does not read this as a miss, and must not. electrs
+	 * indexes a block after the node has already taken the block's
+	 * transactions out of its mempool, so a transaction mined a moment ago
+	 * gets the same answer until electrs catches up. It is final only for a
+	 * record this wallet already saw in a block safely below the tip, or once
+	 * the same answer outlasts two new blocks (issue #935), which is for the
+	 * caller to judge; the Lightning chain backend cannot, and keeps reading it
+	 * as no answer.
+	 * @param {ITransaction<IUtxo>} txData
+	 * @returns {boolean}
+	 */
+	public transactionMissingWithoutTxindex(
+		txData: ITransaction<IUtxo>
+	): boolean {
+		const message = txData?.error?.message;
+		return typeof message === 'string' && NO_TXINDEX_MISS.test(message);
 	}
 
 	/**
@@ -2608,7 +2680,11 @@ export class Electrum {
 		// coins this transaction spends, and the UTXO set is only ever replaced
 		// by a whole scan, which arrives on a notification at best and never on
 		// a timer: until one lands, every caller of listUtxos can still select a
-		// coin that is already gone.
+		// coin that is already gone. The Result removeSpentUtxos returns is not
+		// checked: the transaction is out and its txid is the answer. A write of
+		// the new set that storage refuses is logged by the wallet, and the scan
+		// this spend triggers through the wallet's own scripthash subscription
+		// writes it again.
 		await this._wallet.removeSpentUtxos(rawTx);
 		return ok(broadcastResponse.data);
 	}
@@ -2791,6 +2867,41 @@ export class Electrum {
 			);
 		}
 		this.connectedToElectrum = false;
+	}
+
+	/**
+	 * Stops an instance whose wallet was never handed to anyone, such as the
+	 * one a Wallet.create builds before it returns an error (issue #966).
+	 *
+	 * The constructor starts the connection poll, and the caller has no wallet
+	 * to stop, so without this the poll runs forever: it connects to the
+	 * configured servers, reports the connection through a wallet the caller
+	 * was told does not exist, and keeps the process alive.
+	 *
+	 * The full disconnect() only runs when this instance is connected or has a
+	 * connect in flight. It stops rn-electrum-client's client for the network,
+	 * and there is only one of those per network in the whole process, so for
+	 * an instance that never connected it would tear down the socket a sibling
+	 * wallet on the same network is using.
+	 * @returns {Promise<void>}
+	 */
+	public async abandon(): Promise<void> {
+		this.stopConnectionPolling();
+		// A poll tick already running checks this at entry and again before it
+		// reconnects, so it returns instead of putting the instance on the
+		// network. Only an explicit connectToElectrum clears it.
+		this._disconnected = true;
+		const connecting = this._connectInFlight;
+		if (!this.connectedToElectrum && !connecting) return;
+		if (connecting) {
+			// The attempt reads the flag above, so it never reports a
+			// connection. How it ended does not matter here, only that the
+			// teardown runs after it: an attempt that succeeds records its server
+			// as held by this instance, and one that finished after disconnect()
+			// would leave that record with nothing left to release it.
+			await connecting.catch(() => undefined);
+		}
+		await this.disconnect();
 	}
 
 	public startConnectionPolling(): void {

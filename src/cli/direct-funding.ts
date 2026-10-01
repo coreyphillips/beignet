@@ -46,8 +46,8 @@ export type IDfWallet = Pick<
 	| 'listUtxos'
 	| 'isUtxoFrozen'
 	| 'listFrozenUtxos'
-	| 'freezeUtxo'
-	| 'unfreezeUtxo'
+	| 'freezeUtxoIfUnfrozen'
+	| 'unfreezeUtxoIfTagged'
 	| 'getPrivateKey'
 	| 'getChangeAddress'
 	| 'transactions'
@@ -303,20 +303,28 @@ export function directFundingWallet(
 			// against when this payer took it. Anyone else's is a coin withheld from
 			// us, and the wallet's Ok would otherwise read as our own.
 			if (held) return held.freezeTag === DF_FREEZE_TAG;
-			const result = await wallet.freezeUtxo({
+			// No entry here can still mean one under the wallet's lock: a freeze
+			// queued ahead of this call creates it first, and it is not ours.
+			const result = await wallet.freezeUtxoIfUnfrozen({
 				txid: txidHex,
 				index: vout,
 				tag: DF_FREEZE_TAG
 			});
-			return result.isOk();
+			return result.isOk() && result.value.created;
 		},
 
 		async unfreezeUtxo(txidHex: string, vout: number): Promise<boolean> {
 			// Ours only. A payment settling must not lift the freeze an operator put
 			// on the same coin, which outlives this payment by design.
 			if (frozenEntry(txidHex, vout)?.freezeTag !== DF_FREEZE_TAG) return false;
-			const result = await wallet.unfreezeUtxo({ txid: txidHex, index: vout });
-			return result.isOk();
+			// Asked again under the wallet's lock: an operator freeze queued ahead
+			// of this call takes the entry over by clearing our tag.
+			const result = await wallet.unfreezeUtxoIfTagged({
+				txid: txidHex,
+				index: vout,
+				tag: DF_FREEZE_TAG
+			});
+			return result.isOk() && result.value.unfrozen;
 		},
 
 		blockHeight(): number {

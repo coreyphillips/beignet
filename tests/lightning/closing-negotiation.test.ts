@@ -834,6 +834,34 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 			expect(opener.getState()).to.not.equal(ChannelState.CLOSED);
 		});
 
+		it('reserves what the builder keeps for a P2PKH output, above our dust limit (issue #1030)', function () {
+			// The builder drops a P2PKH output under 546 sat whatever the
+			// negotiated limit, so reserving only 354 would let a fee burn it.
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+			opener.getFullState().localShutdownScript = Buffer.from(
+				'76a914' + '11'.repeat(20) + '88ac',
+				'hex'
+			);
+			setOpenerBalance(opener, 800_000n);
+
+			opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: 300n,
+					signature: crypto.randomBytes(64)
+				},
+				signFn
+			);
+
+			// 800 sat balance minus the 546 sat P2PKH relay threshold
+			expect(opener.getFullState().closingFeeMax).to.equal(254n);
+			expect(opener.getState()).to.not.equal(ChannelState.CLOSED);
+		});
+
 		it('should store theirLastClosingFeeSat', function () {
 			const { opener } = setupNegotiatingChannels();
 			opener.handleShutdown({

@@ -72,6 +72,7 @@ import {
 	calculateClosingFee,
 	closingTxWeight,
 	closingTxRelayProfile,
+	closingOutputDustLimit,
 	minRelayFeeForWeight
 } from '../chain/closing';
 import {
@@ -95,7 +96,9 @@ import {
 	HtlcState,
 	BITCOIN_CHAIN_HASH,
 	MAX_FUNDING_SATOSHIS,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	DEFAULT_MINIMUM_DEPTH,
+	MAX_MINIMUM_DEPTH
 } from './types';
 import {
 	IAbandonedLocalAdd,
@@ -137,6 +140,7 @@ import {
 	verifyRemoteCommitmentPartial,
 	verifyRemoteHtlcSignatures,
 	verifyRemoteHtlcSignaturesTaproot,
+	filterUntrimmedHtlcs,
 	funderCommitmentCostSats,
 	getCommitmentFeeRate,
 	getLocalCommitmentFeeRate,
@@ -148,6 +152,7 @@ import {
 	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
+	receivedAddIrrevocablyCommitted,
 	scidAliasAnnounceRefusal,
 	validateV2ChannelType
 } from './types';
@@ -1023,11 +1028,8 @@ export class Channel {
 		revocationIndex: bigint;
 		secretIndex: bigint;
 	} | null = null;
-	// Watchtower: the remote commitment transactions we have signed, keyed by the
-	// per-commitment point they use, so that when the peer later reveals that
-	// point's secret (revoke_and_ack) we can ship the exact revoked tx to a tower.
-	// In-memory only and bounded; unrevoked states number at most a couple.
-	private _remoteCommitmentTxCache = new Map<string, string>();
+	// Bound on state.watchtowerRemoteCommitmentTxs; unrevoked states number at
+	// most a couple.
 	private static readonly REVOKED_TX_CACHE_MAX = 8;
 	// We dropped an unresumable splice on disconnect/restart, but the peer may
 	// still hold its in-flight copy (CLN never forgets one on its own — it blocks
@@ -1998,6 +2000,10 @@ export class Channel {
 			partialSignatureWithNonce: taproot ? partialSignatureWithNonce : undefined
 		};
 
+		this._cacheRemoteCommitmentForWatchtower(
+			this._state.remoteCurrentPerCommitmentPoint,
+			0n
+		);
 		this._state.state = ChannelState.SENT_FUNDING_CREATED;
 		return [
 			sendMsg(MessageType.FUNDING_CREATED, encodeFundingCreatedMessage(msg))
@@ -2547,6 +2553,10 @@ export class Channel {
 			partialSignatureWithNonce: taproot ? partialSignatureWithNonce : undefined
 		};
 
+		this._cacheRemoteCommitmentForWatchtower(
+			this._state.remoteCurrentPerCommitmentPoint,
+			0n
+		);
 		this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 
 		const actions: ChannelAction[] = [
@@ -3160,6 +3170,34 @@ export class Channel {
 				}
 			];
 		}
+		// An expiry at or below our tip can never be offered (issue #1009):
+		// the peer could not claim it before we could time it out, and a peer
+		// may answer the offer by failing the channel. Local refusal, same
+		// shape as the timestamp check; the node maps it to a fail-back of the
+		// inbound leg when the add was a forward. Skipped while the tip is
+		// unknown, as every height-dependent check in this class is.
+		if (
+			this._currentBlockHeight > 0 &&
+			cltvExpiry <= this._currentBlockHeight
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `HTLC cltv_expiry ${cltvExpiry} has already expired at height ${this._currentBlockHeight}`
+				}
+			];
+		}
+
+		// BOLT 2: a peer receiving amount_msat 0 may fail the channel, and a
+		// peer advertising htlc_minimum_msat 0 lets the check below pass it.
+		if (amountMsat <= 0n) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'HTLC amount must be positive'
+				}
+			];
+		}
 
 		// Check amount exceeds minimum
 		if (amountMsat < this._state.remoteConfig.htlcMinimumMsat) {
@@ -3204,6 +3242,18 @@ export class Channel {
 					message: 'Insufficient balance for HTLC'
 				}
 			];
+		}
+
+		// When the PEER funds, the commitment fee comes off ITS balance and our
+		// add raises it. The peer refuses, and fails the channel over, an add
+		// its fee headroom cannot absorb (the funder-side arm of
+		// handleUpdateAddHtlc; eclair, LND and CLN do the same), so the same
+		// arithmetic is asked here first and answers with a local error
+		// instead: a refused payment costs a retry, a refused add costs the
+		// channel (issue #1020).
+		const funderRefusal = this._remoteFunderFeeRefusal([amountMsat]);
+		if (funderRefusal) {
+			return [{ type: ChannelActionType.ERROR, message: funderRefusal }];
 		}
 
 		// Cap total dust-HTLC exposure (BOLT 2 recommendation): dust HTLCs are
@@ -3430,25 +3480,131 @@ export class Channel {
 			// the builder deducts from the funder separately: one expression, so
 			// the base weight this channel type prices at and the anchor add can
 			// never be applied apart (#403).
-			remoteRequiredMsat +=
-				funderCommitmentCostSats(
-					Math.max(
-						getLocalCommitmentFeeRate(this._state),
-						getRemoteCommitmentFeeRate(this._state)
-					),
-					this._countActiveHtlcs() + 1,
-					this._state.channelType
-				) * 1000n;
+			const candidate = [
+				{ amountMsat: msg.amountMsat, direction: HtlcDirection.RECEIVED }
+			];
+			const localCostMsat = this._remoteFunderLocalCostMsat(
+				getLocalCommitmentFeeRate(this._state),
+				candidate
+			);
+			const remoteCostMsat = this._remoteFunderLocalCostMsat(
+				getRemoteCommitmentFeeRate(this._state),
+				candidate
+			);
+			remoteRequiredMsat += bigIntMax(localCostMsat, remoteCostMsat);
 		}
 		if (this._state.remoteBalanceMsat - msg.amountMsat < remoteRequiredMsat) {
-			// BOLT 2 MUST fail: an add the sender cannot afford above its reserve can
-			// never enter our commitment, so its log now holds an entry ours never
-			// will. Wire error (issue 404): the silent refusal this replaced let the
-			// peer's next commitment_signed cover state we do not hold, and the
-			// channel force closed a round later blamed on an invalid signature.
+			// BOLT 2 MUST fail: offering an add the SENDER cannot afford above its
+			// reserve is the sender's MUST NOT, so its log now holds an entry ours
+			// never will. Wire error (issue 404): the silent refusal this replaced
+			// let the peer's next commitment_signed cover state we do not hold,
+			// and the channel force closed a round later blamed on an invalid
+			// signature. The funder-side refusal below is a different matter:
+			// BOLT 2 has no MUST for a receiver that funds, and refusing is our
+			// policy, the one eclair, LND and CLN apply.
 			return this._failChannelWithWireError(
 				'Remote cannot afford HTLC above channel reserve'
 			);
+		}
+
+		let funderFeeFailback = false;
+		if (this._state.role === ChannelRole.OPENER) {
+			// We fund, so the commitment fee comes off OUR balance and the peer's
+			// add raises it (issue #1020). Nothing else bounded that: the check
+			// above prices the fee only when the PEER funds,
+			// _localCommitmentEmptyRefusal arms only below our dust limit or
+			// mid-splice, and the builder saturates our output at zero and drops
+			// it, so a peer could stack adds until the fee consumed our whole
+			// balance and a broadcast of either commitment handed it to miners.
+			//
+			// Three thresholds, from the two views a peer and we can hold:
+			//
+			// 1. The SENDER's view of our commitment (_funderSenderView): what
+			//    eclair's canSendAdd, LND's validateCommitmentSanity and CLN
+			//    compute before offering us an add, priced at the rate the peer
+			//    has revoked for and trimmed at OUR dust limit. Reserve plus that
+			//    cost admits the add outright; every conforming sender stops
+			//    there, so nothing past this line can hit an honest peer. On a
+			//    channel that has been spliced eclair keeps one more branch
+			//    (Commitments.canSendAdd): with fewer than 5 HTLCs it offers while
+			//    our balance merely exceeds the fee, reserve or not, so a funder
+			//    a splice-out left under its reserve can climb back out. Mirrored
+			//    here (_inSplicedClimbOut): the exposure is four fee slots, about
+			//    1,720 sats at 2,500 sat/kw.
+			// 2. Short of that, the CONSERVATIVE floor (_funderConservativeView):
+			//    the dearer of the two commitments over everything in flight, off
+			//    the live balance plus the refunds both builders already apply.
+			//    While our output still clears the higher dust limit under it,
+			//    the add is ADMITTED and stamped funderFeeFailback: the node fails
+			//    it back once committed (temporary_channel_failure forwarding,
+			//    incorrect_or_unknown_payment_details at the final hop), the
+			//    exact mechanism of dustExposureFailback below. Every earlier
+			//    PENDING add is counted, so on the LIVE state a burst inside one
+			//    round can take our output from reserve plus cost down to the
+			//    dust limit and no further. Two protocol-legal changes of state
+			//    can carry it past that after the fact: the peer's revoke_and_ack
+			//    promoting a fee raise of ours (adds priced here at the old rate
+			//    then cost the new one), or its revoke_and_ack for an add of our
+			//    own (credited back here until then). The bound across those is
+			//    held at sign time instead, by _funderOutputTrimmedRefusal, which
+			//    fails the channel before we sign or accept a commitment whose
+			//    fee has trimmed our output, with the earlier commitments and our
+			//    output in them intact. That band (reserve minus dust, to miners
+			//    if the peer broadcasts) is the exposure eclair accepts: its own
+			//    receive-side bound is toLocal minus fees, no reserve, since a
+			//    balance that is receiving is about to grow.
+			// 3. Past the floor our output would be trimmed: the add fails the
+			//    channel on the wire. BOLT 2 has no MUST for a receiver that
+			//    funds; this is our policy, and eclair (CannotAffordFees), LND
+			//    (validateCommitmentSanity) and CLN fail the channel at their own
+			//    bound.
+			//
+			// Both balance thresholds bind on the pending-splice view too while a
+			// splice awaits its lock, as updateFee's send side does.
+			const candidate = [
+				{ amountMsat: msg.amountMsat, direction: HtlcDirection.RECEIVED }
+			];
+			const sender = this._funderSenderView(candidate);
+			const senderHeadroomMsat = this._funderHeadroomMsat(sender.balanceMsat);
+			const climbOut =
+				this._inSplicedClimbOut() && sender.balanceMsat - sender.costMsat > 0n;
+			if (senderHeadroomMsat < sender.costMsat && !climbOut) {
+				const floor = this._funderConservativeView(candidate);
+				// Our output must survive on BOTH commitments: to_local at our
+				// dust limit on ours, to_remote at the peer's on the peer's.
+				const outputFloorMsat =
+					bigIntMax(
+						this._state.localConfig.dustLimitSatoshis,
+						this._state.remoteConfig.dustLimitSatoshis
+					) * 1000n;
+				const outputMsat =
+					this._funderLiveBalanceFloorMsat() +
+					floor.creditMsat -
+					floor.costMsat;
+				if (outputMsat < outputFloorMsat) {
+					const wire =
+						'Cannot afford commitment fee for inbound HTLC above channel reserve';
+					return this._failChannelWithWireError(
+						wire,
+						undefined,
+						`${wire}: localBalanceMsat=${this._state.localBalanceMsat} ` +
+							`reserveSats=${this._state.remoteConfig.channelReserveSatoshis} ` +
+							`senderViewBalanceMsat=${sender.balanceMsat} ` +
+							`senderViewHeadroomMsat=${senderHeadroomMsat} ` +
+							`senderViewFeeratePerKw=${sender.feeratePerKw} ` +
+							`senderViewUntrimmedHtlcs=${sender.untrimmed} ` +
+							`senderViewRequiredMsat=${sender.costMsat} ` +
+							`floorFeeratePerKw=${floor.feeratePerKw} ` +
+							`floorUntrimmedHtlcs=${floor.untrimmed} ` +
+							`floorRequiredMsat=${floor.costMsat} ` +
+							`floorCreditMsat=${floor.creditMsat} ` +
+							`outputMsat=${outputMsat} ` +
+							`outputFloorMsat=${outputFloorMsat} ` +
+							`htlcAmountMsat=${msg.amountMsat}`
+					);
+				}
+				funderFeeFailback = true;
+			}
 		}
 
 		// The dust-exposure ceiling is deliberately NOT enforced here. BOLT 2
@@ -3472,20 +3628,22 @@ export class Channel {
 			);
 		}
 
-		// CLTV validation
-		if (this._currentBlockHeight > 0) {
-			if (msg.cltvExpiry <= this._currentBlockHeight) {
-				// The one arm that turns on state the peer cannot see, our own
-				// _currentBlockHeight. A skew large enough to reach here past the
-				// sender's cltv_expiry_delta means our chain view is broken rather than
-				// that the peer raced us, and the add cannot enter our commitment
-				// either way.
-				return this._failChannelWithWireError('HTLC CLTV already expired');
-			}
-			// The far-future horizon (MAX_HTLC_CLTV_EXPIRY_DELTA) is OUR policy,
-			// not a BOLT 2 MUST: the node admits the add and fails it back with
-			// expiry_too_far once committed (issue 410).
-		}
+		// CLTV against our tip: admitted and stamped, never a channel failure
+		// (issue #1009). This arm turns on state the peer cannot see, our own
+		// _currentBlockHeight: a peer one block behind us, or a forwarder that
+		// relayed a payer's stale outgoing_cltv_value, is not attacking the
+		// channel, and the add cannot be kept out of our commitment without a
+		// wire failure that costs the channel (issue 404). The node fails it
+		// back with expiry_too_soon once committed, exactly as the far-future
+		// horizon (MAX_HTLC_CLTV_EXPIRY_DELTA, issue 410) is failed back with
+		// expiry_too_far. The node never claims a stamped entry: its claim
+		// backstop (scanExpiringHtlcs) excludes one that was not actually
+		// fulfilled, so a block landing while the peer still owes the ack of
+		// the fail-back does not close the channel, and if the fail cannot be
+		// sent the peer times the HTLC out on chain at no cost to us.
+		const expiredOnArrival =
+			this._currentBlockHeight > 0 &&
+			msg.cltvExpiry <= this._currentBlockHeight;
 
 		const entry: IHtlcEntry = {
 			id: msg.id,
@@ -3497,6 +3655,8 @@ export class Channel {
 			state: HtlcState.PENDING,
 			...(msg.blindingPoint ? { blindingPoint: msg.blindingPoint } : {}),
 			...(dustExposureFailback ? { dustExposureFailback: true } : {}),
+			...(expiredOnArrival ? { expiredOnArrival: true } : {}),
+			...(funderFeeFailback ? { funderFeeFailback: true } : {}),
 			// Provenance for the recency holds (issues #469 and #907) and for a
 			// proven revocation (issues #905 and #915): only an add admitted
 			// while the restriction already stood is refused by the node; one
@@ -3539,6 +3699,9 @@ export class Channel {
 		// behavior) let unrelated triggers sign the peer's own add into its
 		// commitment prematurely — "Bad commit_sig" at the peer.
 		entry.addLocallyRevoked = false;
+		// ...and it is not ours to forward or settle until the peer also
+		// revokes for a commitment of ours that carries it.
+		entry.addRemotelyRevoked = false;
 
 		// Deduct from remote balance provisionally
 		this._state.remoteBalanceMsat -= msg.amountMsat;
@@ -3720,6 +3883,20 @@ export class Channel {
 	}
 
 	/**
+	 * Whether a settle the peer sends for this offered HTLC arrives before
+	 * the add is committed: still PENDING (in no commitment_signed of ours),
+	 * or signed but not yet revoked for by the peer. BOLT 2 forbids settling
+	 * before the add is irrevocably committed and the peer's revoke_and_ack
+	 * reaches us ahead of any settle it sends after that, so this is never
+	 * an honest peer, and the receiver MUST fail the channel (#1047).
+	 */
+	private _addNotYetCommitted(entry: IHtlcEntry): boolean {
+		return (
+			entry.state === HtlcState.PENDING || entry.addRemoteCommitted === false
+		);
+	}
+
+	/**
 	 * Handle update_fulfill_htlc from remote.
 	 */
 	handleUpdateFulfillHtlc(msg: IUpdateFulfillHtlcMessage): ChannelAction[] {
@@ -3798,6 +3975,12 @@ export class Channel {
 					paymentPreimage: msg.paymentPreimage
 				}
 			];
+		}
+
+		if (this._addNotYetCommitted(entry)) {
+			return this._failChannelWithWireError(
+				'update_fulfill_htlc for an HTLC not yet committed'
+			);
 		}
 
 		entry.state = HtlcState.FULFILLED;
@@ -4075,6 +4258,12 @@ export class Channel {
 			];
 		}
 
+		if (this._addNotYetCommitted(entry)) {
+			return this._failChannelWithWireError(
+				'update_fail_htlc for an HTLC not yet committed'
+			);
+		}
+
 		entry.state = HtlcState.FAILED;
 		// Two-phase: finalize the refund (and delete the entry) only once the
 		// peer has revoked for OUR commitment covering this removal.
@@ -4150,9 +4339,16 @@ export class Channel {
 				{
 					type: ChannelActionType.HTLC_FAILED,
 					htlcId: msg.id,
-					reason: replayReason
+					reason: replayReason,
+					malformedCode: msg.failureCode
 				}
 			];
+		}
+
+		if (this._addNotYetCommitted(entry)) {
+			return this._failChannelWithWireError(
+				'update_fail_malformed_htlc for an HTLC not yet committed'
+			);
 		}
 
 		// A malformed-HTLC removal follows the SAME two-phase settlement as a plain
@@ -4177,7 +4373,8 @@ export class Channel {
 			{
 				type: ChannelActionType.HTLC_FAILED,
 				htlcId: msg.id,
-				reason
+				reason,
+				malformedCode: msg.failureCode
 			}
 		];
 	}
@@ -4228,35 +4425,49 @@ export class Channel {
 	}
 
 	/**
-	 * Cache the remote commitment tx we just signed, keyed by its per-commitment
-	 * point, mirroring the manager's build (remoteNextPerCommitmentPoint, number
-	 * +1). Taproot commitments are cached too: they feed the version-1 (schnorr)
-	 * justice kit. Never throws: a cache miss only forfeits a pre-emptive tower
-	 * ship, it must not break commitment signing.
+	 * Cache the remote commitment tx we signed at `commitmentNumber`, keyed by
+	 * its per-commitment point, so the revoke_and_ack that later reveals that
+	 * point's secret can hand the exact tx to a watchtower. Taproot commitments
+	 * are cached too: they feed the version-1 (schnorr) justice kit. Never
+	 * throws: a cache miss only forfeits a pre-emptive tower ship, it must not
+	 * break commitment signing.
+	 *
+	 * `spliced` is the pending splice's view: its tx joins the one cached for
+	 * the current funding under the same point.
 	 */
-	private _cacheRemoteCommitmentForWatchtower(): void {
+	private _cacheRemoteCommitmentForWatchtower(
+		point: Buffer | null,
+		commitmentNumber: bigint,
+		spliced?: IChannelState
+	): void {
 		try {
-			if (!this._state.remoteBasepoints || !this._state.fundingTxid) return;
-			const point =
-				this._state.remoteNextPerCommitmentPoint ||
-				this._state.remoteCurrentPerCommitmentPoint;
-			if (!point) return;
-			const built = buildRemoteCommitment(
-				this._state,
-				point,
-				this._state.remoteCommitmentNumber + 1n
-			);
-			this._remoteCommitmentTxCache.set(
-				point.toString('hex'),
-				built.result.tx.toBuffer().toString('hex')
-			);
+			const view = spliced ?? this._state;
+			if (!point || !view.remoteBasepoints || !view.fundingTxid) {
+				return;
+			}
+			const built = buildRemoteCommitment(view, point, commitmentNumber);
+			const cache = (this._state.watchtowerRemoteCommitmentTxs ??= new Map<
+				string,
+				Buffer[]
+			>());
+			const key = point.toString('hex');
+			// Anything else under the point is a signature since replaced, or a
+			// splice attempt that never locked, so only the current funding's tx
+			// survives a splice-side write.
+			const current = this._state.fundingTxid;
+			const kept =
+				spliced && current
+					? (cache.get(key) ?? []).filter(
+							(tx) =>
+								bitcoin.Transaction.fromBuffer(tx).ins[0]?.hash.equals(current)
+					  )
+					: [];
+			cache.set(key, [...kept, built.result.tx.toBuffer()]);
 			// Bound the cache: only unrevoked states matter and there are few.
-			while (
-				this._remoteCommitmentTxCache.size > Channel.REVOKED_TX_CACHE_MAX
-			) {
-				const oldest = this._remoteCommitmentTxCache.keys().next().value;
+			while (cache.size > Channel.REVOKED_TX_CACHE_MAX) {
+				const oldest = cache.keys().next().value;
 				if (oldest === undefined) break;
-				this._remoteCommitmentTxCache.delete(oldest);
+				cache.delete(oldest);
 			}
 		} catch {
 			// Best-effort cache; ignore.
@@ -4264,17 +4475,87 @@ export class Channel {
 	}
 
 	/**
-	 * Given a per-commitment secret the peer just revealed, return (and forget)
-	 * the revoked remote commitment tx we cached for that state, or null if we
-	 * never signed it (e.g. the initial funding commitment).
+	 * Cache the peer's latest signed commitment if a restored row has no entry
+	 * for it. Rows written before the cache was persisted have none, and the
+	 * revoke_and_ack that retires that commitment would go without a backup.
+	 * The tx is rebuilt from the row, which describes the signed commitment
+	 * only while no update is pending, so a row that owes a signature is left
+	 * alone.
+	 *
+	 * A pending splice signed the same point over its own funding, and rows
+	 * written before that side was cached hold only the current funding's tx,
+	 * so the splice side is checked on its own.
 	 */
-	takeRevokedCommitmentTx(perCommitmentSecret: Buffer): Buffer | null {
+	repairWatchtowerCommitmentCache(): void {
+		if (this._state.needsCommitment) return;
+		const point = this.isAwaitingRemoteRevocation()
+			? this._state.remoteNextPerCommitmentPoint
+			: this._state.remoteCurrentPerCommitmentPoint;
+		if (!point) return;
+		const key = point.toString('hex');
+		if (!this._state.watchtowerRemoteCommitmentTxs?.has(key)) {
+			this._cacheRemoteCommitmentForWatchtower(
+				point,
+				this._state.remoteCommitmentNumber
+			);
+		}
+		const spliced = this._state.spliceInFlight ? this._splicedState() : null;
+		const spliceFunding = spliced?.fundingTxid;
+		if (!spliced || !spliceFunding) return;
+		const spliceCached = (
+			this._state.watchtowerRemoteCommitmentTxs?.get(key) ?? []
+		).some((tx) => {
+			try {
+				return bitcoin.Transaction.fromBuffer(tx).ins[0]?.hash.equals(
+					spliceFunding
+				);
+			} catch {
+				return false;
+			}
+		});
+		if (!spliceCached) {
+			this._cacheRemoteCommitmentForWatchtower(
+				point,
+				this._state.remoteCommitmentNumber,
+				spliced
+			);
+		}
+	}
+
+	/**
+	 * Given a per-commitment secret the peer just revealed, return (and forget)
+	 * the revoked remote commitment txs we cached for that state, one per
+	 * funding output it was signed over. Empty if we never cached it (an older
+	 * row restored with a commitment in flight or an update pending).
+	 */
+	takeRevokedCommitmentTxs(perCommitmentSecret: Buffer): Buffer[] {
 		const pointHex =
 			perCommitmentPointFromSecret(perCommitmentSecret).toString('hex');
-		const txHex = this._remoteCommitmentTxCache.get(pointHex);
-		if (!txHex) return null;
-		this._remoteCommitmentTxCache.delete(pointHex);
-		return Buffer.from(txHex, 'hex');
+		const cache = this._state.watchtowerRemoteCommitmentTxs;
+		const txs = cache?.get(pointHex) ?? [];
+		cache?.delete(pointHex);
+		return txs;
+	}
+
+	/**
+	 * Keep a revoked commitment whose tower hand-off failed, with the secret
+	 * that revoked it, until takeOwedWatchtowerBackups hands it out again.
+	 */
+	oweWatchtowerBackup(perCommitmentSecret: Buffer, tx: Buffer): void {
+		(this._state.watchtowerBackupsOwed ??= []).push({
+			perCommitmentSecret,
+			tx
+		});
+	}
+
+	/** Return (and forget) every revoked commitment still owed to the towers. */
+	takeOwedWatchtowerBackups(): Array<{
+		perCommitmentSecret: Buffer;
+		tx: Buffer;
+	}> {
+		const owed = this._state.watchtowerBackupsOwed ?? [];
+		this._state.watchtowerBackupsOwed = undefined;
+		return owed;
 	}
 
 	/**
@@ -4332,6 +4613,35 @@ export class Channel {
 			];
 		}
 
+		// Sign-time backstop of the funder-fee guards (issue #1020): never
+		// sign the peer a commitment whose fee has trimmed our to_remote. The
+		// signature handed in is over exactly this commitment; refusing here
+		// means it never leaves and nothing below is written.
+		{
+			const point =
+				this._state.remoteNextPerCommitmentPoint ??
+				this._state.remoteCurrentPerCommitmentPoint;
+			if (point) {
+				const number = this._state.remoteCommitmentNumber + 1n;
+				const trimmed = this._funderOutputTrimmedRefusal(
+					this._state,
+					'remote',
+					point,
+					number
+				);
+				if (trimmed) return this._failChannelWithWireError(trimmed);
+				if (spliceBatch) {
+					const spliced = this._splicedState();
+					const splicedTrimmed = spliced
+						? this._funderOutputTrimmedRefusal(spliced, 'remote', point, number)
+						: null;
+					if (splicedTrimmed) {
+						return this._failChannelWithWireError(splicedTrimmed);
+					}
+				}
+			}
+		}
+
 		const msg: ICommitmentSignedMessage = {
 			channelId: this._state.channelId!,
 			signature: taproot ? Buffer.alloc(64) : signature,
@@ -4366,7 +4676,21 @@ export class Channel {
 
 		// Watchtower: cache the remote commitment tx we just committed the peer to,
 		// keyed by its per-commitment point, for pre-emptive justice on breach.
-		this._cacheRemoteCommitmentForWatchtower();
+		const signedPoint =
+			this._state.remoteNextPerCommitmentPoint ||
+			this._state.remoteCurrentPerCommitmentPoint;
+		this._cacheRemoteCommitmentForWatchtower(
+			signedPoint,
+			this._state.remoteCommitmentNumber + 1n
+		);
+		const splicedView = spliceBatch ? this._splicedState() : null;
+		if (splicedView) {
+			this._cacheRemoteCommitmentForWatchtower(
+				signedPoint,
+				this._state.remoteCommitmentNumber + 1n,
+				splicedView
+			);
+		}
 
 		// A staged update_fee that is signable here (opener always; acceptor
 		// once the fee round reached it — see getRemoteCommitmentFeeRate) is
@@ -4411,6 +4735,16 @@ export class Channel {
 					entry.state === HtlcState.FAILED)
 			) {
 				entry.commitCoverPending = true;
+			}
+			// A peer add is only in this signature once we revoked for it, the
+			// same rule buildRemoteCommitment applies.
+			if (
+				entry.addRemotelyRevoked === false &&
+				entry.addLocallyRevoked !== false &&
+				(entry.state === HtlcState.PENDING ||
+					entry.state === HtlcState.COMMITTED)
+			) {
+				entry.addCoverPending = true;
 			}
 		}
 
@@ -4653,6 +4987,22 @@ export class Channel {
 					message: 'Unexpected commitment_signed'
 				}
 			];
+		}
+
+		// Sign-time backstop of the funder-fee guards (issue #1020): never
+		// accept a signature over a commitment of ours whose fee has trimmed
+		// our to_local. Before either verifying arm, so no state is written
+		// and the commitment we keep holding is the one that carries our
+		// output.
+		{
+			const next = this._state.localCommitmentNumber + 1n;
+			const trimmed = this._funderOutputTrimmedRefusal(
+				this._state,
+				'local',
+				getPerCommitmentPoint(this._state.localPerCommitmentSeed, next),
+				next
+			);
+			if (trimmed) return this._failChannelWithWireError(trimmed);
 		}
 
 		if (isTaprootChannel(this._state.channelType)) {
@@ -4999,6 +5349,15 @@ export class Channel {
 		// Update remote's per-commitment point
 		this._state.remoteCurrentPerCommitmentPoint =
 			this._state.remoteNextPerCommitmentPoint;
+		// The next point keys every commitment we sign from here on, and only
+		// another revoke_and_ack replaces it, so an off-curve one stored here
+		// makes every later signature throw for good. The secret above is
+		// already kept, so the revoked commitment stays punishable.
+		if (!isValidPublicKey(msg.nextPerCommitmentPoint)) {
+			return this._failChannelWithWireError(
+				'revoke_and_ack has an invalid next_per_commitment_point'
+			);
+		}
 		this._state.remoteNextPerCommitmentPoint = msg.nextPerCommitmentPoint;
 
 		// option_taproot: rotate the peer's verification nonce forward in lockstep
@@ -5045,6 +5404,10 @@ export class Channel {
 				} else {
 					entry.removalRemoteCommitted = true;
 				}
+			}
+			if (entry.addCoverPending === true) {
+				entry.addCoverPending = false;
+				entry.addRemotelyRevoked = true;
 			}
 		}
 
@@ -5116,7 +5479,9 @@ export class Channel {
 		// Emit HTLC_FORWARDED for committed received HTLCs that haven't been
 		// dispatched yet. This happens AFTER the full commitment round-trip
 		// (commitment_signed → revoke_and_ack both ways), ensuring the HTLC
-		// is fully committed on both sides before we try to settle it.
+		// is fully committed on both sides before we try to settle it. This
+		// revoke_and_ack may answer a commitment that left the add out, so
+		// COMMITTED is not enough (receivedAddIrrevocablyCommitted).
 		//
 		// forwardEmitted makes the dispatch edge-triggered. COMMITTED is not a
 		// "needs dispatching" state: a received HTLC sits in it for the entire
@@ -5130,8 +5495,8 @@ export class Channel {
 		const htlcActions: ChannelAction[] = [];
 		for (const entry of this._state.htlcs.values()) {
 			if (
-				entry.state === HtlcState.COMMITTED &&
 				entry.direction === HtlcDirection.RECEIVED &&
+				receivedAddIrrevocablyCommitted(entry) &&
 				entry.forwardEmitted !== true &&
 				// FFOR section 9.5.1 step 3: a parked voucher is never dispatched,
 				// nor a mismatching add the round's unwind will fail.
@@ -5416,15 +5781,10 @@ export class Channel {
 		// the opener's own arithmetic, and since issue 404 that refusal fails the
 		// channel outright rather than desyncing it silently, so this arithmetic has
 		// to match the opener's exactly (#403).
-		const activeHtlcCount = this._countActiveHtlcs();
-		const newCost = funderCommitmentCostSats(
-			msg.feeratePerKw,
-			activeHtlcCount,
-			this._state.channelType
-		);
+		const newCostMsat = this._remoteFunderLocalCostMsat(msg.feeratePerKw, []);
 		const reserveMsat = this._state.localConfig.channelReserveSatoshis * 1000n;
 		// Remote is the opener (we are acceptor), so check their balance
-		if (newCost * 1000n > this._state.remoteBalanceMsat - reserveMsat) {
+		if (newCostMsat > this._state.remoteBalanceMsat - reserveMsat) {
 			// BOLT 2: a rate the opener cannot afford above its reserve can never be
 			// applied to the commitment we hold.
 			return this._failChannelWithWireError(
@@ -7659,7 +8019,7 @@ export class Channel {
 		if (isOpener) {
 			// Reserve our dust limit so an accepted fee can neither drop our output
 			// nor consume it down to a dust remnant.
-			const dust = this._state.localConfig.dustLimitSatoshis;
+			const dust = this.ownClosingOutputDustLimit();
 			if (openerBalanceSat < msg.feeSatoshis + dust) {
 				return this._failChannelWithWireError(
 					`Taproot closing fee ${msg.feeSatoshis} leaves our output below dust (balance ${openerBalanceSat}, dust ${dust})`
@@ -7803,9 +8163,19 @@ export class Channel {
 				this._state.remoteShutdownScript ?? PLACEHOLDER_SHUTDOWN_SCRIPT,
 			localAmount: isOpener ? localSat - feeSatoshis : localSat,
 			remoteAmount: isOpener ? remoteSat : remoteSat - feeSatoshis,
+			localDustLimit: this._state.localConfig.dustLimitSatoshis,
+			remoteDustLimit: this._state.remoteConfig.dustLimitSatoshis,
 			isTaproot: isTaprootChannel(this._state.channelType)
 		});
 		return feePaid >= minRelayFeeForWeight(weight);
+	}
+
+	/** Smallest amount our output keeps in the legacy closing tx. */
+	private ownClosingOutputDustLimit(): bigint {
+		return closingOutputDustLimit(
+			this._state.localShutdownScript ?? PLACEHOLDER_SHUTDOWN_SCRIPT,
+			this._state.localConfig.dustLimitSatoshis
+		);
 	}
 
 	private initClosingFeeRange(idealFee: bigint): void {
@@ -7822,7 +8192,7 @@ export class Channel {
 			? this._state.localBalanceMsat / 1000n
 			: this._state.remoteBalanceMsat / 1000n;
 		if (isOpener) {
-			const dust = this._state.localConfig.dustLimitSatoshis;
+			const dust = this.ownClosingOutputDustLimit();
 			openerBalance = openerBalance > dust ? openerBalance - dust : 0n;
 		}
 		this._state.closingFeeMin = min;
@@ -9897,6 +10267,49 @@ export class Channel {
 	}
 
 	/**
+	 * Raise a legacy v2 opener's funding depth on load. Returns whether it
+	 * changed the row (issue #1197).
+	 *
+	 * Before #1034 handleAcceptChannel2 never stored the accepter's
+	 * minimum_depth, so a non-zero-conf v2 opener persisted mid-open still
+	 * carries the 0 from createOpenerState. Restored as is, one confirmation
+	 * readies the channel, and with the peer's channel_ready already in hand
+	 * it goes NORMAL while a shallow reorg can still let the accepter
+	 * double-spend its inputs. The accepter's request is gone, so the stand-in
+	 * is the deepest one we would have accepted.
+	 *
+	 * Only a row still waiting on the chain: a zero-conf type negotiated its
+	 * 0, and past our channel_ready the depth gates nothing. A peer ready
+	 * that arrived first leaves the row in AWAITING_CHANNEL_READY.
+	 */
+	repairLegacyV2OpenerDepth(): boolean {
+		const s = this._state;
+		if (s.role !== ChannelRole.OPENER || s.fundingVersion !== 2) return false;
+		if (s.minimumDepth !== 0 || this._isZeroConfChannelType()) return false;
+		if (s.localChannelReady) return false;
+		const st =
+			s.state === ChannelState.AWAITING_REESTABLISH
+				? s.preReestablishState
+				: s.state;
+		if (
+			st !== ChannelState.AWAITING_TX_SIGNATURES &&
+			st !== ChannelState.AWAITING_FUNDING_CONFIRMED &&
+			st !== ChannelState.AWAITING_CHANNEL_READY
+		) {
+			return false;
+		}
+		s.minimumDepth = MAX_MINIMUM_DEPTH;
+		// A parked confirmation was stamped against depth 0, and reestablish
+		// or the exchange completing would flush channel_ready from it. The
+		// restored watch stamps it again at the raised depth. A row with no
+		// in-flight record parks it in fundingConfirmedLate instead.
+		if (s.v2InFlight) s.v2InFlight.confirmed = false;
+		for (const rec of s.v2PreviousAttempts ?? []) rec.confirmed = false;
+		s.fundingConfirmedLate = undefined;
+		return true;
+	}
+
+	/**
 	 * Refuse to resume a restored v2 open whose commitment #0 could never be
 	 * broadcast, on load. Returns whether it tore one down (issue #387).
 	 *
@@ -10143,7 +10556,14 @@ export class Channel {
 			!msg.yourLastPerCommitmentSecret.equals(Buffer.alloc(32))
 		) {
 			this._state.dataLossDetected = true;
-			this._state.dlpRemotePerCommitmentPoint = msg.myCurrentPerCommitmentPoint;
+			// Failing the channel over a bad point would broadcast the commitment
+			// this arm forbids, so the point is only dropped. An off-curve one
+			// would throw in the taproot to_remote sweep, which falls back to our
+			// last known point without it.
+			if (isValidPublicKey(msg.myCurrentPerCommitmentPoint)) {
+				this._state.dlpRemotePerCommitmentPoint =
+					msg.myCurrentPerCommitmentPoint;
+			}
 			this._state.recoveryCloseReason = 'local-data-loss';
 			this._state.state = ChannelState.ERRORED;
 			return [
@@ -10287,6 +10707,22 @@ export class Channel {
 			// Peer expects a revocation we've never created — irrecoverable
 			return this._heldReestablishGapFailure(
 				'Remote expects future revocation we have not sent'
+			);
+		}
+
+		// The other direction: a peer more than one commitment_signed or
+		// revoke_and_ack behind cannot be levelled by retransmitting our latest
+		// one, and BOLT 2 says to fail the channel. Our current commitment's
+		// secret has never left this node, so the ordinary failure may
+		// broadcast it; a held row stays held through the derived disposition.
+		if (msg.nextCommitmentNumber < this._state.remoteCommitmentNumber) {
+			return this._failChannelWithWireError(
+				'channel_reestablish next_commitment_number is more than one behind'
+			);
+		}
+		if (msg.nextRevocationNumber + 1n < this._state.localCommitmentNumber) {
+			return this._failChannelWithWireError(
+				'channel_reestablish next_revocation_number is more than one behind'
 			);
 		}
 
@@ -13135,6 +13571,13 @@ export class Channel {
 	 * every update against all active commitments), so an HTLC the live
 	 * commitment could afford would make the spliced one unbuildable or
 	 * spec-refusable.
+	 *
+	 * When the peer funds, the mirror of its funder-fee guard folds in too
+	 * (_remoteFunderCeilingMsat, issue #1020). An amount cannot express "N
+	 * more HTLCs", so the fold sizes for ONE more untrimmed add: MPP parts
+	 * sent one after another over the same channel may run past the slots
+	 * the funder can carry, and the later parts meet a local refusal and a
+	 * retry (canOfferHtlcSet judges a set whole), never a wire failure.
 	 */
 	getSpendableOutboundMsat(): bigint {
 		const spendableFor = (
@@ -13198,9 +13641,15 @@ export class Channel {
 		);
 		const pendingSplice = this.getPendingSpliceLocalBalanceMsat();
 		const pendingReserve = this._pendingSpliceKeptReserveSats();
-		if (pendingSplice === null || pendingReserve === null) return live;
-		const spliced = spendableFor(pendingSplice, pendingReserve);
-		return spliced < live ? spliced : live;
+		let own = live;
+		if (pendingSplice !== null && pendingReserve !== null) {
+			const spliced = spendableFor(pendingSplice, pendingReserve);
+			if (spliced < live) own = spliced;
+		}
+		// When the peer funds, its commitment fee bounds what we may add too
+		// (issue #1020): fold the mirror in so the router never offers a
+		// channel whose add _remoteFunderFeeRefusal then refuses.
+		return this._remoteFunderCeilingMsat(own);
 	}
 
 	/**
@@ -13326,6 +13775,11 @@ export class Channel {
 			this._signer,
 			this._state.remoteCurrentPerCommitmentPoint,
 			this._state.remoteCommitmentNumber
+		);
+		this._cacheRemoteCommitmentForWatchtower(
+			this._state.remoteCurrentPerCommitmentPoint,
+			this._state.remoteCommitmentNumber,
+			spliced
 		);
 		this._spliceSentCommitment = true;
 		// From this point the splice MUST survive a disconnect or restart (the
@@ -13480,6 +13934,7 @@ export class Channel {
 			return false;
 		}
 		if (sum > this.getSpendableOutboundMsat()) return false;
+		if (this._remoteFunderFeeRefusal(amounts)) return false;
 		if (
 			dust > 0n &&
 			this._dustExposureMsat() + dust > Channel.MAX_DUST_HTLC_EXPOSURE_MSAT
@@ -13713,6 +14168,15 @@ export class Channel {
 			this._state.localPerCommitmentSeed,
 			nextNum
 		);
+		// The spliced member gets the same sign-time backstop as the live one
+		// (handleCommitmentSigned, issue #1020).
+		const splicedTrimmed = this._funderOutputTrimmedRefusal(
+			spliced,
+			'local',
+			ourPoint,
+			nextNum
+		);
+		if (splicedTrimmed) return this._failChannelWithWireError(splicedTrimmed);
 		if (
 			!verifyRemoteCommitmentSig(
 				spliced,
@@ -14344,6 +14808,25 @@ export class Channel {
 	private _withSpliceAdoptionTail(
 		fields: Partial<IChannelState>
 	): Partial<IChannelState> {
+		// The funding has moved: from here on the funder-fee guard admits the
+		// climb-out adds eclair sends on a spliced channel (issue #1020).
+		fields.hasBeenSpliced = true;
+		// Keep the funding this adoption retires (issue #1060). The state
+		// still holds the OLD txid here: the swap above is a value in
+		// `fields`, applied by the caller. Only a real swap appends, so the
+		// degenerate empty-fields adoption and a view built against the
+		// funding already current leave the list alone, and an applied
+		// adoption appends exactly once.
+		if (
+			fields.fundingTxid &&
+			this._state.fundingTxid &&
+			!fields.fundingTxid.equals(this._state.fundingTxid)
+		) {
+			fields.previousFundingTxids = [
+				...(this._state.previousFundingTxids ?? []),
+				Buffer.from(this._state.fundingTxid)
+			];
+		}
 		// The reads below have to see the funding swap this same adoption
 		// makes, exactly as they did when this ran after the live mutation.
 		const adopted = { ...this._state, ...fields } as IChannelState;
@@ -14681,6 +15164,47 @@ export class Channel {
 	}
 
 	/**
+	 * Whether this in-flight received HTLC's cltv_expiry was already at or
+	 * below our chain tip when it was ADMITTED (the expiredOnArrival stamp set
+	 * by handleUpdateAddHtlc, issue #1009). The node fails it back once
+	 * committed: expiry_too_soon for a forward, incorrect_or_unknown_payment_
+	 * details at the final hop. Stamped and persisted like dustExposureFailback
+	 * so a restart replay answers identically.
+	 */
+	receivedHtlcExpiredOnArrival(htlcId: bigint): boolean {
+		const entry = this._state.htlcs.get('received-' + htlcId);
+		if (!entry) return false;
+		if (
+			entry.state !== HtlcState.PENDING &&
+			entry.state !== HtlcState.COMMITTED
+		) {
+			return false;
+		}
+		return entry.expiredOnArrival === true;
+	}
+
+	/**
+	 * Whether this in-flight received HTLC was admitted inside the funder-fee
+	 * band (the funderFeeFailback stamp set by handleUpdateAddHtlc, issue
+	 * #1020): by the sender's own arithmetic our commitment fee could not be
+	 * met above our reserve once it was in, but our output still survived.
+	 * The node fails it back once committed rather than settling it, the same
+	 * shape as receivedHtlcExceedsDustExposure; the stamp is persisted so a
+	 * restart replay answers identically.
+	 */
+	receivedHtlcExceedsFunderFee(htlcId: bigint): boolean {
+		const entry = this._state.htlcs.get('received-' + htlcId);
+		if (!entry) return false;
+		if (
+			entry.state !== HtlcState.PENDING &&
+			entry.state !== HtlcState.COMMITTED
+		) {
+			return false;
+		}
+		return entry.funderFeeFailback === true;
+	}
+
+	/**
 	 * Would the commitment WE hold be built with NO outputs once a peer-driven
 	 * update is applied? A refusal reason, or null (issue #386).
 	 *
@@ -14791,6 +15315,577 @@ export class Channel {
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * The three readings of "what the funder holds and pays" behind the
+	 * funder-fee guards (issue #1020). Each returns the balance to set
+	 * against the reserve, the untrimmed HTLC count the builder fees, the
+	 * rate that count was classified at and funderCommitmentCostSats of it
+	 * (the BOLT 3 fee at the channel type's base weight plus, on anchor
+	 * channels, the two 330-sat anchor outputs the builder deducts on top),
+	 * in msat. Counting goes through the builder's own filterUntrimmedHtlcs
+	 * (the whole-satoshi amount against dust limit plus second-level fee,
+	 * timeout weight for an offered output and success weight for a received
+	 * one, no second-level fee on anchor channels), never _countActiveHtlcs,
+	 * which counts trimmed entries the builder does not fee (#1047).
+	 */
+	private _countUntrimmedRows(
+		rows: { amount: bigint; direction: HtlcDirection }[],
+		dustLimitSats: bigint,
+		feeratePerKw: number
+	): number {
+		return filterUntrimmedHtlcs(
+			rows,
+			dustLimitSats,
+			feeratePerKw,
+			isAnchorChannel(this._state.channelType)
+		).length;
+	}
+
+	private _funderCostMsat(feeratePerKw: number, untrimmed: number): bigint {
+		return (
+			funderCommitmentCostSats(
+				feeratePerKw,
+				untrimmed,
+				this._state.channelType
+			) * 1000n
+		);
+	}
+
+	/**
+	 * What a peer that funds pays on the commitment WE hold, which is what
+	 * LND, eclair and CLN price a funder's update_add_htlc or update_fee
+	 * against on receipt: every PENDING or COMMITTED entry plus the
+	 * candidates, trimmed at our dust limit under our commitment's direction
+	 * rule. BOLT 3 charges weight only for untrimmed outputs, so counting a
+	 * trimmed one failed an honest funder holding dust HTLCs (#1047).
+	 */
+	private _remoteFunderLocalCostMsat(
+		feeratePerKw: number,
+		candidates: { amountMsat: bigint; direction: HtlcDirection }[]
+	): bigint {
+		const rows: { amount: bigint; direction: HtlcDirection }[] = [];
+		for (const entry of this._state.htlcs.values()) {
+			if (
+				entry.state === HtlcState.PENDING ||
+				entry.state === HtlcState.COMMITTED
+			) {
+				rows.push({
+					amount: entry.amountMsat / 1000n,
+					direction: entry.direction
+				});
+			}
+		}
+		for (const c of candidates) {
+			rows.push({ amount: c.amountMsat / 1000n, direction: c.direction });
+		}
+		const untrimmed = this._countUntrimmedRows(
+			rows,
+			this._state.localConfig.dustLimitSatoshis,
+			feeratePerKw
+		);
+		return this._funderCostMsat(feeratePerKw, untrimmed);
+	}
+
+	/**
+	 * The view of OUR commitment a conforming peer holds when it decides
+	 * whether it may offer us an add, for the case where WE fund: eclair's
+	 * canSendAdd reduces remoteCommit.spec with remoteChanges.acked and
+	 * localChanges.proposed and prices commitTxTotalCost at OUR dust limit
+	 * and the spec's feerate; LND's validateCommitmentSanity at its acked
+	 * index and CLN's view at the recipient's feerate compute the same.
+	 *  - balance: localBalanceMsat, plus every offered add of ours the peer
+	 *    has not revoked for (addRemoteCommitted === false: addHtlc debits
+	 *    at send, the peer debits only at its revoke_and_ack), plus every
+	 *    offered HTLC of ours the peer has failed (its own proposal, in its
+	 *    view from the moment it sends it; handleRevokeAndAck lands the
+	 *    refund a round later). NO credit for a received HTLC we fulfilled:
+	 *    the peer applies our removal only once it has revoked for it, and
+	 *    handleRevokeAndAck credits and deletes the entry on that very
+	 *    revoke_and_ack, so while the entry is here the credit is unapplied
+	 *    and the output still stands (#1020 review: crediting it admitted
+	 *    98 adds and built a held commitment with no to_local).
+	 *  - outputs: every PENDING or COMMITTED entry in either direction except
+	 *    those same un-revoked adds of ours, plus every received HTLC whose
+	 *    removal the peer has not committed (removalRemoteCommitted ===
+	 *    false: the commitment we hold still carries it), plus the
+	 *    candidates, trimmed at OUR dust limit under our commitment's
+	 *    direction rule.
+	 *  - rate: getLocalCommitmentFeeRate, the rate the peer has revoked for.
+	 *    Our own staged update_fee applies to the commitment we hold only
+	 *    once the peer's revoke_and_ack promotes it; pricing a crossing add
+	 *    at the staged rate refused a legal add right after our own raise.
+	 * Every conforming sender stops at reserve plus this cost, so a refusal
+	 * past this line can never hit an honest peer.
+	 */
+	private _funderSenderView(
+		candidates: { amountMsat: bigint; direction: HtlcDirection }[]
+	): {
+		balanceMsat: bigint;
+		untrimmed: number;
+		feeratePerKw: number;
+		costMsat: bigint;
+	} {
+		let balanceMsat = this._state.localBalanceMsat;
+		const rows: { amount: bigint; direction: HtlcDirection }[] = [];
+		for (const entry of this._state.htlcs.values()) {
+			const inFlight =
+				entry.state === HtlcState.PENDING ||
+				entry.state === HtlcState.COMMITTED;
+			if (entry.direction === HtlcDirection.OFFERED) {
+				if (inFlight && entry.addRemoteCommitted === false) {
+					balanceMsat += entry.amountMsat;
+					continue;
+				}
+				if (entry.state === HtlcState.FAILED) {
+					balanceMsat += entry.amountMsat;
+					continue;
+				}
+				if (!inFlight) continue;
+			} else if (!inFlight && entry.removalRemoteCommitted !== false) {
+				continue;
+			}
+			rows.push({
+				amount: entry.amountMsat / 1000n,
+				direction: entry.direction
+			});
+		}
+		for (const c of candidates) {
+			rows.push({ amount: c.amountMsat / 1000n, direction: c.direction });
+		}
+		const feeratePerKw = getLocalCommitmentFeeRate(this._state);
+		const untrimmed = this._countUntrimmedRows(
+			rows,
+			this._state.localConfig.dustLimitSatoshis,
+			feeratePerKw
+		);
+		return {
+			balanceMsat,
+			untrimmed,
+			feeratePerKw,
+			costMsat: this._funderCostMsat(feeratePerKw, untrimmed)
+		};
+	}
+
+	/**
+	 * The dearest reading of what we pay as funder, for the floor under which
+	 * an add fails the channel: every PENDING or COMMITTED entry in either
+	 * direction (our own un-revoked adds included, they enter the commitment
+	 * on the peer's next revoke_and_ack), every removal not yet out of a
+	 * commitment we sign (received with removalRemoteCommitted === false,
+	 * offered with removalLocallyRevoked === false), and the candidates,
+	 * trimmed at the LOWER of the two dust limits (the commitment trimming
+	 * lower carries every output the other does, and the fee comes off our
+	 * output on both: to_local on ours, to_remote on the peer's), priced at
+	 * the local and the remote commitment rate each with the count THAT rate
+	 * produces, keeping the dearer: mid fee round the two differ, and on
+	 * non-anchor channels the trim threshold moves with the rate, so neither
+	 * the higher rate nor the larger count alone is guaranteed to price the
+	 * dearer commitment. Set against the LIVE balance plus creditMsat: the
+	 * refund of every offered HTLC of ours the peer failed and we have revoked
+	 * for the removal of (removalLocallyRevoked !== false), which BOTH
+	 * builders already apply (buildLocalCommitment refunds it outright,
+	 * buildRemoteCommitment once we have revoked). One still awaiting our
+	 * revoke_and_ack stays an output and is not credited, since the remote
+	 * build does not refund it yet. No other deferred credit: a fulfilled
+	 * received HTLC's value stays out until the peer commits the removal.
+	 */
+	private _funderConservativeView(
+		candidates: { amountMsat: bigint; direction: HtlcDirection }[]
+	): {
+		untrimmed: number;
+		feeratePerKw: number;
+		costMsat: bigint;
+		creditMsat: bigint;
+	} {
+		const rows: { amount: bigint; direction: HtlcDirection }[] = [];
+		let creditMsat = 0n;
+		for (const entry of this._state.htlcs.values()) {
+			const present =
+				entry.state === HtlcState.PENDING ||
+				entry.state === HtlcState.COMMITTED ||
+				(entry.direction === HtlcDirection.RECEIVED
+					? entry.removalRemoteCommitted === false
+					: entry.removalLocallyRevoked === false);
+			if (!present) {
+				if (
+					entry.direction === HtlcDirection.OFFERED &&
+					entry.state === HtlcState.FAILED
+				) {
+					creditMsat += entry.amountMsat;
+				}
+				continue;
+			}
+			rows.push({
+				amount: entry.amountMsat / 1000n,
+				direction: entry.direction
+			});
+		}
+		for (const c of candidates) {
+			rows.push({ amount: c.amountMsat / 1000n, direction: c.direction });
+		}
+		const dustLimitSats = bigIntMin(
+			this._state.localConfig.dustLimitSatoshis,
+			this._state.remoteConfig.dustLimitSatoshis
+		);
+		const priceAt = (
+			feeratePerKw: number
+		): {
+			untrimmed: number;
+			feeratePerKw: number;
+			costMsat: bigint;
+			creditMsat: bigint;
+		} => {
+			const untrimmed = this._countUntrimmedRows(
+				rows,
+				dustLimitSats,
+				feeratePerKw
+			);
+			return {
+				untrimmed,
+				feeratePerKw,
+				costMsat: this._funderCostMsat(feeratePerKw, untrimmed),
+				creditMsat
+			};
+		};
+		const local = priceAt(getLocalCommitmentFeeRate(this._state));
+		const remoteRate = getRemoteCommitmentFeeRate(this._state);
+		if (remoteRate === local.feeratePerKw) return local;
+		const remote = priceAt(remoteRate);
+		return remote.costMsat > local.costMsat ? remote : local;
+	}
+
+	/**
+	 * eclair's climb-out regime (Commitments.canSendAdd on a spliced channel):
+	 * once the funding has moved, and while fewer than 5 HTLCs are in the
+	 * map, eclair offers an add while the funder's balance merely exceeds the
+	 * fee, reserve or not, so that a funder a splice-out left under its
+	 * reserve can climb back out. The receive-side arm admits those adds
+	 * outright and the sign-time backstop tolerates a remainder under the
+	 * dust limit in this regime, refusing only a fee that exceeds our whole
+	 * balance (eclair's own canReceiveAdd bound). The exposure is bounded by
+	 * four fee slots. The map size is the population eclair counts, settled
+	 * entries awaiting their round included.
+	 */
+	private _inSplicedClimbOut(view: IChannelState = this._state): boolean {
+		return view.hasBeenSpliced === true && view.htlcs.size < 5;
+	}
+
+	/**
+	 * The sign-time backstop of the funder-fee guards (issue #1020): the
+	 * receive-side arm bounds each add on the LIVE state, and two
+	 * protocol-legal changes of state can carry a set of admitted adds past
+	 * that bound afterwards. The peer's revoke_and_ack promoting a fee raise
+	 * of ours re-prices every add it admitted at the old rate, and its
+	 * revoke_and_ack for an add of our own brings that add, credited back
+	 * until then, into the count. LND holds the line at signing time
+	 * (SignNextCommitment re-runs validateCommitmentSanity on the remote
+	 * chain and fails the channel with its balance intact); so does this.
+	 *
+	 * Asked of the commitment about to be signed (the peer's, our output is
+	 * its to_remote) or accepted (ours, our output is its to_local), built
+	 * by the real builder at the rate that applies to it, so the answer is
+	 * exact once the promoted rate is known. A refusal here is a wire
+	 * failure: the commitments we then hold and would broadcast are the
+	 * earlier ones, with our output in them. Only a funder's output can be
+	 * trimmed by the fee, and only when its balance clears the dust limit is
+	 * the absence the fee's doing: below it the output is absent whatever the
+	 * fee, and that is the reserve's business, not this guard's. In eclair's
+	 * climb-out regime the remainder under the dust limit is tolerated and
+	 * only a fee exceeding our whole balance refuses (its canReceiveAdd
+	 * bound), or every add that branch admits would fail here.
+	 */
+	private _funderOutputTrimmedRefusal(
+		view: IChannelState,
+		side: 'local' | 'remote',
+		perCommitmentPoint: Buffer,
+		commitmentNumber: bigint
+	): string | null {
+		if (view.role !== ChannelRole.OPENER) return null;
+		if (!view.remoteBasepoints || !view.fundingTxid) return null;
+		const dustSats =
+			side === 'local'
+				? view.localConfig.dustLimitSatoshis
+				: view.remoteConfig.dustLimitSatoshis;
+		const balanceSats = view.localBalanceMsat / 1000n;
+		if (balanceSats < dustSats) return null;
+		let built: IBuiltCommitment;
+		try {
+			built =
+				side === 'local'
+					? buildLocalCommitment(view, perCommitmentPoint, commitmentNumber)
+					: buildRemoteCommitment(view, perCommitmentPoint, commitmentNumber);
+		} catch {
+			// Unbuildable here is unbuildable at the signing or verifying step
+			// that follows, which answers with its own reason.
+			return null;
+		}
+		const ours =
+			side === 'local'
+				? built.result.outputMap.toLocal
+				: built.result.outputMap.toRemote;
+		if (ours !== undefined) return null;
+		if (this._inSplicedClimbOut(view)) {
+			const feeratePerKw =
+				side === 'local'
+					? getLocalCommitmentFeeRate(view)
+					: getRemoteCommitmentFeeRate(view);
+			const feeSats = funderCommitmentCostSats(
+				feeratePerKw,
+				built.htlcOutputs.length,
+				view.channelType
+			);
+			if (feeSats <= balanceSats) return null;
+		}
+		return 'Commitment would trim our output to fees';
+	}
+
+	/**
+	 * _funderSenderView from the other chair, for the case where the PEER
+	 * funds and we are about to offer it adds: the view the funder holds of
+	 * ITS commitment, read from our book, so that what we offer is what its
+	 * own guard admits.
+	 *  - balance: remoteBalanceMsat, plus every add of the funder's we have
+	 *    not revoked for (addLocallyRevoked === false: handleUpdateAddHtlc
+	 *    debited it at receipt, the funder's own view debits it only on our
+	 *    revoke_and_ack), plus every HTLC of the funder's we failed (our
+	 *    proposal, credited by every sender), plus every offered HTLC of
+	 *    ours the funder fulfilled once we have revoked for the removal
+	 *    (removalLocallyRevoked === true: that revoke_and_ack is what lets
+	 *    the funder credit and delete it; before it the funder's view still
+	 *    carries the output and no credit).
+	 *  - outputs: every PENDING or COMMITTED entry except those same
+	 *    un-revoked adds of the funder's, plus every offered HTLC of ours
+	 *    whose removal we have not revoked for (removalLocallyRevoked ===
+	 *    false), plus the candidates, trimmed at the FUNDER's dust limit
+	 *    under ITS commitment's direction rule: what we offer is a received
+	 *    output there (success weight), what we receive an offered one
+	 *    (timeout weight).
+	 *  - rate: getRemoteCommitmentFeeRate, the rate the funder has acked; its
+	 *    staged raise counts only once signable, i.e. once we revoked for the
+	 *    commitment_signed that carried it, which is when its own view
+	 *    promotes the rate.
+	 * extraSlots reserves that many further untrimmed HTLCs beyond the
+	 * candidates, charged only when a candidate is itself untrimmed there: a
+	 * trimmed add costs the funder no fee weight, and LND and eclair senders
+	 * offer one at zero slots.
+	 */
+	private _remoteFunderSenderView(
+		candidates: { amountMsat: bigint; direction: HtlcDirection }[],
+		extraSlots: number
+	): {
+		balanceMsat: bigint;
+		untrimmed: number;
+		feeratePerKw: number;
+		costMsat: bigint;
+	} {
+		let balanceMsat = this._state.remoteBalanceMsat;
+		const rows: { amount: bigint; direction: HtlcDirection }[] = [];
+		const onFunder = (direction: HtlcDirection): HtlcDirection =>
+			direction === HtlcDirection.OFFERED
+				? HtlcDirection.RECEIVED
+				: HtlcDirection.OFFERED;
+		for (const entry of this._state.htlcs.values()) {
+			const inFlight =
+				entry.state === HtlcState.PENDING ||
+				entry.state === HtlcState.COMMITTED;
+			if (entry.direction === HtlcDirection.RECEIVED) {
+				if (inFlight && entry.addLocallyRevoked === false) {
+					balanceMsat += entry.amountMsat;
+					continue;
+				}
+				if (entry.state === HtlcState.FAILED) {
+					balanceMsat += entry.amountMsat;
+					continue;
+				}
+				if (!inFlight) continue;
+			} else if (!inFlight) {
+				if (entry.removalLocallyRevoked !== false) {
+					if (entry.state === HtlcState.FULFILLED) {
+						balanceMsat += entry.amountMsat;
+					}
+					continue;
+				}
+			}
+			rows.push({
+				amount: entry.amountMsat / 1000n,
+				direction: onFunder(entry.direction)
+			});
+		}
+		const candidateRows = candidates.map((c) => ({
+			amount: c.amountMsat / 1000n,
+			direction: onFunder(c.direction)
+		}));
+		const feeratePerKw = getRemoteCommitmentFeeRate(this._state);
+		const dustLimitSats = this._state.remoteConfig.dustLimitSatoshis;
+		const untrimmedCandidates = this._countUntrimmedRows(
+			candidateRows,
+			dustLimitSats,
+			feeratePerKw
+		);
+		const untrimmed =
+			this._countUntrimmedRows(rows, dustLimitSats, feeratePerKw) +
+			untrimmedCandidates +
+			(untrimmedCandidates > 0 ? extraSlots : 0);
+		return {
+			balanceMsat,
+			untrimmed,
+			feeratePerKw,
+			costMsat: this._funderCostMsat(feeratePerKw, untrimmed)
+		};
+	}
+
+	/**
+	 * A reading of our balance above the reserve the peer requires of us,
+	 * bound by the pending-splice view while a splice awaits its lock,
+	 * exactly as updateFee's send side binds: an add admitted now rides both
+	 * commitments, and the spliced one has its own balance (a splice-out
+	 * leaves less) and its own reserve (priced at the pending capacity). The
+	 * spliced balance derives from the LIVE figure, so the reading's
+	 * adjustments are carried onto it.
+	 */
+	private _funderHeadroomMsat(balanceMsat: bigint): bigint {
+		const adjustMsat = balanceMsat - this._state.localBalanceMsat;
+		let headroomMsat =
+			balanceMsat - this._state.remoteConfig.channelReserveSatoshis * 1000n;
+		const pendingMsat = this.getPendingSpliceLocalBalanceMsat();
+		const pendingReserveSats = this._pendingSpliceKeptReserveSats();
+		if (pendingMsat !== null && pendingReserveSats !== null) {
+			const pendingHeadroomMsat =
+				pendingMsat + adjustMsat - pendingReserveSats * 1000n;
+			if (pendingHeadroomMsat < headroomMsat) {
+				headroomMsat = pendingHeadroomMsat;
+			}
+		}
+		return headroomMsat;
+	}
+
+	/** The lesser of our live balance and its pending-splice reading. */
+	private _funderLiveBalanceFloorMsat(): bigint {
+		const pendingMsat = this.getPendingSpliceLocalBalanceMsat();
+		return pendingMsat !== null && pendingMsat < this._state.localBalanceMsat
+			? pendingMsat
+			: this._state.localBalanceMsat;
+	}
+
+	/**
+	 * A reading of the funder's balance above the reserve we enforce, bound
+	 * by the pending-splice view. With the session rebuilt, _splicedState
+	 * derives the funder's spliced balance; after a restart it is derived
+	 * from the invariant the spliced state itself uses (new capacity = ours
+	 * + theirs + every entry's value) off the persisted record, so the
+	 * mirror never skips the view the funder's own guard binds on. That
+	 * fallback (getPendingSpliceLocalBalanceMsat) leaves the initiator's
+	 * splice-out fee in our own pending balance, so the funder's remainder
+	 * reads lower than it is: stricter only.
+	 */
+	private _remoteFunderHeadroomMsat(balanceMsat: bigint): bigint {
+		const reserveSats = this._state.localConfig.channelReserveSatoshis;
+		const adjustMsat = balanceMsat - this._state.remoteBalanceMsat;
+		let headroomMsat = balanceMsat - reserveSats * 1000n;
+		const inFlight = this._state.spliceInFlight;
+		if (!inFlight) return headroomMsat;
+		const spliced = this._splicedState();
+		let pendingMsat: bigint | null = null;
+		let pendingCapacity = inFlight.newFundingSatoshis;
+		if (spliced) {
+			pendingMsat = spliced.remoteBalanceMsat;
+			pendingCapacity = spliced.fundingSatoshis;
+		} else {
+			const pendingLocalMsat = this.getPendingSpliceLocalBalanceMsat();
+			if (pendingLocalMsat !== null) {
+				let htlcMsat = 0n;
+				for (const e of this._state.htlcs.values()) htlcMsat += e.amountMsat;
+				pendingMsat = pendingCapacity * 1000n - pendingLocalMsat - htlcMsat;
+			}
+		}
+		if (pendingMsat !== null) {
+			// The reserve the funder keeps on the pending capacity, floored at
+			// the stored value: the mirror of _pendingSpliceKeptReserveSats.
+			const pendingReserveSats = bigIntMax(
+				reserveSats,
+				v2ReserveWeKeep(
+					pendingCapacity,
+					this._state.remoteConfig.dustLimitSatoshis,
+					this._state.localConfig.dustLimitSatoshis
+				)
+			);
+			const pendingHeadroomMsat =
+				pendingMsat + adjustMsat - pendingReserveSats * 1000n;
+			if (pendingHeadroomMsat < headroomMsat) {
+				headroomMsat = pendingHeadroomMsat;
+			}
+		}
+		return headroomMsat;
+	}
+
+	/**
+	 * The send-side mirror of the funder-side arm in handleUpdateAddHtlc,
+	 * for the case where the PEER funds: null when the funder's own view of
+	 * its commitment (_remoteFunderSenderView) still keeps its reserve plus
+	 * the funder's cost with these offered adds in, else the local error to
+	 * answer with. One extra untrimmed slot is kept beyond the adds so a
+	 * sats-scale difference between the two books can only make this side
+	 * refuse first: a refusal here costs a retry, the funder's costs the
+	 * channel (issue #1020). Nothing to ask when we fund:
+	 * getSpendableOutboundMsat already retains our own fee with a buffer.
+	 */
+	private _remoteFunderFeeRefusal(amounts: bigint[]): string | null {
+		if (this._state.role !== ChannelRole.ACCEPTOR) return null;
+		const view = this._remoteFunderSenderView(
+			amounts.map((amountMsat) => ({
+				amountMsat,
+				direction: HtlcDirection.OFFERED
+			})),
+			1
+		);
+		if (this._remoteFunderHeadroomMsat(view.balanceMsat) >= view.costMsat) {
+			return null;
+		}
+		return 'Remote funder cannot afford commitment fee for HTLC';
+	}
+
+	/**
+	 * The outbound ceiling folded with the mirror, so the router and MPP
+	 * planning never select an add _remoteFunderFeeRefusal then refuses:
+	 * unchanged while the funder can take one more untrimmed HTLC with the
+	 * slot to spare (the cost of its untrimmed set plus two), capped at the
+	 * largest amount that trims on the funder's commitment while it can
+	 * still carry the set it has (a trimmed add costs it no fee weight and no
+	 * slot), zero below that. Not the funder's headroom itself: our sends do
+	 * not draw on the funder's balance, so subtracting its cost from our
+	 * ceiling would under-report a healthy channel by the funder's whole
+	 * slack.
+	 */
+	private _remoteFunderCeilingMsat(spendableMsat: bigint): bigint {
+		if (this._state.role !== ChannelRole.ACCEPTOR) return spendableMsat;
+		// The funder's untrimmed set as it stands; an untrimmed add of ours
+		// needs the funder to carry it plus the spare slot (two more), a
+		// trimmed one needs nothing beyond the set itself.
+		const current = this._remoteFunderSenderView([], 0);
+		const headroomMsat = this._remoteFunderHeadroomMsat(current.balanceMsat);
+		if (
+			headroomMsat >=
+			this._funderCostMsat(current.feeratePerKw, current.untrimmed + 2)
+		) {
+			return spendableMsat;
+		}
+		if (headroomMsat < current.costMsat) return 0n;
+		// An add of ours is a received output on the funder's commitment:
+		// trimmed below its dust limit plus the HTLC-success fee at the rate
+		// the funder has acked (no second-level fee on anchor channels).
+		let secondLevelFeeSats = 0n;
+		if (!isAnchorChannel(this._state.channelType)) {
+			secondLevelFeeSats = BigInt(
+				Math.floor((HTLC_SUCCESS_WEIGHT * current.feeratePerKw) / 1000)
+			);
+		}
+		const trimmedCapMsat =
+			(this._state.remoteConfig.dustLimitSatoshis + secondLevelFeeSats) *
+				1000n -
+			1n;
+		return trimmedCapMsat < spendableMsat ? trimmedCapMsat : spendableMsat;
 	}
 
 	private _countActiveHtlcs(): number {
@@ -15646,11 +16741,22 @@ export class Channel {
 			this._state.channelType &&
 			FeatureFlags.fromBuffer(this._state.channelType).hasFeature(
 				Feature.ZERO_CONF
-			) &&
-			msg.minimumDepth !== 0
+			)
 		) {
-			const reason = `zero_conf accept_channel2 must use minimum_depth 0, got ${msg.minimumDepth}`;
-			return refuse(reason);
+			if (msg.minimumDepth !== 0) {
+				const reason = `zero_conf accept_channel2 must use minimum_depth 0, got ${msg.minimumDepth}`;
+				return refuse(reason);
+			}
+		} else {
+			// BOLT 2: our channel_ready waits for the accepter's minimum_depth.
+			// Never for less than our own default either: until the funding is
+			// buried the accepter can double-spend an input of its own and take
+			// back a balance it has already spent through us. Floored whatever
+			// the accepter funds here, because an RBF can change its share later.
+			this._state.minimumDepth = Math.max(
+				DEFAULT_MINIMUM_DEPTH,
+				msg.minimumDepth
+			);
 		}
 
 		this._state.remoteBasepoints = session.getRemoteBasepoints();
@@ -17951,6 +19057,10 @@ export class Channel {
 			);
 		}
 		this._v2SentCommitment = true;
+		this._cacheRemoteCommitmentForWatchtower(
+			this._state.remoteCurrentPerCommitmentPoint,
+			0n
+		);
 		const msg: ICommitmentSignedMessage = {
 			channelId: this._state.channelId!,
 			signature,
@@ -19633,6 +20743,15 @@ export class Channel {
 		// A v2 opening commitment (#0) carries no HTLCs.
 		this._state.remoteHtlcSignatures = [];
 		this._restoreV2RecordSnapshot(record);
+		// Every attempt shares the peer's point #0, so the watchtower entry
+		// under it describes whichever attempt was signed last. Re-cache it
+		// for the attempt that can now actually be revoked.
+		if (this._state.remoteCommitmentNumber === 0n) {
+			this._cacheRemoteCommitmentForWatchtower(
+				this._state.remoteCurrentPerCommitmentPoint,
+				0n
+			);
+		}
 	}
 
 	/**
@@ -21808,6 +22927,17 @@ export class Channel {
 			return refuse(
 				FforAbortReason.TERMS_REFUSED,
 				'settlement_deadline is not in the future'
+			);
+		}
+		// The vouchers are our own offered HTLCs on preimages only we hold, and
+		// only ff_close or T_exp releases them (ACTIVE has no timeout). With any
+		// host policy or none, they may not reach past the horizon we accept on
+		// a received HTLC.
+		const epochBlocks = params.voucherExpiry - this._currentBlockHeight;
+		if (epochBlocks > Channel.MAX_HTLC_CLTV_EXPIRY_DELTA) {
+			return refuse(
+				FforAbortReason.TERMS_REFUSED,
+				`epoch of ${epochBlocks} blocks exceeds the ${Channel.MAX_HTLC_CLTV_EXPIRY_DELTA}-block voucher horizon`
 			);
 		}
 		if (

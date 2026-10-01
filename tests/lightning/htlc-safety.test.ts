@@ -13,13 +13,27 @@ import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
 	HtlcState,
-	HtlcDirection
+	HtlcDirection,
+	IHtlcEntry,
+	receivedAddIrrevocablyCommitted
 } from '../../src/lightning/channel/types';
-import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import {
+	ChannelActionType,
+	IHtlcForwardedAction
+} from '../../src/lightning/channel/channel-actions';
+import {
+	serializeChannelState,
+	deserializeChannelState
+} from '../../src/lightning/storage/serialization';
 import { MessageType } from '../../src/lightning/message/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { createAcceptorState } from '../../src/lightning/channel/channel-state';
 import { decodeChannelReadyMessage } from '../../src/lightning/message/channel-funding';
+import {
+	decodeCommitmentSignedMessage,
+	decodeRevokeAndAckMessage
+} from '../../src/lightning/message/channel-commitment';
+import { decodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import {
 	INCORRECT_CLTV_EXPIRY,
@@ -28,7 +42,8 @@ import {
 import {
 	seedKey,
 	signerFromSeed,
-	realInitialCommitmentSig
+	realInitialCommitmentSig,
+	realCommitmentSigs
 } from './helpers/real-signing';
 
 function makeBasepoints(seed?: Buffer): IChannelBasepoints {
@@ -180,6 +195,41 @@ function setupChannelWithHtlc(cltvExpiry: number): {
 		crypto.randomBytes(1366)
 	);
 	expect(findErrorAction(addResult)).to.be.null;
+	const addPayload = findSendAction(addResult, MessageType.UPDATE_ADD_HTLC)!;
+	expect(
+		findErrorAction(
+			acceptor.handleUpdateAddHtlc(decodeUpdateAddHtlcMessage(addPayload))
+		)
+	).to.be.null;
+
+	const openerSigs = realCommitmentSigs(opener);
+	const openerCommitment = findSendAction(
+		opener.signCommitment(openerSigs.signature, openerSigs.htlcSignatures),
+		MessageType.COMMITMENT_SIGNED
+	)!;
+	const acceptorRevoke = findSendAction(
+		acceptor.handleCommitmentSigned(
+			decodeCommitmentSignedMessage(openerCommitment)
+		),
+		MessageType.REVOKE_AND_ACK
+	)!;
+	opener.handleRevokeAndAck(decodeRevokeAndAckMessage(acceptorRevoke));
+
+	const acceptorSigs = realCommitmentSigs(acceptor);
+	const acceptorCommitment = findSendAction(
+		acceptor.signCommitment(
+			acceptorSigs.signature,
+			acceptorSigs.htlcSignatures
+		),
+		MessageType.COMMITMENT_SIGNED
+	)!;
+	const openerRevoke = findSendAction(
+		opener.handleCommitmentSigned(
+			decodeCommitmentSignedMessage(acceptorCommitment)
+		),
+		MessageType.REVOKE_AND_ACK
+	)!;
+	acceptor.handleRevokeAndAck(decodeRevokeAndAckMessage(openerRevoke));
 
 	return { opener, acceptor, htlcId };
 }
@@ -485,5 +535,91 @@ describe('Security audit fixes — adversarial counterparty', function () {
 		const err = findErrorAction(result);
 		expect(err, 'mismatched revocation secret must be rejected').to.not.be.null;
 		expect(err).to.match(/per-commitment point/i);
+	});
+
+	it('C3: dispatches a peer add only after the peer revokes a commitment of ours carrying it (#1231)', function () {
+		const { opener, acceptor: live } = setupChannelWithHtlc(500);
+		let acceptor = live;
+
+		const add = (): bigint => {
+			const id = opener.getFullState().localHtlcCounter;
+			const actions = opener.addHtlc(
+				10_000_000n,
+				crypto.randomBytes(32),
+				500,
+				crypto.randomBytes(1366)
+			);
+			expect(findErrorAction(actions)).to.be.null;
+			const msg = decodeUpdateAddHtlcMessage(
+				findSendAction(actions, MessageType.UPDATE_ADD_HTLC)!
+			);
+			expect(findErrorAction(acceptor.handleUpdateAddHtlc(msg))).to.be.null;
+			return id;
+		};
+		const sign = (channel: Channel): Buffer => {
+			const sigs = realCommitmentSigs(channel);
+			return findSendAction(
+				channel.signCommitment(sigs.signature, sigs.htlcSignatures),
+				MessageType.COMMITMENT_SIGNED
+			)!;
+		};
+		const revoke = (channel: Channel, commitment: Buffer): Buffer => {
+			const actions = channel.handleCommitmentSigned(
+				decodeCommitmentSignedMessage(commitment)
+			);
+			expect(findErrorAction(actions)).to.be.null;
+			return findSendAction(actions, MessageType.REVOKE_AND_ACK)!;
+		};
+		const forwarded = (channel: Channel, revocation: Buffer): bigint[] => {
+			const actions = channel.handleRevokeAndAck(
+				decodeRevokeAndAckMessage(revocation)
+			);
+			expect(findErrorAction(actions)).to.be.null;
+			return actions
+				.filter((a) => a.type === ChannelActionType.HTLC_FORWARDED)
+				.map((a) => (a as IHtlcForwardedAction).htlcId);
+		};
+
+		// u1 is signed both ways, but the acceptor's commitment B_prev is still
+		// in flight when the opener adds and signs u2.
+		const u1 = add();
+		const revokeU1 = revoke(acceptor, sign(opener));
+		const bPrev = sign(acceptor);
+		forwarded(opener, revokeU1);
+		const u2 = add();
+		const revokeU2 = revoke(acceptor, sign(opener));
+
+		// h: the opener cannot sign it (u2's round is open), so no
+		// commitment_signed covers it.
+		const h = add();
+
+		// B_prev predates u2, so the opener's revoke for it releases u1 only.
+		expect(forwarded(acceptor, revoke(opener, bPrev))).to.deep.equal([u1]);
+
+		// Bk, what the manager's auto-sign sends next, carries u2 and leaves h
+		// out. h reads COMMITTED from here on, but is not irrevocably committed.
+		const bk = sign(acceptor);
+		const hEntry = (): IHtlcEntry =>
+			acceptor.getFullState().htlcs.get(`received-${h}`)!;
+		expect(hEntry().state).to.equal(HtlcState.COMMITTED);
+		expect(receivedAddIrrevocablyCommitted(hEntry())).to.equal(false);
+
+		// A restart here must keep both the pending stamp and h's flag.
+		acceptor = new Channel(
+			deserializeChannelState(serializeChannelState(acceptor.getFullState()))
+		);
+		acceptor.setSigner(live.getSigner()!);
+
+		forwarded(opener, revokeU2);
+		expect(forwarded(acceptor, revoke(opener, bk))).to.deep.equal([u2]);
+		expect(receivedAddIrrevocablyCommitted(hEntry())).to.equal(false);
+
+		// Only once the opener signs h and revokes a commitment carrying it.
+		const revokeH = revoke(acceptor, sign(opener));
+		const bNext = sign(acceptor);
+		forwarded(opener, revokeH);
+		expect(receivedAddIrrevocablyCommitted(hEntry())).to.equal(false);
+		expect(forwarded(acceptor, revoke(opener, bNext))).to.deep.equal([h]);
+		expect(receivedAddIrrevocablyCommitted(hEntry())).to.equal(true);
 	});
 });

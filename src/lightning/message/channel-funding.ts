@@ -28,6 +28,12 @@ const TLV_NEXT_LOCAL_NONCE = 4n;
 // pin at interop). Same type/layout as commitment_signed — 32-byte MuSig2
 // partial signature || 66-byte public (signing) nonce.
 const TLV_PARTIAL_SIG_WITH_NONCE = 2n;
+/** Shared by funding_created and funding_signed. */
+const FUNDING_SIG_TLV_TYPES = new Set<bigint>([TLV_PARTIAL_SIG_WITH_NONCE]);
+const CHANNEL_READY_TLV_TYPES = new Set<bigint>([
+	TLV_SHORT_CHANNEL_ID,
+	TLV_NEXT_LOCAL_NONCE
+]);
 
 export interface IFundingCreatedMessage {
 	temporaryChannelId: Buffer;
@@ -143,7 +149,7 @@ export function decodeFundingCreatedMessage(
 
 	// option_taproot: parse the optional partial_signature_with_nonce (TLV type 2).
 	if (offset < payload.length) {
-		const { records } = decodeTlvStream(payload, offset);
+		const { records } = decodeTlvStream(payload, offset, FUNDING_SIG_TLV_TYPES);
 		for (const record of records) {
 			if (
 				record.type === TLV_PARTIAL_SIG_WITH_NONCE &&
@@ -205,7 +211,11 @@ export function decodeFundingSignedMessage(
 
 	// option_taproot: parse the optional partial_signature_with_nonce (TLV type 2).
 	if (payload.length > FUNDING_SIGNED_LENGTH) {
-		const { records } = decodeTlvStream(payload, FUNDING_SIGNED_LENGTH);
+		const { records } = decodeTlvStream(
+			payload,
+			FUNDING_SIGNED_LENGTH,
+			FUNDING_SIG_TLV_TYPES
+		);
 		for (const record of records) {
 			if (
 				record.type === TLV_PARTIAL_SIG_WITH_NONCE &&
@@ -276,7 +286,11 @@ export function decodeChannelReadyMessage(
 	const result: IChannelReadyMessage = { channelId, secondPerCommitmentPoint };
 
 	if (offset < payload.length) {
-		const { records } = decodeTlvStream(payload, offset);
+		const { records } = decodeTlvStream(
+			payload,
+			offset,
+			CHANNEL_READY_TLV_TYPES
+		);
 		for (const record of records) {
 			if (record.type === TLV_SHORT_CHANNEL_ID) {
 				result.shortChannelId = record.value;

@@ -19,6 +19,7 @@ import {
 	defaultDataDirForMnemonic,
 	gossipPrimeLatch
 } from '../../src/cli/beignet-node';
+import { Wallet } from '../../src/wallet';
 import type {
 	ApiResponse,
 	NodeInfo,
@@ -46,7 +47,7 @@ import type {
 // regtest default in src/cli/beignet-node.ts is a remote public host, so these
 // nominally offline tests dial a third party over the internet and fail
 // whenever it is unreachable. BeignetNode.init tolerates a failed connect:
-// resolveWalletSweepScript falls back to a locally derived index-0 address.
+// resolveWalletSweepScript falls back to a locally derived change address.
 const OFFLINE_ELECTRUM = {
 	electrumHost: '127.0.0.1',
 	electrumPort: 65529,
@@ -325,6 +326,25 @@ describe('Config management', () => {
 		expect(resolved.alias).to.equal('fileAlias');
 	});
 
+	it('resolveConfig prefers BEIGNET_API_TOKEN over the file token, and reads the file token without it (issue #1005)', () => {
+		// beignet init writes the token to the file; an operator who sets the
+		// env var on top still gets the env var.
+		saveConfig({ network: 'regtest', apiToken: 'filetoken' });
+		const origEnv = process.env.BEIGNET_API_TOKEN;
+		try {
+			delete process.env.BEIGNET_API_TOKEN;
+			expect(resolveConfig({}).apiToken).to.equal('filetoken');
+			process.env.BEIGNET_API_TOKEN = 'envtoken';
+			expect(resolveConfig({}).apiToken).to.equal('envtoken');
+			expect(resolveConfig({ apiToken: 'flagtoken' }).apiToken).to.equal(
+				'flagtoken'
+			);
+		} finally {
+			if (origEnv === undefined) delete process.env.BEIGNET_API_TOKEN;
+			else process.env.BEIGNET_API_TOKEN = origEnv;
+		}
+	});
+
 	it('resolveConfig uses env vars as middle priority', () => {
 		const config: BeignetConfig = { network: 'mainnet' };
 		saveConfig(config);
@@ -473,10 +493,12 @@ describe('BeignetNode', () => {
 		// catch that accepted any Error, and expect.fail throws an
 		// AssertionError, so the test passed whether or not create rejected.
 		// It does not reject: resolveWalletSweepScript swallows the connect
-		// failure and falls back to a deterministic index-0 wallet address,
-		// which is what keeps an offline restart able to build a force-close
-		// sweep. (The dial is a refused loopback port rather than the old
-		// 192.0.2.1 blackhole, which cost a connect timeout per run.)
+		// failure and falls back to the wallet's change address (change index
+		// 0 on a wallet that has never set its indexes; receive index 0 before
+		// issue #1064), which is what keeps an offline restart able to build
+		// a force-close sweep. (The dial is a refused loopback port rather
+		// than the old 192.0.2.1 blackhole, which cost a connect timeout per
+		// run.)
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-test-'));
 		let node: BeignetNode | undefined;
 		try {
@@ -494,6 +516,26 @@ describe('BeignetNode', () => {
 				'the offline fallback still produced a wallet-owned sweep script'
 			).to.be.instanceOf(Buffer);
 			expect(sweepScript!.length).to.be.greaterThan(0);
+			// The change chain, never the receive chain (issue #1064): the
+			// receive address is the one POST /address/new hands out on a new
+			// wallet, so a sweep there would read as a request being paid.
+			const wallet = (node as unknown as { wallet: Wallet }).wallet;
+			const generated = await wallet.generateAddresses({
+				addressAmount: 1,
+				changeAddressAmount: 1
+			});
+			expect(generated.isOk()).to.equal(true);
+			const bitcoin = require('bitcoinjs-lib');
+			const scriptOf = (address: string): Buffer =>
+				bitcoin.address.toOutputScript(address, bitcoin.networks.regtest);
+			const change0 = Object.values(
+				generated.isOk() ? generated.value.changeAddresses : {}
+			)[0].address;
+			const receive0 = Object.values(
+				generated.isOk() ? generated.value.addresses : {}
+			)[0].address;
+			expect(sweepScript!.equals(scriptOf(change0))).to.equal(true);
+			expect(sweepScript!.equals(scriptOf(receive0))).to.equal(false);
 		} finally {
 			await node?.destroy();
 			fs.rmSync(dir, { recursive: true, force: true });
@@ -991,6 +1033,14 @@ describe('BeignetNode new methods', () => {
 		const rawTxId =
 			'c5e16610ec61535498f672f71653242a05f80b7e7e080b8b86badb49737f0efa';
 
+		// Inherit the prototype so internal helpers (_broadcastRawTx) resolve.
+		// Object.create skips field initializers, so the send lock is set here.
+		const nodeWith = (wallet: unknown): BeignetNode =>
+			Object.assign(Object.create(BeignetNode.prototype), {
+				wallet,
+				_onchainSendLock: Promise.resolve()
+			}) as unknown as BeignetNode;
+
 		it('builds without broadcast, then broadcasts the hex', async () => {
 			const { ok } = require('../../src/utils/result');
 			const calls: Record<string, unknown>[] = [];
@@ -999,6 +1049,8 @@ describe('BeignetNode new methods', () => {
 					calls.push({ method: 'send', ...opts });
 					return ok(rawTxHex);
 				},
+				// sendOnchain resets the staged send on every way out (#1002).
+				resetSendTransaction: async (): Promise<unknown> => ok('reset'),
 				electrum: {
 					broadcastTransaction: async (opts: {
 						rawTx: string;
@@ -1008,11 +1060,7 @@ describe('BeignetNode new methods', () => {
 					}
 				}
 			};
-			// Inherit the prototype so internal helpers (_broadcastRawTx) resolve.
-			const result = await BeignetNode.prototype.sendOnchain.call(
-				Object.assign(Object.create(BeignetNode.prototype), {
-					wallet: fakeWallet
-				}) as unknown as BeignetNode,
+			const result = await nodeWith(fakeWallet).sendOnchain(
 				'bcrt1qexample',
 				200000,
 				2
@@ -1031,24 +1079,132 @@ describe('BeignetNode new methods', () => {
 			const { ok, err } = require('../../src/utils/result');
 			const fakeWallet = {
 				send: async (): Promise<unknown> => ok(rawTxHex),
+				resetSendTransaction: async (): Promise<unknown> => ok('reset'),
 				electrum: {
 					broadcastTransaction: async (): Promise<unknown> =>
 						err('electrum rejected')
 				}
 			};
 			try {
-				await BeignetNode.prototype.sendOnchain.call(
-					Object.assign(Object.create(BeignetNode.prototype), {
-						wallet: fakeWallet
-					}) as unknown as BeignetNode,
-					'bcrt1qexample',
-					200000
-				);
+				await nodeWith(fakeWallet).sendOnchain('bcrt1qexample', 200000);
 				expect.fail('Should have thrown');
 			} catch (e: unknown) {
 				expect((e as BeignetError).code).to.equal('SEND_FAILED');
 				expect((e as BeignetError).message).to.include('electrum rejected');
 			}
+		});
+
+		describe('overlapping sends (#1054)', () => {
+			const bitcoin = require('bitcoinjs-lib');
+			const network = bitcoin.networks.regtest;
+			const addressFor = (fill: number): string =>
+				bitcoin.payments.p2wpkh({ hash: Buffer.alloc(20, fill), network })
+					.address;
+
+			/**
+			 * Stages every send in one shared transaction, the way the wallet
+			 * does: send resets it on entry, stages its output, and builds only
+			 * after an await (the persist), so a send that starts in that window
+			 * replaces the first one's output.
+			 */
+			const stagingWallet = (
+				failFor?: string
+			): {
+				wallet: unknown;
+				gates: Array<() => void>;
+				broadcasts: string[][];
+			} => {
+				const { ok, err } = require('../../src/utils/result');
+				const gates: Array<() => void> = [];
+				const broadcasts: string[][] = [];
+				let staged: Array<{ address: string; value: number }> = [];
+				const wallet = {
+					send: async (opts: {
+						address: string;
+						amount: number;
+					}): Promise<unknown> => {
+						staged = [{ address: opts.address, value: opts.amount }];
+						await new Promise<void>((resolve) => gates.push(resolve));
+						if (opts.address === failFor) return err('insufficient funds');
+						const tx = new bitcoin.Transaction();
+						tx.addInput(Buffer.alloc(32, broadcasts.length + 1), 0);
+						for (const output of staged) {
+							tx.addOutput(
+								bitcoin.address.toOutputScript(output.address, network),
+								output.value
+							);
+						}
+						return ok(tx.toHex());
+					},
+					resetSendTransaction: async (): Promise<unknown> => {
+						staged = [];
+						return ok('reset');
+					},
+					electrum: {
+						broadcastTransaction: async (opts: {
+							rawTx: string;
+						}): Promise<unknown> => {
+							const tx = bitcoin.Transaction.fromHex(opts.rawTx);
+							broadcasts.push(
+								tx.outs.map((out: { script: Buffer }) =>
+									bitcoin.address.fromOutputScript(out.script, network)
+								)
+							);
+							return ok(tx.getId());
+						}
+					}
+				};
+				return { wallet, gates, broadcasts };
+			};
+
+			/** Opens the wallet's persist gates one at a time until all settle. */
+			const drain = async (
+				gates: Array<() => void>,
+				sends: Promise<unknown>[]
+			): Promise<PromiseSettledResult<unknown>[]> => {
+				let done = false;
+				const settled = Promise.allSettled(sends).then((results) => {
+					done = true;
+					return results;
+				});
+				while (!done) {
+					await new Promise((resolve) => setImmediate(resolve));
+					gates.shift()?.();
+				}
+				return settled;
+			};
+
+			it('each broadcast carries only its own recipient', async () => {
+				const first = addressFor(1);
+				const second = addressFor(2);
+				const { wallet, gates, broadcasts } = stagingWallet();
+				const node = nodeWith(wallet);
+				const results = await drain(gates, [
+					node.sendOnchain(first, 10_000),
+					node.sendOnchain(second, 20_000)
+				]);
+				expect(results.map((r) => r.status)).to.deep.equal([
+					'fulfilled',
+					'fulfilled'
+				]);
+				expect(broadcasts).to.deep.equal([[first], [second]]);
+			});
+
+			it('a failed send does not hold up the one queued behind it', async () => {
+				const first = addressFor(1);
+				const second = addressFor(2);
+				const { wallet, gates, broadcasts } = stagingWallet(first);
+				const node = nodeWith(wallet);
+				const results = await drain(gates, [
+					node.sendOnchain(first, 10_000),
+					node.sendOnchain(second, 20_000)
+				]);
+				expect(results.map((r) => r.status)).to.deep.equal([
+					'rejected',
+					'fulfilled'
+				]);
+				expect(broadcasts).to.deep.equal([[second]]);
+			});
 		});
 	});
 
@@ -1201,10 +1357,12 @@ describe('Payment Fee Safety', () => {
 		const {
 			LightningNode
 		} = require('../../src/lightning/node/lightning-node');
-		// sendPayment(invoiceStr, excludedChannels?, maxFeeMsat?, amountMsat?, maxCltvExpiryHeight?)
+		// sendPayment(invoiceStr, excludedChannels?, maxFeeMsat?, amountMsat?, maxCltvExpiryHeight?, policyOverrides?, metadata?)
 		expect(typeof LightningNode.prototype.sendPayment).to.equal('function');
-		// Verify it accepts 5 params (invoiceStr, excludedChannels, maxFeeMsat, amountMsat, maxCltvExpiryHeight)
-		expect(LightningNode.prototype.sendPayment.length).to.equal(5);
+		// Verify it accepts 7 params (invoiceStr, excludedChannels, maxFeeMsat,
+		// amountMsat, maxCltvExpiryHeight, policyOverrides since #1056,
+		// metadata since #1152)
+		expect(LightningNode.prototype.sendPayment.length).to.equal(7);
 	});
 
 	it('sendPayment is backward compatible without maxFeeMsat', () => {

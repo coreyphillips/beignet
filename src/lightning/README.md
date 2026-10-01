@@ -1143,7 +1143,7 @@ Channel-scoped events carry an **object**, not a bare id: `node.on('channel:read
 | Code | Thrown When |
 |------|------------|
 | `NO_ROUTE` | No route found to destination |
-| `DUPLICATE_PAYMENT` | Payment hash already in-flight |
+| `DUPLICATE_PAYMENT` | Payment hash already paid (known preimage or COMPLETED record, in memory or on disk), or still has an HTLC out; a failed HTLC counts as out until its removal is irrevocable (the peer's `revoke_and_ack` for the commitment without it), which is also when the automatic retry of a temporary failure is dispatched; after that a failed attempt can be sent again |
 | `NO_CHANNEL_TO_HOP` | No channel to first hop peer |
 | `FEE_EXCEEDS_MAX` | Route fee exceeds `maxFeeMsat` |
 | `MISSING_AMOUNT` | Amount-less invoice with no `amountMsat` override |

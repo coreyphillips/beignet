@@ -149,6 +149,8 @@ export interface ISerializedHtlcEntry {
 	commitCoverPending?: boolean;
 	addLocallyRevoked?: boolean;
 	removalLocallyRevoked?: boolean;
+	addRemotelyRevoked?: boolean;
+	addCoverPending?: boolean;
 	/** FFOR Variant D voucher marker (see IHtlcEntry.fforVoucher). */
 	fforVoucher?: boolean;
 	/** FFOR Variant D mismatching-add marker (see IHtlcEntry.fforMismatch). */
@@ -159,6 +161,10 @@ export interface ISerializedHtlcEntry {
 	forwardEmitted?: boolean;
 	/** Admission-time dust-exposure classification (see IHtlcEntry). */
 	dustExposureFailback?: boolean;
+	/** Admission-time expired-at-our-tip classification (see IHtlcEntry). */
+	expiredOnArrival?: boolean;
+	/** Admission-time funder-fee band classification (see IHtlcEntry). */
+	funderFeeFailback?: boolean;
 	/** Admitted while the capsule-restore hold stood (see IHtlcEntry). */
 	addedWhileRestoreUnproven?: boolean;
 	/** Admitted while the funding-missing quarantine stood (see IHtlcEntry). */
@@ -208,6 +214,12 @@ export function serializeHtlcEntry(
 		...(e.removalLocallyRevoked !== undefined
 			? { removalLocallyRevoked: e.removalLocallyRevoked }
 			: {}),
+		...(e.addRemotelyRevoked !== undefined
+			? { addRemotelyRevoked: e.addRemotelyRevoked }
+			: {}),
+		...(e.addCoverPending !== undefined
+			? { addCoverPending: e.addCoverPending }
+			: {}),
 		...(e.addRemoteSigned !== undefined
 			? { addRemoteSigned: e.addRemoteSigned }
 			: {}),
@@ -216,6 +228,12 @@ export function serializeHtlcEntry(
 			: {}),
 		...(e.dustExposureFailback !== undefined
 			? { dustExposureFailback: e.dustExposureFailback }
+			: {}),
+		...(e.expiredOnArrival !== undefined
+			? { expiredOnArrival: e.expiredOnArrival }
+			: {}),
+		...(e.funderFeeFailback !== undefined
+			? { funderFeeFailback: e.funderFeeFailback }
 			: {}),
 		...(e.addedWhileRestoreUnproven !== undefined
 			? { addedWhileRestoreUnproven: e.addedWhileRestoreUnproven }
@@ -260,6 +278,12 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 			...(s.removalLocallyRevoked !== undefined
 				? { removalLocallyRevoked: s.removalLocallyRevoked }
 				: {}),
+			...(s.addRemotelyRevoked !== undefined
+				? { addRemotelyRevoked: s.addRemotelyRevoked }
+				: {}),
+			...(s.addCoverPending !== undefined
+				? { addCoverPending: s.addCoverPending }
+				: {}),
 			...(s.addRemoteSigned !== undefined
 				? { addRemoteSigned: s.addRemoteSigned }
 				: {}),
@@ -268,6 +292,12 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 				: {}),
 			...(s.dustExposureFailback !== undefined
 				? { dustExposureFailback: s.dustExposureFailback }
+				: {}),
+			...(s.expiredOnArrival !== undefined
+				? { expiredOnArrival: s.expiredOnArrival }
+				: {}),
+			...(s.funderFeeFailback !== undefined
+				? { funderFeeFailback: s.funderFeeFailback }
 				: {}),
 			...(s.addedWhileRestoreUnproven !== undefined
 				? { addedWhileRestoreUnproven: s.addedWhileRestoreUnproven }
@@ -328,6 +358,13 @@ export interface ISerializedChannelState {
 	 * quarantine the chain has not lifted.
 	 */
 	fundingUnaccounted?: boolean;
+	/** A splice has been adopted at least once (see IChannelState). */
+	hasBeenSpliced?: boolean;
+	/**
+	 * Funding txids retired by adopted splices, oldest first, internal byte
+	 * order hex (issue #1060). Absent on rows written before the field.
+	 */
+	previousFundingTxids?: string[];
 	fundingOutputIndex: number;
 	minimumDepth: number;
 	localConfig: ISerializedChannelConfig;
@@ -382,6 +419,13 @@ export interface ISerializedChannelState {
 	htlcs: ISerializedHtlcEntry[];
 	/** Per-remote-commitment HTLC snapshots for penalty completeness (H2). */
 	revokedHtlcSnapshots?: ISerializedHtlcSnapshot[];
+	/**
+	 * Unrevoked remote commitment txs kept for watchtower backups. A point
+	 * repeats once per funding output it was signed over.
+	 */
+	watchtowerRemoteCommitmentTxs?: Array<{ point: string; tx: string }>;
+	/** Revoked remote commitment txs whose watchtower hand-off failed. */
+	watchtowerBackupsOwed?: Array<{ secret: string; tx: string }>;
 	remoteCommitmentSignature: string | null;
 	remoteHtlcSignatures: string[];
 	/**
@@ -846,6 +890,8 @@ export function serializeChannelState(
 		pendingFundingTxHex: s.pendingFundingTxHex,
 		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
 		fundingUnaccounted: s.fundingUnaccounted,
+		hasBeenSpliced: s.hasBeenSpliced,
+		previousFundingTxids: s.previousFundingTxids?.map((t) => t.toString('hex')),
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: serializeChannelConfig(s.localConfig),
@@ -881,6 +927,17 @@ export function serializeChannelState(
 		localHtlcCounter: bigintToStr(s.localHtlcCounter),
 		htlcs,
 		revokedHtlcSnapshots,
+		watchtowerRemoteCommitmentTxs: s.watchtowerRemoteCommitmentTxs?.size
+			? [...s.watchtowerRemoteCommitmentTxs].flatMap(([point, txs]) =>
+					txs.map((tx) => ({ point, tx: tx.toString('hex') }))
+			  )
+			: undefined,
+		watchtowerBackupsOwed: s.watchtowerBackupsOwed?.length
+			? s.watchtowerBackupsOwed.map((e) => ({
+					secret: e.perCommitmentSecret.toString('hex'),
+					tx: e.tx.toString('hex')
+			  }))
+			: undefined,
 		remoteCommitmentSignature: bufToHex(s.remoteCommitmentSignature),
 		remoteHtlcSignatures: s.remoteHtlcSignatures.map((b) => b.toString('hex')),
 		remoteSigningNonce: bufToHex(s.remoteSigningNonce ?? null),
@@ -1264,6 +1321,10 @@ export function deserializeChannelState(
 		pendingFundingTxHex: s.pendingFundingTxHex,
 		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
 		fundingUnaccounted: s.fundingUnaccounted,
+		hasBeenSpliced: s.hasBeenSpliced,
+		previousFundingTxids: s.previousFundingTxids?.map((t) =>
+			Buffer.from(t, 'hex')
+		),
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: deserializeChannelConfig(s.localConfig),
@@ -1301,6 +1362,22 @@ export function deserializeChannelState(
 		localHtlcCounter: strToBigint(s.localHtlcCounter),
 		htlcs,
 		revokedHtlcSnapshots,
+		watchtowerRemoteCommitmentTxs: s.watchtowerRemoteCommitmentTxs?.length
+			? s.watchtowerRemoteCommitmentTxs.reduce(
+					(cache, e) =>
+						cache.set(e.point, [
+							...(cache.get(e.point) ?? []),
+							Buffer.from(e.tx, 'hex')
+						]),
+					new Map<string, Buffer[]>()
+			  )
+			: undefined,
+		watchtowerBackupsOwed: s.watchtowerBackupsOwed?.length
+			? s.watchtowerBackupsOwed.map((e) => ({
+					perCommitmentSecret: Buffer.from(e.secret, 'hex'),
+					tx: Buffer.from(e.tx, 'hex')
+			  }))
+			: undefined,
 		remoteCommitmentSignature: hexToBuf(s.remoteCommitmentSignature),
 		remoteHtlcSignatures: s.remoteHtlcSignatures.map((h) =>
 			Buffer.from(h, 'hex')
@@ -1454,6 +1531,8 @@ export interface ISerializedPaymentInfo {
 	paymentHash: string;
 	preimage?: string;
 	amountMsat: string;
+	/** Msat that left the node, fees included, when amountMsat is not that (MPP). */
+	sentMsat?: string;
 	status: string;
 	direction: string;
 	route?: string; // JSON string
@@ -1472,6 +1551,7 @@ export function serializePaymentInfo(p: IPaymentInfo): ISerializedPaymentInfo {
 		paymentHash: p.paymentHash.toString('hex'),
 		preimage: bufToHex(p.preimage) ?? undefined,
 		amountMsat: bigintToStr(p.amountMsat),
+		...(p.sentMsat !== undefined ? { sentMsat: bigintToStr(p.sentMsat) } : {}),
 		status: p.status,
 		direction: p.direction,
 		route: p.route
@@ -1515,6 +1595,7 @@ export function deserializePaymentInfo(
 		paymentHash: Buffer.from(s.paymentHash, 'hex'),
 		preimage: s.preimage ? Buffer.from(s.preimage, 'hex') : undefined,
 		amountMsat: strToBigint(s.amountMsat),
+		...(s.sentMsat !== undefined ? { sentMsat: strToBigint(s.sentMsat) } : {}),
 		status: s.status as PaymentStatus,
 		direction: s.direction as PaymentDirection,
 		route: s.route ? JSON.parse(s.route, reviver) : undefined,

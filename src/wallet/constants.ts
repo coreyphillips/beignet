@@ -22,7 +22,9 @@ export const DUST_LIMITS = {
 };
 
 /**
- * How long stop() waits for an in-flight refresh before shutting down anyway.
+ * How long stop() waits for an in-flight refresh, and for the storage writes
+ * already queued when it was called, before shutting down anyway. The two
+ * share this one deadline.
  *
  * A refresh is not itself bounded: it awaits an Electrum client that falls into
  * an untimed server_version handshake whenever a network has no client, plus
@@ -38,6 +40,12 @@ export const DUST_LIMITS = {
  * would rather wait can pass their own deadline.
  */
 export const STOP_REFRESH_WAIT_MS = 30_000;
+
+/**
+ * How many PSBTs buildPsbt remembers for importSignedPsbt to check against.
+ * The oldest is forgotten first; importing it then needs the unsigned PSBT.
+ */
+export const MAX_REMEMBERED_PSBT_BUILDS = 50;
 
 export const TRANSACTION_DEFAULTS = {
 	recommendedBaseFee: 256, // Total recommended tx base fee in sats

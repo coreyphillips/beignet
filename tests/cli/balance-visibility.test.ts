@@ -9,27 +9,95 @@
  */
 
 import { expect } from 'chai';
+import * as bitcoin from 'bitcoinjs-lib';
 import { BeignetNode } from '../../src/cli/beignet-node';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { ChannelState } from '../../src/lightning/channel/types';
+import {
+	CommitmentType,
+	OutputStatus,
+	OutputType
+} from '../../src/lightning/chain/types';
+
+type FakeTrackedOutput = {
+	txid: string;
+	outputType: OutputType;
+	status: OutputStatus;
+	isSecondLevelHtlc?: boolean;
+	resolutionTxid?: string;
+	sweepTxHex?: string;
+};
+
+/** What getPendingCloseBalanceSats reads from a channel's chain monitor. */
+type FakeMonitor = {
+	commitmentType: CommitmentType;
+	commitmentTxid: string;
+	outputs: FakeTrackedOutput[];
+};
 
 type FakeChannel = {
+	channelId?: Buffer;
 	state: ChannelState;
 	localBalanceMsat: bigint;
 	pendingSpliceLocalBalanceMsat?: bigint;
 	htlcUsable?: boolean;
 	payThroughSplice?: boolean;
+	monitor?: FakeMonitor;
 };
 
-function fakeNode(channels: FakeChannel[]): {
-	node: { listChannels: () => FakeChannel[] };
+type FakeWalletTx = { txid: string; exists?: boolean };
+
+function fakeNode(
+	channels: FakeChannel[],
+	walletTxs: FakeWalletTx[] = []
+): {
+	node: {
+		listChannels: () => FakeChannel[];
+		getChannelManager: () => { getMonitor: (id?: Buffer) => unknown };
+	};
+	wallet: { transactions: Record<string, FakeWalletTx> };
 } {
-	return { node: { listChannels: () => channels } };
+	const monitors = new Map<string, FakeMonitor>();
+	for (const ch of channels) {
+		if (ch.channelId && ch.monitor) {
+			monitors.set(ch.channelId.toString('hex'), ch.monitor);
+		}
+	}
+	const transactions: Record<string, FakeWalletTx> = {};
+	for (const tx of walletTxs) transactions[tx.txid] = tx;
+	// Built on the prototype so the private helpers a bucket calls through
+	// `this` (isForceCloseBalanceInWallet) resolve.
+	return Object.assign(Object.create(BeignetNode.prototype), {
+		node: {
+			listChannels: () => channels,
+			getChannelManager: () => ({
+				// A fake channel row without a channelId (the older cases) has
+				// no monitor, like a FORCE_CLOSED channel nothing has classified.
+				getMonitor: (id?: Buffer) => {
+					const monitor = id && monitors.get(id.toString('hex'));
+					if (!monitor) return undefined;
+					return {
+						getFullState: () => ({
+							commitmentBroadcast: {
+								commitmentType: monitor.commitmentType,
+								txid: monitor.commitmentTxid
+							}
+						}),
+						getTrackedOutputs: () => monitor.outputs
+					};
+				}
+			})
+		},
+		wallet: { transactions }
+	});
 }
 
-function pendingCloseSats(channels: FakeChannel[]): number {
+function pendingCloseSats(
+	channels: FakeChannel[],
+	walletTxs: FakeWalletTx[] = []
+): number {
 	return (BeignetNode.prototype as any).getPendingCloseBalanceSats.call(
-		fakeNode(channels)
+		fakeNode(channels, walletTxs)
 	);
 }
 
@@ -189,6 +257,77 @@ describe('Channel listing wire fields (GET /channels JSON)', () => {
 		);
 		expect(info.htlcUsable).to.equal(undefined);
 		expect(info.payThroughSplice).to.equal(undefined);
+	});
+
+	// Issue #1060: a wallet matches its own deposits against the channel's
+	// fundings, so the in-flight splice txid has to ride with the pending
+	// balance (same presence rule) and the retired fundings have to survive
+	// the adoption that moves fundingTxid on.
+	it('toChannelInfo passes pendingSpliceTxid through, present exactly with the pending balance', () => {
+		const call = (ch: Record<string, unknown>): Record<string, unknown> =>
+			(BeignetNode.prototype as any).toChannelInfo.call(
+				{
+					node: {
+						getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' }),
+						peerSupportsSplicing: () => null
+					}
+				},
+				ch
+			);
+		const base = {
+			channelId: Buffer.alloc(32, 4),
+			peerPubkey: 'peerpk',
+			state: 'NORMAL',
+			localBalanceMsat: 132_295_000n,
+			remoteBalanceMsat: 5_000_000n,
+			fundingSatoshis: 137_295n,
+			channelType: null
+		};
+		const spliceTxid = 'ab'.repeat(32);
+		const mid = call({
+			...base,
+			state: 'SPLICING',
+			pendingSpliceLocalBalanceMsat: 211_746_000n,
+			pendingSpliceTxid: spliceTxid
+		});
+		expect(mid.pendingSpliceLocalBalanceSats).to.equal(211_746);
+		expect(mid.pendingSpliceTxid).to.equal(spliceTxid);
+		const idle = call(base);
+		expect(idle.pendingSpliceLocalBalanceSats).to.equal(undefined);
+		expect(idle).to.not.have.property('pendingSpliceTxid');
+	});
+
+	it('toChannelInfo passes previousFundingTxids through in display order, oldest first', () => {
+		const call = (ch: Record<string, unknown>): Record<string, unknown> =>
+			(BeignetNode.prototype as any).toChannelInfo.call(
+				{
+					node: {
+						getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' }),
+						peerSupportsSplicing: () => null
+					}
+				},
+				ch
+			);
+		const base = {
+			channelId: Buffer.alloc(32, 5),
+			peerPubkey: 'peerpk',
+			state: 'NORMAL',
+			localBalanceMsat: 1_000_000n,
+			remoteBalanceMsat: 0n,
+			fundingSatoshis: 1_000n,
+			channelType: null,
+			fundingTxid: 'cc'.repeat(32)
+		};
+		// The node layer already reversed these; the serializer must pass
+		// them through untouched and in order.
+		const previous = ['aa'.repeat(32), 'bb'.repeat(32)];
+		const spliced = call({ ...base, previousFundingTxids: previous });
+		expect(spliced.previousFundingTxids).to.deep.equal(previous);
+		expect(spliced.fundingTxid).to.equal('cc'.repeat(32));
+		const never = call(base);
+		expect(never).to.not.have.property('previousFundingTxids');
+		const empty = call({ ...base, previousFundingTxids: [] });
+		expect(empty).to.not.have.property('previousFundingTxids');
 	});
 
 	// The dashboard hides its splice buttons on `false` alone, so the
@@ -390,5 +529,290 @@ describe('Balance visibility (pending close / errored)', () => {
 		expect(typeof BeignetNode.prototype.recoverFallbackFunds).to.equal(
 			'function'
 		);
+	});
+});
+
+describe('pendingCloseBalanceSats hands off to the wallet at the sweep (#1065)', () => {
+	// The regtest numbers from the issue: a 200,000-sat channel in which we
+	// held 10,628 sats, force-closed by the peer; our to_remote sweep pays
+	// 10,298 after a 330-sat fee.
+	const LOCAL_MSAT = 10_628_000n;
+	const channelId = Buffer.alloc(32, 7);
+	const commitmentTxid = 'aa'.repeat(32);
+	const spendTxid = 'bb'.repeat(32);
+
+	/** A real sweep tx so the txid derived from sweepTxHex is the wallet's. */
+	function sweepTx(): { hex: string; txid: string } {
+		const tx = new bitcoin.Transaction();
+		tx.version = 2;
+		tx.addInput(Buffer.from(commitmentTxid, 'hex').reverse(), 0);
+		tx.addOutput(Buffer.from('0014' + '11'.repeat(20), 'hex'), 10_298);
+		return { hex: tx.toHex(), txid: tx.getId() };
+	}
+
+	function theirCurrent(
+		balanceOutput: Partial<FakeTrackedOutput>,
+		extra: FakeTrackedOutput[] = []
+	): FakeChannel {
+		return {
+			channelId,
+			state: ChannelState.FORCE_CLOSED,
+			localBalanceMsat: LOCAL_MSAT,
+			monitor: {
+				commitmentType: CommitmentType.THEIR_CURRENT_COMMITMENT,
+				commitmentTxid,
+				outputs: [
+					{
+						txid: commitmentTxid,
+						outputType: OutputType.TO_REMOTE,
+						status: OutputStatus.CONFIRMED,
+						...balanceOutput
+					},
+					// The peer's own to_local: never ours, never swept by us.
+					{
+						txid: commitmentTxid,
+						outputType: OutputType.TO_LOCAL,
+						status: OutputStatus.CONFIRMED
+					},
+					...extra
+				]
+			}
+		};
+	}
+
+	it('counts a FORCE_CLOSED channel whose balance output is not swept yet', () => {
+		// Timelocked or declined: no sweep exists, the funds are pending close.
+		expect(pendingCloseSats([theirCurrent({})])).to.equal(10_628);
+		// A sweep exists but the wallet has not seen it: still pending close.
+		const sweep = sweepTx();
+		expect(
+			pendingCloseSats([
+				theirCurrent({
+					status: OutputStatus.SPEND_BROADCAST,
+					sweepTxHex: sweep.hex
+				})
+			])
+		).to.equal(10_628);
+	});
+
+	it('drops the channel once the wallet history holds the spend the monitor saw', () => {
+		const channel = theirCurrent({
+			status: OutputStatus.SPEND_CONFIRMED,
+			resolutionTxid: spendTxid
+		});
+		expect(pendingCloseSats([channel], [{ txid: spendTxid }])).to.equal(0);
+	});
+
+	it('drops the channel once the wallet history holds the sweep it built (mempool sighting)', () => {
+		const sweep = sweepTx();
+		const channel = theirCurrent({
+			status: OutputStatus.SPEND_BROADCAST,
+			sweepTxHex: sweep.hex
+		});
+		expect(pendingCloseSats([channel], [{ txid: sweep.txid }])).to.equal(0);
+		// An unrelated wallet transaction is not the sweep.
+		expect(pendingCloseSats([channel], [{ txid: spendTxid }])).to.equal(10_628);
+	});
+
+	it('counts the channel again when the wallet drops the sweep (evicted or ghosted)', () => {
+		const sweep = sweepTx();
+		const channel = theirCurrent({
+			status: OutputStatus.SPEND_BROADCAST,
+			sweepTxHex: sweep.hex
+		});
+		expect(pendingCloseSats([channel], [{ txid: sweep.txid }])).to.equal(0);
+		// Evicted: the entry is gone from the history.
+		expect(pendingCloseSats([channel], [])).to.equal(10_628);
+		// Ghosted: the entry is kept but marked no longer observed.
+		expect(
+			pendingCloseSats([channel], [{ txid: sweep.txid, exists: false }])
+		).to.equal(10_628);
+	});
+
+	it('uses the recorded spend over the built sweep when both exist', () => {
+		// An RBF replacement the monitor did not build (or a re-report) is the
+		// authoritative spend; the retained template is stale.
+		const sweep = sweepTx();
+		const channel = theirCurrent({
+			status: OutputStatus.SPEND_CONFIRMED,
+			sweepTxHex: sweep.hex,
+			resolutionTxid: spendTxid
+		});
+		expect(pendingCloseSats([channel], [{ txid: spendTxid }])).to.equal(0);
+		expect(pendingCloseSats([channel], [{ txid: sweep.txid }])).to.equal(
+			10_628
+		);
+	});
+
+	it('an HTLC sweep in the wallet does not stand in for the balance sweep', () => {
+		const htlcSpend = 'cc'.repeat(32);
+		const channel = theirCurrent({}, [
+			{
+				txid: commitmentTxid,
+				outputType: OutputType.RECEIVED_HTLC,
+				status: OutputStatus.SPEND_CONFIRMED,
+				resolutionTxid: htlcSpend
+			}
+		]);
+		expect(pendingCloseSats([channel], [{ txid: htlcSpend }])).to.equal(10_628);
+	});
+
+	it('on OUR commitment the balance output is the commitment to_local, not a second-level one', () => {
+		const secondLevelTxid = 'dd'.repeat(32);
+		const secondLevelSpend = 'ee'.repeat(32);
+		const ours = (toLocal: Partial<FakeTrackedOutput>): FakeChannel => ({
+			channelId,
+			state: ChannelState.FORCE_CLOSED,
+			localBalanceMsat: LOCAL_MSAT,
+			monitor: {
+				commitmentType: CommitmentType.OUR_COMMITMENT,
+				commitmentTxid,
+				outputs: [
+					{
+						txid: commitmentTxid,
+						outputType: OutputType.TO_LOCAL,
+						status: OutputStatus.CONFIRMED,
+						...toLocal
+					},
+					// The peer's to_remote on our commitment: never ours.
+					{
+						txid: commitmentTxid,
+						outputType: OutputType.TO_REMOTE,
+						status: OutputStatus.CONFIRMED
+					},
+					// The CSV output of our own HTLC-success tx: an HTLC resolution.
+					{
+						txid: secondLevelTxid,
+						outputType: OutputType.TO_LOCAL,
+						status: OutputStatus.SPEND_CONFIRMED,
+						isSecondLevelHtlc: true,
+						resolutionTxid: secondLevelSpend
+					}
+				]
+			}
+		});
+		// Timelocked to_local, no sweep yet: pending close, even though the
+		// second-level sweep is already in the wallet.
+		expect(pendingCloseSats([ours({})], [{ txid: secondLevelSpend }])).to.equal(
+			10_628
+		);
+		// The matured to_local sweep is in the wallet: handed off.
+		expect(
+			pendingCloseSats(
+				[
+					ours({
+						status: OutputStatus.SPEND_CONFIRMED,
+						resolutionTxid: spendTxid
+					})
+				],
+				[{ txid: spendTxid }]
+			)
+		).to.equal(0);
+	});
+
+	it('leaves SHUTTING_DOWN and NEGOTIATING_CLOSING counted whole, and a channel with no monitor', () => {
+		const coopId = Buffer.alloc(32, 8);
+		expect(
+			pendingCloseSats(
+				[
+					{
+						channelId: coopId,
+						state: ChannelState.SHUTTING_DOWN,
+						localBalanceMsat: 5_000_000n,
+						monitor: {
+							commitmentType: CommitmentType.COOPERATIVE_CLOSE,
+							commitmentTxid,
+							outputs: [
+								{
+									txid: commitmentTxid,
+									outputType: OutputType.TO_LOCAL,
+									status: OutputStatus.SPEND_CONFIRMED,
+									resolutionTxid: spendTxid
+								}
+							]
+						}
+					},
+					{
+						state: ChannelState.NEGOTIATING_CLOSING,
+						localBalanceMsat: 3_000_000n
+					},
+					// FORCE_CLOSED with no monitor at all (nothing classified yet).
+					{
+						channelId: Buffer.alloc(32, 9),
+						state: ChannelState.FORCE_CLOSED,
+						localBalanceMsat: 2_000_000n
+					}
+				],
+				[{ txid: spendTxid }]
+			)
+		).to.equal(10_000);
+	});
+
+	it('sums per channel: only the channel whose sweep the wallet holds leaves the figure', () => {
+		const otherId = Buffer.alloc(32, 10);
+		const otherCommitment = 'ff'.repeat(32);
+		const swept = theirCurrent({
+			status: OutputStatus.SPEND_CONFIRMED,
+			resolutionTxid: spendTxid
+		});
+		const unswept: FakeChannel = {
+			channelId: otherId,
+			state: ChannelState.FORCE_CLOSED,
+			localBalanceMsat: 4_000_000n,
+			monitor: {
+				commitmentType: CommitmentType.THEIR_CURRENT_COMMITMENT,
+				commitmentTxid: otherCommitment,
+				outputs: [
+					{
+						txid: otherCommitment,
+						outputType: OutputType.TO_REMOTE,
+						status: OutputStatus.CONFIRMED
+					}
+				]
+			}
+		};
+		expect(pendingCloseSats([swept, unswept], [{ txid: spendTxid }])).to.equal(
+			4_000
+		);
+	});
+
+	it('getInfo: after the sweep reaches the wallet the total equals the on-chain balance', () => {
+		// The issue's regtest read: height 96828, the to_remote sweep is in the
+		// mempool and the wallet already counts it (10,298). Before the fix
+		// getInfo reported pending close 10,628 next to it, a total of 20,926
+		// against a true 10,298.
+		const sweep = sweepTx();
+		const channel = theirCurrent({
+			status: OutputStatus.SPEND_BROADCAST,
+			sweepTxHex: sweep.hex
+		});
+		const info = (walletTxs: FakeWalletTx[], onchain: number) => {
+			const fake = Object.assign(Object.create(BeignetNode.prototype), {
+				...fakeNode([channel], walletTxs),
+				networkName: 'regtest'
+			});
+			fake.node.getNodeInfo = () => ({
+				nodeId: '02' + '00'.repeat(32),
+				channelCount: 1,
+				openChannelCount: 0,
+				peerCount: 0
+			});
+			fake.node.getCurrentBlockHeight = () => 96_828;
+			fake.node.isListening = () => false;
+			fake.node.getBalance = () => ({ localBalanceMsat: 0n });
+			fake.wallet.getBalance = () => onchain;
+			return fake.getInfo();
+		};
+		const before = info([], 0);
+		expect(before.pendingCloseBalanceSats).to.equal(10_628);
+		expect(before.onchainBalanceSats).to.equal(0);
+		const after = info([{ txid: sweep.txid }], 10_298);
+		expect(after.pendingCloseBalanceSats).to.equal(0);
+		expect(after.onchainBalanceSats).to.equal(10_298);
+		expect(
+			after.onchainBalanceSats +
+				after.lightningBalanceSats +
+				after.pendingCloseBalanceSats
+		).to.equal(10_298);
 	});
 });

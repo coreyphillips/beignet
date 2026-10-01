@@ -29,6 +29,7 @@ import {
 	parseStateBytes,
 	recordTranscriptHash,
 	registerTranscriptHash,
+	retainTranscriptHash,
 	signTranscript,
 	stateBytes,
 	statesEqual,
@@ -40,10 +41,14 @@ import {
 	IGuardianRecord,
 	IGuardianReceipt,
 	IGuardianRegisterNodeRequest,
+	IGuardianRetainFloor,
 	IGuardianRotateSetRequest,
-	IGuardianGetHeadResponse
+	IGuardianGetHeadResponse,
+	IGuardianGetStateResponse
 } from './guardian';
 import {
+	GuardianProtocolMismatchError,
+	GuardianTransportError,
 	IBoundGuardianClient,
 	IGuardianSetContext,
 	boundFanOut,
@@ -53,11 +58,15 @@ import {
 	verifyGuardianRotation,
 	IGuardianFanOutResult
 } from './guardian-client';
+import { GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES } from './guardian-host';
 import {
 	JOURNAL_META_KEYS,
+	META_LAST_SNAPSHOT_GROUP,
 	chainLostBackfill,
+	readSnapshotPageCount,
 	storedTipSequence,
 	resolveWatermarkAnchor,
+	verifyFrameChain,
 	META_REPLICATED_THROUGH,
 	META_REPLICATED_THROUGH_HASH
 } from './journal';
@@ -75,13 +84,66 @@ const META_PENDING_REGISTRATION = 'guardian_pending_registration_v1';
 export const META_GENERATION = JOURNAL_META_KEYS.generation;
 /** The configured guardian set as it stands, JSON entries (a rotation moves it). */
 export const META_GUARDIAN_SET = 'guardian_set_v1';
+/** The snapshot group every guardian proved it holds (see retainFloor). */
+const META_RETAIN_FLOOR = 'guardian_retain_floor_v1';
+
+interface ISnapshotGroup {
+	sequence: bigint;
+	groupEnd: bigint;
+	frameHash: Buffer;
+	/** The hash of the frame at groupEnd, recorded by the journal only. */
+	endHash?: Buffer;
+}
+
+/**
+ * A stored snapshot group, or null when it cannot name a record or, given a
+ * set id, was not stored for that set.
+ */
+function parseSnapshotGroup(
+	raw: string | null | undefined,
+	guardianSetId?: Buffer
+): ISnapshotGroup | null {
+	if (raw == null) return null;
+	let group: ISnapshotGroup;
+	try {
+		const parsed = JSON.parse(raw) as Record<string, unknown>;
+		if (
+			guardianSetId &&
+			parsed.guardianSetId !== guardianSetId.toString('hex')
+		) {
+			return null;
+		}
+		group = {
+			sequence: BigInt(String(parsed.sequence)),
+			groupEnd: BigInt(String(parsed.groupEnd)),
+			frameHash: Buffer.from(String(parsed.frameHash), 'hex'),
+			endHash:
+				parsed.endHash == null
+					? undefined
+					: Buffer.from(String(parsed.endHash), 'hex')
+		};
+	} catch {
+		return null;
+	}
+	if (
+		group.sequence < 1n ||
+		group.groupEnd < group.sequence ||
+		group.groupEnd > 0xffffffffffffffffn ||
+		group.frameHash.length !== 32 ||
+		(group.endHash !== undefined && group.endHash.length !== 32)
+	) {
+		return null;
+	}
+	return group;
+}
 
 export const REPLICATION_META_KEYS = {
 	replicatedThrough: META_REPLICATED_THROUGH,
 	replicatedThroughHash: META_REPLICATED_THROUGH_HASH,
 	pendingRegistration: META_PENDING_REGISTRATION,
 	generation: META_GENERATION,
-	guardianSet: META_GUARDIAN_SET
+	guardianSet: META_GUARDIAN_SET,
+	retainFloor: META_RETAIN_FLOOR
 } as const;
 
 /**
@@ -195,6 +257,11 @@ export interface IGuardianReplicationConfig {
 	 * at generation + 1 before the journal records the switch.
 	 */
 	generationOverride?: bigint;
+	/**
+	 * The journal's frame keys. A retain floor is named only from a frame
+	 * that decrypts to a snapshot, so without them no floor is sent.
+	 */
+	journalKeys?: { masterKey: Buffer; nodeId: Buffer };
 }
 
 export interface IGuardianReplicationEvent {
@@ -208,6 +275,8 @@ export interface IGuardianReplicationEvent {
 		| 'record:under-replicated'
 		| 'record:rejected'
 		| 'record:conflict'
+		| 'record:too-large'
+		| 'record:quota-refused'
 		| 'writer:fenced'
 		| 'writer:supersession-unproven';
 	detail: string;
@@ -241,6 +310,20 @@ export interface IReplicationResult {
 
 /** Frames one guardian may hold in flight at once (spec 5.3, pipelining). */
 const DEFAULT_PIPELINE_WINDOW = 8;
+/** Records read back per step when searching guardians for a floor. */
+const FLOOR_SEARCH_STEP = 64n;
+
+/** A guardian record as the journal stores a frame. */
+function recordAsFrame(record: IGuardianRecord): IStoredRecoveryFrame {
+	return {
+		sequence: Number(record.sequence),
+		writerEpoch: Number(record.epoch),
+		frameHash: record.frameHash,
+		previousFrameHash: record.previousHash,
+		ciphertext: record.ciphertext,
+		createdAt: 0
+	};
+}
 
 /**
  * What one guardian's stream achieved: the highest sequence it PROVED it
@@ -258,6 +341,12 @@ interface IGuardianStreamResult {
 	sawRetired: boolean;
 	/** A guardian holding a DIFFERENT record at one of our sequences. */
 	conflictAt: bigint | null;
+	/** The record this guardian refused as larger than it accepts. */
+	tooLargeAt: bigint | null;
+	/** The lowest record this guardian refused because its quota is full. */
+	quotaRefusedAt: bigint | null;
+	/** The head it reported when that lies below this pass's first record. */
+	behindAt: bigint | null;
 	requests: number;
 }
 
@@ -267,6 +356,14 @@ export class GuardianReplicator {
 	private readonly pipelineWindow: number;
 
 	private verifiedBindings: Set<string> | null = null;
+	/** maxCiphertextBytes each verified guardian advertised, by guardian id. */
+	private readonly advertisedCeilings = new Map<string, number>();
+	/** Too-large refusals already reported, as `guardian:sequence`. */
+	private readonly reportedTooLarge = new Set<string>();
+	/** Guardians whose quota refusal was reported and has not lifted since. */
+	private readonly reportedQuotaRefusal = new Set<string>();
+	/** Where findHeldRetainFloor last found no group (see there). */
+	private floorSearchMissedAt: string | null = null;
 	/**
 	 * Single-flight over replicatePending. Two overlapping passes would fan
 	 * the same records out twice and, worse, race the watermark: each computes
@@ -281,12 +378,14 @@ export class GuardianReplicator {
 		replicatedThrough: string;
 		replicatedThroughHash: string;
 		pendingRegistration: string;
+		retainFloor: string;
 	} {
 		const prefix = this.config.metaKeyPrefix ?? '';
 		return {
 			replicatedThrough: prefix + META_REPLICATED_THROUGH,
 			replicatedThroughHash: prefix + META_REPLICATED_THROUGH_HASH,
-			pendingRegistration: prefix + META_PENDING_REGISTRATION
+			pendingRegistration: prefix + META_PENDING_REGISTRATION,
+			retainFloor: prefix + META_RETAIN_FLOOR
 		};
 	}
 
@@ -314,9 +413,77 @@ export class GuardianReplicator {
 		if (this.verifiedBindings) return this.verifiedBindings;
 		this.verifiedBindings = await verifyGuardianBindings(
 			this.config.guardians,
-			this.config.context
+			this.config.context,
+			(key, info) => {
+				if (info.maxCiphertextBytes > 0) {
+					this.advertisedCeilings.set(key, info.maxCiphertextBytes);
+				}
+			}
 		);
 		return this.verifiedBindings;
+	}
+
+	/**
+	 * The largest record ciphertext every guardian in the set accepts. A
+	 * guardian refuses a bigger record and, accepting only the next sequence,
+	 * every record after it, so the journal holds its frames under this. A
+	 * guardian whose INFO has not been read yet counts at the host default.
+	 */
+	maxRecordBytes(): number {
+		let ceiling = Number.POSITIVE_INFINITY;
+		for (const entry of this.config.guardians) {
+			const advertised = this.advertisedCeilings.get(
+				entry.expectedGuardianId.toString('hex')
+			);
+			ceiling = Math.min(
+				ceiling,
+				advertised ?? GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES
+			);
+		}
+		return ceiling;
+	}
+
+	/** Start from the limits another replicator read for the same guardians. */
+	adoptRecordLimits(from: GuardianReplicator): void {
+		for (const [key, bytes] of from.advertisedCeilings) {
+			this.advertisedCeilings.set(key, bytes);
+		}
+	}
+
+	/**
+	 * Binding reads INFO once, so a guardian that was down then would count
+	 * at the host default for good. Asking it again each pass means records
+	 * written after it returns are sized for the limit it actually enforces.
+	 */
+	private async readMissingLimits(): Promise<void> {
+		await Promise.all(
+			this.config.guardians.map(async (entry) => {
+				const key = entry.expectedGuardianId.toString('hex');
+				if (this.advertisedCeilings.has(key)) return;
+				try {
+					// The client's cached compatibility INFO: a guardian that
+					// answered any verb has a known limit without another request
+					// that could fail. A guardian outside our protocol range is
+					// refused with the INFO it sent, and that limit still binds
+					// once it is back in range.
+					const info = await entry.client
+						.checkVersion()
+						.catch((error) =>
+							error instanceof GuardianProtocolMismatchError
+								? error.info
+								: entry.client.info()
+						);
+					if (
+						info.guardianId.equals(entry.expectedGuardianId) &&
+						info.maxCiphertextBytes > 0
+					) {
+						this.advertisedCeilings.set(key, info.maxCiphertextBytes);
+					}
+				} catch {
+					// Still unreachable: asked again next pass.
+				}
+			})
+		);
 	}
 
 	private emit(event: IGuardianReplicationEvent): void {
@@ -483,6 +650,10 @@ export class GuardianReplicator {
 	): Promise<NamespaceDecision> {
 		const held = loadWriterLease(this.config.storage);
 		if (held.state === 'present') {
+			// Nothing else on this path reads INFO before the node's first
+			// append writes this run's re-base snapshot, which must already be
+			// sized for the set's real limit.
+			await this.readMissingLimits();
 			return { outcome: 'already-held', lease: held.lease };
 		}
 
@@ -714,6 +885,10 @@ export class GuardianReplicator {
 			detail: `namespace registered with ${accepted} guardians at origin sequence ${initialState.origin.firstSequence}`,
 			receipts: accepted
 		});
+		// A guardian whose binding INFO failed can still have registered, and
+		// the first snapshot is written before any replication pass reads its
+		// limit again.
+		await this.readMissingLimits();
 		return { outcome: 'registered', lease };
 	}
 
@@ -773,6 +948,301 @@ export class GuardianReplicator {
 			receipts: accepted
 		});
 		return { accepted, initialState };
+	}
+
+	/**
+	 * The floor guardians may free below (wire 5.2): the newest snapshot
+	 * group every guardian of this set has proven it holds. A restore builds
+	 * on the first record it downloads, so a guardian must never keep less
+	 * than a complete group. A quorum is not enough: a guardian left behind
+	 * a peer's floor can never be repaired from that peer, and a restore
+	 * that has lost a quorum member needs exactly that repair.
+	 */
+	retainFloor(lease: IWriterLeaseKeys): IGuardianRetainFloor | undefined {
+		// Bound to the set that proved it: a rotation's incoming set has not.
+		const group = parseSnapshotGroup(
+			this.config.storage.getRecoveryMeta?.(this.keys.retainFloor),
+			this.config.context.guardianSetId
+		);
+		if (!group) return undefined;
+		return {
+			sequence: group.sequence,
+			frameHash: group.frameHash,
+			writerSignature: signTranscript(
+				retainTranscriptHash(this.config.context.guardianSetId, {
+					recoveryId: this.config.recoveryRoot.recoveryId,
+					epoch: lease.epoch,
+					sequence: group.sequence,
+					frameHash: group.frameHash
+				}),
+				lease.writerSecret
+			)
+		};
+	}
+
+	/**
+	 * Make the journal's newest snapshot group the retain floor once every
+	 * guardian proved in this pass that it holds the whole group. Returns
+	 * whether the floor moved.
+	 */
+	private advanceRetainFloor(streams: IGuardianStreamResult[]): boolean {
+		const storage = this.config.storage;
+		const keys = this.config.journalKeys;
+		if (!keys) return false;
+		const group = parseSnapshotGroup(
+			storage.getRecoveryMeta?.(META_LAST_SNAPSHOT_GROUP)
+		);
+		if (
+			!group ||
+			streams.some(
+				(stream) =>
+					stream.provenThrough == null || stream.provenThrough < group.groupEnd
+			)
+		) {
+			return false;
+		}
+		const current = parseSnapshotGroup(
+			storage.getRecoveryMeta?.(this.keys.retainFloor),
+			this.config.context.guardianSetId
+		);
+		if (current && current.sequence >= group.sequence) return false;
+		// The metadata is a plain row, so it only points: a delta or a
+		// groupEnd short of the last page would free below a snapshot no
+		// guardian keeps whole. The frame it names must decrypt to a snapshot
+		// whose own page count ends the group, at a frame the journal holds
+		// (it never compacts its newest group).
+		const stored =
+			storage.loadRecoveryFrames?.(Number(group.sequence) - 1) ?? [];
+		const frameAt = (sequence: bigint): IStoredRecoveryFrame | undefined =>
+			stored.find((frame) => BigInt(frame.sequence) === sequence);
+		const snapshot = frameAt(group.sequence);
+		const pages = snapshot
+			? readSnapshotPageCount(snapshot, keys.masterKey, keys.nodeId)
+			: null;
+		if (
+			pages == null ||
+			group.sequence + BigInt(pages) !== group.groupEnd ||
+			!group.endHash ||
+			!snapshot?.frameHash.equals(group.frameHash) ||
+			!frameAt(group.groupEnd)?.frameHash.equals(group.endHash)
+		) {
+			return false;
+		}
+		this.saveRetainFloor(group);
+		return true;
+	}
+
+	private saveRetainFloor(group: ISnapshotGroup): void {
+		this.config.storage.setRecoveryMeta?.(
+			this.keys.retainFloor,
+			JSON.stringify({
+				guardianSetId: this.config.context.guardianSetId.toString('hex'),
+				sequence: group.sequence.toString(),
+				groupEnd: group.groupEnd.toString(),
+				frameHash: group.frameHash.toString('hex')
+			})
+		);
+	}
+
+	/**
+	 * Name a floor for a set whose quota refuses this writer's records.
+	 * A refusal carries no receipt, so advanceRetainFloor has no proof, and
+	 * the journal's newest group is one the full guardians never received
+	 * (a restart re-bases above them and compacts what they hold). So the
+	 * floor is the newest snapshot group under every guardian's signed
+	 * head, read back from a guardian and verified up to a hash the journal
+	 * still holds. It is sent on its own snapshot record, which every
+	 * guardian holds, so each frees before being asked to store anything.
+	 * Returns whether a floor was named.
+	 */
+	private async findHeldRetainFloor(
+		lease: IWriterLeaseKeys,
+		tip: bigint
+	): Promise<boolean> {
+		const keys = this.config.journalKeys;
+		// A member this writer does not stream to could sit below the floor.
+		if (
+			!keys ||
+			this.config.guardians.length < this.config.context.members.length
+		) {
+			return false;
+		}
+		const storage = this.config.storage;
+		const recoveryId = this.config.recoveryRoot.recoveryId;
+		const receipts = await Promise.all(
+			this.config.guardians.map((entry) =>
+				entry.client.getHead(recoveryId).then(
+					(response) => response.receipt,
+					() => undefined
+				)
+			)
+		);
+		const heads: bigint[] = [];
+		for (const receipt of receipts) {
+			if (!receipt) return false;
+			heads.push(receipt.state.logHead.sequence);
+		}
+		const low = heads.reduce((a, b) => (b < a ? b : a));
+		const current = parseSnapshotGroup(
+			storage.getRecoveryMeta?.(this.keys.retainFloor),
+			this.config.context.guardianSetId
+		);
+		// Which groups qualify depends on nothing else, and a full guardian's
+		// head does not move, so a miss is not searched again every pass.
+		const position = `${lease.epoch}:${low}:${current?.sequence ?? 0n}`;
+		if (this.floorSearchMissedAt === position) return false;
+		const miss = (): false => {
+			this.floorSearchMissedAt = position;
+			return false;
+		};
+
+		let top = low;
+		let anchor = resolveWatermarkAnchor(storage, top);
+		if (!anchor) {
+			const first = storage.loadRecoveryFrames?.(Number(low))[0];
+			if (first) {
+				top = BigInt(first.sequence) - 1n;
+				anchor = resolveWatermarkAnchor(storage, top);
+			}
+		}
+		if (!anchor) return miss();
+		for (const [index, source] of this.config.guardians.entries()) {
+			if (heads[index] < top) continue;
+			let chain: { records: IGuardianRecord[]; pages: number } | null;
+			try {
+				chain = await this.readGroupBack(
+					source,
+					top,
+					low,
+					current?.sequence ?? 1n,
+					lease,
+					keys
+				);
+			} catch {
+				// Unreadable here: another guardian, or the next pass.
+				continue;
+			}
+			if (!chain) return miss();
+			const rows = chain.records.map(recordAsFrame);
+			const floor = chain.records[0];
+			try {
+				verifyFrameChain(
+					rows,
+					{
+						tipSequence: top.toString(),
+						tipHash: anchor.toString('hex'),
+						lastSnapshotSequence: floor.sequence.toString()
+					},
+					keys.masterKey,
+					keys.nodeId
+				);
+			} catch {
+				continue;
+			}
+			const groupEnd = floor.sequence + BigInt(chain.pages);
+			const verified = new Map(rows.map((row) => [BigInt(row.sequence), row]));
+			const everyHeld = receipts.every((receipt, i) => {
+				const proven = this.provenHead(
+					receipt,
+					lease,
+					verified,
+					this.config.guardians[i].expectedGuardianId,
+					tip
+				);
+				return proven?.conflictAt === null && proven.head >= groupEnd;
+			});
+			// A receipt that fails to bind may be a bad response, not the head.
+			if (!everyHeld) return false;
+			this.saveRetainFloor({
+				sequence: floor.sequence,
+				groupEnd,
+				frameHash: floor.frameHash
+			});
+			const record = this.signRecord(rows[0], lease);
+			const retainFloor = this.retainFloor(lease);
+			await Promise.all(
+				this.config.guardians.map((entry) =>
+					entry.client.putState(record, retainFloor).catch(() => undefined)
+				)
+			);
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Read `source`'s records back from `top` until the newest snapshot
+	 * above `above` whose whole group lies at or below `low`, as records
+	 * from that snapshot through `top`, or null when there is none. Only the
+	 * current lease's records qualify: a guardian frees below a floor only
+	 * that lease wrote. Throws when `source` does not serve the range.
+	 */
+	private async readGroupBack(
+		source: IBoundGuardianClient,
+		top: bigint,
+		low: bigint,
+		above: bigint,
+		lease: IWriterLeaseKeys,
+		keys: { masterKey: Buffer; nodeId: Buffer }
+	): Promise<{ records: IGuardianRecord[]; pages: number } | null> {
+		let records: IGuardianRecord[] = [];
+		let nextSnapshot: bigint | null = null;
+		let below = top;
+		let pageSize = Number(FLOOR_SEARCH_STEP);
+		while (below > above) {
+			const start =
+				below - above > FLOOR_SEARCH_STEP ? below - FLOOR_SEARCH_STEP : above;
+			const step: IGuardianRecord[] = [];
+			let cursor = start;
+			while (cursor < below) {
+				const want = Math.min(pageSize, Number(below - cursor));
+				let page: IGuardianGetStateResponse;
+				try {
+					page = await source.client.getState(
+						this.config.recoveryRoot.recoveryId,
+						cursor,
+						want
+					);
+				} catch (error) {
+					// Records that each fit can still overrun the client's
+					// response cap together.
+					if (want === 1) throw error;
+					pageSize = Math.ceil(want / 2);
+					continue;
+				}
+				const batch = page.records ?? [];
+				if (batch[0]?.sequence !== cursor + 1n) {
+					throw new Error(`guardian does not serve record ${cursor + 1n}`);
+				}
+				for (const record of batch) {
+					if (cursor === below || record.sequence !== cursor + 1n) break;
+					step.push(record);
+					cursor = record.sequence;
+				}
+			}
+			records = [...step, ...records];
+			for (let i = step.length - 1; i >= 0; i--) {
+				const record = step[i];
+				if (record.epoch !== lease.epoch) return null;
+				const pages = readSnapshotPageCount(
+					recordAsFrame(record),
+					keys.masterKey,
+					keys.nodeId
+				);
+				if (pages == null) continue;
+				const end = record.sequence + BigInt(pages);
+				// A later snapshot inside the page range cut this group off.
+				if (end <= low && (nextSnapshot == null || nextSnapshot > end)) {
+					return {
+						records: records.slice(records.indexOf(record)),
+						pages
+					};
+				}
+				nextSnapshot = record.sequence;
+			}
+			below = start;
+		}
+		return null;
 	}
 
 	/** Sign one journal frame as a guardian record (wire 4.2 RECORD). */
@@ -1032,13 +1502,17 @@ export class GuardianReplicator {
 		frames: IStoredRecoveryFrame[],
 		lease: IWriterLeaseKeys,
 		framesBySequence: Map<bigint, IStoredRecoveryFrame>,
-		tip: bigint
+		tip: bigint,
+		retainFloor: IGuardianRetainFloor | undefined
 	): Promise<IGuardianStreamResult> {
 		const result: IGuardianStreamResult = {
 			provenThrough: null,
 			sawSupersession: false,
 			sawRetired: false,
 			conflictAt: null,
+			tooLargeAt: null,
+			quotaRefusedAt: null,
+			behindAt: null,
 			requests: 0
 		};
 		let window = this.pipelineWindow;
@@ -1047,6 +1521,12 @@ export class GuardianReplicator {
 		// Strictly bounded: every round either advances the cursor or narrows
 		// the window, and a round that does neither twice stops the stream.
 		const maxRounds = frames.length + this.pipelineWindow + 1;
+		const noteTooLarge = (frame: IStoredRecoveryFrame): void => {
+			const sequence = BigInt(frame.sequence);
+			if (result.tooLargeAt == null || sequence < result.tooLargeAt) {
+				result.tooLargeAt = sequence;
+			}
+		};
 
 		for (let round = 0; round < maxRounds && cursor < frames.length; round++) {
 			const batch = frames.slice(cursor, cursor + window);
@@ -1054,16 +1534,40 @@ export class GuardianReplicator {
 			const responses = await Promise.all(
 				batch.map(async (frame) => {
 					try {
-						return await entry.client.putState(this.signRecord(frame, lease));
-					} catch {
+						return await entry.client.putState(
+							this.signRecord(frame, lease),
+							retainFloor
+						);
+					} catch (error) {
+						// A body past the advertised limit plus the envelope
+						// allowance is refused by the transport (HTTP and BOLT 8
+						// alike answer 413) before the guardian ever sees it.
+						if (
+							error instanceof GuardianTransportError &&
+							error.httpStatus === 413
+						) {
+							noteTooLarge(frame);
+						}
 						return undefined;
 					}
 				})
 			);
 
 			let reported: bigint | null = null;
-			for (const response of responses) {
+			for (const [index, response] of responses.entries()) {
 				if (!response) continue;
+				if (response.status === GuardianStatus.ERR_TOO_LARGE) {
+					noteTooLarge(batch[index]);
+				}
+				if (response.status === GuardianStatus.ERR_QUOTA_EXCEEDED) {
+					const sequence = BigInt(batch[index].sequence);
+					if (
+						result.quotaRefusedAt == null ||
+						sequence < result.quotaRefusedAt
+					) {
+						result.quotaRefusedAt = sequence;
+					}
+				}
 				if (response.status === GuardianStatus.ERR_EPOCH_SUPERSEDED) {
 					result.sawSupersession = true;
 				}
@@ -1106,6 +1610,10 @@ export class GuardianReplicator {
 
 			if (result.sawSupersession) return result;
 			if (reported == null) return result;
+			if (reported < BigInt(frames[0].sequence) - 1n) {
+				result.behindAt = reported;
+				return result;
+			}
 			const next = frames.findIndex(
 				(frame) => BigInt(frame.sequence) > (reported as bigint)
 			);
@@ -1121,6 +1629,56 @@ export class GuardianReplicator {
 			cursor = next;
 		}
 		return result;
+	}
+
+	/**
+	 * Relay what a guardian missed in earlier passes from a peer. A pass
+	 * starts at the quorum watermark, so otherwise it answers every later
+	 * record with a gap for good, and no retain floor (which needs every
+	 * guardian) qualifies again. The journal may have compacted those
+	 * frames, but no floor has passed this guardian, so the peers keep them.
+	 * At most `budget` records a pass, because the barrier waits on the
+	 * pass. The guardian misses every record a pass adds until it catches
+	 * up, so a budget no larger than that never closes the gap. Returns
+	 * whether the guardian reached `through`.
+	 */
+	private async catchUp(
+		entry: IBoundGuardianClient,
+		head: bigint,
+		through: bigint,
+		budget: number
+	): Promise<boolean> {
+		const limit = head + BigInt(budget);
+		const stop = limit < through ? limit : through;
+		for (const peer of this.config.guardians) {
+			if (peer === entry) continue;
+			let start: bigint;
+			do {
+				start = head;
+				try {
+					const page = await peer.client.getState(
+						this.config.recoveryRoot.recoveryId,
+						head,
+						this.pipelineWindow
+					);
+					for (const record of page.records ?? []) {
+						if (head >= stop || record.sequence !== head + 1n) break;
+						const response = await entry.client.syncRecord(record);
+						if (
+							response.status !== GuardianStatus.OK &&
+							response.status !== GuardianStatus.OK_DUPLICATE
+						) {
+							break;
+						}
+						head = record.sequence;
+					}
+				} catch {
+					// Nothing more from this peer this pass.
+				}
+			} while (head > start && head < stop);
+			if (head >= stop) break;
+		}
+		return head >= through;
 	}
 
 	/**
@@ -1155,6 +1713,7 @@ export class GuardianReplicator {
 			(frame) => BigInt(frame.sequence) > from
 		);
 		if (frames.length === 0) {
+			await this.readMissingLimits();
 			return {
 				outcome: 'replicated',
 				attempted: 0,
@@ -1171,14 +1730,59 @@ export class GuardianReplicator {
 			framesBySequence.set(BigInt(frame.sequence), frame);
 		}
 		const tip = BigInt(frames[frames.length - 1].sequence);
+		const streamTo = async (
+			entry: IBoundGuardianClient,
+			retainFloor: IGuardianRetainFloor | undefined
+		): Promise<IGuardianStreamResult> => {
+			const stream = (): Promise<IGuardianStreamResult> =>
+				this.streamToGuardian(
+					entry,
+					frames,
+					lease,
+					framesBySequence,
+					tip,
+					retainFloor
+				);
+			const result = await stream();
+			return result.behindAt != null &&
+				(await this.catchUp(
+					entry,
+					result.behindAt,
+					BigInt(frames[0].sequence) - 1n,
+					frames.length + this.pipelineWindow
+				))
+				? stream()
+				: result;
+		};
 
-		const streams = await Promise.all(
-			this.config.guardians.map((entry) =>
-				this.streamToGuardian(entry, frames, lease, framesBySequence, tip)
-			)
-		);
+		const retainFloor = this.retainFloor(lease);
+		let [streams] = await Promise.all([
+			Promise.all(
+				this.config.guardians.map((entry) => streamTo(entry, retainFloor))
+			),
+			this.readMissingLimits()
+		]);
+		// Retried now: without a waiting barrier, the next pass only comes
+		// with the next commit.
+		if (
+			streams.some((stream) => stream.quotaRefusedAt != null) &&
+			!streams.some((stream) => stream.sawSupersession || stream.sawRetired) &&
+			(await this.findHeldRetainFloor(lease, tip))
+		) {
+			const refused = streams;
+			const rescued = this.retainFloor(lease);
+			streams = await Promise.all(
+				this.config.guardians.map((entry, index) =>
+					refused[index].quotaRefusedAt == null
+						? refused[index]
+						: streamTo(entry, rescued)
+				)
+			);
+		}
 
-		for (const stream of streams) {
+		for (const [index, stream] of streams.entries()) {
+			const guardian =
+				this.config.guardians[index].expectedGuardianId.toString('hex');
 			if (stream.conflictAt != null) {
 				this.emit({
 					type: 'record:conflict',
@@ -1186,6 +1790,41 @@ export class GuardianReplicator {
 						`a guardian holds a DIFFERENT record at sequence ${stream.conflictAt}; ` +
 						`its receipts are not evidence for this chain`,
 					sequence: stream.conflictAt
+				});
+			}
+			if (stream.tooLargeAt != null) {
+				const key = `${guardian}:${stream.tooLargeAt}`;
+				// Every later pass resends the same record and meets the same
+				// refusal, so each one is reported once, not once per pass.
+				if (!this.reportedTooLarge.has(key)) {
+					this.reportedTooLarge.add(key);
+					this.emit({
+						type: 'record:too-large',
+						detail:
+							`guardian ${guardian} refused record ${stream.tooLargeAt} as larger ` +
+							`than the ciphertext it accepts; it takes only the next sequence, ` +
+							`so it can store nothing after this until its operator raises ` +
+							`the limit (the protocol allows up to 16 MiB)`,
+						sequence: stream.tooLargeAt
+					});
+				}
+			}
+			// Reported once per episode: every pass meets the same refusal
+			// until the guardian stores something again.
+			if (stream.quotaRefusedAt == null) {
+				if (stream.provenThrough != null) {
+					this.reportedQuotaRefusal.delete(guardian);
+				}
+			} else if (!this.reportedQuotaRefusal.has(guardian)) {
+				this.reportedQuotaRefusal.add(guardian);
+				this.emit({
+					type: 'record:quota-refused',
+					detail:
+						`guardian ${guardian} refused record ${stream.quotaRefusedAt}: ` +
+						`the storage quota it keeps for this guardian set is full, so it ` +
+						`stores nothing more until its operator raises the quota or the ` +
+						`set's writers free records below their retain floors`,
+					sequence: stream.quotaRefusedAt
 				});
 			}
 		}
@@ -1217,6 +1856,27 @@ export class GuardianReplicator {
 		if (quorumHead > tip) quorumHead = tip;
 		if (quorumHead < from) quorumHead = from;
 
+		// Remembered rather than recomputed: the journal overwrites the group
+		// when it writes its next snapshot, which a restart does before any
+		// pass runs, and every later record carries the remembered floor.
+		const completed = this.advanceRetainFloor(streams)
+			? this.retainFloor(lease)
+			: undefined;
+		// Sent now as well, on a record each guardian holds (answered
+		// OK_DUPLICATE), so a writer that goes idle still frees. Before the
+		// watermark moves, so no reader sees it ahead of this pass's result.
+		if (completed) {
+			await Promise.all(
+				this.config.guardians.map(async (entry, index) => {
+					const held = streams[index].provenThrough;
+					const frame = held == null ? undefined : framesBySequence.get(held);
+					if (!frame) return;
+					await entry.client
+						.putState(this.signRecord(frame, lease), completed)
+						.catch(() => undefined);
+				})
+			);
+		}
 		const replicatedThrough = this.raiseWatermark(quorumHead);
 		const durable = Number(
 			replicatedThrough > from ? replicatedThrough - from : 0n

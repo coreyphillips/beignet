@@ -61,7 +61,8 @@ function invoiceFor(
 	amountMsat: bigint,
 	hash = paymentHash,
 	network = Network.REGTEST,
-	timestamp = 1_700_000_000
+	timestamp = 1_700_000_000,
+	minFinalCltvExpiry = 194
 ): string {
 	return encodeInvoice({
 		network,
@@ -71,7 +72,7 @@ function invoiceFor(
 		paymentSecret: crypto.randomBytes(32),
 		description: 'swap',
 		expiry: 1800,
-		minFinalCltvExpiry: 194,
+		minFinalCltvExpiry,
 		privateKey: providerKey
 	});
 }
@@ -457,6 +458,29 @@ describe('Swap messages (issue #737)', function () {
 					termsFor({ bolt11: 'lnbcrt1nonsense' }),
 					{},
 					/does not decode/
+				],
+				// A provider that never funds keeps the payment locked for the
+				// invoice's final CLTV (issue #1039): at most the 144-block
+				// refund delta plus the margin.
+				[
+					'invoice final cltv',
+					termsFor({
+						bolt11: invoiceFor(
+							101_500_000n,
+							paymentHash,
+							Network.REGTEST,
+							1_700_000_000,
+							2016
+						)
+					}),
+					{},
+					/final CLTV 2016 exceeds 288/
+				],
+				[
+					'invoice final cltv past a tighter margin',
+					termsFor(),
+					{ maxFinalCltvMargin: 49 },
+					/final CLTV 194 exceeds 193/
 				]
 			];
 			for (const [label, ack, extra, pattern] of cases) {

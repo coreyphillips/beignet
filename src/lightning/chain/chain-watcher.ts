@@ -14,6 +14,7 @@ import { ChannelManager } from '../channel/channel-manager';
 import { createFundingScript } from '../script/funding';
 import { createTaprootFundingScript } from '../script/funding-taproot';
 import { isTaprootChannel } from '../channel/types';
+import { decodeShortChannelId } from '../gossip/types';
 import { IRREVOCABLE_DEPTH } from './types';
 
 bitcoin.initEccLib(ecc);
@@ -404,6 +405,86 @@ export async function classifyRemoteFundingInput(
 }
 
 /**
+ * Chain verdict on a gossiped channel's funding output (issue #1105).
+ * 'proven' = unspent at the SCID's height, transaction index and output
+ * index, paying the 2-of-2 of the announced bitcoin keys. 'refuted' = the
+ * server answered with no such output although the SCID is deep enough to
+ * need one: fabricated, or since closed. 'unknown' = the answer settles
+ * nothing. 'unavailable' = no answer; ask again later.
+ */
+export type AnnouncedFundingVerdict =
+	| 'proven'
+	| 'refuted'
+	| 'unknown'
+	| 'unavailable';
+
+/**
+ * Confirmations after which a missing funding output refutes an
+ * announcement: channels are announced at 6, and the other 6 cover a server
+ * that lags the tip this node last recorded.
+ */
+const FUNDING_REFUTE_DEPTH = 12;
+
+/**
+ * Check a channel_announcement's SCID against the chain. Never throws.
+ */
+export async function classifyAnnouncedChannelFunding(
+	backend: IChainBackend,
+	announcement: {
+		shortChannelId: Buffer;
+		bitcoinKey1: Buffer;
+		bitcoinKey2: Buffer;
+	},
+	tipHeight: number
+): Promise<AnnouncedFundingVerdict> {
+	if (!backend.listUnspent || !backend.getTransactionMerkleProof) {
+		return 'unknown';
+	}
+	let scid: ReturnType<typeof decodeShortChannelId>;
+	let scriptHash: string;
+	try {
+		scid = decodeShortChannelId(announcement.shortChannelId);
+		scriptHash = computeScriptHash(
+			createFundingScript(announcement.bitcoinKey1, announcement.bitcoinKey2)
+				.p2wshOutput
+		);
+	} catch {
+		return 'unknown';
+	}
+	let unspent: Awaited<ReturnType<NonNullable<IChainBackend['listUnspent']>>>;
+	try {
+		unspent = await backend.listUnspent(scriptHash);
+	} catch {
+		return 'unavailable';
+	}
+	// Height 0 is the mempool, which an SCID can never name.
+	const candidates = unspent.filter(
+		(u) =>
+			u.height > 0 &&
+			u.height === scid.block &&
+			u.outputIndex === scid.outputIndex
+	);
+	for (const u of candidates) {
+		let txIndex: number;
+		try {
+			txIndex = (await backend.getTransactionMerkleProof(u.txid, u.height))
+				.txIndex;
+		} catch {
+			return 'unavailable';
+		}
+		// ElectrumBackend reports a failed proof as index 0, so index 0 (the
+		// coinbase) can never prove a position.
+		if (txIndex !== 0 && txIndex === scid.txIndex) return 'proven';
+	}
+	// The right output in a transaction at another index proves nothing
+	// either way, for the same reason.
+	if (candidates.length > 0) return 'unknown';
+	return tipHeight - scid.block + 1 >= FUNDING_REFUTE_DEPTH
+		? 'refuted'
+		: 'unknown';
+}
+
+/**
  * Watches the blockchain for funding confirmations, output spends,
  * and new blocks, bridging these events to the ChannelManager.
  *
@@ -448,8 +529,10 @@ export async function classifyRemoteFundingInput(
  *   needs an output watched and cannot arm it itself
  * - 'block' (height: number)
  * - 'broadcast:success' (txid: string)
- * - 'broadcast:failure' (error: Error)
- * - 'broadcast:permanent_failure' (error: Error): retries exhausted
+ * - 'broadcast:failure' (error: Error, txid?: string): txid in display
+ *   order when the payload decoded (issue #1062)
+ * - 'broadcast:permanent_failure' (error: Error, txid: string): retries
+ *   exhausted; the transaction leaves the watcher's queue
  * - 'error' (error: Error)
  *
  * CONTRACT: register an 'error' listener. Chain failures are reported there
@@ -1587,8 +1670,9 @@ export class ChainWatcher extends EventEmitter {
 			// Queue for retry on next block. Guard the decode so a malformed
 			// payload is logged and dropped rather than throwing an unhandled
 			// rejection inside this catch handler (which would crash the process).
+			let txidHex: string | undefined;
 			try {
-				const txidHex = bitcoin.Transaction.fromBuffer(tx).getId();
+				txidHex = bitcoin.Transaction.fromBuffer(tx).getId();
 				// Dedup by txid
 				if (!this.failedBroadcasts.some((fb) => fb.txidHex === txidHex)) {
 					this.failedBroadcasts.push({
@@ -1600,7 +1684,10 @@ export class ChainWatcher extends EventEmitter {
 			} catch {
 				// Not a decodable transaction; nothing to queue for retry.
 			}
-			this.emit('broadcast:failure', err);
+			// The txid rides as a second argument (issue #1062) so the node
+			// can say which transaction, and whose channel, the failure is
+			// about. Undefined when the payload did not decode.
+			this.emit('broadcast:failure', err, txidHex);
 		});
 	};
 
@@ -1656,11 +1743,15 @@ export class ChainWatcher extends EventEmitter {
 			for (const fb of pendingBroadcasts) {
 				fb.retryCount++;
 				if (fb.retryCount > MAX_BROADCAST_RETRIES) {
+					// The txid as a second argument (issue #1062): the node
+					// resolves the channel and whether it still holds the
+					// transaction itself from it.
 					this.emit(
 						'broadcast:permanent_failure',
 						new Error(
 							`Broadcast permanently failed after ${MAX_BROADCAST_RETRIES} retries: ${fb.txidHex}`
-						)
+						),
+						fb.txidHex
 					);
 					continue;
 				}

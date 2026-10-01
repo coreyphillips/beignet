@@ -318,9 +318,9 @@ export function hasUnsupportedRequiredFeatures(
 	// BOLT 1: the disconnect test is whether we UNDERSTAND the required
 	// feature, not whether this node instance chose to advertise it —
 	// advertising is config-gated (anchors, wumbo, ...) and some implemented
-	// features (upfront_shutdown_script, route_blinding) are not advertised
-	// at all. Comparing against the advertised set alone disconnected peers
-	// requiring features we fully implement (S-7 LOW).
+	// features (route_blinding) are not advertised at all. Comparing against
+	// the advertised set alone disconnected peers requiring features we fully
+	// implement (S-7 LOW).
 	const implemented = implementedFeatures();
 
 	for (let bit = 0; bit <= maxBit; bit += 2) {
@@ -345,11 +345,14 @@ export function hasUnsupportedRequiredFeatures(
  * Every feature this implementation understands, independent of what a node
  * instance advertises. ONLY for the unknown-required-feature disconnect test
  * above — never advertise from this set.
+ *
+ * upfront_shutdown_script is absent on purpose: the script is parsed but
+ * handleShutdown never holds the peer to it, so a peer that requires the
+ * guarantee must be disconnected rather than silently not given it (#1047).
  */
 export function implementedFeatures(): FeatureFlags {
 	const flags = FeatureFlags.empty();
 	flags.setOptional(Feature.DATA_LOSS_PROTECT);
-	flags.setOptional(Feature.UPFRONT_SHUTDOWN_SCRIPT);
 	flags.setOptional(Feature.GOSSIP_QUERIES);
 	flags.setOptional(Feature.TLV_ONION);
 	flags.setOptional(Feature.STATIC_REMOTE_KEY);

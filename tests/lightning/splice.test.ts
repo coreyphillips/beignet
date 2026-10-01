@@ -42,7 +42,10 @@ import {
 	HtlcState
 } from '../../src/lightning/channel/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
-import { calculateCommitmentFee } from '../../src/lightning/channel/commitment-builder';
+import {
+	buildLocalCommitment,
+	calculateCommitmentFee
+} from '../../src/lightning/channel/commitment-builder';
 import { MessageType } from '../../src/lightning/message/types';
 import {
 	decodeTxAbortMessage,
@@ -67,7 +70,10 @@ import {
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
 import { ChannelRecoveryStatus } from '../../src/lightning/recovery';
 import { ChannelSigner } from '../../src/lightning/keys/signer';
-import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
+import {
+	IChannelBasepoints,
+	perCommitmentPointFromSecret
+} from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	decodeOpenChannelMessage,
@@ -7816,6 +7822,222 @@ describe('Splice', function () {
 			);
 		});
 
+		it('backs up revoked commitments on both fundings, across a restart and the lock (#1108)', function () {
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				acceptorChannel,
+				openerPubkey,
+				acceptorPubkey
+			} = pendingLockPair();
+			const oldFunding = openerChannel
+				.getFullState()
+				.fundingTxid!.toString('hex');
+			const spliceFunding = openerChannel
+				.getFullState()
+				.spliceInFlight!.spliceTxid.toString('hex');
+			const bothFundings = [oldFunding, spliceFunding].sort();
+			const fundingsOf = (txs: Buffer[]): string[] =>
+				txs
+					.map((tx) =>
+						Buffer.from(
+							bitcoin.Transaction.fromBuffer(tx).ins[0].hash
+						).toString('hex')
+					)
+					.sort();
+			const backups = new Map<string, Buffer[]>();
+			openerManager.on(
+				'watchtower:backup',
+				(_id: Buffer, _peer: string, secret: Buffer, tx: Buffer) => {
+					const point = perCommitmentPointFromSecret(secret).toString('hex');
+					backups.set(point, [...(backups.get(point) ?? []), tx]);
+				}
+			);
+
+			// The splice negotiation signed #0 over the new funding too; the
+			// first batch round revokes it.
+			const point0 = openerChannel
+				.getFullState()
+				.remoteCurrentPerCommitmentPoint!.toString('hex');
+			expect(openerManager.updateChannelFee(channelId, 1000).ok).to.equal(true);
+			expect(fundingsOf(backups.get(point0) ?? [])).to.deep.equal(bothFundings);
+
+			// That round signed #1 over both fundings. Restart the opener from
+			// its row while #1 is unrevoked.
+			const point1 = openerChannel
+				.getFullState()
+				.remoteCurrentPerCommitmentPoint!.toString('hex');
+			openerManager.handlePeerDisconnected(acceptorPubkey);
+			acceptorManager.handlePeerDisconnected(openerPubkey);
+			const restarted = new Channel(
+				deserializeChannelState(
+					JSON.parse(
+						JSON.stringify(serializeChannelState(openerChannel.getFullState()))
+					)
+				)
+			);
+			expect(
+				fundingsOf(
+					restarted.getFullState().watchtowerRemoteCommitmentTxs?.get(point1) ??
+						[]
+				)
+			).to.deep.equal(bothFundings);
+			openerManager.restoreChannel(restarted, acceptorPubkey);
+
+			openerManager.removeAllListeners('message:outbound');
+			acceptorManager.removeAllListeners('message:outbound');
+			const fromOpener: Array<{ type: number; payload: Buffer }> = [];
+			const fromAcceptor: Array<{ type: number; payload: Buffer }> = [];
+			openerManager.on('message:outbound', (pk, type, payload) => {
+				if (pk === acceptorPubkey) fromOpener.push({ type, payload });
+			});
+			acceptorManager.on('message:outbound', (pk, type, payload) => {
+				if (pk === openerPubkey) fromAcceptor.push({ type, payload });
+			});
+			openerManager.handlePeerReconnected(acceptorPubkey);
+			acceptorManager.handlePeerReconnected(openerPubkey);
+			openerManager.removeAllListeners('message:outbound');
+			acceptorManager.removeAllListeners('message:outbound');
+			connectManagers(
+				openerManager,
+				openerPubkey,
+				acceptorManager,
+				acceptorPubkey
+			);
+			for (const m of fromOpener.splice(0)) {
+				acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
+			}
+			for (const m of fromAcceptor.splice(0)) {
+				openerManager.handleMessage(acceptorPubkey, m.type, m.payload);
+			}
+			expect(restarted.isSplicePendingLock()).to.equal(true);
+
+			// Once the splice locks, the peer's #1 over the new funding is the
+			// commitment it could breach with after the next round.
+			openerManager.sendSpliceLocked(channelId);
+			acceptorManager.sendSpliceLocked(channelId);
+			expect(restarted.getState()).to.equal(ChannelState.NORMAL);
+			expect(restarted.getFullState().fundingTxid!.toString('hex')).to.equal(
+				spliceFunding
+			);
+			const peerTx1 = buildLocalCommitment(
+				acceptorChannel.getFullState(),
+				Buffer.from(point1, 'hex'),
+				1n
+			).result.tx.getId();
+
+			expect(openerManager.updateChannelFee(channelId, 1500).ok).to.equal(true);
+			const revoked1 = backups.get(point1) ?? [];
+			expect(fundingsOf(revoked1)).to.deep.equal(bothFundings);
+			expect(
+				revoked1.map((tx) => bitcoin.Transaction.fromBuffer(tx).getId())
+			).to.include(peerTx1);
+		});
+
+		it('rebuilds the splice-side commitment a row from before #1108 did not cache (#1138)', function () {
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				openerPubkey,
+				acceptorPubkey
+			} = pendingLockPair();
+			const oldFunding = openerChannel
+				.getFullState()
+				.fundingTxid!.toString('hex');
+			const spliceFunding = openerChannel
+				.getFullState()
+				.spliceInFlight!.spliceTxid.toString('hex');
+			const fundingOf = (tx: Buffer): string =>
+				Buffer.from(bitcoin.Transaction.fromBuffer(tx).ins[0].hash).toString(
+					'hex'
+				);
+			const backups = new Map<string, Buffer[]>();
+			openerManager.on(
+				'watchtower:backup',
+				(_id: Buffer, _peer: string, secret: Buffer, tx: Buffer) => {
+					const point = perCommitmentPointFromSecret(secret).toString('hex');
+					backups.set(point, [...(backups.get(point) ?? []), tx]);
+				}
+			);
+
+			// The splice negotiation signed #0 over the new funding too.
+			const point0 = openerChannel
+				.getFullState()
+				.remoteCurrentPerCommitmentPoint!.toString('hex');
+			const signed = openerChannel
+				.getFullState()
+				.watchtowerRemoteCommitmentTxs!.get(point0)!
+				.map((tx) => tx.toString('hex'))
+				.sort();
+			expect(
+				signed.map((tx) => fundingOf(Buffer.from(tx, 'hex'))).sort()
+			).to.deep.equal([oldFunding, spliceFunding].sort());
+
+			// The prior version kept one tx per point, the current funding's.
+			openerManager.handlePeerDisconnected(acceptorPubkey);
+			acceptorManager.handlePeerDisconnected(openerPubkey);
+			const row = JSON.parse(
+				JSON.stringify(serializeChannelState(openerChannel.getFullState()))
+			);
+			row.watchtowerRemoteCommitmentTxs =
+				row.watchtowerRemoteCommitmentTxs.filter(
+					(e: { tx: string }) =>
+						fundingOf(Buffer.from(e.tx, 'hex')) === oldFunding
+				);
+			const restarted = new Channel(deserializeChannelState(row));
+			expect(
+				restarted
+					.getFullState()
+					.watchtowerRemoteCommitmentTxs!.get(point0)!
+					.map(fundingOf)
+			).to.deep.equal([oldFunding]);
+			openerManager.restoreChannel(restarted, acceptorPubkey);
+			expect(
+				restarted
+					.getFullState()
+					.watchtowerRemoteCommitmentTxs!.get(point0)!
+					.map((tx) => tx.toString('hex'))
+					.sort()
+			).to.deep.equal(signed);
+
+			openerManager.removeAllListeners('message:outbound');
+			acceptorManager.removeAllListeners('message:outbound');
+			const fromOpener: Array<{ type: number; payload: Buffer }> = [];
+			const fromAcceptor: Array<{ type: number; payload: Buffer }> = [];
+			openerManager.on('message:outbound', (pk, type, payload) => {
+				if (pk === acceptorPubkey) fromOpener.push({ type, payload });
+			});
+			acceptorManager.on('message:outbound', (pk, type, payload) => {
+				if (pk === openerPubkey) fromAcceptor.push({ type, payload });
+			});
+			openerManager.handlePeerReconnected(acceptorPubkey);
+			acceptorManager.handlePeerReconnected(openerPubkey);
+			openerManager.removeAllListeners('message:outbound');
+			acceptorManager.removeAllListeners('message:outbound');
+			connectManagers(
+				openerManager,
+				openerPubkey,
+				acceptorManager,
+				acceptorPubkey
+			);
+			for (const m of fromOpener.splice(0)) {
+				acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
+			}
+			for (const m of fromAcceptor.splice(0)) {
+				openerManager.handleMessage(acceptorPubkey, m.type, m.payload);
+			}
+			expect(restarted.isSplicePendingLock()).to.equal(true);
+
+			expect(openerManager.updateChannelFee(channelId, 1000).ok).to.equal(true);
+			expect(
+				(backups.get(point0) ?? []).map((tx) => tx.toString('hex')).sort()
+			).to.deep.equal(signed);
+		});
+
 		it('spliced-state invariant holds at every HTLC lifecycle stage mid-splice', function () {
 			// The table-driven check the review asked for before lifting gates:
 			// at each observable stage of add and settle during pending-lock, the
@@ -8055,14 +8277,25 @@ describe('Splice', function () {
 				// Reconnect. Both sides emit channel_reestablish independently (as
 				// real transports do) BEFORE either is delivered — a synchronous
 				// loopback would otherwise deliver the first reestablish before
-				// the second side has sent its own. Capture both, rewire, then
-				// deliver cross-wise; all replays flow through the live loopback.
+				// the second side has sent its own. Both reestablishes are also
+				// delivered before the loopback is rewired: otherwise the first
+				// side's retransmissions reach a peer still awaiting reestablish,
+				// which drops them. The captured retransmissions are replayed
+				// through the live loopback.
 				fromOpener.length = 0;
 				fromAcceptor.length = 0;
 				openerManager.handlePeerReconnected(acceptorPubkey);
 				acceptorManager.handlePeerReconnected(openerPubkey);
 				const openerReest = fromOpener.splice(0);
 				const acceptorReest = fromAcceptor.splice(0);
+				for (const m of openerReest) {
+					acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
+				}
+				for (const m of acceptorReest) {
+					openerManager.handleMessage(acceptorPubkey, m.type, m.payload);
+				}
+				const openerReplay = fromOpener.splice(0);
+				const acceptorReplay = fromAcceptor.splice(0);
 				openerManager.removeAllListeners('message:outbound');
 				acceptorManager.removeAllListeners('message:outbound');
 				connectManagers(
@@ -8071,10 +8304,10 @@ describe('Splice', function () {
 					acceptorManager,
 					acceptorPubkey
 				);
-				for (const m of openerReest) {
+				for (const m of openerReplay) {
 					acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
 				}
-				for (const m of acceptorReest) {
+				for (const m of acceptorReplay) {
 					openerManager.handleMessage(acceptorPubkey, m.type, m.payload);
 				}
 

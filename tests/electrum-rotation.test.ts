@@ -33,7 +33,7 @@ const serverB: TServer = {
 };
 
 const createElectrum = (
-	servers: TServer[],
+	servers: TServer | TServer[],
 	network = EAvailableNetworks.testnet
 ): Electrum => {
 	const fakeWallet = {
@@ -191,6 +191,28 @@ describe('Electrum multi-server rotation', () => {
 		const res = await electrum.connectToElectrum({});
 		expect(res.isErr()).to.equal(true);
 		expect(attempts).to.have.length(0);
+	});
+
+	it('regtest accepts a single server object when the connect omits servers (#980)', async () => {
+		const electrum = createElectrum(serverA, EAvailableNetworks.regtest);
+		const attempts: string[] = [];
+		stubConnections(electrum, new Set(), attempts);
+
+		const res = await electrum.connectToElectrum({});
+		expect(res.isOk()).to.equal(true);
+		expect(attempts).to.deep.equal([serverA.host]);
+		expect(electrum.currentServer?.host).to.equal(serverA.host);
+	});
+
+	it('dials a single server object first when the connect omits servers (#980)', async () => {
+		const electrum = createElectrum(serverA);
+		const attempts: string[] = [];
+		stubConnections(electrum, new Set(), attempts);
+
+		const res = await electrum.connectToElectrum({});
+		expect(res.isOk()).to.equal(true);
+		expect(attempts).to.deep.equal([serverA.host]);
+		expect(electrum.currentServer?.host).to.equal(serverA.host);
 	});
 
 	it('regtest never appends external fallback peers', async () => {

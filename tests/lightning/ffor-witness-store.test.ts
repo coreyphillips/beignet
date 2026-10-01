@@ -75,6 +75,8 @@ interface IHarness {
 	service: FforWitnessService;
 	sent: { peer: string; type: number; payload: Buffer }[];
 	events: { event: string; data: unknown }[];
+	/** The witness's tip; the default puts T_exp 800_000 4000 blocks out. */
+	tip: { height: number };
 }
 
 function serviceOn(
@@ -83,30 +85,32 @@ function serviceOn(
 ): IHarness {
 	const sent: IHarness['sent'] = [];
 	const events: IHarness['events'] = [];
+	const tip = { height: 796_000 };
 	const service = new FforWitnessService(
 		{ enabled: true, ...cfg },
 		{
 			ledger,
 			nodePrivkey: W_PRIV,
 			nodeId: W_ID,
-			currentHeight: () => 790_100,
+			currentHeight: () => tip.height,
 			send: (peer, type, payload) => sent.push({ peer, type, payload }),
 			log: () => undefined,
 			emit: (event, data) => events.push({ event, data })
 		}
 	);
-	return { service, sent, events };
+	return { service, sent, events, tip };
 }
 
 function book(
 	K: number,
-	seed = 'book'
+	seed = 'book',
+	tExp = 800_000
 ): { book: Buffer; entries: IFforBookEntry[] } {
 	const entries = Array.from({ length: K }, (_, i) => ({
 		k: i + 1,
 		paymentHash: sha256(Buffer.from(`${seed}-${i}`)),
 		amountMsat: 100_000_000n,
-		voucherExpiry: 800_000,
+		voucherExpiry: tExp,
 		settlementDeadline: 798_992,
 		sHtlcId: BigInt(i)
 	}));
@@ -299,6 +303,94 @@ describe('FFOR witness store and service (Appendix F.5, section 9.6.4)', functio
 		expect(provision(h, provisionFor(good)).ok).to.be.true;
 		expect(refusal(provisionFor(good))).to.match(/already held/);
 		storage.close();
+	});
+
+	it('refuses a book or a retention beyond its horizon, so no mailbox holds a reservation for good (issue #1032)', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const ledger = ledgerOn(storage);
+		const h = serviceOn(ledger, { maxMailboxes: 1 });
+		const max = 2 ** 32 - 1;
+		// A witness with no header yet has nothing to bound a book against.
+		h.tip.height = 0;
+		expect(
+			provision(
+				h,
+				provisionFor(book(1, 'early', 100).book, { retentionUntil: 388 })
+			).error
+		).to.match(/no chain tip yet/);
+		h.tip.height = 796_000;
+		// The reported fill: T_exp and retention_until at the top of the u32.
+		const far = provision(
+			h,
+			provisionFor(book(1, 'far', max - 144).book, { retentionUntil: max })
+		);
+		expect(far.ok).to.be.false;
+		expect(far.error).to.match(/T_exp is more than 5184 blocks away/);
+		// A near T_exp does not carry an unbounded retention.
+		const kept = provision(
+			h,
+			provisionFor(book(1, 'kept').book, { retentionUntil: max })
+		);
+		expect(kept.error).to.match(/retention_until is over T_exp \+ 2016/);
+		// A book whose T_exp has already come.
+		h.tip.height = 800_000;
+		expect(provision(h, provisionFor(book(1, 'past').book)).error).to.match(
+			/T_exp is not in the future/
+		);
+		expect(h.service.listMailboxes()).to.have.length(0);
+
+		// Both edges are accepted, and the mailbox frees its slot on schedule.
+		h.tip.height = 800_000 - 5184;
+		const edge = provisionFor(book(1, 'edge').book, {
+			retentionUntil: 800_000 + 2016
+		});
+		expect(provision(h, edge).ok).to.be.true;
+		expect(provision(h, provisionFor(book(1, 'next').book)).error).to.match(
+			/cannot reserve/
+		);
+		h.service.onBlock(800_000 + 2017);
+		expect(ledger.mailbox(edge.mailboxId.toString('hex'))!.state).to.equal(
+			'EXPIRED'
+		);
+		storage.close();
+	});
+
+	it('releases a far mailbox stored before the horizon on the first block after a restart (issue #1032)', () => {
+		const file = tmpDb();
+		const storage1 = new SqliteStorage(file);
+		storage1.open();
+		const h1 = serviceOn(ledgerOn(storage1), { maxMailboxes: 1 });
+		const max = 2 ** 32 - 1;
+		// A tip at the top of the u32 lets today's checks admit the reported
+		// fill, standing in for a row stored before they existed.
+		h1.tip.height = max - 144 - 5184;
+		const poisoned = provisionFor(book(1, 'far', max - 144).book, {
+			retentionUntil: max
+		});
+		expect(provision(h1, poisoned).ok).to.be.true;
+		storage1.close();
+
+		const storage2 = new SqliteStorage(file);
+		storage2.open();
+		const ledger2 = ledgerOn(storage2);
+		const h2 = serviceOn(ledger2, { maxMailboxes: 1 });
+		expect(ledger2.occupancy().mailboxes).to.equal(1);
+		h2.service.onBlock(796_001);
+		expect(ledger2.mailbox(poisoned.mailboxId.toString('hex'))!.state).to.equal(
+			'EXPIRED'
+		);
+		expect(ledger2.occupancy()).to.include({ mailboxes: 0, reservedBytes: 0 });
+		// A mailbox at the edge of today's bounds survives a 144-block reorg.
+		const edge = provisionFor(book(1, 'edge', 796_000 + 5184).book, {
+			retentionUntil: 796_000 + 7200
+		});
+		expect(provision(h2, edge).ok).to.be.true;
+		h2.service.onBlock(796_000 - 144);
+		expect(ledger2.mailbox(edge.mailboxId.toString('hex'))!.state).to.equal(
+			'PROVISIONED'
+		);
+		storage2.close();
 	});
 
 	it('judges capacity against what it holds, and an unknown mailbox answers like an empty one', () => {

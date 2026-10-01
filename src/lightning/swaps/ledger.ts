@@ -21,6 +21,11 @@
  *                                                  under us; funds are, or may
  *                                                  be, on chain: signed bytes
  *                                                  whose broadcast threw count)
+ *   EXPOSED -> FAILED                              (the funding never confirmed
+ *                                                  and the refund height passed:
+ *                                                  an input was spent elsewhere,
+ *                                                  or the operator cancelled a
+ *                                                  stranded row)
  *
  * Submarine swap lifecycle (client funds the chain, provider pays Lightning,
  * issue #743):
@@ -189,6 +194,12 @@ export interface ISwapRecord extends ILedgerRecord {
 	claimBumps?: number;
 	/** Submarine: when the funding was last seen gone. */
 	fundingLostAt?: number;
+	/**
+	 * Reverse, EXPOSED: the height this process first saw the funding absent
+	 * past the refund height and resolution margin. Licenses the operator
+	 * cancel; cleared when the funding reappears and on reload.
+	 */
+	strandedHeight?: number;
 	/** Refund (reverse: ours) bookkeeping. */
 	refundTxHex?: string;
 	refundTxid?: string;
@@ -260,7 +271,7 @@ const REVERSE_TRANSITIONS: Readonly<
 	FUNDED: ['CLAIMED', 'REFUND_PENDING', 'EXPOSED'],
 	CLAIMED: ['SETTLED', 'EXPOSED'],
 	REFUND_PENDING: ['CLAIMED', 'REFUNDED', 'EXPOSED'],
-	EXPOSED: [],
+	EXPOSED: ['FAILED'],
 	SETTLED: [],
 	REFUNDED: [],
 	CANCELLED: [],
@@ -396,6 +407,9 @@ export const swapCodec: ILedgerCodec<ISwapRecord> = {
 					verifiedThisSession: false
 				};
 			}
+			// Same for an absent funding: the operator cancel waits for this
+			// process to look again.
+			delete parsed.strandedHeight;
 			return parsed as ISwapRecord;
 		} catch {
 			return null;

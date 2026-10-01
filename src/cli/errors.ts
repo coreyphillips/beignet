@@ -22,6 +22,12 @@ export enum BeignetErrorCode {
 	NO_ROUTE = 'NO_ROUTE',
 	/** No route fits under the caller's cltvLimit; nothing was sent (#751). */
 	CLTV_EXCEEDS_MAX = 'CLTV_EXCEEDS_MAX',
+	/**
+	 * Every route costs more than the caller's fee cap (maxFeeSats or
+	 * maxFeeMsat); nothing was sent. The same request meets the same cap, so
+	 * it is permanent, like CLTV_EXCEEDS_MAX (#1001).
+	 */
+	FEE_EXCEEDS_MAX = 'FEE_EXCEEDS_MAX',
 	/** The node has no chain tip yet, so a height-relative bound cannot be set. */
 	CHAIN_NOT_SYNCED = 'CHAIN_NOT_SYNCED',
 	/** User-supplied BOLT 11 string failed to parse. */
@@ -94,12 +100,29 @@ export enum BeignetErrorCode {
 	BODY_TOO_LARGE = 'BODY_TOO_LARGE',
 	MNEMONIC_REQUIRES_AUTH = 'MNEMONIC_REQUIRES_AUTH',
 	UNAUTHORIZED = 'UNAUTHORIZED',
-	RATE_LIMITED = 'RATE_LIMITED'
+	RATE_LIMITED = 'RATE_LIMITED',
+	// Browser guards (issue #1005), enforced only while no credential is
+	// configured: a web page can reach a loopback daemon with a body it did
+	// not label application/json, with a foreign Origin, or through a DNS
+	// name that rebinds to 127.0.0.1. Each refusal names what to fix.
+	/** A request body whose Content-Type is not application/json (415). */
+	UNSUPPORTED_MEDIA_TYPE = 'UNSUPPORTED_MEDIA_TYPE',
+	/** An Origin or Sec-Fetch-Site header from a page this daemon does not serve (403). */
+	CROSS_SITE_REQUEST_REFUSED = 'CROSS_SITE_REQUEST_REFUSED',
+	/** A Host header that is not the loopback name the daemon is bound on (421). */
+	HOST_NOT_ALLOWED = 'HOST_NOT_ALLOWED'
 }
 
 export class BeignetError extends Error {
 	code: BeignetErrorCode | string;
 	failureCode?: number;
+	/**
+	 * The payment the error is about, hex. Set on PAYMENT_TIMEOUT, and on the
+	 * daemon's DUPLICATE_PAYMENT for a keyed offer retry: an offer or keysend
+	 * caller never saw the hash, and needs it to look the payment up before
+	 * deciding to pay again (issue #1094).
+	 */
+	paymentHash?: string;
 
 	constructor(
 		code: BeignetErrorCode | string,
@@ -112,12 +135,23 @@ export class BeignetError extends Error {
 		this.failureCode = failureCode;
 	}
 
-	toJSON(): { code: string; message: string; failureCode?: number } {
-		const json: { code: string; message: string; failureCode?: number } = {
+	toJSON(): {
+		code: string;
+		message: string;
+		failureCode?: number;
+		paymentHash?: string;
+	} {
+		const json: {
+			code: string;
+			message: string;
+			failureCode?: number;
+			paymentHash?: string;
+		} = {
 			code: this.code,
 			message: this.message
 		};
 		if (this.failureCode !== undefined) json.failureCode = this.failureCode;
+		if (this.paymentHash !== undefined) json.paymentHash = this.paymentHash;
 		return json;
 	}
 }
@@ -139,13 +173,22 @@ export function isRetryableError(err: BeignetError): boolean {
 		BeignetErrorCode.UNAUTHORIZED,
 		BeignetErrorCode.BODY_TOO_LARGE,
 		BeignetErrorCode.MNEMONIC_REQUIRES_AUTH,
+		// The browser guards refuse the request's shape, which a retry repeats.
+		BeignetErrorCode.UNSUPPORTED_MEDIA_TYPE,
+		BeignetErrorCode.CROSS_SITE_REQUEST_REFUSED,
+		BeignetErrorCode.HOST_NOT_ALLOWED,
 		BeignetErrorCode.SPENDING_LIMIT_EXCEEDED,
 		BeignetErrorCode.SERVICE_DRAINING,
 		// A node with no funding provider will not grow one on a retry.
 		BeignetErrorCode.FUNDING_PROVIDER_REQUIRED,
 		// The caller's own CLTV bound refused every route; the same request
 		// meets the same bound.
-		BeignetErrorCode.CLTV_EXCEEDS_MAX
+		BeignetErrorCode.CLTV_EXCEEDS_MAX,
+		// The caller's own fee cap refused every route, before anything was
+		// sent. Answered 409, never a retryable 5xx: as PAYMENT_FAILED it
+		// made payInvoiceWithRetry and daemon clients retry a deterministic
+		// refusal with backoff (#1001).
+		BeignetErrorCode.FEE_EXCEEDS_MAX
 	]);
 	if (permanentCodes.has(err.code)) return false;
 

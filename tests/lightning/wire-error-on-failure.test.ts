@@ -356,7 +356,10 @@ describe('wire error + channel failure on peer protocol violations', function ()
 
 	describe('legacy coop-close signature verification (issue 409 review)', function () {
 		/** Shutdown-scripted NEGOTIATING pair with real balances on both sides. */
-		function closingPair(tag: string): IPair {
+		function closingPair(
+			tag: string,
+			aScript = Buffer.from('0014' + 'aa'.repeat(20), 'hex')
+		): IPair {
 			const t = makePair(tag);
 			for (const [ch, local, remote] of [
 				[t.aChannel, 700_000_000n, 300_000_000n],
@@ -369,10 +372,7 @@ describe('wire error + channel failure on peer protocol violations', function ()
 			// closing_signed is dropped, so both sides hold scripts + state and
 			// the test can drive signatures by hand.
 			t.cutBefore(MessageType.CLOSING_SIGNED);
-			const res = t.A.initiateShutdown(
-				t.channelId,
-				Buffer.from('0014' + 'aa'.repeat(20), 'hex')
-			);
+			const res = t.A.initiateShutdown(t.channelId, aScript);
 			expect(res.ok, res.error).to.equal(true);
 			expect(t.aChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
 			return t;
@@ -444,6 +444,85 @@ describe('wire error + channel failure on peer protocol violations', function ()
 					Buffer.alloc(64, 0xff)
 				)
 			).to.equal(false);
+		});
+
+		/**
+		 * B's signature over the closing tx as LND builds it, independent of our
+		 * builder: each output kept at or above its owner's dust_limit_satoshis,
+		 * BIP 69 order. A (the opener) pays the fee.
+		 */
+		function lndStyleSig(t: IPair, fee: bigint): Buffer {
+			const st = t.aChannel.getFullState();
+			const outs = [
+				{
+					script: st.localShutdownScript!,
+					value: st.localBalanceMsat / 1000n - fee,
+					dust: st.localConfig.dustLimitSatoshis
+				},
+				{
+					script: st.remoteShutdownScript!,
+					value: st.remoteBalanceMsat / 1000n,
+					dust: st.remoteConfig.dustLimitSatoshis
+				}
+			]
+				.filter((o) => o.value >= o.dust)
+				.sort((x, y) =>
+					x.value !== y.value
+						? x.value < y.value
+							? -1
+							: 1
+						: Buffer.compare(x.script, y.script)
+				);
+			const tx = new bitcoin.Transaction();
+			tx.version = 2;
+			tx.addInput(st.fundingTxid!, st.fundingOutputIndex!, 0xffffffff);
+			for (const o of outs) tx.addOutput(o.script, Number(o.value));
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const { witnessScript } = (t.A as any).buildClosingTxAndScript(
+				t.aChannel,
+				fee
+			);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			return (t.B as any)
+				.signerFor(t.bChannel, false)
+				.signClosingTx(tx, witnessScript, Number(st.fundingSatoshis));
+		}
+
+		/** Leave A (the opener) `aSat` of the 1M sat channel. */
+		function setOpenerSats(t: IPair, aSat: bigint): void {
+			const a = t.aChannel.getFullState();
+			const b = t.bChannel.getFullState();
+			a.localBalanceMsat = b.remoteBalanceMsat = aSat * 1000n;
+			a.remoteBalanceMsat = b.localBalanceMsat = (1_000_000n - aSat) * 1000n;
+		}
+
+		it('verifies a peer that keeps our 500 sat P2TR output at dust 354 (issue #1030)', function () {
+			const t = closingPair(
+				'close-dust-p2tr',
+				Buffer.from('5120' + 'aa'.repeat(32), 'hex')
+			);
+			const fee = 500n;
+			setOpenerSats(t, fee + 500n);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const ours = (t.A as any).buildClosingTxAndScript(t.aChannel, fee);
+			expect(
+				ours.tx.outs.map((o: { value: number }) => o.value),
+				'our output is not burned to fees'
+			).to.include(500);
+			expect(
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(t.A as any).verifyPeerClosingSig(t.aChannel, fee, lndStyleSig(t, fee))
+			).to.equal(true);
+		});
+
+		it('verifies a peer that drops our 300 sat P2WPKH output at dust 354 (issue #1030)', function () {
+			const t = closingPair('close-dust-p2wpkh');
+			const fee = 500n;
+			setOpenerSats(t, fee + 300n);
+			expect(
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(t.A as any).verifyPeerClosingSig(t.aChannel, fee, lndStyleSig(t, fee))
+			).to.equal(true);
 		});
 	});
 });

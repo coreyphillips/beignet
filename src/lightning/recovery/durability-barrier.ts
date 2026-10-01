@@ -286,6 +286,11 @@ export class DurabilityBarrier {
 		return this.config.durability;
 	}
 
+	/** The largest record the current guardian set accepts, in ciphertext bytes. */
+	maxRecordBytes(): number {
+		return this.config.replicator.maxRecordBytes();
+	}
+
 	/** The watermark, read through from storage the first time. */
 	watermark(): bigint {
 		if (this.durableThrough == null) {

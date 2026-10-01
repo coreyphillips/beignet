@@ -14,7 +14,9 @@
  * tests below are the ones that fail if a later change "unifies" them with
  * the rest. Two former refusals are no longer refusals at all (issues 410 and
  * 411): OUR-policy dust/CLTV-horizon adds are admitted and failed back by the
- * node once committed, and an add that crossed our own stfu is accepted.
+ * node once committed, and an add that crossed our own stfu is accepted. An
+ * add already expired at OUR tip joined them (issue #1009): the tip is state
+ * the peer cannot see, so it is stamped and failed back the same way.
  */
 
 import { expect } from 'chai';
@@ -240,20 +242,6 @@ describe('Update-path refusals reach the peer (issue 404)', function () {
 						)
 					};
 				}
-			},
-			{
-				name: 'a cltv_expiry that has already expired',
-				reason: /CLTV already expired/,
-				run: () => {
-					const channel = makeChannel();
-					channel.setBlockHeight(1_000);
-					return {
-						channel,
-						actions: channel.handleUpdateAddHtlc(
-							add(channel, { cltvExpiry: 999 })
-						)
-					};
-				}
 			}
 		];
 
@@ -279,6 +267,35 @@ describe('Update-path refusals reach the peer (issue 404)', function () {
 				'recorded'
 			).to.not.equal(undefined);
 			expect(channel.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('ADMITS a cltv_expiry at or below our tip, stamped for the fail-back (issue #1009)', function () {
+			// Turns on state the peer cannot see (our own tip), so it is a
+			// fail-back once committed, never a channel failure: the node
+			// answers expiry_too_soon as a forwarder and
+			// incorrect_or_unknown_payment_details as the final hop.
+			const channel = makeChannel();
+			channel.setBlockHeight(1_000);
+			const actions = channel.handleUpdateAddHtlc(
+				add(channel, { cltvExpiry: 999 })
+			);
+			expect(actions, 'admitted, not refused').to.have.length(0);
+			const entry = channel.getFullState().htlcs.get('received-0');
+			expect(entry, 'recorded').to.not.equal(undefined);
+			expect(entry!.expiredOnArrival, 'stamped at admission').to.equal(true);
+			expect(channel.receivedHtlcExpiredOnArrival(0n)).to.equal(true);
+			expect(channel.getState()).to.equal(ChannelState.NORMAL);
+
+			// Control: one block of headroom is not stamped.
+			const fresh = makeChannel();
+			fresh.setBlockHeight(1_000);
+			expect(
+				fresh.handleUpdateAddHtlc(add(fresh, { cltvExpiry: 1_001 }))
+			).to.have.length(0);
+			expect(
+				fresh.getFullState().htlcs.get('received-0')!.expiredOnArrival
+			).to.equal(undefined);
+			expect(fresh.receivedHtlcExpiredOnArrival(0n)).to.equal(false);
 		});
 
 		it('ADMITS dust exposure over our ceiling (failed back once committed)', function () {

@@ -2340,6 +2340,124 @@ describe('Chain Monitor (Phase 4C)', function () {
 				.exist;
 			expect(monitor.isFullyResolved()).to.be.true;
 		});
+
+		it('an unspent PEER to_local on THEIR current commitment does not block full resolution (#1065)', function () {
+			// The mirror of the case above: on the peer's commitment its own
+			// to_local is locked by OUR to_self_delay and only the peer can spend
+			// it. Waiting for that spend held the channel FORCE_CLOSED for at
+			// least 244 blocks, and forever when the peer never swept.
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+
+			const built = buildRemoteCommitment(
+				state,
+				state.remoteCurrentPerCommitmentPoint!
+			);
+			monitor.handleFundingSpent(built.result.tx, 100);
+			expect(
+				monitor.getFullState().commitmentBroadcast!.commitmentType
+			).to.equal(CommitmentType.THEIR_CURRENT_COMMITMENT);
+
+			const outputs = monitor.getFullState().trackedOutputs;
+			const peerToLocal = outputs.find(
+				(o) => o.outputType === OutputType.TO_LOCAL
+			);
+			const ourToRemote = outputs.find(
+				(o) => o.outputType === OutputType.TO_REMOTE
+			);
+			expect(peerToLocal, 'peer to_local tracked').to.exist;
+			expect(ourToRemote, 'our to_remote tracked').to.exist;
+			expect(peerToLocal!.status).to.equal(OutputStatus.CONFIRMED);
+			expect(peerToLocal!.sweepTxHex, 'nothing of ours spends it').to.be
+				.undefined;
+
+			// Our to_remote claim confirms at 100; the peer never touches its
+			// to_local.
+			for (const output of outputs) {
+				if (output.outputType === OutputType.TO_LOCAL) continue;
+				output.status = OutputStatus.SPEND_CONFIRMED;
+				output.resolutionTxid = crypto.randomBytes(32).toString('hex');
+				output.confirmationHeight = 100;
+			}
+
+			// One block short of IRREVOCABLE_DEPTH: our claim still holds it.
+			const early = monitor.handleNewBlock(100 + IRREVOCABLE_DEPTH - 1);
+			expect(
+				early.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED),
+				'our own claim still gates resolution'
+			).to.not.exist;
+			expect(monitor.isFullyResolved()).to.be.false;
+
+			const actions = monitor.handleNewBlock(100 + IRREVOCABLE_DEPTH);
+			expect(
+				actions.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED),
+				'channel resolves despite the unspent peer to_local'
+			).to.exist;
+			expect(monitor.isFullyResolved()).to.be.true;
+			expect(peerToLocal!.status, 'the peer output is left as it is').to.equal(
+				OutputStatus.CONFIRMED
+			);
+		});
+
+		it('an unspent to_local on THEIR revoked commitment (our penalty claim) still blocks full resolution', function () {
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
+			exchangeCommitments(opener, acceptor);
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+
+			// Commitment 0 is revoked: rebuild it from the secret the peer gave up.
+			const revokedSecret = state.shaChainStore.getSecret(MAX_INDEX - 0n);
+			expect(revokedSecret).to.not.be.null;
+			const revokedPoint = perCommitmentPointFromSecret(revokedSecret!);
+			const built = buildRemoteCommitment(state, revokedPoint, 0n);
+			monitor.handleFundingSpent(built.result.tx, 100);
+			expect(
+				monitor.getFullState().commitmentBroadcast!.commitmentType
+			).to.equal(CommitmentType.THEIR_REVOKED_COMMITMENT);
+
+			const outputs = monitor.getFullState().trackedOutputs;
+			const cheaterToLocal = outputs.find(
+				(o) => o.outputType === OutputType.TO_LOCAL
+			);
+			expect(cheaterToLocal, 'revoked to_local tracked').to.exist;
+			// Model the penalty never landing (stuck or declined): the output is
+			// back to unspent while every other claim is irrevocably resolved.
+			for (const output of outputs) {
+				if (output === cheaterToLocal) {
+					output.status = OutputStatus.CONFIRMED;
+					continue;
+				}
+				output.status = OutputStatus.SPEND_CONFIRMED;
+				output.resolutionTxid = crypto.randomBytes(32).toString('hex');
+				output.confirmationHeight = 100;
+			}
+
+			const actions = monitor.handleNewBlock(100 + IRREVOCABLE_DEPTH);
+			expect(
+				actions.find((a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED),
+				'the penalty claim holds resolution'
+			).to.not.exist;
+			expect(monitor.isFullyResolved()).to.be.false;
+		});
 	});
 
 	describe('Output Spent Events', function () {

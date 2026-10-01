@@ -265,7 +265,10 @@ export interface ISwapStatus {
 	/** 0 while in the mempool. */
 	fundingHeight?: number;
 	fundingConfirmations?: number;
-	/** Raw funding transaction; bound to fundingTxid, so trust-free. */
+	/**
+	 * Raw funding transaction, sent only once confirmed; bound to
+	 * fundingTxid, so trust-free.
+	 */
 	fundingTx?: Buffer;
 	resolutionTxid?: Buffer;
 	resolutionKind?: SwapWireResolutionKind;

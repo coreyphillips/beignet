@@ -139,7 +139,28 @@ export interface IWalletLike {
 		index: number;
 		tag?: string;
 	}): Promise<IResult>;
+	/**
+	 * freezeUtxo whose Ok value is { created: boolean }: whether this call
+	 * added the entry, decided under the wallet's own write lock. Pledges use
+	 * it to know which freezes are theirs to lift.
+	 */
+	freezeUtxoIfUnfrozen?(params: {
+		txid: string;
+		index: number;
+		tag?: string;
+	}): Promise<IResult>;
 	unfreezeUtxo?(params: { txid: string; index: number }): Promise<IResult>;
+	/**
+	 * unfreezeUtxo that leaves the coin frozen (Ok, { unfrozen: false }) once
+	 * an entry without tag stands on it, decided under the wallet's own write
+	 * lock. A coin with nothing frozen answers Ok too, so an Err always means
+	 * the tagged entry is still there.
+	 */
+	unfreezeUtxoIfTagged?(params: {
+		txid: string;
+		index: number;
+		tag: string;
+	}): Promise<IResult>;
 	listFrozenUtxos?(): Array<{
 		tx_hash: string;
 		tx_pos: number;
@@ -176,6 +197,15 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * funding session that may simply have been abandoned.
 	 */
 	private renewedPledges = new Set<string>();
+	/**
+	 * Pledged outpoints whose wallet freeze this provider placed. A pledge can
+	 * also stand on a freeze someone else holds (the user froze the coin first,
+	 * or froze it while a renewal the wallet refused held only the record), and
+	 * unfreezeUtxo lifts every freeze on an outpoint, so releasing that pledge
+	 * must leave the wallet alone. Kept here rather than read back from the
+	 * freeze tag, which a wallet need not persist.
+	 */
+	private ownedFreezes = new Set<string>();
 	private adoptedStale = false;
 	private static readonly PLEDGE_TTL_MS = 10 * 60_000;
 	/**
@@ -229,12 +259,58 @@ export class WalletFundingProvider implements IFundingProvider {
 		renewed = false
 	): Promise<string | null> {
 		const key = `${txid}:${vout}`;
-		const res = await this.wallet.freezeUtxo?.({
-			txid,
-			index: vout,
-			tag: WalletFundingProvider.PLEDGE_TAG
-		});
+		const params = { txid, index: vout, tag: WalletFundingProvider.PLEDGE_TAG };
+		let res: IResult | undefined;
+		let owned: boolean;
+		if (this.wallet.freezeUtxoIfUnfrozen) {
+			const frozenBefore = this.wallet.isUtxoFrozen?.(txid, vout) === true;
+			// A freeze queued ahead of ours in the wallet lands between any read
+			// taken from here and our own write, so only the wallet can say
+			// whether this call added the entry. An entry that was already there
+			// leaves ownership as it stood.
+			//
+			// A refusal settles nothing about the entry on the coin: the read
+			// above and the one below can each catch an unfreeze, queued on
+			// either side of ours, whose storage write then rolls it back. Where
+			// release checks the tag under the wallet's lock, ownership of a
+			// freeze that is really gone lifts nothing, so a refusal leaves it as
+			// it stood. A plain unfreeze would lift whatever froze the coin
+			// since, so there only a coin frozen before the call stays owned.
+			res = await this.wallet.freezeUtxoIfUnfrozen(params);
+			owned = res.isErr()
+				? this.ownedFreezes.has(key) &&
+				  (frozenBefore || this.wallet.unfreezeUtxoIfTagged !== undefined)
+				: (res as IResultOk<{ created: boolean }>).value.created === true ||
+				  this.ownedFreezes.has(key);
+		} else {
+			// The wallet answers ok for a coin that is already frozen without
+			// adding an entry, so the freeze is ours only when there was none
+			// before it.
+			const frozenBefore = this.wallet.isUtxoFrozen?.(txid, vout) === true;
+			res = await this.wallet.freezeUtxo?.(params);
+			// The freeze read above can be another caller's provisional entry
+			// that its storage write then rolls back, letting ours land after all.
+			// The wallet decides that under its own lock, and our tag on the entry
+			// left standing is the only sign of it this side can read.
+			owned = frozenBefore
+				? this.ownedFreezes.has(key) ||
+				  this.wallet
+						.listFrozenUtxos?.()
+						.some(
+							(f) =>
+								`${f.tx_hash}:${f.tx_pos}` === key &&
+								f.freezeTag === WalletFundingProvider.PLEDGE_TAG
+						) === true
+				: res !== undefined && !res.isErr();
+		}
 		const refusal = res?.isErr() ? (res as IResultErr).error.message : null;
+		if (owned) this.ownedFreezes.add(key);
+		// The unfrozen read can equally be an unfreeze that then rolls back and
+		// restores our entry, so a refusal only ends ownership of a coin it left
+		// unfrozen.
+		else if (this.wallet.isUtxoFrozen?.(txid, vout) === false) {
+			this.ownedFreezes.delete(key);
+		}
 		if (refusal === null || renewed) {
 			this.pledged.set(key, Date.now());
 			if (renewed) this.renewedPledges.add(key);
@@ -256,14 +332,38 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * Lift the freeze behind a pledge. Returns whether the coin ended up
 	 * released, so a caller only forgets the pledge once it no longer holds
 	 * anything: a wallet that refused the write still has the coin frozen, and
-	 * dropping the record would leave nothing able to try again. A wallet that
-	 * no longer lists the outpoint as frozen is released whatever it called the
-	 * refusal ("not frozen" is the answer to a double release).
+	 * dropping the record would leave nothing able to try again. A pledge
+	 * standing on a freeze this provider did not place has nothing to lift.
+	 *
+	 * A user freeze on a coin we froze clears our tag or replaces our entry
+	 * without telling us. Where the wallet offers it, the unfreeze checks the
+	 * tag under the wallet's lock. A read from here could see a takeover whose
+	 * write is still in flight and may yet roll back, or a queued user
+	 * unfreeze whose failed write then restores our entry. So that wallet's
+	 * refusal always keeps the pledge: it answers a coin with nothing frozen
+	 * with Ok.
+	 *
+	 * A plain unfreezeUtxo calls a double release "not frozen", and reading
+	 * the coin back is the only way to tell that from a failed write.
 	 */
 	private async releasePledge(txid: string, vout: number): Promise<boolean> {
-		const res = await this.wallet.unfreezeUtxo?.({ txid, index: vout });
-		if (!res?.isErr()) return true;
-		return this.wallet.isUtxoFrozen?.(txid, vout) === false;
+		const key = `${txid}:${vout}`;
+		if (!this.ownedFreezes.has(key)) return true;
+		let released: boolean;
+		if (this.wallet.unfreezeUtxoIfTagged) {
+			const res = await this.wallet.unfreezeUtxoIfTagged({
+				txid,
+				index: vout,
+				tag: WalletFundingProvider.PLEDGE_TAG
+			});
+			released = !res.isErr();
+		} else {
+			const res = await this.wallet.unfreezeUtxo?.({ txid, index: vout });
+			released =
+				!res?.isErr() || this.wallet.isUtxoFrozen?.(txid, vout) === false;
+		}
+		if (released) this.ownedFreezes.delete(key);
+		return released;
 	}
 
 	/**
@@ -323,6 +423,9 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * timestamp; an entry with no timestamp is treated as already expired, and
 	 * the regular pruning unfreezes them. User freezes (no tag) are never
 	 * touched.
+	 *
+	 * A tagged freeze is ours even when a renewal already recorded the coin: a
+	 * renewal that runs before this found it frozen and could not tell.
 	 */
 	private adoptStalePledges(): void {
 		if (this.adoptedStale) return;
@@ -331,6 +434,7 @@ export class WalletFundingProvider implements IFundingProvider {
 		for (const f of frozen) {
 			if (f.freezeTag !== WalletFundingProvider.PLEDGE_TAG) continue;
 			const key = `${f.tx_hash}:${f.tx_pos}`;
+			this.ownedFreezes.add(key);
 			if (this.pledged.has(key)) continue;
 			this.pledged.set(key, f.frozenAt ?? 0);
 		}
@@ -384,9 +488,9 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * select-and-pledge or a renewal; a release racing a per-block renewal is
 	 * self-healing anyway (the next pledgeTransactionInputs re-freezes).
 	 * Adopting stale pledges first makes a pledge persisted by a previous run
-	 * releasable too. Only outpoints in the pledged map are touched: the map
-	 * only ever holds PLEDGE_TAG freezes, so user freezes are safe, and
-	 * unknown outpoints (including a double release) are no-ops.
+	 * releasable too. Only outpoints in the pledged map are touched, and only
+	 * the freezes this provider placed are lifted, so user freezes are safe
+	 * and unknown outpoints (including a double release) are no-ops.
 	 */
 	async releaseInputPledges(
 		outpoints: Array<{ txid: string; vout: number }>

@@ -160,6 +160,7 @@ const res = await Wallet.create({
 ```
 
 - **Failover:** with multiple servers the wallet rotates through them in order on connect/reconnect failure, then through hardcoded fallback peers for the network, with a per-server cooldown so dead servers are not hammered. Inspect `wallet.electrum.currentServer` and `wallet.electrum.rotationCount`.
+- **Certificate verification:** by default a TLS Electrum connection is encrypted but the server certificate is not checked, because the client library dials with `rejectUnauthorized: false`. An on-path attacker can therefore stand in for the server. On Node, pass `tls: withTlsVerification(tls)` to accept only certificates that chain to a trusted CA and match the host, and add `{ fingerprints: ['AB:CD:…'] }` to also accept self-signed servers by SHA-256 fingerprint (`openssl x509 -noout -fingerprint -sha256`). The CLI/daemon and React Native do not verify yet.
 - **Fee source:** `'electrum'` queries only the connected server via `blockchain.estimatefee`, so fee lookups never leak to mempool.space/blocktank over clearnet. `'auto'` prefers Electrum and falls back to HTTP. All remote rates are clamped to 5000 sat/vB.
 - **Networks:** mainnet, testnet, regtest and signet work end to end (wallet, Electrum, CLI/daemon `--network signet`, Lightning chain hash and `tbs` invoice prefix). Signet shares testnet address formats and coin type 1.
 - **BIP21:** `encodeBip21({ address, amountSats?, label?, message? })` builds a `bitcoin:` URI.
@@ -194,7 +195,7 @@ The full read-only surface works: address generation, gap-limit scanning, Electr
 <details>
 <summary><b>Hardware wallets and external signers (PSBT)</b></summary>
 
-`buildPsbt` runs the normal setup (coin selection, change, fee) but stops before signing, returning a base64 PSBT populated with what a hardware signer needs: `witnessUtxo` (or `nonWitnessUtxo` for legacy p2pkh), `redeemScript` for p2sh-p2wpkh, `tapInternalKey` plus `tapBip32Derivation` for p2tr, and `bip32Derivation` on every wallet input. Works on full and watch-only wallets.
+`buildPsbt` runs the normal setup (coin selection, change, fee) but stops before signing, returning a base64 PSBT populated with what a hardware signer needs: `witnessUtxo` (or `nonWitnessUtxo` for legacy p2pkh), `redeemScript` for p2sh-p2wpkh, `tapInternalKey` plus `tapBip32Derivation` for p2tr, and `bip32Derivation` on every wallet input. The change output carries the same derivation fields, so the signer shows it as change rather than as a second recipient. Works on full and watch-only wallets.
 
 ```typescript
 // 1. Build (never touches private keys)
@@ -205,9 +206,10 @@ const { psbtBase64, fee, vsizeEstimate } = build.value;
 // 2. Sign externally (hardware wallet, HWI, another machine)
 const signedBase64 = await myHardwareWallet.signPsbt(psbtBase64);
 
-// 3. Import: validates a signature on EVERY input, finalizes, does NOT broadcast
+// 3. Import: checks the inputs and outputs are the ones built, validates a
+//    signature on EVERY input, finalizes, does NOT broadcast
 const imported = wallet.importSignedPsbt(signedBase64);
-if (imported.isErr()) return; // missing/invalid signatures are rejected loudly
+if (imported.isErr()) return; // changed outputs, missing/invalid signatures are rejected loudly
 const { txHex, txid } = imported.value;
 
 // 4. Broadcast when ready
@@ -217,9 +219,11 @@ await wallet.broadcastTransaction(txHex);
 const combined = wallet.combinePsbts([copyA, copyB]);
 ```
 
+`importSignedPsbt` finalizes only a PSBT that spends the same inputs to the same outputs as one this wallet instance built (it remembers its 50 most recent builds, in memory). To import a PSBT built elsewhere, or after a restart, pass the unsigned PSBT as the second argument: `wallet.importSignedPsbt(signedBase64, psbtBase64)`. Inputs the signer already finalized are refused, since their signatures cannot be checked.
+
 For watch-only wallets the true master fingerprint is unknowable from an account xpub, so the xpub's parent fingerprint is used: signers should locate keys by derivation path.
 
-Also on the daemon (`POST /psbt/build`, `/psbt/import-signed`, `/psbt/combine`) and the CLI (`beignet psbt build|import-signed|combine`).
+Also on the daemon (`POST /psbt/build`, `/psbt/import-signed`, `/psbt/combine`) and the CLI (`beignet psbt build|import-signed|combine`). A restart forgets the daemon's builds, so the import there takes the unsigned PSBT too: `unsignedPsbtBase64` on the route, a second argument to `beignet psbt import-signed`.
 
 </details>
 
@@ -262,10 +266,11 @@ const signedA = walletA.signPsbtWithOurKey(unsigned);
 const signedB = walletB.signPsbtWithOurKey(unsigned);
 if (signedA.isErr() || signedB.isErr()) return;
 
-// 5. Combine, finalize at threshold, broadcast.
+// 5. Combine, finalize at threshold, broadcast. The coordinator did not build
+//    the PSBT, so it checks the combined one against the unsigned original.
 const combined = coordinator.combinePsbts([signedA.value, signedB.value]);
 if (combined.isErr()) return;
-const finalized = coordinator.importSignedPsbt(combined.value); // 2-of-3 met
+const finalized = coordinator.importSignedPsbt(combined.value, unsigned); // 2-of-3 met
 if (finalized.isErr()) return;
 await coordinator.broadcastTransaction(finalized.value.txHex);
 
@@ -284,7 +289,7 @@ coordinator.exportDescriptors();
 <details>
 <summary><b>Encrypted storage and leveled logging</b></summary>
 
-The wallet persists through the host-injected `TStorage` interface (`storage: { getData, setData }`), and values are handed over as-is, so by default they are stored in plaintext. Persisted data is addresses, indexes, UTXOs, transactions, balance and fee estimates: no private keys and no mnemonic are ever written, so exposure is a privacy concern (full wallet history), not fund loss.
+The wallet persists through the host-injected `TStorage` interface (`storage: { getData, setData }`), and values are handed over as-is, so by default they are stored in plaintext. Persisted data is addresses, indexes, UTXOs, transactions, balance and fee estimates: no private keys and no mnemonic are ever written, so exposure is a privacy concern (full wallet history), not fund loss. The staged send (`transaction`) is written without signing keys, so a key pair handed to `sweepPrivateKey` or `addExternalInputs` never reaches storage, and `send`, `sendMany`, `sendMax`, `buildPsbt` and `sweepPrivateKey` reset the staged send when they return, so a restart never replays an earlier call's recipients.
 
 Wrap any `TStorage` with `createEncryptedStorage` to encrypt at rest with AES-256-GCM under an HKDF-derived key from the seed. Pre-existing plaintext values pass through unchanged and migrate lazily as they are rewritten.
 
@@ -442,14 +447,17 @@ CLI: `beignet watchtower list|add <pubkey@host:port>|remove <uri>`, daemon flag 
 The same node runs as an HTTP/SSE daemon for language-agnostic integrations, driven by a JSON CLI.
 
 ```bash
-# 1. Generate a mnemonic + ~/.beignet/config.json
+# 1. Generate a mnemonic, an API token and ~/.beignet/config.json
 npx beignet init --network regtest
+# {"ok":true,"result":{"message":"Initialized","mnemonic":"...","network":"regtest",
+#   "apiToken":"3f9c...64 hex...","note":"apiToken was generated and saved to config.json; ..."}}
 
-# 2. Start the daemon (add --daemon to background it)
+# 2. Start the daemon (add --daemon to background it). It reads the token from
+#    config.json; --api-token or BEIGNET_API_TOKEN override it.
 BEIGNET_ELECTRUM_HOST=127.0.0.1 BEIGNET_ELECTRUM_PORT=60001 BEIGNET_ELECTRUM_TLS=false \
-  npx beignet start --network regtest --api-token mytoken
+  npx beignet start --network regtest
 
-# 3. Drive it with the CLI (thin HTTP client, JSON out)
+# 3. Drive it with the CLI (thin HTTP client, JSON out; it sends the token itself)
 npx beignet info --pretty
 npx beignet address
 npx beignet channel connect-and-open <pubkey> <host> <port> 200000
@@ -459,22 +467,26 @@ npx beignet invoice pay <bolt11>
 
 Electrum and most other settings come from `~/.beignet/config.json` or the environment (`BEIGNET_MNEMONIC`, `BEIGNET_ELECTRUM_HOST`, `BEIGNET_ELECTRUM_PORT`, `BEIGNET_NETWORK`, ...). Run `npx beignet help` for the full command and flag list.
 
-Or over HTTP directly:
+`config.json` holds the mnemonic, so everything under `~/.beignet` is created owner-only (`0700` directories, `0600` files: config, pid file, database and sidecars, backups, SCB exports), the CLI runs `init`, `start`, `backup` and `restore` under umask `077`, and a config file an earlier release left readable is tightened the next time it is read, with a notice on stderr. Details in [src/cli/README.md](src/cli/README.md#file-permissions).
+
+Or over HTTP directly, with the token `init` printed (or `apiToken` from `~/.beignet/config.json`):
 
 ```bash
-curl -X POST http://localhost:2112/invoice/create -H 'Authorization: Bearer mytoken' \
+TOKEN=3f9c...   # the apiToken from beignet init
+curl -X POST http://localhost:2112/invoice/create -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d '{"amountSats": 1000, "description": "coffee"}'
 
-curl -X POST http://localhost:2112/invoice/pay -H 'Authorization: Bearer mytoken' \
+curl -X POST http://localhost:2112/invoice/pay -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d '{"bolt11": "lnbcrt10n1..."}'
 
-curl -N http://localhost:2112/events -H 'Authorization: Bearer mytoken'  # SSE stream
-curl http://localhost:2112/ready                                        # load-balancer probe
+curl -N http://localhost:2112/events -H "Authorization: Bearer $TOKEN"  # SSE stream
+curl http://localhost:2112/ready                                       # load-balancer probe
 ```
 
 - Responses are `{ "ok": true, "result": {...} }` or `{ "ok": false, "error": { "code": "...", "message": "..." } }`.
 - Full spec at `GET /openapi.json`.
-- `GET /health`, `/ready`, `/openapi.json` and `/metrics` are auth-exempt; everything else requires the bearer token **when one is configured**. Auth is off unless you set `apiToken` or `apiKeys` (named keys with `readonly`/`invoice`/`admin` scopes), so configure a token before exposing the daemon anywhere. It binds `127.0.0.1` by default.
+- Authentication is on for every install `beignet init` creates (releases after 0.22.0): `init` mints a random `apiToken` and saves it in `config.json` (run `init` again on an older config to add one). Auth is off only for a config with neither `apiToken` nor `apiKeys` (named keys with `readonly`/`invoice`/`admin` scopes); `beignet start` warns on stderr in that case. `GET /health`, `/ready` and `/openapi.json` are auth-exempt; `/metrics` only with `metricsPublic`; everything else requires the bearer token. The daemon binds `127.0.0.1` by default.
+- While auth is off, three browser guards keep a web page from driving the loopback daemon (issue #1005): a request body must be `Content-Type: application/json` (else `415 UNSUPPORTED_MEDIA_TYPE`), an `Origin` other than the configured `cors` origin or a `Sec-Fetch-Site: cross-site` request is refused (`403 CROSS_SITE_REQUEST_REFUSED`), and the `Host` header must be the loopback name the daemon is bound on (else `421 HOST_NOT_ALLOWED`, which also defeats DNS rebinding). They apply to every route but `OPTIONS`; plain clients (curl, the CLI, the SDKs) send none of those headers and are unaffected, and with a token configured the guards do not run at all.
 - Embed it instead of shelling out: `import { startDaemon } from 'beignet/cli'`.
 
 ### FFOR offline receive
@@ -740,9 +752,15 @@ Beignet is under active development. Known gaps and caveats:
 
 Recommended safeguards in production:
 
-- Cap exposure with `maxPaymentSats` and `dailySpendLimitSats`.
+- Cap exposure with `maxPaymentSats` and `dailySpendLimitSats`. Both count a
+  payment's amount plus its routing-fee cap, so the fee cannot slip past them:
+  the cap is `maxFeeSats`/`maxFeeMsat` when you pass one, and 1% of the
+  amount (never below 50 sats) when you do not. Both also cover external
+  on-chain sends (amount plus fee); see the Spending Limits section of
+  `src/cli/README.md`.
 - Call `validatePayment()` before every send.
 - Set `backupPath` for automated database backups, and keep an SCB (`beignet backup scb`).
+- Keep `~/.beignet` and the data directory owner-only. The CLI creates them `0700`/`0600` and tightens an older config on load; check them again after copying files between hosts.
 - Pass multiple `electrumServers` for connection redundancy.
 - Configure watchtowers so breaches are punished while you are offline.
 - Monitor `node:error` events and the `/health` endpoint.
