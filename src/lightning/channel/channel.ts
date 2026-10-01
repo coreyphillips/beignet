@@ -721,6 +721,41 @@ export interface IForceClosePlanRefused {
 }
 
 /**
+ * Up to this many kept received removals, a refused force-close rebuild is
+ * retried for every selection of them. Six is 63 further rebuilds at most,
+ * each one transaction build and one signature check, and it is far more
+ * than a single revoke_and_ack leaves behind outside a large multi-part
+ * settle.
+ */
+const KEPT_REMOVAL_FULL_SEARCH = 6;
+
+/**
+ * The smaller selections of the kept received removals a force close tries
+ * once the stored signature has refused the whole list, largest first.
+ *
+ * The list is a reading of our own records and the signature is the fact, so
+ * an entry the signature does not cover must cost only itself, not the
+ * entries beside it. Up to KEPT_REMOVAL_FULL_SEARCH entries every selection
+ * is tried, which is exact. Past that the search would double with each
+ * entry, so only the shapes a stale list can realistically take are tried:
+ * one entry too many (each all-but-one selection) and none of it valid (the
+ * empty selection).
+ */
+function keptRemovalSelections(kept: IHtlcEntry[] | undefined): IHtlcEntry[][] {
+	const n = kept?.length ?? 0;
+	if (!kept || n === 0) return [];
+	if (n > KEPT_REMOVAL_FULL_SEARCH) {
+		return [...kept.map((_, drop) => kept.filter((__, i) => i !== drop)), []];
+	}
+	const selections: IHtlcEntry[][] = [];
+	// Every mask but the full one, which was the first rebuild.
+	for (let mask = (1 << n) - 2; mask >= 0; mask--) {
+		selections.push(kept.filter((_, i) => (mask & (1 << i)) !== 0));
+	}
+	return selections.sort((a, b) => b.length - a.length);
+}
+
+/**
  * A force close that is going to work: everything fallible is already done,
  * and the live channel has not been touched.
  */
@@ -764,6 +799,13 @@ export interface IForceClosePlanReady {
 	 * with, so a duplicated buffer signs nothing.
 	 */
 	localNonce: Uint8Array | null;
+	/**
+	 * The received removals the commitment still carries: the part of
+	 * signedLocalRemovals the stored signature turned out to cover, or
+	 * undefined for none. Written back by applyForceClosePlan, so the monitor
+	 * classifies the broadcast against the same entries it was built from.
+	 */
+	signedLocalRemovals: IHtlcEntry[] | undefined;
 	/** The id the CHANNEL_CLOSED action carries. */
 	channelId: Buffer;
 }
@@ -5178,6 +5220,20 @@ export class Channel {
 				entry.addLocallyRevoked = true;
 				this._state.needsCommitment = true;
 			}
+			// A peer add we removed before this signature arrived is covered by
+			// it all the same: the commitment just verified carries its output
+			// until the peer revokes for the removal, which has not happened or
+			// the entry would be gone. Nothing we sign reads the flag once the
+			// add is FULFILLED or FAILED, so no commitment_signed is owed for
+			// it; the flag only tells _retainSignedLocalRemoval that the stored
+			// signature carries the output (issue #1291).
+			if (
+				entry.addLocallyRevoked === false &&
+				(entry.state === HtlcState.FULFILLED ||
+					entry.state === HtlcState.FAILED)
+			) {
+				entry.addLocallyRevoked = true;
+			}
 			if (
 				entry.removalLocallyRevoked === false &&
 				(entry.state === HtlcState.FULFILLED ||
@@ -5292,8 +5348,8 @@ export class Channel {
 	 * side. We may fail an add before the peer has signed it into any
 	 * commitment of ours, and there the stored signature covers a commitment
 	 * that never had the output. The flag flips in the handleCommitmentSigned
-	 * that stores the covering signature; absent reads as "already signed", as
-	 * it does everywhere else.
+	 * that stores the covering signature, whatever state the entry is in by
+	 * then; absent reads as "already signed", as it does everywhere else.
 	 */
 	private _retainSignedLocalRemoval(entry: IHtlcEntry): void {
 		if (entry.addLocallyRevoked === false) return;
@@ -7020,9 +7076,10 @@ export class Channel {
 			// signature covers.
 			//
 			// The received removals kept for this rebuild are decided the same
-			// way: a signature that replaced the stored one without passing
-			// through handleCommitmentSigned (a splice adoption) was never asked
-			// about them, so the rebuild without them is tried as well.
+			// way, entry by entry: a signature that replaced the stored one
+			// without passing through handleCommitmentSigned (a splice adoption)
+			// was never asked about them, so the rebuilds that keep only part of
+			// the list, or none of it, are tried as well.
 			for (const candidate of this._fallbackCloseViews(closing)) {
 				const rebuilt = buildLocalCommitment(
 					candidate,
@@ -7070,6 +7127,7 @@ export class Channel {
 				: null,
 			v2Adoption,
 			localNonce,
+			signedLocalRemovals: witnessedView.signedLocalRemovals,
 			channelId: closing.channelId!
 		};
 	}
@@ -7239,24 +7297,27 @@ export class Channel {
 	/**
 	 * Every other close view prepareForceClose may try once the stored
 	 * signature has turned down the first rebuild, in order: the unstamped
-	 * adds read as unsigned, then the same views again without the received
-	 * removals kept for the signed commitment (signedLocalRemovals).
+	 * adds read as unsigned, then the same views again for each smaller
+	 * selection of the received removals kept for the signed commitment
+	 * (signedLocalRemovals).
 	 *
-	 * The second half makes that retention additive. Whatever a close could
-	 * broadcast without it, it still can, because the signature is asked about
-	 * that rebuild too and covers at most one of them.
+	 * The second half makes that retention additive, entry by entry. Whatever
+	 * a close could broadcast without a kept entry it still can, because the
+	 * signature is asked about that rebuild too and covers at most one of
+	 * them.
 	 */
 	private *_fallbackCloseViews(
 		closing: IChannelState
 	): Generator<IChannelState> {
 		yield* this._viewsWithUnstampedAddsUnsigned(closing);
-		if (!closing.signedLocalRemovals?.length) return;
-		const plain = {
-			...closing,
-			signedLocalRemovals: undefined
-		} as IChannelState;
-		yield plain;
-		yield* this._viewsWithUnstampedAddsUnsigned(plain);
+		for (const kept of keptRemovalSelections(closing.signedLocalRemovals)) {
+			const view = {
+				...closing,
+				signedLocalRemovals: kept.length > 0 ? kept : undefined
+			} as IChannelState;
+			yield view;
+			yield* this._viewsWithUnstampedAddsUnsigned(view);
+		}
 	}
 
 	/**
@@ -7295,6 +7356,15 @@ export class Channel {
 		}
 		if (plan.localNonce) {
 			this._state.localNonce = plan.localNonce;
+		}
+		// The kept removals the signature did not cover are not in the
+		// commitment on the network, so they stop being candidates for its
+		// outputs. Left alone for a close against a splice below its lock
+		// depth: the channel stays on the other funding there, whose own
+		// signature a re-drive asks afresh, and the monitor reads the plan's
+		// view for this one.
+		if (!plan.provisionalSpliceClose) {
+			this._state.signedLocalRemovals = plan.signedLocalRemovals;
 		}
 		this._state.state = ChannelState.FORCE_CLOSED;
 
@@ -14993,6 +15063,14 @@ export class Channel {
 			fields.lastSignedCommitLeaseBlockheight =
 				this._state.spliceInFlight?.remoteCommitmentSigLeaseBlockheight ??
 				getLocalCommitmentLeaseBlockheight(adopted);
+			// signedLocalRemovals is deliberately carried over (issue #1291).
+			// A splice-side signature from a commitment batch covers the same
+			// HTLC set as the current-funding one it arrived with, kept
+			// removals included, so clearing here would close the exit a
+			// window opened during pending-lock still needs. One taken from the
+			// splice's first commitment exchange may predate or postdate the
+			// list; prepareForceClose settles that against the signature itself,
+			// entry by entry (_fallbackCloseViews).
 		} else {
 			fields.needsCommitment = true;
 		}

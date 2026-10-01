@@ -454,9 +454,12 @@ export interface IChannelState {
 	 * claimed with the preimage and the stored HTLC signature.
 	 *
 	 * Written by handleRevokeAndAck, cleared by the next commitment_signed we
-	 * accept. Nothing else reads it: balances, the commitments being signed or
-	 * verified and the peer's commitment are all past the removal already.
-	 * Optional: absent means none.
+	 * accept, and narrowed by a force close to the entries the stored
+	 * signature turned out to cover. Besides those two readers only the
+	 * node's claim backstop looks here, to close ahead of a fulfilled entry's
+	 * expiry: balances, the commitments being signed or verified and the
+	 * peer's commitment are all past the removal already. Optional: absent
+	 * means none.
 	 */
 	signedLocalRemovals?: IHtlcEntry[];
 
