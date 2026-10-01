@@ -571,6 +571,35 @@ function localCommitmentCarriesAdd(
 }
 
 /**
+ * Whether a received add is one the commitment the stored remote signature
+ * covers was built without: the peer has sent update_add_htlc and its
+ * commitment_signed covering the add has not been accepted yet
+ * (addLocallyRevoked === false, which handleCommitmentSigned clears for every
+ * add that signature carries, whatever state the entry has reached).
+ *
+ * The received twin of localCommitmentCarriesAdd. Only the signedLocal
+ * rebuild asks: the commitment being VERIFIED is the next one, which the
+ * peer's own add is in from the moment it is sent. The output loop and the
+ * balance loop below both ask through here so they can never disagree.
+ *
+ * Without it a force close in that gap rebuilt a commitment with an output
+ * the stored signature has never covered, and with the amount already out of
+ * the peer's balance, so the close was refused for as long as the peer kept
+ * the connection up and withheld its signature (issue #1295). A disconnect
+ * rolls such an add back, which is why the refusal went with it.
+ */
+function signedLocalLacksReceivedAdd(
+	entry: IHtlcEntry,
+	signedLocal: boolean
+): boolean {
+	return (
+		signedLocal &&
+		entry.direction === HtlcDirection.RECEIVED &&
+		entry.addLocallyRevoked === false
+	);
+}
+
+/**
  * Build the local commitment transaction (the one we hold).
  *
  * From our perspective:
@@ -661,6 +690,15 @@ export function buildLocalCommitment(
 			// This rebuild still carries the HTLC output (the stored signature
 			// predates the peer's removal), so nothing has been settled on it:
 			// neither the peer's credit nor our refund belongs here (issue #634).
+			continue;
+		}
+		if (signedLocalLacksReceivedAdd(entry, signedLocal)) {
+			// This rebuild predates the peer's add, whatever we have done to it
+			// since: the provisional deduction handleUpdateAddHtlc took from
+			// the peer's balance goes back for this build (the output is
+			// excluded below), and no removal of it has anything to settle
+			// (issue #1295).
+			remoteMsat += entry.amountMsat;
 			continue;
 		}
 		if (entry.state === HtlcState.FULFILLED) {
@@ -1613,6 +1651,12 @@ function buildHtlcOutputsForLocal(
 	})[] = [];
 
 	for (const entry of state.htlcs.values()) {
+		// An add of the PEER's that the stored signature has never covered is
+		// in no state part of the signedLocal rebuild (issue #1295).
+		if (signedLocalLacksReceivedAdd(entry, signedLocal)) {
+			continue;
+		}
+
 		// Only include PENDING and COMMITTED HTLCs in commitment outputs.
 		// FULFILLED/FAILED HTLCs are excluded because we already sent
 		// update_fulfill/fail_htlc + commitment_signed for them — the remote

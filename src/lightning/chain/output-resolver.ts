@@ -1355,9 +1355,24 @@ function htlcMatchOrder(
 	].sort(([, a], [, b]) => a.cltvExpiry - b.cltvExpiry);
 	const sameAmount = ([, entry]: [string, IHtlcEntry]): boolean =>
 		entry.amountMsat / 1000n === amount;
-	return [
+	const ordered = [
 		...entries.filter(sameAmount),
 		...entries.filter((e) => !sameAmount(e))
+	];
+	if (!isLocalCommitment) return ordered;
+	// On OUR commitment an add the peer has not signed in yet has no output:
+	// the commitment we broadcast is the one the stored signature covers, and
+	// that signature predates the add (issue #1295). A retry on the same hash
+	// and expiry has a byte-identical script all the same, so such an entry
+	// is asked last, after every entry whose output can really be there. It
+	// stays a candidate, because the script comparison is the arbiter and
+	// the flag is only our reading of the records.
+	const unsignedAdd = ([, entry]: [string, IHtlcEntry]): boolean =>
+		entry.direction === HtlcDirection.RECEIVED &&
+		entry.addLocallyRevoked === false;
+	return [
+		...ordered.filter((e) => !unsignedAdd(e)),
+		...ordered.filter(unsignedAdd)
 	];
 }
 

@@ -269,7 +269,10 @@ export interface IHtlcEntry {
 	 * addLocallyRevoked (RECEIVED entries the peer added): false from
 	 * handleUpdateAddHtlc until we revoke for the peer's covering
 	 * commitment_signed. While false, buildRemoteCommitment omits the HTLC and
-	 * returns the peer's provisionally-deducted amount.
+	 * returns the peer's provisionally-deducted amount. So does the force-close
+	 * rebuild of OUR commitment (buildLocalCommitment signedLocal=true): the
+	 * signature we hold was made before the add, and the same handler that
+	 * stores the covering signature clears the flag (issue #1295).
 	 *
 	 * removalLocallyRevoked (OFFERED entries the peer fulfilled/failed): false
 	 * from handleUpdateFulfill/FailHtlc until we revoke for the covering

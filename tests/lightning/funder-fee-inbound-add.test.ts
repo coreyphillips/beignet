@@ -1209,10 +1209,14 @@ describe('Funder commitment fee on an inbound add (issue #1020)', function () {
 			expectWireFailure(actions, channel.getChannelId()!, TRIM_WIRE);
 			expect(channel.getState()).to.equal(ChannelState.ERRORED);
 			// The commitment we hold, at the rate its signature was made at,
-			// still carries our output: 28,240 - 7,830 = 20,410 sats.
+			// still carries our output. The 14 adds are the peer's and no
+			// commitment_signed of its has covered them yet, so that
+			// commitment has none of their outputs (issue #1295) and our
+			// balance pays the fee on none: 28,240 - 1,810 = 26,430 sats.
+			expect(funderCommitmentCostSats(2_500, 0, null)).to.equal(1_810n);
 			const held = heldSignedCommitment(channel);
-			expect(held.htlcOutputs).to.equal(14);
-			expect(held.toLocalSats).to.equal(20_410);
+			expect(held.htlcOutputs).to.equal(0);
+			expect(held.toLocalSats).to.equal(26_430);
 		});
 
 		it('verify path: at the old rate the same state passes the backstop', function () {
