@@ -13796,6 +13796,7 @@ export class LightningNode extends EventEmitter {
 		maxFeeSats: bigint;
 		timeoutMs?: number;
 	}): Promise<IRebalanceResult> {
+		if (this._destroyed) throw new Error('Node destroyed');
 		const { fromChannelId, toChannelId, amountSats, maxFeeSats } = options;
 		const cidErr =
 			validateBuffer(fromChannelId, 32, 'fromChannelId') ||
