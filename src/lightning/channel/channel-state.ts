@@ -440,6 +440,27 @@ export interface IChannelState {
 	htlcs: Map<string, IHtlcEntry>;
 
 	/**
+	 * RECEIVED HTLCs we fulfilled or failed that have left `htlcs`, while the
+	 * local commitment the stored remote signature covers still carries their
+	 * outputs.
+	 *
+	 * The peer's revoke_and_ack for our removal settles it everywhere but
+	 * there: the entry is deleted and the balance moves, and the commitment we
+	 * hold, the only one we can broadcast, stays the one the peer signed
+	 * before the removal until its next commitment_signed replaces it. Until
+	 * then the force-close rebuild (buildLocalCommitment signedLocal=true) and
+	 * the classification of our own commitment read the entries kept here, so
+	 * that what we broadcast is what the signature covers and the output is
+	 * claimed with the preimage and the stored HTLC signature.
+	 *
+	 * Written by handleRevokeAndAck, cleared by the next commitment_signed we
+	 * accept. Nothing else reads it: balances, the commitments being signed or
+	 * verified and the peer's commitment are all past the removal already.
+	 * Optional: absent means none.
+	 */
+	signedLocalRemovals?: IHtlcEntry[];
+
+	/**
 	 * Per-remote-commitment HTLC snapshots, keyed by remote commitment number.
 	 * Records which HTLCs were present in each remote commitment we signed, so
 	 * that if the counterparty broadcasts a REVOKED commitment whose HTLCs have

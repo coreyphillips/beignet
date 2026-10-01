@@ -5129,6 +5129,10 @@ export class Channel {
 
 		// The HTLC SET the signature covers, same purpose (issue #643).
 		this._markOfferedAddsRemoteSigned();
+		// And the received removals it no longer carries: the peer signed this
+		// commitment after revoking for them, so the outputs kept for the
+		// previous signature are not in the commitment we now hold.
+		this._state.signedLocalRemovals = undefined;
 
 		// Two-phase update_fee, acceptor side: this commitment_signed from the
 		// opener covers its staged update_fee (the update always precedes its
@@ -5269,6 +5273,33 @@ export class Channel {
 			// FFOR: the round boundary at which S's voucher round completes.
 			...this._fforAfterRound('cs')
 		];
+	}
+
+	/**
+	 * Keep a received HTLC the peer has just revoked the removal of where the
+	 * force-close rebuild can still find it (IChannelState.signedLocalRemovals).
+	 *
+	 * That revoke_and_ack ends the removal on the PEER's commitment, and the
+	 * entry leaves the map with it. Our own commitment is one message behind:
+	 * the signature we hold is over the commitment from before the removal,
+	 * HTLC output included, until the peer's next commitment_signed arrives. A
+	 * force close in between broadcasts that commitment or nothing, and with
+	 * the entry simply gone the rebuild produced one the signature does not
+	 * cover, so prepareForceClose refused for as long as the peer withheld its
+	 * signature.
+	 *
+	 * addLocallyRevoked bounds it the way addRemoteSigned bounds the offered
+	 * side. We may fail an add before the peer has signed it into any
+	 * commitment of ours, and there the stored signature covers a commitment
+	 * that never had the output. The flag flips in the handleCommitmentSigned
+	 * that stores the covering signature; absent reads as "already signed", as
+	 * it does everywhere else.
+	 */
+	private _retainSignedLocalRemoval(entry: IHtlcEntry): void {
+		if (entry.addLocallyRevoked === false) return;
+		const retained = this._state.signedLocalRemovals ?? [];
+		retained.push({ ...entry });
+		this._state.signedLocalRemovals = retained;
 	}
 
 	/**
@@ -5424,6 +5455,7 @@ export class Channel {
 				if (entry.direction === HtlcDirection.RECEIVED) {
 					// We received and fulfilled: credit our balance
 					this._state.localBalanceMsat += entry.amountMsat;
+					this._retainSignedLocalRemoval(entry);
 				} else {
 					// We offered and remote fulfilled: credit remote balance
 					this._state.remoteBalanceMsat += entry.amountMsat;
@@ -5433,6 +5465,7 @@ export class Channel {
 				if (entry.direction === HtlcDirection.RECEIVED) {
 					// We received but failed: refund remote balance
 					this._state.remoteBalanceMsat += entry.amountMsat;
+					this._retainSignedLocalRemoval(entry);
 				} else {
 					// We offered but it failed: refund our balance
 					this._state.localBalanceMsat += entry.amountMsat;
@@ -6985,7 +7018,12 @@ export class Channel {
 			// HTLC output. So the signature decides: rebuild with the unstamped
 			// adds read as unsigned, and take the first rebuild the stored
 			// signature covers.
-			for (const candidate of this._viewsWithUnstampedAddsUnsigned(closing)) {
+			//
+			// The received removals kept for this rebuild are decided the same
+			// way: a signature that replaced the stored one without passing
+			// through handleCommitmentSigned (a splice adoption) was never asked
+			// about them, so the rebuild without them is tried as well.
+			for (const candidate of this._fallbackCloseViews(closing)) {
 				const rebuilt = buildLocalCommitment(
 					candidate,
 					perCommitmentPoint,
@@ -7196,6 +7234,29 @@ export class Channel {
 			htlcs.set(id, { ...entry, addRemoteSigned: false });
 			yield { ...closing, htlcs: new Map(htlcs) } as IChannelState;
 		}
+	}
+
+	/**
+	 * Every other close view prepareForceClose may try once the stored
+	 * signature has turned down the first rebuild, in order: the unstamped
+	 * adds read as unsigned, then the same views again without the received
+	 * removals kept for the signed commitment (signedLocalRemovals).
+	 *
+	 * The second half makes that retention additive. Whatever a close could
+	 * broadcast without it, it still can, because the signature is asked about
+	 * that rebuild too and covers at most one of them.
+	 */
+	private *_fallbackCloseViews(
+		closing: IChannelState
+	): Generator<IChannelState> {
+		yield* this._viewsWithUnstampedAddsUnsigned(closing);
+		if (!closing.signedLocalRemovals?.length) return;
+		const plain = {
+			...closing,
+			signedLocalRemovals: undefined
+		} as IChannelState;
+		yield plain;
+		yield* this._viewsWithUnstampedAddsUnsigned(plain);
 	}
 
 	/**

@@ -417,6 +417,12 @@ export interface ISerializedChannelState {
 	remoteNextPerCommitmentPoint: string | null;
 	localHtlcCounter: string;
 	htlcs: ISerializedHtlcEntry[];
+	/**
+	 * Received removals the signed local commitment still carries (see
+	 * IChannelState.signedLocalRemovals). Absent when there are none, so a row
+	 * outside that window is byte for byte what it was.
+	 */
+	signedLocalRemovals?: ISerializedHtlcEntry[];
 	/** Per-remote-commitment HTLC snapshots for penalty completeness (H2). */
 	revokedHtlcSnapshots?: ISerializedHtlcSnapshot[];
 	/**
@@ -926,6 +932,11 @@ export function serializeChannelState(
 		remoteNextPerCommitmentPoint: bufToHex(s.remoteNextPerCommitmentPoint),
 		localHtlcCounter: bigintToStr(s.localHtlcCounter),
 		htlcs,
+		signedLocalRemovals: s.signedLocalRemovals?.length
+			? s.signedLocalRemovals.map((e) =>
+					serializeHtlcEntry(`received-${e.id}`, e)
+			  )
+			: undefined,
 		revokedHtlcSnapshots,
 		watchtowerRemoteCommitmentTxs: s.watchtowerRemoteCommitmentTxs?.size
 			? [...s.watchtowerRemoteCommitmentTxs].flatMap(([point, txs]) =>
@@ -1361,6 +1372,9 @@ export function deserializeChannelState(
 		remoteNextPerCommitmentPoint: hexToBuf(s.remoteNextPerCommitmentPoint),
 		localHtlcCounter: strToBigint(s.localHtlcCounter),
 		htlcs,
+		signedLocalRemovals: s.signedLocalRemovals?.length
+			? s.signedLocalRemovals.map((h) => deserializeHtlcEntry(h).entry)
+			: undefined,
 		revokedHtlcSnapshots,
 		watchtowerRemoteCommitmentTxs: s.watchtowerRemoteCommitmentTxs?.length
 			? s.watchtowerRemoteCommitmentTxs.reduce(
