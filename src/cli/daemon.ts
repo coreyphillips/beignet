@@ -2981,7 +2981,11 @@ async function bootDaemon(
 			);
 			if ('refusal' in dest) return failure('INVALID_PARAMS', dest.refusal);
 			await node.backup(dest.path);
-			return success({ backed_up: true, macPath: backupMacPath(dest.path) });
+			return success({
+				backed_up: true,
+				path: dest.path,
+				macPath: backupMacPath(dest.path)
+			});
 		},
 		'GET /backup/scb': () => success(node.exportStaticChannelBackup()),
 		// Newest valid SCB returned by a peer via BOLT 1 peer storage. Recovery
