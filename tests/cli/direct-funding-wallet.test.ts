@@ -20,7 +20,7 @@ import {
 } from '../../src';
 import { directFundingWallet, IDfWallet } from '../../src/cli/direct-funding';
 import { IUtxo } from '../../src/types';
-import { ok, err, Result } from '../../src/utils';
+import { ok, Result } from '../../src/utils';
 
 const NETWORK = bitcoin.networks.regtest;
 const TXID = 'aa'.repeat(32);
@@ -68,15 +68,18 @@ function stubWallet(
 			});
 			return ok({ created: true });
 		},
-		unfreezeUtxo: async (args: {
+		unfreezeUtxoIfTagged: async (args: {
 			txid: string;
 			index: number;
-		}): Promise<Result<string>> => {
-			const before = stub.frozen.length;
-			stub.frozen = stub.frozen.filter(
-				(f) => !(f.tx_hash === args.txid && f.tx_pos === args.index)
-			);
-			return stub.frozen.length === before ? err('not frozen') : ok('unfrozen');
+			tag: string;
+		}): Promise<Result<{ unfrozen: boolean }>> => {
+			const on = (f: IUtxo): boolean =>
+				f.tx_hash === args.txid && f.tx_pos === args.index;
+			if (stub.frozen.some((f) => on(f) && f.freezeTag !== args.tag)) {
+				return ok({ unfrozen: false });
+			}
+			stub.frozen = stub.frozen.filter((f) => !on(f));
+			return ok({ unfrozen: true });
 		},
 		transactions: opts.transactions ?? {},
 		electrum: {
@@ -133,11 +136,12 @@ describe('direct funding wallet: a freeze queued ahead of ours (issue #1253)', f
 	const TXID_Y = '44'.repeat(32);
 
 	let wallet: Wallet;
+	let store: Map<string, unknown>;
 	// Every blacklist write waits on this before it reaches storage.
 	let blacklistWrite: Promise<void> = Promise.resolve();
 
 	beforeEach(async function () {
-		const store = new Map<string, unknown>();
+		store = new Map<string, unknown>();
 		const storage: TStorage = {
 			getData: async <K extends keyof IWalletData>(
 				key: string
@@ -237,6 +241,32 @@ describe('direct funding wallet: a freeze queued ahead of ours (issue #1253)', f
 		expect(reserved).to.equal(true);
 		expect(await df.unfreezeUtxo(TXID_X, 0)).to.equal(true);
 		expect(wallet.isUtxoFrozen(TXID_X, 0)).to.equal(false);
+	});
+
+	it('does not release X when an operator freeze is queued ahead (issue #1266)', async () => {
+		const df = directFundingWallet(wallet, NETWORK);
+		expect(await df.freezeUtxo(TXID_X, 0)).to.equal(true);
+		const { userY, release } = holdBlacklist();
+		const userX = wallet.freezeUtxo({ txid: TXID_X, index: 0 });
+		const payer = df.unfreezeUtxo(TXID_X, 0);
+		await new Promise((resolve) => setImmediate(resolve));
+		const entryX = (): IUtxo | undefined =>
+			wallet
+				.listFrozenUtxos()
+				.find((f) => f.tx_hash === TXID_X && f.tx_pos === 0);
+		expect(entryX()?.freezeTag).to.equal('direct-funding');
+		release();
+		const [y, x, released] = await Promise.all([userY, userX, payer]);
+		expect(y.isOk() && x.isOk()).to.equal(true);
+		expect(released, 'the operator now owns the freeze').to.equal(false);
+		expect(entryX()?.freezeTag).to.equal(undefined);
+		const stored = store.get(
+			wallet.getWalletDataKey('blacklistedUtxos')
+		) as IUtxo[];
+		expect(
+			stored.some((f) => f.tx_hash === TXID_X && f.tx_pos === 0),
+			'the operator freeze in storage'
+		).to.equal(true);
 	});
 });
 
