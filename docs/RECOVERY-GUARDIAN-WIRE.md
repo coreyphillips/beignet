@@ -672,7 +672,8 @@ record is accepted when:
 the bundle's newEpoch and newWriterPublicKey are the local lease
 the guardian's own certificate for that lease fixes a head of the
   bundle's superseded lease, and nothing was written under the lease
-  since (the log head is still that head)
+  since (the log head is that head, or a superseded-epoch record an
+  earlier extension took)
 record.epoch == the superseded lease epoch, and its writer signature
   verifies under the superseded lease's key
 record.sequence <= the bundle's certified head, and the record extends
@@ -683,10 +684,13 @@ a bundle head at the record's sequence is this record, and one below
 
 Anything else from below the lease stays `ERR_EPOCH_SUPERSEDED`, so a
 record above the certified head, which never reached a quorum, is never
-taken. On accept the guardian re-signs its own TAKEOVER certificate over
-the new head with the receipt. Its history therefore stays one takeover
-over one head, which the open-time walk (5.10) verifies. The final state a
-quorum certified never moves; this guardian's grant moves up to it.
+taken. The guardian's own TAKEOVER certificate keeps the head it was
+granted over. Rewriting it would hide a quorum of signers at that lower
+head, which a later restore must still see as a conflict (spec 5.7 step
+6). The open-time walk (5.10) accepts a takeover certificate below the
+replayed head when that head is a record of the superseded lease and the
+certificate's head lies on the log. The final state a quorum certified
+never moves; this guardian's log moves up to it.
 
 ### 5.7 SYNC_EPOCH
 

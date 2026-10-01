@@ -1565,9 +1565,10 @@ export class ReferenceGuardian {
 	 * SYNC_RECORD with a takeover bundle (wire 5.6). A guardian that granted
 	 * its lease over a lower head of the superseded epoch than the quorum
 	 * certified takes that epoch's records up to the certified head. Its own
-	 * certificate moves with each record, so its history stays one takeover
-	 * over one head. Null when the bundle does not apply: the record is then
-	 * fenced like any other.
+	 * certificate keeps the head it was granted over: rewriting it would hide
+	 * a quorum at that head that a later bundle needs to see as a conflict.
+	 * Null when the bundle does not apply: the record is then fenced like any
+	 * other.
 	 */
 	private extendGrant(
 		state: GuardianState,
@@ -1587,7 +1588,8 @@ export class ReferenceGuardian {
 			return null;
 		}
 		// Nothing may have been written under the lease since the grant: its
-		// head is still the one this guardian's certificate fixed.
+		// head is the one this guardian's certificate fixed, or a record of
+		// the superseded epoch an earlier extension took.
 		const row = this.store.getEpoch(recoveryId, u64be(state.lease.epoch));
 		const granted = row ? tryParseState(row.certSupersededState) : null;
 		if (
@@ -1595,7 +1597,8 @@ export class ReferenceGuardian {
 			!granted ||
 			!row.writerPublicKey.equals(state.lease.writerPublicKey) ||
 			!sameLease(granted, certified) ||
-			!logHeadsEqual(granted.logHead, state.logHead)
+			(!logHeadsEqual(granted.logHead, state.logHead) &&
+				state.logHead.recordEpoch !== certified.lease.epoch)
 		) {
 			return null;
 		}
@@ -1679,25 +1682,8 @@ export class ReferenceGuardian {
 			writerSignature: Buffer.from(record.writerSignature)
 		});
 		charge(GUARDIAN_RECORD_OVERHEAD_BYTES + record.ciphertext.length);
-		const superseded: GuardianState = { ...granted, logHead: head };
 		const newState: GuardianState = { ...state, logHead: head };
-		const cert = this.signCertificate(
-			superseded,
-			state.lease.epoch,
-			state.lease.writerPublicKey
-		);
 		const receipt = this.signReceipt(newState);
-		this.store.updateEpochTakeover({
-			recoveryId: Buffer.from(recoveryId),
-			epoch: u64be(state.lease.epoch),
-			writerPublicKey: Buffer.from(row.writerPublicKey),
-			certSupersededState: stateBytes(superseded),
-			certIssuedAt: u64be(cert.issuedAt),
-			certSignature: cert.signature,
-			receiptState: stateBytes(newState),
-			receiptIssuedAt: u64be(receipt.issuedAt),
-			receiptSignature: receipt.signature
-		});
 		this.store.updateNamespaceState(
 			recoveryId,
 			stateBytes(newState),
@@ -2568,6 +2554,19 @@ export class ReferenceGuardian {
 		return null;
 	}
 
+	/** Whether a head lies on this guardian's stored log, without alarming. */
+	private headOnLog(recoveryId: Buffer, head: LogHead): boolean {
+		if (isGenesisLogHead(head)) return true;
+		const stored = this.store.getRecord(recoveryId, u64be(head.sequence));
+		return (
+			stored !== null &&
+			recordRowProblem(stored) === null &&
+			stored.frameHash.equals(head.frameHash) &&
+			stored.ciphertextHash.equals(head.ciphertextHash) &&
+			readU64be(stored.epoch) === head.recordEpoch
+		);
+	}
+
 	/**
 	 * SYNC_EPOCH steps 1 to 6 (wire 5.7), shared with the bundle SYNC_RECORD
 	 * may carry (5.6). Signers may have granted one key over different heads
@@ -3407,6 +3406,12 @@ export class ReferenceGuardian {
 			) {
 				return fail('takeover epoch row is missing its artifacts');
 			}
+			// A grant extended to a quorum's higher head (wire 5.6) keeps its
+			// certificate below the superseded epoch's records it then took.
+			const extended =
+				superseded.lease.epoch === sim.lease.epoch &&
+				superseded.logHead.sequence < sim.logHead.sequence &&
+				this.headOnLog(recoveryId, superseded.logHead);
 			if (
 				!superseded.recoveryId.equals(recoveryId) ||
 				superseded.origin.firstSequence !== sim.origin.firstSequence ||
@@ -3414,7 +3419,7 @@ export class ReferenceGuardian {
 				rowEpoch !== superseded.lease.epoch + 1n ||
 				(belowFloor
 					? superseded.logHead.sequence > belowFloor.logHead.sequence
-					: !logHeadsEqual(superseded.logHead, sim.logHead) ||
+					: (!logHeadsEqual(superseded.logHead, sim.logHead) && !extended) ||
 					  superseded.lease.epoch < sim.lease.epoch ||
 					  (superseded.lease.epoch === sim.lease.epoch &&
 							!superseded.lease.writerPublicKey.equals(
@@ -3441,7 +3446,7 @@ export class ReferenceGuardian {
 					writerPublicKey: Buffer.from(row.writerPublicKey)
 				},
 				origin: sim.origin,
-				logHead: belowFloor ? superseded.logHead : sim.logHead
+				logHead: superseded.logHead
 			};
 			const receiptState = tryParseState(row.receiptState);
 			if (receiptState === null || !statesEqual(receiptState, post)) {
@@ -3458,7 +3463,7 @@ export class ReferenceGuardian {
 			) {
 				return fail('stored takeover receipt signature failed');
 			}
-			if (!belowFloor) sim = post;
+			if (!belowFloor) sim = { ...post, logHead: sim.logHead };
 			return null;
 		};
 

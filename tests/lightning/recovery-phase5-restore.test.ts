@@ -39,6 +39,7 @@ import {
 	RESTORE_META_KEYS,
 	RestoreDriver,
 	RestoreRefusedError,
+	RestoreRotatedError,
 	computeGuardianSetId,
 	decodeAcquireEpochRequest,
 	decodePutStateRequest,
@@ -54,8 +55,10 @@ import {
 	loadWriterLease,
 	nodeGuardianTransport,
 	registerTranscriptHash,
+	rotateTranscriptHash,
 	signAcquisition,
 	signTranscript,
+	stateBytes,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
@@ -241,6 +244,45 @@ function driverFor(
 			events.push(event);
 		}
 	});
+}
+
+type WriterKey = ReturnType<typeof generateWriterKey>;
+
+/** One guardian grants the epoch after `lease` to `writer` over its head. */
+async function grantNext(
+	client: GuardianClient,
+	lease: IWriterLeaseKeys,
+	writer: WriterKey
+): Promise<GuardianState> {
+	const guard = (await client.getHead(ROOT.recoveryId)).state as GuardianState;
+	const response = await client.acquireEpoch({
+		protocolVersion: 1,
+		guardianSetId: SET_ID,
+		expectedState: guard,
+		newEpoch: lease.epoch + 1n,
+		newWriterPublicKey: writer.publicKey,
+		...signAcquisition(SET_ID, guard, lease.epoch + 1n, writer, ROOT.rootSecret)
+	});
+	expect(response.status).to.equal(GuardianStatus.OK);
+	return guard;
+}
+
+/** The acquisition record a restore persists before it sends the request. */
+function persistPending(
+	target: IStorageBackend,
+	guard: GuardianState,
+	writer: WriterKey
+): void {
+	target.setRecoveryMeta!(
+		RESTORE_META_KEYS.pendingAcquisition,
+		JSON.stringify({
+			version: 1,
+			expectedState: stateBytes(guard).toString('hex'),
+			newEpoch: (guard.lease.epoch + 1n).toString(),
+			writerSecret: writer.secret.toString('hex'),
+			writerPublicKey: writer.publicKey.toString('hex')
+		})
+	);
 }
 
 describe('Recovery phase 5: restore driver', () => {
@@ -1348,6 +1390,165 @@ describe('Recovery phase 5: restore driver', () => {
 		later.close();
 	});
 
+	it('follows a rotation that reaches the source while a split takeover completes', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		// G1 granted the pending attempt over N and G2 over N+1, with G3
+		// still under the old lease at N+1. The rotation lands on G2 after
+		// every head was read, while G3 is being repaired.
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const clients = served.map((s) => s.client);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		const writer = generateWriterKey();
+		await grantNext(clients[0], lease, writer);
+		live.manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, 84).toString('hex'),
+					preimage: Buffer.alloc(32, 84)
+				}
+			],
+			outboundMessages: []
+		});
+		const all = live.storage.loadRecoveryFrames();
+		const tail = rep.signRecord(all[all.length - 1], lease);
+		for (const client of clients.slice(1)) {
+			expect((await client.putState(tail)).status).to.equal(GuardianStatus.OK);
+		}
+		const guard = await grantNext(clients[1], lease, writer);
+		const target = openStorage();
+		persistPending(target, guard, writer);
+
+		const incoming = [
+			GUARDIAN_IDS[1],
+			GUARDIAN_IDS[2],
+			xOnlyFromSecret(sha('p5-restore-guardian-4'))
+		];
+		const fields = {
+			recoveryId: ROOT.recoveryId,
+			newGuardianSetId: computeGuardianSetId({
+				...CRASH_V1_PROFILE,
+				guardianIds: incoming
+			}),
+			generation: 2n,
+			newMembers: incoming
+		};
+		const rotation = {
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			...fields,
+			rootSignature: signTranscript(
+				rotateTranscriptHash(SET_ID, fields),
+				ROOT.rootSecret
+			),
+			newTransports: incoming.map((id) => ({
+				type: 'https',
+				url: `https://${id.toString('hex').slice(0, 8)}.example`
+			}))
+		};
+		let retired = false;
+		const repairing: IBoundGuardianClient = {
+			expectedGuardianId: served[2].id,
+			client: new GuardianClient({
+				url: served[2].client.url,
+				guardianSetId: SET_ID,
+				transport: async (
+					url,
+					init
+				): Promise<{ status: number; body: Buffer }> => {
+					if (url.endsWith('/sync_epoch') && !retired) {
+						retired = true;
+						expect(served[1].guardian.rotateSet(rotation).status).to.equal(
+							GuardianStatus.OK
+						);
+					}
+					return nodeGuardianTransport()(url, init);
+				}
+			})
+		};
+		try {
+			await driverFor(target, [
+				...bind(served.slice(0, 2)),
+				repairing
+			]).restore();
+			expect.fail('a retired set must not complete the takeover');
+		} catch (error) {
+			expect(error).to.be.instanceOf(RestoreRotatedError);
+		}
+		expect(retired).to.equal(true);
+		expect(loadWriterLease(target).state).to.equal('missing');
+		expect(target.loadRecoveryFrames()).to.have.length(0);
+		await shutdown(served);
+		live.storage.close();
+		target.close();
+	});
+
+	it('halts a split takeover whose lower head is off the certified chain', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		// G1 granted the pending attempt over its own record at sequence 1,
+		// G2 over sequence 2 of a log with another record at 1. Both name
+		// the same lease and key, but they are two different histories.
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const clients = served.map((s) => s.client);
+		const live = liveNode(1);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		const fork = liveNode(0);
+		for (const n of [91, 92]) {
+			fork.manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'payment_preimage',
+						paymentHash: Buffer.alloc(32, n).toString('hex'),
+						preimage: Buffer.alloc(32, n)
+					}
+				],
+				outboundMessages: []
+			});
+		}
+		const [own] = live.storage.loadRecoveryFrames();
+		expect(
+			(await clients[0].putState(rep.signRecord(own, lease))).status
+		).to.equal(GuardianStatus.OK);
+		for (const client of clients.slice(1)) {
+			for (const frame of fork.storage.loadRecoveryFrames()) {
+				expect(
+					(await client.putState(rep.signRecord(frame, lease))).status
+				).to.equal(GuardianStatus.OK);
+			}
+		}
+		const writer = generateWriterKey();
+		await grantNext(clients[0], lease, writer);
+		const guard = await grantNext(clients[1], lease, writer);
+		const target = openStorage();
+		persistPending(target, guard, writer);
+
+		try {
+			await driverFor(target, bind(served)).restore();
+			expect.fail('two histories under one takeover must halt the restore');
+		} catch (error) {
+			expect(error).to.be.instanceOf(RestoreRefusedError);
+			expect((error as RestoreRefusedError).reason).to.equal('conflict');
+		}
+		expect(loadWriterLease(target).state).to.equal('missing');
+		expect(target.loadRecoveryFrames()).to.have.length(0);
+		await shutdown(served);
+		live.storage.close();
+		fork.storage.close();
+		target.close();
+	});
+
 	it('repairs a guardian that missed the takeover and discards its superseded tail', async function (): Promise<void> {
 		// Real guardians over real TCP: the default 2s is not enough under
 		// full-suite load, and a load-sensitive timeout is a flaky test.
@@ -1957,9 +2158,29 @@ describe('Recovery phase 5: restore driver', () => {
 		}
 		expect(loadWriterLease(target).state).to.equal('missing');
 		expect(target.loadRecoveryFrames()).to.have.length(0);
+
+		// With G3 away the quorum over N is out of sight, so a restore runs
+		// and takes G1 up to N+1. G1 still serves its grant over N, so the
+		// conflict is found again once G3 is back.
+		const partial = openStorage();
+		await driverFor(partial, bind(served.slice(0, 2))).restore();
+		expect(
+			((await clients[0].getHead(ROOT.recoveryId)).state as GuardianState)
+				.logHead.sequence
+		).to.equal(tail.sequence);
+		const again = openStorage();
+		try {
+			await driverFor(again, bind(served)).restore();
+			expect.fail('the quorum over N still fixes a second final head');
+		} catch (error) {
+			expect(error).to.be.instanceOf(RestoreRefusedError);
+			expect((error as RestoreRefusedError).reason).to.equal('conflict');
+		}
 		await shutdown(served);
 		live.storage.close();
 		target.close();
+		partial.close();
+		again.close();
 	});
 });
 

@@ -51,6 +51,7 @@ import { withStorageTransaction } from '../storage/transaction';
 import {
 	GuardianState,
 	genesisLogHead,
+	isGenesisLogHead,
 	parseStateBytes,
 	stateBytes,
 	statesEqual,
@@ -1049,12 +1050,16 @@ export class RestoreDriver {
 			this.grantedOver(reading.state, attempt, certified)
 		);
 		if (!source) return null;
+		const repaired = await this.repairLaggards(pool, stale, source);
+		// No ACQUIRE goes out on this path, so no ERR_SET_RETIRED answer can
+		// reveal a retirement that landed after the heads were read.
+		const rotation = await this.refetchRotation();
+		if (rotation) throw this.rotated(rotation);
 		this.emit(
 			'epoch:acquired',
 			`epoch ${attempt.newEpoch} acquired with ${bundle.length} certificates ` +
 				`granted over different heads, certifying sequence ${certified.logHead.sequence}`
 		);
-		const repaired = await this.repairLaggards(pool, stale, source);
 		return {
 			lease: {
 				epoch: attempt.newEpoch,
@@ -1321,6 +1326,20 @@ export class RestoreDriver {
 					last?.sequence ?? 0n
 				}, not at the certified head ${certified.logHead.sequence}`
 			);
+		}
+		// A split grant certifies its highest head on the word of signers
+		// fenced at lower ones, so those heads must lie on this chain too.
+		for (const cert of acquired.certificates) {
+			const head = cert.supersededState.logHead;
+			if (isGenesisLogHead(head)) continue;
+			const record = records.find((r) => r.sequence === head.sequence);
+			if (!record || !record.frameHash.equals(head.frameHash)) {
+				throw new RestoreRefusedError(
+					'conflict',
+					`a takeover certificate's head at sequence ${head.sequence} is not on the certified chain; ` +
+						'outside the crash-fault model, halting the restore'
+				);
+			}
 		}
 		this.emit(
 			'frames:downloaded',

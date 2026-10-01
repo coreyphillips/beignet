@@ -681,28 +681,6 @@ export class GuardianStore {
 			);
 	}
 
-	/** Replace a takeover epoch row's certificate and receipt. */
-	updateEpochTakeover(row: IGuardianEpochRow): void {
-		this.db
-			.prepare(
-				`UPDATE guardian_epochs SET
-					cert_superseded_state = ?, cert_issued_at = ?, cert_signature = ?,
-					receipt_state = ?, receipt_issued_at = ?, receipt_signature = ?
-				WHERE recovery_id = ? AND epoch = ? AND writer_public_key = ?`
-			)
-			.run(
-				row.certSupersededState,
-				row.certIssuedAt,
-				row.certSignature,
-				row.receiptState,
-				row.receiptIssuedAt,
-				row.receiptSignature,
-				row.recoveryId,
-				row.epoch,
-				row.writerPublicKey
-			);
-	}
-
 	deleteEpochsAbove(recoveryId: Buffer, epochExclusive: Buffer): void {
 		this.db
 			.prepare(

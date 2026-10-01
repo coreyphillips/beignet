@@ -1081,29 +1081,32 @@ describe('Guardian core: one key granted over two heads (issue #1268)', () => {
 		const taken = a.syncRecord({ record: chain[1], certificates: bundle });
 		expect(taken.status).to.equal(GuardianStatus.OK);
 		expectValidReceipt(taken.receipt, 0, headOf(b));
+		// A keeps serving its grant over sequence 1, so a quorum at that head
+		// stays visible beside the higher one.
 		const certs =
 			a.getHead({
 				protocolVersion: 1,
 				guardianSetId: SET_ID,
 				recoveryId: ROOT.recoveryId
 			}).certificates ?? [];
-		const moved = expectValidCertificate(
+		const kept = expectValidCertificate(
 			certs.find((cert) => cert.newEpoch === 2n),
 			0
 		);
-		expect(statesEqual(moved.supersededState, certB.supersededState)).to.equal(
+		expect(statesEqual(kept.supersededState, certA.supersededState)).to.equal(
 			true
 		);
 
-		// Nothing above the certified head, and the grant answers over it.
+		// Nothing above the certified head, and the grant answers over its
+		// own head only.
 		expect(
 			a.syncRecord({ record: chain[2], certificates: bundle }).status
 		).to.equal(GuardianStatus.ERR_EPOCH_SUPERSEDED);
 		expect(
-			a.acquireEpoch(buildAcquire(certB.supersededState, WRITER_2)).status
+			a.acquireEpoch(buildAcquire(certA.supersededState, WRITER_2)).status
 		).to.equal(GuardianStatus.OK_DUPLICATE);
 
-		// The moved grant is history the open-time walk verifies, and the
+		// The extended grant is history the open-time walk verifies, and the
 		// new writer continues from it.
 		a.close();
 		const reopened = makeGuardian(0, fixture.file);
