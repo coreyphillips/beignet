@@ -798,9 +798,11 @@ export interface BeignetConfig {
 	/** Relay third-party HTLCs, i.e. act as a routing hop (default true). Set
 	 *  false so a wallet declines all forwards. Env: BEIGNET_FORWARDING_ENABLED. */
 	forwardingEnabled?: boolean;
-	/** Signature-verify foreign broadcast gossip at intake (default false:
-	 *  verification is deferred until a gossip query asks for the entry;
-	 *  nothing unverified is ever served either way). Set true on relay-class
+	/** Signature-verify all foreign broadcast gossip at intake (default false:
+	 *  only what pathfinding reads and channel peers' node announcements are
+	 *  verified at intake, the rest is deferred
+	 *  until a gossip query asks for it; nothing unverified is ever served
+	 *  either way). Set true on relay-class
 	 *  nodes that serve the graph. Env: BEIGNET_EAGER_GOSSIP_VERIFY, exact
 	 *  'true' or 'false'; anything else is ignored. */
 	eagerGossipVerify?: boolean;

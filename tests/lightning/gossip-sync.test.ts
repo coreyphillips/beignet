@@ -53,6 +53,11 @@ import { Feature } from '../../src/lightning/features/flags';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 
+// The raw module.exports object the node reads its intake verifiers from,
+// so replacing one here is seen there.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const gossipValidation = require('../../src/lightning/gossip/validation');
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 function makeBasepoints(): IChannelBasepoints {
@@ -1204,9 +1209,12 @@ describe('Gossip Sync (Phase 5)', function () {
 			graph.addChannelAnnouncement(makeChannelAnnouncement(scid, n1, n2), {
 				verified: true
 			});
-			// RGS-style: synthetic update stamped with the snapshot's global
-			// latest-seen timestamp.
-			graph.applyChannelUpdate(makeChannelUpdate(scid, 0, 2000));
+			// RGS-style: signatureless synthetic update stamped with the
+			// snapshot's global latest-seen timestamp.
+			graph.applyChannelUpdate({
+				...makeChannelUpdate(scid, 0, 2000),
+				signature: Buffer.alloc(64)
+			});
 			// The real signed update carries its true, older timestamp and must
 			// still win the slot.
 			expect(
@@ -1919,6 +1927,15 @@ describe('Gossip Sync (Phase 5)', function () {
 				8000,
 				REGTEST_CHAIN_HASH
 			);
+			// Lazy intake verifies channel data too (issue #1024), and signing
+			// 8000 real channels would take minutes of pure-JS work. This test
+			// is about batching, so the intake checks pass everything.
+			const verifiers = {
+				verifyChannelAnnouncement: gossipValidation.verifyChannelAnnouncement,
+				verifyChannelUpdate: gossipValidation.verifyChannelUpdate
+			};
+			gossipValidation.verifyChannelAnnouncement = (): boolean => true;
+			gossipValidation.verifyChannelUpdate = (): boolean => true;
 
 			try {
 				await responder.listen(0, '127.0.0.1');
@@ -1950,6 +1967,7 @@ describe('Gossip Sync (Phase 5)', function () {
 					expect(ch?.update2, scid.toString('hex')).to.not.equal(undefined);
 				}
 			} finally {
+				Object.assign(gossipValidation, verifiers);
 				initiator.destroy();
 				responder.destroy();
 			}
@@ -2003,22 +2021,16 @@ describe('Gossip Sync (Phase 5)', function () {
 				);
 			}
 
-			function sendAnnouncement(scidHex: string, i: number): void {
-				const node1 = Buffer.alloc(33, 0x02);
-				node1[32] = i * 2 + 1;
-				const node2 = Buffer.alloc(33, 0x02);
-				node2[32] = i * 2 + 2;
+			// Signed: lazy intake verifies a new channel (issue #1024).
+			function sendAnnouncement(scidHex: string): void {
 				node.handlePeerMessage(
 					peerPubkey,
 					MessageType.CHANNEL_ANNOUNCEMENT,
-					encodeChannelAnnouncementMessage(
-						makeChannelAnnouncement(
-							Buffer.from(scidHex, 'hex'),
-							node1,
-							node2,
-							REGTEST_CHAIN_HASH
-						)
-					)
+					makeSignedChannelAnnouncement(
+						Buffer.from(scidHex, 'hex'),
+						makeSignedChannelKeys(),
+						REGTEST_CHAIN_HASH
+					).payload
 				);
 			}
 
@@ -2041,7 +2053,7 @@ describe('Gossip Sync (Phase 5)', function () {
 				onQuery = (): void => {
 					channelsAtSecondQuery = node.getGraph().getChannelCount();
 				};
-				sendAnnouncement(queries[0][0], 0);
+				sendAnnouncement(queries[0][0]);
 				sendEnd();
 				// The announcement is still queued, so the query waits.
 				expect(queries).to.have.length(1);
@@ -2059,7 +2071,7 @@ describe('Gossip Sync (Phase 5)', function () {
 				statics.GOSSIP_INTAKE_MAX = 2;
 				try {
 					startSync(1500);
-					for (let i = 0; i < 4; i++) sendAnnouncement(queries[0][i], i);
+					for (let i = 0; i < 4; i++) sendAnnouncement(queries[0][i]);
 					sendEnd();
 					await waitFor(() => queries.length === 2);
 					expect(queries[1]).to.eql(queries[0]);
@@ -2085,9 +2097,9 @@ describe('Gossip Sync (Phase 5)', function () {
 				statics.GOSSIP_INTAKE_MAX = 1;
 				try {
 					startSync(1);
-					sendAnnouncement(queries[0][0], 0);
+					sendAnnouncement(queries[0][0]);
 					// The intake is full, so this is dropped.
-					sendAnnouncement(queries[0][0], 0);
+					sendAnnouncement(queries[0][0]);
 					node.getPeerManager()!.emit('peer:disconnect', peerPubkey);
 					await node.flushGossip();
 					expect(node.getGraph().getChannelCount()).to.equal(1);
@@ -2404,7 +2416,47 @@ describe('Gossip Sync (Phase 5)', function () {
 			node.destroy();
 		});
 
-		it('defers intake verification and resolves it at serve time (issue #443, lazy default)', async function () {
+		it('an older canonical update cannot roll back a newer one that does not re-encode (issue #1024)', async function () {
+			const node = makeNode();
+			const peer = 'aa'.repeat(33);
+			const scid = makeScid(152, 1, 0);
+			const keys = makeSignedChannelKeys();
+			const ann = makeSignedChannelAnnouncement(scid, keys, REGTEST_CHAIN_HASH);
+			const extended = makeSignedChannelUpdate(
+				scid,
+				keys.nodeKey1,
+				0,
+				2000,
+				REGTEST_CHAIN_HASH,
+				Buffer.from([9, 9])
+			);
+			const older = makeSignedChannelUpdate(
+				scid,
+				keys.nodeKey1,
+				0,
+				1000,
+				REGTEST_CHAIN_HASH
+			);
+			node.handlePeerMessage(
+				peer,
+				MessageType.CHANNEL_ANNOUNCEMENT,
+				ann.payload
+			);
+			node.handlePeerMessage(
+				peer,
+				MessageType.CHANNEL_UPDATE,
+				extended.payload
+			);
+			node.handlePeerMessage(peer, MessageType.CHANNEL_UPDATE, older.payload);
+			await node.flushGossip();
+
+			const ch = node.getGraph().getChannel(scid)!;
+			expect(ch.update1?.timestamp).to.equal(2000);
+			expect(ch.update1Verified).to.be.false;
+			node.destroy();
+		});
+
+		it('verifies channel gossip at intake in lazy mode and serves only what re-encodes (issues #443, #1024)', async function () {
 			const node = makeNode();
 			const peer = 'aa'.repeat(33);
 			const cleanScid = makeScid(150, 3, 0);
@@ -2415,9 +2467,8 @@ describe('Gossip Sync (Phase 5)', function () {
 				cleanKeys,
 				REGTEST_CHAIN_HASH
 			);
-			// Signed future fields the codec cannot round-trip: serve-time
-			// resolution verifies the canonical re-encoding, so this one must
-			// resolve unservable exactly like eager intake would classify it.
+			// Signed future fields the codec cannot round-trip: validly signed,
+			// so it is admitted and routable, but never served.
 			const extra = makeSignedChannelAnnouncement(
 				extraScid,
 				makeSignedChannelKeys(),
@@ -2448,22 +2499,19 @@ describe('Gossip Sync (Phase 5)', function () {
 			);
 			await node.flushGossip();
 
-			// Intake paid for no signatures: everything sits deferred, with the
-			// boolean flags unset so truthiness checks read unverified.
+			// Pathfinding reads these, so intake settled them even in lazy mode.
 			const graph = node.getGraph();
-			expect(graph.getChannel(cleanScid)!.announcementVerified).to.equal(
-				undefined
-			);
-			expect(graph.getChannel(cleanScid)!.announcementVerifyDeferred).to.equal(
-				true
-			);
-			expect(graph.getChannel(cleanScid)!.update1VerifyDeferred).to.equal(true);
-			expect(graph.getChannel(extraScid)!.announcementVerifyDeferred).to.equal(
-				true
-			);
+			expect(graph.getChannel(cleanScid)!.announcementVerified).to.be.true;
+			expect(graph.getChannel(cleanScid)!.update1Verified).to.be.true;
+			expect(graph.getChannel(extraScid)!.announcementVerified).to.be.false;
+			for (const scid of [cleanScid, extraScid]) {
+				const ch = graph.getChannel(scid)!;
+				expect(ch.announcementVerifyDeferred).to.equal(undefined);
+				expect(ch.update1VerifyDeferred).to.equal(undefined);
+			}
 
-			// A gossip query triggers resolution: the clean entry is served
-			// byte-identically, the unreproducible one is withheld.
+			// The clean entry is served byte-identically, the unreproducible
+			// one is withheld.
 			const outbound: Array<{ type: number; payload: Buffer }> = [];
 			node.on(
 				'message:outbound',
@@ -2489,11 +2537,6 @@ describe('Gossip Sync (Phase 5)', function () {
 			);
 			expect(servedUpds.length).to.equal(1);
 			expect(servedUpds[0].payload.equals(cleanUpd.payload)).to.be.true;
-
-			// Resolution is sticky: the flags are booleans now.
-			expect(graph.getChannel(cleanScid)!.announcementVerified).to.be.true;
-			expect(graph.getChannel(cleanScid)!.update1Verified).to.be.true;
-			expect(graph.getChannel(extraScid)!.announcementVerified).to.be.false;
 			node.destroy();
 		});
 

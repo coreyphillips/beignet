@@ -998,19 +998,24 @@ unverified (`*Verified: false`, failed verification or signatureless, never
 served and never re-checked) and deferred (`*VerifyDeferred: true` with the
 boolean unset: carries signatures, not yet checked). The booleans never go
 truthy for unchecked data, so existing `if (announcementVerified)` consumers
-stay safe. By default the node runs lazy verification: foreign broadcast
-gossip is admitted deferred without any signature work, `reply_channel_range`
-advertises those SCIDs, and the first `query_short_channel_ids` that asks for
-an entry resolves it, serving only what verifies. Resolution draws on a
+stay safe. Pathfinding reads every stored update whatever its provenance, so
+the node verifies every `channel_update`, and every `channel_announcement` for
+an SCID it does not hold yet, at intake in either mode; otherwise any peer
+could rewrite the policy of any channel. By default the node runs lazy
+verification for the rest: node announcements, and signed announcements that
+upgrade a held signatureless (RGS) entry in place, are admitted deferred
+without any signature work, `reply_channel_range` advertises those SCIDs, and
+the first `query_short_channel_ids` that asks for an entry resolves it,
+serving only what verifies. Resolution draws on a
 verification budget shared by all queries in a rolling window
 (`NetworkGraph.SERVE_VERIFY_BUDGET_MS` per `SERVE_VERIFY_WINDOW_MS`); each
 channel is served atomically (announcement plus updates plus endpoint node
 announcements) or omitted whole, and an omission forced by the budget is
 reported through the `reply_short_channel_ids_end` `full_information` bit.
-This skips nearly the entire first-dump verification cost for wallet nodes
-while preserving the never-serve-unverified rule. Trust-consuming reads stay
-verified everywhere: updates naming our own channels and node announcements
-that feed peer address capture are verified at intake, and every dial-address
+On an RGS-primed wallet this skips the announcement signatures of the whole
+snapshot while preserving the never-serve-unverified rule. Trust-consuming
+reads stay verified everywhere: node announcements that feed peer address
+capture are verified at intake, and every dial-address
 consumer goes through `NetworkGraph.getVerifiedNodeAnnouncement`, which
 resolves a deferred announcement before handing out addresses. FFOR public-fee
 eligibility uses `NetworkGraph.getVerifiedChannelAnnouncement`, which resolves
@@ -1020,9 +1025,17 @@ local public channel. Set
 `eagerGossipVerify: true` on relay-class nodes to verify everything at intake
 as before; eager mode also re-requests signatureless RGS-primed entries from
 peers so their signed copies become servable. Stored rows that predate the
-provenance flags are resolved at restore: eager mode verifies the canonical
-re-encoding (failing safe to unverified), lazy mode marks them deferred and
-lets the point of consumption decide.
+provenance flags are resolved at restore. Update slots are verified in either
+mode, and a signed update that fails is dropped because pathfinding would read
+it. Signatureless (RGS) update slots are kept. Older lazy runs also stored a
+peer's zero-signature forgery as a signatureless slot flagged unverified, the
+same shape RGS data is saved in, so the first boot of a version that verifies
+every update at intake drops every such slot once, writes the repaired rows
+back and records that in the metadata table
+(`gossip_legacy_unsigned_updates_dropped`). From then on only RGS writes that
+shape. For announcements, eager mode verifies the canonical re-encoding
+(failing safe to unverified), lazy mode marks them deferred and lets the point
+of consumption decide.
 
 Local public-channel gossip is rebuilt from stored channel signatures on restart,
 including when a graph row already exists. Periodic refresh updates the local graph

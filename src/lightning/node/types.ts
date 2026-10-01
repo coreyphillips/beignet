@@ -477,10 +477,13 @@ export interface INodeConfig {
 	 */
 	forwardingEnabled?: boolean;
 	/**
-	 * Whether to signature-verify foreign broadcast gossip at intake. Default
-	 * false: entries are admitted with deferred provenance and verified only
-	 * when a gossip query asks for them, which skips nearly the entire
-	 * first-dump verification cost for wallet nodes (issue #443). Nothing
+	 * Whether to signature-verify all foreign broadcast gossip at intake.
+	 * Default false: channel updates and announcements of new channels are
+	 * still verified at intake because pathfinding reads them (issue #1024),
+	 * as are channel peers' node announcements, whose addresses we dial;
+	 * other node announcements and signed copies of RGS-primed channels are
+	 * admitted with deferred provenance and verified only when a gossip query
+	 * asks for them (issue #443). Nothing
 	 * unverified is ever served to gossip queries in either mode. Set true on
 	 * relay-class nodes that want to serve the graph: intake and restore then
 	 * verify eagerly, and signatureless RGS-primed entries are re-requested

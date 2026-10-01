@@ -3187,9 +3187,10 @@ Start flags:
   --no-forwarding                        Decline to relay third-party HTLCs, i.e.
                                          do not act as a routing hop (forwarding
                                          is on by default)
-  --eager-gossip-verify                  Verify foreign gossip signatures at intake
-                                         instead of lazily at serve time (off by
-                                         default; for relay-class nodes)
+  --eager-gossip-verify                  Verify all foreign gossip signatures at
+                                         intake (off by default: channel data is
+                                         verified at intake anyway, the rest at
+                                         serve time; for relay-class nodes)
   --no-auto-reconnect                    Do not dial known peers, channel partners
                                          included, on start or disconnect. With no
                                          listen/websocket port either, the node is

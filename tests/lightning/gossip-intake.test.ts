@@ -259,13 +259,44 @@ describe('Gossip pre-verification gates (NetworkGraph)', () => {
 		expect(graph.addChannelAnnouncement(ann.msg, { verified: true })).to.equal(
 			true
 		);
-		// Same for a stale update sitting in an unverified slot.
-		const rgsUpdate = buildUpdate(ann, 5000, 1, REGTEST_CHAIN_HASH);
-		expect(
-			graph.applyChannelUpdate(rgsUpdate.msg, { verified: false })
-		).to.equal(true);
+		// Same for a stale update sitting in a signatureless (RGS) slot.
+		const rgsUpdate = {
+			...buildUpdate(ann, 5000, 1, REGTEST_CHAIN_HASH).msg,
+			signature: Buffer.alloc(64)
+		};
+		expect(graph.applyChannelUpdate(rgsUpdate, { verified: false })).to.equal(
+			true
+		);
 		const signedNotNewer = buildUpdate(ann, 5000, 1, REGTEST_CHAIN_HASH);
 		expect(graph.wouldAcceptChannelUpdate(signedNotNewer.msg)).to.equal(true);
+	});
+
+	it('a stale re-send against a signed unverified slot is refused at the gate (issue #1024)', () => {
+		const graph = new NetworkGraph(REGTEST_CHAIN_HASH);
+		const ann = buildAnnouncement(104, REGTEST_CHAIN_HASH);
+		graph.addChannelAnnouncement(ann.msg, { verified: true });
+		// A validly signed update the codec cannot re-encode settles false.
+		const held = buildUpdate(ann, 2000, 0, REGTEST_CHAIN_HASH);
+		expect(graph.applyChannelUpdate(held.msg, { verified: false })).to.equal(
+			true
+		);
+
+		// Apply refuses an older or equal canonical replay, so the gate must
+		// too, or every stale re-send would pay for a signature check.
+		for (const timestamp of [1000, 2000]) {
+			const replay = buildUpdate(ann, timestamp, 0, REGTEST_CHAIN_HASH);
+			expect(graph.wouldAcceptChannelUpdate(replay.msg)).to.equal(false);
+			expect(graph.applyChannelUpdate(replay.msg, { verified: true })).to.equal(
+				false
+			);
+		}
+		expect(
+			graph.getChannel(ann.msg.shortChannelId)!.update1?.timestamp
+		).to.equal(2000);
+
+		// A newer update still passes.
+		const newer = buildUpdate(ann, 3000, 0, REGTEST_CHAIN_HASH);
+		expect(graph.wouldAcceptChannelUpdate(newer.msg)).to.equal(true);
 	});
 
 	it('wrong chain and disordered node ids never reach verification', () => {
@@ -408,6 +439,46 @@ describe('Gossip far-future timestamps (NetworkGraph, issue #446)', () => {
 		expect(
 			graph.applyNodeAnnouncement(realAnn.msg, { verified: true })
 		).to.equal(true);
+	});
+
+	it('a lazy restore drops a forged signed update but keeps a signatureless RGS one (issue #1024)', () => {
+		// An older lazy run saved a random-signature forgery as deferred.
+		// The zero-signature slot flagged false is the shape RGS saves.
+		const ann = buildAnnouncement(704, REGTEST_CHAIN_HASH);
+		const storedRow = (): IGraphChannel => ({
+			shortChannelId: ann.msg.shortChannelId,
+			nodeId1: ann.msg.nodeId1,
+			nodeId2: ann.msg.nodeId2,
+			features: Buffer.alloc(0),
+			announcement: ann.msg,
+			announcementVerifyDeferred: true,
+			update1: {
+				...buildUpdate(ann, 1000, 0, REGTEST_CHAIN_HASH).msg,
+				signature: crypto.randomBytes(64)
+			},
+			update1VerifyDeferred: true,
+			update2: {
+				...buildUpdate(ann, 1000, 1, REGTEST_CHAIN_HASH).msg,
+				signature: Buffer.alloc(64)
+			},
+			update2Verified: false
+		});
+		const graph = new NetworkGraph(REGTEST_CHAIN_HASH);
+		graph.restoreChannel(storedRow());
+		const ch = graph.getChannel(ann.msg.shortChannelId)!;
+		expect(ch.update1).to.equal(undefined);
+		expect(ch.update1VerifyDeferred).to.equal(undefined);
+		expect(ch.update2?.feeBaseMsat).to.equal(1000);
+		expect(ch.update2Verified).to.equal(false);
+
+		// The one-time upgrade pass is what removes a zero-signature slot
+		// flagged false, the shape older lazy intake gave a peer forgery.
+		const legacy = storedRow();
+		expect(NetworkGraph.dropLegacyUnsignedUpdates(legacy)).to.equal(true);
+		expect(legacy.update1).to.not.equal(undefined);
+		expect(legacy.update2).to.equal(undefined);
+		expect(legacy.update2Verified).to.equal(undefined);
+		expect(NetworkGraph.dropLegacyUnsignedUpdates(legacy)).to.equal(false);
 	});
 });
 
@@ -875,6 +946,39 @@ describe('Gossip intake queue (LightningNode)', () => {
 	};
 	const graphOf = (n: LightningNode): NetworkGraph =>
 		(n as unknown as { graph: NetworkGraph }).graph;
+	/**
+	 * What applyRapidGossipSnapshot stores for a channel: no signatures, no
+	 * bitcoin keys, no provenance claim, and optionally one update.
+	 */
+	const rgsPrime = (
+		ann: ReturnType<typeof buildAnnouncement>,
+		updateTimestamp?: number
+	): void => {
+		const graph = graphOf(node);
+		graph.addChannelAnnouncement({
+			...ann.msg,
+			nodeSignature1: Buffer.alloc(64),
+			nodeSignature2: Buffer.alloc(64),
+			bitcoinSignature1: Buffer.alloc(64),
+			bitcoinSignature2: Buffer.alloc(64),
+			bitcoinKey1: Buffer.alloc(33),
+			bitcoinKey2: Buffer.alloc(33)
+		});
+		if (updateTimestamp !== undefined) {
+			graph.applyChannelUpdate({
+				...buildUpdate(ann, updateTimestamp, 0, REGTEST_CHAIN_HASH).msg,
+				feeBaseMsat: 4242,
+				signature: Buffer.alloc(64)
+			});
+		}
+	};
+	/** destroy() closes the storage handle, so reopen it for the next node. */
+	const restart = (): void => {
+		node.destroy();
+		storage = new SqliteStorage(dbPath);
+		storage.open();
+		node = new LightningNode(makeConfig());
+	};
 
 	it('broadcast gossip is queued, not applied inline, and lands on flush', async () => {
 		const ann = buildAnnouncement(200, REGTEST_CHAIN_HASH);
@@ -930,8 +1034,9 @@ describe('Gossip intake queue (LightningNode)', () => {
 
 	it('the event loop keeps ticking while a dump drains', async () => {
 		// The tick floor below only exists when intake verifies (issue #437's
-		// contract); the lazy default admits a 40-message dump in one slice.
-		// destroy() closes the storage handle, so build a fresh one.
+		// contract), so pin eager mode rather than lean on which messages the
+		// lazy default verifies. destroy() closes the storage handle, so build
+		// a fresh one.
 		node.destroy();
 		storage = new SqliteStorage(dbPath);
 		storage.open();
@@ -956,41 +1061,118 @@ describe('Gossip intake queue (LightningNode)', () => {
 		expect(ticks).to.be.at.least(5);
 	});
 
-	it('lazy intake (default) admits a dump as deferred without paying for signatures', async () => {
+	it('lazy intake (default) verifies what pathfinding reads: a new channel and its update', async () => {
 		const ann = buildAnnouncement(500, REGTEST_CHAIN_HASH);
 		const update = buildUpdate(ann, 1000, 0, REGTEST_CHAIN_HASH);
 		feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
 		feed(MessageType.CHANNEL_UPDATE, update.payload);
 		await node.flushGossip();
 		const ch = graphOf(node).getChannel(ann.msg.shortChannelId)!;
-		expect(ch.announcementVerified).to.equal(undefined);
-		expect(ch.announcementVerifyDeferred).to.equal(true);
-		expect(ch.update1VerifyDeferred).to.equal(true);
+		expect(ch.announcementVerified).to.equal(true);
+		expect(ch.announcementVerifyDeferred).to.equal(undefined);
+		expect(ch.update1Verified).to.equal(true);
+		expect(ch.update1VerifyDeferred).to.equal(undefined);
 	});
 
-	it('lazy intake admits a garbage-signature announcement as deferred; eager drops it', async () => {
+	it('a garbage-signature announcement for a new SCID is dropped in lazy mode too', async () => {
 		const ann = buildAnnouncement(501, REGTEST_CHAIN_HASH);
 		const garbage = {
 			...ann.msg,
 			nodeSignature1: crypto.randomBytes(64)
 		};
-		const garbagePayload = encodeChannelAnnouncementMessage(garbage);
-		feed(MessageType.CHANNEL_ANNOUNCEMENT, garbagePayload);
-		await node.flushGossip();
-		expect(
-			graphOf(node).getChannel(ann.msg.shortChannelId)!
-				.announcementVerifyDeferred
-		).to.equal(true);
-
-		node.destroy();
-		storage = new SqliteStorage(dbPath);
-		storage.open();
-		node = new LightningNode(makeConfig(true));
-		feed(MessageType.CHANNEL_ANNOUNCEMENT, garbagePayload);
+		let writes = 0;
+		const original = storage.saveGossipChannel.bind(storage);
+		storage.saveGossipChannel = (scidHex, channel): void => {
+			writes++;
+			original(scidHex, channel);
+		};
+		feed(
+			MessageType.CHANNEL_ANNOUNCEMENT,
+			encodeChannelAnnouncementMessage(garbage)
+		);
 		await node.flushGossip();
 		expect(graphOf(node).getChannel(ann.msg.shortChannelId)).to.equal(
 			undefined
 		);
+		expect(writes).to.equal(0);
+	});
+
+	it('a forged update cannot rewrite or camp a channel policy in lazy mode (issue #1024)', async () => {
+		const now = Math.floor(Date.now() / 1000);
+		const ann = buildAnnouncement(503, REGTEST_CHAIN_HASH);
+		const real = buildUpdate(ann, now - 60, 0, REGTEST_CHAIN_HASH);
+		feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
+		feed(MessageType.CHANNEL_UPDATE, real.payload);
+		await node.flushGossip();
+		const ch = graphOf(node).getChannel(ann.msg.shortChannelId)!;
+
+		// Unsigned, near the far-future bound, and pricing the hop out.
+		const forged = {
+			...buildUpdate(ann, now + 3599, 0, REGTEST_CHAIN_HASH).msg,
+			feeBaseMsat: 0xffffffff,
+			signature: crypto.randomBytes(64)
+		};
+		feed(MessageType.CHANNEL_UPDATE, encodeChannelUpdateMessage(forged));
+		await node.flushGossip();
+		expect(ch.update1?.timestamp).to.equal(now - 60);
+		expect(ch.update1?.feeBaseMsat).to.equal(1000);
+
+		// The endpoint's next real update still lands.
+		const next = buildUpdate(ann, now, 0, REGTEST_CHAIN_HASH);
+		feed(MessageType.CHANNEL_UPDATE, next.payload);
+		await node.flushGossip();
+		expect(ch.update1?.timestamp).to.equal(now);
+		expect(ch.update1Verified).to.equal(true);
+	});
+
+	it('an RGS-primed channel keeps its deferred announcement upgrade but refuses forged updates', async () => {
+		const now = Math.floor(Date.now() / 1000);
+		const ann = buildAnnouncement(504, REGTEST_CHAIN_HASH);
+		const graph = graphOf(node);
+		// RGS rows carry zero signatures and a synthetic snapshot timestamp.
+		graph.addChannelAnnouncement(
+			{
+				...ann.msg,
+				nodeSignature1: Buffer.alloc(64),
+				nodeSignature2: Buffer.alloc(64),
+				bitcoinSignature1: Buffer.alloc(64),
+				bitcoinSignature2: Buffer.alloc(64)
+			},
+			{ verified: false }
+		);
+		graph.applyChannelUpdate(
+			{
+				...buildUpdate(ann, now, 0, REGTEST_CHAIN_HASH).msg,
+				signature: Buffer.alloc(64)
+			},
+			{ verified: false }
+		);
+		const ch = graph.getChannel(ann.msg.shortChannelId)!;
+
+		// The signed announcement cannot move the endpoints, so lazy mode
+		// still skips its signatures.
+		feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
+		await node.flushGossip();
+		expect(ch.announcementVerifyDeferred).to.equal(true);
+
+		// A forged update no longer takes the signatureless slot.
+		const forged = {
+			...buildUpdate(ann, now - 60, 0, REGTEST_CHAIN_HASH).msg,
+			channelFlags: 2, // disabled, direction 0
+			signature: crypto.randomBytes(64)
+		};
+		feed(MessageType.CHANNEL_UPDATE, encodeChannelUpdateMessage(forged));
+		await node.flushGossip();
+		expect(ch.update1?.channelFlags).to.equal(0);
+		expect(ch.update1Verified).to.equal(false);
+
+		// The endpoint's signed update does, even though its timestamp is
+		// older than the snapshot's synthetic one.
+		const real = buildUpdate(ann, now - 60, 0, REGTEST_CHAIN_HASH);
+		feed(MessageType.CHANNEL_UPDATE, real.payload);
+		await node.flushGossip();
+		expect(ch.update1?.timestamp).to.equal(now - 60);
+		expect(ch.update1Verified).to.equal(true);
 	});
 
 	it('a re-served dump in lazy mode causes no graph change and no storage writes', async () => {
@@ -1000,9 +1182,9 @@ describe('Gossip intake queue (LightningNode)', () => {
 		feed(MessageType.CHANNEL_UPDATE, update.payload);
 		await node.flushGossip();
 
-		// A deferred slot holding real signatures must refuse its own re-serve
-		// at apply, or every re-served dump would rewrite the whole gossip
-		// table (the #437 failure class relocated to disk).
+		// Every re-served entry must refuse at the gates, or every re-served
+		// dump would rewrite the whole gossip table (the #437 failure class
+		// relocated to disk).
 		let writes = 0;
 		const original = storage.saveGossipChannel.bind(storage);
 		storage.saveGossipChannel = (scidHex, channel): void => {
@@ -1014,7 +1196,7 @@ describe('Gossip intake queue (LightningNode)', () => {
 		await node.flushGossip();
 		expect(writes).to.equal(0);
 		const ch = graphOf(node).getChannel(ann.msg.shortChannelId)!;
-		expect(ch.announcementVerifyDeferred).to.equal(true);
+		expect(ch.announcementVerified).to.equal(true);
 		expect(ch.update1?.timestamp).to.equal(1000);
 	});
 
@@ -1032,6 +1214,10 @@ describe('Gossip intake queue (LightningNode)', () => {
 			})
 		);
 		for (let i = 0; i < genuine.length; i++) {
+			// Intake checks the announcement of a new SCID (issue #1024), so
+			// each forgery arrives as the signed upgrade of an RGS-primed
+			// entry, the one announcement lazy intake still takes unchecked.
+			rgsPrime(genuine[i]);
 			feed(MessageType.CHANNEL_ANNOUNCEMENT, forged[i]);
 			// A row with no fresh update would be dropped at restore.
 			feed(
@@ -1041,6 +1227,11 @@ describe('Gossip intake queue (LightningNode)', () => {
 		}
 		await node.flushGossip();
 		const [viaRead, viaServe] = genuine.map((ann) => ann.msg.shortChannelId);
+		for (const scid of [viaRead, viaServe]) {
+			expect(
+				graphOf(node).getChannel(scid)!.announcementVerifyDeferred
+			).to.equal(true);
+		}
 		expect(graphOf(node).getVerifiedChannelAnnouncement(viaRead)).to.equal(
 			undefined
 		);
@@ -1048,10 +1239,7 @@ describe('Gossip intake queue (LightningNode)', () => {
 			graphOf(node).getGossipMessagesForChannels([viaServe]).announcements
 		).to.have.length(0);
 
-		node.destroy();
-		storage = new SqliteStorage(dbPath);
-		storage.open();
-		node = new LightningNode(makeConfig());
+		restart();
 		for (const scid of [viaRead, viaServe]) {
 			expect(graphOf(node).getChannel(scid)!.announcementVerified).to.be.false;
 		}
@@ -1078,6 +1266,87 @@ describe('Gossip intake queue (LightningNode)', () => {
 				undefined
 			);
 		}
+	});
+
+	it('RGS policies survive restarts once the legacy update pass has run (issue #1024)', async () => {
+		const now = Math.floor(Date.now() / 1000);
+		const ann = buildAnnouncement(505, REGTEST_CHAIN_HASH);
+		const scid = ann.msg.shortChannelId;
+		// The first boot of this database ran the one-time pass already.
+		expect(
+			storage.loadMetadata('gossip_legacy_unsigned_updates_dropped')
+		).to.equal('1');
+
+		// An RGS policy reaches disk with the row a signed update saves.
+		rgsPrime(ann, now - 60);
+		feed(
+			MessageType.CHANNEL_UPDATE,
+			buildUpdate(ann, now - 30, 1, REGTEST_CHAIN_HASH).payload
+		);
+		await node.flushGossip();
+		const saved = storage.loadAllGossipChannels();
+		expect(saved).to.have.length(1);
+		expect(saved[0].update1Verified).to.equal(false);
+
+		for (let boot = 0; boot < 2; boot++) {
+			restart();
+			const ch = graphOf(node).getChannel(scid)!;
+			expect(ch.update1?.feeBaseMsat).to.equal(4242);
+			expect(ch.update1Verified).to.equal(false);
+			expect(ch.update2Verified).to.equal(true);
+		}
+	});
+
+	it('a zero-signature update saved by an older lazy run is dropped once and the repair is saved (issue #1024)', () => {
+		const now = Math.floor(Date.now() / 1000);
+		const ann = buildAnnouncement(506, REGTEST_CHAIN_HASH);
+		const scid = ann.msg.shortChannelId;
+		// A database from before the pass: no marker, and the row older lazy
+		// intake saved for a peer's unsigned update beside a real one.
+		node.destroy();
+		for (const suffix of ['', '-wal', '-shm']) {
+			try {
+				fs.unlinkSync(dbPath + suffix);
+			} catch {
+				/* ignore */
+			}
+		}
+		storage = new SqliteStorage(dbPath);
+		storage.open();
+		storage.saveGossipChannel(scid.toString('hex'), {
+			shortChannelId: scid,
+			nodeId1: ann.msg.nodeId1,
+			nodeId2: ann.msg.nodeId2,
+			features: Buffer.alloc(0),
+			announcement: ann.msg,
+			announcementVerified: true,
+			update1: {
+				...buildUpdate(ann, now - 60, 0, REGTEST_CHAIN_HASH).msg,
+				channelFlags: 2, // disabled, direction 0
+				signature: Buffer.alloc(64)
+			},
+			update1Verified: false,
+			update2: buildUpdate(ann, now - 60, 1, REGTEST_CHAIN_HASH).msg,
+			update2Verified: true
+		});
+		expect(
+			storage.loadMetadata('gossip_legacy_unsigned_updates_dropped')
+		).to.equal(null);
+
+		node = new LightningNode(makeConfig());
+		const ch = graphOf(node).getChannel(scid)!;
+		expect(ch.update1).to.equal(undefined);
+		expect(ch.update2Verified).to.equal(true);
+		const [row] = storage.loadAllGossipChannels();
+		expect(row.update1).to.equal(undefined);
+		expect(row.update2Verified).to.equal(true);
+		expect(
+			storage.loadMetadata('gossip_legacy_unsigned_updates_dropped')
+		).to.equal('1');
+
+		// Repaired on disk, so the forgery stays gone under the marker.
+		restart();
+		expect(graphOf(node).getChannel(scid)!.update1).to.equal(undefined);
 	});
 
 	it('our-channel updates keep eager verification in lazy mode', async () => {
@@ -1434,15 +1703,24 @@ describe('Gossip intake queue (LightningNode)', () => {
 
 	describe('funding checks (issue #1105)', () => {
 		const savedCap = NetworkGraph.MAX_CHANNELS;
+		const pacing = LightningNode as unknown as {
+			GOSSIP_FUNDING_CHECK_INTERVAL_MS: number;
+		};
+		const savedInterval = pacing.GOSSIP_FUNDING_CHECK_INTERVAL_MS;
+		beforeEach(() => {
+			// Unpaced unless a test says otherwise: these count lookups, not time.
+			pacing.GOSSIP_FUNDING_CHECK_INTERVAL_MS = 0;
+		});
 		afterEach(() => {
 			NetworkGraph.MAX_CHANNELS = savedCap;
+			pacing.GOSSIP_FUNDING_CHECK_INTERVAL_MS = savedInterval;
 		});
 
-		const eagerNode = (backend?: IChainBackend): void => {
+		const eagerNode = (backend?: IChainBackend, eager = true): void => {
 			node.destroy();
 			storage = new SqliteStorage(dbPath);
 			storage.open();
-			node = new LightningNode(makeConfig(true));
+			node = new LightningNode(makeConfig(eager));
 			if (backend) {
 				(node as unknown as { _chainBackend: IChainBackend })._chainBackend =
 					backend;
@@ -1567,6 +1845,46 @@ describe('Gossip intake queue (LightningNode)', () => {
 			node.handleNewBlock(1011);
 			await settleFundingChecks();
 			expect(channel.fundingVerified).to.equal(true);
+		});
+
+		it('lazy intake queues a lookup per new channel, and the lookups are paced (issue #1024)', async () => {
+			pacing.GOSSIP_FUNDING_CHECK_INTERVAL_MS = 300;
+			const first = buildAnnouncement(940, REGTEST_CHAIN_HASH);
+			const second = buildAnnouncement(941, REGTEST_CHAIN_HASH);
+			const backend = fundingBackend([
+				{ ann: first, txid: 'a1'.repeat(32) },
+				{ ann: second, txid: 'a2'.repeat(32) }
+			]);
+			const answer = backend.listUnspent!;
+			const lookups: number[] = [];
+			backend.listUnspent = (scriptHash: string): Promise<TUnspent> => {
+				lookups.push(Date.now());
+				return answer(scriptHash);
+			};
+			eagerNode(backend, false);
+			feedChannel(first);
+			feedChannel(second);
+			await node.flushGossip();
+			for (let i = 0; i < 100 && lookups.length < 1; i++) {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			}
+			// The first lookup runs at once; the second waits out the gap.
+			for (let i = 0; i < 50; i++) {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			}
+			expect(lookups).to.have.length(1);
+			const internals = node as unknown as { gossipFundingChecking: boolean };
+			const deadline = Date.now() + 5_000;
+			while (internals.gossipFundingChecking && Date.now() < deadline) {
+				await new Promise<void>((resolve) => setTimeout(resolve, 20));
+			}
+			expect(lookups).to.have.length(2);
+			expect(lookups[1] - lookups[0]).to.be.at.least(250);
+			for (const ann of [first, second]) {
+				expect(
+					graphOf(node).getChannel(ann.msg.shortChannelId)!.fundingVerified
+				).to.equal(true);
+			}
 		});
 	});
 });

@@ -98,6 +98,7 @@ import { MissionControl } from '../gossip/mission-control';
 import {
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
+	IGraphChannel,
 	INodeAnnouncementMessage,
 	INodeAddress,
 	IRoute,
@@ -694,6 +695,15 @@ const ZERO_CONF_TRUSTED_PEERS_KEY = 'zero_conf_trusted_peers';
  * `<channelIdHex>:<htlcId>`. Rewritten whole on every change.
  */
 const OWED_PART_FAILURES_KEY = 'owed_part_failures';
+/**
+ * Metadata key set once the stored gossip rows have been cleared of the
+ * zero-signature forgeries older lazy intake saved (issue #1024, see
+ * NetworkGraph.dropLegacyUnsignedUpdates). Absent until the first boot of a
+ * version that verifies every update at intake; '1' from then on, after
+ * which a signatureless update row can only be RGS data and is kept.
+ */
+const GOSSIP_LEGACY_UNSIGNED_UPDATES_DROPPED_KEY =
+	'gossip_legacy_unsigned_updates_dropped';
 /** Default wait for an LSP's answer to a registration request. */
 const ASYNC_GRANT_REQUEST_TIMEOUT_MS = 30_000;
 /** Grants kept per LSP (newest first); older ones are dropped. */
@@ -1088,6 +1098,17 @@ export class LightningNode extends EventEmitter {
 	 */
 	private gossipFundingQueue: Set<string> = new Set();
 	private gossipFundingChecking = false;
+	/**
+	 * Least gap between two funding lookups, each a listunspent plus at most
+	 * one merkle proof. Since issue #1024 lazy intake verifies every new SCID,
+	 * so a first sync without RGS queues a lookup per channel. Unpaced, the
+	 * one-at-a-time loop runs at the server's round trip, which holds an
+	 * ElectrumX session (cost about 1 per listunspent, decaying about 1 per
+	 * second) in the server's throttle for the whole backlog, slowing the
+	 * node's own chain requests on that session. One lookup a second stays
+	 * close to that decay. Proofs persist, so each channel pays once.
+	 */
+	private static readonly GOSSIP_FUNDING_CHECK_INTERVAL_MS = 1_000;
 	/** Our own node_announcement (cached so we can re-broadcast it for propagation). */
 	private _ownNodeAnnouncement?: Buffer;
 	/** Our own channel_announcement + channel_update per channel, cached for re-broadcast. */
@@ -3432,7 +3453,9 @@ export class LightningNode extends EventEmitter {
 		// it surfaces as a node that takes minutes to start rather than as a
 		// node that stalls.
 		const staleRowDeletes: Array<() => void> = [];
-		for (const channel of this.storage.loadAllGossipChannels()) {
+		const gossipRows = this.storage.loadAllGossipChannels();
+		this.dropLegacyUnsignedGossipUpdates(gossipRows);
+		for (const channel of gossipRows) {
 			const ts1 =
 				channel.update1 &&
 				!gossipTimestampTooFarFuture(channel.update1.timestamp)
@@ -4361,6 +4384,40 @@ export class LightningNode extends EventEmitter {
 				timestamp: Date.now()
 			} as ILightningError);
 		}
+	}
+
+	/**
+	 * Clear stored gossip rows of the zero-signature update forgeries older
+	 * lazy intake saved (issue #1024), once per database. The repaired rows
+	 * are written back and the marker is stored in the same transaction, so
+	 * an interrupted pass runs again on the next boot. After it, restore
+	 * keeps a signatureless update flagged false, which only RGS still
+	 * writes, instead of dropping RGS policy on every restart. Rows are
+	 * repaired in memory either way, so a failed write only delays the
+	 * persisted repair.
+	 */
+	private dropLegacyUnsignedGossipUpdates(rows: IGraphChannel[]): void {
+		const storage = this.storage;
+		if (
+			!storage ||
+			storage.loadMetadata(GOSSIP_LEGACY_UNSIGNED_UPDATES_DROPPED_KEY) !== null
+		) {
+			return;
+		}
+		const repaired: IGraphChannel[] = [];
+		for (const row of rows) {
+			if (NetworkGraph.dropLegacyUnsignedUpdates(row)) repaired.push(row);
+		}
+		this.safeStorage(
+			() =>
+				withStorageTransaction(storage, () => {
+					for (const row of repaired) {
+						storage.saveGossipChannel(row.shortChannelId.toString('hex'), row);
+					}
+					storage.saveMetadata(GOSSIP_LEGACY_UNSIGNED_UPDATES_DROPPED_KEY, '1');
+				}),
+			'dropLegacyUnsignedGossipUpdates'
+		);
 	}
 
 	// ─────────────── Setup ───────────────
@@ -15567,12 +15624,13 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Check queued channels' funding outputs on chain, one at a time (issue
-	 * #1105). A signature only proves keys the announcement carries, so this
-	 * is what separates a real channel, kept at the graph ceiling from then
-	 * on, from a fabricated or closed one, which is dropped. Without an answer
-	 * the pass stops until the next block, and the channel goes to the back
-	 * of the queue so one failing lookup cannot hold up the rest.
+	 * Check queued channels' funding outputs on chain, one at a time and
+	 * paced (issue #1105). A signature only proves keys the announcement
+	 * carries, so this is what separates a real channel, kept at the graph
+	 * ceiling from then on, from a fabricated or closed one, which is
+	 * dropped. Without an answer the pass stops until the next block, and the
+	 * channel goes to the back of the queue so one failing lookup cannot hold
+	 * up the rest.
 	 */
 	private checkGossipFunding(): void {
 		if (this.gossipFundingChecking || this.gossipFundingQueue.size === 0) {
@@ -15589,7 +15647,19 @@ export class LightningNode extends EventEmitter {
 	}
 
 	private async runGossipFundingChecks(): Promise<void> {
+		let looked = false;
 		while (!this._destroyed) {
+			// Paced, see GOSSIP_FUNDING_CHECK_INTERVAL_MS. The queue head is
+			// read after the wait, since the graph may have moved meanwhile.
+			const intervalMs = LightningNode.GOSSIP_FUNDING_CHECK_INTERVAL_MS;
+			if (looked && intervalMs > 0) {
+				await new Promise<void>((resolve) => {
+					const timer = setTimeout(resolve, intervalMs);
+					timer.unref?.();
+				});
+				if (this._destroyed) return;
+			}
+			looked = false;
 			const backend = this._chainBackend;
 			const next = this.gossipFundingQueue.values().next();
 			if (!backend || next.done) return;
@@ -15609,6 +15679,7 @@ export class LightningNode extends EventEmitter {
 				channel.announcement,
 				this.currentBlockHeight
 			);
+			looked = true;
 			if (this._destroyed) return;
 			// Evicted, pruned or replaced while the lookup ran. A replacement
 			// queued itself, and that entry is not this lookup's to clear.
@@ -15681,11 +15752,13 @@ export class LightningNode extends EventEmitter {
 		if (!this.graph.wouldAcceptChannelAnnouncement(msg)) {
 			return;
 		}
-		// Lazy mode (default): admit with deferred provenance and skip the
-		// signature work entirely; verification pays for itself only at serve
-		// time, when a gossip query asks for the entry (issue #443).
+		// A new SCID becomes a pathfinding edge between the node ids it names,
+		// so its signatures are checked now in either mode (issue #1024). Lazy
+		// mode (default) defers only the in-place upgrade of a held
+		// signatureless (RGS) entry: that cannot change the endpoints, and its
+		// verification buys nothing but the right to serve (issue #443).
 		let verified: TGossipVerified = 'deferred';
-		if (this.eagerGossipVerify) {
+		if (this.eagerGossipVerify || !this.graph.getChannel(msg.shortChannelId)) {
 			if (!verifyChannelAnnouncement(msg, payload)) {
 				return;
 			}
@@ -15856,19 +15929,15 @@ export class LightningNode extends EventEmitter {
 		if (!this.graph.wouldAcceptChannelUpdate(msg)) {
 			return;
 		}
-		// Updates naming one of OUR channels keep eager verification even in
-		// lazy mode: their graph slots back invoice route hints and must never
-		// sit deferred. Everything else defers to serve time (issue #443).
-		let verified: TGossipVerified = 'deferred';
-		if (this.eagerGossipVerify || this.channelUpdateTargetsOurChannel(msg)) {
-			if (
-				!verifyChannelUpdate(msg, payload, channel.nodeId1, channel.nodeId2)
-			) {
-				return;
-			}
-			// Serve only what re-encodes byte-identically (see handleChannelAnnouncement).
-			verified = encodeChannelUpdateMessage(msg).equals(payload);
+		// Verified in either mode: pathfinding and route hints read every
+		// update in the graph, and a deferred one would let any peer rewrite
+		// (or, with a future timestamp, camp) the policy of any channel
+		// (issue #1024).
+		if (!verifyChannelUpdate(msg, payload, channel.nodeId1, channel.nodeId2)) {
+			return;
 		}
+		// Serve only what re-encodes byte-identically (see handleChannelAnnouncement).
+		const verified = encodeChannelUpdateMessage(msg).equals(payload);
 		if (this.graph.applyChannelUpdate(msg, { verified })) {
 			const ch = this.graph.getChannel(msg.shortChannelId);
 			if (ch)
