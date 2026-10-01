@@ -27,6 +27,19 @@ export const FF_REESTABLISH_TLV_TYPE = 55001n;
 /** Feature bits 560/561, option_ff_receive (section 5). */
 export const FF_RECEIVE_FEATURE_BIT = 560;
 
+/**
+ * Feature bits 562/563, option_ff_concurrent (CONCURRENT-RECEIVE.md section
+ * 1.1): the concurrent receive extension, a proposed experimental
+ * assignment.
+ */
+export const FF_CONCURRENT_FEATURE_BIT = 562;
+
+/**
+ * The one concurrent_version this implementation selects (ff_init and
+ * ff_accept TLV 17, exactly the two bytes `00 01`).
+ */
+export const FF_CONCURRENT_VERSION = 1;
+
 /** section 7.1 `variant`. Only D is implemented here. */
 export enum FforVariant {
 	A = 1,
@@ -120,6 +133,13 @@ export interface IFforEpochParams {
 	 * unlocks every lower slot. Requires uniform amounts.
 	 */
 	hashChain?: boolean;
+	/**
+	 * TLV 17 (CONCURRENT-RECEIVE.md section 1.1): the concurrent_version R
+	 * asked for, exactly as the wire carried it. Absent means no TLV: a
+	 * baseline epoch. A request is not a selection; see
+	 * IFforEpochRecord.concurrentVersion.
+	 */
+	concurrentVersion?: number;
 }
 
 /** One section 7.5.3 book entry. */
@@ -232,6 +252,16 @@ export interface IFforEpochRecord {
 	 * (section 7.5.5). S stops settling; R's remedy is on-chain.
 	 */
 	activationMismatch: boolean;
+	/**
+	 * Both: the profile this epoch selected (CONCURRENT-RECEIVE.md section
+	 * 1.1). Absent or 0 is the baseline epoch of the base spec; 1 is
+	 * concurrent receive version 1. S sets it as it answers ff_accept with
+	 * the echo; R sets it only on the exact signed echo. It never changes
+	 * afterwards and is never inferred from the features a later connection
+	 * advertises: it is persisted with the transcript and checked against the
+	 * stored ff_init and ff_accept bytes on load.
+	 */
+	concurrentVersion?: 0 | 1;
 }
 
 /**
@@ -253,6 +283,12 @@ export interface IFforSettlePolicy {
 	/** Refuse fee terms below these floors (section 7.6, fee_S). */
 	minFeeBaseMsat?: number;
 	minFeeProportionalMillionths?: number;
+	/**
+	 * Answer an ff_init that asks for the concurrent profile (TLV 17,
+	 * CONCURRENT-RECEIVE.md section 1.1). Absent or false refuses it with
+	 * reason 2; baseline requests are not affected either way.
+	 */
+	allowConcurrent?: boolean;
 }
 
 /** What the channel needs from its host to run an epoch. */
@@ -269,6 +305,13 @@ export interface IFforChannelContext {
 	 * onion is not verified and failures carry an unencryptable reason.
 	 */
 	nodePrivateKey: Buffer | null;
+	/**
+	 * Whether both sides advertised option_ff_receive and
+	 * option_ff_concurrent in the current init exchange
+	 * (CONCURRENT-RECEIVE.md section 1.1). Absent reads as false: a peer
+	 * whose init is unknown has negotiated nothing.
+	 */
+	concurrentNegotiated?: boolean;
 }
 
 /** Wire-level ff_init (section 7.1). */
@@ -297,6 +340,8 @@ export interface IFforAcceptMessage {
 	voucherAmountsMsat: bigint[];
 	/** TLV 11. */
 	initHash: Buffer;
+	/** TLV 17: the echo of ff_init's concurrent_version, absent in baseline. */
+	concurrentVersion?: number;
 	signature: Buffer;
 }
 

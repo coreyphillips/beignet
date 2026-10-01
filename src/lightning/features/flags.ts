@@ -106,7 +106,17 @@ export enum Feature {
 	 * FFOR: Fast-Forward Offline Receive (specs/ffor-offline-receive.md
 	 * section 5), bits 560/561, provisional in the experimental range.
 	 */
-	OPTION_FF_RECEIVE = 560
+	OPTION_FF_RECEIVE = 560,
+	/**
+	 * FFOR concurrent receive, version 1 (specs/CONCURRENT-RECEIVE.md section
+	 * 1.1), bits 562/563, a proposed experimental assignment. Requires
+	 * option_ff_receive. Advertised only when a node opts in (fforConcurrent)
+	 * and deliberately absent from implementedFeatures() until the whole
+	 * version is implemented: the spec forbids advertising before that, and a
+	 * peer that REQUIRES the bit must keep being disconnected by a node that
+	 * has not opted in.
+	 */
+	OPTION_FF_CONCURRENT = 562
 }
 
 /**
