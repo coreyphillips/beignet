@@ -1878,11 +1878,24 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
 		await settle();
 
+		// The owed row's first write fails; the next block must write it.
+		const saveMetadata = storage1.saveMetadata.bind(storage1);
+		let busy = true;
+		storage1.saveMetadata = (key: string, value: string): void => {
+			if (key === 'owed_part_failures' && busy) {
+				busy = false;
+				throw new Error('SQLITE_BUSY');
+			}
+			saveMetadata(key, value);
+		};
 		payPart(carol, 40_000n, 120_000n);
 		await settle();
 		const carolPayment = carol.getPayment(invoice.paymentHash)!;
 		expect(carolPayment.status).to.equal(PaymentStatus.FAILED);
 		expect(carolPayment.failureCode).to.equal(FINAL_INCORRECT_HTLC_AMOUNT);
+		expect(busy, 'the first owed-row write was refused').to.equal(false);
+		expect(storage1.loadMetadata('owed_part_failures')).to.equal(null);
+		bob.handleNewBlock(1000);
 		bob.destroy();
 
 		const aliceKey = `${aliceChannelId.toString('hex')}:0`;

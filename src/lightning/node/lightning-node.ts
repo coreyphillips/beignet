@@ -1357,6 +1357,8 @@ export class LightningNode extends EventEmitter {
 		string,
 		{ inChannelIdHex: string; fail: () => boolean; failureCode?: number }
 	>();
+	/** The last `owed_part_failures` write failed; every block retries it. */
+	private owedPartFailuresUnsaved = false;
 	private graphPruneTimer: ReturnType<typeof setInterval> | null = null;
 	private _chainBackend: import('../chain/chain-watcher').IChainBackend | null =
 		null;
@@ -22134,7 +22136,7 @@ export class LightningNode extends EventEmitter {
 				rows.push({ key, failureCode: owed.failureCode });
 			}
 		}
-		this.safeStorage(
+		this.owedPartFailuresUnsaved = !this.safeStorage(
 			() =>
 				this.storage!.saveMetadata(
 					OWED_PART_FAILURES_KEY,
@@ -22857,7 +22859,9 @@ export class LightningNode extends EventEmitter {
 				retiredPersisted ||= owed.failureCode !== undefined;
 			}
 		}
-		if (retiredPersisted) this.persistOwedPartFailures();
+		if (retiredPersisted || this.owedPartFailuresUnsaved) {
+			this.persistOwedPartFailures();
+		}
 	}
 
 	/**
