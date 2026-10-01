@@ -953,6 +953,185 @@ describe('Guardian core: SYNC_EPOCH', () => {
 	});
 });
 
+describe('Guardian core: one key granted over two heads (issue #1268)', () => {
+	let dir: string;
+	before(() => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-guardian-split-'));
+	});
+	after(() => {
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	interface ISplitFixture {
+		a: ReferenceGuardian;
+		b: ReferenceGuardian;
+		c: ReferenceGuardian;
+		file: string;
+		chain: IGuardianRecord[];
+		certA: IGuardianTakeoverCertificate;
+		certB: IGuardianTakeoverCertificate;
+		alarms: IGuardianAlarm[];
+	}
+
+	/**
+	 * A grants epoch 2 to WRITER_2 over sequence 1, B over sequence 2, and
+	 * C is still under epoch 1 at sequence 3.
+	 */
+	function splitFixture(name: string): ISplitFixture {
+		const file = path.join(dir, `${name}.sqlite`);
+		const alarms: IGuardianAlarm[] = [];
+		const a = makeGuardian(0, file);
+		const b = makeGuardian(1);
+		const c = makeGuardian(2, ':memory:', (alarm) => alarms.push(alarm));
+		const registration = buildRegistration();
+		for (const g of [a, b, c]) g.register(registration);
+		const chain = buildChain(registration.initialState, 3);
+		for (const g of [a, b, c]) g.putState({ record: chain[0] });
+		const certA = a.acquireEpoch(buildAcquire(headOf(a), WRITER_2))
+			.certificate as IGuardianTakeoverCertificate;
+		for (const g of [b, c]) g.putState({ record: chain[1] });
+		const certB = b.acquireEpoch(buildAcquire(headOf(b), WRITER_2))
+			.certificate as IGuardianTakeoverCertificate;
+		expect(c.putState({ record: chain[2] }).status).to.equal(GuardianStatus.OK);
+		return { a, b, c, file, chain, certA, certB, alarms };
+	}
+
+	function resign(
+		cert: IGuardianTakeoverCertificate,
+		index: number,
+		supersededState = cert.supersededState
+	): IGuardianTakeoverCertificate {
+		return {
+			...cert,
+			guardianId: GUARDIAN_IDS[index],
+			supersededState,
+			signature: signTranscript(
+				takeoverTranscriptHash(
+					SET_ID,
+					GUARDIAN_IDS[index],
+					supersededState,
+					cert.newEpoch,
+					cert.newWriterPublicKey,
+					cert.issuedAt
+				),
+				GUARDIAN_SECRETS[index]
+			)
+		};
+	}
+
+	function closeAll(fixture: ISplitFixture): void {
+		fixture.a.close();
+		fixture.b.close();
+		fixture.c.close();
+	}
+
+	it('SYNC_EPOCH certifies the highest head and archives the tail above it', () => {
+		const fixture = splitFixture('sync-epoch');
+		const { b, c, chain, certA, certB } = fixture;
+		const response = c.syncEpoch({ certificates: [certA, certB] });
+		expect(response.status).to.equal(GuardianStatus.OK);
+		const ownCert = expectValidCertificate(response.certificate, 2);
+		expect(
+			statesEqual(ownCert.supersededState, certB.supersededState)
+		).to.equal(true);
+		expectValidReceipt(response.receipt, 2, headOf(b));
+		const orphans = c.listOrphanedRecords(ROOT.recoveryId);
+		expect(orphans.length).to.equal(1);
+		expect(orphans[0].frameHash.equals(chain[2].frameHash)).to.equal(true);
+		closeAll(fixture);
+	});
+
+	it('SYNC_EPOCH refuses a quorum at a lower head, and a lower head off its log', () => {
+		const fixture = splitFixture('sync-epoch-refusals');
+		const { c, certA, certB, alarms } = fixture;
+		// C's own grant over sequence 1 beside A's would certify sequence 1,
+		// and B's alone sequence 2: two final heads for one epoch.
+		expect(
+			c.syncEpoch({ certificates: [certA, resign(certA, 2), certB] }).status
+		).to.equal(GuardianStatus.ERR_CERT_MISMATCH);
+
+		const elsewhere = resign(certA, 0, {
+			...certA.supersededState,
+			logHead: {
+				...certA.supersededState.logHead,
+				frameHash: sha('a-record-c-never-held')
+			}
+		});
+		expect(c.syncEpoch({ certificates: [elsewhere, certB] }).status).to.equal(
+			GuardianStatus.ERR_CONFLICT
+		);
+		expect(
+			alarms.some((alarm) => alarm.status === GuardianStatus.ERR_CONFLICT)
+		).to.equal(true);
+		expect(headOf(c).lease.epoch).to.equal(1n);
+		closeAll(fixture);
+	});
+
+	it('SYNC_RECORD under the bundle brings the lower grant up to the certified head', () => {
+		const fixture = splitFixture('sync-record');
+		const { a, b, chain, certA, certB } = fixture;
+		const bundle = [certA, certB];
+		expect(a.syncRecord({ record: chain[1] }).status).to.equal(
+			GuardianStatus.ERR_EPOCH_SUPERSEDED
+		);
+		expect(
+			a.syncRecord({ record: chain[1], certificates: [certA] }).status
+		).to.equal(GuardianStatus.ERR_INSUFFICIENT_CERTS);
+
+		const taken = a.syncRecord({ record: chain[1], certificates: bundle });
+		expect(taken.status).to.equal(GuardianStatus.OK);
+		expectValidReceipt(taken.receipt, 0, headOf(b));
+		// A keeps serving its grant over sequence 1, so a quorum at that head
+		// stays visible beside the higher one.
+		const certs =
+			a.getHead({
+				protocolVersion: 1,
+				guardianSetId: SET_ID,
+				recoveryId: ROOT.recoveryId
+			}).certificates ?? [];
+		const kept = expectValidCertificate(
+			certs.find((cert) => cert.newEpoch === 2n),
+			0
+		);
+		expect(statesEqual(kept.supersededState, certA.supersededState)).to.equal(
+			true
+		);
+
+		// Nothing above the certified head, and the grant answers over its
+		// own head only.
+		expect(
+			a.syncRecord({ record: chain[2], certificates: bundle }).status
+		).to.equal(GuardianStatus.ERR_EPOCH_SUPERSEDED);
+		expect(
+			a.acquireEpoch(buildAcquire(certA.supersededState, WRITER_2)).status
+		).to.equal(GuardianStatus.OK_DUPLICATE);
+
+		// The extended grant is history the open-time walk verifies, and the
+		// new writer continues from it.
+		a.close();
+		const reopened = makeGuardian(0, fixture.file);
+		const head = reopened.getHead({
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			recoveryId: ROOT.recoveryId
+		});
+		expect(head.possiblyStale).to.equal(false);
+		expect(statesEqual(head.state as GuardianState, headOf(b))).to.equal(true);
+		const next = buildRecord({
+			epoch: 2n,
+			sequence: 3n,
+			previousHash: chain[1].frameHash,
+			writerSecret: WRITER_2.secret
+		});
+		expect(reopened.putState({ record: next }).status).to.equal(
+			GuardianStatus.OK
+		);
+		reopened.close();
+		fixture.b.close();
+		fixture.c.close();
+	});
+});
+
 describe('Guardian core: durability and reopen', () => {
 	let dir: string;
 	before(() => {

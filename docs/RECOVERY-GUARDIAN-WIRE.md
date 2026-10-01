@@ -660,6 +660,38 @@ HISTORY (a record from an epoch below its current lease) cannot be
 patched in place: that is the uncertain-store case, repaired by the
 rollback-and-replay procedure in 5.10.
 
+A guardian whose lease was granted over a LOWER head of the superseded
+epoch than a quorum certified (spec 5.7 step 6) is behind on that epoch,
+not missing history, and appends the rest of it on the quorum's word. The
+request then carries `certificates`, a bundle for the takeover that
+granted the guardian's lease, validated exactly as SYNC_EPOCH steps 1 to 6
+(a bundle that fails refuses the request with that step's code). The
+record is accepted when:
+
+```text
+the bundle's newEpoch and newWriterPublicKey are the local lease
+the guardian's own certificate for that lease fixes a head of the
+  bundle's superseded lease, and nothing was written under the lease
+  since (the log head is that head, or a superseded-epoch record an
+  earlier extension took)
+record.epoch == the superseded lease epoch, and its writer signature
+  verifies under the superseded lease's key
+record.sequence <= the bundle's certified head, and the record extends
+  the log as in 5.2
+a bundle head at the record's sequence is this record, and one below
+  it lies on the local log                     else ERR_CONFLICT
+```
+
+Anything else from below the lease stays `ERR_EPOCH_SUPERSEDED`, so a
+record above the certified head, which never reached a quorum, is never
+taken. The guardian's own TAKEOVER certificate keeps the head it was
+granted over. Rewriting it would hide a quorum of signers at that lower
+head, which a later restore must still see as a conflict (spec 5.7 step
+6). The open-time walk (5.10) accepts a takeover certificate below the
+replayed head when that head is a record of the superseded lease and the
+certificate's head lies on the log. The final state a quorum certified
+never moves; this guardian's log moves up to it.
+
 ### 5.7 SYNC_EPOCH
 
 Request: a set of TAKEOVER certificates for one takeover. Exact
@@ -667,8 +699,9 @@ validation algorithm, in order, with the code each failure returns:
 
 ```text
 1  every certificate carries identical protocol_version,
-   guardian_set_id, recovery_id, superseded STATE, newEpoch and
-   newWriterPublicKey                          else ERR_CERT_MISMATCH
+   guardian_set_id, recovery_id, superseded LEASE and ORIGIN, newEpoch
+   and newWriterPublicKey; superseded LOGHEADs may differ, but two at
+   one sequence are identical                  else ERR_CERT_MISMATCH
 2  guardian_set_id is served by this guardian  else ERR_UNKNOWN_SET
 3  every guardianId is a MEMBER of the set committed by
    guardian_set_id, all distinct               else ERR_CERT_MISMATCH
@@ -676,6 +709,8 @@ validation algorithm, in order, with the code each failure returns:
    guardianId                                  else ERR_BAD_SIGNATURE
 5  distinct valid signers >= required (2 in crash-v1)
                                                else ERR_INSUFFICIENT_CERTS
+   the `required`-th lowest LOGHEAD is the highest one (no quorum of
+   the signers fixes a lower head)             else ERR_CERT_MISMATCH
 6  newEpoch == certified STATE.lease.epoch + 1 else ERR_CERT_MISMATCH
 7  local lease.epoch <= certified STATE.lease.epoch
    (a guardian already at or beyond newEpoch rejects the stale bundle)
@@ -686,7 +721,15 @@ validation algorithm, in order, with the code each failure returns:
    SYNC_RECORD                                 else ERR_HEAD_UNKNOWN
    a local record AT the certified sequence with a DIFFERENT hash is
    outside the crash-fault model               ERR_CONFLICT
+   every lower LOGHEAD the bundle names lies on the local log
+                                               else ERR_CONFLICT
 ```
+
+The certified STATE is the superseded state at the highest LOGHEAD the
+bundle names. The signers name one head unless a resumed acquisition moved
+its guard to a newer head of the same lease and an old-writer append split
+the round (spec 5.7 step 6). Each signer is fenced at its own head, so no
+record above the highest reached a quorum.
 
 On success the guardian adopts lease = (newEpoch, newWriterPublicKey),
 fixes the superseded epoch's final state at the certified STATE, discards
@@ -1124,7 +1167,11 @@ message AcquireEpochResponse {
   repeated TakeoverCertificate certificates = 6;
 }
 
-message SyncRecordRequest  { Record record = 1; }
+message SyncRecordRequest {
+  Record                       record       = 1;
+  // optional (5.6); field 2 is PutStateRequest's retain_floor, never sent
+  repeated TakeoverCertificate certificates = 3;
+}
 message SyncRecordResponse {
   uint32        status  = 1;
   string        detail  = 2;
@@ -1231,7 +1278,9 @@ record ciphertext           <= 16 MiB hard protocol cap; guardians MAY
                                the journal's byte cadence)
 GET_STATE max_records       <= 256 per request
 request body                ciphertext cap plus 4 KiB envelope
-certificates per SYNC_EPOCH <= total guardians in the set
+certificates per SYNC_EPOCH <= total guardians in the set; the same
+                               bound applies to a SYNC_RECORD bundle (5.6)
+                               and keeps it inside the envelope
 ```
 
 ## 9. Authentication, replay, and anti-DoS

@@ -635,15 +635,24 @@ Head reconciliation and stale-guardian repair (revision 3). "Reconcile the highe
    takeover certificates for one epoch: outside the crash-fault model
    (a Byzantine writer or guardian). Halt the restore, surface both
    artifacts to the operator, take no channel action. Certificates
-   granting one epoch to ONE writer key over two heads of the same
-   superseded lease do not conflict: a resumed acquisition keeps its
-   epoch and key and moves its guard to the adopted head once too few
-   guardians can still grant the old one. A guardian grants an epoch
-   once, so only one of those heads can gather a quorum; two that do
-   are a conflict.
+   granting one epoch to ONE writer key over different heads of the
+   same superseded lease do not conflict: a resumed acquisition keeps
+   its epoch and key and moves its guard to the adopted head once too
+   few guardians can still grant the old one. A quorum of such
+   certificates certifies the HIGHEST head they name. Each signer is
+   fenced at its own head, so no record above the highest reached a
+   quorum. This is how a takeover completes when an old-writer append
+   lands inside the retargeted round and splits it, leaving no head
+   that a quorum can still grant (issue #1268). The guardians that
+   did not grant it are repaired onto that head: SYNC_EPOCH takes the
+   bundle as it is, and a guardian granted over a lower head takes the
+   records up to it through SYNC_RECORD (wire 5.6, 5.7). A quorum of
+   signers at a LOWER head than another signer granted over would fix
+   a second final head for the epoch, and that is a conflict. So is a
+   lower head that does not lie on the chain the highest one ends.
 ```
 
-Rotation comes before all of this (wire 5.9, 5.11; issue #714). The set the restore device reads may have retired the namespace in favour of another, and the retirement is accepted by as few as one member, so step 1 also checks every answer for a root-signed rotation that verifies and, finding one, ends the restore with a `rotated` outcome carrying the incoming set before any head is adopted or any repair or takeover is sent; an `ERR_SET_RETIRED` answer to the takeover re-reads the heads and verifies the rotation before any certificate quorum is counted. The device then restores from the incoming set.
+Rotation comes before all of this (wire 5.9, 5.11; issue #714). The set the restore device reads may have retired the namespace in favour of another, and the retirement is accepted by as few as one member, so step 1 also checks every answer for a root-signed rotation that verifies and, finding one, ends the restore with a `rotated` outcome carrying the incoming set before any head is adopted or any repair or takeover is sent; an `ERR_SET_RETIRED` answer to the takeover re-reads the heads and verifies the rotation before any certificate quorum is counted. A takeover completed from a split grant sends no takeover request, so it re-reads the heads for a rotation before it counts. The device then restores from the incoming set.
 
 Worked example, the divergent-head case from the revision 3 design review. Guardians G1, G2, G3, quorum 2-of-3. Frame N was committed with receipts from G1 and G2; G3 was offline at N-1. The device dies; at restore time G1 is unreachable. The restore device reads G2 (head N) and G3 (head N-1): read set of 2 is met, N is adopted (highest valid head), N is replayed to G3 with SYNC_RECORD, and ACQUIRE_EPOCH(expectedState = N) then succeeds on both G2 and G3. Without SYNC_RECORD the CAS could never assemble a quorum: G3 would reject expectedState N, and G2 would reject expectedState N-1 as a rollback. Durability 2-of-3 therefore does not mean "the exact two guardians that acked the last frame must both be reachable"; it means any `required`-sized read set plus repair.
 

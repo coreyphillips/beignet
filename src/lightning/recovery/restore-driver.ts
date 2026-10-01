@@ -46,10 +46,13 @@
  * generation is live.
  */
 
+import { createHash } from 'crypto';
 import { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
 import { withStorageTransaction } from '../storage/transaction';
 import {
 	GuardianState,
+	genesisLogHead,
+	isGenesisLogHead,
 	parseStateBytes,
 	stateBytes,
 	statesEqual,
@@ -283,6 +286,15 @@ interface IPendingAttempt {
 	writer: { secret: Buffer; publicKey: Buffer };
 }
 
+interface IAcquired {
+	lease: IWriterLeaseKeys;
+	certifiedState: GuardianState;
+	certificates: IGuardianTakeoverCertificate[];
+	repaired: number;
+	/** A guardian whose log ends at the certified head. */
+	source: IHeadReading;
+}
+
 /**
  * An acquisition already sent to at least one guardian, persisted BEFORE
  * the request goes out.
@@ -318,8 +330,27 @@ function certificatesAgree(
 	const right = b.supersededState;
 	return (
 		statesEqual(left, right) ||
-		(left.logHead.sequence !== right.logHead.sequence &&
-			statesEqual({ ...left, logHead: right.logHead }, right))
+		(left.logHead.sequence !== right.logHead.sequence && sameLease(left, right))
+	);
+}
+
+/** Two states of one lease and origin, whatever their log heads. */
+function sameLease(a: GuardianState, b: GuardianState): boolean {
+	return statesEqual({ ...a, logHead: b.logHead }, b);
+}
+
+/**
+ * The superseded state a bundle certifies: the highest head its signers
+ * granted over. Each signer is fenced at its own head, so no record above
+ * the highest reached a quorum.
+ */
+function certifiedBy(bundle: IGuardianTakeoverCertificate[]): GuardianState {
+	return bundle.reduce(
+		(best, cert) =>
+			cert.supersededState.logHead.sequence > best.logHead.sequence
+				? cert.supersededState
+				: best,
+		bundle[0].supersededState
 	);
 }
 
@@ -622,7 +653,10 @@ export class RestoreDriver {
 	 * that disagree about one epoch, are outside the crash-fault model. Halt
 	 * and surface them; take no channel action.
 	 */
-	private assertNoConflict(readings: IHeadReading[]): void {
+	private assertNoConflict(
+		readings: IHeadReading[],
+		stale: IHeadReading[]
+	): void {
 		// Records are compared by their OWN position (recordEpoch, sequence),
 		// not by the guardian's current lease, which legitimately differs from
 		// the record epoch after a takeover.
@@ -651,8 +685,11 @@ export class RestoreDriver {
 				`conflicting takeover certificates for epoch ${epoch}; ` +
 					'outside the crash-fault model, halting the restore'
 			);
+		// A possibly-stale head proves no recency, but the certificates it
+		// carries are signed, and a grant it hides can be half of a quorum.
+		const evidence = [...readings, ...stale];
 		const byEpoch = new Map<string, IGuardianTakeoverCertificate[]>();
-		for (const reading of readings) {
+		for (const reading of evidence) {
 			for (const cert of reading.certificates) {
 				const key = cert.newEpoch.toString();
 				const seen = byEpoch.get(key) ?? [];
@@ -664,22 +701,28 @@ export class RestoreDriver {
 				byEpoch.set(key, [...seen, cert]);
 			}
 		}
-		// One key may hold certificates over several heads, but a guardian
-		// grants an epoch once, so only one of those heads can gather a quorum.
-		const quorumEpochs = new Set<string>();
-		for (const bundle of this.certificateBundles(readings)) {
+		// One key may hold certificates over several heads, and a quorum of
+		// them certifies the highest. A quorum at a lower head would fix a
+		// different final head: two quorums for one epoch.
+		for (const bundle of this.certificateBundles(evidence)) {
 			if (bundle.length < this.config.required) continue;
-			const key = bundle[0].newEpoch.toString();
-			if (quorumEpochs.has(key)) throw conflict(bundle[0].newEpoch);
-			quorumEpochs.add(key);
+			const sequences = bundle
+				.map((cert) => cert.supersededState.logHead.sequence)
+				.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+			if (
+				sequences[this.config.required - 1] !== sequences[sequences.length - 1]
+			) {
+				throw conflict(bundle[0].newEpoch);
+			}
 		}
 	}
 
 	/**
 	 * Every certificate any guardian returned, grouped by the takeover it
 	 * describes and deduplicated by signer. A bundle is only a bundle when
-	 * `required` DISTINCT guardians certified the same takeover, and no
-	 * single reading is guaranteed to carry the whole thing.
+	 * `required` DISTINCT guardians granted the same epoch to the same key
+	 * over heads of the same lease, and no single reading is guaranteed to
+	 * carry the whole thing.
 	 */
 	private certificateBundles(
 		readings: IHeadReading[]
@@ -687,10 +730,11 @@ export class RestoreDriver {
 		const groups = new Map<string, Map<string, IGuardianTakeoverCertificate>>();
 		for (const reading of readings) {
 			for (const cert of reading.certificates) {
+				const lease = { ...cert.supersededState, logHead: genesisLogHead() };
 				const key = [
 					cert.newEpoch.toString(),
 					cert.newWriterPublicKey.toString('hex'),
-					stateBytes(cert.supersededState).toString('hex')
+					stateBytes(lease).toString('hex')
 				].join('|');
 				const bySigner = groups.get(key) ?? new Map();
 				bySigner.set(cert.guardianId.toString('hex'), cert);
@@ -779,7 +823,14 @@ export class RestoreDriver {
 					target.state.logHead.sequence
 				);
 				for (const record of missing) {
-					const response = await reading.client.syncRecord(record);
+					// A guardian granted over a lower head of the epoch this
+					// record belongs to takes it on the quorum's word.
+					const response = await reading.client.syncRecord(
+						record,
+						record.epoch < reading.state.lease.epoch
+							? forEpoch(record.epoch + 1n)
+							: undefined
+					);
 					if (
 						response.status !== GuardianStatus.OK &&
 						response.status !== GuardianStatus.OK_DUPLICATE
@@ -975,6 +1026,63 @@ export class RestoreDriver {
 	}
 
 	/**
+	 * A quorum already granted the attempt's epoch and key, but over
+	 * different heads of the lease it supersedes: an old-writer append
+	 * landed between a retargeted round's grants (issue #1268). No single
+	 * guard can gather a quorum any more, and none has to, because the
+	 * takeover is complete at the highest head. The other members are
+	 * brought onto it: one still under the old lease through SYNC_EPOCH,
+	 * one granted over a lower head by relaying the records up to it.
+	 */
+	private async finishSplitGrant(
+		attempt: IPendingAttempt,
+		pool: IHeadReading[],
+		stale: IHeadReading[]
+	): Promise<IAcquired | null> {
+		const bundle = this.certificateBundles(pool).find(
+			(certs) =>
+				certs.length >= this.config.required &&
+				certs[0].newEpoch === attempt.newEpoch &&
+				certs[0].newWriterPublicKey.equals(attempt.writer.publicKey) &&
+				sameLease(certs[0].supersededState, attempt.expectedState)
+		);
+		if (!bundle) return null;
+		const certified = certifiedBy(bundle);
+		// One head for the whole quorum is an ordinary grant: the round
+		// collects it from the guardians' idempotent replies.
+		if (bundle.every((cert) => statesEqual(cert.supersededState, certified))) {
+			return null;
+		}
+		const source = pool.find((reading) =>
+			this.grantedOver(reading.state, attempt, certified)
+		);
+		if (!source) return null;
+		const repaired = await this.repairLaggards(pool, stale, source);
+		// No ACQUIRE goes out on this path, so no ERR_SET_RETIRED answer can
+		// reveal a retirement that landed after the heads were read.
+		const rotation = await this.refetchRotation();
+		if (rotation) throw this.rotated(rotation);
+		this.emit(
+			'epoch:acquired',
+			`epoch ${attempt.newEpoch} acquired with ${bundle.length} certificates ` +
+				`granted over different heads, certifying sequence ${certified.logHead.sequence}`
+		);
+		return {
+			lease: {
+				epoch: attempt.newEpoch,
+				writerSecret: attempt.writer.secret,
+				writerPublicKey: attempt.writer.publicKey,
+				guardianCertificates: bundle,
+				confirmedAt: this.clock()
+			},
+			certifiedState: certified,
+			certificates: bundle,
+			repaired,
+			source
+		};
+	}
+
+	/**
 	 * Steps 4 and 5: the CAS takeover. An attempt is PERSISTED before it is
 	 * sent and RETRIED IDENTICALLY, because once a guardian accepts an
 	 * acquisition it is bound to that exact (epoch, writer key) and answers
@@ -986,13 +1094,7 @@ export class RestoreDriver {
 		target: IHeadReading,
 		readings: IHeadReading[],
 		stale: IHeadReading[]
-	): Promise<{
-		lease: IWriterLeaseKeys;
-		certifiedState: GuardianState;
-		certificates: IGuardianTakeoverCertificate[];
-		repaired: number;
-		source: IHeadReading;
-	}> {
+	): Promise<IAcquired> {
 		let expected = target;
 		let pool = readings;
 		let stalePool = stale;
@@ -1008,6 +1110,10 @@ export class RestoreDriver {
 		}
 
 		for (let attempt = 1; attempt <= this.maxCasAttempts; attempt++) {
+			const split = pending
+				? await this.finishSplitGrant(pending, pool, stalePool)
+				: null;
+			if (split) return { ...split, repaired: repaired + split.repaired };
 			// A guardian that may hold the pending attempt can grant nothing
 			// else, so this round completes it over its own guard or not at
 			// all. Repairing laggards toward a newer head would carry them past
@@ -1102,7 +1208,7 @@ export class RestoreDriver {
 				`attempt ${attempt} collected ${certificates.length} of ${this.config.required} certificates`
 			);
 			const refreshed = await this.readHeads();
-			this.assertNoConflict(refreshed.readings);
+			this.assertNoConflict(refreshed.readings, refreshed.stale);
 			pool = refreshed.readings;
 			stalePool = refreshed.stale;
 			expected = this.selectHead(pool);
@@ -1196,7 +1302,7 @@ export class RestoreDriver {
 			);
 		}
 		const { readings, stale } = await this.readHeads();
-		this.assertNoConflict(readings);
+		this.assertNoConflict(readings, stale);
 		const target = this.selectHead(readings);
 		this.emit(
 			'head:adopted',
@@ -1227,6 +1333,28 @@ export class RestoreDriver {
 					last?.sequence ?? 0n
 				}, not at the certified head ${certified.logHead.sequence}`
 			);
+		}
+		// A split grant certifies its highest head on the word of signers
+		// fenced at lower ones, so those heads must lie on this chain too.
+		for (const cert of acquired.certificates) {
+			const head = cert.supersededState.logHead;
+			if (isGenesisLogHead(head)) continue;
+			const record = records.find((r) => r.sequence === head.sequence);
+			if (
+				!record ||
+				record.epoch !== head.recordEpoch ||
+				!record.frameHash.equals(head.frameHash) ||
+				!createHash('sha256')
+					.update(record.ciphertext)
+					.digest()
+					.equals(head.ciphertextHash)
+			) {
+				throw new RestoreRefusedError(
+					'conflict',
+					`a takeover certificate's head at sequence ${head.sequence} is not on the certified chain; ` +
+						'outside the crash-fault model, halting the restore'
+				);
+			}
 		}
 		this.emit(
 			'frames:downloaded',

@@ -557,12 +557,24 @@ export class GuardianClient {
 		);
 	}
 
+	/**
+	 * `certificates` is the quorum that granted the guardian's lease, for a
+	 * record of the epoch that lease superseded (wire 5.6).
+	 */
 	async syncRecord(
-		record: IGuardianRecord
+		record: IGuardianRecord,
+		certificates?: IGuardianTakeoverCertificate[]
 	): Promise<IGuardianSyncRecordResponse> {
 		await this.ensureCompatible();
 		return decodeSyncRecordResponse(
-			await this.exchange('sync_record', encodeSyncRecordRequest({ record }))
+			await this.exchange(
+				'sync_record',
+				encodeSyncRecordRequest(
+					certificates && certificates.length > 0
+						? { record, certificates }
+						: { record }
+				)
+			)
 		);
 	}
 

@@ -264,6 +264,11 @@ export interface IGuardianAcquireEpochResponse {
 
 export interface IGuardianSyncRecordRequest {
 	record: IGuardianRecord;
+	/**
+	 * The quorum that granted this guardian's lease, when the record belongs
+	 * to the epoch that lease superseded (wire 5.6).
+	 */
+	certificates?: IGuardianTakeoverCertificate[];
 }
 
 export interface IGuardianSyncRecordResponse {
@@ -387,6 +392,21 @@ function logHeadsEqual(a: LogHead, b: LogHead): boolean {
 		a.frameHash.equals(b.frameHash) &&
 		a.ciphertextHash.equals(b.ciphertextHash)
 	);
+}
+
+/** Two states of one lease and origin, whatever their log heads. */
+function sameLease(a: GuardianState, b: GuardianState): boolean {
+	return statesEqual({ ...a, logHead: b.logHead }, b);
+}
+
+/** A verified quorum of takeover certificates (wire 5.7 steps 1 to 6). */
+interface ITakeoverBundle {
+	/** The superseded state at the highest head any signer granted over. */
+	certified: GuardianState;
+	/** Every head the signers granted over, the certified one included. */
+	heads: LogHead[];
+	newEpoch: bigint;
+	newWriterPublicKey: Buffer;
 }
 
 /**
@@ -1203,7 +1223,12 @@ export class ReferenceGuardian {
 	 * ever appends at the current state; there is no insert-behind-head.
 	 */
 	syncRecord(request: IGuardianSyncRecordRequest): IGuardianSyncRecordResponse {
-		const result = this.appendRecord(request.record, true);
+		const result = this.appendRecord(
+			request.record,
+			true,
+			undefined,
+			request.certificates
+		);
 		const response: IGuardianSyncRecordResponse = { status: result.status };
 		if (result.detail !== undefined) response.detail = result.detail;
 		if (result.receipt) response.receipt = result.receipt;
@@ -1213,7 +1238,8 @@ export class ReferenceGuardian {
 	private appendRecord(
 		record: IGuardianRecord,
 		isSync: boolean,
-		retainFloor?: IGuardianRetainFloor
+		retainFloor?: IGuardianRetainFloor,
+		certificates?: IGuardianTakeoverCertificate[]
 	): IGuardianPutStateResponse {
 		try {
 			const gate = this.versionAndSetProblem(
@@ -1274,6 +1300,18 @@ export class ReferenceGuardian {
 					!isLen(retainFloor.writerSignature, 64))
 			) {
 				return err(GuardianStatus.ERR_MALFORMED, 'retain floor malformed');
+			}
+			let bundle: ITakeoverBundle | null = null;
+			if (isSync && certificates && certificates.length > 0) {
+				const verified = this.takeoverBundle(certificates);
+				if ('status' in verified) return verified;
+				if (!verified.certified.recoveryId.equals(record.recoveryId)) {
+					return err(
+						GuardianStatus.ERR_CERT_MISMATCH,
+						'certificates belong to a different recovery_id'
+					);
+				}
+				bundle = verified;
 			}
 			const ciphertextHash = sha256(record.ciphertext);
 			const quarantine = this.quarantineGate(record.recoveryId);
@@ -1420,6 +1458,11 @@ export class ReferenceGuardian {
 				}
 
 				if (record.epoch !== state.lease.epoch) {
+					const extended =
+						bundle && record.epoch < state.lease.epoch
+							? this.extendGrant(state, record, ciphertextHash, bundle, charge)
+							: null;
+					if (extended) return extended;
 					return {
 						...err(
 							GuardianStatus.ERR_EPOCH_SUPERSEDED,
@@ -1516,6 +1559,141 @@ export class ReferenceGuardian {
 		} catch (error) {
 			return this.internalError(error);
 		}
+	}
+
+	/**
+	 * SYNC_RECORD with a takeover bundle (wire 5.6). A guardian that granted
+	 * its lease over a lower head of the superseded epoch than the quorum
+	 * certified takes that epoch's records up to the certified head. Its own
+	 * certificate keeps the head it was granted over: rewriting it would hide
+	 * a quorum at that head that a later bundle needs to see as a conflict.
+	 * Null when the bundle does not apply: the record is then fenced like any
+	 * other.
+	 */
+	private extendGrant(
+		state: GuardianState,
+		record: IGuardianRecord,
+		ciphertextHash: Buffer,
+		bundle: ITakeoverBundle,
+		charge: (bytes: number) => void
+	): IGuardianPutStateResponse | null {
+		const recoveryId = record.recoveryId;
+		const certified = bundle.certified;
+		if (
+			bundle.newEpoch !== state.lease.epoch ||
+			!bundle.newWriterPublicKey.equals(state.lease.writerPublicKey) ||
+			record.epoch !== certified.lease.epoch ||
+			record.sequence > certified.logHead.sequence
+		) {
+			return null;
+		}
+		// Nothing may have been written under the lease since the grant: its
+		// head is the one this guardian's certificate fixed, or a record of
+		// the superseded epoch an earlier extension took.
+		const row = this.store.getEpoch(recoveryId, u64be(state.lease.epoch));
+		const granted = row ? tryParseState(row.certSupersededState) : null;
+		if (
+			!row ||
+			!granted ||
+			!row.writerPublicKey.equals(state.lease.writerPublicKey) ||
+			!sameLease(granted, certified) ||
+			(!logHeadsEqual(granted.logHead, state.logHead) &&
+				state.logHead.recordEpoch !== certified.lease.epoch)
+		) {
+			return null;
+		}
+		const transcript = recordTranscriptHash(this.guardianSetId, {
+			recoveryId,
+			epoch: record.epoch,
+			sequence: record.sequence,
+			previousHash: record.previousHash,
+			frameHash: record.frameHash,
+			ciphertextHash
+		});
+		if (
+			!this.safeVerify(
+				transcript,
+				record.writerSignature,
+				certified.lease.writerPublicKey
+			)
+		) {
+			return err(
+				GuardianStatus.ERR_BAD_SIGNATURE,
+				'writer signature over the RECORD transcript failed'
+			);
+		}
+		const genesis = isGenesisLogHead(state.logHead);
+		const expectedSequence = genesis
+			? state.origin.firstSequence
+			: state.logHead.sequence + 1n;
+		const expectedPrevious = genesis
+			? state.origin.previousHash
+			: state.logHead.frameHash;
+		if (record.sequence !== expectedSequence) {
+			return {
+				...err(
+					GuardianStatus.ERR_SEQUENCE_GAP,
+					`expected sequence ${expectedSequence}`
+				),
+				current: state
+			};
+		}
+		if (!record.previousHash.equals(expectedPrevious)) {
+			return {
+				...err(
+					GuardianStatus.ERR_PREV_HASH_MISMATCH,
+					'previousHash does not extend the current head'
+				),
+				current: state
+			};
+		}
+		const head: LogHead = {
+			sequence: record.sequence,
+			frameHash: Buffer.from(record.frameHash),
+			ciphertextHash,
+			recordEpoch: record.epoch
+		};
+		for (const named of bundle.heads) {
+			if (named.sequence > record.sequence) continue;
+			if (named.sequence < record.sequence) {
+				const problem = this.headOffLog(recoveryId, state, named);
+				if (problem) return problem;
+			} else if (!logHeadsEqual(named, head)) {
+				this.alarm(
+					recoveryId,
+					GuardianStatus.ERR_CONFLICT,
+					`certified head conflicts with the relayed record at sequence ${head.sequence}`
+				);
+				return err(
+					GuardianStatus.ERR_CONFLICT,
+					'certified head conflicts with the relayed record'
+				);
+			}
+		}
+
+		this.store.insertRecord({
+			recoveryId: Buffer.from(recoveryId),
+			sequence: u64be(record.sequence),
+			epoch: u64be(record.epoch),
+			previousHash: Buffer.from(record.previousHash),
+			frameHash: Buffer.from(record.frameHash),
+			ciphertextHash,
+			ciphertext: Buffer.from(record.ciphertext),
+			writerSignature: Buffer.from(record.writerSignature)
+		});
+		charge(GUARDIAN_RECORD_OVERHEAD_BYTES + record.ciphertext.length);
+		const newState: GuardianState = { ...state, logHead: head };
+		const receipt = this.signReceipt(newState);
+		this.store.updateNamespaceState(
+			recoveryId,
+			stateBytes(newState),
+			u64be(receipt.issuedAt),
+			receipt.signature
+		);
+		return {
+			status: GuardianStatus.OK,
+			receipt: this.toReceipt(newState, receipt.issuedAt, receipt.signature)
+		};
 	}
 
 	/**
@@ -2325,133 +2503,234 @@ export class ReferenceGuardian {
 
 	// ─────────────── SYNC_EPOCH (wire 5.7) ───────────────
 
-	syncEpoch(request: IGuardianSyncEpochRequest): IGuardianSyncEpochResponse {
-		try {
-			const certs = request.certificates;
-			if (!Array.isArray(certs) || certs.length === 0) {
-				return err(GuardianStatus.ERR_MALFORMED, 'certificate bundle is empty');
+	/**
+	 * Whether a head a takeover certificate names lies on this guardian's
+	 * log, which reaches at least its sequence: null when it does,
+	 * ERR_CONFLICT (alarmed) when its records were freed or another record
+	 * holds its position.
+	 */
+	private headOffLog(
+		recoveryId: Buffer,
+		local: GuardianState,
+		head: LogHead
+	): IErr | null {
+		if (isGenesisLogHead(head) || logHeadsEqual(local.logHead, head)) {
+			return null;
+		}
+		if (head.sequence < this.retainedFrom(recoveryId, local)) {
+			// Only a quorum-held snapshot becomes a floor, and a takeover
+			// cannot certify below a quorum-held record.
+			this.alarm(
+				recoveryId,
+				GuardianStatus.ERR_CONFLICT,
+				`certified head ${head.sequence} lies below the writer's retain floor`
+			);
+			return err(
+				GuardianStatus.ERR_CONFLICT,
+				'certified head lies below the retain floor; its records were freed'
+			);
+		}
+		const stored = this.store.getRecord(recoveryId, u64be(head.sequence));
+		if (!stored) {
+			throw new Error(
+				'stored log is missing the certified sequence inside its own range'
+			);
+		}
+		if (
+			!stored.frameHash.equals(head.frameHash) ||
+			!stored.ciphertextHash.equals(head.ciphertextHash) ||
+			readU64be(stored.epoch) !== head.recordEpoch
+		) {
+			this.alarm(
+				recoveryId,
+				GuardianStatus.ERR_CONFLICT,
+				`certified head conflicts with the stored record at sequence ${head.sequence}`
+			);
+			return err(
+				GuardianStatus.ERR_CONFLICT,
+				'certified head conflicts with a stored record'
+			);
+		}
+		return null;
+	}
+
+	/** Whether a head lies on this guardian's stored log, without alarming. */
+	private headOnLog(recoveryId: Buffer, head: LogHead): boolean {
+		if (isGenesisLogHead(head)) return true;
+		const stored = this.store.getRecord(recoveryId, u64be(head.sequence));
+		return (
+			stored !== null &&
+			recordRowProblem(stored) === null &&
+			stored.frameHash.equals(head.frameHash) &&
+			stored.ciphertextHash.equals(head.ciphertextHash) &&
+			readU64be(stored.epoch) === head.recordEpoch
+		);
+	}
+
+	/**
+	 * SYNC_EPOCH steps 1 to 6 (wire 5.7), shared with the bundle SYNC_RECORD
+	 * may carry (5.6). Signers may have granted one key over different heads
+	 * of the superseded lease, when a resumed acquisition moved its guard.
+	 * Every signer is fenced at its own head, so no record above the highest
+	 * of them reached a quorum, and that head is the one certified.
+	 */
+	private takeoverBundle(
+		certs: IGuardianTakeoverCertificate[]
+	): ITakeoverBundle | IErr {
+		if (!Array.isArray(certs) || certs.length === 0) {
+			return err(GuardianStatus.ERR_MALFORMED, 'certificate bundle is empty');
+		}
+		if (certs.length > CRASH_V1_PROFILE.total) {
+			return err(
+				GuardianStatus.ERR_MALFORMED,
+				'more certificates than guardians in the set'
+			);
+		}
+		for (const cert of certs) {
+			const shape = this.stateShapeProblem(cert.supersededState);
+			if (shape) return err(GuardianStatus.ERR_MALFORMED, shape);
+			if (!isLen(cert.guardianId, 32)) {
+				return err(GuardianStatus.ERR_MALFORMED, 'guardianId must be 32 bytes');
 			}
-			if (certs.length > CRASH_V1_PROFILE.total) {
+			if (!isLen(cert.newWriterPublicKey, 32)) {
 				return err(
 					GuardianStatus.ERR_MALFORMED,
-					'more certificates than guardians in the set'
+					'new writer public key must be 32 bytes'
 				);
 			}
-			for (const cert of certs) {
-				const shape = this.stateShapeProblem(cert.supersededState);
-				if (shape) return err(GuardianStatus.ERR_MALFORMED, shape);
-				if (!isLen(cert.guardianId, 32)) {
-					return err(
-						GuardianStatus.ERR_MALFORMED,
-						'guardianId must be 32 bytes'
-					);
-				}
-				if (!isLen(cert.newWriterPublicKey, 32)) {
-					return err(
-						GuardianStatus.ERR_MALFORMED,
-						'new writer public key must be 32 bytes'
-					);
-				}
-				if (!isLen(cert.signature, 64)) {
-					return err(
-						GuardianStatus.ERR_MALFORMED,
-						'signature must be 64 bytes'
-					);
-				}
-				if (!validU64(cert.newEpoch) || cert.newEpoch === 0n) {
-					return err(
-						GuardianStatus.ERR_MALFORMED,
-						'newEpoch must be a nonzero u64'
-					);
-				}
-				if (!validU64(cert.issuedAt)) {
-					return err(GuardianStatus.ERR_MALFORMED, 'issuedAt must be a u64');
-				}
+			if (!isLen(cert.signature, 64)) {
+				return err(GuardianStatus.ERR_MALFORMED, 'signature must be 64 bytes');
 			}
-			const reference = certs[0];
-			const referenceSuperseded = stateBytes(reference.supersededState);
+			if (!validU64(cert.newEpoch) || cert.newEpoch === 0n) {
+				return err(
+					GuardianStatus.ERR_MALFORMED,
+					'newEpoch must be a nonzero u64'
+				);
+			}
+			if (!validU64(cert.issuedAt)) {
+				return err(GuardianStatus.ERR_MALFORMED, 'issuedAt must be a u64');
+			}
+		}
+		const reference = certs[0];
 
-			// Step 1: identical protocol_version, guardian_set_id, recovery_id,
-			// superseded STATE, newEpoch and newWriterPublicKey everywhere.
-			for (const cert of certs) {
-				if (
-					cert.protocolVersion !== reference.protocolVersion ||
-					!cert.guardianSetId.equals(reference.guardianSetId) ||
-					!stateBytes(cert.supersededState).equals(referenceSuperseded) ||
-					cert.newEpoch !== reference.newEpoch ||
-					!cert.newWriterPublicKey.equals(reference.newWriterPublicKey)
-				) {
-					return err(
-						GuardianStatus.ERR_CERT_MISMATCH,
-						'certificates disagree about the takeover'
-					);
-				}
-			}
-			if (reference.protocolVersion !== GUARDIAN_PROTOCOL_VERSION) {
-				return err(
-					GuardianStatus.ERR_UNSUPPORTED_VERSION,
-					`protocol_version ${reference.protocolVersion} outside supported range 1..1`
-				);
-			}
-			// Step 2: the set is served here.
-			if (!reference.guardianSetId.equals(this.guardianSetId)) {
-				return err(
-					GuardianStatus.ERR_UNKNOWN_SET,
-					'guardian_set_id is not served by this guardian'
-				);
-			}
-			// Step 3: every signer is a distinct member of the committed set.
-			for (const cert of certs) {
-				if (!this.members.some((m) => m.equals(cert.guardianId))) {
-					return err(
-						GuardianStatus.ERR_CERT_MISMATCH,
-						'certificate signer is not a member of the guardian set'
-					);
-				}
-			}
-			for (let i = 0; i < certs.length; i++) {
-				for (let j = i + 1; j < certs.length; j++) {
-					if (certs[i].guardianId.equals(certs[j].guardianId)) {
-						return err(
-							GuardianStatus.ERR_CERT_MISMATCH,
-							'duplicate certificate signer'
-						);
-					}
-				}
-			}
-			// Step 4: every signature verifies over the TAKEOVER transcript.
-			for (const cert of certs) {
-				const transcript = takeoverTranscriptHash(
-					this.guardianSetId,
-					cert.guardianId,
-					cert.supersededState,
-					cert.newEpoch,
-					cert.newWriterPublicKey,
-					cert.issuedAt
-				);
-				if (!this.safeVerify(transcript, cert.signature, cert.guardianId)) {
-					return err(
-						GuardianStatus.ERR_BAD_SIGNATURE,
-						'certificate signature failed'
-					);
-				}
-			}
-			// Step 5: threshold.
-			if (certs.length < this.required) {
-				return err(
-					GuardianStatus.ERR_INSUFFICIENT_CERTS,
-					`takeover requires ${this.required} distinct certificates`
-				);
-			}
-			// Step 6: epoch continuity inside the bundle.
-			if (reference.newEpoch !== reference.supersededState.lease.epoch + 1n) {
+		// Step 1: identical protocol_version, guardian_set_id, recovery_id,
+		// superseded lease and origin, newEpoch and newWriterPublicKey
+		// everywhere. The superseded log heads may differ.
+		for (const cert of certs) {
+			if (
+				cert.protocolVersion !== reference.protocolVersion ||
+				!cert.guardianSetId.equals(reference.guardianSetId) ||
+				!sameLease(cert.supersededState, reference.supersededState) ||
+				cert.newEpoch !== reference.newEpoch ||
+				!cert.newWriterPublicKey.equals(reference.newWriterPublicKey)
+			) {
 				return err(
 					GuardianStatus.ERR_CERT_MISMATCH,
-					'newEpoch must equal the certified lease epoch + 1'
+					'certificates disagree about the takeover'
 				);
 			}
+		}
+		const heads = certs
+			.map((cert) => cert.supersededState.logHead)
+			.sort((a, b) =>
+				a.sequence < b.sequence ? -1 : a.sequence > b.sequence ? 1 : 0
+			);
+		for (let i = 1; i < heads.length; i++) {
+			if (
+				heads[i].sequence === heads[i - 1].sequence &&
+				!logHeadsEqual(heads[i], heads[i - 1])
+			) {
+				return err(
+					GuardianStatus.ERR_CERT_MISMATCH,
+					'certificates name two different records at one sequence'
+				);
+			}
+		}
+		if (reference.protocolVersion !== GUARDIAN_PROTOCOL_VERSION) {
+			return err(
+				GuardianStatus.ERR_UNSUPPORTED_VERSION,
+				`protocol_version ${reference.protocolVersion} outside supported range 1..1`
+			);
+		}
+		// Step 2: the set is served here.
+		if (!reference.guardianSetId.equals(this.guardianSetId)) {
+			return err(
+				GuardianStatus.ERR_UNKNOWN_SET,
+				'guardian_set_id is not served by this guardian'
+			);
+		}
+		// Step 3: every signer is a distinct member of the committed set.
+		for (const cert of certs) {
+			if (!this.members.some((m) => m.equals(cert.guardianId))) {
+				return err(
+					GuardianStatus.ERR_CERT_MISMATCH,
+					'certificate signer is not a member of the guardian set'
+				);
+			}
+		}
+		for (let i = 0; i < certs.length; i++) {
+			for (let j = i + 1; j < certs.length; j++) {
+				if (certs[i].guardianId.equals(certs[j].guardianId)) {
+					return err(
+						GuardianStatus.ERR_CERT_MISMATCH,
+						'duplicate certificate signer'
+					);
+				}
+			}
+		}
+		// Step 4: every signature verifies over the TAKEOVER transcript.
+		for (const cert of certs) {
+			const transcript = takeoverTranscriptHash(
+				this.guardianSetId,
+				cert.guardianId,
+				cert.supersededState,
+				cert.newEpoch,
+				cert.newWriterPublicKey,
+				cert.issuedAt
+			);
+			if (!this.safeVerify(transcript, cert.signature, cert.guardianId)) {
+				return err(
+					GuardianStatus.ERR_BAD_SIGNATURE,
+					'certificate signature failed'
+				);
+			}
+		}
+		// Step 5: threshold. A quorum of signers at a head below the highest
+		// would certify a lower final head than the bundle as a whole: two
+		// quorums for one epoch, which is a conflict, not a takeover.
+		if (certs.length < this.required) {
+			return err(
+				GuardianStatus.ERR_INSUFFICIENT_CERTS,
+				`takeover requires ${this.required} distinct certificates`
+			);
+		}
+		const highest = heads[heads.length - 1];
+		if (heads[this.required - 1].sequence !== highest.sequence) {
+			return err(
+				GuardianStatus.ERR_CERT_MISMATCH,
+				'a quorum of the certificates fixes a lower head than another signer granted over'
+			);
+		}
+		// Step 6: epoch continuity inside the bundle.
+		if (reference.newEpoch !== reference.supersededState.lease.epoch + 1n) {
+			return err(
+				GuardianStatus.ERR_CERT_MISMATCH,
+				'newEpoch must equal the certified lease epoch + 1'
+			);
+		}
+		return {
+			certified: { ...reference.supersededState, logHead: highest },
+			heads,
+			newEpoch: reference.newEpoch,
+			newWriterPublicKey: reference.newWriterPublicKey
+		};
+	}
 
-			const certified = reference.supersededState;
+	syncEpoch(request: IGuardianSyncEpochRequest): IGuardianSyncEpochResponse {
+		try {
+			const bundle = this.takeoverBundle(request.certificates);
+			if ('status' in bundle) return bundle;
+			const certified = bundle.certified;
 			const recoveryId = certified.recoveryId;
 			const quarantine = this.quarantineGate(recoveryId);
 			if (quarantine) return quarantine;
@@ -2514,57 +2793,18 @@ export class ReferenceGuardian {
 						'certified lease conflicts with the local lease at the same epoch'
 					);
 				}
-				// Step 8: the local log must contain the certified head.
+				// Step 8: the local log must contain the certified head, and
+				// every lower head a signer granted over must lie on it.
 				const head = certified.logHead;
-				if (!logHeadsEqual(local.logHead, head)) {
-					if (local.logHead.sequence < head.sequence) {
-						return err(
-							GuardianStatus.ERR_HEAD_UNKNOWN,
-							'local log is behind the certified head; repair with SYNC_RECORD first'
-						);
-					}
-					if (
-						!isGenesisLogHead(head) &&
-						head.sequence < this.retainedFrom(recoveryId, local)
-					) {
-						// Only a quorum-held snapshot becomes a floor, and a
-						// takeover cannot certify below a quorum-held record.
-						this.alarm(
-							recoveryId,
-							GuardianStatus.ERR_CONFLICT,
-							`certified head ${head.sequence} lies below the writer's retain floor`
-						);
-						return err(
-							GuardianStatus.ERR_CONFLICT,
-							'certified head lies below the retain floor; its records were freed'
-						);
-					}
-					if (!isGenesisLogHead(head)) {
-						const stored = this.store.getRecord(
-							recoveryId,
-							u64be(head.sequence)
-						);
-						if (!stored) {
-							throw new Error(
-								'stored log is missing the certified sequence inside its own range'
-							);
-						}
-						if (
-							!stored.frameHash.equals(head.frameHash) ||
-							!stored.ciphertextHash.equals(head.ciphertextHash) ||
-							readU64be(stored.epoch) !== head.recordEpoch
-						) {
-							this.alarm(
-								recoveryId,
-								GuardianStatus.ERR_CONFLICT,
-								`certified head conflicts with the stored record at sequence ${head.sequence}`
-							);
-							return err(
-								GuardianStatus.ERR_CONFLICT,
-								'certified head conflicts with a stored record'
-							);
-						}
-					}
+				if (local.logHead.sequence < head.sequence) {
+					return err(
+						GuardianStatus.ERR_HEAD_UNKNOWN,
+						'local log is behind the certified head; repair with SYNC_RECORD first'
+					);
+				}
+				for (const named of bundle.heads) {
+					const problem = this.headOffLog(recoveryId, local, named);
+					if (problem) return problem;
 				}
 
 				// Adopt: discard the minority tail above the certified head into
@@ -2578,14 +2818,14 @@ export class ReferenceGuardian {
 				);
 				const ownCert = this.signCertificate(
 					certified,
-					reference.newEpoch,
-					reference.newWriterPublicKey
+					bundle.newEpoch,
+					bundle.newWriterPublicKey
 				);
 				const newState: GuardianState = {
 					recoveryId: Buffer.from(recoveryId),
 					lease: {
-						epoch: reference.newEpoch,
-						writerPublicKey: Buffer.from(reference.newWriterPublicKey)
+						epoch: bundle.newEpoch,
+						writerPublicKey: Buffer.from(bundle.newWriterPublicKey)
 					},
 					origin: local.origin,
 					logHead: head
@@ -2593,8 +2833,8 @@ export class ReferenceGuardian {
 				const receipt = this.signReceipt(newState);
 				this.store.insertEpoch({
 					recoveryId: Buffer.from(recoveryId),
-					epoch: u64be(reference.newEpoch),
-					writerPublicKey: Buffer.from(reference.newWriterPublicKey),
+					epoch: u64be(bundle.newEpoch),
+					writerPublicKey: Buffer.from(bundle.newWriterPublicKey),
 					certSupersededState: stateBytes(certified),
 					certIssuedAt: u64be(ownCert.issuedAt),
 					certSignature: ownCert.signature,
@@ -2615,8 +2855,8 @@ export class ReferenceGuardian {
 						guardianSetId: Buffer.from(this.guardianSetId),
 						guardianId: Buffer.from(this.guardianId),
 						supersededState: certified,
-						newEpoch: reference.newEpoch,
-						newWriterPublicKey: Buffer.from(reference.newWriterPublicKey),
+						newEpoch: bundle.newEpoch,
+						newWriterPublicKey: Buffer.from(bundle.newWriterPublicKey),
 						issuedAt: ownCert.issuedAt,
 						signature: Buffer.from(ownCert.signature)
 					},
@@ -3166,6 +3406,12 @@ export class ReferenceGuardian {
 			) {
 				return fail('takeover epoch row is missing its artifacts');
 			}
+			// A grant extended to a quorum's higher head (wire 5.6) keeps its
+			// certificate below the superseded epoch's records it then took.
+			const extended =
+				superseded.lease.epoch === sim.lease.epoch &&
+				superseded.logHead.sequence < sim.logHead.sequence &&
+				this.headOnLog(recoveryId, superseded.logHead);
 			if (
 				!superseded.recoveryId.equals(recoveryId) ||
 				superseded.origin.firstSequence !== sim.origin.firstSequence ||
@@ -3173,7 +3419,7 @@ export class ReferenceGuardian {
 				rowEpoch !== superseded.lease.epoch + 1n ||
 				(belowFloor
 					? superseded.logHead.sequence > belowFloor.logHead.sequence
-					: !logHeadsEqual(superseded.logHead, sim.logHead) ||
+					: (!logHeadsEqual(superseded.logHead, sim.logHead) && !extended) ||
 					  superseded.lease.epoch < sim.lease.epoch ||
 					  (superseded.lease.epoch === sim.lease.epoch &&
 							!superseded.lease.writerPublicKey.equals(
@@ -3200,7 +3446,7 @@ export class ReferenceGuardian {
 					writerPublicKey: Buffer.from(row.writerPublicKey)
 				},
 				origin: sim.origin,
-				logHead: belowFloor ? superseded.logHead : sim.logHead
+				logHead: superseded.logHead
 			};
 			const receiptState = tryParseState(row.receiptState);
 			if (receiptState === null || !statesEqual(receiptState, post)) {
@@ -3217,7 +3463,7 @@ export class ReferenceGuardian {
 			) {
 				return fail('stored takeover receipt signature failed');
 			}
-			if (!belowFloor) sim = post;
+			if (!belowFloor) sim = { ...post, logHead: sim.logHead };
 			return null;
 		};
 
