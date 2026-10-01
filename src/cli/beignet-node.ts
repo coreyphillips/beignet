@@ -13010,7 +13010,9 @@ export class BeignetNode extends EventEmitter {
 				budgetSatsPerDay,
 				stopRequested: () => {
 					reachedPlans = true;
-					return this._draining;
+					// A shutdown sets destroyed without draining, and reaches the
+					// engine only after any backup in flight has finished.
+					return this._draining || this.destroyed;
 				}
 			});
 			spentSats = spendLimitSats(summary.feeSpentMsat);

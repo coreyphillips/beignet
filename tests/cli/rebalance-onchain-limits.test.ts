@@ -351,6 +351,15 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 		expect(stopRequested?.()).to.equal(true);
 	});
 
+	it('stops an advisor run once a shutdown starts, without a drain (issue #1250)', async () => {
+		const node = rebalancingNode({});
+		await node.executeRebalances(1_000);
+		const stopRequested = node.runOptions?.stopRequested;
+		expect(stopRequested?.()).to.equal(false);
+		node.destroyed = true;
+		expect(stopRequested?.()).to.equal(true);
+	});
+
 	it('keeps the whole day budget charged when a teardown cuts a run short', async () => {
 		const node = rebalancingNode({ daily: 10_000 }, { tornDown: true });
 		await node.executeRebalances(1_500);
