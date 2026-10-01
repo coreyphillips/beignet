@@ -628,6 +628,66 @@ describe('Advisor Execution (M3 phases 1+2)', function () {
 			}
 		});
 
+		it('refuses a fresh rebalance once a shutdown starts, letting the one out settle (issue #1264)', async function () {
+			const setup = setupCircular();
+			const { alice, bob, charlie, abChannelId, caChannelId } = setup;
+			try {
+				// Alice's messages to Bob wait until released, so the first
+				// HTLC is still out when the shutdown starts.
+				let holding = true;
+				const held: Array<[number, Buffer]> = [];
+				let adds = 0;
+				alice.removeAllListeners('message:outbound');
+				alice.on(
+					'message:outbound',
+					(pubkey: string, type: number, payload: Buffer) => {
+						if (pubkey === charlie.getNodeId()) {
+							charlie.handlePeerMessage(alice.getNodeId(), type, payload);
+							return;
+						}
+						if (type === MessageType.UPDATE_ADD_HTLC) adds++;
+						if (holding) held.push([type, payload]);
+						else bob.handlePeerMessage(alice.getNodeId(), type, payload);
+					}
+				);
+				const options = {
+					fromChannelId: abChannelId,
+					toChannelId: caChannelId,
+					amountSats: 100_000n,
+					maxFeeSats: 10n
+				};
+
+				const first = alice.rebalanceChannel(options);
+				expect(adds).to.equal(1);
+				const shutdown = alice.gracefulShutdown(10_000);
+				let error: unknown;
+				try {
+					await alice.rebalanceChannel(options);
+				} catch (err) {
+					error = err;
+				}
+				expect((error as Error | undefined)?.message).to.equal(
+					'Node destroyed'
+				);
+				expect(adds).to.equal(1);
+				expect(
+					alice.listPayments().filter((p) => p.direction === 'OUTGOING')
+				).to.have.length(1);
+
+				holding = false;
+				for (const [type, payload] of held.splice(0)) {
+					bob.handlePeerMessage(alice.getNodeId(), type, payload);
+				}
+				const result = await first;
+				await shutdown;
+
+				expect(result.feeMsat > 0n, 'the first rebalance settled').to.be.true;
+				expect(adds).to.equal(1);
+			} finally {
+				setup.destroy();
+			}
+		});
+
 		it('rejects unusable inputs', async function () {
 			const setup = setupCircular();
 			const { alice, abChannelId, caChannelId } = setup;

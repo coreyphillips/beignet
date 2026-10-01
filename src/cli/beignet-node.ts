@@ -12925,6 +12925,14 @@ export class BeignetNode extends EventEmitter {
 				'maxFeeSats must be a non-negative integer'
 			);
 		this._checkDraining();
+		// A shutdown waits on any backup in flight before the engine learns of
+		// it, so the engine would still send.
+		if (this.destroyed) {
+			throw new BeignetError(
+				BeignetErrorCode.NODE_DESTROYED,
+				'Node is shutting down; no new rebalances accepted'
+			);
+		}
 		// The amount comes back round the loop, so the fee is all a rebalance
 		// spends. The cap is charged before anything is sent, so a crash or a
 		// teardown with the HTLC still out leaves it charged. Once the outcome

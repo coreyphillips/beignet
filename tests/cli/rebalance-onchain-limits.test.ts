@@ -53,6 +53,7 @@ type Fake<T> = Ledger &
 		BeignetNode,
 		| 'rebalanceChannel'
 		| 'executeRebalances'
+		| 'gracefulShutdown'
 		| 'sendOnchain'
 		| 'sendMaxOnchain'
 		| 'spliceOut'
@@ -195,6 +196,39 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 		);
 		expect(err.code).to.equal('SERVICE_DRAINING');
 		expect(node.engineCalls).to.equal(0);
+	});
+
+	it('refuses a rebalance while a shutdown waits on a backup (issue #1264)', async () => {
+		let finishBackup = (): void => undefined;
+		let engineCalls = 0;
+		const node = fakeNode(
+			{ daily: 100_000 },
+			{
+				destroyed: false,
+				_autoApply: { phase: 'idle' },
+				_backupPromise: new Promise<void>((resolve) => {
+					finishBackup = (): void => resolve();
+				}),
+				storage: { close: (): void => undefined },
+				node: {
+					rebalanceChannel: async (): Promise<never> => {
+						engineCalls++;
+						throw new Error('engine reached');
+					},
+					gracefulShutdown: async (): Promise<void> => undefined
+				}
+			}
+		);
+		// Not draining: a programmatic shutdown only sets destroyed.
+		const shutdown = node.gracefulShutdown();
+		const err = await refusal(() =>
+			node.rebalanceChannel(CHANNEL_A, CHANNEL_B, 100_000, 500)
+		);
+		expect(err.code).to.equal('NODE_DESTROYED');
+		expect(engineCalls).to.equal(0);
+		expect(node._dailySpentSats).to.equal(0);
+		finishBackup();
+		await shutdown;
 	});
 
 	it('refuses a rebalance whose fee cap does not fit the day', async () => {
