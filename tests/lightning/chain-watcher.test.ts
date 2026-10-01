@@ -2208,6 +2208,109 @@ describe('Phase 4: Chain Watcher', () => {
 
 			expect(backend.getBroadcastedTxs()).to.have.lengthOf(1);
 		});
+
+		describe('an answer saying the network already has the tx (issue #921)', () => {
+			const settle = (): Promise<void> =>
+				new Promise((resolve) => setTimeout(resolve, 20));
+
+			function captureOutcomes(): {
+				successes: string[];
+				failures: Error[];
+				permanent: Error[];
+			} {
+				const out = {
+					successes: [] as string[],
+					failures: [] as Error[],
+					permanent: [] as Error[]
+				};
+				watcher.on('broadcast:success', (t: string) => out.successes.push(t));
+				watcher.on('broadcast:failure', (e: Error) => out.failures.push(e));
+				watcher.on('broadcast:permanent_failure', (e: Error) =>
+					out.permanent.push(e)
+				);
+				return out;
+			}
+
+			function closeLikeTx(): bitcoin.Transaction {
+				const tx = new bitcoin.Transaction();
+				tx.addInput(crypto.randomBytes(32), 0);
+				tx.addOutput(Buffer.from('0014' + 'ab'.repeat(20), 'hex'), 50_000);
+				return tx;
+			}
+
+			it('is a success on the first send, not a queued retry', async () => {
+				// Core 28+ says this only while an output of the txid is unspent:
+				// the close or sweep is mined. Queued, every retry hears the same
+				// answer until the watcher reports a permanent failure.
+				const sent: string[] = [];
+				backend.broadcastTransaction = async (hex: string): Promise<string> => {
+					sent.push(hex);
+					throw new Error(
+						'Failed to broadcast transaction: Transaction outputs already in utxo set'
+					);
+				};
+				const outcomes = captureOutcomes();
+				const tx = closeLikeTx();
+
+				channelManager.emit('broadcast:tx', tx.toBuffer());
+				await settle();
+				expect(outcomes.successes).to.deep.equal([tx.getId()]);
+				expect(outcomes.failures).to.have.lengthOf(0);
+
+				for (let height = 100; height <= 112; height++) {
+					backend.simulateNewBlock(height);
+					await settle();
+				}
+				expect(sent, 'nothing was queued for a retry').to.have.lengthOf(1);
+				expect(outcomes.permanent).to.have.lengthOf(0);
+			});
+
+			it('takes a queued retry out of the queue as a success', async () => {
+				const sent: string[] = [];
+				let answer = 'connection refused';
+				backend.broadcastTransaction = async (hex: string): Promise<string> => {
+					sent.push(hex);
+					throw new Error(answer);
+				};
+				const outcomes = captureOutcomes();
+				const tx = closeLikeTx();
+
+				channelManager.emit('broadcast:tx', tx.toBuffer());
+				await settle();
+				expect(outcomes.failures).to.have.lengthOf(1);
+				expect(outcomes.successes).to.have.lengthOf(0);
+
+				// Mined meanwhile: the first retry hears so and stops there.
+				answer = 'Transaction already in block chain';
+				backend.simulateNewBlock(100);
+				await settle();
+				expect(outcomes.successes).to.deep.equal([tx.getId()]);
+
+				for (let height = 101; height <= 113; height++) {
+					backend.simulateNewBlock(height);
+					await settle();
+				}
+				expect(sent).to.have.lengthOf(2);
+				expect(outcomes.permanent).to.have.lengthOf(0);
+			});
+
+			it('still retries a conflicting-input refusal', async () => {
+				const sent: string[] = [];
+				backend.broadcastTransaction = async (hex: string): Promise<string> => {
+					sent.push(hex);
+					throw new Error('Input already spent by conflicting transaction');
+				};
+				const outcomes = captureOutcomes();
+
+				channelManager.emit('broadcast:tx', closeLikeTx().toBuffer());
+				await settle();
+				backend.simulateNewBlock(100);
+				await settle();
+				expect(outcomes.successes).to.have.lengthOf(0);
+				expect(outcomes.failures).to.have.lengthOf(1);
+				expect(sent, 'retried on the next block').to.have.lengthOf(2);
+			});
+		});
 	});
 
 	describe('ChannelManager event wiring', () => {
