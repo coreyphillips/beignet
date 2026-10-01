@@ -267,12 +267,19 @@ export class WalletFundingProvider implements IFundingProvider {
 			// A freeze queued ahead of ours in the wallet lands between any read
 			// taken from here and our own write, so only the wallet can say
 			// whether this call added the entry. An entry that was already there
-			// leaves ownership as it stood. So does a refusal of a coin frozen
-			// before the call, since the read below can catch an unfreeze queued
-			// behind ours whose storage write then rolls it back.
+			// leaves ownership as it stood.
+			//
+			// A refusal settles nothing about the entry on the coin: the read
+			// above and the one below can each catch an unfreeze, queued on
+			// either side of ours, whose storage write then rolls it back. Where
+			// release checks the tag under the wallet's lock, ownership of a
+			// freeze that is really gone lifts nothing, so a refusal leaves it as
+			// it stood. A plain unfreeze would lift whatever froze the coin
+			// since, so there only a coin frozen before the call stays owned.
 			res = await this.wallet.freezeUtxoIfUnfrozen(params);
 			owned = res.isErr()
-				? frozenBefore && this.ownedFreezes.has(key)
+				? this.ownedFreezes.has(key) &&
+				  (frozenBefore || this.wallet.unfreezeUtxoIfTagged !== undefined)
 				: (res as IResultOk<{ created: boolean }>).value.created === true ||
 				  this.ownedFreezes.has(key);
 		} else {
