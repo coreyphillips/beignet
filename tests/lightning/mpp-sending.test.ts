@@ -51,6 +51,11 @@ import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
 import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
 import { IRoutingHintHop } from '../../src/lightning/invoice/types';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
+import {
+	deserializePaymentInfo,
+	serializePaymentInfo
+} from '../../src/lightning/storage/serialization';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 
 // ─────────────── Helpers ───────────────
 
@@ -827,6 +832,144 @@ describe('MPP Sending (Phase 5)', function () {
 			bob.destroy();
 		});
 
+		it('an MPP split of a zero-amount invoice pays and records the caller amount (#1016)', async function () {
+			// A zero-amount invoice takes its amount from the caller. The MPP
+			// fallback used to read the invoice's amount instead, so every part
+			// carried total_msat equal to its own amount (the payee settled one
+			// part as the whole payment) and the payer's record had no amount
+			// and could not be serialized.
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(78),
+				htlcBasepointSecret: htlcSecretFor(78)
+			});
+			alice.on('error', () => {});
+			const bob = new LightningNode({
+				...makeNodeConfig(79),
+				htlcBasepointSecret: htlcSecretFor(79)
+			});
+			bob.on('error', () => {});
+			connectNodes(alice, bob);
+
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+
+			const invoice = bob.createInvoice({ description: 'any amount mpp' });
+			expect(decodeInvoice(invoice.bolt11).amountMsat).to.equal(undefined);
+
+			const payment = alice.sendPayment(
+				invoice.bolt11,
+				undefined,
+				undefined,
+				250_000_000n
+			);
+			await new Promise((r) => setTimeout(r, 50));
+
+			const record = alice.getPayment(payment.paymentHash)!;
+			expect(record.status).to.equal(PaymentStatus.COMPLETED);
+			expect(record.amountMsat).to.equal(250_000_000n);
+			const restored = deserializePaymentInfo(serializePaymentInfo(record));
+			expect(restored.amountMsat).to.equal(250_000_000n);
+
+			const bobPayment = bob.getPayment(payment.paymentHash);
+			expect(bobPayment, 'bob recorded the payment').to.exist;
+			expect(bobPayment!.status).to.equal(PaymentStatus.COMPLETED);
+			expect(
+				bobPayment!.settledHtlcs,
+				'bob settled both parts as one payment'
+			).to.have.length(2);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('the payee records the amount an any-amount invoice settled for (#1093)', async function () {
+			// An any-amount invoice's record starts at 0n and used to stay there
+			// through settlement, whether it settled as one HTLC or an MPP set.
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = new LightningNode({
+				...makeNodeConfig(88),
+				htlcBasepointSecret: htlcSecretFor(88)
+			});
+			alice.on('error', () => {});
+			const bob = new LightningNode({
+				...makeNodeConfig(89),
+				htlcBasepointSecret: htlcSecretFor(89),
+				storage
+			});
+			bob.on('error', () => {});
+			connectNodes(alice, bob);
+
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+
+			const settledEvents = new Map<string, bigint>();
+			bob.on(
+				'invoice:settled',
+				(e: { paymentHash: Buffer; amountMsat: bigint }) => {
+					settledEvents.set(e.paymentHash.toString('hex'), e.amountMsat);
+				}
+			);
+
+			const pay = async (
+				invoiceAmountMsat: bigint | undefined,
+				payAmountMsat: bigint
+			): Promise<Buffer> => {
+				const invoice = bob.createInvoice({
+					description: 'receive amount',
+					amountMsat: invoiceAmountMsat
+				});
+				alice.sendPayment(
+					invoice.bolt11,
+					undefined,
+					undefined,
+					invoiceAmountMsat === undefined ? payAmountMsat : undefined
+				);
+				await new Promise((r) => setTimeout(r, 50));
+				return invoice.paymentHash;
+			};
+
+			const cases: Array<[string, Buffer, bigint, number]> = [
+				// Fits one channel: settles as a single HTLC.
+				['single part', await pay(undefined, 50_000_000n), 50_000_000n, 1],
+				// Fits neither channel alone: settles as a two-part set.
+				['mpp', await pay(undefined, 250_000_000n), 250_000_000n, 2],
+				// A fixed-amount invoice keeps the amount it was issued for.
+				['fixed amount', await pay(40_000_000n, 40_000_000n), 40_000_000n, 1]
+			];
+
+			for (const [label, hash, amountMsat, parts] of cases) {
+				const hex = hash.toString('hex');
+				const record = bob.getPayment(hash)!;
+				expect(record.status, label).to.equal(PaymentStatus.COMPLETED);
+				expect(record.settledHtlcs, label).to.have.length(parts);
+				expect(record.amountMsat, `${label} record`).to.equal(amountMsat);
+				expect(
+					storage.loadPayment(hex)!.amountMsat,
+					`${label} persisted`
+				).to.equal(amountMsat);
+				expect(settledEvents.get(hex), `${label} invoice:settled`).to.equal(
+					amountMsat
+				);
+			}
+
+			alice.destroy();
+			bob.destroy();
+			storage.close();
+		});
+
 		it('a routing hint whose forwarding node is the sender cannot bypass the local capacity bound (#254)', function () {
 			// Unit-level companion to the test above: the synthetic edge for a
 			// hint hop naming the SENDER as forwarder must not exist — the
@@ -1315,6 +1458,120 @@ describe('MPP Sending (Phase 5)', function () {
 			expect(alice.getPayment(payment.paymentHash)!.status).to.equal(
 				PaymentStatus.COMPLETED
 			);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('records sentMsat as the sum of the parts and it survives a serialise round trip (#1008)', async function () {
+			// The daemon's spend ledger charges what left the node, fees
+			// included. An MPP record carries the invoice amount in amountMsat
+			// and its route is the first part only, so the sum of the parts'
+			// first-hop amounts is written to the record with its first
+			// persist, where a restart can still find it.
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(76),
+				htlcBasepointSecret: htlcSecretFor(76)
+			});
+			alice.on('error', () => {});
+			const bob = new LightningNode({
+				...makeNodeConfig(77),
+				htlcBasepointSecret: htlcSecretFor(77)
+			});
+			bob.on('error', () => {});
+			connectNodes(alice, bob);
+
+			const channelA = openReadyChannel(alice, bob, 200_000n);
+			const channelB = openReadyChannel(alice, bob, 500_000n);
+			const scidOf = (channelId: Buffer): Buffer => {
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				const st = (alice as any).channelManager
+					.getChannel(channelId)
+					.getFullState();
+				return (st.shortChannelId ?? st.scidAlias) as Buffer;
+			};
+			const bobPub = Buffer.from(bob.getNodeId(), 'hex');
+
+			const invoice = bob.createInvoice({
+				description: 'sent msat',
+				amountMsat: 100_000_000n
+			});
+			const decoded = decodeInvoice(invoice.bolt11);
+
+			// Each part carries 1 000 msat of fee on top of its 50 000 000.
+			const mkPart = (
+				scid: Buffer,
+				feeMsat: bigint
+			): {
+				hops: Array<{
+					pubkey: Buffer;
+					shortChannelId: Buffer;
+					amountToForwardMsat: bigint;
+					outgoingCltvValue: number;
+					cltvExpiryDelta: number;
+					feeBaseMsat: number;
+					feeProportionalMillionths: number;
+				}>;
+				totalAmountMsat: bigint;
+				totalCltvDelta: number;
+				totalFeeMsat: bigint;
+			} => ({
+				hops: [
+					{
+						pubkey: bobPub,
+						shortChannelId: scid,
+						amountToForwardMsat: 50_000_000n,
+						outgoingCltvValue: 40,
+						cltvExpiryDelta: 40,
+						feeBaseMsat: 0,
+						feeProportionalMillionths: 0
+					}
+				],
+				totalAmountMsat: 50_000_000n + feeMsat,
+				totalCltvDelta: 40,
+				totalFeeMsat: feeMsat
+			});
+			const multiRoute = {
+				parts: [
+					mkPart(scidOf(channelA), 1_000n),
+					mkPart(scidOf(channelB), 2_000n)
+				],
+				totalAmountMsat: 100_003_000n,
+				totalFeeMsat: 3_000n
+			};
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const payment = (alice as any).sendPaymentMpp(
+				invoice.bolt11,
+				{
+					paymentHash: decoded.paymentHash,
+					paymentSecret: decoded.paymentSecret,
+					amountMsat: decoded.amountMsat
+				},
+				multiRoute,
+				40
+			);
+			await new Promise((r) => setTimeout(r, 50));
+
+			const record = alice.getPayment(payment.paymentHash)!;
+			expect(record.amountMsat.toString()).to.equal('100000000');
+			expect(record.sentMsat?.toString()).to.equal('100003000');
+
+			const restored = deserializePaymentInfo(serializePaymentInfo(record));
+			expect(restored.sentMsat?.toString()).to.equal('100003000');
+			expect(restored.amountMsat.toString()).to.equal('100000000');
+			// A record without the field comes back without it, not with an
+			// undefined key.
+			const legacy = deserializePaymentInfo(
+				serializePaymentInfo({ ...record, sentMsat: undefined })
+			);
+			expect('sentMsat' in legacy).to.equal(false);
 
 			alice.destroy();
 			bob.destroy();

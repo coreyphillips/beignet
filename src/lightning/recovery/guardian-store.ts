@@ -85,6 +85,21 @@ export interface IGuardianEpochRow {
 	receiptSignature: Buffer | null;
 }
 
+/**
+ * Where a namespace's stored records begin once the writer's retain floor
+ * freed the ones below (wire 5.2): the state the log stood at just before
+ * the first kept record, this guardian's receipt signature over it, and
+ * the writer's signed floor that allowed it.
+ */
+export interface IGuardianRetainFloorRow {
+	recoveryId: Buffer;
+	state: Buffer;
+	issuedAt: Buffer;
+	signature: Buffer;
+	frameHash: Buffer;
+	writerSignature: Buffer;
+}
+
 export interface IGuardianOrphanRow {
 	recoveryId: Buffer;
 	epoch: Buffer;
@@ -180,8 +195,20 @@ CREATE TABLE IF NOT EXISTS guardian_orphan_records (
 	reason TEXT NOT NULL,
 	PRIMARY KEY (recovery_id, epoch, sequence)
 );
+CREATE TABLE IF NOT EXISTS guardian_retain_floors (
+	recovery_id BLOB PRIMARY KEY,
+	state BLOB NOT NULL,
+	issued_at BLOB NOT NULL,
+	signature BLOB NOT NULL,
+	frame_hash BLOB NOT NULL,
+	writer_signature BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS guardian_usage (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
+	content_bytes INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS guardian_namespace_usage (
+	recovery_id BLOB PRIMARY KEY,
 	content_bytes INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS guardian_epochs (
@@ -271,6 +298,13 @@ export class GuardianStore {
 			.prepare('SELECT * FROM guardian_namespaces ORDER BY recovery_id')
 			.all() as INamespaceDbRow[];
 		return rows.map((row) => this.namespaceFromDb(row));
+	}
+
+	countNamespaces(): number {
+		const row = this.db
+			.prepare('SELECT COUNT(*) AS n FROM guardian_namespaces')
+			.get() as { n: number | bigint };
+		return Number(row.n);
 	}
 
 	insertNamespace(row: IGuardianNamespaceRow): void {
@@ -741,42 +775,155 @@ export class GuardianStore {
 			.run(recoveryId);
 	}
 
+	// ─────────────── retain floors (wire 5.2) ───────────────
+
+	getRetainFloor(recoveryId: Buffer): IGuardianRetainFloorRow | null {
+		const row = this.db
+			.prepare('SELECT * FROM guardian_retain_floors WHERE recovery_id = ?')
+			.get(recoveryId) as
+			| {
+					recovery_id: Buffer;
+					state: Buffer;
+					issued_at: Buffer;
+					signature: Buffer;
+					frame_hash: Buffer;
+					writer_signature: Buffer;
+			  }
+			| undefined;
+		return row
+			? {
+					recoveryId: row.recovery_id,
+					state: row.state,
+					issuedAt: row.issued_at,
+					signature: row.signature,
+					frameHash: row.frame_hash,
+					writerSignature: row.writer_signature
+			  }
+			: null;
+	}
+
+	setRetainFloor(row: IGuardianRetainFloorRow): void {
+		this.db
+			.prepare(
+				`INSERT OR REPLACE INTO guardian_retain_floors (
+					recovery_id, state, issued_at, signature, frame_hash,
+					writer_signature
+				) VALUES (?, ?, ?, ?, ?, ?)`
+			)
+			.run(
+				row.recoveryId,
+				row.state,
+				row.issuedAt,
+				row.signature,
+				row.frameHash,
+				row.writerSignature
+			);
+	}
+
+	deleteRetainFloor(recoveryId: Buffer): void {
+		this.db
+			.prepare('DELETE FROM guardian_retain_floors WHERE recovery_id = ?')
+			.run(recoveryId);
+	}
+
+	/**
+	 * The content bytes of the records below a sequence, orphaned ones
+	 * included (contentBytes' measure).
+	 */
+	recordBytesBelow(recoveryId: Buffer, sequenceExclusive: Buffer): number {
+		let total = 0;
+		for (const [table, columns] of CONTENT_COLUMNS) {
+			if (!FREED_TABLES.includes(table)) continue;
+			const sum = columns.map((c) => `COALESCE(length(${c}), 0)`).join(' + ');
+			const row = this.db
+				.prepare(
+					`SELECT COALESCE(SUM(${sum}), 0) AS bytes FROM ${table}
+					WHERE recovery_id = ? AND sequence < ?`
+				)
+				.get(recoveryId, sequenceExclusive) as { bytes: number | bigint };
+			total += Number(row.bytes);
+		}
+		return total;
+	}
+
+	/**
+	 * Free every record below a sequence, orphaned ones included. Unlike the
+	 * archive moves this keeps nothing: the writer signed that it will never
+	 * ask for them again, and an orphan left behind would still count
+	 * against the quota.
+	 */
+	deleteRecordsBelow(recoveryId: Buffer, sequenceExclusive: Buffer): void {
+		for (const table of FREED_TABLES) {
+			this.db
+				.prepare(`DELETE FROM ${table} WHERE recovery_id = ? AND sequence < ?`)
+				.run(recoveryId, sequenceExclusive);
+		}
+	}
+
 	// ─────────────── storage accounting ───────────────
 
 	/**
-	 * The content counter: the encoded bytes the store holds, kept as a row
-	 * of the store itself so every writer, in this process or another,
-	 * reads and advances the same number under the same BEGIN IMMEDIATE it
-	 * writes under. Re-derived from the rows at every open (resetUsage), so
-	 * it is recoverable and can be audited against contentBytes().
+	 * The content counters: the encoded bytes the store holds, in total or
+	 * under one recovery_id, kept as rows of the store itself so every
+	 * writer, in this process or another, reads and advances the same
+	 * numbers under the same BEGIN IMMEDIATE it writes under. Re-derived
+	 * from the rows at every open (resetUsage), so they are recoverable and
+	 * can be audited against contentBytes().
 	 */
-	usageBytes(): number {
-		const row = this.db
-			.prepare('SELECT content_bytes FROM guardian_usage WHERE id = 1')
-			.get() as { content_bytes: number | bigint } | undefined;
+	usageBytes(recoveryId?: Buffer): number {
+		const row = (
+			recoveryId
+				? this.db
+						.prepare(
+							'SELECT content_bytes FROM guardian_namespace_usage WHERE recovery_id = ?'
+						)
+						.get(recoveryId)
+				: this.db
+						.prepare('SELECT content_bytes FROM guardian_usage WHERE id = 1')
+						.get()
+		) as { content_bytes: number | bigint } | undefined;
 		return row ? Number(row.content_bytes) : 0;
 	}
 
-	resetUsage(bytes: number): void {
+	/** Re-derive every counter from the rows; call inside a write. */
+	resetUsage(): void {
 		this.db
 			.prepare(
 				'INSERT OR REPLACE INTO guardian_usage (id, content_bytes) VALUES (1, ?)'
 			)
-			.run(bytes);
+			.run(this.contentBytes());
+		this.db.prepare('DELETE FROM guardian_namespace_usage').run();
+		const perTable = CONTENT_COLUMNS.map(
+			([table, columns]) =>
+				`SELECT recovery_id, ${rowBytesSql(columns)} AS bytes FROM ${table}`
+		).join(' UNION ALL ');
+		this.db
+			.prepare(
+				`INSERT INTO guardian_namespace_usage (recovery_id, content_bytes)
+				SELECT recovery_id, SUM(bytes) FROM (${perTable}) GROUP BY recovery_id`
+			)
+			.run();
 	}
 
-	/** Advance the counter by what a transaction wrote; call inside it. */
-	chargeUsage(delta: number): void {
+	/** Advance the counters by what a transaction wrote; call inside it. */
+	chargeUsage(recoveryId: Buffer, delta: number): void {
 		this.db
 			.prepare(
 				'UPDATE guardian_usage SET content_bytes = content_bytes + ? WHERE id = 1'
 			)
 			.run(delta);
+		this.db
+			.prepare(
+				`INSERT INTO guardian_namespace_usage (recovery_id, content_bytes)
+				VALUES (?, ?) ON CONFLICT (recovery_id)
+				DO UPDATE SET content_bytes = content_bytes + excluded.content_bytes`
+			)
+			.run(recoveryId, delta);
 	}
 
 	/**
 	 * The encoded bytes the store holds, measured from the rows: every
-	 * column of every row, summed across the four tables, or across one
+	 * column of every row, summed across the content tables, or across one
 	 * namespace's rows. This is what a hosted guardian's byte quota bounds:
 	 * a record costs exactly its columns, so the cost of a write can be
 	 * known before it happens and the counter re-derived after a restart.
@@ -788,7 +935,7 @@ export class GuardianStore {
 		const args = recoveryId ? [recoveryId] : [];
 		let total = 0;
 		for (const [table, columns] of CONTENT_COLUMNS) {
-			const sum = columns.map((c) => `COALESCE(length(${c}), 0)`).join(' + ');
+			const sum = rowBytesSql(columns);
 			const row = this.db
 				.prepare(
 					`SELECT COALESCE(SUM(${sum}), 0) AS bytes FROM ${table}${where}`
@@ -860,5 +1007,23 @@ const CONTENT_COLUMNS: ReadonlyArray<[string, string[]]> = [
 			'receipt_issued_at',
 			'receipt_signature'
 		]
+	],
+	[
+		'guardian_retain_floors',
+		[
+			'recovery_id',
+			'state',
+			'issued_at',
+			'signature',
+			'frame_hash',
+			'writer_signature'
+		]
 	]
 ];
+
+function rowBytesSql(columns: string[]): string {
+	return columns.map((c) => `COALESCE(length(${c}), 0)`).join(' + ');
+}
+
+/** The tables a retain floor frees below (wire 5.2). */
+const FREED_TABLES = ['guardian_records', 'guardian_orphan_records'];

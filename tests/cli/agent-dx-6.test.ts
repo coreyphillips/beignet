@@ -53,7 +53,7 @@ describe('Agent DX 6: CLI-level Production Hardening 11', function () {
 				[LightningErrorCode.NO_ROUTE, 'NO_ROUTE'],
 				[LightningErrorCode.DUPLICATE_PAYMENT, 'DUPLICATE_PAYMENT'],
 				[LightningErrorCode.NO_CHANNEL_TO_HOP, 'PEER_NOT_CONNECTED'],
-				[LightningErrorCode.FEE_EXCEEDS_MAX, 'PAYMENT_FAILED'],
+				[LightningErrorCode.FEE_EXCEEDS_MAX, 'FEE_EXCEEDS_MAX'],
 				[LightningErrorCode.MISSING_AMOUNT, 'INVALID_PARAMS'],
 				[LightningErrorCode.INVALID_INVOICE, 'INVALID_PARAMS'],
 				[LightningErrorCode.INVOICE_EXPIRED, 'INVOICE_EXPIRED']
@@ -63,7 +63,7 @@ describe('Agent DX 6: CLI-level Production Hardening 11', function () {
 				NO_ROUTE: 'NO_ROUTE',
 				DUPLICATE_PAYMENT: 'DUPLICATE_PAYMENT',
 				NO_CHANNEL_TO_HOP: 'PEER_NOT_CONNECTED',
-				FEE_EXCEEDS_MAX: 'PAYMENT_FAILED',
+				FEE_EXCEEDS_MAX: 'FEE_EXCEEDS_MAX',
 				MISSING_AMOUNT: 'INVALID_PARAMS',
 				INVALID_INVOICE: 'INVALID_PARAMS',
 				INVOICE_EXPIRED: 'INVOICE_EXPIRED'

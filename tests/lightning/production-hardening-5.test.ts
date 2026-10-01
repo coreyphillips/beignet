@@ -384,7 +384,7 @@ describe('Production Hardening 5: Phase 1 — HTLC & Channel Validation', functi
 	// ─── Fix 13: CLTV validation on incoming HTLCs ───
 
 	describe('Fix 13: CLTV validation on incoming HTLCs', () => {
-		it('rejects HTLC with already-expired CLTV', () => {
+		it('admits HTLC with already-expired CLTV (failed back once committed)', () => {
 			const { channel, state } = makeNormalChannel(13);
 			channel.setBlockHeight(500);
 
@@ -396,10 +396,45 @@ describe('Production Hardening 5: Phase 1 — HTLC & Channel Validation', functi
 				cltvExpiry: 499, // Already expired
 				onionRoutingPacket: Buffer.alloc(1366)
 			});
-			// Wire-visible: the peer must learn its update was refused, or its
-			// next commitment_signed covers state we do not hold (issue 404).
-			expectWireFailure(actions, state.channelId!, /CLTV already expired/);
-			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+			// Our tip is state the peer cannot see (issue #1009): the add is
+			// admitted, stamped, and failed back by the node with
+			// expiry_too_soon once committed, exactly like the far-future
+			// horizon below. Failing the channel here cost a forwarder its
+			// outgoing channel whenever an upstream relayed a stale expiry.
+			expect(actions).to.have.length(0);
+			expect(state.htlcs.get('received-0')!.expiredOnArrival).to.equal(true);
+			expect(channel.receivedHtlcExpiredOnArrival(0n)).to.equal(true);
+			expect(channel.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('refuses to OFFER an HTLC whose CLTV has already expired (issue #1009)', () => {
+			const { channel } = makeNormalChannel(15);
+			channel.setBlockHeight(500);
+
+			const refused = channel.addHtlc(
+				10_000n,
+				crypto.randomBytes(32),
+				500,
+				Buffer.alloc(1366)
+			);
+			// Local API misuse like the timestamp check: a bare ERROR, never
+			// on the wire, which the node maps to a fail-back of the inbound
+			// leg when the add was a forward.
+			expect(refused).to.have.lengthOf(1);
+			expect(refused[0].type).to.equal(ChannelActionType.ERROR);
+			expect((refused[0] as any).message).to.include('already expired');
+
+			// Control: one block of headroom is offered.
+			const offered = channel.addHtlc(
+				10_000n,
+				crypto.randomBytes(32),
+				501,
+				Buffer.alloc(1366)
+			);
+			expect(
+				offered.some((a) => a.type === ChannelActionType.ERROR),
+				'offered'
+			).to.equal(false);
 		});
 
 		it('admits HTLC with CLTV too far in future (failed back once committed)', () => {

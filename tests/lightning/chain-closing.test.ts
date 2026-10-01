@@ -14,6 +14,7 @@ import { ChannelSigner } from '../../src/lightning/keys/signer';
 import {
 	buildClosingTx,
 	calculateClosingFee,
+	closingTxRelayProfile,
 	IClosingTxParams
 } from '../../src/lightning/chain/closing';
 import {
@@ -225,6 +226,85 @@ describe('Chain Closing & Sweep (Phase 4A)', function () {
 			// Verify the tx can be serialized
 			const serialized = result.tx.toBuffer();
 			expect(serialized.length).to.be.greaterThan(0);
+		});
+
+		describe('trimming at the negotiated dust limit (issue #1030)', function () {
+			const p2trScript = Buffer.concat([
+				Buffer.from([0x51, 0x20]),
+				Buffer.alloc(32, 0xaa)
+			]);
+			const trimmed = (
+				local: { script: Buffer; amount: bigint; dust: bigint },
+				remote: { script: Buffer; amount: bigint; dust: bigint }
+			): bigint[] =>
+				buildClosingTx({
+					fundingTxid,
+					fundingOutputIndex,
+					fundingAmount,
+					localScriptPubkey: local.script,
+					remoteScriptPubkey: remote.script,
+					localAmount: local.amount,
+					remoteAmount: remote.amount,
+					feeAmount: 1_000n,
+					localDustLimit: local.dust,
+					remoteDustLimit: remote.dust
+				}).tx.outs.map((o) => BigInt(o.value));
+
+			it('keeps a 500 sat P2TR output and drops a 300 sat P2WPKH one at dust 354', function () {
+				// The old script table did the opposite (546 for P2TR, 294 for
+				// P2WPKH), so an LND peer's signature failed to verify either way.
+				expect(
+					trimmed(
+						{ script: p2trScript, amount: 500n, dust: 354n },
+						{ script: remoteScript, amount: 300n, dust: 354n }
+					)
+				).to.deep.equal([500n]);
+			});
+
+			it("trims each output at its own owner's dust limit", function () {
+				expect(
+					trimmed(
+						{ script: localScript, amount: 500n, dust: 354n },
+						{ script: remoteScript, amount: 500n, dust: 600n }
+					)
+				).to.deep.equal([500n]);
+			});
+
+			it('still drops an output below its script relay threshold', function () {
+				// A 354 sat dust limit would otherwise keep a P2PKH output that no
+				// default-policy mempool relays.
+				const p2pkh = bitcoin.payments.p2pkh({
+					pubkey: localDestPubkey,
+					network
+				}).output!;
+				expect(
+					trimmed(
+						{ script: p2pkh, amount: 545n, dust: 354n },
+						{ script: remoteScript, amount: 900_000n, dust: 354n }
+					)
+				).to.deep.equal([900_000n]);
+				expect(
+					trimmed(
+						{ script: p2pkh, amount: 546n, dust: 354n },
+						{ script: remoteScript, amount: 900_000n, dust: 354n }
+					)
+				).to.deep.equal([546n, 900_000n]);
+			});
+
+			it('closingTxRelayProfile judges the same outputs the builder keeps', function () {
+				// 1500 sat fee with our 500 sat P2TR output kept; the old table
+				// dropped it and reported 2000 sat paid.
+				const { feePaid } = closingTxRelayProfile({
+					fundingAmount,
+					localScriptPubkey: p2trScript,
+					remoteScriptPubkey: remoteScript,
+					localAmount: 500n,
+					remoteAmount: fundingAmount - 2_000n,
+					localDustLimit: 354n,
+					remoteDustLimit: 354n
+				});
+				expect(feePaid).to.equal(1_500n);
+			});
 		});
 	});
 

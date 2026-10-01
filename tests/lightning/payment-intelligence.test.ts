@@ -423,4 +423,40 @@ describe('Payment Intelligence — estimatePayment()', () => {
 		expect(encoded!.feeSats).to.be.greaterThan(100);
 		node.destroy();
 	});
+
+	it('rounds a part-sat fee up so a cap at the quote admits the route (#998)', () => {
+		const node = createNode(516);
+		// 512 msat base on each forwarding hop: a fee that is not whole sats.
+		const { destPrivkey } = buildChain(node, 3, {
+			feeBaseMsat: 512,
+			feeProportionalMillionths: 0
+		});
+		const invoice = createTestInvoice(destPrivkey, 24_425_000n);
+
+		const estimate = node.estimatePayment(invoice);
+		expect(estimate).to.not.be.null;
+		const feeMsat = estimate!.estimatedFeeMsat;
+		expect(Number(feeMsat % 1000n)).to.not.equal(0);
+		expect(estimate!.estimatedFeeSats).to.equal(
+			Number((feeMsat + 999n) / 1000n)
+		);
+		// The pre-dispatch check refuses when route.totalFeeMsat > maxFeeSats * 1000.
+		expect(BigInt(estimate!.estimatedFeeSats) * 1000n >= feeMsat).to.equal(
+			true
+		);
+
+		const routeFee = node.estimateRouteFee(invoice);
+		expect(routeFee).to.not.be.null;
+		expect(routeFee!.feeMsat).to.equal(feeMsat);
+		expect(routeFee!.feeSats).to.equal(estimate!.estimatedFeeSats);
+
+		const probe = node.probeRoute(
+			getPublicKey(destPrivkey).toString('hex'),
+			24_425
+		);
+		expect(probe.success).to.equal(true);
+		expect(probe.feeMsat).to.equal(feeMsat);
+		expect(probe.feeSats).to.equal(estimate!.estimatedFeeSats);
+		node.destroy();
+	});
 });

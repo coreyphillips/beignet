@@ -12,6 +12,10 @@ import { EventEmitter } from 'events';
 import { SocksClient } from 'socks';
 import { createInitiatorHandshake } from '../transport/noise';
 import { TransportCipher } from '../transport/cipher';
+import {
+	Socks5ProxyScope,
+	selectOutboundProxy
+} from '../transport/peer-manager';
 import { encodeMessage, decodeMessage } from '../message/codec';
 import { ITowerAddress, ITowerTransport } from './types';
 
@@ -19,15 +23,18 @@ const ENCRYPTED_LENGTH_SIZE = 18;
 const MAC_SIZE = 16;
 const MAX_READ_BUFFER = 5 * 1024 * 1024;
 const ACT_TWO_LENGTH = 50;
-const DEFAULT_TOR_PROXY = { host: '127.0.0.1', port: 9050 };
 
 export interface ITowerConnectionOptions {
 	/** Our node identity private key (same key used for peer Noise). */
 	localPrivateKey: Buffer;
 	address: ITowerAddress;
 	connectTimeoutMs?: number;
-	/** SOCKS5 proxy for outbound (e.g. Tor). Auto-used for .onion when unset. */
+	/** SOCKS5 proxy for outbound (e.g. Tor). Auto-used for .onion when unset;
+	 *  never used for a private or loopback tower, which Tor would refuse. */
 	socks5Proxy?: { host: string; port: number };
+	/** Which hosts ride socks5Proxy (default 'all'): 'onion' dials a public
+	 *  clearnet tower directly. Same table as peer dials (selectOutboundProxy). */
+	socks5ProxyScope?: Socks5ProxyScope;
 }
 
 export class TowerConnection extends EventEmitter implements ITowerTransport {
@@ -46,9 +53,14 @@ export class TowerConnection extends EventEmitter implements ITowerTransport {
 		this.localPrivateKey = opts.localPrivateKey;
 		this.address = opts.address;
 		this.connectTimeoutMs = opts.connectTimeoutMs ?? 15000;
-		this.socks5Proxy =
-			opts.socks5Proxy ??
-			(opts.address.host.endsWith('.onion') ? DEFAULT_TOR_PROXY : undefined);
+		// Resolved once per tower with the same table peer dials use, so a LAN
+		// tower is dialed directly even with a proxy set (Tor rejects private
+		// addresses) and a clearnet tower follows the configured scope.
+		this.socks5Proxy = selectOutboundProxy(
+			opts.address.host,
+			opts.socks5Proxy,
+			opts.socks5ProxyScope ?? 'all'
+		);
 	}
 
 	isConnected(): boolean {

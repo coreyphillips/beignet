@@ -217,6 +217,12 @@ export interface IGraphChannel {
 	announcementVerifyDeferred?: boolean;
 	update1VerifyDeferred?: boolean;
 	update2VerifyDeferred?: boolean;
+	// The funding output was found unspent on chain at the SCID's position,
+	// paying the 2-of-2 of the announced bitcoin keys, or the channel is our
+	// own (issue #1105). Signatures only prove keys the announcement itself
+	// carries, so only a channel with this set is kept when the graph is at
+	// its ceiling. Meaningful only while announcementVerified is true.
+	fundingVerified?: boolean;
 }
 
 export interface IGraphNode {

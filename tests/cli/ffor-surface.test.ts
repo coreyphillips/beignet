@@ -27,6 +27,7 @@ import {
 	IFforEpochRecord
 } from '../../src/lightning/ffor/types';
 import { decodeRequestEnvelope } from '../../src/lightning/direct-funding/envelope';
+import { BeignetCustomSubtype } from '../../src/lightning/message/custom';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -822,6 +823,187 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 		}
 	});
 
+	/**
+	 * Put the shared node in one recovery state until the returned function
+	 * runs: superseded at runtime (the barrier's latch), or a startup gate
+	 * that is fenced or still quarantined. Only what the node reads to decide
+	 * is swapped, without the hard freeze, so the daemon stays reachable.
+	 */
+	function withRecoveryState(
+		kind: 'barrier-fenced' | 'fenced' | 'quarantined'
+	): () => void {
+		const inner = daemon.node.getNode() as unknown as {
+			_barrierFenced: boolean;
+			recoveryGate: unknown;
+		};
+		const previous = {
+			fenced: inner._barrierFenced,
+			gate: inner.recoveryGate
+		};
+		if (kind === 'barrier-fenced') {
+			inner._barrierFenced = true;
+		} else {
+			inner.recoveryGate = {
+				getState: (): string => kind,
+				permitsPeerTraffic: (): boolean => false,
+				reportBlocked: (): void => undefined
+			};
+		}
+		return (): void => {
+			inner._barrierFenced = previous.fenced;
+			inner.recoveryGate = previous.gate;
+		};
+	}
+
+	it('all force-close routes demand the acknowledgement on a fenced or quarantined device (issue #1013)', async () => {
+		const inner = daemon.node.getNode();
+		const { ChannelState } = require('../../src/lightning/channel/types');
+		const forceClose = sinon.spy(inner.getChannelManager(), 'forceClose');
+		const recover = sinon.spy(inner, 'rescueFforEpoch');
+		try {
+			for (const kind of ['barrier-fenced', 'fenced', 'quarantined'] as const) {
+				// No hold of its own: the device is the whole reason. Disconnected,
+				// as every channel on a frozen device is, so /ffor/recover reaches
+				// its force close rather than the cooperative path.
+				const fx = installChannel(false);
+				inner.getChannelManager().getChannel(fx.idBuf)!.getFullState().state =
+					ChannelState.AWAITING_REESTABLISH;
+				const restore = withRecoveryState(kind);
+				try {
+					expect(inner.getRecoveryOwnershipHold()).to.equal(
+						kind === 'quarantined' ? 'unconfirmed' : 'superseded'
+					);
+					for (const route of [
+						'/ffor/recover',
+						'/ffor/enforce',
+						'/channel/forceclose'
+					]) {
+						const body = {
+							channelId: fx.channelId,
+							...(route === '/ffor/recover'
+								? { forceCloseIfUnreachable: true }
+								: {})
+						};
+						for (const flag of [undefined, false, 'true', 1]) {
+							forceClose.resetHistory();
+							recover.resetHistory();
+							const res = await request(portOf(daemon), 'POST', route, {
+								...body,
+								...(flag === undefined ? {} : { acceptStaleStateRisk: flag })
+							});
+							const label = `${kind} ${route} ${JSON.stringify(flag)}`;
+							expect(res.status, label).to.equal(400);
+							expect(errorOf(res).code, label).to.equal('INVALID_PARAMS');
+							const message = errorOf(res).message ?? '';
+							expect(message, label).to.match(/acceptStaleStateRisk/);
+							expect(message, label).to.match(
+								kind === 'quarantined'
+									? /has not confirmed with its guardians/
+									: /This device was superseded/
+							);
+							expect(message, label).to.not.match(/Recovery Capsule/);
+							expect(forceClose.called, `${label}: no commitment`).to.equal(
+								false
+							);
+							expect(recover.called, `${label}: no recovery`).to.equal(false);
+						}
+						forceClose.resetHistory();
+						const accepted = await request(portOf(daemon), 'POST', route, {
+							...body,
+							acceptStaleStateRisk: true
+						});
+						// The fixture has no remote commitment signature, as above.
+						expect(accepted.status, `${kind} ${route}`).to.equal(
+							route === '/channel/forceclose' ? 500 : 200
+						);
+						expect(errorOf(accepted).message ?? '').to.not.match(
+							/acceptStaleStateRisk/
+						);
+						expect(
+							forceClose.calledOnce,
+							`${kind} ${route}: acknowledged engine exit`
+						).to.equal(true);
+					}
+				} finally {
+					restore();
+					fx.remove();
+				}
+			}
+		} finally {
+			recover.restore();
+			forceClose.restore();
+		}
+	});
+
+	it('rechecks a fence that latches during witness retrieval before force closing (issue #1013)', async () => {
+		const inner = daemon.node.getNode();
+		const { ChannelState } = require('../../src/lightning/channel/types');
+		for (const flag of [undefined, 'true', true]) {
+			const fx = installChannel(false);
+			inner.getChannelManager().getChannel(fx.idBuf)!.getFullState().state =
+				ChannelState.AWAITING_REESTABLISH;
+			fx.record.witnesses = [
+				{
+					witnessNodeId: fx.record.remoteNodeId,
+					mailboxId: crypto.randomBytes(32),
+					fetchPrivkey: crypto.randomBytes(32),
+					encPrivkey: crypto.randomBytes(32),
+					retentionUntil: 802_000,
+					minReceipts: 1,
+					manifestWire: Buffer.alloc(0),
+					ackedAt: 1
+				}
+			];
+			let release!: () => void;
+			let entered!: () => void;
+			const waiting = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const started = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			const fetch = sinon
+				.stub(inner, 'fetchFforWitnessRecords')
+				.callsFake(async () => {
+					entered();
+					await waiting;
+					return [];
+				});
+			const forceClose = sinon.spy(inner.getChannelManager(), 'forceClose');
+			let restore = (): void => undefined;
+			try {
+				// The daemon's preflight passes: the device is not fenced yet.
+				const pending = request(portOf(daemon), 'POST', '/ffor/recover', {
+					channelId: fx.channelId,
+					forceCloseIfUnreachable: true,
+					...(flag === undefined ? {} : { acceptStaleStateRisk: flag })
+				});
+				await started;
+				restore = withRecoveryState('barrier-fenced');
+				release();
+				const result = await pending;
+				if (flag === true) {
+					expect(result.status).to.equal(200);
+					expect(forceClose.calledOnce).to.equal(true);
+				} else {
+					expect(result.status).to.equal(400);
+					expect(errorOf(result).code).to.equal('INVALID_PARAMS');
+					expect(errorOf(result).message).to.match(
+						/This device was superseded/
+					);
+					expect(errorOf(result).message).to.match(/acceptStaleStateRisk/);
+					expect(forceClose.called).to.equal(false);
+				}
+			} finally {
+				release();
+				restore();
+				fetch.restore();
+				forceClose.restore();
+				fx.remove();
+			}
+		}
+	});
+
 	it('ffor:enforce reports both hold origins independently', async () => {
 		const held = installChannel(true);
 		const reestablish = installChannel('reestablish');
@@ -1053,5 +1235,122 @@ describe('automatic receive falls back to direct funding', function () {
 		expect((config.body.result as { lspPubkey: string }).lspPubkey).to.equal(
 			lsp
 		);
+	});
+});
+
+/**
+ * Issue #920: in bolt11 mode the receive routes ask the settlement peer for
+ * its terms, and a peer that refuses (one that does not run the settle role)
+ * used to reach the wallet as a 500 "Internal server error". The refusal is
+ * the peer's to explain, so it comes back as a 409 in the peer's own words.
+ */
+describe('automatic receive surfaces a settlement peer refusal (issue #920)', function () {
+	this.timeout(30_000);
+	let daemon: IStartedDaemon;
+	let dir: string;
+	let port: number;
+	// bolt11 mode builds no envelope, so the key only has to look like one.
+	const primary = '02' + '5a'.repeat(32);
+	const refusal = 'Your node does not provide offline receiving.';
+	/** Every receive request the stubbed transport carried to the peer. */
+	let asked: Record<string, unknown>[];
+
+	before(async function () {
+		this.timeout(30_000);
+		dir = tmpDir('receive-refusal');
+		daemon = await startDaemon({ ...OFFLINE, dataDir: dir });
+		port = portOf(daemon);
+	});
+
+	// Scoped to each test: the daemon's background loops read the channel list
+	// too, and must not see this made-up channel outside the request under test.
+	beforeEach(() => {
+		asked = [];
+		sinon
+			.stub(daemon.node, 'listPeers')
+			.returns([
+				{ pubkey: primary, host: '10.0.0.9', port: 9735, state: 'ready' }
+			]);
+		// Nothing spendable on our side and room to receive: the shape that puts
+		// the request on the bolt11 route, where the peer is asked for terms.
+		sinon.stub(daemon.node, 'listChannels').returns([
+			{
+				channelId: '6b'.repeat(32),
+				peerPubkey: primary,
+				state: 'NORMAL',
+				htlcUsable: true,
+				localBalanceSats: 0,
+				remoteBalanceSats: 200_000
+			}
+		]);
+		const ln = daemon.node.getNode();
+		sinon
+			.stub(ln, 'sendCustomMessage')
+			.callsFake((to: string, subtype: number, payload: Buffer) => {
+				if (
+					to !== primary ||
+					subtype !== BeignetCustomSubtype.FFOR_RECEIVE_REQUEST
+				)
+					return;
+				const body = JSON.parse(payload.toString('utf8'));
+				asked.push(body);
+				setImmediate(() =>
+					ln.emit('custom-message', {
+						peerPubkey: primary,
+						version: 1,
+						subtype: BeignetCustomSubtype.FFOR_RECEIVE_RESPONSE,
+						payload: Buffer.from(
+							JSON.stringify({ id: body.id, ok: false, error: refusal })
+						)
+					})
+				);
+			});
+	});
+
+	afterEach(() => sinon.restore());
+
+	after(async function () {
+		this.timeout(30_000);
+		await daemon.stop();
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("GET /receive/quote answers 409 with the peer's own message", async () => {
+		const res = await request(
+			port,
+			'GET',
+			`/receive/quote?peer=${primary}&amountSats=20000`
+		);
+		expect(asked.map((b) => b.op)).to.deep.equal(['quote']);
+		expect(res.status).to.equal(409);
+		expect(res.body.error).to.deep.equal({
+			code: 'RECEIVE_UNAVAILABLE',
+			message: refusal
+		});
+	});
+
+	it('POST /receive/invoice answers the same and keeps no request', async () => {
+		const res = await request(port, 'POST', '/receive/invoice', {
+			peer: primary,
+			amountSats: 20_000,
+			requestId: 'daemon-refusal-0001',
+			quote: {
+				peer: primary,
+				amountSats: 20_000,
+				terms: { feeBaseMsat: 0, feePpm: 0 },
+				expiresAt: Date.now() + 60_000
+			}
+		});
+		expect(asked.map((b) => b.op)).to.deep.equal(['quote']);
+		expect(res.status).to.equal(409);
+		expect(res.body.error).to.deep.equal({
+			code: 'RECEIVE_UNAVAILABLE',
+			message: refusal
+		});
+		const status = await request(port, 'GET', '/receive/status');
+		expect(status.body.result).to.deep.include({
+			reservedChannelIds: [],
+			requests: []
+		});
 	});
 });

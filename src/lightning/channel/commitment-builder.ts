@@ -224,7 +224,7 @@ export function funderCommitmentCostSats(
  * used for BOTH the commitment outputs and the num_untrimmed_htlcs fee count so
  * the two never diverge (a divergence builds a commitment the peer rejects).
  */
-function filterUntrimmedHtlcs<
+export function filterUntrimmedHtlcs<
 	T extends { amount: bigint; direction: HtlcDirection }
 >(
 	htlcOutputs: T[],

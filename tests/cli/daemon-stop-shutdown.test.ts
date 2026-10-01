@@ -8,15 +8,53 @@
  */
 
 import { expect } from 'chai';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
 import { AddressInfo } from 'net';
 import { startDaemon, IStartedDaemon } from '../../src/cli/daemon';
+import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
+import {
+	DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+	Network
+} from '../../src/lightning/invoice/types';
+import {
+	PaymentDirection,
+	PaymentStatus
+} from '../../src/lightning/node/types';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+
+/** An invoice from somebody else, for a preimage the test knows. */
+function invoiceFrom(description: string): {
+	bolt11: string;
+	paymentHash: Buffer;
+	preimage: Buffer;
+} {
+	const preimage = crypto.randomBytes(32);
+	const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+	return {
+		bolt11: encodeInvoice({
+			network: Network.REGTEST,
+			amountMsat: 1_000_000n,
+			timestamp: Math.floor(Date.now() / 1000),
+			paymentHash,
+			paymentSecret: crypto.randomBytes(32),
+			description,
+			expiry: 3600,
+			minFinalCltvExpiry: DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+			privateKey: crypto
+				.createHash('sha256')
+				.update(Buffer.from(`payee-${description}`))
+				.digest()
+		}),
+		paymentHash,
+		preimage
+	};
+}
 
 const TOKEN = 'stop-shutdown-token';
 
@@ -177,7 +215,8 @@ describe('Webhooks survive a graceful stop (issue 402)', function () {
 		const firstPort = (first.server.address() as AddressInfo).port;
 		const registered = await request(firstPort, 'POST', '/webhooks/register', {
 			url: 'http://127.0.0.1:9/hook',
-			events: ['*']
+			events: ['*'],
+			allowPrivateNetwork: true
 		});
 		expect(registered.status).to.equal(200);
 		await first.stop();
@@ -191,6 +230,130 @@ describe('Webhooks survive a graceful stop (issue 402)', function () {
 			expect((listed.body.result as Array<{ url: string }>)[0].url).to.equal(
 				'http://127.0.0.1:9/hook'
 			);
+		} finally {
+			await second.stop();
+		}
+	});
+});
+
+describe('A queued payment survives a graceful stop (issue #958)', function () {
+	this.timeout(120_000);
+
+	let tmpDir: string;
+
+	before(function () {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-stop-queue-'));
+	});
+
+	after(function () {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	// The database stays open while the wallet stops, so stop() halts the
+	// queue first: a payment still waiting its turn is not dispatched to the
+	// stopped node and recorded as failed, it stays queued for the next boot.
+	// That boot dispatches it once the node is ready, with no enqueue, and
+	// settles a row left dispatching against the node's record rather than
+	// sending it again (issue #967).
+	it('a payment waiting its turn at stop() is not dispatched, and the next boot dispatches it and settles one left in flight', async () => {
+		type Entry = { id: string; status: string; error?: string };
+		const paid = invoiceFrom('paid before the stop');
+		const first = await bootDaemon(tmpDir);
+		const firstPort = (first.server.address() as AddressInfo).port;
+		const payCalls: string[] = [];
+		const failPays: Array<(e: Error) => void> = [];
+		let stopCalled = false;
+		(
+			first.node as unknown as {
+				payInvoiceSafe: (b: string) => Promise<unknown>;
+			}
+		).payInvoiceSafe = (bolt11: string): Promise<unknown> => {
+			payCalls.push(bolt11);
+			// As the stopped node does: a dispatch after stop() fails at once,
+			// so one the queue should have held back persists 'failed'.
+			if (stopCalled) return Promise.reject(new Error('node destroyed'));
+			return new Promise((_resolve, reject) => failPays.push(reject));
+		};
+		const listQueue = async (port: number): Promise<Entry[]> =>
+			(await request(port, 'GET', '/queue')).body.result as Entry[];
+		let waiting: Entry | undefined;
+		try {
+			while (!waiting && payCalls.length < 10) {
+				const added = await request(firstPort, 'POST', '/queue/add', {
+					bolt11: `lnbcrt_issue958_${payCalls.length}`
+				});
+				expect(added.status).to.equal(200);
+				waiting = (await listQueue(firstPort)).find(
+					(e) => e.status === 'queued'
+				);
+			}
+			expect(waiting).to.not.equal(undefined);
+			const inFlight = payCalls.length;
+
+			// A payment the node completed while its queue row stayed
+			// 'dispatching', as a stop mid-payment leaves it. The engine does
+			// not refuse a hash whose record is COMPLETED, so sending it again
+			// would pay twice.
+			const storage = first.node.getStorage();
+			storage.savePayment(paid.paymentHash.toString('hex'), {
+				paymentHash: paid.paymentHash,
+				preimage: paid.preimage,
+				amountMsat: 1_000_000n,
+				status: PaymentStatus.COMPLETED,
+				direction: PaymentDirection.OUTGOING,
+				createdAt: Date.now() - 1_000,
+				completedAt: Date.now()
+			});
+			storage.savePreimage(paid.paymentHash.toString('hex'), paid.preimage);
+			storage.saveQueueEntry({
+				id: 'q-1-issue967',
+				bolt11: paid.bolt11,
+				priority: 5,
+				status: 'dispatching',
+				createdAt: Date.now() - 1_000
+			});
+
+			stopCalled = true;
+			const stopped = first.stop();
+			// The stopped node fails what it had in flight.
+			for (const fail of failPays) fail(new Error('node destroyed'));
+			await stopped;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(payCalls).to.have.length(inFlight);
+		} finally {
+			await first.stop();
+		}
+
+		const second = await bootDaemon(tmpDir);
+		try {
+			const secondPort = (second.server.address() as AddressInfo).port;
+			// Nothing is enqueued on this boot: the queue dispatches what it
+			// restored once the node is ready.
+			const isFinal = (e: Entry | undefined): boolean =>
+				e !== undefined && e.status !== 'queued' && e.status !== 'dispatching';
+			let restored: Entry | undefined;
+			let settled: Entry | undefined;
+			const deadline = Date.now() + 15_000;
+			for (;;) {
+				const entries = await listQueue(secondPort);
+				restored = entries.find((e) => e.id === waiting!.id);
+				settled = entries.find((e) => e.id === 'q-1-issue967');
+				if (isFinal(restored) && isFinal(settled)) break;
+				if (Date.now() > deadline) {
+					throw new Error(
+						`restored queue rows never settled: ${JSON.stringify(entries)}`
+					);
+				}
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			}
+			// The real payer refuses the placeholder invoice, so reaching it
+			// at all is what shows the dispatch.
+			expect(restored?.status).to.equal('failed');
+			expect(restored?.error).to.equal('Payment status: FAILED');
+			// Settled against the node's COMPLETED record: never sent again.
+			expect(settled?.status).to.equal('completed');
+			const record = second.node.getPayment(paid.paymentHash.toString('hex'));
+			expect(record?.status).to.equal('COMPLETED');
 		} finally {
 			await second.stop();
 		}

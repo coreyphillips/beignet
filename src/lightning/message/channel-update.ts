@@ -31,6 +31,8 @@
  *   [4: feerate_per_kw]
  */
 
+import { decodeTlvStream } from './tlv';
+
 export interface IUpdateAddHtlcMessage {
 	channelId: Buffer;
 	id: bigint;
@@ -85,6 +87,9 @@ const UPDATE_FULFILL_HTLC_LENGTH = 72; // 32 + 8 + 32
 const UPDATE_FAIL_HTLC_FIXED_LENGTH = 42; // 32 + 8 + 2
 const UPDATE_FAIL_MALFORMED_HTLC_LENGTH = 74; // 32 + 8 + 32 + 2
 const UPDATE_FEE_LENGTH = 36; // 32 + 4
+
+const TLV_BLINDING_POINT = 0n;
+const UPDATE_ADD_HTLC_TLV_TYPES = new Set<bigint>([TLV_BLINDING_POINT]);
 
 /**
  * Encode an `update_add_htlc` message payload.
@@ -150,15 +155,28 @@ export function decodeUpdateAddHtlcMessage(
 	);
 	offset += 1366;
 
-	// Optional trailing blinding_point TLV (type 0, length 33). Parse only the
-	// blinding_point; tolerate/ignore any other trailing TLV records.
+	// Optional trailing update_add_htlc_tlvs; only blinding_point is known.
+	// Its length is checked, since every sender serializes a point as 33
+	// bytes. It is not checked to be a curve point: a decode error fails the
+	// channel, and an honest relay can pass on a bad point chosen by the
+	// path's creator. The node fails only that HTLC, with
+	// invalid_onion_blinding (BOLT 2).
 	let blindingPoint: Buffer | undefined;
-	if (payload.length >= offset + 2 && payload[offset] === 0x00) {
-		const len = payload[offset + 1];
-		if (len === 33 && payload.length >= offset + 2 + 33) {
-			blindingPoint = Buffer.from(
-				payload.subarray(offset + 2, offset + 2 + 33)
-			);
+	if (offset < payload.length) {
+		const { records } = decodeTlvStream(
+			payload,
+			offset,
+			UPDATE_ADD_HTLC_TLV_TYPES
+		);
+		for (const record of records) {
+			if (record.type === TLV_BLINDING_POINT) {
+				if (record.value.length !== 33) {
+					throw new Error(
+						`update_add_htlc: blinding_point must be 33 bytes, got ${record.value.length}`
+					);
+				}
+				blindingPoint = record.value;
+			}
 		}
 	}
 

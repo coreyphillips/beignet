@@ -21,15 +21,22 @@ import { isValidBech32mEncodedString } from '../../src/utils/wallet';
 describe('LOW hardening batch', function () {
 	describe('BOLT 7 required-feature check vs the IMPLEMENTED set', function () {
 		it('does not disconnect a peer requiring a feature we implement but did not advertise', function () {
-			// route_blinding (24) and upfront_shutdown_script (4) are implemented
-			// but not advertised in init; a peer requiring them must be accepted.
+			// route_blinding (24) is implemented but not advertised in init; a
+			// peer requiring it must be accepted.
 			const advertised = FeatureFlags.empty();
 			const remote = FeatureFlags.empty();
 			remote.setCompulsory(Feature.ROUTE_BLINDING);
-			remote.setCompulsory(Feature.UPFRONT_SHUTDOWN_SCRIPT);
 			expect(hasUnsupportedRequiredFeatures(advertised, remote)).to.have.length(
 				0
 			);
+		});
+
+		it('disconnects a peer requiring upfront_shutdown_script, which we do not enforce (#1047)', function () {
+			const remote = FeatureFlags.empty();
+			remote.setCompulsory(Feature.UPFRONT_SHUTDOWN_SCRIPT);
+			expect(
+				hasUnsupportedRequiredFeatures(FeatureFlags.empty(), remote)
+			).to.deep.equal([Feature.UPFRONT_SHUTDOWN_SCRIPT]);
 		});
 
 		it('still disconnects a peer requiring a genuinely unknown feature', function () {
@@ -40,10 +47,10 @@ describe('LOW hardening batch', function () {
 			).to.deep.equal([100]);
 		});
 
-		it('implementedFeatures covers route_blinding and upfront_shutdown', function () {
+		it('implementedFeatures covers route_blinding but not upfront_shutdown', function () {
 			const impl = implementedFeatures();
 			expect(impl.hasFeature(Feature.ROUTE_BLINDING)).to.equal(true);
-			expect(impl.hasFeature(Feature.UPFRONT_SHUTDOWN_SCRIPT)).to.equal(true);
+			expect(impl.hasFeature(Feature.UPFRONT_SHUTDOWN_SCRIPT)).to.equal(false);
 		});
 	});
 

@@ -466,6 +466,22 @@ describe('Lightning Messages', function () {
 			expect(decoded.channelId.equals(channelId)).to.be.true;
 			expect(getErrorText(decoded)).to.equal(text);
 		});
+
+		it('Should replace every byte outside printable ASCII', function () {
+			const data = Buffer.concat([
+				Buffer.from('ok\n[INFO] forged\x1b[2J\x7f', 'ascii'),
+				Buffer.from('é', 'utf8')
+			]);
+			expect(getErrorText({ channelId: ALL_CHANNELS, data })).to.equal(
+				'ok?[INFO] forged?[2J???'
+			);
+		});
+
+		it('Should truncate long error text', function () {
+			const data = Buffer.alloc(5000, 'a');
+			const text = getErrorText({ channelId: ALL_CHANNELS, data });
+			expect(text).to.equal('a'.repeat(1024) + '...');
+		});
 	});
 
 	describe('Feature Flags', function () {

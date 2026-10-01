@@ -151,7 +151,7 @@ export const PROBE_MUTATION_COVERAGE: Record<RecoveryMutation['type'], true> = {
 	outbox_supersede: true
 };
 export const PROBE_SNAPSHOT_COVERAGE: Record<
-	Exclude<keyof RecoverySnapshot, 'schemaVersion'>,
+	Exclude<keyof RecoverySnapshot, 'schemaVersion' | 'pageFrames'>,
 	true
 > = {
 	channels: true,

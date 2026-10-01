@@ -129,13 +129,15 @@ import {
 	addressTypes,
 	defaultFeesShape,
 	getAddressTypeContent,
-	getAddressTypes
+	getAddressTypes,
+	getDefaultSendTransaction
 } from '../shapes';
 import { Electrum } from '../electrum';
 import { Transaction } from '../transaction';
 import {
 	GAP_LIMIT,
 	GAP_LIMIT_CHANGE,
+	MAX_REMEMBERED_PSBT_BUILDS,
 	STOP_REFRESH_WAIT_MS,
 	TRANSACTION_DEFAULTS
 } from './constants';
@@ -205,13 +207,35 @@ export class Wallet {
 	// so without this an older query landing last would undo a newer one.
 	private _scanSeq = 0;
 	private _appliedScanSeq = 0;
+	// This wallet's tip at the first check a node without a txindex answered
+	// "no such mempool transaction" for a record the rule of issue #871 kept,
+	// by txid, or the highest tip it held if that was higher. A miss that
+	// outlasts two new blocks is final (issue #935). Memory only: a restart
+	// counts again from its own first miss, which only waits longer.
+	private readonly _noTxindexMisses: Map<string, number> = new Map();
+	// How often this session has set each transaction's exists flag to false,
+	// by txid. A refresh acts on its answer for a transaction only if no
+	// clearing came after its lookup went out: otherwise it neither rewrites
+	// the record, which would read it as back, nor watches it again. Never
+	// reset, so a count never repeats (issues #945 and #964).
+	private readonly _ghostClearings: Map<string, number> = new Map();
+	// The highest tip updateHeader has replaced. A failover to a server
+	// further behind lowers the tip, and that server may announce new blocks
+	// while it catches up to the one a transaction was mined in (issue #935).
+	private _replacedTipHeight = 0;
+	// The previous output of every input of each PSBT buildPsbt returned, keyed
+	// by the PSBT's unsigned transaction. importSignedPsbt finalizes nothing
+	// else unless the caller hands it the unsigned PSBT, so an output rewritten
+	// between build and sign is refused. Memory only.
+	private readonly _builtPsbts: Map<string, bitcoin.TxOutput[]> = new Map();
 	private _disableMessagesOnCreate: boolean;
 	private _disableRefreshOnCreate: boolean;
 	// Raised by stop(). Work that outlived the shutdown, above all the refresh
 	// its deadline walked away from, must not undo the teardown.
 	private _stopped = false;
-	// Raised by stop() before it waits for the refresh in flight. A wallet
-	// shutting down owes no further scan, and one would only hold stop() up.
+	// Raised by stop() before it waits for the refresh in flight and the
+	// queued writes. A wallet shutting down owes no further scan, and one
+	// would only hold stop() up.
 	private _stopping = false;
 	// BIP32 account index as a path segment string ('0' by default).
 	private readonly _account: string;
@@ -479,11 +503,16 @@ export class Wallet {
 	}
 
 	static async create(params: IWallet): Promise<Result<Wallet>> {
+		// Outside the try, so the catch can reach a wallet the constructor built.
+		let wallet: Wallet | undefined;
 		try {
-			const wallet = new Wallet(params);
+			wallet = new Wallet(params);
 			if (wallet._disableMessagesOnCreate) wallet.disableMessages = true;
 			const res = await wallet.setWalletData();
-			if (res.isErr()) return err(res.error.message);
+			if (res.isErr()) {
+				await wallet._abandonFailedCreate();
+				return err(res.error.message);
+			}
 			void wallet.updateFeeEstimates(true);
 			// A host that owns the startup refresh (and must hold its ONE
 			// promise, e.g. BeignetNode.waitForInitialSync) opts out here so
@@ -491,7 +520,33 @@ export class Wallet {
 			if (!wallet._disableRefreshOnCreate) void wallet.refreshWallet({});
 			return ok(wallet);
 		} catch (e) {
+			if (wallet) await wallet._abandonFailedCreate();
 			return err(e);
+		}
+	}
+
+	/**
+	 * Silences and stops a wallet Wallet.create is about to report as failed
+	 * (issue #966). The constructor has already started the Electrum
+	 * connection poll, and the caller never receives this instance, so nothing
+	 * else could ever stop it: it would go on connecting, calling onMessage
+	 * for a wallet the caller was told does not exist, and keeping the process
+	 * alive.
+	 *
+	 * Never throws. A teardown that fails is logged, so the caller still gets
+	 * the error that failed the create rather than this one.
+	 * @private
+	 * @returns {Promise<void>}
+	 */
+	private async _abandonFailedCreate(): Promise<void> {
+		this.disableMessages = true;
+		try {
+			await this.electrum.abandon();
+		} catch (e) {
+			this.logger.warn(
+				'Unable to stop the Electrum connection of a wallet that failed to create.',
+				e
+			);
 		}
 	}
 
@@ -728,21 +783,37 @@ export class Wallet {
 	}
 
 	/**
-	 * Stops the wallet permanently, waiting up to refreshTimeout for active refreshes.
+	 * Stops the wallet permanently, waiting up to refreshTimeout for active
+	 * refreshes and for the storage writes already queued at the call.
 	 * @param {Object} [options]
-	 * @param {number} [options.refreshTimeout] How long to wait for an in-flight refresh, in ms.
+	 * @param {number} [options.refreshTimeout] How long to wait for an in-flight refresh and queued writes, in ms.
 	 * @returns {Promise<Result<string>>}
 	 */
 	public async stop({
 		refreshTimeout = STOP_REFRESH_WAIT_MS
 	}: { refreshTimeout?: number } = {}): Promise<Result<string>> {
 		let abandonedRefresh = false;
+		let abandonedWrites: string[] = [];
+		// One deadline for both waits below: the writes get what the refresh
+		// left of it, never a second deadline of their own.
+		const deadline = Date.now() + refreshTimeout;
+		// Writes callers issued before the shutdown. Clearing _setData drops a
+		// write still waiting its turn, so they get their chance first.
+		const queuedWrites = Object.entries(this.savingOperations);
 		this._stopping = true;
 		try {
 			try {
 				// if we are refreshing, we need to wait for it to finish
 				if (this.isRefreshing) {
 					abandonedRefresh = !(await this._waitForRefresh(refreshTimeout));
+				}
+				// Only with a write queued: with nothing to wait for, the teardown
+				// below runs in the same tick as the call, as it always has.
+				if (queuedWrites.length) {
+					abandonedWrites = await this._waitForWrites(
+						queuedWrites,
+						deadline - Date.now()
+					);
 				}
 			} finally {
 				// However the wait above ended, the teardown runs: a shutdown that
@@ -755,11 +826,20 @@ export class Wallet {
 				this.disableMessages = true;
 				// disable saving to storage
 				this._setData = undefined;
+				// Nothing checks again here, and a new wallet counts afresh.
+				this._noTxindexMisses.clear();
 				// disconnect from Electrum
 				await this.electrum.disconnect();
 			}
-			if (abandonedRefresh) {
-				const message = `Wallet stopped, abandoning a refresh that did not finish within ${refreshTimeout}ms.`;
+			const abandoned: string[] = [];
+			if (abandonedRefresh) abandoned.push('a refresh');
+			if (abandonedWrites.length) {
+				abandoned.push(`writes to ${abandonedWrites.join(', ')}`);
+			}
+			if (abandoned.length) {
+				const message = `Wallet stopped, abandoning ${abandoned.join(
+					' and '
+				)} that did not finish within ${refreshTimeout}ms.`;
 				this.logger.warn(message);
 				return ok(message);
 			}
@@ -767,6 +847,42 @@ export class Wallet {
 		} catch (e) {
 			return err(e);
 		}
+	}
+
+	/**
+	 * Waits for the given queued writes, for at most `timeout` ms. Resolves
+	 * the keys whose writes were still pending when the deadline came.
+	 *
+	 * Never rejects (saveWalletData's queue does not), and never cancels: a
+	 * write the adapter is already making may still land after stop(), while
+	 * those queued behind it are dropped by the cleared _setData.
+	 * @private
+	 */
+	private async _waitForWrites(
+		writes: [string, Promise<Result<string>>][],
+		timeout: number
+	): Promise<string[]> {
+		if (!writes.length) return [];
+		const pending = new Set(writes.map(([key]) => key));
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<void>((resolve) => {
+			timer = setTimeout(resolve, Math.max(0, timeout));
+		});
+		try {
+			await Promise.race([
+				Promise.all(
+					writes.map(([key, write]) =>
+						write.then(() => {
+							pending.delete(key);
+						})
+					)
+				),
+				deadline
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
+		return [...pending];
 	}
 
 	/**
@@ -898,7 +1014,12 @@ export class Wallet {
 		force?: boolean;
 		onStart?: () => void;
 	} = {}): Promise<Result<IWalletData>> {
-		if (this._stopped) return err('Wallet stopped.');
+		// A stopping wallet starts no new body: one started while stop() waits
+		// on queued writes would only be abandoned mid-step by the teardown. A
+		// call made while a refresh is in flight still queues behind it, which
+		// is how stop() waits for one.
+		if (this._stopped || (this._stopping && !this.isRefreshing))
+			return err('Wallet stopped.');
 		if (onStart) this._refreshStartCallbacks.push(onStart);
 		if (this.isRefreshing && !force) {
 			this._refreshOwed = true;
@@ -1030,11 +1151,29 @@ export class Wallet {
 			if (walletDataResponse.isErr())
 				return err(walletDataResponse.error.message);
 			this._data = walletDataResponse.value;
+			await this._scrubStoredSendTransaction();
 			await this._applyBirthdayHeightOption();
 			return ok(true);
 		} catch (e) {
 			return err(e);
 		}
+	}
+
+	/**
+	 * The staged send is a per-call working area, never a draft to restore:
+	 * nothing reads the stored copy, and a copy an older version left behind
+	 * can carry an earlier call's recipients (#1002) and, after a key sweep,
+	 * the swept key pair (#1011). Drop it rather than keep it, in memory and
+	 * in storage, and only write when there is something to drop.
+	 * @private
+	 * @async
+	 * @returns {Promise<void>}
+	 */
+	private async _scrubStoredSendTransaction(): Promise<void> {
+		const stored = this._data.transaction;
+		if (!stored?.inputs?.length && !stored?.outputs?.length) return;
+		this._data.transaction = getDefaultSendTransaction();
+		await this.saveWalletData('transaction', this._data.transaction);
 	}
 
 	/**
@@ -2529,7 +2668,10 @@ export class Wallet {
 	 * @param {number} addressIndex
 	 * @param {number} changeAddressIndex
 	 * @param {EAddressType[]} [addressTypesToCheck]
-	 * @returns {Promise<Result<IGetUtxosResponse>>}
+	 * @returns {Promise<Result<IGetUtxosResponse>>} The pair the scan applied
+	 * to memory, or, when a newer scan already landed, memory's pair as it
+	 * stands, applied and written by that scan instead. A write that storage
+	 * refuses is logged, not returned: the scan itself succeeded.
 	 */
 	public async getUtxos({
 		scanningStrategy = EScanningStrategy.gapLimit,
@@ -2579,10 +2721,10 @@ export class Wallet {
 		const balance = (getUtxosRes.value?.balance ?? 0) - scanned.spentValue;
 		this._data.utxos = utxos;
 		this._data.balance = balance;
-		await Promise.all([
-			this.saveWalletData('utxos', this._data.utxos),
-			this.saveWalletData('balance', this._data.balance)
-		]);
+		// A refused write is logged and left to the next scan, which writes both
+		// again. An Err here would stop refreshWallet before updateTransactions
+		// and subscribeToAddresses, and deposits would go unseen.
+		await this.saveUtxoState();
 		return ok({ utxos, balance });
 	}
 
@@ -2599,8 +2741,15 @@ export class Wallet {
 	 * set and records their outpoints, so a scan that predates the broadcast
 	 * cannot put them back. Called for every broadcast: inputs that are not
 	 * this wallet's coins match nothing.
+	 *
+	 * A write of the new set that storage refuses is logged, not returned. The
+	 * removal happened and stands, since the coins are spent whatever storage
+	 * says, and a retry of this call would find nothing left to remove. The
+	 * scan the spend triggers through the wallet's own scripthash
+	 * subscription writes the pair again.
 	 * @param {string} rawTx The transaction that was broadcast, as hex.
-	 * @returns {Promise<Result<IUtxo[]>>} The coins removed from the set.
+	 * @returns {Promise<Result<IUtxo[]>>} The coins removed from the set, or
+	 * Err when the hex does not parse (nothing removed).
 	 */
 	public async removeSpentUtxos(rawTx: string): Promise<Result<IUtxo[]>> {
 		let outpoints: string[];
@@ -2628,10 +2777,7 @@ export class Wallet {
 			0,
 			this._data.balance - removed.reduce((sum, utxo) => sum + utxo.value, 0)
 		);
-		await Promise.all([
-			this.saveWalletData('utxos', this._data.utxos),
-			this.saveWalletData('balance', this._data.balance)
-		]);
+		await this.saveUtxoState();
 		return ok(removed);
 	}
 
@@ -2669,6 +2815,38 @@ export class Wallet {
 			if (mark <= settled) this._spentOutpoints.delete(outpoint);
 		}
 		return { utxos, spentValue };
+	}
+
+	/**
+	 * Writes the UTXO set, then the balance, as one pair read from memory at
+	 * the call. They are separate storage keys and cannot be written
+	 * atomically, so the balance is written only once the set has landed. A
+	 * refused set write then leaves both keys as they were, instead of the old
+	 * set beside the new balance (#812). A refused balance write leaves the
+	 * new set beside the old balance, and so does a stop() between the two
+	 * writes: it drops the balance write without a log, as it drops every
+	 * write after it. Either way this is display consistency, not selection
+	 * safety: coin selection reads the set, never the balance. Memory keeps
+	 * the new state regardless, and the next applied scan writes both again.
+	 * @returns {Promise<Result<string>>} Err naming the refused write, which
+	 * has already been logged.
+	 */
+	private async saveUtxoState(): Promise<Result<string>> {
+		// Read before the first await: a scan landing while the set write is
+		// queued replaces memory, and pairing this set with that scan's balance
+		// would split the stored pair if the scan's own set write were refused.
+		const { utxos, balance } = this._data;
+		const set = await this.saveWalletData('utxos', utxos);
+		const saved = set.isErr()
+			? set
+			: await this.saveWalletData('balance', balance);
+		if (saved.isErr()) {
+			const refused = set.isErr() ? 'UTXO set' : "UTXO set's balance";
+			const message = `Failed to persist the ${refused}: ${saved.error.message}`;
+			this.logger.error(message);
+			return err(message);
+		}
+		return ok('UTXO set saved.');
 	}
 
 	/**
@@ -2721,6 +2899,35 @@ export class Wallet {
 		 *  freezes after a restart without touching user-frozen coins. */
 		tag?: string;
 	}): Promise<Result<string>> {
+		const res = await this.freezeUtxoIfUnfrozen(params);
+		if (res.isErr()) return err(res.error);
+		const outpoint = `${params.txid}:${params.index}`;
+		return ok(
+			res.value.created
+				? `UTXO ${outpoint} frozen.`
+				: `UTXO ${outpoint} is already frozen.`
+		);
+	}
+
+	/**
+	 * freezeUtxo that also reports whether this call added the blacklist
+	 * entry. The answer is decided under the blacklist lock, so a freeze queued
+	 * ahead of this one reports created: false even when the coin was unfrozen
+	 * at the time of the call. A caller that later unfreezes only what it
+	 * created needs this, since unfreezeUtxo lifts every freeze on the outpoint.
+	 *
+	 * An untagged call on a coin an automated freezer tagged takes that freeze
+	 * over: the tag is cleared and created is true, because the freeze is now
+	 * the caller's and the tagged owner must not lift it.
+	 * @param {string} txid
+	 * @param {number} index
+	 * @returns {Promise<Result<{ created: boolean }>>}
+	 */
+	public async freezeUtxoIfUnfrozen(params: {
+		txid: string;
+		index: number;
+		tag?: string;
+	}): Promise<Result<{ created: boolean }>> {
 		return this.runBlacklistWrite(() => this.freezeUtxoLocked(params));
 	}
 
@@ -2732,7 +2939,7 @@ export class Wallet {
 		txid: string;
 		index: number;
 		tag?: string;
-	}): Promise<Result<string>> {
+	}): Promise<Result<{ created: boolean }>> {
 		if (typeof txid !== 'string' || !/^[0-9a-fA-F]{64}$/.test(txid)) {
 			return err('txid must be a 64-character hex string.');
 		}
@@ -2746,7 +2953,9 @@ export class Wallet {
 			return err(`UTXO ${txid}:${index} is not known to this wallet.`);
 		}
 		if (this.isUtxoFrozen(txid, index)) {
-			return ok(`UTXO ${txid}:${index} is already frozen.`);
+			return tag === undefined
+				? this.untagFrozenUtxo(txid, index)
+				: ok({ created: false });
 		}
 		// keyPair must never be persisted with the frozen entry.
 		const { keyPair, ...frozen } = utxo;
@@ -2772,7 +2981,48 @@ export class Wallet {
 				`Failed to persist the freeze for UTXO ${txid}:${index}: ${saved.error.message}`
 			);
 		}
-		return ok(`UTXO ${txid}:${index} frozen.`);
+		return ok({ created: true });
+	}
+
+	/**
+	 * Clears the tag on a frozen outpoint's entries. Automated freezers
+	 * recognize their own freezes by the tag, so an entry that kept it would
+	 * be lifted when that freezer lets go, taking the caller's freeze with it.
+	 */
+	private async untagFrozenUtxo(
+		txid: string,
+		index: number
+	): Promise<Result<{ created: boolean }>> {
+		const tagged = this._data.blacklistedUtxos.filter(
+			(frozen) =>
+				frozen.tx_hash === txid &&
+				frozen.tx_pos === index &&
+				frozen.freezeTag !== undefined
+		);
+		if (tagged.length === 0) return ok({ created: false });
+		const untagged = tagged.map((frozen) => {
+			const entry = { ...frozen };
+			delete entry.freezeTag;
+			delete entry.frozenAt;
+			return entry;
+		});
+		const swap = (from: IUtxo[], to: IUtxo[]): void => {
+			this._data.blacklistedUtxos = this._data.blacklistedUtxos.map(
+				(frozen) => to[from.indexOf(frozen)] ?? frozen
+			);
+		};
+		swap(tagged, untagged);
+		const saved = await this.saveWalletData(
+			'blacklistedUtxos',
+			this._data.blacklistedUtxos
+		);
+		if (saved.isErr()) {
+			swap(untagged, tagged);
+			return err(
+				`Failed to persist the freeze for UTXO ${txid}:${index}: ${saved.error.message}`
+			);
+		}
+		return ok({ created: true });
 	}
 
 	/**
@@ -2823,6 +3073,39 @@ export class Wallet {
 			);
 		}
 		return ok(`UTXO ${txid}:${index} unfrozen.`);
+	}
+
+	/**
+	 * unfreezeUtxo for an automated freezer: lifts the freeze only while every
+	 * entry on the outpoint still carries tag, and reports unfrozen: false when
+	 * one does not. An outpoint with no entry reports unfrozen: true, since
+	 * nothing is left to lift. The check runs under the blacklist lock, so a
+	 * freeze that took the entry over, or one whose write then rolls back, has
+	 * settled before it is read. An error is a refused write: the entry stands.
+	 * @param {string} txid
+	 * @param {number} index
+	 * @param {string} tag
+	 * @returns {Promise<Result<{ unfrozen: boolean }>>}
+	 */
+	public async unfreezeUtxoIfTagged(params: {
+		txid: string;
+		index: number;
+		tag: string;
+	}): Promise<Result<{ unfrozen: boolean }>> {
+		return this.runBlacklistWrite(async () => {
+			const entries = this._data.blacklistedUtxos.filter(
+				(frozen) =>
+					frozen.tx_hash === params.txid && frozen.tx_pos === params.index
+			);
+			if (entries.length === 0) return ok({ unfrozen: true });
+			const heldByOther = entries.some(
+				(frozen) => frozen.freezeTag !== params.tag
+			);
+			if (heldByOther) return ok({ unfrozen: false });
+			const res = await this.unfreezeUtxoLocked(params);
+			if (res.isErr()) return err(res.error);
+			return ok({ unfrozen: true });
+		});
 	}
 
 	/**
@@ -3052,6 +3335,11 @@ export class Wallet {
 		return clone.toBase58();
 	}
 
+	// The newest write queued for each key. Each write waits for the one
+	// queued before it, so this one settles only after all of them, and it
+	// never rejects.
+	private savingOperations: Record<string, Promise<Result<string>>> = {};
+
 	/**
 	 * Saves the wallet data object to storage if able.
 	 *
@@ -3062,50 +3350,77 @@ export class Wallet {
 	 *
 	 * A wallet configured without a setData is not a failure: it never had
 	 * persistence to lose.
+	 *
+	 * Writes to one key reach storage one at a time, in the order they were
+	 * issued, so an adapter that completes writes out of order still ends up
+	 * holding the last value written. Never rejects: an adapter that throws,
+	 * before or after returning its promise, answers Err, and so does a write
+	 * stop() dropped while it waited its turn (#946).
 	 * @private
 	 * @async
 	 * @param {TWalletDataKeys} key
 	 * @param {IWalletData[K]} data
 	 * @returns {Promise<Result<string>>}
 	 */
-	private savingOperations: Record<string, Promise<Result<string>>> = {};
 	public async saveWalletData<K extends keyof IWalletData>(
 		key: TWalletDataKeys,
 		data: IWalletData[K]
 	): Promise<Result<string>> {
 		if (!this._setData) return ok('No setData method has been provided');
-
-		// Check if there's an ongoing save operation for the same key
-		if (key in this.savingOperations) {
-			// Wait for the ongoing operation to complete
-			await this.savingOperations[key];
-		}
-
+		// Fixed now, not when the write's turn comes: switchNetwork moves the
+		// wallet to another network while a write may still be waiting, and
+		// that write carries the old network's data.
 		const walletDataKey = this.getWalletDataKey(key);
-		// Create a new save operation
-		this.savingOperations[key] = this._setData(walletDataKey, data)
-			.then((res) => {
-				// Adapters written in JS may resolve something that is not a
-				// Result at all; only an explicit Err counts as a failure.
-				if (typeof res?.isErr === 'function' && res.isErr()) {
-					return err<string>(
-						`Error saving wallet data for ${walletDataKey}: ${res.error.message}`
-					);
-				}
-				return ok(`${walletDataKey} data saved successfully`);
-			})
-			.catch((error) => {
-				return err<string>(
-					`Error saving wallet data for ${walletDataKey}: ${error}`
-				);
-			})
-			.finally(() => {
-				// Remove the operation once it's completed
-				delete this.savingOperations[key];
-			});
+		// With nothing queued for the key the write is issued in this same
+		// tick, so a stop() that follows the call cannot get in ahead of it.
+		const operation =
+			key in this.savingOperations
+				? this.savingOperations[key].then(() =>
+						this.writeWalletData(walletDataKey, data)
+				  )
+				: this.writeWalletData(walletDataKey, data);
+		this.savingOperations[key] = operation;
+		const saved = await operation;
+		// A newer write that queued behind this one owns the entry now.
+		if (this.savingOperations[key] === operation) {
+			delete this.savingOperations[key];
+		}
+		return saved;
+	}
 
-		// Wait for the save operation to complete
-		return await this.savingOperations[key];
+	/**
+	 * Hands one write to the storage adapter, for saveWalletData once the
+	 * write's turn has come. Never rejects.
+	 * @private
+	 * @param {string} walletDataKey The storage key, fixed when the write was issued.
+	 * @param {IWalletData[K]} data
+	 * @returns {Promise<Result<string>>}
+	 */
+	private async writeWalletData<K extends keyof IWalletData>(
+		walletDataKey: string,
+		data: IWalletData[K]
+	): Promise<Result<string>> {
+		try {
+			// stop() clears the adapter on purpose, so that work it walked away
+			// from cannot write after it. A write still waiting its turn then
+			// was accepted and never made, and its caller has to hear that.
+			if (!this._setData) {
+				return err(
+					`Wallet stopped before the queued write of ${walletDataKey} could run; it was not saved.`
+				);
+			}
+			const res = await this._setData(walletDataKey, data);
+			// Adapters written in JS may resolve something that is not a
+			// Result at all; only an explicit Err counts as a failure.
+			if (typeof res?.isErr === 'function' && res.isErr()) {
+				return err(
+					`Error saving wallet data for ${walletDataKey}: ${res.error.message}`
+				);
+			}
+			return ok(`${walletDataKey} data saved successfully`);
+		} catch (error) {
+			return err(`Error saving wallet data for ${walletDataKey}: ${error}`);
+		}
 	}
 
 	//TODO: Implement this as a way to better update and save state so we can consolidate this.data[key] updates.
@@ -3143,6 +3458,17 @@ export class Wallet {
 		//If the tx is reorg'd or bumped from the mempool and no longer exists, the transaction will be removed from the store and updated in the activity list.
 		await this.checkUnconfirmedTransactions();
 
+		// Every transaction's clearing count as this refresh's lookup goes out.
+		// A record's height and address come from its address history entry, so
+		// an answer is only as new as the history call below. A clearing that
+		// lands after this point, from a check beside this refresh, may rest on
+		// a newer answer than this one, so it stands on every branch below: the
+		// record is neither rewritten from this answer nor watched again, and
+		// the next refresh reads it again if the transaction really is back.
+		// This refresh's own check, and the forced refresh nested in its rescan,
+		// are done by now, so neither counts as newer (issues #945 and #964).
+		const clearingsAtLookup = new Map(this._ghostClearings);
+
 		const history = await this.electrum.getAddressHistory({
 			scanAllAddresses: scanAllAddresses || replaceStoredTransactions
 		});
@@ -3160,7 +3486,6 @@ export class Wallet {
 				return !((this.data.transactions[tx.tx_hash]?.height ?? 0) >= 6);
 			});
 		}
-
 		const getTransactionsResponse = await this.electrum.getTransactions({
 			txHashes: filteredTxHashes
 		});
@@ -3174,17 +3499,44 @@ export class Wallet {
 		if (formatTransactionsResponse.isErr()) {
 			return err(formatTransactionsResponse.error.message);
 		}
-		const transactions = formatTransactionsResponse.value;
+		// The answers this refresh may still act on: every transaction no
+		// clearing has landed on since its lookup went out. Both the watch
+		// below and the record writes are taken from this one map, since
+		// updateGhostTransactions relies on a refresh that reads a record as
+		// back watching it in the same stretch. Nothing awaits between here and
+		// the merge into the transactions map, so no clearing can land in
+		// between (issue #964).
+		const fresh: IFormattedTransactions = {};
+		for (const [txid, transaction] of Object.entries(
+			formatTransactionsResponse.value
+		)) {
+			if (
+				(this._ghostClearings.get(txid) ?? 0) ===
+				(clearingsAtLookup.get(txid) ?? 0)
+			) {
+				fresh[txid] = transaction;
+			}
+		}
 
 		// Add unconfirmed transactions.
 		// No need to wait for this to finish.
 		void this.addUnconfirmedTransactions({
-			transactions
+			transactions: fresh
 		});
 
 		if (replaceStoredTransactions) {
-			// No need to check the existing txs since we're replacing them. Update with the returned formatTransactionsResponse.
-			this._data.transactions = transactions;
+			// No need to check the existing txs since we're replacing them. Update
+			// with the fresh answers. A transaction this refresh looked up but has
+			// no fresh answer for keeps the record it has, since the missing answer
+			// says nothing about it: a clearing landed on it meanwhile (issue
+			// #964), the server answered its entry with an error (issue #934), or
+			// its batch failed (issue #872).
+			const next: IFormattedTransactions = { ...fresh };
+			for (const { tx_hash } of filteredTxHashes) {
+				const kept = this._data.transactions[tx_hash];
+				if (!(tx_hash in next) && kept) next[tx_hash] = kept;
+			}
+			this._data.transactions = next;
 			await this.saveWalletData('transactions', this._data.transactions);
 			return ok(undefined);
 		}
@@ -3198,17 +3550,22 @@ export class Wallet {
 		const receivedTxs: TTransactionMessage[] = [];
 		const sentTxs: TTransactionMessage[] = [];
 
-		Object.keys(transactions).forEach((txid) => {
+		Object.keys(fresh).forEach((txid) => {
 			const stored = storedTransactions[txid];
 			const isNew = !stored;
-			//If the tx is new or the tx now has a block height (state changed to confirmed)
-			if (isNew || stored.height !== transactions[txid].height) {
+			// The ghost path leaves a cleared record at height 0, and a transaction
+			// back in the mempool returns at height 0 too, so only its exists flag
+			// changed. The server has just served it, and the record was cleared
+			// before this lookup went out, so it is pending again (issue #945).
+			const returned = stored?.exists === false;
+			//If the tx is new, was cleared and is back, or now has a different block height
+			if (isNew || returned || stored.height !== fresh[txid].height) {
 				formattedTransactions[txid] = {
-					...transactions[txid],
+					...fresh[txid],
 					// Keep the previous timestamp if the tx is not new.
 					timestamp:
 						storedTransactions[txid]?.timestamp ??
-						transactions[txid]?.timestamp ??
+						fresh[txid]?.timestamp ??
 						Date.now()
 				};
 				// A confirmation is a transition: a transaction the wallet already
@@ -3232,10 +3589,10 @@ export class Wallet {
 
 			// if the tx is new, incoming but not from a transfer - show notification
 			if (isNew) {
-				if (transactions[txid].type === EPaymentType.received) {
-					receivedTxs.push({ transaction: transactions[txid] });
-				} else if (transactions[txid].type === EPaymentType.sent) {
-					sentTxs.push({ transaction: transactions[txid] });
+				if (fresh[txid].type === EPaymentType.received) {
+					receivedTxs.push({ transaction: fresh[txid] });
+				} else if (fresh[txid].type === EPaymentType.sent) {
+					sentTxs.push({ transaction: fresh[txid] });
 				}
 				notificationTxid = txid;
 			}
@@ -3324,29 +3681,56 @@ export class Wallet {
 		reorgDetected = false
 	): Promise<Result<string>> {
 		try {
+			// What the check below looks up. An entry a refresh adds while it
+			// waits is in none of its results, and both branches below keep it.
+			const observed = new Set(Object.keys(this.getUnconfirmedTransactions()));
 			const processRes = await this.processUnconfirmedTransactions();
 			if (processRes.isErr()) {
 				return err(processRes.error.message);
 			}
 
 			const { unconfirmedTxs, outdatedTxs, ghostTxs } = processRes.value;
+			// Each repair below returns early on a write that did not land, so Ok
+			// means all of it is durable. An Err also leaves a reorg that
+			// Electrum's header path found still owed, so it is reconciled again
+			// on every header until storage recovers (issue #870).
 			if (outdatedTxs.length > 0 || reorgDetected) {
 				this.sendMessage('reorg', outdatedTxs);
 				//We need to update the height of the transactions that were reorg'd out.
-				await this.updateTransactionHeights(outdatedTxs);
+				const updated = await this.updateTransactionHeights(outdatedTxs);
+				// Return before anything else is written. The main record is
+				// already cleared in memory, so the copy under observation, still
+				// at the lost block, is what asks for this repair again on the next
+				// check, and every ghost of this round stays observed with it. A
+				// refresh that finds the transaction in its address history again
+				// rewrites that copy at zero, which ends that retry. The record in
+				// memory is right either way and lands with the next write of the
+				// transactions map, and a restart before then reads the lost block
+				// from the stored record itself (issue #870).
+				if (updated.isErr()) return err(updated.error.message);
 			}
 			if (ghostTxs.length > 0) {
 				this.sendMessage('rbf', ghostTxs);
 				//We need to update the ghost transactions in the store & activity-list and rescan the addresses to get the correct balance.
-				await this.updateGhostTransactions({
-					txIds: ghostTxs
+				const updated = await this.updateGhostTransactions({
+					txIds: ghostTxs,
+					unconfirmedTxs,
+					observed
 				});
+				if (updated.isErr()) return err(updated.error.message);
 			} else {
-				this._data.unconfirmedTransactions = unconfirmedTxs;
-				await this.saveWalletData(
+				// As on the ghost path, an entry a refresh added while this check
+				// waited is kept (issue #944).
+				this._data.unconfirmedTransactions = this.keepAddedMeanwhile(
+					unconfirmedTxs,
+					observed
+				);
+				const saved = await this.saveWalletData(
 					'unconfirmedTransactions',
 					this._data.unconfirmedTransactions
 				);
+				// Already in memory, so the next check writes it again.
+				if (saved.isErr()) return err(saved.error.message);
 			}
 			return ok('Successfully updated unconfirmed transactions.');
 		} catch (e) {
@@ -3358,7 +3742,7 @@ export class Wallet {
 	 * This method processes all transactions with less than 6 confirmations and returns the following:
 	 * 1. Transactions that still have less than 6 confirmations and can be considered unconfirmed. (unconfirmedTxs)
 	 * 2. Transactions that have fewer confirmations than before due to a reorg. (outdatedTxs)
-	 * 3. Transactions that have been removed from the mempool. (ghostTxs)
+	 * 3. Transactions the server no longer has in the mempool or the chain. (ghostTxs)
 	 * @private
 	 * @async
 	 * @returns {Promise<Result<TProcessUnconfirmedTransactions>>}
@@ -3369,6 +3753,10 @@ export class Wallet {
 		try {
 			//Retrieve all unconfirmed transactions (tx less than 6 confirmations in this case) from the store
 			const oldUnconfirmedTxs = this.getUnconfirmedTransactions();
+			// A miss counted for a transaction no longer observed is over.
+			for (const txid of this._noTxindexMisses.keys()) {
+				if (!(txid in oldUnconfirmedTxs)) this._noTxindexMisses.delete(txid);
+			}
 
 			//Use electrum to check if the transaction was removed/bumped from the mempool or if it still exists.
 			const tx_hashes: ITxHash[] = Object.values(oldUnconfirmedTxs).map(
@@ -3376,6 +3764,9 @@ export class Wallet {
 					return { tx_hash: transaction.txid };
 				}
 			);
+			// A header that lands while the lookup is in flight is newer than the
+			// answer, so the rule of issue #935 below judges by this one.
+			const tipBeforeLookup = this.data.header?.height ?? 0;
 			const txs = await this.electrum.getTransactions({
 				txHashes: tx_hashes
 			});
@@ -3387,13 +3778,73 @@ export class Wallet {
 			const outdatedTxs: IUtxo[] = []; //Transactions that have been pushed back into the mempool due to a reorg. We need to update the height.
 			const ghostTxs: string[] = []; //Transactions that have been removed from the mempool and are no longer in the blockchain.
 			const answered = new Set<string>();
+			const tipHeight = this.data.header?.height ?? 0;
 			txs.value.data.forEach((txData: ITransaction<IUtxo>) => {
 				answered.add(txData.data.tx_hash);
+				// The block this wallet last saw the transaction in, zero for none.
+				// The main record counts as well: a repair whose write was lost
+				// leaves the lost block there, while after a restart the copy
+				// observed here may already read zero (issue #870).
+				const oldHeight = Math.max(
+					oldUnconfirmedTxs[txData.data.tx_hash]?.height ?? 0,
+					this.data.transactions[txData.data.tx_hash]?.height ?? 0
+				);
 				// Check if the transaction has been removed from the mempool/still exists.
-				if (!this.electrum.transactionExists(txData)) {
+				if (
+					!this.electrum.transactionExists(txData) ||
+					// A node without a txindex searches only its mempool, and electrs
+					// finds a confirmed transaction only in blocks it has indexed.
+					// So that miss says nothing about a transaction never seen in a
+					// block: one mined into a block electrs has not indexed yet gets
+					// it too. And it counts only two blocks under the tip, since a
+					// failover commonly lands on a server a block behind, and a
+					// height written from a confirmation count runs a block low
+					// (confirmationsToBlockHeight). A record nearer the tip keeps its
+					// entry below and is asked about again on the next refresh
+					// (issue #871).
+					(oldHeight > 0 &&
+						oldHeight < tipHeight - 1 &&
+						this.electrum.transactionMissingWithoutTxindex(txData))
+				) {
 					//Transaction may have been removed/bumped from the mempool or potentially reorg'd out.
 					ghostTxs.push(txData.data.tx_hash);
 					return;
+				}
+
+				if (this.electrum.transactionMissingWithoutTxindex(txData)) {
+					// For a record only ever seen in the mempool, which the rule above
+					// keeps, the same miss is final once it outlasts two new blocks.
+					// electrs indexes a block before it announces the block's header,
+					// so once this wallet's tip has moved on, a transaction mined in
+					// the meantime is found through electrs' index. The second block
+					// covers a failover to a server a block behind, as above. So what
+					// is still missing then was replaced or evicted from the mempool
+					// (issue #935).
+					//
+					// Counted from no lower than the highest tip this wallet has
+					// held, though: a failover to a server further behind lowers the
+					// tip, and that server announces new blocks while it catches up to
+					// the one the transaction may be in. Nor from lower than a block
+					// the record was seen in, which leaves such a record to the rule
+					// above. Nothing is counted before the wallet knows a tip, and the
+					// count stays until the transaction is answered for or leaves
+					// observation.
+					const firstMiss = this._noTxindexMisses.get(txData.data.tx_hash);
+					if (firstMiss === undefined) {
+						if (tipHeight > 0) {
+							this._noTxindexMisses.set(
+								txData.data.tx_hash,
+								Math.max(tipHeight, this._replacedTipHeight)
+							);
+						}
+					} else if (
+						Math.min(tipBeforeLookup, tipHeight) -
+							Math.max(firstMiss, oldHeight) >=
+						2
+					) {
+						ghostTxs.push(txData.data.tx_hash);
+						return;
+					}
 				}
 
 				if (!txData.result) {
@@ -3405,6 +3856,8 @@ export class Wallet {
 						oldUnconfirmedTxs[txData.data.tx_hash];
 					return;
 				}
+				// Answered for, so whatever miss was counted is over.
+				this._noTxindexMisses.delete(txData.data.tx_hash);
 
 				if (!txData.result.confirmations) {
 					// No confirmations is no block, which this wallet stores as height
@@ -3412,7 +3865,6 @@ export class Wallet {
 					// confirmationsToBlockHeight, which answers the current TIP for
 					// zero confirmations: that is above every stored height, so the
 					// comparison never fired and the reorg went unseen (issue #863).
-					const oldHeight = oldUnconfirmedTxs[txData.data.tx_hash]?.height ?? 0;
 					if (oldHeight > 0) {
 						//Transaction was reorg'd back to zero confirmations. Add it to the outdatedTxs array.
 						outdatedTxs.push(txData.data);
@@ -3495,8 +3947,38 @@ export class Wallet {
 	 * @returns {Promise<void>}
 	 */
 	public async updateHeader(headerData: IHeader): Promise<void> {
+		this._replacedTipHeight = Math.max(
+			this._replacedTipHeight,
+			this._data.header?.height ?? 0
+		);
 		this._data.header = headerData;
 		await this.saveWalletData('header', headerData);
+	}
+
+	/**
+	 * What a check leaves under observation: the map it built, plus every entry
+	 * a refresh added while it waited. Such an entry is not among what the
+	 * check looked up, so it is in none of its results, and a record found
+	 * already in a block is not fetched again: this entry is all that would
+	 * notice a later reorg of it (issue #944). An entry the check did look up
+	 * keeps the check's copy, so one it dropped stays dropped. Read after the
+	 * check's last await, so an entry added during any of them is kept.
+	 * @private
+	 * @param {IFormattedTransactions} unconfirmedTxs The check's own map.
+	 * @param {Set<string>} observed Every transaction that check looked up.
+	 * @returns {IFormattedTransactions}
+	 */
+	private keepAddedMeanwhile(
+		unconfirmedTxs: IFormattedTransactions,
+		observed: Set<string>
+	): IFormattedTransactions {
+		const next: IFormattedTransactions = { ...unconfirmedTxs };
+		for (const [txid, transaction] of Object.entries(
+			this.getUnconfirmedTransactions()
+		)) {
+			if (!observed.has(txid)) next[txid] = transaction;
+		}
+		return next;
 	}
 
 	/**
@@ -3504,43 +3986,87 @@ export class Wallet {
 	 * @private
 	 * @async
 	 * @param {string[]} txIds
+	 * @param {IFormattedTransactions} unconfirmedTxs What the check that found
+	 * them leaves under observation, these already left out.
+	 * @param {Set<string>} observed Every transaction that check looked up.
 	 * @returns {Promise<Result<string>>}
 	 */
 	private async updateGhostTransactions({
-		txIds
+		txIds,
+		unconfirmedTxs,
+		observed
 	}: {
 		txIds: string[];
+		unconfirmedTxs: IFormattedTransactions;
+		observed: Set<string>;
 	}): Promise<Result<string>> {
 		try {
 			const transactions = this.data.transactions;
-			const unconfirmedTransactions = this.data.unconfirmedTransactions;
 			txIds.forEach((txId) => {
 				if (txId in transactions) {
 					transactions[txId]['exists'] = false;
-					// A server without a txindex answers "no such transaction" for a
-					// reorg'd out transaction instead of one with no confirmations, so
-					// this is where that reorg lands. The block it was found in is
-					// gone with it (issue #863).
+					this._ghostClearings.set(
+						txId,
+						(this._ghostClearings.get(txId) ?? 0) + 1
+					);
+					// A reorg'd out transaction no mempool took back is answered "no
+					// such transaction" rather than with no confirmations: by a server
+					// with a txindex always, and by electrs on a node without one for
+					// a record seen in a block two or more under the tip (issue
+					// #871), or once the miss outlasts two new blocks (issue #935).
+					// So this is where that reorg lands, and the block it was found
+					// in is gone with it (issue #863).
 					transactions[txId].height = 0;
 					delete transactions[txId].blockhash;
 					delete transactions[txId].confirmTimestamp;
 				}
-				if (txId in unconfirmedTransactions) {
-					delete unconfirmedTransactions[txId];
-				}
 			});
 			this._data.transactions = transactions;
-			await this.saveWalletData('transactions', transactions);
-			this._data.unconfirmedTransactions = unconfirmedTransactions;
-			await this.saveWalletData(
+			const saved = await this.saveWalletData('transactions', transactions);
+			// Dropping the unconfirmed copy is what stops this transaction being
+			// looked up again, so it may only happen once the repaired record is
+			// durable. Otherwise a failed write leaves it stored as confirmed at a
+			// lost block, and unwatched. The rescan waits for it too: its forced
+			// refresh runs this check again, and a ghost still observed would
+			// come straight back here (issue #870).
+			if (saved.isErr()) return err(saved.error.message);
+
+			// The check's own map rather than the old one less these ghosts: a
+			// transaction the same round found back in the mempool is observed at
+			// zero from now on, where its old copy would report the same reorg
+			// again on the next check.
+			const next = this.keepAddedMeanwhile(unconfirmedTxs, observed);
+			// A refresh whose lookup went out during the write above, after these
+			// clearings, may have been served one of these ghosts, read it as back
+			// and watched it again. Its record no longer reads cleared, and
+			// dropping its entry would leave it held and unwatched, so a later
+			// loss would never show. The next check judges it again instead
+			// (issue #945). A refresh whose lookup went out before these
+			// clearings leaves them be (issue #964).
+			for (const txId of txIds) {
+				const live = this.data.unconfirmedTransactions[txId];
+				const record = this.data.transactions[txId];
+				if (live && record && record.exists !== false) next[txId] = live;
+			}
+			this._data.unconfirmedTransactions = next;
+			// Their counted misses end here, with their observation, and not when
+			// the check found them: a ghost whose write failed above is still
+			// observed, and the next check clears it at once rather than counting
+			// two more blocks (issue #935).
+			for (const txId of txIds) this._noTxindexMisses.delete(txId);
+			const savedUnconfirmed = await this.saveWalletData(
 				'unconfirmedTransactions',
-				unconfirmedTransactions
+				next
 			);
 
 			//Rescan the addresses to get the correct balance.
 			await this.rescanAddresses({
 				shouldClearAddresses: false // No need to clear addresses since we are only updating the balance.
 			});
+			// Reported only after the rescan. Memory no longer observes these
+			// ghosts, so nothing in this session would rescan for them again,
+			// and a copy still on disk only repeats this repair after a restart.
+			if (savedUnconfirmed.isErr()) return err(savedUnconfirmed.error.message);
 			return ok('Successfully deleted transactions.');
 		} catch (e) {
 			return err(e);
@@ -3611,7 +4137,8 @@ export class Wallet {
 	}
 
 	/**
-	 * Clears the UTXO array and balance from storage.
+	 * Clears the UTXO array and balance from storage. A write storage refuses
+	 * is logged, and the next applied scan writes both again.
 	 * @public
 	 * @async
 	 * @returns {Promise<string>}
@@ -3619,10 +4146,7 @@ export class Wallet {
 	public async clearUtxos(): Promise<string> {
 		this._data.balance = 0;
 		this._data.utxos = [];
-		await Promise.all([
-			this.saveWalletData('balance', this._data.balance),
-			this.saveWalletData('utxos', this._data.utxos)
-		]);
+		await this.saveUtxoState();
 		return "Successfully cleared UTXO's.";
 	}
 
@@ -3658,9 +4182,11 @@ export class Wallet {
 	 * @private
 	 * @async
 	 * @param {IUtxo[]} txs
-	 * @returns {Promise<string>}
+	 * @returns {Promise<Result<string>>}
 	 */
-	private async updateTransactionHeights(txs: IUtxo[]): Promise<string> {
+	private async updateTransactionHeights(
+		txs: IUtxo[]
+	): Promise<Result<string>> {
 		let needsSave = false;
 		const transactions = this.data.transactions;
 		txs.forEach((tx) => {
@@ -3677,9 +4203,10 @@ export class Wallet {
 			}
 		});
 		if (needsSave) {
-			await this.saveWalletData('transactions', transactions);
+			const saved = await this.saveWalletData('transactions', transactions);
+			if (saved.isErr()) return err(saved.error.message);
 		}
-		return 'Successfully updated reorg transactions.';
+		return ok('Successfully updated reorg transactions.');
 	}
 
 	/**
@@ -3753,6 +4280,11 @@ export class Wallet {
 
 	/**
 	 * Formats the provided transaction.
+	 *
+	 * A transaction is left out of the result, like an entry the server
+	 * answered with an error, when the previous output of any of its inputs
+	 * could not be looked up (issue #965). The caller keeps whatever record it
+	 * has for it and the next refresh tries again.
 	 * @async
 	 * @param {ITransaction<IUtxo>[]} transactions
 	 * @returns {Promise<Result<IFormattedTransactions>>}
@@ -3784,7 +4316,7 @@ export class Wallet {
 				});
 			}
 		});
-		const inputDataResponse = await this.getInputData({
+		const inputDataResponse = await this._getInputData({
 			inputs
 		});
 		if (inputDataResponse.isErr()) {
@@ -3793,13 +4325,12 @@ export class Wallet {
 			);
 		}
 		const addressTypeKeys = Object.values(EAddressType);
-		const inputData = inputDataResponse.value;
+		const { inputData, unresolved } = inputDataResponse.value;
 		const currentAddresses = currentWallet.addresses;
 		const currentChangeAddresses = currentWallet.changeAddresses;
 
 		let addresses = {} as IAddresses;
 		let changeAddresses = {} as IAddresses;
-		let rbf = false;
 
 		addressTypeKeys.map((addressType) => {
 			// Check if addresses of this type have been generated. If not, skip.
@@ -3827,8 +4358,34 @@ export class Wallet {
 		);
 
 		const formattedTransactions: IFormattedTransactions = {};
-		transactions.map(async ({ data, result }) => {
-			if (!result.txid) {
+		const heldBack: string[] = [];
+		transactions.forEach(({ data, result }) => {
+			// An entry the server answered with an error carries no result
+			// (issue #934). Skip it and format the rest of the batch.
+			if (!result?.txid) {
+				return;
+			}
+
+			// Hold back a transaction with an input whose previous output could
+			// not be looked up. Formatted from a partial answer, the wallet's own
+			// send has no matched input value and reads as received, with its
+			// change as the value and a fee that is off by the missing input. It
+			// has to be any input, not only one spending a transaction the wallet
+			// knows: on a restore the history scan covers a window of addresses at
+			// a time (filterAddressesForGapLimit), so the wallet's own funding
+			// transaction may not be known yet. Left out here, the transaction is
+			// neither recorded nor announced and the next refresh tries again.
+			// The balance does not depend on it, since UTXOs are read separately
+			// (issue #965).
+			const unresolvedInput = result.vin.some(
+				(vin) =>
+					'txid' in vin &&
+					vin.txid !== undefined &&
+					vin.vout !== undefined &&
+					unresolved.has(`${vin.txid}${vin.vout}`)
+			);
+			if (unresolvedInput) {
+				heldBack.push(result.txid);
 				return;
 			}
 
@@ -3840,6 +4397,9 @@ export class Wallet {
 
 			//Iterate over each input
 			let isCoinbase = false;
+			// Per transaction: a flag shared by the batch marked every transaction
+			// after a signalling one as rbf too (issue #941).
+			let rbf = false;
 			result.vin.map((vin) => {
 				//Push any OP_RETURN messages to messages array
 				try {
@@ -3949,11 +4509,23 @@ export class Wallet {
 			};
 		});
 
+		if (heldBack.length) {
+			this.logger.warn(
+				'Holding back transactions whose inputs could not all be looked up, to retry on the next refresh:',
+				heldBack
+			);
+		}
+
 		return ok(formattedTransactions);
 	}
 
 	/**
 	 * Returns formatted input data from the inputs array.
+	 *
+	 * An input whose previous output could not be looked up, even on a retry,
+	 * is missing from the result. formatTransactions holds back a transaction
+	 * with such an input rather than format it from a partial answer (issue
+	 * #965).
 	 * @async
 	 * @param {{tx_hash: string, vout: number}[]} inputs
 	 * @returns {Promise<Result<InputData>>}
@@ -3963,6 +4535,33 @@ export class Wallet {
 	}: {
 		inputs: { tx_hash: string; vout: number }[];
 	}): Promise<Result<InputData>> {
+		const res = await this._getInputData({ inputs });
+		if (res.isErr()) return err(res.error);
+		return ok(res.value.inputData);
+	}
+
+	/**
+	 * Looks up the previous output of each input, and names the inputs it
+	 * could not resolve.
+	 *
+	 * An input is unresolved when no usable answer came back for it on the
+	 * first attempt or on a retry: the server answered it with an error, with
+	 * nothing, or with a transaction lacking that output. It is found by what
+	 * is missing rather than by the error branch, so each of these is retried
+	 * and reported. Inputs are keyed as formatTransactions looks them up,
+	 * `${tx_hash}${vout}`, taken from the request. An input the server calls
+	 * too large to send is neither retried nor unresolved, since that answer
+	 * does not change (issue #965).
+	 * @private
+	 * @async
+	 * @param {{tx_hash: string, vout: number}[]} inputs
+	 * @returns {Promise<Result<{ inputData: InputData; unresolved: Set<string> }>>}
+	 */
+	private async _getInputData({
+		inputs
+	}: {
+		inputs: { tx_hash: string; vout: number }[];
+	}): Promise<Result<{ inputData: InputData; unresolved: Set<string> }>> {
 		try {
 			// Defense-in-depth behind the updateTransactions guard: never ask
 			// the server for a prevout that does not exist (coinbase inputs
@@ -3971,7 +4570,30 @@ export class Wallet {
 				(i) => i.tx_hash !== undefined && i.vout !== undefined
 			);
 			const inputData: InputData = {};
-			const failedRequests: { tx_hash: string; vout: number }[] = [];
+			// The last error the server answered each input with.
+			const errors = new Map<string, { code?: number; message?: string }>();
+			// Inputs Electrum considers too large to send. No point in asking for
+			// them again, so they are logged and skipped.
+			const tooLarge = new Set<string>();
+
+			const read = (
+				answers: ITransaction<{ tx_hash: string; vout: number }>[]
+			): void => {
+				for (const { data, result, error } of answers) {
+					if (!data) continue;
+					const key = `${data.tx_hash}${data.vout}`;
+					const output = result?.vout?.[data.vout];
+					if (output?.scriptPubKey) {
+						inputData[key] = this._extractVoutData(output);
+					} else if (error) {
+						errors.set(key, error);
+						if (/response too large/i.test(error.message ?? '')) {
+							tooLarge.add(key);
+							this._logGetInputDataError(error, data);
+						}
+					}
+				}
+			};
 
 			const batchLimit = this.electrum.batchLimit;
 			for (let i = 0; i < inputs.length; i += batchLimit) {
@@ -3988,29 +4610,18 @@ export class Wallet {
 							getTransactionsResponse.error?.data
 					);
 				}
-				getTransactionsResponse.value.data.map(({ data, result, error }) => {
-					if (result && result?.vout) {
-						const { addresses, value, key } = this._extractVoutData(
-							result.vout[data.vout],
-							data
-						);
-						inputData[key] = { addresses, value };
-					} else if (error) {
-						if (
-							error?.message &&
-							error.message.includes('response too large')
-						) {
-							// No point in re-running this tx_hash since Electrum considers the tx too large, just log the error.
-							this._logGetInputDataError(error, data);
-						} else {
-							failedRequests.push(data);
-						}
-					}
-				});
+				read(getTransactionsResponse.value.data);
 			}
 
-			// Attempt to retrieve the data for any failed getTransactionsFromInputs request.
-			for (const input of failedRequests) {
+			// Every input still without a usable answer, each asked once more.
+			const missing = new Map<string, { tx_hash: string; vout: number }>();
+			for (const input of inputs) {
+				const key = `${input.tx_hash}${input.vout}`;
+				if (!(key in inputData) && !tooLarge.has(key)) {
+					missing.set(key, input);
+				}
+			}
+			for (const input of missing.values()) {
 				const getTransactionsResponse =
 					await this.electrum.getTransactionsFromInputs({
 						txHashes: [input]
@@ -4022,19 +4633,21 @@ export class Wallet {
 							getTransactionsResponse.error?.data
 					);
 				}
-				getTransactionsResponse.value.data.map(({ data, result, error }) => {
-					if (result && result?.vout) {
-						const { addresses, value, key } = this._extractVoutData(
-							result.vout[data.vout],
-							data
-						);
-						inputData[key] = { addresses, value };
-					} else if (error) {
-						this._logGetInputDataError(error, data);
-					}
-				});
+				read(getTransactionsResponse.value.data);
 			}
-			return ok(inputData);
+
+			const unresolved = new Set<string>();
+			for (const [key, input] of missing) {
+				if (key in inputData || tooLarge.has(key)) continue;
+				unresolved.add(key);
+				const error = errors.get(key);
+				if (error) {
+					this._logGetInputDataError(error, input);
+				} else {
+					this.logger.warn('No usable answer for input data of:', input);
+				}
+			}
+			return ok({ inputData, unresolved });
 		} catch (e) {
 			return err(e);
 		}
@@ -4044,21 +4657,19 @@ export class Wallet {
 	 * Extracts data from the provided vout.
 	 * @private
 	 * @param {IVout} vout
-	 * @param { tx_hash: string; vout: number } data
-	 * @returns { addresses: string[]; value: number; key: string }
+	 * @returns { addresses: string[]; value: number }
 	 */
-	private _extractVoutData(
-		vout: IVout,
-		data: { tx_hash: string; vout: number }
-	): { addresses: string[]; value: number; key: string } {
+	private _extractVoutData(vout: IVout): {
+		addresses: string[];
+		value: number;
+	} {
 		const addresses = vout.scriptPubKey.addresses
 			? vout.scriptPubKey.addresses
 			: vout.scriptPubKey.address
 			? [vout.scriptPubKey.address]
 			: [];
 		const value = vout.value;
-		const key = `${data.tx_hash}${vout.n}`;
-		return { addresses, value, key };
+		return { addresses, value };
 	}
 
 	/*
@@ -4122,7 +4733,19 @@ export class Wallet {
 			this.logger.warn(generateAddressResponse.error.message);
 			return err('Unable to successfully generate a change address.');
 		}
-		return ok(generateAddressResponse.value.changeAddresses[0]);
+		// generateAddresses keys its result by scriptHash, so `[0]` read an
+		// index that never exists and this leg answered ok(undefined) on a
+		// wallet that had not yet set its indexes (issue #1064: the offline
+		// force-close sweep leg on a never-synced wallet). Change index 0 is
+		// what the first gap scan starts from on such a wallet, so it is
+		// always inside the scan window.
+		const generated = Object.values(
+			generateAddressResponse.value.changeAddresses
+		)[0];
+		if (!generated?.address) {
+			return err('Unable to successfully generate a change address.');
+		}
+		return ok(generated);
 	}
 
 	/**
@@ -4339,57 +4962,69 @@ export class Wallet {
 		if (!this.data.utxos.length) {
 			return err('No UTXOs available.');
 		}
-		const setupTransactionRes = await this.transaction.setupTransaction({
-			rbf
-		});
-		if (setupTransactionRes.isErr()) {
-			return err(setupTransactionRes.error.message);
-		}
-
-		if (!Array.isArray(txs)) txs = [txs];
-
-		const shuffledTxs = shuffleOutputs ? shuffleArray(txs) : txs;
-		let index = 0;
-		for (const tx of shuffledTxs) {
-			const updateSendTransactionRes = this.transaction.updateSendTransaction({
-				transaction: {
-					label: tx.message,
-					outputs: [{ address: tx.address, value: tx.amount, index }]
-				}
+		// The staged send is a per-call working area. It starts empty, so
+		// nothing an earlier call staged rides along (#1002), and its stored
+		// copy is dropped on the way out, so nothing of this call outlives the
+		// process. The live copy stays readable (fee, inputs) until the next
+		// call resets it.
+		await this.resetSendTransaction();
+		try {
+			const setupTransactionRes = await this.transaction.setupTransaction({
+				rbf
 			});
-			if (updateSendTransactionRes.isErr())
-				return err(updateSendTransactionRes.error.message);
-			index++;
-		}
-
-		const updateFeeRes = this.transaction.updateFee({ satsPerByte });
-		if (updateFeeRes.isErr()) {
-			if (updateFeeRes.error.message.includes('Unable to increase the fee')) {
-				const feeInfo = this.getFeeInfo({ satsPerByte: 1 });
-				if (feeInfo.isOk()) {
-					return err(
-						`Fee is too high. The maximum fee for this transaction is ${feeInfo.value.maxSatPerByte}`
-					);
-				}
+			if (setupTransactionRes.isErr()) {
+				return err(setupTransactionRes.error.message);
 			}
-			// The fee probe above only refines the message. Either way the fee was
-			// never updated, so never fall through to build and broadcast.
-			return err(updateFeeRes.error.message);
-		}
 
-		const createRes = await this.transaction.createTransaction({
-			shuffleOutputs
-		});
-		if (createRes.isErr()) return err(createRes.error.message);
-		const { hex } = createRes.value;
-		if (!broadcast) {
-			return ok(hex);
+			if (!Array.isArray(txs)) txs = [txs];
+
+			const shuffledTxs = shuffleOutputs ? shuffleArray(txs) : txs;
+			let index = 0;
+			for (const tx of shuffledTxs) {
+				const updateSendTransactionRes = this.transaction.updateSendTransaction(
+					{
+						transaction: {
+							label: tx.message,
+							outputs: [{ address: tx.address, value: tx.amount, index }]
+						}
+					}
+				);
+				if (updateSendTransactionRes.isErr())
+					return err(updateSendTransactionRes.error.message);
+				index++;
+			}
+
+			const updateFeeRes = this.transaction.updateFee({ satsPerByte });
+			if (updateFeeRes.isErr()) {
+				if (updateFeeRes.error.message.includes('Unable to increase the fee')) {
+					const feeInfo = this.getFeeInfo({ satsPerByte: 1 });
+					if (feeInfo.isOk()) {
+						return err(
+							`Fee is too high. The maximum fee for this transaction is ${feeInfo.value.maxSatPerByte}`
+						);
+					}
+				}
+				// The fee probe above only refines the message. Either way the fee
+				// was never updated, so never fall through to build and broadcast.
+				return err(updateFeeRes.error.message);
+			}
+
+			const createRes = await this.transaction.createTransaction({
+				shuffleOutputs
+			});
+			if (createRes.isErr()) return err(createRes.error.message);
+			const { hex } = createRes.value;
+			if (!broadcast) {
+				return ok(hex);
+			}
+			const broadcastRes = await this.electrum.broadcastTransaction({
+				rawTx: hex
+			});
+			if (broadcastRes.isErr()) return err(broadcastRes.error.message);
+			return ok(broadcastRes.value);
+		} finally {
+			await this.transaction.clearStoredSendTransaction();
 		}
-		const broadcastRes = await this.electrum.broadcastTransaction({
-			rawTx: hex
-		});
-		if (broadcastRes.isErr()) return err(broadcastRes.error.message);
-		return ok(broadcastRes.value);
 	}
 
 	/**
@@ -4416,34 +5051,40 @@ export class Wallet {
 		if (!this.data.utxos.length) {
 			return err('No UTXOs available.');
 		}
+		// Same working-area rule as sendMany: empty on entry, dropped from
+		// storage on exit, live copy readable until the next call.
 		await this.resetSendTransaction();
-		const setupTransactionRes = await this.transaction.setupTransaction();
-		if (setupTransactionRes.isErr()) {
-			return err(setupTransactionRes.error.message);
-		}
-		const sendMaxRes = await this.transaction.sendMax({
-			address,
-			satsPerByte,
-			rbf
-		});
+		try {
+			const setupTransactionRes = await this.transaction.setupTransaction();
+			if (setupTransactionRes.isErr()) {
+				return err(setupTransactionRes.error.message);
+			}
+			const sendMaxRes = await this.transaction.sendMax({
+				address,
+				satsPerByte,
+				rbf
+			});
 
-		if (sendMaxRes.isErr()) {
-			return err(sendMaxRes.error.message);
-		}
+			if (sendMaxRes.isErr()) {
+				return err(sendMaxRes.error.message);
+			}
 
-		const createRes = await this.transaction.createTransaction({
-			shuffleOutputs: true
-		});
-		if (createRes.isErr()) return err(createRes.error.message);
-		const { hex } = createRes.value;
-		if (!broadcast) {
-			return ok(hex);
+			const createRes = await this.transaction.createTransaction({
+				shuffleOutputs: true
+			});
+			if (createRes.isErr()) return err(createRes.error.message);
+			const { hex } = createRes.value;
+			if (!broadcast) {
+				return ok(hex);
+			}
+			const broadcastRes = await this.electrum.broadcastTransaction({
+				rawTx: hex
+			});
+			if (broadcastRes.isErr()) return err(broadcastRes.error.message);
+			return ok(broadcastRes.value);
+		} finally {
+			await this.transaction.clearStoredSendTransaction();
 		}
-		const broadcastRes = await this.electrum.broadcastTransaction({
-			rawTx: hex
-		});
-		if (broadcastRes.isErr()) return err(broadcastRes.error.message);
-		return ok(broadcastRes.value);
 	}
 
 	/**
@@ -4544,6 +5185,7 @@ export class Wallet {
 			});
 			if (psbtRes.isErr()) return err(psbtRes.error.message);
 			const psbt = psbtRes.value;
+			this._rememberBuiltPsbt(psbt);
 			const txData = this.transaction.data;
 			const inputValue = this.transaction.getTransactionInputValue({
 				inputs: txData.inputs
@@ -4587,6 +5229,11 @@ export class Wallet {
 			});
 		} catch (e) {
 			return err(e);
+		} finally {
+			// The response carries everything the caller needs, and none of
+			// the later steps (signPsbtWithOurKey, combinePsbts,
+			// importSignedPsbt) reads the staged send.
+			await this.transaction.clearStoredSendTransaction();
 		}
 	}
 
@@ -4594,26 +5241,40 @@ export class Wallet {
 	 * Imports an externally signed PSBT, validates that EVERY input carries a
 	 * valid signature, finalizes and extracts the transaction WITHOUT
 	 * broadcasting it. Broadcast separately via broadcastTransaction.
+	 * The PSBT must spend the same inputs to the same outputs as one this
+	 * wallet's buildPsbt returned, or as unsignedPsbtBase64 when given (a PSBT
+	 * built by another instance, e.g. a multisig cosigner). Inputs the signer
+	 * already finalized are refused, since their signatures cannot be checked.
 	 * Multisig (P2WSH m-of-n witnessScript) inputs finalize only when at
 	 * least m VALID partial signatures from script keys are present; below
 	 * the threshold the error names how many signatures it has and needs.
+	 * Errs when an input spends a previous output that disagrees with its
+	 * witnessUtxo or this wallet's UTXO, since cosigners with no record of
+	 * the coin can only check the PSBT against itself.
 	 * @param {string} psbtBase64
+	 * @param {string} [unsignedPsbtBase64] the PSBT buildPsbt returned
 	 * @returns {Result<IImportSignedPsbtResponse>}
 	 */
 	public importSignedPsbt(
-		psbtBase64: string
+		psbtBase64: string,
+		unsignedPsbtBase64?: string
 	): Result<IImportSignedPsbtResponse> {
 		try {
 			if (!psbtBase64) return err('No PSBT provided.');
 			const network = this.getBitcoinNetwork();
 			const psbt = bitcoin.Psbt.fromBase64(psbtBase64, { network });
 			if (psbt.inputCount === 0) return err('PSBT has no inputs.');
+			const buildRes = this._checkAgainstBuild(psbt, unsignedPsbtBase64);
+			if (buildRes.isErr()) return err(buildRes.error.message);
 			for (let i = 0; i < psbt.inputCount; i++) {
+				const prevOutCheck = this._checkPsbtPrevOut(psbt, i);
+				if (prevOutCheck.isErr()) return err(prevOutCheck.error.message);
 				const input = psbt.data.inputs[i];
-				// Inputs already finalized by the signer carry their signature in
-				// the final script and cannot be re-validated via partialSig.
-				const finalized = !!(input.finalScriptSig || input.finalScriptWitness);
-				if (finalized) continue;
+				if (input.finalScriptSig || input.finalScriptWitness) {
+					return err(
+						`Input ${i} is already finalized, so its signature cannot be checked. Import the PSBT before it is finalized.`
+					);
+				}
 				const hasSignature =
 					(input.partialSig?.length ?? 0) > 0 ||
 					!!input.tapKeySig ||
@@ -4641,6 +5302,112 @@ export class Wallet {
 		} catch (e) {
 			return err(e);
 		}
+	}
+
+	/**
+	 * Refuses a PSBT unless its unsigned transaction (every input outpoint and
+	 * sequence, every output script and value) and the previous output each
+	 * input claims to spend are those of the build: unsignedPsbtBase64 when
+	 * given, otherwise a PSBT this wallet's buildPsbt returned.
+	 * @private
+	 * @param {bitcoin.Psbt} psbt
+	 * @param {string} [unsignedPsbtBase64]
+	 * @returns {Result<string>}
+	 */
+	private _checkAgainstBuild(
+		psbt: bitcoin.Psbt,
+		unsignedPsbtBase64?: string
+	): Result<string> {
+		const unsignedTx = psbt.data.getTransaction().toString('hex');
+		let built: bitcoin.TxOutput[] | undefined;
+		if (unsignedPsbtBase64) {
+			const unsigned = bitcoin.Psbt.fromBase64(unsignedPsbtBase64, {
+				network: this.getBitcoinNetwork()
+			});
+			if (unsigned.data.getTransaction().toString('hex') !== unsignedTx) {
+				return err(
+					'The PSBT does not spend the same inputs to the same outputs as the unsigned PSBT.'
+				);
+			}
+			built = this._psbtPrevouts(unsigned);
+		} else {
+			built = this._builtPsbts.get(unsignedTx);
+			if (!built) {
+				return err(
+					'The PSBT does not match any this wallet built: its inputs or outputs were changed, or it was built elsewhere (pass the unsigned PSBT to import it).'
+				);
+			}
+		}
+		const prevouts = this._psbtPrevouts(psbt);
+		for (let i = 0; i < prevouts.length; i++) {
+			if (
+				!prevouts[i].script.equals(built[i].script) ||
+				prevouts[i].value !== built[i].value
+			) {
+				return err(
+					`Input ${i} claims a different previous output than the one built.`
+				);
+			}
+		}
+		return ok('The PSBT matches the build.');
+	}
+
+	/**
+	 * Records the previous outputs of a PSBT buildPsbt is about to return, so
+	 * importSignedPsbt can recognise it. Only the newest
+	 * MAX_REMEMBERED_PSBT_BUILDS are kept.
+	 * @private
+	 * @param {bitcoin.Psbt} psbt
+	 */
+	private _rememberBuiltPsbt(psbt: bitcoin.Psbt): void {
+		const unsignedTx = psbt.data.getTransaction().toString('hex');
+		this._builtPsbts.delete(unsignedTx);
+		this._builtPsbts.set(unsignedTx, this._psbtPrevouts(psbt));
+		for (const oldest of this._builtPsbts.keys()) {
+			if (this._builtPsbts.size <= MAX_REMEMBERED_PSBT_BUILDS) break;
+			this._builtPsbts.delete(oldest);
+		}
+	}
+
+	/**
+	 * The previous output (script and value) each PSBT input spends, from its
+	 * witnessUtxo or the output of nonWitnessUtxo the input points at. bitcoinjs
+	 * checks segwit v0 signatures against nonWitnessUtxo when present and
+	 * taproot ones against witnessUtxo, so an input carrying both is refused
+	 * unless they agree. Throws when an input carries neither, its
+	 * nonWitnessUtxo is another transaction, or the two disagree.
+	 * @private
+	 * @param {bitcoin.Psbt} psbt
+	 * @returns {bitcoin.TxOutput[]}
+	 */
+	private _psbtPrevouts(psbt: bitcoin.Psbt): bitcoin.TxOutput[] {
+		return psbt.txInputs.map((txInput, i) => {
+			const { witnessUtxo, nonWitnessUtxo } = psbt.data.inputs[i];
+			let prevOut: bitcoin.TxOutput | undefined = witnessUtxo;
+			if (nonWitnessUtxo) {
+				const prevTx = bitcoin.Transaction.fromBuffer(nonWitnessUtxo);
+				const out = prevTx.getHash().equals(txInput.hash)
+					? prevTx.outs[txInput.index]
+					: undefined;
+				if (!out) {
+					throw new Error(`Input ${i} does not carry the output it spends.`);
+				}
+				if (
+					witnessUtxo &&
+					(!witnessUtxo.script.equals(out.script) ||
+						witnessUtxo.value !== out.value)
+				) {
+					throw new Error(
+						`Input ${i} carries two different records of the output it spends.`
+					);
+				}
+				prevOut = out;
+			}
+			if (!prevOut) {
+				throw new Error(`Input ${i} does not carry the output it spends.`);
+			}
+			return { script: prevOut.script, value: prevOut.value };
+		});
 	}
 
 	/**
@@ -4719,8 +5486,10 @@ export class Wallet {
 	 * Adds OUR partial signature(s) to a PSBT without finalizing it (multisig
 	 * cosigner flow). Inputs are matched through their bip32Derivation
 	 * entries: any entry whose pubkey equals the key this wallet derives at
-	 * that path gets signed. Inputs we already signed are skipped. Requires
-	 * the mnemonic; watch-only wallets get the typed WatchOnlySigningError.
+	 * that path gets signed. Inputs we already signed are skipped. Errs when
+	 * an input we would sign spends a previous output that disagrees with its
+	 * witnessUtxo or this wallet's UTXO. Requires the mnemonic; watch-only
+	 * wallets get the typed WatchOnlySigningError.
 	 * @param {string} psbtBase64
 	 * @returns {Result<string>} The PSBT (base64) including our signatures.
 	 */
@@ -4747,7 +5516,11 @@ export class Wallet {
 					const alreadySigned = (input.partialSig ?? []).some((ps) =>
 						ps.pubkey.equals(keyPair.publicKey)
 					);
-					if (!alreadySigned) psbt.signInput(i, keyPair);
+					if (!alreadySigned) {
+						const prevOutCheck = this._checkPsbtPrevOut(psbt, i);
+						if (prevOutCheck.isErr()) return err(prevOutCheck.error.message);
+						psbt.signInput(i, keyPair);
+					}
 					break;
 				}
 			}
@@ -4760,6 +5533,68 @@ export class Wallet {
 		} catch (e) {
 			return err(e);
 		}
+	}
+
+	/**
+	 * Refuses input i unless the previous output its signature commits
+	 * to agrees with the input's witnessUtxo and with this wallet's record of
+	 * the coin. bitcoinjs signs segwit v0 and legacy inputs over the output in
+	 * nonWitnessUtxo when present, while buildPsbt priced the fee from the
+	 * server-reported value (also written to witnessUtxo). A real previous
+	 * transaction added later for an under-reported coin would otherwise get
+	 * a valid signature that pays the difference as fee. A cosigner that has
+	 * no record of the coin still checks witnessUtxo.
+	 * @private
+	 * @param {bitcoin.Psbt} psbt
+	 * @param {number} i
+	 * @returns {Result<string>}
+	 */
+	private _checkPsbtPrevOut(psbt: bitcoin.Psbt, i: number): Result<string> {
+		const { witnessUtxo, nonWitnessUtxo } = psbt.data.inputs[i];
+		const { hash, index } = psbt.txInputs[i];
+		const txid = Buffer.from(hash).reverse().toString('hex');
+		const outpoint = `${txid}:${index}`;
+		let prevOut: bitcoin.TxOutput | undefined = witnessUtxo;
+		if (nonWitnessUtxo) {
+			const prevTx = bitcoin.Transaction.fromBuffer(nonWitnessUtxo);
+			prevOut = prevTx.getHash().equals(hash) ? prevTx.outs[index] : undefined;
+			if (!prevOut) {
+				return err(
+					`Input ${i}: nonWitnessUtxo is not the transaction holding ${outpoint}.`
+				);
+			}
+		}
+		if (!prevOut) return err(`Input ${i} does not carry the output it spends.`);
+		const records: { source: string; script: Buffer; value: number }[] = [];
+		if (witnessUtxo) {
+			records.push({ source: 'its witnessUtxo', ...witnessUtxo });
+		}
+		const utxo = this.data.utxos.find(
+			(u) => u.tx_hash.toLowerCase() === txid && u.tx_pos === index
+		);
+		if (utxo) {
+			records.push({
+				source: 'this wallet',
+				script: bitcoin.address.toOutputScript(
+					utxo.address,
+					this.getBitcoinNetwork()
+				),
+				value: utxo.value
+			});
+		}
+		for (const record of records) {
+			if (!prevOut.script.equals(record.script)) {
+				return err(
+					`Input ${i}: ${outpoint} pays a different script than ${record.source} records.`
+				);
+			}
+			if (prevOut.value !== record.value) {
+				return err(
+					`Input ${i}: ${outpoint} holds ${prevOut.value} sats, not the ${record.value} ${record.source} records.`
+				);
+			}
+		}
+		return ok('Previous output matches.');
 	}
 
 	/**
@@ -5002,6 +5837,11 @@ export class Wallet {
 			return err(txResponse.error.message);
 		}
 		const txData = txResponse.value.data;
+		// canBoost only reads the height stored at the last refresh. A replacement
+		// for a transaction that has since confirmed is rejected by every node.
+		if ((txData[0]?.result?.confirmations ?? 0) > 0) {
+			return err('Transaction is already confirmed. Unable to RBF.');
+		}
 
 		const wallet = this.data;
 		const addressTypeKeys = objectKeys(EAddressType);
@@ -5064,9 +5904,6 @@ export class Wallet {
 				});
 				if (tx.isErr()) {
 					return err(tx.error.message);
-				}
-				if (tx.value.data[0].data.height > 0) {
-					return err('Transaction is already confirmed. Unable to RBF.');
 				}
 				const txVout = tx.value.data[0].result.vout[input.vout];
 				if (txVout.scriptPubKey?.address) {
@@ -5192,17 +6029,23 @@ export class Wallet {
 		if (txid in unconfirmed) {
 			delete unconfirmed[txid];
 		}
+		// No longer observed, so a count of its misses is over (issue #935).
+		this._noTxindexMisses.delete(txid);
 		await this.saveWalletData('transactions', transactions);
 		await this.saveWalletData('unconfirmedTransactions', unconfirmed);
 	}
 
 	/**
-	 * Sets "exists" to false for a given on-chain transaction id.
+	 * Sets "exists" to false for a given on-chain transaction id. A refresh
+	 * whose lookup goes out after this and gets the transaction from the server
+	 * sets it back to true (issue #945). One whose lookup was already in flight
+	 * leaves it false and does not watch it again (issue #964).
 	 * @param {string} txid
 	 */
 	async addGhostTransaction({ txid }: { txid: string }): Promise<void> {
 		if (txid in this._data.transactions) {
 			this._data.transactions[txid].exists = false;
+			this._ghostClearings.set(txid, (this._ghostClearings.get(txid) ?? 0) + 1);
 		}
 		await this.saveWalletData('transactions', this._data.transactions);
 	}
@@ -5475,13 +6318,20 @@ export class Wallet {
 
 	/**
 	 * Used to temporarily update the balance until the Electrum server catches up after sending a transaction.
+	 * The write is not awaited; a refusal of it is logged.
 	 * @param {number} balance
 	 * @returns {Result<string>}
 	 */
 	public updateWalletBalance({ balance }: { balance: number }): Result<string> {
 		try {
 			this._data.balance = balance;
-			void this.saveWalletData('balance', balance);
+			void this.saveWalletData('balance', balance).then((saved) => {
+				if (saved.isErr()) {
+					this.logger.error(
+						`Failed to persist the balance: ${saved.error.message}`
+					);
+				}
+			});
 			return ok('Successfully updated balance.');
 		} catch (e) {
 			return err(e);
@@ -5607,44 +6457,51 @@ export class Wallet {
 			utxos = [...walletUtxos, ...utxos];
 		}
 		await this.transaction.resetSendTransaction();
-		await this.transaction.setupTransaction({
-			satsPerByte,
-			utxos,
-			outputs: [{ address: toAddress, value: balance, index: 0 }]
-		});
-		const sendMaxRes = await this.transaction.sendMax({
-			address: toAddress,
-			satsPerByte,
-			transaction: {
-				...this.transaction.data,
-				outputs: [{ address: toAddress, value: balance, index: 0 }],
-				inputs: utxos,
-				satsPerByte
+		try {
+			await this.transaction.setupTransaction({
+				satsPerByte,
+				utxos,
+				outputs: [{ address: toAddress, value: balance, index: 0 }]
+			});
+			const sendMaxRes = await this.transaction.sendMax({
+				address: toAddress,
+				satsPerByte,
+				transaction: {
+					...this.transaction.data,
+					outputs: [{ address: toAddress, value: balance, index: 0 }],
+					inputs: utxos,
+					satsPerByte
+				}
+			});
+			if (sendMaxRes.isErr()) {
+				return err(sendMaxRes.error.message);
 			}
-		});
-		if (sendMaxRes.isErr()) {
-			return err(sendMaxRes.error.message);
-		}
-		const createRes = await this.transaction.createTransaction({});
-		if (createRes.isErr()) {
-			return err(createRes.error.message);
-		}
-		const response = {
-			...createRes.value,
-			balance
-		};
-		if (!broadcast) {
+			const createRes = await this.transaction.createTransaction({});
+			if (createRes.isErr()) {
+				return err(createRes.error.message);
+			}
+			const response = {
+				...createRes.value,
+				balance
+			};
+			if (!broadcast) {
+				return ok(response);
+			}
+			const broadcastResponse = await this.electrum.broadcastTransaction({
+				rawTx: response.hex,
+				subscribeToOutputAddress: false
+			});
+			if (broadcastResponse.isErr()) {
+				return err(broadcastResponse.error.message);
+			}
+			response.id = broadcastResponse.value;
 			return ok(response);
+		} finally {
+			// The staged inputs carry the swept key pair, so the live copy goes
+			// too, not only the stored one (#1011). The response already holds
+			// the hex and the balance.
+			await this.transaction.resetSendTransaction();
 		}
-		const broadcastResponse = await this.electrum.broadcastTransaction({
-			rawTx: response.hex,
-			subscribeToOutputAddress: false
-		});
-		if (broadcastResponse.isErr()) {
-			return err(broadcastResponse.error.message);
-		}
-		response.id = broadcastResponse.value;
-		return ok(response);
 	}
 
 	public getAddressInfoFromScriptHash(scriptHash: string): Result<{

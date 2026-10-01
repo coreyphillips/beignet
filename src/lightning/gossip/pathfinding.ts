@@ -7,6 +7,7 @@
 
 import {
 	IGraphChannel,
+	IChannelUpdateMessage,
 	IRoute,
 	IRouteHop,
 	CHANNEL_FLAG_DISABLED,
@@ -19,6 +20,57 @@ import { IRoutingHintHop } from '../invoice/types';
 
 /** Default max hops per BOLT 4. */
 const DEFAULT_MAX_HOPS = 20;
+
+/**
+ * Payment-scoped channel policies (issue #1056). A fee_insufficient,
+ * incorrect_cltv_expiry or amount_below_minimum failure carries the erring
+ * node's signed channel_update for its outgoing channel. BOLT 4 lets the
+ * origin consider that update when retrying the same payment and forbids
+ * applying it to the network graph, so a retry hands the router these
+ * instead: the router substitutes each one for the graph's copy of the same
+ * edge and nothing else ever reads them. Keyed by policyOverrideKey.
+ */
+export type TPolicyOverrides = Map<string, IChannelUpdateMessage>;
+
+/**
+ * Key of an edge's policy override: its SCID plus the BOLT 7 direction bit
+ * of the node forwarding over it (0 when that node is the numerically lesser
+ * of the channel's two node ids).
+ */
+export function policyOverrideKey(scidHex: string, direction: number): string {
+	return `${scidHex}:${direction & 1}`;
+}
+
+/**
+ * The BOLT 7 direction bit of the edge upstream -> downstream. Node ids are
+ * fixed-length lowercase hex, so string order is numeric order.
+ */
+export function edgeDirection(
+	upstreamHex: string,
+	downstreamHex: string
+): number {
+	return upstreamHex < downstreamHex ? 0 : 1;
+}
+
+/**
+ * The policy the router uses for one edge: the retry's payment-scoped
+ * override when it holds one for this edge, else the graph's update. An
+ * override never adds an edge the graph has no update for.
+ */
+function policyFor(
+	update: IChannelUpdateMessage | undefined,
+	policyOverrides: TPolicyOverrides | undefined,
+	scidHex: string,
+	upstreamHex: string,
+	downstreamHex: string
+): IChannelUpdateMessage | undefined {
+	if (!update || !policyOverrides) return update;
+	return (
+		policyOverrides.get(
+			policyOverrideKey(scidHex, edgeDirection(upstreamHex, downstreamHex))
+		) ?? update
+	);
+}
 
 /**
  * Per-hop reliability penalty (msat) added to the routing cost for every hop.
@@ -437,7 +489,8 @@ export function findRoute(
 	maxCltvExpiry: number = DEFAULT_MAX_CLTV_EXPIRY,
 	routingHints?: IRoutingHintHop[][],
 	currentTimestamp?: number,
-	localChannels?: ILocalChannelEdge[]
+	localChannels?: ILocalChannelEdge[],
+	policyOverrides?: TPolicyOverrides
 ): IRoute | null {
 	const sourceHex = source.toString('hex');
 	const destHex = destination.toString('hex');
@@ -550,6 +603,16 @@ export function findRoute(
 				}
 			}
 
+			// A retry's payment-scoped policy for this edge replaces the
+			// graph's copy (issue #1056); the graph itself is never written
+			// from a failure (issue #182).
+			update = policyFor(
+				update,
+				policyOverrides,
+				scidHex,
+				upstreamNodeHex,
+				current.nodeId
+			);
 			if (!update) continue;
 
 			// Skip disabled channels
@@ -706,7 +769,8 @@ export function findMultiPathRoute(
 	currentTimestamp?: number,
 	localChannels?: ILocalChannelEdge[],
 	excludedChannels?: Set<string>,
-	maxCltvExpiry: number = DEFAULT_MAX_CLTV_EXPIRY
+	maxCltvExpiry: number = DEFAULT_MAX_CLTV_EXPIRY,
+	policyOverrides?: TPolicyOverrides
 ): IMultiPathRoute | null {
 	// Track used capacity per SCID to avoid reusing same liquidity
 	const usedCapacity = new Map<string, bigint>();
@@ -728,7 +792,8 @@ export function findMultiPathRoute(
 			currentTimestamp,
 			localChannels,
 			excludedChannels,
-			maxCltvExpiry
+			maxCltvExpiry,
+			policyOverrides
 		);
 
 		// If that fails, try halving the amount until we find a path or give up
@@ -748,7 +813,8 @@ export function findMultiPathRoute(
 					currentTimestamp,
 					localChannels,
 					excludedChannels,
-					maxCltvExpiry
+					maxCltvExpiry,
+					policyOverrides
 				);
 				if (route) break;
 				tryAmount = tryAmount / 2n;
@@ -803,7 +869,8 @@ function findRouteWithCapacityLimits(
 	currentTimestamp?: number,
 	localChannels?: ILocalChannelEdge[],
 	excludedChannels?: Set<string>,
-	maxCltvExpiry: number = DEFAULT_MAX_CLTV_EXPIRY
+	maxCltvExpiry: number = DEFAULT_MAX_CLTV_EXPIRY,
+	policyOverrides?: TPolicyOverrides
 ): IRoute | null {
 	const sourceHex = source.toString('hex');
 	const destHex = destination.toString('hex');
@@ -885,6 +952,15 @@ function findRouteWithCapacityLimits(
 				}
 			}
 
+			// A retry's payment-scoped policy replaces the graph's (see
+			// findRoute, issue #1056).
+			update = policyFor(
+				update,
+				policyOverrides,
+				scidHex,
+				upstreamNodeHex,
+				current.nodeId
+			);
 			if (!update) continue;
 			if ((update.channelFlags & CHANNEL_FLAG_DISABLED) !== 0) continue;
 
@@ -1009,7 +1085,16 @@ import { IBlindedPath, IBlindedPayInfo } from '../onion/blinded-path';
  * The blinded section's aggregate fee/CLTV (payInfo) is paid at the
  * introduction node: we route `amountMsat + blindedFee` to it with
  * `finalCltvExpiry + payInfo.cltvExpiryDelta` of headroom, and the recipient
- * still receives exactly `amountMsat`.
+ * still receives exactly `amountMsat`. The payinfo is written by the payee,
+ * so its fee is part of what the route reports as `totalFeeMsat` (public
+ * hops plus the blinded section, issue #1001). Its htlc bounds apply to
+ * `amountMsat`, the amount the RECIPIENT receives: every writer expresses
+ * them net of the path's fees (LDK subtracts each relay fee, eclair seeds
+ * the maximum with the invoice amount, CLN and LND take the post-fee
+ * channel limits, and our own builder uses the peer's channel maximum),
+ * so judging the fee-inclusive amount at the introduction node would refuse
+ * every invoice whose maximum equals its amount. A maximum of 0 admits
+ * nothing (no known writer emits one; the FFOR issuer maps 0 to 21M BTC).
  *
  * @param graph - The network graph
  * @param source - 33-byte source node public key
@@ -1018,7 +1103,9 @@ import { IBlindedPath, IBlindedPayInfo } from '../onion/blinded-path';
  * @param amountMsat - Amount to deliver to the recipient (in millisatoshis)
  * @param finalCltvExpiry - CLTV expiry delta for the final hop
  * @param maxHops - Maximum number of hops (default 20)
- * @returns Combined route or null if no path to introduction node
+ * @returns Combined route, or null if there is no path to the introduction
+ *   node or `amountMsat` falls outside the payinfo's htlc_minimum_msat /
+ *   htlc_maximum_msat
  */
 export function findRouteToBlindedPath(
 	graph: NetworkGraph,
@@ -1031,7 +1118,8 @@ export function findRouteToBlindedPath(
 	excludedChannels?: Set<string>,
 	missionControl?: MissionControl,
 	localChannels?: ILocalChannelEdge[],
-	maxCltvExpiry: number = DEFAULT_MAX_CLTV_EXPIRY
+	maxCltvExpiry: number = DEFAULT_MAX_CLTV_EXPIRY,
+	policyOverrides?: TPolicyOverrides
 ): IRoute | null {
 	const hops = blindedPath.blindedHops;
 	if (hops.length === 0) return null;
@@ -1042,6 +1130,17 @@ export function findRouteToBlindedPath(
 		(amountMsat * BigInt(payInfo.feeProportionalMillionths)) / 1_000_000n;
 	const amountAtIntro = amountMsat + blindedFeeMsat;
 	const cltvAtIntro = finalCltvExpiry + payInfo.cltvExpiryDelta;
+	// The payinfo's htlc bounds are the blinded section's aggregate limits as
+	// seen by the recipient, so they are judged on amountMsat and never on
+	// the fee-inclusive amountAtIntro (see the doc comment). The decoder reads
+	// both as plain u64s (there is no "absent" encoding), so a payee that
+	// wrote a maximum of 0 admits nothing, as a relay with that policy would.
+	if (
+		amountMsat < payInfo.htlcMinimumMsat ||
+		amountMsat > payInfo.htlcMaximumMsat
+	) {
+		return null;
+	}
 
 	const introNodeId = blindedPath.introductionNodeId;
 	const sourceHex = source.toString('hex');
@@ -1095,7 +1194,8 @@ export function findRouteToBlindedPath(
 		undefined,
 		// Use our local channel edges so a direct channel to the introduction node
 		// is usable even when it isn't in the public gossip graph (interop, private).
-		localChannels
+		localChannels,
+		policyOverrides
 	);
 	if (!routeToIntro) return null;
 
@@ -1105,10 +1205,15 @@ export function findRouteToBlindedPath(
 
 	const combinedHops = [...routeToIntro.hops, ...tail.slice(1)];
 
+	// The fee is everything we send beyond what the recipient receives: the
+	// public hops' fees (routeToIntro prices those against amountAtIntro) plus
+	// the blinded section's own fee. Reporting only routeToIntro.totalFeeMsat
+	// hid the payee-written part from every fee cap and every payment record
+	// (a direct channel to the introduction node reported 0, issue #1001).
 	return {
 		hops: combinedHops,
 		totalAmountMsat: routeToIntro.totalAmountMsat,
 		totalCltvDelta: routeToIntro.totalCltvDelta,
-		totalFeeMsat: routeToIntro.totalFeeMsat
+		totalFeeMsat: routeToIntro.totalAmountMsat - amountMsat
 	};
 }

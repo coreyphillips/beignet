@@ -176,8 +176,9 @@ still without running a swap:
   checked to hash to it. `verifiedThisSession` is false until the first
   observation after a restart; recorded depths are not trusted before then.
 - **Exposure policy** (`exposure.ts`): minimum and maximum swap size, total
-  principal at risk, concurrency, fee-rate ceiling and an optional fee
-  reserve check when a balance is supplied.
+  principal at risk, how many swaps may have principal at risk at once (an
+  unpaid create is free to make, so it never counts), fee-rate ceiling and an
+  optional fee reserve check when a balance is supplied.
 
 `INodeConfig.swaps.enabled` builds and rehydrates the ledger at construction;
 `swapChain()` and `getSwapKeyDeriver()` are the node's seams for an engine.
@@ -196,7 +197,7 @@ even types required, odd optional):
 |---|---|
 | `SWAP_QUOTE_REQUEST` / `SWAP_QUOTE` | direction, amount; fee terms, limits, refund delta, confirmations, the fee on this amount and the invoice amount. Stateless. |
 | `SWAP_CREATE` / `SWAP_CREATE_ACK` | the client's payment hash, claim key, on-chain amount and fee ceiling; the swap id, hold invoice, refund key and height, contract script and address, and every amount. A refusal carries a typed reason. |
-| `SWAP_STATUS_REQUEST` / `SWAP_STATUS` | the provider's view of one swap, answered only to the peer that created it: state, funding outpoint and depth, the raw funding transaction, the winning resolution. |
+| `SWAP_STATUS_REQUEST` / `SWAP_STATUS` | the provider's view of one swap, answered only to the peer that created it: state, funding outpoint and depth, the raw funding transaction once confirmed, the winning resolution. |
 | `SWAP_SUBMARINE_CREATE` (54) / `SWAP_SUBMARINE_CREATE_ACK` (55) | the submarine direction (issue #743): the client's payment hash, refund key, its own invoice for the on-chain amount minus the fee, the on-chain amount and fee ceiling; the swap id, the provider's claim key, refund height, contract script and address, every amount, the depth the funding must reach before the provider pays, the deadline for funding and, informationally, the absolute expiry ceiling the provider's payment is bound by. Quote and status carry `direction`; `SwapWireState` gained the submarine states 12 to 19. |
 
 The client receives exactly `onchainAmountSat`; the invoice is that plus
@@ -205,14 +206,17 @@ derived from the peer and the hash, so an identical repeated create returns
 the same ack and any other reuse of a hash is refused. `verifyReverseSwapTerms`
 (`client.ts`) is the pure check a client runs before paying: it rebuilds the
 contract from its own hash and claim key plus the ack's refund key and height
-and requires the ack's script, address, invoice and amounts to agree.
+and requires the ack's script, address, invoice and amounts to agree. It also
+bounds the invoice's final CLTV at the refund delta plus `maxFinalCltvMargin`
+(default 144): that is how long the payment stays locked if the provider
+never funds.
 
 Lifecycle, every arrow a compare-and-swap on the ledger row, persisted BEFORE
 the action it licenses:
 
 ```text
 CREATED  record inserted, then the hold invoice minted with a final CLTV of
-         refundDelta + resolution margin + the sweeper's margin + 8
+         the swap's refund delta + resolution margin + the sweeper's margin + 8
 HELD     the COMPLETE committed set admitted through validateReverseSwapAdmission,
          the sweeper's cancel height checked against the refund height, exposure
          re-checked; a partial MPP set never funds
@@ -235,8 +239,18 @@ EXPOSED  the node's own sweeper cancelled the hold while coins were, or may
          refund still recovers the coins, a late claim still records its
          preimage, swap:exposed is emitted at error level
 CANCELLED / FAILED before any funds moved (FAILED from FUNDING only while no
-         bytes were ever signed)
+         bytes were ever signed), or from EXPOSED for a funding that never
+         confirmed (see below)
 ```
+
+An EXPOSED row whose funding the chain does not show past `refundHeight +
+resolutionSafetyBlocks` is stranded: its hold is gone and nothing renews its
+inputs' pledge. It fails on its own once another transaction spending one of
+those inputs reaches `resolutionConfirmations`, since then the bytes can
+never confirm. An empty answer from the backend proves nothing, so short of
+that the row only gets `strandedHeight`, which `POST /swaps/cancel` accepts:
+the operator vouches the bytes will not confirm (spending the inputs makes
+sure). The mark is cleared when the funding reappears and on reload.
 
 Rules the engine never breaks: a hold is never cancelled because the refund
 height passed or a refund was broadcast; a claim beats a pending refund; a
@@ -275,9 +289,9 @@ fee with no replacement; a chain stall long enough that the sweeper's cancel
 height arrives before the refund resolves (bounded by the admission margins,
 never eliminated); no fee estimate fails quotes closed rather than guessing.
 
-Daemon: `GET /swaps/status`, `GET /swaps`, `POST /swaps/cancel` (CREATED or
-HELD only); env `BEIGNET_SWAPS`, `BEIGNET_SWAP_FLAT_FEE_SAT`,
-`BEIGNET_SWAP_FEE_PPM`, `BEIGNET_SWAP_MIN_SAT`, `BEIGNET_SWAP_MAX_SAT`,
+Daemon: `GET /swaps/status`, `GET /swaps`, `POST /swaps/cancel` (CREATED,
+HELD, or a stranded EXPOSED row); env `BEIGNET_SWAPS`,
+`BEIGNET_SWAP_FLAT_FEE_SAT`, `BEIGNET_SWAP_FEE_PPM`, `BEIGNET_SWAP_MIN_SAT`, `BEIGNET_SWAP_MAX_SAT`,
 `BEIGNET_SWAP_MAX_EXPOSURE_SAT`, `BEIGNET_SWAP_MAX_CONCURRENT`,
 `BEIGNET_SWAP_REFUND_DELTA_BLOCKS`, `BEIGNET_SWAP_FUNDING_CONFS`,
 `BEIGNET_SWAP_RESOLUTION_CONFS`; events `swap:created`, `swap:held`,

@@ -10,6 +10,7 @@
 import * as http from 'http';
 import * as fs from 'fs';
 import * as nodePath from 'path';
+import { randomBytes } from 'crypto';
 import { generateMnemonic } from '../utils/helpers';
 import {
 	loadConfig,
@@ -20,11 +21,15 @@ import {
 	removePidFile,
 	getDaemonPort
 } from './config';
-import { startDaemon } from './daemon';
+import { AUTH_OFF_WARNING, startDaemon } from './daemon';
 import { daemonOptions } from './daemon-options';
 import { defaultDataDirForMnemonic } from './beignet-node';
 import { performDbRestore } from './restore';
+import { deriveBackupMacKey } from './backup-mac';
+import * as bip39 from 'bip39';
 import { InstanceLockError } from './instance-lock';
+import { installProcessFaultHandlers } from './process-faults';
+import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
 import { ApiResponse, BeignetConfig } from './types';
 
 const args = process.argv.slice(2);
@@ -155,6 +160,17 @@ async function httpRequest(
 	});
 }
 
+/**
+ * Owner-only creation for every file this process makes (issue #1004): the
+ * paths that write secrets set their modes explicitly, but SQLite's WAL and
+ * shm sidecars, backups and anything else created without a mode inherit the
+ * umask. Set here in the CLI only: a host embedding BeignetNode owns its own
+ * process umask, so no library path ever calls this. Windows has no umask.
+ */
+function restrictUmask(): void {
+	if (process.platform !== 'win32') process.umask(0o077);
+}
+
 async function main(): Promise<void> {
 	const cmd = filteredArgs[0];
 
@@ -165,8 +181,10 @@ async function main(): Promise<void> {
 
 	switch (cmd) {
 		case 'init':
+			restrictUmask();
 			return handleInit();
 		case 'start':
+			restrictUmask();
 			return handleStart();
 		case 'stop':
 			return handleStop();
@@ -351,8 +369,10 @@ async function main(): Promise<void> {
 		case 'auth':
 			return handleAuth();
 		case 'backup':
+			restrictUmask();
 			return handleBackup();
 		case 'restore':
+			restrictUmask();
 			return handleRestore();
 		case 'recovery':
 			return handleRecovery();
@@ -367,18 +387,49 @@ async function main(): Promise<void> {
 	}
 }
 
+/** True when the config file or the environment carries an API credential. */
+function hasApiCredential(config: BeignetConfig): boolean {
+	if (config.apiToken) return true;
+	if (Array.isArray(config.apiKeys) && config.apiKeys.length > 0) return true;
+	return Boolean(process.env.BEIGNET_API_TOKEN || process.env.BEIGNET_API_KEYS);
+}
+
+const API_TOKEN_NOTE =
+	'apiToken was generated and saved to config.json; the CLI reads it from there, and HTTP clients send it as "Authorization: Bearer <apiToken>"';
+
+/**
+ * Mint a bearer token for a config that has no credential (issue #1005). A
+ * loopback daemon with no token can be driven by any web page, so every
+ * install `init` creates carries one; an existing token or key set is left
+ * alone and never printed. Returns the minted token, or undefined when the
+ * config already had a credential (in the file or in the environment, where
+ * a minted token would be shadowed and mislead whoever reads the output).
+ */
+function mintApiTokenIfAbsent(config: BeignetConfig): string | undefined {
+	if (hasApiCredential(config)) return undefined;
+	const apiToken = randomBytes(32).toString('hex');
+	config.apiToken = apiToken;
+	return apiToken;
+}
+
 function handleInit(): void {
 	const config = loadConfig();
 	const network = parseFlag('--network') || config.network || 'mainnet';
 	const alias = parseFlag('--alias') || config.alias;
 
 	if (config.mnemonic) {
+		// A config an older release wrote has a mnemonic and no token: it gets
+		// one here, the same way a fresh one does.
+		const apiToken = mintApiTokenIfAbsent(config);
+		if (apiToken) saveConfig(config);
+		// The seed is printed only when it is created: a scripted re-run
+		// would otherwise copy it into whatever logs its output.
 		output({
 			ok: true,
 			result: {
 				message: 'Config already exists',
-				mnemonic: config.mnemonic,
-				network: config.network
+				network: config.network,
+				...(apiToken ? { apiToken, note: API_TOKEN_NOTE } : {})
 			}
 		});
 		return;
@@ -391,9 +442,18 @@ function handleInit(): void {
 		network: network as BeignetConfig['network']
 	};
 	if (alias) newConfig.alias = alias;
+	const apiToken = mintApiTokenIfAbsent(newConfig);
 	saveConfig(newConfig);
 
-	output({ ok: true, result: { message: 'Initialized', mnemonic, network } });
+	output({
+		ok: true,
+		result: {
+			message: 'Initialized',
+			mnemonic,
+			network,
+			...(apiToken ? { apiToken, note: API_TOKEN_NOTE } : {})
+		}
+	});
 }
 
 async function handleStart(): Promise<void> {
@@ -448,6 +508,7 @@ async function handleStart(): Promise<void> {
 	if (tlsKeyFlag) cliFlags.tlsKey = tlsKeyFlag;
 	const torProxyFlag = parseFlag('--tor-proxy');
 	if (torProxyFlag) cliFlags.torProxy = torProxyFlag;
+	if (hasFlag('--tor-proxy-onion-only')) cliFlags.torProxyOnionOnly = true;
 	const announceAddrFlag = parseFlag('--announce-addr');
 	if (announceAddrFlag)
 		cliFlags.announceAddresses = announceAddrFlag
@@ -494,19 +555,39 @@ async function handleStart(): Promise<void> {
 	const isDaemon = hasFlag('--daemon');
 
 	try {
-		const { stop } = await startDaemon(daemonOptions(config, daemonPort));
+		const { stop, logger } = await startDaemon(
+			daemonOptions(config, daemonPort)
+		);
 
-		writePidFile(process.pid, daemonPort);
-		output({
-			ok: true,
-			result: { message: 'Node started', port: daemonPort, pid: process.pid }
-		});
+		// No credential at all (issue #1005): the daemon logs this at warn
+		// level, which the default silent log level swallows, so the CLI says
+		// it on stderr itself whenever the daemon's logger would not.
+		const daemonWarns =
+			config.logLevel === 'debug' ||
+			config.logLevel === 'info' ||
+			config.logLevel === 'warn';
+		if (!hasApiCredential(config) && !daemonWarns) {
+			process.stderr.write(`beignet: warning: ${AUTH_OFF_WARNING}\n`);
+		}
+
+		// A fault nothing caught (an unhandled rejection, an uncaught
+		// exception) is logged with its stack and the process stays up
+		// (issue #1003): Node's default would terminate it, and a node that
+		// exits cannot claim or time out its HTLCs. Registered here, not in
+		// the library, because a host owns its process.
+		installProcessFaultHandlers(logger);
 
 		// Clean shutdown on signals: the same teardown POST /stop runs, so an
 		// in-flight backup completes and SQLite closes before the process ends.
 		// The inner bound caps the node's HTLC drain; the outer one covers a
 		// hang the node's own timeout does not reach (SQLite close, wallet
 		// stop) so Ctrl-C always terminates.
+		// The handlers go in before the pid file and the `Node started` line
+		// announce readiness (issue #968). A supervisor or test that signals
+		// as soon as it sees the banner would otherwise hit the default action
+		// and kill the process with no drain, no wallet stop and the pid file
+		// left behind. removePidFile ignores a missing file, and a signal is
+		// only handled once this synchronous block has written the pid file.
 		const SHUTDOWN_NODE_TIMEOUT_MS = 10_000;
 		const SHUTDOWN_FORCE_EXIT_MS = 15_000;
 		let shuttingDown = false;
@@ -533,6 +614,12 @@ async function handleStart(): Promise<void> {
 		};
 		process.on('SIGINT', shutdown);
 		process.on('SIGTERM', shutdown);
+
+		writePidFile(process.pid, daemonPort);
+		output({
+			ok: true,
+			result: { message: 'Node started', port: daemonPort, pid: process.pid }
+		});
 
 		if (isDaemon) {
 			// Keep running
@@ -646,30 +733,33 @@ function readPsbtArg(arg?: string): string | undefined {
 async function handlePsbt(): Promise<void> {
 	const sub = filteredArgs[1];
 	switch (sub) {
-		case 'build':
+		case 'build': {
+			const pos = positionalArgs();
 			return outputResult(
 				await httpRequest('POST', '/psbt/build', {
 					outputs: [
 						{
-							address: filteredArgs[2],
-							amountSats: parseInt(filteredArgs[3], 10)
+							address: pos[2],
+							amountSats: parseInt(pos[3], 10)
 						}
 					],
-					satsPerVbyte: filteredArgs[4]
-						? parseInt(filteredArgs[4], 10)
-						: undefined
+					satsPerVbyte: pos[4] ? parseInt(pos[4], 10) : undefined
 				})
 			);
-		case 'import-signed':
+		}
+		case 'import-signed': {
+			const pos = positionalArgs();
 			return outputResult(
 				await httpRequest('POST', '/psbt/import-signed', {
-					psbtBase64: readPsbtArg(filteredArgs[2])
+					psbtBase64: readPsbtArg(pos[2]),
+					unsignedPsbtBase64: readPsbtArg(pos[3])
 				})
 			);
+		}
 		case 'combine':
 			return outputResult(
 				await httpRequest('POST', '/psbt/combine', {
-					psbts: filteredArgs
+					psbts: positionalArgs()
 						.slice(2)
 						.map((arg) => readPsbtArg(arg))
 						.filter((psbt): psbt is string => !!psbt)
@@ -681,7 +771,7 @@ async function handlePsbt(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet psbt [build <address> <sats> [satsPerVbyte]|import-signed <psbtBase64|file>|combine <psbt|file> <psbt|file> ...]'
+						'Usage: beignet psbt [build <address> <sats> [satsPerVbyte]|import-signed <psbtBase64|file> [unsignedPsbt|file]|combine <psbt|file> <psbt|file> ...]'
 				}
 			});
 			process.exitCode = 1;
@@ -1663,7 +1753,7 @@ async function handleWebhooks(): Promise<void> {
 					error: {
 						code: 'INVALID_PARAMS',
 						message:
-							'Usage: beignet webhooks register <url> <event,event,...|*> [--secret <secret>]'
+							'Usage: beignet webhooks register <url> <event,event,...|*> [--secret <secret>] [--allow-private-network]'
 					}
 				});
 				process.exitCode = 1;
@@ -1676,7 +1766,8 @@ async function handleWebhooks(): Promise<void> {
 						.split(',')
 						.map((e) => e.trim())
 						.filter((e) => e.length > 0),
-					secret: parseFlag('--secret')
+					secret: parseFlag('--secret'),
+					allowPrivateNetwork: hasFlag('--allow-private-network') || undefined
 				})
 			);
 		}
@@ -2316,15 +2407,22 @@ async function handleOffer(): Promise<void> {
 					offer: filteredArgs[2]
 				})
 			);
-		case 'pay':
+		case 'pay': {
+			// amountSats is positional and optional, so the token after the
+			// offer may already be a flag.
+			const amountArg = filteredArgs[3];
+			const maxFee = parseFlag('--max-fee');
 			return outputResult(
 				await httpRequest('POST', '/offer/pay', {
 					offer: filteredArgs[2],
-					amountSats: filteredArgs[3]
-						? parseInt(filteredArgs[3], 10)
-						: undefined
+					amountSats:
+						amountArg && !amountArg.startsWith('--')
+							? parseInt(amountArg, 10)
+							: undefined,
+					maxFeeSats: maxFee !== undefined ? parseInt(maxFee, 10) : undefined
 				})
 			);
+		}
 		default:
 			output({
 				ok: false,
@@ -2390,7 +2488,7 @@ async function handleMessage(): Promise<void> {
 }
 
 async function handleBackup(): Promise<void> {
-	const sub = filteredArgs[1];
+	const sub = positionalArgs(undefined, new Set(['--overwrite']))[1];
 	if (sub === 'trigger') {
 		// On-demand encrypted database backup to the configured backupPath.
 		return outputResult(await httpRequest('POST', '/backup/trigger'));
@@ -2410,7 +2508,8 @@ async function handleBackup(): Promise<void> {
 			encoded: string;
 			channelCount: number;
 		};
-		fs.writeFileSync(destPath, encoded);
+		// Owner-only, like the copy the daemon keeps in the data directory.
+		writeFileAtomic(destPath, encoded);
 		return output({
 			ok: true,
 			result: { written: true, path: destPath, channelCount }
@@ -2423,13 +2522,19 @@ async function handleBackup(): Promise<void> {
 			error: {
 				code: 'INVALID_PARAMS',
 				message:
-					'Usage: beignet backup <destPath> | beignet backup scb [destPath] | beignet backup trigger'
+					'Usage: beignet backup <destPath> [--overwrite] | beignet backup scb [destPath] | beignet backup trigger'
 			}
 		});
 		process.exitCode = 1;
 		return;
 	}
-	return outputResult(await httpRequest('POST', '/backup', { destPath: sub }));
+	return outputResult(
+		await httpRequest('POST', '/backup', {
+			// The daemon would resolve a relative path against its own cwd.
+			destPath: nodePath.resolve(sub),
+			...(hasFlag('--overwrite') ? { overwrite: true } : {})
+		})
+	);
 }
 
 async function handleGuardian(): Promise<void> {
@@ -2584,12 +2689,16 @@ async function handleRestore(): Promise<void> {
 		// OFFLINE full-state restore: copies a database backup into place. The
 		// daemon must be stopped - the restore holds the same single-instance
 		// lock the daemon takes, so a live node is never overwritten.
-		if (!file) {
+		const backupFile = positionalArgs(
+			undefined,
+			new Set(['--unauthenticated'])
+		)[2];
+		if (!backupFile) {
 			output({
 				ok: false,
 				error: {
 					code: 'INVALID_PARAMS',
-					message: 'Usage: beignet restore db <backupFile>'
+					message: 'Usage: beignet restore db <backupFile> [--unauthenticated]'
 				}
 			});
 			process.exitCode = 1;
@@ -2633,12 +2742,16 @@ async function handleRestore(): Promise<void> {
 		const dbPath = nodePath.join(dataDir, `${network}.db`);
 		const lockPath = nodePath.join(dataDir, `${network}.lock`);
 		try {
-			fs.mkdirSync(dataDir, { recursive: true });
-			const result = performDbRestore(file, dbPath, lockPath);
+			ensurePrivateDir(dataDir);
+			const result = await performDbRestore(backupFile, dbPath, lockPath, {
+				macKey: deriveBackupMacKey(bip39.mnemonicToSeedSync(config.mnemonic)),
+				allowUnauthenticated: hasFlag('--unauthenticated')
+			});
 			output({
 				ok: true,
 				result: {
 					restored: true,
+					authenticated: result.authenticated,
 					dbPath: result.dbPath,
 					preRestorePath: result.preRestorePath,
 					network,
@@ -2707,7 +2820,7 @@ function printHelp(): void {
 Usage: beignet <command> [options]
 
 Setup:
-  init [--network N] [--alias A]         Generate mnemonic + config
+  init [--network N] [--alias A]         Generate mnemonic, API token + config
   start [flags]                          Start node daemon
   stop                                   Stop daemon
 
@@ -2751,8 +2864,12 @@ On-chain:
   psbt build <address> <sats> [satsPerVbyte]
                                          Build an UNSIGNED PSBT for an external
                                          signer (hardware wallet)
-  psbt import-signed <psbtBase64|file>   Validate + finalize a signed PSBT;
-                                         returns txid/txHex WITHOUT broadcast
+  psbt import-signed <psbtBase64|file> [unsignedPsbt|file]
+                                         Validate + finalize a signed PSBT;
+                                         returns txid/txHex WITHOUT broadcast.
+                                         Pass the unsigned PSBT from psbt build
+                                         once the daemon has restarted or made
+                                         50 newer builds
   psbt combine <psbt|file> <psbt|file>   Combine partially signed PSBT copies
   transactions [limit]                   List on-chain transactions (newest first)
   utxos                                  List wallet UTXOs (includes frozen flag)
@@ -2766,7 +2883,9 @@ On-chain:
                                          (public keys only, never private)
   recover-fallback-funds [--fee-rate N]  Sweep funding-key fallback UTXOs into
                                          the wallet
-  backup <destPath>                      Create database backup
+  backup <destPath> [--overwrite]        Create database backup, MAC in
+                                         <destPath>.hmac (--overwrite to
+                                         replace existing files)
   backup trigger                         Run the configured scheduled backup now
   backup scb [destPath]                  Export encrypted static channel backup
   backup peer-retrieved                  Show newest SCB returned by a peer
@@ -2774,9 +2893,12 @@ On-chain:
   restore scb <file>                     Restore channels from an SCB (on-chain
                                          recovery only: peers force-close and
                                          funds are swept to the wallet)
-  restore db <backupFile>                Restore a database backup (full state;
+  restore db <backupFile> [--unauthenticated]
+                                         Restore a database backup (full state;
                                          OFFLINE - stop the daemon first; needs
-                                         the same mnemonic, DB is seed-encrypted)
+                                         the same mnemonic and <backupFile>.hmac;
+                                         --unauthenticated accepts a backup made
+                                         before backups carried a MAC)
   recovery status                        Recovery Protocol status: mode, guardian
                                          set, startup gate, durable sequence
   recovery restore                       Restore this node from its guardian
@@ -2848,7 +2970,8 @@ Channels:
   channel forceclose <id>                Force close
                                          --accept-stale-state-risk: required
                                          for a channel restored from a
-                                         Recovery Capsule, whose commitment
+                                         Recovery Capsule, or on a fenced or
+                                         quarantined device, whose commitment
                                          the peer may have already revoked
   channel rebroadcast-close <id>         Rebroadcast recorded close tx
   channel funding-quote <pubkey> [satsPerVbyte]
@@ -2983,7 +3106,7 @@ BOLT 12 Offers:
   offer create <description> [amountSats]  Create reusable offer
   offer list                             List local offers
   offer decode <offer>                   Decode a BOLT 12 offer string
-  offer pay <offer> [amountSats]         Pay a BOLT 12 offer
+  offer pay <offer> [amountSats] [--max-fee <sats>]  Pay a BOLT 12 offer
 
 Direct funding (a payer's on-chain payment IS this node's channel funding):
   direct-funding configure [--lsp <pubkey>] [--lsp-host H] [--lsp-port P]
@@ -3007,9 +3130,11 @@ Direct funding (a payer's on-chain payment IS this node's channel funding):
                                          is known rather than failing
 
 Webhooks (event push; see also GET /events SSE):
-  webhooks register <url> <events> [--secret S]
-                                         Register a callback URL; <events> is
-                                         comma-separated (or '*' for all)
+  webhooks register <url> <events> [--secret S] [--allow-private-network]
+                                         Register an http(s) callback URL;
+                                         <events> is comma-separated (or '*'
+                                         for all). Loopback and private hosts
+                                         need --allow-private-network
   webhooks unregister <id>               Remove a webhook
   webhooks list                          List registered webhooks
 
@@ -3050,6 +3175,9 @@ Start flags:
   --tls-key <path>                       TLS private key file (requires --tls-cert)
   --tor-proxy <host:port>                SOCKS5 proxy for outbound Lightning peer
                                          connections (e.g. Tor at 127.0.0.1:9050)
+  --tor-proxy-onion-only                 Use --tor-proxy for .onion peers only and
+                                         dial public clearnet peers directly
+                                         (hybrid mode; needs --tor-proxy)
   --announce-addr <addr[,addr...]>       Addresses to advertise in node_announcement
                                          (IPv4, [ipv6]:port, .onion v3, or hostname;
                                          port defaults to 9735)

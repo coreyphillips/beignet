@@ -276,6 +276,17 @@ export interface IHtlcEntry {
 	 * commitment_signed. While false, buildRemoteCommitment still includes the
 	 * HTLC.
 	 *
+	 * addRemotelyRevoked (RECEIVED entries the peer added): false from
+	 * handleUpdateAddHtlc until the peer's revoke_and_ack for a
+	 * commitment_signed of ours that carries the add. Only then is the add in
+	 * a commitment of the peer's that it cannot go back on, so only then may
+	 * we forward or settle it (see receivedAddIrrevocablyCommitted).
+	 *
+	 * addCoverPending: the same stamp as commitCoverPending, for that one
+	 * phase. It is kept apart because we may remove a received add before the
+	 * peer's answering revoke_and_ack, and a shared stamp would then promote
+	 * our unsigned removal instead.
+	 *
 	 * All are optional: absent (legacy persisted states and hand-built
 	 * fixtures) means "already committed/revoked" — the pre-two-phase behavior.
 	 */
@@ -284,6 +295,8 @@ export interface IHtlcEntry {
 	commitCoverPending?: boolean;
 	addLocallyRevoked?: boolean;
 	removalLocallyRevoked?: boolean;
+	addRemotelyRevoked?: boolean;
+	addCoverPending?: boolean;
 
 	/**
 	 * OFFERED entries: false from addHtlc until a commitment_signed we accepted
@@ -354,6 +367,33 @@ export interface IHtlcEntry {
 	 */
 	dustExposureFailback?: boolean;
 	/**
+	 * Admission-time classification (issue #1009): this received HTLC's
+	 * cltv_expiry was at or below our chain tip when it was admitted, so the
+	 * node fails it back once committed (expiry_too_soon as a forwarder,
+	 * incorrect_or_unknown_payment_details as the final hop) and never settles
+	 * it. Stamped at admission because the tip is ours alone and the peer
+	 * cannot be blamed for it; persisted so a restart replay answers
+	 * identically.
+	 */
+	expiredOnArrival?: boolean;
+	/**
+	 * Admission-time classification (issue #1020): this received HTLC was
+	 * admitted inside the funder-fee band. We fund the channel, and by the
+	 * sender's own view of our commitment (the one eclair, LND and CLN price
+	 * before offering an add) our commitment fee could no longer be met above
+	 * our reserve once this HTLC was in, but under the dearest reading of the
+	 * live state our output still survived, so the add was taken rather than
+	 * failing the channel, and the node fails it back once committed (BOLT 4:
+	 * temporary_channel_failure forwarding, incorrect_or_unknown_payment_
+	 * details at the final hop). The band's bound holds per add on the live
+	 * state; across a fee-rate promotion or an add of our own the sign-time
+	 * backstop (Channel._funderOutputTrimmedRefusal) holds it instead.
+	 * Stamped at admission for the same reason as dustExposureFailback: the
+	 * classification is order-dependent within a batch, and a restart replay
+	 * must answer identically. Persisted.
+	 */
+	funderFeeFailback?: boolean;
+	/**
 	 * Admission-time provenance (issue #469): this received HTLC entered the
 	 * channel while a restriction that disarms its on-chain enforcement was
 	 * already standing: the recency hold (restoreRecencyUnproven, or the
@@ -377,6 +417,21 @@ export interface IHtlcEntry {
 	 * so the refusal survives a crash between the commit and the fail-back.
 	 */
 	addedWhileFundingUnaccounted?: boolean;
+}
+
+/**
+ * Whether a received add is irrevocably committed (BOLT 2): we revoked for
+ * the peer's commitment_signed that covers it, and the peer revoked for ours.
+ * Nothing may forward or settle it before then. COMMITTED alone does not say
+ * this, because signCommitment flips every PENDING entry, including a peer add
+ * the commitment it signs leaves out.
+ */
+export function receivedAddIrrevocablyCommitted(entry: IHtlcEntry): boolean {
+	return (
+		entry.state === HtlcState.COMMITTED &&
+		entry.addLocallyRevoked !== false &&
+		entry.addRemotelyRevoked !== false
+	);
 }
 
 /**
@@ -424,6 +479,15 @@ export const MIN_DUST_LIMIT_SATOSHIS = 354n;
  *  "too-small-to-create" threshold: an unbounded value lets an acceptor trim
  *  our to_remote output out of every commitment we sign (see FS-1). */
 export const MAX_DUST_LIMIT_SATOSHIS = 1062n;
+
+/** The minimum_depth we advertise as acceptor, and the least a v2 opener
+ *  waits on a funding transaction that can carry the accepter's inputs. */
+export const DEFAULT_MINIMUM_DEPTH = 3;
+
+/** Upper bound on a peer's minimum_depth, matching LDK's max_minimum_depth.
+ *  The funder's coins are locked in the 2-of-2 until that depth, so an
+ *  unbounded value holds them until a force close. */
+export const MAX_MINIMUM_DEPTH = 144;
 
 /** Largest value encodable in a wire u64 field. */
 export const U64_MAX = 0xffffffffffffffffn;

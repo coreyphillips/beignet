@@ -42,6 +42,7 @@ import {
 	IJusticeContext
 } from './justice';
 import { TowerConnection, parseTowerUri } from './tower-connection';
+import { Socks5ProxyScope } from '../transport/peer-manager';
 import {
 	ITowerAddress,
 	ITowerTransport,
@@ -84,6 +85,9 @@ export interface IWatchtowerClientOptions {
 	store?: IWatchtowerStore;
 	transportFactory?: TowerTransportFactory;
 	socks5Proxy?: { host: string; port: number };
+	/** Which tower hosts ride socks5Proxy (default 'all'; 'onion' dials
+	 *  public clearnet towers directly). See selectOutboundProxy. */
+	socks5ProxyScope?: Socks5ProxyScope;
 	maxUpdates?: number;
 	sweepFeeRateSatPerKw?: bigint;
 	connectTimeoutMs?: number;
@@ -131,6 +135,7 @@ export class WatchtowerClient extends EventEmitter {
 	private readonly store?: IWatchtowerStore;
 	private readonly transportFactory: TowerTransportFactory;
 	private readonly socks5Proxy?: { host: string; port: number };
+	private readonly socks5ProxyScope: Socks5ProxyScope;
 	private readonly maxUpdates: number;
 	private readonly sweepFeeRate: bigint;
 	private readonly connectTimeoutMs: number;
@@ -143,6 +148,7 @@ export class WatchtowerClient extends EventEmitter {
 		this.chainHash = opts.chainHash;
 		this.store = opts.store;
 		this.socks5Proxy = opts.socks5Proxy;
+		this.socks5ProxyScope = opts.socks5ProxyScope ?? 'all';
 		this.maxUpdates = opts.maxUpdates ?? DEFAULT_MAX_UPDATES;
 		this.sweepFeeRate =
 			opts.sweepFeeRateSatPerKw ?? DEFAULT_SWEEP_FEE_RATE_SAT_PER_KW;
@@ -154,7 +160,8 @@ export class WatchtowerClient extends EventEmitter {
 					localPrivateKey: transportKey ?? this.localPrivateKey,
 					address: addr,
 					connectTimeoutMs: this.connectTimeoutMs,
-					socks5Proxy: this.socks5Proxy
+					socks5Proxy: this.socks5Proxy,
+					socks5ProxyScope: this.socks5ProxyScope
 				}));
 
 		for (const uri of opts.towers ?? []) {
@@ -193,6 +200,8 @@ export class WatchtowerClient extends EventEmitter {
 			for (const u of this.store.loadPendingWatchtowerUpdates()) {
 				const state = this.towers.get(u.towerUri);
 				if (!state) continue;
+				// Queued before start (a hand-off retried at channel restore).
+				if (state.backlog.some((b) => b.id === u.id)) continue;
 				state.backlog.push(u);
 				this.ensureSlot(state, u.blobType);
 			}
@@ -264,10 +273,15 @@ export class WatchtowerClient extends EventEmitter {
 	 * Build and ship a justice blob for a revoked commitment to every tower.
 	 * Called by the node inside revoke_and_ack handling. Never throws to the
 	 * caller: a failure to reach a tower keeps the update queued for retry.
+	 *
+	 * Returns false when an update could not be written to the store. Nothing
+	 * is queued for that tower, so the caller must keep the revoked tx and
+	 * call again.
 	 */
-	backupRevokedState(ctx: IJusticeContext): void {
-		if (!this.enabled) return;
+	backupRevokedState(ctx: IJusticeContext): boolean {
+		if (!this.enabled) return true;
 		const blobType = blobTypeForChannel(ctx.isAnchor, ctx.isTaproot ?? false);
+		let queued = true;
 		for (const state of this.towers.values()) {
 			const slot = this.ensureSlot(state, blobType);
 			if (this.started) this.connectSlot(state, slot);
@@ -305,7 +319,20 @@ export class WatchtowerClient extends EventEmitter {
 				acked: false,
 				createdAt: Date.now()
 			};
-			const id = this.store ? this.store.addWatchtowerUpdate(update) : -1;
+			let id = -1;
+			if (this.store) {
+				try {
+					id = this.store.addWatchtowerUpdate(update);
+				} catch (err) {
+					queued = false;
+					this.emitLog('backup_failed', {
+						tower: state.address.uri,
+						channelId: ctx.channelId,
+						error: err instanceof Error ? err.message : String(err)
+					});
+					continue;
+				}
+			}
 			state.backlog.push({ ...update, id });
 			this.emitLog('backup_queued', {
 				tower: state.address.uri,
@@ -325,6 +352,7 @@ export class WatchtowerClient extends EventEmitter {
 				});
 			});
 		}
+		return queued;
 	}
 
 	private registerTower(uri: string): ITowerState {

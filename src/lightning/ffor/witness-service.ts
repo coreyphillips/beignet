@@ -10,6 +10,7 @@
  */
 
 import crypto from 'crypto';
+import { Channel } from '../channel/channel';
 import { sign } from '../crypto/ecdh';
 import { computeHAct, computeHBook, decodeVoucherBook } from './transcript';
 import { sealRecordBody } from './witness-crypto';
@@ -123,6 +124,11 @@ interface IPendingBarrier {
 
 const DEFAULT_MAX_MAILBOXES = 64;
 const DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
+/**
+ * How far past T_exp a mailbox may ask to be kept. R asks for T_exp + 288 by
+ * default, and records fetched after T_exp are audit only.
+ */
+const MAX_RETENTION_PAST_T_EXP = 2016;
 
 export class FforWitnessService {
 	readonly maxMailboxes: number;
@@ -470,8 +476,31 @@ export class FforWitnessService {
 			refuse('activation hash does not match the book');
 			return;
 		}
+		// Anyone may provision, and the reservation is held until
+		// retention_until, so both ends are bounded against the tip. S activates
+		// no epoch whose T_exp is further than MAX_HTLC_CLTV_EXPIRY_DELTA away;
+		// the margin absorbs a witness tip that lags S's.
+		const tip = this.deps.currentHeight();
+		const maxBookBlocks =
+			Channel.MAX_HTLC_CLTV_EXPIRY_DELTA + FF_WITNESS_RETENTION_MARGIN_BLOCKS;
+		if (tip <= 0) {
+			refuse('no chain tip yet');
+			return;
+		}
+		if (tExp <= tip) {
+			refuse('T_exp is not in the future');
+			return;
+		}
+		if (tExp > tip + maxBookBlocks) {
+			refuse(`T_exp is more than ${maxBookBlocks} blocks away`);
+			return;
+		}
 		if (manifest.retentionUntil < tExp + FF_WITNESS_RETENTION_MARGIN_BLOCKS) {
 			refuse('retention_until is under T_exp + 144');
+			return;
+		}
+		if (manifest.retentionUntil > tExp + MAX_RETENTION_PAST_T_EXP) {
+			refuse(`retention_until is over T_exp + ${MAX_RETENTION_PAST_T_EXP}`);
 			return;
 		}
 		if (manifest.minReceipts > 0) {
@@ -697,9 +726,17 @@ export class FforWitnessService {
 				this.releaseBarrier(outKey, 'deadline');
 			}
 		}
+		// A mailbox stored before provisions were bounded can hold a retention
+		// near 2^32. One past the longest span a provision may now ask for goes
+		// too; the extra margin keeps a shallow reorg from dropping an edge row.
+		const horizon =
+			height +
+			Channel.MAX_HTLC_CLTV_EXPIRY_DELTA +
+			2 * FF_WITNESS_RETENTION_MARGIN_BLOCKS +
+			MAX_RETENTION_PAST_T_EXP;
 		for (const m of this.deps.ledger.listMailboxes()) {
 			if (m.state === 'EXPIRED') continue;
-			if (m.retentionUntil < height) {
+			if (m.retentionUntil < height || m.retentionUntil > horizon) {
 				const result = this.deps.ledger.expire(m.id);
 				if (result.outcome === 'applied') {
 					this.deps.log('ffor_witness_expired', { mailboxId: m.id });

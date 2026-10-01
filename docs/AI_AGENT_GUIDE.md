@@ -62,7 +62,7 @@ const { server, node } = await startDaemon({
 });
 ```
 
-All endpoints use JSON. Example:
+All endpoints use JSON: send every body as `Content-Type: application/json` (with authentication off the daemon refuses anything else with `415 UNSUPPORTED_MEDIA_TYPE`). `$TOKEN` is the `apiToken` that `beignet init` prints and saves to `~/.beignet/config.json` (or whatever `apiToken`/`apiKeys` you configured). Example:
 
 ```bash
 # Pay an invoice
@@ -239,6 +239,21 @@ const check = node.validatePayment(bigInvoice);
 // check.status === 'FAIL', check.summary includes "exceeds per-payment limit"
 ```
 
+Both limits count the routing fee, not just the invoice amount. Every pay
+path sends under a fee cap: `maxFeeSats` / `maxFeeMsat` when you pass one,
+otherwise 1% of the amount with a 50 sat floor. `maxPaymentSats` and the daily
+limit are judged on the amount plus that cap when the payment is admitted, and
+the day is charged the amount plus the fee actually paid when it settles. A
+payment that fits the limit on its amount alone but not with its cap is
+refused, and the error says whether to lower `maxFeeSats` or the amount;
+`validatePayment(bolt11, amountSats, maxFeeSats)` previews the same
+judgement. `sendToRoute` is judged on what its first hop carries.
+
+External on-chain sends are held to both limits as well: `sendOnchain`, an
+address-targeted `spliceOut` and `sendDirectFunding` on the amount plus the
+fee, `sendMaxOnchain` on the whole sweep. A circular rebalance counts only its
+routing fee, and only against the daily limit.
+
 ## Error Handling
 
 ### Decision tree
@@ -279,7 +294,7 @@ if (result.status === 'COMPLETED') {
 ```
 
 ### Payment queuing
-For batch payments with concurrency control. The queue is **persistent** — queued payments survive daemon restarts and crashes. Payments that were mid-dispatch at crash time are automatically reset to `queued` on recovery.
+For batch payments with concurrency control. The queue is **persistent**: queued payments survive daemon restarts and crashes, and dispatch once a channel can carry them after the next start. A payment that was mid-dispatch at the restart is checked against the node's own record for its invoice before anything sends it again: one that was paid is recorded `completed`, one whose HTLCs are still out stays `dispatching` until they resolve, and only one that paid nothing is queued again. A dispatch whose HTLC is still out when the queue's own payment timeout fires (60 s by default) is not recorded `failed` either: it stays `dispatching` and is recorded from the node's outcome, `completed` when the payment settles and `failed` once every HTLC resolved with nothing paid (issue #976). A `failed` entry is a verdict; a `dispatching` one is still being paid, so do not enqueue its invoice again.
 
 ```typescript
 const queue = node.enqueuePayment(bolt11, 1); // priority 1 (highest)
@@ -360,18 +375,18 @@ curl "http://localhost:2112/channel/health?channelId=abc123..." \
 
 ### Timeout behavior
 
-`payInvoice()` calls `failPayment()` internally on timeout, but the HTLC may still settle after the timeout fires. Always check `getPayment(hash)` before retrying to avoid duplicate payments.
+At its timeout `payInvoice()` fails the payment only when no HTLC is out for it. With one still in flight the record stays `PENDING` until that HTLC resolves (it can still settle after the timeout fires), no further route is tried after the timeout, and the record is failed when the HTLC fails or its on-chain timeout resolves; the `PAYMENT_TIMEOUT` message says so, and `payInvoiceSafe()` then returns that `PENDING` record (issue #976). Check `getPayment(hash)` before retrying: a `PENDING` payment is still being paid, and the engine refuses a second payment to it in any case.
 
 ### Duplicate payment protection
 
-Retrying the same invoice while the payment is still `PENDING` will throw `DUPLICATE_PAYMENT`. The correct pattern: check the payment status first, use `waitForPayment()` if still pending.
+Retrying the same invoice while the payment is still `PENDING`, while any HTLC it sent is still out (a payment that timed out at the wall clock is not over until its HTLC resolves), or after it completed will throw `DUPLICATE_PAYMENT`. This holds for `payInvoice()`, `payInvoiceSafe()`, `sendPaymentAsync()` (`POST /invoice/pay-async` answers 409 `DUPLICATE_PAYMENT`, not a retryable 502), BOLT 12 payments and `sendToRoute()` alike, on a node that still has its payment records (a completed record is refused from memory, and from the database once pruned from memory after 24 hours); a seed-only restore has no records to refuse from. `payInvoiceSafe()` and `payInvoiceWithRetry()` return the existing record instead of throwing. A failed attempt can be sent again once the failed HTLC's removal is irrevocable (the peer's `revoke_and_ack` for the commitment without it); until then it still counts as in flight, and the engine's own retry of a temporary failure waits for the same moment (issue #989). The correct pattern: check the payment status first, use `waitForPayment()` if still pending.
 
 ### Method comparison
 
 | Method | Blocks? | Throws on failure? | Best for |
 |--------|---------|-------------------|----------|
 | `payInvoice()` | Yes | Yes | Simple scripts |
-| `payInvoiceSafe()` | Yes | No (returns `FAILED`) | Agent loops |
+| `payInvoiceSafe()` | Yes | No (returns `FAILED`, or the `PENDING` record after a timeout with an HTLC still out) | Agent loops |
 | `sendPaymentAsync()` | No | Only at submission (drain, limits, decode, no route) | Fire-and-forget |
 | `payInvoiceWithRetry()` | Yes | No | Production agents |
 
@@ -594,11 +609,13 @@ const node = await BeignetNode.create({
 
 // Check current spend info
 const info = node.getDailySpendInfo();
-console.log('Limit:', info.limitSats, 'Spent:', info.spentSats, 'Remaining:', info.remainingSats);
+console.log('Limit:', info.limitSats, 'Spent:', info.spentSats, 'Pending:', info.pendingSats, 'Remaining:', info.remainingSats);
 // Resets at midnight UTC (info.resetsAt)
 
 // payInvoice and sendKeysend will throw SPENDING_LIMIT_EXCEEDED if the limit is hit.
-// Spend is recorded AFTER payment settles — failed payments do not count against the limit.
+// Spend is recorded when a payment settles, once, even when the settle lands after
+// payInvoice's timeout or after a restart; failed payments do not count against the limit.
+// The ledger is persisted: a restart within the UTC day resumes the day's total.
 // Concurrent payments are guarded by a pending counter to prevent overshoot.
 ```
 
@@ -615,7 +632,7 @@ beignet start --daily-spend-limit 100000
 Via HTTP:
 ```bash
 curl http://localhost:2112/spend-limit -H "Authorization: Bearer $TOKEN"
-# { "ok": true, "result": { "limitSats": 100000, "spentSats": 42000, "remainingSats": 58000, "resetsAt": 1709078400000 } }
+# { "ok": true, "result": { "limitSats": 100000, "spentSats": 42000, "remainingSats": 58000, "pendingSats": 0, "resetsAt": 1709078400000 } }
 ```
 
 ## Paying for APIs with L402
@@ -652,7 +669,8 @@ What the client guarantees before any payment leaves:
   A macaroon that cannot be sent back in a header (one carrying whitespace, which
   base64 decoding would happily ignore) is refused before paying, not after.
 - The challenge came from the origin you asked for. A redirect to another origin
-  is not paid unless you pass `allowCrossOriginChallenge: true`.
+  is not paid unless you pass `allowCrossOriginChallenge: true`, and even then
+  only for a GET or HEAD request.
 - Both halves of the challenge come from the SAME entry in the
   `WWW-Authenticate` header, so a reflected or multi-scheme header cannot pair a
   macaroon with someone else's invoice.
@@ -661,8 +679,9 @@ What the client guarantees before any payment leaves:
 
 `maxPriceSats` is per request; your `dailySpendLimitSats` and `maxPaymentSats`
 still apply underneath it. An unattended agent wants both: one bounds a single
-purchase, the other bounds the wallet. Note that the wallet limits count the
-invoice amount, not the routing fee, which is why the fee cap above matters.
+purchase, the other bounds the wallet. The wallet limits count the invoice
+amount plus the routing-fee cap, so the L402 fee cap above is also what the
+wallet limits are judged against for that purchase.
 
 Over HTTP, `POST /l402/fetch` honours `X-Idempotency-Key`, so a retried fetch
 replays the first result instead of buying a second challenge.
@@ -678,6 +697,7 @@ node.forgetL402Credential(scope);    // drop one, so the next call pays again
 Via HTTP:
 ```bash
 curl -X POST http://localhost:2112/l402/fetch -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
   -d '{"url":"https://api.example/v1/data","maxPriceSats":50}'
 ```
 
@@ -712,7 +732,22 @@ curl -X POST http://localhost:2112/invoice/pay-safe \
 # Same key with DIFFERENT body — returns 409 IDEMPOTENCY_CONFLICT
 ```
 
-Supported endpoints: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`.
+Supported endpoints: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/splice-out`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`.
+
+Any other `POST` that carries the header is refused with `400 INVALID_PARAMS`
+and does not run, so a key is never silently dropped. Drop the header for
+those routes.
+
+A BOLT 12 offer payment needs the key more than a BOLT 11 one: every
+`POST /offer/pay` asks the payee for a fresh invoice with a fresh payment hash,
+so nothing but the key can tell a retry from a new payment. That holds after a
+`504 PAYMENT_TIMEOUT` too, whose error carries the `paymentHash`: a keyed retry
+answers `200` with the payment once it completed and `409 DUPLICATE_PAYMENT`
+while an HTLC for it can still settle, and asks for a new invoice only once
+nothing sent for the first can (issue #1094). A keyed `POST /keysend` that
+timed out is answered the same way, since a rerun would pick a fresh preimage
+(issue #1133). Query `GET /payment?paymentHash=...` rather than retrying in a
+loop.
 
 The same applies to the on-chain sends: a retried `POST /send` that carries the
 key of a send already broadcast returns that broadcast's txid instead of
@@ -746,15 +781,15 @@ await node.gracefulShutdown();
 
 ## Security
 
-- **API Token**: Always set `apiToken` in production
+- **API Token**: `beignet init` mints one and saves it to the config; always keep `apiToken` (or `apiKeys`) set in production. Without one the daemon warns at start and falls back to browser guards (JSON-only bodies, no foreign `Origin`, loopback `Host` only), which keep a web page out but not another local process.
 - **Mnemonic**: Store securely, never log
 - **Network**: Bind daemon to `127.0.0.1` (default)
 - **TLS**: For production, enable HTTPS with `--tls-cert` and `--tls-key` (or `BEIGNET_TLS_CERT`/`BEIGNET_TLS_KEY` env vars)
 - **CORS**: Only enable if needed, specify exact origin
 - **Spending Limits**: Set `dailySpendLimitSats` to cap daily agent spending
 - **Idempotency Keys**: Use `X-Idempotency-Key` header on payment requests to prevent duplicates
-- **Webhook Secrets**: Use HMAC-SHA256 verification (secrets are hashed in storage, never stored plaintext)
-- **Rate Limiting**: Enable `rateLimit` option to protect against runaway agent loops (429 `RATE_LIMITED` response). Health endpoints are exempt; `/metrics` is auth-gated (it reports balances) unless `metricsPublic` is set. Buckets are keyed on the connecting address, so behind a reverse proxy all clients share one bucket unless you list the proxy's IP in `rateLimit.trustedProxies`, which keys on the client address the proxy reports via `X-Forwarded-For`. Never front the daemon with a proxy you do not control when the limiter matters: the header is only trusted from listed addresses.
+- **Webhook Secrets**: Use HMAC-SHA256 verification (the webhook rows hold only a hash; the secret itself is kept in the encrypted wallet data so deliveries stay signed across restarts)
+- **Rate Limiting**: Enable `rateLimit` option to protect against runaway agent loops (429 `RATE_LIMITED` response). Every route counts, the unauthenticated health and spec endpoints included; `/metrics` is auth-gated (it reports balances) unless `metricsPublic` is set. Buckets are keyed on the connecting address, so behind a reverse proxy all clients share one bucket unless you list the proxy's IP in `rateLimit.trustedProxies`, which keys on the client address the proxy reports via `X-Forwarded-For`. Never front the daemon with a proxy you do not control when the limiter matters: the header is only trusted from listed addresses.
 
 ## Mainnet Checklist
 

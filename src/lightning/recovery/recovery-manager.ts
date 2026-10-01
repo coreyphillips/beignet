@@ -156,10 +156,11 @@ export class RecoveryManager {
 						this.storage.setOutboxFrameSequence(ids, Number(sequence));
 					}
 					// appendFrame reports the sequence it actually used, which is
-					// what a Phase 6 barrier waits on. nextSequence agrees with it
-					// in all three append branches, but the barrier is a fund
-					// safety gate: it takes the value the frame was written under,
-					// not a prediction of it.
+					// what a Phase 6 barrier waits on. It is later than
+					// nextSequence only when a bootstrap or re-base snapshot
+					// spilled into page frames, and the barrier is a fund safety
+					// gate: it takes the value the frame was written under, not a
+					// prediction of it.
 					frameSequence = this.options.journal.appendFrame(
 						mutations,
 						outboundMessages

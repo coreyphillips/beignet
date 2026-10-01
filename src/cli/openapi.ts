@@ -14,11 +14,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			version: '1.0.0',
 			description:
 				'HTTP API for a self-custodial Bitcoin + Lightning node. Designed for AI agents.\n\n' +
-				'**Idempotency:** These endpoints support the `X-Idempotency-Key` header: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`. ' +
+				'**Idempotency:** These endpoints support the `X-Idempotency-Key` header: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/splice-out`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`. ' +
 				'When provided, the response is cached in memory for 24 hours (or until the daemon restarts), and repeated requests with the same key and body return the cached response. ' +
-				'If the same key is reused with a different request body, a `409 IDEMPOTENCY_CONFLICT` error is returned.\n\n' +
+				'If the same key is reused with a different request body, a `409 IDEMPOTENCY_CONFLICT` error is returned. ' +
+				'Any other POST that carries the header answers `400 INVALID_PARAMS` without running.\n\n' +
 				'**TLS:** The daemon supports HTTPS when started with `--tls-cert` and `--tls-key` flags (or `BEIGNET_TLS_CERT`/`BEIGNET_TLS_KEY` env vars).\n\n' +
-				'**Scoped API keys:** Besides the legacy single `apiToken` (implicit admin scope), the `apiKeys` config defines named keys with `readonly`, `invoice`, and/or `admin` scopes. Each operation lists the scopes it accepts in `x-accepted-scopes`; unclassified routes are admin-only. Requests fail with 401 (bad/absent key) or 403 (valid key, insufficient scope).\n\n' +
+				'**Scoped API keys:** Besides the legacy single `apiToken` (implicit admin scope), the `apiKeys` config defines named keys with `readonly`, `invoice`, and/or `admin` scopes. Each operation lists the scopes it accepts in `x-accepted-scopes`; unclassified routes are admin-only. Requests fail with 401 (bad/absent key) or 403 (valid key, insufficient scope). `beignet init` mints an `apiToken` for every install it creates.\n\n' +
+				'**Browser guards (no credential configured):** a request body must be `Content-Type: application/json` (else `415 UNSUPPORTED_MEDIA_TYPE`), an `Origin` other than the configured `cors` origin or a `Sec-Fetch-Site: cross-site` request is refused (`403 CROSS_SITE_REQUEST_REFUSED`), and the `Host` header must be the loopback name the daemon is bound on (else `421 HOST_NOT_ALLOWED`). They apply to every route but `OPTIONS` and do not run once `apiToken` or `apiKeys` is set.\n\n' +
 				'**Spending Limits:** Configure `dailySpendLimitSats` (or `BEIGNET_DAILY_SPEND_LIMIT_SATS` env var) to enforce a daily budget. Query `GET /spend-limit` for current usage.\n\n' +
 				'**Drain Mode:** `POST /stop` accepts `{ "drain": true }` to stop accepting new payments and wait for in-flight ones to settle before shutdown.'
 		},
@@ -127,6 +129,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/payments': {
 				get: {
 					summary: 'List payments with optional filtering',
+					description:
+						'Newest first. Read through to the node database: a completed or failed payment stays listed with its status after the engine prunes its in-memory record (24 hours after completion, oldest first past 10,000). A database read that fails answers 500, never a shorter list.',
 					tags: ['Payments'],
 					parameters: [
 						{
@@ -270,6 +274,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/invoices': {
 				get: {
 					summary: 'List created invoices',
+					description:
+						'status is PAID on a completed receive for the hash, from the in-memory record or the database row once the engine has pruned it, so a paid invoice never reads EXPIRED or PENDING later. A database read that fails answers 500.',
 					tags: ['Invoices'],
 					responses: {
 						'200': {
@@ -438,6 +444,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							content: jsonContent({
 								$ref: '#/components/schemas/DirectFundingSendResult'
 							})
+						},
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: the amount plus the fee ceiling is over dailySpendLimitSats. Nothing was spent'
+						},
+						'409': {
+							description:
+								'SERVICE_DRAINING: the node is draining and takes no new payment. Nothing was spent'
 						}
 					}
 				}
@@ -518,6 +532,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/invoice': {
 				get: {
 					summary: 'Get a specific invoice by payment hash',
+					description:
+						'status is judged as GET /invoices judges it: PAID from the in-memory record or the database row, so it never reverts to EXPIRED or PENDING after the engine prunes the record.',
 					tags: ['Invoices'],
 					parameters: [
 						{
@@ -547,8 +563,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Pre-flight payment validation — checks decode, expiry, limits, capacity, route',
+					description:
+						'Judges MAX_PAYMENT and DAILY_LIMIT as POST /invoice/pay will: on the amount plus the routing-fee cap, maxFeeSats when given and 1% of the amount with a 50 sat floor otherwise. Previews BOLT 11 payments only.',
 					tags: ['Payments'],
-					requestBody: bodyContent({ bolt11: 'string', amountSats: 'number?' }),
+					requestBody: bodyContent({
+						bolt11: 'string',
+						amountSats: 'number?',
+						maxFeeSats: 'number?'
+					}),
 					responses: {
 						'200': {
 							description: 'Validation result',
@@ -581,11 +603,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/invoice/pay': {
 				post: {
 					summary: 'Pay an invoice (blocks until settled or timeout)',
+					description:
+						'When neither maxFeeSats nor maxFeeMsat is given the routing fee is capped at 1% of the amount, never below 50 sats. maxPaymentSats and the daily spend limit count the amount plus that cap at admission (403 SPENDING_LIMIT_EXCEEDED; the message says whether to lower maxFeeSats or the amount) and the amount plus the fee actually paid once the payment settles.',
 					tags: ['Payments'],
 					requestBody: bodyContent({
 						bolt11: 'string',
 						timeoutMs: 'number?',
 						maxFeeSats: 'number?',
+						maxFeeMsat: 'string?',
 						amountSats: 'number?',
 						metadata: 'Record<string,string>?',
 						cltvLimit: 'number?'
@@ -594,6 +619,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'200': {
 							description: 'Payment result',
 							content: jsonContent({ $ref: '#/components/schemas/PaymentInfo' })
+						},
+						'409': {
+							description:
+								'FEE_EXCEEDS_MAX, every route costs more than maxFeeSats / maxFeeMsat; nothing was sent'
 						}
 					}
 				}
@@ -601,6 +630,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/invoice/pay-async': {
 				post: {
 					summary: 'Pay an invoice (returns immediately)',
+					description:
+						'When neither maxFeeSats nor maxFeeMsat is given the routing fee is capped at 1% of the amount, never below 50 sats. maxPaymentSats and the daily spend limit count the amount plus that cap at admission (403 SPENDING_LIMIT_EXCEEDED; the message says whether to lower maxFeeSats or the amount) and the amount plus the fee actually paid once the payment settles.',
 					tags: ['Payments'],
 					requestBody: bodyContent({
 						bolt11: 'string',
@@ -620,6 +651,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 									status: { type: 'string', enum: ['PENDING', 'FAILED'] }
 								}
 							})
+						},
+						'409': {
+							description:
+								'FEE_EXCEEDS_MAX, every route costs more than maxFeeSats / maxFeeMsat; nothing was sent'
 						}
 					}
 				}
@@ -628,11 +663,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Pay an invoice (never throws — always returns PaymentInfo with COMPLETED or FAILED status)',
+					description:
+						"When neither maxFeeSats nor maxFeeMsat is given the routing fee is capped at 1% of the amount, never below 50 sats. maxPaymentSats and the daily spend limit count the amount plus that cap at admission (403 SPENDING_LIMIT_EXCEEDED; the message says whether to lower maxFeeSats or the amount) and the amount plus the fee actually paid once the payment settles. A limit refusal is reported in the result's failureDescription.",
 					tags: ['Payments'],
 					requestBody: bodyContent({
 						bolt11: 'string',
 						timeoutMs: 'number?',
 						maxFeeSats: 'number?',
+						maxFeeMsat: 'string?',
 						amountSats: 'number?',
 						metadata: 'Record<string,string>?',
 						cltvLimit: 'number?'
@@ -697,7 +735,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/channel/close': {
 				post: {
 					summary:
-						'Cooperatively close a channel. The payout goes to a wallet-scanned address: the current unused wallet address when the wallet can produce one (consecutive closes may get the same address until it sees use), else the startup sweep address, else the funding-key address, so the closed balance is tracked and spendable without a rescue sweep. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because a mutual close pays out the balances that row carries and a stale allocation is peer-favourable by construction: any payment received after the capsule was written is missing from it. Letting the peer close unilaterally is the safe outcome; the flag is the labelled way to accept the risk anyway',
+						"Cooperatively close a channel. The payout goes to a wallet-scanned address on the wallet's internal change chain, never to a receive address that POST /address/new or a receive request handed out, so a close can never read as a payer paying a request (issue #1064): the next unused change address when the wallet can produce one (consecutive closes may get the same address until it sees use), else the startup sweep address (also a change address), else the funding-key address, so the closed balance is tracked and spendable without a rescue sweep. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because a mutual close pays out the balances that row carries and a stale allocation is peer-favourable by construction: any payment received after the capsule was written is missing from it. Letting the peer close unilaterally is the safe outcome; the flag is the labelled way to accept the risk anyway",
 					tags: ['Channels'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -712,7 +750,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/channel/forceclose': {
 				post: {
 					summary:
-						'Force close a channel (returns commitment txid). A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because its recency cannot be proven: the node refuses to broadcast such a commitment on its own initiative, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path. Waiting for the peer to close is the safe outcome; the flag is the labelled way to accept the risk anyway. Once any channel reports restoreRevokedRisk on /recovery/status (its peer has shown in channel_reestablish that it already holds the revocation for the stored commitment), the force close is refused with FORCE_CLOSE_REVOKED (409) whatever the flag says: there is no risk left to accept; wait for the peer to force close',
+						'Force close a channel (returns commitment txid). A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because its recency cannot be proven: the node refuses to broadcast such a commitment on its own initiative, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path. Waiting for the peer to close is the safe outcome; the flag is the labelled way to accept the risk anyway. Every channel needs the flag while /recovery/status reports the gate fenced or quarantined (issue #1013): a fenced device was taken over by another restored from the same seed, whose channel updates revoked the commitments this one stores, and a quarantined one cannot yet show that no takeover happened. Once any channel reports restoreRevokedRisk on /recovery/status (its peer has shown in channel_reestablish that it already holds the revocation for the stored commitment), the force close is refused with FORCE_CLOSE_REVOKED (409) whatever the flag says: there is no risk left to accept; wait for the peer to force close',
 					tags: ['Channels'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -968,6 +1006,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/payment': {
 				get: {
 					summary: 'Get a specific payment by hash',
+					description:
+						'The in-memory record, else its database row, so a payment is found however long ago it completed. NOT_FOUND only when neither exists; a database read that fails answers 500.',
 					tags: ['Payments'],
 					parameters: [
 						{
@@ -1031,12 +1071,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								allowCrossOriginChallenge: {
 									type: 'boolean',
 									description:
-										'Unsafe: pay a challenge served from a different origin than requested, after a redirect'
+										'Unsafe: pay a challenge served from a different origin than requested, after a redirect. Only GET and HEAD requests qualify'
 								},
 								allowPrivateNetwork: {
 									type: 'boolean',
 									description:
-										'Permit a target on a private, loopback, or link-local host, which is refused by default because this endpoint fetches on behalf of the caller from the node machine'
+										'Permit a target on a private, loopback, or link-local host, which is refused by default (for redirect targets too, before they are requested) because this endpoint fetches on behalf of the caller from the node machine'
 								}
 							}
 						})
@@ -1171,6 +1211,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Pay an invoice with automatic retry and exponential backoff',
+					description:
+						'When neither maxFeeSats nor maxFeeMsat is given the routing fee is capped at 1% of the amount, never below 50 sats. maxPaymentSats and the daily spend limit count the amount plus that cap at admission (403 SPENDING_LIMIT_EXCEEDED; the message says whether to lower maxFeeSats or the amount) and the amount plus the fee actually paid once the payment settles. A limit refusal is not retried.',
 					tags: ['Payments'],
 					requestBody: bodyContent({
 						bolt11: 'string',
@@ -1195,6 +1237,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Send a keysend (spontaneous) payment — blocks until settled or timeout',
+					description:
+						'When maxFeeSats is not given the routing fee is capped at 1% of the amount, never below 50 sats. maxPaymentSats and the daily spend limit count the amount plus that cap at admission (403 SPENDING_LIMIT_EXCEEDED) and the amount plus the fee actually paid once the keysend settles.',
 					tags: ['Payments'],
 					requestBody: bodyContent({
 						pubkey: 'string',
@@ -1207,6 +1251,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'200': {
 							description: 'Payment result',
 							content: jsonContent({ $ref: '#/components/schemas/PaymentInfo' })
+						},
+						'409': {
+							description:
+								'FEE_EXCEEDS_MAX, every route costs more than maxFeeSats / maxFeeMsat; nothing was sent'
 						}
 					}
 				}
@@ -1215,6 +1263,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Send a keysend payment — never throws, always returns PaymentInfo',
+					description:
+						"Same fee cap and limits as POST /keysend: 1% of the amount with a 50 sat floor when maxFeeSats is not given, counted with the amount by maxPaymentSats and the daily spend limit. A limit refusal is reported in the result's failureDescription.",
 					tags: ['Payments'],
 					requestBody: bodyContent({
 						pubkey: 'string',
@@ -1455,6 +1505,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Send a payment along an explicit route (hops from POST /route/query)',
+					description:
+						"Admitted like every other pay route: 409 SERVICE_DRAINING while draining, and maxPaymentSats and the daily spend limit judged on what the first hop carries (the amount plus every fee in the route), which is what leaves this node; over a limit answers 403 SPENDING_LIMIT_EXCEEDED. The first hop must carry at least the final hop's amount and no hop may be negative (400 INVALID_PARAMS). The settlement is charged to the daily spend at the first hop's amount.",
 					tags: ['Payments'],
 					requestBody: {
 						content: {
@@ -1655,9 +1707,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			},
 			'/backup': {
 				post: {
-					summary: 'Create database backup',
+					summary:
+						'Create database backup at the canonical destPath (returned as path; a relative destPath resolves against the working directory of the daemon, not the caller), with its seed-derived MAC in <destPath>.hmac (returned as macPath; `beignet restore db` needs it). An existing destPath or MAC file needs overwrite: true; the live database, its sidecars, the instance lock, config.json and daemon.pid are always refused',
 					tags: ['Node'],
-					requestBody: bodyContent({ destPath: 'string' }),
+					requestBody: bodyContent({
+						destPath: 'string',
+						overwrite: 'boolean?'
+					}),
 					responses: { '200': { description: 'Backup result' } }
 				}
 			},
@@ -1786,7 +1842,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								'AMOUNT_TOO_SMALL naming the minimum of the applicable mode, or INVALID_PARAMS'
 						},
 						'409': {
-							description: 'RECEIVE_UNAVAILABLE: the peer is not connected'
+							description:
+								"RECEIVE_UNAVAILABLE: the peer is not connected, or in bolt11 mode did not answer within 15 s or refused (the message is the peer's own, e.g. 'Your node does not provide offline receiving.'); RECEIVE_BUSY: too many receive requests in flight"
 						}
 					}
 				}
@@ -1810,7 +1867,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'409': {
 							description:
-								'RECEIVE_UNAVAILABLE: the peer is not connected, or direct funding is configured for a different peer'
+								"RECEIVE_UNAVAILABLE: the peer is not connected, in bolt11 mode did not answer within 15 s or refused (the message is the peer's own, e.g. 'Your node does not provide offline receiving.'), or direct funding is configured for a different peer; RECEIVE_BUSY: another request is being prepared or too many receive requests are in flight"
 						}
 					}
 				}
@@ -1950,7 +2007,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ffor/recover': {
 				post: {
 					summary:
-						'R, back online: fetch every provisioned witness, credit each record that verifies, then close the epoch cooperatively when S is there and ACTIVE, or force-close with every known preimage when forceCloseIfUnreachable is true and S is not. Returns what was learned and what was done. On a channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret, forceCloseIfUnreachable also needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for, since it publishes the same commitment (issue #908)',
+						'R, back online: fetch every provisioned witness, credit each record that verifies, then close the epoch cooperatively when S is there and ACTIVE, or force-close with every known preimage when forceCloseIfUnreachable is true and S is not. Returns what was learned and what was done. On a channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret, forceCloseIfUnreachable also needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for, since it publishes the same commitment (issue #908). So does any channel while the recovery gate is fenced or quarantined (issue #1013)',
 					tags: ['FFOR'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -1974,7 +2031,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ffor/enforce': {
 				post: {
 					summary:
-						'R: force-close the channel carrying every known preimage; each settled voucher claims through its setup-time HTLC-success signature. The remedy when S will not answer ff_close or contradicted the epoch. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for: its recency cannot be proven, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path (issue #908)',
+						'R: force-close the channel carrying every known preimage; each settled voucher claims through its setup-time HTLC-success signature. The remedy when S will not answer ff_close or contradicted the epoch. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for: its recency cannot be proven, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path (issue #908). So does any channel while the recovery gate is fenced or quarantined (issue #1013)',
 					tags: ['FFOR'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -2152,7 +2209,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/guardian/status': {
 				get: {
 					summary:
-						"The reference guardian this node serves to OTHER beignet nodes over bolt8 sessions (docs/RECOVERY-GUARDIAN-WIRE.md 2.7): serving false when hosting is off, and also while hosting is on but the Lightning listener guardians dial is not bound, when listenError (a ListenerProblem) says why (issue #861); whenever hosting is on, the guardian id, whether a bearer token is required, open sessions, requests retained in flight, every served set (id, members, namespaces, bytes stored and on disk, registeredAt), the bytes stored across sets, and the limits (per-record ciphertext, bytes per set, sets). Independent of this node's own recovery mode",
+						"The reference guardian this node serves to OTHER beignet nodes over bolt8 sessions (docs/RECOVERY-GUARDIAN-WIRE.md 2.7): serving false when hosting is off, and also while hosting is on but the Lightning listener guardians dial is not bound, when listenError (a ListenerProblem) says why (issue #861); whenever hosting is on, the guardian id, whether a bearer token is required, open sessions, requests retained in flight, every served set (id, members, namespaces, bytes stored and on disk, registeredAt), the bytes stored across sets, and the limits (per-record ciphertext, bytes per set, namespaces per set, bytes per namespace, sets). Independent of this node's own recovery mode",
 					tags: ['Node'],
 					responses: {
 						'200': {
@@ -2218,7 +2275,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						amountSats: 'number',
 						satsPerVbyte: 'number?'
 					}),
-					responses: { '200': { description: 'Transaction info' } }
+					responses: {
+						'200': { description: 'Transaction info' },
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: amount + fee over maxPaymentSats or dailySpendLimitSats'
+						}
+					}
 				}
 			},
 			'/send-max': {
@@ -2235,7 +2298,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description: 'Transaction info',
 							content: jsonContent({ $ref: '#/components/schemas/TxInfo' })
 						},
-						'400': { description: 'Invalid address/fee rate or no UTXOs' }
+						'400': { description: 'Invalid address/fee rate or no UTXOs' },
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: the whole sweep over maxPaymentSats or dailySpendLimitSats'
+						}
 					}
 				}
 			},
@@ -2336,13 +2403,17 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/psbt/import-signed': {
 				post: {
 					summary:
-						'Validate and finalize an externally signed PSBT; returns { txid, txHex } WITHOUT broadcasting',
+						'Validate and finalize an externally signed PSBT; returns { txid, txHex } WITHOUT broadcasting. The node remembers only its 50 most recent builds, in memory; for an older build or one from before a restart, pass unsignedPsbtBase64 (the PSBT /psbt/build returned)',
 					tags: ['Node'],
-					requestBody: bodyContent({ psbtBase64: 'string' }),
+					requestBody: bodyContent({
+						psbtBase64: 'string',
+						unsignedPsbtBase64: 'string?'
+					}),
 					responses: {
 						'200': { description: 'Finalized transaction (not broadcast)' },
 						'400': {
-							description: 'PSBT_IMPORT_FAILED (missing/invalid signatures)'
+							description:
+								'PSBT_IMPORT_FAILED (missing/invalid signatures, an input already finalized, or inputs/outputs that differ from unsignedPsbtBase64 or, without it, from every PSBT this node remembers building)'
 						}
 					}
 				}
@@ -2435,7 +2506,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							content: jsonContent({
 								$ref: '#/components/schemas/RebalanceExecutionSummary'
 							})
-						}
+						},
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: the advisor fee budget for the day does not fit the remaining dailySpendLimitSats'
+						},
+						'409': { description: 'SERVICE_DRAINING' }
 					}
 				}
 			},
@@ -2459,6 +2535,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'400': {
 							description: 'No route, fee exceeds maxFeeSats, or invalid params'
+						},
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: maxFeeSats does not fit the remaining dailySpendLimitSats'
+						},
+						'409': {
+							description: 'SERVICE_DRAINING, or NODE_DESTROYED during shutdown'
 						}
 					}
 				}
@@ -2691,7 +2774,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/swaps/cancel': {
 				post: {
 					summary:
-						'Cancel a swap before any funds moved: a reverse swap in CREATED or HELD (closes its hold invoice and fails the payer), a submarine swap before PAYING (the peer refunds its own coins at the refund height). Past that a swap resolves on chain by claim or refund. Admin scope',
+						'Cancel a swap before any funds moved: a reverse swap in CREATED or HELD (closes its hold invoice and fails the payer), a submarine swap before PAYING (the peer refunds its own coins at the refund height). Also ends a stranded reverse swap (EXPOSED with strandedHeight set: its funding was absent past the refund height). Past that a swap resolves on chain by claim or refund. Admin scope',
 					tags: ['Swaps'],
 					requestBody: {
 						required: true,
@@ -2716,7 +2799,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'409': {
 							description:
-								'SWAP_NOT_CANCELLABLE: the swap is past CREATED/HELD (reverse) or PAYING (submarine) and resolves on chain'
+								'SWAP_NOT_CANCELLABLE: the swap is past CREATED/HELD (reverse, unless stranded) or PAYING (submarine) and resolves on chain'
 						}
 					}
 				}
@@ -2724,7 +2807,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string, htlcCount, and the GET /invoices/held expiry fields minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks and cancelHeight (issue #770), hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, the splice lifecycle splice:complete, splice:aborted, splice:conflicted, splice:reverted (issue #760; channelId plus spliceTxid and conflictTxid where they exist, display order), peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:delegated-failed, ffor:enforce (carries restoreRecencyUnproven: true for a capsule hold, reestablishRecencyUnproven: true for an unproven peer claim and reestablishSecretMissing: true for a missing local per-commitment secret, including several when several hold; either requires acceptStaleStateRisk: true on POST /ffor/enforce and on POST /ffor/recover with forceCloseIfUnreachable: true; issues #908 and #907), ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:witness-refused, ffor:witness-closed, ffor:witness-expired, ffor:witness-audit (a fetched record that failed verification: channelId, witnessNodeId, k, reason), ffor:issuer-provisioned, ffor:issuer-issued, ffor:issuer-retired (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason. node:error code REESTABLISH_SECRET_MISSING is raised when this node cannot build its own channel_reestablish for a channel, because its shachain store holds no per-commitment secret at the index its revocation counter names: nothing is sent to the peer (all zeroes there is a protocol violation), the channel is failed and held, and the message names the channel, the revocation index and the acknowledged force close that is the exit. node:error code HTLC_DEADLINE_HELD is raised by each on-chain HTLC deadline backstop (HTLC_CLAIM_FORCE_CLOSE, FORWARD_TIMEOUT_FORCE_CLOSE, HTLC_EXPIRY_FORCE_CLOSE) that declines to force-close a channel held under restoreRecencyUnproven or reestablishRecencyUnproven, naming the channel, the HTLC and its payment hash, its cltv_expiry, the current height, which hold it is and the acknowledged force close (/channel/forceclose with acceptStaleStateRisk: true) that is the exit; throttled per HTLC per backstop, since only an operator can resolve such an HTLC before its deadline. node:error code LISTEN_FAILED is raised when the OS refuses a configured TCP or WebSocket listener bind (the port is taken or not permitted): the message names the listener, the port and the OS error, says inbound peers cannot connect and, for a guardian host, that its guardian is unreachable. It is not fatal and nothing retries it; GET /info carries the same failure as listenError or websocketListenError. A bind failure at startup is raised before this stream is wired, so read it from GET /info or GET /logs?category=error (issue #861)',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string, htlcCount, and the GET /invoices/held expiry fields minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks and cancelHeight (issue #770), hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, the splice lifecycle splice:complete, splice:aborted, splice:conflicted, splice:reverted (issue #760; channelId plus spliceTxid and conflictTxid where they exist, display order), peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:delegated-failed, ffor:enforce (carries restoreRecencyUnproven: true for a capsule hold, reestablishRecencyUnproven: true for an unproven peer claim and reestablishSecretMissing: true for a missing local per-commitment secret, including several when several hold; either requires acceptStaleStateRisk: true on POST /ffor/enforce and on POST /ffor/recover with forceCloseIfUnreachable: true; issues #908 and #907), ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:witness-refused, ffor:witness-closed, ffor:witness-expired, ffor:witness-audit (a fetched record that failed verification: channelId, witnessNodeId, k, reason), ffor:issuer-provisioned, ffor:issuer-issued, ffor:issuer-retired (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason. The broadcast codes BROADCAST_FAILED (the chain watcher could not hand a transaction to the backend and will retry it on the next block), BROADCAST_PERMANENT_FAILURE (the watcher gave up after its retries) and SPLICE_BROADCAST_REFUSED (the backend refused a fully signed splice the node re-sends every block; raised once per transaction and reason) also carry txid, the transaction in display order, and retained: true when the node itself still holds that transaction and rebroadcasts it on every block until it confirms (a pending funding, an in-flight or adopted but unconfirmed splice), false when the watcher queue was its only driver, such as a close or a sweep (issue #1062).node:error code REESTABLISH_SECRET_MISSING is raised when this node cannot build its own channel_reestablish for a channel, because its shachain store holds no per-commitment secret at the index its revocation counter names: nothing is sent to the peer (all zeroes there is a protocol violation), the channel is failed and held, and the message names the channel, the revocation index and the acknowledged force close that is the exit. node:error code HTLC_DEADLINE_HELD is raised by each on-chain HTLC deadline backstop (HTLC_CLAIM_FORCE_CLOSE, FORWARD_TIMEOUT_FORCE_CLOSE, HTLC_EXPIRY_FORCE_CLOSE) that declines to force-close a channel held under restoreRecencyUnproven or reestablishRecencyUnproven, naming the channel, the HTLC and its payment hash, its cltv_expiry, the current height, which hold it is and the acknowledged force close (/channel/forceclose with acceptStaleStateRisk: true) that is the exit; throttled per HTLC per backstop, since only an operator can resolve such an HTLC before its deadline. node:error code LISTEN_FAILED is raised when the OS refuses a configured TCP or WebSocket listener bind (the port is taken or not permitted): the message names the listener, the port and the OS error, says inbound peers cannot connect and, for a guardian host, that its guardian is unreachable. It is not fatal and nothing retries it; GET /info carries the same failure as listenError or websocketListenError. A bind failure at startup is raised before this stream is wired, so read it from GET /info or GET /logs?category=error (issue #861)',
 					tags: ['Node'],
 					responses: {
 						'200': {
@@ -3276,7 +3359,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'403': {
 							description:
-								'SPENDING_LIMIT_EXCEEDED: an address-targeted splice-out over dailySpendLimitSats'
+								'SPENDING_LIMIT_EXCEEDED: an address-targeted splice-out over maxPaymentSats or dailySpendLimitSats'
 						},
 						'404': { description: 'CHANNEL_NOT_FOUND' },
 						'409': {
@@ -3381,16 +3464,28 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/offer/pay': {
 				post: {
 					summary: 'Pay a BOLT 12 offer',
+					description:
+						"When neither maxFeeSats nor maxFeeMsat is given the routing fee is capped at 1% of the invoice the payee returns, never below 50 sats. maxPaymentSats and the daily spend limit count that invoice's amount plus the cap at admission (403 SPENDING_LIMIT_EXCEEDED) and the amount plus the fee actually paid once the payment settles.",
 					tags: ['Offers'],
 					requestBody: bodyContent({
 						offer: 'string',
 						amountSats: 'number?',
-						timeoutMs: 'number?'
+						timeoutMs: 'number?',
+						maxFeeSats: 'number?',
+						maxFeeMsat: 'string?'
 					}),
 					responses: {
 						'200': {
 							description: 'Payment result',
 							content: jsonContent({ $ref: '#/components/schemas/PaymentInfo' })
+						},
+						'409': {
+							description:
+								'FEE_EXCEEDS_MAX, every route costs more than maxFeeSats / maxFeeMsat; nothing was sent. DUPLICATE_PAYMENT, with error.paymentHash, for a keyed retry of a timed-out payment that can still settle'
+						},
+						'504': {
+							description:
+								'PAYMENT_TIMEOUT, with error.paymentHash. A keyed retry does not request a new invoice while that payment can still settle, and answers 200 once it completed'
 						}
 					}
 				}
@@ -3399,11 +3494,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Register a webhook for event notifications (persistent across restarts)',
+					description:
+						'The url must be http or https. A loopback, private, or link-local host is refused (403 PRIVATE_NETWORK_REFUSED) unless allowPrivateNetwork is true. Payloads never carry a payment preimage; read it from GET /payment.',
 					tags: ['Webhooks'],
 					requestBody: bodyContent({
 						url: 'string',
 						events: 'string',
-						secret: 'string?'
+						secret: 'string?',
+						allowPrivateNetwork: 'boolean?'
 					}),
 					responses: {
 						'200': {
@@ -3446,6 +3544,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				post: {
 					summary:
 						'Add a payment to the priority queue (persistent — survives restarts)',
+					description:
+						'Dispatched through POST /invoice/pay-safe: when maxFeeSats is not given the routing fee is capped at 1% of the amount, never below 50 sats, and maxPaymentSats and the daily spend limit count the amount plus that cap at dispatch.',
 					tags: ['Queue'],
 					requestBody: bodyContent({
 						bolt11: 'string',
@@ -3611,6 +3711,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								message: {
 									type: 'string',
 									description: 'Human-readable error message'
+								},
+								paymentHash: {
+									type: 'string',
+									description:
+										'The payment the error is about, hex (PAYMENT_TIMEOUT, and DUPLICATE_PAYMENT on a keyed /offer/pay retry)'
 								}
 							},
 							description: 'Error details (present when ok=false)'
@@ -3862,6 +3967,17 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description:
 								'Local balance the channel settles to when its in-flight splice locks; present only mid-splice (localBalanceSats stays pre-splice until splice_locked)'
 						},
+						pendingSpliceTxid: {
+							type: 'string',
+							description:
+								'The in-flight splice transaction id, display byte order like fundingTxid; present exactly when pendingSpliceLocalBalanceSats is, so a wallet can recognise the transaction moving its coins as this channel and not as a send (issue #1060)'
+						},
+						previousFundingTxids: {
+							type: 'array',
+							items: { type: 'string' },
+							description:
+								'Funding transaction ids this channel ran on before fundingTxid, oldest first, display byte order, one per adopted splice; absent on a channel that has never been spliced (issue #1060)'
+						},
 						htlcUsable: {
 							type: 'boolean',
 							description:
@@ -4021,7 +4137,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 										properties: {
 											pubkey: { type: 'string' },
 											shortChannelId: { type: 'string' },
-											feeMsat: { type: 'integer' }
+											feeMsat: {
+												type: 'integer',
+												description:
+													'Fee this hop kept, in msat: what it received less what it forwarded. 0 at the final hop.'
+											}
 										}
 									}
 								},
@@ -4433,7 +4553,15 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				RouteEstimate: {
 					type: 'object',
 					properties: {
-						feeSats: { type: 'integer' },
+						feeSats: {
+							type: 'integer',
+							description:
+								'Route fee rounded up to whole sats, so it is safe to pass as maxFeeSats'
+						},
+						feeMsat: {
+							type: 'string',
+							description: 'Exact route fee in msat, as a decimal string'
+						},
 						hops: { type: 'integer' },
 						cltvDelta: { type: 'integer' }
 					}
@@ -4754,7 +4882,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						skippedBudget: { type: 'integer' },
 						feeSpentMsat: {
 							type: 'string',
-							description: 'Fees spent by this run, msat as decimal string'
+							description:
+								'Fees spent by this run, msat as decimal string. An attempt whose wait timed out counts at its fee cap'
 						},
 						budgetRemainingMsat: {
 							type: 'string',
@@ -4960,7 +5089,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						estimatedFeeSats: {
 							type: 'integer',
-							description: 'Estimated routing fee in satoshis'
+							description:
+								'Estimated routing fee in satoshis, rounded up so it is safe to pass as maxFeeSats'
+						},
+						estimatedFeeMsat: {
+							type: 'string',
+							description:
+								'Exact estimated routing fee in msat, as a decimal string'
 						},
 						hopCount: {
 							type: 'integer',
@@ -4973,6 +5108,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'routeQuality',
 						'alternativeAvailable',
 						'estimatedFeeSats',
+						'estimatedFeeMsat',
 						'hopCount'
 					]
 				},

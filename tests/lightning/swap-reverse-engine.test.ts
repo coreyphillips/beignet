@@ -9,6 +9,8 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
+import * as ecc from '@bitcoinerlab/secp256k1';
+import { ECPairFactory } from 'ecpair';
 import { BeignetCustomSubtype } from '../../src/lightning/message/custom';
 import { Network } from '../../src/lightning/invoice/types';
 import {
@@ -29,6 +31,7 @@ import {
 	verifyReverseSwapTerms
 } from '../../src/lightning/swaps';
 import { IDfCustomMessage } from '../../src/lightning/direct-funding/transport';
+import { WalletFundingProvider } from '../../src/lightning/wallet/wallet-funding-provider';
 import { FakeDfPeer } from './helpers/df-transport';
 import {
 	IClientSwap,
@@ -69,6 +72,7 @@ async function create(
 		maxTotalFeeSat: bigint;
 		direction: SwapWireDirection;
 		from: FakeDfPeer;
+		preferredRefundDelta: number;
 	}> = {}
 ): Promise<ISwapCreateAck> {
 	const from = overrides.from ?? h.client;
@@ -82,7 +86,8 @@ async function create(
 			paymentHash: swap.paymentHash,
 			claimPubkey: swap.claimPubkey,
 			onchainAmountSat: overrides.onchainAmountSat ?? AMOUNT,
-			maxTotalFeeSat: overrides.maxTotalFeeSat ?? 5_000n
+			maxTotalFeeSat: overrides.maxTotalFeeSat ?? 5_000n,
+			preferredRefundDelta: overrides.preferredRefundDelta
 		})
 	);
 	await settle();
@@ -382,6 +387,74 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(record(h, swap).state).to.equal('CANCELLED');
 			expect(h.holds.cancelled).to.have.length(1);
 		});
+
+		it('a preferred refund delta above the default mints a hold that outlives it (issue #1039)', async function () {
+			const h = await harness();
+			const swap = clientSwap();
+			const ack = await create(h, swap, { preferredRefundDelta: 120 });
+			expect(ack.accepted, ack.reasonText).to.equal(true);
+			const r = record(h, swap);
+			expect(r.refundHeight).to.equal(1120);
+			const finalCltv = h.holds.invoices.get(
+				swap.paymentHash.toString('hex')
+			)!.minFinalCltvExpiry;
+			expect(finalCltv).to.equal(120 + 6 + 18 + 8);
+			// The payer locks exactly the invoice's final CLTV.
+			h.holds.hold(
+				swap.paymentHash,
+				BigInt(r.invoiceMsat),
+				h.chain.height + finalCltv
+			);
+			await settle();
+			expect(record(h, swap).state).to.equal('FUNDING_BROADCAST');
+		});
+
+		it('unpaid creates hold no concurrency slot; the cap binds once swaps are paid (issue #1039)', async function () {
+			const h = await harness({
+				config: {
+					exposure: {
+						minSwapSat: 10_000n,
+						maxSwapSat: AMOUNT,
+						maxTotalExposureSat: 10n * AMOUNT,
+						maxConcurrentSwaps: 2,
+						feeReserveSat: 0n,
+						fundingFeeRateCeilingSatPerVbyte: 200
+					}
+				}
+			});
+			// Two throwaway node ids fill their quota with swaps never paid.
+			for (const name of ['sybil-a', 'sybil-b']) {
+				const sybil = h.net.add(name);
+				h.net.connect(h.provider, sybil);
+				for (let i = 0; i < 4; i++) {
+					const ack = await create(h, clientSwap(), { from: sybil });
+					expect(ack.accepted, ack.reasonText).to.equal(true);
+				}
+			}
+			const paid = [clientSwap(), clientSwap(), clientSwap()];
+			for (const swap of paid) {
+				const ack = await create(h, swap);
+				expect(ack.accepted, ack.reasonText).to.equal(true);
+			}
+			for (const swap of paid) {
+				const r = record(h, swap);
+				h.holds.hold(
+					swap.paymentHash,
+					BigInt(r.invoiceMsat),
+					r.refundHeight + 60
+				);
+				await settle();
+			}
+			expect(paid.map((swap) => record(h, swap).state)).to.deep.equal([
+				'FUNDING_BROADCAST',
+				'FUNDING_BROADCAST',
+				'CANCELLED'
+			]);
+			expect(record(h, paid[2]).failureReason).to.match(/2 swaps at risk/);
+			expect((await create(h, clientSwap())).reason).to.equal(
+				SwapRefusalReason.EXPOSURE_EXCEEDED
+			);
+		});
 	});
 
 	describe('funding', function () {
@@ -448,6 +521,300 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(h.chain.broadcasts).to.deep.equal([stuck.fundingTxHex]);
 		});
 
+		it('a retry past the funding margin is withheld, and a funding someone else puts out is still watched (issue #1012)', async function () {
+			const h = await harness();
+			h.chain.failBroadcasts = 1_000;
+			const swap = clientSwap();
+			await create(h, swap);
+			const r = record(h, swap);
+			h.holds.hold(
+				swap.paymentHash,
+				BigInt(r.invoiceMsat),
+				r.refundHeight + 60
+			);
+			await settle();
+			expect(record(h, swap).state).to.equal('FUNDING');
+			// The backend would take the bytes now, but the refund height is
+			// inside the funding margin: a fresh admission would refuse.
+			h.chain.failBroadcasts = 0;
+			for (const height of [r.refundHeight - 6, r.refundHeight - 5]) {
+				h.chain.height = height;
+				await h.engine.onBlock(height);
+			}
+			const withheld = record(h, swap);
+			expect(withheld.state).to.equal('FUNDING');
+			expect(withheld.lastError).to.match(/^broadcast withheld: /);
+			expect(h.chain.broadcasts).to.have.length(0);
+			expect(h.chain.mempoolHas(withheld.fundingTxid!)).to.equal(false);
+			expect(h.holds.cancelled).to.have.length(0);
+			expect(
+				h.logs.filter((l) => l.action === 'swap_broadcast_withheld')
+			).to.have.length(1);
+			// Bytes that reach the chain anyway move on, and the claim on them
+			// settles the hold that was left parked.
+			h.chain.place(bitcoin.Transaction.fromHex(withheld.fundingTxHex!), 0);
+			await h.engine.onBlock(h.chain.height);
+			expect(record(h, swap).state).to.equal('FUNDING_BROADCAST');
+			h.chain.place(claimTxFor(record(h, swap), swap), 0);
+			await h.engine.onBlock(h.chain.height);
+			expect(record(h, swap).state).to.equal('SETTLED');
+			expect(h.holds.settled).to.have.length(1);
+		});
+
+		it('a funding the mempool dropped is rebroadcast only while the margins hold (issue #1012)', async function () {
+			const h = await harness();
+			const { swap } = await fundedSwap(h);
+			const r = record(h, swap);
+			expect(h.chain.broadcasts).to.have.length(1);
+			h.chain.evict(r.fundingTxid!);
+			await h.engine.onBlock(1001);
+			expect(h.chain.broadcasts).to.have.length(2);
+			h.chain.evict(r.fundingTxid!);
+			h.chain.height = r.refundHeight - 6;
+			await h.engine.onBlock(h.chain.height);
+			expect(h.chain.broadcasts).to.have.length(2);
+			expect(h.chain.mempoolHas(r.fundingTxid!)).to.equal(false);
+			const withheld = record(h, swap);
+			expect(withheld.state).to.equal('FUNDING_BROADCAST');
+			expect(withheld.lastError).to.match(/^broadcast withheld: /);
+			expect(h.holds.cancelled).to.have.length(0);
+		});
+
+		it('a funding reorged out is rebroadcast only while the hold is live (issue #1099)', async function () {
+			const h = await harness();
+			const { swap } = await fundedSwap(h);
+			const r = record(h, swap);
+			h.chain.confirm(r.fundingTxid!, 1001);
+			h.chain.height = 1001;
+			await h.engine.onBlock(1001);
+			expect(record(h, swap).fundingHeight).to.equal(1001);
+			h.chain.evict(r.fundingTxid!);
+			h.chain.height = 1002;
+			await h.engine.onBlock(1002);
+			expect(h.chain.broadcasts).to.have.length(2);
+			expect(record(h, swap).fundingHeight).to.equal(undefined);
+
+			h.chain.confirm(r.fundingTxid!, 1003);
+			h.chain.height = 1003;
+			await h.engine.onBlock(1003);
+			expect(record(h, swap).fundingHeight).to.equal(1003);
+			h.holds.sweep(swap.paymentHash);
+			await settle();
+			expect(record(h, swap).state).to.equal('EXPOSED');
+			h.chain.evict(r.fundingTxid!);
+			h.chain.height = 1004;
+			await h.engine.onBlock(1004);
+			const withheld = record(h, swap);
+			expect(h.chain.broadcasts).to.have.length(2);
+			expect(h.chain.mempoolHas(r.fundingTxid!)).to.equal(false);
+			expect(withheld.fundingHeight).to.equal(undefined);
+			expect(withheld.lastError).to.match(/^broadcast withheld: hold is/);
+			// Still watched: bytes someone else puts back are tracked again.
+			h.chain.place(bitcoin.Transaction.fromHex(r.fundingTxHex!), 1005);
+			h.chain.height = 1005;
+			await h.engine.onBlock(1005);
+			expect(record(h, swap).fundingHeight).to.equal(1005);
+		});
+
+		it('a reorg rebroadcast that fails is retried on the next block (issue #1129)', async function () {
+			const h = await harness();
+			const { swap } = await fundedSwap(h);
+			const r = record(h, swap);
+			h.chain.confirm(r.fundingTxid!, 1001);
+			h.chain.height = 1001;
+			await h.engine.onBlock(1001);
+			expect(record(h, swap).state).to.equal('FUNDED');
+			h.chain.evict(r.fundingTxid!);
+			h.chain.failBroadcasts = 1;
+			h.chain.height = 1002;
+			await h.engine.onBlock(1002);
+			expect(h.chain.broadcasts).to.have.length(1);
+			expect(record(h, swap).fundingHeight).to.equal(undefined);
+
+			h.chain.height = 1003;
+			await h.engine.onBlock(1003);
+			expect(h.chain.broadcasts).to.have.length(2);
+			expect(h.chain.mempoolHas(r.fundingTxid!)).to.equal(true);
+			expect(record(h, swap).state).to.equal('FUNDED');
+
+			// The retry is judged live, like any other, and a withheld one
+			// holds no wallet coins (issue #1149).
+			const pledges = h.wallet.pledged.length;
+			h.chain.evict(r.fundingTxid!);
+			h.chain.height = r.refundHeight - 6;
+			await h.engine.onBlock(h.chain.height);
+			expect(h.chain.broadcasts).to.have.length(2);
+			const withheld = record(h, swap);
+			expect(withheld.state).to.equal('FUNDED');
+			expect(withheld.lastError).to.match(/^broadcast withheld: /);
+			expect(h.wallet.pledged).to.have.length(pledges);
+		});
+
+		it('a funding retry waits for its pledge and is judged again after it (issue #1149)', async function () {
+			const h = await harness();
+			const { swap } = await fundedSwap(h);
+			const r = record(h, swap);
+			h.chain.confirm(r.fundingTxid!, 1001);
+			h.chain.height = 1001;
+			await h.engine.onBlock(1001);
+			expect(record(h, swap).state).to.equal('FUNDED');
+			const pledges = h.wallet.pledged.length;
+			let releasePledge: () => void = () => undefined;
+			h.wallet.pledgeGate = () =>
+				new Promise<void>((resolve) => {
+					releasePledge = resolve;
+				});
+
+			h.chain.evict(r.fundingTxid!);
+			h.chain.height = 1002;
+			let pass = h.engine.onBlock(1002);
+			await settle();
+			expect(h.chain.broadcasts).to.have.length(1);
+			releasePledge();
+			await pass;
+			expect(h.wallet.pledged.slice(pledges)).to.deep.equal([r.fundingTxHex]);
+			expect(h.chain.broadcasts).to.have.length(2);
+
+			// A cancel that lands while the wallet is pledging keeps the bytes in.
+			h.chain.evict(r.fundingTxid!);
+			h.chain.height = 1003;
+			pass = h.engine.onBlock(1003);
+			await settle();
+			h.holds.sweep(swap.paymentHash);
+			releasePledge();
+			await pass;
+			expect(h.chain.broadcasts).to.have.length(2);
+			expect(h.chain.mempoolHas(r.fundingTxid!)).to.equal(false);
+			expect(record(h, swap).lastError).to.match(
+				/^broadcast withheld: hold is CANCELLED/
+			);
+			// The pledge it took while waiting is given back.
+			expect(h.wallet.released).to.deep.equal([r.fundingTxHex]);
+		});
+
+		it('a failed reorg rebroadcast keeps its input out of wallet selection (issue #1149)', async function () {
+			const network = bitcoin.networks.regtest;
+			const key = ECPairFactory(ecc).makeRandom({ network });
+			const pubkey = Buffer.from(key.publicKey);
+			const payment = bitcoin.payments.p2wpkh({ pubkey, network });
+			const parents = [200_000, 100_000, 100_000].map((value) => {
+				const tx = new bitcoin.Transaction();
+				tx.addInput(crypto.randomBytes(32), 0);
+				tx.addOutput(payment.output!, value);
+				return tx;
+			});
+			const utxos = parents.map((tx) => ({
+				address: payment.address!,
+				path: "m/84'/0/0",
+				tx_hash: tx.getId(),
+				tx_pos: 0,
+				value: tx.outs[0].value,
+				height: 900,
+				publicKey: pubkey.toString('hex')
+			}));
+			const fundingCoin = utxos[0];
+			const coin = `${fundingCoin.tx_hash}:0`;
+			const frozen = new Set<string>();
+			const ok = <T>(value: T) => ({ isErr: () => false, value });
+			const wallet = {
+				network: 'regtest',
+				// The swap funding spends the largest coin.
+				send: async (p: { address: string; amount: number }) => {
+					const tx = new bitcoin.Transaction();
+					tx.version = 2;
+					tx.addInput(Buffer.from(fundingCoin.tx_hash, 'hex').reverse(), 0);
+					tx.addOutput(
+						bitcoin.address.toOutputScript(p.address, network),
+						p.amount
+					);
+					tx.addOutput(payment.output!, 90_000);
+					return ok(tx.toHex());
+				},
+				listUtxos: () => utxos,
+				getPrivateKey: () => key.toWIF(),
+				getChangeAddress: async () => ok({ address: payment.address! }),
+				isUtxoFrozen: (txid: string, index: number) =>
+					frozen.has(`${txid}:${index}`),
+				freezeUtxo: async (p: { txid: string; index: number }) => {
+					frozen.add(`${p.txid}:${p.index}`);
+					return ok('frozen');
+				},
+				unfreezeUtxo: async (p: { txid: string; index: number }) => {
+					frozen.delete(`${p.txid}:${p.index}`);
+					return ok('unfrozen');
+				},
+				electrum: {
+					getTransactions: async (params: {
+						txHashes: Array<{ tx_hash: string }>;
+					}) =>
+						ok({
+							data: params.txHashes.map((t) => ({
+								data: { tx_hash: t.tx_hash },
+								result: {
+									txid: t.tx_hash,
+									hex: parents.find((p) => p.getId() === t.tx_hash)!.toHex()
+								}
+							}))
+						})
+				}
+			};
+			const fp = new WalletFundingProvider(wallet as never);
+			const selectOutpoints = async (amountSat: bigint): Promise<string[]> =>
+				(await fp.selectSpliceInputs(amountSat, 1000)).inputs.map(
+					(i) =>
+						`${bitcoin.Transaction.fromBuffer(i.prevTx).getId()}:${
+							i.prevOutputIndex
+						}`
+				);
+			// Wired the way the node wires its funding provider.
+			const h = await harness({
+				deps: {
+					fundOutput: async (address, amountSat, feeRate) => {
+						const built = await fp.buildFundingTransaction(
+							address,
+							amountSat,
+							feeRate
+						);
+						return {
+							txHex: built.txHex,
+							txid: built.txid,
+							vout: built.outputIndex
+						};
+					},
+					pledge: (txHex) => fp.pledgeTransactionInputs(txHex)
+				}
+			});
+			const { swap } = await fundedSwap(h);
+			const r = record(h, swap);
+			expect(frozen.has(coin)).to.equal(true);
+			h.chain.confirm(r.fundingTxid!, 1001);
+			h.chain.height = 1001;
+			await h.engine.onBlock(1001);
+			expect(record(h, swap).state).to.equal('FUNDED');
+
+			// The wallet sees the spend, and its next selection prunes the pledge.
+			utxos.splice(0, 1);
+			await selectOutpoints(50_000n);
+			expect(frozen.has(coin)).to.equal(false);
+
+			// A reorg hands the coin back and the rebroadcast fails.
+			utxos.unshift(fundingCoin);
+			h.chain.evict(r.fundingTxid!);
+			h.chain.failBroadcasts = 1;
+			h.chain.height = 1002;
+			await h.engine.onBlock(1002);
+			expect(h.chain.broadcasts).to.have.length(1);
+			expect(frozen.has(coin)).to.equal(true);
+			expect(await selectOutpoints(50_000n)).to.deep.equal([
+				`${utxos[2].tx_hash}:0`
+			]);
+
+			h.chain.height = 1003;
+			await h.engine.onBlock(1003);
+			expect(h.chain.broadcasts).to.have.length(2);
+			expect(h.chain.mempoolHas(r.fundingTxid!)).to.equal(true);
+		});
+
 		it('reports funding progress over status and confirms to policy', async function () {
 			const h = await harness();
 			const { swap, ack } = await fundedSwap(h);
@@ -455,7 +822,7 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			let st = await status(h, ack.terms!.swapId);
 			expect(st.state).to.equal(SwapWireState.FUNDING);
 			expect(st.fundingTxid!.toString('hex')).to.equal(r.fundingTxid);
-			expect(st.fundingTx!.toString('hex')).to.equal(r.fundingTxHex);
+			expect(st.fundingTx).to.equal(undefined);
 			h.chain.confirm(r.fundingTxid!, 1001);
 			h.chain.height = 1001;
 			await h.engine.onBlock(1001);
@@ -464,6 +831,7 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			st = await status(h, ack.terms!.swapId);
 			expect(st.state).to.equal(SwapWireState.FUNDED);
 			expect(st.fundingConfirmations).to.equal(1);
+			expect(st.fundingTx!.toString('hex')).to.equal(r.fundingTxHex);
 			expect(names(h)).to.include('swap:funded');
 		});
 	});
@@ -837,6 +1205,107 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(h2.chain.broadcasts).to.have.length(0);
 		});
 
+		/** Bytes that may be out, never seen on chain, and a hold that is gone. */
+		async function strandedSwap(
+			h: ISwapHarness
+		): Promise<{ swap: IClientSwap; r: ISwapRecord }> {
+			h.chain.failBroadcasts = 1;
+			const swap = clientSwap();
+			await create(h, swap);
+			const r = record(h, swap);
+			h.holds.hold(
+				swap.paymentHash,
+				BigInt(r.invoiceMsat),
+				r.refundHeight + 60
+			);
+			await settle();
+			h.holds.sweep(swap.paymentHash);
+			await settle();
+			expect(record(h, swap).state).to.equal('EXPOSED');
+			return { swap, r };
+		}
+
+		it('an exposed swap whose funding never confirmed fails once its input is spent elsewhere (issue #1039)', async function () {
+			const h = await harness();
+			// The wallet's coin, confirmed, so the resolver can follow its spends.
+			const coin = new bitcoin.Transaction();
+			coin.version = 2;
+			coin.addInput(crypto.randomBytes(32), 0, 0xfffffffd);
+			coin.addOutput(h.destination, 500_000);
+			h.chain.place(coin, 990);
+			h.wallet.nextInput = { hash: coin.getHash(), index: 0 };
+			const { swap, r } = await strandedSwap(h);
+			// Up to the refund height plus the resolution margin it waits.
+			h.chain.height = r.refundHeight + 6;
+			await h.engine.onBlock(h.chain.height);
+			expect(record(h, swap).strandedHeight).to.equal(undefined);
+			// Past it an absent funding is only marked: absence proves nothing.
+			h.chain.height += 1;
+			await h.engine.onBlock(h.chain.height);
+			expect(record(h, swap).state).to.equal('EXPOSED');
+			expect(record(h, swap).strandedHeight).to.equal(h.chain.height);
+			expect(h.logs.some((l) => l.action === 'swap_stranded')).to.equal(true);
+			// The wallet spends the coin elsewhere: proof only at resolution depth.
+			const conflict = new bitcoin.Transaction();
+			conflict.version = 2;
+			conflict.addInput(coin.getHash(), 0, 0xfffffffd);
+			conflict.addOutput(h.destination, 400_000);
+			h.chain.place(conflict, h.chain.height);
+			await h.engine.onBlock(h.chain.height);
+			expect(record(h, swap).state).to.equal('EXPOSED');
+			// Deep enough, but something pays the contract under another txid
+			// (a malleated funding would): not stranded, the mark goes.
+			const other = new bitcoin.Transaction();
+			other.version = 2;
+			other.addInput(crypto.randomBytes(32), 0, 0xfffffffd);
+			other.addOutput(Buffer.from(r.outputScriptHex, 'hex'), Number(AMOUNT));
+			h.chain.place(other, 0);
+			h.chain.height += 1;
+			await h.engine.onBlock(h.chain.height);
+			expect(record(h, swap).state).to.equal('EXPOSED');
+			expect(record(h, swap).strandedHeight).to.equal(undefined);
+			h.chain.evict(other.getId());
+			await h.engine.onBlock(h.chain.height);
+			const failed = record(h, swap);
+			expect(failed.state).to.equal('FAILED');
+			expect(failed.failureReason).to.include(conflict.getId());
+			expect(failed.fundingTxHex).to.equal(undefined);
+			expect(h.wallet.released).to.have.length(1);
+			expect(h.engine.status().exposedCount).to.equal(0);
+			expect(names(h)[names(h).length - 1]).to.equal('swap:failed');
+		});
+
+		it('the operator can cancel an exposed swap only while this process sees its funding absent past the refund height (issue #1039)', async function () {
+			const h = await harness();
+			const { swap, r } = await strandedSwap(h);
+			const fundingHex = record(h, swap).fundingTxHex!;
+			expect(h.engine.cancel(r.id)).to.deep.equal({
+				ok: false,
+				reason: 'swap is EXPOSED'
+			});
+			h.chain.height = r.refundHeight + 7;
+			await h.engine.onBlock(h.chain.height);
+			expect(record(h, swap).strandedHeight).to.equal(h.chain.height);
+			// The funding shows up after all: the mark goes with it.
+			const funding = bitcoin.Transaction.fromHex(fundingHex);
+			h.chain.place(funding, 0);
+			h.chain.height += 1;
+			await h.engine.onBlock(h.chain.height);
+			expect(record(h, swap).strandedHeight).to.equal(undefined);
+			expect(h.engine.cancel(r.id).ok).to.equal(false);
+			// Gone again: marked again, and the operator ends it.
+			h.chain.evict(funding.getId());
+			h.chain.height += 1;
+			await h.engine.onBlock(h.chain.height);
+			expect(h.engine.cancel(r.id)).to.deep.equal({ ok: true });
+			const failed = record(h, swap);
+			expect(failed.state).to.equal('FAILED');
+			expect(failed.failureReason).to.match(/operator cancel/);
+			expect(failed.fundingTxHex).to.equal(undefined);
+			expect(h.wallet.released).to.deep.equal([fundingHex]);
+			expect(h.engine.status().exposedCount).to.equal(0);
+		});
+
 		it('a hold cancelled while the wallet is signing never has its bytes broadcast', async function () {
 			const h = await harness();
 			let releaseWallet: () => void = () => undefined;
@@ -913,9 +1382,9 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(h.chain.broadcasts).to.have.length(0);
 		});
 
-		it('status carries the funding bytes only once a broadcast was attempted', async function () {
+		it('status carries the funding bytes only once the chain confirms them (issue #1012)', async function () {
 			const h = await harness();
-			h.chain.failBroadcasts = 1;
+			h.chain.failBroadcasts = 1_000;
 			const swap = clientSwap();
 			await create(h, swap);
 			const r = record(h, swap);
@@ -925,13 +1394,27 @@ describe('Reverse swap provider engine (issue #737)', function () {
 				r.refundHeight + 60
 			);
 			await settle();
-			// Attempted and refused by the backend: the bytes may be out,
-			// the payer may have them.
+			// Attempted and refused while the hold is parked: bytes handed
+			// over now could still be put out after the cancel.
 			const stuck = record(h, swap);
 			expect(stuck.state).to.equal('FUNDING');
 			expect(stuck.fundingBroadcastAttemptedAt).to.be.a('number');
-			const st = await status(h, Buffer.from(stuck.id, 'hex'));
-			expect(st.fundingTx!.toString('hex')).to.equal(stuck.fundingTxHex);
+			const id = Buffer.from(stuck.id, 'hex');
+			expect((await status(h, id)).fundingTx).to.equal(undefined);
+			h.holds.sweep(swap.paymentHash);
+			await settle();
+			expect(record(h, swap).state).to.equal('EXPOSED');
+			const exposed = await status(h, id);
+			expect(exposed.state).to.equal(SwapWireState.EXPOSED);
+			expect(exposed.fundingTx).to.equal(undefined);
+			// Confirmed bytes are public: handing them out costs nothing.
+			h.chain.place(bitcoin.Transaction.fromHex(stuck.fundingTxHex!), 1001);
+			h.chain.height = 1001;
+			await h.engine.onBlock(1001);
+			expect(record(h, swap).fundingHeight).to.equal(1001);
+			expect((await status(h, id)).fundingTx!.toString('hex')).to.equal(
+				stuck.fundingTxHex
+			);
 		});
 
 		it('a restart judges the hold again before the first broadcast', async function () {
