@@ -47,7 +47,7 @@ export type IDfWallet = Pick<
 	| 'isUtxoFrozen'
 	| 'listFrozenUtxos'
 	| 'freezeUtxoIfUnfrozen'
-	| 'unfreezeUtxo'
+	| 'unfreezeUtxoIfTagged'
 	| 'getPrivateKey'
 	| 'getChangeAddress'
 	| 'transactions'
@@ -317,8 +317,14 @@ export function directFundingWallet(
 			// Ours only. A payment settling must not lift the freeze an operator put
 			// on the same coin, which outlives this payment by design.
 			if (frozenEntry(txidHex, vout)?.freezeTag !== DF_FREEZE_TAG) return false;
-			const result = await wallet.unfreezeUtxo({ txid: txidHex, index: vout });
-			return result.isOk();
+			// Asked again under the wallet's lock: an operator freeze queued ahead
+			// of this call takes the entry over by clearing our tag.
+			const result = await wallet.unfreezeUtxoIfTagged({
+				txid: txidHex,
+				index: vout,
+				tag: DF_FREEZE_TAG
+			});
+			return result.isOk() && result.value.unfrozen;
 		},
 
 		blockHeight(): number {
