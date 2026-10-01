@@ -687,6 +687,12 @@ const CHANNEL_KEY_INDEX_ALLOCATED_KEY = 'channel_key_index_allocated';
  * pubkeys, rewritten whole on every change.
  */
 const ZERO_CONF_TRUSTED_PEERS_KEY = 'zero_conf_trusted_peers';
+/**
+ * Metadata key the owed fails of rejected MPP parts persist under (issue
+ * #1265): a JSON array of `{ key, failureCode }`, the key being the part's
+ * `<channelIdHex>:<htlcId>`. Rewritten whole on every change.
+ */
+const OWED_PART_FAILURES_KEY = 'owed_part_failures';
 /** Default wait for an LSP's answer to a registration request. */
 const ASYNC_GRANT_REQUEST_TIMEOUT_MS = 30_000;
 /** Grants kept per LSP (newest first); older ones are dropped. */
@@ -1342,11 +1348,14 @@ export class LightningNode extends EventEmitter {
 	 * reconnect resolves it, not only a restart. Keyed by inbound identity.
 	 * A late hold part turned away as `held_set_complete` (issue #822), a
 	 * part refused as `settled_row_full` (issue #1189), and an MPP part failed
-	 * at the MPP timeout (issue #1233), is owed here too.
+	 * at the MPP timeout (issue #1233), is owed here too. An MPP part's entry
+	 * carries its failure code and is persisted (issue #1265): nothing else
+	 * durable says the part was rejected, and the restore repair would put
+	 * it into a new set.
 	 */
 	private owedHeldForwardFailures = new Map<
 		string,
-		{ inChannelIdHex: string; fail: () => boolean }
+		{ inChannelIdHex: string; fail: () => boolean; failureCode?: number }
 	>();
 	private graphPruneTimer: ReturnType<typeof setInterval> | null = null;
 	private _chainBackend: import('../chain/chain-watcher').IChainBackend | null =
@@ -3055,6 +3064,32 @@ export class LightningNode extends EventEmitter {
 			this.receivedHtlcSharedSecrets.set(key, secret);
 		}
 
+		// Rejected MPP parts still owed their fail. Back before any channel
+		// reestablishes, so the restore repair leaves them to the owed retry.
+		const owedPartsJson = this.storage.loadMetadata(OWED_PART_FAILURES_KEY);
+		if (owedPartsJson) {
+			try {
+				const parsed = JSON.parse(owedPartsJson) as Array<{
+					key: string;
+					failureCode: number;
+				}>;
+				for (const { key, failureCode } of parsed) {
+					const [channelIdHex, htlcId] = key.split(':');
+					this.owedHeldForwardFailures.set(key, {
+						inChannelIdHex: channelIdHex,
+						fail: this.rejectedPartFail(
+							Buffer.from(channelIdHex, 'hex'),
+							BigInt(htlcId),
+							failureCode
+						),
+						failureCode
+					});
+				}
+			} catch {
+				/* ignore corrupted owed-part metadata */
+			}
+		}
+
 		// Restore per-channel routing-policy overrides
 		if (this.storage.loadAllChannelPolicies) {
 			for (const {
@@ -3543,6 +3578,16 @@ export class LightningNode extends EventEmitter {
 			// An FFOR voucher (section 9.5.1): the epoch's drain or unwind
 			// resolves it, never the onion path. Same for a mismatching add.
 			if (htlc.fforVoucher === true || htlc.fforMismatch === true) continue;
+			// Rejected before the restart and still owed its fail: the owed
+			// retry carries it, and a dispatch would put a rejected MPP part
+			// back into a new set (issue #1265).
+			if (
+				this.owedHeldForwardFailures.has(
+					`${channelId.toString('hex')}:${htlc.id}`
+				)
+			) {
+				continue;
+			}
 			// Held by the JIT engine before the restart, and already owed a
 			// refund by the restored-hold queue. Dispatching it again would
 			// forward a payment the sweep is about to fail upstream.
@@ -21883,42 +21928,18 @@ export class LightningNode extends EventEmitter {
 			// total is now ambiguous, keeping parked parts alive locks the
 			// payer's funds until the MPP timeout, and a sender could keep
 			// injecting mismatched parts to hold state open indefinitely.
-			// The set is dropped below, so a refused fail is owed and retried,
-			// and each secret stays until its fail leaves.
-			const failMismatchedPart = (
-				partChannelId: Buffer,
-				partHtlcId: bigint
-			): void => {
-				const partKey = `${partChannelId.toString('hex')}:${partHtlcId}`;
-				const partSecret = this.receivedHtlcSharedSecrets.get(partKey);
-				const partReason = partSecret
-					? createFailureMessage(partSecret, FINAL_INCORRECT_HTLC_AMOUNT)
-					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
-				const fail = (): boolean => {
-					if (
-						!this.channelManager.failHtlc(partChannelId, partHtlcId, partReason)
-							.ok
-					) {
-						return false;
-					}
-					this.cleanupHtlcSharedSecret(partKey);
-					return true;
-				};
-				if (!fail()) {
-					this.owedHeldForwardFailures.set(partKey, {
-						inChannelIdHex: partChannelId.toString('hex'),
-						fail
-					});
-				}
-			};
 			for (const p of pending.receivedParts) {
 				if (p.status !== PaymentStatus.PENDING) continue;
 				p.status = PaymentStatus.FAILED;
-				failMismatchedPart(p.channelId, p.htlcId);
+				this.failRejectedMppPart(
+					p.channelId,
+					p.htlcId,
+					FINAL_INCORRECT_HTLC_AMOUNT
+				);
 			}
 			this.pendingMppPayments.delete(hashHex);
 			this.clearJitSkim(hashHex);
-			failMismatchedPart(channelId, htlcId);
+			this.failRejectedMppPart(channelId, htlcId, FINAL_INCORRECT_HTLC_AMOUNT);
 			return;
 		}
 
@@ -22054,36 +22075,73 @@ export class LightningNode extends EventEmitter {
 				for (const part of pending.receivedParts) {
 					if (part.status === PaymentStatus.PENDING) {
 						part.status = PaymentStatus.FAILED;
-						const htlcSecretKey = `${part.channelId.toString('hex')}:${
-							part.htlcId
-						}`;
-						const sharedSecret =
-							this.receivedHtlcSharedSecrets.get(htlcSecretKey);
-						const reason = sharedSecret
-							? createFailureMessage(sharedSecret, MPP_TIMEOUT)
-							: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
-						// The set is dropped below, so a refused fail is owed and
-						// retried, and the secret stays until the fail leaves.
-						const { channelId, htlcId } = part;
-						const failTimedOutPart = (): boolean => {
-							if (!this.channelManager.failHtlc(channelId, htlcId, reason).ok) {
-								return false;
-							}
-							this.cleanupHtlcSharedSecret(htlcSecretKey);
-							return true;
-						};
-						if (!failTimedOutPart()) {
-							this.owedHeldForwardFailures.set(htlcSecretKey, {
-								inChannelIdHex: channelId.toString('hex'),
-								fail: failTimedOutPart
-							});
-						}
+						this.failRejectedMppPart(part.channelId, part.htlcId, MPP_TIMEOUT);
 					}
 				}
 				this.pendingMppPayments.delete(hashHex);
 				this.clearJitSkim(hashHex);
 			}
 		}
+	}
+
+	/**
+	 * Fail a part of an MPP set this node dropped. Nothing else tracks the
+	 * part once its set is gone, so a refused fail is owed and retried, and
+	 * the secret stays until the fail leaves. The debt is persisted: after a
+	 * restart the part would otherwise look unresolved to the restore repair.
+	 */
+	private failRejectedMppPart(
+		channelId: Buffer,
+		htlcId: bigint,
+		failureCode: number
+	): void {
+		const fail = this.rejectedPartFail(channelId, htlcId, failureCode);
+		if (fail()) return;
+		this.owedHeldForwardFailures.set(`${channelId.toString('hex')}:${htlcId}`, {
+			inChannelIdHex: channelId.toString('hex'),
+			fail,
+			failureCode
+		});
+		this.persistOwedPartFailures();
+	}
+
+	/** A rejected MPP part's fail: true once the channel takes it. */
+	private rejectedPartFail(
+		channelId: Buffer,
+		htlcId: bigint,
+		failureCode: number
+	): () => boolean {
+		const secretKey = `${channelId.toString('hex')}:${htlcId}`;
+		return (): boolean => {
+			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
+			const reason = sharedSecret
+				? createFailureMessage(sharedSecret, failureCode)
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			if (!this.channelManager.failHtlc(channelId, htlcId, reason).ok) {
+				return false;
+			}
+			this.cleanupHtlcSharedSecret(secretKey);
+			return true;
+		};
+	}
+
+	/** Persist the owed fails that carry a failure code (issue #1265). */
+	private persistOwedPartFailures(): void {
+		if (!this.storage) return;
+		const rows: Array<{ key: string; failureCode: number }> = [];
+		for (const [key, owed] of this.owedHeldForwardFailures) {
+			if (owed.failureCode !== undefined) {
+				rows.push({ key, failureCode: owed.failureCode });
+			}
+		}
+		this.safeStorage(
+			() =>
+				this.storage!.saveMetadata(
+					OWED_PART_FAILURES_KEY,
+					JSON.stringify(rows)
+				),
+			'persistOwedPartFailures'
+		);
 	}
 
 	/**
@@ -22767,6 +22825,7 @@ export class LightningNode extends EventEmitter {
 	 * dropped: there is nothing left to fail.
 	 */
 	private retryOwedHeldForwardFailures(inChannelIdHex?: string): void {
+		let retiredPersisted = false;
 		for (const [key, owed] of this.owedHeldForwardFailures) {
 			if (inChannelIdHex && owed.inChannelIdHex !== inChannelIdHex) continue;
 			const [chanHex, htlcId] = key.split(':');
@@ -22785,6 +22844,7 @@ export class LightningNode extends EventEmitter {
 			) {
 				this.owedHeldForwardFailures.delete(key);
 				this.cleanupHtlcSharedSecret(key);
+				retiredPersisted ||= owed.failureCode !== undefined;
 				continue;
 			}
 			const htlc = channel?.getFullState().htlcs.get(`received-${htlcId}`);
@@ -22794,8 +22854,10 @@ export class LightningNode extends EventEmitter {
 					htlc.state === HtlcState.PENDING);
 			if (!stillCommitted || owed.fail()) {
 				this.owedHeldForwardFailures.delete(key);
+				retiredPersisted ||= owed.failureCode !== undefined;
 			}
 		}
+		if (retiredPersisted) this.persistOwedPartFailures();
 	}
 
 	/**
