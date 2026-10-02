@@ -28,7 +28,11 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import { Channel } from '../../src/lightning/channel/channel';
-import { ChannelAction } from '../../src/lightning/channel/channel-actions';
+import {
+	ChannelAction,
+	ChannelActionType
+} from '../../src/lightning/channel/channel-actions';
+import { decodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
 import { ChannelState } from '../../src/lightning/channel/types';
 import { MessageType } from '../../src/lightning/message/types';
 import { Feature } from '../../src/lightning/features/flags';
@@ -668,40 +672,182 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 			expect(fromR).to.not.equal(null);
 		});
 
-		// Introduced by the fix: before it, handleReestablish REPLACED the held
-		// set (`this._fforHeldReplay = held`); now it runs its answer through
-		// fforHoldStream, which APPENDS. A second channel_reestablish on a
-		// connection that is already holding (the manager answers one: see
+		// Found by this review: before the round 1 fix handleReestablish
+		// REPLACED the held set; the fix ran its answer through fforHoldStream,
+		// which APPENDS. A second channel_reestablish on a connection that is
+		// already holding (the manager answers one: see
 		// shouldRetransmitReestablish, the path CLN's channeld restart takes)
-		// puts the retransmission into the chain twice, and the release sends
+		// put the retransmission into the chain twice, and the release sent
 		// two copies of the commitment_signed. Two beignet nodes do not send a
 		// second reestablish on one connection, so this needs a peer that
-		// does: a robustness regression, not an honest-pair failure.
-		it.skip('DEFECT [introduced by the round 1 fixes] a second channel_reestablish on a connection that is already holding doubles the chain, and the release fails the channel', () => {
-			const { pair } = sLostTheClose([2]);
-			pair.link.holdAt = (from, type): boolean =>
-				from === 'S' && type === MessageType.FF_CLOSE_ACK;
-			pair.link.reconnect();
-			pair.link.holdAt = null;
-			const once = heldTypes(pair.rChannel);
-			expect(once).to.deep.equal([
-				MessageType.UPDATE_FAIL_HTLC,
-				MessageType.UPDATE_FULFILL_HTLC,
-				MessageType.UPDATE_FAIL_HTLC,
-				MessageType.COMMITMENT_SIGNED
-			]);
-			const reestablish = pair.link.log.find(
-				(e) => e.from === 'S' && e.type === MessageType.CHANNEL_REESTABLISH
-			)!;
-			pair.rManager.handleMessage(
-				pair.sPub,
-				MessageType.CHANNEL_REESTABLISH,
-				reestablish.payload
-			);
-			expect(
-				heldTypes(pair.rChannel),
-				'the chain after a repeated reestablish'
-			).to.deep.equal(once);
+		// does.
+		//
+		// Fixed: a reestablish begins the hold from a clean set. Nothing of
+		// the old chain is kept, because whatever joined it after the first
+		// reestablish advanced the channel's state as if it had been sent, and
+		// the answer to the second reestablish reproduces it from that state.
+		// The cases below are the three things that can have joined.
+		describe('a second channel_reestablish on a connection that is already holding', () => {
+			/** Hold with S's ff_close_ack delayed; returns S's reestablish bytes. */
+			function heldPair(): { pair: IPair; fromS: Flight; again: () => void } {
+				const { pair, fromS } = sLostTheClose([2]);
+				pair.link.holdAt = (from, type): boolean =>
+					from === 'S' && type === MessageType.FF_CLOSE_ACK;
+				pair.link.reconnect();
+				pair.link.holdAt = null;
+				const reestablish = pair.link.log.find(
+					(e) => e.from === 'S' && e.type === MessageType.CHANNEL_REESTABLISH
+				)!;
+				return {
+					pair,
+					fromS: fromS!,
+					again: (): void => {
+						pair.rManager.handleMessage(
+							pair.sPub,
+							MessageType.CHANNEL_REESTABLISH,
+							reestablish.payload
+						);
+					}
+				};
+			}
+
+			it('with nothing new in the chain: the chain is the retransmission once, not twice', () => {
+				const { pair, again } = heldPair();
+				const once = heldTypes(pair.rChannel);
+				expect(once).to.deep.equal([
+					MessageType.UPDATE_FAIL_HTLC,
+					MessageType.UPDATE_FULFILL_HTLC,
+					MessageType.UPDATE_FAIL_HTLC,
+					MessageType.COMMITMENT_SIGNED
+				]);
+				again();
+				expect(holding(pair.rChannel)).to.equal(true);
+				expect(
+					heldTypes(pair.rChannel),
+					'the chain after a repeated reestablish'
+				).to.deep.equal(once);
+				again();
+				expect(heldTypes(pair.rChannel)).to.deep.equal(once);
+			});
+
+			it("with a revoke_and_ack of R's in the chain (S added while R held): the second answer reproduces it once, behind the commitment_signed, and the release drains", () => {
+				const { pair } = sLostTheClose([2]);
+				pair.link.holdAt = (from, type): boolean =>
+					from === 'R' && type === MessageType.FF_CLOSE;
+				pair.link.reconnect();
+				pair.link.holdAt = null;
+				const reestablish = pair.link.log.find(
+					(e) => e.from === 'S' && e.type === MessageType.CHANNEL_REESTABLISH
+				)!;
+				const add = offer(pair, 'S', 2_000_000n);
+				expect(add.result.ok, add.result.error).to.equal(true);
+				const before = heldTypes(pair.rChannel);
+				expect(before).to.deep.equal([
+					MessageType.UPDATE_FAIL_HTLC,
+					MessageType.UPDATE_FULFILL_HTLC,
+					MessageType.UPDATE_FAIL_HTLC,
+					MessageType.COMMITMENT_SIGNED,
+					MessageType.REVOKE_AND_ACK
+				]);
+				// The peer asks again, with the numbers it had: it holds neither
+				// R's commitment_signed nor the revoke_and_ack R made since.
+				// Handed to the channel itself: through the manager R would send
+				// its own reestablish again, the honest S of this harness would
+				// answer with a third, and the two would cross what is in
+				// flight, which is the peer's restart to get right, not ours.
+				const answer = pair.rChannel.handleReestablish(
+					decodeChannelReestablishMessage(reestablish.payload)
+				);
+				expect(
+					answer.filter((a) => a.type === ChannelActionType.ERROR)
+				).to.deep.equal([]);
+				expect(holding(pair.rChannel)).to.equal(true);
+				expect(heldTypes(pair.rChannel)).to.deep.equal(before);
+				pair.link.release('R');
+				expectAlive(pair, 'released');
+				expectClosed(pair, 'released');
+				expect(pair.events.R.forwarded).to.include(add.id);
+			});
+
+			it('with a commitment_signed signed while holding (the #1304 row): the second answer retransmits that signature once', () => {
+				const pair = activePair();
+				settleSlot(pair, 2);
+				const backup = snapshot(pair, 'S');
+				let row: string | null = null;
+				pair.rManager.on('channel:persist', () => {
+					if (
+						row === null &&
+						record(pair.rChannel).state === FforState.DRAINING
+					) {
+						row = snapshot(pair, 'R');
+					}
+				});
+				pair.link.drop = (from, type): boolean =>
+					from === 'R' && type !== MessageType.FF_CLOSE;
+				const closed = pair.rManager.closeFforEpoch(pair.channelId);
+				expect(closed.ok, closed.error).to.equal(true);
+				pair.link.drop = null;
+				restart(pair, 'S', backup);
+				restart(pair, 'R', row!);
+				pair.link.log.length = 0;
+				pair.link.holdAt = (from, type): boolean =>
+					from === 'S' && type === MessageType.FF_CLOSE_ACK;
+				pair.link.reconnect();
+				pair.link.holdAt = null;
+				const reestablish = pair.link.log.find(
+					(e) => e.from === 'S' && e.type === MessageType.CHANNEL_REESTABLISH
+				)!;
+				const once = heldTypes(pair.rChannel);
+				expect(once).to.deep.equal([
+					MessageType.UPDATE_FAIL_HTLC,
+					MessageType.UPDATE_FULFILL_HTLC,
+					MessageType.UPDATE_FAIL_HTLC,
+					MessageType.COMMITMENT_SIGNED
+				]);
+				const answer = pair.rChannel.handleReestablish(
+					decodeChannelReestablishMessage(reestablish.payload)
+				);
+				expect(
+					answer.filter((a) => a.type === ChannelActionType.ERROR)
+				).to.deep.equal([]);
+				expect(heldTypes(pair.rChannel)).to.deep.equal(once);
+				pair.link.release('S');
+				expectAlive(pair, 'released');
+				expectClosed(pair, 'released');
+			});
+
+			it("PIN [#1300] with a settle of R's waiting behind the chain: the second answer replays it ahead of the commitment_signed that does not cover it", () => {
+				// The settle is, in the channel's state, an update queued behind
+				// an unrevoked commitment_signed, and the answer to a reestablish
+				// replays every queued update before the retransmitted signature
+				// (issue #1300, not this PR's to fix). The first chain had it in
+				// the right place; the answer to the second does not. Required
+				// once #1300 is fixed: the fulfil follows the commitment_signed,
+				// and the release drains with no wire error.
+				const { pair, fromS, again } = heldPair();
+				const settle = pair.rManager.fulfillHtlc(
+					pair.channelId,
+					fromS.id,
+					fromS.preimage
+				);
+				expect(settle.ok, settle.error).to.equal(true);
+				expect(heldTypes(pair.rChannel)).to.deep.equal([
+					MessageType.UPDATE_FAIL_HTLC,
+					MessageType.UPDATE_FULFILL_HTLC,
+					MessageType.UPDATE_FAIL_HTLC,
+					MessageType.COMMITMENT_SIGNED,
+					MessageType.UPDATE_FULFILL_HTLC
+				]);
+				again();
+				// Today: once each, and the late fulfil ahead of the signature.
+				expect(heldTypes(pair.rChannel)).to.deep.equal([
+					MessageType.UPDATE_FAIL_HTLC,
+					MessageType.UPDATE_FULFILL_HTLC,
+					MessageType.UPDATE_FAIL_HTLC,
+					MessageType.UPDATE_FULFILL_HTLC,
+					MessageType.COMMITMENT_SIGNED
+				]);
+			});
 		});
 
 		// Issue #1303 (one failed durable write, then a write that lands) at

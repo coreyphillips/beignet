@@ -11323,6 +11323,18 @@ export class Channel {
 		}
 
 		// ── FFOR section 7.5.5 retransmission rules ──
+		// A reestablish decides the hold afresh, from a clean set. A peer may
+		// send a second channel_reestablish on a connection we are already
+		// holding on (two of our nodes never do), and the answer above is
+		// then the whole retransmission again: appended to the chain of the
+		// first, the release would send everything twice. Nothing in the old
+		// chain needs keeping. Whatever joined it after the first reestablish
+		// advanced the channel's state as if it had been sent, so the answer
+		// above reproduces it for the numbers the peer now reports: an update
+		// of ours from pendingLocalUpdates, a commitment_signed signed while
+		// holding from the retransmission cache, a revoke_and_ack likewise.
+		this._fforHolding = false;
+		this._fforHeldReplay = [];
 		const fforActions = this._handleReestablishFfor(msg);
 		if (this._fforAckLeadsReplay(fforActions)) {
 			// A concurrent S that owes R its ff_activate_ack again may also
