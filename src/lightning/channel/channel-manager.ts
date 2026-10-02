@@ -4303,6 +4303,9 @@ export class ChannelManager extends EventEmitter {
 		// AFTER the whole batch (one logical update) has been verified and revoked.
 		if (!hasError && channel.getChannelId() && !channel.isCollectingBatch()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
+			// Our revoke_and_ack may have been the last message the channel
+			// needed before its close can be negotiated.
+			this.maybeStartClosingNegotiation(peerPubkey, channel);
 		}
 	}
 
@@ -4392,6 +4395,11 @@ export class ChannelManager extends EventEmitter {
 		// does not loop.
 		if (channelId) {
 			this.autoSignAndSendCommitment(channelId);
+		}
+		// The peer's revoke_and_ack may have been the last message the channel
+		// needed before its close can be negotiated.
+		if (!hadError) {
+			this.maybeStartClosingNegotiation(peerPubkey, channel);
 		}
 	}
 
@@ -4526,8 +4534,17 @@ export class ChannelManager extends EventEmitter {
 			this.emit('channel:pending-close', msg.channelId, 'remote');
 		}
 
+		// With anything still in flight the channel stays in SHUTTING_DOWN and
+		// the negotiation starts from maybeStartClosingNegotiation instead.
 		if (channel.getState() !== ChannelState.NEGOTIATING_CLOSING) return;
+		this.startClosingNegotiation(peerPubkey, channel);
+	}
 
+	/**
+	 * Our first move of a closing negotiation, for a channel that has just
+	 * reached NEGOTIATING_CLOSING or resumes there after a reestablish.
+	 */
+	private startClosingNegotiation(peerPubkey: string, channel: Channel): void {
 		if (channel.isSimpleClose()) {
 			// option_simple_close: BOTH sides SHOULD send closing_complete.
 			this.startSimpleClose(peerPubkey, channel);
@@ -4542,6 +4559,30 @@ export class ChannelManager extends EventEmitter {
 			);
 			this.processActions(peerPubkey, channel, closingActions);
 		}
+	}
+
+	/**
+	 * Start the closing negotiation of a channel that was waiting in
+	 * SHUTTING_DOWN for its last HTLC, the moment it is empty (issue #1307).
+	 *
+	 * The shutdown exchange only starts the negotiation when it finds the
+	 * channel already empty. Otherwise the channel becomes empty at the end of
+	 * a commitment round, on a revoke_and_ack we receive or one we send, and
+	 * nothing else would ever look again: the close sat in SHUTTING_DOWN until
+	 * a reconnect retransmitted the shutdowns or the stuck-channel timer
+	 * force closed it. Called after both messages, once any signature we owe
+	 * has gone out. On the wire our revoke_and_ack precedes the proposal, so
+	 * the peer is empty too by the time it reads it.
+	 */
+	private maybeStartClosingNegotiation(
+		peerPubkey: string,
+		channel: Channel
+	): void {
+		if (!channel.beginClosingNegotiationIfReady()) return;
+		this.processActions(peerPubkey, channel, [
+			{ type: ChannelActionType.PERSIST_STATE }
+		]);
+		this.startClosingNegotiation(peerPubkey, channel);
 	}
 
 	private getDefaultShutdownScript(): Buffer {
@@ -5848,19 +5889,11 @@ export class ChannelManager extends EventEmitter {
 				);
 			}
 			if (state === ChannelState.NEGOTIATING_CLOSING) {
-				if (channel.isSimpleClose()) {
-					// Both roles restart the simple-close signing flow.
-					this.startSimpleClose(peerPubkey, channel);
-				} else if (channel.getRole() === ChannelRole.OPENER) {
-					// Opener re-proposes closing_signed to resume fee negotiation
-					// (proposeClosingFee re-derives the fee range, so a range
-					// persisted from a stale/too-low feerate is replaced here).
-					this.applyClosingFeerate(channel);
-					const closingActions = channel.proposeClosingFee(
-						(feeSatoshis: bigint) => this.signClosingTx(channel, feeSatoshis)
-					);
-					this.processActions(peerPubkey, channel, closingActions);
-				}
+				// Both roles restart the simple-close signing flow; on the legacy
+				// path the opener re-proposes closing_signed to resume fee
+				// negotiation (proposeClosingFee re-derives the fee range, so a
+				// range persisted from a stale/too-low feerate is replaced here).
+				this.startClosingNegotiation(peerPubkey, channel);
 			}
 		}
 

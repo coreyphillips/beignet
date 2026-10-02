@@ -410,6 +410,12 @@ export interface IChannelState {
 	 */
 	pendingFeerateSignable?: boolean;
 	pendingFeerateCommitted?: boolean;
+	/**
+	 * Our fee update was revoked by the peer, whose answering commitment_signed
+	 * is still owed. Kept separately from the fee value so an unchanged rate
+	 * still completes its round before cooperative close. Absent on older rows.
+	 */
+	awaitingLocalFeeCommitment?: boolean;
 
 	/**
 	 * The feerate baked into OUR current local commitment — the exact rate the
