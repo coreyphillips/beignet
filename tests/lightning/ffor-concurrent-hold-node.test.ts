@@ -95,6 +95,8 @@ describe('FFOR concurrent receive: the drain hold through the node', function ()
 
 	it('a forward owed upstream is settled by the node on channel:reestablished while the chain is held: the fulfil waits behind the chain, nothing fails, and the payer is paid out', async () => {
 		const w = createConcurrentWorld();
+		const initialS = srChannel(w.s, w).getFullState().localBalanceMsat;
+		const initialR = srChannel(w.r, w).getFullState().localBalanceMsat;
 		activateWorld(w, true);
 		const { x, errors: xErrors } = addDownstream(w);
 
@@ -120,13 +122,23 @@ describe('FFOR concurrent receive: the drain hold through the node', function ()
 		// R retires the book. S acknowledges; R's drain (three voucher fails
 		// and their commitment_signed) is lost on the wire.
 		const rId = w.r.getNodeId();
-		w.sr.drop = (from, type): boolean =>
-			from === rId && type !== MessageType.FF_CLOSE;
+		const issued: { type: number; payload: string }[] = [];
+		w.sr.drop = (from, type, payload): boolean => {
+			if (from !== rId || type === MessageType.FF_CLOSE) return false;
+			issued.push({ type, payload: payload.toString('hex') });
+			return true;
+		};
 		const closed = w.r.closeFforEpoch(w.srHex);
 		expect(closed.ok, closed.error).to.equal(true);
 		await flush();
 		expect(record(w.r, w.srHex).state).to.equal(FforState.DRAINING);
 		w.sr.drop = null;
+		expect(issued.map((e) => e.type)).to.deep.equal([
+			MessageType.UPDATE_FAIL_HTLC,
+			MessageType.UPDATE_FAIL_HTLC,
+			MessageType.UPDATE_FAIL_HTLC,
+			MessageType.COMMITMENT_SIGNED
+		]);
 
 		// The link goes down, and S comes back from the row that predates
 		// ff_close: ACTIVE, with no close on record.
@@ -166,19 +178,28 @@ describe('FFOR concurrent receive: the drain hold through the node', function ()
 			`S:${MessageType.ERROR}`
 		);
 		expect(wire).to.not.include(`R:${MessageType.ERROR}`);
-		// The fulfil of the forward joined the held chain, and the held
-		// commitment_signed was made again over it: the three voucher fails,
-		// the fulfil, then one signature that covers all four.
-		const fromR = w.sr.log.filter((e) => e.from === rId).map((e) => e.type);
-		expect(fromR.slice(0, 7)).to.deep.equal([
+		// The original signed prefix replays unchanged. The later fulfil
+		// follows that signature and is covered by a subsequent round.
+		const fromR = w.sr.log.filter((e) => e.from === rId);
+		expect(fromR.slice(0, 7).map((e) => e.type)).to.deep.equal([
 			MessageType.CHANNEL_REESTABLISH,
 			MessageType.FF_CLOSE,
 			MessageType.UPDATE_FAIL_HTLC,
 			MessageType.UPDATE_FAIL_HTLC,
 			MessageType.UPDATE_FAIL_HTLC,
-			MessageType.UPDATE_FULFILL_HTLC,
-			MessageType.COMMITMENT_SIGNED
+			MessageType.COMMITMENT_SIGNED,
+			MessageType.UPDATE_FULFILL_HTLC
 		]);
+		expect(
+			fromR.slice(2, 6).map((e) => ({
+				type: e.type,
+				payload: e.payload.toString('hex')
+			}))
+		).to.deep.equal(issued);
+		expect(
+			fromR.slice(7).some((e) => e.type === MessageType.COMMITMENT_SIGNED),
+			'a later signature covers the forwarded fulfil'
+		).to.equal(true);
 		expect(srChannel(w.s, w).getState()).to.equal(ChannelState.NORMAL);
 		expect(srChannel(w.r, w).getState()).to.equal(ChannelState.NORMAL);
 		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
@@ -186,6 +207,14 @@ describe('FFOR concurrent receive: the drain hold through the node', function ()
 		expect(record(w.s, w.srHex).state).to.equal(FforState.CLOSED);
 		expect(ordinary(srChannel(w.r, w))).to.deep.equal([]);
 		expect(ordinary(srChannel(w.s, w))).to.deep.equal([]);
+		const sState = srChannel(w.s, w).getFullState();
+		const rState = srChannel(w.r, w).getFullState();
+		expect(sState.localBalanceMsat).to.equal(initialS - payment.amountMsat);
+		expect(rState.remoteBalanceMsat).to.equal(initialS - payment.amountMsat);
+		expect(rState.localBalanceMsat).to.equal(initialR + payment.amountMsat);
+		expect(sState.remoteBalanceMsat).to.equal(initialR + payment.amountMsat);
+		expect(w.errors.s).to.deep.equal([]);
+		expect(w.errors.r).to.deep.equal([]);
 		expect(xErrors).to.deep.equal([]);
 
 		for (const node of [w.p, w.s, w.r, x]) node.destroy();

@@ -6,15 +6,16 @@
  * either one cheating: a cut connection, a restart, a lost or crossing
  * message, a failed durable write, a row that predates a message.
  *
- * Every test passes. Most pin an attack that held. The defects the review
+ * Most cases check recovery invariants. The defects the review
  * found in PR #1301 are fixed and their cases assert the fixed behaviour.
  * Cases titled PIN record a known defect that is NOT this PR's to fix, by
  * asserting what happens today, with the issue that tracks it: the
  * assertion fails, visibly, on the day that issue is fixed, and the case is
  * then rewritten to the outcome the spec requires (stated in its comment).
  *
- *   PIN [#1300]         the reestablish replay-order bug, shown beside a
- *                       live voucher book
+ * Replay ordering (#1300) is fixed and checked beside live voucher books.
+ * Remaining known-defect pins:
+ *
  *   PIN [#1303]         one failed durable write, then a write that lands
  *   PIN [#1293 item 1]  S's setup timer crossing R's stfu
  *   PIN [PR 2 of #1283] the interim CLOSED rule when every voucher was
@@ -191,9 +192,8 @@ function expectClosed(pair: IPair, label: string): void {
 }
 
 /**
- * Whether a side has updates queued behind a commitment_signed the peer has
- * not revoked: the precondition of issue #1300 (reestablish replays them
- * ahead of that commitment_signed).
+ * Whether a side has an unsigned tail behind an outstanding signed round.
+ * The reconnect replay preserves the signed prefix before this tail (#1300).
  */
 function prone1300(pair: IPair): boolean {
 	for (const side of SIDES) {
@@ -209,6 +209,26 @@ function prone1300(pair: IPair): boolean {
 		}
 	}
 	return false;
+}
+
+/** Copy the issued round so later updates cannot alter the expectation. */
+function signedRound(ch: Channel): {
+	number: bigint;
+	covered: number;
+	signature: string | null;
+	htlcSignatures: string[];
+	updates: { type: number; payload: string }[];
+} {
+	const state = ch.getFullState();
+	return {
+		number: state.remoteCommitmentNumber,
+		covered: state.pendingLocalUpdatesSignedCount,
+		signature: state.lastSentCommitmentSigned?.toString('hex') ?? null,
+		htlcSignatures: state.lastSentHtlcSignatures.map((s) => s.toString('hex')),
+		updates: state.pendingLocalUpdates
+			.slice(0, state.pendingLocalUpdatesSignedCount)
+			.map((u) => ({ type: u.type, payload: u.payload.toString('hex') }))
+	};
 }
 
 /** An application that issues no update behind an unrevoked commitment (#1300). */
@@ -914,30 +934,27 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 	// ───────────────────────────────────────────────────────────────────
 	// Attack 1, randomized: crossing messages, cuts and restarts.
 	// ───────────────────────────────────────────────────────────────────
-	describe('1d. schedule explorer, clear of issue #1300', () => {
+	describe('1d. schedule explorer with signed prefixes and unsigned tails', () => {
 		const [first, last] = (process.env.FFOR_SEEDS ?? '1-3')
 			.split('-')
 			.map(Number);
 		for (const mode of ['none', 'active', 'draining'] as ExploreMode[]) {
 			for (let seed = first; seed <= (last ?? first); seed++) {
 				it(`${mode} seed ${seed}`, () => {
-					const res = explore(seed, mode, true);
-					expect(res.proneCuts).to.equal(0);
+					explore(seed, mode, false);
 				});
 			}
 		}
 	});
 
 	// ───────────────────────────────────────────────────────────────────
-	// Attack 6, issue #1300 in a concurrent epoch. Pre-existing: the same
-	// replay order fails a channel with no epoch at all (the issue's own
-	// repro). Not this PR's to fix, so the two cases below PIN what happens
-	// today. When #1300 is fixed their last assertions fail; replace them
-	// with the required outcome each comment names.
+	// Ordered reconnect replay (#1300) beside a live voucher book.
+	// Covered updates and their original signature precede the unsigned tail.
 	// ───────────────────────────────────────────────────────────────────
 	describe('6a. issue #1300 beside a live voucher book', () => {
-		it('PIN [#1300] ACTIVE: R settles an HTLC behind its own unrevoked commitment_signed, the connection drops, and the reestablish fails the channel', () => {
+		it('ACTIVE: R settles an HTLC behind its own unrevoked commitment_signed, and reconnect preserves the book and completes both payments', () => {
 			const pair = activePair();
+			const hAct = Buffer.from(record(pair.rChannel).hAct!);
 			const inbound = offer(pair, 'S', 4_000_000n);
 			expect(inbound.result.ok, inbound.result.error).to.equal(true);
 			// R's add and its commitment_signed are lost with the socket; R,
@@ -954,19 +971,27 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 			expect(prone1300(pair)).to.equal(true);
 			interrupt(pair, 'disconnect');
 			pair.link.reconnect();
-			// Required once #1300 is fixed: both channels NORMAL, no wire
-			// error, the epoch ACTIVE with its three vouchers
-			// (expectAlive, expectActiveUnchanged). Today:
-			expect(pair.link.types()).to.include(MessageType.ERROR);
-			expect(pair.sErrors.join('|')).to.match(/Invalid commitment signature/);
-			expect(pair.sChannel.getState()).to.equal(ChannelState.ERRORED);
-			// The failure removed nothing: every voucher is still in the
-			// commitments both sides hold.
-			expect(vouchers(pair.sChannel).length).to.equal(3);
-			expect(vouchers(pair.rChannel).length).to.equal(3);
+			expectAlive(pair, 'reconnected');
+			expectActiveUnchanged(pair, hAct, 'reconnected');
+			expect(pair.sErrors).to.deep.equal([]);
+			expect(pair.rErrors).to.deep.equal([]);
+			const complete = pair.sManager.fulfillHtlc(
+				pair.channelId,
+				out.id,
+				out.preimage
+			);
+			expect(complete.ok, complete.error).to.equal(true);
+			expectSettled(pair, 'both payments completed');
+			expectActiveUnchanged(pair, hAct, 'both payments completed');
+			expect(balances(pair)).to.deep.equal({
+				s: S_AFTER_BOOK - 2_000_000n,
+				r: R_START + 2_000_000n,
+				sViewOfR: R_START + 2_000_000n,
+				rViewOfS: S_AFTER_BOOK - 2_000_000n
+			});
 		});
 
-		it('PIN [#1300] DRAINING: the drain is issued behind an unrevoked commitment_signed, the connection drops, and the reestablish fails the channel', () => {
+		it('DRAINING: the drain is issued behind an unrevoked commitment_signed, and reconnect closes the book with the channel open', () => {
 			const pair = activePair();
 			settleSlot(pair, 2);
 			// S's acknowledgement is in flight while R sends an ordinary add;
@@ -986,40 +1011,33 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 			expect(prone1300(pair)).to.equal(true);
 			interrupt(pair, 'disconnect');
 			pair.link.reconnect();
-			// Required once #1300 is fixed: both channels NORMAL, no wire
-			// error, the book CLOSED on both sides (expectAlive,
-			// expectClosed). Today:
-			expect(pair.link.types()).to.include(MessageType.ERROR);
-			expect(pair.sErrors.join('|')).to.match(/Invalid commitment signature/);
-			expect(pair.sChannel.getState()).to.equal(ChannelState.ERRORED);
-			expect(vouchers(pair.sChannel).length).to.equal(3);
+			expectAlive(pair, 'reconnected');
+			expectClosed(pair, 'reconnected');
+			expect(pair.sErrors).to.deep.equal([]);
+			expect(pair.rErrors).to.deep.equal([]);
+			const complete = pair.sManager.fulfillHtlc(
+				pair.channelId,
+				out.id,
+				out.preimage
+			);
+			expect(complete.ok, complete.error).to.equal(true);
+			expectSettled(pair, 'ordinary payment completed');
+			expect(balances(pair)).to.deep.equal(drained(-2_000_000n));
 		});
 
-		it('PIN [#1300] every explorer failure with the avoidance off was cut on the #1300 precondition', () => {
-			// The same walk, but the application stacks updates behind an
-			// unrevoked commitment and cuts fall anywhere. Schedules fail; the
-			// claim pinned here is that none fails WITHOUT a cut on the
-			// precondition, in any mode, with or without an epoch. The last
-			// two assertions require that schedules DO fail, so they flip when
-			// #1300 is fixed: required then is that no schedule fails at all
-			// (failed is empty), and section 1d can drop its avoidance.
+		it('every explorer schedule recovers when cuts can cross a signed prefix and unsigned tail', () => {
 			const failed: string[] = [];
-			const unexplained: string[] = [];
 			for (const mode of ['none', 'active', 'draining'] as ExploreMode[]) {
 				for (let seed = 1; seed <= 6; seed++) {
 					try {
 						explore(seed, mode, false);
 					} catch (err) {
 						const text = (err as Error).message;
-						failed.push(`${mode}/${seed}`);
-						if (/precondition: 0\n/.test(text)) unexplained.push(text);
+						failed.push(`${mode}/${seed}: ${text}`);
 					}
 				}
 			}
-			expect(unexplained, unexplained.join('\n\n')).to.deep.equal([]);
-			// Not vacuous: the bug is hit, epoch or no epoch.
-			expect(failed.some((f) => f.startsWith('none/'))).to.equal(true);
-			expect(failed.some((f) => !f.startsWith('none/'))).to.equal(true);
+			expect(failed, failed.join('\n\n')).to.deep.equal([]);
 		});
 	});
 
@@ -1043,7 +1061,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 		// (Channel.fforHoldStream, asked by the manager for every batch), and
 		// a new add of R's is refused. The three shapes found, then the
 		// baseline double fault the same gate closes (issue #1304).
-		it('R fulfils an ordinary HTLC while its chain is held: the fulfil joins the chain, the held signature is made again over it, and both commit when the acknowledgement returns', () => {
+		it('R fulfils an ordinary HTLC while its chain is held: the original signed round stays intact and the fulfil commits in the next round', () => {
 			const { pair, inbound } = sLostTheClose([2]);
 			pair.link.holdAt = (from, type): boolean =>
 				from === 'S' && type === MessageType.FF_CLOSE_ACK;
@@ -1055,6 +1073,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 				MessageType.FF_CLOSE
 			]);
 			expect(pair.rChannel.getState()).to.equal(ChannelState.NORMAL);
+			const signedBefore = signedRound(pair.rChannel);
 			// An existing obligation: R holds the preimage of S's HTLC. It is
 			// taken, and reported as owed to the wire, not as sent.
 			const settle = pair.rManager.fulfillHtlc(
@@ -1068,12 +1087,12 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 				sentBy(pair, 'R'),
 				'nothing left ahead of the chain'
 			).to.deep.equal([MessageType.CHANNEL_REESTABLISH, MessageType.FF_CLOSE]);
-			// The held commitment_signed was provably undelivered, so it was
-			// taken back and made again over the fulfil: nothing of R's is
-			// queued behind a signature that does not cover it (round 2).
-			expect(prone1300(pair)).to.equal(false);
+			// The original signed prefix stays unchanged. The later fulfil
+			// remains unsigned until that round has been acknowledged.
+			expect(signedRound(pair.rChannel)).to.deep.equal(signedBefore);
+			expect(prone1300(pair)).to.equal(true);
 			// S's acknowledgement arrives and the chain is released: the
-			// voucher updates, the fulfil, then the one signature over them.
+			// voucher updates and original signature, then the later fulfil.
 			pair.link.release('S');
 			const fromR = pair.link.log.filter((e) => e.from === 'R');
 			const signed = fromR.findIndex(
@@ -1085,7 +1104,15 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 					e.payload.readBigUInt64BE(32) === inbound.id
 			);
 			expect(late).to.be.greaterThan(-1);
-			expect(signed, 'one signature, after the fulfil').to.be.greaterThan(late);
+			expect(signed, 'original signature before the fulfil').to.be.lessThan(
+				late
+			);
+			expect(
+				fromR.findIndex(
+					(e, i) => i > late && e.type === MessageType.COMMITMENT_SIGNED
+				),
+				'next round covers the fulfil'
+			).to.be.greaterThan(late);
 			expectAlive(pair, 'chain released');
 			expectClosed(pair, 'chain released');
 			expect(ordinaryHtlcs(pair.sChannel)).to.deep.equal([]);
@@ -1709,27 +1736,23 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 			expect(pair.events.R.forwarded).to.include(add.id);
 		});
 
-		it('a settle made while the chain is held, then the connection drops before the acknowledgement: nothing of R is queued behind a signature that does not cover it, and the reconnect drains', () => {
-			// Round 1 left the settle queued behind the held commitment_signed,
-			// which in the channel's state is issue #1300's precondition, and
-			// the reconnect failed the channel. Since round 2 the held
-			// signature is made again over whatever of R's joins the chain
-			// (it is provably undelivered), so the queue is always updates
-			// and then one signature, which a reestablish replays in order.
+		it('a settle made while the chain is held, then a second disconnect: the original signed prefix and unsigned tail replay in order and drain', () => {
 			const { pair, inbound } = sLostTheClose([2]);
 			pair.link.holdAt = (from, type): boolean =>
 				from === 'S' && type === MessageType.FF_CLOSE_ACK;
 			pair.link.reconnect();
 			pair.link.holdAt = null;
 			const number = pair.rChannel.getFullState().remoteCommitmentNumber;
+			const signedBefore = signedRound(pair.rChannel);
 			const settle = pair.rManager.fulfillHtlc(
 				pair.channelId,
 				inbound.id,
 				inbound.preimage
 			);
 			expect(settle.ok, settle.error).to.equal(true);
-			expect(prone1300(pair)).to.equal(false);
-			// The same commitment number, signed again.
+			expect(prone1300(pair)).to.equal(true);
+			expect(signedRound(pair.rChannel)).to.deep.equal(signedBefore);
+			// The original commitment number and signature stay unchanged.
 			expect(pair.rChannel.getFullState().remoteCommitmentNumber).to.equal(
 				number
 			);
