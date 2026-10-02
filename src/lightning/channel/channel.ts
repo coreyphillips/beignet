@@ -7772,15 +7772,40 @@ export class Channel {
 			}
 		}
 
-		// If no pending HTLCs, move to negotiating
-		if (
-			this.countPendingHtlcs(HtlcDirection.OFFERED) === 0 &&
-			this.countPendingHtlcs(HtlcDirection.RECEIVED) === 0
-		) {
+		// Negotiation starts only on an empty channel (closingBlockedBy). With
+		// anything still in flight the channel waits in SHUTTING_DOWN, where the
+		// messages that finish it keep flowing, and
+		// beginClosingNegotiationIfReady moves it on when the last one lands.
+		if (this.closingBlockedBy() === null) {
 			this._state.state = ChannelState.NEGOTIATING_CLOSING;
 		}
 
 		return actions;
+	}
+
+	/**
+	 * SHUTTING_DOWN to NEGOTIATING_CLOSING, at the moment the channel becomes
+	 * empty (issue #1307).
+	 *
+	 * handleShutdown makes the same move when the peer's shutdown finds the
+	 * channel already empty. When it does not, the channel stays in
+	 * SHUTTING_DOWN until the commitment round that removes the last HTLC
+	 * completes, and that round ends in a revoke_and_ack, received or sent,
+	 * not in a shutdown. The manager calls this after each of the two, and
+	 * starts the negotiation when it answers true.
+	 *
+	 * Both shutdowns must have been exchanged: SHUTTING_DOWN means ours is
+	 * out (we started, or answered the peer's), and remoteShutdownScript is
+	 * set by the peer's. A held restore (issue #469) is left where it is; the
+	 * signing stages refuse it themselves.
+	 */
+	beginClosingNegotiationIfReady(): boolean {
+		if (this._state.state !== ChannelState.SHUTTING_DOWN) return false;
+		if (this._state.remoteShutdownScript === null) return false;
+		if (this.closingBlockedBy() !== null) return false;
+		if (this.isMutualCloseHeld()) return false;
+		this._state.state = ChannelState.NEGOTIATING_CLOSING;
+		return true;
 	}
 
 	/**
@@ -7815,15 +7840,14 @@ export class Channel {
 
 		// Fund-safety: the closing tx pays out localBalanceMsat/remoteBalanceMsat
 		// only, so any in-flight HTLC's value would be silently burned to fees.
-		// BOLT 2 forbids starting fee negotiation until all HTLCs are resolved.
-		if (
-			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
-			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
-		) {
+		// BOLT 2 forbids starting fee negotiation until all HTLCs are resolved
+		// and no update is pending (closingBlockedBy).
+		const proposeBlockedBy = this.closingBlockedBy();
+		if (proposeBlockedBy !== null) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Cannot propose closing fee: pending HTLCs'
+					message: `Cannot propose closing fee: ${proposeBlockedBy}`
 				}
 			];
 		}
@@ -7930,14 +7954,22 @@ export class Channel {
 		// lands here mid-replay. The stall also self-heals: we stay in the
 		// current state (channel + funding watch intact), the replayed round
 		// drains the count, and the shutdown exchange re-kicks negotiation.
-		if (
-			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
-			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
-		) {
+		//
+		// The same answer for a peer that proposes while a removal is still in
+		// flight (issue #1307). Until that removal is irrevocably committed
+		// the HTLC is on neither balance, so the peer's signature over the two
+		// balances VERIFIES on our side too, and answering it would sign the
+		// HTLC's value away. BOLT 2 forbids the sender and leaves us free to
+		// fail the channel or ignore the message; ignoring signs nothing, keeps
+		// the state and the funding watch, lets the removal finish (after which
+		// negotiation starts from our side, beginClosingNegotiationIfReady) and
+		// leaves the unilateral exit to the usual backstops if it never does.
+		const signedBlockedBy = this.closingBlockedBy();
+		if (signedBlockedBy !== null) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Unexpected closing_signed: pending HTLCs'
+					message: `Unexpected closing_signed: ${signedBlockedBy}`
 				}
 			];
 		}
@@ -8513,11 +8545,9 @@ export class Channel {
 		if (this.isMutualCloseHeld()) {
 			return this.refuseHeldMutualClose();
 		}
-		if (
-			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
-			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
-		) {
-			return err('Cannot send closing_complete: pending HTLCs');
+		const sendBlockedBy = this.closingBlockedBy();
+		if (sendBlockedBy !== null) {
+			return err(`Cannot send closing_complete: ${sendBlockedBy}`);
 		}
 		if (!this._state.simpleClose) {
 			return err('Cannot send closing_complete: simple close not negotiated');
@@ -8670,11 +8700,11 @@ export class Channel {
 		if (this.isMutualCloseHeld()) {
 			return this.refuseHeldMutualClose();
 		}
-		if (
-			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
-			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
-		) {
-			return err('Unexpected closing_complete: pending HTLCs');
+		// Same gate and same answer as handleClosingSigned: never the closee
+		// signature while anything is unresolved, and a bare local refusal.
+		const completeBlockedBy = this.closingBlockedBy();
+		if (completeBlockedBy !== null) {
+			return err(`Unexpected closing_complete: ${completeBlockedBy}`);
 		}
 		if (!this._state.simpleClose) {
 			return err('Unexpected closing_complete: simple close not negotiated');
@@ -8870,6 +8900,15 @@ export class Channel {
 		// but the refusal keeps the stages uniform.
 		if (this.isMutualCloseHeld()) {
 			return this.refuseHeldMutualClose();
+		}
+		// Completing broadcasts the close our closing_complete signed. That one
+		// is only sent on an empty channel and nothing can enter a channel in
+		// NEGOTIATING_CLOSING, so it takes a row from before the gate existed
+		// to get here with something unresolved; the check keeps the stages
+		// uniform, as the hold check above does.
+		const sigBlockedBy = this.closingBlockedBy();
+		if (sigBlockedBy !== null) {
+			return err(`Unexpected closing_sig: ${sigBlockedBy}`);
 		}
 		const last = this._state.lastLocalClosingComplete;
 		if (!last || !this._state.awaitingClosingSig) {
@@ -11153,6 +11192,21 @@ export class Channel {
 		) {
 			this._state.state = this._state.preReestablishState;
 			this._state.preReestablishState = null;
+			// A row in NEGOTIATING_CLOSING that is not empty goes back to
+			// SHUTTING_DOWN (issue #1307). Rows written before the close path
+			// waited for removals can be in that state with an HTLC entry still
+			// on them, and NEGOTIATING_CLOSING refuses every message the replay
+			// above needs answered (update_fulfill_htlc, update_fail_htlc,
+			// commitment_signed, revoke_and_ack), so the removal could never
+			// finish and no signing stage would ever pass its gate. Back in
+			// SHUTTING_DOWN the round completes and
+			// beginClosingNegotiationIfReady starts the negotiation again.
+			if (
+				this._state.state === ChannelState.NEGOTIATING_CLOSING &&
+				this.closingBlockedBy() !== null
+			) {
+				this._state.state = ChannelState.SHUTTING_DOWN;
+			}
 		}
 
 		// ── Interactive-tx resumption ──
@@ -15253,6 +15307,78 @@ export class Channel {
 		this._quiescence.exitQuiescence();
 		this._spliceSession = null;
 		this._resetSpliceDriver();
+	}
+
+	/**
+	 * BOLT 2 gate for closing negotiation: what still stands between this
+	 * channel and an empty one, or null when nothing does (issue #1307).
+	 *
+	 * "Once shutdown is complete, the channel is empty of HTLCs, there are no
+	 * commitments for which a revocation is owed, and all updates are included
+	 * on both commitments, ... closing fee negotiation begins." The closing
+	 * transaction pays the two balances and nothing else, so whatever is on
+	 * neither balance when a close is signed goes to the miners.
+	 *
+	 * 'pending HTLCs':
+	 *  - any entry in the HTLC map, in any state. An entry leaves the map only
+	 *    when its removal is irrevocably committed by the peer, and only then
+	 *    is its amount credited. A FULFILLED or FAILED entry is therefore as
+	 *    unresolved as a live one: debited from the offerer, credited to
+	 *    nobody. countPendingHtlcs, which the close path used to ask, sees
+	 *    PENDING and COMMITTED only.
+	 *  - a received removal the peer has revoked for and not yet signed out of
+	 *    our commitment (signedLocalRemovals, issue #1291). Its amount is
+	 *    settled; what is outstanding is the peer's commitment_signed and our
+	 *    revoke_and_ack for it, which the peer waits for before it is empty.
+	 *
+	 * 'pending updates':
+	 *  - a signature we owe, a commitment of ours the peer has not revoked
+	 *    for, an update of ours it has not acknowledged, a batch half
+	 *    collected;
+	 *  - a staged update_fee or update_blockheight, including its last leg:
+	 *    once the peer's revoke_and_ack has promoted our own, the peer still
+	 *    owes us the commitment_signed at the new value, and the commitment
+	 *    we hold is signed at the old one until it arrives.
+	 *
+	 * Every close-path gate asks this and nothing narrower: handleShutdown,
+	 * beginClosingNegotiationIfReady, proposeClosingFee, handleClosingSigned,
+	 * sendClosingComplete, handleClosingComplete, handleClosingSig, and the
+	 * reestablish restore of a NEGOTIATING_CLOSING row. It is also wider than
+	 * hasPendingHtlcs below (the quiescence gate), for which a fully committed
+	 * live HTLC is not pending.
+	 */
+	closingBlockedBy(): 'pending HTLCs' | 'pending updates' | null {
+		if (this._state.htlcs.size > 0) return 'pending HTLCs';
+		if ((this._state.signedLocalRemovals?.length ?? 0) > 0) {
+			return 'pending HTLCs';
+		}
+		if (
+			this.needsCommitment() ||
+			this.isAwaitingRemoteRevocation() ||
+			(this._state.pendingLocalUpdates?.length ?? 0) > 0 ||
+			this._pendingBatch !== null ||
+			this._state.pendingFeeratePerKw !== undefined ||
+			this._state.pendingLeaseBlockheight !== undefined
+		) {
+			return 'pending updates';
+		}
+		// The last leg of our own fee or blockheight round. Rows written before
+		// the signed values were recorded have nothing to compare.
+		if (
+			this._state.lastSignedCommitFeeratePerKw !== undefined &&
+			this._state.lastSignedCommitFeeratePerKw !==
+				getLocalCommitmentFeeRate(this._state)
+		) {
+			return 'pending updates';
+		}
+		if (
+			this._state.lastSignedCommitLeaseBlockheight !== undefined &&
+			this._state.lastSignedCommitLeaseBlockheight !==
+				getLocalCommitmentLeaseBlockheight(this._state)
+		) {
+			return 'pending updates';
+		}
+		return null;
 	}
 
 	/**
