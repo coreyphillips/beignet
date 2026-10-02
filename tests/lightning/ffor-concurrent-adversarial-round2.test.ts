@@ -37,6 +37,11 @@ import { MessageType } from '../../src/lightning/message/types';
 import { Feature } from '../../src/lightning/features/flags';
 import { FforState } from '../../src/lightning/ffor/types';
 import {
+	bitmapSet,
+	decodeFforCloseAckMessage,
+	encodeFforCloseAckUnsigned
+} from '../../src/lightning/ffor/messages';
+import {
 	activate,
 	AMOUNTS,
 	balances,
@@ -1248,6 +1253,129 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 				expectClosed(pair, 'released');
 				expect(pair.events.R.forwarded).to.include(add.id);
 				// R's own 3,000 sat HTLC and S's two are still in flight.
+				expect(balances(pair).r).to.equal(
+					R_START + AMOUNTS[0] + AMOUNTS[1] - 3_000_000n
+				);
+			});
+
+			for (const concurrent of [true, false]) {
+				it(`${
+					concurrent ? 'concurrent' : 'baseline'
+				}: a differing acknowledgement on a connection with no hold; its hash-valid preimage is kept and written, a preimage that hashes to nothing is ignored, and the delivered fail stands`, () => {
+					// S took the whole drain round (so a signature of R's over the
+					// fail of voucher 1 is in its hands), and then sends an
+					// acknowledgement that marks slot 1 settled with t_1. It is
+					// built here from S's own bytes with the slot added; its
+					// signature no longer verifies, which the preimage does not
+					// need.
+					const pair = drainRound(
+						concurrent,
+						(from, type) => from === 'S' && type !== MessageType.FF_CLOSE_ACK
+					);
+					const learned: string[] = [];
+					pair.rManager.on('preimage:learned', (hash: Buffer) =>
+						learned.push(hash.toString('hex'))
+					);
+					const first = decodeFforCloseAckMessage(
+						record(pair.rChannel).closeAckWire!.subarray(2)
+					);
+					const t1 = Buffer.from(record(pair.sChannel).preimages[0]);
+					const settledBits = Buffer.from(first.settled);
+					bitmapSet(settledBits, 1);
+					bitmapSet(settledBits, 3);
+					const second = Buffer.concat([
+						encodeFforCloseAckUnsigned({
+							channelId: first.channelId,
+							epochId: first.epochId,
+							activationHash: first.activationHash,
+							numSlots: first.numSlots,
+							settled: settledBits,
+							preimages: [
+								{ k: 1, preimage: t1 },
+								...first.preimages,
+								{ k: 3, preimage: Buffer.alloc(32, 7) }
+							]
+						}),
+						Buffer.alloc(64)
+					]);
+					const failed = stateOfVoucherOne(pair);
+					let writes = 0;
+					pair.rManager.on('channel:persist', () => writes++);
+					pair.rManager.handleMessage(
+						pair.sPub,
+						MessageType.FF_CLOSE_ACK,
+						second
+					);
+					expect(pair.rErrors.join('|')).to.match(/ff_close_ack differs/);
+					const f = record(pair.rChannel);
+					expect(f.knownPreimages[0]!.equals(t1)).to.equal(true);
+					expect(f.knownPreimages[2], 'not a preimage of slot 3').to.equal(
+						null
+					);
+					expect(learned).to.deep.equal([f.paymentHashes[0].toString('hex')]);
+					expect(writes, 'the kept preimage is written').to.be.greaterThan(0);
+					// The acknowledgement itself is refused.
+					expect(
+						f.closeAckWire!.equals(
+							Buffer.concat([Buffer.from([0xd7, 0x0d]), second])
+						)
+					).to.equal(false);
+					expect(f.activationMismatch).to.equal(concurrent);
+					// No hold, and S holds the signature: the fail stands.
+					expect(holding(pair.rChannel)).to.equal(false);
+					expect(stateOfVoucherOne(pair)).to.equal(failed);
+					// The preimage is on the row.
+					interrupt(pair, 'restart R');
+					expect(record(pair.rChannel).knownPreimages[0]!.equals(t1)).to.equal(
+						true
+					);
+					pair.link.reconnect();
+					expectAlive(pair, 'reestablished');
+					expectClosed(pair, 'reestablished');
+				});
+			}
+
+			it('the signature taken back leaves no trace of itself: the sign counter, the covered count and the cover stamps are as before it was made, and a commitment is owed', () => {
+				const { pair } = sLostTheClose([2]);
+				pair.link.holdAt = (from, type): boolean =>
+					from === 'S' && type === MessageType.FF_CLOSE_ACK;
+				pair.link.reconnect();
+				pair.link.holdAt = null;
+				const before = pair.rChannel.getFullState();
+				const number = before.remoteCommitmentNumber;
+				expect(pair.rChannel.isAwaitingRemoteRevocation()).to.equal(true);
+				expect(before.pendingLocalUpdatesSignedCount).to.equal(3);
+				const stamped = (): number =>
+					[...pair.rChannel.getFullState().htlcs.values()].filter(
+						(e) => e.commitCoverPending === true || e.addCoverPending === true
+					).length;
+				expect(stamped()).to.be.greaterThan(0);
+				// The channel alone, without the manager's auto-sign behind it.
+				const actions = pair.rChannel.fforAddPreimage(
+					record(pair.sChannel).preimages[0]
+				);
+				expect(
+					actions.filter((a) => a.type === ChannelActionType.ERROR)
+				).to.deep.equal([]);
+				const after = pair.rChannel.getFullState();
+				expect(after.remoteCommitmentNumber).to.equal(number - 1n);
+				expect(pair.rChannel.isAwaitingRemoteRevocation()).to.equal(false);
+				expect(after.pendingLocalUpdatesSignedCount).to.equal(0);
+				expect(after.pendingLocalUpdates.length).to.equal(3);
+				expect(stamped()).to.equal(0);
+				expect(pair.rChannel.needsCommitment()).to.equal(true);
+				expect(after.lastSentCommitmentSigned).to.equal(null);
+				expect(heldTypes(pair.rChannel)).to.deep.equal([
+					MessageType.UPDATE_FULFILL_HTLC,
+					MessageType.UPDATE_FULFILL_HTLC,
+					MessageType.UPDATE_FAIL_HTLC
+				]);
+				// A restart here, before any new signature: the row owes the
+				// commitment, and the reestablish signs it at that number.
+				interrupt(pair, 'restart R');
+				pair.link.reconnect();
+				expectAlive(pair, 'reestablished');
+				expectClosed(pair, 'reestablished');
 				expect(balances(pair).r).to.equal(
 					R_START + AMOUNTS[0] + AMOUNTS[1] - 3_000_000n
 				);
