@@ -11172,6 +11172,13 @@ export class Channel {
 			this._state.spliceInFlight?.sentTxSignatures === true &&
 			this._state.spliceInFlight?.receivedTxSignatures === true;
 
+		// ── FFOR: withdraw a voucher fail the peer provably never took ──
+		// Before anything is replayed: the replay below is what the peer will
+		// hold, and the peer's numbers say what it holds now (issue #1308).
+		if (!spliceActive) {
+			this._fforWithdrawFailsAtReestablish(msg);
+		}
+
 		// ── Retransmit un-acked update messages (BOLT 2) ──
 		// Every queued update the peer has not acknowledged with a
 		// revoke_and_ack may have been lost with the connection (the peer
@@ -25396,27 +25403,47 @@ export class Channel {
 				message: 'FFOR: ff_close_ack differs from the one processed',
 				cleanup: 'none'
 			};
-			if (
-				this._fforIsConcurrent(f) &&
-				f.state === FforState.DRAINING &&
-				!f.activationMismatch
-			) {
-				// S signed two different final acknowledgements for one epoch
-				// (it came back from a row that predates a settlement, or
-				// worse). Nothing is adopted from the second, and a chain held
-				// for the first stays held: this connection cannot release it.
+			if (f.state !== FforState.DRAINING) {
+				// The book has CLOSED: every voucher is resolved, and there is
+				// nothing left to claim or to dispute.
+				return [differs];
+			}
+			// S signed two different final acknowledgements for one epoch (it
+			// came back from a row that predates a settlement, or worse). The
+			// second is refused: its bitmap replaces nothing, and a chain held
+			// for the first stays held, since this connection cannot release
+			// it.
+			//
+			// Its preimages are kept all the same (issue #1308, both
+			// profiles). A preimage that hashes to a book entry is a claim
+			// whatever message carried it: S may have settled the slot for a
+			// payer after it lost the close. Each reaches the chain monitors
+			// before the persist, as in the accepting branch below, and a fail
+			// of that voucher the peer provably never took is withdrawn for
+			// the fulfil (_fforWithdrawFails).
+			const kept: ChannelAction[] = [];
+			for (const p of msg.preimages) {
+				kept.push(...(this._fforKeepPreimage(f, p.preimage) ?? []));
+			}
+			const withdrew = this._fforWithdrawFails(f, null);
+			let disputed = false;
+			if (this._fforIsConcurrent(f) && !f.activationMismatch) {
 				// A concurrent epoch would otherwise go on taking ordinary
 				// work into a round it cannot sign, so the dispute is
 				// recorded: no new add of ours (fforAdmissionHold), no settle
 				// of ours behind a chain that will not leave
 				// (_fforConcurrentRefusal), and the host is told. A baseline
-				// epoch carries no ordinary traffic and is left as it was, and
-				// so is a book that has already CLOSED: every voucher is
-				// resolved and there is nothing left to dispute.
+				// epoch carries no ordinary traffic and records none.
 				f.activationMismatch = true;
-				return [{ type: ChannelActionType.PERSIST_STATE }, differs];
+				disputed = true;
 			}
-			return [differs];
+			return [
+				...kept,
+				...(kept.length > 0 || withdrew || disputed
+					? [{ type: ChannelActionType.PERSIST_STATE } as ChannelAction]
+					: []),
+				differs
+			];
 		}
 		if (f.state !== FforState.ACTIVE || !f.closeSent || !f.hAct) {
 			return [
@@ -25559,9 +25586,8 @@ export class Channel {
 				}
 			];
 		}
-		const h = crypto.createHash('sha256').update(preimage).digest();
-		const idx = f.paymentHashes.findIndex((x) => x.equals(h));
-		if (idx < 0) {
+		const learned = this._fforKeepPreimage(f, preimage);
+		if (learned === null) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -25570,6 +25596,32 @@ export class Channel {
 				}
 			];
 		}
+		// Section 7.5.6 again: a fail of that voucher that is queued and that
+		// the peer provably never took gives way to the fulfil (issue #1308).
+		if (f.state === FforState.DRAINING) {
+			this._fforWithdrawFails(f, null);
+		}
+		return [
+			...learned,
+			{ type: ChannelActionType.PERSIST_STATE },
+			...(f.state === FforState.DRAINING ? this._fforDrain(f) : [])
+		];
+	}
+
+	/**
+	 * R: keep a preimage that hashes to an entry of the book, whatever
+	 * carried it, with the ones a chained book derives from it. Returns the
+	 * PREIMAGE_LEARNED actions for what was new (the chain monitors and the
+	 * durable preimage store learn it before the persist that follows), or
+	 * null when it matches no voucher of this epoch.
+	 */
+	private _fforKeepPreimage(
+		f: IFforEpochRecord,
+		preimage: Buffer
+	): ChannelAction[] | null {
+		const h = crypto.createHash('sha256').update(preimage).digest();
+		const idx = f.paymentHashes.findIndex((x) => x.equals(h));
+		if (idx < 0) return null;
 		const learned: ChannelAction[] = [];
 		if (!f.knownPreimages[idx]) {
 			f.knownPreimages[idx] = Buffer.from(preimage);
@@ -25596,11 +25648,169 @@ export class Channel {
 				});
 			}
 		}
-		return [
-			...learned,
-			{ type: ChannelActionType.PERSIST_STATE },
-			...(f.state === FforState.DRAINING ? this._fforDrain(f) : [])
-		];
+		return learned;
+	}
+
+	/**
+	 * R, DRAINING (issue #1308, both profiles): a voucher whose preimage we
+	 * hold is fulfilled, never failed (base section 7.5.6), and a preimage
+	 * that arrives during a pending failure is used where that is still
+	 * possible (CONCURRENT-RECEIVE.md section 7). It is still possible
+	 * exactly while the fail is provably undelivered, which is one of:
+	 *
+	 *   1. no commitment_signed of ours covers the fail yet, and the fail
+	 *      itself has not left on this connection: it sits in the held chain,
+	 *      or a reestablish is about to replay it (the peer forgets
+	 *      uncommitted updates with the connection, BOLT 2);
+	 *   2. the one commitment_signed that covers it is itself undelivered by
+	 *      the peer's own account: it sits in the held chain (the reestablish
+	 *      that began the hold asked for it again, or it was signed while
+	 *      holding), or the peer's channel_reestablish, being answered now,
+	 *      asks for it again (`peerLacksCommitment`).
+	 *
+	 * Then the queued update_fail_htlc is replaced, in place, by the
+	 * update_fulfill_htlc, and in case 2 the commitment_signed is taken back
+	 * so the next one is made at the same commitment number over the fulfil.
+	 * BOLT 2 lets a retransmitted commitment_signed differ from the lost
+	 * one: the peer holds neither it nor the updates under it.
+	 *
+	 * In every other case a signature of ours that removes the voucher as
+	 * failed may be in the peer's hands, and nothing off chain takes it
+	 * back. The preimage is kept; what remains is on chain. Our own
+	 * commitment carries the voucher until we revoke it, which we do only
+	 * when the peer's commitment_signed without the voucher arrives, so a
+	 * force close before that claims it with the preimage.
+	 *
+	 * `peerLacksCommitment` is the answer of the reestablish being handled,
+	 * or null on a live connection, where only the held chain can prove
+	 * anything. Returns whether anything was withdrawn.
+	 */
+	private _fforWithdrawFails(
+		f: IFforEpochRecord,
+		peerLacksCommitment: boolean | null
+	): boolean {
+		if (f.role !== 'R' || f.state !== FforState.DRAINING) return false;
+		const atReestablish = peerLacksCommitment !== null;
+		if (!atReestablish && !this._fforHolding) return false;
+		const queue = this._state.pendingLocalUpdates;
+		const signedCount = this._state.pendingLocalUpdatesSignedCount;
+		const heldCommitment = this._fforHeldReplay.findIndex(
+			(a) =>
+				a.type === ChannelActionType.SEND_MESSAGE &&
+				a.messageType === MessageType.COMMITMENT_SIGNED
+		);
+		// The outstanding signature may be taken back only when it is ours
+		// alone to take: one commitment_signed awaiting its revoke_and_ack,
+		// the peer without it, and nothing but HTLC updates baked into it.
+		const commitmentUndelivered =
+			this.isAwaitingRemoteRevocation() &&
+			(atReestablish ? peerLacksCommitment === true : heldCommitment >= 0) &&
+			this._state.pendingFeerateCommitted !== true &&
+			this._state.pendingLeaseBlockheightCommitted !== true &&
+			!this._lastSentBatch;
+		const isFailOf = (type: number, payload: Buffer, id: bigint): boolean =>
+			(type === MessageType.UPDATE_FAIL_HTLC ||
+				type === MessageType.UPDATE_FAIL_MALFORMED_HTLC) &&
+			payload.length >= 40 &&
+			payload.readBigUInt64BE(32) === id;
+		let withdrew = false;
+		let unsign = false;
+		for (const [k, entry] of this._fforVoucherEntries(f)) {
+			const preimage = f.knownPreimages[k - 1];
+			if (!preimage) continue;
+			if (
+				entry.state !== HtlcState.FAILED ||
+				entry.removalRemoteCommitted !== false
+			) {
+				continue;
+			}
+			const index = queue.findIndex((u) =>
+				isFailOf(u.type, u.payload, entry.id)
+			);
+			// Not in the queue: the peer has revoked for the commitment that
+			// removed the voucher. The failure is irrevocable.
+			if (index < 0) continue;
+			const signed = index < signedCount;
+			if (signed && !commitmentUndelivered) continue;
+			const fulfil = encodeUpdateFulfillHtlcMessage({
+				channelId: this._state.channelId!,
+				id: entry.id,
+				paymentPreimage: preimage
+			});
+			if (!atReestablish) {
+				// On a live connection the fail must be in the held chain: that
+				// is the proof it has not left. It gives up its place there.
+				const held = this._fforHeldReplay.findIndex(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						isFailOf(a.messageType, a.payload, entry.id)
+				);
+				if (held < 0) continue;
+				this._fforHeldReplay[held] = sendMsg(
+					MessageType.UPDATE_FULFILL_HTLC,
+					fulfil
+				);
+			}
+			entry.state = HtlcState.FULFILLED;
+			queue[index] = {
+				type: MessageType.UPDATE_FULFILL_HTLC,
+				payload: fulfil
+			};
+			withdrew = true;
+			if (signed) unsign = true;
+		}
+		if (unsign) {
+			this._fforTakeBackCommitment();
+			if (!atReestablish) {
+				// Re-read: the swaps above replaced entries, never moved them.
+				const at = this._fforHeldReplay.findIndex(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						a.messageType === MessageType.COMMITMENT_SIGNED
+				);
+				if (at >= 0) this._fforHeldReplay.splice(at, 1);
+			}
+		}
+		return withdrew;
+	}
+
+	/** _fforWithdrawFails, judged by the channel_reestablish being answered. */
+	private _fforWithdrawFailsAtReestablish(
+		msg: IChannelReestablishMessage
+	): void {
+		const f = this._state.ffor;
+		if (!f) return;
+		// The peer asks for our outstanding commitment_signed again exactly
+		// when the next one it expects is the one we last signed.
+		const peerLacksCommitment =
+			this._state.remoteCommitmentNumber > 0n &&
+			msg.nextCommitmentNumber === this._state.remoteCommitmentNumber;
+		this._fforWithdrawFails(f, peerLacksCommitment);
+	}
+
+	/**
+	 * Take back the one commitment_signed of ours that awaits its
+	 * revoke_and_ack and that the peer provably does not hold, so that the
+	 * next signature is made at the same commitment number over the updates
+	 * as they now stand. The inverse of signCommitment's bookkeeping for an
+	 * HTLC-only round: the sign counter, the count of updates the signature
+	 * covered, the stamps the peer's revoke_and_ack would have promoted, and
+	 * the retransmission cache. The owed-commitment flag is raised, so the
+	 * ordinary auto-sign makes the new signature. Entries the signature
+	 * moved from PENDING to COMMITTED stay COMMITTED: they are still queued
+	 * and the new signature covers them again.
+	 */
+	private _fforTakeBackCommitment(): void {
+		this._state.remoteCommitmentNumber -= 1n;
+		this._state.pendingLocalUpdatesSignedCount = 0;
+		this._state.needsCommitment = true;
+		this._state.lastSentCommitmentSigned = null;
+		this._state.lastSentPartialSignatureWithNonce = null;
+		this._state.lastSentHtlcSignatures = [];
+		for (const entry of this._state.htlcs.values()) {
+			if (entry.commitCoverPending === true) entry.commitCoverPending = false;
+			if (entry.addCoverPending === true) entry.addCoverPending = false;
+		}
 	}
 
 	/**
