@@ -1872,6 +1872,9 @@ export class ChannelManager extends EventEmitter {
 		if (!channel) {
 			return { ok: false, actions: [], error: `Channel not found: ${idHex}` };
 		}
+		const fforRefusal = channel.fforCommitmentRefusal?.();
+		if (fforRefusal) return { ok: false, actions: [], error: fforRefusal };
+
 		// BOLT 2: only send commitment_signed when we have pending updates the
 		// remote has not yet committed. Re-committing an unchanged state would
 		// loop the commitment exchange and reuse stale per-commitment points.
@@ -5844,6 +5847,16 @@ export class ChannelManager extends EventEmitter {
 			if (channel.getState() === ChannelState.ERRORED) return;
 		}
 
+		// FFOR concurrent receive (CONCURRENT-RECEIVE.md section 8): before a
+		// concurrent epoch resumes new ordinary adds or new delegated
+		// admissions, the CURRENT init exchange must advertise the base and
+		// concurrent capabilities on both sides. Judged here, on every
+		// reestablish, and handed to the channel before it runs.
+		if (typeof channel.setFforCapabilities === 'function') {
+			channel.setFforCapabilities(
+				this.peerNegotiatedFforConcurrent(peerPubkey)
+			);
+		}
 		const actions = channel.handleReestablish(msg);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -6069,6 +6082,51 @@ export class ChannelManager extends EventEmitter {
 		);
 	}
 
+	/**
+	 * Where a peer's init features are read from when no peer manager holds
+	 * them. A test seam: the loopback harnesses drive two managers with no
+	 * transport, so nothing ever records an init exchange. Null (the
+	 * default) reads the peer manager; a source answering null is a peer
+	 * whose init is unknown.
+	 */
+	private fforPeerFeatureSource:
+		| ((peerPubkey: string) => FeatureFlags | null)
+		| null = null;
+
+	setFforPeerFeatureSource(
+		source: ((peerPubkey: string) => FeatureFlags | null) | null
+	): void {
+		this.fforPeerFeatureSource = source;
+	}
+
+	/**
+	 * Whether the current init exchange negotiated concurrent receive
+	 * (CONCURRENT-RECEIVE.md section 1.1): each side advertised either bit
+	 * of option_ff_receive (560/561) and either bit of option_ff_concurrent
+	 * (562/563). Unlike peerSupportsFfor this is FALSE when the peer's init
+	 * is unknown: an advertisement that was not seen selects nothing, and
+	 * the reconnect check of section 8 must not pass on a guess.
+	 */
+	private peerNegotiatedFforConcurrent(peerPubkey: string): boolean {
+		const local = this.config.localFeatures;
+		if (
+			!local ||
+			!local.hasFeature(Feature.OPTION_FF_RECEIVE) ||
+			!local.hasFeature(Feature.OPTION_FF_CONCURRENT)
+		) {
+			return false;
+		}
+		const remote = this.fforPeerFeatureSource
+			? this.fforPeerFeatureSource(peerPubkey)
+			: this.peerManager?.getPeer(peerPubkey)?.getRemoteInit()?.features ??
+			  null;
+		if (!remote) return false;
+		return (
+			remote.hasFeature(Feature.OPTION_FF_RECEIVE) &&
+			remote.hasFeature(Feature.OPTION_FF_CONCURRENT)
+		);
+	}
+
 	/** Hand the channel its peer's node id and our node-key signer. */
 	/** S's terms for answering ff_init (issue #729); null answers on any. */
 	private fforSettlePolicy: IFforSettlePolicy | null = null;
@@ -6088,7 +6146,8 @@ export class ChannelManager extends EventEmitter {
 			signFn: nodeKey
 				? (digest: Buffer): Buffer => signWithNodeKey(digest, nodeKey)
 				: null,
-			nodePrivateKey: nodeKey
+			nodePrivateKey: nodeKey,
+			concurrentNegotiated: this.peerNegotiatedFforConcurrent(peerPubkey)
 		});
 	}
 
@@ -6105,6 +6164,12 @@ export class ChannelManager extends EventEmitter {
 		// dispatch can have moved the record past what this batch persisted.
 		if (!this._fforDurableState.has(hex)) return;
 		const state = this._fforDurableState.get(hex) ?? null;
+		if (
+			record?.concurrentVersion === 2 &&
+			record.voucherOutcomes?.some((o) => o !== null)
+		) {
+			this.emit('ffor:voucher-outcomes', channelId, record);
+		}
 		const last = this._fforLastState.get(hex);
 		if (last === state) return;
 		this._fforLastState.set(hex, state);
@@ -6140,8 +6205,13 @@ export class ChannelManager extends EventEmitter {
 		}
 	}
 
-	/** Channels whose activation mismatch was already announced. */
-	private _fforEnforceAnnounced = new Set<string>();
+	/**
+	 * The epoch whose dispute was last announced, per channel. Keyed by the
+	 * epoch and not by the channel alone: a disputed book can drain to
+	 * CLOSED and the channel then takes a new epoch, whose own dispute the
+	 * host must hear of as well.
+	 */
+	private _fforEnforceAnnounced = new Map<string, string>();
 
 	/**
 	 * 'ffor:enforce' (channelId, record): the peer's reestablish contradicted
@@ -6154,8 +6224,9 @@ export class ChannelManager extends EventEmitter {
 		record: IFforEpochRecord | null
 	): void {
 		if (!record || !record.activationMismatch) return;
-		if (this._fforEnforceAnnounced.has(hex)) return;
-		this._fforEnforceAnnounced.add(hex);
+		const epoch = record.epochId.toString('hex');
+		if (this._fforEnforceAnnounced.get(hex) === epoch) return;
+		this._fforEnforceAnnounced.set(hex, epoch);
 		this.emit('ffor:enforce', channelId, record);
 	}
 
@@ -6228,6 +6299,20 @@ export class ChannelManager extends EventEmitter {
 		}
 		const progress = newDispatchProgress();
 		this.processActions(peerPubkey, channel, actions, progress);
+		// A concurrent epoch whose close just fell into dispute while its
+		// retransmission chain is held can make no progress on this
+		// connection: the chain is not released and the channel refuses its
+		// own settles until it reestablishes. Ask for that reestablish the
+		// way a blocked transition does, so an HTLC the node holds the
+		// preimage for is settled after one reconnect instead of riding to
+		// its on-chain deadline. A failed write has already asked.
+		if (
+			typeof channel.fforTakeReconnectRequest === 'function' &&
+			channel.fforTakeReconnectRequest() &&
+			!progress.sendsWithheld
+		) {
+			this.emit('transition:blocked', peerPubkey, channelId);
+		}
 		if (progress.sendsWithheld) {
 			// The durable write behind this transition did not land: nothing
 			// that transition authorizes may follow it. The reestablish path
@@ -6310,6 +6395,17 @@ export class ChannelManager extends EventEmitter {
 			feeBaseMsat: number;
 			feeProportionalMillionths: number;
 			epochId?: Buffer;
+			/** TLV 13: the peers delegated HTLCs may reach S from. */
+			witnessPeers?: Buffer[];
+			/** TLV 15: hash-chained vouchers; uniform amounts only. */
+			hashChain?: boolean;
+			/**
+			 * TLV 17: ask for concurrent receive version 1. The channel
+			 * refuses unless both feature pairs are negotiated with the peer.
+			 */
+			concurrent?: boolean;
+			/** Exact signed profile request. Version 2 retains unresolved reserves. */
+			concurrentVersion?: 1 | 2;
 		}
 	): ChannelResult {
 		const peerPubkey = this.channelPeers.get(channelId.toString('hex'));
@@ -9035,15 +9131,26 @@ export class ChannelManager extends EventEmitter {
 	private processActions(
 		peerPubkey: string,
 		channel: Channel,
-		actions: ChannelAction[],
+		produced: ChannelAction[],
 		progress?: IActionDispatchProgress
 	): void {
 		this._syncQuiescenceWatchdog(channel);
 		this._fforEnsureContext(peerPubkey, channel);
 		// An empty batch announces nothing: only a dispatch whose durable
 		// write landed may report the epoch's state (see the tail below).
-		if (actions.length === 0) return;
+		if (produced.length === 0) return;
 		const dispatchProgress = progress ?? newDispatchProgress();
+		// FFOR: a channel holding its retransmission chain puts nothing of
+		// the BOLT 2 stream on the wire ahead of it. Decided here, once, for
+		// every producer: the channel takes those sends out of the batch and
+		// releases them in order behind the chain. The rest of the batch (its
+		// persist, its events) runs now. The state did commit and the wire
+		// is owed in order, which is what sendsHeld reports.
+		const actions =
+			typeof channel.fforHoldStream === 'function'
+				? channel.fforHoldStream(produced)
+				: produced;
+		if (actions !== produced) dispatchProgress.sendsHeld = true;
 		const errorIndex = actions.findIndex(
 			(action) => action.type === ChannelActionType.ERROR
 		);
@@ -9334,6 +9441,16 @@ export class ChannelManager extends EventEmitter {
 						break;
 					}
 					progress?.attemptedMessageTypes.add(action.messageType);
+					// FFOR concurrent receive: S's ff_activate_ack is leaving, so
+					// R can take what a concurrent S originates from here on.
+					// Told to the channel before the transport call, so an
+					// answer the peer returns on this stack already finds it.
+					if (
+						action.messageType === MessageType.FF_ACTIVATE_ACK &&
+						typeof channel.fforNoteActivateAckSent === 'function'
+					) {
+						channel.fforNoteActivateAckSent();
+					}
 					this.sendMessage(peerPubkey, action.messageType, action.payload);
 					// The peer has our tx_signatures now, whatever an earlier drop
 					// of one left behind (issue #645).
@@ -9567,8 +9684,17 @@ export class ChannelManager extends EventEmitter {
 					// No listener (or no storage) leaves committed true, which is
 					// the pre-outbox behavior for a node that persists nothing.
 					if (persistRequest && !persistRequest.committed) {
+						if (typeof channel.fforNoteStateWritten === 'function') {
+							channel.fforNoteStateWritten(false);
+						}
 						setSendsBlocked(true);
 						break;
+					}
+					// The channel learns that its state is on disk: what it
+					// still owed to storage (an observed capability hold of a
+					// concurrent FFOR epoch) is no longer owed.
+					if (typeof channel.fforNoteStateWritten === 'function') {
+						channel.fforNoteStateWritten(true);
 					}
 					// The FFOR state this write made durable, captured HERE: a
 					// nested dispatch may move the in-memory record before this

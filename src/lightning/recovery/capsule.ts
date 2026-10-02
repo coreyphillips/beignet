@@ -43,7 +43,7 @@ import { PEER_STORAGE_MAX_BYTES } from '../message/peer-storage';
 import { getPublicKey } from '../crypto/ecdh';
 import {
 	JOURNAL_META_KEYS,
-	SNAPSHOT_SCHEMA_VERSION,
+	FFOR_SNAPSHOT_SCHEMA_VERSION,
 	assertEmptyTarget,
 	assertFramesReconstructable,
 	assertNoJournalResidue,
@@ -138,6 +138,7 @@ export const PROBE_MUTATION_COVERAGE: Record<RecoveryMutation['type'], true> = {
 	forwarded_htlc: true,
 	delete_forwarded_htlc: true,
 	payment_state: true,
+	ffor_voucher: true,
 	payment_secret: true,
 	delete_payment_secret: true,
 	delete_payment: true,
@@ -155,6 +156,7 @@ export const PROBE_SNAPSHOT_COVERAGE: Record<
 	true
 > = {
 	channels: true,
+	fforVouchers: true,
 	keyIndices: true,
 	chainMonitors: true,
 	preimages: true,
@@ -171,6 +173,21 @@ export const PROBE_SNAPSHOT_COVERAGE: Record<
 
 const PROBE_CHANNEL_ID = 'dd'.repeat(32);
 const PROBE_HASH = 'bb'.repeat(32);
+function probeVoucher(
+	slot: number
+): import('../ffor/voucher-archive').IFforVoucherArchive {
+	return {
+		channelId: PROBE_CHANNEL_ID,
+		epochId: 'ee'.repeat(32),
+		slot,
+		role: 'R',
+		paymentHash: PROBE_HASH,
+		amountMsat: '1000000',
+		htlcId: String(slot),
+		voucherExpiry: 800000,
+		concurrentVersion: 2
+	};
+}
 
 /**
  * A serializable channel state built by the production constructor, so the
@@ -234,7 +251,8 @@ export function knownGoodProbeFrames(): VerifiedRecoveryChain {
 		mutations: [],
 		outboundMessages: [],
 		snapshot: {
-			schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+			schemaVersion: FFOR_SNAPSHOT_SCHEMA_VERSION,
+			fforVouchers: [probeVoucher(1)],
 			channels: [
 				{
 					channelId: PROBE_CHANNEL_ID,
@@ -315,6 +333,7 @@ export function knownGoodProbeFrames(): VerifiedRecoveryChain {
 		previousFrameHash: Buffer.alloc(32),
 		timestamp: 0,
 		mutations: [
+			{ type: 'ffor_voucher', record: probeVoucher(2) },
 			{
 				type: 'channel_state',
 				channelId: PROBE_CHANNEL_ID,

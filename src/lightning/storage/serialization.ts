@@ -12,12 +12,15 @@ import {
 	ChannelCloseReason
 } from '../channel/channel-state';
 import {
+	isFforConcurrentVersion,
+	FforConcurrentVersion,
 	FforAbortReason,
 	FforRole,
 	FforSlotState,
 	FforState,
 	IFforEpochRecord
 } from '../ffor/types';
+import { fforTranscriptConcurrentVersion } from '../ffor/messages';
 import { ShaChainStore, IShaChainEntry } from '../keys/shachain';
 import { IChannelBasepoints } from '../keys/derivation';
 import {
@@ -1110,6 +1113,8 @@ export interface ISerializedFforEpoch {
 		voucherAmountsMsat: string[];
 		witnessPeers?: string[];
 		hashChain?: boolean;
+		/** ff_init TLV 17 as requested; absent when the TLV was. */
+		concurrentVersion?: number;
 	};
 	remoteNodeId: string;
 	initWire: string;
@@ -1132,6 +1137,11 @@ export interface ISerializedFforEpoch {
 	slotUpstream: (string | null)[];
 	settledBitmap: string | null;
 	knownPreimages: (string | null)[];
+	voucherOutcomes?: ({
+		outcome: 'fulfilled' | 'cancelled';
+		localCommitmentNumber: string;
+		remoteCommitmentNumber: string;
+	} | null)[];
 	/** Absent on records written before the field existed: no slot exposed. */
 	exposedSlots?: boolean[];
 	/** Absent on records written before the field existed: no issuer. */
@@ -1153,6 +1163,18 @@ export interface ISerializedFforEpoch {
 	abortReason: number | null;
 	closeSent: boolean;
 	activationMismatch: boolean;
+	/**
+	 * The selected profile (see IFforEpochRecord.concurrentVersion). Written
+	 * only for a concurrent epoch, so a baseline record serializes to the
+	 * bytes it always did; absent reads as baseline.
+	 */
+	concurrentVersion?: number;
+	concurrentVersionMismatch?: boolean;
+	/**
+	 * The capability hold (see IFforEpochRecord.capabilityHold). Written
+	 * only while it stands, and only a concurrent epoch has one.
+	 */
+	capabilityHold?: boolean;
 }
 
 export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
@@ -1177,7 +1199,10 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 			...(f.params.witnessPeers
 				? { witnessPeers: f.params.witnessPeers.map((p) => p.toString('hex')) }
 				: {}),
-			...(f.params.hashChain ? { hashChain: true } : {})
+			...(f.params.hashChain ? { hashChain: true } : {}),
+			...(f.params.concurrentVersion !== undefined
+				? { concurrentVersion: f.params.concurrentVersion }
+				: {})
 		},
 		remoteNodeId: f.remoteNodeId.toString('hex'),
 		initWire: f.initWire.toString('hex'),
@@ -1201,6 +1226,19 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 		slotUpstream: [...f.slotUpstream],
 		settledBitmap: bufToHex(f.settledBitmap),
 		knownPreimages: f.knownPreimages.map((p) => bufToHex(p)),
+		...(f.voucherOutcomes
+			? {
+					voucherOutcomes: f.voucherOutcomes.map((o) =>
+						o
+							? {
+									outcome: o.outcome,
+									localCommitmentNumber: bigintToStr(o.localCommitmentNumber),
+									remoteCommitmentNumber: bigintToStr(o.remoteCommitmentNumber)
+							  }
+							: null
+					)
+			  }
+			: {}),
 		exposedSlots: [...f.exposedSlots],
 		issuerProvisioned: f.issuerProvisioned,
 		witnesses: f.witnesses.map((w) => ({
@@ -1218,13 +1256,97 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 		unwindOwed: f.unwindOwed,
 		abortReason: f.abortReason,
 		closeSent: f.closeSent,
-		activationMismatch: f.activationMismatch
+		activationMismatch: f.activationMismatch,
+		...(f.concurrentVersionMismatch ? { concurrentVersionMismatch: true } : {}),
+		...(isFforConcurrentVersion(f.concurrentVersion)
+			? { concurrentVersion: f.concurrentVersion }
+			: {}),
+		...(isFforConcurrentVersion(f.concurrentVersion) &&
+		f.capabilityHold === true
+			? { capabilityHold: true }
+			: {})
 	};
+}
+
+/**
+ * The selected profile of a stored epoch, checked against the transcript
+ * it was persisted with (CONCURRENT-RECEIVE.md section 1.1: the version is
+ * never inferred from features, connection status or preferences, and
+ * section 8: it is compared with the persisted setup bytes).
+ *
+ * The stored field and the stored ff_init and ff_accept must tell one
+ * story: a request and its exact echo beside a selected version, or no
+ * TLV 17 in either beside none. When they do not (a row a build without
+ * the field rewrote, a damaged row), the record is never read as a
+ * baseline epoch: it is concurrent if either source says so, and
+ * `mismatch` is set so the caller raises activationMismatch, which stops
+ * new work on both sides and leaves the vouchers and every existing
+ * obligation in place. A record whose wires do not decode and whose field
+ * is absent is left alone; there is nothing to compare.
+ */
+function storedConcurrentVersion(
+	storedField: number | undefined,
+	requestedField: number | undefined,
+	initWire: Buffer,
+	acceptWire: Buffer | null
+): { selected: 0 | FforConcurrentVersion; mismatch: boolean } {
+	const stored = isFforConcurrentVersion(storedField) ? storedField : 0;
+	const transcript = fforTranscriptConcurrentVersion(initWire, acceptWire);
+	if (transcript === null) {
+		const hints = [storedField, requestedField].filter(
+			(version) => version !== undefined && version !== 0
+		);
+		return {
+			selected:
+				hints.some((version) => version !== 1) || requestedField === 0
+					? 2
+					: hints.length
+					? 1
+					: 0,
+			mismatch: !!storedField || requestedField !== undefined
+		};
+	}
+	const { requested, echoed } = transcript;
+	const accepted = acceptWire !== null;
+	const selectedOnWire =
+		accepted && isFforConcurrentVersion(requested) && echoed === requested
+			? requested
+			: 0;
+	const unsupported =
+		(storedField !== undefined &&
+			storedField !== 0 &&
+			!isFforConcurrentVersion(storedField)) ||
+		[requestedField, requested, echoed].some(
+			(version) => version !== undefined && !isFforConcurrentVersion(version)
+		);
+	const consistent =
+		!unsupported &&
+		selectedOnWire === stored &&
+		requested === requestedField &&
+		(!accepted || echoed === requested);
+	// Never reinterpret a contradictory or unknown selected version as baseline.
+	// Prefer the reservation-preserving profile while the mismatch quarantines it.
+	const selected =
+		unsupported ||
+		stored === 2 ||
+		selectedOnWire === 2 ||
+		(!consistent && [requestedField, requested, echoed].includes(2))
+			? 2
+			: stored || selectedOnWire;
+	return { selected, mismatch: !consistent };
 }
 
 export function deserializeFforEpoch(
 	s: ISerializedFforEpoch
 ): IFforEpochRecord {
+	const initWire = Buffer.from(s.initWire, 'hex');
+	const acceptWire = hexToBuf(s.acceptWire);
+	const concurrent = storedConcurrentVersion(
+		s.concurrentVersion,
+		s.params.concurrentVersion,
+		initWire,
+		acceptWire
+	);
 	return {
 		role: s.role as FforRole,
 		state: s.state as FforState,
@@ -1250,11 +1372,14 @@ export function deserializeFforEpoch(
 						)
 				  }
 				: {}),
-			...(s.params.hashChain ? { hashChain: true } : {})
+			...(s.params.hashChain ? { hashChain: true } : {}),
+			...(s.params.concurrentVersion !== undefined
+				? { concurrentVersion: s.params.concurrentVersion }
+				: {})
 		},
 		remoteNodeId: Buffer.from(s.remoteNodeId, 'hex'),
-		initWire: Buffer.from(s.initWire, 'hex'),
-		acceptWire: hexToBuf(s.acceptWire),
+		initWire,
+		acceptWire,
 		sCommitmentNumber:
 			s.sCommitmentNumber === null ? null : strToBigint(s.sCommitmentNumber),
 		sHtlcIdBase: s.sHtlcIdBase === null ? null : strToBigint(s.sHtlcIdBase),
@@ -1274,6 +1399,24 @@ export function deserializeFforEpoch(
 		slotUpstream: [...s.slotUpstream],
 		settledBitmap: hexToBuf(s.settledBitmap),
 		knownPreimages: s.knownPreimages.map((p) => hexToBuf(p)),
+		...(s.voucherOutcomes
+			? {
+					voucherOutcomes: s.voucherOutcomes.map((o) => {
+						if (o === null) return null;
+						if (
+							(o.outcome !== 'fulfilled' && o.outcome !== 'cancelled') ||
+							!/^\d+$/.test(o.localCommitmentNumber) ||
+							!/^\d+$/.test(o.remoteCommitmentNumber)
+						)
+							throw new Error('Invalid FFOR voucher outcome');
+						return {
+							outcome: o.outcome,
+							localCommitmentNumber: strToBigint(o.localCommitmentNumber),
+							remoteCommitmentNumber: strToBigint(o.remoteCommitmentNumber)
+						};
+					})
+			  }
+			: {}),
 		exposedSlots: s.exposedSlots ?? s.knownPreimages.map(() => false),
 		issuerProvisioned: s.issuerProvisioned === true,
 		witnesses: (s.witnesses ?? []).map((w) => ({
@@ -1294,7 +1437,18 @@ export function deserializeFforEpoch(
 				? null
 				: (s.abortReason as FforAbortReason),
 		closeSent: s.closeSent === true,
-		activationMismatch: s.activationMismatch === true
+		activationMismatch: s.activationMismatch === true || concurrent.mismatch,
+		...(s.concurrentVersionMismatch ||
+		(concurrent.selected === 2 && concurrent.mismatch)
+			? { concurrentVersionMismatch: true }
+			: {}),
+		...(isFforConcurrentVersion(concurrent.selected)
+			? { concurrentVersion: concurrent.selected }
+			: {}),
+		...(isFforConcurrentVersion(concurrent.selected) &&
+		s.capabilityHold === true
+			? { capabilityHold: true }
+			: {})
 	};
 }
 

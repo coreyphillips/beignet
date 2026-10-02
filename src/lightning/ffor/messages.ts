@@ -333,12 +333,44 @@ export function encodeFforInitUnsigned(
 	if (msg.hashChain) {
 		records.push({ type: 15n, value: u8(1) });
 	}
+	if (msg.concurrentVersion !== undefined) {
+		records.push({
+			type: 17n,
+			value: encodeConcurrentVersion(msg.concurrentVersion)
+		});
+	}
 	return Buffer.concat([
 		msg.channelId,
 		msg.epochId,
 		fixed,
 		encodeTlvStream(records)
 	]);
+}
+
+/**
+ * TLV 17 `concurrent_version` of ff_init and ff_accept (CONCURRENT-RECEIVE.md
+ * section 1.1): exactly two bytes, big-endian.
+ */
+function encodeConcurrentVersion(version: number): Buffer {
+	if (!Number.isInteger(version) || version < 0 || version > 0xffff) {
+		throw new Error('concurrent_version must fit two bytes');
+	}
+	return u16(version);
+}
+
+/**
+ * A length other than two is malformed. The value itself is not judged
+ * here: the handler refuses one it does not select.
+ */
+function decodeConcurrentVersion(
+	value: Buffer | undefined,
+	what: string
+): number | undefined {
+	if (value === undefined) return undefined;
+	if (value.length !== 2) {
+		throw new Error(`${what} TLV 17 must be 2 bytes`);
+	}
+	return value.readUInt16BE(0);
 }
 
 function assertNodeId(id: Buffer, what: string): void {
@@ -384,6 +416,10 @@ export function decodeFforInitMessage(body: Buffer): IFforInitMessage {
 	const amounts = tlvList(tlvs, 9n);
 	const witnessPeers = tlvList(tlvs, 13n);
 	const hashChain = tlvList(tlvs, 15n);
+	const concurrentVersion = decodeConcurrentVersion(
+		tlvList(tlvs, 17n),
+		'ff_init'
+	);
 	if (tower !== undefined && tower.length !== 33) {
 		throw new Error('ff_init TLV 3 must be 33 bytes');
 	}
@@ -421,6 +457,7 @@ export function decodeFforInitMessage(body: Buffer): IFforInitMessage {
 			? { witnessPeers: decodeWitnessPeers(witnessPeers) }
 			: {}),
 		...(hashChain !== undefined ? { hashChain: true } : {}),
+		...(concurrentVersion !== undefined ? { concurrentVersion } : {}),
 		signature
 	};
 }
@@ -447,6 +484,12 @@ export function encodeFforAcceptUnsigned(
 		});
 	}
 	records.push({ type: 11n, value: msg.initHash });
+	if (msg.concurrentVersion !== undefined) {
+		records.push({
+			type: 17n,
+			value: encodeConcurrentVersion(msg.concurrentVersion)
+		});
+	}
 	return Buffer.concat([
 		msg.channelId,
 		msg.epochId,
@@ -472,6 +515,10 @@ export function decodeFforAcceptMessage(body: Buffer): IFforAcceptMessage {
 	if (initHash === undefined || initHash.length !== 32) {
 		throw new Error('ff_accept: TLV 11 (init_hash) required, 32 bytes');
 	}
+	const concurrentVersion = decodeConcurrentVersion(
+		tlvList(tlvs, 17n),
+		'ff_accept'
+	);
 	return {
 		channelId,
 		epochId,
@@ -485,8 +532,44 @@ export function decodeFforAcceptMessage(body: Buffer): IFforAcceptMessage {
 				  )
 				: [],
 		initHash,
+		...(concurrentVersion !== undefined ? { concurrentVersion } : {}),
 		signature
 	};
+}
+
+/**
+ * What a stored setup transcript says about the concurrent profile
+ * (CONCURRENT-RECEIVE.md section 1.1): the concurrent_version ff_init
+ * requested and the one ff_accept echoed, read from the wire bytes the
+ * epoch record keeps (`[2: type] || body`). `acceptWire` is null before
+ * ff_accept. Returns null when a stored message does not decode, so the
+ * caller can tell "says baseline" from "cannot say".
+ */
+export function fforTranscriptConcurrentVersion(
+	initWire: Buffer,
+	acceptWire: Buffer | null
+): { requested: number | undefined; echoed: number | undefined } | null {
+	try {
+		if (initWire.length < 2 || initWire.readUInt16BE(0) !== FF_INIT_TYPE) {
+			return null;
+		}
+		const requested = decodeFforInitMessage(
+			initWire.subarray(2)
+		).concurrentVersion;
+		if (acceptWire === null) return { requested, echoed: undefined };
+		if (
+			acceptWire.length < 2 ||
+			acceptWire.readUInt16BE(0) !== FF_ACCEPT_TYPE
+		) {
+			return null;
+		}
+		return {
+			requested,
+			echoed: decodeFforAcceptMessage(acceptWire.subarray(2)).concurrentVersion
+		};
+	} catch {
+		return null;
+	}
 }
 
 // ---------------------------------------------------------------------------

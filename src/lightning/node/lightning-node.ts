@@ -6,6 +6,15 @@
  * into a unified Lightning node API.
  */
 
+import {
+	archiveFforVouchers,
+	IFforVoucherArchive,
+	fforVoucherArchiveId,
+	fforChainReceiptId,
+	fforVoucherReceiptIds,
+	mergeFforVoucherArchive
+} from '../ffor/voucher-archive';
+import { archiveFforChainEvidence } from '../ffor/voucher-chain';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX } from '../message/splice';
 
 /**
@@ -895,6 +904,20 @@ interface IPendingFundingTx {
 	broadcastSucceeded?: boolean;
 }
 
+/** A verified voucher credit whose payment write may need a live retry. */
+interface IFforVoucherCredit {
+	id: string;
+	channelId: Buffer;
+	paymentHash: Buffer;
+	preimage: Buffer;
+	amountMsat: bigint;
+	slot: number;
+	htlcId: bigint | null;
+	claimTxid?: string;
+	/** Final archive source, when this credit is backed by durable custody. */
+	receiptId?: string;
+}
+
 export class LightningNode extends EventEmitter {
 	private nodePrivkey: Buffer;
 	/** Genesis hashes of chains we operate on (for gossip chain-scoping). */
@@ -905,6 +928,8 @@ export class LightningNode extends EventEmitter {
 	private graph: NetworkGraph;
 	private peerManager: PeerManager | null = null;
 	private payments: Map<string, IPaymentInfo> = new Map();
+	private fforArchivedVouchers = new Map<string, IFforVoucherArchive>();
+	private pendingFforVoucherCredits = new Map<string, IFforVoucherCredit>();
 	private preimages: Map<string, Buffer> = new Map();
 	// Hashes of settled incoming keysends that pruneCompletedPayments dropped
 	// from memory. Without an invoice, nothing else keeps the hash closed to a
@@ -1511,6 +1536,33 @@ export class LightningNode extends EventEmitter {
 		this.network = config.network || Network.REGTEST;
 		this.acceptableChainHashes = config.chainHashes ?? [];
 		this.storage = config.storage || null;
+		if (this.storage) {
+			const archiveMethods = [
+				this.storage.saveFforVoucher,
+				this.storage.loadFforVoucher,
+				this.storage.loadAllFforVouchers
+			];
+			const present = archiveMethods.filter(
+				(m) => typeof m === 'function'
+			).length;
+			if (present !== 0 && present !== archiveMethods.length)
+				throw new Error(
+					'Storage must implement all FFOR voucher custody methods together'
+				);
+			if (
+				present === 0 &&
+				this.storage
+					.loadAllChannels()
+					.some((r) => r.state.ffor?.concurrentVersion === 2)
+			) {
+				throw new Error('Storage cannot restore version 2 voucher custody');
+			}
+		}
+		// Custody is safety-critical. A corrupt archive stops startup instead
+		// of silently losing claims or treating consumed slots as new ones.
+		for (const record of this.storage?.loadAllFforVouchers?.() ?? []) {
+			this.fforArchivedVouchers.set(fforVoucherArchiveId(record), record);
+		}
 		// Recovery Protocol phase 1: the choke point every safety-critical write
 		// goes through, so channel state, its key index, its chain monitor delta
 		// and the wire bytes they authorize commit as one unit
@@ -1786,6 +1838,27 @@ export class LightningNode extends EventEmitter {
 		} else {
 			localFeatures.clearBit(Feature.ASYNC_RECEIVE_SERVICE);
 			localFeatures.clearBit(Feature.ASYNC_RECEIVE_SERVICE + 1);
+		}
+		// FFOR concurrent receive (CONCURRENT-RECEIVE.md section 1.1): the
+		// optional bit is advertised only when the node opts in, and it
+		// depends on option_ff_receive (and on option_quiesce, which every
+		// activation runs under). Cleared explicitly otherwise, so a
+		// caller-supplied feature set cannot advertise an extension this node
+		// has not turned on: the spec forbids advertising it by default until
+		// the whole version is implemented.
+		if (config.fforConcurrent?.enabled) {
+			if (
+				!localFeatures.hasFeature(Feature.OPTION_FF_RECEIVE) ||
+				!localFeatures.hasFeature(Feature.QUIESCE)
+			) {
+				throw new Error(
+					'fforConcurrent needs option_ff_receive and option_quiesce in the feature set'
+				);
+			}
+			localFeatures.setOptional(Feature.OPTION_FF_CONCURRENT);
+		} else {
+			localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT);
+			localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT + 1);
 		}
 		this.localFeatures = localFeatures;
 
@@ -2428,6 +2501,7 @@ export class LightningNode extends EventEmitter {
 				this.storage.setRecoveryMeta?.(REPAIR_TAIL_KEY, 'owed');
 			}
 			this.restoreFromStorage();
+			this.reconcileFforVoucherPayments();
 			// Channels and forward linkage are loaded: settle every held
 			// forward whose outcome those durable facts already decide.
 			this.asyncPaymentManager.reconcile();
@@ -3865,6 +3939,39 @@ export class LightningNode extends EventEmitter {
 				peerPubkey: peer
 			}
 		];
+		const epoch = channel.getFforEpoch();
+		if (
+			epoch &&
+			this.storage.saveFforVoucher &&
+			this.storage.loadFforVoucher &&
+			this.storage.loadAllFforVouchers
+		) {
+			if (
+				!this.safeStorage(() => {
+					for (const record of archiveFforVouchers(channelIdHex, epoch)) {
+						const previous = this.storage!.loadFforVoucher!(
+							fforVoucherArchiveId(record)
+						);
+						const merged = mergeFforVoucherArchive(previous, record);
+						if (JSON.stringify(previous) !== JSON.stringify(merged)) {
+							mutations.push({ type: 'ffor_voucher', record: merged });
+						}
+					}
+				}, 'prepare voucher custody')
+			) {
+				if (request) request.committed = false;
+				return;
+			}
+		} else if (epoch?.concurrentVersion === 2) {
+			if (request) request.committed = false;
+			this.emit('node:error', {
+				code: 'PERSISTENCE_ERROR',
+				channelId,
+				message: 'Storage cannot preserve version 2 voucher custody',
+				timestamp: Date.now()
+			} as ILightningError);
+			return;
+		}
 		if (keyIndex != null) {
 			mutations.push({
 				type: 'channel_key_index',
@@ -3874,6 +3981,14 @@ export class LightningNode extends EventEmitter {
 		}
 		const monitorMutation = this.takeDirtyMonitorMutation(channelIdHex);
 		if (monitorMutation) mutations.push(monitorMutation);
+		if (!this.prepareFforChainCustody(channelIdHex, mutations)) {
+			if (monitorMutation) {
+				this.dirtyMonitors.add(channelIdHex);
+				this.monitorsAwaitingChannel.add(channelIdHex);
+			}
+			if (request) request.committed = false;
+			return;
+		}
 		// A peer-proven outbox supersede (its revoke_and_ack acknowledged the
 		// rows) deletes IN this same transaction: on rollback the rows survive
 		// alongside the pre-revoke state that still needs them.
@@ -3953,6 +4068,14 @@ export class LightningNode extends EventEmitter {
 				timestamp: Date.now()
 			} as ILightningError);
 		} else {
+			for (const mutation of mutations) {
+				if (mutation.type === 'ffor_voucher') {
+					this.fforArchivedVouchers.set(
+						fforVoucherArchiveId(mutation.record),
+						mutation.record
+					);
+				}
+			}
 			this._failedTerminalPersists.delete(channelIdHex);
 		}
 	}
@@ -4164,9 +4287,14 @@ export class LightningNode extends EventEmitter {
 		}
 		const mutation = this.takeDirtyMonitorMutation(channelIdHex);
 		if (!mutation) return;
+		const mutations = [mutation];
+		if (!this.prepareFforChainCustody(channelIdHex, mutations)) {
+			this.dirtyMonitors.add(channelIdHex);
+			return;
+		}
 		const result = this.recovery.commit({
 			criticality: RecoveryCriticality.SafetyCritical,
-			mutations: [mutation],
+			mutations,
 			outboundMessages: []
 		});
 		if (!result.committed) {
@@ -4174,7 +4302,46 @@ export class LightningNode extends EventEmitter {
 			// cleared the flag. Mark it dirty again so the next block, fee sample or
 			// channel transition writes this monitor instead of dropping the delta.
 			this.dirtyMonitors.add(channelIdHex);
+		} else {
+			for (const entry of mutations) {
+				if (entry.type === 'ffor_voucher') {
+					this.fforArchivedVouchers.set(
+						fforVoucherArchiveId(entry.record),
+						entry.record
+					);
+				}
+			}
 		}
+	}
+
+	/** Add custody to the same transaction as the monitor that establishes it. */
+	private prepareFforChainCustody(
+		channelId: string,
+		mutations: RecoveryMutation[]
+	): boolean {
+		const monitor = mutations.find((m) => m.type === 'chain_monitor');
+		if (
+			!monitor ||
+			monitor.type !== 'chain_monitor' ||
+			!this.storage?.saveFforVoucher
+		)
+			return true;
+		return this.safeStorage(() => {
+			const records = new Map(
+				[...this.fforArchivedVouchers].filter(
+					([, r]) => r.channelId === channelId
+				)
+			);
+			for (const mutation of mutations) {
+				if (mutation.type === 'ffor_voucher')
+					records.set(fforVoucherArchiveId(mutation.record), mutation.record);
+			}
+			for (const record of records.values()) {
+				const next = archiveFforChainEvidence(record, monitor.state);
+				if (JSON.stringify(next) !== JSON.stringify(record))
+					mutations.push({ type: 'ffor_voucher', record: next });
+			}
+		}, 'prepare voucher chain custody');
 	}
 
 	/**
@@ -4613,8 +4780,9 @@ export class LightningNode extends EventEmitter {
 			// A terminal channel also retires its monitor bookkeeping: a
 			// lingering awaiting-channel hold would otherwise block standalone
 			// monitor commits for this id forever.
-			this.dirtyMonitors.delete(channelId.toString('hex'));
-			this.monitorsAwaitingChannel.delete(channelId.toString('hex'));
+			if (!this.dirtyMonitors.has(channelId.toString('hex'))) {
+				this.monitorsAwaitingChannel.delete(channelId.toString('hex'));
+			}
 			// Close-broadcast bookkeeping is only meaningful while the close can
 			// still be rebroadcast; a resolved close retires it.
 			const resolvedIdHex = channelId.toString('hex');
@@ -5207,6 +5375,12 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 		this.channelManager.on(
+			'ffor:voucher-outcomes',
+			(channelId: Buffer, record: IFforEpochRecord) => {
+				this.fforSettleVoucherInvoices(channelId, record);
+			}
+		);
+		this.channelManager.on(
 			'ffor:enforce',
 			(channelId: Buffer, record: IFforEpochRecord) => {
 				this.emit('ffor:enforce', { channelId, record });
@@ -5401,6 +5575,10 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on(
 			'monitor:updated',
 			(channelIdHex: string, _monitor: ChainMonitor) => {
+				if (!this.recovery) {
+					this.captureInMemoryFforCustody(channelIdHex);
+					return;
+				}
 				this.dirtyMonitors.add(channelIdHex);
 				// ANY open transition for this channel claims the delta, not just
 				// the innermost: a nested batch for another channel can sit on
@@ -14773,9 +14951,23 @@ export class LightningNode extends EventEmitter {
 			// field made CLN/eclair/LDK refuse to route onion messages to us and
 			// left our BOLT 12 offers unreachable to non-direct peers. Reuse the init
 			// feature set (large_channels is already in it when wumbo is enabled).
+			//
+			// option_ff_concurrent is the one exception. CONCURRENT-RECEIVE.md
+			// section 1.1 defines it for the init context only: it qualifies a
+			// connection, both peers read it from the current init exchange,
+			// and nothing may infer a profile from an advertisement seen
+			// elsewhere. So it stays out of gossip. A node that has not opted
+			// in takes the first branch and announces the bytes it always did.
+			let announcedFeatures = this.localFeatures.toBuffer();
+			if (this.localFeatures.hasFeature(Feature.OPTION_FF_CONCURRENT)) {
+				const announced = FeatureFlags.fromBuffer(announcedFeatures);
+				announced.clearBit(Feature.OPTION_FF_CONCURRENT);
+				announced.clearBit(Feature.OPTION_FF_CONCURRENT + 1);
+				announcedFeatures = announced.toBuffer();
+			}
 			const payload = encodeNodeAnnouncementMessage({
 				signature: Buffer.alloc(64), // placeholder — signed below
-				features: this.localFeatures.toBuffer(),
+				features: announcedFeatures,
 				timestamp,
 				nodeId,
 				rgbColor: Buffer.from([0, 0, 0]),
@@ -18429,8 +18621,30 @@ export class LightningNode extends EventEmitter {
 			witnessPeers?: Buffer[];
 			/** TLV 15: hash-chained vouchers (section 9.5.4); uniform amounts. */
 			hashChain?: boolean;
+			/**
+			 * TLV 17: ask for concurrent receive version 1
+			 * (CONCURRENT-RECEIVE.md section 1.1). Refused unless both sides
+			 * advertised option_ff_concurrent; selected only by S's echo.
+			 */
+			concurrent?: boolean;
+			/** Exact signed profile request. Version 2 retains unresolved reserves. */
+			concurrentVersion?: 1 | 2;
 		}
 	): ChannelResult {
+		if (
+			request.concurrentVersion === 2 &&
+			this.storage &&
+			(!this.storage.saveFforVoucher ||
+				!this.storage.loadFforVoucher ||
+				!this.storage.loadAllFforVouchers)
+		) {
+			return {
+				ok: false,
+				actions: [],
+				error: 'Storage cannot preserve version 2 voucher custody'
+			};
+		}
+
 		return this.channelManager.initiateFforEpoch(
 			Buffer.from(channelIdHex, 'hex'),
 			request
@@ -18462,10 +18676,57 @@ export class LightningNode extends EventEmitter {
 	 */
 	fforAddPreimage(channelIdHex: string, preimage: Buffer): ChannelResult {
 		const channelId = Buffer.from(channelIdHex, 'hex');
+		if (preimage.length !== 32)
+			return {
+				ok: false,
+				actions: [],
+				error: 'FFOR preimage must be 32 bytes'
+			};
+		const hashHex = crypto.createHash('sha256').update(preimage).digest('hex');
+		const live = this.channelManager.getFforEpoch(channelId);
+		if (!live?.paymentHashes.some((h) => h.toString('hex') === hashHex)) {
+			const archived = [...this.fforArchivedVouchers.values()].filter(
+				(r) =>
+					r.role === 'R' &&
+					r.channelId === channelIdHex &&
+					r.paymentHash === hashHex
+			);
+			if (archived.length > 0) {
+				const updated = archived.map((r) => ({
+					...r,
+					preimage: preimage.toString('hex')
+				}));
+				if (
+					!this.commitMutations(
+						'archive voucher proof',
+						[
+							...updated.map(
+								(record): RecoveryMutation => ({ type: 'ffor_voucher', record })
+							),
+							{ type: 'payment_preimage', paymentHash: hashHex, preimage }
+						],
+						RecoveryCriticality.SafetyCritical
+					)
+				)
+					return {
+						ok: false,
+						actions: [],
+						error: 'FFOR proof custody write failed'
+					};
+				for (const record of updated)
+					this.fforArchivedVouchers.set(fforVoucherArchiveId(record), record);
+				this.preimages.set(hashHex, Buffer.from(preimage));
+				this.channelManager.recordPreimage(
+					Buffer.from(hashHex, 'hex'),
+					preimage
+				);
+				this.reconcileFforVoucherPayments();
+				return { ok: true, actions: [] };
+			}
+		}
 		const result = this.channelManager.fforAddPreimage(channelId, preimage);
 		if (result.ok) {
 			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
-			const hashHex = paymentHash.toString('hex');
 			this.preimages.set(hashHex, preimage);
 			this.commitMutations(
 				'savePreimage',
@@ -18920,6 +19181,13 @@ export class LightningNode extends EventEmitter {
 				'FFOR epoch is in dispute after reestablish: no invoice is exposed'
 			);
 		}
+		// CONCURRENT-RECEIVE.md section 8: an incompatible reconnect holds new
+		// admission. S refuses to settle under the hold, so an invoice exposed
+		// now is one it would not honour.
+		const admissionHold = channel.fforAdmissionHold();
+		if (admissionHold) {
+			throw new Error(`FFOR: no invoice is exposed while ${admissionHold}`);
+		}
 		if (k < 1 || k > record.params.maxPayments) {
 			throw new Error(`voucher ${k} is not in the book`);
 		}
@@ -18988,26 +19256,184 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * R, once the epoch closed: complete the incoming payment record of every
-	 * voucher whose preimage the drain fulfilled with, and announce it. A
-	 * voucher invoice is an ordinary invoice with an external hash, so it has
-	 * a PENDING incoming payment from the mint; the receiver never handles
-	 * the payer's HTLC (S settled it upstream), so nothing on the onion path
-	 * ever completed it, and the invoice list said PENDING for a voucher the
-	 * channel balance already carried (issue #876). The credit is the drain
-	 * round's fulfil, which is what CLOSED follows, so this is where the
-	 * receive is announced: payment:received and invoice:settled, the same
-	 * two a wallet's notifications listen for.
+	 * R: complete only vouchers whose durable removal fulfilled them. A
+	 * preimage or a CLOSED book alone is not evidence of received value.
 	 */
 	private fforSettleVoucherInvoices(
 		channelId: Buffer,
 		record: IFforEpochRecord
 	): void {
+		if (!this.storage)
+			this.captureInMemoryFforCustody(channelId.toString('hex'));
+		if (
+			!record.paymentHashes.some((hash, i) => {
+				const payment = this.payments.get(hash.toString('hex'));
+				return (
+					record.voucherOutcomes?.[i]?.outcome === 'fulfilled' &&
+					payment?.direction === PaymentDirection.INCOMING &&
+					payment.status !== PaymentStatus.COMPLETED
+				);
+			})
+		)
+			return;
+		if (this.storage) {
+			// State events carry a live object that re-entrant dispatch may
+			// have advanced beyond the last successful write.
+			let durable: IFforEpochRecord | null | undefined;
+			if (
+				!this.safeStorage(() => {
+					durable = this.storage!.loadChannel(channelId.toString('hex'))?.state
+						.ffor;
+				}, 'load voucher outcomes')
+			)
+				return;
+			if (!durable || !durable.epochId.equals(record.epochId)) return;
+			record = durable;
+		}
+		if (
+			record.role !== 'R' ||
+			(record.state !== FforState.CLOSED && record.concurrentVersion !== 2)
+		)
+			return;
 		record.paymentHashes.forEach((hash, i) => {
 			const preimage = record.knownPreimages[i];
-			if (!hash || !preimage) return;
+			if (
+				!hash ||
+				!preimage ||
+				record.voucherOutcomes?.[i]?.outcome !== 'fulfilled'
+			)
+				return;
 			this.fforCompleteVoucherPayment(channelId, record, i, preimage);
 		});
+	}
+
+	/** Keep identical accounting semantics for explicitly ephemeral nodes. */
+	private captureInMemoryFforCustody(channelIdHex: string): void {
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		const epoch = this.channelManager.getFforEpoch(channelId);
+		if (epoch) {
+			for (const record of archiveFforVouchers(channelIdHex, epoch)) {
+				const id = fforVoucherArchiveId(record);
+				this.fforArchivedVouchers.set(
+					id,
+					mergeFforVoucherArchive(
+						this.fforArchivedVouchers.get(id) ?? null,
+						record
+					)
+				);
+			}
+		}
+		const records = [...this.fforArchivedVouchers].filter(
+			([, record]) => record.channelId === channelIdHex
+		);
+		if (!records.length) return;
+		const monitor = this.channelManager.getMonitor(channelId)?.getFullState();
+		if (!monitor) return;
+		for (const [id, record] of records) {
+			this.fforArchivedVouchers.set(
+				id,
+				archiveFforChainEvidence(record, monitor)
+			);
+		}
+	}
+
+	/** Durable receipt identities for hosts reconciling separately received value. */
+	getFforVoucherReceipts(channelIdHex?: string): {
+		channelId: string;
+		epochId: string;
+		slot: number;
+		paymentHash: string;
+		receiptIds: string[];
+		creditedReceiptId?: string;
+		uncreditedReceiptIds: string[];
+		reconciliationRequired: boolean;
+	}[] {
+		return [...this.fforArchivedVouchers.values()]
+			.filter(
+				(r) => r.role === 'R' && (!channelIdHex || r.channelId === channelIdHex)
+			)
+			.map((r) => {
+				const receiptIds = fforVoucherReceiptIds(r);
+				const uncreditedReceiptIds = receiptIds.filter(
+					(id) => id !== r.creditedReceiptId
+				);
+				return {
+					channelId: r.channelId,
+					epochId: r.epochId,
+					slot: r.slot,
+					paymentHash: r.paymentHash,
+					receiptIds,
+					creditedReceiptId: r.creditedReceiptId,
+					uncreditedReceiptIds,
+					reconciliationRequired:
+						uncreditedReceiptIds.length > 0 &&
+						(!!r.creditedReceiptId ||
+							this.payments.get(r.paymentHash)?.status ===
+								PaymentStatus.COMPLETED)
+				};
+			});
+	}
+
+	/** Retry a missed completion after restart or a failed payment write. */
+	private reconcileFforVoucherPayments(): void {
+		// Final monitors stop receiving ordinary block updates. Retry their
+		// failed custody writes here before consuming any archived receipt.
+		for (const id of [...this.dirtyMonitors]) {
+			if (!this.openTransitions.includes(id)) this.persistMonitorAlone(id);
+		}
+		for (const record of this.fforArchivedVouchers.values()) {
+			if (record.role !== 'R' || !record.preimage) continue;
+			const receiptId =
+				record.creditedReceiptId ?? fforVoucherReceiptIds(record)[0];
+			if (!receiptId) continue;
+			const chain = record.chainResolutions?.find(
+				(r) => fforChainReceiptId(r) === receiptId
+			);
+			this.fforApplyVoucherCredit({
+				id: fforVoucherArchiveId(record),
+				channelId: Buffer.from(record.channelId, 'hex'),
+				paymentHash: Buffer.from(record.paymentHash, 'hex'),
+				preimage: Buffer.from(record.preimage, 'hex'),
+				amountMsat: BigInt(chain?.amountMsat ?? record.amountMsat),
+				slot: record.slot,
+				htlcId: BigInt(record.htlcId),
+				receiptId,
+				...(chain ? { claimTxid: chain.spendingTxid } : {})
+			});
+		}
+		for (const credit of [...this.pendingFforVoucherCredits.values()]) {
+			if (credit.claimTxid) {
+				// Do not complete a deferred claim after its observation was
+				// reorged out or while the monitor still needs to reverify it.
+				const confirmed = this.channelManager
+					.getMonitor(credit.channelId)
+					?.getTrackedOutputs()
+					.some(
+						(output) =>
+							output.outputType === OutputType.RECEIVED_HTLC &&
+							output.htlcId === credit.htlcId &&
+							output.paymentHash?.equals(credit.paymentHash) &&
+							output.resolutionTxid === credit.claimTxid &&
+							!output.spendReverifyPending &&
+							output.confirmationHeight > 0 &&
+							(output.status === OutputStatus.SPEND_CONFIRMED ||
+								output.status === OutputStatus.IRREVOCABLY_RESOLVED)
+					);
+				if (!confirmed) continue;
+			}
+			this.fforApplyVoucherCredit(credit);
+		}
+		for (const channel of this.channelManager.listChannels()) {
+			const record = channel.getFforEpoch();
+			const channelId = channel.getChannelId();
+			if (
+				channelId &&
+				record?.role === 'R' &&
+				(record.state === FforState.CLOSED || record.concurrentVersion === 2)
+			) {
+				this.fforSettleVoucherInvoices(channelId, record);
+			}
+		}
 	}
 
 	/**
@@ -19023,6 +19449,9 @@ export class LightningNode extends EventEmitter {
 	): void {
 		const record = this.channelManager.getFforEpoch(channelId);
 		if (!record || record.role !== 'R') return;
+		// Version 2 receives credit from final archived evidence, including the
+		// CSV descendant when our own commitment was published.
+		if (record.concurrentVersion === 2) return;
 		const i = record.paymentHashes.findIndex((h) => h.equals(paymentHash));
 		if (i < 0) return;
 		this.fforCompleteVoucherPayment(channelId, record, i, preimage, claimTxid);
@@ -19040,39 +19469,159 @@ export class LightningNode extends EventEmitter {
 		preimage: Buffer,
 		claimTxid?: string
 	): void {
-		const hash = record.paymentHashes[i];
+		const id = `${channelId.toString('hex')}:${record.epochId.toString(
+			'hex'
+		)}:${i + 1}`;
+		const archived = this.fforArchivedVouchers.get(id);
+		this.fforApplyVoucherCredit({
+			id,
+			channelId: Buffer.from(channelId),
+			paymentHash: Buffer.from(record.paymentHashes[i]),
+			preimage: Buffer.from(preimage),
+			amountMsat: record.params.voucherAmountsMsat[i],
+			slot: i + 1,
+			htlcId:
+				record.sHtlcIdBase === null ? null : record.sHtlcIdBase + BigInt(i),
+			claimTxid,
+			...(!claimTxid && archived
+				? { receiptId: fforVoucherReceiptIds(archived)[0] }
+				: {})
+		});
+	}
+
+	private fforApplyVoucherCredit(credit: IFforVoucherCredit): void {
+		const { paymentHash: hash, preimage, channelId, claimTxid } = credit;
 		const hashHex = hash.toString('hex');
 		const payment = this.payments.get(hashHex);
-		if (
-			!payment ||
-			payment.direction !== PaymentDirection.INCOMING ||
-			payment.status === PaymentStatus.COMPLETED
-		) {
+		if (!payment || payment.direction !== PaymentDirection.INCOMING) {
+			this.pendingFforVoucherCredits.delete(credit.id);
 			return;
 		}
-		payment.status = PaymentStatus.COMPLETED;
-		payment.preimage = Buffer.from(preimage);
-		payment.completedAt = Date.now();
-		payment.amountMsat = record.params.voucherAmountsMsat[i];
+		if (payment.status === PaymentStatus.COMPLETED) {
+			this.fforAttributeCompletedVoucherCredit(credit, payment);
+			return;
+		}
+		const completed: IPaymentInfo = {
+			...payment,
+			status: PaymentStatus.COMPLETED,
+			preimage: Buffer.from(preimage),
+			completedAt: Date.now(),
+			amountMsat: credit.amountMsat
+		};
+		const mutations: RecoveryMutation[] = [];
+		const archived = this.fforArchivedVouchers.get(credit.id);
+		let creditedArchive: IFforVoucherArchive | undefined;
+		if (credit.receiptId && archived) {
+			creditedArchive = mergeFforVoucherArchive(archived, {
+				...archived,
+				creditedReceiptId: credit.receiptId
+			});
+			mutations.push({ type: 'ffor_voucher', record: creditedArchive });
+			completed.metadata = {
+				...payment.metadata,
+				fforReceiptId: credit.receiptId
+			};
+		}
 		// The voucher HTLC on our side, so a restart redispatch knows the
 		// completed hash was settled by exactly it.
-		if (record.sHtlcIdBase !== null) {
-			payment.settledHtlcs = [
-				`${channelId.toString('hex')}:${record.sHtlcIdBase + BigInt(i)}`
+		if (credit.htlcId !== null) {
+			completed.settledHtlcs = [
+				`${channelId.toString('hex')}:${credit.htlcId}`
 			];
 		}
 		if (claimTxid) {
-			payment.metadata = { ...payment.metadata, claimTxid };
+			completed.metadata = {
+				...payment.metadata,
+				...completed.metadata,
+				claimTxid
+			};
 		}
-		this.safeStorage(() => this.persistPayment(hash), 'persistPayment');
-		this.emit('payment:received', payment);
-		this.emitInvoiceSettled(hash, payment);
+		if (
+			!this.commitMutations(
+				'Failed to persist voucher payment',
+				[
+					...mutations,
+					{
+						type: 'payment_state',
+						paymentHash: hashHex,
+						payment: completed
+					}
+				],
+				RecoveryCriticality.SafetyCritical
+			)
+		) {
+			this.pendingFforVoucherCredits.set(credit.id, credit);
+			return;
+		}
+		this.pendingFforVoucherCredits.delete(credit.id);
+		if (creditedArchive)
+			this.fforArchivedVouchers.set(credit.id, creditedArchive);
+		this.payments.set(hashHex, completed);
+		this.emit('payment:received', completed);
+		this.emitInvoiceSettled(hash, completed);
 		this.emitStructuredLog('payment', 'received', {
 			paymentHash: hashHex,
 			fforVoucher: 'true',
-			slot: String(i + 1),
+			slot: String(credit.slot),
 			...(claimTxid ? { claimTxid } : {})
 		});
+	}
+
+	/** Backfill a legacy credit's exact source without completing the invoice again. */
+	private fforAttributeCompletedVoucherCredit(
+		credit: IFforVoucherCredit,
+		payment: IPaymentInfo
+	): void {
+		const archived = this.fforArchivedVouchers.get(credit.id);
+		const matchingHtlc =
+			credit.htlcId !== null &&
+			payment.settledHtlcs?.includes(
+				`${credit.channelId.toString('hex')}:${credit.htlcId}`
+			);
+		const matchingSource =
+			payment.metadata?.fforReceiptId === credit.receiptId ||
+			(matchingHtlc &&
+				(credit.claimTxid
+					? payment.metadata?.claimTxid === credit.claimTxid
+					: !payment.metadata?.claimTxid &&
+					  archived?.outcome?.outcome === 'fulfilled'));
+		if (
+			!credit.receiptId ||
+			!archived ||
+			archived.creditedReceiptId ||
+			!matchingSource
+		) {
+			this.pendingFforVoucherCredits.delete(credit.id);
+			return;
+		}
+		const attributed = mergeFforVoucherArchive(archived, {
+			...archived,
+			creditedReceiptId: credit.receiptId
+		});
+		const updated = {
+			...payment,
+			metadata: { ...payment.metadata, fforReceiptId: credit.receiptId }
+		};
+		if (
+			!this.commitMutations(
+				'Failed to persist voucher credit attribution',
+				[
+					{ type: 'ffor_voucher', record: attributed },
+					{
+						type: 'payment_state',
+						paymentHash: archived.paymentHash,
+						payment: updated
+					}
+				],
+				RecoveryCriticality.SafetyCritical
+			)
+		) {
+			this.pendingFforVoucherCredits.set(credit.id, credit);
+			return;
+		}
+		this.fforArchivedVouchers.set(credit.id, attributed);
+		this.payments.set(archived.paymentHash, updated);
+		this.pendingFforVoucherCredits.delete(credit.id);
 	}
 
 	/**
@@ -26990,6 +27539,7 @@ export class LightningNode extends EventEmitter {
 		// block (issue #760): the peer may simply have been behind the chain.
 		this.resendSpliceConflicts();
 		this.retryFailedTerminalPersists();
+		this.reconcileFforVoucherPayments();
 		this.retrySpliceCloseRedrives();
 		this.retryPendingOutputWatches();
 		// Funding checks a backend outage paused (issue #1105).
@@ -28193,6 +28743,7 @@ export class LightningNode extends EventEmitter {
 			directFunding?: INodeConfig['directFunding'];
 			swaps?: INodeConfig['swaps'];
 			fforSettle?: INodeConfig['fforSettle'];
+			fforConcurrent?: INodeConfig['fforConcurrent'];
 			fforWitness?: INodeConfig['fforWitness'];
 			fforIssuer?: INodeConfig['fforIssuer'];
 			leaseRates?: import('../gossip/types').ILeaseRates;
@@ -28262,6 +28813,7 @@ export class LightningNode extends EventEmitter {
 			directFunding: options?.directFunding,
 			swaps: options?.swaps,
 			fforSettle: options?.fforSettle,
+			fforConcurrent: options?.fforConcurrent,
 			fforWitness: options?.fforWitness,
 			fforIssuer: options?.fforIssuer,
 			leaseRates: options?.leaseRates,

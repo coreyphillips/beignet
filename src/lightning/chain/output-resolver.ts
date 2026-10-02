@@ -2103,7 +2103,8 @@ export function resolveSecondLevelHtlcOutput(
 		outputType: OutputType.TO_LOCAL,
 		status: OutputStatus.CONFIRMED,
 		confirmationHeight,
-		witnessScript
+		witnessScript,
+		isSecondLevelHtlc: true
 	};
 	if (sweepOutputValue(amount, feeSatoshis, destinationScript) === null) {
 		// Still ours to track and watch; the monitor retries it as fees fall.

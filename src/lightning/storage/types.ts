@@ -5,6 +5,7 @@
  * reflects the latest in-memory state.
  */
 
+import { IFforVoucherArchive } from '../ffor/voucher-archive';
 import { IChannelState } from '../channel/channel-state';
 import { IPaymentInfo } from '../node/types';
 import { IChainMonitorState } from '../chain/chain-monitor';
@@ -27,6 +28,11 @@ export interface IStorageBackend {
 		peerPubkey: string;
 	}>;
 	deleteChannel(id: string): void;
+
+	/** Required for FFOR archive custody and journal snapshots that contain it. */
+	saveFforVoucher?(record: IFforVoucherArchive): void;
+	loadFforVoucher?(id: string): IFforVoucherArchive | null;
+	loadAllFforVouchers?(): IFforVoucherArchive[];
 
 	// ─── Payments ───
 	savePayment(paymentHash: string, payment: IPaymentInfo): void;

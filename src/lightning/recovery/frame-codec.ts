@@ -14,6 +14,10 @@
  * module keeps fixed, so hashing the encoded bytes is stable.
  */
 
+import {
+	IFforVoucherArchive,
+	validateFforVoucherArchive
+} from '../ffor/voucher-archive';
 import { createHash } from 'crypto';
 import {
 	serializeChannelState,
@@ -53,6 +57,7 @@ interface IEncodedOutboundMessage {
 }
 
 interface IEncodedSnapshot {
+	fforVouchers?: IFforVoucherArchive[];
 	/** Snapshot content schema, authenticated by the frame hash. Written
 	 *  first so its bytes sit at a stable position; conditional so frames
 	 *  captured before the field existed re-encode byte-identically. */
@@ -154,6 +159,11 @@ const DURABILITY_VALUES: readonly RecoveryDurability[] = [
 
 function encodeMutation(mutation: RecoveryMutation): IEncodedMutation {
 	switch (mutation.type) {
+		case 'ffor_voucher':
+			return {
+				type: mutation.type,
+				record: validateFforVoucherArchive(mutation.record)
+			};
 		case 'channel_state':
 			return {
 				type: mutation.type,
@@ -252,6 +262,11 @@ function encodeMutation(mutation: RecoveryMutation): IEncodedMutation {
 
 function decodeMutation(encoded: IEncodedMutation): RecoveryMutation {
 	switch (encoded.type) {
+		case 'ffor_voucher':
+			return {
+				type: encoded.type,
+				record: validateFforVoucherArchive(encoded.record)
+			};
 		case 'channel_state':
 			return {
 				type: encoded.type,
@@ -390,6 +405,9 @@ function encodeSnapshot(snapshot: RecoverySnapshot): IEncodedSnapshot {
 		...(snapshot.pageFrames !== undefined
 			? { pageFrames: snapshot.pageFrames }
 			: {}),
+		...(snapshot.fforVouchers !== undefined
+			? { fforVouchers: snapshot.fforVouchers.map(validateFforVoucherArchive) }
+			: {}),
 		channels: snapshot.channels.map((c) => ({
 			channelId: c.channelId,
 			state: serializeChannelState(c.state),
@@ -451,6 +469,17 @@ function decodeSnapshot(encoded: IEncodedSnapshot): RecoverySnapshot {
 			'Recovery snapshot schemaVersion, when present, must be a nonempty string'
 		);
 	}
+	const hasArchiveSchema =
+		encoded.schemaVersion === '2+ffor-vouchers' ||
+		encoded.schemaVersion === '2+ffor-vouchers+pages';
+	if (
+		hasArchiveSchema !== (encoded.fforVouchers !== undefined) ||
+		(encoded.fforVouchers !== undefined && !Array.isArray(encoded.fforVouchers))
+	) {
+		throw new Error(
+			'Recovery snapshot FFOR custody does not match its declared schema'
+		);
+	}
 	// Restore trusts this count to say whether the snapshot is whole.
 	if (
 		'pageFrames' in encoded &&
@@ -466,6 +495,9 @@ function decodeSnapshot(encoded: IEncodedSnapshot): RecoverySnapshot {
 			: {}),
 		...(encoded.pageFrames !== undefined
 			? { pageFrames: encoded.pageFrames }
+			: {}),
+		...(encoded.fforVouchers !== undefined
+			? { fforVouchers: encoded.fforVouchers.map(validateFforVoucherArchive) }
 			: {}),
 		channels: encoded.channels.map((c) => ({
 			channelId: c.channelId,

@@ -39,12 +39,14 @@ import { SqliteStorage } from '../../../src/lightning/storage/sqlite-storage';
 import { ChannelActionType } from '../../../src/lightning/channel/channel-actions';
 import {
 	CommitmentType,
+	IRREVOCABLE_DEPTH,
 	OutputStatus,
 	OutputType
 } from '../../../src/lightning/chain/types';
 import {
 	FF_RECONCILE_MARGIN_BLOCKS,
-	FforSlotState
+	FforSlotState,
+	FforState
 } from '../../../src/lightning/ffor/types';
 import {
 	IWorld,
@@ -58,6 +60,7 @@ import {
 	record,
 	worldConfigs
 } from '../helpers/ffor-world';
+import { wireWorldFeatures } from '../helpers/ffor-concurrent-world';
 
 const CAPACITY_SAT = 1_000_000n;
 const FEERATE_PER_KW = 2500; // 10 sat/vB: a commitment bitcoind relays alone
@@ -175,6 +178,7 @@ async function regtestWorld(opts: {
 	rStorage?: SqliteStorage;
 	srPushMsat?: bigint;
 	feeInputs?: number;
+	concurrent?: boolean;
 }): Promise<IRegtestWorld> {
 	await ensureBitcoindFunds(3);
 	const sProvider = new BitcoindFundingProvider();
@@ -194,7 +198,16 @@ async function regtestWorld(opts: {
 			...(opts.rToSelfDelay ? { toSelfDelay: opts.rToSelfDelay } : {})
 		},
 		srCapacitySats: CAPACITY_SAT,
-		srPushMsat: opts.srPushMsat
+		srPushMsat: opts.srPushMsat,
+		...(opts.concurrent
+			? {
+					sExtra: {
+						fforConcurrent: { enabled: true },
+						fforSettle: { enabled: true, allowConcurrent: true }
+					},
+					rExtra: { fforConcurrent: { enabled: true } }
+			  }
+			: {})
 	};
 	const { sConfig, rConfig } = worldConfigs(seedBase, worldOpts);
 	const script = createFundingScript(
@@ -222,6 +235,7 @@ async function regtestWorld(opts: {
 		},
 		tip
 	});
+	if (opts.concurrent) wireWorldFeatures(w);
 	for (const [node, provider] of [
 		[w.s, sProvider],
 		[w.r, rProvider]
@@ -385,6 +399,172 @@ describe('FFOR Variant D on regtest (spec section 15.2)', function () {
 			}
 		}
 	});
+
+	for (const closerRole of ['R', 'S'] as const) {
+		it(`reserved version 2: ${closerRole}'s current commitment produces a final archived receiver receipt`, async function () {
+			if (skip) this.skip();
+			const dbPath = path.join(
+				os.tmpdir(),
+				`ffor-reserved-${crypto.randomBytes(8).toString('hex')}.sqlite`
+			);
+			tmpFiles.push(dbPath, `${dbPath}-wal`, `${dbPath}-shm`);
+			const storage = new SqliteStorage(dbPath);
+			storage.open();
+			const rw = await regtestWorld({
+				rStorage: storage,
+				concurrent: true,
+				srPushMsat: 200_000_000n
+			});
+			const { w, chain, rDest, sDest } = rw;
+			let restored: LightningNode | undefined;
+			let restoredStorage: SqliteStorage | undefined;
+			let completions = 0;
+			w.r.on('payment:received', () => completions++);
+			try {
+				const d = 200_000_000n;
+				const start = w.r.startFforEpoch(w.srHex, {
+					voucherAmountsMsat: [d],
+					minPaymentMsat: d,
+					settlementDeadline: chain.height + 60,
+					voucherExpiry: chain.height + 60 + FF_RECONCILE_MARGIN_BLOCKS,
+					feeBaseMsat: 1000,
+					feeProportionalMillionths: 5000,
+					concurrent: true,
+					concurrentVersion: 2
+				});
+				expect(start.ok, start.error).to.be.true;
+				expect(record(w.r, w.srHex).state).to.equal(FforState.ACTIVE);
+				expect(record(w.r, w.srHex).concurrentVersion).to.equal(2);
+				expect(record(w.s, w.srHex).concurrentVersion).to.equal(2);
+				const [invoice] = exposeAndLeave(w, [1]);
+				const paid = pay(w, invoice);
+				expect(paid.status).to.equal(PaymentStatus.COMPLETED);
+				const hash = record(w.r, w.srHex).paymentHashes[0];
+				chain.unwatch(w.s);
+				expect(w.r.fforAddPreimage(w.srHex, paid.preimage!).ok).to.be.true;
+				const { commitment, confirmedAt } = await forceCloseOnChain(
+					rw,
+					closerRole === 'R' ? w.r : w.s,
+					closerRole === 'R' ? rDest : sDest
+				);
+				let claims: bitcoin.Transaction[];
+				if (closerRole === 'R') {
+					claims = await resolveHtlcs(
+						rw,
+						w.r,
+						commitment,
+						confirmedAt,
+						rDest,
+						OutputType.RECEIVED_HTLC,
+						CommitmentType.OUR_COMMITMENT
+					);
+				} else {
+					const seen = taps(w.r);
+					w.r
+						.getChannelManager()
+						.handleFundingSpent(
+							w.srChannelId,
+							commitment,
+							confirmedAt,
+							rDest,
+							SWEEP_FEE_RATE,
+							undefined,
+							undefined,
+							REGTEST
+						);
+					expect(
+						w.r.getChannelManager().getMonitor(w.srChannelId)!.getFullState()
+							.commitmentBroadcast?.commitmentType
+					).to.equal(CommitmentType.THEIR_CURRENT_COMMITMENT);
+					const output = w.r
+						.getChannelManager()
+						.getMonitor(w.srChannelId)!
+						.getTrackedOutputs()
+						.find(
+							(o) =>
+								o.outputType === OutputType.RECEIVED_HTLC &&
+								o.paymentHash?.equals(hash)
+						)!;
+					await chain.mine(2);
+					const claim = await waitFor(
+						() => seen.find((tx) => spends(tx, commitment, output.outputIndex)),
+						'direct success claim'
+					);
+					await submit(claim, 'version 2 direct success claim');
+					await chain.mine(1);
+					expect(await confirmations(claim.getId())).to.be.at.least(1);
+					expect(paidTo(claim, rDest) > 0n).to.be.true;
+					claims = [claim];
+				}
+				for (const claim of claims) {
+					for (const input of claim.ins) {
+						w.r
+							.getChannelManager()
+							.handleOutputSpent(
+								Buffer.from(input.hash).reverse().toString('hex'),
+								input.index,
+								claim,
+								chain.height
+							);
+					}
+				}
+				expect(w.r.getPayment(hash)?.status).to.equal(PaymentStatus.PENDING);
+				await chain.mine(IRREVOCABLE_DEPTH - 1);
+				expect(w.r.getPayment(hash)?.status).to.equal(PaymentStatus.PENDING);
+				await chain.mine(1);
+				expect(w.r.getPayment(hash)?.status).to.equal(PaymentStatus.COMPLETED);
+				expect(completions).to.equal(1);
+				const archived = storage
+					.loadAllFforVouchers()
+					.find((r) => r.paymentHash === hash.toString('hex'))!;
+				expect(archived.chainResolutions).to.have.length(1);
+				expect(archived.creditedReceiptId).to.be.a('string');
+				expect(w.r.getPayment(hash)?.metadata?.fforReceiptId).to.equal(
+					archived.creditedReceiptId
+				);
+				expect(archived.chainResolutions![0].outputTxid).to.equal(
+					commitment.getId()
+				);
+				const completedAt = w.r.getPayment(hash)?.completedAt;
+				chain.unwatch(w.r);
+				w.r.destroy();
+				restoredStorage = new SqliteStorage(dbPath);
+				restoredStorage.open();
+				restored = new LightningNode({
+					...w.rConfig,
+					storage: restoredStorage
+				});
+				restored.on('payment:received', () => completions++);
+				chain.watch(restored);
+				await chain.mine(1);
+				expect(restored.getPayment(hash)?.completedAt).to.equal(completedAt);
+				expect(completions).to.equal(1);
+				expect(
+					restored.getFforVoucherReceipts(w.srHex)[0].reconciliationRequired
+				).to.be.false;
+				console.log(
+					JSON.stringify({
+						profile: 2,
+						closerRole,
+						commitmentTxid: commitment.getId(),
+						claimTxids: claims.map((tx) => tx.getId()),
+						receiverSweepSats: claims
+							.reduce((sum, tx) => sum + paidTo(tx, rDest), 0n)
+							.toString(),
+						creditedMsat: restored.getPayment(hash)?.amountMsat.toString(),
+						receipt: { ...archived.chainResolutions![0], preimage: undefined }
+					})
+				);
+			} finally {
+				restored?.destroy();
+				w.p.destroy();
+				w.s.destroy();
+				w.r.destroy();
+				storage.close();
+				restoredStorage?.close();
+			}
+		});
+	}
 
 	it('M8.4: S settles and vanishes; R recovers the voucher with the payer preimage alone', async function () {
 		if (skip) this.skip();
