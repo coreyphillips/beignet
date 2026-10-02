@@ -742,7 +742,8 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 
 	// ───────────────────────────────────────────────────────────────────
 	// Attack 1: the crash matrix over one ordinary round beside the
-	// vouchers, in ACTIVE. All 144 cases hold.
+	// vouchers, in ACTIVE. All 144 cases hold (FFOR_EXHAUSTIVE=1); the
+	// default run takes 18 of them.
 	// ───────────────────────────────────────────────────────────────────
 	describe('1a. ACTIVE: an ordinary round cut at every message boundary', () => {
 		const AMOUNT = 7_000_000n;
@@ -1028,15 +1029,18 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 		// fulfill/fail and commitment progress." Section 8: "Continue safe
 		// fulfill/fail/replay work needed for existing obligations."
 		//
-		// Observed: handleReestablish parks the retransmission chain (updates
-		// and their commitment_signed) in _fforHeldReplay until S's
-		// ff_close_ack returns, but the channel is back in NORMAL and nothing
-		// serializes NEW messages behind the parked chain. Anything R sends in
-		// that window reaches S ahead of a commitment_signed that was signed
-		// before it, and S fails the channel with "Invalid commitment
-		// signature". A baseline epoch cannot get here: it carries no ordinary
-		// traffic in DRAINING.
-		it.skip('DEFECT [new in #1301] R fulfils an ordinary HTLC while its chain is held: the fulfil overtakes the held commitment_signed and S fails the channel', () => {
+		// handleReestablish parks the retransmission chain (updates and their
+		// commitment_signed) until S's ff_close_ack returns, and the channel
+		// is back in NORMAL meanwhile. Review round 1 of PR #1301 found that
+		// nothing serialized NEW messages behind the parked chain: anything R
+		// sent in that window reached S ahead of a commitment_signed that was
+		// signed before it, and S failed the channel with "Invalid commitment
+		// signature". Fixed: while the chain is held, every update,
+		// commitment_signed and revoke_and_ack R would send joins the chain
+		// (Channel.fforHoldStream, asked by the manager for every batch), and
+		// a new add of R's is refused. The three shapes found, then the
+		// baseline double fault the same gate closes (issue #1304).
+		it('R fulfils an ordinary HTLC while its chain is held: the fulfil waits behind the chain, and both commit when the acknowledgement returns', () => {
 			const { pair, inbound } = sLostTheClose([2]);
 			pair.link.holdAt = (from, type): boolean =>
 				from === 'S' && type === MessageType.FF_CLOSE_ACK;
@@ -1048,43 +1052,71 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 				MessageType.FF_CLOSE
 			]);
 			expect(pair.rChannel.getState()).to.equal(ChannelState.NORMAL);
-			// An existing obligation: R holds the preimage of S's HTLC.
+			// An existing obligation: R holds the preimage of S's HTLC. It is
+			// taken, and reported as owed to the wire, not as sent.
 			const settle = pair.rManager.fulfillHtlc(
 				pair.channelId,
 				inbound.id,
 				inbound.preimage
 			);
 			expect(settle.ok, settle.error).to.equal(true);
-			// S's acknowledgement arrives and the chain is released.
+			expect(settle.sendsHeld).to.equal(true);
+			expect(
+				sentBy(pair, 'R'),
+				'nothing left ahead of the chain'
+			).to.deep.equal([MessageType.CHANNEL_REESTABLISH, MessageType.FF_CLOSE]);
+			// S's acknowledgement arrives and the chain is released, the
+			// fulfil of the ordinary HTLC after the commitment_signed that was
+			// made before it.
 			pair.link.release('S');
+			const fromR = pair.link.log.filter((e) => e.from === 'R');
+			const held = fromR.findIndex(
+				(e) => e.type === MessageType.COMMITMENT_SIGNED
+			);
+			const late = fromR.findIndex(
+				(e) =>
+					e.type === MessageType.UPDATE_FULFILL_HTLC &&
+					e.payload.readBigUInt64BE(32) === inbound.id
+			);
+			expect(held).to.be.greaterThan(-1);
+			expect(late, 'behind the held commitment_signed').to.be.greaterThan(held);
 			expectAlive(pair, 'chain released');
 			expectClosed(pair, 'chain released');
 			expect(ordinaryHtlcs(pair.sChannel)).to.deep.equal([]);
 			expect(balances(pair)).to.deep.equal(drained(6_000_000n));
 		});
 
-		it.skip('DEFECT [new in #1301] R offers an ordinary HTLC while its chain is held: same failure', () => {
-			const { pair } = sLostTheClose([2]);
+		it('R offers an ordinary HTLC while its chain is held: the add is refused locally, nothing leaves, and it is taken again once the chain is released', () => {
+			const { pair, inbound } = sLostTheClose([2]);
 			pair.link.holdAt = (from, type): boolean =>
 				from === 'S' && type === MessageType.FF_CLOSE_ACK;
 			pair.link.reconnect();
 			pair.link.holdAt = null;
-			// Not refused: the add is taken and put on the wire at once.
+			// Serializing the add behind the close transition is allowed
+			// (section 3), and this transition may not end on this connection.
 			const out = offer(pair, 'R', 2_000_000n);
-			if (out.result.ok) {
-				pair.link.release('S');
-				expectAlive(pair, 'chain released');
-				expectClosed(pair, 'chain released');
-				expect(ordinaryHtlcs(pair.sChannel)).to.include(`received-${out.id}`);
-			} else {
-				// Serializing the add behind the close transition is allowed.
-				pair.link.release('S');
-				expectAlive(pair, 'chain released');
-				expectClosed(pair, 'chain released');
-			}
+			expect(out.result.ok).to.equal(false);
+			expect(out.result.error).to.match(
+				/no new add while the close of the voucher book is being recovered/
+			);
+			expect(sentBy(pair, 'R')).to.deep.equal([
+				MessageType.CHANNEL_REESTABLISH,
+				MessageType.FF_CLOSE
+			]);
+			expect(ordinaryHtlcs(pair.rChannel), 'no entry for it').to.deep.equal([
+				`received-${inbound.id}`
+			]);
+			pair.rErrors.length = 0;
+			pair.link.release('S');
+			expectAlive(pair, 'chain released');
+			expectClosed(pair, 'chain released');
+			const again = offer(pair, 'R', 2_000_000n);
+			expect(again.result.ok, again.result.error).to.equal(true);
+			expectAlive(pair, 'an add after the release');
+			expect(ordinaryHtlcs(pair.sChannel)).to.include(`received-${again.id}`);
 		});
 
-		it.skip("DEFECT [new in #1301] S forwards a payment to R while R's chain is held: R's fresh revoke_and_ack overtakes the held commitment_signed and S fails the channel", () => {
+		it("S forwards a payment to R while R's chain is held: R's revoke_and_ack waits behind the held commitment_signed", () => {
 			const { pair } = sLostTheClose([2]);
 			// S has answered the reestablish; R's retransmitted ff_close is
 			// still in flight when S, ACTIVE and concurrent, adds an HTLC.
@@ -1094,13 +1126,61 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 			pair.link.holdAt = null;
 			const add = offer(pair, 'S', 2_000_000n);
 			expect(add.result.ok, add.result.error).to.equal(true);
-			// Per-direction FIFO is kept: ff_close, then R's revoke_and_ack
-			// for S's commitment_signed, then (after S's acknowledgement) the
-			// chain R was holding.
+			// R took S's commitment_signed and revoked for it, in its state.
+			// On the wire there is still ff_close and nothing else.
+			expect(pair.link.inFlight('R')).to.deep.equal([MessageType.FF_CLOSE]);
 			pair.link.release('R');
+			// S's acknowledgement released the chain: the commitment_signed
+			// made before S's add, then the revoke_and_ack that admits it.
+			const fromR = sentBy(pair, 'R');
+			const signed = fromR.indexOf(MessageType.COMMITMENT_SIGNED);
+			const revoked = fromR.indexOf(MessageType.REVOKE_AND_ACK);
+			expect(signed).to.be.greaterThan(-1);
+			expect(revoked, 'behind the held commitment_signed').to.be.greaterThan(
+				signed
+			);
 			expectAlive(pair, 'chain released');
 			expectClosed(pair, 'chain released');
 			expect(ordinaryHtlcs(pair.rChannel)).to.include(`received-${add.id}`);
+			expect(pair.events.R.forwarded, 'the add is committed').to.include(
+				add.id
+			);
+		});
+
+		it("S fulfils an HTLC of R's while R's chain is held: the round completes behind the chain", () => {
+			// The peer's settle is the third thing R answers with a
+			// revoke_and_ack. R's own HTLC is in flight from before the close.
+			const pair = activePair();
+			const out = offer(pair, 'R', 3_000_000n);
+			expect(out.result.ok, out.result.error).to.equal(true);
+			settleSlot(pair, 2);
+			const backup = snapshot(pair, 'S');
+			pair.link.drop = (from, type): boolean =>
+				from === 'R' && type !== MessageType.FF_CLOSE;
+			const closed = pair.rManager.closeFforEpoch(pair.channelId);
+			expect(closed.ok, closed.error).to.equal(true);
+			pair.link.drop = null;
+			restart(pair, 'S', backup);
+			pair.link.log.length = 0;
+			pair.sErrors.length = 0;
+			pair.rErrors.length = 0;
+			pair.link.holdAt = (from, type): boolean =>
+				from === 'R' && type === MessageType.FF_CLOSE;
+			pair.link.reconnect();
+			pair.link.holdAt = null;
+			const settle = pair.sManager.fulfillHtlc(
+				pair.channelId,
+				out.id,
+				out.preimage
+			);
+			expect(settle.ok, settle.error).to.equal(true);
+			expect(pair.link.inFlight('R')).to.deep.equal([MessageType.FF_CLOSE]);
+			pair.link.release('R');
+			expectAlive(pair, 'chain released');
+			expectClosed(pair, 'chain released');
+			expect(ordinaryHtlcs(pair.rChannel)).to.deep.equal([]);
+			expect(ordinaryHtlcs(pair.sChannel)).to.deep.equal([]);
+			expect(pair.events.R.fulfilled).to.include(out.id);
 		});
 
 		it('control: with nothing sent in the window, the same hold releases cleanly', () => {
@@ -1362,10 +1442,13 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 			});
 		});
 
-		it.skip('DEFECT [pre-existing, baseline hold] R restarts from the row its DRAINING write left (drain queued, nothing signed) and S lost the close: the reestablish tail signs over the held updates', () => {
-			// Not new: a baseline epoch fails the same way (second pass of
-			// the loop). A double fault: R dies between the DRAINING write and
-			// the commitment_signed, AND S's row predates ff_close.
+		it('R restarts from the row its DRAINING write left (drain queued, nothing signed) and S lost the close: the commitment_signed the reestablish tail signs waits behind the held updates, in a concurrent and in a baseline epoch (#1304)', () => {
+			// A double fault: R dies between the DRAINING write and the
+			// commitment_signed, AND S's row predates ff_close. The chain R
+			// holds then has no commitment_signed in it, so the auto-sign that
+			// follows every reestablish signs over the held updates. It used to
+			// send that signature ahead of them, in a baseline epoch as well
+			// (issue #1304); the same gate now puts it behind them.
 			const outcomes: string[] = [];
 			for (const concurrent of [true, false]) {
 				const pair = createPair({ pushSat: 200_000n });
@@ -1395,15 +1478,57 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 				pair.sErrors.length = 0;
 				pair.rErrors.length = 0;
 				pair.link.reconnect();
+				// The three voucher updates, then the one commitment_signed.
+				const fromR = sentBy(pair, 'R').filter(
+					(t) =>
+						t === MessageType.UPDATE_FULFILL_HTLC ||
+						t === MessageType.UPDATE_FAIL_HTLC ||
+						t === MessageType.COMMITMENT_SIGNED
+				);
+				expect(fromR.length, `concurrent=${concurrent}`).to.equal(4);
+				expect(fromR[3]).to.equal(MessageType.COMMITMENT_SIGNED);
 				outcomes.push(
 					`concurrent=${concurrent}: S ${
 						ChannelState[pair.sChannel.getState()]
-					}, R ${ChannelState[pair.rChannel.getState()]}, ${pair.sErrors.join(
+					} ${FforState[record(pair.sChannel).state]}, R ${
+						ChannelState[pair.rChannel.getState()]
+					} ${FforState[record(pair.rChannel).state]}, ${pair.sErrors.join(
 						'; '
 					)}`
 				);
+				expect(balances(pair), `concurrent=${concurrent}`).to.deep.equal(
+					drained(0n)
+				);
 			}
-			expect(outcomes.join('\n')).to.not.match(/ERRORED/);
+			expect(outcomes).to.deep.equal([
+				'concurrent=true: S NORMAL CLOSED, R NORMAL CLOSED, ',
+				'concurrent=false: S NORMAL CLOSED, R NORMAL CLOSED, '
+			]);
+		});
+
+		it('PIN [#1300] a settle waiting behind the held chain, then the connection drops before the acknowledgement: the reconnect replays it ahead of the commitment_signed that does not cover it', () => {
+			// What waits behind the chain is, in the channel's state, an update
+			// queued behind an unrevoked commitment_signed: issue #1300's
+			// precondition, here as anywhere. Not this PR's to fix. Required
+			// once #1300 is fixed: no wire error, both channels NORMAL, the
+			// book CLOSED (expectAlive, expectClosed). Today:
+			const { pair, inbound } = sLostTheClose([2]);
+			pair.link.holdAt = (from, type): boolean =>
+				from === 'S' && type === MessageType.FF_CLOSE_ACK;
+			pair.link.reconnect();
+			pair.link.holdAt = null;
+			const settle = pair.rManager.fulfillHtlc(
+				pair.channelId,
+				inbound.id,
+				inbound.preimage
+			);
+			expect(settle.ok, settle.error).to.equal(true);
+			expect(prone1300(pair)).to.equal(true);
+			// The acknowledgement dies with the socket; S holds the close now.
+			interrupt(pair, 'disconnect');
+			pair.link.reconnect();
+			expect(pair.link.types()).to.include(MessageType.ERROR);
+			expect(pair.sErrors.join('|')).to.match(/Invalid commitment signature/);
 		});
 	});
 

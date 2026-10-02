@@ -9067,15 +9067,26 @@ export class ChannelManager extends EventEmitter {
 	private processActions(
 		peerPubkey: string,
 		channel: Channel,
-		actions: ChannelAction[],
+		produced: ChannelAction[],
 		progress?: IActionDispatchProgress
 	): void {
 		this._syncQuiescenceWatchdog(channel);
 		this._fforEnsureContext(peerPubkey, channel);
 		// An empty batch announces nothing: only a dispatch whose durable
 		// write landed may report the epoch's state (see the tail below).
-		if (actions.length === 0) return;
+		if (produced.length === 0) return;
 		const dispatchProgress = progress ?? newDispatchProgress();
+		// FFOR: a channel holding its retransmission chain puts nothing of
+		// the BOLT 2 stream on the wire ahead of it. Decided here, once, for
+		// every producer: the channel takes those sends out of the batch and
+		// releases them in order behind the chain. The rest of the batch (its
+		// persist, its events) runs now. The state did commit and the wire
+		// is owed in order, which is what sendsHeld reports.
+		const actions =
+			typeof channel.fforHoldStream === 'function'
+				? channel.fforHoldStream(produced)
+				: produced;
+		if (actions !== produced) dispatchProgress.sendsHeld = true;
 		const errorIndex = actions.findIndex(
 			(action) => action.type === ChannelActionType.ERROR
 		);

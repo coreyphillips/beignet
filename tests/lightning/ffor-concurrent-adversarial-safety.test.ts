@@ -186,7 +186,12 @@ describe('FFOR concurrent receive, adversarial: the drain hold reorders the BOLT
 		expect(record(pair.rChannel).state).to.equal(FforState.CLOSED);
 	});
 
-	it.skip('DEFECT: an ordinary add of R made while the drain chain is held leaves ahead of the held commitment_signed, and S fails the channel when the chain is released', () => {
+	// Review round 1 of PR #1301: the channel is NORMAL while the chain is
+	// held, and what it sent then left ahead of a commitment_signed made
+	// before it, so S failed the channel when the chain was released. Fixed:
+	// every BOLT 2 stream message R would send while holding joins the chain
+	// (Channel.fforHoldStream), and a new add of R's is refused.
+	it('an ordinary add of R made while the drain chain is held is refused locally, and the released chain closes the book', () => {
 		const pair = sLostTheClose([2]);
 		// S's ff_close_ack is delayed (S slow, or withholding it).
 		pair.link.holdAt = (from, type): boolean =>
@@ -195,18 +200,32 @@ describe('FFOR concurrent receive, adversarial: the drain hold reorders the BOLT
 		pair.link.holdAt = null;
 		expect(pair.rChannel.getState()).to.equal(ChannelState.NORMAL);
 		expect(record(pair.rChannel).state).to.equal(FforState.DRAINING);
-		// The channel is NORMAL and the epoch concurrent: R's wallet pays.
+		// The channel is NORMAL and the epoch concurrent, but R's wallet does
+		// not pay into a close that is still being recovered.
 		const add = offer(pair, 'R', 1_000_000n);
-		expect(add.result.ok, add.result.error).to.equal(true);
+		expect(add.result.ok).to.equal(false);
+		expect(add.result.error).to.match(
+			/no new add while the close of the voucher book is being recovered/
+		);
+		expect(
+			pair.link.log.filter((e) => e.from === 'R').map((e) => e.type),
+			'nothing left ahead of the chain'
+		).to.deep.equal([MessageType.CHANNEL_REESTABLISH, MessageType.FF_CLOSE]);
+		pair.rErrors.length = 0;
 		// The acknowledgement arrives and the held chain is released.
 		pair.link.release('S');
 		expect(pair.link.types(), `no wire error ${why(pair)}`).to.not.include(
 			MessageType.ERROR
 		);
-		expectHealthy(pair, 'held chain released after a new add');
+		expectHealthy(pair, 'held chain released');
+		expect(record(pair.rChannel).state).to.equal(FforState.CLOSED);
+		expect(record(pair.sChannel).state).to.equal(FforState.CLOSED);
+		// The hold is over and R pays again.
+		pay(pair, 'R', 1_000_000n);
+		expectHealthy(pair, 'a payment after the release');
 	});
 
-	it.skip("DEFECT: an ordinary add S makes before R's ff_close reaches it is answered by R with a revoke_and_ack that leaves ahead of the held commitment_signed, and S fails the channel", () => {
+	it("an ordinary add S makes before R's ff_close reaches it is answered by R behind the held chain: the revoke_and_ack follows the held commitment_signed, and the add commits", () => {
 		const pair = sLostTheClose([2]);
 		// R's retransmitted ff_close is still on the wire when S, ACTIVE from
 		// its backup and concurrent, originates an ordinary add.
@@ -217,17 +236,26 @@ describe('FFOR concurrent receive, adversarial: the drain hold reorders the BOLT
 		expect(record(pair.sChannel).state).to.equal(FforState.ACTIVE);
 		const add = offer(pair, 'S', 1_000_000n);
 		expect(add.result.ok, add.result.error).to.equal(true);
-		// R answered S's commitment_signed: its revoke_and_ack is on the wire
-		// behind ff_close, and the held chain is not.
-		expect(pair.link.inFlight('R')).to.deep.equal([
-			MessageType.FF_CLOSE,
-			MessageType.REVOKE_AND_ACK
-		]);
+		// R took S's commitment_signed. Its revoke_and_ack is not on the wire
+		// behind ff_close: it waits with the held chain.
+		expect(pair.link.inFlight('R')).to.deep.equal([MessageType.FF_CLOSE]);
 		pair.link.release('R');
+		const fromR = pair.link.log
+			.filter((e) => e.from === 'R')
+			.map((e) => e.type);
+		expect(fromR.indexOf(MessageType.REVOKE_AND_ACK)).to.be.greaterThan(
+			fromR.indexOf(MessageType.COMMITMENT_SIGNED)
+		);
+		expect(fromR.indexOf(MessageType.COMMITMENT_SIGNED)).to.be.greaterThan(-1);
 		expect(pair.link.types(), `no wire error ${why(pair)}`).to.not.include(
 			MessageType.ERROR
 		);
 		expectHealthy(pair, 'held chain released after a peer add');
+		expect(record(pair.rChannel).state).to.equal(FforState.CLOSED);
+		expect(
+			pair.rChannel.getFullState().htlcs.has(`received-${add.id}`),
+			"S's add is committed on R"
+		).to.equal(true);
 	});
 });
 

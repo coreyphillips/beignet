@@ -899,6 +899,23 @@ export interface ITaprootClosingCache {
  */
 export const REVERTED_SPLICES_KEPT = 8;
 
+/**
+ * FFOR: the BOLT 2 update stream. While a channel holds its retransmission
+ * chain (Channel.fforHoldStream) every message of these types it would send
+ * joins the chain instead of leaving, so none overtakes a signature made
+ * before it.
+ */
+const FFOR_HELD_STREAM_TYPES: ReadonlySet<number> = new Set<number>([
+	MessageType.UPDATE_ADD_HTLC,
+	MessageType.UPDATE_FULFILL_HTLC,
+	MessageType.UPDATE_FAIL_HTLC,
+	MessageType.UPDATE_FAIL_MALFORMED_HTLC,
+	MessageType.UPDATE_FEE,
+	MessageType.START_BATCH,
+	MessageType.COMMITMENT_SIGNED,
+	MessageType.REVOKE_AND_ACK
+]);
+
 /** The kinds of channel operation an FFOR epoch judges (_fforUpdateRefusal). */
 type FforUpdateKind =
 	| 'add'
@@ -956,9 +973,20 @@ export class Channel {
 	 */
 	private _fforInternalAdd = false;
 	/**
-	 * FFOR (R, DRAINING): BOLT 2 retransmissions of the drain (the fulfils,
-	 * fails and commitment_signed) held back because the peer reestablished
-	 * reporting ACTIVE; released when its ff_close_ack arrives. Memory-only.
+	 * FFOR (R, DRAINING): the peer reestablished reporting a state before
+	 * DRAINING, so it does not hold our ff_close, and the retransmission
+	 * chain it would refuse is held back until its ff_close_ack arrives
+	 * again. While set, every BOLT 2 stream message this channel would send
+	 * joins _fforHeldReplay behind that chain (fforHoldStream is the one
+	 * place that decides it), and no new add of ours is taken. Memory-only:
+	 * a disconnect ends it and the next reestablish decides afresh.
+	 */
+	private _fforHolding = false;
+	/**
+	 * FFOR (R, DRAINING): the held chain, in wire order. It starts as the
+	 * BOLT 2 retransmissions of the reestablish that began the hold and
+	 * grows with whatever the channel would have sent since. Released, in
+	 * that order, by the peer's ff_close_ack. Memory-only.
 	 */
 	private _fforHeldReplay: ChannelAction[] = [];
 	/**
@@ -9420,6 +9448,7 @@ export class Channel {
 		this._quiescence.reset();
 		this._stfuReplyOwed = false;
 		this._fforStfuReplyStale = false;
+		this._fforHolding = false;
 		this._fforHeldReplay = [];
 		this._state.quiescenceState = QuiescenceState.NORMAL;
 		this._state.quiescenceInitiator = false;
@@ -11297,23 +11326,15 @@ export class Channel {
 			// whole retransmission chain in its order, ordinary updates
 			// included: the commitment_signed that covers the fail covers
 			// them too.
-			const concurrent =
-				this._state.ffor !== null &&
-				this._state.ffor !== undefined &&
-				this._fforIsConcurrent(this._state.ffor);
-			const held = actions.filter(
-				(a) =>
-					a.type === ChannelActionType.SEND_MESSAGE &&
-					(a.messageType === MessageType.UPDATE_FULFILL_HTLC ||
-						a.messageType === MessageType.UPDATE_FAIL_HTLC ||
-						a.messageType === MessageType.COMMITMENT_SIGNED ||
-						a.messageType === MessageType.REVOKE_AND_ACK ||
-						(concurrent &&
-							(a.messageType === MessageType.UPDATE_ADD_HTLC ||
-								a.messageType === MessageType.UPDATE_FAIL_MALFORMED_HTLC)))
-			);
-			this._fforHeldReplay = held;
-			actions = actions.filter((a) => !held.includes(a));
+			//
+			// From here until the release the channel is NORMAL again, and
+			// whatever it sends next (a settle, the revoke_and_ack that
+			// answers the peer's commitment_signed, a fresh commitment_signed)
+			// was made after the chain and must reach the peer after it.
+			// fforHoldStream keeps that order for this batch and for every
+			// later one.
+			this._fforHolding = true;
+			actions = this.fforHoldStream(actions);
 		}
 
 		// ── Retransmit channel_ready if we sent it previously (BOLT 2 §5) ──
@@ -22799,6 +22820,13 @@ export class Channel {
 		if (f.activationMismatch) {
 			return 'the epoch is in dispute';
 		}
+		if (this._fforHolding) {
+			// CONCURRENT-RECEIVE.md section 3: a close transition may briefly
+			// serialize new ordinary adds. This one waits for the peer's
+			// ff_close_ack, which may never come on this connection, so a new
+			// add is refused rather than parked behind the chain.
+			return 'the close of the voucher book is being recovered with the peer';
+		}
 		if (this._fforCapabilityHold) {
 			return 'the peer did not advertise option_ff_receive and option_ff_concurrent on this connection';
 		}
@@ -25245,10 +25273,9 @@ export class Channel {
 		const wire = fforWireBytes(FF_CLOSE_ACK_TYPE, payload);
 		if (f.closeAckWire) {
 			if (f.closeAckWire.equals(wire)) {
-				// A retransmission: release any drain messages held back while
-				// the peer did not hold ff_close, then re-drive what is owed.
-				const held = this._fforHeldReplay;
-				this._fforHeldReplay = [];
+				// A retransmission: release the chain held back while the peer
+				// did not hold ff_close, then re-drive what is owed.
+				const held = this._fforReleaseHeld();
 				// The peer holds the close again: voucher fails may flow.
 				this._fforPeerLacksClose = false;
 				return [...held, ...this._fforDrain(f)];
@@ -25357,7 +25384,8 @@ export class Channel {
 		if (f.state !== FforState.DRAINING || !f.settledBitmap) return [];
 		if (this._state.state !== ChannelState.NORMAL) return [];
 		if (this._quiescence.isQuiescing()) return [];
-		if (this._fforHeldReplay.length > 0) return [];
+		// Nothing new is drained into a held chain: the release re-drives.
+		if (this._fforHolding) return [];
 		const actions: ChannelAction[] = [];
 		this._fforInternalSettle = true;
 		try {
@@ -25625,6 +25653,56 @@ export class Channel {
 		}
 		if (k < 1 || k > f.params.maxPayments) return 'no such slot';
 		return null;
+	}
+
+	/**
+	 * The one place that keeps the BOLT 2 stream in order behind a held
+	 * retransmission chain (see _fforHolding). Given a batch of actions this
+	 * channel produced, it moves every update, commitment_signed and
+	 * revoke_and_ack the batch would send to the end of the chain and returns
+	 * the batch without them; with nothing held it returns the batch itself.
+	 *
+	 * handleReestablish runs its own answer through it to begin the hold, and
+	 * the manager runs every batch through it before dispatch, so no producer
+	 * needs to know a chain is held: a settle of ours, the revoke_and_ack
+	 * that answers the peer's commitment_signed and the commitment_signed an
+	 * auto-sign makes all join the chain in the order they were made. The
+	 * channel's state has advanced as if they were sent, exactly as for a
+	 * message written to a socket that then dies, so a disconnect needs no
+	 * unwinding: the next reestablish retransmits from that state.
+	 *
+	 * Everything else in the batch (the persist, the events, the epoch's own
+	 * messages, a wire error) is untouched.
+	 */
+	fforHoldStream(actions: ChannelAction[]): ChannelAction[] {
+		if (!this._fforHolding) return actions;
+		const kept: ChannelAction[] = [];
+		for (const action of actions) {
+			if (
+				action.type === ChannelActionType.SEND_MESSAGE &&
+				FFOR_HELD_STREAM_TYPES.has(action.messageType)
+			) {
+				this._fforHeldReplay.push(action);
+			} else {
+				kept.push(action);
+			}
+		}
+		return kept.length === actions.length ? actions : kept;
+	}
+
+	/**
+	 * End the hold and hand back the chain, in order, behind a persist of its
+	 * own. That persist writes the state every message in the chain was made
+	 * from, so each one is authorized by a durable write that precedes it
+	 * whatever became of the write of the batch it was taken out of, and the
+	 * ones that are not replays are recorded for retransmission with it.
+	 */
+	private _fforReleaseHeld(): ChannelAction[] {
+		const held = this._fforHeldReplay;
+		this._fforHolding = false;
+		this._fforHeldReplay = [];
+		if (held.length === 0) return [];
+		return [{ type: ChannelActionType.PERSIST_STATE }, ...held];
 	}
 
 	/**
