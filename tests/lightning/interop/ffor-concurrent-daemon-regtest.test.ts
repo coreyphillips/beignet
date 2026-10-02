@@ -164,8 +164,7 @@ describe('Concurrent receive daemon HTTP acceptance on regtest', function () {
 				localFeatures: features,
 				enableNetworking: true,
 				autoReconnect: false,
-				fforConcurrent: { enabled: true },
-				fforSettle: { enabled: true, allowConcurrent: true }
+				fforSettle: { enabled: true }
 			})
 		);
 		const p = new LightningNode(
@@ -184,9 +183,7 @@ describe('Concurrent receive daemon HTTP acceptance on regtest', function () {
 				fforConcurrentNegotiated: (peer: string) =>
 					s.getChannelManager().peerNegotiatedFforConcurrent(peer)
 			} as unknown as BeignetNode,
-			{ enabled: true },
-			undefined,
-			true
+			{ enabled: true }
 		);
 		const options = {
 			dataDir: dir,
@@ -200,9 +197,7 @@ describe('Concurrent receive daemon HTTP acceptance on regtest', function () {
 			rapidGossipSync: false,
 			autoGossipSync: false,
 			autoBootstrap: false,
-			logLevel: 'silent' as const,
-			fforConcurrent: true,
-			fforSettleConcurrent: true
+			logLevel: 'silent' as const
 		};
 		let daemon: IStartedDaemon | undefined;
 		try {

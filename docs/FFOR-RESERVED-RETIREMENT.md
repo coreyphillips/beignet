@@ -3,7 +3,9 @@
 Concurrent version 2 preserves unresolved voucher claims when a receiver closes
 an offline receive book early. Ordinary online payments can continue using the
 channel's remaining capacity. This extension is experimental. Feature bits
-562/563 remain disabled by default pending full protocol and regtest qualification.
+562/563 are advertised by default when their dependencies are enabled. Explicit
+`fforConcurrent.enabled: false` disables advertisement; `fforSettle.allowConcurrent:
+false` refuses new books while retaining support for existing ones.
 
 ## Negotiation and retirement
 
@@ -135,6 +137,8 @@ from each stored commitment. History still grows with channel activity, and its
 expanded in-memory representation is unchanged. This is lossless compression,
 not a pruning policy or a bound on a channel's lifetime storage.
 
-Before enabling this profile by default, the remaining qualification includes the
-full commitment and chain crash matrix on regtest, and daemon/coordinator integration.
-The focused in-process checks do not substitute for those release gates.
+Default enablement is qualified by the durable-boundary and process-restart
+matrices, current commitment claims and timeouts on regtest, read-only historical
+claim package validation, and daemon HTTP acceptance. Run
+`npm run test:interop:ffor-concurrent` to repeat the regtest qualification.
+Native device lifecycle and cross-implementation interoperability remain downstream work.

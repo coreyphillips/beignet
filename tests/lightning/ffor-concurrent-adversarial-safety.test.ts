@@ -1545,13 +1545,15 @@ describe('FFOR concurrent receive, adversarial: feature bit hygiene', function (
 		return f;
 	};
 
-	it('option off: neither bit is advertised or implemented, and a peer REQUIRING 562 is one we disconnect', () => {
-		const node = new LightningNode(makeNodeConfig(9101));
+	it('option off: neither bit is advertised, and a peer requiring 562 is disconnected', () => {
+		const node = new LightningNode(
+			makeNodeConfig(9101, undefined, { fforConcurrent: { enabled: false } })
+		);
 		const local = node.getLocalFeatures();
 		expect(local.hasBit(562) || local.hasBit(563)).to.equal(false);
 		expect(implementedFeatures().hasBit(562)).to.equal(false);
-		expect(implementedFeatures().hasBit(563)).to.equal(false);
-		expect(LightningNode.defaultFeatures().hasBit(563)).to.equal(false);
+		expect(implementedFeatures().hasBit(563)).to.equal(true);
+		expect(LightningNode.defaultFeatures().hasBit(563)).to.equal(true);
 		expect(hasUnsupportedRequiredFeatures(local, requires562())).to.deep.equal([
 			562
 		]);
@@ -1566,7 +1568,10 @@ describe('FFOR concurrent receive, adversarial: feature bit hygiene', function (
 		supplied.setCompulsory(Feature.OPTION_FF_CONCURRENT);
 		supplied.setOptional(Feature.OPTION_FF_CONCURRENT);
 		const node = new LightningNode(
-			makeNodeConfig(9102, undefined, { localFeatures: supplied })
+			makeNodeConfig(9102, undefined, {
+				localFeatures: supplied,
+				fforConcurrent: { enabled: false }
+			})
 		);
 		const local = node.getLocalFeatures();
 		expect(local.hasBit(562) || local.hasBit(563)).to.equal(false);
@@ -1575,7 +1580,7 @@ describe('FFOR concurrent receive, adversarial: feature bit hygiene', function (
 		]);
 	});
 
-	it('option on: a peer requiring 562 is accepted, although the bit is not in implementedFeatures()', () => {
+	it('option on: a peer requiring 562 is accepted', () => {
 		const node = new LightningNode(
 			makeNodeConfig(9103, undefined, { fforConcurrent: { enabled: true } })
 		);
@@ -1618,7 +1623,9 @@ describe('FFOR concurrent receive, adversarial: feature bit hygiene', function (
 			expect(payload, 'announcement built').to.not.equal(null);
 			return decodeNodeAnnouncementMessage(payload!).features;
 		};
-		const off = new LightningNode(makeNodeConfig(9104));
+		const off = new LightningNode(
+			makeNodeConfig(9104, undefined, { fforConcurrent: { enabled: false } })
+		);
 		expect(
 			FeatureFlags.fromBuffer(announce(off)).hasFeature(
 				Feature.OPTION_FF_CONCURRENT

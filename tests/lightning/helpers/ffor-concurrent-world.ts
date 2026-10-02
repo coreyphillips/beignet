@@ -56,7 +56,7 @@ export function createConcurrentWorld(
 		srPushMsat: 200_000_000n,
 		...opts,
 		sExtra: {
-			...(concurrent ? { fforConcurrent: { enabled: true } } : {}),
+			fforConcurrent: { enabled: concurrent },
 			fforSettle: {
 				enabled: true,
 				allowConcurrent: opts.allowConcurrent ?? true
@@ -64,7 +64,7 @@ export function createConcurrentWorld(
 			...opts.sExtra
 		},
 		rExtra: {
-			...(concurrent ? { fforConcurrent: { enabled: true } } : {}),
+			fforConcurrent: { enabled: concurrent },
 			...opts.rExtra
 		}
 	});

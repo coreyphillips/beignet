@@ -108,13 +108,10 @@ export enum Feature {
 	 */
 	OPTION_FF_RECEIVE = 560,
 	/**
-	 * FFOR concurrent receive, version 1 (specs/CONCURRENT-RECEIVE.md section
-	 * 1.1), bits 562/563, a proposed experimental assignment. Requires
-	 * option_ff_receive. Advertised only when a node opts in (fforConcurrent)
-	 * and deliberately absent from implementedFeatures() until the whole
-	 * version is implemented: the spec forbids advertising before that, and a
-	 * peer that REQUIRES the bit must keep being disconnected by a node that
-	 * has not opted in.
+	 * FFOR concurrent receive (specs/CONCURRENT-RECEIVE.md section 1.1),
+	 * bits 562/563, a proposed experimental assignment. Requires
+	 * option_ff_receive and option_quiesce. Advertised by default when both
+	 * dependencies are present; fforConcurrent.enabled can disable it.
 	 */
 	OPTION_FF_CONCURRENT = 562
 }
@@ -336,6 +333,15 @@ export function hasUnsupportedRequiredFeatures(
 	for (let bit = 0; bit <= maxBit; bit += 2) {
 		// Even bit = required/compulsory
 		if (remoteFeatures.hasBit(bit)) {
+			// Concurrent receive can be explicitly disabled. Preserve that
+			// choice even though the implementation understands the feature.
+			if (
+				bit === Feature.OPTION_FF_CONCURRENT &&
+				!localFeatures.hasFeature(bit)
+			) {
+				unsupported.push(bit);
+				continue;
+			}
 			// We support this feature if we have either the even or odd bit set
 			if (
 				!localFeatures.hasBit(bit) &&
@@ -383,5 +389,6 @@ export function implementedFeatures(): FeatureFlags {
 	flags.setOptional(Feature.SIMPLE_CLOSE);
 	flags.setOptional(Feature.PROVIDE_STORAGE);
 	flags.setOptional(Feature.OPTION_FF_RECEIVE);
+	flags.setOptional(Feature.OPTION_FF_CONCURRENT);
 	return flags;
 }

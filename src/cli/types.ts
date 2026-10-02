@@ -883,9 +883,9 @@ export interface BeignetConfig {
 		feeBaseMsat?: number;
 		feePpm?: number;
 	};
-	/** Advertise concurrent receive. Kept off until qualification completes. */
+	/** Advertise concurrent receive. Defaults to true. */
 	fforConcurrent?: boolean;
-	/** Accept new concurrent books when settlement is enabled. */
+	/** Accept new concurrent books when settlement is enabled. Defaults to true. */
 	fforSettleConcurrent?: boolean;
 	/** FFOR receipt witness (spec section 9.6). Env: BEIGNET_FFOR_WITNESS
 	 *  (exact true/false), BEIGNET_FFOR_WITNESS_MAX_MAILBOXES,

@@ -63,24 +63,26 @@ describe('FFOR concurrent receive: wire (CONCURRENT-RECEIVE.md 1.1)', () => {
 			expect(flags.hasFeature(Feature.OPTION_FF_CONCURRENT)).to.equal(true);
 		});
 
-		it('is not advertised by default and not in the implemented set', () => {
+		it('is advertised by default and included in the implemented set', () => {
 			expect(
 				LightningNode.defaultFeatures().hasFeature(Feature.OPTION_FF_CONCURRENT)
-			).to.equal(false);
+			).to.equal(true);
 			expect(
 				implementedFeatures().hasFeature(Feature.OPTION_FF_CONCURRENT)
-			).to.equal(false);
+			).to.equal(true);
 		});
 
-		it('a peer that requires it is unsupported until a node opts in', () => {
+		it('a peer requiring it is accepted by default and refused after opt-out', () => {
 			const remote = FeatureFlags.empty();
 			remote.setCompulsory(Feature.OPTION_FF_CONCURRENT);
 			expect(
 				hasUnsupportedRequiredFeatures(LightningNode.defaultFeatures(), remote)
-			).to.deep.equal([562]);
-			const optedIn = LightningNode.defaultFeatures();
-			optedIn.setOptional(Feature.OPTION_FF_CONCURRENT);
-			expect(hasUnsupportedRequiredFeatures(optedIn, remote)).to.deep.equal([]);
+			).to.deep.equal([]);
+			const optedOut = LightningNode.defaultFeatures();
+			optedOut.clearBit(Feature.OPTION_FF_CONCURRENT + 1);
+			expect(hasUnsupportedRequiredFeatures(optedOut, remote)).to.deep.equal([
+				562
+			]);
 		});
 	});
 

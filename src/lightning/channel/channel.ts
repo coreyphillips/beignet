@@ -24322,7 +24322,7 @@ export class Channel {
 					`concurrent_version ${msg.concurrentVersion} not supported`
 				);
 			}
-			if (policy?.allowConcurrent !== true) {
+			if (policy?.allowConcurrent === false) {
 				return refuse(
 					FforAbortReason.TERMS_REFUSED,
 					'concurrent receive not offered by this peer'

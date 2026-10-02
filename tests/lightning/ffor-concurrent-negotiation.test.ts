@@ -486,9 +486,7 @@ describe('FFOR concurrent receive: negotiation (CONCURRENT-RECEIVE.md 1.1)', fun
 
 	describe("S's policy", () => {
 		const refusing: Array<[string, IPair['sPolicy']]> = [
-			['allowConcurrent false', { enabled: true, allowConcurrent: false }],
-			['allowConcurrent absent', { enabled: true }],
-			['no policy at all', null]
+			['allowConcurrent false', { enabled: true, allowConcurrent: false }]
 		];
 		for (const [name, policy] of refusing) {
 			it(`${name}: a concurrent request is refused with reason 2, a baseline one answered`, () => {
@@ -802,11 +800,11 @@ describe('FFOR concurrent receive: negotiation through the node (CONCURRENT-RECE
 	this.timeout(120_000);
 
 	describe('the fforConcurrent option', () => {
-		it('is off by default: the bit is not advertised', () => {
+		it('advertises by default and honors explicit false', () => {
 			const node = new LightningNode(makeNodeConfig(9001));
 			expect(
 				node.getLocalFeatures().hasFeature(Feature.OPTION_FF_CONCURRENT)
-			).to.equal(false);
+			).to.equal(true);
 			const off = new LightningNode(
 				makeNodeConfig(9002, undefined, { fforConcurrent: { enabled: false } })
 			);
@@ -830,18 +828,27 @@ describe('FFOR concurrent receive: negotiation through the node (CONCURRENT-RECE
 			supplied.setOptional(Feature.OPTION_FF_CONCURRENT);
 			supplied.setCompulsory(Feature.OPTION_FF_CONCURRENT);
 			const node = new LightningNode(
-				makeNodeConfig(9004, undefined, { localFeatures: supplied })
+				makeNodeConfig(9004, undefined, {
+					localFeatures: supplied,
+					fforConcurrent: { enabled: false }
+				})
 			);
 			expect(
 				node.getLocalFeatures().hasFeature(Feature.OPTION_FF_CONCURRENT)
 			).to.equal(false);
 		});
 
-		it('refuses to start without option_ff_receive or option_quiesce', () => {
+		it('omitted config tolerates missing dependencies, explicit true refuses them', () => {
 			for (const missing of [Feature.OPTION_FF_RECEIVE, Feature.QUIESCE]) {
 				const supplied = LightningNode.defaultFeatures();
 				supplied.clearBit(missing);
 				supplied.clearBit(missing + 1);
+				const node = new LightningNode(
+					makeNodeConfig(9006, undefined, { localFeatures: supplied })
+				);
+				expect(
+					node.getLocalFeatures().hasFeature(Feature.OPTION_FF_CONCURRENT)
+				).to.equal(false);
 				expect(
 					() =>
 						new LightningNode(
