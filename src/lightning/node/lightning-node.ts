@@ -27564,7 +27564,8 @@ export class LightningNode extends EventEmitter {
 	 * Scan all channels for received HTLCs that are close to expiry.
 	 * Auto-fail any that are within the safety margin. Separately, force-close to
 	 * claim any inbound HTLC we already hold the preimage for (or that is
-	 * FULFILLED off-chain) whose counterparty may never ack the removal.
+	 * FULFILLED off-chain) whose counterparty may never ack the removal, or
+	 * never sign it out of the commitment we hold once it has.
 	 */
 	private scanExpiringHtlcs(blockHeight: number): void {
 		const claimBuffer = Math.max(
@@ -27598,7 +27599,22 @@ export class LightningNode extends EventEmitter {
 			if (effectiveState !== ChannelState.NORMAL && !errored && !splicing)
 				continue;
 
-			for (const [key, htlc] of state.htlcs) {
+			// An inbound HTLC we fulfilled stays inside the claim backstop for
+			// one message longer than it stays in the map (issue #1291). The
+			// peer's revoke_and_ack for our removal deletes the entry, while the
+			// commitment we hold keeps the output until the peer's next
+			// commitment_signed. A peer that withholds that signature leaves a
+			// commitment whose HTLC output it can take by timeout once the
+			// expiry passes, for an HTLC whose preimage it already has, so the
+			// close has to come while our HTLC-success is the only valid spend,
+			// at the margin a live fulfilled HTLC gets. A kept FAILED entry is
+			// the peer's to time out and needs no close.
+			const keptClaims = (state.signedLocalRemovals ?? [])
+				.filter((kept) => kept.state === HtlcState.FULFILLED)
+				.map((kept): [string, IHtlcEntry] => [`received-${kept.id}`, kept]);
+			const keptEntries = new Set(keptClaims.map(([, kept]) => kept));
+
+			for (const [key, htlc] of [...state.htlcs, ...keptClaims]) {
 				if (!key.startsWith('received-')) continue;
 
 				// Backstop (HIGH-4): if we hold this inbound HTLC's preimage (either
@@ -27682,7 +27698,9 @@ export class LightningNode extends EventEmitter {
 					this.emit('node:error', {
 						code: 'HTLC_CLAIM_FORCE_CLOSE',
 						channelId,
-						message: `inbound HTLC ${htlc.id} preimage held but unacked ${claimBuffer} blocks before expiry (${htlc.cltvExpiry}); force-closing to claim via HTLC-success`,
+						message: keptEntries.has(htlc)
+							? `inbound HTLC ${htlc.id} fulfilled but still in our commitment ${claimBuffer} blocks before expiry (${htlc.cltvExpiry}), the peer has not signed it away; force-closing to claim via HTLC-success`
+							: `inbound HTLC ${htlc.id} preimage held but unacked ${claimBuffer} blocks before expiry (${htlc.cltvExpiry}); force-closing to claim via HTLC-success`,
 						timestamp: Date.now()
 					} as ILightningError);
 					this._forceCloseWithReason(

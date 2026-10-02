@@ -283,6 +283,29 @@ function signedLocalCarriesRemoval(
 	);
 }
 
+/**
+ * The RECEIVED HTLCs we removed whose outputs the commitment the stored remote
+ * signature covers still carries (IChannelState.signedLocalRemovals).
+ *
+ * The same question as signedLocalCarriesRemoval, for the other direction. An
+ * offered removal waits in the map for OUR revoke, so its entry is there to be
+ * asked. A received removal is finished by the PEER's revoke_and_ack, which
+ * deletes the entry and moves the balance one message before the peer's next
+ * commitment_signed drops the output from the commitment we hold. Only the
+ * signedLocal rebuild asks, for the same reason: the commitment being VERIFIED
+ * is that next one.
+ *
+ * Without it a force close inside the window rebuilt a commitment the stored
+ * signature does not cover and was refused, so a peer that went quiet after
+ * its revoke_and_ack left us no unilateral exit at all.
+ */
+function signedLocalRetainedRemovals(
+	state: IChannelState,
+	signedLocal: boolean
+): IHtlcEntry[] {
+	return signedLocal ? state.signedLocalRemovals ?? [] : [];
+}
+
 /** The last COMMITTED channel feerate (fee rounds fully finalized). */
 function committedFeeRate(state: IChannelState): number {
 	return state.role === ChannelRole.OPENER
@@ -677,6 +700,16 @@ export function buildLocalCommitment(
 			// balance deduction from addHtlc is not in the peer's signature over
 			// it — return it for this build (the output is excluded above).
 			localMsat += entry.amountMsat;
+		}
+	}
+	for (const entry of signedLocalRetainedRemovals(state, signedLocal)) {
+		// The peer's revoke_and_ack already moved this amount, to us for a
+		// fulfill and back to the peer for a fail. This rebuild still carries
+		// the HTLC output, so the amount is in neither balance yet.
+		if (entry.state === HtlcState.FULFILLED) {
+			localMsat -= entry.amountMsat;
+		} else {
+			remoteMsat -= entry.amountMsat;
 		}
 	}
 	let localAmount = localMsat / 1000n;
@@ -1578,7 +1611,6 @@ function buildHtlcOutputsForLocal(
 		direction: HtlcDirection;
 		amountMsat: bigint;
 	})[] = [];
-	const useAnchors = isAnchorChannel(state.channelType);
 
 	for (const entry of state.htlcs.values()) {
 		// Only include PENDING and COMMITTED HTLCs in commitment outputs.
@@ -1622,58 +1654,73 @@ function buildHtlcOutputsForLocal(
 			continue;
 		}
 
-		const isTaproot = isTaprootChannel(state.channelType);
-		if (entry.direction === HtlcDirection.OFFERED) {
-			const script = buildOfferedHtlcScript(
-				keys.revocationPubkey,
-				keys.localHtlcPubkey,
-				keys.remoteHtlcPubkey,
-				entry.paymentHash,
-				useAnchors
-			);
-			outputs.push({
-				script,
-				amount: entry.amountMsat / 1000n,
-				amountMsat: entry.amountMsat,
-				cltvExpiry: entry.cltvExpiry,
-				paymentHash: entry.paymentHash,
-				direction: HtlcDirection.OFFERED,
-				taprootScript: taprootHtlcScript(
-					isTaproot,
-					'offered',
-					keys,
-					entry.paymentHash,
-					entry.cltvExpiry
-				)
-			});
-		} else {
-			const script = buildReceivedHtlcScript(
-				keys.revocationPubkey,
-				keys.localHtlcPubkey,
-				keys.remoteHtlcPubkey,
-				entry.paymentHash,
-				entry.cltvExpiry,
-				useAnchors
-			);
-			outputs.push({
-				script,
-				amount: entry.amountMsat / 1000n,
-				amountMsat: entry.amountMsat,
-				cltvExpiry: entry.cltvExpiry,
-				paymentHash: entry.paymentHash,
-				direction: HtlcDirection.RECEIVED,
-				taprootScript: taprootHtlcScript(
-					isTaproot,
-					'received',
-					keys,
-					entry.paymentHash,
-					entry.cltvExpiry
-				)
-			});
-		}
+		outputs.push(buildLocalHtlcOutput(state, keys, entry));
+	}
+
+	// Received removals the peer has revoked for but not yet signed away: gone
+	// from the map, still in the commitment the stored signature covers.
+	for (const entry of signedLocalRetainedRemovals(state, signedLocal)) {
+		outputs.push(buildLocalHtlcOutput(state, keys, entry));
 	}
 
 	return outputs;
+}
+
+/** One entry's HTLC output on the local commitment. */
+function buildLocalHtlcOutput(
+	state: IChannelState,
+	keys: ICommitmentKeys,
+	entry: IHtlcEntry
+): IHtlcOutput & { direction: HtlcDirection; amountMsat: bigint } {
+	const useAnchors = isAnchorChannel(state.channelType);
+	const isTaproot = isTaprootChannel(state.channelType);
+	if (entry.direction === HtlcDirection.OFFERED) {
+		const script = buildOfferedHtlcScript(
+			keys.revocationPubkey,
+			keys.localHtlcPubkey,
+			keys.remoteHtlcPubkey,
+			entry.paymentHash,
+			useAnchors
+		);
+		return {
+			script,
+			amount: entry.amountMsat / 1000n,
+			amountMsat: entry.amountMsat,
+			cltvExpiry: entry.cltvExpiry,
+			paymentHash: entry.paymentHash,
+			direction: HtlcDirection.OFFERED,
+			taprootScript: taprootHtlcScript(
+				isTaproot,
+				'offered',
+				keys,
+				entry.paymentHash,
+				entry.cltvExpiry
+			)
+		};
+	}
+	const script = buildReceivedHtlcScript(
+		keys.revocationPubkey,
+		keys.localHtlcPubkey,
+		keys.remoteHtlcPubkey,
+		entry.paymentHash,
+		entry.cltvExpiry,
+		useAnchors
+	);
+	return {
+		script,
+		amount: entry.amountMsat / 1000n,
+		amountMsat: entry.amountMsat,
+		cltvExpiry: entry.cltvExpiry,
+		paymentHash: entry.paymentHash,
+		direction: HtlcDirection.RECEIVED,
+		taprootScript: taprootHtlcScript(
+			isTaproot,
+			'received',
+			keys,
+			entry.paymentHash,
+			entry.cltvExpiry
+		)
+	};
 }
 
 /**

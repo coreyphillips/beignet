@@ -1295,6 +1295,35 @@ function htlcEntryCanBePresent(
 	);
 }
 
+/** Key prefix of a candidate that comes from signedLocalRemovals, not the map. */
+const SIGNED_LOCAL_REMOVAL_KEY = 'signed-local-removal:';
+
+/**
+ * The received removals OUR commitment can still carry after their entries
+ * left the map (IChannelState.signedLocalRemovals): the peer has revoked for
+ * the removal, and the commitment its stored signature covers, the one we
+ * broadcast, predates it until the peer's next commitment_signed. This is the
+ * one message htlcEntryCanBePresent cannot see, because there is no entry left
+ * to ask.
+ *
+ * Without them a force close in that window left the output untracked: no
+ * HTLC-success despite the preimage and the peer's signature, and every later
+ * HTLC output's htlcSigIndex shifted onto the wrong signature (the shape of
+ * issues #561 and #556, one message later).
+ *
+ * Candidates only, like every other entry: an output is attributed to one
+ * when its script matches byte for byte, so a commitment that has dropped the
+ * output matches nothing here.
+ */
+function signedLocalRemovalCandidates(
+	state: IChannelState
+): [string, IHtlcEntry][] {
+	return (state.signedLocalRemovals ?? []).map((entry) => [
+		`${SIGNED_LOCAL_REMOVAL_KEY}${entry.id}`,
+		entry
+	]);
+}
+
 /**
  * The entries an output of `amount` is attributed from, best first.
  *
@@ -1314,11 +1343,16 @@ function htlcEntryCanBePresent(
  */
 function htlcMatchOrder(
 	state: IChannelState,
-	amount: bigint
+	amount: bigint,
+	isLocalCommitment: boolean
 ): [string, IHtlcEntry][] {
-	const entries = [...state.htlcs.entries()].sort(
-		([, a], [, b]) => a.cltvExpiry - b.cltvExpiry
-	);
+	// The kept removals go first, so the stable sort hands them a tie: their
+	// output is known to be in the signed commitment, which a same-hash add
+	// the peer has not signed in yet is not.
+	const entries = [
+		...(isLocalCommitment ? signedLocalRemovalCandidates(state) : []),
+		...state.htlcs.entries()
+	].sort(([, a], [, b]) => a.cltvExpiry - b.cltvExpiry);
 	const sameAmount = ([, entry]: [string, IHtlcEntry]): boolean =>
 		entry.amountMsat / 1000n === amount;
 	return [
@@ -1346,11 +1380,14 @@ function matchHtlcOutput(
 	// that matches the on-chain commitment.
 	const useAnchors = isAnchorChannel(state.channelType);
 
-	for (const [entryKey, entry] of htlcMatchOrder(state, outAmount)) {
+	for (const [entryKey, entry] of htlcMatchOrder(state, outAmount, isLocal)) {
 		if (claimedKeys?.has(entryKey)) {
 			continue;
 		}
-		if (!htlcEntryCanBePresent(entry, isLocal)) {
+		if (
+			!entryKey.startsWith(SIGNED_LOCAL_REMOVAL_KEY) &&
+			!htlcEntryCanBePresent(entry, isLocal)
+		) {
 			continue;
 		}
 
@@ -1533,11 +1570,14 @@ function matchTaprootHtlcOutput(
 	// scripts must each claim a DISTINCT entry.
 	claimedKeys?: Set<string>
 ): IHtlcMatch | null {
-	for (const [entryKey, entry] of htlcMatchOrder(state, outAmount)) {
+	for (const [entryKey, entry] of htlcMatchOrder(state, outAmount, isOurs)) {
 		if (claimedKeys?.has(entryKey)) {
 			continue;
 		}
-		if (!htlcEntryCanBePresent(entry, isOurs)) {
+		if (
+			!entryKey.startsWith(SIGNED_LOCAL_REMOVAL_KEY) &&
+			!htlcEntryCanBePresent(entry, isOurs)
+		) {
 			continue;
 		}
 
