@@ -177,6 +177,8 @@ import {
 	isFforConcurrentVersion,
 	FF_EPOCH_START_TOLERANCE_BLOCKS,
 	FF_INIT_TYPE,
+	FF_SYNC_TYPE,
+	FF_SYNC_REPLY_TYPE,
 	FforAbortReason,
 	FforRole,
 	FforSlotState,
@@ -194,7 +196,9 @@ import {
 	IFforEpochRecord,
 	IFforErrorMessage,
 	IFforInitMessage,
-	IFforReestablishTlv
+	IFforReestablishTlv,
+	IFforSyncMessage,
+	IFforSyncReplyMessage
 } from '../ffor/types';
 import { IFforWitnessProvision } from '../ffor/witness-types';
 import {
@@ -209,6 +213,8 @@ import {
 	decodeFforCloseMessage,
 	decodeFforErrorMessage,
 	decodeFforInitMessage,
+	decodeFforSyncMessage,
+	decodeFforSyncReplyMessage,
 	encodeFforAbortUnsigned,
 	encodeFforAcceptUnsigned,
 	encodeFforActivateAckUnsigned,
@@ -217,7 +223,10 @@ import {
 	encodeFforCloseUnsigned,
 	encodeFforErrorMessage,
 	encodeFforInitUnsigned,
+	encodeFforSyncUnsigned,
+	encodeFforSyncReplyUnsigned,
 	fforMessageDigest,
+	fforSyncSnapshotContent,
 	fforWireBytes,
 	verifyFforMessage
 } from '../ffor/messages';
@@ -969,6 +978,7 @@ export class Channel {
 	 * voucher; every other settle of a parked voucher is refused.
 	 */
 	private _fforInternalSettle = false;
+	private _fforSyncBudget = { startedAt: 0, count: 0 };
 	/**
 	 * FFOR: set while handleFforInit offers the epoch's own vouchers; every
 	 * other add of ours is refused while the setup runs.
@@ -4170,8 +4180,25 @@ export class Channel {
 		// the only remaining source, so swallowing it here would strand the
 		// upstream leg of a forward forever (issue 295). Every listener on the
 		// resulting event is repeat-tolerant.
+		const ffor = this._state.ffor;
+		const redeemed =
+			!!ffor &&
+			ffor.role === 'S' &&
+			this._fforIsConcurrent(ffor) &&
+			entry.fforVoucher === true &&
+			!this._addNotYetCommitted(entry);
+		if (redeemed) {
+			const slot = matchVoucher(this._fforBook(ffor!), entry);
+			if (slot) {
+				ffor!.slotRedeemed ??= ffor!.paymentHashes.map(() => false);
+				ffor!.slotRedeemed[slot.k - 1] = true;
+			}
+		}
 		if (entry.state === HtlcState.FULFILLED) {
 			return [
+				...(redeemed
+					? [{ type: ChannelActionType.PERSIST_STATE } as ChannelAction]
+					: []),
 				{
 					type: ChannelActionType.HTLC_FULFILLED,
 					htlcId: msg.id,
@@ -4202,6 +4229,9 @@ export class Channel {
 		// happens when the commitment exchange confirms via revoke_and_ack.
 
 		return [
+			...(redeemed
+				? [{ type: ChannelActionType.PERSIST_STATE } as ChannelAction]
+				: []),
 			{
 				type: ChannelActionType.HTLC_FULFILLED,
 				htlcId: msg.id,
@@ -5720,25 +5750,28 @@ export class Channel {
 			if (entry.removalRemoteCommitted === false) {
 				continue;
 			}
-			if (entry.state === HtlcState.FULFILLED) {
-				const f = this._state.ffor;
-				if (
-					f?.role === 'S' &&
-					f.concurrentVersion === FF_CONCURRENT_RESERVED_VERSION &&
-					entry.direction === HtlcDirection.OFFERED &&
-					entry.fforVoucher &&
-					entry.removalLocallyRevoked === true
-				) {
-					const slot = matchVoucher(this._fforBook(f), entry);
-					if (slot) {
-						f.voucherOutcomes ??= f.paymentHashes.map(() => null);
-						f.voucherOutcomes[slot.k - 1] ??= {
-							outcome: 'fulfilled',
-							localCommitmentNumber: this._state.localCommitmentNumber,
-							remoteCommitmentNumber: this._remoteRevocationCount()
-						};
-					}
+			const f = this._state.ffor;
+			if (
+				f?.role === 'S' &&
+				this._fforIsConcurrent(f) &&
+				entry.direction === HtlcDirection.OFFERED &&
+				entry.fforVoucher &&
+				entry.removalLocallyRevoked === true &&
+				(entry.state === HtlcState.FULFILLED ||
+					entry.state === HtlcState.FAILED)
+			) {
+				const slot = matchVoucher(this._fforBook(f), entry);
+				if (slot) {
+					f.voucherOutcomes ??= f.paymentHashes.map(() => null);
+					f.voucherOutcomes[slot.k - 1] ??= {
+						outcome:
+							entry.state === HtlcState.FULFILLED ? 'fulfilled' : 'cancelled',
+						localCommitmentNumber: this._state.localCommitmentNumber,
+						remoteCommitmentNumber: this._remoteRevocationCount()
+					};
 				}
+			}
+			if (entry.state === HtlcState.FULFILLED) {
 				if (entry.direction === HtlcDirection.RECEIVED) {
 					// We received and fulfilled: credit our balance
 					this._state.localBalanceMsat += entry.amountMsat;
@@ -24747,6 +24780,7 @@ export class Channel {
 		if (f.state === FforState.DRAINING) {
 			return this._fforMaybeClosed(f, boundary);
 		}
+		if (f.state === FforState.ACTIVE) return this._fforRedeem(f);
 		return [];
 	}
 
@@ -25502,6 +25536,11 @@ export class Channel {
 		if (f.state !== FforState.DRAINING) return [];
 		if (this._fforVoucherEntries(f).size > 0) return [];
 		if (
+			this._fforIsConcurrent(f) &&
+			f.paymentHashes.some((_, i) => !f.voucherOutcomes?.[i])
+		)
+			return [];
+		if (
 			f.concurrentVersion === FF_CONCURRENT_RESERVED_VERSION &&
 			f.paymentHashes.some(
 				(_, i) => f.voucherOutcomes?.[i]?.outcome !== 'fulfilled'
@@ -25515,11 +25554,7 @@ export class Channel {
 		// section 7): an ordinary update in flight neither delays CLOSED nor
 		// closes the channel.
 		//
-		// Interim rule for concurrent epochs, until PR 2's terminal slot
-		// records: CLOSED once no voucher entry remains on the channel (an
-		// entry lives until its removal is irrevocable, so none remaining
-		// also means no voucher removal is pending), and on R only at a
-		// commitment_signed boundary, as below.
+		// Concurrent terminal records establish removal in both views.
 		if (!this._fforIsConcurrent(f) && this.hasPendingHtlcs()) return [];
 		// R's map empties at S's revoke_and_ack for R's removal commitment,
 		// while R's OWN commitment still carries the vouchers until S's next
@@ -25531,6 +25566,260 @@ export class Channel {
 		// Section 7: unique across all epochs, closed ones included.
 		this._fforBurnEpochId(f.epochId);
 		return [];
+	}
+
+	/** R: fetch receipts without stopping admission or replacing an outstanding nonce. */
+	fforSync(): ChannelAction[] {
+		const f = this._state.ffor;
+		if (
+			!f ||
+			f.role !== 'R' ||
+			!this._fforIsConcurrent(f) ||
+			f.state !== FforState.ACTIVE ||
+			!f.hAct ||
+			f.closeSent ||
+			f.activationMismatch ||
+			f.capabilityHold
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: no synchronized ACTIVE concurrent epoch to fetch',
+					cleanup: 'none'
+				}
+			];
+		}
+		if (this._state.state !== ChannelState.NORMAL)
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: channel must reestablish before fetching receipts',
+					cleanup: 'none'
+				}
+			];
+		if (!f.syncRequestWire) {
+			const body = this._fforSign(
+				FF_SYNC_TYPE,
+				encodeFforSyncUnsigned({
+					channelId: this._state.channelId!,
+					epochId: f.epochId,
+					activationHash: f.hAct,
+					nonce: crypto.randomBytes(32)
+				})
+			);
+			if (!body)
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'FFOR: signing ff_sync failed',
+						cleanup: 'none'
+					}
+				];
+			f.syncRequestWire = fforWireBytes(FF_SYNC_TYPE, body);
+		}
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			replayMsg(MessageType.FF_SYNC, f.syncRequestWire.subarray(2))
+		];
+	}
+
+	private _fforSyncError(epochId: Buffer, message: string): ChannelAction[] {
+		return [
+			{
+				type: ChannelActionType.ERROR,
+				message: `FFOR: ${message}`,
+				cleanup: 'none'
+			},
+			sendMsg(
+				MessageType.FF_ERROR,
+				encodeFforErrorMessage({
+					channelId: this._state.channelId!,
+					epochId,
+					data: Buffer.from(message)
+				})
+			)
+		];
+	}
+
+	/** S: publish only durable settlement or redemption, with a stable sequence. */
+	handleFforSync(payload: Buffer): ChannelAction[] {
+		const f = this._state.ffor;
+		let msg: IFforSyncMessage;
+		try {
+			msg = decodeFforSyncMessage(payload);
+		} catch {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: undecodable ff_sync',
+					cleanup: 'none'
+				}
+			];
+		}
+		const refuse = (message: string): ChannelAction[] =>
+			this._fforSyncError(msg.epochId, message);
+		if (
+			!f ||
+			f.role !== 'S' ||
+			!this._fforIsConcurrent(f) ||
+			!msg.channelId.equals(this._state.channelId!) ||
+			!msg.epochId.equals(f.epochId) ||
+			!f.hAct ||
+			!msg.activationHash.equals(f.hAct)
+		)
+			return refuse('ff_sync does not name an activated concurrent epoch');
+		const now = Date.now();
+		if (now - this._fforSyncBudget.startedAt >= 1000)
+			this._fforSyncBudget = { startedAt: now, count: 0 };
+		if (++this._fforSyncBudget.count > 8)
+			return refuse('ff_sync rate limit reached');
+		if (!verifyFforMessage(FF_SYNC_TYPE, payload, f.remoteNodeId))
+			return refuse('invalid ff_sync signature');
+		if (
+			(f.state === FforState.DRAINING || f.state === FforState.CLOSED) &&
+			f.closeAckWire
+		)
+			return [
+				{ type: ChannelActionType.PERSIST_STATE },
+				replayMsg(MessageType.FF_CLOSE_ACK, f.closeAckWire.subarray(2))
+			];
+		if (
+			f.state !== FforState.ACTIVE ||
+			f.activationMismatch ||
+			this._fforActivateAckUnsent
+		)
+			return refuse('ff_sync is unavailable before synchronized activation');
+		const settled = Buffer.alloc(bitmapLength(f.params.maxPayments));
+		const preimages: IFforSyncReplyMessage['preimages'] = [];
+		for (let k = 1; k <= f.params.maxPayments; k++) {
+			if (
+				f.slotStates[k - 1] !== FforSlotState.SETTLED &&
+				f.voucherOutcomes?.[k - 1]?.outcome !== 'fulfilled'
+			)
+				continue;
+			const preimage = f.preimages[k - 1];
+			if (
+				!preimage ||
+				!crypto
+					.createHash('sha256')
+					.update(preimage)
+					.digest()
+					.equals(f.paymentHashes[k - 1])
+			)
+				return refuse('reportable slot lacks its claim proof');
+			bitmapSet(settled, k);
+			preimages.push({ k, preimage });
+		}
+		const snapshot = { numSlots: f.params.maxPayments, settled, preimages };
+		const previous = f.syncSnapshotWire
+			? decodeFforSyncReplyMessage(f.syncSnapshotWire.subarray(2))
+			: null;
+		const changed = previous
+			? !fforSyncSnapshotContent(previous).equals(
+					fforSyncSnapshotContent(snapshot)
+			  )
+			: preimages.length > 0;
+		if (previous && previous.preimages.some((p) => !bitmapGet(settled, p.k)))
+			return refuse('reportable snapshot cannot shrink');
+		const snapshotSeq = (previous?.snapshotSeq ?? 0n) + (changed ? 1n : 0n);
+		if (snapshotSeq > 0xffffffffffffffffn)
+			return refuse('snapshot sequence exhausted');
+		const body = this._fforSign(
+			FF_SYNC_REPLY_TYPE,
+			encodeFforSyncReplyUnsigned({ ...msg, ...snapshot, snapshotSeq })
+		);
+		if (!body) return refuse('signing ff_sync_reply failed');
+		f.syncSnapshotWire = fforWireBytes(FF_SYNC_REPLY_TYPE, body);
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			{ ...sendMsg(MessageType.FF_SYNC_REPLY, body), durabilityCritical: true }
+		];
+	}
+
+	/** R: retain proof independently of correlated monotonic snapshot progress. */
+	handleFforSyncReply(payload: Buffer): ChannelAction[] {
+		const f = this._state.ffor;
+		let msg: IFforSyncReplyMessage;
+		try {
+			msg = decodeFforSyncReplyMessage(payload);
+		} catch {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: undecodable ff_sync_reply',
+					cleanup: 'none'
+				}
+			];
+		}
+		const refuse = (message: string): ChannelAction[] =>
+			this._fforSyncError(msg.epochId, message);
+		if (
+			!f ||
+			f.role !== 'R' ||
+			!this._fforIsConcurrent(f) ||
+			![FforState.ACTIVE, FforState.DRAINING, FforState.CLOSED].includes(
+				f.state
+			) ||
+			!msg.channelId.equals(this._state.channelId!) ||
+			!msg.epochId.equals(f.epochId) ||
+			!f.hAct ||
+			!msg.activationHash.equals(f.hAct) ||
+			msg.numSlots !== f.params.maxPayments ||
+			!verifyFforMessage(FF_SYNC_REPLY_TYPE, payload, f.remoteNodeId)
+		)
+			return refuse('invalid ff_sync_reply identity or signature');
+		if (
+			msg.preimages.some(
+				(p) =>
+					!crypto
+						.createHash('sha256')
+						.update(p.preimage)
+						.digest()
+						.equals(f.paymentHashes[p.k - 1])
+			)
+		)
+			return refuse('ff_sync_reply preimage does not match its slot');
+		const previous = f.syncSnapshotWire
+			? decodeFforSyncReplyMessage(f.syncSnapshotWire.subarray(2))
+			: null;
+		const request = f.syncRequestWire
+			? decodeFforSyncMessage(f.syncRequestWire.subarray(2))
+			: null;
+		const matches = !!request && request.nonce.equals(msg.nonce);
+		const conflict =
+			!!previous &&
+			((msg.snapshotSeq === previous.snapshotSeq &&
+				!fforSyncSnapshotContent(previous).equals(
+					fforSyncSnapshotContent(msg)
+				)) ||
+				(msg.snapshotSeq > previous.snapshotSeq &&
+					previous.preimages.some((p) => !bitmapGet(msg.settled, p.k))));
+		const learned: ChannelAction[] = [];
+		for (const p of msg.preimages)
+			learned.push(...(this._fforKeepPreimage(f, p.preimage) ?? []));
+		if (conflict) {
+			f.syncConflictWire ??= fforWireBytes(FF_SYNC_REPLY_TYPE, payload);
+			f.activationMismatch = true;
+		} else if (
+			matches &&
+			f.state === FforState.ACTIVE &&
+			!f.closeAckWire &&
+			(!previous || msg.snapshotSeq > previous.snapshotSeq)
+		) {
+			f.syncSnapshotWire = fforWireBytes(FF_SYNC_REPLY_TYPE, payload);
+		}
+		if (matches) delete f.syncRequestWire;
+		if (f.state === FforState.DRAINING) this._fforWithdrawFails(f, false);
+		return [
+			...learned,
+			{ type: ChannelActionType.PERSIST_STATE },
+			...(f.state === FforState.ACTIVE
+				? this._fforRedeem(f)
+				: this._fforDrain(f)),
+			...(conflict
+				? refuse('conflicting signed receipt snapshot retained')
+				: [])
+		];
 	}
 
 	/** R: ff_close (section 7.5.4), or its resend while the ack is owed. */
@@ -25648,7 +25937,10 @@ export class Channel {
 			if (f.slotStates[k - 1] === FforSlotState.SETTLING) {
 				f.slotStates[k - 1] = FforSlotState.SETTLED;
 			}
-			if (f.slotStates[k - 1] === FforSlotState.SETTLED) {
+			if (
+				f.slotStates[k - 1] === FforSlotState.SETTLED ||
+				f.slotRedeemed?.[k - 1]
+			) {
 				bitmapSet(bitmap, k);
 				preimages.push({ k, preimage: f.preimages[k - 1] });
 			}
@@ -25676,6 +25968,7 @@ export class Channel {
 		f.settledBitmap = bitmap;
 		f.closeAckWire = fforWireBytes(FF_CLOSE_ACK_TYPE, ack);
 		f.state = FforState.DRAINING;
+		if (this._fforIsConcurrent(f)) this._fforMaybeClosed(f, 'raa');
 		return [
 			{ type: ChannelActionType.PERSIST_STATE },
 			sendMsg(MessageType.FF_CLOSE_ACK, ack)
@@ -25857,12 +26150,42 @@ export class Channel {
 		}
 		f.settledBitmap = Buffer.from(msg.settled);
 		f.closeAckWire = wire;
+		delete f.syncRequestWire;
 		f.state = FforState.DRAINING;
+		if (this._fforIsConcurrent(f)) this._fforMaybeClosed(f, 'cs');
 		return [
 			...learned,
 			{ type: ChannelActionType.PERSIST_STATE },
 			...this._fforDrain(f)
 		];
+	}
+
+	/** Redeem only known claims while the concurrent book stays open. */
+	private _fforRedeem(f: IFforEpochRecord): ChannelAction[] {
+		if (
+			f.role !== 'R' ||
+			!this._fforIsConcurrent(f) ||
+			f.state !== FforState.ACTIVE ||
+			this._state.state !== ChannelState.NORMAL ||
+			this._quiescence.isQuiescing() ||
+			this._fforHolding ||
+			f.concurrentVersionMismatch
+		)
+			return [];
+		const actions: ChannelAction[] = [];
+		this._fforInternalSettle = true;
+		try {
+			for (const [k, entry] of this._fforVoucherEntries(f)) {
+				const preimage = f.knownPreimages[k - 1];
+				if (entry.state !== HtlcState.COMMITTED || !preimage) continue;
+				const fulfill = this.fulfillHtlc(entry.id, preimage);
+				if (!fulfill.some((action) => action.type === ChannelActionType.ERROR))
+					actions.push(...fulfill);
+			}
+		} finally {
+			this._fforInternalSettle = false;
+		}
+		return actions;
 	}
 
 	/**
@@ -25940,7 +26263,9 @@ export class Channel {
 		return [
 			...learned,
 			{ type: ChannelActionType.PERSIST_STATE },
-			...(f.state === FforState.DRAINING ? this._fforDrain(f) : [])
+			...(f.state === FforState.DRAINING
+				? this._fforDrain(f)
+				: this._fforRedeem(f))
 		];
 	}
 
@@ -26216,6 +26541,22 @@ export class Channel {
 				}
 			];
 		}
+		if (
+			this._fforIsConcurrent(f) &&
+			f.slotStates[k - 1] !== FforSlotState.UNUSED &&
+			(state === FforSlotState.UNUSED ||
+				upstream !== f.slotUpstream[k - 1] ||
+				(f.slotStates[k - 1] === FforSlotState.SETTLED &&
+					state !== FforSlotState.SETTLED))
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: delegated settlement identity cannot regress',
+					cleanup: 'none'
+				}
+			];
+		}
 		f.slotStates[k - 1] = state;
 		f.slotUpstream[k - 1] = upstream;
 		return [{ type: ChannelActionType.PERSIST_STATE }];
@@ -26244,6 +26585,7 @@ export class Channel {
 			return 'settlement_deadline reached';
 		}
 		if (k < 1 || k > f.params.maxPayments) return 'no such slot';
+		if (f.slotRedeemed?.[k - 1]) return 'voucher already redeemed';
 		return null;
 	}
 
@@ -26554,6 +26896,20 @@ export class Channel {
 					actions.push(
 						replayMsg(MessageType.FF_CLOSE, f.closeWire.subarray(2))
 					);
+				}
+				if (
+					f.role === 'R' &&
+					this._fforIsConcurrent(f) &&
+					!f.activationMismatch &&
+					!f.closeSent
+				) {
+					if (f.syncRequestWire) {
+						actions.push(
+							{ type: ChannelActionType.PERSIST_STATE },
+							replayMsg(MessageType.FF_SYNC, f.syncRequestWire.subarray(2))
+						);
+					}
+					actions.push(...this._fforRedeem(f));
 				}
 				break;
 			case FforState.DRAINING:

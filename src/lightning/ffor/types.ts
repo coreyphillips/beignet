@@ -20,6 +20,8 @@ export const FF_ACTIVATE_ACK_TYPE = 55047;
 export const FF_ABORT_TYPE = 55049;
 export const FF_CLOSE_TYPE = 55051;
 export const FF_CLOSE_ACK_TYPE = 55053;
+export const FF_SYNC_TYPE = 55075;
+export const FF_SYNC_REPLY_TYPE = 55077;
 
 /** channel_reestablish TLV carrying the epoch state (section 11.1). */
 export const FF_REESTABLISH_TLV_TYPE = 55001n;
@@ -212,6 +214,14 @@ export interface IFforEpochRecord {
 	activateAckWire: Buffer | null;
 	closeWire: Buffer | null;
 	closeAckWire: Buffer | null;
+	/** R: one outstanding signed fetch, replayed byte for byte after restart. */
+	syncRequestWire?: Buffer;
+	/** S: last published snapshot. R: highest accepted snapshot. */
+	syncSnapshotWire?: Buffer;
+	/** First conflicting signed snapshot, retained alongside the accepted one. */
+	syncConflictWire?: Buffer;
+	/** S: a voucher fulfillment was received, independently of upstream payment. */
+	slotRedeemed?: boolean[];
 	/** S: per-slot settlement state (section 9.5.1). R: unused. */
 	slotStates: FforSlotState[];
 	/**
@@ -455,6 +465,19 @@ export interface IFforCloseAckMessage {
 	/** TLV 1: [2: k][32: t_k] per set bit, in k order. */
 	preimages: { k: number; preimage: Buffer }[];
 	signature: Buffer;
+}
+
+/** Signed nonterminal settlement fetch for a concurrent epoch. */
+export interface IFforSyncMessage extends IFforCloseMessage {
+	nonce: Buffer;
+}
+
+/** A cumulative reportable snapshot. Sequence identifies content, not nonce. */
+export interface IFforSyncReplyMessage extends IFforSyncMessage {
+	snapshotSeq: bigint;
+	numSlots: number;
+	settled: Buffer;
+	preimages: { k: number; preimage: Buffer }[];
 }
 
 /** Wire-level ff_error (section 11.1), unsigned. */

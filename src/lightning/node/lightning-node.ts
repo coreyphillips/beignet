@@ -15,6 +15,11 @@ import {
 	mergeFforVoucherArchive
 } from '../ffor/voucher-archive';
 import { archiveFforChainEvidence } from '../ffor/voucher-chain';
+import { FforVoucherIndex } from '../ffor/voucher-index';
+import {
+	deserializeChannelState,
+	serializeChannelState
+} from '../storage/serialization';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX } from '../message/splice';
 
 /**
@@ -190,7 +195,8 @@ import {
 	FforAbortReason,
 	FforSlotState,
 	FforState,
-	IFforEpochRecord
+	IFforEpochRecord,
+	isFforConcurrentVersion
 } from '../ffor/types';
 import { encode as encodeInvoice } from '../invoice/encode';
 import { decode as decodeInvoice } from '../invoice/decode';
@@ -929,6 +935,7 @@ export class LightningNode extends EventEmitter {
 	private peerManager: PeerManager | null = null;
 	private payments: Map<string, IPaymentInfo> = new Map();
 	private fforArchivedVouchers = new Map<string, IFforVoucherArchive>();
+	private readonly fforVoucherIndex = new FforVoucherIndex();
 	private pendingFforVoucherCredits = new Map<string, IFforVoucherCredit>();
 	private preimages: Map<string, Buffer> = new Map();
 	// Hashes of settled incoming keysends that pruneCompletedPayments dropped
@@ -1553,15 +1560,15 @@ export class LightningNode extends EventEmitter {
 				present === 0 &&
 				this.storage
 					.loadAllChannels()
-					.some((r) => r.state.ffor?.concurrentVersion === 2)
+					.some((r) => isFforConcurrentVersion(r.state.ffor?.concurrentVersion))
 			) {
-				throw new Error('Storage cannot restore version 2 voucher custody');
+				throw new Error('Storage cannot restore concurrent voucher custody');
 			}
 		}
 		// Custody is safety-critical. A corrupt archive stops startup instead
 		// of silently losing claims or treating consumed slots as new ones.
 		for (const record of this.storage?.loadAllFforVouchers?.() ?? []) {
-			this.fforArchivedVouchers.set(fforVoucherArchiveId(record), record);
+			this.rememberFforVoucher(record);
 		}
 		// Recovery Protocol phase 1: the choke point every safety-critical write
 		// goes through, so channel state, its key index, its chain monitor delta
@@ -1863,6 +1870,10 @@ export class LightningNode extends EventEmitter {
 		this.localFeatures = localFeatures;
 
 		this.channelManager = new ChannelManager({
+			fforVoucherLookup:
+				this.storage && !this.storage.loadAllFforVouchers
+					? undefined
+					: (hash) => this.fforVoucherIndex.get(hash),
 			localFeatures,
 			localConfig: config.channelConfig,
 			localBasepoints: config.channelBasepoints,
@@ -2904,6 +2915,7 @@ export class LightningNode extends EventEmitter {
 
 	private restoreFromStorage(): void {
 		if (!this.storage) return;
+		this.restoreFforVoucherIdentities();
 
 		// Seed the per-channel key index from storage FIRST: restoreChannel
 		// advances it from each restored row, but a row removed below never
@@ -3924,7 +3936,15 @@ export class LightningNode extends EventEmitter {
 		channelId: Buffer,
 		request?: IChannelPersistRequest
 	): void {
-		if (!this.storage || !this.recovery) return;
+		if (!this.storage) {
+			try {
+				this.captureInMemoryFforCustody(channelId.toString('hex'));
+			} catch {
+				if (request) request.committed = false;
+			}
+			return;
+		}
+		if (!this.recovery) return;
 		const channelIdHex = channelId.toString('hex');
 		const keyIndex = channel.channelKeyIndex;
 		// Channel state persisted without its key index restores a channel that
@@ -3948,7 +3968,9 @@ export class LightningNode extends EventEmitter {
 		) {
 			if (
 				!this.safeStorage(() => {
-					for (const record of archiveFforVouchers(channelIdHex, epoch)) {
+					const records = archiveFforVouchers(channelIdHex, epoch);
+					this.fforVoucherIndex.assertAvailableAll(records);
+					for (const record of records) {
 						const previous = this.storage!.loadFforVoucher!(
 							fforVoucherArchiveId(record)
 						);
@@ -3962,14 +3984,23 @@ export class LightningNode extends EventEmitter {
 				if (request) request.committed = false;
 				return;
 			}
-		} else if (epoch?.concurrentVersion === 2) {
+		} else if (isFforConcurrentVersion(epoch?.concurrentVersion)) {
 			if (request) request.committed = false;
 			this.emit('node:error', {
 				code: 'PERSISTENCE_ERROR',
 				channelId,
-				message: 'Storage cannot preserve version 2 voucher custody',
+				message: 'Storage cannot preserve concurrent voucher custody',
 				timestamp: Date.now()
 			} as ILightningError);
+			return;
+		}
+		let settledSlots: { record: IFforEpochRecord; k: number }[] = [];
+		if (
+			!this.safeStorage(() => {
+				settledSlots = this.prepareFforSettlementMutations(channel, mutations);
+			}, 'prepare delegated settlement receipt')
+		) {
+			if (request) request.committed = false;
 			return;
 		}
 		if (keyIndex != null) {
@@ -4068,12 +4099,11 @@ export class LightningNode extends EventEmitter {
 				timestamp: Date.now()
 			} as ILightningError);
 		} else {
+			for (const { record, k } of settledSlots)
+				record.slotStates[k - 1] = FforSlotState.SETTLED;
 			for (const mutation of mutations) {
 				if (mutation.type === 'ffor_voucher') {
-					this.fforArchivedVouchers.set(
-						fforVoucherArchiveId(mutation.record),
-						mutation.record
-					);
+					this.rememberFforVoucher(mutation.record);
 				}
 			}
 			this._failedTerminalPersists.delete(channelIdHex);
@@ -4305,10 +4335,7 @@ export class LightningNode extends EventEmitter {
 		} else {
 			for (const entry of mutations) {
 				if (entry.type === 'ffor_voucher') {
-					this.fforArchivedVouchers.set(
-						fforVoucherArchiveId(entry.record),
-						entry.record
-					);
+					this.rememberFforVoucher(entry.record);
 				}
 			}
 		}
@@ -18122,7 +18149,21 @@ export class LightningNode extends EventEmitter {
 		// restart via redispatchUnresolvedReceivedHtlcs.
 		const finalHop = isFinalHop(processed.nextPacket);
 		let policyCode: number | null = null;
+		const archivedVoucher = this.fforVoucherIndex.get(
+			paymentHash.toString('hex')
+		);
 		if (
+			archivedVoucher &&
+			(archivedVoucher.role === 'R' ||
+				!this.channelManager.fforFindDelegatedSlot(paymentHash))
+		) {
+			// Book hashes retain their single-use identity after epoch replacement
+			// and channel pruning. A receiver's hash never enters ordinary payment
+			// handling, even when its claim proof is already known.
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: TEMPORARY_NODE_FAILURE;
+		} else if (
 			(isRecencyUnproven(channel.getFullState()) ||
 				channel.getFullState().restoreRevokedRisk === true) &&
 			htlcEntry.addedWhileRestoreUnproven === true
@@ -18632,7 +18673,8 @@ export class LightningNode extends EventEmitter {
 		}
 	): ChannelResult {
 		if (
-			request.concurrentVersion === 2 &&
+			(request.concurrent ||
+				isFforConcurrentVersion(request.concurrentVersion)) &&
 			this.storage &&
 			(!this.storage.saveFforVoucher ||
 				!this.storage.loadFforVoucher ||
@@ -18641,7 +18683,7 @@ export class LightningNode extends EventEmitter {
 			return {
 				ok: false,
 				actions: [],
-				error: 'Storage cannot preserve version 2 voucher custody'
+				error: 'Storage cannot preserve concurrent voucher custody'
 			};
 		}
 
@@ -18654,6 +18696,11 @@ export class LightningNode extends EventEmitter {
 	/** R: close the ACTIVE epoch (ff_close, section 7.5.4). */
 	closeFforEpoch(channelIdHex: string): ChannelResult {
 		return this.channelManager.closeFforEpoch(Buffer.from(channelIdHex, 'hex'));
+	}
+
+	/** Fetch a concurrent book's cumulative receipts without closing admission. */
+	fforSync(channelIdHex: string): ChannelResult {
+		return this.channelManager.fforSync(Buffer.from(channelIdHex, 'hex'));
 	}
 
 	/** Either side: abort a setup before ACTIVE. */
@@ -18713,8 +18760,7 @@ export class LightningNode extends EventEmitter {
 						actions: [],
 						error: 'FFOR proof custody write failed'
 					};
-				for (const record of updated)
-					this.fforArchivedVouchers.set(fforVoucherArchiveId(record), record);
+				for (const record of updated) this.rememberFforVoucher(record);
 				this.preimages.set(hashHex, Buffer.from(preimage));
 				this.channelManager.recordPreimage(
 					Buffer.from(hashHex, 'hex'),
@@ -18999,9 +19045,9 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * R, back online (section 9.6.6, section 7.5.6): fetch every witness,
-	 * credit what verifies, then close the epoch cooperatively when S is
-	 * there and ACTIVE, or force-close with every known preimage when asked
-	 * and S is not. Returns what was learned and what was done.
+	 * import verified proof, then request live receipts for a concurrent
+	 * book or close a baseline book when S is reachable. Optional force-close
+	 * behavior remains caller-selected. Returns what was learned and done.
 	 */
 	async rescueFforEpoch(
 		channelIdHex: string,
@@ -19018,7 +19064,7 @@ export class LightningNode extends EventEmitter {
 	): Promise<{
 		preimagesKnown: number[];
 		witnesses: Awaited<ReturnType<LightningNode['fetchFforWitnessRecords']>>;
-		action: 'closed' | 'force-closed' | 'nothing';
+		action: 'closed' | 'force-closed' | 'nothing' | 'synced';
 	}> {
 		const channelId = Buffer.from(channelIdHex, 'hex');
 		const channel = this.channelManager.getChannel(channelId);
@@ -19043,6 +19089,14 @@ export class LightningNode extends EventEmitter {
 		// AWAITING_REESTABLISH either way.
 		const connected = channel.getState() === ChannelState.NORMAL;
 		if (after.state === FforState.ACTIVE && connected) {
+			if (isFforConcurrentVersion(after.concurrentVersion)) {
+				const synced = this.fforSync(channelIdHex);
+				return {
+					preimagesKnown,
+					witnesses,
+					action: synced.ok ? 'synced' : 'nothing'
+				};
+			}
 			const closed = this.closeFforEpoch(channelIdHex);
 			if (closed.ok) return { preimagesKnown, witnesses, action: 'closed' };
 		}
@@ -19292,7 +19346,8 @@ export class LightningNode extends EventEmitter {
 		}
 		if (
 			record.role !== 'R' ||
-			(record.state !== FforState.CLOSED && record.concurrentVersion !== 2)
+			(record.state !== FforState.CLOSED &&
+				!isFforConcurrentVersion(record.concurrentVersion))
 		)
 			return;
 		record.paymentHashes.forEach((hash, i) => {
@@ -19307,15 +19362,110 @@ export class LightningNode extends EventEmitter {
 		});
 	}
 
+	/** Save reportability in the same frame that durably queues the upstream fulfill. */
+	private prepareFforSettlementMutations(
+		channel: Channel,
+		mutations: RecoveryMutation[]
+	): { record: IFforEpochRecord; k: number }[] {
+		const upstreamId = channel.getChannelId()!.toString('hex');
+		const promoted: { record: IFforEpochRecord; k: number }[] = [];
+		for (const [key, entry] of channel.getFullState().htlcs) {
+			if (!key.startsWith('received-') || entry.state !== HtlcState.FULFILLED)
+				continue;
+			const slot = this.channelManager.fforFindDelegatedSlot(entry.paymentHash);
+			if (!slot || !isFforConcurrentVersion(slot.record.concurrentVersion))
+				continue;
+			const k = slot.entry.k;
+			if (
+				slot.record.slotStates[k - 1] !== FforSlotState.SETTLING ||
+				slot.record.slotUpstream[k - 1] !== `${upstreamId}:${entry.id}`
+			)
+				continue;
+			const id = slot.channelId.toString('hex');
+			let mutation = mutations.find(
+				(m): m is Extract<RecoveryMutation, { type: 'channel_state' }> =>
+					m.type === 'channel_state' && m.channelId === id
+			);
+			if (!mutation) {
+				const stored = this.storage!.loadChannel(id);
+				if (!stored || !stored.state.ffor?.epochId.equals(slot.record.epochId))
+					throw new Error('Delegated settlement book is not durably adopted');
+				mutation = {
+					type: 'channel_state',
+					channelId: id,
+					state: stored.state,
+					peerPubkey: stored.peerPubkey
+				};
+				mutations.push(mutation);
+			}
+			mutation.state = deserializeChannelState(
+				serializeChannelState(mutation.state)
+			);
+			const durable = mutation.state.ffor;
+			if (
+				!durable ||
+				durable.slotUpstream[k - 1] !== `${upstreamId}:${entry.id}`
+			)
+				throw new Error('Delegated settlement upstream identity changed');
+			durable.slotStates[k - 1] = FforSlotState.SETTLED;
+			mutations.push({
+				type: 'payment_preimage',
+				paymentHash: entry.paymentHash.toString('hex'),
+				preimage: slot.record.preimages[k - 1]
+			});
+			promoted.push({ record: slot.record, k });
+		}
+		return promoted;
+	}
+
+	/** Backfill retained books before restored channels can receive traffic or be pruned. */
+	private restoreFforVoucherIdentities(): void {
+		if (!this.storage?.loadAllFforVouchers) return;
+		const candidate = new FforVoucherIndex();
+		for (const record of this.fforArchivedVouchers.values())
+			candidate.remember(record);
+		const mutations: RecoveryMutation[] = [];
+		for (const row of this.storage.loadAllChannels()) {
+			if (!row.state.ffor) continue;
+			for (const record of archiveFforVouchers(row.channelId, row.state.ffor)) {
+				candidate.remember(record);
+				const previous =
+					this.fforArchivedVouchers.get(fforVoucherArchiveId(record)) ?? null;
+				const merged = mergeFforVoucherArchive(previous, record);
+				if (JSON.stringify(previous) !== JSON.stringify(merged))
+					mutations.push({ type: 'ffor_voucher', record: merged });
+			}
+		}
+		if (!mutations.length) return;
+		if (
+			!this.commitMutations(
+				'restore voucher identity archive',
+				mutations,
+				RecoveryCriticality.SafetyCritical
+			)
+		)
+			throw new Error('Could not restore durable voucher identities');
+		for (const mutation of mutations) {
+			if (mutation.type === 'ffor_voucher')
+				this.rememberFforVoucher(mutation.record);
+		}
+	}
+
+	private rememberFforVoucher(record: IFforVoucherArchive): void {
+		this.fforVoucherIndex.remember(record);
+		this.fforArchivedVouchers.set(fforVoucherArchiveId(record), record);
+	}
+
 	/** Keep identical accounting semantics for explicitly ephemeral nodes. */
 	private captureInMemoryFforCustody(channelIdHex: string): void {
 		const channelId = Buffer.from(channelIdHex, 'hex');
 		const epoch = this.channelManager.getFforEpoch(channelId);
 		if (epoch) {
-			for (const record of archiveFforVouchers(channelIdHex, epoch)) {
+			const records = archiveFforVouchers(channelIdHex, epoch);
+			this.fforVoucherIndex.assertAvailableAll(records);
+			for (const record of records) {
 				const id = fforVoucherArchiveId(record);
-				this.fforArchivedVouchers.set(
-					id,
+				this.rememberFforVoucher(
 					mergeFforVoucherArchive(
 						this.fforArchivedVouchers.get(id) ?? null,
 						record
@@ -19329,11 +19479,8 @@ export class LightningNode extends EventEmitter {
 		if (!records.length) return;
 		const monitor = this.channelManager.getMonitor(channelId)?.getFullState();
 		if (!monitor) return;
-		for (const [id, record] of records) {
-			this.fforArchivedVouchers.set(
-				id,
-				archiveFforChainEvidence(record, monitor)
-			);
+		for (const [, record] of records) {
+			this.rememberFforVoucher(archiveFforChainEvidence(record, monitor));
 		}
 	}
 
@@ -19429,7 +19576,8 @@ export class LightningNode extends EventEmitter {
 			if (
 				channelId &&
 				record?.role === 'R' &&
-				(record.state === FforState.CLOSED || record.concurrentVersion === 2)
+				(record.state === FforState.CLOSED ||
+					isFforConcurrentVersion(record.concurrentVersion))
 			) {
 				this.fforSettleVoucherInvoices(channelId, record);
 			}
@@ -19554,8 +19702,7 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 		this.pendingFforVoucherCredits.delete(credit.id);
-		if (creditedArchive)
-			this.fforArchivedVouchers.set(credit.id, creditedArchive);
+		if (creditedArchive) this.rememberFforVoucher(creditedArchive);
 		this.payments.set(hashHex, completed);
 		this.emit('payment:received', completed);
 		this.emitInvoiceSettled(hash, completed);
@@ -19619,7 +19766,7 @@ export class LightningNode extends EventEmitter {
 			this.pendingFforVoucherCredits.set(credit.id, credit);
 			return;
 		}
-		this.fforArchivedVouchers.set(credit.id, attributed);
+		this.rememberFforVoucher(attributed);
 		this.payments.set(archived.paymentHash, updated);
 		this.pendingFforVoucherCredits.delete(credit.id);
 	}
@@ -23676,6 +23823,12 @@ export class LightningNode extends EventEmitter {
 			if (!cid) continue;
 			for (const [key, htlc] of channel.getFullState().htlcs) {
 				if (!key.startsWith('received-')) continue;
+				if (
+					htlc.fforVoucher ||
+					this.fforVoucherIndex.get(htlc.paymentHash.toString('hex'))?.role ===
+						'R'
+				)
+					continue;
 				if (
 					htlc.state !== HtlcState.COMMITTED &&
 					htlc.state !== HtlcState.PENDING

@@ -37,10 +37,37 @@ independent issuer admission-stop contract is implemented.
 
 ## Custody and received value
 
+Concurrent versions 1 and 2 support `LightningNode.fforSync(channelIdHex)`.
+It sends a signed receipt request while the book remains ACTIVE. The receiver
+persists one outstanding nonce and replays the same request after reconnect.
+The sender persists each cumulative snapshot before publishing it. Quorum-mode
+nodes also wait for the snapshot's recovery frame to reach the durability barrier.
+
+The sender reports a slot after it has durably queued the delegated payer's
+fulfillment, or after the voucher itself has a fulfilled outcome in both
+commitment views. A SETTLING intent alone is not a receipt. The upstream fulfillment,
+its proof and the book's SETTLED state commit in one recovery transaction.
+
+Verified proof from sync, a payer or a witness starts live redemption through the
+normal commitment flow. Receipt progress and proof custody are separate: an older
+reply can supply proof without replacing the newest accepted snapshot. A signed
+conflict is retained and holds further admission. Sync never cancels a voucher.
+
+`rescueFforEpoch()` requests sync for a connected concurrent book and returns
+`action: 'synced'`. The request may still be outstanding when it returns. Witness
+mailboxes and version 1 issuers remain available for other slots after sync or
+partial redemption. Version 2 issuer provisioning remains refused.
+
 The voucher archive binds each slot to its channel, epoch, role, payment hash,
 amount, HTLC id and expiry. Identity is immutable. Proof, off-chain terminal
 outcome, chain observations, final chain resolutions and invoice-credit source
 survive epoch replacement and channel deletion.
+
+An index rebuilt from the archive reserves every adopted payment hash and
+directional HTLC id for its original book. Retained channel books are backfilled
+before startup exposes channels. An archived hash cannot become an ordinary
+incoming payment or a slot in another book. The archive has no automatic pruning
+policy; its size grows with adopted books.
 
 Observed chain evidence binds the original outpoint to the exact spending
 transaction and its success preimage when present. Observations survive a reorg
@@ -72,9 +99,9 @@ a crash can occur between a durable payment write and event delivery.
 
 ## Storage compatibility and qualification
 
-Version 2 requires the complete voucher archive interface on configured storage:
+Both concurrent versions require the complete voucher archive interface on configured storage:
 `saveFforVoucher`, `loadFforVoucher` and `loadAllFforVouchers`. Adapters with none of
-these methods retain ordinary recovery support but cannot persist version 2.
+these methods retain baseline support but cannot persist concurrent books.
 An incomplete interface is rejected. Nodes explicitly configured without storage
 keep the same accounting rules in memory, with no restart durability.
 
@@ -84,10 +111,9 @@ readers reject them instead of silently omitting custody. Invalid archive rows o
 identity changes fail explicitly. Contradictory or unsupported version metadata
 preserves the strict reservation profile and quarantines new commitment updates.
 
-Downgrading a live version 2 database to an older binary is unsupported. Older
+Downgrading a live concurrent database to an older binary is unsupported. Older
 direct database readers cannot be made safe by checks in the new binary.
 
-Before enabling this profile by default, the remaining qualification includes live
-receipt synchronization and redemption, consumed-slot protection, the full
-commitment and chain crash matrix on regtest, and daemon/coordinator integration.
+Before enabling this profile by default, the remaining qualification includes the
+full commitment and chain crash matrix on regtest, and daemon/coordinator integration.
 The focused in-process checks do not substitute for those release gates.

@@ -21,6 +21,7 @@ import {
 	IFforEpochRecord
 } from '../ffor/types';
 import { fforTranscriptConcurrentVersion } from '../ffor/messages';
+import { validateFforSyncState } from '../ffor/sync-state';
 import { ShaChainStore, IShaChainEntry } from '../keys/shachain';
 import { IChannelBasepoints } from '../keys/derivation';
 import {
@@ -1133,6 +1134,10 @@ export interface ISerializedFforEpoch {
 	activateAckWire: string | null;
 	closeWire: string | null;
 	closeAckWire: string | null;
+	syncRequestWire?: string;
+	syncSnapshotWire?: string;
+	syncConflictWire?: string;
+	slotRedeemed?: boolean[];
 	slotStates: string[];
 	slotUpstream: (string | null)[];
 	settledBitmap: string | null;
@@ -1222,6 +1227,16 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 		activateAckWire: bufToHex(f.activateAckWire),
 		closeWire: bufToHex(f.closeWire),
 		closeAckWire: bufToHex(f.closeAckWire),
+		...(f.syncRequestWire
+			? { syncRequestWire: f.syncRequestWire.toString('hex') }
+			: {}),
+		...(f.syncSnapshotWire
+			? { syncSnapshotWire: f.syncSnapshotWire.toString('hex') }
+			: {}),
+		...(f.syncConflictWire
+			? { syncConflictWire: f.syncConflictWire.toString('hex') }
+			: {}),
+		...(f.slotRedeemed ? { slotRedeemed: [...f.slotRedeemed] } : {}),
 		slotStates: [...f.slotStates],
 		slotUpstream: [...f.slotUpstream],
 		settledBitmap: bufToHex(f.settledBitmap),
@@ -1339,6 +1354,17 @@ function storedConcurrentVersion(
 export function deserializeFforEpoch(
 	s: ISerializedFforEpoch
 ): IFforEpochRecord {
+	for (const wire of [
+		s.syncRequestWire,
+		s.syncSnapshotWire,
+		s.syncConflictWire
+	]) {
+		if (
+			wire !== undefined &&
+			(typeof wire !== 'string' || !/^(?:[0-9a-f]{2})+$/.test(wire))
+		)
+			throw new Error('Invalid persisted receipt wire encoding');
+	}
 	const initWire = Buffer.from(s.initWire, 'hex');
 	const acceptWire = hexToBuf(s.acceptWire);
 	const concurrent = storedConcurrentVersion(
@@ -1347,7 +1373,7 @@ export function deserializeFforEpoch(
 		initWire,
 		acceptWire
 	);
-	return {
+	const record: IFforEpochRecord = {
 		role: s.role as FforRole,
 		state: s.state as FforState,
 		epochId: Buffer.from(s.epochId, 'hex'),
@@ -1395,6 +1421,16 @@ export function deserializeFforEpoch(
 		activateAckWire: hexToBuf(s.activateAckWire),
 		closeWire: hexToBuf(s.closeWire),
 		closeAckWire: hexToBuf(s.closeAckWire),
+		...(s.syncRequestWire
+			? { syncRequestWire: Buffer.from(s.syncRequestWire, 'hex') }
+			: {}),
+		...(s.syncSnapshotWire
+			? { syncSnapshotWire: Buffer.from(s.syncSnapshotWire, 'hex') }
+			: {}),
+		...(s.syncConflictWire
+			? { syncConflictWire: Buffer.from(s.syncConflictWire, 'hex') }
+			: {}),
+		...(s.slotRedeemed ? { slotRedeemed: [...s.slotRedeemed] } : {}),
 		slotStates: s.slotStates.map((x) => x as FforSlotState),
 		slotUpstream: [...s.slotUpstream],
 		settledBitmap: hexToBuf(s.settledBitmap),
@@ -1450,6 +1486,8 @@ export function deserializeFforEpoch(
 			? { capabilityHold: true }
 			: {})
 	};
+	validateFforSyncState(record);
+	return record;
 }
 
 export function deserializeChannelState(

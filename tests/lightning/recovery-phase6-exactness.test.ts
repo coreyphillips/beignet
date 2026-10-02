@@ -540,7 +540,7 @@ describe('Recovery phase 6: a quorum claim names the policy behind it', () => {
 		// it without a bump would let old frames be read as promises their
 		// writers never made. Change the set, change this pin, bump the
 		// version, all in one commit.
-		expect(WIRE_SAFETY_POLICY_VERSION).to.equal(2);
+		expect(WIRE_SAFETY_POLICY_VERSION).to.equal(3);
 		expect(
 			[...QUORUM_BARRIER_MESSAGE_TYPES].sort((a, b) => a - b)
 		).to.deep.equal(
@@ -550,7 +550,8 @@ describe('Recovery phase 6: a quorum claim names the policy behind it', () => {
 				MessageType.UPDATE_FULFILL_HTLC,
 				MessageType.TX_SIGNATURES,
 				MessageType.SPLICE_LOCKED,
-				MessageType.FUNDING_SIGNED
+				MessageType.FUNDING_SIGNED,
+				MessageType.FF_SYNC_REPLY
 			].sort((a, b) => a - b)
 		);
 	});

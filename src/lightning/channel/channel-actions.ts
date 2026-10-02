@@ -536,7 +536,10 @@ export const QUORUM_BARRIER_MESSAGE_TYPES: ReadonlySet<number> =
 		// The v2 counterpart, tx_signatures, has been gated since phase 6
 		// landed, so leaving this out would give the identical role different
 		// exactness guarantees depending on which open the peer chose.
-		MessageType.FUNDING_SIGNED
+		MessageType.FUNDING_SIGNED,
+		// A restored sender must not publish different content under a sequence
+		// that its receiver has already accepted.
+		MessageType.FF_SYNC_REPLY
 	]);
 
 /**
@@ -551,7 +554,7 @@ export const QUORUM_BARRIER_MESSAGE_TYPES: ReadonlySet<number> =
  * pinned-set test in tests/lightning/recovery-phase6-exactness.test.ts fails
  * otherwise.
  */
-export const WIRE_SAFETY_POLICY_VERSION = 2;
+export const WIRE_SAFETY_POLICY_VERSION = 3;
 
 export type ChannelAction =
 	| ISendMessageAction

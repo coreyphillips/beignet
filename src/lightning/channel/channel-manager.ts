@@ -190,9 +190,11 @@ import {
 	FforSlotState,
 	FforState,
 	IFforBookEntry,
-	IFforEpochRecord
+	IFforEpochRecord,
+	isFforConcurrentVersion
 } from '../ffor/types';
 import { IFforWitnessProvision } from '../ffor/witness-types';
+import { IFforVoucherArchive } from '../ffor/voucher-archive';
 
 /**
  * The outpoints a raw transaction spends, txid in display-order hex (the
@@ -302,6 +304,8 @@ interface IBarrierQueue {
 }
 
 export interface IChannelManagerConfig {
+	/** Durable book lookup supplied by the node's voucher custody index. */
+	fforVoucherLookup?: (paymentHash: string) => IFforVoucherArchive | undefined;
 	localConfig?: IChannelConfig;
 	localBasepoints: IChannelBasepoints;
 	localPerCommitmentSeed: Buffer;
@@ -1142,6 +1146,8 @@ export class ChannelManager extends EventEmitter {
 			MessageType.FF_ABORT,
 			MessageType.FF_CLOSE,
 			MessageType.FF_CLOSE_ACK,
+			MessageType.FF_SYNC,
+			MessageType.FF_SYNC_REPLY,
 			// BOLT 1 error/warning: without these registrations a remote error is
 			// silently dropped — the channel never gets marked ERRORED and the node
 			// reconnect-loops against a peer that fails it on every reestablish.
@@ -3617,7 +3623,9 @@ export class ChannelManager extends EventEmitter {
 			MessageType.FF_ACTIVATE_ACK,
 			MessageType.FF_ABORT,
 			MessageType.FF_CLOSE,
-			MessageType.FF_CLOSE_ACK
+			MessageType.FF_CLOSE_ACK,
+			MessageType.FF_SYNC,
+			MessageType.FF_SYNC_REPLY
 		]);
 
 	/**
@@ -3782,6 +3790,8 @@ export class ChannelManager extends EventEmitter {
 				case MessageType.FF_ABORT:
 				case MessageType.FF_CLOSE:
 				case MessageType.FF_CLOSE_ACK:
+				case MessageType.FF_SYNC:
+				case MessageType.FF_SYNC_REPLY:
 					this.handleFforMessage(peerPubkey, type, payload);
 					break;
 				default:
@@ -6165,7 +6175,8 @@ export class ChannelManager extends EventEmitter {
 		if (!this._fforDurableState.has(hex)) return;
 		const state = this._fforDurableState.get(hex) ?? null;
 		if (
-			record?.concurrentVersion === 2 &&
+			record &&
+			isFforConcurrentVersion(record.concurrentVersion) &&
 			record.voucherOutcomes?.some((o) => o !== null)
 		) {
 			this.emit('ffor:voucher-outcomes', channelId, record);
@@ -6288,6 +6299,12 @@ export class ChannelManager extends EventEmitter {
 				break;
 			case MessageType.FF_CLOSE_ACK:
 				actions = channel.handleFforCloseAck(payload);
+				break;
+			case MessageType.FF_SYNC:
+				actions = channel.handleFforSync(payload);
+				break;
+			case MessageType.FF_SYNC_REPLY:
+				actions = channel.handleFforSyncReply(payload);
 				break;
 			case MessageType.FF_ERROR:
 				actions = channel.handleFforError(payload);
@@ -6422,6 +6439,11 @@ export class ChannelManager extends EventEmitter {
 		return this._fforDrive(channelId, (c) => c.closeFforEpoch());
 	}
 
+	/** R: request a nonterminal receipt snapshot. */
+	fforSync(channelId: Buffer): ChannelResult {
+		return this._fforDrive(channelId, (c) => c.fforSync());
+	}
+
 	/** Either side: abort a setup before ACTIVE. */
 	abortFforEpoch(
 		channelId: Buffer,
@@ -6494,12 +6516,26 @@ export class ChannelManager extends EventEmitter {
 		record: IFforEpochRecord;
 		entry: IFforBookEntry;
 	} | null {
-		for (const channel of this.channels.values()) {
+		const archived = this.config.fforVoucherLookup?.(
+			paymentHash.toString('hex')
+		);
+		const archivedChannel =
+			archived?.role === 'S'
+				? this.channels.get(archived.channelId)
+				: undefined;
+		const candidates = this.config.fforVoucherLookup
+			? archivedChannel
+				? [archivedChannel]
+				: []
+			: this.channels.values();
+		for (const channel of candidates) {
 			// Every state, ABORTED and CLOSED included: a hash from a book of
 			// ours is single-use (section 7.3) and a payment on it outside
 			// ACTIVE is failed upstream (section 7.5.6), never forwarded to R.
 			const record = channel.getFforEpoch();
 			if (!record || record.role !== 'S') continue;
+			if (archived && record.epochId.toString('hex') !== archived.epochId)
+				continue;
 			const idx = record.paymentHashes.findIndex((h) => h.equals(paymentHash));
 			if (idx < 0) continue;
 			const channelId = channel.getChannelId();

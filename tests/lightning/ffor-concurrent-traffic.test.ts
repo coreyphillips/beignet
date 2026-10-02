@@ -1104,23 +1104,12 @@ describe('FFOR concurrent receive: traffic (CONCURRENT-RECEIVE.md 3, 4, 6, 7)', 
 		}
 
 		it('S takes a valid voucher fulfil while ACTIVE, credits R in full, and the book stays open', () => {
-			// PR 2 gives R the caller; here the epoch's own settle is driven by
-			// hand, with the preimage R would have verified.
+			// Verified proof starts live redemption through the public API.
 			const pair = activePair();
 			const base = record(pair.rChannel).sHtlcIdBase!;
 			const t2 = record(pair.sChannel).preimages[1];
 			const learned = pair.rManager.fforAddPreimage(pair.channelId, t2);
 			expect(learned.ok, learned.error).to.equal(true);
-			// Knowing the preimage redeems nothing by itself in PR 1.
-			expect(vouchers(pair.rChannel).map(([, st]) => st)).to.deep.equal([
-				HtlcState.COMMITTED,
-				HtlcState.COMMITTED,
-				HtlcState.COMMITTED
-			]);
-			guard(pair.rChannel)._fforInternalSettle = true;
-			const res = pair.rManager.fulfillHtlc(pair.channelId, base + 1n, t2);
-			guard(pair.rChannel)._fforInternalSettle = false;
-			expect(res.ok, res.error).to.equal(true);
 			expectHealthy(pair, 'voucher 2 redeemed');
 			// Voucher 2 left both commitments and R was credited exactly d_2.
 			expect(vouchers(pair.rChannel).map(([key]) => key)).to.deep.equal([
