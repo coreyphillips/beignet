@@ -895,6 +895,18 @@ interface IPendingFundingTx {
 	broadcastSucceeded?: boolean;
 }
 
+/** A verified voucher credit whose payment write may need a live retry. */
+interface IFforVoucherCredit {
+	id: string;
+	channelId: Buffer;
+	paymentHash: Buffer;
+	preimage: Buffer;
+	amountMsat: bigint;
+	slot: number;
+	htlcId: bigint | null;
+	claimTxid?: string;
+}
+
 export class LightningNode extends EventEmitter {
 	private nodePrivkey: Buffer;
 	/** Genesis hashes of chains we operate on (for gossip chain-scoping). */
@@ -905,6 +917,7 @@ export class LightningNode extends EventEmitter {
 	private graph: NetworkGraph;
 	private peerManager: PeerManager | null = null;
 	private payments: Map<string, IPaymentInfo> = new Map();
+	private pendingFforVoucherCredits = new Map<string, IFforVoucherCredit>();
 	private preimages: Map<string, Buffer> = new Map();
 	// Hashes of settled incoming keysends that pruneCompletedPayments dropped
 	// from memory. Without an invoice, nothing else keeps the hash closed to a
@@ -2449,6 +2462,7 @@ export class LightningNode extends EventEmitter {
 				this.storage.setRecoveryMeta?.(REPAIR_TAIL_KEY, 'owed');
 			}
 			this.restoreFromStorage();
+			this.reconcileFforVoucherPayments();
 			// Channels and forward linkage are loaded: settle every held
 			// forward whose outcome those durable facts already decide.
 			this.asyncPaymentManager.reconcile();
@@ -19036,26 +19050,86 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * R, once the epoch closed: complete the incoming payment record of every
-	 * voucher whose preimage the drain fulfilled with, and announce it. A
-	 * voucher invoice is an ordinary invoice with an external hash, so it has
-	 * a PENDING incoming payment from the mint; the receiver never handles
-	 * the payer's HTLC (S settled it upstream), so nothing on the onion path
-	 * ever completed it, and the invoice list said PENDING for a voucher the
-	 * channel balance already carried (issue #876). The credit is the drain
-	 * round's fulfil, which is what CLOSED follows, so this is where the
-	 * receive is announced: payment:received and invoice:settled, the same
-	 * two a wallet's notifications listen for.
+	 * R: complete only vouchers whose durable removal fulfilled them. A
+	 * preimage or a CLOSED book alone is not evidence of received value.
 	 */
 	private fforSettleVoucherInvoices(
 		channelId: Buffer,
 		record: IFforEpochRecord
 	): void {
+		if (
+			!record.paymentHashes.some((hash, i) => {
+				const payment = this.payments.get(hash.toString('hex'));
+				return (
+					record.voucherOutcomes?.[i]?.outcome === 'fulfilled' &&
+					payment?.direction === PaymentDirection.INCOMING &&
+					payment.status !== PaymentStatus.COMPLETED
+				);
+			})
+		)
+			return;
+		if (this.storage) {
+			// State events carry a live object that re-entrant dispatch may
+			// have advanced beyond the last successful write.
+			let durable: IFforEpochRecord | null | undefined;
+			if (
+				!this.safeStorage(() => {
+					durable = this.storage!.loadChannel(channelId.toString('hex'))?.state
+						.ffor;
+				}, 'load voucher outcomes')
+			)
+				return;
+			if (!durable || !durable.epochId.equals(record.epochId)) return;
+			record = durable;
+		}
+		if (record.state !== FforState.CLOSED || record.role !== 'R') return;
 		record.paymentHashes.forEach((hash, i) => {
 			const preimage = record.knownPreimages[i];
-			if (!hash || !preimage) return;
+			if (
+				!hash ||
+				!preimage ||
+				record.voucherOutcomes?.[i]?.outcome !== 'fulfilled'
+			)
+				return;
 			this.fforCompleteVoucherPayment(channelId, record, i, preimage);
 		});
+	}
+
+	/** Retry a missed completion after restart or a failed payment write. */
+	private reconcileFforVoucherPayments(): void {
+		for (const credit of [...this.pendingFforVoucherCredits.values()]) {
+			if (credit.claimTxid) {
+				// Do not complete a deferred claim after its observation was
+				// reorged out or while the monitor still needs to reverify it.
+				const confirmed = this.channelManager
+					.getMonitor(credit.channelId)
+					?.getTrackedOutputs()
+					.some(
+						(output) =>
+							output.outputType === OutputType.RECEIVED_HTLC &&
+							output.htlcId === credit.htlcId &&
+							output.paymentHash?.equals(credit.paymentHash) &&
+							output.resolutionTxid === credit.claimTxid &&
+							!output.spendReverifyPending &&
+							output.confirmationHeight > 0 &&
+							(output.status === OutputStatus.SPEND_CONFIRMED ||
+								output.status === OutputStatus.IRREVOCABLY_RESOLVED)
+					);
+				if (!confirmed) continue;
+			}
+			this.fforApplyVoucherCredit(credit);
+		}
+		for (const channel of this.channelManager.listChannels()) {
+			const record = channel.getFforEpoch();
+			const channelId = channel.getChannelId();
+			if (
+				channelId &&
+				record?.role === 'R' &&
+				record.state === FforState.CLOSED
+			) {
+				this.fforSettleVoucherInvoices(channelId, record);
+			}
+		}
 	}
 
 	/**
@@ -19088,7 +19162,21 @@ export class LightningNode extends EventEmitter {
 		preimage: Buffer,
 		claimTxid?: string
 	): void {
-		const hash = record.paymentHashes[i];
+		this.fforApplyVoucherCredit({
+			id: `${channelId.toString('hex')}:${record.epochId.toString('hex')}:${i}`,
+			channelId: Buffer.from(channelId),
+			paymentHash: Buffer.from(record.paymentHashes[i]),
+			preimage: Buffer.from(preimage),
+			amountMsat: record.params.voucherAmountsMsat[i],
+			slot: i + 1,
+			htlcId:
+				record.sHtlcIdBase === null ? null : record.sHtlcIdBase + BigInt(i),
+			claimTxid
+		});
+	}
+
+	private fforApplyVoucherCredit(credit: IFforVoucherCredit): void {
+		const { paymentHash: hash, preimage, channelId, claimTxid } = credit;
 		const hashHex = hash.toString('hex');
 		const payment = this.payments.get(hashHex);
 		if (
@@ -19096,29 +19184,50 @@ export class LightningNode extends EventEmitter {
 			payment.direction !== PaymentDirection.INCOMING ||
 			payment.status === PaymentStatus.COMPLETED
 		) {
+			this.pendingFforVoucherCredits.delete(credit.id);
 			return;
 		}
-		payment.status = PaymentStatus.COMPLETED;
-		payment.preimage = Buffer.from(preimage);
-		payment.completedAt = Date.now();
-		payment.amountMsat = record.params.voucherAmountsMsat[i];
+		const completed: IPaymentInfo = {
+			...payment,
+			status: PaymentStatus.COMPLETED,
+			preimage: Buffer.from(preimage),
+			completedAt: Date.now(),
+			amountMsat: credit.amountMsat
+		};
 		// The voucher HTLC on our side, so a restart redispatch knows the
 		// completed hash was settled by exactly it.
-		if (record.sHtlcIdBase !== null) {
-			payment.settledHtlcs = [
-				`${channelId.toString('hex')}:${record.sHtlcIdBase + BigInt(i)}`
+		if (credit.htlcId !== null) {
+			completed.settledHtlcs = [
+				`${channelId.toString('hex')}:${credit.htlcId}`
 			];
 		}
 		if (claimTxid) {
-			payment.metadata = { ...payment.metadata, claimTxid };
+			completed.metadata = { ...payment.metadata, claimTxid };
 		}
-		this.safeStorage(() => this.persistPayment(hash), 'persistPayment');
-		this.emit('payment:received', payment);
-		this.emitInvoiceSettled(hash, payment);
+		if (
+			!this.commitMutations(
+				'Failed to persist voucher payment',
+				[
+					{
+						type: 'payment_state',
+						paymentHash: hashHex,
+						payment: completed
+					}
+				],
+				RecoveryCriticality.SafetyCritical
+			)
+		) {
+			this.pendingFforVoucherCredits.set(credit.id, credit);
+			return;
+		}
+		this.pendingFforVoucherCredits.delete(credit.id);
+		this.payments.set(hashHex, completed);
+		this.emit('payment:received', completed);
+		this.emitInvoiceSettled(hash, completed);
 		this.emitStructuredLog('payment', 'received', {
 			paymentHash: hashHex,
 			fforVoucher: 'true',
-			slot: String(i + 1),
+			slot: String(credit.slot),
 			...(claimTxid ? { claimTxid } : {})
 		});
 	}
@@ -27038,6 +27147,7 @@ export class LightningNode extends EventEmitter {
 		// block (issue #760): the peer may simply have been behind the chain.
 		this.resendSpliceConflicts();
 		this.retryFailedTerminalPersists();
+		this.reconcileFforVoucherPayments();
 		this.retrySpliceCloseRedrives();
 		this.retryPendingOutputWatches();
 		// Funding checks a backend outage paused (issue #1105).

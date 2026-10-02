@@ -153,6 +153,15 @@ export interface IFforBookEntry {
 	sHtlcId: bigint;
 }
 
+/** Receiver-side evidence that a voucher left both commitment views. */
+export interface IFforVoucherOutcome {
+	outcome: 'fulfilled' | 'cancelled';
+	/** The local signature that removes the retained voucher output. */
+	localCommitmentNumber: bigint;
+	/** The peer has revoked its voucher-bearing commitment at this boundary. */
+	remoteCommitmentNumber: bigint;
+}
+
 /**
  * The durable epoch record (section 7.5.5 "Durable"): everything a restart
  * with the peer offline needs to serve every later transition from disk.
@@ -201,6 +210,12 @@ export interface IFforEpochRecord {
 	settledBitmap: Buffer | null;
 	/** R: preimages learned from the ack, a payer or a witness, by slot. */
 	knownPreimages: (Buffer | null)[];
+	/**
+	 * R: observed terminal removals, recorded only after both commitment
+	 * views remove the voucher. Missing evidence is unknown, including on
+	 * legacy CLOSED records. Learning a preimage never changes an outcome.
+	 */
+	voucherOutcomes?: (IFforVoucherOutcome | null)[];
 	/**
 	 * R: which slots' invoices have been exposed (section 9.5.4: a chained
 	 * book serves invoices strictly in ascending level order, and a slot is

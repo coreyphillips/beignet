@@ -1136,6 +1136,11 @@ export interface ISerializedFforEpoch {
 	slotUpstream: (string | null)[];
 	settledBitmap: string | null;
 	knownPreimages: (string | null)[];
+	voucherOutcomes?: ({
+		outcome: 'fulfilled' | 'cancelled';
+		localCommitmentNumber: string;
+		remoteCommitmentNumber: string;
+	} | null)[];
 	/** Absent on records written before the field existed: no slot exposed. */
 	exposedSlots?: boolean[];
 	/** Absent on records written before the field existed: no issuer. */
@@ -1219,6 +1224,19 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 		slotUpstream: [...f.slotUpstream],
 		settledBitmap: bufToHex(f.settledBitmap),
 		knownPreimages: f.knownPreimages.map((p) => bufToHex(p)),
+		...(f.voucherOutcomes
+			? {
+					voucherOutcomes: f.voucherOutcomes.map((o) =>
+						o
+							? {
+									outcome: o.outcome,
+									localCommitmentNumber: bigintToStr(o.localCommitmentNumber),
+									remoteCommitmentNumber: bigintToStr(o.remoteCommitmentNumber)
+							  }
+							: null
+					)
+			  }
+			: {}),
 		exposedSlots: [...f.exposedSlots],
 		issuerProvisioned: f.issuerProvisioned,
 		witnesses: f.witnesses.map((w) => ({
@@ -1353,6 +1371,24 @@ export function deserializeFforEpoch(
 		slotUpstream: [...s.slotUpstream],
 		settledBitmap: hexToBuf(s.settledBitmap),
 		knownPreimages: s.knownPreimages.map((p) => hexToBuf(p)),
+		...(s.voucherOutcomes
+			? {
+					voucherOutcomes: s.voucherOutcomes.map((o) => {
+						if (o === null) return null;
+						if (
+							(o.outcome !== 'fulfilled' && o.outcome !== 'cancelled') ||
+							!/^\d+$/.test(o.localCommitmentNumber) ||
+							!/^\d+$/.test(o.remoteCommitmentNumber)
+						)
+							throw new Error('Invalid FFOR voucher outcome');
+						return {
+							outcome: o.outcome,
+							localCommitmentNumber: strToBigint(o.localCommitmentNumber),
+							remoteCommitmentNumber: strToBigint(o.remoteCommitmentNumber)
+						};
+					})
+			  }
+			: {}),
 		exposedSlots: s.exposedSlots ?? s.knownPreimages.map(() => false),
 		issuerProvisioned: s.issuerProvisioned === true,
 		witnesses: (s.witnesses ?? []).map((w) => ({

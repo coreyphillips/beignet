@@ -5378,6 +5378,7 @@ export class Channel {
 		// And the received removals it no longer carries: the peer signed this
 		// commitment after revoking for them, so the outputs kept for the
 		// previous signature are not in the commitment we now hold.
+		this._fforRecordVoucherOutcomes();
 		this._state.signedLocalRemovals = undefined;
 
 		// Two-phase update_fee, acceptor side: this commitment_signed from the
@@ -25384,6 +25385,35 @@ export class Channel {
 		return Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 	}
 
+	/**
+	 * The verified local signature has removed these retained outputs. The
+	 * peer already revoked their removals, so both views now agree on the
+	 * economic outcome. Record it before discarding the retained entries.
+	 */
+	private _fforRecordVoucherOutcomes(): void {
+		const f = this._state.ffor;
+		if (!f || f.role !== 'R') return;
+		const book = this._fforBook(f);
+		for (const entry of this._state.signedLocalRemovals ?? []) {
+			if (
+				entry.direction !== HtlcDirection.RECEIVED ||
+				!entry.fforVoucher ||
+				(entry.state !== HtlcState.FULFILLED &&
+					entry.state !== HtlcState.FAILED)
+			)
+				continue;
+			const slot = matchVoucher(book, entry);
+			if (!slot || f.voucherOutcomes?.[slot.k - 1]) continue;
+			f.voucherOutcomes ??= f.paymentHashes.map(() => null);
+			f.voucherOutcomes[slot.k - 1] = {
+				outcome:
+					entry.state === HtlcState.FULFILLED ? 'fulfilled' : 'cancelled',
+				localCommitmentNumber: this._state.localCommitmentNumber + 1n,
+				remoteCommitmentNumber: this._remoteRevocationCount()
+			};
+		}
+	}
+
 	/** Section 7.5.1: CLOSED once no voucher remains in either commitment. */
 	private _fforMaybeClosed(
 		f: IFforEpochRecord,
@@ -25615,11 +25645,6 @@ export class Channel {
 				message: 'FFOR: ff_close_ack differs from the one processed',
 				cleanup: 'none'
 			};
-			if (f.state !== FforState.DRAINING) {
-				// The book has CLOSED: every voucher is resolved, and there is
-				// nothing left to claim or to dispute.
-				return [differs];
-			}
 			// S signed two different final acknowledgements for one epoch (it
 			// came back from a row that predates a settlement, or worse). The
 			// second is refused: its bitmap replaces nothing, and a chain held
@@ -25639,7 +25664,11 @@ export class Channel {
 			}
 			const withdrew = this._fforWithdrawFails(f, false);
 			let disputed = false;
-			if (this._fforIsConcurrent(f) && !f.activationMismatch) {
+			if (
+				f.state === FforState.DRAINING &&
+				this._fforIsConcurrent(f) &&
+				!f.activationMismatch
+			) {
 				// A concurrent epoch would otherwise go on taking ordinary
 				// work into a round it cannot sign, so the dispute is
 				// recorded: no new add of ours (fforAdmissionHold), no settle
