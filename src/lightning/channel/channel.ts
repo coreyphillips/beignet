@@ -26109,7 +26109,9 @@ export class Channel {
 	 * auto-sign makes all join the chain in the order they were made. The
 	 * channel's state has advanced as if they were sent, exactly as for a
 	 * message written to a socket that then dies, so a disconnect needs no
-	 * unwinding: the next reestablish retransmits from that state.
+	 * unwinding: the next reestablish retransmits from that state. (An
+	 * update of ours first takes a held commitment_signed back, so the
+	 * signature that then joins covers it: _fforReopenHeldCommitment.)
 	 *
 	 * Everything else in the batch (the persist, the events, the epoch's own
 	 * messages, a wire error) is untouched.
