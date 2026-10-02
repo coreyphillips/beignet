@@ -37,6 +37,12 @@ import {
 import { IPaymentInfo, PaymentStatus, PaymentDirection } from '../node/types';
 import { IChainMonitorState } from '../chain/chain-monitor';
 import { IGraphChannel, IGraphNode } from '../gossip/types';
+import {
+	ICompactHtlcHistory,
+	encodeHtlcHistory,
+	decodeHtlcHistory,
+	usesCompactHtlcHistory
+} from './htlc-history';
 
 // ─── Primitive helpers ───
 
@@ -430,6 +436,7 @@ export interface ISerializedChannelState {
 	signedLocalRemovals?: ISerializedHtlcEntry[];
 	/** Per-remote-commitment HTLC snapshots for penalty completeness (H2). */
 	revokedHtlcSnapshots?: ISerializedHtlcSnapshot[];
+	compactHtlcHistory?: ICompactHtlcHistory;
 	/**
 	 * Unrevoked remote commitment txs kept for watchtower backups. A point
 	 * repeats once per funding output it was signed over.
@@ -867,7 +874,8 @@ export function deserializeV2InFlight(s: ISerializedV2InFlight): IV2InFlight {
 }
 
 export function serializeChannelState(
-	s: IChannelState
+	s: IChannelState,
+	options: { legacyHtlcHistory?: boolean } = {}
 ): ISerializedChannelState {
 	const htlcs: ISerializedHtlcEntry[] = [];
 	for (const [key, entry] of s.htlcs) {
@@ -875,7 +883,13 @@ export function serializeChannelState(
 	}
 
 	let revokedHtlcSnapshots: ISerializedHtlcSnapshot[] | undefined;
-	if (s.revokedHtlcSnapshots && s.revokedHtlcSnapshots.size > 0) {
+	const compactHistory =
+		!options.legacyHtlcHistory && usesCompactHtlcHistory(s);
+	if (
+		!compactHistory &&
+		s.revokedHtlcSnapshots &&
+		s.revokedHtlcSnapshots.size > 0
+	) {
 		revokedHtlcSnapshots = [];
 		for (const [commitmentNumber, entries] of s.revokedHtlcSnapshots) {
 			revokedHtlcSnapshots.push({
@@ -944,6 +958,9 @@ export function serializeChannelState(
 			  )
 			: undefined,
 		revokedHtlcSnapshots,
+		...(compactHistory
+			? { compactHtlcHistory: encodeHtlcHistory(s.revokedHtlcSnapshots) }
+			: {}),
 		watchtowerRemoteCommitmentTxs: s.watchtowerRemoteCommitmentTxs?.size
 			? [...s.watchtowerRemoteCommitmentTxs].flatMap(([point, txs]) =>
 					txs.map((tx) => ({ point, tx: tx.toString('hex') }))
@@ -1500,6 +1517,11 @@ export function deserializeChannelState(
 	}
 
 	let revokedHtlcSnapshots: Map<string, IHtlcSnapshotEntry[]> | undefined;
+	if (s.compactHtlcHistory !== undefined) {
+		if (s.revokedHtlcSnapshots !== undefined)
+			throw new Error('Conflicting HTLC history encodings');
+		revokedHtlcSnapshots = decodeHtlcHistory(s.compactHtlcHistory);
+	}
 	if (s.revokedHtlcSnapshots && s.revokedHtlcSnapshots.length > 0) {
 		revokedHtlcSnapshots = new Map();
 		for (const snap of s.revokedHtlcSnapshots) {
@@ -1571,6 +1593,10 @@ export function deserializeChannelState(
 			? s.signedLocalRemovals.map((h) => deserializeHtlcEntry(h).entry)
 			: undefined,
 		revokedHtlcSnapshots,
+		...(s.compactHtlcHistory !== undefined ||
+		isFforConcurrentVersion(s.ffor?.concurrentVersion)
+			? { compactHtlcHistory: true as const }
+			: {}),
 		watchtowerRemoteCommitmentTxs: s.watchtowerRemoteCommitmentTxs?.length
 			? s.watchtowerRemoteCommitmentTxs.reduce(
 					(cache, e) =>

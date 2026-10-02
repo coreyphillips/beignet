@@ -1861,7 +1861,7 @@ describe('Recovery phase 2: authenticated snapshot schema at the write boundary'
 		// An AEAD-valid frame at sequence 2 whose plaintext this release's
 		// decodeFrame refuses (unsupported frame version).
 		const plaintext = Buffer.from(
-			JSON.stringify({ version: 2, shape: 'from the future' }),
+			JSON.stringify({ version: 3, shape: 'from the future' }),
 			'utf8'
 		);
 		const frameHash = hashFrame(plaintext);

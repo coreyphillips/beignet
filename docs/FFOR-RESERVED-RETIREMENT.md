@@ -114,6 +114,27 @@ preserves the strict reservation profile and quarantines new commitment updates.
 Downgrading a live concurrent database to an older binary is unsupported. Older
 direct database readers cannot be made safe by checks in the new binary.
 
+Once a concurrent book is adopted, the channel persists revoked HTLC history as
+a dictionary of complete `(paymentHash, amountMsat, cltvExpiry, direction)` tuples
+and ordered changes between commitment snapshots. This encoding retains every
+snapshot, including empty snapshots and repeated entries. It remains selected
+after retirement and later baseline books. The in-memory snapshots and the chain
+resolver continue to use independent HTLC entries with the original identities.
+Channels that have never adopted concurrent receive retain their existing format.
+
+Compact history uses recovery frame version 2 and snapshot schema
+`2+ffor-vouchers+htlc-history`, with `+pages` when payment rows are paged. Earlier
+recovery readers reject these formats. Version 1 frames still decode and re-encode
+byte for byte, and their next channel write upgrades the history without removing
+evidence. The frame key derivation and encrypted transport envelope do not change.
+
+The positive growth check measures ten ordinary payments with 2, 16 and 128 live
+vouchers. History growth falls from 9,641 / 51,361 / 385,121 bytes to
+2,628 / 2,656 / 2,686 bytes respectively. This removes repeated voucher tuples
+from each stored commitment. History still grows with channel activity, and its
+expanded in-memory representation is unchanged. This is lossless compression,
+not a pruning policy or a bound on a channel's lifetime storage.
+
 Before enabling this profile by default, the remaining qualification includes the
 full commitment and chain crash matrix on regtest, and daemon/coordinator integration.
 The focused in-process checks do not substitute for those release gates.
