@@ -3341,6 +3341,19 @@ export class Channel {
 			return [{ type: ChannelActionType.ERROR, message: funderRefusal }];
 		}
 
+		// FFOR concurrent receive: while a voucher book is live the funder,
+		// whichever side that is, keeps the fee-spike buffer over the whole
+		// mixed commitment (CONCURRENT-RECEIVE.md section 3.1). The ceiling
+		// above already folds this in (_fforMixedBufferCeilingMsat), so an
+		// amount past it has met "Insufficient balance"; asked again here so
+		// the rule holds at the admission point whatever the ceiling says.
+		const mixedBufferRefusal = this._fforMixedBufferRefusal([
+			{ amountMsat, direction: HtlcDirection.OFFERED }
+		]);
+		if (mixedBufferRefusal) {
+			return [{ type: ChannelActionType.ERROR, message: mixedBufferRefusal }];
+		}
+
 		// Cap total dust-HTLC exposure (BOLT 2 recommendation): dust HTLCs are
 		// trimmed from the commitment, so at force-close their full value goes
 		// to miner fees. Bound the worst case.
@@ -3695,6 +3708,22 @@ export class Channel {
 				}
 				funderFeeFailback = true;
 			}
+		}
+
+		// FFOR concurrent receive (CONCURRENT-RECEIVE.md section 3.1): while a
+		// voucher book is live the funder keeps the fee-spike buffer over the
+		// full mixed commitment, whoever funds and whoever adds. A peer add
+		// that breaks it is new work to reject, but never by failing the
+		// channel: that would cost the vouchers the channel they live on. It
+		// is admitted and stamped for the same fail-back as the funder-fee
+		// band above, which the node sends once the add is committed.
+		if (
+			!funderFeeFailback &&
+			this._fforMixedBufferRefusal([
+				{ amountMsat: msg.amountMsat, direction: HtlcDirection.RECEIVED }
+			]) !== null
+		) {
+			funderFeeFailback = true;
 		}
 
 		// The dust-exposure ceiling is deliberately NOT enforced here. BOLT 2
@@ -4752,6 +4781,12 @@ export class Channel {
 						return this._failChannelWithWireError(splicedTrimmed);
 					}
 				}
+				// FFOR concurrent receive, the voucher-subset invariant
+				// (CONCURRENT-RECEIVE.md section 4): never sign the peer a
+				// commitment that has dropped an unresolved voucher. Refused
+				// before anything is written, like the backstop above.
+				const subset = this._fforVoucherSubsetRefusal('remote', point, number);
+				if (subset) return this._failChannelWithWireError(subset);
 			}
 		}
 
@@ -5226,6 +5261,21 @@ export class Channel {
 				// BOLT 2: MUST fail the channel (see above).
 				return this._failChannelWithWireError('Invalid HTLC signature');
 			}
+
+			// FFOR concurrent receive, the voucher-subset invariant
+			// (CONCURRENT-RECEIVE.md section 4): the commitment these
+			// signatures cover must still carry every unresolved voucher, or
+			// the revoke_and_ack below would give up the one that does.
+			// Checked once the signatures verify and before anything is
+			// stored, so a refusal leaves the commitment we hold, and the
+			// signature that goes with it, untouched. FFOR does not run on
+			// taproot channels, so the arm above needs no twin.
+			const subset = this._fforVoucherSubsetRefusal(
+				'local',
+				nextPerCommitmentPoint,
+				nextCommitmentNumber
+			);
+			if (subset) return this._failChannelWithWireError(subset);
 
 			// Store remote's signature
 			this._state.remoteCommitmentSignature = msg.signature;
@@ -13919,8 +13969,10 @@ export class Channel {
 		}
 		// When the peer funds, its commitment fee bounds what we may add too
 		// (issue #1020): fold the mirror in so the router never offers a
-		// channel whose add _remoteFunderFeeRefusal then refuses.
-		return this._remoteFunderCeilingMsat(own);
+		// channel whose add _remoteFunderFeeRefusal then refuses. The same
+		// for the buffer a live concurrent voucher book adds on top
+		// (_fforMixedBufferRefusal); unchanged when there is none.
+		return this._fforMixedBufferCeilingMsat(this._remoteFunderCeilingMsat(own));
 	}
 
 	/**
@@ -14206,6 +14258,16 @@ export class Channel {
 		}
 		if (sum > this.getSpendableOutboundMsat()) return false;
 		if (this._remoteFunderFeeRefusal(amounts)) return false;
+		if (
+			this._fforMixedBufferRefusal(
+				amounts.map((amountMsat) => ({
+					amountMsat,
+					direction: HtlcDirection.OFFERED
+				}))
+			)
+		) {
+			return false;
+		}
 		if (
 			dust > 0n &&
 			this._dustExposureMsat() + dust > Channel.MAX_DUST_HTLC_EXPOSURE_MSAT
@@ -22959,6 +23021,243 @@ export class Channel {
 				// DRAINING: the drain. ABORTED: the unwind.
 				return null;
 		}
+	}
+
+	/**
+	 * The voucher-subset invariant (CONCURRENT-RECEIVE.md section 4): every
+	 * commitment of a concurrent ACTIVE or DRAINING epoch preserves each
+	 * unresolved voucher's direction, id, hash, amount and expiry. Returns
+	 * why the commitment about to be signed (`remote`) or accepted (`local`)
+	 * does not, or null.
+	 *
+	 * For every slot it requires the keyed entry (received on R, offered on
+	 * S) to exist as a voucher with the book's tuple, unless the slot may be
+	 * absent (_fforSlotMayBeAbsent); and it requires the built commitment to
+	 * carry, for every such entry with no removal in flight, an untrimmed
+	 * output of that direction, hash, amount and expiry. Ordinary HTLCs may
+	 * sit beside them: this is a subset rule, not the exact count the
+	 * activation checks.
+	 *
+	 * Both builders read the same HTLC map, so this cannot be failed by a
+	 * peer: it is an assertion over our own state, catching a local fault or
+	 * a trimmed voucher before a signature or a revocation makes it
+	 * permanent. A refusal fails the channel on the wire with nothing signed,
+	 * stored or revoked, so the commitments we hold still carry the vouchers.
+	 */
+	private _fforVoucherSubsetRefusal(
+		view: 'local' | 'remote',
+		perCommitmentPoint: Buffer,
+		commitmentNumber: bigint
+	): string | null {
+		const f = this._fforLive();
+		if (!f || !this._fforIsConcurrent(f)) return null;
+		if (f.state !== FforState.ACTIVE && f.state !== FforState.DRAINING) {
+			return null;
+		}
+		const direction =
+			f.role === 'R' ? HtlcDirection.RECEIVED : HtlcDirection.OFFERED;
+		const tuple = (hash: Buffer, amountSat: bigint, expiry: number): string =>
+			`${hash.toString('hex')}:${amountSat}:${expiry}`;
+		const required = new Map<string, number>();
+		for (const slot of this._fforBook(f)) {
+			const entry = this._state.htlcs.get(this._fforVoucherKey(f, slot.k));
+			if (!entry || entry.fforVoucher !== true) {
+				if (this._fforSlotMayBeAbsent(f, slot.k)) continue;
+				return `FFOR voucher ${slot.k} is unresolved and missing from the channel`;
+			}
+			if (
+				entry.direction !== direction ||
+				entry.id !== slot.sHtlcId ||
+				!entry.paymentHash.equals(slot.paymentHash) ||
+				entry.amountMsat !== slot.amountMsat ||
+				entry.cltvExpiry !== slot.voucherExpiry
+			) {
+				return `FFOR voucher ${slot.k} no longer matches the book`;
+			}
+			// A fulfil or fail in flight is the authorized transition: the
+			// output may already be gone from this view.
+			if (entry.state !== HtlcState.COMMITTED) continue;
+			const key = tuple(
+				slot.paymentHash,
+				slot.amountMsat / 1000n,
+				slot.voucherExpiry
+			);
+			required.set(key, (required.get(key) ?? 0) + 1);
+		}
+		if (required.size === 0) return null;
+		let built: IBuiltCommitment;
+		try {
+			built =
+				view === 'local'
+					? buildLocalCommitment(
+							this._state,
+							perCommitmentPoint,
+							commitmentNumber
+					  )
+					: buildRemoteCommitment(
+							this._state,
+							perCommitmentPoint,
+							commitmentNumber
+					  );
+		} catch {
+			// Unbuildable here is unbuildable at the signing or verifying step
+			// beside this one, which answers with its own reason.
+			return null;
+		}
+		const carried = new Map<string, number>();
+		for (const out of built.htlcOutputs) {
+			if (out.direction !== direction) continue;
+			const key = tuple(out.paymentHash, out.amount, out.cltvExpiry);
+			carried.set(key, (carried.get(key) ?? 0) + 1);
+		}
+		for (const [key, count] of required) {
+			if ((carried.get(key) ?? 0) < count) {
+				return `FFOR: the ${view} commitment does not carry every unresolved voucher`;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Whether slot k's voucher may be gone from the channel under an
+	 * authorized transition (CONCURRENT-RECEIVE.md sections 4, 6 and 7).
+	 *
+	 * R removes a voucher only by fulfilling it, which needs its preimage,
+	 * or by failing it in DRAINING when the ff_close_ack marks it unsettled.
+	 * So on R a slot with neither a held preimage nor a clear bit of a
+	 * final acknowledgement must still be there.
+	 *
+	 * S cannot tell from this record: it accepts a valid fulfil whatever
+	 * its own slot accounting says, and keeps no note of having done so.
+	 * Interim: PR 2's terminal slot records replace this derivation on both
+	 * sides and close that gap on S.
+	 */
+	private _fforSlotMayBeAbsent(f: IFforEpochRecord, k: number): boolean {
+		if (f.role !== 'R') return true;
+		if (f.knownPreimages[k - 1]) return true;
+		return (
+			f.state === FforState.DRAINING &&
+			f.settledBitmap !== null &&
+			!bitmapGet(f.settledBitmap, k)
+		);
+	}
+
+	/**
+	 * The concurrent epoch whose voucher book puts the mixed-commitment
+	 * fee-spike buffer in force, if any: ACTIVE or DRAINING with at least
+	 * one voucher still on the channel.
+	 */
+	private _fforMixedBufferEpoch(): IFforEpochRecord | null {
+		const f = this._fforLive();
+		if (!f || !this._fforIsConcurrent(f)) return null;
+		if (f.state !== FforState.ACTIVE && f.state !== FforState.DRAINING) {
+			return null;
+		}
+		return this._fforVoucherEntries(f).size > 0 ? f : null;
+	}
+
+	/**
+	 * What the funder holds above its reserve, and what it pays for, over
+	 * the full mixed commitment with `candidates` added: every HTLC output
+	 * either commitment carries (the dearest reading,
+	 * _funderConservativeView, which counts outputs whoever funds) and the
+	 * candidates, against the funder's LIVE balance less what the
+	 * candidates draw from it (an add comes out of its offerer's balance).
+	 * The live balance already excludes every HTLC still in flight, the
+	 * vouchers included, so the voucher value is charged once.
+	 */
+	private _fforMixedBufferView(
+		candidates: { amountMsat: bigint; direction: HtlcDirection }[]
+	): { headroomMsat: bigint; untrimmed: number; feeratePerKw: number } {
+		const weFund = this._state.role === ChannelRole.OPENER;
+		const outputs = this._funderConservativeView(candidates);
+		let drawnMsat = 0n;
+		for (const c of candidates) {
+			if ((c.direction === HtlcDirection.OFFERED) === weFund) {
+				drawnMsat += c.amountMsat;
+			}
+		}
+		return {
+			headroomMsat: weFund
+				? this._funderHeadroomMsat(
+						this._state.localBalanceMsat + outputs.creditMsat - drawnMsat
+				  )
+				: this._remoteFunderHeadroomMsat(
+						this._state.remoteBalanceMsat - drawnMsat
+				  ),
+			untrimmed: outputs.untrimmed,
+			feeratePerKw: Math.max(
+				getLocalCommitmentFeeRate(this._state),
+				getRemoteCommitmentFeeRate(this._state)
+			)
+		};
+	}
+
+	/**
+	 * CONCURRENT-RECEIVE.md section 3.1 with base section 7.6: while a
+	 * concurrent voucher book is live, the funder keeps above its reserve
+	 * the commitment cost at TWICE the feerate for the full mixed
+	 * commitment, not only for the K vouchers the setup checked. Returns
+	 * why `candidates` would break that, or null.
+	 *
+	 * The stock add path holds this buffer only when we fund and we add
+	 * (getSpendableOutboundMsat) and prices the other three cases at the
+	 * live rate. The book makes it mandatory in all four: the vouchers stay
+	 * until T_exp, update_fee is refused while they do, and a funder that
+	 * kept only the live fee could not afford a force close after a fee
+	 * rise. Our own add is refused locally; a peer add is stamped for a
+	 * fail-back once committed (handleUpdateAddHtlc), never failed on the
+	 * wire. Either way no voucher is touched.
+	 */
+	private _fforMixedBufferRefusal(
+		candidates: { amountMsat: bigint; direction: HtlcDirection }[]
+	): string | null {
+		if (!this._fforMixedBufferEpoch()) return null;
+		const view = this._fforMixedBufferView(candidates);
+		if (
+			view.headroomMsat >=
+			this._funderCostMsat(view.feeratePerKw * 2, view.untrimmed)
+		) {
+			return null;
+		}
+		return 'FFOR voucher book is live: the funder cannot keep the fee-spike buffer over the commitment with this HTLC';
+	}
+
+	/**
+	 * The outbound ceiling folded with _fforMixedBufferRefusal, so the
+	 * router never selects an add it then refuses: the largest single add
+	 * of ours the buffer admits, at most `spendableMsat`. When we fund, the
+	 * add comes out of the balance that pays the fee; when the peer funds,
+	 * it only adds an output, so the answer is all, a trimmed amount or
+	 * nothing. Unchanged when no concurrent book is live.
+	 */
+	private _fforMixedBufferCeilingMsat(spendableMsat: bigint): bigint {
+		if (!this._fforMixedBufferEpoch()) return spendableMsat;
+		const weFund = this._state.role === ChannelRole.OPENER;
+		const view = this._fforMixedBufferView([]);
+		const costWith = (extra: number): bigint =>
+			this._funderCostMsat(view.feeratePerKw * 2, view.untrimmed + extra);
+		const room = (costMsat: bigint): bigint =>
+			weFund
+				? view.headroomMsat - costMsat
+				: view.headroomMsat >= costMsat
+				? spendableMsat
+				: -1n;
+		// The smallest amount that is an output on a commitment: the lower
+		// dust limit, as _funderConservativeView counts. An epoch runs only
+		// on an anchor channel, where no second-level fee enters the trim.
+		const outputFloorMsat =
+			bigIntMin(
+				this._state.localConfig.dustLimitSatoshis,
+				this._state.remoteConfig.dustLimitSatoshis
+			) * 1000n;
+		const asOutput = room(costWith(1));
+		let ceilingMsat =
+			asOutput >= outputFloorMsat
+				? asOutput
+				: bigIntMin(room(costWith(0)), outputFloorMsat - 1n);
+		if (ceilingMsat < 0n) ceilingMsat = 0n;
+		return ceilingMsat < spendableMsat ? ceilingMsat : spendableMsat;
 	}
 
 	/**
