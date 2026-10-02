@@ -851,17 +851,25 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 		});
 
 		// Issue #1303 (one failed durable write, then a write that lands) at
-		// the one write the fix added: the release leads with its own persist,
-		// and when that write fails the whole chain is withheld and dropped
-		// while the hold is already cleared. Anything R sends before the
-		// forced disconnect then leaves ahead of a chain that never left.
-		it("PIN [#1303] the write of the release fails once: the chain is dropped with the hold already cleared, R's next revoke_and_ack leaves alone, and the reconnect fails the channel", () => {
+		// the one write the round 1 fix added: the release leads with its own
+		// persist. This review pinned what happened when that write failed:
+		// the whole chain was withheld and dropped while the hold was already
+		// cleared, so anything R sent before the forced disconnect left ahead
+		// of a chain that never left, and the reconnect failed the channel.
+		//
+		// Fixed for the release (the general #1303 is not): a failed write
+		// takes the release back. The hold stands again with the chain
+		// intact, what R makes before the disconnect joins it, and the
+		// reestablish retransmits everything in order.
+		it("the write of the release fails once: the hold stands again with the chain intact, R's next revoke_and_ack waits behind it, and the reconnect drains", () => {
 			const { pair } = sLostTheClose([2]);
 			pair.link.holdAt = (from, type): boolean =>
 				from === 'S' && type === MessageType.FF_CLOSE_ACK;
 			pair.link.reconnect();
 			pair.link.holdAt = null;
+			const chain = heldTypes(pair.rChannel);
 			let failed = 0;
+			let blocked = 0;
 			pair.rManager.on(
 				'channel:persist',
 				(ev: { request?: { committed: boolean } }) => {
@@ -871,19 +879,26 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 					}
 				}
 			);
+			pair.rManager.on('transition:blocked', () => blocked++);
 			pair.link.release('S');
 			expect(failed).to.equal(1);
-			expect(holding(pair.rChannel)).to.equal(false);
+			expect(blocked, 'the node is asked to drop the connection').to.equal(1);
+			expect(holding(pair.rChannel)).to.equal(true);
+			expect(heldTypes(pair.rChannel)).to.deep.equal(chain);
 			expect(sentBy(pair, 'R')).to.not.include(MessageType.COMMITMENT_SIGNED);
 			// Before the node's deferred disconnect, S forwards a payment.
 			const add = offer(pair, 'S', 2_000_000n);
 			expect(add.result.ok, add.result.error).to.equal(true);
-			expect(sentBy(pair, 'R')).to.include(MessageType.REVOKE_AND_ACK);
+			expect(sentBy(pair, 'R')).to.not.include(MessageType.REVOKE_AND_ACK);
+			expect(heldTypes(pair.rChannel)).to.deep.equal([
+				...chain,
+				MessageType.REVOKE_AND_ACK
+			]);
 			interrupt(pair, 'disconnect');
 			pair.link.reconnect();
-			// Today. Once #1303 is fixed: expectAlive and expectClosed.
-			expect(pair.sChannel.getState()).to.equal(ChannelState.ERRORED);
-			expect(pair.sErrors.join('|')).to.match(/Invalid commitment signature/);
+			expectAlive(pair, 'reconnected');
+			expectClosed(pair, 'reconnected');
+			expect(pair.events.R.forwarded).to.include(add.id);
 		});
 	});
 

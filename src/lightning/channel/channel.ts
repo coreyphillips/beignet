@@ -990,6 +990,15 @@ export class Channel {
 	 */
 	private _fforHeldReplay: ChannelAction[] = [];
 	/**
+	 * FFOR (R, DRAINING): the stream the last release handed to the dispatch,
+	 * until the write that leads it is known to have landed. If that write
+	 * fails the dispatch withholds every message of it, and the hold stands
+	 * again with this as its chain (fforNoteStateWritten), so nothing made
+	 * afterwards on this connection leaves ahead of what never left.
+	 * Memory-only.
+	 */
+	private _fforReleasedStream: ChannelAction[] | null = null;
+	/**
 	 * FFOR concurrent receive: setFforCapabilities changed the record's
 	 * capability hold and no durable write has carried the change yet. Every
 	 * reestablish asks for that write while this is set, whether or not it
@@ -9470,6 +9479,7 @@ export class Channel {
 		this._fforStfuReplyStale = false;
 		this._fforHolding = false;
 		this._fforHeldReplay = [];
+		this._fforReleasedStream = null;
 		this._state.quiescenceState = QuiescenceState.NORMAL;
 		this._state.quiescenceInitiator = false;
 
@@ -11337,6 +11347,7 @@ export class Channel {
 		// holding from the retransmission cache, a revoke_and_ack likewise.
 		this._fforHolding = false;
 		this._fforHeldReplay = [];
+		this._fforReleasedStream = null;
 		const fforActions = this._handleReestablishFfor(msg);
 		if (this._fforAckLeadsReplay(fforActions)) {
 			// A concurrent S that owes R its ff_activate_ack again may also
@@ -25367,7 +25378,18 @@ export class Channel {
 				const held = this._fforReleaseHeld();
 				// The peer holds the close again: voucher fails may flow.
 				this._fforPeerLacksClose = false;
-				return [...held, ...this._fforDrain(f)];
+				const released = [...held, ...this._fforDrain(f)];
+				if (held.length > 0) {
+					// Remembered until the leading write is known to have
+					// landed, the re-driven drain included: it is part of what
+					// a failed write withholds.
+					this._fforReleasedStream = released.filter(
+						(a) =>
+							a.type === ChannelActionType.SEND_MESSAGE &&
+							FFOR_HELD_STREAM_TYPES.has(a.messageType)
+					);
+				}
+				return released;
 			}
 			const differs: ChannelAction = {
 				type: ChannelActionType.ERROR,
@@ -25766,11 +25788,25 @@ export class Channel {
 	/**
 	 * The manager's dispatch reports what became of a durable write of this
 	 * channel's state. A write that landed carried everything in the record,
-	 * so nothing of it is still owed to storage.
+	 * so nothing of it is still owed to storage, and a release it led is
+	 * final. A write that failed takes back the release it led.
 	 */
 	fforNoteStateWritten(landed: boolean): void {
 		if (landed) {
 			this._fforCapabilityHoldUnsaved = false;
+			this._fforReleasedStream = null;
+			return;
+		}
+		// The write that leads a release failed, so the dispatch withholds
+		// the chain. The hold was ended when the release was built; it stands
+		// again, with the chain intact, and whatever this channel makes
+		// before the connection is dropped joins it instead of leaving
+		// alone. Nothing releases it a second time on this connection: the
+		// reestablish that follows the forced disconnect retransmits it.
+		if (this._fforReleasedStream !== null) {
+			this._fforHolding = true;
+			this._fforHeldReplay = this._fforReleasedStream;
+			this._fforReleasedStream = null;
 		}
 	}
 
