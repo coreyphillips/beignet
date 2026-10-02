@@ -27745,6 +27745,18 @@ export class LightningNode extends EventEmitter {
 				// remedy for an HTLC nearing its deadline during quiescence.
 				if (channel.isQuiescing()) continue;
 
+				// BOLT 2 allows update_fail_htlc only once the add is irrevocably
+				// committed on both sides (issue #1297). Sent for an add the peer
+				// has not signed in yet, a stock peer answers "update_fail_htlc
+				// for an HTLC not yet committed" and fails the channel, over an
+				// HTLC nothing is owed on: unsigned, it is in no commitment and a
+				// disconnect rolls it back; signed in but not revoked for by the
+				// peer, it is the peer's own to time out. No forward hangs off
+				// it either, since nothing is dispatched before this point. The
+				// revoke_and_ack that completes the round makes it failable, and
+				// the node's dispatch or the next block's scan takes it then.
+				if (!receivedAddIrrevocablyCommitted(htlc)) continue;
+
 				if (htlc.cltvExpiry - blockHeight <= this.htlcSafetyMargin) {
 					const channelId = state.channelId || state.temporaryChannelId;
 
