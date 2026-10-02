@@ -629,15 +629,14 @@ describe('FFOR concurrent receive: capacity (CONCURRENT-RECEIVE.md 3.1, 4)', fun
 			).to.deep.equal([]);
 		});
 
-		it('a voucher whose removal is authorized may be absent: a held preimage, or an unsettled slot of the final ack', () => {
+		it('a fulfilled voucher may leave commitments while other slots remain', () => {
 			const pair = bookPair();
-			// The preimage R holds makes slot 2's absence an authorized fulfil.
+			// A held preimage now completes slot 2 through live redemption.
 			const learned = pair.rManager.fforAddPreimage(
 				pair.channelId,
 				record(pair.sChannel).preimages[1]
 			);
 			expect(learned.ok, learned.error).to.equal(true);
-			dropVoucher(pair, 2);
 			pay(pair, 'S', 5_000_000n);
 			pay(pair, 'R', 1_000_000n);
 			expectHealthy(pair, 'slot 2 absent with its preimage held');
