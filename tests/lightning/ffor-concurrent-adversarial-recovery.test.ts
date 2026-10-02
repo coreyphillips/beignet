@@ -995,11 +995,14 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 			expect(vouchers(pair.sChannel).length).to.equal(3);
 		});
 
-		it('every explorer failure with the avoidance off was cut on the #1300 precondition', () => {
+		it('PIN [#1300] every explorer failure with the avoidance off was cut on the #1300 precondition', () => {
 			// The same walk, but the application stacks updates behind an
 			// unrevoked commitment and cuts fall anywhere. Schedules fail; the
 			// claim pinned here is that none fails WITHOUT a cut on the
-			// precondition, in any mode, with or without an epoch.
+			// precondition, in any mode, with or without an epoch. The last
+			// two assertions require that schedules DO fail, so they flip when
+			// #1300 is fixed: required then is that no schedule fails at all
+			// (failed is empty), and section 1d can drop its avoidance.
 			const failed: string[] = [];
 			const unexplained: string[] = [];
 			for (const mode of ['none', 'active', 'draining'] as ExploreMode[]) {
