@@ -1752,7 +1752,10 @@ describe('FFOR concurrent receive, adversarial: the capability hold', function (
 		);
 	});
 
-	it.skip('DEFECT (low): the hold is memory only, so a restart of the holding side lifts it with no compatible init having been seen; S resumes delegated settlement for an R that last connected without the capability', () => {
+	// Review round 1 of PR #1301: the hold was memory only, so a restart of
+	// the holding side lifted it with no compatible init having been seen.
+	// Fixed: it is on the epoch record.
+	it('the hold survives a restart of the holding side: S does not resume delegated settlement for an R that last connected without the capability', () => {
 		const pair = activePair();
 		pair.link.disconnect();
 		pair.rConfig.localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT + 1);

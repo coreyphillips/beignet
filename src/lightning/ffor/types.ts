@@ -268,6 +268,22 @@ export interface IFforEpochRecord {
 	 * stored ff_init and ff_accept bytes on load.
 	 */
 	concurrentVersion?: 0 | 1;
+	/**
+	 * Both, concurrent epochs only (CONCURRENT-RECEIVE.md section 8): the
+	 * latest reestablish ran on a connection whose init exchange did not
+	 * advertise the base and concurrent capabilities on both sides. While
+	 * set, an ACTIVE or DRAINING epoch takes no new ordinary add of ours, no
+	 * new delegated settlement and exposes no invoice; fulfils, fails,
+	 * commitments and replays of what already exists are not affected, and
+	 * the selected version never changes.
+	 *
+	 * Written only by a reestablish (Channel.setFforCapabilities), never by a
+	 * disconnect, so S's offline settlement service continues while R is
+	 * simply away; and persisted, so a restart of either side does not lift
+	 * a hold no compatible init has lifted. Present only while the hold
+	 * stands: a record without one serializes as it always did.
+	 */
+	capabilityHold?: boolean;
 }
 
 /**

@@ -1161,6 +1161,11 @@ export interface ISerializedFforEpoch {
 	 * bytes it always did; absent reads as baseline.
 	 */
 	concurrentVersion?: number;
+	/**
+	 * The capability hold (see IFforEpochRecord.capabilityHold). Written
+	 * only while it stands, and only a concurrent epoch has one.
+	 */
+	capabilityHold?: boolean;
 }
 
 export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
@@ -1232,6 +1237,10 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 		activationMismatch: f.activationMismatch,
 		...(f.concurrentVersion === FF_CONCURRENT_VERSION
 			? { concurrentVersion: FF_CONCURRENT_VERSION }
+			: {}),
+		...(f.concurrentVersion === FF_CONCURRENT_VERSION &&
+		f.capabilityHold === true
+			? { capabilityHold: true }
 			: {})
 	};
 }
@@ -1365,6 +1374,10 @@ export function deserializeFforEpoch(
 		activationMismatch: s.activationMismatch === true || concurrent.mismatch,
 		...(concurrent.selected === FF_CONCURRENT_VERSION
 			? { concurrentVersion: FF_CONCURRENT_VERSION }
+			: {}),
+		...(concurrent.selected === FF_CONCURRENT_VERSION &&
+		s.capabilityHold === true
+			? { capabilityHold: true }
 			: {})
 	};
 }

@@ -1941,9 +1941,12 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 		// retirement or enforcement." The PR's own test pins that the hold
 		// "lasts through a later disconnect until a compatible init".
 		//
-		// Observed: _fforCapabilityHold is memory-only and starts false, so a
-		// restart forgets an observed incompatible init.
-		it.skip('DEFECT [new in #1301] S restarts after an incompatible reconnect, R still away: the hold is gone and S starts delegated settlements again', () => {
+		// Review round 1 of PR #1301 found the hold was memory only, so a
+		// restart of either side forgot an observed incompatible init. Fixed:
+		// it is a field of the epoch record, written only while it stands,
+		// persisted by the reestablish that observed it and judged afresh by
+		// every later one.
+		it('S restarts after an incompatible reconnect, R still away: the hold survives the restart and S starts no delegated settlement', () => {
 			const pair = activePair();
 			pair.link.disconnect();
 			advertise(pair, 'R', false);
@@ -1963,9 +1966,17 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 				pair.sChannel.fforSettlementRefusal(1, TIP),
 				'the hold must survive the restart'
 			).to.match(/capability hold/);
+			// R comes back with the capability: the hold lifts, on the record
+			// too, and stays lifted across another restart.
+			advertise(pair, 'R', true);
+			pair.link.reconnect();
+			expect(pair.sChannel.fforSettlementRefusal(1, TIP)).to.equal(null);
+			expect(record(pair.sChannel).capabilityHold).to.equal(undefined);
+			restart(pair, 'S');
+			expect(pair.sChannel.fforSettlementRefusal(1, TIP)).to.equal(null);
 		});
 
-		it.skip('DEFECT [new in #1301] R restarts after an incompatible reconnect: it will expose a voucher invoice S refuses to settle', () => {
+		it('R restarts after an incompatible reconnect: the hold survives the restart and R exposes no voucher invoice', () => {
 			const pair = activePair();
 			pair.link.disconnect();
 			advertise(pair, 'S', false);
@@ -1979,6 +1990,59 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 				pair.rChannel.fforAdmissionHold(),
 				'the hold must survive the restart'
 			).to.match(/did not advertise/);
+		});
+
+		it('the hold is written by the reestablish that observes it, although that reestablish sends nothing, and only while it stands', () => {
+			const pair = activePair();
+			const row = (side: Side): { ffor: Record<string, unknown> } =>
+				JSON.parse(snapshot(pair, side));
+			expect('capabilityHold' in row('S').ffor).to.equal(false);
+			expect('capabilityHold' in row('R').ffor).to.equal(false);
+			pair.link.disconnect();
+			advertise(pair, 'R', false);
+			let persists = 0;
+			pair.sManager.on('channel:persist', () => persists++);
+			pair.link.log.length = 0;
+			pair.link.reconnect();
+			// Nothing but the two channel_reestablish messages crossed.
+			expect(pair.link.types()).to.deep.equal([
+				MessageType.CHANNEL_REESTABLISH,
+				MessageType.CHANNEL_REESTABLISH
+			]);
+			expect(persists, 'S wrote the hold').to.be.greaterThan(0);
+			expect(row('S').ffor.capabilityHold).to.equal(true);
+			// The mode is untouched (section 8).
+			expect(row('S').ffor.concurrentVersion).to.equal(1);
+			// The same incompatible reconnect again changes nothing and writes
+			// nothing.
+			pair.link.disconnect();
+			persists = 0;
+			pair.link.reconnect();
+			expect(persists).to.equal(0);
+			// A compatible one lifts it and removes the field.
+			pair.link.disconnect();
+			advertise(pair, 'R', true);
+			pair.link.reconnect();
+			expect(persists, 'S wrote the lift').to.be.greaterThan(0);
+			expect('capabilityHold' in row('S').ffor).to.equal(false);
+			expect(pair.sChannel.fforSettlementRefusal(1, TIP)).to.equal(null);
+		});
+
+		it('a baseline epoch never carries the field, whatever a connection advertises', () => {
+			const pair = createPair({ pushSat: 200_000n });
+			activate(pair, AMOUNTS, false);
+			pair.link.disconnect();
+			advertise(pair, 'R', false);
+			let persists = 0;
+			pair.sManager.on('channel:persist', () => persists++);
+			pair.link.reconnect();
+			expect(persists).to.equal(0);
+			for (const side of SIDES) {
+				const ffor = JSON.parse(snapshot(pair, side)).ffor;
+				expect('capabilityHold' in ffor, side).to.equal(false);
+				expect('concurrentVersion' in ffor, side).to.equal(false);
+			}
+			expect(pair.sChannel.fforSettlementRefusal(1, TIP)).to.equal(null);
 		});
 
 		describe('it holds new admission only', () => {

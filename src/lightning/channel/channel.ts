@@ -990,17 +990,11 @@ export class Channel {
 	 */
 	private _fforHeldReplay: ChannelAction[] = [];
 	/**
-	 * FFOR concurrent receive (CONCURRENT-RECEIVE.md section 8): the latest
-	 * reestablish ran on a connection whose init exchange did not advertise
-	 * the base and concurrent capabilities on both sides. While set, a
-	 * concurrent ACTIVE or DRAINING epoch takes no new ordinary add of ours
-	 * and no new delegated settlement; fulfils, fails, commitments and
-	 * replays of what already exists are not affected, and the persisted
-	 * mode never changes. Memory-only and connection-observed: written only
-	 * by setFforCapabilities at a reestablish, never by a disconnect, so S's
-	 * offline settlement service continues while R is simply away.
+	 * FFOR concurrent receive: setFforCapabilities changed the record's
+	 * capability hold and no persist has carried the change yet. The
+	 * reestablish that follows writes it, whether or not it sends anything.
 	 */
-	private _fforCapabilityHold = false;
+	private _fforCapabilityHoldUnsaved = false;
 	/**
 	 * FFOR concurrent receive (S, ACTIVE): our ff_activate_ack has been
 	 * produced but is not on the wire yet. handleFforActivate moves the
@@ -11468,7 +11462,16 @@ export class Channel {
 		// exactly the case the gate exists to stop, arriving one connection
 		// later. A retransmission is only safe once what justifies it is on
 		// disk.
-		if (actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)) {
+		//
+		// A capability hold this reestablish set or lifted is written too,
+		// even when nothing is sent (CONCURRENT-RECEIVE.md section 8: the hold
+		// lasts until a compatible init, so it must outlive this process).
+		const holdUnsaved = this._fforCapabilityHoldUnsaved;
+		this._fforCapabilityHoldUnsaved = false;
+		if (
+			holdUnsaved ||
+			actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)
+		) {
 			actions.unshift({ type: ChannelActionType.PERSIST_STATE });
 		}
 
@@ -22823,11 +22826,23 @@ export class Channel {
 	 * the connection this reestablish runs on negotiated the base and
 	 * concurrent capabilities. Called by the manager from the current init
 	 * exchange immediately before handleReestablish, on every reestablish.
-	 * An incompatible one holds new admission (see _fforCapabilityHold); a
-	 * later compatible one lifts the hold. Nothing else writes it.
+	 * An incompatible one holds new admission of a live concurrent epoch
+	 * (IFforEpochRecord.capabilityHold); a later compatible one lifts the
+	 * hold. Nothing else writes it, and handleReestablish persists a change.
 	 */
 	setFforCapabilities(concurrentNegotiated: boolean): void {
-		this._fforCapabilityHold = !concurrentNegotiated;
+		const f = this._state.ffor;
+		if (!f) return;
+		const live = this._fforLive();
+		const hold =
+			live !== null && this._fforIsConcurrent(live) && !concurrentNegotiated;
+		if ((f.capabilityHold === true) === hold) return;
+		if (hold) {
+			f.capabilityHold = true;
+		} else {
+			delete f.capabilityHold;
+		}
+		this._fforCapabilityHoldUnsaved = true;
 	}
 
 	/**
@@ -22851,7 +22866,7 @@ export class Channel {
 			// add is refused rather than parked behind the chain.
 			return 'the close of the voucher book is being recovered with the peer';
 		}
-		if (this._fforCapabilityHold) {
+		if (f.capabilityHold === true) {
 			return 'the peer did not advertise option_ff_receive and option_ff_concurrent on this connection';
 		}
 		return null;
@@ -25714,7 +25729,7 @@ export class Channel {
 		// CONCURRENT-RECEIVE.md section 8: no new delegated admission after an
 		// incompatible reconnect, until a compatible one. An ordinary
 		// disconnect sets no hold, so the offline service is not interrupted.
-		if (this._fforIsConcurrent(f) && this._fforCapabilityHold) {
+		if (this._fforIsConcurrent(f) && f.capabilityHold === true) {
 			return 'capability hold: the peer did not advertise option_ff_receive and option_ff_concurrent on its last connection';
 		}
 		if (f.closeProcessed) return 'ff_close processed';
