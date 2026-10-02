@@ -40,6 +40,20 @@ export const FF_CONCURRENT_FEATURE_BIT = 562;
  */
 export const FF_CONCURRENT_VERSION = 1;
 
+/** Experimental version 2 retains unresolved claims after an admission stop. */
+export const FF_CONCURRENT_RESERVED_VERSION = 2;
+
+export type FforConcurrentVersion = 1 | 2;
+
+export function isFforConcurrentVersion(
+	version: number | undefined
+): version is FforConcurrentVersion {
+	return (
+		version === FF_CONCURRENT_VERSION ||
+		version === FF_CONCURRENT_RESERVED_VERSION
+	);
+}
+
 /** section 7.1 `variant`. Only D is implemented here. */
 export enum FforVariant {
 	A = 1,
@@ -153,7 +167,7 @@ export interface IFforBookEntry {
 	sHtlcId: bigint;
 }
 
-/** Receiver-side evidence that a voucher left both commitment views. */
+/** Evidence that a voucher left both commitment views. */
 export interface IFforVoucherOutcome {
 	outcome: 'fulfilled' | 'cancelled';
 	/** The local signature that removes the retained voucher output. */
@@ -276,13 +290,15 @@ export interface IFforEpochRecord {
 	/**
 	 * Both: the profile this epoch selected (CONCURRENT-RECEIVE.md section
 	 * 1.1). Absent or 0 is the baseline epoch of the base spec; 1 is
-	 * concurrent receive version 1. S sets it as it answers ff_accept with
+	 * concurrent receive version 1 and 2 retains unresolved claims on close. S sets it as it answers ff_accept with
 	 * the echo; R sets it only on the exact signed echo. It never changes
 	 * afterwards and is never inferred from the features a later connection
 	 * advertises: it is persisted with the transcript and checked against the
 	 * stored ff_init and ff_accept bytes on load.
 	 */
-	concurrentVersion?: 0 | 1;
+	concurrentVersion?: 0 | FforConcurrentVersion;
+	/** Unknown or contradictory version selection: keep claims, sign no new updates. */
+	concurrentVersionMismatch?: boolean;
 	/**
 	 * Both, concurrent epochs only (CONCURRENT-RECEIVE.md section 8): the
 	 * latest reestablish ran on a connection whose init exchange did not

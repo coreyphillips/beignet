@@ -94,7 +94,8 @@ export function createConcurrentWorld(
 export function activateWorld(
 	w: IWorld,
 	concurrent: boolean,
-	amounts: bigint[] = AMOUNTS
+	amounts: bigint[] = AMOUNTS,
+	version: 1 | 2 = 1
 ): void {
 	const res = w.r.startFforEpoch(w.srHex, {
 		voucherAmountsMsat: amounts,
@@ -103,7 +104,7 @@ export function activateWorld(
 		voucherExpiry: T_EXP,
 		feeBaseMsat: FEE_BASE,
 		feeProportionalMillionths: FEE_PPM,
-		...(concurrent ? { concurrent: true } : {})
+		...(concurrent ? { concurrent: true, concurrentVersion: version } : {})
 	});
 	expect(res.ok, res.error).to.equal(true);
 	expect(record(w.s, w.srHex).state, JSON.stringify(w.errors)).to.equal(
@@ -111,9 +112,9 @@ export function activateWorld(
 	);
 	expect(record(w.r, w.srHex).state).to.equal(FforState.ACTIVE);
 	expect(record(w.s, w.srHex).concurrentVersion ?? 0).to.equal(
-		concurrent ? 1 : 0
+		concurrent ? version : 0
 	);
 	expect(record(w.r, w.srHex).concurrentVersion ?? 0).to.equal(
-		concurrent ? 1 : 0
+		concurrent ? version : 0
 	);
 }

@@ -5,6 +5,12 @@
  * All tables use WAL mode for concurrent reader support.
  */
 
+import {
+	IFforVoucherArchive,
+	fforVoucherArchiveId,
+	mergeFforVoucherArchive,
+	validateFforVoucherArchive
+} from '../ffor/voucher-archive';
 import Database from 'better-sqlite3';
 import * as fs from 'fs';
 import {
@@ -214,7 +220,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 13;
+	static readonly CURRENT_SCHEMA_VERSION = 14;
 
 	/**
 	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
@@ -236,6 +242,7 @@ export class SqliteStorage implements IStorageBackend {
 	}> = [
 		{ table: 'channels', pk: 'channel_id', columns: ['state_json'] },
 		{ table: 'payments', pk: 'payment_hash', columns: ['payment_json'] },
+		{ table: 'ffor_vouchers', pk: 'id', columns: ['record_json'] },
 		{ table: 'preimages', pk: 'payment_hash', columns: ['preimage'] },
 		{
 			table: 'htlc_payment_map',
@@ -343,6 +350,10 @@ export class SqliteStorage implements IStorageBackend {
 				peer_pubkey TEXT NOT NULL
 			);
 
+			CREATE TABLE IF NOT EXISTS ffor_vouchers (
+				id TEXT PRIMARY KEY,
+				record_json TEXT NOT NULL
+			);
 			CREATE TABLE IF NOT EXISTS payments (
 				payment_hash TEXT PRIMARY KEY,
 				payment_json TEXT NOT NULL
@@ -640,6 +651,43 @@ export class SqliteStorage implements IStorageBackend {
 				.prepare('DELETE FROM recovery_outbox WHERE channel_id = ?')
 				.run(id);
 		})();
+	}
+
+	saveFforVoucher(record: IFforVoucherArchive): void {
+		const id = fforVoucherArchiveId(record);
+		const merged = mergeFforVoucherArchive(this.loadFforVoucher(id), record);
+		this.db
+			.prepare(
+				'INSERT OR REPLACE INTO ffor_vouchers (id, record_json) VALUES (?, ?)'
+			)
+			.run(id, this._enc(JSON.stringify(merged)));
+	}
+
+	loadFforVoucher(id: string): IFforVoucherArchive | null {
+		const row = this.db
+			.prepare('SELECT record_json FROM ffor_vouchers WHERE id = ?')
+			.get(id) as { record_json: string } | undefined;
+		if (!row) return null;
+		const record = validateFforVoucherArchive(
+			JSON.parse(this._dec(row.record_json))
+		);
+		if (fforVoucherArchiveId(record) !== id)
+			throw new Error('FFOR archive row key mismatch');
+		return record;
+	}
+
+	loadAllFforVouchers(): IFforVoucherArchive[] {
+		const rows = this.db
+			.prepare('SELECT id, record_json FROM ffor_vouchers ORDER BY id')
+			.all() as { id: string; record_json: string }[];
+		return rows.map((row) => {
+			const record = validateFforVoucherArchive(
+				JSON.parse(this._dec(row.record_json))
+			);
+			if (fforVoucherArchiveId(record) !== row.id)
+				throw new Error('FFOR archive row key mismatch');
+			return record;
+		});
 	}
 
 	// ─── Payments ───
@@ -1504,6 +1552,9 @@ export class SqliteStorage implements IStorageBackend {
 			// arrive already AEAD-encrypted with the per-epoch frame key.
 			(): void => {
 				// No-op
+			}, // Migration 13->14: ffor_vouchers is created above.
+			(): void => {
+				/* No data is inferred for legacy missing outcomes. */
 			}
 		];
 

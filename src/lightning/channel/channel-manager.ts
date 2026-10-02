@@ -1872,6 +1872,9 @@ export class ChannelManager extends EventEmitter {
 		if (!channel) {
 			return { ok: false, actions: [], error: `Channel not found: ${idHex}` };
 		}
+		const fforRefusal = channel.fforCommitmentRefusal?.();
+		if (fforRefusal) return { ok: false, actions: [], error: fforRefusal };
+
 		// BOLT 2: only send commitment_signed when we have pending updates the
 		// remote has not yet committed. Re-committing an unchanged state would
 		// loop the commitment exchange and reuse stale per-commitment points.
@@ -6161,6 +6164,12 @@ export class ChannelManager extends EventEmitter {
 		// dispatch can have moved the record past what this batch persisted.
 		if (!this._fforDurableState.has(hex)) return;
 		const state = this._fforDurableState.get(hex) ?? null;
+		if (
+			record?.concurrentVersion === 2 &&
+			record.voucherOutcomes?.some((o) => o !== null)
+		) {
+			this.emit('ffor:voucher-outcomes', channelId, record);
+		}
 		const last = this._fforLastState.get(hex);
 		if (last === state) return;
 		this._fforLastState.set(hex, state);
@@ -6395,6 +6404,8 @@ export class ChannelManager extends EventEmitter {
 			 * refuses unless both feature pairs are negotiated with the peer.
 			 */
 			concurrent?: boolean;
+			/** Exact signed profile request. Version 2 retains unresolved reserves. */
+			concurrentVersion?: 1 | 2;
 		}
 	): ChannelResult {
 		const peerPubkey = this.channelPeers.get(channelId.toString('hex'));

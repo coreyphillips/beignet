@@ -426,6 +426,7 @@ export interface ITerms {
 	epochId?: Buffer;
 	hashChain?: boolean;
 	concurrent?: boolean;
+	concurrentVersion?: 1 | 2;
 }
 
 export function terms(
@@ -487,23 +488,24 @@ export function why(pair: IPair): string {
 export function activate(
 	pair: IPair,
 	amounts: bigint[] = AMOUNTS,
-	concurrent?: boolean
+	concurrent?: boolean,
+	version: 1 | 2 = 1
 ): void {
 	const ask =
 		concurrent ??
 		pair.rConfig.localFeatures.hasFeature(Feature.OPTION_FF_CONCURRENT);
 	const res = pair.rManager.initiateFforEpoch(
 		pair.channelId,
-		terms(amounts, ask ? { concurrent: true } : {})
+		terms(amounts, ask ? { concurrent: true, concurrentVersion: version } : {})
 	);
 	expect(res.ok, res.error).to.equal(true);
 	expect(record(pair.sChannel).state, why(pair)).to.equal(FforState.ACTIVE);
 	expect(record(pair.rChannel).state, why(pair)).to.equal(FforState.ACTIVE);
 	expect(record(pair.sChannel).concurrentVersion ?? 0, why(pair)).to.equal(
-		ask ? 1 : 0
+		ask ? version : 0
 	);
 	expect(record(pair.rChannel).concurrentVersion ?? 0, why(pair)).to.equal(
-		ask ? 1 : 0
+		ask ? version : 0
 	);
 }
 

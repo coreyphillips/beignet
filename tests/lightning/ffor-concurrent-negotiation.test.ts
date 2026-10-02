@@ -355,7 +355,7 @@ describe('FFOR concurrent receive: negotiation (CONCURRENT-RECEIVE.md 1.1)', fun
 	});
 
 	describe('the requested value', () => {
-		for (const hex of ['0000', '0002', 'ffff']) {
+		for (const hex of ['0000', '0003', 'ffff']) {
 			it(`ff_init TLV 17 = ${hex}: S refuses with reason 2 and adds nothing`, () => {
 				const pair = createPair();
 				const { body, epochId } = craftInit(

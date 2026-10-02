@@ -59,6 +59,11 @@ export interface ITrackedOutput {
 	cltvExpiry?: number;
 	witnessScript?: Buffer;
 	resolutionTxid?: string;
+	/** Witness evidence bound to a spend of our received HTLC on a current commitment. */
+	receivedHtlcSpend?: {
+		txid: string;
+		preimage?: string;
+	};
 	/** Block height when the sweep was broadcast */
 	broadcastHeight?: number;
 	/** Fee rate used for the initial broadcast (sat/vbyte) */

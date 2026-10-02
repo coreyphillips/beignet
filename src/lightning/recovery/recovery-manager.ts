@@ -339,6 +339,11 @@ export class RecoveryManager {
 
 	private applyMutation(mutation: RecoveryMutation): void {
 		switch (mutation.type) {
+			case 'ffor_voucher':
+				if (!this.storage.saveFforVoucher)
+					throw new Error('Storage cannot persist FFOR voucher custody');
+				this.storage.saveFforVoucher(mutation.record);
+				break;
 			case 'channel_state':
 				this.storage.saveChannel(
 					mutation.channelId,

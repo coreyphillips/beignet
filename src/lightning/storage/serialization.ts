@@ -12,7 +12,8 @@ import {
 	ChannelCloseReason
 } from '../channel/channel-state';
 import {
-	FF_CONCURRENT_VERSION,
+	isFforConcurrentVersion,
+	FforConcurrentVersion,
 	FforAbortReason,
 	FforRole,
 	FforSlotState,
@@ -1168,6 +1169,7 @@ export interface ISerializedFforEpoch {
 	 * bytes it always did; absent reads as baseline.
 	 */
 	concurrentVersion?: number;
+	concurrentVersionMismatch?: boolean;
 	/**
 	 * The capability hold (see IFforEpochRecord.capabilityHold). Written
 	 * only while it stands, and only a concurrent epoch has one.
@@ -1255,10 +1257,11 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 		abortReason: f.abortReason,
 		closeSent: f.closeSent,
 		activationMismatch: f.activationMismatch,
-		...(f.concurrentVersion === FF_CONCURRENT_VERSION
-			? { concurrentVersion: FF_CONCURRENT_VERSION }
+		...(f.concurrentVersionMismatch ? { concurrentVersionMismatch: true } : {}),
+		...(isFforConcurrentVersion(f.concurrentVersion)
+			? { concurrentVersion: f.concurrentVersion }
 			: {}),
-		...(f.concurrentVersion === FF_CONCURRENT_VERSION &&
+		...(isFforConcurrentVersion(f.concurrentVersion) &&
 		f.capabilityHold === true
 			? { capabilityHold: true }
 			: {})
@@ -1286,26 +1289,51 @@ function storedConcurrentVersion(
 	requestedField: number | undefined,
 	initWire: Buffer,
 	acceptWire: Buffer | null
-): { selected: 0 | 1; mismatch: boolean } {
-	const stored = storedField === FF_CONCURRENT_VERSION;
+): { selected: 0 | FforConcurrentVersion; mismatch: boolean } {
+	const stored = isFforConcurrentVersion(storedField) ? storedField : 0;
 	const transcript = fforTranscriptConcurrentVersion(initWire, acceptWire);
 	if (transcript === null) {
-		return { selected: stored ? 1 : 0, mismatch: stored };
+		const hints = [storedField, requestedField].filter(
+			(version) => version !== undefined && version !== 0
+		);
+		return {
+			selected:
+				hints.some((version) => version !== 1) || requestedField === 0
+					? 2
+					: hints.length
+					? 1
+					: 0,
+			mismatch: !!storedField || requestedField !== undefined
+		};
 	}
 	const { requested, echoed } = transcript;
 	const accepted = acceptWire !== null;
 	const selectedOnWire =
-		accepted &&
-		requested === FF_CONCURRENT_VERSION &&
-		echoed === FF_CONCURRENT_VERSION;
+		accepted && isFforConcurrentVersion(requested) && echoed === requested
+			? requested
+			: 0;
+	const unsupported =
+		(storedField !== undefined &&
+			storedField !== 0 &&
+			!isFforConcurrentVersion(storedField)) ||
+		[requestedField, requested, echoed].some(
+			(version) => version !== undefined && !isFforConcurrentVersion(version)
+		);
 	const consistent =
+		!unsupported &&
 		selectedOnWire === stored &&
 		requested === requestedField &&
 		(!accepted || echoed === requested);
-	return {
-		selected: stored || selectedOnWire ? 1 : 0,
-		mismatch: !consistent
-	};
+	// Never reinterpret a contradictory or unknown selected version as baseline.
+	// Prefer the reservation-preserving profile while the mismatch quarantines it.
+	const selected =
+		unsupported ||
+		stored === 2 ||
+		selectedOnWire === 2 ||
+		(!consistent && [requestedField, requested, echoed].includes(2))
+			? 2
+			: stored || selectedOnWire;
+	return { selected, mismatch: !consistent };
 }
 
 export function deserializeFforEpoch(
@@ -1410,10 +1438,14 @@ export function deserializeFforEpoch(
 				: (s.abortReason as FforAbortReason),
 		closeSent: s.closeSent === true,
 		activationMismatch: s.activationMismatch === true || concurrent.mismatch,
-		...(concurrent.selected === FF_CONCURRENT_VERSION
-			? { concurrentVersion: FF_CONCURRENT_VERSION }
+		...(s.concurrentVersionMismatch ||
+		(concurrent.selected === 2 && concurrent.mismatch)
+			? { concurrentVersionMismatch: true }
 			: {}),
-		...(concurrent.selected === FF_CONCURRENT_VERSION &&
+		...(isFforConcurrentVersion(concurrent.selected)
+			? { concurrentVersion: concurrent.selected }
+			: {}),
+		...(isFforConcurrentVersion(concurrent.selected) &&
 		s.capabilityHold === true
 			? { capabilityHold: true }
 			: {})

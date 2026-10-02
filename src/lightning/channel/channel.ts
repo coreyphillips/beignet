@@ -173,6 +173,8 @@ import {
 	FF_CLOSE_ACK_TYPE,
 	FF_CLOSE_TYPE,
 	FF_CONCURRENT_VERSION,
+	FF_CONCURRENT_RESERVED_VERSION,
+	isFforConcurrentVersion,
 	FF_EPOCH_START_TOLERANCE_BLOCKS,
 	FF_INIT_TYPE,
 	FforAbortReason,
@@ -1415,7 +1417,7 @@ export class Channel {
 			f !== undefined &&
 			f.role === 'S' &&
 			f.state === FforState.ACTIVE &&
-			f.concurrentVersion === FF_CONCURRENT_VERSION;
+			isFforConcurrentVersion(f.concurrentVersion);
 	}
 
 	/**
@@ -4790,6 +4792,12 @@ export class Channel {
 			spliceHtlcSignatures: Buffer[];
 		}
 	): ChannelAction[] {
+		const fforRefusal = this.fforCommitmentRefusal();
+		if (fforRefusal)
+			return [
+				{ type: ChannelActionType.ERROR, message: fforRefusal, cleanup: 'none' }
+			];
+
 		if (
 			this._state.state !== ChannelState.NORMAL &&
 			this._state.state !== ChannelState.SHUTTING_DOWN &&
@@ -5713,6 +5721,24 @@ export class Channel {
 				continue;
 			}
 			if (entry.state === HtlcState.FULFILLED) {
+				const f = this._state.ffor;
+				if (
+					f?.role === 'S' &&
+					f.concurrentVersion === FF_CONCURRENT_RESERVED_VERSION &&
+					entry.direction === HtlcDirection.OFFERED &&
+					entry.fforVoucher &&
+					entry.removalLocallyRevoked === true
+				) {
+					const slot = matchVoucher(this._fforBook(f), entry);
+					if (slot) {
+						f.voucherOutcomes ??= f.paymentHashes.map(() => null);
+						f.voucherOutcomes[slot.k - 1] ??= {
+							outcome: 'fulfilled',
+							localCommitmentNumber: this._state.localCommitmentNumber,
+							remoteCommitmentNumber: this._remoteRevocationCount()
+						};
+					}
+				}
 				if (entry.direction === HtlcDirection.RECEIVED) {
 					// We received and fulfilled: credit our balance
 					this._state.localBalanceMsat += entry.amountMsat;
@@ -23062,7 +23088,7 @@ export class Channel {
 	 * what a connection advertises.
 	 */
 	private _fforIsConcurrent(f: IFforEpochRecord): boolean {
-		return f.concurrentVersion === FF_CONCURRENT_VERSION;
+		return isFforConcurrentVersion(f.concurrentVersion);
 	}
 
 	/**
@@ -23172,11 +23198,17 @@ export class Channel {
 	 * whether a settle fulfils or fails. An epoch that selected concurrent
 	 * receive is judged by _fforConcurrentRefusal instead.
 	 */
+	fforCommitmentRefusal(): string | null {
+		return this._fforUpdateRefusal('commit', { origin: 'local' });
+	}
+
 	private _fforUpdateRefusal(
 		kind: FforUpdateKind,
 		ctx: IFforUpdateContext
 	): string | null {
 		const any = this._state.ffor;
+		if (any?.concurrentVersionMismatch)
+			return 'FFOR: stored concurrent version is unsupported or inconsistent';
 		if (any && this._fforIsConcurrent(any)) {
 			return this._fforConcurrentRefusal(any, kind, ctx);
 		}
@@ -23350,6 +23382,13 @@ export class Channel {
 		origin: 'local' | 'peer'
 	): string | null {
 		const id = settle.id;
+		if (
+			f.concurrentVersion === FF_CONCURRENT_RESERVED_VERSION &&
+			(f.state === FforState.ACTIVE || f.state === FforState.DRAINING) &&
+			settle.op === 'fail'
+		) {
+			return `FFOR voucher ${id} remains reserved until its claim is resolved`;
+		}
 		const parked = `FFOR voucher ${id} is parked: only the epoch's own drain, redemption or unwind settles it`;
 		if (f.role === 'R') {
 			// The vouchers are received on R: a peer settle never names one.
@@ -23450,6 +23489,12 @@ export class Channel {
 			) {
 				return `FFOR voucher ${slot.k} no longer matches the book`;
 			}
+			if (
+				f.concurrentVersion === FF_CONCURRENT_RESERVED_VERSION &&
+				entry.state === HtlcState.FAILED
+			) {
+				return `FFOR voucher ${slot.k} cannot be cancelled while its claim is reserved`;
+			}
 			// A fulfil or fail in flight is the authorized transition: the
 			// output may already be gone from this view.
 			if (entry.state !== HtlcState.COMMITTED) continue;
@@ -23509,6 +23554,21 @@ export class Channel {
 	 * sides and close that gap on S.
 	 */
 	private _fforSlotMayBeAbsent(f: IFforEpochRecord, k: number): boolean {
+		if (f.concurrentVersion === FF_CONCURRENT_RESERVED_VERSION) {
+			if (f.voucherOutcomes?.[k - 1]?.outcome === 'fulfilled') return true;
+			// R's map is one signature ahead of its stored local commitment.
+			// The retained entry bridges that interval and is still claimable.
+			return (
+				f.role === 'R' &&
+				(this._state.signedLocalRemovals ?? []).some(
+					(entry) =>
+						entry.state === HtlcState.FULFILLED &&
+						entry.fforVoucher === true &&
+						entry.direction === HtlcDirection.RECEIVED &&
+						matchVoucher(this._fforBook(f), entry)?.k === k
+				)
+			);
+		}
 		if (f.role !== 'R') return true;
 		if (f.knownPreimages[k - 1]) return true;
 		return (
@@ -23837,6 +23897,8 @@ export class Channel {
 		 * signed echo; independent hashes only.
 		 */
 		concurrent?: boolean;
+		/** Exact signed profile request. Version 2 retains unresolved reserves. */
+		concurrentVersion?: 1 | 2;
 	}): ChannelAction[] {
 		const pre = this._fforSetupPreconditionError();
 		if (pre) {
@@ -23844,6 +23906,20 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: `Cannot start FFOR epoch: ${pre}`,
+					cleanup: 'none'
+				}
+			];
+		}
+		if (
+			request.concurrentVersion !== undefined &&
+			(!request.concurrent ||
+				!isFforConcurrentVersion(request.concurrentVersion))
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot start FFOR epoch: unsupported concurrent version or missing concurrent request',
 					cleanup: 'none'
 				}
 			];
@@ -23901,7 +23977,10 @@ export class Channel {
 				: {}),
 			...(request.hashChain ? { hashChain: true } : {}),
 			...(request.concurrent
-				? { concurrentVersion: FF_CONCURRENT_VERSION }
+				? {
+						concurrentVersion:
+							request.concurrentVersion ?? FF_CONCURRENT_VERSION
+				  }
 				: {})
 		};
 		const bookError = checkVoucherBook(params, this._fforBookContext('R'));
@@ -24204,7 +24283,7 @@ export class Channel {
 					'the concurrent profile takes no hash chain (ff_init TLV 15 must be absent)'
 				);
 			}
-			if (msg.concurrentVersion !== FF_CONCURRENT_VERSION) {
+			if (!isFforConcurrentVersion(msg.concurrentVersion)) {
 				return refuse(
 					FforAbortReason.TERMS_REFUSED,
 					`concurrent_version ${msg.concurrentVersion} not supported`
@@ -24292,7 +24371,7 @@ export class Channel {
 				initHash: tInit,
 				// The exact signed echo is the only thing that selects the
 				// concurrent profile (CONCURRENT-RECEIVE.md section 1.1).
-				...(concurrent ? { concurrentVersion: FF_CONCURRENT_VERSION } : {})
+				...(concurrent ? { concurrentVersion: msg.concurrentVersion } : {})
 			})
 		);
 		if (!acceptBody) {
@@ -24309,7 +24388,8 @@ export class Channel {
 		f.acceptWire = acceptWire;
 		// Selected with the transcript it rides in: on the record before the
 		// persist that precedes ff_accept.
-		if (concurrent) f.concurrentVersion = FF_CONCURRENT_VERSION;
+		if (isFforConcurrentVersion(msg.concurrentVersion))
+			f.concurrentVersion = msg.concurrentVersion;
 		f.sCommitmentNumber = this._state.localCommitmentNumber;
 		f.sHtlcIdBase = sHtlcIdBase;
 		f.paymentHashes = hashes;
@@ -24549,8 +24629,8 @@ export class Channel {
 		}
 		f.acceptWire = acceptWire;
 		// The exact echo of the one version we request, checked above.
-		if (requestedVersion === FF_CONCURRENT_VERSION) {
-			f.concurrentVersion = FF_CONCURRENT_VERSION;
+		if (isFforConcurrentVersion(requestedVersion)) {
+			f.concurrentVersion = requestedVersion;
 		}
 		f.sCommitmentNumber = msg.sCommitmentNumber;
 		f.sHtlcIdBase = msg.sHtlcIdBase;
@@ -25421,6 +25501,13 @@ export class Channel {
 	): ChannelAction[] {
 		if (f.state !== FforState.DRAINING) return [];
 		if (this._fforVoucherEntries(f).size > 0) return [];
+		if (
+			f.concurrentVersion === FF_CONCURRENT_RESERVED_VERSION &&
+			f.paymentHashes.some(
+				(_, i) => f.voucherOutcomes?.[i]?.outcome !== 'fulfilled'
+			)
+		)
+			return [];
 		// Baseline: the channel carries nothing but the drain, so CLOSED also
 		// waits for every pending update. A concurrent epoch carries ordinary
 		// traffic, which may never pause, and CLOSED means every VOUCHER is
@@ -25799,7 +25886,10 @@ export class Channel {
 					const r = this.fulfillHtlc(entry.id, preimage);
 					if (!r.some((a) => a.type === ChannelActionType.ERROR))
 						actions.push(...r);
-				} else if (!bitmapGet(f.settledBitmap, k)) {
+				} else if (
+					f.concurrentVersion !== FF_CONCURRENT_RESERVED_VERSION &&
+					!bitmapGet(f.settledBitmap, k)
+				) {
 					// A concurrent S that reestablished short of DRAINING takes
 					// ordinary traffic and voucher fulfils, but fails the
 					// channel on a voucher fail: none until its ack returns.
@@ -25974,6 +26064,13 @@ export class Channel {
 		const f = this._state.ffor;
 		if (!f || f.role !== 'R') return 'no epoch of ours';
 		if (k < 1 || k > f.params.maxPayments) return 'no such slot';
+		if (f.concurrentVersionMismatch)
+			return 'stored concurrent version is unsupported or inconsistent';
+		if (
+			f.concurrentVersion === FF_CONCURRENT_RESERVED_VERSION &&
+			(f.state !== FforState.ACTIVE || f.closeSent)
+		)
+			return 'invoice admission has stopped';
 		if (f.issuerProvisioned) {
 			return `the issuer sells this book: voucher ${k} gets no invoice from R`;
 		}
@@ -26086,6 +26183,11 @@ export class Channel {
 			{ type: ChannelActionType.ERROR, message, cleanup: 'none' }
 		];
 		if (!f || f.role !== 'R') return refuse('FFOR: no epoch of ours');
+		if (f.concurrentVersion === FF_CONCURRENT_RESERVED_VERSION) {
+			return refuse(
+				'FFOR: version 2 requires an independent issuer admission-stop protocol before issuer provisioning'
+			);
+		}
 		const exposed = f.exposedSlots.indexOf(true);
 		if (exposed >= 0) {
 			return refuse(

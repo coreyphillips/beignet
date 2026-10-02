@@ -1093,6 +1093,50 @@ export class ChainMonitor {
 			(candidate) =>
 				candidate.txid === txid && spentIndices.has(candidate.outputIndex)
 		);
+		// Capture proof before any persistence or idempotent return. Bind it to
+		// the exact input and current spender, so a reorg cannot turn an old
+		// success witness into evidence for a later timeout.
+		if (
+			this._commitmentBroadcast?.commitmentType ===
+				CommitmentType.OUR_COMMITMENT ||
+			this._commitmentBroadcast?.commitmentType ===
+				CommitmentType.THEIR_CURRENT_COMMITMENT
+		) {
+			for (const spent of spentTrackedOutputs) {
+				if (
+					spent.outputType !== OutputType.RECEIVED_HTLC ||
+					!spent.paymentHash ||
+					!spent.witnessScript
+				)
+					continue;
+				const input = spendingTx.ins.find(
+					(i) =>
+						Buffer.from(i.hash).reverse().toString('hex') === spent.txid &&
+						i.index === spent.outputIndex
+				);
+				const witness = input?.witness ?? [];
+				if (
+					!witness.length ||
+					!Buffer.from(witness[witness.length - 1]).equals(spent.witnessScript)
+				)
+					continue;
+				const preimage = witness.find(
+					(el) =>
+						el.length === 32 &&
+						crypto
+							.createHash('sha256')
+							.update(el)
+							.digest()
+							.equals(spent.paymentHash!)
+				);
+				spent.receivedHtlcSpend = {
+					txid: spendingTx.getId(),
+					...(preimage
+						? { preimage: Buffer.from(preimage).toString('hex') }
+						: {})
+				};
+			}
+		}
 
 		// Idempotent: the watch is retained after a spend (so a reorg can be detected),
 		// which re-fires the subscription. If we already recorded THIS exact spend,

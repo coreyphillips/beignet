@@ -306,6 +306,10 @@ describe('FFOR voucher terminal outcomes', function () {
 			const old = storage.loadChannel(w.srHex)!;
 			delete old.state.ffor!.voucherOutcomes;
 			storage.saveChannel(w.srHex, old.state, old.peerPubkey);
+			// A pre-archive database has neither embedded outcomes nor custody rows.
+			(storage as unknown as { db: { exec(sql: string): void } }).db.exec(
+				'DELETE FROM ffor_vouchers'
+			);
 			const restored = new LightningNode(w.rConfig);
 			nodes.push(restored);
 			restored.handleNewBlock(TIP + 1);
