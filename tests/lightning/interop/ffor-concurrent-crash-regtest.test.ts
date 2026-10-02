@@ -10,6 +10,7 @@ import {
 import { ChannelActionType } from '../../../src/lightning/channel/channel-actions';
 import {
 	FforState,
+	FforSlotState,
 	FF_RECONCILE_MARGIN_BLOCKS
 } from '../../../src/lightning/ffor/types';
 import { createFundingScript } from '../../../src/lightning/script/funding';
@@ -26,12 +27,14 @@ import {
 	openChaosStorage,
 	IChaosEnvOptions
 } from '../helpers/chaos-harness';
-import { REGTEST } from '../helpers/ffor-world';
+import { publishChannel, REGTEST } from '../helpers/ffor-world';
+import { encodeShortChannelId } from '../../../src/lightning/gossip/types';
 import { bitcoinRpc, ensureBitcoindFunds, mineBlocks } from './shared-helpers';
 import { bitcoindUp, tipHeight } from './ffor-concurrent-helpers';
 
 const S_SEED = 91;
 const R_SEED = 92;
+const P_SEED = 93;
 const AMOUNT = 1000000n;
 const extra: Partial<INodeConfig> = {
 	fforConcurrent: { enabled: true },
@@ -52,6 +55,8 @@ describe('Concurrent receive durable boundary qualification on regtest', functio
 	this.timeout(600000);
 	let fundingTx: bitcoin.Transaction;
 	let fundingIndex: number;
+	let payerFundingTx: bitcoin.Transaction;
+	let payerFundingIndex: number;
 	let height: number;
 	before(async () => {
 		if (!(await bitcoindUp()))
@@ -74,12 +79,36 @@ describe('Concurrent receive durable boundary qualification on regtest', functio
 			Buffer.from(output.script).equals(script.p2wshOutput)
 		);
 		expect(fundingIndex).to.be.greaterThan(-1);
+		const payerScript = createFundingScript(
+			makeChaosNodeConfig(P_SEED).channelBasepoints!.fundingPubkey,
+			makeChaosNodeConfig(S_SEED).channelBasepoints!.fundingPubkey,
+			REGTEST
+		);
+		const payerTxid = (await bitcoinRpc('sendtoaddress', [
+			payerScript.address,
+			0.01
+		])) as string;
+		await mineBlocks(1);
+		payerFundingTx = bitcoin.Transaction.fromHex(
+			(await bitcoinRpc('getrawtransaction', [payerTxid])) as string
+		);
+		payerFundingIndex = payerFundingTx.outs.findIndex((output) =>
+			Buffer.from(output.script).equals(payerScript.p2wshOutput)
+		);
+		expect(payerFundingIndex).to.be.greaterThan(-1);
 		height = await tipHeight();
 	});
 
 	for (const version of [1, 2] as const)
 		for (const role of ['S', 'R'] as const)
-			for (const operation of ['send', 'receive', 'proof', 'sync'] as const) {
+			for (const operation of [
+				'send',
+				'receive',
+				'proof',
+				'sync',
+				'settlement'
+			] as const) {
+				if (operation === 'settlement' && role === 'R') continue;
 				it(`version ${version}, ${role} restart during ${operation}: every durable boundary resumes with current commitments`, async () => {
 					const sides = (
 						env: IChaosEnv,
@@ -90,7 +119,10 @@ describe('Concurrent receive durable boundary qualification on regtest', functio
 							: { s: env.peers[0], r: victim };
 					const options: IChaosEnvOptions = {
 						victimSeedId: role === 'S' ? S_SEED : R_SEED,
-						peerSeedIds: [role === 'S' ? R_SEED : S_SEED],
+						peerSeedIds:
+							operation === 'settlement'
+								? [R_SEED, P_SEED]
+								: [role === 'S' ? R_SEED : S_SEED],
 						victimExtras: extra,
 						peerFactory: (seed) => createChaosNode(seed, { extras: extra }),
 						afterRestart: (env, restored) => {
@@ -139,6 +171,44 @@ describe('Concurrent receive durable boundary qualification on regtest', functio
 							r.handleFundingConfirmed(env.channelId);
 							buildDirectGraph(s, S_SEED, R_SEED);
 							buildDirectGraph(r, R_SEED, S_SEED);
+							if (operation === 'settlement') {
+								const p = env.peers[1];
+								p.handleNewBlock(height);
+								const opening = p.openChannel(s.getNodeId(), 1000000n);
+								const psId = p.createFunding(
+									opening,
+									payerFundingTx.getHash(),
+									payerFundingIndex,
+									crypto.randomBytes(64)
+								)!;
+								p.handleFundingConfirmed(psId);
+								s.handleFundingConfirmed(psId);
+								env.scratch.psId = psId;
+								for (const viewer of [p, s, r]) {
+									publishChannel(
+										viewer,
+										p,
+										s,
+										psId,
+										encodeShortChannelId({
+											block: height,
+											txIndex: 1,
+											outputIndex: 0
+										})
+									);
+									publishChannel(
+										viewer,
+										s,
+										r,
+										env.channelId,
+										encodeShortChannelId({
+											block: height,
+											txIndex: 2,
+											outputIndex: 0
+										})
+									);
+								}
+							}
 							const result = r.startFforEpoch(env.channelId.toString('hex'), {
 								voucherAmountsMsat: [AMOUNT, AMOUNT],
 								minPaymentMsat: AMOUNT,
@@ -158,7 +228,10 @@ describe('Concurrent receive durable boundary qualification on regtest', functio
 							env.scratch.hashes = epoch.paymentHashes.map((hash) =>
 								hash.toString('hex')
 							);
-							r.createFforVoucherInvoice(env.channelId.toString('hex'), 1);
+							env.scratch.invoice = r.createFforVoucherInvoice(
+								env.channelId.toString('hex'),
+								1
+							).bolt11;
 							if (operation === 'sync')
 								expect(
 									r.fforAddPreimage(
@@ -189,6 +262,25 @@ describe('Concurrent receive durable boundary qualification on regtest', functio
 								);
 								if (!env.kill.killed)
 									expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+							} else if (operation === 'settlement') {
+								const payment = env.peers[1].sendPayment(
+									env.scratch.invoice as string
+								);
+								await chaosWait(
+									env,
+									() =>
+										env.peers[1].getPayment(payment.paymentHash)?.status !==
+										PaymentStatus.PENDING
+								);
+								if (!env.kill.killed) {
+									expect(
+										env.peers[1].getPayment(payment.paymentHash)?.status
+									).to.equal(PaymentStatus.COMPLETED);
+									expect(
+										s.getFforEpoch(env.channelId!.toString('hex'))!
+											.slotStates[0]
+									).to.equal(FforSlotState.SETTLED);
+								}
 							} else if (operation === 'proof')
 								r.fforAddPreimage(
 									env.channelId!.toString('hex'),
@@ -201,6 +293,65 @@ describe('Concurrent receive durable boundary qualification on regtest', functio
 							buildDirectGraph(s, S_SEED, R_SEED);
 							buildDirectGraph(r, R_SEED, S_SEED);
 							const id = env.channelId!.toString('hex');
+							if (operation === 'settlement') {
+								const hash = Buffer.from(
+									(env.scratch.hashes as string[])[0],
+									'hex'
+								);
+								await chaosWait(
+									env,
+									() =>
+										env.peers[1].getPayment(hash)?.status ===
+										PaymentStatus.COMPLETED
+								);
+								expect(env.peers[1].getPayment(hash)?.status).to.equal(
+									PaymentStatus.COMPLETED
+								);
+								expect(s.getFforEpoch(id)!.slotStates[0]).to.equal(
+									FforSlotState.SETTLED
+								);
+								const upstreamInvoice = s.createInvoice({
+									amountMsat: 1000000n,
+									description:
+										'fresh upstream payment after settlement recovery'
+								});
+								const upstreamPayment = env.peers[1].sendPayment(
+									upstreamInvoice.bolt11
+								);
+								await chaosWait(
+									env,
+									() =>
+										env.peers[1].getPayment(upstreamPayment.paymentHash)
+											?.status !== PaymentStatus.PENDING
+								);
+								expect(
+									env.peers[1].getPayment(upstreamPayment.paymentHash)?.status
+								).to.equal(PaymentStatus.COMPLETED);
+								expect(r.fforSync(id).ok).to.be.true;
+								await chaosWait(
+									env,
+									() =>
+										r.getPayment(hash)?.status === PaymentStatus.COMPLETED &&
+										!r.getFforEpoch(id)!.syncRequestWire
+								);
+								expect(r.getPayment(hash)?.status).to.equal(
+									PaymentStatus.COMPLETED
+								);
+								const completedAt = r.getPayment(hash)!.completedAt;
+								expect(r.fforSync(id).ok).to.be.true;
+								await chaosWait(
+									env,
+									() => !r.getFforEpoch(id)!.syncRequestWire
+								);
+								expect(r.getPayment(hash)!.completedAt).to.equal(completedAt);
+								expect(
+									decodeFforSyncReplyMessage(
+										r.getFforEpoch(id)!.syncSnapshotWire!.subarray(2)
+									).preimages.map((entry) => entry.preimage.toString('hex'))
+								).to.deep.equal([
+									(env.scratch.preimage as Buffer).toString('hex')
+								]);
+							}
 							if (
 								operation === 'proof' &&
 								!r.getFforEpoch(id)!.knownPreimages[0]
@@ -259,7 +410,10 @@ describe('Concurrent receive durable boundary qualification on regtest', functio
 						async (result) => {
 							const { s, r } = sides(result.env, result.restored);
 							const id = result.env.channelId!;
-							const redeemed = operation === 'proof' || operation === 'sync';
+							const redeemed =
+								operation === 'proof' ||
+								operation === 'sync' ||
+								operation === 'settlement';
 							const hashes = result.env.scratch.hashes as string[];
 							if (operation === 'proof' && role === 'R') {
 								const disk = JSON.parse(result.postKillDump) as {
@@ -309,7 +463,9 @@ describe('Concurrent receive durable boundary qualification on regtest', functio
 								).to.deep.equal(redeemed ? hashes.slice(1) : hashes);
 							}
 							for (const status of result.restored.getRecoveryStatus().channels)
-								expect(status.status).to.equal(ChannelRecoveryStatus.Active);
+								expect(status.status, JSON.stringify(status)).to.equal(
+									ChannelRecoveryStatus.Active
+								);
 							expect(result.broadcasts).to.deep.equal([]);
 							if (redeemed)
 								expect(

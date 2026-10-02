@@ -143,6 +143,8 @@ export async function regtestWorld(opts: {
 	srPushMsat?: bigint;
 	feeInputs?: number;
 	concurrent?: boolean;
+	sChannel?: IWorldOptions['sChannel'];
+	rChannel?: IWorldOptions['rChannel'];
 }): Promise<IRegtestWorld> {
 	await ensureBitcoindFunds(3);
 	const sProvider = new BitcoindFundingProvider();
@@ -157,9 +159,10 @@ export async function regtestWorld(opts: {
 		seedBase,
 		rStorage: opts.rStorage,
 		sStorage: opts.sStorage,
-		sChannel: { feeratePerKw: FEERATE_PER_KW },
+		sChannel: { feeratePerKw: FEERATE_PER_KW, ...opts.sChannel },
 		rChannel: {
 			feeratePerKw: FEERATE_PER_KW,
+			...opts.rChannel,
 			...(opts.rToSelfDelay ? { toSelfDelay: opts.rToSelfDelay } : {})
 		},
 		srCapacitySats: CAPACITY_SAT,
