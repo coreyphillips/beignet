@@ -9377,6 +9377,16 @@ export class ChannelManager extends EventEmitter {
 						break;
 					}
 					progress?.attemptedMessageTypes.add(action.messageType);
+					// FFOR concurrent receive: S's ff_activate_ack is leaving, so
+					// R can take what a concurrent S originates from here on.
+					// Told to the channel before the transport call, so an
+					// answer the peer returns on this stack already finds it.
+					if (
+						action.messageType === MessageType.FF_ACTIVATE_ACK &&
+						typeof channel.fforNoteActivateAckSent === 'function'
+					) {
+						channel.fforNoteActivateAckSent();
+					}
 					this.sendMessage(peerPubkey, action.messageType, action.payload);
 					// The peer has our tx_signatures now, whatever an earlier drop
 					// of one left behind (issue #645).

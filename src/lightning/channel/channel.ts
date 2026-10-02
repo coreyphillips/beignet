@@ -1002,6 +1002,23 @@ export class Channel {
 	 */
 	private _fforCapabilityHold = false;
 	/**
+	 * FFOR concurrent receive (S, ACTIVE): our ff_activate_ack has been
+	 * produced but is not on the wire yet. handleFforActivate moves the
+	 * record to ACTIVE and ends our quiescence as it returns the ack, and the
+	 * ack leaves only when the durable write lands (and, in quorum mode, when
+	 * its frame is durable). Until it leaves R is ACTIVATING and quiescent
+	 * and fails the channel on any update, so a concurrent S takes no add
+	 * and no settle of its own (_fforConcurrentRefusal). A baseline S is
+	 * frozen in ACTIVE and needs no such rule.
+	 *
+	 * Set where the ack is produced (handleFforActivate, and its replay at a
+	 * reestablish), cleared by the dispatch that puts it on the wire
+	 * (fforNoteActivateAckSent). Memory-only: a restart sets it from the
+	 * record (the constructor), since a row cannot say whether the ack left,
+	 * and the first reestablish settles it from what R reports.
+	 */
+	private _fforActivateAckUnsent = false;
+	/**
 	 * FFOR concurrent receive (R, DRAINING): the peer reestablished
 	 * reporting a state before DRAINING, so it does not hold our ff_close
 	 * and would fail the channel on a voucher fail. No new voucher fail is
@@ -1377,6 +1394,13 @@ export class Channel {
 	constructor(state: IChannelState, signer?: ISigner) {
 		this._state = state;
 		this._signer = signer || null;
+		const f = state.ffor;
+		this._fforActivateAckUnsent =
+			f !== null &&
+			f !== undefined &&
+			f.role === 'S' &&
+			f.state === FforState.ACTIVE &&
+			f.concurrentVersion === FF_CONCURRENT_VERSION;
 	}
 
 	/**
@@ -22944,9 +22968,12 @@ export class Channel {
 	 *   ACTIVE, DRAINING: ordinary adds, fulfils and fails and the
 	 *     commitment rounds they need pass, in both directions. Our own add
 	 *     is refused under an admission hold (fforAdmissionHold); the
-	 *     peer's is not. update_fee, update_blockheight, a new stfu, splice
-	 *     and cooperative close stay refused: version 1 keeps the setup
-	 *     feerate and the funding until the book closes.
+	 *     peer's is not. Our own add and settle are refused on S until its
+	 *     ff_activate_ack has left (_fforActivateAckUnsent), and our own
+	 *     settle on R while a disputed close keeps its chain held.
+	 *     update_fee, update_blockheight, a new stfu, splice and cooperative
+	 *     close stay refused: version 1 keeps the setup feerate and the
+	 *     funding until the book closes.
 	 *   ABORTED, CLOSED: nothing is refused.
 	 *
 	 * A settle that names a voucher is judged separately, in every state
@@ -22976,6 +23003,18 @@ export class Channel {
 				return `FFOR epoch is ACTIVATING: no ${kind} until the activation is acknowledged`;
 			case FforState.ACTIVE:
 			case FforState.DRAINING:
+				// S, whose ff_activate_ack has not left: R is ACTIVATING and
+				// quiescent until it arrives, and fails the channel on an
+				// update. Nothing of ours is originated before the ack.
+				if (
+					ctx.origin === 'local' &&
+					(kind === 'add' || kind === 'settle') &&
+					f.role === 'S' &&
+					f.state === FforState.ACTIVE &&
+					this._fforActivateAckUnsent
+				) {
+					return `FFOR epoch is ACTIVE: no ${kind} until ff_activate_ack has been sent`;
+				}
 				switch (kind) {
 					case 'add': {
 						// Section 8: an incompatible reconnect holds NEW
@@ -24705,6 +24744,9 @@ export class Channel {
 		f.activateWire = wire;
 		f.activateAckWire = fforWireBytes(FF_ACTIVATE_ACK_TYPE, ack);
 		f.state = FforState.ACTIVE;
+		// Until the dispatch reports the ack sent, a concurrent S originates
+		// nothing: R is still ACTIVATING (see _fforActivateAckUnsent).
+		this._fforActivateAckUnsent = true;
 		// ACTIVE is on disk before the ack leaves (the persist leads the batch
 		// and a failed persist withholds the send); the ack ends quiescence.
 		return [
@@ -25686,6 +25728,15 @@ export class Channel {
 	}
 
 	/**
+	 * The manager's dispatch is putting our ff_activate_ack on the wire: its
+	 * durable write landed and nothing withholds it. From here a concurrent S
+	 * may originate ordinary traffic (see _fforActivateAckUnsent).
+	 */
+	fforNoteActivateAckSent(): void {
+		this._fforActivateAckUnsent = false;
+	}
+
+	/**
 	 * The one place that keeps the BOLT 2 stream in order behind a held
 	 * retransmission chain (see _fforHolding). Given a batch of actions this
 	 * channel produced, it moves every update, commitment_signed and
@@ -25986,6 +26037,14 @@ export class Channel {
 				actions.push(...this._fforMaybeUnwind(f));
 				break;
 		}
+		// Settled afresh at every reestablish: the ack is owed to the wire
+		// exactly when this answer replays it (R reported a state before
+		// ACTIVE), and the dispatch clears it as the replay leaves.
+		this._fforActivateAckUnsent = actions.some(
+			(a) =>
+				a.type === ChannelActionType.SEND_MESSAGE &&
+				a.messageType === MessageType.FF_ACTIVATE_ACK
+		);
 		return actions;
 	}
 }

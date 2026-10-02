@@ -1719,17 +1719,18 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 		// the manager's own comment for a failed write: "nothing that
 		// transition authorizes may follow it".
 		//
-		// Observed: handleFforActivate has already moved S's record to ACTIVE
-		// and ended S's quiescence in memory when the write fails. The ack is
-		// withheld, so R stays ACTIVATING and quiescent, but S's concurrent
-		// epoch now admits ordinary adds. When the failure is transient (the
-		// next write lands), an add S sends before the node's deferred
-		// disconnect reaches R, which fails the channel ("update_add_htlc
-		// after your stfu"). A baseline S is frozen in ACTIVE and refuses the
-		// add locally (the control below). The same class as 5a, in a place a
-		// baseline epoch does not have. A write that KEEPS failing withholds
-		// the add too and nothing leaks.
-		it.skip("DEFECT [new in #1301] S's ACTIVE write fails once: S, ACTIVE only in memory with its ack withheld, sends an ordinary add and R fails the channel", () => {
+		// handleFforActivate has already moved S's record to ACTIVE and ended
+		// S's quiescence in memory when the write fails. The ack is withheld,
+		// so R stays ACTIVATING and quiescent. Review round 1 of PR #1301
+		// found that S's concurrent epoch admitted ordinary adds there: when
+		// the failure was transient (the next write lands), an add S sent
+		// before the node's deferred disconnect reached R, which failed the
+		// channel ("update_add_htlc after your stfu"). A baseline S is frozen
+		// in ACTIVE and refuses the add locally (the control below).
+		//
+		// Fixed: a concurrent S originates nothing until the dispatch has put
+		// its ff_activate_ack on the wire.
+		it("S's ACTIVE write fails once: S, ACTIVE only in memory with its ack withheld, refuses its own add, and takes it again once the reconnect has replayed the ack", () => {
 			const pair = createPair({ pushSat: 200_000n });
 			let blocked = 0;
 			let failed = 0;
@@ -1754,18 +1755,101 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 			expect(res.ok, res.error).to.equal(true);
 			expect(blocked).to.equal(1);
 			expect(pair.link.types()).to.not.include(MessageType.FF_ACTIVATE_ACK);
+			expect(record(pair.sChannel).state).to.equal(FforState.ACTIVE);
 			expect(record(pair.rChannel).state).to.equal(FforState.ACTIVATING);
 			// Before the forced disconnect (deferred by setImmediate in the
-			// node), S originates a payment to R.
+			// node), S originates a payment to R. The write would land now.
 			pair.link.log.length = 0;
 			const add = offer(pair, 'S', 2_000_000n);
-			if (add.result.ok) {
-				expect(
-					sentBy(pair, 'S'),
-					'an add S accepted while its ack is withheld must not reach R'
-				).to.not.include(MessageType.UPDATE_ADD_HTLC);
-			}
-			expectAlive(pair, 'after the add');
+			expect(add.result.ok).to.equal(false);
+			expect(add.result.error).to.match(
+				/no add until ff_activate_ack has been sent/
+			);
+			expect(sentBy(pair, 'S')).to.deep.equal([]);
+			expect(ordinaryHtlcs(pair.sChannel)).to.deep.equal([]);
+			pair.sErrors.length = 0;
+			expectAlive(pair, 'after the refused add');
+			// The disconnect the node forces, and the reconnect: R reports
+			// ACTIVATING, S replays the ack ahead of everything, and from then
+			// on S's ordinary traffic is taken.
+			interrupt(pair, 'disconnect');
+			pair.link.reconnect();
+			expect(sentBy(pair, 'S')).to.include(MessageType.FF_ACTIVATE_ACK);
+			expect(record(pair.rChannel).state).to.equal(FforState.ACTIVE);
+			expectAlive(pair, 'ack replayed');
+			pay(pair, 'S', 2_000_000n);
+			expectAlive(pair, 'an ordinary payment of S');
+		});
+
+		it("the ack is replayed but its write fails again: S still originates nothing, and R's channel survives", () => {
+			const pair = createPair({ pushSat: 200_000n });
+			let failing = true;
+			pair.sManager.on(
+				'channel:persist',
+				(ev: { request?: { committed: boolean } }) => {
+					if (
+						failing &&
+						record(pair.sChannel).state === FforState.ACTIVE &&
+						ev.request
+					) {
+						ev.request.committed = false;
+					}
+				}
+			);
+			const res = pair.rManager.initiateFforEpoch(
+				pair.channelId,
+				terms(AMOUNTS, { concurrent: true })
+			);
+			expect(res.ok, res.error).to.equal(true);
+			interrupt(pair, 'disconnect');
+			pair.link.log.length = 0;
+			pair.link.reconnect();
+			// The reestablish persist failed too: the replayed ack is withheld.
+			expect(sentBy(pair, 'S')).to.not.include(MessageType.FF_ACTIVATE_ACK);
+			expect(record(pair.rChannel).state).to.equal(FforState.ACTIVATING);
+			failing = false;
+			const add = offer(pair, 'S', 2_000_000n);
+			expect(add.result.ok).to.equal(false);
+			expect(sentBy(pair, 'S')).to.not.include(MessageType.UPDATE_ADD_HTLC);
+			expect(pair.rChannel.getState()).to.not.equal(ChannelState.ERRORED);
+			expect(pair.link.types()).to.not.include(MessageType.ERROR);
+		});
+
+		it('a restarted S does not know whether its ack left: it originates nothing until the reestablish has settled it', () => {
+			const pair = createPair({ pushSat: 200_000n });
+			let dead = false;
+			pair.link.drop = (from, type): boolean => {
+				if (from === 'S' && type === MessageType.FF_ACTIVATE_ACK) dead = true;
+				return dead;
+			};
+			const res = pair.rManager.initiateFforEpoch(
+				pair.channelId,
+				terms(AMOUNTS, { concurrent: true })
+			);
+			expect(res.ok, res.error).to.equal(true);
+			expect(record(pair.rChannel).state).to.equal(FforState.ACTIVATING);
+			pair.link.drop = null;
+			restart(pair, 'S');
+			const internal = pair.sChannel as unknown as {
+				_fforActivateAckUnsent: boolean;
+			};
+			expect(internal._fforActivateAckUnsent, 'from the record').to.equal(true);
+			pair.link.log.length = 0;
+			pair.link.reconnect();
+			expect(internal._fforActivateAckUnsent, 'the replay left').to.equal(
+				false
+			);
+			expect(record(pair.rChannel).state).to.equal(FforState.ACTIVE);
+			pay(pair, 'S', 2_000_000n);
+			expectAlive(pair, 'after the replay');
+			// And when R already holds the ack, the reestablish clears it with
+			// nothing replayed.
+			restart(pair, 'S');
+			pair.link.log.length = 0;
+			pair.link.reconnect();
+			expect(sentBy(pair, 'S')).to.not.include(MessageType.FF_ACTIVATE_ACK);
+			pay(pair, 'S', 1_000_000n);
+			expectAlive(pair, 'after a second restart');
 		});
 
 		it('control: a baseline S whose ACTIVE write fails once refuses the add locally and the channel survives', () => {
