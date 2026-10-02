@@ -18,8 +18,6 @@
  *
  *   PIN [#1303]         one failed durable write, then a write that lands
  *   PIN [#1293 item 1]  S's setup timer crossing R's stfu
- *   PIN [PR 2 of #1283] the interim CLOSED rule when every voucher was
- *                       redeemed while ACTIVE
  *
  * Harness: helpers/ffor-concurrent-pair.ts (two ChannelManagers in loopback,
  * a Link with per-direction holds, restart by serialize / deserialize).
@@ -2904,60 +2902,19 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 			activate(pair, AMOUNTS, true);
 		});
 
-		it('PIN [PR 2 of #1283] DRAINING with no voucher left (every slot redeemed while ACTIVE, as PR 2 will allow): neither side reaches CLOSED until an ordinary round passes, and no new epoch can start before it', () => {
-			// The interim CLOSED rule has no round boundary at which CLOSED can
-			// be declared here, and R has no caller that redeems while ACTIVE
-			// until PR 2 of #1283, whose terminal slot records replace the
-			// rule. Pinned so PR 2 inherits a test: the epoch is not stuck for
-			// good, but it is stuck until unrelated traffic happens. Required
-			// then: both sides CLOSED at the acknowledgement.
+		it('a fully redeemed book stays closed across restart and permits the next epoch', () => {
 			const pair = activePair();
-			const base = record(pair.rChannel).sHtlcIdBase!;
-			const guard = pair.rChannel as unknown as {
-				_fforInternalSettle: boolean;
-			};
-			for (let k = 1; k <= 3; k++) {
-				const t = record(pair.sChannel).preimages[k - 1];
+			for (const t of record(pair.sChannel).preimages)
 				expect(pair.rManager.fforAddPreimage(pair.channelId, t).ok).to.equal(
 					true
 				);
-				guard._fforInternalSettle = true;
-				const res = pair.rManager.fulfillHtlc(
-					pair.channelId,
-					base + BigInt(k - 1),
-					t
-				);
-				guard._fforInternalSettle = false;
-				expect(res.ok, res.error).to.equal(true);
-			}
 			expect(vouchers(pair.rChannel)).to.deep.equal([]);
 			expect(vouchers(pair.sChannel)).to.deep.equal([]);
-			const closed = pair.rManager.closeFforEpoch(pair.channelId);
-			expect(closed.ok, closed.error).to.equal(true);
-			for (const side of SIDES) {
-				expect(FforState[record(channel(pair, side)).state]).to.equal(
-					'DRAINING'
-				);
-			}
-			const blocked = pair.rManager.initiateFforEpoch(
-				pair.channelId,
-				terms(AMOUNTS, { concurrent: true })
-			);
-			expect(blocked.ok).to.equal(false);
-			expect(blocked.error).to.match(/already in progress/);
-			// A reconnect does not close it either.
+			expect(pair.rManager.closeFforEpoch(pair.channelId).ok).to.equal(true);
+			expectClosed(pair, 'at close acknowledgement');
 			interrupt(pair, 'restart both');
 			pair.link.reconnect();
-			for (const side of SIDES) {
-				expect(FforState[record(channel(pair, side)).state]).to.equal(
-					'DRAINING'
-				);
-			}
-			// One ordinary payment supplies the boundary.
-			pay(pair, 'S', 1_000_000n);
-			expectClosed(pair, 'after an unrelated payment');
-			pair.sErrors.length = 0;
-			pair.rErrors.length = 0;
+			expectClosed(pair, 'after restart');
 			activate(pair, AMOUNTS, true);
 		});
 	});

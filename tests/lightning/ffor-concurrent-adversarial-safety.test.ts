@@ -628,29 +628,16 @@ function runSchedule(
 			else forgive('R', res.error);
 			check('close');
 		} else if (roll < 0.96 && !closeAsked && redemptions) {
-			// A paid voucher redeemed while ACTIVE, driven by hand: S takes
-			// it from any R that sends it (PR 2 gives ours the caller).
+			// A paid voucher redeemed while ACTIVE through the public API.
 			const open = [1, 2, 3].filter((k) => !settled.includes(k));
 			if (open.length === 0) continue;
 			const k = pick(open);
-			const base = record(pair.rChannel).sHtlcIdBase!;
 			const t = record(pair.sChannel).preimages[k - 1];
 			settleSlot(pair, k);
 			settled = [...settled, k];
 			const learned = pair.rManager.fforAddPreimage(pair.channelId, t);
 			expect(learned.ok, `${learned.error}; ${tell()}`).to.equal(true);
-			const internal = pair.rChannel as unknown as {
-				_fforInternalSettle: boolean;
-			};
-			internal._fforInternalSettle = true;
-			const res = pair.rManager.fulfillHtlc(
-				pair.channelId,
-				base + BigInt(k - 1),
-				t
-			);
-			internal._fforInternalSettle = false;
-			trace.push(`redeem ${k}${res.ok ? '' : ' (refused)'}`);
-			expect(res.ok, `${res.error}; ${tell()}`).to.equal(true);
+			trace.push(`redeem ${k}`);
 			check('redeem');
 		}
 	}
@@ -675,23 +662,6 @@ function runSchedule(
 			`S closed; ${tell()} ${why(pair)}`
 		).to.equal(FforState.CLOSED);
 	};
-	// With every voucher redeemed while ACTIVE the interim CLOSED rule needs
-	// one more commitment round after ff_close (pinned below),
-	// which the final settles below supply; otherwise CLOSED is already due.
-	const drainedBeforeClose =
-		redemptions && record(pair.rChannel).state === FforState.DRAINING;
-	if (drainedBeforeClose) {
-		expect(unresolvedSlots(pair), tell()).to.deep.equal([]);
-		const nudge = offer(pair, 'S', 1_000_000n);
-		expect(nudge.result.ok, `${nudge.result.error}; ${tell()}`).to.equal(true);
-		htlcs.push({
-			from: 'S',
-			id: nudge.id,
-			preimage: nudge.preimage,
-			amountMsat: 1_000_000n,
-			outcome: 'open'
-		});
-	}
 	expectClosed();
 	for (const h of htlcs) {
 		if (h.outcome !== 'open') continue;
@@ -809,10 +779,9 @@ describe('FFOR concurrent receive, adversarial: the unilateral exit while ACTIVE
 	// signed in no longer blocks the force close. A concurrent epoch is where
 	// a peer can send such an add beside live vouchers, so both directions
 	// are kept here as regressions.
-	it('regression (#1295): S sends one ordinary update_add_htlc and withholds its commitment_signed; R can still force close, so a voucher it holds the preimage of stays claimable on chain', () => {
+	it('regression (#1295): R can still force close after live redemption with an ordinary update pending', () => {
 		const pair = activePair();
-		// R holds the preimage of slot 2 (a payer's receipt): its claim on the
-		// voucher is enforceable on chain only through a force close.
+		// Importing the payer receipt redeems slot 2 before the next update.
 		const learned = pair.rManager.fforAddPreimage(
 			pair.channelId,
 			record(pair.sChannel).preimages[1]
@@ -825,9 +794,7 @@ describe('FFOR concurrent receive, adversarial: the unilateral exit while ACTIVE
 		expect(pair.rChannel.getState()).to.equal(ChannelState.NORMAL);
 		const plan = planClose(pair, 'R');
 		expect(plan.ok, `R cannot force close: ${plan.error}`).to.equal(true);
-		expect(pair.rChannel.getFullState().htlcs.size).to.equal(
-			AMOUNTS.length + 1
-		);
+		expect(pair.rChannel.getFullState().htlcs.size).to.equal(AMOUNTS.length);
 	});
 });
 
@@ -862,24 +829,12 @@ describe('FFOR concurrent receive, adversarial: the unilateral exit while ACTIVE
 describe('FFOR concurrent receive, adversarial: voucher settles a malicious R sends', function () {
 	this.timeout(30_000);
 
-	/** Redeem slot k by hand, as an R with a caller for it (PR 2, or not ours) does. */
+	/** Redeem a paid slot through the public proof-import operation. */
 	function redeem(pair: IPair, k: number): void {
-		const base = record(pair.rChannel).sHtlcIdBase!;
 		const t = record(pair.sChannel).preimages[k - 1];
 		settleSlot(pair, k);
 		const learned = pair.rManager.fforAddPreimage(pair.channelId, t);
 		expect(learned.ok, learned.error).to.equal(true);
-		const internal = pair.rChannel as unknown as {
-			_fforInternalSettle: boolean;
-		};
-		internal._fforInternalSettle = true;
-		const res = pair.rManager.fulfillHtlc(
-			pair.channelId,
-			base + BigInt(k - 1),
-			t
-		);
-		internal._fforInternalSettle = false;
-		expect(res.ok, res.error).to.equal(true);
 	}
 
 	for (const how of [
@@ -960,90 +915,36 @@ describe('FFOR concurrent receive, adversarial: voucher settles a malicious R se
 		expect(planClose(pair, 'R').ok).to.equal(true);
 	});
 
-	// PR 1 of #1283 has an interim CLOSED rule (DRAINING, no voucher entry
-	// left, checked at a commitment round boundary). R has no caller that
-	// redeems while ACTIVE until PR 2 of #1283, whose terminal slot records
-	// replace the rule. Until then this case PINS what the interim rule does
-	// when a hand-driven R redeemed every voucher before ff_close. Required
-	// once PR 2 lands (CONCURRENT-RECEIVE.md section 7: CLOSED means every
-	// voucher has been irrevocably resolved): both sides CLOSED at the
-	// acknowledgement, with no ordinary round needed.
-	it('PIN [PR 2 of #1283] (interim CLOSED rule): when every voucher was redeemed while ACTIVE, ff_close and its acknowledgement leave both sides DRAINING with nothing to drain, until an ordinary round passes', () => {
+	it('closes a fully redeemed book at its acknowledgement without another payment round', () => {
 		const pair = activePair();
-		redeem(pair, 1);
-		redeem(pair, 2);
-		redeem(pair, 3);
+		for (const k of [1, 2, 3]) redeem(pair, k);
 		expectHealthy(pair, 'all redeemed');
 		expect(pair.sChannel.getFullState().htlcs.size).to.equal(0);
 		expect(pair.rChannel.getFullState().htlcs.size).to.equal(0);
 		const closed = pair.rManager.closeFforEpoch(pair.channelId);
 		expect(closed.ok, closed.error).to.equal(true);
+		for (const ch of [pair.sChannel, pair.rChannel])
+			expect(record(ch).state).to.equal(FforState.CLOSED);
 		expectHealthy(pair, 'retired');
-		const states = (): string[] =>
-			[record(pair.sChannel).state, record(pair.rChannel).state].map(
-				(s) => FforState[s]
-			);
-		// Today: no round boundary follows the acknowledgement.
-		expect(states(), 'the interim rule').to.deep.equal([
-			'DRAINING',
-			'DRAINING'
-		]);
-		// Not stuck for good: the next ordinary round is the boundary.
-		pay(pair, 'S', 1_000_000n);
-		expectHealthy(pair, 'an ordinary round');
-		expect(states(), 'after an ordinary round').to.deep.equal([
-			'CLOSED',
-			'CLOSED'
-		]);
 	});
 });
 
-describe('FFOR concurrent receive, adversarial: the interim CLOSED rule splits the two sides', function () {
+describe('FFOR concurrent retirement beside ordinary updates', function () {
 	this.timeout(60_000);
-
-	// The same interim rule, seen from the two sides: S checks it when R's
-	// commitment_signed arrives and R one boundary later. It takes an R that
-	// redeemed every voucher while ACTIVE, which nothing in PR 1 does on its
-	// own. A PIN of what happens today; required once PR 2 of #1283 replaces
-	// the rule with terminal slot records: no wire error, both channels
-	// NORMAL (expectHealthy) after S's fee update.
-	it("PIN [PR 2 of #1283] (interim CLOSED rule, needs an R that redeems while ACTIVE): S reports CLOSED at R's commitment_signed while R is still DRAINING, and S's then-legal update_fee fails the channel at R", () => {
+	it('finishes retirement on both sides before later fee updates', () => {
 		const pair = createPair({ pushSat: 200_000n });
 		activate(pair, AMOUNTS, true);
-		// Every voucher is redeemed while ACTIVE (S accepts that in this PR).
-		const base = record(pair.rChannel).sHtlcIdBase!;
-		for (const k of [1, 2, 3]) {
-			const t = record(pair.sChannel).preimages[k - 1];
-			settleSlot(pair, k);
-			const learned = pair.rManager.fforAddPreimage(pair.channelId, t);
-			expect(learned.ok, learned.error).to.equal(true);
-			const internal = pair.rChannel as unknown as {
-				_fforInternalSettle: boolean;
-			};
-			internal._fforInternalSettle = true;
-			const res = pair.rManager.fulfillHtlc(
-				pair.channelId,
-				base + BigInt(k - 1),
-				t
+		for (const t of record(pair.sChannel).preimages)
+			expect(pair.rManager.fforAddPreimage(pair.channelId, t).ok).to.equal(
+				true
 			);
-			internal._fforInternalSettle = false;
-			expect(res.ok, res.error).to.equal(true);
-		}
-		expectHealthy(pair, 'all redeemed');
-		pair.link.log.length = 0;
-		// S's messages are slow from here on. S has an ordinary add and its
-		// commitment_signed on the wire.
 		pair.link.holdAt = (from): boolean => from === 'S';
 		const fromS = offer(pair, 'S', 1_000_000n);
 		expect(fromS.result.ok, fromS.result.error).to.equal(true);
-		// R retires the book and makes an ordinary payment.
-		const closed = pair.rManager.closeFforEpoch(pair.channelId);
-		expect(closed.ok, closed.error).to.equal(true);
+		expect(pair.rManager.closeFforEpoch(pair.channelId).ok).to.equal(true);
 		const fromR = offer(pair, 'R', 1_000_000n);
 		expect(fromR.result.ok, fromR.result.error).to.equal(true);
-		// S took R's commitment_signed with no voucher left: CLOSED on S.
 		expect(record(pair.sChannel).state).to.equal(FforState.CLOSED);
-		// Baseline ordinary operation on S: a fee update is legal again.
 		const fee = pair.sManager.updateChannelFee(
 			pair.channelId,
 			pair.sChannel.getFullState().localConfig.feeratePerKw + 50
@@ -1051,12 +952,8 @@ describe('FFOR concurrent receive, adversarial: the interim CLOSED rule splits t
 		expect(fee.ok, fee.error).to.equal(true);
 		pair.link.holdAt = null;
 		pair.link.release('S');
-		// Today: R, still DRAINING, refuses the fee update and fails the
-		// channel.
-		expect(pair.link.types(), why(pair)).to.include(MessageType.ERROR);
-		expect(pair.rErrors.join('|')).to.match(
-			/FFOR epoch is DRAINING: no fee while the voucher book is live/
-		);
+		expect(record(pair.rChannel).state).to.equal(FforState.CLOSED);
+		expectHealthy(pair, 'retired with ordinary traffic');
 	});
 });
 
@@ -1836,16 +1733,8 @@ describe('FFOR concurrent receive, adversarial: through the node', function () {
 		const rCh = srChannel(w.r, w);
 		const sBefore = srChannel(w.s, w).getFullState().localBalanceMsat;
 		const rBefore = rCh.getFullState().localBalanceMsat;
-		const base = worldRecord(w.r, w.srHex).sHtlcIdBase!;
 		const learned = w.r.fforAddPreimage(w.srHex, paid.preimage!);
 		expect(learned.ok, learned.error).to.equal(true);
-		const internal = rCh as unknown as { _fforInternalSettle: boolean };
-		internal._fforInternalSettle = true;
-		const res = w.r
-			.getChannelManager()
-			.fulfillHtlc(w.srChannelId, base + 1n, paid.preimage!);
-		internal._fforInternalSettle = false;
-		expect(res.ok, res.error).to.equal(true);
 		expect(rCh.getFullState().localBalanceMsat).to.equal(
 			rBefore + WORLD_AMOUNTS[1]
 		);
