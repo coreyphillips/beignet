@@ -478,6 +478,8 @@ export interface IChannelState {
 	 * reclaims formerly-in-flight HTLC value the penalty was meant to confiscate.
 	 */
 	revokedHtlcSnapshots?: Map<string, IHtlcSnapshotEntry[]>;
+	/** Sticky once a concurrent book is adopted, including after retirement. */
+	compactHtlcHistory?: true;
 
 	/**
 	 * Watchtower: the remote commitment transactions we signed that the peer

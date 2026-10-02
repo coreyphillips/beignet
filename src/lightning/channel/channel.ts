@@ -24421,8 +24421,10 @@ export class Channel {
 		f.acceptWire = acceptWire;
 		// Selected with the transcript it rides in: on the record before the
 		// persist that precedes ff_accept.
-		if (isFforConcurrentVersion(msg.concurrentVersion))
+		if (isFforConcurrentVersion(msg.concurrentVersion)) {
 			f.concurrentVersion = msg.concurrentVersion;
+			this._state.compactHtlcHistory = true;
+		}
 		f.sCommitmentNumber = this._state.localCommitmentNumber;
 		f.sHtlcIdBase = sHtlcIdBase;
 		f.paymentHashes = hashes;
@@ -24664,6 +24666,7 @@ export class Channel {
 		// The exact echo of the one version we request, checked above.
 		if (isFforConcurrentVersion(requestedVersion)) {
 			f.concurrentVersion = requestedVersion;
+			this._state.compactHtlcHistory = true;
 		}
 		f.sCommitmentNumber = msg.sCommitmentNumber;
 		f.sHtlcIdBase = msg.sHtlcIdBase;

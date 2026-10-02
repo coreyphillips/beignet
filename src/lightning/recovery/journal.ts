@@ -28,6 +28,7 @@ import { createCipheriv, createDecipheriv } from 'crypto';
 import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
 import { deriveFrameIv } from './guardian-wire';
 import { hkdfKey } from '../storage/encryption';
+import { usesCompactHtlcHistory } from '../storage/htlc-history';
 import {
 	CorruptRecoveryRowError,
 	IStorageBackend,
@@ -41,6 +42,7 @@ import {
 	decodeFrame,
 	encodeFrame,
 	encodedMutationBytes,
+	frameVersionForContent,
 	hashFrame
 } from './frame-codec';
 import { PaymentDirection, PaymentStatus } from '../node/types';
@@ -116,10 +118,14 @@ export const SNAPSHOT_SCHEMA_VERSION = '2';
 const PAGED_SNAPSHOT_SCHEMA_VERSION = '2+pages';
 export const FFOR_SNAPSHOT_SCHEMA_VERSION = '2+ffor-vouchers';
 const FFOR_PAGED_SNAPSHOT_SCHEMA_VERSION = '2+ffor-vouchers+pages';
+export const COMPACT_SNAPSHOT_SCHEMA_VERSION = '2+ffor-vouchers+htlc-history';
+const COMPACT_PAGED_SNAPSHOT_SCHEMA_VERSION =
+	'2+ffor-vouchers+htlc-history+pages';
 function currentSnapshotSchema(marker: string | null | undefined): boolean {
 	return (
 		marker === SNAPSHOT_SCHEMA_VERSION ||
-		marker === FFOR_SNAPSHOT_SCHEMA_VERSION
+		marker === FFOR_SNAPSHOT_SCHEMA_VERSION ||
+		marker === COMPACT_SNAPSHOT_SCHEMA_VERSION
 	);
 }
 /**
@@ -1097,7 +1103,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			mutations: [],
 			outboundMessages: []
 		};
-		this.stampDurability(frame);
+		this.stampFramePolicy(frame);
 		return ceiling - encodeFrame(frame).length - FRAME_CIPHERTEXT_OVERHEAD;
 	}
 
@@ -1286,6 +1292,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			if (
 				declared !== PAGED_SNAPSHOT_SCHEMA_VERSION &&
 				declared !== FFOR_PAGED_SNAPSHOT_SCHEMA_VERSION &&
+				declared !== COMPACT_PAGED_SNAPSHOT_SCHEMA_VERSION &&
 				!snapshotSchemaKnown(declared)
 			) {
 				throw new Error(
@@ -1561,7 +1568,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 					`verified chain's epoch ${this.epochFloor}; refusing to write`
 			);
 		}
-		this.stampDurability(frame);
+		this.stampFramePolicy(frame);
 		const plaintext = encodeFrame(frame);
 		const ceiling = this.maxFrameCiphertextBytes?.();
 		if (
@@ -1633,13 +1640,14 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	}
 
 	/**
-	 * Stamped at write time rather than at each construction site so that
+	 * Format and durability are stamped on newly written frames, so that
 	 * deltas, bootstrap snapshots, per-run re-base snapshots and interval
 	 * snapshots all carry the same declaration; a snapshot that omitted it
 	 * would be a certified head that says nothing about what its writer
 	 * promised.
 	 */
-	private stampDurability(frame: RecoveryFrame): void {
+	private stampFramePolicy(frame: RecoveryFrame): void {
+		frame.version = frameVersionForContent(frame);
 		if (!this.durability) return;
 		frame.durability = this.durability;
 		// Only quorum frames carry a policy stamp, because only they make a
@@ -1666,7 +1674,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	private fitSnapshotUnderCeiling(frame: RecoveryFrame): string[] {
 		const ceiling = this.maxFrameCiphertextBytes?.();
 		if (ceiling === undefined) return [];
-		this.stampDurability(frame);
+		this.stampFramePolicy(frame);
 		const size = (): number =>
 			encodeFrame(frame).length + FRAME_CIPHERTEXT_OVERHEAD;
 		if (size() <= ceiling) return [];
@@ -1903,7 +1911,9 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		const paged: RecoverySnapshot = {
 			...snapshot,
 			schemaVersion:
-				snapshot.schemaVersion === FFOR_SNAPSHOT_SCHEMA_VERSION
+				snapshot.schemaVersion === COMPACT_SNAPSHOT_SCHEMA_VERSION
+					? COMPACT_PAGED_SNAPSHOT_SCHEMA_VERSION
+					: snapshot.schemaVersion === FFOR_SNAPSHOT_SCHEMA_VERSION
 					? FFOR_PAGED_SNAPSHOT_SCHEMA_VERSION
 					: PAGED_SNAPSHOT_SCHEMA_VERSION,
 			...(snapshot.fforVouchers !== undefined ? { fforVouchers: [] } : {}),
@@ -1935,7 +1945,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			mutations,
 			outboundMessages: []
 		};
-		this.stampDurability(frame);
+		this.stampFramePolicy(frame);
 		return frame;
 	}
 
@@ -1996,7 +2006,9 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		// means a fresh journal is never seen as needing the repair.
 		this.storage.setRecoveryMeta!(
 			META_SNAPSHOT_SCHEMA,
-			frame.snapshot?.fforVouchers !== undefined
+			frameVersionForContent(frame) === 2
+				? COMPACT_SNAPSHOT_SCHEMA_VERSION
+				: frame.snapshot?.fforVouchers !== undefined
 				? FFOR_SNAPSHOT_SCHEMA_VERSION
 				: SNAPSHOT_SCHEMA_VERSION
 		);
@@ -2142,15 +2154,19 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		const corruptBefore = storage.corruptRowCount?.();
 		const channels = storage.loadAllChannels();
 		const fforVouchers = storage.loadAllFforVouchers?.() ?? [];
+		const compactHistory = channels.some((channel) =>
+			usesCompactHtlcHistory(channel.state)
+		);
 		const snapshot: RecoverySnapshot = {
 			// Authenticated by the frame: restoration re-derives the local
 			// schema marker from here, since recovery_meta does not ride
 			// frames and would otherwise be lost with the device.
-			schemaVersion:
-				fforVouchers.length > 0
-					? FFOR_SNAPSHOT_SCHEMA_VERSION
-					: SNAPSHOT_SCHEMA_VERSION,
-			...(fforVouchers.length > 0 ? { fforVouchers } : {}),
+			schemaVersion: compactHistory
+				? COMPACT_SNAPSHOT_SCHEMA_VERSION
+				: fforVouchers.length > 0
+				? FFOR_SNAPSHOT_SCHEMA_VERSION
+				: SNAPSHOT_SCHEMA_VERSION,
+			...(fforVouchers.length > 0 || compactHistory ? { fforVouchers } : {}),
 			channels: channels.map((c) => ({
 				channelId: c.channelId,
 				state: c.state,
@@ -2427,7 +2443,8 @@ export function assertFramesReconstructable(frames: RecoveryFrame[]): void {
 	if (
 		currentSnapshotSchema(declared) ||
 		declared === PAGED_SNAPSHOT_SCHEMA_VERSION ||
-		declared === FFOR_PAGED_SNAPSHOT_SCHEMA_VERSION
+		declared === FFOR_PAGED_SNAPSHOT_SCHEMA_VERSION ||
+		declared === COMPACT_PAGED_SNAPSHOT_SCHEMA_VERSION
 	) {
 		return;
 	}
@@ -2491,7 +2508,9 @@ export function reconstructFromFrames(
 	const declaredSchema = frames[snapshotIndex].snapshot!.schemaVersion;
 	// The local marker records content, and a paged snapshot's is schema 2.
 	const snapshotSchema =
-		declaredSchema === PAGED_SNAPSHOT_SCHEMA_VERSION
+		declaredSchema === COMPACT_PAGED_SNAPSHOT_SCHEMA_VERSION
+			? COMPACT_SNAPSHOT_SCHEMA_VERSION
+			: declaredSchema === PAGED_SNAPSHOT_SCHEMA_VERSION
 			? SNAPSHOT_SCHEMA_VERSION
 			: declaredSchema === FFOR_PAGED_SNAPSHOT_SCHEMA_VERSION
 			? FFOR_SNAPSHOT_SCHEMA_VERSION
