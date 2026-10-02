@@ -9620,8 +9620,17 @@ export class ChannelManager extends EventEmitter {
 					// No listener (or no storage) leaves committed true, which is
 					// the pre-outbox behavior for a node that persists nothing.
 					if (persistRequest && !persistRequest.committed) {
+						if (typeof channel.fforNoteStateWritten === 'function') {
+							channel.fforNoteStateWritten(false);
+						}
 						setSendsBlocked(true);
 						break;
+					}
+					// The channel learns that its state is on disk: what it
+					// still owed to storage (an observed capability hold of a
+					// concurrent FFOR epoch) is no longer owed.
+					if (typeof channel.fforNoteStateWritten === 'function') {
+						channel.fforNoteStateWritten(true);
 					}
 					// The FFOR state this write made durable, captured HERE: a
 					// nested dispatch may move the in-memory record before this

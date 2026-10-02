@@ -991,8 +991,10 @@ export class Channel {
 	private _fforHeldReplay: ChannelAction[] = [];
 	/**
 	 * FFOR concurrent receive: setFforCapabilities changed the record's
-	 * capability hold and no persist has carried the change yet. The
-	 * reestablish that follows writes it, whether or not it sends anything.
+	 * capability hold and no durable write has carried the change yet. Every
+	 * reestablish asks for that write while this is set, whether or not it
+	 * sends anything, and only a write that landed clears it
+	 * (fforNoteStateWritten): a write that failed is asked for again.
 	 */
 	private _fforCapabilityHoldUnsaved = false;
 	/**
@@ -11475,13 +11477,14 @@ export class Channel {
 		// later. A retransmission is only safe once what justifies it is on
 		// disk.
 		//
-		// A capability hold this reestablish set or lifted is written too,
-		// even when nothing is sent (CONCURRENT-RECEIVE.md section 8: the hold
+		// A capability hold a reestablish set or lifted is written too, even
+		// when nothing is sent (CONCURRENT-RECEIVE.md section 8: the hold
 		// lasts until a compatible init, so it must outlive this process).
-		const holdUnsaved = this._fforCapabilityHoldUnsaved;
-		this._fforCapabilityHoldUnsaved = false;
+		// The marker is not consumed here: the write may fail, and then the
+		// record in memory already carries the change and no later
+		// reestablish would see one. It stands until a write lands.
 		if (
-			holdUnsaved ||
+			this._fforCapabilityHoldUnsaved ||
 			actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)
 		) {
 			actions.unshift({ type: ChannelActionType.PERSIST_STATE });
@@ -25758,6 +25761,17 @@ export class Channel {
 		}
 		if (k < 1 || k > f.params.maxPayments) return 'no such slot';
 		return null;
+	}
+
+	/**
+	 * The manager's dispatch reports what became of a durable write of this
+	 * channel's state. A write that landed carried everything in the record,
+	 * so nothing of it is still owed to storage.
+	 */
+	fforNoteStateWritten(landed: boolean): void {
+		if (landed) {
+			this._fforCapabilityHoldUnsaved = false;
+		}
 	}
 
 	/**

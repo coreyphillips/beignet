@@ -1234,12 +1234,14 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 		// Section 8: the hold lasts until a compatible init, and the fix's own
 		// words: "it must outlive this process".
 		//
-		// Observed: handleReestablish consumes _fforCapabilityHoldUnsaved as it
-		// asks for the write. When that write fails, the record in memory
-		// already carries the hold, so the next reestablish sees no change
-		// and asks for no write; an idle channel's reestablish sends nothing
-		// either. The hold stays in memory only, and a restart lifts it.
-		it.skip('DEFECT [introduced by the round 1 fixes] the write of an observed hold fails once and is never asked for again: a later restart lifts the hold', () => {
+		// Found by this review: handleReestablish consumed
+		// _fforCapabilityHoldUnsaved as it asked for the write. When that
+		// write failed, the record in memory already carried the hold, so the
+		// next reestablish saw no change and asked for no write; an idle
+		// channel's reestablish sends nothing either. The hold stayed in
+		// memory only, and a restart lifted it. Fixed: the marker stands
+		// until the manager reports a write that landed.
+		it('the write of an observed hold fails once: the next reestablish asks for it again, and the hold outlives a restart', () => {
 			const pair = activePair();
 			pair.link.disconnect();
 			advertise(pair, 'R', false);
@@ -1259,13 +1261,27 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 			expect(pair.sChannel.fforSettlementRefusal(1, TIP)).to.match(
 				/capability hold/
 			);
+			expect(stored.row(), 'not on disk yet').to.not.include('capabilityHold');
 			// The node drops the connection over the failed write; R, still
-			// without the extension, comes back.
+			// without the extension, comes back. Nothing changed, nothing is
+			// sent, and the write is asked for again all the same.
 			pair.link.disconnect();
+			pair.link.log.length = 0;
 			pair.link.reconnect();
+			expect(pair.link.types()).to.deep.equal([
+				MessageType.CHANNEL_REESTABLISH,
+				MessageType.CHANNEL_REESTABLISH
+			]);
 			expect(pair.sChannel.fforSettlementRefusal(1, TIP)).to.match(
 				/capability hold/
 			);
+			expect(stored.row(), 'on disk now').to.include('"capabilityHold":true');
+			// Once it has landed it is not asked for a third time.
+			let writes = 0;
+			pair.sManager.on('channel:persist', () => writes++);
+			pair.link.disconnect();
+			pair.link.reconnect();
+			expect(writes).to.equal(0);
 			// R goes away; S restarts from what storage holds.
 			pair.link.disconnect();
 			restart(pair, 'S', stored.row());
