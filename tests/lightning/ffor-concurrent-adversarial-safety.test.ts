@@ -676,7 +676,7 @@ function runSchedule(
 		).to.equal(FforState.CLOSED);
 	};
 	// With every voucher redeemed while ACTIVE the interim CLOSED rule needs
-	// one more commitment round after ff_close (pinned above),
+	// one more commitment round after ff_close (pinned below),
 	// which the final settles below supply; otherwise CLOSED is already due.
 	const drainedBeforeClose =
 		redemptions && record(pair.rChannel).state === FforState.DRAINING;

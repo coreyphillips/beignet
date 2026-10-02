@@ -25359,7 +25359,11 @@ export class Channel {
 				message: 'FFOR: ff_close_ack differs from the one processed',
 				cleanup: 'none'
 			};
-			if (this._fforIsConcurrent(f) && !f.activationMismatch) {
+			if (
+				this._fforIsConcurrent(f) &&
+				f.state === FforState.DRAINING &&
+				!f.activationMismatch
+			) {
 				// S signed two different final acknowledgements for one epoch
 				// (it came back from a row that predates a settlement, or
 				// worse). Nothing is adopted from the second, and a chain held
@@ -25369,7 +25373,9 @@ export class Channel {
 				// recorded: no new add of ours (fforAdmissionHold), no settle
 				// of ours behind a chain that will not leave
 				// (_fforConcurrentRefusal), and the host is told. A baseline
-				// epoch carries no ordinary traffic and is left as it was.
+				// epoch carries no ordinary traffic and is left as it was, and
+				// so is a book that has already CLOSED: every voucher is
+				// resolved and there is nothing left to dispute.
 				f.activationMismatch = true;
 				return [{ type: ChannelActionType.PERSIST_STATE }, differs];
 			}

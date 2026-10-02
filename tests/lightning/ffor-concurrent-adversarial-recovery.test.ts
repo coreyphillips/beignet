@@ -1512,6 +1512,32 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 				expectSettled(pair, 'after the wedge');
 			});
 
+			it('a differing acknowledgement after the book has CLOSED records no dispute: every voucher is already resolved', () => {
+				const pair = activePair();
+				const enforce: Buffer[] = [];
+				pair.rManager.on('ffor:enforce', (id: Buffer) => enforce.push(id));
+				settleSlot(pair, 2);
+				const closed = pair.rManager.closeFforEpoch(pair.channelId);
+				expect(closed.ok, closed.error).to.equal(true);
+				expectClosed(pair, 'closed');
+				const other2 = Buffer.from(
+					record(pair.rChannel).closeAckWire!.subarray(2)
+				);
+				other2[other2.length - 1] ^= 1;
+				pair.rErrors.length = 0;
+				pair.rManager.handleMessage(
+					pair.sPub,
+					MessageType.FF_CLOSE_ACK,
+					other2
+				);
+				expect(pair.rErrors.join('|')).to.match(/ff_close_ack differs/);
+				expect(record(pair.rChannel).activationMismatch).to.equal(false);
+				expect(enforce.length).to.equal(0);
+				pair.rErrors.length = 0;
+				pay(pair, 'R', 1_000_000n);
+				expectAlive(pair, 'afterwards');
+			});
+
 			it('control: a baseline epoch answers a differing acknowledgement as before, with no dispute recorded', () => {
 				const pair = createPair({ pushSat: 200_000n });
 				activate(pair, AMOUNTS, false);
