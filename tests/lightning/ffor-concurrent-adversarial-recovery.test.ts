@@ -1626,6 +1626,83 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 			]);
 		});
 
+		it('in quorum mode the released chain waits for the frame its release wrote, then leaves in order, and nothing is refused for want of a frame', async () => {
+			// Recovery Protocol 5.8: a commitment_signed, a revoke_and_ack or
+			// an update_fulfill_htlc leaves only against the persist that
+			// authorized it, and a batch that sends one with no persist ahead
+			// is refused outright. The release therefore leads with a persist
+			// of its own, and what R made while holding rides behind it.
+			const pair = activePair();
+			const waiting: Array<
+				(outcome: { released: boolean; reason: string }) => void
+			> = [];
+			const barrier = {
+				enforcing: true,
+				open: true,
+				isReleased(): boolean {
+					return this.open;
+				},
+				whenReleased(): Promise<{ released: boolean; reason: string }> {
+					if (this.open) {
+						return Promise.resolve({ released: true, reason: '' });
+					}
+					return new Promise((resolve) => waiting.push(resolve));
+				}
+			};
+			pair.rConfig.durabilityBarrier = barrier;
+			restart(pair, 'R');
+			const frozen: string[] = [];
+			pair.rManager.on(
+				'transition:frozen',
+				(_peer: string, _id: string, reason: string) => frozen.push(reason)
+			);
+			pair.link.reconnect();
+			settleSlot(pair, 2);
+			const backup = snapshot(pair, 'S');
+			pair.link.drop = (from, type): boolean =>
+				from === 'R' && type !== MessageType.FF_CLOSE;
+			const closed = pair.rManager.closeFforEpoch(pair.channelId);
+			expect(closed.ok, closed.error).to.equal(true);
+			pair.link.drop = null;
+			restart(pair, 'S', backup);
+			pair.link.log.length = 0;
+			pair.sErrors.length = 0;
+			pair.rErrors.length = 0;
+			// S adds while R's ff_close is in flight; R answers behind its chain.
+			pair.link.holdAt = (from, type): boolean =>
+				from === 'R' && type === MessageType.FF_CLOSE;
+			pair.link.reconnect();
+			pair.link.holdAt = null;
+			const add = offer(pair, 'S', 2_000_000n);
+			expect(add.result.ok, add.result.error).to.equal(true);
+			// From here R's frames are not yet quorum durable.
+			barrier.open = false;
+			pair.link.release('R');
+			expect(record(pair.sChannel).state).to.equal(FforState.DRAINING);
+			// The acknowledgement came back and the chain is released, but it
+			// is parked behind the frame of its own persist: nothing left.
+			expect(sentBy(pair, 'R')).to.not.include(MessageType.COMMITMENT_SIGNED);
+			expect(sentBy(pair, 'R')).to.not.include(MessageType.REVOKE_AND_ACK);
+			expect(waiting.length, 'one batch waits on the barrier').to.equal(1);
+			barrier.open = true;
+			for (const resolve of waiting.splice(0)) {
+				resolve({ released: true, reason: '' });
+			}
+			for (let i = 0; i < 10; i++) {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			}
+			expect(frozen, 'no batch was refused').to.deep.equal([]);
+			const fromR = sentBy(pair, 'R');
+			const signed = fromR.indexOf(MessageType.COMMITMENT_SIGNED);
+			expect(signed).to.be.greaterThan(-1);
+			expect(fromR.indexOf(MessageType.REVOKE_AND_ACK)).to.be.greaterThan(
+				signed
+			);
+			expectAlive(pair, 'chain released');
+			expectClosed(pair, 'chain released');
+			expect(pair.events.R.forwarded).to.include(add.id);
+		});
+
 		it('PIN [#1300] a settle waiting behind the held chain, then the connection drops before the acknowledgement: the reconnect replays it ahead of the commitment_signed that does not cover it', () => {
 			// What waits behind the chain is, in the channel's state, an update
 			// queued behind an unrevoked commitment_signed: issue #1300's
