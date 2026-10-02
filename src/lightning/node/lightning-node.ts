@@ -18947,6 +18947,13 @@ export class LightningNode extends EventEmitter {
 				'FFOR epoch is in dispute after reestablish: no invoice is exposed'
 			);
 		}
+		// CONCURRENT-RECEIVE.md section 8: an incompatible reconnect holds new
+		// admission. S refuses to settle under the hold, so an invoice exposed
+		// now is one it would not honour.
+		const admissionHold = channel.fforAdmissionHold();
+		if (admissionHold) {
+			throw new Error(`FFOR: no invoice is exposed while ${admissionHold}`);
+		}
 		if (k < 1 || k > record.params.maxPayments) {
 			throw new Error(`voucher ${k} is not in the book`);
 		}

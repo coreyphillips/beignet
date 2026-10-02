@@ -973,6 +973,14 @@ export class Channel {
 	 * offline settlement service continues while R is simply away.
 	 */
 	private _fforCapabilityHold = false;
+	/**
+	 * FFOR concurrent receive (R, DRAINING): the peer reestablished
+	 * reporting a state before DRAINING, so it does not hold our ff_close
+	 * and would fail the channel on a voucher fail. No new voucher fail is
+	 * issued until its ff_close_ack arrives again. Memory-only: every
+	 * reestablish answers it afresh.
+	 */
+	private _fforPeerLacksClose = false;
 	private _spliceSession: SpliceSession | null = null;
 	// A splice the caller requested while the channel was not yet quiescent.
 	// Fired automatically once we reach QUIESCENT (we drive quiescence ourselves
@@ -11268,18 +11276,41 @@ export class Channel {
 		}
 
 		// ── FFOR section 7.5.5 retransmission rules ──
-		actions.push(...this._handleReestablishFfor(msg));
+		const fforActions = this._handleReestablishFfor(msg);
+		if (this._fforAckLeadsReplay(fforActions)) {
+			// A concurrent S that owes R its ff_activate_ack again may also
+			// hold ordinary updates it sent after activating. R is still
+			// ACTIVATING until the ack arrives and fails the channel on any
+			// update before it, so the ack leaves ahead of every BOLT 2
+			// retransmission. A baseline S has nothing to retransmit here.
+			actions = [...fforActions, ...actions];
+		} else {
+			actions.push(...fforActions);
+		}
 		if (this._fforShouldHoldDrain(msg)) {
 			// R in DRAINING facing an S that does not hold ff_close: the drain's
 			// fulfils, fails and commitment_signed would land in S's ACTIVE
 			// freeze. Hold them; handleFforCloseAck releases them.
+			//
+			// A concurrent epoch holds only when a voucher fail is queued (S,
+			// still ACTIVE, fails the channel on one), and then holds the
+			// whole retransmission chain in its order, ordinary updates
+			// included: the commitment_signed that covers the fail covers
+			// them too.
+			const concurrent =
+				this._state.ffor !== null &&
+				this._state.ffor !== undefined &&
+				this._fforIsConcurrent(this._state.ffor);
 			const held = actions.filter(
 				(a) =>
 					a.type === ChannelActionType.SEND_MESSAGE &&
 					(a.messageType === MessageType.UPDATE_FULFILL_HTLC ||
 						a.messageType === MessageType.UPDATE_FAIL_HTLC ||
 						a.messageType === MessageType.COMMITMENT_SIGNED ||
-						a.messageType === MessageType.REVOKE_AND_ACK)
+						a.messageType === MessageType.REVOKE_AND_ACK ||
+						(concurrent &&
+							(a.messageType === MessageType.UPDATE_ADD_HTLC ||
+								a.messageType === MessageType.UPDATE_FAIL_MALFORMED_HTLC)))
 			);
 			this._fforHeldReplay = held;
 			actions = actions.filter((a) => !held.includes(a));
@@ -25218,6 +25249,8 @@ export class Channel {
 				// the peer did not hold ff_close, then re-drive what is owed.
 				const held = this._fforHeldReplay;
 				this._fforHeldReplay = [];
+				// The peer holds the close again: voucher fails may flow.
+				this._fforPeerLacksClose = false;
 				return [...held, ...this._fforDrain(f)];
 			}
 			return [
@@ -25336,6 +25369,10 @@ export class Channel {
 					if (!r.some((a) => a.type === ChannelActionType.ERROR))
 						actions.push(...r);
 				} else if (!bitmapGet(f.settledBitmap, k)) {
+					// A concurrent S that reestablished short of DRAINING takes
+					// ordinary traffic and voucher fulfils, but fails the
+					// channel on a voucher fail: none until its ack returns.
+					if (this._fforIsConcurrent(f) && this._fforPeerLacksClose) continue;
 					const r = this.failHtlc(entry.id, this._fforVoucherFailReason(entry));
 					if (!r.some((a) => a.type === ChannelActionType.ERROR))
 						actions.push(...r);
@@ -25590,12 +25627,60 @@ export class Channel {
 		return null;
 	}
 
-	/** R in DRAINING whose peer reports a state before DRAINING for our epoch. */
+	/**
+	 * R in DRAINING whose peer reports a state before DRAINING for our epoch.
+	 * A baseline S is frozen there and takes nothing, so every drain
+	 * retransmission is held. A concurrent S takes ordinary updates and
+	 * voucher fulfils while ACTIVE and refuses only a voucher fail, so the
+	 * retransmissions are held only when one is queued.
+	 */
 	private _fforShouldHoldDrain(msg: IChannelReestablishMessage): boolean {
 		const f = this._state.ffor;
 		if (!f || f.role !== 'R' || f.state !== FforState.DRAINING) return false;
 		if (!msg.ffor || !msg.ffor.epochId.equals(f.epochId)) return false;
-		return msg.ffor.state < FforState.DRAINING;
+		if (msg.ffor.state >= FforState.DRAINING) return false;
+		return !this._fforIsConcurrent(f) || this._fforVoucherFailQueued(f);
+	}
+
+	/**
+	 * Whether an update_fail_htlc or update_fail_malformed_htlc of ours for
+	 * a voucher awaits retransmission. Both bodies begin `[32: channel_id]
+	 * [8: id]`, and the ids we fail are S's offered ids, among which the
+	 * book's range names the vouchers and nothing else.
+	 */
+	private _fforVoucherFailQueued(f: IFforEpochRecord): boolean {
+		if (f.sHtlcIdBase === null) return false;
+		const first = f.sHtlcIdBase;
+		const last = first + BigInt(f.params.maxPayments - 1);
+		for (const update of this._state.pendingLocalUpdates ?? []) {
+			if (
+				update.type !== MessageType.UPDATE_FAIL_HTLC &&
+				update.type !== MessageType.UPDATE_FAIL_MALFORMED_HTLC
+			) {
+				continue;
+			}
+			if (update.payload.length < 40) continue;
+			const id = update.payload.readBigUInt64BE(32);
+			if (id >= first && id <= last) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Whether the FFOR part of a reestablish answer must leave before the
+	 * BOLT 2 retransmissions: a concurrent epoch whose answer retransmits
+	 * ff_activate_ack (CONCURRENT-RECEIVE.md section 1.2 keeps base section
+	 * 7.5.5's acknowledgement-loss rule, and a concurrent S may have sent
+	 * updates since).
+	 */
+	private _fforAckLeadsReplay(fforActions: ChannelAction[]): boolean {
+		const f = this._state.ffor;
+		if (!f || !this._fforIsConcurrent(f)) return false;
+		return fforActions.some(
+			(a) =>
+				a.type === ChannelActionType.SEND_MESSAGE &&
+				a.messageType === MessageType.FF_ACTIVATE_ACK
+		);
 	}
 
 	/** The section 11.1 reestablish TLV for our epoch, if any. */
@@ -25644,6 +25729,12 @@ export class Channel {
 		const peer =
 			msg.ffor && msg.ffor.epochId.equals(f.epochId) ? msg.ffor : null;
 		const peerState: FforState | null = peer ? peer.state : null;
+		// Answered afresh on every reestablish (see _fforPeerLacksClose).
+		this._fforPeerLacksClose =
+			f.role === 'R' &&
+			f.state === FforState.DRAINING &&
+			peerState !== null &&
+			peerState < FforState.DRAINING;
 		const actions: ChannelAction[] = [];
 		const error = (message: string): void => {
 			actions.push({ type: ChannelActionType.ERROR, message, cleanup: 'none' });

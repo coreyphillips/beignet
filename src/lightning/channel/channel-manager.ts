@@ -5803,6 +5803,16 @@ export class ChannelManager extends EventEmitter {
 			if (channel.getState() === ChannelState.ERRORED) return;
 		}
 
+		// FFOR concurrent receive (CONCURRENT-RECEIVE.md section 8): before a
+		// concurrent epoch resumes new ordinary adds or new delegated
+		// admissions, the CURRENT init exchange must advertise the base and
+		// concurrent capabilities on both sides. Judged here, on every
+		// reestablish, and handed to the channel before it runs.
+		if (typeof channel.setFforCapabilities === 'function') {
+			channel.setFforCapabilities(
+				this.peerNegotiatedFforConcurrent(peerPubkey)
+			);
+		}
 		const actions = channel.handleReestablish(msg);
 		this.processActions(peerPubkey, channel, actions);
 
