@@ -99,6 +99,8 @@ export enum MessageType {
 	FF_ABORT = 55049,
 	FF_CLOSE = 55051,
 	FF_CLOSE_ACK = 55053,
+	FF_SYNC = 55075,
+	FF_SYNC_REPLY = 55077,
 
 	// FFOR D-R receipt witnesses and the BOLT 12 issuer (Appendix F): odd,
 	// 16-byte request id, authorized under the mailbox's fetch_key, never

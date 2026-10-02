@@ -52,6 +52,8 @@ describe('FFOR voucher terminal outcomes', function () {
 	it('keeps acknowledged outcome evidence behind a later ordinary signature', () => {
 		const pair = createPair({ pushSat: 100_000n });
 		activate(pair);
+		// Learn proof offline so this case exercises the retirement round.
+		pair.link.disconnect();
 		expect(
 			pair.rManager.fforAddPreimage(
 				pair.channelId,
@@ -61,6 +63,7 @@ describe('FFOR voucher terminal outcomes', function () {
 		pair.link.holdAt = (from, type) =>
 			from === 'S' && type === MessageType.COMMITMENT_SIGNED;
 		expect(pair.rManager.closeFforEpoch(pair.channelId).ok).to.be.true;
+		pair.link.reconnect();
 		const acknowledged = pair.rChannel.getFullState().remoteRevocationNumber;
 		expect(offer(pair, 'R', 2_000_000n).result.ok).to.be.true;
 		expect(pair.rChannel.getFullState().remoteCommitmentNumber).to.equal(
@@ -81,12 +84,14 @@ describe('FFOR voucher terminal outcomes', function () {
 		it(`${profile}: records the actual removal only when both views remove the voucher`, () => {
 			const pair = createPair({ concurrent });
 			activate(pair);
+			pair.link.disconnect();
 			const preimage = pairRecord(pair.sChannel).preimages[0];
 			expect(pair.rManager.fforAddPreimage(pair.channelId, preimage).ok).to.be
 				.true;
 			pair.link.holdAt = (from, type) =>
 				from === 'S' && type === MessageType.COMMITMENT_SIGNED;
 			expect(pair.rManager.closeFforEpoch(pair.channelId).ok).to.be.true;
+			pair.link.reconnect();
 			expect(pair.rChannel.getFullState().signedLocalRemovals).to.have.length(
 				3
 			);
@@ -218,9 +223,7 @@ describe('FFOR voucher terminal outcomes', function () {
 				const paid = pay(w, invoice);
 				expect(paid.status).to.equal(PaymentStatus.COMPLETED);
 				const hash = record(w.r, w.srHex).paymentHashes[0];
-				w.sr.reconnect();
 				expect(w.r.fforAddPreimage(w.srHex, paid.preimage!).ok).to.be.true;
-				w.sr.disconnect();
 				const view = forceCloseAndObserve(
 					w,
 					w.r,

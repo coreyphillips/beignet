@@ -510,6 +510,15 @@ node can run for others, each an explicit opt-in switched on with an exact
 The SSE stream carries `ffor:state`, `ffor:settled`, `ffor:delegated-failed`,
 `ffor:enforce` and the witness and issuer events.
 
+The experimental concurrent library profile keeps ordinary payments available
+within the channel's remaining capacity. `LightningNode.fforSync()` fetches paid
+slot receipts and redeems them while other vouchers remain live.
+`rescueFforEpoch()` syncs a connected concurrent book without retiring it.
+Feature bits 562/563 remain disabled by default until full regtest qualification.
+See [concurrent receive and reserved retirement](docs/FFOR-RESERVED-RETIREMENT.md)
+for the version 1 and 2 contracts and storage requirements. Daemon and automatic
+receive integration remain separate work.
+
 ### Swaps (Lightning to on-chain, and on-chain to Lightning)
 
 A beignet node can serve swaps to any Lightning peer in both directions.

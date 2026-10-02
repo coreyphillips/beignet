@@ -35,7 +35,10 @@ import {
 	FF_ERROR_TYPE,
 	FF_INIT_TYPE,
 	FF_INVOICES_TYPE,
+	FF_MAX_K,
 	FF_REESTABLISH_TLV_TYPE,
+	FF_SYNC_TYPE,
+	FF_SYNC_REPLY_TYPE,
 	FforAbortReason,
 	FforState,
 	IFforAbortMessage,
@@ -47,7 +50,9 @@ import {
 	IFforErrorMessage,
 	IFforInitMessage,
 	IFforInvoicesMessage,
-	IFforReestablishTlv
+	IFforReestablishTlv,
+	IFforSyncMessage,
+	IFforSyncReplyMessage
 } from './types';
 
 const HEADER_LEN = 64;
@@ -75,6 +80,10 @@ export function fforMessageName(type: number): string {
 			return 'ff_close';
 		case FF_CLOSE_ACK_TYPE:
 			return 'ff_close_ack';
+		case FF_SYNC_TYPE:
+			return 'ff_sync';
+		case FF_SYNC_REPLY_TYPE:
+			return 'ff_sync_reply';
 		default:
 			return `ff_unknown(${type})`;
 	}
@@ -91,7 +100,9 @@ export function isFforMessageType(type: number): boolean {
 		type === FF_ACTIVATE_ACK_TYPE ||
 		type === FF_ABORT_TYPE ||
 		type === FF_CLOSE_TYPE ||
-		type === FF_CLOSE_ACK_TYPE
+		type === FF_CLOSE_ACK_TYPE ||
+		type === FF_SYNC_TYPE ||
+		type === FF_SYNC_REPLY_TYPE
 	);
 }
 
@@ -835,6 +846,127 @@ export function decodeFforCloseAckMessage(body: Buffer): IFforCloseAckMessage {
 		preimages,
 		signature
 	};
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent receive: ff_sync (55075), ff_sync_reply (55077)
+// ---------------------------------------------------------------------------
+
+export function encodeFforSyncUnsigned(
+	msg: Omit<IFforSyncMessage, 'signature'>
+): Buffer {
+	assert32(msg.channelId, 'channel_id');
+	assert32(msg.epochId, 'epoch_id');
+	assert32(msg.activationHash, 'activation_hash');
+	assert32(msg.nonce, 'nonce');
+	return Buffer.concat([
+		msg.channelId,
+		msg.epochId,
+		msg.activationHash,
+		msg.nonce
+	]);
+}
+
+export function decodeFforSyncMessage(body: Buffer): IFforSyncMessage {
+	if (body.length + 2 > 0xffff) throw new Error('ff_sync: frame too long');
+	const r = new Reader(body, 'ff_sync');
+	const channelId = r.bytes(32);
+	const epochId = r.bytes(32);
+	const activationHash = r.bytes(32);
+	const nonce = r.bytes(32);
+	const { signature } = splitSigned(body, r.offset, [], 'ff_sync');
+	return { channelId, epochId, activationHash, nonce, signature };
+}
+
+type SyncSnapshot = Pick<
+	IFforSyncReplyMessage,
+	'numSlots' | 'settled' | 'preimages'
+>;
+
+/** Canonical content excludes nonce, signature, extensions and sequence. */
+export function fforSyncSnapshotContent(snapshot: SyncSnapshot): Buffer {
+	const { numSlots, settled, preimages } = snapshot;
+	if (!Number.isInteger(numSlots) || numSlots < 1 || numSlots > FF_MAX_K)
+		throw new Error('ff_sync_reply: invalid slot count');
+	if (settled.length !== bitmapLength(numSlots))
+		throw new Error('ff_sync_reply: bitmap length must be ceil(K/8)');
+	const usedBits = numSlots % 8;
+	if (usedBits && settled[settled.length - 1] >> usedBits !== 0)
+		throw new Error('ff_sync_reply: unused bitmap bits must be zero');
+	const expected: number[] = [];
+	for (let k = 1; k <= numSlots; k++) {
+		if (bitmapGet(settled, k)) expected.push(k);
+	}
+	if (preimages.length !== expected.length)
+		throw new Error('ff_sync_reply: preimage count must match bitmap');
+	const encoded: Buffer[] = [];
+	for (let i = 0; i < expected.length; i++) {
+		const p = preimages[i];
+		if (p.k !== expected[i])
+			throw new Error(
+				'ff_sync_reply: preimages must match ordered bitmap slots'
+			);
+		assert32(p.preimage, 'preimage');
+		encoded.push(u16(p.k), p.preimage);
+	}
+	return Buffer.concat([
+		u16(numSlots),
+		settled,
+		u16(preimages.length),
+		...encoded
+	]);
+}
+
+export function encodeFforSyncReplyUnsigned(
+	msg: Omit<IFforSyncReplyMessage, 'signature'>
+): Buffer {
+	if (msg.snapshotSeq === 0n && msg.preimages.length > 0)
+		throw new Error('ff_sync_reply: sequence zero must be empty');
+	return Buffer.concat([
+		encodeFforSyncUnsigned(msg),
+		u64(msg.snapshotSeq),
+		fforSyncSnapshotContent(msg)
+	]);
+}
+
+export function decodeFforSyncReplyMessage(
+	body: Buffer
+): IFforSyncReplyMessage {
+	if (body.length + 2 > 0xffff)
+		throw new Error('ff_sync_reply: frame too long');
+	const r = new Reader(body, 'ff_sync_reply');
+	const channelId = r.bytes(32);
+	const epochId = r.bytes(32);
+	const activationHash = r.bytes(32);
+	const nonce = r.bytes(32);
+	const snapshotSeq = r.u64();
+	const numSlots = r.u16();
+	if (numSlots < 1 || numSlots > FF_MAX_K)
+		throw new Error('ff_sync_reply: invalid slot count');
+	const settled = r.bytes(bitmapLength(numSlots));
+	const count = r.u16();
+	if (count > numSlots || r.remaining() < count * 34 + SIG_LEN)
+		throw new Error('ff_sync_reply: invalid preimage count');
+	const preimages: IFforSyncReplyMessage['preimages'] = [];
+	for (let i = 0; i < count; i++) {
+		preimages.push({ k: r.u16(), preimage: r.bytes(32) });
+	}
+	const { signature } = splitSigned(body, r.offset, [], 'ff_sync_reply');
+	const message = {
+		channelId,
+		epochId,
+		activationHash,
+		nonce,
+		snapshotSeq,
+		numSlots,
+		settled,
+		preimages,
+		signature
+	};
+	fforSyncSnapshotContent(message);
+	if (snapshotSeq === 0n && preimages.length > 0)
+		throw new Error('ff_sync_reply: sequence zero must be empty');
+	return message;
 }
 
 // ---------------------------------------------------------------------------
