@@ -395,6 +395,7 @@ export interface ISerializedChannelState {
 	 */
 	pendingFeerateSignable?: boolean;
 	pendingFeerateCommitted?: boolean;
+	awaitingLocalFeeCommitment?: boolean;
 	/**
 	 * The feerate baked into the current signed local commitment (the rate
 	 * remoteCommitmentSignature covers) — force-close rebuilds at this rate.
@@ -919,6 +920,7 @@ export function serializeChannelState(
 		pendingFeeratePerKw: s.pendingFeeratePerKw,
 		pendingFeerateSignable: s.pendingFeerateSignable,
 		pendingFeerateCommitted: s.pendingFeerateCommitted,
+		awaitingLocalFeeCommitment: s.awaitingLocalFeeCommitment,
 		lastSignedCommitFeeratePerKw: s.lastSignedCommitFeeratePerKw,
 		pendingLeaseBlockheight: s.pendingLeaseBlockheight,
 		pendingLeaseBlockheightSignable: s.pendingLeaseBlockheightSignable,
@@ -1443,6 +1445,7 @@ export function deserializeChannelState(
 		pendingFeeratePerKw: s.pendingFeeratePerKw,
 		pendingFeerateSignable: s.pendingFeerateSignable,
 		pendingFeerateCommitted: s.pendingFeerateCommitted,
+		awaitingLocalFeeCommitment: s.awaitingLocalFeeCommitment,
 		lastSignedCommitFeeratePerKw: s.lastSignedCommitFeeratePerKw,
 		pendingLeaseBlockheight: s.pendingLeaseBlockheight,
 		pendingLeaseBlockheightSignable: s.pendingLeaseBlockheightSignable,
