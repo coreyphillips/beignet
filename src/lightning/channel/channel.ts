@@ -4457,10 +4457,11 @@ export class Channel {
 	 * peer's revoke_and_ack acknowledges the commitment that contains it. On
 	 * reconnection the peer may have lost it (uncommitted updates are
 	 * forgotten across a disconnect, and a restarted peer restores a state
-	 * that may predate it), so handleReestablish retransmits the queue BEFORE
-	 * any retransmitted commitment_signed. Receivers treat replays
-	 * idempotently (duplicate add ids are ignored; a fulfill/fail of an
-	 * already fulfilled/failed HTLC is a no-op).
+	 * that may predate it), so handleReestablish retransmits the queue: the
+	 * entries our last commitment_signed covered ahead of that signature when
+	 * it is retransmitted, the entries queued after it behind it. Receivers
+	 * treat replays idempotently (duplicate add ids are ignored; a
+	 * fulfill/fail of an already fulfilled/failed HTLC is a no-op).
 	 */
 	private _queuePendingLocalUpdate(type: MessageType, payload: Buffer): void {
 		this._state.pendingLocalUpdates.push({
@@ -11054,16 +11055,39 @@ export class Channel {
 		// Every queued update the peer has not acknowledged with a
 		// revoke_and_ack may have been lost with the connection (the peer
 		// forgets uncommitted updates; a restarted peer restores a state that
-		// may predate them). Replay them verbatim BEFORE any retransmitted
-		// commitment_signed so the signature always follows the updates it
-		// covers. Peers that did keep them treat the replays idempotently
+		// may predate them). Replay them verbatim, in the order they were
+		// sent. Peers that did keep them treat the replays idempotently
 		// (duplicate add ids ignored; fulfill/fail of an already
 		// fulfilled/failed HTLC is a no-op).
+		//
+		// A retransmitted commitment_signed must follow exactly the updates it
+		// covers (issue #1300). The queue's first pendingLocalUpdatesSignedCount
+		// entries are the ones our last commitment_signed covered; anything
+		// behind them was sent after it, while its revoke_and_ack was still
+		// outstanding. Replayed ahead of that signature, a later update lands
+		// in the view the peer verifies the signature against, and the peer
+		// fails the channel on a signature that was never wrong. So when the
+		// peer missed the signature the later updates are held back here and
+		// go out after it (and after any revoke_and_ack retransmitted behind
+		// it), which is where they sat on the original connection. They stay
+		// queued and needsCommitment stays set, so our NEXT signature covers
+		// them once the peer's revoke_and_ack for this one arrives. With no
+		// signature to retransmit the whole queue goes out here, as before.
+		const peerMissedCommitment =
+			msg.nextCommitmentNumber <= this._state.remoteCommitmentNumber &&
+			this._state.remoteCommitmentNumber > 0n;
+		const laterUpdates: ChannelAction[] = [];
 		if (!spliceActive || pendingLock) {
 			const queue = this._state.pendingLocalUpdates;
 			const signedCount = this._state.pendingLocalUpdatesSignedCount;
 			const peerHasCommitment =
 				msg.nextCommitmentNumber === this._state.remoteCommitmentNumber + 1n;
+			// A count that is not a number names no boundary: everything stays
+			// ahead of the signature, as it did before the boundary was read.
+			const covered =
+				peerMissedCommitment && Number.isInteger(signedCount)
+					? Math.min(Math.max(signedCount, 0), queue.length)
+					: queue.length;
 			for (let i = 0; i < queue.length; i++) {
 				const update = queue[i];
 				// A fee already covered by the commitment the peer holds must not
@@ -11078,9 +11102,18 @@ export class Channel {
 				) {
 					continue;
 				}
-				actions.push(replayMsg(update.type as MessageType, update.payload));
+				const replay = replayMsg(update.type as MessageType, update.payload);
+				if (i < covered) {
+					actions.push(replay);
+				} else {
+					laterUpdates.push(replay);
+				}
 			}
 		}
+		// Position of the commitment_signed retransmission, if one is made
+		// below: the later updates only wait for a signature that actually
+		// leaves.
+		const beforeCommitmentRetransmit = actions.length;
 
 		// ── Retransmit our pending-lock commitment BATCH if the peer missed it ──
 		// The generic single-message path below can't: it holds neither the
@@ -11194,8 +11227,25 @@ export class Channel {
 			}
 		}
 
+		// No commitment_signed was retransmitted after all (nothing cached to
+		// replay, or a batch that could not be rebuilt): the later updates take
+		// the place they always had, ahead of a deferred revoke_and_ack.
+		const commitmentRetransmitted = actions.length > beforeCommitmentRetransmit;
+		if (!commitmentRetransmitted) {
+			actions.push(...laterUpdates);
+		}
+
 		// Deferred revoke_and_ack (original order: commitment_signed first).
 		actions.push(...revokeRetransmit);
+
+		// Updates sent after the retransmitted commitment_signed. Behind the
+		// deferred revoke_and_ack too: nothing the peer does with a
+		// revoke_and_ack depends on an update of ours, while a later settle can
+		// depend on the revoke_and_ack (the peer refuses a settle of an HTLC
+		// whose add we have not revoked for).
+		if (commitmentRetransmitted) {
+			actions.push(...laterUpdates);
+		}
 
 		// option_taproot: adopt the peer's freshly-regenerated verification nonce so
 		// the next commitment round can co-sign (the peer's old nonce was lost on its
