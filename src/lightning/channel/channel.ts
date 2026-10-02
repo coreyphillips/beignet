@@ -4607,10 +4607,6 @@ export class Channel {
 	 * already fulfilled/failed HTLC is a no-op).
 	 */
 	private _queuePendingLocalUpdate(type: MessageType, payload: Buffer): void {
-		// FFOR: an update of ours made while the retransmission chain is held
-		// must not be left behind a held commitment_signed that does not
-		// cover it (see _fforReopenHeldCommitment).
-		this._fforReopenHeldCommitment();
 		this._state.pendingLocalUpdates.push({
 			type,
 			payload: Buffer.from(payload)
@@ -11187,11 +11183,10 @@ export class Channel {
 			this._state.spliceInFlight?.sentTxSignatures === true &&
 			this._state.spliceInFlight?.receivedTxSignatures === true;
 
-		// ── FFOR: withdraw a voucher fail the peer provably never took ──
-		// Before anything is replayed: the replay below is what the peer will
-		// hold, and the peer's numbers say what it holds now (issue #1308).
+		// FFOR: replace unsigned voucher fails before reconnect replay.
+		// A signed fail remains covered by its original signature (issue #1308).
 		if (!spliceActive) {
-			this._fforWithdrawFailsAtReestablish(msg);
+			this._fforWithdrawFailsAtReestablish();
 		}
 
 		// ── Retransmit un-acked update messages (BOLT 2) ──
@@ -25436,13 +25431,13 @@ export class Channel {
 			// whatever message carried it: S may have settled the slot for a
 			// payer after it lost the close. Each reaches the chain monitors
 			// before the persist, as in the accepting branch below, and a fail
-			// of that voucher the peer provably never took is withdrawn for
-			// the fulfil (_fforWithdrawFails).
+			// of that voucher is replaced by the fulfil only while no signature
+			// covers it (_fforWithdrawFails).
 			const kept: ChannelAction[] = [];
 			for (const p of msg.preimages) {
 				kept.push(...(this._fforKeepPreimage(f, p.preimage) ?? []));
 			}
-			const withdrew = this._fforWithdrawFails(f, null);
+			const withdrew = this._fforWithdrawFails(f, false);
 			let disputed = false;
 			if (this._fforIsConcurrent(f) && !f.activationMismatch) {
 				// A concurrent epoch would otherwise go on taking ordinary
@@ -25618,10 +25613,10 @@ export class Channel {
 				}
 			];
 		}
-		// Section 7.5.6 again: a fail of that voucher that is queued and that
-		// the peer provably never took gives way to the fulfil (issue #1308).
+		// Section 7.5.6: an unsigned, held fail may give way to the fulfil.
+		// A signed fail stays unchanged, with its preimage kept for the chain.
 		if (f.state === FforState.DRAINING) {
-			this._fforWithdrawFails(f, null);
+			this._fforWithdrawFails(f, false);
 		}
 		return [
 			...learned,
@@ -25674,66 +25669,25 @@ export class Channel {
 	}
 
 	/**
-	 * R, DRAINING (issue #1308, both profiles): a voucher whose preimage we
-	 * hold is fulfilled, never failed (base section 7.5.6), and a preimage
-	 * that arrives during a pending failure is used where that is still
-	 * possible (CONCURRENT-RECEIVE.md section 7). It is still possible
-	 * exactly while the fail is provably undelivered, which is one of:
-	 *
-	 *   1. no commitment_signed of ours covers the fail yet, and the fail
-	 *      itself has not left on this connection: it sits in the held chain,
-	 *      or a reestablish is about to replay it (the peer forgets
-	 *      uncommitted updates with the connection, BOLT 2);
-	 *   2. the one commitment_signed that covers it is itself undelivered by
-	 *      the peer's own account: it sits in the held chain (the reestablish
-	 *      that began the hold asked for it again, or it was signed while
-	 *      holding), or the peer's channel_reestablish, being answered now,
-	 *      asks for it again (`peerLacksCommitment`).
-	 *
-	 * Then the queued update_fail_htlc is replaced, in place, by the
-	 * update_fulfill_htlc, and in case 2 the commitment_signed is taken back
-	 * so the next one is made at the same commitment number over the fulfil.
-	 * BOLT 2 lets a retransmitted commitment_signed differ from the lost
-	 * one: the peer holds neither it nor the updates under it.
-	 *
-	 * In every other case a signature of ours that removes the voucher as
-	 * failed may be in the peer's hands, and nothing off chain takes it
-	 * back. The preimage is kept; what remains is on chain. Our own
-	 * commitment carries the voucher until we revoke it, which we do only
-	 * when the peer's commitment_signed without the voucher arrives, so a
-	 * force close before that claims it with the preimage.
-	 *
-	 * `peerLacksCommitment` is the answer of the reestablish being handled,
-	 * or null on a live connection, where only the held chain can prove
-	 * anything. Returns whether anything was withdrawn.
+	 * Replace an unsigned voucher fail only while it is held locally or is
+	 * about to be replayed after a disconnect. Once a signature covers the
+	 * fail, preserve that signature and the update it covered regardless of
+	 * the peer's reestablish counters. Keep the preimage for on-chain recovery.
 	 */
 	private _fforWithdrawFails(
 		f: IFforEpochRecord,
-		peerLacksCommitment: boolean | null
+		atReestablish: boolean
 	): boolean {
 		if (f.role !== 'R' || f.state !== FforState.DRAINING) return false;
-		const atReestablish = peerLacksCommitment !== null;
 		if (!atReestablish && !this._fforHolding) return false;
 		const queue = this._state.pendingLocalUpdates;
 		const signedCount = this._state.pendingLocalUpdatesSignedCount;
-		const heldCommitment = this._fforHeldReplay.findIndex(
-			(a) =>
-				a.type === ChannelActionType.SEND_MESSAGE &&
-				a.messageType === MessageType.COMMITMENT_SIGNED
-		);
-		// The outstanding signature may be taken back only when it is ours
-		// alone to take: one commitment_signed awaiting its revoke_and_ack,
-		// the peer without it, and nothing but HTLC updates baked into it.
-		const commitmentUndelivered =
-			(atReestablish ? peerLacksCommitment === true : heldCommitment >= 0) &&
-			this._fforCommitmentCanBeTakenBack();
 		const isFailOf = (type: number, payload: Buffer, id: bigint): boolean =>
 			(type === MessageType.UPDATE_FAIL_HTLC ||
 				type === MessageType.UPDATE_FAIL_MALFORMED_HTLC) &&
 			payload.length >= 40 &&
 			payload.readBigUInt64BE(32) === id;
 		let withdrew = false;
-		let unsign = false;
 		for (const [k, entry] of this._fforVoucherEntries(f)) {
 			const preimage = f.knownPreimages[k - 1];
 			if (!preimage) continue;
@@ -25746,19 +25700,13 @@ export class Channel {
 			const index = queue.findIndex((u) =>
 				isFailOf(u.type, u.payload, entry.id)
 			);
-			// Not in the queue: the peer has revoked for the commitment that
-			// removed the voucher. The failure is irrevocable.
-			if (index < 0) continue;
-			const signed = index < signedCount;
-			if (signed && !commitmentUndelivered) continue;
+			if (index < 0 || index < signedCount) continue;
 			const fulfil = encodeUpdateFulfillHtlcMessage({
 				channelId: this._state.channelId!,
 				id: entry.id,
 				paymentPreimage: preimage
 			});
 			if (!atReestablish) {
-				// On a live connection the fail must be in the held chain: that
-				// is the proof it has not left. It gives up its place there.
 				const held = this._fforHeldReplay.findIndex(
 					(a) =>
 						a.type === ChannelActionType.SEND_MESSAGE &&
@@ -25776,97 +25724,14 @@ export class Channel {
 				payload: fulfil
 			};
 			withdrew = true;
-			if (signed) unsign = true;
-		}
-		if (unsign) {
-			if (atReestablish) {
-				this._fforTakeBackCommitment();
-			} else {
-				this._fforReopenHeldCommitment();
-			}
 		}
 		return withdrew;
 	}
 
-	/**
-	 * Whether the one commitment_signed of ours that awaits its
-	 * revoke_and_ack may be taken back, given that the peer provably does
-	 * not hold it: it must be the only thing in flight, with nothing but
-	 * HTLC updates baked into it.
-	 */
-	private _fforCommitmentCanBeTakenBack(): boolean {
-		return (
-			this.isAwaitingRemoteRevocation() &&
-			this._state.pendingFeerateCommitted !== true &&
-			this._state.pendingLeaseBlockheightCommitted !== true &&
-			!this._lastSentBatch
-		);
-	}
-
-	/**
-	 * While the chain is held, keep it in the one shape a retransmission can
-	 * always reproduce: our updates, then one commitment_signed over all of
-	 * them. A held commitment_signed is provably undelivered (the peer's
-	 * reestablish asked for it again, or it was signed while holding), so
-	 * when an update of ours is about to join the chain behind it, or a
-	 * queued fail under it is withdrawn, the signature is taken out of the
-	 * chain and taken back, and the auto-sign that follows every update
-	 * makes it again, at the same commitment number, over everything queued.
-	 *
-	 * Without this the update would sit behind an unrevoked signature that
-	 * does not cover it, and a connection lost before the release would
-	 * meet the reestablish replay of issue #1300 (every queued update ahead
-	 * of the retransmitted signature), which fails the channel.
-	 */
-	private _fforReopenHeldCommitment(): void {
-		if (!this._fforHolding) return;
-		const at = this._fforHeldReplay.findIndex(
-			(a) =>
-				a.type === ChannelActionType.SEND_MESSAGE &&
-				a.messageType === MessageType.COMMITMENT_SIGNED
-		);
-		if (at < 0 || !this._fforCommitmentCanBeTakenBack()) return;
-		this._fforHeldReplay.splice(at, 1);
-		this._fforTakeBackCommitment();
-	}
-
-	/** _fforWithdrawFails, judged by the channel_reestablish being answered. */
-	private _fforWithdrawFailsAtReestablish(
-		msg: IChannelReestablishMessage
-	): void {
+	/** Replace only unsigned voucher fails before the reconnect replay. */
+	private _fforWithdrawFailsAtReestablish(): void {
 		const f = this._state.ffor;
-		if (!f) return;
-		// The peer asks for our outstanding commitment_signed again exactly
-		// when the next one it expects is the one we last signed.
-		const peerLacksCommitment =
-			this._state.remoteCommitmentNumber > 0n &&
-			msg.nextCommitmentNumber === this._state.remoteCommitmentNumber;
-		this._fforWithdrawFails(f, peerLacksCommitment);
-	}
-
-	/**
-	 * Take back the one commitment_signed of ours that awaits its
-	 * revoke_and_ack and that the peer provably does not hold, so that the
-	 * next signature is made at the same commitment number over the updates
-	 * as they now stand. The inverse of signCommitment's bookkeeping for an
-	 * HTLC-only round: the sign counter, the count of updates the signature
-	 * covered, the stamps the peer's revoke_and_ack would have promoted, and
-	 * the retransmission cache. The owed-commitment flag is raised, so the
-	 * ordinary auto-sign makes the new signature. Entries the signature
-	 * moved from PENDING to COMMITTED stay COMMITTED: they are still queued
-	 * and the new signature covers them again.
-	 */
-	private _fforTakeBackCommitment(): void {
-		this._state.remoteCommitmentNumber -= 1n;
-		this._state.pendingLocalUpdatesSignedCount = 0;
-		this._state.needsCommitment = true;
-		this._state.lastSentCommitmentSigned = null;
-		this._state.lastSentPartialSignatureWithNonce = null;
-		this._state.lastSentHtlcSignatures = [];
-		for (const entry of this._state.htlcs.values()) {
-			if (entry.commitCoverPending === true) entry.commitCoverPending = false;
-			if (entry.addCoverPending === true) entry.addCoverPending = false;
-		}
+		if (f) this._fforWithdrawFails(f, true);
 	}
 
 	/**
@@ -26109,9 +25974,9 @@ export class Channel {
 	 * auto-sign makes all join the chain in the order they were made. The
 	 * channel's state has advanced as if they were sent, exactly as for a
 	 * message written to a socket that then dies, so a disconnect needs no
-	 * unwinding: the next reestablish retransmits from that state. (An
-	 * update of ours first takes a held commitment_signed back, so the
-	 * signature that then joins covers it: _fforReopenHeldCommitment.)
+	 * unwinding: the next reestablish retransmits from that state. Later
+	 * updates stay behind the held signature and wait for its revocation
+	 * before the next commitment can cover them.
 	 *
 	 * Everything else in the batch (the persist, the events, the epoch's own
 	 * messages, a wire error) is untouched.

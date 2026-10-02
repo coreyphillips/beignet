@@ -11,9 +11,9 @@
  * ack-unsent flag and the persisted capability hold, between two HONEST
  * nodes, with cuts, restarts, crossing messages and failed durable writes.
  *
- * Every test passes. Most pin an attack that held. What the review found is
- * fixed, and those cases assert the fixed behaviour; each says in a comment
- * what it found.
+ * Signed commitments remain immutable while later updates wait behind
+ * them. Signed-fail preimage checks stop with the current voucher claim available,
+ * before a replacement commitment can make a signed failure irrevocable.
  *
  * Harness: helpers/ffor-concurrent-pair.ts.
  *
@@ -27,14 +27,17 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import { Channel } from '../../src/lightning/channel/channel';
+import { buildLocalCommitment } from '../../src/lightning/channel/commitment-builder';
 import {
 	ChannelAction,
 	ChannelActionType
 } from '../../src/lightning/channel/channel-actions';
 import { decodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
-import { ChannelState } from '../../src/lightning/channel/types';
+import { ChannelState, HtlcDirection } from '../../src/lightning/channel/types';
 import { MessageType } from '../../src/lightning/message/types';
 import { Feature } from '../../src/lightning/features/flags';
+import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivation';
+import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { FforState } from '../../src/lightning/ffor/types';
 import {
 	bitmapSet,
@@ -173,11 +176,48 @@ function heldTypes(ch: Channel): number[] {
 	return held.map((a) => (a as unknown as { messageType: number }).messageType);
 }
 
+interface ISignedCommitment {
+	localNumber: bigint;
+	remoteNumber: bigint;
+	revocations: bigint | undefined;
+	signedCount: number;
+	signature: Buffer | null;
+	partialSignature: Buffer | null;
+	htlcSignatures: Buffer[];
+	updates: { type: number; payload: Buffer }[];
+	coverStamps: [string, boolean, boolean][];
+}
+
+function signedCommitment(ch: Channel): ISignedCommitment {
+	const state = ch.getFullState();
+	return {
+		localNumber: state.localCommitmentNumber,
+		remoteNumber: state.remoteCommitmentNumber,
+		revocations: state.remoteRevocationNumber,
+		signedCount: state.pendingLocalUpdatesSignedCount,
+		signature: state.lastSentCommitmentSigned
+			? Buffer.from(state.lastSentCommitmentSigned)
+			: null,
+		partialSignature: state.lastSentPartialSignatureWithNonce
+			? Buffer.from(state.lastSentPartialSignatureWithNonce)
+			: null,
+		htlcSignatures: state.lastSentHtlcSignatures.map((s) => Buffer.from(s)),
+		updates: state.pendingLocalUpdates
+			.slice(0, state.pendingLocalUpdatesSignedCount)
+			.map((u) => ({ type: u.type, payload: Buffer.from(u.payload) })),
+		coverStamps: [...state.htlcs].map(([key, entry]) => [
+			key,
+			entry.commitCoverPending === true,
+			entry.addCoverPending === true
+		])
+	};
+}
+
 /** The commitment a force close would broadcast, or the refusal. */
 function planClose(
 	pair: IPair,
 	side: Side
-): { ok: boolean; error?: string; outputs: number } {
+): { ok: boolean; error?: string; outputs: number; tx: Buffer | null } {
 	const mgr = manager(pair, side) as unknown as {
 		signerFor(channel: Channel, htlc: boolean): unknown;
 	};
@@ -194,8 +234,49 @@ function planClose(
 		error: plan.error,
 		outputs: plan.commitmentTx
 			? bitcoin.Transaction.fromBuffer(plan.commitmentTx).outs.length
-			: 0
+			: 0,
+		tx: plan.commitmentTx ?? null
 	};
+}
+
+function expectVoucherClaimAvailable(pair: IPair, k: number): void {
+	const state = pair.rChannel.getFullState();
+	const f = record(pair.rChannel);
+	const preimage = f.knownPreimages[k - 1];
+	expect(preimage, `voucher ${k} preimage`).to.not.equal(null);
+	expect(
+		crypto
+			.createHash('sha256')
+			.update(preimage!)
+			.digest()
+			.equals(f.paymentHashes[k - 1])
+	).to.equal(true);
+	const local = buildLocalCommitment(
+		state,
+		perCommitmentPointFromSecret(
+			generateFromSeed(
+				state.localPerCommitmentSeed,
+				MAX_INDEX - state.localCommitmentNumber
+			)
+		),
+		state.localCommitmentNumber,
+		true
+	);
+	expect(
+		local.htlcOutputs.some(
+			(o) =>
+				o.direction === HtlcDirection.RECEIVED &&
+				o.paymentHash.equals(f.paymentHashes[k - 1]) &&
+				o.amount === f.params.voucherAmountsMsat[k - 1] / 1000n &&
+				o.cltvExpiry === f.params.voucherExpiry
+		),
+		`voucher ${k} in R's current signed commitment`
+	).to.equal(true);
+	const plan = planClose(pair, 'R');
+	expect(plan.ok, plan.error).to.equal(true);
+	expect(bitcoin.Transaction.fromBuffer(plan.tx!).getId()).to.equal(
+		local.result.tx.getId()
+	);
 }
 
 /**
@@ -820,13 +901,9 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 				expectClosed(pair, 'released');
 			});
 
-			it("with a settle of R's in the chain: the held signature was made again over it, and the second answer reproduces the updates and then that signature", () => {
-				// A settle made while holding used to sit behind the held
-				// commitment_signed, and the answer to a reestablish replays
-				// every queued update ahead of the retransmitted signature
-				// (issue #1300). The held signature is now made again over
-				// whatever of R's joins the chain, so the queue is updates and
-				// then one signature, and any answer reproduces that order.
+			it("with a settle of R's in the chain: the second answer preserves the signed prefix, original signature and unsigned tail", () => {
+				// Issue #1306 preserves the signed boundary when rebuilding the
+				// replay. The later settle belongs to the next commitment.
 				const { pair, fromS } = sLostTheClose([2]);
 				pair.link.holdAt = (from, type): boolean =>
 					from === 'S' && type === MessageType.FF_CLOSE_ACK;
@@ -835,6 +912,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 				const reestablish = pair.link.log.find(
 					(e) => e.from === 'S' && e.type === MessageType.CHANNEL_REESTABLISH
 				)!;
+				const signed = signedCommitment(pair.rChannel);
 				const settle = pair.rManager.fulfillHtlc(
 					pair.channelId,
 					fromS!.id,
@@ -845,10 +923,11 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 					MessageType.UPDATE_FAIL_HTLC,
 					MessageType.UPDATE_FULFILL_HTLC,
 					MessageType.UPDATE_FAIL_HTLC,
-					MessageType.UPDATE_FULFILL_HTLC,
-					MessageType.COMMITMENT_SIGNED
+					MessageType.COMMITMENT_SIGNED,
+					MessageType.UPDATE_FULFILL_HTLC
 				];
 				expect(heldTypes(pair.rChannel)).to.deep.equal(chain);
+				expect(signedCommitment(pair.rChannel)).to.deep.equal(signed);
 				const answer = pair.rChannel.handleReestablish(
 					decodeChannelReestablishMessage(reestablish.payload)
 				);
@@ -856,6 +935,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 					answer.filter((a) => a.type === ChannelActionType.ERROR)
 				).to.deep.equal([]);
 				expect(heldTypes(pair.rChannel)).to.deep.equal(chain);
+				expect(signedCommitment(pair.rChannel)).to.deep.equal(signed);
 				pair.link.release('S');
 				expectAlive(pair, 'released');
 				expectClosed(pair, 'released');
@@ -921,41 +1001,85 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 	// 2. The dispute.
 	// ───────────────────────────────────────────────────────────────────
 	describe('2. a differing ff_close_ack, and a preimage that arrives while the fail is held', () => {
-		// Base section 7.5.6: a slot R holds a preimage for is fulfilled,
-		// never failed. CONCURRENT-RECEIVE.md section 7: "On receiving the
-		// final ack, R unions every valid preimage from every source ...
-		// Present vouchers with known preimages are fulfilled even if the peer
-		// denies payment", and "If a preimage arrives during a pending
-		// failure, preserve it and use ordinary commitment/on-chain recovery
-		// where still possible." Section 5.3: a response that cannot advance
-		// state "may still supply a hash-valid claim preimage".
-		//
-		// The honest sequence: S comes back from the row that predates
-		// ff_close, so for S the book is open again and its offline service
-		// resumes. A payer pays the invoice of slot 1 while R is away; S
-		// settles it upstream and keeps t_1 for R. R reconnects, DRAINING,
-		// with the fail of voucher 1 queued under the first acknowledgement
-		// (which said unsettled, truthfully, at the time). S's answer to the
-		// retransmitted ff_close is a second acknowledgement: slot 1 settled,
-		// with t_1 in it.
-		//
-		// Found by this review (issue #1308, on master for baseline epochs
-		// too): handleFforCloseAck compared the bytes, answered "differs" and
-		// adopted nothing, the preimage included. The next reestablish
-		// replayed the fail, S (DRAINING) took it, and the voucher was gone: S
-		// kept the payer's money AND the voucher's value, R was out d_1 for an
-		// invoice that was paid.
-		//
-		// Fixed for both profiles. The differing acknowledgement is still
-		// refused, but every hash-valid preimage in it is kept and handed to
-		// the chain monitors; and a queued fail of a voucher R holds the
-		// preimage of is replaced by the fulfil while the fail is provably
-		// undelivered. The cases after these two walk that boundary.
 		for (const concurrent of [true, false]) {
 			it(`${
 				concurrent ? 'concurrent' : 'baseline'
-			} epoch: the differing acknowledgement carries the preimage of a slot S settled after coming back; R keeps it, withdraws the held fail of that voucher, and is paid d_1`, () => {
-				const { pair, fromS } = sLostTheClose([2], concurrent);
+			}: learning a preimage preserves a signed fail and its commitment number`, () => {
+				const { pair } = sLostTheClose([2], concurrent);
+				pair.link.holdAt = (from, type): boolean =>
+					from === 'S' && type === MessageType.FF_CLOSE_ACK;
+				pair.link.reconnect();
+				pair.link.holdAt = null;
+				const before = pair.rChannel.getFullState();
+				const number = before.remoteCommitmentNumber;
+				const count = before.pendingLocalUpdatesSignedCount;
+				const signature = Buffer.from(before.lastSentCommitmentSigned!);
+				const queued = before.pendingLocalUpdates.map((u) => ({
+					type: u.type,
+					payload: Buffer.from(u.payload)
+				}));
+				const chain = heldTypes(pair.rChannel);
+				const preimage = record(pair.sChannel).preimages[0];
+				const actions = pair.rChannel.fforAddPreimage(preimage);
+				expect(
+					actions.some((a) => a.type === ChannelActionType.ERROR)
+				).to.equal(false);
+				const after = pair.rChannel.getFullState();
+				expect(
+					record(pair.rChannel).knownPreimages[0]!.equals(preimage)
+				).to.equal(true);
+				expect(
+					actions.some((a) => a.type === ChannelActionType.PREIMAGE_LEARNED)
+				).to.equal(true);
+				expect(after.remoteCommitmentNumber).to.equal(number);
+				expect(after.pendingLocalUpdatesSignedCount).to.equal(count);
+				expect(after.lastSentCommitmentSigned!.equals(signature)).to.equal(
+					true
+				);
+				expect(after.pendingLocalUpdates).to.deep.equal(queued);
+				expect(heldTypes(pair.rChannel)).to.deep.equal(chain);
+				expect(pair.rChannel.isAwaitingRemoteRevocation()).to.equal(true);
+				expect(planClose(pair, 'R').ok).to.equal(true);
+			});
+		}
+
+		it('an ordinary settle queues behind the held signature without changing the signed prefix', () => {
+			const { pair, fromS } = sLostTheClose([2]);
+			pair.link.holdAt = (from, type): boolean =>
+				from === 'S' && type === MessageType.FF_CLOSE_ACK;
+			pair.link.reconnect();
+			pair.link.holdAt = null;
+			const before = pair.rChannel.getFullState();
+			const number = before.remoteCommitmentNumber;
+			const count = before.pendingLocalUpdatesSignedCount;
+			const signature = Buffer.from(before.lastSentCommitmentSigned!);
+			const chain = heldTypes(pair.rChannel);
+			const result = pair.rManager.fulfillHtlc(
+				pair.channelId,
+				fromS!.id,
+				fromS!.preimage
+			);
+			expect(result.ok, result.error).to.equal(true);
+			const after = pair.rChannel.getFullState();
+			expect(after.remoteCommitmentNumber).to.equal(number);
+			expect(after.pendingLocalUpdatesSignedCount).to.equal(count);
+			expect(after.lastSentCommitmentSigned!.equals(signature)).to.equal(true);
+			expect(after.pendingLocalUpdates.length).to.equal(count + 1);
+			expect(heldTypes(pair.rChannel)).to.deep.equal([
+				...chain,
+				MessageType.UPDATE_FULFILL_HTLC
+			]);
+		});
+
+		// A differing acknowledgement can still deliver a claim preimage
+		// (issue #1308, both profiles). It changes neither the adopted bitmap
+		// nor a signed fail. The current local commitment and the retained
+		// preimage remain available for on-chain recovery.
+		for (const concurrent of [true, false]) {
+			it(`${
+				concurrent ? 'concurrent' : 'baseline'
+			} epoch: a differing acknowledgement preserves the signed fail and saves its preimage for the current on-chain claim`, () => {
+				const { pair } = sLostTheClose([2], concurrent);
 				const learned: string[] = [];
 				pair.rManager.on('preimage:learned', (hash: Buffer) =>
 					learned.push(hash.toString('hex'))
@@ -967,8 +1091,15 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 				expect(h1.equals(record(pair.rChannel).paymentHashes[0])).to.equal(
 					true
 				);
-				const base = record(pair.rChannel).sHtlcIdBase!;
 				expect(record(pair.rChannel).knownPreimages[0]).to.equal(null);
+				const signed = signedCommitment(pair.rChannel);
+				const close = planClose(pair, 'R');
+				let saved: string | null = null;
+				pair.rManager.on('channel:persist', () => {
+					if (record(pair.rChannel).knownPreimages[0]) {
+						saved = snapshot(pair, 'R');
+					}
+				});
 				pair.link.reconnect();
 				expect(pair.rErrors.join('|')).to.match(/ff_close_ack differs/);
 				// S's signed message did deliver t_1 to R.
@@ -983,16 +1114,15 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 				expect(record(pair.rChannel).closeAckWire!.includes(t1)).to.equal(
 					false
 				);
-				// The preimage is kept, and the chain monitors have it.
+				// The preimage is retained and the manager reports its hash.
 				expect(record(pair.rChannel).knownPreimages[0]!.equals(t1)).to.equal(
 					true
 				);
 				expect(learned).to.include(h1.toString('hex'));
-				// The held fail of voucher 1 gave way to the fulfil, in place,
-				// and the signature over the fail was taken back and made again.
+				expect(signedCommitment(pair.rChannel)).to.deep.equal(signed);
 				const chain = heldTypes(pair.rChannel);
 				expect(chain.slice(0, 3)).to.deep.equal([
-					MessageType.UPDATE_FULFILL_HTLC,
+					MessageType.UPDATE_FAIL_HTLC,
 					MessageType.UPDATE_FULFILL_HTLC,
 					MessageType.UPDATE_FAIL_HTLC
 				]);
@@ -1005,81 +1135,61 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 					MessageType.CHANNEL_REESTABLISH,
 					MessageType.FF_CLOSE
 				]);
-				// The next reestablish (S holds the close now, so no hold).
-				interrupt(pair, 'disconnect');
-				pair.link.reconnect();
-				expectAlive(pair, 'second reconnect');
-				expectClosed(pair, 'second reconnect');
-				expect(pair.sErrors, 'S has no complaint').to.deep.equal([]);
-				const fails = pair.link.log.filter(
-					(e) =>
-						e.from === 'R' &&
-						e.type === MessageType.UPDATE_FAIL_HTLC &&
-						e.payload.readBigUInt64BE(32) === base
-				);
-				expect(fails.length, 'no fail of voucher 1 on the wire').to.equal(0);
-				// A concurrent epoch has R's own 3,000 sat HTLC still in flight.
-				const offered = fromS ? 3_000_000n : 0n;
-				expect(balances(pair).r, 'R is paid d_1 and d_2').to.equal(
-					R_START + AMOUNTS[0] + AMOUNTS[1] - offered
-				);
-				expect(balances(pair).sViewOfR).to.equal(balances(pair).r);
+				expectVoucherClaimAvailable(pair, 1);
+				expect(planClose(pair, 'R').tx).to.deep.equal(close.tx);
+				expect(
+					saved,
+					'the preimage and signed prefix are persisted'
+				).to.not.equal(null);
+				restart(pair, 'R', saved!);
+				expect(signedCommitment(pair.rChannel)).to.deep.equal(signed);
+				expectVoucherClaimAvailable(pair, 1);
 			});
 		}
 
-		// The same rule from another source. While the chain is held, the fail
-		// of voucher 1 is signed but provably undelivered (S's own reestablish
-		// asked for the commitment_signed that covers it), and R's commitment
-		// still carries the voucher. R learns t_1 (a witness, a payer's
-		// receipt). It used to be recorded, and then the release sent the
-		// fail anyway.
+		// The same preimage custody rule applies to direct import while the
+		// fail and its original commitment_signed are held.
 		for (const concurrent of [true, false]) {
 			it(`${
 				concurrent ? 'concurrent' : 'baseline'
-			} epoch: R learns the preimage of a voucher whose fail is still held; the fail is withdrawn and the release fulfils the voucher`, () => {
-				const { pair, fromS } = sLostTheClose([2], concurrent);
+			} epoch: importing a preimage while a signed fail is held preserves the claim across restart`, () => {
+				const { pair } = sLostTheClose([2], concurrent);
 				pair.link.holdAt = (from, type): boolean =>
 					from === 'S' && type === MessageType.FF_CLOSE_ACK;
 				pair.link.reconnect();
 				pair.link.holdAt = null;
 				expect(holding(pair.rChannel)).to.equal(true);
-				const signedAt = pair.rChannel.getFullState().remoteCommitmentNumber;
+				const signed = signedCommitment(pair.rChannel);
+				const chain = heldTypes(pair.rChannel);
+				const close = planClose(pair, 'R');
 				const t1 = record(pair.sChannel).preimages[0];
+				const hashes: string[] = [];
+				let saved: string | null = null;
+				pair.rManager.on('preimage:learned', (hash: Buffer) =>
+					hashes.push(hash.toString('hex'))
+				);
+				pair.rManager.on('channel:persist', () => {
+					saved = snapshot(pair, 'R');
+				});
 				const learned = pair.rManager.fforAddPreimage(pair.channelId, t1);
 				expect(learned.ok, learned.error).to.equal(true);
 				expect(record(pair.rChannel).knownPreimages[0]).to.not.equal(null);
-				// The new signature is at the commitment number of the one it
-				// replaces, and it is the last thing in the chain.
-				expect(pair.rChannel.getFullState().remoteCommitmentNumber).to.equal(
-					signedAt
-				);
-				const chain = heldTypes(pair.rChannel);
-				expect(chain[chain.length - 1]).to.equal(MessageType.COMMITMENT_SIGNED);
-				expect(
-					chain.filter((t) => t === MessageType.COMMITMENT_SIGNED).length
-				).to.equal(1);
-				pair.link.release('S');
-				expectAlive(pair, 'released');
-				expectClosed(pair, 'released');
-				const base = record(pair.rChannel).sHtlcIdBase!;
-				expect(
-					pair.link.log.filter(
-						(e) =>
-							e.from === 'R' &&
-							e.type === MessageType.UPDATE_FAIL_HTLC &&
-							e.payload.readBigUInt64BE(32) === base
-					).length,
-					'no fail of voucher 1 on the wire'
-				).to.equal(0);
-				const offered = fromS ? 3_000_000n : 0n;
-				expect(balances(pair).r).to.equal(
-					R_START + AMOUNTS[0] + AMOUNTS[1] - offered
-				);
-				expect(balances(pair).sViewOfR).to.equal(balances(pair).r);
+				expect(hashes).to.deep.equal([
+					record(pair.rChannel).paymentHashes[0].toString('hex')
+				]);
+				expect(signedCommitment(pair.rChannel)).to.deep.equal(signed);
+				expect(heldTypes(pair.rChannel)).to.deep.equal(chain);
+				expectVoucherClaimAvailable(pair, 1);
+				expect(planClose(pair, 'R').tx).to.deep.equal(close.tx);
+				expect(saved, 'the import is persisted').to.not.equal(null);
+				restart(pair, 'R', saved!);
+				expect(signedCommitment(pair.rChannel)).to.deep.equal(signed);
+				expectVoucherClaimAvailable(pair, 1);
+				expect(planClose(pair, 'R').tx).to.deep.equal(close.tx);
 			});
 		}
 
-		describe('the boundary: a queued fail is withdrawn only while it is provably undelivered', () => {
+		describe('the boundary: only an unsigned queued fail can be replaced', () => {
 			/** R's drain round with S DRAINING; `drop` says what the wire loses. */
 			function drainRound(
 				concurrent: boolean,
@@ -1106,36 +1216,53 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 			for (const concurrent of [true, false]) {
 				const profile = concurrent ? 'concurrent' : 'baseline';
 
-				it(`${profile}: the fail and its commitment_signed were sent on a live connection and lost with it; nothing is withdrawn while that connection is up, and the reestablish at which S asks for the signature again withdraws it`, () => {
+				it(`${profile}: an ordinary lost signed fail replays the original bytes while its current on-chain claim remains available`, () => {
 					// S acknowledged the close; R's whole drain round is lost.
 					const pair = drainRound(
 						concurrent,
 						(from, type) => from === 'R' && type !== MessageType.FF_CLOSE
 					);
 					const failed = stateOfVoucherOne(pair);
+					const signed = signedCommitment(pair.rChannel);
+					const close = planClose(pair, 'R');
+					const lostSignature = pair.link.dropped.find(
+						(e) => e.from === 'R' && e.type === MessageType.COMMITMENT_SIGNED
+					)!;
 					const t1 = record(pair.sChannel).preimages[0];
 					const learned = pair.rManager.fforAddPreimage(pair.channelId, t1);
 					expect(learned.ok, learned.error).to.equal(true);
-					// R cannot know the round was lost: for all it knows the
-					// signature is in S's hands. The fail stands, for now.
 					expect(holding(pair.rChannel)).to.equal(false);
 					expect(stateOfVoucherOne(pair)).to.equal(failed);
+					expect(signedCommitment(pair.rChannel)).to.deep.equal(signed);
+					expectVoucherClaimAvailable(pair, 1);
+					expect(planClose(pair, 'R').tx).to.deep.equal(close.tx);
 					expect(sentBy(pair, 'R')).to.deep.equal([]);
 					interrupt(pair, 'disconnect');
+					// Inspect the ordinary reconnect replay before the peer takes
+					// the drain round, retaining the current local voucher claim.
+					pair.link.holdAt = (from, type): boolean =>
+						from === 'R' && type === MessageType.UPDATE_FAIL_HTLC;
+					const replayed: { type: number; payload: Buffer }[] = [];
+					pair.rManager.on(
+						'message:outbound',
+						(_peer: string, type: number, payload: Buffer) =>
+							replayed.push({ type, payload: Buffer.from(payload) })
+					);
 					pair.link.reconnect();
-					// S's reestablish asked for the commitment_signed again.
 					expectAlive(pair, 'reestablished');
-					expectClosed(pair, 'reestablished');
-					expect(balances(pair).r).to.equal(R_START + AMOUNTS[0] + AMOUNTS[1]);
-					expect(balances(pair).sViewOfR).to.equal(balances(pair).r);
-					// The fulfils of vouchers 1 and 2, the fail of voucher 3, and
-					// one signature over them.
-					expect(sentBy(pair, 'R').slice(1, 5)).to.deep.equal([
-						MessageType.UPDATE_FULFILL_HTLC,
+					expect(signedCommitment(pair.rChannel)).to.deep.equal(signed);
+					expect(pair.link.inFlight('R').slice(0, 4)).to.deep.equal([
+						MessageType.UPDATE_FAIL_HTLC,
 						MessageType.UPDATE_FULFILL_HTLC,
 						MessageType.UPDATE_FAIL_HTLC,
 						MessageType.COMMITMENT_SIGNED
 					]);
+					const replay = replayed.find(
+						(e) => e.type === MessageType.COMMITMENT_SIGNED
+					)!;
+					expect(replay.payload).to.deep.equal(lostSignature.payload);
+					expectVoucherClaimAvailable(pair, 1);
+					expect(planClose(pair, 'R').tx).to.deep.equal(close.tx);
 				});
 
 				it(`${profile}: the fail is queued and unsigned (R died between the DRAINING write and the signature); the reestablish replays the fulfil instead`, () => {
@@ -1179,12 +1306,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 					]);
 				});
 
-				it(`${profile}: S holds the commitment_signed that removes the voucher as failed (only its answer was lost); the preimage is kept, the fail stands, and R's remedy is on chain until it revokes`, () => {
-					const before = ((): number => {
-						const probe = activePair(concurrent);
-						settleSlot(probe, 2);
-						return planClose(probe, 'R').outputs;
-					})();
+				it(`${profile}: the peer holds the signed fail, and importing its preimage preserves R's current on-chain claim`, () => {
 					// S takes the whole drain round; its revoke_and_ack and its
 					// commitment_signed are lost.
 					const pair = drainRound(
@@ -1196,34 +1318,28 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 						learned.push(hash.toString('hex'))
 					);
 					const failed = stateOfVoucherOne(pair);
+					const signed = signedCommitment(pair.rChannel);
+					const close = planClose(pair, 'R');
 					const t1 = record(pair.sChannel).preimages[0];
 					const res = pair.rManager.fforAddPreimage(pair.channelId, t1);
 					expect(res.ok, res.error).to.equal(true);
-					// Kept, and with the chain monitors.
+					// Retained, with its hash reported by the manager.
 					expect(record(pair.rChannel).knownPreimages[0]).to.not.equal(null);
 					expect(learned).to.deep.equal([
 						record(pair.rChannel).paymentHashes[0].toString('hex')
 					]);
 					// Not withdrawn: a signature of R's over the fail is out.
 					expect(stateOfVoucherOne(pair)).to.equal(failed);
-					// What remains: R's own commitment still carries all three
-					// vouchers, so a force close now claims voucher 1 with t_1.
-					const plan = planClose(pair, 'R');
-					expect(plan.ok, plan.error).to.equal(true);
-					expect(plan.outputs, 'the vouchers are still in it').to.equal(before);
-					// Not at the reestablish either: S does not ask for the
-					// signature, it holds it. Its own round arrives, R revokes,
-					// and the failure is irrevocable.
-					interrupt(pair, 'disconnect');
-					pair.link.reconnect();
-					expectAlive(pair, 'reestablished');
-					expectClosed(pair, 'reestablished');
-					expect(balances(pair).r, 'd_2 only').to.equal(R_START + AMOUNTS[1]);
-					expect(planClose(pair, 'R').outputs).to.be.lessThan(before);
+					expect(signedCommitment(pair.rChannel)).to.deep.equal(signed);
+					expectVoucherClaimAvailable(pair, 1);
+					expect(planClose(pair, 'R').tx).to.deep.equal(close.tx);
+					restart(pair, 'R');
+					expect(signedCommitment(pair.rChannel)).to.deep.equal(signed);
+					expectVoucherClaimAvailable(pair, 1);
 				});
 			}
 
-			it("concurrent: S added while R held (R's revoke_and_ack is in the chain); the withdrawal signs again over the fulfil and S's add, and the release commits both", () => {
+			it('concurrent: a peer add leaves the held signed fail and revoke_and_ack intact when its preimage arrives', () => {
 				const { pair } = sLostTheClose([2]);
 				pair.link.holdAt = (from, type): boolean =>
 					from === 'R' && type === MessageType.FF_CLOSE;
@@ -1231,31 +1347,24 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 				pair.link.holdAt = null;
 				const add = offer(pair, 'S', 2_000_000n);
 				expect(add.result.ok, add.result.error).to.equal(true);
-				expect(heldTypes(pair.rChannel)).to.deep.equal([
+				const chain = [
 					MessageType.UPDATE_FAIL_HTLC,
 					MessageType.UPDATE_FULFILL_HTLC,
 					MessageType.UPDATE_FAIL_HTLC,
 					MessageType.COMMITMENT_SIGNED,
 					MessageType.REVOKE_AND_ACK
-				]);
+				];
+				expect(heldTypes(pair.rChannel)).to.deep.equal(chain);
+				const signed = signedCommitment(pair.rChannel);
+				const close = planClose(pair, 'R');
 				const t1 = record(pair.sChannel).preimages[0];
 				const res = pair.rManager.fforAddPreimage(pair.channelId, t1);
 				expect(res.ok, res.error).to.equal(true);
-				expect(heldTypes(pair.rChannel)).to.deep.equal([
-					MessageType.UPDATE_FULFILL_HTLC,
-					MessageType.UPDATE_FULFILL_HTLC,
-					MessageType.UPDATE_FAIL_HTLC,
-					MessageType.REVOKE_AND_ACK,
-					MessageType.COMMITMENT_SIGNED
-				]);
-				pair.link.release('R');
-				expectAlive(pair, 'released');
-				expectClosed(pair, 'released');
-				expect(pair.events.R.forwarded).to.include(add.id);
-				// R's own 3,000 sat HTLC and S's two are still in flight.
-				expect(balances(pair).r).to.equal(
-					R_START + AMOUNTS[0] + AMOUNTS[1] - 3_000_000n
-				);
+				expect(heldTypes(pair.rChannel)).to.deep.equal(chain);
+				expect(signedCommitment(pair.rChannel)).to.deep.equal(signed);
+				expect(ordinaryHtlcs(pair.rChannel)).to.include(`received-${add.id}`);
+				expectVoucherClaimAvailable(pair, 1);
+				expect(planClose(pair, 'R').tx).to.deep.equal(close.tx);
 			});
 
 			for (const concurrent of [true, false]) {
@@ -1335,14 +1444,17 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 				});
 			}
 
-			it('the signature taken back leaves no trace of itself: the sign counter, the covered count and the cover stamps are as before it was made, and a commitment is owed', () => {
+			it('preimage learning preserves the signed counter, covered count, coverage stamps and signature caches across restart', () => {
 				const { pair } = sLostTheClose([2]);
 				pair.link.holdAt = (from, type): boolean =>
 					from === 'S' && type === MessageType.FF_CLOSE_ACK;
 				pair.link.reconnect();
 				pair.link.holdAt = null;
 				const before = pair.rChannel.getFullState();
-				const number = before.remoteCommitmentNumber;
+				const signed = signedCommitment(pair.rChannel);
+				const chain = heldTypes(pair.rChannel);
+				const close = planClose(pair, 'R');
+				const owed = pair.rChannel.needsCommitment();
 				expect(pair.rChannel.isAwaitingRemoteRevocation()).to.equal(true);
 				expect(before.pendingLocalUpdatesSignedCount).to.equal(3);
 				const stamped = (): number =>
@@ -1350,6 +1462,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 						(e) => e.commitCoverPending === true || e.addCoverPending === true
 					).length;
 				expect(stamped()).to.be.greaterThan(0);
+				const count = stamped();
 				// The channel alone, without the manager's auto-sign behind it.
 				const actions = pair.rChannel.fforAddPreimage(
 					record(pair.sChannel).preimages[0]
@@ -1357,28 +1470,21 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 				expect(
 					actions.filter((a) => a.type === ChannelActionType.ERROR)
 				).to.deep.equal([]);
-				const after = pair.rChannel.getFullState();
-				expect(after.remoteCommitmentNumber).to.equal(number - 1n);
-				expect(pair.rChannel.isAwaitingRemoteRevocation()).to.equal(false);
-				expect(after.pendingLocalUpdatesSignedCount).to.equal(0);
-				expect(after.pendingLocalUpdates.length).to.equal(3);
-				expect(stamped()).to.equal(0);
-				expect(pair.rChannel.needsCommitment()).to.equal(true);
-				expect(after.lastSentCommitmentSigned).to.equal(null);
-				expect(heldTypes(pair.rChannel)).to.deep.equal([
-					MessageType.UPDATE_FULFILL_HTLC,
-					MessageType.UPDATE_FULFILL_HTLC,
-					MessageType.UPDATE_FAIL_HTLC
-				]);
-				// A restart here, before any new signature: the row owes the
-				// commitment, and the reestablish signs it at that number.
+				expect(
+					actions.some((a) => a.type === ChannelActionType.PERSIST_STATE)
+				).to.equal(true);
+				expect(signedCommitment(pair.rChannel)).to.deep.equal(signed);
+				expect(pair.rChannel.isAwaitingRemoteRevocation()).to.equal(true);
+				expect(stamped()).to.equal(count);
+				expect(pair.rChannel.needsCommitment()).to.equal(owed);
+				expect(heldTypes(pair.rChannel)).to.deep.equal(chain);
+				expectVoucherClaimAvailable(pair, 1);
+				expect(planClose(pair, 'R').tx).to.deep.equal(close.tx);
 				interrupt(pair, 'restart R');
-				pair.link.reconnect();
-				expectAlive(pair, 'reestablished');
-				expectClosed(pair, 'reestablished');
-				expect(balances(pair).r).to.equal(
-					R_START + AMOUNTS[0] + AMOUNTS[1] - 3_000_000n
-				);
+				expect(signedCommitment(pair.rChannel)).to.deep.equal(signed);
+				expect(pair.rChannel.isAwaitingRemoteRevocation()).to.equal(true);
+				expectVoucherClaimAvailable(pair, 1);
+				expect(planClose(pair, 'R').tx).to.deep.equal(close.tx);
 			});
 
 			it('a preimage for a voucher that is not failed, or a second copy of one already used, withdraws nothing', () => {
@@ -1407,9 +1513,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 					true
 				);
 				expect(heldTypes(pair.rChannel)).to.deep.equal(once);
-				pair.link.release('S');
-				expectAlive(pair, 'released');
-				expectClosed(pair, 'released');
+				expectVoucherClaimAvailable(pair, 1);
 			});
 		});
 
