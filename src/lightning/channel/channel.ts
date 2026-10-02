@@ -7110,7 +7110,9 @@ export class Channel {
 			// way, entry by entry: a signature that replaced the stored one
 			// without passing through handleCommitmentSigned (a splice adoption)
 			// was never asked about them, so the rebuilds that keep only part of
-			// the list, or none of it, are tried as well.
+			// the list, or none of it, are tried as well. And so is the reading
+			// of a received add as unsigned (issue #1295): the rebuild that
+			// carries it is asked last.
 			for (const candidate of this._fallbackCloseViews(closing)) {
 				const rebuilt = buildLocalCommitment(
 					candidate,
@@ -7330,14 +7332,26 @@ export class Channel {
 	 * signature has turned down the first rebuild, in order: the unstamped
 	 * adds read as unsigned, then the same views again for each smaller
 	 * selection of the received removals kept for the signed commitment
-	 * (signedLocalRemovals).
+	 * (signedLocalRemovals), and last all of those once more with the
+	 * received adds the flags call unsigned read as signed in.
 	 *
-	 * The second half makes that retention additive, entry by entry. Whatever
-	 * a close could broadcast without a kept entry it still can, because the
-	 * signature is asked about that rebuild too and covers at most one of
-	 * them.
+	 * The later halves make those readings additive. Whatever a close could
+	 * broadcast without a kept entry, or with an add the rebuild now leaves
+	 * out, it still can, because the signature is asked about that rebuild
+	 * too and covers at most one of them.
 	 */
 	private *_fallbackCloseViews(
+		closing: IChannelState
+	): Generator<IChannelState> {
+		yield* this._keptRemovalCloseViews(closing);
+		const carried = this._viewWithUnsignedReceivedAddsCarried(closing);
+		if (!carried) return;
+		yield carried;
+		yield* this._keptRemovalCloseViews(carried);
+	}
+
+	/** The unstamped-add views of `closing`, for it and each smaller kept selection. */
+	private *_keptRemovalCloseViews(
 		closing: IChannelState
 	): Generator<IChannelState> {
 		yield* this._viewsWithUnstampedAddsUnsigned(closing);
@@ -7349,6 +7363,41 @@ export class Channel {
 			yield view;
 			yield* this._viewsWithUnstampedAddsUnsigned(view);
 		}
+	}
+
+	/**
+	 * The close view with every received add the flags call unsigned
+	 * (addLocallyRevoked === false) read as signed in, or null when there is
+	 * no such add.
+	 *
+	 * The signedLocal rebuild leaves those adds out, because the flag only
+	 * clears when a commitment_signed carrying the add is accepted (issue
+	 * #1295). That is a reading of our own records all the same, and the
+	 * stored signature is the fact: carrying them is what every rebuild did
+	 * before, so it stays on as the last thing asked and nothing that closed
+	 * then can fail to close now. All of them together, since a
+	 * commitment_signed covers every add sent before it.
+	 *
+	 * A copy down to the entries it changes, as in
+	 * _viewsWithUnstampedAddsUnsigned: a question asked of a candidate, not a
+	 * repair of the live rows.
+	 */
+	private _viewWithUnsignedReceivedAddsCarried(
+		closing: IChannelState
+	): IChannelState | null {
+		let changed = false;
+		const htlcs = new Map(closing.htlcs);
+		for (const [id, entry] of closing.htlcs) {
+			if (
+				entry.direction !== HtlcDirection.RECEIVED ||
+				entry.addLocallyRevoked !== false
+			) {
+				continue;
+			}
+			htlcs.set(id, { ...entry, addLocallyRevoked: true });
+			changed = true;
+		}
+		return changed ? ({ ...closing, htlcs } as IChannelState) : null;
 	}
 
 	/**

@@ -1242,12 +1242,11 @@ describe('Received-removal window, adversarial', function () {
 	});
 
 	describe('where the window is still shut', function () {
-		it('pins issue #1295 (same on master, no removal involved): an update_add_htlc with its commitment_signed withheld refuses the close by itself', function () {
-			// The root of the next case, isolated, and not this window's to
-			// fix: issue #1295 tracks it. The signedLocal rebuild carries
-			// every PENDING received entry, including one no signature we hold
-			// covers (addLocallyRevoked === false), and leaves its amount out
-			// of the peer's balance.
+		it('an update_add_htlc with its commitment_signed withheld does not refuse the close (issue #1295, no removal involved)', function () {
+			// The root of the next case, isolated. The signedLocal rebuild
+			// used to carry every PENDING received entry, including one no
+			// signature we hold covers (addLocallyRevoked === false), and
+			// leave its amount out of the peer's balance.
 			const r = rig(1340);
 			park(r.alice, r.bob, 50_000_000n, 'committed');
 			const before = rebuild(fullState(r.bob, r.channelId)).result.tx;
@@ -1261,25 +1260,27 @@ describe('Received-removal window, adversarial', function () {
 			).to.have.length(1);
 			expect(
 				rebuild(st).result.outputMap.htlcs,
-				'the rebuild carries the unsigned add'
-			).to.have.length(2);
+				'the rebuild leaves the unsigned add out'
+			).to.have.length(1);
 			expect(
 				peerSigned(r.bob, r.channelId, before),
-				'while the stored signature is still over the commitment without it'
+				'as the stored signature is still over the commitment without it'
 			).to.equal(true);
 
 			const plan = planClose(r.bob, r.channelId);
 
-			expect(plan.ok, 'refused until issue #1295 is fixed').to.equal(false);
+			expect(plan.ok, plan.error).to.equal(true);
+			expect(
+				bitcoin.Transaction.fromBuffer(plan.commitmentTx!).getId()
+			).to.equal(before.getId());
 			r.destroy();
 		});
 
-		it('pins issue #1295: one update_add_htlc from the withholding peer closes the exit again (force close refused while connected)', function () {
+		it('one update_add_htlc from the withholding peer does not close the exit again (issue #1295, force close while connected)', function () {
 			// The peer withholds its commitment_signed, which is the case the
 			// PR is for, and also sends one update_add_htlc. The add is in no
-			// signature we hold, yet the signedLocal rebuild carries it, so
-			// every candidate (with and without the kept removal) is refused.
-			// Issue #1295 tracks the fix.
+			// signature we hold, so the rebuild leaves it out and the kept
+			// removal alone decides the commitment.
 			const w = simpleWindow(1800, 'fulfill');
 			park(w.alice, w.bob, 40_000_000n, 'unsigned');
 			const st = fullState(w.bob, w.channelId);
@@ -1298,17 +1299,15 @@ describe('Received-removal window, adversarial', function () {
 				? viaNode
 				: w.bob.getChannelManager().forceClose(w.channelId, DESTINATION);
 
-			expect(res.ok, 'refused until issue #1295 is fixed').to.equal(false);
+			expect(res.ok, res.error).to.equal(true);
 			w.destroy();
 		});
 
-		it('the same state closes once the peer is disconnected (the unsigned add is rolled back)', function () {
+		it('the same state closes on the same commitment once the peer is disconnected (the unsigned add is rolled back)', function () {
 			const w = simpleWindow(1820, 'fulfill');
 			park(w.alice, w.bob, 40_000_000n, 'unsigned');
-			expect(
-				planClose(w.bob, w.channelId).ok,
-				'refused while connected'
-			).to.equal(false);
+			const connected = assertExit(w, 'bob', [w.h], 'while connected');
+			expect(connected.tx.getId()).to.equal(w.signed.getId());
 			w.bob.getChannelManager().handlePeerDisconnected(w.alice.getNodeId());
 			const v = assertExit(w, 'bob', [w.h], 'after disconnect');
 			expect(v.tx.getId()).to.equal(w.signed.getId());

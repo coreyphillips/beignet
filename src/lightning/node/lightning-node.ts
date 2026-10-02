@@ -27649,7 +27649,18 @@ export class LightningNode extends EventEmitter {
 				// the fail-back keeps open. A genuinely FULFILLED one is claimed.
 				const expiredUnclaimed =
 					htlc.expiredOnArrival === true && htlc.state !== HtlcState.FULFILLED;
+				// An add the peer has sent but not yet signed into our commitment
+				// (addLocallyRevoked === false) has no output on the commitment
+				// we hold, which is the one this close would broadcast (issue
+				// #1295). Holding its preimage is no claim there: the close
+				// would spend a channel to claim nothing, on one unsigned
+				// update_add_htlc for any invoice of ours. Once the peer signs it
+				// in, the next block asks again. The kept removals this loop also
+				// walks were signed in by construction, and absent reads as
+				// signed in.
+				const notInOurCommitment = htlc.addLocallyRevoked === false;
 				const haveClaim =
+					!notInOurCommitment &&
 					!parkedHold &&
 					!expiredUnclaimed &&
 					(htlc.state === HtlcState.FULFILLED ||
