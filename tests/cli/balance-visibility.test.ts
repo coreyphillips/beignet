@@ -215,6 +215,7 @@ describe('Channel listing wire fields (GET /channels JSON)', () => {
 		const info = (BeignetNode.prototype as any).toChannelInfo.call(
 			{
 				node: {
+					getFforEpoch: () => undefined,
 					getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' }),
 					peerSupportsSplicing: () => null
 				}
@@ -241,6 +242,7 @@ describe('Channel listing wire fields (GET /channels JSON)', () => {
 		const info = (BeignetNode.prototype as any).toChannelInfo.call(
 			{
 				node: {
+					getFforEpoch: () => undefined,
 					getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' }),
 					peerSupportsSplicing: () => null
 				}
@@ -268,6 +270,7 @@ describe('Channel listing wire fields (GET /channels JSON)', () => {
 			(BeignetNode.prototype as any).toChannelInfo.call(
 				{
 					node: {
+						getFforEpoch: () => undefined,
 						getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' }),
 						peerSupportsSplicing: () => null
 					}
@@ -302,6 +305,7 @@ describe('Channel listing wire fields (GET /channels JSON)', () => {
 			(BeignetNode.prototype as any).toChannelInfo.call(
 				{
 					node: {
+						getFforEpoch: () => undefined,
 						getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' }),
 						peerSupportsSplicing: () => null
 					}
@@ -346,6 +350,7 @@ describe('Channel listing wire fields (GET /channels JSON)', () => {
 		};
 		const withSupport = (answer: boolean | null) => ({
 			node: {
+				getFforEpoch: () => undefined,
 				getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' }),
 				peerSupportsSplicing: () => answer
 			}

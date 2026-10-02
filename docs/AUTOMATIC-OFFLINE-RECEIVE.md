@@ -1,6 +1,6 @@
 # Automatic offline receiving
 
-The wallet integration prepares a one-payment FFOR reservation before displaying a fixed-amount Lightning invoice. Closing the app does not cancel it. On startup and while running, the wallet requests receipts, verifies each preimage against its stored invoice hash, and reconciles a paid reservation into its ordinary balance and Activity. An unpaid invoice stays payable until its expiry. The coordinator allows a two-minute settlement grace period before releasing an expired reservation and never force closes automatically.
+The wallet integration prepares a one-payment FFOR reservation before displaying a fixed-amount Lightning invoice. Closing the app does not cancel it. On startup and while running, the wallet requests receipts, verifies each preimage against its stored invoice hash, and reconciles completed voucher receipts into its ordinary balance and Activity. An unpaid invoice stays payable until its expiry. The coordinator requests retirement after a two-minute settlement grace period and never force closes automatically. An expired invoice does not by itself release the underlying reservation.
 
 This requires the accompanying wallet-core and portable-engine changes plus an upgraded settlement peer. Beignet 0.21.7 by itself does not implement the discovery and funding messages described below. An unsupported peer fails the receive preparation explicitly. The app does not silently issue an online-only invoice.
 
@@ -23,13 +23,25 @@ Settlement remains opt-in. Funding new receive channels requires a separate expl
 
 These are cumulative allocation limits, persisted before initiating funding. A failed or interrupted opening retains its allocation rather than risking a second spend on retry. Operators must budget for the funding transactions and channel liquidity. New channels contain the invoice amount plus 50,000 sats of headroom and use a 2 sat/vbyte funding rate. The open is zero-confirmation only when the operator has already put that client in the zero-conf trusted set (`POST /trusted-peer/add`); every other client gets an ordinary confirmed open. Earlier builds proposed the zero-conf channel type to every client regardless, which a peer that had not trusted this node back refuses outright. Allocation never adds a receiving peer to the inbound trust list.
 
-Automatic offline receiving is only for a channel that ALREADY exists with the peer and whose inbound capacity covers the amount. The wallet reuses suitable empty inbound channels and never reserves a channel containing spendable local money. After receipt reconciliation, that channel becomes available for ordinary payments. This flow never opens a channel to obtain inbound liquidity: when no suitable channel exists, the request falls back to direct funding, where the payer's on-chain payment becomes this node's channel funding and the liquidity peer opens the channel to us. The receiver therefore never sends the `allocate` message described below; the provider side still answers it for other clients.
+Automatic offline receiving uses a channel that already exists with the peer and whose inbound capacity covers the amount. When both peers negotiate concurrent receive and the settlement peer offers concurrent terms, that channel may contain spendable local money. Ordinary payments remain available within its unreserved capacity while the wallet is online. Baseline receive still requires an empty inbound channel and pauses ordinary payments while its book is live. With no suitable channel, the request falls back to direct funding, where the payer's on-chain payment becomes this node's channel funding and the liquidity peer opens the channel to us. The receiver never sends the `allocate` message described below; the provider side still answers it for other clients.
+
+## Concurrent receive
+
+Concurrent receive is opt-in during qualification. Set `BEIGNET_FFOR_CONCURRENT=true` on both peers (configuration key `fforConcurrent`) and `BEIGNET_FFOR_SETTLE_CONCURRENT=true` on the settlement peer (`fforSettleConcurrent`), in addition to enabling its settlement role. Both concurrent switches default to false. Disabling acceptance of new concurrent books does not change the persisted profile of existing books.
+
+The automatic coordinator chooses version 2 from an upgraded peer's terms and saves that choice before creating an epoch. A retry cannot silently switch versions or fall back to a baseline book. Busy channel payments return `RECEIVE_PENDING`; retry the same request after those payments settle. If its 60-second quote expired, refresh `/receive/quote` with the same `requestId` so the quote reuses its reservation. One immutable book may be live per channel. Each invoice has a fixed amount.
+
+`POST /ffor/sync` requests cumulative signed receipts without closing a concurrent book. A successful response reports the current epoch view; the reply and redemption may finish later. `POST /ffor/recover` reports `action: 'synced'` for connected concurrent recovery. Proof custody alone is not a completed payment. The epoch view distinguishes `settled` proof state from terminal `redeemed` or `cancelled` outcomes, and reports `concurrentVersion`, `snapshotSeq` (a decimal string, or null for unreadable retained evidence) and `capabilityHold`.
+
+Explicit retirement, including the coordinator's expiry path, uses `/ffor/epoch/close`. Version 2 keeps unknown slots reserved in `DRAINING` until their outcomes can be resolved safely. Ordinary payments may continue with the remaining capacity. Fee updates, splices and cooperative channel close remain unavailable while reservations are live. Hosts must keep `reservedChannelIds` excluded from automatic channel changes while using `htlcUsable` and available capacity to decide whether ordinary payments are possible.
+
+`ChannelInfo.ffor` and concurrent `/receive/status` requests report `reservedInboundSats` and `unresolvedSlots`. The SSE event `ffor:slot-resolved` carries `channelId`, `epochId`, `k`, `paymentHash`, decimal `amountMsat`, and `outcome` (`fulfilled` or `cancelled`). Refresh status after reconnect because events are not a durable replay log. Use payment records to deduplicate credited Activity. Offline receive does not make ordinary HTLCs safe to leave unattended beyond their deadlines.
 
 ## Peer messages
 
 Custom message type 44069, version 1, subtypes 80 (request) and 81 (response), carries bounded UTF-8 JSON. Every request has a random 16-byte hex `id`. Replies must match both that id and the authenticated Lightning peer.
 
-- `quote` returns protocol version, sender fee terms, and funding availability.
+- `quote` returns protocol version, sender fee terms, and funding availability. Negotiated concurrent settlement adds `concurrent: true` and `concurrentVersion: 2`.
 - `allocate` takes a stable 16-byte `allocationId` and `amountSats`, and returns a ready `channelId`. Retries refer to the same allocation. A beignet receiver no longer sends this: it falls back to direct funding instead. The provider side is kept for other clients that do.
 - `receipts` takes `channelId` and `epochId`. The response echoes both and returns `{k, preimage}` entries only for durably SETTLED slots belonging to the requesting receiver. It does not close or mutate the reservation. UNUSED and SETTLING slots are never disclosed.
 
@@ -47,7 +59,7 @@ App images can depend on it once 0.21.9 is published to npm.
 
 Both routes take one of two routes, and say which in a `mode` (quote) or `kind`
 (invoice) field. `bolt11` is the FFOR lane and needs a channel that already
-exists with that peer, is NORMAL and usable, holds no spendable local money, is
+exists with that peer, is NORMAL and usable, has concurrent settlement negotiated or holds no spendable local money, is
 not already reserved, has no live epoch, and has at least `amountSats + 50000`
 of inbound. `direct-funding` is the fallback for every other case. Nothing here
 opens a channel to obtain inbound liquidity.
@@ -55,9 +67,9 @@ opens a channel to obtain inbound liquidity.
 - `GET /receive/quote?peer=<compressed-pubkey>&amountSats=<integer>` returns
   `available`, `mode`, `peer`, `amountSats`, `feeSats` and a 60-second
   `expiresAt`. In `bolt11` mode it also returns the sender fee `terms` read from
-  the peer, and the minimum is 354 sats (the dust limit). In `direct-funding`
-  mode it does not contact the peer at all, and returns `minAmountSat`, the
-  configured direct-funding minimum (5000 sats by default). An amount under the
+  the peer. Pass `requestId` when refreshing an interrupted request to reuse its reserved channel. The minimum is 354 sats (the dust limit). In `direct-funding`
+  mode it returns `minAmountSat`, the
+  configured direct-funding minimum (5000 sats by default). A funded candidate may first query the peer's concurrent terms before selecting this fallback. An amount under the
   applicable minimum is refused with `AMOUNT_TOO_SMALL` naming it. The peer must
   be connected in either mode, otherwise `RECEIVE_UNAVAILABLE`. In `bolt11`
   mode, a peer that refuses (for example one that does not run the settlement
@@ -68,7 +80,7 @@ opens a channel to obtain inbound liquidity.
   and a stable `requestId` (16 to 160 letters, digits, underscores or hyphens).
   Use the same id on retries, including after a lost response. In `bolt11` mode
   success returns `kind: 'bolt11'`, `bolt11`, `paymentHash`, `amountSats`,
-  `expiresAt` and `offlineReceive: true`. The invoice expires after ten minutes.
+  `expiresAt` and `offlineReceive: true`, plus `concurrent: true` and `concurrentVersion` when selected. The invoice expires after ten minutes.
   In `direct-funding` mode success returns `kind: 'direct-funding'`, `request`
   (the base64url envelope a payer pays, also embeddable in a BIP 21 URI),
   `paymentHash` (the receipt hash), `expiresAt`, `amountSats`, `peer` and

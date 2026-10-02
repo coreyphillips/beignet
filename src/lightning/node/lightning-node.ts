@@ -19453,7 +19453,27 @@ export class LightningNode extends EventEmitter {
 
 	private rememberFforVoucher(record: IFforVoucherArchive): void {
 		this.fforVoucherIndex.remember(record);
-		this.fforArchivedVouchers.set(fforVoucherArchiveId(record), record);
+		const id = fforVoucherArchiveId(record);
+		const previous = this.fforArchivedVouchers.get(id);
+		this.fforArchivedVouchers.set(id, record);
+		if (
+			previous &&
+			!previous.outcome &&
+			record.outcome &&
+			isFforConcurrentVersion(record.concurrentVersion)
+		) {
+			// The archive was committed before it entered this cache. Notify after
+			// the transition completes so a UI observer cannot interrupt persistence.
+			const event = {
+				channelId: record.channelId,
+				epochId: record.epochId,
+				k: record.slot,
+				paymentHash: record.paymentHash,
+				amountMsat: record.amountMsat,
+				outcome: record.outcome.outcome
+			};
+			queueMicrotask(() => this.emit('ffor:slot-resolved', event));
+		}
 	}
 
 	/** Keep identical accounting semantics for explicitly ephemeral nodes. */

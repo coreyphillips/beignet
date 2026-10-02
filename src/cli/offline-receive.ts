@@ -26,6 +26,8 @@ export type OfflineReceiveJob = {
 	allocationId?: string;
 	channelId?: string;
 	epochId?: string;
+	concurrent?: boolean;
+	concurrentVersion?: 1 | 2;
 	previousEpochId?: string;
 	expiresAt?: number;
 	invoice?: any;
@@ -83,6 +85,11 @@ export class OfflineReceive {
 					j.amountSats <= 0 ||
 					(j.channelId !== undefined && !/^[a-f0-9]{64}$/.test(j.channelId)) ||
 					(j.epochId !== undefined && !/^[a-f0-9]{64}$/.test(j.epochId)) ||
+					(j.concurrent !== undefined && typeof j.concurrent !== 'boolean') ||
+					(j.concurrent === true
+						? j.concurrentVersion !== 1 && j.concurrentVersion !== 2
+						: j.concurrentVersion !== undefined) ||
+					(j.kind === 'direct-funding' && j.concurrent === true) ||
 					(j.request !== undefined && typeof j.request !== 'string') ||
 					(j.paymentHash !== undefined && !/^[a-f0-9]{64}$/.test(j.paymentHash))
 			)
@@ -102,7 +109,22 @@ export class OfflineReceive {
 			reservedChannelIds: [...this.reservedIds()],
 			// kind is filled in on read so a host never has to know that an older
 			// journal left it out.
-			requests: this.jobs.map((j) => ({ ...j, kind: kindOf(j) }))
+			requests: this.jobs.map((j) => {
+				const capacity = j.channelId
+					? this.node.listChannels().find((c) => c.channelId === j.channelId)
+							?.ffor
+					: undefined;
+				return {
+					...j,
+					kind: kindOf(j),
+					...(j.concurrent
+						? {
+								reservedInboundSats: capacity?.reservedInboundSats ?? 0,
+								unresolvedSlots: capacity?.unresolvedSlots ?? 0
+						  }
+						: {})
+				};
+			})
 		};
 	}
 	private persist() {
@@ -123,14 +145,15 @@ export class OfflineReceive {
 	/**
 	 * The one channel this peer could carry the payment on while we are closed.
 	 *
-	 * Never a channel holding spendable local money: that money stays available
-	 * to the ordinary send and channelize paths. Never one another request has
+	 * A funded channel is eligible when concurrent receive is negotiated.
+	 * Never one another request has
 	 * already reserved, and never one with a live epoch on it. The same search
 	 * decides the quote's mode and the invoice's route, so the two agree.
 	 */
 	private suitableChannel(
 		peer: string,
-		amountSats: number
+		amountSats: number,
+		concurrent = false
 	): string | undefined {
 		const reserved = this.reservedIds();
 		return this.node
@@ -140,7 +163,7 @@ export class OfflineReceive {
 					c.peerPubkey === peer &&
 					c.state === 'NORMAL' &&
 					c.htlcUsable &&
-					c.localBalanceSats === 0 &&
+					(concurrent || c.localBalanceSats === 0) &&
 					c.remoteBalanceSats >= amountSats + 50000 &&
 					!reserved.has(c.channelId) &&
 					!live(
@@ -168,7 +191,8 @@ export class OfflineReceive {
 	private route(
 		peer: string,
 		amountSats: number,
-		reuse?: string
+		reuse?: string,
+		concurrent = false
 	): OfflineReceiveKind {
 		if (this.stopped)
 			fail(
@@ -180,7 +204,7 @@ export class OfflineReceive {
 		if (!Number.isSafeInteger(amountSats) || amountSats <= 0)
 			fail('AMOUNT_REQUIRED', 'Enter an amount for this payment request.');
 		const mode: OfflineReceiveKind =
-			reuse !== undefined || this.suitableChannel(peer, amountSats)
+			reuse !== undefined || this.suitableChannel(peer, amountSats, concurrent)
 				? 'bolt11'
 				: 'direct-funding';
 		const minimum =
@@ -209,9 +233,11 @@ export class OfflineReceive {
 		return mode;
 	}
 	/** The sender fee terms this peer charges, checked into range. */
-	private async terms(
-		peer: string
-	): Promise<{ feeBaseMsat: number; feePpm: number }> {
+	private async terms(peer: string): Promise<{
+		feeBaseMsat: number;
+		feePpm: number;
+		concurrentVersion?: 1 | 2;
+	}> {
 		const terms = await this.node
 			.getFforReceiveService()
 			.request(peer, { op: 'quote' }, 15000);
@@ -228,10 +254,60 @@ export class OfflineReceive {
 				'RECEIVE_UNAVAILABLE',
 				'Your node returned unsupported receive terms.'
 			);
-		return { feeBaseMsat: terms.feeBaseMsat, feePpm: terms.feePpm };
+		const concurrentVersion =
+			terms.concurrent === true && this.node.fforConcurrentNegotiated(peer)
+				? terms.concurrentVersion ?? 1
+				: undefined;
+		if (
+			concurrentVersion !== undefined &&
+			concurrentVersion !== 1 &&
+			concurrentVersion !== 2
+		)
+			fail(
+				'RECEIVE_UNAVAILABLE',
+				'Your node returned unsupported concurrent receive terms.'
+			);
+		return {
+			feeBaseMsat: terms.feeBaseMsat,
+			feePpm: terms.feePpm,
+			...(concurrentVersion ? { concurrentVersion } : {})
+		};
 	}
-	async quote(peer: string, amountSats: number): Promise<any> {
-		const mode = this.route(peer, amountSats);
+	async quote(
+		peer: string,
+		amountSats: number,
+		requestId?: string
+	): Promise<any> {
+		if (requestId !== undefined && !/^[a-zA-Z0-9_-]{16,160}$/.test(requestId))
+			fail('INVALID_PARAMS', 'A valid requestId is required.');
+		const job = requestId
+			? this.jobs.find((entry) => entry.id === requestId)
+			: undefined;
+		if (job && (job.peer !== peer || job.amountSats !== amountSats))
+			fail('INVALID_REVIEW', 'This payment request changed.');
+		let mode = this.route(
+			peer,
+			amountSats,
+			job?.channelId,
+			job ? job.concurrent === true : this.node.fforConcurrentNegotiated(peer)
+		);
+		const terms = mode === 'bolt11' ? await this.terms(peer) : undefined;
+		if (
+			job &&
+			kindOf(job) === 'bolt11' &&
+			(!terms || job.concurrentVersion !== terms.concurrentVersion)
+		)
+			fail(
+				'RECEIVE_UNAVAILABLE',
+				'The receive profile for this request is not currently available.'
+			);
+		if (terms)
+			mode = this.route(
+				peer,
+				amountSats,
+				job?.channelId,
+				terms.concurrentVersion !== undefined
+			);
 		const expiresAt = this.now() + 60000;
 		// A direct-funded request is paid on chain and carries no FFOR sender fee,
 		// so there is nothing to ask the peer for and no round trip to wait on.
@@ -251,7 +327,10 @@ export class OfflineReceive {
 			peer,
 			amountSats,
 			feeSats: 0,
-			terms: await this.terms(peer),
+			terms,
+			...(terms?.concurrentVersion
+				? { concurrent: true, concurrentVersion: terms.concurrentVersion }
+				: {}),
 			expiresAt
 		};
 	}
@@ -367,8 +446,33 @@ export class OfflineReceive {
 			}
 			if (body.quote.expiresAt <= this.now())
 				fail('QUOTE_EXPIRED', 'Review this payment request again.');
-			const mode = this.route(peer, body.amountSats, job?.channelId);
-			if (mode === 'direct-funding') return this.directFunding(body, peer, job);
+			const requestedVersion = job
+				? job.concurrentVersion
+				: body.quote.terms?.concurrentVersion;
+			if (job && requestedVersion !== body.quote.terms?.concurrentVersion)
+				fail('INVALID_REVIEW', 'The receive profile for this request changed.');
+			const concurrent =
+				(requestedVersion === 1 || requestedVersion === 2) &&
+				this.node.fforConcurrentNegotiated(peer);
+			if (requestedVersion !== undefined && !concurrent)
+				fail(
+					'RECEIVE_PENDING',
+					'Reconnect your node before preparing this concurrent payment request.'
+				);
+			const mode = this.route(
+				peer,
+				body.amountSats,
+				job?.channelId,
+				concurrent
+			);
+			if (mode === 'direct-funding') {
+				if (job && kindOf(job) === 'bolt11')
+					fail(
+						'RECEIVE_UNAVAILABLE',
+						'The receive channel is no longer available. Retry this request when its capacity is available.'
+					);
+				return this.directFunding(body, peer, job);
+			}
 			// Recheck terms before changing a channel. A peer cannot increase the
 			// authorized sender fee between the review and the reservation.
 			const fresh = await this.terms(peer);
@@ -382,7 +486,10 @@ export class OfflineReceive {
 					id: body.requestId,
 					peer,
 					amountSats: body.amountSats,
-					kind: 'bolt11'
+					kind: 'bolt11',
+					...(concurrent
+						? { concurrent: true, concurrentVersion: fresh.concurrentVersion }
+						: {})
 				};
 				this.jobs.push(job);
 				this.persist();
@@ -391,7 +498,11 @@ export class OfflineReceive {
 			if (!job.channelId) {
 				// Already established by `route`: reaching here without a channel
 				// would mean opening one, which this flow never does.
-				const channelId = this.suitableChannel(peer, job.amountSats);
+				const channelId = this.suitableChannel(
+					peer,
+					job.amountSats,
+					concurrent
+				);
 				if (!channelId)
 					fail(
 						'RECEIVE_UNAVAILABLE',
@@ -411,7 +522,7 @@ export class OfflineReceive {
 							c.state === 'NORMAL'
 					)
 			);
-			if (channel.localBalanceSats !== 0)
+			if (!concurrent && channel.localBalanceSats !== 0)
 				fail(
 					'RECEIVE_UNAVAILABLE',
 					'The receive channel is no longer available.'
@@ -420,6 +531,11 @@ export class OfflineReceive {
 				.fforEpochs('R')
 				.find((e) => e.channelId === channelId);
 			if (!live(epoch)) {
+				if ((channel.htlcCount ?? 0) > 0)
+					fail(
+						'RECEIVE_PENDING',
+						'Wait for the current channel payments to finish before preparing this request.'
+					);
 				job.previousEpochId = epoch?.epochId;
 				this.persist();
 				const height = this.node.getInfo().blockHeight;
@@ -429,7 +545,10 @@ export class OfflineReceive {
 					settlementDeadline: height + 144,
 					voucherExpiry: height + 144 + 1152,
 					feeBaseMsat: body.quote.terms.feeBaseMsat,
-					feeProportionalMillionths: body.quote.terms.feePpm
+					feeProportionalMillionths: body.quote.terms.feePpm,
+					...(concurrent
+						? { concurrent: true, concurrentVersion: fresh.concurrentVersion }
+						: {})
 				});
 				job.epochId = epoch.epochId;
 				this.persist();
@@ -456,6 +575,8 @@ export class OfflineReceive {
 					);
 				return e.state === 'ACTIVE' ? e : null;
 			});
+			if ((epoch.concurrentVersion ?? 0) !== (fresh.concurrentVersion ?? 0))
+				fail('RECEIVE_UNAVAILABLE', 'The receive profile changed.');
 			const invoice = epoch.slots[0].bolt11
 				? {
 						bolt11: epoch.slots[0].bolt11,
@@ -484,6 +605,9 @@ export class OfflineReceive {
 				kind: 'bolt11',
 				...invoice,
 				amountSats: job.amountSats,
+				...(job.concurrent
+					? { concurrent: true, concurrentVersion: job.concurrentVersion }
+					: {}),
 				expiresAt: job.expiresAt,
 				offlineReceive: true
 			};
@@ -527,6 +651,7 @@ export class OfflineReceive {
 					this.persist();
 					continue;
 				}
+				if (job.concurrentVersion !== epoch.concurrentVersion) continue;
 				if (epoch.state !== 'ACTIVE') continue;
 				// Recover an invoice saved by the engine immediately before a crash in
 				// our metadata write. No new invoice or replacement hash is created.
@@ -536,13 +661,18 @@ export class OfflineReceive {
 					this.persist();
 				}
 				try {
-					await this.node.getFforReceiveService().receipts(job.channelId);
+					if (epoch.concurrentVersion) this.node.fforSync(job.channelId);
+					else await this.node.getFforReceiveService().receipts(job.channelId);
 				} catch {
 					continue;
 				}
 				if (this.stopped) return;
 				const current: any = this.node.fforEpoch(job.channelId);
-				const paid = current.slots.every((s: any) => s.state === 'settled');
+				const paid = current.slots.every((s: any) =>
+					current.concurrentVersion
+						? s.state === 'redeemed' || s.state === 'cancelled'
+						: s.state === 'settled'
+				);
 				const expired =
 					job.expiresAt != null && this.now() >= job.expiresAt + 120000;
 				const unused =
@@ -552,8 +682,11 @@ export class OfflineReceive {
 					current.epochId === epoch.epochId &&
 					current.state === 'ACTIVE' &&
 					(paid || expired || unused)
-				)
-					await this.node.fforRecover({ channelId: job.channelId });
+				) {
+					if (current.concurrentVersion)
+						this.node.fforCloseEpoch(job.channelId);
+					else await this.node.fforRecover({ channelId: job.channelId });
+				}
 			}
 		} finally {
 			this.syncing = false;

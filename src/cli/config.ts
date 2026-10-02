@@ -633,6 +633,24 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			cliFlags.fforReceiveFunding ??
 			receiveFundingEnv() ??
 			file.fforReceiveFunding,
+		fforConcurrent:
+			cliFlags.fforConcurrent ??
+			(process.env.BEIGNET_FFOR_CONCURRENT === 'true'
+				? true
+				: process.env.BEIGNET_FFOR_CONCURRENT === 'false'
+				? false
+				: undefined) ??
+			file.fforConcurrent ??
+			false,
+		fforSettleConcurrent:
+			cliFlags.fforSettleConcurrent ??
+			(process.env.BEIGNET_FFOR_SETTLE_CONCURRENT === 'true'
+				? true
+				: process.env.BEIGNET_FFOR_SETTLE_CONCURRENT === 'false'
+				? false
+				: undefined) ??
+			file.fforSettleConcurrent ??
+			false,
 		fforSettle:
 			cliFlags.fforSettle ??
 			(process.env.BEIGNET_FFOR_SETTLE === 'true' ||

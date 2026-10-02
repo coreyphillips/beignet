@@ -6117,7 +6117,7 @@ export class ChannelManager extends EventEmitter {
 	 * is unknown: an advertisement that was not seen selects nothing, and
 	 * the reconnect check of section 8 must not pass on a guess.
 	 */
-	private peerNegotiatedFforConcurrent(peerPubkey: string): boolean {
+	peerNegotiatedFforConcurrent(peerPubkey: string): boolean {
 		const local = this.config.localFeatures;
 		if (
 			!local ||
