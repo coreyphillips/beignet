@@ -1014,13 +1014,14 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 			});
 		}
 
-		// The manager announces a dispute once per channel for the life of
-		// the process (_fforEnforceAnnounced is never cleared). That was
-		// enough while only a reestablish could raise activationMismatch on an
-		// epoch that then stayed in dispute. A disputed concurrent book now
-		// drains to CLOSED and the channel takes a new epoch; a dispute on
-		// that one is recorded and never announced.
-		it.skip("DEFECT [pre-existing bookkeeping, newly reachable] a second disputed epoch on the same channel raises no 'ffor:enforce': the host is told once per channel, not once per epoch", () => {
+		// Found by this review: the manager announced a dispute once per
+		// channel for the life of the process. That was enough while only a
+		// reestablish could raise activationMismatch on an epoch that then
+		// stayed in dispute. A disputed concurrent book now drains to CLOSED
+		// and the channel takes a new epoch; a dispute on that one was
+		// recorded and never announced. Fixed: the announcement is kept per
+		// epoch.
+		it("a second disputed epoch on the same channel raises its own 'ffor:enforce': the host is told once per epoch", () => {
 			const pair = createPair({ pushSat: 200_000n });
 			const enforce: Buffer[] = [];
 			pair.rManager.on('ffor:enforce', (_id: Buffer, f: { epochId: Buffer }) =>

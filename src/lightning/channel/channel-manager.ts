@@ -6163,8 +6163,13 @@ export class ChannelManager extends EventEmitter {
 		}
 	}
 
-	/** Channels whose activation mismatch was already announced. */
-	private _fforEnforceAnnounced = new Set<string>();
+	/**
+	 * The epoch whose dispute was last announced, per channel. Keyed by the
+	 * epoch and not by the channel alone: a disputed book can drain to
+	 * CLOSED and the channel then takes a new epoch, whose own dispute the
+	 * host must hear of as well.
+	 */
+	private _fforEnforceAnnounced = new Map<string, string>();
 
 	/**
 	 * 'ffor:enforce' (channelId, record): the peer's reestablish contradicted
@@ -6177,8 +6182,9 @@ export class ChannelManager extends EventEmitter {
 		record: IFforEpochRecord | null
 	): void {
 		if (!record || !record.activationMismatch) return;
-		if (this._fforEnforceAnnounced.has(hex)) return;
-		this._fforEnforceAnnounced.add(hex);
+		const epoch = record.epochId.toString('hex');
+		if (this._fforEnforceAnnounced.get(hex) === epoch) return;
+		this._fforEnforceAnnounced.set(hex, epoch);
 		this.emit('ffor:enforce', channelId, record);
 	}
 
