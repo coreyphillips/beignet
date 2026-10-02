@@ -676,7 +676,7 @@ function runSchedule(
 		).to.equal(FforState.CLOSED);
 	};
 	// With every voucher redeemed while ACTIVE the interim CLOSED rule needs
-	// one more commitment round after ff_close (pinned as a DEFECT above),
+	// one more commitment round after ff_close (pinned above),
 	// which the final settles below supply; otherwise CLOSED is already due.
 	const drainedBeforeClose =
 		redemptions && record(pair.rChannel).state === FforState.DRAINING;
@@ -1709,27 +1709,41 @@ describe('FFOR concurrent receive, adversarial: feature bit hygiene', function (
 		expect(w.s.getFforEpoch(w.srHex)?.concurrentVersion ?? 0).to.equal(0);
 	});
 
-	it('OBSERVATION: with the option on, bit 563 also rides in node_announcement (the node reuses its init set); with it off it does not', () => {
-		const announce = (node: LightningNode): FeatureFlags => {
+	// The review observed that with the option on, bit 563 also rode in
+	// node_announcement, because the node reuses its init set there.
+	// CONCURRENT-RECEIVE.md section 1.1 names the init context only, so the
+	// announcement now leaves it out.
+	it('with the option on, bit 563 is advertised in init and left out of node_announcement, whose features are those of a node with the option off', () => {
+		const announce = (node: LightningNode): Buffer => {
 			const payload = (
 				node as unknown as { buildNodeAnnouncement(t: number): Buffer | null }
 			).buildNodeAnnouncement(1_790_000_000);
 			expect(payload, 'announcement built').to.not.equal(null);
-			return FeatureFlags.fromBuffer(
-				decodeNodeAnnouncementMessage(payload!).features
-			);
+			return decodeNodeAnnouncementMessage(payload!).features;
 		};
 		const off = new LightningNode(makeNodeConfig(9104));
-		expect(announce(off).hasFeature(Feature.OPTION_FF_CONCURRENT)).to.equal(
-			false
-		);
+		expect(
+			FeatureFlags.fromBuffer(announce(off)).hasFeature(
+				Feature.OPTION_FF_CONCURRENT
+			)
+		).to.equal(false);
 		const on = new LightningNode(
 			makeNodeConfig(9105, undefined, { fforConcurrent: { enabled: true } })
 		);
-		// CONCURRENT-RECEIVE.md section 1.1 names the init context only. This
-		// pins what the build does today so a change is deliberate.
-		expect(announce(on).hasBit(563)).to.equal(true);
-		expect(announce(on).hasBit(562)).to.equal(false);
+		expect(on.getLocalFeatures().hasBit(563), 'in init').to.equal(true);
+		const announced = FeatureFlags.fromBuffer(announce(on));
+		expect(announced.hasBit(563)).to.equal(false);
+		expect(announced.hasBit(562)).to.equal(false);
+		// Everything else the node advertises is still announced, the base
+		// capability included.
+		expect(announced.hasFeature(Feature.OPTION_FF_RECEIVE)).to.equal(true);
+		expect(announce(on).equals(announce(off))).to.equal(true);
+		// And the init set itself is not touched by building an announcement.
+		expect(on.getLocalFeatures().hasBit(563)).to.equal(true);
+		// With the option off the announcement is the init set, byte for byte.
+		expect(announce(off).equals(off.getLocalFeatures().toBuffer())).to.equal(
+			true
+		);
 	});
 });
 

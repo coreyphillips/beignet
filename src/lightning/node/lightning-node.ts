@@ -14794,9 +14794,23 @@ export class LightningNode extends EventEmitter {
 			// field made CLN/eclair/LDK refuse to route onion messages to us and
 			// left our BOLT 12 offers unreachable to non-direct peers. Reuse the init
 			// feature set (large_channels is already in it when wumbo is enabled).
+			//
+			// option_ff_concurrent is the one exception. CONCURRENT-RECEIVE.md
+			// section 1.1 defines it for the init context only: it qualifies a
+			// connection, both peers read it from the current init exchange,
+			// and nothing may infer a profile from an advertisement seen
+			// elsewhere. So it stays out of gossip. A node that has not opted
+			// in takes the first branch and announces the bytes it always did.
+			let announcedFeatures = this.localFeatures.toBuffer();
+			if (this.localFeatures.hasFeature(Feature.OPTION_FF_CONCURRENT)) {
+				const announced = FeatureFlags.fromBuffer(announcedFeatures);
+				announced.clearBit(Feature.OPTION_FF_CONCURRENT);
+				announced.clearBit(Feature.OPTION_FF_CONCURRENT + 1);
+				announcedFeatures = announced.toBuffer();
+			}
 			const payload = encodeNodeAnnouncementMessage({
 				signature: Buffer.alloc(64), // placeholder — signed below
-				features: this.localFeatures.toBuffer(),
+				features: announcedFeatures,
 				timestamp,
 				nodeId,
 				rgbColor: Buffer.from([0, 0, 0]),
