@@ -1043,7 +1043,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 		// (Channel.fforHoldStream, asked by the manager for every batch), and
 		// a new add of R's is refused. The three shapes found, then the
 		// baseline double fault the same gate closes (issue #1304).
-		it('R fulfils an ordinary HTLC while its chain is held: the fulfil waits behind the chain, and both commit when the acknowledgement returns', () => {
+		it('R fulfils an ordinary HTLC while its chain is held: the fulfil joins the chain, the held signature is made again over it, and both commit when the acknowledgement returns', () => {
 			const { pair, inbound } = sLostTheClose([2]);
 			pair.link.holdAt = (from, type): boolean =>
 				from === 'S' && type === MessageType.FF_CLOSE_ACK;
@@ -1068,12 +1068,15 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 				sentBy(pair, 'R'),
 				'nothing left ahead of the chain'
 			).to.deep.equal([MessageType.CHANNEL_REESTABLISH, MessageType.FF_CLOSE]);
-			// S's acknowledgement arrives and the chain is released, the
-			// fulfil of the ordinary HTLC after the commitment_signed that was
-			// made before it.
+			// The held commitment_signed was provably undelivered, so it was
+			// taken back and made again over the fulfil: nothing of R's is
+			// queued behind a signature that does not cover it (round 2).
+			expect(prone1300(pair)).to.equal(false);
+			// S's acknowledgement arrives and the chain is released: the
+			// voucher updates, the fulfil, then the one signature over them.
 			pair.link.release('S');
 			const fromR = pair.link.log.filter((e) => e.from === 'R');
-			const held = fromR.findIndex(
+			const signed = fromR.findIndex(
 				(e) => e.type === MessageType.COMMITMENT_SIGNED
 			);
 			const late = fromR.findIndex(
@@ -1081,8 +1084,8 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 					e.type === MessageType.UPDATE_FULFILL_HTLC &&
 					e.payload.readBigUInt64BE(32) === inbound.id
 			);
-			expect(held).to.be.greaterThan(-1);
-			expect(late, 'behind the held commitment_signed').to.be.greaterThan(held);
+			expect(late).to.be.greaterThan(-1);
+			expect(signed, 'one signature, after the fulfil').to.be.greaterThan(late);
 			expectAlive(pair, 'chain released');
 			expectClosed(pair, 'chain released');
 			expect(ordinaryHtlcs(pair.sChannel)).to.deep.equal([]);
@@ -1706,29 +1709,37 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 			expect(pair.events.R.forwarded).to.include(add.id);
 		});
 
-		it('PIN [#1300] a settle waiting behind the held chain, then the connection drops before the acknowledgement: the reconnect replays it ahead of the commitment_signed that does not cover it', () => {
-			// What waits behind the chain is, in the channel's state, an update
-			// queued behind an unrevoked commitment_signed: issue #1300's
-			// precondition, here as anywhere. Not this PR's to fix. Required
-			// once #1300 is fixed: no wire error, both channels NORMAL, the
-			// book CLOSED (expectAlive, expectClosed). Today:
+		it('a settle made while the chain is held, then the connection drops before the acknowledgement: nothing of R is queued behind a signature that does not cover it, and the reconnect drains', () => {
+			// Round 1 left the settle queued behind the held commitment_signed,
+			// which in the channel's state is issue #1300's precondition, and
+			// the reconnect failed the channel. Since round 2 the held
+			// signature is made again over whatever of R's joins the chain
+			// (it is provably undelivered), so the queue is always updates
+			// and then one signature, which a reestablish replays in order.
 			const { pair, inbound } = sLostTheClose([2]);
 			pair.link.holdAt = (from, type): boolean =>
 				from === 'S' && type === MessageType.FF_CLOSE_ACK;
 			pair.link.reconnect();
 			pair.link.holdAt = null;
+			const number = pair.rChannel.getFullState().remoteCommitmentNumber;
 			const settle = pair.rManager.fulfillHtlc(
 				pair.channelId,
 				inbound.id,
 				inbound.preimage
 			);
 			expect(settle.ok, settle.error).to.equal(true);
-			expect(prone1300(pair)).to.equal(true);
+			expect(prone1300(pair)).to.equal(false);
+			// The same commitment number, signed again.
+			expect(pair.rChannel.getFullState().remoteCommitmentNumber).to.equal(
+				number
+			);
 			// The acknowledgement dies with the socket; S holds the close now.
 			interrupt(pair, 'disconnect');
 			pair.link.reconnect();
-			expect(pair.link.types()).to.include(MessageType.ERROR);
-			expect(pair.sErrors.join('|')).to.match(/Invalid commitment signature/);
+			expectAlive(pair, 'reconnected');
+			expectClosed(pair, 'reconnected');
+			expect(balances(pair)).to.deep.equal(drained(6_000_000n));
+			expectSettled(pair, 'reconnected');
 		});
 	});
 

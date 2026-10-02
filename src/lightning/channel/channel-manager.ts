@@ -6257,6 +6257,20 @@ export class ChannelManager extends EventEmitter {
 		}
 		const progress = newDispatchProgress();
 		this.processActions(peerPubkey, channel, actions, progress);
+		// A concurrent epoch whose close just fell into dispute while its
+		// retransmission chain is held can make no progress on this
+		// connection: the chain is not released and the channel refuses its
+		// own settles until it reestablishes. Ask for that reestablish the
+		// way a blocked transition does, so an HTLC the node holds the
+		// preimage for is settled after one reconnect instead of riding to
+		// its on-chain deadline. A failed write has already asked.
+		if (
+			typeof channel.fforTakeReconnectRequest === 'function' &&
+			channel.fforTakeReconnectRequest() &&
+			!progress.sendsWithheld
+		) {
+			this.emit('transition:blocked', peerPubkey, channelId);
+		}
 		if (progress.sendsWithheld) {
 			// The durable write behind this transition did not land: nothing
 			// that transition authorizes may follow it. The reestablish path

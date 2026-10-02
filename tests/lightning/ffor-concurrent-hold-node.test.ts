@@ -18,7 +18,7 @@
 import { expect } from 'chai';
 import { Channel } from '../../src/lightning/channel/channel';
 import { ChannelState, HtlcState } from '../../src/lightning/channel/types';
-import { FforState } from '../../src/lightning/ffor/types';
+import { FforSlotState, FforState } from '../../src/lightning/ffor/types';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
 import { MessageType } from '../../src/lightning/message/types';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
@@ -166,13 +166,19 @@ describe('FFOR concurrent receive: the drain hold through the node', function ()
 			`S:${MessageType.ERROR}`
 		);
 		expect(wire).to.not.include(`R:${MessageType.ERROR}`);
-		// The fulfil of the forward left behind the commitment_signed that
-		// was signed before it existed.
+		// The fulfil of the forward joined the held chain, and the held
+		// commitment_signed was made again over it: the three voucher fails,
+		// the fulfil, then one signature that covers all four.
 		const fromR = w.sr.log.filter((e) => e.from === rId).map((e) => e.type);
-		const signed = fromR.indexOf(MessageType.COMMITMENT_SIGNED);
-		const fulfil = fromR.indexOf(MessageType.UPDATE_FULFILL_HTLC);
-		expect(signed).to.be.greaterThan(-1);
-		expect(fulfil, 'the fulfil of the forward').to.be.greaterThan(signed);
+		expect(fromR.slice(0, 7)).to.deep.equal([
+			MessageType.CHANNEL_REESTABLISH,
+			MessageType.FF_CLOSE,
+			MessageType.UPDATE_FAIL_HTLC,
+			MessageType.UPDATE_FAIL_HTLC,
+			MessageType.UPDATE_FAIL_HTLC,
+			MessageType.UPDATE_FULFILL_HTLC,
+			MessageType.COMMITMENT_SIGNED
+		]);
 		expect(srChannel(w.s, w).getState()).to.equal(ChannelState.NORMAL);
 		expect(srChannel(w.r, w).getState()).to.equal(ChannelState.NORMAL);
 		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
@@ -180,6 +186,111 @@ describe('FFOR concurrent receive: the drain hold through the node', function ()
 		expect(record(w.s, w.srHex).state).to.equal(FforState.CLOSED);
 		expect(ordinary(srChannel(w.r, w))).to.deep.equal([]);
 		expect(ordinary(srChannel(w.s, w))).to.deep.equal([]);
+		expect(xErrors).to.deep.equal([]);
+
+		for (const node of [w.p, w.s, w.r, x]) node.destroy();
+	});
+
+	it("S's second acknowledgement differs while the chain is held: R's node asks its host to drop the connection, once, and the reconnect settles the forward the dispute held back", async () => {
+		// The same forward owed upstream, but S's row also predates a
+		// settlement, so the acknowledgement it signs again differs from the
+		// one R processed. R records the dispute and keeps its chain held;
+		// its own settles are refused until the channel reestablishes. The
+		// manager asks for that reestablish (transition:blocked), the node
+		// applies the disconnect and tells its host
+		// (peer:disconnect-requested), and the reconnect drains: without the
+		// request the forward would wait for its on-chain deadline on a
+		// healthy connection.
+		const w = createConcurrentWorld();
+		activateWorld(w, true);
+		const { x, errors: xErrors } = addDownstream(w);
+		const invoice = x.createInvoice({
+			amountMsat: 3_000_000n,
+			description: 'through R',
+			hold: true
+		});
+		const payment = w.s.sendPayment(invoice.bolt11);
+		await waitFor('the HTLC to park at X', () =>
+			x.listHoldInvoices().some((h) => h.state === 'ACCEPTED')
+		);
+		const rId = w.r.getNodeId();
+		const sId = w.s.getNodeId();
+		const backup = JSON.stringify(
+			serializeChannelState(srChannel(w.s, w).getFullState())
+		);
+		// S settles slot 2 after that row was written.
+		const settled = w.s
+			.getChannelManager()
+			.fforSetSlot(
+				w.srChannelId,
+				2,
+				FforSlotState.SETTLED,
+				`${'ab'.repeat(32)}:2`
+			);
+		expect(settled.ok, settled.error).to.equal(true);
+		w.sr.drop = (from, type): boolean =>
+			from === rId && type !== MessageType.FF_CLOSE;
+		const closed = w.r.closeFforEpoch(w.srHex);
+		expect(closed.ok, closed.error).to.equal(true);
+		await flush();
+		expect(record(w.r, w.srHex).state).to.equal(FforState.DRAINING);
+		w.sr.drop = null;
+		w.sr.disconnect();
+		w.s
+			.getChannelManager()
+			.restoreChannel(
+				new Channel(deserializeChannelState(JSON.parse(backup))),
+				rId
+			);
+		await flush();
+		x.settleHeldHtlc(invoice.paymentHash);
+		await flush();
+
+		const requested: string[] = [];
+		const enforce: string[] = [];
+		w.r.on('peer:disconnect-requested', (pubkey: string) =>
+			requested.push(pubkey)
+		);
+		w.r.on('ffor:enforce', (e: { channelId: Buffer }) =>
+			enforce.push(e.channelId.toString('hex'))
+		);
+		w.sr.log.length = 0;
+		w.sr.reconnect();
+		// In the dispute, before the node's deferred disconnect. The node
+		// settled the forward on channel:reestablished, ahead of S's
+		// acknowledgement, so its fulfil waits in the held chain; nothing of
+		// R's stream has left, and the payer is still waiting.
+		expect(record(w.r, w.srHex).activationMismatch).to.equal(true);
+		expect(payment.status).to.equal(PaymentStatus.PENDING);
+		expect(ordinary(srChannel(w.r, w))[0]).to.match(/^received-\d+:FULFILLED$/);
+		expect(
+			w.sr.log.filter((e) => e.from === rId).map((e) => e.type)
+		).to.deep.equal([MessageType.CHANNEL_REESTABLISH, MessageType.FF_CLOSE]);
+		await waitFor('the node to ask its host for the disconnect', () => {
+			return requested.length > 0;
+		});
+		expect(requested).to.deep.equal([sId]);
+		expect(enforce).to.deep.equal([w.srHex]);
+		expect(srChannel(w.r, w).getState()).to.equal(
+			ChannelState.AWAITING_REESTABLISH
+		);
+		// The host severs the transport and the peers reconnect.
+		w.sr.disconnect();
+		w.sr.reconnect();
+		await waitFor('the payer to be paid out', () => {
+			return payment.status !== PaymentStatus.PENDING;
+		});
+		await flush();
+		const wire = w.sr.log.map((e) => `${e.from === rId ? 'R' : 'S'}:${e.type}`);
+		expect(wire, JSON.stringify(w.errors)).to.not.include(
+			`S:${MessageType.ERROR}`
+		);
+		expect(wire).to.not.include(`R:${MessageType.ERROR}`);
+		expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+		expect(record(w.r, w.srHex).state).to.equal(FforState.CLOSED);
+		expect(record(w.s, w.srHex).state).to.equal(FforState.CLOSED);
+		expect(ordinary(srChannel(w.r, w))).to.deep.equal([]);
+		expect(requested.length, 'asked once').to.equal(1);
 		expect(xErrors).to.deep.equal([]);
 
 		for (const node of [w.p, w.s, w.r, x]) node.destroy();

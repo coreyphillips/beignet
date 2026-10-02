@@ -13,8 +13,7 @@
  *
  * Every test passes. Most pin an attack that held. What the review found is
  * fixed, and those cases assert the fixed behaviour; each says in a comment
- * what it found. Titles that begin with PIN assert what happens today for a
- * defect that is tracked elsewhere, so they fail visibly when it is fixed.
+ * what it found.
  *
  * Harness: helpers/ffor-concurrent-pair.ts.
  *
@@ -816,37 +815,48 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 				expectClosed(pair, 'released');
 			});
 
-			it("PIN [#1300] with a settle of R's waiting behind the chain: the second answer replays it ahead of the commitment_signed that does not cover it", () => {
-				// The settle is, in the channel's state, an update queued behind
-				// an unrevoked commitment_signed, and the answer to a reestablish
-				// replays every queued update before the retransmitted signature
-				// (issue #1300, not this PR's to fix). The first chain had it in
-				// the right place; the answer to the second does not. Required
-				// once #1300 is fixed: the fulfil follows the commitment_signed,
-				// and the release drains with no wire error.
-				const { pair, fromS, again } = heldPair();
+			it("with a settle of R's in the chain: the held signature was made again over it, and the second answer reproduces the updates and then that signature", () => {
+				// A settle made while holding used to sit behind the held
+				// commitment_signed, and the answer to a reestablish replays
+				// every queued update ahead of the retransmitted signature
+				// (issue #1300). The held signature is now made again over
+				// whatever of R's joins the chain, so the queue is updates and
+				// then one signature, and any answer reproduces that order.
+				const { pair, fromS } = sLostTheClose([2]);
+				pair.link.holdAt = (from, type): boolean =>
+					from === 'S' && type === MessageType.FF_CLOSE_ACK;
+				pair.link.reconnect();
+				pair.link.holdAt = null;
+				const reestablish = pair.link.log.find(
+					(e) => e.from === 'S' && e.type === MessageType.CHANNEL_REESTABLISH
+				)!;
 				const settle = pair.rManager.fulfillHtlc(
 					pair.channelId,
-					fromS.id,
-					fromS.preimage
+					fromS!.id,
+					fromS!.preimage
 				);
 				expect(settle.ok, settle.error).to.equal(true);
-				expect(heldTypes(pair.rChannel)).to.deep.equal([
-					MessageType.UPDATE_FAIL_HTLC,
-					MessageType.UPDATE_FULFILL_HTLC,
-					MessageType.UPDATE_FAIL_HTLC,
-					MessageType.COMMITMENT_SIGNED,
-					MessageType.UPDATE_FULFILL_HTLC
-				]);
-				again();
-				// Today: once each, and the late fulfil ahead of the signature.
-				expect(heldTypes(pair.rChannel)).to.deep.equal([
+				const chain = [
 					MessageType.UPDATE_FAIL_HTLC,
 					MessageType.UPDATE_FULFILL_HTLC,
 					MessageType.UPDATE_FAIL_HTLC,
 					MessageType.UPDATE_FULFILL_HTLC,
 					MessageType.COMMITMENT_SIGNED
-				]);
+				];
+				expect(heldTypes(pair.rChannel)).to.deep.equal(chain);
+				const answer = pair.rChannel.handleReestablish(
+					decodeChannelReestablishMessage(reestablish.payload)
+				);
+				expect(
+					answer.filter((a) => a.type === ChannelActionType.ERROR)
+				).to.deep.equal([]);
+				expect(heldTypes(pair.rChannel)).to.deep.equal(chain);
+				pair.link.release('S');
+				expectAlive(pair, 'released');
+				expectClosed(pair, 'released');
+				expect(ordinaryHtlcs(pair.sChannel)).to.not.include(
+					`offered-${fromS!.id}`
+				);
 			});
 		});
 
@@ -1317,16 +1327,21 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 		// CONCURRENT-RECEIVE.md section 3: a close transition "MUST permit
 		// existing ordinary fulfill/fail and commitment progress".
 		//
-		// The fix refuses R's own settle while the disputed chain is held and
-		// names the remedy: "the caller keeps what it owes and settles when
-		// the channel has reestablished". Nothing brings that reestablish
-		// about. The connection is healthy, S has nothing to wait for, and
-		// the manager raises ffor:enforce and no request to drop the
-		// connection (a failed write gets one: transition:blocked). So the
-		// refusal lasts until something unrelated cuts the link; an inbound
-		// HTLC R holds the preimage for rides to the claim backstop, which
-		// force closes a channel one reconnect would have drained.
-		it.skip('DEFECT [left by the round 1 fixes] the disputed hold refuses R its own settle "until the channel reestablishes" and nothing asks for that reestablish', () => {
+		// The round 1 fix refuses R's own settle while the disputed chain is
+		// held and names the remedy: "the caller keeps what it owes and
+		// settles when the channel has reestablished". This review found that
+		// nothing brought that reestablish about. The connection is healthy,
+		// S has nothing to wait for, and the manager raised ffor:enforce and
+		// no request to drop the connection (a failed write gets one:
+		// transition:blocked). So the refusal lasted until something
+		// unrelated cut the link; an inbound HTLC R holds the preimage for
+		// rode to the claim backstop, which force closes a channel one
+		// reconnect would have drained.
+		//
+		// Fixed: as the dispute is recorded while the chain is held, the
+		// manager raises transition:blocked for the peer, once, which is the
+		// node's cue to drop the connection.
+		it('the disputed hold refuses R its own settle "until the channel reestablishes", asks once for that reestablish, and the reconnect settles', () => {
 			const pair = activePair();
 			const inbound = offer(pair, 'S', 6_000_000n);
 			expect(inbound.result.ok, inbound.result.error).to.equal(true);
@@ -1338,25 +1353,103 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 			expect(closed.ok, closed.error).to.equal(true);
 			pair.link.drop = null;
 			restart(pair, 'S', backup);
-			const asked: string[] = [];
-			for (const name of ['transition:blocked', 'transition:frozen']) {
-				pair.rManager.on(name, () => asked.push(name));
-			}
+			const asked: Array<{ name: string; peer: string; id: string }> = [];
+			pair.rManager.on(
+				'transition:blocked',
+				(peer: string, id: Buffer | null) =>
+					asked.push({
+						name: 'transition:blocked',
+						peer,
+						id: id ? id.toString('hex') : ''
+					})
+			);
+			pair.rManager.on('transition:frozen', (peer: string, id: string) =>
+				asked.push({ name: 'transition:frozen', peer, id })
+			);
 			pair.link.log.length = 0;
 			pair.link.reconnect();
 			expect(record(pair.rChannel).activationMismatch).to.equal(true);
 			expect(holding(pair.rChannel)).to.equal(true);
+			expect(asked, 'R asks for the reconnect, once').to.deep.equal([
+				{
+					name: 'transition:blocked',
+					peer: pair.sPub,
+					id: pair.channelId.toString('hex')
+				}
+			]);
 			const settle = pair.rManager.fulfillHtlc(
 				pair.channelId,
 				inbound.id,
 				inbound.preimage
 			);
-			// Either the settle makes progress, or R asks for the reconnect
-			// that lets it.
-			expect(
-				settle.ok || asked.length > 0,
-				`settle: ${settle.error}; reconnect requested: ${asked.length > 0}`
-			).to.equal(true);
+			expect(settle.ok).to.equal(false);
+			// The same acknowledgement again asks for nothing more.
+			const again = pair.link.log.find(
+				(e) => e.from === 'S' && e.type === MessageType.FF_CLOSE_ACK
+			)!;
+			pair.rManager.handleMessage(
+				pair.sPub,
+				MessageType.FF_CLOSE_ACK,
+				again.payload
+			);
+			expect(asked.length).to.equal(1);
+			// The node drops the connection; the reestablish drains, and the
+			// settle the channel refused goes through.
+			interrupt(pair, 'disconnect');
+			pair.link.reconnect();
+			expectAlive(pair, 'reconnected');
+			expectClosed(pair, 'reconnected');
+			expect(asked.length, 'no loop').to.equal(1);
+			const retried = pair.rManager.fulfillHtlc(
+				pair.channelId,
+				inbound.id,
+				inbound.preimage
+			);
+			expect(retried.ok, retried.error).to.equal(true);
+			expect(balances(pair)).to.deep.equal(drained(6_000_000n));
+			expectSettled(pair, 'reconnected');
+		});
+
+		it('a dispute already on the record asks for no second reconnect, and a baseline epoch asks for none', () => {
+			// One epoch asks once, so a peer that keeps losing the close cannot
+			// make R drop the connection in a loop.
+			const pair = activePair();
+			const backup = snapshot(pair, 'S');
+			settleSlot(pair, 2);
+			pair.link.drop = (from, type): boolean =>
+				from === 'R' && type !== MessageType.FF_CLOSE;
+			const closed = pair.rManager.closeFforEpoch(pair.channelId);
+			expect(closed.ok, closed.error).to.equal(true);
+			pair.link.drop = null;
+			restart(pair, 'S', backup);
+			let asked = 0;
+			pair.rManager.on('transition:blocked', () => asked++);
+			pair.link.reconnect();
+			expect(asked).to.equal(1);
+			// S loses the close again; R is the same process.
+			pair.link.disconnect();
+			restart(pair, 'S', backup);
+			pair.link.reconnect();
+			expect(holding(pair.rChannel)).to.equal(true);
+			expect(pair.rErrors.join('|')).to.match(/ff_close_ack differs/);
+			expect(asked).to.equal(1);
+			// And again after R restarts: the record remembers.
+			pair.link.disconnect();
+			restart(pair, 'R');
+			restart(pair, 'S', backup);
+			pair.rManager.on('transition:blocked', () => asked++);
+			pair.link.reconnect();
+			expect(holding(pair.rChannel)).to.equal(true);
+			expect(asked).to.equal(1);
+
+			const base = sLostTheClose([], false).pair;
+			let baselineAsked = 0;
+			base.rManager.on('transition:blocked', () => baselineAsked++);
+			settleSlot(base, 2);
+			base.link.reconnect();
+			expect(base.rErrors.join('|')).to.match(/ff_close_ack differs/);
+			expect(holding(base.rChannel)).to.equal(true);
+			expect(baselineAsked).to.equal(0);
 		});
 
 		it('the dispute through restarts of both sides and a third loss of the close by S: consistent, nothing fails, and the first reestablish with a DRAINING S drains', () => {

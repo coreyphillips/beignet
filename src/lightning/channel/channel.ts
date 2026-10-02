@@ -999,6 +999,16 @@ export class Channel {
 	 */
 	private _fforReleasedStream: ChannelAction[] | null = null;
 	/**
+	 * FFOR concurrent receive (R, DRAINING): a dispute was just recorded
+	 * while the chain is held. Nothing on this connection releases the chain
+	 * any more, and our own settles are refused until the channel
+	 * reestablishes, so that reestablish is asked for: the manager takes
+	 * this (fforTakeReconnectRequest) and has the connection dropped, the
+	 * way it does for a blocked transition. Set only as the dispute is
+	 * first recorded, which the record remembers, so one epoch asks once.
+	 */
+	private _fforReconnectWanted = false;
+	/**
 	 * FFOR concurrent receive: setFforCapabilities changed the record's
 	 * capability hold and no durable write has carried the change yet. Every
 	 * reestablish asks for that write while this is set, whether or not it
@@ -4597,6 +4607,10 @@ export class Channel {
 	 * already fulfilled/failed HTLC is a no-op).
 	 */
 	private _queuePendingLocalUpdate(type: MessageType, payload: Buffer): void {
+		// FFOR: an update of ours made while the retransmission chain is held
+		// must not be left behind a held commitment_signed that does not
+		// cover it (see _fforReopenHeldCommitment).
+		this._fforReopenHeldCommitment();
 		this._state.pendingLocalUpdates.push({
 			type,
 			payload: Buffer.from(payload)
@@ -9480,6 +9494,7 @@ export class Channel {
 		this._fforHolding = false;
 		this._fforHeldReplay = [];
 		this._fforReleasedStream = null;
+		this._fforReconnectWanted = false;
 		this._state.quiescenceState = QuiescenceState.NORMAL;
 		this._state.quiescenceInitiator = false;
 
@@ -23080,8 +23095,10 @@ export class Channel {
 						// ours could only wait behind it for the reconnect.
 						// Refused as it is while awaiting reestablish, and for
 						// the same remedy: the caller keeps what it owes and
-						// settles when the channel has reestablished. The
-						// peer's settle is taken, and answered behind the chain.
+						// settles when the channel has reestablished, which
+						// the dispute asked for as it was recorded
+						// (_fforReconnectWanted). The peer's settle is taken,
+						// and answered behind the chain.
 						if (
 							ctx.origin === 'local' &&
 							this._fforHolding &&
@@ -25436,6 +25453,11 @@ export class Channel {
 				// epoch carries no ordinary traffic and records none.
 				f.activationMismatch = true;
 				disputed = true;
+				// The chain stays held and our own settles are refused until
+				// the channel reestablishes: ask for that reestablish, once.
+				// At it S reports DRAINING, no hold applies, and everything
+				// drains.
+				if (this._fforHolding) this._fforReconnectWanted = true;
 			}
 			return [
 				...kept,
@@ -25703,11 +25725,8 @@ export class Channel {
 		// alone to take: one commitment_signed awaiting its revoke_and_ack,
 		// the peer without it, and nothing but HTLC updates baked into it.
 		const commitmentUndelivered =
-			this.isAwaitingRemoteRevocation() &&
 			(atReestablish ? peerLacksCommitment === true : heldCommitment >= 0) &&
-			this._state.pendingFeerateCommitted !== true &&
-			this._state.pendingLeaseBlockheightCommitted !== true &&
-			!this._lastSentBatch;
+			this._fforCommitmentCanBeTakenBack();
 		const isFailOf = (type: number, payload: Buffer, id: bigint): boolean =>
 			(type === MessageType.UPDATE_FAIL_HTLC ||
 				type === MessageType.UPDATE_FAIL_MALFORMED_HTLC) &&
@@ -25760,18 +25779,55 @@ export class Channel {
 			if (signed) unsign = true;
 		}
 		if (unsign) {
-			this._fforTakeBackCommitment();
-			if (!atReestablish) {
-				// Re-read: the swaps above replaced entries, never moved them.
-				const at = this._fforHeldReplay.findIndex(
-					(a) =>
-						a.type === ChannelActionType.SEND_MESSAGE &&
-						a.messageType === MessageType.COMMITMENT_SIGNED
-				);
-				if (at >= 0) this._fforHeldReplay.splice(at, 1);
+			if (atReestablish) {
+				this._fforTakeBackCommitment();
+			} else {
+				this._fforReopenHeldCommitment();
 			}
 		}
 		return withdrew;
+	}
+
+	/**
+	 * Whether the one commitment_signed of ours that awaits its
+	 * revoke_and_ack may be taken back, given that the peer provably does
+	 * not hold it: it must be the only thing in flight, with nothing but
+	 * HTLC updates baked into it.
+	 */
+	private _fforCommitmentCanBeTakenBack(): boolean {
+		return (
+			this.isAwaitingRemoteRevocation() &&
+			this._state.pendingFeerateCommitted !== true &&
+			this._state.pendingLeaseBlockheightCommitted !== true &&
+			!this._lastSentBatch
+		);
+	}
+
+	/**
+	 * While the chain is held, keep it in the one shape a retransmission can
+	 * always reproduce: our updates, then one commitment_signed over all of
+	 * them. A held commitment_signed is provably undelivered (the peer's
+	 * reestablish asked for it again, or it was signed while holding), so
+	 * when an update of ours is about to join the chain behind it, or a
+	 * queued fail under it is withdrawn, the signature is taken out of the
+	 * chain and taken back, and the auto-sign that follows every update
+	 * makes it again, at the same commitment number, over everything queued.
+	 *
+	 * Without this the update would sit behind an unrevoked signature that
+	 * does not cover it, and a connection lost before the release would
+	 * meet the reestablish replay of issue #1300 (every queued update ahead
+	 * of the retransmitted signature), which fails the channel.
+	 */
+	private _fforReopenHeldCommitment(): void {
+		if (!this._fforHolding) return;
+		const at = this._fforHeldReplay.findIndex(
+			(a) =>
+				a.type === ChannelActionType.SEND_MESSAGE &&
+				a.messageType === MessageType.COMMITMENT_SIGNED
+		);
+		if (at < 0 || !this._fforCommitmentCanBeTakenBack()) return;
+		this._fforHeldReplay.splice(at, 1);
+		this._fforTakeBackCommitment();
 	}
 
 	/** _fforWithdrawFails, judged by the channel_reestablish being answered. */
@@ -25993,6 +26049,16 @@ export class Channel {
 		}
 		if (k < 1 || k > f.params.maxPayments) return 'no such slot';
 		return null;
+	}
+
+	/**
+	 * Whether the channel wants its connection dropped so that it
+	 * reestablishes (see _fforReconnectWanted). Reading it clears it.
+	 */
+	fforTakeReconnectRequest(): boolean {
+		const wanted = this._fforReconnectWanted;
+		this._fforReconnectWanted = false;
+		return wanted;
 	}
 
 	/**
