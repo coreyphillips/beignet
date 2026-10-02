@@ -5200,6 +5200,11 @@ export class Channel {
 		this._state.lastSignedCommitLeaseBlockheight =
 			getLocalCommitmentLeaseBlockheight(this._state);
 
+		// The verified signature completes the peer's half of our fee round,
+		// including an update that kept the same rate. Its revoke_and_ack has
+		// already promoted that rate before this message can arrive on the wire.
+		this._state.awaitingLocalFeeCommitment = false;
+
 		// The HTLC SET the signature covers, same purpose (issue #643).
 		this._markOfferedAddsRemoteSigned();
 		// And the received removals it no longer carries: the peer signed this
@@ -5575,6 +5580,7 @@ export class Channel {
 		) {
 			if (this._state.role === ChannelRole.OPENER) {
 				this._state.localConfig.feeratePerKw = this._state.pendingFeeratePerKw;
+				this._state.awaitingLocalFeeCommitment = true;
 			} else {
 				this._state.remoteConfig.feeratePerKw = this._state.pendingFeeratePerKw;
 			}
@@ -11054,7 +11060,24 @@ export class Channel {
 		// (duplicate add ids ignored; fulfill/fail of an already
 		// fulfilled/failed HTLC is a no-op).
 		if (!spliceActive || pendingLock) {
-			for (const update of this._state.pendingLocalUpdates) {
+			const queue = this._state.pendingLocalUpdates;
+			const signedCount = this._state.pendingLocalUpdatesSignedCount;
+			const peerHasCommitment =
+				msg.nextCommitmentNumber === this._state.remoteCommitmentNumber + 1n;
+			for (let i = 0; i < queue.length; i++) {
+				const update = queue[i];
+				// A fee already covered by the commitment the peer holds must not
+				// start another fee round on replay. The lost revoke_and_ack will
+				// acknowledge it; unsigned updates and a missing commitment still
+				// need their original replay.
+				if (
+					peerHasCommitment &&
+					Number.isInteger(signedCount) &&
+					i < signedCount &&
+					update.type === MessageType.UPDATE_FEE
+				) {
+					continue;
+				}
 				actions.push(replayMsg(update.type as MessageType, update.payload));
 			}
 		}
@@ -15358,6 +15381,7 @@ export class Channel {
 			(this._state.pendingLocalUpdates?.length ?? 0) > 0 ||
 			this._pendingBatch !== null ||
 			this._state.pendingFeeratePerKw !== undefined ||
+			this._state.awaitingLocalFeeCommitment === true ||
 			this._state.pendingLeaseBlockheight !== undefined
 		) {
 			return 'pending updates';
