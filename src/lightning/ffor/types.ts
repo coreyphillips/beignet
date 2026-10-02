@@ -250,6 +250,12 @@ export interface IFforEpochRecord {
 	/**
 	 * Both: two ACTIVE peers reported different H_act values at reestablish
 	 * (section 7.5.5). S stops settling; R's remedy is on-chain.
+	 *
+	 * R of a concurrent epoch also sets it when S signs a second
+	 * ff_close_ack that differs from the one R processed
+	 * (CONCURRENT-RECEIVE.md section 7: every reported settled bit must stay
+	 * set). The epoch is in dispute from then on: R takes no new ordinary
+	 * add until the book is CLOSED, and the host is told ('ffor:enforce').
 	 */
 	activationMismatch: boolean;
 	/**

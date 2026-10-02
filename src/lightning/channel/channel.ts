@@ -22988,6 +22988,23 @@ export class Channel {
 							: `FFOR epoch is ${FforState[f.state]}: no new add while ${hold}`;
 					}
 					case 'settle':
+						// A disputed close keeps the chain held for the rest of
+						// the connection (handleFforCloseAck), so a settle of
+						// ours could only wait behind it for the reconnect.
+						// Refused as it is while awaiting reestablish, and for
+						// the same remedy: the caller keeps what it owes and
+						// settles when the channel has reestablished. The
+						// peer's settle is taken, and answered behind the chain.
+						if (
+							ctx.origin === 'local' &&
+							this._fforHolding &&
+							f.activationMismatch
+						) {
+							return `FFOR epoch is ${
+								FforState[f.state]
+							}: no settle until the channel reestablishes, the close is in dispute and its retransmissions are held`;
+						}
+						return null;
 					case 'commit':
 						return null;
 					default:
@@ -25280,13 +25297,26 @@ export class Channel {
 				this._fforPeerLacksClose = false;
 				return [...held, ...this._fforDrain(f)];
 			}
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'FFOR: ff_close_ack differs from the one processed',
-					cleanup: 'none'
-				}
-			];
+			const differs: ChannelAction = {
+				type: ChannelActionType.ERROR,
+				message: 'FFOR: ff_close_ack differs from the one processed',
+				cleanup: 'none'
+			};
+			if (this._fforIsConcurrent(f) && !f.activationMismatch) {
+				// S signed two different final acknowledgements for one epoch
+				// (it came back from a row that predates a settlement, or
+				// worse). Nothing is adopted from the second, and a chain held
+				// for the first stays held: this connection cannot release it.
+				// A concurrent epoch would otherwise go on taking ordinary
+				// work into a round it cannot sign, so the dispute is
+				// recorded: no new add of ours (fforAdmissionHold), no settle
+				// of ours behind a chain that will not leave
+				// (_fforConcurrentRefusal), and the host is told. A baseline
+				// epoch carries no ordinary traffic and is left as it was.
+				f.activationMismatch = true;
+				return [{ type: ChannelActionType.PERSIST_STATE }, differs];
+			}
+			return [differs];
 		}
 		if (f.state !== FforState.ACTIVE || !f.closeSent || !f.hAct) {
 			return [

@@ -1373,7 +1373,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 				return { pair, inbound };
 			}
 
-			it.skip('the hold is not released on this connection; the next reconnect drains, and R is paid for the slot it holds a preimage for', () => {
+			it('the hold is not released on this connection; the next reconnect drains, and R is paid for the slot it holds a preimage for', () => {
 				// As in baseline: the wedge lasts until the next reestablish,
 				// where S reports DRAINING and no hold applies.
 				const { pair, inbound } = differingAck();
@@ -1392,49 +1392,143 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 				expect(balances(pair)).to.deep.equal(drained(6_000_000n));
 			});
 
-			it.skip('DEFECT [new in #1301] ordinary traffic is taken into the wedge: adds and settles are accepted and sent, and none of them can be committed', () => {
-				// Section 3: new work that cannot proceed is rejected, and
-				// existing fulfil / fail and commitment progress is permitted.
-				// Observed: both sides answer ok and put the updates on the
-				// wire; R cannot sign (its only commitment_signed is parked),
-				// so nothing commits for the rest of the connection.
-				const { pair, inbound } = differingAck();
-				const fromS = offer(pair, 'S', 1_000_000n);
+			// Section 3: new work that cannot proceed is rejected. Review
+			// round 1 of PR #1301 found that both sides answered ok and put
+			// updates on the wire that R could not sign for the rest of the
+			// connection (its only commitment_signed is parked). Fixed on R,
+			// the side that knows: the differing acknowledgement puts the
+			// epoch in dispute, durably, and while the chain stays held R
+			// refuses its own new adds and its own settles, as a channel
+			// awaiting reestablish does. S cannot know its acknowledgement was
+			// refused; what it sends is taken and answered behind the chain,
+			// and commits at the reconnect.
+			it('the epoch is in dispute: R refuses its own adds and settles into the wedge, the host is told once, and the record keeps it across a restart', () => {
+				const pair = activePair();
+				const enforce: Buffer[] = [];
+				pair.rManager.on('ffor:enforce', (id: Buffer) => enforce.push(id));
+				const inbound = offer(pair, 'S', 6_000_000n);
+				expect(inbound.result.ok, inbound.result.error).to.equal(true);
+				const backup = snapshot(pair, 'S');
+				settleSlot(pair, 2);
+				pair.link.drop = (from, type): boolean =>
+					from === 'R' && type !== MessageType.FF_CLOSE;
+				const closed = pair.rManager.closeFforEpoch(pair.channelId);
+				expect(closed.ok, closed.error).to.equal(true);
+				pair.link.drop = null;
+				restart(pair, 'S', backup);
+				pair.link.log.length = 0;
+				expect(record(pair.rChannel).activationMismatch).to.equal(false);
+				expect(enforce.length).to.equal(0);
+				pair.link.reconnect();
+				expect(pair.rErrors.join('|')).to.match(/ff_close_ack differs/);
+				expect(record(pair.rChannel).activationMismatch).to.equal(true);
+				expect(enforce.length, "'ffor:enforce' on R").to.equal(1);
+				expect(enforce[0].equals(pair.channelId)).to.equal(true);
+
 				const fromR = offer(pair, 'R', 1_000_000n);
+				expect(fromR.result.ok).to.equal(false);
+				expect(fromR.result.error).to.match(
+					/no new add while the epoch is in dispute/
+				);
 				const settle = pair.rManager.fulfillHtlc(
 					pair.channelId,
 					inbound.id,
 					inbound.preimage
 				);
-				// Either the work is refused, or it completes.
-				if (fromS.result.ok) {
-					expect(
-						pair.events.R.forwarded,
-						"S's add was accepted and must commit"
-					).to.include(fromS.id);
-				}
-				if (fromR.result.ok) {
-					expect(
-						pair.events.S.forwarded,
-						"R's add was accepted and must commit"
-					).to.include(fromR.id);
-				}
-				if (settle.ok) {
-					expect(ordinaryHtlcs(pair.sChannel)).to.not.include(
-						`offered-${inbound.id}`
-					);
-				}
+				expect(settle.ok).to.equal(false);
+				expect(settle.error).to.match(
+					/no settle until the channel reestablishes/
+				);
+				const fail = pair.rManager.failHtlc(
+					pair.channelId,
+					inbound.id,
+					Buffer.alloc(292)
+				);
+				expect(fail.ok).to.equal(false);
+				// Nothing of R's stream is on the wire, and nothing was queued:
+				// the inbound HTLC is as it was.
+				expect(sentBy(pair, 'R')).to.deep.equal([
+					MessageType.CHANNEL_REESTABLISH,
+					MessageType.FF_CLOSE
+				]);
+				expect(ordinaryHtlcs(pair.rChannel)).to.deep.equal([
+					`received-${inbound.id}`
+				]);
+				expect(prone1300(pair), 'nothing queued behind the chain').to.equal(
+					false
+				);
+				// The same differing acknowledgement again announces nothing new.
+				const again = pair.link.log.find(
+					(e) => e.from === 'S' && e.type === MessageType.FF_CLOSE_ACK
+				)!;
+				pair.rManager.handleMessage(
+					pair.sPub,
+					MessageType.FF_CLOSE_ACK,
+					again.payload
+				);
+				expect(enforce.length).to.equal(1);
+				expect(record(pair.rChannel).state).to.equal(FforState.DRAINING);
+
+				// The dispute is on the record, and survives R's restart.
+				restart(pair, 'R');
+				expect(record(pair.rChannel).activationMismatch).to.equal(true);
 			});
 
-			it.skip('DEFECT [#1300] ...and the reconnect that ends the wedge then fails the channel on what was queued in it', () => {
+			it("S cannot know: its add into the wedge is taken by R and answered behind the chain, and it commits at the reconnect with R's settle and the drain", () => {
 				const { pair, inbound } = differingAck();
+				const fromS = offer(pair, 'S', 1_000_000n);
+				expect(fromS.result.ok, fromS.result.error).to.equal(true);
+				// R holds the add and has revoked for it in its own state, but
+				// nothing of R's has left: no revoke_and_ack overtakes the chain.
+				expect(
+					pair.rChannel.getFullState().htlcs.has(`received-${fromS.id}`)
+				).to.equal(true);
+				expect(sentBy(pair, 'R')).to.not.include(MessageType.REVOKE_AND_ACK);
+				expect(sentBy(pair, 'R')).to.not.include(MessageType.COMMITMENT_SIGNED);
+				expect(pair.events.R.forwarded).to.not.include(fromS.id);
+				expectAlive(pair, 'in the wedge');
+				// The reconnect ends the wedge: S reports DRAINING, no hold
+				// applies, and the retransmission carries the chain and R's
+				// revoke_and_ack in the order R made them.
+				interrupt(pair, 'disconnect');
+				pair.link.reconnect();
+				expectAlive(pair, 'second reconnect');
+				expectClosed(pair, 'second reconnect');
+				expect(pair.events.R.forwarded, "S's add commits").to.include(fromS.id);
+				// R's settle, refused in the wedge, goes through now.
 				const settle = pair.rManager.fulfillHtlc(
 					pair.channelId,
 					inbound.id,
 					inbound.preimage
 				);
 				expect(settle.ok, settle.error).to.equal(true);
-				expect(prone1300(pair)).to.equal(true);
+				const other2 = pair.rManager.fulfillHtlc(
+					pair.channelId,
+					fromS.id,
+					fromS.preimage
+				);
+				expect(other2.ok, other2.error).to.equal(true);
+				expect(balances(pair)).to.deep.equal(drained(7_000_000n));
+				expectSettled(pair, 'after the wedge');
+			});
+
+			it('control: a baseline epoch answers a differing acknowledgement as before, with no dispute recorded', () => {
+				const pair = createPair({ pushSat: 200_000n });
+				activate(pair, AMOUNTS, false);
+				const backup = snapshot(pair, 'S');
+				settleSlot(pair, 2);
+				pair.link.drop = (from, type): boolean =>
+					from === 'R' && type !== MessageType.FF_CLOSE;
+				const closed = pair.rManager.closeFforEpoch(pair.channelId);
+				expect(closed.ok, closed.error).to.equal(true);
+				pair.link.drop = null;
+				restart(pair, 'S', backup);
+				pair.link.log.length = 0;
+				pair.rErrors.length = 0;
+				pair.link.reconnect();
+				expect(pair.rErrors.join('|')).to.match(/ff_close_ack differs/);
+				expect(record(pair.rChannel).activationMismatch).to.equal(false);
+				expect(sentBy(pair, 'R')).to.not.include(MessageType.COMMITMENT_SIGNED);
 				interrupt(pair, 'disconnect');
 				pair.link.reconnect();
 				expectAlive(pair, 'second reconnect');
