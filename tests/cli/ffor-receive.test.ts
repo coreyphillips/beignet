@@ -26,7 +26,7 @@ const typed =
 		assert.equal(statusForErrorCode(e.code), 409);
 		return true;
 	};
-function fixture(role = 'R') {
+function fixture(role = 'R', concurrent = false) {
 	const node: any = new EventEmitter();
 	const sent: any[] = [];
 	const added: any[] = [];
@@ -68,6 +68,7 @@ function fixture(role = 'R') {
 	/** Every argument list the allocate path handed to openChannel. */
 	const opened: unknown[][] = [];
 	const host: any = {
+		fforConcurrentNegotiated: () => concurrent,
 		getNode: () => node,
 		getStorage: () => storage,
 		openChannel: (...args: unknown[]) => {
@@ -84,7 +85,8 @@ function fixture(role = 'R') {
 			maxChannelsPerPeer: 1,
 			maxChannelSats: 100000,
 			maxTotalSats: 100000
-		}
+		},
+		concurrent
 	);
 	const response = (result: any, sender = peer) =>
 		node.emit('custom-message', {
@@ -126,6 +128,24 @@ function fixture(role = 'R') {
 	};
 }
 describe('automatic receive service', () => {
+	it('offers version 2 only when concurrent settlement and peer negotiation are both enabled', async () => {
+		for (const enabled of [false, true]) {
+			const f = fixture('S', enabled);
+			try {
+				const quote = await (f.service as any).serve(peer, { op: 'quote' });
+				assert.equal(quote.concurrent, enabled ? true : undefined);
+				assert.equal(quote.concurrentVersion, enabled ? 2 : undefined);
+				f.host.fforConcurrentNegotiated = () => false;
+				assert.equal(
+					(await (f.service as any).serve(peer, { op: 'quote' }))
+						.concurrentVersion,
+					undefined
+				);
+			} finally {
+				f.service.stop();
+			}
+		}
+	});
 	it('authenticates replies and verifies the invoice hash before saving any receipt', async () => {
 		const f = fixture();
 		try {

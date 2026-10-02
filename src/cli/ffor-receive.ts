@@ -70,7 +70,8 @@ export class FforReceiveService {
 		private settle:
 			| { enabled: boolean; feeBaseMsat?: number; feePpm?: number }
 			| undefined,
-		private funding?: FforReceiveFunding
+		private funding?: FforReceiveFunding,
+		private concurrent = false
 	) {
 		if (funding?.enabled)
 			for (const k of [
@@ -231,6 +232,9 @@ export class FforReceiveService {
 				version: 1,
 				feeBaseMsat: this.settle.feeBaseMsat ?? 0,
 				feePpm: this.settle.feePpm ?? 0,
+				...(this.concurrent && this.host.fforConcurrentNegotiated(peer)
+					? { concurrent: true, concurrentVersion: 2 }
+					: {}),
 				canFund: this.funding?.enabled === true
 			};
 		if (

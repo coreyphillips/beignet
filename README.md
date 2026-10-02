@@ -496,7 +496,7 @@ wallet receive while offline through a settlement peer that holds a pre-signed
 voucher book. The daemon exposes the receiver's lifecycle under `/ffor/*`
 (`/ffor/epoch/start`, `/ffor/invoice`, `/ffor/epoch/close`, `/ffor/preimage`,
 `/ffor/witness/provision`, `/ffor/issuer/offer`, `/ffor/issuer/provision`,
-`/ffor/recover`, `/ffor/enforce`, `/ffor/epochs`, `/ffor/epoch`,
+`/ffor/sync`, `/ffor/recover`, `/ffor/enforce`, `/ffor/epochs`, `/ffor/epoch`,
 `/ffor/witness/close`, `/ffor/issuer/issued`) and three roles a
 node can run for others, each an explicit opt-in switched on with an exact
 `true`:
@@ -507,17 +507,22 @@ node can run for others, each an explicit opt-in switched on with an exact
 | `BEIGNET_FFOR_WITNESS` | Store a receiver-encrypted record of every delegated preimage this node relays before propagating the fulfil (a receipt witness). `BEIGNET_FFOR_WITNESS_MAX_MAILBOXES` and `BEIGNET_FFOR_WITNESS_MAX_BYTES` cap it. `GET /ffor/witness/status`. |
 | `BEIGNET_FFOR_ISSUER` | Answer BOLT 12 invoice requests for offers a receiver delegated to this node, one fixed-amount slot per invoice. Needs the witness. `GET /ffor/issuer/status`. |
 
-The SSE stream carries `ffor:state`, `ffor:settled`, `ffor:delegated-failed`,
+The SSE stream carries `ffor:state`, `ffor:settled`, `ffor:slot-resolved`, `ffor:delegated-failed`,
 `ffor:enforce` and the witness and issuer events.
 
-The experimental concurrent library profile keeps ordinary payments available
+The experimental concurrent profile keeps ordinary payments available
 within the channel's remaining capacity. `LightningNode.fforSync()` fetches paid
 slot receipts and redeems them while other vouchers remain live.
 `rescueFforEpoch()` syncs a connected concurrent book without retiring it.
 Feature bits 562/563 remain disabled by default until full regtest qualification.
 See [concurrent receive and reserved retirement](docs/FFOR-RESERVED-RETIREMENT.md)
-for the version 1 and 2 contracts and storage requirements. Daemon and automatic
-receive integration remain separate work.
+for the version 1 and 2 contracts and storage requirements. The daemon enables
+advertisement with `BEIGNET_FFOR_CONCURRENT=true` and new concurrent settlement
+with `BEIGNET_FFOR_SETTLE_CONCURRENT=true`; both default to false during
+qualification. The automatic coordinator can reuse a funded home channel when
+the peers negotiate concurrent settlement. See the
+[automatic receive API](docs/AUTOMATIC-OFFLINE-RECEIVE.md#concurrent-receive)
+for sync, retirement and reserved-capacity fields.
 
 ### Swaps (Lightning to on-chain, and on-chain to Lightning)
 

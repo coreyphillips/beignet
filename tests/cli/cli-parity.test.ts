@@ -54,6 +54,7 @@ const INTENTIONALLY_NO_CLI = new Set([
 	'/ffor/issuer/offer',
 	'/ffor/issuer/provision',
 	'/ffor/recover',
+	'/ffor/sync',
 	'/ffor/enforce',
 	'/ffor/witness/status',
 	'/ffor/issuer/status',

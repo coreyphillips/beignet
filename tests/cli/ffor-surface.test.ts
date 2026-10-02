@@ -123,6 +123,28 @@ describe('Automatic receive funding environment', () => {
 });
 
 describe('FFOR surface: configuration (issue #729)', () => {
+	it('keeps concurrent opt-in during qualification and honors explicit switches', () => {
+		const saved = { ...process.env };
+		try {
+			delete process.env.BEIGNET_FFOR_CONCURRENT;
+			delete process.env.BEIGNET_FFOR_SETTLE_CONCURRENT;
+			expect(resolveConfig({}).fforConcurrent).to.equal(false);
+			expect(resolveConfig({}).fforSettleConcurrent).to.equal(false);
+			process.env.BEIGNET_FFOR_CONCURRENT = 'true';
+			process.env.BEIGNET_FFOR_SETTLE_CONCURRENT = 'true';
+			expect(resolveConfig({}).fforConcurrent).to.equal(true);
+			expect(resolveConfig({}).fforSettleConcurrent).to.equal(true);
+			expect(resolveConfig({ fforConcurrent: false }).fforConcurrent).to.equal(
+				false
+			);
+			process.env.BEIGNET_FFOR_CONCURRENT = 'yes';
+			process.env.BEIGNET_FFOR_SETTLE_CONCURRENT = '1';
+			expect(resolveConfig({}).fforConcurrent).to.equal(false);
+			expect(resolveConfig({}).fforSettleConcurrent).to.equal(false);
+		} finally {
+			process.env = saved;
+		}
+	});
 	it('parses the BEIGNET_FFOR_* switches exactly, with their limits', () => {
 		const saved = { ...process.env };
 		try {
@@ -307,6 +329,8 @@ describe('FFOR surface: routes on a node with no epoch (issue #729)', () => {
 		expect(offer.status).to.equal(400);
 		const enforce = await request(port, 'POST', '/ffor/enforce', {});
 		expect(enforce.status).to.equal(400);
+		const sync = await request(port, 'POST', '/ffor/sync', {});
+		expect(sync.status).to.equal(400);
 		const close = await request(port, 'POST', '/ffor/witness/close', {});
 		expect(close.status).to.equal(400);
 		const closeUnknown = await request(port, 'POST', '/ffor/witness/close', {
@@ -515,6 +539,76 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 	} {
 		return (res.body.error as { code?: string; message?: string }) ?? {};
 	}
+
+	it('reports terminal concurrent slots, reserved inbound capacity and sync routing', async () => {
+		const fx = installChannel(false);
+		const inner = daemon.node.getNode();
+		const sync = sinon
+			.stub(inner, 'fforSync')
+			.returns({ ok: true, actions: [] });
+		try {
+			const version = await request(
+				portOf(daemon),
+				'POST',
+				'/ffor/epoch/start',
+				{
+					channelId: fx.channelId,
+					voucherAmountsMsat: ['1000'],
+					concurrent: true,
+					concurrentVersion: 3
+				}
+			);
+			expect(version.status).to.equal(400);
+			expect((version.body.error as { message: string }).message).to.match(
+				/concurrentVersion/
+			);
+			fx.record.concurrentVersion = 2;
+			fx.record.capabilityHold = true;
+			fx.record.voucherOutcomes = [
+				{
+					outcome: 'fulfilled',
+					localCommitmentNumber: 4n,
+					remoteCommitmentNumber: 4n
+				},
+				null
+			];
+			const reply = await request(portOf(daemon), 'POST', '/ffor/sync', {
+				channelId: fx.channelId
+			});
+			expect(reply.status).to.equal(200);
+			expect(sync.calledOnceWithExactly(fx.channelId)).to.equal(true);
+			const epoch = reply.body.result as any;
+			expect(epoch.concurrentVersion).to.equal(2);
+			expect(epoch.capabilityHold).to.equal(true);
+			expect(epoch.snapshotSeq).to.equal('0');
+			expect(epoch.slots[0].state).to.equal('redeemed');
+			const channel = daemon.node
+				.listChannels()
+				.find((entry) => entry.channelId === fx.channelId)!;
+			expect(channel.ffor?.reservedInboundSats).to.equal(
+				Number(fx.record.params.voucherAmountsMsat[1] / 1000n)
+			);
+			expect(channel.ffor?.unresolvedSlots).to.equal(1);
+			fx.record.state = FforState.CLOSED;
+			expect(
+				daemon.node
+					.listChannels()
+					.find((entry) => entry.channelId === fx.channelId)!.ffor
+					?.reservedInboundSats
+			).to.equal(0);
+			fx.record.state = FforState.ABORTED;
+			fx.record.paymentHashes = [];
+			fx.record.voucherOutcomes = undefined;
+			const refused = daemon.node
+				.listChannels()
+				.find((entry) => entry.channelId === fx.channelId)!.ffor!;
+			expect(refused.reservedInboundSats).to.equal(0);
+			expect(refused.unresolvedSlots).to.equal(0);
+		} finally {
+			sync.restore();
+			fx.remove();
+		}
+	});
 
 	it('POST /ffor/enforce refuses a held channel without acceptStaleStateRisk and admits it with the exact flag', async () => {
 		const fx = installChannel(true);

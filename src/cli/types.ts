@@ -172,6 +172,13 @@ export interface ChannelInfo {
 	previousFundingTxids?: string[];
 	/** Whether the channel will accept a NEW HTLC (0.6.0+). */
 	htlcUsable?: boolean;
+	ffor?: {
+		state: string;
+		concurrent: boolean;
+		concurrentVersion?: 1 | 2;
+		reservedInboundSats: number;
+		unresolvedSlots: number;
+	};
 	/**
 	 * The channel was restored from a Recovery Capsule and its state has not
 	 * been proven current, so it takes no new HTLCs and is offered to no
@@ -876,6 +883,10 @@ export interface BeignetConfig {
 		feeBaseMsat?: number;
 		feePpm?: number;
 	};
+	/** Advertise concurrent receive. Kept off until qualification completes. */
+	fforConcurrent?: boolean;
+	/** Accept new concurrent books when settlement is enabled. */
+	fforSettleConcurrent?: boolean;
 	/** FFOR receipt witness (spec section 9.6). Env: BEIGNET_FFOR_WITNESS
 	 *  (exact true/false), BEIGNET_FFOR_WITNESS_MAX_MAILBOXES,
 	 *  BEIGNET_FFOR_WITNESS_MAX_BYTES. */
@@ -1559,6 +1570,7 @@ export interface BeignetNodeEvents {
 		epoch: Record<string, unknown>;
 	}) => void;
 	'ffor:settled': (data: Record<string, unknown>) => void;
+	'ffor:slot-resolved': (data: Record<string, unknown>) => void;
 	'ffor:delegated-failed': (data: Record<string, unknown>) => void;
 	'ffor:enforce': (data: {
 		channelId: string;

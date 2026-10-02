@@ -33,6 +33,7 @@ type Epoch = {
 	channelId: string;
 	epochId: string;
 	state: string;
+	concurrentVersion?: 1 | 2;
 	slots: Slot[];
 };
 type Channel = {
@@ -42,6 +43,8 @@ type Channel = {
 	htlcUsable?: boolean;
 	localBalanceSats?: number;
 	remoteBalanceSats?: number;
+	htlcCount?: number;
+	ffor?: { reservedInboundSats: number; unresolvedSlots: number };
 };
 type Peer = { pubkey: string; host: string; port: number; state: string };
 type Json = Record<string, unknown>;
@@ -112,6 +115,7 @@ function fixture(overrides: Json = {}, opts: Opts = {}): any {
 	const sent: Json[] = [];
 	const saved: unknown[] = [];
 	const node: Json = {
+		fforConcurrentNegotiated: () => false,
 		listChannels: () => channels,
 		listPeers: () =>
 			opts.peers ?? [
@@ -138,12 +142,16 @@ function fixture(overrides: Json = {}, opts: Opts = {}): any {
 		fforStartEpoch: (params: {
 			channelId: string;
 			voucherAmountsMsat: string[];
+			concurrentVersion?: 1 | 2;
 		}) => {
 			started++;
 			const fresh = {
 				channelId: params.channelId,
 				epochId: spareEpochId,
 				state: 'ACTIVE',
+				...(params.concurrentVersion
+					? { concurrentVersion: params.concurrentVersion }
+					: {}),
 				slots: [
 					{
 						state: 'exposed',
@@ -193,6 +201,7 @@ function fixture(overrides: Json = {}, opts: Opts = {}): any {
 		saved,
 		config,
 		configured,
+		channels,
 		get queries() {
 			return queries;
 		},
@@ -213,6 +222,229 @@ function fixture(overrides: Json = {}, opts: Opts = {}): any {
 		}
 	};
 }
+
+describe('concurrent automatic receive', () => {
+	const terms = {
+		version: 1,
+		feeBaseMsat: 0,
+		feePpm: 0,
+		concurrent: true,
+		concurrentVersion: 2
+	};
+	function funded() {
+		const f = fixture({}, { jobs: [], spare: true });
+		f.channels[1].localBalanceSats = 50000;
+		f.node.fforConcurrentNegotiated = () => true;
+		f.node.getFforReceiveService = () => ({ request: async () => terms });
+		return f;
+	}
+	const body = (quote: unknown) => ({
+		requestId: 'concurrent-request-1',
+		amountSats: 20000,
+		quote
+	});
+	it('creates a version 2 invoice on the funded home channel and persists its profile', async () => {
+		const f = funded();
+		const quote = await f.coordinator.quote(peer, 20000);
+		assert.equal(quote.mode, 'bolt11');
+		assert.equal(quote.concurrentVersion, 2);
+		const invoice = await f.coordinator.create(body(quote), peer);
+		assert.equal(invoice.concurrent, true);
+		assert.equal(invoice.concurrentVersion, 2);
+		assert.equal(f.started, 1);
+		assert.equal(f.minted, 0);
+		assert.deepEqual([...f.coordinator.reservedIds()], [spareId]);
+		const [job] = f.coordinator.status().requests;
+		assert.equal(job.concurrentVersion, 2);
+		assert.deepEqual(await f.coordinator.create(body(quote), peer), invoice);
+	});
+	it('waits for the signed profile echo before checking a newly negotiating epoch', async () => {
+		const f = funded();
+		const start = f.node.fforStartEpoch;
+		f.node.fforStartEpoch = (params: unknown) => {
+			const epoch = start(params);
+			epoch.state = 'NEGOTIATING';
+			delete epoch.concurrentVersion;
+			setImmediate(() => {
+				epoch.concurrentVersion = 2;
+				epoch.state = 'ACTIVE';
+			});
+			return epoch;
+		};
+		const quote = await f.coordinator.quote(peer, 20000);
+		const invoice = await f.coordinator.create(body(quote), peer);
+		assert.equal(invoice.concurrentVersion, 2);
+		assert.equal(f.started, 1);
+	});
+	it('keeps a busy request pending, then resumes the same profile after payments settle', async () => {
+		const f = funded();
+		f.channels[1].htlcCount = 1;
+		const quote = await f.coordinator.quote(peer, 20000);
+		await assert.rejects(
+			f.coordinator.create(body(quote), peer),
+			(e: Failure) => e.code === 'RECEIVE_PENDING'
+		);
+		assert.equal(f.started, 0);
+		f.channels[1].htlcCount = 0;
+		const invoice = await f.coordinator.create(body(quote), peer);
+		assert.equal(invoice.concurrentVersion, 2);
+		assert.equal(f.coordinator.status().requests.length, 1);
+	});
+	it('refreshes an expired quote for the same busy request after restart', async () => {
+		const f = funded();
+		f.channels[1].htlcCount = 1;
+		const quote = await f.coordinator.quote(peer, 20000);
+		await assert.rejects(
+			f.coordinator.create(body(quote), peer),
+			(e: Failure) => e.code === 'RECEIVE_PENDING'
+		);
+		f.now += 61000;
+		f.channels[1].htlcCount = 0;
+		const restarted = new OfflineReceive(
+			f.node,
+			() => {},
+			f.coordinator.status().requests,
+			() => f.now
+		);
+		const refreshed = await restarted.quote(
+			peer,
+			20000,
+			'concurrent-request-1'
+		);
+		assert.equal(refreshed.mode, 'bolt11');
+		assert.equal(refreshed.concurrentVersion, 2);
+		const invoice = await restarted.create(body(refreshed), peer);
+		assert.equal(invoice.concurrentVersion, 2);
+		assert.equal(f.started, 1);
+	});
+	it('does not change a persisted profile when the peer offers different terms after restart', async () => {
+		const f = funded();
+		f.channels[1].htlcCount = 1;
+		const quote = await f.coordinator.quote(peer, 20000);
+		await assert.rejects(f.coordinator.create(body(quote), peer));
+		const restarted = new OfflineReceive(
+			f.node,
+			() => {},
+			f.coordinator.status().requests,
+			() => f.now
+		);
+		f.channels[1].htlcCount = 0;
+		const changed = {
+			...quote,
+			terms: { ...quote.terms, concurrentVersion: 1 }
+		};
+		await assert.rejects(
+			restarted.create(body(changed), peer),
+			(e: Failure) => e.code === 'INVALID_REVIEW'
+		);
+		assert.equal(f.started, 0);
+		assert.equal(restarted.status().requests[0].concurrentVersion, 2);
+	});
+	it('keeps an interrupted bolt11 request on its persisted route when capacity becomes unavailable', async () => {
+		const f = funded();
+		const quote = await f.coordinator.quote(peer, 20000);
+		f.node.getFforReceiveService = () => ({
+			request: async () => {
+				f.channels[1].remoteBalanceSats = 0;
+				return terms;
+			}
+		});
+		await assert.rejects(
+			f.coordinator.create(body(quote), peer),
+			(e: Failure) => e.code === 'RECEIVE_UNAVAILABLE'
+		);
+		await assert.rejects(
+			f.coordinator.create(body(quote), peer),
+			(e: Failure) => e.code === 'RECEIVE_UNAVAILABLE'
+		);
+		assert.equal(f.minted, 0);
+		const [job] = f.coordinator.status().requests;
+		assert.equal(job.kind, 'bolt11');
+		assert.equal(job.concurrentVersion, 2);
+		assert.doesNotThrow(() => new OfflineReceive(f.node, () => {}, [job]));
+	});
+	it('uses direct funding for a funded channel when the peer has not opted into concurrent settlement', async () => {
+		const f = funded();
+		f.node.getFforReceiveService = () => ({
+			request: async () => ({ version: 1, feeBaseMsat: 0, feePpm: 0 })
+		});
+		const quote = await f.coordinator.quote(peer, 20000);
+		assert.equal(quote.mode, 'direct-funding');
+		const invoice = await f.coordinator.create(body(quote), peer);
+		assert.equal(invoice.kind, 'direct-funding');
+		assert.equal(f.started, 0);
+	});
+	it('syncs a live request without closing it and retains expired unknown reservations while draining', async () => {
+		const f = fixture({ concurrent: true, concurrentVersion: 2 });
+		f.epoch.concurrentVersion = 2;
+		f.channels[0].ffor = { reservedInboundSats: 20000, unresolvedSlots: 1 };
+		let syncs = 0,
+			closes = 0;
+		f.node.fforSync = () => {
+			syncs++;
+			return f.epoch;
+		};
+		f.node.fforCloseEpoch = () => {
+			closes++;
+			f.epoch.state = 'DRAINING';
+		};
+		await f.coordinator.sync();
+		assert.equal(syncs, 1);
+		assert.equal(closes, 0);
+		const [status] = f.coordinator.status().requests;
+		assert.equal(status.concurrent, true);
+		assert.equal(status.reservedInboundSats, 20000);
+		assert.equal(status.unresolvedSlots, 1);
+		f.now = f.job.expiresAt + 120000;
+		await f.coordinator.sync();
+		assert.equal(closes, 1);
+		await f.coordinator.sync();
+		assert.deepEqual([...f.coordinator.reservedIds()], [channelId]);
+		assert.notEqual(f.job.done, true);
+		assert.equal(f.closes, 0);
+	});
+	it('closes after terminal credit, releases a closed book, and never treats proof custody as payment', async () => {
+		const f = fixture({ concurrent: true, concurrentVersion: 2 });
+		f.epoch.concurrentVersion = 2;
+		f.node.fforSync = () => f.epoch;
+		let closes = 0;
+		f.node.fforCloseEpoch = () => {
+			closes++;
+			f.epoch.state = 'CLOSED';
+		};
+		f.epoch.slots[0].state = 'settled';
+		await f.coordinator.sync();
+		assert.equal(closes, 0);
+		f.epoch.slots[0].state = 'redeemed';
+		await f.coordinator.sync();
+		await f.coordinator.sync();
+		assert.equal(closes, 1);
+		assert.equal(f.coordinator.reservedIds().size, 0);
+	});
+	it('releases a setup refusal before the signed profile echo arrived', async () => {
+		const f = fixture({ concurrent: true, concurrentVersion: 2 });
+		f.epoch.state = 'ABORTED';
+		await f.coordinator.sync();
+		assert.equal(f.job.done, true);
+		assert.equal(f.coordinator.reservedIds().size, 0);
+		assert.equal(f.queries, 0);
+	});
+	it('validates the persisted profile and leaves baseline journals readable', () => {
+		assert.doesNotThrow(() => fixture());
+		assert.throws(
+			() => fixture({ concurrent: true }),
+			/Invalid receive journal/
+		);
+		assert.throws(
+			() => fixture({ concurrentVersion: 2 }),
+			/Invalid receive journal/
+		);
+		assert.throws(
+			() => fixture({ concurrent: true, concurrentVersion: 3 }),
+			/Invalid receive journal/
+		);
+	});
+});
 
 it('reopening an unpaid request queries receipts without closing its reservation', async () => {
 	const f = fixture();

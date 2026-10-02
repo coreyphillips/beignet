@@ -46,9 +46,13 @@ import {
 	FforAbortReason,
 	FforSlotState,
 	FforState,
+	isFforConcurrentVersion,
 	IFforEpochRecord
 } from '../lightning/ffor/types';
-import { bitmapGet } from '../lightning/ffor/messages';
+import {
+	bitmapGet,
+	decodeFforSyncReplyMessage
+} from '../lightning/ffor/messages';
 import { IFforIssuerStatusResp } from '../lightning/ffor/issuer-messages';
 import { IOffer } from '../lightning/offer/types';
 import {
@@ -588,6 +592,8 @@ export interface BeignetNodeOptions {
 		feeBaseMsat?: number;
 		feePpm?: number;
 	};
+	fforConcurrent?: boolean;
+	fforSettleConcurrent?: boolean;
 	fforWitness?: { enabled: boolean; maxMailboxes?: number; maxBytes?: number };
 	fforIssuer?: boolean;
 	fforReceiveFunding?: FforReceiveFunding;
@@ -2815,8 +2821,10 @@ export class BeignetNode extends EventEmitter {
 			// daemon that was not told to answers no ff_init, whatever the
 			// feature bit says. The witness and the issuer are services this
 			// node runs for others and are off unless switched on.
+			fforConcurrent: { enabled: opts.fforConcurrent === true },
 			fforSettle: {
 				enabled: opts.fforSettle?.enabled === true,
+				allowConcurrent: opts.fforSettleConcurrent === true,
 				...(opts.fforSettle?.maxBudgetMsat !== undefined
 					? { maxBudgetMsat: BigInt(opts.fforSettle.maxBudgetMsat) }
 					: {}),
@@ -3034,7 +3042,8 @@ export class BeignetNode extends EventEmitter {
 		this.fforReceiveService = new FforReceiveService(
 			this,
 			opts.fforSettle,
-			opts.fforReceiveFunding
+			opts.fforReceiveFunding,
+			opts.fforSettleConcurrent === true
 		);
 		const receiveKey = 'automatic_receive_jobs_v1';
 		const receiveJobs = this.storage.loadWalletData(receiveKey);
@@ -3563,6 +3572,7 @@ export class BeignetNode extends EventEmitter {
 			'direct-funding:offer:failed',
 			'direct-funding:offer:completed',
 			'ffor:settled',
+			'ffor:slot-resolved',
 			'ffor:delegated-failed',
 			'ffor:witness-provisioned',
 			'ffor:witness-recorded',
@@ -7849,10 +7859,30 @@ export class BeignetNode extends EventEmitter {
 		// (issue #875). S never holds one.
 		const invoices =
 			f.role === 'R' ? this.node.fforSlotInvoices(channelIdHex) : [];
+		let snapshotSeq: string | null = '0';
+		if (f.syncSnapshotWire) {
+			try {
+				snapshotSeq = decodeFforSyncReplyMessage(
+					f.syncSnapshotWire.subarray(2)
+				).snapshotSeq.toString();
+			} catch {
+				snapshotSeq = null;
+			}
+		}
 		const slots = Array.from({ length: K }, (_, i) => {
 			const k = i + 1;
 			let state: string;
-			if (f.role === 'S') {
+			if (
+				isFforConcurrentVersion(f.concurrentVersion) &&
+				f.voucherOutcomes?.[i]?.outcome === 'fulfilled'
+			) {
+				state = 'redeemed';
+			} else if (
+				isFforConcurrentVersion(f.concurrentVersion) &&
+				f.voucherOutcomes?.[i]?.outcome === 'cancelled'
+			) {
+				state = 'cancelled';
+			} else if (f.role === 'S') {
 				state =
 					f.slotStates[i] === FforSlotState.SETTLED
 						? 'settled'
@@ -7884,6 +7914,12 @@ export class BeignetNode extends EventEmitter {
 			epochId: f.epochId.toString('hex'),
 			peerNodeId: f.remoteNodeId.toString('hex'),
 			variant: f.params.variant,
+			concurrent: isFforConcurrentVersion(f.concurrentVersion),
+			...(f.concurrentVersion
+				? { concurrentVersion: f.concurrentVersion }
+				: {}),
+			snapshotSeq,
+			capabilityHold: f.capabilityHold === true,
 			budgetMsat: f.params.budgetMsat.toString(),
 			numSlots: K,
 			hashChain: f.params.hashChain === true,
@@ -7920,6 +7956,18 @@ export class BeignetNode extends EventEmitter {
 		return out;
 	}
 
+	fforConcurrentNegotiated(peer: string): boolean {
+		return this.node.getChannelManager().peerNegotiatedFforConcurrent(peer);
+	}
+
+	fforSync(channelId: string): Record<string, unknown> {
+		const id = this.fforChannelId(channelId).toString('hex');
+		const result = this.node.fforSync(id);
+		if (!result.ok)
+			throw new BeignetError('FFOR_REFUSED', result.error ?? 'sync refused');
+		return this.fforEpoch(id);
+	}
+
 	fforEpoch(channelId: string): Record<string, unknown> {
 		const idBuf = this.fforChannelId(channelId);
 		const f = this.node.getFforEpoch(idBuf.toString('hex'));
@@ -7941,8 +7989,20 @@ export class BeignetNode extends EventEmitter {
 		feeProportionalMillionths?: number;
 		hashChain?: boolean;
 		witnessPeers?: string[];
+		concurrent?: boolean;
+		concurrentVersion?: 1 | 2;
 	}): Record<string, unknown> {
 		const idBuf = this.fforChannelId(body.channelId);
+		if (
+			(body.concurrent !== undefined && typeof body.concurrent !== 'boolean') ||
+			(body.concurrentVersion !== undefined &&
+				(body.concurrent !== true ||
+					(body.concurrentVersion !== 1 && body.concurrentVersion !== 2)))
+		)
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'concurrentVersion requires concurrent: true and version 1 or 2'
+			);
 		if (
 			!Array.isArray(body.voucherAmountsMsat) ||
 			body.voucherAmountsMsat.length === 0
@@ -7994,6 +8054,9 @@ export class BeignetNode extends EventEmitter {
 			feeBaseMsat: body.feeBaseMsat!,
 			feeProportionalMillionths: body.feeProportionalMillionths!,
 			...(body.hashChain === true ? { hashChain: true } : {}),
+			...(body.concurrent === true
+				? { concurrent: true, concurrentVersion: body.concurrentVersion ?? 2 }
+				: {}),
 			...(witnessPeers.length > 0 ? { witnessPeers } : {})
 		});
 		if (!res.ok) {
@@ -8810,6 +8873,29 @@ export class BeignetNode extends EventEmitter {
 		// here re-parked every mid-splice channel in the UI while the daemon
 		// happily paid through the window.
 		if (ch.htlcUsable !== undefined) info.htlcUsable = ch.htlcUsable;
+		const ffor = this.node.getFforEpoch(info.channelId);
+		if (ffor) {
+			const unresolved =
+				ffor.state === FforState.CLOSED ||
+				(ffor.state === FforState.ABORTED && !ffor.paymentHashes.length)
+					? []
+					: ffor.params.voucherAmountsMsat.filter(
+							(_amount, index) => !ffor.voucherOutcomes?.[index]
+					  );
+			const reserved =
+				ffor.role === 'R'
+					? unresolved.reduce((total, amount) => total + amount, 0n)
+					: 0n;
+			info.ffor = {
+				state: FforState[ffor.state],
+				concurrent: isFforConcurrentVersion(ffor.concurrentVersion),
+				...(ffor.concurrentVersion
+					? { concurrentVersion: ffor.concurrentVersion }
+					: {}),
+				reservedInboundSats: Number(reserved / 1000n),
+				unresolvedSlots: unresolved.length
+			};
+		}
 		if (ch.restoreRecencyUnproven)
 			info.restoreRecencyUnproven = ch.restoreRecencyUnproven;
 		if (ch.reestablishRecencyUnproven)

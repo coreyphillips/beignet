@@ -1950,6 +1950,16 @@ liquidity. See
 [automatic receiving](../../docs/AUTOMATIC-OFFLINE-RECEIVE.md#daemon-api) for
 the durable invoice preparation and reconciliation API.
 
+With concurrent receive negotiated, a funded home channel can carry an offline
+invoice and ordinary online payments within its remaining capacity. During
+qualification, enable `BEIGNET_FFOR_CONCURRENT=true` on both peers and
+`BEIGNET_FFOR_SETTLE_CONCURRENT=true` on the settlement peer. Both default to
+false. `POST /ffor/sync` refreshes receipts without retiring the book. The
+`ffor` block on channels and the concurrent entries in `/receive/status` expose
+reserved inbound capacity and unresolved slots. Keep reserved channels out of
+automatic splicing and channel close. Retirement of version 2 unknown slots
+can remain `DRAINING` after the invoice expires.
+
 ### JSON Envelope
 
 Every response follows this format:

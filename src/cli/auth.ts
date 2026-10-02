@@ -172,6 +172,7 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'POST /ffor/issuer/offer': ['invoice'],
 	'POST /ffor/issuer/provision': [],
 	'POST /ffor/recover': [],
+	'POST /ffor/sync': [],
 	'POST /ffor/enforce': [],
 	// The guardian this node serves to others (issue #699).
 	'GET /guardian/status': ['readonly'],

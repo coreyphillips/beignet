@@ -81,6 +81,8 @@ export function daemonOptions(
 		// fforWitness refuses startup by name, which it could not do while
 		// these were parsed here and dropped.
 		fforSettle: config.fforSettle,
+		fforConcurrent: config.fforConcurrent,
+		fforSettleConcurrent: config.fforSettleConcurrent,
 		fforReceiveFunding: config.fforReceiveFunding,
 		fforWitness: config.fforWitness,
 		fforIssuer: config.fforIssuer,
