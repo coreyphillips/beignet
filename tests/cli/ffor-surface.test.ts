@@ -123,13 +123,13 @@ describe('Automatic receive funding environment', () => {
 });
 
 describe('FFOR surface: configuration (issue #729)', () => {
-	it('keeps concurrent opt-in during qualification and honors explicit switches', () => {
+	it('enables concurrent receive by default and honors explicit switches', () => {
 		const saved = { ...process.env };
 		try {
 			delete process.env.BEIGNET_FFOR_CONCURRENT;
 			delete process.env.BEIGNET_FFOR_SETTLE_CONCURRENT;
-			expect(resolveConfig({}).fforConcurrent).to.equal(false);
-			expect(resolveConfig({}).fforSettleConcurrent).to.equal(false);
+			expect(resolveConfig({}).fforConcurrent).to.equal(true);
+			expect(resolveConfig({}).fforSettleConcurrent).to.equal(true);
 			process.env.BEIGNET_FFOR_CONCURRENT = 'true';
 			process.env.BEIGNET_FFOR_SETTLE_CONCURRENT = 'true';
 			expect(resolveConfig({}).fforConcurrent).to.equal(true);
@@ -137,10 +137,17 @@ describe('FFOR surface: configuration (issue #729)', () => {
 			expect(resolveConfig({ fforConcurrent: false }).fforConcurrent).to.equal(
 				false
 			);
-			process.env.BEIGNET_FFOR_CONCURRENT = 'yes';
-			process.env.BEIGNET_FFOR_SETTLE_CONCURRENT = '1';
+			process.env.BEIGNET_FFOR_CONCURRENT = 'false';
+			process.env.BEIGNET_FFOR_SETTLE_CONCURRENT = 'false';
 			expect(resolveConfig({}).fforConcurrent).to.equal(false);
 			expect(resolveConfig({}).fforSettleConcurrent).to.equal(false);
+			expect(
+				resolveConfig({ fforSettleConcurrent: true }).fforSettleConcurrent
+			).to.equal(true);
+			process.env.BEIGNET_FFOR_CONCURRENT = 'yes';
+			process.env.BEIGNET_FFOR_SETTLE_CONCURRENT = '1';
+			expect(resolveConfig({}).fforConcurrent).to.equal(true);
+			expect(resolveConfig({}).fforSettleConcurrent).to.equal(true);
 		} finally {
 			process.env = saved;
 		}

@@ -71,7 +71,7 @@ export class FforReceiveService {
 			| { enabled: boolean; feeBaseMsat?: number; feePpm?: number }
 			| undefined,
 		private funding?: FforReceiveFunding,
-		private concurrent = false
+		private concurrent = true
 	) {
 		if (funding?.enabled)
 			for (const k of [

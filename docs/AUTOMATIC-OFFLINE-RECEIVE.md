@@ -27,7 +27,7 @@ Automatic offline receiving uses a channel that already exists with the peer and
 
 ## Concurrent receive
 
-Concurrent receive is opt-in during qualification. Set `BEIGNET_FFOR_CONCURRENT=true` on both peers (configuration key `fforConcurrent`) and `BEIGNET_FFOR_SETTLE_CONCURRENT=true` on the settlement peer (`fforSettleConcurrent`), in addition to enabling its settlement role. Both concurrent switches default to false. Disabling acceptance of new concurrent books does not change the persisted profile of existing books.
+Concurrent receive defaults to enabled. `BEIGNET_FFOR_CONCURRENT` (configuration key `fforConcurrent`) controls advertisement; `BEIGNET_FFOR_SETTLE_CONCURRENT` (`fforSettleConcurrent`) controls acceptance of new books. Both default to true and accept explicit `false`. The settlement role still requires separate enablement. Disabling acceptance of new concurrent books does not change the persisted profile of existing books.
 
 The automatic coordinator chooses version 2 from an upgraded peer's terms and saves that choice before creating an epoch. A retry cannot silently switch versions or fall back to a baseline book. Busy channel payments return `RECEIVE_PENDING`; retry the same request after those payments settle. If its 60-second quote expired, refresh `/receive/quote` with the same `requestId` so the quote reuses its reservation. One immutable book may be live per channel. Each invoice has a fixed amount.
 

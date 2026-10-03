@@ -2821,10 +2821,10 @@ export class BeignetNode extends EventEmitter {
 			// daemon that was not told to answers no ff_init, whatever the
 			// feature bit says. The witness and the issuer are services this
 			// node runs for others and are off unless switched on.
-			fforConcurrent: { enabled: opts.fforConcurrent === true },
+			fforConcurrent: { enabled: opts.fforConcurrent !== false },
 			fforSettle: {
 				enabled: opts.fforSettle?.enabled === true,
-				allowConcurrent: opts.fforSettleConcurrent === true,
+				allowConcurrent: opts.fforSettleConcurrent !== false,
 				...(opts.fforSettle?.maxBudgetMsat !== undefined
 					? { maxBudgetMsat: BigInt(opts.fforSettle.maxBudgetMsat) }
 					: {}),
@@ -3043,7 +3043,7 @@ export class BeignetNode extends EventEmitter {
 			this,
 			opts.fforSettle,
 			opts.fforReceiveFunding,
-			opts.fforSettleConcurrent === true
+			opts.fforSettleConcurrent !== false
 		);
 		const receiveKey = 'automatic_receive_jobs_v1';
 		const receiveJobs = this.storage.loadWalletData(receiveKey);

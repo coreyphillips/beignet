@@ -26,7 +26,11 @@ const typed =
 		assert.equal(statusForErrorCode(e.code), 409);
 		return true;
 	};
-function fixture(role = 'R', concurrent = false) {
+function fixture(
+	role = 'R',
+	concurrent = false,
+	acceptance: boolean | undefined = undefined
+) {
 	const node: any = new EventEmitter();
 	const sent: any[] = [];
 	const added: any[] = [];
@@ -86,7 +90,7 @@ function fixture(role = 'R', concurrent = false) {
 			maxChannelSats: 100000,
 			maxTotalSats: 100000
 		},
-		concurrent
+		acceptance
 	);
 	const response = (result: any, sender = peer) =>
 		node.emit('custom-message', {
@@ -128,6 +132,22 @@ function fixture(role = 'R', concurrent = false) {
 	};
 }
 describe('automatic receive service', () => {
+	it('offers version 2 by default while allowing independent acceptance opt-out', async () => {
+		for (const acceptance of [undefined, true, false]) {
+			const f = fixture('S', true, acceptance);
+			try {
+				const quote = await (f.service as any).serve(peer, { op: 'quote' });
+				assert.equal(
+					quote.concurrentVersion,
+					acceptance === false ? undefined : 2
+				);
+				assert.equal(f.host.fforConcurrentNegotiated(peer), true);
+			} finally {
+				f.service.stop();
+			}
+		}
+	});
+
 	it('offers version 2 only when concurrent settlement and peer negotiation are both enabled', async () => {
 		for (const enabled of [false, true]) {
 			const f = fixture('S', enabled);

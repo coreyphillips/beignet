@@ -1846,22 +1846,17 @@ export class LightningNode extends EventEmitter {
 			localFeatures.clearBit(Feature.ASYNC_RECEIVE_SERVICE);
 			localFeatures.clearBit(Feature.ASYNC_RECEIVE_SERVICE + 1);
 		}
-		// FFOR concurrent receive (CONCURRENT-RECEIVE.md section 1.1): the
-		// optional bit is advertised only when the node opts in, and it
-		// depends on option_ff_receive (and on option_quiesce, which every
-		// activation runs under). Cleared explicitly otherwise, so a
-		// caller-supplied feature set cannot advertise an extension this node
-		// has not turned on: the spec forbids advertising it by default until
-		// the whole version is implemented.
-		if (config.fforConcurrent?.enabled) {
-			if (
-				!localFeatures.hasFeature(Feature.OPTION_FF_RECEIVE) ||
-				!localFeatures.hasFeature(Feature.QUIESCE)
-			) {
-				throw new Error(
-					'fforConcurrent needs option_ff_receive and option_quiesce in the feature set'
-				);
-			}
+		// Concurrent receive is available by default when its dependencies are
+		// present. An explicit opt-out also clears caller-supplied bits.
+		const concurrentDependencies =
+			localFeatures.hasFeature(Feature.OPTION_FF_RECEIVE) &&
+			localFeatures.hasFeature(Feature.QUIESCE);
+		if (config.fforConcurrent?.enabled === true && !concurrentDependencies) {
+			throw new Error(
+				'fforConcurrent needs option_ff_receive and option_quiesce in the feature set'
+			);
+		}
+		if (config.fforConcurrent?.enabled !== false && concurrentDependencies) {
 			localFeatures.setOptional(Feature.OPTION_FF_CONCURRENT);
 		} else {
 			localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT);
@@ -29058,6 +29053,7 @@ export class LightningNode extends EventEmitter {
 		// FFOR Variant D (specs/ffor-offline-receive.md section 5): both the
 		// recipient and the settlement-peer roles are implemented.
 		flags.setOptional(Feature.OPTION_FF_RECEIVE);
+		flags.setOptional(Feature.OPTION_FF_CONCURRENT);
 		// LARGE_CHANNELS (18) is not set here but the constructor sets it by
 		// default (largeChannels defaults to true), so it is advertised unless
 		// opted out; the > 2^24 cap is still only lifted with a wumbo peer.

@@ -514,12 +514,12 @@ The experimental concurrent profile keeps ordinary payments available
 within the channel's remaining capacity. `LightningNode.fforSync()` fetches paid
 slot receipts and redeems them while other vouchers remain live.
 `rescueFforEpoch()` syncs a connected concurrent book without retiring it.
-Feature bits 562/563 remain disabled by default until full regtest qualification.
+Feature bits 562/563 are advertised by default when their dependencies are enabled.
 See [concurrent receive and reserved retirement](docs/FFOR-RESERVED-RETIREMENT.md)
 for the version 1 and 2 contracts and storage requirements. The daemon enables
 advertisement with `BEIGNET_FFOR_CONCURRENT=true` and new concurrent settlement
-with `BEIGNET_FFOR_SETTLE_CONCURRENT=true`; both default to false during
-qualification. The automatic coordinator can reuse a funded home channel when
+with `BEIGNET_FFOR_SETTLE_CONCURRENT=true`; both default to true. Set either to
+`false` to disable it. Settlement still requires its separate role to be enabled. The automatic coordinator can reuse a funded home channel when
 the peers negotiate concurrent settlement. See the
 [automatic receive API](docs/AUTOMATIC-OFFLINE-RECEIVE.md#concurrent-receive)
 for sync, retirement and reserved-capacity fields.

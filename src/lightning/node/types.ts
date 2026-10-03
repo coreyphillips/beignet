@@ -333,14 +333,13 @@ export interface INodeConfig {
 	 */
 	fforSettle?: import('../ffor/types').IFforSettlePolicy;
 	/**
-	 * FFOR concurrent receive, version 1 (specs/CONCURRENT-RECEIVE.md).
-	 * Absent or `enabled: false` (the default): option_ff_concurrent
-	 * (562/563) is not advertised, a peer that requires it is disconnected,
-	 * and no epoch selects the concurrent profile. Enabled: the optional bit
-	 * is advertised, R may ask for the profile and S may answer it when its
-	 * `fforSettle.allowConcurrent` says so. Needs option_ff_receive and
-	 * option_quiesce in the feature set. EXPERIMENTAL: the extension is not
-	 * complete, so this is for tests and development only.
+	 * FFOR concurrent receive (specs/CONCURRENT-RECEIVE.md). Enabled by
+	 * default when option_ff_receive and option_quiesce are present.
+	 * Explicit true requires both dependencies. Explicit false clears bits
+	 * 562/563 and refuses peers requiring the feature. Epochs still select
+	 * their profile explicitly. To refuse only new concurrent books, set
+	 * `fforSettle.allowConcurrent: false` and retain this advertisement for
+	 * existing books. The feature assignment remains experimental.
 	 */
 	fforConcurrent?: { enabled: boolean };
 	/** Max reconnect delay in ms */

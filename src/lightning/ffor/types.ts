@@ -348,8 +348,9 @@ export interface IFforSettlePolicy {
 	minFeeProportionalMillionths?: number;
 	/**
 	 * Answer an ff_init that asks for the concurrent profile (TLV 17,
-	 * CONCURRENT-RECEIVE.md section 1.1). Absent or false refuses it with
-	 * reason 2; baseline requests are not affected either way.
+	 * CONCURRENT-RECEIVE.md section 1.1). Defaults to true; explicit false
+	 * refuses new concurrent books with reason 2. Existing books and
+	 * baseline requests are not affected. The enabled policy still applies.
 	 */
 	allowConcurrent?: boolean;
 }

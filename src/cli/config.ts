@@ -641,7 +641,7 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? false
 				: undefined) ??
 			file.fforConcurrent ??
-			false,
+			true,
 		fforSettleConcurrent:
 			cliFlags.fforSettleConcurrent ??
 			(process.env.BEIGNET_FFOR_SETTLE_CONCURRENT === 'true'
@@ -650,7 +650,7 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? false
 				: undefined) ??
 			file.fforSettleConcurrent ??
-			false,
+			true,
 		fforSettle:
 			cliFlags.fforSettle ??
 			(process.env.BEIGNET_FFOR_SETTLE === 'true' ||
