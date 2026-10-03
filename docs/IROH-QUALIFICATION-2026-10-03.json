@@ -1,0 +1,239 @@
+{
+	"date": "2026-10-03",
+	"engine": "0.26.0",
+	"umbrelRelease": "0.27.0",
+	"image": "ghcr.io/coreyphillips/beignet-app:0.27.0@sha256:96599fbcbad5423c408c959118dabc2d473ee08b530bb7803fb94c529c950528",
+	"runtime": {
+		"node": "20.20.2",
+		"iroh": "1.1.0",
+		"platform": "linux",
+		"architecture": "arm64"
+	},
+	"baseline": [
+		{
+			"mode": "direct",
+			"payments": 20,
+			"engineMs": {
+				"p50": 177,
+				"p90": 284,
+				"max": 383
+			}
+		},
+		{
+			"mode": "relay",
+			"payments": 20,
+			"engineMs": {
+				"p50": 306,
+				"p90": 444,
+				"max": 528
+			}
+		}
+	],
+	"outages": [
+		{
+			"seconds": 30,
+			"blockedMs": 31103,
+			"usableMs": 221,
+			"firstPaymentMs": 2458,
+			"disconnected": false,
+			"manualRedial": false,
+			"payments": [
+				{
+					"from": "phone",
+					"to": "primary",
+					"elapsedMs": 2072,
+					"engineMs": 375,
+					"cutOffsetMs": null,
+					"status": "COMPLETED",
+					"paymentStatus": "COMPLETED",
+					"invoiceStatus": "PAID",
+					"explicitRedial": false
+				},
+				{
+					"from": "primary",
+					"to": "phone",
+					"elapsedMs": 1630,
+					"engineMs": 320,
+					"cutOffsetMs": null,
+					"status": "COMPLETED",
+					"paymentStatus": "COMPLETED",
+					"invoiceStatus": "PAID",
+					"explicitRedial": false
+				}
+			]
+		},
+		{
+			"seconds": 120,
+			"blockedMs": 121432,
+			"usableMs": 29289,
+			"firstPaymentMs": 31296,
+			"disconnected": true,
+			"manualRedial": false,
+			"payments": [
+				{
+					"from": "phone",
+					"to": "primary",
+					"elapsedMs": 1711,
+					"engineMs": 376,
+					"cutOffsetMs": null,
+					"status": "COMPLETED",
+					"paymentStatus": "COMPLETED",
+					"invoiceStatus": "PAID",
+					"explicitRedial": false
+				},
+				{
+					"from": "primary",
+					"to": "phone",
+					"elapsedMs": 1971,
+					"engineMs": 276,
+					"cutOffsetMs": null,
+					"status": "COMPLETED",
+					"paymentStatus": "COMPLETED",
+					"invoiceStatus": "PAID",
+					"explicitRedial": false
+				}
+			]
+		},
+		{
+			"seconds": 300,
+			"blockedMs": 301060,
+			"usableMs": 47104,
+			"firstPaymentMs": 49289,
+			"disconnected": true,
+			"manualRedial": false,
+			"payments": [
+				{
+					"from": "phone",
+					"to": "primary",
+					"elapsedMs": 1906,
+					"engineMs": 409,
+					"cutOffsetMs": null,
+					"status": "COMPLETED",
+					"paymentStatus": "COMPLETED",
+					"invoiceStatus": "PAID",
+					"explicitRedial": false
+				},
+				{
+					"from": "primary",
+					"to": "phone",
+					"elapsedMs": 1775,
+					"engineMs": 301,
+					"cutOffsetMs": null,
+					"status": "COMPLETED",
+					"paymentStatus": "COMPLETED",
+					"invoiceStatus": "PAID",
+					"explicitRedial": false
+				}
+			]
+		}
+	],
+	"cuts": [
+		{
+			"mode": "relay",
+			"cuts": 30,
+			"attempts": 30,
+			"explicitStressRedial": true,
+			"warmupGapMs": {
+				"min": 0,
+				"max": 56
+			},
+			"observedCutOffsetsMs": [
+				94, 109, 134, 364, 179, 323, 247, 334, 300, 115, 92, 121, 195, 186, 209,
+				270, 255, 408, 93, 132, 114, 152, 184, 256, 260, 265, 288, 90, 97, 118
+			],
+			"interruptedPaymentsCompleted": 30,
+			"channelFailures": 0
+		},
+		{
+			"mode": "direct",
+			"cuts": 30,
+			"attempts": 36,
+			"explicitStressRedial": true,
+			"warmupGapMs": {
+				"min": 1,
+				"max": 7
+			},
+			"observedCutOffsetsMs": [
+				95, 165, 128, 190, 214, 262, 139, 96, 159, 190, 356, 293, 230, 355, 90,
+				124, 136, 206, 198, 233, 288, 75, 110, 122, 194, 207, 251, 229, 274, 355
+			],
+			"interruptedPaymentsCompleted": 30,
+			"channelFailures": 0
+		}
+	],
+	"firewallEvidence": [
+		{
+			"kind": "baseline-passed",
+			"at": "2026-10-03T20:06:28.980Z",
+			"iptables": "Chain INPUT (policy ACCEPT 0 packets, 0 bytes)\n    pkts      bytes target     prot opt in     out     source               destination         \n    8309  2485263 BQ_IN      0    --  *      *       0.0.0.0/0            0.0.0.0/0           \n\nChain FORWARD (policy ACCEPT 0 packets, 0 bytes)\n    pkts      bytes target     prot opt in     out     source               destination         \n\nChain OUTPUT (policy ACCEPT 0 packets, 0 bytes)\n    pkts      bytes target     prot opt in     out     source               destination         \n    9885  3314360 BQ_OUT     0    --  *      *       0.0.0.0/0            0.0.0.0/0           \n\nChain BQ_IN (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n    1157   322281 RETURN     0    --  lo     *       0.0.0.0/0            0.0.0.0/0           \n       0        0 RETURN     17   --  *      *       0.0.0.0/0            0.0.0.0/0            udp spt:53\n       9      567 DROP       17   --  *      *       0.0.0.0/0            0.0.0.0/0           \n\nChain BQ_OUT (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n    1157   322281 RETURN     0    --  *      lo      0.0.0.0/0            0.0.0.0/0           \n       0        0 RETURN     17   --  *      *       0.0.0.0/0            0.0.0.0/0            udp dpt:53\n      84    80048 DROP       17   --  *      *       0.0.0.0/0            0.0.0.0/0",
+			"ip6tables": "Chain INPUT (policy ACCEPT 0 packets, 0 bytes)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 BQ_IN      0    --  *      *       ::/0                 ::/0                \n\nChain FORWARD (policy ACCEPT 0 packets, 0 bytes)\n    pkts      bytes target     prot opt in     out     source               destination         \n\nChain OUTPUT (policy ACCEPT 0 packets, 0 bytes)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 BQ_OUT     0    --  *      *       ::/0                 ::/0                \n\nChain BQ_IN (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 RETURN     0    --  lo     *       ::/0                 ::/0                \n       0        0 RETURN     17   --  *      *       ::/0                 ::/0                 udp spt:53\n       0        0 DROP       17   --  *      *       ::/0                 ::/0                \n\nChain BQ_OUT (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 RETURN     0    --  *      lo      ::/0                 ::/0                \n       0        0 RETURN     17   --  *      *       ::/0                 ::/0                 udp dpt:53\n       0        0 DROP       17   --  *      *       ::/0                 ::/0"
+		},
+		{
+			"kind": "cuts-passed",
+			"at": "2026-10-03T20:22:08.274Z",
+			"iptables": "Chain INPUT (policy ACCEPT 0 packets, 0 bytes)\n    pkts      bytes target     prot opt in     out     source               destination         \n   24570 12078437 BQ_IN      0    --  *      *       0.0.0.0/0            0.0.0.0/0           \n\nChain FORWARD (policy ACCEPT 0 packets, 0 bytes)\n    pkts      bytes target     prot opt in     out     source               destination         \n\nChain OUTPUT (policy ACCEPT 0 packets, 0 bytes)\n    pkts      bytes target     prot opt in     out     source               destination         \n   28222 14148944 BQ_OUT     0    --  *      *       0.0.0.0/0            0.0.0.0/0           \n\nChain BQ_IN (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n    5523  2714932 RETURN     0    --  lo     *       0.0.0.0/0            0.0.0.0/0           \n       0        0 RETURN     17   --  *      *       0.0.0.0/0            0.0.0.0/0            udp spt:53\n     409    25767 DROP       17   --  *      *       0.0.0.0/0            0.0.0.0/0           \n\nChain BQ_OUT (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n    5523  2714932 RETURN     0    --  *      lo      0.0.0.0/0            0.0.0.0/0           \n       0        0 RETURN     17   --  *      *       0.0.0.0/0            0.0.0.0/0            udp dpt:53\n    1094   442702 DROP       17   --  *      *       0.0.0.0/0            0.0.0.0/0",
+			"ip6tables": "Chain INPUT (policy ACCEPT 0 packets, 0 bytes)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 BQ_IN      0    --  *      *       ::/0                 ::/0                \n\nChain FORWARD (policy ACCEPT 0 packets, 0 bytes)\n    pkts      bytes target     prot opt in     out     source               destination         \n\nChain OUTPUT (policy ACCEPT 0 packets, 0 bytes)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 BQ_OUT     0    --  *      *       ::/0                 ::/0                \n\nChain BQ_IN (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 RETURN     0    --  lo     *       ::/0                 ::/0                \n       0        0 RETURN     17   --  *      *       ::/0                 ::/0                 udp spt:53\n       0        0 DROP       17   --  *      *       ::/0                 ::/0                \n\nChain BQ_OUT (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 RETURN     0    --  *      lo      ::/0                 ::/0                \n       0        0 RETURN     17   --  *      *       ::/0                 ::/0                 udp dpt:53\n       0        0 DROP       17   --  *      *       ::/0                 ::/0"
+		}
+	],
+	"final": {
+		"at": "2026-10-03T20:26:42.297Z",
+		"kind": "final-channel-proof",
+		"ids": {
+			"primary": "81b7f59a92e20122fc7586d396eae3072764c4c6e9b583ab090aab154e32c14a",
+			"phone": "81b7f59a92e20122fc7586d396eae3072764c4c6e9b583ab090aab154e32c14a"
+		},
+		"channels": {
+			"primary": [
+				{
+					"channelId": "81b7f59a92e20122fc7586d396eae3072764c4c6e9b583ab090aab154e32c14a",
+					"peerPubkey": "0304f8e67b6f84dc3c752e00578e3b6a25596fd53f8260258caeedd116cb5311c5",
+					"state": "NORMAL",
+					"localBalanceSats": 700000,
+					"remoteBalanceSats": 300000,
+					"capacitySats": 1000000,
+					"isAnchor": true,
+					"peerSupportsSplicing": true,
+					"fundingTxid": "e541aa586a77b5b95d539c1b43545a87c26bb456eae2d72f2d3de1fcefc56f69",
+					"fundingOutputIndex": 0,
+					"shortChannelId": "01bff60000010000",
+					"feeratePerKw": 253,
+					"htlcCount": 0,
+					"htlcUsable": true,
+					"isPrivate": true,
+					"feeBaseMsat": 1000,
+					"feeProportionalMillionths": 1,
+					"cltvExpiryDelta": 40,
+					"htlcMinimumMsat": "1000",
+					"htlcMaximumMsat": "1000000000"
+				}
+			],
+			"phone": [
+				{
+					"channelId": "81b7f59a92e20122fc7586d396eae3072764c4c6e9b583ab090aab154e32c14a",
+					"peerPubkey": "02f4ffe42f1f8adc6a22c80f5e3efc2404353c7b16e37aaf8a83d90ba46123c883",
+					"state": "NORMAL",
+					"localBalanceSats": 300000,
+					"remoteBalanceSats": 700000,
+					"capacitySats": 1000000,
+					"isAnchor": true,
+					"peerSupportsSplicing": true,
+					"fundingTxid": "e541aa586a77b5b95d539c1b43545a87c26bb456eae2d72f2d3de1fcefc56f69",
+					"fundingOutputIndex": 0,
+					"shortChannelId": "01bff60000010000",
+					"feeratePerKw": 253,
+					"htlcCount": 0,
+					"htlcUsable": true,
+					"isPrivate": true,
+					"feeBaseMsat": 1000,
+					"feeProportionalMillionths": 1,
+					"cltvExpiryDelta": 40,
+					"htlcMinimumMsat": "1000",
+					"htlcMaximumMsat": "1000000000"
+				}
+			]
+		},
+		"fundingOutputUnspent": true,
+		"fundingConfirmations": 6,
+		"channelFailures": 0
+	}
+}

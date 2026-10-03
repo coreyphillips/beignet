@@ -1,0 +1,28 @@
+name: beignet-iroh-qualification
+services:
+  primary:
+    image: beignet-iroh-qualification:0.26.0
+    build: .
+    container_name: beignet-iroh-primary
+    labels:
+      beignet.test: iroh-qualification
+    volumes:
+      - .:/fixture:ro
+      - ./primary-data:/data
+    networks: [qualification]
+  phone:
+    image: beignet-iroh-qualification:0.26.0
+    build: .
+    container_name: beignet-iroh-phone
+    labels:
+      beignet.test: iroh-qualification
+    cap_add: [NET_ADMIN]
+    volumes:
+      - .:/fixture:ro
+      - ./phone-data:/data
+    networks: [qualification]
+networks:
+  qualification:
+    name: beignet-iroh-qualification
+    labels:
+      beignet.test: iroh-qualification
