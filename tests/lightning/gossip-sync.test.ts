@@ -188,6 +188,15 @@ function populateGraph(
 	return scids;
 }
 
+/** The sync ended: all it sends is a filter for the peer's whole store. */
+function expectStoreFilter(out: IGossipSyncMessage[]): void {
+	expect(out).to.have.length(1);
+	expect(out[0].type).to.equal(MessageType.GOSSIP_TIMESTAMP_FILTER);
+	const filter = decodeGossipTimestampFilterMessage(out[0].payload);
+	expect(filter.firstTimestamp).to.equal(0);
+	expect(filter.timestampRange).to.equal(0xffffffff);
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 describe('Gossip Sync (Phase 5)', function () {
@@ -504,11 +513,20 @@ describe('Gossip Sync (Phase 5)', function () {
 			const graph = new NetworkGraph();
 			const mgr = new GossipSyncManager(graph);
 
+			const before = Math.floor(Date.now() / 1000);
 			const messages = mgr.initiateSync();
+			const after = Math.floor(Date.now() / 1000);
 			expect(messages.length).to.equal(2);
 			expect(messages[0].type).to.equal(MessageType.GOSSIP_TIMESTAMP_FILTER);
 			expect(messages[1].type).to.equal(MessageType.QUERY_CHANNEL_RANGE);
 			expect(mgr.getState()).to.equal(GossipSyncState.AWAITING_RANGE_REPLY);
+
+			// Only new gossip while the sync runs (issue #1281).
+			const filter = decodeGossipTimestampFilterMessage(messages[0].payload);
+			expect(filter.firstTimestamp).to.be.within(before, after);
+			expect(filter.firstTimestamp + filter.timestampRange).to.equal(
+				0xffffffff
+			);
 
 			// Verify query is for full range
 			const query = decodeQueryChannelRangeMessage(messages[1].payload);
@@ -534,7 +552,7 @@ describe('Gossip Sync (Phase 5)', function () {
 				encodedShortIds: encodedScids
 			});
 
-			expect(messages.length).to.equal(0);
+			expectStoreFilter(messages);
 			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
 		});
 
@@ -623,7 +641,7 @@ describe('Gossip Sync (Phase 5)', function () {
 				complete: true
 			});
 
-			expect(messages.length).to.equal(0);
+			expectStoreFilter(messages);
 			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
 		});
 
@@ -718,12 +736,16 @@ describe('Gossip Sync (Phase 5)', function () {
 			mgr.initiateSync();
 
 			let sent = 0;
+			let last: IGossipSyncMessage[] = [];
 			while (sent <= MAX_RANGE_REPLY_SCIDS) {
 				expect(mgr.getState()).to.equal(GossipSyncState.AWAITING_RANGE_REPLY);
-				mgr.handleReplyChannelRange(rangeReply(uniqueScids(sent, 8000), false));
+				last = mgr.handleReplyChannelRange(
+					rangeReply(uniqueScids(sent, 8000), false)
+				);
 				sent += 8000;
 			}
 			expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+			expectStoreFilter(last);
 
 			// The rest of the stream, final reply included, is ignored.
 			const out = mgr.handleReplyChannelRange(
@@ -750,10 +772,12 @@ describe('Gossip Sync (Phase 5)', function () {
 				1000
 			);
 			// One query batch in total: the duplicates were never queued.
-			mgr.handleReplyShortChannelIdsEnd({
-				chainHash: BITCOIN_CHAIN_HASH,
-				complete: true
-			});
+			expectStoreFilter(
+				mgr.handleReplyShortChannelIdsEnd({
+					chainHash: BITCOIN_CHAIN_HASH,
+					complete: true
+				})
+			);
 			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
 		});
 	});
@@ -771,18 +795,23 @@ describe('Gossip Sync (Phase 5)', function () {
 
 		/** Starts a sync the peer answers with these SCIDs; returns batch 0. */
 		function offer(mgr: GossipSyncManager, scids: string[]): string[] {
+			return queried(offerReply(mgr, scids));
+		}
+
+		function offerReply(
+			mgr: GossipSyncManager,
+			scids: string[]
+		): IGossipSyncMessage[] {
 			mgr.initiateSync();
-			return queried(
-				mgr.handleReplyChannelRange({
-					chainHash: BITCOIN_CHAIN_HASH,
-					firstBlocknum: 0,
-					numberOfBlocks: 0xffffffff,
-					syncComplete: true,
-					encodedShortIds: encodeShortChannelIds(
-						scids.map((s) => Buffer.from(s, 'hex'))
-					)
-				})
-			);
+			return mgr.handleReplyChannelRange({
+				chainHash: BITCOIN_CHAIN_HASH,
+				firstBlocknum: 0,
+				numberOfBlocks: 0xffffffff,
+				syncComplete: true,
+				encodedShortIds: encodeShortChannelIds(
+					scids.map((s) => Buffer.from(s, 'hex'))
+				)
+			});
 		}
 
 		function queried(out: IGossipSyncMessage[]): string[] {
@@ -799,9 +828,12 @@ describe('Gossip Sync (Phase 5)', function () {
 			const mgr = new GossipSyncManager(new NetworkGraph());
 			const sizes = [startSync(mgr, 2500).length];
 			for (;;) {
-				const next = queried(mgr.handleReplyShortChannelIdsEnd(END));
-				if (next.length === 0) break;
-				sizes.push(next.length);
+				const out = mgr.handleReplyShortChannelIdsEnd(END);
+				if (mgr.getState() !== GossipSyncState.AWAITING_SCID_REPLY) {
+					expectStoreFilter(out);
+					break;
+				}
+				sizes.push(queried(out).length);
 			}
 			expect(sizes).to.eql([1000, 1000, 500]);
 			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
@@ -817,7 +849,7 @@ describe('Gossip Sync (Phase 5)', function () {
 			// The re-asked batch arrived whole: the sync moves on.
 			const second = queried(mgr.handleReplyShortChannelIdsEnd(END));
 			expect(second).to.have.length(500);
-			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
+			expectStoreFilter(mgr.handleReplyShortChannelIdsEnd(END));
 			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
 		});
 
@@ -839,7 +871,7 @@ describe('Gossip Sync (Phase 5)', function () {
 				500
 			);
 
-			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
+			expectStoreFilter(mgr.handleReplyShortChannelIdsEnd(END));
 			expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
 			expect(synced).to.equal(false);
 		});
@@ -853,7 +885,7 @@ describe('Gossip Sync (Phase 5)', function () {
 			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.have.length(
 				500
 			);
-			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
+			expectStoreFilter(mgr.handleReplyShortChannelIdsEnd(END));
 			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
 		});
 
@@ -879,11 +911,11 @@ describe('Gossip Sync (Phase 5)', function () {
 					})
 				)
 			).to.have.members(known);
-			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
+			expectStoreFilter(mgr.handleReplyShortChannelIdsEnd(END));
 			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
 
 			// Repaired: the next sync asks only for what is missing.
-			expect(offer(mgr, known)).to.eql([]);
+			expectStoreFilter(offerReply(mgr, known));
 			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
 		});
 
@@ -902,7 +934,7 @@ describe('Gossip Sync (Phase 5)', function () {
 			expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
 
 			expect(offer(mgr, offered)).to.have.members(offered);
-			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
+			expectStoreFilter(mgr.handleReplyShortChannelIdsEnd(END));
 			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
 
 			// Repaired: the next sync asks only for what is missing.
@@ -938,7 +970,7 @@ describe('Gossip Sync (Phase 5)', function () {
 		it('ignores intake loss while no batch is in flight', function () {
 			const mgr = new GossipSyncManager(new NetworkGraph());
 			expect(startSync(mgr, 10)).to.have.length(10);
-			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
+			expectStoreFilter(mgr.handleReplyShortChannelIdsEnd(END));
 			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
 
 			// Broadcast gossip dropped after the sync is not a lost batch.
@@ -1003,7 +1035,7 @@ describe('Gossip Sync (Phase 5)', function () {
 				expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.have.length(
 					500
 				);
-				expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
+				expectStoreFilter(mgr.handleReplyShortChannelIdsEnd(END));
 				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
 				expect(mgr.repairPending).to.equal(true);
 				expect(synced).to.equal(false);
@@ -1025,7 +1057,12 @@ describe('Gossip Sync (Phase 5)', function () {
 
 				expect(offer(mgr, offered)).to.eql([unknown]);
 				clock.tick(TIMEOUT * 3);
-				expect(timeouts.map(queried)).to.eql([[unknown], [unknown], []]);
+				expect(timeouts).to.have.length(3);
+				expect(timeouts.slice(0, 2).map(queried)).to.eql([
+					[unknown],
+					[unknown]
+				]);
+				expectStoreFilter(timeouts[2]);
 				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
 				expect(mgr.repairPending).to.equal(true);
 				expect(synced).to.equal(false);
@@ -1043,7 +1080,7 @@ describe('Gossip Sync (Phase 5)', function () {
 
 				// An old marker can still close its batch before the reply, so no
 				// sync on this connection ends SYNCED.
-				expect(mgr.handleReplyShortChannelIdsEnd(END)).to.eql([]);
+				expectStoreFilter(mgr.handleReplyShortChannelIdsEnd(END));
 				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
 				expect(mgr.repairPending).to.equal(true);
 				expect(synced).to.equal(false);
@@ -1080,7 +1117,9 @@ describe('Gossip Sync (Phase 5)', function () {
 				mgr.initiateSync();
 
 				clock.tick(TIMEOUT * 3);
-				expect(timeouts.map((t) => t.length)).to.eql([1, 1, 0]);
+				expect(timeouts).to.have.length(3);
+				expect(timeouts.slice(0, 2).map((t) => t.length)).to.eql([1, 1]);
+				expectStoreFilter(timeouts[2]);
 				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
 				expect(mgr.repairPending).to.equal(false);
 			});
@@ -1969,7 +2008,7 @@ describe('Gossip Sync (Phase 5)', function () {
 			// A processes end marker
 			const endDecoded = decodeReplyShortChannelIdsEndMessage(endMsg.payload);
 			const finalMessages = syncA.handleReplyShortChannelIdsEnd(endDecoded);
-			expect(finalMessages.length).to.equal(0);
+			expectStoreFilter(finalMessages);
 			expect(syncA.getState()).to.equal(GossipSyncState.SYNCED);
 		});
 	});
@@ -2248,6 +2287,47 @@ describe('Gossip Sync (Phase 5)', function () {
 					startSync(1);
 					expect(queries).to.have.length(2);
 					expect(queries[1]).to.eql(queries[0]);
+				} finally {
+					statics.GOSSIP_INTAKE_MAX = saved;
+				}
+			});
+
+			it('asks for the whole store after the sync when gossip outside the batch was dropped (issue #1281)', async function () {
+				const statics = LightningNode as unknown as {
+					GOSSIP_INTAKE_MAX: number;
+				};
+				const saved = statics.GOSSIP_INTAKE_MAX;
+				statics.GOSSIP_INTAKE_MAX = 1;
+				const filters: number[][] = [];
+				node.on(
+					'message:outbound',
+					(_pubkey: string, type: number, payload: Buffer) => {
+						if (type !== MessageType.GOSSIP_TIMESTAMP_FILTER) return;
+						const filter = decodeGossipTimestampFilterMessage(payload);
+						filters.push([filter.firstTimestamp, filter.timestampRange]);
+					}
+				);
+				try {
+					startSync(1);
+					// While the sync runs the peer sends only new gossip.
+					expect(filters).to.have.length(1);
+					expect(filters[0][0]).to.be.greaterThan(0);
+
+					sendAnnouncement(queries[0][0], 0);
+					// New gossip for a channel outside the batch: the intake is
+					// full, so it is dropped, and no batch asks for it.
+					sendAnnouncement(makeScid(5000, 1, 0).toString('hex'), 1);
+					sendEnd();
+					await waitFor(() => queries.length === 2);
+					expect(node.getGraph().getChannelCount()).to.equal(1);
+					sendEnd();
+					expect(node.getGossipSyncState(peerPubkey)).to.equal(
+						GossipSyncState.SYNCED
+					);
+
+					// The store the sync ends with carries that channel again.
+					await waitFor(() => filters.length === 2);
+					expect(filters[1]).to.eql([0, 0xffffffff]);
 				} finally {
 					statics.GOSSIP_INTAKE_MAX = saved;
 				}

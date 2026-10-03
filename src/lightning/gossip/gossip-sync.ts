@@ -4,12 +4,14 @@
  * State machine: IDLE → AWAITING_RANGE_REPLY → AWAITING_SCID_REPLY → SYNCED
  *
  * Initiating side:
- *   1. initiateSync() → send gossip_timestamp_filter + query_channel_range
+ *   1. initiateSync() → send gossip_timestamp_filter (new gossip only) +
+ *      query_channel_range
  *   2. handleReplyChannelRange() → accumulate SCIDs until syncComplete
  *   3. handleReplyShortChannelIdsEnd() → re-ask a lost batch, send the next
  *      one, or → SYNCED (IDLE when a batch was given up on)
  *   A reply that does not arrive in time is asked for again, and the sync
  *   ends IDLE once the attempts run out (emits 'timeout' either way).
+ *   However the sync ends, it widens the filter to the peer's whole store.
  *
  * Responding side:
  *   4. handleQueryChannelRange() → return reply_channel_range
@@ -153,15 +155,10 @@ export class GossipSyncManager extends EventEmitter {
 		if (repair) this._repairPending = true;
 		const messages: IGossipSyncMessage[] = [];
 
-		// Send gossip_timestamp_filter to receive future gossip
-		messages.push({
-			type: MessageType.GOSSIP_TIMESTAMP_FILTER,
-			payload: encodeGossipTimestampFilterMessage({
-				chainHash: this._chainHash,
-				firstTimestamp: 0,
-				timestampRange: 0xffffffff
-			})
-		});
+		// Only new gossip while the sync runs. The peer's whole store would
+		// compete with the batch replies for the intake, and no batch asks
+		// again for a channel outside it. _endSync asks for the store.
+		messages.push(this._timestampFilter(Math.floor(Date.now() / 1000)));
 
 		this._clearRangeScids();
 		this._rangeAttempts = 0;
@@ -197,8 +194,7 @@ export class GossipSyncManager extends EventEmitter {
 		const needed = this._rangeScidBytes + scids.length * 8;
 		if (needed > MAX_RANGE_REPLY_SCIDS * 8) {
 			this._clearRangeScids();
-			this._state = GossipSyncState.IDLE;
-			return [];
+			return this._endSync(GossipSyncState.IDLE);
 		}
 		if (needed > this._rangeScids.length) {
 			const grown = Buffer.alloc(
@@ -234,10 +230,7 @@ export class GossipSyncManager extends EventEmitter {
 		this._clearRangeScids();
 
 		if (missing.length === 0) {
-			this._repairPending = false;
-			this._state = GossipSyncState.SYNCED;
-			this.emit('synced');
-			return [];
+			return this._endSync(GossipSyncState.SYNCED);
 		}
 
 		// Batch into chunks of MAX_SCIDS_PER_QUERY
@@ -292,14 +285,11 @@ export class GossipSyncManager extends EventEmitter {
 		if (this._currentBatchIndex >= this._pendingQueries.length) {
 			// All batches processed
 			this._pendingQueries = [];
-			if (this._incomplete || this._markerOwed) {
-				this._state = GossipSyncState.IDLE;
-				return [];
-			}
-			this._repairPending = false;
-			this._state = GossipSyncState.SYNCED;
-			this.emit('synced');
-			return [];
+			return this._endSync(
+				this._incomplete || this._markerOwed
+					? GossipSyncState.IDLE
+					: GossipSyncState.SYNCED
+			);
 		}
 
 		return this._sendNextScidQuery();
@@ -311,7 +301,9 @@ export class GossipSyncManager extends EventEmitter {
 	 * asked for again when its end marker arrives. Before the range reply
 	 * completes it is gossip no batch would ask for, so the sync asks for
 	 * every channel instead. Either way the loss stays recorded until a sync
-	 * ends SYNCED, so the node can carry it past a disconnect.
+	 * ends SYNCED, so the node can carry it past a disconnect. New gossip
+	 * outside the batch comes again with the store the sync asks for at its
+	 * end.
 	 */
 	noteIntakeLoss(): void {
 		if (this._state === GossipSyncState.AWAITING_SCID_REPLY) {
@@ -486,7 +478,7 @@ export class GossipSyncManager extends EventEmitter {
 				messages = this._sendRangeQuery();
 			} else {
 				this._clearRangeScids();
-				this._state = GossipSyncState.IDLE;
+				messages = this._endSync(GossipSyncState.IDLE);
 			}
 		} else if (this._state === GossipSyncState.AWAITING_SCID_REPLY) {
 			this._markerOwed = true;
@@ -501,12 +493,41 @@ export class GossipSyncManager extends EventEmitter {
 				// getMissingSCIDs would not ask for, so the next sync asks for
 				// every channel.
 				this._pendingQueries = [];
-				this._state = GossipSyncState.IDLE;
+				messages = this._endSync(GossipSyncState.IDLE);
 			}
 		} else {
 			return;
 		}
 		this.emit('timeout', messages);
+	}
+
+	/**
+	 * End the sync and ask for the peer's whole store. The query sync only
+	 * fetches channels the graph lacks, so the store is what refreshes the
+	 * ones it holds.
+	 */
+	private _endSync(
+		state: GossipSyncState.IDLE | GossipSyncState.SYNCED
+	): IGossipSyncMessage[] {
+		this._state = state;
+		if (state === GossipSyncState.SYNCED) {
+			this._repairPending = false;
+			this.emit('synced');
+		}
+		return [this._timestampFilter(0)];
+	}
+
+	private _timestampFilter(firstTimestamp: number): IGossipSyncMessage {
+		return {
+			type: MessageType.GOSSIP_TIMESTAMP_FILTER,
+			payload: encodeGossipTimestampFilterMessage({
+				chainHash: this._chainHash,
+				firstTimestamp,
+				// The window's end stays within u32, so it does not depend on how
+				// a peer handles first_timestamp + timestamp_range overflowing.
+				timestampRange: 0xffffffff - firstTimestamp
+			})
+		};
 	}
 
 	private _clearRangeScids(): void {
