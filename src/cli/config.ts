@@ -1,3 +1,4 @@
+import { irohBooleanEnv } from './iroh-config';
 /**
  * CLI config file management.
  * Reads/writes ~/.beignet/config.json and manages daemon PID files.
@@ -433,6 +434,16 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? parseInt(process.env.BEIGNET_LISTEN_PORT, 10)
 				: undefined) ||
 			file.listenPort,
+		iroh: cliFlags.iroh ?? irohBooleanEnv('BEIGNET_IROH') ?? file.iroh,
+		irohDiscovery:
+			cliFlags.irohDiscovery ??
+			irohBooleanEnv('BEIGNET_IROH_DISCOVERY') ??
+			file.irohDiscovery,
+		irohRelays:
+			cliFlags.irohRelays ??
+			(process.env.BEIGNET_IROH_RELAYS !== undefined
+				? process.env.BEIGNET_IROH_RELAYS.split(',').map((url) => url.trim())
+				: file.irohRelays),
 		websocketPort:
 			cliFlags.websocketPort ||
 			(process.env.BEIGNET_WEBSOCKET_PORT

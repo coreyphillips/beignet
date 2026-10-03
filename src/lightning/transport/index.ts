@@ -8,3 +8,4 @@ export * from './websocket-frame';
 export * from './websocket-server';
 export * from './websocket-node-client';
 export * from './peer-uri';
+export * from './iroh';

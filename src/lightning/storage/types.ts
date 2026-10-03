@@ -1,3 +1,4 @@
+import type { IPeerTransportOptions } from '../transport/duplex-transport';
 /**
  * Storage backend interface for Lightning node persistence.
  *
@@ -127,8 +128,18 @@ export interface IStorageBackend {
 	loadMissionControl(): string | null;
 
 	// ─── Peer Addresses ───
-	savePeerAddress(pubkey: string, host: string, port: number): void;
-	loadAllPeerAddresses(): Array<{ pubkey: string; host: string; port: number }>;
+	savePeerAddress(
+		pubkey: string,
+		host: string,
+		port: number,
+		transport?: IPeerTransportOptions
+	): void;
+	loadAllPeerAddresses(): Array<{
+		pubkey: string;
+		host: string;
+		port: number;
+		transport?: IPeerTransportOptions;
+	}>;
 	deletePeerAddress(pubkey: string): void;
 
 	// ─── Announced Peer Addresses (optional) ───

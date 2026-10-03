@@ -1,3 +1,6 @@
+import { parseIrohAddress } from '../transport/iroh';
+import { parseWebSocketUrl } from '../transport/websocket';
+import type { IPeerTransportOptions } from '../transport/duplex-transport';
 /**
  * Static channel backup (SCB): a portable, versioned, encrypted blob carrying
  * the minimum per-channel data needed to recover funds without the full
@@ -98,8 +101,25 @@ export interface IStaticChannelBackup {
  */
 export function parseScbAddress(
 	address: unknown
-): { host: string; port: number } | null {
+): { host: string; port: number; transport?: IPeerTransportOptions } | null {
 	if (typeof address !== 'string') return null;
+	try {
+		if (/^iroh:/i.test(address)) {
+			const parsed = parseIrohAddress(address);
+			return {
+				host: parsed.endpointId,
+				port: 0,
+				transport: { type: 'iroh', ...parsed }
+			};
+		}
+		if (/^wss?:/i.test(address)) {
+			const { host, port } = parseWebSocketUrl(address);
+			return { host, port, transport: { type: 'ws', url: address } };
+		}
+	} catch {
+		return null;
+	}
+
 	const sep = address.lastIndexOf(':');
 	if (sep <= 0 || sep === address.length - 1) return null;
 	let host = address.slice(0, sep);

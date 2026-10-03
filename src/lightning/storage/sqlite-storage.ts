@@ -1,3 +1,9 @@
+import {
+	normalizeIrohEndpointId,
+	validateIrohRelayUrl
+} from '../transport/iroh';
+import { parseWebSocketUrl } from '../transport/websocket';
+import type { IPeerTransportOptions } from '../transport/duplex-transport';
 /**
  * SQLite storage backend for Lightning node persistence.
  *
@@ -220,7 +226,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 14;
+	static readonly CURRENT_SCHEMA_VERSION = 15;
 
 	/**
 	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
@@ -1183,23 +1189,59 @@ export class SqliteStorage implements IStorageBackend {
 
 	// ─── Peer Addresses ───
 
-	savePeerAddress(pubkey: string, host: string, port: number): void {
+	savePeerAddress(
+		pubkey: string,
+		host: string,
+		port: number,
+		transport?: IPeerTransportOptions
+	): void {
 		this.db
 			.prepare(
-				'INSERT OR REPLACE INTO peer_addresses (pubkey, host, port, last_connected) VALUES (?, ?, ?, ?)'
+				'INSERT OR REPLACE INTO peer_addresses (pubkey, host, port, last_connected, transport_json) VALUES (?, ?, ?, ?, ?)'
 			)
-			.run(pubkey, host, port, Date.now());
+			.run(
+				pubkey,
+				host,
+				port,
+				Date.now(),
+				transport ? JSON.stringify(transport) : null
+			);
 	}
 
 	loadAllPeerAddresses(): Array<{
 		pubkey: string;
 		host: string;
 		port: number;
+		transport?: IPeerTransportOptions;
 	}> {
 		const rows = this.db
-			.prepare('SELECT pubkey, host, port FROM peer_addresses')
-			.all() as Array<{ pubkey: string; host: string; port: number }>;
-		return rows;
+			.prepare('SELECT pubkey, host, port, transport_json FROM peer_addresses')
+			.all() as Array<{
+			pubkey: string;
+			host: string;
+			port: number;
+			transport_json: string | null;
+		}>;
+		return rows.flatMap(({ transport_json, ...row }) => {
+			if (!transport_json) return [row];
+			try {
+				const transport = JSON.parse(transport_json) as IPeerTransportOptions;
+				if (!transport || !['tcp', 'ws', 'iroh'].includes(transport.type))
+					throw new Error('Invalid stored peer transport');
+				if (transport.type === 'iroh') {
+					normalizeIrohEndpointId(transport.endpointId ?? row.host);
+					if (row.port !== 0) throw new Error('Invalid stored Iroh port');
+					if (transport.relayUrl !== undefined)
+						validateIrohRelayUrl(transport.relayUrl);
+				}
+				if (transport.type === 'ws' && transport.url !== undefined)
+					parseWebSocketUrl(transport.url);
+				return [{ ...row, transport }];
+			} catch (error) {
+				this.reportCorruptRow(error);
+				return [];
+			}
+		});
 	}
 
 	deletePeerAddress(pubkey: string): void {
@@ -1555,6 +1597,10 @@ export class SqliteStorage implements IStorageBackend {
 			}, // Migration 13->14: ffor_vouchers is created above.
 			(): void => {
 				/* No data is inferred for legacy missing outcomes. */
+			},
+			// Migration 14->15: retain the selected peer transport across restarts.
+			(db): void => {
+				db.exec('ALTER TABLE peer_addresses ADD COLUMN transport_json TEXT');
 			}
 		];
 

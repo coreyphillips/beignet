@@ -4,23 +4,25 @@
  * Standard Lightning form:      pubkey@host:port         (TCP — unchanged)
  * WebSocket forms (additive):   pubkey@ws://host:port    (RFC 6455 client)
  *                               pubkey@wss://host:port
+ * Iroh form:                    pubkey@iroh:<endpoint-id>?relay=<url>
  */
 
 import { IPeerTransportOptions } from './duplex-transport';
 import { parseWebSocketUrl } from './websocket';
+import { parseIrohAddress } from './iroh';
 
 export interface IParsedPeerUri {
 	/** 33-byte compressed pubkey, lowercase hex. */
 	pubkey: string;
 	host: string;
 	port: number;
-	/** Present only for ws:// / wss:// URIs; absent means plain TCP. */
+	/** Present for WebSocket and Iroh URIs; absent means plain TCP. */
 	transport?: IPeerTransportOptions;
 }
 
 /**
  * Parse a `pubkey@address` peer URI. The address part is either a plain
- * `host:port` (TCP, exactly the historical format) or a ws:// / wss:// URL.
+ * `host:port` (TCP), a ws:// / wss:// URL, or an iroh: endpoint address.
  */
 export function parsePeerUri(uri: string): IParsedPeerUri {
 	const at = uri.indexOf('@');
@@ -32,6 +34,16 @@ export function parsePeerUri(uri: string): IParsedPeerUri {
 		throw new Error(`Invalid peer pubkey in URI: ${uri}`);
 	}
 	const address = uri.slice(at + 1);
+
+	if (/^iroh:/i.test(address)) {
+		const parsed = parseIrohAddress(address);
+		return {
+			pubkey,
+			host: parsed.endpointId,
+			port: 0,
+			transport: { type: 'iroh', ...parsed }
+		};
+	}
 
 	if (/^wss?:\/\//i.test(address)) {
 		const { host, port } = parseWebSocketUrl(address);
