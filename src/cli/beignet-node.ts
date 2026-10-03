@@ -1,5 +1,3 @@
-import { IrohDaemonConfig, validateIrohConfig } from './iroh-config';
-import { createNodeIrohEndpoint } from '../lightning/transport/iroh-node';
 /**
  * BeignetNode: Simplified wrapper class for AI-friendly Bitcoin + Lightning.
  *
@@ -7,6 +5,8 @@ import { createNodeIrohEndpoint } from '../lightning/transport/iroh-node';
  * and ElectrumBackend behind a single class with plain JSON return types.
  */
 
+import { IrohDaemonConfig, validateIrohConfig } from './iroh-config';
+import { createNodeIrohEndpoint } from '../lightning/transport/iroh-node';
 import { OfflineReceive } from './offline-receive';
 import { FforReceiveService, FforReceiveFunding } from './ffor-receive';
 import * as path from 'path';
@@ -5500,7 +5500,7 @@ export class BeignetNode extends EventEmitter {
 		}
 		try {
 			for (const peer of from.loadAllPeerAddresses()) {
-				to.savePeerAddress(peer.pubkey, peer.host, peer.port);
+				to.savePeerAddress(peer.pubkey, peer.host, peer.port, peer.transport);
 			}
 		} catch (err) {
 			this.log('warn', 'Could not carry peer addresses into the restore', {

@@ -2127,7 +2127,7 @@ your IP address. There is no automatic switch of existing peers to Iroh.
 | Environment variable | Meaning |
 | --- | --- |
 | `BEIGNET_IROH` | Exactly `true` enables the experimental transport; unset or `false` leaves it off |
-| `BEIGNET_IROH_RELAYS` | Comma-separated HTTP(S) relay URLs replacing n0's public defaults |
+| `BEIGNET_IROH_RELAYS` | Comma-separated HTTP(S) relay URLs replacing n0's public defaults; an empty value disables relays |
 | `BEIGNET_IROH_DISCOVERY` | Exactly `false` disables public endpoint discovery and publication; defaults to `true` when Iroh is enabled |
 
 The corresponding config keys are `iroh`, `irohRelays` and `irohDiscovery`.

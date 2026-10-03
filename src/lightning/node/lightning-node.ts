@@ -1,9 +1,3 @@
-import {
-	deriveIrohSecretKey,
-	formatIrohAddress,
-	normalizeIrohEndpointId,
-	validateIrohRelayUrl
-} from '../transport/iroh';
 /**
  * Lightning Node API: Top-level orchestrator.
  *
@@ -12,6 +6,12 @@ import {
  * into a unified Lightning node API.
  */
 
+import {
+	deriveIrohSecretKey,
+	formatIrohAddress,
+	normalizeIrohEndpointId,
+	validateIrohRelayUrl
+} from '../transport/iroh';
 import {
 	archiveFforVouchers,
 	IFforVoucherArchive,
@@ -8978,6 +8978,10 @@ export class LightningNode extends EventEmitter {
 		if (transport && !['tcp', 'ws', 'iroh'].includes(transport.type))
 			throw new InvalidPeerConnectError('Unknown peer transport');
 		if (transport?.type === 'iroh') {
+			if (!this.peerManager.isIrohEnabled())
+				throw new InvalidPeerConnectError(
+					'Iroh is not enabled; configure an Iroh endpoint factory'
+				);
 			const fallback = transport.fallbackOnion;
 			if (
 				fallback &&

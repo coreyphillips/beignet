@@ -17,6 +17,12 @@ export function irohBooleanEnv(name: string): boolean | undefined {
 	throw new Error(`${name} must be exactly true or false`);
 }
 
+export function irohRelaysEnv(): string[] | undefined {
+	return process.env.BEIGNET_IROH_RELAYS?.split(',')
+		.map((url) => url.trim())
+		.filter(Boolean);
+}
+
 export function validateIrohConfig(config: IrohDaemonConfig): void {
 	for (const name of ['iroh', 'irohDiscovery'] as const) {
 		if (config[name] !== undefined && typeof config[name] !== 'boolean')

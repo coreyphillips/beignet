@@ -2,6 +2,8 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { SocksClient } from 'socks';
+const sinon = require('sinon');
 import {
 	createNode,
 	makeNodeConfig,
@@ -321,7 +323,14 @@ describe('Iroh endpoint lifecycle', () => {
 		);
 	});
 	it('refuses an Iroh dial without an injected factory', async () => {
-		const pm = new PeerManager({ localPrivateKey: Buffer.alloc(32, 1) });
+		const pm = new PeerManager({
+			localPrivateKey: Buffer.alloc(32, 1),
+			autoReconnect: true
+		});
+		const reconnect = sinon.spy(
+			pm as unknown as { scheduleReconnect: () => void },
+			'scheduleReconnect'
+		);
 		try {
 			const message = await pm
 				.connectPeer(PK, ID, 0, { type: 'iroh', endpointId: ID })
@@ -330,6 +339,8 @@ describe('Iroh endpoint lifecycle', () => {
 					(err: Error) => err.message
 				);
 			expect(message).to.contain('Iroh is not enabled');
+			expect(reconnect.called).to.equal(false);
+			expect(pm.getPeerAddress(PK)).to.equal(undefined);
 		} finally {
 			pm.destroy();
 		}
@@ -337,6 +348,63 @@ describe('Iroh endpoint lifecycle', () => {
 });
 
 describe('Iroh with an optional Tor fallback', () => {
+	for (const phase of ['binding', 'connecting']) {
+		it(`cancels fallback and late work after timing out during ${phase}`, async () => {
+			const clock = sinon.useFakeTimers();
+			const socks = sinon
+				.stub(SocksClient, 'createConnection')
+				.rejects(new Error('unexpected fallback'));
+			const bound = deferred<IIrohEndpoint>();
+			const connected = deferred<IrohTransport>();
+			const connect = sinon.stub().returns(connected.promise);
+			const endpoint = {
+				connect,
+				close: async () => undefined,
+				stopListening: () => undefined
+			} as unknown as IIrohEndpoint;
+			const pm = new PeerManager({
+				localPrivateKey: Buffer.alloc(32, 1),
+				iroh: {
+					secretKey: Buffer.alloc(32, 2),
+					factory: (): Promise<IIrohEndpoint> =>
+						phase === 'binding' ? bound.promise : Promise.resolve(endpoint)
+				}
+			});
+			try {
+				const result = pm
+					.connectPeer(
+						PK,
+						ID,
+						0,
+						{
+							type: 'iroh',
+							endpointId: ID,
+							fallbackOnion: { host: 'a'.repeat(56) + '.onion', port: 9735 }
+						},
+						{ timeoutMs: 100, reconnect: false }
+					)
+					.then(
+						() => null,
+						(error: Error) => error
+					);
+				await clock.tickAsync(100);
+				expect((await result)?.message).to.equal('Connection timeout');
+				await clock.tickAsync(2000);
+				expect(socks.called).to.equal(false);
+				bound.resolve(endpoint);
+				await clock.tickAsync(1);
+				expect(connect.callCount).to.equal(phase === 'binding' ? 0 : 1);
+				const stream = fakeStream();
+				connected.resolve(new IrohTransport(stream));
+				await clock.tickAsync(1);
+				if (phase === 'connecting') expect(stream.closeCount).to.equal(1);
+			} finally {
+				pm.destroy();
+				socks.restore();
+				clock.restore();
+			}
+		});
+	}
 	it('does not start Tor when Iroh connects promptly', async () => {
 		const socket = new IrohTransport(fakeStream());
 		let fallbackCalls = 0;

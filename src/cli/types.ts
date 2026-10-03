@@ -1,10 +1,10 @@
-import type { IrohDaemonConfig } from './iroh-config';
-import type { IIrohDiagnostics } from '../lightning/transport/iroh';
 /**
  * CLI types — JSON-serializable response types.
  * All IDs are hex strings, all amounts are numbers in satoshis.
  */
 
+import type { IrohDaemonConfig } from './iroh-config';
+import type { IIrohDiagnostics } from '../lightning/transport/iroh';
 import { TLogLevel } from '../logger';
 import type { IGuardianConfigEntry } from '../lightning/recovery/assembly';
 import type {

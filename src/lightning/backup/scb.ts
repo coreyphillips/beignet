@@ -1,6 +1,3 @@
-import { parseIrohAddress } from '../transport/iroh';
-import { parseWebSocketUrl } from '../transport/websocket';
-import type { IPeerTransportOptions } from '../transport/duplex-transport';
 /**
  * Static channel backup (SCB): a portable, versioned, encrypted blob carrying
  * the minimum per-channel data needed to recover funds without the full
@@ -25,6 +22,9 @@ import type { IPeerTransportOptions } from '../transport/duplex-transport';
  * HKDF-SHA256(seed, salt empty, info 'beignet-scb-v1').
  */
 
+import { parseIrohAddress } from '../transport/iroh';
+import { parseWebSocketUrl } from '../transport/websocket';
+import type { IPeerTransportOptions } from '../transport/duplex-transport';
 import {
 	hkdfKey,
 	encryptWithPrefix,

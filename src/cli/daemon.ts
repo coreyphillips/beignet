@@ -1,14 +1,14 @@
-import { validateIrohConfig } from './iroh-config';
-import {
-	normalizeIrohEndpointId,
-	validateIrohRelayUrl
-} from '../lightning/transport/iroh';
 /**
  * HTTP daemon: lightweight http.createServer() on 127.0.0.1.
  * Routes HTTP endpoints to BeignetNode methods.
  * Uniform JSON envelope: { ok: true, result } or { ok: false, error: { code, message } }.
  */
 
+import { validateIrohConfig } from './iroh-config';
+import {
+	normalizeIrohEndpointId,
+	validateIrohRelayUrl
+} from '../lightning/transport/iroh';
 import * as http from 'http';
 import * as net from 'net';
 import * as https from 'https';

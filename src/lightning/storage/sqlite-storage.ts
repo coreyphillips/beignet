@@ -1,9 +1,3 @@
-import {
-	normalizeIrohEndpointId,
-	validateIrohRelayUrl
-} from '../transport/iroh';
-import { parseWebSocketUrl } from '../transport/websocket';
-import type { IPeerTransportOptions } from '../transport/duplex-transport';
 /**
  * SQLite storage backend for Lightning node persistence.
  *
@@ -11,6 +5,12 @@ import type { IPeerTransportOptions } from '../transport/duplex-transport';
  * All tables use WAL mode for concurrent reader support.
  */
 
+import {
+	normalizeIrohEndpointId,
+	validateIrohRelayUrl
+} from '../transport/iroh';
+import { parseWebSocketUrl } from '../transport/websocket';
+import type { IPeerTransportOptions } from '../transport/duplex-transport';
 import {
 	IFforVoucherArchive,
 	fforVoucherArchiveId,

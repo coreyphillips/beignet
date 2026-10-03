@@ -1,11 +1,3 @@
-import {
-	IIrohConfig,
-	IIrohEndpoint,
-	IIrohDiagnostics,
-	formatIrohAddress,
-	connectIrohWithFallback,
-	normalizeIrohEndpointId
-} from './iroh';
 /**
  * Peer connection pool manager.
  *
@@ -16,6 +8,14 @@ import {
  * - Reconnection with exponential backoff
  */
 
+import {
+	IIrohConfig,
+	IIrohEndpoint,
+	IIrohDiagnostics,
+	formatIrohAddress,
+	connectIrohWithFallback,
+	normalizeIrohEndpointId
+} from './iroh';
 import { EventEmitter } from 'events';
 import net from 'net';
 import { SocksClient } from 'socks';
@@ -452,6 +452,10 @@ export class PeerManager extends EventEmitter {
 		transport?: IPeerTransportOptions,
 		options: IPeerDialOptions = {}
 	): Promise<void> {
+		if (transport?.type === 'iroh' && !this.isIrohEnabled())
+			throw new Error(
+				'Iroh is not enabled; configure an Iroh endpoint factory'
+			);
 		// The same key an inbound connection from this peer registers under.
 		pubkey = normalizeHexPubkey(pubkey);
 		const cancelGeneration = this.cancelGenerations.get(pubkey) ?? 0;
@@ -556,6 +560,7 @@ export class PeerManager extends EventEmitter {
 		timeoutMs?: number
 	): Promise<void> {
 		const dialGeneration = this.cancelGenerations.get(pubkey) ?? 0;
+		const dialAbort = new AbortController();
 		if (this.connectionsDisabled()) {
 			throw new Error(
 				`Connections are ${this.connectionsDisabledReason()}; refusing dial to peer ${pubkey}`
@@ -592,6 +597,7 @@ export class PeerManager extends EventEmitter {
 			const primary = async (): Promise<IDuplexTransport> => {
 				const endpoint = await this.getIrohEndpoint();
 				if (
+					dialAbort.signal.aborted ||
 					this.connectionsDisabled() ||
 					(this.cancelGenerations.get(pubkey) ?? 0) !== dialGeneration ||
 					(this.connectionGate && !this.connectionGate())
@@ -608,26 +614,33 @@ export class PeerManager extends EventEmitter {
 			const fallback = transport.fallbackOnion;
 			createSocket = fallback
 				? (): Promise<IDuplexTransport> =>
-						connectIrohWithFallback(primary, async () => {
-							if (
-								this.connectionsDisabled() ||
-								(this.cancelGenerations.get(pubkey) ?? 0) !== dialGeneration ||
-								(this.connectionGate && !this.connectionGate())
-							)
-								throw new PeerDialCancelledError(pubkey);
-							if (
-								!/^[a-z2-7]{56}\.onion$/i.test(fallback.host) ||
-								!Number.isInteger(fallback.port) ||
-								fallback.port < 1 ||
-								fallback.port > 65535
-							)
-								throw new Error('Invalid Iroh fallback onion address');
-							const socket = await socks5SocketFactory(
-								this.socks5Proxy ?? { host: '127.0.0.1', port: 9050 },
-								timeoutMs ?? this.socks5TimeoutMs
-							)(fallback.host, fallback.port);
-							return Object.assign(socket, { transportType: 'tcp' as const });
-						})
+						connectIrohWithFallback(
+							primary,
+							async () => {
+								if (
+									dialAbort.signal.aborted ||
+									this.connectionsDisabled() ||
+									(this.cancelGenerations.get(pubkey) ?? 0) !==
+										dialGeneration ||
+									(this.connectionGate && !this.connectionGate())
+								)
+									throw new PeerDialCancelledError(pubkey);
+								if (
+									!/^[a-z2-7]{56}\.onion$/i.test(fallback.host) ||
+									!Number.isInteger(fallback.port) ||
+									fallback.port < 1 ||
+									fallback.port > 65535
+								)
+									throw new Error('Invalid Iroh fallback onion address');
+								const socket = await socks5SocketFactory(
+									this.socks5Proxy ?? { host: '127.0.0.1', port: 9050 },
+									timeoutMs ?? this.socks5TimeoutMs
+								)(fallback.host, fallback.port);
+								return Object.assign(socket, { transportType: 'tcp' as const });
+							},
+							1500,
+							dialAbort.signal
+						)
 				: primary;
 		} else if (transport?.type === 'ws') {
 			// WebSocket transport (does NOT route through the SOCKS5 proxy)
@@ -714,6 +727,7 @@ export class PeerManager extends EventEmitter {
 			}
 			throw err;
 		} finally {
+			dialAbort.abort();
 			this.pendingPeers.delete(peer);
 			pendingDials.delete(peer);
 			if (pendingDials.size === 0) {
@@ -1344,7 +1358,8 @@ export class PeerManager extends EventEmitter {
 			transport?: IPeerTransportOptions;
 		}> = [];
 		const dialed = this.peerAddresses.get(pubkey);
-		if (dialed) candidates.push(dialed);
+		if (dialed && (dialed.transport?.type !== 'iroh' || this.isIrohEnabled()))
+			candidates.push(dialed);
 		for (const addr of this.announcedAddresses.get(pubkey) ?? []) {
 			if (
 				!candidates.some((c) => c.host === addr.host && c.port === addr.port)
@@ -1483,9 +1498,12 @@ export class PeerManager extends EventEmitter {
 		}
 	}
 
-	/**
-	 * Bind the shared endpoint only when an Iroh listener or dial needs it.
-	 */
+	/** Whether an Iroh endpoint factory has been configured. */
+	isIrohEnabled(): boolean {
+		return this.irohConfig !== undefined;
+	}
+
+	/** Bind the shared endpoint only when an Iroh listener or dial needs it. */
 	private getIrohEndpoint(): Promise<IIrohEndpoint> {
 		if (this.connectionsDisabled())
 			return Promise.reject(new Error('Connections are disabled'));

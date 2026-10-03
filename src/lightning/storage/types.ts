@@ -1,4 +1,3 @@
-import type { IPeerTransportOptions } from '../transport/duplex-transport';
 /**
  * Storage backend interface for Lightning node persistence.
  *
@@ -6,6 +5,7 @@ import type { IPeerTransportOptions } from '../transport/duplex-transport';
  * reflects the latest in-memory state.
  */
 
+import type { IPeerTransportOptions } from '../transport/duplex-transport';
 import { IFforVoucherArchive } from '../ffor/voucher-archive';
 import { IChannelState } from '../channel/channel-state';
 import { IPaymentInfo } from '../node/types';

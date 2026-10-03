@@ -275,26 +275,38 @@ function asError(error: unknown): Error {
 export function connectIrohWithFallback(
 	primary: () => Promise<IDuplexTransport>,
 	fallback: () => Promise<IDuplexTransport>,
-	delayMs = 1500
+	delayMs = 1500,
+	signal?: AbortSignal
 ): Promise<IDuplexTransport> {
 	return new Promise((resolve, reject) => {
 		let finished = false;
 		let fallbackStarted = false;
 		const failures: Error[] = [];
+		const cleanup = (): void => {
+			clearTimeout(timer);
+			signal?.removeEventListener('abort', onAbort);
+		};
+		const onAbort = (): void => {
+			if (finished) return;
+			finished = true;
+			cleanup();
+			reject(new Error('Iroh dial cancelled'));
+		};
 		const attempt = (
 			connect: () => Promise<IDuplexTransport>,
 			isPrimary: boolean
 		): void => {
 			void Promise.resolve()
-				.then(connect)
+				.then(() => (finished ? undefined : connect()))
 				.then(
 					(socket) => {
+						if (!socket) return;
 						if (finished) {
 							socket.destroy();
 							return;
 						}
 						finished = true;
-						clearTimeout(timer);
+						cleanup();
 						resolve(socket);
 					},
 					(error) => {
@@ -303,7 +315,7 @@ export function connectIrohWithFallback(
 						if (isPrimary) startFallback();
 						if (failures.length === 2) {
 							finished = true;
-							clearTimeout(timer);
+							cleanup();
 							reject(
 								new Error(
 									`Iroh and Tor connections failed: ${failures
@@ -321,6 +333,8 @@ export function connectIrohWithFallback(
 			attempt(fallback, false);
 		};
 		const timer = setTimeout(startFallback, delayMs);
-		attempt(primary, true);
+		signal?.addEventListener('abort', onAbort, { once: true });
+		if (signal?.aborted) onAbort();
+		else attempt(primary, true);
 	});
 }

@@ -72,7 +72,7 @@ describe('Iroh native transport', function () {
 	}
 	before(function () {
 		try {
-			require('@number0/iroh');
+			require('@number0/iroh/index.js');
 		} catch {
 			this.skip();
 		}

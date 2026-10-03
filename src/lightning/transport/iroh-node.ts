@@ -20,7 +20,7 @@ export async function createNodeIrohEndpoint(
 		throw new Error('Iroh secret key must be 32 bytes');
 	let binding: typeof Binding;
 	try {
-		binding = require('@number0/iroh') as typeof Binding;
+		binding = require('@number0/iroh/index.js') as typeof Binding;
 	} catch {
 		throw new Error(
 			'Iroh requires the optional @number0/iroh binding and Node >= 20.3'
@@ -108,6 +108,7 @@ class NodeIrohEndpoint implements IIrohEndpoint {
 			throw new Error('Iroh endpoint is closed');
 		}
 		try {
+			limitIncomingStreams(connection, false);
 			const stream = await withDeadline(connection.openBi(), timeoutMs);
 			return adapt(connection, stream);
 		} catch (err) {
@@ -181,9 +182,9 @@ class NodeIrohEndpoint implements IIrohEndpoint {
 				return;
 			}
 			this.handshakes.add(connection);
-			connection.setMaxConcurrentBiStreams(1n);
-			connection.setMaxConcurrentUniStreams(0n);
+			limitIncomingStreams(connection, true);
 			const stream = await withDeadline(connection.acceptBi(), timeout);
+			rejectUnexpectedStream(connection, connection.acceptBi());
 			if (!this.onConnection || epoch !== this.epoch || this.closed) {
 				closeConnection(connection);
 				return;
@@ -196,6 +197,28 @@ class NodeIrohEndpoint implements IIrohEndpoint {
 			if (connection) this.handshakes.delete(connection);
 		}
 	}
+}
+
+function limitIncomingStreams(
+	connection: Binding.Connection,
+	acceptFirstBi: boolean
+): void {
+	connection.setMaxConcurrentBiStreams(acceptFirstBi ? 1n : 0n);
+	connection.setMaxConcurrentUniStreams(0n);
+	// Credits advertised during the handshake cannot be retracted. Close on
+	// any unexpected stream instead of leaving its native buffers unread.
+	rejectUnexpectedStream(connection, connection.acceptUni());
+	if (!acceptFirstBi) rejectUnexpectedStream(connection, connection.acceptBi());
+}
+
+function rejectUnexpectedStream(
+	connection: Binding.Connection,
+	stream: Promise<unknown>
+): void {
+	void stream.then(
+		() => connection.close(1n, Array.from(Buffer.from('Unexpected stream'))),
+		() => undefined // Normal connection shutdown rejects pending accepts.
+	);
 }
 
 function adapt(

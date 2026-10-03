@@ -1283,16 +1283,16 @@ The experimental Iroh adapter carries BOLT 8 inside one QUIC bidirectional
 stream, using ALPN `beignet/bolt8/1`. Import the Node backend explicitly:
 
 ```ts
-import { LightningNode, parsePeerUri } from 'beignet/lightning';
+import { node, transport } from 'beignet/lightning';
 import { createNodeIrohEndpoint } from 'beignet/lightning/iroh-node';
 
-const node = LightningNode.fromMnemonic(mnemonic, {
+const lightning = node.LightningNode.fromMnemonic(mnemonic, {
   enableNetworking: true,
   iroh: { factory: createNodeIrohEndpoint }
 });
-await node.listenIroh();
-const peer = parsePeerUri(primaryUri);
-await node.connectPeer(peer.pubkey, peer.host, peer.port, peer.transport);
+await lightning.listenIroh();
+const peer = transport.parsePeerUri(primaryUri);
+await lightning.connectPeer(peer.pubkey, peer.host, peer.port, peer.transport);
 ```
 
 `fromMnemonic` derives the endpoint secret key using the same documented seed
