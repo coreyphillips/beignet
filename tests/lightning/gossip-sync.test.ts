@@ -984,6 +984,10 @@ describe('Gossip Sync (Phase 5)', function () {
 
 			it('asks for a batch again when its end marker never arrives', function () {
 				const mgr = new GossipSyncManager(new NetworkGraph());
+				let synced = false;
+				mgr.on('synced', () => {
+					synced = true;
+				});
 				const timeouts = timeoutsOf(mgr);
 				const first = startSync(mgr, 1500);
 
@@ -993,12 +997,16 @@ describe('Gossip Sync (Phase 5)', function () {
 				expect(timeouts).to.have.length(1);
 				expect(queried(timeouts[0])).to.eql(first);
 
-				// The re-asked reply arrived: the sync moves on.
+				// The first reply was only slow: its marker moves the sync on, and
+				// the re-asked reply's marker then closes the last batch before
+				// that batch's reply arrives.
 				expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.have.length(
 					500
 				);
 				expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
-				expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
+				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+				expect(mgr.repairPending).to.equal(true);
+				expect(synced).to.equal(false);
 				clock.tick(TIMEOUT * 3);
 				expect(timeouts).to.have.length(1);
 			});
@@ -2256,6 +2264,25 @@ describe('Gossip Sync (Phase 5)', function () {
 					const asked = queries.length;
 					await new Promise((resolve) => setTimeout(resolve, 200));
 					expect(queries).to.have.length(asked);
+				} finally {
+					statics.REPLY_TIMEOUT_MS = saved;
+				}
+			});
+
+			it('stops asking once the host is asked to close the connection (issue #1280)', async function () {
+				const statics = GossipSyncManager as unknown as {
+					REPLY_TIMEOUT_MS: number;
+				};
+				const saved = statics.REPLY_TIMEOUT_MS;
+				statics.REPLY_TIMEOUT_MS = 50;
+				try {
+					startSync(1500);
+					(
+						node as unknown as { requestPeerDisconnect(pubkey: string): void }
+					).requestPeerDisconnect(peerPubkey);
+					await new Promise((resolve) => setTimeout(resolve, 200));
+					expect(queries).to.have.length(1);
+					expect(node.getGossipSyncState(peerPubkey)).to.equal(null);
 				} finally {
 					statics.REPLY_TIMEOUT_MS = saved;
 				}

@@ -5878,6 +5878,7 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 		this.channelManager.handlePeerDisconnected(peerPubkey);
+		this.dropGossipSync(peerPubkey);
 		this.notifyPeerDisconnectRequestObservers(peerPubkey);
 	}
 
@@ -7016,12 +7017,7 @@ export class LightningNode extends EventEmitter {
 		this.peerManager.on('peer:disconnect', (pubkey: string) => {
 			this.guardianHost?.sessionClosed(pubkey);
 			this.channelManager.handlePeerDisconnected(pubkey);
-			const syncMgr = this.gossipSyncManagers.get(pubkey);
-			if (syncMgr?.repairPending) {
-				this.gossipRepairPending = true;
-			}
-			syncMgr?.stop();
-			this.gossipSyncManagers.delete(pubkey);
+			this.dropGossipSync(pubkey);
 			this.rateLimiter.removePeer(pubkey);
 			this.notifyPeerDisconnectObservers(pubkey);
 		});
@@ -15942,6 +15938,16 @@ export class LightningNode extends EventEmitter {
 		});
 		this.gossipSyncManagers.set(pubkey, mgr);
 		return mgr;
+	}
+
+	/** End a peer's sync with its connection, keeping any repair it owed. */
+	private dropGossipSync(pubkey: string): void {
+		const syncMgr = this.gossipSyncManagers.get(pubkey);
+		if (syncMgr?.repairPending) {
+			this.gossipRepairPending = true;
+		}
+		syncMgr?.stop();
+		this.gossipSyncManagers.delete(pubkey);
 	}
 
 	/**

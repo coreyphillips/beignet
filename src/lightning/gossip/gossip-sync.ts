@@ -485,6 +485,11 @@ export class GossipSyncManager extends EventEmitter {
 			if (this._batchAttempts < MAX_BATCH_ATTEMPTS) {
 				// The re-asked reply covers whatever the intake lost.
 				this._batchLost = false;
+				// The first reply may still come, and its end marker would then
+				// close a later batch before that batch's reply arrives, so this
+				// sync cannot end SYNCED.
+				this._incomplete = true;
+				this._repairPending = true;
 				messages = this._sendNextScidQuery();
 			} else {
 				// The peer stopped answering. Part of the batch may have
