@@ -15933,9 +15933,11 @@ export class LightningNode extends EventEmitter {
 		const existing = this.gossipSyncManagers.get(pubkey);
 		if (existing) return existing;
 		const mgr = new GossipSyncManager(this.graph, this.chainHash());
-		mgr.on('timeout', (queries: IGossipSyncMessage[]) => {
+		const send = (queries: IGossipSyncMessage[]): void => {
 			this.sendGossipQueriesAfterIntake(pubkey, mgr, queries);
-		});
+		};
+		mgr.on('timeout', send);
+		mgr.on('retry', send);
 		this.gossipSyncManagers.set(pubkey, mgr);
 		return mgr;
 	}
