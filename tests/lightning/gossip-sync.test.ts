@@ -27,7 +27,8 @@ import {
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
 	INodeAnnouncementMessage,
-	IReplyChannelRangeMessage
+	IReplyChannelRangeMessage,
+	IReplyShortChannelIdsEndMessage
 } from '../../src/lightning/gossip/types';
 import {
 	decodeChannelAnnouncementMessage,
@@ -876,19 +877,6 @@ describe('Gossip Sync (Phase 5)', function () {
 			expect(synced).to.equal(false);
 		});
 
-		it('asks for a batch again when the responder reports it incomplete', function () {
-			const mgr = new GossipSyncManager(new NetworkGraph());
-			const first = startSync(mgr, 1500);
-
-			const partial = { ...END, complete: false };
-			expect(queried(mgr.handleReplyShortChannelIdsEnd(partial))).to.eql(first);
-			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.have.length(
-				500
-			);
-			expectStoreFilter(mgr.handleReplyShortChannelIdsEnd(END));
-			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
-		});
-
 		it('asks for every channel after losing gossip before the range reply', function () {
 			const graph = new NetworkGraph();
 			const known = populateGraph(graph, 3).map((s) => s.toString('hex'));
@@ -1132,6 +1120,147 @@ describe('Gossip Sync (Phase 5)', function () {
 				mgr.stop();
 				clock.tick(TIMEOUT * 3);
 				expect(timeouts).to.have.length(0);
+			});
+		});
+
+		describe('replies the responder left incomplete (issue #1282)', function () {
+			const WINDOW = NetworkGraph.SERVE_VERIFY_WINDOW_MS;
+			const PARTIAL = { ...END, complete: false };
+			let clock: sinon.SinonFakeTimers;
+
+			beforeEach(function () {
+				clock = sinon.useFakeTimers({
+					now: Date.now(),
+					toFake: ['setTimeout', 'clearTimeout', 'Date']
+				});
+			});
+
+			afterEach(function () {
+				clock.restore();
+			});
+
+			function retriesOf(mgr: GossipSyncManager): IGossipSyncMessage[][] {
+				const seen: IGossipSyncMessage[][] = [];
+				mgr.on('retry', (queries: IGossipSyncMessage[]) => seen.push(queries));
+				return seen;
+			}
+
+			it('asks for the batch again one serve window later', function () {
+				const mgr = new GossipSyncManager(new NetworkGraph());
+				const retries = retriesOf(mgr);
+				const first = startSync(mgr, 1500);
+
+				expect(mgr.handleReplyShortChannelIdsEnd(PARTIAL)).to.eql([]);
+				expect(mgr.getState()).to.equal(GossipSyncState.AWAITING_SCID_REPLY);
+				clock.tick(WINDOW - 1);
+				expect(retries).to.have.length(0);
+				clock.tick(1);
+				expect(retries).to.have.length(1);
+				expect(queried(retries[0])).to.eql(first);
+
+				expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.have.length(
+					500
+				);
+				expectStoreFilter(mgr.handleReplyShortChannelIdsEnd(END));
+				expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
+			});
+
+			it('syncs from a responder whose budget is spent for one window', function () {
+				const responderGraph = new NetworkGraph();
+				const scid = makeScid(100_000, 1, 0);
+				responderGraph.addChannelAnnouncement(
+					makeSignedChannelAnnouncement(scid, makeSignedChannelKeys()).msg,
+					{ verified: 'deferred' }
+				);
+				const seam = responderGraph as unknown as {
+					_serveVerifyWindowStart: number;
+					_serveVerifySpentMs: number;
+				};
+				seam._serveVerifyWindowStart = Date.now();
+				seam._serveVerifySpentMs = NetworkGraph.SERVE_VERIFY_BUDGET_MS;
+				const responder = new GossipSyncManager(responderGraph);
+				const requester = new GossipSyncManager(new NetworkGraph());
+				const retries = retriesOf(requester);
+
+				function serve(query: IGossipSyncMessage): {
+					announced: number;
+					end: IReplyShortChannelIdsEndMessage;
+				} {
+					const reply = responder.handleQueryShortChannelIds(
+						decodeQueryShortChannelIdsMessage(query.payload)
+					);
+					return {
+						announced: reply.filter(
+							(m) => m.type === MessageType.CHANNEL_ANNOUNCEMENT
+						).length,
+						end: decodeReplyShortChannelIdsEndMessage(
+							reply[reply.length - 1].payload
+						)
+					};
+				}
+
+				const rangeQuery = requester.initiateSync()[1];
+				const [rangeReply] = responder.handleQueryChannelRange(
+					decodeQueryChannelRangeMessage(rangeQuery.payload)
+				);
+				const [batch] = requester.handleReplyChannelRange(
+					decodeReplyChannelRangeMessage(rangeReply.payload)
+				);
+
+				const starved = serve(batch);
+				expect(starved.announced).to.equal(0);
+				expect(starved.end.complete).to.equal(false);
+				// Asked again now, the batch would meet the same spent budget.
+				expect(requester.handleReplyShortChannelIdsEnd(starved.end)).to.eql([]);
+
+				clock.tick(WINDOW);
+				expect(retries).to.have.length(1);
+				const served = serve(retries[0][0]);
+				expect(served.announced).to.equal(1);
+				expect(served.end.complete).to.equal(true);
+				expectStoreFilter(requester.handleReplyShortChannelIdsEnd(served.end));
+				expect(requester.getState()).to.equal(GossipSyncState.SYNCED);
+			});
+
+			it('gives up on the batch after three incomplete replies', function () {
+				const mgr = new GossipSyncManager(new NetworkGraph());
+				const retries = retriesOf(mgr);
+				startSync(mgr, 1500);
+
+				for (let i = 0; i < 2; i++) {
+					expect(mgr.handleReplyShortChannelIdsEnd(PARTIAL)).to.eql([]);
+					clock.tick(WINDOW);
+				}
+				expect(retries).to.have.length(2);
+				expect(
+					queried(mgr.handleReplyShortChannelIdsEnd(PARTIAL))
+				).to.have.length(500);
+				expectStoreFilter(mgr.handleReplyShortChannelIdsEnd(END));
+				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+				expect(mgr.repairPending).to.equal(true);
+			});
+
+			it('drops an end marker that arrives while the retry waits', function () {
+				const mgr = new GossipSyncManager(new NetworkGraph());
+				const retries = retriesOf(mgr);
+				const first = startSync(mgr, 1500);
+
+				mgr.handleReplyShortChannelIdsEnd(PARTIAL);
+				expect(mgr.handleReplyShortChannelIdsEnd(END)).to.eql([]);
+				clock.tick(WINDOW);
+				expect(retries).to.have.length(1);
+				expect(queried(retries[0])).to.eql(first);
+			});
+
+			it('stops waiting once stopped', function () {
+				const mgr = new GossipSyncManager(new NetworkGraph());
+				const retries = retriesOf(mgr);
+				startSync(mgr, 10);
+
+				mgr.handleReplyShortChannelIdsEnd(PARTIAL);
+				mgr.stop();
+				clock.tick(WINDOW * 3);
+				expect(retries).to.have.length(0);
 			});
 		});
 	});
@@ -2212,13 +2341,13 @@ describe('Gossip Sync (Phase 5)', function () {
 				);
 			}
 
-			function sendEnd(): void {
+			function sendEnd(complete = true): void {
 				node.handlePeerMessage(
 					peerPubkey,
 					MessageType.REPLY_SHORT_CHANNEL_IDS_END,
 					encodeReplyShortChannelIdsEndMessage({
 						chainHash: REGTEST_CHAIN_HASH,
-						complete: true
+						complete
 					})
 				);
 			}
@@ -2264,6 +2393,22 @@ describe('Gossip Sync (Phase 5)', function () {
 					);
 				} finally {
 					statics.GOSSIP_INTAKE_MAX = saved;
+				}
+			});
+
+			it('asks for a batch again one serve window after the responder reports it incomplete (issue #1282)', async function () {
+				const saved = NetworkGraph.SERVE_VERIFY_WINDOW_MS;
+				NetworkGraph.SERVE_VERIFY_WINDOW_MS = 50;
+				try {
+					startSync(1500);
+					sendEnd(false);
+					await new Promise((resolve) => setTimeout(resolve, 10));
+					expect(queries).to.have.length(1);
+
+					await waitFor(() => queries.length === 2);
+					expect(queries[1]).to.eql(queries[0]);
+				} finally {
+					NetworkGraph.SERVE_VERIFY_WINDOW_MS = saved;
 				}
 			});
 

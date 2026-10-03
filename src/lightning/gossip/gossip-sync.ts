@@ -8,7 +8,9 @@
  *      query_channel_range
  *   2. handleReplyChannelRange() → accumulate SCIDs until syncComplete
  *   3. handleReplyShortChannelIdsEnd() → re-ask a lost batch, send the next
- *      one, or → SYNCED (IDLE when a batch was given up on)
+ *      one, or → SYNCED (IDLE when a batch was given up on). A batch the
+ *      responder reported incomplete is re-asked one serve window later
+ *      (emits 'retry').
  *   A reply that does not arrive in time is asked for again, and the sync
  *   ends IDLE once the attempts run out (emits 'timeout' either way).
  *   However the sync ends, it widens the filter to the peer's whole store.
@@ -105,6 +107,8 @@ export class GossipSyncManager extends EventEmitter {
 	private _batchAttempts = 0;
 	private _rangeAttempts = 0;
 	private _replyTimer: ReturnType<typeof setTimeout> | null = null;
+	/** Re-asks for a batch the responder reported incomplete. */
+	private _retryTimer: ReturnType<typeof setTimeout> | null = null;
 	/** Part of the in-flight batch's reply was dropped or left out. */
 	private _batchLost = false;
 	/** A batch of this sync was given up on, so it cannot end SYNCED. */
@@ -160,6 +164,7 @@ export class GossipSyncManager extends EventEmitter {
 		// again for a channel outside it. _endSync asks for the store.
 		messages.push(this._timestampFilter(Math.floor(Date.now() / 1000)));
 
+		this._clearRetryTimer();
 		this._clearRangeScids();
 		this._rangeAttempts = 0;
 		messages.push(...this._sendRangeQuery());
@@ -167,11 +172,12 @@ export class GossipSyncManager extends EventEmitter {
 	}
 
 	/**
-	 * Stop waiting for a reply. Called when the manager is dropped with its
-	 * connection.
+	 * Stop waiting for a reply or a retry. Called when the manager is dropped
+	 * with its connection.
 	 */
 	stop(): void {
 		this._clearReplyTimer();
+		this._clearRetryTimer();
 	}
 
 	/**
@@ -256,23 +262,33 @@ export class GossipSyncManager extends EventEmitter {
 
 	/**
 	 * Handle reply_short_channel_ids_end from peer.
-	 * Asks for the batch again if the intake lost part of its reply, else
-	 * sends the next batch or ends the sync. A marker with no batch in
-	 * flight, such as one arriving after its sync timed out, is dropped so it
-	 * cannot end a later sync.
+	 * Asks for the batch again if the intake lost part of its reply, or one
+	 * serve window later if the responder left part of it out, else sends
+	 * the next batch or ends the sync. A marker with no batch in flight, such
+	 * as one arriving after its sync timed out or while a retry waits, is
+	 * dropped so it cannot end a later sync.
 	 */
 	handleReplyShortChannelIdsEnd(
 		msg: IReplyShortChannelIdsEndMessage
 	): IGossipSyncMessage[] {
-		if (this._state !== GossipSyncState.AWAITING_SCID_REPLY) return [];
-		this._clearReplyTimer();
-		// full_information 0: the responder left part of the reply out.
-		if (!msg.complete) {
-			this._batchLost = true;
+		if (
+			this._state !== GossipSyncState.AWAITING_SCID_REPLY ||
+			this._retryTimer
+		) {
+			return [];
 		}
-		if (this._batchLost) {
+		this._clearReplyTimer();
+		if (this._batchLost || !msg.complete) {
 			this._batchLost = false;
 			if (this._batchAttempts < MAX_BATCH_ATTEMPTS) {
+				// full_information 0: the responder left part of the reply out.
+				// Ours does once its verification budget for the window is
+				// spent, and a batch asked for again at once lands in that same
+				// window.
+				if (!msg.complete) {
+					this._retryAfterServeWindow();
+					return [];
+				}
 				return this._sendNextScidQuery();
 			}
 			this._incomplete = true;
@@ -462,6 +478,28 @@ export class GossipSyncManager extends EventEmitter {
 		if (this._replyTimer) {
 			clearTimeout(this._replyTimer);
 			this._replyTimer = null;
+		}
+	}
+
+	/**
+	 * Ask for the batch again once a beignet responder's verification budget
+	 * has renewed. What it verified for the last reply stays verified, so
+	 * each attempt gets further.
+	 */
+	private _retryAfterServeWindow(): void {
+		this._retryTimer = setTimeout(() => {
+			this._retryTimer = null;
+			// The re-asked reply covers whatever the intake lost meanwhile.
+			this._batchLost = false;
+			this.emit('retry', this._sendNextScidQuery());
+		}, NetworkGraph.SERVE_VERIFY_WINDOW_MS);
+		this._retryTimer.unref?.();
+	}
+
+	private _clearRetryTimer(): void {
+		if (this._retryTimer) {
+			clearTimeout(this._retryTimer);
+			this._retryTimer = null;
 		}
 	}
 
