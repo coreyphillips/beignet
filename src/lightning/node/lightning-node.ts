@@ -7,6 +7,12 @@
  */
 
 import {
+	deriveIrohSecretKey,
+	formatIrohAddress,
+	normalizeIrohEndpointId,
+	validateIrohRelayUrl
+} from '../transport/iroh';
+import {
 	archiveFforVouchers,
 	IFforVoucherArchive,
 	fforVoucherArchiveId,
@@ -2351,7 +2357,8 @@ export class LightningNode extends EventEmitter {
 					this.channelManager.getChannelsByPeer(pubkey).length > 0,
 				socks5Proxy: config.socks5Proxy,
 				socks5ProxyScope: this.socks5ProxyScope,
-				webSocketImpl: config.webSocketImpl
+				webSocketImpl: config.webSocketImpl,
+				iroh: config.iroh
 			});
 			this.channelManager.attachToPeerManager(this.peerManager);
 			// The socket boundary answers to the startup quarantine gate
@@ -6974,7 +6981,13 @@ export class LightningNode extends EventEmitter {
 			const addr = this.peerManager.getPeerAddress(pubkey);
 			if (addr) {
 				this.safeStorage(
-					() => this.storage!.savePeerAddress(pubkey, addr.host, addr.port),
+					() =>
+						this.storage!.savePeerAddress(
+							pubkey,
+							addr.host,
+							addr.port,
+							addr.transport
+						),
 					'savePeerAddress'
 				);
 			}
@@ -7184,12 +7197,12 @@ export class LightningNode extends EventEmitter {
 		let delay = 0;
 		const STAGGER_MS = 500;
 
-		for (const { pubkey, host, port } of peersToConnect) {
+		for (const { pubkey, host, port, transport } of peersToConnect) {
 			const pm = this.peerManager;
 			const timer = setTimeout(() => {
 				this._reconnectTimers.delete(timer);
 				if (this._destroyed) return;
-				pm.connectPeer(pubkey, host, port)
+				pm.connectPeer(pubkey, host, port, transport)
 					.catch((err) => {
 						this.emit('node:error', {
 							code: 'AUTO_RECONNECT_FAILED',
@@ -7221,15 +7234,21 @@ export class LightningNode extends EventEmitter {
 		pubkey: string;
 		host: string;
 		port: number;
+		transport?: IPeerTransportOptions;
 	}> {
 		const byPubkey = new Map<
 			string,
-			{ pubkey: string; host: string; port: number }
+			{
+				pubkey: string;
+				host: string;
+				port: number;
+				transport?: IPeerTransportOptions;
+			}
 		>();
 		for (const row of this.storage!.loadAllPeerAddresses()) {
 			const pubkey = normalizeHexPubkey(row.pubkey);
 			if (row.pubkey !== pubkey && byPubkey.has(pubkey)) continue;
-			byPubkey.set(pubkey, { pubkey, host: row.host, port: row.port });
+			byPubkey.set(pubkey, { ...row, pubkey });
 		}
 		return [...byPubkey.values()];
 	}
@@ -8283,7 +8302,16 @@ export class LightningNode extends EventEmitter {
 		if (this.storage) {
 			for (const addr of this.loadPeerAddresses()) {
 				const list = peerAddresses.get(addr.pubkey) ?? [];
-				list.push(`${addr.host}:${addr.port}`);
+				list.push(
+					addr.transport?.type === 'iroh'
+						? formatIrohAddress({
+								endpointId: addr.transport.endpointId ?? addr.host,
+								relayUrl: addr.transport.relayUrl
+						  })
+						: addr.transport?.type === 'ws' && addr.transport.url
+						? addr.transport.url
+						: `${addr.host}:${addr.port}`
+				);
 				peerAddresses.set(addr.pubkey, list);
 			}
 		}
@@ -8414,7 +8442,8 @@ export class LightningNode extends EventEmitter {
 					this.storage.savePeerAddress(
 						entry.peerNodeId,
 						dialCandidate.host,
-						dialCandidate.port
+						dialCandidate.port,
+						dialCandidate.transport
 					);
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
@@ -8587,7 +8616,7 @@ export class LightningNode extends EventEmitter {
 	 */
 	private firstDialableRecoveryAddress(
 		addresses: string[]
-	): { host: string; port: number } | null {
+	): { host: string; port: number; transport?: IPeerTransportOptions } | null {
 		for (const address of addresses) {
 			const parsed = parseScbAddress(address);
 			if (parsed) return parsed;
@@ -8604,7 +8633,12 @@ export class LightningNode extends EventEmitter {
 			const parsed = parseScbAddress(address);
 			if (!parsed) continue;
 			try {
-				await this.connectPeer(peerNodeId, parsed.host, parsed.port);
+				await this.connectPeer(
+					peerNodeId,
+					parsed.host,
+					parsed.port,
+					parsed.transport
+				);
 				return;
 			} catch {
 				// Try the next address; unreachable peers are expected here.
@@ -8941,6 +8975,52 @@ export class LightningNode extends EventEmitter {
 		const pubkeyErr = validateHexPubkey(pubkey, 'pubkey');
 		if (pubkeyErr) throw new InvalidPeerConnectError(pubkeyErr);
 		pubkey = normalizeHexPubkey(pubkey);
+		if (transport && !['tcp', 'ws', 'iroh'].includes(transport.type))
+			throw new InvalidPeerConnectError('Unknown peer transport');
+		if (transport?.type === 'iroh') {
+			if (!this.peerManager.isIrohEnabled())
+				throw new InvalidPeerConnectError(
+					'Iroh is not enabled; configure an Iroh endpoint factory'
+				);
+			const fallback = transport.fallbackOnion;
+			if (
+				fallback &&
+				(!/^[a-z2-7]{56}\.onion$/i.test(fallback.host) ||
+					!Number.isInteger(fallback.port) ||
+					fallback.port < 1 ||
+					fallback.port > 65535)
+			)
+				throw new InvalidPeerConnectError(
+					'Invalid Iroh fallback onion address'
+				);
+			let endpointId: string;
+			let relayUrl: string | undefined;
+			try {
+				endpointId = normalizeIrohEndpointId(
+					transport.endpointId ?? host ?? ''
+				);
+				relayUrl =
+					transport.relayUrl === undefined
+						? undefined
+						: validateIrohRelayUrl(transport.relayUrl);
+				if (
+					(host !== undefined &&
+						normalizeIrohEndpointId(host) !== endpointId) ||
+					(port !== undefined && port !== 0)
+				)
+					throw new Error('Iroh uses an endpoint id and port 0');
+			} catch (err) {
+				throw new InvalidPeerConnectError((err as Error).message);
+			}
+			await this.peerManager.connectPeer(
+				pubkey,
+				endpointId,
+				0,
+				{ ...transport, endpointId, ...(relayUrl ? { relayUrl } : {}) },
+				options
+			);
+			return;
+		}
 		if (transport?.type === 'ws' && transport.url !== undefined) {
 			// Derive the dial address from the explicit URL (and reject a
 			// mismatched host/port pair to avoid ambiguous bookkeeping).
@@ -9182,9 +9262,19 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Start listening for inbound peers over WebSocket (opt-in; coexists with
-	 * the TCP listener started via listen()).
+	 * Start the opt-in Iroh listener alongside any TCP or WebSocket listener.
 	 */
+	async listenIroh(): Promise<void> {
+		if (!this.peerManager) throw new Error('Networking is not enabled');
+		this.assertPeerContactPermitted('listenIroh');
+		await this.peerManager.listenIroh();
+	}
+
+	getIrohConnectionString(): string | undefined {
+		return this.peerManager?.getIrohConnectionString();
+	}
+
+	/** Start the opt-in WebSocket listener alongside TCP. */
 	async listenWebSocket(port: number, host?: string): Promise<void> {
 		if (!this.peerManager) {
 			throw new Error('Networking is not enabled');
@@ -9194,7 +9284,7 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Stop listening for inbound connections (TCP and WebSocket).
+	 * Stop listening for inbound connections (TCP, WebSocket and Iroh).
 	 */
 	stopListening(): void {
 		if (this.peerManager) {
@@ -28897,6 +28987,7 @@ export class LightningNode extends EventEmitter {
 			socks5ProxyScope?: Socks5ProxyScope;
 			maxInboundPeers?: number;
 			webSocketImpl?: import('../transport/websocket').WebSocketConstructor;
+			iroh?: Omit<import('../transport/iroh').IIrohConfig, 'secretKey'>;
 			preferAnchors?: boolean;
 			largeChannels?: boolean;
 			chainBackend?: import('../chain/chain-watcher').IChainBackend;
@@ -28997,6 +29088,14 @@ export class LightningNode extends EventEmitter {
 			socks5ProxyScope: options?.socks5ProxyScope,
 			maxInboundPeers: options?.maxInboundPeers,
 			webSocketImpl: options?.webSocketImpl,
+			iroh: options?.iroh
+				? {
+						...options.iroh,
+						secretKey: deriveIrohSecretKey(
+							bip39.mnemonicToSeedSync(mnemonic, options?.passphrase)
+						)
+				  }
+				: undefined,
 			preferAnchors: options?.preferAnchors,
 			largeChannels: options?.largeChannels,
 			chainBackend: options?.chainBackend,

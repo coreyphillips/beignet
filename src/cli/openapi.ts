@@ -962,13 +962,16 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/peer/connect': {
 				post: {
 					summary:
-						'Connect to a peer (omit host+port to resolve the address from the gossip graph / DNS bootstrap; pass transport "ws" and/or a ws:///wss:// url to dial over WebSocket)',
+						'Connect to a peer (omit host+port to resolve the address from the gossip graph / DNS bootstrap; pass transport "ws" and/or a ws:///wss:// url to dial over WebSocket; transport "iroh" requires endpointId and optionally relayUrl)',
 					tags: ['Peers'],
 					requestBody: bodyContent({
 						pubkey: 'string',
 						host: 'string?',
 						port: 'number?',
 						transport: 'string?',
+						endpointId: 'string?',
+						fallbackOnion: 'object?',
+						relayUrl: 'string?',
 						url: 'string?'
 					}),
 					responses: {
@@ -3779,7 +3782,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						listening: {
 							type: 'boolean',
 							description:
-								'True while an inbound listener (TCP or WebSocket) is bound'
+								'True while an inbound listener (TCP, WebSocket or Iroh) is bound'
 						},
 						listenPort: {
 							type: 'integer',
@@ -3794,6 +3797,15 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description:
 								'The WebSocket listener port, present only while it is bound'
 						},
+						irohAvailable: {
+							type: 'boolean',
+							description: 'Engine supports the optional Iroh transport'
+						},
+						irohUri: {
+							type: 'string',
+							description: 'Iroh connection string, present while listening'
+						},
+						irohListenError: { $ref: '#/components/schemas/ListenerProblem' },
 						websocketListenError: {
 							$ref: '#/components/schemas/ListenerProblem'
 						}
@@ -3949,6 +3961,15 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				PeerInfo: {
 					type: 'object',
 					properties: {
+						transport: { type: 'string', enum: ['tcp', 'ws', 'iroh'] },
+						iroh: {
+							type: 'object',
+							properties: {
+								endpointId: { type: 'string' },
+								path: { type: 'string', enum: ['direct', 'relay', 'unknown'] },
+								rttMs: { type: 'number' }
+							}
+						},
 						pubkey: { type: 'string' },
 						host: { type: 'string' },
 						port: { type: 'integer' },

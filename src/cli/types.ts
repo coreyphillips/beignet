@@ -3,6 +3,8 @@
  * All IDs are hex strings, all amounts are numbers in satoshis.
  */
 
+import type { IrohDaemonConfig } from './iroh-config';
+import type { IIrohDiagnostics } from '../lightning/transport/iroh';
 import { TLogLevel } from '../logger';
 import type { IGuardianConfigEntry } from '../lightning/recovery/assembly';
 import type {
@@ -11,6 +13,11 @@ import type {
 } from '../lightning/node/types';
 
 export interface NodeInfo {
+	/** True when this engine includes the opt-in Iroh integration. */
+	irohAvailable?: boolean;
+	/** Present only while accepting Iroh peers. */
+	irohUri?: string;
+	irohListenError?: ListenerProblem;
 	nodeId: string;
 	alias?: string;
 	network: string;
@@ -48,7 +55,7 @@ export interface NodeInfo {
 	/** Channels not in a terminal state (CLOSED, FORCE_CLOSED, ERRORED). */
 	openChannelCount: number;
 	peerCount: number;
-	/** True while an inbound listener (TCP or WebSocket) is bound. */
+	/** True while an inbound listener (TCP, WebSocket or Iroh) is bound. */
 	listening: boolean;
 	/**
 	 * The TCP listen port this node was asked for, present whenever one was
@@ -85,6 +92,8 @@ export interface ListenerProblem {
 export type PeerState = 'ready' | 'connected' | 'connecting' | 'disconnected';
 
 export interface PeerInfo {
+	transport?: 'tcp' | 'ws' | 'iroh';
+	iroh?: IIrohDiagnostics;
 	pubkey: string;
 	host: string;
 	port: number;
@@ -742,7 +751,7 @@ export interface Bolt12InvoiceInfo {
 	relativeExpiry?: number;
 }
 
-export interface BeignetConfig {
+export interface BeignetConfig extends IrohDaemonConfig {
 	mnemonic?: string;
 	network?: 'mainnet' | 'testnet' | 'regtest' | 'signet';
 	alias?: string;

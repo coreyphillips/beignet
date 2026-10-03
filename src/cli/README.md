@@ -2110,6 +2110,86 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_DF_RELAY` | Relay direct-funding frames for OTHER nodes (`true`/`false`, default off). Paying and being paid needs nothing switched on; this is work done for strangers, metered but not free |
 | `BEIGNET_DF_MIN_AMOUNT` | Smallest direct-funding offer this node serves, a whole number of satoshis. Clamps up to the 5000 sat protocol floor; a partly numeric value refuses startup |
 
+### Experimental Iroh phone link
+
+`BEIGNET_IROH=true` enables an additional Iroh listener and outbound dialer. TCP,
+Tor, Hybrid routing and WebSocket settings continue to apply to other peers.
+Iroh requires the optional `@number0/iroh` package and Node 20.3 or later. A failed
+native installation leaves ordinary networking available; enabling Iroh then
+reports `irohListenError` on `/info`.
+
+This is opt-in and is intended for a phone connecting to its owner's primary
+node. It provides encryption, not anonymity: the peer can see your IP address,
+and a relay can see endpoint identities, IP addresses, timing and traffic volume.
+The relay cannot read BOLT 8 plaintext. Keep Tor for peers where you need to hide
+your IP address. There is no automatic switch of existing peers to Iroh.
+
+| Environment variable | Meaning |
+| --- | --- |
+| `BEIGNET_IROH` | Exactly `true` enables the experimental transport; unset or `false` leaves it off |
+| `BEIGNET_IROH_RELAYS` | Comma-separated HTTP(S) relay URLs replacing n0's public defaults; an empty value disables relays |
+| `BEIGNET_IROH_DISCOVERY` | Exactly `false` disables public endpoint discovery and publication; defaults to `true` when Iroh is enabled |
+
+The corresponding config keys are `iroh`, `irohRelays` and `irohDiscovery`.
+Discovery and relay selection are independent. To avoid public discovery and
+public relays, disable discovery and provide your own relay URLs. With discovery
+disabled, a dial requires a relay hint, and `/info` waits for a home relay before
+publishing the URI. No inbound port mapping or router forwarding is required.
+
+`GET /info` includes `irohAvailable: true` for engines with this integration, plus
+`irohUri` while an Iroh connection string is available. The URI has the form:
+
+```text
+<lightning-pubkey>@iroh:<endpoint-id>?relay=<url-encoded-relay-url>
+```
+
+The endpoint id is 32 bytes in hexadecimal; the parser also accepts Iroh's
+unpadded base32 form. The relay hint is optional when discovery is enabled.
+The endpoint key is HKDF-SHA256 of the BIP39 seed, with a 32-byte zero salt and
+UTF-8 info `beignet/iroh/identity/v1`, producing 32 bytes. It is independent of
+the Lightning private key and survives a mnemonic restore, including the same
+BIP39 passphrase. The connection still authenticates the Lightning pubkey with
+BOLT 8 inside the QUIC stream.
+
+```sh
+BEIGNET_IROH=true beignet start
+beignet peer connect '<lightning-pubkey>@iroh:<endpoint-id>'
+```
+
+The API accepts the same address as structured fields:
+
+```json
+{
+  "pubkey": "<lightning-pubkey>",
+  "transport": "iroh",
+  "endpointId": "<endpoint-id>",
+  "relayUrl": "https://relay.example/"
+}
+```
+
+Post this to `/peer/connect`. Omit `host` and `port`, or use the endpoint id as
+`host` and `0` as `port`. An optional `fallbackOnion: { "host": "<v3-id>.onion",
+"port": 9735 }` identifies an onion address for the same Lightning pubkey.
+The dial starts Iroh first and starts the configured SOCKS5/Tor connection after
+1.5 seconds, or immediately if Iroh fails. It runs BOLT 8 only on the first
+socket to connect and closes a late losing socket. A connected socket that
+subsequently fails authentication does not trigger the other transport.
+
+`GET /peers` includes `transport: "iroh"` and `iroh: { endpointId, path, rttMs }`.
+`path` is `direct`, `relay` or `unknown`; RTT is omitted until available. Tor
+fallback reports `transport: "tcp"`. The saved preferred address remains Iroh,
+including its optional onion fallback, so reconnects try Iroh first again.
+Iroh addresses are retained in channel backups and never published in gossip.
+Backup address strings carry the endpoint and relay; reconfigure the optional
+onion fallback after restoring a backup.
+
+The adapter and Node integration have local QUIC, handshake, channel payment,
+reconnect, storage, configuration and API tests. Funding in the local channel
+test is simulated. Live relay-only payments, the mid-payment network-cut sweep,
+long outage timing, and real Umbrel and phone lifecycle tests remain release
+validation work. Umbrel's per-wallet switch and Connect card, and Chicory's
+native mobile bridge and primary settings, are separate companion changes.
+
 ### Tor proxy
 
 `BEIGNET_TOR_PROXY` (`--tor-proxy`, config key `torProxy`) sets the SOCKS5

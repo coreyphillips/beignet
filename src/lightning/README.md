@@ -1276,3 +1276,43 @@ Interop tests and the `recovery-phase7-*` kill matrices are excluded from `npm r
 | bLIP-51 | Liquidity Ads | lease_rates, request_funds, will_fund, lease fee accounting, CLTV-locked lessor output |
 
 Validated against the official BOLT vectors (`npm run test:conformance`) and against live LND, Core Lightning and Eclair (`npm run test:interop`). Not implemented: trampoline routing, LSPS0/1/2, watchtower server mode. See the root README's [status and limitations](../../README.md#status--limitations) for caveats that apply per feature.
+
+### Iroh transport injection
+
+The experimental Iroh adapter carries BOLT 8 inside one QUIC bidirectional
+stream, using ALPN `beignet/bolt8/1`. Import the Node backend explicitly:
+
+```ts
+import { node, transport } from 'beignet/lightning';
+import { createNodeIrohEndpoint } from 'beignet/lightning/iroh-node';
+
+const lightning = node.LightningNode.fromMnemonic(mnemonic, {
+  enableNetworking: true,
+  iroh: { factory: createNodeIrohEndpoint }
+});
+await lightning.listenIroh();
+const peer = transport.parsePeerUri(primaryUri);
+await lightning.connectPeer(peer.pubkey, peer.host, peer.port, peer.transport);
+```
+
+`fromMnemonic` derives the endpoint secret key using the same documented seed
+label as the daemon. Direct `new LightningNode(config)` callers provide
+`config.iroh.secretKey` themselves, derived from the wallet seed with
+`deriveIrohSecretKey`, and must not reuse a Lightning private key.
+
+Portable and mobile builds inject an `IrohEndpointFactory` implementing
+`IIrohEndpoint`. It owns endpoint binding, dialing, incoming streams and shutdown.
+Adapt native streams with `IrohTransport` and its `IIrohStream` contract. Writes
+must resolve only after the complete supplied buffer is accepted, reads return
+an empty buffer at EOF, and `closed()` resolves or rejects when the connection
+dies. `close()` must unblock pending reads and writes. The adapter orders writes,
+tracks queued bytes, buffers data between Noise readers, and closes both stream
+directions at EOF. The peer layer keeps its usual BOLT ping/pong liveness checks.
+The Node binding currently does not expose QUIC idle or keepalive tuning.
+
+The portable entry point does not load or import the native binding. A mobile
+host should create a fresh endpoint after suspension when necessary and dispose
+of the previous one, while reusing the derived identity. Iroh is opt-in per
+peer. It reveals IP addresses to peers and relays and does not provide Tor's
+anonymity. See the CLI README for relay/discovery settings, API diagnostics and
+remaining device and relay validation.

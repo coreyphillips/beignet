@@ -4,6 +4,11 @@
  * Uniform JSON envelope: { ok: true, result } or { ok: false, error: { code, message } }.
  */
 
+import { validateIrohConfig } from './iroh-config';
+import {
+	normalizeIrohEndpointId,
+	validateIrohRelayUrl
+} from '../lightning/transport/iroh';
 import * as http from 'http';
 import * as net from 'net';
 import * as https from 'https';
@@ -882,6 +887,11 @@ async function bootDaemon(
 	// Config-only checks belong here, ahead of BeignetNode.create: a typo is
 	// not worth booting a node for, and one that throws further down leaves the
 	// caller no handle to destroy.
+	try {
+		validateIrohConfig(opts);
+	} catch (err) {
+		throw new BeignetError('INVALID_PARAMS', (err as Error).message);
+	}
 	if (opts.tlsCert && !opts.tlsKey) {
 		throw new BeignetError(
 			'INVALID_PARAMS',
@@ -1754,13 +1764,19 @@ async function bootDaemon(
 				host: peerHost,
 				port: peerPort,
 				transport: peerTransport,
-				url: peerUrl
+				url: peerUrl,
+				endpointId,
+				fallbackOnion,
+				relayUrl
 			} = body as {
 				pubkey: string;
 				host?: string;
 				port?: number;
 				transport?: string;
 				url?: string;
+				endpointId?: string;
+				fallbackOnion?: { host: string; port: number };
+				relayUrl?: string;
 			};
 			if (!pubkey) return failure('INVALID_PARAMS', 'pubkey required');
 			// Additive WebSocket support: transport 'ws' and/or an explicit
@@ -1768,9 +1784,40 @@ async function bootDaemon(
 			if (
 				peerTransport !== undefined &&
 				peerTransport !== 'tcp' &&
-				peerTransport !== 'ws'
+				peerTransport !== 'ws' &&
+				peerTransport !== 'iroh'
 			)
-				return failure('INVALID_PARAMS', "transport must be 'tcp' or 'ws'");
+				return failure(
+					'INVALID_PARAMS',
+					"transport must be 'tcp', 'ws' or 'iroh'"
+				);
+			if (peerTransport === 'iroh') {
+				if (peerUrl !== undefined)
+					return failure('INVALID_PARAMS', 'Iroh does not use a WebSocket URL');
+				try {
+					normalizeIrohEndpointId(endpointId ?? peerHost ?? '');
+					if (relayUrl !== undefined) validateIrohRelayUrl(relayUrl);
+				} catch (err) {
+					return failure('INVALID_PARAMS', (err as Error).message);
+				}
+				return success(
+					await node.connectPeer(pubkey, peerHost, peerPort, {
+						type: 'iroh',
+						fallbackOnion,
+						endpointId,
+						relayUrl
+					})
+				);
+			}
+			if (
+				endpointId !== undefined ||
+				relayUrl !== undefined ||
+				fallbackOnion !== undefined
+			)
+				return failure(
+					'INVALID_PARAMS',
+					'endpointId and relayUrl require transport iroh'
+				);
 			if (peerUrl !== undefined) {
 				if (typeof peerUrl !== 'string' || !/^wss?:\/\//i.test(peerUrl))
 					return failure('INVALID_PARAMS', 'url must be a ws:// or wss:// URL');

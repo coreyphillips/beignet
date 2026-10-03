@@ -135,6 +135,7 @@ export class Peer extends EventEmitter {
 	private heldLifecycleId = 0;
 	/** The configured hold behavior, re-armed on every establishment. */
 	private readonly holdOnEstablish: boolean = false;
+
 	private socket: IDuplexTransport | null = null;
 	private transport: TransportCipher | null = null;
 	private remoteInit: IInitMessage | null = null;
@@ -183,6 +184,14 @@ export class Peer extends EventEmitter {
 		this.handshakeTimeoutMs = options.handshakeTimeout ?? 30_000;
 		this.holdOnEstablish = options.holdMessagesUntilRelease === true;
 		this.heldMessages = this.holdOnEstablish ? [] : null;
+	}
+
+	getTransportType(): 'tcp' | 'ws' | 'iroh' | undefined {
+		return this.socket?.transportType;
+	}
+
+	getIrohDiagnostics(): import('./iroh').IIrohDiagnostics | undefined {
+		return this.socket?.getIrohDiagnostics?.();
 	}
 
 	getState(): PeerState {
@@ -271,6 +280,7 @@ export class Peer extends EventEmitter {
 				});
 				await Promise.race([handshake, abortPromise]);
 				this.socket.setTimeout(0); // Clear handshake timeout
+				this.socket.markEstablished?.();
 				this.state = 'ready';
 				this.setupMessageLoop();
 				this.startPingTimer();

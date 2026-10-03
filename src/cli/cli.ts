@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { parseIrohAddress } from '../lightning/transport/iroh';
 
 /**
  * Beignet CLI: AI-friendly Bitcoin + Lightning interface.
@@ -794,7 +795,13 @@ async function handlePeer(): Promise<void> {
 				const at = target.indexOf('@');
 				const pubkey = target.slice(0, at);
 				const address = target.slice(at + 1);
-				if (/^wss?:\/\//i.test(address)) {
+				if (/^iroh:/i.test(address)) {
+					connectBody = {
+						pubkey,
+						transport: 'iroh',
+						...parseIrohAddress(address)
+					};
+				} else if (/^wss?:\/\//i.test(address)) {
 					connectBody = { pubkey, url: address };
 				} else {
 					const lastColon = address.lastIndexOf(':');
@@ -809,6 +816,12 @@ async function handlePeer(): Promise<void> {
 				/^wss?:\/\//i.test(filteredArgs[3])
 			) {
 				connectBody = { pubkey: target, url: filteredArgs[3] };
+			} else if (/^iroh:/i.test(filteredArgs[3] ?? '')) {
+				connectBody = {
+					pubkey: target,
+					transport: 'iroh',
+					...parseIrohAddress(filteredArgs[3])
+				};
 			} else if (filteredArgs[3] !== undefined) {
 				connectBody = {
 					pubkey: target,
@@ -2935,6 +2948,7 @@ Peers:
   peer connect <pubkey> <host> <port>    Connect to peer
   peer connect <pubkey> <ws://host:port> Connect over WebSocket (ws:// or wss://)
   peer connect <pubkey@[ws://]host:port> Connect by URI
+  peer connect <pubkey@iroh:endpoint-id> Connect over Iroh (experimental)
   peer disconnect <pubkey>               Disconnect peer
   peer list                              List peers
 

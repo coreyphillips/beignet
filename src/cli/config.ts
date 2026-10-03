@@ -3,6 +3,7 @@
  * Reads/writes ~/.beignet/config.json and manages daemon PID files.
  */
 
+import { irohBooleanEnv, irohRelaysEnv } from './iroh-config';
 import * as fs from 'fs';
 import * as path from 'path';
 import { BeignetConfig } from './types';
@@ -433,6 +434,12 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? parseInt(process.env.BEIGNET_LISTEN_PORT, 10)
 				: undefined) ||
 			file.listenPort,
+		iroh: cliFlags.iroh ?? irohBooleanEnv('BEIGNET_IROH') ?? file.iroh,
+		irohDiscovery:
+			cliFlags.irohDiscovery ??
+			irohBooleanEnv('BEIGNET_IROH_DISCOVERY') ??
+			file.irohDiscovery,
+		irohRelays: cliFlags.irohRelays ?? irohRelaysEnv() ?? file.irohRelays,
 		websocketPort:
 			cliFlags.websocketPort ||
 			(process.env.BEIGNET_WEBSOCKET_PORT

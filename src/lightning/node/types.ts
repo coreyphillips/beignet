@@ -578,6 +578,8 @@ export interface INodeConfig {
 	 * {type: 'ws'}; mirrors how electrumOptions injects net/tls.
 	 */
 	webSocketImpl?: WebSocketConstructor;
+	/** Opt-in Iroh endpoint, supplied by Node or a native mobile bridge. */
+	iroh?: import('../transport/iroh').IIrohConfig;
 	/**
 	 * Watchtowers to ship encrypted justice data to at every revocation, as
 	 * `pubkey@host:port` URIs (LND altruist wtwire protocol). Empty/undefined

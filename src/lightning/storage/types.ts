@@ -5,6 +5,7 @@
  * reflects the latest in-memory state.
  */
 
+import type { IPeerTransportOptions } from '../transport/duplex-transport';
 import { IFforVoucherArchive } from '../ffor/voucher-archive';
 import { IChannelState } from '../channel/channel-state';
 import { IPaymentInfo } from '../node/types';
@@ -127,8 +128,18 @@ export interface IStorageBackend {
 	loadMissionControl(): string | null;
 
 	// ─── Peer Addresses ───
-	savePeerAddress(pubkey: string, host: string, port: number): void;
-	loadAllPeerAddresses(): Array<{ pubkey: string; host: string; port: number }>;
+	savePeerAddress(
+		pubkey: string,
+		host: string,
+		port: number,
+		transport?: IPeerTransportOptions
+	): void;
+	loadAllPeerAddresses(): Array<{
+		pubkey: string;
+		host: string;
+		port: number;
+		transport?: IPeerTransportOptions;
+	}>;
 	deletePeerAddress(pubkey: string): void;
 
 	// ─── Announced Peer Addresses (optional) ───

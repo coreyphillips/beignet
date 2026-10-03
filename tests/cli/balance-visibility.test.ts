@@ -804,6 +804,7 @@ describe('pendingCloseBalanceSats hands off to the wallet at the sweep (#1065)',
 			});
 			fake.node.getCurrentBlockHeight = () => 96_828;
 			fake.node.isListening = () => false;
+			fake.node.getIrohConnectionString = () => undefined;
 			fake.node.getBalance = () => ({ localBalanceMsat: 0n });
 			fake.wallet.getBalance = () => onchain;
 			return fake.getInfo();

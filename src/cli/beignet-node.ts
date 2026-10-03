@@ -5,6 +5,8 @@
  * and ElectrumBackend behind a single class with plain JSON return types.
  */
 
+import { IrohDaemonConfig, validateIrohConfig } from './iroh-config';
+import { createNodeIrohEndpoint } from '../lightning/transport/iroh-node';
 import { OfflineReceive } from './offline-receive';
 import { FforReceiveService, FforReceiveFunding } from './ffor-receive';
 import * as path from 'path';
@@ -275,7 +277,7 @@ export interface LogEntry {
 	timestamp: number;
 }
 
-export interface BeignetNodeOptions {
+export interface BeignetNodeOptions extends IrohDaemonConfig {
 	mnemonic?: string;
 	network?: 'mainnet' | 'testnet' | 'regtest' | 'signet';
 	alias?: string;
@@ -1862,7 +1864,7 @@ interface IRecencyHold {
 }
 
 /** The inbound listeners a node can be asked to bind. */
-type ListenerKind = 'tcp' | 'websocket';
+type ListenerKind = 'tcp' | 'websocket' | 'iroh';
 
 const LISTENER_HELD_MESSAGE =
 	'held by the startup quarantine until writer ownership is confirmed ' +
@@ -1873,7 +1875,11 @@ const LISTENER_FENCED_MESSAGE =
 	'the listener stays down';
 
 function listenerLabel(kind: ListenerKind): string {
-	return kind === 'tcp' ? 'Lightning listener' : 'WebSocket listener';
+	return kind === 'tcp'
+		? 'Lightning listener'
+		: kind === 'iroh'
+		? 'Iroh listener'
+		: 'WebSocket listener';
 }
 
 export class BeignetNode extends EventEmitter {
@@ -2131,6 +2137,8 @@ export class BeignetNode extends EventEmitter {
 	/** The TCP listener's port, set only once the bind succeeded. */
 	private _listenPort?: number;
 	private _websocketPort?: number;
+	private _irohBound = false;
+	private _irohListenError?: ListenerProblem;
 	/** The TCP port asked for, bound or not. */
 	private _requestedListenPort?: number;
 	/** Why a configured listener is not bound (issues #861 and #933). */
@@ -2268,6 +2276,11 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	static async create(opts: BeignetNodeOptions = {}): Promise<BeignetNode> {
+		try {
+			validateIrohConfig(opts);
+		} catch (err) {
+			throw new BeignetError('INVALID_PARAMS', (err as Error).message);
+		}
 		const mnemonic = opts.mnemonic || generateMnemonic();
 		const networkName = opts.network || 'mainnet';
 		// Namespace the default storage per-wallet so different mnemonics never
@@ -2806,6 +2819,13 @@ export class BeignetNode extends EventEmitter {
 			// rebuild, and while the node's block height is zero.
 			newChannelsRefused: (): string | null => this.newChannelRefusal(),
 			enableNetworking: true,
+			iroh: opts.iroh
+				? {
+						factory: createNodeIrohEndpoint,
+						relays: opts.irohRelays,
+						discovery: opts.irohDiscovery
+				  }
+				: undefined,
 			autoReconnect: opts.autoReconnect ?? true,
 			autoUpdateChannelFees: opts.autoUpdateChannelFees ?? false,
 			forwardingEnabled: opts.forwardingEnabled ?? true,
@@ -3747,6 +3767,9 @@ export class BeignetNode extends EventEmitter {
 		}
 		if (opts.websocketPort) {
 			await this.bindListener('websocket', opts.websocketPort);
+		}
+		if (opts.iroh) {
+			await this.bindListener('iroh', 0);
 		}
 
 		// 11. Connect timeout + Daily spending limit
@@ -5477,7 +5500,7 @@ export class BeignetNode extends EventEmitter {
 		}
 		try {
 			for (const peer of from.loadAllPeerAddresses()) {
-				to.savePeerAddress(peer.pubkey, peer.host, peer.port);
+				to.savePeerAddress(peer.pubkey, peer.host, peer.port, peer.transport);
 			}
 		} catch (err) {
 			this.log('warn', 'Could not carry peer addresses into the restore', {
@@ -6181,6 +6204,7 @@ export class BeignetNode extends EventEmitter {
 		const info = this.node.getNodeInfo();
 		const lightningBalance = this.getLightningBalanceSats();
 		const result: NodeInfo = {
+			irohAvailable: true,
 			nodeId: info.nodeId,
 			alias: info.alias,
 			network: this.networkName,
@@ -6195,6 +6219,10 @@ export class BeignetNode extends EventEmitter {
 			peerCount: info.peerCount,
 			listening: this.node.isListening()
 		};
+		const irohUri = this.node.getIrohConnectionString();
+		if (irohUri) result.irohUri = irohUri;
+		if (this._irohListenError)
+			result.irohListenError = { ...this._irohListenError };
 		if (this._requestedListenPort !== undefined) {
 			result.listenPort = this._requestedListenPort;
 		}
@@ -7521,7 +7549,9 @@ export class BeignetNode extends EventEmitter {
 			pubkey,
 			host: host ?? connected?.host ?? '',
 			port: port ?? connected?.port ?? 0,
-			state: 'connected'
+			state: 'connected',
+			...(connected?.transport ? { transport: connected.transport } : {}),
+			...(connected?.iroh ? { iroh: connected.iroh } : {})
 		};
 	}
 
@@ -7534,7 +7564,9 @@ export class BeignetNode extends EventEmitter {
 			pubkey: p.pubkey,
 			host: p.host,
 			port: p.port,
-			state: p.state as import('./types').PeerState
+			state: p.state as import('./types').PeerState,
+			...(p.transport ? { transport: p.transport } : {}),
+			...(p.iroh ? { iroh: p.iroh } : {})
 		}));
 	}
 
@@ -14479,6 +14511,8 @@ export class BeignetNode extends EventEmitter {
 		this._listenEpoch++;
 		this._listenPort = undefined;
 		this._websocketPort = undefined;
+		this._irohBound = false;
+		this._irohListenError = undefined;
 		this._requestedListenPort = undefined;
 		this._listenError = undefined;
 		this._websocketListenError = undefined;
@@ -14513,6 +14547,7 @@ export class BeignetNode extends EventEmitter {
 			this.destroyed || this.node !== node || this._listenEpoch !== epoch;
 		try {
 			if (kind === 'tcp') await node.listen(port);
+			else if (kind === 'iroh') await node.listenIroh();
 			else await node.listenWebSocket(port);
 		} catch (err) {
 			if (stale()) return;
@@ -14542,6 +14577,7 @@ export class BeignetNode extends EventEmitter {
 		}
 		const wasHeld = this.listenerProblem(kind)?.state === 'held';
 		if (kind === 'tcp') this._listenPort = port;
+		else if (kind === 'iroh') this._irohBound = true;
 		else this._websocketPort = port;
 		this.setListenerProblem(kind, undefined);
 		if (wasHeld) {
@@ -14618,7 +14654,11 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	private listenerProblem(kind: ListenerKind): ListenerProblem | undefined {
-		return kind === 'tcp' ? this._listenError : this._websocketListenError;
+		return kind === 'tcp'
+			? this._listenError
+			: kind === 'iroh'
+			? this._irohListenError
+			: this._websocketListenError;
 	}
 
 	private setListenerProblem(
@@ -14626,6 +14666,7 @@ export class BeignetNode extends EventEmitter {
 		problem: ListenerProblem | undefined
 	): void {
 		if (kind === 'tcp') this._listenError = problem;
+		else if (kind === 'iroh') this._irohListenError = problem;
 		else this._websocketListenError = problem;
 	}
 
@@ -14639,7 +14680,7 @@ export class BeignetNode extends EventEmitter {
 	private bindHeldListeners(): void {
 		if (this.destroyed || !this.node) return;
 		const held: Array<[ListenerKind, number]> = [];
-		for (const kind of ['tcp', 'websocket'] as const) {
+		for (const kind of ['tcp', 'websocket', 'iroh'] as const) {
 			const problem = this.listenerProblem(kind);
 			if (problem?.state === 'held') held.push([kind, problem.port]);
 		}
@@ -14660,13 +14701,21 @@ export class BeignetNode extends EventEmitter {
 	 * a socket nobody answers. A failed bind keeps its OS error.
 	 */
 	private fenceListeners(): void {
-		for (const kind of ['tcp', 'websocket'] as const) {
+		for (const kind of ['tcp', 'websocket', 'iroh'] as const) {
 			const problem = this.listenerProblem(kind);
-			const bound = kind === 'tcp' ? this._listenPort : this._websocketPort;
+			const bound =
+				kind === 'tcp'
+					? this._listenPort
+					: kind === 'iroh'
+					? this._irohBound
+						? 0
+						: undefined
+					: this._websocketPort;
 			const port =
 				bound ?? (problem?.state === 'held' ? problem.port : undefined);
 			if (port === undefined) continue;
 			if (kind === 'tcp') this._listenPort = undefined;
+			else if (kind === 'iroh') this._irohBound = false;
 			else this._websocketPort = undefined;
 			this.setListenerProblem(kind, {
 				port,
