@@ -60,10 +60,12 @@ declare module 'sinon' {
 	namespace sinon {
 		type SinonSandbox = any;
 		type SinonStub = any;
+		type SinonFakeTimers = any;
 		function createSandbox(): any;
 		function restore(): void;
 		function spy(...args: any[]): any;
 		function stub(...args: any[]): any;
+		function useFakeTimers(...args: any[]): any;
 	}
 	export = sinon;
 }

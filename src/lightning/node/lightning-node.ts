@@ -147,7 +147,7 @@ import {
 	decodeQueryShortChannelIdsMessage,
 	decodeGossipTimestampFilterMessage
 } from '../gossip/gossip-queries';
-import { GossipSyncManager } from '../gossip/gossip-sync';
+import { GossipSyncManager, IGossipSyncMessage } from '../gossip/gossip-sync';
 import {
 	verifyChannelAnnouncement,
 	verifyNodeAnnouncement,
@@ -5878,6 +5878,7 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 		this.channelManager.handlePeerDisconnected(peerPubkey);
+		this.dropGossipSync(peerPubkey);
 		this.notifyPeerDisconnectRequestObservers(peerPubkey);
 	}
 
@@ -7016,10 +7017,7 @@ export class LightningNode extends EventEmitter {
 		this.peerManager.on('peer:disconnect', (pubkey: string) => {
 			this.guardianHost?.sessionClosed(pubkey);
 			this.channelManager.handlePeerDisconnected(pubkey);
-			if (this.gossipSyncManagers.get(pubkey)?.repairPending) {
-				this.gossipRepairPending = true;
-			}
-			this.gossipSyncManagers.delete(pubkey);
+			this.dropGossipSync(pubkey);
 			this.rateLimiter.removePeer(pubkey);
 			this.notifyPeerDisconnectObservers(pubkey);
 		});
@@ -11034,6 +11032,7 @@ export class LightningNode extends EventEmitter {
 		this.htlcPaymentMap.clear();
 		this.forwardedHtlcs.clear();
 		this.retriesAwaitingRemoval.clear();
+		for (const syncMgr of this.gossipSyncManagers.values()) syncMgr.stop();
 		this.gossipSyncManagers.clear();
 		this.pendingMppPayments.clear();
 		this.pendingFundingTxs.clear();
@@ -15729,22 +15728,11 @@ export class LightningNode extends EventEmitter {
 				const syncMgr = this.gossipSyncManagers.get(pubkey);
 				if (syncMgr) {
 					const msg = decodeReplyShortChannelIdsEndMessage(payload);
-					const responses = syncMgr.handleReplyShortChannelIdsEnd(msg);
-					// The batch this marker closes may still be queued. A fast
-					// peer's next reply would land behind it and overflow the
-					// intake, so the next query waits for the intake to drain.
-					if (responses.length > 0) {
-						void this.flushGossip().then(() => {
-							if (this.gossipSyncManagers.get(pubkey) !== syncMgr) return;
-							try {
-								for (const resp of responses) {
-									this.emitOutbound(pubkey, resp.type, resp.payload);
-								}
-							} catch {
-								// Peer disconnected while the intake drained.
-							}
-						});
-					}
+					this.sendGossipQueriesAfterIntake(
+						pubkey,
+						syncMgr,
+						syncMgr.handleReplyShortChannelIdsEnd(msg)
+					);
 				}
 				break;
 			}
@@ -15942,12 +15930,47 @@ export class LightningNode extends EventEmitter {
 	}
 
 	private getOrCreateSyncManager(pubkey: string): GossipSyncManager {
-		let mgr = this.gossipSyncManagers.get(pubkey);
-		if (!mgr) {
-			mgr = new GossipSyncManager(this.graph, this.chainHash());
-			this.gossipSyncManagers.set(pubkey, mgr);
-		}
+		const existing = this.gossipSyncManagers.get(pubkey);
+		if (existing) return existing;
+		const mgr = new GossipSyncManager(this.graph, this.chainHash());
+		mgr.on('timeout', (queries: IGossipSyncMessage[]) => {
+			this.sendGossipQueriesAfterIntake(pubkey, mgr, queries);
+		});
+		this.gossipSyncManagers.set(pubkey, mgr);
 		return mgr;
+	}
+
+	/** End a peer's sync with its connection, keeping any repair it owed. */
+	private dropGossipSync(pubkey: string): void {
+		const syncMgr = this.gossipSyncManagers.get(pubkey);
+		if (syncMgr?.repairPending) {
+			this.gossipRepairPending = true;
+		}
+		syncMgr?.stop();
+		this.gossipSyncManagers.delete(pubkey);
+	}
+
+	/**
+	 * The batch before a query may still be queued. A fast peer's next reply
+	 * would land behind it and overflow the intake, so the query waits for
+	 * the intake to drain.
+	 */
+	private sendGossipQueriesAfterIntake(
+		pubkey: string,
+		syncMgr: GossipSyncManager,
+		queries: IGossipSyncMessage[]
+	): void {
+		if (queries.length === 0) return;
+		void this.flushGossip().then(() => {
+			if (this.gossipSyncManagers.get(pubkey) !== syncMgr) return;
+			try {
+				for (const query of queries) {
+					this.emitOutbound(pubkey, query.type, query.payload);
+				}
+			} catch {
+				// Peer disconnected while the intake drained.
+			}
+		});
 	}
 
 	/**

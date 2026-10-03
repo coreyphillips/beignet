@@ -8,6 +8,8 @@
  *   2. handleReplyChannelRange() → accumulate SCIDs until syncComplete
  *   3. handleReplyShortChannelIdsEnd() → re-ask a lost batch, send the next
  *      one, or → SYNCED (IDLE when a batch was given up on)
+ *   A reply that does not arrive in time is asked for again, and the sync
+ *   ends IDLE once the attempts run out (emits 'timeout' either way).
  *
  * Responding side:
  *   4. handleQueryChannelRange() → return reply_channel_range
@@ -55,7 +57,9 @@ const MAX_SCIDS_PER_QUERY = 1000;
 
 /**
  * How many times one batch is asked for while its reply keeps arriving
- * incomplete. After that the sync moves on and ends IDLE, not SYNCED.
+ * incomplete. After that the sync moves on and ends IDLE, not SYNCED. A
+ * batch or range query whose reply keeps not arriving at all is asked for
+ * as often, and then the sync ends IDLE at once.
  */
 const MAX_BATCH_ATTEMPTS = 3;
 
@@ -75,6 +79,15 @@ export interface IGossipSyncMessage {
 }
 
 export class GossipSyncManager extends EventEmitter {
+	/**
+	 * How long the sync waits for a reply, or for the next part of a range
+	 * reply. A responder may drop a reply under its own backpressure (ours
+	 * does past Peer.MAX_SYNC_REPLY_WRITE_BUFFER), and nothing else ends the
+	 * wait. It is long because asking again while a slow reply is still on
+	 * its way breaks BOLT 7's one query_short_channel_ids at a time.
+	 */
+	private static readonly REPLY_TIMEOUT_MS = 120_000;
+
 	private _state: GossipSyncState = GossipSyncState.IDLE;
 	private _graph: NetworkGraph;
 	/**
@@ -88,10 +101,19 @@ export class GossipSyncManager extends EventEmitter {
 	private _pendingQueries: Buffer[] = [];
 	private _currentBatchIndex = 0;
 	private _batchAttempts = 0;
+	private _rangeAttempts = 0;
+	private _replyTimer: ReturnType<typeof setTimeout> | null = null;
 	/** Part of the in-flight batch's reply was dropped or left out. */
 	private _batchLost = false;
 	/** A batch of this sync was given up on, so it cannot end SYNCED. */
 	private _incomplete = false;
+	/**
+	 * A batch reply timed out, so its end marker may still arrive and close
+	 * a later batch, in this sync or a later one, before that batch's reply
+	 * does. No sync on this connection can then end SYNCED, and the repair
+	 * waits for the next connection.
+	 */
+	private _markerOwed = false;
 	/**
 	 * Gossip was lost and no sync has ended SYNCED since. The next range sync
 	 * then asks for every channel the peer lists: getMissingSCIDs only finds
@@ -141,19 +163,18 @@ export class GossipSyncManager extends EventEmitter {
 			})
 		});
 
-		// Query full block range
-		messages.push({
-			type: MessageType.QUERY_CHANNEL_RANGE,
-			payload: encodeQueryChannelRangeMessage({
-				chainHash: this._chainHash,
-				firstBlocknum: 0,
-				numberOfBlocks: 0xffffffff
-			})
-		});
-
-		this._state = GossipSyncState.AWAITING_RANGE_REPLY;
 		this._clearRangeScids();
+		this._rangeAttempts = 0;
+		messages.push(...this._sendRangeQuery());
 		return messages;
+	}
+
+	/**
+	 * Stop waiting for a reply. Called when the manager is dropped with its
+	 * connection.
+	 */
+	stop(): void {
+		this._clearReplyTimer();
 	}
 
 	/**
@@ -170,6 +191,7 @@ export class GossipSyncManager extends EventEmitter {
 		) {
 			return [];
 		}
+		this._clearReplyTimer();
 
 		const scids = decodeShortChannelIds(msg.encodedShortIds);
 		const needed = this._rangeScidBytes + scids.length * 8;
@@ -195,6 +217,7 @@ export class GossipSyncManager extends EventEmitter {
 
 		if (!msg.syncComplete) {
 			// More chunks coming
+			this._awaitReply();
 			return [];
 		}
 
@@ -241,13 +264,17 @@ export class GossipSyncManager extends EventEmitter {
 	/**
 	 * Handle reply_short_channel_ids_end from peer.
 	 * Asks for the batch again if the intake lost part of its reply, else
-	 * sends the next batch or ends the sync.
+	 * sends the next batch or ends the sync. A marker with no batch in
+	 * flight, such as one arriving after its sync timed out, is dropped so it
+	 * cannot end a later sync.
 	 */
 	handleReplyShortChannelIdsEnd(
 		msg: IReplyShortChannelIdsEndMessage
 	): IGossipSyncMessage[] {
+		if (this._state !== GossipSyncState.AWAITING_SCID_REPLY) return [];
+		this._clearReplyTimer();
 		// full_information 0: the responder left part of the reply out.
-		if (!msg.complete && this._state === GossipSyncState.AWAITING_SCID_REPLY) {
+		if (!msg.complete) {
 			this._batchLost = true;
 		}
 		if (this._batchLost) {
@@ -265,7 +292,7 @@ export class GossipSyncManager extends EventEmitter {
 		if (this._currentBatchIndex >= this._pendingQueries.length) {
 			// All batches processed
 			this._pendingQueries = [];
-			if (this._incomplete) {
+			if (this._incomplete || this._markerOwed) {
 				this._state = GossipSyncState.IDLE;
 				return [];
 			}
@@ -399,9 +426,28 @@ export class GossipSyncManager extends EventEmitter {
 
 	// ── Internal ───────────────────────────────────────────────────
 
+	private _sendRangeQuery(): IGossipSyncMessage[] {
+		this._state = GossipSyncState.AWAITING_RANGE_REPLY;
+		this._rangeAttempts++;
+		this._awaitReply();
+
+		// Query full block range
+		return [
+			{
+				type: MessageType.QUERY_CHANNEL_RANGE,
+				payload: encodeQueryChannelRangeMessage({
+					chainHash: this._chainHash,
+					firstBlocknum: 0,
+					numberOfBlocks: 0xffffffff
+				})
+			}
+		];
+	}
+
 	private _sendNextScidQuery(): IGossipSyncMessage[] {
 		this._state = GossipSyncState.AWAITING_SCID_REPLY;
 		this._batchAttempts++;
+		this._awaitReply();
 
 		return [
 			{
@@ -409,6 +455,58 @@ export class GossipSyncManager extends EventEmitter {
 				payload: this._pendingQueries[this._currentBatchIndex]
 			}
 		];
+	}
+
+	private _awaitReply(): void {
+		this._clearReplyTimer();
+		this._replyTimer = setTimeout(
+			() => this._replyTimedOut(),
+			GossipSyncManager.REPLY_TIMEOUT_MS
+		);
+		this._replyTimer.unref?.();
+	}
+
+	private _clearReplyTimer(): void {
+		if (this._replyTimer) {
+			clearTimeout(this._replyTimer);
+			this._replyTimer = null;
+		}
+	}
+
+	/**
+	 * The awaited reply did not come: ask again, or end the sync once the
+	 * attempts run out. Range SCIDs already received are kept, so a slow
+	 * reply that finishes after all still counts.
+	 */
+	private _replyTimedOut(): void {
+		this._replyTimer = null;
+		let messages: IGossipSyncMessage[] = [];
+		if (this._state === GossipSyncState.AWAITING_RANGE_REPLY) {
+			if (this._rangeAttempts < MAX_BATCH_ATTEMPTS) {
+				messages = this._sendRangeQuery();
+			} else {
+				this._clearRangeScids();
+				this._state = GossipSyncState.IDLE;
+			}
+		} else if (this._state === GossipSyncState.AWAITING_SCID_REPLY) {
+			this._markerOwed = true;
+			this._repairPending = true;
+			if (this._batchAttempts < MAX_BATCH_ATTEMPTS) {
+				// The re-asked reply covers whatever the intake lost.
+				this._batchLost = false;
+				messages = this._sendNextScidQuery();
+			} else {
+				// The peer stopped answering. Part of the batch may have
+				// arrived, an announcement without its updates say, which
+				// getMissingSCIDs would not ask for, so the next sync asks for
+				// every channel.
+				this._pendingQueries = [];
+				this._state = GossipSyncState.IDLE;
+			}
+		} else {
+			return;
+		}
+		this.emit('timeout', messages);
 	}
 
 	private _clearRangeScids(): void {

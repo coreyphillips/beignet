@@ -4,6 +4,7 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import sinon from 'sinon';
 import {
 	encodeShortChannelIds,
 	encodeShortChannelIdsCompressed,
@@ -25,7 +26,8 @@ import {
 	encodeShortChannelId,
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
-	INodeAnnouncementMessage
+	INodeAnnouncementMessage,
+	IReplyChannelRangeMessage
 } from '../../src/lightning/gossip/types';
 import {
 	decodeChannelAnnouncementMessage,
@@ -943,6 +945,155 @@ describe('Gossip Sync (Phase 5)', function () {
 			mgr.noteIntakeLoss();
 			expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
 			expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
+		});
+
+		describe('replies that never arrive (issue #1280)', function () {
+			const TIMEOUT = (
+				GossipSyncManager as unknown as { REPLY_TIMEOUT_MS: number }
+			).REPLY_TIMEOUT_MS;
+			let clock: sinon.SinonFakeTimers;
+
+			beforeEach(function () {
+				clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+			});
+
+			afterEach(function () {
+				clock.restore();
+			});
+
+			function timeoutsOf(mgr: GossipSyncManager): IGossipSyncMessage[][] {
+				const seen: IGossipSyncMessage[][] = [];
+				mgr.on('timeout', (queries: IGossipSyncMessage[]) =>
+					seen.push(queries)
+				);
+				return seen;
+			}
+
+			function rangeReply(
+				scids: Buffer[],
+				syncComplete: boolean
+			): IReplyChannelRangeMessage {
+				return {
+					chainHash: BITCOIN_CHAIN_HASH,
+					firstBlocknum: 0,
+					numberOfBlocks: 0xffffffff,
+					syncComplete,
+					encodedShortIds: encodeShortChannelIds(scids)
+				};
+			}
+
+			it('asks for a batch again when its end marker never arrives', function () {
+				const mgr = new GossipSyncManager(new NetworkGraph());
+				let synced = false;
+				mgr.on('synced', () => {
+					synced = true;
+				});
+				const timeouts = timeoutsOf(mgr);
+				const first = startSync(mgr, 1500);
+
+				clock.tick(TIMEOUT - 1);
+				expect(timeouts).to.have.length(0);
+				clock.tick(1);
+				expect(timeouts).to.have.length(1);
+				expect(queried(timeouts[0])).to.eql(first);
+
+				// The first reply was only slow: its marker moves the sync on, and
+				// the re-asked reply's marker then closes the last batch before
+				// that batch's reply arrives.
+				expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.have.length(
+					500
+				);
+				expect(queried(mgr.handleReplyShortChannelIdsEnd(END))).to.eql([]);
+				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+				expect(mgr.repairPending).to.equal(true);
+				expect(synced).to.equal(false);
+				clock.tick(TIMEOUT * 3);
+				expect(timeouts).to.have.length(1);
+			});
+
+			it('ends IDLE with the repair kept once every attempt timed out', function () {
+				const graph = new NetworkGraph();
+				const known = populateGraph(graph, 3).map((s) => s.toString('hex'));
+				const unknown = makeScid(100_000, 1, 0).toString('hex');
+				const offered = [...known, unknown];
+				const mgr = new GossipSyncManager(graph);
+				let synced = false;
+				mgr.on('synced', () => {
+					synced = true;
+				});
+				const timeouts = timeoutsOf(mgr);
+
+				expect(offer(mgr, offered)).to.eql([unknown]);
+				clock.tick(TIMEOUT * 3);
+				expect(timeouts.map(queried)).to.eql([[unknown], [unknown], []]);
+				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+				expect(mgr.repairPending).to.equal(true);
+				expect(synced).to.equal(false);
+
+				// A marker arriving this late ends neither this sync nor the next.
+				expect(mgr.handleReplyShortChannelIdsEnd(END)).to.eql([]);
+				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+				mgr.initiateSync();
+				expect(mgr.handleReplyShortChannelIdsEnd(END)).to.eql([]);
+				expect(mgr.getState()).to.equal(GossipSyncState.AWAITING_RANGE_REPLY);
+				expect(mgr.repairPending).to.equal(true);
+
+				// The next sync asks for every channel.
+				expect(offer(mgr, offered)).to.have.members(offered);
+
+				// An old marker can still close its batch before the reply, so no
+				// sync on this connection ends SYNCED.
+				expect(mgr.handleReplyShortChannelIdsEnd(END)).to.eql([]);
+				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+				expect(mgr.repairPending).to.equal(true);
+				expect(synced).to.equal(false);
+			});
+
+			it('asks for the range again when its final reply never arrives', function () {
+				const mgr = new GossipSyncManager(new NetworkGraph());
+				const timeouts = timeoutsOf(mgr);
+				const a = makeScid(100, 1, 0);
+				const b = makeScid(200, 2, 0);
+				mgr.initiateSync();
+
+				// Each part of the reply restarts the wait.
+				clock.tick(TIMEOUT - 1);
+				expect(mgr.handleReplyChannelRange(rangeReply([a], false))).to.eql([]);
+				clock.tick(TIMEOUT - 1);
+				expect(timeouts).to.have.length(0);
+				clock.tick(1);
+				expect(timeouts).to.have.length(1);
+				expect(timeouts[0].map((m) => m.type)).to.eql([
+					MessageType.QUERY_CHANNEL_RANGE
+				]);
+				expect(mgr.getState()).to.equal(GossipSyncState.AWAITING_RANGE_REPLY);
+
+				// What arrived before the timeout still counts.
+				expect(
+					queried(mgr.handleReplyChannelRange(rangeReply([b], true)))
+				).to.have.members([a.toString('hex'), b.toString('hex')]);
+			});
+
+			it('ends IDLE once every range query timed out', function () {
+				const mgr = new GossipSyncManager(new NetworkGraph());
+				const timeouts = timeoutsOf(mgr);
+				mgr.initiateSync();
+
+				clock.tick(TIMEOUT * 3);
+				expect(timeouts.map((t) => t.length)).to.eql([1, 1, 0]);
+				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+				expect(mgr.repairPending).to.equal(false);
+			});
+
+			it('stops waiting once stopped', function () {
+				const mgr = new GossipSyncManager(new NetworkGraph());
+				const timeouts = timeoutsOf(mgr);
+				startSync(mgr, 10);
+
+				mgr.stop();
+				clock.tick(TIMEOUT * 3);
+				expect(timeouts).to.have.length(0);
+			});
 		});
 	});
 
@@ -2099,6 +2250,48 @@ describe('Gossip Sync (Phase 5)', function () {
 					expect(queries[1]).to.eql(queries[0]);
 				} finally {
 					statics.GOSSIP_INTAKE_MAX = saved;
+				}
+			});
+
+			it('asks for a batch again when its end marker never arrives, until the connection closes (issue #1280)', async function () {
+				const statics = GossipSyncManager as unknown as {
+					REPLY_TIMEOUT_MS: number;
+				};
+				const saved = statics.REPLY_TIMEOUT_MS;
+				statics.REPLY_TIMEOUT_MS = 50;
+				try {
+					startSync(1500);
+					await waitFor(() => queries.length >= 2);
+					expect(queries[1]).to.eql(queries[0]);
+					expect(node.getGossipSyncState(peerPubkey)).to.equal(
+						GossipSyncState.AWAITING_SCID_REPLY
+					);
+
+					node.getPeerManager()!.emit('peer:disconnect', peerPubkey);
+					const asked = queries.length;
+					await new Promise((resolve) => setTimeout(resolve, 200));
+					expect(queries).to.have.length(asked);
+				} finally {
+					statics.REPLY_TIMEOUT_MS = saved;
+				}
+			});
+
+			it('stops asking once the host is asked to close the connection (issue #1280)', async function () {
+				const statics = GossipSyncManager as unknown as {
+					REPLY_TIMEOUT_MS: number;
+				};
+				const saved = statics.REPLY_TIMEOUT_MS;
+				statics.REPLY_TIMEOUT_MS = 50;
+				try {
+					startSync(1500);
+					(
+						node as unknown as { requestPeerDisconnect(pubkey: string): void }
+					).requestPeerDisconnect(peerPubkey);
+					await new Promise((resolve) => setTimeout(resolve, 200));
+					expect(queries).to.have.length(1);
+					expect(node.getGossipSyncState(peerPubkey)).to.equal(null);
+				} finally {
+					statics.REPLY_TIMEOUT_MS = saved;
 				}
 			});
 		});
