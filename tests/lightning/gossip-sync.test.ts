@@ -1040,6 +1040,13 @@ describe('Gossip Sync (Phase 5)', function () {
 
 				// The next sync asks for every channel.
 				expect(offer(mgr, offered)).to.have.members(offered);
+
+				// An old marker can still close its batch before the reply, so no
+				// sync on this connection ends SYNCED.
+				expect(mgr.handleReplyShortChannelIdsEnd(END)).to.eql([]);
+				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+				expect(mgr.repairPending).to.equal(true);
+				expect(synced).to.equal(false);
 			});
 
 			it('asks for the range again when its final reply never arrives', function () {

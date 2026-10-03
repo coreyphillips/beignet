@@ -108,6 +108,13 @@ export class GossipSyncManager extends EventEmitter {
 	/** A batch of this sync was given up on, so it cannot end SYNCED. */
 	private _incomplete = false;
 	/**
+	 * A batch reply timed out, so its end marker may still arrive and close
+	 * a later batch, in this sync or a later one, before that batch's reply
+	 * does. No sync on this connection can then end SYNCED, and the repair
+	 * waits for the next connection.
+	 */
+	private _markerOwed = false;
+	/**
 	 * Gossip was lost and no sync has ended SYNCED since. The next range sync
 	 * then asks for every channel the peer lists: getMissingSCIDs only finds
 	 * absent channels, and a channel whose updates were dropped is not absent.
@@ -285,7 +292,7 @@ export class GossipSyncManager extends EventEmitter {
 		if (this._currentBatchIndex >= this._pendingQueries.length) {
 			// All batches processed
 			this._pendingQueries = [];
-			if (this._incomplete) {
+			if (this._incomplete || this._markerOwed) {
 				this._state = GossipSyncState.IDLE;
 				return [];
 			}
@@ -482,14 +489,11 @@ export class GossipSyncManager extends EventEmitter {
 				this._state = GossipSyncState.IDLE;
 			}
 		} else if (this._state === GossipSyncState.AWAITING_SCID_REPLY) {
+			this._markerOwed = true;
+			this._repairPending = true;
 			if (this._batchAttempts < MAX_BATCH_ATTEMPTS) {
 				// The re-asked reply covers whatever the intake lost.
 				this._batchLost = false;
-				// The first reply may still come, and its end marker would then
-				// close a later batch before that batch's reply arrives, so this
-				// sync cannot end SYNCED.
-				this._incomplete = true;
-				this._repairPending = true;
 				messages = this._sendNextScidQuery();
 			} else {
 				// The peer stopped answering. Part of the batch may have
@@ -497,7 +501,6 @@ export class GossipSyncManager extends EventEmitter {
 				// getMissingSCIDs would not ask for, so the next sync asks for
 				// every channel.
 				this._pendingQueries = [];
-				this._repairPending = true;
 				this._state = GossipSyncState.IDLE;
 			}
 		} else {
