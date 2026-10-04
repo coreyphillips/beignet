@@ -8823,6 +8823,7 @@ export class BeignetNode extends EventEmitter {
 		peerPubkey: string;
 		state: string;
 		localBalanceMsat: bigint;
+		spendableOutboundMsat?: bigint;
 		remoteBalanceMsat: bigint;
 		fundingSatoshis: bigint;
 		channelType?: Buffer | null;
@@ -8867,6 +8868,7 @@ export class BeignetNode extends EventEmitter {
 			peerPubkey,
 			state: ch.state as CS,
 			localBalanceSats: Number(ch.localBalanceMsat / 1000n),
+			maxSendableSats: Number((ch.spendableOutboundMsat ?? 0n) / 1000n),
 			remoteBalanceSats: Number(ch.remoteBalanceMsat / 1000n),
 			capacitySats: Number(ch.fundingSatoshis),
 			isAnchor: isAnchorChannel(ch.channelType ?? null)
@@ -13046,24 +13048,14 @@ export class BeignetNode extends EventEmitter {
 
 	getLiquiditySnapshot(): LiquiditySnapshot {
 		const snapshot = this.node.getLiquiditySnapshot();
-		// The reserve every channel holds back on our side is unspendable, so what
-		// can actually be sent is the local balance above it, summed over routable
-		// channels, the same figure canSend() reports. Surfacing both lets callers
-		// show a true "can send" (zero while still below the reserve) instead of the
-		// raw local balance, which overstates it.
-		//
-		// Routable means NORMAL or htlcUsable: a channel paying through its splice
-		// still sends, so it must keep counting. Filtering on NORMAL alone zeroed
-		// the sendable figure for the whole splice window, which read as having no
-		// funds while a payment would in fact go through. Mid-splice the spendable
-		// side is the conservative min of the live and settle-to balances,
-		// mirroring the balance side of the channel's own add gate. (The true
-		// per-add ceiling, getSpendableOutboundMsat, additionally reserves the
-		// funder's commitment fee; this aggregation, like the NORMAL-channel
-		// figure before it, prices only balance minus reserve.)
+		// Preserve the legacy balance-minus-reserve estimate for existing
+		// readers. The new ceiling uses the same commitment costs, splice
+		// views and voucher buffer as the channel's outbound add gate.
 		let reserveMsat = 0n;
 		let sendableMsat = 0n;
+		let maxSendableMsat = 0n;
 		for (const ch of this.node.listChannels()) {
+			maxSendableMsat += ch.spendableOutboundMsat ?? 0n;
 			// A held restore is NORMAL with htlcUsable false, so this two-clause
 			// test admitted it on the first clause alone (issue #469). Its
 			// balance is real, but it can carry nothing, so it contributes no
@@ -13090,6 +13082,7 @@ export class BeignetNode extends EventEmitter {
 			inboundLiquidityPct: snapshot.inboundLiquidityPct,
 			reserveSats: Number(reserveMsat / 1000n),
 			sendableSats: Number(sendableMsat / 1000n),
+			maxSendableSats: Number(maxSendableMsat / 1000n),
 			recommendations: snapshot.recommendations
 		};
 	}

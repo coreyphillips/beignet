@@ -14724,6 +14724,12 @@ export class LightningNode extends EventEmitter {
 			);
 		}
 		info.htlcUsable = channel.acceptsNewHtlcs();
+		// The initial splice handshake is still NORMAL, but its quiescence
+		// gate already refuses outbound adds.
+		info.spendableOutboundMsat =
+			info.htlcUsable && !channel.isQuiescing()
+				? channel.getSpendableOutboundMsat()
+				: 0n;
 		// The reason a NORMAL channel can still answer false, so a consumer can
 		// tell "mid-splice and parked" from "restored and held" (issue #469) and
 		// from "funding unaccounted for" (issue #593).
