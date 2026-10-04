@@ -14,6 +14,7 @@ import * as bitcoin from 'bitcoinjs-lib';
 import net from 'net';
 import sinon from 'sinon';
 import tls from 'tls';
+import { OnchainSweeps } from '../src/cli/onchain-sweep';
 
 // The raw module.exports object: the compiled namespace import in src/electrum
 // reads it live through getter bindings, while this file's own namespace copy
@@ -503,6 +504,83 @@ describe('UTXO state persistence (#812)', function () {
 	afterEach(async function () {
 		sinon.restore();
 		await wallet?.stop();
+	});
+
+	it('a signed sweep remains excluded from coin selection after confirmation, restart and reorg', async () => {
+		const journal = new Map<string, string>();
+		const sent: string[] = [];
+		let charged = 0;
+		const sweeps = () =>
+			new OnchainSweeps({
+				wallet,
+				network: bitcoin.networks.regtest,
+				storage: {
+					loadWalletData: (key) => journal.get(key) ?? null,
+					saveWalletData: (key, value) => {
+						journal.set(key, value);
+					}
+				},
+				broadcast: async (hex) => {
+					sent.push(hex);
+					const result = await wallet.removeSpentUtxos(hex);
+					if (result.isErr()) throw result.error;
+				},
+				admitAndSave: (_debit, save) => {
+					save();
+					charged++;
+				}
+			});
+		const prepared = await sweeps().prepare({
+			requestId: 'real-wallet-drain',
+			address: EXTERNAL_ADDRESS,
+			satsPerVbyte: 2,
+			maxFeeSats: 1000,
+			debitSats: utxoA.value,
+			inputOutpoints: [{ txid: utxoA.tx_hash, vout: utxoA.tx_pos }]
+		});
+		await sweeps().submit(prepared.requestId);
+		expect(wallet.listUtxos()).to.deep.equal([utxoB]);
+		wallet.transactions[prepared.txid!] = {
+			height: 10,
+			exists: true
+		} as Wallet['transactions'][string];
+		await wallet.saveWalletData('transactions', wallet.transactions);
+		await sweeps().submit(prepared.requestId);
+		expect(wallet.isUtxoFrozen(utxoA.tx_hash, utxoA.tx_pos)).to.equal(true);
+		await wallet.stop();
+		const reloaded = await Wallet.create({
+			mnemonic: MNEMONIC,
+			name: NAME,
+			network,
+			storage,
+			electrumOptions,
+			logger,
+			disableRefreshOnCreate: true
+		});
+		if (reloaded.isErr()) throw reloaded.error;
+		wallet = reloaded.value;
+		expect(wallet.isUtxoFrozen(utxoA.tx_hash, utxoA.tx_pos)).to.equal(true);
+		wallet.transactions[prepared.txid!] = {
+			height: 0,
+			exists: false
+		} as Wallet['transactions'][string];
+		scanAnswers({ utxos: [utxoA, utxoB], balance: utxoA.value + utxoB.value });
+		const scanned = await wallet.getUtxos({});
+		if (scanned.isErr()) throw scanned.error;
+		expect(sweeps().get(prepared.requestId)?.status).to.equal('submitted');
+		expect(wallet.listUtxos()).to.deep.equal([utxoA, utxoB]);
+		expect(wallet.transaction.removeBlackListedUtxos()).to.deep.equal([utxoB]);
+		await wallet.resetSendTransaction();
+		const ordinary = await wallet.transaction.setupTransaction({
+			satsPerByte: 2
+		});
+		if (ordinary.isErr()) throw ordinary.error;
+		expect(ordinary.value.inputs).to.deep.equal([utxoB]);
+		await wallet.resetSendTransaction();
+		await sweeps().submit(prepared.requestId);
+		expect(sent).to.have.length(2);
+		expect(sent[1]).to.equal(sent[0]);
+		expect(charged).to.equal(1);
 	});
 
 	it('logs a refused UTXO write and still keeps the spent coin out of memory', async () => {

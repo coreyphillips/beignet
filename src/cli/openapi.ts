@@ -772,13 +772,49 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
-			'/channel/close': {
+			'/channel/close-quote': {
 				post: {
 					summary:
-						"Cooperatively close a channel. The payout goes to a wallet-scanned address on the wallet's internal change chain, never to a receive address that POST /address/new or a receive request handed out, so a close can never read as a payer paying a request (issue #1064): the next unused change address when the wallet can produce one (consecutive closes may get the same address until it sees use), else the startup sweep address (also a change address), else the funding-key address, so the closed balance is tracked and spendable without a rescue sweep. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because a mutual close pays out the balances that row carries and a stale allocation is peer-favourable by construction: any payment received after the capsule was written is missing from it. Letting the peer close unilaterally is the safe outcome; the flag is the labelled way to accept the risk anyway",
+						'Estimate our cooperative-close payout at the current chain feerate. Read-only; no review or balance is held. The peer chooses its script and negotiates the final fee, so the amount is an estimate.',
 					tags: ['Channels'],
 					requestBody: bodyContent({
 						channelId: 'string',
+						address: 'string?',
+						acceptStaleStateRisk: 'boolean?'
+					}),
+					responses: {
+						'200': {
+							description: 'Expected payout',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									amountSats: { type: 'integer' },
+									feeSats: {
+										type: 'integer',
+										description: 'Fee charged to our balance'
+									},
+									networkFeeSats: { type: 'integer' },
+									feeratePerkw: { type: 'integer' },
+									feePayer: { type: 'string', enum: ['local', 'remote'] },
+									feeEstimated: { type: 'boolean', enum: [true] }
+								}
+							})
+						},
+						'409': {
+							description:
+								'CLOSE_UNAVAILABLE: channel not ready, pending HTLCs or updates, recency hold, or no spendable payout after fees'
+						}
+					}
+				}
+			},
+			'/channel/close': {
+				post: {
+					summary:
+						"Cooperatively close a channel. Optional address sends our payout directly to that address on the configured network and records a durable on-chain send with its actual output and our fee. External closes refuse pending HTLCs, updates and splices. Without address, the payout goes to a wallet-scanned address on the wallet's internal change chain, never to a receive address that POST /address/new or a receive request handed out, so a close can never read as a payer paying a request (issue #1064): the next unused change address when the wallet can produce one (consecutive closes may get the same address until it sees use), else the startup sweep address (also a change address), else the funding-key address, so the closed balance is tracked and spendable without a rescue sweep. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because a mutual close pays out the balances that row carries and a stale allocation is peer-favourable by construction: any payment received after the capsule was written is missing from it. Letting the peer close unilaterally is the safe outcome; the flag is the labelled way to accept the risk anyway",
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						address: 'string?',
 						// Conditionally required, and only for a capsule-restored
 						// channel, so the schema cannot say "required" without
 						// misdescribing every other close.
@@ -2372,6 +2408,127 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description:
 								'SPENDING_LIMIT_EXCEEDED: the whole sweep over maxPaymentSats or dailySpendLimitSats'
 						}
+					}
+				}
+			},
+			'/onchain/sweep/prepare': {
+				post: {
+					summary:
+						'Prepare and persist one reviewed sweep without broadcasting',
+					tags: ['Node'],
+					requestBody: {
+						content: jsonContent({
+							type: 'object',
+							required: [
+								'requestId',
+								'address',
+								'satsPerVbyte',
+								'inputOutpoints',
+								'debitSats',
+								'maxFeeSats'
+							],
+							properties: {
+								requestId: {
+									type: 'string',
+									pattern: '^[a-zA-Z0-9_-]{8,128}$'
+								},
+								address: { type: 'string' },
+								satsPerVbyte: {
+									type: 'number',
+									minimum: 0,
+									exclusiveMinimum: true
+								},
+								debitSats: { type: 'integer', minimum: 1 },
+								maxFeeSats: { type: 'integer', minimum: 0 },
+								inputOutpoints: {
+									type: 'array',
+									minItems: 1,
+									items: {
+										type: 'object',
+										required: ['txid', 'vout'],
+										properties: {
+											txid: { type: 'string' },
+											vout: { type: 'integer', minimum: 0 }
+										}
+									}
+								}
+							}
+						})
+					},
+					responses: {
+						'200': {
+							description:
+								'Durable preparation, also returned for an identical requestId',
+							content: jsonContent({
+								$ref: '#/components/schemas/OnchainSweepInfo'
+							})
+						},
+						'409': {
+							description:
+								'Conflicting request, unavailable inputs or expired review'
+						},
+						'503': {
+							description: 'Sweep journal or reservation could not be persisted'
+						}
+					}
+				}
+			},
+			'/onchain/sweep/submit': {
+				post: {
+					summary: 'Submit or rebroadcast exactly the saved sweep transaction',
+					tags: ['Node'],
+					requestBody: bodyContent({ requestId: 'string' }),
+					responses: {
+						'200': {
+							description:
+								'Durable sweep status. Submitted does not imply confirmation or broadcast acceptance.',
+							content: jsonContent({
+								$ref: '#/components/schemas/OnchainSweepInfo'
+							})
+						},
+						'409': {
+							description: 'Sweep is not prepared or its inputs are unavailable'
+						},
+						'403': { description: 'Spend limit refused the first submission' }
+					}
+				}
+			},
+			'/onchain/sweep/cancel': {
+				post: {
+					summary: 'Cancel a sweep only before any broadcast attempt',
+					tags: ['Node'],
+					requestBody: bodyContent({ requestId: 'string' }),
+					responses: {
+						'200': {
+							description: 'Cancelled sweep and released owned reservations',
+							content: jsonContent({
+								$ref: '#/components/schemas/OnchainSweepInfo'
+							})
+						},
+						'409': { description: 'A submitted sweep cannot be cancelled' }
+					}
+				}
+			},
+			'/onchain/sweep': {
+				get: {
+					summary: 'Read a durable sweep without signed hex',
+					tags: ['Node'],
+					parameters: [
+						{
+							name: 'requestId',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Sweep status',
+							content: jsonContent({
+								$ref: '#/components/schemas/OnchainSweepInfo'
+							})
+						},
+						'404': { description: 'Unknown requestId' }
 					}
 				}
 			},
@@ -4822,6 +4979,39 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						totalFeeMsat: { type: 'string' },
 						totalCltvDelta: { type: 'integer' },
 						finalCltvExpiry: { type: 'integer' }
+					}
+				},
+				OnchainSweepInfo: {
+					type: 'object',
+					required: [
+						'requestId',
+						'address',
+						'status',
+						'debitSats',
+						'createdAt'
+					],
+					properties: {
+						requestId: { type: 'string' },
+						address: { type: 'string' },
+						status: {
+							type: 'string',
+							enum: [
+								'preparing',
+								'prepared',
+								'submitted',
+								'confirmed',
+								'cancelling',
+								'cancelled'
+							]
+						},
+						debitSats: { type: 'integer' },
+						amountSats: { type: 'integer' },
+						feeSats: { type: 'integer' },
+						satsPerVbyte: { type: 'number' },
+						txid: { type: 'string' },
+						createdAt: { type: 'integer' },
+						broadcastAccepted: { type: 'boolean' },
+						error: { type: 'string' }
 					}
 				},
 				TxInfo: {

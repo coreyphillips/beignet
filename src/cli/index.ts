@@ -45,3 +45,4 @@ export {
 	IKeysendOptions
 } from '../lightning/node/types';
 export * from './types';
+export type { OnchainSweepInfo, OnchainSweepRequest } from './onchain-sweep';

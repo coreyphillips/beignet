@@ -68,6 +68,7 @@ import {
 	encodeClosingSigMessage
 } from '../message/channel-close';
 import {
+	ICooperativeCloseQuote,
 	isDustOutput,
 	calculateClosingFee,
 	closingTxWeight,
@@ -1589,8 +1590,28 @@ export class Channel {
 	 * in the pre-confirmation window can rebroadcast it and re-arm the funding
 	 * watch (see LightningNode.restoreChainWatches).
 	 */
-	recordCooperativeCloseTx(txHex: string): void {
+	recordCooperativeCloseTx(txHex: string, localFeeSats?: bigint): void {
 		this._state.lastCooperativeCloseTxHex = txHex;
+		if (localFeeSats !== undefined)
+			this.recordExternalCloseCandidate(txHex, localFeeSats);
+	}
+
+	/** Candidate identity is history data, never a rebroadcast payload. */
+	recordExternalCloseCandidate(txHex: string, localFeeSats: bigint): void {
+		const intent = this._state.externalClose;
+		if (intent) {
+			const transactions = intent.transactions ?? [];
+			const txid = bitcoin.Transaction.fromHex(txHex).getId();
+			this._state.externalClose = {
+				...intent,
+				transactions: [
+					...transactions.filter(
+						(entry) => bitcoin.Transaction.fromHex(entry.txHex).getId() !== txid
+					),
+					{ txHex, localFeeSats: Number(localFeeSats) }
+				]
+			};
+		}
 	}
 
 	/**
@@ -7708,9 +7729,85 @@ export class Channel {
 		];
 	}
 
-	/**
-	 * Initiate cooperative close by sending shutdown.
-	 */
+	/** Read-only payout estimate. No balance or shutdown state is held. */
+	quoteCooperativeClose(
+		scriptPubkey: Buffer,
+		simpleClose: boolean,
+		liveFeeratePerKw = 0,
+		acceptStaleStateRisk = false
+	): ICooperativeCloseQuote {
+		const state = this._state;
+		if (state.state !== ChannelState.NORMAL || this.isQuiescing()) {
+			throw new Error('Cannot close cooperatively: channel is not ready');
+		}
+		const blocked = this.closingBlockedBy();
+		if (blocked) throw new Error(`Cannot close cooperatively: ${blocked}`);
+		if (
+			state.restoreRevokedRisk === true ||
+			(this.isMutualCloseHeld() && acceptStaleStateRisk !== true)
+		) {
+			throw new Error(`Cannot close cooperatively: ${this._heldCloseOrigin()}`);
+		}
+		const ffor = this._fforUpdateRefusal('shutdown', { origin: 'local' });
+		if (ffor) throw new Error(`Cannot close cooperatively: ${ffor}`);
+		if (!isValidShutdownScript(scriptPubkey, true)) {
+			throw new Error('Invalid local shutdown scriptPubkey');
+		}
+		const taproot = isTaprootChannel(state.channelType);
+		const simple = simpleClose && !taproot;
+		const rate = Math.max(liveFeeratePerKw, this.getClosingFeeratePerKw());
+		// The peer chooses its shutdown script later. Price a P2TR/P2WSH
+		// output until that script is known and label every quote estimated.
+		const remoteLength = state.remoteShutdownScript?.length ?? 34;
+		const weight = closingTxWeight(scriptPubkey.length, remoteLength, taproot);
+		const calculated = calculateClosingFee(
+			rate,
+			scriptPubkey.length,
+			remoteLength,
+			taproot
+		);
+		const floor = minRelayFeeForWeight(weight);
+		const fee = calculated > floor ? calculated : floor;
+		const localPays = simple || state.role === ChannelRole.OPENER;
+		const localFee = localPays ? fee : 0n;
+		const amount = state.localBalanceMsat / 1000n - localFee;
+		const dust = simple
+			? isDustOutput(scriptPubkey, amount)
+			: amount <
+			  closingOutputDustLimit(
+					scriptPubkey,
+					state.localConfig.dustLimitSatoshis
+			  );
+		if (amount <= 0n || dust)
+			throw new Error('Cannot close cooperatively: our payout would be dust');
+		const profile = closingTxRelayProfile({
+			fundingAmount: state.fundingSatoshis,
+			localScriptPubkey: scriptPubkey,
+			remoteScriptPubkey:
+				state.remoteShutdownScript ??
+				Buffer.concat([Buffer.from([0, 32]), Buffer.alloc(32)]),
+			localAmount: amount,
+			remoteAmount: state.remoteBalanceMsat / 1000n - (localPays ? 0n : fee),
+			localDustLimit: simple ? 0n : state.localConfig.dustLimitSatoshis,
+			remoteDustLimit: simple ? 0n : state.remoteConfig.dustLimitSatoshis,
+			isTaproot: taproot
+		});
+		if (profile.feePaid < minRelayFeeForWeight(profile.weight)) {
+			throw new Error(
+				'Cannot close cooperatively: fee payer cannot cover the network fee'
+			);
+		}
+		return {
+			amountSats: Number(amount),
+			feeSats: Number(localFee),
+			networkFeeSats: Number(profile.feePaid),
+			feeratePerkw: rate,
+			feePayer: localPays ? 'local' : 'remote',
+			feeEstimated: true
+		};
+	}
+
+	/** Initiate cooperative close by sending shutdown. */
 	initiateShutdown(
 		scriptPubkey: Buffer,
 		/**
@@ -7719,7 +7816,8 @@ export class Channel {
 		 * restored from a Recovery Capsule, whose BALANCES nothing can prove
 		 * current (issue #469).
 		 */
-		acceptStaleStateRisk = false
+		acceptStaleStateRisk = false,
+		externalDestination = false
 	): ChannelAction[] {
 		// A mutual close needs no revocation, which is why the hold allows the
 		// channel to resume - but it pays out the balances THIS row carries,
@@ -7780,7 +7878,35 @@ export class Channel {
 				}
 			];
 		}
+		if (externalDestination) {
+			try {
+				this.quoteCooperativeClose(
+					scriptPubkey,
+					this.isSimpleClose(),
+					0,
+					acknowledged
+				);
+			} catch (error) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: (error as Error).message,
+						cleanup: 'none'
+					}
+				];
+			}
+		}
 		const actions = this._initiateShutdown(scriptPubkey);
+		if (
+			externalDestination &&
+			!actions.some((a) => a.type === ChannelActionType.ERROR)
+		) {
+			this._state.externalClose = {
+				scriptHex: scriptPubkey.toString('hex'),
+				timestamp: Date.now()
+			};
+			actions.unshift({ type: ChannelActionType.PERSIST_STATE });
+		}
 		if (
 			acknowledged &&
 			isRecencyUnproven(this._state) &&
@@ -8650,6 +8776,12 @@ export class Channel {
 		const isOpener = this._state.role === ChannelRole.OPENER;
 		const localSat = this._state.localBalanceMsat / 1000n;
 		const remoteSat = this._state.remoteBalanceMsat / 1000n;
+		if (
+			this._state.externalClose &&
+			localSat - (isOpener ? feeSatoshis : 0n) <
+				this.ownClosingOutputDustLimit()
+		)
+			return false;
 		const { feePaid, weight } = closingTxRelayProfile({
 			fundingAmount: this._state.fundingSatoshis,
 			localScriptPubkey:
@@ -8744,6 +8876,11 @@ export class Channel {
 		const theirValue = this._state.remoteBalanceMsat / 1000n;
 		const ourDust = isDustOutput(closerScript, ourValue);
 		const theirDust = isDustOutput(closeeScript, theirValue);
+		if (this._state.externalClose && ourDust) {
+			return {
+				error: 'Cannot close cooperatively: external payout would be dust'
+			};
+		}
 
 		if (ourDust && theirDust) {
 			// Both outputs dust: the spec's OP_RETURN-burn case. We never generate
@@ -9039,6 +9176,8 @@ export class Channel {
 		// that drops our non-dust output.
 		const ourValue = this._state.localBalanceMsat / 1000n;
 		const ourDust = isDustOutput(msg.closeeScriptPubkey, ourValue);
+		if (this._state.externalClose && ourDust)
+			return err('Cannot close cooperatively: external payout would be dust');
 		let variant: ClosingSigVariant;
 		let theirSig: Buffer;
 		if (ourDust) {

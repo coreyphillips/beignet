@@ -873,10 +873,20 @@ async function handleChannel(): Promise<void> {
 				})
 			);
 		}
+		case 'close-quote':
+			return outputResult(
+				await httpRequest('POST', '/channel/close-quote', {
+					channelId: filteredArgs[2],
+					address: parseFlag('--address'),
+					acceptStaleStateRisk:
+						hasFlag('--accept-stale-state-risk') || undefined
+				})
+			);
 		case 'close':
 			return outputResult(
 				await httpRequest('POST', '/channel/close', {
 					channelId: filteredArgs[2],
+					address: parseFlag('--address'),
 					// A channel restored from a Recovery Capsule refuses an
 					// unacknowledged cooperative close too: a mutual close pays
 					// out the restored balances, which cannot be proven
@@ -1684,12 +1694,61 @@ async function handleWallet(): Promise<void> {
 			return outputResult(await httpRequest('POST', '/wallet/refresh'));
 		case 'descriptors':
 			return outputResult(await httpRequest('GET', '/wallet/descriptors'));
+		case 'sweep-prepare': {
+			const input = filteredArgs[2];
+			let request: Record<string, unknown>;
+			try {
+				request = JSON.parse(
+					input?.trimStart().startsWith('{')
+						? input
+						: fs.readFileSync(input, 'utf8')
+				);
+				if (!request || typeof request !== 'object' || Array.isArray(request))
+					throw new Error('Expected a JSON object');
+			} catch {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet wallet sweep-prepare <requestJson|requestFile>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/onchain/sweep/prepare', request)
+			);
+		}
+		case 'sweep-submit':
+			return outputResult(
+				await httpRequest('POST', '/onchain/sweep/submit', {
+					requestId: filteredArgs[2]
+				})
+			);
+		case 'sweep-cancel':
+			return outputResult(
+				await httpRequest('POST', '/onchain/sweep/cancel', {
+					requestId: filteredArgs[2]
+				})
+			);
+		case 'sweep-get':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/onchain/sweep?requestId=${encodeURIComponent(
+						filteredArgs[2] || ''
+					)}`
+				)
+			);
 		default:
 			output({
 				ok: false,
 				error: {
 					code: 'UNKNOWN_COMMAND',
-					message: 'Usage: beignet wallet [refresh|descriptors]'
+					message:
+						'Usage: beignet wallet [refresh|descriptors|sweep-prepare|sweep-submit|sweep-cancel|sweep-get]'
 				}
 			});
 			process.exitCode = 1;
@@ -2911,6 +2970,10 @@ On-chain:
   fee-estimates                          Current fee estimates (sats/vbyte)
   wallet refresh                         Re-sync the on-chain wallet
   wallet descriptors                     Export BIP 380 output descriptors
+  wallet sweep-prepare <json|file>        Persist a reviewed sweep without broadcast
+  wallet sweep-submit <requestId>        Submit or rebroadcast the saved sweep
+  wallet sweep-cancel <requestId>        Cancel only before submission
+  wallet sweep-get <requestId>           Read durable sweep status
                                          (public keys only, never private)
   recover-fallback-funds [--fee-rate N]  Sweep funding-key fallback UTXOs into
                                          the wallet
@@ -2994,7 +3057,8 @@ Channels:
                                          Connect to peer + open in one call
                                          --trusted: zero-conf, usable before
                                          confirmation (trusted peers only)
-  channel close <id>                     Cooperative close
+  channel close <id> [--address <addr>]   Cooperative close
+  channel close-quote <id> [--address <addr>]  Estimate the close payout
                                          --accept-stale-state-risk: required
                                          for a channel restored from a
                                          Recovery Capsule, whose balances a

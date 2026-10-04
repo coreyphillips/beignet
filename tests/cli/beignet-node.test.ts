@@ -1011,7 +1011,8 @@ describe('BeignetNode new methods', () => {
 		// Inherit the prototype so internal helpers (toOnchainTxInfo) resolve.
 		const txs = BeignetNode.prototype.listOnchainTransactions.call(
 			Object.assign(Object.create(BeignetNode.prototype), {
-				wallet: fakeWallet
+				wallet: fakeWallet,
+				node: { listExternalClosePayments: () => [] }
 			}) as unknown as BeignetNode
 		);
 		expect(txs).to.have.lengthOf(2);

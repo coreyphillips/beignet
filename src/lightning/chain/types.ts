@@ -144,6 +144,8 @@ export interface ICommitmentBroadcast {
 	 * full tx to read output values). Only set for revoked-commitment broadcasts.
 	 */
 	revokedTxHex?: string;
+	/** Observed cooperative transaction, retained for external payout history. */
+	cooperativeTxHex?: string;
 	/**
 	 * The funding outpoint this transaction was reported as spending (issue
 	 * #479).

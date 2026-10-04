@@ -11792,6 +11792,93 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/** Estimate the cooperative payout at the current chain feerate. */
+	closeQuote(
+		channelId: Buffer,
+		scriptPubkey: Buffer,
+		acceptStaleStateRisk = false
+	): import('../chain/closing').ICooperativeCloseQuote {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new Error(cidErr);
+		if (
+			!Buffer.isBuffer(scriptPubkey) ||
+			!isValidShutdownScript(scriptPubkey, true)
+		) {
+			throw new Error('Invalid local shutdown scriptPubkey');
+		}
+		return this.channelManager.quoteCooperativeClose(
+			channelId,
+			scriptPubkey,
+			acceptStaleStateRisk
+		);
+	}
+
+	/** Payout history derived from durable intent and the actual signed close. */
+	listExternalClosePayments(): Array<{
+		channelId: string;
+		txid: string;
+		scriptHex: string;
+		amountSats: number;
+		feeSats: number;
+		networkFeeSats: number;
+		satsPerVbyte: number;
+		timestamp: number;
+		confirmationHeight: number;
+	}> {
+		const payments: ReturnType<LightningNode['listExternalClosePayments']> = [];
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (!state.externalClose || !state.channelId) continue;
+			const status = this._buildCloseStatus(state, state.channelId);
+			if (status?.closer !== 'cooperative') continue;
+			const recorded = state.externalClose.transactions?.find(
+				(entry) =>
+					bitcoin.Transaction.fromHex(entry.txHex).getId() ===
+					status.closingTxid
+			);
+			// Only the funding spend selected by the chain monitor is final.
+			// Before observation, closeStatus selects the last signed candidate.
+			if (!recorded) continue;
+			const observed = this.channelManager
+				.getMonitor(state.channelId)
+				?.getFullState().commitmentBroadcast?.cooperativeTxHex;
+			const signed = state.lastCooperativeCloseTxHex
+				? bitcoin.Transaction.fromHex(state.lastCooperativeCloseTxHex)
+				: undefined;
+			const tx = observed
+				? bitcoin.Transaction.fromHex(observed)
+				: signed && signed.getId() === status.closingTxid
+				? signed
+				: bitcoin.Transaction.fromHex(recorded.txHex);
+			const script = Buffer.from(state.externalClose.scriptHex, 'hex');
+			const expected =
+				Number(state.localBalanceMsat / 1000n) - recorded.localFeeSats;
+			const output = tx.outs.find(
+				(out) => out.script.equals(script) && out.value === expected
+			);
+			if (!output) continue;
+			const amountSats = output.value;
+			const networkFeeSats =
+				Number(state.fundingSatoshis) -
+				tx.outs.reduce((sum, out) => sum + out.value, 0);
+			payments.push({
+				channelId: state.channelId.toString('hex'),
+				txid: tx.getId(),
+				scriptHex: state.externalClose.scriptHex,
+				amountSats,
+				feeSats: Math.max(
+					0,
+					Number(state.localBalanceMsat / 1000n) - amountSats
+				),
+				networkFeeSats,
+				satsPerVbyte: networkFeeSats / tx.virtualSize(),
+				timestamp: state.externalClose.timestamp,
+				confirmationHeight: status.confirmationHeight
+			});
+		}
+		return payments;
+	}
+
 	closeChannel(
 		channelId: Buffer,
 		scriptPubkey: Buffer,
@@ -11801,7 +11888,9 @@ export class LightningNode extends EventEmitter {
 		 * pays out the balances that row carries, and a stale allocation can
 		 * only be the peer-favourable one (issue #469).
 		 */
-		acceptStaleStateRisk = false
+		acceptStaleStateRisk = false,
+		/** Record a payment to this destination instead of a wallet payout. */
+		externalDestination = false
 	): { ok: boolean; error?: string } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
@@ -11824,7 +11913,8 @@ export class LightningNode extends EventEmitter {
 		const result = this.channelManager.initiateShutdown(
 			channelId,
 			scriptPubkey,
-			acceptStaleStateRisk
+			acceptStaleStateRisk,
+			externalDestination
 		);
 		if (!result.ok) {
 			if (stamped) {
