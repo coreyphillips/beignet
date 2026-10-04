@@ -145,6 +145,8 @@ describe('Interop chaos: LND crash-resume (regtest)', function () {
 			storage.open();
 			const kill = new KillSwitch();
 			node = mkNode(sealableStorage(storage, kill));
+			// Persistent channel keys require a real chain tip before opening.
+			node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 			const nodeId = node.getNodeId();
 
 			await fundLndWallet(lnd, 110);

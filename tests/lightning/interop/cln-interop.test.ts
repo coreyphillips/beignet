@@ -1767,6 +1767,7 @@ describe('Interop: Beignet ↔ CLN (regtest)', function () {
 				const nodeId = node.getNodeId();
 
 				await fundClnWallet(cln);
+				node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 				await node.connectPeer(clnPubkey, CLN_P2P_HOST, CLN_P2P_PORT);
 				await sleep(2000);
 
@@ -1829,6 +1830,7 @@ describe('Interop: Beignet ↔ CLN (regtest)', function () {
 				expect(recoveredState).to.equal(ChannelState.AWAITING_REESTABLISH);
 
 				// Phase 4: Reconnect
+				node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 				await node.connectPeer(clnPubkey, CLN_P2P_HOST, CLN_P2P_PORT);
 				await sleep(5000);
 
@@ -1903,6 +1905,7 @@ describe('Interop: Beignet ↔ CLN (regtest)', function () {
 				const beignetNodeId = node.getNodeId();
 
 				await fundClnWallet(cln);
+				node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 				await node.connectPeer(clnPubkey, CLN_P2P_HOST, CLN_P2P_PORT);
 				await sleep(2000);
 

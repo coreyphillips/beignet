@@ -1822,6 +1822,7 @@ describe('Interop: Beignet ↔ LND (regtest)', function () {
 
 				// Fund LND and open channel
 				await fundLndWallet(lnd, 110);
+				node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 				await node.connectPeer(lndPubkey, LND_P2P_HOST, LND_P2P_PORT);
 				await sleep(2000);
 
@@ -1897,6 +1898,7 @@ describe('Interop: Beignet ↔ LND (regtest)', function () {
 				expect(recoveredState).to.equal(ChannelState.AWAITING_REESTABLISH);
 
 				// ── Phase 4: Reconnect and verify reestablish ──
+				node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 				await node.connectPeer(lndPubkey, LND_P2P_HOST, LND_P2P_PORT);
 				await sleep(5000);
 
@@ -1992,6 +1994,7 @@ describe('Interop: Beignet ↔ LND (regtest)', function () {
 				const nodeId = node.getNodeId();
 
 				await fundLndWallet(lnd, 110);
+				node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 				await node.connectPeer(lndPubkey, LND_P2P_HOST, LND_P2P_PORT);
 				await sleep(2000);
 				await lnd.openChannelSync(nodeId, 500_000, 100_000);
@@ -2032,6 +2035,7 @@ describe('Interop: Beignet ↔ LND (regtest)', function () {
 				expect(recovered).to.not.be.undefined;
 
 				// ── RECONNECT — the moment the mainnet channels force-closed ──
+				node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 				await node.connectPeer(lndPubkey, LND_P2P_HOST, LND_P2P_PORT);
 				await sleep(6000);
 
@@ -2102,6 +2106,7 @@ describe('Interop: Beignet ↔ LND (regtest)', function () {
 				});
 
 				await fundLndWallet(lnd, 110);
+				node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 				await node.connectPeer(lndPubkey, LND_P2P_HOST, LND_P2P_PORT);
 				await sleep(2000);
 

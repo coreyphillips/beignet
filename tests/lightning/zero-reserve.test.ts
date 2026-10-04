@@ -125,6 +125,51 @@ function v2Params(
 }
 
 describe('One-way zero reserve negotiation', () => {
+	it('advertises qualified wallet support by default while preserving primary opt-in and explicit opt-out', () => {
+		const cases = [
+			{ config: {}, advertised: true },
+			{
+				config: { zeroReserve: { role: 'wallet' as const } },
+				advertised: true
+			},
+			{ config: { zeroReserve: { advertise: false } }, advertised: false },
+			{
+				config: { zeroReserve: { role: 'primary' as const } },
+				advertised: false
+			},
+			{
+				config: {
+					zeroReserve: { role: 'primary' as const, waiveClientReserve: true }
+				},
+				advertised: true
+			},
+			{
+				config: {
+					zeroReserve: {
+						role: 'primary' as const,
+						waiveClientReserve: true,
+						advertise: false
+					}
+				},
+				advertised: false
+			}
+		];
+		for (const [index, item] of cases.entries()) {
+			const node = createNode(
+				'zero-reserve-defaults',
+				index,
+				undefined,
+				item.config
+			);
+			try {
+				expect(
+					node.getLocalFeatures().hasFeature(Feature.OPTION_ZERO_RESERVE)
+				).to.equal(item.advertised);
+			} finally {
+				node.destroy();
+			}
+		}
+	});
 	it('requires both advertisements and preserves the one-way role policy', () => {
 		for (const role of ['wallet', 'primary'] as const) {
 			for (const advertise of [false, true]) {

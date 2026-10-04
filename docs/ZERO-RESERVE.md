@@ -1,6 +1,6 @@
 # Zero-reserve home channels
 
-This implements the `option_zero_reserve` form in [BOLTs proposal 1140](https://github.com/lightning/bolts/pull/1140): feature bits 64/65 and the empty v2 `disable_channel_reserve` TLV, type 4. The proposal is not yet a final standard. Support remains unadvertised by default during qualification.
+This implements the `option_zero_reserve` form in [BOLTs proposal 1140](https://github.com/lightning/bolts/pull/1140): feature bits 64/65 and the empty v2 `disable_channel_reserve` TLV, type 4. The proposal is not yet a final standard. Wallets advertise support and accept waivers by default after qualification. Set `advertise: false` to opt out. Primaries grant waivers only with their operator setting.
 
 ## One-way policy
 
@@ -41,5 +41,7 @@ Both commitment transactions must remain valid. An HTLC that would leave a commi
 ## Compatibility and migration
 
 Peers that do not advertise bits 64/65 keep ordinary reserves. The proposal uses neither the Phoenix-specific feature bit nor a private substitute. Real waiver qualification requires a supporting Beignet primary and wallet; CLN, LND, and eclair checks establish that ordinary channels remain compatible.
+
+Regtest qualification covers JIT pay-all to zero, both opener roles through v1 and v2 opens, P2WPKH/P2TR/P2WSH splice destinations, and SQLite restart/reestablishment. The primary keeps its reserve in every path. Ordinary CLN 26.06.1, LND 0.20 and Eclair 0.14.1 channels, payments, closes and crash recovery were checked with optional feature advertisement. Interoperability fixture corrections supply real chain heights and deterministic local offer paths.
 
 Existing channels keep their original terms. Cooperative close and reopening provide the migration path. Enabling this setting does not rewrite an existing channel's reserve.

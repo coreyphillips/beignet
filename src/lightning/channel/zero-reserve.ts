@@ -1,6 +1,6 @@
 /** One-way home-channel policy for option_zero_reserve (BOLTs proposal 1140). */
 export interface IZeroReserveConfig {
-	/** Advertise support in init. Disabled until qualification is complete. */
+	/** Advertise support in init. Defaults on for wallets and opted-in primaries. */
 	advertise?: boolean;
 	/** Wallets accept waivers. Primaries always retain their own reserve. */
 	role?: 'wallet' | 'primary';

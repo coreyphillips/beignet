@@ -1871,8 +1871,18 @@ export class LightningNode extends EventEmitter {
 			localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT);
 			localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT + 1);
 		}
-		// Keep proposal support opt-in until live qualification is complete.
-		if (config.zeroReserve?.advertise) {
+		const zeroReserveRole =
+			config.zeroReserve?.role ??
+			(config.jitReceive?.enabled || config.zeroReserve?.waiveClientReserve
+				? 'primary'
+				: 'wallet');
+		// Qualified wallets accept waivers by default. Primaries still need
+		// the operator setting, and an explicit advertisement opt-out wins.
+		const advertiseZeroReserve =
+			config.zeroReserve?.advertise ??
+			(zeroReserveRole === 'wallet' ||
+				config.zeroReserve?.waiveClientReserve === true);
+		if (advertiseZeroReserve) {
 			localFeatures.setOptional(Feature.OPTION_ZERO_RESERVE);
 		} else {
 			localFeatures.clearBit(Feature.OPTION_ZERO_RESERVE);
@@ -1888,11 +1898,7 @@ export class LightningNode extends EventEmitter {
 			localFeatures,
 			zeroReserve: {
 				...config.zeroReserve,
-				role:
-					config.zeroReserve?.role ??
-					(config.jitReceive?.enabled || config.zeroReserve?.waiveClientReserve
-						? 'primary'
-						: 'wallet')
+				role: zeroReserveRole
 			},
 			localConfig: config.channelConfig,
 			localBasepoints: config.channelBasepoints,
