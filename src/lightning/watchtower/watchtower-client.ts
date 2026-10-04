@@ -412,7 +412,9 @@ export class WatchtowerClient extends EventEmitter {
 				error: err.message
 			});
 		});
-		transport.on('close', () => this.onClose(state, slot));
+		transport.on('close', () => {
+			if (slot.transport === transport) this.onClose(state, slot);
+		});
 
 		transport
 			.connect()
@@ -503,6 +505,7 @@ export class WatchtowerClient extends EventEmitter {
 		try {
 			if (!slot.session && !slot.rejected && !slot.negotiating) {
 				await this.negotiateSession(state, slot);
+				return;
 			}
 			await this.drainSlot(state, slot);
 		} catch (err) {
@@ -567,6 +570,10 @@ export class WatchtowerClient extends EventEmitter {
 			slot.session = session;
 			slot.sessionKey = sessionKey;
 			this.store?.saveWatchtowerSession(session, sessionKey);
+			// LND uses a connection either to create a session or to stream
+			// updates. Reconnect with this same key before shipping the backlog.
+			slot.initReceived = false;
+			slot.transport?.close();
 			this.emitLog('session_created', {
 				tower: state.address.uri,
 				blobType: slot.blobType,
@@ -582,7 +589,7 @@ export class WatchtowerClient extends EventEmitter {
 		state: ITowerState,
 		slot: ISessionSlot
 	): Promise<void> {
-		if (slot.draining) return;
+		if (slot.draining || slot.negotiating) return;
 		if (!slot.transport?.isConnected() || !slot.initReceived) return;
 		if (!slot.session) {
 			// Lazily negotiate when the first update of this blob type arrives on
