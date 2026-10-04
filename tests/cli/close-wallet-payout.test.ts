@@ -69,6 +69,7 @@ const storedChange = (): unknown => ({
 interface ICloseCapture {
 	script?: Buffer;
 	acceptStaleStateRisk?: boolean;
+	externalDestination?: boolean;
 }
 
 function closableNode(opts: {
@@ -81,13 +82,26 @@ function closableNode(opts: {
 		node: {
 			getChannel: (): unknown => ({ channelId: Buffer.alloc(32) }),
 			getFundingAddress: (): string => FUNDING_ADDR,
+			closeQuote: (_id: Buffer, script: Buffer): unknown => {
+				opts.capture.script = script;
+				return {
+					amountSats: 999800,
+					feeSats: 200,
+					networkFeeSats: 200,
+					feeratePerkw: 253,
+					feePayer: 'local',
+					feeEstimated: true
+				};
+			},
 			closeChannel: (
 				_id: Buffer,
 				script: Buffer,
-				acceptStaleStateRisk: boolean
+				acceptStaleStateRisk: boolean,
+				externalDestination: boolean
 			): unknown => {
 				opts.capture.script = script;
 				opts.capture.acceptStaleStateRisk = acceptStaleStateRisk;
+				opts.capture.externalDestination = externalDestination;
 				return { ok: true };
 			}
 		},
@@ -231,5 +245,126 @@ describe('closeChannel wallet-credited payout (issue #542)', () => {
 		});
 		await bn.closeChannel(CHANNEL_ID, true);
 		expect(capture.acceptStaleStateRisk).to.equal(true);
+	});
+
+	it('quotes and closes directly to P2TR without looking up a wallet address', async () => {
+		const capture: ICloseCapture = {};
+		let lookups = 0;
+		const node = closableNode({
+			capture,
+			wallet: {
+				getNextAvailableAddress: () => {
+					lookups++;
+					throw new Error('unexpected lookup');
+				}
+			}
+		});
+		const script = Buffer.from(
+			'512079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798',
+			'hex'
+		);
+		const address = bitcoin.address.fromOutputScript(
+			script,
+			bitcoin.networks.regtest
+		);
+		const quote = await node.closeQuote(CHANNEL_ID, address);
+		expect(quote.amountSats).to.equal(999800);
+		expect(capture.script!.equals(script)).to.equal(true);
+		expect(capture.externalDestination).to.equal(undefined);
+		expect((await node.closeChannel(CHANNEL_ID, false, address)).ok).to.equal(
+			true
+		);
+		expect(capture.externalDestination).to.equal(true);
+		expect(capture.script!.equals(script)).to.equal(true);
+		expect(lookups).to.equal(0);
+	});
+
+	for (const address of [
+		'',
+		'not-an-address',
+		bitcoin.payments.p2wpkh({
+			hash: Buffer.alloc(20, 1),
+			network: bitcoin.networks.bitcoin
+		}).address!
+	]) {
+		it(`refuses an invalid or foreign destination: ${
+			address || 'empty'
+		}`, async () => {
+			const capture: ICloseCapture = {};
+			const node = closableNode({ capture, wallet: {} });
+			for (const operation of [
+				() => node.closeQuote(CHANNEL_ID, address),
+				() => node.closeChannel(CHANNEL_ID, false, address)
+			]) {
+				let code: string | undefined;
+				try {
+					await operation();
+				} catch (error) {
+					code = (error as { code: string }).code;
+				}
+				expect(code).to.equal('INVALID_PARAMS');
+			}
+			expect(capture.script).to.equal(undefined);
+		});
+	}
+
+	it('applies the payment limit to the full external debit', async () => {
+		const capture: ICloseCapture = {};
+		const node = closableNode({ capture, wallet: {} });
+		Object.assign(node, { _maxPaymentSats: 999900 });
+		let code: string | undefined;
+		try {
+			await node.closeChannel(CHANNEL_ID, false, CHANGE_ADDR);
+		} catch (error) {
+			code = (error as { code: string }).code;
+		}
+		expect(code).to.equal('SPENDING_LIMIT_EXCEEDED');
+		expect(capture.externalDestination).to.equal(undefined);
+	});
+
+	it('merges the actual external payout into on-chain history exactly once', () => {
+		const txid = 'ab'.repeat(32);
+		const node = Object.assign(Object.create(BeignetNode.prototype), {
+			networkName: 'regtest',
+			wallet: {
+				transactions: {
+					[txid]: {
+						txid,
+						type: 'received',
+						value: 0.1,
+						fee: 0,
+						satsPerByte: 1,
+						address: CHANGE_ADDR,
+						timestamp: 1
+					}
+				}
+			},
+			node: {
+				listExternalClosePayments: () => [
+					{
+						channelId: CHANNEL_ID,
+						txid,
+						scriptHex: scriptOf(CHANGE_ADDR).toString('hex'),
+						amountSats: 999800,
+						feeSats: 200,
+						satsPerVbyte: 1.2,
+						timestamp: 2,
+						confirmationHeight: 100
+					}
+				]
+			}
+		}) as BeignetNode;
+		const history = node.listOnchainTransactions();
+		expect(history).to.have.length(1);
+		expect(history[0]).to.include({
+			source: 'cooperative-close',
+			channelId: CHANNEL_ID,
+			type: 'sent',
+			valueSats: 999800,
+			feeSats: 200,
+			confirmed: true,
+			height: 100,
+			address: CHANGE_ADDR
+		});
 	});
 });

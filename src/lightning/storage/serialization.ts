@@ -556,6 +556,11 @@ export interface ISerializedChannelState {
 	// Cooperative close: fully-signed mutual-close tx (hex). Persisted so a restart
 	// in the pre-confirmation window can rebroadcast it and re-arm the funding watch.
 	lastCooperativeCloseTxHex?: string;
+	externalClose?: {
+		scriptHex: string;
+		timestamp: number;
+		transactions?: Array<{ txHex: string; localFeeSats: number }>;
+	};
 	// Data loss protection: MUST persist - a restart after detecting we fell
 	// behind would otherwise forget the flag and let a force-close broadcast
 	// our stale (revoked) commitment.
@@ -1092,6 +1097,7 @@ export function serializeChannelState(
 		leaseExpiry: s.leaseExpiry,
 		leaseCommitBlockheight: s.leaseCommitBlockheight,
 		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
+		externalClose: s.externalClose,
 		dataLossDetected: s.dataLossDetected,
 		fundingConfirmedLate: s.fundingConfirmedLate,
 		stateUncertain: s.stateUncertain,
@@ -1744,6 +1750,7 @@ export function deserializeChannelState(
 		leaseExpiry: s.leaseExpiry,
 		leaseCommitBlockheight: s.leaseCommitBlockheight,
 		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
+		externalClose: s.externalClose,
 		dataLossDetected: s.dataLossDetected,
 		fundingConfirmedLate: s.fundingConfirmedLate,
 		stateUncertain: s.stateUncertain,

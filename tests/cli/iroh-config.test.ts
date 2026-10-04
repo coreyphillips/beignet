@@ -54,8 +54,10 @@ describe('Iroh daemon configuration', () => {
 			});
 			target.savePeerAddress(pubkey, id, 0, { type: 'iroh', endpointId: id });
 			const node = Object.create(BeignetNode.prototype) as {
+				storage: SqliteStorage;
 				carryDaemonState: (from: SqliteStorage, to: SqliteStorage) => void;
 			};
+			node.storage = source;
 			node.carryDaemonState(source, target);
 			expect(target.loadAllPeerAddresses()).to.deep.equal(
 				source.loadAllPeerAddresses()

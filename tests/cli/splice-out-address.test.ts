@@ -267,4 +267,64 @@ describe('Daemon splice-out address passthrough', function () {
 			engine.spliceQuote = originalQuote;
 		}
 	});
+
+	for (const route of ['/channel/close', '/channel/close-quote']) {
+		for (const address of ['not-an-address', '', 42, null, MAINNET_ADDRESS]) {
+			it(`refuses invalid ${route} address ${JSON.stringify(
+				address
+			)}`, async () => {
+				const res = await request(
+					port,
+					{ channelId: UNKNOWN_CHANNEL_ID, address },
+					route
+				);
+				expect(res.status).to.equal(400);
+				expect((res.body.error as { code: string }).code).to.equal(
+					'INVALID_PARAMS'
+				);
+			});
+		}
+	}
+
+	it('forwards external close destination and exact stale-state acknowledgement', async () => {
+		const close = daemon.node.closeChannel;
+		const quote = daemon.node.closeQuote;
+		const calls: unknown[][] = [];
+		daemon.node.closeChannel = async (...args) => {
+			calls.push(args);
+			return { ok: true };
+		};
+		daemon.node.closeQuote = async (...args) => {
+			calls.push(args);
+			return {
+				amountSats: 999800,
+				feeSats: 200,
+				networkFeeSats: 200,
+				feeratePerkw: 253,
+				feePayer: 'local',
+				feeEstimated: true
+			};
+		};
+		try {
+			for (const route of ['/channel/close', '/channel/close-quote']) {
+				const res = await request(
+					port,
+					{
+						channelId: UNKNOWN_CHANNEL_ID,
+						address: REGTEST_ADDRESS,
+						acceptStaleStateRisk: 'true'
+					},
+					route
+				);
+				expect(res.status).to.equal(200);
+			}
+			expect(calls).to.deep.equal([
+				[UNKNOWN_CHANNEL_ID, false, REGTEST_ADDRESS],
+				[UNKNOWN_CHANNEL_ID, REGTEST_ADDRESS, false]
+			]);
+		} finally {
+			daemon.node.closeChannel = close;
+			daemon.node.closeQuote = quote;
+		}
+	});
 });

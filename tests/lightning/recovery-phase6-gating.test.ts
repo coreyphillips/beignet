@@ -45,6 +45,7 @@ function stubChannel(channelId: Buffer): Channel {
 		getChannelId: (): Buffer => channelId,
 		getTemporaryChannelId: (): Buffer | null => null,
 		getState: (): ChannelState => ChannelState.NORMAL,
+		getFullState: (): Record<string, unknown> => ({}),
 		markForReestablish: (): unknown[] => [],
 		isAbandonedV2Open: (): boolean => false
 	} as unknown as Channel;
@@ -729,6 +730,7 @@ describe('Recovery phase 6: the peer-close request survives a refusal', () => {
 			getChannelId: (): Buffer => channelId,
 			getTemporaryChannelId: (): Buffer | null => null,
 			getState: (): ChannelState => ChannelState.ERRORED,
+			getFullState: (): Record<string, unknown> => ({}),
 			markForReestablish: (): unknown[] => [],
 			buildRecoveryCloseActions: (): ChannelAction[] => [
 				{ type: ChannelActionType.PERSIST_STATE },
@@ -993,6 +995,7 @@ describe('Recovery phase 6: a restart asks the barrier, it does not assume', () 
 			getChannelId: (): Buffer => channelId,
 			getTemporaryChannelId: (): Buffer | null => null,
 			getState: (): ChannelState => ChannelState.AWAITING_FUNDING_CONFIRMED,
+			getFullState: (): Record<string, unknown> => ({}),
 			markForReestablish: (): unknown[] => [],
 			buildFundingReauthorizationActions: (): ChannelAction[] => [
 				{ type: ChannelActionType.PERSIST_STATE },

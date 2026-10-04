@@ -627,6 +627,9 @@ export type TChannelFundingQuote = {
 };
 
 export interface OnchainTxInfo {
+	/** External cooperative payouts are retained with their channel record. */
+	source?: 'cooperative-close' | 'onchain-sweep';
+	channelId?: string;
 	txid: string;
 	type: 'sent' | 'received';
 	valueSats: number;

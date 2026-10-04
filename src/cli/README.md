@@ -161,7 +161,7 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `openChannelAndWait(pubkey, amountSats, opts?)` | `Promise<ChannelInfo>` | Open channel + wait for NORMAL state. `opts: { pushSats?, timeoutMs? }` |
 | `openZeroConfChannel(pubkey, sats, pushSats?)` | `ChannelInfo` | Open zero-conf channel (peer must be trusted) |
 | `openChannelV2(pubkey, params)` | `ChannelInfo` | Open dual-funded v2 channel |
-| `closeChannel(channelId, acceptStaleStateRisk?)` | `Promise<{ ok, error? }>` | Cooperative close (`await` it): the payout goes to a wallet-scanned address on the change chain, never to a handed-out receive address. A capsule-restored channel needs `acceptStaleStateRisk: true`, because a mutual close signs the balances that row carries |
+| `closeChannel(channelId, acceptStaleStateRisk?, address?)` | `Promise<{ ok, error? }>` | Cooperative close (`await` it): optional `address` pays an external destination and records the signed payout in on-chain history. Without it, the payout goes to a wallet-scanned address on the change chain, never to a handed-out receive address. A capsule-restored channel needs `acceptStaleStateRisk: true`, because a mutual close signs the balances that row carries |
 | `forceCloseChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error?, commitmentTxid? }` | Force close; the sweep pays the wallet's change chain, never a handed-out receive address. A capsule-restored channel needs `acceptStaleStateRisk: true` |
 | `spliceIn(channelId, amountSats, feerate)` | `SpliceResult` | Add funds to existing channel |
 | `spliceOut(channelId, amountSats, feerate, destinationAddress?)` | `SpliceResult` | Withdraw funds from channel, to the wallet or an external address. An address-targeted splice-out counts amount + fee against `maxPaymentSats` and `dailySpendLimitSats` |
@@ -1697,7 +1697,8 @@ beignet channel open-v2 <pubkey> <sats> [fundingFeeratePerkw] [--request-funds <
 # given rate ceiling; --blockheight defaults to the node's current tip.
 beignet channel open-and-wait <pubkey> <sats> [pushSats] [--timeout 60000]
 beignet channel connect-and-open <pubkey> <host> <port> <sats> [pushSats]
-beignet channel close <channelId> [--accept-stale-state-risk]
+beignet channel close <channelId> [--address <address>] [--accept-stale-state-risk]
+beignet channel close-quote <channelId> [--address <address>]
 beignet channel forceclose <channelId> [--accept-stale-state-risk]
 # Both closes pay out to a wallet-owned address the wallet scans, on the
 # internal change chain: the next unused change address when the wallet can
@@ -2285,6 +2286,8 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 
 ### Endpoints
 
+The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wallet sweep-submit <requestId>`, `wallet sweep-cancel <requestId>` and `wallet sweep-get <requestId>`. Preparation and submission are separate: preparation persists the exact signed transaction, and submission never selects coins again. Cancellation remains `cancelling` if reservation cleanup is interrupted; repeat it to finish. Submitted inputs retain their reservations after confirmation to prevent another send after a reorg. Generic UTXO freeze and unfreeze cannot take over these inputs. Database replacement carries the journal and its reservations together, and refuses an unresolved sweep.
+
 | Method | Path | Parameters | Description |
 |--------|------|------------|-------------|
 | GET | `/info` | -- | Node info |
@@ -2312,6 +2315,10 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/wallet/refresh` | -- | Sync wallet |
 | POST | `/send` | `{ address, amountSats, satsPerVbyte? }` | Send on-chain (optional fee rate). Counts amount + fee against the combined daily spend limit |
 | POST | `/send-max` | `{ address, satsPerVbyte? }` | Sweep the whole on-chain balance to one address. The computed sweep total is checked against the combined daily spend limit before broadcast |
+| POST | `/onchain/sweep/prepare` | `{ requestId, address, satsPerVbyte, inputOutpoints: [{txid, vout}], debitSats, maxFeeSats }` | Reserve the reviewed wallet-owned inputs and persist one signed sweep without broadcasting. Reject foreign, frozen or pledged inputs and a changed debit or excessive fee |
+| POST | `/onchain/sweep/submit` | `{ requestId }` | Submit or rebroadcast the same saved transaction. First submission records the spend exactly once before broadcast |
+| POST | `/onchain/sweep/cancel` | `{ requestId }` | Cancel only before any broadcast attempt, releasing only this request's reservations |
+| GET | `/onchain/sweep` | `?requestId=` | Read durable sweep status without signed hex. A lost response is resolved by querying or submitting this same ID |
 | POST | `/tx/bump-fee` | `{ txid, satsPerVbyte }` | RBF an unconfirmed tx at a higher fee (NOT_BOOSTABLE if RBF unavailable) |
 | POST | `/tx/boost` | `{ txid, satsPerVbyte? }` | Fee-bump a tx: RBF when possible, else CPFP |
 | GET | `/transactions/boostable` | -- | Unconfirmed txs eligible for RBF/CPFP, by method |
@@ -2578,3 +2585,9 @@ npm run test:all
 # skipping. See "Interop testing" in the top-level README.
 npm run test:interop
 ```
+
+### Cooperative close to an address
+
+`POST /channel/close-quote` accepts `{ channelId, address? }` and returns the expected `amountSats`, our `feeSats`, the whole transaction's `networkFeeSats`, `feeratePerkw`, `feePayer`, and `feeEstimated: true`. `BeignetNode.closeQuote(channelId, address?)` provides the same read-only estimate. The peer's shutdown script and fee negotiation can change the final payout. Legacy closes charge the opener; simple close can charge the party whose signed candidate confirms.
+
+`POST /channel/close` accepts the same optional address. It validates the network, checks external spend limits, and refuses while HTLCs, updates or a splice are pending. The ordinary wallet payout and explicit stale-state acknowledgement keep their existing behavior. An external close saves its destination before sending shutdown and retains signed payout candidates before broadcast. `GET /transactions` includes one `sent` row for the selected cooperative transaction with `source: "cooperative-close"`, `channelId`, the actual payout, our actual fee and its confirmation state, including after a restart. A force close remains a separate action.

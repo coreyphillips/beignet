@@ -2000,13 +2000,29 @@ export class ChannelManager extends EventEmitter {
 		return { ok: true, actions };
 	}
 
-	/**
-	 * Initiate cooperative shutdown on a channel.
-	 */
-	initiateShutdown(
+	quoteCooperativeClose(
 		channelId: Buffer,
 		scriptPubkey: Buffer,
 		acceptStaleStateRisk = false
+	): import('../chain/closing').ICooperativeCloseQuote {
+		const channel = this.channels.get(channelId.toString('hex'));
+		if (!channel) throw new Error('Channel not found');
+		const peer = this.channelPeers.get(channelId.toString('hex'));
+		if (!peer) throw new Error('Peer not found for channel');
+		return channel.quoteCooperativeClose(
+			scriptPubkey,
+			this.peerNegotiatedSimpleClose(peer),
+			this.config.getClosingFeeratePerKw?.() ?? 0,
+			acceptStaleStateRisk
+		);
+	}
+
+	/** Initiate cooperative shutdown on a channel. */
+	initiateShutdown(
+		channelId: Buffer,
+		scriptPubkey: Buffer,
+		acceptStaleStateRisk = false,
+		externalDestination = false
 	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
@@ -2022,15 +2038,50 @@ export class ChannelManager extends EventEmitter {
 			return { ok: false, actions: [], error };
 		}
 
+		const before = channel.getFullState();
+		const previous = {
+			state: before.state,
+			localShutdownScript: before.localShutdownScript,
+			externalClose: before.externalClose,
+			staleCloseRiskAccepted: before.staleCloseRiskAccepted,
+			simpleClose: before.simpleClose
+		};
 		// Stamp the negotiation path from the init-feature intersection before
 		// the state machine runs (its script rules depend on it).
 		channel.setSimpleClose(this.peerNegotiatedSimpleClose(peerPubkey));
+		this.applyClosingFeerate(channel);
 
 		const actions = channel.initiateShutdown(
 			scriptPubkey,
-			acceptStaleStateRisk
+			acceptStaleStateRisk,
+			externalDestination
 		);
-		this.processActions(peerPubkey, channel, actions);
+		const progress = newDispatchProgress();
+		this.processActions(peerPubkey, channel, actions, progress);
+		if (
+			externalDestination &&
+			progress.sendsWithheld &&
+			!progress.sendsHeld &&
+			!progress.attemptedMessageTypes.has(MessageType.SHUTDOWN)
+		) {
+			const current = channel.getFullState();
+			if (current.state === ChannelState.SHUTTING_DOWN)
+				current.state = previous.state;
+			else if (
+				current.state === ChannelState.AWAITING_REESTABLISH &&
+				current.preReestablishState === ChannelState.SHUTTING_DOWN
+			)
+				current.preReestablishState = previous.state;
+			current.localShutdownScript = previous.localShutdownScript;
+			current.externalClose = previous.externalClose;
+			current.staleCloseRiskAccepted = previous.staleCloseRiskAccepted;
+			current.simpleClose = previous.simpleClose;
+			return {
+				ok: false,
+				actions: [],
+				error: 'External close intent was not persisted'
+			};
+		}
 		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
 		if (errorAction) {
 			return {
@@ -4685,8 +4736,20 @@ export class ChannelManager extends EventEmitter {
 				// Persist the signed close tx BEFORE processActions emits channel:closed
 				// (which triggers persistChannel upstream) so a restart in the
 				// pre-confirmation window can rebroadcast it and keep the funding watch.
-				channel.recordCooperativeCloseTx(Buffer.from(closeTx).toString('hex'));
-				this.emit('broadcast:tx', closeTx);
+				channel.recordCooperativeCloseTx(
+					Buffer.from(closeTx).toString('hex'),
+					channel.getFullState().role === ChannelRole.OPENER
+						? msg.feeSatoshis
+						: 0n
+				);
+				if (channel.getFullState().externalClose) {
+					actions.unshift(
+						{ type: ChannelActionType.PERSIST_STATE },
+						{ type: ChannelActionType.BROADCAST_TX, tx: closeTx }
+					);
+				} else {
+					this.emit('broadcast:tx', closeTx);
+				}
 				this.processActions(peerPubkey, channel, actions);
 			} else {
 				// Defense in depth: handleClosingSigned already gated CLOSED on a valid
@@ -4857,6 +4920,10 @@ export class ChannelManager extends EventEmitter {
 			channel,
 			feeSatoshis
 		);
+		channel.recordExternalCloseCandidate(
+			tx.toHex(),
+			channel.getFullState().role === ChannelRole.OPENER ? feeSatoshis : 0n
+		);
 		const signer = this.signerFor(channel, false);
 		return signer.signClosingTx(tx, witnessScript, Number(fundingSatoshis));
 	}
@@ -4935,6 +5002,10 @@ export class ChannelManager extends EventEmitter {
 			);
 		}
 		if (cache.ourPartialSig) return cache.ourPartialSig;
+		channel.recordExternalCloseCandidate(
+			cache.tx.toHex(),
+			channel.getFullState().role === ChannelRole.OPENER ? feeSatoshis : 0n
+		);
 		const nonces = channel.getClosingNonces();
 		const signer = this.signerFor(channel, false);
 		const partial = signer.signCommitmentPartial(
@@ -5196,6 +5267,10 @@ export class ChannelManager extends EventEmitter {
 				closerScript,
 				closeeScript
 			);
+		channel.recordExternalCloseCandidate(
+			tx.toHex(),
+			closerIsLocal ? feeSatoshis : 0n
+		);
 		const signer = this.signerFor(channel, false);
 		return signer.signClosingTx(tx, witnessScript, Number(fundingSatoshis));
 	}
@@ -5416,8 +5491,18 @@ export class ChannelManager extends EventEmitter {
 				  )
 				: null;
 		if (closeTx) {
-			channel.recordCooperativeCloseTx(Buffer.from(closeTx).toString('hex'));
-			this.emit('broadcast:tx', closeTx);
+			channel.recordCooperativeCloseTx(
+				Buffer.from(closeTx).toString('hex'),
+				0n
+			);
+			if (channel.getFullState().externalClose) {
+				actions.unshift(
+					{ type: ChannelActionType.PERSIST_STATE },
+					{ type: ChannelActionType.BROADCAST_TX, tx: closeTx }
+				);
+			} else {
+				this.emit('broadcast:tx', closeTx);
+			}
 			this.processActions(peerPubkey, channel, actions);
 		} else {
 			// Defense in depth: the state machine verified the sig already, so we
@@ -5492,8 +5577,18 @@ export class ChannelManager extends EventEmitter {
 			  )
 			: null;
 		if (closeTx) {
-			channel.recordCooperativeCloseTx(Buffer.from(closeTx).toString('hex'));
-			this.emit('broadcast:tx', closeTx);
+			channel.recordCooperativeCloseTx(
+				Buffer.from(closeTx).toString('hex'),
+				msg.feeSatoshis
+			);
+			if (channel.getFullState().externalClose) {
+				actions.unshift(
+					{ type: ChannelActionType.PERSIST_STATE },
+					{ type: ChannelActionType.BROADCAST_TX, tx: closeTx }
+				);
+			} else {
+				this.emit('broadcast:tx', closeTx);
+			}
 			this.processActions(peerPubkey, channel, actions);
 		} else {
 			this.emit(
@@ -9212,6 +9307,23 @@ export class ChannelManager extends EventEmitter {
 		produced: ChannelAction[],
 		progress?: IActionDispatchProgress
 	): void {
+		// A proposal signature can let the peer publish without replying.
+		// Retain its candidate identity before any external-close signature
+		// leaves, including proposals and alternative simple-close variants.
+		if (
+			channel.getFullState().externalClose &&
+			produced.some(
+				(action) =>
+					action.type === ChannelActionType.SEND_MESSAGE &&
+					[
+						MessageType.CLOSING_SIGNED,
+						MessageType.CLOSING_COMPLETE,
+						MessageType.CLOSING_SIG
+					].includes(action.messageType)
+			)
+		) {
+			produced = [{ type: ChannelActionType.PERSIST_STATE }, ...produced];
+		}
 		this._syncQuiescenceWatchdog(channel);
 		this._fforEnsureContext(peerPubkey, channel);
 		// An empty batch announces nothing: only a dispatch whose durable

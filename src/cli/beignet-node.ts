@@ -36,6 +36,11 @@ import {
 	TMessageDataMap
 } from '../types/wallet';
 import { createWalletStorage } from './wallet-storage';
+import {
+	OnchainSweeps,
+	OnchainSweepInfo,
+	OnchainSweepRequest
+} from './onchain-sweep';
 import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
 import { deriveBackupMacKey, writeBackupMac } from './backup-mac';
 import { nodeStorageView } from './node-storage-view';
@@ -5476,6 +5481,7 @@ export class BeignetNode extends EventEmitter {
 	 * logged.
 	 */
 	private carryDaemonState(from: SqliteStorage, to: SqliteStorage): void {
+		this.onchainSweeps().carryTo(to);
 		const overrides = from.loadWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY);
 		if (overrides !== null) {
 			to.saveWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY, overrides);
@@ -6336,9 +6342,16 @@ export class BeignetNode extends EventEmitter {
 		]);
 		let totalMsat = 0n;
 		for (const ch of this.node.listChannels()) {
-			if (!recovering.has(ch.state)) continue;
+			const effectiveState =
+				ch.state === ChannelState.AWAITING_REESTABLISH
+					? this.node
+							.getChannelManager()
+							.getChannel(ch.channelId)
+							?.getFullState().preReestablishState ?? ch.state
+					: ch.state;
+			if (!recovering.has(effectiveState)) continue;
 			if (
-				ch.state === ChannelState.FORCE_CLOSED &&
+				effectiveState === ChannelState.FORCE_CLOSED &&
 				this.isForceCloseBalanceInWallet(ch.channelId)
 			) {
 				continue;
@@ -7109,6 +7122,56 @@ export class BeignetNode extends EventEmitter {
 		});
 	}
 
+	private onchainSweeps(): OnchainSweeps {
+		return new OnchainSweeps({
+			storage: this.storage,
+			wallet: this.wallet,
+			network: this.getBitcoinNetwork() as import('bitcoinjs-lib').Network,
+			broadcast: (hex) => this._broadcastRawTx(hex),
+			admitAndSave: (debitSats, save) => {
+				this._checkMaxPayment(debitSats);
+				this._checkSpendLimit(debitSats);
+				const before = {
+					total: this._dailySpentSats,
+					onchain: this._dailySpentOnchainSats,
+					lightning: this._dailySpentLightningSats,
+					reset: this._dailySpendResetTime
+				};
+				try {
+					this.storage.transaction(() => {
+						this._recordSpend(debitSats, 'onchain');
+						this._persistSpendState(true);
+						save();
+					});
+				} catch (error) {
+					this._dailySpentSats = before.total;
+					this._dailySpentOnchainSats = before.onchain;
+					this._dailySpentLightningSats = before.lightning;
+					this._dailySpendResetTime = before.reset;
+					throw error;
+				}
+			}
+		});
+	}
+
+	/** Bind a drain's reviewed inputs to one durable signed transaction. */
+	prepareOnchainSweep(request: OnchainSweepRequest): Promise<OnchainSweepInfo> {
+		return this._runOnchainSend(() => this.onchainSweeps().prepare(request));
+	}
+
+	/** Submit or rebroadcast the same saved transaction, without coin selection. */
+	submitOnchainSweep(requestId: string): Promise<OnchainSweepInfo> {
+		return this._runOnchainSend(() => this.onchainSweeps().submit(requestId));
+	}
+
+	getOnchainSweep(requestId: string): OnchainSweepInfo | null {
+		return this.onchainSweeps().get(requestId);
+	}
+
+	cancelOnchainSweep(requestId: string): Promise<OnchainSweepInfo> {
+		return this._runOnchainSend(() => this.onchainSweeps().cancel(requestId));
+	}
+
 	/**
 	 * Replace an unconfirmed, RBF-signalling wallet transaction with a
 	 * higher-fee version (BIP 125). Throws NOT_BOOSTABLE when RBF is not
@@ -7414,9 +7477,55 @@ export class BeignetNode extends EventEmitter {
 	listOnchainTransactions(): OnchainTxInfo[] {
 		// wallet.transactions already includes unconfirmed txs;
 		// unconfirmedTransactions is a subset copy, so no merge here.
-		return Object.values(this.wallet.transactions)
-			.map((tx) => this.toOnchainTxInfo(tx))
-			.sort((a, b) => b.timestamp - a.timestamp);
+		const transactions = new Map(
+			Object.values(this.wallet.transactions).map((tx) => {
+				const info = this.toOnchainTxInfo(tx);
+				return [info.txid, info] as const;
+			})
+		);
+		for (const close of this.node.listExternalClosePayments()) {
+			const bitcoin = require('bitcoinjs-lib');
+			transactions.set(close.txid, {
+				txid: close.txid,
+				type: 'sent',
+				valueSats: close.amountSats,
+				feeSats: close.feeSats,
+				satsPerVbyte: close.satsPerVbyte,
+				address: bitcoin.address.fromOutputScript(
+					Buffer.from(close.scriptHex, 'hex'),
+					this.getBitcoinNetwork()
+				),
+				confirmed: close.confirmationHeight > 0,
+				...(close.confirmationHeight > 0
+					? { height: close.confirmationHeight }
+					: {}),
+				timestamp: close.timestamp,
+				source: 'cooperative-close',
+				channelId: close.channelId
+			});
+		}
+		if (typeof this.storage?.loadWalletData === 'function') {
+			for (const sweep of this.onchainSweeps().list()) {
+				if (
+					!sweep.txid ||
+					!['submitted', 'confirmed'].includes(sweep.status) ||
+					transactions.has(sweep.txid)
+				)
+					continue;
+				transactions.set(sweep.txid, {
+					txid: sweep.txid,
+					type: 'sent',
+					valueSats: sweep.amountSats!,
+					feeSats: sweep.feeSats!,
+					satsPerVbyte: sweep.satsPerVbyte!,
+					address: sweep.address,
+					confirmed: sweep.status === 'confirmed',
+					timestamp: sweep.createdAt,
+					source: 'onchain-sweep'
+				});
+			}
+		}
+		return [...transactions.values()].sort((a, b) => b.timestamp - a.timestamp);
 	}
 
 	listUtxos(): UtxoInfo[] {
@@ -7435,14 +7544,16 @@ export class BeignetNode extends EventEmitter {
 	/** Freeze a UTXO: excluded from all coin selection until unfrozen. */
 	async freezeUtxo(txid: string, index: number): Promise<{ frozen: string }> {
 		this._validateTxid(txid);
-		const res = await this.wallet.freezeUtxo({ txid, index });
-		if (res.isErr()) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				res.error.message
-			);
-		}
-		return { frozen: `${txid}:${index}` };
+		return this._runOnchainSend(async () => {
+			this.onchainSweeps().assertInputMutable(txid, index);
+			const res = await this.wallet.freezeUtxo({ txid, index });
+			if (res.isErr())
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					res.error.message
+				);
+			return { frozen: `${txid}:${index}` };
+		});
 	}
 
 	/** Unfreeze a previously frozen UTXO. */
@@ -7451,14 +7562,16 @@ export class BeignetNode extends EventEmitter {
 		index: number
 	): Promise<{ unfrozen: string }> {
 		this._validateTxid(txid);
-		const res = await this.wallet.unfreezeUtxo({ txid, index });
-		if (res.isErr()) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				res.error.message
-			);
-		}
-		return { unfrozen: `${txid}:${index}` };
+		return this._runOnchainSend(async () => {
+			this.onchainSweeps().assertInputMutable(txid, index);
+			const res = await this.wallet.unfreezeUtxo({ txid, index });
+			if (res.isErr())
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					res.error.message
+				);
+			return { unfrozen: `${txid}:${index}` };
+		});
 	}
 
 	/** Set (or clear with an empty label) a user label for an address. */
@@ -7808,18 +7921,40 @@ export class BeignetNode extends EventEmitter {
 		return opened;
 	}
 
+	async closeQuote(
+		channelId: string,
+		address?: string,
+		acceptStaleStateRisk = false
+	): Promise<ReturnType<LightningNode['closeQuote']>> {
+		const idBuf = requireChannelIdHex(channelId);
+		const script = this._decodeSpliceDestination(address);
+		if (!this.node.getChannel(idBuf))
+			throw new BeignetError(
+				BeignetErrorCode.CHANNEL_NOT_FOUND,
+				`Channel not found: ${channelId}`
+			);
+		const destination = script ?? (await this.cooperativeCloseDestination());
+		try {
+			return this.node.closeQuote(idBuf, destination, acceptStaleStateRisk);
+		} catch (error) {
+			throw new BeignetError('CLOSE_UNAVAILABLE', (error as Error).message);
+		}
+	}
+
 	async closeChannel(
 		channelId: string,
 		// Required for a capsule-restored channel, whose balances nothing can
 		// prove current: a mutual close signs the allocation this row carries,
 		// and a stale one is peer-favourable by construction (issue #469).
-		acceptStaleStateRisk = false
+		acceptStaleStateRisk = false,
+		address?: string
 	): Promise<{ ok: boolean; error?: string }> {
 		// Validated the way forceCloseChannel already validates: Buffer.from
 		// truncates at the first non-hex pair, so a caller's spelling is not an
 		// identity and a malformed id would silently address some other channel
 		// (issue #463/#469).
 		const idBuf = requireChannelIdHex(channelId);
+		const destination = this._decodeSpliceDestination(address);
 		// An unknown channel is the caller's mistake, not a node fault. It used
 		// to fall through to the engine and come back as CLOSE_FAILED, which
 		// has no status entry and therefore shipped as a retryable 500 with
@@ -7830,6 +7965,32 @@ export class BeignetNode extends EventEmitter {
 				`Channel not found: ${idBuf.toString('hex')}`
 			);
 		}
+		const scriptPubkey =
+			destination ?? (await this.cooperativeCloseDestination());
+		let externalSpendSats: number | undefined;
+		if (destination) {
+			let quote: ReturnType<LightningNode['closeQuote']>;
+			try {
+				quote = this.node.closeQuote(idBuf, destination, acceptStaleStateRisk);
+			} catch (error) {
+				throw new BeignetError('CLOSE_UNAVAILABLE', (error as Error).message);
+			}
+			externalSpendSats = quote.amountSats + quote.feeSats;
+			this._checkMaxPayment(externalSpendSats);
+			this._checkSpendLimit(externalSpendSats);
+		}
+		const result = this.node.closeChannel(
+			idBuf,
+			scriptPubkey,
+			acceptStaleStateRisk,
+			destination !== undefined
+		);
+		if (result.ok && externalSpendSats !== undefined)
+			this._recordSpend(externalSpendSats, 'onchain');
+		return result;
+	}
+
+	private async cooperativeCloseDestination(): Promise<Buffer> {
 		// Pay the cooperative-close output to an address the on-chain wallet
 		// actually scans (issue #542, LFBW port #532 workstream 1C). The old
 		// funding-key script was invisible to the wallet: the payout sat
@@ -7862,7 +8023,7 @@ export class BeignetNode extends EventEmitter {
 				this.getBitcoinNetwork()
 			) as Buffer;
 		}
-		return this.node.closeChannel(idBuf, scriptPubkey, acceptStaleStateRisk);
+		return scriptPubkey!;
 	}
 
 	/**
@@ -10321,7 +10482,7 @@ export class BeignetNode extends EventEmitter {
 	 * logged and does not fail the payment that caused it; the next mutation
 	 * writes the whole ledger again.
 	 */
-	private _persistSpendState(): void {
+	private _persistSpendState(strict = false): void {
 		if (this._dailySpendLimitSats === undefined) return;
 		// A daemon that has not opened its database has nowhere to write.
 		const storage = this.storage as SqliteStorage | undefined;
@@ -10340,6 +10501,7 @@ export class BeignetNode extends EventEmitter {
 		try {
 			storage.saveMetadata(DAILY_SPEND_STATE_KEY, JSON.stringify(state));
 		} catch (err) {
+			if (strict) throw err;
 			this.log('warn', 'Could not persist the daily spend ledger', {
 				error: err instanceof Error ? err.message : String(err)
 			});

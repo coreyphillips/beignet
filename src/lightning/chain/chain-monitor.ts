@@ -707,6 +707,9 @@ export class ChainMonitor {
 		this._trackedOutputs = trackedOutputs;
 		this._commitmentBroadcast = {
 			commitmentType: classified.type,
+			...(classified.type === CommitmentType.COOPERATIVE_CLOSE
+				? { cooperativeTxHex: spendingTx.toHex() }
+				: {}),
 			txid,
 			blockHeight,
 			commitmentNumber: classified.commitmentNumber,

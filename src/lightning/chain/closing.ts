@@ -13,6 +13,17 @@ bitcoin.initEccLib(ecc);
 const DUST_LIMIT_P2WPKH = 294;
 const DUST_LIMIT_P2WSH = 546;
 
+/** Expected local payout before cooperative fee negotiation with the peer. */
+export interface ICooperativeCloseQuote {
+	amountSats: number;
+	/** Fee charged to our balance, excluding the peer's contribution. */
+	feeSats: number;
+	networkFeeSats: number;
+	feeratePerkw: number;
+	feePayer: 'local' | 'remote';
+	feeEstimated: true;
+}
+
 export interface IClosingTxParams {
 	fundingTxid: string;
 	fundingOutputIndex: number;
