@@ -52,6 +52,8 @@ import {
 
 /** TLV type for channel_type */
 const TLV_CHANNEL_TYPE = 1n;
+/** option_zero_reserve in both v2 open messages. */
+export const TLV_DISABLE_CHANNEL_RESERVE = 4n;
 // option_will_fund: request_funds (open_channel2) and will_fund (accept_channel2)
 // are BOTH TLV type 3, matching CLN and the spec. They were type 5, so leases
 // never negotiated cross-implementation (both odd types are silently ignored).
@@ -67,12 +69,14 @@ const TLV_UPFRONT_SHUTDOWN_SCRIPT = 0n;
 const OPEN_CHANNEL2_TLV_TYPES = new Set<bigint>([
 	TLV_UPFRONT_SHUTDOWN_SCRIPT,
 	TLV_CHANNEL_TYPE,
-	TLV_REQUEST_FUNDS
+	TLV_REQUEST_FUNDS,
+	TLV_DISABLE_CHANNEL_RESERVE
 ]);
 const ACCEPT_CHANNEL2_TLV_TYPES = new Set<bigint>([
 	TLV_UPFRONT_SHUTDOWN_SCRIPT,
 	TLV_CHANNEL_TYPE,
-	TLV_WILL_FUND
+	TLV_WILL_FUND,
+	TLV_DISABLE_CHANNEL_RESERVE
 ]);
 
 /** Buyer's lease request, carried in open_channel2 (bLIP-0051). */
@@ -152,6 +156,8 @@ export interface IOpenChannel2Message {
 	channelType?: Buffer;
 	/** Liquidity ads (bLIP-0051): buyer's inbound-liquidity request. */
 	requestFunds?: IRequestFunds;
+	/** Waive the receiver's channel reserve. Requires negotiated support. */
+	disableChannelReserve?: boolean;
 }
 
 export interface IAcceptChannel2Message {
@@ -173,6 +179,8 @@ export interface IAcceptChannel2Message {
 	channelType?: Buffer;
 	/** Liquidity ads (bLIP-0051): seller's signed lease commitment. */
 	willFund?: IWillFund;
+	/** Waive the receiver's channel reserve. Requires negotiated support. */
+	disableChannelReserve?: boolean;
 }
 
 // open_channel2 fixed payload length:
@@ -246,6 +254,12 @@ export function encodeOpenChannel2Message(msg: IOpenChannel2Message): Buffer {
 		tlvRecords.push({
 			type: TLV_REQUEST_FUNDS,
 			value: encodeRequestFunds(msg.requestFunds)
+		});
+	}
+	if (msg.disableChannelReserve) {
+		tlvRecords.push({
+			type: TLV_DISABLE_CHANNEL_RESERVE,
+			value: Buffer.alloc(0)
 		});
 	}
 	if (tlvRecords.length > 0) {
@@ -346,7 +360,11 @@ export function decodeOpenChannel2Message(
 			OPEN_CHANNEL2_TLV_TYPES
 		);
 		for (const record of records) {
-			if (record.type === TLV_CHANNEL_TYPE) {
+			if (record.type === TLV_DISABLE_CHANNEL_RESERVE) {
+				if (record.value.length !== 0)
+					throw new Error('disable_channel_reserve must be empty');
+				result.disableChannelReserve = true;
+			} else if (record.type === TLV_CHANNEL_TYPE) {
 				result.channelType = record.value;
 			} else if (record.type === TLV_REQUEST_FUNDS) {
 				result.requestFunds = decodeRequestFunds(record.value);
@@ -411,6 +429,12 @@ export function encodeAcceptChannel2Message(
 		tlvRecords.push({
 			type: TLV_WILL_FUND,
 			value: encodeWillFund(msg.willFund)
+		});
+	}
+	if (msg.disableChannelReserve) {
+		tlvRecords.push({
+			type: TLV_DISABLE_CHANNEL_RESERVE,
+			value: Buffer.alloc(0)
 		});
 	}
 	if (tlvRecords.length > 0) {
@@ -498,7 +522,11 @@ export function decodeAcceptChannel2Message(
 			ACCEPT_CHANNEL2_TLV_TYPES
 		);
 		for (const record of records) {
-			if (record.type === TLV_CHANNEL_TYPE) {
+			if (record.type === TLV_DISABLE_CHANNEL_RESERVE) {
+				if (record.value.length !== 0)
+					throw new Error('disable_channel_reserve must be empty');
+				result.disableChannelReserve = true;
+			} else if (record.type === TLV_CHANNEL_TYPE) {
 				result.channelType = record.value;
 			} else if (record.type === TLV_WILL_FUND) {
 				result.willFund = decodeWillFund(record.value);

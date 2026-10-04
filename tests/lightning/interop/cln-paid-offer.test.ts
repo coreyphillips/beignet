@@ -108,17 +108,22 @@ describe('Interop: Beignet pays a CLN BOLT 12 offer (regtest)', function () {
 		node.handleNewBlock(tip);
 		setupRoutingForChannel(node, clnPubkey);
 
-		// CLN publishes an offer with a fixed amount.
+		// Keep this offer local to the channel under test. Shared regtest gossip
+		// can otherwise make CLN choose an unrelated introduction node.
 		const amountMsat = 25_000_000n;
 		const offerResult = await cln.createOffer(
 			`${amountMsat}msat`,
-			`beignet paid-offer milestone ${Date.now()}`
+			`beignet paid-offer milestone ${Date.now()}`,
+			[[clnPubkey]]
 		);
 		expect(offerResult.bolt12.startsWith('lno')).to.equal(true);
 
 		// beignet decodes the live lno string.
 		const offer = decodeOffer(offerResult.bolt12);
 		expect(offer.amount).to.equal(amountMsat);
+		expect(
+			offer.paths?.map((entry) => entry.introductionNodeId.toString('hex'))
+		).to.deep.equal([clnPubkey]);
 
 		// invoice_request goes out as an onion message; CLN's offers subsystem
 		// replies with a signed BOLT 12 invoice over our reply path.
@@ -134,6 +139,12 @@ describe('Interop: Beignet pays a CLN BOLT 12 offer (regtest)', function () {
 				.paths![0].introductionNodeId.toString('hex')
 				.slice(0, 16)}..., ${invoice.paths![0].blindedHops.length} hop(s)`
 		);
+		expect(
+			invoice.paths!.some(
+				(entry) => entry.introductionNodeId.toString('hex') === clnPubkey
+			),
+			'invoice has a path through the funded CLN peer'
+		).to.equal(true);
 
 		// Pay it through the blinded path and wait for settlement.
 		const payment = node.payBolt12Invoice(invoice);

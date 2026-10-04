@@ -228,6 +228,11 @@ describe('Interop: option_simple_close vs Eclair (regtest)', function () {
 		// its own closing_complete and acts purely as the closee.
 		const setup = await setupEclairChannel(eclair, eclairPubkey, 260, 500_000);
 		node = setup.node;
+		node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
+		const errors: string[] = [];
+		node.on('node:error', (error: unknown) =>
+			errors.push(JSON.stringify(error))
+		);
 		const captured = captureCloseMessages(node);
 		const broadcasts = relayBroadcasts(node);
 
@@ -243,7 +248,11 @@ describe('Interop: option_simple_close vs Eclair (regtest)', function () {
 			ChannelState.CLOSED,
 			60_000
 		);
-		expect(closed, 'beignet channel reaches CLOSED').to.equal(true);
+		expect(
+			closed,
+			`beignet channel reaches CLOSED: ${errors.join('; ')}`
+		).to.equal(true);
+		expect(errors).to.deep.equal([]);
 
 		// Eclair sent a closing_complete we accepted and answered.
 		const cc = captured.filter((m) => m.type === MessageType.CLOSING_COMPLETE);
@@ -284,6 +293,11 @@ describe('Interop: option_simple_close vs Eclair (regtest)', function () {
 			100_000_000
 		);
 		node = setup.node;
+		node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
+		const errors: string[] = [];
+		node.on('node:error', (error: unknown) =>
+			errors.push(JSON.stringify(error))
+		);
 		const captured = captureCloseMessages(node);
 		const broadcasts = relayBroadcasts(node);
 
@@ -299,7 +313,11 @@ describe('Interop: option_simple_close vs Eclair (regtest)', function () {
 			ChannelState.CLOSED,
 			60_000
 		);
-		expect(closed, 'beignet channel reaches CLOSED').to.equal(true);
+		expect(
+			closed,
+			`beignet channel reaches CLOSED: ${errors.join('; ')}`
+		).to.equal(true);
+		expect(errors).to.deep.equal([]);
 
 		// Eclair answered our closing_complete with closing_sig.
 		const cs = captured.filter((m) => m.type === MessageType.CLOSING_SIG);

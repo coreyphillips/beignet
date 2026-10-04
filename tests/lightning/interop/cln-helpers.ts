@@ -315,6 +315,7 @@ export async function setupClnChannel(
 	node: LightningNode;
 	channelId: Buffer;
 	fundingTxid: string;
+	openingFeeratePerKw: number;
 }> {
 	const node = createInteropNode(seedId);
 	node.on('node:error', () => {
@@ -330,6 +331,10 @@ export async function setupClnChannel(
 		fundingAmount,
 		pushMsat > 0 ? pushMsat : undefined
 	);
+	const openingChannel = node.getChannelManager().listChannels()[0];
+	if (!openingChannel) throw new Error('Channel not found after funding');
+	const openingFeeratePerKw =
+		openingChannel.getFullState().remoteConfig.feeratePerKw;
 
 	await mineBlocks(6);
 	await sleep(3000);
@@ -359,7 +364,7 @@ export async function setupClnChannel(
 		await sleep(500);
 	}
 
-	return { node, channelId, fundingTxid: openResult.txid };
+	return { node, channelId, fundingTxid: openResult.txid, openingFeeratePerKw };
 }
 
 // ── Strict Payment Helpers ──────────────────────────────────────

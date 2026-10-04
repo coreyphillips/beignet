@@ -1775,6 +1775,7 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 				const nodeId = node.getNodeId();
 
 				await fundEclairWallet(eclair);
+				node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 				await node.connectPeer(eclairPubkey, ECLAIR_P2P_HOST, ECLAIR_P2P_PORT);
 				await sleep(2000);
 
@@ -1792,6 +1793,7 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 				node.handleFundingConfirmed(channelId);
 
 				await restartEclairAndSync(eclair, 60_000);
+				node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 				await node.connectPeer(eclairPubkey, ECLAIR_P2P_HOST, ECLAIR_P2P_PORT);
 				await sleep(3000);
 				// Poll THIS peer's channel (not a bare count, which stale leftover
@@ -1845,6 +1847,7 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 				expect(recoveredState).to.equal(ChannelState.AWAITING_REESTABLISH);
 
 				// Phase 4: Reconnect
+				node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 				await node.connectPeer(eclairPubkey, ECLAIR_P2P_HOST, ECLAIR_P2P_PORT);
 				await sleep(5000);
 
@@ -1919,6 +1922,7 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 				const beignetNodeId = node.getNodeId();
 
 				await fundEclairWallet(eclair);
+				node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 				await node.connectPeer(eclairPubkey, ECLAIR_P2P_HOST, ECLAIR_P2P_PORT);
 				await sleep(2000);
 
@@ -1939,6 +1943,7 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 				node.handleFundingConfirmed(channelId);
 
 				await restartEclairAndSync(eclair, 60_000);
+				node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 				await node.connectPeer(eclairPubkey, ECLAIR_P2P_HOST, ECLAIR_P2P_PORT);
 				await sleep(3000);
 				// Poll THIS peer's channel (not a bare count, which stale leftover

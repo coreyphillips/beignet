@@ -530,6 +530,8 @@ export function deriveCommitmentKeys(
  * Result of building a commitment transaction.
  */
 export interface IBuiltCommitment {
+	/** Opener balance in this commitment view, before its fee and anchor cost. */
+	funderBalanceMsat: bigint;
 	result: ICommitmentTxResult;
 	fundingWitnessScript: Buffer;
 	fundingAmount: number;
@@ -824,6 +826,7 @@ export function buildLocalCommitment(
 	const result = buildCommitmentTx(params);
 
 	return {
+		funderBalanceMsat: isOpener ? localMsat : remoteMsat,
 		result,
 		fundingWitnessScript: funding.witnessScript,
 		fundingAmount: Number(state.fundingSatoshis),
@@ -1015,6 +1018,7 @@ export function buildRemoteCommitment(
 	const result = buildCommitmentTx(params);
 
 	return {
+		funderBalanceMsat: isOpener ? remoteMsat : localMsat,
 		result,
 		fundingWitnessScript: funding.witnessScript,
 		fundingAmount: Number(state.fundingSatoshis),

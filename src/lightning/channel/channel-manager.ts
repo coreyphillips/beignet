@@ -304,6 +304,7 @@ interface IBarrierQueue {
 }
 
 export interface IChannelManagerConfig {
+	zeroReserve?: import('./zero-reserve').IZeroReserveConfig;
 	/** Durable book lookup supplied by the node's voucher custody index. */
 	fforVoucherLookup?: (paymentHash: string) => IFforVoucherArchive | undefined;
 	localConfig?: IChannelConfig;
@@ -1300,6 +1301,7 @@ export class ChannelManager extends EventEmitter {
 		}
 		channel.channelKeyIndex = chKeys.channelIndex;
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
+		this.configureZeroReserve(channel, peerPubkey);
 		const tempId = state.temporaryChannelId.toString('hex');
 		this.tempChannels.set(tempId, channel);
 		this.channelPeers.set(tempId, peerPubkey);
@@ -1371,6 +1373,7 @@ export class ChannelManager extends EventEmitter {
 		}
 		channel.channelKeyIndex = chKeys.channelIndex;
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
+		this.configureZeroReserve(channel, peerPubkey);
 		const tempId = state.temporaryChannelId.toString('hex');
 		this.tempChannels.set(tempId, channel);
 		this.channelPeers.set(tempId, peerPubkey);
@@ -4013,6 +4016,7 @@ export class ChannelManager extends EventEmitter {
 			}
 			channel.channelKeyIndex = chKeys.channelIndex;
 			channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
+			this.configureZeroReserve(channel, peerPubkey);
 			this.tempChannels.set(tempId, channel);
 			this.channelPeers.set(tempId, peerPubkey);
 			registered = channel;
@@ -6707,6 +6711,23 @@ export class ChannelManager extends EventEmitter {
 			: MAX_FUNDING_SATOSHIS;
 	}
 
+	private configureZeroReserve(channel: Channel, peerPubkey: string): void {
+		const remote = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit()
+			?.features;
+		const negotiated =
+			this.config.localFeatures?.hasFeature(Feature.OPTION_ZERO_RESERVE) ===
+				true && remote?.hasFeature(Feature.OPTION_ZERO_RESERVE) === true;
+		const primary = this.config.zeroReserve?.role === 'primary';
+		channel.setZeroReservePolicy({
+			acceptWaiver: negotiated && !primary,
+			waivePeer:
+				negotiated &&
+				primary &&
+				this.config.zeroReserve?.waiveClientReserve === true,
+			waiveOnOpen: this.isJitClient(peerPubkey)
+		});
+	}
+
 	private peerNegotiatedSimpleClose(peerPubkey: string): boolean {
 		if (!this.config.localFeatures?.hasFeature(Feature.SIMPLE_CLOSE)) {
 			return false;
@@ -6746,6 +6767,7 @@ export class ChannelManager extends EventEmitter {
 		// Splices can grow capacity, so refresh the (possibly wumbo-lifted) cap
 		// from the peer's live init features before validating.
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
+		this.configureZeroReserve(channel, peerPubkey);
 		const actions = channel.handleSplice(msg);
 		this.processActions(peerPubkey, channel, actions);
 	}
@@ -6767,6 +6789,7 @@ export class ChannelManager extends EventEmitter {
 		if (!channel) return;
 
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
+		this.configureZeroReserve(channel, peerPubkey);
 		const actions = channel.handleSpliceAck(msg);
 		this.processActions(peerPubkey, channel, actions);
 	}
@@ -6867,6 +6890,7 @@ export class ChannelManager extends EventEmitter {
 		// Refresh the (possibly wumbo-lifted) funding cap before the splice-in
 		// growth check inside initiateSplice.
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
+		this.configureZeroReserve(channel, peerPubkey);
 		const actions = channel.initiateSplice(
 			relativeSatoshis,
 			fundingFeeratePerkw,
@@ -7357,6 +7381,7 @@ export class ChannelManager extends EventEmitter {
 		};
 
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
+		this.configureZeroReserve(channel, peerPubkey);
 		// initiateOpenV2 derives the BOLT-2 temporary_channel_id from our
 		// revocation basepoint (replacing the random stub), so key tempChannels
 		// AFTER it runs — otherwise accept_channel2 (which echoes the derived id)
@@ -7678,6 +7703,7 @@ export class ChannelManager extends EventEmitter {
 			}
 			channel.channelKeyIndex = chKeys.channelIndex;
 			channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
+			this.configureZeroReserve(channel, peerPubkey);
 			const tempId = msg.channelId.toString('hex');
 			this.tempChannels.set(tempId, channel);
 			this.channelPeers.set(tempId, peerPubkey);

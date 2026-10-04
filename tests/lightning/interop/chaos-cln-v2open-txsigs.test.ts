@@ -298,6 +298,8 @@ describe('Interop chaos: CLN v2 open crash-resume (regtest)', function () {
 			kill,
 			() => life1Broadcasts++
 		);
+		// Persistent channel keys require a real chain tip before opening.
+		node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 		const nodeId = node.getNodeId();
 
 		await node.connectPeer(clnPubkey, CLN_P2P_HOST, CLN_P2P_PORT);

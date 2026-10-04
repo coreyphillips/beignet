@@ -68,6 +68,7 @@ export function daemonOptions(
 		routingCltvDelta: config.routingCltvDelta,
 		leaseRates: config.leaseRates,
 		jitReceive: config.jitReceive,
+		waiveClientReserve: config.waiveClientReserve,
 		swaps: config.swaps,
 		dfRelay: config.dfRelay,
 		dfMinAmountSat: config.dfMinAmountSat,

@@ -1871,6 +1871,23 @@ export class LightningNode extends EventEmitter {
 			localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT);
 			localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT + 1);
 		}
+		const zeroReserveRole =
+			config.zeroReserve?.role ??
+			(config.jitReceive?.enabled || config.zeroReserve?.waiveClientReserve
+				? 'primary'
+				: 'wallet');
+		// Qualified wallets accept waivers by default. Primaries still need
+		// the operator setting, and an explicit advertisement opt-out wins.
+		const advertiseZeroReserve =
+			config.zeroReserve?.advertise ??
+			(zeroReserveRole === 'wallet' ||
+				config.zeroReserve?.waiveClientReserve === true);
+		if (advertiseZeroReserve) {
+			localFeatures.setOptional(Feature.OPTION_ZERO_RESERVE);
+		} else {
+			localFeatures.clearBit(Feature.OPTION_ZERO_RESERVE);
+			localFeatures.clearBit(Feature.OPTION_ZERO_RESERVE + 1);
+		}
 		this.localFeatures = localFeatures;
 
 		this.channelManager = new ChannelManager({
@@ -1879,6 +1896,10 @@ export class LightningNode extends EventEmitter {
 					? undefined
 					: (hash) => this.fforVoucherIndex.get(hash),
 			localFeatures,
+			zeroReserve: {
+				...config.zeroReserve,
+				role: zeroReserveRole
+			},
 			localConfig: config.channelConfig,
 			localBasepoints: config.channelBasepoints,
 			localPerCommitmentSeed: config.perCommitmentSeed,
@@ -13781,6 +13802,7 @@ export class LightningNode extends EventEmitter {
 		spendableSats: number;
 		maxAmountSats: number;
 		reserveSats?: number;
+		commitmentCostSats?: number;
 		inputCount?: number;
 	} {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
@@ -13810,6 +13832,7 @@ export class LightningNode extends EventEmitter {
 			const state = channel.getFullState();
 			const stored = state.remoteConfig?.channelReserveSatoshis ?? 0n;
 			const local = channel.getBalances().localMsat / 1000n;
+			const commitmentCost = channel.spliceOutCommitmentCostSats();
 			// spliceOut prices the kept reserve at the POST-splice capacity, so
 			// the advertised maximum must be solved against that same predicate:
 			// pricing at the current capacity understates it whenever the stored
@@ -13822,7 +13845,10 @@ export class LightningNode extends EventEmitter {
 					state.fundingSatoshis - amountSats - feeSats
 				);
 				const reserve = derived > stored ? derived : stored;
-				return amountSats + feeSats <= local - reserve;
+				return (
+					amountSats + feeSats <= local - reserve - commitmentCost &&
+					channel.spliceOutCommitmentRefusal(amountSats + feeSats) === null
+				);
 			};
 			let lo = 0n;
 			let hi = local > feeSats ? local - feeSats : 0n;
@@ -13837,13 +13863,15 @@ export class LightningNode extends EventEmitter {
 				state.fundingSatoshis - max - feeSats
 			);
 			const reserve = derivedAtMax > stored ? derivedAtMax : stored;
-			const spendable = local > reserve ? local - reserve : 0n;
+			const kept = reserve + commitmentCost;
+			const spendable = local > kept ? local - kept : 0n;
 			return {
 				direction,
 				feeSats: Number(feeSats),
 				spendableSats: Number(spendable),
 				maxAmountSats: Number(max),
-				reserveSats: Number(reserve)
+				reserveSats: Number(reserve),
+				commitmentCostSats: Number(commitmentCost)
 			};
 		}
 
@@ -13961,15 +13989,22 @@ export class LightningNode extends EventEmitter {
 			const stored = state.remoteConfig?.channelReserveSatoshis ?? 0n;
 			const derived = channel.spliceReserveWeKeepSats(postCapacity);
 			const reserve = derived > stored ? derived : stored;
-			const spendableSats = channel.getBalances().localMsat / 1000n - reserve;
+			const commitmentCost = channel.spliceOutCommitmentCostSats();
+			const spendableSats =
+				channel.getBalances().localMsat / 1000n - reserve - commitmentCost;
 			if (amountSats + fee > spendableSats) {
 				refusal = {
 					error: `insufficient channel balance for splice-out: need ${
 						amountSats + fee
-					} sats (amount + ${fee}-sat fee at ${fundingFeeratePerkw} sat/kw), spendable ${spendableSats} sats after the ${reserve}-sat reserve at the post-splice capacity`,
+					} sats (amount + ${fee}-sat fee at ${fundingFeeratePerkw} sat/kw), spendable ${spendableSats} sats after the ${reserve}-sat reserve and ${commitmentCost}-sat commitment cost at the post-splice capacity`,
 					code: SpliceRefusalCode.INSUFFICIENT_BALANCE
 				};
 			}
+		}
+		if (!refusal) {
+			const error = channel.spliceOutCommitmentRefusal(amountSats + fee);
+			if (error)
+				refusal = { error, code: SpliceRefusalCode.INSUFFICIENT_BALANCE };
 		}
 		if (refusal) {
 			this.emit('node:error', {
@@ -14887,6 +14922,9 @@ export class LightningNode extends EventEmitter {
 		}
 		info.htlcCount = htlcCount;
 		info.localReserveMsat = state.remoteConfig.channelReserveSatoshis * 1000n;
+		info.localReserveWaived = state.localReserveWaived === true;
+		info.remoteReserveWaived = state.remoteReserveWaived === true;
+		info.isOpener = state.role === ChannelRole.OPENER;
 		info.remoteReserveMsat = state.localConfig.channelReserveSatoshis * 1000n;
 		info.isPrivate = !state.announceChannel;
 		// Effective routing policy (per-channel override or node defaults)
@@ -29399,6 +29437,7 @@ export class LightningNode extends EventEmitter {
 			storage?: IStorageBackend;
 			enableNetworking?: boolean;
 			localFeatures?: FeatureFlags;
+			zeroReserve?: INodeConfig['zeroReserve'];
 			chainHashes?: Buffer[];
 			alias?: string;
 			announcedAddresses?: INodeAddress[];
@@ -29500,6 +29539,7 @@ export class LightningNode extends EventEmitter {
 			leaseRates: options?.leaseRates,
 			eagerGossipVerify: options?.eagerGossipVerify,
 			localFeatures: options?.localFeatures,
+			zeroReserve: options?.zeroReserve,
 			chainHashes: options?.chainHashes,
 			alias: options?.alias,
 			announcedAddresses: options?.announcedAddresses,

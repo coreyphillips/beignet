@@ -3508,6 +3508,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 										type: 'number',
 										description: 'splice-out only'
 									},
+									commitmentCostSats: {
+										type: 'number',
+										description:
+											'splice-out only: commitment fee and anchors retained by the channel opener'
+									},
 									inputCount: {
 										type: 'number',
 										description: 'splice-in only'
@@ -4208,6 +4213,19 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						capacitySats: { type: 'integer' },
 						isAnchor: { type: 'boolean' },
 						isPrivate: { type: 'boolean' },
+						isOpener: { type: 'boolean' },
+						localReserveWaived: {
+							type: 'boolean',
+							description:
+								'The peer waived our reserve when this channel opened.'
+						},
+						remoteReserveWaived: {
+							type: 'boolean',
+							description:
+								'We waived the peer reserve when this channel opened.'
+						},
+						localReserveSats: { type: 'integer' },
+						remoteReserveSats: { type: 'integer' },
 						fundingTxid: { type: 'string' },
 						shortChannelId: { type: 'string' },
 						feeratePerKw: { type: 'integer' },
