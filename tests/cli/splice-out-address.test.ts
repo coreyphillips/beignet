@@ -23,6 +23,7 @@ import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
 import { AddressInfo } from 'net';
+import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
 
 const MNEMONIC =
@@ -47,7 +48,8 @@ const MAINNET_ADDRESS = 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4';
 
 function request(
 	port: number,
-	body: Record<string, unknown>
+	body: Record<string, unknown>,
+	route = '/channel/splice-out'
 ): Promise<{ status: number; body: Record<string, unknown> }> {
 	return new Promise((resolve, reject) => {
 		const payload = JSON.stringify(body);
@@ -55,7 +57,7 @@ function request(
 			{
 				hostname: '127.0.0.1',
 				port,
-				path: '/channel/splice-out',
+				path: route,
 				method: 'POST',
 				headers: {
 					'Content-Type': 'application/json',
@@ -202,5 +204,67 @@ describe('Daemon splice-out address passthrough', function () {
 		const error = res.body.error as { code: string; message: string };
 		expect(error.code).to.equal('CHANNEL_NOT_FOUND');
 		expect(error.message).to.include('Channel not found');
+	});
+	for (const address of ['not-an-address', '', 42, null, MAINNET_ADDRESS]) {
+		it(`refuses invalid splice-quote address ${JSON.stringify(
+			address
+		)}`, async () => {
+			const res = await request(
+				port,
+				{
+					channelId: UNKNOWN_CHANNEL_ID,
+					direction: 'out',
+					feeratePerkw: 253,
+					address
+				},
+				'/channel/splice-quote'
+			);
+			expect(res.status).to.equal(400);
+			expect((res.body.error as { code: string }).code).to.equal(
+				'INVALID_PARAMS'
+			);
+		});
+	}
+
+	it('forwards a decoded Taproot splice-quote destination and preserves the omitted default', async () => {
+		const engine = (daemon.node as unknown as { node: LightningNode }).node;
+		const originalQuote = engine.spliceQuote;
+		const scripts: Array<Buffer | undefined> = [];
+		engine.spliceQuote = (_id, direction, _feerate, destination) => {
+			scripts.push(destination);
+			return {
+				direction,
+				feeSats: 200,
+				spendableSats: 50000,
+				maxAmountSats: 49800
+			};
+		};
+		try {
+			const script = Buffer.concat([
+				Buffer.from('5120', 'hex'),
+				PUBKEY.subarray(1)
+			]);
+			const address = bitcoin.address.fromOutputScript(
+				script,
+				bitcoin.networks.regtest
+			);
+			for (const destination of [address, undefined]) {
+				const res = await request(
+					port,
+					{
+						channelId: UNKNOWN_CHANNEL_ID,
+						direction: 'out',
+						feeratePerkw: 253,
+						address: destination
+					},
+					'/channel/splice-quote'
+				);
+				expect(res.status).to.equal(200);
+				expect(res.body.ok).to.equal(true);
+			}
+			expect(scripts).to.deep.equal([script, undefined]);
+		} finally {
+			engine.spliceQuote = originalQuote;
+		}
 	});
 });

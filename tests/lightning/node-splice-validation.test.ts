@@ -480,6 +480,77 @@ describe('LightningNode splice validation', function () {
 		node.destroy();
 	});
 
+	for (const [label, prefix, size] of [
+		['P2WPKH', '0014', 20],
+		['P2TR', '5120', 32],
+		['P2WSH', '0020', 32]
+	] as const) {
+		for (const feerate of [253, 5000]) {
+			it(`prices the ${label} destination and admits exactly its quoted max at ${feerate} sat/kw`, () => {
+				const node = createTestNode();
+				try {
+					const channelId = injectNormalChannel(node);
+					const channel = node.getChannelManager().getChannel(channelId)!;
+					const destination = Buffer.concat([
+						Buffer.from(prefix, 'hex'),
+						Buffer.alloc(size, 1)
+					]);
+					const quote = node.spliceQuote(
+						channelId,
+						'out',
+						feerate,
+						destination
+					);
+					const defaultQuote = node.spliceQuote(channelId, 'out', feerate);
+					const fee = spliceFeeSats(
+						estimateSpliceTxWeight({
+							walletInputCount: 0,
+							destinationScriptLen: destination.length
+						}),
+						feerate
+					);
+					expect(quote.feeSats).to.equal(Number(fee));
+					if (size === 32) {
+						expect(quote.feeSats).to.be.greaterThan(defaultQuote.feeSats);
+					} else {
+						expect(quote).to.deep.equal(defaultQuote);
+					}
+					const max = BigInt(quote.maxAmountSats);
+					expect(
+						node.spliceOut(channelId, max + 1n, feerate, destination).code
+					).to.equal(SpliceRefusalCode.INSUFFICIENT_BALANCE);
+					let contribution: bigint | undefined;
+					const manager = node.getChannelManager();
+					const initiate = manager.initiateSplice.bind(manager);
+					manager.initiateSplice = (id, amount, rate) => {
+						contribution = amount;
+						return initiate(id, amount, rate);
+					};
+					expect(node.spliceOut(channelId, max, feerate, destination).ok).to.be
+						.true;
+					expect(contribution).to.equal(-(max + fee));
+					expect(channel.getState()).to.equal(ChannelState.NORMAL);
+				} finally {
+					node.destroy();
+				}
+			});
+		}
+	}
+
+	it('refuses invalid destination scripts in a splice-out quote', () => {
+		const node = createTestNode();
+		try {
+			const channelId = injectNormalChannel(node);
+			for (const destination of [Buffer.alloc(0), Buffer.from([0x6a])]) {
+				expect(() =>
+					node.spliceQuote(channelId, 'out', 253, destination)
+				).to.throw(InvalidSpliceError);
+			}
+		} finally {
+			node.destroy();
+		}
+	});
+
 	it('admits a splice-out exactly at the default 546-sat floor (issue #389)', function () {
 		const node = createTestNode();
 		const channelId = injectNormalChannel(node);

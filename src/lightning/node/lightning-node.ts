@@ -13668,11 +13668,13 @@ export class LightningNode extends EventEmitter {
 	 * splice-out prices from the channel's own spendable balance net of the
 	 * reserve the peer actually set. Exists so a UI never has to reconstruct
 	 * this arithmetic and offer an amount the daemon then rejects.
+	 * Pass the intended splice-out destination to price its exact output size.
 	 */
 	spliceQuote(
 		channelId: Buffer,
 		direction: 'in' | 'out',
-		fundingFeeratePerkw = 253
+		fundingFeeratePerkw = 253,
+		destinationScript?: Buffer
 	): {
 		direction: 'in' | 'out';
 		feeSats: number;
@@ -13697,7 +13699,7 @@ export class LightningNode extends EventEmitter {
 		}
 
 		if (direction === 'out') {
-			const destination = this.getSweepDestinationScript();
+			const destination = this._spliceOutDestination(destinationScript);
 			const feeSats = spliceFeeSats(
 				estimateSpliceTxWeight({
 					walletInputCount: 0,
@@ -13761,24 +13763,7 @@ export class LightningNode extends EventEmitter {
 		};
 	}
 
-	spliceOut(
-		channelId: Buffer,
-		amountSats: bigint,
-		fundingFeeratePerkw = 253,
-		destinationScript?: Buffer
-	): ISpliceRequestResult {
-		const cidErr = validateBuffer(channelId, 32, 'channelId');
-		if (cidErr) throw new InvalidSpliceError(cidErr);
-		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
-		if (satsErr) throw new InvalidSpliceError(satsErr);
-		// splice_init carries funding_feerate_perkw as a u32. Refuse a bad one
-		// here: encoding happens AFTER the channel has moved to SPLICING and
-		// persisted, so a throw there leaves the channel wedged until restart.
-		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
-			min: 1,
-			max: MAX_SPLICE_FEERATE_PERKW
-		});
-		if (feeErr) throw new InvalidSpliceError(feeErr);
+	private _spliceOutDestination(destinationScript?: Buffer): Buffer {
 		if (
 			destinationScript !== undefined &&
 			(!Buffer.isBuffer(destinationScript) || destinationScript.length === 0)
@@ -13799,6 +13784,28 @@ export class LightningNode extends EventEmitter {
 				'destinationScript is not a standard output script (would burn the withdrawn funds)'
 			);
 		}
+		return destinationScript ?? this.getSweepDestinationScript();
+	}
+
+	spliceOut(
+		channelId: Buffer,
+		amountSats: bigint,
+		fundingFeeratePerkw = 253,
+		destinationScript?: Buffer
+	): ISpliceRequestResult {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new InvalidSpliceError(cidErr);
+		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
+		if (satsErr) throw new InvalidSpliceError(satsErr);
+		// splice_init carries funding_feerate_perkw as a u32. Refuse a bad one
+		// here: encoding happens AFTER the channel has moved to SPLICING and
+		// persisted, so a throw there leaves the channel wedged until restart.
+		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
+			min: 1,
+			max: MAX_SPLICE_FEERATE_PERKW
+		});
+		if (feeErr) throw new InvalidSpliceError(feeErr);
+		const destination = this._spliceOutDestination(destinationScript);
 
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) {
@@ -13808,8 +13815,6 @@ export class LightningNode extends EventEmitter {
 				code: SpliceRefusalCode.CHANNEL_NOT_FOUND
 			};
 		}
-
-		const destination = destinationScript ?? this.getSweepDestinationScript();
 
 		// Sanity checks before any protocol message goes out: dust amount, peer
 		// support, and spendable channel balance.

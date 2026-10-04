@@ -3289,12 +3289,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/channel/splice-quote': {
 				post: {
 					summary:
-						'Quote a splice: the on-chain fee and the largest amount that can move at this feerate (splice-in prices against spendable wallet UTXOs, splice-out against local balance net of the peer-set channel reserve)',
+						'Quote a splice: the on-chain fee and the largest amount that can move at this feerate (splice-in prices against spendable wallet UTXOs, splice-out against local balance net of the peer-set channel reserve). Pass address to price the intended splice-out destination; omitted uses the wallet destination',
 					tags: ['Channels'],
 					requestBody: bodyContent({
 						channelId: 'string',
 						direction: 'string',
-						feeratePerkw: 'number'
+						feeratePerkw: 'number',
+						address: 'string?'
 					}),
 					responses: {
 						'200': {
@@ -3323,7 +3324,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'400': {
 							description:
-								'INVALID_PARAMS: malformed channelId, non-integer amount, or a feeratePerkw outside 1..4294967295'
+								'INVALID_PARAMS: malformed channelId, invalid or wrong-network address, or a feeratePerkw outside 1..100000'
 						},
 						'404': { description: 'CHANNEL_NOT_FOUND' }
 					}
