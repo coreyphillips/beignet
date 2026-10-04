@@ -119,9 +119,9 @@ describe('Agent DX 6: CLI-level Production Hardening 11', function () {
 			expect(lErr).to.be.instanceOf(Error);
 		});
 
-		it('should all 9 error codes exist', () => {
+		it('should all payment error codes exist', () => {
 			const allCodes = Object.values(LightningErrorCode);
-			expect(allCodes).to.have.lengthOf(9);
+			expect(allCodes).to.have.lengthOf(12);
 			expect(allCodes).to.include('NO_ROUTE');
 			expect(allCodes).to.include('DUPLICATE_PAYMENT');
 			expect(allCodes).to.include('NO_CHANNEL_TO_HOP');
@@ -130,6 +130,9 @@ describe('Agent DX 6: CLI-level Production Hardening 11', function () {
 			expect(allCodes).to.include('INVALID_INVOICE');
 			expect(allCodes).to.include('INVOICE_EXPIRED');
 			expect(allCodes).to.include('INVALID_KEYSEND');
+			expect(allCodes).to.include('PAY_ALL_REVIEW_EXPIRED');
+			expect(allCodes).to.include('PAY_ALL_REMAINDER');
+			expect(allCodes).to.include('PAY_ALL_BUDGET_MISMATCH');
 		});
 	});
 });

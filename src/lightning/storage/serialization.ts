@@ -1769,6 +1769,13 @@ export function deserializeChannelState(
 // ─── IPaymentInfo ───
 
 export interface ISerializedPaymentInfo {
+	payAll?: {
+		debitMsat: string;
+		maxFeeMsat: string;
+		deliveredMsat: string;
+		feeMsat: string;
+		remainderMsat: string;
+	};
 	paymentHash: string;
 	preimage?: string;
 	amountMsat: string;
@@ -1789,6 +1796,17 @@ export interface ISerializedPaymentInfo {
 
 export function serializePaymentInfo(p: IPaymentInfo): ISerializedPaymentInfo {
 	return {
+		...(p.payAll
+			? {
+					payAll: {
+						debitMsat: p.payAll.debitMsat.toString(),
+						maxFeeMsat: p.payAll.maxFeeMsat.toString(),
+						deliveredMsat: p.payAll.deliveredMsat.toString(),
+						feeMsat: p.payAll.feeMsat.toString(),
+						remainderMsat: p.payAll.remainderMsat.toString()
+					}
+			  }
+			: {}),
 		paymentHash: p.paymentHash.toString('hex'),
 		preimage: bufToHex(p.preimage) ?? undefined,
 		amountMsat: bigintToStr(p.amountMsat),
@@ -1833,6 +1851,17 @@ export function deserializePaymentInfo(
 	};
 
 	return {
+		...(s.payAll
+			? {
+					payAll: {
+						debitMsat: BigInt(s.payAll.debitMsat),
+						maxFeeMsat: BigInt(s.payAll.maxFeeMsat),
+						deliveredMsat: BigInt(s.payAll.deliveredMsat),
+						feeMsat: BigInt(s.payAll.feeMsat),
+						remainderMsat: BigInt(s.payAll.remainderMsat)
+					}
+			  }
+			: {}),
 		paymentHash: Buffer.from(s.paymentHash, 'hex'),
 		preimage: s.preimage ? Buffer.from(s.preimage, 'hex') : undefined,
 		amountMsat: strToBigint(s.amountMsat),

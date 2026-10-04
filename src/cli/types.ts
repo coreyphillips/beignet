@@ -296,7 +296,25 @@ export interface PaymentRoute {
 	hopCount: number;
 }
 
+export interface PayAllQuote {
+	debitMsat: string;
+	minRecipientMsat: string;
+	maxFeeMsat: string;
+	routeFound: boolean;
+	remainderMsat: string;
+	searchExhausted: boolean;
+}
+
+export interface PayAllPayment {
+	debitMsat: string;
+	maxFeeMsat: string;
+	deliveredMsat: string;
+	feeMsat: string;
+	remainderMsat: string;
+}
+
 export interface PaymentInfo {
+	payAll?: PayAllPayment;
 	paymentHash: string;
 	preimage?: string;
 	amountSats: number;
@@ -312,6 +330,7 @@ export interface PaymentInfo {
 }
 
 export interface PaymentProof {
+	payAll?: PayAllPayment;
 	paymentHash: string;
 	preimage: string;
 	amountSats: number;

@@ -620,15 +620,18 @@ describe('Issue #474: the payment and invoice paths guard before BigInt()', () =
 		/** undefined is "no limit", which is what an unconfigured node has. */
 		dailySpendLimitSats?: number
 	): BeignetNode {
-		return Object.assign(nodeWithEngine(engine), {
-			_pendingSpendSats: 0,
-			_asyncSpendClaims: new Map(),
-			_dailySpentSats: 0,
-			_dailySpentLightningSats: 0,
-			_dailySpentOnchainSats: 0,
-			_dailySpendLimitSats: dailySpendLimitSats,
-			_draining: false
-		}) as unknown as BeignetNode;
+		return Object.assign(
+			nodeWithEngine({ getPayment: (): undefined => undefined, ...engine }),
+			{
+				_pendingSpendSats: 0,
+				_asyncSpendClaims: new Map(),
+				_dailySpentSats: 0,
+				_dailySpentLightningSats: 0,
+				_dailySpentOnchainSats: 0,
+				_dailySpendLimitSats: dailySpendLimitSats,
+				_draining: false
+			}
+		) as unknown as BeignetNode;
 	}
 
 	const pendingOf = (bn: BeignetNode): number =>

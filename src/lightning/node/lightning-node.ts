@@ -110,6 +110,8 @@ import {
 	TPolicyOverrides,
 	policyOverrideKey
 } from '../gossip/pathfinding';
+import { findPayAllRoute, IPayAllRouteResult } from '../gossip/pay-all';
+import { IPayAllBudget, IPayAllQuote } from './types';
 import {
 	applyRapidGossipSnapshot,
 	IRapidGossipResult
@@ -940,6 +942,7 @@ export class LightningNode extends EventEmitter {
 	private graph: NetworkGraph;
 	private peerManager: PeerManager | null = null;
 	private payments: Map<string, IPaymentInfo> = new Map();
+	private prunedPayAllBudgets = new Map<string, IPayAllBudget>();
 	private fforArchivedVouchers = new Map<string, IFforVoucherArchive>();
 	private readonly fforVoucherIndex = new FforVoucherIndex();
 	private pendingFforVoucherCredits = new Map<string, IFforVoucherCredit>();
@@ -11041,6 +11044,7 @@ export class LightningNode extends EventEmitter {
 		this.prunedKeysendHashes.clear();
 		this.prunedOutgoingHashes.clear();
 		this.prunedCompletedOutgoingHashes.clear();
+		this.prunedPayAllBudgets.clear();
 		this.paymentSecrets.clear();
 		this.invoices.clear();
 		this.scidToChannelId.clear();
@@ -11155,6 +11159,12 @@ export class LightningNode extends EventEmitter {
 				: this.owesSettledFulfill(payment);
 
 		const forget = (hash: string, payment: IPaymentInfo): void => {
+			if (payment.payAll && !this.storage) {
+				this.prunedPayAllBudgets.set(hash, {
+					debitMsat: payment.payAll.debitMsat,
+					maxFeeMsat: payment.payAll.maxFeeMsat
+				});
+			}
 			this.payments.delete(hash);
 			this.preimages.delete(hash);
 			if (
@@ -16587,6 +16597,218 @@ export class LightningNode extends EventEmitter {
 		return edges;
 	}
 
+	private decodePayAllInvoice(
+		invoiceStr: string
+	): ReturnType<typeof decodeInvoice> {
+		let invoice: ReturnType<typeof decodeInvoice>;
+		try {
+			invoice = decodeInvoice(invoiceStr);
+		} catch {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVALID_INVOICE,
+				'Invalid BOLT 11 invoice'
+			);
+		}
+		if (
+			invoice.network !== this.network ||
+			invoice.amountMsat !== undefined ||
+			!invoice.paymentSecret ||
+			!(invoice.payeeNodeKey || invoice.recoveredPubkey) ||
+			(invoice.blindedPaths?.length ?? 0) > 0
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVALID_INVOICE,
+				'Pay-all requires an amountless BOLT 11 invoice with a payment secret on this network and an unblinded route'
+			);
+		}
+		for (const bit of invoice.featureBits?.listSetBits() ?? []) {
+			if (bit % 2 === 0 && !PAYER_UNDERSTOOD_INVOICE_FEATURES.has(bit)) {
+				throw new LightningPaymentError(
+					LightningErrorCode.INVALID_INVOICE,
+					`Invoice requires unknown feature bit ${bit}`
+				);
+			}
+		}
+		if (
+			Math.floor(Date.now() / 1000) >
+			invoice.timestamp + (invoice.expiry ?? DEFAULT_EXPIRY)
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVOICE_EXPIRED,
+				'Invoice has expired'
+			);
+		}
+		return invoice;
+	}
+
+	private persistedPayAllBudget(hash: string): IPayAllBudget | undefined {
+		// Pruning drops the cache, not the approval contract. Read failures
+		// propagate so an unavailable durable record cannot authorize a new debit.
+		return (
+			this.payments.get(hash)?.payAll ??
+			this.prunedPayAllBudgets.get(hash) ??
+			this.storage?.loadPayment(hash)?.payAll
+		);
+	}
+
+	private validatePayAllBudget(budget: IPayAllBudget): void {
+		if (
+			budget.debitMsat <= 0n ||
+			budget.debitMsat > 0xffffffffffffffffn ||
+			budget.maxFeeMsat < 0n ||
+			budget.maxFeeMsat >= budget.debitMsat
+		) {
+			throw new InvalidRequestError(
+				'Pay-all requires a positive u64 debitMsat and 0 <= maxFeeMsat < debitMsat'
+			);
+		}
+	}
+
+	private payAllLocalEdges(): ILocalChannelEdge[] {
+		return this.getLocalChannelEdges().filter((edge) => {
+			const channel = this.findLocalChannelByScid(
+				edge.shortChannelId,
+				edge.peer.toString('hex')
+			);
+			return channel && !channel.isQuiescing();
+		});
+	}
+
+	private payAllRoute(
+		invoice: ReturnType<typeof decodeInvoice>,
+		budget: IPayAllBudget,
+		context?: IPaymentRetryContext
+	): IPayAllRouteResult {
+		const baseHeight = this.cltvBaseHeight(invoice.paymentHash);
+		return findPayAllRoute({
+			graph: this.graph,
+			source: getPublicKey(this.nodePrivkey),
+			destination: (invoice.payeeNodeKey || invoice.recoveredPubkey)!,
+			...budget,
+			finalCltvExpiry: this.paddedFinalCltvExpiry(invoice.minFinalCltvExpiry),
+			localChannels: this.payAllLocalEdges(),
+			routingHints: invoice.routingHints,
+			excludedChannels: context?.excludedChannels,
+			policyOverrides: context?.policyOverrides,
+			maxCltvExpiry: this.cltvBudgetFor(
+				invoice.paymentHash,
+				context?.maxCltvExpiryHeight
+			),
+			canSend: (route) => {
+				const hop = route.hops[0];
+				const channel = this.findLocalChannelByScid(
+					hop.shortChannelId,
+					hop.pubkey.toString('hex')
+				);
+				return (
+					!!channel &&
+					channel.validateOutgoingHtlc(
+						budget.debitMsat,
+						hop.outgoingCltvValue + baseHeight
+					).length === 0
+				);
+			}
+		});
+	}
+
+	/** Read-only quote. Multiple local channels may require unsupported MPP. */
+	quotePayAll(invoiceStr: string, maxFeeMsat: bigint): IPayAllQuote {
+		const invoice = this.decodePayAllInvoice(invoiceStr);
+		this.assertHashUnpaid(invoice.paymentHash, 'any-pending');
+		const prior = this.persistedPayAllBudget(
+			invoice.paymentHash.toString('hex')
+		);
+		if (prior && prior.maxFeeMsat !== maxFeeMsat) {
+			throw new LightningPaymentError(
+				LightningErrorCode.PAY_ALL_BUDGET_MISMATCH,
+				'A retry must retain the persisted pay-all debit and fee cap'
+			);
+		}
+		const debitMsat =
+			prior?.debitMsat ??
+			this.payAllLocalEdges().reduce(
+				(sum, edge) => sum + edge.outboundMsat,
+				0n
+			);
+		const budget = { debitMsat, maxFeeMsat };
+		this.validatePayAllBudget(budget);
+		const found = this.payAllRoute(invoice, budget);
+		return {
+			...budget,
+			minRecipientMsat: debitMsat - maxFeeMsat,
+			routeFound: found.route !== null,
+			remainderMsat: found.remainderMsat,
+			searchExhausted: found.searchExhausted
+		};
+	}
+
+	/** Single-part pay-all. Every retry uses the same reviewed debit and cap. */
+	sendPayAll(
+		invoiceStr: string,
+		debitMsat: bigint,
+		maxFeeMsat: bigint,
+		metadata?: Record<string, string>
+	): IPaymentInfo {
+		const redispatching = this.redispatchingRetryContext;
+		this.redispatchingRetryContext = undefined;
+		const invoice = this.decodePayAllInvoice(invoiceStr);
+		this.assertHashUnpaid(invoice.paymentHash, 'any-pending');
+		const hash = invoice.paymentHash.toString('hex');
+		const prior = this.persistedPayAllBudget(hash);
+		const budget = { debitMsat, maxFeeMsat };
+		this.validatePayAllBudget(budget);
+		if (
+			prior &&
+			(prior.debitMsat !== debitMsat || prior.maxFeeMsat !== maxFeeMsat)
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.PAY_ALL_BUDGET_MISMATCH,
+				'A retry must retain the persisted pay-all debit and fee cap'
+			);
+		}
+		const oldContext = this.paymentRetryContexts.get(hash);
+		if (oldContext && oldContext !== redispatching)
+			this.paymentRetryContexts.delete(hash);
+		const available = this.payAllLocalEdges().reduce(
+			(sum, edge) => sum + edge.outboundMsat,
+			0n
+		);
+		if (available < debitMsat) {
+			throw new LightningPaymentError(
+				LightningErrorCode.PAY_ALL_REVIEW_EXPIRED,
+				'The reviewed debit is no longer spendable; prepare a new review'
+			);
+		}
+		const context: IPaymentRetryContext = redispatching ?? {
+			invoiceStr,
+			payAll: budget,
+			maxFeeMsat,
+			excludedChannels: new Set(),
+			retryCount: 0,
+			maxRetries: this.maxPaymentRetries,
+			metadata
+		};
+		const found = this.payAllRoute(invoice, budget, context);
+		if (!found.route) {
+			throw new LightningPaymentError(
+				found.remainderMsat > 0n
+					? LightningErrorCode.PAY_ALL_REMAINDER
+					: LightningErrorCode.NO_ROUTE,
+				`No exact single-part pay-all route within the approved cap; remainderMsat=${found.remainderMsat}` +
+					(found.searchExhausted ? '; route search limit reached' : '')
+			);
+		}
+		return this.dispatchInvoiceRoute(
+			found.route,
+			invoice.paymentHash,
+			this.paddedFinalCltvExpiry(invoice.minFinalCltvExpiry),
+			invoice.paymentSecret!,
+			found.route.hops[found.route.hops.length - 1].amountToForwardMsat,
+			context,
+			metadata
+		);
+	}
+
 	sendPayment(
 		invoiceStr: string,
 		excludedChannels?: Set<string>,
@@ -16617,6 +16839,12 @@ export class LightningNode extends EventEmitter {
 		// the guarantee on the route, and MPP dispatch runs only after this.
 		this.assertHashUnpaid(invoice.paymentHash, 'any-pending');
 		const dedupHashHex = invoice.paymentHash.toString('hex');
+		if (this.persistedPayAllBudget(dedupHashHex)) {
+			throw new LightningPaymentError(
+				LightningErrorCode.PAY_ALL_BUDGET_MISMATCH,
+				'Retry this payment through pay-all with its persisted budget'
+			);
+		}
 		// Past that check nothing is out for the hash, so a context other than
 		// the retry being re-dispatched was left by a send that ended. This
 		// call's amount, fee cap, ceiling and exclusions replace it (issue #1041).
@@ -16953,7 +17181,8 @@ export class LightningNode extends EventEmitter {
 				finalCltvExpiry,
 				paymentSecret,
 				paymentAmountMsat,
-				metadata
+				metadata,
+				context.payAll
 			);
 			if (payment.status === PaymentStatus.FAILED) release();
 			return payment;
@@ -17003,7 +17232,8 @@ export class LightningNode extends EventEmitter {
 		finalCltvExpiry: number,
 		paymentSecret?: Buffer,
 		totalMsat?: bigint,
-		metadata?: Record<string, string>
+		metadata?: Record<string, string>,
+		payAll?: IPayAllBudget
 	): IPaymentInfo {
 		if (route.hops.length === 0) {
 			throw new Error('Route must have at least one hop');
@@ -17021,6 +17251,32 @@ export class LightningNode extends EventEmitter {
 		// part all the same.
 		const finalAmountMsat =
 			route.hops[route.hops.length - 1].amountToForwardMsat;
+		const priorPayAll = this.persistedPayAllBudget(paymentHash.toString('hex'));
+		if (
+			priorPayAll &&
+			(!payAll ||
+				priorPayAll.debitMsat !== payAll.debitMsat ||
+				priorPayAll.maxFeeMsat !== payAll.maxFeeMsat)
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.PAY_ALL_BUDGET_MISMATCH,
+				'Retry this payment through pay-all with its persisted budget'
+			);
+		}
+		if (payAll) {
+			this.validatePayAllBudget(payAll);
+			if (
+				route.hops[0].amountToForwardMsat !== payAll.debitMsat ||
+				finalAmountMsat <= 0n ||
+				finalAmountMsat > payAll.debitMsat ||
+				payAll.debitMsat - finalAmountMsat > payAll.maxFeeMsat ||
+				(totalMsat !== undefined && totalMsat !== finalAmountMsat)
+			) {
+				throw new InvalidRequestError(
+					'Route does not match the frozen single-part pay-all budget'
+				);
+			}
+		}
 		this.assertHashUnpaid(
 			paymentHash,
 			totalMsat !== undefined && totalMsat > finalAmountMsat
@@ -17124,7 +17380,9 @@ export class LightningNode extends EventEmitter {
 		const outChannel =
 			selfIntro?.outChannel ??
 			this.findLocalChannelByScid(hops[0].shortChannelId, firstHopPubkey) ??
-			this.findChannelForPeer(firstHopPubkey, hops[0].amountToForwardMsat);
+			(payAll
+				? undefined
+				: this.findChannelForPeer(firstHopPubkey, hops[0].amountToForwardMsat));
 		if (!outChannel) {
 			throw new LightningPaymentError(
 				LightningErrorCode.NO_CHANNEL_TO_HOP,
@@ -17136,6 +17394,15 @@ export class LightningNode extends EventEmitter {
 		const cltvExpiry =
 			(selfIntro?.wireCltvRel ?? hops[0].outgoingCltvValue) + baseHeight;
 		const amount = selfIntro?.wireAmountMsat ?? hops[0].amountToForwardMsat;
+		if (
+			payAll &&
+			outChannel.validateOutgoingHtlc(amount, cltvExpiry).length > 0
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.PAY_ALL_REVIEW_EXPIRED,
+				'The reviewed debit can no longer be admitted; prepare a new review'
+			);
+		}
 		// Fail closed BEFORE any record, mapping or HTLC exists: the router
 		// bound above is advisory, this is the guarantee (issue #737).
 		this.assertWithinCltvCeiling(paymentHash, cltvExpiry);
@@ -17143,6 +17410,16 @@ export class LightningNode extends EventEmitter {
 		// Create payment info BEFORE addHtlc because in synchronous loopback
 		// the entire fulfill chain runs during addHtlc
 		const payment: IPaymentInfo = {
+			...(payAll
+				? {
+						payAll: {
+							...payAll,
+							deliveredMsat: finalAmountMsat,
+							feeMsat: amount - finalAmountMsat,
+							remainderMsat: payAll.debitMsat - amount
+						}
+				  }
+				: {}),
 			paymentHash,
 			amountMsat: amount,
 			status: PaymentStatus.PENDING,
@@ -17201,6 +17478,7 @@ export class LightningNode extends EventEmitter {
 				'payment metadata is too large for the recovery guardians to accept'
 			);
 		}
+		const priorPayment = this.payments.get(paymentHash.toString('hex'));
 		this.payments.set(paymentHash.toString('hex'), payment);
 
 		// Track offered HTLC → payment mapping
@@ -17215,11 +17493,22 @@ export class LightningNode extends EventEmitter {
 			];
 			const paymentMutation = this.paymentMutation(paymentHash);
 			if (paymentMutation) mutations.unshift(paymentMutation);
-			this.commitMutations(
+			const committed = this.commitMutations(
 				'persist payment + HTLC mapping',
 				mutations,
 				RecoveryCriticality.SafetyCritical
 			);
+			if (payAll && !committed) {
+				// No HTLC may leave without the frozen contract. The failed
+				// transition is atomic; undo its provisional memory entries too.
+				this.htlcPaymentMap.delete(htlcKey);
+				if (priorPayment)
+					this.payments.set(paymentHash.toString('hex'), priorPayment);
+				else this.payments.delete(paymentHash.toString('hex'));
+				throw new Error(
+					'Could not persist pay-all budget and HTLC mapping; nothing was sent'
+				);
+			}
 		}
 
 		// Add HTLC to channel (may trigger synchronous fulfillment via loopback)
@@ -25404,15 +25693,22 @@ export class LightningNode extends EventEmitter {
 					const outerRedispatch = this.redispatchingRetryContext;
 					this.redispatchingRetryContext = retryCtx;
 					try {
-						retried = this.sendPayment(
-							retryCtx.invoiceStr!,
-							retryCtx.excludedChannels,
-							retryCtx.maxFeeMsat,
-							retryCtx.amountMsat,
-							retryCtx.maxCltvExpiryHeight,
-							retryCtx.policyOverrides,
-							retryCtx.metadata
-						);
+						retried = retryCtx.payAll
+							? this.sendPayAll(
+									retryCtx.invoiceStr!,
+									retryCtx.payAll.debitMsat,
+									retryCtx.payAll.maxFeeMsat,
+									retryCtx.metadata
+							  )
+							: this.sendPayment(
+									retryCtx.invoiceStr!,
+									retryCtx.excludedChannels,
+									retryCtx.maxFeeMsat,
+									retryCtx.amountMsat,
+									retryCtx.maxCltvExpiryHeight,
+									retryCtx.policyOverrides,
+									retryCtx.metadata
+							  );
 					} finally {
 						this.redispatchingRetryContext = outerRedispatch;
 					}
