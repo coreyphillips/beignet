@@ -1602,9 +1602,9 @@ describe('Production Hardening 11', function () {
 				expect(err.code).to.equal(LightningErrorCode.NO_ROUTE);
 			});
 
-			it('should all 9 error codes be defined', () => {
+			it('should all payment error codes be defined', () => {
 				const codes = Object.values(LightningErrorCode);
-				expect(codes).to.have.lengthOf(9);
+				expect(codes).to.have.lengthOf(12);
 				expect(codes).to.include('CLTV_EXCEEDS_MAX');
 				expect(codes).to.include('NO_ROUTE');
 				expect(codes).to.include('DUPLICATE_PAYMENT');
@@ -1614,6 +1614,9 @@ describe('Production Hardening 11', function () {
 				expect(codes).to.include('INVALID_INVOICE');
 				expect(codes).to.include('INVOICE_EXPIRED');
 				expect(codes).to.include('INVALID_KEYSEND');
+				expect(codes).to.include('PAY_ALL_REVIEW_EXPIRED');
+				expect(codes).to.include('PAY_ALL_REMAINDER');
+				expect(codes).to.include('PAY_ALL_BUDGET_MISMATCH');
 			});
 
 			it('should INVOICE_EXPIRED return FAILED payment', () => {

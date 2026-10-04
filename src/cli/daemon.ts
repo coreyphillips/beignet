@@ -116,6 +116,7 @@ const CORS_ALLOW_HEADERS = 'Content-Type, Authorization, X-Idempotency-Key';
 
 const IDEMPOTENT_ROUTES = new Set([
 	'POST /invoice/pay',
+	'POST /invoice/pay-all',
 	'POST /invoice/pay-safe',
 	'POST /invoice/pay-async',
 	'POST /invoice/pay-retry',
@@ -502,6 +503,9 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// The caller's own fee ceiling, a recovery answer that needs a reachable
 	// quorum, and a resource with nothing recorded yet: none is a node fault.
 	FEE_EXCEEDS_MAX: 409,
+	PAY_ALL_REVIEW_EXPIRED: 409,
+	PAY_ALL_REMAINDER: 409,
+	PAY_ALL_BUDGET_MISMATCH: 409,
 	CLTV_EXCEEDS_MAX: 409,
 	CHAIN_NOT_SYNCED: 503,
 	RECOVERY_UNAVAILABLE: 503,
@@ -2331,6 +2335,36 @@ async function bootDaemon(
 			const { bolt11 } = body as { bolt11: string };
 			if (!bolt11) return failure('INVALID_PARAMS', 'bolt11 required');
 			return success(node.decodeInvoice(bolt11));
+		},
+		'POST /invoice/pay-all/quote': (body) => {
+			const { bolt11, maxFeeMsat } = body as {
+				bolt11: string;
+				maxFeeMsat: number | string;
+			};
+			if (typeof bolt11 !== 'string' || !bolt11 || maxFeeMsat === undefined)
+				return failure('INVALID_PARAMS', 'bolt11 and maxFeeMsat required');
+			return success(node.quotePayAll(bolt11, maxFeeMsat));
+		},
+		'POST /invoice/pay-all': async (body) => {
+			const { bolt11, debitMsat, maxFeeMsat, timeoutMs } = body as {
+				bolt11: string;
+				debitMsat: number | string;
+				maxFeeMsat: number | string;
+				timeoutMs?: number;
+			};
+			if (
+				typeof bolt11 !== 'string' ||
+				!bolt11 ||
+				debitMsat === undefined ||
+				maxFeeMsat === undefined
+			)
+				return failure(
+					'INVALID_PARAMS',
+					'bolt11, debitMsat and maxFeeMsat required'
+				);
+			return success(
+				await node.payInvoiceAll(bolt11, debitMsat, maxFeeMsat, timeoutMs)
+			);
 		},
 		'POST /invoice/pay': async (body) => {
 			const {

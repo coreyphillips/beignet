@@ -207,6 +207,7 @@ import {
 	PeerInfo,
 	ChannelInfo,
 	PaymentInfo,
+	PayAllQuote,
 	InvoiceInfo,
 	DecodedInvoice,
 	TxInfo,
@@ -840,6 +841,9 @@ export function parseScid(scid: string): Buffer {
  * route it came in by.
  */
 export const ENGINE_PAYMENT_ERROR_CODES: Readonly<Record<string, string>> = {
+	PAY_ALL_REVIEW_EXPIRED: 'PAY_ALL_REVIEW_EXPIRED',
+	PAY_ALL_REMAINDER: 'PAY_ALL_REMAINDER',
+	PAY_ALL_BUDGET_MISMATCH: 'PAY_ALL_BUDGET_MISMATCH',
 	NO_ROUTE: 'NO_ROUTE',
 	DUPLICATE_PAYMENT: 'DUPLICATE_PAYMENT',
 	NO_CHANNEL_TO_HOP: 'PEER_NOT_CONNECTED',
@@ -11015,6 +11019,66 @@ export class BeignetNode extends EventEmitter {
 	 * caller cap at an exact quote such as estimatePayment's estimatedFeeMsat
 	 * (issue #998).
 	 */
+	quotePayAll(bolt11: string, maxFeeMsat: number | string): PayAllQuote {
+		try {
+			const quote = this.node.quotePayAll(
+				bolt11,
+				requireMsatValue(maxFeeMsat, 'maxFeeMsat')
+			);
+			return {
+				...quote,
+				debitMsat: quote.debitMsat.toString(),
+				maxFeeMsat: quote.maxFeeMsat.toString(),
+				minRecipientMsat: quote.minRecipientMsat.toString(),
+				remainderMsat: quote.remainderMsat.toString()
+			};
+		} catch (err) {
+			throw this._toBeignetPaymentError(err);
+		}
+	}
+
+	async payInvoiceAll(
+		bolt11: string,
+		debitMsat: number | string,
+		maxFeeMsat: number | string,
+		timeoutMs = 60_000
+	): Promise<PaymentInfo> {
+		this._checkDraining();
+		const decoded = decodeInvoiceInput(bolt11);
+		const debit = requireMsatValue(debitMsat, 'debitMsat');
+		const feeCap = requireMsatValue(maxFeeMsat, 'maxFeeMsat');
+		if (debit <= 0n || debit > 0xffffffffffffffffn || feeCap >= debit) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'Pay-all requires a positive u64 debitMsat and maxFeeMsat below it'
+			);
+		}
+		if (
+			!Number.isSafeInteger(timeoutMs) ||
+			timeoutMs < 1 ||
+			timeoutMs > 2_147_483_647
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'timeoutMs must be a positive timer duration'
+			);
+		}
+		// The debit already includes the fee. Reserve it exactly once.
+		const claim = this._admitLightningSpend(
+			decoded.paymentHash.toString('hex'),
+			debit,
+			0n
+		);
+		return this.waitForInvoicePayment(
+			decoded.paymentHash,
+			timeoutMs,
+			claim,
+			() => {
+				this.node.sendPayAll(bolt11, debit, feeCap);
+			}
+		);
+	}
+
 	async payInvoice(
 		bolt11: string,
 		timeoutMs = 60_000,
@@ -11075,15 +11139,38 @@ export class BeignetNode extends EventEmitter {
 			maxFeeMsat
 		);
 
+		return this.waitForInvoicePayment(
+			decoded.paymentHash,
+			timeoutMs,
+			claim,
+			() => {
+				this.node.sendPayment(
+					bolt11,
+					undefined,
+					maxFeeMsat,
+					amountMsat,
+					maxCltvExpiryHeight,
+					undefined,
+					metadata
+				);
+			}
+		);
+	}
+
+	private waitForInvoicePayment(
+		paymentHash: Buffer,
+		timeoutMs: number,
+		claim: ReturnType<BeignetNode['_admitLightningSpend']>,
+		dispatch: () => void
+	): Promise<PaymentInfo> {
+		const paymentHashHex = paymentHash.toString('hex');
 		return new Promise<PaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
 				// A ghost payment is failed to free its capacity, and its
 				// claim's reservation with it; one with an HTLC still out stays
 				// PENDING (issue #976) and keeps its claim for the settle.
-				reject(
-					this._paymentTimeout(decoded.paymentHash, 'Payment', timeoutMs, claim)
-				);
+				reject(this._paymentTimeout(paymentHash, 'Payment', timeoutMs, claim));
 			}, timeoutMs);
 
 			const cleanup = (): void => {
@@ -11122,25 +11209,21 @@ export class BeignetNode extends EventEmitter {
 			this.node.on('payment:sent', onSent);
 			this.node.on('payment:failed', onFailed);
 
+			const beforeDispatch = this.node.getPayment(paymentHash);
 			try {
-				// The metadata rides the send, which creates the record it belongs
-				// on; setPaymentMetadata only labels a record that already exists.
-				this.node.sendPayment(
-					bolt11,
-					undefined,
-					maxFeeMsat,
-					amountMsat,
-					maxCltvExpiryHeight,
-					undefined,
-					metadata
-				);
+				dispatch();
 			} catch (err: unknown) {
 				cleanup();
 				// A payment that never started holds no capacity. Without this
 				// the reservation outlived every refused send (no route, a
 				// duplicate, a peer that is gone) and ratcheted the counter up
 				// until the daily limit refused real payments (issue #474).
-				if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
+				const dispatched = this.node.getPayment(paymentHash) !== beforeDispatch;
+				if (dispatched && this.node.hasHtlcInFlight(paymentHash)) {
+					this.node.failPaymentUnlessInFlight(paymentHash);
+				} else if (claim) {
+					this._closeAsyncSpendClaim(paymentHashHex, claim);
+				}
 				reject(this._toBeignetPaymentError(err));
 			}
 		});
@@ -11889,6 +11972,7 @@ export class BeignetNode extends EventEmitter {
 		if (!proof || !record) return null;
 		const feeMsat = paymentFeeMsat(record);
 		return {
+			...(record.payAll ? { payAll: this.toPaymentInfo(record).payAll } : {}),
 			paymentHash: proof.paymentHash.toString('hex'),
 			preimage: proof.preimage.toString('hex'),
 			amountSats: paymentAmountSats(record),
@@ -12054,6 +12138,17 @@ export class BeignetNode extends EventEmitter {
 	 */
 	private toPaymentInfo(p: IPaymentInfo): PaymentInfo {
 		const info: PaymentInfo = {
+			...(p.payAll
+				? {
+						payAll: {
+							debitMsat: p.payAll.debitMsat.toString(),
+							maxFeeMsat: p.payAll.maxFeeMsat.toString(),
+							deliveredMsat: p.payAll.deliveredMsat.toString(),
+							feeMsat: p.payAll.feeMsat.toString(),
+							remainderMsat: p.payAll.remainderMsat.toString()
+						}
+				  }
+				: {}),
 			paymentHash: p.paymentHash.toString('hex'),
 			amountSats: paymentAmountSats(p),
 			status: p.status,

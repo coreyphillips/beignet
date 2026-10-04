@@ -57,7 +57,7 @@ export function edgeDirection(
  * override when it holds one for this edge, else the graph's update. An
  * override never adds an edge the graph has no update for.
  */
-function policyFor(
+export function policyFor(
 	update: IChannelUpdateMessage | undefined,
 	policyOverrides: TPolicyOverrides | undefined,
 	scidHex: string,
@@ -348,7 +348,7 @@ function makeLocalChannelEdge(
  * overlay (edges keyed by destination-side node, plus a SCID→destination map)
  * that the backward Dijkstra merges with the gossip graph.
  */
-function buildEdgeOverlay(
+export function buildEdgeOverlay(
 	graph: NetworkGraph,
 	source: Buffer,
 	destination: Buffer,

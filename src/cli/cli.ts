@@ -1354,6 +1354,24 @@ async function handleInvoice(): Promise<void> {
 					bolt11: filteredArgs[2]
 				})
 			);
+		case 'pay-all-quote':
+			return outputResult(
+				await httpRequest('POST', '/invoice/pay-all/quote', {
+					bolt11: filteredArgs[2],
+					maxFeeMsat: parseFlag('--max-fee-msat')
+				})
+			);
+		case 'pay-all':
+			return outputResult(
+				await httpRequest('POST', '/invoice/pay-all', {
+					bolt11: filteredArgs[2],
+					debitMsat: parseFlag('--debit-msat'),
+					maxFeeMsat: parseFlag('--max-fee-msat'),
+					timeoutMs: parseFlag('--timeout')
+						? Number(parseFlag('--timeout'))
+						: undefined
+				})
+			);
 		case 'pay-safe':
 			return outputResult(
 				await httpRequest('POST', '/invoice/pay-safe', {
@@ -3055,6 +3073,10 @@ Swaps (reverse: a peer pays us over Lightning, we fund an on-chain contract;
   invoice validate <bolt11> [sats]       Pre-flight checks: should this be paid?
   invoice get <hash>                     Details of an invoice we created
   invoice pay <bolt11>                   Pay invoice (blocks until settled)
+  invoice pay-all-quote <bolt11> --max-fee-msat N
+                                        Review an exact pay-all debit
+  invoice pay-all <bolt11> --debit-msat N --max-fee-msat N [--timeout ms]
+                                        Send the reviewed debit, including fees
   invoice pay-safe <bolt11> [--max-fee N] [--amount N] [--timeout ms]
                                          Pay; resolves with status FAILED
                                          instead of erroring
