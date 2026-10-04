@@ -3,6 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import * as bitcoin from 'bitcoinjs-lib';
+import { BeignetNode } from '../../src/cli/beignet-node';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
@@ -217,6 +218,19 @@ describe('External cooperative close', function () {
 			bob.handlePeerMessage(alice.getNodeId(), msg.type, msg.payload);
 		}
 		expect(published).not.to.equal(undefined);
+		const assertBalances = (pending: number) => {
+			const api = Object.assign(Object.create(BeignetNode.prototype), {
+				node: alice,
+				networkName: 'regtest',
+				wallet: { transactions: {}, getBalance: () => 0 }
+			}) as BeignetNode;
+			expect(api.getBalance().lightning).to.equal(0);
+			expect(api.getBalance().total).to.equal(0);
+			expect(api.getInfo().pendingCloseBalanceSats).to.equal(pending);
+		};
+		assertBalances(1_000_000);
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		assertBalances(1_000_000);
 		const before = storage.loadChannel(channelId.toString('hex'))!.state;
 		expect(before.lastCooperativeCloseTxHex).to.equal(undefined);
 		expect(
@@ -230,7 +244,9 @@ describe('External cooperative close', function () {
 		storage = new SqliteStorage(db);
 		storage.open();
 		alice = createNode('close-address', 1, storage);
+		assertBalances(1_000_000);
 		alice.handleFundingSpent(channelId, published!, 100, P2WPKH);
+		assertBalances(0);
 		const history = alice.listExternalClosePayments();
 		expect(history).to.have.length(1);
 		expect(history[0].txid).to.equal(published!.getId());

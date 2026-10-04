@@ -103,8 +103,13 @@ describe('Interop: external cooperative close payout (regtest)', function () {
 				const api = Object.assign(Object.create(BeignetNode.prototype), {
 					node: wallet,
 					networkName: 'regtest',
-					wallet: { transactions: {} }
+					wallet: { transactions: {}, getBalance: () => 0 }
 				}) as BeignetNode;
+				const assertNoWalletBalance = () => {
+					expect(api.getBalance().lightning).to.equal(0);
+					expect(api.getBalance().total).to.equal(0);
+					expect(api.getInfo().pendingCloseBalanceSats).to.equal(0);
+				};
 				const quote = await api.closeQuote(channelId.toString('hex'), address);
 				expect(quote.amountSats + quote.feeSats).to.equal(
 					walletIsOpener ? 600000 : 400000
@@ -118,6 +123,7 @@ describe('Interop: external cooperative close payout (regtest)', function () {
 					.getChannel(channelId)!
 					.getFullState();
 				expect(closed.state).to.equal(ChannelState.CLOSED);
+				assertNoWalletBalance();
 				const tx = bitcoin.Transaction.fromHex(
 					closed.lastCooperativeCloseTxHex!
 				);
@@ -142,6 +148,7 @@ describe('Interop: external cooperative close payout (regtest)', function () {
 					tx.outs[outputIndex].value
 				);
 				expect(payout.confirmations).to.be.at.least(1);
+				assertNoWalletBalance();
 				const history = api.listOnchainTransactions();
 				expect(history).to.have.length(1);
 				expect(history[0]).to.include({
@@ -162,6 +169,7 @@ describe('Interop: external cooperative close payout (regtest)', function () {
 				expect(wallet.getChannel(channelId)!.spendableOutboundMsat).to.equal(
 					0n
 				);
+				assertNoWalletBalance();
 				expect(api.listOnchainTransactions()).to.have.length(1);
 			} finally {
 				wallet.destroy();

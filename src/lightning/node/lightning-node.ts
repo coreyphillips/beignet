@@ -31663,10 +31663,7 @@ export class LightningNode extends EventEmitter {
 					channel.getPendingSpliceLocalBalanceMsat() ?? state.localBalanceMsat;
 				localBalanceMsat +=
 					pending < state.localBalanceMsat ? pending : state.localBalanceMsat;
-			} else if (
-				state.state !== ChannelState.NORMAL &&
-				state.state !== ChannelState.AWAITING_REESTABLISH
-			) {
+			} else if (effState !== ChannelState.NORMAL) {
 				continue;
 			} else {
 				localBalanceMsat += state.localBalanceMsat;

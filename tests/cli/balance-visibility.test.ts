@@ -161,6 +161,38 @@ describe('LightningNode.getBalance mid-splice accounting', () => {
 		expect(balanceOf([disconnected])).to.equal(20_000_000n);
 	});
 
+	for (const prior of [
+		ChannelState.SHUTTING_DOWN,
+		ChannelState.NEGOTIATING_CLOSING,
+		ChannelState.FORCE_CLOSED,
+		ChannelState.CLOSED
+	]) {
+		it(`does not restore ${prior} funds to Lightning after a disconnect`, () => {
+			expect(
+				balanceOf([
+					{
+						state: ChannelState.AWAITING_REESTABLISH,
+						preReestablishState: prior,
+						localBalanceMsat: 50_000_000n,
+						remoteBalanceMsat: 0n
+					}
+				])
+			).to.equal(0n);
+		});
+	}
+	it('retains the balance of a disconnected normal channel', () => {
+		expect(
+			balanceOf([
+				{
+					state: ChannelState.AWAITING_REESTABLISH,
+					preReestablishState: ChannelState.NORMAL,
+					localBalanceMsat: 50_000_000n,
+					remoteBalanceMsat: 0n
+				}
+			])
+		).to.equal(50_000_000n);
+	});
+
 	it('counts a pay-through splice-in at its live side, connected or not', () => {
 		const connected: FakeNodeChannel = {
 			state: ChannelState.SPLICING,

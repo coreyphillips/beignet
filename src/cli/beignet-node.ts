@@ -6342,9 +6342,16 @@ export class BeignetNode extends EventEmitter {
 		]);
 		let totalMsat = 0n;
 		for (const ch of this.node.listChannels()) {
-			if (!recovering.has(ch.state)) continue;
+			const effectiveState =
+				ch.state === ChannelState.AWAITING_REESTABLISH
+					? this.node
+							.getChannelManager()
+							.getChannel(ch.channelId)
+							?.getFullState().preReestablishState ?? ch.state
+					: ch.state;
+			if (!recovering.has(effectiveState)) continue;
 			if (
-				ch.state === ChannelState.FORCE_CLOSED &&
+				effectiveState === ChannelState.FORCE_CLOSED &&
 				this.isForceCloseBalanceInWallet(ch.channelId)
 			) {
 				continue;

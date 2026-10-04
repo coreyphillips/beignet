@@ -1004,6 +1004,7 @@ describe('Recovery phase 1: a failed transition strands nothing on disk', () => 
 describe('Recovery phase 1: batch dispatch invariants', () => {
 	function stubChannel(channelId: Buffer): Channel {
 		return {
+			getFullState: (): Record<string, unknown> => ({}),
 			getChannelId: (): Buffer => channelId,
 			getTemporaryChannelId: (): Buffer | null => null,
 			getState: (): ChannelState => ChannelState.NORMAL
