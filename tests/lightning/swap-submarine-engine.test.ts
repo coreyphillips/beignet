@@ -646,7 +646,7 @@ describe('Submarine swap provider engine (issue #743)', function () {
 			const { ack } = await create(h, unfunded);
 			expect(ack.accepted).to.equal(true);
 			const funded = submarineClient();
-			await create(h, funded);
+			const { ack: fundedAck } = await create(h, funded);
 			fundContract(
 				h.chain,
 				Buffer.from(record(h, funded).outputScriptHex, 'hex'),
@@ -655,7 +655,9 @@ describe('Submarine swap provider engine (issue #743)', function () {
 			);
 			await tick(h);
 			expect(record(h, funded).state).to.equal('FUNDING_SEEN');
-			h.clock = (ack.terms!.expiresAt + 1) * 1000;
+			h.clock =
+				(Math.max(ack.terms!.expiresAt, fundedAck.terms!.expiresAt) + 1) *
+				1000;
 			await tick(h);
 			expect(record(h, unfunded).state).to.equal('CANCELLED');
 			expect(record(h, unfunded).failureReason).to.match(/expired/);
