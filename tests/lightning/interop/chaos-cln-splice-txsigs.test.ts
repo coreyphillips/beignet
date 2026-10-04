@@ -175,6 +175,8 @@ describe('Interop chaos: CLN splice tx_signatures crash-resume (regtest)', funct
 			storage.open();
 			const kill = new KillSwitch();
 			node = mkNode(sealableStorage(storage, kill));
+			// Persistent channel keys require a real chain tip before opening.
+			node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 			const nodeId = node.getNodeId();
 
 			await fundClnWallet(cln);

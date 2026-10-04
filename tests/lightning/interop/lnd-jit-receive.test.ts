@@ -153,118 +153,182 @@ describe('Interop: LND pays through a JIT intercept SCID (issue #594)', function
 		bob = null;
 	});
 
-	it('opens a zero-conf channel mid-payment and settles', async function () {
-		alice = makeNode('jit-lsp-901', {
-			fundingProvider: new BitcoindFundingProvider(),
-			jitReceive: {
-				enabled: true,
-				fundingBufferSats: 20_000n,
-				maxClientFundingSats: 500_000n
-			}
-		});
-		bob = makeNode('jit-wallet-902');
-		const aliceId = alice.getNodeId();
-		const bobId = bob.getNodeId();
+	for (const waiveClientReserve of [false, true]) {
+		it(`opens a zero-conf channel mid-payment with waiver ${waiveClientReserve} and settles`, async function () {
+			alice = makeNode('jit-lsp-901', {
+				zeroReserve: {
+					advertise: waiveClientReserve,
+					role: 'primary',
+					waiveClientReserve
+				},
+				fundingProvider: new BitcoindFundingProvider(),
+				jitReceive: {
+					enabled: true,
+					fundingBufferSats: 20_000n,
+					maxClientFundingSats: 500_000n
+				}
+			});
+			bob = makeNode('jit-wallet-902', {
+				zeroReserve: { advertise: true, role: 'wallet' }
+			});
+			const aliceId = alice.getNodeId();
+			const bobId = bob.getNodeId();
 
-		// ── LND funds a channel to alice, so LND has the outbound to spend ──
-		await fundLndWallet(lnd, 110);
-		await alice.connectPeer(lndPubkey, LND_P2P_HOST, LND_P2P_PORT);
-		await sleep(2_000);
-		await lnd.openChannelSync(aliceId, LND_TO_ALICE_SAT, 0);
-		await mineBlocks(6);
-		await sleep(3_000);
-		const inbound = alice.getChannelManager().listChannels();
-		expect(inbound.length, 'alice has the LND channel').to.be.greaterThan(0);
-		alice.handleFundingConfirmed(inbound[0].getChannelId()!);
-		await waitForLndChannels(lnd, 1, 30_000);
-		setupRoutingForChannel(alice, lndPubkey);
-		const tip = (await bitcoinRpc('getblockcount')) as number;
-		alice.handleNewBlock(tip);
-		bob.handleNewBlock(tip);
+			// ── LND funds a channel to alice, so LND has the outbound to spend ──
+			await fundLndWallet(lnd, 110);
+			await alice.connectPeer(lndPubkey, LND_P2P_HOST, LND_P2P_PORT);
+			await sleep(2_000);
+			await lnd.openChannelSync(aliceId, LND_TO_ALICE_SAT, 0);
+			await mineBlocks(6);
+			await sleep(3_000);
+			const inbound = alice.getChannelManager().listChannels();
+			expect(inbound.length, 'alice has the LND channel').to.be.greaterThan(0);
+			alice.handleFundingConfirmed(inbound[0].getChannelId()!);
+			await waitForLndChannels(lnd, 1, 30_000);
+			setupRoutingForChannel(alice, lndPubkey);
+			const tip = (await bitcoinRpc('getblockcount')) as number;
+			alice.handleNewBlock(tip);
+			bob.handleNewBlock(tip);
 
-		// ── bob connects to alice and trusts it for the coming zero-conf open ──
-		const bobPort = await freePort();
-		await bob.listen(bobPort);
-		bob.addTrustedPeer(aliceId);
-		await alice.connectPeer(bobId, '127.0.0.1', bobPort);
-		await sleep(1_500);
-		expect(
-			alice.listChannels().filter((c) => c.peerPubkey === bobId),
-			'no channel to bob yet'
-		).to.have.length(0);
+			// ── bob connects to alice and trusts it for the coming zero-conf open ──
+			const bobPort = await freePort();
+			await bob.listen(bobPort);
+			bob.addTrustedPeer(aliceId);
+			await alice.connectPeer(bobId, '127.0.0.1', bobPort);
+			await sleep(1_500);
+			expect(
+				alice.listChannels().filter((c) => c.peerPubkey === bobId),
+				'no channel to bob yet'
+			).to.have.length(0);
 
-		// ── bob registers a receive intent; alice mints the intercept SCID ──
-		let ack: IJitReceiveAck | undefined;
-		bob.on('custom-message', (m: { subtype: number; payload: Buffer }) => {
-			if (m.subtype === BeignetCustomSubtype.JIT_RECEIVE_ACK) {
-				ack = decodeJitAck(m.payload);
-			}
-		});
-		bob.sendCustomMessage(
-			aliceId,
-			BeignetCustomSubtype.JIT_RECEIVE_AUTHORIZATION,
-			encodeJitAuthorization({
-				requestId: crypto.randomBytes(8),
-				maxAmountMsat: PAYMENT_MSAT,
-				expectedTotalMsat: PAYMENT_MSAT,
-				targetRemainingInboundSat: 50_000n,
-				expirySeconds: 600
-			})
-		);
-		await sleep(1_000);
-		expect(ack, 'bob received the ack').to.not.equal(undefined);
-		expect(ack!.accepted).to.equal(true);
-
-		// ── the invoice: unpayable today, its only hint is the intercept SCID ──
-		const invoice = bob.createInvoice({
-			amountMsat: PAYMENT_MSAT,
-			description: 'jit receive',
-			extraRoutingHints: [
-				[
-					{
-						pubkey: Buffer.from(aliceId, 'hex'),
-						shortChannelId: ack!.interceptScid,
-						feeBaseMsat: 1_000,
-						feeProportionalMillionths: 1,
-						cltvExpiryDelta: HINT_CLTV_DELTA
-					}
-				]
-			]
-		});
-
-		const opened = new Promise<void>((resolve, reject) => {
-			alice!.once('jit:forwarded', () => resolve());
-			alice!.once('jit:failed', (d: { reason: string }) =>
-				reject(new Error(`JIT funding failed: ${d.reason}`))
+			// ── bob registers a receive intent; alice mints the intercept SCID ──
+			let ack: IJitReceiveAck | undefined;
+			bob.on('custom-message', (m: { subtype: number; payload: Buffer }) => {
+				if (m.subtype === BeignetCustomSubtype.JIT_RECEIVE_ACK) {
+					ack = decodeJitAck(m.payload);
+				}
+			});
+			bob.sendCustomMessage(
+				aliceId,
+				BeignetCustomSubtype.JIT_RECEIVE_AUTHORIZATION,
+				encodeJitAuthorization({
+					requestId: crypto.randomBytes(8),
+					maxAmountMsat: PAYMENT_MSAT,
+					expectedTotalMsat: PAYMENT_MSAT,
+					targetRemainingInboundSat: 50_000n,
+					expirySeconds: 600
+				})
 			);
+			await sleep(1_000);
+			expect(ack, 'bob received the ack').to.not.equal(undefined);
+			expect(ack!.accepted).to.equal(true);
+
+			// ── the invoice: unpayable today, its only hint is the intercept SCID ──
+			const invoice = bob.createInvoice({
+				amountMsat: PAYMENT_MSAT,
+				description: 'jit receive',
+				extraRoutingHints: [
+					[
+						{
+							pubkey: Buffer.from(aliceId, 'hex'),
+							shortChannelId: ack!.interceptScid,
+							feeBaseMsat: 1_000,
+							feeProportionalMillionths: 1,
+							cltvExpiryDelta: HINT_CLTV_DELTA
+						}
+					]
+				]
+			});
+
+			const opened = new Promise<void>((resolve, reject) => {
+				alice!.once('jit:forwarded', () => resolve());
+				alice!.once('jit:failed', (d: { reason: string }) =>
+					reject(new Error(`JIT funding failed: ${d.reason}`))
+				);
+			});
+
+			const payment = await lnd.sendPaymentSync(invoice.bolt11);
+			expect(payment.payment_error || '').to.equal('');
+			expect(payment.payment_preimage).to.be.a('string');
+			await opened;
+
+			// The channel alice funded mid-payment is real and carries the receive.
+			const jitChannels = alice.listChannels();
+			expect(jitChannels.filter((c) => c.peerPubkey === bobId)).to.have.length(
+				1
+			);
+			expect(bob.listChannels()).to.have.length(1);
+			// The settle rides a commitment round after LND's payment returns.
+			const settled = Date.now() + 20_000;
+			while (
+				bob.listChannels()[0].localBalanceMsat < PAYMENT_MSAT &&
+				Date.now() < settled
+			) {
+				await sleep(250);
+			}
+			expect(
+				Number(bob.listChannels()[0].localBalanceMsat),
+				'bob was credited the receive'
+			).to.be.greaterThanOrEqual(Number(PAYMENT_MSAT));
+			// The intent is consumed: it authorized one receive, not a standing
+			// right to be funded again.
+			expect(alice.getJitReceiveManager()!.listIntents()).to.have.length(0);
+			expect(alice.getChannelManager().isTrustedPeer(bobId)).to.equal(false);
+			const walletChannel = bob.getChannelManager().listChannels()[0];
+			const walletState = walletChannel.getFullState();
+			const primaryChannel = alice
+				.getChannelManager()
+				.getChannel(walletChannel.getChannelId()!)!;
+			expect(walletState.localReserveWaived === true).to.equal(
+				waiveClientReserve
+			);
+			expect(
+				primaryChannel.getFullState().remoteReserveWaived === true
+			).to.equal(waiveClientReserve);
+			expect(walletState.remoteReserveWaived === true).to.equal(false);
+			expect(
+				primaryChannel.getFullState().remoteConfig.channelReserveSatoshis > 0n
+			).to.equal(true);
+			const lndChannel = alice
+				.getChannelManager()
+				.getChannel(inbound[0].getChannelId()!)!;
+			expect(lndChannel.getFullState().localReserveWaived === true).to.equal(
+				false
+			);
+			expect(lndChannel.getFullState().remoteReserveWaived === true).to.equal(
+				false
+			);
+			if (waiveClientReserve) {
+				const debit = walletChannel.getSpendableOutboundMsat();
+				expect(debit).to.equal(walletState.localBalanceMsat);
+				const maxInvoice = alice.createInvoice({
+					description: 'return the full wallet balance'
+				});
+				const quote = bob.quotePayAll(maxInvoice.bolt11, 1000n);
+				expect(quote.debitMsat).to.equal(debit);
+				expect(quote.routeFound).to.equal(true);
+				const payAllPayment = bob.sendPayAll(
+					maxInvoice.bolt11,
+					quote.debitMsat,
+					quote.maxFeeMsat
+				);
+				const payAllResult = await bob.waitForPayment(
+					payAllPayment.paymentHash,
+					30_000
+				);
+				expect(payAllResult.payAll).to.deep.equal({
+					debitMsat: debit,
+					maxFeeMsat: 1000n,
+					deliveredMsat: debit,
+					feeMsat: 0n,
+					remainderMsat: 0n
+				});
+				expect(walletChannel.getFullState().localBalanceMsat).to.equal(0n);
+				expect(walletChannel.getState()).to.equal('NORMAL');
+				expect(primaryChannel.getState()).to.equal('NORMAL');
+			}
 		});
-
-		const payment = await lnd.sendPaymentSync(invoice.bolt11);
-		expect(payment.payment_error || '').to.equal('');
-		expect(payment.payment_preimage).to.be.a('string');
-		await opened;
-
-		// The channel alice funded mid-payment is real and carries the receive.
-		const jitChannels = alice.listChannels();
-		expect(jitChannels.filter((c) => c.peerPubkey === bobId)).to.have.length(1);
-		expect(bob.listChannels()).to.have.length(1);
-		// The settle rides a commitment round after LND's payment returns.
-		const settled = Date.now() + 20_000;
-		while (
-			bob.listChannels()[0].localBalanceMsat < PAYMENT_MSAT &&
-			Date.now() < settled
-		) {
-			await sleep(250);
-		}
-		expect(
-			Number(bob.listChannels()[0].localBalanceMsat),
-			'bob was credited the receive'
-		).to.be.greaterThanOrEqual(Number(PAYMENT_MSAT));
-		// The intent is consumed: it authorized one receive, not a standing
-		// right to be funded again.
-		expect(alice.getJitReceiveManager()!.listIntents()).to.have.length(0);
-		expect(alice.getChannelManager().isTrustedPeer(bobId)).to.equal(false);
-	});
+	}
 
 	// Exercise both fee contracts through a real LND payment. Skim mode
 	// needs the receiver's shortfall allowance; hop mode must pay the entire

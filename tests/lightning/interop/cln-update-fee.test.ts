@@ -115,24 +115,33 @@ describe('Interop: CLN-funded update_fee desync regression (live)', function () 
 		// CLN raises an anchor channel's commitment feerate (regtest target
 		// ~1250 sat/kw) right after NORMAL; wait for a fee round to land and
 		// fully settle (staged rate promoted, nothing pending).
-		const openRate = channel.getFullState().remoteConfig.feeratePerKw;
-		const feeRound = await waitFor(() => {
+		const openRate = setup.openingFeeratePerKw;
+		let feeRound: number | null = null;
+		const feeDeadline = Date.now() + 25_000;
+		while (Date.now() < feeDeadline) {
 			const st = channel.getFullState();
-			return st.remoteConfig.feeratePerKw !== openRate &&
+			if (
+				st.remoteConfig.feeratePerKw !== openRate &&
 				st.pendingFeeratePerKw === undefined
-				? st.remoteConfig.feeratePerKw
-				: null;
-		}, 25_000);
+			) {
+				feeRound = st.remoteConfig.feeratePerKw;
+				break;
+			}
+			await sleep(500);
+		}
 		if (feeRound !== null) {
 			console.log(
 				`    CLN update_fee absorbed: ${openRate} → ${feeRound} sat/kw`
 			);
 		} else {
 			console.log(
-				`    No CLN update_fee within 25s (opened at ${openRate} sat/kw) — continuing`
+				`    No CLN update_fee within 25s (opened at ${openRate} sat/kw); fee-update qualification skipped`
 			);
-			// Whatever happened, no fee round may be left dangling.
 			expect(channel.getFullState().pendingFeeratePerKw).to.equal(undefined);
+			expect(channel.getState()).to.equal(ChannelState.NORMAL);
+			expect(desyncErrors, desyncErrors.join('; ')).to.deep.equal([]);
+			this.skip();
+			return;
 		}
 
 		// ── 3. beignet → CLN, strict ──

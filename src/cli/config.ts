@@ -738,6 +738,14 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			cliFlags.leaseRates ??
 			leaseRatesEnv(process.env.BEIGNET_LEASE_RATES) ??
 			file.leaseRates,
+		waiveClientReserve:
+			cliFlags.waiveClientReserve ??
+			(process.env.BEIGNET_WAIVE_CLIENT_RESERVE === 'true'
+				? true
+				: process.env.BEIGNET_WAIVE_CLIENT_RESERVE === 'false'
+				? false
+				: undefined) ??
+			file.waiveClientReserve,
 		jitReceive: mergeJitReceive(
 			cliFlags.jitReceive,
 			jitReceiveEnv(),

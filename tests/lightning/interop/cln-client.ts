@@ -492,11 +492,13 @@ export class ClnRestClient {
 
 	async createOffer(
 		amountMsat: number | string | 'any',
-		description: string
+		description: string,
+		devPaths?: string[][]
 	): Promise<IClnOfferResponse> {
 		return this.request('POST', '/v1/offer', {
 			amount: String(amountMsat),
-			description
+			description,
+			...(devPaths ? { dev_paths: devPaths } : {})
 		});
 	}
 

@@ -149,7 +149,8 @@ function validateChannelPoints(
  */
 export function validateOpenChannelParams(
 	msg: IOpenChannelMessage,
-	maxFundingSatoshis: bigint = MAX_FUNDING_SATOSHIS
+	maxFundingSatoshis: bigint = MAX_FUNDING_SATOSHIS,
+	allowZeroReserve = false
 ): string | null {
 	// funding_satoshis must be > 0
 	if (msg.fundingSatoshis === 0n) {
@@ -179,7 +180,10 @@ export function validateOpenChannelParams(
 	}
 
 	// channel_reserve must be >= dust_limit
-	if (msg.channelReserveSatoshis < msg.dustLimitSatoshis) {
+	if (
+		msg.channelReserveSatoshis < msg.dustLimitSatoshis &&
+		!(allowZeroReserve && msg.channelReserveSatoshis === 0n)
+	) {
 		return 'channel_reserve_satoshis must be >= dust_limit_satoshis';
 	}
 
@@ -250,9 +254,14 @@ export function validateOpenChannelParams(
  */
 export function validatePeerOpenChannelParams(
 	msg: IOpenChannelMessage,
-	maxFundingSatoshis: bigint = MAX_FUNDING_SATOSHIS
+	maxFundingSatoshis: bigint = MAX_FUNDING_SATOSHIS,
+	allowZeroReserve = false
 ): string | null {
-	const error = validateOpenChannelParams(msg, maxFundingSatoshis);
+	const error = validateOpenChannelParams(
+		msg,
+		maxFundingSatoshis,
+		allowZeroReserve
+	);
 	if (error) {
 		return error;
 	}
@@ -306,7 +315,8 @@ function peerReserveCap(fundingSatoshis: bigint, dustFloor: bigint): bigint {
  */
 export function validateAcceptChannelParams(
 	open: IProposedOpenParams,
-	accept: IAcceptChannelMessage
+	accept: IAcceptChannelMessage,
+	waivers: { localReserveWaived?: boolean; remoteReserveWaived?: boolean } = {}
 ): string | null {
 	// temporary_channel_id must match
 	if (!open.temporaryChannelId.equals(accept.temporaryChannelId)) {
@@ -331,12 +341,18 @@ export function validateAcceptChannelParams(
 	}
 
 	// channel_reserve must be >= dust_limit of the opener
-	if (accept.channelReserveSatoshis < open.dustLimitSatoshis) {
+	if (
+		accept.channelReserveSatoshis < open.dustLimitSatoshis &&
+		!(waivers.localReserveWaived && accept.channelReserveSatoshis === 0n)
+	) {
 		return 'acceptor channel_reserve must be >= opener dust_limit';
 	}
 
 	// opener channel_reserve must be >= acceptor dust_limit
-	if (open.channelReserveSatoshis < accept.dustLimitSatoshis) {
+	if (
+		open.channelReserveSatoshis < accept.dustLimitSatoshis &&
+		!(waivers.remoteReserveWaived && open.channelReserveSatoshis === 0n)
+	) {
 		return 'opener channel_reserve must be >= acceptor dust_limit';
 	}
 

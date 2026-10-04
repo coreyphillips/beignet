@@ -279,6 +279,8 @@ export interface LogEntry {
 }
 
 export interface BeignetNodeOptions extends IrohDaemonConfig {
+	/** Primary-only switch for new private client channels. Default false. */
+	waiveClientReserve?: boolean;
 	mnemonic?: string;
 	network?: 'mainnet' | 'testnet' | 'regtest' | 'signet';
 	alias?: string;
@@ -2431,6 +2433,15 @@ export class BeignetNode extends EventEmitter {
 				throw new BeignetError('INVALID_PARAMS', `leaseRates: ${refusal}`);
 			}
 		}
+		if (
+			opts.waiveClientReserve !== undefined &&
+			typeof opts.waiveClientReserve !== 'boolean'
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'waiveClientReserve must be a boolean'
+			);
+		}
 		if (opts.jitReceive !== undefined) {
 			const refusal = jitReceiveRefusal(opts.jitReceive);
 			if (refusal !== null) {
@@ -2879,6 +2890,11 @@ export class BeignetNode extends EventEmitter {
 			// The LSP engine only exists when explicitly switched on; the client
 			// ceilings apply either way, because asking an LSP for a JIT receive
 			// is not the same role as being one.
+			zeroReserve: {
+				role: 'primary',
+				advertise: opts.waiveClientReserve === true,
+				waiveClientReserve: opts.waiveClientReserve === true
+			},
 			jitReceive:
 				opts.jitReceive?.enabled === true
 					? {
@@ -8852,6 +8868,9 @@ export class BeignetNode extends EventEmitter {
 			revertedAt: number;
 		}>;
 		localReserveMsat?: bigint;
+		localReserveWaived?: boolean;
+		remoteReserveWaived?: boolean;
+		isOpener?: boolean;
 		remoteReserveMsat?: bigint;
 		isPrivate?: boolean;
 		feeBaseMsat?: number;
@@ -8873,6 +8892,11 @@ export class BeignetNode extends EventEmitter {
 			state: ch.state as CS,
 			localBalanceSats: Number(ch.localBalanceMsat / 1000n),
 			maxSendableSats: Number((ch.spendableOutboundMsat ?? 0n) / 1000n),
+			localReserveWaived: ch.localReserveWaived === true,
+			remoteReserveWaived: ch.remoteReserveWaived === true,
+			isOpener: ch.isOpener,
+			localReserveSats: Number((ch.localReserveMsat ?? 0n) / 1000n),
+			remoteReserveSats: Number((ch.remoteReserveMsat ?? 0n) / 1000n),
 			remoteBalanceSats: Number(ch.remoteBalanceMsat / 1000n),
 			capacitySats: Number(ch.fundingSatoshis),
 			isAnchor: isAnchorChannel(ch.channelType ?? null)

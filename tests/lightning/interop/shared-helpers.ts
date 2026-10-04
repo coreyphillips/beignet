@@ -254,6 +254,7 @@ export function createInteropNode(seedId = 42): LightningNode {
 		enableNetworking: true,
 		localFeatures: features,
 		chainHashes: [REGTEST_CHAIN_HASH],
+		zeroReserve: { advertise: true, role: 'wallet' },
 		preferAnchors: true
 	});
 }

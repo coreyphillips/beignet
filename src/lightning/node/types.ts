@@ -263,6 +263,8 @@ export interface IFundingProvider {
 }
 
 export interface INodeConfig {
+	/** One-way reserve waivers for new private home channels. */
+	zeroReserve?: import('../channel/zero-reserve').IZeroReserveConfig;
 	nodePrivateKey: Buffer;
 	network?: Network;
 	channelConfig?: IChannelConfig;
@@ -1190,6 +1192,9 @@ export interface IChannelInfo {
 	}>;
 	/** Reserve we must maintain (set by remote peer), in msat */
 	localReserveMsat?: bigint;
+	localReserveWaived?: boolean;
+	remoteReserveWaived?: boolean;
+	isOpener?: boolean;
 	/** Reserve remote must maintain (set by us), in msat */
 	remoteReserveMsat?: bigint;
 	/** Whether this channel is private (unannounced) */

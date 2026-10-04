@@ -310,6 +310,8 @@ describe('Interop chaos: Eclair v2 open crash-resume (regtest)', function () {
 			kill,
 			() => life1Broadcasts++
 		);
+		// Persistent channel keys require a real chain tip before opening.
+		node.handleNewBlock((await bitcoinRpc('getblockcount')) as number);
 		const nodeId = node.getNodeId();
 
 		await node.connectPeer(eclairPubkey, ECLAIR_P2P_HOST, ECLAIR_P2P_PORT);
