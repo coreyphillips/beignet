@@ -805,6 +805,7 @@ class FakeTower extends EventEmitter implements ITowerTransport {
 		clientBehindTo?: number;
 		/** Never answer STATE_UPDATE (a stalled tower). */
 		silentUpdates?: boolean;
+		closeAfterCreateReply?: boolean;
 	} = {};
 
 	constructor(public addr: ITowerAddress) {
@@ -848,6 +849,8 @@ class FakeTower extends EventEmitter implements ITowerTransport {
 						data: Buffer.alloc(0)
 					})
 				);
+				if (this.behaviour.closeAfterCreateReply)
+					setImmediate(() => this.close());
 			} else if (type === WtMessageType.STATE_UPDATE) {
 				this.stateUpdatesSeen++;
 				if (this.behaviour.silentUpdates) return;
@@ -969,6 +972,54 @@ describe('watchtower client session state machine (fake tower)', function () {
 			towers: [TOWER_URI],
 			store,
 			transportFactory: (): ITowerTransport => fake
+		});
+	}
+
+	for (const closeAfterCreateReply of [true, false]) {
+		it(`reconnects before draining a newly created session when tower closes=${closeAfterCreateReply}`, async () => {
+			const transports: FakeTower[] = [];
+			const keys: Buffer[] = [];
+			const store = new InMemoryStore();
+			const logs: Array<{ event: string }> = [];
+			const client = new WatchtowerClient({
+				localPrivateKey: crypto.randomBytes(32),
+				chainHash: chainHashForNetwork(network),
+				network,
+				towers: [TOWER_URI],
+				store,
+				transportFactory: (addr, key) => {
+					const transport = new FakeTower(addr);
+					transport.behaviour.closeAfterCreateReply = closeAfterCreateReply;
+					transports.push(transport);
+					keys.push(Buffer.from(key!));
+					return transport;
+				}
+			});
+			client.on('log', (entry: { event: string }) => logs.push(entry));
+			try {
+				client.backupRevokedState(contextForClient());
+				await client.start();
+				await settle(
+					() => store.updates.length === 1 && store.updates[0].acked,
+					5000
+				);
+				expect(transports).to.have.length(2);
+				expect(transports[0].created).to.equal(true);
+				expect(transports[0].stateUpdatesSeen).to.equal(0);
+				expect(transports[1].created).to.equal(false);
+				expect(
+					transports[1].receivedUpdates.map((item) => item.seqNum)
+				).to.deep.equal([1]);
+				expect(keys[1].equals(keys[0])).to.equal(true);
+				expect(store.sessions).to.have.length(1);
+				expect(
+					logs.filter((entry) =>
+						['backup_failed', 'session_error'].includes(entry.event)
+					)
+				).to.deep.equal([]);
+			} finally {
+				client.stop();
+			}
 		});
 	}
 
