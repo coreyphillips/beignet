@@ -4001,6 +4001,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							]
 						},
 						localBalanceSats: { type: 'integer' },
+						maxSendableSats: {
+							type: 'integer',
+							description:
+								'Balance-based debit ceiling for one new outbound HTLC, floored to sats, before routing fees and route HTLC limits; zero when unavailable'
+						},
 						remoteBalanceSats: { type: 'integer' },
 						capacitySats: { type: 'integer' },
 						isAnchor: { type: 'boolean' },
@@ -4861,7 +4866,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						sendableSats: {
 							type: 'integer',
 							description:
-								'Local balance above the reserve, i.e. what can actually be sent (sats); zero while below the reserve'
+								'Legacy local balance above the reserve (sats), excluding commitment costs and other send buffers; zero while below the reserve'
+						},
+						maxSendableSats: {
+							type: 'integer',
+							description:
+								'Sum of available channel outbound debit ceilings, floored to sats after summing msat, before routing fees and route HTLC limits; may require multiple parts'
 						},
 						recommendations: {
 							type: 'array',

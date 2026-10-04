@@ -1050,6 +1050,10 @@ export interface IChannelInfo {
 	peerPubkey: string;
 	state: ChannelState;
 	localBalanceMsat: bigint;
+	/** Balance-based debit ceiling for one new outbound HTLC, including
+	 * commitment costs and buffers. Zero while new HTLCs are unavailable.
+	 * Routing fees and the route's HTLC limits still apply. */
+	spendableOutboundMsat?: bigint;
 	remoteBalanceMsat: bigint;
 	fundingSatoshis: bigint;
 	channelType: Buffer | null;

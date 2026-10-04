@@ -150,6 +150,10 @@ export interface ChannelInfo {
 	peerPubkey: string;
 	state: ChannelStateString;
 	localBalanceSats: number;
+	/** Balance-based debit ceiling for one new outbound HTLC, floored to
+	 * sats, before routing fees and route HTLC limits. Zero when unavailable.
+	 * Present on channel list/query snapshots. */
+	maxSendableSats?: number;
 	remoteBalanceSats: number;
 	capacitySats: number;
 	isAnchor: boolean;
@@ -1183,9 +1187,13 @@ export interface LiquiditySnapshot {
 	inboundLiquidityPct: number;
 	/** Total local balance held back as channel reserve, unspendable (sats). */
 	reserveSats: number;
-	/** Local balance above the reserve, i.e. what can actually be sent (sats).
-	 *  Zero while a channel's balance is still below its reserve. */
+	/** Legacy local balance above the reserve (sats), excluding commitment
+	 * costs and other send buffers. Zero while below the reserve. */
 	sendableSats: number;
+	/** Sum of the available channels' outbound debit ceilings, floored to
+	 * sats after summing msat. Before routing fees and route HTLC limits.
+	 * May require multiple parts when more than one channel contributes. */
+	maxSendableSats: number;
 	recommendations: LiquidityRecommendation[];
 }
 
