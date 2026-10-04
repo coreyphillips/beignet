@@ -807,6 +807,14 @@ export class ChannelManager extends EventEmitter {
 	 * retransmission that finally puts one on the wire.
 	 */
 	private readonly txSignaturesDropped = new Set<string>();
+	/**
+	 * Channels a failed persist withheld sends from on the current connection
+	 * (issue #1303). A withheld update stays in the channel's queue, and our
+	 * next commitment_signed signs that queue, so a signature made on this
+	 * connection would cover an update the peer never received. Signing waits
+	 * for the reconnect, whose reestablish replays the queue first.
+	 */
+	private readonly sendsWithheldOnConnection = new Set<string>();
 
 	constructor(config: IChannelManagerConfig) {
 		super();
@@ -1721,10 +1729,9 @@ export class ChannelManager extends EventEmitter {
 		// order, and the commitment that removes the HTLC has to queue behind
 		// it or nothing ever signs the removal: the restart re-drive of a
 		// forwarded fulfil is exactly such a proactive settle, with nobody
-		// else to drive the round. A failed persist (sendsWithheld) blocks the
-		// auto-sign's own batch the same way it blocked this one and surfaces
-		// transition:blocked, which is what forces the reconnect that
-		// re-drives both.
+		// else to drive the round. After a failed persist (sendsWithheld) the
+		// auto-sign defers until the reconnect that transition:blocked forces,
+		// whose reestablish replays the fulfil and then signs it.
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
@@ -1894,6 +1901,11 @@ export class ChannelManager extends EventEmitter {
 		// single commitment_signed. needsCommitment stays set, so the deferred
 		// signature goes out from the revoke_and_ack handler below.
 		if (channel.isAwaitingRemoteRevocation()) {
+			return { ok: true, actions: [] };
+		}
+		// Deferred the same way: needsCommitment stays set, and the
+		// reestablish tail signs once the withheld updates have been replayed.
+		if (this.sendsWithheldOnConnection.has(idHex)) {
 			return { ok: true, actions: [] };
 		}
 		const peerPubkey = this.channelPeers.get(idHex);
@@ -2294,7 +2306,10 @@ export class ChannelManager extends EventEmitter {
 			// retransmittable comes back through the outbox and the reestablish
 			// rules; what is not was a negotiation that restarts.
 			const channelIdHex = channel.getChannelId()?.toString('hex');
-			if (channelIdHex) this.purgeBarrierQueue(channelIdHex);
+			if (channelIdHex) {
+				this.purgeBarrierQueue(channelIdHex);
+				this.sendsWithheldOnConnection.delete(channelIdHex);
+			}
 			// A promoted v1 opener still awaiting funding_signed has no
 			// commitment to resume: BOLT 2 has no reestablish before
 			// funding_signed, and the peers (eclair, LND) forget the attempt
@@ -2398,6 +2413,7 @@ export class ChannelManager extends EventEmitter {
 				const idHex = channel.getChannelId()?.toString('hex');
 				if (idHex && this.channels.has(idHex)) {
 					this.purgeBarrierQueue(idHex);
+					this.sendsWithheldOnConnection.delete(idHex);
 					this._rollbackForReestablish(channel);
 					this.releaseDanglingV2Pledges(channel);
 					continue;
@@ -9374,7 +9390,12 @@ export class ChannelManager extends EventEmitter {
 				() => sendsBlocked,
 				(blocked: boolean) => {
 					sendsBlocked = blocked;
-					if (blocked) progress.sendsWithheld = true;
+					if (blocked) {
+						progress.sendsWithheld = true;
+						// Recorded now rather than at the tail: a re-entrant
+						// listener later in this batch can already auto-sign.
+						if (channelIdHex) this.sendsWithheldOnConnection.add(channelIdHex);
+					}
 				},
 				0,
 				false,

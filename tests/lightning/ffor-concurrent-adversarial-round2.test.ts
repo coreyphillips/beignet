@@ -952,10 +952,10 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 		// cleared, so anything R sent before the forced disconnect left ahead
 		// of a chain that never left, and the reconnect failed the channel.
 		//
-		// Fixed for the release (the general #1303 is not): a failed write
-		// takes the release back. The hold stands again with the chain
-		// intact, what R makes before the disconnect joins it, and the
-		// reestablish retransmits everything in order.
+		// Fixed for the release: a failed write takes the release back. The
+		// hold stands again with the chain intact, what R makes before the
+		// disconnect joins it, and the reestablish retransmits everything in
+		// order.
 		it("the write of the release fails once: the hold stands again with the chain intact, R's next revoke_and_ack waits behind it, and the reconnect drains", () => {
 			const { pair } = sLostTheClose([2]);
 			pair.link.holdAt = (from, type): boolean =>
