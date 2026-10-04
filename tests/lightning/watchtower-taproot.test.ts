@@ -789,11 +789,12 @@ interface ISessionRecord {
 }
 
 /**
- * Fake tower network mirroring lnd wtserver semantics: each CONNECTION is a
- * distinct session (keyed by its transport key), one blob type per session.
+ * Fake tower network mirroring LND: sessions persist across connections and
+ * are keyed by the authenticated transport key, one blob type per session.
  */
 class FakeTowerNet {
 	connections: FakeTowerConn[] = [];
+	sessions = new Map<string, ISessionRecord>();
 	rejectBlobTypes = new Set<number>();
 
 	factory = (addr: ITowerAddress, transportKey?: Buffer): ITowerTransport => {
@@ -833,6 +834,8 @@ class FakeTowerConn extends EventEmitter implements ITowerTransport {
 
 	async connect(): Promise<void> {
 		this.connected = true;
+		this.session =
+			this.net.sessions.get(this.transportKey.toString('hex')) ?? null;
 	}
 
 	close(): void {
@@ -868,6 +871,7 @@ class FakeTowerConn extends EventEmitter implements ITowerTransport {
 					return;
 				}
 				this.session = { blobType: req.blobType, updates: [] };
+				this.net.sessions.set(this.transportKey.toString('hex'), this.session);
 				this.reply(
 					WtMessageType.CREATE_SESSION_REPLY,
 					encodeCreateSessionReply({
@@ -979,7 +983,7 @@ describe('watchtower client per-blob-type sessions', function () {
 				(net.sessionFor(BlobType.ALTRUIST_TAPROOT_COMMIT)?.updates.length ??
 					0) > 0 &&
 				(net.sessionFor(BlobType.ALTRUIST_COMMIT)?.updates.length ?? 0) > 0 &&
-				net.connections.length === 2 &&
+				net.connections.length === 4 &&
 				client.getHealth()[0].pendingBacklog === 0,
 			5000
 		);
@@ -992,12 +996,18 @@ describe('watchtower client per-blob-type sessions', function () {
 		expect(legacySession!.updates.length).to.equal(1);
 		expect(legacySession!.updates[0].seqNum).to.equal(1);
 
-		// Separate connections with distinct transport keys (LND towers key the
-		// session to the connection pubkey).
-		expect(net.connections.length).to.equal(2);
-		expect(
-			net.connections[0].transportKey.equals(net.connections[1].transportKey)
-		).to.equal(false);
+		// Each session has a creation connection and an update connection,
+		// authenticated with the same key. Blob types keep distinct keys.
+		expect(net.sessions.size).to.equal(2);
+		expect(net.connections).to.have.length(4);
+		for (const key of net.sessions.keys()) {
+			const connections = net.connections.filter(
+				(connection) => connection.transportKey.toString('hex') === key
+			);
+			expect(connections).to.have.length(2);
+			expect(connections[0].createSessionBlobTypes).to.have.length(1);
+			expect(connections[1].createSessionBlobTypes).to.have.length(0);
+		}
 
 		const health = client.getHealth();
 		expect(health[0].sessions).to.equal(2);
