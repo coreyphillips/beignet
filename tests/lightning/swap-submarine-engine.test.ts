@@ -656,8 +656,7 @@ describe('Submarine swap provider engine (issue #743)', function () {
 			await tick(h);
 			expect(record(h, funded).state).to.equal('FUNDING_SEEN');
 			h.clock =
-				(Math.max(ack.terms!.expiresAt, fundedAck.terms!.expiresAt) + 1) *
-				1000;
+				(Math.max(ack.terms!.expiresAt, fundedAck.terms!.expiresAt) + 1) * 1000;
 			await tick(h);
 			expect(record(h, unfunded).state).to.equal('CANCELLED');
 			expect(record(h, unfunded).failureReason).to.match(/expired/);
