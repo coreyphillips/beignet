@@ -301,16 +301,28 @@ describe('Interop: LND pays through a JIT intercept SCID (issue #594)', function
 			if (waiveClientReserve) {
 				const debit = walletChannel.getSpendableOutboundMsat();
 				expect(debit).to.equal(walletState.localBalanceMsat);
-				const invoice = alice.createInvoice({
+				const maxInvoice = alice.createInvoice({
 					description: 'return the full wallet balance'
 				});
-				const quote = bob.quotePayAll(invoice.bolt11, 1000n);
+				const quote = bob.quotePayAll(maxInvoice.bolt11, 1000n);
 				expect(quote.debitMsat).to.equal(debit);
 				expect(quote.routeFound).to.equal(true);
-				const payment = bob.sendPayAll(invoice.bolt11, quote.debitMsat, quote.maxFeeMsat);
-				const settled = await bob.waitForPayment(payment.paymentHash, 30_000);
-				expect(settled.payAll).to.deep.equal({ debitMsat: debit, maxFeeMsat: 1000n,
-					deliveredMsat: debit, feeMsat: 0n, remainderMsat: 0n });
+				const payAllPayment = bob.sendPayAll(
+					maxInvoice.bolt11,
+					quote.debitMsat,
+					quote.maxFeeMsat
+				);
+				const payAllResult = await bob.waitForPayment(
+					payAllPayment.paymentHash,
+					30_000
+				);
+				expect(payAllResult.payAll).to.deep.equal({
+					debitMsat: debit,
+					maxFeeMsat: 1000n,
+					deliveredMsat: debit,
+					feeMsat: 0n,
+					remainderMsat: 0n
+				});
 				expect(walletChannel.getFullState().localBalanceMsat).to.equal(0n);
 				expect(walletChannel.getState()).to.equal('NORMAL');
 				expect(primaryChannel.getState()).to.equal('NORMAL');
