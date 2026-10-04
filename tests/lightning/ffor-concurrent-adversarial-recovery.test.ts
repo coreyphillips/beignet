@@ -13,10 +13,9 @@
  * assertion fails, visibly, on the day that issue is fixed, and the case is
  * then rewritten to the outcome the spec requires (stated in its comment).
  *
- * Replay ordering (#1300) is fixed and checked beside live voucher books.
- * Remaining known-defect pins:
+ * Replay ordering (#1300) and signing over a withheld update (#1303) are
+ * fixed and checked beside live voucher books. Remaining known-defect pins:
  *
- *   PIN [#1303]         one failed durable write, then a write that lands
  *   PIN [#1293 item 1]  S's setup timer crossing R's stfu
  *
  * Harness: helpers/ffor-concurrent-pair.ts (two ChannelManagers in loopback,
@@ -2020,16 +2019,15 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 
 	// ───────────────────────────────────────────────────────────────────
 	// Attack 5 (failed writes): pre-existing and not FFOR, issue #1303. One
-	// transient failed write withholds an update; the next batch on the same
-	// connection signs over it. Reproduced on origin/master at fc0184e4 on a
-	// channel with no epoch. Concurrent ordinary traffic inherits it. A PIN
-	// of what happens today: when #1303 is fixed the last assertion fails,
-	// and the required outcome is that neither channel is ERRORED.
+	// transient failed write withholds an update, and the next batch on the
+	// same connection used to sign over it. Fixed: nothing signs on that
+	// connection, and the reconnect replays the update ahead of the
+	// signature. Concurrent ordinary traffic is checked beside a plain
+	// channel (channel-manager-withheld-update.test.ts covers fail and add).
 	// ───────────────────────────────────────────────────────────────────
 	describe('5a. a single failed write, then a write that lands', () => {
-		it('PIN [#1303, no epoch needed] the fulfil is withheld, the auto-sign that follows signs over it and the peer fails the channel', () => {
-			const outcomes: string[] = [];
-			for (const withEpoch of [false, true]) {
+		for (const withEpoch of [false, true]) {
+			it(`epoch=${withEpoch}: the fulfil is withheld, nothing signs over it, and the reconnect replays it ahead of the signature`, () => {
 				const pair = createPair({ pushSat: 200_000n });
 				if (withEpoch) activate(pair, AMOUNTS, true);
 				const add = offer(pair, 'S', 2_000_000n);
@@ -2053,21 +2051,20 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 					add.preimage
 				);
 				expect(res.sendsWithheld).to.equal(true);
-				outcomes.push(
-					`epoch=${withEpoch}: S ${ChannelState[pair.sChannel.getState()]}, R ${
-						ChannelState[pair.rChannel.getState()]
-					}, ${pair.sErrors.join('; ')}`
-				);
-			}
-			// Required once #1303 is fixed: no line says ERRORED. Today both do,
-			// with and without an epoch.
-			expect(outcomes.length).to.equal(2);
-			for (const outcome of outcomes) {
-				expect(outcome).to.match(
-					/S ERRORED, R ERRORED, Invalid commitment signature/
-				);
-			}
-		});
+				expect(sentBy(pair, 'R')).to.not.include(MessageType.COMMITMENT_SIGNED);
+				expectAlive(pair, 'before the reconnect');
+				expect(pair.sErrors, why(pair)).to.deep.equal([]);
+				interrupt(pair, 'disconnect');
+				pair.link.reconnect();
+				const sent = sentBy(pair, 'R');
+				const fulfil = sent.indexOf(MessageType.UPDATE_FULFILL_HTLC);
+				expect(fulfil, why(pair)).to.be.at.least(0);
+				expect(sent.indexOf(MessageType.COMMITMENT_SIGNED)).to.be.above(fulfil);
+				expectAlive(pair, 'after the reconnect');
+				expect(pair.events.S.fulfilled).to.include(add.id);
+				expect(ordinaryHtlcs(pair.sChannel)).to.deep.equal([]);
+			});
+		}
 	});
 
 	// ───────────────────────────────────────────────────────────────────
