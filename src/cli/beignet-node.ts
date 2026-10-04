@@ -12287,12 +12287,18 @@ export class BeignetNode extends EventEmitter {
 	spliceQuote(
 		channelId: string,
 		direction: 'in' | 'out',
-		feeratePerkw: number
+		feeratePerkw: number,
+		destinationAddress?: string
 	): ReturnType<LightningNode['spliceQuote']> {
 		const idBuf = requireChannelIdHex(channelId);
 		requireU32(feeratePerkw, 'feeratePerkw', 1, MAX_SPLICE_FEERATE_PERKW);
 		return fundingOrRefuse(() =>
-			this.node.spliceQuote(idBuf, direction, feeratePerkw)
+			this.node.spliceQuote(
+				idBuf,
+				direction,
+				feeratePerkw,
+				this._decodeSpliceDestination(destinationAddress)
+			)
 		);
 	}
 
@@ -12319,15 +12325,9 @@ export class BeignetNode extends EventEmitter {
 		return result;
 	}
 
-	spliceOut(
-		channelId: string,
-		amountSats: number,
-		feeratePerkw: number,
+	private _decodeSpliceDestination(
 		destinationAddress?: string
-	): SpliceResult {
-		const idBuf = requireChannelIdHex(channelId);
-		requirePositiveSafeInteger(amountSats, 'amountSats');
-		requireU32(feeratePerkw, 'feeratePerkw', 1, MAX_SPLICE_FEERATE_PERKW);
+	): Buffer | undefined {
 		let destinationScript: Buffer | undefined;
 		if (destinationAddress !== undefined) {
 			// A provided-but-empty (or non-string) destination is a caller bug,
@@ -12360,6 +12360,19 @@ export class BeignetNode extends EventEmitter {
 				);
 			}
 		}
+		return destinationScript;
+	}
+
+	spliceOut(
+		channelId: string,
+		amountSats: number,
+		feeratePerkw: number,
+		destinationAddress?: string
+	): SpliceResult {
+		const idBuf = requireChannelIdHex(channelId);
+		requirePositiveSafeInteger(amountSats, 'amountSats');
+		requireU32(feeratePerkw, 'feeratePerkw', 1, MAX_SPLICE_FEERATE_PERKW);
+		const destinationScript = this._decodeSpliceDestination(destinationAddress);
 		// An address-targeted splice-out is an external send: the destination
 		// receives the full amount and the channel additionally pays the
 		// on-chain fee (the engine declares relative = -(amount + fee), same
