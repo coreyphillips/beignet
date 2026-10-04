@@ -670,6 +670,17 @@ LightningNode              High-level API (EventEmitter)
 
 ## Tests
 
+Use **Node.js 20 (20.19+)** for development and `npm ci` to install the locked tools.
+The linter and test runner have newer Node requirements than the library API.
+CI uses Node.js 20.
+
+The lint configuration keeps the established CommonJS imports, enum aliases,
+unused catch bindings, `any` warnings and Chai assertion style. Rules removed
+from the upgraded linter's recommended preset remain explicitly enabled where
+they were enforced before. Prettier covers TypeScript semicolons, with the core
+semicolon rule retained for JavaScript. Typed promise checks remain enabled for
+every TypeScript file.
+
 ```bash
 npm run test:local         # test:lightning + test:cli at once; no infrastructure needed
 npm run test:lightning     # 6200+ Lightning unit tests (parallel), no infrastructure needed
