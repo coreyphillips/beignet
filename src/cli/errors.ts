@@ -28,6 +28,9 @@ export enum BeignetErrorCode {
 	 * it is permanent, like CLTV_EXCEEDS_MAX (#1001).
 	 */
 	FEE_EXCEEDS_MAX = 'FEE_EXCEEDS_MAX',
+	PAY_ALL_REVIEW_EXPIRED = 'PAY_ALL_REVIEW_EXPIRED',
+	PAY_ALL_REMAINDER = 'PAY_ALL_REMAINDER',
+	PAY_ALL_BUDGET_MISMATCH = 'PAY_ALL_BUDGET_MISMATCH',
 	/** The node has no chain tip yet, so a height-relative bound cannot be set. */
 	CHAIN_NOT_SYNCED = 'CHAIN_NOT_SYNCED',
 	/** User-supplied BOLT 11 string failed to parse. */
@@ -188,7 +191,10 @@ export function isRetryableError(err: BeignetError): boolean {
 		// sent. Answered 409, never a retryable 5xx: as PAYMENT_FAILED it
 		// made payInvoiceWithRetry and daemon clients retry a deterministic
 		// refusal with backoff (#1001).
-		BeignetErrorCode.FEE_EXCEEDS_MAX
+		BeignetErrorCode.FEE_EXCEEDS_MAX,
+		BeignetErrorCode.PAY_ALL_REVIEW_EXPIRED,
+		BeignetErrorCode.PAY_ALL_REMAINDER,
+		BeignetErrorCode.PAY_ALL_BUDGET_MISMATCH
 	]);
 	if (permanentCodes.has(err.code)) return false;
 

@@ -829,7 +829,28 @@ export enum PaymentDirection {
 	INCOMING = 'INCOMING'
 }
 
+export interface IPayAllBudget {
+	debitMsat: bigint;
+	maxFeeMsat: bigint;
+}
+
+export interface IPayAllQuote extends IPayAllBudget {
+	minRecipientMsat: bigint;
+	routeFound: boolean;
+	remainderMsat: bigint;
+	searchExhausted: boolean;
+}
+
+/** Planned figures while pending; exact settled figures when completed. */
+export interface IPayAllPayment extends IPayAllBudget {
+	deliveredMsat: bigint;
+	feeMsat: bigint;
+	/** Unspent part of the approved debit, excluding reserves and later receipts. */
+	remainderMsat: bigint;
+}
+
 export interface IPaymentInfo {
+	payAll?: IPayAllPayment;
 	paymentHash: Buffer;
 	preimage?: Buffer;
 	amountMsat: bigint;
@@ -882,6 +903,8 @@ export interface IKeysendRetrySource {
 }
 
 export interface IPaymentRetryContext {
+	/** Fixed across retries. Restarts wait for resolution without auto-retrying. */
+	payAll?: IPayAllBudget;
 	/** Absent for keysend and BOLT 12, which replay their own sources. */
 	invoiceStr?: string;
 	keysend?: IKeysendRetrySource;
@@ -1599,6 +1622,9 @@ export interface IHoldCancelledEvent {
 // ─── Typed Payment Errors ───
 
 export enum LightningErrorCode {
+	PAY_ALL_REVIEW_EXPIRED = 'PAY_ALL_REVIEW_EXPIRED',
+	PAY_ALL_REMAINDER = 'PAY_ALL_REMAINDER',
+	PAY_ALL_BUDGET_MISMATCH = 'PAY_ALL_BUDGET_MISMATCH',
 	NO_ROUTE = 'NO_ROUTE',
 	DUPLICATE_PAYMENT = 'DUPLICATE_PAYMENT',
 	NO_CHANNEL_TO_HOP = 'NO_CHANNEL_TO_HOP',

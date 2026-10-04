@@ -3213,12 +3213,10 @@ export class Channel {
 	/**
 	 * Add an HTLC to the channel (locally offered).
 	 */
-	addHtlc(
+	/** Read-only admission shared by quoting and the actual add. */
+	validateOutgoingHtlc(
 		amountMsat: bigint,
-		paymentHash: Buffer,
-		cltvExpiry: number,
-		onionRoutingPacket: Buffer,
-		blindingPoint?: Buffer
+		cltvExpiry: number
 	): ChannelAction[] {
 		// A commitment the peer has PROVEN it can punish (issues #905 and
 		// #915) enforces nothing at all: this node will not broadcast it under
@@ -3457,6 +3455,18 @@ export class Channel {
 			];
 		}
 
+		return [];
+	}
+
+	addHtlc(
+		amountMsat: bigint,
+		paymentHash: Buffer,
+		cltvExpiry: number,
+		onionRoutingPacket: Buffer,
+		blindingPoint?: Buffer
+	): ChannelAction[] {
+		const refusal = this.validateOutgoingHtlc(amountMsat, cltvExpiry);
+		if (refusal.length > 0) return refusal;
 		const htlcId = this._state.localHtlcCounter++;
 
 		const entry: IHtlcEntry = {

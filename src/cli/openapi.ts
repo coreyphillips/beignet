@@ -14,7 +14,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			version: '1.0.0',
 			description:
 				'HTTP API for a self-custodial Bitcoin + Lightning node. Designed for AI agents.\n\n' +
-				'**Idempotency:** These endpoints support the `X-Idempotency-Key` header: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/splice-out`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`. ' +
+				'**Idempotency:** These endpoints support the `X-Idempotency-Key` header: `/invoice/pay`, `/invoice/pay-all`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/splice-out`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`. ' +
 				'When provided, the response is cached in memory for 24 hours (or until the daemon restarts), and repeated requests with the same key and body return the cached response. ' +
 				'If the same key is reused with a different request body, a `409 IDEMPOTENCY_CONFLICT` error is returned. ' +
 				'Any other POST that carries the header answers `400 INVALID_PARAMS` without running.\n\n' +
@@ -596,6 +596,46 @@ export function getOpenApiSpec(): Record<string, unknown> {
 									invoice: { $ref: '#/components/schemas/DecodedInvoice' }
 								}
 							})
+						}
+					}
+				}
+			},
+			'/invoice/pay-all/quote': {
+				post: {
+					summary:
+						'Quote a single-part pay-all to an amountless BOLT 11 invoice',
+					description:
+						'Read-only; holds no review or funds. All msat figures are decimal strings. The debit sums usable local balance ceilings; routeFound is false when it cannot fit one part or the exact fee gap cannot be placed. Blinded invoices and MPP are unsupported.',
+					tags: ['Payments'],
+					requestBody: bodyContent({ bolt11: 'string', maxFeeMsat: 'string' }),
+					responses: {
+						'200': {
+							description: 'Frozen budget to review',
+							content: jsonContent({ $ref: '#/components/schemas/PayAllQuote' })
+						}
+					}
+				}
+			},
+			'/invoice/pay-all': {
+				post: {
+					summary: 'Pay an amountless invoice using a frozen debit and fee cap',
+					description:
+						'Single-part only. Reserves the approved debit once. Retries retain the exact budget; later receipts are not swept. An unresolved timeout remains pending, including after restart. Restarts reconcile the existing attempt without automatic retries. Retry the same invoice only after a definitive failure, with its original budget. Exact figures are in payment.payAll; amountSats retains its historical total-debit meaning.',
+					tags: ['Payments'],
+					requestBody: bodyContent({
+						bolt11: 'string',
+						debitMsat: 'string',
+						maxFeeMsat: 'string',
+						timeoutMs: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Settled payment',
+							content: jsonContent({ $ref: '#/components/schemas/PaymentInfo' })
+						},
+						'409': {
+							description:
+								'PAY_ALL_REVIEW_EXPIRED, PAY_ALL_REMAINDER, PAY_ALL_BUDGET_MISMATCH or DUPLICATE_PAYMENT. Nothing new was sent. A remainder refusal names remainderMsat in its message.'
 						}
 					}
 				}
@@ -4174,9 +4214,33 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						source: { type: 'string', enum: ['override', 'default'] }
 					}
 				},
+				PayAllQuote: {
+					type: 'object',
+					properties: {
+						debitMsat: { type: 'string' },
+						minRecipientMsat: { type: 'string' },
+						maxFeeMsat: { type: 'string' },
+						routeFound: { type: 'boolean' },
+						remainderMsat: { type: 'string' },
+						searchExhausted: { type: 'boolean' }
+					}
+				},
+				PayAllPayment: {
+					type: 'object',
+					description:
+						'Exact msat strings. Planned figures while PENDING, settled figures when COMPLETED. FAILED records describe the failed attempt. Remainder excludes reserves and funds received after review.',
+					properties: {
+						debitMsat: { type: 'string' },
+						maxFeeMsat: { type: 'string' },
+						deliveredMsat: { type: 'string' },
+						feeMsat: { type: 'string' },
+						remainderMsat: { type: 'string' }
+					}
+				},
 				PaymentInfo: {
 					type: 'object',
 					properties: {
+						payAll: { $ref: '#/components/schemas/PayAllPayment' },
 						paymentHash: { type: 'string' },
 						preimage: { type: 'string' },
 						amountSats: { type: 'integer' },
@@ -4590,6 +4654,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				PaymentProof: {
 					type: 'object',
 					properties: {
+						payAll: { $ref: '#/components/schemas/PayAllPayment' },
 						paymentHash: { type: 'string' },
 						preimage: { type: 'string' },
 						amountSats: { type: 'number' },
