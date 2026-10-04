@@ -72,6 +72,8 @@ export enum Feature {
 	SIMPLE_CLOSE = 60,
 	/** Channel splicing (lightning/bolts PR #1160, option_splice) */
 	SPLICE = 62,
+	/** option_zero_reserve, init and node announcement scope (BOLTs proposal 1140). */
+	OPTION_ZERO_RESERVE = 64,
 	/**
 	 * Simple taproot channels (option_taproot, lightning/bolts PR #995): MuSig2
 	 * key-spend P2TR funding + taproot commitment/HTLC outputs.
@@ -386,6 +388,7 @@ export function implementedFeatures(): FeatureFlags {
 	flags.setOptional(Feature.ZERO_CONF);
 	flags.setOptional(Feature.KEYSEND);
 	flags.setOptional(Feature.SPLICE);
+	flags.setOptional(Feature.OPTION_ZERO_RESERVE);
 	flags.setOptional(Feature.SIMPLE_CLOSE);
 	flags.setOptional(Feature.PROVIDE_STORAGE);
 	flags.setOptional(Feature.OPTION_FF_RECEIVE);

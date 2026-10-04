@@ -654,6 +654,7 @@ function reserveWeEnforceAt(
 	state: IChannelState,
 	capacitySatoshis: bigint
 ): bigint {
+	if (state.remoteReserveWaived) return 0n;
 	const ourDust = state.localConfig.dustLimitSatoshis;
 	if (state.fundingVersion === 2 || state.spliceFundingTxid) {
 		return v2ReserveWeEnforce(
@@ -1417,6 +1418,11 @@ export class Channel {
 	// unless the ChannelManager lifted it because option_wumbo was negotiated
 	// with the peer. In-memory only; the manager re-derives it per operation.
 	private _maxFundingSatoshis: bigint = MAX_FUNDING_SATOSHIS;
+	private _zeroReservePolicy: import('./zero-reserve').IZeroReservePolicy = {
+		acceptWaiver: false,
+		waivePeer: false,
+		waiveOnOpen: false
+	};
 
 	constructor(state: IChannelState, signer?: ISigner) {
 		this._state = state;
@@ -1434,6 +1440,33 @@ export class Channel {
 	 * Set the funding cap used to validate opens and splices on this channel
 	 * (lifted above 2^24 sat only when option_wumbo was negotiated).
 	 */
+	private _reserveWeKeep(
+		capacity: bigint,
+		ourDust: bigint,
+		peerDust: bigint
+	): bigint {
+		return this._state.localReserveWaived
+			? 0n
+			: v2ReserveWeKeep(capacity, ourDust, peerDust);
+	}
+
+	private _reserveWeEnforce(
+		capacity: bigint,
+		ourDust: bigint,
+		peerDust: bigint
+	): bigint {
+		return this._state.remoteReserveWaived
+			? 0n
+			: v2ReserveWeEnforce(capacity, ourDust, peerDust);
+	}
+
+	/** Permissions at open only. Existing persisted waiver directions never change. */
+	setZeroReservePolicy(
+		policy: import('./zero-reserve').IZeroReservePolicy
+	): void {
+		this._zeroReservePolicy = { ...policy };
+	}
+
 	setMaxFundingSatoshis(max: bigint): void {
 		this._maxFundingSatoshis = max;
 	}
@@ -1685,10 +1718,16 @@ export class Channel {
 		const channelType = channelTypeFlags.toBuffer();
 		this._state.channelType = channelType;
 
-		const channelReserve = computeChannelReserve(
-			this._state.fundingSatoshis,
-			this._state.localConfig.dustLimitSatoshis
-		);
+		const waivePeer =
+			zeroConf &&
+			this._zeroReservePolicy.waivePeer &&
+			this._zeroReservePolicy.waiveOnOpen;
+		const channelReserve = waivePeer
+			? 0n
+			: computeChannelReserve(
+					this._state.fundingSatoshis,
+					this._state.localConfig.dustLimitSatoshis
+			  );
 
 		// max_htlc_value_in_flight_msat is advertised as configured, NOT
 		// clamped to capacity: the advertisement is immutable for the life of
@@ -1743,7 +1782,11 @@ export class Channel {
 			firstPerCommitmentPoint: firstPoint
 		};
 
-		const error = validateOpenChannelParams(msg, this._maxFundingSatoshis);
+		const error = validateOpenChannelParams(
+			msg,
+			this._maxFundingSatoshis,
+			waivePeer
+		);
 		if (error) {
 			return [{ type: ChannelActionType.ERROR, message: error }];
 		}
@@ -1761,6 +1804,8 @@ export class Channel {
 			...this._state.localConfig,
 			channelReserveSatoshis: channelReserve
 		};
+		this._state.remoteReserveWaived = waivePeer;
+		this._state.announceChannel = (msg.channelFlags & 0x01) !== 0;
 		this._state.channelReserveVersion = ENFORCED_RESERVE_VERSION;
 
 		this._state.state = ChannelState.SENT_OPEN;
@@ -2020,6 +2065,10 @@ export class Channel {
 		// could set e.g. an unbounded dust_limit that trims our to_remote output to
 		// fees on every commitment we sign (FS-1). The values we proposed live in
 		// channel state.
+		const localReserveWaived =
+			msg.channelReserveSatoshis === 0n &&
+			this._zeroReservePolicy.acceptWaiver &&
+			!this._state.announceChannel;
 		const acceptError = validateAcceptChannelParams(
 			{
 				temporaryChannelId: this._state.temporaryChannelId,
@@ -2027,11 +2076,16 @@ export class Channel {
 				channelReserveSatoshis: this._state.localConfig.channelReserveSatoshis,
 				fundingSatoshis: this._state.fundingSatoshis
 			},
-			msg
+			msg,
+			{
+				localReserveWaived,
+				remoteReserveWaived: this._state.remoteReserveWaived
+			}
 		);
 		if (acceptError) {
 			return refuse(`Invalid accept_channel: ${acceptError}`);
 		}
+		this._state.localReserveWaived = localReserveWaived;
 
 		// Adopted before the channel-type, zero_conf and nonce arms below, so a
 		// refusal there leaves a mutated state object. What makes that safe is what
@@ -2115,6 +2169,9 @@ export class Channel {
 			}
 			this._state.remoteNonce = msg.nextLocalNonce;
 		}
+
+		const initialRefusal = this._initialWaivedCommitmentRefusal();
+		if (initialRefusal) return refuse(initialRefusal);
 
 		this._state.state = ChannelState.SENT_ACCEPT;
 		return [];
@@ -2408,11 +2465,20 @@ export class Channel {
 		// the ERROR action drops the temporary channel entirely
 		// (removeCurrentTempChannel), so nothing it seeded ever reaches a live
 		// channel.
-		const error = validatePeerOpenChannelParams(msg, this._maxFundingSatoshis);
+		const localReserveWaived =
+			msg.channelReserveSatoshis === 0n &&
+			this._zeroReservePolicy.acceptWaiver &&
+			(msg.channelFlags & 1) === 0;
+		const error = validatePeerOpenChannelParams(
+			msg,
+			this._maxFundingSatoshis,
+			localReserveWaived
+		);
 		if (error) {
 			return refuse(error);
 		}
 
+		this._state.localReserveWaived = localReserveWaived;
 		// Store remote config
 		this._state.remoteConfig = {
 			dustLimitSatoshis: msg.dustLimitSatoshis,
@@ -2499,17 +2565,22 @@ export class Channel {
 		// both dust limits, see MAX_DUST_LIMIT_SATOSHIS in types.ts), leaving the
 		// opener a reserve output that trims away in our own commitment, and LND
 		// rejects such an accept_channel outright.
-		const channelReserve = bigIntMax(
-			computeChannelReserve(
-				this._state.fundingSatoshis,
-				this._state.localConfig.dustLimitSatoshis
-			),
-			bigIntMax(
-				msg.dustLimitSatoshis,
-				this._state.localConfig.dustLimitSatoshis
-			)
-		);
+		const waivePeer =
+			this._zeroReservePolicy.waivePeer && !this._state.announceChannel;
+		const channelReserve = waivePeer
+			? 0n
+			: bigIntMax(
+					computeChannelReserve(
+						this._state.fundingSatoshis,
+						this._state.localConfig.dustLimitSatoshis
+					),
+					bigIntMax(
+						msg.dustLimitSatoshis,
+						this._state.localConfig.dustLimitSatoshis
+					)
+			  );
 		if (
+			!localReserveWaived &&
 			this._state.localConfig.dustLimitSatoshis > msg.channelReserveSatoshis
 		) {
 			return refuse(
@@ -2534,6 +2605,7 @@ export class Channel {
 			return refuse(acceptMaxHtlcErr);
 		}
 
+		this._state.remoteReserveWaived = waivePeer;
 		const acceptMsg: IAcceptChannelMessage = {
 			temporaryChannelId: this._state.temporaryChannelId,
 			dustLimitSatoshis: this._state.localConfig.dustLimitSatoshis,
@@ -2571,6 +2643,9 @@ export class Channel {
 			channelReserveSatoshis: channelReserve
 		};
 		this._state.channelReserveVersion = ENFORCED_RESERVE_VERSION;
+
+		const initialRefusal = this._initialWaivedCommitmentRefusal();
+		if (initialRefusal) return refuse(initialRefusal);
 
 		this._state.state = ChannelState.SENT_ACCEPT;
 		return [
@@ -3455,6 +3530,26 @@ export class Channel {
 					message: 'Dust HTLC exposure limit exceeded'
 				}
 			];
+		}
+
+		if (this._state.localReserveWaived || this._state.remoteReserveWaived) {
+			const id = this._state.localHtlcCounter;
+			const refusal = this._localCommitmentEmptyRefusal({
+				localBalanceMsat: this._state.localBalanceMsat - amountMsat,
+				addedHtlc: {
+					key: `offered-${id}`,
+					entry: {
+						id,
+						amountMsat,
+						paymentHash: Buffer.alloc(32),
+						cltvExpiry,
+						onionRoutingPacket: Buffer.alloc(0),
+						direction: HtlcDirection.OFFERED,
+						state: HtlcState.PENDING
+					}
+				}
+			});
+			if (refusal) return [{ type: ChannelActionType.ERROR, message: refusal }];
 		}
 
 		const htlcId = this._state.localHtlcCounter++;
@@ -6015,6 +6110,12 @@ export class Channel {
 				}
 			];
 		}
+
+		const emptyRefusal = this._localCommitmentEmptyRefusal({
+			pendingFeeratePerKw: feeratePerKw
+		});
+		if (emptyRefusal)
+			return [{ type: ChannelActionType.ERROR, message: emptyRefusal }];
 
 		// Stage the new feerate as pending — do NOT apply it to the committed
 		// config yet. It is used for the commitment built in this round and only
@@ -10742,6 +10843,13 @@ export class Channel {
 	 * reserves for the active attempt.
 	 */
 	repairKeptChannelReserve(): void {
+		if (this._state.localReserveWaived) {
+			this._state.remoteConfig = {
+				...this._state.remoteConfig,
+				channelReserveSatoshis: 0n
+			};
+			return;
+		}
 		if (this._state.fundingVersion !== 2 && !this._state.spliceFundingTxid) {
 			return;
 		}
@@ -10749,7 +10857,7 @@ export class Channel {
 		if (this._state.v2InFlight || this._state.v2PreviousAttempts?.length) {
 			return;
 		}
-		const derived = v2ReserveWeKeep(
+		const derived = this._reserveWeKeep(
 			this._state.fundingSatoshis,
 			this._state.localConfig.dustLimitSatoshis,
 			this._state.remoteConfig.dustLimitSatoshis
@@ -12374,7 +12482,7 @@ export class Channel {
 				);
 				const changeSats = walletTotal - relativeSatoshis - feeSats;
 				const postCapacity = this._state.fundingSatoshis + relativeSatoshis;
-				const reserveSats = v2ReserveWeKeep(
+				const reserveSats = this._reserveWeKeep(
 					postCapacity,
 					this._state.localConfig.dustLimitSatoshis,
 					this._state.remoteConfig.dustLimitSatoshis
@@ -12399,6 +12507,9 @@ export class Channel {
 		// before we quiesce, so we don't STFU only to then fail).
 		if (relativeSatoshis < 0n) {
 			const withdrawSats = -relativeSatoshis;
+			const commitmentRefusal = this.spliceOutCommitmentRefusal(withdrawSats);
+			if (commitmentRefusal)
+				return [{ type: ChannelActionType.ERROR, message: commitmentRefusal }];
 			const localBalanceSats = this._state.localBalanceMsat / 1000n;
 			if (withdrawSats > localBalanceSats) {
 				return [
@@ -12414,7 +12525,7 @@ export class Channel {
 			// the negotiation. Refuse up-front rather than burn a quiescence
 			// round on a splice our own tx_complete audit would abort.
 			const postCapacity = this._state.fundingSatoshis + relativeSatoshis;
-			const reserveSats = v2ReserveWeKeep(
+			const reserveSats = this._reserveWeKeep(
 				postCapacity,
 				this._state.localConfig.dustLimitSatoshis,
 				this._state.remoteConfig.dustLimitSatoshis
@@ -12948,6 +13059,67 @@ export class Channel {
 		);
 	}
 
+	/** Commitment cost the opener retains through a splice, without the HTLC fee-spike buffer. */
+	spliceOutCommitmentCostSats(): bigint {
+		if (this._state.role !== ChannelRole.OPENER) return 0n;
+		if (this._state.remoteBasepoints && this._state.fundingTxid) {
+			const n = this._state.localCommitmentNumber + 1n;
+			const local = buildLocalCommitment(
+				this._state,
+				getPerCommitmentPoint(this._state.localPerCommitmentSeed, n),
+				n
+			);
+			const remote = buildRemoteCommitment(
+				this._state,
+				this._state.remoteNextPerCommitmentPoint ??
+					this._state.remoteCurrentPerCommitmentPoint!,
+				this._state.remoteCommitmentNumber + 1n
+			);
+			return this._builtCommitmentCostSats(this._state, local, remote);
+		}
+		return funderCommitmentCostSats(
+			Math.max(
+				getLocalCommitmentFeeRate(this._state),
+				getRemoteCommitmentFeeRate(this._state)
+			),
+			this._countActiveHtlcs(),
+			this._state.channelType
+		);
+	}
+
+	private _builtCommitmentCostSats(
+		view: IChannelState,
+		local: IBuiltCommitment,
+		remote: IBuiltCommitment
+	): bigint {
+		return bigIntMax(
+			funderCommitmentCostSats(
+				getLocalCommitmentFeeRate(view),
+				local.htlcOutputs.length,
+				view.channelType
+			),
+			funderCommitmentCostSats(
+				getRemoteCommitmentFeeRate(view),
+				remote.htlcOutputs.length,
+				view.channelType
+			)
+		);
+	}
+
+	/** Shared preflight for a withdrawal, including its transaction fee. */
+	spliceOutCommitmentRefusal(withdrawSats: bigint): string | null {
+		const localBalanceMsat =
+			this._state.localBalanceMsat - withdrawSats * 1000n;
+		if (localBalanceMsat < this.spliceOutCommitmentCostSats() * 1000n) {
+			return 'Splice-out would leave the opener unable to pay its commitment cost';
+		}
+		return this._waivedCommitmentRefusal({
+			...this._state,
+			localBalanceMsat,
+			fundingSatoshis: this._state.fundingSatoshis - withdrawSats
+		});
+	}
+
 	/**
 	 * The reserve a conforming peer may require us to keep at a given capacity
 	 * (v2ReserveWeKeep), derived from the capacity and the two dust limits
@@ -12956,7 +13128,7 @@ export class Channel {
 	 * output is one the peer MUST tx_abort (BOLT 2, issue #423).
 	 */
 	spliceReserveWeKeepSats(capacitySats: bigint): bigint {
-		return v2ReserveWeKeep(
+		return this._reserveWeKeep(
 			capacitySats,
 			this._state.localConfig.dustLimitSatoshis,
 			this._state.remoteConfig.dustLimitSatoshis
@@ -14164,12 +14336,13 @@ export class Channel {
 	 */
 	private _pendingSpliceKeptReserveSats(): bigint | null {
 		if (!this._state.spliceInFlight) return null;
+		if (this._state.localReserveWaived) return 0n;
 		const pendingCapacity =
 			this._splicedState()?.fundingSatoshis ??
 			this._state.spliceInFlight.newFundingSatoshis;
 		return bigIntMax(
 			this._state.remoteConfig.channelReserveSatoshis,
-			v2ReserveWeKeep(
+			this._reserveWeKeep(
 				pendingCapacity,
 				this._state.localConfig.dustLimitSatoshis,
 				this._state.remoteConfig.dustLimitSatoshis
@@ -14226,9 +14399,12 @@ export class Channel {
 			// value, but it skips a still-negotiating row and only runs on
 			// restore, so the invariant is asserted here as well rather than
 			// left to depend on which ran first (issues #386, #387).
-			const reserveMsat =
-				bigIntMax(keptReserveSats, this._state.localConfig.dustLimitSatoshis) *
-				1000n;
+			const reserveMsat = this._state.localReserveWaived
+				? 0n
+				: bigIntMax(
+						keptReserveSats,
+						this._state.localConfig.dustLimitSatoshis
+				  ) * 1000n;
 			let requiredMsat = reserveMsat;
 			if (this._state.role === ChannelRole.OPENER) {
 				const feeratePerKw = Math.max(
@@ -15546,14 +15722,16 @@ export class Channel {
 		// re-price a never-spliced v1 row's wire-negotiated value (every real
 		// adoption arm sets fields.spliceFundingTxid before this runs).
 		if (adopted.fundingVersion === 2 || adopted.spliceFundingTxid) {
-			const keptReserve = bigIntMax(
-				this._state.remoteConfig.channelReserveSatoshis,
-				v2ReserveWeKeep(
-					adopted.fundingSatoshis,
-					this._state.localConfig.dustLimitSatoshis,
-					this._state.remoteConfig.dustLimitSatoshis
-				)
-			);
+			const keptReserve = this._state.localReserveWaived
+				? 0n
+				: bigIntMax(
+						this._state.remoteConfig.channelReserveSatoshis,
+						this._reserveWeKeep(
+							adopted.fundingSatoshis,
+							this._state.localConfig.dustLimitSatoshis,
+							this._state.remoteConfig.dustLimitSatoshis
+						)
+				  );
 			if (keptReserve !== this._state.remoteConfig.channelReserveSatoshis) {
 				fields.remoteConfig = {
 					...this._state.remoteConfig,
@@ -15937,6 +16115,88 @@ export class Channel {
 		return entry.funderFeeFailback === true;
 	}
 
+	private _initialWaivedCommitmentRefusal(): string | null {
+		if (!this._state.localReserveWaived && !this._state.remoteReserveWaived)
+			return null;
+		const s = this._state;
+		const opener = s.role === ChannelRole.OPENER;
+		const cost =
+			funderCommitmentCostSats(
+				opener ? s.localConfig.feeratePerKw : s.remoteConfig.feeratePerKw,
+				0,
+				s.channelType
+			) * 1000n;
+		const ours = s.localBalanceMsat - (opener ? cost : 0n);
+		const theirs = s.remoteBalanceMsat - (opener ? 0n : cost);
+		const dust =
+			bigIntMax(
+				s.localConfig.dustLimitSatoshis,
+				s.remoteConfig.dustLimitSatoshis
+			) * 1000n;
+		return ours < 0n || theirs < 0n || bigIntMax(ours, theirs) < dust
+			? 'Initial commitment would have no outputs or insufficient commitment funding'
+			: null;
+	}
+
+	private _waivedCommitmentRefusal(view: IChannelState): string | null {
+		if (!view.localReserveWaived && !view.remoteReserveWaived) return null;
+		if (view.localBalanceMsat < 0n || view.remoteBalanceMsat < 0n) {
+			return 'Splice would leave a negative channel balance';
+		}
+		try {
+			const n = view.localCommitmentNumber + 1n;
+			const local = buildLocalCommitment(
+				view,
+				getPerCommitmentPoint(view.localPerCommitmentSeed, n),
+				n
+			);
+			const remote = buildRemoteCommitment(
+				view,
+				view.remoteNextPerCommitmentPoint ??
+					view.remoteCurrentPerCommitmentPoint!,
+				view.remoteCommitmentNumber + 1n
+			);
+			for (const [built, side] of [
+				[local, 'local'],
+				[remote, 'remote']
+			] as const) {
+				const refusal = this._waivedCommitmentFundingRefusal(view, built, side);
+				if (refusal) return refusal;
+			}
+			return local.result.tx.outs.length && remote.result.tx.outs.length
+				? null
+				: 'Operation would leave a commitment with no outputs';
+		} catch {
+			return 'Cannot build both commitments for the proposed operation';
+		}
+	}
+
+	private _waivedCommitmentFundingRefusal(
+		view: IChannelState,
+		built: IBuiltCommitment,
+		side: 'local' | 'remote'
+	): string | null {
+		const rate =
+			side === 'local'
+				? getLocalCommitmentFeeRate(view)
+				: getRemoteCommitmentFeeRate(view);
+		const cost = funderCommitmentCostSats(
+			rate,
+			built.htlcOutputs.length,
+			view.channelType
+		);
+		if (built.funderBalanceMsat < cost * 1000n) {
+			return 'Operation would leave the opener unable to pay its commitment cost';
+		}
+		const outputSats = built.result.tx.outs.reduce(
+			(sum, output) => sum + BigInt(output.value),
+			0n
+		);
+		return outputSats > view.fundingSatoshis
+			? 'Commitment outputs exceed the funding amount'
+			: null;
+	}
+
 	/**
 	 * Would the commitment WE hold be built with NO outputs once a peer-driven
 	 * update is applied? A refusal reason, or null (issue #386).
@@ -15986,15 +16246,21 @@ export class Channel {
 	 * both views (issue #405).
 	 */
 	private _localCommitmentEmptyRefusal(overrides: {
+		localBalanceMsat?: bigint;
 		remoteBalanceMsat?: bigint;
 		pendingFeeratePerKw?: number;
 		addedHtlc?: { key: string; entry: IHtlcEntry };
 	}): string | null {
 		const ourDust = this._state.localConfig.dustLimitSatoshis;
-		const liveHalf = this._state.localConfig.channelReserveSatoshis < ourDust;
+		const waived =
+			this._state.localReserveWaived || this._state.remoteReserveWaived;
+		const liveHalf =
+			waived || this._state.localConfig.channelReserveSatoshis < ourDust;
 		const spliceHalf = this.isSplicePendingLock();
 		if (!liveHalf && !spliceHalf) return null;
 		const candidate: IChannelState = { ...this._state };
+		if (overrides.localBalanceMsat !== undefined)
+			candidate.localBalanceMsat = overrides.localBalanceMsat;
 		if (overrides.remoteBalanceMsat !== undefined) {
 			candidate.remoteBalanceMsat = overrides.remoteBalanceMsat;
 		}
@@ -16013,8 +16279,29 @@ export class Channel {
 		const emptyRefusal = (view: IChannelState, what: string): string | null => {
 			let outputCount: number;
 			try {
-				outputCount = buildLocalCommitment(view, point, next).result.tx.outs
-					.length;
+				const local = buildLocalCommitment(view, point, next);
+				outputCount = local.result.tx.outs.length;
+				if (waived) {
+					const remote = buildRemoteCommitment(
+						view,
+						view.remoteNextPerCommitmentPoint ??
+							view.remoteCurrentPerCommitmentPoint!,
+						view.remoteCommitmentNumber + 1n
+					);
+					for (const [built, side] of [
+						[local, 'local'],
+						[remote, 'remote']
+					] as const) {
+						const refusal = this._waivedCommitmentFundingRefusal(
+							view,
+							built,
+							side
+						);
+						if (refusal) return refusal;
+					}
+					if (remote.result.tx.outs.length === 0)
+						return `Update would trim every output of the remote ${what}`;
+				}
 			} catch {
 				// A commitment we cannot build is strictly worse than one we can,
 				// so this refuses rather than admitting on the builder's behalf.
@@ -16025,8 +16312,25 @@ export class Channel {
 			if (outputCount > 0) return null;
 			return `Update would trim every output of the ${what} we hold at the ${ourDust}-sat dust limit`;
 		};
+		const checkRates = (view: IChannelState, what: string): string | null => {
+			const transient = emptyRefusal(view, what);
+			if (transient) return transient;
+			if (waived && overrides.pendingFeeratePerKw !== undefined) {
+				const rate = overrides.pendingFeeratePerKw;
+				return emptyRefusal(
+					{
+						...view,
+						localConfig: { ...view.localConfig, feeratePerKw: rate },
+						remoteConfig: { ...view.remoteConfig, feeratePerKw: rate },
+						pendingFeeratePerKw: undefined
+					},
+					`${what} after the fee update commits`
+				);
+			}
+			return null;
+		};
 		if (liveHalf) {
-			const refusal = emptyRefusal(candidate, 'commitment');
+			const refusal = checkRates(candidate, 'commitment');
 			if (refusal) return refusal;
 		}
 		if (spliceHalf) {
@@ -16044,7 +16348,9 @@ export class Channel {
 				if (spliced.localBalanceMsat < 0n || spliced.remoteBalanceMsat < 0n) {
 					return `Update would overdraw the ${spliced.fundingSatoshis}-sat pending-splice capacity`;
 				}
-				return emptyRefusal(spliced, 'pending-splice commitment');
+				return checkRates(spliced, 'pending-splice commitment');
+			} else if (waived) {
+				return 'Cannot verify the pending-splice commitments until restoration completes';
 			}
 		}
 		return null;
@@ -16342,7 +16648,7 @@ export class Channel {
 				? view.localConfig.dustLimitSatoshis
 				: view.remoteConfig.dustLimitSatoshis;
 		const balanceSats = view.localBalanceMsat / 1000n;
-		if (balanceSats < dustSats) return null;
+		if (!view.localReserveWaived && balanceSats < dustSats) return null;
 		let built: IBuiltCommitment;
 		try {
 			built =
@@ -16359,7 +16665,7 @@ export class Channel {
 				? built.result.outputMap.toLocal
 				: built.result.outputMap.toRemote;
 		if (ours !== undefined) return null;
-		if (this._inSplicedClimbOut(view)) {
+		if (view.localReserveWaived || this._inSplicedClimbOut(view)) {
 			const feeratePerKw =
 				side === 'local'
 					? getLocalCommitmentFeeRate(view)
@@ -16369,7 +16675,10 @@ export class Channel {
 				built.htlcOutputs.length,
 				view.channelType
 			);
-			if (feeSats <= balanceSats) return null;
+			const funderSats = view.localReserveWaived
+				? built.funderBalanceMsat / 1000n
+				: balanceSats;
+			if (feeSats <= funderSats && built.result.tx.outs.length > 0) return null;
 		}
 		return 'Commitment would trim our output to fees';
 	}
@@ -16536,14 +16845,16 @@ export class Channel {
 		if (pendingMsat !== null) {
 			// The reserve the funder keeps on the pending capacity, floored at
 			// the stored value: the mirror of _pendingSpliceKeptReserveSats.
-			const pendingReserveSats = bigIntMax(
-				reserveSats,
-				v2ReserveWeKeep(
-					pendingCapacity,
-					this._state.remoteConfig.dustLimitSatoshis,
-					this._state.localConfig.dustLimitSatoshis
-				)
-			);
+			const pendingReserveSats = this._state.remoteReserveWaived
+				? 0n
+				: bigIntMax(
+						reserveSats,
+						v2ReserveWeKeep(
+							pendingCapacity,
+							this._state.remoteConfig.dustLimitSatoshis,
+							this._state.localConfig.dustLimitSatoshis
+						)
+				  );
 			const pendingHeadroomMsat =
 				pendingMsat + adjustMsat - pendingReserveSats * 1000n;
 			if (pendingHeadroomMsat < headroomMsat) {
@@ -17124,6 +17435,13 @@ export class Channel {
 			];
 		}
 
+		this._state.announceChannel = (result.message.channelFlags & 1) !== 0;
+		this._state.remoteReserveWaived =
+			this._zeroReservePolicy.waivePeer &&
+			this._zeroReservePolicy.waiveOnOpen &&
+			!this._state.announceChannel;
+		result.message.disableChannelReserve = this._state.remoteReserveWaived;
+
 		// max_htlc_value_in_flight_msat is advertised as configured, not
 		// capacity-clamped (final v2 capacity is unknown here anyway; see
 		// initiateOpen for why clamping is wrong in general). v2 params arrive
@@ -17207,6 +17525,15 @@ export class Channel {
 		// default (false) while the opener announced: the opener sent its
 		// announcement_signatures at depth, the acceptor never answered, and
 		// a beignet-to-beignet dual-funded channel was never in any graph.
+		if (
+			msg.disableChannelReserve &&
+			(!this._zeroReservePolicy.acceptWaiver || (msg.channelFlags & 1) !== 0)
+		) {
+			return refuse('disable_channel_reserve is not permitted on this channel');
+		}
+		this._state.localReserveWaived = msg.disableChannelReserve === true;
+		this._state.remoteReserveWaived =
+			this._zeroReservePolicy.waivePeer && (msg.channelFlags & 1) === 0;
 		this._state.announceChannel = (msg.channelFlags & 0x01) !== 0;
 
 		this._state.fundingVersion = 2;
@@ -17254,6 +17581,8 @@ export class Channel {
 		if (!result.ok || !result.message) {
 			return refuse(result.error || 'Failed to handle open_channel2');
 		}
+
+		result.message.disableChannelReserve = this._state.remoteReserveWaived;
 
 		// max_htlc_value_in_flight_msat is advertised as configured, not
 		// capacity-clamped (a will_fund lease fee can still grow capacity
@@ -17455,6 +17784,14 @@ export class Channel {
 		if (!session) {
 			return refuse('No dual-funding session');
 		}
+
+		if (
+			msg.disableChannelReserve &&
+			(!this._zeroReservePolicy.acceptWaiver || this._state.announceChannel)
+		) {
+			return refuse('disable_channel_reserve is not permitted on this channel');
+		}
+		this._state.localReserveWaived = msg.disableChannelReserve === true;
 
 		const result = session.handleAcceptChannel2(msg);
 		if (!result.ok) {
@@ -18744,7 +19081,11 @@ export class Channel {
 		const ourDust = this._state.localConfig.dustLimitSatoshis;
 		const peerDust = this._state.remoteConfig.dustLimitSatoshis;
 		if (theyAdded) {
-			const theirReserve = v2ReserveWeEnforce(newCapacity, ourDust, peerDust);
+			const theirReserve = this._reserveWeEnforce(
+				newCapacity,
+				ourDust,
+				peerDust
+			);
 			if (theirNewMsat < theirReserve * 1000n) {
 				return `splice leaves the peer balance ${
 					theirNewMsat / 1000n
@@ -18752,14 +19093,19 @@ export class Channel {
 			}
 		}
 		if (weAdded) {
-			const ourReserve = v2ReserveWeKeep(newCapacity, ourDust, peerDust);
+			const ourReserve = this._reserveWeKeep(newCapacity, ourDust, peerDust);
 			if (myNewLocalMsat < ourReserve * 1000n) {
 				return `splice leaves our balance ${
 					myNewLocalMsat / 1000n
 				} sats below the channel reserve ${ourReserve} sats at the new capacity ${newCapacity} sats`;
 			}
 		}
-		return null;
+		return this._waivedCommitmentRefusal({
+			...this._state,
+			fundingSatoshis: newCapacity,
+			localBalanceMsat: myNewLocalMsat,
+			remoteBalanceMsat: theirNewMsat
+		});
 	}
 
 	private _v2NegotiatedTx(): {
@@ -21503,11 +21849,15 @@ export class Channel {
 		const peerDust = this._state.remoteConfig.dustLimitSatoshis;
 		this._state.remoteConfig = {
 			...this._state.remoteConfig,
-			channelReserveSatoshis: v2ReserveWeKeep(capacity, ourDust, peerDust)
+			channelReserveSatoshis: this._reserveWeKeep(capacity, ourDust, peerDust)
 		};
 		this._state.localConfig = {
 			...this._state.localConfig,
-			channelReserveSatoshis: v2ReserveWeEnforce(capacity, ourDust, peerDust)
+			channelReserveSatoshis: this._reserveWeEnforce(
+				capacity,
+				ourDust,
+				peerDust
+			)
 		};
 		this._state.channelReserveVersion = ENFORCED_RESERVE_VERSION;
 	}
@@ -21534,13 +21884,21 @@ export class Channel {
 		const peerDust = this._state.remoteConfig.dustLimitSatoshis;
 		if (record.localChannelReserveSatoshis === undefined) {
 			return {
-				ours: v2ReserveWeKeep(record.fundingSatoshis!, ourDust, peerDust),
-				theirs: v2ReserveWeEnforce(record.fundingSatoshis!, ourDust, peerDust)
+				ours: this._reserveWeKeep(record.fundingSatoshis!, ourDust, peerDust),
+				theirs: this._reserveWeEnforce(
+					record.fundingSatoshis!,
+					ourDust,
+					peerDust
+				)
 			};
 		}
 		return {
-			ours: record.remoteChannelReserveSatoshis!,
-			theirs: record.localChannelReserveSatoshis
+			ours: this._state.localReserveWaived
+				? 0n
+				: record.remoteChannelReserveSatoshis!,
+			theirs: this._state.remoteReserveWaived
+				? 0n
+				: record.localChannelReserveSatoshis
 		};
 	}
 
@@ -21831,8 +22189,8 @@ export class Channel {
 		}
 		const ourDust = this._state.localConfig.dustLimitSatoshis;
 		const peerDust = this._state.remoteConfig.dustLimitSatoshis;
-		const ourReserve = v2ReserveWeKeep(capacity, ourDust, peerDust);
-		const theirReserve = v2ReserveWeEnforce(capacity, ourDust, peerDust);
+		const ourReserve = this._reserveWeKeep(capacity, ourDust, peerDust);
+		const theirReserve = this._reserveWeEnforce(capacity, ourDust, peerDust);
 		const ourSatsAfterFee = weAreOpener
 			? localSats - commitCostSats
 			: localSats;

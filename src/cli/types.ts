@@ -146,6 +146,12 @@ export interface CloseStatus {
 }
 
 export interface ChannelInfo {
+	/** Per-channel waiver directions fixed at open, false for legacy channels. */
+	localReserveWaived?: boolean;
+	remoteReserveWaived?: boolean;
+	isOpener?: boolean;
+	localReserveSats?: number;
+	remoteReserveSats?: number;
 	channelId: string;
 	peerPubkey: string;
 	state: ChannelStateString;
@@ -756,6 +762,8 @@ export interface Bolt12InvoiceInfo {
 }
 
 export interface BeignetConfig extends IrohDaemonConfig {
+	/** Primary-only switch for new private client channels. Default false. */
+	waiveClientReserve?: boolean;
 	mnemonic?: string;
 	network?: 'mainnet' | 'testnet' | 'regtest' | 'signet';
 	alias?: string;
