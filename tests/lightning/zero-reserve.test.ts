@@ -360,6 +360,11 @@ describe('One-way zero reserve negotiation', () => {
 		const legacy = deserializeChannelState(row);
 		expect(legacy.localReserveWaived).to.equal(false);
 		expect(legacy.remoteReserveWaived).to.equal(false);
+		const legacyJson = JSON.parse(
+			JSON.stringify(serializeChannelState(legacy))
+		);
+		expect(legacyJson).not.to.have.property('localReserveWaived');
+		expect(legacyJson).not.to.have.property('remoteReserveWaived');
 	});
 });
 

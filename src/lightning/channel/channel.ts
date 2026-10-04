@@ -12517,9 +12517,6 @@ export class Channel {
 		// before we quiesce, so we don't STFU only to then fail).
 		if (relativeSatoshis < 0n) {
 			const withdrawSats = -relativeSatoshis;
-			const commitmentRefusal = this.spliceOutCommitmentRefusal(withdrawSats);
-			if (commitmentRefusal)
-				return [{ type: ChannelActionType.ERROR, message: commitmentRefusal }];
 			const localBalanceSats = this._state.localBalanceMsat / 1000n;
 			if (withdrawSats > localBalanceSats) {
 				return [
@@ -12529,6 +12526,9 @@ export class Channel {
 					}
 				];
 			}
+			const commitmentRefusal = this.spliceOutCommitmentRefusal(withdrawSats);
+			if (commitmentRefusal)
+				return [{ type: ChannelActionType.ERROR, message: commitmentRefusal }];
 			// BOLT 2 tx_complete (issue #423): a splice-out adds a destination
 			// output, and a side that adds a non-funding output must end at or
 			// above the reserve the NEW capacity prices, or the peer MUST abort
