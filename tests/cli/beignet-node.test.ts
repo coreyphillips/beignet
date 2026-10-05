@@ -26,6 +26,16 @@ import {
 	gossipPrimeLatch
 } from '../../src/cli/beignet-node';
 import { Wallet } from '../../src/wallet';
+import * as rapidSync from '../../src/lightning/gossip/rapid-sync';
+import { NetworkGraph } from '../../src/lightning/gossip/network-graph';
+import { LightningNode as LightningNodeClass } from '../../src/lightning/node/lightning-node';
+import { ILogger } from '../../src/logger';
+import {
+	buildV1Snapshot,
+	generateNodes,
+	generateSnapshot,
+	prng
+} from '../lightning/helpers/rgs-snapshot';
 import type {
 	ApiResponse,
 	NodeInfo,
@@ -45,7 +55,8 @@ import type {
 	BootstrapPeerInfo,
 	Bolt12InvoiceInfo,
 	HealthInfo,
-	EventMessage
+	EventMessage,
+	BeignetNodeEvents
 } from '../../src/cli/types';
 
 // Electrum intentionally unreachable: nothing below needs a live chain, and a
@@ -797,6 +808,215 @@ describe('Gossip sync deferral during initial RGS (issue #441)', () => {
 		} finally {
 			await bn.destroy();
 		}
+	});
+});
+
+// ─────────────── Rapid Gossip Sync, cooperative import ───────────────
+
+describe('Rapid gossip sync on a mainnet node (cooperative import)', function () {
+	this.timeout(30_000);
+
+	type TSeams = { _initialGossipPrime: Promise<void> | null };
+	type TSynced = Parameters<BeignetNodeEvents['gossip:synced']>[0];
+	type TImportOptions = Parameters<
+		LightningNodeClass['loadRapidGossipSnapshotAsync']
+	>[1];
+
+	const savedSlice = LightningNodeClass.RAPID_GOSSIP_SLICE_MS;
+	const now = Math.floor(Date.now() / 1000);
+	const snapshot = ((): { data: Buffer; channels: number } => {
+		const rand = prng(441);
+		const { nodes, duplicates } = generateNodes(rand, 120);
+		const { spec } = generateSnapshot(rand, {
+			latestSeen: now - 60,
+			nodes,
+			duplicates,
+			channels: 400
+		});
+		const data = buildV1Snapshot(spec);
+		return {
+			data,
+			channels: rapidSync.applyRapidGossipSnapshot(new NetworkGraph(), data)
+				.channelsAdded
+		};
+	})();
+
+	let fetch: sinon.SinonStub;
+	let download: { resolve: (data: Buffer) => void };
+	let dir: string;
+	let bn: BeignetNode | undefined;
+
+	beforeEach(() => {
+		// One step per slice, so the import spans many turns of the loop.
+		LightningNodeClass.RAPID_GOSSIP_SLICE_MS = 0;
+		fetch = sinon.stub(rapidSync, 'fetchRapidGossipSnapshot').callsFake(
+			() =>
+				new Promise<Buffer>((resolve) => {
+					download = { resolve };
+				})
+		);
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-rgs-'));
+	});
+
+	afterEach(async () => {
+		LightningNodeClass.RAPID_GOSSIP_SLICE_MS = savedSlice;
+		fetch.restore();
+		await bn?.destroy();
+		bn = undefined;
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	const create = async (
+		opts: Partial<BeignetNodeOptions> = {}
+	): Promise<BeignetNode> => {
+		bn = await BeignetNode.create({
+			network: 'mainnet',
+			dataDir: dir,
+			logLevel: 'silent',
+			autoGossipSync: true,
+			// Never the real endpoint, should the stub not take.
+			rapidGossipSyncUrl: 'https://127.0.0.1:1/snapshot',
+			...OFFLINE_ELECTRUM,
+			...opts
+		});
+		// The boot sync started during create().
+		expect(fetch.callCount).to.equal(1);
+		return bn;
+	};
+
+	const rejection = async (promise: Promise<unknown>): Promise<Error> => {
+		try {
+			await promise;
+		} catch (err) {
+			return err as Error;
+		}
+		throw new Error('expected a rejection');
+	};
+
+	it('joins the sync in flight instead of downloading and applying twice', async () => {
+		const node = await create();
+		const joined = node.syncRapidGossip();
+		const again = node.syncRapidGossip();
+		expect(joined).to.equal(again);
+		expect(fetch.callCount).to.equal(1);
+		download.resolve(snapshot.data);
+		const result = await joined;
+		expect(result).to.deep.equal({
+			channelsAdded: snapshot.channels,
+			updatesApplied: result!.updatesApplied
+		});
+		expect(snapshot.channels).to.be.greaterThan(0);
+		expect(node.getNode().getGraph().getChannelCount()).to.equal(
+			snapshot.channels
+		);
+
+		// Settled, a new call is a new sync.
+		const later = node.syncRapidGossip();
+		expect(later).to.not.equal(joined);
+		expect(fetch.callCount).to.equal(2);
+		download.resolve(snapshot.data);
+		expect((await later)!.channelsAdded).to.equal(0);
+	});
+
+	it('reports download and import timings on gossip:synced', async () => {
+		const node = await create();
+		const events: TSynced[] = [];
+		node.on('gossip:synced', (e): void => {
+			events.push(e);
+		});
+		await new Promise<void>((resolve) => setTimeout(resolve, 30));
+		download.resolve(snapshot.data);
+		const result = await node.syncRapidGossip();
+		expect(events).to.have.length(1);
+		const [e] = events;
+		expect(Object.keys(e)).to.deep.equal([
+			'channelsAdded',
+			'updatesApplied',
+			'downloadMs',
+			'applyMs',
+			'busyMs',
+			'slices'
+		]);
+		expect(e.channelsAdded).to.equal(result!.channelsAdded);
+		expect(e.updatesApplied).to.equal(result!.updatesApplied);
+		expect(e.downloadMs).to.be.at.least(25);
+		expect(e.slices).to.be.greaterThan(10);
+		expect(e.busyMs).to.be.at.most(e.applyMs);
+		// The return shape is unchanged.
+		expect(Object.keys(result!)).to.deep.equal([
+			'channelsAdded',
+			'updatesApplied'
+		]);
+	});
+
+	it('releases the boot latch only once the snapshot is applied', async () => {
+		const node = await create();
+		const prime = (node as unknown as TSeams)._initialGossipPrime;
+		expect(prime).to.not.equal(null);
+		let atRelease = -1;
+		void prime!.then(() => {
+			atRelease = node.getNode().getGraph().getChannelCount();
+		});
+		download.resolve(snapshot.data);
+		await prime;
+		expect(atRelease).to.equal(snapshot.channels);
+		expect((node as unknown as TSeams)._initialGossipPrime).to.equal(null);
+	});
+
+	it('a shutdown mid-download cancels the boot sync quietly', async () => {
+		const logged: string[] = [];
+		const record =
+			(level: string) =>
+			(message: string): void => {
+				logged.push(`${level}: ${message}`);
+			};
+		const logger: ILogger = {
+			debug: record('debug'),
+			info: record('info'),
+			warn: record('warn'),
+			error: record('error')
+		};
+		const node = await create({ logLevel: 'debug', logger });
+		const joined = node.syncRapidGossip();
+		await node.destroy();
+		download.resolve(snapshot.data);
+		const err = await rejection(joined);
+		expect(err).to.be.instanceOf(rapidSync.RapidGossipCancelledError);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(logged).to.include('debug: Rapid gossip sync cancelled by shutdown');
+		expect(logged).to.not.include('warn: Rapid gossip sync failed');
+		expect(node.getNode().getGraph().getChannelCount()).to.equal(0);
+	});
+
+	it('a shutdown mid-import stops the import', async () => {
+		const node = await create();
+		const ln = node.getNode();
+		const load = ln.loadRapidGossipSnapshotAsync.bind(ln);
+		let slices = 0;
+		let destroying: Promise<void> | undefined;
+		let atDestroy = -1;
+		sinon
+			.stub(ln, 'loadRapidGossipSnapshotAsync')
+			.callsFake((data: Buffer, opts?: TImportOptions) =>
+				load(data, {
+					...opts,
+					onSlice: (ms) => {
+						opts?.onSlice?.(ms);
+						if (++slices === 3) {
+							destroying = node.destroy();
+							atDestroy = ln.getGraph().getChannelCount();
+						}
+					}
+				})
+			);
+		const joined = node.syncRapidGossip();
+		download.resolve(snapshot.data);
+		const err = await rejection(joined);
+		await destroying;
+		expect(err).to.be.instanceOf(rapidSync.RapidGossipCancelledError);
+		expect(slices).to.equal(3);
+		expect(atDestroy).to.be.within(1, snapshot.channels - 1);
+		expect(ln.getGraph().getChannelCount()).to.equal(atDestroy);
 	});
 });
 

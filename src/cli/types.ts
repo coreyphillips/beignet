@@ -1508,6 +1508,20 @@ export interface BeignetNodeEvents {
 		retained?: boolean;
 	}) => void;
 	'node:ready': () => void;
+	/**
+	 * A Rapid Gossip Sync snapshot was downloaded and applied. downloadMs
+	 * is the fetch; applyMs is the import from start to finish, of which
+	 * busyMs was spent applying, in `slices` turns of the event loop (the
+	 * rest went to other work between slices).
+	 */
+	'gossip:synced': (data: {
+		channelsAdded: number;
+		updatesApplied: number;
+		downloadMs: number;
+		applyMs: number;
+		busyMs: number;
+		slices: number;
+	}) => void;
 	log: (entry: {
 		level: string;
 		message: string;
