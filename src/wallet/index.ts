@@ -275,6 +275,7 @@ export class Wallet {
 		masterFingerprint,
 		originPath,
 		passphrase,
+		seed,
 		name,
 		network = EAvailableNetworks.mainnet,
 		addressType,
@@ -324,7 +325,11 @@ export class Wallet {
 		if (mnemonic) {
 			if (!validateMnemonic(mnemonic)) throw new Error('Invalid mnemonic.');
 			this._mnemonic = mnemonic;
-			this._seed = getSeed(this._mnemonic, this._passphrase);
+			// A supplied seed is copied, so the wallet's own never changes with
+			// the caller's buffer.
+			this._seed = seed
+				? Buffer.from(seed)
+				: getSeed(this._mnemonic, this._passphrase);
 			this._root = bip32.fromSeed(
 				this._seed,
 				this.getBitcoinNetwork(this._network)

@@ -4,10 +4,12 @@
  *
  * Two Wallet instances over the same mnemonic + storage but different
  * accounts must derive from m/purpose'/coin'/ACCOUNT' and use disjoint
- * storage keys.
+ * storage keys. A wallet given its BIP39 seed must derive exactly what one
+ * given only the mnemonic does.
  */
 
 import { expect } from 'chai';
+import sinon from 'sinon';
 import net from 'net';
 import tls from 'tls';
 import BIP32Factory, { BIP32Interface } from 'bip32';
@@ -216,5 +218,44 @@ describe('Multi-account support', function () {
 		const expectedXpub = root.derivePath("m/84'/1'/1'").neutered().toBase58();
 		expect(p2wpkh!.external).to.contain('/84h/1h/1h]');
 		expect(p2wpkh!.external).to.contain(expectedXpub);
+	});
+});
+
+describe('Wallet given its BIP39 seed', function () {
+	this.timeout(testTimeout);
+
+	it('derives what the mnemonic alone derives, without a PBKDF2 pass', async () => {
+		// BeignetNode hands the wallet the seed it derived once per boot.
+		const seed = bip39.mnemonicToSeedSync(MNEMONIC);
+		const root = bip32.fromSeed(seed, bitcoin.networks.regtest);
+		const pbkdf2 = sinon.spy(bip39, 'mnemonicToSeedSync');
+		const wallets: Wallet[] = [];
+		try {
+			for (const supplied of [undefined, seed]) {
+				const res = await Wallet.create({
+					mnemonic: MNEMONIC,
+					seed: supplied,
+					network,
+					storage: makeStorage().storage,
+					electrumOptions,
+					account: 1
+				});
+				if (res.isErr()) throw res.error;
+				wallets.push(res.value);
+				// Only the wallet without a seed derives one.
+				expect(pbkdf2.callCount).to.equal(1);
+			}
+			const [derived, given] = wallets;
+			expect(given.id).to.equal(derived.id);
+			expect(await given.getAddress({ index: '7' })).to.equal(
+				expectedP2wpkhAddress(root, 1, 0, 7)
+			);
+			expect(
+				await given.getAddress({ index: '3', changeAddress: true })
+			).to.equal(expectedP2wpkhAddress(root, 1, 1, 3));
+		} finally {
+			pbkdf2.restore();
+			for (const wallet of wallets) await wallet.stop();
+		}
 	});
 });

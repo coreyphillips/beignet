@@ -184,6 +184,33 @@ export function deriveChannelKeys(
 }
 
 /**
+ * Build the BIP32 root of a BIP39 seed with this module's factory, so the
+ * factory's ecc self-test runs once per process instead of once per caller.
+ *
+ * @param seed - BIP39 seed (mnemonicToSeed output)
+ * @returns BIP32 root key
+ */
+export function bip32RootFromSeed(seed: Buffer): bip32.BIP32Interface {
+	return BIP32Factory.fromSeed(seed);
+}
+
+/**
+ * Derive all Lightning keys from a BIP39 seed. The same keys as
+ * deriveLightningKeysFromMnemonic, without its PBKDF2 pass, for a caller
+ * that already holds the seed.
+ *
+ * @param seed - BIP39 seed (mnemonicToSeed output)
+ * @param coinType - Coin type (0=mainnet, 1=testnet/regtest)
+ * @returns All derived Lightning keys
+ */
+export function deriveLightningKeysFromSeed(
+	seed: Buffer,
+	coinType: number = LnCoinType.BITCOIN
+): ILightningKeysFromSeed {
+	return deriveLightningKeys(bip32RootFromSeed(seed), coinType);
+}
+
+/**
  * Derive all Lightning keys from a BIP39 mnemonic.
  *
  * @param mnemonic - BIP39 mnemonic phrase
@@ -200,8 +227,8 @@ export function deriveLightningKeysFromMnemonic(
 		throw new Error('Invalid BIP39 mnemonic');
 	}
 
-	const seed = bip39.mnemonicToSeedSync(mnemonic, passphrase);
-	const root = BIP32Factory.fromSeed(seed);
-
-	return deriveLightningKeys(root, coinType);
+	return deriveLightningKeysFromSeed(
+		bip39.mnemonicToSeedSync(mnemonic, passphrase),
+		coinType
+	);
 }

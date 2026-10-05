@@ -603,6 +603,7 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 			// be exercised without an Electrum-connected BeignetNode instance.
 			const proto = BeignetNode.prototype as unknown as {
 				nodeSecret: () => Buffer;
+				walletSeed: () => Buffer;
 				toCoinType: (network: string) => number;
 				toLnNetwork: (network: string) => string;
 				offerRetrievedScb: () => void;
@@ -620,6 +621,7 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 				_peerRetrievedCapsules: new Map(),
 				recoveryGuardianSet: [],
 				nodeSecret: proto.nodeSecret,
+				walletSeed: proto.walletSeed,
 				toCoinType: proto.toCoinType,
 				toLnNetwork: proto.toLnNetwork,
 				offerRetrievedScb: proto.offerRetrievedScb,

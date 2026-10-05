@@ -431,11 +431,11 @@ import {
 	chainHashForNetwork
 } from '../watchtower';
 import {
-	deriveLightningKeysFromMnemonic,
+	bip32RootFromSeed,
+	deriveLightningKeys,
 	deriveChannelKeys,
 	LnCoinType
 } from '../keys/wallet-keys';
-import * as bip32Lib from 'bip32';
 import * as bip39 from 'bip39';
 import { generateFromSeed } from '../keys/shachain';
 import { perCommitmentPointFromSecret } from '../keys/derivation';
@@ -29432,6 +29432,12 @@ export class LightningNode extends EventEmitter {
 		mnemonic: string,
 		options?: {
 			passphrase?: string;
+			/**
+			 * The BIP39 seed of `mnemonic` and `passphrase`, for a caller that
+			 * already holds it: skips the PBKDF2 pass. It is not checked against
+			 * the mnemonic, so it must be that mnemonic's seed.
+			 */
+			seed?: Buffer;
 			coinType?: number;
 			network?: Network;
 			storage?: IStorageBackend;
@@ -29482,18 +29488,21 @@ export class LightningNode extends EventEmitter {
 		}
 	): LightningNode {
 		const coinType = options?.coinType ?? LnCoinType.REGTEST;
-		const keys = deriveLightningKeysFromMnemonic(
-			mnemonic,
-			options?.passphrase,
-			coinType
-		);
+		if (!bip39.validateMnemonic(mnemonic)) {
+			throw new Error('Invalid BIP39 mnemonic');
+		}
+		// One seed and one BIP32 root serve the node keys, the per-channel
+		// keys and the Iroh identity. The PBKDF2 pass behind the seed is the
+		// slow step (a phone runs it on the JS thread), so it runs at most
+		// once here, and not at all when the caller passes the seed.
+		const seed =
+			options?.seed ?? bip39.mnemonicToSeedSync(mnemonic, options?.passphrase);
+		const root = bip32RootFromSeed(seed);
+		const keys = deriveLightningKeys(root, coinType);
 
 		// Build per-channel key deriver from BIP32 root (unless caller provides one)
 		let channelKeyDeriver = options?.channelKeyDeriver;
 		if (!channelKeyDeriver) {
-			const seed = bip39.mnemonicToSeedSync(mnemonic, options?.passphrase);
-			const BIP32Factory = bip32Lib.BIP32Factory(ecc);
-			const root = BIP32Factory.fromSeed(seed);
 			channelKeyDeriver = (
 				channelIndex: number
 			): ReturnType<NonNullable<INodeConfig['channelKeyDeriver']>> => {
@@ -29553,9 +29562,7 @@ export class LightningNode extends EventEmitter {
 			iroh: options?.iroh
 				? {
 						...options.iroh,
-						secretKey: deriveIrohSecretKey(
-							bip39.mnemonicToSeedSync(mnemonic, options?.passphrase)
-						)
+						secretKey: deriveIrohSecretKey(seed)
 				  }
 				: undefined,
 			preferAnchors: options?.preferAnchors,
