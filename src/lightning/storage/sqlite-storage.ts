@@ -50,6 +50,7 @@ import {
 	deserializeGraphNode
 } from './serialization';
 import {
+	ENC_PREFIX,
 	encryptValue,
 	decryptValue,
 	isEncryptedValue,
@@ -315,15 +316,32 @@ export class SqliteStorage implements IStorageBackend {
 	 * Rewrite any plaintext rows in the sensitive tables as encrypted values,
 	 * in a single transaction. Idempotent: rows already carrying the 'enc1:'
 	 * prefix are skipped, so reopening an already-encrypted database is a no-op.
+	 *
+	 * Every open with a key runs this, so SQL picks the candidates: a row comes
+	 * back only when one of its columns is not NULL and does not start with
+	 * the prefix. An encrypted database then selects nothing, rather than
+	 * reading every sensitive value into JS to skip it. The filter keeps every
+	 * row the per-column check below would rewrite: substr() reads an INTEGER
+	 * or REAL as its text, which never starts with the prefix, and a BLOB as
+	 * bytes, which never equal TEXT, so such rows still come back, and that
+	 * check still decides.
 	 */
 	private _encryptExistingData(): void {
 		const key = this.encryptionKey;
 		if (!key) return;
 		this.db.transaction(() => {
 			for (const { table, pk, columns } of SqliteStorage.ENCRYPTED_COLUMNS) {
+				const plaintext = columns.map(
+					(col) => `(${col} IS NOT NULL AND substr(${col}, 1, ?) IS NOT ?)`
+				);
 				const rows = this.db
-					.prepare(`SELECT ${pk}, ${columns.join(', ')} FROM ${table}`)
-					.all() as Array<Record<string, unknown>>;
+					.prepare(
+						`SELECT ${pk}, ${columns.join(', ')} FROM ${table} ` +
+							`WHERE ${plaintext.join(' OR ')}`
+					)
+					.all(
+						...columns.flatMap(() => [ENC_PREFIX.length, ENC_PREFIX])
+					) as Array<Record<string, unknown>>;
 				for (const row of rows) {
 					const updates: string[] = [];
 					const params: unknown[] = [];
