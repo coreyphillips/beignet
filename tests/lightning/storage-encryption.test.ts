@@ -1,4 +1,6 @@
 import { expect } from 'chai';
+import sinon from 'sinon';
+import Database from 'better-sqlite3';
 import crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -371,6 +373,283 @@ describe('Storage Encryption', function () {
 			const raw = readRawDbBytes(dbPath);
 			expect(raw).to.not.include('localBalanceMsat');
 			expect(raw).to.not.include('fundingSatoshis');
+		});
+
+		describe('the encryption pass on open', function () {
+			/** The sensitive tables and columns, as the storage declares them. */
+			const SENSITIVE = (
+				SqliteStorage as unknown as {
+					ENCRYPTED_COLUMNS: ReadonlyArray<{
+						table: string;
+						pk: string;
+						columns: string[];
+					}>;
+				}
+			).ENCRYPTED_COLUMNS;
+
+			function rawDb(storage: SqliteStorage): Database.Database {
+				return (storage as unknown as { db: Database.Database }).db;
+			}
+
+			/**
+			 * Open with the key, counting per table the rows the encryption
+			 * pass selects. On a database an earlier open already migrated,
+			 * the pass is the only code that calls all() during open, so the
+			 * statements are wrapped as they are prepared.
+			 */
+			function openCountingSelected(): {
+				storage: SqliteStorage;
+				selected: Record<string, number>;
+			} {
+				const storage = new SqliteStorage(dbPath, undefined, {
+					encryptionKey: TEST_KEY
+				});
+				const db = rawDb(storage);
+				const prepare = db.prepare.bind(db);
+				const selected: Record<string, number> = {};
+				const stub = sinon.stub(db, 'prepare').callsFake((source: string) => {
+					const statement = prepare(source) as unknown as {
+						all: (...params: unknown[]) => unknown[];
+					};
+					const table = /\bFROM (\w+)/.exec(source)?.[1];
+					const all = statement.all.bind(statement);
+					statement.all = (...params: unknown[]): unknown[] => {
+						const rows = all(...params);
+						if (table) selected[table] = (selected[table] ?? 0) + rows.length;
+						return rows;
+					};
+					return statement;
+				});
+				try {
+					storage.open({ synchronous: 'NORMAL' });
+				} finally {
+					stub.restore();
+				}
+				return { storage, selected };
+			}
+
+			/** Rows selected per sensitive table: the counts given, else none. */
+			function selectedRows(
+				plaintextRows: Record<string, number>
+			): Record<string, number> {
+				return Object.fromEntries(
+					SENSITIVE.map(({ table }) => [table, plaintextRows[table] ?? 0])
+				);
+			}
+
+			/** Every sensitive value as stored, by table, row key and column. */
+			function storedValues(): Record<string, unknown> {
+				const db = new Database(dbPath);
+				try {
+					const values: Record<string, unknown> = {};
+					for (const { table, pk, columns } of SENSITIVE) {
+						const rows = db
+							.prepare(`SELECT ${pk}, ${columns.join(', ')} FROM ${table}`)
+							.all() as Array<Record<string, unknown>>;
+						for (const row of rows) {
+							for (const col of columns) {
+								values[`${table}/${String(row[pk])}/${col}`] = row[col];
+							}
+						}
+					}
+					return values;
+				} finally {
+					db.close();
+				}
+			}
+
+			it('encrypts legacy plaintext rows of every storage class', function () {
+				const plain = new SqliteStorage(dbPath);
+				plain.open({ synchronous: 'NORMAL' });
+				const state = createTestChannelState();
+				const channelId = state.channelId!.toString('hex');
+				plain.saveChannel(channelId, state, '03'.repeat(33));
+				const preimage = crypto.randomBytes(32);
+				plain.savePreimage('aa'.repeat(32), preimage);
+				// channel_index is an INTEGER column, so plaintext rows hold integers.
+				plain.saveChannelKeyIndex('chan-a', 4);
+				const inChannelId = crypto.randomBytes(32);
+				plain.saveForwardedHtlc('out:1', inChannelId, 7n);
+				const pathId = crypto.randomBytes(32);
+				plain.saveOffer('offer-1', 'lno1withpath', pathId, 1000);
+				plain.saveOffer('offer-2', 'lno1nopath', null, 2000);
+				// A BLOB where TEXT belongs: nothing writes one today, but the
+				// per-column check would rewrite it, so the pass must select it.
+				rawDb(plain)
+					.prepare('INSERT INTO wallet_data (key, value) VALUES (?, ?)')
+					.run('legacy-blob', Buffer.from('legacy wallet bytes'));
+				plain.close();
+
+				const { storage, selected } = openCountingSelected();
+				expect(selected).to.deep.equal(
+					selectedRows({
+						channels: 1,
+						preimages: 1,
+						channel_key_indices: 1,
+						forwarded_htlcs: 1,
+						offers: 2,
+						wallet_data: 1
+					})
+				);
+				expect(
+					storage
+						.loadChannel(channelId)!
+						.state.channelId!.equals(state.channelId!)
+				).to.equal(true);
+				expect(
+					storage.loadPreimage('aa'.repeat(32))!.equals(preimage)
+				).to.equal(true);
+				expect(storage.loadChannelKeyIndex('chan-a')).to.equal(4);
+				const [forwarded] = storage.loadAllForwardedHtlcs();
+				expect(forwarded.inChannelId.equals(inChannelId)).to.equal(true);
+				expect(forwarded.inHtlcId).to.equal(7n);
+				const offers = storage
+					.loadAllOffers()
+					.sort((a, b) => a.createdAt - b.createdAt);
+				expect(offers.map((offer) => offer.encoded)).to.deep.equal([
+					'lno1withpath',
+					'lno1nopath'
+				]);
+				expect(offers[0].pathId!.equals(pathId)).to.equal(true);
+				expect(offers[1].pathId).to.equal(null);
+				storage.close();
+
+				const stored = storedValues();
+				// A NULL stays NULL; every other value is ciphertext now.
+				expect(stored['offers/offer-2/path_id']).to.equal(null);
+				for (const [where, value] of Object.entries(stored)) {
+					if (value === null) continue;
+					expect(
+						typeof value === 'string' && isEncryptedValue(value),
+						where
+					).to.equal(true);
+				}
+				expect(
+					decryptValue(
+						TEST_KEY,
+						stored['wallet_data/legacy-blob/value'] as string
+					)
+				).to.equal('legacy wallet bytes');
+			});
+
+			it('selects no row of an encrypted database, and rewrites none, on every reopen', function () {
+				const storage = openEncrypted();
+				const state = createTestChannelState();
+				storage.saveChannel(
+					state.channelId!.toString('hex'),
+					state,
+					'02'.repeat(33)
+				);
+				const preimage = crypto.randomBytes(32);
+				storage.savePreimage('bb'.repeat(32), preimage);
+				storage.saveChannelKeyIndex('chan-b', 9);
+				storage.saveForwardedHtlc('out:2', crypto.randomBytes(32), 3n);
+				storage.saveOffer(
+					'offer-3',
+					'lno1encrypted',
+					crypto.randomBytes(32),
+					3000
+				);
+				storage.savePeerStorageBlob(
+					'02'.repeat(33),
+					crypto.randomBytes(64),
+					4000
+				);
+				storage.close();
+				const before = storedValues();
+
+				for (const reopen of [1, 2]) {
+					const again = openCountingSelected();
+					expect(again.selected, `reopen ${reopen}`).to.deep.equal(
+						selectedRows({})
+					);
+					expect(
+						again.storage.loadPreimage('bb'.repeat(32))!.equals(preimage)
+					).to.equal(true);
+					expect(again.storage.loadChannelKeyIndex('chan-b')).to.equal(9);
+					again.storage.close();
+				}
+				// Same ciphertext byte for byte: nothing was encrypted twice.
+				expect(storedValues()).to.deep.equal(before);
+			});
+
+			it('in mixed tables, rewrites only the plaintext rows and columns', function () {
+				const hashA = 'a1'.repeat(32);
+				const hashB = 'b2'.repeat(32);
+				const encrypted = openEncrypted();
+				const preimageA = crypto.randomBytes(32);
+				encrypted.savePreimage(hashA, preimageA);
+				encrypted.saveForwardedHtlc('out:a', crypto.randomBytes(32), 1n);
+				const pathId = crypto.randomBytes(32);
+				encrypted.saveOffer('offer-m', 'lno1mixed', pathId, 5000);
+				encrypted.close();
+
+				// An open without the key writes plaintext beside the ciphertext.
+				const plain = new SqliteStorage(dbPath);
+				plain.open({ synchronous: 'NORMAL' });
+				const preimageB = crypto.randomBytes(32);
+				plain.savePreimage(hashB, preimageB);
+				plain.saveForwardedHtlc('out:b', crypto.randomBytes(32), 2n);
+				plain.saveChannelKeyIndex('chan-m', 3);
+				// One row with an encrypted column beside a plaintext one.
+				rawDb(plain)
+					.prepare('UPDATE offers SET path_id = ? WHERE offer_id = ?')
+					.run(pathId.toString('hex'), 'offer-m');
+				plain.close();
+				const before = storedValues();
+
+				const { storage, selected } = openCountingSelected();
+				expect(selected).to.deep.equal(
+					selectedRows({
+						preimages: 1,
+						forwarded_htlcs: 1,
+						offers: 1,
+						channel_key_indices: 1
+					})
+				);
+				storage.close();
+
+				const after = storedValues();
+				// Ciphertext that was already there is left as it was ...
+				for (const where of [
+					`preimages/${hashA}/preimage`,
+					'forwarded_htlcs/out:a/in_channel_id',
+					'forwarded_htlcs/out:a/in_htlc_id',
+					'offers/offer-m/encoded'
+				]) {
+					expect(isEncryptedValue(before[where] as string), where).to.equal(
+						true
+					);
+					expect(after[where], where).to.equal(before[where]);
+				}
+				// ... and every value is ciphertext now.
+				for (const [where, value] of Object.entries(after)) {
+					expect(
+						typeof value === 'string' && isEncryptedValue(value),
+						where
+					).to.equal(true);
+				}
+
+				const again = openCountingSelected();
+				expect(again.selected).to.deep.equal(selectedRows({}));
+				expect(again.storage.loadPreimage(hashA)!.equals(preimageA)).to.equal(
+					true
+				);
+				expect(again.storage.loadPreimage(hashB)!.equals(preimageB)).to.equal(
+					true
+				);
+				const [offer] = again.storage.loadAllOffers();
+				expect(offer.encoded).to.equal('lno1mixed');
+				expect(offer.pathId!.equals(pathId)).to.equal(true);
+				expect(
+					again.storage
+						.loadAllForwardedHtlcs()
+						.map((htlc) => htlc.inHtlcId)
+						.sort()
+				).to.deep.equal([1n, 2n]);
+				expect(again.storage.loadChannelKeyIndex('chan-m')).to.equal(3);
+				again.storage.close();
+			});
 		});
 	});
 

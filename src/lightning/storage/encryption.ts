@@ -14,7 +14,8 @@ import {
 	createDecipheriv
 } from 'crypto';
 
-const ENC_PREFIX = 'enc1:';
+/** Leads every value encryptValue writes; isEncryptedValue tests for it. */
+export const ENC_PREFIX = 'enc1:';
 const HKDF_INFO = 'beignet-storage-encryption-v1';
 const KEY_LENGTH = 32;
 const IV_LENGTH = 12;
