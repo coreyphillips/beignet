@@ -106,6 +106,83 @@ export function decodeBigSize(data: Buffer, offset = 0): IBigSizeResult {
 	return { value, bytesRead: 9 };
 }
 
+/** Big-endian u32 at an offset the caller has already bounds-checked. */
+function readU32Unchecked(data: Buffer, offset: number): number {
+	return (
+		data[offset] * 0x1000000 +
+		((data[offset + 1] << 16) | (data[offset + 2] << 8) | data[offset + 3])
+	);
+}
+
+/**
+ * Decode a BigSize into two unsigned 32-bit halves without allocating a
+ * BigInt: value = out.hi * 2^32 + out.lo. Same bounds checks and error
+ * messages as decodeBigSize (a non-canonical value is always below 2^32, so
+ * it prints the same digits), for hot loops such as the Rapid Gossip Sync
+ * import, where a BigInt per field dominated the cost.
+ * @param data - Buffer to read from
+ * @param offset - Starting offset in the buffer
+ * @param out - Receives the decoded halves
+ * @returns Number of bytes consumed
+ */
+export function readBigSizeParts(
+	data: Buffer,
+	offset: number,
+	out: { hi: number; lo: number }
+): number {
+	if (offset >= data.length) {
+		throw new Error('BigSize: unexpected end of data');
+	}
+
+	const first = data[offset];
+
+	if (first < 0xfd) {
+		out.hi = 0;
+		out.lo = first;
+		return 1;
+	}
+
+	if (first === 0xfd) {
+		if (offset + 3 > data.length) {
+			throw new Error('BigSize: unexpected end of data for 2-byte value');
+		}
+		const value = (data[offset + 1] << 8) | data[offset + 2];
+		if (value < 0xfd) {
+			throw new Error(`BigSize: non-canonical encoding for value ${value}`);
+		}
+		out.hi = 0;
+		out.lo = value;
+		return 3;
+	}
+
+	if (first === 0xfe) {
+		if (offset + 5 > data.length) {
+			throw new Error('BigSize: unexpected end of data for 4-byte value');
+		}
+		const value = readU32Unchecked(data, offset + 1);
+		if (value < 0x10000) {
+			throw new Error(`BigSize: non-canonical encoding for value ${value}`);
+		}
+		out.hi = 0;
+		out.lo = value;
+		return 5;
+	}
+
+	// first === 0xff
+	if (offset + 9 > data.length) {
+		throw new Error('BigSize: unexpected end of data for 8-byte value');
+	}
+	const hi = readU32Unchecked(data, offset + 1);
+	const lo = readU32Unchecked(data, offset + 5);
+	// Below 2^32 exactly when the high half is zero, and then lo is the value.
+	if (hi === 0) {
+		throw new Error(`BigSize: non-canonical encoding for value ${lo}`);
+	}
+	out.hi = hi;
+	out.lo = lo;
+	return 9;
+}
+
 /**
  * Encode a Lightning message with the standard framing format.
  * Format: [2-byte type (BE)][payload]

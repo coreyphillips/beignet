@@ -993,6 +993,18 @@ re-encode byte-identically to the signed wire payload, or
 `{ verified: 'deferred' }` for signed-but-unchecked ones. Rapid Gossip Sync
 entries are always unverified because RGS strips signatures.
 
+A full mainnet RGS snapshot (about 28k channels and twice as many updates)
+holds the event loop for hundreds of milliseconds when applied in one pass
+(`applyRapidGossipSnapshot`, `node.loadRapidGossipSnapshot`), and for seconds
+on a phone. `applyRapidGossipSnapshotAsync(graph, data, { sliceMs, cancelled,
+onSlice })` applies the same snapshot in time slices, yielding to the event
+loop between them, and leaves exactly the same graph; it rejects with
+`RapidGossipCancelledError` once `cancelled()` returns true.
+`node.loadRapidGossipSnapshotAsync` (what `BeignetNode.syncRapidGossip` uses)
+runs one import at a time in slices of `LightningNode.RAPID_GOSSIP_SLICE_MS`,
+holds the broadcast gossip intake and any stale-gossip prune until it ends,
+and stops when the node is destroyed.
+
 Gossip provenance has three states: verified (`*Verified: true`, servable),
 unverified (`*Verified: false`, failed verification or signatureless, never
 served and never re-checked) and deferred (`*VerifyDeferred: true` with the

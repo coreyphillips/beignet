@@ -114,6 +114,7 @@ import { findPayAllRoute, IPayAllRouteResult } from '../gossip/pay-all';
 import { IPayAllBudget, IPayAllQuote } from './types';
 import {
 	applyRapidGossipSnapshot,
+	applyRapidGossipSnapshotAsync,
 	IRapidGossipResult
 } from '../gossip/rapid-sync';
 import { MissionControl } from '../gossip/mission-control';
@@ -1122,6 +1123,27 @@ export class LightningNode extends EventEmitter {
 	private gossipIntakeDropped = 0;
 	private static readonly GOSSIP_INTAKE_MAX = 30_000;
 	private static readonly GOSSIP_INTAKE_SLICE_MS = 10;
+	/**
+	 * Time slice of a cooperative Rapid Gossip Sync import
+	 * (loadRapidGossipSnapshotAsync), in milliseconds. A mainnet snapshot
+	 * applied in one pass held a phone's JS thread for seconds after launch;
+	 * in slices this size, input and I/O are served between them. Static and
+	 * mutable so tests can pin it (the NetworkGraph.MAX_CHANNELS pattern).
+	 */
+	static RAPID_GOSSIP_SLICE_MS = 8;
+	/**
+	 * True while loadRapidGossipSnapshotAsync applies a snapshot. The import
+	 * adds every channel before any update, so the stale-gossip prune (which
+	 * drops channels without updates) is deferred to its end rather than
+	 * wiping the snapshot mid-way, and the broadcast gossip intake holds so
+	 * queued gossip lands after the snapshot, as it did when the import was
+	 * one synchronous block.
+	 */
+	private rapidGossipImporting = false;
+	/** Imports run one at a time: each chains on the previous one's settle. */
+	private rapidGossipImportTail: Promise<unknown> = Promise.resolve();
+	/** A prune was asked for during an import; it runs when the import ends. */
+	private gossipPruneDeferred = false;
 	/**
 	 * SCIDs of verified graph channels whose funding output is still to be
 	 * checked on chain, oldest first (issue #1105). Only filled when the chain
@@ -8954,9 +8976,61 @@ export class LightningNode extends EventEmitter {
 	 * Apply a Rapid Gossip Sync snapshot to the network graph. This populates the
 	 * graph for multi-hop pathfinding without crawling p2p gossip. The snapshot's
 	 * chain hash must match this node's network (RGS snapshots are mainnet).
+	 * Blocks the event loop for the whole snapshot: hundreds of milliseconds
+	 * for a mainnet one on a server, seconds on a phone. Prefer
+	 * loadRapidGossipSnapshotAsync, which leaves the same graph.
 	 */
 	loadRapidGossipSnapshot(data: Buffer): IRapidGossipResult {
 		return applyRapidGossipSnapshot(this.graph, data);
+	}
+
+	/**
+	 * loadRapidGossipSnapshot applied cooperatively, in slices of
+	 * RAPID_GOSSIP_SLICE_MS with the event loop served between them; the
+	 * resulting graph and counts are the same. Imports run one at a time,
+	 * each after the previous one settles. While one runs, the broadcast
+	 * gossip intake holds and a stale-gossip prune waits for its end (see
+	 * rapidGossipImporting). Rejects with RapidGossipCancelledError once the
+	 * node is destroyed or `opts.cancelled` returns true; what was applied by
+	 * then stays in the graph.
+	 */
+	loadRapidGossipSnapshotAsync(
+		data: Buffer,
+		opts: { cancelled?: () => boolean; onSlice?: (ms: number) => void } = {}
+	): Promise<IRapidGossipResult> {
+		const run = this.rapidGossipImportTail.then(() =>
+			this.runRapidGossipImport(data, opts)
+		);
+		this.rapidGossipImportTail = run.catch(() => undefined);
+		return run;
+	}
+
+	private async runRapidGossipImport(
+		data: Buffer,
+		opts: { cancelled?: () => boolean; onSlice?: (ms: number) => void }
+	): Promise<IRapidGossipResult> {
+		this.rapidGossipImporting = true;
+		try {
+			return await applyRapidGossipSnapshotAsync(this.graph, data, {
+				sliceMs: LightningNode.RAPID_GOSSIP_SLICE_MS,
+				cancelled: () => this._destroyed || opts.cancelled?.() === true,
+				onSlice: opts.onSlice
+			});
+		} finally {
+			this.rapidGossipImporting = false;
+			if (this.gossipPruneDeferred && !this._destroyed) {
+				this.gossipPruneDeferred = false;
+				// The import's outcome is settled; a failing prune must not
+				// turn it into a failure.
+				try {
+					this.pruneStaleGossipWithStorage();
+				} catch (err) {
+					this.emitStructuredLog('peer', 'gossip_prune_failed', {
+						error: err instanceof Error ? err.message : String(err)
+					});
+				}
+			}
+		}
 	}
 
 	getChannelManager(): ChannelManager {
@@ -15951,6 +16025,14 @@ export class LightningNode extends EventEmitter {
 	 * how much an overflow episode dropped (if any) and closes it.
 	 */
 	private drainGossipIntake(): void {
+		// Held while a cooperative RGS import runs, so queued gossip lands
+		// after the snapshot. gossipIntakeDraining stays set meanwhile, so
+		// flushGossip keeps waiting and no second drain is scheduled; once
+		// destroyed, the next check falls through to the reset below.
+		if (this.rapidGossipImporting && !this._destroyed) {
+			setTimeout(() => this.drainGossipIntake(), 25);
+			return;
+		}
 		const sliceStart = Date.now();
 		while (
 			this.gossipIntakeHead < this.gossipIntake.length &&
@@ -31963,6 +32045,13 @@ export class LightningNode extends EventEmitter {
 	 * Prune stale gossip channels from both in-memory graph and storage.
 	 */
 	private pruneStaleGossipWithStorage(): void {
+		// An RGS import adds every channel before any update, so pruning
+		// mid-import would drop the snapshot's channels as update-less. The
+		// import runs this when it ends instead.
+		if (this.rapidGossipImporting) {
+			this.gossipPruneDeferred = true;
+			return;
+		}
 		const now = Math.floor(Date.now() / 1000);
 
 		// A process suspended beyond the gossip age limit can run its prune

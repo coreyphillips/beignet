@@ -1,5 +1,13 @@
 /**
- * BOLT 7: Network graph — in-memory store of channel and node information.
+ * BOLT 7: Network graph, the in-memory store of channel and node information.
+ *
+ * Invariant: graph buffers (SCIDs, node ids, features, and every field of a
+ * stored message) are never written in place, by the graph or by anything
+ * that reads from it. Code that needs different bytes builds a new buffer,
+ * and `.copy()` only ever copies out of a graph buffer. Rapid Gossip Sync
+ * relies on this: it stores one buffer per node, shared by the node entry
+ * and every channel and announcement naming it, one SCID buffer shared by a
+ * channel and its announcement, and one empty features buffer for all.
  */
 
 import { BITCOIN_CHAIN_HASH } from '../channel/types';
@@ -148,8 +156,8 @@ export class NetworkGraph {
 	private _serveVerifySpentMs = 0;
 	private _nodes: Map<string, IGraphNode> = new Map();
 	// BOLT 7: announcements are chain-scoped. The graph accepts only its own
-	// chain — previously hardcoded to mainnet, which silently discarded every
-	// announcement on regtest/testnet/signet (S-7.M1).
+	// chain; it was previously hardcoded to mainnet, which silently discarded
+	// every announcement on regtest/testnet/signet (S-7.M1).
 	private readonly _chainHash: Buffer;
 	// Eager mode (relay-class nodes): foreign gossip is verified at intake and
 	// restore, and RGS-primed signatureless entries are re-requested from
@@ -362,7 +370,8 @@ export class NetworkGraph {
 		// entry with unproven funding is evictable too, or signed fabrications
 		// would lock real channels out (issue #1105). Node-eviction reports
 		// wait until the incoming channel is inserted (the victim may share an
-		// endpoint).
+		// endpoint). addRapidGossipChannel mirrors the unverified half of these
+		// rules; keep the two together.
 		if (this._channels.size >= NetworkGraph.MAX_CHANNELS) {
 			if (verified !== true) return false;
 			this._deferredNodeEvictions = [];
@@ -372,13 +381,68 @@ export class NetworkGraph {
 			}
 		}
 
-		// Create the channel entry
+		this._admitChannel(
+			msg,
+			verified,
+			{
+				scidHex,
+				node1Hex: msg.nodeId1.toString('hex'),
+				node2Hex: msg.nodeId2.toString('hex')
+			},
+			true
+		);
+		return true;
+	}
+
+	/**
+	 * Admit one channel from a Rapid Gossip Sync snapshot; only the RGS
+	 * importer calls this. The rules are addChannelAnnouncement's for an
+	 * unverified announcement (RGS strips signatures): our chain only,
+	 * ordered node ids, an SCID already held is refused (an unverified entry
+	 * never upgrades anything), and at the ceiling the entry is refused
+	 * rather than evicting. The importer builds the message's buffers for
+	 * the graph alone and shares one buffer per node across its channels, so
+	 * they are stored without copies (graph buffers are never written in
+	 * place), and it passes the hex keys it already derived.
+	 *
+	 * @internal
+	 */
+	addRapidGossipChannel(
+		msg: IChannelAnnouncementMessage,
+		keys: { scidHex: string; node1Hex: string; node2Hex: string }
+	): boolean {
+		if (!msg.chainHash.equals(this._chainHash)) return false;
+		if (Buffer.compare(msg.nodeId1, msg.nodeId2) >= 0) return false;
+		if (this._channels.has(keys.scidHex)) return false;
+		if (this._channels.size >= NetworkGraph.MAX_CHANNELS) return false;
+		this._admitChannel(msg, false, keys, false);
+		return true;
+	}
+
+	/**
+	 * Insert a new channel and link it to its endpoint nodes, creating them
+	 * as needed: the shared tail of addChannelAnnouncement and
+	 * addRapidGossipChannel, so both admission paths build the same entry
+	 * (rows are serialized as built, so the property order matters too). The
+	 * caller has passed every admission check and made room at the ceiling.
+	 * With copy false the message's buffers are stored as they are; that is
+	 * only safe because graph buffers are never written in place.
+	 */
+	private _admitChannel(
+		msg: IChannelAnnouncementMessage,
+		verified: TGossipVerified,
+		keys: { scidHex: string; node1Hex: string; node2Hex: string },
+		copy: boolean
+	): void {
+		const { scidHex, node1Hex, node2Hex } = keys;
 		const pair = provenancePair(verified);
 		const channel: IGraphChannel = {
-			shortChannelId: Buffer.from(msg.shortChannelId),
-			nodeId1: Buffer.from(msg.nodeId1),
-			nodeId2: Buffer.from(msg.nodeId2),
-			features: Buffer.from(msg.features),
+			shortChannelId: copy
+				? Buffer.from(msg.shortChannelId)
+				: msg.shortChannelId,
+			nodeId1: copy ? Buffer.from(msg.nodeId1) : msg.nodeId1,
+			nodeId2: copy ? Buffer.from(msg.nodeId2) : msg.nodeId2,
+			features: copy ? Buffer.from(msg.features) : msg.features,
 			announcement: msg,
 			announcementVerified: pair.verified,
 			announcementVerifyDeferred: pair.deferred
@@ -387,27 +451,27 @@ export class NetworkGraph {
 		this._syncUnverifiedIndex(scidHex, channel);
 
 		// Ensure node entries exist and link channel
-		const node1Hex = msg.nodeId1.toString('hex');
-		const node2Hex = msg.nodeId2.toString('hex');
-
-		if (!this._nodes.has(node1Hex)) {
-			this._nodes.set(node1Hex, {
-				nodeId: Buffer.from(msg.nodeId1),
+		let node1 = this._nodes.get(node1Hex);
+		if (!node1) {
+			node1 = {
+				nodeId: copy ? Buffer.from(msg.nodeId1) : msg.nodeId1,
 				channels: new Set()
-			});
+			};
+			this._nodes.set(node1Hex, node1);
 		}
-		this._nodes.get(node1Hex)!.channels.add(scidHex);
+		node1.channels.add(scidHex);
 
-		if (!this._nodes.has(node2Hex)) {
-			this._nodes.set(node2Hex, {
-				nodeId: Buffer.from(msg.nodeId2),
+		let node2 = this._nodes.get(node2Hex);
+		if (!node2) {
+			node2 = {
+				nodeId: copy ? Buffer.from(msg.nodeId2) : msg.nodeId2,
 				channels: new Set()
-			});
+			};
+			this._nodes.set(node2Hex, node2);
 		}
-		this._nodes.get(node2Hex)!.channels.add(scidHex);
+		node2.channels.add(scidHex);
 
 		this._flushDeferredNodeEvictions();
-		return true;
 	}
 
 	/**
@@ -422,13 +486,40 @@ export class NetworkGraph {
 		msg: IChannelUpdateMessage,
 		opts: { verified?: TGossipVerified } = {}
 	): boolean {
+		return this._applyChannelUpdate(
+			msg,
+			msg.shortChannelId.toString('hex'),
+			opts.verified
+		);
+	}
+
+	/**
+	 * Apply one channel_update from a Rapid Gossip Sync snapshot; only the
+	 * RGS importer calls this. Exactly applyChannelUpdate for an unverified
+	 * update, keyed by the SCID hex the importer already derived.
+	 *
+	 * @internal
+	 */
+	applyRapidGossipUpdate(msg: IChannelUpdateMessage, scidHex: string): boolean {
+		return this._applyChannelUpdate(msg, scidHex, false);
+	}
+
+	/**
+	 * The acceptance rule and slot write shared by applyChannelUpdate and
+	 * applyRapidGossipUpdate, so the two cannot drift. `claimed` is the
+	 * caller's provenance claim, normalized here.
+	 */
+	private _applyChannelUpdate(
+		msg: IChannelUpdateMessage,
+		scidHex: string,
+		claimed: TGossipVerified | undefined
+	): boolean {
 		// BOLT 7: ignore timestamps unreasonably far in the future, whatever
 		// the provenance; admitted, one would camp its slot against the
 		// strictly-newer rule below and never go stale (issue #446).
 		if (gossipTimestampTooFarFuture(msg.timestamp)) {
 			return false;
 		}
-		const scidHex = msg.shortChannelId.toString('hex');
 		const channel = this._channels.get(scidHex);
 		if (!channel) {
 			return false;
@@ -438,7 +529,7 @@ export class NetworkGraph {
 		const existing = direction === 0 ? channel.update1 : channel.update2;
 		const existingVerified =
 			direction === 0 ? channel.update1Verified : channel.update2Verified;
-		const verified = normalizeVerified(opts.verified, msg.signature);
+		const verified = normalizeVerified(claimed, msg.signature);
 
 		// Reject if not strictly newer, unless a verified update is taking over
 		// an unverified slot: RGS stamps synthetic updates with the snapshot's

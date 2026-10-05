@@ -90,7 +90,8 @@ import {
 import * as bip39 from 'bip39';
 import {
 	fetchRapidGossipSnapshot,
-	DEFAULT_RGS_URL
+	DEFAULT_RGS_URL,
+	RapidGossipCancelledError
 } from '../lightning/gossip/rapid-sync';
 import { parseAnnouncedAddress } from '../lightning/gossip/messages';
 import {
@@ -2132,6 +2133,15 @@ export class BeignetNode extends EventEmitter {
 	 */
 	private _releaseBootRgs: (() => void) | null = null;
 	/**
+	 * The Rapid Gossip Sync in flight, download and import together, so a
+	 * second syncRapidGossip call (POST /gossip/sync-rapid during boot) joins
+	 * it instead of applying the same graph twice. Null when none runs.
+	 */
+	private _rapidGossipSync: Promise<{
+		channelsAdded: number;
+		updatesApplied: number;
+	} | null> | null = null;
+	/**
 	 * Pubkeys with a deferred gossip sync already queued on the latch. A
 	 * connect/disconnect/reconnect churn during the RGS window must produce
 	 * one sync per peer, not one per connect: a duplicate initiateGossipSync
@@ -3840,12 +3850,18 @@ export class BeignetNode extends EventEmitter {
 
 		// Default graph source: download the full network graph via Rapid Gossip
 		// Sync (mainnet). Runs in the background so it never blocks startup; the
-		// graph fills in within a few seconds, enabling multi-hop routing.
+		// graph fills in within a few seconds, enabling multi-hop routing, and
+		// is applied in slices that leave the event loop free in between.
 		// Connect-time p2p gossip sync defers behind the latch (installed
 		// earlier, before the node existed) until this first attempt settles,
-		// success or not (issue #441).
+		// download and import both, success or not (issue #441).
 		if (this.rapidGossipSync && this.networkName === 'mainnet') {
 			const rgs = this.syncRapidGossip().catch((err) => {
+				// A shutdown during boot cancels the sync; that is no failure.
+				if (err instanceof RapidGossipCancelledError && this.destroyed) {
+					this.log('debug', 'Rapid gossip sync cancelled by shutdown', {});
+					return;
+				}
 				this.log('warn', 'Rapid gossip sync failed', {
 					error: err instanceof Error ? err.message : String(err)
 				});
@@ -7776,8 +7792,26 @@ export class BeignetNode extends EventEmitter {
 	 * Download and apply a Rapid Gossip Sync snapshot, populating the network
 	 * graph for multi-hop routing (a few MB over HTTPS). RGS snapshots are
 	 * mainnet-only; on other networks this is a no-op. Returns ingestion counts.
+	 * Single-flight: a call while a sync is in flight (the boot sync, say)
+	 * joins it instead of downloading and applying the graph again. The
+	 * snapshot is applied cooperatively, so the event loop keeps turning
+	 * while it lands.
 	 */
-	async syncRapidGossip(): Promise<{
+	syncRapidGossip(): Promise<{
+		channelsAdded: number;
+		updatesApplied: number;
+	} | null> {
+		if (this._rapidGossipSync) return this._rapidGossipSync;
+		const run = this.runRapidGossipSync();
+		this._rapidGossipSync = run;
+		const clear = (): void => {
+			if (this._rapidGossipSync === run) this._rapidGossipSync = null;
+		};
+		void run.then(clear, clear);
+		return run;
+	}
+
+	private async runRapidGossipSync(): Promise<{
 		channelsAdded: number;
 		updatesApplied: number;
 	} | null> {
@@ -7787,17 +7821,41 @@ export class BeignetNode extends EventEmitter {
 		}
 		const url = this.rapidGossipSyncUrl ?? DEFAULT_RGS_URL;
 		this.log('info', 'Rapid gossip sync: downloading snapshot', { url });
+		const downloadStart = Date.now();
 		const data = await fetchRapidGossipSnapshot(url);
-		const result = this.node.loadRapidGossipSnapshot(data);
+		const downloadMs = Date.now() - downloadStart;
+		// Shut down mid-download: applying the graph would only hold up teardown.
+		if (this.destroyed) throw new RapidGossipCancelledError();
+		let slices = 0;
+		let busyMs = 0;
+		const applyStart = Date.now();
+		const result = await this.node.loadRapidGossipSnapshotAsync(data, {
+			cancelled: () => this.destroyed,
+			onSlice: (ms) => {
+				slices++;
+				busyMs += ms;
+			}
+		});
+		const applyMs = Date.now() - applyStart;
 		this._lastGraphSyncAt = Date.now();
 		this.log('info', 'Rapid gossip sync complete', {
 			channelsAdded: result.channelsAdded,
 			updatesApplied: result.updatesApplied,
-			nodes: result.nodeCount
+			nodes: result.nodeCount,
+			downloadMs,
+			applyMs,
+			busyMs,
+			slices
 		});
+		// applyMs is wall time from start to finish; busyMs is the part spent
+		// applying, in `slices` turns of the event loop.
 		this.emit('gossip:synced', {
 			channelsAdded: result.channelsAdded,
-			updatesApplied: result.updatesApplied
+			updatesApplied: result.updatesApplied,
+			downloadMs,
+			applyMs,
+			busyMs,
+			slices
 		});
 		return {
 			channelsAdded: result.channelsAdded,
