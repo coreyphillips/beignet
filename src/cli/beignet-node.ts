@@ -109,7 +109,7 @@ import {
 } from '../lightning/invoice/types';
 import {
 	LnCoinType,
-	deriveLightningKeysFromMnemonic
+	deriveLightningKeysFromSeed
 } from '../lightning/keys/wallet-keys';
 import {
 	GuardianBootDecision,
@@ -2253,6 +2253,8 @@ export class BeignetNode extends EventEmitter {
 	/** A non-empty SCB went out to storage peers this run. */
 	private _pushedChannelBackup = false;
 	private _nodeSecret?: Buffer;
+	/** The mnemonic's BIP39 seed once derived; read through walletSeed(). */
+	private _walletSeed?: Buffer;
 	private _storageEncryptionKey?: Buffer;
 	/**
 	 * A Tier 2 capsule restore replaced the database underneath this daemon;
@@ -2534,7 +2536,7 @@ export class BeignetNode extends EventEmitter {
 		// without the mnemonic. Pre-existing plaintext rows migrate on open().
 		let encryptionKey: Buffer | undefined;
 		if (opts.storageEncryption ?? true) {
-			encryptionKey = deriveStorageKey(bip39.mnemonicToSeedSync(this.mnemonic));
+			encryptionKey = deriveStorageKey(this.walletSeed());
 		}
 
 		this._storageEncryptionKey = encryptionKey;
@@ -2642,6 +2644,7 @@ export class BeignetNode extends EventEmitter {
 		};
 		const walletResult = await Wallet.create({
 			mnemonic: this.mnemonic,
+			seed: this.walletSeed(),
 			network: beignetNetwork,
 			// BeignetNode owns the ONE startup refresh (init step 15) so
 			// waitForInitialSync can hold its promise; without this flag
@@ -2833,6 +2836,7 @@ export class BeignetNode extends EventEmitter {
 		this._nodeStorageView = nodeStorageView(this.storage);
 		this.node = LightningNode.fromMnemonic(this.mnemonic, {
 			coinType,
+			seed: this.walletSeed(),
 			network: lnNetwork,
 			storage: this._nodeStorageView,
 			// Issue #906: fence fresh indices during active auto-apply or a
@@ -6012,13 +6016,35 @@ export class BeignetNode extends EventEmitter {
 
 	private nodeSecret(): Buffer {
 		if (!this._nodeSecret) {
-			this._nodeSecret = deriveLightningKeysFromMnemonic(
-				this.mnemonic,
-				undefined,
+			// Keeps the refusal deriveLightningKeysFromMnemonic made here: a
+			// guardian boot asks for this secret before the wallet or the node
+			// has checked the mnemonic.
+			if (!bip39.validateMnemonic(this.mnemonic)) {
+				throw new Error('Invalid BIP39 mnemonic');
+			}
+			this._nodeSecret = deriveLightningKeysFromSeed(
+				this.walletSeed(),
 				this.toCoinType(this.networkName)
 			).nodePrivateKey;
 		}
 		return this._nodeSecret;
+	}
+
+	/**
+	 * The mnemonic's BIP39 seed (no passphrase), derived once: its PBKDF2
+	 * pass is the slow step behind every key this node derives, and a phone
+	 * runs it on the JS thread. No new secret and no longer lifetime: this
+	 * instance holds the mnemonic for its whole life and already memoizes
+	 * nodeSecret(), and the wallet keeps the same seed. Callers get a copy,
+	 * so none can alter the cache. Not zeroed on destroy(), which does not
+	 * wait for a backup in flight: that backup still derives its MAC key
+	 * from the seed.
+	 */
+	private walletSeed(): Buffer {
+		if (!this._walletSeed) {
+			this._walletSeed = bip39.mnemonicToSeedSync(this.mnemonic);
+		}
+		return Buffer.from(this._walletSeed);
 	}
 
 	/**
@@ -14395,10 +14421,7 @@ export class BeignetNode extends EventEmitter {
 	/** Back up the database to `destPath`, with its MAC in backupMacPath(destPath). */
 	async backup(destPath: string): Promise<void> {
 		await this.storage.backup(destPath);
-		await writeBackupMac(
-			deriveBackupMacKey(bip39.mnemonicToSeedSync(this.mnemonic)),
-			destPath
-		);
+		await writeBackupMac(deriveBackupMacKey(this.walletSeed()), destPath);
 	}
 
 	/** The live database, its sidecars and the instance lock. */
@@ -14468,7 +14491,7 @@ export class BeignetNode extends EventEmitter {
 			createdAt: Date.now(),
 			channels: data.channels
 		};
-		const seed = bip39.mnemonicToSeedSync(this.mnemonic);
+		const seed = this.walletSeed();
 		const encoded = encodeScb(backup, seed);
 		const scbPath = path.join(this.dataDir, 'channels.scb');
 		// Atomic write: a crash mid-write must never leave a truncated backup.
@@ -14492,7 +14515,7 @@ export class BeignetNode extends EventEmitter {
 		skipped: Array<{ channelId: string; reason: string }>;
 		channelCount: number;
 	}> {
-		const seed = bip39.mnemonicToSeedSync(this.mnemonic);
+		const seed = this.walletSeed();
 		const backup = decodeScb(encoded.trim(), seed);
 		const expectedNetwork = this.toLnNetwork(this.networkName);
 		if (backup.network !== expectedNetwork) {
@@ -14690,7 +14713,7 @@ export class BeignetNode extends EventEmitter {
 			}
 			// Surface the Tier 1 material under the wallet seed, the key
 			// restoreFromScb (POST /restore/scb) decodes with.
-			const seed = bip39.mnemonicToSeedSync(this.mnemonic);
+			const seed = this.walletSeed();
 			this.offerRetrievedScb(
 				encodeScb(embedded, seed),
 				embedded,
@@ -14702,7 +14725,7 @@ export class BeignetNode extends EventEmitter {
 		let backup: IStaticChannelBackup;
 		const encoded = blob.toString('utf8');
 		try {
-			const seed = bip39.mnemonicToSeedSync(this.mnemonic);
+			const seed = this.walletSeed();
 			backup = decodeScb(encoded, seed);
 		} catch {
 			this.log('debug', 'Ignoring peer storage blob that is not our SCB', {

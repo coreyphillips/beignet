@@ -1,10 +1,16 @@
 import { expect } from 'chai';
+import sinon from 'sinon';
+import * as bip39 from 'bip39';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as http from 'http';
 import * as net from 'net';
 import { BeignetError, describeFailureCode } from '../../src/cli/errors';
+import {
+	deriveLightningKeysFromMnemonic,
+	LnCoinType
+} from '../../src/lightning/keys/wallet-keys';
 import {
 	loadConfig,
 	saveConfig,
@@ -537,6 +543,62 @@ describe('BeignetNode', () => {
 			expect(sweepScript!.equals(scriptOf(change0))).to.equal(true);
 			expect(sweepScript!.equals(scriptOf(receive0))).to.equal(false);
 		} finally {
+			await node?.destroy();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it('derives the BIP39 seed once, and every later key site reuses it', async function () {
+		this.timeout(20_000);
+		// The seed's PBKDF2 pass runs on a phone's JS thread, and boot used
+		// to pay it at each site: the storage key, the wallet, the node keys,
+		// the channel keys, the boot SCB export. A mnemonic no other test
+		// uses, so only this node's derivations are counted.
+		const mnemonic =
+			'legal winner thank year wave sausage worth useful legal winner thank yellow';
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-seed-once-'));
+		const pbkdf2 = sinon.spy(bip39, 'mnemonicToSeedSync');
+		const pbkdf2Async = sinon.spy(bip39, 'mnemonicToSeed');
+		const ofThisWallet = (calls: Array<{ args: unknown[] }>): number =>
+			calls.filter((call) => call.args[0] === mnemonic).length;
+		const derivations = (): number =>
+			ofThisWallet(pbkdf2.getCalls()) + ofThisWallet(pbkdf2Async.getCalls());
+		let node: BeignetNode | undefined;
+		try {
+			node = await BeignetNode.create({
+				mnemonic,
+				network: 'regtest',
+				logLevel: 'silent',
+				dataDir: dir,
+				rapidGossipSync: false,
+				autoGossipSync: false,
+				...OFFLINE_ELECTRUM
+			});
+			expect(derivations(), 'derivations during create').to.equal(1);
+
+			// The sites after boot: the SCB export and restore, the database
+			// backup's MAC key, and the node secret the recovery paths use.
+			const scb = node.exportStaticChannelBackup();
+			await node.restoreFromScb(scb.encoded);
+			await node.backup(path.join(dir, 'backup.db'));
+			const nodeSecret = (
+				node as unknown as { nodeSecret(): Buffer }
+			).nodeSecret();
+			expect(derivations(), 'derivations after the later sites').to.equal(1);
+
+			// That one seed gives the keys the mnemonic always gave.
+			const keys = deriveLightningKeysFromMnemonic(
+				mnemonic,
+				undefined,
+				LnCoinType.REGTEST
+			);
+			expect(node.getNode().getNodeId()).to.equal(
+				keys.nodePublicKey.toString('hex')
+			);
+			expect(nodeSecret.equals(keys.nodePrivateKey)).to.equal(true);
+		} finally {
+			pbkdf2.restore();
+			pbkdf2Async.restore();
 			await node?.destroy();
 			fs.rmSync(dir, { recursive: true, force: true });
 		}

@@ -236,6 +236,11 @@ export interface IWallet {
 	id?: string;
 	name?: string;
 	passphrase?: string;
+	// The BIP39 seed of mnemonic + passphrase, for a host that already holds
+	// it (BeignetNode derives it once per boot): the constructor then skips
+	// its PBKDF2 pass. It is not checked against the mnemonic, so it must be
+	// that mnemonic's seed. Ignored without a mnemonic.
+	seed?: Buffer;
 	network?: EAvailableNetworks;
 	addressType?: EAddressType;
 	// BIP32 account index (m/purpose'/coin'/ACCOUNT'/change/index). Defaults
@@ -561,7 +566,7 @@ export interface ISend {
 // passphrase and key-dependent options do not apply.
 export type IWatchOnlyWallet = Omit<
 	IWallet,
-	'mnemonic' | 'passphrase' | 'xpub'
+	'mnemonic' | 'passphrase' | 'seed' | 'xpub'
 > & {
 	xpub: string;
 };
