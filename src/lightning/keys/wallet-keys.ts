@@ -68,9 +68,10 @@ export function deriveLightningKeys(
 	coinType: number = LnCoinType.BITCOIN
 ): ILightningKeysFromSeed {
 	const basePath = `m/${LN_PURPOSE}'/${coinType}'/0'`;
+	const base = root.derivePath(basePath);
 
 	const deriveKey = (index: number): Buffer => {
-		const child = root.derivePath(`${basePath}/${index}`);
+		const child = base.derive(index);
 		if (!child.privateKey) {
 			throw new Error(`Failed to derive private key at ${basePath}/${index}`);
 		}
@@ -147,9 +148,14 @@ export function deriveChannelKeys(
 	channelIndex = 0
 ): IChannelKeys {
 	const basePath = `m/${LN_PURPOSE}'/${coinType}'/${channelIndex}'`;
+	// The hardened levels once, then each key from them. Deriving every key
+	// from the root walked those levels again, computing each one's public
+	// key for its fingerprint: about three point multiplications a key, and
+	// on a phone, where they run in JavaScript, most of the time it took.
+	const base = root.derivePath(basePath);
 
 	const deriveKey = (index: number): Buffer => {
-		const child = root.derivePath(`${basePath}/${index}`);
+		const child = base.derive(index);
 		if (!child.privateKey) {
 			throw new Error(`Failed to derive private key at ${basePath}/${index}`);
 		}
@@ -180,6 +186,31 @@ export function deriveChannelKeys(
 		htlcBasepointSecret,
 		perCommitmentSeed,
 		channelBasepoints
+	};
+}
+
+/**
+ * A copy of `keys` that shares no buffer with it, for handing out keys that
+ * are kept: whoever is handed them may change their bytes.
+ */
+export function copyChannelKeys(keys: IChannelKeys): IChannelKeys {
+	const copy = (bytes: Buffer): Buffer => Buffer.from(bytes);
+	const points = keys.channelBasepoints;
+	return {
+		fundingPrivkey: copy(keys.fundingPrivkey),
+		revocationBasepointSecret: copy(keys.revocationBasepointSecret),
+		paymentBasepointSecret: copy(keys.paymentBasepointSecret),
+		delayedPaymentBasepointSecret: copy(keys.delayedPaymentBasepointSecret),
+		htlcBasepointSecret: copy(keys.htlcBasepointSecret),
+		perCommitmentSeed: copy(keys.perCommitmentSeed),
+		channelBasepoints: {
+			fundingPubkey: copy(points.fundingPubkey),
+			revocationBasepoint: copy(points.revocationBasepoint),
+			paymentBasepoint: copy(points.paymentBasepoint),
+			delayedPaymentBasepoint: copy(points.delayedPaymentBasepoint),
+			htlcBasepoint: copy(points.htlcBasepoint),
+			firstPerCommitmentPoint: copy(points.firstPerCommitmentPoint)
+		}
 	};
 }
 
