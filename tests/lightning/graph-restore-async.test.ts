@@ -626,6 +626,32 @@ describe('Cooperative restore of the stored network map', () => {
 		expect(applied.sort()).to.deep.equal([base, base + 9].sort());
 	});
 
+	it('does not hold an update for our channel that is dated far in the future', async () => {
+		const store = buildStore(120);
+		LightningNode.GRAPH_RESTORE_SLICE_MS = 0;
+		const { node } = open(store.dbPath, true);
+		const inner = node as unknown as {
+			handleGossipMessage(p: string, t: number, b: Buffer): void;
+			channelUpdateTargetsOurChannel(): boolean;
+			maybeAdoptPeerChannelPolicy(): void;
+			ownUpdatesWaiting: Map<string, { timestamp: number }>;
+		};
+		inner.channelUpdateTargetsOurChannel = (): boolean => true;
+		inner.maybeAdoptPeerChannelPolicy = (): void => undefined;
+		const real = NOW() - 10;
+		for (const timestamp of [real, NOW() + 10 * 86_400]) {
+			inner.handleGossipMessage(
+				'aa'.repeat(33),
+				MessageType.CHANNEL_UPDATE,
+				encodeChannelUpdateMessage(update(scidOf(110), 0, timestamp))
+			);
+		}
+		expect(
+			[...inner.ownUpdatesWaiting.values()].map((u) => u.timestamp)
+		).to.deep.equal([real]);
+		await node.whenGraphRestored();
+	});
+
 	it('settles even when a listener of its report throws', async () => {
 		const store = buildStore(60);
 		LightningNode.GRAPH_RESTORE_SLICE_MS = 0;
