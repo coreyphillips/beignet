@@ -13726,7 +13726,7 @@ export class BeignetNode extends EventEmitter {
 	 * (deferGraphRestore) is still running.
 	 */
 	isGraphRestoring(): boolean {
-		return this.node?.isGraphRestoring() ?? false;
+		return this.node?.isGraphRestoring?.() ?? false;
 	}
 
 	/**
@@ -13735,7 +13735,7 @@ export class BeignetNode extends EventEmitter {
 	 * failure or the node's destruction cut it short. It never rejects.
 	 */
 	whenGraphRestored(): Promise<boolean> {
-		return this.node?.whenGraphRestored() ?? Promise.resolve(true);
+		return this.node?.whenGraphRestored?.() ?? Promise.resolve(true);
 	}
 
 	/**
@@ -13761,7 +13761,7 @@ export class BeignetNode extends EventEmitter {
 		if (this._lastGraphSyncAt !== undefined) {
 			info.lastSyncAt = this._lastGraphSyncAt;
 		}
-		if (this.node.isGraphRestoring()) info.restoring = true;
+		if (this.isGraphRestoring()) info.restoring = true;
 		return info;
 	}
 
