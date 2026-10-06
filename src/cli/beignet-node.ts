@@ -185,6 +185,7 @@ import {
 	IHoldCancelledEvent,
 	IHoldInvoiceStateEvent,
 	IStructuredLog,
+	IGraphRestoreStats,
 	IRebalanceExecutionSummary,
 	IRebalanceResult,
 	PaymentDirection,
@@ -2233,6 +2234,8 @@ export class BeignetNode extends EventEmitter {
 	private peerStorageEnabled = true;
 	/** Epoch ms of the last gossip/RGS sync completed this session. */
 	private _lastGraphSyncAt?: number;
+	/** How long building the last LightningNode took (getGraphRestoreStats). */
+	private _nodeConstructMs?: number;
 	/** Newest VALID SCB a peer returned via peer storage (never auto-restored). */
 	private _peerRetrievedScb: {
 		encoded: string;
@@ -2844,6 +2847,7 @@ export class BeignetNode extends EventEmitter {
 		// node comes through here, so each gets a fresh view of the database
 		// it runs on.
 		this._nodeStorageView = nodeStorageView(this.storage);
+		const constructStarted = Date.now();
 		this.node = LightningNode.fromMnemonic(this.mnemonic, {
 			coinType,
 			seed: this.walletSeed(),
@@ -3097,6 +3101,7 @@ export class BeignetNode extends EventEmitter {
 			watchtowers: opts.watchtowers,
 			recovery: this.recoveryNodeConfig
 		});
+		this._nodeConstructMs = Date.now() - constructStarted;
 
 		this.fforReceiveService = new FforReceiveService(
 			this,
@@ -13683,6 +13688,20 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	// ─────────────── Graph Queries ───────────────
+
+	/**
+	 * How the stored network map came back as the node was built, with how
+	 * long building the node took in all (`constructMs`), or null before
+	 * there is a node or for one without storage. A phone's boot report reads
+	 * it as soon as create() returns.
+	 */
+	getGraphRestoreStats(): IGraphRestoreStats | null {
+		const stats = this.node?.getGraphRestoreStats() ?? null;
+		if (!stats) return null;
+		return this._nodeConstructMs === undefined
+			? stats
+			: { ...stats, constructMs: this._nodeConstructMs };
+	}
 
 	getGraphInfo(): GraphInfo {
 		const graph = this.node.getGraph();
