@@ -41,6 +41,7 @@ export {
 	ChannelFundingUnavailableCode,
 	IChannelHealth,
 	IStructuredLog,
+	IGraphRestoreStats,
 	IPaymentProof,
 	IKeysendOptions
 } from '../lightning/node/types';

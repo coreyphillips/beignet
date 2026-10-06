@@ -5,8 +5,9 @@
  * store the size of a phone's after a few weeks on mainnet. Each run builds a
  * fresh node on the same database; the median run is reported. Usage:
  *   npx ts-node scripts/bench-graph-restore.ts [runs]
- * BENCH_CHANNELS and BENCH_NODES set the store's size (default 14700 and
- * 12700); BENCH_DB keeps the store in that file and reuses it when it exists.
+ * BENCH_CHANNELS and BENCH_NODES set the store's size (default 20300 and
+ * 8000, a phone's on 2026-10-06; a node no channel reaches is left out);
+ * BENCH_DB keeps the store in that file and reuses it when it exists.
  * Run node with --expose-gc to collect between runs, and with --jitless for a
  * rough stand-in for Hermes, which has no JIT either. A phone is slower again:
  * its Buffer is a JavaScript polyfill that decodes hex a byte at a time.
@@ -121,6 +122,9 @@ function buildStore(dbPath: string, channels: number, nodes: number): void {
 			linked[two].add(scidHex);
 		}
 		nodeIds.forEach((nodeId, i) => {
+			// A node no channel reaches is an orphan the first restore deletes,
+			// which would shrink the store after the warm-up run.
+			if (linked[i].size === 0) return;
 			const node: IGraphNode = {
 				nodeId,
 				channels: linked[i],
@@ -184,8 +188,8 @@ const median = (xs: number[]): number => {
 
 const main = (): void => {
 	const runs = Number(process.argv[2] ?? 5);
-	const channels = Number(process.env.BENCH_CHANNELS ?? 14_700);
-	const nodes = Number(process.env.BENCH_NODES ?? 12_700);
+	const channels = Number(process.env.BENCH_CHANNELS ?? 20_300);
+	const nodes = Number(process.env.BENCH_NODES ?? 8_000);
 	const kept = process.env.BENCH_DB;
 	const dbPath =
 		kept ??

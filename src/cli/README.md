@@ -253,6 +253,7 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `getGraphInfo()` | `GraphInfo` | Node/channel counts + last gossip sync time this session |
+| `getGraphRestoreStats()` | `IGraphRestoreStats \| null` | How the stored network map came back as the node was built: rows read, stale and orphan rows, the graph left, the milliseconds of each step, and `constructMs`, the whole node build |
 | `getGraphNode(pubkey)` | `GraphNodeInfo \| null` | Node announcement info (alias, addresses, features) + its known channel SCIDs |
 | `getGraphChannel(scid)` | `GraphChannelInfo \| null` | Channel endpoints, capacity (from htlc_maximum_msat) and both directions' policies |
 | `describeGraph(limit?, offset?)` | `GraphDescribeResult` | Paged channel dump (limit defaults to 500, capped at 500) |

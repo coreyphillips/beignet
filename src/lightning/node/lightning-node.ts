@@ -3577,10 +3577,12 @@ export class LightningNode extends EventEmitter {
 		// node that stalls.
 		const staleRowDeletes: Array<() => void> = [];
 		// Each step is timed and counted for getGraphRestoreStats: on a phone
-		// this block is most of a cold start's longest hold on the JS thread.
+		// this block may be most of a cold start's longest hold on the JS
+		// thread.
 		const graphStarted = Date.now();
 		const channelRows = this.storage.loadAllGossipChannels();
 		const channelsLoaded = Date.now();
+		const channelRowCount = channelRows.length;
 		let staleChannels = 0;
 		for (const channel of channelRows) {
 			const ts1 =
@@ -3620,15 +3622,14 @@ export class LightningNode extends EventEmitter {
 		// capture, not in gossip_nodes.
 		const nodeRows = this.storage.loadAllGossipNodes();
 		const nodesLoaded = Date.now();
+		const nodeRowCount = nodeRows.length;
 		let orphanNodes = 0;
 		for (const node of nodeRows) {
 			if (!this.graph.getNode(node.nodeId)) {
 				const nodeIdHex = node.nodeId.toString('hex');
-				if (
-					!diskChannelEndpoints.has(nodeIdHex) &&
-					typeof this.storage.deleteGossipNode === 'function'
-				) {
-					orphanNodes++;
+				if (diskChannelEndpoints.has(nodeIdHex)) continue;
+				orphanNodes++;
+				if (typeof this.storage.deleteGossipNode === 'function') {
 					staleRowDeletes.push(() =>
 						this.storage!.deleteGossipNode!(nodeIdHex)
 					);
@@ -3664,9 +3665,9 @@ export class LightningNode extends EventEmitter {
 		this.graphRestoreStats = {
 			graphMs: reannounced - graphStarted,
 			restoreMs: 0,
-			channelRows: channelRows.length,
+			channelRows: channelRowCount,
 			staleChannels,
-			nodeRows: nodeRows.length,
+			nodeRows: nodeRowCount,
 			orphanNodes,
 			graphChannels: this.graph.getChannelCount(),
 			graphNodes: this.graph.getNodeCount(),

@@ -1870,10 +1870,16 @@ export interface IGraphRestoreStats {
 	/** The whole restore from storage, the network map included. */
 	restoreMs: number;
 	channelRows: number;
-	/** Channel rows past the freshness cutoff: not restored, deleted. */
+	/**
+	 * Channel rows past the freshness cutoff: not restored, and deleted when
+	 * the storage can delete gossip rows.
+	 */
 	staleChannels: number;
 	nodeRows: number;
-	/** Node rows with no channel row behind them on disk: deleted. */
+	/**
+	 * Node rows with no channel row behind them on disk: not restored, and
+	 * deleted when the storage can delete gossip rows.
+	 */
 	orphanNodes: number;
 	/** The graph once the restore and its prune are done. */
 	graphChannels: number;
