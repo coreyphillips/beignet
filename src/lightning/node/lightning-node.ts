@@ -1180,8 +1180,10 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * The most peer requests that may wait on a cooperative restore
 	 * (afterGraphRestore): a peer that floods queries for the seconds a
-	 * restore takes must not grow the queue without end. Our own waiting
-	 * tasks are bounded by our channel and peer counts and never dropped.
+	 * restore takes must not grow the queue without end. The node's own
+	 * waiting tasks are never dropped: they come one per start-up step, and
+	 * our channels' updates wait as one task holding the newest per channel
+	 * and direction (deferOwnChannelUpdate).
 	 */
 	static AFTER_GRAPH_RESTORE_MAX = 1000;
 	private cooperativeGraphRestore: boolean;
@@ -1193,6 +1195,11 @@ export class LightningNode extends EventEmitter {
 	private afterGraphRestore: Array<() => void> = [];
 	/** Of afterGraphRestore, the tasks peers asked for (the capped part). */
 	private peerTasksWaiting = 0;
+	/** Our channels' updates whose graph write waits (deferOwnChannelUpdate). */
+	private ownUpdatesWaiting = new Map<
+		string,
+		{ payload: Buffer; timestamp: number }
+	>();
 	/** The restore from storage inside the constructor, once it has run. */
 	private storageRestoreMs: number | null = null;
 	/**
@@ -4629,6 +4636,9 @@ export class LightningNode extends EventEmitter {
 	 */
 	private finishGraphRestore(run: IGraphRestoreRun, complete: boolean): void {
 		this.graphRestore = null;
+		// Settled first, so nothing emitted below can leave anyone waiting;
+		// what waits on it only runs once this finish has returned.
+		run.resolve(complete);
 		const finishing = Date.now();
 		// gossip_nodes carries no foreign key to gossip_channels, so holding
 		// the channel deletes back until here cannot change what the node
@@ -4685,10 +4695,7 @@ export class LightningNode extends EventEmitter {
 				});
 			}
 		}
-		// Settled before it is reported, so a listener that throws cannot
-		// leave anyone waiting. Inline, the constructor reports it once its
-		// own restore is timed.
-		run.resolve(complete);
+		// Inline, the constructor reports it once its own restore is timed.
 		if (this.storageRestoreMs !== null) this.reportGraphRestore();
 	}
 
@@ -4700,6 +4707,7 @@ export class LightningNode extends EventEmitter {
 		this.graphRestore = null;
 		this.afterGraphRestore = [];
 		this.peerTasksWaiting = 0;
+		this.ownUpdatesWaiting = new Map();
 		run.resolve(false);
 	}
 
@@ -16264,10 +16272,7 @@ export class LightningNode extends EventEmitter {
 					// cannot replace it.
 					if (this.graphRestore) {
 						this.adoptPeerChannelPolicyNow(payload);
-						this.afterGraphRestored(
-							() => this.handleChannelUpdate(payload, false),
-							'own channel_update'
-						);
+						this.deferOwnChannelUpdate(payload);
 						break;
 					}
 					this.handleChannelUpdate(payload);
@@ -16798,6 +16803,35 @@ export class LightningNode extends EventEmitter {
 					'saveGossipChannel'
 				);
 		}
+	}
+
+	/**
+	 * Holds an update naming one of our channels until a cooperative restore
+	 * ends, the newest per channel and direction: the match is on the short
+	 * channel id alone, before any signature check, so a peer can send any
+	 * number, and only the newest could land anyway. Bounded so by our
+	 * channel count, one task applies them all once the map is back.
+	 */
+	private deferOwnChannelUpdate(payload: Buffer): void {
+		let msg: IChannelUpdateMessage;
+		try {
+			msg = decodeChannelUpdateMessage(payload);
+		} catch {
+			return;
+		}
+		const key = `${msg.shortChannelId.toString('hex')}:${msg.channelFlags & 1}`;
+		const held = this.ownUpdatesWaiting.get(key);
+		if (held && held.timestamp >= msg.timestamp) return;
+		if (this.ownUpdatesWaiting.size === 0) {
+			this.afterGraphRestored(() => {
+				const waiting = this.ownUpdatesWaiting;
+				this.ownUpdatesWaiting = new Map();
+				for (const { payload: update } of waiting.values()) {
+					this.handleChannelUpdate(update, false);
+				}
+			}, 'own channel_update');
+		}
+		this.ownUpdatesWaiting.set(key, { payload, timestamp: msg.timestamp });
 	}
 
 	/**

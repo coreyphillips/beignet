@@ -586,6 +586,46 @@ describe('Cooperative restore of the stored network map', () => {
 		expect(adopted).to.equal(1);
 	});
 
+	it("holds only the newest of our channel's updates per direction while it runs", async () => {
+		const store = buildStore(120);
+		LightningNode.GRAPH_RESTORE_SLICE_MS = 0;
+		const { node } = open(store.dbPath, true);
+		const inner = node as unknown as {
+			handleGossipMessage(p: string, t: number, b: Buffer): void;
+			handleChannelUpdate(payload: Buffer, adoptPolicy?: boolean): void;
+			channelUpdateTargetsOurChannel(): boolean;
+			maybeAdoptPeerChannelPolicy(): void;
+			afterGraphRestore: unknown[];
+		};
+		inner.channelUpdateTargetsOurChannel = (): boolean => true;
+		inner.maybeAdoptPeerChannelPolicy = (): void => undefined;
+		const applied: number[] = [];
+		const real = inner.handleChannelUpdate.bind(node);
+		inner.handleChannelUpdate = (
+			payload: Buffer,
+			adoptPolicy?: boolean
+		): void => {
+			applied.push(payload.readUInt32BE(64 + 32 + 8));
+			real(payload, adoptPolicy);
+		};
+		const base = NOW() - 100;
+		for (const offset of [5, 9, 2, 9, 7]) {
+			inner.handleGossipMessage(
+				'aa'.repeat(33),
+				MessageType.CHANNEL_UPDATE,
+				encodeChannelUpdateMessage(update(scidOf(110), 0, base + offset))
+			);
+		}
+		inner.handleGossipMessage(
+			'aa'.repeat(33),
+			MessageType.CHANNEL_UPDATE,
+			encodeChannelUpdateMessage(update(scidOf(110), 1, base))
+		);
+		expect(inner.afterGraphRestore).to.have.length(1);
+		await node.whenGraphRestored();
+		expect(applied.sort()).to.deep.equal([base, base + 9].sort());
+	});
+
 	it('settles even when a listener of its report throws', async () => {
 		const store = buildStore(60);
 		LightningNode.GRAPH_RESTORE_SLICE_MS = 0;
