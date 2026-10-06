@@ -436,6 +436,7 @@ import {
 	bip32RootFromSeed,
 	deriveLightningKeys,
 	deriveChannelKeys,
+	copyChannelKeys,
 	LnCoinType
 } from '../keys/wallet-keys';
 import * as bip39 from 'bip39';
@@ -29637,13 +29638,25 @@ export class LightningNode extends EventEmitter {
 		const root = bip32RootFromSeed(seed);
 		const keys = deriveLightningKeys(root, coinType);
 
-		// Build per-channel key deriver from BIP32 root (unless caller provides one)
+		// Build per-channel key deriver from BIP32 root (unless caller provides
+		// one). Each channel's keys are derived once a process: a restored
+		// channel's monitor, a splice's or close's funding signature and a
+		// recovery each ask for them again, and on a phone, where the curve
+		// arithmetic runs in JavaScript, each derivation costs a sizeable
+		// fraction of a second. Every caller gets its own copies, so none can
+		// change what the next one is handed.
 		let channelKeyDeriver = options?.channelKeyDeriver;
 		if (!channelKeyDeriver) {
+			const derived = new Map<number, ReturnType<typeof deriveChannelKeys>>();
 			channelKeyDeriver = (
 				channelIndex: number
 			): ReturnType<NonNullable<INodeConfig['channelKeyDeriver']>> => {
-				const ck = deriveChannelKeys(root, coinType, channelIndex);
+				let held = derived.get(channelIndex);
+				if (!held) {
+					held = deriveChannelKeys(root, coinType, channelIndex);
+					derived.set(channelIndex, held);
+				}
+				const ck = copyChannelKeys(held);
 				return {
 					fundingPrivkey: ck.fundingPrivkey,
 					basepoints: ck.channelBasepoints,
