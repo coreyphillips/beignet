@@ -361,10 +361,15 @@ describe('Cooperative restore of the stored network map', () => {
 		LightningNode.GRAPH_RESTORE_SLICE_MS = 0;
 		const order: string[] = [];
 		const { node } = open(store.dbPath, true);
-		setTimeout(() => order.push('timer'), 0);
+		let restoringInTimer: boolean | undefined;
+		setTimeout(() => {
+			restoringInTimer = node.isGraphRestoring();
+			order.push('timer');
+		}, 0);
 		void node.whenGraphRestored().then(() => order.push('restored'));
 		await node.whenGraphRestored();
 		await new Promise((resolve) => setTimeout(resolve, 5));
+		expect(restoringInTimer).to.equal(true);
 		expect(order).to.deep.equal(['timer', 'restored']);
 	});
 
@@ -528,7 +533,7 @@ describe('Cooperative restore of the stored network map', () => {
 		).to.not.deep.equal(Buffer.alloc(64));
 	});
 
-	it('finishes at once when a route is asked for mid-restore', async () => {
+	it('finishes at once, leaving the whole map, when a route is asked for mid-restore', async () => {
 		const store = buildStore(160);
 		const copy = copyStore(store);
 		LightningNode.GRAPH_RESTORE_SLICE_MS = 0;
@@ -553,6 +558,154 @@ describe('Cooperative restore of the stored network map', () => {
 		);
 	});
 
+	it("takes the peer's policy for our own channel at once, and only defers its graph write", async () => {
+		const store = buildStore(120);
+		LightningNode.GRAPH_RESTORE_SLICE_MS = 0;
+		const { node } = open(store.dbPath, true);
+		const inner = node as unknown as {
+			handleGossipMessage(p: string, t: number, b: Buffer): void;
+			channelUpdateTargetsOurChannel(): boolean;
+			maybeAdoptPeerChannelPolicy(): void;
+			afterGraphRestore: unknown[];
+		};
+		let adopted = 0;
+		inner.channelUpdateTargetsOurChannel = (): boolean => true;
+		inner.maybeAdoptPeerChannelPolicy = (): void => {
+			adopted++;
+		};
+		inner.handleGossipMessage(
+			'aa'.repeat(33),
+			MessageType.CHANNEL_UPDATE,
+			encodeChannelUpdateMessage(update(scidOf(110), 0, NOW() - 1))
+		);
+		expect(adopted).to.equal(1);
+		expect(inner.afterGraphRestore).to.have.length(1);
+		await node.whenGraphRestored();
+		// The graph write ran, without taking the policy a second time.
+		expect(inner.afterGraphRestore).to.have.length(0);
+		expect(adopted).to.equal(1);
+	});
+
+	it('settles even when a listener of its report throws', async () => {
+		const store = buildStore(60);
+		LightningNode.GRAPH_RESTORE_SLICE_MS = 0;
+		const { node } = open(store.dbPath, true);
+		node.on('graph:restored', () => {
+			throw new Error('listener broke');
+		});
+		expect(await node.whenGraphRestored()).to.equal(true);
+		expect(node.isGraphRestoring()).to.equal(false);
+		expect(node.getGraphRestoreStats()?.cooperative).to.equal(true);
+	});
+
+	it('settles after a storage failure even when the error listener throws', async () => {
+		const store = buildStore(160);
+		LightningNode.GRAPH_RESTORE_SLICE_MS = 0;
+		const storage = new SqliteStorage(store.dbPath);
+		storage.open();
+		cleanup.push(() => removeDb(store.dbPath));
+		cleanup.push(() => storage.close());
+		storage.loadGossipChannelsAfter = (): ReturnType<
+			SqliteStorage['loadGossipChannelsAfter']
+		> => {
+			throw new Error('disk I/O error');
+		};
+		const node = new LightningNode(makeConfig(storage, true));
+		cleanup.push(() => node.destroy());
+		node.on('node:error', () => {
+			throw new Error('listener broke');
+		});
+		expect(await node.whenGraphRestored()).to.equal(false);
+		expect(node.isGraphRestoring()).to.equal(false);
+	});
+
+	it('caps what peers queue while it runs, never what the node itself waits to do', async () => {
+		const store = buildStore(120);
+		LightningNode.GRAPH_RESTORE_SLICE_MS = 0;
+		const savedMax = LightningNode.AFTER_GRAPH_RESTORE_MAX;
+		LightningNode.AFTER_GRAPH_RESTORE_MAX = 3;
+		cleanup.push(() => {
+			LightningNode.AFTER_GRAPH_RESTORE_MAX = savedMax;
+		});
+		const { node } = open(store.dbPath, true);
+		const inner = node as unknown as {
+			handleGossipMessage(p: string, t: number, b: Buffer): void;
+			afterGraphRestore: unknown[];
+		};
+		const dropped: string[] = [];
+		node.on('log', (entry: { action: string; data: { what?: string } }) => {
+			if (entry.action === 'graph_restore_waiter_dropped')
+				dropped.push(String(entry.data.what));
+		});
+		const query = encodeQueryChannelRangeMessage({
+			chainHash: BITCOIN_CHAIN_HASH,
+			firstBlocknum: 0,
+			numberOfBlocks: 10
+		});
+		for (let i = 0; i < 5; i++) {
+			inner.handleGossipMessage(
+				'ee'.repeat(33),
+				MessageType.QUERY_CHANNEL_RANGE,
+				query
+			);
+		}
+		node.initiateGossipSync('ff'.repeat(33));
+		expect(dropped).to.deep.equal(['gossip query', 'gossip query']);
+		expect(inner.afterGraphRestore).to.have.length(4);
+		await node.whenGraphRestored();
+		expect(node.getGossipSyncState('ff'.repeat(33))).to.not.equal(null);
+	});
+
+	it('does not start a deferred gossip sync with a peer that has left', async () => {
+		const store = buildStore(120);
+		LightningNode.GRAPH_RESTORE_SLICE_MS = 0;
+		const { node } = open(store.dbPath, true);
+		node.initiateGossipSync('ab'.repeat(33));
+		(node as unknown as { peerManager: unknown }).peerManager = {
+			getPeer: (): undefined => undefined
+		};
+		try {
+			await node.whenGraphRestored();
+			expect(node.getGossipSyncState('ab'.repeat(33))).to.equal(null);
+		} finally {
+			(node as unknown as { peerManager: unknown }).peerManager = null;
+		}
+	});
+
+	it("seeds a channel peer's addresses from the graph once it is back, and dials a peer that had none", async () => {
+		const store = buildStore(60);
+		const { node } = open(store.dbPath, false);
+		const announced: string[] = [];
+		const dialed: string[] = [];
+		const inner = node as unknown as {
+			peerManager: unknown;
+			seedReconnectsFromGraph(peers: Set<string>, dialing: Set<string>): void;
+		};
+		inner.peerManager = {
+			setAnnouncedAddresses: (pubkey: string): void => {
+				announced.push(pubkey);
+			},
+			getPeer: (): undefined => undefined,
+			connectPeer: (pubkey: string): Promise<void> => {
+				dialed.push(pubkey);
+				return Promise.resolve();
+			}
+		};
+		try {
+			// Node rows at even indexes were stored verified.
+			const fresh = store.nodeIds[0].toString('hex');
+			const already = store.nodeIds[2].toString('hex');
+			inner.seedReconnectsFromGraph(
+				new Set([fresh, already]),
+				new Set([already])
+			);
+			expect(announced).to.have.members([fresh, already]);
+			expect(dialed).to.deep.equal([fresh]);
+		} finally {
+			inner.peerManager = null;
+		}
+	});
+
 	it('drops the restore when the node is destroyed mid-way: nothing deleted, holds let go', async () => {
 		const store = buildStore(160);
 		LightningNode.GRAPH_RESTORE_SLICE_MS = 0;
@@ -563,6 +716,8 @@ describe('Cooperative restore of the stored network map', () => {
 		const node = new LightningNode(makeConfig(storage, true));
 		node.initiateGossipSync('dd'.repeat(33));
 		node.destroy();
+		// Ended by destroy itself, before its storage closes.
+		expect(node.isGraphRestoring()).to.equal(false);
 		expect(await node.whenGraphRestored()).to.equal(false);
 		expect(node.isGraphRestoring()).to.equal(false);
 		expect(

@@ -14,9 +14,6 @@ import { IGraphChannel, IGraphNode } from '../gossip/types';
 import { IWatchtowerSession, IWatchtowerUpdate } from '../watchtower/types';
 
 /**
- * Abstract storage backend. SqliteStorage implements this.
- */
-/**
  * One page of stored gossip rows (loadGossipChannelsAfter). `cursor` is the
  * last row read, a corrupt one included, where the next page starts after;
  * `done` is set once a page comes back short, so no rows are left.
@@ -27,6 +24,9 @@ export interface IGossipRowPage<T> {
 	done: boolean;
 }
 
+/**
+ * Abstract storage backend. SqliteStorage implements this.
+ */
 export interface IStorageBackend {
 	open(): void;
 	close(): void;

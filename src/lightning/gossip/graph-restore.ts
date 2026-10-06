@@ -169,13 +169,16 @@ export class GossipGraphRestore {
 		budgetMs: number
 	): IGraphChannel[] | IGraphNode[] {
 		const reading = Date.now();
+		// A step with no budget, as one that finishes a restore at once, reads
+		// the largest pages: on a phone each query has its own cost.
+		const limit = Number.isFinite(budgetMs) ? this.pageRows : MAX_PAGE_ROWS;
 		const page =
 			kind === 'channels'
 				? this.paged && this.storage.loadGossipChannelsAfter
-					? this.storage.loadGossipChannelsAfter(this.cursor, this.pageRows)
+					? this.storage.loadGossipChannelsAfter(this.cursor, limit)
 					: null
 				: this.paged && this.storage.loadGossipNodesAfter
-				? this.storage.loadGossipNodesAfter(this.cursor, this.pageRows)
+				? this.storage.loadGossipNodesAfter(this.cursor, limit)
 				: null;
 		let rows: IGraphChannel[] | IGraphNode[];
 		if (page) {

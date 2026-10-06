@@ -1178,10 +1178,10 @@ export class LightningNode extends EventEmitter {
 	 */
 	static GRAPH_RESTORE_SLICE_MS = 8;
 	/**
-	 * The most actions that may wait on a cooperative restore
-	 * (afterGraphRestore). They are bounded by our channel count and by what
-	 * peers query, but a peer that floods queries for the few seconds a
-	 * restore takes must not grow the queue without end.
+	 * The most peer requests that may wait on a cooperative restore
+	 * (afterGraphRestore): a peer that floods queries for the seconds a
+	 * restore takes must not grow the queue without end. Our own waiting
+	 * tasks are bounded by our channel and peer counts and never dropped.
 	 */
 	static AFTER_GRAPH_RESTORE_MAX = 1000;
 	private cooperativeGraphRestore: boolean;
@@ -1191,6 +1191,8 @@ export class LightningNode extends EventEmitter {
 	private graphRestored: Promise<boolean> = Promise.resolve(true);
 	/** What waits for a cooperative restore to end, in the order it came. */
 	private afterGraphRestore: Array<() => void> = [];
+	/** Of afterGraphRestore, the tasks peers asked for (the capped part). */
+	private peerTasksWaiting = 0;
 	/** The restore from storage inside the constructor, once it has run. */
 	private storageRestoreMs: number | null = null;
 	/**
@@ -4525,21 +4527,6 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Run a batch of best-effort storage deletes as ONE transaction.
-	 *
-	 * Each delete used to commit on its own, and the SQLite backend opens
-	 * `journal_mode = WAL` with `synchronous = FULL`, so every row cost a
-	 * separate fsync on the daemon's only thread. Deleting a mainnet-sized
-	 * graph's worth of stale rows that way blocks the event loop for as long
-	 * as the disk takes: /health goes silent, and peers pass their BOLT 1
-	 * ping timeout and drop the connection. One transaction is one fsync.
-	 *
-	 * The deletes stay best-effort. A row that throws is counted and skipped
-	 * rather than rolling the batch back, and a backend whose transaction
-	 * will not open falls back to the plain loop. Deleting by primary key is
-	 * idempotent, so that fallback cannot double-delete anything.
-	 */
-	/**
 	 * Restores the stored network map (GossipGraphRestore). Stale rows are
 	 * filtered out BEFORE the graph's restore ceiling sees them: the prune
 	 * after the restore removes them anyway, so letting one occupy a ceiling
@@ -4615,12 +4602,16 @@ export class LightningNode extends EventEmitter {
 			run.busyMs += Date.now() - started;
 			run.slices++;
 			if (!this.cooperativeGraphRestore) throw err;
-			this.emit('node:error', {
-				code: 'GRAPH_RESTORE_FAILED',
-				message: `gossip restore: ${(err as Error).message}`,
-				timestamp: Date.now()
-			});
 			this.finishGraphRestore(run, false);
+			try {
+				this.emit('node:error', {
+					code: 'GRAPH_RESTORE_FAILED',
+					message: `gossip restore: ${(err as Error).message}`,
+					timestamp: Date.now()
+				});
+			} catch {
+				// Ended and settled already; a listener's failure is its own.
+			}
 			return true;
 		}
 		run.busyMs += Date.now() - started;
@@ -4684,6 +4675,7 @@ export class LightningNode extends EventEmitter {
 		};
 		const waiting = this.afterGraphRestore;
 		this.afterGraphRestore = [];
+		this.peerTasksWaiting = 0;
 		for (const task of waiting) {
 			try {
 				task();
@@ -4693,9 +4685,11 @@ export class LightningNode extends EventEmitter {
 				});
 			}
 		}
-		// Inline, the constructor reports it once its own restore is timed.
-		if (this.storageRestoreMs !== null) this.reportGraphRestore();
+		// Settled before it is reported, so a listener that throws cannot
+		// leave anyone waiting. Inline, the constructor reports it once its
+		// own restore is timed.
 		run.resolve(complete);
+		if (this.storageRestoreMs !== null) this.reportGraphRestore();
 	}
 
 	/**
@@ -4705,6 +4699,7 @@ export class LightningNode extends EventEmitter {
 	private cancelGraphRestore(run: IGraphRestoreRun): void {
 		this.graphRestore = null;
 		this.afterGraphRestore = [];
+		this.peerTasksWaiting = 0;
 		run.resolve(false);
 	}
 
@@ -4716,8 +4711,14 @@ export class LightningNode extends EventEmitter {
 		const stats = this.graphRestoreStats;
 		if (!stats) return;
 		stats.restoreMs = this.storageRestoreMs ?? stats.restoreMs;
-		this.emitStructuredLog('peer', 'graph_restored', { ...stats });
-		this.emit('graph:restored', { ...stats });
+		// A report, never a step the node depends on: a listener that throws
+		// is not the restore's failure.
+		try {
+			this.emitStructuredLog('peer', 'graph_restored', { ...stats });
+			this.emit('graph:restored', { ...stats });
+		} catch {
+			// The figures stay readable from getGraphRestoreStats().
+		}
 	}
 
 	/**
@@ -4742,16 +4743,24 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Holds `task` until a cooperative restore of the stored network map has
 	 * ended, and says whether it did; with none running the caller goes on
-	 * as before. Past AFTER_GRAPH_RESTORE_MAX waiting tasks a task is dropped
-	 * and logged, as gossip beyond the intake's cap is.
+	 * as before. A peer's task (`fromPeer`) past AFTER_GRAPH_RESTORE_MAX
+	 * waiting peer tasks is dropped and logged, as gossip beyond the intake's
+	 * cap is; our own tasks are never dropped.
 	 */
-	private afterGraphRestored(task: () => void, what: string): boolean {
+	private afterGraphRestored(
+		task: () => void,
+		what: string,
+		fromPeer = false
+	): boolean {
 		if (!this.graphRestore) return false;
-		if (
-			this.afterGraphRestore.length >= LightningNode.AFTER_GRAPH_RESTORE_MAX
-		) {
-			this.emitStructuredLog('peer', 'graph_restore_waiter_dropped', { what });
-			return true;
+		if (fromPeer) {
+			if (this.peerTasksWaiting >= LightningNode.AFTER_GRAPH_RESTORE_MAX) {
+				this.emitStructuredLog('peer', 'graph_restore_waiter_dropped', {
+					what
+				});
+				return true;
+			}
+			this.peerTasksWaiting++;
 		}
 		this.afterGraphRestore.push(task);
 		return true;
@@ -4772,6 +4781,21 @@ export class LightningNode extends EventEmitter {
 		return this.graphRestore !== null;
 	}
 
+	/**
+	 * Run a batch of best-effort storage deletes as ONE transaction.
+	 *
+	 * Each delete used to commit on its own, and the SQLite backend opens
+	 * `journal_mode = WAL` with `synchronous = FULL`, so every row cost a
+	 * separate fsync on the daemon's only thread. Deleting a mainnet-sized
+	 * graph's worth of stale rows that way blocks the event loop for as long
+	 * as the disk takes: /health goes silent, and peers pass their BOLT 1
+	 * ping timeout and drop the connection. One transaction is one fsync.
+	 *
+	 * The deletes stay best-effort. A row that throws is counted and skipped
+	 * rather than rolling the batch back, and a backend whose transaction
+	 * will not open falls back to the plain loop. Deleting by primary key is
+	 * idempotent, so that fallback cannot double-delete anything.
+	 */
 	private batchStorageDeletes(
 		deletes: Array<() => void>,
 		operation: string
@@ -7432,6 +7456,16 @@ export class LightningNode extends EventEmitter {
 				});
 			}
 		}
+		// A sliced restore of the stored map has not brought the graph's
+		// announcements back yet: once it has, what they know that is newer
+		// is seeded, and a channel peer with no address to dial yet is dialed.
+		if (this.graphRestore) {
+			const dialing = new Set(peersToConnect.map((peer) => peer.pubkey));
+			this.afterGraphRestored(
+				() => this.seedReconnectsFromGraph(channelPeers, dialing),
+				'reconnect seeding'
+			);
+		}
 
 		if (peersToConnect.length === 0) {
 			this.emitReady();
@@ -7468,6 +7502,47 @@ export class LightningNode extends EventEmitter {
 			timer.unref();
 			this._reconnectTimers.add(timer);
 			delay += STAGGER_MS;
+		}
+	}
+
+	/**
+	 * autoReconnectPeers' graph source, run once a sliced restore of the
+	 * stored map has brought the announcements back: a channel peer's newer
+	 * verified announcement is seeded as its reconnect fallback, and a peer
+	 * the startup pass had no address to dial is dialed now.
+	 */
+	private seedReconnectsFromGraph(
+		channelPeers: Set<string>,
+		dialing: Set<string>
+	): void {
+		const pm = this.peerManager;
+		if (this._destroyed || !pm) return;
+		for (const pubkey of channelPeers) {
+			const announcement = this.graph.getVerifiedNodeAnnouncement(
+				Buffer.from(pubkey, 'hex')
+			);
+			if (!announcement) continue;
+			const known = this.announcedPeerAddresses.get(pubkey);
+			if (known && announcement.timestamp <= known.timestamp) continue;
+			const addresses = announcedDialableAddresses(announcement.addresses);
+			this.announcedPeerAddresses.set(pubkey, {
+				timestamp: announcement.timestamp,
+				addresses
+			});
+			pm.setAnnouncedAddresses(pubkey, addresses);
+			if (dialing.has(pubkey) || addresses.length === 0) continue;
+			if (pm.getPeer(pubkey)) continue;
+			pm.connectPeer(pubkey, addresses[0].host, addresses[0].port).catch(
+				(err) => {
+					this.emit('node:error', {
+						code: 'AUTO_RECONNECT_FAILED',
+						message: `Failed to reconnect ${pubkey.slice(0, 8)}...: ${
+							(err as Error).message
+						}`,
+						timestamp: Date.now()
+					} as ILightningError);
+				}
+			);
 		}
 	}
 
@@ -9398,8 +9473,10 @@ export class LightningNode extends EventEmitter {
 		// a signature-verified announcement may supply dial targets; a
 		// deferred one is resolved by this read (issue #443). A cooperative
 		// restore of the stored map is waited for, so its addresses are in.
-		await this.whenGraphRestored();
-		assertNotCancelled();
+		if (this.graphRestore) {
+			await this.whenGraphRestored();
+			assertNotCancelled();
+		}
 		const announced =
 			this.graph.getVerifiedNodeAnnouncement(Buffer.from(pubkey, 'hex'))
 				?.addresses ?? [];
@@ -11224,6 +11301,8 @@ export class LightningNode extends EventEmitter {
 
 	destroy(): void {
 		this._destroyed = true;
+		// A restore of the stored map ends here, before its storage closes.
+		if (this.graphRestore) this.cancelGraphRestore(this.graphRestore);
 		this.guardianHost?.close();
 		for (const [nonce, pending] of this.pendingGrantRequests) {
 			clearTimeout(pending.timer);
@@ -15074,6 +15153,7 @@ export class LightningNode extends EventEmitter {
 	}
 
 	getChannelSuggestions(count?: number): IChannelSuggestion[] {
+		this.requireGraph('getChannelSuggestions');
 		// Collect existing peer pubkeys to exclude
 		const excludeNodeIds = new Set<string>();
 		for (const ch of this.channelManager.listChannels()) {
@@ -16147,7 +16227,8 @@ export class LightningNode extends EventEmitter {
 			GRAPH_READING_GOSSIP.has(type) &&
 			this.afterGraphRestored(
 				() => this.handleGossipMessage(pubkey, type, payload),
-				'gossip query'
+				'gossip query',
+				true
 			)
 		) {
 			return;
@@ -16176,14 +16257,17 @@ export class LightningNode extends EventEmitter {
 					return; // malformed gossip — same silent drop as the handler's
 				}
 				if (ours) {
-					// Applied once the stored map is back, so the restore's
-					// older row cannot replace it.
-					if (
+					// While the stored map is restored in slices, the peer's
+					// policy is taken at once, since a private channel's route
+					// hints and blinded paths read it from the channel state;
+					// only the graph write waits, so the restore's older row
+					// cannot replace it.
+					if (this.graphRestore) {
+						this.adoptPeerChannelPolicyNow(payload);
 						this.afterGraphRestored(
-							() => this.handleChannelUpdate(payload),
+							() => this.handleChannelUpdate(payload, false),
 							'own channel_update'
-						)
-					) {
+						);
 						break;
 					}
 					this.handleChannelUpdate(payload);
@@ -16470,10 +16554,11 @@ export class LightningNode extends EventEmitter {
 		// What the peer lacks is judged against the graph, so the sync starts
 		// once the stored map is back.
 		if (
-			this.afterGraphRestored(
-				() => this.initiateGossipSync(pubkey),
-				'gossip sync'
-			)
+			this.afterGraphRestored(() => {
+				// A peer that left meanwhile gets no sync manager.
+				if (this.peerManager && !this.peerManager.getPeer(pubkey)) return;
+				this.initiateGossipSync(pubkey);
+			}, 'gossip sync')
 		) {
 			return;
 		}
@@ -16653,7 +16738,12 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
-	private handleChannelUpdate(payload: Buffer): void {
+	/**
+	 * `adoptPolicy` false skips taking the peer's policy for one of our
+	 * channels, already taken by adoptPeerChannelPolicyNow when the graph
+	 * write had to wait for a cooperative restore.
+	 */
+	private handleChannelUpdate(payload: Buffer, adoptPolicy = true): void {
 		let msg: IChannelUpdateMessage;
 		try {
 			msg = decodeChannelUpdateMessage(payload);
@@ -16673,7 +16763,7 @@ export class LightningNode extends EventEmitter {
 		// signature-verified direct update on the channel state instead — the
 		// only real source of the peer's fees/CLTV for invoice route hints and
 		// blinded-path payment_relay.
-		this.maybeAdoptPeerChannelPolicy(msg, payload);
+		if (adoptPolicy) this.maybeAdoptPeerChannelPolicy(msg, payload);
 		const channel = this.graph.getChannel(msg.shortChannelId);
 		if (!channel) {
 			return; // no prior announcement
@@ -16708,6 +16798,22 @@ export class LightningNode extends EventEmitter {
 					'saveGossipChannel'
 				);
 		}
+	}
+
+	/**
+	 * The policy half of handleChannelUpdate, for an update naming one of our
+	 * channels while the stored map is restored in slices: the same decode,
+	 * the same far-future refusal, then maybeAdoptPeerChannelPolicy.
+	 */
+	private adoptPeerChannelPolicyNow(payload: Buffer): void {
+		let msg: IChannelUpdateMessage;
+		try {
+			msg = decodeChannelUpdateMessage(payload);
+		} catch {
+			return;
+		}
+		if (gossipTimestampTooFarFuture(msg.timestamp)) return;
+		this.maybeAdoptPeerChannelPolicy(msg, payload);
 	}
 
 	/**
@@ -19392,9 +19498,9 @@ export class LightningNode extends EventEmitter {
 			// must resolve to a public channel of ours to R whose two funding
 			// keys the announcement carries, each beside its own node id.
 			const outScid = hopPayload.shortChannelId;
+			if (outScid) this.requireGraph('ffor settle');
 			// A deferred row (learned lazily, or restored without settled
 			// flags) is verified here: nothing else on this path would.
-			if (outScid) this.requireGraph('ffor settle');
 			const ann = outScid
 				? this.graph.getVerifiedChannelAnnouncement(outScid)
 				: undefined;
@@ -30514,6 +30620,7 @@ export class LightningNode extends EventEmitter {
 		maxFeeMsat?: bigint,
 		policyOverrides?: TPolicyOverrides
 	): IPaymentInfo {
+		this.requireGraph('payBolt12Invoice');
 		if (!invoice.paymentHash || !invoice.amount || !invoice.nodeId) {
 			throw new Error('BOLT 12 invoice missing required fields');
 		}
