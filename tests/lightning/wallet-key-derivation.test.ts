@@ -2,11 +2,12 @@
  * The node and per-channel keys come from the BIP32 base node of their path,
  * derived once, rather than from the root once per key: the same keys, for
  * a fraction of the curve arithmetic. And the per-channel deriver
- * fromMnemonic builds derives each channel's keys once a process, handing
+ * fromMnemonic builds derives each channel's keys once per node, handing
  * every caller copies of its own.
  */
 import { expect } from 'chai';
 import * as bip39 from 'bip39';
+import * as walletKeys from '../../src/lightning/keys/wallet-keys';
 import {
 	LnCoinType,
 	bip32RootFromSeed,
@@ -85,16 +86,67 @@ describe('Wallet key derivation from the base node', () => {
 		const keys = deriveChannelKeys(root, LnCoinType.REGTEST, 3);
 		const copy = copyChannelKeys(keys);
 		expect(copy).to.deep.equal(keys);
-		copy.fundingPrivkey.fill(0);
-		copy.channelBasepoints.fundingPubkey.fill(0);
-		expect(keys.fundingPrivkey.equals(Buffer.alloc(32))).to.equal(false);
-		expect(
-			keys.channelBasepoints.fundingPubkey.equals(Buffer.alloc(33))
-		).to.equal(false);
+		expect(copy.channelBasepoints).to.not.equal(keys.channelBasepoints);
+		const buffers = (k: ReturnType<typeof deriveChannelKeys>): Buffer[] => [
+			k.fundingPrivkey,
+			k.revocationBasepointSecret,
+			k.paymentBasepointSecret,
+			k.delayedPaymentBasepointSecret,
+			k.htlcBasepointSecret,
+			k.perCommitmentSeed,
+			...Object.values(k.channelBasepoints)
+		];
+		const originals = buffers(keys).map((b) => Buffer.from(b));
+		expect(buffers(copy)).to.have.length(12);
+		// Every buffer is its own: wiping each of the copy's leaves the keys.
+		buffers(copy).forEach((b, i) => {
+			expect(b).to.not.equal(buffers(keys)[i]);
+			b.fill(0);
+		});
+		buffers(keys).forEach((b, i) =>
+			expect(b.equals(originals[i])).to.equal(true)
+		);
 	});
 });
 
 describe('The per-channel deriver fromMnemonic builds', () => {
+	it('derives a channel only the first time it is asked for', () => {
+		const keysModule = walletKeys as unknown as {
+			deriveChannelKeys: typeof deriveChannelKeys;
+		};
+		const real = keysModule.deriveChannelKeys;
+		const derived: number[] = [];
+		keysModule.deriveChannelKeys = (
+			r,
+			coinType,
+			index
+		): ReturnType<typeof deriveChannelKeys> => {
+			derived.push(index ?? 0);
+			return real(r, coinType, index);
+		};
+		const node = LightningNode.fromMnemonic(MNEMONIC, {
+			coinType: LnCoinType.REGTEST,
+			enableNetworking: false
+		});
+		try {
+			const deriver = (
+				node as unknown as {
+					channelManager: {
+						config: Required<Pick<INodeConfig, 'channelKeyDeriver'>>;
+					};
+				}
+			).channelManager.config.channelKeyDeriver;
+			deriver(9);
+			deriver(9);
+			deriver(10);
+			deriver(9);
+			expect(derived).to.deep.equal([9, 10]);
+		} finally {
+			keysModule.deriveChannelKeys = real;
+			node.destroy();
+		}
+	});
+
 	it('derives each channel once and hands every caller its own copies', () => {
 		const node = LightningNode.fromMnemonic(MNEMONIC, {
 			coinType: LnCoinType.REGTEST,

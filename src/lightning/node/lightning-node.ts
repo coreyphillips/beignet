@@ -29639,7 +29639,7 @@ export class LightningNode extends EventEmitter {
 		const keys = deriveLightningKeys(root, coinType);
 
 		// Build per-channel key deriver from BIP32 root (unless caller provides
-		// one). Each channel's keys are derived once a process: a restored
+		// one). Each channel's keys are derived once per node: a restored
 		// channel's monitor, a splice's or close's funding signature and a
 		// recovery each ask for them again, and on a phone, where the curve
 		// arithmetic runs in JavaScript, each derivation costs a sizeable
