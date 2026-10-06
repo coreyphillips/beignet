@@ -8,3 +8,4 @@ export * from './gossip-queries';
 export * from './gossip-sync';
 export * from './mission-control';
 export * from './rapid-sync';
+export * from './graph-restore';

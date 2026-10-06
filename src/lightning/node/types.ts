@@ -500,6 +500,14 @@ export interface INodeConfig {
 	 */
 	eagerGossipVerify?: boolean;
 	/**
+	 * Bring back the stored network map a time slice at a time after the
+	 * constructor returns, rather than inside it (default false). A phone's
+	 * JavaScript thread is otherwise held for seconds as its wallet opens.
+	 * Until the restore ends, gossip that would write the graph waits for it,
+	 * and route finding finishes it first (whenGraphRestored).
+	 */
+	cooperativeGraphRestore?: boolean;
+	/**
 	 * JIT channel receive, LSP role (issue #594): hold HTLCs addressed to
 	 * intercept SCIDs this node minted for wallet peers, fund a zero-conf
 	 * channel to the client (or splice its existing one bigger), then forward.
@@ -1859,15 +1867,28 @@ export interface IStructuredLog {
 }
 
 /**
- * How the stored network map came back as the node was built
- * (LightningNode.getGraphRestoreStats). Counts are rows read from storage and
- * what the graph held afterwards; times are milliseconds of the synchronous
- * restore, which runs inside the constructor.
+ * How the stored network map came back (LightningNode.getGraphRestoreStats).
+ * Counts are rows read from storage and what the graph held afterwards; times
+ * are milliseconds. Inline, the restore runs inside the constructor; with
+ * cooperativeGraphRestore it runs in slices after it.
  */
 export interface IGraphRestoreStats {
-	/** The network map's part: reads, restores, deletes, prune, reannounce. */
+	/** Whether the map came back in slices after the constructor. */
+	cooperative: boolean;
+	/**
+	 * The network map's part, from its start to its end: reads, restores,
+	 * deletes, prune, reannounce, and in slices the turns of the event loop
+	 * between them.
+	 */
 	graphMs: number;
-	/** The whole restore from storage, the network map included. */
+	/** Of graphMs, the time spent restoring: all of it inline. */
+	busyMs: number;
+	/** How many slices it took: 1 inline. */
+	slices: number;
+	/**
+	 * The restore from storage inside the constructor, which includes the
+	 * network map only when that is restored inline.
+	 */
 	restoreMs: number;
 	channelRows: number;
 	/**

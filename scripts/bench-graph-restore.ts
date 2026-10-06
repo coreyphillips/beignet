@@ -1,9 +1,9 @@
 /**
  * Network map restore benchmark: how long a node takes to bring back the
- * gossip rows stored in its SQLite database as it is built
- * (LightningNode.restoreFromStorage, read through getGraphRestoreStats), on a
- * store the size of a phone's after a few weeks on mainnet. Each run builds a
- * fresh node on the same database; the median run is reported. Usage:
+ * gossip rows stored in its SQLite database (read through
+ * getGraphRestoreStats), on a store the size of a phone's after a few weeks
+ * on mainnet. Each run builds a fresh node on the same database; the median
+ * run is reported. Usage:
  *   npx ts-node scripts/bench-graph-restore.ts [runs]
  * BENCH_CHANNELS and BENCH_NODES set the store's size (default 20300 and
  * 8000, a phone's on 2026-10-06; a node no channel reaches is left out);
@@ -12,9 +12,17 @@
  * rough stand-in for Hermes, which has no JIT either. A phone is slower again:
  * its Buffer is a JavaScript polyfill that decodes hex a byte at a time.
  *
- * Columns: the restore's steps in milliseconds, as getGraphRestoreStats
- * splits them (load is the read and the parse of each row), and the cost per
- * channel row of loading and restoring channels.
+ * Each run restores the store inline, as the constructor always did, and
+ * cooperatively (cooperativeGraphRestore), in slices of
+ * LightningNode.GRAPH_RESTORE_SLICE_MS; the two are interleaved so machine
+ * load hits them alike.
+ *
+ * Columns: graphMs is the map's restore from start to end, busyMs the part
+ * spent restoring, slices how many turns it took, and maxLagMs the longest
+ * the event loop went without serving a probe timer, which is what a tap
+ * waits for. Then the restore's steps in milliseconds, as
+ * getGraphRestoreStats splits them (load is the read and the parse of each
+ * row), and the cost per channel row of loading and restoring channels.
  */
 import crypto from 'crypto';
 import * as fs from 'fs';
@@ -145,7 +153,10 @@ function buildStore(dbPath: string, channels: number, nodes: number): void {
 	storage.close();
 }
 
-function nodeConfig(storage: SqliteStorage): INodeConfig {
+function nodeConfig(
+	storage: SqliteStorage,
+	cooperativeGraphRestore: boolean
+): INodeConfig {
 	const random = bytes('bench-graph-restore:node');
 	const keys = Array.from({ length: 5 }, () => random(32));
 	return {
@@ -163,18 +174,48 @@ function nodeConfig(storage: SqliteStorage): INodeConfig {
 		perCommitmentSeed: random(32),
 		fundingPrivkey: keys[0],
 		storage,
-		enableNetworking: false
+		enableNetworking: false,
+		cooperativeGraphRestore
 	};
 }
 
-function restoreOnce(dbPath: string): IGraphRestoreStats {
+interface IRun {
+	stats: IGraphRestoreStats;
+	/** The longest the event loop went without serving a probe timer. */
+	maxLagMs: number;
+}
+
+/**
+ * Builds a node on the store, inline or cooperatively, and waits for its
+ * map to come back, timing the longest stretch the event loop was held.
+ */
+async function restoreOnce(
+	dbPath: string,
+	cooperative: boolean
+): Promise<IRun> {
+	let maxLagMs = 0;
+	let last = Date.now();
+	let probing = true;
+	const probe = (): void => {
+		const now = Date.now();
+		maxLagMs = Math.max(maxLagMs, now - last);
+		last = now;
+		if (probing) setTimeout(probe, 1);
+	};
+	setTimeout(probe, 1);
+	// Building the node is itself a stretch the probe cannot interrupt.
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	last = Date.now();
 	const storage = new SqliteStorage(dbPath);
 	storage.open();
-	const node = new LightningNode(nodeConfig(storage));
+	const node = new LightningNode(nodeConfig(storage, cooperative));
 	try {
+		await node.whenGraphRestored();
+		probing = false;
+		maxLagMs = Math.max(maxLagMs, Date.now() - last);
 		const stats = node.getGraphRestoreStats();
 		if (!stats) throw new Error('the node reported no restore');
-		return stats;
+		return { stats, maxLagMs };
 	} finally {
 		node.destroy();
 		storage.close();
@@ -186,7 +227,7 @@ const median = (xs: number[]): number => {
 	return s[Math.floor(s.length / 2)];
 };
 
-const main = (): void => {
+const main = async (): Promise<void> => {
 	const runs = Number(process.argv[2] ?? 5);
 	const channels = Number(process.env.BENCH_CHANNELS ?? 20_300);
 	const nodes = Number(process.env.BENCH_NODES ?? 8_000);
@@ -204,36 +245,47 @@ const main = (): void => {
 			(process.execArgv.includes('--jitless') ? ' --jitless' : '')
 	);
 	const gc = (globalThis as { gc?: () => void }).gc;
-	const results: IGraphRestoreStats[] = [];
-	// One warm-up run, then the measured ones.
+	const modes: Array<[string, boolean]> = [
+		['inline', false],
+		[`cooperative (${LightningNode.GRAPH_RESTORE_SLICE_MS}ms)`, true]
+	];
+	const results = new Map<string, IRun[]>(modes.map(([name]) => [name, []]));
+	// One warm-up pass, then interleaved measured runs.
 	for (let r = -1; r < runs; r++) {
-		gc?.();
-		const stats = restoreOnce(dbPath);
-		if (r >= 0) results.push(stats);
+		for (const [name, cooperative] of modes) {
+			gc?.();
+			const run = await restoreOnce(dbPath, cooperative);
+			if (r >= 0) results.get(name)!.push(run);
+		}
 	}
-	const pick = (key: keyof IGraphRestoreStats): number =>
-		median(results.map((stats) => Number(stats[key] ?? 0)));
-	const first = results[0];
-	console.table([
-		{
+	const rows = modes.map(([name]) => {
+		const rs = results.get(name)!;
+		const pick = (key: keyof IGraphRestoreStats): number =>
+			median(rs.map((run) => Number(run.stats[key] ?? 0)));
+		const first = rs[0].stats;
+		return {
+			mode: name,
 			channelRows: first.channelRows,
 			nodeRows: first.nodeRows,
-			graphChannels: first.graphChannels,
-			graphNodes: first.graphNodes,
-			restoreMs: pick('restoreMs'),
 			graphMs: pick('graphMs'),
+			busyMs: pick('busyMs'),
+			slices: pick('slices'),
+			maxLagMs: median(rs.map((run) => run.maxLagMs)),
 			loadChannelsMs: pick('loadChannelsMs'),
 			restoreChannelsMs: pick('restoreChannelsMs'),
 			loadNodesMs: pick('loadNodesMs'),
 			restoreNodesMs: pick('restoreNodesMs'),
-			pruneMs: pick('pruneMs'),
 			usPerChannelRow: Math.round(
 				((pick('loadChannelsMs') + pick('restoreChannelsMs')) * 1000) /
 					Math.max(1, first.channelRows)
 			)
-		}
-	]);
+		};
+	});
+	console.table(rows);
 	if (!kept) fs.rmSync(dbPath, { force: true });
 };
 
-main();
+main().catch((err) => {
+	console.error(err);
+	process.exit(1);
+});

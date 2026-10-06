@@ -7,6 +7,7 @@ import type { IrohDaemonConfig } from './iroh-config';
 import type { IIrohDiagnostics } from '../lightning/transport/iroh';
 import { TLogLevel } from '../logger';
 import type { IGuardianConfigEntry } from '../lightning/recovery/assembly';
+import type { IGraphRestoreStats } from '../lightning/node/types';
 import type {
 	HoldCancelReason,
 	SpliceRefusalCode
@@ -1110,6 +1111,11 @@ export interface GraphInfo {
 	channelCount: number;
 	/** Epoch ms of the last gossip/RGS sync completed this session, if any */
 	lastSyncAt?: number;
+	/**
+	 * Set while a deferred restore of the stored network map runs
+	 * (deferGraphRestore): the counts are of the part restored so far.
+	 */
+	restoring?: boolean;
 }
 
 /** One direction's routing policy from a channel_update. */
@@ -1508,6 +1514,13 @@ export interface BeignetNodeEvents {
 		retained?: boolean;
 	}) => void;
 	'node:ready': () => void;
+	/**
+	 * A deferred restore of the stored network map (deferGraphRestore)
+	 * ended: how it went, as getGraphRestoreStats() returns it. An inline
+	 * restore ends inside create(), before anyone can listen, so it is read
+	 * from the getter instead.
+	 */
+	'graph:restored': (stats: IGraphRestoreStats) => void;
 	/**
 	 * A Rapid Gossip Sync snapshot was downloaded and applied. downloadMs
 	 * is the fetch; applyMs is the import from start to finish, of which

@@ -14,6 +14,17 @@ import { IGraphChannel, IGraphNode } from '../gossip/types';
 import { IWatchtowerSession, IWatchtowerUpdate } from '../watchtower/types';
 
 /**
+ * One page of stored gossip rows (loadGossipChannelsAfter). `cursor` is the
+ * last row read, a corrupt one included, where the next page starts after;
+ * `done` is set once a page comes back short, so no rows are left.
+ */
+export interface IGossipRowPage<T> {
+	rows: T[];
+	cursor: number;
+	done: boolean;
+}
+
+/**
  * Abstract storage backend. SqliteStorage implements this.
  */
 export interface IStorageBackend {
@@ -213,6 +224,23 @@ export interface IStorageBackend {
 	deleteHtlcSharedSecret(key: string): void;
 	/** Load all persisted HTLC shared secrets. */
 	loadAllHtlcSharedSecrets(): Array<{ key: string; secret: Buffer }>;
+
+	// ─── Gossip Pages (optional) ───
+	/**
+	 * Up to `limit` stored channel rows after the row `afterRowid`, in the
+	 * order loadAllGossipChannels reads them, so a restore can read the
+	 * network map a page at a time instead of in one call. Without these
+	 * methods a restore reads it whole.
+	 */
+	loadGossipChannelsAfter?(
+		afterRowid: number,
+		limit: number
+	): IGossipRowPage<IGraphChannel>;
+	/** loadGossipChannelsAfter, for the stored node rows. */
+	loadGossipNodesAfter?(
+		afterRowid: number,
+		limit: number
+	): IGossipRowPage<IGraphNode>;
 
 	// ─── Gossip Cleanup (optional) ───
 	/** Delete a gossip channel by SCID hex. Used during graph pruning. */
