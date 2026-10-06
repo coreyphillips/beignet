@@ -118,6 +118,7 @@ import {
 	IRapidGossipResult
 } from '../gossip/rapid-sync';
 import { MissionControl } from '../gossip/mission-control';
+import { GossipGraphRestore } from '../gossip/graph-restore';
 import {
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
@@ -934,6 +935,29 @@ interface IFforVoucherCredit {
 	receiptId?: string;
 }
 
+/**
+ * Gossip messages whose handling reads the graph: peers' queries, our own
+ * sync's replies, and a peer asking for our gossip. They wait for a
+ * cooperative restore of the stored map (handleGossipMessage).
+ */
+const GRAPH_READING_GOSSIP: ReadonlySet<number> = new Set([
+	MessageType.QUERY_CHANNEL_RANGE,
+	MessageType.REPLY_CHANNEL_RANGE,
+	MessageType.QUERY_SHORT_CHANNEL_IDS,
+	MessageType.REPLY_SHORT_CHANNEL_IDS_END,
+	MessageType.GOSSIP_TIMESTAMP_FILTER
+]);
+
+/** A cooperative restore of the stored network map (beginGraphRestore). */
+interface IGraphRestoreRun {
+	restore: GossipGraphRestore;
+	started: number;
+	/** Time spent restoring, over every slice so far. */
+	busyMs: number;
+	slices: number;
+	resolve: (restored: boolean) => void;
+}
+
 export class LightningNode extends EventEmitter {
 	private nodePrivkey: Buffer;
 	/** Genesis hashes of chains we operate on (for gossip chain-scoping). */
@@ -1147,6 +1171,28 @@ export class LightningNode extends EventEmitter {
 	private gossipPruneDeferred = false;
 	/** How the stored network map came back (getGraphRestoreStats). */
 	private graphRestoreStats: IGraphRestoreStats | null = null;
+	/**
+	 * Time slice of a cooperative restore of the stored network map
+	 * (cooperativeGraphRestore), in milliseconds: the RGS import's, for the
+	 * same reason. Static and mutable so tests can pin it.
+	 */
+	static GRAPH_RESTORE_SLICE_MS = 8;
+	/**
+	 * The most actions that may wait on a cooperative restore
+	 * (afterGraphRestore). They are bounded by our channel count and by what
+	 * peers query, but a peer that floods queries for the few seconds a
+	 * restore takes must not grow the queue without end.
+	 */
+	static AFTER_GRAPH_RESTORE_MAX = 1000;
+	private cooperativeGraphRestore: boolean;
+	/** A cooperative restore of the stored network map, while it runs. */
+	private graphRestore: IGraphRestoreRun | null = null;
+	/** Settles true once the map is back, false if a restore was cut short. */
+	private graphRestored: Promise<boolean> = Promise.resolve(true);
+	/** What waits for a cooperative restore to end, in the order it came. */
+	private afterGraphRestore: Array<() => void> = [];
+	/** The restore from storage inside the constructor, once it has run. */
+	private storageRestoreMs: number | null = null;
 	/**
 	 * SCIDs of verified graph channels whose funding output is still to be
 	 * checked on chain, oldest first (issue #1105). Only filled when the chain
@@ -1772,6 +1818,7 @@ export class LightningNode extends EventEmitter {
 		this.htlcSafetyMargin = config.htlcSafetyMargin ?? 6;
 		this.forwardingEnabled = config.forwardingEnabled ?? true;
 		this.eagerGossipVerify = config.eagerGossipVerify ?? false;
+		this.cooperativeGraphRestore = config.cooperativeGraphRestore ?? false;
 		this.forwardingCltvDelta = config.forwardingCltvDelta ?? 40;
 		this.forwardingFeeBaseMsat = config.forwardingFeeBaseMsat ?? 1000;
 		this.forwardingFeePropMillionths = config.forwardingFeePropMillionths ?? 1;
@@ -2564,12 +2611,10 @@ export class LightningNode extends EventEmitter {
 			}
 			const restoreStarted = Date.now();
 			this.restoreFromStorage();
-			if (this.graphRestoreStats) {
-				this.graphRestoreStats.restoreMs = Date.now() - restoreStarted;
-				this.emitStructuredLog('peer', 'graph_restored', {
-					...this.graphRestoreStats
-				});
-			}
+			this.storageRestoreMs = Date.now() - restoreStarted;
+			// Inline, the network map is already back; in slices, it reports
+			// once it is.
+			if (this.graphRestoreStats) this.reportGraphRestore();
 			this.reconcileFforVoucherPayments();
 			// Channels and forward linkage are loaded: settle every held
 			// forward whose outcome those durable facts already decide.
@@ -3554,131 +3599,10 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
-		// Restore gossip graph. Stale rows are filtered out BEFORE the graph's
-		// restore ceiling sees them: startup pruning removes them right after
-		// anyway, so letting one occupy a ceiling slot first could evict (and
-		// delete) a fresh row it will not outlive. Far-future timestamps do
-		// not count toward freshness here for the same reason: restoreChannel
-		// drops those slots, leaving such a row equally short-lived.
-		const gossipRestoreCutoff =
-			Math.floor(Date.now() / 1000) - DEFAULT_PRUNE_MAX_AGE;
-		// Endpoints of every channel row that stays on disk past the stale
-		// filter. Node-row orphanhood below is decided against DISK, not the
-		// capped in-memory graph: restoreChannel keeps verified overflow rows
-		// on disk without admitting them, and their node rows must survive
-		// alongside them. Rows restoreChannel itself trims from disk leave
-		// their endpoints in this set; those node rows are cleaned one boot
-		// later, once their channel rows are gone.
-		const diskChannelEndpoints = new Set<string>();
-		// Every row the two loops below condemn, deleted together at the end.
-		// One at a time is the same fsync storm as the hourly prune (see
-		// batchStorageDeletes), and it runs before the daemon can listen, so
-		// it surfaces as a node that takes minutes to start rather than as a
-		// node that stalls.
-		const staleRowDeletes: Array<() => void> = [];
-		// Each step is timed and counted for getGraphRestoreStats: on a phone
-		// this block may be most of a cold start's longest hold on the JS
-		// thread.
-		const graphStarted = Date.now();
-		const channelRows = this.storage.loadAllGossipChannels();
-		const channelsLoaded = Date.now();
-		const channelRowCount = channelRows.length;
-		let staleChannels = 0;
-		for (const channel of channelRows) {
-			const ts1 =
-				channel.update1 &&
-				!gossipTimestampTooFarFuture(channel.update1.timestamp)
-					? channel.update1.timestamp
-					: 0;
-			const ts2 =
-				channel.update2 &&
-				!gossipTimestampTooFarFuture(channel.update2.timestamp)
-					? channel.update2.timestamp
-					: 0;
-			if (Math.max(ts1, ts2) < gossipRestoreCutoff) {
-				staleChannels++;
-				if (typeof this.storage.deleteGossipChannel === 'function') {
-					const scidHex = channel.shortChannelId.toString('hex');
-					staleRowDeletes.push(() =>
-						this.storage!.deleteGossipChannel!(scidHex)
-					);
-				}
-				continue;
-			}
-			diskChannelEndpoints.add(channel.nodeId1.toString('hex'));
-			diskChannelEndpoints.add(channel.nodeId2.toString('hex'));
-			this.graph.restoreChannel(channel);
-		}
-		const channelsRestored = Date.now();
-		// The channel loop above created a graph node entry for every restored
-		// channel endpoint. A node row absent from the graph AND from the
-		// surviving disk channel rows' endpoints has no channel behind it: an
-		// orphan leaked before node rows were deleted alongside their last
-		// channel (issue #447). Restoring it would resurrect the leak in
-		// memory, so delete the row and skip it. A node row referenced only by
-		// a retained overflow channel row is kept on disk but not restored;
-		// it returns with its channel on a later boot. Channel peer reconnects
-		// are unaffected: their addresses live in the announced peer address
-		// capture, not in gossip_nodes.
-		const nodeRows = this.storage.loadAllGossipNodes();
-		const nodesLoaded = Date.now();
-		const nodeRowCount = nodeRows.length;
-		let orphanNodes = 0;
-		for (const node of nodeRows) {
-			if (!this.graph.getNode(node.nodeId)) {
-				const nodeIdHex = node.nodeId.toString('hex');
-				if (diskChannelEndpoints.has(nodeIdHex)) continue;
-				orphanNodes++;
-				if (typeof this.storage.deleteGossipNode === 'function') {
-					staleRowDeletes.push(() =>
-						this.storage!.deleteGossipNode!(nodeIdHex)
-					);
-				}
-				continue;
-			}
-			this.graph.restoreNode(node);
-		}
-		const nodesRestored = Date.now();
-		// gossip_nodes carries no foreign key to gossip_channels, so holding
-		// the channel deletes back until here cannot change what the node
-		// loop above saw on disk.
-		this.batchStorageDeletes(staleRowDeletes, 'gossipRestoreCleanup');
-		const rowsDeleted = Date.now();
-
-		// Prune stale gossip immediately on restore (BOLT 7: >2 weeks = stale)
-		this.pruneStaleGossipWithStorage();
-		const graphPruned = Date.now();
-
-		// Rebuild every usable public channel from its stored signatures, even
-		// when the graph row survived. The announcement handler also restores
-		// our broadcast cache and refresh timer, so its public policy remains
-		// available while the counterparty is offline.
-		for (const channel of this.channelManager.listChannels()) {
-			const channelId = channel.getChannelId();
-			const scid = channel.getShortChannelId();
-			if (channelId && scid && channel.isHtlcUsable(true)) {
-				this.channelManager.reannounceChannel(channelId);
-			}
-		}
-		const reannounced = Date.now();
-		// The caller adds restoreMs once the rest of the restore is done.
-		this.graphRestoreStats = {
-			graphMs: reannounced - graphStarted,
-			restoreMs: 0,
-			channelRows: channelRowCount,
-			staleChannels,
-			nodeRows: nodeRowCount,
-			orphanNodes,
-			graphChannels: this.graph.getChannelCount(),
-			graphNodes: this.graph.getNodeCount(),
-			loadChannelsMs: channelsLoaded - graphStarted,
-			restoreChannelsMs: channelsRestored - channelsLoaded,
-			loadNodesMs: nodesLoaded - channelsRestored,
-			restoreNodesMs: nodesRestored - nodesLoaded,
-			deleteMs: rowsDeleted - nodesRestored,
-			pruneMs: graphPruned - rowsDeleted,
-			reannounceMs: reannounced - graphPruned
-		};
+		// Restore gossip graph, then delete the rows it condemned, prune it
+		// and reannounce our public channels: inline, or in slices after the
+		// constructor with cooperativeGraphRestore (beginGraphRestore).
+		this.beginGraphRestore();
 
 		// JIT receive: bring back the live intents (so invoices already out
 		// there stay payable) and queue every pre-restart held HTLC to be
@@ -4615,6 +4539,239 @@ export class LightningNode extends EventEmitter {
 	 * will not open falls back to the plain loop. Deleting by primary key is
 	 * idempotent, so that fallback cannot double-delete anything.
 	 */
+	/**
+	 * Restores the stored network map (GossipGraphRestore). Stale rows are
+	 * filtered out BEFORE the graph's restore ceiling sees them: the prune
+	 * after the restore removes them anyway, so letting one occupy a ceiling
+	 * slot first could evict (and delete) a fresh row it will not outlive.
+	 *
+	 * Inline by default, as it always ran. With cooperativeGraphRestore the
+	 * constructor only starts it: the rows come back in slices of
+	 * GRAPH_RESTORE_SLICE_MS after the constructor returns, with the event
+	 * loop served between them, so a phone's JavaScript thread is not held
+	 * for seconds as its wallet opens. Until it ends, nothing else writes the
+	 * graph, so a row from disk never replaces live data: the broadcast
+	 * gossip intake holds, a stale-gossip prune is deferred, an RGS import
+	 * waits its turn (rapidGossipImportTail), and our own channels' gossip,
+	 * peers' gossip queries and our own gossip sync wait on
+	 * afterGraphRestore. Anything that decides an outcome from the graph,
+	 * finding a route above all, finishes it first (requireGraph).
+	 */
+	private beginGraphRestore(): void {
+		const run: IGraphRestoreRun = {
+			restore: new GossipGraphRestore(
+				this.graph,
+				this.storage!,
+				Math.floor(Date.now() / 1000) - DEFAULT_PRUNE_MAX_AGE,
+				this.cooperativeGraphRestore
+			),
+			started: Date.now(),
+			busyMs: 0,
+			slices: 0,
+			resolve: () => undefined
+		};
+		if (!this.cooperativeGraphRestore) {
+			this.continueGraphRestore(run, Infinity);
+			return;
+		}
+		this.graphRestored = new Promise<boolean>((resolve) => {
+			run.resolve = resolve;
+		});
+		this.rapidGossipImportTail = this.graphRestored;
+		this.graphRestore = run;
+		setImmediate(() => this.graphRestoreSlice());
+	}
+
+	/** One slice of a cooperative restore, and the next after a yield. */
+	private graphRestoreSlice(): void {
+		const run = this.graphRestore;
+		// Finished early by requireGraph, or cancelled.
+		if (!run) return;
+		if (this._destroyed) {
+			this.cancelGraphRestore(run);
+			return;
+		}
+		if (this.continueGraphRestore(run, LightningNode.GRAPH_RESTORE_SLICE_MS)) {
+			return;
+		}
+		setImmediate(() => this.graphRestoreSlice());
+	}
+
+	/**
+	 * Restores rows for up to `budgetMs`, and finishes the restore once they
+	 * are all in. Returns whether it has ended. Inline, a storage failure
+	 * fails the constructor, as it always did; in slices it ends the restore
+	 * with what came back and is reported as GRAPH_RESTORE_FAILED.
+	 */
+	private continueGraphRestore(
+		run: IGraphRestoreRun,
+		budgetMs: number
+	): boolean {
+		const started = Date.now();
+		let done: boolean;
+		try {
+			done = run.restore.step(budgetMs);
+		} catch (err) {
+			run.busyMs += Date.now() - started;
+			run.slices++;
+			if (!this.cooperativeGraphRestore) throw err;
+			this.emit('node:error', {
+				code: 'GRAPH_RESTORE_FAILED',
+				message: `gossip restore: ${(err as Error).message}`,
+				timestamp: Date.now()
+			});
+			this.finishGraphRestore(run, false);
+			return true;
+		}
+		run.busyMs += Date.now() - started;
+		run.slices++;
+		if (!done) return false;
+		this.finishGraphRestore(run, true);
+		return true;
+	}
+
+	/**
+	 * The end of a restore of the stored network map: the rows it condemned
+	 * are deleted, the graph is pruned, our public channels are reannounced,
+	 * and what waited for it runs. A restore cut short by a storage failure
+	 * deletes nothing, since it judged the rows on part of the store.
+	 */
+	private finishGraphRestore(run: IGraphRestoreRun, complete: boolean): void {
+		this.graphRestore = null;
+		const finishing = Date.now();
+		// gossip_nodes carries no foreign key to gossip_channels, so holding
+		// the channel deletes back until here cannot change what the node
+		// rows were judged against on disk.
+		if (complete) {
+			this.batchStorageDeletes(
+				run.restore.staleRowDeletes,
+				'gossipRestoreCleanup'
+			);
+		}
+		const rowsDeleted = Date.now();
+
+		// Prune stale gossip immediately on restore (BOLT 7: >2 weeks = stale).
+		// A prune deferred while the restore ran is this one.
+		this.gossipPruneDeferred = false;
+		this.pruneStaleGossipWithStorage();
+		const graphPruned = Date.now();
+
+		// Rebuild every usable public channel from its stored signatures, even
+		// when the graph row survived. The announcement handler also restores
+		// our broadcast cache and refresh timer, so its public policy remains
+		// available while the counterparty is offline.
+		for (const channel of this.channelManager.listChannels()) {
+			const channelId = channel.getChannelId();
+			const scid = channel.getShortChannelId();
+			if (channelId && scid && channel.isHtlcUsable(true)) {
+				this.channelManager.reannounceChannel(channelId);
+			}
+		}
+		const reannounced = Date.now();
+		this.graphRestoreStats = {
+			cooperative: this.cooperativeGraphRestore,
+			graphMs: reannounced - run.started,
+			busyMs: run.busyMs + (reannounced - finishing),
+			slices: run.slices,
+			// The constructor's own restore, once it has run (reportGraphRestore).
+			restoreMs: this.storageRestoreMs ?? 0,
+			...run.restore.stats(),
+			graphChannels: this.graph.getChannelCount(),
+			graphNodes: this.graph.getNodeCount(),
+			deleteMs: rowsDeleted - finishing,
+			pruneMs: graphPruned - rowsDeleted,
+			reannounceMs: reannounced - graphPruned
+		};
+		const waiting = this.afterGraphRestore;
+		this.afterGraphRestore = [];
+		for (const task of waiting) {
+			try {
+				task();
+			} catch (err) {
+				this.emitStructuredLog('peer', 'graph_restore_waiter_failed', {
+					error: err instanceof Error ? err.message : String(err)
+				});
+			}
+		}
+		// Inline, the constructor reports it once its own restore is timed.
+		if (this.storageRestoreMs !== null) this.reportGraphRestore();
+		run.resolve(complete);
+	}
+
+	/**
+	 * A node destroyed mid-restore drops it: nothing is deleted or pruned,
+	 * what waited on it never runs, and the holds it kept are let go.
+	 */
+	private cancelGraphRestore(run: IGraphRestoreRun): void {
+		this.graphRestore = null;
+		this.afterGraphRestore = [];
+		run.resolve(false);
+	}
+
+	/**
+	 * Logs how the stored network map came back (`peer:graph_restored`) and
+	 * emits it as `graph:restored`, with the constructor's own restore time.
+	 */
+	private reportGraphRestore(): void {
+		const stats = this.graphRestoreStats;
+		if (!stats) return;
+		stats.restoreMs = this.storageRestoreMs ?? stats.restoreMs;
+		this.emitStructuredLog('peer', 'graph_restored', { ...stats });
+		this.emit('graph:restored', { ...stats });
+	}
+
+	/**
+	 * Finishes a cooperative restore of the stored network map now, if one
+	 * is still running, so what reads the graph next sees all of it: a route
+	 * found on part of the map could miss the cheapest path or find none. It
+	 * costs what the inline restore costs, so a phone only pays it when it
+	 * pays, probes or settles within seconds of opening. `caller` names who
+	 * asked, in the `graph_restore_forced` log.
+	 */
+	private requireGraph(caller: string): void {
+		const run = this.graphRestore;
+		if (!run) return;
+		const started = Date.now();
+		this.continueGraphRestore(run, Infinity);
+		this.emitStructuredLog('peer', 'graph_restore_forced', {
+			caller,
+			ms: Date.now() - started
+		});
+	}
+
+	/**
+	 * Holds `task` until a cooperative restore of the stored network map has
+	 * ended, and says whether it did; with none running the caller goes on
+	 * as before. Past AFTER_GRAPH_RESTORE_MAX waiting tasks a task is dropped
+	 * and logged, as gossip beyond the intake's cap is.
+	 */
+	private afterGraphRestored(task: () => void, what: string): boolean {
+		if (!this.graphRestore) return false;
+		if (
+			this.afterGraphRestore.length >= LightningNode.AFTER_GRAPH_RESTORE_MAX
+		) {
+			this.emitStructuredLog('peer', 'graph_restore_waiter_dropped', { what });
+			return true;
+		}
+		this.afterGraphRestore.push(task);
+		return true;
+	}
+
+	/**
+	 * Settles once the stored network map is back: at once inline, or when a
+	 * cooperative restore ends. True when it came back whole, false when it
+	 * was cut short by a storage failure or the node's destruction. It never
+	 * rejects.
+	 */
+	whenGraphRestored(): Promise<boolean> {
+		return this.graphRestored;
+	}
+
+	/** Whether a cooperative restore of the stored network map is running. */
+	isGraphRestoring(): boolean {
+		return this.graphRestore !== null;
+	}
+
 	private batchStorageDeletes(
 		deletes: Array<() => void>,
 		operation: string
@@ -8344,6 +8501,7 @@ export class LightningNode extends EventEmitter {
 		if (!result.valid || !result.pubkey) {
 			return { valid: false, pubkey: null, knownNode: false };
 		}
+		this.requireGraph('verifyMessage');
 		const knownNode = this.graph.getNode(result.pubkey) !== undefined;
 		return {
 			valid: true,
@@ -9036,6 +9194,8 @@ export class LightningNode extends EventEmitter {
 	 * loadRapidGossipSnapshotAsync, which leaves the same graph.
 	 */
 	loadRapidGossipSnapshot(data: Buffer): IRapidGossipResult {
+		// Disk rows land first, as they always did.
+		this.requireGraph('loadRapidGossipSnapshot');
 		return applyRapidGossipSnapshot(this.graph, data);
 	}
 
@@ -9236,7 +9396,10 @@ export class LightningNode extends EventEmitter {
 
 		// 1. Gossip graph: node_announcement addresses in announced order. Only
 		// a signature-verified announcement may supply dial targets; a
-		// deferred one is resolved by this read (issue #443).
+		// deferred one is resolved by this read (issue #443). A cooperative
+		// restore of the stored map is waited for, so its addresses are in.
+		await this.whenGraphRestored();
+		assertNotCancelled();
 		const announced =
 			this.graph.getVerifiedNodeAnnouncement(Buffer.from(pubkey, 'hex'))
 				?.addresses ?? [];
@@ -14442,6 +14605,7 @@ export class LightningNode extends EventEmitter {
 		timeoutMs?: number;
 	}): Promise<IRebalanceResult> {
 		if (this._destroyed) throw new Error('Node destroyed');
+		this.requireGraph('rebalanceChannel');
 		const { fromChannelId, toChannelId, amountSats, maxFeeSats } = options;
 		const cidErr =
 			validateBuffer(fromChannelId, 32, 'fromChannelId') ||
@@ -15441,6 +15605,16 @@ export class LightningNode extends EventEmitter {
 
 	/** Keep our graph and disk as fresh as the signed update we advertise. */
 	private storeOwnChannelUpdate(payload: Buffer): void {
+		// Written once the stored map is back, so the restore's older row
+		// cannot replace it.
+		if (
+			this.afterGraphRestored(
+				() => this.storeOwnChannelUpdate(payload),
+				'own channel_update store'
+			)
+		) {
+			return;
+		}
 		try {
 			const update = decodeChannelUpdateMessage(payload);
 			this.graph.applyChannelUpdate(update, { verified: true });
@@ -15611,6 +15785,8 @@ export class LightningNode extends EventEmitter {
 			cltvExpiryDelta = directPolicy.cltvExpiryDelta;
 		}
 		if (state.shortChannelId) {
+			// Only a public channel's update is in the graph.
+			if (state.announceChannel) this.requireGraph('routing hint');
 			const graphChannel = this.graph.getChannel(state.shortChannelId);
 			const peerUpdate = graphChannel?.nodeId1.equals(peerPubkey)
 				? graphChannel.update1
@@ -15650,6 +15826,7 @@ export class LightningNode extends EventEmitter {
 		feeBaseMsat: number;
 		feeProportionalMillionths: number;
 	} | null {
+		this.requireGraph('findBlindedIntroExtension');
 		const ourNodeId = getPublicKey(this.nodePrivkey);
 		for (const edge of this.graph.getNodeChannels(peerPubkey)) {
 			const introIsNode1 = edge.nodeId2.equals(peerPubkey);
@@ -15741,6 +15918,8 @@ export class LightningNode extends EventEmitter {
 				htlcMaximumMsat = directPolicy.htlcMaximumMsat;
 			}
 			if (state.shortChannelId) {
+				// Only a public channel's update is in the graph.
+				if (state.announceChannel) this.requireGraph('blinded path');
 				const graphChannel = this.graph.getChannel(state.shortChannelId);
 				const peerUpdate = graphChannel?.nodeId1.equals(peerPubkey)
 					? graphChannel.update1
@@ -15961,6 +16140,18 @@ export class LightningNode extends EventEmitter {
 		type: number,
 		payload: Buffer
 	): void {
+		// Peers' queries, and the replies to ours, read the graph: while a
+		// cooperative restore brings the stored map back they wait for it, so
+		// none is answered from part of the map.
+		if (
+			GRAPH_READING_GOSSIP.has(type) &&
+			this.afterGraphRestored(
+				() => this.handleGossipMessage(pubkey, type, payload),
+				'gossip query'
+			)
+		) {
+			return;
+		}
 		switch (type) {
 			// Broadcast gossip is queued, not handled inline: see gossipIntake.
 			// Query/reply traffic stays synchronous below; it is low-volume,
@@ -15985,6 +16176,16 @@ export class LightningNode extends EventEmitter {
 					return; // malformed gossip — same silent drop as the handler's
 				}
 				if (ours) {
+					// Applied once the stored map is back, so the restore's
+					// older row cannot replace it.
+					if (
+						this.afterGraphRestored(
+							() => this.handleChannelUpdate(payload),
+							'own channel_update'
+						)
+					) {
+						break;
+					}
 					this.handleChannelUpdate(payload);
 					break;
 				}
@@ -16080,11 +16281,12 @@ export class LightningNode extends EventEmitter {
 	 * how much an overflow episode dropped (if any) and closes it.
 	 */
 	private drainGossipIntake(): void {
-		// Held while a cooperative RGS import runs, so queued gossip lands
-		// after the snapshot. gossipIntakeDraining stays set meanwhile, so
-		// flushGossip keeps waiting and no second drain is scheduled; once
-		// destroyed, the next check falls through to the reset below.
-		if (this.rapidGossipImporting && !this._destroyed) {
+		// Held while a cooperative RGS import or restore of the stored map
+		// runs, so queued gossip lands after them. gossipIntakeDraining stays
+		// set meanwhile, so flushGossip keeps waiting and no second drain is
+		// scheduled; once destroyed, the next check falls through to the
+		// reset below.
+		if ((this.rapidGossipImporting || this.graphRestore) && !this._destroyed) {
 			setTimeout(() => this.drainGossipIntake(), 25);
 			return;
 		}
@@ -16265,6 +16467,16 @@ export class LightningNode extends EventEmitter {
 	 * Initiate gossip sync with a connected peer.
 	 */
 	initiateGossipSync(pubkey: string): void {
+		// What the peer lacks is judged against the graph, so the sync starts
+		// once the stored map is back.
+		if (
+			this.afterGraphRestored(
+				() => this.initiateGossipSync(pubkey),
+				'gossip sync'
+			)
+		) {
+			return;
+		}
 		pubkey = normalizeHexPubkey(pubkey);
 		const mgr = this.getOrCreateSyncManager(pubkey);
 		const messages = mgr.initiateSync(this.gossipRepairPending);
@@ -16912,6 +17124,7 @@ export class LightningNode extends EventEmitter {
 		budget: IPayAllBudget,
 		context?: IPaymentRetryContext
 	): IPayAllRouteResult {
+		this.requireGraph('payAllRoute');
 		const baseHeight = this.cltvBaseHeight(invoice.paymentHash);
 		return findPayAllRoute({
 			graph: this.graph,
@@ -17051,6 +17264,7 @@ export class LightningNode extends EventEmitter {
 		policyOverrides?: TPolicyOverrides,
 		metadata?: Record<string, string>
 	): IPaymentInfo {
+		this.requireGraph('sendPayment');
 		// Taken once, so a send a payment:failed listener starts from inside
 		// this call is not mistaken for the retry.
 		const redispatching = this.redispatchingRetryContext;
@@ -18188,6 +18402,7 @@ export class LightningNode extends EventEmitter {
 		excludedChannels?: Set<string>,
 		policyOverrides?: TPolicyOverrides
 	): IPaymentInfo {
+		this.requireGraph('dispatchKeysend');
 		const {
 			destination,
 			amountMsat,
@@ -19179,6 +19394,7 @@ export class LightningNode extends EventEmitter {
 			const outScid = hopPayload.shortChannelId;
 			// A deferred row (learned lazily, or restored without settled
 			// flags) is verified here: nothing else on this path would.
+			if (outScid) this.requireGraph('ffor settle');
 			const ann = outScid
 				? this.graph.getVerifiedChannelAnnouncement(outScid)
 				: undefined;
@@ -22151,6 +22367,7 @@ export class LightningNode extends EventEmitter {
 		pubkeyHex = normalizeHexPubkey(pubkeyHex);
 		const init = this.peerManager?.getPeer(pubkeyHex)?.getRemoteInit();
 		if (init) return init.features.hasFeature(Feature.ASYNC_RECEIVE_SERVICE);
+		this.requireGraph('peerAdvertisesAsyncReceive');
 		const ann = this.graph.getVerifiedNodeAnnouncement(
 			Buffer.from(pubkeyHex, 'hex')
 		);
@@ -26316,6 +26533,7 @@ export class LightningNode extends EventEmitter {
 		hops: number;
 		cltvDelta: number;
 	} | null {
+		this.requireGraph('estimateRouteFee');
 		try {
 			const decoded = decodeInvoice(bolt11);
 			// Same precedence sendPayment applies (see estimatePayment).
@@ -26370,6 +26588,7 @@ export class LightningNode extends EventEmitter {
 		bolt11: string,
 		amountSats?: number
 	): IPaymentEstimate | null {
+		this.requireGraph('estimatePayment');
 		try {
 			const decoded = decodeInvoice(bolt11);
 			// The precedence sendPayment applies: a fixed invoice is paid for its
@@ -26497,6 +26716,7 @@ export class LightningNode extends EventEmitter {
 		hops?: number;
 		path?: Array<{ pubkey: string; shortChannelId: string }>;
 	} {
+		this.requireGraph('probeRoute');
 		try {
 			const amountMsat = BigInt(amountSats) * 1000n;
 			const destBuf = Buffer.from(destination, 'hex');
@@ -26555,6 +26775,7 @@ export class LightningNode extends EventEmitter {
 		amountMsat: bigint,
 		finalCltvExpiry: number = DEFAULT_MIN_FINAL_CLTV_EXPIRY
 	): IRoute | null {
+		this.requireGraph('queryRoute');
 		const sourceBuf = Buffer.from(this.nodeId, 'hex');
 		return findRoute(
 			this.graph,
@@ -29611,6 +29832,7 @@ export class LightningNode extends EventEmitter {
 			fforIssuer?: INodeConfig['fforIssuer'];
 			leaseRates?: import('../gossip/types').ILeaseRates;
 			eagerGossipVerify?: boolean;
+			cooperativeGraphRestore?: boolean;
 			sweepDestinationScript?: Buffer;
 			peerStorageEnabled?: boolean;
 			autoRebalance?: IAutoRebalanceConfig;
@@ -29684,6 +29906,7 @@ export class LightningNode extends EventEmitter {
 			fforIssuer: options?.fforIssuer,
 			leaseRates: options?.leaseRates,
 			eagerGossipVerify: options?.eagerGossipVerify,
+			cooperativeGraphRestore: options?.cooperativeGraphRestore,
 			localFeatures: options?.localFeatures,
 			zeroReserve: options?.zeroReserve,
 			chainHashes: options?.chainHashes,
@@ -30229,6 +30452,7 @@ export class LightningNode extends EventEmitter {
 			timeoutMs?: number;
 		}
 	): Promise<IBolt12Invoice> {
+		this.requireGraph('requestInvoice');
 		// BOLT 12: an offer without offer_chains is for bitcoin mainnet. One
 		// that does not list our chain would be paid on ours to whichever node
 		// holds the issuer's key here.
@@ -32102,8 +32326,9 @@ export class LightningNode extends EventEmitter {
 	private pruneStaleGossipWithStorage(): void {
 		// An RGS import adds every channel before any update, so pruning
 		// mid-import would drop the snapshot's channels as update-less. The
-		// import runs this when it ends instead.
-		if (this.rapidGossipImporting) {
+		// import runs this when it ends instead, and so does a cooperative
+		// restore of the stored map, which prunes as it finishes.
+		if (this.rapidGossipImporting || this.graphRestore) {
 			this.gossipPruneDeferred = true;
 			return;
 		}

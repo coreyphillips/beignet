@@ -21,6 +21,7 @@ import Database from 'better-sqlite3';
 import * as fs from 'fs';
 import {
 	IStorageBackend,
+	IGossipRowPage,
 	IInvoiceInfo,
 	IPersistedChannelPolicy,
 	IForwardingEvent,
@@ -1005,6 +1006,32 @@ export class SqliteStorage implements IStorageBackend {
 		return results;
 	}
 
+	loadGossipChannelsAfter(
+		afterRowid: number,
+		limit: number
+	): IGossipRowPage<IGraphChannel> {
+		const rows = this.db
+			.prepare(
+				'SELECT rowid, channel_json FROM gossip_channels WHERE rowid > ? ORDER BY rowid LIMIT ?'
+			)
+			.all(afterRowid, limit) as Array<{ rowid: number; channel_json: string }>;
+		const results: IGraphChannel[] = [];
+		for (const row of rows) {
+			try {
+				results.push(deserializeGraphChannel(row.channel_json));
+			} catch (err) {
+				// Skip corrupted row
+				this.reportCorruptRow(err);
+			}
+		}
+		return {
+			rows: results,
+			cursor:
+				rows.length > 0 ? Number(rows[rows.length - 1].rowid) : afterRowid,
+			done: rows.length < limit
+		};
+	}
+
 	saveGossipNode(nodeIdHex: string, node: IGraphNode): void {
 		const json = serializeGraphNode(node);
 		this.db
@@ -1034,6 +1061,32 @@ export class SqliteStorage implements IStorageBackend {
 			}
 		}
 		return results;
+	}
+
+	loadGossipNodesAfter(
+		afterRowid: number,
+		limit: number
+	): IGossipRowPage<IGraphNode> {
+		const rows = this.db
+			.prepare(
+				'SELECT rowid, node_json FROM gossip_nodes WHERE rowid > ? ORDER BY rowid LIMIT ?'
+			)
+			.all(afterRowid, limit) as Array<{ rowid: number; node_json: string }>;
+		const results: IGraphNode[] = [];
+		for (const row of rows) {
+			try {
+				results.push(deserializeGraphNode(row.node_json));
+			} catch (err) {
+				// Skip corrupted row
+				this.reportCorruptRow(err);
+			}
+		}
+		return {
+			rows: results,
+			cursor:
+				rows.length > 0 ? Number(rows[rows.length - 1].rowid) : afterRowid,
+			done: rows.length < limit
+		};
 	}
 
 	// ─── Payment Secrets ───

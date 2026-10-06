@@ -1387,11 +1387,13 @@ describe('Gossip intake queue (LightningNode)', () => {
 		for (const part of parts) {
 			expect(stats![part], part).to.be.a('number').and.at.least(0);
 		}
-		// The parts are consecutive, so they add up to the whole, and the
-		// whole restore from storage takes at least the network map's part.
-		expect(parts.reduce((sum, part) => sum + stats![part], 0)).to.equal(
-			stats!.graphMs
+		// The parts fit in the time spent, all of the map's time inline, and
+		// the whole restore from storage holds the map's part.
+		expect(stats).to.include({ cooperative: false, slices: 1 });
+		expect(parts.reduce((sum, part) => sum + stats![part], 0)).to.be.at.most(
+			stats!.busyMs
 		);
+		expect(stats!.busyMs).to.be.at.most(stats!.graphMs);
 		expect(stats!.restoreMs).to.be.at.least(stats!.graphMs);
 		// A copy: the caller cannot change what the next read says.
 		stats!.channelRows = 99;

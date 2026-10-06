@@ -1006,14 +1006,36 @@ holds the broadcast gossip intake and any stale-gossip prune until it ends,
 and stops when the node is destroyed.
 
 The gossip rows a node has stored come back as it is built, in one pass
-inside the constructor (`restoreFromStorage`). `node.getGraphRestoreStats()`
-(and `BeignetNode.getGraphRestoreStats()`, which adds `constructMs`, the time
-building the whole node took) reports how that went: the rows read, the stale
-channel rows and orphan node rows it deleted, the graph it left, and the
-milliseconds spent reading and parsing the rows, restoring them, deleting,
-pruning and reannouncing. The same figures are logged once as the structured
-log `peer:graph_restored`. `scripts/bench-graph-restore.ts` times it on a
-synthetic store the size of a phone's.
+inside the constructor (`restoreFromStorage`). On a phone that pass holds the
+JavaScript thread for seconds as the wallet opens, so
+`cooperativeGraphRestore: true` (`BeignetNode`'s `deferGraphRestore`) brings
+them back after the constructor instead, a page of rows at a time in slices
+of `LightningNode.GRAPH_RESTORE_SLICE_MS`, with the event loop served between
+slices, and leaves the same graph and the same rows on disk. Until it ends,
+nothing else writes the graph, so a row from disk never replaces live data:
+the broadcast gossip intake holds, a stale-gossip prune is deferred to its
+end, an RGS import waits its turn, and our own channel updates, peers' gossip
+queries and our own gossip sync wait for it. Anything that decides an
+outcome from the graph (route finding for payments, probes and estimates, a
+public channel's route hint, an FFOR settlement's announcement check)
+finishes it first, synchronously, and logs `peer:graph_restore_forced`.
+`node.whenGraphRestored()` settles once the map is back (false if a storage
+failure or the node's destruction cut it short), `isGraphRestoring()` says
+whether it is still running, and `BeignetNode.getGraphInfo()` adds
+`restoring: true` meanwhile. A storage failure mid-restore is reported as
+`node:error` `GRAPH_RESTORE_FAILED` and deletes nothing.
+
+`node.getGraphRestoreStats()` (and `BeignetNode.getGraphRestoreStats()`,
+which adds `constructMs`, the time building the whole node took) reports how
+the restore went: inline or not, the rows read, the stale channel rows and
+orphan node rows it left out (and deleted, when the storage can), the graph
+it left, its time from start to end, the part spent restoring and in how many
+slices, and the milliseconds spent reading and parsing the rows, restoring
+them, deleting, pruning and reannouncing. A cooperative restore has none to
+report until it ends; it then emits `graph:restored` with them. The same
+figures are logged once as the structured log `peer:graph_restored`.
+`scripts/bench-graph-restore.ts` times both on a synthetic store the size of
+a phone's.
 
 Gossip provenance has three states: verified (`*Verified: true`, servable),
 unverified (`*Verified: false`, failed verification or signatureless, never
