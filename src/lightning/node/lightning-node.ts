@@ -16820,6 +16820,10 @@ export class LightningNode extends EventEmitter {
 		} catch {
 			return;
 		}
+		// Refused before it is held, as handleChannelUpdate refuses it before
+		// any side effect: a far-future update would take the newest slot
+		// from the peer's real one and then fail at the graph's gate.
+		if (gossipTimestampTooFarFuture(msg.timestamp)) return;
 		const key = `${msg.shortChannelId.toString('hex')}:${msg.channelFlags & 1}`;
 		const held = this.ownUpdatesWaiting.get(key);
 		if (held && held.timestamp >= msg.timestamp) return;
