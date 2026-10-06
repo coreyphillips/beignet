@@ -333,6 +333,7 @@ import {
 	FundingWaitTimeoutError,
 	IChannelHealth,
 	IStructuredLog,
+	IGraphRestoreStats,
 	IPaymentProof,
 	IPaymentEstimate,
 	IKeysendOptions,
@@ -1144,6 +1145,8 @@ export class LightningNode extends EventEmitter {
 	private rapidGossipImportTail: Promise<unknown> = Promise.resolve();
 	/** A prune was asked for during an import; it runs when the import ends. */
 	private gossipPruneDeferred = false;
+	/** How the stored network map came back (getGraphRestoreStats). */
+	private graphRestoreStats: IGraphRestoreStats | null = null;
 	/**
 	 * SCIDs of verified graph channels whose funding output is still to be
 	 * checked on chain, oldest first (issue #1105). Only filled when the chain
@@ -2559,7 +2562,14 @@ export class LightningNode extends EventEmitter {
 			if (owesRepair && !tailOwed) {
 				this.storage.setRecoveryMeta?.(REPAIR_TAIL_KEY, 'owed');
 			}
+			const restoreStarted = Date.now();
 			this.restoreFromStorage();
+			if (this.graphRestoreStats) {
+				this.graphRestoreStats.restoreMs = Date.now() - restoreStarted;
+				this.emitStructuredLog('peer', 'graph_restored', {
+					...this.graphRestoreStats
+				});
+			}
 			this.reconcileFforVoucherPayments();
 			// Channels and forward linkage are loaded: settle every held
 			// forward whose outcome those durable facts already decide.
@@ -3566,7 +3576,15 @@ export class LightningNode extends EventEmitter {
 		// it surfaces as a node that takes minutes to start rather than as a
 		// node that stalls.
 		const staleRowDeletes: Array<() => void> = [];
-		for (const channel of this.storage.loadAllGossipChannels()) {
+		// Each step is timed and counted for getGraphRestoreStats: on a phone
+		// this block may be most of a cold start's longest hold on the JS
+		// thread.
+		const graphStarted = Date.now();
+		const channelRows = this.storage.loadAllGossipChannels();
+		const channelsLoaded = Date.now();
+		const channelRowCount = channelRows.length;
+		let staleChannels = 0;
+		for (const channel of channelRows) {
 			const ts1 =
 				channel.update1 &&
 				!gossipTimestampTooFarFuture(channel.update1.timestamp)
@@ -3578,6 +3596,7 @@ export class LightningNode extends EventEmitter {
 					? channel.update2.timestamp
 					: 0;
 			if (Math.max(ts1, ts2) < gossipRestoreCutoff) {
+				staleChannels++;
 				if (typeof this.storage.deleteGossipChannel === 'function') {
 					const scidHex = channel.shortChannelId.toString('hex');
 					staleRowDeletes.push(() =>
@@ -3590,6 +3609,7 @@ export class LightningNode extends EventEmitter {
 			diskChannelEndpoints.add(channel.nodeId2.toString('hex'));
 			this.graph.restoreChannel(channel);
 		}
+		const channelsRestored = Date.now();
 		// The channel loop above created a graph node entry for every restored
 		// channel endpoint. A node row absent from the graph AND from the
 		// surviving disk channel rows' endpoints has no channel behind it: an
@@ -3600,13 +3620,16 @@ export class LightningNode extends EventEmitter {
 		// it returns with its channel on a later boot. Channel peer reconnects
 		// are unaffected: their addresses live in the announced peer address
 		// capture, not in gossip_nodes.
-		for (const node of this.storage.loadAllGossipNodes()) {
+		const nodeRows = this.storage.loadAllGossipNodes();
+		const nodesLoaded = Date.now();
+		const nodeRowCount = nodeRows.length;
+		let orphanNodes = 0;
+		for (const node of nodeRows) {
 			if (!this.graph.getNode(node.nodeId)) {
 				const nodeIdHex = node.nodeId.toString('hex');
-				if (
-					!diskChannelEndpoints.has(nodeIdHex) &&
-					typeof this.storage.deleteGossipNode === 'function'
-				) {
+				if (diskChannelEndpoints.has(nodeIdHex)) continue;
+				orphanNodes++;
+				if (typeof this.storage.deleteGossipNode === 'function') {
 					staleRowDeletes.push(() =>
 						this.storage!.deleteGossipNode!(nodeIdHex)
 					);
@@ -3615,13 +3638,16 @@ export class LightningNode extends EventEmitter {
 			}
 			this.graph.restoreNode(node);
 		}
+		const nodesRestored = Date.now();
 		// gossip_nodes carries no foreign key to gossip_channels, so holding
 		// the channel deletes back until here cannot change what the node
 		// loop above saw on disk.
 		this.batchStorageDeletes(staleRowDeletes, 'gossipRestoreCleanup');
+		const rowsDeleted = Date.now();
 
 		// Prune stale gossip immediately on restore (BOLT 7: >2 weeks = stale)
 		this.pruneStaleGossipWithStorage();
+		const graphPruned = Date.now();
 
 		// Rebuild every usable public channel from its stored signatures, even
 		// when the graph row survived. The announcement handler also restores
@@ -3634,6 +3660,25 @@ export class LightningNode extends EventEmitter {
 				this.channelManager.reannounceChannel(channelId);
 			}
 		}
+		const reannounced = Date.now();
+		// The caller adds restoreMs once the rest of the restore is done.
+		this.graphRestoreStats = {
+			graphMs: reannounced - graphStarted,
+			restoreMs: 0,
+			channelRows: channelRowCount,
+			staleChannels,
+			nodeRows: nodeRowCount,
+			orphanNodes,
+			graphChannels: this.graph.getChannelCount(),
+			graphNodes: this.graph.getNodeCount(),
+			loadChannelsMs: channelsLoaded - graphStarted,
+			restoreChannelsMs: channelsRestored - channelsLoaded,
+			loadNodesMs: nodesLoaded - channelsRestored,
+			restoreNodesMs: nodesRestored - nodesLoaded,
+			deleteMs: rowsDeleted - nodesRestored,
+			pruneMs: graphPruned - rowsDeleted,
+			reannounceMs: reannounced - graphPruned
+		};
 
 		// JIT receive: bring back the live intents (so invoices already out
 		// there stay payable) and queue every pre-restart held HTLC to be
@@ -8970,6 +9015,16 @@ export class LightningNode extends EventEmitter {
 
 	getGraph(): NetworkGraph {
 		return this.graph;
+	}
+
+	/**
+	 * How the stored network map came back as this node was built, or null
+	 * for a node without storage. The restore runs inside the constructor,
+	 * before anyone can listen for the `graph_restored` structured log that
+	 * also carries it, so a client timing its boot reads it here.
+	 */
+	getGraphRestoreStats(): IGraphRestoreStats | null {
+		return this.graphRestoreStats ? { ...this.graphRestoreStats } : null;
 	}
 
 	/**

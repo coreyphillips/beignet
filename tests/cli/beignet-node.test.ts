@@ -504,6 +504,29 @@ describe('BeignetNode', () => {
 		}
 	});
 
+	it('reports how the stored network map came back and how long building the node took', async function () {
+		this.timeout(20_000);
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-graph-stats-'));
+		const node = await BeignetNode.create({
+			network: 'regtest',
+			dataDir: dir,
+			logLevel: 'silent',
+			...OFFLINE_ELECTRUM
+		});
+		try {
+			const stats = node.getGraphRestoreStats();
+			expect(stats).to.not.equal(null);
+			expect(stats!.channelRows).to.equal(0);
+			expect(stats!.nodeRows).to.equal(0);
+			// Building the node includes its whole restore from storage.
+			expect(stats!.constructMs).to.be.a('number');
+			expect(stats!.constructMs!).to.be.at.least(stats!.restoreMs);
+			expect(stats!.restoreMs).to.be.at.least(stats!.graphMs);
+		} finally {
+			await node.destroy();
+		}
+	});
+
 	it('create comes up over an unreachable Electrum, on a locally derived sweep address', async function () {
 		this.timeout(20_000);
 		// This asserted the opposite until #400: it wrapped `expect.fail` in a

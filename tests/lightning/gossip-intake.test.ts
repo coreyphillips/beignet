@@ -1320,6 +1320,100 @@ describe('Gossip intake queue (LightningNode)', () => {
 		expect(remaining[0].nodeId.equals(ann.msg.nodeId1)).to.equal(true);
 	});
 
+	it('boot counts and times the network map it restores (getGraphRestoreStats)', async () => {
+		node.destroy();
+		storage = new SqliteStorage(dbPath);
+		storage.open();
+
+		const now = Math.floor(Date.now() / 1000);
+		const fresh = buildAnnouncement(840, REGTEST_CHAIN_HASH);
+		const freshUpd = buildUpdate(fresh, now - 60, 0, REGTEST_CHAIN_HASH);
+		storage.saveGossipChannel(fresh.msg.shortChannelId.toString('hex'), {
+			shortChannelId: fresh.msg.shortChannelId,
+			nodeId1: fresh.msg.nodeId1,
+			nodeId2: fresh.msg.nodeId2,
+			features: Buffer.alloc(0),
+			announcement: fresh.msg,
+			update1: freshUpd.msg
+		});
+		const stale = buildAnnouncement(841, REGTEST_CHAIN_HASH);
+		const staleUpd = buildUpdate(
+			stale,
+			now - DEFAULT_PRUNE_MAX_AGE - 3600,
+			0,
+			REGTEST_CHAIN_HASH
+		);
+		storage.saveGossipChannel(stale.msg.shortChannelId.toString('hex'), {
+			shortChannelId: stale.msg.shortChannelId,
+			nodeId1: stale.msg.nodeId1,
+			nodeId2: stale.msg.nodeId2,
+			features: Buffer.alloc(0),
+			announcement: stale.msg,
+			update1: staleUpd.msg
+		});
+		for (const nodeId of [fresh.msg.nodeId1, fresh.msg.nodeId2]) {
+			storage.saveGossipNode(nodeId.toString('hex'), {
+				nodeId,
+				channels: new Set([fresh.msg.shortChannelId.toString('hex')])
+			});
+		}
+		const orphanId = buildAnnouncement(842, REGTEST_CHAIN_HASH).msg.nodeId1;
+		storage.saveGossipNode(orphanId.toString('hex'), {
+			nodeId: orphanId,
+			channels: new Set(['bb'.repeat(8)])
+		});
+
+		node = new LightningNode(makeConfig());
+
+		const stats = node.getGraphRestoreStats();
+		expect(stats).to.not.equal(null);
+		expect(stats).to.deep.include({
+			channelRows: 2,
+			staleChannels: 1,
+			nodeRows: 3,
+			orphanNodes: 1,
+			graphChannels: 1,
+			graphNodes: 2
+		});
+		const parts = [
+			'loadChannelsMs',
+			'restoreChannelsMs',
+			'loadNodesMs',
+			'restoreNodesMs',
+			'deleteMs',
+			'pruneMs',
+			'reannounceMs'
+		] as const;
+		for (const part of parts) {
+			expect(stats![part], part).to.be.a('number').and.at.least(0);
+		}
+		// The parts are consecutive, so they add up to the whole, and the
+		// whole restore from storage takes at least the network map's part.
+		expect(parts.reduce((sum, part) => sum + stats![part], 0)).to.equal(
+			stats!.graphMs
+		);
+		expect(stats!.restoreMs).to.be.at.least(stats!.graphMs);
+		// A copy: the caller cannot change what the next read says.
+		stats!.channelRows = 99;
+		expect(node.getGraphRestoreStats()!.channelRows).to.equal(2);
+		// Persisted with the action log, where a phone's boot can be read back.
+		const logged = storage
+			.loadActionLog({ category: 'peer' })
+			.filter((entry) => entry.action === 'graph_restored')
+			.map((entry) => JSON.parse(entry.data) as Record<string, number>)
+			.find((data) => data.channelRows === 2);
+		expect(logged).to.deep.include({ staleChannels: 1, orphanNodes: 1 });
+	});
+
+	it('a node without storage has no network map restore to report', () => {
+		const bare = new LightningNode({ ...makeConfig(), storage: undefined });
+		try {
+			expect(bare.getGraphRestoreStats()).to.equal(null);
+		} finally {
+			bare.destroy();
+		}
+	});
+
 	it('boot keeps node rows referenced by channel rows retained past the ceiling', async () => {
 		// restoreChannel deliberately leaves excess verified channel rows on
 		// disk when the ceiling was lowered between runs. Their endpoints are

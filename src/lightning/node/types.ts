@@ -1858,6 +1858,48 @@ export interface IStructuredLog {
 	data: Record<string, unknown>;
 }
 
+/**
+ * How the stored network map came back as the node was built
+ * (LightningNode.getGraphRestoreStats). Counts are rows read from storage and
+ * what the graph held afterwards; times are milliseconds of the synchronous
+ * restore, which runs inside the constructor.
+ */
+export interface IGraphRestoreStats {
+	/** The network map's part: reads, restores, deletes, prune, reannounce. */
+	graphMs: number;
+	/** The whole restore from storage, the network map included. */
+	restoreMs: number;
+	channelRows: number;
+	/**
+	 * Channel rows past the freshness cutoff: not restored, and deleted when
+	 * the storage can delete gossip rows.
+	 */
+	staleChannels: number;
+	nodeRows: number;
+	/**
+	 * Node rows with no channel row behind them on disk: not restored, and
+	 * deleted when the storage can delete gossip rows.
+	 */
+	orphanNodes: number;
+	/** The graph once the restore and its prune are done. */
+	graphChannels: number;
+	graphNodes: number;
+	/** Reading the channel rows and parsing them. */
+	loadChannelsMs: number;
+	restoreChannelsMs: number;
+	/** Reading the node rows and parsing them. */
+	loadNodesMs: number;
+	restoreNodesMs: number;
+	deleteMs: number;
+	pruneMs: number;
+	reannounceMs: number;
+	/**
+	 * Building the LightningNode, the restore included. Only BeignetNode,
+	 * which builds it, can time that.
+	 */
+	constructMs?: number;
+}
+
 // ─── Payment Proof ───
 
 export interface IPaymentProof {

@@ -1005,6 +1005,16 @@ runs one import at a time in slices of `LightningNode.RAPID_GOSSIP_SLICE_MS`,
 holds the broadcast gossip intake and any stale-gossip prune until it ends,
 and stops when the node is destroyed.
 
+The gossip rows a node has stored come back as it is built, in one pass
+inside the constructor (`restoreFromStorage`). `node.getGraphRestoreStats()`
+(and `BeignetNode.getGraphRestoreStats()`, which adds `constructMs`, the time
+building the whole node took) reports how that went: the rows read, the stale
+channel rows and orphan node rows it deleted, the graph it left, and the
+milliseconds spent reading and parsing the rows, restoring them, deleting,
+pruning and reannouncing. The same figures are logged once as the structured
+log `peer:graph_restored`. `scripts/bench-graph-restore.ts` times it on a
+synthetic store the size of a phone's.
+
 Gossip provenance has three states: verified (`*Verified: true`, servable),
 unverified (`*Verified: false`, failed verification or signatureless, never
 served and never re-checked) and deferred (`*VerifyDeferred: true` with the
