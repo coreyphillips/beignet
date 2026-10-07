@@ -1240,8 +1240,9 @@ export class NetworkGraph {
 	 * one per endpoint's node announcement), so a check per channel let a
 	 * reply overrun the budget by all of them: on a phone, pure-JS
 	 * secp256k1 put about 0.1 s of overrun on each of the requester's
-	 * retries. Now the overrun is one check. Returns false when the budget
-	 * ran out first; what was checked keeps its sticky result, and the
+	 * retries. Now the overrun is one message verification, which still
+	 * checks four signatures together for a channel announcement. Returns
+	 * false when the budget ran out first; what was checked keeps its sticky result, and the
 	 * rest stays deferred for a later window.
 	 */
 	private _settleForServing(

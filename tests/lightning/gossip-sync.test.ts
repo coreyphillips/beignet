@@ -1815,10 +1815,11 @@ describe('Gossip Sync (Phase 5)', function () {
 			expect(served.complete).to.equal(true);
 		});
 
-		it('draws on the serve budget before each signature, not once per channel', function () {
+		it('draws on the serve budget before each message, not once per channel', function () {
 			// Checked once per channel, the budget let one reply overrun it by
 			// every signature of the channel it had started: up to eight. Drawn
-			// before each check, the overrun is one check; the channel then
+			// before each message, the overrun is one message verification,
+			// still four signatures for an announcement. The channel then
 			// waits whole, the checks already made stay settled, and only the
 			// rest run in a later window.
 			const graph = new NetworkGraph();
