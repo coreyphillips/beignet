@@ -2831,8 +2831,9 @@ export class LightningNode extends EventEmitter {
 
 		// Compose the initial Recovery Capsule (spec 5.4) so peers connecting
 		// before the first journaled transition still receive a current blob
-		// via sendPeerStorageOnConnect.
-		this.scheduleRecoveryCapsuleRefresh();
+		// via sendPeerStorageOnConnect. It runs in its own task, just after
+		// this constructor returns (scheduleInitialCapsule).
+		this.scheduleInitialCapsule();
 
 		this.startCleanupTimer();
 
@@ -6615,6 +6616,30 @@ export class LightningNode extends EventEmitter {
 			this.capsuleRefreshTimer = null;
 			this.refreshRecoveryCapsule();
 		}, LightningNode.PEER_STORAGE_MIN_INTERVAL_MS - elapsed);
+		if (typeof timer.unref === 'function') timer.unref();
+		this.capsuleRefreshTimer = timer;
+	}
+
+	/**
+	 * The run's first capsule, composed in a task of its own just after the
+	 * constructor returns instead of inside it. Composing re-bases the
+	 * journal and verifies the stored chain (prepareForReplication, then
+	 * composeRecoveryCapsule); on a phone that was about 0.33 s of a 0.8 s
+	 * constructor, all of it in one block on the thread that draws the
+	 * wallet. Nothing waits on it in between: the capsule stays dirty until
+	 * it is composed, so a provider that connects first gets a freshly
+	 * composed one (sendPeerStorageOnConnect), and a journaled commit
+	 * composes through the throttle as before.
+	 */
+	private scheduleInitialCapsule(): void {
+		if (!this.recoveryCapsuleActive || !this.peerStorageEnabled) return;
+		this.capsuleDirty = true;
+		if (this.capsuleRefreshTimer) return;
+		const timer = setTimeout(() => {
+			this.capsuleRefreshTimer = null;
+			if (this._destroyed || !this.capsuleDirty) return;
+			this.scheduleRecoveryCapsuleRefresh();
+		}, 0);
 		if (typeof timer.unref === 'function') timer.unref();
 		this.capsuleRefreshTimer = timer;
 	}

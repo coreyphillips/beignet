@@ -163,6 +163,11 @@ function createNode(
 	return node;
 }
 
+/** One macrotask: what the node's first capsule waits for. */
+function nextTask(): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 function connectNodes(nodeA: LightningNode, nodeB: LightningNode): void {
 	nodeA.on('message:outbound', (pubkey: string, type: number, p: Buffer) => {
 		if (pubkey === nodeB.getNodeId()) {
@@ -1359,7 +1364,7 @@ describe('Recovery phase 3: capsule guardian locators (issue #457)', () => {
 });
 
 describe('Recovery phase 3: review regressions', () => {
-	it('startup capsule re-bases a journal left stale by a disabled period', () => {
+	it('startup capsule re-bases a journal left stale by a disabled period', async () => {
 		// node.destroy() closes its storage, so the three runs share a
 		// file-backed database instead of one ':memory:' handle.
 		const dbPath = path.join(
@@ -1382,13 +1387,14 @@ describe('Recovery phase 3: review regressions', () => {
 		run2.createInvoice({ amountMsat: 2_000n, description: 'state-b' });
 		run2.destroy();
 
-		// Run 3: recovery enabled again. The INITIAL capsule, captured before
-		// any new transition, must already describe state B: the constructor
-		// re-bases the journal before composing. A capsule whose SCB and
-		// inline Tier 2 journal describe different points in time is exactly
-		// the stale-restore bug.
+		// Run 3: recovery enabled again. The INITIAL capsule, composed in the
+		// task after the constructor and before any new transition, must
+		// already describe state B: the journal re-bases before composing. A
+		// capsule whose SCB and inline Tier 2 journal describe different
+		// points in time is exactly the stale-restore bug.
 		const run3Storage = openFile();
 		const run3 = createNode(4, run3Storage, true);
+		await nextTask();
 		const blob = (run3 as unknown as { ourPeerStorageBlob: Buffer | null })
 			.ourPeerStorageBlob;
 		expect(blob, 'initial capsule composed').to.not.equal(null);
@@ -1647,7 +1653,7 @@ describe('Recovery phase 3: review regressions', () => {
 		storage.close();
 	});
 
-	it('never inlines a stale journal when the startup re-base fails', () => {
+	it('never inlines a stale journal when the startup re-base fails', async () => {
 		const dbPath = path.join(
 			fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-p3-rebase-')),
 			'rebase.db'
@@ -1683,6 +1689,7 @@ describe('Recovery phase 3: review regressions', () => {
 			}
 		}) as IStorageBackend;
 		const run3 = createNode(6, failing, true);
+		await nextTask();
 		const blob = (run3 as unknown as { ourPeerStorageBlob: Buffer | null })
 			.ourPeerStorageBlob;
 		expect(blob, 'SCB + locator capsule still composed').to.not.equal(null);
@@ -1713,6 +1720,103 @@ describe('Recovery phase 3: review regressions', () => {
 		).to.not.equal(null);
 		run3.destroy();
 		target.close();
+	});
+
+	describe('the first capsule of a run', () => {
+		/** A file-backed node that holds state from an earlier run. */
+		function nodeWithState(seedId: number): {
+			open: () => SqliteStorage;
+		} {
+			const dbPath = path.join(
+				fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-p3-first-')),
+				'first.db'
+			);
+			const open = (): SqliteStorage => {
+				const s = new SqliteStorage(dbPath);
+				s.open();
+				return s;
+			};
+			const earlier = createNode(seedId, open(), true);
+			earlier.createInvoice({ amountMsat: 1_000n, description: 'earlier' });
+			earlier.destroy();
+			return { open };
+		}
+
+		function ownBlob(node: LightningNode): Buffer | null {
+			return (node as unknown as { ourPeerStorageBlob: Buffer | null })
+				.ourPeerStorageBlob;
+		}
+
+		function dirty(node: LightningNode): boolean {
+			return (node as unknown as { capsuleDirty: boolean }).capsuleDirty;
+		}
+
+		it('is composed in the task after the constructor, not inside it', async () => {
+			const { open } = nodeWithState(7);
+			const node = createNode(7, open(), true);
+			// The constructor leaves the capsule dirty and composes nothing.
+			expect(ownBlob(node)).to.equal(null);
+			expect(dirty(node)).to.equal(true);
+
+			await nextTask();
+			const blob = ownBlob(node);
+			expect(blob, 'first capsule composed').to.not.equal(null);
+			const capsule = decodeRecoveryCapsuleBlob(
+				blob!,
+				makeNodeConfig(7).nodePrivateKey
+			)!;
+			expect(capsule.inlineRecoveryState).to.not.equal(undefined);
+			expect(dirty(node)).to.equal(false);
+			node.destroy();
+		});
+
+		it('reaches a provider that connects before it is composed, fresh', async () => {
+			const { open } = nodeWithState(8);
+			const node = createNode(8, open(), true);
+			const capablePk = '03'.repeat(33);
+			const capableFeatures = FeatureFlags.empty();
+			capableFeatures.setOptional(Feature.PROVIDE_STORAGE);
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			(node as unknown as { peerManager: unknown }).peerManager = {
+				listPeers: (): unknown[] => [{ pubkey: capablePk }],
+				getPeer: (): unknown => ({
+					getRemoteInit: (): unknown => ({ features: capableFeatures })
+				}),
+				sendToPeer: (_pubkey: string, type: number, payload: Buffer): void => {
+					sent.push({ type, payload });
+				},
+				destroy: (): void => {}
+			};
+			// Same task as the constructor: the first capsule has not run yet.
+			(
+				node as unknown as { sendPeerStorageOnConnect: (pk: string) => void }
+			).sendPeerStorageOnConnect(capablePk);
+
+			const push = sent.find((m) => m.type === MessageType.PEER_STORAGE);
+			expect(push, 'capsule pushed on connect').to.not.equal(undefined);
+			const framed = decodePeerStorageMessage(push!.payload).blob;
+			const raw = framed.subarray(8, 8 + framed.readUInt32BE(4));
+			const capsule = decodeRecoveryCapsuleBlob(
+				Buffer.from(raw),
+				makeNodeConfig(8).nodePrivateKey
+			)!;
+			expect(capsule.inlineRecoveryState).to.not.equal(undefined);
+			expect(dirty(node)).to.equal(false);
+
+			// The deferred task then finds nothing left to compose.
+			const composed = ownBlob(node);
+			await nextTask();
+			expect(ownBlob(node)).to.equal(composed);
+			node.destroy();
+		});
+
+		it('is never composed for a node destroyed before its task runs', async () => {
+			const { open } = nodeWithState(9);
+			const node = createNode(9, open(), true);
+			node.destroy();
+			await nextTask();
+			expect(ownBlob(node)).to.equal(null);
+		});
 	});
 
 	it('tries every replica of a nonconflicting head before dropping lower', () => {
