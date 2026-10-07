@@ -19,6 +19,8 @@ import { getECPair } from './ecc-apis';
 import { BIP32Interface } from 'bip32';
 import { toXOnly } from 'bitcoinjs-lib/src/psbt/bip371';
 
+bitcoin.initEccLib(ecc);
+
 /**
  * PSBT signature validator for Psbt.validateSignaturesOfInput. A 32-byte
  * pubkey means a taproot (x-only, schnorr) signature; 33 bytes means ECDSA.
@@ -292,9 +294,8 @@ export const getAddressFromKeyPair = ({
 				publicKey: keyPair.publicKey,
 				network
 			});
-			if (res.isOk()) {
-				address = res.value.address;
-			}
+			if (res.isErr()) return err(res.error);
+			address = res.value.address;
 			break;
 		case EAddressType.p2wsh:
 			// A sorted-multisig P2WSH address needs every cosigner's key, not a
@@ -360,7 +361,7 @@ export const getAddressesFromPrivateKey = ({
 				addressType,
 				network
 			});
-			if (addressInfo.isErr()) throw new Error(addressInfo.error.message);
+			if (addressInfo.isErr()) throw addressInfo.error;
 			return addressInfo.value;
 		});
 		if (!response) return err('Unable to get addresses from private key.');
