@@ -15,7 +15,7 @@ import { addressTypes, getAddressTypes } from '../shapes';
 import { getKeyDerivationPathObject } from './derivation-path';
 import { ECPairInterface } from 'ecpair';
 import { ecc } from './ecc';
-import { ECPair } from './ecc-apis';
+import { getECPair } from './ecc-apis';
 import { BIP32Interface } from 'bip32';
 import { toXOnly } from 'bitcoinjs-lib/src/psbt/bip371';
 
@@ -35,7 +35,7 @@ export const validatePsbtSignature = (
 	if (pubkey.length === 32) {
 		return Boolean(ecc.verifySchnorr(msghash, pubkey, signature));
 	}
-	return ECPair.fromPublicKey(pubkey).verify(msghash, signature);
+	return getECPair().fromPublicKey(pubkey).verify(msghash, signature);
 };
 
 /**
@@ -353,7 +353,7 @@ export const getAddressesFromPrivateKey = ({
 }): Result<IGetAddressesFromPrivateKey> => {
 	try {
 		if (!privateKey) return err('No private key provided.');
-		const keyPair = ECPair.fromWIF(privateKey, network);
+		const keyPair = getECPair().fromWIF(privateKey, network);
 		const response = addrTypes.map((addressType) => {
 			const addressInfo = getAddressFromKeyPair({
 				keyPair,

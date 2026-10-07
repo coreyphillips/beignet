@@ -17,7 +17,8 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../utils/ecc';
-import { ECPair } from '../utils/ecc-apis';
+import { ECPairInterface } from 'ecpair';
+import { getECPair } from '../utils/ecc-apis';
 import type { Wallet } from '../wallet';
 import type { IUtxo } from '../types';
 import {
@@ -227,9 +228,9 @@ export function directFundingWallet(
 			if (!utxo) return null;
 			const kind = scriptKind(coin.script);
 			if (!kind) return null;
-			let keyPair: ReturnType<typeof ECPair.fromWIF>;
+			let keyPair: ECPairInterface;
 			try {
-				keyPair = ECPair.fromWIF(wallet.getPrivateKey(utxo.path), network);
+				keyPair = getECPair().fromWIF(wallet.getPrivateKey(utxo.path), network);
 			} catch {
 				// Watch-only, or a path this wallet cannot derive.
 				return null;

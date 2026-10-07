@@ -7,7 +7,7 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
-import { ECPair } from '../../utils/ecc-apis';
+import { getECPair } from '../../utils/ecc-apis';
 import { IFundingProvider, IUtxoSelectionOpts } from '../node/types';
 import { ISpliceWalletInput } from '../channel/channel';
 import {
@@ -999,7 +999,10 @@ export class WalletFundingProvider implements IFundingProvider {
 			if (!hex) {
 				throw new Error(`missing raw tx for ${purpose} input ${utxo.tx_hash}`);
 			}
-			const keyPair = ECPair.fromWIF(wallet.getPrivateKey!(utxo.path), network);
+			const keyPair = getECPair().fromWIF(
+				wallet.getPrivateKey!(utxo.path),
+				network
+			);
 			const pubkey = Buffer.from(keyPair.publicKey);
 			if (pubkey.toString('hex') !== utxo.publicKey) {
 				throw new Error(
