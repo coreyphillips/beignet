@@ -5,7 +5,7 @@
  * BIP 340 operates on x-only (32-byte) public keys.
  */
 
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 
 /**
  * Sign a 32-byte message with BIP 340 Schnorr.

@@ -44,7 +44,7 @@
  */
 
 import { randomBytes, timingSafeEqual } from 'crypto';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 import { Peer } from '../transport/peer';
 import { IDuplexTransport } from '../transport/duplex-transport';
 import {

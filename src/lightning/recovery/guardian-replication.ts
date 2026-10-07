@@ -35,7 +35,7 @@ import {
 	statesEqual,
 	xOnlyFromSecret
 } from './guardian-wire';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 import {
 	GuardianStatus,
 	IGuardianRecord,

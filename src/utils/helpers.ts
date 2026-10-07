@@ -13,11 +13,10 @@ import { availableNetworks, isValidBech32mEncodedString } from './wallet';
 import { err, ok, Result } from './result';
 import { addressTypes, getAddressTypes } from '../shapes';
 import { getKeyDerivationPathObject } from './derivation-path';
-import { ECPairFactory, ECPairInterface } from 'ecpair';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ECPairInterface } from 'ecpair';
+import { ECPair, ecc } from './ecc';
 import { BIP32Interface } from 'bip32';
 import { toXOnly } from 'bitcoinjs-lib/src/psbt/bip371';
-const ECPair = ECPairFactory(ecc);
 
 /**
  * PSBT signature validator for Psbt.validateSignaturesOfInput. A 32-byte

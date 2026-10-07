@@ -24,7 +24,7 @@
  * locally, surfaced here as `restore-required` or `unavailable`.
  */
 
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 import { IStorageBackend } from '../storage/types';
 import { INodeConfig } from '../node/types';
 import { getPublicKey } from '../crypto/ecdh';

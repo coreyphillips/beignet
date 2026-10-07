@@ -6,8 +6,7 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
-import * as ecc from '@bitcoinerlab/secp256k1';
-import { ECPairFactory } from 'ecpair';
+import { ECPair, ecc } from '../../utils/ecc';
 import { IFundingProvider, IUtxoSelectionOpts } from '../node/types';
 import { ISpliceWalletInput } from '../channel/channel';
 import {
@@ -21,7 +20,6 @@ import {
 } from '../channel/splice-weight';
 
 bitcoin.initEccLib(ecc);
-const ECPair = ECPairFactory(ecc);
 
 /** Classify a scriptPubKey as one of the spendable kinds, or null. */
 export function scriptKind(script: Buffer): 'p2wpkh' | 'p2tr' | null {

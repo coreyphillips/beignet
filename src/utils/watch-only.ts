@@ -1,11 +1,9 @@
 import * as bitcoin from 'bitcoinjs-lib';
-import BIP32Factory, { BIP32Interface } from 'bip32';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { BIP32Interface } from 'bip32';
+import { bip32 } from './ecc';
 
 import { EAddressType, EAvailableNetworks } from '../types';
 import { err, ok, Result } from './result';
-
-const bip32 = BIP32Factory(ecc);
 
 /**
  * Typed error thrown/returned whenever a watch-only wallet is asked to

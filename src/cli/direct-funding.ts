@@ -16,8 +16,7 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
-import * as ecc from '@bitcoinerlab/secp256k1';
-import { ECPairFactory } from 'ecpair';
+import { ECPair, ecc } from '../utils/ecc';
 import type { Wallet } from '../wallet';
 import type { IUtxo } from '../types';
 import {
@@ -34,7 +33,6 @@ import {
 } from '../lightning/direct-funding';
 
 bitcoin.initEccLib(ecc);
-const ECPair = ECPairFactory(ecc);
 
 /**
  * The narrow slice of the on-chain wallet this needs. Declared structurally so

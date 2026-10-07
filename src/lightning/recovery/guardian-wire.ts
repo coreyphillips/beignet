@@ -13,7 +13,7 @@
 import { createHash } from 'crypto';
 import { hkdfSync } from 'crypto';
 import { schnorrSign, schnorrVerify } from '../offer/schnorr';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 
 /** secp256k1 group order. */
 const CURVE_ORDER = BigInt(

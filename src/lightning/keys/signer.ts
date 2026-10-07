@@ -6,7 +6,7 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 import { sign, verify, getPublicKey } from '../crypto/ecdh';
 import { partialSign, type SessionKey } from '../crypto/musig';
 import { derivePrivateKey } from './derivation';

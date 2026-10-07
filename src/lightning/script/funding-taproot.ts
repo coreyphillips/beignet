@@ -8,7 +8,7 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 import { deriveTaprootFundingKey } from '../crypto/musig';
 
 // Ensure ECC is initialized for bitcoinjs-lib taproot operations.
