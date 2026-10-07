@@ -23,6 +23,7 @@ import {
 	decodeGossipTimestampFilterMessage
 } from '../../src/lightning/gossip/gossip-queries';
 import {
+	decodeShortChannelId,
 	encodeShortChannelId,
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
@@ -71,6 +72,13 @@ function makeBasepoints(): IChannelBasepoints {
 
 function makeScid(block: number, txIndex: number, outputIndex: number): Buffer {
 	return encodeShortChannelId({ block, txIndex, outputIndex });
+}
+
+/** Two random compressed-key-shaped node ids. */
+function randomPair(): [Buffer, Buffer] {
+	const id = (): Buffer =>
+		Buffer.concat([Buffer.from([0x02]), crypto.randomBytes(32)]);
+	return [id(), id()];
 }
 
 async function waitFor(
@@ -422,6 +430,58 @@ describe('Gossip Sync (Phase 5)', function () {
 			expect(result.length).to.equal(5);
 			for (let i = 1; i < result.length; i++) {
 				expect(Buffer.compare(result[i - 1], result[i])).to.be.lessThan(0);
+			}
+		});
+
+		it('should select and order a range as the BigInt decode and Buffer.compare did', function () {
+			const graph = new NetworkGraph();
+			// Ids that differ only in a later byte, in the tx index or the
+			// output index, and blocks across the 0x00ffff and 0x0000ff byte
+			// boundaries, added out of order.
+			const ids: Array<[number, number, number]> = [
+				[700_000, 5, 1],
+				[700_000, 5, 0],
+				[700_000, 4, 65_535],
+				[65_535, 1, 0],
+				[65_536, 0, 0],
+				[255, 2, 3],
+				[256, 0, 0],
+				[700_001, 0, 0],
+				[699_999, 16_777_215, 9]
+			];
+			for (let k = 0; k < 200; k++) {
+				ids.push([
+					crypto.randomInt(0, 16_777_216),
+					crypto.randomInt(0, 16_777_216),
+					crypto.randomInt(0, 65_536)
+				]);
+			}
+			const scids = ids.map(([b, t, o]) => makeScid(b, t, o));
+			for (const scid of scids) {
+				graph.addChannelAnnouncement(
+					makeChannelAnnouncement(scid, ...randomPair()),
+					{ verified: true }
+				);
+			}
+			const ranges: Array<[number, number]> = [
+				[0, 16_777_216],
+				[65_535, 2],
+				[255, 2],
+				[699_999, 3],
+				[700_000, 1],
+				[5_000_000, 1_000_000]
+			];
+			for (const [first, count] of ranges) {
+				const expected = scids
+					.filter((scid) => {
+						const block = decodeShortChannelId(scid).block;
+						return block >= first && block < first + count;
+					})
+					.sort((a, b) => Buffer.compare(a, b));
+				const got = graph.getChannelsByBlockRange(first, count);
+				expect(got.map((s) => s.toString('hex'))).to.deep.equal(
+					expected.map((s) => s.toString('hex'))
+				);
 			}
 		});
 
