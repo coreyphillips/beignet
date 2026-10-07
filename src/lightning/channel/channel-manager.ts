@@ -3531,23 +3531,39 @@ export class ChannelManager extends EventEmitter {
 		}
 	}
 
-	/** Seed a freshly created/restored monitor with all known preimages. */
+	/**
+	 * Seed a freshly created/restored monitor with all known preimages.
+	 *
+	 * Skip redundant saves only for fully resolved monitors that already
+	 * hold every known preimage. Active monitors can build held claims
+	 * without returning an action, so they must still be saved. A monitor
+	 * that cannot report its preimages or resolution state is saved as before.
+	 */
 	private _seedMonitorPreimages(
 		channelIdHex: string,
 		monitor: ChainMonitor
 	): void {
+		if (this._knownPreimages.size === 0) return;
 		const channelId = Buffer.from(channelIdHex, 'hex');
 		const pendingActions: ChainAction[] = [];
-		let seeded = false;
+		const fullyResolved =
+			typeof monitor.isFullyResolved === 'function' &&
+			monitor.isFullyResolved();
+		const held =
+			typeof monitor.getKnownPreimages === 'function'
+				? monitor.getKnownPreimages()
+				: null;
+		let learned = false;
 		for (const [hashHex, preimage] of this._knownPreimages) {
+			// Read before addPreimage, which writes the same map.
+			if (!held?.get(hashHex)?.equals(preimage)) learned = true;
 			const actions = monitor.addPreimage(
 				Buffer.from(hashHex, 'hex'),
 				preimage
 			);
-			seeded = true;
 			pendingActions.push(...actions);
 		}
-		if (!seeded) return;
+		if (fullyResolved && !learned && pendingActions.length === 0) return;
 
 		// Request a save of every seeded preimage and built claim before routing.
 		this.emit('monitor:updated', channelIdHex, monitor);
