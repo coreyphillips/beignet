@@ -14,7 +14,7 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../../utils/ecc';
 import { computeScriptHash } from '../../chain/chain-watcher';
 import { verify as ecdsaVerify } from '../../crypto/ecdh';
 import { MAX_INTERACTIVE_TX_SEQUENCE } from '../../interactive-tx/validation';

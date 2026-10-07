@@ -42,7 +42,7 @@ import {
 } from '../types';
 import { Psbt } from 'bitcoinjs-lib';
 import { BIP32Interface } from 'bip32';
-import ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../utils/ecc';
 import * as bitcoin from 'bitcoinjs-lib';
 import { getAddressInfo } from 'bitcoin-address-validation';
 import { ECPairInterface } from 'ecpair';

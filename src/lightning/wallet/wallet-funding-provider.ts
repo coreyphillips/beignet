@@ -6,8 +6,8 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
-import * as ecc from '@bitcoinerlab/secp256k1';
-import { ECPairFactory } from 'ecpair';
+import { ecc } from '../../utils/ecc';
+import { getECPair } from '../../utils/ecc-apis';
 import { IFundingProvider, IUtxoSelectionOpts } from '../node/types';
 import { ISpliceWalletInput } from '../channel/channel';
 import {
@@ -21,7 +21,6 @@ import {
 } from '../channel/splice-weight';
 
 bitcoin.initEccLib(ecc);
-const ECPair = ECPairFactory(ecc);
 
 /** Classify a scriptPubKey as one of the spendable kinds, or null. */
 export function scriptKind(script: Buffer): 'p2wpkh' | 'p2tr' | null {
@@ -1000,7 +999,10 @@ export class WalletFundingProvider implements IFundingProvider {
 			if (!hex) {
 				throw new Error(`missing raw tx for ${purpose} input ${utxo.tx_hash}`);
 			}
-			const keyPair = ECPair.fromWIF(wallet.getPrivateKey!(utxo.path), network);
+			const keyPair = getECPair().fromWIF(
+				wallet.getPrivateKey!(utxo.path),
+				network
+			);
 			const pubkey = Buffer.from(keyPair.publicKey);
 			if (pubkey.toString('hex') !== utxo.publicKey) {
 				throw new Error(

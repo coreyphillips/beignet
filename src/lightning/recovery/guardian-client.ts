@@ -14,7 +14,7 @@
 
 import { request as httpRequest } from 'http';
 import { request as httpsRequest } from 'https';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 import {
 	GUARDIAN_PROTOCOL_VERSION,
 	GuardianState,

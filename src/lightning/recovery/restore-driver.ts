@@ -98,7 +98,7 @@ import {
 	requireEncryptedSecretStorage,
 	signAcquisition
 } from './writer-lease';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 
 /**
  * A stored acquisition attempt is unreadable. This is NEVER equivalent to

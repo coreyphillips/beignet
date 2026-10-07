@@ -19,7 +19,7 @@
 
 import { MuSigFactory } from '@brandonblack/musig';
 import type { Crypto, KeyGenContext, SessionKey } from '@brandonblack/musig';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 import { sha256 as nobleSha256 } from '@noble/hashes/sha256';
 
 // base_crypto provides the library's pure-BigInt scalar/field math. It is a

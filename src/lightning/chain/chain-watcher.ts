@@ -9,7 +9,7 @@
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 import { ChannelManager } from '../channel/channel-manager';
 import { createFundingScript } from '../script/funding';
 import { createTaprootFundingScript } from '../script/funding-taproot';

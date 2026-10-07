@@ -114,7 +114,7 @@ import {
 	buildTaprootKeySpendWitness
 } from '../script/funding-taproot';
 import { buildTaprootAnchorOutput } from '../script/commitment-taproot';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 import { Channel, ISpliceWalletInput, ITaprootClosingCache } from './channel';
 import {
 	createOpenerState,

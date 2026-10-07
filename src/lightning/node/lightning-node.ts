@@ -370,7 +370,7 @@ import {
 	MAX_SCRIPT_SIZE
 } from '../validation';
 import * as bitcoin from 'bitcoinjs-lib';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 import {
 	IStorageBackend,
 	IPersistedChannelPolicy,

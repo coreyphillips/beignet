@@ -35,7 +35,7 @@
  */
 
 import { randomBytes } from 'crypto';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 import { IStorageBackend } from '../storage/types';
 import {
 	GuardianState,

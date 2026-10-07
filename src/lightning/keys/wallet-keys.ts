@@ -14,13 +14,13 @@
  *   6 - perCommitmentSeed
  */
 
-import * as bip32 from 'bip32';
 import * as bip39 from 'bip39';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import * as bip32 from 'bip32';
+import { bip32 as sharedBip32 } from '../../utils/ecc-apis';
 import { getPublicKey } from '../crypto/ecdh';
 import { IChannelBasepoints } from './derivation';
 
-const BIP32Factory = bip32.BIP32Factory(ecc);
+const BIP32Factory = sharedBip32;
 
 /** Lightning key family BIP32 purpose (BOLT-compliant LND uses 1017) */
 const LN_PURPOSE = 1017;

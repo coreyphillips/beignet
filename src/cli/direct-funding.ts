@@ -16,8 +16,9 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
-import * as ecc from '@bitcoinerlab/secp256k1';
-import { ECPairFactory } from 'ecpair';
+import { ecc } from '../utils/ecc';
+import { ECPairInterface } from 'ecpair';
+import { getECPair } from '../utils/ecc-apis';
 import type { Wallet } from '../wallet';
 import type { IUtxo } from '../types';
 import {
@@ -34,7 +35,6 @@ import {
 } from '../lightning/direct-funding';
 
 bitcoin.initEccLib(ecc);
-const ECPair = ECPairFactory(ecc);
 
 /**
  * The narrow slice of the on-chain wallet this needs. Declared structurally so
@@ -228,9 +228,9 @@ export function directFundingWallet(
 			if (!utxo) return null;
 			const kind = scriptKind(coin.script);
 			if (!kind) return null;
-			let keyPair: ReturnType<typeof ECPair.fromWIF>;
+			let keyPair: ECPairInterface;
 			try {
-				keyPair = ECPair.fromWIF(wallet.getPrivateKey(utxo.path), network);
+				keyPair = getECPair().fromWIF(wallet.getPrivateKey(utxo.path), network);
 			} catch {
 				// Watch-only, or a path this wallet cannot derive.
 				return null;

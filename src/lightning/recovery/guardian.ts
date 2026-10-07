@@ -24,7 +24,7 @@
  */
 
 import { createHash } from 'crypto';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 import {
 	CRASH_V1_PROFILE,
 	GUARDIAN_PROTOCOL_VERSION,
