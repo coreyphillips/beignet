@@ -6,7 +6,8 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
-import { ECPair, ecc } from '../../utils/ecc';
+import { ecc } from '../../utils/ecc';
+import { ECPair } from '../../utils/ecc-apis';
 import { IFundingProvider, IUtxoSelectionOpts } from '../node/types';
 import { ISpliceWalletInput } from '../channel/channel';
 import {

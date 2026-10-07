@@ -16,7 +16,7 @@
 
 import * as bip39 from 'bip39';
 import * as bip32 from 'bip32';
-import { bip32 as sharedBip32 } from '../../utils/ecc';
+import { bip32 as sharedBip32 } from '../../utils/ecc-apis';
 import { getPublicKey } from '../crypto/ecdh';
 import { IChannelBasepoints } from './derivation';
 

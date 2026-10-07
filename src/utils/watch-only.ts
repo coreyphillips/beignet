@@ -1,6 +1,6 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import { BIP32Interface } from 'bip32';
-import { bip32 } from './ecc';
+import { bip32 } from './ecc-apis';
 
 import { EAddressType, EAvailableNetworks } from '../types';
 import { err, ok, Result } from './result';

@@ -2,7 +2,7 @@ import * as bip39 from 'bip39';
 import * as bitcoin from 'bitcoinjs-lib';
 import { Network } from 'bitcoinjs-lib';
 import { BIP32Interface } from 'bip32';
-import { bip32 } from '../utils/ecc';
+import { bip32 } from '../utils/ecc-apis';
 import cloneDeep from 'lodash.clonedeep';
 
 import {

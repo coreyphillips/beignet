@@ -16,7 +16,8 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
-import { ECPair, ecc } from '../utils/ecc';
+import { ecc } from '../utils/ecc';
+import { ECPair } from '../utils/ecc-apis';
 import type { Wallet } from '../wallet';
 import type { IUtxo } from '../types';
 import {

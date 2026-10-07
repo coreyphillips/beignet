@@ -14,7 +14,8 @@ import { err, ok, Result } from './result';
 import { addressTypes, getAddressTypes } from '../shapes';
 import { getKeyDerivationPathObject } from './derivation-path';
 import { ECPairInterface } from 'ecpair';
-import { ECPair, ecc } from './ecc';
+import { ecc } from './ecc';
+import { ECPair } from './ecc-apis';
 import { BIP32Interface } from 'bip32';
 import { toXOnly } from 'bitcoinjs-lib/src/psbt/bip371';
 
