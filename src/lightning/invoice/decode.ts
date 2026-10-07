@@ -36,10 +36,28 @@ const FIXED_LENGTH_TAG_WORDS: Partial<Record<TagType, number>> = {
 	[TagType.PAYEE_PUBKEY]: 53
 };
 
+/** How decode treats an invoice's signature. */
+export interface IDecodeOptions {
+	/**
+	 * Whether to recover the signer, reject an invoice whose signature does
+	 * not recover, and check the signer against an `n` field. On by default,
+	 * as BOLT 11 requires for any invoice that came from outside. Turn it off
+	 * only for an invoice this node issued and stored itself and now reads
+	 * back, as a phone does with each request it saved on every start: its
+	 * signature is the node's own, and recovering it costs tens of
+	 * milliseconds of pure-JS secp256k1 on a phone. Every other field is
+	 * parsed and checked the same way, and `recoveredPubkey` is left out.
+	 */
+	recoverSigner?: boolean;
+}
+
 /**
  * Decode a BOLT 11 invoice string into a structured object.
  */
-export function decode(invoiceString: string): IInvoice {
+export function decode(
+	invoiceString: string,
+	options: IDecodeOptions = {}
+): IInvoice {
 	// Passed as given: the library accepts an all-upper or all-lower string
 	// and rejects a mixed-case one, as BIP 173 requires. Lowercasing first
 	// defeated that check.
@@ -74,10 +92,13 @@ export function decode(invoiceString: string): IInvoice {
 	// Verify signature and recover pubkey. BOLT 11: an invoice whose signature
 	// does not recover to a public key is invalid and MUST be rejected — do not
 	// return a half-parsed invoice with no recoverable payee.
-	const dataWords = Array.from(words.slice(0, sigStart));
-	const recoveredPubkey = verifyInvoice(prefix, dataWords, signature);
-	if (!recoveredPubkey) {
-		throw new Error('Invoice signature is not recoverable');
+	let recoveredPubkey: Buffer | null = null;
+	if (options.recoverSigner !== false) {
+		const dataWords = Array.from(words.slice(0, sigStart));
+		recoveredPubkey = verifyInvoice(prefix, dataWords, signature);
+		if (!recoveredPubkey) {
+			throw new Error('Invoice signature is not recoverable');
+		}
 	}
 
 	// Parse tagged fields
@@ -157,7 +178,11 @@ export function decode(invoiceString: string): IInvoice {
 	// BOLT 11: when an `n` field is present the reader MUST use it to validate
 	// the signature (equivalently: the recovered key must BE `n`). Otherwise a
 	// signature by anyone routes a payment to the claimed payee.
-	if (result.payeeNodeKey && !result.payeeNodeKey.equals(recoveredPubkey)) {
+	if (
+		recoveredPubkey &&
+		result.payeeNodeKey &&
+		!result.payeeNodeKey.equals(recoveredPubkey)
+	) {
 		throw new Error(
 			'Invoice signature does not match the payee node id (n field)'
 		);

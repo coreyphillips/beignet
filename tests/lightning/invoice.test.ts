@@ -7,6 +7,7 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import * as secp from '@noble/secp256k1';
+import { bech32 } from 'bech32';
 import {
 	// Types
 	Network,
@@ -697,6 +698,55 @@ describe('Invoice (BOLT 11) — Phase 5', function () {
 			const { invoiceStr } = encodeForDecode();
 			const inv = decode(invoiceStr);
 			expect(inv.signature).to.have.length(65);
+		});
+
+		it('reads an issued invoice the same way without recovering its signer', function () {
+			const { publicKey } = makeKeypair();
+			const { invoiceStr } = encodeForDecode({
+				amountMsat: 21_000n,
+				paymentSecret: crypto.randomBytes(32),
+				expiry: 3600,
+				minFinalCltvExpiry: 144,
+				payeeNodeKey: undefined,
+				routingHints: [
+					[
+						{
+							pubkey: publicKey,
+							shortChannelId: Buffer.from('0000010000020003', 'hex'),
+							feeBaseMsat: 1000,
+							feeProportionalMillionths: 100,
+							cltvExpiryDelta: 40
+						}
+					]
+				]
+			});
+			const checked = decode(invoiceStr);
+			const issued = decode(invoiceStr, { recoverSigner: false });
+			expect(issued.recoveredPubkey).to.equal(undefined);
+			const { recoveredPubkey: _signer, ...rest } = checked;
+			expect(issued).to.deep.equal(rest);
+		});
+
+		it('checks the signer by default and leaves it to a caller that vouches for the invoice', function () {
+			const { privateKey, publicKey } = makeKeypair();
+			const invoiceStr = encode({
+				network: Network.MAINNET,
+				paymentHash: crypto.randomBytes(32),
+				description: 'issued',
+				privateKey,
+				payeeNodeKey: publicKey,
+				timestamp: 1700000000
+			});
+			// Change one word of the timestamp after signing: the signature
+			// now recovers to some other key than the `n` field names.
+			const { prefix, words } = bech32.decode(invoiceStr, 7089);
+			const altered = [...words];
+			altered[6] = (altered[6] + 1) % 32;
+			const tampered = bech32.encode(prefix, altered, 7089);
+			expect(() => decode(tampered)).to.throw();
+			const read = decode(tampered, { recoverSigner: false });
+			expect(read.payeeNodeKey).to.deep.equal(publicKey);
+			expect(read.recoveredPubkey).to.equal(undefined);
 		});
 	});
 
