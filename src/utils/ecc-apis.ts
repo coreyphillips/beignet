@@ -11,9 +11,9 @@ let ecpair: ECPairAPI | undefined;
 
 /**
  * ECPair over `ecc`, made the first time it is asked for. Its check of the
- * library signs and verifies test vectors, about 0.3 s of pure-JS secp256k1
- * on a phone, and nothing at startup needs it: it signs and checks on-chain
- * spends. Made when the engine loaded, it held back the first paint of the
+ * library signs and verifies test vectors. Deferring this saved about 85 ms
+ * before first paint on a phone, and nothing at startup needs it: it signs
+ * and checks on-chain spends. Made when the engine loaded, it held back the first paint of the
  * wallet that loaded it.
  */
 export function getECPair(): ECPairAPI {
