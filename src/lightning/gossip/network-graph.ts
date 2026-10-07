@@ -33,6 +33,32 @@ import {
 const ZERO_SIG = Buffer.alloc(64);
 
 /**
+ * The block height a short channel id names: its first three bytes, big
+ * endian (BOLT 7), the figure decodeShortChannelId gives. A range reply reads
+ * it for every channel in the graph, so it is read here without a BigInt. An
+ * id that is not 8 bytes long is refused as decodeShortChannelId refuses it.
+ */
+function scidBlock(scid: Buffer): number {
+	if (scid.length !== 8) return decodeShortChannelId(scid).block;
+	return (scid[0] << 16) | (scid[1] << 8) | scid[2];
+}
+
+/**
+ * The byte order of two short channel ids, which for 8-byte ids is their
+ * numeric order, as Buffer.compare gives it. A range reply sorts every
+ * channel the range holds, and the buffer package a portable build runs on
+ * copies both arguments on each Buffer.compare: about 280,000 copies to sort
+ * a phone's 20,000 channels, held on its only thread.
+ */
+function compareScids(a: Buffer, b: Buffer): number {
+	const length = Math.min(a.length, b.length);
+	for (let i = 0; i < length; i++) {
+		if (a[i] !== b[i]) return a[i] - b[i];
+	}
+	return a.length - b.length;
+}
+
+/**
  * A stored message with an all-zero signature can never be verified or served
  * (Rapid Gossip Sync strips signatures). Such slots also carry synthetic
  * timestamps, which is why some freshness rules treat them specially.
@@ -1096,13 +1122,13 @@ export class NetworkGraph {
 			) {
 				continue;
 			}
-			const scid = decodeShortChannelId(channel.shortChannelId);
-			if (scid.block >= firstBlock && scid.block < endBlock) {
+			const block = scidBlock(channel.shortChannelId);
+			if (block >= firstBlock && block < endBlock) {
 				result.push(Buffer.from(channel.shortChannelId));
 			}
 		}
 		// Sort by SCID value (lexicographic on 8 bytes = numeric order)
-		result.sort((a, b) => Buffer.compare(a, b));
+		result.sort(compareScids);
 		return result;
 	}
 
