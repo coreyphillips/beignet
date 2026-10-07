@@ -1815,6 +1815,70 @@ describe('Gossip Sync (Phase 5)', function () {
 			expect(served.complete).to.equal(true);
 		});
 
+		it('draws on the serve budget before each signature, not once per channel', function () {
+			// Checked once per channel, the budget let one reply overrun it by
+			// every signature of the channel it had started: up to eight. Drawn
+			// before each check, the overrun is one check; the channel then
+			// waits whole, the checks already made stay settled, and only the
+			// rest run in a later window.
+			const graph = new NetworkGraph();
+			const scid = makeScid(103, 5, 0);
+			const keys = makeSignedChannelKeys();
+			graph.addChannelAnnouncement(
+				makeSignedChannelAnnouncement(scid, keys).msg,
+				{ verified: 'deferred' }
+			);
+			graph.applyChannelUpdate(
+				makeSignedChannelUpdate(scid, keys.nodeKey1, 0, 1000).msg,
+				{ verified: 'deferred' }
+			);
+			graph.applyChannelUpdate(
+				makeSignedChannelUpdate(scid, keys.nodeKey2, 1, 1000).msg,
+				{ verified: 'deferred' }
+			);
+			const nodeAnn = makeSignedNodeAnnouncement(keys.nodeKey1, 1000);
+			graph.applyNodeAnnouncement(nodeAnn.msg, { verified: 'deferred' });
+			const seam = graph as unknown as {
+				_serveVerifyWindowStart: number;
+				_serveVerifySpentMs: number;
+			};
+
+			// Every reading of the clock moves it 30 ms on, so each check
+			// costs 30 ms against a 50 ms budget: two fit.
+			let clock = Date.now();
+			const now = sinon.stub(Date, 'now').callsFake(() => (clock += 30));
+			const budget = NetworkGraph.SERVE_VERIFY_BUDGET_MS;
+			try {
+				NetworkGraph.SERVE_VERIFY_BUDGET_MS = 50;
+				const first = graph.getGossipMessagesForChannels([scid]);
+				expect(first.announcements.length).to.equal(0);
+				expect(first.updates.length).to.equal(0);
+				expect(first.complete).to.equal(false);
+				const channel = graph.getChannel(scid)!;
+				// The two checks that fit are settled and kept...
+				expect(channel.announcementVerified).to.equal(true);
+				expect(channel.update1Verified).to.equal(true);
+				// ...and the rest wait, unchecked.
+				expect(channel.update2VerifyDeferred).to.equal(true);
+				expect(
+					graph.getNode(nodeAnn.msg.nodeId)!.announcementVerifyDeferred
+				).to.equal(true);
+				expect(seam._serveVerifySpentMs).to.equal(60);
+
+				// The next window settles the rest and serves the channel.
+				seam._serveVerifyWindowStart = 0;
+				const second = graph.getGossipMessagesForChannels([scid]);
+				expect(second.announcements.length).to.equal(1);
+				expect(second.updates.length).to.equal(2);
+				expect(second.nodeAnnouncements.length).to.equal(1);
+				expect(second.complete).to.equal(true);
+				expect(seam._serveVerifySpentMs).to.equal(60);
+			} finally {
+				NetworkGraph.SERVE_VERIFY_BUDGET_MS = budget;
+				now.restore();
+			}
+		});
+
 		it('reports partial replies through the reply_short_channel_ids_end full_information bit', function () {
 			const graph = new NetworkGraph();
 			const scid = makeScid(103, 4, 0);
