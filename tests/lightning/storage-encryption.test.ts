@@ -257,6 +257,28 @@ describe('Storage Encryption', function () {
 			expect(raw).to.include('aa'.repeat(32));
 		});
 
+		it('keeps node metadata out of the raw database file', function () {
+			const storage = openEncrypted();
+			const row = JSON.stringify({
+				id: 'swap-1',
+				paymentHash: '77'.repeat(32),
+				amountSat: 123456789
+			});
+			storage.saveMetadata('swap:row:swap-1', row);
+			// A ledger tombstone is an empty value.
+			storage.saveMetadata('swap:row:gone', '');
+			expect(storage.loadMetadata('swap:row:swap-1')).to.equal(row);
+			expect(storage.loadMetadata('swap:row:gone')).to.equal('');
+			expect(storage.loadMetadata('swap:row:missing')).to.equal(null);
+			storage.checkpoint();
+			storage.close();
+
+			const raw = readRawDbBytes(dbPath);
+			expect(raw).to.not.include('77'.repeat(32));
+			expect(raw).to.not.include('amountSat');
+			expect(raw).to.include('swap:row:swap-1');
+		});
+
 		it('migrates a plaintext database in place on open', function () {
 			const plain = new SqliteStorage(dbPath);
 			plain.open({ synchronous: 'NORMAL' });
@@ -301,6 +323,7 @@ describe('Storage Encryption', function () {
 				createTestChannelState(),
 				'02'.repeat(33)
 			);
+			storage.saveMetadata('jit:held', '[]');
 			storage.close();
 
 			const corruptions: unknown[] = [];
@@ -308,6 +331,9 @@ describe('Storage Encryption', function () {
 			keyless.open({ synchronous: 'NORMAL' });
 			expect(() => keyless.loadPreimage('dd'.repeat(32))).to.throw(
 				'storage is encrypted; encryptionKey required'
+			);
+			expect(() => keyless.loadMetadata('jit:held')).to.throw(
+				StorageEncryptedError
 			);
 			// loadAll* must propagate the missing-key error, not skip rows as corrupt
 			expect(() => keyless.loadAllPreimages()).to.throw(StorageEncryptedError);
@@ -473,6 +499,7 @@ describe('Storage Encryption', function () {
 				const pathId = crypto.randomBytes(32);
 				plain.saveOffer('offer-1', 'lno1withpath', pathId, 1000);
 				plain.saveOffer('offer-2', 'lno1nopath', null, 2000);
+				plain.saveMetadata('swap:row:legacy', '{"id":"legacy"}');
 				// A BLOB where TEXT belongs: nothing writes one today, but the
 				// per-column check would rewrite it, so the pass must select it.
 				rawDb(plain)
@@ -488,8 +515,12 @@ describe('Storage Encryption', function () {
 						channel_key_indices: 1,
 						forwarded_htlcs: 1,
 						offers: 2,
-						wallet_data: 1
+						wallet_data: 1,
+						metadata: 1
 					})
+				);
+				expect(storage.loadMetadata('swap:row:legacy')).to.equal(
+					'{"id":"legacy"}'
 				);
 				expect(
 					storage
@@ -555,6 +586,7 @@ describe('Storage Encryption', function () {
 					crypto.randomBytes(64),
 					4000
 				);
+				storage.saveMetadata('blockHeight', '800000');
 				storage.close();
 				const before = storedValues();
 
@@ -567,6 +599,7 @@ describe('Storage Encryption', function () {
 						again.storage.loadPreimage('bb'.repeat(32))!.equals(preimage)
 					).to.equal(true);
 					expect(again.storage.loadChannelKeyIndex('chan-b')).to.equal(9);
+					expect(again.storage.loadMetadata('blockHeight')).to.equal('800000');
 					again.storage.close();
 				}
 				// Same ciphertext byte for byte: nothing was encrypted twice.

@@ -310,7 +310,11 @@ export class SqliteStorage implements IStorageBackend {
 		// LEASE: the private half of the ephemeral writer key that signs
 		// guardian records. That is signing material and must never sit in
 		// plaintext in a stolen database file.
-		{ table: 'recovery_meta', pk: 'key', columns: ['value'] }
+		{ table: 'recovery_meta', pk: 'key', columns: ['value'] },
+		// Node metadata: the swap, held-forward, FFOR witness and issuer
+		// ledgers, JIT receive intents and held HTLCs. No keys, but swap
+		// amounts, payment hashes and peer identities.
+		{ table: 'metadata', pk: 'key', columns: ['value'] }
 	];
 
 	/**
@@ -1691,18 +1695,19 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	// ─── Metadata ───
+	// Values are encrypted at rest when a key is set (see ENCRYPTED_COLUMNS).
 
 	saveMetadata(key: string, value: string): void {
 		this.db
 			.prepare('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)')
-			.run(key, value);
+			.run(key, this._enc(value));
 	}
 
 	loadMetadata(key: string): string | null {
 		const row = this.db
 			.prepare('SELECT value FROM metadata WHERE key = ?')
 			.get(key) as { value: string } | undefined;
-		return row ? row.value : null;
+		return row ? this._dec(row.value) : null;
 	}
 
 	// ─── On-chain Wallet Data ───
