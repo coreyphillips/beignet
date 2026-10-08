@@ -756,6 +756,15 @@ export class Transaction {
 			outputs
 		});
 
+		// The built transaction pays whatever the outputs leave over, so a staged
+		// fee the inputs cannot cover would be silently cut, possibly below the
+		// relay floor. addOutput and removeTxInput do not reprice the fee.
+		if (outputValue + fee > balance) {
+			return err(
+				`Inputs of ${balance} sats cannot cover outputs of ${outputValue} sats plus the staged fee of ${fee} sats.`
+			);
+		}
+
 		const network = getBitcoinJsNetwork(this._wallet.network);
 
 		//Collect all outputs.
