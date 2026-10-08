@@ -2207,12 +2207,21 @@ export class LightningNode extends EventEmitter {
 		// before any transport exists, so no release can be judged against an
 		// empty ledger. The store rides the node's metadata table when storage
 		// is configured; an embedded node without storage keeps it in memory.
+		// A stored row that no longer decodes is dropped from its ledger, so
+		// its record (a hold still owed, a swap still to refund) is forgotten.
+		// No listener exists yet, so the report goes to the logger and the
+		// action log.
+		const onCorruptLedgerRow = (key: string): void => {
+			this.logger.error(`ledger row failed to decode: ${key}`, { key });
+			this.emitStructuredLog('error', 'ledger_corrupt_row', { key });
+		};
 		this.heldForwardLedger = new HeldForwardLedger(
 			this.storage
 				? new MetadataLedgerStore<IHeldForwardRecord>(
 						this.storage,
 						HELD_FORWARD_LEDGER_PREFIX,
-						heldForwardCodec
+						heldForwardCodec,
+						onCorruptLedgerRow
 				  )
 				: new MemoryLedgerStore<IHeldForwardRecord>()
 		);
@@ -2224,7 +2233,8 @@ export class LightningNode extends EventEmitter {
 					? new MetadataLedgerStore<ISwapRecord>(
 							this.storage,
 							SWAP_LEDGER_PREFIX,
-							swapCodec
+							swapCodec,
+							onCorruptLedgerRow
 					  )
 					: new MemoryLedgerStore<ISwapRecord>()
 			);
@@ -2244,14 +2254,16 @@ export class LightningNode extends EventEmitter {
 					? new MetadataLedgerStore<IFforWitnessMailboxRecord>(
 							this.storage,
 							FF_WITNESS_MAILBOX_LEDGER_PREFIX,
-							fforWitnessMailboxCodec
+							fforWitnessMailboxCodec,
+							onCorruptLedgerRow
 					  )
 					: new MemoryLedgerStore<IFforWitnessMailboxRecord>(),
 				this.storage
 					? new MetadataLedgerStore<IFforWitnessRecordRow>(
 							this.storage,
 							FF_WITNESS_RECORD_LEDGER_PREFIX,
-							fforWitnessRecordCodec
+							fforWitnessRecordCodec,
+							onCorruptLedgerRow
 					  )
 					: new MemoryLedgerStore<IFforWitnessRecordRow>()
 			);
@@ -2284,14 +2296,16 @@ export class LightningNode extends EventEmitter {
 						? new MetadataLedgerStore<IFforIssuerManifestRecord>(
 								this.storage,
 								FF_ISSUER_MANIFEST_LEDGER_PREFIX,
-								fforIssuerManifestCodec
+								fforIssuerManifestCodec,
+								onCorruptLedgerRow
 						  )
 						: new MemoryLedgerStore<IFforIssuerManifestRecord>(),
 					this.storage
 						? new MetadataLedgerStore<IFforIssuerSlotRecord>(
 								this.storage,
 								FF_ISSUER_SLOT_LEDGER_PREFIX,
-								fforIssuerSlotCodec
+								fforIssuerSlotCodec,
+								onCorruptLedgerRow
 						  )
 						: new MemoryLedgerStore<IFforIssuerSlotRecord>()
 				);
@@ -2321,7 +2335,8 @@ export class LightningNode extends EventEmitter {
 				? new MetadataLedgerStore<IAsyncRegistrationRecord>(
 						this.storage,
 						ASYNC_REGISTRATION_LEDGER_PREFIX,
-						asyncRegistrationCodec
+						asyncRegistrationCodec,
+						onCorruptLedgerRow
 				  )
 				: new MemoryLedgerStore<IAsyncRegistrationRecord>(),
 			this.heldForwardLedger,

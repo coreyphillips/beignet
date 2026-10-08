@@ -217,6 +217,41 @@ describe('DurableLedger (issue #708 infrastructure)', () => {
 		expect(otherAgain.get('x')!.state).to.equal('B');
 	});
 
+	it('MetadataLedgerStore reports a row that no longer decodes and leaves it as stored (issue #1371)', () => {
+		const kv = new FakeKv();
+		const codec = {
+			encode: (r: IToyRecord): string => JSON.stringify(r),
+			decode: (s: string): IToyRecord | null => {
+				try {
+					return JSON.parse(s) as IToyRecord;
+				} catch {
+					return null;
+				}
+			}
+		};
+		const first = new DurableLedger<IToyRecord>(
+			new MetadataLedgerStore<IToyRecord>(kv, 'toy', codec)
+		);
+		first.rehydrate();
+		first.insert({ id: 'x', state: 'A' });
+		first.insert({ id: 'y', state: 'A' });
+		const corrupt = kv.rows.get('toy:row:y')!.slice(0, -1);
+		kv.rows.set('toy:row:y', corrupt);
+		const index = kv.rows.get('toy:index');
+
+		const reported: string[] = [];
+		const second = new DurableLedger<IToyRecord>(
+			new MetadataLedgerStore<IToyRecord>(kv, 'toy', codec, (key) =>
+				reported.push(key)
+			)
+		);
+		expect(second.rehydrate()).to.equal(1);
+		expect(second.get('x')!.state).to.equal('A');
+		expect(reported).to.deep.equal(['toy:row:y']);
+		expect(kv.rows.get('toy:row:y'), 'row left as stored').to.equal(corrupt);
+		expect(kv.rows.get('toy:index'), 'index left as stored').to.equal(index);
+	});
+
 	it('MetadataLedgerStore rides the real SQLite metadata table transactionally', () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-ledger-'));
 		const db = new SqliteStorage(path.join(dir, 'node.db'));

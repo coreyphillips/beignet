@@ -465,6 +465,29 @@ describe('Swap ledger (issue #737 phase 2)', function () {
 			expect(disabled.getSwapLedger()).to.equal(undefined);
 			storage.close();
 		});
+
+		it('the node logs a stored swap row that no longer decodes (issue #1371)', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const first = createNode('swap-ledger', 1, storage, {
+				swaps: { enabled: true }
+			});
+			const id = first.getSwapLedger()!.insert(input()).record!.id;
+			const key = `${SWAP_LEDGER_PREFIX}:row:${id}`;
+			storage.saveMetadata(
+				key,
+				storage.loadMetadata(key)!.replace('"reverse"', '"revers"')
+			);
+			const second = createNode('swap-ledger', 1, storage, {
+				swaps: { enabled: true }
+			});
+			expect(second.getSwapLedger()!.get(id)).to.equal(undefined);
+			const reports = second
+				.getActionLog({ category: 'error' })
+				.filter((log) => log.action === 'ledger_corrupt_row');
+			expect(reports.map((log) => log.data.key)).to.deep.equal([key]);
+			storage.close();
+		});
 	});
 
 	describe('keys', function () {
