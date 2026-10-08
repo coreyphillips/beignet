@@ -5058,7 +5058,11 @@ export class Wallet {
 		// storage on exit, live copy readable until the next call.
 		await this.resetSendTransaction();
 		try {
-			const setupTransactionRes = await this.transaction.setupTransaction();
+			// transaction.sendMax only stages rbf when it does the setup itself,
+			// which it skips once inputs are staged here.
+			const setupTransactionRes = await this.transaction.setupTransaction({
+				rbf
+			});
 			if (setupTransactionRes.isErr()) {
 				return err(setupTransactionRes.error.message);
 			}
