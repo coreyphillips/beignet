@@ -242,6 +242,22 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(st.found).to.equal(false);
 		});
 
+		it('never replays a submarine row as a reverse ack (issue #1370)', async function () {
+			const h = await harness();
+			const swap = clientSwap();
+			expect((await create(h, swap)).accepted).to.equal(true);
+			// The swap id ignores direction, so a submarine row on this hash
+			// shares it. Same terms otherwise, so only the direction differs.
+			const r = record(h, swap);
+			expect(h.ledger.patch(r.id, { direction: 'submarine' }).outcome).to.equal(
+				'applied'
+			);
+			const ack = await create(h, swap);
+			expect(ack.accepted).to.equal(false);
+			expect(ack.reason).to.equal(SwapRefusalReason.DUPLICATE_HASH);
+			expect(ack.terms).to.equal(undefined);
+		});
+
 		it('refuses a fee above the client ceiling, a bad direction and the per-peer quota', async function () {
 			const h = await harness();
 			expect(
