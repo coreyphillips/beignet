@@ -5012,8 +5012,12 @@ export class Wallet {
 				return err(updateFeeRes.error.message);
 			}
 
+			// updateFee priced only the coins the wallet's coinSelectPreference
+			// selects, so build from those coins. Every staged UTXO would pay that
+			// smaller transaction's fee at a fraction of the requested rate.
 			const createRes = await this.transaction.createTransaction({
-				shuffleOutputs
+				shuffleOutputs,
+				runCoinSelect: true
 			});
 			if (createRes.isErr()) return err(createRes.error.message);
 			const { hex } = createRes.value;
