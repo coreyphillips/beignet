@@ -170,7 +170,7 @@ export interface ISendTransaction {
 	label: string; // User set label for a given transaction.
 	rbf: boolean;
 	boostType: EBoostType;
-	minFee: number; // (sats) Used for RBF/CPFP transactions where the fee needs to be greater than the original.
+	minFee: number; // (sats/vbyte) Lowest fee rate to offer for an RBF/CPFP boost. A rate like satsPerByte, not a total like fee.
 	max: boolean; // If the user intends to send the max amount.
 	tags: string[];
 	slashTagsUrl?: string; // TODO: Remove after migration.
