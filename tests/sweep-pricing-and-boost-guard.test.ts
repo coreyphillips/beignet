@@ -23,6 +23,7 @@ import {
 import {
 	EAddressType,
 	EAvailableNetworks,
+	ECoinSelectPreference,
 	EProtocol,
 	IUtxo,
 	IWalletData,
@@ -258,6 +259,47 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 				FUNDING_TXID
 			]);
 			expect(res.value.changeAddress).to.equal(changeAddress());
+		});
+
+		// #1364: the change output was priced twice, once from the outputs and
+		// once from changeAddress.
+		it('prices the replacement it builds', async function () {
+			// Smallest-first selection covers the 40k payment with one input, so
+			// it would price the two-input replacement an input short.
+			wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
+			stubLookups({
+				[BOOSTED_TXID]: {
+					vin: [
+						{ txid: FUNDING_TXID, vout: 0 },
+						{ txid: FUNDING_TXID, vout: 1 }
+					] as TTxDetails['vin'],
+					vout: [
+						{ value: 0.0004, n: 0, scriptPubKey: { address: P2WPKH } },
+						{ value: 0.0015, n: 1, scriptPubKey: { address: changeAddress() } }
+					] as unknown as TTxDetails['vout']
+				},
+				[FUNDING_TXID]: {
+					confirmations: 10,
+					vout: [
+						{ value: 0.001, n: 0, scriptPubKey: { address: receiveAddress() } },
+						{ value: 0.001, n: 1, scriptPubKey: { address: receiveAddress() } }
+					] as unknown as TTxDetails['vout']
+				}
+			});
+
+			const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+			if (res.isErr()) throw res.error;
+			const created = await wallet.transaction.createTransaction();
+			if (created.isErr()) throw created.error;
+
+			const tx = BitcoinTransaction.fromHex(created.value.hex);
+			expect(tx.ins).to.have.length(2);
+			expect(tx.outs).to.have.length(2);
+			const fee = 200_000 - tx.outs.reduce((sum, out) => sum + out.value, 0);
+			expect(fee).to.equal(res.value.fee);
+			// At the fast rate of 10 sat/vB. A third, phantom output adds 31 vB.
+			expect(fee).to.be.at.least(tx.virtualSize() * 10);
+			expect(fee).to.be.below((tx.virtualSize() + 31) * 10);
 		});
 	});
 

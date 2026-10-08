@@ -1896,17 +1896,21 @@ export class Transaction {
 			}
 			const transaction = response.value;
 
-			const satsPerByte = this._wallet.feeEstimates.fast;
-			const newFee = this.getTotalFee({
-				transaction,
-				satsPerByte,
-				message: transaction.message
-			});
-
 			// filter out change address, otherwise getTransactionOutputValue will include it
 			const outputs = transaction.outputs
 				.filter((output) => output.address !== transaction.changeAddress)
 				.map((output, index) => ({ ...output, index }));
+
+			// getTotalFee prices the change output from changeAddress, so it is
+			// given the outputs without it. The replacement spends every input of
+			// the original, so coin selection must not price a subset of them.
+			const satsPerByte = this._wallet.feeEstimates.fast;
+			const newFee = this.getTotalFee({
+				transaction: { ...transaction, outputs },
+				satsPerByte,
+				message: transaction.message,
+				coinSelectPreference: ECoinSelectPreference.consolidate
+			});
 
 			const inputTotal = this.getTransactionInputValue({
 				inputs: transaction.inputs
