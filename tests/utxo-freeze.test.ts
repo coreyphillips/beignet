@@ -247,6 +247,35 @@ describe('UTXO freeze/unfreeze', function () {
 		await wallet.resetSendTransaction();
 	});
 
+	it('estimates the max send from the coins sendMax can spend (#1365)', async () => {
+		// Electrum's balance also counts dust that refresh keeps out of the set.
+		wallet.data.balance += 500;
+		try {
+			const estimate = wallet.transaction.estimateTransactionCosts({
+				customFeeRate: 2
+			});
+			if (estimate.isErr()) throw estimate.error;
+			expect(estimate.value.amount + estimate.value.fee).to.equal(60000);
+
+			const res = await wallet.sendMax({
+				address: 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk',
+				satsPerByte: 2,
+				broadcast: false
+			});
+			if (res.isErr()) throw res.error;
+			const decoded = decodeRawTransaction(res.value, wallet.network);
+			if (decoded.isErr()) throw decoded.error;
+			const outputTotal = decoded.value.vout.reduce(
+				(acc, v) => acc + v.value,
+				0
+			);
+			expect(estimate.value.amount).to.equal(outputTotal);
+		} finally {
+			wallet.data.balance -= 500;
+			await wallet.resetSendTransaction();
+		}
+	});
+
 	it('excludes the frozen UTXO from buildPsbt', async () => {
 		const res = await wallet.buildPsbt({
 			address: 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk',
