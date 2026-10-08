@@ -283,6 +283,9 @@ describe('Broadcast drops the coins it spends', function () {
 		const first = pay();
 		await waitFor(() => broadcast.callCount === 1);
 		const second = pay();
+		// Give an unserialized second send time to stage before the first
+		// broadcast returns and drops its coin.
+		await new Promise((resolve) => setImmediate(resolve));
 		releaseFirst();
 		const [firstRes, secondRes] = await Promise.all([first, second]);
 		if (firstRes.isErr()) throw firstRes.error;

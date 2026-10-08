@@ -4976,7 +4976,10 @@ export class Wallet {
 		broadcast?: boolean;
 		shuffleOutputs?: boolean;
 	}): Promise<Result<string>> {
-		return this.runSend(() => this.sendManyLocked(params));
+		// Copied now so a caller reusing the options object cannot retarget a
+		// send that is still queued.
+		const options = { ...params };
+		return this.runSend(() => this.sendManyLocked(options));
 	}
 
 	private async sendManyLocked({
@@ -5076,7 +5079,8 @@ export class Wallet {
 			broadcast?: boolean;
 		} = {}
 	): Promise<Result<string>> {
-		return this.runSend(() => this.sendMaxLocked(params));
+		const options = { ...params };
+		return this.runSend(() => this.sendMaxLocked(options));
 	}
 
 	private async sendMaxLocked({
