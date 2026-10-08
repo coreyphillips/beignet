@@ -1217,7 +1217,7 @@ export class Transaction {
 				return err('No input provided.');
 			}
 
-			if (input.value < TRANSACTION_DEFAULTS.dustLimit) {
+			if (input.value < getDustThreshold(input.address)) {
 				return err('Input value is below dust limit.');
 			}
 
@@ -1677,7 +1677,7 @@ export class Transaction {
 
 			const currentWallet = this._wallet.data;
 			// The coins sendMax spends. The stored balance is not: it also counts
-			// frozen coins and the dust a refresh keeps out of the UTXO set.
+			// frozen coins.
 			const spendableUtxos = this.removeBlackListedUtxos(currentWallet.utxos);
 			const onchainBalance = this.getTransactionInputValue({
 				inputs: spendableUtxos

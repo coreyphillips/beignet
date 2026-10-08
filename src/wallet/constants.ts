@@ -1,5 +1,3 @@
-import { EAddressType } from '../types';
-
 export const BITKIT_WALLET_SEED_HASH_PREFIX = Buffer.from(
 	'@Bitkit/wallet-uuid'
 );
@@ -12,14 +10,6 @@ export const GENERATE_ADDRESS_AMOUNT = 5;
 // TODO: Add this as a settings for users to adjust when needed.
 export const GAP_LIMIT = 20;
 export const GAP_LIMIT_CHANGE = 20;
-
-export const DUST_LIMITS = {
-	[EAddressType.p2pkh]: 546,
-	[EAddressType.p2sh]: 546,
-	[EAddressType.p2wpkh]: 294,
-	[EAddressType.p2tr]: 294,
-	[EAddressType.p2wsh]: 330
-};
 
 /**
  * How long stop() waits for an in-flight refresh, and for the storage writes
