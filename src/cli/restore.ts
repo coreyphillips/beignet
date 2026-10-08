@@ -141,6 +141,20 @@ export async function restoreDbFile(
 			fs.copyFileSync(dbPath, preRestorePath);
 			tightenMode(preRestorePath, SECRET_FILE_MODE);
 		}
+		// A marker write failure must leave the live WAL intact.
+		// A marker already here belongs to an earlier restore that has not booted
+		// yet, and its database is still the live one if this swap fails.
+		const markerPending = fs.existsSync(markerPath);
+		writeFileAtomic(
+			markerPath,
+			JSON.stringify({
+				version: 1,
+				restoredAt: now,
+				backupFile,
+				authenticated: expectedMac !== null
+			})
+		);
+		markerWritten = !markerPending;
 		// Stale WAL/SHM sidecars pair with the OLD database; replayed against the
 		// restored file they corrupt it. Preserve them next to the pre-restore copy.
 		for (const suffix of ['-wal', '-shm']) {
@@ -154,20 +168,6 @@ export async function restoreDbFile(
 				}
 			}
 		}
-		// Before the swap, so the restored file never goes live without it. A
-		// marker already here belongs to an earlier restore that has not booted
-		// yet, and its database is still the live one if this swap fails.
-		const markerPending = fs.existsSync(markerPath);
-		writeFileAtomic(
-			markerPath,
-			JSON.stringify({
-				version: 1,
-				restoredAt: now,
-				backupFile,
-				authenticated: expectedMac !== null
-			})
-		);
-		markerWritten = !markerPending;
 		fs.renameSync(staged, dbPath);
 	} catch (err) {
 		fs.rmSync(staged, { force: true });
