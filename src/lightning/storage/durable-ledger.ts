@@ -102,6 +102,10 @@ export class MemoryLedgerStore<R extends ILedgerRecord>
  * changes, because the metadata table has no prefix scan and no delete. A
  * deleted record's row is overwritten with an empty tombstone and dropped
  * from the index.
+ *
+ * A row that no longer decodes cannot be served, so its engine forgets the
+ * record. `loadAll` reports its metadata key to `onCorruptRow` and leaves
+ * the row and its index entry as stored, so it is skipped, not erased.
  */
 export class MetadataLedgerStore<R extends ILedgerRecord>
 	implements IDurableLedgerStore<R>
@@ -109,7 +113,8 @@ export class MetadataLedgerStore<R extends ILedgerRecord>
 	constructor(
 		private readonly storage: ILedgerKeyValueStorage,
 		private readonly prefix: string,
-		private readonly codec: ILedgerCodec<R>
+		private readonly codec: ILedgerCodec<R>,
+		private readonly onCorruptRow?: (key: string) => void
 	) {}
 
 	private rowKey(id: string): string {
@@ -146,8 +151,12 @@ export class MetadataLedgerStore<R extends ILedgerRecord>
 	loadAll(): R[] {
 		const out: R[] = [];
 		for (const id of this.loadIndex()) {
-			const row = this.load(id);
+			const key = this.rowKey(id);
+			const raw = this.storage.loadMetadata(key);
+			if (!raw) continue;
+			const row = this.codec.decode(raw);
 			if (row) out.push(row);
+			else this.onCorruptRow?.(key);
 		}
 		return out;
 	}
