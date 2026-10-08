@@ -653,6 +653,7 @@ export class ReverseSwapProvider extends EventEmitter {
 		const existing = this.deps.ledger.get(swapIdHex);
 		if (existing) {
 			if (
+				existing.direction === 'reverse' &&
 				existing.claimPubkeyHex === req.claimPubkey.toString('hex') &&
 				existing.onchainSat === req.onchainAmountSat.toString() &&
 				existing.bolt11 &&
