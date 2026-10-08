@@ -1,5 +1,5 @@
 /**
- * Staged on-chain send hygiene (#1002, #1011). Fully OFFLINE: wallets point at
+ * Staged on-chain send hygiene (#1002, #1011, #1367). Fully OFFLINE: wallets point at
  * an unreachable Electrum port, UTXOs are injected directly into wallet data
  * (signing only needs the derivation path or the attached key pair), and
  * nothing is broadcast (broadcast: false).
@@ -535,6 +535,82 @@ describe('Signing keys never reach wallet storage (#1011)', function () {
 		);
 		expect(wallet.transaction.data.inputs).to.have.length(0);
 		expect(wallet.transaction.data.outputs).to.have.length(0);
+	});
+});
+
+/**
+ * #1367: getFeeInfo() with no transaction quotes the staged send. With no
+ * inputs staged it ran setupTransaction to gather them, which replaced the
+ * staged outputs with none and wrote the result to storage.
+ */
+describe('A no-arg fee quote leaves the staged send alone (#1367)', function () {
+	this.timeout(testTimeout);
+
+	const NAME = 'stagedquote';
+	let wallet: Wallet;
+	let json: IJsonStorage;
+
+	before(async function () {
+		json = makeJsonStorage();
+		wallet = await createWallet(NAME, json.storage);
+		injectUtxo(wallet, TXID_A, 300_000);
+	});
+
+	after(async function () {
+		await wallet?.stop();
+	});
+
+	it('quotes staged outputs with no staged inputs, and stages and writes nothing', async () => {
+		// Coin control: two recipients staged, then the only input deselected.
+		const setup = await wallet.transaction.setupTransaction({ satsPerByte: 2 });
+		if (setup.isErr()) throw setup.error;
+		const staged = wallet.transaction.updateSendTransaction({
+			transaction: {
+				outputs: [
+					{ address: RECIPIENT_A, value: 20_000, index: 0 },
+					{ address: RECIPIENT_B, value: 30_000, index: 1 }
+				]
+			}
+		});
+		if (staged.isErr()) throw staged.error;
+		for (const input of [...wallet.transaction.data.inputs]) {
+			const removed = wallet.removeTxInput({ input });
+			if (removed.isErr()) throw removed.error;
+		}
+		await settle();
+		const before = JSON.stringify(wallet.transaction.data);
+		const writes = json.history.length;
+
+		const quote = wallet.getFeeInfo({ satsPerByte: 5 });
+		if (quote.isErr()) throw quote.error;
+		await settle();
+
+		expect(JSON.stringify(wallet.transaction.data)).to.equal(before);
+		expect(json.history.length, 'nothing written').to.equal(writes);
+		// It priced the two staged recipients against the wallet's coins.
+		const explicit = wallet.getFeeInfo({
+			satsPerByte: 5,
+			transaction: {
+				...wallet.transaction.data,
+				inputs: wallet.transaction.removeBlackListedUtxos(wallet.data.utxos)
+			}
+		});
+		if (explicit.isErr()) throw explicit.error;
+		expect(quote.value).to.deep.equal(explicit.value);
+		await wallet.resetSendTransaction();
+	});
+
+	it('quotes an empty staging area against every UTXO and leaves it empty', async () => {
+		await wallet.resetSendTransaction();
+		const writes = json.history.length;
+
+		const quote = wallet.getFeeInfo({ satsPerByte: 5 });
+		if (quote.isErr()) throw quote.error;
+		await settle();
+
+		expect(quote.value.transactionByteCount).to.be.greaterThan(0);
+		expect(wallet.transaction.data).to.deep.equal(getDefaultSendTransaction());
+		expect(json.history.length, 'nothing written').to.equal(writes);
 	});
 });
 
