@@ -11,13 +11,18 @@
  * file is only readable by a node running with the same mnemonic. That key
  * gives no integrity (plaintext rows are accepted), so the backup must also
  * carry a MAC under the same seed (see backup-mac.ts).
+ *
+ * The MAC proves the backup is ours, not that it is current, so the channels
+ * it brings back are held on the next boot (holdDbRestoredChannels).
  */
 
 import { timingSafeEqual } from 'crypto';
 import * as fs from 'fs';
 import { acquireInstanceLock, releaseInstanceLock } from './instance-lock';
-import { SECRET_FILE_MODE, tightenMode } from './fs-utils';
+import { SECRET_FILE_MODE, tightenMode, writeFileAtomic } from './fs-utils';
 import { backupMacPath, fileMac, readBackupMac } from './backup-mac';
+import { ChannelState } from '../lightning/channel/types';
+import { IStorageBackend } from '../lightning/storage/types';
 
 /** First 16 bytes of every SQLite 3 database file. */
 export const SQLITE_HEADER = Buffer.from('SQLite format 3\0', 'ascii');
@@ -48,6 +53,14 @@ export function preRestoreBackupPath(
 	now: number = Date.now()
 ): string {
 	return `${dbPath}.pre-restore-${now}`;
+}
+
+/**
+ * Marker a restore leaves beside the database for the next boot. Its
+ * presence is the signal; the contents are only reported.
+ */
+export function dbRestoreMarkerPath(dbPath: string): string {
+	return `${dbPath}.restored`;
 }
 
 export interface IDbRestoreOptions {
@@ -104,6 +117,8 @@ export async function restoreDbFile(
 	const staged = `${dbPath}.restoring`;
 	fs.copyFileSync(backupFile, staged);
 	tightenMode(staged, SECRET_FILE_MODE);
+	const markerPath = dbRestoreMarkerPath(dbPath);
+	let markerWritten = false;
 	let preRestorePath: string | null = null;
 	try {
 		if (!isSqliteFile(staged)) {
@@ -139,9 +154,24 @@ export async function restoreDbFile(
 				}
 			}
 		}
+		// Before the swap, so the restored file never goes live without it. A
+		// marker already here belongs to an earlier restore that has not booted
+		// yet, and its database is still the live one if this swap fails.
+		const markerPending = fs.existsSync(markerPath);
+		writeFileAtomic(
+			markerPath,
+			JSON.stringify({
+				version: 1,
+				restoredAt: now,
+				backupFile,
+				authenticated: expectedMac !== null
+			})
+		);
+		markerWritten = !markerPending;
 		fs.renameSync(staged, dbPath);
 	} catch (err) {
 		fs.rmSync(staged, { force: true });
+		if (markerWritten) fs.rmSync(markerPath, { force: true });
 		throw err;
 	}
 	return { dbPath, preRestorePath, authenticated: expectedMac !== null };
@@ -167,4 +197,61 @@ export async function performDbRestore(
 	} finally {
 		releaseInstanceLock(lockPath);
 	}
+}
+
+export interface IDbRestoreHold {
+	/** Channels the hold was applied to. */
+	held: number;
+	/** When the restore ran, if the marker could be read. */
+	restoredAt: number | null;
+	/** False when unreadable rows kept the marker for the next boot. */
+	markerCleared: boolean;
+}
+
+/**
+ * On the first boot after a `restore db`, put every channel it brought back
+ * under the recency hold a capsule restore gets (restoreRecencyUnproven).
+ * Returns null when no restore is pending.
+ *
+ * A backup is a checkpoint, so its latest commitment may already be revoked
+ * in the peer's view, and a peer can under-report compatible reestablish
+ * counters while holding a newer state. The hold stops every broadcast of our
+ * commitment the node would make on its own (HTLC deadline and error-driven
+ * closes) and takes no new HTLCs, while the channel still resumes. Not
+ * stateUncertain, which would have every peer force-close on reconnect even
+ * when the backup was current.
+ *
+ * The marker is cleared only once every row decoded: a row this key cannot
+ * read (a wrong mnemonic, say) would otherwise load unheld on a later boot.
+ */
+export function holdDbRestoredChannels(
+	dbPath: string,
+	storage: IStorageBackend
+): IDbRestoreHold | null {
+	const markerPath = dbRestoreMarkerPath(dbPath);
+	if (!fs.existsSync(markerPath)) return null;
+	let restoredAt: number | null = null;
+	try {
+		const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+		if (typeof marker?.restoredAt === 'number') restoredAt = marker.restoredAt;
+	} catch {
+		// Presence alone requires the hold.
+	}
+	const corruptBefore = storage.corruptRowCount?.() ?? 0;
+	let held = 0;
+	for (const row of storage.loadAllChannels()) {
+		// Terminal rows never reestablish and have nothing left to broadcast.
+		if (
+			row.state.state === ChannelState.CLOSED ||
+			row.state.state === ChannelState.FORCE_CLOSED
+		) {
+			continue;
+		}
+		row.state.restoreRecencyUnproven = true;
+		storage.saveChannel(row.channelId, row.state, row.peerPubkey);
+		held++;
+	}
+	const markerCleared = (storage.corruptRowCount?.() ?? 0) === corruptBefore;
+	if (markerCleared) fs.unlinkSync(markerPath);
+	return { held, restoredAt, markerCleared };
 }

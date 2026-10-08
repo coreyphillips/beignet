@@ -406,10 +406,16 @@ Three very different restore modes:
   mnemonic that made the backup. Backups made before backups carried a MAC
   have no `.hmac` file and are refused; restore one with `--unauthenticated`
   only when you know it was not modified, then take a fresh backup once the
-  node is running. WARNING: restoring a
-  stale database and going online can be unsafe (peers may prove the state
-  stale); prefer the most recent backup, and rely on SCB recovery when in
-  doubt.
+  node is running. The MAC proves the backup is yours, not that it is
+  current, and a peer holding a newer state can hide that at reestablish and
+  wait for the node to broadcast a commitment it has already revoked. So the
+  restore leaves a marker (`<db>.restored`), and the next start puts every
+  open channel under the same hold a capsule restore gets
+  (`restoreRecencyUnproven`): channels resume and existing HTLCs settle, but
+  the node never force-closes one on its own and takes no new HTLCs. Closing
+  one from this node, cooperatively or by force, needs
+  `acceptStaleStateRisk: true`; the safe exit is the peer's own close.
+  Prefer the most recent backup, and rely on SCB recovery when in doubt.
 
 - **Guardian restore = resume the channels.** With the Recovery Protocol in a
   guardian mode (below), the node's safety-critical state is replicated as an

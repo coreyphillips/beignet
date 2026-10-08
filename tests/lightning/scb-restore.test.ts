@@ -49,11 +49,15 @@ import {
 import { BeignetNode } from '../../src/cli/beignet-node';
 import {
 	SQLITE_HEADER,
+	dbRestoreMarkerPath,
+	holdDbRestoredChannels,
 	isSqliteFile,
 	preRestoreBackupPath,
 	restoreDbFile,
 	performDbRestore
 } from '../../src/cli/restore';
+import { createOpenerState } from '../../src/lightning/channel/channel-state';
+import { deriveStorageKey } from '../../src/lightning/storage/encryption';
 import {
 	backupMacPath,
 	deriveBackupMacKey,
@@ -1273,6 +1277,196 @@ describe('SCB restore', function () {
 				expect(
 					fs.readFileSync(dbPath).equals(fs.readFileSync(backup))
 				).to.equal(true);
+			}
+		});
+
+		/** A channel row in `state`, as a backup would carry it. */
+		function saveChannelRow(
+			storage: SqliteStorage,
+			state: ChannelState
+		): string {
+			const point = getPublicKey(crypto.randomBytes(32));
+			const bp = {
+				fundingPubkey: point,
+				revocationBasepoint: point,
+				paymentBasepoint: point,
+				delayedPaymentBasepoint: point,
+				htlcBasepoint: point,
+				firstPerCommitmentPoint: point
+			};
+			const row = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 100_000n,
+				pushMsat: 0n,
+				localConfig: DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: bp,
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			row.state = state;
+			row.channelId = crypto.randomBytes(32);
+			row.fundingTxid = crypto.randomBytes(32);
+			row.remoteBasepoints = bp;
+			const id = row.channelId.toString('hex');
+			storage.saveChannel(
+				id,
+				row,
+				getPublicKey(crypto.randomBytes(32)).toString('hex')
+			);
+			return id;
+		}
+
+		it('restoreDbFile leaves a marker for the next boot and takes back its own when the swap fails (#1363)', async function () {
+			const backup = path.join(tmpDir, 'backup.db');
+			const dbPath = path.join(tmpDir, 'mainnet.db');
+			const markerPath = dbRestoreMarkerPath(dbPath);
+			await writeBackup(backup, 'NEW');
+			writeSqliteLike(dbPath, 'OLD');
+
+			await restoreDbFile(backup, dbPath, { macKey, now: 42 });
+			expect(JSON.parse(fs.readFileSync(markerPath, 'utf8'))).to.include({
+				restoredAt: 42,
+				authenticated: true
+			});
+
+			// A refused backup writes none.
+			fs.unlinkSync(markerPath);
+			const notDb = path.join(tmpDir, 'not-a-db.bin');
+			fs.writeFileSync(notDb, 'garbage');
+			await writeBackupMac(macKey, notDb);
+			await rejectionOf(restoreDbFile(notDb, dbPath, { macKey }));
+			expect(fs.existsSync(markerPath)).to.equal(false);
+
+			// The module object itself: the namespace import is getters only.
+			const nodeFs = require('fs') as typeof fs;
+			const realRename = nodeFs.renameSync;
+			nodeFs.renameSync = (from, to): void => {
+				if (to === dbPath) throw new Error('rename failed');
+				realRename(from, to);
+			};
+			try {
+				// The swap failed, so the live database is the one that was there,
+				// and holding its channels would be a false alarm.
+				await rejectionOf(restoreDbFile(backup, dbPath, { macKey }));
+				expect(fs.existsSync(markerPath)).to.equal(false);
+
+				// An earlier restore that has not booted yet is still the live
+				// database after a failed second one, so its marker stays.
+				fs.writeFileSync(markerPath, '{}');
+				await rejectionOf(restoreDbFile(backup, dbPath, { macKey }));
+				expect(fs.existsSync(markerPath)).to.equal(true);
+			} finally {
+				nodeFs.renameSync = realRename;
+			}
+		});
+
+		it('holdDbRestoredChannels holds every open channel a restore brought back, once (#1363)', function () {
+			const dbPath = path.join(tmpDir, 'mainnet.db');
+			const storage = new SqliteStorage(dbPath);
+			storage.open();
+			try {
+				const open = saveChannelRow(storage, ChannelState.NORMAL);
+				const closed = saveChannelRow(storage, ChannelState.CLOSED);
+
+				// No restore pending: nothing changes.
+				expect(holdDbRestoredChannels(dbPath, storage)).to.equal(null);
+				expect(
+					storage.loadChannel(open)!.state.restoreRecencyUnproven
+				).to.equal(undefined);
+
+				fs.writeFileSync(
+					dbRestoreMarkerPath(dbPath),
+					JSON.stringify({ version: 1, restoredAt: 42 })
+				);
+				expect(holdDbRestoredChannels(dbPath, storage)).to.deep.equal({
+					held: 1,
+					restoredAt: 42,
+					markerCleared: true
+				});
+				expect(
+					storage.loadChannel(open)!.state.restoreRecencyUnproven
+				).to.equal(true);
+				expect(
+					storage.loadChannel(closed)!.state.restoreRecencyUnproven
+				).to.equal(undefined);
+				expect(fs.existsSync(dbRestoreMarkerPath(dbPath))).to.equal(false);
+				expect(holdDbRestoredChannels(dbPath, storage)).to.equal(null);
+
+				// An unreadable marker still means a restore ran.
+				fs.writeFileSync(dbRestoreMarkerPath(dbPath), 'not json');
+				expect(holdDbRestoredChannels(dbPath, storage)).to.deep.equal({
+					held: 1,
+					restoredAt: null,
+					markerCleared: true
+				});
+			} finally {
+				storage.close();
+			}
+		});
+
+		it('holdDbRestoredChannels keeps the marker while a row cannot be read (#1363)', function () {
+			const dbPath = path.join(tmpDir, 'mainnet.db');
+			const writer = new SqliteStorage(dbPath, undefined, {
+				encryptionKey: crypto.randomBytes(32)
+			});
+			writer.open();
+			saveChannelRow(writer, ChannelState.NORMAL);
+			writer.close();
+			fs.writeFileSync(dbRestoreMarkerPath(dbPath), '{}');
+
+			// Started under the wrong mnemonic: the row does not decrypt, so it
+			// must still be held on the boot that can read it.
+			const wrongKey = new SqliteStorage(dbPath, () => undefined, {
+				encryptionKey: crypto.randomBytes(32)
+			});
+			wrongKey.open();
+			try {
+				expect(holdDbRestoredChannels(dbPath, wrongKey)).to.deep.equal({
+					held: 0,
+					restoredAt: null,
+					markerCleared: false
+				});
+				expect(fs.existsSync(dbRestoreMarkerPath(dbPath))).to.equal(true);
+			} finally {
+				wrongKey.close();
+			}
+		});
+
+		it('a BeignetNode started on a restored database holds its channels (#1363)', async function () {
+			this.timeout(60_000);
+			const encryptionKey = deriveStorageKey(
+				bip39.mnemonicToSeedSync(MNEMONIC)
+			);
+			const backup = path.join(tmpDir, 'backup.db');
+			const source = new SqliteStorage(backup, undefined, { encryptionKey });
+			source.open();
+			const channelId = saveChannelRow(source, ChannelState.NORMAL);
+			source.close();
+			await writeBackupMac(macKey, backup);
+
+			const dataDir = path.join(tmpDir, 'data');
+			fs.mkdirSync(dataDir);
+			const dbPath = path.join(dataDir, 'regtest.db');
+			await restoreDbFile(backup, dbPath, { macKey });
+
+			const node = await BeignetNode.create({
+				mnemonic: MNEMONIC,
+				network: 'regtest',
+				dataDir,
+				logLevel: 'silent',
+				rapidGossipSync: false,
+				autoGossipSync: false,
+				...OFFLINE_ELECTRUM
+			});
+			try {
+				const channel = node
+					.getNode()
+					.getChannelManager()
+					.getChannel(Buffer.from(channelId, 'hex'));
+				expect(channel, 'the restored channel loaded').to.not.equal(undefined);
+				expect(channel!.getFullState().restoreRecencyUnproven).to.equal(true);
+				expect(fs.existsSync(dbRestoreMarkerPath(dbPath))).to.equal(false);
+			} finally {
+				await node.destroy();
 			}
 		});
 
