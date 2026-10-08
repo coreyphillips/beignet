@@ -1667,7 +1667,12 @@ export class Transaction {
 			}
 
 			const currentWallet = this._wallet.data;
-			const onchainBalance = currentWallet.balance;
+			// The coins sendMax spends. The stored balance is not: it also counts
+			// frozen coins and the dust a refresh keeps out of the UTXO set.
+			const spendableUtxos = this.removeBlackListedUtxos(currentWallet.utxos);
+			const onchainBalance = this.getTransactionInputValue({
+				inputs: spendableUtxos
+			});
 
 			const inputValue = this.getTransactionInputValue({
 				inputs: transaction.inputs
@@ -1676,10 +1681,10 @@ export class Transaction {
 
 			let utxos: IUtxo[] = [];
 			//Ensure we add the larger utxo set for a more accurate fee.
-			if (transaction.inputs.length > currentWallet?.utxos.length) {
+			if (transaction.inputs.length > spendableUtxos.length) {
 				utxos = transaction.inputs;
 			} else {
-				utxos = currentWallet?.utxos ?? [];
+				utxos = spendableUtxos;
 			}
 			const fees = this._wallet.feeEstimates;
 			const selectedFeeId = this._wallet.selectedFeeId;
