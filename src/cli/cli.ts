@@ -2845,7 +2845,10 @@ async function handleRestore(): Promise<void> {
 					dbPath: result.dbPath,
 					preRestorePath: result.preRestorePath,
 					network,
-					note: 'DB is encrypted under the wallet seed; start the node with the same mnemonic.'
+					note:
+						'DB is encrypted under the wallet seed; start the node with the same mnemonic. ' +
+						'A backup cannot be proven current, so the next start holds every open channel: ' +
+						'no automatic force close and no new HTLCs, and closing one needs acceptStaleStateRisk.'
 				}
 			});
 		} catch (err: unknown) {
@@ -2992,7 +2995,10 @@ On-chain:
                                          OFFLINE - stop the daemon first; needs
                                          the same mnemonic and <backupFile>.hmac;
                                          --unauthenticated accepts a backup made
-                                         before backups carried a MAC)
+                                         before backups carried a MAC). A backup
+                                         may be stale, so the next start holds
+                                         every open channel: no automatic force
+                                         close, no new HTLCs
   recovery status                        Recovery Protocol status: mode, guardian
                                          set, startup gate, durable sequence
   recovery restore                       Restore this node from its guardian

@@ -42,6 +42,7 @@ import {
 	OnchainSweepRequest
 } from './onchain-sweep';
 import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
+import { holdDbRestoredChannels } from './restore';
 import { deriveBackupMacKey, writeBackupMac } from './backup-mac';
 import { nodeStorageView } from './node-storage-view';
 import { EProtocol } from '../types/electrum';
@@ -2581,6 +2582,18 @@ export class BeignetNode extends EventEmitter {
 		);
 		this.storage.open();
 		this._bootOpts = opts;
+		// Before anything loads a channel: nothing may resume a `restore db`
+		// row unheld (issue #1363).
+		const dbRestore = holdDbRestoredChannels(dbPath, this.storage);
+		if (dbRestore) {
+			this.log(
+				'warn',
+				'Database was restored from a backup that cannot be proven ' +
+					'current, so its channels are held: no automatic force close and ' +
+					'no new HTLCs. Closing one from this node needs acceptStaleStateRisk',
+				{ ...dbRestore }
+			);
+		}
 
 		// Recovery Protocol boot decision (docs/RECOVERY-PROTOCOL.md section
 		// 8). Guardian modes ask the guardian set who owns this namespace
