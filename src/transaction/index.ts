@@ -440,9 +440,18 @@ export class Transaction {
 		coinSelectPreference?: ECoinSelectPreference;
 	} = {}): Result<TGetTotalFeeObj> => {
 		try {
+			// With no inputs, price the transaction against every spendable UTXO, as
+			// setupTransaction would gather them, but in memory. Staging them here
+			// would replace the caller's staged outputs and write that to storage.
 			if (!transaction.inputs?.length) {
-				void this.setupTransaction({});
-				transaction = this.data;
+				transaction = {
+					...transaction,
+					inputs: this.removeBlackListedUtxos(this._wallet.data.utxos),
+					changeAddress:
+						transaction.changeAddress ||
+						this._wallet.data.changeAddressIndex[this._wallet.addressType]
+							?.address
+				};
 			}
 			const changeAddress = transaction.changeAddress;
 
