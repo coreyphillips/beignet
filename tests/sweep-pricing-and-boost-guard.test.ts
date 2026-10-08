@@ -205,6 +205,29 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 				expect(fee).to.equal(wallet.transaction.data.fee);
 			});
 		});
+
+		// A sweep has no change output to CPFP from, so RBF is the sender's only
+		// way to bump it (#1359).
+		[true, false].forEach((rbf) => {
+			it(`stages rbf: ${rbf} in the input sequences`, async function () {
+				injectUtxo(FUNDING_TXID, 100_000);
+				injectUtxo(BOOSTED_TXID, 100_000);
+
+				const res = await wallet.sendMax({
+					address: P2WPKH,
+					satsPerByte: 10,
+					rbf,
+					broadcast: false
+				});
+				if (res.isErr()) throw res.error;
+
+				const tx = BitcoinTransaction.fromHex(res.value);
+				expect(tx.ins).to.have.length(2);
+				for (const input of tx.ins) {
+					expect(input.sequence < 0xfffffffe, 'signals RBF').to.equal(rbf);
+				}
+			});
+		});
 	});
 
 	describe('setupRbf', function () {
