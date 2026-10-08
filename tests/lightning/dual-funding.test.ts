@@ -1545,6 +1545,67 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			);
 		});
 
+		describe('off-curve peer points (issue 1369)', () => {
+			// Well formed (0x02 prefix, 33 bytes) but not on the curve, so only a
+			// real curve check catches it.
+			const offCurvePoint = (): Buffer => {
+				let point: Buffer;
+				do {
+					point = Buffer.concat([Buffer.from([0x02]), crypto.randomBytes(32)]);
+				} while (ecc.isPoint(point));
+				return point;
+			};
+			const fields: Array<[keyof IChannelBasepoints, string]> = [
+				['fundingPubkey', 'funding_pubkey'],
+				['revocationBasepoint', 'revocation_basepoint'],
+				['paymentBasepoint', 'payment_basepoint'],
+				['delayedPaymentBasepoint', 'delayed_payment_basepoint'],
+				['htlcBasepoint', 'htlc_basepoint'],
+				['firstPerCommitmentPoint', 'first_per_commitment_point']
+			];
+			const sentWireError = (actions: ChannelAction[]): boolean =>
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						a.messageType === MessageType.ERROR
+				);
+
+			for (const [field, wireName] of fields) {
+				it(`refuses an open_channel2 with an off-curve ${wireName}`, () => {
+					const bad = offCurvePoint();
+					const { channel, actions } = openAcceptorChannel({
+						fundingSatoshis: 200_000n,
+						[field]: bad
+					});
+					expect(refusalOf(actions)).to.equal(
+						`${wireName} is not a valid secp256k1 public key`
+					);
+					expect(sentWireError(actions), 'the refusal went out on the wire').to
+						.be.true;
+					const state = channel.getFullState();
+					expect(state.dualFundingSession).to.equal(null);
+					expect(state.remoteBasepoints?.[field]).to.not.deep.equal(bad);
+				});
+
+				it(`refuses an accept_channel2 with an off-curve ${wireName}`, () => {
+					const bad = offCurvePoint();
+					const { channel, actions } = openOpenerChannel(200_000n, {
+						[field]: bad
+					});
+					expect(refusalOf(actions)).to.equal(
+						`${wireName} is not a valid secp256k1 public key`
+					);
+					expect(sentWireError(actions), 'the refusal went out on the wire').to
+						.be.true;
+					const session = channel.getFullState().dualFundingSession;
+					expect(session?.getState()).to.equal(
+						DualFundingState.AWAITING_ACCEPT
+					);
+					expect(session?.getRemoteBasepoints()).to.equal(null);
+				});
+			}
+		});
+
 		it('refuses a v2 open whose commitment #0 would have no outputs (issue 379)', () => {
 			// open_channel2 and accept_channel2 inherit accept_channel's
 			// requirements, so BOLT 2's two receiver MUST-fails on the initial

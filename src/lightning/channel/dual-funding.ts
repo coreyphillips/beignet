@@ -142,6 +142,7 @@ import {
 	DEFAULT_MINIMUM_DEPTH,
 	MAX_MINIMUM_DEPTH
 } from './types';
+import { validateChannelPoints } from './validation';
 import { IChannelBasepoints } from '../keys/derivation';
 import { ILeaseRates } from '../gossip/types';
 
@@ -1206,11 +1207,10 @@ export class DualFundingSession {
 			return 'commitment_feerate must be greater than 0';
 		}
 
-		if (msg.fundingPubkey.length !== 33) {
-			return 'funding_pubkey must be 33 bytes';
-		}
-
-		return null;
+		// Same check as v1. Nothing touches these points as curve points until
+		// the commitment #0 build after negotiation, where an off-curve one
+		// throws and wedges the open.
+		return validateChannelPoints(msg);
 	}
 
 	private validateAcceptParams(msg: IAcceptChannel2Message): string | null {
@@ -1242,10 +1242,6 @@ export class DualFundingSession {
 			return `minimum_depth ${msg.minimumDepth} exceeds maximum ${MAX_MINIMUM_DEPTH}`;
 		}
 
-		if (msg.fundingPubkey.length !== 33) {
-			return 'funding_pubkey must be 33 bytes';
-		}
-
-		return null;
+		return validateChannelPoints(msg);
 	}
 }

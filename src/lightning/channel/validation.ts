@@ -110,13 +110,13 @@ export function deriveV2TemporaryChannelId(
 }
 
 /**
- * BOLT 2: every public key and basepoint in open_channel / accept_channel MUST
- * be a valid secp256k1 point. An off-curve basepoint makes every later key
- * derivation (commitment keys, revocation, HTLC keys) fail or, worse, produce
- * unspendable outputs.
+ * BOLT 2: every public key and basepoint in open_channel / accept_channel (and
+ * their v2 counterparts) MUST be a valid secp256k1 point. An off-curve
+ * basepoint makes every later key derivation (commitment keys, revocation, HTLC
+ * keys) fail or, worse, produce unspendable outputs.
  * @returns Error string naming the bad field, or null.
  */
-function validateChannelPoints(
+export function validateChannelPoints(
 	msg: Pick<
 		IOpenChannelMessage,
 		| 'fundingPubkey'
