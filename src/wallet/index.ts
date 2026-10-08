@@ -99,6 +99,7 @@ import {
 	getDataFallback,
 	getDefaultWalletData,
 	getDefaultWalletDataKeys,
+	getDustThreshold,
 	getBitcoinJsNetwork,
 	getElectrumNetwork,
 	getHighestUsedIndexFromTxHashes,
@@ -2721,7 +2722,13 @@ export class Wallet {
 			spendMark
 		);
 		const utxos = removeDustUtxos(scanned.utxos);
-		const balance = (getUtxosRes.value?.balance ?? 0) - scanned.spentValue;
+		// No send path can select a coin the set leaves out, so the balance does
+		// not count it either.
+		const droppedValue =
+			scanned.utxos.reduce((sum, utxo) => sum + utxo.value, 0) -
+			utxos.reduce((sum, utxo) => sum + utxo.value, 0);
+		const balance =
+			(getUtxosRes.value?.balance ?? 0) - scanned.spentValue - droppedValue;
 		this._data.utxos = utxos;
 		this._data.balance = balance;
 		// A refused write is logged and left to the next scan, which writes both
@@ -6195,7 +6202,7 @@ export class Wallet {
 	 */
 	public addTxInput({ input }: { input: IUtxo }): Result<IUtxo[]> {
 		try {
-			if (input.value < TRANSACTION_DEFAULTS.dustLimit) {
+			if (input.value < getDustThreshold(input.address)) {
 				return err('Input value is below dust limit.');
 			}
 			const txData = this.transaction.data;
