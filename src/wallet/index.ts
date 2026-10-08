@@ -4946,6 +4946,21 @@ export class Wallet {
 	}
 
 	/**
+	 * Serializes send, sendMany and sendMax. They share one staged
+	 * transaction, and the coins a broadcast spends leave the UTXO set only
+	 * when it returns. Two overlapping calls would stage the same coins, and
+	 * under RBF the later broadcast replaces the earlier one after both have
+	 * reported a txid.
+	 */
+	private sendLock: Promise<unknown> = Promise.resolve();
+
+	private runSend<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this.sendLock.then(fn, fn);
+		this.sendLock = run.catch(() => undefined);
+		return run;
+	}
+
+	/**
 	 * Sets up and creates a transaction to multiple outputs.
 	 * @param {ISendTx[]} txs
 	 * @param {number} [satsPerByte]
@@ -4954,19 +4969,23 @@ export class Wallet {
 	 * @param {boolean} [shuffleOutputs]
 	 * @returns {Promise<Result<string>>}
 	 */
-	public async sendMany({
-		txs = [],
-		satsPerByte = this.feeEstimates.normal,
-		rbf,
-		broadcast = true,
-		shuffleOutputs = true
-	}: {
+	public async sendMany(params: {
 		txs: ISendTx[];
 		satsPerByte?: number;
 		rbf?: boolean;
 		broadcast?: boolean;
 		shuffleOutputs?: boolean;
 	}): Promise<Result<string>> {
+		return this.runSend(() => this.sendManyLocked(params));
+	}
+
+	private async sendManyLocked({
+		txs = [],
+		satsPerByte = this.feeEstimates.normal,
+		rbf,
+		broadcast = true,
+		shuffleOutputs = true
+	}: Parameters<Wallet['sendMany']>[0]): Promise<Result<string>> {
 		if (this._multisig) return err(new MultisigSpendError());
 		if (this.isWatchOnly) return err(new WatchOnlySigningError());
 		if (!this.data.utxos.length) {
@@ -5049,17 +5068,23 @@ export class Wallet {
 	 * @param {boolean} [broadcast]
 	 * @returns {Promise<Result<string>>}
 	 */
-	public async sendMax({
+	public async sendMax(
+		params: {
+			address?: string;
+			satsPerByte?: number;
+			rbf?: boolean;
+			broadcast?: boolean;
+		} = {}
+	): Promise<Result<string>> {
+		return this.runSend(() => this.sendMaxLocked(params));
+	}
+
+	private async sendMaxLocked({
 		address,
 		satsPerByte,
 		rbf = false,
 		broadcast = true
-	}: {
-		address?: string;
-		satsPerByte?: number;
-		rbf?: boolean;
-		broadcast?: boolean;
-	} = {}): Promise<Result<string>> {
+	}: Parameters<Wallet['sendMax']>[0] = {}): Promise<Result<string>> {
 		if (this._multisig) return err(new MultisigSpendError());
 		if (this.isWatchOnly) return err(new WatchOnlySigningError());
 		if (!this.data.utxos.length) {

@@ -25,6 +25,7 @@ const electrumHelpers = require('rn-electrum-client/helpers');
 import {
 	EAddressType,
 	EAvailableNetworks,
+	ECoinSelectPreference,
 	EProtocol,
 	IGetUtxosResponse,
 	ILogger,
@@ -257,6 +258,50 @@ describe('Broadcast drops the coins it spends', function () {
 		expect(wallet.getBalance()).to.equal(
 			remaining.reduce((sum, utxo) => sum + utxo.value, 0)
 		);
+	});
+
+	// Issue #1368: two overlapping sends both staged the full set before
+	// either broadcast had dropped its coins.
+	it('does not let two overlapping sends spend the same coin', async () => {
+		wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
+		let releaseFirst!: () => void;
+		const firstHeld = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		broadcast.onFirstCall().callsFake(async () => {
+			await firstHeld;
+			return { error: false, data: BROADCAST_TXID };
+		});
+		const pay = (): Promise<Result<string>> =>
+			wallet.send({
+				address: EXTERNAL_ADDRESS,
+				amount: 30000,
+				satsPerByte: 2,
+				rbf: true
+			});
+
+		const first = pay();
+		await waitFor(() => broadcast.callCount === 1);
+		const second = pay();
+		releaseFirst();
+		const [firstRes, secondRes] = await Promise.all([first, second]);
+		if (firstRes.isErr()) throw firstRes.error;
+		if (secondRes.isErr()) throw secondRes.error;
+		expect(broadcast.callCount).to.equal(2);
+		const spentBy = (call: number): string[] => {
+			const decoded = decodeRawTransaction(
+				broadcast.getCall(call).args[0].rawTx,
+				wallet.network
+			);
+			if (decoded.isErr()) throw decoded.error;
+			return decoded.value.vin.map((vin) => `${vin.txid}:${vin.vout}`);
+		};
+		const firstSpent = spentBy(0);
+		const secondSpent = spentBy(1);
+		expect(firstSpent).to.have.length(1);
+		expect(secondSpent).to.have.length(1);
+		expect(secondSpent).to.not.include(firstSpent[0]);
+		expect(wallet.listUtxos()).to.have.length(0);
 	});
 
 	it('drops only the coins the raw transaction names', async () => {
