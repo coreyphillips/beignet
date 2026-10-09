@@ -129,6 +129,12 @@ export interface IReverseSwapProviderConfig {
 	maxFundingAttempts: number;
 	maxCreatedPerPeer: number;
 	/**
+	 * CREATED rows across every peer, connected or not. Each keeps a ledger
+	 * row and a hold invoice until its invoice expires, and the exposure caps
+	 * only count a row once it is held, so a create past this is refused.
+	 */
+	maxUnpaidSwaps: number;
+	/**
 	 * Per-peer budget for quote, create and status requests: a token bucket
 	 * of rate times multiplier. A request past it is dropped unanswered.
 	 */
@@ -165,6 +171,7 @@ export const REVERSE_SWAP_DEFAULTS: Omit<
 	refundBumpIntervalBlocks: 2,
 	maxFundingAttempts: 3,
 	maxCreatedPerPeer: 4,
+	maxUnpaidSwaps: 64,
 	maxRequestsPerSecond: 5,
 	requestBurstMultiplier: 4,
 	fundingVbytesEstimate: 200,
@@ -768,6 +775,15 @@ export class ReverseSwapProvider extends EventEmitter {
 		}
 		if (this.deps.ledger.createdCount(peer) >= this.config.maxCreatedPerPeer) {
 			return refuse(SwapRefusalReason.RATE_LIMITED, 'too many unpaid swaps');
+		}
+		if (
+			this.deps.ledger.countInStates('reverse', ['CREATED']) >=
+			this.config.maxUnpaidSwaps
+		) {
+			return refuse(
+				SwapRefusalReason.RATE_LIMITED,
+				'too many unpaid swaps on this provider'
+			);
 		}
 		const fee = await this.quoteFee(req.onchainAmountSat);
 		if (!fee)
