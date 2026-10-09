@@ -116,8 +116,8 @@ export class GossipSyncManager extends EventEmitter {
 	/**
 	 * A batch reply timed out, so its end marker may still arrive and close
 	 * a later batch, in this sync or a later one, before that batch's reply
-	 * does. No sync on this connection can then end SYNCED, and the repair
-	 * waits for the next connection.
+	 * does. No sync on this connection can then end SYNCED, so a repair it
+	 * holds is finished by a sync on another connection.
 	 */
 	private _markerOwed = false;
 	/**
@@ -146,6 +146,21 @@ export class GossipSyncManager extends EventEmitter {
 	/** Lost gossip that no sync has fetched again yet. */
 	get repairPending(): boolean {
 		return this._repairPending;
+	}
+
+	/**
+	 * Give up a repair the sync ended IDLE without finishing, for the node to
+	 * hand to the next sync, which may be another peer's. A sync still
+	 * running keeps its repair.
+	 *
+	 * @returns Whether there was a repair to give up.
+	 */
+	releaseRepair(): boolean {
+		if (this._state !== GossipSyncState.IDLE || !this._repairPending) {
+			return false;
+		}
+		this._repairPending = false;
+		return true;
 	}
 
 	/**
@@ -237,9 +252,12 @@ export class GossipSyncManager extends EventEmitter {
 
 		if (missing.length === 0) {
 			// A repair asks for every offered channel, so here the peer offered
-			// none and nothing lost was fetched again.
+			// none and nothing lost was fetched again. An owed marker rules out
+			// SYNCED even when the repair was released to another sync.
 			return this._endSync(
-				this._repairPending ? GossipSyncState.IDLE : GossipSyncState.SYNCED
+				this._repairPending || this._markerOwed
+					? GossipSyncState.IDLE
+					: GossipSyncState.SYNCED
 			);
 		}
 
@@ -259,6 +277,9 @@ export class GossipSyncManager extends EventEmitter {
 		this._batchAttempts = 0;
 		this._batchLost = false;
 		this._incomplete = false;
+		// An old marker can close any of these batches before its reply
+		// arrives, so the sync holds a repair even after releasing one.
+		if (this._markerOwed) this._repairPending = true;
 
 		// Send first batch
 		return this._sendNextScidQuery();
@@ -320,15 +341,19 @@ export class GossipSyncManager extends EventEmitter {
 	 * During a batch that message may be part of the reply, so the batch is
 	 * asked for again when its end marker arrives. Before the range reply
 	 * completes it is gossip no batch would ask for, so the sync asks for
-	 * every channel instead. Either way the loss stays recorded until a sync
-	 * ends SYNCED, so the node can carry it past a disconnect. New gossip
-	 * outside the batch comes again with the store the sync asks for at its
-	 * end.
+	 * every channel instead. While a marker is owed, a timed-out batch's reply
+	 * can still arrive after the sync ended, so a loss then is recorded too.
+	 * Either way the loss stays recorded until a sync ends SYNCED, so the node
+	 * can carry it past a disconnect. New gossip outside the batch comes again
+	 * with the store the sync asks for at its end.
 	 */
 	noteIntakeLoss(): void {
 		if (this._state === GossipSyncState.AWAITING_SCID_REPLY) {
 			this._batchLost = true;
-		} else if (this._state !== GossipSyncState.AWAITING_RANGE_REPLY) {
+		} else if (
+			this._state !== GossipSyncState.AWAITING_RANGE_REPLY &&
+			!this._markerOwed
+		) {
 			return;
 		}
 		this._repairPending = true;
