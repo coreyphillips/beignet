@@ -415,8 +415,9 @@ export class Peer extends EventEmitter {
 	 * Backpressure: when the socket's write buffer is saturated (slow link, e.g.
 	 * a stalled Tor circuit) best-effort gossip messages are dropped instead of
 	 * growing the buffer without bound — replying to a full-graph gossip query
-	 * over a slow circuit must not OOM the node. Channel-critical messages are
-	 * always queued regardless of buffer depth.
+	 * over a slow circuit must not OOM the node. Other messages are queued
+	 * until the buffer passes MAX_WRITE_BUFFER, and then the peer is
+	 * disconnected.
 	 */
 	sendMessage(type: number, payload: Buffer): void {
 		if (this.state !== 'ready' || !this.transport || !this.socket) {
@@ -429,6 +430,20 @@ export class Peer extends EventEmitter {
 		}
 
 		const buffered = this.socket.writableLength;
+		if (buffered > Peer.MAX_WRITE_BUFFER) {
+			// Disconnect before the error goes out, so a send from an error
+			// observer throws instead of re-entering this branch. The message
+			// is lost with the rest of the buffer, as it would be in a socket
+			// that died, and reestablish retransmits what a channel needs.
+			this.disconnect();
+			this.emit(
+				'error',
+				new Error(
+					`Write buffer overflow: ${buffered} bytes exceeds ${Peer.MAX_WRITE_BUFFER}`
+				)
+			);
+			return;
+		}
 		if (
 			Peer.GOSSIP_MESSAGE_TYPES.has(type) &&
 			buffered > Peer.MAX_GOSSIP_WRITE_BUFFER
@@ -483,6 +498,15 @@ export class Peer extends EventEmitter {
 	 */
 	private static readonly MAX_SYNC_REPLY_WRITE_BUFFER =
 		Peer.MAX_GOSSIP_WRITE_BUFFER + 1024 * 1024;
+
+	/**
+	 * Above this many buffered bytes the peer is disconnected, whatever the
+	 * message type. The largest burst a legitimate sender queues at once is a
+	 * guardian GET_STATE page written in one loop, which a client accepts up
+	 * to 64 MiB (guardian-client DEFAULT_MAX_RESPONSE_BYTES), so a lower cap
+	 * would fail a restore from a full namespace on every retry.
+	 */
+	private static readonly MAX_WRITE_BUFFER = 72 * 1024 * 1024; // 72 MB
 
 	/**
 	 * Disconnect from the peer gracefully.
