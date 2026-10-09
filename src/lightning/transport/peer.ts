@@ -512,6 +512,7 @@ export class Peer extends EventEmitter {
 	 * Disconnect from the peer gracefully.
 	 */
 	disconnect(): void {
+		const established = this.state === 'ready';
 		// An in-flight connect/accept must not survive this call: the abort
 		// flag stops the handshake at its next boundary, a socket factory
 		// that resolves later destroys its socket instead of adopting it, and
@@ -527,6 +528,18 @@ export class Peer extends EventEmitter {
 		this.stopPingTimer();
 		this.destroySocket();
 		this.state = 'disconnected';
+		if (established) {
+			// destroySocket strips the socket's close listener, so the close
+			// owners rely on to release this connection (PeerManager's
+			// registration and inbound slot) is reported here instead. It is
+			// deferred like a socket's close, so a caller's own teardown after
+			// disconnect() runs first, and dropped if a new connect/accept
+			// (which bumps heldLifecycleId) began meanwhile.
+			const lifecycle = this.heldLifecycleId;
+			queueMicrotask(() => {
+				if (this.heldLifecycleId === lifecycle) this.emit('close', false);
+			});
+		}
 	}
 
 	/**
