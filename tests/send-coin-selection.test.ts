@@ -209,4 +209,18 @@ describe('sendMany coin selection (#1360)', function () {
 			[`${b}:5000`, `${c}:6000`].sort()
 		);
 	});
+
+	it('leaves every coin to a concurrent PSBT build', async function () {
+		wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
+
+		const [first, second] = await Promise.all([
+			wallet.buildPsbt({ address: RECIPIENT, amount: 15_000, satsPerByte: 2 }),
+			wallet.buildPsbt({ address: RECIPIENT, amount: 35_000, satsPerByte: 2 })
+		]);
+		if (first.isErr()) throw first.error;
+		if (second.isErr()) throw second.error;
+
+		expect(first.value.inputs).to.have.length(2);
+		expect(second.value.inputs).to.have.length(4);
+	});
 });

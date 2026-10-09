@@ -5239,13 +5239,10 @@ export class Wallet {
 				coinSelectPreference: this.coinSelectPreference
 			});
 			if (coinSelectRes.isErr()) return err(coinSelectRes.error.message);
-			// Build from the returned copy: a concurrent build can restage the
-			// shared transaction while this one awaits.
-			const selectedRes = await this.transaction.applyAutoCoinSelect({
-				coinSelectRes: coinSelectRes.value
-			});
-			if (selectedRes.isErr()) return err(selectedRes.error.message);
-			const txData = selectedRes.value;
+			// A local copy, not applyAutoCoinSelect: narrowing the shared staged
+			// inputs would shrink the pool a concurrent build is still pricing,
+			// and that build could restage the shared copy while this one awaits.
+			const txData = { ...staged, inputs: coinSelectRes.value.inputs };
 			const psbtRes = await this.transaction.createUnsignedPsbt({
 				transactionData: txData,
 				shuffleOutputs
