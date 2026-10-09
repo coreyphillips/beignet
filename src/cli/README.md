@@ -2315,7 +2315,7 @@ The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wal
 | GET | `/channels/ready` | -- | List channels that are NORMAL and will accept a new HTLC (a capsule-restored channel holding for recency is excluded) |
 | GET | `/can-send` | `?amountSats=<n>` | Check send capacity |
 | GET | `/can-receive` | `?amountSats=<n>` | Check receive capacity |
-| GET | `/payments` | `?status=&direction=&since=&limit=&offset=` | List payments (filterable). Read through to the node database, so a completed or failed payment stays listed after the engine prunes its in-memory record (24 hours after completion); a database read that fails answers 500, never a shorter list |
+| GET | `/payments` | `?status=&direction=&since=&limit=&offset=` | List payments (filterable), newest first. One page per call: `limit` defaults to and may not exceed 1000, so page with `offset`. Read through to the node database, so a completed or failed payment stays listed after the engine prunes its in-memory record (24 hours after completion); a database read that fails answers 500, never a shorter list |
 | GET | `/forwards` | `?since=&until=&limit=&offset=&channelId=` | Settled forwards with fees earned (msat values as strings) |
 | GET | `/forwards/summary` | `?since=` | Forwarding totals: `{ count, volumeOutMsat, feesEarnedMsat }` |
 | GET | `/invoices` | -- | List created invoices. `status` is `PAID` on a completed receive, from the in-memory record or the database row once the engine has pruned it, so a paid invoice never reads `EXPIRED` or `PENDING` later |

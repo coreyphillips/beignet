@@ -440,6 +440,7 @@ describe('Pruned payments stay readable from their durable rows (issue #1063)', 
 		const liveInvoice = node.createInvoice(700, 'still in the map', 3_600);
 
 		sinon.stub(storage, 'loadAllPayments').throws(new Error('disk gone'));
+		sinon.stub(storage, 'paymentsNewestFirst').throws(new Error('disk gone'));
 		expect(() => node.listPayments()).to.throw('disk gone');
 		expect(() => node.listPayments({ direction: 'INCOMING' })).to.throw(
 			'disk gone'
@@ -618,6 +619,7 @@ describe('GET /payments, /payment, /invoices and /invoice after the prune (issue
 	it('a database read that fails answers 500, never a shorter list or NOT_FOUND', async () => {
 		const storage = daemon.node.getStorage();
 		sinon.stub(storage, 'loadAllPayments').throws(new Error('disk gone'));
+		sinon.stub(storage, 'paymentsNewestFirst').throws(new Error('disk gone'));
 		sinon.stub(storage, 'loadPayment').throws(new Error('disk gone'));
 		for (const p of [
 			'/payments',

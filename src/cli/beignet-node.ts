@@ -81,7 +81,10 @@ import { IInvoiceInfo } from '../lightning/storage/types';
 import { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
 import { normalizeHexPubkey } from '../lightning/validation';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
-import { SqliteStorage } from '../lightning/storage/sqlite-storage';
+import {
+	IStoredPaymentRef,
+	SqliteStorage
+} from '../lightning/storage/sqlite-storage';
 import { deriveStorageKey } from '../lightning/storage/encryption';
 import {
 	encodeScb,
@@ -11972,43 +11975,89 @@ export class BeignetNode extends EventEmitter {
 	 * exist, the row stands in where the map has forgotten. A wallet must
 	 * never show less than it already knew, so a row set that cannot be
 	 * read fails the call rather than answering with the map alone.
+	 *
+	 * The rows come newest first from the database's created_at index and
+	 * the read stops once the page is full, so a limit bounds how many rows
+	 * are decrypted (issue #1403). Without a status, direction or metadata
+	 * filter the rows skipped by offset are not decrypted either.
 	 */
 	listPayments(filter?: PaymentFilter): PaymentInfo[] {
-		let payments = this.paymentRecords().map((p) => this.toPaymentInfo(p));
-
-		// Sort by createdAt descending (newest first)
-		payments.sort((a, b) => b.createdAt - a.createdAt);
-
-		if (filter) {
-			if (filter.status) {
-				payments = payments.filter((p) => p.status === filter.status);
-			}
-			if (filter.direction) {
-				payments = payments.filter((p) => p.direction === filter.direction);
-			}
-			if (filter.since !== undefined) {
-				payments = payments.filter((p) => p.createdAt >= filter.since!);
-			}
-			if (filter.metadataKey !== undefined) {
-				if (filter.metadataValue !== undefined) {
-					payments = payments.filter(
-						(p) => p.metadata?.[filter.metadataKey!] === filter.metadataValue
-					);
-				} else {
-					payments = payments.filter(
-						(p) => p.metadata !== undefined && filter.metadataKey! in p.metadata
-					);
-				}
-			}
-			if (filter.offset !== undefined && filter.offset > 0) {
-				payments = payments.slice(filter.offset);
-			}
-			if (filter.limit !== undefined && filter.limit > 0) {
-				payments = payments.slice(0, filter.limit);
-			}
+		const since = filter?.since;
+		const live = new Map<string, IPaymentInfo>();
+		for (const p of this.node.listPayments()) {
+			live.set(p.paymentHash.toString('hex'), p);
 		}
+		// Ties on createdAt go to the larger hash, the index's order.
+		const newer = (a: IStoredPaymentRef, b: IStoredPaymentRef): boolean =>
+			a.createdAt > b.createdAt ||
+			(a.createdAt === b.createdAt && a.paymentHash > b.paymentHash);
+		const liveNewestFirst: IStoredPaymentRef[] = [...live]
+			.filter(([, p]) => since === undefined || p.createdAt >= since)
+			.map(([paymentHash, p]) => ({
+				paymentHash,
+				createdAt: p.createdAt,
+				load: () => p
+			}))
+			.sort((a, b) => (newer(a, b) ? -1 : newer(b, a) ? 1 : 0));
+		const rows = this.storage.paymentsNewestFirst(since);
+		const nextRow = (): IStoredPaymentRef | undefined => {
+			for (let r = rows.next(); !r.done; r = rows.next()) {
+				if (!live.has(r.value.paymentHash)) return r.value;
+			}
+			return undefined;
+		};
 
-		return payments;
+		const filtered =
+			!!filter?.status ||
+			!!filter?.direction ||
+			filter?.metadataKey !== undefined;
+		const matches = (p: PaymentInfo): boolean => {
+			if (!filter) return true;
+			if (filter.status && p.status !== filter.status) return false;
+			if (filter.direction && p.direction !== filter.direction) return false;
+			if (filter.metadataKey === undefined) return true;
+			if (filter.metadataValue !== undefined) {
+				return p.metadata?.[filter.metadataKey] === filter.metadataValue;
+			}
+			return p.metadata !== undefined && filter.metadataKey in p.metadata;
+		};
+		const offset =
+			filter?.offset !== undefined && filter.offset > 0 ? filter.offset : 0;
+		const limit =
+			filter?.limit !== undefined && filter.limit > 0 ? filter.limit : Infinity;
+
+		const page: PaymentInfo[] = [];
+		let skipped = 0;
+		let i = 0;
+		let row = nextRow();
+		while (page.length < limit) {
+			let next: IStoredPaymentRef;
+			if (
+				i < liveNewestFirst.length &&
+				(!row || newer(liveNewestFirst[i], row))
+			) {
+				next = liveNewestFirst[i++];
+			} else if (row) {
+				next = row;
+				row = nextRow();
+			} else {
+				break;
+			}
+			if (!filtered && skipped < offset) {
+				skipped++;
+				continue;
+			}
+			const record = next.load();
+			if (!record) continue;
+			const info = this.toPaymentInfo(record);
+			if (!matches(info)) continue;
+			if (skipped < offset) {
+				skipped++;
+				continue;
+			}
+			page.push(info);
+		}
+		return page;
 	}
 
 	/**
@@ -12049,22 +12098,6 @@ export class BeignetNode extends EventEmitter {
 	private livePayment(paymentHash: string): PaymentInfo | null {
 		const p = this.node.getPayment(Buffer.from(paymentHash, 'hex'));
 		return p ? this.toPaymentInfo(p) : null;
-	}
-
-	/**
-	 * The durable rows under the in-memory map, keyed by hash, the live
-	 * record winning. One storage read per call; a row set that cannot be
-	 * read throws.
-	 */
-	private paymentRecords(): IPaymentInfo[] {
-		const byHash = new Map<string, IPaymentInfo>();
-		for (const { paymentHash, payment } of this.storage.loadAllPayments()) {
-			byHash.set(paymentHash, payment);
-		}
-		for (const p of this.node.listPayments()) {
-			byHash.set(p.paymentHash.toString('hex'), p);
-		}
-		return [...byHash.values()];
 	}
 
 	/**

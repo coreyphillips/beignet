@@ -130,7 +130,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				get: {
 					summary: 'List payments with optional filtering',
 					description:
-						'Newest first. Read through to the node database: a completed or failed payment stays listed with its status after the engine prunes its in-memory record (24 hours after completion, oldest first past 10,000). A database read that fails answers 500, never a shorter list.',
+						'Newest first, at most 1000 per call: page with offset. Read through to the node database: a completed or failed payment stays listed with its status after the engine prunes its in-memory record (24 hours after completion, oldest first past 10,000). A database read that fails answers 500, never a shorter list.',
 					tags: ['Payments'],
 					parameters: [
 						{
@@ -147,7 +147,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							schema: { type: 'string', enum: ['OUTGOING', 'INCOMING'] }
 						},
 						{ name: 'since', in: 'query', schema: { type: 'integer' } },
-						{ name: 'limit', in: 'query', schema: { type: 'integer' } },
+						{
+							name: 'limit',
+							in: 'query',
+							schema: { type: 'integer', minimum: 0, maximum: 1000 },
+							description: 'Page size; 0 or absent is 1000'
+						},
 						{ name: 'offset', in: 'query', schema: { type: 'integer' } },
 						{
 							name: 'metadataKey',
