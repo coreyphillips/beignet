@@ -15,9 +15,13 @@
 
 import { expect } from 'chai';
 import * as bitcoin from 'bitcoinjs-lib';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { BeignetNode } from '../../src/cli/beignet-node';
 import { BeignetError } from '../../src/cli/errors';
 import { PaymentWaitTimeoutError } from '../../src/lightning/node/types';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { ok } from '../../src/utils/result';
 
 const CHANNEL_A = 'aa'.repeat(32);
@@ -340,6 +344,80 @@ describe('Issue #1042: rebalances under the drain and the daily limit', () => {
 		const err = await refusal(() => node.executeRebalances(1_000));
 		expect(err.code).to.equal('SERVICE_DRAINING');
 		expect(node.engineCalls).to.equal(0);
+	});
+
+	it('refuses an advisor run while a shutdown waits on a backup, leaving the day uncharged across a restart (issue #1423)', async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-1423-'));
+		const dbPath = path.join(dir, 'node.db');
+		try {
+			const storage = new SqliteStorage(dbPath);
+			storage.open();
+			let finishBackup = (): void => undefined;
+			let engineCalls = 0;
+			// A boot only adopts a stored day that ends at the next UTC midnight.
+			const midnight = new Date();
+			midnight.setUTCHours(24, 0, 0, 0);
+			const node = fakeNode(
+				{ daily: 1_000 },
+				{
+					destroyed: false,
+					_dailySpendResetTime: midnight.getTime(),
+					_autoApply: { phase: 'idle' },
+					_backupPromise: new Promise<void>((resolve) => {
+						finishBackup = (): void => resolve();
+					}),
+					storage,
+					node: {
+						rebalanceBudgetSatsPerDay: (given?: number): number => given ?? 0,
+						// As the engine does once shutdown has set destroyed: asks,
+						// is told to stop, and returns an empty run.
+						executeRebalanceRecommendations: async (options: {
+							stopRequested?: () => boolean;
+						}): Promise<unknown> => {
+							engineCalls++;
+							options.stopRequested?.();
+							return {
+								attempts: [],
+								succeeded: 0,
+								failed: 0,
+								skippedBudget: 0,
+								feeSpentMsat: 0n,
+								budgetRemainingMsat: 0n
+							};
+						},
+						gracefulShutdown: async (): Promise<void> => undefined
+					}
+				}
+			);
+			// Not draining: a programmatic shutdown only sets destroyed.
+			const shutdown = node.gracefulShutdown();
+			const err = await refusal(() => node.executeRebalances(1_000));
+			expect(err.code).to.equal('NODE_DESTROYED');
+			expect(engineCalls).to.equal(0);
+			expect(node._dailySpentSats).to.equal(0);
+			finishBackup();
+			await shutdown;
+
+			// The next boot reads the ledger back from the same database.
+			const reopened = new SqliteStorage(dbPath);
+			reopened.open();
+			try {
+				const next = fakeNode(
+					{ daily: 1_000 },
+					{ storage: reopened }
+				) as unknown as Ledger & {
+					_loadSpendState(): void;
+					_checkSpendLimit(sats: number): void;
+				};
+				next._loadSpendState();
+				expect(next._dailySpentSats).to.equal(0);
+				expect(() => next._checkSpendLimit(1_000)).to.not.throw();
+			} finally {
+				reopened.close();
+			}
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it('refuses an advisor run whose day budget does not fit the limit', async () => {

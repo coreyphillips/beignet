@@ -13651,6 +13651,15 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		this._checkDraining();
+		// Refused here as in rebalanceChannel: a run during a shutdown's backup
+		// wait sends nothing, but the refund is skipped once destroyed, so the
+		// charge below would stand.
+		if (this.destroyed) {
+			throw new BeignetError(
+				BeignetErrorCode.NODE_DESTROYED,
+				'Node is shutting down; no new rebalances accepted'
+			);
+		}
 		// Charged up front as rebalanceChannel is, at the whole day's fee
 		// budget, which bounds what the run can spend whatever the advisor has
 		// already spent today.

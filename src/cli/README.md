@@ -743,9 +743,10 @@ figure as the daily limit: `sendOnchain`, an address-targeted `spliceOut` and
 whole sweep. The exclusions above are outside it too.
 
 Circular rebalances (`rebalanceChannel`, `executeRebalances` and their routes)
-are refused with `SERVICE_DRAINING` while the node drains, and a drain that
-starts during an `executeRebalances` run stops the plans it has not tried
-yet. The amount comes back to the node, so only the routing fee counts
+are refused with `SERVICE_DRAINING` while the node drains, and with
+`NODE_DESTROYED` once a shutdown starts, before anything is charged. A drain
+or shutdown that starts during an `executeRebalances` run stops the plans it
+has not tried yet. The amount comes back to the node, so only the routing fee counts
 against the daily limit. The day is charged `maxFeeSats` (`rebalanceChannel`)
 or the day's advisor fee budget (`executeRebalances`) when the call starts,
 and gets back what the fees actually paid did not use when it returns. A
