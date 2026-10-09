@@ -2190,4 +2190,184 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		carol.destroy();
 		alice.destroy();
 	});
+
+	/** Alice pays 60,000 of a 100,000 msat invoice to Bob in one part. */
+	function payTimedOutPart(alice: LightningNode, bob: LightningNode): Buffer {
+		const invoice = bob.createInvoice({
+			amountMsat: 100_000n,
+			description: 'mpp timeout during quiescence'
+		});
+		const finalCltv = (
+			alice as unknown as { paddedFinalCltvExpiry: () => number }
+		).paddedFinalCltvExpiry();
+		alice.sendPaymentToRoute(
+			{
+				hops: [
+					{
+						pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+						shortChannelId: encodeShortChannelId({
+							block: 500,
+							txIndex: 1,
+							outputIndex: 0
+						}),
+						amountToForwardMsat: 60_000n,
+						outgoingCltvValue: finalCltv
+					}
+				]
+			},
+			invoice.paymentHash,
+			finalCltv,
+			invoice.paymentSecret,
+			100_000n
+		);
+		return invoice.paymentHash;
+	}
+
+	function timeOutMppSets(node: LightningNode): Map<string, unknown> {
+		const pendingMpp = (
+			node as unknown as {
+				pendingMppPayments: Map<string, { createdAt: number }>;
+			}
+		).pendingMppPayments;
+		for (const pending of pendingMpp.values()) pending.createdAt -= 120_000;
+		node.failTimedOutMppPayments();
+		return pendingMpp;
+	}
+
+	it('an MPP part timed out during quiescence is failed after a restart, not reaccumulated (#1424)', async function () {
+		this.timeout(20_000);
+		const dbPath = tempDb('quiescent-mpp-timeout');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED, storage1);
+		wire(alice, bob, { val: false });
+		alice.handleNewBlock(1000);
+		bob.handleNewBlock(1000);
+		const channelId = openReadyChannel(alice, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+		const paymentHash = payTimedOutPart(alice, bob);
+		await settle();
+
+		expect(bob.getChannelManager().initiateQuiescence(channelId).ok).to.equal(
+			true
+		);
+		await settle();
+		const bobChannel = bob.getChannelManager().getChannel(channelId)!;
+		expect(bobChannel.isQuiescent(), 'both sides sent stfu').to.equal(true);
+
+		const pendingMpp = timeOutMppSets(bob);
+		expect(pendingMpp.size, 'the timed-out set is dropped').to.equal(0);
+		expect(bobChannel.getFullState().htlcs.get('received-0')!.state).to.equal(
+			HtlcState.COMMITTED
+		);
+		const aliceKey = `${channelId.toString('hex')}:0`;
+		expect(
+			JSON.parse(storage1.loadMetadata('owed_part_failures')!),
+			'the deferred fail is owed on disk'
+		).to.deep.equal([{ key: aliceKey, failureCode: MPP_TIMEOUT }]);
+		expect(
+			storage1.loadAllHtlcSharedSecrets().map((s) => s.key),
+			'the secret outlives the deferral'
+		).to.deep.equal([aliceKey]);
+		bob.destroy();
+
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		alice.removeAllListeners('message:outbound');
+		const restarted = createNode(BOB_SEED, storage2);
+		await reconnect(restarted, alice);
+
+		expect(
+			(restarted as unknown as { pendingMppPayments: Map<string, unknown> })
+				.pendingMppPayments.size,
+			'the timed-out part was not reaccumulated'
+		).to.equal(0);
+		const alicePayment = alice.getPayment(paymentHash)!;
+		expect(alicePayment.status).to.equal(PaymentStatus.FAILED);
+		expect(alicePayment.failureCode, 'the payer read the timeout').to.equal(
+			MPP_TIMEOUT
+		);
+		const restartedChannel = restarted
+			.getChannelManager()
+			.getChannel(channelId)!;
+		expect(restartedChannel.getFullState().htlcs.size, 'no HTLC left').to.equal(
+			0
+		);
+		expect(sharedSecrets(restarted).size, 'no shared secret left').to.equal(0);
+		expect(storage2.loadAllHtlcSharedSecrets()).to.deep.equal([]);
+		expect(
+			storage2.loadMetadata('owed_part_failures'),
+			'the owed fail is retired on disk'
+		).to.equal('[]');
+
+		// Past the height the claim backstop would have force-closed at.
+		for (let height = 1001; height <= 1050; height++) {
+			alice.handleNewBlock(height);
+			restarted.handleNewBlock(height);
+		}
+		expect(restartedChannel.getState()).to.equal(ChannelState.NORMAL);
+
+		restarted.destroy();
+		alice.destroy();
+	});
+
+	it('an MPP part timed out during quiescence retires its debt and secret once quiescence ends (#1424)', async function () {
+		this.timeout(20_000);
+		const storage = new SqliteStorage(tempDb('quiescent-mpp-timeout-live'));
+		storage.open();
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED, storage);
+		wire(alice, bob, { val: false });
+		alice.handleNewBlock(1000);
+		bob.handleNewBlock(1000);
+		const channelId = openReadyChannel(alice, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+		const paymentHash = payTimedOutPart(alice, bob);
+		await settle();
+
+		const quiescing = bob
+			.getChannelManager()
+			.getChannel(channelId)! as unknown as {
+			isQuiescing: () => boolean;
+		};
+		quiescing.isQuiescing = (): boolean => true;
+		timeOutMppSets(bob);
+		const aliceKey = `${channelId.toString('hex')}:0`;
+		expect(
+			JSON.parse(storage.loadMetadata('owed_part_failures')!)
+		).to.deep.equal([{ key: aliceKey, failureCode: MPP_TIMEOUT }]);
+
+		// Quiescence ends with no reconnect (a splice exit, say). The block's
+		// queue drain carries the fail and the HTLC resolves before the owed
+		// retry looks at it.
+		delete (quiescing as { isQuiescing?: unknown }).isQuiescing;
+		bob.handleNewBlock(1001);
+		alice.handleNewBlock(1001);
+		await settle();
+
+		const alicePayment = alice.getPayment(paymentHash)!;
+		expect(alicePayment.status).to.equal(PaymentStatus.FAILED);
+		expect(alicePayment.failureCode, 'the payer read the timeout').to.equal(
+			MPP_TIMEOUT
+		);
+		const bobChannel = bob.getChannelManager().getChannel(channelId)!;
+		expect(bobChannel.getFullState().htlcs.size, 'no HTLC left').to.equal(0);
+		expect(sharedSecrets(bob).size, 'no shared secret left').to.equal(0);
+		expect(storage.loadAllHtlcSharedSecrets()).to.deep.equal([]);
+		expect(
+			storage.loadMetadata('owed_part_failures'),
+			'the owed fail is retired on disk'
+		).to.equal('[]');
+
+		for (let height = 1002; height <= 1050; height++) {
+			alice.handleNewBlock(height);
+			bob.handleNewBlock(height);
+		}
+		expect(bobChannel.getState()).to.equal(ChannelState.NORMAL);
+
+		bob.destroy();
+		alice.destroy();
+	});
 });

@@ -1774,7 +1774,8 @@ export class ChannelManager extends EventEmitter {
 	 *
 	 * sendsWithheld means the fail is not on disk: this persist failed, or
 	 * memory already had the fail from one that did and nothing has landed
-	 * since. A restart before the next landed persist forgets it.
+	 * since, or quiescence deferred it to a memory-only queue. A restart
+	 * before the next landed persist forgets it.
 	 */
 	failHtlc(
 		channelId: Buffer,
@@ -1805,7 +1806,7 @@ export class ChannelManager extends EventEmitter {
 				direction
 			})
 		) {
-			return { ok: true, actions: [] };
+			return { ok: true, actions: [], sendsWithheld: true };
 		}
 
 		const actions = channel.failHtlc(htlcId, reason, direction);

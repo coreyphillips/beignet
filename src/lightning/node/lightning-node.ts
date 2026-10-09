@@ -24916,7 +24916,13 @@ export class LightningNode extends EventEmitter {
 				(htlc.state === HtlcState.COMMITTED ||
 					htlc.state === HtlcState.PENDING ||
 					htlc.state === HtlcState.FAILED);
-			if (!stillOwed || owed.fail()) {
+			if (!stillOwed) {
+				// Resolved, so no fail will ever need the secret. A fail that
+				// left through the quiescence queue lands here, not below.
+				this.owedHeldForwardFailures.delete(key);
+				this.cleanupHtlcSharedSecret(key);
+				retiredPersisted ||= owed.failureCode !== undefined;
+			} else if (owed.fail()) {
 				this.owedHeldForwardFailures.delete(key);
 				retiredPersisted ||= owed.failureCode !== undefined;
 			}
