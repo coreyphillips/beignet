@@ -6479,9 +6479,6 @@ export class Wallet {
 			return err(getUtxoRes.error.message);
 		}
 		const { balance, utxos } = getUtxoRes.value;
-		if (balance < TRANSACTION_DEFAULTS.dustLimit) {
-			return err('Balance is below dust limit.');
-		}
 		return ok({ balance, utxos, keyPair, addresses });
 	}
 
@@ -6511,6 +6508,9 @@ export class Wallet {
 			return err(privateKeyInfo.error.message);
 		}
 		const { keyPair } = privateKeyInfo.value;
+		if (!privateKeyInfo.value.utxos.length) {
+			return err('No UTXOs found for this private key.');
+		}
 		// addInput refuses a coin below its script's dust threshold, so one
 		// unsolicited dust deposit would abort the sweep of every other coin.
 		let utxos: IUtxo[] = privateKeyInfo.value.utxos

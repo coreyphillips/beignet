@@ -2,6 +2,8 @@
  * Regression tests for issue #1434: sweepPrivateKey staged every coin the key
  * held, and addInput refuses one below its script's dust threshold, so a
  * single 293 sat P2WPKH deposit aborted the sweep of the key's other coins.
+ * Issue #1433: a key holding under 546 sats in total was refused before sweep
+ * pricing, so its coins could not even join a sweep of the wallet's funds.
  *
  * Fully OFFLINE: the wallet points at an unreachable Electrum port and the
  * key's UTXO lookup is stubbed.
@@ -102,7 +104,28 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 
 	afterEach(function () {
 		sinon.restore();
+		wallet.data.utxos = [];
 	});
+
+	/** Adds a coin paying the wallet's own index-0 P2WPKH address. */
+	const walletHolds = (txid: string, value: number): void => {
+		const source = wallet.data.addressIndex[EAddressType.p2wpkh];
+		wallet.data.utxos.push({
+			address: source.address,
+			index: source.index,
+			path: source.path,
+			scriptHash: source.scriptHash,
+			height: 1,
+			tx_hash: txid,
+			tx_pos: 0,
+			value,
+			publicKey: source.publicKey
+		});
+	};
+
+	/** The txids a signed transaction spends, in input order. */
+	const spentTxids = (tx: BitcoinTransaction): string[] =>
+		tx.ins.map((input) => Buffer.from(input.hash).reverse().toString('hex'));
 
 	it('sweeps the coins above the threshold and leaves a 293 sat one behind', async () => {
 		const funded = keyCoin('11'.repeat(32), 10_000);
@@ -117,9 +140,7 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 		if (res.isErr()) throw res.error;
 
 		const tx = BitcoinTransaction.fromHex(res.value.hex);
-		expect(
-			tx.ins.map((input) => Buffer.from(input.hash).reverse().toString('hex'))
-		).to.deep.equal([funded.tx_hash]);
+		expect(spentTxids(tx)).to.deep.equal([funded.tx_hash]);
 		expect(tx.outs).to.have.length(1);
 		expect(res.value.balance).to.equal(10_000);
 		const fee = 10_000 - tx.outs[0].value;
@@ -128,22 +149,10 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 	});
 
 	it('refuses a key whose every coin is below the threshold', async () => {
-		// Together over the flat 546 getPrivateKeyInfo checks, each under 294.
 		keyHolds([keyCoin('33'.repeat(32), 293), keyCoin('44'.repeat(32), 293)]);
 		// A wallet coin, so an empty input set cannot fall back to the
 		// wallet's own coins unnoticed.
-		const source = wallet.data.addressIndex[EAddressType.p2wpkh];
-		wallet.data.utxos.push({
-			address: source.address,
-			index: source.index,
-			path: source.path,
-			scriptHash: source.scriptHash,
-			height: 1,
-			tx_hash: '55'.repeat(32),
-			tx_pos: 0,
-			value: 50_000,
-			publicKey: source.publicKey
-		});
+		walletHolds('55'.repeat(32), 50_000);
 
 		const res = await wallet.sweepPrivateKey({
 			privateKey: keyPair.toWIF(),
@@ -158,5 +167,69 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 			'Every UTXO held by this key is below the dust limit.'
 		);
 		expect(wallet.transaction.data.inputs).to.have.length(0);
+	});
+
+	it('reports a key holding less than 546 sats', async () => {
+		keyHolds([keyCoin('66'.repeat(32), 500)]);
+
+		const res = await wallet.getPrivateKeyInfo(keyPair.toWIF());
+		if (res.isErr()) throw res.error;
+
+		expect(res.value.balance).to.equal(500);
+		expect(res.value.utxos.map((utxo) => utxo.value)).to.deep.equal([500]);
+	});
+
+	it('sweeps a 500 sat coin together with the wallet coins', async () => {
+		const coin = keyCoin('88'.repeat(32), 500);
+		keyHolds([coin]);
+		walletHolds('99'.repeat(32), 20_000);
+
+		const res = await wallet.sweepPrivateKey({
+			privateKey: keyPair.toWIF(),
+			toAddress: RECIPIENT,
+			satsPerByte: 1,
+			broadcast: false,
+			combineWithWalletUtxos: true
+		});
+		if (res.isErr()) throw res.error;
+
+		const tx = BitcoinTransaction.fromHex(res.value.hex);
+		expect(spentTxids(tx)).to.have.members(['99'.repeat(32), coin.tx_hash]);
+		expect(tx.outs).to.have.length(1);
+		expect(20_500 - tx.outs[0].value).to.be.at.least(tx.virtualSize());
+	});
+
+	it('leaves a lone 500 sat coin for sweep pricing to judge', async () => {
+		// getTotalFee prices any transaction at 1 sat/vB as at least 256 vB,
+		// which leaves 244 sats for a destination whose threshold is 294.
+		keyHolds([keyCoin('aa'.repeat(32), 500)]);
+
+		const res = await wallet.sweepPrivateKey({
+			privateKey: keyPair.toWIF(),
+			toAddress: RECIPIENT,
+			satsPerByte: 1,
+			broadcast: false
+		});
+
+		expect(res.isErr(), 'the sweep was refused').to.equal(true);
+		if (res.isOk()) return;
+		expect(res.error.message).to.equal(
+			`Output value for ${RECIPIENT} must be greater than or equal to the dust threshold of 294 sats`
+		);
+	});
+
+	it('refuses a key that holds no coins', async () => {
+		keyHolds([]);
+
+		const res = await wallet.sweepPrivateKey({
+			privateKey: keyPair.toWIF(),
+			toAddress: RECIPIENT,
+			satsPerByte: 1,
+			broadcast: false
+		});
+
+		expect(res.isErr(), 'the sweep was refused').to.equal(true);
+		if (res.isOk()) return;
+		expect(res.error.message).to.equal('No UTXOs found for this private key.');
 	});
 });
