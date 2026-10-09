@@ -5239,16 +5239,20 @@ export class Wallet {
 				coinSelectPreference: this.coinSelectPreference
 			});
 			if (coinSelectRes.isErr()) return err(coinSelectRes.error.message);
-			await this.transaction.applyAutoCoinSelect({
+			// Build from the returned copy: a concurrent build can restage the
+			// shared transaction while this one awaits.
+			const selectedRes = await this.transaction.applyAutoCoinSelect({
 				coinSelectRes: coinSelectRes.value
 			});
+			if (selectedRes.isErr()) return err(selectedRes.error.message);
+			const txData = selectedRes.value;
 			const psbtRes = await this.transaction.createUnsignedPsbt({
+				transactionData: txData,
 				shuffleOutputs
 			});
 			if (psbtRes.isErr()) return err(psbtRes.error.message);
 			const psbt = psbtRes.value;
 			this._rememberBuiltPsbt(psbt);
-			const txData = this.transaction.data;
 			const inputValue = this.transaction.getTransactionInputValue({
 				inputs: txData.inputs
 			});

@@ -179,4 +179,34 @@ describe('sendMany coin selection (#1360)', function () {
 		expect(feeOf(tx)).to.equal(built.value.fee);
 		expect(feeOf(tx) / tx.virtualSize()).to.be.at.least(10);
 	});
+
+	it('keeps each concurrent PSBT build on its own recipients', async function () {
+		wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
+		const [a, b, c] = [4, 5, 6].map((fill) =>
+			bitcoinAddress.toBech32(Buffer.alloc(20, fill), 0, 'bcrt')
+		);
+
+		const [first, second] = await Promise.all([
+			wallet.buildPsbt({ address: a, amount: 10_000, satsPerByte: 2 }),
+			wallet.buildPsbt({
+				txs: [
+					{ address: b, amount: 5_000 },
+					{ address: c, amount: 6_000 }
+				],
+				satsPerByte: 2
+			})
+		]);
+		if (first.isErr()) throw first.error;
+		if (second.isErr()) throw second.error;
+		const paid = (outputs: { address?: string; value: number }[]): string[] =>
+			outputs
+				.filter(({ address }) => [a, b, c].includes(address ?? ''))
+				.map(({ address, value }) => `${address}:${value}`)
+				.sort();
+
+		expect(paid(first.value.outputs)).to.deep.equal([`${a}:10000`]);
+		expect(paid(second.value.outputs)).to.deep.equal(
+			[`${b}:5000`, `${c}:6000`].sort()
+		);
+	});
 });
