@@ -444,4 +444,58 @@ describe('Reverse swap provider on LightningNode (issue #737)', function () {
 			}
 		}
 	});
+
+	it('a partly paid create that expires fails its parked part back (issue #1390)', async function () {
+		const s = scene(13);
+		await s.bob.startSwapProvider();
+		const swap = clientSwap();
+		const ack = await createSwap(s, swap);
+		expect(ack.accepted, ack.reasonText).to.equal(true);
+		const terms = ack.terms!;
+		const secret = (await import('../../src/lightning/invoice/decode')).decode(
+			terms.bolt11
+		).paymentSecret!;
+		// One dust part with an expiry weeks out: the sweeper alone would
+		// leave it parked until block 5000 - 18.
+		s.alice.sendPaymentToRoute(
+			{
+				hops: [
+					{
+						pubkey: Buffer.from(s.bob.getNodeId(), 'hex'),
+						shortChannelId: scidForIndex(0),
+						amountToForwardMsat: 1_000n,
+						outgoingCltvValue: 5000
+					}
+				]
+			},
+			swap.paymentHash,
+			5000,
+			secret,
+			terms.invoiceAmountMsat
+		);
+		await settle();
+		const receivedHtlcs = (): number =>
+			[
+				...s.bob
+					.getChannelManager()
+					.getChannel(s.channels[0])!
+					.getFullState()
+					.htlcs.keys()
+			].filter((key) => key.startsWith('received-')).length;
+		expect(receivedHtlcs()).to.equal(1);
+		await tick(s, 1001);
+		expect(s.bob.listSwaps()[0].state).to.equal('CREATED');
+
+		s.bob['swapLedger']!.patch(terms.swapId.toString('hex'), {
+			invoiceExpiresAt: 1
+		});
+		await tick(s, 1002);
+		expect(s.bob.listSwaps()[0].state).to.equal('CANCELLED');
+		expect(receivedHtlcs()).to.equal(0);
+		expect(s.alice.getPayment(swap.paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+		expect(s.bob.listHoldInvoices()).to.deep.equal([]);
+		expect(s.events).to.deep.equal(['swap:created', 'swap:hold-cancelled']);
+	});
 });

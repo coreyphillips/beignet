@@ -12,7 +12,8 @@ import { expect } from 'chai';
 import { PaymentStatus } from '../../src/lightning/node/types';
 import {
 	HELD_HTLC_EXPIRY_MARGIN,
-	LightningNode
+	LightningNode,
+	MAX_HELD_PARTS_PER_HASH
 } from '../../src/lightning/node/lightning-node';
 import {
 	IHoldCancelledEvent,
@@ -312,6 +313,66 @@ describe('Hold invoice snapshot (issue #737 phase 2)', function () {
 		bob.handleNewBlock(1040 - HELD_HTLC_EXPIRY_MARGIN);
 		expect(events).to.have.length(0);
 		expect(bob.getHeldInvoiceSnapshot(hash)!.state).to.equal('ACCEPTED');
+	});
+
+	it('parks at most MAX_HELD_PARTS_PER_HASH parts of one hold (issue #1390)', function () {
+		const alice = createNode(TAG, 43);
+		// The default per-peer budget refuses a burst this size first.
+		const bob = createNode(TAG, 44, undefined, {
+			rateLimitConfig: { maxHtlcsPerSecond: 1_000 }
+		});
+		connectNodes(alice, bob);
+		for (const node of [alice, bob]) node.handleNewBlock(1000);
+		const channelId = openReadyChannel(alice, bob, 100_000n);
+		buildGraph(alice, bob, [channelId], 100_000_000n);
+
+		const { hash } = makeExternalHash();
+		const totalMsat = 90_000_000n;
+		const invoice = bob.createInvoice({
+			amountMsat: totalMsat,
+			description: 'hold-dust-parts',
+			hold: true,
+			paymentHash: hash
+		});
+		const refusals: IStructuredLog[] = [];
+		bob.on('log', (log: IStructuredLog) => {
+			if (log.action === 'held_parts_full') refusals.push(log);
+		});
+		const bobPubkey = Buffer.from(bob.getNodeId(), 'hex');
+		const receivedHtlcs = (): number =>
+			[
+				...bob
+					.getChannelManager()
+					.getChannel(channelId)!
+					.getFullState()
+					.htlcs.keys()
+			].filter((key) => key.startsWith('received-')).length;
+		// One-sat parts with a far expiry: what an unpaid hold would park
+		// until the sweeper reached them.
+		for (let i = 0; i <= MAX_HELD_PARTS_PER_HASH; i++) {
+			alice.sendPaymentToRoute(
+				{
+					hops: [
+						{
+							pubkey: bobPubkey,
+							shortChannelId: scidForIndex(0),
+							amountToForwardMsat: 1_000n,
+							outgoingCltvValue: 5000
+						}
+					]
+				},
+				hash,
+				5000,
+				invoice.paymentSecret,
+				totalMsat
+			);
+		}
+		const snap = bob.getHeldInvoiceSnapshot(hash)!;
+		expect(snap.parts).to.have.length(MAX_HELD_PARTS_PER_HASH);
+		expect(snap.complete).to.equal(false);
+		expect(refusals).to.have.length(1);
+		// The refused part was failed back, so it holds no slot.
+		expect(receivedHtlcs()).to.equal(MAX_HELD_PARTS_PER_HASH);
 	});
 
 	/**

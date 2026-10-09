@@ -264,11 +264,14 @@ already mined; a create is refused for any hash the node already holds a
 record for (an invoice, a payment it is sending, a parked hold), because
 minting a hold invoice on it would overwrite that record; no swap is quoted
 while the sweep destination is not native segwit, the only kind the refund
-builder pays. On the node side a parked set that already covers the invoice
+builder pays; an unpaid swap is cancelled when its invoice expires, partial
+set and all, since the payer picks how long its parts would otherwise stay
+parked. On the node side a parked set that already covers the invoice
 takes no further part (a late short-expiry part would drag the whole set
-into the sweeper's margin), and the per-block sweep waits, bounded, for the
-provider's chain look so a claim seen at the block settles before the sweep
-judges its hash.
+into the sweeper's margin), one hold parks at most
+`MAX_HELD_PARTS_PER_HASH` (64) parts, and the per-block sweep waits,
+bounded, for the provider's chain look so a claim seen at the block settles
+before the sweep judges its hash.
 
 Before the funding bytes leave for the first time the hold is judged again,
 live (`heldSnapshot` complete and ACCEPTED, the admission margins at the
