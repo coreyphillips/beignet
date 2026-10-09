@@ -11,6 +11,7 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
 	IFundingProvider,
 	PaymentStatus
@@ -108,11 +109,11 @@ interface IScene {
 	channels: Buffer[];
 }
 
-function scene(seed: number, channels = 1): IScene {
+function scene(seed: number, channels = 1, storage?: SqliteStorage): IScene {
 	const chain = new FakeSwapChain();
 	const fp = fakeFundingProvider(chain);
 	const alice = createNode(TAG, seed);
-	const bob = createNode(TAG, seed + 1, undefined, {
+	const bob = createNode(TAG, seed + 1, storage, {
 		fundingProvider: fp,
 		feeEstimator: { estimateFee: async () => 2 },
 		swaps: {
@@ -256,6 +257,11 @@ describe('Reverse swap provider on LightningNode (issue #737)', function () {
 		);
 		expect(s.bob.listHoldInvoices()[0].state).to.equal('SETTLED');
 		expect(s.events.slice(-2)).to.deep.equal(['swap:claimed', 'swap:settled']);
+		// A settled hold is payment history, never forgotten (issue #1389).
+		expect(s.bob['forgetCancelledHoldInvoice'](swap.paymentHash)).to.equal(
+			false
+		);
+		expect(s.bob.listHoldInvoices()[0].state).to.equal('SETTLED');
 	});
 
 	it('funds only once both MPP parts are committed', async function () {
@@ -328,7 +334,9 @@ describe('Reverse swap provider on LightningNode (issue #737)', function () {
 
 		await tick(s, 1063);
 		expect(s.bob.listSwaps()[0].state).to.equal('REFUNDED');
-		expect(s.bob.listHoldInvoices()[0].state).to.equal('CANCELLED');
+		// Cancelled, then forgotten with the swap over (issue #1389).
+		expect(s.bob.listHoldInvoices()).to.deep.equal([]);
+		expect(s.bob.getPayment(swap.paymentHash)).to.equal(undefined);
 		expect(s.alice.getPayment(swap.paymentHash)!.status).to.equal(
 			PaymentStatus.FAILED
 		);
@@ -368,12 +376,72 @@ describe('Reverse swap provider on LightningNode (issue #737)', function () {
 		expect(s.bob.cancelSwap(ack.terms!.swapId.toString('hex')).ok).to.equal(
 			true
 		);
-		expect(s.bob.listHoldInvoices()[0].state).to.equal('CANCELLED');
+		expect(s.bob.listHoldInvoices()).to.deep.equal([]);
 		expect(() => s.alice.sendPayment(ack.terms!.bolt11)).to.not.throw();
 		await settle();
 		expect(s.alice.getPayment(swap.paymentHash)!.status).to.equal(
 			PaymentStatus.FAILED
 		);
 		expect(s.bob.listSwaps()[0].state).to.equal('CANCELLED');
+	});
+
+	it('an unpaid create that expires leaves no invoice, payment or secret behind (issue #1389)', async function () {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		try {
+			const s = scene(11, 1, storage);
+			await s.bob.startSwapProvider();
+			const swap = clientSwap();
+			const ack = await createSwap(s, swap);
+			expect(ack.accepted, ack.reasonText).to.equal(true);
+			const hashHex = swap.paymentHash.toString('hex');
+			const stored = (): Record<string, boolean> => ({
+				invoice: storage
+					.loadAllInvoices()
+					.some((r) => r.paymentHashHex === hashHex),
+				payment: storage.loadPayment(hashHex) !== null,
+				secret: storage
+					.loadAllPaymentSecrets()
+					.some((r) => r.paymentHashHex === hashHex)
+			});
+			expect(stored()).to.deep.equal({
+				invoice: true,
+				payment: true,
+				secret: true
+			});
+			// An open hold is never forgotten.
+			expect(s.bob['forgetCancelledHoldInvoice'](swap.paymentHash)).to.equal(
+				false
+			);
+
+			s.bob['swapLedger']!.patch(ack.terms!.swapId.toString('hex'), {
+				invoiceExpiresAt: 1
+			});
+			await tick(s, 1001);
+			expect(s.bob.listSwaps()[0].state).to.equal('CANCELLED');
+			expect(s.bob.listHoldInvoices()).to.deep.equal([]);
+			expect(s.bob.getPayment(swap.paymentHash)).to.equal(undefined);
+			expect(stored()).to.deep.equal({
+				invoice: false,
+				payment: false,
+				secret: false
+			});
+
+			// The swap row still owns the hash, and a late payment fails.
+			expect((await createSwap(s, swap)).accepted).to.equal(false);
+			s.alice.sendPayment(ack.terms!.bolt11);
+			await settle();
+			expect(s.alice.getPayment(swap.paymentHash)!.status).to.equal(
+				PaymentStatus.FAILED
+			);
+			s.alice.destroy();
+			s.bob.destroy();
+		} finally {
+			try {
+				storage.close();
+			} catch {
+				// bob.destroy() already closed the shared handle
+			}
+		}
 	});
 });
