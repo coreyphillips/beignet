@@ -58,6 +58,7 @@ import type {
 	IDfPeerMessaging
 } from '../direct-funding/transport/types';
 import type { IOutgoingPaymentResolution, IPaymentInfo } from '../node/types';
+import { PeerRateLimiter } from '../node/rate-limiter';
 import { buildSwapHtlc, ISwapHtlc } from './htlc';
 import { buildSwapClaimTx } from './transactions';
 import { validateSubmarineSwapAdmission } from './policy';
@@ -159,6 +160,12 @@ export interface ISubmarineSwapProviderConfig {
 	fallbackFeeRateSatPerVbyte: number;
 	claimVbytesEstimate: number;
 	maxCreatedPerPeer: number;
+	/**
+	 * Per-peer budget for quote, create and status requests: a token bucket
+	 * of rate times multiplier. A request past it is dropped unanswered.
+	 */
+	maxRequestsPerSecond: number;
+	requestBurstMultiplier: number;
 }
 
 export const SUBMARINE_SWAP_DEFAULTS: Omit<
@@ -187,7 +194,9 @@ export const SUBMARINE_SWAP_DEFAULTS: Omit<
 	maxFeeRateSatPerVbyte: 200,
 	fallbackFeeRateSatPerVbyte: 10,
 	claimVbytesEstimate: 150,
-	maxCreatedPerPeer: 4
+	maxCreatedPerPeer: 4,
+	maxRequestsPerSecond: 5,
+	requestBurstMultiplier: 4
 };
 
 export const SUBMARINE_SWAP_DEFAULT_EXPOSURE: ISwapExposurePolicy =
@@ -306,6 +315,12 @@ const IN_FLIGHT_STATES: readonly SwapState[] = [
 	'CLAIM_BROADCAST',
 	'EXPOSED'
 ];
+/** The requests this engine answers, each paid from the peer's budget. */
+const REQUEST_SUBTYPES: ReadonlySet<number> = new Set([
+	BeignetCustomSubtype.SWAP_QUOTE_REQUEST,
+	BeignetCustomSubtype.SWAP_SUBMARINE_CREATE,
+	BeignetCustomSubtype.SWAP_STATUS_REQUEST
+]);
 /** The node pads the invoice's final CLTV by this much when it pays. */
 const FINAL_CLTV_PADDING = 3;
 
@@ -331,6 +346,7 @@ interface IInvoiceFacts {
 export class SubmarineSwapProvider extends EventEmitter {
 	readonly config: ISubmarineSwapProviderConfig;
 	private readonly unsubscribe: Array<() => void> = [];
+	private readonly requestBudget: PeerRateLimiter;
 	private queue: Promise<void> = Promise.resolve();
 	private stopped = false;
 	/** Rows being re-read after an event left them unresolved (see rechecks). */
@@ -384,6 +400,10 @@ export class SubmarineSwapProvider extends EventEmitter {
 		) {
 			throw new Error('paymentMaxFeePpm must be a non-negative integer');
 		}
+		this.requestBudget = new PeerRateLimiter({
+			maxHtlcsPerSecond: this.config.maxRequestsPerSecond,
+			burstMultiplier: this.config.requestBurstMultiplier
+		});
 		this.unsubscribe.push(
 			deps.peers.onCustomMessage((msg) => this.onMessage(msg)),
 			deps.onPaymentEvent((hash) => {
@@ -414,6 +434,12 @@ export class SubmarineSwapProvider extends EventEmitter {
 		this.unsubscribe.length = 0;
 		for (const r of this.rechecks.values()) clearTimeout(r.timer);
 		this.rechecks.clear();
+		this.requestBudget.clear();
+	}
+
+	/** Forget a disconnected peer's request budget. */
+	forgetPeer(peerHex: string): void {
+		this.requestBudget.removePeer(peerHex);
 	}
 
 	/** Per-block work; ticks are serialized and never overlap. */
@@ -498,6 +524,10 @@ export class SubmarineSwapProvider extends EventEmitter {
 	// ─────────────── wire ───────────────
 
 	private onMessage(msg: IDfCustomMessage): void {
+		if (!REQUEST_SUBTYPES.has(msg.subtype)) return;
+		// Spent before decoding. Not logged: the node persists every log
+		// line, so logging a flood would make it cost a write per message.
+		if (!this.requestBudget.tryConsume(msg.peerPubkey)) return;
 		let work: Promise<void> | undefined;
 		try {
 			switch (msg.subtype) {
@@ -698,7 +728,7 @@ export class SubmarineSwapProvider extends EventEmitter {
 			direction: 'submarine',
 			amountSat: req.amountSat,
 			feeRateSatPerVbyte: fee.feeRate,
-			live: this.deps.ledger.unresolved()
+			live: this.deps.ledger.atRisk(this.config.resolutionConfirmations)
 		});
 		if (!verdict.ok)
 			return refuse(exposureRefusal(verdict.reason), verdict.detail);
@@ -909,10 +939,10 @@ export class SubmarineSwapProvider extends EventEmitter {
 		if (destinationProblem) {
 			return refuse(SwapRefusalReason.INTERNAL, destinationProblem);
 		}
-		const createdByPeer = this.rows().filter(
-			(r) => r.peerNodeIdHex === peer && r.state === 'CREATED'
-		).length;
-		if (createdByPeer >= this.config.maxCreatedPerPeer) {
+		if (
+			this.deps.ledger.createdCount(peer, 'submarine') >=
+			this.config.maxCreatedPerPeer
+		) {
 			return refuse(SwapRefusalReason.RATE_LIMITED, 'too many unfunded swaps');
 		}
 		const refundHeight = height + this.refundDelta(req.preferredRefundDelta);
@@ -943,7 +973,7 @@ export class SubmarineSwapProvider extends EventEmitter {
 			direction: 'submarine',
 			amountSat: req.onchainAmountSat,
 			feeRateSatPerVbyte: fee.feeRate,
-			live: this.deps.ledger.unresolved()
+			live: this.deps.ledger.atRisk(this.config.resolutionConfirmations)
 		});
 		if (!verdict.ok)
 			return refuse(exposureRefusal(verdict.reason), verdict.detail);

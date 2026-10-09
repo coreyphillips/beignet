@@ -7353,6 +7353,8 @@ export class LightningNode extends EventEmitter {
 			this.channelManager.handlePeerDisconnected(pubkey);
 			this.dropGossipSync(pubkey);
 			this.rateLimiter.removePeer(pubkey);
+			this.swapProvider?.forgetPeer(pubkey);
+			this.submarineSwapProvider?.forgetPeer(pubkey);
 			this.notifyPeerDisconnectObservers(pubkey);
 		});
 		this.peerManager.on('peer:error', (pubkey: string, err: Error) => {

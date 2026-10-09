@@ -355,6 +355,36 @@ export function isSwapExposure(
 	);
 }
 
+/**
+ * The depth of an EXPOSED row's resolution verified in this process, when
+ * isSwapExposure counts the row only under a deeper policy. Every other
+ * row counts at every depth or at none.
+ */
+function resolvedDepth(record: ISwapRecord): number | undefined {
+	const resolution = record.resolution;
+	if (record.state !== 'EXPOSED' || !resolution?.verifiedThisSession) {
+		return undefined;
+	}
+	return resolution.confirmations >= 1 ? resolution.confirmations : undefined;
+}
+
+function addToIndex<K>(index: Map<K, Set<string>>, key: K, id: string): void {
+	const ids = index.get(key);
+	if (ids) ids.add(id);
+	else index.set(key, new Set([id]));
+}
+
+function dropFromIndex<K>(
+	index: Map<K, Set<string>>,
+	key: K,
+	id: string
+): void {
+	const ids = index.get(key);
+	if (!ids) return;
+	ids.delete(id);
+	if (ids.size === 0) index.delete(key);
+}
+
 const HEX64 = /^[0-9a-f]{64}$/;
 
 function isDecimal(value: unknown): boolean {
@@ -438,13 +468,27 @@ export interface ISwapExposureSummary {
 
 export class SwapLedger {
 	private readonly ledger: DurableLedger<ISwapRecord>;
+	// Ids only, kept in step with every applied write, so the lookups a
+	// peer's quote or create triggers never copy the whole ledger.
+	private readonly idsByHash = new Map<string, Set<string>>();
+	private readonly createdIdsByPeer = new Map<string, Set<string>>();
+	private readonly atRiskIds = new Set<string>();
+	// Resolved EXPOSED rows stay EXPOSED for good. Keyed by depth, a policy
+	// reads only the ones still shallower than it.
+	private readonly resolvedIdsByDepth = new Map<number, Set<string>>();
 
 	constructor(store: IDurableLedgerStore<ISwapRecord>) {
 		this.ledger = new DurableLedger(store);
 	}
 
 	rehydrate(): number {
-		return this.ledger.rehydrate();
+		const count = this.ledger.rehydrate();
+		this.idsByHash.clear();
+		this.createdIdsByPeer.clear();
+		this.atRiskIds.clear();
+		this.resolvedIdsByDepth.clear();
+		for (const record of this.ledger.list()) this.track(undefined, record);
+		return count;
 	}
 
 	isRehydrated(): boolean {
@@ -464,7 +508,32 @@ export class SwapLedger {
 	}
 
 	byPaymentHash(paymentHashHex: string): ISwapRecord[] {
-		return this.ledger.find((r) => r.paymentHashHex === paymentHashHex);
+		return this.copies(this.idsByHash.get(paymentHashHex));
+	}
+
+	/**
+	 * Every row isSwapExposure counts at this depth: what admission judges
+	 * against. A row joins only after passing admission, so the set follows
+	 * the exposure caps, not the length of the ledger's history.
+	 */
+	atRisk(resolutionConfirmations = 1): ISwapRecord[] {
+		const out = this.copies(this.atRiskIds);
+		for (let depth = 1; depth < resolutionConfirmations; depth++) {
+			out.push(...this.copies(this.resolvedIdsByDepth.get(depth)));
+		}
+		return out;
+	}
+
+	/** CREATED rows the peer opened, of one direction or of both. */
+	createdCount(peerNodeIdHex: string, direction?: SwapDirection): number {
+		const ids = this.createdIdsByPeer.get(peerNodeIdHex);
+		if (!ids) return 0;
+		if (!direction) return ids.size;
+		let count = 0;
+		for (const id of ids) {
+			if (this.ledger.get(id)?.direction === direction) count++;
+		}
+		return count;
 	}
 
 	byFundingOutpoint(txid: string, vout: number): ISwapRecord | undefined {
@@ -497,13 +566,15 @@ export class SwapLedger {
 	 */
 	insert(input: ISwapRecordInput): SwapTransition {
 		const now = Date.now();
-		return this.ledger.insert({
+		const result = this.ledger.insert({
 			...input,
 			state: 'CREATED',
 			fundingAttempts: input.fundingAttempts ?? 0,
 			refundBumps: input.refundBumps ?? 0,
 			updatedAt: now
 		});
+		if (result.outcome === 'applied') this.track(undefined, result.record);
+		return result;
 	}
 
 	/**
@@ -523,10 +594,13 @@ export class SwapLedger {
 		if (from.length === 0) {
 			return { outcome: 'stale', record: current, actualState: current.state };
 		}
-		return this.ledger.transition(swapIdHex, from, to, {
-			...this.withoutPreimageRemoval(current, patch),
-			updatedAt: Date.now()
-		});
+		return this.tracked(
+			current,
+			this.ledger.transition(swapIdHex, from, to, {
+				...this.withoutPreimageRemoval(current, patch),
+				updatedAt: Date.now()
+			})
+		);
 	}
 
 	/**
@@ -537,10 +611,13 @@ export class SwapLedger {
 		if (!this.ledger.isRehydrated()) return { outcome: 'not_rehydrated' };
 		const current = this.ledger.get(swapIdHex);
 		if (!current) return { outcome: 'missing' };
-		return this.ledger.transition(swapIdHex, [current.state], current.state, {
-			...this.withoutPreimageRemoval(current, patch),
-			updatedAt: Date.now()
-		});
+		return this.tracked(
+			current,
+			this.ledger.transition(swapIdHex, [current.state], current.state, {
+				...this.withoutPreimageRemoval(current, patch),
+				updatedAt: Date.now()
+			})
+		);
 	}
 
 	/**
@@ -560,18 +637,63 @@ export class SwapLedger {
 			return { outcome: 'stale', record: current, actualState: current.state };
 		}
 		if (current.preimageHex) return { outcome: 'applied', record: current };
-		return this.ledger.transition(swapIdHex, [current.state], current.state, {
-			preimageHex,
-			preimageSource: source,
-			updatedAt: Date.now()
-		});
+		return this.tracked(
+			current,
+			this.ledger.transition(swapIdHex, [current.state], current.state, {
+				preimageHex,
+				preimageSource: source,
+				updatedAt: Date.now()
+			})
+		);
 	}
 
 	/** Drop a terminal record. Refuses anything still unresolved. */
 	forget(swapIdHex: string): boolean {
 		const current = this.ledger.get(swapIdHex);
 		if (!current || !isTerminalSwapState(current.state)) return false;
-		return this.ledger.remove(swapIdHex);
+		if (!this.ledger.remove(swapIdHex)) return false;
+		this.track(current, undefined);
+		return true;
+	}
+
+	private tracked(before: ISwapRecord, result: SwapTransition): SwapTransition {
+		if (result.outcome === 'applied') this.track(before, result.record);
+		return result;
+	}
+
+	/** Move one row's ids from what it was to what it is now. */
+	private track(before?: ISwapRecord, after?: ISwapRecord): void {
+		const id = (after ?? before)!.id;
+		// Left alone when unchanged, so byPaymentHash keeps insertion order.
+		if (before?.paymentHashHex !== after?.paymentHashHex) {
+			if (before) dropFromIndex(this.idsByHash, before.paymentHashHex, id);
+			if (after) addToIndex(this.idsByHash, after.paymentHashHex, id);
+		}
+		if (before?.state === 'CREATED') {
+			dropFromIndex(this.createdIdsByPeer, before.peerNodeIdHex, id);
+		}
+		if (after?.state === 'CREATED') {
+			addToIndex(this.createdIdsByPeer, after.peerNodeIdHex, id);
+		}
+		const beforeDepth = before && resolvedDepth(before);
+		const afterDepth = after && resolvedDepth(after);
+		if (beforeDepth !== afterDepth) {
+			if (beforeDepth) dropFromIndex(this.resolvedIdsByDepth, beforeDepth, id);
+			if (afterDepth) addToIndex(this.resolvedIdsByDepth, afterDepth, id);
+		}
+		// At depth 1 a row with a resolved depth no longer counts, so these
+		// are the rows every depth counts.
+		if (after && isSwapExposure(after)) this.atRiskIds.add(id);
+		else this.atRiskIds.delete(id);
+	}
+
+	private copies(ids: ReadonlySet<string> | undefined): ISwapRecord[] {
+		const out: ISwapRecord[] = [];
+		for (const id of ids ?? []) {
+			const record = this.ledger.get(id);
+			if (record) out.push(record);
+		}
+		return out;
 	}
 
 	private withoutPreimageRemoval(

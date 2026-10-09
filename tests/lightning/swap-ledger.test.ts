@@ -380,6 +380,82 @@ describe('Swap ledger (issue #737 phase 2)', function () {
 			});
 		});
 
+		it('keeps its at-risk, hash and unpaid-create indexes in step with every write (issue #1388)', function () {
+			const store = new MemoryLedgerStore<ISwapRecord>();
+			const ledger = ledgerOn(store);
+			const peer = '02' + '55'.repeat(32);
+			const created = ledger.insert(input({ peerNodeIdHex: peer })).record!;
+			ledger.insert(input({ peerNodeIdHex: peer, direction: 'submarine' }));
+			const held = ledger.insert(input()).record!;
+			ledger.move(held.id, 'HELD');
+			const exposed = ledger.insert(input({ onchainSat: '7000' })).record!;
+			for (const to of ['HELD', 'FUNDING', 'EXPOSED'] as const)
+				ledger.move(exposed.id, to);
+			// Resolved at depth 1 only: a deeper policy still counts it.
+			ledger.patch(exposed.id, {
+				resolution: {
+					kind: 'refund',
+					txid: 'aa'.repeat(32),
+					confirmations: 1,
+					verifiedThisSession: true
+				}
+			});
+			const done = ledger.insert(input()).record!;
+			ledger.move(done.id, 'HELD');
+			ledger.move(done.id, 'CANCELLED');
+
+			const ids = (rows: ISwapRecord[]): string[] =>
+				rows.map((r) => r.id).sort();
+			const expectInStep = (l: SwapLedger): void => {
+				expect(ids(l.atRisk(1))).to.deep.equal(ids([held]));
+				expect(ids(l.atRisk(3))).to.deep.equal(ids([held, exposed]));
+				// Admission reads the same exposure from either set.
+				for (const [depth, count] of [
+					[1, 1],
+					[3, 2]
+				]) {
+					const full = SwapLedger.exposure(l.unresolved(), depth);
+					const fast = SwapLedger.exposure(l.atRisk(depth), depth);
+					expect(fast.exposedCount).to.equal(count);
+					expect(fast.exposedCount).to.equal(full.exposedCount);
+					expect(fast.exposedSat).to.equal(full.exposedSat);
+				}
+				expect(l.createdCount(peer)).to.equal(2);
+				expect(l.createdCount(peer, 'reverse')).to.equal(1);
+				expect(l.createdCount(peer, 'submarine')).to.equal(1);
+				expect(
+					l.byPaymentHash(done.paymentHashHex).map((r) => r.id)
+				).to.deep.equal([done.id]);
+			};
+			expectInStep(ledger);
+			expectInStep(ledgerOn(store));
+
+			ledger.move(created.id, 'HELD');
+			expect(ledger.createdCount(peer, 'reverse')).to.equal(0);
+			expect(ids(ledger.atRisk(3))).to.deep.equal(
+				ids([held, exposed, created])
+			);
+			// A resolution at policy depth leaves the row EXPOSED but out of
+			// the set; demoted by a reorg, it is back.
+			const resolution = ledger.get(exposed.id)!.resolution!;
+			ledger.patch(exposed.id, {
+				resolution: { ...resolution, confirmations: 3 }
+			});
+			expect(ledger.get(exposed.id)!.state).to.equal('EXPOSED');
+			expect(ids(ledger.atRisk(3))).to.deep.equal(ids([held, created]));
+			expect(ids(ledgerOn(store).atRisk(3))).to.deep.equal(
+				ids([held, created])
+			);
+			ledger.patch(exposed.id, {
+				resolution: { ...resolution, confirmations: 0 }
+			});
+			expect(ids(ledger.atRisk(1))).to.deep.equal(
+				ids([held, exposed, created])
+			);
+			ledger.forget(done.id);
+			expect(ledger.byPaymentHash(done.paymentHashHex)).to.deep.equal([]);
+		});
+
 		it('forgets only terminal rows', function () {
 			const ledger = ledgerOn();
 			const id = ledger.insert(input()).record!.id;
