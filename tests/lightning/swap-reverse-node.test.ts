@@ -426,6 +426,10 @@ describe('Reverse swap provider on LightningNode (issue #737)', function () {
 				payment: false,
 				secret: false
 			});
+			// Already gone reads as done, so the swap row can be pruned.
+			expect(s.bob['forgetCancelledHoldInvoice'](swap.paymentHash)).to.equal(
+				true
+			);
 
 			// The swap row still owns the hash, and a late payment fails.
 			expect((await createSwap(s, swap)).accepted).to.equal(false);

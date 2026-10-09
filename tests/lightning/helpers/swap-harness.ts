@@ -149,6 +149,7 @@ export class FakeHolds {
 	failCreate = false;
 	settleReturns: boolean | undefined;
 	settleThrows = false;
+	forgetFails = false;
 	/** Hashes the node already holds a record for (invoice, payment, hold). */
 	readonly inUse = new Set<string>();
 
@@ -270,11 +271,18 @@ export class FakeHolds {
 	}
 
 	/** Mirrors the node: only a cancelled hold with nothing parked is dropped. */
-	forgetHold(paymentHash: Buffer): void {
+	forgetHold(paymentHash: Buffer): boolean {
 		const hashHex = paymentHash.toString('hex');
-		if (!this.cancelledHashes.has(hashHex) || this.parts.get(hashHex)?.length)
-			return;
-		if (this.invoices.delete(hashHex)) this.forgotten.push(hashHex);
+		if (!this.invoices.has(hashHex)) return true;
+		if (
+			this.forgetFails ||
+			!this.cancelledHashes.has(hashHex) ||
+			this.parts.get(hashHex)?.length
+		)
+			return false;
+		this.invoices.delete(hashHex);
+		this.forgotten.push(hashHex);
+		return true;
 	}
 
 	/** The node's own sweeper (or an operator) cancels: fires 'hold:cancelled'. */

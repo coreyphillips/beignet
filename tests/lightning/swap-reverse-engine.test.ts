@@ -1748,8 +1748,8 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			h.ledger.patch(r.id, { invoiceExpiresAt: 1 });
 			await h.engine.onBlock(1001);
 			expect(record(h, swap).state).to.equal('CANCELLED');
-			// The node refused the hold forget at the cancel: the row's
-			// deletion is its last try.
+			// The node refused the hold forget at the cancel: the prune
+			// retries it.
 			h.holds.invoices.set(hashHex, invoice);
 
 			// A refunded row whose hold cancel never landed: start() owes it.
@@ -1776,6 +1776,27 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(h.holds.forgotten).to.deep.equal([hashHex, hashHex]);
 			expect(h.holds.invoices.has(hashHex)).to.equal(false);
 			expect(h.ledger.get(owed.id)!.state).to.equal('REFUNDED');
+		});
+
+		it('keeps a terminal row until its hold forget succeeds', async function () {
+			const h = await harness({ config: { terminalRetentionBlocks: 10 } });
+			const swap = clientSwap();
+			await create(h, swap);
+			const r = record(h, swap);
+			const hashHex = swap.paymentHash.toString('hex');
+			h.holds.forgetFails = true;
+			h.ledger.patch(r.id, { invoiceExpiresAt: 1 });
+			await h.engine.onBlock(1001);
+			expect(record(h, swap).state).to.equal('CANCELLED');
+
+			await h.engine.onBlock(r.refundHeight + 10);
+			expect(h.ledger.get(r.id)!.state).to.equal('CANCELLED');
+			expect(h.holds.invoices.has(hashHex)).to.equal(true);
+
+			h.holds.forgetFails = false;
+			await h.engine.onBlock(r.refundHeight + 11);
+			expect(h.ledger.get(r.id)).to.equal(undefined);
+			expect(h.holds.forgotten).to.deep.equal([hashHex]);
 		});
 	});
 

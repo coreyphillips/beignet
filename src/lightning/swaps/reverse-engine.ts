@@ -208,9 +208,11 @@ export interface IReverseSwapProviderDeps {
 	/**
 	 * Delete the node's records of a cancelled hold: its invoice, payment and
 	 * secret. Called once the swap is terminal; a no-op for a hold that is
-	 * still open, settled, or holding parts.
+	 * still open, settled, or holding parts. True once no invoice is left
+	 * under the hash; until then the swap's row is kept so the forget is
+	 * retried.
 	 */
-	forgetHold?(paymentHash: Buffer): void;
+	forgetHold?(paymentHash: Buffer): boolean;
 	onHeld(cb: (event: { paymentHash: Buffer }) => void): () => void;
 	onHoldCancelled(
 		cb: (event: { paymentHash: Buffer; reason: string }) => void
@@ -417,9 +419,9 @@ export class ReverseSwapProvider extends EventEmitter {
 		)) {
 			// start() still owes this row its hold cancel.
 			if (record.state === 'REFUNDED' && !record.holdCancelledAt) continue;
-			// The row is how start() retries a refused hold forget, so this is
-			// the last try.
-			if (record.holdCancelledAt) this.forgetHold(record);
+			// The row is the only record that a refused or failed hold forget
+			// is still owed.
+			if (record.holdCancelledAt && !this.forgetHold(record)) continue;
 			ended.push(record.id);
 		}
 		// One transaction: the first block after an upgrade finds every
@@ -1125,15 +1127,16 @@ export class ReverseSwapProvider extends EventEmitter {
 	 * behind every swap that ends unpaid grows memory and storage for good.
 	 * The swap's own row stays the record of what happened.
 	 */
-	private forgetHold(record: ISwapRecord): void {
-		if (!this.deps.forgetHold) return;
+	private forgetHold(record: ISwapRecord): boolean {
+		if (!this.deps.forgetHold) return true;
 		try {
-			this.deps.forgetHold(Buffer.from(record.paymentHashHex, 'hex'));
+			return this.deps.forgetHold(Buffer.from(record.paymentHashHex, 'hex'));
 		} catch (err) {
 			this.deps.log('swap_forget_hold_failed', {
 				swapId: record.id,
 				error: err instanceof Error ? err.message : String(err)
 			});
+			return false;
 		}
 	}
 
