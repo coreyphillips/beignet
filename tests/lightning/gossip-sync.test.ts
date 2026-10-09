@@ -2839,6 +2839,27 @@ describe('Gossip Sync (Phase 5)', function () {
 				nextWindow();
 				expect(scans.callCount).to.equal(2);
 			});
+
+			it('disconnects a peer whose waiting query is malformed', function () {
+				const disconnects: string[] = [];
+				node.on('peer:disconnect-requested', (pubkey: string) =>
+					disconnects.push(pubkey)
+				);
+				query(peerA, 2);
+				node.handlePeerMessage(
+					peerA,
+					MessageType.QUERY_SHORT_CHANNEL_IDS,
+					encodeQueryShortChannelIdsMessage({
+						chainHash: REGTEST_CHAIN_HASH,
+						encodedShortIds: Buffer.from([2])
+					})
+				);
+				query(peerA);
+
+				nextWindow();
+				expect(disconnects).to.eql([peerA]);
+				expect(scans.callCount).to.equal(2);
+			});
 		});
 
 		it('ignores reply_channel_range from a peer we never queried (issue #1023)', function () {

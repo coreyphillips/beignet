@@ -16596,11 +16596,15 @@ export class LightningNode extends EventEmitter {
 			try {
 				this.serveGossipQuery(pubkey, query);
 			} catch (err) {
+				// A query answered inline disconnects its peer when it throws.
+				// Doing the same here keeps a malformed query from costing a
+				// logged failure per turn without any budget charged.
 				this.emitStructuredLog('peer', 'gossip_query_failed', {
 					pubkey,
 					type: query.type,
 					error: err instanceof Error ? err.message : String(err)
 				});
+				this.requestPeerDisconnect(pubkey);
 			}
 		}
 		if (this.gossipQueries.size > 0) {
