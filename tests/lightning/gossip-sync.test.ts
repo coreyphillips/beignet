@@ -1207,6 +1207,19 @@ describe('Gossip Sync (Phase 5)', function () {
 				expect(mgr.repairPending).to.equal(true);
 			});
 
+			it('records a loss from a timed-out batch reply arriving after the repair was released (issue #1461)', function () {
+				const mgr = new GossipSyncManager(new NetworkGraph());
+
+				startSync(mgr, 1);
+				clock.tick(TIMEOUT * 3);
+				expect(mgr.releaseRepair()).to.equal(true);
+
+				// The batch reply arrives late and the intake drops part of it.
+				mgr.noteIntakeLoss();
+				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+				expect(mgr.repairPending).to.equal(true);
+			});
+
 			it('asks for the range again when its final reply never arrives', function () {
 				const mgr = new GossipSyncManager(new NetworkGraph());
 				const timeouts = timeoutsOf(mgr);

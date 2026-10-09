@@ -341,15 +341,19 @@ export class GossipSyncManager extends EventEmitter {
 	 * During a batch that message may be part of the reply, so the batch is
 	 * asked for again when its end marker arrives. Before the range reply
 	 * completes it is gossip no batch would ask for, so the sync asks for
-	 * every channel instead. Either way the loss stays recorded until a sync
-	 * ends SYNCED, so the node can carry it past a disconnect. New gossip
-	 * outside the batch comes again with the store the sync asks for at its
-	 * end.
+	 * every channel instead. While a marker is owed, a timed-out batch's reply
+	 * can still arrive after the sync ended, so a loss then is recorded too.
+	 * Either way the loss stays recorded until a sync ends SYNCED, so the node
+	 * can carry it past a disconnect. New gossip outside the batch comes again
+	 * with the store the sync asks for at its end.
 	 */
 	noteIntakeLoss(): void {
 		if (this._state === GossipSyncState.AWAITING_SCID_REPLY) {
 			this._batchLost = true;
-		} else if (this._state !== GossipSyncState.AWAITING_RANGE_REPLY) {
+		} else if (
+			this._state !== GossipSyncState.AWAITING_RANGE_REPLY &&
+			!this._markerOwed
+		) {
 			return;
 		}
 		this._repairPending = true;
