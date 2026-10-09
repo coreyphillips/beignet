@@ -826,6 +826,12 @@ export class ChannelManager extends EventEmitter {
 	 * for the reconnect, whose reestablish replays the queue first.
 	 */
 	private readonly sendsWithheldOnConnection = new Set<string>();
+	/**
+	 * Channels whose latest persist failed, so memory holds state the disk
+	 * does not (issue #1425). Unlike the set above it survives a disconnect:
+	 * only a persist that lands clears it.
+	 */
+	private readonly persistFailed = new Set<string>();
 
 	constructor(config: IChannelManagerConfig) {
 		super();
@@ -1765,6 +1771,10 @@ export class ChannelManager extends EventEmitter {
 	 * Fail a received HTLC on a channel. Direction defaults to RECEIVED; an
 	 * offered id must be passed explicitly so channel.failHtlc can reject it
 	 * rather than cancel an unrelated same-id received HTLC.
+	 *
+	 * sendsWithheld means the fail is not on disk: this persist failed, or
+	 * memory already had the fail from one that did and nothing has landed
+	 * since. A restart before the next landed persist forgets it.
 	 */
 	failHtlc(
 		channelId: Buffer,
@@ -1807,7 +1817,9 @@ export class ChannelManager extends EventEmitter {
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
-		return this.resultFromActions(actions);
+		const result = this.resultFromActions(actions);
+		if (this.persistFailed.has(idHex)) result.sendsWithheld = true;
+		return result;
 	}
 
 	/**
@@ -9946,8 +9958,12 @@ export class ChannelManager extends EventEmitter {
 						if (typeof channel.fforNoteStateWritten === 'function') {
 							channel.fforNoteStateWritten(false);
 						}
+						this.persistFailed.add(channel.getChannelId()!.toString('hex'));
 						setSendsBlocked(true);
 						break;
+					}
+					if (persistRequest) {
+						this.persistFailed.delete(channel.getChannelId()!.toString('hex'));
 					}
 					// The channel learns that its state is on disk: what it
 					// still owed to storage (an observed capability hold of a

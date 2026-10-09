@@ -24161,7 +24161,11 @@ export class LightningNode extends EventEmitter {
 		this.persistOwedPartFailures();
 	}
 
-	/** A rejected MPP part's fail: true once the channel takes it. */
+	/**
+	 * A rejected MPP part's fail: true once the channel takes it and the fail
+	 * is on disk. The debt is durable, so retiring it on a fail the disk
+	 * lacks would leave a restart with the part committed and nothing owed.
+	 */
 	private rejectedPartFail(
 		channelId: Buffer,
 		htlcId: bigint,
@@ -24173,7 +24177,8 @@ export class LightningNode extends EventEmitter {
 			const reason = sharedSecret
 				? createFailureMessage(sharedSecret, failureCode)
 				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
-			if (!this.channelManager.failHtlc(channelId, htlcId, reason).ok) {
+			const result = this.channelManager.failHtlc(channelId, htlcId, reason);
+			if (!result.ok || result.sendsWithheld) {
 				return false;
 			}
 			this.cleanupHtlcSharedSecret(secretKey);
@@ -24904,11 +24909,14 @@ export class LightningNode extends EventEmitter {
 				continue;
 			}
 			const htlc = channel?.getFullState().htlcs.get(`received-${htlcId}`);
-			const stillCommitted =
+			// FAILED is still asked: memory has the fail, but its persist may
+			// have failed, and the fail closure is what says it reached disk.
+			const stillOwed =
 				htlc !== undefined &&
 				(htlc.state === HtlcState.COMMITTED ||
-					htlc.state === HtlcState.PENDING);
-			if (!stillCommitted || owed.fail()) {
+					htlc.state === HtlcState.PENDING ||
+					htlc.state === HtlcState.FAILED);
+			if (!stillOwed || owed.fail()) {
 				this.owedHeldForwardFailures.delete(key);
 				retiredPersisted ||= owed.failureCode !== undefined;
 			}

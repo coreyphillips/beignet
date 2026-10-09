@@ -1945,4 +1945,249 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		carol.destroy();
 		alice.destroy();
 	});
+
+	/**
+	 * Bob rejects Alice's MPP part (a total mismatch) while that channel is
+	 * reconnecting, so the fail is owed and on disk. The reconnect retries it,
+	 * and the channel write of that fail is refused. Secret and metadata
+	 * writes still land. Returns with Bob holding the fail in memory only.
+	 */
+	async function refuseRejectedPartFailWrite(dbPrefix: string): Promise<{
+		alice: LightningNode;
+		bob: LightningNode;
+		carol: LightningNode;
+		storage: SqliteStorage;
+		dbPath: string;
+		gate: IWireGate;
+		aliceChannelId: Buffer;
+		aliceKey: string;
+		paymentHash: Buffer;
+		allowChannelWrites: () => void;
+	}> {
+		const CAROL_SEED = 43;
+		const dbPath = tempDb(dbPrefix);
+		const storage = new SqliteStorage(dbPath);
+		storage.open();
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED, storage);
+		const carol = createNode(CAROL_SEED);
+		const gate: IWireGate = { hold: false, queue: [] };
+		wire(alice, bob, { val: false }, gate);
+		wire(carol, bob, { val: false });
+		for (const node of [alice, bob, carol]) node.handleNewBlock(1000);
+		const aliceChannelId = openReadyChannel(alice, bob);
+		openReadyChannel(carol, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+		buildDirectGraph(carol, CAROL_SEED, BOB_SEED);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 100_000n,
+			description: 'mpp total mismatch, fail write refused'
+		});
+		const payPart = (
+			payer: LightningNode,
+			amountMsat: bigint,
+			totalMsat: bigint
+		): void => {
+			const finalCltv = (
+				payer as unknown as { paddedFinalCltvExpiry: () => number }
+			).paddedFinalCltvExpiry();
+			payer.sendPaymentToRoute(
+				{
+					hops: [
+						{
+							pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+							shortChannelId: encodeShortChannelId({
+								block: 500,
+								txIndex: 1,
+								outputIndex: 0
+							}),
+							amountToForwardMsat: amountMsat,
+							outgoingCltvValue: finalCltv
+						}
+					]
+				},
+				invoice.paymentHash,
+				finalCltv,
+				invoice.paymentSecret,
+				totalMsat
+			);
+		};
+
+		payPart(alice, 60_000n, 100_000n);
+		await settle();
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
+		await settle();
+		payPart(carol, 40_000n, 120_000n);
+		await settle();
+		expect(carol.getPayment(invoice.paymentHash)!.failureCode).to.equal(
+			FINAL_INCORRECT_HTLC_AMOUNT
+		);
+		const aliceKey = `${aliceChannelId.toString('hex')}:0`;
+		expect(
+			JSON.parse(storage.loadMetadata('owed_part_failures')!)
+		).to.deep.equal([
+			{ key: aliceKey, failureCode: FINAL_INCORRECT_HTLC_AMOUNT }
+		]);
+
+		const saveChannel = storage.saveChannel.bind(storage);
+		let refusing = true;
+		let refused = 0;
+		storage.saveChannel = (
+			...args: Parameters<SqliteStorage['saveChannel']>
+		): void => {
+			if (
+				refusing &&
+				args[1].htlcs.get('received-0')?.state === HtlcState.FAILED
+			) {
+				refused++;
+				throw new Error('SQLITE_BUSY');
+			}
+			saveChannel(...args);
+		};
+		gate.hold = true;
+		alice.getChannelManager().handlePeerReconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerReconnected(alice.getNodeId());
+		while (gate.queue.length > 0) {
+			const m = gate.queue.shift()!;
+			m.to.handlePeerMessage(m.from, m.type, m.p);
+		}
+		gate.hold = false;
+		await settle();
+		expect(refused, 'the fail transition was refused').to.be.greaterThan(0);
+		expect(
+			bob
+				.getChannelManager()
+				.getChannel(aliceChannelId)!
+				.getFullState()
+				.htlcs.get('received-0')!.state,
+			'memory is ahead of disk'
+		).to.equal(HtlcState.FAILED);
+		return {
+			alice,
+			bob,
+			carol,
+			storage,
+			dbPath,
+			gate,
+			aliceChannelId,
+			aliceKey,
+			paymentHash: invoice.paymentHash,
+			allowChannelWrites: (): void => {
+				refusing = false;
+			}
+		};
+	}
+
+	it('a rejected MPP part whose fail write was refused keeps its debt across a restart (#1425)', async function () {
+		this.timeout(20_000);
+		const {
+			alice,
+			bob,
+			carol,
+			storage,
+			dbPath,
+			gate,
+			aliceChannelId,
+			aliceKey,
+			paymentHash
+		} = await refuseRejectedPartFailWrite('refused-fail-restart');
+		// A reconnect and a block both retry the debt while the write is
+		// still refused, with memory already saying FAILED.
+		await cycleConnection(alice, bob, gate);
+		bob.handleNewBlock(1000);
+		expect(
+			JSON.parse(storage.loadMetadata('owed_part_failures')!),
+			'the debt outlives the refused write'
+		).to.deep.equal([
+			{ key: aliceKey, failureCode: FINAL_INCORRECT_HTLC_AMOUNT }
+		]);
+		expect(
+			storage.loadAllHtlcSharedSecrets().map((s) => s.key),
+			'the secret outlives the refused write'
+		).to.deep.equal([aliceKey]);
+		bob.destroy();
+
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		alice.removeAllListeners('message:outbound');
+		carol.removeAllListeners('message:outbound');
+		const restarted = createNode(BOB_SEED, storage2);
+		await reconnect(restarted, alice);
+
+		const pendingMpp = (
+			restarted as unknown as { pendingMppPayments: Map<string, unknown> }
+		).pendingMppPayments;
+		expect(pendingMpp.size, 'the rejected part was not reaccumulated').to.equal(
+			0
+		);
+		const alicePayment = alice.getPayment(paymentHash)!;
+		expect(alicePayment.status).to.equal(PaymentStatus.FAILED);
+		expect(alicePayment.failureCode, 'the payer read the mismatch').to.equal(
+			FINAL_INCORRECT_HTLC_AMOUNT
+		);
+		const aliceChannel = restarted
+			.getChannelManager()
+			.getChannel(aliceChannelId)!;
+		expect(aliceChannel.getFullState().htlcs.size, 'no HTLC left').to.equal(0);
+		expect(sharedSecrets(restarted).size, 'no shared secret left').to.equal(0);
+		expect(storage2.loadAllHtlcSharedSecrets()).to.deep.equal([]);
+		expect(
+			storage2.loadMetadata('owed_part_failures'),
+			'the owed fail is retired on disk'
+		).to.equal('[]');
+
+		// Past the height the claim backstop would have force-closed at.
+		for (let height = 1001; height <= 1050; height++) {
+			alice.handleNewBlock(height);
+			restarted.handleNewBlock(height);
+		}
+		expect(aliceChannel.getState()).to.equal(ChannelState.NORMAL);
+
+		restarted.destroy();
+		carol.destroy();
+		alice.destroy();
+	});
+
+	it('a rejected MPP part whose fail write was refused retires its debt once a reconnect writes it (#1425)', async function () {
+		this.timeout(20_000);
+		const {
+			alice,
+			bob,
+			carol,
+			storage,
+			gate,
+			aliceChannelId,
+			paymentHash,
+			allowChannelWrites
+		} = await refuseRejectedPartFailWrite('refused-fail-live');
+		allowChannelWrites();
+		await cycleConnection(alice, bob, gate);
+
+		const alicePayment = alice.getPayment(paymentHash)!;
+		expect(alicePayment.status).to.equal(PaymentStatus.FAILED);
+		expect(alicePayment.failureCode, 'the payer read the mismatch').to.equal(
+			FINAL_INCORRECT_HTLC_AMOUNT
+		);
+		const aliceChannel = bob.getChannelManager().getChannel(aliceChannelId)!;
+		expect(aliceChannel.getFullState().htlcs.size, 'no HTLC left').to.equal(0);
+		expect(sharedSecrets(bob).size, 'no shared secret left').to.equal(0);
+		expect(storage.loadAllHtlcSharedSecrets()).to.deep.equal([]);
+		expect(
+			storage.loadMetadata('owed_part_failures'),
+			'the owed fail is retired on disk'
+		).to.equal('[]');
+
+		for (let height = 1001; height <= 1050; height++) {
+			alice.handleNewBlock(height);
+			bob.handleNewBlock(height);
+		}
+		expect(aliceChannel.getState()).to.equal(ChannelState.NORMAL);
+
+		bob.destroy();
+		carol.destroy();
+		alice.destroy();
+	});
 });
