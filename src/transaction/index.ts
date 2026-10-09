@@ -1527,6 +1527,17 @@ export class Transaction {
 		index?: number;
 		transaction?: ISendTransaction;
 	}): Result<{ fee: number }> {
+		// setupRbf sets minFee no lower than the rate at which the replacement
+		// outbids the original. Nodes reject anything under it.
+		if (
+			transaction.boostType === EBoostType.rbf &&
+			satsPerByte < transaction.minFee
+		) {
+			return err(
+				`A replacement needs at least ${transaction.minFee} sats/vbyte to outbid the original transaction.`
+			);
+		}
+
 		const inputTotal = this.getTransactionInputValue({
 			inputs: transaction.inputs
 		});
@@ -1933,13 +1944,25 @@ export class Transaction {
 			// getTotalFee prices the change output from changeAddress, so it is
 			// given the outputs without it. The replacement spends every input of
 			// the original, so coin selection must not price a subset of them.
-			const satsPerByte = this._wallet.feeEstimates.fast;
-			const newFee = this.getTotalFee({
-				transaction: { ...transaction, outputs },
-				satsPerByte,
-				message: transaction.message,
-				coinSelectPreference: ECoinSelectPreference.consolidate
-			});
+			const priceAt = (rate: number): number =>
+				this.getTotalFee({
+					transaction: { ...transaction, outputs },
+					satsPerByte: rate,
+					message: transaction.message,
+					coinSelectPreference: ECoinSelectPreference.consolidate
+				});
+			// Nodes only relay a replacement that pays the original fee plus its
+			// own size at the incremental relay rate, and estimates can have
+			// fallen below what the original paid. Below 2 sat/vB getTotalFee
+			// floors the size at 256 vB, so the size is read at 2.
+			const vsize = priceAt(2) / 2;
+			const relayFloor = Math.ceil(
+				(transaction.fee + vsize * TRANSACTION_DEFAULTS.incrementalRelayFee) /
+					vsize
+			);
+			const minFee = Math.max(this._wallet.feeEstimates.slow, relayFloor);
+			const satsPerByte = Math.max(this._wallet.feeEstimates.fast, minFee);
+			const newFee = priceAt(satsPerByte);
 
 			const inputTotal = this.getTransactionInputValue({
 				inputs: transaction.inputs
@@ -1963,7 +1986,7 @@ export class Transaction {
 			const newTransaction: Partial<ISendTransaction> = {
 				...transaction,
 				outputs,
-				minFee: this._wallet.feeEstimates.slow,
+				minFee,
 				fee: newFee,
 				satsPerByte,
 				rbf: true,
