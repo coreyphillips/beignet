@@ -161,6 +161,12 @@ export interface ISubmarineSwapProviderConfig {
 	claimVbytesEstimate: number;
 	maxCreatedPerPeer: number;
 	/**
+	 * Rows nothing has been paid for yet, across every peer. Each costs one
+	 * or two chain lookups a block until it pays or ends, and the exposure
+	 * caps only count rows once paid, so a create past this is refused.
+	 */
+	maxUnpaidSwaps: number;
+	/**
 	 * Per-peer budget for quote, create and status requests: a token bucket
 	 * of rate times multiplier. A request past it is dropped unanswered.
 	 */
@@ -195,6 +201,7 @@ export const SUBMARINE_SWAP_DEFAULTS: Omit<
 	fallbackFeeRateSatPerVbyte: 10,
 	claimVbytesEstimate: 150,
 	maxCreatedPerPeer: 4,
+	maxUnpaidSwaps: 64,
 	maxRequestsPerSecond: 5,
 	requestBurstMultiplier: 4
 };
@@ -944,6 +951,15 @@ export class SubmarineSwapProvider extends EventEmitter {
 			this.config.maxCreatedPerPeer
 		) {
 			return refuse(SwapRefusalReason.RATE_LIMITED, 'too many unfunded swaps');
+		}
+		if (
+			this.deps.ledger.countInStates('submarine', CANCELLABLE_STATES) >=
+			this.config.maxUnpaidSwaps
+		) {
+			return refuse(
+				SwapRefusalReason.RATE_LIMITED,
+				'too many unpaid swaps on this provider'
+			);
 		}
 		const refundHeight = height + this.refundDelta(req.preferredRefundDelta);
 		const judged = this.invoiceProblem(req, height, refundHeight);

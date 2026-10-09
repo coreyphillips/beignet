@@ -456,6 +456,42 @@ describe('Swap ledger (issue #737 phase 2)', function () {
 			expect(ledger.byPaymentHash(done.paymentHashHex)).to.deep.equal([]);
 		});
 
+		it('counts rows by direction and state in step with every write (issue #1392)', function () {
+			const store = new MemoryLedgerStore<ISwapRecord>();
+			const ledger = ledgerOn(store);
+			const unpaid: SwapState[] = [
+				'CREATED',
+				'FUNDING_SEEN',
+				'FUNDED',
+				'FUNDING_LOST'
+			];
+			const sub = (): ISwapRecord =>
+				ledger.insert(input({ direction: 'submarine' })).record!;
+			const a = sub();
+			const b = sub();
+			const c = sub();
+			ledger.insert(input());
+			ledger.move(b.id, 'FUNDING_SEEN');
+			ledger.move(b.id, 'FUNDING_LOST');
+			for (const to of ['FUNDING_SEEN', 'FUNDED', 'PAYING'] as const)
+				ledger.move(c.id, to);
+			const counts = (l: SwapLedger): number[] => [
+				l.countInStates('submarine', unpaid),
+				l.countInStates('submarine', ['CREATED']),
+				l.countInStates('submarine', ['PAYING']),
+				l.countInStates('reverse', ['CREATED'])
+			];
+			expect(counts(ledger)).to.deep.equal([2, 1, 1, 1]);
+			expect(counts(ledgerOn(store))).to.deep.equal([2, 1, 1, 1]);
+			ledger.patch(a.id, { lastError: 'x' });
+			expect(counts(ledger)).to.deep.equal([2, 1, 1, 1]);
+			ledger.move(a.id, 'CANCELLED');
+			expect(counts(ledger)).to.deep.equal([1, 0, 1, 1]);
+			expect(ledger.countInStates('submarine', ['CANCELLED'])).to.equal(1);
+			ledger.forget(a.id);
+			expect(ledger.countInStates('submarine', ['CANCELLED'])).to.equal(0);
+		});
+
 		it('forgets only terminal rows', function () {
 			const ledger = ledgerOn();
 			const id = ledger.insert(input()).record!.id;

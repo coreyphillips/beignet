@@ -472,6 +472,7 @@ export class SwapLedger {
 	// peer's quote or create triggers never copy the whole ledger.
 	private readonly idsByHash = new Map<string, Set<string>>();
 	private readonly createdIdsByPeer = new Map<string, Set<string>>();
+	private readonly idsByState = new Map<string, Set<string>>();
 	private readonly atRiskIds = new Set<string>();
 	// Resolved EXPOSED rows stay EXPOSED for good. Keyed by depth, a policy
 	// reads only the ones still shallower than it.
@@ -485,6 +486,7 @@ export class SwapLedger {
 		const count = this.ledger.rehydrate();
 		this.idsByHash.clear();
 		this.createdIdsByPeer.clear();
+		this.idsByState.clear();
 		this.atRiskIds.clear();
 		this.resolvedIdsByDepth.clear();
 		for (const record of this.ledger.list()) this.track(undefined, record);
@@ -532,6 +534,18 @@ export class SwapLedger {
 		let count = 0;
 		for (const id of ids) {
 			if (this.ledger.get(id)?.direction === direction) count++;
+		}
+		return count;
+	}
+
+	/** Rows of one direction in any of these states, across every peer. */
+	countInStates(
+		direction: SwapDirection,
+		states: readonly SwapState[]
+	): number {
+		let count = 0;
+		for (const state of states) {
+			count += this.idsByState.get(`${direction}:${state}`)?.size ?? 0;
 		}
 		return count;
 	}
@@ -674,6 +688,12 @@ export class SwapLedger {
 		}
 		if (after?.state === 'CREATED') {
 			addToIndex(this.createdIdsByPeer, after.peerNodeIdHex, id);
+		}
+		const beforeState = before && `${before.direction}:${before.state}`;
+		const afterState = after && `${after.direction}:${after.state}`;
+		if (beforeState !== afterState) {
+			if (beforeState) dropFromIndex(this.idsByState, beforeState, id);
+			if (afterState) addToIndex(this.idsByState, afterState, id);
 		}
 		const beforeDepth = before && resolvedDepth(before);
 		const afterDepth = after && resolvedDepth(after);
