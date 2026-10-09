@@ -345,6 +345,38 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			}
 		);
 
+		// #1462: the quote coin-selected the same single input.
+		[ECoinSelectPreference.small, ECoinSelectPreference.large].forEach(
+			(preference) => {
+				it(`quotes every input of a replacement with preference ${preference}`, async function () {
+					wallet.updateCoinSelectPreference(preference);
+					stubTwoInputBoostedTransaction();
+
+					const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+					if (res.isErr()) throw res.error;
+					const updated = wallet.transaction.updateFee({ satsPerByte: 20 });
+					if (updated.isErr()) throw updated.error;
+					const quote = wallet.getFeeInfo({ satsPerByte: 20 });
+					if (quote.isErr()) throw quote.error;
+					const created = await wallet.transaction.createTransaction();
+					if (created.isErr()) throw created.error;
+
+					const tx = BitcoinTransaction.fromHex(created.value.hex);
+					expect(tx.ins).to.have.length(2);
+					const fee =
+						200_000 - tx.outs.reduce((sum, out) => sum + out.value, 0);
+					expect(quote.value.totalFee).to.equal(fee);
+					const atMax = wallet.transaction.updateFee({
+						satsPerByte: quote.value.maxSatPerByte
+					});
+					expect(atMax.isOk(), 'the quoted maximum rate is accepted').to.equal(
+						true
+					);
+					expect(wallet.coinSelectPreference).to.equal(preference);
+				});
+			}
+		);
+
 		// #1430: at these estimates the quote was 1,660 sats and minFee 2, both
 		// under the original's 10k fee.
 		it('outbids the original fee when estimates have fallen', async function () {

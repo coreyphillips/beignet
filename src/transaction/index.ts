@@ -458,9 +458,12 @@ export class Transaction {
 			let inputs = transaction.inputs || [];
 			const outputs = transaction.outputs || [];
 
+			// A replacement spends every input of the original, so coin selection
+			// must not price a subset of them.
 			if (
 				coinSelectPreference !== ECoinSelectPreference.consolidate &&
-				!transaction.max
+				!transaction.max &&
+				transaction.boostType !== EBoostType.rbf
 			) {
 				const coinSelectRes = this.autoCoinSelect({
 					inputs,
