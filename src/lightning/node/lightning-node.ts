@@ -2269,6 +2269,8 @@ export class LightningNode extends EventEmitter {
 		);
 		this.heldForwardLedger.rehydrate();
 		// Swap ledger (issue #737): same rule, rehydrated at construction.
+		// A create is free to send, so its rows are found by key scan: an
+		// insert writes one row, not an index of every swap (issue #1387).
 		if (config.swaps?.enabled) {
 			this.swapLedger = new SwapLedger(
 				this.storage
@@ -2276,7 +2278,8 @@ export class LightningNode extends EventEmitter {
 							this.storage,
 							SWAP_LEDGER_PREFIX,
 							swapCodec,
-							onCorruptLedgerRow
+							onCorruptLedgerRow,
+							{ scanRows: true }
 					  )
 					: new MemoryLedgerStore<ISwapRecord>()
 			);
@@ -22359,12 +22362,13 @@ export class LightningNode extends EventEmitter {
 	 * mints a hold invoice, and one that ends unpaid would otherwise stay in
 	 * memory and storage for good. Refuses an open or settled hold, a hash
 	 * with a part still parked or resolving, and a payment record that is not
-	 * an unsettled incoming one.
+	 * an unsettled incoming one. True once no invoice is left under the hash.
 	 */
 	private forgetCancelledHoldInvoice(paymentHash: Buffer): boolean {
 		const hashHex = paymentHash.toString('hex');
 		const invoice = this.invoices.get(hashHex);
-		if (!invoice?.hold || !invoice.cancelledAt) return false;
+		if (!invoice) return true;
+		if (!invoice.hold || !invoice.cancelledAt) return false;
 		if (
 			this.heldInvoiceHashes.has(hashHex) ||
 			this.heldHtlcs.has(hashHex) ||
@@ -28590,9 +28594,8 @@ export class LightningNode extends EventEmitter {
 				cancelHold: (paymentHash) => {
 					this.cancelHoldInvoice(paymentHash);
 				},
-				forgetHold: (paymentHash) => {
-					this.forgetCancelledHoldInvoice(paymentHash);
-				},
+				forgetHold: (paymentHash): boolean =>
+					this.forgetCancelledHoldInvoice(paymentHash),
 				onHeld: (cb): (() => void) => {
 					const handler = (e: { paymentHash: Buffer }): void => cb(e);
 					this.on('htlc:held', handler);

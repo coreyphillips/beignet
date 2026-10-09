@@ -1710,6 +1710,26 @@ export class SqliteStorage implements IStorageBackend {
 		return row ? this._dec(row.value) : null;
 	}
 
+	loadMetadataByPrefix(prefix: string): Array<{ key: string; value: string }> {
+		if (!prefix) throw new Error('metadata prefix must not be empty');
+		// A key range rather than LIKE, which would read _ and % in the prefix
+		// as wildcards and fold case. Keys compare bytewise, so the range ends
+		// at the prefix with its last character raised by one.
+		const end =
+			prefix.slice(0, -1) +
+			String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
+		const rows = this.db
+			.prepare(
+				'SELECT key, value FROM metadata WHERE key >= ? AND key < ? ORDER BY key'
+			)
+			.all(prefix, end) as Array<{ key: string; value: string }>;
+		return rows.map((row) => ({ key: row.key, value: this._dec(row.value) }));
+	}
+
+	deleteMetadata(key: string): void {
+		this.db.prepare('DELETE FROM metadata WHERE key = ?').run(key);
+	}
+
 	// ─── On-chain Wallet Data ───
 	// Key/value persistence for the on-chain wallet's IWalletData. Values are
 	// JSON strings, encrypted at rest when a key is set (see ENCRYPTED_COLUMNS).

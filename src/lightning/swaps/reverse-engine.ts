@@ -136,6 +136,12 @@ export interface IReverseSwapProviderConfig {
 	requestBurstMultiplier: number;
 	fundingVbytesEstimate: number;
 	refundVbytesEstimate: number;
+	/**
+	 * Blocks a terminal row is kept past its refund height (or its later
+	 * resolution) before it is deleted. Every unpaid create ends in a row,
+	 * so without this the ledger grows with every create ever sent.
+	 */
+	terminalRetentionBlocks: number;
 }
 
 export const REVERSE_SWAP_DEFAULTS: Omit<
@@ -162,7 +168,8 @@ export const REVERSE_SWAP_DEFAULTS: Omit<
 	maxRequestsPerSecond: 5,
 	requestBurstMultiplier: 4,
 	fundingVbytesEstimate: 200,
-	refundVbytesEstimate: 160
+	refundVbytesEstimate: 160,
+	terminalRetentionBlocks: 144
 };
 
 export const REVERSE_SWAP_DEFAULT_EXPOSURE: ISwapExposurePolicy = {
@@ -201,9 +208,11 @@ export interface IReverseSwapProviderDeps {
 	/**
 	 * Delete the node's records of a cancelled hold: its invoice, payment and
 	 * secret. Called once the swap is terminal; a no-op for a hold that is
-	 * still open, settled, or holding parts.
+	 * still open, settled, or holding parts. True once no invoice is left
+	 * under the hash; until then the swap's row is kept so the forget is
+	 * retried.
 	 */
-	forgetHold?(paymentHash: Buffer): void;
+	forgetHold?(paymentHash: Buffer): boolean;
 	onHeld(cb: (event: { paymentHash: Buffer }) => void): () => void;
 	onHoldCancelled(
 		cb: (event: { paymentHash: Buffer; reason: string }) => void
@@ -331,6 +340,12 @@ export class ReverseSwapProvider extends EventEmitter {
 				'refundDeltaBlocks must exceed the funding and resolution margins'
 			);
 		}
+		if (
+			!Number.isSafeInteger(this.config.terminalRetentionBlocks) ||
+			this.config.terminalRetentionBlocks < 0
+		) {
+			throw new Error('terminalRetentionBlocks must be a non-negative integer');
+		}
 		this.requestBudget = new PeerRateLimiter({
 			maxHtlcsPerSecond: this.config.maxRequestsPerSecond,
 			burstMultiplier: this.config.requestBurstMultiplier
@@ -389,7 +404,29 @@ export class ReverseSwapProvider extends EventEmitter {
 			for (const record of this.deps.ledger.unresolved()) {
 				await this.processRecord(record.id, `block ${height}`);
 			}
+			this.forgetEnded(height);
 		});
+	}
+
+	/** Delete terminal rows past retention (see terminalRetentionBlocks). */
+	private forgetEnded(height: number): void {
+		if (this.stopped) return;
+		const ended: string[] = [];
+		for (const record of this.deps.ledger.pastRetention(
+			'reverse',
+			height,
+			this.config.terminalRetentionBlocks
+		)) {
+			// start() still owes this row its hold cancel.
+			if (record.state === 'REFUNDED' && !record.holdCancelledAt) continue;
+			// The row is the only record that a refused or failed hold forget
+			// is still owed.
+			if (record.holdCancelledAt && !this.forgetHold(record)) continue;
+			ended.push(record.id);
+		}
+		// One transaction: the first block after an upgrade finds every
+		// terminal row ever written due at once.
+		if (ended.length > 0) this.deps.ledger.forgetAll(ended);
 	}
 
 	list(): ISwapRecord[] {
@@ -1090,15 +1127,16 @@ export class ReverseSwapProvider extends EventEmitter {
 	 * behind every swap that ends unpaid grows memory and storage for good.
 	 * The swap's own row stays the record of what happened.
 	 */
-	private forgetHold(record: ISwapRecord): void {
-		if (!this.deps.forgetHold) return;
+	private forgetHold(record: ISwapRecord): boolean {
+		if (!this.deps.forgetHold) return true;
 		try {
-			this.deps.forgetHold(Buffer.from(record.paymentHashHex, 'hex'));
+			return this.deps.forgetHold(Buffer.from(record.paymentHashHex, 'hex'));
 		} catch (err) {
 			this.deps.log('swap_forget_hold_failed', {
 				swapId: record.id,
 				error: err instanceof Error ? err.message : String(err)
 			});
+			return false;
 		}
 	}
 

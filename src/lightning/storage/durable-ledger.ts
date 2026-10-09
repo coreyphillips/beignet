@@ -63,7 +63,20 @@ export interface ILedgerCodec<R extends ILedgerRecord> {
 export interface ILedgerKeyValueStorage {
 	saveMetadata(key: string, value: string): void;
 	loadMetadata(key: string): string | null;
+	loadMetadataByPrefix?(prefix: string): Array<{ key: string; value: string }>;
+	deleteMetadata?(key: string): void;
 	transaction<T>(fn: () => T): T;
+}
+
+export interface IMetadataLedgerStoreOptions {
+	/**
+	 * Find rows by key prefix instead of through the id index, when the
+	 * storage offers loadMetadataByPrefix and deleteMetadata. A put or delete
+	 * then writes one row rather than the whole index. loadAll returns rows
+	 * in id order, not insertion order, so a ledger whose rehydrate depends
+	 * on that order must not opt in.
+	 */
+	scanRows?: boolean;
 }
 
 /* eslint-disable brace-style -- prettier wraps the long class heads */
@@ -103,6 +116,12 @@ export class MemoryLedgerStore<R extends ILedgerRecord>
  * deleted record's row is overwritten with an empty tombstone and dropped
  * from the index.
  *
+ * With `scanRows` and a storage that can scan and delete, there is no index:
+ * `loadAll` reads every `<prefix>:row:` key and a delete removes the row.
+ * Rows written under the index layout are already under those keys, and
+ * its empty tombstones are skipped, so the switch needs no migration. The
+ * old index row is left as it was.
+ *
  * A row that no longer decodes cannot be served, so its engine forgets the
  * record. `loadAll` reports its metadata key to `onCorruptRow` and leaves
  * the row and its index entry as stored, so it is skipped, not erased.
@@ -110,12 +129,20 @@ export class MemoryLedgerStore<R extends ILedgerRecord>
 export class MetadataLedgerStore<R extends ILedgerRecord>
 	implements IDurableLedgerStore<R>
 {
+	private readonly scanRows: boolean;
+
 	constructor(
 		private readonly storage: ILedgerKeyValueStorage,
 		private readonly prefix: string,
 		private readonly codec: ILedgerCodec<R>,
-		private readonly onCorruptRow?: (key: string) => void
-	) {}
+		private readonly onCorruptRow?: (key: string) => void,
+		options: IMetadataLedgerStoreOptions = {}
+	) {
+		this.scanRows =
+			options.scanRows === true &&
+			typeof storage.loadMetadataByPrefix === 'function' &&
+			typeof storage.deleteMetadata === 'function';
+	}
 
 	private rowKey(id: string): string {
 		return `${this.prefix}:row:${id}`;
@@ -149,12 +176,16 @@ export class MetadataLedgerStore<R extends ILedgerRecord>
 	}
 
 	loadAll(): R[] {
+		const stored = this.scanRows
+			? this.storage.loadMetadataByPrefix!(this.rowKey(''))
+			: this.loadIndex().map((id) => {
+					const key = this.rowKey(id);
+					return { key, value: this.storage.loadMetadata(key) };
+			  });
 		const out: R[] = [];
-		for (const id of this.loadIndex()) {
-			const key = this.rowKey(id);
-			const raw = this.storage.loadMetadata(key);
-			if (!raw) continue;
-			const row = this.codec.decode(raw);
+		for (const { key, value } of stored) {
+			if (!value) continue;
+			const row = this.codec.decode(value);
 			if (row) out.push(row);
 			else this.onCorruptRow?.(key);
 		}
@@ -167,6 +198,7 @@ export class MetadataLedgerStore<R extends ILedgerRecord>
 				this.rowKey(record.id),
 				this.codec.encode(record)
 			);
+			if (this.scanRows) return;
 			const ids = this.loadIndex();
 			if (!ids.includes(record.id)) {
 				ids.push(record.id);
@@ -176,6 +208,10 @@ export class MetadataLedgerStore<R extends ILedgerRecord>
 	}
 
 	delete(id: string): void {
+		if (this.scanRows) {
+			this.storage.deleteMetadata!(this.rowKey(id));
+			return;
+		}
 		this.storage.transaction(() => {
 			this.storage.saveMetadata(this.rowKey(id), '');
 			const ids = this.loadIndex().filter((x) => x !== id);
@@ -326,6 +362,23 @@ export class DurableLedger<R extends ILedgerRecord> {
 			return false;
 		}
 		this.records.delete(id);
+		return true;
+	}
+
+	/**
+	 * Drop several records in one store transaction: on a storage failure
+	 * none goes. Ids not present are skipped.
+	 */
+	removeSet(ids: readonly string[]): boolean {
+		const present = [...new Set(ids)].filter((id) => this.records.has(id));
+		try {
+			this.store.transaction(() => {
+				for (const id of present) this.store.delete(id);
+			});
+		} catch {
+			return false;
+		}
+		for (const id of present) this.records.delete(id);
 		return true;
 	}
 }

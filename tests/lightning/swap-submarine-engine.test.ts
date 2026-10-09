@@ -808,6 +808,37 @@ describe('Submarine swap provider engine (issue #743)', function () {
 			expect(h.engine.cancel('00'.repeat(16)).ok).to.equal(false);
 		});
 
+		it('deletes its terminal rows past retention and leaves the reverse rows alone (issue #1387)', async function () {
+			const net = new FakeDfNetwork();
+			const reverse = await reverseHarness({
+				net,
+				config: { answerSubmarineRequests: false }
+			});
+			const h = await submarineHarness({
+				net,
+				provider: reverse.provider,
+				store: reverse.store,
+				ledger: reverse.ledger,
+				config: { terminalRetentionBlocks: 10 }
+			});
+			const client = submarineClient();
+			await create(h, client);
+			const r = record(h, client);
+			expect(h.engine.cancel(r.id).ok).to.equal(true);
+			const reverseRow = h.ledger.insert({
+				...r,
+				id: crypto.randomBytes(16).toString('hex'),
+				direction: 'reverse',
+				paymentHashHex: crypto.randomBytes(32).toString('hex')
+			}).record!;
+			h.ledger.move(reverseRow.id, 'CANCELLED');
+			await h.engine.onBlock(r.refundHeight + 9);
+			expect(h.ledger.get(r.id)!.state).to.equal('CANCELLED');
+			await h.engine.onBlock(r.refundHeight + 10);
+			expect(h.ledger.get(r.id)).to.equal(undefined);
+			expect(h.ledger.get(reverseRow.id)!.state).to.equal('CANCELLED');
+		});
+
 		it('defers the payment while outbound liquidity is short, then dispatches', async function () {
 			const h = await submarineHarness();
 			const client = submarineClient();
