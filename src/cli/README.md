@@ -2022,6 +2022,7 @@ Every response follows this format:
   "connectTimeoutMs": 15000,
   "tlsCert": "/etc/ssl/beignet/cert.pem",
   "tlsKey": "/etc/ssl/beignet/key.pem",
+  "rateLimit": { "maxRequests": 100, "windowMs": 60000 },
   "htlcEvents": false
 }
 ```
@@ -2262,6 +2263,10 @@ When any credential is configured, all endpoints require an `Authorization: Bear
 These still count against the rate limiter when `rateLimit` is configured.
 
 A daemon bound beyond loopback refuses to start when the `apiToken` or any `apiKeys` secret is shorter than 16 characters, unless `insecure` is set: there the credential is the only lock, and the rate limiter is off unless configured. Prefer `BEIGNET_API_TOKEN` or the config file to `--api-token`, whose value any local user can read from the process list.
+
+The rate limiter is the `rateLimit` config file key: `{ "maxRequests": 100, "windowMs": 60000, "trustedProxies": [] }`, every field optional, so `{}` turns it on with those defaults. A client past its bucket gets `429 RATE_LIMITED`. Buckets are keyed on the peer address, and `X-Forwarded-For` is read only when the peer is listed in `trustedProxies`; without that, every client behind a proxy shares the proxy's bucket. A `maxRequests`, `windowMs` or `maxClients` that is not a positive integer refuses startup.
+
+Whether or not it is on, the server holds at most 256 connections at once (SSE streams and waits included) and closes any more as they arrive. A client has 30 seconds to send its headers and 120 seconds for the whole request, and an idle keep-alive connection is closed after 5 seconds.
 
 Every install `beignet init` creates carries an `apiToken` (see [Setup](#setup)). If neither `apiToken` nor `apiKeys` is configured (a config written by hand or by a release before 0.22.0's successor), all endpoints are open to local processes, `GET /mnemonic` excepted (it needs auth, and `admin`), the daemon logs a warning at boot, and three browser guards keep a web page from driving it (issue #1005):
 

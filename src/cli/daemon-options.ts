@@ -51,6 +51,7 @@ export function daemonOptions(
 		htlcEvents: config.htlcEvents,
 		metricsPublic: config.metricsPublic,
 		insecure: config.insecure,
+		rateLimit: config.rateLimit,
 		forwardingEnabled: config.forwardingEnabled,
 		eagerGossipVerify: config.eagerGossipVerify,
 		autoReconnect: config.autoReconnect,

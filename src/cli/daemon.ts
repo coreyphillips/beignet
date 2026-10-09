@@ -97,6 +97,16 @@ const WAIT_ROUTES = new Set([
 ]);
 const WAIT_MAX_PER_KEY = 16;
 const WAIT_MAX_TIMEOUT_MS = 10 * 60 * 1000;
+// Sockets the HTTP server holds at once, SSE streams and waits included. Past
+// it a new connection is closed on accept, so a flood of idle sockets cannot
+// take the descriptors the node's peers and database need.
+export const HTTP_MAX_CONNECTIONS = 256;
+// A request's headers are a few hundred bytes and its body at most
+// MAX_BODY_BYTES; these bound how long a client may take to send them. The
+// response side is unbounded, which SSE and the long-poll waits rely on.
+export const HTTP_HEADERS_TIMEOUT_MS = 30_000;
+export const HTTP_REQUEST_TIMEOUT_MS = 120_000;
+export const HTTP_KEEP_ALIVE_TIMEOUT_MS = 5_000;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 // The CachedResponse entries that carry a paymentHash, and the keyed payments
@@ -944,6 +954,17 @@ async function bootDaemon(
 			throw new BeignetError(
 				'INVALID_PARAMS',
 				`rateLimit.trustedProxies entry is not an IP address: ${proxy}`
+			);
+		}
+	}
+	// A zero, negative or non-numeric value would answer every request 429,
+	// /health included.
+	for (const field of ['maxRequests', 'windowMs', 'maxClients'] as const) {
+		const value = opts.rateLimit?.[field];
+		if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`rateLimit.${field} must be a positive integer, got ${String(value)}`
 			);
 		}
 	}
@@ -4119,6 +4140,10 @@ async function bootDaemon(
 			);
 		});
 	}
+	server.maxConnections = HTTP_MAX_CONNECTIONS;
+	server.headersTimeout = HTTP_HEADERS_TIMEOUT_MS;
+	server.requestTimeout = HTTP_REQUEST_TIMEOUT_MS;
+	server.keepAliveTimeout = HTTP_KEEP_ALIVE_TIMEOUT_MS;
 
 	// The one teardown path for a successful boot, shared by the POST /stop
 	// route and whatever handle the caller keeps (the CLI's signal handler).
