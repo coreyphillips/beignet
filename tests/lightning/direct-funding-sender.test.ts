@@ -2288,6 +2288,39 @@ describe('Direct funding sender: a freeze that outlived its run', () => {
 		expect(wallet.frozen.size).to.equal(0);
 	});
 
+	for (const via of ['retry', 'reconcile'] as const) {
+		it(`retries failed cleanup on a ${via} without a restart (issue #1460)`, async () => {
+			const storage = memoryStorage();
+			const request = mintRequest();
+			const wallet = new FakeSenderWallet([makeCoin()]);
+			await life(request, wallet, storage).sender.send(request.encoded, {
+				amountSat: 100_000n
+			});
+			rewindToPrePersist(storage);
+			const unfreeze = wallet.unfreezeUtxo.bind(wallet);
+			wallet.unfreezeUtxo = async (): Promise<boolean> => false;
+			const { sender, payments } = life(request, wallet, storage);
+			sender.start();
+			try {
+				await flush();
+				expect(payments.list()[0].freezeReleased).to.equal(false);
+				wallet.unfreezeUtxo = unfreeze;
+				if (via === 'reconcile') {
+					await sender.reconcile();
+					await flush();
+					expect(payments.list()[0].freezeReleased).to.equal(true);
+					expect(wallet.frozen.size).to.equal(0);
+				}
+				const retried = await sender.send(request.encoded, {
+					amountSat: 100_000n
+				});
+				expect(retried.status).to.equal('SIGNED_PENDING');
+			} finally {
+				sender.stop();
+			}
+		});
+	}
+
 	it('does not release an aborted outpoint held by a signed payment', async () => {
 		const h = harness();
 		await h.sender.send(h.request.encoded, { amountSat: 100_000n });
