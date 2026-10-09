@@ -2,8 +2,9 @@
  * Swap chain resolver (issue #737, phase 2) over a scripted chain source
  * seeded from the P2WSH fixture: funding status, spend classification with
  * preimage extraction, confirmation policy, backend answers that do not
- * hash to the requested txid, reorg demotion, a claim racing a refund, and
- * the first-observation-after-restart rule.
+ * hash to the requested txid, reorg demotion, a claim racing a refund, the
+ * first-observation-after-restart rule, and a history padded with payments
+ * read once rather than every observe.
  */
 
 import { expect } from 'chai';
@@ -335,6 +336,51 @@ describe('Swap chain resolver (issue #737 phase 2)', function () {
 		await r.observe({ htlc, funding });
 		await r.observe({ htlc, funding });
 		expect(source.fetches).to.deep.equal([fundingTxid, claimTx.getId()]);
+	});
+
+	it('fetches each history entry once however many payments pad the contract (#1393)', async function () {
+		const source = new FakeSource();
+		const r = resolver(source);
+		const outputScript = buildSwapHtlc(htlc).outputScript;
+		const dust = (seed: number): bitcoin.Transaction => {
+			const tx = new bitcoin.Transaction();
+			tx.version = 2;
+			const prevout = Buffer.alloc(32);
+			prevout.writeUInt32LE(seed);
+			tx.addInput(prevout, 0);
+			tx.addOutput(outputScript, 546);
+			return tx;
+		};
+		source.add(fundingTx, 800_000);
+		// More entries than the transaction cache holds.
+		for (let i = 1; i <= 600; i++) source.add(dust(i), 800_001);
+		const observeBoth = async (): Promise<void> => {
+			const discovered = await r.observe({ htlc });
+			expect(discovered.candidates).to.have.length(
+				source.history.get(scriptHash)!.length
+			);
+			await r.observe({ htlc, funding });
+		};
+		await observeBoth();
+
+		source.fetches = [];
+		await observeBoth();
+		expect(source.fetches).to.deep.equal([]);
+
+		const late = dust(601);
+		source.add(late, 0);
+		await observeBoth();
+		expect(source.fetches).to.deep.equal([late.getId()]);
+
+		source.fetches = [];
+		source.add(claimTx, 0);
+		const claimed = await r.observe({ htlc, funding });
+		expect(source.fetches).to.deep.equal([claimTx.getId()]);
+		expect(claimed.spends).to.have.length(1);
+		expect(claimed.spends[0].kind).to.equal('claim');
+		expect(claimed.spends[0].preimage!.toString('hex')).to.equal(
+			vector.preimage
+		);
 	});
 
 	it('broadcast verifies the reported txid', async function () {

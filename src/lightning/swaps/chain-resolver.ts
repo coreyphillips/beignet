@@ -135,11 +135,34 @@ export interface ISwapObserveParams {
 	};
 }
 
+/** What a transaction in a contract's history says about the contract. */
+interface IContractTxFacts {
+	/** Outputs paying the contract script. */
+	pays: Array<{ vout: number; valueSat: bigint }>;
+	/** The outpoints its inputs spend, as txid:vout. */
+	spent: string[];
+}
+
 const TX_CACHE_LIMIT = 512;
+/**
+ * Contracts whose history facts are kept. Every row the engines poll is
+ * observed each block and so stays recent; this only has to exceed them.
+ */
+const HISTORY_FACTS_SCRIPT_LIMIT = 1024;
 
 export class SwapChainResolver {
 	private readonly txCache = new Map<string, bitcoin.Transaction>();
 	private readonly verified = new Set<string>();
+	/**
+	 * Per contract script hash, least recently observed first. A txid fixes
+	 * a transaction's inputs and outputs, so each history entry is fetched
+	 * once however many payments an attacker adds to the address, instead
+	 * of once per observe after they push it past the transaction cache.
+	 */
+	private readonly historyFacts = new Map<
+		string,
+		Map<string, IContractTxFacts>
+	>();
 
 	constructor(
 		private readonly source: ISwapChainSource,
@@ -169,6 +192,7 @@ export class SwapChainResolver {
 		const scriptHash = computeScriptHash(outputScript);
 		const height = this.source.currentHeight();
 		const history = await this.source.getScriptHashHistory(scriptHash);
+		const facts = this.historyFactsOf(scriptHash, history);
 		const key = params.funding
 			? `${params.funding.txid}:${params.funding.vout}`
 			: scriptHash;
@@ -216,17 +240,15 @@ export class SwapChainResolver {
 			}
 		} else {
 			for (const entry of history) {
-				const tx = await this.fetch(entry.txid);
-				tx.outs.forEach((out, vout) => {
-					if (out.script.equals(outputScript)) {
-						candidates.push({
-							txid: entry.txid,
-							vout,
-							valueSat: BigInt(out.value),
-							height: entry.height
-						});
-					}
-				});
+				const { pays } = await this.txFacts(facts, entry.txid, outputScript);
+				for (const out of pays) {
+					candidates.push({
+						txid: entry.txid,
+						vout: out.vout,
+						valueSat: out.valueSat,
+						height: entry.height
+					});
+				}
 			}
 		}
 
@@ -234,8 +256,11 @@ export class SwapChainResolver {
 		if (params.funding && fundingTx) {
 			const fundingHash = fundingTx.getHash();
 			const outputIndex = params.funding.vout;
+			const outpoint = `${fundingTx.getId()}:${outputIndex}`;
 			for (const entry of history) {
 				if (entry.txid === params.funding.txid) continue;
+				const { spent } = await this.txFacts(facts, entry.txid, outputScript);
+				if (!spent.includes(outpoint)) continue;
 				const tx = await this.fetch(entry.txid);
 				const inputIndex = tx.ins.findIndex(
 					(input) =>
@@ -359,6 +384,52 @@ export class SwapChainResolver {
 			}
 		}
 		return undefined;
+	}
+
+	/**
+	 * The facts kept for a contract, trimmed to its current history so
+	 * replaced or reorged entries do not accumulate.
+	 */
+	private historyFactsOf(
+		scriptHash: string,
+		history: Array<{ txid: string }>
+	): Map<string, IContractTxFacts> {
+		const facts =
+			this.historyFacts.get(scriptHash) ?? new Map<string, IContractTxFacts>();
+		this.historyFacts.delete(scriptHash);
+		this.historyFacts.set(scriptHash, facts);
+		if (this.historyFacts.size > HISTORY_FACTS_SCRIPT_LIMIT) {
+			const oldest = this.historyFacts.keys().next().value;
+			if (oldest !== undefined) this.historyFacts.delete(oldest);
+		}
+		const present = new Set(history.map((h) => h.txid));
+		for (const txid of facts.keys()) {
+			if (!present.has(txid)) facts.delete(txid);
+		}
+		return facts;
+	}
+
+	private async txFacts(
+		facts: Map<string, IContractTxFacts>,
+		txid: string,
+		outputScript: Buffer
+	): Promise<IContractTxFacts> {
+		const known = facts.get(txid);
+		if (known) return known;
+		const tx = await this.fetch(txid);
+		const found: IContractTxFacts = { pays: [], spent: [] };
+		tx.outs.forEach((out, vout) => {
+			if (out.script.equals(outputScript)) {
+				found.pays.push({ vout, valueSat: BigInt(out.value) });
+			}
+		});
+		for (const input of tx.ins) {
+			found.spent.push(
+				`${Buffer.from(input.hash).reverse().toString('hex')}:${input.index}`
+			);
+		}
+		facts.set(txid, found);
+		return found;
 	}
 
 	/** Fetch by txid and refuse bytes that do not hash to it. */
