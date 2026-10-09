@@ -94,7 +94,23 @@ function harness(storageOverride?: SqliteStorage) {
 				inputs = utxos;
 				return ok({});
 			},
-			sendMax: async ({ address }: { address: string }) => {
+			sendMax: async ({
+				address,
+				spendFrozen
+			}: {
+				address: string;
+				spendFrozen?: boolean;
+			}) => {
+				// The wallet's sendMax drops frozen inputs unless told otherwise,
+				// and the sweep's inputs are frozen by its own reservation.
+				const reserved = inputs.filter((coin) =>
+					frozen.some(
+						(entry) =>
+							entry.tx_hash === coin.tx_hash && entry.tx_pos === coin.tx_pos
+					)
+				);
+				if (reserved.length && !spendFrozen)
+					return err('Every staged input is frozen.');
 				outputAddress = address;
 				return ok('ready');
 			},

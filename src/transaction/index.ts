@@ -1613,19 +1613,22 @@ export class Transaction {
 	 * @param {number} [index]
 	 * @param satsPerByte
 	 * @param rbf
+	 * @param {boolean} [spendFrozen] Keeps staged inputs that are frozen, for a caller that froze them to reserve them for this send.
 	 */
 	sendMax = async ({
 		address,
 		transaction,
 		index = 0,
 		satsPerByte,
-		rbf = false
+		rbf = false,
+		spendFrozen = false
 	}: {
 		address?: string;
 		transaction?: ISendTransaction;
 		index?: number;
 		satsPerByte?: number;
 		rbf?: boolean;
+		spendFrozen?: boolean;
 	} = {}): Promise<Result<string>> => {
 		try {
 			if (!transaction) {
@@ -1644,6 +1647,16 @@ export class Transaction {
 				address = outputs[index]?.address ?? '';
 			}
 
+			// setupTransaction leaves frozen coins out, but a coin frozen since is
+			// still staged, and createTransaction signs what is staged.
+			const unfrozen = (utxos: IUtxo[]): IUtxo[] =>
+				spendFrozen ? utxos : this.removeBlackListedUtxos(utxos);
+			const stagedInputs = transaction.inputs ?? [];
+			const inputs = unfrozen(stagedInputs);
+			if (stagedInputs.length && !inputs.length) {
+				return err('Every staged input is frozen.');
+			}
+
 			// Priced as the one output staged below. With no outputs, getTotalFee
 			// assumes one of the wallet's own type, which is 12 vB short for a p2wpkh
 			// wallet sweeping to a p2tr or p2wsh address.
@@ -1652,6 +1665,7 @@ export class Transaction {
 				selectedFeeId: transaction.selectedFeeId,
 				transaction: {
 					...transaction,
+					inputs,
 					outputs: address ? [{ address, value: 0, index }] : []
 				}
 			});
@@ -1665,6 +1679,7 @@ export class Transaction {
 					transaction: {
 						satsPerByte,
 						max: true,
+						inputs: unfrozen(this._data.inputs),
 						outputs: [{ address, value: amount, index }],
 						fee
 					}

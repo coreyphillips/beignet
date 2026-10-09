@@ -461,7 +461,9 @@ export class OnchainSweeps {
 			const sweep = await wallet.transaction.sendMax({
 				address: request.address,
 				satsPerByte: request.satsPerVbyte,
-				rbf: false
+				rbf: false,
+				// reserve() froze these inputs for this sweep.
+				spendFrozen: true
 			});
 			if (sweep.isErr()) return refuse('SEND_FAILED', sweep.error.message);
 			const built = await wallet.transaction.createTransaction({
