@@ -46,6 +46,7 @@ import type {
 	IDfPeerMessaging
 } from '../direct-funding/transport/types';
 import type { IHeldInvoiceSnapshot } from '../node/types';
+import { PeerRateLimiter } from '../node/rate-limiter';
 import { buildSwapHtlc, ISwapHtlc } from './htlc';
 import { buildSwapRefundTx } from './transactions';
 import { validateReverseSwapAdmission } from './policy';
@@ -127,6 +128,12 @@ export interface IReverseSwapProviderConfig {
 	/** Funding BUILD attempts, not broadcasts. */
 	maxFundingAttempts: number;
 	maxCreatedPerPeer: number;
+	/**
+	 * Per-peer budget for quote, create and status requests: a token bucket
+	 * of rate times multiplier. A request past it is dropped unanswered.
+	 */
+	maxRequestsPerSecond: number;
+	requestBurstMultiplier: number;
 	fundingVbytesEstimate: number;
 	refundVbytesEstimate: number;
 }
@@ -152,6 +159,8 @@ export const REVERSE_SWAP_DEFAULTS: Omit<
 	refundBumpIntervalBlocks: 2,
 	maxFundingAttempts: 3,
 	maxCreatedPerPeer: 4,
+	maxRequestsPerSecond: 5,
+	requestBurstMultiplier: 4,
 	fundingVbytesEstimate: 200,
 	refundVbytesEstimate: 160
 };
@@ -271,6 +280,12 @@ const WATCHED_STATES: readonly SwapState[] = [
 	'CLAIMED',
 	'EXPOSED'
 ];
+/** The requests this engine answers, each paid from the peer's budget. */
+const REQUEST_SUBTYPES: ReadonlySet<number> = new Set([
+	BeignetCustomSubtype.SWAP_QUOTE_REQUEST,
+	BeignetCustomSubtype.SWAP_CREATE,
+	BeignetCustomSubtype.SWAP_STATUS_REQUEST
+]);
 const DUST_FLOOR_SAT = SWAP_DUST_FLOOR_SAT;
 /** Padding past the admission inequality so any pay height satisfies it. */
 const HOLD_CLTV_PADDING = 8;
@@ -278,6 +293,7 @@ const HOLD_CLTV_PADDING = 8;
 export class ReverseSwapProvider extends EventEmitter {
 	readonly config: IReverseSwapProviderConfig;
 	private readonly unsubscribe: Array<() => void> = [];
+	private readonly requestBudget: PeerRateLimiter;
 	private queue: Promise<void> = Promise.resolve();
 	private stopped = false;
 
@@ -309,6 +325,10 @@ export class ReverseSwapProvider extends EventEmitter {
 				'refundDeltaBlocks must exceed the funding and resolution margins'
 			);
 		}
+		this.requestBudget = new PeerRateLimiter({
+			maxHtlcsPerSecond: this.config.maxRequestsPerSecond,
+			burstMultiplier: this.config.requestBurstMultiplier
+		});
 		// Subscribed at construction so nothing between construction and
 		// start() is missed; every handler contains its own errors because
 		// the node runs all custom-message listeners in one try/catch.
@@ -341,6 +361,12 @@ export class ReverseSwapProvider extends EventEmitter {
 		this.stopped = true;
 		for (const off of this.unsubscribe) off();
 		this.unsubscribe.length = 0;
+		this.requestBudget.clear();
+	}
+
+	/** Forget a disconnected peer's request budget. */
+	forgetPeer(peerHex: string): void {
+		this.requestBudget.removePeer(peerHex);
 	}
 
 	/** Per-block work; ticks are serialized and never overlap. */
@@ -442,6 +468,10 @@ export class ReverseSwapProvider extends EventEmitter {
 	// ─────────────── wire ───────────────
 
 	private onMessage(msg: IDfCustomMessage): void {
+		if (!REQUEST_SUBTYPES.has(msg.subtype)) return;
+		// Spent before decoding. Not logged: the node persists every log
+		// line, so logging a flood would make it cost a write per message.
+		if (!this.requestBudget.tryConsume(msg.peerPubkey)) return;
 		let work: Promise<void> | undefined;
 		try {
 			switch (msg.subtype) {
@@ -591,7 +621,7 @@ export class ReverseSwapProvider extends EventEmitter {
 			amountSat: req.amountSat,
 			estimatedFundingFeeSat: fee.minerFeeSat,
 			feeRateSatPerVbyte: fee.feeRate,
-			live: this.deps.ledger.unresolved()
+			live: this.deps.ledger.atRisk()
 		});
 		if (!verdict.ok)
 			return refuse(exposureRefusal(verdict.reason), verdict.detail);
@@ -685,10 +715,7 @@ export class ReverseSwapProvider extends EventEmitter {
 		if (destinationProblem) {
 			return refuse(SwapRefusalReason.INTERNAL, destinationProblem);
 		}
-		const createdByPeer = this.deps.ledger
-			.list()
-			.filter((r) => r.peerNodeIdHex === peer && r.state === 'CREATED').length;
-		if (createdByPeer >= this.config.maxCreatedPerPeer) {
+		if (this.deps.ledger.createdCount(peer) >= this.config.maxCreatedPerPeer) {
 			return refuse(SwapRefusalReason.RATE_LIMITED, 'too many unpaid swaps');
 		}
 		const fee = await this.quoteFee(req.onchainAmountSat);
@@ -706,7 +733,7 @@ export class ReverseSwapProvider extends EventEmitter {
 			amountSat: req.onchainAmountSat,
 			estimatedFundingFeeSat: fee.minerFeeSat,
 			feeRateSatPerVbyte: fee.feeRate,
-			live: this.deps.ledger.unresolved()
+			live: this.deps.ledger.atRisk()
 		});
 		if (!verdict.ok)
 			return refuse(exposureRefusal(verdict.reason), verdict.detail);

@@ -33,7 +33,7 @@ export interface ISwapExposureInput {
 	/** Miner fee the funding transaction is expected to pay (reverse). */
 	estimatedFundingFeeSat?: bigint;
 	feeRateSatPerVbyte?: number;
-	/** ledger.unresolved() */
+	/** ledger.atRisk(), or any set of rows that holds it. */
 	live: readonly ISwapRecord[];
 	/**
 	 * The provider's resolution depth: an exposed row stops counting only

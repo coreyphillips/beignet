@@ -278,6 +278,62 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			);
 		});
 
+		it('answers quotes and creates without scanning the ledger (issue #1388)', async function () {
+			const h = await harness();
+			const fullScan = (): never => {
+				throw new Error('full ledger scan');
+			};
+			h.ledger.list = fullScan;
+			h.ledger.unresolved = fullScan;
+			expect((await quote(h)).accepted).to.equal(true);
+			expect((await create(h, clientSwap())).accepted).to.equal(true);
+			for (let i = 0; i < 3; i++) await create(h, clientSwap());
+			expect((await create(h, clientSwap())).reason).to.equal(
+				SwapRefusalReason.RATE_LIMITED
+			);
+			expect(h.logs.map((l) => l.action)).to.not.include('swap_handler_failed');
+		});
+
+		it("drops a peer's requests past its budget, before decoding them (issue #1388)", async function () {
+			const h = await harness({
+				config: { maxRequestsPerSecond: 1, requestBurstMultiplier: 2 }
+			});
+			const quotes = (): number =>
+				h.provider.sent.filter(
+					(s) => s.subtype === BeignetCustomSubtype.SWAP_QUOTE
+				).length;
+			const request = (from: FakeDfPeer, payload?: Buffer): void =>
+				from.sendCustomMessage(
+					h.provider.id,
+					BeignetCustomSubtype.SWAP_QUOTE_REQUEST,
+					payload ??
+						encodeSwapQuoteRequest({
+							requestId: crypto.randomBytes(8),
+							direction: SwapWireDirection.REVERSE,
+							amountSat: AMOUNT
+						})
+				);
+			for (let i = 0; i < 5; i++) request(h.client);
+			await settle();
+			expect(quotes()).to.equal(2);
+			// Over budget, garbage is not even decoded.
+			request(h.client, Buffer.from([0xff]));
+			await settle();
+			expect(h.logs.map((l) => l.action)).to.not.include(
+				'swap_message_malformed'
+			);
+			const other = h.net.add('other-client');
+			h.net.connect(h.provider, other);
+			request(other);
+			await settle();
+			expect(quotes()).to.equal(3);
+			// A disconnected peer's budget is forgotten.
+			h.engine.forgetPeer(h.client.id);
+			request(h.client);
+			await settle();
+			expect(quotes()).to.equal(4);
+		});
+
 		it('refuses a hash the node already holds a record for, before anything is written', async function () {
 			const h = await harness();
 			const swap = clientSwap();

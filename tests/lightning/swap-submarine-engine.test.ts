@@ -525,6 +525,43 @@ describe('Submarine swap provider engine (issue #743)', function () {
 			expect(ack.accepted, ack.reasonText).to.equal(true);
 		});
 
+		it('answers quotes and creates without scanning the ledger, within a per-peer budget (issue #1388)', async function () {
+			const h = await submarineHarness({
+				config: { maxRequestsPerSecond: 1, requestBurstMultiplier: 6 }
+			});
+			const fullScan = (): never => {
+				throw new Error('full ledger scan');
+			};
+			h.ledger.list = fullScan;
+			h.ledger.unresolved = fullScan;
+			expect((await quote(h)).accepted).to.equal(true);
+			for (let i = 0; i < 4; i++) {
+				const { ack } = await create(h, submarineClient());
+				expect(ack.accepted, `create ${i}`).to.equal(true);
+			}
+			expect((await create(h, submarineClient())).ack.reason).to.equal(
+				SwapRefusalReason.RATE_LIMITED
+			);
+			expect(h.logs.map((l) => l.action)).to.not.include('swap_handler_failed');
+			// The budget is spent: a seventh request goes unanswered.
+			const quotes = countFrom(h.provider, BeignetCustomSubtype.SWAP_QUOTE);
+			h.client.sendCustomMessage(
+				h.provider.id,
+				BeignetCustomSubtype.SWAP_QUOTE_REQUEST,
+				encodeSwapQuoteRequest({
+					requestId: crypto.randomBytes(8),
+					direction: SwapWireDirection.SUBMARINE,
+					amountSat: AMOUNT
+				})
+			);
+			await settle();
+			expect(countFrom(h.provider, BeignetCustomSubtype.SWAP_QUOTE)).to.equal(
+				quotes
+			);
+			h.engine.forgetPeer(h.client.id);
+			expect((await quote(h)).accepted).to.equal(true);
+		});
+
 		it('refuses a hash the node already holds, a peer with too many unfunded swaps, no liquidity and a non-segwit destination', async function () {
 			const h = await submarineHarness();
 			const used = submarineClient();
