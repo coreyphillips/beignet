@@ -683,6 +683,62 @@ describe('Storage Encryption', function () {
 				expect(again.storage.loadChannelKeyIndex('chan-m')).to.equal(3);
 				again.storage.close();
 			});
+
+			it('leaves no migrated plaintext in the database or WAL file', function () {
+				// Forty held parts serialize past 10 KB, so each value spans
+				// overflow pages that the encrypted rewrite frees.
+				const digest = (label: string): string =>
+					crypto.createHash('sha256').update(label).digest('hex');
+				const parts = Array.from({ length: 40 }, (_, i) => ({
+					inChannelIdHex: digest(`channel-${i}`),
+					inHtlcId: String(i),
+					paymentHashHex: digest(`payment-${i}`),
+					amountMsat: String(918_273_645_000 + i),
+					incomingCltvExpiry: 800_000 + i,
+					disposition: 'fail'
+				}));
+				const held = JSON.stringify(parts);
+				const wallet = JSON.stringify({ utxos: parts });
+				expect(held.length).to.be.greaterThan(10_000);
+				const secrets = parts.flatMap((part) => [
+					part.paymentHashHex,
+					part.inChannelIdHex,
+					part.amountMsat
+				]);
+				const leaked = (): string[] => {
+					const raw = readRawDbBytes(dbPath);
+					return secrets.filter((secret) => raw.includes(secret));
+				};
+
+				const plain = new SqliteStorage(dbPath);
+				plain.open({ synchronous: 'NORMAL' });
+				plain.saveMetadata('jit:held', held);
+				plain.saveWalletData('wallet', wallet);
+				plain.close();
+				expect(leaked()).to.deep.equal(secrets);
+
+				const storage = openEncrypted();
+				// Straight after open, before the caller checkpoints or closes;
+				// the WAL is read alongside the file.
+				expect(leaked()).to.deep.equal([]);
+				expect(storage.loadMetadata('jit:held')).to.equal(held);
+				expect(storage.loadWalletData('wallet')).to.equal(wallet);
+				storage.checkpoint();
+				storage.close();
+				expect(leaked()).to.deep.equal([]);
+				const stored = storedValues();
+				expect(isEncryptedValue(stored['metadata/jit:held/value'] as string)).to
+					.be.true;
+				expect(isEncryptedValue(stored['wallet_data/wallet/value'] as string))
+					.to.be.true;
+
+				const again = openEncrypted();
+				expect(again.loadMetadata('jit:held')).to.equal(held);
+				expect(again.loadWalletData('wallet')).to.equal(wallet);
+				again.close();
+				expect(storedValues()).to.deep.equal(stored);
+				expect(leaked()).to.deep.equal([]);
+			});
 		});
 	});
 

@@ -208,8 +208,14 @@ export class SqliteStorage implements IStorageBackend {
 		this.db.pragma('busy_timeout = 5000');
 		this._createTables();
 		this._fillPaymentCreatedAt();
-		if (this.encryptionKey) {
-			this._encryptExistingData();
+		if (this.encryptionKey && this._encryptExistingData()) {
+			// UPDATE leaves the old plaintext in freed pages. secure_delete
+			// would clear only what this pass frees, not free pages left by
+			// earlier plaintext writes, so VACUUM rebuilds the file. The
+			// checkpoint then copies it from the WAL over the old pages and
+			// empties the WAL.
+			this.db.exec('VACUUM');
+			this.checkpoint();
 		}
 		// The sidecars exist now; any left by an older release are tightened.
 		this._restrictFileModes();
@@ -333,6 +339,7 @@ export class SqliteStorage implements IStorageBackend {
 	 * Rewrite any plaintext rows in the sensitive tables as encrypted values,
 	 * in a single transaction. Idempotent: rows already carrying the 'enc1:'
 	 * prefix are skipped, so reopening an already-encrypted database is a no-op.
+	 * Returns whether any row was rewritten.
 	 *
 	 * Every open with a key runs this, so SQL picks the candidates: a row comes
 	 * back only when one of its columns is not NULL and does not start with
@@ -343,10 +350,11 @@ export class SqliteStorage implements IStorageBackend {
 	 * bytes, which never equal TEXT, so such rows still come back, and that
 	 * check still decides.
 	 */
-	private _encryptExistingData(): void {
+	private _encryptExistingData(): boolean {
 		const key = this.encryptionKey;
-		if (!key) return;
-		this.db.transaction(() => {
+		if (!key) return false;
+		return this.db.transaction(() => {
+			let rewritten = false;
 			for (const { table, pk, columns } of SqliteStorage.ENCRYPTED_COLUMNS) {
 				const plaintext = columns.map(
 					(col) => `(${col} IS NOT NULL AND substr(${col}, 1, ?) IS NOT ?)`
@@ -378,8 +386,10 @@ export class SqliteStorage implements IStorageBackend {
 							`UPDATE ${table} SET ${updates.join(', ')} WHERE ${pk} = ?`
 						)
 						.run(...params);
+					rewritten = true;
 				}
 			}
+			return rewritten;
 		})();
 	}
 
