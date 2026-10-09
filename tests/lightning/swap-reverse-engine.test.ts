@@ -278,6 +278,44 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			);
 		});
 
+		it('caps unpaid swaps across every peer, so fresh identities cannot bypass the per-peer quota (issue #1458)', async function () {
+			const h = await harness({ config: { maxUnpaidSwaps: 6 } });
+			let accepted = 0;
+			for (const name of ['a', 'b', 'c', 'd', 'e']) {
+				const from = h.net.add(`sybil-${name}`);
+				h.net.connect(h.provider, from);
+				for (let i = 0; i < 4; i++) {
+					const ack = await create(h, clientSwap(), { from });
+					if (ack.accepted) accepted++;
+					else expect(ack.reasonText).to.match(/unpaid swaps on this provider/);
+				}
+				// Its rows still count once it is gone.
+				h.net.disconnect(h.provider, from);
+			}
+			expect(accepted).to.equal(6);
+			expect(h.ledger.list()).to.have.length(6);
+			expect(h.holds.invoices.size).to.equal(6);
+
+			// Refused before any row or invoice is written.
+			const fresh = h.net.add('sybil-f');
+			h.net.connect(h.provider, fresh);
+			const late = clientSwap();
+			const lateHex = late.paymentHash.toString('hex');
+			expect((await create(h, late, { from: fresh })).reason).to.equal(
+				SwapRefusalReason.RATE_LIMITED
+			);
+			expect(h.ledger.byPaymentHash(lateHex)).to.be.empty;
+			expect(h.holds.invoices.has(lateHex)).to.equal(false);
+
+			// An expired invoice gives its slot back.
+			const first = h.ledger.list()[0];
+			h.ledger.patch(first.id, { invoiceExpiresAt: 1 });
+			await h.engine.onBlock(1001);
+			expect(h.ledger.get(first.id)!.state).to.equal('CANCELLED');
+			const ack = await create(h, late, { from: fresh });
+			expect(ack.accepted, ack.reasonText).to.equal(true);
+		});
+
 		it('answers quotes and creates without scanning the ledger (issue #1388)', async function () {
 			const h = await harness();
 			const fullScan = (): never => {

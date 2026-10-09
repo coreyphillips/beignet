@@ -208,7 +208,13 @@ even types required, odd optional):
 The client receives exactly `onchainAmountSat`; the invoice is that plus
 `totalFeeSat` (flat + ppm + the quoted funding miner fee). The swap id is
 derived from the peer and the hash, so an identical repeated create returns
-the same ack and any other reuse of a hash is refused. `verifyReverseSwapTerms`
+the same ack and any other reuse of a hash is refused. A create is also
+refused (`RATE_LIMITED`) while its peer has `maxCreatedPerPeer` (default 4)
+unpaid rows, or while the provider has `maxUnpaidSwaps` (default 64, node
+config `swaps.timeouts.maxUnpaidSwaps`) rows in CREATED across every peer,
+connected or not: each keeps a row and a hold invoice until its invoice
+expires, and the exposure caps only count a row once it is held.
+`verifyReverseSwapTerms`
 (`client.ts`) is the pure check a client runs before paying: it rebuilds the
 contract from its own hash and claim key plus the ack's refund key and height
 and requires the ack's script, address, invoice and amounts to agree. It also

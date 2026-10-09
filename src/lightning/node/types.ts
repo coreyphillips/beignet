@@ -1453,6 +1453,8 @@ export interface ISwapNodeConfig {
 		refundBumpIntervalBlocks?: number;
 		maxFundingAttempts?: number;
 		maxCreatedPerPeer?: number;
+		/** Unpaid reverse swaps across every peer (default 64). */
+		maxUnpaidSwaps?: number;
 	};
 	/**
 	 * The submarine direction (on-chain to Lightning, issue #743): off by
