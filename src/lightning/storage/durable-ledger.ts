@@ -125,6 +125,9 @@ export class MemoryLedgerStore<R extends ILedgerRecord>
  * A row that no longer decodes cannot be served, so its engine forgets the
  * record. `loadAll` reports its metadata key to `onCorruptRow` and leaves
  * the row and its index entry as stored, so it is skipped, not erased.
+ * A malformed index hides every row: `loadAll` reports the index key and
+ * returns nothing, and `put` and `delete` throw before writing, so the
+ * index and the rows it names stay as stored.
  */
 export class MetadataLedgerStore<R extends ILedgerRecord>
 	implements IDurableLedgerStore<R>
@@ -152,17 +155,29 @@ export class MetadataLedgerStore<R extends ILedgerRecord>
 		return `${this.prefix}:index`;
 	}
 
-	private loadIndex(): string[] {
+	/** The stored ids, or null when the index is not a JSON array of strings. */
+	private readIndex(): string[] | null {
 		const raw = this.storage.loadMetadata(this.indexKey());
 		if (!raw) return [];
 		try {
 			const parsed = JSON.parse(raw) as unknown;
-			return Array.isArray(parsed)
-				? parsed.filter((x): x is string => typeof x === 'string')
-				: [];
+			return Array.isArray(parsed) &&
+				parsed.every((x): x is string => typeof x === 'string')
+				? parsed
+				: null;
 		} catch {
-			return [];
+			return null;
 		}
+	}
+
+	/**
+	 * The stored ids, for a write that rewrites the index. Throws on a
+	 * malformed index: rewriting it would drop every id it still names.
+	 */
+	private loadIndex(): string[] {
+		const ids = this.readIndex();
+		if (!ids) throw new Error(`malformed ledger index: ${this.indexKey()}`);
+		return ids;
 	}
 
 	private saveIndex(ids: string[]): void {
@@ -176,12 +191,20 @@ export class MetadataLedgerStore<R extends ILedgerRecord>
 	}
 
 	loadAll(): R[] {
-		const stored = this.scanRows
-			? this.storage.loadMetadataByPrefix!(this.rowKey(''))
-			: this.loadIndex().map((id) => {
-					const key = this.rowKey(id);
-					return { key, value: this.storage.loadMetadata(key) };
-			  });
+		let stored: Array<{ key: string; value: string | null }>;
+		if (this.scanRows) {
+			stored = this.storage.loadMetadataByPrefix!(this.rowKey(''));
+		} else {
+			const ids = this.readIndex();
+			if (!ids) {
+				this.onCorruptRow?.(this.indexKey());
+				return [];
+			}
+			stored = ids.map((id) => {
+				const key = this.rowKey(id);
+				return { key, value: this.storage.loadMetadata(key) };
+			});
+		}
 		const out: R[] = [];
 		for (const { key, value } of stored) {
 			if (!value) continue;
@@ -194,13 +217,12 @@ export class MetadataLedgerStore<R extends ILedgerRecord>
 
 	put(record: R): void {
 		this.storage.transaction(() => {
+			const ids = this.scanRows ? null : this.loadIndex();
 			this.storage.saveMetadata(
 				this.rowKey(record.id),
 				this.codec.encode(record)
 			);
-			if (this.scanRows) return;
-			const ids = this.loadIndex();
-			if (!ids.includes(record.id)) {
+			if (ids && !ids.includes(record.id)) {
 				ids.push(record.id);
 				this.saveIndex(ids);
 			}
@@ -213,8 +235,8 @@ export class MetadataLedgerStore<R extends ILedgerRecord>
 			return;
 		}
 		this.storage.transaction(() => {
-			this.storage.saveMetadata(this.rowKey(id), '');
 			const ids = this.loadIndex().filter((x) => x !== id);
+			this.storage.saveMetadata(this.rowKey(id), '');
 			this.saveIndex(ids);
 		});
 	}

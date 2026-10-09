@@ -252,6 +252,45 @@ describe('DurableLedger (issue #708 infrastructure)', () => {
 		expect(kv.rows.get('toy:index'), 'index left as stored').to.equal(index);
 	});
 
+	it('MetadataLedgerStore reports a malformed index and refuses to rewrite it (issue #1435)', () => {
+		const codec = {
+			encode: (r: IToyRecord): string => JSON.stringify(r),
+			decode: (s: string): IToyRecord => JSON.parse(s) as IToyRecord
+		};
+		for (const malformed of ['["funded"', '{}', '["funded",5]']) {
+			// No rollback, so a refused write must not have written anything.
+			const kv = new FakeKv();
+			kv.transaction = <T>(fn: () => T): T => fn();
+			const first = new DurableLedger<IToyRecord>(
+				new MetadataLedgerStore<IToyRecord>(kv, 'toy', codec)
+			);
+			first.rehydrate();
+			first.insert({ id: 'funded', state: 'A' });
+			kv.rows.set('toy:index', malformed);
+			const stored = new Map(kv.rows);
+
+			const reported: string[] = [];
+			const store = new MetadataLedgerStore<IToyRecord>(
+				kv,
+				'toy',
+				codec,
+				(key) => reported.push(key)
+			);
+			const second = new DurableLedger<IToyRecord>(store);
+			expect(second.rehydrate(), malformed).to.equal(0);
+			expect(reported, malformed).to.deep.equal(['toy:index']);
+			expect(second.insert({ id: 'new', state: 'A' }).outcome).to.equal(
+				'storage_failed'
+			);
+			expect(() => store.delete('funded')).to.throw(
+				'malformed ledger index: toy:index'
+			);
+			expect(kv.rows, `${malformed}: metadata left as stored`).to.deep.equal(
+				stored
+			);
+		}
+	});
+
 	it('MetadataLedgerStore rides the real SQLite metadata table transactionally', () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-ledger-'));
 		const db = new SqliteStorage(path.join(dir, 'node.db'));
