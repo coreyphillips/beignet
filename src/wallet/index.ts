@@ -5227,6 +5227,21 @@ export class Wallet {
 			}
 			const updateFeeRes = this.transaction.updateFee({ satsPerByte });
 			if (updateFeeRes.isErr()) return err(updateFeeRes.error.message);
+			// updateFee priced only the coins the wallet's coinSelectPreference
+			// selects, so build from those coins, as sendMany does.
+			const staged = this.transaction.data;
+			const coinSelectRes = this.transaction.autoCoinSelect({
+				inputs: staged.inputs,
+				outputs: staged.outputs,
+				satsPerByte: staged.satsPerByte,
+				changeAddress: staged.changeAddress,
+				message: staged.message,
+				coinSelectPreference: this.coinSelectPreference
+			});
+			if (coinSelectRes.isErr()) return err(coinSelectRes.error.message);
+			await this.transaction.applyAutoCoinSelect({
+				coinSelectRes: coinSelectRes.value
+			});
 			const psbtRes = await this.transaction.createUnsignedPsbt({
 				shuffleOutputs
 			});

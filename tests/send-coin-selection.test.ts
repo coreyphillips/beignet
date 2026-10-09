@@ -1,10 +1,11 @@
 /**
- * sendMany builds from the coins it priced (#1360). Fully OFFLINE: the wallet
- * points at an unreachable Electrum port, UTXOs are injected into wallet data,
- * and nothing is broadcast (broadcast: false).
+ * sendMany and buildPsbt build from the coins they priced (#1360, #1431).
+ * Fully OFFLINE: the wallet points at an unreachable Electrum port, UTXOs are
+ * injected into wallet data, and nothing is broadcast.
  *
  * With any coinSelectPreference but consolidate, updateFee priced the subset
- * autoCoinSelect picks, while createTransaction built from every staged UTXO.
+ * autoCoinSelect picks, while createTransaction and createUnsignedPsbt built
+ * from every staged UTXO.
  * The change output absorbed the extra inputs and the transaction went out at
  * about half the requested rate.
  */
@@ -155,6 +156,27 @@ describe('sendMany coin selection (#1360)', function () {
 
 		expect(tx.ins).to.have.length(5);
 		expect(feeOf(tx)).to.equal(wallet.transaction.data.fee);
+		expect(feeOf(tx) / tx.virtualSize()).to.be.at.least(10);
+	});
+
+	it('builds a PSBT from the selected coins at the requested rate (#1431)', async function () {
+		wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
+
+		const built = await wallet.buildPsbt({
+			address: RECIPIENT,
+			amount: 15_000,
+			satsPerByte: 10
+		});
+		if (built.isErr()) throw built.error;
+		const signed = wallet.signPsbtWithOurKey(built.value.psbtBase64);
+		if (signed.isErr()) throw signed.error;
+		const imported = wallet.importSignedPsbt(signed.value);
+		if (imported.isErr()) throw imported.error;
+		const tx = BitcoinTransaction.fromHex(imported.value.txHex);
+
+		expect(tx.ins).to.have.length(2);
+		expect(built.value.inputs).to.have.length(2);
+		expect(feeOf(tx)).to.equal(built.value.fee);
 		expect(feeOf(tx) / tx.virtualSize()).to.be.at.least(10);
 	});
 });
