@@ -16774,12 +16774,18 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 		pubkey = normalizeHexPubkey(pubkey);
+		// A sync that ended IDLE keeps the repair it could not finish, and its
+		// peer may stay connected, so the repair moves to this sync.
+		for (const syncMgr of this.gossipSyncManagers.values()) {
+			if (syncMgr.releaseRepair()) this.gossipRepairPending = true;
+		}
 		const mgr = this.getOrCreateSyncManager(pubkey);
 		const messages = mgr.initiateSync(this.gossipRepairPending);
 		for (const msg of messages) {
 			this.emitOutbound(pubkey, msg.type, msg.payload);
 		}
-		// The manager holds the repair now. Its disconnect hands it back.
+		// The manager holds the repair now. Its disconnect hands it back, and
+		// so does the next sync started after it ends IDLE.
 		this.gossipRepairPending = false;
 	}
 

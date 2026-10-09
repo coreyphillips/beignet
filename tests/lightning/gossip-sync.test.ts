@@ -1154,6 +1154,42 @@ describe('Gossip Sync (Phase 5)', function () {
 				expect(synced).to.equal(false);
 			});
 
+			it('releases the repair only once the sync has ended (issue #1461)', function () {
+				const graph = new NetworkGraph();
+				const known = populateGraph(graph, 3).map((s) => s.toString('hex'));
+				const mgr = new GossipSyncManager(graph);
+
+				mgr.initiateSync(true);
+				expect(mgr.releaseRepair()).to.equal(false);
+				expect(mgr.repairPending).to.equal(true);
+
+				clock.tick(TIMEOUT * 3);
+				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+				expect(mgr.releaseRepair()).to.equal(true);
+				expect(mgr.repairPending).to.equal(false);
+				expect(mgr.releaseRepair()).to.equal(false);
+
+				// Released: the next sync asks only for what is missing.
+				expectStoreFilter(offerReply(mgr, known));
+				expect(mgr.getState()).to.equal(GossipSyncState.SYNCED);
+			});
+
+			it('ends IDLE on an empty range while a marker is owed, after the repair was released (issue #1461)', function () {
+				const mgr = new GossipSyncManager(new NetworkGraph());
+				let synced = false;
+				mgr.on('synced', () => {
+					synced = true;
+				});
+
+				startSync(mgr, 1);
+				clock.tick(TIMEOUT * 3);
+				expect(mgr.releaseRepair()).to.equal(true);
+
+				expectStoreFilter(offerReply(mgr, []));
+				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+				expect(synced).to.equal(false);
+			});
+
 			it('asks for the range again when its final reply never arrives', function () {
 				const mgr = new GossipSyncManager(new NetworkGraph());
 				const timeouts = timeoutsOf(mgr);
@@ -2450,12 +2486,12 @@ describe('Gossip Sync (Phase 5)', function () {
 				node.destroy();
 			});
 
-			function startSync(count: number): void {
+			function startSync(count: number, pubkey = peerPubkey): void {
 				const scids: Buffer[] = [];
 				for (let i = 0; i < count; i++) scids.push(makeScid(1000 + i, 1, 0));
-				node.initiateGossipSync(peerPubkey);
+				node.initiateGossipSync(pubkey);
 				node.handlePeerMessage(
-					peerPubkey,
+					pubkey,
 					MessageType.REPLY_CHANNEL_RANGE,
 					encodeReplyChannelRangeMessage({
 						chainHash: REGTEST_CHAIN_HASH,
@@ -2609,6 +2645,62 @@ describe('Gossip Sync (Phase 5)', function () {
 				} finally {
 					statics.GOSSIP_INTAKE_MAX = saved;
 				}
+			});
+
+			describe('a repair kept by a peer that stays connected (issue #1461)', function () {
+				const holder = 'bb'.repeat(33);
+				const next = 'cc'.repeat(33);
+				const statics = LightningNode as unknown as {
+					GOSSIP_INTAKE_MAX: number;
+				};
+				let saved: number;
+
+				beforeEach(async function () {
+					saved = statics.GOSSIP_INTAKE_MAX;
+					statics.GOSSIP_INTAKE_MAX = 1;
+					startSync(1);
+					sendAnnouncement(queries[0][0], 0);
+					// The intake is full, so this is dropped.
+					sendAnnouncement(queries[0][0], 0);
+					node.getPeerManager()!.emit('peer:disconnect', peerPubkey);
+					await node.flushGossip();
+					expect(node.getGraph().getChannelCount()).to.equal(1);
+				});
+
+				afterEach(function () {
+					statics.GOSSIP_INTAKE_MAX = saved;
+				});
+
+				it('goes to the next sync after the holder lists no channels', function () {
+					startSync(0, holder);
+					expect(node.getGossipSyncState(holder)).to.equal(
+						GossipSyncState.IDLE
+					);
+
+					startSync(1, next);
+					expect(queries).to.have.length(2);
+					expect(queries[1]).to.eql(queries[0]);
+				});
+
+				it('goes to the next sync after every range query to the holder timed out', async function () {
+					const timeouts = GossipSyncManager as unknown as {
+						REPLY_TIMEOUT_MS: number;
+					};
+					const savedTimeout = timeouts.REPLY_TIMEOUT_MS;
+					timeouts.REPLY_TIMEOUT_MS = 20;
+					try {
+						node.initiateGossipSync(holder);
+						await waitFor(
+							() => node.getGossipSyncState(holder) === GossipSyncState.IDLE
+						);
+					} finally {
+						timeouts.REPLY_TIMEOUT_MS = savedTimeout;
+					}
+
+					startSync(1, next);
+					expect(queries).to.have.length(2);
+					expect(queries[1]).to.eql(queries[0]);
+				});
 			});
 
 			it('asks for the whole store after the sync when gossip outside the batch was dropped (issue #1281)', async function () {
