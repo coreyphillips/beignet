@@ -684,7 +684,7 @@ describe('Storage Encryption', function () {
 				again.storage.close();
 			});
 
-			it('leaves no migrated plaintext in the database or WAL file', function () {
+			describe('scrubbing the migrated plaintext', function () {
 				// Forty held parts serialize past 10 KB, so each value spans
 				// overflow pages that the encrypted rewrite frees.
 				const digest = (label: string): string =>
@@ -699,45 +699,135 @@ describe('Storage Encryption', function () {
 				}));
 				const held = JSON.stringify(parts);
 				const wallet = JSON.stringify({ utxos: parts });
-				expect(held.length).to.be.greaterThan(10_000);
 				const secrets = parts.flatMap((part) => [
 					part.paymentHashHex,
 					part.inChannelIdHex,
 					part.amountMsat
 				]);
-				const leaked = (): string[] => {
+
+				/** The secrets readable in the raw database and WAL files. */
+				function leaked(): string[] {
 					const raw = readRawDbBytes(dbPath);
 					return secrets.filter((secret) => raw.includes(secret));
-				};
+				}
 
-				const plain = new SqliteStorage(dbPath);
-				plain.open({ synchronous: 'NORMAL' });
-				plain.saveMetadata('jit:held', held);
-				plain.saveWalletData('wallet', wallet);
-				plain.close();
-				expect(leaked()).to.deep.equal(secrets);
+				function savePlaintext(): void {
+					expect(held.length).to.be.greaterThan(10_000);
+					const plain = new SqliteStorage(dbPath);
+					plain.open({ synchronous: 'NORMAL' });
+					plain.saveMetadata('jit:held', held);
+					plain.saveWalletData('wallet', wallet);
+					plain.close();
+					expect(leaked()).to.deep.equal(secrets);
+				}
 
-				const storage = openEncrypted();
-				// Straight after open, before the caller checkpoints or closes;
-				// the WAL is read alongside the file.
-				expect(leaked()).to.deep.equal([]);
-				expect(storage.loadMetadata('jit:held')).to.equal(held);
-				expect(storage.loadWalletData('wallet')).to.equal(wallet);
-				storage.checkpoint();
-				storage.close();
-				expect(leaked()).to.deep.equal([]);
-				const stored = storedValues();
-				expect(isEncryptedValue(stored['metadata/jit:held/value'] as string)).to
-					.be.true;
-				expect(isEncryptedValue(stored['wallet_data/wallet/value'] as string))
-					.to.be.true;
+				function scrubPending(storage: SqliteStorage): boolean {
+					const row = rawDb(storage)
+						.prepare('SELECT 1 FROM encryption_scrub_pending')
+						.get();
+					return row !== undefined;
+				}
 
-				const again = openEncrypted();
-				expect(again.loadMetadata('jit:held')).to.equal(held);
-				expect(again.loadWalletData('wallet')).to.equal(wallet);
-				again.close();
-				expect(storedValues()).to.deep.equal(stored);
-				expect(leaked()).to.deep.equal([]);
+				it('leaves no migrated plaintext in the database or WAL file', function () {
+					savePlaintext();
+					const storage = openEncrypted();
+					// Straight after open, before the caller checkpoints or
+					// closes; the WAL is read alongside the file.
+					expect(leaked()).to.deep.equal([]);
+					expect(scrubPending(storage)).to.equal(false);
+					expect(storage.loadMetadata('jit:held')).to.equal(held);
+					expect(storage.loadWalletData('wallet')).to.equal(wallet);
+					storage.checkpoint();
+					storage.close();
+					expect(leaked()).to.deep.equal([]);
+					const stored = storedValues();
+					expect(isEncryptedValue(stored['metadata/jit:held/value'] as string))
+						.to.be.true;
+					expect(isEncryptedValue(stored['wallet_data/wallet/value'] as string))
+						.to.be.true;
+
+					const again = openEncrypted();
+					expect(again.loadMetadata('jit:held')).to.equal(held);
+					expect(again.loadWalletData('wallet')).to.equal(wallet);
+					again.close();
+					expect(storedValues()).to.deep.equal(stored);
+					expect(leaked()).to.deep.equal([]);
+				});
+
+				it('retries a failed VACUUM on the next open', function () {
+					savePlaintext();
+					const storage = new SqliteStorage(dbPath, undefined, {
+						encryptionKey: TEST_KEY
+					});
+					const db = rawDb(storage);
+					const exec = db.exec.bind(db);
+					const stub = sinon.stub(db, 'exec').callsFake((source: string) => {
+						if (source === 'VACUUM') {
+							throw new Error('SQLITE_FULL: database or disk is full');
+						}
+						return exec(source);
+					});
+					try {
+						storage.open({ synchronous: 'NORMAL' });
+					} finally {
+						stub.restore();
+					}
+					expect(scrubPending(storage)).to.equal(true);
+					expect(storage.loadMetadata('jit:held')).to.equal(held);
+					storage.checkpoint();
+					storage.close();
+					expect(leaked()).to.not.be.empty;
+
+					const again = openEncrypted();
+					expect(leaked()).to.deep.equal([]);
+					expect(scrubPending(again)).to.equal(false);
+					expect(again.loadMetadata('jit:held')).to.equal(held);
+					expect(again.loadWalletData('wallet')).to.equal(wallet);
+					again.close();
+				});
+
+				it('retries a checkpoint a reader held back on the next open', function () {
+					savePlaintext();
+					// A read transaction from before the migration pins the
+					// plaintext pages, so the checkpoint cannot copy over them.
+					const reader = new Database(dbPath);
+					reader.exec('BEGIN');
+					reader.prepare('SELECT value FROM metadata').get();
+					const storage = new SqliteStorage(dbPath, undefined, {
+						encryptionKey: TEST_KEY
+					});
+					const db = rawDb(storage);
+					const pragma = db.pragma.bind(db);
+					// No busy timeout, so the blocked checkpoint returns at once
+					// instead of after five seconds.
+					const stub = sinon
+						.stub(db, 'pragma')
+						.callsFake((source: string, options?: Database.PragmaOptions) =>
+							pragma(
+								source === 'busy_timeout = 5000' ? 'busy_timeout = 0' : source,
+								options
+							)
+						);
+					try {
+						storage.open({ synchronous: 'NORMAL' });
+					} finally {
+						stub.restore();
+					}
+					expect(scrubPending(storage)).to.equal(true);
+					expect(leaked()).to.not.be.empty;
+					reader.exec('COMMIT');
+					reader.close();
+
+					// The first connection stays open, so no close-time
+					// checkpoint can do the scrub's work.
+					const again = openEncrypted();
+					expect(leaked()).to.deep.equal([]);
+					expect(scrubPending(again)).to.equal(false);
+					expect(again.loadMetadata('jit:held')).to.equal(held);
+					expect(again.loadWalletData('wallet')).to.equal(wallet);
+					again.close();
+					storage.close();
+				});
 			});
 		});
 	});

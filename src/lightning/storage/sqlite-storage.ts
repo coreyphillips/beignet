@@ -208,14 +208,9 @@ export class SqliteStorage implements IStorageBackend {
 		this.db.pragma('busy_timeout = 5000');
 		this._createTables();
 		this._fillPaymentCreatedAt();
-		if (this.encryptionKey && this._encryptExistingData()) {
-			// UPDATE leaves the old plaintext in freed pages. secure_delete
-			// would clear only what this pass frees, not free pages left by
-			// earlier plaintext writes, so VACUUM rebuilds the file. The
-			// checkpoint then copies it from the WAL over the old pages and
-			// empties the WAL.
-			this.db.exec('VACUUM');
-			this.checkpoint();
+		if (this.encryptionKey) {
+			this._encryptExistingData();
+			this._scrubMigratedPlaintext();
 		}
 		// The sidecars exist now; any left by an older release are tightened.
 		this._restrictFileModes();
@@ -339,7 +334,7 @@ export class SqliteStorage implements IStorageBackend {
 	 * Rewrite any plaintext rows in the sensitive tables as encrypted values,
 	 * in a single transaction. Idempotent: rows already carrying the 'enc1:'
 	 * prefix are skipped, so reopening an already-encrypted database is a no-op.
-	 * Returns whether any row was rewritten.
+	 * Rewriting any row marks a scrub pending (see _scrubMigratedPlaintext).
 	 *
 	 * Every open with a key runs this, so SQL picks the candidates: a row comes
 	 * back only when one of its columns is not NULL and does not start with
@@ -350,10 +345,10 @@ export class SqliteStorage implements IStorageBackend {
 	 * bytes, which never equal TEXT, so such rows still come back, and that
 	 * check still decides.
 	 */
-	private _encryptExistingData(): boolean {
+	private _encryptExistingData(): void {
 		const key = this.encryptionKey;
-		if (!key) return false;
-		return this.db.transaction(() => {
+		if (!key) return;
+		this.db.transaction(() => {
 			let rewritten = false;
 			for (const { table, pk, columns } of SqliteStorage.ENCRYPTED_COLUMNS) {
 				const plaintext = columns.map(
@@ -389,8 +384,40 @@ export class SqliteStorage implements IStorageBackend {
 					rewritten = true;
 				}
 			}
-			return rewritten;
+			// Committed with the rewrite, so a crash before the scrub still
+			// leaves it pending for the next open.
+			if (rewritten) {
+				this.db.exec(
+					'INSERT OR IGNORE INTO encryption_scrub_pending (id) VALUES (1)'
+				);
+			}
 		})();
+	}
+
+	/**
+	 * Remove the plaintext an encryption pass replaced, if a scrub is pending.
+	 * UPDATE leaves the old plaintext in freed pages. secure_delete would
+	 * clear only what the pass frees, not free pages left by earlier
+	 * plaintext writes, so VACUUM rebuilds the file. The checkpoint then
+	 * copies it from the WAL over the old pages and empties the WAL. A full
+	 * disk can fail the VACUUM and a reader on another connection can hold
+	 * the checkpoint back. Neither should stop the open, so the marker stays
+	 * and the next open tries again.
+	 */
+	private _scrubMigratedPlaintext(): void {
+		const pending = this.db
+			.prepare('SELECT 1 FROM encryption_scrub_pending')
+			.get();
+		if (!pending) return;
+		try {
+			this.db.exec('VACUUM');
+		} catch {
+			return;
+		}
+		const [{ busy }] = this.db.pragma('wal_checkpoint(TRUNCATE)') as Array<{
+			busy: number;
+		}>;
+		if (busy === 0) this.db.exec('DELETE FROM encryption_scrub_pending');
 	}
 
 	/**
@@ -668,6 +695,12 @@ export class SqliteStorage implements IStorageBackend {
 			CREATE TABLE IF NOT EXISTS wallet_data (
 				key TEXT PRIMARY KEY,
 				value TEXT NOT NULL
+			);
+
+			-- One row while freed pages or the WAL may still hold plaintext
+			-- the encryption pass replaced (see _scrubMigratedPlaintext).
+			CREATE TABLE IF NOT EXISTS encryption_scrub_pending (
+				id INTEGER PRIMARY KEY
 			);
 		`);
 
