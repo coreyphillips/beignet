@@ -595,6 +595,57 @@ describe('Submarine swap provider engine (issue #743)', function () {
 				SwapRefusalReason.INTERNAL
 			);
 		});
+
+		it('caps unpaid swaps across every peer, so sybil creates cannot grow the per-block chain lookups (issue #1392)', async function () {
+			const h = await submarineHarness({ config: { maxUnpaidSwaps: 6 } });
+			let accepted = 0;
+			for (const name of ['a', 'b', 'c', 'd', 'e']) {
+				const from = h.net.add(`sybil-${name}`);
+				h.net.connect(h.provider, from);
+				for (let i = 0; i < 4; i++) {
+					const { ack } = await create(h, submarineClient(), { from });
+					if (ack.accepted) accepted++;
+					else expect(ack.reasonText).to.match(/unpaid swaps on this provider/);
+				}
+			}
+			expect(accepted).to.equal(6);
+			expect(h.ledger.list()).to.have.length(6);
+			let lookups = 0;
+			const history = h.chain.getScriptHashHistory.bind(h.chain);
+			h.chain.getScriptHashHistory = (
+				scriptHash: string
+			): ReturnType<typeof history> => {
+				lookups++;
+				return history(scriptHash);
+			};
+			await tick(h);
+			expect(lookups).to.equal(6);
+
+			// A funded row still counts; one that has paid no longer does.
+			const client = submarineClient();
+			expect((await create(h, client)).ack.reason).to.equal(
+				SwapRefusalReason.RATE_LIMITED
+			);
+			const first = h.ledger.list()[0];
+			const funding = fundContract(
+				h.chain,
+				Buffer.from(first.outputScriptHex, 'hex'),
+				AMOUNT,
+				0
+			);
+			await tick(h);
+			expect(h.ledger.get(first.id)!.state).to.equal('FUNDING_SEEN');
+			expect((await create(h, client)).ack.reason).to.equal(
+				SwapRefusalReason.RATE_LIMITED
+			);
+			expect(h.ledger.byPaymentHash(client.paymentHash.toString('hex'))).to.be
+				.empty;
+			h.chain.confirm(funding.getId(), h.chain.height);
+			await tick(h);
+			expect(h.ledger.get(first.id)!.state).to.equal('PAYING');
+			const { ack } = await create(h, client);
+			expect(ack.accepted, ack.reasonText).to.equal(true);
+		});
 	});
 
 	describe('funding', function () {

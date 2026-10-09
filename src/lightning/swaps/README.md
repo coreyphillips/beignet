@@ -341,7 +341,11 @@ claimSafetyBlocks - resolutionSafetyBlocks` and the fit is `height +
 fundingConfirmations + routeCltvBudgetBlocks + min_final_cltv_expiry + 3 <=
 C` (`CLTV_UNFITTABLE` otherwise, FAILED when it stops holding before the
 payment goes out); `validateSubmarineSwapAdmission` is run on the same
-numbers.
+numbers. A create is also refused (`RATE_LIMITED`) while its peer has
+`maxCreatedPerPeer` unfunded rows, or while the provider has `maxUnpaidSwaps`
+(default 64) rows in CREATED, FUNDING_SEEN, FUNDED or FUNDING_LOST: each is
+looked up on chain every block, and the exposure caps only count a row once
+it has paid.
 
 Lifecycle, every arrow a compare-and-swap on the ledger row, persisted BEFORE
 the action it licenses:

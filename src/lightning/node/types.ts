@@ -1473,6 +1473,8 @@ export interface ISwapNodeConfig {
 		paymentMaxFeePpm?: number;
 		claimBumpIntervalBlocks?: number;
 		minInvoiceExpirySeconds?: number;
+		/** Swaps nothing has been paid for yet, across every peer (default 64). */
+		maxUnpaidSwaps?: number;
 	};
 	/**
 	 * A chain view for the provider that wins over the node's chain backend.
