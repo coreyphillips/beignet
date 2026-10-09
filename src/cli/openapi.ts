@@ -2742,7 +2742,9 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description:
 								'SPENDING_LIMIT_EXCEEDED: the advisor fee budget for the day does not fit the remaining dailySpendLimitSats'
 						},
-						'409': { description: 'SERVICE_DRAINING' }
+						'409': {
+							description: 'SERVICE_DRAINING, or NODE_DESTROYED during shutdown'
+						}
 					}
 				}
 			},
