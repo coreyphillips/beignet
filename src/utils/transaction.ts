@@ -375,10 +375,12 @@ export const getByteCount = (
 					totalWeight += weight * count;
 				}
 				inputCount += count;
-				// Any segwit input needs the 2-WU marker+flag. P2TR is segwit (v1) but
-				// has no 'W' in its name, so it was missed here and every taproot-only
-				// tx under-counted the witness overhead by 2 WU.
-				if (count > 0 && (key.indexOf('W') >= 0 || key === 'P2TR'))
+				// P2SH inputs use nested SegWit here, so they need the witness marker
+				// and flag even though the address type has no 'W'.
+				if (
+					count > 0 &&
+					(key.indexOf('W') >= 0 || key === 'P2TR' || key === 'P2SH')
+				)
 					hasWitness = true;
 			}
 		);

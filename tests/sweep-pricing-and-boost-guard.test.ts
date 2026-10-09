@@ -17,6 +17,7 @@ import tls from 'tls';
 import sinon from 'sinon';
 import {
 	address as bitcoinAddress,
+	networks,
 	Transaction as BitcoinTransaction
 } from 'bitcoinjs-lib';
 
@@ -368,6 +369,62 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			expect(fee).to.equal(quotedFee);
 			// More than the original, by its own size at 1 sat/vB (BIP 125).
 			expect(fee - 10_000).to.be.at.least(tx.virtualSize());
+		});
+
+		it('covers the incremental relay fee for a signed nested SegWit replacement', async function () {
+			const source = wallet.data.addressIndex[EAddressType.p2sh];
+			const change = wallet.data.changeAddressIndex[EAddressType.p2sh].address;
+			const previous = new BitcoinTransaction();
+			previous.addInput(Buffer.alloc(32, 1), 0);
+			const script = bitcoinAddress.toOutputScript(
+				source.address,
+				networks.regtest
+			);
+			previous.addOutput(script, 100_000);
+			previous.addOutput(script, 100_000);
+			const originalFee = 2_550;
+			wallet.feeEstimates = { ...wallet.feeEstimates, fast: 2, slow: 1 };
+			sinon.stub(wallet, 'getRbfData').resolves(
+				ok({
+					inputs: [0, 1].map((index) => ({
+						...source,
+						index,
+						height: 0,
+						tx_hash: previous.getId(),
+						tx_pos: index,
+						value: 100_000
+					})),
+					outputs: [
+						{ address: P2WPKH, value: 10_000, index: 0 },
+						{ address: change, value: 187_450, index: 1 }
+					],
+					changeAddress: change,
+					fee: originalFee,
+					balance: 200_000,
+					addressType: EAddressType.p2sh,
+					message: ''
+				})
+			);
+			stubLookups({ [previous.getId()]: { hex: previous.toHex() } });
+
+			const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+			if (res.isErr()) throw res.error;
+			expect(res.value.minFee).to.equal(11);
+			const updated = wallet.transaction.updateFee({
+				satsPerByte: res.value.minFee
+			});
+			if (updated.isErr()) throw updated.error;
+			expect(updated.value.fee).to.equal(res.value.fee);
+			const created = await wallet.transaction.createTransaction({
+				shuffleOutputs: false
+			});
+			if (created.isErr()) throw created.error;
+
+			const tx = BitcoinTransaction.fromHex(created.value.hex);
+			expect(tx.virtualSize()).to.equal(256);
+			const fee = 200_000 - tx.outs.reduce((sum, out) => sum + out.value, 0);
+			expect(fee).to.equal(res.value.fee);
+			expect(fee - originalFee).to.be.at.least(tx.virtualSize());
 		});
 
 		it('refuses when the change cannot pay the replacement floor', async function () {
