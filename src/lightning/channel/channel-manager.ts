@@ -9003,7 +9003,10 @@ export class ChannelManager extends EventEmitter {
 	 * promotes before the txid it names has to exist, and a promoted channel
 	 * survives disconnect and restart (issue #1456). A trusted zero-conf open
 	 * is exempt, since accepting it already trusted the peer's unconfirmed
-	 * funding.
+	 * funding. So is a CLOSED channel: every way into CLOSED either spent the
+	 * funding on chain or ran through NORMAL, even when no confirmation was
+	 * recorded (a v2 open that force-closed first, a resolved restore that no
+	 * longer watches its funding).
 	 */
 	private _pendingInboundOpensFull(peerPubkey: string): boolean {
 		let pending = 0;
@@ -9019,6 +9022,7 @@ export class ChannelManager extends EventEmitter {
 			if (
 				this.channelPeers.get(channelId) !== peerPubkey ||
 				channel.getRole() !== ChannelRole.ACCEPTOR ||
+				channel.getState() === ChannelState.CLOSED ||
 				channel.isFundingKnownOnChain()
 			) {
 				continue;

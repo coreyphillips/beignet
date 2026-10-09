@@ -306,11 +306,12 @@ describe('Pending inbound open cap (issue #1394)', () => {
 describe('Unconfirmed inbound channels keep their quota (issue #1456)', () => {
 	function probeRefused(victim: ChannelManager, probe: ChannelManager): void {
 		const open = offerOpen(probe);
+		const index = victim.nextChannelIndex;
 		expectRefused(
 			victim,
 			open,
 			inbound(victim, PEER_A, MessageType.OPEN_CHANNEL, open.payload),
-			victim.nextChannelIndex
+			index
 		);
 	}
 
@@ -356,6 +357,29 @@ describe('Unconfirmed inbound channels keep their quota (issue #1456)', () => {
 			);
 		}
 		probeRefused(restarted, makeManager('probe-restore', 2000));
+	});
+
+	it('frees the slot of a channel whose close resolved, with no funding confirmation recorded', () => {
+		const victim = makeManager('victim-resolved');
+		const opener = makeManager('opener-resolved', 1000);
+		const probe = makeManager('probe-resolved', 2000);
+		connect(victim, opener);
+		const funded: Buffer[] = [];
+		for (let i = 0; i < 4; i++) {
+			funded.push(fundWithNonexistentTx(victim, opener));
+		}
+		probeRefused(victim, probe);
+
+		const closed = victim.forceClose(
+			funded[0],
+			Buffer.concat([Buffer.from('0014', 'hex'), Buffer.alloc(20, 1)])
+		);
+		expect(closed.ok, closed.error).to.equal(true);
+		expect(victim.markChannelResolved(funded[0])).to.equal(true);
+		expect(victim.getChannel(funded[0])!.isFundingKnownOnChain()).to.equal(
+			false
+		);
+		acceptV1(victim, PEER_A, probe);
 	});
 
 	it('leaves trusted zero-conf opens out of the count', () => {
