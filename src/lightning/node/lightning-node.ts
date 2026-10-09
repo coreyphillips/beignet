@@ -124,6 +124,8 @@ import {
 	IChannelUpdateMessage,
 	INodeAnnouncementMessage,
 	INodeAddress,
+	IQueryChannelRangeMessage,
+	IQueryShortChannelIdsMessage,
 	IRoute,
 	IRouteHop,
 	TGossipVerified,
@@ -956,6 +958,14 @@ const GRAPH_READING_GOSSIP: ReadonlySet<number> = new Set([
 	MessageType.GOSSIP_TIMESTAMP_FILTER
 ]);
 
+/** A peer's gossip query waiting for the query budget (issue #1398). */
+type TGossipQuery =
+	| { type: MessageType.QUERY_CHANNEL_RANGE; msg: IQueryChannelRangeMessage }
+	| {
+			type: MessageType.QUERY_SHORT_CHANNEL_IDS;
+			msg: IQueryShortChannelIdsMessage;
+	  };
+
 /** A cooperative restore of the stored network map (beginGraphRestore). */
 interface IGraphRestoreRun {
 	restore: GossipGraphRestore;
@@ -1163,6 +1173,31 @@ export class LightningNode extends EventEmitter {
 	private gossipIntakeDropped = 0;
 	private static readonly GOSSIP_INTAKE_MAX = 30_000;
 	private static readonly GOSSIP_INTAKE_SLICE_MS = 10;
+	/**
+	 * Peers' gossip queries share this much main-thread time per window
+	 * (issue #1398). A 40-byte query_channel_range scans and sorts the whole
+	 * graph, about 50 ms at NetworkGraph.MAX_CHANNELS, so answering every
+	 * query as it arrives let one peer hold the event loop. Past the budget,
+	 * queries wait in gossipQueries for the next window.
+	 */
+	private static readonly GOSSIP_QUERY_BUDGET_MS = 100;
+	private static readonly GOSSIP_QUERY_WINDOW_MS = 1000;
+	/**
+	 * Queries one peer may have waiting. BOLT 7 has a peer await each reply
+	 * before it asks again, so an honest one waits on at most one of each
+	 * kind; a query past this is dropped.
+	 */
+	private static readonly GOSSIP_QUERIES_PER_PEER = 2;
+	/**
+	 * Waiting queries by peer. Served one per turn from the front peer, which
+	 * then moves to the back, so a flooding peer cannot delay the others by
+	 * more than one query each.
+	 */
+	private gossipQueries = new Map<string, TGossipQuery[]>();
+	private gossipQueryTimer: ReturnType<typeof setTimeout> | null = null;
+	private gossipQueryWindowStart = 0;
+	private gossipQuerySpentMs = 0;
+	private gossipQueriesDropped = 0;
 	/**
 	 * Time slice of a cooperative Rapid Gossip Sync import
 	 * (loadRapidGossipSnapshotAsync), in milliseconds. A mainnet snapshot
@@ -11386,6 +11421,11 @@ export class LightningNode extends EventEmitter {
 		// checks _destroyed so an in-flight slice stops rescheduling.
 		this.gossipIntake = [];
 		this.gossipIntakeHead = 0;
+		this.gossipQueries.clear();
+		if (this.gossipQueryTimer) {
+			clearTimeout(this.gossipQueryTimer);
+			this.gossipQueryTimer = null;
+		}
 		// Anything held behind the barrier is refused rather than left parked.
 		// A shutdown is not permission either, and the barrier's retry timer
 		// must not keep the process alive.
@@ -16306,9 +16346,10 @@ export class LightningNode extends EventEmitter {
 		}
 		switch (type) {
 			// Broadcast gossip is queued, not handled inline: see gossipIntake.
-			// Query/reply traffic stays synchronous below; it is low-volume,
+			// Replies to our queries stay synchronous below; they are
 			// request-scoped, and a sync manager mid-conversation should not
-			// wait behind a queued dump.
+			// wait behind a queued dump. Peers' queries share a time budget:
+			// see gossipQueries.
 			case MessageType.CHANNEL_ANNOUNCEMENT:
 			case MessageType.NODE_ANNOUNCEMENT:
 				this.enqueueBroadcastGossip(pubkey, type, payload);
@@ -16367,24 +16408,18 @@ export class LightningNode extends EventEmitter {
 				}
 				break;
 			}
-			case MessageType.QUERY_CHANNEL_RANGE: {
-				const syncMgr = this.getOrCreateSyncManager(pubkey);
-				const msg = decodeQueryChannelRangeMessage(payload);
-				const responses = syncMgr.handleQueryChannelRange(msg);
-				for (const resp of responses) {
-					this.emitOutbound(pubkey, resp.type, resp.payload);
-				}
+			case MessageType.QUERY_CHANNEL_RANGE:
+				this.admitGossipQuery(pubkey, {
+					type: MessageType.QUERY_CHANNEL_RANGE,
+					msg: decodeQueryChannelRangeMessage(payload)
+				});
 				break;
-			}
-			case MessageType.QUERY_SHORT_CHANNEL_IDS: {
-				const syncMgr = this.getOrCreateSyncManager(pubkey);
-				const msg = decodeQueryShortChannelIdsMessage(payload);
-				const responses = syncMgr.handleQueryShortChannelIds(msg);
-				for (const resp of responses) {
-					this.emitOutbound(pubkey, resp.type, resp.payload);
-				}
+			case MessageType.QUERY_SHORT_CHANNEL_IDS:
+				this.admitGossipQuery(pubkey, {
+					type: MessageType.QUERY_SHORT_CHANNEL_IDS,
+					msg: decodeQueryShortChannelIdsMessage(payload)
+				});
 				break;
-			}
 			case MessageType.GOSSIP_TIMESTAMP_FILTER:
 				// A peer requesting gossip: at minimum send our own announcements so we
 				// propagate into its graph (and onward to explorers). We always include
@@ -16499,6 +16534,107 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Answer a peer's gossip query now if no other query waits and the
+	 * window's budget is not spent, else queue it behind the others.
+	 */
+	private admitGossipQuery(pubkey: string, query: TGossipQuery): void {
+		if (this.gossipQueries.size === 0 && this.gossipQueryBudgetLeft()) {
+			this.serveGossipQuery(pubkey, query);
+			return;
+		}
+		const queued = this.gossipQueries.get(pubkey) ?? [];
+		if (queued.length >= LightningNode.GOSSIP_QUERIES_PER_PEER) {
+			if (this.gossipQueriesDropped === 0) {
+				this.emitStructuredLog('peer', 'gossip_query_overflow', { pubkey });
+			}
+			this.gossipQueriesDropped++;
+			return;
+		}
+		queued.push(query);
+		this.gossipQueries.set(pubkey, queued);
+		this.scheduleGossipQuery();
+	}
+
+	private gossipQueryBudgetLeft(): boolean {
+		const now = Date.now();
+		if (
+			now - this.gossipQueryWindowStart >=
+			LightningNode.GOSSIP_QUERY_WINDOW_MS
+		) {
+			this.gossipQueryWindowStart = now;
+			this.gossipQuerySpentMs = 0;
+		}
+		return this.gossipQuerySpentMs < LightningNode.GOSSIP_QUERY_BUDGET_MS;
+	}
+
+	/** Serve the next waiting query at once, or when the window renews. */
+	private scheduleGossipQuery(): void {
+		if (this.gossipQueryTimer || this._destroyed) return;
+		const delay = this.gossipQueryBudgetLeft()
+			? 0
+			: this.gossipQueryWindowStart +
+			  LightningNode.GOSSIP_QUERY_WINDOW_MS -
+			  Date.now();
+		this.gossipQueryTimer = setTimeout(() => {
+			this.gossipQueryTimer = null;
+			this.serveNextGossipQuery();
+		}, delay);
+	}
+
+	/**
+	 * One query per turn, so the event loop runs between them, from the
+	 * front peer, which then goes to the back of the queue.
+	 */
+	private serveNextGossipQuery(): void {
+		if (this._destroyed) return;
+		const next = this.gossipQueries.entries().next();
+		if (!next.done && this.gossipQueryBudgetLeft()) {
+			const [pubkey, queued] = next.value;
+			this.gossipQueries.delete(pubkey);
+			const query = queued.shift()!;
+			if (queued.length > 0) this.gossipQueries.set(pubkey, queued);
+			try {
+				this.serveGossipQuery(pubkey, query);
+			} catch (err) {
+				// A query answered inline disconnects its peer when it throws.
+				// Doing the same here keeps a malformed query from costing a
+				// logged failure per turn without any budget charged.
+				this.emitStructuredLog('peer', 'gossip_query_failed', {
+					pubkey,
+					type: query.type,
+					error: err instanceof Error ? err.message : String(err)
+				});
+				this.requestPeerDisconnect(pubkey);
+			}
+		}
+		if (this.gossipQueries.size > 0) {
+			this.scheduleGossipQuery();
+		} else if (this.gossipQueriesDropped > 0) {
+			this.emitStructuredLog('peer', 'gossip_query_overflow_ended', {
+				dropped: this.gossipQueriesDropped
+			});
+			this.gossipQueriesDropped = 0;
+		}
+	}
+
+	/** Answer one query, charging its time, sends included, to the budget. */
+	private serveGossipQuery(pubkey: string, query: TGossipQuery): void {
+		const started = Date.now();
+		try {
+			const syncMgr = this.getOrCreateSyncManager(pubkey);
+			const responses =
+				query.type === MessageType.QUERY_CHANNEL_RANGE
+					? syncMgr.handleQueryChannelRange(query.msg)
+					: syncMgr.handleQueryShortChannelIds(query.msg);
+			for (const resp of responses) {
+				this.emitOutbound(pubkey, resp.type, resp.payload);
+			}
+		} finally {
+			this.gossipQuerySpentMs += Date.now() - started;
+		}
+	}
+
+	/**
 	 * Check queued channels' funding outputs on chain, one at a time (issue
 	 * #1105). A signature only proves keys the announcement carries, so this
 	 * is what separates a real channel, kept at the graph ceiling from then
@@ -16582,7 +16718,10 @@ export class LightningNode extends EventEmitter {
 		return mgr;
 	}
 
-	/** End a peer's sync with its connection, keeping any repair it owed. */
+	/**
+	 * End a peer's sync and its waiting queries with its connection, keeping
+	 * any repair it owed.
+	 */
 	private dropGossipSync(pubkey: string): void {
 		const syncMgr = this.gossipSyncManagers.get(pubkey);
 		if (syncMgr?.repairPending) {
@@ -16590,6 +16729,7 @@ export class LightningNode extends EventEmitter {
 		}
 		syncMgr?.stop();
 		this.gossipSyncManagers.delete(pubkey);
+		this.gossipQueries.delete(pubkey);
 	}
 
 	/**
