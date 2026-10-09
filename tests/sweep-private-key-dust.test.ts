@@ -4,6 +4,7 @@
  * single 293 sat P2WPKH deposit aborted the sweep of the key's other coins.
  * Issue #1433: a key holding under 546 sats in total was refused before sweep
  * pricing, so its coins could not even join a sweep of the wallet's funds.
+ * Issue #1466: a combined sweep also spent the wallet's frozen coins.
  *
  * Fully OFFLINE: the wallet points at an unreachable Electrum port and the
  * key's UTXO lookup is stubbed.
@@ -105,6 +106,7 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 	afterEach(function () {
 		sinon.restore();
 		wallet.data.utxos = [];
+		wallet.data.blacklistedUtxos = [];
 	});
 
 	/** Adds a coin paying the wallet's own index-0 P2WPKH address. */
@@ -197,6 +199,31 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 		expect(spentTxids(tx)).to.have.members(['99'.repeat(32), coin.tx_hash]);
 		expect(tx.outs).to.have.length(1);
 		expect(20_500 - tx.outs[0].value).to.be.at.least(tx.virtualSize());
+	});
+
+	it('leaves a frozen wallet coin out of a combined sweep (#1466)', async () => {
+		const coin = keyCoin('bb'.repeat(32), 10_000);
+		keyHolds([coin]);
+		walletHolds('cc'.repeat(32), 50_000);
+		walletHolds('dd'.repeat(32), 20_000);
+		const frozen = await wallet.freezeUtxo({ txid: 'cc'.repeat(32), index: 0 });
+		if (frozen.isErr()) throw frozen.error;
+
+		const res = await wallet.sweepPrivateKey({
+			privateKey: keyPair.toWIF(),
+			toAddress: RECIPIENT,
+			satsPerByte: 1,
+			broadcast: false,
+			combineWithWalletUtxos: true
+		});
+		if (res.isErr()) throw res.error;
+
+		const tx = BitcoinTransaction.fromHex(res.value.hex);
+		expect(spentTxids(tx)).to.have.members(['dd'.repeat(32), coin.tx_hash]);
+		expect(tx.outs).to.have.length(1);
+		const fee = 30_000 - tx.outs[0].value;
+		expect(fee).to.be.at.least(tx.virtualSize());
+		expect(fee).to.be.below(1_000);
 	});
 
 	it('leaves a lone 500 sat coin for sweep pricing to judge', async () => {

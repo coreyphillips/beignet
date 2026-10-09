@@ -6523,7 +6523,11 @@ export class Wallet {
 		}
 		const balance = utxos.reduce((total, utxo) => total + utxo.value, 0);
 		if (combineWithWalletUtxos) {
-			const walletUtxos = this.data.utxos;
+			// setupTransaction only drops frozen coins it gathers itself, not an
+			// explicit utxos list.
+			const walletUtxos = this.transaction.removeBlackListedUtxos(
+				this.data.utxos
+			);
 			utxos = [...walletUtxos, ...utxos];
 		}
 		await this.transaction.resetSendTransaction();
