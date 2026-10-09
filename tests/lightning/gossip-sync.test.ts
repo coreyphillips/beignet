@@ -1190,6 +1190,23 @@ describe('Gossip Sync (Phase 5)', function () {
 				expect(synced).to.equal(false);
 			});
 
+			it('holds a repair again when it asks for a batch while a marker is owed, after the repair was released (issue #1461)', function () {
+				const graph = new NetworkGraph();
+				const known = populateGraph(graph, 3).map((s) => s.toString('hex'));
+				const unknown = makeScid(100_000, 1, 0).toString('hex');
+				const mgr = new GossipSyncManager(graph);
+
+				expect(offer(mgr, [...known, unknown])).to.eql([unknown]);
+				clock.tick(TIMEOUT * 3);
+				expect(mgr.releaseRepair()).to.equal(true);
+
+				// An old marker closes the next sync's batch before its reply.
+				expect(offer(mgr, [...known, unknown])).to.eql([unknown]);
+				expectStoreFilter(mgr.handleReplyShortChannelIdsEnd(END));
+				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+				expect(mgr.repairPending).to.equal(true);
+			});
+
 			it('asks for the range again when its final reply never arrives', function () {
 				const mgr = new GossipSyncManager(new NetworkGraph());
 				const timeouts = timeoutsOf(mgr);

@@ -277,6 +277,9 @@ export class GossipSyncManager extends EventEmitter {
 		this._batchAttempts = 0;
 		this._batchLost = false;
 		this._incomplete = false;
+		// An old marker can close any of these batches before its reply
+		// arrives, so the sync holds a repair even after releasing one.
+		if (this._markerOwed) this._repairPending = true;
 
 		// Send first batch
 		return this._sendNextScidQuery();
