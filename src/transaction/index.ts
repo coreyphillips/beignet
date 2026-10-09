@@ -1535,7 +1535,17 @@ export class Transaction {
 			address = outputs[index]?.address ?? '';
 		}
 
-		const newFee = this.getTotalFee({ satsPerByte, transaction, message });
+		// A replacement spends every input of the original, so coin selection
+		// must not price a subset of them.
+		const newFee = this.getTotalFee({
+			satsPerByte,
+			transaction,
+			message,
+			coinSelectPreference:
+				transaction.boostType === EBoostType.rbf
+					? ECoinSelectPreference.consolidate
+					: undefined
+		});
 
 		//Return if the new fee exceeds half of the user's input balance
 		if (newFee >= inputTotal / 2) {
