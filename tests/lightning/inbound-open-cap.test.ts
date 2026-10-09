@@ -4,15 +4,21 @@
  * temporary id derived a key set and retained a Channel until the peer
  * disconnected, so a peer that stayed connected could accumulate them
  * without bound. The fifth is refused on the wire before any key is derived.
+ *
+ * Issue #1456: an open promoted by funding_created keeps its slot until its
+ * funding confirms, across disconnect and restore, because the txid it names
+ * need not exist.
  */
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import { Channel } from '../../src/lightning/channel/channel';
 import {
 	ChannelManager,
 	IPerChannelKeys
 } from '../../src/lightning/channel/channel-manager';
 import {
+	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
 	REGTEST_CHAIN_HASH
 } from '../../src/lightning/channel/types';
@@ -29,6 +35,10 @@ import {
 } from '../../src/lightning/message/dual-funding';
 import { decodeErrorMessage } from '../../src/lightning/message/error';
 import { MessageType } from '../../src/lightning/message/types';
+import {
+	deserializeChannelState,
+	serializeChannelState
+} from '../../src/lightning/storage/serialization';
 
 const PEER_A = '02' + 'a1'.repeat(32);
 const PEER_B = '02' + 'b2'.repeat(32);
@@ -75,7 +85,8 @@ function makePerChannelKeys(channelIndex: number): IPerChannelKeys {
 	};
 }
 
-function makeManager(tag: string): ChannelManager {
+/** keyOffset keeps two managers that complete an open off each other's keys. */
+function makeManager(tag: string, keyOffset = 0): ChannelManager {
 	const seed = makeSeed(tag);
 	const manager = new ChannelManager({
 		localConfig: { ...DEFAULT_CHANNEL_CONFIG },
@@ -84,10 +95,46 @@ function makeManager(tag: string): ChannelManager {
 		localFundingPrivkey: derivePrivkey(seed, 0),
 		htlcBasepointSecret: derivePrivkey(seed, 4),
 		chainHash: REGTEST_CHAIN_HASH,
-		channelKeyDeriver: makePerChannelKeys
+		channelKeyDeriver: (index: number): IPerChannelKeys =>
+			makePerChannelKeys(index + keyOffset)
 	});
 	manager.on('error', noop);
 	return manager;
+}
+
+/** Wire the opener to the victim, which knows it as PEER_A. */
+function connect(victim: ChannelManager, opener: ChannelManager): void {
+	opener.on('message:outbound', (peer: string, type: number, body: Buffer) => {
+		if (peer === VICTIM) victim.handleMessage(PEER_A, type, body);
+	});
+	victim.on('message:outbound', (peer: string, type: number, body: Buffer) => {
+		if (peer === PEER_A) opener.handleMessage(VICTIM, type, body);
+	});
+}
+
+/**
+ * A complete v1 open whose correctly signed funding_created names a
+ * transaction that does not exist. The victim promotes it all the same.
+ */
+function fundWithNonexistentTx(
+	victim: ChannelManager,
+	opener: ChannelManager
+): Buffer {
+	const channel = opener.openChannel(VICTIM, 100_000n);
+	const channelId = opener.createFunding(
+		channel,
+		crypto.randomBytes(32),
+		0,
+		Buffer.alloc(64)
+	);
+	expect(channelId, 'funding_created was accepted').to.not.equal(null);
+	expect(victim.getTempChannel(channel.getTemporaryChannelId())).to.equal(
+		undefined
+	);
+	expect(victim.getChannel(channelId!)?.getState()).to.equal(
+		ChannelState.AWAITING_FUNDING_CONFIRMED
+	);
+	return channelId!;
 }
 
 /** An open_channel payload with a fresh temporary id, captured off the wire. */
@@ -253,5 +300,86 @@ describe('Pending inbound open cap (issue #1394)', () => {
 		victim.handlePeerDisconnected(PEER_A);
 		acceptV1(victim, PEER_A, opener);
 		acceptV2(victim, PEER_A, 'a-after');
+	});
+});
+
+describe('Unconfirmed inbound channels keep their quota (issue #1456)', () => {
+	function probeRefused(victim: ChannelManager, probe: ChannelManager): void {
+		const open = offerOpen(probe);
+		expectRefused(
+			victim,
+			open,
+			inbound(victim, PEER_A, MessageType.OPEN_CHANNEL, open.payload),
+			victim.nextChannelIndex
+		);
+	}
+
+	it('counts opens promoted with a nonexistent funding tx, across disconnect, until the funding confirms', () => {
+		const victim = makeManager('victim-promoted');
+		const opener = makeManager('opener-promoted', 1000);
+		const probe = makeManager('probe-promoted', 2000);
+		connect(victim, opener);
+		const funded: Buffer[] = [];
+		for (let i = 0; i < 4; i++) {
+			funded.push(fundWithNonexistentTx(victim, opener));
+		}
+		probeRefused(victim, probe);
+
+		victim.handlePeerDisconnected(PEER_A);
+		expect(victim.getChannelsByPeer(PEER_A)).to.have.length(4);
+		probeRefused(victim, probe);
+
+		// Funding our own watcher saw gives that channel's slot back.
+		victim.handleFundingConfirmed(funded[0]);
+		expect(victim.getChannel(funded[0])!.isFundingKnownOnChain()).to.equal(
+			true
+		);
+		acceptV1(victim, PEER_A, probe);
+		probeRefused(victim, probe);
+	});
+
+	it('counts unconfirmed inbound channels restored from disk', () => {
+		const victim = makeManager('victim-restore');
+		const opener = makeManager('opener-restore', 1000);
+		connect(victim, opener);
+		for (let i = 0; i < 4; i++) fundWithNonexistentTx(victim, opener);
+
+		const restarted = makeManager('victim-restore');
+		for (const channel of victim.getChannelsByPeer(PEER_A)) {
+			const row = deserializeChannelState(
+				serializeChannelState(channel.getFullState())
+			);
+			restarted.restoreChannel(
+				new Channel(row),
+				PEER_A,
+				channel.channelKeyIndex
+			);
+		}
+		probeRefused(restarted, makeManager('probe-restore', 2000));
+	});
+
+	it('leaves trusted zero-conf opens out of the count', () => {
+		const victim = makeManager('victim-zero-conf');
+		const opener = makeManager('opener-zero-conf', 1000);
+		connect(victim, opener);
+		victim.addTrustedPeer(PEER_A);
+		opener.addTrustedPeer(VICTIM);
+		for (let i = 0; i < 5; i++) {
+			const channel = opener.openChannel(
+				VICTIM,
+				100_000n,
+				undefined,
+				undefined,
+				{ trusted: true }
+			);
+			const channelId = opener.createFunding(
+				channel,
+				crypto.randomBytes(32),
+				0,
+				Buffer.alloc(64)
+			);
+			expect(channelId, `open ${i + 1} was accepted`).to.not.equal(null);
+			expect(victim.getChannel(channelId!)).to.not.equal(undefined);
+		}
 	});
 });

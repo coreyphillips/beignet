@@ -547,12 +547,14 @@ const MAX_HELD_UNKNOWN_REESTABLISH_PER_PEER = 64;
 const MAX_HELD_UNKNOWN_REESTABLISH = 1024;
 
 /**
- * Ceiling on inbound opens one peer may hold unfunded at once (issue #1394).
- * Each costs a derived key set and a retained Channel, a v2 one an
- * interactive-tx session as well, and only a disconnect retires them, so a
- * peer that stays connected could otherwise pile them up without bound.
- * Per peer only, so reaching it is always self-inflicted. LDK allows four;
- * an honest opener rarely has more than one negotiation in flight with us.
+ * Ceiling on inbound opens one peer may hold unfunded at once (issues #1394,
+ * #1456). Each costs a derived key set and a retained Channel, a v2 one an
+ * interactive-tx session as well. A temporary one lives until disconnect and
+ * a promoted one whose funding never appears for 2016 blocks, so a peer could
+ * otherwise pile them up without bound.
+ * Per peer only, so reaching it is always self-inflicted. LDK allows four
+ * and counts unconfirmed channels the same way; an honest opener rarely has
+ * more than one channel waiting on us or the chain.
  */
 const MAX_PENDING_INBOUND_OPENS_PER_PEER = 4;
 
@@ -8996,8 +8998,12 @@ export class ChannelManager extends EventEmitter {
 
 	/**
 	 * Whether this peer already holds MAX_PENDING_INBOUND_OPENS_PER_PEER
-	 * opens it proposed that are still temporary: v1 until funding_created
-	 * promotes them, v2 until their record does.
+	 * opens it proposed whose funding this node has not seen on chain.
+	 * Promoted channels count as well as temporary ones: funding_created
+	 * promotes before the txid it names has to exist, and a promoted channel
+	 * survives disconnect and restart (issue #1456). A trusted zero-conf open
+	 * is exempt, since accepting it already trusted the peer's unconfirmed
+	 * funding.
 	 */
 	private _pendingInboundOpensFull(peerPubkey: string): boolean {
 		let pending = 0;
@@ -9008,6 +9014,18 @@ export class ChannelManager extends EventEmitter {
 			) {
 				pending++;
 			}
+		}
+		for (const [channelId, channel] of this.channels) {
+			if (
+				this.channelPeers.get(channelId) !== peerPubkey ||
+				channel.getRole() !== ChannelRole.ACCEPTOR ||
+				channel.isFundingKnownOnChain()
+			) {
+				continue;
+			}
+			const state = channel.getFullState();
+			if (state.zeroConfEnabled && state.trustedPeer) continue;
+			pending++;
 		}
 		return pending >= MAX_PENDING_INBOUND_OPENS_PER_PEER;
 	}
