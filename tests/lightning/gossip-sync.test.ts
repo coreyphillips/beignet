@@ -2746,6 +2746,101 @@ describe('Gossip Sync (Phase 5)', function () {
 			node.destroy();
 		});
 
+		describe('peer query budget (issue #1398)', function () {
+			const peerA = 'aa'.repeat(33);
+			const peerB = 'bb'.repeat(33);
+			const rangeQuery = encodeQueryChannelRangeMessage({
+				chainHash: REGTEST_CHAIN_HASH,
+				firstBlocknum: 0,
+				numberOfBlocks: 0xffffffff
+			});
+			let node: LightningNode;
+			let clock: sinon.SinonFakeTimers;
+			let dateNow: sinon.SinonStub;
+			let now: number;
+			let scans: sinon.SinonStub;
+			let replies: string[];
+			let logs: Array<{ action: string; data: Record<string, unknown> }>;
+
+			beforeEach(function () {
+				node = makeNode();
+				clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+				now = Date.now();
+				dateNow = sinon.stub(Date, 'now').callsFake(() => now);
+				// Each graph scan takes 60 ms, so two spend a window's budget.
+				scans = sinon
+					.stub(node.getGraph(), 'getChannelsByBlockRange')
+					.callsFake(() => {
+						now += 60;
+						return [];
+					});
+				replies = [];
+				node.on('message:outbound', (pubkey: string, type: number) => {
+					if (type === MessageType.REPLY_CHANNEL_RANGE) replies.push(pubkey);
+				});
+				logs = [];
+				node.on('log', (log) => logs.push(log));
+			});
+
+			afterEach(function () {
+				node.destroy();
+				dateNow.restore();
+				clock.restore();
+			});
+
+			function query(pubkey: string, times = 1): void {
+				for (let i = 0; i < times; i++) {
+					node.handlePeerMessage(
+						pubkey,
+						MessageType.QUERY_CHANNEL_RANGE,
+						rangeQuery
+					);
+				}
+			}
+
+			function nextWindow(): void {
+				now += 1000;
+				clock.tick(1000);
+			}
+
+			it('answers a flooding peer within the budget and drops what it pipelines past two', function () {
+				query(peerA, 10);
+				expect(scans.callCount).to.equal(2);
+
+				nextWindow();
+				expect(scans.callCount).to.equal(4);
+				nextWindow();
+				expect(scans.callCount).to.equal(4);
+				expect(replies).to.have.length(4);
+				expect(
+					logs
+						.filter((log) => log.action === 'gossip_query_overflow_ended')
+						.map((log) => log.data.dropped)
+				).to.eql([6]);
+			});
+
+			it('answers a quiet peer ahead of a flooding peer backlog', function () {
+				query(peerA, 4);
+				query(peerB);
+				expect(replies).to.eql([peerA, peerA]);
+
+				nextWindow();
+				expect(replies).to.eql([peerA, peerA, peerA, peerB]);
+				nextWindow();
+				expect(replies).to.eql([peerA, peerA, peerA, peerB, peerA]);
+			});
+
+			it('drops a peer waiting queries with its connection', function () {
+				query(peerA, 4);
+				(
+					node as unknown as { requestPeerDisconnect(pubkey: string): void }
+				).requestPeerDisconnect(peerA);
+
+				nextWindow();
+				expect(scans.callCount).to.equal(2);
+			});
+		});
+
 		it('ignores reply_channel_range from a peer we never queried (issue #1023)', function () {
 			const node = makeNode();
 			const outbound: number[] = [];
