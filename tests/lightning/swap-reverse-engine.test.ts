@@ -464,6 +464,25 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			]);
 		});
 
+		it('expires a partly paid swap with its invoice (issue #1390)', async function () {
+			const h = await harness();
+			const swap = clientSwap();
+			await create(h, swap);
+			const r = record(h, swap);
+			h.holds.hold(swap.paymentHash, 1_000n, r.refundHeight + 5000);
+			await settle();
+			await h.engine.onBlock(1001);
+			expect(record(h, swap).state).to.equal('CREATED');
+			expect(h.holds.cancelled).to.have.length(0);
+			h.ledger.patch(r.id, { invoiceExpiresAt: 1 });
+			await h.engine.onBlock(1002);
+			expect(record(h, swap).state).to.equal('CANCELLED');
+			expect(h.holds.cancelled).to.deep.equal([
+				swap.paymentHash.toString('hex')
+			]);
+			expect(h.wallet.builds).to.have.length(0);
+		});
+
 		it('a preferred refund delta above the default mints a hold that outlives it (issue #1039)', async function () {
 			const h = await harness();
 			const swap = clientSwap();

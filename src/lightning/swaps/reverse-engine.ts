@@ -1159,10 +1159,12 @@ export class ReverseSwapProvider extends EventEmitter {
 					expectedMsat: record.invoiceMsat
 				});
 			}
+			// A partial set goes with the invoice too: the sender picks its
+			// parts' expiry, so waiting for the sweeper would let anyone hold
+			// this node's inbound HTLC slots for weeks at the cost of a create.
 			if (
 				record.invoiceExpiresAt !== undefined &&
-				this.now() > record.invoiceExpiresAt * 1000 &&
-				(!snapshot || snapshot.parts.length === 0)
+				this.now() > record.invoiceExpiresAt * 1000
 			) {
 				const moved = this.deps.ledger.move(record.id, 'CANCELLED', {
 					failureReason: 'invoice expired unpaid'

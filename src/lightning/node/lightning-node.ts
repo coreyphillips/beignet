@@ -648,6 +648,13 @@ const GOSSIP_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
  */
 export const HELD_HTLC_EXPIRY_MARGIN = 18;
 /**
+ * Parts one hold invoice may park at once. Each parked part holds an inbound
+ * HTLC slot until the hold resolves, and a swap hands out hold invoices to
+ * anyone, so without a bound one unpaid hold could fill every slot of a
+ * channel with dust parts. Payers split into far fewer (LND 16, LDK 10).
+ */
+export const MAX_HELD_PARTS_PER_HASH = 64;
+/**
  * Blocks between our chain tip and the lowest outgoing cltv_expiry a forward
  * may carry (issue #1009). An onward HTLC whose expiry has passed, or sits
  * this close to the tip, is failed upstream with expiry_too_soon rather than
@@ -1482,12 +1489,12 @@ export class LightningNode extends EventEmitter {
 	 * terminal (FAILED, forward_refused); the refund is owed here and
 	 * retried when the channel reestablishes and on every block, so a live
 	 * reconnect resolves it, not only a restart. Keyed by inbound identity.
-	 * A late hold part turned away as `held_set_complete` (issue #822), a
-	 * part refused as `settled_row_full` (issue #1189), and an MPP part failed
-	 * at the MPP timeout (issue #1233), is owed here too. An MPP part's entry
-	 * carries its failure code and is persisted (issue #1265): nothing else
-	 * durable says the part was rejected, and the restore repair would put
-	 * it into a new set.
+	 * A late hold part turned away as `held_set_complete` (issue #822) or
+	 * `held_parts_full` (issue #1390), a part refused as `settled_row_full`
+	 * (issue #1189), and an MPP part failed at the MPP timeout (issue #1233),
+	 * is owed here too. An MPP part's entry carries its failure code and is
+	 * persisted (issue #1265): nothing else durable says the part was
+	 * rejected, and the restore repair would put it into a new set.
 	 */
 	private owedHeldForwardFailures = new Map<
 		string,
@@ -21579,13 +21586,24 @@ export class LightningNode extends EventEmitter {
 					(finalInvoice?.amountMsat &&
 						finalInvoice.amountMsat > 0n &&
 						parkedMsat >= finalInvoice.amountMsat));
+			const partsFull =
+				!alreadyParked &&
+				!setComplete &&
+				parked.length >= MAX_HELD_PARTS_PER_HASH;
 			// Settlement lists every parked part on the payment row.
 			const rowFull =
-				!alreadyParked && !setComplete && !this.settledRowFits(hashHex);
-			if (setComplete || rowFull) {
+				!alreadyParked &&
+				!setComplete &&
+				!partsFull &&
+				!this.settledRowFits(hashHex);
+			if (setComplete || partsFull || rowFull) {
 				this.emitStructuredLog(
 					'htlc',
-					setComplete ? 'held_set_complete' : 'settled_row_full',
+					setComplete
+						? 'held_set_complete'
+						: partsFull
+						? 'held_parts_full'
+						: 'settled_row_full',
 					{
 						paymentHash: hashHex,
 						parkedMsat: parkedMsat.toString(),
