@@ -547,6 +547,16 @@ const MAX_HELD_UNKNOWN_REESTABLISH_PER_PEER = 64;
 const MAX_HELD_UNKNOWN_REESTABLISH = 1024;
 
 /**
+ * Ceiling on inbound opens one peer may hold unfunded at once (issue #1394).
+ * Each costs a derived key set and a retained Channel, a v2 one an
+ * interactive-tx session as well, and only a disconnect retires them, so a
+ * peer that stays connected could otherwise pile them up without bound.
+ * Per peer only, so reaching it is always self-inflicted. LDK allows four;
+ * an honest opener rarely has more than one negotiation in flight with us.
+ */
+const MAX_PENDING_INBOUND_OPENS_PER_PEER = 4;
+
+/**
  * setTimeout turns anything past 2^31-1 ms into a 1 ms delay, which would
  * make an over-large hold window fire instantly and look like no hold at all.
  * Out-of-range windows decline the hold outright instead (issue #462).
@@ -3979,6 +3989,16 @@ export class ChannelManager extends EventEmitter {
 				peerPubkey,
 				msg.temporaryChannelId,
 				'open_channel refused: temporary_channel_id is already in use'
+			);
+			return;
+		}
+		// Issue #1394: ahead of the key derivation, so a refused open costs no
+		// EC work and retains nothing.
+		if (this._pendingInboundOpensFull(peerPubkey)) {
+			this.refuseInboundOpen(
+				peerPubkey,
+				msg.temporaryChannelId,
+				`open_channel refused: ${MAX_PENDING_INBOUND_OPENS_PER_PEER} opens from this peer are already pending`
 			);
 			return;
 		}
@@ -7664,6 +7684,16 @@ export class ChannelManager extends EventEmitter {
 				return;
 			}
 		}
+		// Issue #1394: the per-peer quota, on the wire before derivation as in
+		// the v1 acceptor. v1 and v2 opens share it.
+		if (this._pendingInboundOpensFull(peerPubkey)) {
+			this.refuseInboundOpen(
+				peerPubkey,
+				msg.channelId,
+				`open_channel2 refused: ${MAX_PENDING_INBOUND_OPENS_PER_PEER} opens from this peer are already pending`
+			);
+			return;
+		}
 
 		const chKeys = this.deriveKeysForNewChannel();
 		// Issue #906: the index is consumed HERE, ahead of the parameter
@@ -8949,6 +8979,24 @@ export class ChannelManager extends EventEmitter {
 			this.channelPeers.has(idHex) ||
 			this.channelIdReservations.has(idHex)
 		);
+	}
+
+	/**
+	 * Whether this peer already holds MAX_PENDING_INBOUND_OPENS_PER_PEER
+	 * opens it proposed that are still temporary: v1 until funding_created
+	 * promotes them, v2 until their record does.
+	 */
+	private _pendingInboundOpensFull(peerPubkey: string): boolean {
+		let pending = 0;
+		for (const [tempId, channel] of this.tempChannels) {
+			if (
+				this.channelPeers.get(tempId) === peerPubkey &&
+				channel.getRole() === ChannelRole.ACCEPTOR
+			) {
+				pending++;
+			}
+		}
+		return pending >= MAX_PENDING_INBOUND_OPENS_PER_PEER;
 	}
 
 	/** Whether this exact lifecycle may claim an id without replacing another. */
