@@ -88,6 +88,15 @@ const MIN_EXPOSED_CREDENTIAL_LENGTH = 16;
 const SSE_MAX_CLIENTS_PER_KEY = 16;
 const SSE_MAX_CLIENTS = 64;
 const SSE_MAX_BUFFERED_BYTES = 1_048_576;
+// Long-poll waits each hold a socket, a timer and node listeners until they
+// settle, so a credential may park only so many, for so long.
+const WAIT_ROUTES = new Set([
+	'POST /node/wait-ready',
+	'POST /channel/wait-ready',
+	'POST /payment/wait'
+]);
+const WAIT_MAX_PER_KEY = 16;
+const WAIT_MAX_TIMEOUT_MS = 10 * 60 * 1000;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 // The CachedResponse entries that carry a paymentHash, and the keyed payments
@@ -609,6 +618,13 @@ function endWithResult(res: http.ServerResponse, result: unknown): void {
 		);
 	}
 	res.end(JSON.stringify(result));
+}
+
+/** Absent keeps the node's default; anything else waits at most the ceiling. */
+function clampWaitTimeout(timeoutMs: number | undefined): number | undefined {
+	return timeoutMs === undefined
+		? undefined
+		: Math.min(timeoutMs, WAIT_MAX_TIMEOUT_MS);
 }
 
 /**
@@ -2888,7 +2904,7 @@ async function bootDaemon(
 		// ── Wait APIs ──
 		'POST /node/wait-ready': async (body) => {
 			const { timeoutMs } = body as { timeoutMs?: number };
-			await node.waitForReady(timeoutMs);
+			await node.waitForReady(clampWaitTimeout(timeoutMs));
 			return success({ ready: true });
 		},
 		'POST /channel/wait-ready': async (body) => {
@@ -2897,7 +2913,7 @@ async function bootDaemon(
 				timeoutMs?: number;
 			};
 			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
-			await node.waitForChannelReady(channelId, timeoutMs);
+			await node.waitForChannelReady(channelId, clampWaitTimeout(timeoutMs));
 			return success({ channelId, ready: true });
 		},
 		'POST /payment/wait': async (body) => {
@@ -2907,7 +2923,9 @@ async function bootDaemon(
 			};
 			if (!paymentHash)
 				return failure('INVALID_PARAMS', 'paymentHash required');
-			return success(await node.waitForPayment(paymentHash, timeoutMs));
+			return success(
+				await node.waitForPayment(paymentHash, clampWaitTimeout(timeoutMs))
+			);
 		},
 
 		// ── Route Estimation ──
@@ -3511,6 +3529,8 @@ async function bootDaemon(
 
 	// Open event streams, each with the credential it authenticated as.
 	const sseClients = new Map<http.ServerResponse, string>();
+	// Unsettled long-poll waits, counted per credential.
+	const parkedWaits = new Map<string, number>();
 	// Node buffers every frame for a client that stops reading, so one that
 	// has fallen too far behind is dropped instead of written to.
 	const sseWrite = (client: http.ServerResponse, chunk: string): void => {
@@ -3755,6 +3775,7 @@ async function bootDaemon(
 		// 401 for a bad/absent key, 403 for a valid key without the required
 		// scope. Unclassified routes fail closed to admin-only (see
 		// ROUTE_SCOPES in auth.ts and the drift test that keeps it complete).
+		let credential = 'unauthenticated';
 		if (authenticator.enabled && !authExempt) {
 			const auth = authenticator.authenticate(req.headers['authorization']);
 			if (!auth.ok) {
@@ -3775,6 +3796,7 @@ async function bootDaemon(
 				);
 				return;
 			}
+			credential = auth.keyName === null ? 'apiToken' : `key:${auth.keyName}`;
 		}
 
 		// ── Restore-pending hold (docs/RECOVERY-PROTOCOL.md section 8) ──
@@ -3874,6 +3896,24 @@ async function bootDaemon(
 			res.statusCode = 404;
 			res.end(JSON.stringify(failure('NOT_FOUND', `No route: ${routeKey}`)));
 			return;
+		}
+
+		// Held until the node settles the wait, not until the client hangs up:
+		// the timer and listeners outlive a dropped socket.
+		const waitKey = WAIT_ROUTES.has(routeKey) ? credential : undefined;
+		if (waitKey !== undefined) {
+			const parked = parkedWaits.get(waitKey) ?? 0;
+			if (parked >= WAIT_MAX_PER_KEY) {
+				endWithResult(
+					res,
+					failure(
+						'RATE_LIMITED',
+						`Too many open wait requests (at most ${WAIT_MAX_PER_KEY} per credential)`
+					)
+				);
+				return;
+			}
+			parkedWaits.set(waitKey, parked + 1);
 		}
 
 		try {
@@ -4017,6 +4057,12 @@ async function bootDaemon(
 				res.end(
 					JSON.stringify(failure('INTERNAL_ERROR', 'Internal server error'))
 				);
+			}
+		} finally {
+			if (waitKey !== undefined) {
+				const left = (parkedWaits.get(waitKey) ?? 1) - 1;
+				if (left > 0) parkedWaits.set(waitKey, left);
+				else parkedWaits.delete(waitKey);
 			}
 		}
 	};
