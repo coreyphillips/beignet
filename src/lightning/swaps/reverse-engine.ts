@@ -136,6 +136,12 @@ export interface IReverseSwapProviderConfig {
 	requestBurstMultiplier: number;
 	fundingVbytesEstimate: number;
 	refundVbytesEstimate: number;
+	/**
+	 * Blocks a terminal row is kept past its refund height (or its later
+	 * resolution) before it is deleted. Every unpaid create ends in a row,
+	 * so without this the ledger grows with every create ever sent.
+	 */
+	terminalRetentionBlocks: number;
 }
 
 export const REVERSE_SWAP_DEFAULTS: Omit<
@@ -162,7 +168,8 @@ export const REVERSE_SWAP_DEFAULTS: Omit<
 	maxRequestsPerSecond: 5,
 	requestBurstMultiplier: 4,
 	fundingVbytesEstimate: 200,
-	refundVbytesEstimate: 160
+	refundVbytesEstimate: 160,
+	terminalRetentionBlocks: 144
 };
 
 export const REVERSE_SWAP_DEFAULT_EXPOSURE: ISwapExposurePolicy = {
@@ -331,6 +338,12 @@ export class ReverseSwapProvider extends EventEmitter {
 				'refundDeltaBlocks must exceed the funding and resolution margins'
 			);
 		}
+		if (
+			!Number.isSafeInteger(this.config.terminalRetentionBlocks) ||
+			this.config.terminalRetentionBlocks < 0
+		) {
+			throw new Error('terminalRetentionBlocks must be a non-negative integer');
+		}
 		this.requestBudget = new PeerRateLimiter({
 			maxHtlcsPerSecond: this.config.maxRequestsPerSecond,
 			burstMultiplier: this.config.requestBurstMultiplier
@@ -389,7 +402,29 @@ export class ReverseSwapProvider extends EventEmitter {
 			for (const record of this.deps.ledger.unresolved()) {
 				await this.processRecord(record.id, `block ${height}`);
 			}
+			this.forgetEnded(height);
 		});
+	}
+
+	/** Delete terminal rows past retention (see terminalRetentionBlocks). */
+	private forgetEnded(height: number): void {
+		if (this.stopped) return;
+		const ended: string[] = [];
+		for (const record of this.deps.ledger.pastRetention(
+			'reverse',
+			height,
+			this.config.terminalRetentionBlocks
+		)) {
+			// start() still owes this row its hold cancel.
+			if (record.state === 'REFUNDED' && !record.holdCancelledAt) continue;
+			// The row is how start() retries a refused hold forget, so this is
+			// the last try.
+			if (record.holdCancelledAt) this.forgetHold(record);
+			ended.push(record.id);
+		}
+		// One transaction: the first block after an upgrade finds every
+		// terminal row ever written due at once.
+		if (ended.length > 0) this.deps.ledger.forgetAll(ended);
 	}
 
 	list(): ISwapRecord[] {

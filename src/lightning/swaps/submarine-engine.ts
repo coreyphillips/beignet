@@ -172,6 +172,12 @@ export interface ISubmarineSwapProviderConfig {
 	 */
 	maxRequestsPerSecond: number;
 	requestBurstMultiplier: number;
+	/**
+	 * Blocks a terminal row is kept past its refund height (or its later
+	 * resolution) before it is deleted. Every unpaid create ends in a row,
+	 * so without this the ledger grows with every create ever sent.
+	 */
+	terminalRetentionBlocks: number;
 }
 
 export const SUBMARINE_SWAP_DEFAULTS: Omit<
@@ -203,7 +209,8 @@ export const SUBMARINE_SWAP_DEFAULTS: Omit<
 	maxCreatedPerPeer: 4,
 	maxUnpaidSwaps: 64,
 	maxRequestsPerSecond: 5,
-	requestBurstMultiplier: 4
+	requestBurstMultiplier: 4,
+	terminalRetentionBlocks: 144
 };
 
 export const SUBMARINE_SWAP_DEFAULT_EXPOSURE: ISwapExposurePolicy =
@@ -407,6 +414,12 @@ export class SubmarineSwapProvider extends EventEmitter {
 		) {
 			throw new Error('paymentMaxFeePpm must be a non-negative integer');
 		}
+		if (
+			!Number.isSafeInteger(this.config.terminalRetentionBlocks) ||
+			this.config.terminalRetentionBlocks < 0
+		) {
+			throw new Error('terminalRetentionBlocks must be a non-negative integer');
+		}
 		this.requestBudget = new PeerRateLimiter({
 			maxHtlcsPerSecond: this.config.maxRequestsPerSecond,
 			burstMultiplier: this.config.requestBurstMultiplier
@@ -456,6 +469,13 @@ export class SubmarineSwapProvider extends EventEmitter {
 				if (isTerminalSwapState(record.state)) continue;
 				await this.processRecord(record.id, `block ${height}`);
 			}
+			if (this.stopped) return;
+			// Delete terminal rows past retention (see terminalRetentionBlocks),
+			// in one transaction as the reverse engine does.
+			const ended = this.deps.ledger
+				.pastRetention('submarine', height, this.config.terminalRetentionBlocks)
+				.map((r) => r.id);
+			if (ended.length > 0) this.deps.ledger.forgetAll(ended);
 		});
 	}
 

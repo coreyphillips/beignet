@@ -52,6 +52,40 @@ class FakeKv implements ILedgerKeyValueStorage {
 	}
 }
 
+/** FakeKv that can scan and delete, recording every write in order. */
+class ScanKv extends FakeKv {
+	readonly writes: string[] = [];
+	/** Deletes that succeed before one throws. */
+	deletesLeft = Infinity;
+	saveMetadata(key: string, value: string): void {
+		super.saveMetadata(key, value);
+		this.writes.push(`save ${key}`);
+	}
+	loadMetadataByPrefix(prefix: string): Array<{ key: string; value: string }> {
+		return [...this.rows]
+			.filter(([key]) => key.startsWith(prefix))
+			.sort(([a], [b]) => (a < b ? -1 : 1))
+			.map(([key, value]) => ({ key, value }));
+	}
+	deleteMetadata(key: string): void {
+		if (this.deletesLeft-- <= 0) throw new Error('disk full');
+		this.rows.delete(key);
+		this.writes.push(`delete ${key}`);
+	}
+}
+
+function scannedStore(
+	kv: ILedgerKeyValueStorage
+): MetadataLedgerStore<ISwapRecord> {
+	return new MetadataLedgerStore<ISwapRecord>(
+		kv,
+		SWAP_LEDGER_PREFIX,
+		swapCodec,
+		undefined,
+		{ scanRows: true }
+	);
+}
+
 function input(overrides: Partial<ISwapRecordInput> = {}): ISwapRecordInput {
 	return {
 		id: crypto.randomBytes(16).toString('hex'),
@@ -501,6 +535,47 @@ describe('Swap ledger (issue #737 phase 2)', function () {
 			expect(ledger.get(id)).to.equal(undefined);
 			expect(ledger.forget(id)).to.equal(false);
 		});
+
+		it('lists terminal rows past retention, counted from the later of the refund height and the resolution (issue #1387)', function () {
+			const ledger = ledgerOn();
+			const cancelled = ledger.insert(input()).record!.id;
+			ledger.move(cancelled, 'CANCELLED');
+			ledger.insert(input());
+			const settled = ledger.insert(input()).record!.id;
+			for (const to of [
+				'HELD',
+				'FUNDING',
+				'FUNDING_BROADCAST',
+				'CLAIMED'
+			] as SwapState[]) {
+				expect(ledger.move(settled, to).outcome).to.equal('applied');
+			}
+			ledger.move(settled, 'SETTLED', {
+				resolution: {
+					kind: 'claim',
+					txid: 'ab'.repeat(32),
+					height: 1050,
+					confirmations: 3,
+					verifiedThisSession: true
+				}
+			});
+			const submarine = ledger.insert(input({ direction: 'submarine' })).record!
+				.id;
+			ledger.move(submarine, 'CANCELLED');
+			const past = (height: number): string[] =>
+				ledger
+					.pastRetention('reverse', height, 10)
+					.map((r) => r.id)
+					.sort();
+			// Refund height 1000, retention 10.
+			expect(past(1009)).to.deep.equal([]);
+			expect(past(1010)).to.deep.equal([cancelled]);
+			expect(past(1059)).to.deep.equal([cancelled]);
+			expect(past(1060)).to.deep.equal([cancelled, settled].sort());
+			expect(
+				ledger.pastRetention('submarine', 1010, 10).map((r) => r.id)
+			).to.deep.equal([submarine]);
+		});
 	});
 
 	describe('durability', function () {
@@ -551,6 +626,98 @@ describe('Swap ledger (issue #737 phase 2)', function () {
 			storage.close();
 		});
 
+		it('with scanRows an insert or forget writes one row and no index (issue #1387)', function () {
+			const kv = new ScanKv();
+			const ledger = ledgerOn(scannedStore(kv));
+			for (let i = 0; i < 20; i++) ledger.insert(input());
+			kv.writes.length = 0;
+			const id = ledger.insert(input()).record!.id;
+			const rowKey = `${SWAP_LEDGER_PREFIX}:row:${id}`;
+			expect(kv.writes).to.deep.equal([`save ${rowKey}`]);
+			ledger.move(id, 'FAILED');
+			kv.writes.length = 0;
+			expect(ledger.forget(id)).to.equal(true);
+			expect(kv.writes).to.deep.equal([`delete ${rowKey}`]);
+			expect(kv.rows.has(`${SWAP_LEDGER_PREFIX}:index`)).to.equal(false);
+			const again = new SwapLedger(scannedStore(kv));
+			expect(again.rehydrate()).to.equal(20);
+			expect(again.get(id)).to.equal(undefined);
+
+			// A storage that cannot scan keeps the index.
+			const plain = new FakeKv();
+			ledgerOn(scannedStore(plain)).insert(input());
+			expect(plain.rows.has(`${SWAP_LEDGER_PREFIX}:index`)).to.equal(true);
+		});
+
+		it('forgets a set of terminal rows in one transaction, all or none (issue #1387)', function () {
+			const kv = new ScanKv();
+			const ledger = ledgerOn(scannedStore(kv));
+			const a = ledger.insert(input()).record!.id;
+			const b = ledger.insert(input()).record!.id;
+			const live = ledger.insert(input()).record!.id;
+			ledger.move(a, 'FAILED');
+			ledger.move(b, 'CANCELLED');
+			const ended = (): number =>
+				ledger.countInStates('reverse', ['FAILED', 'CANCELLED']);
+			expect(ledger.forgetAll([a, live])).to.equal(false);
+			expect(ended()).to.equal(2);
+			// The second delete fails: the first is rolled back with it.
+			kv.deletesLeft = 1;
+			expect(ledger.forgetAll([a, b])).to.equal(false);
+			expect(ended()).to.equal(2);
+			expect(new SwapLedger(scannedStore(kv)).rehydrate()).to.equal(3);
+			kv.deletesLeft = Infinity;
+			expect(ledger.forgetAll([a, b])).to.equal(true);
+			expect(ended()).to.equal(0);
+			expect(ledger.list().map((r) => r.id)).to.deep.equal([live]);
+			expect(new SwapLedger(scannedStore(kv)).rehydrate()).to.equal(1);
+		});
+
+		it('with scanRows reads what the index layout wrote, skipping its tombstones (issue #1387)', function () {
+			const kv = new ScanKv();
+			const legacy = ledgerOn(
+				new MetadataLedgerStore<ISwapRecord>(kv, SWAP_LEDGER_PREFIX, swapCodec)
+			);
+			const kept = legacy.insert(input()).record!.id;
+			const gone = legacy.insert(input()).record!.id;
+			legacy.move(gone, 'FAILED');
+			legacy.forget(gone);
+			expect(kv.rows.get(`${SWAP_LEDGER_PREFIX}:row:${gone}`)).to.equal('');
+			const scanned = new SwapLedger(scannedStore(kv));
+			expect(scanned.rehydrate()).to.equal(1);
+			expect(scanned.get(kept)!.state).to.equal('CREATED');
+		});
+
+		it('SqliteStorage scans exactly one key prefix, decrypted, and deletes rows (issue #1387)', function () {
+			const storage = new SqliteStorage(':memory:', undefined, {
+				encryptionKey: crypto.randomBytes(32)
+			});
+			storage.open();
+			for (const key of [
+				'held_forward:row:a',
+				'held_forward:row:b',
+				// LIKE would take both: _ is a wildcard and case folds.
+				'heldXforward:row:c',
+				'HELD_FORWARD:row:d',
+				'held_forward:rox',
+				'held_forward:index'
+			]) {
+				storage.saveMetadata(key, `v-${key}`);
+			}
+			expect(storage.loadMetadataByPrefix('held_forward:row:')).to.deep.equal([
+				{ key: 'held_forward:row:a', value: 'v-held_forward:row:a' },
+				{ key: 'held_forward:row:b', value: 'v-held_forward:row:b' }
+			]);
+			storage.deleteMetadata('held_forward:row:a');
+			storage.deleteMetadata('held_forward:row:missing');
+			expect(storage.loadMetadata('held_forward:row:a')).to.equal(null);
+			expect(
+				storage.loadMetadataByPrefix('held_forward:row:').map((r) => r.key)
+			).to.deep.equal(['held_forward:row:b']);
+			expect(() => storage.loadMetadataByPrefix('')).to.throw(/prefix/);
+			storage.close();
+		});
+
 		it('the node builds and rehydrates its ledger when swaps are enabled', function () {
 			const storage = new SqliteStorage(':memory:');
 			storage.open();
@@ -560,6 +727,10 @@ describe('Swap ledger (issue #737 phase 2)', function () {
 			const ledger = first.getSwapLedger()!;
 			expect(ledger.isRehydrated()).to.equal(true);
 			const id = ledger.insert(input()).record!.id;
+			// Rows are found by key scan, with no index to rewrite (issue #1387).
+			expect(storage.loadMetadata(`${SWAP_LEDGER_PREFIX}:index`)).to.equal(
+				null
+			);
 			const second = createNode('swap-ledger', 1, storage, {
 				swaps: { enabled: true }
 			});

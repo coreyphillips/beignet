@@ -203,6 +203,14 @@ export interface IStorageBackend {
 	// ─── Metadata (key/value) ───
 	saveMetadata(key: string, value: string): void;
 	loadMetadata(key: string): string | null;
+	/**
+	 * Every metadata row whose key starts with `prefix`, in key order.
+	 * Optional so partial backends keep compiling; a ledger store without it
+	 * (or without deleteMetadata) keeps its id index instead.
+	 */
+	loadMetadataByPrefix?(prefix: string): Array<{ key: string; value: string }>;
+	/** Delete one metadata row; a missing key is not an error. */
+	deleteMetadata?(key: string): void;
 
 	// ─── On-chain Wallet Data (optional, key/value) ───
 	/** Persist one on-chain wallet data value (JSON string) under its key. */

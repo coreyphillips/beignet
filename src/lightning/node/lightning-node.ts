@@ -2269,6 +2269,8 @@ export class LightningNode extends EventEmitter {
 		);
 		this.heldForwardLedger.rehydrate();
 		// Swap ledger (issue #737): same rule, rehydrated at construction.
+		// A create is free to send, so its rows are found by key scan: an
+		// insert writes one row, not an index of every swap (issue #1387).
 		if (config.swaps?.enabled) {
 			this.swapLedger = new SwapLedger(
 				this.storage
@@ -2276,7 +2278,8 @@ export class LightningNode extends EventEmitter {
 							this.storage,
 							SWAP_LEDGER_PREFIX,
 							swapCodec,
-							onCorruptLedgerRow
+							onCorruptLedgerRow,
+							{ scanRows: true }
 					  )
 					: new MemoryLedgerStore<ISwapRecord>()
 			);

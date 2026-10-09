@@ -169,6 +169,11 @@ still without running a swap:
   the reverse and submarine lifecycles as compare-and-swap arrows, a
   write-once preimage no transition removes, and no private key stored
   (`keys.ts` re-derives per-swap keys from the node key and the swap id).
+  Each engine deletes its terminal rows once the chain is
+  `terminalRetentionBlocks` (default 144) past the refund height, or past
+  the resolution's height when that is later. A REFUNDED row whose hold
+  cancel never landed is kept for `start()`. On the node the rows are found
+  by key scan, so an insert or delete writes one row (issue #1387).
 - **Chain resolver** (`chain-resolver.ts`): `observe` reports the funding
   output's status, every spend classified as claim (with the extracted
   preimage), refund or unknown, confirmations against the operator's policy,

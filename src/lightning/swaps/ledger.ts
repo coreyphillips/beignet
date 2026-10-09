@@ -208,7 +208,7 @@ export interface ISwapRecord extends ILedgerRecord {
 	refundBumps: number;
 	/** The winning spend as last observed. */
 	resolution?: ISwapResolutionRecord;
-	/** Any hash-matching preimage from any source; retained forever. */
+	/** Any hash-matching preimage from any source; kept as long as the row. */
 	preimageHex?: string;
 	preimageSource?: SwapPreimageSource;
 	settledAt?: number;
@@ -550,6 +550,33 @@ export class SwapLedger {
 		return count;
 	}
 
+	/**
+	 * Terminal rows of one direction the chain is `retentionBlocks` past,
+	 * counting from the refund height or, when later, the height the
+	 * resolution confirmed at. PAYMENT_FAILED counts as terminal here: every
+	 * HTLC already failed, and this far past the refund height a claim on a
+	 * late preimage would only race the client's refund.
+	 */
+	pastRetention(
+		direction: SwapDirection,
+		height: number,
+		retentionBlocks: number
+	): ISwapRecord[] {
+		const out: ISwapRecord[] = [];
+		for (const state of TERMINAL_STATES) {
+			for (const record of this.copies(
+				this.idsByState.get(`${direction}:${state}`)
+			)) {
+				const ended = Math.max(
+					record.refundHeight,
+					record.resolution?.height ?? 0
+				);
+				if (height >= ended + retentionBlocks) out.push(record);
+			}
+		}
+		return out;
+	}
+
 	byFundingOutpoint(txid: string, vout: number): ISwapRecord | undefined {
 		return this.ledger.find(
 			(r) => r.fundingTxid === txid && r.fundingVout === vout
@@ -667,6 +694,22 @@ export class SwapLedger {
 		if (!current || !isTerminalSwapState(current.state)) return false;
 		if (!this.ledger.remove(swapIdHex)) return false;
 		this.track(current, undefined);
+		return true;
+	}
+
+	/**
+	 * Drop terminal records in one store transaction. Refuses the lot when
+	 * any is missing or unresolved.
+	 */
+	forgetAll(swapIdHexes: readonly string[]): boolean {
+		const rows: ISwapRecord[] = [];
+		for (const id of new Set(swapIdHexes)) {
+			const row = this.ledger.get(id);
+			if (!row || !isTerminalSwapState(row.state)) return false;
+			rows.push(row);
+		}
+		if (!this.ledger.removeSet(rows.map((r) => r.id))) return false;
+		for (const row of rows) this.track(row, undefined);
 		return true;
 	}
 

@@ -1737,6 +1737,48 @@ describe('Reverse swap provider engine (issue #737)', function () {
 		});
 	});
 
+	describe('retention (issue #1387)', function () {
+		it('deletes a terminal row once the chain is the retention past its refund height', async function () {
+			const h = await harness({ config: { terminalRetentionBlocks: 10 } });
+			const swap = clientSwap();
+			await create(h, swap);
+			const r = record(h, swap);
+			const hashHex = swap.paymentHash.toString('hex');
+			const invoice = h.holds.invoices.get(hashHex)!;
+			h.ledger.patch(r.id, { invoiceExpiresAt: 1 });
+			await h.engine.onBlock(1001);
+			expect(record(h, swap).state).to.equal('CANCELLED');
+			// The node refused the hold forget at the cancel: the row's
+			// deletion is its last try.
+			h.holds.invoices.set(hashHex, invoice);
+
+			// A refunded row whose hold cancel never landed: start() owes it.
+			const owed = h.ledger.insert({
+				...r,
+				id: crypto.randomBytes(16).toString('hex'),
+				paymentHashHex: crypto.randomBytes(32).toString('hex')
+			}).record!;
+			for (const to of [
+				'HELD',
+				'FUNDING',
+				'FUNDING_BROADCAST',
+				'FUNDED',
+				'REFUND_PENDING',
+				'REFUNDED'
+			] as const) {
+				expect(h.ledger.move(owed.id, to).outcome).to.equal('applied');
+			}
+
+			await h.engine.onBlock(r.refundHeight + 9);
+			expect(h.ledger.get(r.id)!.state).to.equal('CANCELLED');
+			await h.engine.onBlock(r.refundHeight + 10);
+			expect(h.ledger.get(r.id)).to.equal(undefined);
+			expect(h.holds.forgotten).to.deep.equal([hashHex, hashHex]);
+			expect(h.holds.invoices.has(hashHex)).to.equal(false);
+			expect(h.ledger.get(owed.id)!.state).to.equal('REFUNDED');
+		});
+	});
+
 	it('drops a malformed frame and keeps serving', async function () {
 		const h = await harness();
 		h.client.sendCustomMessage(
