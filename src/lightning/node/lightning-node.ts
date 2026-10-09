@@ -22196,6 +22196,38 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Delete a cancelled hold invoice's invoice, payment and secret records.
+	 * A swap engine calls this once its swap has ended: every remote create
+	 * mints a hold invoice, and one that ends unpaid would otherwise stay in
+	 * memory and storage for good. Refuses an open or settled hold, a hash
+	 * with a part still parked or resolving, and a payment record that is not
+	 * an unsettled incoming one.
+	 */
+	private forgetCancelledHoldInvoice(paymentHash: Buffer): boolean {
+		const hashHex = paymentHash.toString('hex');
+		const invoice = this.invoices.get(hashHex);
+		if (!invoice?.hold || !invoice.cancelledAt) return false;
+		if (
+			this.heldInvoiceHashes.has(hashHex) ||
+			this.heldHtlcs.has(hashHex) ||
+			this.heldResolutions.has(hashHex) ||
+			this.resolvingHeldHtlcs.has(hashHex) ||
+			this.pendingMppPayments.has(hashHex)
+		) {
+			return false;
+		}
+		const payment = this.payments.get(hashHex);
+		if (
+			!payment ||
+			payment.direction !== PaymentDirection.INCOMING ||
+			payment.status === PaymentStatus.COMPLETED
+		) {
+			return false;
+		}
+		return this.deleteInvoiceRecords('forgetCancelledHoldInvoice', [hashHex]);
+	}
+
+	/**
 	 * List hold invoices with their derived lifecycle state.
 	 * OPEN: created, no HTLC parked yet. ACCEPTED: HTLC(s) parked awaiting
 	 * settle/cancel. SETTLED: preimage revealed, payment received.
@@ -28400,6 +28432,9 @@ export class LightningNode extends EventEmitter {
 				cancelHold: (paymentHash) => {
 					this.cancelHoldInvoice(paymentHash);
 				},
+				forgetHold: (paymentHash) => {
+					this.forgetCancelledHoldInvoice(paymentHash);
+				},
 				onHeld: (cb): (() => void) => {
 					const handler = (e: { paymentHash: Buffer }): void => cb(e);
 					this.on('htlc:held', handler);
@@ -31127,19 +31162,32 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 		if (toRemove.length === 0) return;
+		if (!this.deleteInvoiceRecords('sweepExpiredIssuedInvoices', toRemove)) {
+			return;
+		}
+		this.emitStructuredLog('payment', 'issued_invoice_sweep', {
+			removed: toRemove.length,
+			expired: expiredCount,
+			capEvicted: toRemove.length - expiredCount
+		});
+	}
 
-		// Durable rows FIRST: if the transaction fails, the in-memory copies
-		// are kept too, so runtime and persisted state never diverge and the
-		// next sweep retries the whole batch. All five deletes are REQUIRED
-		// interface members (no optional chaining): a backend skipping
-		// deletePreimage would leave an orphaned preimage row that a restart
-		// restores WITHOUT the invoice's bolt12 marker or expected path_id,
-		// making the hash claimable outside the fail-closed path check, and
-		// one skipping deleteInvoicePathId would accumulate path_id rows
-		// forever, the amplification this sweep exists to stop.
+	/**
+	 * Delete every record an issued invoice left under these hashes (preimage,
+	 * legacy payment secret, path_id, invoice, payment), durable rows FIRST:
+	 * if the transaction fails, the in-memory copies are kept too, so runtime
+	 * and persisted state never diverge and the caller can retry the batch.
+	 * All five deletes are REQUIRED interface members (no optional chaining):
+	 * a backend skipping deletePreimage would leave an orphaned preimage row
+	 * that a restart restores WITHOUT the invoice's bolt12 marker or expected
+	 * path_id, making the hash claimable outside the fail-closed path check,
+	 * and one skipping deleteInvoicePathId would accumulate path_id rows
+	 * forever, the amplification these deletes exist to stop.
+	 */
+	private deleteInvoiceRecords(label: string, hashes: string[]): boolean {
 		if (this.storage) {
 			const mutations: RecoveryMutation[] = [];
-			for (const hashHex of toRemove) {
+			for (const hashHex of hashes) {
 				mutations.push(
 					{ type: 'delete_preimage', paymentHash: hashHex },
 					{ type: 'delete_payment_secret', paymentHash: hashHex },
@@ -31148,20 +31196,20 @@ export class LightningNode extends EventEmitter {
 					{ type: 'delete_payment', paymentHash: hashHex }
 				);
 			}
-			// SafetyCritical, and journaled: a restore that resurrected a swept
-			// preimage would reopen the issued-unpaid amplification this sweep
-			// exists to close.
+			// SafetyCritical, and journaled: a restore that resurrected a
+			// deleted preimage would reopen the issued-unpaid amplification
+			// these deletes exist to close.
 			if (
 				!this.commitMutations(
-					'sweepExpiredIssuedInvoices',
+					label,
 					mutations,
 					RecoveryCriticality.SafetyCritical
 				)
 			) {
-				return;
+				return false;
 			}
 		}
-		for (const hashHex of toRemove) {
+		for (const hashHex of hashes) {
 			this.preimages.delete(hashHex);
 			this.paymentSecrets.delete(hashHex);
 			this.invoices.delete(hashHex);
@@ -31171,11 +31219,7 @@ export class LightningNode extends EventEmitter {
 			// already withdraws it; this drops what an in-flight part conceded.
 			this.clearJitSkim(hashHex);
 		}
-		this.emitStructuredLog('payment', 'issued_invoice_sweep', {
-			removed: toRemove.length,
-			expired: expiredCount,
-			capEvicted: toRemove.length - expiredCount
-		});
+		return true;
 	}
 
 	/**

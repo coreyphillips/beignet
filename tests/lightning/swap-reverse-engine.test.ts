@@ -458,6 +458,10 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			await h.engine.onBlock(1001);
 			expect(record(h, swap).state).to.equal('CANCELLED');
 			expect(h.holds.cancelled).to.have.length(1);
+			// Nothing of the hold outlives the swap (issue #1389).
+			expect(h.holds.forgotten).to.deep.equal([
+				swap.paymentHash.toString('hex')
+			]);
 		});
 
 		it('a preferred refund delta above the default mints a hold that outlives it (issue #1039)', async function () {
@@ -1599,6 +1603,7 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(h.engine.cancel(record(h, a).id).ok).to.equal(true);
 			expect(record(h, a).state).to.equal('CANCELLED');
 			expect(h.holds.cancelled).to.have.length(1);
+			expect(h.holds.forgotten).to.deep.equal([a.paymentHash.toString('hex')]);
 			const { swap: b } = await fundedSwap(h);
 			expect(h.engine.cancel(record(h, b).id)).to.deep.equal({
 				ok: false,
@@ -1670,6 +1675,8 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			// A second swap parked in REFUND_PENDING with a confirmed refund.
 			const { swap: two } = await fundedSwap(h2);
 			const r2 = record(h2, two);
+			const twoHex = two.paymentHash.toString('hex');
+			const twoInvoice = h2.holds.invoices.get(twoHex)!;
 			h2.chain.confirm(r2.fundingTxid!, 1003);
 			h2.chain.height = r2.refundHeight + 1;
 			await h2.engine.onBlock(h2.chain.height);
@@ -1679,14 +1686,35 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			h2.chain.height += 3;
 			const h3 = await h2.restart();
 			expect(h3.ledger.get(r2.id)!.state).to.equal('REFUNDED');
-			expect(h3.holds.cancelled).to.include(two.paymentHash.toString('hex'));
-			// REFUNDED without the cancel recorded: re-cancelled on start, once.
+			expect(h3.holds.cancelled).to.include(twoHex);
+			// REFUNDED without the cancel recorded: the hold is still open, and
+			// is re-cancelled on start, once, then forgotten.
 			h3.ledger.patch(r2.id, { holdCancelledAt: undefined });
-			h3.holds.cancelledHashes.delete(two.paymentHash.toString('hex'));
+			h3.holds.cancelledHashes.delete(twoHex);
+			h3.holds.invoices.set(twoHex, twoInvoice);
 			const before = h3.holds.cancelled.length;
 			const h4 = await h3.restart();
 			expect(h4.holds.cancelled.length).to.equal(before + 1);
 			expect(h4.ledger.get(r2.id)!.holdCancelledAt).to.be.a('number');
+			expect(h4.holds.invoices.has(twoHex)).to.equal(false);
+		});
+
+		it('a hold the node cancels is forgotten with the swap, and a restart finishes a forget a crash cut short (issue #1389)', async function () {
+			const h = await harness();
+			const swap = clientSwap();
+			await create(h, swap);
+			const hashHex = swap.paymentHash.toString('hex');
+			const invoice = h.holds.invoices.get(hashHex)!;
+			h.holds.sweep(swap.paymentHash, 'api');
+			await settle();
+			expect(record(h, swap).state).to.equal('CANCELLED');
+			expect(h.holds.forgotten).to.deep.equal([hashHex]);
+
+			// Cancelled and recorded, but the process died before the forget.
+			h.holds.invoices.set(hashHex, invoice);
+			const h2 = await h.restart();
+			expect(h2.holds.forgotten).to.deep.equal([hashHex, hashHex]);
+			expect(h2.holds.invoices.has(hashHex)).to.equal(false);
 		});
 	});
 

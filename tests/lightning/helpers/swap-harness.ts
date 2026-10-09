@@ -139,6 +139,7 @@ export class FakeHolds {
 	readonly parts = new Map<string, IHeldInvoicePart[]>();
 	readonly settled: Array<{ hash: string; preimage: string }> = [];
 	readonly cancelled: string[] = [];
+	readonly forgotten: string[] = [];
 	readonly heldListeners = new Set<(e: { paymentHash: Buffer }) => void>();
 	readonly cancelListeners = new Set<
 		(e: { paymentHash: Buffer; reason: string }) => void
@@ -266,6 +267,14 @@ export class FakeHolds {
 		this.cancelled.push(hashHex);
 		this.parts.delete(hashHex);
 		this.cancelledHashes.add(hashHex);
+	}
+
+	/** Mirrors the node: only a cancelled hold with nothing parked is dropped. */
+	forgetHold(paymentHash: Buffer): void {
+		const hashHex = paymentHash.toString('hex');
+		if (!this.cancelledHashes.has(hashHex) || this.parts.get(hashHex)?.length)
+			return;
+		if (this.invoices.delete(hashHex)) this.forgotten.push(hashHex);
 	}
 
 	/** The node's own sweeper (or an operator) cancels: fires 'hold:cancelled'. */
@@ -409,6 +418,7 @@ export async function harness(
 		hashInUse: (hash) => holds.inUse.has(hash.toString('hex')),
 		settleHeld: (hash, preimage) => holds.settleHeld(hash, preimage),
 		cancelHold: (hash) => holds.cancelHold(hash),
+		forgetHold: (hash) => holds.forgetHold(hash),
 		onHeld: (cb) => {
 			holds.heldListeners.add(cb);
 			return () => holds.heldListeners.delete(cb);

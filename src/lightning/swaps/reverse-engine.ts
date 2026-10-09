@@ -198,6 +198,12 @@ export interface IReverseSwapProviderDeps {
 	settleHeld(paymentHash: Buffer, preimage: Buffer): boolean;
 	/** Idempotent; a closed hash is not an error. */
 	cancelHold(paymentHash: Buffer): void;
+	/**
+	 * Delete the node's records of a cancelled hold: its invoice, payment and
+	 * secret. Called once the swap is terminal; a no-op for a hold that is
+	 * still open, settled, or holding parts.
+	 */
+	forgetHold?(paymentHash: Buffer): void;
 	onHeld(cb: (event: { paymentHash: Buffer }) => void): () => void;
 	onHoldCancelled(
 		cb: (event: { paymentHash: Buffer; reason: string }) => void
@@ -352,6 +358,14 @@ export class ReverseSwapProvider extends EventEmitter {
 			for (const record of this.deps.ledger.list()) {
 				if (record.state === 'REFUNDED' && !record.holdCancelledAt) {
 					this.cancelHoldFor(record.id, 'refund_confirmed');
+				} else if (
+					record.direction === 'reverse' &&
+					record.holdCancelledAt &&
+					isTerminalSwapState(record.state)
+				) {
+					// A crash between the cancel and the forget, or a hold left
+					// by a swap that ended before holds were forgotten.
+					this.forgetHold(record);
 				}
 			}
 		});
@@ -956,8 +970,10 @@ export class ReverseSwapProvider extends EventEmitter {
 						...patch,
 						failureReason: `hold cancelled (${reason})`
 					});
-					if (moved.outcome === 'applied')
+					if (moved.outcome === 'applied') {
+						this.forgetHold(moved.record!);
 						this.emitSwap('swap:hold-cancelled', moved.record!, { reason });
+					}
 					break;
 				}
 				case 'FUNDING': {
@@ -993,6 +1009,7 @@ export class ReverseSwapProvider extends EventEmitter {
 					});
 					if (moved.outcome === 'applied') {
 						void this.dropUnsentFunding(moved.record!);
+						this.forgetHold(moved.record!);
 						this.emitSwap('swap:failed', moved.record!, {
 							reason: moved.record!.failureReason
 						});
@@ -1062,6 +1079,25 @@ export class ReverseSwapProvider extends EventEmitter {
 			this.deps.ledger.patch(swapIdHex, {
 				holdCancelledAt: this.now(),
 				holdCancelReason: why
+			});
+		}
+		this.forgetHold(record);
+	}
+
+	/**
+	 * Drop the node's records of an ended swap's cancelled hold. A create is
+	 * free to send and mints an invoice, payment and secret, so leaving them
+	 * behind every swap that ends unpaid grows memory and storage for good.
+	 * The swap's own row stays the record of what happened.
+	 */
+	private forgetHold(record: ISwapRecord): void {
+		if (!this.deps.forgetHold) return;
+		try {
+			this.deps.forgetHold(Buffer.from(record.paymentHashHex, 'hex'));
+		} catch (err) {
+			this.deps.log('swap_forget_hold_failed', {
+				swapId: record.id,
+				error: err instanceof Error ? err.message : String(err)
 			});
 		}
 	}

@@ -501,13 +501,12 @@ export async function runReverseSwapRefundPath(
 	).to.equal('REFUND_PENDING');
 	expect(await scene.payer.status(hashHex)).to.equal('pending');
 
-	// Policy depth: refunded, hold cancelled, payment fails.
+	// Policy depth: refunded, hold cancelled and forgotten, payment fails.
 	await mineAndTick(scene, 1);
 	await waitForSwapState(scene.provider, swapIdHex, ['REFUNDED']);
 	expect(
-		scene.provider.listHoldInvoices().find((i) => i.paymentHash === hashHex)!
-			.state
-	).to.equal('CANCELLED');
+		scene.provider.listHoldInvoices().some((i) => i.paymentHash === hashHex)
+	).to.equal(false);
 	await until(
 		'payment failed',
 		async () => (await scene.payer.status(hashHex)) === 'failed'
