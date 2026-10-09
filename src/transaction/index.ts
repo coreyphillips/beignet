@@ -782,9 +782,10 @@ export class Transaction {
 		//Change address and amount to send back to wallet.
 		if (changeAddress) {
 			const changeAddressValue = balance - (outputValue + fee);
-			// Ensure we're not creating unspendable dust.
-			// If we have less than 2x the recommended base fee, just contribute it to the fee in this transaction.
-			if (changeAddressValue >= TRANSACTION_DEFAULTS.dustLimit) {
+			// Change below its own script's dust threshold would not relay, so it
+			// goes to the fee. The flat 546 is only P2PKH's threshold and gave
+			// away relayable segwit change.
+			if (changeAddressValue >= getDustThreshold(changeAddress)) {
 				targets.push({
 					address: changeAddress,
 					value: changeAddressValue,
@@ -794,13 +795,14 @@ export class Transaction {
 			// Looks like we don't need a change address.
 			// Double check we don't have any spare sats hanging around.
 		} else if (outputValue + fee < balance) {
-			// If we have spare sats hanging around and the difference is greater than the dust limit, generate a changeAddress to send them to.
+			// The threshold depends on the change script, so fetch the address
+			// before deciding whether the spare sats are worth an output.
 			const diffValue = balance - (outputValue + fee);
-			if (diffValue >= TRANSACTION_DEFAULTS.dustLimit) {
-				const changeAddressRes = await this._wallet.getChangeAddress();
-				if (changeAddressRes.isErr()) {
-					return err(changeAddressRes.error.message);
-				}
+			const changeAddressRes = await this._wallet.getChangeAddress();
+			if (changeAddressRes.isErr()) {
+				return err(changeAddressRes.error.message);
+			}
+			if (diffValue >= getDustThreshold(changeAddressRes.value.address)) {
 				changeAddress = changeAddressRes.value.address;
 				targets.push({
 					address: changeAddress,
