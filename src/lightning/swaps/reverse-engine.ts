@@ -621,7 +621,7 @@ export class ReverseSwapProvider extends EventEmitter {
 			amountSat: req.amountSat,
 			estimatedFundingFeeSat: fee.minerFeeSat,
 			feeRateSatPerVbyte: fee.feeRate,
-			live: this.deps.ledger.atRisk()
+			live: this.deps.ledger.atRisk(this.config.resolutionConfirmations)
 		});
 		if (!verdict.ok)
 			return refuse(exposureRefusal(verdict.reason), verdict.detail);
@@ -733,7 +733,7 @@ export class ReverseSwapProvider extends EventEmitter {
 			amountSat: req.onchainAmountSat,
 			estimatedFundingFeeSat: fee.minerFeeSat,
 			feeRateSatPerVbyte: fee.feeRate,
-			live: this.deps.ledger.atRisk()
+			live: this.deps.ledger.atRisk(this.config.resolutionConfirmations)
 		});
 		if (!verdict.ok)
 			return refuse(exposureRefusal(verdict.reason), verdict.detail);

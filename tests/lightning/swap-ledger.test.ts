@@ -407,14 +407,15 @@ describe('Swap ledger (issue #737 phase 2)', function () {
 			const ids = (rows: ISwapRecord[]): string[] =>
 				rows.map((r) => r.id).sort();
 			const expectInStep = (l: SwapLedger): void => {
-				expect(ids(l.atRisk())).to.deep.equal(ids([held, exposed]));
+				expect(ids(l.atRisk(1))).to.deep.equal(ids([held]));
+				expect(ids(l.atRisk(3))).to.deep.equal(ids([held, exposed]));
 				// Admission reads the same exposure from either set.
 				for (const [depth, count] of [
 					[1, 1],
 					[3, 2]
 				]) {
 					const full = SwapLedger.exposure(l.unresolved(), depth);
-					const fast = SwapLedger.exposure(l.atRisk(), depth);
+					const fast = SwapLedger.exposure(l.atRisk(depth), depth);
 					expect(fast.exposedCount).to.equal(count);
 					expect(fast.exposedCount).to.equal(full.exposedCount);
 					expect(fast.exposedSat).to.equal(full.exposedSat);
@@ -431,7 +432,26 @@ describe('Swap ledger (issue #737 phase 2)', function () {
 
 			ledger.move(created.id, 'HELD');
 			expect(ledger.createdCount(peer, 'reverse')).to.equal(0);
-			expect(ids(ledger.atRisk())).to.deep.equal(ids([held, exposed, created]));
+			expect(ids(ledger.atRisk(3))).to.deep.equal(
+				ids([held, exposed, created])
+			);
+			// A resolution at policy depth leaves the row EXPOSED but out of
+			// the set; demoted by a reorg, it is back.
+			const resolution = ledger.get(exposed.id)!.resolution!;
+			ledger.patch(exposed.id, {
+				resolution: { ...resolution, confirmations: 3 }
+			});
+			expect(ledger.get(exposed.id)!.state).to.equal('EXPOSED');
+			expect(ids(ledger.atRisk(3))).to.deep.equal(ids([held, created]));
+			expect(ids(ledgerOn(store).atRisk(3))).to.deep.equal(
+				ids([held, created])
+			);
+			ledger.patch(exposed.id, {
+				resolution: { ...resolution, confirmations: 0 }
+			});
+			expect(ids(ledger.atRisk(1))).to.deep.equal(
+				ids([held, exposed, created])
+			);
 			ledger.forget(done.id);
 			expect(ledger.byPaymentHash(done.paymentHashHex)).to.deep.equal([]);
 		});

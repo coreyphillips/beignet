@@ -356,26 +356,27 @@ export function isSwapExposure(
 }
 
 /**
- * Whether isSwapExposure may count the row at some resolution depth. Only
- * EXPOSED depends on the depth, so every EXPOSED row qualifies.
+ * The depth of an EXPOSED row's resolution verified in this process, when
+ * isSwapExposure counts the row only under a deeper policy. Every other
+ * row counts at every depth or at none.
  */
-function mayBeSwapExposure(record: ISwapRecord): boolean {
-	return record.state === 'EXPOSED' || isSwapExposure(record);
+function resolvedDepth(record: ISwapRecord): number | undefined {
+	const resolution = record.resolution;
+	if (record.state !== 'EXPOSED' || !resolution?.verifiedThisSession) {
+		return undefined;
+	}
+	return resolution.confirmations >= 1 ? resolution.confirmations : undefined;
 }
 
-function addToIndex(
-	index: Map<string, Set<string>>,
-	key: string,
-	id: string
-): void {
+function addToIndex<K>(index: Map<K, Set<string>>, key: K, id: string): void {
 	const ids = index.get(key);
 	if (ids) ids.add(id);
 	else index.set(key, new Set([id]));
 }
 
-function dropFromIndex(
-	index: Map<string, Set<string>>,
-	key: string,
+function dropFromIndex<K>(
+	index: Map<K, Set<string>>,
+	key: K,
 	id: string
 ): void {
 	const ids = index.get(key);
@@ -472,6 +473,9 @@ export class SwapLedger {
 	private readonly idsByHash = new Map<string, Set<string>>();
 	private readonly createdIdsByPeer = new Map<string, Set<string>>();
 	private readonly atRiskIds = new Set<string>();
+	// Resolved EXPOSED rows stay EXPOSED for good. Keyed by depth, a policy
+	// reads only the ones still shallower than it.
+	private readonly resolvedIdsByDepth = new Map<number, Set<string>>();
 
 	constructor(store: IDurableLedgerStore<ISwapRecord>) {
 		this.ledger = new DurableLedger(store);
@@ -482,6 +486,7 @@ export class SwapLedger {
 		this.idsByHash.clear();
 		this.createdIdsByPeer.clear();
 		this.atRiskIds.clear();
+		this.resolvedIdsByDepth.clear();
 		for (const record of this.ledger.list()) this.track(undefined, record);
 		return count;
 	}
@@ -507,12 +512,16 @@ export class SwapLedger {
 	}
 
 	/**
-	 * Every row isSwapExposure may count, at any depth: what admission
-	 * judges against. A row joins only after passing admission, so the set
-	 * follows the exposure caps, not the length of the ledger's history.
+	 * Every row isSwapExposure counts at this depth: what admission judges
+	 * against. A row joins only after passing admission, so the set follows
+	 * the exposure caps, not the length of the ledger's history.
 	 */
-	atRisk(): ISwapRecord[] {
-		return this.copies(this.atRiskIds);
+	atRisk(resolutionConfirmations = 1): ISwapRecord[] {
+		const out = this.copies(this.atRiskIds);
+		for (let depth = 1; depth < resolutionConfirmations; depth++) {
+			out.push(...this.copies(this.resolvedIdsByDepth.get(depth)));
+		}
+		return out;
 	}
 
 	/** CREATED rows the peer opened, of one direction or of both. */
@@ -666,7 +675,15 @@ export class SwapLedger {
 		if (after?.state === 'CREATED') {
 			addToIndex(this.createdIdsByPeer, after.peerNodeIdHex, id);
 		}
-		if (after && mayBeSwapExposure(after)) this.atRiskIds.add(id);
+		const beforeDepth = before && resolvedDepth(before);
+		const afterDepth = after && resolvedDepth(after);
+		if (beforeDepth !== afterDepth) {
+			if (beforeDepth) dropFromIndex(this.resolvedIdsByDepth, beforeDepth, id);
+			if (afterDepth) addToIndex(this.resolvedIdsByDepth, afterDepth, id);
+		}
+		// At depth 1 a row with a resolved depth no longer counts, so these
+		// are the rows every depth counts.
+		if (after && isSwapExposure(after)) this.atRiskIds.add(id);
 		else this.atRiskIds.delete(id);
 	}
 

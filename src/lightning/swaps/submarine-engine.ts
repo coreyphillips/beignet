@@ -728,7 +728,7 @@ export class SubmarineSwapProvider extends EventEmitter {
 			direction: 'submarine',
 			amountSat: req.amountSat,
 			feeRateSatPerVbyte: fee.feeRate,
-			live: this.deps.ledger.atRisk()
+			live: this.deps.ledger.atRisk(this.config.resolutionConfirmations)
 		});
 		if (!verdict.ok)
 			return refuse(exposureRefusal(verdict.reason), verdict.detail);
@@ -973,7 +973,7 @@ export class SubmarineSwapProvider extends EventEmitter {
 			direction: 'submarine',
 			amountSat: req.onchainAmountSat,
 			feeRateSatPerVbyte: fee.feeRate,
-			live: this.deps.ledger.atRisk()
+			live: this.deps.ledger.atRisk(this.config.resolutionConfirmations)
 		});
 		if (!verdict.ok)
 			return refuse(exposureRefusal(verdict.reason), verdict.detail);
