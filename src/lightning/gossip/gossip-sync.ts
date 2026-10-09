@@ -236,7 +236,11 @@ export class GossipSyncManager extends EventEmitter {
 		this._clearRangeScids();
 
 		if (missing.length === 0) {
-			return this._endSync(GossipSyncState.SYNCED);
+			// A repair asks for every offered channel, so here the peer offered
+			// none and nothing lost was fetched again.
+			return this._endSync(
+				this._repairPending ? GossipSyncState.IDLE : GossipSyncState.SYNCED
+			);
 		}
 
 		// Batch into chunks of MAX_SCIDS_PER_QUERY

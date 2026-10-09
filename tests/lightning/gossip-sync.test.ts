@@ -1134,6 +1134,26 @@ describe('Gossip Sync (Phase 5)', function () {
 				expect(synced).to.equal(false);
 			});
 
+			it('keeps the repair when the next range lists no channels (issue #1427)', function () {
+				const graph = new NetworkGraph();
+				const known = populateGraph(graph, 3).map((s) => s.toString('hex'));
+				const unknown = makeScid(100_000, 1, 0).toString('hex');
+				const mgr = new GossipSyncManager(graph);
+				let synced = false;
+				mgr.on('synced', () => {
+					synced = true;
+				});
+
+				expect(offer(mgr, [...known, unknown])).to.eql([unknown]);
+				clock.tick(TIMEOUT * 3);
+				expect(mgr.repairPending).to.equal(true);
+
+				expectStoreFilter(offerReply(mgr, []));
+				expect(mgr.getState()).to.equal(GossipSyncState.IDLE);
+				expect(mgr.repairPending).to.equal(true);
+				expect(synced).to.equal(false);
+			});
+
 			it('asks for the range again when its final reply never arrives', function () {
 				const mgr = new GossipSyncManager(new NetworkGraph());
 				const timeouts = timeoutsOf(mgr);
@@ -2554,6 +2574,35 @@ describe('Gossip Sync (Phase 5)', function () {
 
 					// The channel is known, but whatever was lost went with the
 					// connection, so it is asked for again.
+					startSync(1);
+					expect(queries).to.have.length(2);
+					expect(queries[1]).to.eql(queries[0]);
+				} finally {
+					statics.GOSSIP_INTAKE_MAX = saved;
+				}
+			});
+
+			it('keeps the repair past a peer that lists no channels (issue #1427)', async function () {
+				const statics = LightningNode as unknown as {
+					GOSSIP_INTAKE_MAX: number;
+				};
+				const saved = statics.GOSSIP_INTAKE_MAX;
+				statics.GOSSIP_INTAKE_MAX = 1;
+				try {
+					startSync(1);
+					sendAnnouncement(queries[0][0], 0);
+					// The intake is full, so this is dropped.
+					sendAnnouncement(queries[0][0], 0);
+					node.getPeerManager()!.emit('peer:disconnect', peerPubkey);
+					await node.flushGossip();
+					expect(node.getGraph().getChannelCount()).to.equal(1);
+
+					startSync(0);
+					expect(node.getGossipSyncState(peerPubkey)).to.equal(
+						GossipSyncState.IDLE
+					);
+					node.getPeerManager()!.emit('peer:disconnect', peerPubkey);
+
 					startSync(1);
 					expect(queries).to.have.length(2);
 					expect(queries[1]).to.eql(queries[0]);
