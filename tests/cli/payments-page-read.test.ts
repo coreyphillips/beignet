@@ -23,6 +23,10 @@ import {
 	PaymentDirection,
 	PaymentStatus
 } from '../../src/lightning/node/types';
+import {
+	decryptValue,
+	encryptValue
+} from '../../src/lightning/storage/encryption';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 
 const OFFLINE_ELECTRUM = {
@@ -210,6 +214,46 @@ describe('Payment rows are read newest first from the created_at index (issue #1
 			).to.deep.equal(
 				[...saved].sort((a, b) => b.createdAt - a.createdAt).map(hex)
 			);
+		} finally {
+			reopened.close();
+		}
+	});
+
+	it('opens a schema 15 database holding a payment whose createdAt is not a number', () => {
+		const storage = new SqliteStorage(dbPath, undefined, {
+			encryptionKey: key
+		});
+		storage.open();
+		const good = recordOf(1);
+		const bad = recordOf(2);
+		storage.savePayment(hex(good), good);
+		storage.savePayment(hex(bad), bad);
+		storage.close();
+
+		const legacy = new Database(dbPath);
+		const row = legacy
+			.prepare('SELECT payment_json FROM payments WHERE payment_hash = ?')
+			.get(hex(bad)) as { payment_json: string };
+		const payload = JSON.parse(decryptValue(key, row.payment_json));
+		payload.createdAt = {};
+		legacy
+			.prepare('UPDATE payments SET payment_json = ? WHERE payment_hash = ?')
+			.run(encryptValue(key, JSON.stringify(payload)), hex(bad));
+		legacy.exec(
+			'DROP INDEX idx_payments_created_at; ' +
+				'ALTER TABLE payments DROP COLUMN created_at; ' +
+				'DELETE FROM schema_version WHERE version = 16'
+		);
+		legacy.close();
+
+		const reopened = new SqliteStorage(dbPath, undefined, {
+			encryptionKey: key
+		});
+		reopened.open();
+		try {
+			expect(
+				[...reopened.paymentsNewestFirst()].map((r) => r.paymentHash)
+			).to.deep.equal([hex(good)]);
 		} finally {
 			reopened.close();
 		}

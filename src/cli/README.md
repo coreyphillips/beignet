@@ -1861,7 +1861,7 @@ beignet invoice held
 beignet invoice settle-hold <preimage>       # fulfills the parked HTLC(s)
 beignet invoice cancel-hold <paymentHash>    # fails them back to the payer
 
-beignet payment list
+beignet payment list [--limit 1000] [--offset 0]
 beignet payment get <paymentHash>
 beignet payment cancel <paymentHash>
 beignet payment wait <paymentHash> [--timeout 60000]

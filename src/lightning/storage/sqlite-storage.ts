@@ -402,7 +402,7 @@ export class SqliteStorage implements IStorageBackend {
 		);
 		this.db.transaction(() => {
 			for (const row of rows) {
-				let createdAt: number;
+				let createdAt: unknown;
 				try {
 					createdAt = deserializePaymentInfo(
 						JSON.parse(this._dec(row.payment_json))
@@ -410,6 +410,11 @@ export class SqliteStorage implements IStorageBackend {
 				} catch (err) {
 					// Without the key no other row decodes either.
 					if (err instanceof StorageEncryptedError) return;
+					continue;
+				}
+				// A row whose timestamp is not a number is left as one that
+				// cannot be decoded; binding it would throw out of open().
+				if (typeof createdAt !== 'number' || !Number.isFinite(createdAt)) {
 					continue;
 				}
 				update.run(createdAt, row.payment_hash);

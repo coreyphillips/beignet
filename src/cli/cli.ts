@@ -1484,8 +1484,17 @@ async function handleSwaps(): Promise<void> {
 async function handlePayment(): Promise<void> {
 	const sub = filteredArgs[1];
 	switch (sub) {
-		case 'list':
-			return outputResult(await httpRequest('GET', '/payments'));
+		case 'list': {
+			const params = new URLSearchParams();
+			const limit = parseFlag('--limit');
+			if (limit !== undefined) params.set('limit', limit);
+			const offset = parseFlag('--offset');
+			if (offset !== undefined) params.set('offset', offset);
+			const qs = params.toString();
+			return outputResult(
+				await httpRequest('GET', qs ? `/payments?${qs}` : '/payments')
+			);
+		}
 		case 'get':
 			return outputResult(
 				await httpRequest(
@@ -3157,7 +3166,8 @@ Swaps (reverse: a peer pays us over Lightning, we fund an on-chain contract;
   keysend [safe] <pubkey> <sats> [--max-fee N] [--timeout ms]
                                          Spontaneous payment, no invoice needed
                                          ('safe' resolves FAILED, never errors)
-  payment list                           List payments
+  payment list [--limit N] [--offset N]  List payments, newest first, at
+                                         most 1000 per call
   payment get <hash>                     Payment details
   payment cancel <hash>                  Cancel a pending outbound payment
   payment wait <hash> [--timeout ms]     Block until a payment settles
