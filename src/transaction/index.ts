@@ -1693,15 +1693,18 @@ export class Transaction {
 				inputs: spendableUtxos
 			});
 
+			// A coin frozen after it was staged is still among the inputs, and
+			// sendMax restages without it.
+			const stagedInputs = this.removeBlackListedUtxos(transaction.inputs);
 			const inputValue = this.getTransactionInputValue({
-				inputs: transaction.inputs
+				inputs: stagedInputs
 			});
 			const amount = onchainBalance > inputValue ? onchainBalance : inputValue;
 
 			let utxos: IUtxo[] = [];
 			//Ensure we add the larger utxo set for a more accurate fee.
-			if (transaction.inputs.length > spendableUtxos.length) {
-				utxos = transaction.inputs;
+			if (stagedInputs.length > spendableUtxos.length) {
+				utxos = stagedInputs;
 			} else {
 				utxos = spendableUtxos;
 			}

@@ -330,6 +330,55 @@ describe('UTXO freeze/unfreeze', function () {
 		expect(decoded.value.vin).to.have.length(2);
 		await wallet.resetSendTransaction();
 	});
+
+	it('leaves a coin frozen after staging out of the max send (#1429)', async () => {
+		const staged = await wallet.transaction.setupTransaction();
+		if (staged.isErr()) throw staged.error;
+		expect(wallet.transaction.data.inputs).to.have.length(2);
+		const frozen = await wallet.freezeUtxo({
+			txid: utxoB.tx_hash,
+			index: utxoB.tx_pos
+		});
+		if (frozen.isErr()) throw frozen.error;
+		try {
+			const estimate = wallet.transaction.estimateTransactionCosts({
+				customFeeRate: 2
+			});
+			if (estimate.isErr()) throw estimate.error;
+			expect(estimate.value.amount + estimate.value.fee).to.equal(60000);
+
+			// A staged input the wallet does not hold is still counted.
+			const external: IUtxo = { ...utxoA, tx_hash: '33'.repeat(32) };
+			const withExternal = wallet.transaction.estimateTransactionCosts({
+				customFeeRate: 2,
+				transaction: {
+					...wallet.transaction.data,
+					inputs: [...wallet.transaction.data.inputs, external]
+				}
+			});
+			if (withExternal.isErr()) throw withExternal.error;
+			expect(withExternal.value.amount + withExternal.value.fee).to.equal(
+				120000
+			);
+
+			const res = await wallet.sendMax({
+				address: 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk',
+				satsPerByte: 2,
+				broadcast: false
+			});
+			if (res.isErr()) throw res.error;
+			const decoded = decodeRawTransaction(res.value, wallet.network);
+			if (decoded.isErr()) throw decoded.error;
+			const outputTotal = decoded.value.vout.reduce(
+				(acc, v) => acc + v.value,
+				0
+			);
+			expect(estimate.value.amount).to.equal(outputTotal);
+		} finally {
+			await wallet.unfreezeUtxo({ txid: utxoB.tx_hash, index: utxoB.tx_pos });
+			await wallet.resetSendTransaction();
+		}
+	});
 });
 
 /**
