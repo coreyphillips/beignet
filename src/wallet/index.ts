@@ -5227,13 +5227,29 @@ export class Wallet {
 			}
 			const updateFeeRes = this.transaction.updateFee({ satsPerByte });
 			if (updateFeeRes.isErr()) return err(updateFeeRes.error.message);
+			// updateFee priced only the coins the wallet's coinSelectPreference
+			// selects, so build from those coins, as sendMany does.
+			const staged = this.transaction.data;
+			const coinSelectRes = this.transaction.autoCoinSelect({
+				inputs: staged.inputs,
+				outputs: staged.outputs,
+				satsPerByte: staged.satsPerByte,
+				changeAddress: staged.changeAddress,
+				message: staged.message,
+				coinSelectPreference: this.coinSelectPreference
+			});
+			if (coinSelectRes.isErr()) return err(coinSelectRes.error.message);
+			// A local copy, not applyAutoCoinSelect: narrowing the shared staged
+			// inputs would shrink the pool a concurrent build is still pricing,
+			// and that build could restage the shared copy while this one awaits.
+			const txData = { ...staged, inputs: coinSelectRes.value.inputs };
 			const psbtRes = await this.transaction.createUnsignedPsbt({
+				transactionData: txData,
 				shuffleOutputs
 			});
 			if (psbtRes.isErr()) return err(psbtRes.error.message);
 			const psbt = psbtRes.value;
 			this._rememberBuiltPsbt(psbt);
-			const txData = this.transaction.data;
 			const inputValue = this.transaction.getTransactionInputValue({
 				inputs: txData.inputs
 			});

@@ -1,10 +1,11 @@
 /**
- * sendMany builds from the coins it priced (#1360). Fully OFFLINE: the wallet
- * points at an unreachable Electrum port, UTXOs are injected into wallet data,
- * and nothing is broadcast (broadcast: false).
+ * sendMany and buildPsbt build from the coins they priced (#1360, #1431).
+ * Fully OFFLINE: the wallet points at an unreachable Electrum port, UTXOs are
+ * injected into wallet data, and nothing is broadcast.
  *
  * With any coinSelectPreference but consolidate, updateFee priced the subset
- * autoCoinSelect picks, while createTransaction built from every staged UTXO.
+ * autoCoinSelect picks, while createTransaction and createUnsignedPsbt built
+ * from every staged UTXO.
  * The change output absorbed the extra inputs and the transaction went out at
  * about half the requested rate.
  */
@@ -156,5 +157,70 @@ describe('sendMany coin selection (#1360)', function () {
 		expect(tx.ins).to.have.length(5);
 		expect(feeOf(tx)).to.equal(wallet.transaction.data.fee);
 		expect(feeOf(tx) / tx.virtualSize()).to.be.at.least(10);
+	});
+
+	it('builds a PSBT from the selected coins at the requested rate (#1431)', async function () {
+		wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
+
+		const built = await wallet.buildPsbt({
+			address: RECIPIENT,
+			amount: 15_000,
+			satsPerByte: 10
+		});
+		if (built.isErr()) throw built.error;
+		const signed = wallet.signPsbtWithOurKey(built.value.psbtBase64);
+		if (signed.isErr()) throw signed.error;
+		const imported = wallet.importSignedPsbt(signed.value);
+		if (imported.isErr()) throw imported.error;
+		const tx = BitcoinTransaction.fromHex(imported.value.txHex);
+
+		expect(tx.ins).to.have.length(2);
+		expect(built.value.inputs).to.have.length(2);
+		expect(feeOf(tx)).to.equal(built.value.fee);
+		expect(feeOf(tx) / tx.virtualSize()).to.be.at.least(10);
+	});
+
+	it('keeps each concurrent PSBT build on its own recipients', async function () {
+		wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
+		const [a, b, c] = [4, 5, 6].map((fill) =>
+			bitcoinAddress.toBech32(Buffer.alloc(20, fill), 0, 'bcrt')
+		);
+
+		const [first, second] = await Promise.all([
+			wallet.buildPsbt({ address: a, amount: 10_000, satsPerByte: 2 }),
+			wallet.buildPsbt({
+				txs: [
+					{ address: b, amount: 5_000 },
+					{ address: c, amount: 6_000 }
+				],
+				satsPerByte: 2
+			})
+		]);
+		if (first.isErr()) throw first.error;
+		if (second.isErr()) throw second.error;
+		const paid = (outputs: { address?: string; value: number }[]): string[] =>
+			outputs
+				.filter(({ address }) => [a, b, c].includes(address ?? ''))
+				.map(({ address, value }) => `${address}:${value}`)
+				.sort();
+
+		expect(paid(first.value.outputs)).to.deep.equal([`${a}:10000`]);
+		expect(paid(second.value.outputs)).to.deep.equal(
+			[`${b}:5000`, `${c}:6000`].sort()
+		);
+	});
+
+	it('leaves every coin to a concurrent PSBT build', async function () {
+		wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
+
+		const [first, second] = await Promise.all([
+			wallet.buildPsbt({ address: RECIPIENT, amount: 15_000, satsPerByte: 2 }),
+			wallet.buildPsbt({ address: RECIPIENT, amount: 35_000, satsPerByte: 2 })
+		]);
+		if (first.isErr()) throw first.error;
+		if (second.isErr()) throw second.error;
+
+		expect(first.value.inputs).to.have.length(2);
+		expect(second.value.inputs).to.have.length(4);
 	});
 });
