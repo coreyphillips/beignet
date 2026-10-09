@@ -846,6 +846,11 @@ export interface BeignetConfig extends IrohDaemonConfig {
 	metricsPublic?: boolean;
 	/** Allow non-loopback bind / wildcard CORS without auth (default false). */
 	insecure?: boolean;
+	/** Per-client token bucket on every HTTP request, counted before auth.
+	 *  Off unless set; `{}` turns it on with the defaults (100 requests per
+	 *  60000 ms). Behind a reverse proxy, list the proxy in trustedProxies or
+	 *  its clients share one bucket. */
+	rateLimit?: import('./http-rate-limiter').RateLimitOptions;
 	/** Relay third-party HTLCs, i.e. act as a routing hop (default true). Set
 	 *  false so a wallet declines all forwards. Env: BEIGNET_FORWARDING_ENABLED. */
 	forwardingEnabled?: boolean;

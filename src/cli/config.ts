@@ -549,6 +549,7 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? process.env.BEIGNET_INSECURE === 'true'
 				: undefined) ??
 			file.insecure,
+		rateLimit: cliFlags.rateLimit ?? file.rateLimit,
 		forwardingEnabled:
 			cliFlags.forwardingEnabled ??
 			(process.env.BEIGNET_FORWARDING_ENABLED !== undefined
