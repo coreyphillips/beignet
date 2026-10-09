@@ -4946,11 +4946,13 @@ export class Wallet {
 	}
 
 	/**
-	 * Serializes send, sendMany and sendMax. They share one staged
+	 * Serializes send, sendMany, sendMax and buildPsbt. They share one staged
 	 * transaction, and the coins a broadcast spends leave the UTXO set only
 	 * when it returns. Two overlapping calls would stage the same coins, and
 	 * under RBF the later broadcast replaces the earlier one after both have
-	 * reported a txid.
+	 * reported a txid. Staging a recipient overwrites only its own index, so
+	 * an overlapping call with fewer recipients would also pay the other
+	 * call's trailing ones (#1464).
 	 */
 	private sendLock: Promise<unknown> = Promise.resolve();
 
@@ -5182,7 +5184,14 @@ export class Wallet {
 	 * @param {IBuildPsbtArgs} args
 	 * @returns {Promise<Result<IBuildPsbtResponse>>}
 	 */
-	public async buildPsbt({
+	public async buildPsbt(
+		args: IBuildPsbtArgs
+	): Promise<Result<IBuildPsbtResponse>> {
+		const options = { ...args };
+		return this.runSend(() => this.buildPsbtLocked(options));
+	}
+
+	private async buildPsbtLocked({
 		txs,
 		address,
 		amount,
