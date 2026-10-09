@@ -1,9 +1,15 @@
 import { expect } from 'chai';
+import { EventEmitter } from 'events';
+import https from 'https';
+import sinon from 'sinon';
+import { PassThrough } from 'stream';
 import { NetworkGraph } from '../../src/lightning/gossip/network-graph';
 import {
 	applyRapidGossipSnapshot,
 	applyRapidGossipSnapshotAsync,
+	fetchRapidGossipSnapshot,
 	IRapidGossipResult,
+	MAX_RGS_SNAPSHOT_BYTES,
 	RapidGossipCancelledError,
 	DEFAULT_RGS_URL
 } from '../../src/lightning/gossip/rapid-sync';
@@ -257,6 +263,52 @@ for (const { name, apply } of PATHS) {
 describe('Rapid Gossip Sync endpoint', () => {
 	it('exposes the default public RGS endpoint', () => {
 		expect(DEFAULT_RGS_URL).to.match(/^https:\/\//);
+	});
+});
+
+describe('Rapid Gossip Sync download', () => {
+	afterEach(() => sinon.restore());
+
+	/** Answer https.get with a 200 carrying `body`, counting req.destroy calls. */
+	function serve(body: Buffer[]): { destroys: number } {
+		const seen = { destroys: 0 };
+		sinon.stub(https, 'get').callsFake(((
+			_url: string,
+			onResponse: (res: PassThrough) => void
+		) => {
+			const req = Object.assign(new EventEmitter(), {
+				setTimeout: () => req,
+				destroy: () => {
+					seen.destroys++;
+				}
+			});
+			setImmediate(() => {
+				const res = Object.assign(new PassThrough(), { statusCode: 200 });
+				onResponse(res);
+				for (const chunk of body) res.write(chunk);
+				res.end();
+			});
+			return req;
+		}) as unknown as typeof https.get);
+		return seen;
+	}
+
+	it('refuses a body past the cap and drops the connection', async () => {
+		// One shared half-cap chunk keeps the test from allocating the cap.
+		const half = Buffer.alloc(MAX_RGS_SNAPSHOT_BYTES / 2);
+		const seen = serve([half, half, half]);
+		const err = await rejection(fetchRapidGossipSnapshot());
+		expect(err.message).to.equal(
+			`Rapid gossip sync snapshot exceeds ${MAX_RGS_SNAPSHOT_BYTES} bytes`
+		);
+		expect(seen.destroys).to.equal(1);
+	});
+
+	it('accepts a body of exactly the cap', async () => {
+		const seen = serve([Buffer.from([1, 2]), Buffer.from([3, 4])]);
+		const data = await fetchRapidGossipSnapshot(DEFAULT_RGS_URL, 60_000, 4);
+		expect([...data]).to.deep.equal([1, 2, 3, 4]);
+		expect(seen.destroys).to.equal(0);
 	});
 });
 

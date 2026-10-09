@@ -548,11 +548,20 @@ export const DEFAULT_RGS_URL =
 	'https://rapidsync.lightningdevkit.org/snapshot/0';
 
 /**
- * Download a rapid gossip sync snapshot over HTTPS.
+ * Largest snapshot fetchRapidGossipSnapshot will buffer. A full mainnet
+ * snapshot is under 2 MiB, and one filling NetworkGraph.MAX_CHANNELS would
+ * be roughly 20 MiB, so this leaves room for growth.
+ */
+export const MAX_RGS_SNAPSHOT_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Download a rapid gossip sync snapshot over HTTPS. Rejects, and drops the
+ * connection, once the body passes `maxBytes`.
  */
 export function fetchRapidGossipSnapshot(
 	url: string = DEFAULT_RGS_URL,
-	timeoutMs = 60_000
+	timeoutMs = 60_000,
+	maxBytes = MAX_RGS_SNAPSHOT_BYTES
 ): Promise<Buffer> {
 	return new Promise((resolve, reject) => {
 		const req = https.get(url, (res) => {
@@ -564,7 +573,18 @@ export function fetchRapidGossipSnapshot(
 				return;
 			}
 			const chunks: Buffer[] = [];
-			res.on('data', (c: Buffer) => chunks.push(c));
+			let total = 0;
+			res.on('data', (c: Buffer) => {
+				total += c.length;
+				if (total > maxBytes) {
+					reject(
+						new Error(`Rapid gossip sync snapshot exceeds ${maxBytes} bytes`)
+					);
+					req.destroy();
+					return;
+				}
+				chunks.push(c);
+			});
 			res.on('end', () => resolve(Buffer.concat(chunks)));
 			res.on('error', reject);
 		});
