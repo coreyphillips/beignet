@@ -315,10 +315,10 @@ export class DirectFundingSender {
 				})
 				.catch(() => false)
 				.finally(() => {
+					// A failed release stays held through pendingReleases, and the
+					// next retry or sweep runs it again.
 					this.freezeHolds.delete(owner);
-					if (!this.pendingReleases.has(outpoint)) {
-						this.recoveringFreezes.delete(outpoint);
-					}
+					this.recoveringFreezes.delete(outpoint);
 				});
 			this.recoveringFreezes.set(outpoint, recovering);
 		}
@@ -505,6 +505,9 @@ export class DirectFundingSender {
 	 * makes both a deliberate, user-visible act rather than an automatic one.
 	 */
 	async reconcile(): Promise<void> {
+		// Failed freeze releases get another try, so lifting an operator freeze
+		// that refused one frees the coin without a restart.
+		if (this.pendingReleases.size > 0) this.releaseUnwitnessedFreezes();
 		for (const record of this.deps.payments.pending()) {
 			const fundingTxid = record.fundingTxid;
 			const status = fundingTxid
@@ -854,7 +857,13 @@ export class DirectFundingSender {
 		const outpoint = `${record.spentTxid}:${record.spentVout}`;
 		// Startup may still be releasing this record's old freeze. A retry must
 		// not acquire a new reservation until that release has finished.
-		const recovering = this.recoveringFreezes.get(outpoint);
+		let recovering = this.recoveringFreezes.get(outpoint);
+		if (!recovering && this.pendingReleases.has(outpoint)) {
+			// An earlier release failed, perhaps over an operator freeze that has
+			// since been lifted. Try it again rather than wait for a restart.
+			this.releaseUnwitnessedFreezes(record.requestId);
+			recovering = this.recoveringFreezes.get(outpoint);
+		}
 		if (recovering && !(await recovering)) {
 			throw new DirectFundingError(
 				DirectFundingErrorCode.NO_SUITABLE_UTXO,
