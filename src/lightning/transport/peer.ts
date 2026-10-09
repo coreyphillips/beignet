@@ -46,6 +46,13 @@ const DEFAULT_PONG_TIMEOUT_MS = 60_000;
 const TCP_KEEPALIVE_DELAY_MS = 45_000;
 const ENCRYPTED_LENGTH_SIZE = 18; // 2-byte length + 16-byte tag
 const MAX_READ_BUFFER = 2 * 1024 * 1024; // 2 MB
+// A ping of a few bytes may ask for a 65531-byte pong, so pong bytes are
+// metered per connection: a burst of two maximum pongs, refilled at one
+// per 30s. LND asks for at most 4096 bytes a minute and LDK and CLN ask
+// for 0 or 1, so only a peer farming the amplification runs dry.
+const MAX_PONG_BYTES = 65531;
+const PONG_BYTES_BURST = 2 * MAX_PONG_BYTES;
+const PONG_BYTES_PER_MS = MAX_PONG_BYTES / 30_000;
 
 export interface IPeerOptions {
 	/** Local node private key (32 bytes) */
@@ -149,6 +156,9 @@ export class Peer extends EventEmitter {
 	private pongTimer: ReturnType<typeof setTimeout> | null = null;
 	private pingIntervalMs: number;
 	private pongTimeoutMs: number;
+	/** Pong bytes the remote may still request (see PONG_BYTES_BURST). */
+	private pongBytesAllowance = PONG_BYTES_BURST;
+	private pongAllowanceUpdatedAt = Date.now();
 
 	// Optional transport factory (e.g. SOCKS5/Tor proxy sockets, WebSocket)
 	private createSocketFn?: (
@@ -764,7 +774,15 @@ export class Peer extends EventEmitter {
 		// Handle ping/pong internally
 		if (type === MessageType.PING) {
 			const ping = decodePingMessage(payload);
-			if (ping.numPongBytes <= 65531) {
+			if (ping.numPongBytes <= MAX_PONG_BYTES) {
+				if (!this.takePongAllowance(ping.numPongBytes)) {
+					this.emit(
+						'error',
+						new Error('Ping flood: peer exceeded its pong byte allowance')
+					);
+					this.disconnect();
+					return;
+				}
 				const pong = encodePongMessage(ping.numPongBytes);
 				this.sendMessage(MessageType.PONG, pong);
 			}
@@ -964,6 +982,19 @@ export class Peer extends EventEmitter {
 		} catch {
 			// Ignore send errors during ping
 		}
+	}
+
+	private takePongAllowance(bytes: number): boolean {
+		const now = Date.now();
+		const elapsed = Math.max(0, now - this.pongAllowanceUpdatedAt);
+		this.pongAllowanceUpdatedAt = now;
+		this.pongBytesAllowance = Math.min(
+			PONG_BYTES_BURST,
+			this.pongBytesAllowance + elapsed * PONG_BYTES_PER_MS
+		);
+		if (bytes > this.pongBytesAllowance) return false;
+		this.pongBytesAllowance -= bytes;
+		return true;
 	}
 
 	private handlePong(): void {
