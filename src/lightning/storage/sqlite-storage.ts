@@ -61,6 +61,17 @@ import {
 /** Owner read/write only: the mode for a file holding this wallet's data. */
 const OWNER_ONLY_FILE_MODE = 0o600;
 
+/** Payment keys read per query by paymentsNewestFirst. */
+const PAYMENT_KEY_BATCH = 500;
+
+/** A payment row's key from paymentsNewestFirst; load() decodes the row. */
+export interface IStoredPaymentRef {
+	paymentHash: string;
+	createdAt: number;
+	/** Null when the row is gone or cannot be decoded. */
+	load(): IPaymentInfo | null;
+}
+
 /**
  * chmod `filePath` to 0600 when it exists and any group/other bit is set.
  * Never throws: a missing sidecar and a filesystem that refuses chmod both
@@ -196,6 +207,7 @@ export class SqliteStorage implements IStorageBackend {
 		this.db.pragma('foreign_keys = ON');
 		this.db.pragma('busy_timeout = 5000');
 		this._createTables();
+		this._fillPaymentCreatedAt();
 		if (this.encryptionKey) {
 			this._encryptExistingData();
 		}
@@ -228,7 +240,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 15;
+	static readonly CURRENT_SCHEMA_VERSION = 16;
 
 	/**
 	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
@@ -367,6 +379,45 @@ export class SqliteStorage implements IStorageBackend {
 						)
 						.run(...params);
 				}
+			}
+		})();
+	}
+
+	/**
+	 * Set payments.created_at on rows written without it: every row from
+	 * before schema 16, and any an older release wrote since. A row that
+	 * cannot be decoded keeps NULL, which leaves it out of
+	 * paymentsNewestFirst as the loadAll* readers skip it, and is tried
+	 * again on the next open.
+	 */
+	private _fillPaymentCreatedAt(): void {
+		const rows = this.db
+			.prepare(
+				'SELECT payment_hash, payment_json FROM payments WHERE created_at IS NULL'
+			)
+			.all() as Array<{ payment_hash: string; payment_json: string }>;
+		if (rows.length === 0) return;
+		const update = this.db.prepare(
+			'UPDATE payments SET created_at = ? WHERE payment_hash = ?'
+		);
+		this.db.transaction(() => {
+			for (const row of rows) {
+				let createdAt: unknown;
+				try {
+					createdAt = deserializePaymentInfo(
+						JSON.parse(this._dec(row.payment_json))
+					).createdAt;
+				} catch (err) {
+					// Without the key no other row decodes either.
+					if (err instanceof StorageEncryptedError) return;
+					continue;
+				}
+				// A row whose timestamp is not a number is left as one that
+				// cannot be decoded; binding it would throw out of open().
+				if (typeof createdAt !== 'number' || !Number.isFinite(createdAt)) {
+					continue;
+				}
+				update.run(createdAt, row.payment_hash);
 			}
 		})();
 	}
@@ -726,9 +777,9 @@ export class SqliteStorage implements IStorageBackend {
 		const json = JSON.stringify(serialized);
 		this.db
 			.prepare(
-				'INSERT OR REPLACE INTO payments (payment_hash, payment_json) VALUES (?, ?)'
+				'INSERT OR REPLACE INTO payments (payment_hash, payment_json, created_at) VALUES (?, ?, ?)'
 			)
-			.run(paymentHash, this._enc(json));
+			.run(paymentHash, this._enc(json), payment.createdAt);
 	}
 
 	loadPayment(paymentHash: string): IPaymentInfo | null {
@@ -758,6 +809,62 @@ export class SqliteStorage implements IStorageBackend {
 			}
 		}
 		return results;
+	}
+
+	/**
+	 * Every payment row, newest first by created_at then payment_hash, read
+	 * from the index a batch of keys at a time. Nothing is decrypted until a
+	 * ref's load() is called, so a reader that stops at a page, or skips
+	 * rows to reach it, pays only for the rows it loads (issue #1403). A row
+	 * that cannot be decoded loads as null and is reported as the loadAll*
+	 * readers report one.
+	 */
+	*paymentsNewestFirst(since?: number): Generator<IStoredPaymentRef> {
+		const load = (paymentHash: string): IPaymentInfo | null => {
+			const row = this.db
+				.prepare('SELECT payment_json FROM payments WHERE payment_hash = ?')
+				.get(paymentHash) as { payment_json: string } | undefined;
+			if (!row) return null;
+			try {
+				return deserializePaymentInfo(JSON.parse(this._dec(row.payment_json)));
+			} catch (err) {
+				this.reportCorruptRow(err);
+				return null;
+			}
+		};
+		let after: [number, string] | undefined;
+		for (;;) {
+			const where = ['created_at IS NOT NULL'];
+			const params: unknown[] = [];
+			if (since !== undefined) {
+				where.push('created_at >= ?');
+				params.push(since);
+			}
+			if (after) {
+				where.push('(created_at, payment_hash) < (?, ?)');
+				params.push(...after);
+			}
+			const rows = this.db
+				.prepare(
+					'SELECT payment_hash, created_at FROM payments ' +
+						`WHERE ${where.join(' AND ')} ` +
+						'ORDER BY created_at DESC, payment_hash DESC LIMIT ?'
+				)
+				.all(...params, PAYMENT_KEY_BATCH) as Array<{
+				payment_hash: string;
+				created_at: number;
+			}>;
+			for (const row of rows) {
+				yield {
+					paymentHash: row.payment_hash,
+					createdAt: row.created_at,
+					load: (): IPaymentInfo | null => load(row.payment_hash)
+				};
+			}
+			if (rows.length < PAYMENT_KEY_BATCH) return;
+			const last = rows[rows.length - 1];
+			after = [last.created_at, last.payment_hash];
+		}
 	}
 
 	deletePayment(paymentHash: string): void {
@@ -1676,6 +1783,18 @@ export class SqliteStorage implements IStorageBackend {
 			// Migration 14->15: retain the selected peer transport across restarts.
 			(db): void => {
 				db.exec('ALTER TABLE peer_addresses ADD COLUMN transport_json TEXT');
+			},
+			// Migration 15->16: payments.created_at, indexed, so a page of
+			// payments is read newest first without decrypting the whole table
+			// to sort it (issue #1403). It is a plaintext lookup column: the
+			// hash beside it is already one, and the action log holds recent
+			// payments' hashes and times in plaintext. open() fills it for
+			// older rows.
+			(db): void => {
+				db.exec('ALTER TABLE payments ADD COLUMN created_at INTEGER');
+				db.exec(
+					'CREATE INDEX idx_payments_created_at ON payments(created_at, payment_hash)'
+				);
 			}
 		];
 

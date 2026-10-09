@@ -475,7 +475,9 @@ describe('persisted Iroh peer addresses', () => {
 			legacy.close();
 			const storage = new SqliteStorage(filename);
 			storage.open();
-			expect(storage.getSchemaVersion()).to.equal(15);
+			expect(storage.getSchemaVersion()).to.equal(
+				SqliteStorage.CURRENT_SCHEMA_VERSION
+			);
 			expect(storage.loadAllPeerAddresses()).to.deep.equal([
 				{ pubkey: PK, host: '127.0.0.1', port: 9735 }
 			]);

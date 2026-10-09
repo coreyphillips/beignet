@@ -97,6 +97,9 @@ const WAIT_ROUTES = new Set([
 ]);
 const WAIT_MAX_PER_KEY = 16;
 const WAIT_MAX_TIMEOUT_MS = 10 * 60 * 1000;
+// The most payments one GET /payments call returns, and what it returns
+// without a limit: every call is a page, never the whole history.
+export const PAYMENTS_PAGE_MAX = 1000;
 // Sockets the HTTP server holds at once, SSE streams and waits included. Past
 // it a new connection is closed on accept, so a flood of idle sockets cannot
 // take the descriptors the node's peers and database need.
@@ -1518,8 +1521,9 @@ async function bootDaemon(
 			if (query.get('direction')) filter.direction = query.get('direction');
 			const since = parseIntParam(query, 'since', { min: 0 });
 			if (since !== undefined) filter.since = since;
-			const limit = parseIntParam(query, 'limit', { min: 0 });
-			if (limit !== undefined) filter.limit = limit;
+			filter.limit =
+				parseIntParam(query, 'limit', { min: 0, max: PAYMENTS_PAGE_MAX }) ||
+				PAYMENTS_PAGE_MAX;
 			const offset = parseIntParam(query, 'offset', { min: 0 });
 			if (offset !== undefined) filter.offset = offset;
 			if (query.get('metadataKey'))
@@ -1529,7 +1533,7 @@ async function bootDaemon(
 			return success(
 				node.listPayments(
 					// eslint-disable-next-line @typescript-eslint/no-explicit-any -- query params are unvalidated strings; listPayments tolerates unknown values
-					Object.keys(filter).length > 0 ? (filter as any) : undefined
+					filter as any
 				)
 			);
 		},
