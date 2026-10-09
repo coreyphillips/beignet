@@ -314,11 +314,12 @@ export function directFundingWallet(
 		},
 
 		async unfreezeUtxo(txidHex: string, vout: number): Promise<boolean> {
-			// Ours only. A payment settling must not lift the freeze an operator put
-			// on the same coin, which outlives this payment by design.
-			if (frozenEntry(txidHex, vout)?.freezeTag !== DF_FREEZE_TAG) return false;
-			// Asked again under the wallet's lock: an operator freeze queued ahead
-			// of this call takes the entry over by clearing our tag.
+			// Ours only, decided under the wallet's lock. A payment settling must not
+			// lift the freeze an operator put on the same coin, which outlives this
+			// payment by design, and an operator freeze queued ahead of this call
+			// takes the entry over by clearing our tag. No entry at all answers
+			// true: an operator who already lifted it left nothing of ours to
+			// release, and false would keep the payer holding a spendable coin.
 			const result = await wallet.unfreezeUtxoIfTagged({
 				txid: txidHex,
 				index: vout,

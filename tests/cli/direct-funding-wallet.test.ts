@@ -19,8 +19,26 @@ import {
 	Wallet
 } from '../../src';
 import { directFundingWallet, IDfWallet } from '../../src/cli/direct-funding';
+import { DirectFundingSender } from '../../src/lightning/direct-funding/sender/engine';
+import {
+	DirectFundingPaymentStore,
+	DF_PAYMENTS_STORAGE_KEY
+} from '../../src/lightning/direct-funding/sender/records';
+import { IDfSenderCoin } from '../../src/lightning/direct-funding/sender/types';
+import { chainHashForNetwork } from '../../src/lightning/direct-funding/types';
+import { Network } from '../../src/lightning/invoice/types';
 import { IUtxo } from '../../src/types';
-import { ok, Result } from '../../src/utils';
+import { err, ok, Result } from '../../src/utils';
+import {
+	acceptingReceiver,
+	FakeSenderWallet,
+	flush,
+	makeCoin,
+	memoryStorage,
+	mintRequest,
+	registryWith,
+	ScriptedReceiverLane
+} from '../lightning/helpers/df-sender';
 
 const NETWORK = bitcoin.networks.regtest;
 const TXID = 'aa'.repeat(32);
@@ -139,6 +157,7 @@ describe('direct funding wallet: a freeze queued ahead of ours (issue #1253)', f
 	let store: Map<string, unknown>;
 	// Every blacklist write waits on this before it reaches storage.
 	let blacklistWrite: Promise<void> = Promise.resolve();
+	let refuseBlacklistWrites = false;
 
 	beforeEach(async function () {
 		store = new Map<string, unknown>();
@@ -151,7 +170,10 @@ describe('direct funding wallet: a freeze queued ahead of ours (issue #1253)', f
 				key: string,
 				value: IWalletData[K]
 			): Promise<Result<boolean>> => {
-				if (key.endsWith('blacklistedUtxos')) await blacklistWrite;
+				if (key.endsWith('blacklistedUtxos')) {
+					await blacklistWrite;
+					if (refuseBlacklistWrites) return err('storage is unavailable');
+				}
 				store.set(key, value);
 				return ok(true);
 			}
@@ -195,6 +217,7 @@ describe('direct funding wallet: a freeze queued ahead of ours (issue #1253)', f
 
 	afterEach(async function () {
 		blacklistWrite = Promise.resolve();
+		refuseBlacklistWrites = false;
 		await wallet?.stop();
 	});
 
@@ -267,6 +290,103 @@ describe('direct funding wallet: a freeze queued ahead of ours (issue #1253)', f
 			stored.some((f) => f.tx_hash === TXID_X && f.tx_pos === 0),
 			'the operator freeze in storage'
 		).to.equal(true);
+	});
+
+	it('counts a freeze the operator already lifted as released (issue #1422)', async () => {
+		const df = directFundingWallet(wallet, NETWORK);
+		expect(await df.freezeUtxo(TXID_X, 0)).to.equal(true);
+		const lifted = await wallet.unfreezeUtxo({ txid: TXID_X, index: 0 });
+		expect(lifted.isOk()).to.equal(true);
+		expect(await df.unfreezeUtxo(TXID_X, 0)).to.equal(true);
+	});
+
+	it('reports a release storage refused, and keeps its freeze (issue #1422)', async () => {
+		const df = directFundingWallet(wallet, NETWORK);
+		expect(await df.freezeUtxo(TXID_X, 0)).to.equal(true);
+		refuseBlacklistWrites = true;
+		expect(await df.unfreezeUtxo(TXID_X, 0)).to.equal(false);
+		const entry = wallet
+			.listFrozenUtxos()
+			.find((f) => f.tx_hash === TXID_X && f.tx_pos === 0);
+		expect(entry?.freezeTag).to.equal('direct-funding');
+	});
+
+	it('clears an interrupted payment whose freeze the operator lifted, and retries it (issue #1422)', async () => {
+		const coin = makeCoin();
+		const source = wallet.data.addressIndex[EAddressType.p2wpkh];
+		wallet.data.utxos.push({
+			address: source.address,
+			index: source.index,
+			path: source.path,
+			scriptHash: source.scriptHash,
+			height: 100,
+			tx_hash: coin.txidHex,
+			tx_pos: coin.vout,
+			value: Number(coin.valueSat),
+			publicKey: source.publicKey
+		});
+		// The test coin signs; the real wallet holds its reservation.
+		const df = directFundingWallet(wallet, NETWORK);
+		const payer = new FakeSenderWallet([coin]);
+		payer.listSpendable = (): IDfSenderCoin[] =>
+			payer.coins.filter((c) => !wallet.isUtxoFrozen(c.txidHex, c.vout));
+		payer.freezeUtxo = df.freezeUtxo;
+		payer.unfreezeUtxo = df.unfreezeUtxo;
+		const storage = memoryStorage();
+		const request = mintRequest();
+		const life = (): {
+			sender: DirectFundingSender;
+			payments: DirectFundingPaymentStore;
+		} => {
+			const payments = new DirectFundingPaymentStore({ storage });
+			payments.restore();
+			const lane = new ScriptedReceiverLane(
+				request,
+				acceptingReceiver(request, { noReceipt: true })
+			);
+			const sender = new DirectFundingSender(
+				{
+					wallet: payer,
+					registry: registryWith(lane),
+					payments,
+					chainHash: (): Buffer => chainHashForNetwork(Network.REGTEST)
+				},
+				{ offerResendDelaysMs: [], receiptTimeoutMs: 100 }
+			);
+			return { sender, payments };
+		};
+
+		await life().sender.send(request.encoded, { amountSat: 100_000n });
+		// A run that died after reserving the coin and before the witness left.
+		const rows = JSON.parse(storage.loadWalletData(DF_PAYMENTS_STORAGE_KEY)!);
+		delete rows[0].witness;
+		delete rows[0].witnessSent;
+		delete rows[0].attestation;
+		delete rows[0].negotiatedTx;
+		delete rows[0].fundingTxid;
+		rows[0].status = 'OFFERED';
+		rows[0].frozen = false;
+		storage.saveWalletData(DF_PAYMENTS_STORAGE_KEY, JSON.stringify(rows));
+		expect(rows[0].freezeReleased).to.equal(false);
+		const lifted = await wallet.unfreezeUtxo({
+			txid: coin.txidHex,
+			index: coin.vout
+		});
+		expect(lifted.isOk()).to.equal(true);
+
+		const { sender, payments } = life();
+		sender.start();
+		try {
+			await flush();
+			expect(payments.list()[0].freezeReleased).to.equal(true);
+			const retried = await sender.send(request.encoded, {
+				amountSat: 100_000n
+			});
+			expect(retried.status).to.equal('SIGNED_PENDING');
+			expect(retried.spentTxid).to.equal(coin.txidHex);
+		} finally {
+			sender.stop();
+		}
 	});
 });
 
