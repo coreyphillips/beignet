@@ -155,10 +155,14 @@ export class MetadataLedgerStore<R extends ILedgerRecord>
 		return `${this.prefix}:index`;
 	}
 
-	/** The stored ids, or null when the index is not a JSON array of strings. */
+	/**
+	 * The stored ids, or null when the index is not a JSON array of strings.
+	 * Only a missing index is empty: no write stores '', so a present empty
+	 * value is corrupt.
+	 */
 	private readIndex(): string[] | null {
 		const raw = this.storage.loadMetadata(this.indexKey());
-		if (!raw) return [];
+		if (raw === null) return [];
 		try {
 			const parsed = JSON.parse(raw) as unknown;
 			return Array.isArray(parsed) &&

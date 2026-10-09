@@ -257,7 +257,8 @@ describe('DurableLedger (issue #708 infrastructure)', () => {
 			encode: (r: IToyRecord): string => JSON.stringify(r),
 			decode: (s: string): IToyRecord => JSON.parse(s) as IToyRecord
 		};
-		for (const malformed of ['["funded"', '{}', '["funded",5]']) {
+		// '' is a present value, not a missing index (issue #1468).
+		for (const malformed of ['["funded"', '{}', '["funded",5]', '']) {
 			// No rollback, so a refused write must not have written anything.
 			const kv = new FakeKv();
 			kv.transaction = <T>(fn: () => T): T => fn();
@@ -288,6 +289,29 @@ describe('DurableLedger (issue #708 infrastructure)', () => {
 			expect(kv.rows, `${malformed}: metadata left as stored`).to.deep.equal(
 				stored
 			);
+		}
+	});
+
+	it('MetadataLedgerStore reads a missing index and a stored [] as empty (issue #1468)', () => {
+		const codec = {
+			encode: (r: IToyRecord): string => JSON.stringify(r),
+			decode: (s: string): IToyRecord => JSON.parse(s) as IToyRecord
+		};
+		for (const index of [null, '[]']) {
+			const kv = new FakeKv();
+			if (index !== null) kv.rows.set('toy:index', index);
+			const reported: string[] = [];
+			const ledger = new DurableLedger<IToyRecord>(
+				new MetadataLedgerStore<IToyRecord>(kv, 'toy', codec, (key) =>
+					reported.push(key)
+				)
+			);
+			expect(ledger.rehydrate(), String(index)).to.equal(0);
+			expect(reported, String(index)).to.deep.equal([]);
+			expect(ledger.insert({ id: 'x', state: 'A' }).outcome).to.equal(
+				'applied'
+			);
+			expect(kv.rows.get('toy:index'), String(index)).to.equal('["x"]');
 		}
 	});
 
