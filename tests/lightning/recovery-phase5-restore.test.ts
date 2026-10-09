@@ -23,11 +23,13 @@ import {
 	GuardianReplicator,
 	GuardianRotation,
 	GuardianTransportError,
+	GuardianVerbName,
 	IGuardianReplicationEvent,
 	IParsedGuardian,
 	GuardianState,
 	GuardianStatus,
 	IBoundGuardianClient,
+	IGuardianGetHeadResponse,
 	IGuardianRecord,
 	IRestoreEvent,
 	IWriterLeaseKeys,
@@ -45,6 +47,8 @@ import {
 	decodePutStateRequest,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
+	dispatchGuardianVerb,
+	encodeGuardianInfo,
 	genesisLogHead,
 	generateWriterKey,
 	GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES,
@@ -59,6 +63,7 @@ import {
 	signAcquisition,
 	signTranscript,
 	stateBytes,
+	takeoverTranscriptHash,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
@@ -822,6 +827,113 @@ describe('Recovery phase 5: restore driver', () => {
 		await shutdown(served);
 		live.storage.close();
 		target.close();
+	});
+
+	it('keeps a held acquisition key despite later certificates from another namespace', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = GUARDIAN_SECRETS.map((guardianSecret, index) => {
+			const guardian = new ReferenceGuardian({
+				path: ':memory:',
+				guardianSecret,
+				members: GUARDIAN_IDS,
+				clock
+			});
+			return {
+				guardian,
+				expectedGuardianId: GUARDIAN_IDS[index],
+				client: new GuardianClient({
+					url: 'http://guardian.example',
+					guardianSetId: SET_ID,
+					transport: async (
+						url,
+						init
+					): Promise<{ status: number; body: Buffer }> => ({
+						status: 200,
+						body:
+							init.method === 'GET'
+								? encodeGuardianInfo(guardian)
+								: dispatchGuardianVerb(
+										guardian,
+										url.split('/').pop() as GuardianVerbName,
+										init.body!
+								  )
+					})
+				})
+			};
+		});
+		const live = liveNode(1);
+		const rep = replicatorFor(live.storage, served);
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		const writer = generateWriterKey();
+		const guard = await grantNext(served[0].client, lease, writer);
+		const target = openStorage();
+		persistPending(target, guard, writer);
+
+		const foreignRoot = deriveRecoveryRoot(sha('p5-restore-foreign-node'));
+		const foreignWriter = generateWriterKey();
+		const foreignState: GuardianState = {
+			...guard,
+			recoveryId: foreignRoot.recoveryId,
+			lease: { epoch: 2n, writerPublicKey: foreignWriter.publicKey },
+			logHead: genesisLogHead()
+		};
+		const originalHeads = served.map((entry) =>
+			entry.client.getHead.bind(entry.client)
+		);
+		for (const [index, entry] of served.entries()) {
+			const issuedAt = clock();
+			const certificate = {
+				protocolVersion: 1,
+				guardianSetId: SET_ID,
+				guardianId: entry.expectedGuardianId,
+				supersededState: foreignState,
+				newEpoch: 3n,
+				newWriterPublicKey: foreignWriter.publicKey,
+				issuedAt,
+				signature: signTranscript(
+					takeoverTranscriptHash(
+						SET_ID,
+						entry.expectedGuardianId,
+						foreignState,
+						3n,
+						foreignWriter.publicKey,
+						issuedAt
+					),
+					GUARDIAN_SECRETS[index]
+				)
+			};
+			entry.client.getHead = async (
+				recoveryId: Buffer
+			): Promise<IGuardianGetHeadResponse> => {
+				const head = await originalHeads[index](recoveryId);
+				return {
+					...head,
+					certificates: [...(head.certificates ?? []), certificate]
+				};
+			};
+		}
+
+		const events: IRestoreEvent[] = [];
+		const result = await driverFor(target, served, events).restore();
+		expect(events.some((event) => event.type === 'epoch:abandoned')).to.equal(
+			false
+		);
+		expect(result.lease.epoch).to.equal(2n);
+		expect(result.lease.writerPublicKey.equals(writer.publicKey)).to.equal(
+			true
+		);
+		for (const [index, entry] of served.entries()) {
+			entry.client.getHead = originalHeads[index];
+		}
+		const later = openStorage();
+		expect((await driverFor(later, served).restore()).lease.epoch).to.equal(3n);
+
+		for (const entry of served) entry.guardian.close();
+		live.storage.close();
+		target.close();
+		later.close();
 	});
 
 	it('completes a takeover that raced a live append once the third guardian returns', async function (): Promise<void> {

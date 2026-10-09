@@ -945,6 +945,9 @@ export class RestoreDriver {
 		return this.certificateBundles(readings).some(
 			(bundle) =>
 				bundle.length >= this.config.required &&
+				bundle[0].supersededState.recoveryId.equals(
+					attempt.expectedState.recoveryId
+				) &&
 				(bundle[0].newEpoch > attempt.newEpoch ||
 					(bundle[0].newEpoch === attempt.newEpoch &&
 						!bundle[0].newWriterPublicKey.equals(attempt.writer.publicKey)))
