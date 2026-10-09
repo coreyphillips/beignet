@@ -6510,11 +6510,18 @@ export class Wallet {
 		if (privateKeyInfo.isErr()) {
 			return err(privateKeyInfo.error.message);
 		}
-		const { balance, keyPair } = privateKeyInfo.value;
-		let utxos = privateKeyInfo.value.utxos;
-		utxos = utxos.map((utxo) => {
-			return { ...utxo, keyPair };
-		});
+		const { keyPair } = privateKeyInfo.value;
+		// addInput refuses a coin below its script's dust threshold, so one
+		// unsolicited dust deposit would abort the sweep of every other coin.
+		let utxos: IUtxo[] = privateKeyInfo.value.utxos
+			.filter((utxo) => utxo.value >= getDustThreshold(utxo.address))
+			.map((utxo) => {
+				return { ...utxo, keyPair };
+			});
+		if (!utxos.length) {
+			return err('Every UTXO held by this key is below the dust limit.');
+		}
+		const balance = utxos.reduce((total, utxo) => total + utxo.value, 0);
 		if (combineWithWalletUtxos) {
 			const walletUtxos = this.data.utxos;
 			utxos = [...walletUtxos, ...utxos];
