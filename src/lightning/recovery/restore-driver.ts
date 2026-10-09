@@ -934,6 +934,23 @@ export class RestoreDriver {
 		});
 	}
 
+	/**
+	 * Whether a quorum certified another takeover over this attempt: a later
+	 * epoch, or its own epoch under another key. Either fences it for good.
+	 */
+	private superseded(
+		attempt: IPendingAttempt,
+		readings: IHeadReading[]
+	): boolean {
+		return this.certificateBundles(readings).some(
+			(bundle) =>
+				bundle.length >= this.config.required &&
+				(bundle[0].newEpoch > attempt.newEpoch ||
+					(bundle[0].newEpoch === attempt.newEpoch &&
+						!bundle[0].newWriterPublicKey.equals(attempt.writer.publicKey)))
+		);
+	}
+
 	/** A guardian that granted this attempt and has not moved past it. */
 	private boundTo(reading: IHeadReading, attempt: IPendingAttempt): boolean {
 		return this.grantedOver(reading.state, attempt, attempt.expectedState);
@@ -1101,6 +1118,17 @@ export class RestoreDriver {
 		let repaired = 0;
 		let pending = this.loadPending();
 		let held = false;
+		// Checked before the first round, not only after a failed one: a
+		// guardian replays its grant of the attempt after it has moved on to
+		// a later takeover, so the round would complete a fenced epoch.
+		if (pending && this.superseded(pending, pool)) {
+			this.emit(
+				'epoch:abandoned',
+				`epoch ${pending.newEpoch} was won by another writer; starting a new acquisition`
+			);
+			this.clearPending();
+			pending = null;
+		}
 		if (pending) {
 			held = this.mayBeHeld(pending, pool, stalePool);
 			this.emit(
@@ -1218,15 +1246,7 @@ export class RestoreDriver {
 			const attemptSoFar = pending as IPendingAttempt;
 			// One: a quorum-certified takeover superseded it, so it can never
 			// complete no matter how often it is retried.
-			const superseded = this.certificateBundles(pool).some(
-				(bundle) =>
-					bundle.length >= this.config.required &&
-					(bundle[0].newEpoch > attemptSoFar.newEpoch ||
-						(bundle[0].newEpoch === attemptSoFar.newEpoch &&
-							!bundle[0].newWriterPublicKey.equals(
-								attemptSoFar.writer.publicKey
-							)))
-			);
+			const superseded = this.superseded(attemptSoFar, pool);
 			// Two: NOTHING can hold it (no certificate collected, and every
 			// guardian's head shows it never granted the attempt), while the
 			// reconciled head has moved on. That is the still-live-old-writer
