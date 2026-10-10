@@ -22181,12 +22181,15 @@ export class LightningNode extends EventEmitter {
 	 * fulfilled part of the set, or when the channel refused any parked part.
 	 * Refused parts stay parked and the cancel is retried, with its original
 	 * failure code and reason, on reestablish and on every block; true only
-	 * once every part was failed back.
+	 * once every part was failed back. A cancel refused for every part is
+	 * retried only with `bindWhenRefused`; otherwise nothing reached the
+	 * payer and the caller may still settle instead.
 	 */
 	cancelHeldHtlc(
 		paymentHash: Buffer,
 		failureCode: number = INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
-		cancelReason: HoldCancelReason = 'api'
+		cancelReason: HoldCancelReason = 'api',
+		bindWhenRefused = false
 	): boolean {
 		const hashHex = paymentHash.toString('hex');
 		const held = this.heldHtlcs.get(hashHex);
@@ -22242,10 +22245,9 @@ export class LightningNode extends EventEmitter {
 		}
 		// Nothing reached the payer (a channel awaiting reestablish refuses every
 		// fail, for one). Report the refusal and leave the set parked rather than
-		// closing the invoice CANCELLED over HTLCs the payer still holds; the
-		// expiry sweeper retries this same call on every block.
+		// closing the invoice CANCELLED over HTLCs the payer still holds.
 		if (refused.length === held.length) {
-			if (!chosen) {
+			if (!chosen && !bindWhenRefused) {
 				this.heldResolutions.delete(hashHex);
 				this.persistHeldHtlcs();
 			}
@@ -28654,8 +28656,22 @@ export class LightningNode extends EventEmitter {
 				hashInUse: (paymentHash) => this.paymentHashInUse(paymentHash),
 				settleHeld: (paymentHash, preimage) =>
 					this.settleHeldHtlc(paymentHash, preimage),
-				cancelHold: (paymentHash) => {
-					this.cancelHoldInvoice(paymentHash);
+				cancelHold: (paymentHash): boolean => {
+					const hashHex = paymentHash.toString('hex');
+					// The swap has ended, so the cancel is owed for good: one the
+					// channel refuses for every part stays bound for the retries
+					// on reestablish, on every block and after a restart.
+					if (this.heldHtlcs.has(hashHex)) {
+						this.cancelHeldHtlc(
+							paymentHash,
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+							'api',
+							true
+						);
+					} else {
+						this.cancelHoldInvoice(paymentHash);
+					}
+					return !this.heldHtlcs.has(hashHex);
 				},
 				forgetHold: (paymentHash): boolean =>
 					this.forgetCancelledHoldInvoice(paymentHash),

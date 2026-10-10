@@ -149,6 +149,8 @@ export class FakeHolds {
 	failCreate = false;
 	settleReturns: boolean | undefined;
 	settleThrows = false;
+	/** A channel awaiting reestablish: every fail of a parked part refused. */
+	cancelRefused = false;
 	forgetFails = false;
 	/** Hashes the node already holds a record for (invoice, payment, hold). */
 	readonly inUse = new Set<string>();
@@ -257,17 +259,19 @@ export class FakeHolds {
 		return true;
 	}
 
-	cancelHold(paymentHash: Buffer): void {
+	cancelHold(paymentHash: Buffer): boolean {
 		const hashHex = paymentHash.toString('hex');
 		if (
 			!this.invoices.has(hashHex) ||
 			this.cancelledHashes.has(hashHex) ||
 			this.settledHashes.has(hashHex)
 		)
-			return;
+			return true;
+		if (this.cancelRefused && this.parts.get(hashHex)?.length) return false;
 		this.cancelled.push(hashHex);
 		this.parts.delete(hashHex);
 		this.cancelledHashes.add(hashHex);
+		return true;
 	}
 
 	/** Mirrors the node: only a cancelled hold with nothing parked is dropped. */
