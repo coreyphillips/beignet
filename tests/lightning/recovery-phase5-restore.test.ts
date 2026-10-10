@@ -1731,6 +1731,96 @@ describe('Recovery phase 5: restore driver', () => {
 		other.close();
 	});
 
+	it('completes a resumed split grant whose quorum needs a possibly-stale signer', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		// Issue #1498. G2 granted the attempt over N and now reports
+		// possibly_stale, G1 granted it over N+1, and G3 is still under the
+		// old lease at N+2. Only G2's signed grant completes the quorum.
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const clients = served.map((s) => s.client);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		const writer = generateWriterKey();
+		await grantNext(clients[1], lease, writer);
+
+		const append = (n: number): IGuardianRecord => {
+			live.manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'payment_preimage',
+						paymentHash: Buffer.alloc(32, n).toString('hex'),
+						preimage: Buffer.alloc(32, n)
+					}
+				],
+				outboundMessages: []
+			});
+			const all = live.storage.loadRecoveryFrames();
+			return rep.signRecord(all[all.length - 1], lease);
+		};
+		const tail = append(93);
+		for (const client of [clients[0], clients[2]]) {
+			expect((await client.putState(tail)).status).to.equal(GuardianStatus.OK);
+		}
+		const certifiedDump = dumpTables(live.storage);
+		const guard = await grantNext(clients[0], lease, writer);
+		expect((await clients[2].putState(append(94))).status).to.equal(
+			GuardianStatus.OK
+		);
+		const target = openStorage();
+		persistPending(target, guard, writer);
+		const n = guard.logHead.sequence;
+
+		// A possibly-stale guardian refuses every acquisition (wire 5.3).
+		const staleG2 = new Proxy(clients[1], {
+			get(t, prop, receiver): unknown {
+				if (prop === 'getHead') {
+					return async (id: Buffer): Promise<unknown> => ({
+						...(await t.getHead(id)),
+						possiblyStale: true
+					});
+				}
+				if (prop === 'acquireEpoch') {
+					return async (): Promise<unknown> => ({
+						status: GuardianStatus.ERR_STORE_UNCERTAIN
+					});
+				}
+				const value = Reflect.get(t, prop, receiver);
+				return typeof value === 'function' ? value.bind(t) : value;
+			}
+		});
+		const result = await driverFor(target, [
+			bind(served)[0],
+			{ client: staleG2, expectedGuardianId: served[1].id },
+			bind(served)[2]
+		]).restore();
+		expect(result.lease.epoch).to.equal(lease.epoch + 1n);
+		expect(result.lease.writerPublicKey.equals(writer.publicKey)).to.equal(
+			true
+		);
+		expect(result.certifiedState.logHead.sequence).to.equal(n);
+		expect(dumpTables(target)).to.equal(certifiedDump);
+
+		// G3 is on the new lease over N+1, and its N+2, which never reached
+		// a quorum, is gone from its log.
+		const head = (await clients[2].getHead(ROOT.recoveryId))
+			.state as GuardianState;
+		expect(head.lease.epoch).to.equal(lease.epoch + 1n);
+		expect(head.lease.writerPublicKey.equals(writer.publicKey)).to.equal(true);
+		expect(head.logHead.sequence).to.equal(n);
+		const above = await clients[2].getState(ROOT.recoveryId, n, 8);
+		expect(above.records ?? []).to.have.length(0);
+
+		await shutdown(served);
+		live.storage.close();
+		target.close();
+	});
+
 	it('abandons a resumed attempt a takeover fenced after the heads were read', async function (): Promise<void> {
 		// Real guardians over real TCP: the default 2s is not enough under
 		// full-suite load, and a load-sensitive timeout is a flaky test.

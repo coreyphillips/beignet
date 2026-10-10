@@ -1075,14 +1075,16 @@ export class RestoreDriver {
 	 * guard can gather a quorum any more, and none has to, because the
 	 * takeover is complete at the highest head. The other members are
 	 * brought onto it: one still under the old lease through SYNC_EPOCH,
-	 * one granted over a lower head by relaying the records up to it.
+	 * one granted over a lower head by relaying the records up to it. A
+	 * possibly-stale signer's grant counts toward the quorum, but its head
+	 * is never the source.
 	 */
 	private async finishSplitGrant(
 		attempt: IPendingAttempt,
 		pool: IHeadReading[],
 		stale: IHeadReading[]
 	): Promise<IAcquired | null> {
-		const bundle = this.certificateBundles(pool).find(
+		const bundle = this.certificateBundles([...pool, ...stale]).find(
 			(certs) =>
 				certs.length >= this.config.required &&
 				certs[0].newEpoch === attempt.newEpoch &&
