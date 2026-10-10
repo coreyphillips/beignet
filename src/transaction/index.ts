@@ -750,7 +750,8 @@ export class Transaction {
 		transactionByteCount: number;
 		balance?: number;
 	}): number => {
-		return Math.floor(balance / (2 * transactionByteCount));
+		// updateFee refuses a fee of half the balance, so stay strictly under it.
+		return Math.max(0, Math.ceil(balance / (2 * transactionByteCount)) - 1);
 	};
 
 	/**

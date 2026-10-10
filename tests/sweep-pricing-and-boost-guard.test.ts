@@ -454,6 +454,38 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			}
 		);
 
+		// #1518: half the 41,800 payment is exactly 100 sat/vB over 209 vB, a fee
+		// updateFee refuses.
+		[ECoinSelectPreference.small, ECoinSelectPreference.large].forEach(
+			(preference) => {
+				it(`quotes a maximum rate under half the payment with preference ${preference}`, async function () {
+					wallet.updateCoinSelectPreference(preference);
+					stubTwoInputBoostedTransaction(41_800);
+
+					const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+					if (res.isErr()) throw res.error;
+					const quote = wallet.getFeeInfo({ satsPerByte: 20 });
+					if (quote.isErr()) throw quote.error;
+
+					const { maxSatPerByte, transactionByteCount } = quote.value;
+					const atMax = wallet.transaction.updateFee({
+						satsPerByte: maxSatPerByte
+					});
+					if (atMax.isErr()) throw atMax.error;
+					expect(atMax.value.fee).to.equal(
+						maxSatPerByte * transactionByteCount
+					);
+					expect((maxSatPerByte + 1) * transactionByteCount).to.equal(
+						41_800 / 2
+					);
+					const overMax = wallet.transaction.updateFee({
+						satsPerByte: maxSatPerByte + 1
+					});
+					expect(overMax.isErr(), 'one more sat/vB is refused').to.equal(true);
+				});
+			}
+		);
+
 		// #1430: at these estimates the quote was 1,660 sats and minFee 2, both
 		// under the original's 10k fee.
 		it('outbids the original fee when estimates have fallen', async function () {
