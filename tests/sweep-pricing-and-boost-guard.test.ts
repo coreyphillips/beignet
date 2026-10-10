@@ -377,6 +377,37 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 				160_000 - atMax.value.fee
 			]);
 		});
+
+		[
+			{ input: 30_004, payment: 39_872, maximum: 95 },
+			{ input: 55_903, payment: 74_404, maximum: 177 }
+		].forEach(({ input, payment, maximum }) => {
+			it(`prices generated change below half a ${payment}-sat payment`, async function () {
+				wallet.updateCoinSelectPreference(ECoinSelectPreference.consolidate);
+				injectUtxo(FUNDING_TXID, input);
+				injectUtxo(BOOSTED_TXID, input);
+				const setup = await wallet.transaction.setupTransaction();
+				if (setup.isErr()) throw setup.error;
+				const staged = wallet.transaction.updateSendTransaction({
+					transaction: {
+						changeAddress: '',
+						outputs: [{ address: P2WPKH, value: payment, index: 0 }]
+					}
+				});
+				if (staged.isErr()) throw staged.error;
+
+				const quote = wallet.getFeeInfo({ satsPerByte: 1000 });
+				if (quote.isErr()) throw quote.error;
+				expect(quote.value.maxSatPerByte).to.equal(maximum);
+				expect(quote.value.transactionByteCount).to.equal(209);
+				expect(quote.value.totalFee).to.equal(209 * maximum);
+				const atMax = wallet.transaction.updateFee({
+					satsPerByte: quote.value.maxSatPerByte
+				});
+				if (atMax.isErr()) throw atMax.error;
+				expect(atMax.value.fee).to.equal(quote.value.totalFee);
+			});
+		});
 	});
 
 	describe('setupRbf', function () {
