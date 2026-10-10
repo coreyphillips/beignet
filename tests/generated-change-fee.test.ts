@@ -53,6 +53,9 @@ describe('Fee estimation with generated change (#1465)', function () {
 	this.timeout(120000);
 
 	let wallet: Wallet;
+	// Never refreshed, so its change index is unset and the builder derives
+	// change through getChangeAddress.
+	let freshWallet: Wallet;
 	let inputs: IUtxo[];
 	let changeAddress: string;
 
@@ -66,6 +69,18 @@ describe('Fee estimation with generated change (#1465)', function () {
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
+		const fresh = await Wallet.create({
+			mnemonic: MNEMONIC,
+			network,
+			addressType: EAddressType.p2wpkh,
+			electrumOptions,
+			name: 'generatedchangefeefresh',
+			disableRefreshOnCreate: true
+		});
+		if (fresh.isErr()) throw fresh.error;
+		freshWallet = fresh.value;
+		expect(freshWallet.data.changeAddressIndex[EAddressType.p2wpkh].address).to
+			.be.empty;
 		// Populates the change address; the Electrum sync fails harmlessly
 		// offline.
 		await wallet.refreshWallet({});
@@ -97,15 +112,18 @@ describe('Fee estimation with generated change (#1465)', function () {
 			value: INPUT_VALUE,
 			publicKey: node.value.publicKey.toString('hex')
 		}));
-		const electrum = wallet.electrum as unknown as {
-			getTransactions: () => Promise<unknown>;
-		};
-		electrum.getTransactions = async (): Promise<unknown> =>
-			ok({ data: [{ result: { hex: prevTx.toHex() } }] });
+		for (const target of [wallet, freshWallet]) {
+			const electrum = target.electrum as unknown as {
+				getTransactions: () => Promise<unknown>;
+			};
+			electrum.getTransactions = async (): Promise<unknown> =>
+				ok({ data: [{ result: { hex: prevTx.toHex() } }] });
+		}
 	});
 
 	after(async () => {
 		await wallet?.stop();
+		await freshWallet?.stop();
 	});
 
 	/** The four inputs and the payment, plus one change output if asked. */
@@ -121,9 +139,18 @@ describe('Fee estimation with generated change (#1465)', function () {
 		// itself are under P2WPKH dust (294) and go to the fee. Priced without,
 		// the builder would add 300 sats of change at the cheaper fee.
 		{ satsPerByte: 1, leftover: 300, pricedWithChange: true, change: false },
-		{ satsPerByte: 1, leftover: 200, pricedWithChange: false, change: false }
-	].forEach(({ satsPerByte, leftover, pricedWithChange, change }) => {
-		it(`meets ${satsPerByte} sat/vB with ${leftover} sats left over`, async () => {
+		{ satsPerByte: 1, leftover: 200, pricedWithChange: false, change: false },
+		{
+			satsPerByte: 1,
+			leftover: 600,
+			pricedWithChange: true,
+			change: true,
+			fresh: true
+		}
+	].forEach(({ satsPerByte, leftover, pricedWithChange, change, fresh }) => {
+		const title = `meets ${satsPerByte} sat/vB with ${leftover} sats left over`;
+		it(fresh ? `${title} before the change index is set` : title, async () => {
+			const target = fresh ? freshWallet : wallet;
 			const payment = INPUT_TOTAL - priceAt(satsPerByte, false) - leftover;
 			const transaction = {
 				inputs,
@@ -131,12 +158,12 @@ describe('Fee estimation with generated change (#1465)', function () {
 				changeAddress: '',
 				satsPerByte
 			};
-			const fee = wallet.transaction.getTotalFee({
+			const fee = target.transaction.getTotalFee({
 				satsPerByte,
 				transaction,
 				coinSelectPreference: ECoinSelectPreference.consolidate
 			});
-			const feeObj = wallet.transaction.getTotalFeeObj({
+			const feeObj = target.transaction.getTotalFeeObj({
 				satsPerByte,
 				transaction,
 				coinSelectPreference: ECoinSelectPreference.consolidate
@@ -145,11 +172,11 @@ describe('Fee estimation with generated change (#1465)', function () {
 			expect(fee).to.equal(priceAt(satsPerByte, pricedWithChange));
 			expect(feeObj.value.totalFee).to.equal(fee);
 
-			await wallet.transaction.resetSendTransaction();
-			wallet.transaction.updateSendTransaction({
+			await target.transaction.resetSendTransaction();
+			target.transaction.updateSendTransaction({
 				transaction: { ...transaction, fee }
 			});
-			const res = await wallet.transaction.createTransaction({
+			const res = await target.transaction.createTransaction({
 				shuffleOutputs: false
 			});
 			if (res.isErr()) throw res.error;

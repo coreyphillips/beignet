@@ -349,13 +349,40 @@ export class Transaction {
 	}): string | undefined {
 		if (transaction.changeAddress || transaction.max) return undefined;
 		const address =
-			this._wallet.data.changeAddressIndex[this._wallet.addressType]?.address;
+			this._wallet.data.changeAddressIndex[this._wallet.addressType]?.address ||
+			this.changeAddressStandIn();
 		if (!address) return undefined;
 		const leftover =
 			this.getTransactionInputValue({ inputs }) -
 			this.getTransactionOutputValue({ outputs: transaction.outputs ?? [] }) -
 			fee;
 		return leftover >= getDustThreshold(address) ? address : undefined;
+	}
+
+	/**
+	 * An address of the type getChangeAddress derives, for a wallet that has
+	 * not set its change index yet. getChangeAddress derives one on the fly
+	 * there and the builder pays change to it. The estimate only needs the
+	 * output's size and dust threshold, which the script type alone sets, so
+	 * an all-zero program stands in.
+	 * @private
+	 * @returns {string | undefined}
+	 */
+	private changeAddressStandIn(): string | undefined {
+		const network = getBitcoinJsNetwork(this._wallet.network);
+		const hash = Buffer.alloc(20);
+		switch (this._wallet.addressType) {
+			case EAddressType.p2wpkh:
+				return bitcoin.payments.p2wpkh({ hash, network }).address;
+			case EAddressType.p2sh:
+				return bitcoin.payments.p2sh({ hash, network }).address;
+			case EAddressType.p2pkh:
+				return bitcoin.payments.p2pkh({ hash, network }).address;
+			case EAddressType.p2wsh:
+				return bitcoin.address.toBech32(Buffer.alloc(32), 0, network.bech32);
+			case EAddressType.p2tr:
+				return bitcoin.address.toBech32(Buffer.alloc(32), 1, network.bech32);
+		}
 	}
 
 	/**
