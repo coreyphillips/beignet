@@ -449,51 +449,69 @@ export class Transaction {
 			}
 			const outputs = transaction.outputs || [];
 			const changeAddress = transaction.changeAddress;
-
-			//Group all input & output addresses into their respective array.
-			const inputAddresses = inputs.map((input) => input.address);
-			const outputAddresses = outputs.map((output) => output.address);
-
 			//No need for a change address when draining the wallet
-			if (changeAddress && !transaction.max) {
-				outputAddresses.push(changeAddress);
-			}
-
-			// Every transaction pays to at least one output, even when the caller has
-			// not named it yet. sendMax works out the amount before it knows where it
-			// is going, so the outputs are still empty here; counting none of them
-			// priced the sweep one output short and it went out below the rate that
-			// was asked for. getTotalFeeObj already assumes the output. Assume it here
-			// too, or the two disagree about the same transaction.
-			let increaseAddressCount = 0;
-			if (!outputAddresses.length) {
-				increaseAddressCount++;
-			}
+			const pricesChange = !!changeAddress && !transaction.max;
 
 			//Determine the address type of each address and construct the object for fee calculation
+			const inputAddresses = inputs.map((input) => input.address);
 			const inputParam = this.applyMultisigInputWeights(
 				constructByteCountParam(inputAddresses)
 			);
-			const outputParam = constructByteCountParam(outputAddresses, [
-				{ addrType: this._wallet.addressType, count: increaseAddressCount }
-			]);
-			// A channel funding output is a 2-of-2 P2WSH (43 vB), not the P2WPKH
-			// (31 vB) an ordinary send pays to. Counting it as P2WPKH understates
-			// every channel funding transaction by 12 vB, which is a real shortfall
-			// at the fee rates a funding transaction is actually broadcast at.
-			if (fundingLightning) {
-				const fundingOutputs = outputParam as TGetByteCountOutputs;
-				fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
-			}
 
-			let transactionByteCount = getByteCount(inputParam, outputParam, message);
-			if (satsPerByte < 2 && !this.skipsSizeFloor(transaction, inputs)) {
-				const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
-				if (transactionByteCount < minByteCount)
-					transactionByteCount = minByteCount;
+			const feeFor = (withChange: boolean): number => {
+				const outputAddresses = outputs.map((output) => output.address);
+				if (withChange && changeAddress) {
+					outputAddresses.push(changeAddress);
+				}
+
+				// Every transaction pays to at least one output, even when the caller has
+				// not named it yet. sendMax works out the amount before it knows where it
+				// is going, so the outputs are still empty here; counting none of them
+				// priced the sweep one output short and it went out below the rate that
+				// was asked for. getTotalFeeObj already assumes the output. Assume it here
+				// too, or the two disagree about the same transaction.
+				let increaseAddressCount = 0;
+				if (!outputAddresses.length) {
+					increaseAddressCount++;
+				}
+
+				const outputParam = constructByteCountParam(outputAddresses, [
+					{ addrType: this._wallet.addressType, count: increaseAddressCount }
+				]);
+				// A channel funding output is a 2-of-2 P2WSH (43 vB), not the P2WPKH
+				// (31 vB) an ordinary send pays to. Counting it as P2WPKH understates
+				// every channel funding transaction by 12 vB, which is a real shortfall
+				// at the fee rates a funding transaction is actually broadcast at.
+				if (fundingLightning) {
+					const fundingOutputs = outputParam as TGetByteCountOutputs;
+					fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
+				}
+
+				let transactionByteCount = getByteCount(
+					inputParam,
+					outputParam,
+					message
+				);
+				if (satsPerByte < 2 && !this.skipsSizeFloor(transaction, inputs)) {
+					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
+					if (transactionByteCount < minByteCount)
+						transactionByteCount = minByteCount;
+				}
+				// Outputs are whole sats, so a fractional rate rounds the fee up.
+				return Math.ceil(transactionByteCount * satsPerByte);
+			};
+
+			const fee = feeFor(pricesChange);
+			if (pricesChange) {
+				// The change output can cost more than the inputs have left over.
+				// The payment may still meet the rate without it, and quoting the
+				// whole leftover as the fee leaves the builder nothing to pay change
+				// from.
+				const available =
+					this.getTransactionInputValue({ inputs }) -
+					this.getTransactionOutputValue({ outputs });
+				if (fee > available && feeFor(false) <= available) return available;
 			}
-			// Outputs are whole sats, so a fractional rate rounds the fee up.
-			const fee = Math.ceil(transactionByteCount * satsPerByte);
 			const generatedChange = this.generatedChangeAddress({
 				transaction,
 				inputs,
@@ -590,42 +608,53 @@ export class Transaction {
 				});
 			}
 
-			//Group all input & output addresses into their respective array.
-			const inputAddresses = inputs.map((input) => input.address);
-			const outputAddresses = outputs.map((output) => output.address);
-
-			// Always assume we're sending to at least one output for a proper base calculation.
-			let increaseAddressCount = 0;
-			if (!outputAddresses.length) {
-				increaseAddressCount++;
-			}
 			//No need for a change address when draining the wallet
-			if (changeAddress && !transaction.max) {
-				outputAddresses.push(changeAddress);
-			}
+			const pricesChange = !!changeAddress && !transaction.max;
 
 			//Determine the address type of each address and construct the object for fee calculation
+			const inputAddresses = inputs.map((input) => input.address);
 			const inputParam = this.applyMultisigInputWeights(
 				constructByteCountParam(inputAddresses)
 			);
-			const outputParam = constructByteCountParam(outputAddresses, [
-				{ addrType: this._wallet.addressType, count: increaseAddressCount }
-			]);
-			// A channel funding output is a 2-of-2 P2WSH (43 vB), not the P2WPKH
-			// (31 vB) an ordinary send pays to. Counting it as P2WPKH understates
-			// every channel funding transaction by 12 vB, which is a real shortfall
-			// at the fee rates a funding transaction is actually broadcast at.
-			if (fundingLightning) {
-				const fundingOutputs = outputParam as TGetByteCountOutputs;
-				fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
-			}
 
-			let transactionByteCount = getByteCount(inputParam, outputParam, message);
-			if (satsPerByte < 2 && !this.skipsSizeFloor(transaction, inputs)) {
-				const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
-				if (transactionByteCount < minByteCount)
-					transactionByteCount = minByteCount;
-			}
+			const byteCountFor = (withChange: boolean): number => {
+				const outputAddresses = outputs.map((output) => output.address);
+
+				// Always assume we're sending to at least one output for a proper base calculation.
+				let increaseAddressCount = 0;
+				if (!outputAddresses.length) {
+					increaseAddressCount++;
+				}
+				if (withChange && changeAddress) {
+					outputAddresses.push(changeAddress);
+				}
+
+				const outputParam = constructByteCountParam(outputAddresses, [
+					{ addrType: this._wallet.addressType, count: increaseAddressCount }
+				]);
+				// A channel funding output is a 2-of-2 P2WSH (43 vB), not the P2WPKH
+				// (31 vB) an ordinary send pays to. Counting it as P2WPKH understates
+				// every channel funding transaction by 12 vB, which is a real shortfall
+				// at the fee rates a funding transaction is actually broadcast at.
+				if (fundingLightning) {
+					const fundingOutputs = outputParam as TGetByteCountOutputs;
+					fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
+				}
+
+				let transactionByteCount = getByteCount(
+					inputParam,
+					outputParam,
+					message
+				);
+				if (satsPerByte < 2 && !this.skipsSizeFloor(transaction, inputs)) {
+					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
+					if (transactionByteCount < minByteCount)
+						transactionByteCount = minByteCount;
+				}
+				return transactionByteCount;
+			};
+
+			let transactionByteCount = byteCountFor(pricesChange);
 			const generatedChange = this.generatedChangeAddress({
 				transaction,
 				inputs,
@@ -650,6 +679,28 @@ export class Transaction {
 			// To prevent the user from spending more in fees than their output, use the output amount if available.
 			const txBalance =
 				outputAmount && outputAmount < inputAmount ? outputAmount : inputAmount;
+			// See getTotalFee: a payment that cannot also pay for its change output
+			// goes without it, with the whole leftover as the fee. updateFee refuses
+			// a fee of half the balance, so a leftover that large keeps the change.
+			const available = inputAmount - outputAmount;
+			const quoteAt = (
+				rate: number
+			): { totalFee: number; transactionByteCount: number } => {
+				const byteCount = byteCountFor(pricesChange);
+				const fee = Math.ceil(byteCount * rate);
+				if (pricesChange && fee > available && available < txBalance / 2) {
+					const noChangeByteCount = byteCountFor(false);
+					if (Math.ceil(noChangeByteCount * rate) <= available) {
+						return {
+							totalFee: available,
+							transactionByteCount: noChangeByteCount
+						};
+					}
+				}
+				return { totalFee: fee, transactionByteCount: byteCount };
+			};
+			const quote = quoteAt(satsPerByte);
+			transactionByteCount = quote.transactionByteCount;
 			let maxSatPerByte = this.getMaxSatsPerByte({
 				transactionByteCount,
 				balance: txBalance
@@ -657,23 +708,26 @@ export class Transaction {
 			// updateFee refuses a fee the inputs cannot pay on top of the outputs.
 			// Only a replacement's inputs are fixed: an ordinary send selects more
 			// coins at a higher rate, and a max send sizes its output from the fee.
+			// A rate that leaves no room for the change output drops it, so the
+			// cap is on the size without it.
 			if (transaction.boostType === EBoostType.rbf && !transaction.max) {
 				const remaining = Math.max(0, inputAmount - outputAmount);
 				maxSatPerByte = Math.min(
 					maxSatPerByte,
-					Math.floor(remaining / transactionByteCount)
+					Math.floor(remaining / byteCountFor(false))
 				);
 			}
 			if (maxSatPerByte < satsPerByte) {
+				const capped = quoteAt(maxSatPerByte);
 				return ok({
-					totalFee: transactionByteCount * maxSatPerByte,
-					transactionByteCount: maxSatPerByte ? transactionByteCount : 0,
+					totalFee: capped.totalFee,
+					transactionByteCount: maxSatPerByte ? capped.transactionByteCount : 0,
 					satsPerByte: maxSatPerByte,
 					maxSatPerByte
 				});
 			}
 			return ok({
-				totalFee: Math.ceil(transactionByteCount * satsPerByte),
+				totalFee: quote.totalFee,
 				transactionByteCount,
 				satsPerByte,
 				maxSatPerByte
