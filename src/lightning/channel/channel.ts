@@ -7816,6 +7816,9 @@ export class Channel {
 			? Buffer.from(plan.provisionalSpliceClose.spliceTxid)
 			: null;
 		this._forceCloseBroadcastView = plan.provisionalSpliceClose?.view ?? null;
+		this._state.closeSpendsFundingTxid = Buffer.from(
+			bitcoin.Transaction.fromBuffer(plan.commitmentTx).ins[0].hash
+		);
 		if (plan.v2Adoption) {
 			Object.assign(this._state, plan.v2Adoption);
 			// Durable proof of which attempt this close was planned against:

@@ -507,6 +507,8 @@ export interface ISerializedChannelState {
 	spliceInFlight?: ISerializedSpliceInFlight | null;
 	/** Issue #764: splice (internal hex) the broadcast force close spends. */
 	closeSpendsSpliceTxid?: string | null;
+	/** Issue #1523: funding (internal hex) the last broadcast force close spends. */
+	closeSpendsFundingTxid?: string;
 	/** Issue #756: fully signed splice txs not yet seen confirmed (txid internal hex). */
 	unconfirmedSpliceTxs?: Array<{ txid: string; txHex: string }>;
 	/** Issue #760: splices reverted on a confirmed input conflict (display hex). */
@@ -1054,6 +1056,7 @@ export function serializeChannelState(
 			? serializeSpliceInFlight(s.spliceInFlight)
 			: null,
 		closeSpendsSpliceTxid: bufToHex(s.closeSpendsSpliceTxid),
+		closeSpendsFundingTxid: s.closeSpendsFundingTxid?.toString('hex'),
 		unconfirmedSpliceTxs: s.unconfirmedSpliceTxs?.length
 			? s.unconfirmedSpliceTxs.map((e) => ({
 					txid: e.txid.toString('hex'),
@@ -1706,6 +1709,9 @@ export function deserializeChannelState(
 		closeSpendsSpliceTxid: s.closeSpendsSpliceTxid
 			? hexToBuf(s.closeSpendsSpliceTxid)
 			: null,
+		closeSpendsFundingTxid: s.closeSpendsFundingTxid
+			? Buffer.from(s.closeSpendsFundingTxid, 'hex')
+			: undefined,
 		unconfirmedSpliceTxs: s.unconfirmedSpliceTxs?.length
 			? s.unconfirmedSpliceTxs.map((e) => ({
 					txid: Buffer.from(e.txid, 'hex'),

@@ -6255,6 +6255,9 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 			const closed = t.opener.forceCloseChannel(t.channelId, dest);
 			expect(closed.ok, closed.error).to.equal(true);
 			expect(t.channel.getState()).to.equal(ChannelState.FORCE_CLOSED);
+			expect(
+				t.channel.getFullState().closeSpendsFundingTxid?.equals(t.attempt1Txid)
+			).to.equal(true);
 
 			// Attempt 0 wins the race to depth: the close just broadcast can
 			// never confirm. The channel must adopt the confirmed attempt and
@@ -6290,6 +6293,10 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 				st.remoteCommitmentSignature!.equals(adoptedSig),
 				"the adopted attempt's commitment signature is active"
 			).to.be.true;
+			expect(
+				st.closeSpendsFundingTxid?.equals(t.attempt0Txid),
+				'the re-drive moved the record onto the adopted funding'
+			).to.equal(true);
 
 			// The re-driven close spends the ADOPTED funding outpoint.
 			const rebuilt = managerOf(t.opener).rebuildForceCloseCommitment(
@@ -6425,6 +6432,175 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		} finally {
 			opener.destroy();
 			acceptor.destroy();
+		}
+	});
+
+	it('a restart replaying the confirmation of the funding its mined close spends re-drives nothing (issue 1523)', async function () {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-close-spends-1523-'));
+		const dbPath = path.join(dir, 'opener.db');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const opener1 = new LightningNode(
+			makeNodeConfig(1523, {
+				storage: storage1,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(1524));
+		opener1.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		wireNodes(opener1, acceptor);
+		const channel = opener1.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 100_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(
+			() =>
+				channel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED &&
+				!!channel.getFullState().v2InFlight?.fullySigned
+		);
+		const channelId = channel.getChannelId()!;
+		const idHex = channelId.toString('hex');
+		const fundingTxid = Buffer.from(
+			channel.getFullState().v2InFlight!.fundingTxid
+		);
+		const txidHex = Buffer.from(fundingTxid).reverse().toString('hex');
+
+		// The funding confirms while the peer is away, so the record takes the
+		// stamp, and the reestablish that never comes ends in a force close.
+		managerOf(opener1).handlePeerDisconnected(acceptor.getNodeId());
+		expect(channel.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
+		managerOf(opener1).handleFundingConfirmed(channelId, txidHex);
+		expect(channel.getFullState().v2InFlight!.confirmed).to.equal(true);
+		const dest = bitcoin.payments.p2wpkh({
+			hash: crypto.randomBytes(20)
+		}).output!;
+		const closed = opener1.forceCloseChannel(channelId, dest);
+		expect(closed.ok, closed.error).to.equal(true);
+		const rebuilt = managerOf(opener1).rebuildForceCloseCommitment(
+			channelId,
+			5
+		);
+		expect(rebuilt.ok, rebuilt.error).to.equal(true);
+		const closeTx = bitcoin.Transaction.fromBuffer(rebuilt.tx!);
+		expect(closeTx.getId()).to.equal(closed.commitmentTxid);
+		expect(Buffer.from(closeTx.ins[0].hash).equals(fundingTxid)).to.be.true;
+
+		// The close is mined before the process stops.
+		opener1.handleFundingSpent(channelId, closeTx, 300, dest);
+		expect(
+			managerOf(opener1).getMonitor(channelId)!.isCommitmentConfirmed()
+		).to.equal(true);
+		const row = storage1.loadChannel(idHex)!.state;
+		expect(
+			row.closeSpendsFundingTxid?.equals(fundingTxid),
+			'the row names the funding the close spends'
+		).to.equal(true);
+		opener1.destroy();
+
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		const opener2 = new LightningNode(
+			makeNodeConfig(1523, { storage: storage2, recovery: { enabled: true } })
+		);
+		opener2.on('node:error', () => {});
+		const actions: string[] = [];
+		opener2.on('log', (log: { action: string }) => actions.push(log.action));
+		try {
+			const restored = managerOf(opener2).getChannel(channelId)!;
+			expect(restored.getState()).to.equal(ChannelState.FORCE_CLOSED);
+			expect(restored.getFullState().v2InFlight!.confirmed).to.equal(true);
+			expect(
+				managerOf(opener2).getMonitor(channelId)!.isCommitmentConfirmed()
+			).to.equal(true);
+
+			// The re-armed funding watch reports the depth again, in the
+			// watcher's order, and blocks keep coming.
+			managerOf(opener2).handleFundingConfirmed(channelId, txidHex);
+			(
+				opener2 as unknown as {
+					onFundingWatchConfirmed(id: Buffer, txid?: string): void;
+				}
+			).onFundingWatchConfirmed(channelId, txidHex);
+			opener2.handleNewBlock(301);
+			opener2.handleNewBlock(302);
+			await neverSettles(
+				() => actions.some((a) => a.startsWith('splice_close_redrive')),
+				100
+			);
+			expect(
+				(
+					opener2 as unknown as {
+						_pendingSpliceCloseRedrives: Set<string>;
+					}
+				)._pendingSpliceCloseRedrives.has(idHex)
+			).to.equal(false);
+		} finally {
+			opener2.destroy();
+			acceptor.destroy();
+		}
+	});
+
+	it('a restart without a saved monitor re-drives the close despite its funding marker', async function () {
+		const t = await driveNonLeaseOpen(1525, 1526, [makeWalletInput(200_000)]);
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		let restarted: LightningNode | undefined;
+		try {
+			const idHex = t.channelId.toString('hex');
+			const txidHex = Buffer.from(t.attempt0Txid).reverse().toString('hex');
+			managerOf(t.opener).handlePeerDisconnected(t.acceptor.getNodeId());
+			managerOf(t.opener).handleFundingConfirmed(t.channelId, txidHex);
+			expect(t.channel.getFullState().v2InFlight!.confirmed).to.equal(true);
+
+			// The terminal row can survive a crash before its monitor is saved.
+			t.opener.once('channel:closed', () => {
+				storage.saveChannel(
+					idHex,
+					t.channel.getFullState(),
+					t.acceptor.getNodeId()
+				);
+			});
+			let originalClose!: Buffer;
+			t.opener.once('broadcast:tx', (tx: Buffer) => {
+				originalClose = Buffer.from(tx);
+			});
+			const closed = t.opener.forceCloseChannel(
+				t.channelId,
+				bitcoin.payments.p2wpkh({ hash: crypto.randomBytes(20) }).output!
+			);
+			expect(closed.ok, closed.error).to.equal(true);
+			const row = storage.loadChannel(idHex)!.state;
+			expect(row.closeSpendsFundingTxid?.equals(t.attempt0Txid)).to.equal(true);
+			expect(storage.loadChainMonitor(idHex)).to.equal(null);
+			t.opener.destroy();
+
+			const broadcasts: Buffer[] = [];
+			const backend: IChainBackend = new ScriptedChainBackend();
+			backend.broadcastTransaction = async (txHex: string): Promise<string> => {
+				const tx = bitcoin.Transaction.fromHex(txHex);
+				broadcasts.push(tx.toBuffer());
+				return tx.getId();
+			};
+			restarted = new LightningNode(
+				makeNodeConfig(1525, { storage, chainBackend: backend })
+			);
+			restarted.on('node:error', () => {});
+			expect(managerOf(restarted).getMonitor(t.channelId)).to.equal(undefined);
+			managerOf(restarted).handleFundingConfirmed(t.channelId, txidHex);
+			(
+				restarted as unknown as {
+					onFundingWatchConfirmed(id: Buffer, txid?: string): void;
+				}
+			).onFundingWatchConfirmed(t.channelId, txidHex);
+			await settle(() => broadcasts.length > 0);
+			expect(broadcasts).to.deep.equal([originalClose]);
+		} finally {
+			restarted?.destroy();
+			t.opener.destroy();
+			t.acceptor.destroy();
+			storage.close();
 		}
 	});
 

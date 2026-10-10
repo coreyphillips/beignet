@@ -10459,7 +10459,14 @@ export class LightningNode extends EventEmitter {
 				confirmedTxid
 		) {
 			if (retired) this.persistChannel(channelId);
-			void this.redriveSpliceAdoptedClose(channelId);
+			// The marker precedes broadcast and monitor persistence. Without a
+			// monitor, replay must still recover a close that never reached the chain.
+			if (
+				!this.channelManager.getMonitor(channelId) ||
+				!state.closeSpendsFundingTxid?.equals(state.v2InFlight.fundingTxid)
+			) {
+				void this.redriveSpliceAdoptedClose(channelId);
+			}
 			return;
 		}
 		// Issue #413: a v1 channel failed by a BOLT 1 error before its funding
