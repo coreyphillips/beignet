@@ -242,6 +242,34 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		});
 	});
 
+	describe('getFeeInfo', function () {
+		// #1492: at 7 sat/vB the send selects the second coin, so the one coin
+		// selected at 2 sat/vB must not cap the maximum.
+		[ECoinSelectPreference.small, ECoinSelectPreference.large].forEach(
+			(preference) => {
+				it(`quotes a maximum rate that selects another coin with preference ${preference}`, async function () {
+					wallet.updateCoinSelectPreference(preference);
+					injectUtxo(FUNDING_TXID, 100_000);
+					injectUtxo(BOOSTED_TXID, 100_000);
+					const setup = await wallet.transaction.setupTransaction();
+					if (setup.isErr()) throw setup.error;
+					const staged = wallet.transaction.updateSendTransaction({
+						transaction: {
+							outputs: [{ address: P2WPKH, value: 99_000, index: 0 }]
+						}
+					});
+					if (staged.isErr()) throw staged.error;
+
+					const quote = wallet.getFeeInfo({ satsPerByte: 2 });
+					if (quote.isErr()) throw quote.error;
+					expect(quote.value.maxSatPerByte).to.be.at.least(7);
+					const updated = wallet.transaction.updateFee({ satsPerByte: 7 });
+					if (updated.isErr()) throw updated.error;
+				});
+			}
+		);
+	});
+
 	describe('setupRbf', function () {
 		beforeEach(function () {
 			injectUtxo(FUNDING_TXID, 100_000);

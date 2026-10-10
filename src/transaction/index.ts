@@ -655,8 +655,9 @@ export class Transaction {
 				balance: txBalance
 			});
 			// updateFee refuses a fee the inputs cannot pay on top of the outputs.
-			// A max send is exempt, as its output is sized from what the fee leaves.
-			if (!transaction.max) {
+			// Only a replacement's inputs are fixed: an ordinary send selects more
+			// coins at a higher rate, and a max send sizes its output from the fee.
+			if (transaction.boostType === EBoostType.rbf && !transaction.max) {
 				const remaining = Math.max(0, inputAmount - outputAmount);
 				maxSatPerByte = Math.min(
 					maxSatPerByte,
