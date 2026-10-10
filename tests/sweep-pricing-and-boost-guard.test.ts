@@ -268,6 +268,38 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 				});
 			}
 		);
+
+		// #1518: 1 sat/vB with change is exactly half the 602 payment, but the
+		// change drops and the fee is the 270 sats left over.
+		it('quotes a maximum rate that drops the change output', async function () {
+			wallet.updateCoinSelectPreference(ECoinSelectPreference.consolidate);
+			injectUtxo(FUNDING_TXID, 436);
+			injectUtxo(BOOSTED_TXID, 436);
+			const setup = await wallet.transaction.setupTransaction();
+			if (setup.isErr()) throw setup.error;
+			const message = 'm'.repeat(80);
+			const staged = wallet.transaction.updateSendTransaction({
+				transaction: {
+					message,
+					outputs: [{ address: P2WPKH, value: 602, index: 0 }]
+				}
+			});
+			if (staged.isErr()) throw staged.error;
+
+			const quote = wallet.getFeeInfo({ satsPerByte: 2, message });
+			if (quote.isErr()) throw quote.error;
+			expect(quote.value.maxSatPerByte).to.equal(1);
+			const atMax = wallet.transaction.updateFee({
+				satsPerByte: quote.value.maxSatPerByte
+			});
+			if (atMax.isErr()) throw atMax.error;
+			expect(atMax.value.fee).to.equal(270);
+			stubLookups({});
+			const created = await wallet.transaction.createTransaction();
+			if (created.isErr()) throw created.error;
+			const tx = BitcoinTransaction.fromHex(created.value.hex);
+			expect(tx.outs.map((out) => out.value)).to.have.members([0, 602]);
+		});
 	});
 
 	describe('setupRbf', function () {

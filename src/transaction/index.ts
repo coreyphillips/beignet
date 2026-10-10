@@ -705,6 +705,11 @@ export class Transaction {
 				transactionByteCount,
 				balance: txBalance
 			});
+			// updateFee refuses a fee of exactly half the balance. A rate that drops
+			// the change output pays only the leftover, which is under half.
+			if (maxSatPerByte && quoteAt(maxSatPerByte).totalFee >= txBalance / 2) {
+				maxSatPerByte--;
+			}
 			// updateFee refuses a fee the inputs cannot pay on top of the outputs.
 			// Only a replacement's inputs are fixed: an ordinary send selects more
 			// coins at a higher rate, and a max send sizes its output from the fee.
@@ -750,8 +755,7 @@ export class Transaction {
 		transactionByteCount: number;
 		balance?: number;
 	}): number => {
-		// updateFee refuses a fee of half the balance, so stay strictly under it.
-		return Math.max(0, Math.ceil(balance / (2 * transactionByteCount)) - 1);
+		return Math.floor(balance / (2 * transactionByteCount));
 	};
 
 	/**
