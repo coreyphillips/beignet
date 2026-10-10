@@ -573,18 +573,18 @@ export class Transaction {
 							?.address
 				};
 			}
-			const changeAddress = transaction.changeAddress;
+			let changeAddress = transaction.changeAddress;
 
 			let inputs = transaction.inputs || [];
 			const outputs = transaction.outputs || [];
 
 			// A replacement spends every input of the original, so coin selection
 			// must not price a subset of them.
-			if (
+			const selectsCoins =
 				coinSelectPreference !== ECoinSelectPreference.consolidate &&
 				!transaction.max &&
-				transaction.boostType !== EBoostType.rbf
-			) {
+				transaction.boostType !== EBoostType.rbf;
+			if (selectsCoins) {
 				const coinSelectRes = this.autoCoinSelect({
 					inputs,
 					outputs,
@@ -609,7 +609,7 @@ export class Transaction {
 			}
 
 			//No need for a change address when draining the wallet
-			const pricesChange = !!changeAddress && !transaction.max;
+			let pricesChange = !!changeAddress && !transaction.max;
 
 			//Determine the address type of each address and construct the object for fee calculation
 			const inputAddresses = inputs.map((input) => input.address);
@@ -661,18 +661,11 @@ export class Transaction {
 				fee: Math.ceil(transactionByteCount * satsPerByte)
 			});
 			if (generatedChange) {
-				// Consolidate keeps the inputs already selected above.
-				return this.getTotalFeeObj({
-					satsPerByte,
-					message,
-					transaction: {
-						...transaction,
-						inputs,
-						changeAddress: generatedChange
-					},
-					fundingLightning,
-					coinSelectPreference: ECoinSelectPreference.consolidate
-				});
+				// Priced on the inputs already selected above. Recursing with
+				// consolidate would hide from the half-balance guard below that a
+				// lower rate selects its own coins.
+				changeAddress = generatedChange;
+				pricesChange = true;
 			}
 			const inputAmount = this.getTransactionInputValue({ inputs });
 			const outputAmount = this.getTransactionOutputValue({ outputs });
@@ -705,6 +698,22 @@ export class Transaction {
 				transactionByteCount,
 				balance: txBalance
 			});
+			// updateFee refuses a fee of exactly half the balance. A rate that drops
+			// the change output pays only the leftover, which is under half. A
+			// lower rate can also select fewer coins than this quote did.
+			const feeAt = (rate: number): number =>
+				selectsCoins
+					? this.getTotalFee({
+							satsPerByte: rate,
+							message,
+							transaction,
+							fundingLightning,
+							coinSelectPreference
+					  })
+					: quoteAt(rate).totalFee;
+			if (maxSatPerByte && feeAt(maxSatPerByte) >= txBalance / 2) {
+				maxSatPerByte--;
+			}
 			// updateFee refuses a fee the inputs cannot pay on top of the outputs.
 			// Only a replacement's inputs are fixed: an ordinary send selects more
 			// coins at a higher rate, and a max send sizes its output from the fee.

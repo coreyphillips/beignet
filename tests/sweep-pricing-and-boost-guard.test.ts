@@ -268,6 +268,79 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 				});
 			}
 		);
+
+		// #1518: 1 sat/vB with change is exactly half the 602 payment, but the
+		// change drops and the fee is the 270 sats left over.
+		it('quotes a maximum rate that drops the change output', async function () {
+			wallet.updateCoinSelectPreference(ECoinSelectPreference.consolidate);
+			injectUtxo(FUNDING_TXID, 436);
+			injectUtxo(BOOSTED_TXID, 436);
+			const setup = await wallet.transaction.setupTransaction();
+			if (setup.isErr()) throw setup.error;
+			const message = 'm'.repeat(80);
+			const staged = wallet.transaction.updateSendTransaction({
+				transaction: {
+					message,
+					outputs: [{ address: P2WPKH, value: 602, index: 0 }]
+				}
+			});
+			if (staged.isErr()) throw staged.error;
+
+			const quote = wallet.getFeeInfo({ satsPerByte: 2, message });
+			if (quote.isErr()) throw quote.error;
+			expect(quote.value.maxSatPerByte).to.equal(1);
+			const atMax = wallet.transaction.updateFee({
+				satsPerByte: quote.value.maxSatPerByte
+			});
+			if (atMax.isErr()) throw atMax.error;
+			expect(atMax.value.fee).to.equal(270);
+			stubLookups({});
+			const created = await wallet.transaction.createTransaction();
+			if (created.isErr()) throw created.error;
+			const tx = BitcoinTransaction.fromHex(created.value.hex);
+			expect(tx.outs.map((out) => out.value)).to.have.members([0, 602]);
+		});
+
+		// #1518: six coins at 1 sat/vB are exactly half the 962 payment, but that
+		// rate selects five and pays 413. Without a staged change address the
+		// quote prices the change the builder generates.
+		[
+			{ name: 'staged', stagedChange: {} },
+			{ name: 'generated', stagedChange: { changeAddress: '' } }
+		].forEach(({ name, stagedChange }) => {
+			it(`quotes a maximum rate that selects fewer coins with ${name} change`, async function () {
+				wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
+				[300, 300, 300, 300, 500, 600].forEach((value, txPos) =>
+					injectUtxo(FUNDING_TXID, value, txPos)
+				);
+				const setup = await wallet.transaction.setupTransaction();
+				if (setup.isErr()) throw setup.error;
+				const staged = wallet.transaction.updateSendTransaction({
+					transaction: {
+						...stagedChange,
+						outputs: [{ address: P2WPKH, value: 962, index: 0 }]
+					}
+				});
+				if (staged.isErr()) throw staged.error;
+
+				const quote = wallet.getFeeInfo({ satsPerByte: 2 });
+				if (quote.isErr()) throw quote.error;
+				expect(quote.value.maxSatPerByte).to.equal(1);
+				const atMax = wallet.transaction.updateFee({
+					satsPerByte: quote.value.maxSatPerByte
+				});
+				if (atMax.isErr()) throw atMax.error;
+				expect(atMax.value.fee).to.equal(413);
+				stubLookups({});
+				const created = await wallet.transaction.createTransaction({
+					runCoinSelect: true
+				});
+				if (created.isErr()) throw created.error;
+				const tx = BitcoinTransaction.fromHex(created.value.hex);
+				expect(tx.ins).to.have.length(5);
+				expect(tx.outs.map((out) => out.value)).to.have.members([962, 325]);
+			});
+		});
 	});
 
 	describe('setupRbf', function () {
@@ -446,6 +519,38 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 					const tx = BitcoinTransaction.fromHex(created.value.hex);
 					expect(tx.outs.map((out) => out.value)).to.deep.equal([180_000]);
 					expect(20_000).to.be.at.least(maxSatPerByte * tx.virtualSize());
+					const overMax = wallet.transaction.updateFee({
+						satsPerByte: maxSatPerByte + 1
+					});
+					expect(overMax.isErr(), 'one more sat/vB is refused').to.equal(true);
+				});
+			}
+		);
+
+		// #1518: half the 41,800 payment is exactly 100 sat/vB over 209 vB, a fee
+		// updateFee refuses.
+		[ECoinSelectPreference.small, ECoinSelectPreference.large].forEach(
+			(preference) => {
+				it(`quotes a maximum rate under half the payment with preference ${preference}`, async function () {
+					wallet.updateCoinSelectPreference(preference);
+					stubTwoInputBoostedTransaction(41_800);
+
+					const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+					if (res.isErr()) throw res.error;
+					const quote = wallet.getFeeInfo({ satsPerByte: 20 });
+					if (quote.isErr()) throw quote.error;
+
+					const { maxSatPerByte, transactionByteCount } = quote.value;
+					const atMax = wallet.transaction.updateFee({
+						satsPerByte: maxSatPerByte
+					});
+					if (atMax.isErr()) throw atMax.error;
+					expect(atMax.value.fee).to.equal(
+						maxSatPerByte * transactionByteCount
+					);
+					expect((maxSatPerByte + 1) * transactionByteCount).to.equal(
+						41_800 / 2
+					);
 					const overMax = wallet.transaction.updateFee({
 						satsPerByte: maxSatPerByte + 1
 					});
