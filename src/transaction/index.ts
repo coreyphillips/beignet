@@ -1768,6 +1768,10 @@ export class Transaction {
 			if (!transaction.inputs?.length) {
 				const setupRes = await this.setupTransaction({ rbf });
 				if (setupRes.isErr()) return err(setupRes.error.message);
+				// Setup stages the inputs on a new _data, not on the transaction read
+				// above. Only the inputs are taken, since setup also resets the staged
+				// outputs and rate that the address and rate below fall back to.
+				transaction = { ...transaction, inputs: this._data.inputs };
 			}
 			if (!satsPerByte) {
 				satsPerByte = transaction?.satsPerByte ?? 1;
