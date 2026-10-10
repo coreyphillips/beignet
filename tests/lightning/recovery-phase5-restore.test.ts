@@ -16,6 +16,10 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import Database from 'better-sqlite3';
 import {
 	CRASH_V1_PROFILE,
 	GuardianClient,
@@ -64,6 +68,7 @@ import {
 	signTranscript,
 	stateBytes,
 	takeoverTranscriptHash,
+	u64be,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
@@ -107,7 +112,9 @@ interface IServed {
 }
 
 /** Guardians bound to the identity each endpoint must prove it holds. */
-function bind(served: IServed[]): IBoundGuardianClient[] {
+function bind(
+	served: Pick<IServed, 'client' | 'id'>[]
+): IBoundGuardianClient[] {
 	return served.map((entry) => ({
 		client: entry.client,
 		expectedGuardianId: entry.id
@@ -295,7 +302,7 @@ function persistPending(
  * under the epoch it took. Returns its database.
  */
 async function takeOverAndAppend(
-	members: IServed[],
+	members: Pick<IServed, 'client' | 'id'>[],
 	n: number
 ): Promise<SqliteStorage> {
 	const storage = openStorage();
@@ -2195,6 +2202,103 @@ describe('Recovery phase 5: restore driver', () => {
 		await shutdown(served);
 		live.storage.close();
 		target.close();
+	});
+
+	it('keeps a resumed attempt while a rolled-back signer of the takeover past it reports below it', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		// Issue #1528. Every member granted the attempt over N, then another
+		// device took the next epoch on G1 and G3 and stored N+1 there. A
+		// rollback then drops G3's grants, leaving it possibly stale below
+		// the attempt, so only G1's grant of the takeover shows.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-restore-'));
+		const file = path.join(dir, 'g3.sqlite');
+		const openG3 = (): ReferenceGuardian =>
+			new ReferenceGuardian({
+				path: file,
+				guardianSecret: GUARDIAN_SECRETS[2],
+				members: GUARDIAN_IDS,
+				clock
+			});
+		let g3 = openG3();
+		const inProcessG3 = {
+			id: GUARDIAN_IDS[2],
+			client: new GuardianClient({
+				url: 'http://guardian-3.example',
+				guardianSetId: SET_ID,
+				transport: async (
+					url,
+					init
+				): Promise<{ status: number; body: Buffer }> => ({
+					status: 200,
+					body:
+						init.method === 'GET'
+							? encodeGuardianInfo(g3)
+							: dispatchGuardianVerb(
+									g3,
+									url.split('/').pop() as GuardianVerbName,
+									init.body!
+							  )
+				})
+			})
+		};
+		const served = await Promise.all([serve(0), serve(1)]);
+		const members = [...served, inProcessG3];
+		const clients = members.map((entry) => entry.client);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(members));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		const writer = generateWriterKey();
+		const guard = await grantNext(clients[0], lease, writer);
+		await grantNext(clients[1], lease, writer);
+		await grantNext(clients[2], lease, writer);
+		const target = openStorage();
+		persistPending(target, guard, writer);
+		const pending = target.getRecoveryMeta!(
+			RESTORE_META_KEYS.pendingAcquisition
+		);
+		const other = await takeOverAndAppend([served[0], inProcessG3], 99);
+
+		g3.close();
+		const raw = new Database(file);
+		raw
+			.prepare('UPDATE guardian_epochs SET cert_issued_at = ? WHERE epoch = ?')
+			.run(Buffer.alloc(7, 1), u64be(lease.epoch + 2n));
+		raw.close();
+		g3 = openG3();
+		const rolledBack = await clients[2].getHead(ROOT.recoveryId);
+		expect(rolledBack.possiblyStale).to.equal(true);
+		expect(rolledBack.state?.lease.epoch).to.equal(lease.epoch);
+		expect(rolledBack.certificates ?? []).to.have.length(0);
+
+		const events: IRestoreEvent[] = [];
+		try {
+			await driverFor(target, bind(members), events).restore();
+			expect.fail('the attempt may be fenced by a takeover G3 signed');
+		} catch (error) {
+			expect(error).to.be.instanceOf(RestoreRefusedError);
+			expect((error as RestoreRefusedError).reason).to.equal('no-quorum');
+		}
+		expect(
+			events.some(
+				(e) => e.type === 'epoch:acquired' || e.type === 'epoch:abandoned'
+			)
+		).to.equal(false);
+		expect(loadWriterLease(target).state).to.equal('missing');
+		expect(target.loadRecoveryFrames()).to.have.length(0);
+		expect(
+			target.getRecoveryMeta!(RESTORE_META_KEYS.pendingAcquisition)
+		).to.equal(pending);
+
+		await shutdown(served);
+		g3.close();
+		fs.rmSync(dir, { recursive: true, force: true });
+		live.storage.close();
+		target.close();
+		other.close();
 	});
 
 	it('follows a rotation that reaches the source while a split takeover completes', async function (): Promise<void> {

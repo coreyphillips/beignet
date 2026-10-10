@@ -964,23 +964,24 @@ export class RestoreDriver {
 
 	/**
 	 * Whether a takeover past this attempt may hold a quorum that the heads
-	 * read cannot show: some head is past the attempt, and the members past
-	 * it plus those without a head could make up a quorum. A missing signer
-	 * hides the bundle superseded() counts.
+	 * read cannot show: some head is past the attempt, and the members
+	 * without a fresh head short of it could make up a quorum. A missing
+	 * signer hides the bundle superseded() counts, and so does a rolled-back
+	 * one: a possibly-stale head may have lost the epoch rows of grants its
+	 * guardian signed, so it rules nobody out here.
 	 */
 	private mayBeSuperseded(
 		attempt: IPendingAttempt,
 		readings: IHeadReading[],
 		stale: IHeadReading[]
 	): boolean {
-		const heads = [...readings, ...stale];
 		const past = (reading: IHeadReading): boolean =>
 			reading.state.lease.epoch > attempt.newEpoch ||
 			(reading.state.lease.epoch === attempt.newEpoch &&
 				!reading.state.lease.writerPublicKey.equals(attempt.writer.publicKey));
-		if (!heads.some(past)) return false;
+		if (![...readings, ...stale].some(past)) return false;
 		const ruledOut = new Set(
-			heads
+			readings
 				.filter((reading) => !past(reading))
 				.map((reading) => reading.guardianId.toString('hex'))
 		);
