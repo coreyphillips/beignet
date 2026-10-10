@@ -751,11 +751,16 @@ export class RestoreDriver {
 	 * reestablish reconciles it. ACROSS epochs adopt the highest epoch
 	 * BACKED BY A QUORUM OF TAKEOVER CERTIFICATES: a single guardian sitting
 	 * at a higher epoch proves only that it accepted an acquisition, which a
-	 * partially completed takeover also produces.
+	 * partially completed takeover also produces. A possibly-stale head is
+	 * never a candidate, but the grants it signed still count toward that
+	 * quorum: a rollback loses rows, it does not unsign a certificate.
 	 */
-	private selectHead(readings: IHeadReading[]): IHeadReading {
+	private selectHead(
+		readings: IHeadReading[],
+		stale: IHeadReading[]
+	): IHeadReading {
 		const certifiedEpochs = new Set<string>();
-		for (const bundle of this.certificateBundles(readings)) {
+		for (const bundle of this.certificateBundles([...readings, ...stale])) {
 			if (bundle.length >= this.config.required) {
 				certifiedEpochs.add(bundle[0].newEpoch.toString());
 			}
@@ -791,8 +796,9 @@ export class RestoreDriver {
 
 	/**
 	 * Step 3: repair laggards until `required` guardians share the adopted
-	 * head. Certificate bundles are assembled across ALL readings, since a
-	 * single guardian's response need not carry the whole quorum.
+	 * head. Certificate bundles are assembled across ALL readings, stale ones
+	 * included, since a single guardian's response need not carry the whole
+	 * quorum.
 	 */
 	private async repairLaggards(
 		readings: IHeadReading[],
@@ -800,7 +806,7 @@ export class RestoreDriver {
 		target: IHeadReading
 	): Promise<number> {
 		let repaired = 0;
-		const bundles = this.certificateBundles(readings);
+		const bundles = this.certificateBundles([...readings, ...stale]);
 		const forEpoch = (epoch: bigint): IGuardianTakeoverCertificate[] =>
 			bundles.find(
 				(bundle) =>
@@ -936,13 +942,15 @@ export class RestoreDriver {
 
 	/**
 	 * Whether a quorum certified another takeover over this attempt: a later
-	 * epoch, or its own epoch under another key. Either fences it for good.
+	 * epoch, or its own epoch under another key. Either fences it for good,
+	 * so a possibly-stale guardian's certificates count here too.
 	 */
 	private superseded(
 		attempt: IPendingAttempt,
-		readings: IHeadReading[]
+		readings: IHeadReading[],
+		stale: IHeadReading[]
 	): boolean {
-		return this.certificateBundles(readings).some(
+		return this.certificateBundles([...readings, ...stale]).some(
 			(bundle) =>
 				bundle.length >= this.config.required &&
 				bundle[0].supersededState.recoveryId.equals(
@@ -1124,7 +1132,7 @@ export class RestoreDriver {
 		// Checked before the first round, not only after a failed one: a
 		// guardian replays its grant of the attempt after it has moved on to
 		// a later takeover, so the round would complete a fenced epoch.
-		if (pending && this.superseded(pending, pool)) {
+		if (pending && this.superseded(pending, pool, stalePool)) {
 			this.emit(
 				'epoch:abandoned',
 				`epoch ${pending.newEpoch} was won by another writer; starting a new acquisition`
@@ -1242,14 +1250,14 @@ export class RestoreDriver {
 			this.assertNoConflict(refreshed.readings, refreshed.stale);
 			pool = refreshed.readings;
 			stalePool = refreshed.stale;
-			expected = this.selectHead(pool);
+			expected = this.selectHead(pool, stalePool);
 			// A pending acquisition keeps its epoch and key while any guardian
 			// might be bound to it, which is what makes a partial acceptance
 			// recoverable. It is retired in exactly two cases.
 			const attemptSoFar = pending as IPendingAttempt;
 			// One: a quorum-certified takeover superseded it, so it can never
 			// complete no matter how often it is retried.
-			const superseded = this.superseded(attemptSoFar, pool);
+			const superseded = this.superseded(attemptSoFar, pool, stalePool);
 			// Two: NOTHING can hold it (no certificate collected, and every
 			// guardian's head shows it never granted the attempt), while the
 			// reconciled head has moved on. That is the still-live-old-writer
@@ -1326,7 +1334,7 @@ export class RestoreDriver {
 		}
 		const { readings, stale } = await this.readHeads();
 		this.assertNoConflict(readings, stale);
-		const target = this.selectHead(readings);
+		const target = this.selectHead(readings, stale);
 		this.emit(
 			'head:adopted',
 			`adopted epoch ${target.state.lease.epoch} sequence ${target.state.logHead.sequence}`

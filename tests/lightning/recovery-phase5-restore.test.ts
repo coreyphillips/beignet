@@ -1662,6 +1662,75 @@ describe('Recovery phase 5: restore driver', () => {
 		other.close();
 	});
 
+	it('abandons a resumed attempt fenced by a takeover a possibly-stale guardian signed', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		// Issue #1470. As above, but G3 now reports possibly_stale. Its head
+		// proves no recency, yet its signed grant is half of the quorum that
+		// fenced the attempt, and of the one that repairs G2 up to N+1.
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const clients = served.map((s) => s.client);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		const writer = generateWriterKey();
+		const guard = await grantNext(clients[0], lease, writer);
+		await grantNext(clients[1], lease, writer);
+		await grantNext(clients[2], lease, writer);
+		const target = openStorage();
+		persistPending(target, guard, writer);
+
+		const other = await takeOverAndAppend([served[0], served[2]], 88);
+		const n = guard.logHead.sequence;
+
+		// A possibly-stale guardian refuses every acquisition (wire 5.3).
+		const staleG3 = new Proxy(clients[2], {
+			get(t, prop, receiver): unknown {
+				if (prop === 'getHead') {
+					return async (id: Buffer): Promise<unknown> => ({
+						...(await t.getHead(id)),
+						possiblyStale: true
+					});
+				}
+				if (prop === 'acquireEpoch') {
+					return async (): Promise<unknown> => ({
+						status: GuardianStatus.ERR_STORE_UNCERTAIN
+					});
+				}
+				const value = Reflect.get(t, prop, receiver);
+				return typeof value === 'function' ? value.bind(t) : value;
+			}
+		});
+		const events: IRestoreEvent[] = [];
+		const result = await driverFor(
+			target,
+			[
+				...bind(served.slice(0, 2)),
+				{ client: staleG3, expectedGuardianId: served[2].id }
+			],
+			events
+		).restore();
+		expect(events.some((e) => e.type === 'epoch:abandoned')).to.equal(true);
+		expect(result.lease.epoch).to.equal(lease.epoch + 3n);
+		expect(result.lease.writerPublicKey.equals(writer.publicKey)).to.equal(
+			false
+		);
+		expect(result.certifiedState.logHead.sequence).to.equal(n + 1n);
+		expect(dumpTables(target)).to.equal(dumpTables(other));
+		expect(await headsOf(clients.slice(0, 2))).to.deep.equal({
+			epochs: [lease.epoch + 3n, lease.epoch + 3n],
+			sequences: [n + 1n, n + 1n]
+		});
+
+		await shutdown(served);
+		live.storage.close();
+		target.close();
+		other.close();
+	});
+
 	it('follows a rotation that reaches the source while a split takeover completes', async function (): Promise<void> {
 		// Real guardians over real TCP: the default 2s is not enough under
 		// full-suite load, and a load-sensitive timeout is a flaky test.
