@@ -234,6 +234,10 @@ export class Peer extends EventEmitter {
 		// frames nor skip holding because the first release nulled the
 		// queue: every establishment starts a fresh hold lifecycle.
 		this.rearmHeldMessages();
+		// A handler run by the post-init drain may disconnect and start a new
+		// establishment before this one fails. The failure cleanup below then
+		// belongs to that replacement and must leave it alone.
+		const lifecycle = this.heldLifecycleId;
 
 		this.state = 'connecting';
 		this.aborted = false;
@@ -297,11 +301,13 @@ export class Peer extends EventEmitter {
 				this.startPingTimer();
 				this.emit('connect');
 			} catch (err) {
-				this.state = 'disconnected';
-				this.destroySocket();
+				if (this.heldLifecycleId === lifecycle) {
+					this.state = 'disconnected';
+					this.destroySocket();
+				}
 				throw err;
 			} finally {
-				this.establishmentAbort = null;
+				if (this.heldLifecycleId === lifecycle) this.establishmentAbort = null;
 			}
 		} else {
 			// Direct TCP connection with connect timeout (Fix 3.1)
@@ -346,7 +352,7 @@ export class Peer extends EventEmitter {
 						this.emit('connect');
 						resolve();
 					} catch (err) {
-						this.destroySocket();
+						if (this.heldLifecycleId === lifecycle) this.destroySocket();
 						reject(err);
 					}
 				};
@@ -354,7 +360,7 @@ export class Peer extends EventEmitter {
 					void onConnect();
 				});
 			}).finally(() => {
-				this.establishmentAbort = null;
+				if (this.heldLifecycleId === lifecycle) this.establishmentAbort = null;
 			});
 		}
 	}
@@ -368,8 +374,10 @@ export class Peer extends EventEmitter {
 		if (this.state !== 'disconnected') {
 			throw new Error(`Cannot accept: peer is ${this.state}`);
 		}
-		// See connect(): state validated first, then a fresh hold lifecycle.
+		// See connect(): state validated first, then a fresh hold lifecycle,
+		// whose id scopes the failure cleanup.
 		this.rearmHeldMessages();
+		const lifecycle = this.heldLifecycleId;
 
 		this.socket = socket;
 		this.state = 'handshaking';
@@ -404,11 +412,11 @@ export class Peer extends EventEmitter {
 			this.startPingTimer();
 			this.emit('connect');
 		} catch (err) {
-			this.destroySocket();
+			if (this.heldLifecycleId === lifecycle) this.destroySocket();
 			throw err;
 		} finally {
 			clearTimeout(deadline);
-			this.establishmentAbort = null;
+			if (this.heldLifecycleId === lifecycle) this.establishmentAbort = null;
 		}
 	}
 

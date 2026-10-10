@@ -20,24 +20,40 @@ const INVALID_CIPHERTEXT = Buffer.alloc(18, 0);
 const RESPONDER_INIT_WRITE = 1;
 const INITIATOR_INIT_WRITE = 2;
 
-/** One end of an in-memory link; appends invalid bytes to one write. */
+/**
+ * One end of an in-memory link. It can append invalid bytes to one write,
+ * and hold one write back so it arrives in the same chunk as the next.
+ */
 class MemoryTransport extends EventEmitter implements IDuplexTransport {
 	remote: MemoryTransport | null = null;
 	readonly writableLength = 0;
 	private writes = 0;
 	private destroyed = false;
+	private held: Buffer | null = null;
 
-	constructor(private readonly tamperedWrite: number | null) {
+	constructor(
+		private readonly tamperedWrite: number | null,
+		private readonly heldWrite: number | null = null
+	) {
 		super();
 	}
 
 	write(data: Uint8Array, cb?: (err?: Error) => void): boolean {
 		let chunk = Buffer.from(data);
-		if (this.writes++ === this.tamperedWrite) {
+		const index = this.writes++;
+		if (index === this.tamperedWrite) {
 			chunk = Buffer.concat([chunk, INVALID_CIPHERTEXT]);
 		}
-		const remote = this.remote;
 		queueMicrotask(() => cb?.());
+		if (index === this.heldWrite) {
+			this.held = chunk;
+			return true;
+		}
+		if (this.held) {
+			chunk = Buffer.concat([this.held, chunk]);
+			this.held = null;
+		}
+		const remote = this.remote;
 		setImmediate(() => {
 			if (remote && !remote.destroyed) remote.emit('data', chunk);
 		});
@@ -171,6 +187,69 @@ describe('Peer establishment with coalesced invalid frames (issue #1491)', () =>
 		);
 		await dialing;
 		expectRefused(result);
+	});
+
+	it('leaves a replacement accepted by a drained frame handler alone', async () => {
+		const dialerKey = crypto.randomBytes(32);
+		const link = (heldWrite: number | null): MemoryTransport[] => {
+			const dialSide = new MemoryTransport(null, heldWrite);
+			const acceptSide = new MemoryTransport(null);
+			dialSide.remote = acceptSide;
+			acceptSide.remote = dialSide;
+			return [dialSide, acceptSide];
+		};
+		const dialer = (side: MemoryTransport): Peer => {
+			const peer = new Peer({
+				localPrivateKey: dialerKey,
+				remotePublicKey: getPublicKey(responderKey),
+				host: 'memory',
+				port: 0,
+				createSocket: (): Promise<IDuplexTransport> => Promise.resolve(side)
+			});
+			peers.push(peer);
+			return peer;
+		};
+		// The first dialer's init is held and goes out with the odd message
+		// it sends on connect, so the responder drains that message.
+		const [firstDialSide, firstAcceptSide] = link(INITIATOR_INIT_WRITE);
+		const [secondDialSide, secondAcceptSide] = link(null);
+		const firstDialer = dialer(firstDialSide);
+		const secondDialer = dialer(secondDialSide);
+		const responder = new Peer({
+			localPrivateKey: responderKey,
+			remotePublicKey: Buffer.alloc(33, 0),
+			host: 'memory',
+			port: 0,
+			handshakeTimeout: 2_000
+		});
+		peers.push(responder);
+		const settle = (p: Promise<void>): Promise<Error | null> =>
+			p.then(
+				() => null,
+				(err: Error) => err
+			);
+
+		firstDialer.once('connect', () =>
+			firstDialer.sendMessage(32769, Buffer.alloc(4))
+		);
+		let replacement: Promise<Error | null> | undefined;
+		let redial: Promise<Error | null> | undefined;
+		responder.once('message', () => {
+			responder.disconnect();
+			replacement = settle(responder.acceptInbound(secondAcceptSide));
+			redial = settle(secondDialer.connect());
+		});
+
+		const accepting = settle(responder.acceptInbound(firstAcceptSide));
+		await settle(firstDialer.connect());
+		const original = await accepting;
+		expect(original?.message).to.equal(
+			'Connection closed while draining buffered frames'
+		);
+		expect(await replacement).to.equal(null);
+		expect(await redial).to.equal(null);
+		expect(responder.getState()).to.equal('ready');
+		expect(secondDialer.getState()).to.equal('ready');
 	});
 
 	it('rejects a direct TCP dial', async () => {
