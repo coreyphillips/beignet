@@ -212,7 +212,9 @@ export interface ISwapRecord extends ILedgerRecord {
 	preimageHex?: string;
 	preimageSource?: SwapPreimageSource;
 	settledAt?: number;
+	/** Set once nothing of the hold is left parked. */
 	holdCancelledAt?: number;
+	/** Set alone while a refused cancel is still owed. */
 	holdCancelReason?: string;
 	failureReason?: string;
 	lastError?: string;

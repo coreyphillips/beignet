@@ -521,6 +521,52 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(h.wallet.builds).to.have.length(0);
 		});
 
+		for (const landing of [
+			'with the engine up',
+			'with the engine down'
+		] as const) {
+			it(`keeps a refused hold cancel owed until it lands ${landing} (issue #1455)`, async function () {
+				const h = await harness({ config: { terminalRetentionBlocks: 10 } });
+				const swap = clientSwap();
+				const hashHex = swap.paymentHash.toString('hex');
+				await create(h, swap);
+				const r = record(h, swap);
+				h.holds.hold(swap.paymentHash, 1_000n, r.refundHeight + 5000);
+				await settle();
+				h.holds.cancelRefused = true;
+				h.ledger.patch(r.id, { invoiceExpiresAt: 1 });
+				await h.engine.onBlock(1001);
+				const owed = record(h, swap);
+				expect(owed.state).to.equal('CANCELLED');
+				expect(owed.holdCancelledAt).to.equal(undefined);
+				expect(owed.holdCancelReason).to.equal('invoice_expired');
+				expect(h.holds.forgotten).to.deep.equal([]);
+
+				// Neither the prune nor a restart drops the owed cancel.
+				await h.engine.onBlock(r.refundHeight + 10);
+				let h2 = await h.restart();
+				expect(h2.ledger.get(r.id)!.holdCancelledAt).to.equal(undefined);
+				expect(h2.holds.cancelled).to.deep.equal([]);
+
+				h2.holds.cancelRefused = false;
+				if (landing === 'with the engine up') {
+					// The node's own retry lands and reports the cancel.
+					h2.holds.sweep(swap.paymentHash, 'api');
+					await settle();
+				} else {
+					h2.engine.stop();
+					h2.holds.sweep(swap.paymentHash, 'api');
+					h2 = await h2.restart();
+				}
+				const done = h2.ledger.get(r.id)!;
+				expect(done.holdCancelledAt).to.be.a('number');
+				expect(done.holdCancelReason).to.equal('invoice_expired');
+				expect(h2.holds.forgotten).to.deep.equal([hashHex]);
+				await h2.engine.onBlock(r.refundHeight + 11);
+				expect(h2.ledger.get(r.id)).to.equal(undefined);
+			});
+		}
+
 		it('a preferred refund delta above the default mints a hold that outlives it (issue #1039)', async function () {
 			const h = await harness();
 			const swap = clientSwap();

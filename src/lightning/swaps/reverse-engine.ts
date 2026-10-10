@@ -210,8 +210,13 @@ export interface IReverseSwapProviderDeps {
 	hashInUse?(paymentHash: Buffer): boolean;
 	/** True when parked parts were released against the preimage. */
 	settleHeld(paymentHash: Buffer, preimage: Buffer): boolean;
-	/** Idempotent; a closed hash is not an error. */
-	cancelHold(paymentHash: Buffer): void;
+	/**
+	 * Idempotent; a closed hash is not an error. True once nothing is left
+	 * parked under the hash. A cancel the channel refuses stays the node's
+	 * to retry, and it reports the cancel through onHoldCancelled once it
+	 * lands.
+	 */
+	cancelHold(paymentHash: Buffer): boolean;
 	/**
 	 * Delete the node's records of a cancelled hold: its invoice, payment and
 	 * secret. Called once the swap is terminal; a no-op for a hold that is
@@ -312,6 +317,20 @@ const DUST_FLOOR_SAT = SWAP_DUST_FLOOR_SAT;
 /** Padding past the admission inequality so any pay height satisfies it. */
 const HOLD_CLTV_PADDING = 8;
 
+/**
+ * An ended swap whose hold cancel has not landed: REFUNDED before its
+ * cancel ran, or a cancel refused with parts still parked, which
+ * cancelHoldFor marks with its reason alone.
+ */
+function owesHoldCancel(record: ISwapRecord): boolean {
+	return (
+		record.direction === 'reverse' &&
+		isTerminalSwapState(record.state) &&
+		!record.holdCancelledAt &&
+		(record.state === 'REFUNDED' || record.holdCancelReason !== undefined)
+	);
+}
+
 export class ReverseSwapProvider extends EventEmitter {
 	readonly config: IReverseSwapProviderConfig;
 	private readonly unsubscribe: Array<() => void> = [];
@@ -378,8 +397,11 @@ export class ReverseSwapProvider extends EventEmitter {
 				await this.processRecord(record.id, 'start');
 			}
 			for (const record of this.deps.ledger.list()) {
-				if (record.state === 'REFUNDED' && !record.holdCancelledAt) {
-					this.cancelHoldFor(record.id, 'refund_confirmed');
+				if (owesHoldCancel(record)) {
+					this.cancelHoldFor(
+						record.id,
+						record.holdCancelReason ?? 'refund_confirmed'
+					);
 				} else if (
 					record.direction === 'reverse' &&
 					record.holdCancelledAt &&
@@ -424,8 +446,9 @@ export class ReverseSwapProvider extends EventEmitter {
 			height,
 			this.config.terminalRetentionBlocks
 		)) {
-			// start() still owes this row its hold cancel.
-			if (record.state === 'REFUNDED' && !record.holdCancelledAt) continue;
+			// The row is what start() re-asks the owed hold cancel from, and
+			// what records it once the node lands it.
+			if (owesHoldCancel(record)) continue;
 			// The row is the only record that a refused or failed hold forget
 			// is still owed.
 			if (record.holdCancelledAt && !this.forgetHold(record)) continue;
@@ -1014,6 +1037,11 @@ export class ReverseSwapProvider extends EventEmitter {
 		for (const record of this.deps.ledger.byPaymentHash(
 			paymentHash.toString('hex')
 		)) {
+			// The node's retry landed a cancel this ended swap still owed.
+			if (owesHoldCancel(record)) {
+				this.cancelHoldFor(record.id, record.holdCancelReason ?? reason);
+				continue;
+			}
 			if (isTerminalSwapState(record.state) || record.holdCancelledAt) continue;
 			const patch = { holdCancelledAt: this.now(), holdCancelReason: reason };
 			switch (record.state) {
@@ -1119,19 +1147,29 @@ export class ReverseSwapProvider extends EventEmitter {
 	private cancelHoldFor(swapIdHex: string, why: string): void {
 		const record = this.deps.ledger.get(swapIdHex);
 		if (!record) return;
+		let released = false;
 		try {
-			this.deps.cancelHold(Buffer.from(record.paymentHashHex, 'hex'));
+			released = this.deps.cancelHold(
+				Buffer.from(record.paymentHashHex, 'hex')
+			);
 		} catch (err) {
 			this.deps.log('swap_cancel_hold_failed', {
 				swapId: swapIdHex,
 				error: err instanceof Error ? err.message : String(err)
 			});
+		}
+		if (!released) {
+			// Parts are still parked, so the payer's HTLCs are too: the
+			// reason alone marks the cancel as owed (see owesHoldCancel).
+			if (!record.holdCancelReason) {
+				this.deps.ledger.patch(swapIdHex, { holdCancelReason: why });
+			}
 			return;
 		}
 		if (!record.holdCancelledAt) {
 			this.deps.ledger.patch(swapIdHex, {
 				holdCancelledAt: this.now(),
-				holdCancelReason: why
+				holdCancelReason: record.holdCancelReason ?? why
 			});
 		}
 		this.forgetHold(record);

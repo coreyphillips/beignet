@@ -41,6 +41,15 @@ import {
 	clientSwap,
 	settle
 } from './helpers/swap-harness';
+import {
+	ICut,
+	IWireGate,
+	disconnect,
+	reconnect,
+	reconnectRestarted,
+	tempDb,
+	wire
+} from './helpers/async-world';
 
 const TAG = 'swap-node';
 const AMOUNT = 100_000n;
@@ -109,11 +118,13 @@ interface IScene {
 	channels: Buffer[];
 }
 
-function scene(seed: number, channels = 1, storage?: SqliteStorage): IScene {
-	const chain = new FakeSwapChain();
-	const fp = fakeFundingProvider(chain);
-	const alice = createNode(TAG, seed);
-	const bob = createNode(TAG, seed + 1, storage, {
+function providerNode(
+	seed: number,
+	chain: FakeSwapChain,
+	fp: ReturnType<typeof fakeFundingProvider>,
+	storage?: SqliteStorage
+): LightningNode {
+	return createNode(TAG, seed, storage, {
 		fundingProvider: fp,
 		feeEstimator: { estimateFee: async () => 2 },
 		swaps: {
@@ -131,7 +142,26 @@ function scene(seed: number, channels = 1, storage?: SqliteStorage): IScene {
 			}
 		}
 	});
-	connectNodes(alice, bob);
+}
+
+/** A wire the test can cut and bring back. */
+interface ILink {
+	cut: ICut;
+	gate: IWireGate;
+}
+
+function scene(
+	seed: number,
+	channels = 1,
+	storage?: SqliteStorage,
+	link?: ILink
+): IScene {
+	const chain = new FakeSwapChain();
+	const fp = fakeFundingProvider(chain);
+	const alice = createNode(TAG, seed);
+	const bob = providerNode(seed + 1, chain, fp, storage);
+	if (link) wire(alice, bob, link.cut, undefined, link.gate);
+	else connectNodes(alice, bob);
 	alice.handleNewBlock(1000);
 	bob.handleNewBlock(1000);
 	const ids = [];
@@ -193,6 +223,48 @@ async function tick(s: IScene, height: number): Promise<void> {
 	s.bob.handleNewBlock(height);
 	await settle();
 	await s.bob.getSwapProvider()!.onBlock(height);
+}
+
+function receivedHtlcCount(bob: LightningNode, channelId: Buffer): number {
+	return [
+		...bob
+			.getChannelManager()
+			.getChannel(channelId)!
+			.getFullState()
+			.htlcs.keys()
+	].filter((key) => key.startsWith('received-')).length;
+}
+
+/** Create a swap and park one dust MPP part with an expiry weeks out. */
+async function parkDustPart(
+	s: IScene,
+	swap: IClientSwap
+): Promise<NonNullable<ISwapCreateAck['terms']>> {
+	const ack = await createSwap(s, swap);
+	expect(ack.accepted, ack.reasonText).to.equal(true);
+	const terms = ack.terms!;
+	const secret = (await import('../../src/lightning/invoice/decode')).decode(
+		terms.bolt11
+	).paymentSecret!;
+	s.alice.sendPaymentToRoute(
+		{
+			hops: [
+				{
+					pubkey: Buffer.from(s.bob.getNodeId(), 'hex'),
+					shortChannelId: scidForIndex(0),
+					amountToForwardMsat: 1_000n,
+					outgoingCltvValue: 5000
+				}
+			]
+		},
+		swap.paymentHash,
+		5000,
+		secret,
+		terms.invoiceAmountMsat
+	);
+	await settle();
+	expect(receivedHtlcCount(s.bob, s.channels[0])).to.equal(1);
+	return terms;
 }
 
 describe('Reverse swap provider on LightningNode (issue #737)', function () {
@@ -501,5 +573,86 @@ describe('Reverse swap provider on LightningNode (issue #737)', function () {
 		);
 		expect(s.bob.listHoldInvoices()).to.deep.equal([]);
 		expect(s.events).to.deep.equal(['swap:created', 'swap:hold-cancelled']);
+	});
+
+	it('fails the parts of a cancel refused while the channel was down once it reestablishes (issue #1455)', async function () {
+		const link: ILink = {
+			cut: { val: false },
+			gate: { hold: false, queue: [] }
+		};
+		const s = scene(15, 1, undefined, link);
+		await s.bob.startSwapProvider();
+		const swap = clientSwap();
+		const terms = await parkDustPart(s, swap);
+		await tick(s, 1001);
+		expect(s.bob.listSwaps()[0].state).to.equal('CREATED');
+
+		await disconnect(s.alice, s.bob, link.cut);
+		s.bob['swapLedger']!.patch(terms.swapId.toString('hex'), {
+			invoiceExpiresAt: 1
+		});
+		await tick(s, 1002);
+		const owed = s.bob.listSwaps()[0];
+		expect(owed.state).to.equal('CANCELLED');
+		// Nothing was failed back, so nothing is recorded as cancelled.
+		expect(owed.holdCancelledAt).to.equal(undefined);
+		expect(s.bob.listHoldInvoices()[0].state).to.equal('ACCEPTED');
+		// A block with the channel still down is refused again.
+		await tick(s, 1003);
+		expect(receivedHtlcCount(s.bob, s.channels[0])).to.equal(1);
+
+		await reconnect(s.alice, s.bob, link.cut, link.gate);
+		await settle();
+		expect(receivedHtlcCount(s.bob, s.channels[0])).to.equal(0);
+		expect(s.alice.getPayment(swap.paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+		const done = s.bob.listSwaps()[0];
+		expect(done.holdCancelledAt).to.be.a('number');
+		expect(done.holdCancelReason).to.equal('invoice_expired');
+		expect(s.bob.listHoldInvoices()).to.deep.equal([]);
+	});
+
+	it('a restart keeps retrying a cancel refused while the channel was down (issue #1455)', async function () {
+		this.timeout(20_000);
+		const dbPath = tempDb('swap-hold-cancel');
+		const storage = new SqliteStorage(dbPath);
+		storage.open();
+		const link: ILink = {
+			cut: { val: false },
+			gate: { hold: false, queue: [] }
+		};
+		const s = scene(17, 1, storage, link);
+		await s.bob.startSwapProvider();
+		const swap = clientSwap();
+		const terms = await parkDustPart(s, swap);
+
+		await disconnect(s.alice, s.bob, link.cut);
+		s.bob['swapLedger']!.patch(terms.swapId.toString('hex'), {
+			invoiceExpiresAt: 1
+		});
+		await tick(s, 1001);
+		expect(s.bob.listSwaps()[0].state).to.equal('CANCELLED');
+		expect(s.bob.listSwaps()[0].holdCancelledAt).to.equal(undefined);
+
+		// The process goes away with the cancel still unsent.
+		s.bob.destroy();
+		s.alice.removeAllListeners('message:outbound');
+		const disk = new SqliteStorage(dbPath);
+		disk.open();
+		const bob = providerNode(18, s.chain, s.fp, disk);
+		await bob.startSwapProvider();
+		expect(bob.listHoldInvoices()[0].state).to.equal('ACCEPTED');
+
+		await reconnectRestarted(bob, s.alice);
+		await settle();
+		expect(receivedHtlcCount(bob, s.channels[0])).to.equal(0);
+		expect(s.alice.getPayment(swap.paymentHash)!.status).to.equal(
+			PaymentStatus.FAILED
+		);
+		expect(bob.listSwaps()[0].holdCancelledAt).to.be.a('number');
+		expect(bob.listHoldInvoices()).to.deep.equal([]);
+		s.alice.destroy();
+		bob.destroy();
 	});
 });
