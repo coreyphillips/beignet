@@ -699,6 +699,24 @@ export class Transaction {
 				transactionByteCount,
 				balance: txBalance
 			});
+			// A maximum below the quoted rate leaves more over, and the builder
+			// pays any of it above dust to generated change. A lower rate leaves
+			// more still, so the maximum priced with that change keeps it.
+			if (!pricesChange) {
+				const changeAtMax = this.generatedChangeAddress({
+					transaction,
+					inputs,
+					fee: Math.ceil(byteCountFor(false) * maxSatPerByte)
+				});
+				if (changeAtMax) {
+					changeAddress = changeAtMax;
+					pricesChange = true;
+					maxSatPerByte = this.getMaxSatsPerByte({
+						transactionByteCount: byteCountFor(true),
+						balance: txBalance
+					});
+				}
+			}
 			// updateFee refuses a fee of exactly half the balance. A rate that drops
 			// the change output pays only the leftover, which is under half. A
 			// lower rate can also select fewer coins than this quote did.

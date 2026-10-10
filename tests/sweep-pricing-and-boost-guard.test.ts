@@ -341,6 +341,42 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 				expect(tx.outs.map((out) => out.value)).to.have.members([962, 325]);
 			});
 		});
+
+		// #1519: 1,000 sat/vB leaves nothing for change, but the builder adds it
+		// at the maximum, so the maximum has to pay for its 31 vB.
+		it('quotes a maximum rate that pays for the change it generates', async function () {
+			wallet.updateCoinSelectPreference(ECoinSelectPreference.consolidate);
+			injectUtxo(FUNDING_TXID, 100_000);
+			injectUtxo(BOOSTED_TXID, 100_000);
+			const setup = await wallet.transaction.setupTransaction();
+			if (setup.isErr()) throw setup.error;
+			const staged = wallet.transaction.updateSendTransaction({
+				transaction: {
+					changeAddress: '',
+					outputs: [{ address: P2WPKH, value: 40_000, index: 0 }]
+				}
+			});
+			if (staged.isErr()) throw staged.error;
+
+			const quote = wallet.getFeeInfo({ satsPerByte: 1000 });
+			if (quote.isErr()) throw quote.error;
+			expect(quote.value.maxSatPerByte).to.equal(95);
+			expect(quote.value.transactionByteCount).to.equal(209);
+			expect(quote.value.totalFee).to.equal(209 * 95);
+			const atMax = wallet.transaction.updateFee({
+				satsPerByte: quote.value.maxSatPerByte
+			});
+			if (atMax.isErr()) throw atMax.error;
+			expect(atMax.value.fee).to.equal(quote.value.totalFee);
+			stubLookups({});
+			const created = await wallet.transaction.createTransaction();
+			if (created.isErr()) throw created.error;
+			const tx = BitcoinTransaction.fromHex(created.value.hex);
+			expect(tx.outs.map((out) => out.value)).to.have.members([
+				40_000,
+				160_000 - atMax.value.fee
+			]);
+		});
 	});
 
 	describe('setupRbf', function () {
