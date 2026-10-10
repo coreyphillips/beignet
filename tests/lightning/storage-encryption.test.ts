@@ -754,6 +754,45 @@ describe('Storage Encryption', function () {
 					expect(leaked()).to.deep.equal([]);
 				});
 
+				it('scrubs a database an older release encrypted', function () {
+					savePlaintext();
+					// What a release before the scrub left behind: the rows
+					// rewritten as ciphertext, their plaintext in freed pages,
+					// no marker table and schema 17.
+					const old = new Database(dbPath);
+					old
+						.prepare('UPDATE metadata SET value = ? WHERE key = ?')
+						.run(encryptValue(TEST_KEY, held), 'jit:held');
+					old
+						.prepare('UPDATE wallet_data SET value = ? WHERE key = ?')
+						.run(encryptValue(TEST_KEY, wallet), 'wallet');
+					old.exec('DROP TABLE encryption_scrub_pending');
+					old.exec('DELETE FROM schema_version WHERE version > 17');
+					old.pragma('wal_checkpoint(TRUNCATE)');
+					old.close();
+					expect(leaked()).to.not.be.empty;
+					const stored = storedValues();
+
+					const storage = openEncrypted();
+					expect(leaked()).to.deep.equal([]);
+					expect(scrubPending(storage)).to.equal(false);
+					expect(storage.loadMetadata('jit:held')).to.equal(held);
+					expect(storage.loadWalletData('wallet')).to.equal(wallet);
+					storage.checkpoint();
+					storage.close();
+					expect(leaked()).to.deep.equal([]);
+					expect(storedValues()).to.deep.equal(stored);
+
+					const again = openEncrypted();
+					expect(scrubPending(again)).to.equal(false);
+					expect(again.loadMetadata('jit:held')).to.equal(held);
+					expect(again.loadWalletData('wallet')).to.equal(wallet);
+					again.checkpoint();
+					again.close();
+					expect(leaked()).to.deep.equal([]);
+					expect(storedValues()).to.deep.equal(stored);
+				});
+
 				it('retries a failed VACUUM on the next open', function () {
 					savePlaintext();
 					const storage = new SqliteStorage(dbPath, undefined, {
