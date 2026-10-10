@@ -265,6 +265,7 @@ export const getByteCount = (
 		let totalWeight = 0;
 		let hasWitness = false;
 		let inputCount = 0;
+		let legacyInputCount = 0;
 		let outputCount = 0;
 		// assumes compressed pubkeys in all cases.
 		const types: {
@@ -377,11 +378,11 @@ export const getByteCount = (
 				inputCount += count;
 				// P2SH inputs use nested SegWit here, so they need the witness marker
 				// and flag even though the address type has no 'W'.
-				if (
-					count > 0 &&
-					(key.indexOf('W') >= 0 || key === 'P2TR' || key === 'P2SH')
-				)
-					hasWitness = true;
+				if (key.indexOf('W') >= 0 || key === 'P2TR' || key === 'P2SH') {
+					if (count > 0) hasWitness = true;
+				} else {
+					legacyInputCount += count;
+				}
 			}
 		);
 
@@ -397,7 +398,9 @@ export const getByteCount = (
 			}
 		);
 
-		if (hasWitness) totalWeight += 2;
+		// A segwit transaction gives every legacy input an empty witness, one
+		// byte each.
+		if (hasWitness) totalWeight += 2 + legacyInputCount;
 		// Price the exact script the PSBT builder will embed, rather than a second
 		// copy of its serialization rules. The message was previously added as
 		// message.length * 2 weight units, which is half the payload in vbytes

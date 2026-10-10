@@ -301,6 +301,27 @@ export class Transaction {
 	}
 
 	/**
+	 * Whether a send below 2 sat/vB is priced at getByteCount's size instead
+	 * of at least 256 vB. A max send pays its fee out of its one output, so
+	 * padding only shrinks what the recipient gets and can push a small sweep
+	 * below dust. getByteCount counts every key as compressed, 32 vB short
+	 * for an uncompressed one, so those keep the padding.
+	 * @private
+	 * @param {Partial<ISendTransaction>} transaction
+	 * @param {IUtxo[]} inputs
+	 * @returns {boolean}
+	 */
+	private skipsSizeFloor(
+		transaction: Partial<ISendTransaction>,
+		inputs: IUtxo[]
+	): boolean {
+		return (
+			!!transaction.max &&
+			!inputs.some((input) => input.keyPair?.publicKey.length === 65)
+		);
+	}
+
+	/**
 	 * Rewrites plain P2WSH input counts to the weight-accurate
 	 * MULTISIG-P2WSH:m-n key for multisig wallets. getByteCount has no
 	 * generic P2WSH input weight; without this the byte count is unusable.
@@ -466,12 +487,13 @@ export class Transaction {
 			}
 
 			let transactionByteCount = getByteCount(inputParam, outputParam, message);
-			if (satsPerByte < 2) {
+			if (satsPerByte < 2 && !this.skipsSizeFloor(transaction, inputs)) {
 				const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
 				if (transactionByteCount < minByteCount)
 					transactionByteCount = minByteCount;
 			}
-			const fee = transactionByteCount * satsPerByte;
+			// Outputs are whole sats, so a fractional rate rounds the fee up.
+			const fee = Math.ceil(transactionByteCount * satsPerByte);
 			const generatedChange = this.generatedChangeAddress({
 				transaction,
 				inputs,
@@ -599,7 +621,7 @@ export class Transaction {
 			}
 
 			let transactionByteCount = getByteCount(inputParam, outputParam, message);
-			if (satsPerByte < 2) {
+			if (satsPerByte < 2 && !this.skipsSizeFloor(transaction, inputs)) {
 				const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
 				if (transactionByteCount < minByteCount)
 					transactionByteCount = minByteCount;
@@ -607,7 +629,7 @@ export class Transaction {
 			const generatedChange = this.generatedChangeAddress({
 				transaction,
 				inputs,
-				fee: transactionByteCount * satsPerByte
+				fee: Math.ceil(transactionByteCount * satsPerByte)
 			});
 			if (generatedChange) {
 				// Consolidate keeps the inputs already selected above.
@@ -641,7 +663,7 @@ export class Transaction {
 				});
 			}
 			return ok({
-				totalFee: transactionByteCount * satsPerByte,
+				totalFee: Math.ceil(transactionByteCount * satsPerByte),
 				transactionByteCount,
 				satsPerByte,
 				maxSatPerByte

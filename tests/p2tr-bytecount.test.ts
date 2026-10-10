@@ -30,4 +30,12 @@ describe('getByteCount taproot pricing (S-B.M3)', () => {
 			Math.ceil((66 + 41 * 4 + 2 + 43 * 4 + 8 * 4 + 4 + 4) / 4)
 		);
 	});
+
+	it('counts the empty witness of a legacy input spent beside a taproot one', () => {
+		// 592 WU P2PKH input + 230 WU P2TR input + 1 WU empty witness + 2 WU
+		// marker + 124 WU output + 40 WU base/counts = 989 WU. Rounded down to
+		// 247 vB it paid 247 sats at 1 sat/vB for a signed 248 vB sweep.
+		const mixed = getByteCount({ P2PKH: 1, P2TR: 1 }, { P2WPKH: 1 }, '', 0);
+		expect(mixed).to.equal(248);
+	});
 });
