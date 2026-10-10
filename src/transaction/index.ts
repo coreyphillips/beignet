@@ -884,6 +884,18 @@ export class Transaction {
 
 			const psbt = psbtRes.value;
 
+			// A freeze can land while the awaits above derive keys and load
+			// prevouts, so check what is about to be signed. No await may sit
+			// between this check and signPsbt.
+			if (!spendFrozen) {
+				for (const { hash, index } of psbt.txInputs) {
+					const txid = Buffer.from(hash).reverse().toString('hex');
+					if (this._wallet.isUtxoFrozen(txid, index)) {
+						return err(`Staged input ${txid}:${index} is frozen.`);
+					}
+				}
+			}
+
 			const signedPsbtRes = await this.signPsbt({
 				psbt,
 				bip32Interface: bip32InterfaceRes.value

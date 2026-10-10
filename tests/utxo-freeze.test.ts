@@ -132,6 +132,13 @@ const injectUtxo = (
 	return utxo;
 };
 
+/** A promise that settles only when its resolve is called. */
+const deferred = (): { promise: Promise<void>; resolve: () => void } => {
+	let resolve: () => void = () => {};
+	const promise = new Promise<void>((r) => (resolve = r));
+	return { promise, resolve };
+};
+
 describe('UTXO freeze/unfreeze', function () {
 	this.timeout(testTimeout);
 
@@ -557,6 +564,98 @@ describe('UTXO freeze/unfreeze', function () {
 				utxoB.tx_hash
 			]);
 		} finally {
+			await wallet.unfreezeUtxo({ txid: utxoB.tx_hash, index: utxoB.tx_pos });
+			await wallet.resetSendTransaction();
+		}
+	});
+
+	/**
+	 * Stages a plain send of both coins, starts createTransaction, freezes
+	 * utxoB once `paused` settles, then releases the build through `resume`.
+	 */
+	const freezeDuringBuild = async (
+		paused: Promise<void>,
+		resume: () => void
+	): Promise<Result<{ id: string; hex: string }>> => {
+		await wallet.resetSendTransaction();
+		const staged = await wallet.transaction.setupTransaction();
+		if (staged.isErr()) throw staged.error;
+		const output = wallet.transaction.updateSendTransaction({
+			transaction: {
+				outputs: [
+					{
+						address: 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk',
+						value: 30000,
+						index: 0
+					}
+				]
+			}
+		});
+		if (output.isErr()) throw output.error;
+		const fee = wallet.transaction.updateFee({ satsPerByte: 2 });
+		if (fee.isErr()) throw fee.error;
+		expect(wallet.transaction.data.inputs).to.have.length(2);
+
+		const building = wallet.transaction.createTransaction({});
+		await paused;
+		const frozen = await wallet.freezeUtxo({
+			txid: utxoB.tx_hash,
+			index: utxoB.tx_pos
+		});
+		if (frozen.isErr()) throw frozen.error;
+		resume();
+		return building;
+	};
+
+	it('signs no coin frozen while signing keys are derived (#1524)', async () => {
+		const getBip32Interface = wallet.getBip32Interface;
+		const paused = deferred();
+		const resume = deferred();
+		wallet.getBip32Interface = async (): ReturnType<
+			typeof getBip32Interface
+		> => {
+			paused.resolve();
+			await resume.promise;
+			return getBip32Interface();
+		};
+		try {
+			const created = await freezeDuringBuild(paused.promise, resume.resolve);
+			expect(wallet.isUtxoFrozen(utxoB.tx_hash, utxoB.tx_pos)).to.equal(true);
+			expect(created.isErr()).to.equal(true);
+			if (created.isErr()) {
+				expect(created.error.message).to.equal(
+					`Staged input ${utxoB.tx_hash}:${utxoB.tx_pos} is frozen.`
+				);
+			}
+		} finally {
+			wallet.getBip32Interface = getBip32Interface;
+			await wallet.unfreezeUtxo({ txid: utxoB.tx_hash, index: utxoB.tx_pos });
+			await wallet.resetSendTransaction();
+		}
+	});
+
+	it('signs no coin frozen while prevouts load (#1524)', async () => {
+		const getTransactions = wallet.electrum.getTransactions;
+		const paused = deferred();
+		const resume = deferred();
+		wallet.electrum.getTransactions = async (): ReturnType<
+			typeof getTransactions
+		> => {
+			paused.resolve();
+			await resume.promise;
+			return err('offline');
+		};
+		try {
+			const created = await freezeDuringBuild(paused.promise, resume.resolve);
+			expect(wallet.isUtxoFrozen(utxoB.tx_hash, utxoB.tx_pos)).to.equal(true);
+			expect(created.isErr()).to.equal(true);
+			if (created.isErr()) {
+				expect(created.error.message).to.equal(
+					`Staged input ${utxoB.tx_hash}:${utxoB.tx_pos} is frozen.`
+				);
+			}
+		} finally {
+			wallet.electrum.getTransactions = getTransactions;
 			await wallet.unfreezeUtxo({ txid: utxoB.tx_hash, index: utxoB.tx_pos });
 			await wallet.resetSendTransaction();
 		}
