@@ -24,6 +24,7 @@ import {
 import {
 	EAddressType,
 	EAvailableNetworks,
+	EBoostType,
 	ECoinSelectPreference,
 	EProtocol,
 	IUtxo,
@@ -57,9 +58,11 @@ const electrumOptions = {
 const P2TR = bitcoinAddress.toBech32(Buffer.alloc(32, 1), 1, 'bcrt');
 const P2WSH = bitcoinAddress.toBech32(Buffer.alloc(32, 2), 0, 'bcrt');
 const P2WPKH = bitcoinAddress.toBech32(Buffer.alloc(20, 3), 0, 'bcrt');
+const FOREIGN = bitcoinAddress.toBech32(Buffer.alloc(20, 4), 0, 'bcrt');
 
 const BOOSTED_TXID = 'bb'.repeat(32);
 const FUNDING_TXID = 'aa'.repeat(32);
+const FOREIGN_TXID = 'cc'.repeat(32);
 
 /** An in-memory TStorage, so the wallet has somewhere to persist. */
 const memoryStorage = (): TStorage => {
@@ -457,6 +460,64 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			const fee = 200_000 - tx.outs.reduce((sum, out) => sum + out.value, 0);
 			expect(fee).to.equal(res.value.fee);
 			expect(fee - originalFee).to.be.at.least(tx.virtualSize());
+		});
+
+		// #1489: the foreign input was skipped, so the original's 20k fee read as
+		// 10k and a 10,292 sat replacement was signed.
+		[
+			{ name: 'a foreign address', scriptPubKey: { address: FOREIGN } },
+			{
+				name: 'no address',
+				scriptPubKey: { asm: `${'02'.repeat(33)} OP_CHECKSIG`, type: 'pubkey' }
+			}
+		].forEach(({ name, scriptPubKey }) => {
+			it(`refuses a transaction with an input paid to ${name}`, async function () {
+				wallet.feeEstimates = { ...wallet.feeEstimates, fast: 10, slow: 2 };
+				stubLookups({
+					[BOOSTED_TXID]: {
+						vin: [
+							{ txid: FUNDING_TXID, vout: 0 },
+							{ txid: FOREIGN_TXID, vout: 0 }
+						] as TTxDetails['vin'],
+						vout: [
+							{ value: 0.0004, n: 0, scriptPubKey: { address: P2WPKH } },
+							{
+								value: 0.0005,
+								n: 1,
+								scriptPubKey: { address: changeAddress() }
+							}
+						] as unknown as TTxDetails['vout']
+					},
+					[FUNDING_TXID]: {
+						confirmations: 10,
+						vout: [
+							{
+								value: 0.001,
+								n: 0,
+								scriptPubKey: { address: receiveAddress() }
+							}
+						] as unknown as TTxDetails['vout']
+					},
+					[FOREIGN_TXID]: {
+						confirmations: 10,
+						vout: [
+							{ value: 0.0001, n: 0, scriptPubKey }
+						] as unknown as TTxDetails['vout']
+					}
+				});
+
+				const rbfData = await wallet.getRbfData({
+					txHash: { tx_hash: BOOSTED_TXID }
+				});
+				expect(rbfData.isErr(), 'getRbfData refused').to.equal(true);
+				const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+
+				expect(res.isErr(), 'setupRbf refused').to.equal(true);
+				if (res.isOk()) return;
+				expect(res.error.message).to.include('Unable to RBF');
+				expect(wallet.transaction.data.outputs).to.have.length(0);
+				expect(wallet.transaction.data.boostType).to.not.equal(EBoostType.rbf);
+			});
 		});
 
 		it('refuses when the change cannot pay the replacement floor', async function () {

@@ -5962,7 +5962,12 @@ export class Wallet {
 			})
 		);
 		const { vins, vouts } = insAndOuts[0];
+		// The original fee is read from the inputs rebuilt here, and the
+		// replacement spends only those. An input this wallet cannot sign is
+		// refused, because skipping it would understate that fee.
 		for (let i = 0; i < vins.length; i++) {
+			// A prevout with no address must not inherit the previous input's.
+			address = '';
 			try {
 				const input = vins[i];
 				// A coinbase input has no prevout and can never be RBF'd; the
@@ -5987,13 +5992,16 @@ export class Wallet {
 					address = txVout.scriptPubKey.addresses[0];
 				}
 				if (!address) {
-					continue;
+					return err(
+						'Unable to determine the address of an input. Unable to RBF.'
+					);
 				}
 				scriptHash = getScriptHash({ address, network: this._network });
 				// Check that we are in possession of this scriptHash.
 				if (!(scriptHash in allAddresses)) {
-					// This output did not come from us.
-					continue;
+					return err(
+						'Transaction spends an input this wallet does not own. Unable to RBF.'
+					);
 				}
 				path = allAddresses[scriptHash].path;
 				value = btcToSats(txVout.value);
@@ -6014,6 +6022,7 @@ export class Wallet {
 				}
 			} catch (e) {
 				this.logger.error('Failed to get input value.', e);
+				return err('Failed to get input value. Unable to RBF.');
 			}
 		}
 		for (let i = 0; i < vouts.length; i++) {
