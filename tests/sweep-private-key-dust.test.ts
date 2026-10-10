@@ -5,6 +5,7 @@
  * Issue #1433: a key holding under 546 sats in total was refused before sweep
  * pricing, so its coins could not even join a sweep of the wallet's funds.
  * Issue #1466: a combined sweep also spent the wallet's frozen coins.
+ * Issue #1467: a lone 500 sat coin could not pay for its own sweep at 1 sat/vB.
  *
  * Fully OFFLINE: the wallet points at an unreachable Electrum port and the
  * key's UTXO lookup is stubbed.
@@ -226,10 +227,11 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 		expect(fee).to.be.below(1_000);
 	});
 
-	it('leaves a lone 500 sat coin for sweep pricing to judge', async () => {
-		// getTotalFee prices any transaction at 1 sat/vB as at least 256 vB,
-		// which leaves 244 sats for a destination whose threshold is 294.
-		keyHolds([keyCoin('aa'.repeat(32), 500)]);
+	it('sweeps a lone 500 sat coin at 1 sat/vB (#1467)', async () => {
+		// Padded to 256 vB, the fee left 244 sats for a destination whose
+		// threshold is 294.
+		const coin = keyCoin('aa'.repeat(32), 500);
+		keyHolds([coin]);
 
 		const res = await wallet.sweepPrivateKey({
 			privateKey: keyPair.toWIF(),
@@ -237,12 +239,13 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 			satsPerByte: 1,
 			broadcast: false
 		});
+		if (res.isErr()) throw res.error;
 
-		expect(res.isErr(), 'the sweep was refused').to.equal(true);
-		if (res.isOk()) return;
-		expect(res.error.message).to.equal(
-			`Output value for ${RECIPIENT} must be greater than or equal to the dust threshold of 294 sats`
-		);
+		const tx = BitcoinTransaction.fromHex(res.value.hex);
+		expect(spentTxids(tx)).to.deep.equal([coin.tx_hash]);
+		expect(tx.outs).to.have.length(1);
+		expect(tx.outs[0].value).to.be.at.least(294);
+		expect(500 - tx.outs[0].value).to.be.at.least(tx.virtualSize());
 	});
 
 	it('refuses a key that holds no coins', async () => {

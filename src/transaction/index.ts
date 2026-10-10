@@ -466,7 +466,10 @@ export class Transaction {
 			}
 
 			let transactionByteCount = getByteCount(inputParam, outputParam, message);
-			if (satsPerByte < 2) {
+			// A max send pays its fee out of the one output, so padding the size
+			// only shrinks what the recipient gets, and can push a small sweep
+			// below dust. Its inputs and output are all known, so the count stands.
+			if (satsPerByte < 2 && !transaction.max) {
 				const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
 				if (transactionByteCount < minByteCount)
 					transactionByteCount = minByteCount;
@@ -599,7 +602,8 @@ export class Transaction {
 			}
 
 			let transactionByteCount = getByteCount(inputParam, outputParam, message);
-			if (satsPerByte < 2) {
+			// Unpadded for a max send, as in getTotalFee.
+			if (satsPerByte < 2 && !transaction.max) {
 				const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
 				if (transactionByteCount < minByteCount)
 					transactionByteCount = minByteCount;
