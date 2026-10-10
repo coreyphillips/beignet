@@ -6032,12 +6032,14 @@ export class Wallet {
 				address = vout.scriptPubKey.addresses[0];
 			} else if (vout.scriptPubKey?.address) {
 				address = vout.scriptPubKey.address;
-			} else {
+			} else if (vout.scriptPubKey?.asm?.includes('OP_RETURN')) {
+				// The replacement rebuilds this output from message. Pushing it
+				// would stage a payment to whichever address was read last.
 				try {
-					if (vout.scriptPubKey.asm.includes('OP_RETURN')) {
-						message = decodeOpReturnMessage(vout.scriptPubKey.asm)[0] || '';
-					}
+					message = decodeOpReturnMessage(vout.scriptPubKey.asm)[0] || '';
 				} catch {}
+				outputTotal = outputTotal + voutValue;
+				continue;
 			}
 			if (!address) {
 				continue;
