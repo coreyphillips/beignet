@@ -60,10 +60,13 @@ const KEY_P2PKH = payments.p2pkh({ pubkey: keyPair.publicKey, network });
 const KEY_P2PKH_ADDRESS = KEY_P2PKH.address as string;
 
 /** A previous transaction paying value to the key's P2PKH address. */
-const p2pkhFunding = (value: number): BitcoinTransaction => {
+const p2pkhFunding = (
+	value: number,
+	output = KEY_P2PKH.output as Buffer
+): BitcoinTransaction => {
 	const tx = new BitcoinTransaction();
 	tx.addInput(Buffer.alloc(32, 0x01), 0);
-	tx.addOutput(KEY_P2PKH.output as Buffer, value);
+	tx.addOutput(output, value);
 	return tx;
 };
 
@@ -287,6 +290,49 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 		const tx = BitcoinTransaction.fromHex(res.value.hex);
 		expect(tx.outs).to.have.length(1);
 		expect(10_000 - tx.outs[0].value).to.be.at.least(tx.virtualSize() * 1.5);
+	});
+
+	it('pays 1 sat/vB on a max send from an uncompressed P2PKH key', async () => {
+		// Counted as if compressed, the sweep is 189 vB. Signed, it is about 220.
+		const uncompressed = ECPair.fromPrivateKey(Buffer.alloc(32, 0x5a), {
+			network,
+			compressed: false
+		});
+		const p2pkh = payments.p2pkh({ pubkey: uncompressed.publicKey, network });
+		const prevTx = p2pkhFunding(10_000, p2pkh.output as Buffer);
+		keyHolds([], prevTx);
+		await wallet.transaction.resetSendTransaction();
+		// addExternalInputs prices the fee against a staged output.
+		const staged = wallet.transaction.updateSendTransaction({
+			transaction: {
+				outputs: [{ address: RECIPIENT, value: 1_000, index: 0 }],
+				satsPerByte: 1
+			}
+		});
+		if (staged.isErr()) throw staged.error;
+
+		const added = wallet.transaction.addExternalInputs({
+			inputs: [
+				{
+					...keyCoin(prevTx.getId(), 10_000, p2pkh.address as string),
+					publicKey: uncompressed.publicKey.toString('hex')
+				}
+			],
+			keyPair: uncompressed
+		});
+		if (added.isErr()) throw added.error;
+		const max = await wallet.transaction.sendMax({
+			address: RECIPIENT,
+			satsPerByte: 1
+		});
+		if (max.isErr()) throw max.error;
+		const res = await wallet.transaction.createTransaction({});
+		await wallet.transaction.resetSendTransaction();
+		if (res.isErr()) throw res.error;
+
+		const tx = BitcoinTransaction.fromHex(res.value.hex);
+		expect(tx.outs).to.have.length(1);
+		expect(10_000 - tx.outs[0].value).to.be.at.least(tx.virtualSize());
 	});
 
 	it('refuses a key that holds no coins', async () => {
