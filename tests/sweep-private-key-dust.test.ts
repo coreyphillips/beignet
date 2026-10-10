@@ -56,10 +56,24 @@ const RECIPIENT = 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk';
 const keyPair = ECPair.fromPrivateKey(Buffer.alloc(32, 0x5a), { network });
 const KEY_ADDRESS = payments.p2wpkh({ pubkey: keyPair.publicKey, network })
 	.address as string;
+const KEY_P2PKH = payments.p2pkh({ pubkey: keyPair.publicKey, network });
+const KEY_P2PKH_ADDRESS = KEY_P2PKH.address as string;
 
-/** A coin paying the swept key's P2WPKH address. */
-const keyCoin = (txid: string, value: number): IUtxo => ({
-	address: KEY_ADDRESS,
+/** A previous transaction paying value to the key's P2PKH address. */
+const p2pkhFunding = (value: number): BitcoinTransaction => {
+	const tx = new BitcoinTransaction();
+	tx.addInput(Buffer.alloc(32, 0x01), 0);
+	tx.addOutput(KEY_P2PKH.output as Buffer, value);
+	return tx;
+};
+
+/** A coin paying the swept key, at its P2WPKH address unless told otherwise. */
+const keyCoin = (
+	txid: string,
+	value: number,
+	address = KEY_ADDRESS
+): IUtxo => ({
+	address,
 	index: 0,
 	path: '',
 	scriptHash: '00'.repeat(32),
@@ -75,15 +89,24 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 
 	let wallet: Wallet;
 
-	/** Makes the key's UTXO lookup answer with the given coins. */
-	const keyHolds = (utxos: IUtxo[]): void => {
+	/**
+	 * Makes the key's UTXO lookup answer with the given coins. A P2PKH input
+	 * needs its previous transaction, served as prevTx.
+	 */
+	const keyHolds = (utxos: IUtxo[], prevTx?: BitcoinTransaction): void => {
 		const balance = utxos.reduce((total, utxo) => total + utxo.value, 0);
 		sinon
 			.stub(wallet.electrum, 'listUnspentAddressScriptHashes')
 			.resolves(ok({ utxos, balance }));
 		// Segwit inputs build from witnessUtxo when the previous transaction
 		// cannot be fetched.
-		sinon.stub(wallet.electrum, 'getTransactions').resolves(err('offline'));
+		sinon
+			.stub(wallet.electrum, 'getTransactions')
+			.resolves(
+				prevTx
+					? (ok({ data: [{ result: { hex: prevTx.toHex() } }] }) as never)
+					: err('offline')
+			);
 	};
 
 	before(async function () {
@@ -246,6 +269,24 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 		expect(tx.outs).to.have.length(1);
 		expect(tx.outs[0].value).to.be.at.least(294);
 		expect(500 - tx.outs[0].value).to.be.at.least(tx.virtualSize());
+	});
+
+	it('rounds the fee of a sweep at 1.5 sat/vB up to whole sats', async () => {
+		// 189 vB at 1.5 sat/vB is 283.5 sats.
+		const prevTx = p2pkhFunding(10_000);
+		keyHolds([keyCoin(prevTx.getId(), 10_000, KEY_P2PKH_ADDRESS)], prevTx);
+
+		const res = await wallet.sweepPrivateKey({
+			privateKey: keyPair.toWIF(),
+			toAddress: RECIPIENT,
+			satsPerByte: 1.5,
+			broadcast: false
+		});
+		if (res.isErr()) throw res.error;
+
+		const tx = BitcoinTransaction.fromHex(res.value.hex);
+		expect(tx.outs).to.have.length(1);
+		expect(10_000 - tx.outs[0].value).to.be.at.least(tx.virtualSize() * 1.5);
 	});
 
 	it('refuses a key that holds no coins', async () => {

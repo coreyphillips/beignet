@@ -474,7 +474,8 @@ export class Transaction {
 				if (transactionByteCount < minByteCount)
 					transactionByteCount = minByteCount;
 			}
-			const fee = transactionByteCount * satsPerByte;
+			// Outputs are whole sats, so a fractional rate rounds the fee up.
+			const fee = Math.ceil(transactionByteCount * satsPerByte);
 			const generatedChange = this.generatedChangeAddress({
 				transaction,
 				inputs,
@@ -611,7 +612,7 @@ export class Transaction {
 			const generatedChange = this.generatedChangeAddress({
 				transaction,
 				inputs,
-				fee: transactionByteCount * satsPerByte
+				fee: Math.ceil(transactionByteCount * satsPerByte)
 			});
 			if (generatedChange) {
 				// Consolidate keeps the inputs already selected above.
@@ -645,7 +646,7 @@ export class Transaction {
 				});
 			}
 			return ok({
-				totalFee: transactionByteCount * satsPerByte,
+				totalFee: Math.ceil(transactionByteCount * satsPerByte),
 				transactionByteCount,
 				satsPerByte,
 				maxSatPerByte
