@@ -3060,7 +3060,10 @@ export class Channel {
 			// The peer's channel_ready means it holds the complete funding tx,
 			// so the v2 opening record has nothing left to resume or retransmit
 			// (the funding tx itself stays in pendingFundingTxHex until depth).
+			// The session goes too: its builder holds the peer's prev_txs, which
+			// count against the node-wide budget (issue #1501).
 			this._state.v2InFlight = null;
+			this._state.dualFundingSession = null;
 			return [
 				...prefix,
 				sendMsg(MessageType.CHANNEL_READY, encodeChannelReadyMessage(msg)),
@@ -3305,6 +3308,7 @@ export class Channel {
 			// opening record has nothing left to resume or retransmit, and no
 			// other attempt of this open can confirm any more.
 			this._state.v2InFlight = null;
+			this._state.dualFundingSession = null;
 			this._state.v2PreviousAttempts = undefined;
 			return [
 				...prefix,
@@ -21313,11 +21317,12 @@ export class Channel {
 
 		// BOLT 2: tx_signatures MUST be ignored once either side has sent or
 		// received channel_ready; the opening exchange is over. Checked before
-		// the session requirement, and before anything with an effect: the
-		// record is cleared at NORMAL while the live session object remains,
-		// so without this gate a replay of the original (valid) message would
-		// recreate the record, re-persist, rebroadcast, and pull the channel
-		// from NORMAL back to AWAITING_FUNDING_CONFIRMED. The shared predicate
+		// the session requirement, and before anything with an effect: until
+		// NORMAL the live session object remains, so without this gate a
+		// replay of the original (valid) message would recreate the record,
+		// re-persist, rebroadcast, and pull the channel back to
+		// AWAITING_FUNDING_CONFIRMED. At NORMAL the session is gone, and the
+		// replay would be refused instead of ignored. The shared predicate
 		// counts a transiently stashed early ready too (issue #581): the
 		// peer's witnesses are necessarily already in the session by stash
 		// time, so anything landing here afterwards is a replay to ignore,
