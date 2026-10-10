@@ -4925,7 +4925,7 @@ export class Wallet {
 	 */
 	public getFeeInfo({
 		satsPerByte = this.feeEstimates.normal,
-		message = '',
+		message,
 		transaction,
 		fundingLightning = false,
 		coinSelectPreference = this.coinSelectPreference

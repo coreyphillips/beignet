@@ -761,6 +761,87 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			});
 		});
 
+		// #1521: the quote left out the staged message, so it offered 60 sat/vB
+		// on 166 vB. With the message that is 10,860 sats even without change,
+		// more than the 10k left. 55 is 10k over the 181 vB without change.
+		[ECoinSelectPreference.small, ECoinSelectPreference.large].forEach(
+			(preference) => {
+				it(`quotes a maximum rate that pays for the message with preference ${preference}`, async function () {
+					wallet.updateCoinSelectPreference(preference);
+					const message = 'm'.repeat(60);
+					stubLookups({
+						[BOOSTED_TXID]: {
+							vin: [{ txid: FUNDING_TXID, vout: 0 }] as TTxDetails['vin'],
+							vout: [
+								{ value: 0.0009, n: 0, scriptPubKey: { address: P2WPKH } },
+								{
+									value: 0,
+									n: 1,
+									scriptPubKey: {
+										asm: `OP_RETURN ${Buffer.from(message).toString('hex')}`,
+										type: 'nulldata'
+									}
+								},
+								{
+									value: 0.00009,
+									n: 2,
+									scriptPubKey: { address: changeAddress() }
+								}
+							] as unknown as TTxDetails['vout']
+						},
+						[FUNDING_TXID]: {
+							confirmations: 10,
+							vout: [
+								{
+									value: 0.001,
+									n: 0,
+									scriptPubKey: { address: receiveAddress() }
+								}
+							] as unknown as TTxDetails['vout']
+						}
+					});
+
+					const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+					if (res.isErr()) throw res.error;
+					expect(res.value.message).to.equal(message);
+					const quote = wallet.getFeeInfo({ satsPerByte: 20 });
+					if (quote.isErr()) throw quote.error;
+					const explicit = wallet.getFeeInfo({ satsPerByte: 20, message });
+					if (explicit.isErr()) throw explicit.error;
+					expect(quote.value).to.deep.equal(explicit.value);
+					const withoutMessage = wallet.getFeeInfo({
+						satsPerByte: 20,
+						message: ''
+					});
+					if (withoutMessage.isErr()) throw withoutMessage.error;
+					expect(withoutMessage.value.transactionByteCount).to.be.below(
+						quote.value.transactionByteCount
+					);
+
+					const { maxSatPerByte } = quote.value;
+					expect(maxSatPerByte).to.equal(55);
+					const atMax = wallet.transaction.updateFee({
+						satsPerByte: maxSatPerByte
+					});
+					if (atMax.isErr()) throw atMax.error;
+					const created = await wallet.transaction.createTransaction();
+					if (created.isErr()) throw created.error;
+					const tx = BitcoinTransaction.fromHex(created.value.hex);
+					expect(
+						tx.outs.filter((out) => out.script[0] === 0x6a)
+					).to.have.length(1);
+					const fee =
+						100_000 - tx.outs.reduce((sum, out) => sum + out.value, 0);
+					expect(fee).to.equal(atMax.value.fee);
+					expect(fee).to.be.at.least(maxSatPerByte * tx.virtualSize());
+					const overMax = wallet.transaction.updateFee({
+						satsPerByte: maxSatPerByte + 1
+					});
+					expect(overMax.isErr(), 'one more sat/vB is refused').to.equal(true);
+				});
+			}
+		);
+
 		it('refuses when the change cannot pay the replacement floor', async function () {
 			wallet.feeEstimates = { ...wallet.feeEstimates, fast: 10, slow: 2 };
 			// Outbidding a 9,961 sat fee on 166 vB takes 62 sat/vB, which is 331
