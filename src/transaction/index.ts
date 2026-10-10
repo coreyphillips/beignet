@@ -750,7 +750,12 @@ export class Transaction {
 					}
 				}
 			}
-			if (maxSatPerByte < satsPerByte) {
+			// The maximum is a whole rate, but updateFee takes any rate whose fee
+			// fits its limits, so a fractional rate just past the maximum can too.
+			const paysRequested =
+				quote.totalFee < txBalance / 2 &&
+				(!!transaction.max || quote.totalFee <= available);
+			if (maxSatPerByte < satsPerByte && !paysRequested) {
 				const capped = quoteAt(maxSatPerByte);
 				return ok({
 					totalFee: capped.totalFee,

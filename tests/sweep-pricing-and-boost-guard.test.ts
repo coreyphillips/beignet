@@ -408,6 +408,36 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 				expect(atMax.value.fee).to.equal(quote.value.totalFee);
 			});
 		});
+
+		// #1520: half the 195,715 payment over 166 vB is 589.5 sat/vB. 589.1 is
+		// affordable, but the quote rounded it down to 589.
+		it('quotes a fractional rate above the integer maximum that it can pay', async function () {
+			wallet.updateCoinSelectPreference(ECoinSelectPreference.consolidate);
+			injectUtxo(FUNDING_TXID, 1_000_000);
+			const setup = await wallet.transaction.setupTransaction();
+			if (setup.isErr()) throw setup.error;
+			const staged = wallet.transaction.updateSendTransaction({
+				transaction: {
+					outputs: [{ address: P2WPKH, value: 195_715, index: 0 }]
+				}
+			});
+			if (staged.isErr()) throw staged.error;
+
+			const quote = wallet.getFeeInfo({ satsPerByte: 589.1 });
+			if (quote.isErr()) throw quote.error;
+			expect(quote.value.maxSatPerByte).to.equal(589);
+			expect(quote.value.satsPerByte).to.equal(589.1);
+			const updated = wallet.transaction.updateFee({ satsPerByte: 589.1 });
+			if (updated.isErr()) throw updated.error;
+			expect(updated.value.fee).to.equal(97_791);
+			expect(quote.value.totalFee).to.equal(updated.value.fee);
+
+			const capped = wallet.getFeeInfo({ satsPerByte: 589.6 });
+			if (capped.isErr()) throw capped.error;
+			expect(capped.value.satsPerByte).to.equal(589);
+			const refused = wallet.transaction.updateFee({ satsPerByte: 589.6 });
+			expect(refused.isErr(), '589.6 sat/vB is refused').to.equal(true);
+		});
 	});
 
 	describe('setupRbf', function () {
@@ -625,6 +655,29 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 				});
 			}
 		);
+
+		// #1520: the 4,285 sats the 195,715 payment leaves pay 24.05 sat/vB on
+		// the 178 vB without change, but the quote rounded the rate down to 24.
+		it('quotes a fractional rate above the integer maximum that the leftover can pay', async function () {
+			stubTwoInputBoostedTransaction(195_715);
+
+			const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+			if (res.isErr()) throw res.error;
+			const quote = wallet.getFeeInfo({ satsPerByte: 24.05 });
+			if (quote.isErr()) throw quote.error;
+			expect(quote.value.maxSatPerByte).to.equal(24);
+			expect(quote.value.satsPerByte).to.equal(24.05);
+			const updated = wallet.transaction.updateFee({ satsPerByte: 24.05 });
+			if (updated.isErr()) throw updated.error;
+			expect(updated.value.fee).to.equal(4_285);
+			expect(quote.value.totalFee).to.equal(updated.value.fee);
+
+			const capped = wallet.getFeeInfo({ satsPerByte: 24.1 });
+			if (capped.isErr()) throw capped.error;
+			expect(capped.value.satsPerByte).to.equal(24);
+			const refused = wallet.transaction.updateFee({ satsPerByte: 24.1 });
+			expect(refused.isErr(), '24.1 sat/vB is refused').to.equal(true);
+		});
 
 		// #1430: at these estimates the quote was 1,660 sats and minFee 2, both
 		// under the original's 10k fee.
