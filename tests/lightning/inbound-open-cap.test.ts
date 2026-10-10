@@ -11,10 +11,16 @@
  *
  * Issue #1457: within that quota, the prev_tx bytes the opens' tx_add_input
  * messages leave retained are capped per session and across sessions.
+ *
+ * Issue #1500: a chain check still waiting on the backend holds none of
+ * those bytes once the input or its session is gone, and a refused input
+ * launches no check.
  */
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import v8 from 'v8';
+import vm from 'vm';
 import * as bitcoin from 'bitcoinjs-lib';
 import { Channel } from '../../src/lightning/channel/channel';
 import {
@@ -49,6 +55,12 @@ import {
 	deserializeChannelState,
 	serializeChannelState
 } from '../../src/lightning/storage/serialization';
+
+// lib is pinned to es2020, which predates WeakRef; Node has it.
+declare class WeakRef<T extends object> {
+	constructor(target: T);
+	deref(): T | undefined;
+}
 
 const PEER_A = '02' + 'a1'.repeat(32);
 const PEER_B = '02' + 'b2'.repeat(32);
@@ -444,7 +456,8 @@ describe('Retained peer prev_tx bytes (issue #1457)', () => {
 		victim: ChannelManager,
 		from: string,
 		channelId: Buffer,
-		serialId: bigint
+		serialId: bigint,
+		tx = prevTx
 	): string[] {
 		const errors: string[] = [];
 		const onError = (_id: Buffer | null, message: string): void => {
@@ -457,7 +470,7 @@ describe('Retained peer prev_tx bytes (issue #1457)', () => {
 			encodeTxAddInputMessage({
 				channelId,
 				serialId,
-				prevTx,
+				prevTx: tx,
 				prevTxVout: 0,
 				sequence: 0xfffffffd
 			})
@@ -535,5 +548,123 @@ describe('Retained peer prev_tx bytes (issue #1457)', () => {
 		expect(addInput(victim, PEER_B, b1, 4n)).to.deep.equal([]);
 		expect(retained(victim)).to.equal(3 * prevTx.length);
 		expect(addInput(victim, PEER_B, b1, 6n)[0]).to.contain('node-wide budget');
+	});
+
+	describe('pending chain checks (issue #1500)', () => {
+		type Verify = NonNullable<
+			IChannelManagerConfig['verifyRemoteFundingInput']
+		>;
+		interface IPendingCheck {
+			input: Parameters<Verify>[0];
+			resolve: (verdict: 'unspent' | 'spent-or-missing' | 'unknown') => void;
+		}
+
+		/**
+		 * Answers only when the test says so, and holds its argument meanwhile,
+		 * as the node's own verifier does across its backend query.
+		 */
+		function deferredVerifier(checks: IPendingCheck[]): Verify {
+			return (input) =>
+				new Promise((resolve) => {
+					checks.push({ input, resolve });
+				});
+		}
+
+		/** The memory behind the prev_tx the session's builder kept. */
+		function watchKeptPrevTx(
+			victim: ChannelManager,
+			channelId: Buffer,
+			serialId: bigint
+		): WeakRef<ArrayBufferLike> {
+			const kept = victim
+				.getTempChannel(channelId)!
+				.getDualFundingSession()!
+				.getTxBuilder()!
+				.getSession()
+				.inputs.get(serialId.toString())!.prevTx!;
+			// Its own allocation, not a shared pool slab.
+			expect(kept.buffer.byteLength).to.equal(prevTx.length);
+			return new WeakRef(kept.buffer);
+		}
+
+		/** A full collection, once this job's WeakRef targets are released. */
+		async function collectGarbage(): Promise<void> {
+			await new Promise((resolve) => setImmediate(resolve));
+			v8.setFlagsFromString('--expose-gc');
+			(vm.runInNewContext('gc') as () => void)();
+		}
+
+		it('eight dropped sessions retain no prev_tx while their checks are pending', async () => {
+			const checks: IPendingCheck[] = [];
+			const victim = makeManager('victim-pending', 0, {
+				verifyRemoteFundingInput: deferredVerifier(checks)
+			});
+			const watched: Array<WeakRef<ArrayBufferLike>> = [];
+			for (let i = 0; i < 8; i++) {
+				const id = acceptV2(victim, PEER_A, `pending-${i}`);
+				expect(
+					addInput(victim, PEER_A, id, 0n, makeLargePrevTx())
+				).to.deep.equal([]);
+				watched.push(watchKeptPrevTx(victim, id, 0n));
+				victim.handlePeerDisconnected(PEER_A);
+			}
+			expect(checks).to.have.length(8);
+			expect(retained(victim)).to.equal(0);
+
+			await collectGarbage();
+			expect(
+				watched.filter((ref) => ref.deref() !== undefined),
+				'prev_txs still reachable'
+			).to.have.length(0);
+
+			const sent: number[] = [];
+			victim.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			for (const check of checks) check.resolve('spent-or-missing');
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(sent, 'late verdicts found nothing to abort').to.deep.equal([]);
+		});
+
+		it('a check pending past tx_remove_input retains no prev_tx', async () => {
+			const checks: IPendingCheck[] = [];
+			const victim = makeManager('victim-removed', 0, {
+				verifyRemoteFundingInput: deferredVerifier(checks)
+			});
+			const id = acceptV2(victim, PEER_A, 'removed');
+			expect(addInput(victim, PEER_A, id, 0n, makeLargePrevTx())).to.deep.equal(
+				[]
+			);
+			const watched = watchKeptPrevTx(victim, id, 0n);
+			victim.handleMessage(
+				PEER_A,
+				MessageType.TX_REMOVE_INPUT,
+				encodeTxRemoveInputMessage({ channelId: id, serialId: 0n })
+			);
+			expect(checks).to.have.length(1);
+
+			await collectGarbage();
+			expect(watched.deref(), 'prev_tx still reachable').to.equal(undefined);
+
+			checks[0].resolve('spent-or-missing');
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(victim.getTempChannel(id), 'negotiation survives').to.not.equal(
+				undefined
+			);
+		});
+
+		it('launches no check for an input the budget refused', () => {
+			const checks: IPendingCheck[] = [];
+			const victim = makeManager('victim-refused', 0, {
+				maxRetainedPeerPrevTxBytes: prevTx.length,
+				verifyRemoteFundingInput: deferredVerifier(checks)
+			});
+			const id = acceptV2(victim, PEER_A, 'refused');
+			expect(addInput(victim, PEER_A, id, 0n)).to.deep.equal([]);
+			const refused = addInput(victim, PEER_A, id, 2n, makeLargePrevTx());
+			expect(refused).to.have.length(1);
+			expect(refused[0]).to.contain('node-wide budget');
+			expect(checks).to.have.length(1);
+		});
 	});
 });
