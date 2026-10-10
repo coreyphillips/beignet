@@ -730,6 +730,17 @@ export interface IChannelState {
 	 */
 	closeSpendsSpliceTxid?: Buffer | null;
 	/**
+	 * The funding txid (internal byte order) that the commitment this channel
+	 * last broadcast spends, written by every force-close plan it applies
+	 * (issue #1523). On a v2 open the confirmed in-flight record cannot say
+	 * this: it is stamped for the current attempt confirming as well as for a
+	 * superseded attempt the channel adopted, and only the second leaves the
+	 * close on the network spending a funding that will never exist. Absent on
+	 * rows written before the field and on channels that never broadcast a
+	 * close of their own. Persisted.
+	 */
+	closeSpendsFundingTxid?: Buffer;
+	/**
 	 * Splice txs this node fully signed that the chain has not been seen to
 	 * take (issue #756). A zero-conf channel locks, and so adopts, a splice
 	 * right after tx_signatures, and `spliceInFlight` dies with the adoption;

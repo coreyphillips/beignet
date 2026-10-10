@@ -10459,7 +10459,13 @@ export class LightningNode extends EventEmitter {
 				confirmedTxid
 		) {
 			if (retired) this.persistChannel(channelId);
-			void this.redriveSpliceAdoptedClose(channelId);
+			// Unless the close on the network already spends this funding: the
+			// current attempt confirming, or a restart replaying a confirmation
+			// already acted on. Rebuilding that close only refuses, and a mined
+			// one refuses again every block (issue #1523).
+			if (!state.closeSpendsFundingTxid?.equals(state.v2InFlight.fundingTxid)) {
+				void this.redriveSpliceAdoptedClose(channelId);
+			}
 			return;
 		}
 		// Issue #413: a v1 channel failed by a BOLT 1 error before its funding
