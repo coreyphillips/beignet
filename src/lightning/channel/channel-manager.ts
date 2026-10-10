@@ -437,6 +437,13 @@ export interface IChannelManagerConfig {
 		scriptPubKey: Buffer;
 	}) => Promise<'unspent' | 'spent-or-missing' | 'unknown'>;
 	/**
+	 * Node-wide ceiling on the prev_tx bytes peers' tx_add_input messages may
+	 * have live interactive-tx sessions retain, v2 opens and splices together
+	 * (issue #1457). An input that would cross it fails its negotiation.
+	 * Defaults to DEFAULT_MAX_RETAINED_PEER_PREVTX_BYTES.
+	 */
+	maxRetainedPeerPrevTxBytes?: number;
+	/**
 	 * Whether a durable channel row a restart could restore survives for
 	 * this id (issue #311). Consulted before releasing the funding pledges
 	 * of an abandoned v2 open: the node's channel:abandoned listener can
@@ -557,6 +564,15 @@ const MAX_HELD_UNKNOWN_REESTABLISH = 1024;
  * more than one channel waiting on us or the chain.
  */
 const MAX_PENDING_INBOUND_OPENS_PER_PEER = 4;
+
+/**
+ * Default ceiling on peer prev_tx bytes retained across every live
+ * interactive-tx session (issue #1457). A memory backstop rather than a
+ * policy: MAX_PEER_PREVTX_BYTES_PER_SESSION bounds one negotiation, and this
+ * bounds many together, since channel peers bypass the inbound connection
+ * cap. 32 full sessions, eight peers at their four-open quota.
+ */
+const DEFAULT_MAX_RETAINED_PEER_PREVTX_BYTES = 32 * 1024 * 1024;
 
 /**
  * setTimeout turns anything past 2^31-1 ms into a 1 ms delay, which would
@@ -8276,12 +8292,32 @@ export class ChannelManager extends EventEmitter {
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
 
-		const actions = channel.handleTxAddInput(msg);
+		const actions = channel.handleTxAddInput(msg, this._peerPrevTxBytesFree());
 		// Kick off the chain check before dispatching replies: a synchronous
 		// transport can drive the whole negotiation inside processActions, and
 		// the session gate below must see the state right after the add.
 		this.verifyPeerFundingInput(peerPubkey, channel, msg);
 		this.processActions(peerPubkey, channel, actions);
+	}
+
+	/**
+	 * What the node-wide peer prev_tx budget has left (issue #1457). Summed
+	 * from the live builders on every call rather than tracked, so an aborted
+	 * negotiation, a replaced RBF builder or a removed channel gives its bytes
+	 * back without release bookkeeping on each of those teardown paths.
+	 */
+	private _peerPrevTxBytesFree(): number {
+		let retained = 0;
+		for (const channel of this.channels.values()) {
+			retained += channel.getRetainedPeerPrevTxBytes();
+		}
+		for (const channel of this.tempChannels.values()) {
+			retained += channel.getRetainedPeerPrevTxBytes();
+		}
+		return (
+			(this.config.maxRetainedPeerPrevTxBytes ??
+				DEFAULT_MAX_RETAINED_PEER_PREVTX_BYTES) - retained
+		);
 	}
 
 	/**

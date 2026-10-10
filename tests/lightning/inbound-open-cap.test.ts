@@ -8,15 +8,25 @@
  * Issue #1456: an open promoted by funding_created keeps its slot until its
  * funding confirms, across disconnect and restore, because the txid it names
  * need not exist.
+ *
+ * Issue #1457: within that quota, the prev_tx bytes the opens' tx_add_input
+ * messages leave retained are capped per session and across sessions.
  */
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import * as bitcoin from 'bitcoinjs-lib';
 import { Channel } from '../../src/lightning/channel/channel';
 import {
 	ChannelManager,
+	IChannelManagerConfig,
 	IPerChannelKeys
 } from '../../src/lightning/channel/channel-manager';
+import { MAX_PEER_PREVTX_BYTES_PER_SESSION } from '../../src/lightning/interactive-tx/validation';
+import {
+	encodeTxAddInputMessage,
+	encodeTxRemoveInputMessage
+} from '../../src/lightning/message/interactive-tx';
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
@@ -86,7 +96,11 @@ function makePerChannelKeys(channelIndex: number): IPerChannelKeys {
 }
 
 /** keyOffset keeps two managers that complete an open off each other's keys. */
-function makeManager(tag: string, keyOffset = 0): ChannelManager {
+function makeManager(
+	tag: string,
+	keyOffset = 0,
+	extra: Partial<IChannelManagerConfig> = {}
+): ChannelManager {
 	const seed = makeSeed(tag);
 	const manager = new ChannelManager({
 		localConfig: { ...DEFAULT_CHANNEL_CONFIG },
@@ -96,7 +110,8 @@ function makeManager(tag: string, keyOffset = 0): ChannelManager {
 		htlcBasepointSecret: derivePrivkey(seed, 4),
 		chainHash: REGTEST_CHAIN_HASH,
 		channelKeyDeriver: (index: number): IPerChannelKeys =>
-			makePerChannelKeys(index + keyOffset)
+			makePerChannelKeys(index + keyOffset),
+		...extra
 	});
 	manager.on('error', noop);
 	return manager;
@@ -227,11 +242,12 @@ function acceptV1(
 	expect(target.getTempChannel(open.id)).to.not.equal(undefined);
 }
 
-function acceptV2(target: ChannelManager, from: string, tag: string): void {
+function acceptV2(target: ChannelManager, from: string, tag: string): Buffer {
 	const open = offerOpen2(tag);
 	const answer = inbound(target, from, MessageType.OPEN_CHANNEL2, open.payload);
 	expect(answer.wireTypes).to.deep.equal([MessageType.ACCEPT_CHANNEL2]);
 	expect(target.getTempChannel(open.id)).to.not.equal(undefined);
+	return open.id;
 }
 
 /** The refusal, scoped to the open's id, with nothing derived or retained. */
@@ -405,5 +421,119 @@ describe('Unconfirmed inbound channels keep their quota (issue #1456)', () => {
 			expect(channelId, `open ${i + 1} was accepted`).to.not.equal(null);
 			expect(victim.getChannel(channelId!)).to.not.equal(undefined);
 		}
+	});
+});
+
+describe('Retained peer prev_tx bytes (issue #1457)', () => {
+	/** The reproduction's prev_tx: 65,393 bytes, a P2WPKH at vout 0. */
+	function makeLargePrevTx(): Buffer {
+		const tx = new bitcoin.Transaction();
+		tx.version = 2;
+		tx.addInput(crypto.randomBytes(32), 0);
+		tx.addOutput(
+			Buffer.concat([Buffer.from('0014', 'hex'), crypto.randomBytes(20)]),
+			10_000
+		);
+		tx.addOutput(Buffer.alloc(65_300, 0x6a), 0);
+		return tx.toBuffer();
+	}
+	const prevTx = makeLargePrevTx();
+
+	/** Send one tx_add_input and return the errors it raised. */
+	function addInput(
+		victim: ChannelManager,
+		from: string,
+		channelId: Buffer,
+		serialId: bigint
+	): string[] {
+		const errors: string[] = [];
+		const onError = (_id: Buffer | null, message: string): void => {
+			errors.push(message);
+		};
+		victim.on('error', onError);
+		victim.handleMessage(
+			from,
+			MessageType.TX_ADD_INPUT,
+			encodeTxAddInputMessage({
+				channelId,
+				serialId,
+				prevTx,
+				prevTxVout: 0,
+				sequence: 0xfffffffd
+			})
+		);
+		victim.off('error', onError);
+		return errors;
+	}
+
+	function retained(victim: ChannelManager): number {
+		return victim
+			.listChannels()
+			.reduce((sum, c) => sum + c.getRetainedPeerPrevTxBytes(), 0);
+	}
+
+	it("caps each of a peer's four sessions, so 1,008 inputs no longer retain 66 MB", () => {
+		expect(prevTx.length).to.equal(65_393);
+		const fit = Math.floor(MAX_PEER_PREVTX_BYTES_PER_SESSION / prevTx.length);
+		const victim = makeManager('victim-prevtx');
+		const ids = [1, 2, 3, 4].map((i) => acceptV2(victim, PEER_A, `p-${i}`));
+
+		for (const id of ids) {
+			for (let i = 0; i < fit; i++) {
+				expect(addInput(victim, PEER_A, id, BigInt(2 * i))).to.deep.equal([]);
+			}
+		}
+		expect(retained(victim)).to.equal(4 * fit * prevTx.length);
+		expect(retained(victim)).to.be.at.most(
+			4 * MAX_PEER_PREVTX_BYTES_PER_SESSION
+		);
+
+		for (const id of ids) {
+			const errors = addInput(victim, PEER_A, id, BigInt(2 * fit));
+			expect(errors).to.have.length(1);
+			expect(errors[0]).to.contain('in this session');
+			expect(victim.getTempChannel(id)).to.equal(undefined);
+		}
+		expect(retained(victim)).to.equal(0);
+	});
+
+	it('shares one budget across sessions and peers, freed by tx_remove_input and by disconnect', () => {
+		const victim = makeManager('victim-budget', 0, {
+			maxRetainedPeerPrevTxBytes: 3 * prevTx.length
+		});
+		const a1 = acceptV2(victim, PEER_A, 'budget-a-1');
+		const a2 = acceptV2(victim, PEER_A, 'budget-a-2');
+		const b1 = acceptV2(victim, PEER_B, 'budget-b-1');
+
+		expect(addInput(victim, PEER_A, a1, 0n)).to.deep.equal([]);
+		expect(addInput(victim, PEER_A, a1, 2n)).to.deep.equal([]);
+		expect(addInput(victim, PEER_A, a2, 0n)).to.deep.equal([]);
+
+		// A fourth prev_tx anywhere crosses the budget and fails only the
+		// session it was sent on.
+		const refused = addInput(victim, PEER_A, a2, 2n);
+		expect(refused).to.have.length(1);
+		expect(refused[0]).to.contain('node-wide budget');
+		expect(victim.getTempChannel(a2)).to.equal(undefined);
+		expect(victim.getTempChannel(a1)!.getRetainedPeerPrevTxBytes()).to.equal(
+			2 * prevTx.length
+		);
+
+		// The failed session's bytes came back, and so does a removed input's.
+		expect(addInput(victim, PEER_B, b1, 0n)).to.deep.equal([]);
+		victim.handleMessage(
+			PEER_A,
+			MessageType.TX_REMOVE_INPUT,
+			encodeTxRemoveInputMessage({ channelId: a1, serialId: 0n })
+		);
+		expect(retained(victim)).to.equal(2 * prevTx.length);
+		expect(addInput(victim, PEER_B, b1, 2n)).to.deep.equal([]);
+
+		// So do a disconnected peer's sessions.
+		victim.handlePeerDisconnected(PEER_A);
+		expect(victim.getTempChannel(a1)).to.equal(undefined);
+		expect(addInput(victim, PEER_B, b1, 4n)).to.deep.equal([]);
+		expect(retained(victim)).to.equal(3 * prevTx.length);
+		expect(addInput(victim, PEER_B, b1, 6n)[0]).to.contain('node-wide budget');
 	});
 });
