@@ -413,10 +413,11 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		);
 
 		// #1492: half the 180k payment allowed 430 sat/vB, a fee the 20k left
-		// after it cannot pay.
+		// after it cannot pay. #1496: a rate the change cannot pay sends without
+		// it, so the maximum is priced without the 31 vB P2WPKH change output.
 		[ECoinSelectPreference.small, ECoinSelectPreference.large].forEach(
 			(preference) => {
-				it(`quotes a maximum rate the change can pay with preference ${preference}`, async function () {
+				it(`quotes a maximum rate the leftover can pay with preference ${preference}`, async function () {
 					wallet.updateCoinSelectPreference(preference);
 					stubTwoInputBoostedTransaction(180_000);
 
@@ -430,7 +431,7 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 
 					const { maxSatPerByte, transactionByteCount } = quote.value;
 					expect(maxSatPerByte).to.equal(
-						Math.floor(20_000 / transactionByteCount)
+						Math.floor(20_000 / (transactionByteCount - 31))
 					);
 					const atMax = wallet.transaction.updateFee({
 						satsPerByte: maxSatPerByte
@@ -439,7 +440,8 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 					const created = await wallet.transaction.createTransaction();
 					if (created.isErr()) throw created.error;
 					const tx = BitcoinTransaction.fromHex(created.value.hex);
-					expect(tx.outs.map((out) => out.value)).to.include(180_000);
+					expect(tx.outs.map((out) => out.value)).to.deep.equal([180_000]);
+					expect(20_000).to.be.at.least(maxSatPerByte * tx.virtualSize());
 					const overMax = wallet.transaction.updateFee({
 						satsPerByte: maxSatPerByte + 1
 					});

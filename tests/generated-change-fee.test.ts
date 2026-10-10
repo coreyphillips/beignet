@@ -198,4 +198,55 @@ describe('Fee estimation with generated change (#1465)', function () {
 			expect(paid).to.be.at.least(satsPerByte * tx.virtualSize());
 		});
 	});
+
+	// Issue #1496: at 10 sat/vB the 300 sats left over clear P2WPKH dust (294)
+	// but not the change output's own 310 sats. Priced with change, the fee was
+	// more than the inputs could pay and the send was refused.
+	[true, false].forEach((staged) => {
+		const kind = staged ? 'staged' : 'generated';
+		it(`sends without ${kind} change the leftover cannot pay for`, async () => {
+			const satsPerByte = 10;
+			const payment = INPUT_TOTAL - priceAt(satsPerByte, false) - 300;
+			const available = INPUT_TOTAL - payment;
+			expect(priceAt(satsPerByte, true)).to.be.above(available);
+			const transaction = {
+				inputs,
+				outputs: [{ address: RECIPIENT, value: payment, index: 0 }],
+				changeAddress: staged ? changeAddress : '',
+				satsPerByte
+			};
+			const fee = wallet.transaction.getTotalFee({
+				satsPerByte,
+				transaction,
+				coinSelectPreference: ECoinSelectPreference.consolidate
+			});
+			const feeObj = wallet.transaction.getTotalFeeObj({
+				satsPerByte,
+				transaction,
+				coinSelectPreference: ECoinSelectPreference.consolidate
+			});
+			if (feeObj.isErr()) throw feeObj.error;
+			expect(fee).to.equal(available);
+			expect(feeObj.value.totalFee).to.equal(fee);
+			expect(feeObj.value.transactionByteCount).to.equal(priceAt(1, false));
+
+			await wallet.transaction.resetSendTransaction();
+			wallet.transaction.updateSendTransaction({ transaction });
+			const updateRes = wallet.transaction.updateFee({ satsPerByte });
+			if (updateRes.isErr()) throw updateRes.error;
+			expect(updateRes.value.fee).to.equal(fee);
+			const res = await wallet.transaction.createTransaction({
+				shuffleOutputs: false
+			});
+			if (res.isErr()) throw res.error;
+
+			const tx = bitcoin.Transaction.fromHex(res.value.hex);
+			expect(tx.outs).to.have.length(1);
+			expect(
+				bitcoin.address.fromOutputScript(tx.outs[0].script, regtest)
+			).to.equal(RECIPIENT);
+			expect(tx.outs[0].value).to.equal(payment);
+			expect(available).to.be.at.least(satsPerByte * tx.virtualSize());
+		});
+	});
 });
