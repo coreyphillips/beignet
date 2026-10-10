@@ -580,11 +580,11 @@ export class Transaction {
 
 			// A replacement spends every input of the original, so coin selection
 			// must not price a subset of them.
-			if (
+			const selectsCoins =
 				coinSelectPreference !== ECoinSelectPreference.consolidate &&
 				!transaction.max &&
-				transaction.boostType !== EBoostType.rbf
-			) {
+				transaction.boostType !== EBoostType.rbf;
+			if (selectsCoins) {
 				const coinSelectRes = this.autoCoinSelect({
 					inputs,
 					outputs,
@@ -706,8 +706,19 @@ export class Transaction {
 				balance: txBalance
 			});
 			// updateFee refuses a fee of exactly half the balance. A rate that drops
-			// the change output pays only the leftover, which is under half.
-			if (maxSatPerByte && quoteAt(maxSatPerByte).totalFee >= txBalance / 2) {
+			// the change output pays only the leftover, which is under half. A
+			// lower rate can also select fewer coins than this quote did.
+			const feeAt = (rate: number): number =>
+				selectsCoins
+					? this.getTotalFee({
+							satsPerByte: rate,
+							message,
+							transaction,
+							fundingLightning,
+							coinSelectPreference
+					  })
+					: quoteAt(rate).totalFee;
+			if (maxSatPerByte && feeAt(maxSatPerByte) >= txBalance / 2) {
 				maxSatPerByte--;
 			}
 			// updateFee refuses a fee the inputs cannot pay on top of the outputs.

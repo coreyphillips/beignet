@@ -300,6 +300,40 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			const tx = BitcoinTransaction.fromHex(created.value.hex);
 			expect(tx.outs.map((out) => out.value)).to.have.members([0, 602]);
 		});
+
+		// #1518: six coins at 1 sat/vB are exactly half the 962 payment, but that
+		// rate selects five and pays 413.
+		it('quotes a maximum rate that selects fewer coins', async function () {
+			wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
+			[300, 300, 300, 300, 500, 600].forEach((value, txPos) =>
+				injectUtxo(FUNDING_TXID, value, txPos)
+			);
+			const setup = await wallet.transaction.setupTransaction();
+			if (setup.isErr()) throw setup.error;
+			const staged = wallet.transaction.updateSendTransaction({
+				transaction: {
+					outputs: [{ address: P2WPKH, value: 962, index: 0 }]
+				}
+			});
+			if (staged.isErr()) throw staged.error;
+
+			const quote = wallet.getFeeInfo({ satsPerByte: 2 });
+			if (quote.isErr()) throw quote.error;
+			expect(quote.value.maxSatPerByte).to.equal(1);
+			const atMax = wallet.transaction.updateFee({
+				satsPerByte: quote.value.maxSatPerByte
+			});
+			if (atMax.isErr()) throw atMax.error;
+			expect(atMax.value.fee).to.equal(413);
+			stubLookups({});
+			const created = await wallet.transaction.createTransaction({
+				runCoinSelect: true
+			});
+			if (created.isErr()) throw created.error;
+			const tx = BitcoinTransaction.fromHex(created.value.hex);
+			expect(tx.ins).to.have.length(5);
+			expect(tx.outs.map((out) => out.value)).to.have.members([962, 325]);
+		});
 	});
 
 	describe('setupRbf', function () {
