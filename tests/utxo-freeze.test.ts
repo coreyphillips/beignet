@@ -475,6 +475,58 @@ describe('UTXO freeze/unfreeze', function () {
 			await wallet.resetSendTransaction();
 		}
 	});
+
+	it('prices a direct max send from the coins its own setup staged (#1495)', async () => {
+		await wallet.resetSendTransaction();
+		try {
+			const max = await wallet.transaction.sendMax({
+				address: 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk',
+				satsPerByte: 2
+			});
+			if (max.isErr()) throw max.error;
+			const { inputs, outputs, fee } = wallet.transaction.data;
+			expect(inputs).to.have.length(2);
+			expect(outputs[0].value + fee).to.equal(100000);
+			const created = await wallet.transaction.createTransaction({});
+			if (created.isErr()) throw created.error;
+			const decoded = decodeRawTransaction(created.value.hex, wallet.network);
+			if (decoded.isErr()) throw decoded.error;
+			expect(decoded.value.vin).to.have.length(2);
+			expect(decoded.value.vout).to.have.length(1);
+			expect(decoded.value.vout[0].value).to.equal(outputs[0].value);
+		} finally {
+			await wallet.resetSendTransaction();
+		}
+	});
+
+	it('refuses a direct max send after reset when every coin is frozen (#1495)', async () => {
+		await wallet.resetSendTransaction();
+		for (const utxo of [utxoA, utxoB]) {
+			const frozen = await wallet.freezeUtxo({
+				txid: utxo.tx_hash,
+				index: utxo.tx_pos
+			});
+			if (frozen.isErr()) throw frozen.error;
+		}
+		try {
+			const res = await wallet.transaction.sendMax({
+				address: 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk',
+				satsPerByte: 2
+			});
+			expect(res.isErr()).to.equal(true);
+			if (res.isErr()) {
+				expect(res.error.message).to.equal(
+					'No inputs specified in setupTransaction.'
+				);
+			}
+			expect(wallet.transaction.data.inputs).to.have.length(0);
+		} finally {
+			for (const utxo of [utxoA, utxoB]) {
+				await wallet.unfreezeUtxo({ txid: utxo.tx_hash, index: utxo.tx_pos });
+			}
+			await wallet.resetSendTransaction();
+		}
+	});
 });
 
 /**
