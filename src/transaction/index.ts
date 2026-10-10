@@ -2074,6 +2074,11 @@ export class Transaction {
 			if (receiveAddress.isErr()) {
 				return err(receiveAddress.error.message);
 			}
+			const child = {
+				...this.data,
+				...setupTransactionRes.value,
+				boostType: EBoostType.cpfp
+			};
 
 			// try to calculate satsPerByte if not provided.
 			// child + parent combined fee rate should be higher than fastest.
@@ -2082,7 +2087,20 @@ export class Transaction {
 				const parent = this._wallet.data.transactions[txid];
 				if (parent) {
 					const parentVsize = parent.vsize;
-					const childVsize = 141; // assume segwit 1 input 1 output
+					// The child spends every output of the parent that pays us, so it
+					// is sized as the max send that sendMax prices below. Below 2
+					// sat/vB getTotalFee can floor the size at 256 vB, so the size is
+					// read at 2.
+					const childVsize =
+						this.getTotalFee({
+							satsPerByte: 2,
+							message: child.message,
+							transaction: {
+								...child,
+								max: true,
+								outputs: [{ address: receiveAddress.value, value: 0, index: 0 }]
+							}
+						}) / 2;
 					const { fast, normal } = this._wallet.feeEstimates;
 					// IFormattedTransaction.fee is denominated in BTC. Subtracting it
 					// from a sat figure took roughly 0.00001 off where it meant to take
@@ -2112,11 +2130,7 @@ export class Transaction {
 			}
 
 			const sendMaxRes = await this.sendMax({
-				transaction: {
-					...this.data,
-					...setupTransactionRes.value,
-					boostType: EBoostType.cpfp
-				},
+				transaction: child,
 				address: receiveAddress.value,
 				satsPerByte,
 				rbf: this._wallet.rbf

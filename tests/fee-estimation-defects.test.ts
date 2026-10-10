@@ -342,9 +342,10 @@ describe('fee estimation defects', function () {
 		});
 
 		it('credits the parent fee at its value in sats', async function () {
-			// Parent: 200 vB, 1000 sats of fee. Child: 141 vB assumed.
-			// (10 * 341 - 1000) / 141 = 17.09 -> 18 sat/vB.
-			// Reading the fee as 0.00001 instead of 1000 gave 25.
+			// Parent: 200 vB, 1000 sats of fee. The stubbed setup stages no
+			// inputs, so the child is sized at getByteCount's 166 vB minimum.
+			// (10 * 366 - 1000) / 166 = 16.02 -> 17 sat/vB.
+			// Reading the fee as 0.00001 instead of 1000 gave 23.
 			stageParent(0.00001, 200);
 			const sendMax = sinon
 				.stub(wallet.transaction, 'sendMax')
@@ -354,8 +355,8 @@ describe('fee estimation defects', function () {
 
 			if (res.isErr()) throw res.error;
 			expect(sendMax.calledOnce, 'the child was set up').to.equal(true);
-			expect(sendMax.firstCall.args[0].satsPerByte).to.equal(18);
-			// (5 * 341 - 1000) / 141 = 5 sat/vB, against 13 before the fix.
+			expect(sendMax.firstCall.args[0].satsPerByte).to.equal(17);
+			// (5 * 366 - 1000) / 166 = 5 sat/vB, against 12 before the fix.
 			expect(wallet.transaction.data.minFee).to.equal(5);
 		});
 
