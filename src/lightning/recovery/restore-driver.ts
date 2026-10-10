@@ -1118,7 +1118,8 @@ export class RestoreDriver {
 	 * brought onto it: one still under the old lease through SYNC_EPOCH,
 	 * one granted over a lower head by relaying the records up to it. A
 	 * possibly-stale signer's grant counts toward the quorum, but its head
-	 * is never the source.
+	 * is never the source. A quorum over one head is finished the same way
+	 * when too few of its signers can answer the round.
 	 */
 	private async finishSplitGrant(
 		attempt: IPendingAttempt,
@@ -1135,8 +1136,16 @@ export class RestoreDriver {
 		if (!bundle) return null;
 		const certified = certifiedBy(bundle);
 		// One head for the whole quorum is an ordinary grant: the round
-		// collects it from the guardians' idempotent replies.
-		if (bundle.every((cert) => statesEqual(cert.supersededState, certified))) {
+		// collects it from the guardians' idempotent replies. Only signers
+		// with a fresh head can reply, since a possibly-stale one refuses
+		// every acquisition (wire 5.3).
+		const answering = bundle.filter((cert) =>
+			pool.some((reading) => reading.guardianId.equals(cert.guardianId))
+		);
+		if (
+			answering.length >= this.config.required &&
+			bundle.every((cert) => statesEqual(cert.supersededState, certified))
+		) {
 			return null;
 		}
 		const source = pool.find((reading) =>
@@ -1227,7 +1236,7 @@ export class RestoreDriver {
 					this.emit(
 						'epoch:acquired',
 						`epoch ${pending.newEpoch} acquired with ${split.certificates.length} certificates ` +
-							`granted over different heads, certifying sequence ${split.certifiedState.logHead.sequence}`
+							`read from the guardians' heads, certifying sequence ${split.certifiedState.logHead.sequence}`
 					);
 					return { ...split, repaired: repaired + split.repaired };
 				}
