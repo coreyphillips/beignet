@@ -92,7 +92,7 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		wallet.data.changeAddressIndex[EAddressType.p2wpkh].address;
 
 	/** Fabricates a UTXO paying to the wallet's own index-0 address. */
-	const injectUtxo = (txid: string, value: number): IUtxo => {
+	const injectUtxo = (txid: string, value: number, txPos = 0): IUtxo => {
 		const source = wallet.data.addressIndex[EAddressType.p2wpkh];
 		if (!source?.address) throw new Error('No derived address available.');
 		const utxo: IUtxo = {
@@ -102,7 +102,7 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			scriptHash: source.scriptHash,
 			height: 0,
 			tx_hash: txid,
-			tx_pos: 0,
+			tx_pos: txPos,
 			value,
 			publicKey: source.publicKey
 		};
@@ -642,6 +642,54 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 				res.value.inputs.map((input) => input.tx_hash),
 				'only the parent is spent'
 			).to.deep.equal([BOOSTED_TXID]);
+		});
+
+		// #1497: the child was sized at 141 vB. Spending both of the parent's
+		// outputs to us makes it about 177, so the first three packages came
+		// out below fast and the last below normal at minFee.
+		[
+			{ fast: 1.5, normal: 1, parentFee: 282 },
+			{ fast: 2, normal: 1, parentFee: 423 },
+			{ fast: 4, normal: 1, parentFee: 705 },
+			{ fast: 10, normal: 2, parentFee: 423 }
+		].forEach(({ fast, normal, parentFee }) => {
+			it(`brings a two-input child's package to fast ${fast} and normal ${normal}`, async function () {
+				const parentVsize = 141;
+				wallet.data.transactions[BOOSTED_TXID] = {
+					fee: parentFee / 1e8,
+					vsize: parentVsize
+				} as IFormattedTransaction;
+				injectUtxo(BOOSTED_TXID, 50_000, 1);
+				wallet.feeEstimates = { ...wallet.feeEstimates, fast, normal };
+				stubLookups({ [BOOSTED_TXID]: {} });
+
+				/** Signs a child at the rate given, or the one setupCpfp picks. */
+				const signChild = async (
+					satsPerByte?: number
+				): Promise<{ packageRate: number; minFee: number }> => {
+					const res = await wallet.transaction.setupCpfp({
+						txid: BOOSTED_TXID,
+						satsPerByte
+					});
+					if (res.isErr()) throw res.error;
+					const { minFee } = res.value;
+					const created = await wallet.transaction.createTransaction();
+					if (created.isErr()) throw created.error;
+					const tx = BitcoinTransaction.fromHex(created.value.hex);
+					expect(tx.ins).to.have.length(2);
+					const childFee = 100_000 - tx.outs[0].value;
+					return {
+						packageRate:
+							(parentFee + childFee) / (parentVsize + tx.virtualSize()),
+						minFee
+					};
+				};
+
+				const atFast = await signChild();
+				expect(atFast.packageRate).to.be.at.least(fast);
+				const atMinFee = await signChild(atFast.minFee);
+				expect(atMinFee.packageRate).to.be.at.least(normal);
+			});
 		});
 	});
 });
