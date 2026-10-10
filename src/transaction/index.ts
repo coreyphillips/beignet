@@ -727,6 +727,29 @@ export class Transaction {
 					Math.floor(remaining / byteCountFor(false))
 				);
 			}
+			// Lowering the maximum can put the remainder above dust. The builder
+			// then adds change, which needs its own fee.
+			if (!pricesChange) {
+				const changeAtMax = this.generatedChangeAddress({
+					transaction,
+					inputs,
+					fee: Math.ceil(byteCountFor(false) * maxSatPerByte)
+				});
+				if (changeAtMax) {
+					changeAddress = changeAtMax;
+					pricesChange = true;
+					maxSatPerByte = Math.min(
+						maxSatPerByte,
+						this.getMaxSatsPerByte({
+							transactionByteCount: byteCountFor(true),
+							balance: txBalance
+						})
+					);
+					if (maxSatPerByte && feeAt(maxSatPerByte) >= txBalance / 2) {
+						maxSatPerByte--;
+					}
+				}
+			}
 			if (maxSatPerByte < satsPerByte) {
 				const capped = quoteAt(maxSatPerByte);
 				return ok({
