@@ -28,6 +28,14 @@ export const MAX_INTERACTIVE_TX_MSGS = 4096;
  * enforceable on the collaborative transaction).
  */
 export const MAX_INTERACTIVE_TX_SEQUENCE = 0xfffffffd;
+/**
+ * Ceiling on the prev_tx bytes one peer may have a single negotiation retain
+ * (issue #1457). The 252-input cap alone admits a near-64 KB prev_tx per
+ * input, about 16 MB a session. A real contribution is a few inputs whose
+ * prev_txs run from hundreds of bytes to a few KB; this still admits sixteen
+ * at the wire maximum.
+ */
+export const MAX_PEER_PREVTX_BYTES_PER_SESSION = 1024 * 1024;
 
 /**
  * BOLT 2 interactive-tx receive-side checks on a peer's tx_add_input prevtx:

@@ -651,9 +651,13 @@ export class DualFundingSession {
 	}
 
 	/**
-	 * Add a peer's input to the transaction.
+	 * Add a peer's input to the transaction. `prevTxBytesFree` is the
+	 * node-wide prev_tx budget left (see InteractiveTxBuilder.addPeerInput).
 	 */
-	addPeerInput(input: IInteractiveTxInput): IDualFundingResult {
+	addPeerInput(
+		input: IInteractiveTxInput,
+		prevTxBytesFree?: number
+	): IDualFundingResult {
 		if (this._state !== DualFundingState.TX_NEGOTIATION) {
 			return {
 				ok: false,
@@ -664,7 +668,7 @@ export class DualFundingSession {
 			return { ok: false, error: 'No TX builder' };
 		}
 
-		const err = this._txBuilder.addPeerInput(input);
+		const err = this._txBuilder.addPeerInput(input, prevTxBytesFree);
 		if (err) {
 			return { ok: false, error: err };
 		}

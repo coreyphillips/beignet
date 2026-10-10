@@ -21,12 +21,15 @@ import {
 	MAX_INTERACTIVE_TX_OUTPUTS,
 	MAX_INTERACTIVE_TX_MSGS,
 	MAX_INTERACTIVE_TX_SEQUENCE,
-	MAX_MONEY_SATS
+	MAX_MONEY_SATS,
+	MAX_PEER_PREVTX_BYTES_PER_SESSION
 } from './validation';
 
 export class InteractiveTxBuilder {
 	private session: IInteractiveTxSession;
 	private dustLimitSats = 546n;
+	/** prev_tx bytes held by the peer's inputs currently in the session. */
+	private peerPrevTxBytes = 0;
 
 	constructor(isInitiator: boolean, locktime = 0) {
 		this.session = {
@@ -63,6 +66,11 @@ export class InteractiveTxBuilder {
 
 	getState(): InteractiveTxState {
 		return this.session.state;
+	}
+
+	/** prev_tx bytes the peer's inputs hold in this session (issue #1457). */
+	getPeerPrevTxBytes(): number {
+		return this.peerPrevTxBytes;
 	}
 
 	getSession(): IInteractiveTxSession {
@@ -119,9 +127,14 @@ export class InteractiveTxBuilder {
 	}
 
 	/**
-	 * Add a peer's input to the transaction.
+	 * Add a peer's input to the transaction. `prevTxBytesFree` is what the
+	 * caller's node-wide prev_tx budget has left across every live session,
+	 * this one included.
 	 */
-	addPeerInput(input: IInteractiveTxInput): string | null {
+	addPeerInput(
+		input: IInteractiveTxInput,
+		prevTxBytesFree = Infinity
+	): string | null {
 		if (this.session.state === InteractiveTxState.ABORTED) {
 			return 'Session is aborted';
 		}
@@ -168,12 +181,26 @@ export class InteractiveTxBuilder {
 			return `Peer exceeded ${MAX_INTERACTIVE_TX_INPUTS} inputs`;
 		}
 
+		// Issue #1457: every accepted prev_tx is held until the session is
+		// dropped, so its bytes are budgeted as well as its count.
+		const prevTxBytes = input.prevTx?.length ?? 0;
+		if (
+			this.peerPrevTxBytes + prevTxBytes >
+			MAX_PEER_PREVTX_BYTES_PER_SESSION
+		) {
+			return `Peer prev_tx bytes would exceed ${MAX_PEER_PREVTX_BYTES_PER_SESSION} in this session`;
+		}
+		if (prevTxBytes > prevTxBytesFree) {
+			return 'Peer prev_tx bytes would exceed the node-wide budget';
+		}
+
 		const key = input.serialId.toString();
 		if (this.session.inputs.has(key)) {
 			return `Input with serial ID ${input.serialId} already exists`;
 		}
 
 		this.session.inputs.set(key, input);
+		this.peerPrevTxBytes += prevTxBytes;
 
 		// A peer add after we sent tx_complete continues the negotiation (BOLT 2):
 		// we will need to send tx_complete again, so leave SENT_COMPLETE.
@@ -286,10 +313,17 @@ export class InteractiveTxBuilder {
 	 */
 	removePeerInput(serialId: bigint): string | null {
 		const key = serialId.toString();
-		if (!this.session.inputs.has(key)) {
+		const input = this.session.inputs.get(key);
+		if (!input) {
 			return `Input with serial ID ${serialId} not found`;
 		}
 		this.session.inputs.delete(key);
+		// Only inputs carrying the peer's parity were counted on the way in.
+		if (
+			validatePeerSerialIdParity(serialId, this.session.isInitiator) === null
+		) {
+			this.peerPrevTxBytes -= input.prevTx?.length ?? 0;
+		}
 		if (this.session.state === InteractiveTxState.SENT_COMPLETE) {
 			this.session.state = InteractiveTxState.COLLECTING;
 		}

@@ -346,16 +346,20 @@ export class SpliceSession {
 	}
 
 	/**
-	 * Add a peer's input to the splice transaction.
+	 * Add a peer's input to the splice transaction. `prevTxBytesFree` is the
+	 * node-wide prev_tx budget left (see InteractiveTxBuilder.addPeerInput).
 	 */
-	addPeerInput(input: IInteractiveTxInput): string | null {
+	addPeerInput(
+		input: IInteractiveTxInput,
+		prevTxBytesFree?: number
+	): string | null {
 		if (this._state !== SpliceState.TX_NEGOTIATION) {
 			return 'Cannot add peer input: not in TX_NEGOTIATION state';
 		}
 		if (!this._txBuilder) {
 			return 'No TX builder available';
 		}
-		return this._txBuilder.addPeerInput(input);
+		return this._txBuilder.addPeerInput(input, prevTxBytesFree);
 	}
 
 	/**

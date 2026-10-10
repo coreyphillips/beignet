@@ -18,7 +18,8 @@ import {
 	validateCompletedInteractiveTx,
 	MAX_INTERACTIVE_TX_INPUTS,
 	MAX_INTERACTIVE_TX_OUTPUTS,
-	MAX_MONEY_SATS
+	MAX_MONEY_SATS,
+	MAX_PEER_PREVTX_BYTES_PER_SESSION
 } from '../../src/lightning/interactive-tx/validation';
 import { IInteractiveTxInput } from '../../src/lightning/interactive-tx/types';
 
@@ -34,8 +35,30 @@ function makePrevTx(sats: bigint): Buffer {
 	return tx.toBuffer();
 }
 
-function peerInput(serialId: bigint, sats: bigint): IInteractiveTxInput {
-	const prevTx = makePrevTx(sats);
+/**
+ * A parseable prev_tx of exactly `bytes` paying a P2WPKH at vout 0, padded by
+ * an OP_RETURN output: the size the issue #1457 reproduction used.
+ */
+function makeLargePrevTx(bytes: number): Buffer {
+	const tx = new bitcoin.Transaction();
+	tx.version = 2;
+	tx.addInput(crypto.randomBytes(32), 0);
+	tx.addOutput(
+		Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)]),
+		10_000
+	);
+	// 93 bytes of framing around a script whose length takes a 3-byte varint.
+	tx.addOutput(Buffer.alloc(bytes - 93, 0x6a), 0);
+	const buf = tx.toBuffer();
+	expect(buf.length).to.equal(bytes);
+	return buf;
+}
+
+function peerInput(
+	serialId: bigint,
+	sats: bigint,
+	prevTx = makePrevTx(sats)
+): IInteractiveTxInput {
 	return {
 		serialId,
 		prevTxid: Buffer.from(bitcoin.Transaction.fromBuffer(prevTx).getHash()),
@@ -107,6 +130,48 @@ describe('Interactive-tx receive-side limits (S-2.M4)', function () {
 			scriptPubkey: Buffer.alloc(22)
 		});
 		expect(err).to.contain('exceeded 252 outputs');
+	});
+
+	describe('retained prev_tx bytes (issue #1457)', function () {
+		const prevTx = makeLargePrevTx(65_393);
+		const fit = Math.floor(MAX_PEER_PREVTX_BYTES_PER_SESSION / prevTx.length);
+
+		it('caps one session and gives a removed input its bytes back', function () {
+			const builder = new InteractiveTxBuilder(true);
+			for (let i = 0; i < fit; i++) {
+				const err = builder.addPeerInput(
+					peerInput(BigInt(2 * i + 1), 0n, prevTx)
+				);
+				expect(err).to.equal(null);
+			}
+			expect(builder.getPeerPrevTxBytes()).to.equal(fit * prevTx.length);
+
+			const over = peerInput(BigInt(2 * fit + 1), 0n, prevTx);
+			expect(builder.addPeerInput(over)).to.contain('in this session');
+			expect(builder.getInputs()).to.have.length(fit);
+
+			expect(builder.removePeerInput(1n)).to.equal(null);
+			expect(builder.addPeerInput(over)).to.equal(null);
+		});
+
+		it('refuses an input the node-wide budget has no room for', function () {
+			const builder = new InteractiveTxBuilder(true);
+			expect(
+				builder.addPeerInput(peerInput(1n, 0n, prevTx), prevTx.length - 1)
+			).to.contain('node-wide budget');
+			expect(builder.getPeerPrevTxBytes()).to.equal(0);
+			expect(
+				builder.addPeerInput(peerInput(3n, 0n, prevTx), prevTx.length)
+			).to.equal(null);
+		});
+
+		it('releases nothing when a peer removal names one of our inputs', function () {
+			const builder = new InteractiveTxBuilder(true);
+			expect(builder.addInput(peerInput(0n, 10_000n, prevTx))).to.equal(null);
+			expect(builder.addPeerInput(peerInput(1n, 0n, prevTx))).to.equal(null);
+			expect(builder.removePeerInput(0n)).to.equal(null);
+			expect(builder.getPeerPrevTxBytes()).to.equal(prevTx.length);
+		});
 	});
 
 	describe('validateCompletedInteractiveTx', function () {

@@ -17480,6 +17480,17 @@ export class Channel {
 	}
 
 	/**
+	 * prev_tx bytes the peer's inputs hold across this channel's live
+	 * interactive-tx builders, v2 open and splice (issue #1457).
+	 */
+	getRetainedPeerPrevTxBytes(): number {
+		return (
+			(this._state.dualFundingSession?.getTxBuilder()?.getPeerPrevTxBytes() ??
+				0) + (this._spliceSession?.getTxBuilder()?.getPeerPrevTxBytes() ?? 0)
+		);
+	}
+
+	/**
 	 * Initiate opening a v2 (dual-funded) channel. Sends open_channel2.
 	 */
 	initiateOpenV2(params: IDualFundingParams): ChannelAction[] {
@@ -18174,9 +18185,13 @@ export class Channel {
 	}
 
 	/**
-	 * Handle tx_add_input from peer during v2 opening.
+	 * Handle tx_add_input from peer during v2 opening. `prevTxBytesFree` is
+	 * what the manager's node-wide prev_tx budget has left (issue #1457).
 	 */
-	handleTxAddInput(msg: ITxAddInputMessage): ChannelAction[] {
+	handleTxAddInput(
+		msg: ITxAddInputMessage,
+		prevTxBytesFree?: number
+	): ChannelAction[] {
 		// Splicing reuses the interactive-tx protocol. If a splice negotiation is
 		// in progress, route the peer's input into the splice session.
 		if (this._spliceTxNegotiationActive()) {
@@ -18225,7 +18240,7 @@ export class Channel {
 				prevTxVout: msg.prevTxVout,
 				isShared: !!msg.sharedInputTxid
 			};
-			const err = this._spliceSession!.addPeerInput(input);
+			const err = this._spliceSession!.addPeerInput(input, prevTxBytesFree);
 			if (err) {
 				// BOLT 2: an invalid tx_add_input fails the NEGOTIATION. For a
 				// splice that means tx_abort + unwind; the channel keeps operating
@@ -18266,7 +18281,7 @@ export class Channel {
 			prevTxVout: msg.prevTxVout
 		};
 
-		const result = session.addPeerInput(input);
+		const result = session.addPeerInput(input, prevTxBytesFree);
 		if (!result.ok) {
 			return [
 				{
