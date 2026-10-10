@@ -24,7 +24,10 @@ import * as bitcoin from 'bitcoinjs-lib';
 
 bitcoin.initEccLib(ecc);
 
-import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import {
+	ChannelManager,
+	IChannelManagerConfig
+} from '../../src/lightning/channel/channel-manager';
 import {
 	ChannelState,
 	DEFAULT_MINIMUM_DEPTH,
@@ -157,14 +160,36 @@ interface IHarness {
 	sideB: ISide;
 }
 
+/** An opener's wallet: every selection returns `walletInput`. */
+function fundingProviderFor(walletInput: ISpliceWalletInput): IFundingProvider {
+	const changeScript = bitcoin.payments.p2wpkh({
+		hash: crypto.randomBytes(20)
+	}).output!;
+	return {
+		buildFundingTransaction: async (): Promise<never> => {
+			throw new Error('v1 funding must not run for a v2 open');
+		},
+		broadcastTransaction: async () => 'unused',
+		selectSpliceInputs: async () => ({
+			inputs: [walletInput],
+			changeScript
+		}),
+		selectMaxDualFundingInputs: async () => ({
+			inputs: [walletInput],
+			changeScript
+		})
+	};
+}
+
 function makeHarness(
 	walletInput: ISpliceWalletInput,
-	rewriteFromB?: (type: number, payload: Buffer) => Buffer
+	rewriteFromB?: (type: number, payload: Buffer) => Buffer,
+	configB?: Partial<IChannelManagerConfig>
 ): IHarness {
 	const sideA = makeSide();
 	const sideB = makeSide();
 	const mgrA = new ChannelManager(sideA.config);
-	const mgrB = new ChannelManager(sideB.config);
+	const mgrB = new ChannelManager({ ...sideB.config, ...configB });
 
 	const errors: string[] = [];
 	mgrA.on('error', (_id: Buffer | null, msg: string) =>
@@ -183,32 +208,16 @@ function makeHarness(
 	mgrA.on('message:outbound', (_peer: string, type: number, payload: Buffer) =>
 		mgrB.handleMessage(sideA.pubkey, type, payload)
 	);
-	mgrB.on('message:outbound', (_peer: string, type: number, payload: Buffer) =>
+	mgrB.on('message:outbound', (peer: string, type: number, payload: Buffer) => {
+		if (peer !== sideA.pubkey) return;
 		mgrA.handleMessage(
 			sideB.pubkey,
 			type,
 			rewriteFromB ? rewriteFromB(type, payload) : payload
-		)
-	);
+		);
+	});
 
-	const changeScript = bitcoin.payments.p2wpkh({
-		hash: crypto.randomBytes(20)
-	}).output!;
-	const fundingProvider: IFundingProvider = {
-		buildFundingTransaction: async () => {
-			throw new Error('v1 funding must not run for a v2 open');
-		},
-		broadcastTransaction: async () => 'unused',
-		selectSpliceInputs: async () => ({
-			inputs: [walletInput],
-			changeScript
-		}),
-		selectMaxDualFundingInputs: async () => ({
-			inputs: [walletInput],
-			changeScript
-		})
-	};
-	mgrA.setFundingProvider(fundingProvider);
+	mgrA.setFundingProvider(fundingProviderFor(walletInput));
 
 	return { mgrA, mgrB, errors, broadcasts, sideA, sideB };
 }
@@ -543,6 +552,110 @@ describe("the v2 opener waits for the accepter's minimum_depth (issue 1034)", fu
 			ChannelState.AWAITING_FUNDING_CONFIRMED
 		);
 		expect(h.broadcasts, 'nothing broadcast').to.have.length(0);
+	});
+});
+
+describe('a completed v2 open releases its peer prev_tx (issue #1501)', function () {
+	this.timeout(10_000);
+
+	/**
+	 * Open to NORMAL with the acceptor's prev_tx budget set to exactly the one
+	 * input the opener contributes, which is the prev_tx the acceptor holds.
+	 * Whichever side confirms first completes on the other's channel_ready.
+	 */
+	async function openToNormal(acceptorConfirmsFirst: boolean): Promise<{
+		h: IHarness;
+		chA: Channel;
+		chB: Channel;
+		budget: number;
+	}> {
+		const walletInput = makeWalletInput(WALLET_UTXO_SATS);
+		const budget = walletInput.prevTx.length;
+		const h = makeHarness(walletInput, undefined, {
+			maxRetainedPeerPrevTxBytes: budget
+		});
+		const chA = h.mgrA.createDualFundedChannel(
+			h.sideB.pubkey,
+			openerParams(h.sideA)
+		);
+		await settle(
+			() => chA.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		const chB = acceptorChannel(h)!;
+		expect(chB.getRetainedPeerPrevTxBytes()).to.equal(budget);
+
+		const channelId = chA.getChannelId()!;
+		const order = acceptorConfirmsFirst ? [h.mgrB, h.mgrA] : [h.mgrA, h.mgrB];
+		for (const mgr of order) mgr.handleFundingConfirmed(channelId);
+		expect(chA.getState()).to.equal(ChannelState.NORMAL);
+		expect(chB.getState()).to.equal(ChannelState.NORMAL);
+		expect(h.errors, 'no errors').to.deep.equal([]);
+		return { h, chA, chB, budget };
+	}
+
+	for (const acceptorConfirmsFirst of [false, true]) {
+		const completion = acceptorConfirmsFirst
+			? "the opener's channel_ready"
+			: 'its own confirmation';
+		it(`drops the opening session when ${completion} completes the acceptor`, async function () {
+			const { h, chA, chB, budget } = await openToNormal(acceptorConfirmsFirst);
+			expect(chA.getDualFundingSession()).to.equal(null);
+			expect(chB.getDualFundingSession()).to.equal(null);
+			expect(chB.getRetainedPeerPrevTxBytes()).to.equal(0);
+
+			// A splice-in on the same channel fits in the freed budget.
+			const spliceInput = makeWalletInput(WALLET_UTXO_SATS);
+			expect(spliceInput.prevTx.length).to.equal(budget);
+			chA.setSpliceInInputs(
+				[spliceInput],
+				bitcoin.payments.p2wpkh({ hash: crypto.randomBytes(20) }).output!
+			);
+			expect(
+				h.mgrA.initiateSplice(chA.getChannelId()!, 100_000n, FEERATE_PERKW).ok
+			).to.equal(true);
+			expect(h.errors, 'splice input accepted').to.deep.equal([]);
+			expect(
+				chB.getFullState().spliceInFlight,
+				'splice negotiated'
+			).to.not.equal(null);
+		});
+	}
+
+	it('a later open from another peer fits in the freed budget', async function () {
+		const { h } = await openToNormal(false);
+		const sideC = makeSide();
+		const mgrC = new ChannelManager(sideC.config);
+		mgrC.on('error', (_id: Buffer | null, msg: string) =>
+			h.errors.push(`C: ${msg}`)
+		);
+		mgrC.on(
+			'message:outbound',
+			(_peer: string, type: number, payload: Buffer) =>
+				h.mgrB.handleMessage(sideC.pubkey, type, payload)
+		);
+		h.mgrB.on(
+			'message:outbound',
+			(peer: string, type: number, payload: Buffer) => {
+				if (peer === sideC.pubkey) {
+					mgrC.handleMessage(h.sideB.pubkey, type, payload);
+				}
+			}
+		);
+		mgrC.setFundingProvider(
+			fundingProviderFor(makeWalletInput(WALLET_UTXO_SATS))
+		);
+
+		const chC = mgrC.createDualFundedChannel(
+			h.sideB.pubkey,
+			openerParams(sideC)
+		);
+		await settle(
+			() =>
+				chC.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED ||
+				h.errors.length > 0
+		);
+		expect(h.errors, 'later open accepted').to.deep.equal([]);
+		expect(chC.getState()).to.equal(ChannelState.AWAITING_FUNDING_CONFIRMED);
 	});
 });
 

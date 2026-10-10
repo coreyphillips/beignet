@@ -3815,10 +3815,9 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		deliverCommitments(h);
 		completeExchange(h);
 
-		// channel_ready both ways: the record clears, but the session object
-		// survives (at AWAITING_CHANNEL_READY), so every pre-round-6 guard
-		// passes and only the session-state check stands between a caller and
-		// a tx_init_rbf the peer would refuse with tx_abort.
+		// channel_ready both ways: the record and the session both clear
+		// (issue #1501), and a caller asking for a tx_init_rbf the peer would
+		// refuse with tx_abort is still turned away locally.
 		const opReady = h.opener.fundingConfirmed();
 		const opReadyPayload = findPayload(opReady, MessageType.CHANNEL_READY)!;
 		const acReady = h.acceptor.fundingConfirmed();
@@ -3835,10 +3834,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		).to.equal(null);
 		expect(h.opener.getState()).to.equal(ChannelState.NORMAL);
 		expect(h.opener.getFullState().v2InFlight ?? null).to.equal(null);
-		expect(h.opener.getFullState().dualFundingSession).to.not.be.oneOf([
-			null,
-			undefined
-		]);
+		expect(h.opener.getFullState().dualFundingSession).to.equal(null);
 
 		const actions = h.opener.initiateTxRbf(2000);
 		expect(findError(actions), 'the request is refused locally').to.not.equal(
@@ -4579,7 +4575,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			)
 		).to.equal(null);
 
-		// channel_ready both ways: NORMAL, record cleared, session lives on.
+		// channel_ready both ways: NORMAL, record and session cleared.
 		const opReady = decodeChannelReadyMessage(
 			findPayload(h.opener.fundingConfirmed(), MessageType.CHANNEL_READY)!
 		);
@@ -4590,12 +4586,11 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		h.acceptor.handleChannelReady(opReady);
 		expect(h.opener.getState()).to.equal(ChannelState.NORMAL);
 		expect(h.opener.getFullState().v2InFlight ?? null).to.equal(null);
-		expect(h.opener.getFullState().dualFundingSession).to.not.equal(null);
+		expect(h.opener.getFullState().dualFundingSession).to.equal(null);
 
 		// Replaying the original valid tx_signatures must be ignored: BOLT 2
-		// ends the opening exchange at channel_ready, and without the gate
-		// the replay recreated the record and pulled the channel back to
-		// AWAITING_FUNDING_CONFIRMED.
+		// ends the opening exchange at channel_ready. Without the gate the
+		// replay now meets the missing session and is refused with an error.
 		const replay = h.opener.handleTxSignatures(accTxSigs);
 		expect(replay).to.deep.equal([]);
 		expect(h.opener.getState()).to.equal(ChannelState.NORMAL);
