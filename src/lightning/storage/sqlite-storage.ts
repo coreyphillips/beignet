@@ -267,7 +267,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 17;
+	static readonly CURRENT_SCHEMA_VERSION = 18;
 
 	/**
 	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
@@ -1957,6 +1957,18 @@ export class SqliteStorage implements IStorageBackend {
 				db.exec('ALTER TABLE payments ADD COLUMN status TEXT');
 				db.exec('ALTER TABLE payments ADD COLUMN direction TEXT');
 				db.exec('ALTER TABLE payments ADD COLUMN metadata_tags TEXT');
+			},
+			// Migration 17->18: one scrub for every existing database (issue
+			// #1490). Older releases encrypted rows without scrubbing the pages
+			// the plaintext was freed from, and left no marker, so with nothing
+			// left to rewrite no later pass would schedule it. Marked without a
+			// key too: only a keyed open scrubs, so the marker waits for one. A
+			// new database has no freed plaintext.
+			(db): void => {
+				if (currentVersion === 0) return;
+				db.exec(
+					'INSERT OR IGNORE INTO encryption_scrub_pending (id) VALUES (1)'
+				);
 			}
 		];
 

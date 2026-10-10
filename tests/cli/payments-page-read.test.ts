@@ -50,7 +50,7 @@ const SCHEMA_16 =
 	'ALTER TABLE payments DROP COLUMN status; ' +
 	'ALTER TABLE payments DROP COLUMN direction; ' +
 	'ALTER TABLE payments DROP COLUMN metadata_tags; ' +
-	'DELETE FROM schema_version WHERE version = 17; ';
+	'DELETE FROM schema_version WHERE version >= 17; ';
 
 const recordOf = (
 	i: number,
