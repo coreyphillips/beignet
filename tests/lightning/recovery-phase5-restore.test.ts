@@ -1731,6 +1731,167 @@ describe('Recovery phase 5: restore driver', () => {
 		other.close();
 	});
 
+	it('abandons a resumed attempt a takeover fenced after the heads were read', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		// Issue #1471. Every member granted the attempt over N, and the heads
+		// read show nothing newer. Before the round reaches any guardian,
+		// another device takes the next epoch on G1 and G3 and stores N+1
+		// there. All three replay their grant of the attempt regardless.
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const clients = served.map((s) => s.client);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		const writer = generateWriterKey();
+		const guard = await grantNext(clients[0], lease, writer);
+		await grantNext(clients[1], lease, writer);
+		await grantNext(clients[2], lease, writer);
+		const target = openStorage();
+		persistPending(target, guard, writer);
+		const n = guard.logHead.sequence;
+
+		let taken: Promise<SqliteStorage> | undefined;
+		const takeover = (): Promise<SqliteStorage> =>
+			(taken ??= takeOverAndAppend([served[0], served[2]], 89));
+		const afterRead = (entry: IServed): IBoundGuardianClient => {
+			const client = new GuardianClient({
+				url: entry.client.url,
+				guardianSetId: SET_ID
+			});
+			const acquire = client.acquireEpoch.bind(client);
+			client.acquireEpoch = async (request): ReturnType<typeof acquire> => {
+				await takeover();
+				return acquire(request);
+			};
+			return { client, expectedGuardianId: entry.id };
+		};
+		const events: IRestoreEvent[] = [];
+		const result = await driverFor(
+			target,
+			[served[1], served[0], served[2]].map(afterRead),
+			events
+		).restore();
+		expect(taken).to.not.equal(undefined);
+		const other = await (taken as Promise<SqliteStorage>);
+		expect(events.some((e) => e.type === 'epoch:abandoned')).to.equal(true);
+		expect(result.lease.epoch).to.equal(lease.epoch + 3n);
+		expect(result.lease.writerPublicKey.equals(writer.publicKey)).to.equal(
+			false
+		);
+		expect(result.certifiedState.logHead.sequence).to.equal(n + 1n);
+		expect(dumpTables(target)).to.equal(dumpTables(other));
+
+		// The restored lease is the live one: its next record reaches a quorum.
+		const manager = new RecoveryManager(target, {
+			journal: new RecoveryJournal(
+				target,
+				deriveRecoveryMasterKey(NODE_SECRET),
+				NODE_ID,
+				ROOT.recoveryId
+			)
+		});
+		expect(
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'payment_preimage',
+						paymentHash: Buffer.alloc(32, 90).toString('hex'),
+						preimage: Buffer.alloc(32, 90)
+					}
+				],
+				outboundMessages: []
+			}).committed
+		).to.equal(true);
+		const pass = await replicatorFor(target, bind(served)).replicatePending(
+			result.lease
+		);
+		expect(pass.outcome).to.equal('replicated');
+
+		await shutdown(served);
+		live.storage.close();
+		target.close();
+		other.close();
+	});
+
+	it('abandons a resumed split grant a takeover fenced during its repair', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		// Issue #1471 over a split grant: G1 granted the attempt over N, G2
+		// and G3 over N+1, and the heads read show nothing newer. Before G1
+		// is repaired up to N+1, another device takes the next epoch on G1
+		// and G3 and stores N+2 there.
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const clients = served.map((s) => s.client);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		const writer = generateWriterKey();
+		await grantNext(clients[0], lease, writer);
+		live.manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, 91).toString('hex'),
+					preimage: Buffer.alloc(32, 91)
+				}
+			],
+			outboundMessages: []
+		});
+		const all = live.storage.loadRecoveryFrames();
+		const tail = rep.signRecord(all[all.length - 1], lease);
+		for (const client of clients.slice(1)) {
+			expect((await client.putState(tail)).status).to.equal(GuardianStatus.OK);
+		}
+		const guard = await grantNext(clients[1], lease, writer);
+		await grantNext(clients[2], lease, writer);
+		const target = openStorage();
+		persistPending(target, guard, writer);
+		const n = guard.logHead.sequence;
+
+		let taken: Promise<SqliteStorage> | undefined;
+		const afterRead = (entry: IServed): IBoundGuardianClient => {
+			const client = new GuardianClient({
+				url: entry.client.url,
+				guardianSetId: SET_ID
+			});
+			const sync = client.syncRecord.bind(client);
+			client.syncRecord = async (...args): ReturnType<typeof sync> => {
+				await (taken ??= takeOverAndAppend([served[0], served[2]], 92));
+				return sync(...args);
+			};
+			return { client, expectedGuardianId: entry.id };
+		};
+		const events: IRestoreEvent[] = [];
+		const result = await driverFor(
+			target,
+			served.map(afterRead),
+			events
+		).restore();
+		expect(taken).to.not.equal(undefined);
+		const other = await (taken as Promise<SqliteStorage>);
+		expect(events.some((e) => e.type === 'epoch:abandoned')).to.equal(true);
+		expect(result.lease.epoch).to.equal(lease.epoch + 3n);
+		expect(result.lease.writerPublicKey.equals(writer.publicKey)).to.equal(
+			false
+		);
+		expect(result.certifiedState.logHead.sequence).to.equal(n + 1n);
+		expect(dumpTables(target)).to.equal(dumpTables(other));
+
+		await shutdown(served);
+		live.storage.close();
+		target.close();
+		other.close();
+	});
+
 	it('follows a rotation that reaches the source while a split takeover completes', async function (): Promise<void> {
 		// Real guardians over real TCP: the default 2s is not enough under
 		// full-suite load, and a load-sensitive timeout is a flaky test.
