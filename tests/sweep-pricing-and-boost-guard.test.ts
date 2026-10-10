@@ -594,6 +594,68 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			});
 		});
 
+		// #1517: an OP_RETURN before the change was staged as a zero-value
+		// payment to the address read before it, which failed to sign.
+		[0, 1, 2].forEach((position) => {
+			it(`signs a replacement with an OP_RETURN at output ${position}`, async function () {
+				const message = 'hello beignet';
+				const vout: Record<string, unknown>[] = [
+					{ value: 0.0004, scriptPubKey: { address: P2WPKH } },
+					{ value: 0.0005, scriptPubKey: { address: changeAddress() } }
+				];
+				vout.splice(position, 0, {
+					value: 0,
+					scriptPubKey: {
+						asm: `OP_RETURN ${Buffer.from(message).toString('hex')}`,
+						type: 'nulldata'
+					}
+				});
+				stubLookups({
+					[BOOSTED_TXID]: {
+						vin: [{ txid: FUNDING_TXID, vout: 0 }] as TTxDetails['vin'],
+						vout: vout.map((output, n) => ({
+							...output,
+							n
+						})) as unknown as TTxDetails['vout']
+					},
+					[FUNDING_TXID]: {
+						confirmations: 10,
+						vout: [
+							{
+								value: 0.001,
+								n: 0,
+								scriptPubKey: { address: receiveAddress() }
+							}
+						] as unknown as TTxDetails['vout']
+					}
+				});
+
+				const rbfData = await wallet.getRbfData({
+					txHash: { tx_hash: BOOSTED_TXID }
+				});
+				if (rbfData.isErr()) throw rbfData.error;
+				expect(rbfData.value.fee).to.equal(10_000);
+				const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+				if (res.isErr()) throw res.error;
+				expect(res.value.outputs).to.deep.equal([
+					{ address: P2WPKH, value: 40_000, index: 0 }
+				]);
+				expect(res.value.message).to.equal(message);
+				const created = await wallet.transaction.createTransaction();
+				if (created.isErr()) throw created.error;
+
+				const tx = BitcoinTransaction.fromHex(created.value.hex);
+				expect(tx.outs).to.have.length(3);
+				const embedded = tx.outs.filter((out) => out.script[0] === 0x6a);
+				expect(embedded).to.have.length(1);
+				expect(embedded[0].value).to.equal(0);
+				expect(embedded[0].script.toString()).to.include(message);
+				const fee = 100_000 - tx.outs.reduce((sum, out) => sum + out.value, 0);
+				expect(fee).to.equal(res.value.fee);
+				expect(fee - 10_000).to.be.at.least(tx.virtualSize());
+			});
+		});
+
 		it('refuses when the change cannot pay the replacement floor', async function () {
 			wallet.feeEstimates = { ...wallet.feeEstimates, fast: 10, slow: 2 };
 			// Outbidding a 9,961 sat fee on 166 vB takes 62 sat/vB, which is 331
