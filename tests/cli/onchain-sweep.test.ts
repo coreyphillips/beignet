@@ -42,6 +42,13 @@ function harness(storageOverride?: SqliteStorage) {
 	const frozen: Array<typeof COIN & { freezeTag?: string }> = [];
 	const transactions: Record<string, { height?: number; exists?: boolean }> =
 		{};
+	const stagesFrozen = (): boolean =>
+		inputs.some((coin) =>
+			frozen.some(
+				(entry) =>
+					entry.tx_hash === coin.tx_hash && entry.tx_pos === coin.tx_pos
+			)
+		);
 	const wallet = {
 		data: { utxos: coins },
 		isWatchOnly: false,
@@ -103,18 +110,15 @@ function harness(storageOverride?: SqliteStorage) {
 			}) => {
 				// The wallet's sendMax drops frozen inputs unless told otherwise,
 				// and the sweep's inputs are frozen by its own reservation.
-				const reserved = inputs.filter((coin) =>
-					frozen.some(
-						(entry) =>
-							entry.tx_hash === coin.tx_hash && entry.tx_pos === coin.tx_pos
-					)
-				);
-				if (reserved.length && !spendFrozen)
+				if (stagesFrozen() && !spendFrozen)
 					return err('Every staged input is frozen.');
 				outputAddress = address;
 				return ok('ready');
 			},
-			createTransaction: async () => {
+			createTransaction: async ({ spendFrozen }: { spendFrozen?: boolean }) => {
+				// The wallet's createTransaction refuses frozen inputs the same way.
+				if (stagesFrozen() && !spendFrozen)
+					return err('Staged input is frozen.');
 				builds++;
 				const tx = new bitcoin.Transaction();
 				for (const coin of inputs) {

@@ -704,12 +704,14 @@ export class Transaction {
 	 * @param {ISendTransaction} [transactionData]
 	 * @param {boolean} [shuffleOutputs]
 	 * @param {coinSelectPreference} [ECoinSelectPreference]
+	 * @param {boolean} [spendFrozen] Signs staged inputs that are frozen, for a caller that froze them to reserve them for this send.
 	 * @returns {Promise<Result<{id: string, hex: string}>>}
 	 */
 	createTransaction = async ({
 		transactionData = this.data,
 		shuffleOutputs = true,
-		runCoinSelect = false
+		runCoinSelect = false,
+		spendFrozen = false
 	}: ICreateTransaction = {}): Promise<Result<{ id: string; hex: string }>> => {
 		let transaction = transactionData;
 		if (runCoinSelect) {
@@ -746,6 +748,20 @@ export class Transaction {
 			const message = 'No inputs to spend.';
 			return err(message);
 		}
+
+		// Staging leaves frozen coins out, but a coin frozen since stays staged
+		// until something restages, and sendMax turning max off does not.
+		if (!spendFrozen) {
+			const frozen = transaction.inputs.find((input) =>
+				this._wallet.isUtxoFrozen(input.tx_hash, input.tx_pos)
+			);
+			if (frozen) {
+				return err(
+					`Staged input ${frozen.tx_hash}:${frozen.tx_pos} is frozen.`
+				);
+			}
+		}
+
 		const fee = inputValue - outputValue;
 
 		//Refuse tx if the fee is greater than the amount we're attempting to send.

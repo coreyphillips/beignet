@@ -467,7 +467,8 @@ export class OnchainSweeps {
 			});
 			if (sweep.isErr()) return refuse('SEND_FAILED', sweep.error.message);
 			const built = await wallet.transaction.createTransaction({
-				shuffleOutputs: false
+				shuffleOutputs: false,
+				spendFrozen: true
 			});
 			if (built.isErr()) return refuse('SEND_FAILED', built.error.message);
 			this.resolveInputs(record);
