@@ -676,20 +676,31 @@ export class Transaction {
 			}
 			const inputAmount = this.getTransactionInputValue({ inputs });
 			const outputAmount = this.getTransactionOutputValue({ outputs });
-			let totalFee = Math.ceil(transactionByteCount * satsPerByte);
-			// See getTotalFee: a payment that cannot also pay for its change output
-			// goes without it, with the whole leftover as the fee.
-			const available = inputAmount - outputAmount;
-			if (pricesChange && totalFee > available) {
-				const noChangeByteCount = byteCountFor(false);
-				if (Math.ceil(noChangeByteCount * satsPerByte) <= available) {
-					transactionByteCount = noChangeByteCount;
-					totalFee = available;
-				}
-			}
 			// To prevent the user from spending more in fees than their output, use the output amount if available.
 			const txBalance =
 				outputAmount && outputAmount < inputAmount ? outputAmount : inputAmount;
+			// See getTotalFee: a payment that cannot also pay for its change output
+			// goes without it, with the whole leftover as the fee. updateFee refuses
+			// a fee of half the balance, so a leftover that large keeps the change.
+			const available = inputAmount - outputAmount;
+			const quoteAt = (
+				rate: number
+			): { totalFee: number; transactionByteCount: number } => {
+				const byteCount = byteCountFor(pricesChange);
+				const fee = Math.ceil(byteCount * rate);
+				if (pricesChange && fee > available && available < txBalance / 2) {
+					const noChangeByteCount = byteCountFor(false);
+					if (Math.ceil(noChangeByteCount * rate) <= available) {
+						return {
+							totalFee: available,
+							transactionByteCount: noChangeByteCount
+						};
+					}
+				}
+				return { totalFee: fee, transactionByteCount: byteCount };
+			};
+			const quote = quoteAt(satsPerByte);
+			transactionByteCount = quote.transactionByteCount;
 			let maxSatPerByte = this.getMaxSatsPerByte({
 				transactionByteCount,
 				balance: txBalance
@@ -707,15 +718,16 @@ export class Transaction {
 				);
 			}
 			if (maxSatPerByte < satsPerByte) {
+				const capped = quoteAt(maxSatPerByte);
 				return ok({
-					totalFee: transactionByteCount * maxSatPerByte,
-					transactionByteCount: maxSatPerByte ? transactionByteCount : 0,
+					totalFee: capped.totalFee,
+					transactionByteCount: maxSatPerByte ? capped.transactionByteCount : 0,
 					satsPerByte: maxSatPerByte,
 					maxSatPerByte
 				});
 			}
 			return ok({
-				totalFee,
+				totalFee: quote.totalFee,
 				transactionByteCount,
 				satsPerByte,
 				maxSatPerByte

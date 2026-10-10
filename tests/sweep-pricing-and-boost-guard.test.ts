@@ -437,6 +437,10 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 						satsPerByte: maxSatPerByte
 					});
 					if (atMax.isErr()) throw atMax.error;
+					const capped = wallet.getFeeInfo({ satsPerByte: maxSatPerByte + 1 });
+					if (capped.isErr()) throw capped.error;
+					expect(capped.value.satsPerByte).to.equal(maxSatPerByte);
+					expect(capped.value.totalFee).to.equal(atMax.value.fee);
 					const created = await wallet.transaction.createTransaction();
 					if (created.isErr()) throw created.error;
 					const tx = BitcoinTransaction.fromHex(created.value.hex);
