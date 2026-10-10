@@ -18,6 +18,7 @@ import {
 	validateFforVoucherArchive
 } from '../ffor/voucher-archive';
 import Database from 'better-sqlite3';
+import { createHmac } from 'crypto';
 import * as fs from 'fs';
 import {
 	IStorageBackend,
@@ -54,6 +55,7 @@ import {
 	ENC_PREFIX,
 	encryptValue,
 	decryptValue,
+	hkdfKey,
 	isEncryptedValue,
 	StorageEncryptedError
 } from './encryption';
@@ -64,12 +66,26 @@ const OWNER_ONLY_FILE_MODE = 0o600;
 /** Payment keys read per query by paymentsNewestFirst. */
 const PAYMENT_KEY_BATCH = 500;
 
+/** Derives the key payments.metadata_tags are computed under. */
+const METADATA_TAG_INFO = 'beignet-payment-metadata-tag-v1';
+
+/** Hex characters kept of each metadata tag's HMAC. */
+const METADATA_TAG_HEX = 32;
+
 /** A payment row's key from paymentsNewestFirst; load() decodes the row. */
 export interface IStoredPaymentRef {
 	paymentHash: string;
 	createdAt: number;
 	/** Null when the row is gone or cannot be decoded. */
 	load(): IPaymentInfo | null;
+}
+
+/** What paymentsNewestFirst tests a row on besides its age. */
+export interface IPaymentRowMatch {
+	status?: string;
+	direction?: string;
+	/** A metadata key the payment holds, holding this value when one is set. */
+	metadata?: { key: string; value?: string };
 }
 
 /**
@@ -93,6 +109,12 @@ export class SqliteStorage implements IStorageBackend {
 	private readonly dbPath: string;
 	private onCorruptRow?: (error: unknown) => void;
 	private encryptionKey?: Buffer;
+	/**
+	 * Without a storage key the payment rows are plaintext anyway, so a fixed
+	 * key stands in. A row written that way is tagged again under the
+	 * storage key when one is first set (_fillPaymentLookupColumns).
+	 */
+	private readonly metadataTagKey: Buffer;
 	private corruptRowsSeen = 0;
 
 	/**
@@ -115,6 +137,10 @@ export class SqliteStorage implements IStorageBackend {
 		this.dbPath = dbPath;
 		this.onCorruptRow = onCorruptRow;
 		this.encryptionKey = opts?.encryptionKey;
+		this.metadataTagKey = hkdfKey(
+			opts?.encryptionKey ?? Buffer.alloc(32),
+			METADATA_TAG_INFO
+		);
 		// Before open() switches on WAL: SQLite creates the -wal and -shm
 		// sidecars with the database file's own bits, so tightening the main
 		// file first covers them from the start.
@@ -207,7 +233,7 @@ export class SqliteStorage implements IStorageBackend {
 		this.db.pragma('foreign_keys = ON');
 		this.db.pragma('busy_timeout = 5000');
 		this._createTables();
-		this._fillPaymentCreatedAt();
+		this._fillPaymentLookupColumns();
 		if (this.encryptionKey) {
 			this._encryptExistingData();
 			this._scrubMigratedPlaintext();
@@ -241,7 +267,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 16;
+	static readonly CURRENT_SCHEMA_VERSION = 17;
 
 	/**
 	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
@@ -421,29 +447,40 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	/**
-	 * Set payments.created_at on rows written without it: every row from
-	 * before schema 16, and any an older release wrote since. A row that
-	 * cannot be decoded keeps NULL, which leaves it out of
+	 * Set a payment row's lookup columns where they are missing: every row
+	 * from before schema 16 or 17, and any an older release wrote since.
+	 * With a key, a plaintext row is filled again as well: it was written
+	 * without the key, so its metadata tags are under the fixed one, and the
+	 * encryption pass after this rewrites it, so that happens once. A row
+	 * that cannot be decoded keeps NULL, which leaves it out of
 	 * paymentsNewestFirst as the loadAll* readers skip it, and is tried
 	 * again on the next open.
 	 */
-	private _fillPaymentCreatedAt(): void {
+	private _fillPaymentLookupColumns(): void {
+		const stale = ['created_at IS NULL', 'status IS NULL'];
+		const params: unknown[] = [];
+		if (this.encryptionKey) {
+			stale.push('substr(payment_json, 1, ?) IS NOT ?');
+			params.push(ENC_PREFIX.length, ENC_PREFIX);
+		}
 		const rows = this.db
 			.prepare(
-				'SELECT payment_hash, payment_json FROM payments WHERE created_at IS NULL'
+				'SELECT payment_hash, payment_json FROM payments ' +
+					`WHERE ${stale.join(' OR ')}`
 			)
-			.all() as Array<{ payment_hash: string; payment_json: string }>;
+			.all(...params) as Array<{ payment_hash: string; payment_json: string }>;
 		if (rows.length === 0) return;
 		const update = this.db.prepare(
-			'UPDATE payments SET created_at = ? WHERE payment_hash = ?'
+			'UPDATE payments SET created_at = ?, status = ?, direction = ?, ' +
+				'metadata_tags = ? WHERE payment_hash = ?'
 		);
 		this.db.transaction(() => {
 			for (const row of rows) {
-				let createdAt: unknown;
+				let payment: IPaymentInfo;
 				try {
-					createdAt = deserializePaymentInfo(
+					payment = deserializePaymentInfo(
 						JSON.parse(this._dec(row.payment_json))
-					).createdAt;
+					);
 				} catch (err) {
 					// Without the key no other row decodes either.
 					if (err instanceof StorageEncryptedError) return;
@@ -451,12 +488,54 @@ export class SqliteStorage implements IStorageBackend {
 				}
 				// A row whose timestamp is not a number is left as one that
 				// cannot be decoded; binding it would throw out of open().
+				const createdAt: unknown = payment.createdAt;
 				if (typeof createdAt !== 'number' || !Number.isFinite(createdAt)) {
 					continue;
 				}
-				update.run(createdAt, row.payment_hash);
+				update.run(...this._paymentLookupColumns(payment), row.payment_hash);
 			}
 		})();
+	}
+
+	/**
+	 * The plaintext columns a payment row is found by: created_at, status,
+	 * direction and metadata_tags. A status or direction that is not text
+	 * (only a damaged row holds one) is stored as NULL, as binding it would
+	 * throw.
+	 */
+	private _paymentLookupColumns(
+		payment: IPaymentInfo
+	): [number, string | null, string | null, string | null] {
+		const text = (value: unknown): string | null =>
+			typeof value === 'string' ? value : null;
+		return [
+			payment.createdAt,
+			text(payment.status),
+			text(payment.direction),
+			this._metadataTags(payment.metadata)
+		];
+	}
+
+	/**
+	 * A tag for each metadata key, and for each key with its value, space
+	 * separated. Tags are keyed HMACs, so a stolen file shows which payments
+	 * share a label but not what the label says.
+	 */
+	private _metadataTags(metadata: unknown): string | null {
+		if (!metadata || typeof metadata !== 'object') return null;
+		const tags: string[] = [];
+		for (const [key, value] of Object.entries(metadata)) {
+			tags.push(this._metadataTag(key));
+			if (typeof value === 'string') tags.push(this._metadataTag(key, value));
+		}
+		return tags.length > 0 ? tags.join(' ') : null;
+	}
+
+	private _metadataTag(key: string, value?: string): string {
+		return createHmac('sha256', this.metadataTagKey)
+			.update(JSON.stringify(value === undefined ? [key] : [key, value]))
+			.digest('hex')
+			.slice(0, METADATA_TAG_HEX);
 	}
 
 	private _createTables(): void {
@@ -820,9 +899,15 @@ export class SqliteStorage implements IStorageBackend {
 		const json = JSON.stringify(serialized);
 		this.db
 			.prepare(
-				'INSERT OR REPLACE INTO payments (payment_hash, payment_json, created_at) VALUES (?, ?, ?)'
+				'INSERT OR REPLACE INTO payments (payment_hash, payment_json, ' +
+					'created_at, status, direction, metadata_tags) ' +
+					'VALUES (?, ?, ?, ?, ?, ?)'
 			)
-			.run(paymentHash, this._enc(json), payment.createdAt);
+			.run(
+				paymentHash,
+				this._enc(json),
+				...this._paymentLookupColumns(payment)
+			);
 	}
 
 	loadPayment(paymentHash: string): IPaymentInfo | null {
@@ -858,11 +943,16 @@ export class SqliteStorage implements IStorageBackend {
 	 * Every payment row, newest first by created_at then payment_hash, read
 	 * from the index a batch of keys at a time. Nothing is decrypted until a
 	 * ref's load() is called, so a reader that stops at a page, or skips
-	 * rows to reach it, pays only for the rows it loads (issue #1403). A row
-	 * that cannot be decoded loads as null and is reported as the loadAll*
-	 * readers report one.
+	 * rows to reach it, pays only for the rows it loads (issue #1403). A
+	 * match is tested on the lookup columns during the same walk, so rows it
+	 * leaves out are not decrypted either (issue #1459). A row that cannot be
+	 * decoded loads as null and is reported as the loadAll* readers report
+	 * one.
 	 */
-	*paymentsNewestFirst(since?: number): Generator<IStoredPaymentRef> {
+	*paymentsNewestFirst(
+		since?: number,
+		match: IPaymentRowMatch = {}
+	): Generator<IStoredPaymentRef> {
 		const load = (paymentHash: string): IPaymentInfo | null => {
 			const row = this.db
 				.prepare('SELECT payment_json FROM payments WHERE payment_hash = ?')
@@ -875,14 +965,32 @@ export class SqliteStorage implements IStorageBackend {
 				return null;
 			}
 		};
+		const matching = ['created_at IS NOT NULL'];
+		const matchParams: unknown[] = [];
+		if (since !== undefined) {
+			matching.push('created_at >= ?');
+			matchParams.push(since);
+		}
+		if (match.status !== undefined) {
+			matching.push('status = ?');
+			matchParams.push(match.status);
+		}
+		if (match.direction !== undefined) {
+			matching.push('direction = ?');
+			matchParams.push(match.direction);
+		}
+		if (match.metadata) {
+			// Tags are fixed-length hex between spaces, so a substring the
+			// length of one tag can only be a whole tag.
+			matching.push('instr(metadata_tags, ?) > 0');
+			matchParams.push(
+				this._metadataTag(match.metadata.key, match.metadata.value)
+			);
+		}
 		let after: [number, string] | undefined;
 		for (;;) {
-			const where = ['created_at IS NOT NULL'];
-			const params: unknown[] = [];
-			if (since !== undefined) {
-				where.push('created_at >= ?');
-				params.push(since);
-			}
+			const where = [...matching];
+			const params = [...matchParams];
 			if (after) {
 				where.push('(created_at, payment_hash) < (?, ?)');
 				params.push(...after);
@@ -1838,6 +1946,17 @@ export class SqliteStorage implements IStorageBackend {
 				db.exec(
 					'CREATE INDEX idx_payments_created_at ON payments(created_at, payment_hash)'
 				);
+			},
+			// Migration 16->17: lookup columns tested during that index walk, so
+			// a filtered page does not decrypt the rows it leaves out (issue
+			// #1459). Status and direction are plaintext: the action log holds
+			// recent payments' outcomes in plaintext beside their hashes.
+			// Metadata is not, only keyed tags of it. open() fills them for
+			// older rows.
+			(db): void => {
+				db.exec('ALTER TABLE payments ADD COLUMN status TEXT');
+				db.exec('ALTER TABLE payments ADD COLUMN direction TEXT');
+				db.exec('ALTER TABLE payments ADD COLUMN metadata_tags TEXT');
 			}
 		];
 

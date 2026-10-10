@@ -45,6 +45,13 @@ const ROWS = 1_005;
 
 const BASE_MS = 1_700_000_000_000;
 
+/** Takes a database back to schema 16, before the payment filter columns. */
+const SCHEMA_16 =
+	'ALTER TABLE payments DROP COLUMN status; ' +
+	'ALTER TABLE payments DROP COLUMN direction; ' +
+	'ALTER TABLE payments DROP COLUMN metadata_tags; ' +
+	'DELETE FROM schema_version WHERE version = 17; ';
+
 const recordOf = (
 	i: number,
 	overrides: Partial<IPaymentInfo> = {}
@@ -103,7 +110,8 @@ const referenceListing = (
 		list = list.filter((p) =>
 			filter.metadataValue !== undefined
 				? p.metadata?.[filter.metadataKey!] === filter.metadataValue
-				: p.metadata !== undefined && filter.metadataKey! in p.metadata
+				: p.metadata !== undefined &&
+				  Object.prototype.hasOwnProperty.call(p.metadata, filter.metadataKey!)
 		);
 	}
 	if (filter.offset) list = list.slice(filter.offset);
@@ -197,7 +205,8 @@ describe('Payment rows are read newest first from the created_at index (issue #1
 
 		const legacy = new Database(dbPath);
 		legacy.exec(
-			'DROP INDEX idx_payments_created_at; ' +
+			SCHEMA_16 +
+				'DROP INDEX idx_payments_created_at; ' +
 				'ALTER TABLE payments DROP COLUMN created_at; ' +
 				'DELETE FROM schema_version WHERE version = 16'
 		);
@@ -208,7 +217,9 @@ describe('Payment rows are read newest first from the created_at index (issue #1
 		});
 		reopened.open();
 		try {
-			expect(reopened.getSchemaVersion()).to.equal(16);
+			expect(reopened.getSchemaVersion()).to.equal(
+				SqliteStorage.CURRENT_SCHEMA_VERSION
+			);
 			expect(
 				[...reopened.paymentsNewestFirst()].map((r) => r.paymentHash)
 			).to.deep.equal(
@@ -240,7 +251,8 @@ describe('Payment rows are read newest first from the created_at index (issue #1
 			.prepare('UPDATE payments SET payment_json = ? WHERE payment_hash = ?')
 			.run(encryptValue(key, JSON.stringify(payload)), hex(bad));
 		legacy.exec(
-			'DROP INDEX idx_payments_created_at; ' +
+			SCHEMA_16 +
+				'DROP INDEX idx_payments_created_at; ' +
 				'ALTER TABLE payments DROP COLUMN created_at; ' +
 				'DELETE FROM schema_version WHERE version = 16'
 		);
@@ -293,6 +305,157 @@ describe('Payment rows are read newest first from the created_at index (issue #1
 		} finally {
 			reopened.close();
 		}
+	});
+});
+
+describe('Payment filters are tested on lookup columns, not decrypted rows (issue #1459)', () => {
+	let tmpDir: string;
+	let dbPath: string;
+	const key = crypto.randomBytes(32);
+
+	const FILTERS: PaymentFilter[] = [
+		{ status: 'FAILED' },
+		{ status: 'PENDING' },
+		{ direction: 'INCOMING' },
+		{ status: 'COMPLETED', direction: 'OUTGOING', since: BASE_MS + 10 },
+		{ metadataKey: 'even' },
+		{ metadataKey: 'label', metadataValue: 'row-7' },
+		{ metadataKey: 'label', metadataValue: 'row-' },
+		{ metadataKey: 'absent' }
+	];
+
+	const walk = (storage: SqliteStorage, filter: PaymentFilter): string[] =>
+		[
+			...storage.paymentsNewestFirst(filter.since, {
+				status: filter.status,
+				direction: filter.direction,
+				metadata:
+					filter.metadataKey === undefined
+						? undefined
+						: { key: filter.metadataKey, value: filter.metadataValue }
+			})
+		].map((r) => r.paymentHash);
+
+	const expectFiltersMatch = (storage: SqliteStorage): void => {
+		const all = storage.loadAllPayments();
+		for (const filter of FILTERS) {
+			expect(walk(storage, filter), JSON.stringify(filter)).to.deep.equal(
+				referenceListing(all, [], filter)
+			);
+		}
+	};
+
+	beforeEach(() => {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-payments-match-'));
+		dbPath = path.join(tmpDir, 'node.db');
+	});
+
+	afterEach(() => {
+		sinon.restore();
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	it('matches status, direction and metadata on the walk, decrypting no row', () => {
+		const storage = new SqliteStorage(dbPath, undefined, {
+			encryptionKey: key
+		});
+		storage.open();
+		try {
+			for (let i = 0; i < ROWS; i++) {
+				const p = recordOf(i);
+				storage.savePayment(hex(p), p);
+			}
+			const all = storage.loadAllPayments();
+			const decodes = countDecodes(storage);
+			for (const filter of FILTERS) {
+				expect(walk(storage, filter), JSON.stringify(filter)).to.deep.equal(
+					referenceListing(all, [], filter)
+				);
+			}
+			expect(decodes.callCount).to.equal(0);
+		} finally {
+			storage.close();
+		}
+	});
+
+	it('fills the lookup columns for rows a schema 16 database already held', () => {
+		const storage = new SqliteStorage(dbPath, undefined, {
+			encryptionKey: key
+		});
+		storage.open();
+		for (let i = 0; i < 60; i++) {
+			const p = recordOf(i);
+			storage.savePayment(hex(p), p);
+		}
+		storage.close();
+
+		const legacy = new Database(dbPath);
+		legacy.exec(SCHEMA_16);
+		legacy.close();
+
+		const reopened = new SqliteStorage(dbPath, undefined, {
+			encryptionKey: key
+		});
+		reopened.open();
+		try {
+			expect(reopened.getSchemaVersion()).to.equal(
+				SqliteStorage.CURRENT_SCHEMA_VERSION
+			);
+			expectFiltersMatch(reopened);
+		} finally {
+			reopened.close();
+		}
+	});
+
+	it('tags rows written without a key again once a key is set', () => {
+		const plain = new SqliteStorage(dbPath);
+		plain.open();
+		for (let i = 0; i < 60; i++) {
+			const p = recordOf(i);
+			plain.savePayment(hex(p), p);
+		}
+		plain.close();
+
+		const keyed = new SqliteStorage(dbPath, undefined, { encryptionKey: key });
+		keyed.open();
+		try {
+			expectFiltersMatch(keyed);
+		} finally {
+			keyed.close();
+		}
+	});
+
+	it('stores keyed tags of the metadata, never the metadata', () => {
+		const p = recordOf(1, {
+			metadata: { 'label-key-marker': 'label-value-marker' }
+		});
+		const tagsUnder = (encryptionKey: Buffer, file: string): string => {
+			const storage = new SqliteStorage(file, undefined, { encryptionKey });
+			storage.open();
+			storage.savePayment(hex(p), p);
+			storage.close();
+			const db = new Database(file, { readonly: true });
+			try {
+				return (
+					db.prepare('SELECT metadata_tags FROM payments').get() as {
+						metadata_tags: string;
+					}
+				).metadata_tags;
+			} finally {
+				db.close();
+			}
+		};
+		const tags = tagsUnder(key, dbPath);
+		expect(tags.split(' ')).to.have.length(2);
+		expect(
+			tagsUnder(crypto.randomBytes(32), path.join(tmpDir, 'other.db'))
+		).to.not.equal(tags);
+
+		let raw = fs.readFileSync(dbPath).toString('latin1');
+		if (fs.existsSync(`${dbPath}-wal`)) {
+			raw += fs.readFileSync(`${dbPath}-wal`).toString('latin1');
+		}
+		expect(raw).to.not.include('-marker');
 	});
 });
 
@@ -360,19 +523,37 @@ describe('GET /payments reads one page of the history (issue #1403)', function (
 		).to.deep.equal(referenceListing(rows, [], { offset: 900, limit: 2 }));
 		expect(decodes.callCount, 'offset=900&limit=2').to.equal(2);
 
-		// A filter decrypts until its page fills, not to the end.
+		// A filter is tested in SQL, so it decrypts only its page too.
 		decodes.resetHistory();
-		const order = referenceListing(rows, []);
-		const incoming = referenceListing(rows, [], {
+		const filter: PaymentFilter = {
 			direction: 'INCOMING',
+			metadataKey: 'even',
+			offset: 100,
 			limit: 2
-		});
-		expect(
-			node
-				.listPayments({ direction: 'INCOMING', limit: 2 })
-				.map((p) => p.paymentHash)
-		).to.deep.equal(incoming);
-		expect(decodes.callCount).to.equal(order.indexOf(incoming[1]) + 1);
+		};
+		expect(node.listPayments(filter).map((p) => p.paymentHash)).to.deep.equal(
+			referenceListing(rows, [], filter)
+		);
+		expect(decodes.callCount, JSON.stringify(filter)).to.equal(2);
+	});
+
+	it('decrypts nothing for a filter no row matches (issue #1459)', async () => {
+		const node = daemon.node;
+		const decodes = countDecodes(storage());
+		for (const filter of [
+			{ status: 'PENDING', limit: 1 },
+			{ metadataKey: 'absent', limit: 1 },
+			{ metadataKey: 'label', metadataValue: 'absent', limit: 1 }
+		] as PaymentFilter[]) {
+			expect(node.listPayments(filter), JSON.stringify(filter)).to.deep.equal(
+				[]
+			);
+		}
+		expect(decodes.callCount).to.equal(0);
+
+		const res = await request(port, '/payments?metadataKey=absent&limit=1');
+		expect(res.status).to.equal(200);
+		expect(res.body.result).to.deep.equal([]);
 	});
 
 	it('lists what a full read and sort listed, live records merged in', () => {
@@ -412,6 +593,10 @@ describe('GET /payments reads one page of the history (issue #1403)', function (
 				{ since: mid.createdAt, offset: 2, limit: 5 },
 				{ metadataKey: 'even' },
 				{ metadataKey: 'label', metadataValue: 'live' },
+				// The row holds this label; the live record over it does not.
+				{ metadataKey: 'label', metadataValue: 'row-10' },
+				{ metadataKey: 'toString' },
+				{ direction: 'OUTGOING', metadataKey: 'even', offset: 200, limit: 30 },
 				{
 					status: 'COMPLETED',
 					direction: 'OUTGOING',

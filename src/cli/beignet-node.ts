@@ -11976,13 +11976,39 @@ export class BeignetNode extends EventEmitter {
 	 * never show less than it already knew, so a row set that cannot be
 	 * read fails the call rather than answering with the map alone.
 	 *
-	 * The rows come newest first from the database's created_at index and
-	 * the read stops once the page is full, so a limit bounds how many rows
-	 * are decrypted (issue #1403). Without a status, direction or metadata
-	 * filter the rows skipped by offset are not decrypted either.
+	 * The rows come newest first from the database's created_at index, the
+	 * status, direction and metadata filters are tested on the index walk's
+	 * plaintext lookup columns, and the read stops once the page is full. So
+	 * only the rows on the page are decrypted, however many the filter or
+	 * offset passes over (issues #1403, #1459).
 	 */
 	listPayments(filter?: PaymentFilter): PaymentInfo[] {
 		const since = filter?.since;
+		const status: string | undefined = filter?.status || undefined;
+		const direction: string | undefined = filter?.direction || undefined;
+		const metadata =
+			filter?.metadataKey !== undefined
+				? { key: filter.metadataKey, value: filter.metadataValue }
+				: undefined;
+		// The live records are tested here by the rules the rows are tested
+		// by in SQL. A metadata key must be the record's own, as only those
+		// are tagged.
+		const matches = (p: IPaymentInfo): boolean => {
+			if (since !== undefined && p.createdAt < since) return false;
+			if (status && p.status !== status) return false;
+			if (direction && p.direction !== direction) return false;
+			if (!metadata) return true;
+			if (
+				!p.metadata ||
+				!Object.prototype.hasOwnProperty.call(p.metadata, metadata.key)
+			) {
+				return false;
+			}
+			return (
+				metadata.value === undefined ||
+				p.metadata[metadata.key] === metadata.value
+			);
+		};
 		const live = new Map<string, IPaymentInfo>();
 		for (const p of this.node.listPayments()) {
 			live.set(p.paymentHash.toString('hex'), p);
@@ -11992,14 +12018,18 @@ export class BeignetNode extends EventEmitter {
 			a.createdAt > b.createdAt ||
 			(a.createdAt === b.createdAt && a.paymentHash > b.paymentHash);
 		const liveNewestFirst: IStoredPaymentRef[] = [...live]
-			.filter(([, p]) => since === undefined || p.createdAt >= since)
+			.filter(([, p]) => matches(p))
 			.map(([paymentHash, p]) => ({
 				paymentHash,
 				createdAt: p.createdAt,
 				load: () => p
 			}))
 			.sort((a, b) => (newer(a, b) ? -1 : newer(b, a) ? 1 : 0));
-		const rows = this.storage.paymentsNewestFirst(since);
+		const rows = this.storage.paymentsNewestFirst(since, {
+			status,
+			direction,
+			metadata
+		});
 		const nextRow = (): IStoredPaymentRef | undefined => {
 			for (let r = rows.next(); !r.done; r = rows.next()) {
 				if (!live.has(r.value.paymentHash)) return r.value;
@@ -12007,20 +12037,6 @@ export class BeignetNode extends EventEmitter {
 			return undefined;
 		};
 
-		const filtered =
-			!!filter?.status ||
-			!!filter?.direction ||
-			filter?.metadataKey !== undefined;
-		const matches = (p: PaymentInfo): boolean => {
-			if (!filter) return true;
-			if (filter.status && p.status !== filter.status) return false;
-			if (filter.direction && p.direction !== filter.direction) return false;
-			if (filter.metadataKey === undefined) return true;
-			if (filter.metadataValue !== undefined) {
-				return p.metadata?.[filter.metadataKey] === filter.metadataValue;
-			}
-			return p.metadata !== undefined && filter.metadataKey in p.metadata;
-		};
 		const offset =
 			filter?.offset !== undefined && filter.offset > 0 ? filter.offset : 0;
 		const limit =
@@ -12043,19 +12059,12 @@ export class BeignetNode extends EventEmitter {
 			} else {
 				break;
 			}
-			if (!filtered && skipped < offset) {
-				skipped++;
-				continue;
-			}
-			const record = next.load();
-			if (!record) continue;
-			const info = this.toPaymentInfo(record);
-			if (!matches(info)) continue;
 			if (skipped < offset) {
 				skipped++;
 				continue;
 			}
-			page.push(info);
+			const record = next.load();
+			if (record) page.push(this.toPaymentInfo(record));
 		}
 		return page;
 	}
