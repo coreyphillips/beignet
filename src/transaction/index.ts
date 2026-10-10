@@ -650,10 +650,20 @@ export class Transaction {
 			// To prevent the user from spending more in fees than their output, use the output amount if available.
 			const txBalance =
 				outputAmount && outputAmount < inputAmount ? outputAmount : inputAmount;
-			const maxSatPerByte = this.getMaxSatsPerByte({
+			let maxSatPerByte = this.getMaxSatsPerByte({
 				transactionByteCount,
 				balance: txBalance
 			});
+			// updateFee refuses a fee the inputs cannot pay on top of the outputs.
+			// Only a replacement's inputs are fixed: an ordinary send selects more
+			// coins at a higher rate, and a max send sizes its output from the fee.
+			if (transaction.boostType === EBoostType.rbf && !transaction.max) {
+				const remaining = Math.max(0, inputAmount - outputAmount);
+				maxSatPerByte = Math.min(
+					maxSatPerByte,
+					Math.floor(remaining / transactionByteCount)
+				);
+			}
 			if (maxSatPerByte < satsPerByte) {
 				return ok({
 					totalFee: transactionByteCount * maxSatPerByte,

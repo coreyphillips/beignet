@@ -242,6 +242,34 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		});
 	});
 
+	describe('getFeeInfo', function () {
+		// #1492: at 7 sat/vB the send selects the second coin, so the one coin
+		// selected at 2 sat/vB must not cap the maximum.
+		[ECoinSelectPreference.small, ECoinSelectPreference.large].forEach(
+			(preference) => {
+				it(`quotes a maximum rate that selects another coin with preference ${preference}`, async function () {
+					wallet.updateCoinSelectPreference(preference);
+					injectUtxo(FUNDING_TXID, 100_000);
+					injectUtxo(BOOSTED_TXID, 100_000);
+					const setup = await wallet.transaction.setupTransaction();
+					if (setup.isErr()) throw setup.error;
+					const staged = wallet.transaction.updateSendTransaction({
+						transaction: {
+							outputs: [{ address: P2WPKH, value: 99_000, index: 0 }]
+						}
+					});
+					if (staged.isErr()) throw staged.error;
+
+					const quote = wallet.getFeeInfo({ satsPerByte: 2 });
+					if (quote.isErr()) throw quote.error;
+					expect(quote.value.maxSatPerByte).to.be.at.least(7);
+					const updated = wallet.transaction.updateFee({ satsPerByte: 7 });
+					if (updated.isErr()) throw updated.error;
+				});
+			}
+		);
+	});
+
 	describe('setupRbf', function () {
 		beforeEach(function () {
 			injectUtxo(FUNDING_TXID, 100_000);
@@ -276,7 +304,7 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		 * The boosted transaction spends two 100k coins, so a replacement must
 		 * too. Its 1k fee is outbid at the rates these tests ask for.
 		 */
-		const stubTwoInputBoostedTransaction = (): void => {
+		const stubTwoInputBoostedTransaction = (recipient = 40_000): void => {
 			stubLookups({
 				[BOOSTED_TXID]: {
 					vin: [
@@ -284,8 +312,12 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 						{ txid: FUNDING_TXID, vout: 1 }
 					] as TTxDetails['vin'],
 					vout: [
-						{ value: 0.0004, n: 0, scriptPubKey: { address: P2WPKH } },
-						{ value: 0.00159, n: 1, scriptPubKey: { address: changeAddress() } }
+						{ value: recipient / 1e8, n: 0, scriptPubKey: { address: P2WPKH } },
+						{
+							value: (199_000 - recipient) / 1e8,
+							n: 1,
+							scriptPubKey: { address: changeAddress() }
+						}
 					] as unknown as TTxDetails['vout']
 				},
 				[FUNDING_TXID]: {
@@ -376,6 +408,42 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 						true
 					);
 					expect(wallet.coinSelectPreference).to.equal(preference);
+				});
+			}
+		);
+
+		// #1492: half the 180k payment allowed 430 sat/vB, a fee the 20k left
+		// after it cannot pay.
+		[ECoinSelectPreference.small, ECoinSelectPreference.large].forEach(
+			(preference) => {
+				it(`quotes a maximum rate the change can pay with preference ${preference}`, async function () {
+					wallet.updateCoinSelectPreference(preference);
+					stubTwoInputBoostedTransaction(180_000);
+
+					const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+					if (res.isErr()) throw res.error;
+					const updated = wallet.transaction.updateFee({ satsPerByte: 20 });
+					if (updated.isErr()) throw updated.error;
+					const quote = wallet.getFeeInfo({ satsPerByte: 20 });
+					if (quote.isErr()) throw quote.error;
+					expect(quote.value.totalFee).to.equal(updated.value.fee);
+
+					const { maxSatPerByte, transactionByteCount } = quote.value;
+					expect(maxSatPerByte).to.equal(
+						Math.floor(20_000 / transactionByteCount)
+					);
+					const atMax = wallet.transaction.updateFee({
+						satsPerByte: maxSatPerByte
+					});
+					if (atMax.isErr()) throw atMax.error;
+					const created = await wallet.transaction.createTransaction();
+					if (created.isErr()) throw created.error;
+					const tx = BitcoinTransaction.fromHex(created.value.hex);
+					expect(tx.outs.map((out) => out.value)).to.include(180_000);
+					const overMax = wallet.transaction.updateFee({
+						satsPerByte: maxSatPerByte + 1
+					});
+					expect(overMax.isErr(), 'one more sat/vB is refused').to.equal(true);
 				});
 			}
 		);
