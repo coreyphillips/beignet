@@ -8368,7 +8368,8 @@ export class ChannelManager extends EventEmitter {
 		}
 		const vout = msg.prevTxVout;
 		if (!prevTx.outs[vout]) return;
-		const txid = Buffer.from(prevTx.getHash());
+		const txid = Buffer.alloc(32);
+		prevTx.getHash().copy(txid);
 		const key = `${txid.toString('hex')}:${vout}`;
 		let seen = this._verifiedPeerInputs.get(channel);
 		if (!seen) {
@@ -8377,14 +8378,15 @@ export class ChannelManager extends EventEmitter {
 		}
 		if (seen.has(key)) return;
 		seen.add(key);
-		// The query can outlive the negotiation, so it holds no reference into
-		// the prev_tx (bitcoinjs output scripts are views of it) and no closure
-		// in this method may capture msg, channel or session: V8 shares one
-		// context among a function's closures (issue #1500).
-		const channelId = msg.channelId;
+		// The query can outlive the negotiation. Unpooled copies avoid retaining
+		// prev_tx views or shared slabs. No closure here may capture msg, channel
+		// or session: V8 shares one context among a function's closures (issue #1500).
+		const channelId = Buffer.alloc(msg.channelId.length);
+		msg.channelId.copy(channelId);
 		const channelCheckId = this._peerInputCheckId(channel);
 		const sessionCheckId = this._peerInputCheckId(session);
-		const scriptPubKey = Buffer.from(prevTx.outs[vout].script);
+		const scriptPubKey = Buffer.alloc(prevTx.outs[vout].script.length);
+		prevTx.outs[vout].script.copy(scriptPubKey);
 		void verify({ txid, vout, scriptPubKey })
 			.then((verdict) =>
 				this.applyPeerInputVerdict(

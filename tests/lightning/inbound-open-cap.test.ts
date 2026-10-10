@@ -438,7 +438,7 @@ describe('Unconfirmed inbound channels keep their quota (issue #1456)', () => {
 
 describe('Retained peer prev_tx bytes (issue #1457)', () => {
 	/** The reproduction's prev_tx: 65,393 bytes, a P2WPKH at vout 0. */
-	function makeLargePrevTx(): Buffer {
+	function makeLargePrevTx(paddingBytes = 65_300): Buffer {
 		const tx = new bitcoin.Transaction();
 		tx.version = 2;
 		tx.addInput(crypto.randomBytes(32), 0);
@@ -446,7 +446,7 @@ describe('Retained peer prev_tx bytes (issue #1457)', () => {
 			Buffer.concat([Buffer.from('0014', 'hex'), crypto.randomBytes(20)]),
 			10_000
 		);
-		tx.addOutput(Buffer.alloc(65_300, 0x6a), 0);
+		tx.addOutput(Buffer.alloc(paddingBytes, 0x6a), 0);
 		return tx.toBuffer();
 	}
 	const prevTx = makeLargePrevTx();
@@ -574,7 +574,8 @@ describe('Retained peer prev_tx bytes (issue #1457)', () => {
 		function watchKeptPrevTx(
 			victim: ChannelManager,
 			channelId: Buffer,
-			serialId: bigint
+			serialId: bigint,
+			backingBytes = prevTx.length
 		): WeakRef<ArrayBufferLike> {
 			const kept = victim
 				.getTempChannel(channelId)!
@@ -582,8 +583,7 @@ describe('Retained peer prev_tx bytes (issue #1457)', () => {
 				.getTxBuilder()!
 				.getSession()
 				.inputs.get(serialId.toString())!.prevTx!;
-			// Its own allocation, not a shared pool slab.
-			expect(kept.buffer.byteLength).to.equal(prevTx.length);
+			expect(kept.buffer.byteLength).to.equal(backingBytes);
 			return new WeakRef(kept.buffer);
 		}
 
@@ -624,6 +624,32 @@ describe('Retained peer prev_tx bytes (issue #1457)', () => {
 			for (const check of checks) check.resolve('spent-or-missing');
 			await new Promise((resolve) => setImmediate(resolve));
 			expect(sent, 'late verdicts found nothing to abort').to.deep.equal([]);
+		});
+
+		it('dropped sessions retain no pooled prev_tx while their checks are pending', async () => {
+			const checks: IPendingCheck[] = [];
+			const victim = makeManager('victim-pooled', 0, {
+				verifyRemoteFundingInput: deferredVerifier(checks)
+			});
+			const watched: Array<WeakRef<ArrayBufferLike>> = [];
+			for (let i = 0; i < 16; i++) {
+				const id = acceptV2(victim, PEER_A, `pooled-${i}`);
+				expect(
+					addInput(victim, PEER_A, id, 0n, makeLargePrevTx(i % 2 ? 0 : 3000))
+				).to.deep.equal([]);
+				watched.push(watchKeptPrevTx(victim, id, 0n, Buffer.poolSize));
+				victim.handlePeerDisconnected(PEER_A);
+			}
+			expect(checks).to.have.length(16);
+			expect(victim.listChannels()).to.have.length(0);
+
+			// The active buffer pool itself keeps its current slab alive.
+			for (let i = 0; i < 16; i++) Buffer.allocUnsafe(Buffer.poolSize / 2 - 1);
+			await collectGarbage();
+			expect(
+				watched.filter((ref) => ref.deref() !== undefined),
+				'prev_tx slabs still reachable'
+			).to.have.length(0);
 		});
 
 		it('a check pending past tx_remove_input retains no prev_tx', async () => {
