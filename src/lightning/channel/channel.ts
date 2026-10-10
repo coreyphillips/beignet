@@ -2992,6 +2992,21 @@ export class Channel {
 				this._state.v2InFlight.confirmed = true;
 				return [...prefix, { type: ChannelActionType.PERSIST_STATE }];
 			}
+			// A v2 open force-closed before this attempt confirmed (issue
+			// #1493). The commitment it broadcast already spends this output,
+			// so only the fact is owed. It goes on the failed-channel stamp,
+			// not the record: on a FORCE_CLOSED channel a confirmed record is
+			// what the node's close re-drive keys off, and that is for a
+			// superseded attempt the channel adopted.
+			if (
+				this._state.state === ChannelState.FORCE_CLOSED &&
+				this._state.v2InFlight &&
+				!this._state.v2InFlight.confirmed &&
+				!this._state.fundingConfirmedLate
+			) {
+				this._state.fundingConfirmedLate = true;
+				return [...prefix, { type: ChannelActionType.PERSIST_STATE }];
+			}
 			// A v1 depth observation the ready flow cannot consume: the
 			// zero-conf fast-track already ran it (NORMAL long before real
 			// depth), or the channel has already failed. The callback is

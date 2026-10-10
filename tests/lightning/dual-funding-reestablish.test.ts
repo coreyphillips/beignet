@@ -100,7 +100,10 @@ import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig, IFundingProvider } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
-import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import {
+	ChannelManager,
+	IPerChannelKeys
+} from '../../src/lightning/channel/channel-manager';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { ILeaseRates } from '../../src/lightning/gossip/types';
 import { reconstructFromFrames } from '../../src/lightning/recovery';
@@ -6309,6 +6312,124 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		} finally {
 			t.opener.destroy();
 			t.acceptor.destroy();
+		}
+	});
+
+	it('a force-closed open records its current attempt confirming and frees its inbound slot (issue 1493)', async function () {
+		// Distinct keys per channel: v2 channel ids derive from the revocation
+		// basepoints, so shared node keys would give every open one id.
+		const perChannelKeys =
+			(tag: string) =>
+			(index: number): IPerChannelKeys => {
+				const key = (i: number): Buffer =>
+					crypto
+						.createHash('sha256')
+						.update(`v2-1493-${tag}-${index}-${i}`)
+						.digest();
+				const perCommitmentSeed = key(5);
+				return {
+					fundingPrivkey: key(0),
+					basepoints: {
+						fundingPubkey: getPublicKey(key(0)),
+						revocationBasepoint: getPublicKey(key(1)),
+						paymentBasepoint: getPublicKey(key(2)),
+						delayedPaymentBasepoint: getPublicKey(key(3)),
+						htlcBasepoint: getPublicKey(key(4)),
+						firstPerCommitmentPoint: getPerCommitmentPoint(
+							perCommitmentSeed,
+							0n
+						)
+					},
+					perCommitmentSeed,
+					htlcBasepointSecret: key(4)
+				};
+			};
+		const opener = new LightningNode({
+			...makeNodeConfig(1493, {
+				fundingProvider: recordingFundingProvider(
+					Array.from({ length: 5 }, () => makeWalletInput(200_000))
+				)
+			}),
+			channelKeyDeriver: perChannelKeys('opener')
+		});
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const acceptor = new LightningNode({
+			...makeNodeConfig(1494, { storage }),
+			channelKeyDeriver: perChannelKeys('acceptor')
+		});
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		// A stored node with per-channel keys takes no open before it knows
+		// the chain tip (issue #906).
+		acceptor.handleNewBlock(1000);
+		const actions: string[] = [];
+		acceptor.on('log', (log: { action: string }) => actions.push(log.action));
+		wireNodes(opener, acceptor);
+		const openToAcceptor = async (): Promise<Channel> => {
+			const channel = opener.openChannelV2(acceptor.getNodeId(), {
+				fundingSatoshis: 100_000n,
+				fundingFeeratePerkw: 1000
+			});
+			await settle(
+				() =>
+					channel.getChannelId() !== null &&
+					managerOf(acceptor)
+						.getChannel(channel.getChannelId()!)
+						?.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED
+			);
+			return managerOf(acceptor).getChannel(channel.getChannelId()!)!;
+		};
+		try {
+			const accepted: Channel[] = [];
+			for (let i = 0; i < 4; i++) accepted.push(await openToAcceptor());
+			const dest = bitcoin.payments.p2wpkh({
+				hash: crypto.randomBytes(20)
+			}).output!;
+			for (const channel of accepted) {
+				const channelId = channel.getChannelId()!;
+				const closed = acceptor.forceCloseChannel(channelId, dest);
+				expect(closed.ok, closed.error).to.equal(true);
+				expect(channel.getState()).to.equal(ChannelState.FORCE_CLOSED);
+				expect(channel.isFundingKnownOnChain()).to.equal(false);
+
+				// The watcher's order: the manager first, then the node handler.
+				const txidHex = Buffer.from(
+					channel.getFullState().v2InFlight!.fundingTxid
+				)
+					.reverse()
+					.toString('hex');
+				managerOf(acceptor).handleFundingConfirmed(channelId, txidHex);
+				(
+					acceptor as unknown as {
+						onFundingWatchConfirmed(id: Buffer, txid?: string): void;
+					}
+				).onFundingWatchConfirmed(channelId, txidHex);
+
+				expect(channel.getState()).to.equal(ChannelState.FORCE_CLOSED);
+				expect(channel.isFundingKnownOnChain()).to.equal(true);
+				const row = storage.loadChannel(channelId.toString('hex'))!.state;
+				expect(row.fundingConfirmedLate, 'the stamp is durable').to.equal(true);
+				expect(
+					row.v2InFlight!.confirmed,
+					'a confirmed record is the re-drive marker for an adopted attempt'
+				).to.equal(false);
+			}
+			// The broadcast commitments already spend these outputs, so no close
+			// is rebuilt for them.
+			await neverSettles(
+				() => actions.some((a) => a.startsWith('splice_close_redrive')),
+				100
+			);
+
+			// Every slot came back, so a fifth open from the same peer is taken.
+			const fifth = await openToAcceptor();
+			expect(fifth.getState()).to.equal(
+				ChannelState.AWAITING_FUNDING_CONFIRMED
+			);
+		} finally {
+			opener.destroy();
+			acceptor.destroy();
 		}
 	});
 
