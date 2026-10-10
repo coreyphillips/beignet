@@ -326,6 +326,39 @@ export class Transaction {
 	}
 
 	/**
+	 * Returns the change address createPsbtFromTransactionData will add to a
+	 * transaction staged without one, or undefined when it adds none. The
+	 * builder adds it for any leftover at or above dust and does not reprice
+	 * the fee, so the estimate has to count it. The leftover is measured at the
+	 * fee without change, as the builder would see it. Measuring it after the
+	 * change's own cost leaves out change the builder still adds.
+	 * @private
+	 * @param {Partial<ISendTransaction>} transaction
+	 * @param {IUtxo[]} inputs
+	 * @param {number} fee
+	 * @returns {string | undefined}
+	 */
+	private generatedChangeAddress({
+		transaction,
+		inputs,
+		fee
+	}: {
+		transaction: Partial<ISendTransaction>;
+		inputs: IUtxo[];
+		fee: number;
+	}): string | undefined {
+		if (transaction.changeAddress || transaction.max) return undefined;
+		const address =
+			this._wallet.data.changeAddressIndex[this._wallet.addressType]?.address;
+		if (!address) return undefined;
+		const leftover =
+			this.getTransactionInputValue({ inputs }) -
+			this.getTransactionOutputValue({ outputs: transaction.outputs ?? [] }) -
+			fee;
+		return leftover >= getDustThreshold(address) ? address : undefined;
+	}
+
+	/**
 	 * Attempt to estimate the current fee for a given transaction and its UTXO's
 	 * @param {number} [satsPerByte]
 	 * @param {string} [message]
@@ -411,7 +444,27 @@ export class Transaction {
 				if (transactionByteCount < minByteCount)
 					transactionByteCount = minByteCount;
 			}
-			return transactionByteCount * satsPerByte;
+			const fee = transactionByteCount * satsPerByte;
+			const generatedChange = this.generatedChangeAddress({
+				transaction,
+				inputs,
+				fee
+			});
+			if (generatedChange) {
+				// Consolidate keeps the inputs already selected above.
+				return this.getTotalFee({
+					satsPerByte,
+					message,
+					transaction: {
+						...transaction,
+						inputs,
+						changeAddress: generatedChange
+					},
+					fundingLightning,
+					coinSelectPreference: ECoinSelectPreference.consolidate
+				});
+			}
+			return fee;
 		} catch {
 			return baseTransactionSize * satsPerByte;
 		}
@@ -523,6 +576,25 @@ export class Transaction {
 				const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
 				if (transactionByteCount < minByteCount)
 					transactionByteCount = minByteCount;
+			}
+			const generatedChange = this.generatedChangeAddress({
+				transaction,
+				inputs,
+				fee: transactionByteCount * satsPerByte
+			});
+			if (generatedChange) {
+				// Consolidate keeps the inputs already selected above.
+				return this.getTotalFeeObj({
+					satsPerByte,
+					message,
+					transaction: {
+						...transaction,
+						inputs,
+						changeAddress: generatedChange
+					},
+					fundingLightning,
+					coinSelectPreference: ECoinSelectPreference.consolidate
+				});
 			}
 			const inputAmount = this.getTransactionInputValue({ inputs });
 			const outputAmount = this.getTransactionOutputValue({ outputs });
