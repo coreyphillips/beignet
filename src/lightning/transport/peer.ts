@@ -293,6 +293,7 @@ export class Peer extends EventEmitter {
 				this.socket.markEstablished?.();
 				this.state = 'ready';
 				this.setupMessageLoop();
+				this.throwIfClosedByDrain();
 				this.startPingTimer();
 				this.emit('connect');
 			} catch (err) {
@@ -340,6 +341,7 @@ export class Peer extends EventEmitter {
 						this.socket!.setTimeout(0); // Clear handshake timeout
 						this.state = 'ready';
 						this.setupMessageLoop();
+						this.throwIfClosedByDrain();
 						this.startPingTimer();
 						this.emit('connect');
 						resolve();
@@ -398,6 +400,7 @@ export class Peer extends EventEmitter {
 			socket.markEstablished?.();
 			this.state = 'ready';
 			this.setupMessageLoop();
+			this.throwIfClosedByDrain();
 			this.startPingTimer();
 			this.emit('connect');
 		} catch (err) {
@@ -742,6 +745,18 @@ export class Peer extends EventEmitter {
 		// processed until the next 'data' event unless we kick it here.
 		if (this.readBuffer.length > 0) {
 			this.processReadBuffer();
+		}
+	}
+
+	/**
+	 * setupMessageLoop drains the frames that arrived with the init, and one
+	 * of them can close the connection (an invalid frame, a ping flood). An
+	 * establishment whose connection closed there fails instead of reporting
+	 * connect.
+	 */
+	private throwIfClosedByDrain(): void {
+		if (this.state !== 'ready') {
+			throw new Error('Connection closed while draining buffered frames');
 		}
 	}
 
