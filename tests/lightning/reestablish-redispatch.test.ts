@@ -1890,12 +1890,17 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		};
 		payPart(carol, 40_000n, 120_000n);
 		await settle();
+		expect(busy, 'the first owed-row write was refused').to.equal(false);
+		expect(storage1.loadMetadata('owed_part_failures')).to.equal(null);
+		expect(
+			carol.getPayment(invoice.paymentHash)!.status,
+			'no fail goes out before the row lands'
+		).to.equal(PaymentStatus.PENDING);
+		bob.handleNewBlock(1000);
+		await settle();
 		const carolPayment = carol.getPayment(invoice.paymentHash)!;
 		expect(carolPayment.status).to.equal(PaymentStatus.FAILED);
 		expect(carolPayment.failureCode).to.equal(FINAL_INCORRECT_HTLC_AMOUNT);
-		expect(busy, 'the first owed-row write was refused').to.equal(false);
-		expect(storage1.loadMetadata('owed_part_failures')).to.equal(null);
-		bob.handleNewBlock(1000);
 		bob.destroy();
 
 		const aliceKey = `${aliceChannelId.toString('hex')}:0`;
@@ -1940,6 +1945,130 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 			restarted.handleNewBlock(height);
 		}
 		expect(aliceChannel.getState()).to.equal(ChannelState.NORMAL);
+
+		restarted.destroy();
+		carol.destroy();
+		alice.destroy();
+	});
+
+	it('a total mismatch whose owed-row write is refused is rejected again after a restart before the retry (#1469)', async function () {
+		this.timeout(20_000);
+		const CAROL_SEED = 43;
+		const dbPath = tempDb('owed-part-unsaved-restart');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED, storage1);
+		const carol = createNode(CAROL_SEED);
+		wire(alice, bob, { val: false });
+		wire(carol, bob, { val: false });
+		for (const node of [alice, bob, carol]) node.handleNewBlock(1000);
+		const aliceChannelId = openReadyChannel(alice, bob);
+		const carolChannelId = openReadyChannel(carol, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+		buildDirectGraph(carol, CAROL_SEED, BOB_SEED);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 100_000n,
+			description: 'mpp total mismatch, restart before the row lands'
+		});
+		const payPart = (
+			payer: LightningNode,
+			amountMsat: bigint,
+			totalMsat: bigint
+		): void => {
+			const finalCltv = (
+				payer as unknown as { paddedFinalCltvExpiry: () => number }
+			).paddedFinalCltvExpiry();
+			payer.sendPaymentToRoute(
+				{
+					hops: [
+						{
+							pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+							shortChannelId: encodeShortChannelId({
+								block: 500,
+								txIndex: 1,
+								outputIndex: 0
+							}),
+							amountToForwardMsat: amountMsat,
+							outgoingCltvValue: finalCltv
+						}
+					]
+				},
+				invoice.paymentHash,
+				finalCltv,
+				invoice.paymentSecret,
+				totalMsat
+			);
+		};
+
+		payPart(alice, 60_000n, 100_000n);
+		await settle();
+		alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
+		await settle();
+
+		const saveMetadata = storage1.saveMetadata.bind(storage1);
+		let busy = true;
+		storage1.saveMetadata = (key: string, value: string): void => {
+			if (key === 'owed_part_failures' && busy) {
+				busy = false;
+				throw new Error('SQLITE_BUSY');
+			}
+			saveMetadata(key, value);
+		};
+		payPart(carol, 40_000n, 120_000n);
+		await settle();
+		expect(busy, 'the first owed-row write was refused').to.equal(false);
+		expect(storage1.loadMetadata('owed_part_failures')).to.equal(null);
+		expect(
+			carol.getPayment(invoice.paymentHash)!.status,
+			'the disagreeing part stays committed while nothing records the mismatch'
+		).to.equal(PaymentStatus.PENDING);
+		// Restart before any block retries the write.
+		bob.destroy();
+
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		expect(storage2.loadMetadata('owed_part_failures')).to.equal(null);
+		carol.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+		alice.removeAllListeners('message:outbound');
+		carol.removeAllListeners('message:outbound');
+		const restarted = createNode(BOB_SEED, storage2);
+		await reconnect(restarted, alice);
+		await reconnect(restarted, carol);
+
+		const pendingMpp = (
+			restarted as unknown as { pendingMppPayments: Map<string, unknown> }
+		).pendingMppPayments;
+		expect(pendingMpp.size, 'the rebuilt set was rejected again').to.equal(0);
+		for (const payer of [alice, carol]) {
+			const payment = payer.getPayment(invoice.paymentHash)!;
+			expect(payment.status).to.equal(PaymentStatus.FAILED);
+			expect(payment.failureCode, 'the payer read the mismatch').to.equal(
+				FINAL_INCORRECT_HTLC_AMOUNT
+			);
+		}
+		const channels = [aliceChannelId, carolChannelId].map(
+			(id) => restarted.getChannelManager().getChannel(id)!
+		);
+		for (const channel of channels) {
+			expect(channel.getFullState().htlcs.size, 'no HTLC left').to.equal(0);
+		}
+		expect(sharedSecrets(restarted).size, 'no shared secret left').to.equal(0);
+		expect(storage2.loadAllHtlcSharedSecrets()).to.deep.equal([]);
+		expect(
+			storage2.loadMetadata('owed_part_failures'),
+			'the owed fails are retired on disk'
+		).to.equal('[]');
+
+		// Past the height the claim backstop would have force-closed at.
+		for (let height = 1001; height <= 1050; height++) {
+			for (const node of [alice, carol, restarted]) node.handleNewBlock(height);
+		}
+		for (const channel of channels) {
+			expect(channel.getState()).to.equal(ChannelState.NORMAL);
+		}
 
 		restarted.destroy();
 		carol.destroy();

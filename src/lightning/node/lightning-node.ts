@@ -1535,7 +1535,10 @@ export class LightningNode extends EventEmitter {
 		string,
 		{ inChannelIdHex: string; fail: () => boolean; failureCode?: number }
 	>();
-	/** The last `owed_part_failures` write failed; every block retries it. */
+	/**
+	 * The last `owed_part_failures` write failed; every block retries it, and
+	 * no owed part's fail goes out until it lands.
+	 */
 	private owedPartFailuresUnsaved = false;
 	private graphPruneTimer: ReturnType<typeof setInterval> | null = null;
 	private _chainBackend: import('../chain/chain-watcher').IChainBackend | null =
@@ -23990,18 +23993,16 @@ export class LightningNode extends EventEmitter {
 			// total is now ambiguous, keeping parked parts alive locks the
 			// payer's funds until the MPP timeout, and a sender could keep
 			// injecting mismatched parts to hold state open indefinitely.
+			const rejected: Array<{ channelId: Buffer; htlcId: bigint }> = [];
 			for (const p of pending.receivedParts) {
 				if (p.status !== PaymentStatus.PENDING) continue;
 				p.status = PaymentStatus.FAILED;
-				this.failRejectedMppPart(
-					p.channelId,
-					p.htlcId,
-					FINAL_INCORRECT_HTLC_AMOUNT
-				);
+				rejected.push({ channelId: p.channelId, htlcId: p.htlcId });
 			}
+			rejected.push({ channelId, htlcId });
 			this.pendingMppPayments.delete(hashHex);
 			this.clearJitSkim(hashHex);
-			this.failRejectedMppPart(channelId, htlcId, FINAL_INCORRECT_HTLC_AMOUNT);
+			this.rejectMismatchedMppParts(rejected);
 			return;
 		}
 
@@ -24165,6 +24166,42 @@ export class LightningNode extends EventEmitter {
 			failureCode
 		});
 		this.persistOwedPartFailures();
+	}
+
+	/**
+	 * Fail every part of a total mismatch: the set's pending parts and the
+	 * part that disagreed. Each one is owed on disk before any fail goes out.
+	 * The committed parts are the only durable record of the mismatch, so a
+	 * restart that finds no owed row must still find every part committed,
+	 * and the restore repair then rejects the set again. A refused write
+	 * leaves the fails to the owed retry, which writes first.
+	 */
+	private rejectMismatchedMppParts(
+		parts: Array<{ channelId: Buffer; htlcId: bigint }>
+	): void {
+		const keys = parts.map(({ channelId, htlcId }) => {
+			const key = `${channelId.toString('hex')}:${htlcId}`;
+			this.owedHeldForwardFailures.set(key, {
+				inChannelIdHex: channelId.toString('hex'),
+				fail: this.rejectedPartFail(
+					channelId,
+					htlcId,
+					FINAL_INCORRECT_HTLC_AMOUNT
+				),
+				failureCode: FINAL_INCORRECT_HTLC_AMOUNT
+			});
+			return key;
+		});
+		this.persistOwedPartFailures();
+		if (this.owedPartFailuresUnsaved) return;
+		let retired = false;
+		for (const key of keys) {
+			if (this.owedHeldForwardFailures.get(key)?.fail()) {
+				this.owedHeldForwardFailures.delete(key);
+				retired = true;
+			}
+		}
+		if (retired) this.persistOwedPartFailures();
 	}
 
 	/**
@@ -24892,6 +24929,7 @@ export class LightningNode extends EventEmitter {
 	 * dropped: there is nothing left to fail.
 	 */
 	private retryOwedHeldForwardFailures(inChannelIdHex?: string): void {
+		if (this.owedPartFailuresUnsaved) this.persistOwedPartFailures();
 		let retiredPersisted = false;
 		for (const [key, owed] of this.owedHeldForwardFailures) {
 			if (inChannelIdHex && owed.inChannelIdHex !== inChannelIdHex) continue;
@@ -24928,14 +24966,19 @@ export class LightningNode extends EventEmitter {
 				this.owedHeldForwardFailures.delete(key);
 				this.cleanupHtlcSharedSecret(key);
 				retiredPersisted ||= owed.failureCode !== undefined;
+			} else if (
+				owed.failureCode !== undefined &&
+				this.owedPartFailuresUnsaved
+			) {
+				// Its row is not on disk, and for a total mismatch the committed
+				// parts are the only durable record (rejectMismatchedMppParts).
+				continue;
 			} else if (owed.fail()) {
 				this.owedHeldForwardFailures.delete(key);
 				retiredPersisted ||= owed.failureCode !== undefined;
 			}
 		}
-		if (retiredPersisted || this.owedPartFailuresUnsaved) {
-			this.persistOwedPartFailures();
-		}
+		if (retiredPersisted) this.persistOwedPartFailures();
 	}
 
 	/**
