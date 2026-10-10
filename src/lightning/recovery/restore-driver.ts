@@ -962,6 +962,21 @@ export class RestoreDriver {
 		);
 	}
 
+	/**
+	 * Fresh heads when a quorum fenced the attempt after the heads its
+	 * evidence came from were read, otherwise null. A guardian answers a
+	 * repeated ACQUIRE with the certificate and receipt it stored, even
+	 * after a later takeover moved it on, and a split grant is assembled
+	 * from heads read before its repair, so neither shows that takeover.
+	 */
+	private async fencedSince(
+		attempt: IPendingAttempt
+	): Promise<{ readings: IHeadReading[]; stale: IHeadReading[] } | null> {
+		const fresh = await this.readHeads();
+		this.assertNoConflict(fresh.readings, fresh.stale);
+		return this.superseded(attempt, fresh.readings, fresh.stale) ? fresh : null;
+	}
+
 	/** A guardian that granted this attempt and has not moved past it. */
 	private boundTo(reading: IHeadReading, attempt: IPendingAttempt): boolean {
 		return this.grantedOver(reading.state, attempt, attempt.expectedState);
@@ -1086,15 +1101,6 @@ export class RestoreDriver {
 		);
 		if (!source) return null;
 		const repaired = await this.repairLaggards(pool, stale, source);
-		// No ACQUIRE goes out on this path, so no ERR_SET_RETIRED answer can
-		// reveal a retirement that landed after the heads were read.
-		const rotation = await this.refetchRotation();
-		if (rotation) throw this.rotated(rotation);
-		this.emit(
-			'epoch:acquired',
-			`epoch ${attempt.newEpoch} acquired with ${bundle.length} certificates ` +
-				`granted over different heads, certifying sequence ${certified.logHead.sequence}`
-		);
 		return {
 			lease: {
 				epoch: attempt.newEpoch,
@@ -1147,12 +1153,42 @@ export class RestoreDriver {
 				`resuming the acquisition of epoch ${pending.newEpoch} with its original writer key`
 			);
 		}
+		// The next round acquires over the heads that showed the fence.
+		const abandonFenced = (
+			fenced: IPendingAttempt,
+			fresh: { readings: IHeadReading[]; stale: IHeadReading[] }
+		): void => {
+			this.emit(
+				'epoch:abandoned',
+				`epoch ${fenced.newEpoch} was won by another writer; starting a new acquisition`
+			);
+			this.clearPending();
+			pending = null;
+			held = false;
+			pool = fresh.readings;
+			stalePool = fresh.stale;
+			expected = this.selectHead(pool, stalePool);
+		};
 
 		for (let attempt = 1; attempt <= this.maxCasAttempts; attempt++) {
-			const split = pending
-				? await this.finishSplitGrant(pending, pool, stalePool)
-				: null;
-			if (split) return { ...split, repaired: repaired + split.repaired };
+			if (pending) {
+				const split = await this.finishSplitGrant(pending, pool, stalePool);
+				// No ACQUIRE goes out on this path, so only fresh heads show a
+				// takeover or a retirement that landed since its quorum was read.
+				const fenced = split ? await this.fencedSince(pending) : null;
+				if (fenced) {
+					abandonFenced(pending, fenced);
+					continue;
+				}
+				if (split) {
+					this.emit(
+						'epoch:acquired',
+						`epoch ${pending.newEpoch} acquired with ${split.certificates.length} certificates ` +
+							`granted over different heads, certifying sequence ${split.certifiedState.logHead.sequence}`
+					);
+					return { ...split, repaired: repaired + split.repaired };
+				}
+			}
 			// A guardian that may hold the pending attempt can grant nothing
 			// else, so this round completes it over its own guard or not at
 			// all. Repairing laggards toward a newer head would carry them past
@@ -1211,6 +1247,17 @@ export class RestoreDriver {
 			}
 			const certificates = this.collectCertificates(results, pending);
 			if (certificates.length >= this.config.required) {
+				// A fresh grant is made at the guardian's current head, so only
+				// a replayed one can hide a takeover that fenced the attempt.
+				const fenced = results.some(
+					(entry) => entry.result?.status === GuardianStatus.OK_DUPLICATE
+				)
+					? await this.fencedSince(pending)
+					: null;
+				if (fenced) {
+					abandonFenced(pending, fenced);
+					continue;
+				}
 				const lease: IWriterLeaseKeys = {
 					epoch: pending.newEpoch,
 					writerSecret: pending.writer.secret,
