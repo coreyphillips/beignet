@@ -10459,11 +10459,12 @@ export class LightningNode extends EventEmitter {
 				confirmedTxid
 		) {
 			if (retired) this.persistChannel(channelId);
-			// Unless the close on the network already spends this funding: the
-			// current attempt confirming, or a restart replaying a confirmation
-			// already acted on. Rebuilding that close only refuses, and a mined
-			// one refuses again every block (issue #1523).
-			if (!state.closeSpendsFundingTxid?.equals(state.v2InFlight.fundingTxid)) {
+			// The marker precedes broadcast and monitor persistence. Without a
+			// monitor, replay must still recover a close that never reached the chain.
+			if (
+				!this.channelManager.getMonitor(channelId) ||
+				!state.closeSpendsFundingTxid?.equals(state.v2InFlight.fundingTxid)
+			) {
 				void this.redriveSpliceAdoptedClose(channelId);
 			}
 			return;

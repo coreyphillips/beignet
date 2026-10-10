@@ -6542,6 +6542,68 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		}
 	});
 
+	it('a restart without a saved monitor re-drives the close despite its funding marker', async function () {
+		const t = await driveNonLeaseOpen(1525, 1526, [makeWalletInput(200_000)]);
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		let restarted: LightningNode | undefined;
+		try {
+			const idHex = t.channelId.toString('hex');
+			const txidHex = Buffer.from(t.attempt0Txid).reverse().toString('hex');
+			managerOf(t.opener).handlePeerDisconnected(t.acceptor.getNodeId());
+			managerOf(t.opener).handleFundingConfirmed(t.channelId, txidHex);
+			expect(t.channel.getFullState().v2InFlight!.confirmed).to.equal(true);
+
+			// The terminal row can survive a crash before its monitor is saved.
+			t.opener.once('channel:closed', () => {
+				storage.saveChannel(
+					idHex,
+					t.channel.getFullState(),
+					t.acceptor.getNodeId()
+				);
+			});
+			let originalClose!: Buffer;
+			t.opener.once('broadcast:tx', (tx: Buffer) => {
+				originalClose = Buffer.from(tx);
+			});
+			const closed = t.opener.forceCloseChannel(
+				t.channelId,
+				bitcoin.payments.p2wpkh({ hash: crypto.randomBytes(20) }).output!
+			);
+			expect(closed.ok, closed.error).to.equal(true);
+			const row = storage.loadChannel(idHex)!.state;
+			expect(row.closeSpendsFundingTxid?.equals(t.attempt0Txid)).to.equal(true);
+			expect(storage.loadChainMonitor(idHex)).to.equal(null);
+			t.opener.destroy();
+
+			const broadcasts: Buffer[] = [];
+			const backend: IChainBackend = new ScriptedChainBackend();
+			backend.broadcastTransaction = async (txHex: string): Promise<string> => {
+				const tx = bitcoin.Transaction.fromHex(txHex);
+				broadcasts.push(tx.toBuffer());
+				return tx.getId();
+			};
+			restarted = new LightningNode(
+				makeNodeConfig(1525, { storage, chainBackend: backend })
+			);
+			restarted.on('node:error', () => {});
+			expect(managerOf(restarted).getMonitor(t.channelId)).to.equal(undefined);
+			managerOf(restarted).handleFundingConfirmed(t.channelId, txidHex);
+			(
+				restarted as unknown as {
+					onFundingWatchConfirmed(id: Buffer, txid?: string): void;
+				}
+			).onFundingWatchConfirmed(t.channelId, txidHex);
+			await settle(() => broadcasts.length > 0);
+			expect(broadcasts).to.deep.equal([originalClose]);
+		} finally {
+			restarted?.destroy();
+			t.opener.destroy();
+			t.acceptor.destroy();
+			storage.close();
+		}
+	});
+
 	it('rbfOpenChannelV2 validates u32 inputs before touching the channel (issue 360 review)', async function () {
 		const t = await driveSpecWindowRbf(111, 112);
 		try {
