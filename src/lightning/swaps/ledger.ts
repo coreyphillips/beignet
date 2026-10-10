@@ -214,7 +214,7 @@ export interface ISwapRecord extends ILedgerRecord {
 	settledAt?: number;
 	/** Set once nothing of the hold is left parked. */
 	holdCancelledAt?: number;
-	/** Set alone while a refused cancel is still owed. */
+	/** Set alone while a cancel is still owed. */
 	holdCancelReason?: string;
 	failureReason?: string;
 	lastError?: string;

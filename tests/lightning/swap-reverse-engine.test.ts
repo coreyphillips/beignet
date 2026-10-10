@@ -1819,6 +1819,73 @@ describe('Reverse swap provider engine (issue #737)', function () {
 			expect(h2.holds.forgotten).to.deep.equal([hashHex, hashHex]);
 			expect(h2.holds.invoices.has(hashHex)).to.equal(false);
 		});
+
+		for (const [ending, reason] of [
+			['CANCELLED', 'invoice_expired'],
+			['FAILED', 'funding_rejected']
+		] as const) {
+			it(`a crash between the move to ${ending} and the hold cancel leaves the cancel owed (issue #1499)`, async function () {
+				const checkpoints: ISwapRecord[] = [];
+				let asked = 0;
+				const h: ISwapHarness = await harness({
+					config: { terminalRetentionBlocks: 10 },
+					deps: {
+						// The process dies inside the first cancel call, with the
+						// store holding the row as the terminal move left it.
+						cancelHold: (hash) => {
+							asked++;
+							if (asked > 1) return h.holds.cancelHold(hash);
+							const [row] = h.ledger.byPaymentHash(hash.toString('hex'));
+							checkpoints.push(h.store.load(row.id)!);
+							throw new Error('process died');
+						}
+					}
+				});
+				const swap = clientSwap();
+				const hashHex = swap.paymentHash.toString('hex');
+				await create(h, swap);
+				const r = record(h, swap);
+				if (ending === 'CANCELLED') {
+					h.holds.hold(swap.paymentHash, 1_000n, r.refundHeight + 5000);
+					await settle();
+					h.ledger.patch(r.id, { invoiceExpiresAt: 1 });
+					await h.engine.onBlock(1001);
+				} else {
+					h.wallet.shortBy = 1n;
+					h.holds.hold(
+						swap.paymentHash,
+						BigInt(r.invoiceMsat),
+						r.refundHeight + 5000
+					);
+					await settle();
+				}
+				expect(checkpoints).to.have.length(1);
+				const [checkpoint] = checkpoints;
+				expect(checkpoint.state).to.equal(ending);
+				expect(checkpoint.holdCancelReason).to.equal(reason);
+				expect(checkpoint.holdCancelledAt).to.equal(undefined);
+				h.store.put(checkpoint);
+
+				// The restart asks again; refused, the row outlives retention.
+				h.holds.cancelRefused = true;
+				let h2 = await h.restart();
+				expect(asked).to.equal(2);
+				await h2.engine.onBlock(r.refundHeight + 10);
+				expect(h2.ledger.get(r.id)!.holdCancelledAt).to.equal(undefined);
+				expect(h2.holds.parts.get(hashHex)).to.have.length(1);
+
+				h2.holds.cancelRefused = false;
+				h2 = await h2.restart();
+				expect(asked).to.equal(3);
+				expect(h2.holds.cancelled).to.deep.equal([hashHex]);
+				const done = h2.ledger.get(r.id)!;
+				expect(done.holdCancelledAt).to.be.a('number');
+				expect(done.holdCancelReason).to.equal(reason);
+				expect(h2.holds.forgotten).to.deep.equal([hashHex]);
+				await h2.engine.onBlock(r.refundHeight + 11);
+				expect(h2.ledger.get(r.id)).to.equal(undefined);
+			});
+		}
 	});
 
 	describe('retention (issue #1387)', function () {

@@ -319,8 +319,10 @@ const HOLD_CLTV_PADDING = 8;
 
 /**
  * An ended swap whose hold cancel has not landed: REFUNDED before its
- * cancel ran, or a cancel refused with parts still parked, which
- * cancelHoldFor marks with its reason alone.
+ * cancel ran, or a row carrying the cancel's reason alone. A move to
+ * CANCELLED or FAILED that cancels the hold writes that reason with the
+ * state, so a crash before the cancel still leaves it owed; cancelHoldFor
+ * writes it on a refusal.
  */
 function owesHoldCancel(record: ISwapRecord): boolean {
 	return (
@@ -536,7 +538,8 @@ export class ReverseSwapProvider extends EventEmitter {
 			return { ok: false, reason: `swap is ${record.state}` };
 		}
 		const moved = this.deps.ledger.move(swapIdHex, 'CANCELLED', {
-			failureReason: 'operator cancel'
+			failureReason: 'operator cancel',
+			holdCancelReason: 'operator'
 		});
 		if (moved.outcome !== 'applied') {
 			return { ok: false, reason: `ledger ${moved.outcome}` };
@@ -1231,7 +1234,8 @@ export class ReverseSwapProvider extends EventEmitter {
 		if (!record.bolt11) {
 			// Crashed between the insert and the invoice.
 			const moved = this.deps.ledger.move(record.id, 'FAILED', {
-				failureReason: 'no hold invoice was recorded'
+				failureReason: 'no hold invoice was recorded',
+				holdCancelReason: 'no_invoice'
 			});
 			if (moved.outcome === 'applied') {
 				this.cancelHoldFor(record.id, 'no_invoice');
@@ -1259,7 +1263,8 @@ export class ReverseSwapProvider extends EventEmitter {
 				this.now() > record.invoiceExpiresAt * 1000
 			) {
 				const moved = this.deps.ledger.move(record.id, 'CANCELLED', {
-					failureReason: 'invoice expired unpaid'
+					failureReason: 'invoice expired unpaid',
+					holdCancelReason: 'invoice_expired'
 				});
 				if (moved.outcome === 'applied') {
 					this.cancelHoldFor(record.id, 'invoice_expired');
@@ -1274,7 +1279,8 @@ export class ReverseSwapProvider extends EventEmitter {
 		const refusal = this.admissionProblem(record, snapshot, height);
 		if (refusal) {
 			const moved = this.deps.ledger.move(record.id, 'CANCELLED', {
-				failureReason: refusal
+				failureReason: refusal,
+				holdCancelReason: 'admission_refused'
 			});
 			if (moved.outcome === 'applied') {
 				this.cancelHoldFor(record.id, 'admission_refused');
@@ -1416,7 +1422,8 @@ export class ReverseSwapProvider extends EventEmitter {
 		if (!current.fundingTxHex) {
 			if (current.fundingAttempts >= this.config.maxFundingAttempts) {
 				const moved = this.deps.ledger.move(current.id, 'FAILED', {
-					failureReason: `funding could not be built after ${current.fundingAttempts} attempts`
+					failureReason: `funding could not be built after ${current.fundingAttempts} attempts`,
+					holdCancelReason: 'funding_failed'
 				});
 				if (moved.outcome === 'applied') {
 					this.cancelHoldFor(current.id, 'funding_failed');
@@ -1462,7 +1469,8 @@ export class ReverseSwapProvider extends EventEmitter {
 				this.deps.log('swap_funding_rejected', { swapId: current.id, problem });
 				await this.release(built.txHex);
 				const moved = this.deps.ledger.move(current.id, 'FAILED', {
-					failureReason: problem
+					failureReason: problem,
+					holdCancelReason: 'funding_rejected'
 				});
 				if (moved.outcome === 'applied') {
 					this.cancelHoldFor(current.id, 'funding_rejected');
@@ -1518,7 +1526,8 @@ export class ReverseSwapProvider extends EventEmitter {
 			const problem = this.broadcastProblem(current);
 			if (problem) {
 				const moved = this.deps.ledger.move(current.id, 'FAILED', {
-					failureReason: `broadcast refused: ${problem}`
+					failureReason: `broadcast refused: ${problem}`,
+					holdCancelReason: 'broadcast_refused'
 				});
 				if (moved.outcome === 'applied') {
 					await this.dropUnsentFunding(moved.record!);
