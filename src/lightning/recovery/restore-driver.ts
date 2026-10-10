@@ -963,18 +963,58 @@ export class RestoreDriver {
 	}
 
 	/**
+	 * Whether a takeover past this attempt may hold a quorum that the heads
+	 * read cannot show: some head is past the attempt, and the members past
+	 * it plus those without a head could make up a quorum. A missing signer
+	 * hides the bundle superseded() counts.
+	 */
+	private mayBeSuperseded(
+		attempt: IPendingAttempt,
+		readings: IHeadReading[],
+		stale: IHeadReading[]
+	): boolean {
+		const heads = [...readings, ...stale];
+		const past = (reading: IHeadReading): boolean =>
+			reading.state.lease.epoch > attempt.newEpoch ||
+			(reading.state.lease.epoch === attempt.newEpoch &&
+				!reading.state.lease.writerPublicKey.equals(attempt.writer.publicKey));
+		if (!heads.some(past)) return false;
+		const ruledOut = new Set(
+			heads
+				.filter((reading) => !past(reading))
+				.map((reading) => reading.guardianId.toString('hex'))
+		);
+		return (
+			this.config.context.members.filter(
+				(member) => !ruledOut.has(member.toString('hex'))
+			).length >= this.config.required
+		);
+	}
+
+	/**
 	 * Fresh heads when a quorum fenced the attempt after the heads its
 	 * evidence came from were read, otherwise null. A guardian answers a
 	 * repeated ACQUIRE with the certificate and receipt it stored, even
 	 * after a later takeover moved it on, and a split grant is assembled
 	 * from heads read before its repair, so neither shows that takeover.
+	 * Refuses, keeping the attempt, while that takeover may have a quorum
+	 * the reachable heads cannot prove: abandoning it could strand an epoch
+	 * the takeover never won, and promoting it could install a fenced lease.
 	 */
 	private async fencedSince(
 		attempt: IPendingAttempt
 	): Promise<{ readings: IHeadReading[]; stale: IHeadReading[] } | null> {
 		const fresh = await this.readHeads();
 		this.assertNoConflict(fresh.readings, fresh.stale);
-		return this.superseded(attempt, fresh.readings, fresh.stale) ? fresh : null;
+		if (this.superseded(attempt, fresh.readings, fresh.stale)) return fresh;
+		if (this.mayBeSuperseded(attempt, fresh.readings, fresh.stale)) {
+			throw new RestoreRefusedError(
+				'no-quorum',
+				`a guardian is past epoch ${attempt.newEpoch}, and that takeover may hold ` +
+					'a quorum whose certificates are not all reachable; keeping the acquisition'
+			);
+		}
+		return null;
 	}
 
 	/** A guardian that granted this attempt and has not moved past it. */
