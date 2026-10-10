@@ -803,6 +803,17 @@ export class ChannelManager extends EventEmitter {
 	 */
 	private _verifiedPeerInputs = new WeakMap<Channel, Set<string>>();
 	/**
+	 * Numbers standing in for the channel and session a pending peer input
+	 * check must still find when its verdict lands (issue #1500). Holding the
+	 * objects instead would keep a dropped negotiation's builder, prev_txs
+	 * included, alive outside the node-wide budget until the backend answers.
+	 */
+	private _peerInputCheckIds = new WeakMap<
+		Channel | DualFundingSession,
+		number
+	>();
+	private _nextPeerInputCheckId = 0;
+	/**
 	 * Channels whose funding pledges were already released (issue #311 for
 	 * v2 opens, issue #412 for v1). Several terminal sites can fire for one
 	 * death (an ERROR action in the teardown batch plus the tx_abort
@@ -8341,8 +8352,14 @@ export class ChannelManager extends EventEmitter {
 		if (!session || session.getState() !== DualFundingState.TX_NEGOTIATION) {
 			return;
 		}
-		// A prev_tx the channel already rejected (unparseable, vout out of
-		// range) never reaches the builder; nothing to verify.
+		// Only an input the builder kept is worth a query: a rejected one (bad
+		// prev_tx, over budget, duplicate serial) is already failing the
+		// negotiation (issue #1500).
+		const kept = session
+			.getTxBuilder()
+			?.getSession()
+			.inputs.get(msg.serialId.toString());
+		if (!kept || kept.prevTx !== msg.prevTx) return;
 		let prevTx: bitcoin.Transaction;
 		try {
 			prevTx = bitcoin.Transaction.fromBuffer(msg.prevTx);
@@ -8351,7 +8368,8 @@ export class ChannelManager extends EventEmitter {
 		}
 		const vout = msg.prevTxVout;
 		if (!prevTx.outs[vout]) return;
-		const txid = Buffer.from(prevTx.getHash());
+		const txid = Buffer.alloc(32);
+		prevTx.getHash().copy(txid);
 		const key = `${txid.toString('hex')}:${vout}`;
 		let seen = this._verifiedPeerInputs.get(channel);
 		if (!seen) {
@@ -8360,14 +8378,23 @@ export class ChannelManager extends EventEmitter {
 		}
 		if (seen.has(key)) return;
 		seen.add(key);
-		void verify({ txid, vout, scriptPubKey: prevTx.outs[vout].script })
+		// The query can outlive the negotiation. Unpooled copies avoid retaining
+		// prev_tx views or shared slabs. No closure here may capture msg, channel
+		// or session: V8 shares one context among a function's closures (issue #1500).
+		const channelId = Buffer.alloc(msg.channelId.length);
+		msg.channelId.copy(channelId);
+		const channelCheckId = this._peerInputCheckId(channel);
+		const sessionCheckId = this._peerInputCheckId(session);
+		const scriptPubKey = Buffer.alloc(prevTx.outs[vout].script.length);
+		prevTx.outs[vout].script.copy(scriptPubKey);
+		void verify({ txid, vout, scriptPubKey })
 			.then((verdict) =>
 				this.applyPeerInputVerdict(
 					verdict,
 					peerPubkey,
-					channel,
-					session,
-					msg.channelId,
+					channelId,
+					channelCheckId,
+					sessionCheckId,
 					txid,
 					vout
 				)
@@ -8375,6 +8402,15 @@ export class ChannelManager extends EventEmitter {
 			.catch(() => {
 				// Verification failure is 'unknown': fail open.
 			});
+	}
+
+	private _peerInputCheckId(target: Channel | DualFundingSession): number {
+		let id = this._peerInputCheckIds.get(target);
+		if (id === undefined) {
+			id = ++this._nextPeerInputCheckId;
+			this._peerInputCheckIds.set(target, id);
+		}
+		return id;
 	}
 
 	/**
@@ -8388,9 +8424,9 @@ export class ChannelManager extends EventEmitter {
 	private applyPeerInputVerdict(
 		verdict: 'unspent' | 'spent-or-missing' | 'unknown',
 		peerPubkey: string,
-		channel: Channel,
-		session: DualFundingSession,
 		channelId: Buffer,
+		channelCheckId: number,
+		sessionCheckId: number,
 		txid: Buffer,
 		vout: number
 	): void {
@@ -8398,11 +8434,13 @@ export class ChannelManager extends EventEmitter {
 		// Instance identity: the id must still resolve to this very object,
 		// registered to this very peer. A disconnect plus a same-id retry
 		// replaces the instance; a late verdict must not touch its successor.
-		const found =
+		const channel =
 			this.findChannelByChannelId(channelId) ||
 			this.findChannelByChannelIdInTemp(channelId) ||
 			this.findTempChannel(channelId);
-		if (found !== channel) return;
+		if (!channel || this._peerInputCheckIds.get(channel) !== channelCheckId) {
+			return;
+		}
 		const idHex = channelId.toString('hex');
 		const registeredPeer = this.channelPeers.get(idHex);
 		if (registeredPeer !== undefined && registeredPeer !== peerPubkey) return;
@@ -8414,7 +8452,10 @@ export class ChannelManager extends EventEmitter {
 		if (channel.getState() === ChannelState.AWAITING_REESTABLISH) return;
 		// Session identity: a peer abort or completed open nulls or replaces
 		// the session.
-		if (channel.getDualFundingSession() !== session) return;
+		const session = channel.getDualFundingSession();
+		if (!session || this._peerInputCheckIds.get(session) !== sessionCheckId) {
+			return;
+		}
 		// The outpoint must still be contributed. RBF resets the builder
 		// inside the SAME session object, so builder membership, not session
 		// identity, is the staleness guard for a renegotiated attempt.
