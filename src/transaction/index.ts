@@ -573,7 +573,7 @@ export class Transaction {
 							?.address
 				};
 			}
-			const changeAddress = transaction.changeAddress;
+			let changeAddress = transaction.changeAddress;
 
 			let inputs = transaction.inputs || [];
 			const outputs = transaction.outputs || [];
@@ -609,7 +609,7 @@ export class Transaction {
 			}
 
 			//No need for a change address when draining the wallet
-			const pricesChange = !!changeAddress && !transaction.max;
+			let pricesChange = !!changeAddress && !transaction.max;
 
 			//Determine the address type of each address and construct the object for fee calculation
 			const inputAddresses = inputs.map((input) => input.address);
@@ -661,18 +661,11 @@ export class Transaction {
 				fee: Math.ceil(transactionByteCount * satsPerByte)
 			});
 			if (generatedChange) {
-				// Consolidate keeps the inputs already selected above.
-				return this.getTotalFeeObj({
-					satsPerByte,
-					message,
-					transaction: {
-						...transaction,
-						inputs,
-						changeAddress: generatedChange
-					},
-					fundingLightning,
-					coinSelectPreference: ECoinSelectPreference.consolidate
-				});
+				// Priced on the inputs already selected above. Recursing with
+				// consolidate would hide from the half-balance guard below that a
+				// lower rate selects its own coins.
+				changeAddress = generatedChange;
+				pricesChange = true;
 			}
 			const inputAmount = this.getTransactionInputValue({ inputs });
 			const outputAmount = this.getTransactionOutputValue({ outputs });
