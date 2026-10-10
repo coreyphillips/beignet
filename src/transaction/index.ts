@@ -548,8 +548,9 @@ export class Transaction {
 	 */
 	getTotalFeeObj = ({
 		satsPerByte = this._wallet.feeEstimates.normal,
-		message = '',
 		transaction = this.data,
+		// updateFee prices the staged message, so the quote must too.
+		message = transaction.message ?? '',
 		fundingLightning = false,
 		coinSelectPreference = this._wallet.coinSelectPreference
 	}: {
