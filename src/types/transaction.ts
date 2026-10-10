@@ -15,6 +15,9 @@ export interface ICreateTransaction {
 	transactionData?: ISendTransaction;
 	shuffleOutputs?: boolean;
 	runCoinSelect?: boolean;
+	/** Signs staged inputs that are frozen, for a caller that froze them to
+	 *  reserve them for this send. */
+	spendFrozen?: boolean;
 }
 
 export interface IAddInput {

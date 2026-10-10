@@ -463,7 +463,9 @@ describe('UTXO freeze/unfreeze', function () {
 				spendFrozen: true
 			});
 			if (reserved.isErr()) throw reserved.error;
-			const created = await wallet.transaction.createTransaction({});
+			const created = await wallet.transaction.createTransaction({
+				spendFrozen: true
+			});
 			if (created.isErr()) throw created.error;
 			const decoded = decodeRawTransaction(created.value.hex, wallet.network);
 			if (decoded.isErr()) throw decoded.error;
@@ -472,6 +474,90 @@ describe('UTXO freeze/unfreeze', function () {
 			for (const utxo of [utxoA, utxoB]) {
 				await wallet.unfreezeUtxo({ txid: utxo.tx_hash, index: utxo.tx_pos });
 			}
+			await wallet.resetSendTransaction();
+		}
+	});
+
+	it('signs no coin frozen while max was on once max is turned off (#1494)', async () => {
+		await wallet.resetSendTransaction();
+		const staged = await wallet.transaction.setupTransaction();
+		if (staged.isErr()) throw staged.error;
+		const on = await wallet.transaction.sendMax({
+			address: 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk',
+			satsPerByte: 2
+		});
+		if (on.isErr()) throw on.error;
+		const frozen = await wallet.freezeUtxo({
+			txid: utxoB.tx_hash,
+			index: utxoB.tx_pos
+		});
+		if (frozen.isErr()) throw frozen.error;
+		try {
+			const off = await wallet.transaction.sendMax({
+				address: 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk',
+				satsPerByte: 2
+			});
+			if (off.isErr()) throw off.error;
+			expect(wallet.transaction.data.max).to.equal(false);
+			const created = await wallet.transaction.createTransaction({});
+			expect(created.isErr()).to.equal(true);
+			if (created.isErr()) {
+				expect(created.error.message).to.equal(
+					`Staged input ${utxoB.tx_hash}:${utxoB.tx_pos} is frozen.`
+				);
+			}
+		} finally {
+			await wallet.unfreezeUtxo({ txid: utxoB.tx_hash, index: utxoB.tx_pos });
+			await wallet.resetSendTransaction();
+		}
+	});
+
+	it('signs no coin frozen after staging in a plain send (#1494)', async () => {
+		await wallet.resetSendTransaction();
+		const staged = await wallet.transaction.setupTransaction();
+		if (staged.isErr()) throw staged.error;
+		const output = wallet.transaction.updateSendTransaction({
+			transaction: {
+				outputs: [
+					{
+						address: 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk',
+						value: 30000,
+						index: 0
+					}
+				]
+			}
+		});
+		if (output.isErr()) throw output.error;
+		const fee = wallet.transaction.updateFee({ satsPerByte: 2 });
+		if (fee.isErr()) throw fee.error;
+		expect(wallet.transaction.data.inputs).to.have.length(2);
+		const frozen = await wallet.freezeUtxo({
+			txid: utxoB.tx_hash,
+			index: utxoB.tx_pos
+		});
+		if (frozen.isErr()) throw frozen.error;
+		try {
+			const created = await wallet.transaction.createTransaction({});
+			expect(created.isErr()).to.equal(true);
+			if (created.isErr()) {
+				expect(created.error.message).to.equal(
+					`Staged input ${utxoB.tx_hash}:${utxoB.tx_pos} is frozen.`
+				);
+			}
+
+			// A caller that froze the coin to reserve it for this send.
+			const reserved = await wallet.transaction.createTransaction({
+				spendFrozen: true
+			});
+			if (reserved.isErr()) throw reserved.error;
+			const decoded = decodeRawTransaction(reserved.value.hex, wallet.network);
+			if (decoded.isErr()) throw decoded.error;
+			expect(decoded.value.vin.map((vin) => vin.txid).sort()).to.deep.equal([
+				utxoA.tx_hash,
+				utxoB.tx_hash
+			]);
+		} finally {
+			await wallet.unfreezeUtxo({ txid: utxoB.tx_hash, index: utxoB.tx_pos });
 			await wallet.resetSendTransaction();
 		}
 	});
