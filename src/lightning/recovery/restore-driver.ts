@@ -816,11 +816,17 @@ export class RestoreDriver {
 		// set recovers, even though their word never counted as recency.
 		for (const reading of [...readings, ...stale]) {
 			if (statesEqual(reading.state, target.state)) continue;
-			if (reading.state.lease.epoch < target.state.lease.epoch) {
-				const bundle = forEpoch(target.state.lease.epoch);
-				if (bundle.length >= this.config.required) {
-					await reading.client.syncEpoch(bundle);
-				}
+			const bundle =
+				reading.state.lease.epoch < target.state.lease.epoch
+					? forEpoch(target.state.lease.epoch)
+					: [];
+			// SYNC_EPOCH needs the head the epoch was granted over, so a
+			// guardian below it takes the epoch after the backfill instead.
+			const belowGrant =
+				bundle.length >= this.config.required &&
+				reading.state.logHead.sequence < certifiedBy(bundle).logHead.sequence;
+			if (bundle.length >= this.config.required && !belowGrant) {
+				await reading.client.syncEpoch(bundle);
 			}
 			if (reading.state.logHead.sequence < target.state.logHead.sequence) {
 				const missing = await this.downloadRecords(
@@ -845,6 +851,7 @@ export class RestoreDriver {
 					}
 				}
 			}
+			if (belowGrant) await reading.client.syncEpoch(bundle);
 			const after = await reading.client.getHead(
 				this.config.recoveryRoot.recoveryId
 			);
