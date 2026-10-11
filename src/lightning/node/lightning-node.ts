@@ -10463,7 +10463,7 @@ export class LightningNode extends EventEmitter {
 			// monitor, replay must still recover a close that never reached the chain.
 			if (
 				!this.channelManager.getMonitor(channelId) ||
-				!state.closeSpendsFundingTxid?.equals(state.v2InFlight.fundingTxid)
+				!this.v2CloseSpendsConfirmedFunding(channelId)
 			) {
 				void this.redriveSpliceAdoptedClose(channelId);
 			}
@@ -13476,6 +13476,42 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Whether the close this v2 channel broadcast spends the funding its
+	 * confirmed record names (issue #1523), so no adoption awaits a re-drive.
+	 *
+	 * A row written before `closeSpendsFundingTxid` existed has no marker, and
+	 * once its close is mined nothing rebuilds the plan that would write one
+	 * (issue #1547). The monitor holds the evidence instead: our own
+	 * commitment, reported spending that exact funding outpoint. The marker
+	 * is recovered from it and persisted. A close on a superseded attempt
+	 * names another outpoint and still re-drives.
+	 */
+	private v2CloseSpendsConfirmedFunding(channelId: Buffer): boolean {
+		const channel = this.channelManager.getChannel(channelId);
+		const state = channel?.getFullState();
+		const record = state?.v2InFlight;
+		if (!channel || !state || record?.confirmed !== true) return false;
+		if (state.closeSpendsFundingTxid) {
+			return state.closeSpendsFundingTxid.equals(record.fundingTxid);
+		}
+		const broadcast = this.channelManager.getMonitor(channelId)?.getFullState()
+			.commitmentBroadcast;
+		const spent = broadcast?.spentOutpoint;
+		if (
+			broadcast?.commitmentType !== CommitmentType.OUR_COMMITMENT ||
+			spent?.txid !==
+				Buffer.from(record.fundingTxid).reverse().toString('hex') ||
+			spent.outputIndex !== record.fundingOutputIndex
+		) {
+			return false;
+		}
+		if (channel.recoverCloseSpendsFunding(record.fundingTxid)) {
+			this.persistChannel(channelId);
+		}
+		return true;
+	}
+
+	/**
 	 * Issue #357: a splice that confirms on a FORCE_CLOSED channel voids the
 	 * old-funding commitment we broadcast (both spend the old funding
 	 * outpoint), and until now only an operator rebroadcastClose re-planned
@@ -13520,9 +13556,11 @@ export class LightningNode extends EventEmitter {
 					chState?.spliceInFlight?.confirmedHeight !== undefined ||
 					chState?.closeSpendsSpliceTxid != null ||
 					// A v2 RBF candidate adoption (issue #360) re-drives on the
-					// same machinery and retries the same way.
+					// same machinery and retries the same way, unless the close
+					// already spends the confirmed funding and nothing awaits.
 					(chState?.fundingVersion === 2 &&
-						chState.v2InFlight?.confirmed === true);
+						chState.v2InFlight?.confirmed === true &&
+						!this.v2CloseSpendsConfirmedFunding(channelId));
 				if (rebuilt.retryable === true && confirmedAdoption) {
 					this._pendingSpliceCloseRedrives.add(idHex);
 				}

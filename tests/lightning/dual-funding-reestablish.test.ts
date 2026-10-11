@@ -6542,6 +6542,241 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		}
 	});
 
+	/**
+	 * A FORCE_CLOSED v2 open whose current attempt confirmed and whose close
+	 * was mined at height 300, restarted from a row that omits
+	 * closeSpendsFundingTxid as storage from before the field does. The
+	 * funding confirmation is replayed on the restarted node, in the
+	 * watcher's order.
+	 */
+	async function restartLegacyMinedClose(
+		seedA: number,
+		seedB: number,
+		reportOutpoint: boolean
+	): Promise<{
+		opener: LightningNode;
+		acceptor: LightningNode;
+		storage: SqliteStorage;
+		channelId: Buffer;
+		fundingTxid: Buffer;
+		reportSpend: (node: LightningNode) => void;
+		actions: string[];
+	}> {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-close-spends-1547-'));
+		const dbPath = path.join(dir, 'opener.db');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const opener1 = new LightningNode(
+			makeNodeConfig(seedA, {
+				storage: storage1,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(seedB));
+		opener1.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		wireNodes(opener1, acceptor);
+		const channel = opener1.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 100_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(
+			() =>
+				channel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED &&
+				!!channel.getFullState().v2InFlight?.fullySigned
+		);
+		const channelId = channel.getChannelId()!;
+		const idHex = channelId.toString('hex');
+		const record = channel.getFullState().v2InFlight!;
+		const fundingTxid = Buffer.from(record.fundingTxid);
+		const txidHex = Buffer.from(fundingTxid).reverse().toString('hex');
+
+		managerOf(opener1).handlePeerDisconnected(acceptor.getNodeId());
+		managerOf(opener1).handleFundingConfirmed(channelId, txidHex);
+		expect(channel.getFullState().v2InFlight!.confirmed).to.equal(true);
+		const dest = bitcoin.payments.p2wpkh({
+			hash: crypto.randomBytes(20)
+		}).output!;
+		const closed = opener1.forceCloseChannel(channelId, dest);
+		expect(closed.ok, closed.error).to.equal(true);
+		const rebuilt = managerOf(opener1).rebuildForceCloseCommitment(
+			channelId,
+			5
+		);
+		expect(rebuilt.ok, rebuilt.error).to.equal(true);
+		const closeTx = bitcoin.Transaction.fromBuffer(rebuilt.tx!);
+		expect(closeTx.getId()).to.equal(closed.commitmentTxid);
+
+		// The funding watch names the outpoint it saw spent. A monitor row
+		// from before it did has none.
+		const reportSpend = (node: LightningNode, withOutpoint = true): void => {
+			managerOf(node).handleFundingSpent(
+				channelId,
+				closeTx,
+				300,
+				dest,
+				10,
+				undefined,
+				undefined,
+				undefined,
+				withOutpoint
+					? { txid: txidHex, outputIndex: record.fundingOutputIndex }
+					: undefined
+			);
+		};
+		reportSpend(opener1, reportOutpoint);
+		expect(
+			managerOf(opener1).getMonitor(channelId)!.isCommitmentConfirmed()
+		).to.equal(true);
+		opener1.destroy();
+
+		const storage = new SqliteStorage(dbPath);
+		storage.open();
+		const saved = storage.loadChannel(idHex)!;
+		delete saved.state.closeSpendsFundingTxid;
+		storage.saveChannel(idHex, saved.state, saved.peerPubkey);
+		const opener = new LightningNode(
+			makeNodeConfig(seedA, { storage, recovery: { enabled: true } })
+		);
+		opener.on('node:error', () => {});
+		const actions: string[] = [];
+		opener.on('log', (log: { action: string }) => actions.push(log.action));
+		const restored = managerOf(opener).getChannel(channelId)!;
+		expect(restored.getState()).to.equal(ChannelState.FORCE_CLOSED);
+		expect(restored.getFullState().closeSpendsFundingTxid).to.equal(undefined);
+		expect(managerOf(opener).getMonitor(channelId)!.isCommitmentConfirmed()).to
+			.be.true;
+
+		managerOf(opener).handleFundingConfirmed(channelId, txidHex);
+		(
+			opener as unknown as {
+				onFundingWatchConfirmed(id: Buffer, txid?: string): void;
+			}
+		).onFundingWatchConfirmed(channelId, txidHex);
+		return {
+			opener,
+			acceptor,
+			storage,
+			channelId,
+			fundingTxid,
+			reportSpend,
+			actions
+		};
+	}
+
+	const redriveQueued = (node: LightningNode, channelId: Buffer): boolean =>
+		(
+			node as unknown as { _pendingSpliceCloseRedrives: Set<string> }
+		)._pendingSpliceCloseRedrives.has(channelId.toString('hex'));
+
+	it('a legacy row without the funding marker recovers it from its mined close and re-drives nothing (issue 1547)', async function () {
+		const t = await restartLegacyMinedClose(1547, 1548, true);
+		try {
+			t.opener.handleNewBlock(301);
+			t.opener.handleNewBlock(302);
+			await neverSettles(
+				() => t.actions.some((a) => a.startsWith('splice_close_redrive')),
+				100
+			);
+			expect(redriveQueued(t.opener, t.channelId)).to.equal(false);
+			expect(
+				t.storage
+					.loadChannel(t.channelId.toString('hex'))!
+					.state.closeSpendsFundingTxid?.equals(t.fundingTxid),
+				'the recovered marker is durable'
+			).to.equal(true);
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
+
+	it('a legacy close retry stops once the monitor learns the outpoint its close spent (issue 1547)', async function () {
+		const t = await restartLegacyMinedClose(1551, 1552, false);
+		try {
+			// No evidence names the outpoint yet, so the replay re-drives, is
+			// refused on the mined close, and waits for the next block.
+			const refusals = (): number =>
+				t.actions.filter((a) => a === 'splice_close_redrive_refused').length;
+			await settle(() => refusals() === 1);
+			expect(redriveQueued(t.opener, t.channelId)).to.equal(true);
+
+			// The re-armed watch reports the spend again, naming its outpoint.
+			t.reportSpend(t.opener);
+			t.opener.handleNewBlock(301);
+			await settle(() => refusals() === 2);
+			expect(redriveQueued(t.opener, t.channelId)).to.equal(false);
+			t.opener.handleNewBlock(302);
+			await neverSettles(() => refusals() > 2, 100);
+			expect(
+				t.storage
+					.loadChannel(t.channelId.toString('hex'))!
+					.state.closeSpendsFundingTxid?.equals(t.fundingTxid)
+			).to.equal(true);
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
+
+	it('a legacy row whose close spends a superseded attempt still re-drives onto the adopted one (issue 1547)', async function () {
+		const t = await driveSpecWindowRbf(1549, 1550);
+		try {
+			const dest = bitcoin.payments.p2wpkh({
+				hash: crypto.randomBytes(20)
+			}).output!;
+			const closed = t.opener.forceCloseChannel(t.channelId, dest);
+			expect(closed.ok, closed.error).to.equal(true);
+			const rebuilt = managerOf(t.opener).rebuildForceCloseCommitment(
+				t.channelId,
+				5
+			);
+			expect(rebuilt.ok, rebuilt.error).to.equal(true);
+			const closeTx = bitcoin.Transaction.fromBuffer(rebuilt.tx!);
+			expect(Buffer.from(closeTx.ins[0].hash).equals(t.attempt1Txid)).to.be
+				.true;
+
+			// The monitor has seen our close on attempt 1, and the row carries
+			// no marker, as one written before the field would not.
+			managerOf(t.opener).handleFundingSpent(
+				t.channelId,
+				closeTx,
+				0,
+				dest,
+				10,
+				undefined,
+				undefined,
+				undefined,
+				{
+					txid: Buffer.from(t.attempt1Txid).reverse().toString('hex'),
+					outputIndex: closeTx.ins[0].index
+				}
+			);
+			delete t.channel.getFullState().closeSpendsFundingTxid;
+			const actions: string[] = [];
+			t.opener.on('log', (log: { action: string }) => actions.push(log.action));
+
+			const oldTxidHex = Buffer.from(t.attempt0Txid).reverse().toString('hex');
+			managerOf(t.opener).handleFundingConfirmed(t.channelId, oldTxidHex);
+			(
+				t.opener as unknown as {
+					onFundingWatchConfirmed(id: Buffer, txid?: string): void;
+				}
+			).onFundingWatchConfirmed(t.channelId, oldTxidHex);
+			await settle(() => actions.includes('splice_close_redriven'));
+			const st = t.channel.getFullState();
+			expect(st.fundingTxid!.equals(t.attempt0Txid)).to.be.true;
+			expect(
+				st.closeSpendsFundingTxid?.equals(t.attempt0Txid),
+				'the re-drive moved the close onto the adopted funding'
+			).to.equal(true);
+		} finally {
+			t.opener.destroy();
+			t.acceptor.destroy();
+		}
+	});
+
 	it('a restart without a saved monitor re-drives the close despite its funding marker', async function () {
 		const t = await driveNonLeaseOpen(1525, 1526, [makeWalletInput(200_000)]);
 		const storage = new SqliteStorage(':memory:');
