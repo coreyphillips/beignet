@@ -290,10 +290,9 @@ describe('fee estimation defects', function () {
 
 			if (res.isErr()) throw res.error;
 			expect(res.value.inputs.length).to.equal(1);
-			// autoCoinSelect calls getByteCount without a minByteCount, so the
-			// default 166 vB floor applies to a selection this small.
+			// Priced at its 141 vB, not getByteCount's default 166 vB floor (#1579).
 			expect(res.value.fee).to.equal(
-				getByteCount({ P2WPKH: 1 }, { P2WPKH: 2 }, '') * satsPerByte
+				getByteCount({ P2WPKH: 1 }, { P2WPKH: 2 }, '', 0) * satsPerByte
 			);
 		});
 	});
@@ -343,9 +342,9 @@ describe('fee estimation defects', function () {
 
 		it('credits the parent fee at its value in sats', async function () {
 			// Parent: 200 vB, 1000 sats of fee. The stubbed setup stages no
-			// inputs, so the child is sized at getByteCount's 166 vB minimum.
-			// (10 * 366 - 1000) / 166 = 16.02 -> 17 sat/vB.
-			// Reading the fee as 0.00001 instead of 1000 gave 23.
+			// inputs, so the child is sized at its one 41 vB output.
+			// (10 * 241 - 1000) / 41 = 34.4 -> 35 sat/vB.
+			// Reading the fee as 0.00001 instead of 1000 gave 59.
 			stageParent(0.00001, 200);
 			const sendMax = sinon
 				.stub(wallet.transaction, 'sendMax')
@@ -355,8 +354,8 @@ describe('fee estimation defects', function () {
 
 			if (res.isErr()) throw res.error;
 			expect(sendMax.calledOnce, 'the child was set up').to.equal(true);
-			expect(sendMax.firstCall.args[0].satsPerByte).to.equal(17);
-			// (5 * 366 - 1000) / 166 = 5 sat/vB, against 12 before the fix.
+			expect(sendMax.firstCall.args[0].satsPerByte).to.equal(35);
+			// (5 * 241 - 1000) / 41 = 5 sat/vB, against 30 before the fix.
 			expect(wallet.transaction.data.minFee).to.equal(5);
 		});
 

@@ -508,8 +508,10 @@ export class Transaction {
 					fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
 				}
 
+				// The inputs and outputs are known, so the transaction is priced at
+				// its size, not at getByteCount's default 166 vB floor.
 				let transactionByteCount =
-					getByteCount(inputParam, outputParam, message) +
+					getByteCount(inputParam, outputParam, message, 0) +
 					this.uncompressedKeyBytes(inputs);
 				if (satsPerByte < 2 && !this.skipsSizeFloor(transaction, inputs)) {
 					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
@@ -666,8 +668,9 @@ export class Transaction {
 					fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
 				}
 
+				// See getTotalFee: priced at its size, without the 166 vB floor.
 				let transactionByteCount =
-					getByteCount(inputParam, outputParam, message) +
+					getByteCount(inputParam, outputParam, message, 0) +
 					this.uncompressedKeyBytes(inputs);
 				if (rate < 2 && !this.skipsSizeFloor(transaction, inputs)) {
 					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
@@ -2550,11 +2553,13 @@ export class Transaction {
 						inputTypes[type] = 1;
 					}
 				});
+				// See getTotalFee: priced at its size, without the 166 vB floor.
 				let baseFee =
 					getByteCount(
 						this.applyMultisigInputWeights(inputTypes),
 						types,
-						message
+						message,
+						0
 					) + this.uncompressedKeyBytes(selected);
 				if (satsPerByte < 2) {
 					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;

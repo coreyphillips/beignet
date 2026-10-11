@@ -211,8 +211,6 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		].forEach(({ name, to }) => {
 			it(`pays the requested rate on a sweep to ${name}`, async function () {
 				const satsPerByte = 10;
-				// Two inputs, because getByteCount floors every estimate at 166 vB and
-				// a 1-in-1-out sweep sits under that floor whatever its output type.
 				injectUtxo(FUNDING_TXID, 100_000);
 				injectUtxo(BOOSTED_TXID, 100_000);
 
@@ -283,8 +281,8 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 					if (updated.isErr()) throw updated.error;
 				});
 
-				// #1545: one coin pays 5 sat/vB, so the size-based maximum is 457.
-				// Coin selection at 457 adds the second coin, and with it the fee is
+				// #1545: one coin pays 5 sat/vB, so the size-based maximum is 540.
+				// Coin selection at 540 adds the second coin, and with it the fee is
 				// over half the payment down to 365.
 				it(`quotes a maximum rate whose own coin selection fits under half with preference ${preference}`, async function () {
 					wallet.updateCoinSelectPreference(preference);
@@ -301,7 +299,7 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 
 					const quote = wallet.getFeeInfo({ satsPerByte: 5 });
 					if (quote.isErr()) throw quote.error;
-					expect(quote.value.transactionByteCount).to.equal(166);
+					expect(quote.value.transactionByteCount).to.equal(141);
 					expect(quote.value.maxSatPerByte).to.equal(364);
 					const atMax = wallet.transaction.updateFee({
 						satsPerByte: quote.value.maxSatPerByte
@@ -319,7 +317,7 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 				// the change is gone and the fee is under half the payment again.
 				[
 					[29_936, 29_936],
-					[55_642, 4_230]
+					[50_322, 9_550]
 				].forEach(([first, second]) => {
 					it(`quotes a maximum rate that drops generated change with preference ${preference} and coins of ${first} and ${second}`, async function () {
 						wallet.updateCoinSelectPreference(preference);
@@ -525,7 +523,7 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			});
 		});
 
-		// #1520: half the 195,715 payment over 166 vB is 589.5 sat/vB. 589.1 is
+		// #1520: half the 166,239 payment over 141 vB is 589.5 sat/vB. 589.1 is
 		// affordable, but the quote rounded it down to 589.
 		it('quotes a fractional rate above the integer maximum that it can pay', async function () {
 			wallet.updateCoinSelectPreference(ECoinSelectPreference.consolidate);
@@ -534,7 +532,7 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			if (setup.isErr()) throw setup.error;
 			const staged = wallet.transaction.updateSendTransaction({
 				transaction: {
-					outputs: [{ address: P2WPKH, value: 195_715, index: 0 }]
+					outputs: [{ address: P2WPKH, value: 166_239, index: 0 }]
 				}
 			});
 			if (staged.isErr()) throw staged.error;
@@ -545,7 +543,7 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			expect(quote.value.satsPerByte).to.equal(589.1);
 			const updated = wallet.transaction.updateFee({ satsPerByte: 589.1 });
 			if (updated.isErr()) throw updated.error;
-			expect(updated.value.fee).to.equal(97_791);
+			expect(updated.value.fee).to.equal(83_064);
 			expect(quote.value.totalFee).to.equal(updated.value.fee);
 
 			const capped = wallet.getFeeInfo({ satsPerByte: 589.6 });
@@ -1234,9 +1232,10 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 
 		it('refuses when the change cannot pay the replacement floor', async function () {
 			wallet.feeEstimates = { ...wallet.feeEstimates, fast: 10, slow: 2 };
-			// Outbidding a 9,961 sat fee on 166 vB takes 62 sat/vB, which is 331
-			// sats more. The change holds 300.
-			stubBoostedTransaction(undefined, { recipient: 89_739, change: 300 });
+			// Outbidding a 9,961 sat fee on 141 vB takes 72 sat/vB, which is 191
+			// sats more. The change holds 100, and dropping it pays 100 more than
+			// the original, short of the 110 vB the replacement then needs.
+			stubBoostedTransaction(undefined, { recipient: 89_939, change: 100 });
 
 			const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
 
