@@ -1127,6 +1127,9 @@ export class ReferenceGuardian {
 					);
 					const strayEpochs = this.store.listEpochs(state.recoveryId);
 					if (strayEpochs.length > 0) {
+						// Like a tombstone, this discards every lease the
+						// namespace held and re-anchors below them.
+						this.rememberErasedLease(state.recoveryId, null, 0n);
 						this.store.deleteAllEpochs(state.recoveryId);
 					}
 					strandedHistory = strayRecords > 0 || strayEpochs.length > 0;
@@ -3232,7 +3235,7 @@ export class ReferenceGuardian {
 			const hadAnything = ns.state !== null || ns.registrationState !== null;
 			// No lease survives a tombstone, and re-registration re-anchors
 			// below every one this guardian granted.
-			this.rememberErasedLease(ns, 0n);
+			this.rememberErasedLease(recoveryId, ns.state, 0n);
 			this.store.deleteAllRecords(recoveryId, 'rollback', u64be(this.clock()));
 			this.store.deleteAllEpochs(recoveryId);
 			this.store.deleteRetainFloor(recoveryId);
@@ -3627,7 +3630,7 @@ export class ReferenceGuardian {
 		reason: string
 	): void {
 		const recoveryId = ns.recoveryId;
-		this.rememberErasedLease(ns, checkpoint.lease.epoch);
+		this.rememberErasedLease(recoveryId, ns.state, checkpoint.lease.epoch);
 		this.store.archiveRecordsAbove(
 			recoveryId,
 			u64be(checkpoint.logHead.sequence),
@@ -3712,9 +3715,12 @@ export class ReferenceGuardian {
 	 * go, so remember the highest lease it held before discarding them:
 	 * repair evidence below it cannot prove a lower state current.
 	 */
-	private rememberErasedLease(ns: IGuardianNamespaceRow, kept: bigint): void {
-		const recoveryId = ns.recoveryId;
-		const declared = tryParseState(ns.state);
+	private rememberErasedLease(
+		recoveryId: Buffer,
+		declaredState: Buffer | null,
+		kept: bigint
+	): void {
+		const declared = tryParseState(declaredState);
 		let held =
 			declared !== null && declared.recoveryId.equals(recoveryId)
 				? declared.lease.epoch
