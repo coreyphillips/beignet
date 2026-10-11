@@ -2609,18 +2609,46 @@ export class Transaction {
 						// what it adds to the fee is left out by selecting again.
 						// Inputs of one type and key size add the same, so each kind is
 						// priced once.
-						const added = new Map<string, number>();
-						const economic = newInputs.filter((input, i) => {
+						const kindOf = (input: IUtxo): string => {
 							const { type } = getAddressInfo(input.address);
-							const kind = `${type}:${input.keyPair?.publicKey.length}`;
+							return `${type}:${input.keyPair?.publicKey.length}`;
+						};
+						const added = new Map<string, number>();
+						const economic: IUtxo[] = [];
+						const dropped: IUtxo[] = [];
+						newInputs.forEach((input, i) => {
+							const kind = kindOf(input);
 							let cost = added.get(kind);
 							if (cost === undefined) {
 								cost = fee - calculateFee(newInputs.filter((_, j) => j !== i));
 								added.set(kind, cost);
 							}
-							return input.value > cost;
+							(input.value > cost ? economic : dropped).push(input);
 						});
-						if (!economic.length || economic.length === newInputs.length) {
+						if (!economic.length || !dropped.length) {
+							return err('Not enough funds');
+						}
+						// Dropping coins can bring the selection down to the size floor,
+						// where a coin adds less than it did to the whole selection. Each
+						// dropped coin is offered back, largest first, at what it adds to
+						// the coins kept. Keeping coins only moves the selection away
+						// from the floor, so once one of a kind is refused the smaller
+						// ones of that kind are too.
+						dropped.sort((a, b) => b.value - a.value);
+						const refused = new Set<string>();
+						let keptFee = calculateFee(economic);
+						for (const input of dropped) {
+							const kind = kindOf(input);
+							if (refused.has(kind)) continue;
+							const withInput = calculateFee([...economic, input]);
+							if (input.value > withInput - keptFee) {
+								economic.push(input);
+								keptFee = withInput;
+							} else {
+								refused.add(kind);
+							}
+						}
+						if (economic.length === newInputs.length) {
 							return err('Not enough funds');
 						}
 						return this.autoCoinSelect({

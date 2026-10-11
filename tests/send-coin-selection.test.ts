@@ -391,4 +391,71 @@ describe('sendMany coin selection (#1360)', function () {
 			}
 		});
 	});
+
+	// Both small coins cost 680 sats each in the three-input selection. Without
+	// the 300, the 500 adds only 430, since one input sits below the 166 vB
+	// floor, and paying from 500 and 10,000 leaves a 1,900 sat fee.
+	describe('with coins dropped down to the size floor (#1575)', function () {
+		const AMOUNT = 8_600;
+		const FEE = 1_900;
+
+		beforeEach(function () {
+			for (const utxo of wallet.data.utxos.splice(0)) {
+				wallet.data.balance -= utxo.value;
+				injected.delete(utxo.tx_hash);
+			}
+			injectUtxo('fd'.repeat(32), 300);
+			injectUtxo('fe'.repeat(32), 500);
+			injectUtxo('ff'.repeat(32), 10_000);
+			wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
+		});
+
+		const expectPaid = (tx: BitcoinTransaction): void => {
+			expect(tx.ins).to.have.length(2);
+			expect(tx.outs).to.have.length(1);
+			expect(tx.outs[0].value).to.equal(AMOUNT);
+			expect(feeOf(tx)).to.equal(FEE);
+			expect(feeOf(tx) / tx.virtualSize()).to.be.at.least(10);
+		};
+
+		it('quotes it', function () {
+			const estimate = wallet.getFeeInfo({
+				satsPerByte: 10,
+				transaction: {
+					outputs: [{ address: RECIPIENT, value: AMOUNT, index: 0 }]
+				}
+			});
+			if (estimate.isErr()) throw estimate.error;
+			expect(estimate.value.totalFee).to.equal(FEE);
+		});
+
+		it('sends it', async function () {
+			const res = await wallet.send({
+				address: RECIPIENT,
+				amount: AMOUNT,
+				satsPerByte: 10,
+				broadcast: false
+			});
+			if (res.isErr()) throw res.error;
+
+			expectPaid(BitcoinTransaction.fromHex(res.value));
+			expect(wallet.transaction.data.fee).to.equal(FEE);
+		});
+
+		it('builds it', async function () {
+			const built = await wallet.buildPsbt({
+				address: RECIPIENT,
+				amount: AMOUNT,
+				satsPerByte: 10
+			});
+			if (built.isErr()) throw built.error;
+			const signed = wallet.signPsbtWithOurKey(built.value.psbtBase64);
+			if (signed.isErr()) throw signed.error;
+			const imported = wallet.importSignedPsbt(signed.value);
+			if (imported.isErr()) throw imported.error;
+
+			expectPaid(BitcoinTransaction.fromHex(imported.value.txHex));
+			expect(built.value.fee).to.equal(FEE);
+		});
+	});
 });
