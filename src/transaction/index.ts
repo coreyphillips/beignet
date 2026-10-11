@@ -841,6 +841,24 @@ export class Transaction {
 				quote.totalFee < txBalance / 2 &&
 				(!!transaction.max || quote.totalFee <= available);
 			if (maxSatPerByte < satsPerByte && !paysRequested) {
+				// quoteAt prices the coins selected at the requested rate. The capped
+				// rate can select fewer, and their change can be dust.
+				if (selectsCoins && maxSatPerByte) {
+					const atMax = this.getTotalFeeObj({
+						satsPerByte: maxSatPerByte,
+						message,
+						transaction,
+						fundingLightning,
+						coinSelectPreference
+					});
+					if (atMax.isErr()) return atMax;
+					return ok({
+						totalFee: atMax.value.totalFee,
+						transactionByteCount: atMax.value.transactionByteCount,
+						satsPerByte: maxSatPerByte,
+						maxSatPerByte
+					});
+				}
 				const capped = quoteAt(maxSatPerByte);
 				return ok({
 					totalFee: capped.totalFee,

@@ -582,4 +582,48 @@ describe('sendMany coin selection (#1360)', function () {
 			expect(feeOf(tx)).to.equal(estimate.value.totalFee);
 		});
 	});
+
+	// At 1.5 sat/vB all five coins leave 147 sats of change, so the fee is
+	// the 767 leftover, over half the payment. 1 sat/vB selects only four,
+	// whose 122 sats of change is dust, so the capped quote is their 467
+	// leftover, not the 413 the five coins would pay at that rate.
+	describe('a capped quote that selects fewer coins (#1584)', function () {
+		const AMOUNT = 1_533;
+
+		beforeEach(function () {
+			for (const utxo of wallet.data.utxos.splice(0)) {
+				wallet.data.balance -= utxo.value;
+				injected.delete(utxo.tx_hash);
+			}
+			[300, 300, 300, 500, 900].forEach((value, i) =>
+				injectUtxo((0xe0 + i).toString(16).repeat(32), value)
+			);
+			wallet.updateCoinSelectPreference(ECoinSelectPreference.large);
+		});
+
+		it('quotes what the capped send pays', async function () {
+			const estimate = wallet.getFeeInfo({
+				satsPerByte: 1.5,
+				transaction: {
+					outputs: [{ address: RECIPIENT, value: AMOUNT, index: 0 }]
+				}
+			});
+			if (estimate.isErr()) throw estimate.error;
+			expect(estimate.value.satsPerByte).to.equal(1);
+
+			const res = await wallet.send({
+				address: RECIPIENT,
+				amount: AMOUNT,
+				satsPerByte: estimate.value.satsPerByte,
+				broadcast: false
+			});
+			if (res.isErr()) throw res.error;
+			const tx = BitcoinTransaction.fromHex(res.value);
+			expect(tx.ins).to.have.length(4);
+			expect(tx.outs).to.have.length(1);
+			expect(feeOf(tx)).to.equal(estimate.value.totalFee);
+			expect(estimate.value.totalFee).to.equal(467);
+			expect(estimate.value.transactionByteCount).to.equal(314);
+		});
+	});
 });
