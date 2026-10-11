@@ -5949,7 +5949,7 @@ export class Wallet {
 		let value = 0;
 		const addressType = EAddressType.p2wpkh;
 		const outputs: IOutput[] = [];
-		let message = '';
+		const messages: Buffer[] = [];
 		let inputTotal = 0;
 		let outputTotal = 0;
 		let fee = 0;
@@ -6034,11 +6034,21 @@ export class Wallet {
 			} else if (vout.scriptPubKey?.address) {
 				address = vout.scriptPubKey.address;
 			} else if (vout.scriptPubKey?.asm?.includes('OP_RETURN')) {
-				// The replacement rebuilds this output from message. Pushing it
+				// The replacement rebuilds this output from its message. Pushing it
 				// would stage a payment to whichever address was read last.
-				try {
-					message = decodeOpReturnMessage(vout.scriptPubKey.asm)[0] || '';
-				} catch {}
+				// The hex is read because the asm shows a push of up to 4 bytes
+				// as a number.
+				const [opcode, ...pushes] =
+					bitcoin.script.decompile(
+						Buffer.from(vout.scriptPubKey.hex ?? '', 'hex')
+					) ?? [];
+				if (
+					opcode !== bitcoin.opcodes.OP_RETURN ||
+					!pushes.every(Buffer.isBuffer)
+				) {
+					return err('Unable to read an OP_RETURN output. Unable to RBF.');
+				}
+				messages.push(...pushes);
 				outputTotal = outputTotal + voutValue;
 				continue;
 			}
@@ -6083,6 +6093,13 @@ export class Wallet {
 			return err('Unable to determine change address.');
 		}
 
+		// The replacement carries a single message, so any other would be lost.
+		if (messages.length > 1) {
+			return err(
+				'Transaction carries more than one OP_RETURN message. Unable to RBF.'
+			);
+		}
+
 		if (outputTotal > inputTotal) {
 			return err('Outputs should not be greater than the inputs.');
 		}
@@ -6094,7 +6111,7 @@ export class Wallet {
 			balance: inputTotal,
 			outputs,
 			fee,
-			message,
+			message: messages[0]?.toString() ?? '',
 			addressType,
 			rbf: true
 		});
