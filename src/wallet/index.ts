@@ -5200,6 +5200,8 @@ export class Wallet {
 		rbf = false,
 		shuffleOutputs = true
 	}: IBuildPsbtArgs): Promise<Result<IBuildPsbtResponse>> {
+		let psbt: bitcoin.Psbt;
+		let response: IBuildPsbtResponse;
 		try {
 			let sendTxs: ISendTx[] = txs ?? [];
 			if (!sendTxs.length) {
@@ -5257,8 +5259,7 @@ export class Wallet {
 				shuffleOutputs
 			});
 			if (psbtRes.isErr()) return err(psbtRes.error.message);
-			const psbt = psbtRes.value;
-			this._rememberBuiltPsbt(psbt);
+			psbt = psbtRes.value;
 			const inputValue = this.transaction.getTransactionInputValue({
 				inputs: txData.inputs
 			});
@@ -5291,14 +5292,14 @@ export class Wallet {
 				value: input.value,
 				path: input.path
 			}));
-			return ok({
+			response = {
 				psbtBase64: psbt.toBase64(),
 				fee,
 				vsizeEstimate,
 				satsPerByte: effectiveSatsPerByte,
 				inputs,
 				outputs
-			});
+			};
 		} catch (e) {
 			return err(e);
 		} finally {
@@ -5307,6 +5308,17 @@ export class Wallet {
 			// importSignedPsbt) reads the staged send.
 			await this.transaction.clearStoredSendTransaction();
 		}
+		// createUnsignedPsbt checked for frozen inputs before the cleanup
+		// above awaited storage, and a freeze can complete during that await.
+		// No await may sit between this check and return.
+		for (const { hash, index } of psbt.txInputs) {
+			const txid = Buffer.from(hash).reverse().toString('hex');
+			if (this.isUtxoFrozen(txid, index)) {
+				return err(`Staged input ${txid}:${index} is frozen.`);
+			}
+		}
+		this._rememberBuiltPsbt(psbt);
+		return ok(response);
 	}
 
 	/**
