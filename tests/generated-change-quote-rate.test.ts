@@ -5,6 +5,10 @@
  * the 256 vB floor leaves 292, under dust, so updateFee prices no change.
  * The quote priced change anyway and advertised 0 sat/vB.
  *
+ * Since #1586 those 292 sats count as fee, as the builder pays them. At
+ * 1 sat/vB the fee is then 548 sats, over half the 550 payment, so no whole
+ * rate fits.
+ *
  * Fully OFFLINE: the wallet points at an unreachable Electrum server and the
  * UTXOs are fabricated.
  */
@@ -86,7 +90,7 @@ describe('Generated change at the quoted maximum (#1562)', function () {
 		await wallet?.stop();
 	});
 
-	it('advertises the rate updateFee accepts without change', async () => {
+	it('advertises no rate when 1 sat/vB pays the whole leftover', async () => {
 		await wallet.transaction.resetSendTransaction();
 		const staged = wallet.transaction.updateSendTransaction({
 			transaction: {
@@ -99,14 +103,16 @@ describe('Generated change at the quoted maximum (#1562)', function () {
 
 		const quote = wallet.transaction.getTotalFeeObj({ satsPerByte: 2 });
 		if (quote.isErr()) throw quote.error;
-		expect(quote.value.maxSatPerByte).to.equal(1);
-		expect(quote.value.satsPerByte).to.equal(1);
-		expect(quote.value.totalFee).to.equal(256);
+		expect(quote.value.maxSatPerByte).to.equal(0);
+		expect(quote.value.satsPerByte).to.equal(0);
 
-		const fee = wallet.transaction.updateFee({
-			satsPerByte: quote.value.satsPerByte
-		});
-		if (fee.isErr()) throw new Error(fee.error.message);
-		expect(fee.value.fee).to.equal(quote.value.totalFee);
+		expect(
+			wallet.transaction.getTotalFee({
+				satsPerByte: 1,
+				coinSelectPreference: ECoinSelectPreference.consolidate
+			})
+		).to.equal(3 * INPUT_VALUE - PAYMENT);
+		const fee = wallet.transaction.updateFee({ satsPerByte: 1 });
+		expect(fee.isErr()).to.equal(true);
 	});
 });

@@ -133,22 +133,18 @@ describe('Fee estimation with generated change (#1465)', function () {
 
 	[
 		// The issue's reproduction: 39,086 sats paid, 600 sats left over.
-		{ satsPerByte: 1, leftover: 600, pricedWithChange: true, change: true },
-		{ satsPerByte: 5, leftover: 600, pricedWithChange: true, change: true },
+		{ satsPerByte: 1, leftover: 600, change: true },
+		{ satsPerByte: 5, leftover: 600, change: true },
 		// Priced with change, the 269 sats left once the change output pays for
 		// itself are under P2WPKH dust (294) and go to the fee, so the whole
 		// leftover is quoted (#1584). Priced without, the builder would add 300
 		// sats of change at the cheaper fee.
-		{ satsPerByte: 1, leftover: 300, pricedWithChange: true, change: false },
-		{ satsPerByte: 1, leftover: 200, pricedWithChange: false, change: false },
-		{
-			satsPerByte: 1,
-			leftover: 600,
-			pricedWithChange: true,
-			change: true,
-			fresh: true
-		}
-	].forEach(({ satsPerByte, leftover, pricedWithChange, change, fresh }) => {
+		{ satsPerByte: 1, leftover: 300, change: false },
+		// Under dust before any change is priced, so the builder adds no change
+		// and the whole leftover is the fee (#1586).
+		{ satsPerByte: 1, leftover: 200, change: false },
+		{ satsPerByte: 1, leftover: 600, change: true, fresh: true }
+	].forEach(({ satsPerByte, leftover, change, fresh }) => {
 		const title = `meets ${satsPerByte} sat/vB with ${leftover} sats left over`;
 		it(fresh ? `${title} before the change index is set` : title, async () => {
 			const target = fresh ? freshWallet : wallet;
@@ -171,16 +167,15 @@ describe('Fee estimation with generated change (#1465)', function () {
 			});
 			if (feeObj.isErr()) throw feeObj.error;
 			expect(fee).to.equal(
-				pricedWithChange && !change
-					? INPUT_TOTAL - payment
-					: priceAt(satsPerByte, pricedWithChange)
+				change ? priceAt(satsPerByte, true) : INPUT_TOTAL - payment
 			);
 			expect(feeObj.value.totalFee).to.equal(fee);
 
 			await target.transaction.resetSendTransaction();
-			target.transaction.updateSendTransaction({
-				transaction: { ...transaction, fee }
-			});
+			target.transaction.updateSendTransaction({ transaction });
+			const updateRes = target.transaction.updateFee({ satsPerByte });
+			if (updateRes.isErr()) throw updateRes.error;
+			expect(updateRes.value.fee).to.equal(fee);
 			const res = await target.transaction.createTransaction({
 				shuffleOutputs: false
 			});
@@ -201,7 +196,7 @@ describe('Fee estimation with generated change (#1465)', function () {
 			const paid =
 				INPUT_TOTAL - outputs.reduce((acc, { value }) => acc + value, 0);
 			expect(paid).to.be.at.least(satsPerByte * tx.virtualSize());
-			if (pricedWithChange) expect(paid).to.equal(fee);
+			expect(paid).to.equal(fee);
 		});
 	});
 

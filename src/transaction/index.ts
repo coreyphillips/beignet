@@ -365,6 +365,37 @@ export class Transaction {
 	}
 
 	/**
+	 * The change address createPsbtFromTransactionData fetches for a
+	 * transaction staged without one, and what the inputs leave after the
+	 * outputs and `fee`. Undefined for a staged change address or a max send.
+	 * @private
+	 * @param {Partial<ISendTransaction>} transaction
+	 * @param {IUtxo[]} inputs
+	 * @param {number} fee
+	 * @returns {{ address: string; leftover: number } | undefined}
+	 */
+	private unstagedChange({
+		transaction,
+		inputs,
+		fee
+	}: {
+		transaction: Partial<ISendTransaction>;
+		inputs: IUtxo[];
+		fee: number;
+	}): { address: string; leftover: number } | undefined {
+		if (transaction.changeAddress || transaction.max) return undefined;
+		const address =
+			this._wallet.data.changeAddressIndex[this._wallet.addressType]?.address ||
+			this.changeAddressStandIn();
+		if (!address) return undefined;
+		const leftover =
+			this.getTransactionInputValue({ inputs }) -
+			this.getTransactionOutputValue({ outputs: transaction.outputs ?? [] }) -
+			fee;
+		return { address, leftover };
+	}
+
+	/**
 	 * Returns the change address createPsbtFromTransactionData will add to a
 	 * transaction staged without one, or undefined when it adds none. The
 	 * builder adds it for any leftover at or above dust and does not reprice
@@ -377,25 +408,38 @@ export class Transaction {
 	 * @param {number} fee
 	 * @returns {string | undefined}
 	 */
-	private generatedChangeAddress({
-		transaction,
-		inputs,
-		fee
-	}: {
+	private generatedChangeAddress(args: {
 		transaction: Partial<ISendTransaction>;
 		inputs: IUtxo[];
 		fee: number;
 	}): string | undefined {
-		if (transaction.changeAddress || transaction.max) return undefined;
-		const address =
-			this._wallet.data.changeAddressIndex[this._wallet.addressType]?.address ||
-			this.changeAddressStandIn();
-		if (!address) return undefined;
-		const leftover =
-			this.getTransactionInputValue({ inputs }) -
-			this.getTransactionOutputValue({ outputs: transaction.outputs ?? [] }) -
-			fee;
-		return leftover >= getDustThreshold(address) ? address : undefined;
+		const change = this.unstagedChange(args);
+		return change && change.leftover >= getDustThreshold(change.address)
+			? change.address
+			: undefined;
+	}
+
+	/**
+	 * The leftover createPsbtFromTransactionData adds to `fee` for a
+	 * transaction staged without a change address: all of it when it is under
+	 * the dust threshold of the change the builder would add, otherwise none.
+	 * @private
+	 * @param {Partial<ISendTransaction>} transaction
+	 * @param {IUtxo[]} inputs
+	 * @param {number} fee
+	 * @returns {number}
+	 */
+	private droppedDust(args: {
+		transaction: Partial<ISendTransaction>;
+		inputs: IUtxo[];
+		fee: number;
+	}): number {
+		const change = this.unstagedChange(args);
+		return change &&
+			change.leftover >= 0 &&
+			change.leftover < getDustThreshold(change.address)
+			? change.leftover
+			: 0;
 	}
 
 	/**
@@ -431,7 +475,7 @@ export class Transaction {
 	 * @param {Partial<ISendTransaction>} [transaction]
 	 * @param {boolean} [fundingLightning]
 	 * @param {ECoinSelectPreference} [coinSelectPreference]
-	 * @param {boolean} [generatesChange] Prices the change output the builder adds when no change address is staged.
+	 * @param {boolean} [generatesChange] Prices what the builder does with the leftover when no change address is staged: a change output, or dust added to the fee.
 	 * @returns {number}
 	 */
 	getTotalFee = ({
@@ -559,7 +603,9 @@ export class Transaction {
 					coinSelectPreference: ECoinSelectPreference.consolidate
 				});
 			}
-			return fee;
+			return generatesChange
+				? fee + this.droppedDust({ transaction, inputs, fee })
+				: fee;
 		} catch {
 			return baseTransactionSize * satsPerByte;
 		}
@@ -731,7 +777,13 @@ export class Transaction {
 						};
 					}
 				}
-				return { totalFee: fee, transactionByteCount: byteCount };
+				// Without a change address staged, the builder adds dust to the fee.
+				return {
+					totalFee: pricesChange
+						? fee
+						: fee + this.droppedDust({ transaction, inputs, fee }),
+					transactionByteCount: byteCount
+				};
 			};
 			const quote = quoteAt(satsPerByte);
 			transactionByteCount = quote.transactionByteCount;
