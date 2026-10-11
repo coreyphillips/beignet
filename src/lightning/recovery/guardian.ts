@@ -3230,6 +3230,9 @@ export class ReferenceGuardian {
 			// Wire 5.10 step 1: without the stored registration there is no
 			// checkpoint at all.
 			const hadAnything = ns.state !== null || ns.registrationState !== null;
+			// No lease survives a tombstone, and re-registration re-anchors
+			// below every one this guardian granted.
+			this.rememberErasedLease(ns, 0n);
 			this.store.deleteAllRecords(recoveryId, 'rollback', u64be(this.clock()));
 			this.store.deleteAllEpochs(recoveryId);
 			this.store.deleteRetainFloor(recoveryId);
@@ -3624,28 +3627,7 @@ export class ReferenceGuardian {
 		reason: string
 	): void {
 		const recoveryId = ns.recoveryId;
-		// Grants this guardian signed past the checkpoint stay valid after
-		// their rows go, so remember the highest lease it held: repair
-		// evidence below it cannot prove the checkpoint current.
-		const declared = tryParseState(ns.state);
-		let held =
-			declared !== null && declared.recoveryId.equals(recoveryId)
-				? declared.lease.epoch
-				: 0n;
-		for (const row of this.store.listEpochs(recoveryId)) {
-			const epoch = tryReadU64(row.epoch);
-			if (epoch !== null && epoch > held) held = epoch;
-		}
-		// An unreadable mark already refuses all evidence; a number would
-		// narrow that.
-		const mark = this.store.getErasedEpoch(recoveryId);
-		const erased = tryReadU64(mark);
-		if (
-			held > checkpoint.lease.epoch &&
-			(mark === null || (erased !== null && held > erased))
-		) {
-			this.store.setErasedEpoch(recoveryId, u64be(held));
-		}
+		this.rememberErasedLease(ns, checkpoint.lease.epoch);
 		this.store.archiveRecordsAbove(
 			recoveryId,
 			u64be(checkpoint.logHead.sequence),
@@ -3723,6 +3705,31 @@ export class ReferenceGuardian {
 			GuardianStatus.ERR_STORE_UNCERTAIN,
 			`store rolled back to sequence ${checkpoint.logHead.sequence}, epoch ${checkpoint.lease.epoch}: ${reason}`
 		);
+	}
+
+	/**
+	 * Grants this guardian signed above `kept` stay valid after their rows
+	 * go, so remember the highest lease it held before discarding them:
+	 * repair evidence below it cannot prove a lower state current.
+	 */
+	private rememberErasedLease(ns: IGuardianNamespaceRow, kept: bigint): void {
+		const recoveryId = ns.recoveryId;
+		const declared = tryParseState(ns.state);
+		let held =
+			declared !== null && declared.recoveryId.equals(recoveryId)
+				? declared.lease.epoch
+				: 0n;
+		for (const row of this.store.listEpochs(recoveryId)) {
+			const epoch = tryReadU64(row.epoch);
+			if (epoch !== null && epoch > held) held = epoch;
+		}
+		// An unreadable mark already refuses all evidence; a number would
+		// narrow that.
+		const mark = this.store.getErasedEpoch(recoveryId);
+		const erased = tryReadU64(mark);
+		if (held > kept && (mark === null || (erased !== null && held > erased))) {
+			this.store.setErasedEpoch(recoveryId, u64be(held));
+		}
 	}
 
 	private internalError(error: unknown): IErr {

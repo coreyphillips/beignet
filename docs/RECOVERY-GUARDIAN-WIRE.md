@@ -899,9 +899,10 @@ per namespace:
    a rolled-back guardian and make it contradict a takeover certificate
    it issued before losing its store; fencing is permanent, so recency
    must be proven by quorum evidence, not asserted. A target below the
-   highest lease epoch the rollback discarded never lifts the flag: the
-   guardian may have certified that epoch, and receipts over an earlier
-   state show only that it was once current
+   highest lease epoch the rollback discarded never lifts the flag, even
+   after a rollback with no checkpoint is re-anchored by registration:
+   the guardian may have certified that epoch, and receipts over an
+   earlier state show only that it was once current
 6  when no quorum-certified target can be assembled, the guardian
    REMAINS read-only (possibly_stale) indefinitely, and recovery for
    the affected node degrades to the SCB/DLP path. Restrictive, and

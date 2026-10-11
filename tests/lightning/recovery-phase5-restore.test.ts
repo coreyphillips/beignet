@@ -49,6 +49,7 @@ import {
 	computeGuardianSetId,
 	decodeAcquireEpochRequest,
 	decodePutStateRequest,
+	decodeRegisterNodeRequest,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
 	dispatchGuardianVerb,
@@ -2442,6 +2443,121 @@ describe('Recovery phase 5: restore driver', () => {
 		const repaired = g3.submitRepairEvidence({
 			recoveryId: ROOT.recoveryId,
 			target: rolledBack.state as GuardianState,
+			receipts: historical,
+			certificates: []
+		});
+		expect(repaired.status).to.equal(GuardianStatus.ERR_EPOCH_REGRESSION);
+		expect((await clients[2].getHead(ROOT.recoveryId)).possiblyStale).to.equal(
+			true
+		);
+
+		const events: IRestoreEvent[] = [];
+		try {
+			await driverFor(target, bind(members), events).restore();
+			expect.fail('the attempt may be fenced by a takeover G3 signed');
+		} catch (error) {
+			expect(error).to.be.instanceOf(RestoreRefusedError);
+			expect((error as RestoreRefusedError).reason).to.equal('no-quorum');
+		}
+		expect(
+			events.some(
+				(e) => e.type === 'epoch:acquired' || e.type === 'epoch:abandoned'
+			)
+		).to.equal(false);
+		expect(loadWriterLease(target).state).to.equal('missing');
+		expect(target.loadRecoveryFrames()).to.have.length(0);
+		expect(
+			target.getRecoveryMeta!(RESTORE_META_KEYS.pendingAcquisition)
+		).to.equal(pending);
+
+		await shutdown(served);
+		g3.close();
+		fs.rmSync(dir, { recursive: true, force: true });
+		live.storage.close();
+		target.close();
+		other.close();
+	});
+
+	it('keeps a resumed attempt while a re-registered tombstone of a takeover signer reports below it', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		// Issue #1567. As above, but G3 loses its registration instead, so
+		// its takeover grant goes with a tombstone rather than a rollback.
+		// The original registration re-anchors it at genesis, which G1 and
+		// G2's registration receipts cover.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-restore-'));
+		const file = path.join(dir, 'g3.sqlite');
+		const openG3 = (): ReferenceGuardian =>
+			new ReferenceGuardian({
+				path: file,
+				guardianSecret: GUARDIAN_SECRETS[2],
+				members: GUARDIAN_IDS,
+				clock
+			});
+		let g3 = openG3();
+		let registration: Buffer | undefined;
+		const inProcessG3 = {
+			id: GUARDIAN_IDS[2],
+			client: new GuardianClient({
+				url: 'http://guardian-3.example',
+				guardianSetId: SET_ID,
+				transport: async (
+					url,
+					init
+				): Promise<{ status: number; body: Buffer }> => {
+					const verb = url.split('/').pop() as GuardianVerbName;
+					if (verb === 'register_node') registration ??= init.body;
+					return {
+						status: 200,
+						body:
+							init.method === 'GET'
+								? encodeGuardianInfo(g3)
+								: dispatchGuardianVerb(g3, verb, init.body!)
+					};
+				}
+			})
+		};
+		const served = await Promise.all([serve(0), serve(1)]);
+		const members = [...served, inProcessG3];
+		const clients = members.map((entry) => entry.client);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(members));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		const historical = await Promise.all(
+			[clients[0], clients[1]].map(
+				async (client) => (await client.getHead(ROOT.recoveryId)).receipt!
+			)
+		);
+		await rep.replicatePending(lease);
+		const writer = generateWriterKey();
+		const guard = await grantNext(clients[0], lease, writer);
+		await grantNext(clients[1], lease, writer);
+		await grantNext(clients[2], lease, writer);
+		const target = openStorage();
+		persistPending(target, guard, writer);
+		const pending = target.getRecoveryMeta!(
+			RESTORE_META_KEYS.pendingAcquisition
+		);
+		const other = await takeOverAndAppend([served[0], inProcessG3], 98);
+
+		g3.close();
+		const raw = new Database(file);
+		raw
+			.prepare('UPDATE guardian_namespaces SET registration_signature = ?')
+			.run(Buffer.alloc(64));
+		raw.close();
+		g3 = openG3();
+		expect(
+			g3.register(decodeRegisterNodeRequest(registration as Buffer)).status
+		).to.equal(GuardianStatus.OK);
+		const reanchored = await clients[2].getHead(ROOT.recoveryId);
+		expect(reanchored.possiblyStale).to.equal(true);
+		expect(reanchored.state?.lease.epoch).to.equal(lease.epoch);
+		const repaired = g3.submitRepairEvidence({
+			recoveryId: ROOT.recoveryId,
+			target: reanchored.state as GuardianState,
 			receipts: historical,
 			certificates: []
 		});
