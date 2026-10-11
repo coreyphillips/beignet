@@ -343,5 +343,52 @@ describe('sendMany coin selection (#1360)', function () {
 				});
 			}
 		});
+
+		// The same coin picked before the payment is covered stayed in every
+		// selection, so even the fallback to a shorter one kept it.
+		describe('with an uneconomic coin selected first (#1566)', function () {
+			const addLeadingCoin = (): void => {
+				// FIFO and LIFO both reach the coin after two of the four.
+				wallet.data.utxos.forEach((utxo, i) => {
+					utxo.height = i < 2 ? 100 : 102;
+				});
+				injectUtxo('ff'.repeat(32), 300).height = 101;
+			};
+
+			const expectQuotes = (): void => {
+				const estimate = wallet.getFeeInfo({
+					satsPerByte: 10,
+					transaction: {
+						outputs: [{ address: RECIPIENT, value: AMOUNT, index: 0 }]
+					}
+				});
+				if (estimate.isErr()) throw estimate.error;
+				expect(estimate.value.totalFee).to.equal(FEE);
+			};
+
+			for (const preference of [
+				ECoinSelectPreference.small,
+				ECoinSelectPreference.firstInFirstOut,
+				ECoinSelectPreference.lastInFirstOut
+			]) {
+				it(`quotes it under ${preference}`, function () {
+					wallet.updateCoinSelectPreference(preference);
+					addLeadingCoin();
+					expectQuotes();
+				});
+
+				it(`sends it under ${preference}`, async function () {
+					wallet.updateCoinSelectPreference(preference);
+					addLeadingCoin();
+					await expectSends();
+				});
+
+				it(`builds it under ${preference}`, async function () {
+					wallet.updateCoinSelectPreference(preference);
+					addLeadingCoin();
+					await expectBuilds();
+				});
+			}
+		});
 	});
 });
