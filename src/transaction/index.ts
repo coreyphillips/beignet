@@ -2291,7 +2291,9 @@ export class Transaction {
 				outputs
 			});
 
-			if (outputTotal + newFee >= inputTotal || newFee >= inputTotal / 2) {
+			// A replacement that drops its change pays the whole leftover as fee,
+			// so its outputs and fee add up to exactly the inputs.
+			if (outputTotal + newFee > inputTotal || newFee >= inputTotal / 2) {
 				/*
 				 * We could always pull the fee from the output total,
 				 * but this may negatively impact the transaction made by the user.

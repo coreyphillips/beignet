@@ -1115,6 +1115,74 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			if (res.isOk()) return;
 			expect(res.error.message).to.include('Not enough sats');
 		});
+
+		// #1544: outbidding the 9,700 sat fee takes 43 sat/vB, which the 300 sat
+		// change cannot pay. Without it the 10k left pays 49.5 sat/vB on 202 vB,
+		// but outputs plus fee equal the inputs, and that read as too little.
+		[ECoinSelectPreference.small, ECoinSelectPreference.large].forEach(
+			(preference) => {
+				it(`drops change the replacement exhausts with preference ${preference}`, async function () {
+					wallet.updateCoinSelectPreference(preference);
+					wallet.feeEstimates = { ...wallet.feeEstimates, fast: 10, slow: 2 };
+					const message = 'm'.repeat(80);
+					stubLookups({
+						[BOOSTED_TXID]: {
+							vin: [{ txid: FUNDING_TXID, vout: 0 }] as TTxDetails['vin'],
+							vout: [
+								{ value: 0.0009, n: 0, scriptPubKey: { address: P2WPKH } },
+								{
+									value: 0.000003,
+									n: 1,
+									scriptPubKey: { address: changeAddress() }
+								},
+								{ value: 0, n: 2, scriptPubKey: nulldata(message) }
+							] as unknown as TTxDetails['vout']
+						},
+						[FUNDING_TXID]: {
+							confirmations: 10,
+							vout: [
+								{
+									value: 0.001,
+									n: 0,
+									scriptPubKey: { address: receiveAddress() }
+								}
+							] as unknown as TTxDetails['vout']
+						}
+					});
+
+					const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+					if (res.isErr()) throw res.error;
+					expect(res.value.minFee).to.equal(43);
+					expect(res.value.satsPerByte).to.equal(43);
+					expect(res.value.fee).to.equal(10_000);
+					expect(res.value.outputs).to.deep.equal([
+						{ address: P2WPKH, value: 90_000, index: 0 }
+					]);
+					expect(res.value.message).to.equal(message);
+					const updated = wallet.transaction.updateFee({
+						satsPerByte: res.value.minFee
+					});
+					if (updated.isErr()) throw updated.error;
+					expect(updated.value.fee).to.equal(res.value.fee);
+					const created = await wallet.transaction.createTransaction();
+					if (created.isErr()) throw created.error;
+
+					const tx = BitcoinTransaction.fromHex(created.value.hex);
+					expect(tx.outs).to.have.length(2);
+					expect(tx.outs.map((out) => out.value)).to.include(90_000);
+					const embedded = tx.outs.filter((out) => out.script[0] === 0x6a);
+					expect(embedded).to.have.length(1);
+					expect(embedded[0].script.toString()).to.include(message);
+					const fee =
+						100_000 - tx.outs.reduce((sum, out) => sum + out.value, 0);
+					expect(fee).to.equal(10_000);
+					expect(fee).to.be.at.least(43 * tx.virtualSize());
+					// More than the original, by its own size at 1 sat/vB (BIP 125).
+					expect(fee - 9_700).to.be.at.least(tx.virtualSize());
+					expect(wallet.coinSelectPreference).to.equal(preference);
+				});
+			}
+		);
 	});
 
 	describe('setupCpfp', function () {
