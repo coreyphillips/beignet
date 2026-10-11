@@ -18,6 +18,8 @@ import sinon from 'sinon';
 import {
 	address as bitcoinAddress,
 	networks,
+	payments,
+	script as bitcoinScript,
 	Transaction as BitcoinTransaction
 } from 'bitcoinjs-lib';
 
@@ -59,6 +61,20 @@ const P2TR = bitcoinAddress.toBech32(Buffer.alloc(32, 1), 1, 'bcrt');
 const P2WSH = bitcoinAddress.toBech32(Buffer.alloc(32, 2), 0, 'bcrt');
 const P2WPKH = bitcoinAddress.toBech32(Buffer.alloc(20, 3), 0, 'bcrt');
 const FOREIGN = bitcoinAddress.toBech32(Buffer.alloc(20, 4), 0, 'bcrt');
+
+/** A verbose scriptPubKey for an OP_RETURN pushing each message. */
+const nulldata = (
+	...messages: string[]
+): { asm: string; hex: string; type: string } => {
+	const script = payments.embed({
+		data: messages.map((message) => Buffer.from(message))
+	}).output as Buffer;
+	return {
+		asm: bitcoinScript.toASM(script),
+		hex: script.toString('hex'),
+		type: 'nulldata'
+	};
+};
 
 const BOOSTED_TXID = 'bb'.repeat(32);
 const FUNDING_TXID = 'aa'.repeat(32);
@@ -830,10 +846,7 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 				];
 				vout.splice(position, 0, {
 					value: 0,
-					scriptPubKey: {
-						asm: `OP_RETURN ${Buffer.from(message).toString('hex')}`,
-						type: 'nulldata'
-					}
+					scriptPubKey: nulldata(message)
 				});
 				stubLookups({
 					[BOOSTED_TXID]: {
@@ -878,6 +891,90 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 				const fee = 100_000 - tx.outs.reduce((sum, out) => sum + out.value, 0);
 				expect(fee).to.equal(res.value.fee);
 				expect(fee - 10_000).to.be.at.least(tx.virtualSize());
+			});
+		});
+
+		/** The boosted transaction with these OP_RETURNs after its change. */
+		const stubWithNulldata = (
+			...scriptPubKeys: Record<string, unknown>[]
+		): void =>
+			stubLookups({
+				[BOOSTED_TXID]: {
+					vin: [{ txid: FUNDING_TXID, vout: 0 }] as TTxDetails['vin'],
+					vout: [
+						{ value: 0.0004, scriptPubKey: { address: P2WPKH } },
+						{ value: 0.0005, scriptPubKey: { address: changeAddress() } },
+						...scriptPubKeys.map((scriptPubKey) => ({ value: 0, scriptPubKey }))
+					].map((output, n) => ({
+						...output,
+						n
+					})) as unknown as TTxDetails['vout']
+				},
+				[FUNDING_TXID]: {
+					confirmations: 10,
+					vout: [
+						{
+							value: 0.001,
+							n: 0,
+							scriptPubKey: { address: receiveAddress() }
+						}
+					] as unknown as TTxDetails['vout']
+				}
+			});
+
+		// #1542: bitcoind's asm shows a push of up to 4 bytes as a number, so
+		// "hi" was read as no message and left out of the replacement.
+		it('signs a replacement that keeps a two byte message', async function () {
+			stubWithNulldata({
+				asm: 'OP_RETURN 26984',
+				hex: '6a026869',
+				type: 'nulldata'
+			});
+
+			const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+			if (res.isErr()) throw res.error;
+			expect(res.value.message).to.equal('hi');
+			const created = await wallet.transaction.createTransaction();
+			if (created.isErr()) throw created.error;
+
+			const tx = BitcoinTransaction.fromHex(created.value.hex);
+			const embedded = tx.outs.filter((out) => out.script[0] === 0x6a);
+			expect(embedded).to.have.length(1);
+			const [, payload] = bitcoinScript.decompile(embedded[0].script) ?? [];
+			expect(Buffer.isBuffer(payload)).to.equal(true);
+			expect((payload as Buffer).toString().trimEnd()).to.equal('hi');
+			const fee = 100_000 - tx.outs.reduce((sum, out) => sum + out.value, 0);
+			expect(fee).to.equal(res.value.fee);
+		});
+
+		// #1542: the replacement carries one message, and every message but the
+		// last was dropped from it.
+		[
+			{
+				name: 'two OP_RETURN outputs',
+				scriptPubKeys: [nulldata('first message'), nulldata('second message')]
+			},
+			{
+				name: 'an OP_RETURN with two pushes',
+				scriptPubKeys: [nulldata('first message', 'second message')]
+			}
+		].forEach(({ name, scriptPubKeys }) => {
+			it(`refuses a transaction with ${name}`, async function () {
+				stubWithNulldata(...scriptPubKeys);
+
+				const rbfData = await wallet.getRbfData({
+					txHash: { tx_hash: BOOSTED_TXID }
+				});
+				expect(rbfData.isErr(), 'getRbfData refused').to.equal(true);
+				const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+
+				expect(res.isErr(), 'setupRbf refused').to.equal(true);
+				if (res.isOk()) return;
+				expect(res.error.message).to.include('more than one OP_RETURN message');
+				expect(wallet.transaction.data.outputs).to.have.length(0);
+				expect(wallet.transaction.data.boostType).to.not.equal(EBoostType.rbf);
+				const created = await wallet.transaction.createTransaction();
+				expect(created.isErr(), 'nothing is signed').to.equal(true);
 			});
 		});
 
@@ -945,14 +1042,7 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 							vin: [{ txid: FUNDING_TXID, vout: 0 }] as TTxDetails['vin'],
 							vout: [
 								{ value: 0.0009, n: 0, scriptPubKey: { address: P2WPKH } },
-								{
-									value: 0,
-									n: 1,
-									scriptPubKey: {
-										asm: `OP_RETURN ${Buffer.from(message).toString('hex')}`,
-										type: 'nulldata'
-									}
-								},
+								{ value: 0, n: 1, scriptPubKey: nulldata(message) },
 								{
 									value: 0.00009,
 									n: 2,
