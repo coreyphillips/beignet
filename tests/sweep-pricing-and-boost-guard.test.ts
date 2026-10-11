@@ -1276,6 +1276,49 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 				});
 			}
 		);
+
+		// #1563: outbidding the 1,000 sat fee on 344 vB takes 4 sat/vB, which the
+		// 300 sat change cannot pay. Without it the 1,300 left pays the rate on
+		// 313 vB, but only 300 more than the original (BIP 125 wants 313).
+		[ECoinSelectPreference.small, ECoinSelectPreference.large].forEach(
+			(preference) => {
+				it(`refuses a dropped-change replacement under the relay floor with preference ${preference}`, async function () {
+					wallet.updateCoinSelectPreference(preference);
+					wallet.feeEstimates = { ...wallet.feeEstimates, fast: 2, slow: 1 };
+					const vouts = [0, 1, 2, 3];
+					stubLookups({
+						[BOOSTED_TXID]: {
+							vin: vouts.map((vout) => ({
+								txid: FUNDING_TXID,
+								vout
+							})) as TTxDetails['vin'],
+							vout: [
+								{ value: 0.003987, n: 0, scriptPubKey: { address: P2WPKH } },
+								{
+									value: 0.000003,
+									n: 1,
+									scriptPubKey: { address: changeAddress() }
+								}
+							] as unknown as TTxDetails['vout']
+						},
+						[FUNDING_TXID]: {
+							confirmations: 10,
+							vout: vouts.map((n) => ({
+								value: 0.001,
+								n,
+								scriptPubKey: { address: receiveAddress() }
+							})) as unknown as TTxDetails['vout']
+						}
+					});
+
+					const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+
+					expect(res.isErr(), 'setupRbf refused').to.equal(true);
+					if (res.isOk()) return;
+					expect(res.error.message).to.include('Not enough sats');
+				});
+			}
+		);
 	});
 
 	describe('setupCpfp', function () {

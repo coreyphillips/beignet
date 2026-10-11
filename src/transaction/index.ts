@@ -2324,10 +2324,30 @@ export class Transaction {
 			const outputTotal = this.getTransactionOutputValue({
 				outputs
 			});
+			// The relay floor is a rate on the size with change. A replacement that
+			// drops its change pays the leftover, the same at every rate, on the
+			// smaller size, so the leftover must outbid the original at that size.
+			// A fee that keeps the change already clears this.
+			const noChangeVsize =
+				this.getTotalFee({
+					transaction: { ...transaction, outputs, changeAddress: '' },
+					satsPerByte: 2,
+					message: transaction.message,
+					coinSelectPreference: ECoinSelectPreference.consolidate,
+					generatesChange: false
+				}) / 2;
+			const outbidsOriginal =
+				newFee >=
+				transaction.fee +
+					noChangeVsize * TRANSACTION_DEFAULTS.incrementalRelayFee;
 
 			// A replacement that drops its change pays the whole leftover as fee,
 			// so its outputs and fee add up to exactly the inputs.
-			if (outputTotal + newFee > inputTotal || newFee >= inputTotal / 2) {
+			if (
+				outputTotal + newFee > inputTotal ||
+				newFee >= inputTotal / 2 ||
+				!outbidsOriginal
+			) {
 				/*
 				 * We could always pull the fee from the output total,
 				 * but this may negatively impact the transaction made by the user.
