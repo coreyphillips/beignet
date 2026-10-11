@@ -89,6 +89,30 @@ describe('Capped fee quote below 2 sat/vB (#1543)', function () {
 		await wallet?.stop();
 	});
 
+	it('rechecks funds when capping below the requested rate', async () => {
+		await wallet.transaction.resetSendTransaction();
+		const staged = wallet.transaction.updateSendTransaction({
+			transaction: {
+				inputs: [{ ...inputs[0], value: 1_700 }],
+				outputs: [{ address: RECIPIENT, value: 1_472, index: 0 }],
+				changeAddress
+			}
+		});
+		if (staged.isErr()) throw staged.error;
+
+		const quote = wallet.transaction.getTotalFeeObj({ satsPerByte: 1.5 });
+		if (quote.isErr()) throw quote.error;
+		expect(quote.value.maxSatPerByte).to.equal(0);
+		expect(quote.value.satsPerByte).to.equal(0);
+		expect(quote.value.totalFee).to.equal(228);
+
+		const fee = wallet.transaction.updateFee({
+			satsPerByte: quote.value.satsPerByte
+		});
+		if (fee.isErr()) throw fee.error;
+		expect(fee.value.fee).to.equal(quote.value.totalFee);
+	});
+
 	[1, 2].forEach((inputCount) => {
 		it(`advertises a rate updateFee accepts for ${inputCount} input(s)`, async () => {
 			await wallet.transaction.resetSendTransaction();

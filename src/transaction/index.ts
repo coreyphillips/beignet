@@ -844,6 +844,12 @@ export class Transaction {
 			// rate keeps, so a maximum above the request does not mean it fits.
 			if (!paysRequested && maxSatPerByte >= satsPerByte) {
 				maxSatPerByte = fitUnderHalf(Math.ceil(satsPerByte) - 1);
+				if (!transaction.max && feeAt(maxSatPerByte) > available) {
+					maxSatPerByte = highestFitting(
+						maxSatPerByte,
+						(rate) => feeAt(rate) <= available
+					);
+				}
 			}
 			if (maxSatPerByte < satsPerByte && !paysRequested) {
 				// quoteAt prices the coins selected at the requested rate. The capped
