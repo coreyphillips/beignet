@@ -731,9 +731,22 @@ export class Transaction {
 							coinSelectPreference
 					  })
 					: quoteAt(rate).totalFee;
-			if (maxSatPerByte && feeAt(maxSatPerByte) >= txBalance / 2) {
-				maxSatPerByte--;
-			}
+			// A higher rate can select more coins than this quote did, so the
+			// size-based maximum can be many rates over half. Coin selection only
+			// adds coins as the rate rises, so the fee does not fall with it and a
+			// binary search finds the highest rate under half.
+			const fitUnderHalf = (rate: number): number => {
+				if (!rate || feeAt(rate) < txBalance / 2) return rate;
+				let fits = 0;
+				let over = rate;
+				while (over - fits > 1) {
+					const mid = Math.floor((fits + over) / 2);
+					if (feeAt(mid) < txBalance / 2) fits = mid;
+					else over = mid;
+				}
+				return fits;
+			};
+			maxSatPerByte = fitUnderHalf(maxSatPerByte);
 			// updateFee refuses a fee the inputs cannot pay on top of the outputs.
 			// Only a replacement's inputs are fixed: an ordinary send selects more
 			// coins at a higher rate, and a max send sizes its output from the fee.
@@ -757,16 +770,15 @@ export class Transaction {
 				if (changeAtMax) {
 					changeAddress = changeAtMax;
 					pricesChange = true;
-					maxSatPerByte = Math.min(
-						maxSatPerByte,
-						this.getMaxSatsPerByte({
-							transactionByteCount: byteCountFor(true),
-							balance: txBalance
-						})
+					maxSatPerByte = fitUnderHalf(
+						Math.min(
+							maxSatPerByte,
+							this.getMaxSatsPerByte({
+								transactionByteCount: byteCountFor(true),
+								balance: txBalance
+							})
+						)
 					);
-					if (maxSatPerByte && feeAt(maxSatPerByte) >= txBalance / 2) {
-						maxSatPerByte--;
-					}
 				}
 			}
 			// The maximum is a whole rate, but updateFee takes any rate whose fee
