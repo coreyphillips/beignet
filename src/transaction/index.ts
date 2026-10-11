@@ -781,12 +781,13 @@ export class Transaction {
 				);
 			}
 			// Lowering the maximum can put the remainder above dust. The builder
-			// then adds change, which needs its own fee.
+			// then adds change, which needs its own fee. Below 2 sat/vB the size
+			// floor can keep the remainder under dust, so size at the maximum.
 			if (!pricesChange) {
 				const changeAtMax = this.generatedChangeAddress({
 					transaction,
 					inputs,
-					fee: Math.ceil(byteCountFor(false) * maxSatPerByte)
+					fee: Math.ceil(byteCountFor(false, maxSatPerByte) * maxSatPerByte)
 				});
 				if (changeAtMax) {
 					changeAddress = changeAtMax;
@@ -795,7 +796,7 @@ export class Transaction {
 						Math.min(
 							maxSatPerByte,
 							this.getMaxSatsPerByte({
-								transactionByteCount: byteCountFor(true),
+								transactionByteCount: byteCountFor(true, maxSatPerByte),
 								balance: txBalance
 							})
 						)
