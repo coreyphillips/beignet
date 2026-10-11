@@ -68,9 +68,9 @@ describe('Transaction Test', function () {
 		const feeInfo = wallet.getFeeInfo({ satsPerByte: 5 });
 		if (feeInfo.isErr()) throw feeInfo.error;
 		expect(feeInfo.value.satsPerByte).to.equal(5);
-		expect(feeInfo.value.totalFee).to.equal(830);
-		expect(feeInfo.value.transactionByteCount).to.equal(166);
-		expect(feeInfo.value.maxSatPerByte).to.equal(240);
+		expect(feeInfo.value.totalFee).to.equal(705);
+		expect(feeInfo.value.transactionByteCount).to.equal(141);
+		expect(feeInfo.value.maxSatPerByte).to.equal(283);
 	});
 
 	it('Should successfully create and decode a transaction.', async (): Promise<void> => {
@@ -85,7 +85,7 @@ describe('Transaction Test', function () {
 		});
 		if (sendRes.isErr()) throw sendRes.error;
 		expect(sendRes.value).to.equal(
-			'020000000001014b44d379e48a8100d1c26f7220b8bbf7a4894ff015d5bc4064a28d08d25d808d0000000000000000000288130000000000001600143f1a7a1802e377d01602acf1cad403368ed3bb89ba21010000000000160014a6bd95db4dd6979189cad389daad006e236f4ba802483045022100dd709b656c271c7e2ab4c83e0245b9b8d9096a1c7a33eddc9a32113f436851d9022033f8e5cb016ae4c440badfa34e438ada7bea2cdd36e782c136e516350b502bca012102e86b90924963237c59e5389aab1cc5350c114549d1c5e7186a56ef33aea24ff900000000'
+			'020000000001014b44d379e48a8100d1c26f7220b8bbf7a4894ff015d5bc4064a28d08d25d808d0000000000000000000288130000000000001600143f1a7a1802e377d01602acf1cad403368ed3bb893722010000000000160014a6bd95db4dd6979189cad389daad006e236f4ba8024730440220078f087ba08b79c02e7cb97593d7e698670dd6e7537e3639dec70b4d354f8fa8022018a20a64618a405427eb2e0e67ef9ae2b89bfe1b51cdb365d44b5314b9728a06012102e86b90924963237c59e5389aab1cc5350c114549d1c5e7186a56ef33aea24ff900000000'
 		);
 
 		const decodeRes = decodeRawTransaction(sendRes.value, wallet.network);
@@ -135,11 +135,11 @@ describe('Transaction Test', function () {
 			});
 		if (sweepPrivateKey.isErr()) throw sweepPrivateKey.error;
 		expect(sweepPrivateKey.value.id).to.equal(
-			'7fbef762e16676715bc94693a495923273259aa1190a5bf97bf18ab676393af5'
+			'ffa808ad25c44a905f6341a17a0a6f7978d1c5fa0f58c05375c903dc929f79ad'
 		);
 		expect(sweepPrivateKey.value.balance).to.equal(99170);
 		expect(sweepPrivateKey.value.hex).to.equal(
-			'02000000000101a501e33469d9c408f8825511ed98dfffc99625e003eb76b804ab4de61eb9f6490000000000ffffffff012480010000000000160014e83d280b219726b31aa5a9aee19a1eae985ad0f10247304402201748d26e4a1b49ac0fc3351fc23a02af7fb3d5c0cf30e026cd44f0014cb3b623022074702ba358169c8ac4792fbe962426046684dc152171168d16b90ed272657421012103eb5e83e7992a936edb19b18e4743047ef0f7aba4f469d8d3da1a2f0c514c7dab00000000'
+			'02000000000101a501e33469d9c408f8825511ed98dfffc99625e003eb76b804ab4de61eb9f6490000000000ffffffff013c81010000000000160014e83d280b219726b31aa5a9aee19a1eae985ad0f102473044022013ee6d34c0627fad7d1a18318a4dfb60935f5ae71b3163702deb5afe47b435bc02205d83009de5cbe8a65f15d6f395b95cc7600816420dc93a924c3a62884129a7fa012103eb5e83e7992a936edb19b18e4743047ef0f7aba4f469d8d3da1a2f0c514c7dab00000000'
 		);
 	});
 

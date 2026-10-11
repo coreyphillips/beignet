@@ -71,11 +71,11 @@ export const EXPECTED_WALLET_RESULTS = {
 
 export const EXPECTED_TRANSACTION_RESULTS = {
 	decodeRawTransaction: {
-		txid: '5afdbcb5ffa6e1104c4a67e80e8fde2280cb615b70b33c99951debc2d5e5f500',
-		tx_hash: '094e314cbab1a268950a47216293d6ed170133ad265389e8dde7babf5eebed51',
-		size: 223,
+		txid: '786c97889108849e7970651a0dbd10e08ffe7b4ddfd282be54e465441b985308',
+		tx_hash: 'a5ad458d02cc905593e4b6d3c88cdbedcfff31a192691f24abdab92b4cef74ea',
+		size: 222,
 		vsize: 141,
-		weight: 562,
+		weight: 561,
 		version: 2,
 		locktime: 0,
 		vin: [
@@ -84,7 +84,7 @@ export const EXPECTED_TRANSACTION_RESULTS = {
 				vout: 0,
 				scriptSig: { asm: '', hex: '' },
 				txinwitness: [
-					'3045022100dd709b656c271c7e2ab4c83e0245b9b8d9096a1c7a33eddc9a32113f436851d9022033f8e5cb016ae4c440badfa34e438ada7bea2cdd36e782c136e516350b502bca01',
+					'30440220078f087ba08b79c02e7cb97593d7e698670dd6e7537e3639dec70b4d354f8fa8022018a20a64618a405427eb2e0e67ef9ae2b89bfe1b51cdb365d44b5314b9728a0601',
 					'02e86b90924963237c59e5389aab1cc5350c114549d1c5e7186a56ef33aea24ff9'
 				],
 				sequence: 0
@@ -101,7 +101,7 @@ export const EXPECTED_TRANSACTION_RESULTS = {
 				}
 			},
 			{
-				value: 74170,
+				value: 74295,
 				n: 1,
 				scriptPubKey: {
 					asm: 'OP_0 a6bd95db4dd6979189cad389daad006e236f4ba8',
