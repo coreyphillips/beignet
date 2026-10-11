@@ -2601,7 +2601,36 @@ export class Transaction {
 				const noChangeFee = calculateFee(newInputs, noChangeOutputTypes);
 				if (inputAmount < amountToSend + noChangeFee) {
 					if (!noChangeInputs) {
-						return err('Not enough funds');
+						if (coinSelectPreference === 'consolidate' || !amountToSend) {
+							return err('Not enough funds');
+						}
+						// Every input is selected by now. A coin the first pass picked
+						// stays in every shorter selection too, so one worth less than
+						// what it adds to the fee is left out by selecting again.
+						// Inputs of one type and key size add the same, so each kind is
+						// priced once.
+						const added = new Map<string, number>();
+						const economic = newInputs.filter((input, i) => {
+							const { type } = getAddressInfo(input.address);
+							const kind = `${type}:${input.keyPair?.publicKey.length}`;
+							let cost = added.get(kind);
+							if (cost === undefined) {
+								cost = fee - calculateFee(newInputs.filter((_, j) => j !== i));
+								added.set(kind, cost);
+							}
+							return input.value > cost;
+						});
+						if (!economic.length || economic.length === newInputs.length) {
+							return err('Not enough funds');
+						}
+						return this.autoCoinSelect({
+							inputs: economic,
+							outputs,
+							changeAddress,
+							satsPerByte,
+							message,
+							coinSelectPreference
+						});
 					}
 					newInputs = noChangeInputs;
 					inputAmount = noChangeAmount;
