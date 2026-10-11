@@ -570,13 +570,15 @@ describe('UTXO freeze/unfreeze', function () {
 	});
 
 	/**
-	 * Stages a plain send of both coins, starts createTransaction, freezes
-	 * utxoB once `paused` settles, then releases the build through `resume`.
+	 * Stages a plain send of both coins, starts `build`, freezes utxoB once
+	 * `paused` settles, then releases the build through `resume`.
 	 */
 	const freezeDuringBuild = async (
 		paused: Promise<void>,
-		resume: () => void
-	): Promise<Result<{ id: string; hex: string }>> => {
+		resume: () => void,
+		build: () => Promise<Result<unknown>> = (): Promise<Result<unknown>> =>
+			wallet.transaction.createTransaction({})
+	): Promise<Result<unknown>> => {
 		await wallet.resetSendTransaction();
 		const staged = await wallet.transaction.setupTransaction();
 		if (staged.isErr()) throw staged.error;
@@ -596,7 +598,7 @@ describe('UTXO freeze/unfreeze', function () {
 		if (fee.isErr()) throw fee.error;
 		expect(wallet.transaction.data.inputs).to.have.length(2);
 
-		const building = wallet.transaction.createTransaction({});
+		const building = build();
 		await paused;
 		const frozen = await wallet.freezeUtxo({
 			txid: utxoB.tx_hash,
@@ -651,6 +653,85 @@ describe('UTXO freeze/unfreeze', function () {
 			expect(created.isErr()).to.equal(true);
 			if (created.isErr()) {
 				expect(created.error.message).to.equal(
+					`Staged input ${utxoB.tx_hash}:${utxoB.tx_pos} is frozen.`
+				);
+			}
+		} finally {
+			wallet.electrum.getTransactions = getTransactions;
+			await wallet.unfreezeUtxo({ txid: utxoB.tx_hash, index: utxoB.tx_pos });
+			await wallet.resetSendTransaction();
+		}
+	});
+
+	it('exports no coin frozen after staging in an unsigned PSBT (#1525)', async () => {
+		await wallet.resetSendTransaction();
+		const staged = await wallet.transaction.setupTransaction();
+		if (staged.isErr()) throw staged.error;
+		const output = wallet.transaction.updateSendTransaction({
+			transaction: {
+				outputs: [
+					{
+						address: 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk',
+						value: 30000,
+						index: 0
+					}
+				]
+			}
+		});
+		if (output.isErr()) throw output.error;
+		const fee = wallet.transaction.updateFee({ satsPerByte: 2 });
+		if (fee.isErr()) throw fee.error;
+		expect(wallet.transaction.data.inputs).to.have.length(2);
+		const frozen = await wallet.freezeUtxo({
+			txid: utxoB.tx_hash,
+			index: utxoB.tx_pos
+		});
+		if (frozen.isErr()) throw frozen.error;
+		try {
+			const built = await wallet.transaction.createUnsignedPsbt();
+			expect(built.isErr()).to.equal(true);
+			if (built.isErr()) {
+				expect(built.error.message).to.equal(
+					`Staged input ${utxoB.tx_hash}:${utxoB.tx_pos} is frozen.`
+				);
+			}
+
+			// A caller that froze the coin to reserve it for this send.
+			const reserved = await wallet.transaction.createUnsignedPsbt({
+				spendFrozen: true
+			});
+			if (reserved.isErr()) throw reserved.error;
+			const txids = reserved.value.txInputs.map(({ hash }) =>
+				Buffer.from(hash).reverse().toString('hex')
+			);
+			expect(txids.sort()).to.deep.equal([utxoA.tx_hash, utxoB.tx_hash]);
+		} finally {
+			await wallet.unfreezeUtxo({ txid: utxoB.tx_hash, index: utxoB.tx_pos });
+			await wallet.resetSendTransaction();
+		}
+	});
+
+	it('exports no coin frozen while an unsigned PSBT loads prevouts (#1525)', async () => {
+		const getTransactions = wallet.electrum.getTransactions;
+		const paused = deferred();
+		const resume = deferred();
+		wallet.electrum.getTransactions = async (): ReturnType<
+			typeof getTransactions
+		> => {
+			paused.resolve();
+			await resume.promise;
+			return err('offline');
+		};
+		try {
+			const built = await freezeDuringBuild(
+				paused.promise,
+				resume.resolve,
+				() => wallet.transaction.createUnsignedPsbt()
+			);
+			expect(wallet.isUtxoFrozen(utxoB.tx_hash, utxoB.tx_pos)).to.equal(true);
+			expect(built.isErr()).to.equal(true);
+			if (built.isErr()) {
+				expect(built.error.message).to.equal(
 					`Staged input ${utxoB.tx_hash}:${utxoB.tx_pos} is frozen.`
 				);
 			}
