@@ -1168,14 +1168,17 @@ export class Transaction {
 	 * stops before signing.
 	 * @param {ISendTransaction} [transactionData]
 	 * @param {boolean} [shuffleOutputs]
+	 * @param {boolean} [spendFrozen] Keeps staged inputs that are frozen, for a caller that froze them to reserve them for this send.
 	 * @returns {Promise<Result<Psbt>>}
 	 */
 	createUnsignedPsbt = async ({
 		transactionData = this.data,
-		shuffleOutputs = true
+		shuffleOutputs = true,
+		spendFrozen = false
 	}: {
 		transactionData?: ISendTransaction;
 		shuffleOutputs?: boolean;
+		spendFrozen?: boolean;
 	} = {}): Promise<Result<Psbt>> => {
 		const inputValue = this.getTransactionInputValue({
 			inputs: transactionData.inputs
@@ -1208,6 +1211,16 @@ export class Transaction {
 			if (metadataRes.isErr()) return err(metadataRes.error.message);
 			const changeRes = await this.addChangeOutputMetadata(psbt);
 			if (changeRes.isErr()) return err(changeRes.error.message);
+			// A coin frozen since staging, or during the awaits above, must not
+			// reach an external signer. No await may sit between this and return.
+			if (!spendFrozen) {
+				for (const { hash, index } of psbt.txInputs) {
+					const txid = Buffer.from(hash).reverse().toString('hex');
+					if (this._wallet.isUtxoFrozen(txid, index)) {
+						return err(`Staged input ${txid}:${index} is frozen.`);
+					}
+				}
+			}
 			return ok(psbt);
 		} catch (e) {
 			return err(e);
