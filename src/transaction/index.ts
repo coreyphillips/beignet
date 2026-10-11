@@ -322,6 +322,24 @@ export class Transaction {
 	}
 
 	/**
+	 * The vbytes getByteCount leaves out for inputs signed with an
+	 * uncompressed key. It prices a P2PKH scriptSig with a 33 byte key, and
+	 * an uncompressed one is 65 bytes.
+	 * @private
+	 * @param {IUtxo[]} inputs
+	 * @returns {number}
+	 */
+	private uncompressedKeyBytes(inputs: IUtxo[]): number {
+		return (
+			inputs.filter(
+				(input) =>
+					input.keyPair?.publicKey.length === 65 &&
+					getAddressInfo(input.address).type === 'p2pkh'
+			).length * 32
+		);
+	}
+
+	/**
 	 * Rewrites plain P2WSH input counts to the weight-accurate
 	 * MULTISIG-P2WSH:m-n key for multisig wallets. getByteCount has no
 	 * generic P2WSH input weight; without this the byte count is unusable.
@@ -487,11 +505,9 @@ export class Transaction {
 					fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
 				}
 
-				let transactionByteCount = getByteCount(
-					inputParam,
-					outputParam,
-					message
-				);
+				let transactionByteCount =
+					getByteCount(inputParam, outputParam, message) +
+					this.uncompressedKeyBytes(inputs);
 				if (satsPerByte < 2 && !this.skipsSizeFloor(transaction, inputs)) {
 					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
 					if (transactionByteCount < minByteCount)
@@ -642,11 +658,9 @@ export class Transaction {
 					fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
 				}
 
-				let transactionByteCount = getByteCount(
-					inputParam,
-					outputParam,
-					message
-				);
+				let transactionByteCount =
+					getByteCount(inputParam, outputParam, message) +
+					this.uncompressedKeyBytes(inputs);
 				if (satsPerByte < 2 && !this.skipsSizeFloor(transaction, inputs)) {
 					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
 					if (transactionByteCount < minByteCount)
