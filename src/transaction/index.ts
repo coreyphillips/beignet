@@ -840,6 +840,11 @@ export class Transaction {
 			const paysRequested =
 				quote.totalFee < txBalance / 2 &&
 				(!!transaction.max || quote.totalFee <= available);
+			// Below 2 sat/vB the size floor can leave dust change that a higher
+			// rate keeps, so a maximum above the request does not mean it fits.
+			if (!paysRequested && maxSatPerByte >= satsPerByte) {
+				maxSatPerByte = fitUnderHalf(Math.ceil(satsPerByte) - 1);
+			}
 			if (maxSatPerByte < satsPerByte && !paysRequested) {
 				// quoteAt prices the coins selected at the requested rate. The capped
 				// rate can select fewer, and their change can be dust.

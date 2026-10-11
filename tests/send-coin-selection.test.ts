@@ -626,4 +626,52 @@ describe('sendMany coin selection (#1360)', function () {
 			expect(estimate.value.transactionByteCount).to.equal(314);
 		});
 	});
+
+	// At 1.5 sat/vB the 256 vB size floor leaves 1,100 from a 1,700 sat coin
+	// with 216 sats of change, so the fee is the 600 leftover, over half the
+	// payment. 2 sat/vB has no floor and keeps the change, so the maximum is
+	// above the request, but only 1 sat/vB fits below it.
+	describe('a requested rate below a higher maximum that fits (#1584)', function () {
+		const AMOUNT = 1_100;
+
+		beforeEach(function () {
+			for (const utxo of wallet.data.utxos.splice(0)) {
+				wallet.data.balance -= utxo.value;
+				injected.delete(utxo.tx_hash);
+			}
+			injectUtxo('ff'.repeat(32), 1_700);
+			wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
+		});
+
+		it('quotes a rate below the request that sends', async function () {
+			const estimate = wallet.getFeeInfo({
+				satsPerByte: 1.5,
+				transaction: {
+					outputs: [{ address: RECIPIENT, value: AMOUNT, index: 0 }]
+				}
+			});
+			if (estimate.isErr()) throw estimate.error;
+			expect(estimate.value.satsPerByte).to.equal(1);
+			expect(estimate.value.totalFee).to.equal(256);
+
+			const refused = await wallet.send({
+				address: RECIPIENT,
+				amount: AMOUNT,
+				satsPerByte: 1.5,
+				broadcast: false
+			});
+			expect(refused.isErr()).to.equal(true);
+
+			const res = await wallet.send({
+				address: RECIPIENT,
+				amount: AMOUNT,
+				satsPerByte: estimate.value.satsPerByte,
+				broadcast: false
+			});
+			if (res.isErr()) throw res.error;
+			const tx = BitcoinTransaction.fromHex(res.value);
+			expect(tx.outs).to.have.length(2);
+			expect(feeOf(tx)).to.equal(estimate.value.totalFee);
+		});
+	});
 });
