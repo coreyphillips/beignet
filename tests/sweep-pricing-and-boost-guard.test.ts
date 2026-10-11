@@ -282,6 +282,70 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 					const updated = wallet.transaction.updateFee({ satsPerByte: 7 });
 					if (updated.isErr()) throw updated.error;
 				});
+
+				// #1545: one coin pays 5 sat/vB, so the size-based maximum is 457.
+				// Coin selection at 457 adds the second coin, and with it the fee is
+				// over half the payment down to 365.
+				it(`quotes a maximum rate whose own coin selection fits under half with preference ${preference}`, async function () {
+					wallet.updateCoinSelectPreference(preference);
+					injectUtxo(FUNDING_TXID, 185_744);
+					injectUtxo(BOOSTED_TXID, 176_152);
+					const setup = await wallet.transaction.setupTransaction();
+					if (setup.isErr()) throw setup.error;
+					const staged = wallet.transaction.updateSendTransaction({
+						transaction: {
+							outputs: [{ address: P2WPKH, value: 152_312, index: 0 }]
+						}
+					});
+					if (staged.isErr()) throw staged.error;
+
+					const quote = wallet.getFeeInfo({ satsPerByte: 5 });
+					if (quote.isErr()) throw quote.error;
+					expect(quote.value.transactionByteCount).to.equal(166);
+					expect(quote.value.maxSatPerByte).to.equal(364);
+					const atMax = wallet.transaction.updateFee({
+						satsPerByte: quote.value.maxSatPerByte
+					});
+					if (atMax.isErr()) throw atMax.error;
+					expect(atMax.value.fee).to.equal(209 * 364);
+					const aboveMax = wallet.transaction.updateFee({
+						satsPerByte: quote.value.maxSatPerByte + 1
+					});
+					expect(aboveMax.isErr(), '365 sat/vB is refused').to.equal(true);
+				});
+
+				// From 96 to 110 sat/vB the send generates change it cannot pay for, so
+				// the fee is the whole 20,000 left over. At 111 the leftover is dust,
+				// the change is gone and the fee is under half the payment again.
+				[
+					[29_936, 29_936],
+					[55_642, 4_230]
+				].forEach(([first, second]) => {
+					it(`quotes a maximum rate that drops generated change with preference ${preference} and coins of ${first} and ${second}`, async function () {
+						wallet.updateCoinSelectPreference(preference);
+						injectUtxo(FUNDING_TXID, first);
+						injectUtxo(BOOSTED_TXID, second);
+						const setup = await wallet.transaction.setupTransaction();
+						if (setup.isErr()) throw setup.error;
+						const staged = wallet.transaction.updateSendTransaction({
+							transaction: {
+								changeAddress: '',
+								outputs: [{ address: P2WPKH, value: 39_872, index: 0 }]
+							}
+						});
+						if (staged.isErr()) throw staged.error;
+
+						const quote = wallet.getFeeInfo({ satsPerByte: 112 });
+						if (quote.isErr()) throw quote.error;
+						expect(quote.value.maxSatPerByte).to.equal(111);
+						expect(quote.value.totalFee).to.equal(178 * 111);
+						const atMax = wallet.transaction.updateFee({
+							satsPerByte: quote.value.maxSatPerByte
+						});
+						if (atMax.isErr()) throw atMax.error;
+						expect(atMax.value.fee).to.equal(quote.value.totalFee);
+					});
+				});
 			}
 		);
 
