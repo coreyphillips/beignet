@@ -331,8 +331,11 @@ export class Transaction {
 	 */
 	private uncompressedKeyBytes(inputs: IUtxo[]): number {
 		return (
-			inputs.filter((input) => input.keyPair?.publicKey.length === 65).length *
-			32
+			inputs.filter(
+				(input) =>
+					input.keyPair?.publicKey.length === 65 &&
+					getAddressInfo(input.address).type === 'p2pkh'
+			).length * 32
 		);
 	}
 

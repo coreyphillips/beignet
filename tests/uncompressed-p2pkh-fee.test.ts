@@ -151,4 +151,51 @@ describe('Fee estimation for an uncompressed P2PKH input (#1527)', function () {
 			'New total amount exceeds the available balance. Unable to update the transaction fee.'
 		);
 	});
+
+	it('prices Taproot inputs equally for compressed and uncompressed signing keys', async () => {
+		const taproot = bitcoin.payments.p2tr({
+			internalPubkey: keyPair.publicKey.subarray(1, 33),
+			network: regtest
+		});
+		const funding = new bitcoin.Transaction();
+		funding.addInput(Buffer.alloc(32, 2), 0);
+		funding.addOutput(taproot.output!, INPUT_VALUE);
+		funding.addOutput(taproot.output!, INPUT_VALUE);
+		for (const compressed of [true, false]) {
+			await wallet.transaction.resetSendTransaction();
+			wallet.transaction.updateSendTransaction({
+				transaction: {
+					outputs: [{ address: RECIPIENT, value: 10_000, index: 0 }],
+					changeAddress,
+					satsPerByte: RATE
+				}
+			});
+			const added = wallet.transaction.addExternalInputs({
+				inputs: [0, 1].map((tx_pos) => ({
+					...input,
+					address: taproot.address!,
+					tx_hash: funding.getId(),
+					tx_pos
+				})),
+				keyPair: ECPair.fromPrivateKey(keyPair.privateKey!, {
+					network: regtest,
+					compressed
+				})
+			});
+			if (added.isErr()) throw added.error;
+			const quote = wallet.transaction.getTotalFeeObj({ satsPerByte: RATE });
+			if (quote.isErr()) throw quote.error;
+			expect(quote.value.totalFee).to.equal(1_880);
+			expect(wallet.transaction.getTotalFee({ satsPerByte: RATE })).to.equal(
+				1_880
+			);
+			const res = await wallet.transaction.createTransaction({});
+			if (res.isErr()) throw res.error;
+			const tx = bitcoin.Transaction.fromHex(res.value.hex);
+			expect(tx.virtualSize()).to.equal(188);
+			const paid =
+				2 * INPUT_VALUE - tx.outs.reduce((total, out) => total + out.value, 0);
+			expect(paid).to.equal(RATE * tx.virtualSize());
+		}
+	});
 });
