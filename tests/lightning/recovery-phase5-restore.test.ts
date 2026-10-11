@@ -2370,7 +2370,9 @@ describe('Recovery phase 5: restore driver', () => {
 		// Issue #1528. Every member granted the attempt over N, then another
 		// device took the next epoch on G1 and G3 and stored N+1 there. A
 		// rollback then drops G3's grants, leaving it possibly stale below
-		// the attempt, so only G1's grant of the takeover shows.
+		// the attempt, so only G1's grant of the takeover shows. Issue #1546:
+		// G1 and G2's registration receipts cover that checkpoint, and must
+		// not clear the flag.
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-restore-'));
 		const file = path.join(dir, 'g3.sqlite');
 		const openG3 = (): ReferenceGuardian =>
@@ -2409,6 +2411,11 @@ describe('Recovery phase 5: restore driver', () => {
 		const rep = replicatorFor(live.storage, bind(members));
 		const decision = await rep.ensureNamespace();
 		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		const historical = await Promise.all(
+			[clients[0], clients[1]].map(
+				async (client) => (await client.getHead(ROOT.recoveryId)).receipt!
+			)
+		);
 		await rep.replicatePending(lease);
 		const writer = generateWriterKey();
 		const guard = await grantNext(clients[0], lease, writer);
@@ -2432,6 +2439,16 @@ describe('Recovery phase 5: restore driver', () => {
 		expect(rolledBack.possiblyStale).to.equal(true);
 		expect(rolledBack.state?.lease.epoch).to.equal(lease.epoch);
 		expect(rolledBack.certificates ?? []).to.have.length(0);
+		const repaired = g3.submitRepairEvidence({
+			recoveryId: ROOT.recoveryId,
+			target: rolledBack.state as GuardianState,
+			receipts: historical,
+			certificates: []
+		});
+		expect(repaired.status).to.equal(GuardianStatus.ERR_EPOCH_REGRESSION);
+		expect((await clients[2].getHead(ROOT.recoveryId)).possiblyStale).to.equal(
+			true
+		);
 
 		const events: IRestoreEvent[] = [];
 		try {

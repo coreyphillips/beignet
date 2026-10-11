@@ -3030,6 +3030,29 @@ export class ReferenceGuardian {
 						current
 					};
 				}
+				// A quorum's receipts show the target was current once, not that
+				// it still is, so they cannot lift a lease below one it held.
+				// An unreadable mark may have recorded any epoch.
+				const mark = this.store.getErasedEpoch(request.recoveryId);
+				const erased = tryReadU64(mark);
+				if (mark !== null && erased === null) {
+					return {
+						...err(
+							GuardianStatus.ERR_STORE_UNCERTAIN,
+							'the epoch a rollback discarded is unreadable; this guardian may have granted any later one'
+						),
+						current
+					};
+				}
+				if (erased !== null && target.lease.epoch < erased) {
+					return {
+						...err(
+							GuardianStatus.ERR_EPOCH_REGRESSION,
+							`a rollback discarded epoch ${erased}, which this guardian may have granted; continue SYNC repair up to it`
+						),
+						current
+					};
+				}
 				this.store.setPossiblyStale(request.recoveryId, false);
 				return { status: GuardianStatus.OK };
 			});
@@ -3601,6 +3624,28 @@ export class ReferenceGuardian {
 		reason: string
 	): void {
 		const recoveryId = ns.recoveryId;
+		// Grants this guardian signed past the checkpoint stay valid after
+		// their rows go, so remember the highest lease it held: repair
+		// evidence below it cannot prove the checkpoint current.
+		const declared = tryParseState(ns.state);
+		let held =
+			declared !== null && declared.recoveryId.equals(recoveryId)
+				? declared.lease.epoch
+				: 0n;
+		for (const row of this.store.listEpochs(recoveryId)) {
+			const epoch = tryReadU64(row.epoch);
+			if (epoch !== null && epoch > held) held = epoch;
+		}
+		// An unreadable mark already refuses all evidence; a number would
+		// narrow that.
+		const mark = this.store.getErasedEpoch(recoveryId);
+		const erased = tryReadU64(mark);
+		if (
+			held > checkpoint.lease.epoch &&
+			(mark === null || (erased !== null && held > erased))
+		) {
+			this.store.setErasedEpoch(recoveryId, u64be(held));
+		}
 		this.store.archiveRecordsAbove(
 			recoveryId,
 			u64be(checkpoint.logHead.sequence),
