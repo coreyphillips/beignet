@@ -742,6 +742,47 @@ describe('UTXO freeze/unfreeze', function () {
 		}
 	});
 
+	it('exports no coin frozen during the final cleanup of buildPsbt (#1548)', async () => {
+		const transaction = wallet.transaction;
+		const clear = transaction.clearStoredSendTransaction;
+		const paused = deferred();
+		const resume = deferred();
+		transaction.clearStoredSendTransaction = async (): ReturnType<
+			typeof clear
+		> => {
+			paused.resolve();
+			await resume.promise;
+			return clear.call(transaction);
+		};
+		try {
+			// 80k needs both coins, so utxoB is selected.
+			const building = wallet.buildPsbt({
+				address: 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk',
+				amount: 80000,
+				satsPerByte: 2
+			});
+			await paused.promise;
+			const frozen = await wallet.freezeUtxo({
+				txid: utxoB.tx_hash,
+				index: utxoB.tx_pos
+			});
+			if (frozen.isErr()) throw frozen.error;
+			resume.resolve();
+			const built = await building;
+			expect(wallet.isUtxoFrozen(utxoB.tx_hash, utxoB.tx_pos)).to.equal(true);
+			expect(built.isErr()).to.equal(true);
+			if (built.isErr()) {
+				expect(built.error.message).to.equal(
+					`Staged input ${utxoB.tx_hash}:${utxoB.tx_pos} is frozen.`
+				);
+			}
+		} finally {
+			transaction.clearStoredSendTransaction = clear;
+			await wallet.unfreezeUtxo({ txid: utxoB.tx_hash, index: utxoB.tx_pos });
+			await wallet.resetSendTransaction();
+		}
+	});
+
 	it('prices a direct max send from the coins its own setup staged (#1495)', async () => {
 		await wallet.resetSendTransaction();
 		try {
