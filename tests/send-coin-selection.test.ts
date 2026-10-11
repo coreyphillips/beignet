@@ -460,14 +460,18 @@ describe('sendMany coin selection (#1360)', function () {
 	});
 
 	// One input and one output come to 110 vB, so the 10,000 sat coin pays
-	// 8,400 at 10 sat/vB and leaves 1,600, too little for change. The small
-	// coins cost 680 sats each to spend. Priced at 166 vB, nothing paid.
+	// 8,400 at 10 sat/vB and leaves 1,600. The small coins cost 680 sats each
+	// to spend. Priced at 166 vB, nothing paid. With a 141 vB change output,
+	// 8,300 leaves 290 and 8,400 leaves 190, both under P2WPKH dust, so the
+	// whole leftover is the fee and the quote has to say so (#1584).
 	describe('a payment under 166 vB (#1579)', function () {
-		const AMOUNT = 8_400;
-		const FEE = 1_600;
-
-		for (const coins of [[100, 300, 10_000], [10_000]]) {
-			describe(`from ${coins.join(', ')} sat coins`, function () {
+		for (const [AMOUNT, FEE, coins] of [
+			[8_300, 1_700, [100, 300, 10_000]],
+			[8_300, 1_700, [10_000]],
+			[8_400, 1_600, [100, 300, 10_000]],
+			[8_400, 1_600, [10_000]]
+		] as const) {
+			describe(`of ${AMOUNT} from ${coins.join(', ')} sat coins`, function () {
 				beforeEach(function () {
 					for (const utxo of wallet.data.utxos.splice(0)) {
 						wallet.data.balance -= utxo.value;
@@ -495,7 +499,8 @@ describe('sendMany coin selection (#1360)', function () {
 						}
 					});
 					if (estimate.isErr()) throw estimate.error;
-					expect(estimate.value.totalFee).to.be.at.most(FEE);
+					expect(estimate.value.totalFee).to.equal(FEE);
+					expect(estimate.value.transactionByteCount).to.equal(110);
 					expect(estimate.value.satsPerByte).to.equal(10);
 				});
 
@@ -509,6 +514,7 @@ describe('sendMany coin selection (#1360)', function () {
 					if (res.isErr()) throw res.error;
 
 					expectPaid(BitcoinTransaction.fromHex(res.value));
+					expect(wallet.transaction.data.fee).to.equal(FEE);
 				});
 
 				it('builds it', async function () {
@@ -524,8 +530,56 @@ describe('sendMany coin selection (#1360)', function () {
 					if (imported.isErr()) throw imported.error;
 
 					expectPaid(BitcoinTransaction.fromHex(imported.value.txHex));
+					expect(built.value.fee).to.equal(FEE);
 				});
 			});
 		}
+	});
+
+	// 3,000 from a 4,500 sat coin at 10 sat/vB leaves 90 sats of change, so
+	// the fee is the whole 1,500 leftover, half the payment, which updateFee
+	// refuses. 8 sat/vB is the highest rate that keeps the change (#1584).
+	describe('a payment whose dust change is half its fee (#1584)', function () {
+		const AMOUNT = 3_000;
+
+		beforeEach(function () {
+			for (const utxo of wallet.data.utxos.splice(0)) {
+				wallet.data.balance -= utxo.value;
+				injected.delete(utxo.tx_hash);
+			}
+			injectUtxo('ff'.repeat(32), 4_500);
+			wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
+		});
+
+		it('quotes the highest rate that keeps the change', async function () {
+			const estimate = wallet.getFeeInfo({
+				satsPerByte: 10,
+				transaction: {
+					outputs: [{ address: RECIPIENT, value: AMOUNT, index: 0 }]
+				}
+			});
+			if (estimate.isErr()) throw estimate.error;
+			expect(estimate.value.satsPerByte).to.equal(8);
+			expect(estimate.value.totalFee).to.equal(1_128);
+
+			const refused = await wallet.send({
+				address: RECIPIENT,
+				amount: AMOUNT,
+				satsPerByte: 10,
+				broadcast: false
+			});
+			expect(refused.isErr()).to.equal(true);
+
+			const res = await wallet.send({
+				address: RECIPIENT,
+				amount: AMOUNT,
+				satsPerByte: 8,
+				broadcast: false
+			});
+			if (res.isErr()) throw res.error;
+			const tx = BitcoinTransaction.fromHex(res.value);
+			expect(tx.outs).to.have.length(2);
+			expect(feeOf(tx)).to.equal(estimate.value.totalFee);
+		});
 	});
 });

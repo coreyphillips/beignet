@@ -492,8 +492,10 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			]);
 		});
 
+		// #1584: at 95 sat/vB the 39,872 payment leaves 281 sats of change,
+		// under dust, so the fee is the whole 20,136 leftover, over half.
 		[
-			{ input: 30_004, payment: 39_872, maximum: 95 },
+			{ input: 30_004, payment: 39_872, maximum: 94 },
 			{ input: 55_903, payment: 74_404, maximum: 177 }
 		].forEach(({ input, payment, maximum }) => {
 			it(`prices generated change below half a ${payment}-sat payment`, async function () {
@@ -520,6 +522,14 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 				});
 				if (atMax.isErr()) throw atMax.error;
 				expect(atMax.value.fee).to.equal(quote.value.totalFee);
+				stubLookups({});
+				const created = await wallet.transaction.createTransaction();
+				if (created.isErr()) throw created.error;
+				const tx = BitcoinTransaction.fromHex(created.value.hex);
+				expect(tx.outs.map((out) => out.value)).to.have.members([
+					payment,
+					2 * input - payment - quote.value.totalFee
+				]);
 			});
 		});
 

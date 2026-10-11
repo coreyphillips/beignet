@@ -524,14 +524,19 @@ export class Transaction {
 
 			const fee = feeFor(pricesChange);
 			if (pricesChange) {
-				// The change output can cost more than the inputs have left over.
-				// The payment may still meet the rate without it, and quoting the
-				// whole leftover as the fee leaves the builder nothing to pay change
-				// from.
+				// The change output can cost more than the inputs have left over,
+				// or leave less than dust, which the builder adds to the fee. The
+				// payment may still meet the rate without it, and quoting the whole
+				// leftover as the fee leaves the builder nothing to pay change from.
 				const available =
 					this.getTransactionInputValue({ inputs }) -
 					this.getTransactionOutputValue({ outputs });
-				if (fee > available && feeFor(false) <= available) return available;
+				if (
+					available - fee < getDustThreshold(changeAddress) &&
+					feeFor(false) <= available
+				) {
+					return available;
+				}
 			}
 			const generatedChange =
 				generatesChange &&
@@ -698,9 +703,11 @@ export class Transaction {
 			// To prevent the user from spending more in fees than their output, use the output amount if available.
 			const txBalance =
 				outputAmount && outputAmount < inputAmount ? outputAmount : inputAmount;
-			// See getTotalFee: a payment that cannot also pay for its change output
-			// goes without it, with the whole leftover as the fee. updateFee refuses
-			// a fee of half the balance, so a leftover that large keeps the change.
+			// See getTotalFee: a payment that cannot also pay for its change output,
+			// or would leave it below dust, goes without it, with the whole leftover
+			// as the fee. updateFee refuses a fee of half the balance, so a leftover
+			// that large keeps change it cannot pay for. Dust change cannot stay: the
+			// fee with it looks payable, and updateFee prices the leftover.
 			const available = inputAmount - outputAmount;
 			const quoteAt = (
 				rate: number
@@ -709,7 +716,13 @@ export class Transaction {
 				// prices it with.
 				const byteCount = byteCountFor(pricesChange, rate);
 				const fee = Math.ceil(byteCount * rate);
-				if (pricesChange && fee > available && available < txBalance / 2) {
+				const leftover = available - fee;
+				if (
+					pricesChange &&
+					changeAddress &&
+					leftover < getDustThreshold(changeAddress) &&
+					(leftover >= 0 || available < txBalance / 2)
+				) {
 					const noChangeByteCount = byteCountFor(false, rate);
 					if (Math.ceil(noChangeByteCount * rate) <= available) {
 						return {
