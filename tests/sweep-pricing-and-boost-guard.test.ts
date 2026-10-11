@@ -1042,6 +1042,35 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			});
 		});
 
+		// #1561: the replacement rebuilt the message from UTF-8 text, so 0xff was
+		// signed as U+FFFD and five spaces were left out.
+		[
+			{ name: 'is not valid UTF-8', hex: '6a05ff74657374' },
+			{ name: 'is only spaces', hex: '6a052020202020' }
+		].forEach(({ name, hex }) => {
+			it(`refuses a transaction whose OP_RETURN message ${name}`, async function () {
+				stubWithNulldata({
+					asm: bitcoinScript.toASM(Buffer.from(hex, 'hex')),
+					hex,
+					type: 'nulldata'
+				});
+
+				const rbfData = await wallet.getRbfData({
+					txHash: { tx_hash: BOOSTED_TXID }
+				});
+				expect(rbfData.isErr(), 'getRbfData refused').to.equal(true);
+				const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+
+				expect(res.isErr(), 'setupRbf refused').to.equal(true);
+				if (res.isOk()) return;
+				expect(res.error.message).to.include('cannot rebuild');
+				expect(wallet.transaction.data.outputs).to.have.length(0);
+				expect(wallet.transaction.data.boostType).to.not.equal(EBoostType.rbf);
+				const created = await wallet.transaction.createTransaction();
+				expect(created.isErr(), 'nothing is signed').to.equal(true);
+			});
+		});
+
 		// #1541: a bare pubkey output inherited the address read before it. Its
 		// 10k was paid to the input's address, to the recipient, or into change.
 		[0, 1, 2].forEach((position) => {

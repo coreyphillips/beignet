@@ -87,6 +87,7 @@ import {
 	appendDescriptorChecksum,
 	buildSortedMultisigPayment,
 	clampFeeRate,
+	createOpReturnScript,
 	decodeOpReturnMessage,
 	err,
 	filterAddressesObjForGapLimit,
@@ -6112,6 +6113,19 @@ export class Wallet {
 			);
 		}
 
+		// The replacement rebuilds the OP_RETURN from this string as UTF-8, and
+		// builds none for a blank message.
+		const message = messages[0]?.toString() ?? '';
+		if (
+			messages.length &&
+			(!Buffer.from(message).equals(messages[0]) ||
+				!createOpReturnScript(message))
+		) {
+			return err(
+				'Transaction carries an OP_RETURN message the replacement cannot rebuild. Unable to RBF.'
+			);
+		}
+
 		if (outputTotal > inputTotal) {
 			return err('Outputs should not be greater than the inputs.');
 		}
@@ -6123,7 +6137,7 @@ export class Wallet {
 			balance: inputTotal,
 			outputs,
 			fee,
-			message: messages[0]?.toString() ?? '',
+			message,
 			addressType,
 			rbf: true
 		});
