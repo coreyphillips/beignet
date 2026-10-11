@@ -312,14 +312,18 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 					expect(aboveMax.isErr(), '365 sat/vB is refused').to.equal(true);
 				});
 
-				// From 96 to 110 sat/vB the send generates change it cannot pay for, so
-				// the fee is the whole 20,000 left over. At 111 the leftover is dust,
-				// the change is gone and the fee is under half the payment again.
+				// From 95 sat/vB both coins pay the whole 20,000 left over, more than
+				// half the payment: up to 110 as change the leftover cannot pay for,
+				// from 111 as dust the builder adds to the fee (#1586). Preference
+				// large pays 95 sat/vB with the 50,322 coin alone.
 				[
 					[29_936, 29_936],
 					[50_322, 9_550]
 				].forEach(([first, second]) => {
-					it(`quotes a maximum rate that drops generated change with preference ${preference} and coins of ${first} and ${second}`, async function () {
+					const oneCoin =
+						preference === ECoinSelectPreference.large && first === 50_322;
+					const [maximum, size] = oneCoin ? [95, 110] : [94, 209];
+					it(`quotes a maximum rate below a whole-leftover fee with preference ${preference} and coins of ${first} and ${second}`, async function () {
 						wallet.updateCoinSelectPreference(preference);
 						injectUtxo(FUNDING_TXID, first);
 						injectUtxo(BOOSTED_TXID, second);
@@ -335,13 +339,17 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 
 						const quote = wallet.getFeeInfo({ satsPerByte: 112 });
 						if (quote.isErr()) throw quote.error;
-						expect(quote.value.maxSatPerByte).to.equal(111);
-						expect(quote.value.totalFee).to.equal(178 * 111);
+						expect(quote.value.maxSatPerByte).to.equal(maximum);
+						expect(quote.value.totalFee).to.equal(size * maximum);
 						const atMax = wallet.transaction.updateFee({
 							satsPerByte: quote.value.maxSatPerByte
 						});
 						if (atMax.isErr()) throw atMax.error;
 						expect(atMax.value.fee).to.equal(quote.value.totalFee);
+						const aboveMax = wallet.transaction.updateFee({
+							satsPerByte: quote.value.maxSatPerByte + 1
+						});
+						expect(aboveMax.isErr()).to.equal(true);
 					});
 				});
 			}
