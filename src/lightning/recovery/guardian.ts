@@ -1132,7 +1132,13 @@ export class ReferenceGuardian {
 						this.rememberErasedLease(state.recoveryId, null, 0n);
 						this.store.deleteAllEpochs(state.recoveryId);
 					}
-					strandedHistory = strayRecords > 0 || strayEpochs.length > 0;
+					// A surviving mark is history too: it bounds grants an
+					// earlier rollback or tombstone discarded, and an
+					// unreadable one may bound any of them.
+					strandedHistory =
+						strayRecords > 0 ||
+						strayEpochs.length > 0 ||
+						this.store.getErasedEpoch(state.recoveryId) !== null;
 					if (strandedHistory) {
 						this.alarm(
 							state.recoveryId,

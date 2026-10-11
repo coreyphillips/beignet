@@ -1773,6 +1773,154 @@ describe('Guardian core: damaged store, rollback, replay, quorum re-entry', () =
 		b.close();
 		c.close();
 	});
+
+	interface IMarkOnlyFixture {
+		file: string;
+		registration: IGuardianRegisterNodeRequest;
+		historical: IGuardianReceipt[];
+		certA: IGuardianTakeoverCertificate;
+		certB: IGuardianTakeoverCertificate;
+		b: ReferenceGuardian;
+		c: ReferenceGuardian;
+	}
+
+	/**
+	 * A and B grant epoch 2 to one writer. A's tombstone keeps that grant
+	 * only in its erased-lease mark, then A loses the tombstone row too, so
+	 * the mark is all that survives under the identity.
+	 */
+	function markOnlyFixture(name: string): IMarkOnlyFixture {
+		const file = path.join(dir, name);
+		const a = makeGuardian(0, file);
+		const b = makeGuardian(1);
+		const c = makeGuardian(2);
+		const registration = buildRegistration();
+		a.register(registration);
+		const historical = [b, c].map(
+			(g) => g.register(registration).receipt as IGuardianReceipt
+		);
+		const acquire = buildAcquire(registration.initialState, WRITER_2);
+		const certA = a.acquireEpoch(acquire)
+			.certificate as IGuardianTakeoverCertificate;
+		const certB = b.acquireEpoch(acquire)
+			.certificate as IGuardianTakeoverCertificate;
+		a.close();
+
+		let raw = new Database(file);
+		raw
+			.prepare('UPDATE guardian_namespaces SET registration_signature = ?')
+			.run(Buffer.alloc(64));
+		raw.close();
+		makeGuardian(0, file).close();
+		raw = new Database(file);
+		const mark = raw
+			.prepare('SELECT epoch FROM guardian_erased_leases')
+			.get() as { epoch: Buffer };
+		expect(mark.epoch.equals(u64be(2n))).to.equal(true);
+		for (const table of ['guardian_records', 'guardian_epochs']) {
+			expect(
+				raw.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()
+			).to.deep.equal({ n: 0 });
+		}
+		raw.prepare('DELETE FROM guardian_namespaces').run();
+		raw.close();
+		return { file, registration, historical, certA, certB, b, c };
+	}
+
+	it('keeps re-registration stale when only an erased-lease mark survives', () => {
+		// Issue #1580. With no records or epoch rows left, B and C's
+		// registration receipts would lift the flag, and A and C could
+		// certify a second writer at epoch 2.
+		const { file, registration, historical, certA, certB, b, c } =
+			markOnlyFixture('mark-only-grant.sqlite');
+		const reopened = makeGuardian(0, file);
+		expect(reopened.register(registration).status).to.equal(GuardianStatus.OK);
+		const stale = (): boolean | undefined =>
+			reopened.getHead({
+				protocolVersion: 1,
+				guardianSetId: SET_ID,
+				recoveryId: ROOT.recoveryId
+			}).possiblyStale;
+		expect(stale()).to.equal(true);
+		const refused = reopened.submitRepairEvidence({
+			recoveryId: ROOT.recoveryId,
+			target: registration.initialState,
+			receipts: historical,
+			certificates: []
+		});
+		expect(refused.status).to.equal(GuardianStatus.ERR_EPOCH_REGRESSION);
+		expect(stale()).to.equal(true);
+
+		const conflicting = buildAcquire(
+			registration.initialState,
+			makeWriter('core-writer-3')
+		);
+		expect(reopened.acquireEpoch(conflicting).status).to.equal(
+			GuardianStatus.ERR_STORE_UNCERTAIN
+		);
+		expect(c.acquireEpoch(conflicting).status).to.equal(GuardianStatus.OK);
+
+		// Replayed up to the erased grant, the takeover's evidence lifts it.
+		expect(
+			reopened.syncEpoch({ certificates: [certA, certB] }).status
+		).to.equal(GuardianStatus.OK);
+		const lifted = reopened.submitRepairEvidence({
+			recoveryId: ROOT.recoveryId,
+			target: headOf(b),
+			receipts: [],
+			certificates: [certA, certB]
+		});
+		expect(lifted.status).to.equal(GuardianStatus.OK);
+		expect(stale()).to.equal(false);
+		expect(reopened.acquireEpoch(conflicting).status).to.equal(
+			GuardianStatus.ERR_EPOCH_SUPERSEDED
+		);
+		reopened.close();
+		b.close();
+		c.close();
+	});
+
+	it('keeps re-registration stale when the surviving mark is unreadable', () => {
+		const { file, registration, certA, certB, b, c } = markOnlyFixture(
+			'unreadable-mark-only.sqlite'
+		);
+		const raw = new Database(file);
+		raw
+			.prepare('UPDATE guardian_erased_leases SET epoch = ?')
+			.run(Buffer.alloc(7, 2));
+		raw.close();
+
+		const reopened = makeGuardian(0, file);
+		expect(reopened.register(registration).status).to.equal(GuardianStatus.OK);
+		const stale = (): boolean | undefined =>
+			reopened.getHead({
+				protocolVersion: 1,
+				guardianSetId: SET_ID,
+				recoveryId: ROOT.recoveryId
+			}).possiblyStale;
+		expect(stale()).to.equal(true);
+		expect(
+			reopened.acquireEpoch(
+				buildAcquire(registration.initialState, makeWriter('core-writer-3'))
+			).status
+		).to.equal(GuardianStatus.ERR_STORE_UNCERTAIN);
+
+		// No evidence can show the unreadable mark satisfied.
+		expect(
+			reopened.syncEpoch({ certificates: [certA, certB] }).status
+		).to.equal(GuardianStatus.OK);
+		const refused = reopened.submitRepairEvidence({
+			recoveryId: ROOT.recoveryId,
+			target: headOf(b),
+			receipts: [],
+			certificates: [certA, certB]
+		});
+		expect(refused.status).to.equal(GuardianStatus.ERR_STORE_UNCERTAIN);
+		expect(stale()).to.equal(true);
+		reopened.close();
+		b.close();
+		c.close();
+	});
 });
 
 describe('Guardian core: structural corruption containment', () => {
