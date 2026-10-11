@@ -2480,11 +2480,12 @@ export class Transaction {
 						inputTypes[type] = 1;
 					}
 				});
-				let baseFee = getByteCount(
-					this.applyMultisigInputWeights(inputTypes),
-					types,
-					message
-				);
+				let baseFee =
+					getByteCount(
+						this.applyMultisigInputWeights(inputTypes),
+						types,
+						message
+					) + this.uncompressedKeyBytes(selected);
 				if (satsPerByte < 2) {
 					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
 					if (baseFee < minByteCount) baseFee = minByteCount;
