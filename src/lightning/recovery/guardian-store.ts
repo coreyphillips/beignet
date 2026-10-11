@@ -203,6 +203,10 @@ CREATE TABLE IF NOT EXISTS guardian_retain_floors (
 	frame_hash BLOB NOT NULL,
 	writer_signature BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS guardian_erased_leases (
+	recovery_id BLOB PRIMARY KEY,
+	epoch BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS guardian_usage (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
 	content_bytes INTEGER NOT NULL
@@ -826,6 +830,27 @@ export class GuardianStore {
 			.run(recoveryId);
 	}
 
+	// ─────────────── erased leases (wire 5.10) ───────────────
+
+	/**
+	 * The highest lease epoch a rollback discarded, u64 big-endian, or null
+	 * when none did. Kept apart from the epoch rows so it survives them.
+	 */
+	getErasedEpoch(recoveryId: Buffer): Buffer | null {
+		const row = this.db
+			.prepare('SELECT epoch FROM guardian_erased_leases WHERE recovery_id = ?')
+			.get(recoveryId) as { epoch: Buffer } | undefined;
+		return row ? row.epoch : null;
+	}
+
+	setErasedEpoch(recoveryId: Buffer, epoch: Buffer): void {
+		this.db
+			.prepare(
+				'INSERT OR REPLACE INTO guardian_erased_leases (recovery_id, epoch) VALUES (?, ?)'
+			)
+			.run(recoveryId, epoch);
+	}
+
 	/**
 	 * The content bytes of the records below a sequence, orphaned ones
 	 * included (contentBytes' measure).
@@ -1018,7 +1043,8 @@ const CONTENT_COLUMNS: ReadonlyArray<[string, string[]]> = [
 			'frame_hash',
 			'writer_signature'
 		]
-	]
+	],
+	['guardian_erased_leases', ['recovery_id', 'epoch']]
 ];
 
 function rowBytesSql(columns: string[]): string {

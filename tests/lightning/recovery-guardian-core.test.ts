@@ -1498,6 +1498,77 @@ describe('Guardian core: damaged store, rollback, replay, quorum re-entry', () =
 		b.close();
 		c.close();
 	});
+
+	it('refuses quorum evidence below a grant its rollback discarded', () => {
+		// Issue #1546. A granted epoch 2 and lost the grant to a rollback.
+		// B and C's receipts from before the takeover still cover A's
+		// checkpoint, but cannot show that nothing followed it.
+		const file = path.join(dir, 'discarded-grant.sqlite');
+		const a = makeGuardian(0, file);
+		const b = makeGuardian(1);
+		const c = makeGuardian(2);
+		const registration = buildRegistration();
+		for (const g of [a, b, c]) g.register(registration);
+		const chain = buildChain(registration.initialState, 2);
+		const historical: IGuardianReceipt[] = [];
+		for (const record of chain) {
+			a.putState({ record });
+			for (const g of [b, c]) {
+				const synced = g.syncRecord({ record });
+				if (record === chain[1]) {
+					historical.push(synced.receipt as IGuardianReceipt);
+				}
+			}
+		}
+		const acquire = buildAcquire(headOf(a), WRITER_2);
+		expect(a.acquireEpoch(acquire).status).to.equal(GuardianStatus.OK);
+		const certB = b.acquireEpoch(acquire)
+			.certificate as IGuardianTakeoverCertificate;
+		const certC = c.acquireEpoch(acquire)
+			.certificate as IGuardianTakeoverCertificate;
+		const target = headOf(b);
+		a.close();
+
+		const raw = new Database(file);
+		raw
+			.prepare('UPDATE guardian_epochs SET cert_issued_at = ? WHERE epoch = ?')
+			.run(Buffer.alloc(7, 1), u64be(2n));
+		raw.close();
+
+		const reopened = makeGuardian(0, file);
+		const checkpoint = headOf(reopened);
+		expect(checkpoint.lease.epoch).to.equal(1n);
+		const refused = reopened.submitRepairEvidence({
+			recoveryId: ROOT.recoveryId,
+			target: checkpoint,
+			receipts: historical,
+			certificates: []
+		});
+		expect(refused.status).to.equal(GuardianStatus.ERR_EPOCH_REGRESSION);
+		const stale = (): boolean | undefined =>
+			reopened.getHead({
+				protocolVersion: 1,
+				guardianSetId: SET_ID,
+				recoveryId: ROOT.recoveryId
+			}).possiblyStale;
+		expect(stale()).to.equal(true);
+
+		// Replayed up to the discarded grant, the takeover's evidence lifts it.
+		expect(
+			reopened.syncEpoch({ certificates: [certB, certC] }).status
+		).to.equal(GuardianStatus.OK);
+		const lifted = reopened.submitRepairEvidence({
+			recoveryId: ROOT.recoveryId,
+			target,
+			receipts: [],
+			certificates: [certB, certC]
+		});
+		expect(lifted.status).to.equal(GuardianStatus.OK);
+		expect(stale()).to.equal(false);
+		reopened.close();
+		b.close();
+		c.close();
+	});
 });
 
 describe('Guardian core: structural corruption containment', () => {
