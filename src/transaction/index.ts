@@ -2413,33 +2413,39 @@ export class Transaction {
 				}
 			}
 
-			// Output address types for the fee calculation. Input types are counted
-			// per selection in calculateFee below, since the selection can grow.
-			const outputTypes = {} as IAddressTypesIO['outputs'];
-
-			const outputAddresses = outputs.map(({ address }) => address);
-			if (changeAddress) {
-				outputAddresses.push(changeAddress);
-			}
-			outputAddresses.forEach((address) => {
-				if (!address) {
-					return;
-				}
-				const validateResponse = getAddressInfo(address);
-				if (!validateResponse) {
-					return;
-				}
-				const type = validateResponse.type.toUpperCase() as EAddressType;
-				if (type in outputTypes) {
-					outputTypes[type] = outputTypes[type] + 1;
-				} else {
-					outputTypes[type] = 1;
-				}
-			});
+			// Output address types for the fee calculation, with and without the
+			// change output. Input types are counted per selection in calculateFee
+			// below, since the selection can grow.
+			const countOutputTypes = (
+				addresses: string[]
+			): IAddressTypesIO['outputs'] => {
+				const types = {} as IAddressTypesIO['outputs'];
+				addresses.forEach((address) => {
+					if (!address) {
+						return;
+					}
+					const validateResponse = getAddressInfo(address);
+					if (!validateResponse) {
+						return;
+					}
+					const type = validateResponse.type.toUpperCase() as EAddressType;
+					if (type in types) {
+						types[type] = types[type] + 1;
+					} else {
+						types[type] = 1;
+					}
+				});
+				return types;
+			};
+			const paymentAddresses = outputs.map(({ address }) => address);
+			const noChangeOutputTypes = countOutputTypes(paymentAddresses);
+			const outputTypes = changeAddress
+				? countOutputTypes([...paymentAddresses, changeAddress])
+				: noChangeOutputTypes;
 
 			//Price the current selection. Every input added costs weight, so this
 			//has to be recomputed whenever the selection changes.
-			const calculateFee = (selected: IUtxo[]): number => {
+			const calculateFee = (selected: IUtxo[], types = outputTypes): number => {
 				const inputTypes = {} as IAddressTypesIO['inputs'];
 				selected.forEach(({ address }) => {
 					const validateResponse = getAddressInfo(address);
@@ -2455,7 +2461,7 @@ export class Transaction {
 				});
 				let baseFee = getByteCount(
 					this.applyMultisigInputWeights(inputTypes),
-					outputTypes,
+					types,
 					message
 				);
 				if (satsPerByte < 2) {
@@ -2481,8 +2487,18 @@ export class Transaction {
 			}
 
 			//The provided UTXO's do not have enough to cover the transaction.
-			if (inputAmount < amountToSend + fee || !newInputs?.length) {
+			if (!newInputs?.length) {
 				return err('Not enough funds');
+			}
+			if (inputAmount < amountToSend + fee) {
+				// The payment can still meet the rate without its change output.
+				// getTotalFee then quotes the whole leftover as the fee, and the
+				// builder finds no change to add.
+				const noChangeFee = calculateFee(newInputs, noChangeOutputTypes);
+				if (inputAmount < amountToSend + noChangeFee) {
+					return err('Not enough funds');
+				}
+				fee = inputAmount - amountToSend;
 			}
 			return ok({ inputs: newInputs, outputs, fee });
 		} catch (e) {
