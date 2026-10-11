@@ -241,4 +241,70 @@ describe('sendMany coin selection (#1360)', function () {
 		expect(first.value.inputs).to.have.length(2);
 		expect(second.value.inputs).to.have.length(4);
 	});
+
+	// Four coins pay 36,560 sats at 10 sat/vB and leave 3,440, exactly the fee
+	// without change. Coin selection priced a change output as well and
+	// refused the payment.
+	describe('a payment with nothing left for change (#1526)', function () {
+		const AMOUNT = 36_560;
+		const FEE = 3_440;
+
+		beforeEach(function () {
+			const fifth = wallet.data.utxos.pop();
+			if (!fifth) throw new Error('No UTXO to drop.');
+			wallet.data.balance -= fifth.value;
+			injected.delete(fifth.tx_hash);
+		});
+
+		const expectNoChange = (tx: BitcoinTransaction): void => {
+			expect(tx.ins).to.have.length(4);
+			expect(tx.outs).to.have.length(1);
+			expect(tx.outs[0].value).to.equal(AMOUNT);
+			expect(feeOf(tx)).to.equal(FEE);
+			expect(wallet.transaction.data.fee).to.equal(FEE);
+			expect(feeOf(tx) / tx.virtualSize()).to.be.at.least(10);
+		};
+
+		for (const preference of [
+			ECoinSelectPreference.consolidate,
+			ECoinSelectPreference.small,
+			ECoinSelectPreference.large
+		]) {
+			it(`sends it under ${preference}`, async function () {
+				wallet.updateCoinSelectPreference(preference);
+
+				const res = await wallet.send({
+					address: RECIPIENT,
+					amount: AMOUNT,
+					satsPerByte: 10,
+					broadcast: false
+				});
+				if (res.isErr()) throw res.error;
+
+				expectNoChange(BitcoinTransaction.fromHex(res.value));
+				const estimate = wallet.getFeeInfo({ satsPerByte: 10 });
+				if (estimate.isErr()) throw estimate.error;
+				expect(estimate.value.totalFee).to.equal(FEE);
+			});
+
+			it(`builds it under ${preference}`, async function () {
+				wallet.updateCoinSelectPreference(preference);
+
+				const built = await wallet.buildPsbt({
+					address: RECIPIENT,
+					amount: AMOUNT,
+					satsPerByte: 10
+				});
+				if (built.isErr()) throw built.error;
+				const signed = wallet.signPsbtWithOurKey(built.value.psbtBase64);
+				if (signed.isErr()) throw signed.error;
+				const imported = wallet.importSignedPsbt(signed.value);
+				if (imported.isErr()) throw imported.error;
+
+				expectNoChange(BitcoinTransaction.fromHex(imported.value.txHex));
+				expect(built.value.inputs).to.have.length(4);
+				expect(built.value.fee).to.equal(FEE);
+			});
+		}
+	});
 });
