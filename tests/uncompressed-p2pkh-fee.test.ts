@@ -17,6 +17,7 @@ import { ECPairFactory } from 'ecpair';
 import {
 	EAddressType,
 	EAvailableNetworks,
+	ECoinSelectPreference,
 	EProtocol,
 	IUtxo,
 	ok,
@@ -52,9 +53,18 @@ const p2pkh = bitcoin.payments.p2pkh({
 	pubkey: keyPair.publicKey,
 	network: regtest
 });
+const segwitKeyPair = ECPair.fromPrivateKey(Buffer.alloc(32, 0x5b), {
+	network: regtest
+});
+const p2wpkh = bitcoin.payments.p2wpkh({
+	pubkey: segwitKeyPair.publicKey,
+	network: regtest
+});
+const SEGWIT_VALUE = 20_000;
 const prevTx = new bitcoin.Transaction();
 prevTx.addInput(Buffer.alloc(32, 1), 0);
 prevTx.addOutput(p2pkh.output as Buffer, INPUT_VALUE);
+prevTx.addOutput(p2wpkh.output as Buffer, SEGWIT_VALUE);
 
 const input: IUtxo = {
 	address: p2pkh.address as string,
@@ -67,6 +77,15 @@ const input: IUtxo = {
 	value: INPUT_VALUE,
 	publicKey: keyPair.publicKey.toString('hex'),
 	keyPair
+};
+
+const segwitInput: IUtxo = {
+	...input,
+	address: p2wpkh.address as string,
+	tx_pos: 1,
+	value: SEGWIT_VALUE,
+	publicKey: segwitKeyPair.publicKey.toString('hex'),
+	keyPair: segwitKeyPair
 };
 
 describe('Fee estimation for an uncompressed P2PKH input (#1527)', function () {
@@ -150,6 +169,42 @@ describe('Fee estimation for an uncompressed P2PKH input (#1527)', function () {
 		expect(fee.error.message).to.equal(
 			'New total amount exceeds the available balance. Unable to update the transaction fee.'
 		);
+	});
+
+	it('selects another coin when an uncompressed spend needs one (#1550)', async () => {
+		// The 10,000 sat coin covers 7,800 plus the 2,200 a compressed key
+		// would cost, but not the 2,520 this one does.
+		wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
+		try {
+			await wallet.transaction.resetSendTransaction();
+			const staged = wallet.transaction.updateSendTransaction({
+				transaction: {
+					inputs: [input, segwitInput],
+					outputs: [{ address: RECIPIENT, value: 7_800, index: 0 }],
+					changeAddress,
+					satsPerByte: RATE
+				}
+			});
+			if (staged.isErr()) throw staged.error;
+			const fee = wallet.transaction.updateFee({ satsPerByte: RATE });
+			if (fee.isErr()) throw fee.error;
+			expect(fee.value.fee).to.equal(3_210);
+
+			const res = await wallet.transaction.createTransaction({
+				runCoinSelect: true
+			});
+			if (res.isErr()) throw res.error;
+			const tx = bitcoin.Transaction.fromHex(res.value.hex);
+			expect(tx.ins).to.have.length(2);
+			const paid =
+				INPUT_VALUE +
+				SEGWIT_VALUE -
+				tx.outs.reduce((total, out) => total + out.value, 0);
+			expect(paid).to.equal(3_210);
+			expect(paid).to.be.at.least(RATE * tx.virtualSize());
+		} finally {
+			wallet.updateCoinSelectPreference(ECoinSelectPreference.consolidate);
+		}
 	});
 
 	it('prices Taproot inputs equally for compressed and uncompressed signing keys', async () => {
