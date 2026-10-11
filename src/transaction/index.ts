@@ -737,19 +737,24 @@ export class Transaction {
 							generatesChange
 					  })
 					: quoteAt(rate).totalFee;
+			// The highest rate below `over` that fits.
+			const highestFitting = (
+				over: number,
+				fits: (rate: number) => boolean
+			): number => {
+				let fit = 0;
+				while (over - fit > 1) {
+					const mid = Math.floor((fit + over) / 2);
+					if (fits(mid)) fit = mid;
+					else over = mid;
+				}
+				return fit;
+			};
 			// The highest rate below `over` whose fee is under half.
 			const highestUnderHalf = (
 				over: number,
 				fee: (rate: number) => number
-			): number => {
-				let fits = 0;
-				while (over - fits > 1) {
-					const mid = Math.floor((fits + over) / 2);
-					if (fee(mid) < txBalance / 2) fits = mid;
-					else over = mid;
-				}
-				return fits;
-			};
+			): number => highestFitting(over, (rate) => fee(rate) < txBalance / 2);
 			// A higher rate can select more coins than this quote did, so the
 			// size-based maximum can be many rates over half. Coin selection only
 			// adds coins as the rate rises, so the fee does not fall with it,
@@ -768,17 +773,28 @@ export class Transaction {
 				return feeAt(top) < txBalance / 2 ? top : highestUnderHalf(top, feeAt);
 			};
 			maxSatPerByte = fitUnderHalf(maxSatPerByte);
-			// updateFee refuses a fee the inputs cannot pay on top of the outputs.
-			// Only a replacement's inputs are fixed: an ordinary send selects more
-			// coins at a higher rate, and a max send sizes its output from the fee.
-			// A rate that leaves no room for the change output drops it, so the
-			// cap is on the size without it.
+			// updateFee refuses a fee the staged inputs cannot pay on top of the
+			// outputs. A max send is exempt, since it sizes its output from the fee.
+			// A rate that leaves no room for the change output drops it, so a
+			// replacement, whose inputs are fixed, is capped on the size without it.
 			if (transaction.boostType === EBoostType.rbf && !transaction.max) {
 				const remaining = Math.max(0, inputAmount - outputAmount);
 				maxSatPerByte = Math.min(
 					maxSatPerByte,
 					Math.floor(remaining / byteCountFor(false))
 				);
+			} else if (!transaction.max) {
+				// An ordinary send can select more coins at a higher rate. A selection
+				// that pays one rate pays every lower one too, so the rates the staged
+				// inputs cover end at a single highest one.
+				const stagedAmount = this.getTransactionInputValue({
+					inputs: transaction.inputs
+				});
+				const covers = (rate: number): boolean =>
+					outputAmount + feeAt(rate) <= stagedAmount;
+				if (!covers(maxSatPerByte)) {
+					maxSatPerByte = highestFitting(maxSatPerByte, covers);
+				}
 			}
 			// Lowering the maximum can put the remainder above dust. The builder
 			// then adds change, which needs its own fee. Below 2 sat/vB the size

@@ -349,6 +349,42 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			}
 		);
 
+		// #1565: half the 190,000 payment allows 454 sat/vB, but only 10,000 is
+		// left over. At 56 the change drops and the 178 vB fee fits it.
+		[
+			ECoinSelectPreference.small,
+			ECoinSelectPreference.large,
+			ECoinSelectPreference.consolidate
+		].forEach((preference) => {
+			it(`quotes a maximum rate the inputs can pay with preference ${preference}`, async function () {
+				wallet.updateCoinSelectPreference(preference);
+				injectUtxo(FUNDING_TXID, 100_000);
+				injectUtxo(BOOSTED_TXID, 100_000);
+				const setup = await wallet.transaction.setupTransaction();
+				if (setup.isErr()) throw setup.error;
+				const staged = wallet.transaction.updateSendTransaction({
+					transaction: {
+						outputs: [{ address: P2WPKH, value: 190_000, index: 0 }]
+					}
+				});
+				if (staged.isErr()) throw staged.error;
+
+				const quote = wallet.getFeeInfo({ satsPerByte: 5 });
+				if (quote.isErr()) throw quote.error;
+				expect(quote.value.totalFee).to.equal(209 * 5);
+				expect(quote.value.maxSatPerByte).to.equal(56);
+				const atMax = wallet.transaction.updateFee({
+					satsPerByte: quote.value.maxSatPerByte
+				});
+				if (atMax.isErr()) throw atMax.error;
+				expect(atMax.value.fee).to.equal(10_000);
+				const aboveMax = wallet.transaction.updateFee({
+					satsPerByte: quote.value.maxSatPerByte + 1
+				});
+				expect(aboveMax.isErr(), '57 sat/vB is refused').to.equal(true);
+			});
+		});
+
 		// #1518: 1 sat/vB with change is exactly half the 602 payment, but the
 		// change drops and the fee is the 270 sats left over.
 		it('quotes a maximum rate that drops the change output', async function () {
