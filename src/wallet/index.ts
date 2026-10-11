@@ -6028,6 +6028,7 @@ export class Wallet {
 		for (let i = 0; i < vouts.length; i++) {
 			const vout = vouts[i];
 			const voutValue = btcToSats(vout.value);
+			address = '';
 			if (vout.scriptPubKey?.addresses) {
 				address = vout.scriptPubKey.addresses[0];
 			} else if (vout.scriptPubKey?.address) {
@@ -6041,8 +6042,12 @@ export class Wallet {
 				outputTotal = outputTotal + voutValue;
 				continue;
 			}
+			// The replacement can only pay outputs by address. Skipping this one
+			// would turn its payment into change.
 			if (!address) {
-				continue;
+				return err(
+					'Transaction pays an output without an address. Unable to RBF.'
+				);
 			}
 			const changeAddressScriptHash = getScriptHash({
 				address,
