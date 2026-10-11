@@ -881,6 +881,57 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			});
 		});
 
+		// #1541: a bare pubkey output inherited the address read before it. Its
+		// 10k was paid to the input's address, to the recipient, or into change.
+		[0, 1, 2].forEach((position) => {
+			it(`refuses a transaction that pays a bare pubkey at output ${position}`, async function () {
+				const vout: Record<string, unknown>[] = [
+					{ value: 0.0004, scriptPubKey: { address: P2WPKH } },
+					{ value: 0.0004, scriptPubKey: { address: changeAddress() } }
+				];
+				vout.splice(position, 0, {
+					value: 0.0001,
+					scriptPubKey: {
+						asm: `${'02'.repeat(33)} OP_CHECKSIG`,
+						type: 'pubkey'
+					}
+				});
+				stubLookups({
+					[BOOSTED_TXID]: {
+						vin: [{ txid: FUNDING_TXID, vout: 0 }] as TTxDetails['vin'],
+						vout: vout.map((output, n) => ({
+							...output,
+							n
+						})) as unknown as TTxDetails['vout']
+					},
+					[FUNDING_TXID]: {
+						confirmations: 10,
+						vout: [
+							{
+								value: 0.001,
+								n: 0,
+								scriptPubKey: { address: receiveAddress() }
+							}
+						] as unknown as TTxDetails['vout']
+					}
+				});
+
+				const rbfData = await wallet.getRbfData({
+					txHash: { tx_hash: BOOSTED_TXID }
+				});
+				expect(rbfData.isErr(), 'getRbfData refused').to.equal(true);
+				const res = await wallet.transaction.setupRbf({ txid: BOOSTED_TXID });
+
+				expect(res.isErr(), 'setupRbf refused').to.equal(true);
+				if (res.isOk()) return;
+				expect(res.error.message).to.include('without an address');
+				expect(wallet.transaction.data.outputs).to.have.length(0);
+				expect(wallet.transaction.data.boostType).to.not.equal(EBoostType.rbf);
+				const created = await wallet.transaction.createTransaction();
+				expect(created.isErr(), 'nothing is signed').to.equal(true);
+			});
+		});
+
 		// #1521: the quote left out the staged message, so it offered 60 sat/vB
 		// on 166 vB. With the message that is 10,860 sats even without change,
 		// more than the 10k left. 55 is 10k over the 181 vB without change.
