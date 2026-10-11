@@ -783,6 +783,86 @@ describe('UTXO freeze/unfreeze', function () {
 		}
 	});
 
+	/** Freezes utxoB while the send's final cleanup is paused. */
+	const freezeDuringCleanup = async (
+		send: () => Promise<Result<string>>
+	): Promise<Result<string>> => {
+		const transaction = wallet.transaction;
+		const clear = transaction.clearStoredSendTransaction;
+		const paused = deferred();
+		const resume = deferred();
+		transaction.clearStoredSendTransaction = async (): ReturnType<
+			typeof clear
+		> => {
+			paused.resolve();
+			await resume.promise;
+			return clear.call(transaction);
+		};
+		try {
+			const sending = send();
+			await paused.promise;
+			const frozen = await wallet.freezeUtxo({
+				txid: utxoB.tx_hash,
+				index: utxoB.tx_pos
+			});
+			if (frozen.isErr()) throw frozen.error;
+			resume.resolve();
+			return await sending;
+		} finally {
+			transaction.clearStoredSendTransaction = clear;
+		}
+	};
+
+	it('returns no signed hex spending a coin frozen during the final cleanup of sendMany (#1564)', async () => {
+		try {
+			// 80k needs both coins, so utxoB is selected.
+			const sent = await freezeDuringCleanup(() =>
+				wallet.sendMany({
+					txs: [
+						{
+							address: 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk',
+							amount: 80000
+						}
+					],
+					satsPerByte: 2,
+					broadcast: false
+				})
+			);
+			expect(wallet.isUtxoFrozen(utxoB.tx_hash, utxoB.tx_pos)).to.equal(true);
+			expect(sent.isErr()).to.equal(true);
+			if (sent.isErr()) {
+				expect(sent.error.message).to.equal(
+					`Staged input ${utxoB.tx_hash}:${utxoB.tx_pos} is frozen.`
+				);
+			}
+		} finally {
+			await wallet.unfreezeUtxo({ txid: utxoB.tx_hash, index: utxoB.tx_pos });
+			await wallet.resetSendTransaction();
+		}
+	});
+
+	it('returns no signed hex spending a coin frozen during the final cleanup of sendMax (#1564)', async () => {
+		try {
+			const sent = await freezeDuringCleanup(() =>
+				wallet.sendMax({
+					address: 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk',
+					satsPerByte: 2,
+					broadcast: false
+				})
+			);
+			expect(wallet.isUtxoFrozen(utxoB.tx_hash, utxoB.tx_pos)).to.equal(true);
+			expect(sent.isErr()).to.equal(true);
+			if (sent.isErr()) {
+				expect(sent.error.message).to.equal(
+					`Staged input ${utxoB.tx_hash}:${utxoB.tx_pos} is frozen.`
+				);
+			}
+		} finally {
+			await wallet.unfreezeUtxo({ txid: utxoB.tx_hash, index: utxoB.tx_pos });
+			await wallet.resetSendTransaction();
+		}
+	});
+
 	it('prices a direct max send from the coins its own setup staged (#1495)', async () => {
 		await wallet.resetSendTransaction();
 		try {
