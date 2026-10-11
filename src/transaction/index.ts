@@ -2527,6 +2527,11 @@ export class Transaction {
 			};
 
 			let fee = calculateFee(newInputs);
+			// The top-up below can add a coin worth less than its own weight costs,
+			// leaving a selection that no longer pays the rate even without change.
+			// The last one that did is kept to fall back on.
+			let noChangeInputs: IUtxo[] | undefined;
+			let noChangeAmount = 0;
 
 			//Ensure we can still cover the transaction with the previously selected UTXO's. Add more UTXO's if not.
 			//Repricing after each addition matters: the fee the top-up is measured
@@ -2535,6 +2540,13 @@ export class Transaction {
 			if (amountToSend) {
 				for (const input of oldInputs) {
 					if (inputAmount >= amountToSend + fee) break;
+					if (
+						inputAmount >=
+						amountToSend + calculateFee(newInputs, noChangeOutputTypes)
+					) {
+						noChangeInputs = [...newInputs];
+						noChangeAmount = inputAmount;
+					}
 					inputAmount += input.value;
 					newInputs.push(input);
 					fee = calculateFee(newInputs);
@@ -2551,7 +2563,11 @@ export class Transaction {
 				// builder finds no change to add.
 				const noChangeFee = calculateFee(newInputs, noChangeOutputTypes);
 				if (inputAmount < amountToSend + noChangeFee) {
-					return err('Not enough funds');
+					if (!noChangeInputs) {
+						return err('Not enough funds');
+					}
+					newInputs = noChangeInputs;
+					inputAmount = noChangeAmount;
 				}
 				fee = inputAmount - amountToSend;
 			}

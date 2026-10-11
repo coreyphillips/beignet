@@ -265,6 +265,38 @@ describe('sendMany coin selection (#1360)', function () {
 			expect(feeOf(tx) / tx.virtualSize()).to.be.at.least(10);
 		};
 
+		const expectSends = async (): Promise<void> => {
+			const res = await wallet.send({
+				address: RECIPIENT,
+				amount: AMOUNT,
+				satsPerByte: 10,
+				broadcast: false
+			});
+			if (res.isErr()) throw res.error;
+
+			expectNoChange(BitcoinTransaction.fromHex(res.value));
+			const estimate = wallet.getFeeInfo({ satsPerByte: 10 });
+			if (estimate.isErr()) throw estimate.error;
+			expect(estimate.value.totalFee).to.equal(FEE);
+		};
+
+		const expectBuilds = async (): Promise<void> => {
+			const built = await wallet.buildPsbt({
+				address: RECIPIENT,
+				amount: AMOUNT,
+				satsPerByte: 10
+			});
+			if (built.isErr()) throw built.error;
+			const signed = wallet.signPsbtWithOurKey(built.value.psbtBase64);
+			if (signed.isErr()) throw signed.error;
+			const imported = wallet.importSignedPsbt(signed.value);
+			if (imported.isErr()) throw imported.error;
+
+			expectNoChange(BitcoinTransaction.fromHex(imported.value.txHex));
+			expect(built.value.inputs).to.have.length(4);
+			expect(built.value.fee).to.equal(FEE);
+		};
+
 		for (const preference of [
 			ECoinSelectPreference.consolidate,
 			ECoinSelectPreference.small,
@@ -272,39 +304,44 @@ describe('sendMany coin selection (#1360)', function () {
 		]) {
 			it(`sends it under ${preference}`, async function () {
 				wallet.updateCoinSelectPreference(preference);
-
-				const res = await wallet.send({
-					address: RECIPIENT,
-					amount: AMOUNT,
-					satsPerByte: 10,
-					broadcast: false
-				});
-				if (res.isErr()) throw res.error;
-
-				expectNoChange(BitcoinTransaction.fromHex(res.value));
-				const estimate = wallet.getFeeInfo({ satsPerByte: 10 });
-				if (estimate.isErr()) throw estimate.error;
-				expect(estimate.value.totalFee).to.equal(FEE);
+				await expectSends();
 			});
 
 			it(`builds it under ${preference}`, async function () {
 				wallet.updateCoinSelectPreference(preference);
-
-				const built = await wallet.buildPsbt({
-					address: RECIPIENT,
-					amount: AMOUNT,
-					satsPerByte: 10
-				});
-				if (built.isErr()) throw built.error;
-				const signed = wallet.signPsbtWithOurKey(built.value.psbtBase64);
-				if (signed.isErr()) throw signed.error;
-				const imported = wallet.importSignedPsbt(signed.value);
-				if (imported.isErr()) throw imported.error;
-
-				expectNoChange(BitcoinTransaction.fromHex(imported.value.txHex));
-				expect(built.value.inputs).to.have.length(4);
-				expect(built.value.fee).to.equal(FEE);
+				await expectBuilds();
 			});
 		}
+
+		// A 300 sat coin selected after the four costs 680 to spend. Five inputs
+		// leave 3,740 against a 3,820 fee without change, and coin selection
+		// gave up on the four that already paid.
+		describe('with an uneconomic coin selected last (#1549)', function () {
+			const addTrailingCoin = (preference: ECoinSelectPreference): void => {
+				for (const utxo of wallet.data.utxos) utxo.height = 100;
+				const coin = injectUtxo('ff'.repeat(32), 300);
+				// FIFO spends the oldest coin first and LIFO the newest.
+				coin.height =
+					preference === ECoinSelectPreference.lastInFirstOut ? 99 : 101;
+			};
+
+			for (const preference of [
+				ECoinSelectPreference.large,
+				ECoinSelectPreference.firstInFirstOut,
+				ECoinSelectPreference.lastInFirstOut
+			]) {
+				it(`sends it under ${preference}`, async function () {
+					wallet.updateCoinSelectPreference(preference);
+					addTrailingCoin(preference);
+					await expectSends();
+				});
+
+				it(`builds it under ${preference}`, async function () {
+					wallet.updateCoinSelectPreference(preference);
+					addTrailingCoin(preference);
+					await expectBuilds();
+				});
+			}
+		});
 	});
 });
