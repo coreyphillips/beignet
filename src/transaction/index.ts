@@ -431,6 +431,7 @@ export class Transaction {
 	 * @param {Partial<ISendTransaction>} [transaction]
 	 * @param {boolean} [fundingLightning]
 	 * @param {ECoinSelectPreference} [coinSelectPreference]
+	 * @param {boolean} [generatesChange] Prices the change output the builder adds when no change address is staged.
 	 * @returns {number}
 	 */
 	getTotalFee = ({
@@ -438,13 +439,15 @@ export class Transaction {
 		message = '',
 		transaction = this.data,
 		fundingLightning = false,
-		coinSelectPreference = this._wallet.coinSelectPreference
+		coinSelectPreference = this._wallet.coinSelectPreference,
+		generatesChange = true
 	}: {
 		satsPerByte: number;
 		message?: string;
 		transaction?: Partial<ISendTransaction>;
 		fundingLightning?: boolean;
 		coinSelectPreference?: ECoinSelectPreference;
+		generatesChange?: boolean;
 	}): number => {
 		const baseTransactionSize = TRANSACTION_DEFAULTS.recommendedBaseFee;
 		try {
@@ -528,11 +531,13 @@ export class Transaction {
 					this.getTransactionOutputValue({ outputs });
 				if (fee > available && feeFor(false) <= available) return available;
 			}
-			const generatedChange = this.generatedChangeAddress({
-				transaction,
-				inputs,
-				fee
-			});
+			const generatedChange =
+				generatesChange &&
+				this.generatedChangeAddress({
+					transaction,
+					inputs,
+					fee
+				});
 			if (generatedChange) {
 				// Consolidate keeps the inputs already selected above.
 				return this.getTotalFee({
@@ -721,30 +726,46 @@ export class Transaction {
 			// updateFee refuses a fee of exactly half the balance. A rate that drops
 			// the change output pays only the leftover, which is under half. A
 			// lower rate can also select fewer coins than this quote did.
-			const feeAt = (rate: number): number =>
+			const feeAt = (rate: number, generatesChange = true): number =>
 				selectsCoins
 					? this.getTotalFee({
 							satsPerByte: rate,
 							message,
 							transaction,
 							fundingLightning,
-							coinSelectPreference
+							coinSelectPreference,
+							generatesChange
 					  })
 					: quoteAt(rate).totalFee;
-			// A higher rate can select more coins than this quote did, so the
-			// size-based maximum can be many rates over half. Coin selection only
-			// adds coins as the rate rises, so the fee does not fall with it and a
-			// binary search finds the highest rate under half.
-			const fitUnderHalf = (rate: number): number => {
-				if (!rate || feeAt(rate) < txBalance / 2) return rate;
+			// The highest rate below `over` whose fee is under half.
+			const highestUnderHalf = (
+				over: number,
+				fee: (rate: number) => number
+			): number => {
 				let fits = 0;
-				let over = rate;
 				while (over - fits > 1) {
 					const mid = Math.floor((fits + over) / 2);
-					if (feeAt(mid) < txBalance / 2) fits = mid;
+					if (fee(mid) < txBalance / 2) fits = mid;
 					else over = mid;
 				}
 				return fits;
+			};
+			// A higher rate can select more coins than this quote did, so the
+			// size-based maximum can be many rates over half. Coin selection only
+			// adds coins as the rate rises, so the fee does not fall with it,
+			// except where the leftover becomes dust and generated change goes.
+			// The fee without generated change never falls and is never above the
+			// real one, so the highest rate it fits at bounds the search. If that
+			// rate still prices change, every lower rate where change goes is
+			// already under half, and a plain search below it is safe.
+			const fitUnderHalf = (rate: number): number => {
+				if (!rate || feeAt(rate) < txBalance / 2) return rate;
+				const withoutChange = (r: number): number => feeAt(r, false);
+				const top =
+					withoutChange(rate) < txBalance / 2
+						? rate
+						: highestUnderHalf(rate, withoutChange);
+				return feeAt(top) < txBalance / 2 ? top : highestUnderHalf(top, feeAt);
 			};
 			maxSatPerByte = fitUnderHalf(maxSatPerByte);
 			// updateFee refuses a fee the inputs cannot pay on top of the outputs.
