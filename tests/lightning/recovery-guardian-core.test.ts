@@ -1623,6 +1623,79 @@ describe('Guardian core: damaged store, rollback, replay, quorum re-entry', () =
 		b.close();
 		c.close();
 	});
+
+	it('refuses quorum evidence below a grant its tombstone discarded', () => {
+		// Issue #1567. A granted epoch 2, then lost its registration, so the
+		// open-time verifier tombstoned the namespace and every epoch row.
+		// Re-registration re-anchors at genesis, which B and C's registration
+		// receipts cover.
+		const file = path.join(dir, 'tombstoned-grant.sqlite');
+		const a = makeGuardian(0, file);
+		const b = makeGuardian(1);
+		const c = makeGuardian(2);
+		const registration = buildRegistration();
+		a.register(registration);
+		const historical = [b, c].map(
+			(g) => g.register(registration).receipt as IGuardianReceipt
+		);
+		const chain = buildChain(registration.initialState, 2);
+		for (const record of chain) {
+			a.putState({ record });
+			for (const g of [b, c]) g.syncRecord({ record });
+		}
+		const acquire = buildAcquire(headOf(a), WRITER_2);
+		expect(a.acquireEpoch(acquire).status).to.equal(GuardianStatus.OK);
+		const certB = b.acquireEpoch(acquire)
+			.certificate as IGuardianTakeoverCertificate;
+		const certC = c.acquireEpoch(acquire)
+			.certificate as IGuardianTakeoverCertificate;
+		const target = headOf(b);
+		a.close();
+
+		const raw = new Database(file);
+		raw
+			.prepare('UPDATE guardian_namespaces SET registration_signature = ?')
+			.run(Buffer.alloc(64));
+		raw.close();
+
+		const reopened = makeGuardian(0, file);
+		expect(reopened.register(registration).status).to.equal(GuardianStatus.OK);
+		const refused = reopened.submitRepairEvidence({
+			recoveryId: ROOT.recoveryId,
+			target: registration.initialState,
+			receipts: historical,
+			certificates: []
+		});
+		expect(refused.status).to.equal(GuardianStatus.ERR_EPOCH_REGRESSION);
+		const stale = (): boolean | undefined =>
+			reopened.getHead({
+				protocolVersion: 1,
+				guardianSetId: SET_ID,
+				recoveryId: ROOT.recoveryId
+			}).possiblyStale;
+		expect(stale()).to.equal(true);
+
+		// Replayed up to the discarded grant, the takeover's evidence lifts it.
+		for (const record of chain) {
+			expect(reopened.syncRecord({ record }).status).to.equal(
+				GuardianStatus.OK
+			);
+		}
+		expect(
+			reopened.syncEpoch({ certificates: [certB, certC] }).status
+		).to.equal(GuardianStatus.OK);
+		const lifted = reopened.submitRepairEvidence({
+			recoveryId: ROOT.recoveryId,
+			target,
+			receipts: [],
+			certificates: [certB, certC]
+		});
+		expect(lifted.status).to.equal(GuardianStatus.OK);
+		expect(stale()).to.equal(false);
+		reopened.close();
+		b.close();
+		c.close();
+	});
 });
 
 describe('Guardian core: structural corruption containment', () => {
