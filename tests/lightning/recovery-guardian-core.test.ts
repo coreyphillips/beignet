@@ -1696,6 +1696,83 @@ describe('Guardian core: damaged store, rollback, replay, quorum re-entry', () =
 		b.close();
 		c.close();
 	});
+
+	it('refuses quorum evidence below a grant its stranded epoch rows held', () => {
+		// Issue #1576. A and B granted epoch 2 to one writer, then A lost only
+		// its namespace row. Re-registration clears the stranded epoch rows,
+		// and B and C's registration receipts cover genesis, so lifting the
+		// flag would let A and C certify a second writer at epoch 2.
+		const file = path.join(dir, 'stranded-grant.sqlite');
+		const a = makeGuardian(0, file);
+		const b = makeGuardian(1);
+		const c = makeGuardian(2);
+		const registration = buildRegistration();
+		a.register(registration);
+		const historical = [b, c].map(
+			(g) => g.register(registration).receipt as IGuardianReceipt
+		);
+		const acquire = buildAcquire(registration.initialState, WRITER_2);
+		const certA = a.acquireEpoch(acquire)
+			.certificate as IGuardianTakeoverCertificate;
+		const certB = b.acquireEpoch(acquire)
+			.certificate as IGuardianTakeoverCertificate;
+		expectValidCertificate(certA, 0);
+		expectValidCertificate(certB, 1);
+		const target = headOf(b);
+		a.close();
+
+		const raw = new Database(file);
+		raw
+			.prepare('DELETE FROM guardian_namespaces WHERE recovery_id = ?')
+			.run(ROOT.recoveryId);
+		raw.close();
+
+		const reopened = makeGuardian(0, file);
+		expect(reopened.register(registration).status).to.equal(GuardianStatus.OK);
+		const refused = reopened.submitRepairEvidence({
+			recoveryId: ROOT.recoveryId,
+			target: registration.initialState,
+			receipts: historical,
+			certificates: []
+		});
+		expect(refused.status).to.equal(GuardianStatus.ERR_EPOCH_REGRESSION);
+		const stale = (): boolean | undefined =>
+			reopened.getHead({
+				protocolVersion: 1,
+				guardianSetId: SET_ID,
+				recoveryId: ROOT.recoveryId
+			}).possiblyStale;
+		expect(stale()).to.equal(true);
+
+		// A conflicting writer finds C alone, short of a quorum.
+		const conflicting = buildAcquire(
+			registration.initialState,
+			makeWriter('core-writer-3')
+		);
+		expect(reopened.acquireEpoch(conflicting).status).to.equal(
+			GuardianStatus.ERR_STORE_UNCERTAIN
+		);
+		expect(c.acquireEpoch(conflicting).status).to.equal(GuardianStatus.OK);
+
+		// Replayed up to the stranded grant, the takeover's evidence lifts it.
+		expect(
+			reopened.syncEpoch({ certificates: [certA, certB] }).status
+		).to.equal(GuardianStatus.OK);
+		const lifted = reopened.submitRepairEvidence({
+			recoveryId: ROOT.recoveryId,
+			target,
+			receipts: [],
+			certificates: [certA, certB]
+		});
+		expect(lifted.status).to.equal(GuardianStatus.OK);
+		expect(stale()).to.equal(false);
+		expect(reopened.acquireEpoch(conflicting).status).to.equal(
+			GuardianStatus.ERR_EPOCH_SUPERSEDED
+		);
+		reopened.close();
+		b.close();
+		c.close();
+	});
 });
 
 describe('Guardian core: structural corruption containment', () => {
