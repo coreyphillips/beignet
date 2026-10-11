@@ -3032,9 +3032,18 @@ export class ReferenceGuardian {
 				}
 				// A quorum's receipts show the target was current once, not that
 				// it still is, so they cannot lift a lease below one it held.
-				const erased = tryReadU64(
-					this.store.getErasedEpoch(request.recoveryId)
-				);
+				// An unreadable mark may have recorded any epoch.
+				const mark = this.store.getErasedEpoch(request.recoveryId);
+				const erased = tryReadU64(mark);
+				if (mark !== null && erased === null) {
+					return {
+						...err(
+							GuardianStatus.ERR_STORE_UNCERTAIN,
+							'the epoch a rollback discarded is unreadable; this guardian may have granted any later one'
+						),
+						current
+					};
+				}
 				if (erased !== null && target.lease.epoch < erased) {
 					return {
 						...err(
@@ -3627,8 +3636,14 @@ export class ReferenceGuardian {
 			const epoch = tryReadU64(row.epoch);
 			if (epoch !== null && epoch > held) held = epoch;
 		}
-		const erased = tryReadU64(this.store.getErasedEpoch(recoveryId));
-		if (held > checkpoint.lease.epoch && (erased === null || held > erased)) {
+		// An unreadable mark already refuses all evidence; a number would
+		// narrow that.
+		const mark = this.store.getErasedEpoch(recoveryId);
+		const erased = tryReadU64(mark);
+		if (
+			held > checkpoint.lease.epoch &&
+			(mark === null || (erased !== null && held > erased))
+		) {
 			this.store.setErasedEpoch(recoveryId, u64be(held));
 		}
 		this.store.archiveRecordsAbove(

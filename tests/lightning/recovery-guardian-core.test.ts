@@ -1569,6 +1569,60 @@ describe('Guardian core: damaged store, rollback, replay, quorum re-entry', () =
 		b.close();
 		c.close();
 	});
+
+	it('refuses quorum evidence when the discarded epoch is unreadable', () => {
+		const file = path.join(dir, 'unreadable-erased-epoch.sqlite');
+		const a = makeGuardian(0, file);
+		const b = makeGuardian(1);
+		const c = makeGuardian(2);
+		const registration = buildRegistration();
+		for (const g of [a, b, c]) g.register(registration);
+		const chain = buildChain(registration.initialState, 2);
+		const historical: IGuardianReceipt[] = [];
+		for (const record of chain) {
+			a.putState({ record });
+			for (const g of [b, c]) {
+				const synced = g.syncRecord({ record });
+				if (record === chain[1]) {
+					historical.push(synced.receipt as IGuardianReceipt);
+				}
+			}
+		}
+		const checkpoint = headOf(a);
+		expect(a.acquireEpoch(buildAcquire(checkpoint, WRITER_2)).status).to.equal(
+			GuardianStatus.OK
+		);
+		a.close();
+
+		let raw = new Database(file);
+		raw
+			.prepare('UPDATE guardian_epochs SET cert_issued_at = ? WHERE epoch = ?')
+			.run(Buffer.alloc(7, 1), u64be(2n));
+		raw.close();
+		makeGuardian(0, file).close();
+		raw = new Database(file);
+		raw
+			.prepare('UPDATE guardian_erased_leases SET epoch = ?')
+			.run(Buffer.alloc(7, 2));
+		raw.close();
+
+		const reopened = makeGuardian(0, file);
+		const refused = reopened.submitRepairEvidence({
+			recoveryId: ROOT.recoveryId,
+			target: checkpoint,
+			receipts: historical,
+			certificates: []
+		});
+		expect(refused.status).to.equal(GuardianStatus.ERR_STORE_UNCERTAIN);
+		expect(
+			reopened.acquireEpoch(
+				buildAcquire(checkpoint, makeWriter('core-writer-3'))
+			).status
+		).to.equal(GuardianStatus.ERR_STORE_UNCERTAIN);
+		reopened.close();
+		b.close();
+		c.close();
+	});
 });
 
 describe('Guardian core: structural corruption containment', () => {
