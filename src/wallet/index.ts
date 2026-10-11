@@ -5003,6 +5003,7 @@ export class Wallet {
 		// process. The live copy stays readable (fee, inputs) until the next
 		// call resets it.
 		await this.resetSendTransaction();
+		let hex: string;
 		try {
 			const setupTransactionRes = await this.transaction.setupTransaction({
 				rbf
@@ -5052,18 +5053,37 @@ export class Wallet {
 				runCoinSelect: true
 			});
 			if (createRes.isErr()) return err(createRes.error.message);
-			const { hex } = createRes.value;
-			if (!broadcast) {
-				return ok(hex);
+			hex = createRes.value.hex;
+			if (broadcast) {
+				const broadcastRes = await this.electrum.broadcastTransaction({
+					rawTx: hex
+				});
+				if (broadcastRes.isErr()) return err(broadcastRes.error.message);
+				return ok(broadcastRes.value);
 			}
-			const broadcastRes = await this.electrum.broadcastTransaction({
-				rawTx: hex
-			});
-			if (broadcastRes.isErr()) return err(broadcastRes.error.message);
-			return ok(broadcastRes.value);
 		} finally {
 			await this.transaction.clearStoredSendTransaction();
 		}
+		return this.unfrozenSignedHex(hex);
+	}
+
+	/**
+	 * Returns the signed hex of an unbroadcast send unless it spends a frozen
+	 * coin. createTransaction checked for frozen inputs before the send's
+	 * final cleanup awaited storage, and a freeze can complete during that
+	 * await. Callers run this after the cleanup with no await between it and
+	 * their return.
+	 * @param {string} hex
+	 * @returns {Result<string>}
+	 */
+	private unfrozenSignedHex(hex: string): Result<string> {
+		for (const { hash, index } of bitcoin.Transaction.fromHex(hex).ins) {
+			const txid = Buffer.from(hash).reverse().toString('hex');
+			if (this.isUtxoFrozen(txid, index)) {
+				return err(`Staged input ${txid}:${index} is frozen.`);
+			}
+		}
+		return ok(hex);
 	}
 
 	/**
@@ -5100,6 +5120,7 @@ export class Wallet {
 		// Same working-area rule as sendMany: empty on entry, dropped from
 		// storage on exit, live copy readable until the next call.
 		await this.resetSendTransaction();
+		let hex: string;
 		try {
 			// transaction.sendMax only stages rbf when it does the setup itself,
 			// which it skips once inputs are staged here.
@@ -5123,18 +5144,18 @@ export class Wallet {
 				shuffleOutputs: true
 			});
 			if (createRes.isErr()) return err(createRes.error.message);
-			const { hex } = createRes.value;
-			if (!broadcast) {
-				return ok(hex);
+			hex = createRes.value.hex;
+			if (broadcast) {
+				const broadcastRes = await this.electrum.broadcastTransaction({
+					rawTx: hex
+				});
+				if (broadcastRes.isErr()) return err(broadcastRes.error.message);
+				return ok(broadcastRes.value);
 			}
-			const broadcastRes = await this.electrum.broadcastTransaction({
-				rawTx: hex
-			});
-			if (broadcastRes.isErr()) return err(broadcastRes.error.message);
-			return ok(broadcastRes.value);
 		} finally {
 			await this.transaction.clearStoredSendTransaction();
 		}
+		return this.unfrozenSignedHex(hex);
 	}
 
 	/**
