@@ -634,7 +634,10 @@ export class Transaction {
 				constructByteCountParam(inputAddresses)
 			);
 
-			const byteCountFor = (withChange: boolean): number => {
+			const byteCountFor = (
+				withChange: boolean,
+				rate = satsPerByte
+			): number => {
 				const outputAddresses = outputs.map((output) => output.address);
 
 				// Always assume we're sending to at least one output for a proper base calculation.
@@ -661,7 +664,7 @@ export class Transaction {
 				let transactionByteCount =
 					getByteCount(inputParam, outputParam, message) +
 					this.uncompressedKeyBytes(inputs);
-				if (satsPerByte < 2 && !this.skipsSizeFloor(transaction, inputs)) {
+				if (rate < 2 && !this.skipsSizeFloor(transaction, inputs)) {
 					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
 					if (transactionByteCount < minByteCount)
 						transactionByteCount = minByteCount;
@@ -694,10 +697,12 @@ export class Transaction {
 			const quoteAt = (
 				rate: number
 			): { totalFee: number; transactionByteCount: number } => {
-				const byteCount = byteCountFor(pricesChange);
+				// A rate capped below 2 sat/vB takes the size floor that updateFee
+				// prices it with.
+				const byteCount = byteCountFor(pricesChange, rate);
 				const fee = Math.ceil(byteCount * rate);
 				if (pricesChange && fee > available && available < txBalance / 2) {
-					const noChangeByteCount = byteCountFor(false);
+					const noChangeByteCount = byteCountFor(false, rate);
 					if (Math.ceil(noChangeByteCount * rate) <= available) {
 						return {
 							totalFee: available,
