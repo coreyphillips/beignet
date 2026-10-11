@@ -7136,6 +7136,18 @@ export class Channel {
 	}
 
 	/**
+	 * Fill in `closeSpendsFundingTxid` on a row written before the field
+	 * existed (issue #1547), from spend evidence the caller has verified. A
+	 * marker already present was written by the plan itself and is left
+	 * alone. Returns true when this call wrote it, so the caller persists.
+	 */
+	recoverCloseSpendsFunding(fundingTxid: Buffer): boolean {
+		if (this._state.closeSpendsFundingTxid) return false;
+		this._state.closeSpendsFundingTxid = Buffer.from(fundingTxid);
+		return true;
+	}
+
+	/**
 	 * Force close, in one call: plan, then apply.
 	 *
 	 * Kept for callers with nothing to sequence between the two. The operator
