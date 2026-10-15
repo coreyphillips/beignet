@@ -21,8 +21,8 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
+import { tapleafHash as bip341TapleafHash } from 'bitcoinjs-lib/src/payments/bip341';
 import { ecc } from '../../utils/ecc';
-import crypto from 'crypto';
 import {
 	buildTaprootSecondLevelOutput,
 	TAPLEAF_VERSION
@@ -31,12 +31,6 @@ import {
 bitcoin.initEccLib(ecc);
 
 /**
- * BIP341 tapleaf hash: tagged_hash("TapLeaf", leaf_version || compact_size(script)
- * || script). HTLC/commitment leaves are well under 253 bytes, so the compact
- * size is a single byte. Matches the construction bitcoind validates (proven via
- * testmempoolaccept in the taproot HTLC-spend interop test).
- */
-/**
  * BIP342 sighash type for taproot HTLC second-level signatures: SIGHASH_SINGLE
  * (0x03) | SIGHASH_ANYONECANPAY (0x80) = 0x83. The byte is implicit on the wire
  * (sigs are 64 bytes) and appended only when assembling the spend witness.
@@ -44,25 +38,15 @@ bitcoin.initEccLib(ecc);
 export const TAPROOT_HTLC_SIGHASH_TYPE =
 	bitcoin.Transaction.SIGHASH_SINGLE | bitcoin.Transaction.SIGHASH_ANYONECANPAY;
 
+/**
+ * BIP341 tapleaf hash: tagged_hash("TapLeaf", leaf_version ||
+ * compact_size(len(script)) || script).
+ */
 export function tapleafHash(
 	leafScript: Buffer,
 	version: number = TAPLEAF_VERSION
 ): Buffer {
-	const tag = crypto
-		.createHash('sha256')
-		.update(Buffer.from('TapLeaf'))
-		.digest();
-	return crypto
-		.createHash('sha256')
-		.update(
-			Buffer.concat([
-				tag,
-				tag,
-				Buffer.from([version, leafScript.length]),
-				leafScript
-			])
-		)
-		.digest();
+	return bip341TapleafHash({ output: leafScript, version });
 }
 
 /**
