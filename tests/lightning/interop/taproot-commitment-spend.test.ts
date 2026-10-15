@@ -12,7 +12,6 @@
 import { expect } from 'chai';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
-import { sha256 } from '@noble/hashes/sha256';
 import crypto from 'crypto';
 import { bitcoinRpc, mineBlocks } from './shared-helpers';
 import {
@@ -20,21 +19,10 @@ import {
 	buildTaprootToRemoteOutput,
 	ITaprootLeafSpend
 } from '../../../src/lightning/script/commitment-taproot';
+import { tapleafHash } from '../../../src/lightning/script/htlc-taproot';
 
 bitcoin.initEccLib(ecc);
 const NETWORK = bitcoin.networks.regtest;
-
-function tapleafHash(leafScript: Buffer, version = 0xc0): Buffer {
-	const tag = sha256(Buffer.from('TapLeaf'));
-	const h = sha256.create();
-	h.update(tag);
-	h.update(tag);
-	h.update(Buffer.from([version]));
-	// scripts here are < 253 bytes → single-byte compact size.
-	h.update(Buffer.from([leafScript.length]));
-	h.update(leafScript);
-	return Buffer.from(h.digest());
-}
 
 async function bitcoindUp(): Promise<boolean> {
 	try {

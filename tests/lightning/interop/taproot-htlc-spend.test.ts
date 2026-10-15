@@ -20,6 +20,7 @@ import {
 	buildTaprootAnchorOutput,
 	ITaprootLeafSpend
 } from '../../../src/lightning/script/commitment-taproot';
+import { tapleafHash } from '../../../src/lightning/script/htlc-taproot';
 
 bitcoin.initEccLib(ecc);
 const NETWORK = bitcoin.networks.regtest;
@@ -30,16 +31,6 @@ function taggedHash(tag: string, data: Buffer): Buffer {
 	h.update(t);
 	h.update(t);
 	h.update(data);
-	return Buffer.from(h.digest());
-}
-
-function tapleafHash(leafScript: Buffer, version = 0xc0): Buffer {
-	const h = sha256.create();
-	const t = sha256(Buffer.from('TapLeaf'));
-	h.update(t);
-	h.update(t);
-	h.update(Buffer.from([version, leafScript.length]));
-	h.update(leafScript);
 	return Buffer.from(h.digest());
 }
 
