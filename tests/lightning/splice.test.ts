@@ -53,6 +53,7 @@ import {
 	decodeTxAddOutputMessage,
 	decodeTxSignaturesMessage,
 	encodeTxAddInputMessage,
+	encodeTxInitRbfMessage,
 	encodeTxSignaturesMessage
 } from '../../src/lightning/message/interactive-tx';
 import { decodeStfuMessage } from '../../src/lightning/message/stfu';
@@ -9485,6 +9486,106 @@ describe('Splice', function () {
 					.getFullState()
 					.spliceInFlight!.remoteCommitmentSig!.equals(spliceSigBefore)
 			).to.equal(true);
+		});
+
+		it('answers tx_init_rbf for a signed, unconfirmed splice with tx_abort and keeps the splice (issue #765)', function () {
+			// Beignet has no splice RBF. BOLT 2 says the receiver of tx_init_rbf
+			// MUST reply with tx_ack_rbf or tx_abort, so the refusal is a
+			// tx_abort the peer can interpret, and the signed splice stays
+			// exactly where it was: the channel keeps waiting for the lock on the
+			// candidate both sides already signed.
+			const { openerChannel, acceptorChannel, channelId } = pendingLockPair();
+			for (const channel of [openerChannel, acceptorChannel]) {
+				const inflightBefore = channel.getFullState().spliceInFlight!;
+				const spliceTxidBefore = Buffer.from(inflightBefore.spliceTxid);
+				const commitBefore = channel.getFullState().localCommitmentNumber;
+
+				const actions = channel.handleTxInitRbf({
+					channelId,
+					locktime: 0,
+					feerate: 2000,
+					fundingOutputContribution: 0n
+				});
+
+				const abort = findSendAction(actions, MessageType.TX_ABORT);
+				expect(abort, 'tx_abort answered the tx_init_rbf').to.exist;
+				const decoded = decodeTxAbortMessage(abort.payload);
+				expect(decoded.channelId.equals(channelId)).to.equal(true);
+				expect(decoded.data.toString('utf8')).to.equal(
+					'splice RBF not supported'
+				);
+				expect(
+					actions.some((a) => a.type === ChannelActionType.ERROR),
+					'no channel error'
+				).to.equal(false);
+				expect(
+					findSendAction(actions, MessageType.ERROR),
+					'no wire error'
+				).to.equal(undefined);
+
+				// The splice is untouched and the channel still waits for its lock.
+				expect(channel.getState()).to.equal(ChannelState.SPLICING);
+				expect(channel.isSplicePendingLock()).to.equal(true);
+				const inflightAfter = channel.getFullState().spliceInFlight!;
+				expect(inflightAfter.spliceTxid.equals(spliceTxidBefore)).to.equal(
+					true
+				);
+				expect(inflightAfter.sentTxSignatures).to.equal(true);
+				expect(inflightAfter.receivedTxSignatures).to.equal(true);
+				expect(channel.getFullState().localCommitmentNumber).to.equal(
+					commitBefore
+				);
+			}
+		});
+
+		it('routes a peer tx_init_rbf during pending-lock to the tx_abort refusal through the manager (issue #765)', function () {
+			const { acceptorManager, acceptorChannel, openerPubkey, channelId } =
+				pendingLockPair();
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			acceptorManager.on('message:outbound', (pk, type, payload) => {
+				if (pk === openerPubkey) sent.push({ type, payload });
+			});
+			const errors: string[] = [];
+			acceptorManager.on('error', (_id: Buffer, m: string) => errors.push(m));
+
+			acceptorManager.handleMessage(
+				openerPubkey,
+				MessageType.TX_INIT_RBF,
+				encodeTxInitRbfMessage({
+					channelId,
+					locktime: 0,
+					feerate: 2000,
+					fundingOutputContribution: 0n
+				})
+			);
+
+			const abort = sent.find((m) => m.type === MessageType.TX_ABORT);
+			expect(abort, 'tx_abort left on the wire').to.exist;
+			expect(
+				decodeTxAbortMessage(abort!.payload).data.toString('utf8')
+			).to.equal('splice RBF not supported');
+			expect(errors).to.deep.equal([]);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.SPLICING);
+			expect(acceptorChannel.isSplicePendingLock()).to.equal(true);
+		});
+
+		it('rejects a start_batch larger than two during pending-lock without revoking (issue #765)', function () {
+			// One current funding plus one pending splice is the only shape this
+			// implementation signs over; a larger batch would name a candidate it
+			// does not hold, so it is refused before anything is revoked.
+			const { acceptorChannel, channelId } = pendingLockPair();
+			const before = acceptorChannel.getFullState().localCommitmentNumber;
+			const actions = acceptorChannel.handleStartBatch({
+				channelId,
+				batchSize: 3,
+				messageType: 132
+			});
+			expect(actions.some((a) => a.type === ChannelActionType.ERROR)).to.equal(
+				true
+			);
+			expect(acceptorChannel.getFullState().localCommitmentNumber).to.equal(
+				before
+			);
 		});
 
 		it('rejects start_batch outside the pending-lock window', function () {

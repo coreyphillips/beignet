@@ -10,7 +10,8 @@
  *  - tx_abort echoed from active dual-funding/splice sessions;
  *  - RBF feerate floor is 25/24 of the previous feerate;
  *  - splice-out destination script must be a standard output form.
- * (Splice tx_init_rbf tx_abort reply is covered in splice.test.ts context;
+ * (Splice tx_init_rbf tx_abort reply is pinned in splice.test.ts, "answers
+ *  tx_init_rbf for a signed, unconfirmed splice", issue #765;
  * per-output penalty splitting near expiry is tracked as its own follow-up.)
  */
 
