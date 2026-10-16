@@ -511,6 +511,15 @@ export class FakeDfNode implements IDfReceiverDeps {
 	/** Set to make abortSplice report a refusal (the peer signed first). */
 	spliceAbortError: string | null = null;
 	spliceError: string | null = null;
+	/**
+	 * The live estimate `estimateFeeSatPerVbyte` answers with (issue #763);
+	 * null is "no estimate". Set `feeEstimateThrows` or `feeEstimateHangs` to
+	 * make the estimator fail or never answer instead.
+	 */
+	feeSatPerVbyte: number | null = null;
+	feeEstimateThrows: Error | null = null;
+	feeEstimateHangs = false;
+	readonly feeEstimateCalls: number[] = [];
 	openThrows: Error | null = null;
 	lspPubkey: string | null = LSP_PUBKEY;
 	spliceChannel: Buffer | null = null;
@@ -663,6 +672,13 @@ export class FakeDfNode implements IDfReceiverDeps {
 		return this.abortError
 			? { ok: false, error: this.abortError }
 			: { ok: true, pending: this.abortPending };
+	}
+
+	async estimateFeeSatPerVbyte(targetBlocks: number): Promise<number | null> {
+		this.feeEstimateCalls.push(targetBlocks);
+		if (this.feeEstimateThrows) throw this.feeEstimateThrows;
+		if (this.feeEstimateHangs) return new Promise<never>(() => undefined);
+		return this.feeSatPerVbyte;
 	}
 
 	spliceInWithInputs(

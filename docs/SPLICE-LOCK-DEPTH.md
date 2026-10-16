@@ -190,7 +190,13 @@ The same depth class the rest of the node treats as final.
   offered coin is confirmed; while any splice with the liquidity peer is
   negotiating or waiting on depth, further offers are declined before the
   payer's witness leaves, so the payer falls back to a plain send instead of a
-  second channel. A reverted splice fails the request behind it.
+  second channel. A reverted splice fails the request behind it. The splice
+  is quoted at the node's live fee estimate, held between the relay floor and
+  the splice ceiling and capped at what the payer's `max_total_fee_sat` buys
+  over it (issue #763), so a stranger's splice is not signed at a feerate the
+  mempool has already left behind, with no splice RBF to raise it later; a
+  ceiling under the relay floor is refused before the splice starts, and an
+  operator-pinned `spliceFeeratePerKw` is used as given.
 - Just-in-time receives: a held payment never rides a depth-locked splice; a
   hold arriving while any splice is pending fails fast with nothing fronted.
 - HTLC deadlines: the per-block backstops that force close to claim an inbound

@@ -41,6 +41,11 @@
 import { EventEmitter } from 'events';
 import * as bitcoin from 'bitcoinjs-lib';
 import type { ISpliceWalletInput } from '../../channel/channel';
+import {
+	estimateSpliceTxWeight,
+	MAX_SPLICE_FEERATE_PERKW,
+	spliceFeeSats
+} from '../../channel/splice-weight';
 import { ChainBackendUnavailableError } from '../../chain/chain-watcher';
 import { BeignetCustomSubtype } from '../../message/custom';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX } from '../../message/splice';
@@ -87,8 +92,13 @@ import {
 import {
 	DF_CHAIN_RETRY_INTERVAL_MS,
 	DF_CHAIN_WAIT_MS,
+	DF_DEFAULT_SPLICE_FEE_TARGET_BLOCKS,
 	DF_DEFAULT_SPLICE_FEERATE_PERKW,
 	DF_DEFAULT_UNPAIRED_SPLICE_DEPTH,
+	DF_FEE_ESTIMATE_WAIT_MS,
+	DF_LOG_SPLICE_FEE_ESTIMATE_UNAVAILABLE,
+	DF_LOG_SPLICE_FEERATE,
+	DF_MIN_SPLICE_FEERATE_PERKW,
 	DF_LOG_OFFER_ACCEPTED,
 	DF_LOG_OFFER_COMPLETED,
 	DF_LOG_OFFER_DECLINED,
@@ -245,6 +255,12 @@ interface IDfSessionContext {
 	 * could not say. A resumed funding never carries it, and never needs to.
 	 */
 	coinConfirmed?: boolean;
+	/**
+	 * The node's live fee estimate at admission, in sat/kw, when the offer
+	 * could be served as a splice and the operator pinned no feerate (issue
+	 * #763). Absent when there was no estimator, or it did not answer in time.
+	 */
+	liveSpliceFeeratePerKw?: number;
 }
 
 /** A funding under way, however it got there. */
@@ -255,9 +271,15 @@ interface IDfStartedFunding {
 }
 
 type ResolvedConfig = Required<
-	Omit<IDfReceiverConfig, 'minAmountSat' | 'maxAmountSat' | 'requiredSequence'>
+	Omit<
+		IDfReceiverConfig,
+		'minAmountSat' | 'maxAmountSat' | 'requiredSequence' | 'spliceFeeratePerKw'
+	>
 > &
-	Pick<IDfReceiverConfig, 'minAmountSat' | 'maxAmountSat' | 'requiredSequence'>;
+	Pick<
+		IDfReceiverConfig,
+		'minAmountSat' | 'maxAmountSat' | 'requiredSequence' | 'spliceFeeratePerKw'
+	>;
 
 export class DirectFundingReceiver extends EventEmitter {
 	private readonly state: DfOfferSessions;
@@ -288,8 +310,10 @@ export class DirectFundingReceiver extends EventEmitter {
 			witnessTimeoutMs: config.witnessTimeoutMs ?? DF_WITNESS_TIMEOUT_MS,
 			chainWaitMs: config.chainWaitMs ?? DF_CHAIN_WAIT_MS,
 			sweepIntervalMs: config.sweepIntervalMs ?? DF_RECEIVER_SWEEP_INTERVAL_MS,
-			spliceFeeratePerKw:
-				config.spliceFeeratePerKw ?? DF_DEFAULT_SPLICE_FEERATE_PERKW,
+			spliceFeeratePerKw: config.spliceFeeratePerKw,
+			spliceFeeTargetBlocks:
+				config.spliceFeeTargetBlocks ?? DF_DEFAULT_SPLICE_FEE_TARGET_BLOCKS,
+			feeEstimateWaitMs: config.feeEstimateWaitMs ?? DF_FEE_ESTIMATE_WAIT_MS,
 			allowSplice: config.allowSplice ?? false,
 			allowUnpairedSplice: config.allowUnpairedSplice ?? false,
 			unpairedSpliceDepth: checkedUnpairedSpliceDepth(
@@ -1156,6 +1180,19 @@ export class DirectFundingReceiver extends EventEmitter {
 			return;
 		}
 
+		// 11a. The feerate a splice of this coin would be quoted at (issue
+		// #763). Asked here, in the awaiting part of admission, because the
+		// block below must not await and the splice itself starts
+		// synchronously inside `serve`. Only when a splice is on the table: an
+		// open negotiates at the channel's own feerate, and a pinned feerate
+		// needs no estimate.
+		const liveSpliceFeeratePerKw =
+			this.cfg.allowSplice &&
+			this.cfg.spliceFeeratePerKw === undefined &&
+			this.deps.usableChannelWith(lsp) !== null
+				? await this.liveSpliceFeeratePerKw()
+				: undefined;
+
 		// ── Everything from here mutates shared state, synchronously. ──
 
 		// Re-read what a concurrent admission could have changed while this one
@@ -1321,7 +1358,10 @@ export class DirectFundingReceiver extends EventEmitter {
 			prevTxid: prevTx.getHash(),
 			paired,
 			// Unknown stays unknown: an unanswered index is not a confirmation.
-			...(coinConfirmed !== undefined ? { coinConfirmed } : {})
+			...(coinConfirmed !== undefined ? { coinConfirmed } : {}),
+			...(liveSpliceFeeratePerKw !== undefined
+				? { liveSpliceFeeratePerKw }
+				: {})
 		};
 		await this.serve(ctx, () =>
 			this.startFunding(ctx, lsp, prevTx, coin.confirmed)
@@ -1952,6 +1992,9 @@ export class DirectFundingReceiver extends EventEmitter {
 		channelId: Buffer,
 		input: ISpliceWalletInput
 	): { final: Promise<IDfFinalTx>; unwind: () => boolean } {
+		// Before the waiter: a quote the payer's ceiling cannot carry is refused
+		// here, with nothing to cancel.
+		const feeratePerKw = this.spliceFeerateFor(ctx);
 		const waiter = this.awaitFinalTx(
 			this.spliceWaiters,
 			ctx.session.outpoint,
@@ -1970,7 +2013,7 @@ export class DirectFundingReceiver extends EventEmitter {
 				ctx.offer.amountSat,
 				[input],
 				ctx.offer.changeScript,
-				this.cfg.spliceFeeratePerKw,
+				feeratePerKw,
 				{
 					lockAtDepth: ctx.paired ? undefined : this.cfg.unpairedSpliceDepth
 				}
@@ -1986,6 +2029,114 @@ export class DirectFundingReceiver extends EventEmitter {
 			throw new Error(`splice initiation failed: ${result.error}`);
 		}
 		return { final: waiter.final, unwind };
+	}
+
+	/**
+	 * The node's live fee estimate for a splice, in sat/kw, or undefined when
+	 * there is no estimator or it did not answer inside `feeEstimateWaitMs`
+	 * (issue #763). A failed or slow estimate is logged and the quote falls
+	 * back to `DF_DEFAULT_SPLICE_FEERATE_PERKW`, the only feerate there was
+	 * before: a payer waiting on its 120 s offer window is better served by
+	 * that than by a decline.
+	 */
+	private async liveSpliceFeeratePerKw(): Promise<number | undefined> {
+		const estimate = this.deps.estimateFeeSatPerVbyte;
+		if (!estimate) return undefined;
+		let timer: NodeJS.Timeout | undefined;
+		let reason: string;
+		try {
+			const satPerVbyte = await Promise.race([
+				estimate.call(this.deps, this.cfg.spliceFeeTargetBlocks),
+				new Promise<'timeout'>((resolve) => {
+					timer = setTimeout(
+						() => resolve('timeout'),
+						this.cfg.feeEstimateWaitMs
+					);
+					timer.unref?.();
+				})
+			]);
+			if (satPerVbyte === 'timeout') {
+				reason = `no estimate within ${this.cfg.feeEstimateWaitMs} ms`;
+			} else if (
+				satPerVbyte === null ||
+				!Number.isFinite(satPerVbyte) ||
+				satPerVbyte <= 0
+			) {
+				reason = 'the estimator had no estimate';
+			} else {
+				// sat/vB to sat/kw: 1 vB is 4 WU, so 1000 WU is 250 vB.
+				return Math.ceil(satPerVbyte * 250);
+			}
+		} catch (err) {
+			reason = err instanceof Error ? err.message : String(err);
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+		this.log(DF_LOG_SPLICE_FEE_ESTIMATE_UNAVAILABLE, {
+			targetBlocks: this.cfg.spliceFeeTargetBlocks,
+			reason
+		});
+		return undefined;
+	}
+
+	/**
+	 * The feerate this offer's splice negotiates at (issue #763).
+	 *
+	 * An operator-pinned feerate is used as given. Otherwise the live estimate
+	 * taken at admission (or the fixed default without one) is held between
+	 * the relay floor and the splice ceiling, then capped at what the payer's
+	 * `max_total_fee_sat` buys over the splice: the channel prices the fee
+	 * with the same weight estimate (`estimateSpliceTxWeight` over the one
+	 * payer input and its change output) and takes it out of the payer's
+	 * change, and `fundingTransactionProblem` refuses the sign request when
+	 * that fee is above the ceiling. Capping here turns that late refusal, a
+	 * whole negotiation and quiescence round after the ack, into a splice the
+	 * payer can afford. A ceiling that buys less than the relay floor is
+	 * refused before anything starts.
+	 */
+	private spliceFeerateFor(ctx: IDfSessionContext): number {
+		const pinned = this.cfg.spliceFeeratePerKw;
+		if (pinned !== undefined) {
+			this.log(DF_LOG_SPLICE_FEERATE, {
+				offerId: ctx.session.offerIdHex,
+				feeratePerKw: pinned,
+				source: 'pinned'
+			});
+			return pinned;
+		}
+		const live = ctx.liveSpliceFeeratePerKw;
+		const wanted = Math.min(
+			Math.max(
+				live ?? DF_DEFAULT_SPLICE_FEERATE_PERKW,
+				DF_MIN_SPLICE_FEERATE_PERKW
+			),
+			MAX_SPLICE_FEERATE_PERKW
+		);
+		const weight = estimateSpliceTxWeight({
+			walletInputCount: 1,
+			changeScriptLen: ctx.offer.changeScript.length
+		});
+		// The highest whole sat/kw whose fee over this weight stays within the
+		// ceiling: fee = ceil(weight * rate / 1000) <= ceiling holds for every
+		// rate <= floor(ceiling * 1000 / weight), the ceiling being whole sats.
+		const payerCeilingPerKw = Number(
+			(ctx.offer.maxTotalFeeSat * 1000n) / BigInt(weight)
+		);
+		const feeratePerKw = Math.min(wanted, payerCeilingPerKw);
+		if (feeratePerKw < DF_MIN_SPLICE_FEERATE_PERKW) {
+			throw new Error(
+				`the payer's ${ctx.offer.maxTotalFeeSat} sat fee ceiling buys ${payerCeilingPerKw} sat/kw over this splice, under the ${DF_MIN_SPLICE_FEERATE_PERKW} sat/kw relay floor`
+			);
+		}
+		this.log(DF_LOG_SPLICE_FEERATE, {
+			offerId: ctx.session.offerIdHex,
+			feeratePerKw,
+			source: live !== undefined ? 'live' : 'default',
+			...(live !== undefined ? { liveFeeratePerKw: live } : {}),
+			payerCeilingPerKw,
+			feeSat: spliceFeeSats(weight, feeratePerKw).toString()
+		});
+		return feeratePerKw;
 	}
 
 	/**

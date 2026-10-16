@@ -72,8 +72,33 @@ export const DF_CHAIN_RETRY_INTERVAL_MS = 1_000;
 /** How often expired sessions, reservations and attempt records are swept. */
 export const DF_RECEIVER_SWEEP_INTERVAL_MS = 30_000;
 
-/** Feerate a direct-funded splice negotiates at, when none is configured. */
+/**
+ * Feerate a direct-funded splice negotiates at when no live estimate is
+ * available (no estimator wired, or one that cannot answer) and the operator
+ * pinned none. A fixed 2 sat/vB that was the only feerate before issue #763:
+ * a stranger's splice signed at it sits unconfirmed for days whenever the
+ * mempool is busier, and beignet has no splice RBF to raise it afterwards.
+ */
 export const DF_DEFAULT_SPLICE_FEERATE_PERKW = 500;
+
+/**
+ * The lowest feerate a direct-funded splice is quoted at: the network's
+ * minimum relay feerate. A live estimate under it, or a payer ceiling that
+ * buys less than it over the splice, does not produce a transaction the
+ * network would carry.
+ */
+export const DF_MIN_SPLICE_FEERATE_PERKW = 253;
+
+/** Confirmation target the live splice feerate is estimated for. */
+export const DF_DEFAULT_SPLICE_FEE_TARGET_BLOCKS = 6;
+
+/**
+ * How long admission waits for the fee estimator before quoting the splice
+ * at `DF_DEFAULT_SPLICE_FEERATE_PERKW` instead. Short on purpose: the payer's
+ * offer window is 120 s and the chain lookups ahead of this already take up
+ * to `DF_CHAIN_WAIT_MS` of it.
+ */
+export const DF_FEE_ESTIMATE_WAIT_MS = 5_000;
 
 /**
  * Confirmations an UNPAIRED payer's splice must reach before it locks, when
@@ -106,7 +131,21 @@ export interface IDfReceiverConfig {
 	/** Default `DF_CHAIN_WAIT_MS`. */
 	chainWaitMs?: number;
 	sweepIntervalMs?: number;
+	/**
+	 * Pin every direct-funded splice to this feerate (sat/kw). Unset, the
+	 * splice is quoted at the node's live estimate for
+	 * `spliceFeeTargetBlocks`, bounded above by what the payer's
+	 * `max_total_fee_sat` buys over the splice and by the splice ceiling, and
+	 * below by the relay floor; without an estimate it falls back to
+	 * `DF_DEFAULT_SPLICE_FEERATE_PERKW` (issue #763). A pinned feerate is used
+	 * as given, so a payer whose ceiling does not cover it is refused at the
+	 * sign request, as before.
+	 */
 	spliceFeeratePerKw?: number;
+	/** Default `DF_DEFAULT_SPLICE_FEE_TARGET_BLOCKS`. */
+	spliceFeeTargetBlocks?: number;
+	/** Default `DF_FEE_ESTIMATE_WAIT_MS`. */
+	feeEstimateWaitMs?: number;
 	/**
 	 * Serve offers by splicing an existing channel with the liquidity peer
 	 * rather than opening a new one. Rev 2 classes splice-in as an extension;
@@ -246,6 +285,13 @@ export interface IDfReceiverDeps {
 	/** Requests this node minted (4A). A session exists only for one of these. */
 	requests: DirectFundingRequestStore;
 	chain: IDfChainSource;
+	/**
+	 * The node's fee estimate in sat/vB for a confirmation target, already
+	 * clamped to what the node trusts an estimator with, or null when it has
+	 * none. Optional: a receiver without one quotes every splice at
+	 * `DF_DEFAULT_SPLICE_FEERATE_PERKW` (issue #763).
+	 */
+	estimateFeeSatPerVbyte?(targetBlocks: number): Promise<number | null>;
 	/** The liquidity peer every direct-funded channel is negotiated with. */
 	liquidityPeer(): string | null;
 	/** A channel with this peer a splice could ride, or null. */
@@ -345,6 +391,11 @@ export const DF_LOG_OFFER_DECLINED = 'df_offer_declined';
 export const DF_LOG_OFFER_ACCEPTED = 'df_offer_accepted';
 export const DF_LOG_OFFER_FAILED = 'df_offer_failed';
 export const DF_LOG_OFFER_COMPLETED = 'df_offer_completed';
+/** The feerate a splice was quoted at and where it came from (issue #763). */
+export const DF_LOG_SPLICE_FEERATE = 'df_splice_feerate';
+/** The estimator did not answer; the splice falls back to the default. */
+export const DF_LOG_SPLICE_FEE_ESTIMATE_UNAVAILABLE =
+	'df_splice_fee_estimate_unavailable';
 
 /** Why an offer frame went nowhere. Silence stays on the wire (4B's rule). */
 export enum DfOfferDropReason {

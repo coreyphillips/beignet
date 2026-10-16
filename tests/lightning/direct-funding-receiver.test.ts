@@ -36,12 +36,22 @@ import {
 	memoryStorage
 } from './helpers/df-receiver';
 import {
+	DF_DEFAULT_SPLICE_FEE_TARGET_BLOCKS,
+	DF_DEFAULT_SPLICE_FEERATE_PERKW,
 	DF_DEFAULT_UNPAIRED_SPLICE_DEPTH,
 	DF_LOG_OFFER_DROPPED,
+	DF_LOG_SPLICE_FEE_ESTIMATE_UNAVAILABLE,
+	DF_LOG_SPLICE_FEERATE,
+	DF_MIN_SPLICE_FEERATE_PERKW,
 	DfOfferDropReason,
 	IDfReceiverConfig,
 	IDfReceiverDeps
 } from '../../src/lightning/direct-funding/receiver/types';
+import {
+	estimateSpliceTxWeight,
+	MAX_SPLICE_FEERATE_PERKW,
+	spliceFeeSats
+} from '../../src/lightning/channel/splice-weight';
 import { ChainBackendUnavailableError } from '../../src/lightning/chain/chain-watcher';
 
 const ACK = BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK;
@@ -3355,5 +3365,219 @@ describe('Direct funding receiver: frames it will not open (issue #612)', () => 
 		h.engine.handleFrame(h.payer.frame(SIGN_REQUEST, Buffer.alloc(4), false));
 		await flush();
 		expect(h.payer.sent).to.have.length(0);
+	});
+});
+
+describe('Direct funding receiver: live splice feerate (issue #763)', () => {
+	/** A paired payer with a channel to splice, so every offer takes the splice path. */
+	function spliceHarness(
+		config: IDfReceiverConfig = {},
+		offer: { maxTotalFeeSat?: bigint } = {}
+	): IHarness & {
+		logs: Array<{ action: string; data: Record<string, unknown> }>;
+	} {
+		const logs: Array<{ action: string; data: Record<string, unknown> }> = [];
+		const h = harness(
+			{
+				allowSplice: true,
+				...config
+			},
+			{ authenticatedPeer: 'payer-node-id', offer }
+		);
+		h.node.spliceChannel = crypto.randomBytes(32);
+		h.node.trustedPayers.add('payer-node-id');
+		(h.node as { log?: IDfReceiverDeps['log'] }).log = (action, data): void => {
+			logs.push({ action, data });
+		};
+		return Object.assign(h, { logs });
+	}
+
+	/** The weight the channel prices a one-input splice of this offer at. */
+	function spliceWeight(h: IHarness): number {
+		return estimateSpliceTxWeight({
+			walletInputCount: 1,
+			changeScriptLen: h.offer.changeScript.length
+		});
+	}
+
+	it('quotes the splice at the live estimate, converted to sat/kw', async () => {
+		const h = spliceHarness({}, { maxTotalFeeSat: 50_000n });
+		h.node.feeSatPerVbyte = 10;
+		await h.sendOffer();
+		expect(h.node.splices).to.have.length(1);
+		expect(h.node.splices[0].feeratePerKw).to.equal(2_500);
+		expect(h.node.feeEstimateCalls).to.deep.equal([
+			DF_DEFAULT_SPLICE_FEE_TARGET_BLOCKS
+		]);
+		const quote = h.logs.find((l) => l.action === DF_LOG_SPLICE_FEERATE);
+		expect(quote?.data).to.include({
+			feeratePerKw: 2_500,
+			source: 'live',
+			liveFeeratePerKw: 2_500
+		});
+		h.engine.stop();
+	});
+
+	it('asks the estimator for the configured confirmation target', async () => {
+		const h = spliceHarness(
+			{ spliceFeeTargetBlocks: 2 },
+			{ maxTotalFeeSat: 50_000n }
+		);
+		h.node.feeSatPerVbyte = 4;
+		await h.sendOffer();
+		expect(h.node.feeEstimateCalls).to.deep.equal([2]);
+		expect(h.node.splices[0].feeratePerKw).to.equal(1_000);
+		h.engine.stop();
+	});
+
+	it('falls back to the fixed default without an estimator', async () => {
+		const h = spliceHarness({}, { maxTotalFeeSat: 50_000n });
+		(h.node as { estimateFeeSatPerVbyte?: unknown }).estimateFeeSatPerVbyte =
+			undefined;
+		await h.sendOffer();
+		expect(h.node.splices).to.have.length(1);
+		expect(h.node.splices[0].feeratePerKw).to.equal(
+			DF_DEFAULT_SPLICE_FEERATE_PERKW
+		);
+		const quote = h.logs.find((l) => l.action === DF_LOG_SPLICE_FEERATE);
+		expect(quote?.data).to.include({ source: 'default' });
+		h.engine.stop();
+	});
+
+	it('falls back to the fixed default when the estimator has no estimate', async () => {
+		const h = spliceHarness({}, { maxTotalFeeSat: 50_000n });
+		h.node.feeSatPerVbyte = null;
+		await h.sendOffer();
+		expect(h.node.splices[0].feeratePerKw).to.equal(
+			DF_DEFAULT_SPLICE_FEERATE_PERKW
+		);
+		const miss = h.logs.find(
+			(l) => l.action === DF_LOG_SPLICE_FEE_ESTIMATE_UNAVAILABLE
+		);
+		expect(miss?.data.reason).to.equal('the estimator had no estimate');
+		h.engine.stop();
+	});
+
+	it('falls back to the fixed default when the estimator throws', async () => {
+		const h = spliceHarness({}, { maxTotalFeeSat: 50_000n });
+		h.node.feeEstimateThrows = new Error('estimator offline');
+		await h.sendOffer();
+		expect(h.lastAck()?.accepted).to.equal(true);
+		expect(h.node.splices[0].feeratePerKw).to.equal(
+			DF_DEFAULT_SPLICE_FEERATE_PERKW
+		);
+		const miss = h.logs.find(
+			(l) => l.action === DF_LOG_SPLICE_FEE_ESTIMATE_UNAVAILABLE
+		);
+		expect(miss?.data.reason).to.equal('estimator offline');
+		h.engine.stop();
+	});
+
+	it('falls back to the fixed default when the estimator does not answer in time', async () => {
+		const h = spliceHarness(
+			{ feeEstimateWaitMs: 20 },
+			{ maxTotalFeeSat: 50_000n }
+		);
+		h.node.feeEstimateHangs = true;
+		h.engine.handleFrame(h.payer.offerFrame(h.offer));
+		await sleep(60);
+		await flush();
+		expect(h.lastAck()?.accepted).to.equal(true);
+		expect(h.node.splices[0].feeratePerKw).to.equal(
+			DF_DEFAULT_SPLICE_FEERATE_PERKW
+		);
+		const miss = h.logs.find(
+			(l) => l.action === DF_LOG_SPLICE_FEE_ESTIMATE_UNAVAILABLE
+		);
+		expect(miss?.data.reason).to.equal('no estimate within 20 ms');
+		h.engine.stop();
+	});
+
+	it('caps the quote at what the payer fee ceiling buys over the splice', async () => {
+		const ceiling = 1_000n;
+		const h = spliceHarness({}, { maxTotalFeeSat: ceiling });
+		h.node.feeSatPerVbyte = 40;
+		await h.sendOffer();
+		expect(h.node.splices).to.have.length(1);
+		const weight = spliceWeight(h);
+		const expected = Number((ceiling * 1000n) / BigInt(weight));
+		expect(expected).to.be.below(10_000);
+		expect(h.node.splices[0].feeratePerKw).to.equal(expected);
+		// The fee the channel prices at that rate stays within the ceiling, so
+		// the sign request's fundingTransactionProblem check passes.
+		expect(spliceFeeSats(weight, expected) <= ceiling).to.equal(true);
+		expect(spliceFeeSats(weight, expected + 1) > ceiling).to.equal(true);
+		const quote = h.logs.find((l) => l.action === DF_LOG_SPLICE_FEERATE);
+		expect(quote?.data).to.include({
+			feeratePerKw: expected,
+			payerCeilingPerKw: expected,
+			liveFeeratePerKw: 10_000
+		});
+		h.engine.stop();
+	});
+
+	it('caps the fixed default at the payer fee ceiling too', async () => {
+		const ceiling = 300n;
+		const h = spliceHarness({}, { maxTotalFeeSat: ceiling });
+		h.node.feeSatPerVbyte = null;
+		await h.sendOffer();
+		const expected = Number((ceiling * 1000n) / BigInt(spliceWeight(h)));
+		expect(expected).to.be.below(DF_DEFAULT_SPLICE_FEERATE_PERKW);
+		expect(expected).to.be.at.least(DF_MIN_SPLICE_FEERATE_PERKW);
+		expect(h.node.splices[0].feeratePerKw).to.equal(expected);
+		h.engine.stop();
+	});
+
+	it('never quotes under the relay floor', async () => {
+		const h = spliceHarness({}, { maxTotalFeeSat: 50_000n });
+		h.node.feeSatPerVbyte = 0.5;
+		await h.sendOffer();
+		expect(h.node.splices[0].feeratePerKw).to.equal(
+			DF_MIN_SPLICE_FEERATE_PERKW
+		);
+		h.engine.stop();
+	});
+
+	it('never quotes above the splice ceiling', async () => {
+		const h = spliceHarness({}, { maxTotalFeeSat: 10_000_000n });
+		h.node.feeSatPerVbyte = 5_000;
+		await h.sendOffer();
+		expect(h.node.splices[0].feeratePerKw).to.equal(MAX_SPLICE_FEERATE_PERKW);
+		h.engine.stop();
+	});
+
+	it('fails the offer before the splice starts when the ceiling buys less than the relay floor', async () => {
+		const h = spliceHarness({}, { maxTotalFeeSat: 100n });
+		h.node.feeSatPerVbyte = 10;
+		await h.sendOffer();
+		expect(h.node.splices).to.have.length(0);
+		expect(h.node.aborts).to.have.length(0);
+		expect(h.engine.inflightCount()).to.equal(0);
+		expect(h.lastAck()?.reason).to.contain('under the 253 sat/kw relay floor');
+		h.engine.stop();
+	});
+
+	it('uses a pinned feerate as given, without asking the estimator', async () => {
+		const h = spliceHarness(
+			{ spliceFeeratePerKw: 700 },
+			{ maxTotalFeeSat: 100n }
+		);
+		h.node.feeSatPerVbyte = 10;
+		await h.sendOffer();
+		expect(h.node.feeEstimateCalls).to.deep.equal([]);
+		expect(h.node.splices).to.have.length(1);
+		expect(h.node.splices[0].feeratePerKw).to.equal(700);
+		const quote = h.logs.find((l) => l.action === DF_LOG_SPLICE_FEERATE);
+		expect(quote?.data).to.include({ feeratePerKw: 700, source: 'pinned' });
+		h.engine.stop();
+	});
+
+	it('does not ask the estimator for an offer that opens a channel', async () => {
+		const h = harness({ allowSplice: true });
+		h.node.feeSatPerVbyte = 10;
+		await h.sendOffer();
+		expect(h.node.opens).to.have.length(1);
+		expect(h.node.feeEstimateCalls).to.deep.equal([]);
+		h.engine.stop();
 	});
 });
