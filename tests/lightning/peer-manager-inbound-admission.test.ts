@@ -266,11 +266,88 @@ describe('peer manager inbound admission', () => {
 		expect(pm.getPeer(channelPubkey)).to.exist;
 	});
 
+	it('caps established inbound peers per public source address, admitting channel peers past it', async function () {
+		this.timeout(10_000);
+		const channelKey = crypto.randomBytes(32);
+		const channelPubkey = getPublicKey(channelKey).toString('hex');
+		pm = new PeerManager({
+			localPrivateKey: HOST_SECRET,
+			maxInboundPeersPerAddress: 2,
+			isChannelPeer: (pubkey): boolean => pubkey === channelPubkey
+		});
+		let nextAddress = '';
+		const relay = net.createServer((socket) => {
+			Object.defineProperty(socket, 'remoteAddress', { value: nextAddress });
+			internal(pm!).handleInboundConnection(socket);
+		});
+		await new Promise<void>((resolve) =>
+			relay.listen(0, '127.0.0.1', () => resolve())
+		);
+		const port = (relay.address() as net.AddressInfo).port;
+		/** Resolves with the dialer once registered, or null once refused. */
+		const connect = async (
+			address: string,
+			key = crypto.randomBytes(32)
+		): Promise<Peer | null> => {
+			nextAddress = address;
+			const pubkey = getPublicKey(key).toString('hex');
+			const replaced = pm!.getPeer(pubkey);
+			const peer = dialer(port, key);
+			peers.push(peer);
+			let closed = false;
+			peer.on('close', () => {
+				closed = true;
+			});
+			peer.connect().catch(() => {
+				closed = true;
+			});
+			await until(() => {
+				const registered = pm!.getPeer(pubkey);
+				return closed || (registered !== undefined && registered !== replaced);
+			});
+			return closed ? null : peer;
+		};
+		try {
+			const firstKey = crypto.randomBytes(32);
+			const first = await connect('203.0.113.9', firstKey);
+			const second = await connect('::ffff:203.0.113.9');
+			expect(first).to.not.equal(null);
+			expect(second).to.not.equal(null);
+			expect(await connect('203.0.113.9')).to.equal(null);
+
+			// A redial replaces its own connection instead of counting twice.
+			expect(await connect('203.0.113.9', firstKey)).to.not.equal(null);
+			expect(pm.listPeers()).to.have.length(2);
+
+			expect(await connect('203.0.113.9', channelKey)).to.not.equal(null);
+			expect(await connect('198.51.100.7')).to.not.equal(null);
+			for (let i = 0; i < 3; i++) {
+				expect(await connect('10.21.21.11')).to.not.equal(null);
+			}
+			expect(pm.listPeers()).to.have.length(7);
+
+			// Slots free on either side's disconnect.
+			second!.disconnect();
+			pm.disconnectPeer(channelPubkey);
+			await until(() => pm!.listPeers().length === 5);
+			expect(await connect('203.0.113.9')).to.not.equal(null);
+		} finally {
+			relay.close();
+		}
+	});
+
 	it('rejects a maxInboundPeers that is not a non-negative integer', () => {
 		for (const maxInboundPeers of [NaN, -1, 1.5, Infinity]) {
 			expect(
 				() => new PeerManager({ localPrivateKey: HOST_SECRET, maxInboundPeers })
 			).to.throw('maxInboundPeers must be a non-negative integer');
+			expect(
+				() =>
+					new PeerManager({
+						localPrivateKey: HOST_SECRET,
+						maxInboundPeersPerAddress: maxInboundPeers
+					})
+			).to.throw('maxInboundPeersPerAddress must be a non-negative integer');
 		}
 	});
 
