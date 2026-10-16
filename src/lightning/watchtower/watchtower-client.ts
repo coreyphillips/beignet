@@ -460,8 +460,8 @@ export class WatchtowerClient extends EventEmitter {
 	): void {
 		if (type === WtMessageType.INIT) {
 			slot.initReceived = true;
-			// Reset backoff on a healthy handshake.
-			slot.reconnectDelay = MIN_RECONNECT_MS;
+			// No backoff reset here: a tower that sends Init and then drops would
+			// otherwise hold us in a 1s redial loop. Only session progress resets it.
 			void this.ensureSessionAndDrain(state, slot);
 			return;
 		}
@@ -569,6 +569,7 @@ export class WatchtowerClient extends EventEmitter {
 			};
 			slot.session = session;
 			slot.sessionKey = sessionKey;
+			slot.reconnectDelay = MIN_RECONNECT_MS;
 			this.store?.saveWatchtowerSession(session, sessionKey);
 			// LND uses a connection either to create a session or to stream
 			// updates. Reconnect with this same key before shipping the backlog.
@@ -653,6 +654,7 @@ export class WatchtowerClient extends EventEmitter {
 			session.lastApplied = reply.lastApplied;
 			update.acked = true;
 			update.seqNum = seqNum;
+			slot.reconnectDelay = MIN_RECONNECT_MS;
 			this.store?.setWatchtowerSessionProgress(
 				session.sessionId,
 				seqNum,
@@ -692,6 +694,9 @@ export class WatchtowerClient extends EventEmitter {
 			slot.session = null;
 			slot.sessionKey = null;
 			slot.transportKey = randomBytes(32);
+			// A full session is routine, not a tower fault: rotate without waiting
+			// out a backoff that idle disconnects may have grown.
+			slot.reconnectDelay = MIN_RECONNECT_MS;
 			this.emitLog('session_exhausted', {
 				tower: state.address.uri,
 				blobType: slot.blobType

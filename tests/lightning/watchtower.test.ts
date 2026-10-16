@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { EventEmitter } from 'events';
+import sinon from 'sinon';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -806,6 +807,8 @@ class FakeTower extends EventEmitter implements ITowerTransport {
 		/** Never answer STATE_UPDATE (a stalled tower). */
 		silentUpdates?: boolean;
 		closeAfterCreateReply?: boolean;
+		/** Answer Init, then drop before anything else is answered. */
+		closeAfterInit?: boolean;
 	} = {};
 
 	constructor(public addr: ITowerAddress) {
@@ -838,6 +841,7 @@ class FakeTower extends EventEmitter implements ITowerTransport {
 						chainHash: chainHashForNetwork(network)
 					})
 				);
+				if (this.behaviour.closeAfterInit) this.close();
 			} else if (type === WtMessageType.CREATE_SESSION) {
 				decodeCreateSession(payload);
 				this.created = true;
@@ -1287,6 +1291,131 @@ describe('watchtower client session state machine (fake tower)', function () {
 		expect(failure).to.not.equal(undefined);
 		expect(failure!.channelId).to.equal('older-queued-channel');
 		client.stop();
+	});
+
+	describe('reconnect backoff (#1406)', function () {
+		let clock: sinon.SinonFakeTimers;
+
+		beforeEach(function () {
+			// setImmediate too: FakeTower answers on it, so tickAsync runs every
+			// reply and every redial in virtual time.
+			clock = sinon.useFakeTimers({
+				toFake: ['setTimeout', 'clearTimeout', 'setImmediate']
+			});
+		});
+
+		afterEach(function () {
+			clock.restore();
+		});
+
+		interface IDial {
+			tower: FakeTower;
+			at: number;
+			closedAt: number;
+		}
+
+		/** A client whose nth dial (from 1) reaches a tower set up by configure. */
+		function dialingClient(
+			store: IWatchtowerStore,
+			configure: (tower: FakeTower, n: number) => void
+		): { client: WatchtowerClient; dials: IDial[] } {
+			const dials: IDial[] = [];
+			const client = new WatchtowerClient({
+				localPrivateKey: crypto.randomBytes(32),
+				chainHash: chainHashForNetwork(network),
+				network,
+				towers: [TOWER_URI],
+				store,
+				transportFactory: (addr): ITowerTransport => {
+					const dial = {
+						tower: new FakeTower(addr),
+						at: clock.now,
+						closedAt: -1
+					};
+					dial.tower.on('close', () => {
+						dial.closedAt = clock.now;
+					});
+					dials.push(dial);
+					configure(dial.tower, dials.length);
+					return dial.tower;
+				}
+			});
+			return { client, dials };
+		}
+
+		// Measured from each close, not dial to dial: a zero-delay timer created
+		// mid-tick fires 1 ms late under fake timers, so every reply hop drifts.
+		const redialDelays = (dials: IDial[]): number[] =>
+			dials.slice(1).map((dial, i) => dial.at - dials[i].closedAt);
+
+		it('keeps backing off a tower that sends Init and then drops', async function () {
+			const { client, dials } = dialingClient(new InMemoryStore(), (tower) => {
+				tower.behaviour.closeAfterInit = true;
+			});
+			try {
+				await client.start();
+				await clock.tickAsync(16_000);
+				expect(redialDelays(dials)).to.deep.equal([1000, 2000, 4000, 8000]);
+			} finally {
+				client.stop();
+			}
+		});
+
+		it('resets the backoff on a created session and on an acked update', async function () {
+			const store = new InMemoryStore();
+			const { client, dials } = dialingClient(store, (tower, n) => {
+				tower.behaviour.closeAfterInit = n <= 3;
+			});
+			try {
+				client.backupRevokedState(contextForClient());
+				await client.start();
+				// Dial 4 (about 7 s in) creates the session, dial 5 ships the update.
+				await clock.tickAsync(9000);
+				expect(store.sessions).to.have.length(1);
+				expect(store.updates[0].acked).to.equal(true);
+				// The tower drops the idle connection after the ack.
+				dials[4].tower.close();
+				await clock.tickAsync(1000);
+				expect(redialDelays(dials)).to.deep.equal([
+					1000, 2000, 4000, 1000, 1000
+				]);
+			} finally {
+				client.stop();
+			}
+		});
+
+		it('rotates a full session without waiting out the backoff', async function () {
+			const store = new InMemoryStore();
+			store.sessions.push({
+				session: {
+					towerUri: TOWER_URI,
+					towerPubkey: parseTowerUri(TOWER_URI).pubkey,
+					sessionId: getPublicKey(crypto.randomBytes(32)).toString('hex'),
+					blobType: BlobType.ALTRUIST_COMMIT,
+					maxUpdates: 1024,
+					sweepFeeRate: '2500',
+					seqNum: 0,
+					lastApplied: 0,
+					createdAt: Date.now()
+				},
+				sessionKey: crypto.randomBytes(32)
+			});
+			const { client, dials } = dialingClient(store, (tower, n) => {
+				tower.behaviour.closeAfterInit = n <= 3;
+				tower.behaviour.updateCode = (): number =>
+					StateUpdateCode.MAX_UPDATES_EXCEEDED;
+			});
+			try {
+				client.backupRevokedState(contextForClient());
+				await client.start();
+				// Dial 4 (about 7 s in) is told the session is full; dial 5 replaces it.
+				await clock.tickAsync(9000);
+				expect(redialDelays(dials)).to.deep.equal([1000, 2000, 4000, 1000]);
+				expect(store.sessions).to.have.length(2);
+			} finally {
+				client.stop();
+			}
+		});
 	});
 });
 
