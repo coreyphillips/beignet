@@ -943,11 +943,6 @@ export class Wallet {
 			);
 		}
 		this.isSwitchingNetworks = true;
-		// Disconnect from Electrum.
-		await this.electrum.disconnect();
-
-		this._network = network;
-		this._data = getDefaultWalletData();
 		const params: IWallet = {
 			...this,
 			mnemonic: this._mnemonic,
@@ -967,12 +962,49 @@ export class Wallet {
 			data: getDefaultWalletData(),
 			onMessage: this.sendMessage
 		};
-		const createRes = await Wallet.create(params);
-		if (createRes.isErr()) return err(createRes.error.message);
-		Object.assign(this, createRes.value);
-		await this.updateFeeEstimates(true);
-		this.isSwitchingNetworks = false;
-		return ok(this);
+		try {
+			// Only its state is kept. Wallet.create would also start a refresh and
+			// a fee update on it, connecting an instance nobody holds.
+			const next = new Wallet(params);
+			await next.electrum.abandon();
+			const res = await next.setWalletData();
+			if (res.isErr()) return err(res.error.message);
+			await this.electrum.disconnect();
+			// Its arrow methods and sendMessage close over it, so this wallet
+			// keeps its own. So does the refresh bookkeeping: a refresh still
+			// running here settles against it, and the one started below queues
+			// behind that refresh.
+			const kept = new Set([
+				'isSwitchingNetworks',
+				'isRefreshing',
+				'_activeRefreshes',
+				'_refreshOwed',
+				'_pendingRefreshPromises',
+				'_refreshStartCallbacks'
+			]);
+			Object.assign(
+				this,
+				Object.fromEntries(
+					Object.entries(next).filter(
+						([key, value]) => typeof value !== 'function' && !kept.has(key)
+					)
+				)
+			);
+			// Both point back at the wallet that constructed them.
+			this.transaction = new Transaction({ wallet: this });
+			this.electrum = new Electrum({
+				wallet: this,
+				network,
+				...params.electrumOptions
+			});
+			void this.refreshWallet({});
+			await this.updateFeeEstimates(true);
+			return ok(this);
+		} catch (e) {
+			return err(e);
+		} finally {
+			this.isSwitchingNetworks = false;
+		}
 	}
 
 	/**
