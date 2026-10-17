@@ -9,9 +9,10 @@ export {
 	classifyOfferedCoin,
 	fundingTransactionProblem,
 	offerFieldProblem,
-	ownershipProblem
+	ownershipProblem,
+	spliceFeerateCeiling
 } from './verify';
-export type { IDfFundingCheck } from './verify';
+export type { IDfFundingCheck, IDfSpliceFeerateCeiling } from './verify';
 export {
 	DF_DEFAULT_SPLICE_FEERATE_PERKW,
 	DF_HARD_MIN_OFFER_AMOUNT_SAT,

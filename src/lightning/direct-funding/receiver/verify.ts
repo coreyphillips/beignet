@@ -20,6 +20,7 @@ import { verify as ecdsaVerify } from '../../crypto/ecdh';
 import { MAX_INTERACTIVE_TX_SEQUENCE } from '../../interactive-tx/validation';
 import { schnorrVerify } from '../../offer/schnorr';
 import { isValidShutdownScript } from '../../channel/validation';
+import { estimateSpliceTxWeight } from '../../channel/splice-weight';
 import { scriptKind } from '../../wallet/wallet-funding-provider';
 import {
 	bitcoinMessageHash,
@@ -435,4 +436,71 @@ export function fundingTransactionProblem(c: IDfFundingCheck): string | null {
 		return `payer would pay ${payerFee} sat in fees, above the ${c.offer.maxTotalFeeSat} sat it allowed`;
 	}
 	return null;
+}
+
+// ─────────────── The feerate a splice of the offered coin can carry ───────────────
+
+export interface IDfSpliceFeerateCeiling {
+	/**
+	 * The highest whole sat/kw the splice can be quoted at, 0 when no fee is
+	 * affordable at all.
+	 */
+	perKw: number;
+	/** The most the payer can be charged in fees, after the rules below; 0 when nothing is. */
+	feeBudgetSat: bigint;
+	/** The weight the channel prices the splice with. */
+	weight: number;
+}
+
+/**
+ * The highest feerate a direct-funded splice of this offer can be quoted at
+ * and still produce a transaction `fundingTransactionProblem` and the
+ * channel's own tx_complete audit both accept (issue #763).
+ *
+ * The channel prices the fee over `estimateSpliceTxWeight` (the payer's one
+ * input and its change output), takes it out of the payer's change, and
+ * drops a change output below the channel's interactive-tx dust floor, so
+ * that remainder goes to fees too. So:
+ *
+ * - A coin whose headroom (`valueSat - amountSat`) is within the payer's
+ *   ceiling can never overpay: kept or dropped, the payer pays at most the
+ *   headroom. The fee has to fit in that headroom, though, or the channel
+ *   emits no change, the transaction pays only the headroom, and the audit
+ *   refuses it as below the negotiated feerate.
+ * - A coin with more headroom than the ceiling must keep its change: dropping
+ *   it pays the whole headroom, which is over the ceiling. The fee then has
+ *   to leave at least the dust floor behind as well as stay within the
+ *   ceiling.
+ *
+ * The result is the highest whole sat/kw whose fee, rounded up as
+ * `spliceFeeSats` rounds it, fits that budget.
+ */
+export function spliceFeerateCeiling(c: {
+	valueSat: bigint;
+	amountSat: bigint;
+	maxTotalFeeSat: bigint;
+	changeScriptLen: number;
+	/** The smallest change output the channel keeps. */
+	dustFloorSat: bigint;
+}): IDfSpliceFeerateCeiling {
+	const weight = estimateSpliceTxWeight({
+		walletInputCount: 1,
+		changeScriptLen: c.changeScriptLen
+	});
+	const headroom = c.valueSat - c.amountSat;
+	let feeBudgetSat: bigint;
+	if (headroom <= c.maxTotalFeeSat) {
+		feeBudgetSat = headroom;
+	} else {
+		const changeKept = headroom - c.dustFloorSat;
+		feeBudgetSat =
+			changeKept < c.maxTotalFeeSat ? changeKept : c.maxTotalFeeSat;
+	}
+	// A headroom under the floor keeps no change at any fee (and a coin worth
+	// less than the amount pays none).
+	if (feeBudgetSat < 0n) feeBudgetSat = 0n;
+	// fee = ceil(weight * rate / 1000) <= budget holds for every rate <=
+	// floor(budget * 1000 / weight), the budget being whole sats.
+	const perKw = Number((feeBudgetSat * 1000n) / BigInt(weight));
+	return { perKw, feeBudgetSat, weight };
 }

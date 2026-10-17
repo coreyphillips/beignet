@@ -41,6 +41,11 @@
 import { EventEmitter } from 'events';
 import * as bitcoin from 'bitcoinjs-lib';
 import type { ISpliceWalletInput } from '../../channel/channel';
+import {
+	MAX_SPLICE_FEERATE_PERKW,
+	spliceFeeSats
+} from '../../channel/splice-weight';
+import { DUST_LIMIT_SATS } from '../../interactive-tx/validation';
 import { ChainBackendUnavailableError } from '../../chain/chain-watcher';
 import { BeignetCustomSubtype } from '../../message/custom';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX } from '../../message/splice';
@@ -82,13 +87,19 @@ import {
 	classifyOfferedCoin,
 	fundingTransactionProblem,
 	offerFieldProblem,
-	ownershipProblem
+	ownershipProblem,
+	spliceFeerateCeiling
 } from './verify';
 import {
 	DF_CHAIN_RETRY_INTERVAL_MS,
 	DF_CHAIN_WAIT_MS,
+	DF_DEFAULT_SPLICE_FEE_TARGET_BLOCKS,
 	DF_DEFAULT_SPLICE_FEERATE_PERKW,
 	DF_DEFAULT_UNPAIRED_SPLICE_DEPTH,
+	DF_FEE_ESTIMATE_WAIT_MS,
+	DF_LOG_SPLICE_FEE_ESTIMATE_UNAVAILABLE,
+	DF_LOG_SPLICE_FEERATE,
+	DF_MIN_SPLICE_FEERATE_PERKW,
 	DF_LOG_OFFER_ACCEPTED,
 	DF_LOG_OFFER_COMPLETED,
 	DF_LOG_OFFER_DECLINED,
@@ -245,6 +256,12 @@ interface IDfSessionContext {
 	 * could not say. A resumed funding never carries it, and never needs to.
 	 */
 	coinConfirmed?: boolean;
+	/**
+	 * The node's live fee estimate at admission, in sat/kw, when the offer
+	 * could be served as a splice and the operator pinned no feerate (issue
+	 * #763). Absent when there was no estimator, or it did not answer in time.
+	 */
+	liveSpliceFeeratePerKw?: number;
 }
 
 /** A funding under way, however it got there. */
@@ -255,9 +272,15 @@ interface IDfStartedFunding {
 }
 
 type ResolvedConfig = Required<
-	Omit<IDfReceiverConfig, 'minAmountSat' | 'maxAmountSat' | 'requiredSequence'>
+	Omit<
+		IDfReceiverConfig,
+		'minAmountSat' | 'maxAmountSat' | 'requiredSequence' | 'spliceFeeratePerKw'
+	>
 > &
-	Pick<IDfReceiverConfig, 'minAmountSat' | 'maxAmountSat' | 'requiredSequence'>;
+	Pick<
+		IDfReceiverConfig,
+		'minAmountSat' | 'maxAmountSat' | 'requiredSequence' | 'spliceFeeratePerKw'
+	>;
 
 export class DirectFundingReceiver extends EventEmitter {
 	private readonly state: DfOfferSessions;
@@ -288,8 +311,10 @@ export class DirectFundingReceiver extends EventEmitter {
 			witnessTimeoutMs: config.witnessTimeoutMs ?? DF_WITNESS_TIMEOUT_MS,
 			chainWaitMs: config.chainWaitMs ?? DF_CHAIN_WAIT_MS,
 			sweepIntervalMs: config.sweepIntervalMs ?? DF_RECEIVER_SWEEP_INTERVAL_MS,
-			spliceFeeratePerKw:
-				config.spliceFeeratePerKw ?? DF_DEFAULT_SPLICE_FEERATE_PERKW,
+			spliceFeeratePerKw: config.spliceFeeratePerKw,
+			spliceFeeTargetBlocks:
+				config.spliceFeeTargetBlocks ?? DF_DEFAULT_SPLICE_FEE_TARGET_BLOCKS,
+			feeEstimateWaitMs: config.feeEstimateWaitMs ?? DF_FEE_ESTIMATE_WAIT_MS,
 			allowSplice: config.allowSplice ?? false,
 			allowUnpairedSplice: config.allowUnpairedSplice ?? false,
 			unpairedSpliceDepth: checkedUnpairedSpliceDepth(
@@ -1156,6 +1181,30 @@ export class DirectFundingReceiver extends EventEmitter {
 			return;
 		}
 
+		// A coinbase output cannot be spent before it matures and this source
+		// does not report maturity, so it never reads as a confirmed coin for
+		// the splice decision (issue #760).
+		const coinConfirmed = prevTx.isCoinbase() ? false : coin.confirmed;
+
+		// 11a. The feerate a splice of this coin would be quoted at (issue
+		// #763). Asked here, in the awaiting part of admission, because the
+		// block below must not await and the splice itself starts
+		// synchronously inside `serve`. Only when a splice is on the table: an
+		// open negotiates at the channel's own feerate, a pinned feerate needs
+		// no estimate, and a coin 11c will decline beside the channel is not
+		// worth an estimator round trip or the wait for one.
+		const liveSpliceFeeratePerKw =
+			this.cfg.allowSplice &&
+			this.cfg.spliceFeeratePerKw === undefined &&
+			this.spliceAllowed(this.isPairedFrame(frame), coinConfirmed) &&
+			this.deps.usableChannelWith(lsp) !== null
+				? await this.liveSpliceFeeratePerKw()
+				: undefined;
+		// A stopped engine starts nothing, as `untilChainAnswers` already
+		// rules: the listeners that would finish or unwind a splice begun now
+		// are gone. The payer's re-send is judged afresh by whatever runs next.
+		if (!this.started) return;
+
 		// ── Everything from here mutates shared state, synchronously. ──
 
 		// Re-read what a concurrent admission could have changed while this one
@@ -1225,13 +1274,9 @@ export class DirectFundingReceiver extends EventEmitter {
 		// a plain on-chain send, which lands as a deposit and is spliced into
 		// the home channel once it has confirmed. With no channel to grow the
 		// open path is unchanged, and so is a coin that can be spliced now.
-		const paired =
-			frame.authenticatedPeer !== undefined &&
-			this.deps.isTrustedPayer(frame.authenticatedPeer);
-		// A coinbase output cannot be spent before it matures and this source
-		// does not report maturity, so it never reads as a confirmed coin for
-		// the splice decision (issue #760).
-		const coinConfirmed = prevTx.isCoinbase() ? false : coin.confirmed;
+		// Read again rather than carried over from 11a: the operator can pair
+		// or unpair the payer while the estimate is awaited.
+		const paired = this.isPairedFrame(frame);
 		if (
 			this.cfg.allowSplice &&
 			!this.spliceAllowed(paired, coinConfirmed) &&
@@ -1321,7 +1366,10 @@ export class DirectFundingReceiver extends EventEmitter {
 			prevTxid: prevTx.getHash(),
 			paired,
 			// Unknown stays unknown: an unanswered index is not a confirmation.
-			...(coinConfirmed !== undefined ? { coinConfirmed } : {})
+			...(coinConfirmed !== undefined ? { coinConfirmed } : {}),
+			...(liveSpliceFeeratePerKw !== undefined
+				? { liveSpliceFeeratePerKw }
+				: {})
 		};
 		await this.serve(ctx, () =>
 			this.startFunding(ctx, lsp, prevTx, coin.confirmed)
@@ -1457,9 +1505,7 @@ export class DirectFundingReceiver extends EventEmitter {
 		);
 		this.state.endAdmission(offerIdHex);
 
-		const paired =
-			frame.authenticatedPeer !== undefined &&
-			this.deps.isTrustedPayer(frame.authenticatedPeer);
+		const paired = this.isPairedFrame(frame);
 		this.log(DF_LOG_OFFER_ACCEPTED, {
 			offerId: offerIdHex,
 			amountSat: offer.amountSat.toString(),
@@ -1891,6 +1937,17 @@ export class DirectFundingReceiver extends EventEmitter {
 	}
 
 	/**
+	 * Is the frame's AUTHENTICATED sender a payer the operator paired with?
+	 * An unauthenticated frame never is.
+	 */
+	private isPairedFrame(frame: IDfInboundFrame): boolean {
+		return (
+			frame.authenticatedPeer !== undefined &&
+			this.deps.isTrustedPayer(frame.authenticatedPeer)
+		);
+	}
+
+	/**
 	 * Whether this payer's coin may go under the channel we already have. The
 	 * one rule behind both the funding choice and the admission decline that
 	 * keeps a second channel from being opened beside that one.
@@ -1952,6 +2009,9 @@ export class DirectFundingReceiver extends EventEmitter {
 		channelId: Buffer,
 		input: ISpliceWalletInput
 	): { final: Promise<IDfFinalTx>; unwind: () => boolean } {
+		// Before the waiter: a quote the payer's coin and ceiling cannot carry
+		// is refused here, with nothing to cancel.
+		const feeratePerKw = this.spliceFeerateFor(ctx, channelId);
 		const waiter = this.awaitFinalTx(
 			this.spliceWaiters,
 			ctx.session.outpoint,
@@ -1970,7 +2030,7 @@ export class DirectFundingReceiver extends EventEmitter {
 				ctx.offer.amountSat,
 				[input],
 				ctx.offer.changeScript,
-				this.cfg.spliceFeeratePerKw,
+				feeratePerKw,
 				{
 					lockAtDepth: ctx.paired ? undefined : this.cfg.unpairedSpliceDepth
 				}
@@ -1986,6 +2046,122 @@ export class DirectFundingReceiver extends EventEmitter {
 			throw new Error(`splice initiation failed: ${result.error}`);
 		}
 		return { final: waiter.final, unwind };
+	}
+
+	/**
+	 * The node's live fee estimate for a splice, in sat/kw, or undefined when
+	 * there is no estimator or it did not answer inside `feeEstimateWaitMs`
+	 * (issue #763). A failed or slow estimate is logged and the quote falls
+	 * back to `DF_DEFAULT_SPLICE_FEERATE_PERKW`, the only feerate there was
+	 * before: a payer waiting on its 120 s offer window is better served by
+	 * that than by a decline.
+	 */
+	private async liveSpliceFeeratePerKw(): Promise<number | undefined> {
+		const estimate = this.deps.estimateFeeSatPerVbyte;
+		if (!estimate) return undefined;
+		let timer: NodeJS.Timeout | undefined;
+		let reason: string;
+		try {
+			const satPerVbyte = await Promise.race([
+				estimate.call(this.deps, this.cfg.spliceFeeTargetBlocks),
+				new Promise<'timeout'>((resolve) => {
+					timer = setTimeout(
+						() => resolve('timeout'),
+						this.cfg.feeEstimateWaitMs
+					);
+					timer.unref?.();
+				})
+			]);
+			if (satPerVbyte === 'timeout') {
+				reason = `no estimate within ${this.cfg.feeEstimateWaitMs} ms`;
+			} else if (
+				satPerVbyte === null ||
+				!Number.isFinite(satPerVbyte) ||
+				satPerVbyte <= 0
+			) {
+				reason = 'the estimator had no estimate';
+			} else {
+				// sat/vB to sat/kw: 1 vB is 4 WU, so 1000 WU is 250 vB.
+				return Math.ceil(satPerVbyte * 250);
+			}
+		} catch (err) {
+			reason = err instanceof Error ? err.message : String(err);
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+		this.log(DF_LOG_SPLICE_FEE_ESTIMATE_UNAVAILABLE, {
+			targetBlocks: this.cfg.spliceFeeTargetBlocks,
+			reason
+		});
+		return undefined;
+	}
+
+	/**
+	 * The feerate this offer's splice negotiates at (issue #763).
+	 *
+	 * An operator-pinned feerate is used as given. Otherwise the live estimate
+	 * taken at admission (or the fixed default without one) is held between
+	 * the relay floor and the splice ceiling, then capped at the highest rate
+	 * the payer's coin and fee ceiling can carry (`spliceFeerateCeiling`): the
+	 * channel takes the fee out of the payer's change and turns a change
+	 * output under its dust floor into fee as well, and both
+	 * `fundingTransactionProblem` (the payer's ceiling) and the channel's
+	 * tx_complete audit (the negotiated feerate) refuse a transaction that
+	 * gets this wrong, a whole negotiation and quiescence round after the
+	 * ack. A coin and ceiling that cannot carry even the relay floor are
+	 * refused before anything starts.
+	 */
+	private spliceFeerateFor(ctx: IDfSessionContext, channelId: Buffer): number {
+		const pinned = this.cfg.spliceFeeratePerKw;
+		if (pinned !== undefined) {
+			this.log(DF_LOG_SPLICE_FEERATE, {
+				offerId: ctx.session.offerIdHex,
+				feeratePerKw: pinned,
+				source: 'pinned'
+			});
+			return pinned;
+		}
+		const live = ctx.liveSpliceFeeratePerKw;
+		const wanted = Math.min(
+			Math.max(
+				live ?? DF_DEFAULT_SPLICE_FEERATE_PERKW,
+				DF_MIN_SPLICE_FEERATE_PERKW
+			),
+			MAX_SPLICE_FEERATE_PERKW
+		);
+		// Never under the generic floor, whatever the host reports: the
+		// channel's own floor is at least that.
+		const reportedFloor = this.deps.spliceChangeDustFloorSat?.(channelId);
+		const dustFloorSat =
+			reportedFloor !== null &&
+			reportedFloor !== undefined &&
+			reportedFloor > DUST_LIMIT_SATS
+				? reportedFloor
+				: DUST_LIMIT_SATS;
+		const ceiling = spliceFeerateCeiling({
+			valueSat: ctx.offer.valueSat,
+			amountSat: ctx.offer.amountSat,
+			maxTotalFeeSat: ctx.offer.maxTotalFeeSat,
+			changeScriptLen: ctx.offer.changeScript.length,
+			dustFloorSat
+		});
+		const feeratePerKw = Math.min(wanted, ceiling.perKw);
+		if (feeratePerKw < DF_MIN_SPLICE_FEERATE_PERKW) {
+			throw new Error(
+				`the payer's ${ctx.offer.valueSat} sat coin and ${ctx.offer.maxTotalFeeSat} sat fee ceiling leave ${ceiling.feeBudgetSat} sat for this splice's fee, ${ceiling.perKw} sat/kw, under the ${DF_MIN_SPLICE_FEERATE_PERKW} sat/kw relay floor`
+			);
+		}
+		this.log(DF_LOG_SPLICE_FEERATE, {
+			offerId: ctx.session.offerIdHex,
+			feeratePerKw,
+			source: live !== undefined ? 'live' : 'default',
+			...(live !== undefined ? { liveFeeratePerKw: live } : {}),
+			payerCeilingPerKw: ceiling.perKw,
+			feeBudgetSat: ceiling.feeBudgetSat.toString(),
+			dustFloorSat: dustFloorSat.toString(),
+			feeSat: spliceFeeSats(ceiling.weight, feeratePerKw).toString()
+		});
+		return feeratePerKw;
 	}
 
 	/**

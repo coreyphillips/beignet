@@ -28354,8 +28354,12 @@ export class LightningNode extends EventEmitter {
 					getScriptHashHistory: (scriptHash) =>
 						this.directFundingChain().getScriptHashHistory(scriptHash)
 				},
+				estimateFeeSatPerVbyte: (targetBlocks) =>
+					this.estimateClampedFeeSatPerVbyte(targetBlocks),
 				liquidityPeer: () => policy.liquidityPeer ?? null,
 				usableChannelWith: (peerHex) => this.usableChannelWith(peerHex),
+				spliceChangeDustFloorSat: (channelId) =>
+					this.getRawChannel(channelId)?.spliceInteractiveTxDustFloor() ?? null,
 				spliceInFlightWith: (peerHex) => this.spliceInFlightWith(peerHex),
 				fundingPubkeys: (channelId) =>
 					this.getRawChannel(channelId)?.getFundingPubkeys() ?? null,
@@ -28669,13 +28673,8 @@ export class LightningNode extends EventEmitter {
 			connectPeer: (peerHex: string, host: string, port: number) =>
 				this.connectPeer(peerHex, host, port)
 		};
-		const estimateFee = async (
-			targetBlocks: number
-		): Promise<number | null> => {
-			if (!this.feeEstimator) return null;
-			const raw = await this.feeEstimator.estimateFee(targetBlocks);
-			return raw > 0 ? this.clampEstimatedFeeRate(raw) : null;
-		};
+		const estimateFee = (targetBlocks: number): Promise<number | null> =>
+			this.estimateClampedFeeSatPerVbyte(targetBlocks);
 		const broadcast = async (txHex: string): Promise<string> => {
 			const fp = this.fundingProvider;
 			if (fp) return fp.broadcastTransaction(txHex);
@@ -29678,6 +29677,20 @@ export class LightningNode extends EventEmitter {
 			!state.localChannelReady &&
 			!state.remoteChannelReady
 		);
+	}
+
+	/**
+	 * The estimator's sat/vB for a confirmation target, clamped to what this
+	 * node trusts an estimator with, or null without an estimator or an
+	 * estimate. The swap provider and the direct-funding receiver quote from
+	 * this.
+	 */
+	private async estimateClampedFeeSatPerVbyte(
+		targetBlocks: number
+	): Promise<number | null> {
+		if (!this.feeEstimator) return null;
+		const raw = await this.feeEstimator.estimateFee(targetBlocks);
+		return raw > 0 ? this.clampEstimatedFeeRate(raw) : null;
 	}
 
 	/**
