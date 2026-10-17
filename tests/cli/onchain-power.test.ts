@@ -6,8 +6,7 @@
  * pattern as tests/lightning/scb.test.ts), so it exercises input validation,
  * NOT_BOOSTABLE / NOTHING_TO_CONSOLIDATE error paths, and daemon route
  * wiring. Successful broadcast paths need a live Electrum + bitcoind; the
- * underlying wallet primitives (setupRbf/setupCpfp/sendMax) are covered
- * against regtest in tests/boost.test.ts.
+ * underlying wallet boost is covered against regtest in tests/boost.test.ts.
  */
 
 import { expect } from 'chai';

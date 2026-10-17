@@ -27,6 +27,7 @@ import { EAddressType, ISendTransaction } from '../types/wallet';
 import { ILogger, TLogLevel, LOG_LEVEL_PRIORITY } from '../logger';
 import { generateMnemonic, getBitcoinJsNetwork } from '../utils/helpers';
 import { btcToSats } from '../utils/conversion';
+import { BoostError } from '../utils/boost';
 import {
 	EAvailableNetworks,
 	EBoostType,
@@ -6733,7 +6734,7 @@ export class BeignetNode extends EventEmitter {
 		this._checkSpendLimit(amountSats);
 		return this._runOnchainSend(async () => {
 			// The staged send is read below (the built fee) and reset on every
-			// way out, as _boostRbf does: what one send staged must not outlive
+			// way out, as Wallet.boost does: what one send staged must not outlive
 			// it (#1002).
 			try {
 				// wallet.send with broadcast:true resolves to the txid, not the raw
@@ -7165,7 +7166,7 @@ export class BeignetNode extends EventEmitter {
 		this._validateFeeRate(satsPerVbyte);
 		return this._runOnchainSend(async () => {
 			// The staged send is read below (the swept inputs) and reset on every
-			// way out, as _boostRbf does (#1002).
+			// way out, as Wallet.boost does (#1002).
 			try {
 				const result = await this.wallet.sendMax({
 					address,
@@ -7286,7 +7287,7 @@ export class BeignetNode extends EventEmitter {
 					: `Transaction ${txid} is not boostable (unknown, already confirmed, or balance too low)`
 			);
 		}
-		return this._boostRbf(txid, satsPerVbyte);
+		return this._boost(txid, EBoostType.rbf, satsPerVbyte);
 	}
 
 	/**
@@ -7310,7 +7311,7 @@ export class BeignetNode extends EventEmitter {
 		}
 		if (can.rbf) {
 			try {
-				return await this._boostRbf(txid, satsPerVbyte);
+				return await this._boost(txid, EBoostType.rbf, satsPerVbyte);
 			} catch (e) {
 				const rbfImpossible =
 					e instanceof BeignetError &&
@@ -7318,124 +7319,44 @@ export class BeignetNode extends EventEmitter {
 				if (!(rbfImpossible && can.cpfp)) throw e;
 			}
 		}
-		return this._boostCpfp(txid, satsPerVbyte);
+		return this._boost(txid, EBoostType.cpfp, satsPerVbyte);
 	}
 
-	private async _boostRbf(
+	/**
+	 * The wallet stages the boost under its own send lock. This lock still
+	 * wraps it because the sends here read the staged send after the wallet
+	 * has let go of it (the built fee, the swept inputs).
+	 */
+	private _boost(
 		txid: string,
+		type: EBoostType,
 		satsPerVbyte?: number
 	): Promise<BoostResult> {
 		return this._runOnchainSend(async () => {
-			const setup = await this.wallet.transaction.setupRbf({ txid });
-			if (setup.isErr()) {
-				await this.wallet.resetSendTransaction();
-				throw new BeignetError(
-					BeignetErrorCode.NOT_BOOSTABLE,
-					setup.error.message
-				);
-			}
-			try {
-				// setupRbf defaults to the fast feerate; apply a requested rate through
-				// updateFee so the wallet's fee-overpayment guards run.
-				if (satsPerVbyte !== undefined) {
-					const feeRes = this.wallet.transaction.updateFee({
-						satsPerByte: satsPerVbyte
-					});
-					if (feeRes.isErr()) {
-						throw new BeignetError(
-							BeignetErrorCode.INVALID_PARAMS,
-							feeRes.error.message
-						);
-					}
-				}
-				// BIP 125 rule 3/4: the replacement must pay strictly more than the
-				// original fee or the network rejects it; fail with a clear message
-				// instead of a broadcast error.
-				const original =
-					this.wallet.unconfirmedTransactions[txid] ??
-					this.wallet.transactions[txid];
-				const originalFeeSats = original ? btcToSats(original.fee) : 0;
-				const newFeeSats = this.wallet.transaction.data.fee;
-				if (newFeeSats <= originalFeeSats) {
-					throw new BeignetError(
-						BeignetErrorCode.INVALID_PARAMS,
-						`Replacement fee ${newFeeSats} sats does not exceed the original fee ${originalFeeSats} sats; raise satsPerVbyte`
-					);
-				}
-				const createRes = await this.wallet.transaction.createTransaction();
-				if (createRes.isErr()) {
-					throw new BeignetError('SEND_FAILED', createRes.error.message);
-				}
-				const info = await this._broadcastRawTx(createRes.value.hex);
-				await this._recordBoost(txid, info.txid, EBoostType.rbf, newFeeSats);
-				return {
-					...info,
-					boostType: 'rbf',
-					feeSats: newFeeSats,
-					originalTxid: txid
-				};
-			} finally {
-				await this.wallet.resetSendTransaction();
-			}
-		});
-	}
-
-	private async _boostCpfp(
-		txid: string,
-		satsPerVbyte?: number
-	): Promise<BoostResult> {
-		return this._runOnchainSend(async () => {
-			const setup = await this.wallet.transaction.setupCpfp({
+			const res = await this.wallet.boost({
 				txid,
+				type,
 				...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
 			});
-			if (setup.isErr()) {
-				await this.wallet.resetSendTransaction();
-				throw new BeignetError(
-					BeignetErrorCode.NOT_BOOSTABLE,
-					setup.error.message
-				);
+			if (res.isErr()) {
+				const code =
+					res.error instanceof BoostError
+						? {
+								NOT_BOOSTABLE: BeignetErrorCode.NOT_BOOSTABLE,
+								INVALID_FEE: BeignetErrorCode.INVALID_PARAMS,
+								SEND_FAILED: BeignetErrorCode.SEND_FAILED
+						  }[res.error.code]
+						: BeignetErrorCode.SEND_FAILED;
+				throw new BeignetError(code, res.error.message);
 			}
-			try {
-				const feeSats = setup.value.fee;
-				const createRes = await this.wallet.transaction.createTransaction();
-				if (createRes.isErr()) {
-					throw new BeignetError('SEND_FAILED', createRes.error.message);
-				}
-				const info = await this._broadcastRawTx(createRes.value.hex);
-				await this._recordBoost(txid, info.txid, EBoostType.cpfp, feeSats);
-				return {
-					...info,
-					boostType: 'cpfp',
-					feeSats,
-					originalTxid: txid
-				};
-			} finally {
-				await this.wallet.resetSendTransaction();
-			}
+			return {
+				txid: res.value.id,
+				hex: res.value.hex,
+				boostType: type === EBoostType.rbf ? 'rbf' : 'cpfp',
+				feeSats: res.value.fee,
+				originalTxid: txid
+			};
 		});
-	}
-
-	/** Record a broadcast boost; bookkeeping failure must not fail the bump. */
-	private async _recordBoost(
-		oldTxId: string,
-		newTxId: string,
-		type: EBoostType,
-		fee: number
-	): Promise<void> {
-		const res = await this.wallet.addBoostedTransaction({
-			oldTxId,
-			newTxId,
-			type,
-			fee
-		});
-		if (res.isErr()) {
-			this.log('warn', 'Failed to record boosted transaction', {
-				oldTxId,
-				newTxId,
-				error: res.error.message
-			});
-		}
 	}
 
 	/** Unconfirmed wallet transactions that can be fee-bumped, by method. */
@@ -7471,7 +7392,7 @@ export class BeignetNode extends EventEmitter {
 		const address = await this.getNewAddress();
 		return this._runOnchainSend(async () => {
 			// The staged send is read below (the fee) and reset on every way out,
-			// as _boostRbf does (#1002).
+			// as Wallet.boost does (#1002).
 			try {
 				const result = await this.wallet.sendMax({
 					address,
