@@ -206,6 +206,55 @@ describe('switchNetwork against an unreachable target', function () {
 		}
 	});
 
+	it('keeps later refreshes answered when a refresh spans the switch (#1595)', async function () {
+		const res = await Wallet.create({
+			mnemonic: MNEMONIC,
+			network,
+			electrumOptions,
+			feeEstimationSource: 'electrum',
+			disableRefreshOnCreate: true
+		});
+		if (res.isErr()) throw res.error;
+		const w = res.value;
+		let release = (): void => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		(
+			w as unknown as { _runRefresh: () => Promise<Result<IWalletData>> }
+		)._runRefresh = async (): Promise<Result<IWalletData>> => {
+			await gate;
+			return ok(w.data);
+		};
+		const settles = async (refresh: Promise<unknown>): Promise<boolean> => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const settled = await Promise.race([
+				refresh.then(() => true),
+				new Promise<boolean>((resolve) => {
+					timer = setTimeout(() => resolve(false), 5000);
+				})
+			]);
+			clearTimeout(timer);
+			return settled;
+		};
+		try {
+			const spanning = w.refreshWallet();
+			const switched = await w.switchNetwork(
+				EAvailableNetworks.regtest,
+				otherServer
+			);
+			if (switched.isErr()) throw switched.error;
+			release();
+			expect(await settles(spanning)).to.equal(true);
+			expect(await settles(w.refreshWallet())).to.equal(true);
+			expect(await settles(w.refreshWallet())).to.equal(true);
+			expect(w.isRefreshing).to.equal(false);
+		} finally {
+			release();
+			await w.stop();
+		}
+	});
+
 	it('leaves the wallet untouched when the target network fails to load (#1595)', async function () {
 		const name = 'switchfail';
 		const store = new Map<string, unknown>();

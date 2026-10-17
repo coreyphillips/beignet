@@ -971,13 +971,22 @@ export class Wallet {
 			if (res.isErr()) return err(res.error.message);
 			await this.electrum.disconnect();
 			// Its arrow methods and sendMessage close over it, so this wallet
-			// keeps its own.
+			// keeps its own. So does the refresh bookkeeping: a refresh still
+			// running here settles against it, and the one started below queues
+			// behind that refresh.
+			const kept = new Set([
+				'isSwitchingNetworks',
+				'isRefreshing',
+				'_activeRefreshes',
+				'_refreshOwed',
+				'_pendingRefreshPromises',
+				'_refreshStartCallbacks'
+			]);
 			Object.assign(
 				this,
 				Object.fromEntries(
 					Object.entries(next).filter(
-						([key, value]) =>
-							typeof value !== 'function' && key !== 'isSwitchingNetworks'
+						([key, value]) => typeof value !== 'function' && !kept.has(key)
 					)
 				)
 			);
