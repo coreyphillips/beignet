@@ -1,4 +1,3 @@
-import * as bip39 from 'bip39';
 import * as bitcoin from 'bitcoinjs-lib';
 import { Network } from 'bitcoinjs-lib';
 import { BIP32Interface } from 'bip32';
@@ -6314,15 +6313,19 @@ export class Wallet {
 	}
 
 	/**
-	 * Creates a BIP32Interface from the selected wallet's mnemonic and passphrase
+	 * Returns the wallet's root key, without re-running the seed's PBKDF2.
 	 * @returns {Promise<Result<BIP32Interface>>}
 	 */
 	getBip32Interface = async (): Promise<Result<BIP32Interface>> => {
 		try {
-			if (!this._mnemonic) return err(new WatchOnlySigningError());
-			const network = getBitcoinJsNetwork(this._network);
-			const seed = await bip39.mnemonicToSeed(this._mnemonic, this._passphrase);
-			const root = bip32.fromSeed(seed, network);
+			if (!this._root) return err(new WatchOnlySigningError());
+			// A copy, so a caller setting network or lowR on it cannot change
+			// the root every other key in this wallet is derived from.
+			const root = bip32.fromPrivateKey(
+				this._root.privateKey!,
+				this._root.chainCode,
+				getBitcoinJsNetwork(this._network)
+			);
 			return ok(root);
 		} catch (e) {
 			return err(e);
