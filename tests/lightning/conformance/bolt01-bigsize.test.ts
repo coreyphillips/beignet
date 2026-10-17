@@ -9,6 +9,8 @@
  * readBigSizeParts (the BigInt-free decoder of the Rapid Gossip Sync import)
  * runs the same decoding vectors and must agree with decodeBigSize exactly:
  * the same value, byte count, and error message.
+ * The splice_init / splice_ack TLV decoder and the BOLT 12 merkle walk run the
+ * decoding vectors too, so neither can drift from the canonical decoder.
  */
 
 import { expect } from 'chai';
@@ -17,6 +19,16 @@ import {
 	decodeBigSize,
 	readBigSizeParts
 } from '../../../src/lightning/message/codec';
+import {
+	encodeSpliceMessage,
+	decodeSpliceMessage,
+	encodeSpliceAckMessage,
+	decodeSpliceAckMessage
+} from '../../../src/lightning/message/splice';
+import {
+	computeMerkleRoot,
+	computeMerkleRootFromRecords
+} from '../../../src/lightning/offer/merkle';
 import { loadVectors, hexToBuffer, bufferToHex } from './helpers';
 
 interface IBigSizeCase {
@@ -129,5 +141,106 @@ describe('BOLT 1: BigSize conformance', function () {
 				});
 			}
 		});
+	});
+
+	// Callers that walk peer-supplied TLV bytes must inherit the same refusals.
+	describe('decoding tests via the splice_init and splice_ack TLV stream', function () {
+		const init = encodeSpliceMessage({
+			channelId: Buffer.alloc(32, 0xcd),
+			fundingPubkey: Buffer.concat([Buffer.from([0x02]), Buffer.alloc(32, 1)]),
+			relativeSatoshis: 250_000n,
+			fundingFeeratePerkw: 1_000,
+			locktime: 0
+		});
+		const ack = encodeSpliceAckMessage({
+			channelId: Buffer.alloc(32, 0xcd),
+			fundingPubkey: Buffer.concat([Buffer.from([0x02]), Buffer.alloc(32, 1)]),
+			relativeSatoshis: 0n
+		});
+		const decodeBoth = (tlvs: Buffer): void => {
+			decodeSpliceMessage(Buffer.concat([init, tlvs]));
+			decodeSpliceAckMessage(Buffer.concat([ack, tlvs]));
+		};
+
+		for (const c of v.decode) {
+			// An empty TLV stream is valid, so the no-read vector has no record.
+			if (c.bytes === '') continue;
+			it(`${c.name} as a TLV type`, function () {
+				const bytes = hexToBuffer(c.bytes);
+				if (c.exp_error) {
+					const pattern = c.exp_error.includes('canonical')
+						? /non-canonical/
+						: /end of data/;
+					expect(() =>
+						decodeSpliceMessage(Buffer.concat([init, bytes]))
+					).to.throw(pattern);
+					expect(() =>
+						decodeSpliceAckMessage(Buffer.concat([ack, bytes]))
+					).to.throw(pattern);
+					return;
+				}
+				// A zero-length record: an unknown odd type is skipped, an
+				// unknown even one is refused.
+				const record = Buffer.concat([bytes, Buffer.from([0])]);
+				if (BigInt(c.value) % 2n === 0n) {
+					expect(() => decodeBoth(record)).to.throw(/Unknown required TLV/);
+				} else {
+					expect(() => decodeBoth(record)).to.not.throw();
+				}
+			});
+		}
+
+		it('refuses require_confirmed_inputs with a non-minimal type', function () {
+			expect(
+				decodeSpliceMessage(Buffer.concat([init, hexToBuffer('0200')]))
+			).to.have.property('requireConfirmedInputs', true);
+			expect(() => decodeBoth(hexToBuffer('fd000200'))).to.throw(
+				/non-canonical/
+			);
+		});
+
+		it('refuses lock_depth with a non-minimal length', function () {
+			expect(
+				decodeSpliceMessage(
+					Buffer.concat([init, hexToBuffer('fe00010001020003')])
+				)
+			).to.have.property('lockDepth', 3);
+			expect(() =>
+				decodeBoth(hexToBuffer('fe00010001fe000000020003'))
+			).to.throw(/non-canonical/);
+		});
+	});
+
+	describe('decoding tests via the BOLT 12 merkle walk', function () {
+		for (const c of v.decode) {
+			it(`${c.name} as a record type`, function () {
+				const bytes = hexToBuffer(c.bytes);
+				if (c.exp_error) {
+					const pattern = c.exp_error.includes('canonical')
+						? /non-canonical/
+						: /end of data/;
+					let thrown: unknown;
+					try {
+						computeMerkleRoot([bytes]);
+					} catch (err) {
+						thrown = err;
+					}
+					expect(thrown).to.be.instanceOf(Error);
+					expect(thrown).to.not.be.instanceOf(RangeError);
+					expect((thrown as Error).message).to.match(pattern);
+					return;
+				}
+				// The nonce leaf hashes the type bytes, so the root matches the
+				// one computed from the canonically re-encoded record.
+				const root = computeMerkleRoot([
+					Buffer.concat([bytes, Buffer.from([0])])
+				]);
+				expect(root).to.deep.equal(
+					computeMerkleRootFromRecords([
+						{ type: BigInt(c.value), value: Buffer.alloc(0) }
+					])
+				);
+			});
+		}
 	});
 });

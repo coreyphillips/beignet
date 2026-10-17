@@ -277,7 +277,7 @@ describe('Splice lock depth codec (issue #760)', function () {
 			lockDepthTlv(3),
 			Buffer.from([2, 0])
 		]);
-		expect(() => decodeSpliceMessage(payload)).to.throw(/out of order/);
+		expect(() => decodeSpliceMessage(payload)).to.throw(/not in order/);
 	});
 
 	it('skips an unknown odd TLV and keeps the known ones', function () {
@@ -312,7 +312,7 @@ describe('Splice lock depth codec (issue #760)', function () {
 			decodeSpliceMessage(
 				Buffer.concat([encodeSpliceMessage(baseInit()), smallEven])
 			)
-		).to.throw(/unknown even TLV type 4/);
+		).to.throw(/Unknown required TLV type: 4/);
 		// 65538: even, in the experimental range, after the lock depth.
 		const bigEven = Buffer.from([0xfe, 0x00, 0x01, 0x00, 0x02, 0x00]);
 		expect(() =>
@@ -323,7 +323,7 @@ describe('Splice lock depth codec (issue #760)', function () {
 					bigEven
 				])
 			)
-		).to.throw(/unknown even TLV type 65538/);
+		).to.throw(/Unknown required TLV type: 65538/);
 	});
 
 	it('refuses lockDepth 0 and 2017 on encode', function () {
@@ -390,21 +390,21 @@ describe('Splice lock depth codec (issue #760)', function () {
 			decodeSpliceMessage(
 				Buffer.concat([encodeSpliceMessage(baseInit()), truncatedValue])
 			)
-		).to.throw(/truncated TLV/);
+		).to.throw(/expected 2 bytes but only 1 available/);
 		// The type bigsize itself is cut short.
 		const truncatedType = Buffer.from([0xfe, 0x00, 0x01]);
 		expect(() =>
 			decodeSpliceAckMessage(
 				Buffer.concat([encodeSpliceAckMessage(baseAck()), truncatedType])
 			)
-		).to.throw(/truncated bigsize/);
+		).to.throw(/BigSize: unexpected end of data/);
 		// A type with a length and no value at all.
 		const noValue = Buffer.from([0xfe, 0x00, 0x01, 0x00, 0x01, 0x02]);
 		expect(() =>
 			decodeSpliceAckMessage(
 				Buffer.concat([encodeSpliceAckMessage(baseAck()), noValue])
 			)
-		).to.throw(/truncated TLV/);
+		).to.throw(/expected 2 bytes but only 0 available/);
 	});
 });
 
