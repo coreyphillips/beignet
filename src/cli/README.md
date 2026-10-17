@@ -69,7 +69,7 @@ await node.destroy();
 ```typescript
 const node = await BeignetNode.create({
   mnemonic?: string,        // BIP39 mnemonic; generates new if omitted
-  network?: string,         // 'mainnet' | 'testnet' | 'signet' | 'regtest' (default: 'mainnet')
+  network: string,          // 'mainnet' | 'testnet' | 'signet' | 'regtest' (required, no default)
   alias?: string,           // node alias
   dataDir?: string,         // SQLite + data dir (default: ~/.beignet/data)
   electrumHost?: string,    // Electrum server host

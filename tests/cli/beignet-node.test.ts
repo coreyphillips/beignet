@@ -454,6 +454,26 @@ describe('BeignetNode', () => {
 		expect(typeof BeignetNode.create).to.equal('function');
 	});
 
+	it('refuses to start without a network, before touching the data dir (issue #1599)', async () => {
+		const dataDir = path.join(
+			os.tmpdir(),
+			`beignet-no-network-${process.pid}-${Date.now()}`
+		);
+		for (const opts of [
+			{},
+			{ mnemonic: bip39.generateMnemonic(), dataDir }
+		] as BeignetNodeOptions[]) {
+			const error = await BeignetNode.create(opts).then(
+				() => null,
+				(e: unknown) => e
+			);
+			expect(error).to.be.instanceOf(BeignetError);
+			expect((error as BeignetError).code).to.equal('INVALID_PARAMS');
+			expect((error as BeignetError).message).to.contain('network');
+		}
+		expect(fs.existsSync(dataDir)).to.equal(false);
+	});
+
 	it('auto-initiates gossip sync on peer connect (default), gated by autoGossipSync', async function () {
 		this.timeout(20_000);
 		// Default: gossip sync fires on peer connect so the graph populates and

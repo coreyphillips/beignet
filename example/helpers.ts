@@ -7,20 +7,21 @@ import {
 	EProtocol
 } from '../src';
 import { err, Result, ok } from '../src';
-import { getDefaultWalletData } from '../src';
 
+// The TGetData contract: ok(undefined) for a key never saved, and the wallet
+// applies its own default. A file that exists but cannot be read or parsed is
+// an err, so Wallet.create stops instead of saving defaults over it.
 export const getData: TGetData = async <K extends keyof IWalletData>(
 	key: string
 ): Promise<Result<IWalletData[K]>> => {
 	try {
 		const data = await fs.readFile(`example/walletData/${key}.json`, 'utf8');
-		const walletData: IWalletData[K] = JSON.parse(data);
-		if (walletData) return ok(walletData);
-		const defaultWalletData = getDefaultWalletData();
-		return ok(defaultWalletData[key as K]);
+		return ok(JSON.parse(data) as IWalletData[K]);
 	} catch (e) {
-		const defaultWalletData = getDefaultWalletData();
-		return ok(defaultWalletData[key as K]);
+		if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+			return ok(undefined as unknown as IWalletData[K]);
+		}
+		return err(e instanceof Error ? e : String(e));
 	}
 };
 

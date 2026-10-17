@@ -9,9 +9,28 @@ import * as repl from 'repl';
 import net from 'net';
 import tls from 'tls';
 
-const network: EAvailableNetworks = EAvailableNetworks.mainnet;
+const NETWORKS = new Map<
+	string,
+	| EAvailableNetworks.mainnet
+	| EAvailableNetworks.testnet
+	| EAvailableNetworks.regtest
+>([
+	['mainnet', EAvailableNetworks.mainnet],
+	['testnet', EAvailableNetworks.testnet],
+	['regtest', EAvailableNetworks.regtest]
+]);
 
-const runExample = async (mnemonic = generateMnemonic()): Promise<void> => {
+const runExample = async (
+	mnemonic = generateMnemonic(),
+	networkName = 'regtest'
+): Promise<void> => {
+	const network = NETWORKS.get(networkName)!;
+	console.log('Network: ', networkName);
+	console.log('Mnemonic:', mnemonic);
+	console.log(
+		"This mnemonic is the wallet's only backup: write it down before funding it."
+	);
+
 	// Create Wallet
 	const createWalletResponse = await Wallet.create({
 		mnemonic,
@@ -34,7 +53,13 @@ const runExample = async (mnemonic = generateMnemonic()): Promise<void> => {
 		},
 		coinSelectPreference: ECoinSelectPreference.small
 	});
-	if (createWalletResponse.isErr()) return;
+	if (createWalletResponse.isErr()) {
+		console.error(
+			'\nFailed to create wallet:',
+			createWalletResponse.error.message
+		);
+		process.exit(1);
+	}
 	const wallet = createWalletResponse.value;
 
 	// Get the wallet's balance.
@@ -93,5 +118,11 @@ const runExample = async (mnemonic = generateMnemonic()): Promise<void> => {
 	});
 };
 
-const mnemonic = process.argv[2];
-void runExample(mnemonic);
+// A bare network name picks the network (default regtest). Any other words
+// are the mnemonic, quoted as one argument or not.
+const args = process.argv.slice(2);
+const words = args.filter((arg) => !NETWORKS.has(arg));
+void runExample(
+	words.length > 0 ? words.join(' ') : undefined,
+	args.find((arg) => NETWORKS.has(arg))
+);

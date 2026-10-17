@@ -262,6 +262,9 @@ const runExample = async (
 	console.log('Network:   ', info.network);
 	if (info.alias) console.log('Alias:     ', info.alias);
 	console.log('Mnemonic:  ', mnemonic);
+	console.log(
+		"           This mnemonic is the node's only backup: write it down before funding it."
+	);
 	console.log('Address:   ', node.getFundingAddress());
 	console.log('Storage:   ', path.join(dataDir, 'node.db'));
 	console.log('Channels:  ', info.channelCount);
@@ -334,7 +337,7 @@ import { BeignetNode } from '../src/cli/beignet-node';
 
 const runBeignetExample = async (
 	mnemonic = generateMnemonic(),
-	network: 'mainnet' | 'testnet' | 'regtest' = 'mainnet',
+	network: 'mainnet' | 'testnet' | 'regtest' = 'regtest',
 	electrumHost?: string,
 	electrumPort?: number,
 	alias?: string,
@@ -342,6 +345,11 @@ const runBeignetExample = async (
 	torProxy?: string,
 	electrumTls?: boolean
 ): Promise<void> => {
+	console.log('Network: ', network);
+	console.log('Mnemonic:', mnemonic);
+	console.log(
+		"This mnemonic is the node's only backup: write it down before funding it."
+	);
 	if (torProxy) await probeSocksProxy(torProxy);
 	const node = await BeignetNode.create({
 		mnemonic,
@@ -688,11 +696,18 @@ const onStartupError = (err: unknown): void => {
 if (usePaymentFlow) {
 	runPaymentFlowExample().catch(onStartupError);
 } else if (useLowLevel) {
+	// runExample is wired to mainnet only (chain hash and funding wallet).
+	if (network !== 'mainnet') {
+		console.error(
+			'\n[beignet] --low-level runs on mainnet only: pass mainnet.\n'
+		);
+		process.exit(1);
+	}
 	runExample(mnemonic, alias, torProxy).catch(onStartupError);
 } else {
 	runBeignetExample(
 		mnemonic,
-		(network as 'mainnet' | 'testnet' | 'regtest') || 'mainnet',
+		network as 'mainnet' | 'testnet' | 'regtest' | undefined,
 		electrumHost,
 		electrumPort,
 		alias,

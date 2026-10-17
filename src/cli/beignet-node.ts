@@ -293,6 +293,7 @@ export interface BeignetNodeOptions extends IrohDaemonConfig {
 	/** Primary-only switch for new private client channels. Default false. */
 	waiveClientReserve?: boolean;
 	mnemonic?: string;
+	/** Required by create(), which throws INVALID_PARAMS without it. */
 	network?: 'mainnet' | 'testnet' | 'regtest' | 'signet';
 	alias?: string;
 	dataDir?: string;
@@ -2325,8 +2326,17 @@ export class BeignetNode extends EventEmitter {
 		} catch (err) {
 			throw new BeignetError('INVALID_PARAMS', (err as Error).message);
 		}
+		// No default. Mainnet would put real coins under a seed the caller may
+		// never have seen. Regtest would open an empty regtest.db for a caller
+		// whose node lives in mainnet.db, leaving its channels unwatched.
+		if (!opts.network) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				"network is required: 'mainnet', 'testnet', 'signet' or 'regtest'"
+			);
+		}
 		const mnemonic = opts.mnemonic || generateMnemonic();
-		const networkName = opts.network || 'mainnet';
+		const networkName = opts.network;
 		// Namespace the default storage per-wallet so different mnemonics never
 		// share a database (which would load another seed's channels/identity).
 		// An explicit dataDir is respected as-is (one wallet per dataDir).
