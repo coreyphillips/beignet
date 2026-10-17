@@ -362,17 +362,38 @@ export const getWalletDataStorageKey = (
 	return `${name}-${network}-${key}`;
 };
 
+// The network is spelled out rather than matched as any segment: the name may
+// contain hyphens, and a generic segment would read "acct1" as the network.
+const STORAGE_KEY_PATTERN = new RegExp(
+	`^(.*)-(${[...new Set(Object.values(EAvailableNetworks))].join('|')})` +
+		'(?:-acct([1-9]\\d*))?-([^-]+)$'
+);
+
+/**
+ * Parses a key built by getWalletDataStorageKey.
+ * @param {string} storageKey
+ * @returns {object | undefined} undefined when storageKey is not a wallet data key.
+ */
 export const getStorageKeyValues = (
 	storageKey: string
-): {
-	walletName: string;
-	network: EAvailableNetworks;
-	value: keyof IWalletData;
-} => {
-	const [walletName, network, value] = storageKey.split('-');
+):
+	| {
+			walletName: string;
+			network: EAvailableNetworks;
+			account: number;
+			value: keyof IWalletData;
+	  }
+	| undefined => {
+	const match = STORAGE_KEY_PATTERN.exec(storageKey);
+	if (!match) return undefined;
+	const [, walletName, network, account, value] = match;
+	if (!Object.prototype.hasOwnProperty.call(defaultWalletData, value)) {
+		return undefined;
+	}
 	return {
 		walletName,
 		network: network as EAvailableNetworks,
+		account: account === undefined ? 0 : Number(account),
 		value: value as keyof IWalletData
 	};
 };
