@@ -2129,8 +2129,15 @@ export class DirectFundingReceiver extends EventEmitter {
 			),
 			MAX_SPLICE_FEERATE_PERKW
 		);
+		// Never under the generic floor, whatever the host reports: the
+		// channel's own floor is at least that.
+		const reportedFloor = this.deps.spliceChangeDustFloorSat?.(channelId);
 		const dustFloorSat =
-			this.deps.spliceChangeDustFloorSat?.(channelId) ?? DUST_LIMIT_SATS;
+			reportedFloor !== null &&
+			reportedFloor !== undefined &&
+			reportedFloor > DUST_LIMIT_SATS
+				? reportedFloor
+				: DUST_LIMIT_SATS;
 		const ceiling = spliceFeerateCeiling({
 			valueSat: ctx.offer.valueSat,
 			amountSat: ctx.offer.amountSat,

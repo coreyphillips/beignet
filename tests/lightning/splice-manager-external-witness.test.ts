@@ -387,6 +387,8 @@ describe('ChannelManager splice external witness (issue #592)', function () {
 interface IDirectFundedSplice {
 	/** The negotiated transaction, or null when the negotiation did not complete. */
 	tx: bitcoin.Transaction | null;
+	/** What the splice initiator's manager reported going wrong. */
+	errors: string[];
 	offer: IDfOffer;
 	payerPrevTxid: Buffer;
 	fundingOutputIndex: number;
@@ -417,7 +419,8 @@ function directFundedSplice(
 		acceptorConfig.localBasepoints.fundingPubkey.toString('hex');
 	const openerManager = new ChannelManager(openerConfig);
 	const acceptorManager = new ChannelManager(acceptorConfig);
-	openerManager.on('error', () => undefined);
+	const errors: string[] = [];
+	openerManager.on('error', (_id: Buffer, err: string) => errors.push(err));
 	acceptorManager.on('error', () => undefined);
 	openerManager.on(
 		'message:outbound',
@@ -449,6 +452,7 @@ function directFundedSplice(
 	openerManager.handleFundingConfirmed(channelId);
 	acceptorManager.handleFundingConfirmed(channelId);
 	expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+	errors.length = 0;
 
 	const payerPriv = crypto.randomBytes(32);
 	const payerPub = Buffer.from(ecc.pointFromScalar(payerPriv, true)!);
@@ -515,6 +519,7 @@ function directFundedSplice(
 			started && record
 				? bitcoin.Transaction.fromHex(record.spliceTxHex)
 				: null,
+		errors,
 		offer,
 		payerPrevTxid: Buffer.from(coinTx.getHash()),
 		fundingOutputIndex: signals[0]?.newFundingOutputIndex ?? -1,
@@ -595,10 +600,14 @@ describe('Direct-funded splice feerate against the real channel (issue #763)', f
 		// tx_complete audit refuses it as under the negotiated feerate.
 		const ceilingOnly = directFundedSplice(coin, amount, ceiling, () => 2_000);
 		expect(ceilingOnly.tx, 'refused by the negotiation').to.equal(null);
+		expect(ceilingOnly.errors.join('\n')).to.contain(
+			'Fee 600 is below minimum'
+		);
 
 		const quoted = directFundedSplice(coin, amount, ceiling, (floor) =>
 			Math.min(2_000, quotedCeiling(coin, amount, ceiling, floor))
 		);
 		expect(signRequestProblem(quoted)).to.equal(null);
+		expect(quoted.errors).to.deep.equal([]);
 	});
 });

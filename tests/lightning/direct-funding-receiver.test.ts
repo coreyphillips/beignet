@@ -3687,6 +3687,22 @@ describe('Direct funding receiver: live splice feerate (issue #763)', () => {
 		h.engine.stop();
 	});
 
+	it('lets a coin whose headroom equals the payer ceiling drop its change', async () => {
+		// Dropping the change pays the whole headroom, which is exactly the
+		// ceiling, so the change need not survive and the fee may use all of it.
+		const h = spliceHarness(
+			{},
+			{ amountSat: 50_000n, maxTotalFeeSat: 1_000n },
+			51_000
+		);
+		h.node.feeSatPerVbyte = 40;
+		await h.sendOffer();
+		const expected = Number((1_000n * 1000n) / BigInt(spliceWeight(h)));
+		expect(h.node.splices[0].feeratePerKw).to.equal(expected);
+		expect(payerFeeProblem(h, expected)).to.equal(null);
+		h.engine.stop();
+	});
+
 	it('fails the offer before the splice starts when no feerate keeps the change and stays within the ceiling', async () => {
 		// 700 sat of headroom over a 600 sat ceiling: dropping the change pays
 		// 700, and keeping 546 of it leaves 154 sat of fee, under the floor.

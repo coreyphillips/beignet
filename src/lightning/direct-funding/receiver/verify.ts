@@ -446,7 +446,7 @@ export interface IDfSpliceFeerateCeiling {
 	 * affordable at all.
 	 */
 	perKw: number;
-	/** The most the payer can be charged in fees, after the rules below. */
+	/** The most the payer can be charged in fees, after the rules below; 0 when nothing is. */
 	feeBudgetSat: bigint;
 	/** The weight the channel prices the splice with. */
 	weight: number;
@@ -496,9 +496,11 @@ export function spliceFeerateCeiling(c: {
 		feeBudgetSat =
 			changeKept < c.maxTotalFeeSat ? changeKept : c.maxTotalFeeSat;
 	}
+	// A headroom under the floor keeps no change at any fee (and a coin worth
+	// less than the amount pays none).
+	if (feeBudgetSat < 0n) feeBudgetSat = 0n;
 	// fee = ceil(weight * rate / 1000) <= budget holds for every rate <=
 	// floor(budget * 1000 / weight), the budget being whole sats.
-	const perKw =
-		feeBudgetSat > 0n ? Number((feeBudgetSat * 1000n) / BigInt(weight)) : 0;
+	const perKw = Number((feeBudgetSat * 1000n) / BigInt(weight));
 	return { perKw, feeBudgetSat, weight };
 }
