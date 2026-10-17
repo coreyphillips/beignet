@@ -6319,11 +6319,12 @@ export class Wallet {
 	getBip32Interface = async (): Promise<Result<BIP32Interface>> => {
 		try {
 			if (!this._root) return err(new WatchOnlySigningError());
-			// A copy, so a caller setting network or lowR on it cannot change
-			// the root every other key in this wallet is derived from.
+			// A copy, so a caller setting network or lowR on it, or writing to
+			// its key buffers (fromPrivateKey keeps the ones it is given),
+			// cannot change the root every other key in this wallet uses.
 			const root = bip32.fromPrivateKey(
-				this._root.privateKey!,
-				this._root.chainCode,
+				Buffer.from(this._root.privateKey!),
+				Buffer.from(this._root.chainCode),
 				getBitcoinJsNetwork(this._network)
 			);
 			return ok(root);

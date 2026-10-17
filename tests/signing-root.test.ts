@@ -159,6 +159,19 @@ describe('Signing root (#1598)', function () {
 				expect(await sendAll(wallet)).to.equal(signed);
 			});
 
+			it('a caller writing to the returned key cannot change the wallet', async () => {
+				const path = utxos[0].path;
+				const wif = wallet.getPrivateKey(path);
+				const first = await wallet.getBip32Interface();
+				if (first.isErr()) throw first.error;
+				first.value.privateKey!.fill(0);
+				first.value.chainCode.fill(0);
+				expect(wallet.getPrivateKey(path)).to.equal(wif);
+				const second = await wallet.getBip32Interface();
+				if (second.isErr()) throw second.error;
+				expect(second.value.derivePath(path).toWIF()).to.equal(wif);
+			});
+
 			it('signs every input', async () => {
 				const tx = bitcoin.Transaction.fromHex(await sendAll(wallet));
 				expect(tx.ins).to.have.length(utxos.length);
