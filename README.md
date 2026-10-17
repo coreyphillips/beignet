@@ -52,16 +52,16 @@ npm install
 npm run example
 ```
 
-Creates a mainnet wallet (a fresh mnemonic unless you pass one), syncs it against a public Electrum server, prints the balance and a receive address, then drops you at a `>` prompt with the wallet bound to `wallet`. Type `help()` for the command list.
+Creates a regtest wallet (a fresh mnemonic unless you pass one), syncs it against a public Electrum server, prints the balance and a receive address, then drops you at a `>` prompt with the wallet bound to `wallet`. Type `help()` for the command list.
 
 ```js
 > wallet.getBalance()
 > await wallet.getAddress()
 > await wallet.refreshWallet()
-> await wallet.send({ address: 'bc1q...', amount: 10000, satsPerByte: 2 })
+> await wallet.send({ address: 'bcrt1q...', amount: 10000, satsPerByte: 2 })
 ```
 
-State persists as JSON under `example/walletData/`. Pass a mnemonic as the first argument to reuse a wallet: `npm run example -- "abandon abandon ... about"`.
+State persists as JSON under `example/walletData/`. Pass a mnemonic to reuse a wallet: `npm run example -- "abandon abandon ... about"`. Pass `testnet` or `mainnet` to change the network.
 
 ### 2. Lightning node REPL
 
@@ -69,7 +69,7 @@ State persists as JSON under `example/walletData/`. Pass a mnemonic as the first
 npm run example:lightning
 ```
 
-Boots a real Lightning node (`BeignetNode`) with an auto-created wallet, storage and funding provider, waits for it to become operational, prints info/balance/health, and drops you at a `beignet>` prompt with the node bound to `node`. Type `help()` for the command list. Top-level `await` works.
+Boots a real regtest Lightning node (`BeignetNode`) with an auto-created wallet, storage and funding provider, waits for it to become operational, prints info/balance/health, and drops you at a `beignet>` prompt with the node bound to `node`. Type `help()` for the command list. Top-level `await` works.
 
 ```js
 beignet> await node.getNewAddress()          // fund this on-chain, then:
@@ -83,7 +83,7 @@ The flags you will actually reach for (everything after `--`):
 
 | Flag | Effect |
 |------|--------|
-| `mainnet` \| `testnet` \| `regtest` | Network, as a bare positional arg (default `mainnet`) |
+| `mainnet` \| `testnet` \| `regtest` | Network, as a bare positional arg (default `regtest`) |
 | `<12 or 24 words>` | Reuse a mnemonic, as bare positional args (default generates one) |
 | `--electrum-host <h>` `--electrum-port <p>` | Point at your own Electrum server |
 | `--alias <name>` | Node alias in `node_announcement` |
@@ -92,6 +92,8 @@ The flags you will actually reach for (everything after `--`):
 # named regtest node against a local Electrum server
 npm run example:lightning -- regtest --electrum-host 127.0.0.1 --electrum-port 60001 --alias mynode
 ```
+
+Both examples print the network and the mnemonic before anything else. A generated mnemonic exists only in that output, so write it down before funding the wallet, and pass your own on mainnet.
 
 Tor, full-graph gossip, the low-level `LightningNode` variant and the non-interactive payment-API walkthrough have flags too: see [the flag reference](example/REPL_TESTING.md#repl-flags).
 
@@ -405,6 +407,7 @@ Automatic modes, opt-in via `BeignetNodeOptions` / `INodeConfig`:
 ```typescript
 const node = await BeignetNode.create({
   mnemonic,
+  network: 'mainnet',
   // Periodically executes the rebalance plan. Routing fees spent on rebalances
   // are capped per UTC day and the running spend is persisted, so restarts
   // never overspend the same day. Resets at midnight UTC.
@@ -430,6 +433,7 @@ Penalty enforcement normally needs this node's chain monitor to be online: if a 
 ```typescript
 const node = await BeignetNode.create({
   mnemonic,
+  network: 'mainnet',
   watchtowers: ['03abc...@tower.example.com:9911'] // off when empty
 });
 ```

@@ -227,6 +227,7 @@ Protect your agent from accidental overspend:
 
 ```typescript
 const node = await BeignetNode.create({
+  network: 'mainnet',
   maxPaymentSats: 100_000,       // Reject any single payment over 100k sats
   dailySpendLimitSats: 500_000,  // Cap total daily spend at 500k sats
 });
@@ -585,6 +586,7 @@ await node.backup('/path/to/backup.db');
 
 // Automated backups (configured at node creation)
 const node = await BeignetNode.create({
+  network: 'mainnet',
   backupPath: '/var/backups/beignet/node.db',
   backupIntervalMs: 6 * 60 * 60 * 1000,
 });
