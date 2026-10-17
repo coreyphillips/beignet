@@ -17,6 +17,7 @@
  */
 
 import crypto from 'crypto';
+import { decodeBigSize } from '../message/codec';
 import { ITlvRecord } from '../message/tlv';
 import { encodeTlvRecordRaw } from './tlv';
 
@@ -44,23 +45,6 @@ function taggedHash(tag: string, data: Buffer): Buffer {
 	return taggedHashBuf(Buffer.from(tag), data);
 }
 
-/** Byte length of a BigSize-encoded value given its first byte. */
-function bigSizeLen(firstByte: number): number {
-	if (firstByte < 0xfd) return 1;
-	if (firstByte === 0xfd) return 3;
-	if (firstByte === 0xfe) return 5;
-	return 9;
-}
-
-/** Decode a BigSize value from `buf` at `offset`; returns [value, byteLength]. */
-function readBigSize(buf: Buffer, offset: number): [bigint, number] {
-	const f = buf[offset];
-	if (f < 0xfd) return [BigInt(f), 1];
-	if (f === 0xfd) return [BigInt(buf.readUInt16BE(offset + 1)), 3];
-	if (f === 0xfe) return [BigInt(buf.readUInt32BE(offset + 1)), 5];
-	return [buf.readBigUInt64BE(offset + 1), 9];
-}
-
 function branchHash(a: Buffer, b: Buffer): Buffer {
 	const [first, second] = a.compare(b) <= 0 ? [a, b] : [b, a];
 	return taggedHashBuf(LN_BRANCH_TAG, Buffer.concat([first, second]));
@@ -72,7 +56,7 @@ function branchHash(a: Buffer, b: Buffer): Buffer {
  */
 export function computeMerkleRoot(encodedRecords: Buffer[]): Buffer {
 	const records = encodedRecords.filter(
-		(r) => readBigSize(r, 0)[0] !== SIGNATURE_TLV_TYPE
+		(r) => decodeBigSize(r, 0).value !== SIGNATURE_TLV_TYPE
 	);
 	if (records.length === 0) {
 		throw new Error('Cannot compute merkle root of empty record set');
@@ -81,7 +65,7 @@ export function computeMerkleRoot(encodedRecords: Buffer[]): Buffer {
 	const first = records[0];
 	// Per-TLV node = branch(H("LnLeaf", record), H("LnNonce"||first, type-bytes)).
 	let level = records.map((record) => {
-		const typeBytes = record.subarray(0, bigSizeLen(record[0]));
+		const typeBytes = record.subarray(0, decodeBigSize(record, 0).bytesRead);
 		const leaf = taggedHashBuf(LN_LEAF_TAG, record);
 		const nonce = taggedHashBuf(
 			Buffer.concat([LN_NONCE_TAG, first]),
