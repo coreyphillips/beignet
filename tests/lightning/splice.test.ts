@@ -52,11 +52,15 @@ import {
 	decodeTxAddInputMessage,
 	decodeTxAddOutputMessage,
 	decodeTxSignaturesMessage,
+	encodeTxAbortMessage,
 	encodeTxAddInputMessage,
 	encodeTxInitRbfMessage,
 	encodeTxSignaturesMessage
 } from '../../src/lightning/message/interactive-tx';
-import { decodeStfuMessage } from '../../src/lightning/message/stfu';
+import {
+	decodeStfuMessage,
+	encodeStfuMessage
+} from '../../src/lightning/message/stfu';
 import { decodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
 import {
 	decodeCommitmentSignedMessage,
@@ -7575,7 +7579,9 @@ describe('Splice', function () {
 			expect(decodeStartBatchMessage(bare).messageType).to.equal(undefined);
 		});
 
-		function pendingLockPair(): ReturnType<typeof createNormalChannelPair> {
+		function pendingLockPair(
+			options: { lockAtDepth?: number } = {}
+		): ReturnType<typeof createNormalChannelPair> {
 			const pair = createNormalChannelPair();
 			pair.openerManager.initiateQuiescence(pair.channelId);
 			// Auto-routing drives the splice to fully-signed (tx_signatures both
@@ -7584,7 +7590,8 @@ describe('Splice', function () {
 			const wallet = makeSpliceInWallet(100_000n);
 			pair.openerChannel.setSpliceInInputs(
 				[wallet.walletInput],
-				wallet.changeScript
+				wallet.changeScript,
+				options
 			);
 			expect(
 				pair.openerManager.initiateSplice(pair.channelId, 100_000n, 253).ok
@@ -9488,14 +9495,44 @@ describe('Splice', function () {
 			).to.equal(true);
 		});
 
-		it('answers tx_init_rbf for a signed, unconfirmed splice with tx_abort and keeps the splice (issue #765)', function () {
+		/**
+		 * A pending-lock splice the peer has quiesced in order to ask for its
+		 * RBF: the only state BOLT 2 lets a splice tx_init_rbf arrive in
+		 * (quiescent, the requester the quiescence initiator; anything else is a
+		 * warning or a failed channel, not a tx_abort). A pending-lock splice
+		 * takes stfu only in its conflict revert window (issue #760), so this
+		 * one locks at depth. The auto-wire is detached and the requester's
+		 * stfu is handed to `receiver` directly: the requester's own channel
+		 * does not initiate quiescence outside NORMAL, and this side's stfu
+		 * reply completes the handshake.
+		 */
+		function quiescedPendingLockPair(
+			receiver: 'opener' | 'acceptor'
+		): ReturnType<typeof createNormalChannelPair> & { receiver: Channel } {
+			const pair = pendingLockPair({ lockAtDepth: 2 });
+			pair.openerManager.removeAllListeners('message:outbound');
+			pair.acceptorManager.removeAllListeners('message:outbound');
+			const channel =
+				receiver === 'opener' ? pair.openerChannel : pair.acceptorChannel;
+			const reply = channel.handleStfuMessage({
+				channelId: pair.channelId,
+				initiator: true
+			});
+			expect(findSendAction(reply, MessageType.STFU), 'stfu reply').to.exist;
+			expect(channel.isQuiescent()).to.equal(true);
+			expect(channel.isQuiescenceInitiator()).to.equal(false);
+			return { ...pair, receiver: channel };
+		}
+
+		it('answers a quiesced peer tx_init_rbf for a signed, unconfirmed splice with tx_abort and keeps the splice (issue #765)', function () {
 			// Beignet has no splice RBF. BOLT 2 says the receiver of tx_init_rbf
 			// MUST reply with tx_ack_rbf or tx_abort, so the refusal is a
 			// tx_abort the peer can interpret, and the signed splice stays
 			// exactly where it was: the channel keeps waiting for the lock on the
-			// candidate both sides already signed.
-			const { openerChannel, acceptorChannel, channelId } = pendingLockPair();
-			for (const channel of [openerChannel, acceptorChannel]) {
+			// candidate both sides already signed. Either side may ask (the
+			// requester need not be the splice initiator), so both are checked.
+			for (const side of ['opener', 'acceptor'] as const) {
+				const { receiver: channel, channelId } = quiescedPendingLockPair(side);
 				const inflightBefore = channel.getFullState().spliceInFlight!;
 				const spliceTxidBefore = Buffer.from(inflightBefore.spliceTxid);
 				const commitBefore = channel.getFullState().localCommitmentNumber;
@@ -9508,7 +9545,7 @@ describe('Splice', function () {
 				});
 
 				const abort = findSendAction(actions, MessageType.TX_ABORT);
-				expect(abort, 'tx_abort answered the tx_init_rbf').to.exist;
+				expect(abort, `${side}: tx_abort answered the tx_init_rbf`).to.exist;
 				const decoded = decodeTxAbortMessage(abort.payload);
 				expect(decoded.channelId.equals(channelId)).to.equal(true);
 				expect(decoded.data.toString('utf8')).to.equal(
@@ -9516,11 +9553,11 @@ describe('Splice', function () {
 				);
 				expect(
 					actions.some((a) => a.type === ChannelActionType.ERROR),
-					'no channel error'
+					`${side}: no channel error`
 				).to.equal(false);
 				expect(
 					findSendAction(actions, MessageType.ERROR),
-					'no wire error'
+					`${side}: no wire error`
 				).to.equal(undefined);
 
 				// The splice is untouched and the channel still waits for its lock.
@@ -9538,15 +9575,45 @@ describe('Splice', function () {
 			}
 		});
 
-		it('routes a peer tx_init_rbf during pending-lock to the tx_abort refusal through the manager (issue #765)', function () {
-			const { acceptorManager, acceptorChannel, openerPubkey, channelId } =
-				pendingLockPair();
+		it('routes a quiesced peer tx_init_rbf during pending-lock to the tx_abort refusal through the manager, and swallows the echo (issue #765)', function () {
+			// The whole exchange on the acceptor's manager, wire by hand: the
+			// opener quiesces the channel, asks for RBF, is refused, and echoes
+			// the refusal as BOLT 2's ack. The echo is the step a real requester
+			// always sends, so it is pinned explicitly: it must end the exchange
+			// silently rather than be answered or unwind the signed splice.
+			const pair = pendingLockPair({ lockAtDepth: 2 });
+			const {
+				openerManager,
+				acceptorManager,
+				acceptorChannel,
+				openerPubkey,
+				channelId
+			} = pair;
+			openerManager.removeAllListeners('message:outbound');
+			acceptorManager.removeAllListeners('message:outbound');
 			const sent: Array<{ type: number; payload: Buffer }> = [];
 			acceptorManager.on('message:outbound', (pk, type, payload) => {
 				if (pk === openerPubkey) sent.push({ type, payload });
 			});
 			const errors: string[] = [];
 			acceptorManager.on('error', (_id: Buffer, m: string) => errors.push(m));
+			const spliceTxidBefore = Buffer.from(
+				acceptorChannel.getFullState().spliceInFlight!.spliceTxid
+			);
+
+			acceptorManager.handleMessage(
+				openerPubkey,
+				MessageType.STFU,
+				encodeStfuMessage({ channelId, initiator: true })
+			);
+			expect(
+				sent.map((m) => m.type),
+				'stfu reply'
+			).to.deep.equal([MessageType.STFU]);
+			expect(decodeStfuMessage(sent[0].payload).initiator).to.equal(false);
+			expect(acceptorChannel.isQuiescent()).to.equal(true);
+			expect(acceptorChannel.isQuiescenceInitiator()).to.equal(false);
+			sent.length = 0;
 
 			acceptorManager.handleMessage(
 				openerPubkey,
@@ -9559,33 +9626,51 @@ describe('Splice', function () {
 				})
 			);
 
-			const abort = sent.find((m) => m.type === MessageType.TX_ABORT);
-			expect(abort, 'tx_abort left on the wire').to.exist;
 			expect(
-				decodeTxAbortMessage(abort!.payload).data.toString('utf8')
+				sent.map((m) => m.type),
+				'only the refusal left'
+			).to.deep.equal([MessageType.TX_ABORT]);
+			expect(
+				decodeTxAbortMessage(sent[0].payload).data.toString('utf8')
 			).to.equal('splice RBF not supported');
 			expect(errors).to.deep.equal([]);
+			sent.length = 0;
+
+			// The requester's echo of our tx_abort: having sent one, the acceptor
+			// answers nothing (BOLT 2), raises nothing, and keeps the splice.
+			acceptorManager.handleMessage(
+				openerPubkey,
+				MessageType.TX_ABORT,
+				encodeTxAbortMessage({ channelId, data: Buffer.alloc(0) })
+			);
+			expect(sent, 'the echo is not answered').to.deep.equal([]);
+			expect(errors, 'the echo raises no error').to.deep.equal([]);
 			expect(acceptorChannel.getState()).to.equal(ChannelState.SPLICING);
 			expect(acceptorChannel.isSplicePendingLock()).to.equal(true);
+			expect(
+				acceptorChannel
+					.getFullState()
+					.spliceInFlight!.spliceTxid.equals(spliceTxidBefore)
+			).to.equal(true);
 		});
 
-		it('rejects a start_batch larger than two during pending-lock without revoking (issue #765)', function () {
+		it('refuses a start_batch larger than two during pending-lock before collecting any of it (issue #765)', function () {
 			// One current funding plus one pending splice is the only shape this
 			// implementation signs over; a larger batch would name a candidate it
-			// does not hold, so it is refused before anything is revoked.
+			// does not hold, so the size guard refuses it before the channel
+			// starts collecting the batch's commitment_signed messages.
 			const { acceptorChannel, channelId } = pendingLockPair();
-			const before = acceptorChannel.getFullState().localCommitmentNumber;
 			const actions = acceptorChannel.handleStartBatch({
 				channelId,
 				batchSize: 3,
 				messageType: 132
 			});
-			expect(actions.some((a) => a.type === ChannelActionType.ERROR)).to.equal(
-				true
+			const error = actions.find((a) => a.type === ChannelActionType.ERROR);
+			expect(error, 'refused').to.exist;
+			expect((error as { message?: string }).message).to.equal(
+				'Unsupported start_batch size 3 (expected 2)'
 			);
-			expect(acceptorChannel.getFullState().localCommitmentNumber).to.equal(
-				before
-			);
+			expect(acceptorChannel.isCollectingBatch()).to.equal(false);
 		});
 
 		it('rejects start_batch outside the pending-lock window', function () {
