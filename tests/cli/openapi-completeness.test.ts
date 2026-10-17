@@ -6,6 +6,8 @@
  */
 
 import { expect } from 'chai';
+import * as fs from 'fs';
+import * as path from 'path';
 import { getOpenApiSpec } from '../../src/cli/openapi';
 
 describe('OpenAPI Spec Completeness', () => {
@@ -25,151 +27,50 @@ describe('OpenAPI Spec Completeness', () => {
 		expect(spec.info).to.have.property('version');
 	});
 
+	it('info.version is the package version', () => {
+		const pkg = JSON.parse(
+			fs.readFileSync(path.join(__dirname, '../../package.json'), 'utf8')
+		) as { version: string };
+		expect((spec.info as { version: string }).version).to.equal(pkg.version);
+	});
+
 	// ─────────────── Route Coverage ───────────────
 
-	const expectedRoutes = [
-		'/info',
-		'/balance',
-		'/health',
-		'/peers',
-		'/channels',
-		'/channels/ready',
-		'/payments',
-		'/invoices',
-		'/invoice/create',
-		'/invoice',
-		'/invoice/decode',
-		'/invoice/pay',
-		'/invoice/pay-async',
-		'/invoice/pay-safe',
-		'/channel/open',
-		'/channel/open-and-wait',
-		'/channel/close',
-		'/channel/forceclose',
-		'/channel/rebroadcast-close',
-		'/channel/update-commitment-feerate',
-		'/channel/update-fee',
-		'/channel/update-policy',
-		'/channel/policy',
-		'/channel/connect-and-open',
-		'/channel',
-		'/peer/connect',
-		'/peer/disconnect',
-		'/payment/cancel',
-		'/payment',
-		'/offer/create',
-		'/offer/decode',
-		'/offers',
-		'/route/estimate',
-		'/route/probe',
-		'/backup',
-		'/backup/scb',
-		'/backup/peer-retrieved',
-		'/restore/scb',
-		'/ffor/epochs',
-		'/ffor/settlements',
-		'/ffor/epoch',
-		'/ffor/epoch/start',
-		'/ffor/invoice',
-		'/ffor/epoch/close',
-		'/ffor/epoch/abort',
-		'/ffor/preimage',
-		'/ffor/witness/provision',
-		'/ffor/issuer/offer',
-		'/ffor/issuer/provision',
-		'/ffor/recover',
-		'/ffor/enforce',
-		'/ffor/witness/status',
-		'/ffor/issuer/status',
-		'/ffor/witness/close',
-		'/ffor/issuer/issued',
-		'/recovery/status',
-		'/recovery/restore',
-		'/recovery/restore-capsule',
-		'/recovery/capsule-guardians',
-		'/send',
-		'/stats',
-		'/events',
-		'/stop',
-		// New routes:
-		'/address/new',
-		'/wallet/refresh',
-		'/mnemonic',
-		'/peers/bootstrap',
-		'/peers/connect-seeds',
-		'/trusted-peer/add',
-		'/trusted-peer/remove',
-		'/trusted-peers',
-		'/channel/open-zeroconf',
-		'/channel/open-v2',
-		'/channel/splice-quote',
-		'/channel/splice-in',
-		'/channel/splice-out',
-		'/channel/wait-ready',
-		'/payment/wait',
-		'/payment/metadata',
-		'/can-send',
-		'/can-receive',
-		'/offer/pay',
-		'/transactions',
-		'/utxos',
-		'/fees/estimates',
-		'/forwards',
-		'/forwards/summary',
-		'/graph/info',
-		'/graph/node',
-		'/graph/channel',
-		'/graph/describe',
-		'/route/query',
-		'/payment/send-to-route',
-		'/rebalance',
-		'/advisor/recommendations',
-		'/advisor/execute-rebalances',
-		'/jit/invoice',
-		'/jit/status',
-		'/jit/quote',
-		'/direct-funding/configure',
-		'/direct-funding/config',
-		'/direct-funding/request',
-		'/direct-funding/send',
-		'/invoice/create-hold',
-		'/invoice/settle-hold',
-		'/invoice/cancel-hold',
-		'/invoices/held',
-		'/message/sign',
-		'/message/verify',
-		'/gossip/sync',
-		'/gossip/sync-rapid',
-		'/channel/diagnostics',
-		'/address/validate',
-		'/recover-fallback-funds',
-		'/backup/trigger',
-		'/watchtowers',
-		'/watchtower/add',
-		'/watchtower/remove',
-		'/send-max',
-		'/tx/bump-fee',
-		'/tx/boost',
-		'/transactions/boostable',
-		'/consolidate',
-		'/psbt/build',
-		'/psbt/import-signed',
-		'/psbt/combine',
-		'/utxo/freeze',
-		'/utxo/unfreeze',
-		'/address/label',
-		'/address/labels',
-		'/wallet/descriptors',
-		'/spend-limit'
-	];
-
-	for (const route of expectedRoutes) {
-		it(`should document route ${route}`, () => {
-			expect(spec.paths, `Missing OpenAPI route: ${route}`).to.have.property(
-				route
-			);
-		});
+	// Every route key in daemon.ts source, read the same way as the scope and
+	// CLI-parity drift tests, so a route added to the daemon fails here until
+	// the spec describes it. Covers the routes dispatched outside the routes map
+	// (/stop, /events, /metrics) because their keys are literals there too.
+	function daemonRouteKeys(): string[] {
+		const daemonSrc = fs.readFileSync(
+			path.join(__dirname, '../../src/cli/daemon.ts'),
+			'utf8'
+		);
+		const keys = new Set<string>();
+		const re = /'((?:GET|POST|DELETE) \/[^']+)'/g;
+		let m: RegExpExecArray | null;
+		while ((m = re.exec(daemonSrc)) !== null) {
+			keys.add(m[1]);
+		}
+		return [...keys];
 	}
+
+	// The document does not list the route that serves it.
+	const UNDOCUMENTED_ROUTES = new Set(['GET /openapi.json']);
+
+	it('documents every daemon route with its method', () => {
+		const routeKeys = daemonRouteKeys();
+		// A scan that stops matching must not pass by finding nothing.
+		expect(routeKeys).to.include('GET /info');
+		const missing = routeKeys.filter((key) => {
+			if (UNDOCUMENTED_ROUTES.has(key)) return false;
+			const [method, routePath] = key.split(' ');
+			return !spec.paths[routePath]?.[method.toLowerCase()];
+		});
+		expect(
+			missing,
+			`daemon routes missing from src/cli/openapi.ts: ${missing.join(', ')}`
+		).to.deep.equal([]);
+	});
 
 	// ─────────────── Schema Coverage ───────────────
 
