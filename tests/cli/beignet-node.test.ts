@@ -26,6 +26,7 @@ import {
 	gossipPrimeLatch
 } from '../../src/cli/beignet-node';
 import { Wallet } from '../../src/wallet';
+import { BoostError } from '../../src/utils/boost';
 import * as rapidSync from '../../src/lightning/gossip/rapid-sync';
 import { NetworkGraph } from '../../src/lightning/gossip/network-graph';
 import { LightningNode as LightningNodeClass } from '../../src/lightning/node/lightning-node';
@@ -1531,6 +1532,72 @@ describe('BeignetNode new methods', () => {
 				]);
 				expect(broadcasts).to.deep.equal([[second]]);
 			});
+		});
+	});
+
+	describe('boosting through Wallet.boost (#1597)', () => {
+		const { ok, err } = require('../../src/utils/result');
+		const TXID = 'ab'.repeat(32);
+		const CHILD_TXID = 'cd'.repeat(32);
+
+		/** A node over a wallet whose boost answers by boost type. */
+		const nodeBoosting = (
+			answers: Record<string, unknown>
+		): { node: BeignetNode; calls: Record<string, unknown>[] } => {
+			const calls: Record<string, unknown>[] = [];
+			const wallet = {
+				canBoost: (): Record<string, boolean> => ({
+					canBoost: true,
+					rbf: true,
+					cpfp: true
+				}),
+				boost: async (opts: Record<string, unknown>): Promise<unknown> => {
+					calls.push(opts);
+					return answers[opts.type as string];
+				}
+			};
+			const node = Object.assign(Object.create(BeignetNode.prototype), {
+				wallet,
+				_onchainSendLock: Promise.resolve()
+			}) as unknown as BeignetNode;
+			return { node, calls };
+		};
+
+		it('falls back to CPFP when the wallet refuses RBF as not boostable', async () => {
+			const { node, calls } = nodeBoosting({
+				rbf: err(new BoostError('NOT_BOOSTABLE', 'Not enough sats.')),
+				cpfp: ok({ id: CHILD_TXID, hex: '00', fee: 1234 })
+			});
+
+			const result = await node.boostOnchain(TXID, 5);
+
+			expect(calls).to.deep.equal([
+				{ txid: TXID, type: 'rbf', satsPerByte: 5 },
+				{ txid: TXID, type: 'cpfp', satsPerByte: 5 }
+			]);
+			expect(result).to.deep.equal({
+				txid: CHILD_TXID,
+				hex: '00',
+				boostType: 'cpfp',
+				feeSats: 1234,
+				originalTxid: TXID
+			});
+		});
+
+		it('reports a refused fee as INVALID_PARAMS, without falling back', async () => {
+			const { node, calls } = nodeBoosting({
+				rbf: err(new BoostError('INVALID_FEE', 'Fee too low.')),
+				cpfp: ok({ id: CHILD_TXID, hex: '00', fee: 1234 })
+			});
+
+			try {
+				await node.boostOnchain(TXID, 5);
+				expect.fail('Should have thrown');
+			} catch (e: unknown) {
+				expect((e as BeignetError).code).to.equal('INVALID_PARAMS');
+				expect((e as BeignetError).message).to.equal('Fee too low.');
+			}
+			expect(calls).to.have.length(1);
 		});
 	});
 

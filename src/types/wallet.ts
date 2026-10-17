@@ -682,6 +682,21 @@ export interface IBoostedTransactions {
 	[txId: string]: IBoostedTransaction;
 }
 
+export interface IBoost {
+	txid: string;
+	type: EBoostType;
+	/** Defaults to the rate setupRbf or setupCpfp picks. */
+	satsPerByte?: number;
+}
+
+export interface IBoostRes {
+	/** Txid of the replacement (RBF) or child (CPFP) transaction. */
+	id: string;
+	hex: string;
+	/** Total fee paid by the new transaction, in sats. */
+	fee: number;
+}
+
 export interface IPrivateKeyInfo {
 	balance: number;
 	utxos: IUtxo[];

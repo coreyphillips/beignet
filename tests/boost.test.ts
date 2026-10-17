@@ -1,4 +1,5 @@
 import BitcoinJsonRpc from 'bitcoin-json-rpc';
+import { Transaction } from 'bitcoinjs-lib';
 import { expect } from 'chai';
 import net from 'net';
 import tls from 'tls';
@@ -150,35 +151,22 @@ describe('Boost', function () {
 		const b1 = wallet.canBoost(oldTxId);
 		expect(b1).to.deep.equal({ canBoost: true, rbf: false, cpfp: true });
 
-		const setup = await wallet.transaction.setupCpfp({ txid: oldTxId });
-		if (setup.isErr()) throw setup.error;
-		expect(setup.value.inputs.length).to.equal(1);
-		expect(setup.value.outputs.length).to.equal(1);
-		expect(setup.value.boostType).to.equal(EBoostType.cpfp);
-		expect(setup.value.minFee).to.be.above(1);
-		expect(setup.value.max).to.equal(true);
+		const boost = await wallet.boost({ txid: oldTxId, type: EBoostType.cpfp });
+		if (boost.isErr()) throw boost.error;
+		const child = Transaction.fromHex(boost.value.hex);
+		expect(child.ins.length).to.equal(1);
+		expect(child.outs.length).to.equal(1);
 		// with parent tx at 1 sat/vbyte, and high fee at 4, child tx fee should be around 8
-		expect(setup.value.satsPerByte).to.be.above(6);
+		expect(boost.value.fee / child.virtualSize()).to.be.above(6);
 
-		const createRes = await wallet.transaction.createTransaction();
-		if (createRes.isErr()) throw createRes.error;
-		const newTxId = createRes.value.id;
-		void wallet.electrum.broadcastTransaction({ rawTx: createRes.value.hex });
-
-		const addBoost = await wallet.addBoostedTransaction({
-			oldTxId,
-			newTxId,
-			type: EBoostType.cpfp,
-			fee: setup.value.fee
-		});
-		if (addBoost.isErr()) throw addBoost.error;
+		const newTxId = boost.value.id;
 		const boosted = wallet.getBoostedTransactions();
 		expect(boosted).to.deep.equal({
 			[oldTxId]: {
 				parentTransactions: [oldTxId],
 				childTransaction: newTxId,
 				type: EBoostType.cpfp,
-				fee: setup.value.fee
+				fee: boost.value.fee
 			}
 		});
 
@@ -218,32 +206,16 @@ describe('Boost', function () {
 		expect(b1).to.deep.equal({ canBoost: true, rbf: true, cpfp: true });
 
 		// replace original transaction using RBF
-		const setup = await wallet.transaction.setupRbf({ txid: oldTxId });
-		if (setup.isErr()) throw setup.error;
-		expect(setup.value.boostType).to.equal(EBoostType.rbf);
-		expect(setup.value.minFee).to.be.above(1);
-		const createRes = await wallet.transaction.createTransaction();
-		if (createRes.isErr()) throw createRes.error;
-		const newTxId = createRes.value.id;
-		const broadcastResp = await wallet.electrum.broadcastTransaction({
-			rawTx: createRes.value.hex
-		});
-		if (broadcastResp.isErr()) throw broadcastResp.error;
-
-		const addBoost = await wallet.addBoostedTransaction({
-			oldTxId,
-			newTxId,
-			type: EBoostType.rbf,
-			fee: setup.value.fee
-		});
-		if (addBoost.isErr()) throw addBoost.error;
+		const boost = await wallet.boost({ txid: oldTxId, type: EBoostType.rbf });
+		if (boost.isErr()) throw boost.error;
+		const newTxId = boost.value.id;
 		const boosted = wallet.getBoostedTransactions();
 		expect(boosted).to.deep.equal({
 			[oldTxId]: {
 				parentTransactions: [oldTxId],
 				childTransaction: newTxId,
 				type: EBoostType.rbf,
-				fee: setup.value.fee
+				fee: boost.value.fee
 			}
 		});
 

@@ -15,8 +15,10 @@ import {
 	IAddress,
 	IAddresses,
 	IBalanceBreakdown,
+	IBoost,
 	IBoostedTransaction,
 	IBoostedTransactions,
+	IBoostRes,
 	IBtInfo,
 	IBuildPsbtArgs,
 	IBuildPsbtResponse,
@@ -84,6 +86,7 @@ import {
 } from '../types';
 import {
 	appendDescriptorChecksum,
+	BoostError,
 	buildSortedMultisigPayment,
 	clampFeeRate,
 	createOpReturnScript,
@@ -5000,13 +5003,15 @@ export class Wallet {
 	}
 
 	/**
-	 * Serializes send, sendMany, sendMax and buildPsbt. They share one staged
-	 * transaction, and the coins a broadcast spends leave the UTXO set only
-	 * when it returns. Two overlapping calls would stage the same coins, and
-	 * under RBF the later broadcast replaces the earlier one after both have
-	 * reported a txid. Staging a recipient overwrites only its own index, so
-	 * an overlapping call with fewer recipients would also pay the other
-	 * call's trailing ones (#1464).
+	 * Serializes send, sendMany, sendMax, buildPsbt, sweepPrivateKey and boost.
+	 * They share one staged transaction, and the coins a broadcast spends leave
+	 * the UTXO set only when it returns. Two overlapping calls would stage the
+	 * same coins, and under RBF the later broadcast replaces the earlier one
+	 * after both have reported a txid. Staging a recipient overwrites only its
+	 * own index, so an overlapping call with fewer recipients would also pay
+	 * the other call's trailing ones (#1464). A sweep or a boost resets the
+	 * staged transaction on the way in, wiping whatever a send had staged
+	 * (#1597).
 	 */
 	private sendLock: Promise<unknown> = Promise.resolve();
 
@@ -6256,6 +6261,90 @@ export class Wallet {
 	}
 
 	/**
+	 * Fee-bumps an unconfirmed wallet transaction, by replacing it (RBF) or by
+	 * spending its outputs back to the wallet (CPFP), then broadcasts the new
+	 * transaction and records the boost.
+	 * @param {string} txid
+	 * @param {EBoostType} type
+	 * @param {number} [satsPerByte]
+	 * @returns {Promise<Result<IBoostRes>>} A BoostError names the failed step.
+	 */
+	public async boost(params: IBoost): Promise<Result<IBoostRes>> {
+		const options = { ...params };
+		return this.runSend(() => this.boostLocked(options));
+	}
+
+	private async boostLocked({
+		txid,
+		type,
+		satsPerByte
+	}: IBoost): Promise<Result<IBoostRes>> {
+		if (this._multisig) return err(new MultisigSpendError());
+		if (this.isWatchOnly) return err(new WatchOnlySigningError());
+		try {
+			const setup =
+				type === EBoostType.rbf
+					? await this.transaction.setupRbf({ txid })
+					: await this.transaction.setupCpfp({ txid, satsPerByte });
+			if (setup.isErr()) {
+				return err(new BoostError('NOT_BOOSTABLE', setup.error.message));
+			}
+			// setupRbf stages the fast rate. updateFee applies a requested one
+			// with the fee-overpayment guards.
+			if (type === EBoostType.rbf && satsPerByte !== undefined) {
+				const feeRes = this.transaction.updateFee({ satsPerByte });
+				if (feeRes.isErr()) {
+					return err(new BoostError('INVALID_FEE', feeRes.error.message));
+				}
+			}
+			const fee = this.transaction.data.fee;
+			if (type === EBoostType.rbf) {
+				// BIP 125: a replacement that does not pay more than the original
+				// is rejected by every node.
+				const original =
+					this.data.unconfirmedTransactions[txid] ??
+					this.data.transactions[txid];
+				const originalFee = original ? btcToSats(original.fee) : 0;
+				if (fee <= originalFee) {
+					return err(
+						new BoostError(
+							'INVALID_FEE',
+							`Replacement fee ${fee} sats does not exceed the original fee ${originalFee} sats; raise the fee rate`
+						)
+					);
+				}
+			}
+			const createRes = await this.transaction.createTransaction();
+			if (createRes.isErr()) {
+				return err(new BoostError('SEND_FAILED', createRes.error.message));
+			}
+			const { id, hex } = createRes.value;
+			const broadcastRes = await this.electrum.broadcastTransaction({
+				rawTx: hex
+			});
+			if (broadcastRes.isErr()) {
+				return err(new BoostError('SEND_FAILED', broadcastRes.error.message));
+			}
+			// The boost is on the network, so failing to record it must not report
+			// it as failed.
+			const recorded = await this.addBoostedTransaction({
+				oldTxId: txid,
+				newTxId: id,
+				type,
+				fee
+			});
+			if (recorded.isErr()) {
+				this.logger.warn(
+					`Failed to record boosted transaction ${id}: ${recorded.error.message}`
+				);
+			}
+			return ok({ id, hex, fee });
+		} finally {
+			await this.transaction.resetSendTransaction();
+		}
+	}
+
+	/**
 	 * Adds a boosted transaction id to the boostedTransactions object.
 	 * @param {string} newTxId
 	 * @param {string} oldTxId
@@ -6263,7 +6352,7 @@ export class Wallet {
 	 * @param {number} fee
 	 * @returns {Promise<Result<IBoostedTransaction>>}
 	 */
-	async addBoostedTransaction({
+	private async addBoostedTransaction({
 		newTxId,
 		oldTxId,
 		type,
@@ -6639,7 +6728,14 @@ export class Wallet {
 	 * @param {boolean} [combineWithWalletUtxos]
 	 * @returns {Promise<Result<ISweepPrivateKeyRes>>}
 	 */
-	public async sweepPrivateKey({
+	public async sweepPrivateKey(
+		params: ISweepPrivateKey
+	): Promise<Result<ISweepPrivateKeyRes>> {
+		const options = { ...params };
+		return this.runSend(() => this.sweepPrivateKeyLocked(options));
+	}
+
+	private async sweepPrivateKeyLocked({
 		privateKey,
 		toAddress,
 		satsPerByte = this.feeEstimates.normal,
