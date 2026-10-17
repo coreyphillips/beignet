@@ -220,6 +220,10 @@ export type TAddressLabels = { [address: string]: string };
 
 export type TWalletDataKeys = keyof IWalletData;
 
+// Must return ok(undefined) for a key the storage does not hold, and err only
+// when the read itself fails. Wallet.create refuses to start on an err (see
+// IWallet.resetOnReadFailure), since a wallet loaded from defaults would save
+// them over the data it could not read.
 export type TGetData = <K extends keyof IWalletData>(
 	key: string
 ) => Promise<Result<IWalletData[K]>>;
@@ -256,6 +260,10 @@ export interface IWallet {
 	coinSelectPreference?: ECoinSelectPreference;
 	data?: IWalletData;
 	storage?: TStorage;
+	// Treat a storage read that fails as a missing key and start from the
+	// default for it. Off by default: the wallet's next save then overwrites
+	// whatever the storage could not read, frozen coins and labels included.
+	resetOnReadFailure?: boolean;
 	electrumOptions: {
 		net: Net;
 		tls: Tls;

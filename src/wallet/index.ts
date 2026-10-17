@@ -240,6 +240,8 @@ export class Wallet {
 	private readonly _account: string;
 	// Requested at create time; merged with the stored value in setWalletData.
 	private readonly _birthdayHeightOption?: number;
+	// A failed storage read counts as a missing key instead of failing the load.
+	private readonly _resetOnReadFailure: boolean;
 
 	public addressTypesToMonitor: EAddressType[];
 	public coinSelectPreference: ECoinSelectPreference;
@@ -282,6 +284,7 @@ export class Wallet {
 		birthdayHeight,
 		coinSelectPreference = ECoinSelectPreference.consolidate,
 		storage,
+		resetOnReadFailure = false,
 		electrumOptions,
 		onMessage = (): null => null,
 		customGetAddress,
@@ -398,6 +401,7 @@ export class Wallet {
 		this._data = getDefaultWalletData();
 		this._getData = storage?.getData ?? getDataFallback;
 		this._setData = storage?.setData;
+		this._resetOnReadFailure = resetOnReadFailure;
 		this._disableMessagesOnCreate = disableMessagesOnCreate;
 		this._disableRefreshOnCreate = disableRefreshOnCreate;
 		if (customGetAddress) this._customGetAddress = customGetAddress;
@@ -959,6 +963,7 @@ export class Wallet {
 				getData: this._getData,
 				setData: this._setData
 			},
+			resetOnReadFailure: this._resetOnReadFailure,
 			data: getDefaultWalletData(),
 			onMessage: this.sendMessage
 		};
@@ -1220,10 +1225,10 @@ export class Wallet {
 	 * @returns {Promise<Result<string>>}
 	 */
 	private async storageIdCheck(id: string): Promise<Result<string>> {
-		const storageKey = this.getWalletDataKey('id');
-		const res = await this._getData(storageKey);
+		const res = await this._readStoredValue('id');
+		if (res.isErr()) return err(res.error.message);
 		// No id found, it is safe to save to storage.
-		if (res.isErr() || !res.value) {
+		if (!res.value) {
 			// Save id to storage.
 			this._data.id = id;
 			await this.saveWalletData('id', id);
@@ -1274,29 +1279,44 @@ export class Wallet {
 	}
 
 	/**
-	 * Gets the wallet data object from storage if able.
-	 * Otherwise, it falls back to the default wallet data object.
+	 * Reads one stored value. A key the storage does not hold is ok(undefined).
+	 * A read that failed is an error: starting from the default would let the
+	 * next save overwrite what could not be read. resetOnReadFailure opts back
+	 * into treating it as missing.
+	 * @private
+	 * @param {K} key
+	 * @returns {Promise<Result<IWalletData[K] | undefined>>}
+	 */
+	private async _readStoredValue<K extends keyof IWalletData>(
+		key: K
+	): Promise<Result<IWalletData[K] | undefined>> {
+		let res: Result<IWalletData[K]>;
+		try {
+			res = await this._getData<K>(this.getWalletDataKey(key));
+		} catch (e) {
+			res = err(e instanceof Error ? e : String(e));
+		}
+		if (res.isOk()) return ok(res.value);
+		const msg = `Unable to read wallet data from storage (${key}): ${res.error.message}`;
+		if (!this._resetOnReadFailure) return err(msg);
+		this.logger.warn(`${msg}. Using the default (resetOnReadFailure).`);
+		return ok(undefined);
+	}
+
+	/**
+	 * Gets the wallet data object from storage. A key the storage does not
+	 * hold falls back to its default; a read that failed fails the whole load.
 	 * @returns {Promise<Result<IWalletData>>}
 	 */
 	public async getWalletData(): Promise<Result<IWalletData>> {
 		try {
 			const walletDataKeys = getDefaultWalletDataKeys();
 			const walletData: IWalletData = getDefaultWalletData();
-			await Promise.all(
-				walletDataKeys.map(async (key) => {
-					let dataResult;
-					try {
-						const walletDataKey = this.getWalletDataKey(key);
-						const getDataRes = await this._getData(walletDataKey);
-						if (getDataRes.isErr()) {
-							//dataResult = getDataRes?.value ?? walletData[key];
-							return err('Error getting wallet data');
-						}
-						dataResult = getDataRes?.value;
-					} catch (e) {
-						this.logger.error('Failed to read wallet data from storage.', e);
-					}
-					const data = dataResult ?? walletData[key];
+			const readErrors = await Promise.all(
+				walletDataKeys.map(async (key): Promise<Error | undefined> => {
+					const readRes = await this._readStoredValue(key);
+					if (readRes.isErr()) return readRes.error;
+					const data = readRes.value ?? walletData[key];
 					switch (key) {
 						case 'id':
 							walletData[key] = data as string;
@@ -1354,9 +1374,11 @@ export class Wallet {
 							this.logger.warn(`Unhandled key in getWalletData: ${key}`);
 							break;
 					}
-					return;
+					return undefined;
 				})
 			);
+			const readError = readErrors.find((e) => e !== undefined);
+			if (readError) return err(readError);
 			return ok(walletData);
 		} catch (e) {
 			this.logger.error('Failed to get wallet data.', e);
