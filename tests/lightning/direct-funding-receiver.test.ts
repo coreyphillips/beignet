@@ -53,6 +53,7 @@ import {
 	spliceFeeSats
 } from '../../src/lightning/channel/splice-weight';
 import { ChainBackendUnavailableError } from '../../src/lightning/chain/chain-watcher';
+import { fundingTransactionProblem } from '../../src/lightning/direct-funding/receiver/verify';
 
 const ACK = BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK;
 const SIGN_REQUEST = BeignetCustomSubtype.DIRECT_FUNDING_SIGN_REQUEST;
@@ -3372,7 +3373,8 @@ describe('Direct funding receiver: live splice feerate (issue #763)', () => {
 	/** A paired payer with a channel to splice, so every offer takes the splice path. */
 	function spliceHarness(
 		config: IDfReceiverConfig = {},
-		offer: { maxTotalFeeSat?: bigint } = {}
+		offer: IDfOfferOverrides = {},
+		coinValue?: number
 	): IHarness & {
 		logs: Array<{ action: string; data: Record<string, unknown> }>;
 	} {
@@ -3382,7 +3384,7 @@ describe('Direct funding receiver: live splice feerate (issue #763)', () => {
 				allowSplice: true,
 				...config
 			},
-			{ authenticatedPeer: 'payer-node-id', offer }
+			{ authenticatedPeer: 'payer-node-id', offer, coinValue }
 		);
 		h.node.spliceChannel = crypto.randomBytes(32);
 		h.node.trustedPayers.add('payer-node-id');
@@ -3539,7 +3541,9 @@ describe('Direct funding receiver: live splice feerate (issue #763)', () => {
 	});
 
 	it('never quotes above the splice ceiling', async () => {
-		const h = spliceHarness({}, { maxTotalFeeSat: 10_000_000n });
+		// A coin with the headroom to pay for more than the ceiling, so only
+		// the ceiling binds.
+		const h = spliceHarness({}, { maxTotalFeeSat: 10_000_000n }, 1_000_000);
 		h.node.feeSatPerVbyte = 5_000;
 		await h.sendOffer();
 		expect(h.node.splices[0].feeratePerKw).to.equal(MAX_SPLICE_FEERATE_PERKW);
@@ -3578,6 +3582,163 @@ describe('Direct funding receiver: live splice feerate (issue #763)', () => {
 		await h.sendOffer();
 		expect(h.node.opens).to.have.length(1);
 		expect(h.node.feeEstimateCalls).to.deep.equal([]);
+		h.engine.stop();
+	});
+
+	/**
+	 * The sign request's check over the transaction the channel would build
+	 * at this feerate: the fee over the splice weight comes out of the
+	 * payer's change, and a change below `dustFloorSat` is not added at all
+	 * (channel.ts, the splice-in contribution), so the payer then pays its
+	 * whole headroom.
+	 */
+	function payerFeeProblem(
+		h: IHarness,
+		feeratePerKw: number,
+		dustFloorSat = 546n
+	): string | null {
+		const headroom = h.offer.valueSat - h.offer.amountSat;
+		const fee = spliceFeeSats(spliceWeight(h), feeratePerKw);
+		const feeSat = headroom - fee >= dustFloorSat ? fee : headroom;
+		return fundingTransactionProblem({
+			tx: h.node.buildNegotiatedTx(h.coin, h.offer, { feeSat }),
+			fundingOutputIndex: 0,
+			minFundingValueSat: h.offer.amountSat,
+			payerPrevTxid: Buffer.from(h.coin.prevTx.getHash()),
+			payerVout: h.coin.vout,
+			owedExternalIndices: [0],
+			offer: h.offer
+		});
+	}
+
+	it('keeps the payer change above the dust floor when dropping it would pay past the ceiling', async () => {
+		// 1,250 sat of headroom over a 1,000 sat ceiling. Capped at the ceiling
+		// alone, the quote leaves 250 sat of change, the channel drops it as
+		// dust, and the payer pays all 1,250: refused at the sign request.
+		const h = spliceHarness(
+			{},
+			{ amountSat: 50_000n, maxTotalFeeSat: 1_000n },
+			51_250
+		);
+		h.node.feeSatPerVbyte = 40;
+		await h.sendOffer();
+		expect(h.node.splices).to.have.length(1);
+		const weight = spliceWeight(h);
+		const ceilingOnly = Number((1_000n * 1000n) / BigInt(weight));
+		expect(payerFeeProblem(h, ceilingOnly)).to.contain(
+			'payer would pay 1250 sat in fees'
+		);
+
+		const expected = Number(((1_250n - 546n) * 1000n) / BigInt(weight));
+		expect(h.node.splices[0].feeratePerKw).to.equal(expected);
+		expect(payerFeeProblem(h, expected)).to.equal(null);
+		// The highest such rate: one more and the change is dropped.
+		expect(payerFeeProblem(h, expected + 1)).to.contain(
+			'payer would pay 1250 sat in fees'
+		);
+		const quote = h.logs.find((l) => l.action === DF_LOG_SPLICE_FEERATE);
+		expect(quote?.data).to.include({
+			feeratePerKw: expected,
+			feeBudgetSat: '704',
+			dustFloorSat: '546'
+		});
+		h.engine.stop();
+	});
+
+	it("keeps the change above the channel's own negotiated dust floor", async () => {
+		const h = spliceHarness(
+			{},
+			{ amountSat: 50_000n, maxTotalFeeSat: 1_000n },
+			51_250
+		);
+		h.node.spliceDustFloorSat = 700n;
+		h.node.feeSatPerVbyte = 40;
+		await h.sendOffer();
+		const expected = Number(
+			((1_250n - 700n) * 1000n) / BigInt(spliceWeight(h))
+		);
+		expect(h.node.splices[0].feeratePerKw).to.equal(expected);
+		expect(payerFeeProblem(h, expected, 700n)).to.equal(null);
+		expect(payerFeeProblem(h, expected + 1, 700n)).to.not.equal(null);
+		h.engine.stop();
+	});
+
+	it('caps the quote at what the coin itself can pay when its headroom is under the payer ceiling', async () => {
+		// 600 sat of headroom under a 2,000 sat ceiling. Capped at the ceiling,
+		// the fee would be more than the coin has left: no change at all, a
+		// transaction paying only the 600, and the channel's tx_complete audit
+		// refusing it as below the negotiated feerate.
+		const h = spliceHarness(
+			{},
+			{ amountSat: 99_400n, maxTotalFeeSat: 2_000n },
+			100_000
+		);
+		h.node.feeSatPerVbyte = 8;
+		await h.sendOffer();
+		const weight = spliceWeight(h);
+		expect(spliceFeeSats(weight, 2_000) > 600n).to.equal(true);
+		const expected = Number((600n * 1000n) / BigInt(weight));
+		expect(h.node.splices[0].feeratePerKw).to.equal(expected);
+		expect(spliceFeeSats(weight, expected) <= 600n).to.equal(true);
+		expect(spliceFeeSats(weight, expected + 1) > 600n).to.equal(true);
+		// Whatever the channel does with the remainder, the payer pays at most
+		// its headroom, which is inside its ceiling.
+		expect(payerFeeProblem(h, expected)).to.equal(null);
+		h.engine.stop();
+	});
+
+	it('fails the offer before the splice starts when no feerate keeps the change and stays within the ceiling', async () => {
+		// 700 sat of headroom over a 600 sat ceiling: dropping the change pays
+		// 700, and keeping 546 of it leaves 154 sat of fee, under the floor.
+		const h = spliceHarness(
+			{},
+			{ amountSat: 50_000n, maxTotalFeeSat: 600n },
+			50_700
+		);
+		h.node.feeSatPerVbyte = 10;
+		await h.sendOffer();
+		expect(h.node.splices).to.have.length(0);
+		expect(h.node.aborts).to.have.length(0);
+		expect(h.engine.inflightCount()).to.equal(0);
+		expect(h.lastAck()?.reason).to.contain('leave 154 sat');
+		expect(h.lastAck()?.reason).to.contain('under the 253 sat/kw relay floor');
+		h.engine.stop();
+	});
+
+	it('starts nothing when the receiver stops while the estimate is awaited', async () => {
+		const h = spliceHarness({}, { maxTotalFeeSat: 50_000n });
+		let answer: (satPerVbyte: number) => void = () => undefined;
+		h.node.estimateFeeSatPerVbyte = (targetBlocks): Promise<number | null> => {
+			h.node.feeEstimateCalls.push(targetBlocks);
+			return new Promise<number>((resolve) => {
+				answer = resolve;
+			});
+		};
+		h.engine.handleFrame(h.payer.offerFrame(h.offer));
+		await flush();
+		expect(h.node.feeEstimateCalls).to.have.length(1);
+
+		h.engine.stop();
+		answer(10);
+		await flush();
+		expect(h.node.splices, 'no splice on a stopped receiver').to.have.length(0);
+		expect(h.acks(), 'nothing answered').to.deep.equal([]);
+		expect(h.engine.inflightCount()).to.equal(0);
+	});
+
+	it('does not ask the estimator for an offer it declines beside the channel', async () => {
+		// An unpaired payer while unpaired splices are off: 11c declines it, so
+		// 11a neither asks the estimator nor waits on it.
+		const h = harness({ allowSplice: true, feeEstimateWaitMs: 60_000 });
+		h.node.spliceChannel = crypto.randomBytes(32);
+		h.node.feeEstimateHangs = true;
+		await h.sendOffer();
+		expect(h.node.feeEstimateCalls).to.deep.equal([]);
+		expect(h.lastAck()).to.deep.equal({
+			accepted: false,
+			reason:
+				'a channel with the liquidity peer already exists and it does not take unpaired fundings; pay the address'
+		});
 		h.engine.stop();
 	});
 });

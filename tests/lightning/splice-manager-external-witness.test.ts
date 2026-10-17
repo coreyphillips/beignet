@@ -33,6 +33,12 @@ import { ISpliceInFlight } from '../../src/lightning/channel/channel-state';
 import { MessageType } from '../../src/lightning/message/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { estimateSpliceTxWeight } from '../../src/lightning/channel/splice-weight';
+import { IDfOffer } from '../../src/lightning/direct-funding/messages';
+import {
+	fundingTransactionProblem,
+	spliceFeerateCeiling
+} from '../../src/lightning/direct-funding/receiver/verify';
 
 const FUNDING_SATOSHIS = 1_000_000n;
 const SPLICE_AMOUNT = 300_000n;
@@ -375,5 +381,224 @@ describe('ChannelManager splice external witness (issue #592)', function () {
 		expect(h.openerChannel.getFullState().spliceInFlight!.fullySigned).to.equal(
 			false
 		);
+	});
+});
+
+interface IDirectFundedSplice {
+	/** The negotiated transaction, or null when the negotiation did not complete. */
+	tx: bitcoin.Transaction | null;
+	offer: IDfOffer;
+	payerPrevTxid: Buffer;
+	fundingOutputIndex: number;
+	owedExternalIndices: number[];
+	feeratePerKw: number;
+	dustFloorSat: bigint;
+}
+
+/**
+ * A splice the way the direct-funding receiver starts one (issue #763): the
+ * payer's coin as its only input, external, the offered amount into the
+ * channel, the change back to the payer's script, at the feerate `quote`
+ * picks from the channel's negotiated dust floor. The negotiation runs on
+ * real channels, so the channel's own change arithmetic and tx_complete audit
+ * decide what the transaction looks like.
+ */
+function directFundedSplice(
+	coinSat: bigint,
+	amountSat: bigint,
+	maxTotalFeeSat: bigint,
+	quote: (dustFloorSat: bigint) => number
+): IDirectFundedSplice {
+	const openerConfig = makeConfig(811);
+	const acceptorConfig = makeConfig(812);
+	const openerPubkey =
+		openerConfig.localBasepoints.fundingPubkey.toString('hex');
+	const acceptorPubkey =
+		acceptorConfig.localBasepoints.fundingPubkey.toString('hex');
+	const openerManager = new ChannelManager(openerConfig);
+	const acceptorManager = new ChannelManager(acceptorConfig);
+	openerManager.on('error', () => undefined);
+	acceptorManager.on('error', () => undefined);
+	openerManager.on(
+		'message:outbound',
+		(peer: string, type: number, payload: Buffer) => {
+			if (peer === acceptorPubkey) {
+				acceptorManager.handleMessage(openerPubkey, type, payload);
+			}
+		}
+	);
+	acceptorManager.on(
+		'message:outbound',
+		(peer: string, type: number, payload: Buffer) => {
+			if (peer === openerPubkey) {
+				openerManager.handleMessage(acceptorPubkey, type, payload);
+			}
+		}
+	);
+	const openerChannel = openerManager.openChannel(
+		acceptorPubkey,
+		FUNDING_SATOSHIS
+	);
+	openerManager.createFunding(
+		openerChannel,
+		crypto.randomBytes(32),
+		0,
+		crypto.randomBytes(64)
+	);
+	const channelId = openerChannel.getChannelId()!;
+	openerManager.handleFundingConfirmed(channelId);
+	acceptorManager.handleFundingConfirmed(channelId);
+	expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+
+	const payerPriv = crypto.randomBytes(32);
+	const payerPub = Buffer.from(ecc.pointFromScalar(payerPriv, true)!);
+	const changeScript = bitcoin.payments.p2wpkh({ pubkey: payerPub }).output!;
+	const coinTx = new bitcoin.Transaction();
+	coinTx.version = 2;
+	coinTx.addInput(crypto.randomBytes(32), 0);
+	coinTx.addOutput(changeScript, Number(coinSat));
+	const offer: IDfOffer = {
+		offerId: Buffer.alloc(16),
+		amountSat,
+		txid: Buffer.from(coinTx.getId(), 'hex'),
+		vout: 0,
+		valueSat: coinSat,
+		sequence: 0xfffffffd,
+		changeScript,
+		maxTotalFeeSat,
+		receiptHash: Buffer.alloc(32),
+		ownership: { pubkey: payerPub, signature: Buffer.alloc(64) }
+	};
+
+	const signals: Array<{
+		newFundingOutputIndex: number;
+		externalInputIndices: number[];
+	}> = [];
+	openerManager.on(
+		'channel:splice-txsigs-needed',
+		(
+			_id: Buffer,
+			_spliceTxid: Buffer,
+			newFundingOutputIndex: number,
+			externalInputIndices: number[]
+		) => {
+			signals.push({ newFundingOutputIndex, externalInputIndices });
+		}
+	);
+
+	const dustFloorSat = openerChannel.spliceInteractiveTxDustFloor();
+	const feeratePerKw = quote(dustFloorSat);
+	openerChannel.setSpliceInInputs(
+		[
+			{
+				prevTx: coinTx.toBuffer(),
+				prevOutputIndex: 0,
+				value: coinSat,
+				sequence: offer.sequence,
+				confirmed: true,
+				external: true,
+				signWitness: (): Buffer[] => {
+					throw new Error('external input: the witness comes from its owner');
+				}
+			}
+		],
+		changeScript
+	);
+	const started = openerManager.initiateSplice(
+		channelId,
+		amountSat,
+		feeratePerKw
+	).ok;
+	const record = openerChannel.getFullState().spliceInFlight;
+	return {
+		tx:
+			started && record
+				? bitcoin.Transaction.fromHex(record.spliceTxHex)
+				: null,
+		offer,
+		payerPrevTxid: Buffer.from(coinTx.getHash()),
+		fundingOutputIndex: signals[0]?.newFundingOutputIndex ?? -1,
+		owedExternalIndices: signals[0]?.externalInputIndices ?? [],
+		feeratePerKw,
+		dustFloorSat
+	};
+}
+
+/** The receiver's check over the negotiated transaction, before it attests. */
+function signRequestProblem(s: IDirectFundedSplice): string | null {
+	expect(s.tx, 'the splice negotiated').to.not.equal(null);
+	return fundingTransactionProblem({
+		tx: s.tx!,
+		fundingOutputIndex: s.fundingOutputIndex,
+		minFundingValueSat: FUNDING_SATOSHIS + s.offer.amountSat,
+		payerPrevTxid: s.payerPrevTxid,
+		payerVout: 0,
+		owedExternalIndices: s.owedExternalIndices,
+		offer: s.offer
+	});
+}
+
+function quotedCeiling(
+	coinSat: bigint,
+	amountSat: bigint,
+	maxTotalFeeSat: bigint,
+	dustFloorSat: bigint
+): number {
+	return spliceFeerateCeiling({
+		valueSat: coinSat,
+		amountSat,
+		maxTotalFeeSat,
+		changeScriptLen: 22,
+		dustFloorSat
+	}).perKw;
+}
+
+describe('Direct-funded splice feerate against the real channel (issue #763)', function () {
+	it('keeps the payer change above the dust floor when dropping it would pay past the ceiling', function () {
+		const coin = 51_250n;
+		const amount = 50_000n;
+		const ceiling = 1_000n;
+		const weight = estimateSpliceTxWeight({
+			walletInputCount: 1,
+			changeScriptLen: 22
+		});
+
+		// Capped at what the ceiling alone buys, the 250 sat remainder is under
+		// the channel's floor, so the channel turns it into fee and the payer
+		// pays its whole 1,250 sat headroom.
+		const ceilingOnly = directFundedSplice(coin, amount, ceiling, () =>
+			Number((ceiling * 1000n) / BigInt(weight))
+		);
+		expect(signRequestProblem(ceilingOnly)).to.equal(
+			'payer would pay 1250 sat in fees, above the 1000 sat it allowed'
+		);
+
+		const quoted = directFundedSplice(coin, amount, ceiling, (floor) =>
+			Math.min(10_000, quotedCeiling(coin, amount, ceiling, floor))
+		);
+		expect(quoted.feeratePerKw).to.be.below(ceilingOnly.feeratePerKw);
+		expect(signRequestProblem(quoted)).to.equal(null);
+		const change = quoted.tx!.outs.find((o) =>
+			Buffer.from(o.script).equals(quoted.offer.changeScript)
+		);
+		expect(change, 'the change output survives').to.exist;
+		expect(BigInt(change!.value) >= quoted.dustFloorSat).to.equal(true);
+	});
+
+	it('quotes within the coin when its headroom is under the payer ceiling', function () {
+		const coin = 100_000n;
+		const amount = 99_400n;
+		const ceiling = 2_000n;
+
+		// Capped at the ceiling, the fee is more than the coin has left: the
+		// transaction can only pay the 600 sat headroom, and the channel's
+		// tx_complete audit refuses it as under the negotiated feerate.
+		const ceilingOnly = directFundedSplice(coin, amount, ceiling, () => 2_000);
+		expect(ceilingOnly.tx, 'refused by the negotiation').to.equal(null);
+
+		const quoted = directFundedSplice(coin, amount, ceiling, (floor) =>
+			Math.min(2_000, quotedCeiling(coin, amount, ceiling, floor))
+		);
+		expect(signRequestProblem(quoted)).to.equal(null);
 	});
 });

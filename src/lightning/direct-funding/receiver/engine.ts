@@ -42,10 +42,10 @@ import { EventEmitter } from 'events';
 import * as bitcoin from 'bitcoinjs-lib';
 import type { ISpliceWalletInput } from '../../channel/channel';
 import {
-	estimateSpliceTxWeight,
 	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../../channel/splice-weight';
+import { DUST_LIMIT_SATS } from '../../interactive-tx/validation';
 import { ChainBackendUnavailableError } from '../../chain/chain-watcher';
 import { BeignetCustomSubtype } from '../../message/custom';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX } from '../../message/splice';
@@ -87,7 +87,8 @@ import {
 	classifyOfferedCoin,
 	fundingTransactionProblem,
 	offerFieldProblem,
-	ownershipProblem
+	ownershipProblem,
+	spliceFeerateCeiling
 } from './verify';
 import {
 	DF_CHAIN_RETRY_INTERVAL_MS,
@@ -1180,18 +1181,29 @@ export class DirectFundingReceiver extends EventEmitter {
 			return;
 		}
 
+		// A coinbase output cannot be spent before it matures and this source
+		// does not report maturity, so it never reads as a confirmed coin for
+		// the splice decision (issue #760).
+		const coinConfirmed = prevTx.isCoinbase() ? false : coin.confirmed;
+
 		// 11a. The feerate a splice of this coin would be quoted at (issue
 		// #763). Asked here, in the awaiting part of admission, because the
 		// block below must not await and the splice itself starts
 		// synchronously inside `serve`. Only when a splice is on the table: an
-		// open negotiates at the channel's own feerate, and a pinned feerate
-		// needs no estimate.
+		// open negotiates at the channel's own feerate, a pinned feerate needs
+		// no estimate, and a coin 11c will decline beside the channel is not
+		// worth an estimator round trip or the wait for one.
 		const liveSpliceFeeratePerKw =
 			this.cfg.allowSplice &&
 			this.cfg.spliceFeeratePerKw === undefined &&
+			this.spliceAllowed(this.isPairedFrame(frame), coinConfirmed) &&
 			this.deps.usableChannelWith(lsp) !== null
 				? await this.liveSpliceFeeratePerKw()
 				: undefined;
+		// A stopped engine starts nothing, as `untilChainAnswers` already
+		// rules: the listeners that would finish or unwind a splice begun now
+		// are gone. The payer's re-send is judged afresh by whatever runs next.
+		if (!this.started) return;
 
 		// ── Everything from here mutates shared state, synchronously. ──
 
@@ -1262,13 +1274,9 @@ export class DirectFundingReceiver extends EventEmitter {
 		// a plain on-chain send, which lands as a deposit and is spliced into
 		// the home channel once it has confirmed. With no channel to grow the
 		// open path is unchanged, and so is a coin that can be spliced now.
-		const paired =
-			frame.authenticatedPeer !== undefined &&
-			this.deps.isTrustedPayer(frame.authenticatedPeer);
-		// A coinbase output cannot be spent before it matures and this source
-		// does not report maturity, so it never reads as a confirmed coin for
-		// the splice decision (issue #760).
-		const coinConfirmed = prevTx.isCoinbase() ? false : coin.confirmed;
+		// Read again rather than carried over from 11a: the operator can pair
+		// or unpair the payer while the estimate is awaited.
+		const paired = this.isPairedFrame(frame);
 		if (
 			this.cfg.allowSplice &&
 			!this.spliceAllowed(paired, coinConfirmed) &&
@@ -1497,9 +1505,7 @@ export class DirectFundingReceiver extends EventEmitter {
 		);
 		this.state.endAdmission(offerIdHex);
 
-		const paired =
-			frame.authenticatedPeer !== undefined &&
-			this.deps.isTrustedPayer(frame.authenticatedPeer);
+		const paired = this.isPairedFrame(frame);
 		this.log(DF_LOG_OFFER_ACCEPTED, {
 			offerId: offerIdHex,
 			amountSat: offer.amountSat.toString(),
@@ -1931,6 +1937,17 @@ export class DirectFundingReceiver extends EventEmitter {
 	}
 
 	/**
+	 * Is the frame's AUTHENTICATED sender a payer the operator paired with?
+	 * An unauthenticated frame never is.
+	 */
+	private isPairedFrame(frame: IDfInboundFrame): boolean {
+		return (
+			frame.authenticatedPeer !== undefined &&
+			this.deps.isTrustedPayer(frame.authenticatedPeer)
+		);
+	}
+
+	/**
 	 * Whether this payer's coin may go under the channel we already have. The
 	 * one rule behind both the funding choice and the admission decline that
 	 * keeps a second channel from being opened beside that one.
@@ -1992,9 +2009,9 @@ export class DirectFundingReceiver extends EventEmitter {
 		channelId: Buffer,
 		input: ISpliceWalletInput
 	): { final: Promise<IDfFinalTx>; unwind: () => boolean } {
-		// Before the waiter: a quote the payer's ceiling cannot carry is refused
-		// here, with nothing to cancel.
-		const feeratePerKw = this.spliceFeerateFor(ctx);
+		// Before the waiter: a quote the payer's coin and ceiling cannot carry
+		// is refused here, with nothing to cancel.
+		const feeratePerKw = this.spliceFeerateFor(ctx, channelId);
 		const waiter = this.awaitFinalTx(
 			this.spliceWaiters,
 			ctx.session.outpoint,
@@ -2084,17 +2101,17 @@ export class DirectFundingReceiver extends EventEmitter {
 	 *
 	 * An operator-pinned feerate is used as given. Otherwise the live estimate
 	 * taken at admission (or the fixed default without one) is held between
-	 * the relay floor and the splice ceiling, then capped at what the payer's
-	 * `max_total_fee_sat` buys over the splice: the channel prices the fee
-	 * with the same weight estimate (`estimateSpliceTxWeight` over the one
-	 * payer input and its change output) and takes it out of the payer's
-	 * change, and `fundingTransactionProblem` refuses the sign request when
-	 * that fee is above the ceiling. Capping here turns that late refusal, a
-	 * whole negotiation and quiescence round after the ack, into a splice the
-	 * payer can afford. A ceiling that buys less than the relay floor is
+	 * the relay floor and the splice ceiling, then capped at the highest rate
+	 * the payer's coin and fee ceiling can carry (`spliceFeerateCeiling`): the
+	 * channel takes the fee out of the payer's change and turns a change
+	 * output under its dust floor into fee as well, and both
+	 * `fundingTransactionProblem` (the payer's ceiling) and the channel's
+	 * tx_complete audit (the negotiated feerate) refuse a transaction that
+	 * gets this wrong, a whole negotiation and quiescence round after the
+	 * ack. A coin and ceiling that cannot carry even the relay floor are
 	 * refused before anything starts.
 	 */
-	private spliceFeerateFor(ctx: IDfSessionContext): number {
+	private spliceFeerateFor(ctx: IDfSessionContext, channelId: Buffer): number {
 		const pinned = this.cfg.spliceFeeratePerKw;
 		if (pinned !== undefined) {
 			this.log(DF_LOG_SPLICE_FEERATE, {
@@ -2112,20 +2129,19 @@ export class DirectFundingReceiver extends EventEmitter {
 			),
 			MAX_SPLICE_FEERATE_PERKW
 		);
-		const weight = estimateSpliceTxWeight({
-			walletInputCount: 1,
-			changeScriptLen: ctx.offer.changeScript.length
+		const dustFloorSat =
+			this.deps.spliceChangeDustFloorSat?.(channelId) ?? DUST_LIMIT_SATS;
+		const ceiling = spliceFeerateCeiling({
+			valueSat: ctx.offer.valueSat,
+			amountSat: ctx.offer.amountSat,
+			maxTotalFeeSat: ctx.offer.maxTotalFeeSat,
+			changeScriptLen: ctx.offer.changeScript.length,
+			dustFloorSat
 		});
-		// The highest whole sat/kw whose fee over this weight stays within the
-		// ceiling: fee = ceil(weight * rate / 1000) <= ceiling holds for every
-		// rate <= floor(ceiling * 1000 / weight), the ceiling being whole sats.
-		const payerCeilingPerKw = Number(
-			(ctx.offer.maxTotalFeeSat * 1000n) / BigInt(weight)
-		);
-		const feeratePerKw = Math.min(wanted, payerCeilingPerKw);
+		const feeratePerKw = Math.min(wanted, ceiling.perKw);
 		if (feeratePerKw < DF_MIN_SPLICE_FEERATE_PERKW) {
 			throw new Error(
-				`the payer's ${ctx.offer.maxTotalFeeSat} sat fee ceiling buys ${payerCeilingPerKw} sat/kw over this splice, under the ${DF_MIN_SPLICE_FEERATE_PERKW} sat/kw relay floor`
+				`the payer's ${ctx.offer.valueSat} sat coin and ${ctx.offer.maxTotalFeeSat} sat fee ceiling leave ${ceiling.feeBudgetSat} sat for this splice's fee, ${ceiling.perKw} sat/kw, under the ${DF_MIN_SPLICE_FEERATE_PERKW} sat/kw relay floor`
 			);
 		}
 		this.log(DF_LOG_SPLICE_FEERATE, {
@@ -2133,8 +2149,10 @@ export class DirectFundingReceiver extends EventEmitter {
 			feeratePerKw,
 			source: live !== undefined ? 'live' : 'default',
 			...(live !== undefined ? { liveFeeratePerKw: live } : {}),
-			payerCeilingPerKw,
-			feeSat: spliceFeeSats(weight, feeratePerKw).toString()
+			payerCeilingPerKw: ceiling.perKw,
+			feeBudgetSat: ceiling.feeBudgetSat.toString(),
+			dustFloorSat: dustFloorSat.toString(),
+			feeSat: spliceFeeSats(ceiling.weight, feeratePerKw).toString()
 		});
 		return feeratePerKw;
 	}

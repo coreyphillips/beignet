@@ -134,12 +134,14 @@ export interface IDfReceiverConfig {
 	/**
 	 * Pin every direct-funded splice to this feerate (sat/kw). Unset, the
 	 * splice is quoted at the node's live estimate for
-	 * `spliceFeeTargetBlocks`, bounded above by what the payer's
-	 * `max_total_fee_sat` buys over the splice and by the splice ceiling, and
-	 * below by the relay floor; without an estimate it falls back to
-	 * `DF_DEFAULT_SPLICE_FEERATE_PERKW` (issue #763). A pinned feerate is used
-	 * as given, so a payer whose ceiling does not cover it is refused at the
-	 * sign request, as before.
+	 * `spliceFeeTargetBlocks`, bounded above by the splice ceiling and by the
+	 * highest rate the payer's coin and `max_total_fee_sat` can carry (the fee
+	 * fits the coin's headroom over the amount, and when that headroom is
+	 * above the payer's ceiling it also leaves a change output the channel
+	 * keeps), and below by the relay floor; without an estimate it falls back
+	 * to `DF_DEFAULT_SPLICE_FEERATE_PERKW` (issue #763). A pinned feerate is
+	 * used as given, so a payer whose coin or ceiling does not cover it is
+	 * refused at the sign request, as before.
 	 */
 	spliceFeeratePerKw?: number;
 	/** Default `DF_DEFAULT_SPLICE_FEE_TARGET_BLOCKS`. */
@@ -296,6 +298,13 @@ export interface IDfReceiverDeps {
 	liquidityPeer(): string | null;
 	/** A channel with this peer a splice could ride, or null. */
 	usableChannelWith(peerHex: string): Buffer | null;
+	/**
+	 * The smallest change output a splice on this channel keeps: its
+	 * negotiated interactive-tx dust floor. A smaller remainder becomes fee,
+	 * which the splice quote has to allow for (issue #763). Optional, and null
+	 * for an unknown channel: the quote then assumes the generic 546 sat floor.
+	 */
+	spliceChangeDustFloorSat?(channelId: Buffer): bigint | null;
 	/**
 	 * Is a splice with this peer still in flight (negotiating, or signed and
 	 * waiting on depth)? Issue #760: while one is, no second funding into that

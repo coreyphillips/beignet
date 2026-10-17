@@ -28358,6 +28358,8 @@ export class LightningNode extends EventEmitter {
 					this.estimateClampedFeeSatPerVbyte(targetBlocks),
 				liquidityPeer: () => policy.liquidityPeer ?? null,
 				usableChannelWith: (peerHex) => this.usableChannelWith(peerHex),
+				spliceChangeDustFloorSat: (channelId) =>
+					this.getRawChannel(channelId)?.spliceInteractiveTxDustFloor() ?? null,
 				spliceInFlightWith: (peerHex) => this.spliceInFlightWith(peerHex),
 				fundingPubkeys: (channelId) =>
 					this.getRawChannel(channelId)?.getFundingPubkeys() ?? null,
@@ -29678,11 +29680,6 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Sanity-clamp an IFeeEstimator sample before it feeds any LN operation
-	 * (see clampFeeRateSatPerVbyte), logging a structured warning when the
-	 * estimator's value was actually adjusted.
-	 */
-	/**
 	 * The estimator's sat/vB for a confirmation target, clamped to what this
 	 * node trusts an estimator with, or null without an estimator or an
 	 * estimate. The swap provider and the direct-funding receiver quote from
@@ -29696,6 +29693,11 @@ export class LightningNode extends EventEmitter {
 		return raw > 0 ? this.clampEstimatedFeeRate(raw) : null;
 	}
 
+	/**
+	 * Sanity-clamp an IFeeEstimator sample before it feeds any LN operation
+	 * (see clampFeeRateSatPerVbyte), logging a structured warning when the
+	 * estimator's value was actually adjusted.
+	 */
 	private clampEstimatedFeeRate(satPerVbyte: number): number {
 		return clampFeeRateSatPerVbyte(satPerVbyte, (original, clamped) => {
 			this.emitStructuredLog('fee', 'estimate_clamped', {
