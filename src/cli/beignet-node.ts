@@ -8966,13 +8966,13 @@ export class BeignetNode extends EventEmitter {
 	 * always rebuilds from the latest state, so no older commitment can be
 	 * selected.
 	 */
-	rebroadcastClose(channelId: string): Promise<{
+	async rebroadcastClose(channelId: string): Promise<{
 		ok: boolean;
 		error?: string;
 		txid?: string;
 		broadcastOk?: boolean;
 	}> {
-		return this.node.rebroadcastClose(Buffer.from(channelId, 'hex'));
+		return this.node.rebroadcastClose(requireChannelIdHex(channelId));
 	}
 
 	listChannels(): ChannelInfo[] {
@@ -8980,7 +8980,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	getChannel(channelId: string): ChannelInfo | null {
-		const ch = this.node.getChannel(Buffer.from(channelId, 'hex'));
+		const ch = this.node.getChannel(requireChannelIdHex(channelId));
 		if (!ch) return null;
 		return this.toChannelInfo(ch);
 	}
@@ -8988,11 +8988,11 @@ export class BeignetNode extends EventEmitter {
 	getChannelHealth(
 		channelId: string
 	): import('../lightning/node/types').IChannelHealth | null {
-		return this.node.getChannelHealth(Buffer.from(channelId, 'hex'));
+		return this.node.getChannelHealth(requireChannelIdHex(channelId));
 	}
 
 	getChannelDiagnostics(channelId: string): Record<string, unknown> | null {
-		const channelIdBuf = Buffer.from(channelId, 'hex');
+		const channelIdBuf = requireChannelIdHex(channelId);
 		const channel = this.node.getChannelManager().getChannel(channelIdBuf);
 		if (!channel) return null;
 
@@ -12370,7 +12370,7 @@ export class BeignetNode extends EventEmitter {
 		feeratePerKw: number
 	): { ok: boolean; error?: string } {
 		return this.node.updateChannelFee(
-			Buffer.from(channelId, 'hex'),
+			requireChannelIdHex(channelId),
 			feeratePerKw
 		);
 	}
@@ -12419,7 +12419,7 @@ export class BeignetNode extends EventEmitter {
 				? this.node.listChannels().map((ch) => ch.channelId.toString('hex'))
 				: [channelId];
 		this.node.setChannelPolicy(
-			channelId === 'all' ? 'all' : Buffer.from(channelId, 'hex'),
+			channelId === 'all' ? 'all' : requireChannelIdHex(channelId),
 			update
 		);
 		const policies = targets
@@ -12430,7 +12430,7 @@ export class BeignetNode extends EventEmitter {
 
 	/** Effective routing policy for a channel, or null if unknown. */
 	getChannelPolicy(channelId: string): ChannelPolicyInfo | null {
-		const policy = this.node.getChannelPolicy(Buffer.from(channelId, 'hex'));
+		const policy = this.node.getChannelPolicy(requireChannelIdHex(channelId));
 		if (!policy) return null;
 		return {
 			channelId,
@@ -12555,7 +12555,7 @@ export class BeignetNode extends EventEmitter {
 		timeoutMs = 60_000
 	): Promise<void> {
 		return this.node.waitForChannelReady(
-			Buffer.from(channelId, 'hex'),
+			requireChannelIdHex(channelId),
 			timeoutMs
 		);
 	}
