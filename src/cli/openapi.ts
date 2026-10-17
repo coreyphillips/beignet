@@ -1,17 +1,24 @@
 /**
  * OpenAPI 3.0 specification for the Beignet Lightning daemon.
  *
- * Generated from daemon routes. Served at GET /openapi.json.
+ * Maintained by hand; tests/cli/openapi-completeness.test.ts fails when a
+ * daemon route has no entry here. Served at GET /openapi.json.
  */
 
 import { ROUTE_SCOPES } from './auth';
+
+// require, not import: importing a file outside src/ widens tsc's rootDir and
+// moves the build output. The path is the same depth from src/cli and dist/cli.
+const { version: PACKAGE_VERSION } = require('../../package.json') as {
+	version: string;
+};
 
 export function getOpenApiSpec(): Record<string, unknown> {
 	const spec: Record<string, unknown> = {
 		openapi: '3.0.3',
 		info: {
 			title: 'Beignet Lightning API',
-			version: '1.0.0',
+			version: PACKAGE_VERSION,
 			description:
 				'HTTP API for a self-custodial Bitcoin + Lightning node. Designed for AI agents.\n\n' +
 				'**Idempotency:** These endpoints support the `X-Idempotency-Key` header: `/invoice/pay`, `/invoice/pay-all`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/splice-out`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`. ' +
@@ -2390,6 +2397,88 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'403': {
 							description:
 								'SPENDING_LIMIT_EXCEEDED: amount + fee over maxPaymentSats or dailySpendLimitSats'
+						}
+					}
+				}
+			},
+			'/tx/quote': {
+				post: {
+					summary:
+						'Quote what an on-chain send will cost, from the same coin selection a send runs, without building or staging one',
+					description:
+						'The figures hold for the UTXO set as it stands: a confirmation, a freeze or another spend changes them. A quote reserves nothing.',
+					tags: ['Node'],
+					requestBody: {
+						content: jsonContent({
+							type: 'object',
+							properties: {
+								address: {
+									type: 'string',
+									description:
+										"Destination. Omitted prices an output of the wallet's own address type, or a channel funding output with channelFunding"
+								},
+								amountSats: {
+									type: 'integer',
+									minimum: 1,
+									description: 'Required unless max is true'
+								},
+								satsPerVbyte: {
+									type: 'number',
+									minimum: 0,
+									exclusiveMinimum: true,
+									description: "Defaults to the wallet's normal fee estimate"
+								},
+								max: {
+									type: 'boolean',
+									description:
+										'Price a sweep of the whole spendable balance and report maxSendSats'
+								},
+								channelFunding: {
+									type: 'boolean',
+									description:
+										'With no address, price a P2WSH channel funding output'
+								}
+							}
+						})
+					},
+					responses: {
+						'200': {
+							description: 'On-chain quote',
+							content: jsonContent({
+								type: 'object',
+								required: [
+									'satsPerVbyte',
+									'feeSats',
+									'vsize',
+									'maxSatsPerVbyte'
+								],
+								properties: {
+									satsPerVbyte: {
+										type: 'number',
+										description: 'The rate the quote was made at'
+									},
+									feeSats: { type: 'number' },
+									vsize: { type: 'number' },
+									maxSendSats: {
+										type: 'number',
+										description:
+											'max only: the amount sendable once the fee is taken out'
+									},
+									maxSatsPerVbyte: {
+										type: 'number',
+										description:
+											'The highest rate this transaction can pay without the fee taking half the balance'
+									}
+								}
+							})
+						},
+						'400': {
+							description:
+								'INVALID_PARAMS: amountSats missing or not a positive whole number without max, or satsPerVbyte not a positive number'
+						},
+						'500': {
+							description:
+								'SEND_FAILED: no spendable UTXOs, no change address, or the balance cannot fund the transaction'
 						}
 					}
 				}
