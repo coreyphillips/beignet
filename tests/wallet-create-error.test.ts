@@ -20,6 +20,7 @@
  * wherever they would reach it.
  */
 
+import * as bip39 from 'bip39';
 import { expect } from 'chai';
 import net from 'net';
 import tls from 'tls';
@@ -39,6 +40,8 @@ import {
 	Electrum,
 	EProtocol,
 	err,
+	generateWalletId,
+	getDefaultWalletData,
 	getWalletDataStorageKey,
 	IWallet,
 	IWalletData,
@@ -214,6 +217,124 @@ describe('Wallet.create returning an error (issue #966)', function () {
 		expect(connectionMessages()).to.deep.equal([
 			{ key: 'connectedToElectrum', data: false }
 		]);
+	});
+});
+
+describe('Wallet.create while storage is still loading (issue #1615)', function () {
+	this.timeout(20000);
+
+	let clock: TFakeClock;
+	const key = (k: keyof IWalletData): string =>
+		getWalletDataStorageKey(WALLET_NAME, NETWORK, k);
+
+	beforeEach(function () {
+		clock = useFakeClock();
+	});
+
+	afterEach(function () {
+		sinon.restore();
+	});
+
+	it('keeps the stored receive cursor when a block arrives before a read fails', async function () {
+		const addressIndex = getDefaultWalletData().addressIndex;
+		addressIndex[EAddressType.p2wpkh] = {
+			index: 12,
+			path: "m/84'/1'/0'/0/12",
+			address: 'bcrt1qstoredcursor',
+			scriptHash: 'aa'.repeat(32),
+			publicKey: 'bb'.repeat(33)
+		};
+		const store = new Map<string, unknown>([
+			[key('id'), generateWalletId(bip39.mnemonicToSeedSync(MNEMONIC))],
+			[key('addressIndex'), addressIndex]
+		]);
+		const writes: string[] = [];
+		const frozenRead = createGate();
+		const storage: TStorage = {
+			getData: async <K extends keyof IWalletData>(
+				storageKey: string
+			): Promise<Result<IWalletData[K]>> => {
+				if (storageKey === key('blacklistedUtxos')) {
+					await frozenRead.promise;
+					return err('storage is down');
+				}
+				return ok(store.get(storageKey) as IWalletData[K]);
+			},
+			setData: async <K extends keyof IWalletData>(
+				storageKey: string,
+				value: IWalletData[K]
+			): Promise<Result<boolean>> => {
+				writes.push(storageKey);
+				store.set(storageKey, value);
+				return ok(true);
+			}
+		};
+
+		// A server that accepts the connect and the header subscription, so a
+		// poll running this early gets both. History never answers, which parks
+		// a refresh after it has saved its address indexes.
+		let peer: { host: string; port: number; protocol: EProtocol } | undefined;
+		let onHeader: ((data: unknown) => unknown) | undefined;
+		sinon.stub(electrumHelpers, 'getConnectedPeer').callsFake(() => peer);
+		const startStub = sinon
+			.stub(electrumHelpers, 'start')
+			.callsFake(async () => {
+				peer = { host: '127.0.0.1', port: 65526, protocol: EProtocol.tcp };
+				return { error: false, data: 'connected' };
+			});
+		sinon.stub(electrumHelpers, 'stop').callsFake(async () => {
+			peer = undefined;
+			return { error: false, data: 'stopped' };
+		});
+		sinon
+			.stub(electrumHelpers, 'getAddressScriptHashBalance')
+			.resolves({ error: false, data: { confirmed: 0, unconfirmed: 0 } });
+		sinon
+			.stub(electrumHelpers, 'subscribeHeader')
+			.callsFake(async (args: { onReceive: (data: unknown) => unknown }) => {
+				onHeader = args.onReceive;
+				return { error: false, data: { height: 100, hex: '00'.repeat(80) } };
+			});
+		sinon
+			.stub(electrumHelpers, 'getFeeEstimate')
+			.resolves({ error: false, data: 0.0001 });
+		const never = (): Promise<never> => new Promise(() => {});
+		sinon
+			.stub(electrumHelpers, 'getAddressScriptHashesHistory')
+			.callsFake(never);
+		sinon
+			.stub(electrumHelpers, 'getAddressScriptHashesMempool')
+			.callsFake(never);
+
+		const creating = Wallet.create({
+			mnemonic: MNEMONIC,
+			network: NETWORK,
+			name: WALLET_NAME,
+			addressType: EAddressType.p2wpkh,
+			addressTypesToMonitor: [EAddressType.p2wpkh],
+			electrumOptions,
+			storage,
+			disableRefreshOnCreate: true,
+			feeEstimationSource: 'electrum',
+			logger: createConsoleLogger('silent')
+		});
+		await clock.tickAsync(POLLING_INTERVAL + 1);
+		// Nothing should have subscribed yet. A subscription that did is handed
+		// a block, which is how the cursor used to be lost.
+		void onHeader?.([{ height: 101, hex: '01'.repeat(80) }]);
+		await clock.tickAsync(1);
+		frozenRead.release();
+		const res = await creating;
+
+		expect(res.isErr()).to.equal(true);
+		if (res.isOk()) return;
+		expect(res.error.message).to.contain('(blacklistedUtxos)');
+		const stored = store.get(
+			key('addressIndex')
+		) as IWalletData['addressIndex'];
+		expect(stored[EAddressType.p2wpkh].index).to.equal(12);
+		expect(writes).to.deep.equal([]);
+		expect(startStub.called).to.equal(false);
 	});
 });
 
