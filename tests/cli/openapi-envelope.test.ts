@@ -113,6 +113,22 @@ describe('Issue #1616: OpenAPI success schemas describe the envelope', () => {
 		).to.deep.equal({ $ref: '#/components/schemas/NodeInfo' });
 	});
 
+	// Issue #1624: 55 routes documented a 200 with a description and no
+	// content, so a generated client had no type for the reply at all.
+	it('every 2xx response documents a body', () => {
+		const bodiless: string[] = [];
+		for (const [route, ops] of Object.entries(spec.paths)) {
+			for (const [method, op] of Object.entries(ops)) {
+				for (const [status, response] of Object.entries(op.responses ?? {})) {
+					if (status.startsWith('2') && !response.content) {
+						bodiless.push(`${method.toUpperCase()} ${route} ${status}`);
+					}
+				}
+			}
+		}
+		expect(bodiless).to.deep.equal([]);
+	});
+
 	it('leaves request bodies unwrapped', () => {
 		const body =
 			spec.paths['/l402/fetch'].post.requestBody?.content?.['application/json']
@@ -127,6 +143,7 @@ function request(
 	method = 'GET',
 	body?: unknown
 ): Promise<{ status: number; body: unknown }> {
+	const payload = body === undefined ? undefined : JSON.stringify(body);
 	return new Promise((resolve, reject) => {
 		const req = http.request(
 			{
@@ -134,7 +151,13 @@ function request(
 				port,
 				path: route,
 				method,
-				headers: { 'Content-Type': 'application/json' }
+				// Node frames a DELETE body only when the length is given.
+				headers: {
+					'Content-Type': 'application/json',
+					...(payload === undefined
+						? {}
+						: { 'Content-Length': Buffer.byteLength(payload) })
+				}
 			},
 			(res) => {
 				const chunks: Buffer[] = [];
@@ -148,7 +171,7 @@ function request(
 			}
 		);
 		req.on('error', reject);
-		req.end(body === undefined ? undefined : JSON.stringify(body));
+		req.end(payload);
 	});
 }
 
@@ -227,6 +250,45 @@ describe('Issue #1616: daemon replies validate against the spec', function () {
 		).to.deep.equal(['$.result.removed: expected boolean, got string']);
 		expect(validate(schema, { ok: true, result: {} })).to.deep.equal([
 			'$.result: missing removed'
+		]);
+	});
+
+	// Issue #1624: both replies were documented with no body.
+	it('GET /can-send: a capability read', async () => {
+		const res = await request(port, '/can-send?amountSats=1');
+		expect(res.status).to.equal(200);
+		expect(res.body).to.deep.equal({
+			ok: true,
+			result: { canSend: false, availableSats: 0 }
+		});
+		const schema = successSchema('/can-send');
+		expect(validate(schema, res.body)).to.deep.equal([]);
+		expect(
+			validate(schema, {
+				ok: true,
+				result: { canSend: 'no', availableSats: 0 }
+			})
+		).to.deep.equal(['$.result.canSend: expected boolean, got string']);
+	});
+
+	it('DELETE /webhooks/unregister: a mutation reply', async () => {
+		const registered = await request(port, '/webhooks/register', 'POST', {
+			url: 'http://127.0.0.1:9/hook',
+			events: ['payment:received'],
+			allowPrivateNetwork: true
+		});
+		expect(registered.status).to.equal(200);
+		const { id } = (registered.body as { result: { id: string } }).result;
+		const res = await request(port, '/webhooks/unregister', 'DELETE', { id });
+		expect(res.status).to.equal(200);
+		expect(res.body).to.deep.equal({
+			ok: true,
+			result: { unregistered: true }
+		});
+		const schema = successSchema('/webhooks/unregister', 'delete');
+		expect(validate(schema, res.body)).to.deep.equal([]);
+		expect(validate(schema, { ok: true, result: {} })).to.deep.equal([
+			'$.result: missing unregistered'
 		]);
 	});
 });
