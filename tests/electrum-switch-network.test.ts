@@ -386,6 +386,86 @@ describe('switchNetwork against an unreachable target', function () {
 		}
 	});
 
+	it('keeps a pending write ahead of a newer one after switching back (#1631)', async function () {
+		const name = 'switchback';
+		const store = new Map<string, unknown>();
+		const key = (field: keyof IWalletData): string =>
+			getWalletDataStorageKey(name, network, field);
+		let release = (): void => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let held = (): void => {};
+		const holding = new Promise<void>((resolve) => {
+			held = resolve;
+		});
+		let holds = 1;
+		const res = await Wallet.create({
+			mnemonic: MNEMONIC,
+			name,
+			network,
+			electrumOptions,
+			storage: {
+				...makeStorage(store),
+				setData: async <K extends keyof IWalletData>(
+					at: string,
+					value: IWalletData[K]
+				): Promise<Result<boolean>> => {
+					if (at === key('utxos') && holds-- > 0) {
+						held();
+						await gate;
+					}
+					store.set(at, value);
+					return ok(true);
+				}
+			},
+			feeEstimationSource: 'electrum',
+			disableRefreshOnCreate: true
+		});
+		if (res.isErr()) throw res.error;
+		const w = res.value;
+		w.checkElectrumConnection = async (): Promise<Result<string>> =>
+			ok('connected');
+		w.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
+			ok(w.feeEstimates);
+		(
+			w as unknown as { _runRefresh: () => Promise<Result<IWalletData>> }
+		)._runRefresh = async (): Promise<Result<IWalletData>> => ok(w.data);
+		w.electrum.getUtxos = async (): Promise<Result<IGetUtxosResponse>> =>
+			ok({ utxos: [utxo(100000, 0)], balance: 100000 });
+		try {
+			const older = w.getUtxos({});
+			await holding;
+			const away = await w.switchNetwork(
+				EAvailableNetworks.signet,
+				otherServer
+			);
+			if (away.isErr()) throw away.error;
+			// Nothing in this process connected to signet, so there is no client
+			// for the switch back to stop.
+			w.electrum.disconnect = async (): Promise<void> => {};
+			const back = await w.switchNetwork(network, otherServer);
+			if (back.isErr()) throw back.error;
+			w.electrum.getUtxos = async (): Promise<Result<IGetUtxosResponse>> =>
+				ok({ utxos: [], balance: 0 });
+			const newer = w.getUtxos({});
+			// The newer scan runs as far as it can: unordered, its pair is already
+			// stored when the older write lands on top of it.
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			release();
+			if ((await older).isErr()) throw new Error('the older scan failed');
+			if ((await newer).isErr()) throw new Error('the newer scan failed');
+
+			expect(w.data.utxos).to.deep.equal([]);
+			expect(w.data.balance).to.equal(0);
+			expect(store.get(key('utxos'))).to.deep.equal([]);
+			expect(store.get(key('balance'))).to.equal(0);
+		} finally {
+			release();
+			await w.stop();
+		}
+	});
+
 	it('leaves the wallet untouched when the target network fails to load (#1595)', async function () {
 		const name = 'switchfail';
 		const store = new Map<string, unknown>();

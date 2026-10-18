@@ -985,14 +985,17 @@ export class Wallet {
 			// Its arrow methods and sendMessage close over it, so this wallet
 			// keeps its own. So does the refresh bookkeeping: a refresh still
 			// running here settles against it, and the one started below queues
-			// behind that refresh.
+			// behind that refresh. So does the write queue: a write still waiting
+			// for storage has to stay ahead of later writes to its key, including
+			// ones made after switching back to its network.
 			const kept = new Set([
 				'isSwitchingNetworks',
 				'isRefreshing',
 				'_activeRefreshes',
 				'_refreshOwed',
 				'_pendingRefreshPromises',
-				'_refreshStartCallbacks'
+				'_refreshStartCallbacks',
+				'savingOperations'
 			]);
 			Object.assign(
 				this,
