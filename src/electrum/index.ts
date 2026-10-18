@@ -597,7 +597,8 @@ export class Electrum {
 		servers,
 		batchLimit = 20,
 		batchDelay = 50,
-		onReceive
+		onReceive,
+		pollConnection = true
 	}: {
 		wallet: Wallet;
 		network: EAvailableNetworks;
@@ -607,6 +608,8 @@ export class Electrum {
 		batchLimit?: number;
 		batchDelay?: number;
 		onReceive?: (data: unknown) => void;
+		/** False leaves the poll to an explicit startConnectionPolling(). */
+		pollConnection?: boolean;
 	}) {
 		this._wallet = wallet;
 		this.sendMessage = wallet.sendMessage;
@@ -619,9 +622,8 @@ export class Electrum {
 		this.tls = tls;
 		this.batchLimit = batchLimit;
 		this.batchDelay = batchDelay;
-		this.connectionPollingInterval = setInterval((): void => {
-			void this.checkConnection();
-		}, POLLING_INTERVAL);
+		this.connectionPollingInterval = null;
+		if (pollConnection) this.startConnectionPolling();
 	}
 
 	/**

@@ -427,7 +427,11 @@ export class Wallet {
 		this.electrum = new Electrum({
 			wallet: this,
 			network: this.network,
-			...electrumOptions
+			...electrumOptions,
+			// Started by Wallet.create once storage has loaded. A poll that
+			// connects first lets a block notification refresh the default state
+			// and save its address indexes over the stored ones.
+			pollConnection: false
 		});
 		this.rbf = rbf;
 		this.selectedFeeId = selectedFeeId;
@@ -524,6 +528,7 @@ export class Wallet {
 				await wallet._abandonFailedCreate();
 				return err(res.error.message);
 			}
+			wallet.electrum.startConnectionPolling();
 			void wallet.updateFeeEstimates(true);
 			// A host that owns the startup refresh (and must hold its ONE
 			// promise, e.g. BeignetNode.waitForInitialSync) opts out here so
@@ -538,11 +543,10 @@ export class Wallet {
 
 	/**
 	 * Silences and stops a wallet Wallet.create is about to report as failed
-	 * (issue #966). The constructor has already started the Electrum
-	 * connection poll, and the caller never receives this instance, so nothing
-	 * else could ever stop it: it would go on connecting, calling onMessage
-	 * for a wallet the caller was told does not exist, and keeping the process
-	 * alive.
+	 * (issue #966). The caller never receives this instance, so nothing else
+	 * could ever stop a connection poll or connect it had started: it would go
+	 * on connecting, calling onMessage for a wallet the caller was told does
+	 * not exist, and keeping the process alive.
 	 *
 	 * Never throws. A teardown that fails is logged, so the caller still gets
 	 * the error that failed the create rather than this one.
