@@ -4,6 +4,9 @@
  * staged send outside it. A direct wallet.send that took the lock in that gap
  * lost its staged inputs to the reset and failed to sign.
  *
+ * Issue #1626: BeignetNode.prepareOnchainSweep reset and staged the wallet's
+ * transaction under the node's lock alone, wiping a direct send the same way.
+ *
  * Fully OFFLINE: the wallet points at an unreachable Electrum port, UTXOs are
  * injected into wallet data, and the broadcast is stubbed.
  */
@@ -19,6 +22,7 @@ import {
 } from 'bitcoinjs-lib';
 
 import { BeignetNode } from '../../src/cli/beignet-node';
+import { ONCHAIN_SWEEPS_KEY } from '../../src/cli/onchain-sweep';
 import {
 	EAddressType,
 	EAvailableNetworks,
@@ -55,8 +59,9 @@ const electrumOptions = {
 const network = networks.regtest;
 const CLI_PAYEE = bitcoinAddress.toBech32(Buffer.alloc(20, 3), 0, 'bcrt');
 const DIRECT_PAYEE = bitcoinAddress.toBech32(Buffer.alloc(20, 4), 0, 'bcrt');
-const CLI_COIN = '11'.repeat(32);
-const DIRECT_COIN = '22'.repeat(32);
+const SWEEP_PAYEE = bitcoinAddress.toBech32(Buffer.alloc(20, 5), 0, 'bcrt');
+const LARGE_COIN = '11'.repeat(32);
+const SMALL_COIN = '22'.repeat(32);
 
 /**
  * An in-memory TStorage that answers each write on a later tick, as a real
@@ -98,7 +103,7 @@ const gate = (): { opened: Promise<void>; open: () => void } => {
 	return { opened, open };
 };
 
-describe('CLI on-chain sends hold the wallet send lock (#1617)', function () {
+describe('CLI on-chain sends hold the wallet send lock (#1617, #1626)', function () {
 	this.timeout(60000);
 
 	let wallet: Wallet;
@@ -121,8 +126,8 @@ describe('CLI on-chain sends hold the wallet send lock (#1617)', function () {
 		await wallet.refreshWallet({});
 		const source = wallet.data.addressIndex[EAddressType.p2wpkh];
 		for (const [txid, value] of [
-			[CLI_COIN, 60_000],
-			[DIRECT_COIN, 30_000]
+			[LARGE_COIN, 60_000],
+			[SMALL_COIN, 30_000]
 		] as const) {
 			wallet.data.utxos.push({
 				address: source.address,
@@ -201,9 +206,72 @@ describe('CLI on-chain sends hold the wallet send lock (#1617)', function () {
 		const built = await direct;
 		if (built.isErr()) expect.fail(built.error.message);
 
-		expect(spends(sent.hex)).to.deep.equal([`${CLI_COIN}:0`]);
+		expect(spends(sent.hex)).to.deep.equal([`${LARGE_COIN}:0`]);
 		expect(pays(sent.hex)).to.include(`${CLI_PAYEE}:20000`);
-		expect(spends(built.value)).to.deep.equal([`${DIRECT_COIN}:0`]);
+		expect(spends(built.value)).to.deep.equal([`${SMALL_COIN}:0`]);
 		expect(pays(built.value)).to.include(`${DIRECT_PAYEE}:10000`);
+	});
+
+	it('a sweep prepared while a direct send signs leaves its staged inputs alone', async () => {
+		const journal = new Map<string, string>();
+		const node = Object.assign(Object.create(BeignetNode.prototype), {
+			wallet,
+			_onchainSendLock: Promise.resolve(),
+			storage: {
+				loadWalletData: (key: string) => journal.get(key) ?? null,
+				saveWalletData: (key: string, value: string) => {
+					journal.set(key, value);
+				}
+			},
+			getBitcoinNetwork: () => network
+		}) as BeignetNode;
+
+		// Hold only the direct send at key derivation, after it has staged its
+		// inputs and before it signs them. The sweep signs on a later call.
+		const atSigning = gate();
+		const signingGate = gate();
+		const derive = wallet.getBip32Interface;
+		const stub = sinon.stub(wallet, 'getBip32Interface').callThrough();
+		stub.onFirstCall().callsFake(async () => {
+			atSigning.open();
+			await signingGate.opened;
+			return derive();
+		});
+		const direct = wallet.send({
+			address: DIRECT_PAYEE,
+			amount: 20_000,
+			satsPerByte: 2,
+			broadcast: false
+		});
+		await atSigning.opened;
+
+		const sweep = node.prepareOnchainSweep({
+			requestId: 'overlapping-sweep',
+			address: SWEEP_PAYEE,
+			satsPerVbyte: 2,
+			inputOutpoints: [{ txid: SMALL_COIN, vout: 0 }],
+			debitSats: 30_000,
+			maxFeeSats: 1_000
+		});
+		// Under the lock the sweep cannot finish until the direct send is done,
+		// so this waits a moment rather than on it.
+		await Promise.race([
+			sweep,
+			new Promise((resolve) => setTimeout(resolve, 100))
+		]);
+
+		signingGate.open();
+		const built = await direct;
+		if (built.isErr()) expect.fail(built.error.message);
+		const prepared = await sweep;
+
+		expect(spends(built.value)).to.deep.equal([`${LARGE_COIN}:0`]);
+		expect(pays(built.value)).to.include(`${DIRECT_PAYEE}:20000`);
+		expect(prepared.status).to.equal('prepared');
+		const [record] = JSON.parse(journal.get(ONCHAIN_SWEEPS_KEY)!);
+		expect(spends(record.hex)).to.deep.equal([`${SMALL_COIN}:0`]);
+		expect(pays(record.hex)).to.deep.equal([
+			`${SWEEP_PAYEE}:${prepared.amountSats}`
+		]);
 	});
 });

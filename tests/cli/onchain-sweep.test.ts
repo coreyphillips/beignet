@@ -96,6 +96,7 @@ function harness(storageOverride?: SqliteStorage) {
 			return ok({ unfrozen: found >= 0 });
 		},
 		resetSendTransaction: async () => ok('reset'),
+		withSendLock: <T>(fn: () => Promise<T>) => fn(),
 		transaction: {
 			setupTransaction: async ({ utxos }: { utxos: typeof inputs }) => {
 				inputs = utxos;
