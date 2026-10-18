@@ -5678,6 +5678,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 	const paths = spec.paths as Record<string, Record<string, unknown>>;
 	for (const [routePath, operations] of Object.entries(paths)) {
 		for (const [method, operation] of Object.entries(operations)) {
+			wrapSuccessBodies(operation as Record<string, unknown>);
 			const routeKey = `${method.toUpperCase()} ${routePath}`;
 			if (!(routeKey in ROUTE_SCOPES)) continue;
 			(operation as Record<string, unknown>)['x-accepted-scopes'] = [
@@ -5688,6 +5689,30 @@ export function getOpenApiSpec(): Record<string, unknown> {
 	}
 
 	return spec;
+}
+
+/**
+ * The daemon sends every JSON success as success()'s { ok: true, result },
+ * but the entries above describe only the result, so the envelope goes on
+ * here, once per 2xx response.
+ */
+function wrapSuccessBodies(operation: Record<string, unknown>): void {
+	const responses = (operation.responses ?? {}) as Record<
+		string,
+		{ content?: Record<string, { schema?: Record<string, unknown> }> }
+	>;
+	for (const [status, response] of Object.entries(responses)) {
+		const json = response.content?.['application/json'];
+		if (!status.startsWith('2') || !json?.schema) continue;
+		json.schema = {
+			type: 'object',
+			required: ['ok', 'result'],
+			properties: {
+				ok: { type: 'boolean', enum: [true] },
+				result: json.schema
+			}
+		};
+	}
 }
 
 function jsonContent(schema: Record<string, unknown>): Record<string, unknown> {

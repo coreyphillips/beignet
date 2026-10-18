@@ -63,7 +63,11 @@ describe('M5 Batch B: Electrum-layer improvements (CLI plumbing)', () => {
 								{
 									content: {
 										'application/json': {
-											schema: { properties: Record<string, unknown> };
+											schema: {
+												properties: {
+													result: { properties: Record<string, unknown> };
+												};
+											};
 										};
 									};
 								}
@@ -80,7 +84,8 @@ describe('M5 Batch B: Electrum-layer improvements (CLI plumbing)', () => {
 			expect(bodyProps).to.have.property('label');
 			expect(bodyProps).to.have.property('message');
 			const responseProps =
-				route.responses['200'].content['application/json'].schema.properties;
+				route.responses['200'].content['application/json'].schema.properties
+					.result.properties;
 			expect(responseProps).to.have.property('address');
 			expect(responseProps).to.have.property('bip21');
 		});

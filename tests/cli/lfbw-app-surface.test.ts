@@ -90,11 +90,13 @@ function requestParams(route: string, method = 'post'): string[] {
 	return propertiesOf(op?.requestBody?.content?.['application/json']?.schema);
 }
 
-/** Fields a route's 200 documents; empty for a non-JSON or absent one. */
+/** Fields a route's 200 result documents; empty for a non-JSON or absent one. */
 function responseFields(route: string, method = 'post'): string[] {
 	const op = spec.paths[route]?.[method];
+	const envelope =
+		op?.responses?.['200']?.content?.['application/json']?.schema;
 	return propertiesOf(
-		op?.responses?.['200']?.content?.['application/json']?.schema
+		(envelope?.properties as Schema | undefined)?.result as Schema
 	);
 }
 
