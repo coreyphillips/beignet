@@ -564,7 +564,10 @@ describe('Issue #1042: maxPaymentSats on the external on-chain sends', () => {
 					data: { fee: FEE_SATS, inputs: [] },
 					getTransactionInputValue: (): number => sweepInputSats
 				},
-				resetSendTransaction: async (): Promise<unknown> => ok('reset')
+				resetSendTransaction: async (): Promise<unknown> => ok('reset'),
+				withSendLock(fn: (locked: object) => Promise<unknown>) {
+					return fn(this);
+				}
 			},
 			_broadcastRawTx: async (hex: string): Promise<unknown> => {
 				node.broadcasts.push(hex);

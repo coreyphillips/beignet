@@ -5035,6 +5035,30 @@ export class Wallet {
 	}
 
 	/**
+	 * Runs fn under the send lock, for a caller whose send is more than one
+	 * call: reading what it staged, broadcasting the hex, resetting the staged
+	 * transaction. fn gets send, sendMax and buildPsbt without the queue, since
+	 * fn already holds the lock, so they must not be called once fn settles.
+	 * The wallet's own send methods, called from fn, wait on the lock fn holds
+	 * and never settle.
+	 */
+	public withSendLock<T>(
+		fn: (locked: Pick<Wallet, 'send' | 'sendMax' | 'buildPsbt'>) => Promise<T>
+	): Promise<T> {
+		return this.runSend(() =>
+			fn({
+				send: ({ address, amount, message = '', ...options }) =>
+					this.sendManyLocked({
+						txs: [{ address, amount, message }],
+						...options
+					}),
+				sendMax: (options) => this.sendMaxLocked(options),
+				buildPsbt: (args) => this.buildPsbtLocked(args)
+			})
+		);
+	}
+
+	/**
 	 * Sets up and creates a transaction to multiple outputs.
 	 * @param {ISendTx[]} txs
 	 * @param {number} [satsPerByte]

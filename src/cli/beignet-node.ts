@@ -6723,6 +6723,18 @@ export class BeignetNode extends EventEmitter {
 		return run;
 	}
 
+	/**
+	 * Run an on-chain send under the wallet's send lock as well, through the
+	 * read of what it staged, the broadcast and the reset. A send made on the
+	 * wallet directly would otherwise stage in that gap and lose its inputs to
+	 * this send's reset (#1617).
+	 */
+	private _runWalletSend<T>(
+		fn: (locked: Pick<Wallet, 'send' | 'sendMax' | 'buildPsbt'>) => Promise<T>
+	): Promise<T> {
+		return this._runOnchainSend(() => this.wallet.withSendLock(fn));
+	}
+
 	async sendOnchain(
 		address: string,
 		amountSats: number,
@@ -6732,7 +6744,7 @@ export class BeignetNode extends EventEmitter {
 		// Lightning payments. Fail fast on the amount alone before building.
 		this._checkMaxPayment(amountSats);
 		this._checkSpendLimit(amountSats);
-		return this._runOnchainSend(async () => {
+		return this._runWalletSend(async (locked) => {
 			// The staged send is read below (the built fee) and reset on every
 			// way out, as Wallet.boost does: what one send staged must not outlive
 			// it (#1002).
@@ -6741,7 +6753,7 @@ export class BeignetNode extends EventEmitter {
 				// hex, so build first (broadcast:false returns the hex) and broadcast
 				// separately to report both txid and hex. rbf must be passed per-send:
 				// the wallet-level flag does not propagate into setupTransaction.
-				const result = await this.wallet.send({
+				const result = await locked.send({
 					address,
 					amount: amountSats,
 					broadcast: false,
@@ -6804,11 +6816,11 @@ export class BeignetNode extends EventEmitter {
 			}
 		}
 		this._validateFeeRate(satsPerVbyte);
-		return this._runOnchainSend(async () => {
+		return this._runWalletSend(async (locked) => {
 			// Everything the later steps need (import-signed, combine) is in the
 			// PSBT itself; none of them reads the staged send, so it is reset here.
 			try {
-				const result = await this.wallet.buildPsbt({
+				const result = await locked.buildPsbt({
 					txs: outputs.map((o) => ({
 						address: o.address,
 						amount: o.amountSats
@@ -7164,11 +7176,11 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		this._validateFeeRate(satsPerVbyte);
-		return this._runOnchainSend(async () => {
+		return this._runWalletSend(async (locked) => {
 			// The staged send is read below (the swept inputs) and reset on every
 			// way out, as Wallet.boost does (#1002).
 			try {
-				const result = await this.wallet.sendMax({
+				const result = await locked.sendMax({
 					address,
 					satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
 					rbf: this.wallet.rbf,
@@ -7324,8 +7336,8 @@ export class BeignetNode extends EventEmitter {
 
 	/**
 	 * The wallet stages the boost under its own send lock. This lock still
-	 * wraps it because the sends here read the staged send after the wallet
-	 * has let go of it (the built fee, the swept inputs).
+	 * wraps it because an on-chain sweep prepares under this lock alone,
+	 * staging on the wallet's transaction without taking the wallet's.
 	 */
 	private _boost(
 		txid: string,
@@ -7390,11 +7402,11 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		const address = await this.getNewAddress();
-		return this._runOnchainSend(async () => {
+		return this._runWalletSend(async (locked) => {
 			// The staged send is read below (the fee) and reset on every way out,
 			// as Wallet.boost does (#1002).
 			try {
-				const result = await this.wallet.sendMax({
+				const result = await locked.sendMax({
 					address,
 					satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
 					rbf: this.wallet.rbf,
