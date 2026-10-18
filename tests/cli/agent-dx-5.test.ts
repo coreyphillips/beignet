@@ -297,12 +297,11 @@ describe('Production Hardening 10 — Agent DX', () => {
 
 		it('paths use $ref to schemas', () => {
 			const spec = getOpenApiSpec() as any;
-			const infoResponse =
-				spec.paths['/info'].get.responses['200'].content['application/json'];
-			expect(infoResponse.schema).to.have.property('$ref');
-			expect(infoResponse.schema.$ref).to.equal(
-				'#/components/schemas/NodeInfo'
-			);
+			const infoResult =
+				spec.paths['/info'].get.responses['200'].content['application/json']
+					.schema.properties.result;
+			expect(infoResult).to.have.property('$ref');
+			expect(infoResult.$ref).to.equal('#/components/schemas/NodeInfo');
 		});
 
 		it('OpenAPI spec includes new routes from this plan', () => {
