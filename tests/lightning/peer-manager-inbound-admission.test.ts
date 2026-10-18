@@ -266,6 +266,44 @@ describe('peer manager inbound admission', () => {
 		expect(pm.getPeer(channelPubkey)).to.exist;
 	});
 
+	it('lets a peer at maxInboundPeers replace its own connection, still refusing a stranger', async () => {
+		pm = new PeerManager({ localPrivateKey: HOST_SECRET, maxInboundPeers: 1 });
+		const port = await listenLocal(pm);
+		/** Resolves with the dialer once registered, or null once refused. */
+		const connect = async (
+			key = crypto.randomBytes(32)
+		): Promise<Peer | null> => {
+			const pubkey = getPublicKey(key).toString('hex');
+			const replaced = pm!.getPeer(pubkey);
+			const peer = dialer(port, key);
+			peers.push(peer);
+			let closed = false;
+			peer.on('close', () => {
+				closed = true;
+			});
+			peer.connect().catch(() => {
+				closed = true;
+			});
+			await until(() => {
+				const registered = pm!.getPeer(pubkey);
+				return closed || (registered !== undefined && registered !== replaced);
+			});
+			return closed ? null : peer;
+		};
+
+		const key = crypto.randomBytes(32);
+		const pubkey = getPublicKey(key).toString('hex');
+		expect(await connect(key)).to.not.equal(null);
+		const original = pm.getPeer(pubkey);
+
+		expect(await connect(key)).to.not.equal(null);
+		expect(pm.getPeer(pubkey)).to.not.equal(original);
+		expect(pm.listPeers()).to.have.length(1);
+
+		expect(await connect()).to.equal(null);
+		expect(pm.listPeers().map((p) => p.pubkey)).to.deep.equal([pubkey]);
+	});
+
 	it('caps established inbound peers per public source address, admitting channel peers past it', async function () {
 		this.timeout(10_000);
 		const channelKey = crypto.randomBytes(32);
