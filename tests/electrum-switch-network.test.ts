@@ -16,6 +16,8 @@ import {
 	EAvailableNetworks,
 	ECoinSelectPreference,
 	EProtocol,
+	IGetUtxosResponse,
+	IOnchainFees,
 	IUtxo,
 	IWalletData,
 	ok,
@@ -249,6 +251,62 @@ describe('switchNetwork against an unreachable target', function () {
 			expect(await settles(w.refreshWallet())).to.equal(true);
 			expect(await settles(w.refreshWallet())).to.equal(true);
 			expect(w.isRefreshing).to.equal(false);
+		} finally {
+			release();
+			await w.stop();
+		}
+	});
+
+	it('drops a UTXO answer from the network the wallet switched away from (#1614)', async function () {
+		const res = await Wallet.create({
+			mnemonic: MNEMONIC,
+			network,
+			electrumOptions,
+			feeEstimationSource: 'electrum',
+			disableRefreshOnCreate: true
+		});
+		if (res.isErr()) throw res.error;
+		const w = res.value;
+		const stubs = w as unknown as {
+			_scanSeq: number;
+			_appliedScanSeq: number;
+			_runRefresh: () => Promise<Result<IWalletData>>;
+		};
+		w.checkElectrumConnection = async (): Promise<Result<string>> =>
+			ok('connected');
+		w.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
+			ok(w.feeEstimates);
+		stubs._runRefresh = async (): Promise<Result<IWalletData>> => ok(w.data);
+		let release = (): void => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		w.electrum.getUtxos = async (): Promise<Result<IGetUtxosResponse>> => {
+			await gate;
+			return ok({ utxos: [utxo(100000, 0)], balance: 100000 });
+		};
+		try {
+			stubs._scanSeq = 100;
+			const stale = w.getUtxos({});
+			const switched = await w.switchNetwork(
+				EAvailableNetworks.signet,
+				otherServer
+			);
+			if (switched.isErr()) throw switched.error;
+			release();
+			expect((await stale).isErr()).to.equal(true);
+			expect(w.network).to.equal(EAvailableNetworks.signet);
+			expect(w.data.utxos).to.deep.equal([]);
+			expect(w.data.balance).to.equal(0);
+			expect(stubs._appliedScanSeq).to.equal(0);
+
+			w.electrum.getUtxos = async (): Promise<Result<IGetUtxosResponse>> =>
+				ok({ utxos: [utxo(30000, 1)], balance: 30000 });
+			const fresh = await w.getUtxos({});
+			if (fresh.isErr()) throw fresh.error;
+			expect(stubs._appliedScanSeq).to.equal(1);
+			expect(w.data.utxos).to.deep.equal([utxo(30000, 1)]);
+			expect(w.data.balance).to.equal(30000);
 		} finally {
 			release();
 			await w.stop();
