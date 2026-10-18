@@ -7262,7 +7262,7 @@ export class BeignetNode extends EventEmitter {
 
 	/** Bind a drain's reviewed inputs to one durable signed transaction. */
 	prepareOnchainSweep(request: OnchainSweepRequest): Promise<OnchainSweepInfo> {
-		return this._runOnchainSend(() => this.onchainSweeps().prepare(request));
+		return this._runWalletSend(() => this.onchainSweeps().prepare(request));
 	}
 
 	/** Submit or rebroadcast the same saved transaction, without coin selection. */
@@ -7335,9 +7335,9 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
-	 * The wallet stages the boost under its own send lock. This lock still
-	 * wraps it because an on-chain sweep prepares under this lock alone,
-	 * staging on the wallet's transaction without taking the wallet's.
+	 * The wallet stages the boost under its own send lock, which an on-chain
+	 * sweep's prepare also holds. This lock keeps the boost in order with the
+	 * node's other on-chain operations.
 	 */
 	private _boost(
 		txid: string,

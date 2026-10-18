@@ -120,7 +120,11 @@ function normalize(
 	};
 }
 
-/** Called under the node's on-chain send lock. Stored hex is never rebuilt on submit. */
+/**
+ * Called under the node's on-chain send lock. prepare also needs the wallet's
+ * send lock, since it resets and stages the wallet's shared transaction.
+ * Stored hex is never rebuilt on submit.
+ */
 export class OnchainSweeps {
 	constructor(
 		private readonly deps: {
