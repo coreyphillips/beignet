@@ -272,7 +272,18 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					summary: 'Add a watchtower (pubkey@host:port, LND altruist tower)',
 					tags: ['Node'],
 					requestBody: bodyContent({ uri: 'string' }),
-					responses: { '200': { description: 'Tower added' } }
+					responses: {
+						'200': {
+							description: 'Tower added',
+							content: jsonContent({
+								type: 'object',
+								required: ['added'],
+								properties: {
+									added: { type: 'string', description: 'The uri as given' }
+								}
+							})
+						}
+					}
 				}
 			},
 			'/watchtower/remove': {
@@ -280,7 +291,18 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					summary: 'Remove a watchtower and drop its sessions + backlog',
 					tags: ['Node'],
 					requestBody: bodyContent({ uri: 'string' }),
-					responses: { '200': { description: 'Tower removed' } }
+					responses: {
+						'200': {
+							description: 'Tower removed',
+							content: jsonContent({
+								type: 'object',
+								required: ['removed'],
+								properties: {
+									removed: { type: 'string', description: 'The uri as given' }
+								}
+							})
+						}
+					}
 				}
 			},
 			'/invoices': {
@@ -568,7 +590,49 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					summary: 'Decode a BOLT 11 invoice',
 					tags: ['Invoices'],
 					requestBody: bodyContent({ bolt11: 'string' }),
-					responses: { '200': { description: 'Decoded invoice' } }
+					responses: {
+						'200': {
+							description: 'Decoded invoice',
+							content: jsonContent({
+								type: 'object',
+								required: ['network', 'timestamp', 'paymentHash'],
+								properties: {
+									network: {
+										type: 'string',
+										enum: ['bc', 'tb', 'bcrt', 'tbs']
+									},
+									timestamp: { type: 'integer' },
+									paymentHash: { type: 'string' },
+									amountSats: { type: 'integer' },
+									paymentSecret: { type: 'string' },
+									description: { type: 'string' },
+									payeeNodeKey: { type: 'string' },
+									expiry: { type: 'integer' },
+									minFinalCltvExpiry: { type: 'integer' },
+									routingHints: {
+										type: 'array',
+										items: {
+											type: 'array',
+											items: {
+												type: 'object',
+												properties: {
+													pubkey: { type: 'string' },
+													shortChannelId: {
+														type: 'string',
+														description: 'Hex'
+													},
+													feeBaseMsat: { type: 'integer' },
+													feeProportionalMillionths: { type: 'integer' },
+													cltvExpiryDelta: { type: 'integer' }
+												}
+											}
+										}
+									},
+									warnings: { type: 'array', items: { type: 'string' } }
+								}
+							})
+						}
+					}
 				}
 			},
 			'/invoice/validate': {
@@ -832,7 +896,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						// misdescribing every other close.
 						acceptStaleStateRisk: 'boolean?'
 					}),
-					responses: { '200': { description: 'Close result' } }
+					responses: {
+						'200': {
+							description: 'Close result',
+							content: jsonContent(flagResult('closed'))
+						}
+					}
 				}
 			},
 			'/channel/forceclose': {
@@ -848,7 +917,17 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						acceptStaleStateRisk: 'boolean?'
 					}),
 					responses: {
-						'200': { description: 'Force close result with commitment txid' }
+						'200': {
+							description: 'Force close result with commitment txid',
+							content: jsonContent({
+								type: 'object',
+								required: ['forceClosed'],
+								properties: {
+									forceClosed: { type: 'boolean', enum: [true] },
+									commitmentTxid: { type: 'string' }
+								}
+							})
+						}
 					}
 				}
 			},
@@ -888,7 +967,20 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						channelId: 'string',
 						feeratePerKw: 'number'
 					}),
-					responses: { '200': { description: 'Commitment feerate updated' } }
+					responses: {
+						'200': {
+							description:
+								'Commitment feerate updated. ok false, with error, is an update the engine refused',
+							content: jsonContent({
+								type: 'object',
+								required: ['ok'],
+								properties: {
+									ok: { type: 'boolean' },
+									error: { type: 'string' }
+								}
+							})
+						}
+					}
 				}
 			},
 			'/channel/update-fee': {
@@ -901,7 +993,20 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						channelId: 'string',
 						feeratePerKw: 'number'
 					}),
-					responses: { '200': { description: 'Commitment feerate updated' } }
+					responses: {
+						'200': {
+							description:
+								'Commitment feerate updated. ok false, with error, is an update the engine refused',
+							content: jsonContent({
+								type: 'object',
+								required: ['ok'],
+								properties: {
+									ok: { type: 'boolean' },
+									error: { type: 'string' }
+								}
+							})
+						}
+					}
 				}
 			},
 			'/channel/update-policy': {
@@ -1083,7 +1188,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					summary: 'Disconnect from a peer',
 					tags: ['Peers'],
 					requestBody: bodyContent({ pubkey: 'string' }),
-					responses: { '200': { description: 'Disconnected' } }
+					responses: {
+						'200': {
+							description: 'Disconnected',
+							content: jsonContent(flagResult('disconnected'))
+						}
+					}
 				}
 			},
 			'/payment/cancel': {
@@ -1091,7 +1201,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					summary: 'Cancel a pending payment',
 					tags: ['Payments'],
 					requestBody: bodyContent({ paymentHash: 'string' }),
-					responses: { '200': { description: 'Cancelled' } }
+					responses: {
+						'200': {
+							description: 'Cancelled',
+							content: jsonContent(flagResult('ok'))
+						}
+					}
 				}
 			},
 			'/payment': {
@@ -1448,7 +1563,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					summary: 'Estimate route fee for a BOLT 11 invoice',
 					tags: ['Routing'],
 					requestBody: bodyContent({ bolt11: 'string', amountSats: 'number?' }),
-					responses: { '200': { description: 'Route estimate' } }
+					responses: {
+						'200': {
+							description: 'Route estimate',
+							content: jsonContent({
+								$ref: '#/components/schemas/RouteEstimate'
+							})
+						}
+					}
 				}
 			},
 			'/payment/estimate': {
@@ -1477,7 +1599,35 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						destination: 'string',
 						amountSats: 'number'
 					}),
-					responses: { '200': { description: 'Probe result' } }
+					responses: {
+						'200': {
+							description:
+								'Probe result: success false alone when no route was viable',
+							content: jsonContent({
+								type: 'object',
+								required: ['success'],
+								properties: {
+									success: { type: 'boolean' },
+									feeSats: { type: 'integer' },
+									feeMsat: { type: 'string', description: 'Decimal msat' },
+									hops: { type: 'integer' },
+									path: {
+										type: 'array',
+										items: {
+											type: 'object',
+											properties: {
+												pubkey: { type: 'string' },
+												shortChannelId: {
+													type: 'string',
+													description: '<block>x<tx>x<out>'
+												}
+											}
+										}
+									}
+								}
+							})
+						}
+					}
 				}
 			},
 			'/graph/info': {
@@ -1737,7 +1887,36 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						}
 					],
 					responses: {
-						'200': { description: 'Diagnostics with an issues list' },
+						'200': {
+							description: 'Diagnostics with an issues list',
+							content: jsonContent({
+								type: 'object',
+								required: ['channelId', 'state', 'issues'],
+								properties: {
+									channelId: { type: 'string' },
+									peerPubkey: { type: 'string' },
+									state: { type: 'string' },
+									preReestablishState: { type: 'string', nullable: true },
+									isPeerConnected: { type: 'boolean' },
+									announceChannel: { type: 'boolean' },
+									announcementSigsSent: { type: 'boolean' },
+									announcementSigsReceived: { type: 'boolean' },
+									willGenerateRoutingHint: { type: 'boolean' },
+									scidAlias: { type: 'string', nullable: true },
+									remoteScidAlias: { type: 'string', nullable: true },
+									shortChannelId: { type: 'string', nullable: true },
+									effectiveScid: { type: 'string', nullable: true },
+									localBalanceSats: { type: 'integer' },
+									remoteBalanceSats: { type: 'integer' },
+									issues: {
+										type: 'array',
+										items: { type: 'string' },
+										description:
+											'Each starts with a code, e.g. PEER_DISCONNECTED:'
+									}
+								}
+							})
+						},
 						'404': { description: 'Channel not found' }
 					}
 				}
@@ -1809,7 +1988,20 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						destPath: 'string',
 						overwrite: 'boolean?'
 					}),
-					responses: { '200': { description: 'Backup result' } }
+					responses: {
+						'200': {
+							description: 'Backup result',
+							content: jsonContent({
+								type: 'object',
+								required: ['backed_up', 'path', 'macPath'],
+								properties: {
+									backed_up: { type: 'boolean', enum: [true] },
+									path: { type: 'string' },
+									macPath: { type: 'string' }
+								}
+							})
+						}
+					}
 				}
 			},
 			'/backup/scb': {
@@ -1819,7 +2011,16 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					tags: ['Node'],
 					responses: {
 						'200': {
-							description: 'Encoded SCB blob, channel count, and on-disk path'
+							description: 'Encoded SCB blob, channel count, and on-disk path',
+							content: jsonContent({
+								type: 'object',
+								required: ['encoded', 'channelCount', 'path'],
+								properties: {
+									encoded: { type: 'string' },
+									channelCount: { type: 'integer' },
+									path: { type: 'string' }
+								}
+							})
 						}
 					}
 				}
@@ -1832,7 +2033,24 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Encoded SCB blob, its creation timestamp, channel count, source (scb or capsule), and the peer that returned it'
+								'Encoded SCB blob, its creation timestamp, channel count, source (scb or capsule), and the peer that returned it',
+							content: jsonContent({
+								type: 'object',
+								required: [
+									'encoded',
+									'createdAt',
+									'fromPeer',
+									'channelCount',
+									'source'
+								],
+								properties: {
+									encoded: { type: 'string' },
+									createdAt: { type: 'integer', description: 'Unix ms' },
+									fromPeer: { type: 'string' },
+									channelCount: { type: 'integer' },
+									source: { type: 'string', enum: ['scb', 'capsule'] }
+								}
+							})
 						},
 						'404': {
 							description: 'No peer has returned a valid backup this session'
@@ -1849,7 +2067,26 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Channel ids now recovering, entries skipped with reasons, and total channel count in the backup'
+								'Channel ids now recovering, entries skipped with reasons, and total channel count in the backup',
+							content: jsonContent({
+								type: 'object',
+								required: ['recovering', 'skipped', 'channelCount'],
+								properties: {
+									recovering: { type: 'array', items: { type: 'string' } },
+									skipped: {
+										type: 'array',
+										items: {
+											type: 'object',
+											required: ['channelId', 'reason'],
+											properties: {
+												channelId: { type: 'string' },
+												reason: { type: 'string' }
+											}
+										}
+									},
+									channelCount: { type: 'integer' }
+								}
+							})
 						},
 						'400': {
 							description:
@@ -1866,7 +2103,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Array of epoch records: channelId, role, state (NEGOTIATING, VOUCHERS_COMMITTED, ACTIVATING, ACTIVE, DRAINING, CLOSED, ABORTED), epochId, terms, epochStartHeight, activationHash, slots [{ k, amountMsat, paymentHash, state: unissued | exposed | settled | unsettled | settling | unused, bolt11 (R, once the slot was exposed: the invoice /ffor/invoice minted, read back from the invoice store) }], witnesses, settledBitmap, abortReason, activationMismatch'
+								'Array of epoch records: channelId, role, state (NEGOTIATING, VOUCHERS_COMMITTED, ACTIVATING, ACTIVE, DRAINING, CLOSED, ABORTED), epochId, terms, epochStartHeight, activationHash, slots [{ k, amountMsat, paymentHash, state: unissued | exposed | settled | unsettled | settling | unused, bolt11 (R, once the slot was exposed: the invoice /ffor/invoice minted, read back from the invoice store) }], witnesses, settledBitmap, abortReason, activationMismatch',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/FforEpoch' }
+							})
 						}
 					}
 				}
@@ -1875,7 +2116,15 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				get: {
 					summary: 'The epochs this node settles for others (role S)',
 					tags: ['FFOR'],
-					responses: { '200': { description: 'Array of S-role epoch records' } }
+					responses: {
+						'200': {
+							description: 'Array of S-role epoch records',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/FforEpoch' }
+							})
+						}
+					}
 				}
 			},
 			'/ffor/epoch': {
@@ -1891,7 +2140,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						}
 					],
 					responses: {
-						'200': { description: 'The epoch record' },
+						'200': {
+							description: 'The epoch record',
+							content: jsonContent({ $ref: '#/components/schemas/FforEpoch' })
+						},
 						'404': { description: 'No channel, or no epoch on it' }
 					}
 				}
@@ -1903,7 +2155,51 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								"available, reservedChannelIds and requests; each request carries its kind ('bolt11' or 'direct-funding'), concurrent requests also carry concurrentVersion, reservedInboundSats and unresolvedSlots, and a direct-funding request reserves no channel"
+								"available, reservedChannelIds and requests; each request carries its kind ('bolt11' or 'direct-funding'), concurrent requests also carry concurrentVersion, reservedInboundSats and unresolvedSlots, and a direct-funding request reserves no channel",
+							content: jsonContent({
+								type: 'object',
+								required: ['available', 'reservedChannelIds', 'requests'],
+								properties: {
+									available: { type: 'boolean' },
+									reservedChannelIds: {
+										type: 'array',
+										items: { type: 'string' }
+									},
+									requests: {
+										type: 'array',
+										items: {
+											type: 'object',
+											required: ['id', 'peer', 'amountSats', 'kind'],
+											properties: {
+												id: { type: 'string' },
+												peer: { type: 'string' },
+												amountSats: { type: 'integer' },
+												kind: {
+													type: 'string',
+													enum: ['bolt11', 'direct-funding']
+												},
+												channelId: { type: 'string' },
+												epochId: { type: 'string' },
+												previousEpochId: { type: 'string' },
+												allocationId: { type: 'string' },
+												concurrent: { type: 'boolean' },
+												concurrentVersion: { type: 'integer', enum: [1, 2] },
+												reservedInboundSats: { type: 'integer' },
+												unresolvedSlots: { type: 'integer' },
+												expiresAt: { type: 'integer', description: 'Unix ms' },
+												invoice: {
+													type: 'object',
+													description:
+														'The saved bolt11 reply of POST /receive/invoice (a request saved before kind existed has no kind)'
+												},
+												request: { type: 'string' },
+												paymentHash: { type: 'string' },
+												done: { type: 'boolean' }
+											}
+										}
+									}
+								}
+							})
 						}
 					}
 				}
@@ -1938,7 +2234,46 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'available, mode, peer, amountSats, feeSats and expiresAt (60s). bolt11 mode adds the sender fee terms and its minimum is the 354 sat dust limit; direct-funding mode adds minAmountSat, the configured direct-funding minimum (5000 by default)'
+								'available, mode, peer, amountSats, feeSats and expiresAt (60s). bolt11 mode adds the sender fee terms and its minimum is the 354 sat dust limit; direct-funding mode adds minAmountSat, the configured direct-funding minimum (5000 by default)',
+							content: jsonContent({
+								type: 'object',
+								required: [
+									'available',
+									'mode',
+									'peer',
+									'amountSats',
+									'feeSats',
+									'expiresAt'
+								],
+								properties: {
+									available: { type: 'boolean' },
+									mode: { type: 'string', enum: ['bolt11', 'direct-funding'] },
+									peer: { type: 'string' },
+									amountSats: { type: 'integer' },
+									feeSats: { type: 'integer' },
+									expiresAt: { type: 'integer', description: 'Unix ms' },
+									terms: {
+										type: 'object',
+										description: 'bolt11 mode',
+										required: ['feeBaseMsat', 'feePpm'],
+										properties: {
+											feeBaseMsat: { type: 'integer' },
+											feePpm: { type: 'integer' },
+											concurrentVersion: { type: 'integer', enum: [1, 2] }
+										}
+									},
+									concurrent: { type: 'boolean', description: 'bolt11 mode' },
+									concurrentVersion: {
+										type: 'integer',
+										enum: [1, 2],
+										description: 'bolt11 mode'
+									},
+									minAmountSat: {
+										type: 'integer',
+										description: 'direct-funding mode'
+									}
+								}
+							})
 						},
 						'400': {
 							description:
@@ -1966,7 +2301,25 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								"kind='bolt11' with the saved invoice, paymentHash, amountSats, expiresAt and offlineReceive=true; or kind='direct-funding' with request (the base64url envelope a payer pays), paymentHash (the receipt hash), expiresAt, amountSats, peer and offlineReceive=false. A direct-funding request is idempotent on requestId while unexpired and is replaced under the same id once it expires"
+								"kind='bolt11' with the saved invoice, paymentHash, amountSats, expiresAt and offlineReceive=true; or kind='direct-funding' with request (the base64url envelope a payer pays), paymentHash (the receipt hash), expiresAt, amountSats, peer and offlineReceive=false. A direct-funding request is idempotent on requestId while unexpired and is replaced under the same id once it expires",
+							content: jsonContent({
+								oneOf: [
+									{ $ref: '#/components/schemas/OfflineReceiveBolt11' },
+									{
+										type: 'object',
+										required: ['kind', 'amountSats', 'peer', 'offlineReceive'],
+										properties: {
+											kind: { type: 'string', enum: ['direct-funding'] },
+											request: { type: 'string' },
+											paymentHash: { type: 'string' },
+											expiresAt: { type: 'integer', description: 'Unix ms' },
+											amountSats: { type: 'integer' },
+											peer: { type: 'string' },
+											offlineReceive: { type: 'boolean', enum: [false] }
+										}
+									}
+								]
+							})
 						},
 						'409': {
 							description:
@@ -1993,7 +2346,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						witnessPeers: 'string[]'
 					}),
 					responses: {
-						'200': { description: 'The epoch record, NEGOTIATING' },
+						'200': {
+							description: 'The epoch record, NEGOTIATING',
+							content: jsonContent({ $ref: '#/components/schemas/FforEpoch' })
+						},
 						'400': {
 							description:
 								'Invalid parameters, or FFOR_REFUSED with the reason (book bounds, peer without the feature, a live epoch)'
@@ -2013,7 +2369,23 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						description: 'string'
 					}),
 					responses: {
-						'200': { description: 'bolt11, paymentHash, k, amountMsat' },
+						'200': {
+							description: 'bolt11, paymentHash, k, amountMsat',
+							content: jsonContent({
+								type: 'object',
+								required: ['bolt11', 'paymentHash', 'k', 'amountMsat'],
+								properties: {
+									bolt11: { type: 'string' },
+									paymentHash: { type: 'string' },
+									k: { type: 'integer' },
+									amountMsat: {
+										type: 'string',
+										nullable: true,
+										description: 'Decimal msat'
+									}
+								}
+							})
+						},
 						'400': { description: 'FFOR_REFUSED with the reason' }
 					}
 				}
@@ -2025,7 +2397,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					tags: ['FFOR'],
 					requestBody: bodyContent({ channelId: 'string' }),
 					responses: {
-						'200': { description: 'The epoch record' },
+						'200': {
+							description: 'The epoch record',
+							content: jsonContent({ $ref: '#/components/schemas/FforEpoch' })
+						},
 						'400': { description: 'FFOR_REFUSED' }
 					}
 				}
@@ -2041,7 +2416,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						text: 'string'
 					}),
 					responses: {
-						'200': { description: 'The epoch record' },
+						'200': {
+							description: 'The epoch record',
+							content: jsonContent({ $ref: '#/components/schemas/FforEpoch' })
+						},
 						'400': { description: 'FFOR_REFUSED' }
 					}
 				}
@@ -2053,7 +2431,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					tags: ['FFOR'],
 					requestBody: bodyContent({ channelId: 'string', preimage: 'string' }),
 					responses: {
-						'200': { description: 'The epoch record' },
+						'200': {
+							description: 'The epoch record',
+							content: jsonContent({ $ref: '#/components/schemas/FforEpoch' })
+						},
 						'400': { description: 'Not a preimage of this book' }
 					}
 				}
@@ -2070,7 +2451,20 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						minReceipts: 'number'
 					}),
 					responses: {
-						'200': { description: 'mailboxId, retentionUntil' },
+						'200': {
+							description: 'mailboxId, retentionUntil',
+							content: jsonContent({
+								type: 'object',
+								required: ['mailboxId', 'retentionUntil'],
+								properties: {
+									mailboxId: { type: 'string' },
+									retentionUntil: {
+										type: 'integer',
+										description: 'Block height'
+									}
+								}
+							})
+						},
 						'400': {
 							description: 'FFOR_REFUSED: the witness refused or did not answer'
 						}
@@ -2088,7 +2482,19 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						amountMsat: 'string',
 						quantityMax: 'number'
 					}),
-					responses: { '200': { description: 'offerId and the encoded offer' } }
+					responses: {
+						'200': {
+							description: 'offerId and the encoded offer',
+							content: jsonContent({
+								type: 'object',
+								required: ['offerId', 'encoded'],
+								properties: {
+									offerId: { type: 'string' },
+									encoded: { type: 'string', description: 'The BOLT 12 offer' }
+								}
+							})
+						}
+					}
 				}
 			},
 			'/ffor/issuer/provision': {
@@ -2104,7 +2510,17 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						issueUntil: 'number'
 					}),
 					responses: {
-						'200': { description: 'mailboxId, blindedNodeIds' },
+						'200': {
+							description: 'mailboxId, blindedNodeIds',
+							content: jsonContent({
+								type: 'object',
+								required: ['mailboxId', 'blindedNodeIds'],
+								properties: {
+									mailboxId: { type: 'string' },
+									blindedNodeIds: { type: 'array', items: { type: 'string' } }
+								}
+							})
+						},
 						'400': { description: 'FFOR_REFUSED' }
 					}
 				}
@@ -2118,7 +2534,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Current epoch view. The sync reply may arrive after this response.'
+								'Current epoch view. The sync reply may arrive after this response.',
+							content: jsonContent({ $ref: '#/components/schemas/FforEpoch' })
 						},
 						'400': { description: 'Invalid channel id or FFOR_REFUSED' },
 						'404': { description: 'Channel not found' }
@@ -2140,7 +2557,55 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'action (synced | closed | force-closed | nothing), preimagesKnown, per-witness results, the epoch record'
+								'action (synced | closed | force-closed | nothing), preimagesKnown, per-witness results, the epoch record',
+							content: jsonContent({
+								type: 'object',
+								required: ['action', 'preimagesKnown', 'witnesses', 'epoch'],
+								properties: {
+									action: {
+										type: 'string',
+										enum: ['synced', 'closed', 'force-closed', 'nothing']
+									},
+									preimagesKnown: {
+										type: 'array',
+										items: { type: 'integer' },
+										description: 'Slot indices k'
+									},
+									witnesses: {
+										type: 'array',
+										items: {
+											type: 'object',
+											required: [
+												'witnessNodeId',
+												'ok',
+												'error',
+												'credited',
+												'records'
+											],
+											properties: {
+												witnessNodeId: { type: 'string' },
+												ok: { type: 'boolean' },
+												error: { type: 'string', nullable: true },
+												credited: { type: 'integer' },
+												records: {
+													type: 'array',
+													items: {
+														type: 'object',
+														required: ['k', 'unbarriered', 'verified'],
+														properties: {
+															k: { type: 'integer' },
+															unbarriered: { type: 'boolean' },
+															verified: { type: 'boolean' },
+															reason: { type: 'string' }
+														}
+													}
+												}
+											}
+										}
+									},
+									epoch: { $ref: '#/components/schemas/FforEpoch' }
+								}
+							})
 						},
 						'400': {
 							description:
@@ -2161,7 +2626,23 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						acceptStaleStateRisk: 'boolean?'
 					}),
 					responses: {
-						'200': { description: 'ok, commitmentTxid, preimagesKnown' },
+						'200': {
+							description:
+								'ok, commitmentTxid, preimagesKnown. ok false, with error, is a force close the engine refused',
+							content: jsonContent({
+								type: 'object',
+								required: ['ok', 'preimagesKnown'],
+								properties: {
+									ok: { type: 'boolean' },
+									error: { type: 'string' },
+									commitmentTxid: { type: 'string' },
+									preimagesKnown: {
+										type: 'integer',
+										description: 'How many preimages the close carries'
+									}
+								}
+							})
+						},
 						'400': {
 							description:
 								'INVALID_PARAMS: a recency-held channel without acceptStaleStateRisk: true'
@@ -2174,7 +2655,49 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					summary:
 						'The receipt witness this node runs (BEIGNET_FFOR_WITNESS): every mailbox with its state, slots, records and retention',
 					tags: ['FFOR'],
-					responses: { '200': { description: 'enabled and mailboxes' } }
+					responses: {
+						'200': {
+							description: 'enabled and mailboxes',
+							content: jsonContent({
+								type: 'object',
+								required: ['enabled', 'mailboxes'],
+								properties: {
+									enabled: { type: 'boolean' },
+									mailboxes: {
+										type: 'array',
+										items: {
+											type: 'object',
+											required: [
+												'mailboxId',
+												'state',
+												'slots',
+												'records',
+												'retentionUntil',
+												'provisionedAt'
+											],
+											properties: {
+												mailboxId: { type: 'string' },
+												state: {
+													type: 'string',
+													enum: ['PROVISIONED', 'CLOSED', 'EXPIRED']
+												},
+												slots: { type: 'integer' },
+												records: { type: 'integer' },
+												retentionUntil: {
+													type: 'integer',
+													description: 'Block height'
+												},
+												provisionedAt: {
+													type: 'integer',
+													description: 'Unix ms'
+												}
+											}
+										}
+									}
+								}
+							})
+						}
+					}
 				}
 			},
 			'/ffor/witness/close': {
@@ -2184,7 +2707,21 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					tags: ['FFOR'],
 					requestBody: bodyContent({ channelId: 'string' }),
 					responses: {
-						'200': { description: 'Array of { witnessNodeId, ok, held }' },
+						'200': {
+							description: 'Array of { witnessNodeId, ok, held }',
+							content: jsonContent({
+								type: 'array',
+								items: {
+									type: 'object',
+									required: ['witnessNodeId', 'ok', 'held'],
+									properties: {
+										witnessNodeId: { type: 'string' },
+										ok: { type: 'boolean' },
+										held: { type: 'integer' }
+									}
+								}
+							})
+						},
 						'400': {
 							description:
 								'INVALID_PARAMS: channelId missing or malformed. FFOR_REFUSED: no ff_close_ack yet on a channel still open'
@@ -2198,7 +2735,47 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					summary:
 						'The BOLT 12 issuer this node runs (BEIGNET_FFOR_ISSUER): every manifest with its offer id, state, issued slots and issue_until',
 					tags: ['FFOR'],
-					responses: { '200': { description: 'enabled and manifests' } }
+					responses: {
+						'200': {
+							description: 'enabled and manifests',
+							content: jsonContent({
+								type: 'object',
+								required: ['enabled', 'manifests'],
+								properties: {
+									enabled: { type: 'boolean' },
+									manifests: {
+										type: 'array',
+										items: {
+											type: 'object',
+											required: [
+												'mailboxId',
+												'offerId',
+												'state',
+												'slots',
+												'issued',
+												'issueUntil'
+											],
+											properties: {
+												mailboxId: { type: 'string' },
+												offerId: { type: 'string' },
+												state: { type: 'string', enum: ['ISSUING', 'RETIRED'] },
+												slots: { type: 'integer' },
+												issued: {
+													type: 'array',
+													items: { type: 'integer' },
+													description: 'Issued slot indices k'
+												},
+												issueUntil: {
+													type: 'integer',
+													description: 'Block height'
+												}
+											}
+										}
+									}
+								}
+							})
+						}
+					}
 				}
 			},
 			'/ffor/issuer/issued': {
@@ -2223,7 +2800,35 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'ok, numSlots, issued (the issued bitmap, hex), slots [{ k, payerId, metadataHash, issuedUnixTime }], error (the issuer refusal when ok is false)'
+								'ok, numSlots, issued (the issued bitmap, hex), slots [{ k, payerId, metadataHash, issuedUnixTime }], error (the issuer refusal when ok is false)',
+							content: jsonContent({
+								type: 'object',
+								required: ['ok', 'numSlots', 'issued', 'slots', 'error'],
+								properties: {
+									ok: { type: 'boolean' },
+									numSlots: { type: 'integer' },
+									issued: { type: 'string' },
+									slots: {
+										type: 'array',
+										items: {
+											type: 'object',
+											required: [
+												'k',
+												'payerId',
+												'metadataHash',
+												'issuedUnixTime'
+											],
+											properties: {
+												k: { type: 'integer' },
+												payerId: { type: 'string' },
+												metadataHash: { type: 'string' },
+												issuedUnixTime: { type: 'integer' }
+											}
+										}
+									},
+									error: { type: 'string', nullable: true }
+								}
+							})
 						},
 						'400': {
 							description:
@@ -2241,7 +2846,121 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Mode, profile, guardians, daemon state, node recovery status (null when off, restore-pending or restart-required), retrieved capsule candidates with the best head and the guardian locators that capsule names (credentials redacted; reported, never adopted over the configured set), and restore progress when one is pending or running. In peer-storage mode node.heldReestablish lists peers whose channel_reestablish for a channel this node has no record of is being held rather than answered: each entry carries the expiresAt by which a capsule must be applied, after which the peer is told the channel is unknown and force-closes. A channel restored from a capsule carries node.channels[].restoreRecencyUnproven for as long as it exists: a capsule is best-effort recency and a compatible channel_reestablish does not prove otherwise, so the daemon will never force-close that channel on its own initiative (a peer error and the timeout backstops are held, and the channel asks its peer to close instead). Such a channel also takes no new HTLCs, since its on-chain HTLC deadline backstops can never fire, though existing ones still settle; a cooperative close is refused in both directions too, since a mutual close pays out restored balances that cannot be proven current. The exits are the peer closing, or the operator acknowledging the risk with acceptStaleStateRisk: true on /channel/close (covers the whole negotiation) or /channel/forceclose. A channel whose peer claimed at channel_reestablish that its state is behind without showing the per-commitment secret that would prove it carries node.channels[].reestablishRecencyUnproven and reports status reestablish_recency_unproven: it is ERRORED under the same hold (no automatic close, no new HTLCs, the peer asked to close on every reconnect) with the same exits, the peer closing or /channel/forceclose with acceptStaleStateRisk: true. A channel whose own channel_reestablish could not be built, because the shachain store on this node holds no per-commitment secret at the index its revocation counter names, carries node.channels[].reestablishSecretMissing and reports status reestablish_secret_missing: a local storage fault, held exactly the same way with the same exits, and permanently, since the store cannot recover the secret. It is announced when it happens as node:error REESTABLISH_SECRET_MISSING. Any channel, including one never restored from a capsule, carries node.channels[].restoreRevokedRisk and reports local_data_loss once its peer has shown, in channel_reestablish, that it already holds the revocation for the stored commitment: the risk has become a certainty, so /channel/forceclose refuses it with FORCE_CLOSE_REVOKED regardless of acceptStaleStateRisk, and a cooperative close is refused too. These channels take no new HTLCs and are offered to no router; the flag clears by itself once the retransmission from that peer levels the row and this node revokes the flagged commitment. autoApply reports the automatic capsule application (peer-storage mode, BEIGNET_RECOVERY_AUTO_APPLY): enabled, phase (idle, settling, applying, applied, refused), settleUntil while settling, and lastReason after a refusal, which is the same refusal the manual route would have made. node.barrierLatency (quorum mode) is what the durability barrier has cost so far: waits that parked a message and were released by a guardian receipt, waits refused, and the last, mean, median, 95th percentile and maximum wait in milliseconds over the most recent 256 released waits, so the cost of the barrier is a measurement on this node rather than a guess'
+								'Mode, profile, guardians, daemon state, node recovery status (null when off, restore-pending or restart-required), retrieved capsule candidates with the best head and the guardian locators that capsule names (credentials redacted; reported, never adopted over the configured set), and restore progress when one is pending or running. In peer-storage mode node.heldReestablish lists peers whose channel_reestablish for a channel this node has no record of is being held rather than answered: each entry carries the expiresAt by which a capsule must be applied, after which the peer is told the channel is unknown and force-closes. A channel restored from a capsule carries node.channels[].restoreRecencyUnproven for as long as it exists: a capsule is best-effort recency and a compatible channel_reestablish does not prove otherwise, so the daemon will never force-close that channel on its own initiative (a peer error and the timeout backstops are held, and the channel asks its peer to close instead). Such a channel also takes no new HTLCs, since its on-chain HTLC deadline backstops can never fire, though existing ones still settle; a cooperative close is refused in both directions too, since a mutual close pays out restored balances that cannot be proven current. The exits are the peer closing, or the operator acknowledging the risk with acceptStaleStateRisk: true on /channel/close (covers the whole negotiation) or /channel/forceclose. A channel whose peer claimed at channel_reestablish that its state is behind without showing the per-commitment secret that would prove it carries node.channels[].reestablishRecencyUnproven and reports status reestablish_recency_unproven: it is ERRORED under the same hold (no automatic close, no new HTLCs, the peer asked to close on every reconnect) with the same exits, the peer closing or /channel/forceclose with acceptStaleStateRisk: true. A channel whose own channel_reestablish could not be built, because the shachain store on this node holds no per-commitment secret at the index its revocation counter names, carries node.channels[].reestablishSecretMissing and reports status reestablish_secret_missing: a local storage fault, held exactly the same way with the same exits, and permanently, since the store cannot recover the secret. It is announced when it happens as node:error REESTABLISH_SECRET_MISSING. Any channel, including one never restored from a capsule, carries node.channels[].restoreRevokedRisk and reports local_data_loss once its peer has shown, in channel_reestablish, that it already holds the revocation for the stored commitment: the risk has become a certainty, so /channel/forceclose refuses it with FORCE_CLOSE_REVOKED regardless of acceptStaleStateRisk, and a cooperative close is refused too. These channels take no new HTLCs and are offered to no router; the flag clears by itself once the retransmission from that peer levels the row and this node revokes the flagged commitment. autoApply reports the automatic capsule application (peer-storage mode, BEIGNET_RECOVERY_AUTO_APPLY): enabled, phase (idle, settling, applying, applied, refused), settleUntil while settling, and lastReason after a refusal, which is the same refusal the manual route would have made. node.barrierLatency (quorum mode) is what the durability barrier has cost so far: waits that parked a message and were released by a guardian receipt, waits refused, and the last, mean, median, 95th percentile and maximum wait in milliseconds over the most recent 256 released waits, so the cost of the barrier is a measurement on this node rather than a guess',
+							content: jsonContent({
+								type: 'object',
+								required: [
+									'mode',
+									'profile',
+									'generation',
+									'configuredSetStale',
+									'rotation',
+									'guardians',
+									'state',
+									'node',
+									'capsules',
+									'autoApply'
+								],
+								properties: {
+									mode: {
+										type: 'string',
+										enum: ['off', 'peer-storage', 'async-remote', 'quorum']
+									},
+									profile: { type: 'string', nullable: true },
+									generation: { type: 'string', description: 'Decimal' },
+									configuredSetStale: { type: 'boolean' },
+									rotation: {
+										type: 'object',
+										properties: {
+											inProgress: { type: 'boolean' },
+											pending: { type: 'boolean' },
+											retirePending: { type: 'boolean' },
+											lastEvent: { type: 'object', nullable: true },
+											followed: { type: 'object', nullable: true }
+										}
+									},
+									guardians: {
+										type: 'array',
+										items: { $ref: '#/components/schemas/GuardianLocator' }
+									},
+									state: {
+										type: 'string',
+										enum: [
+											'disabled',
+											'running',
+											'restore-required',
+											'restoring',
+											'restart-required',
+											'fenced'
+										]
+									},
+									node: {
+										type: 'object',
+										nullable: true,
+										description: 'Set while state is running or fenced',
+										properties: {
+											gate: { type: 'string' },
+											durability: {
+												type: 'string',
+												enum: ['local', 'async-remote', 'quorum']
+											},
+											startupRepairPending: { type: 'boolean' },
+											lastDurableSequence: {
+												type: 'string',
+												description: 'Decimal'
+											},
+											awaitingDurabilityCount: { type: 'integer' },
+											fenced: { type: 'boolean' },
+											backfillLost: { type: 'boolean' },
+											barrierLatency: { type: 'object', nullable: true },
+											channels: { type: 'array', items: { type: 'object' } },
+											heldReestablish: {
+												type: 'array',
+												items: {
+													type: 'object',
+													properties: {
+														peer: { type: 'string' },
+														channelId: { type: 'string' },
+														expiresAt: { type: 'integer' }
+													}
+												}
+											}
+										}
+									},
+									capsules: {
+										type: 'object',
+										properties: {
+											candidates: { type: 'integer' },
+											best: { type: 'object', nullable: true }
+										}
+									},
+									restore: {
+										type: 'object',
+										properties: {
+											inProgress: { type: 'boolean' },
+											lastEvent: { type: 'object' }
+										}
+									},
+									autoApply: {
+										type: 'object',
+										properties: {
+											enabled: { type: 'boolean' },
+											phase: {
+												type: 'string',
+												enum: [
+													'idle',
+													'settling',
+													'applying',
+													'applied',
+													'refused'
+												]
+											},
+											settleUntil: { type: 'integer', nullable: true },
+											lastReason: { type: 'string', nullable: true }
+										}
+									}
+								}
+							})
 						}
 					}
 				}
@@ -2255,7 +2974,22 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Restore report: exact (wire-safety proven), frames applied, guardians repaired, and the acquired writer epoch'
+								'Restore report: exact (wire-safety proven), frames applied, guardians repaired, and the acquired writer epoch',
+							content: jsonContent({
+								type: 'object',
+								required: [
+									'exact',
+									'framesApplied',
+									'guardiansRepaired',
+									'epoch'
+								],
+								properties: {
+									exact: { type: 'boolean' },
+									framesApplied: { type: 'integer' },
+									guardiansRepaired: { type: 'integer' },
+									epoch: { type: 'string', description: 'Decimal' }
+								}
+							})
 						},
 						'400': {
 							description:
@@ -2290,7 +3024,53 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Restore report: tier, channel count, frames applied, the restored head and the newest head seen, rejected candidates, whether a restart is required, and, after an unfenced restore, the guardians the capsule named under unfenced (Tier 1 adds the recovering and skipped channel lists)'
+								'Restore report: tier, channel count, frames applied, the restored head and the newest head seen, rejected candidates, whether a restart is required, and, after an unfenced restore, the guardians the capsule named under unfenced (Tier 1 adds the recovering and skipped channel lists)',
+							content: jsonContent({
+								type: 'object',
+								required: [
+									'tier',
+									'channelCount',
+									'framesApplied',
+									'rejectedCandidates',
+									'head',
+									'newestSeenHead',
+									'restartRequired'
+								],
+								properties: {
+									tier: { type: 'integer', enum: [1, 2] },
+									channelCount: { type: 'integer' },
+									framesApplied: { type: 'integer' },
+									rejectedCandidates: { type: 'integer' },
+									head: { $ref: '#/components/schemas/CapsuleHead' },
+									newestSeenHead: { $ref: '#/components/schemas/CapsuleHead' },
+									restartRequired: {
+										type: 'boolean',
+										description: 'true on Tier 2'
+									},
+									recovering: {
+										type: 'array',
+										items: { type: 'string' },
+										description: 'Tier 1'
+									},
+									skipped: {
+										type: 'array',
+										description: 'Tier 1',
+										items: {
+											type: 'object',
+											properties: {
+												channelId: { type: 'string' },
+												reason: { type: 'string' }
+											}
+										}
+									},
+									unfenced: {
+										type: 'object',
+										properties: {
+											guardians: { type: 'array', items: { type: 'object' } }
+										}
+									}
+								}
+							})
 						},
 						'400': {
 							description: 'Missing confirm, or unfenced is not a boolean'
@@ -2318,7 +3098,60 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'The peer the capsule came from, its head, the full descriptors, and config-file ready entries (guardianId, url, auth when present)'
+								'The peer the capsule came from, its head, the full descriptors, and config-file ready entries (guardianId, url, auth when present)',
+							content: jsonContent({
+								type: 'object',
+								required: ['fromPeer', 'head', 'guardians', 'entries'],
+								properties: {
+									fromPeer: { type: 'string' },
+									head: { $ref: '#/components/schemas/CapsuleHead' },
+									guardians: {
+										type: 'array',
+										items: {
+											type: 'object',
+											required: ['guardianId', 'transports'],
+											properties: {
+												guardianId: { type: 'string' },
+												transports: {
+													type: 'array',
+													items: {
+														type: 'object',
+														properties: {
+															type: {
+																type: 'string',
+																enum: [
+																	'onion-http',
+																	'https',
+																	'local-http',
+																	'bolt8'
+																]
+															},
+															url: { type: 'string' }
+														}
+													}
+												},
+												auth: { type: 'object' }
+											}
+										}
+									},
+									entries: {
+										type: 'array',
+										items: {
+											type: 'object',
+											required: ['guardianId', 'url'],
+											properties: {
+												guardianId: { type: 'string' },
+												url: { type: 'string' },
+												auth: {
+													type: 'object',
+													description:
+														'{ type: bearer, token }, { type: macaroon, macaroon } or { type: tor-v3-client-auth, privateKey }'
+												}
+											}
+										}
+									}
+								}
+							})
 						},
 						'400': { description: 'Missing confirm' },
 						'404': {
@@ -2335,7 +3168,44 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'{ serving } plus the host status whenever hosting is on, and listenError while the Lightning listener is not bound. Quotas refuse rather than delete, so a set at its byte limit still answers reads'
+								'{ serving } plus the host status whenever hosting is on, and listenError while the Lightning listener is not bound. Quotas refuse rather than delete, so a set at its byte limit still answers reads',
+							content: jsonContent({
+								type: 'object',
+								required: ['serving'],
+								properties: {
+									serving: { type: 'boolean' },
+									guardianId: { type: 'string' },
+									authRequired: { type: 'boolean' },
+									sessions: { type: 'integer' },
+									inFlight: { type: 'integer' },
+									totalBytes: { type: 'integer' },
+									sets: {
+										type: 'array',
+										items: {
+											type: 'object',
+											properties: {
+												setId: { type: 'string' },
+												members: { type: 'array', items: { type: 'string' } },
+												namespaces: { type: 'integer' },
+												bytes: { type: 'integer' },
+												diskBytes: { type: 'integer' },
+												registeredAt: { type: 'integer' }
+											}
+										}
+									},
+									limits: {
+										type: 'object',
+										properties: {
+											maxCiphertextBytes: { type: 'integer' },
+											maxBytesPerSet: { type: 'integer' },
+											maxNamespacesPerSet: { type: 'integer' },
+											maxBytesPerNamespace: { type: 'integer' },
+											maxSets: { type: 'integer' }
+										}
+									},
+									listenError: { $ref: '#/components/schemas/ListenerProblem' }
+								}
+							})
 						}
 					}
 				}
@@ -2352,7 +3222,19 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'generation, the new guardians, and how many outgoing guardians accepted the retirement (0 means it is retried in the background)'
+								'generation, the new guardians, and how many outgoing guardians accepted the retirement (0 means it is retried in the background)',
+							content: jsonContent({
+								type: 'object',
+								required: ['generation', 'guardians', 'retired'],
+								properties: {
+									generation: { type: 'string', description: 'Decimal' },
+									guardians: {
+										type: 'array',
+										items: { $ref: '#/components/schemas/GuardianLocator' }
+									},
+									retired: { type: 'integer' }
+								}
+							})
 						},
 						'400': {
 							description: 'Missing confirm, not three entries, or the same set'
@@ -2377,7 +3259,24 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'guardianId, url, entry, guardianSetIds, maxCiphertextBytes'
+								'guardianId, url, entry, guardianSetIds, maxCiphertextBytes',
+							content: jsonContent({
+								type: 'object',
+								required: [
+									'guardianId',
+									'url',
+									'entry',
+									'guardianSetIds',
+									'maxCiphertextBytes'
+								],
+								properties: {
+									guardianId: { type: 'string' },
+									url: { type: 'string', description: 'bolt8:// URL' },
+									entry: { type: 'string', description: '<guardianId>@<url>' },
+									guardianSetIds: { type: 'array', items: { type: 'string' } },
+									maxCiphertextBytes: { type: 'integer' }
+								}
+							})
 						},
 						'400': { description: 'Not a <node id>@host:port URI' },
 						'502': {
@@ -2397,7 +3296,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						satsPerVbyte: 'number?'
 					}),
 					responses: {
-						'200': { description: 'Transaction info' },
+						'200': {
+							description: 'Transaction info',
+							content: jsonContent({ $ref: '#/components/schemas/TxInfo' })
+						},
 						'403': {
 							description:
 								'SPENDING_LIMIT_EXCEEDED: amount + fee over maxPaymentSats or dailySpendLimitSats'
@@ -2718,7 +3620,50 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Unsigned PSBT (base64) with fee, vsize estimate and input/output summary'
+								'Unsigned PSBT (base64) with fee, vsize estimate and input/output summary',
+							content: jsonContent({
+								type: 'object',
+								required: [
+									'psbtBase64',
+									'feeSats',
+									'vsizeEstimate',
+									'satsPerVbyte',
+									'inputs',
+									'outputs'
+								],
+								properties: {
+									psbtBase64: { type: 'string' },
+									feeSats: { type: 'integer' },
+									vsizeEstimate: { type: 'integer' },
+									satsPerVbyte: { type: 'number' },
+									inputs: {
+										type: 'array',
+										items: {
+											type: 'object',
+											properties: {
+												txid: { type: 'string' },
+												vout: { type: 'integer' },
+												address: { type: 'string' },
+												valueSats: { type: 'integer' },
+												path: { type: 'string' }
+											}
+										}
+									},
+									outputs: {
+										type: 'array',
+										items: {
+											type: 'object',
+											properties: {
+												address: {
+													type: 'string',
+													description: 'Absent for a non-address output'
+												},
+												valueSats: { type: 'integer' }
+											}
+										}
+									}
+								}
+							})
 						},
 						'400': { description: 'Invalid outputs/fee rate or no UTXOs' }
 					}
@@ -2734,7 +3679,17 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						unsignedPsbtBase64: 'string?'
 					}),
 					responses: {
-						'200': { description: 'Finalized transaction (not broadcast)' },
+						'200': {
+							description: 'Finalized transaction (not broadcast)',
+							content: jsonContent({
+								type: 'object',
+								required: ['txid', 'txHex'],
+								properties: {
+									txid: { type: 'string' },
+									txHex: { type: 'string' }
+								}
+							})
+						},
 						'400': {
 							description:
 								'PSBT_IMPORT_FAILED (missing/invalid signatures, an input already finalized, or inputs/outputs that differ from unsignedPsbtBase64 or, without it, from every PSBT this node remembers building)'
@@ -2749,7 +3704,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					tags: ['Node'],
 					requestBody: bodyContent({ psbts: 'array' }),
 					responses: {
-						'200': { description: 'Combined PSBT (base64)' },
+						'200': {
+							description: 'Combined PSBT (base64)',
+							content: jsonContent({
+								type: 'object',
+								required: ['psbtBase64'],
+								properties: { psbtBase64: { type: 'string' } }
+							})
+						},
 						'400': { description: 'Fewer than two PSBTs or malformed input' }
 					}
 				}
@@ -3382,7 +4344,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					summary: 'Remove a trusted peer',
 					tags: ['Peers'],
 					requestBody: bodyContent({ pubkey: 'string' }),
-					responses: { '200': { description: 'Removed' } }
+					responses: {
+						'200': {
+							description: 'Removed',
+							content: jsonContent({
+								$ref: '#/components/schemas/TrustedPeerInfo'
+							})
+						}
+					}
 				}
 			},
 			'/trusted-peers': {
@@ -3768,7 +4737,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						paymentHash: 'string',
 						metadata: 'Record<string,string>'
 					}),
-					responses: { '200': { description: 'Updated' } }
+					responses: {
+						'200': {
+							description: 'Updated',
+							content: jsonContent(flagResult('updated'))
+						}
+					}
 				}
 			},
 			'/can-send': {
@@ -3779,7 +4753,23 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					parameters: [
 						{ name: 'amountSats', in: 'query', schema: { type: 'integer' } }
 					],
-					responses: { '200': { description: 'Send capability' } }
+					responses: {
+						'200': {
+							description: 'Send capability',
+							content: jsonContent({
+								type: 'object',
+								required: ['canSend', 'availableSats'],
+								properties: {
+									canSend: { type: 'boolean' },
+									bestChannelId: {
+										type: 'string',
+										description: 'Absent with no usable channel'
+									},
+									availableSats: { type: 'integer' }
+								}
+							})
+						}
+					}
 				}
 			},
 			'/can-receive': {
@@ -3790,7 +4780,23 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					parameters: [
 						{ name: 'amountSats', in: 'query', schema: { type: 'integer' } }
 					],
-					responses: { '200': { description: 'Receive capability' } }
+					responses: {
+						'200': {
+							description: 'Receive capability',
+							content: jsonContent({
+								type: 'object',
+								required: ['canReceive', 'availableSats'],
+								properties: {
+									canReceive: { type: 'boolean' },
+									bestChannelId: {
+										type: 'string',
+										description: 'Absent with no usable channel'
+									},
+									availableSats: { type: 'integer' }
+								}
+							})
+						}
+					}
 				}
 			},
 			'/offer/pay': {
@@ -3851,7 +4857,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					tags: ['Webhooks'],
 					requestBody: bodyContent({ id: 'string' }),
 					responses: {
-						'200': { description: 'Webhook unregistered' },
+						'200': {
+							description: 'Webhook unregistered',
+							content: jsonContent(flagResult('unregistered'))
+						},
 						'404': { description: 'Webhook not found' }
 					}
 				}
@@ -3918,7 +4927,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					tags: ['Queue'],
 					requestBody: bodyContent({ id: 'string' }),
 					responses: {
-						'200': { description: 'Payment cancelled' },
+						'200': {
+							description: 'Payment cancelled',
+							content: jsonContent(flagResult('cancelled'))
+						},
 						'404': {
 							description: 'Queued payment not found or already processing'
 						}
@@ -3979,7 +4991,19 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					tags: ['Auth'],
 					requestBody: bodyContent({ name: 'string' }),
 					responses: {
-						'200': { description: 'Key revoked' },
+						'200': {
+							description: 'Key revoked',
+							content: jsonContent({
+								type: 'object',
+								required: ['revoked'],
+								properties: {
+									revoked: {
+										type: 'string',
+										description: 'The revoked key name'
+									}
+								}
+							})
+						},
 						'404': { description: 'No key with that name' }
 					}
 				}
@@ -5132,6 +6156,173 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						error: { type: 'string' }
 					}
 				},
+				GuardianLocator: {
+					type: 'object',
+					required: ['guardianId', 'url'],
+					properties: {
+						guardianId: { type: 'string' },
+						url: { type: 'string' }
+					}
+				},
+				CapsuleHead: {
+					type: 'object',
+					required: ['writerEpoch', 'latestSequence'],
+					properties: {
+						writerEpoch: { type: 'string', description: 'Decimal' },
+						latestSequence: { type: 'string', description: 'Decimal' }
+					}
+				},
+				OfflineReceiveBolt11: {
+					type: 'object',
+					required: [
+						'kind',
+						'bolt11',
+						'paymentHash',
+						'amountSats',
+						'expiresAt',
+						'offlineReceive'
+					],
+					properties: {
+						kind: { type: 'string', enum: ['bolt11'] },
+						bolt11: { type: 'string' },
+						paymentHash: { type: 'string' },
+						amountSats: { type: 'integer' },
+						expiresAt: { type: 'integer', description: 'Unix ms' },
+						offlineReceive: { type: 'boolean', enum: [true] },
+						k: { type: 'integer', description: 'Set when this call minted it' },
+						amountMsat: {
+							type: 'string',
+							nullable: true,
+							description: 'Decimal msat, set when this call minted it'
+						},
+						concurrent: { type: 'boolean' },
+						concurrentVersion: { type: 'integer', enum: [1, 2] }
+					}
+				},
+				FforEpoch: {
+					type: 'object',
+					required: [
+						'channelId',
+						'role',
+						'state',
+						'epochId',
+						'peerNodeId',
+						'variant',
+						'concurrent',
+						'snapshotSeq',
+						'capabilityHold',
+						'budgetMsat',
+						'numSlots',
+						'hashChain',
+						'witnessPeers',
+						'settlementDeadline',
+						'voucherExpiry',
+						'feeBaseMsat',
+						'feeProportionalMillionths',
+						'epochStartHeight',
+						'activationHash',
+						'slots',
+						'witnesses',
+						'settledBitmap',
+						'abortReason',
+						'activationMismatch',
+						'closeSent'
+					],
+					properties: {
+						channelId: { type: 'string' },
+						role: { type: 'string', enum: ['R', 'S'] },
+						state: {
+							type: 'string',
+							enum: [
+								'NEGOTIATING',
+								'VOUCHERS_COMMITTED',
+								'ACTIVATING',
+								'ACTIVE',
+								'DRAINING',
+								'CLOSED',
+								'ABORTED'
+							]
+						},
+						epochId: { type: 'string' },
+						peerNodeId: { type: 'string' },
+						variant: { type: 'integer', description: '4 is Variant D' },
+						concurrent: { type: 'boolean' },
+						concurrentVersion: { type: 'integer', enum: [1, 2] },
+						snapshotSeq: {
+							type: 'string',
+							nullable: true,
+							description:
+								'Decimal; "0" with no snapshot, null when the stored snapshot does not decode'
+						},
+						capabilityHold: { type: 'boolean' },
+						budgetMsat: { type: 'string', description: 'Decimal msat' },
+						numSlots: { type: 'integer' },
+						hashChain: { type: 'boolean' },
+						witnessPeers: { type: 'array', items: { type: 'string' } },
+						settlementDeadline: {
+							type: 'integer',
+							description: 'Block height'
+						},
+						voucherExpiry: { type: 'integer', description: 'Block height' },
+						feeBaseMsat: { type: 'integer' },
+						feeProportionalMillionths: { type: 'integer' },
+						epochStartHeight: { type: 'integer', nullable: true },
+						activationHash: { type: 'string', nullable: true },
+						slots: {
+							type: 'array',
+							items: {
+								type: 'object',
+								required: ['k', 'amountMsat', 'paymentHash', 'state'],
+								properties: {
+									k: { type: 'integer' },
+									amountMsat: { type: 'string', description: 'Decimal msat' },
+									paymentHash: { type: 'string', nullable: true },
+									state: {
+										type: 'string',
+										enum: [
+											'unissued',
+											'exposed',
+											'settled',
+											'unsettled',
+											'settling',
+											'unused',
+											'redeemed',
+											'cancelled'
+										]
+									},
+									bolt11: { type: 'string' }
+								}
+							}
+						},
+						witnesses: {
+							type: 'array',
+							items: {
+								type: 'object',
+								required: [
+									'witnessNodeId',
+									'mailboxId',
+									'retentionUntil',
+									'acknowledged'
+								],
+								properties: {
+									witnessNodeId: { type: 'string' },
+									mailboxId: { type: 'string' },
+									retentionUntil: { type: 'integer' },
+									acknowledged: { type: 'boolean' }
+								}
+							}
+						},
+						settledBitmap: { type: 'string', nullable: true },
+						abortReason: {
+							type: 'integer',
+							nullable: true,
+							description:
+								'OPERATOR 0, TIMEOUT 1, TERMS_REFUSED 2, BOOK_MISMATCH 3, COMMIT_MISMATCH 4, VOUCHER_ROUND_FAILED 5, DISCONNECT 6, PROTOCOL_ERROR 7'
+						},
+						activationMismatch: { type: 'boolean' },
+						closeSent: { type: 'boolean' }
+					}
+				},
 				TxInfo: {
 					type: 'object',
 					properties: {
@@ -5724,6 +6915,15 @@ function jsonContent(schema: Record<string, unknown>): Record<string, unknown> {
 		'application/json': {
 			schema
 		}
+	};
+}
+
+/** A reply that is one always-true flag, such as { closed: true }. */
+function flagResult(name: string): Record<string, unknown> {
+	return {
+		type: 'object',
+		required: [name],
+		properties: { [name]: { type: 'boolean', enum: [true] } }
 	};
 }
 
