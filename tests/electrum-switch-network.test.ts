@@ -313,6 +313,79 @@ describe('switchNetwork against an unreachable target', function () {
 		}
 	});
 
+	it('writes a pending UTXO pair under the network it was scanned on (#1623)', async function () {
+		const name = 'switchsave';
+		const store = new Map<string, unknown>();
+		const key = (on: EAvailableNetworks, field: keyof IWalletData): string =>
+			getWalletDataStorageKey(name, on, field);
+		let release = (): void => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let held = (): void => {};
+		const holding = new Promise<void>((resolve) => {
+			held = resolve;
+		});
+		const res = await Wallet.create({
+			mnemonic: MNEMONIC,
+			name,
+			network,
+			electrumOptions,
+			storage: {
+				...makeStorage(store),
+				setData: async <K extends keyof IWalletData>(
+					at: string,
+					value: IWalletData[K]
+				): Promise<Result<boolean>> => {
+					if (at === key(network, 'utxos')) {
+						held();
+						await gate;
+					}
+					store.set(at, value);
+					return ok(true);
+				}
+			},
+			feeEstimationSource: 'electrum',
+			disableRefreshOnCreate: true
+		});
+		if (res.isErr()) throw res.error;
+		const w = res.value;
+		w.checkElectrumConnection = async (): Promise<Result<string>> =>
+			ok('connected');
+		w.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
+			ok(w.feeEstimates);
+		(
+			w as unknown as { _runRefresh: () => Promise<Result<IWalletData>> }
+		)._runRefresh = async (): Promise<Result<IWalletData>> => ok(w.data);
+		w.electrum.getUtxos = async (): Promise<Result<IGetUtxosResponse>> =>
+			ok({ utxos: [utxo(100000, 0)], balance: 100000 });
+		try {
+			const scan = w.getUtxos({});
+			await holding;
+			const switched = await w.switchNetwork(
+				EAvailableNetworks.signet,
+				otherServer
+			);
+			if (switched.isErr()) throw switched.error;
+			release();
+			if ((await scan).isErr()) throw new Error('the scan failed');
+
+			expect(w.data.utxos).to.deep.equal([]);
+			expect(w.data.balance).to.equal(0);
+			expect(store.has(key(EAvailableNetworks.signet, 'utxos'))).to.equal(
+				false
+			);
+			expect(store.has(key(EAvailableNetworks.signet, 'balance'))).to.equal(
+				false
+			);
+			expect(store.get(key(network, 'utxos'))).to.deep.equal([utxo(100000, 0)]);
+			expect(store.get(key(network, 'balance'))).to.equal(100000);
+		} finally {
+			release();
+			await w.stop();
+		}
+	});
+
 	it('leaves the wallet untouched when the target network fails to load (#1595)', async function () {
 		const name = 'switchfail';
 		const store = new Map<string, unknown>();
