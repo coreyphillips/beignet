@@ -1406,7 +1406,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description: 'Removal result',
-							content: jsonContent({ removed: 'boolean' })
+							content: jsonContent({
+								type: 'object',
+								required: ['removed'],
+								properties: { removed: { type: 'boolean' } }
+							})
 						}
 					}
 				}
