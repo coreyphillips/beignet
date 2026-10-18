@@ -2731,8 +2731,10 @@ export class Wallet {
 	 * @param {EAddressType[]} [addressTypesToCheck]
 	 * @returns {Promise<Result<IGetUtxosResponse>>} The pair the scan applied
 	 * to memory, or, when a newer scan already landed, memory's pair as it
-	 * stands, applied and written by that scan instead. A write that storage
-	 * refuses is logged, not returned: the scan itself succeeded.
+	 * stands, applied and written by that scan instead. Err, with nothing
+	 * applied, when the wallet switched networks while the query was out. A
+	 * write that storage refuses is logged, not returned: the scan itself
+	 * succeeded.
 	 */
 	public async getUtxos({
 		scanningStrategy = EScanningStrategy.gapLimit,
@@ -2754,9 +2756,13 @@ export class Wallet {
 		const spendMark = this._spendSeq;
 		this._scanMarks.push(spendMark);
 		const scanSeq = ++this._scanSeq;
+		// switchNetwork replaces the Electrum instance and restarts the scan
+		// numbers, so an answer from the one this query went to is another
+		// network's coins and its number means nothing to the new count.
+		const electrum = this.electrum;
 		let getUtxosRes: Result<IGetUtxosResponse>;
 		try {
-			getUtxosRes = await this.electrum.getUtxos({
+			getUtxosRes = await electrum.getUtxos({
 				scanningStrategy,
 				addressIndex,
 				changeAddressIndex,
@@ -2769,6 +2775,9 @@ export class Wallet {
 		}
 		if (getUtxosRes.isErr()) {
 			return err(getUtxosRes.error.message);
+		}
+		if (this.electrum !== electrum) {
+			return err('The wallet switched networks while the UTXO scan ran.');
 		}
 		if (scanSeq < this._appliedScanSeq) {
 			return ok({ utxos: this._data.utxos, balance: this._data.balance });
