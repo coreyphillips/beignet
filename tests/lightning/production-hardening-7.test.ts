@@ -1534,8 +1534,8 @@ describe('Phase 4 — Agent API Ergonomics', () => {
 				'utf8'
 			);
 
-			// The handleInboundConnection should check inboundPeerCount
-			expect(pmSrc).to.include('inboundPeerCount >= this.maxInboundPeers');
+			// The handleInboundConnection should check the inbound count
+			expect(pmSrc).to.include('otherInbound >= this.maxInboundPeers');
 			expect(pmSrc).to.include('socket.destroy()');
 		});
 

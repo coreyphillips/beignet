@@ -1737,15 +1737,17 @@ export class PeerManager extends EventEmitter {
 				}
 				// The caps are applied here, once identity is known, and not
 				// on accept: a stranger holding every slot must not keep a
-				// channel peer from reconnecting. A connection this one
-				// replaces (newest wins, below) does not count against its
-				// address, or a stale socket would block its own redial.
+				// channel peer from reconnecting. An inbound connection this
+				// one replaces (newest wins, below) counts against neither
+				// cap, or a stale socket would block its own redial.
+				const otherInbound =
+					this.inboundPeerCount - (this.inboundPeerSet.has(pubkey) ? 1 : 0);
 				let fromAddress = 0;
 				for (const [other, key] of this.inboundAddressKeys) {
 					if (key === addressKey && other !== pubkey) fromAddress++;
 				}
 				if (
-					(this.inboundPeerCount >= this.maxInboundPeers ||
+					(otherInbound >= this.maxInboundPeers ||
 						(addressKey !== null &&
 							fromAddress >= this.maxInboundPeersPerAddress)) &&
 					!this.admitsPastInboundCap(pubkey)
