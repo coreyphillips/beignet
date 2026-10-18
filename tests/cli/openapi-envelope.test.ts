@@ -121,13 +121,22 @@ describe('Issue #1616: OpenAPI success schemas describe the envelope', () => {
 	});
 });
 
-function get(
+function request(
 	port: number,
-	route: string
+	route: string,
+	method = 'GET',
+	body?: unknown
 ): Promise<{ status: number; body: unknown }> {
 	return new Promise((resolve, reject) => {
-		http
-			.get({ hostname: '127.0.0.1', port, path: route }, (res) => {
+		const req = http.request(
+			{
+				hostname: '127.0.0.1',
+				port,
+				path: route,
+				method,
+				headers: { 'Content-Type': 'application/json' }
+			},
+			(res) => {
 				const chunks: Buffer[] = [];
 				res.on('data', (chunk: Buffer) => chunks.push(chunk));
 				res.on('end', () =>
@@ -136,8 +145,10 @@ function get(
 						body: JSON.parse(Buffer.concat(chunks).toString())
 					})
 				);
-			})
-			.on('error', reject);
+			}
+		);
+		req.on('error', reject);
+		req.end(body === undefined ? undefined : JSON.stringify(body));
 	});
 }
 
@@ -172,7 +183,7 @@ describe('Issue #1616: daemon replies validate against the spec', function () {
 	});
 
 	it('GET /peers: an array reply', async () => {
-		const res = await get(port, '/peers');
+		const res = await request(port, '/peers');
 		expect(res.status).to.equal(200);
 		expect(res.body).to.deep.equal({ ok: true, result: [] });
 		const schema = successSchema('/peers');
@@ -183,7 +194,7 @@ describe('Issue #1616: daemon replies validate against the spec', function () {
 	});
 
 	it('GET /info: an object reply', async () => {
-		const res = await get(port, '/info');
+		const res = await request(port, '/info');
 		expect(res.status).to.equal(200);
 		const body = res.body as { ok: unknown; result: Record<string, unknown> };
 		expect(body.ok).to.equal(true);
@@ -194,6 +205,28 @@ describe('Issue #1616: daemon replies validate against the spec', function () {
 		const bad = { ...body, result: { ...body.result, blockHeight: 'tip' } };
 		expect(validate(schema, bad)).to.deep.equal([
 			'$.result.blockHeight: expected integer, got string'
+		]);
+	});
+
+	// Issue #1625: the payload schema was { removed: 'boolean' }, a property
+	// name where a keyword belongs, so it constrained nothing.
+	it('DELETE /offer: the removal reply', async () => {
+		const created = await request(port, '/offer/create', 'POST', {
+			description: 'openapi removal'
+		});
+		expect(created.status).to.equal(200);
+		const { offerId } = (created.body as { result: { offerId: string } })
+			.result;
+		const res = await request(port, `/offer?offerId=${offerId}`, 'DELETE');
+		expect(res.status).to.equal(200);
+		expect(res.body).to.deep.equal({ ok: true, result: { removed: true } });
+		const schema = successSchema('/offer', 'delete');
+		expect(validate(schema, res.body)).to.deep.equal([]);
+		expect(
+			validate(schema, { ok: true, result: { removed: 'yes' } })
+		).to.deep.equal(['$.result.removed: expected boolean, got string']);
+		expect(validate(schema, { ok: true, result: {} })).to.deep.equal([
+			'$.result: missing removed'
 		]);
 	});
 });
