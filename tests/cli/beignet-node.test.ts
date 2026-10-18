@@ -1362,9 +1362,12 @@ describe('BeignetNode new methods', () => {
 
 		// Inherit the prototype so internal helpers (_broadcastRawTx) resolve.
 		// Object.create skips field initializers, so the send lock is set here.
-		const nodeWith = (wallet: unknown): BeignetNode =>
+		// The fake wallets hold no lock, so withSendLock hands back the fake.
+		const nodeWith = (wallet: object): BeignetNode =>
 			Object.assign(Object.create(BeignetNode.prototype), {
-				wallet,
+				wallet: Object.assign(wallet, {
+					withSendLock: (fn: (locked: object) => Promise<unknown>) => fn(wallet)
+				}),
 				_onchainSendLock: Promise.resolve()
 			}) as unknown as BeignetNode;
 
@@ -1437,7 +1440,7 @@ describe('BeignetNode new methods', () => {
 			const stagingWallet = (
 				failFor?: string
 			): {
-				wallet: unknown;
+				wallet: object;
 				gates: Array<() => void>;
 				broadcasts: string[][];
 			} => {
