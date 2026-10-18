@@ -2915,11 +2915,14 @@ export class Wallet {
 		// Read before the first await: a scan landing while the set write is
 		// queued replaces memory, and pairing this set with that scan's balance
 		// would split the stored pair if the scan's own set write were refused.
+		// The balance key too: a switchNetwork landing there would otherwise
+		// file this network's balance under the next network's key.
 		const { utxos, balance } = this._data;
+		const balanceKey = this.getWalletDataKey('balance');
 		const set = await this.saveWalletData('utxos', utxos);
 		const saved = set.isErr()
 			? set
-			: await this.saveWalletData('balance', balance);
+			: await this.saveWalletDataAt('balance', balanceKey, balance);
 		if (saved.isErr()) {
 			const refused = set.isErr() ? 'UTXO set' : "UTXO set's balance";
 			const message = `Failed to persist the ${refused}: ${saved.error.message}`;
@@ -3446,11 +3449,27 @@ export class Wallet {
 		key: TWalletDataKeys,
 		data: IWalletData[K]
 	): Promise<Result<string>> {
-		if (!this._setData) return ok('No setData method has been provided');
 		// Fixed now, not when the write's turn comes: switchNetwork moves the
 		// wallet to another network while a write may still be waiting, and
 		// that write carries the old network's data.
-		const walletDataKey = this.getWalletDataKey(key);
+		return this.saveWalletDataAt(key, this.getWalletDataKey(key), data);
+	}
+
+	/**
+	 * saveWalletData under a storage key the caller fixed earlier, for data
+	 * read before an await that a switchNetwork could land in.
+	 * @private
+	 * @param {TWalletDataKeys} key
+	 * @param {string} walletDataKey The storage key, from getWalletDataKey.
+	 * @param {IWalletData[K]} data
+	 * @returns {Promise<Result<string>>}
+	 */
+	private async saveWalletDataAt<K extends keyof IWalletData>(
+		key: TWalletDataKeys,
+		walletDataKey: string,
+		data: IWalletData[K]
+	): Promise<Result<string>> {
+		if (!this._setData) return ok('No setData method has been provided');
 		// With nothing queued for the key the write is issued in this same
 		// tick, so a stop() that follows the call cannot get in ahead of it.
 		const operation =
