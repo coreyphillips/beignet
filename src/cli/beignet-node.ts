@@ -1310,6 +1310,17 @@ const MAX_DIRECT_FUNDING_CHARGES = 1024;
  */
 const DEFAULT_L402_MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 
+const NETWORK_NAMES = ['mainnet', 'testnet', 'signet', 'regtest'] as const;
+type NetworkName = (typeof NETWORK_NAMES)[number];
+
+/** Typed `never` so a network missing from a converter's switch fails to compile. */
+function unknownNetwork(network: never): never {
+	throw new BeignetError(
+		'INVALID_PARAMS',
+		`unknown network '${String(network)}'`
+	);
+}
+
 const DEFAULT_ELECTRUM: Record<
 	string,
 	{ host: string; port: number; useTls: boolean }
@@ -2335,6 +2346,14 @@ export class BeignetNode extends EventEmitter {
 			throw new BeignetError(
 				'INVALID_PARAMS',
 				"network is required: 'mainnet', 'testnet', 'signet' or 'regtest'"
+			);
+		}
+		// JSON config, BEIGNET_NETWORK and CLI flags are not type checked, and
+		// the lock and database below are named after this value.
+		if (!NETWORK_NAMES.includes(opts.network)) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`unknown network '${opts.network}': expected 'mainnet', 'testnet', 'signet' or 'regtest'`
 			);
 		}
 		const mnemonic = opts.mnemonic || generateMnemonic();
@@ -15330,7 +15349,7 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Internal Helpers ───────────────
 
-	private toBeignetNetwork(network: string): EAvailableNetworks {
+	private toBeignetNetwork(network: NetworkName): EAvailableNetworks {
 		switch (network) {
 			case 'mainnet':
 				return EAvailableNetworks.bitcoin;
@@ -15341,11 +15360,11 @@ export class BeignetNode extends EventEmitter {
 			case 'signet':
 				return EAvailableNetworks.signet;
 			default:
-				return EAvailableNetworks.bitcoin;
+				return unknownNetwork(network);
 		}
 	}
 
-	private toLnNetwork(network: string): Network {
+	private toLnNetwork(network: NetworkName): Network {
 		switch (network) {
 			case 'mainnet':
 				return Network.MAINNET;
@@ -15356,11 +15375,11 @@ export class BeignetNode extends EventEmitter {
 			case 'signet':
 				return Network.SIGNET;
 			default:
-				return Network.MAINNET;
+				return unknownNetwork(network);
 		}
 	}
 
-	private toCoinType(network: string): number {
+	private toCoinType(network: NetworkName): number {
 		switch (network) {
 			case 'mainnet':
 				return LnCoinType.BITCOIN;
@@ -15371,7 +15390,7 @@ export class BeignetNode extends EventEmitter {
 			case 'signet':
 				return LnCoinType.SIGNET;
 			default:
-				return LnCoinType.BITCOIN;
+				return unknownNetwork(network);
 		}
 	}
 
