@@ -55,13 +55,13 @@ const electrumOptions = {
  * Err and leaves the stored value as it was.
  */
 const memoryStorage = (): {
-	storage: TStorage;
+	storage: Required<TStorage>;
 	store: Map<string, string>;
 	refused: Set<TWalletDataKeys>;
 } => {
 	const store = new Map<string, string>();
 	const refused = new Set<TWalletDataKeys>();
-	const storage: TStorage = {
+	const storage: Required<TStorage> = {
 		getData: async <K extends keyof IWalletData>(
 			key: string
 		): Promise<Result<IWalletData[K]>> => {
@@ -177,29 +177,46 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		expectReported('transaction');
 	});
 
-	it('fails a new receive address whose index cannot be saved, and does not hand it out', async function () {
+	it('fails a new receive address whose index cannot be saved, and does not issue it again', async function () {
 		const { storage, store, refused } = memoryStorage();
-		const wallet = await open(storage);
+		let writeOut = (): void => undefined;
+		const out = new Promise<void>((resolve) => (writeOut = resolve));
+		let release = (): void => undefined;
+		const released = new Promise<void>((resolve) => (release = resolve));
+		const wallet = await open({
+			...storage,
+			setData: async <K extends keyof IWalletData>(
+				key: string,
+				value: IWalletData[K]
+			): Promise<Result<boolean>> => {
+				if (refused.has('addressIndex') && key === storageKey('addressIndex')) {
+					writeOut();
+					await released;
+				}
+				return storage.setData(key, value);
+			}
+		});
 		const first = await wallet.generateNewReceiveAddress();
 		if (first.isErr()) throw first.error;
 		refused.add('addressIndex');
 
-		const second = await wallet.generateNewReceiveAddress();
+		const pending = wallet.generateNewReceiveAddress();
+		await out;
+		const served = await wallet.getReceiveAddress({});
+		if (served.isErr()) throw served.error;
+		release();
+		const second = await pending;
 
 		expect(second.isErr()).to.equal(true);
 		if (second.isOk()) return;
 		expect(second.error.message).to.contain('receive address index');
 		expectReported('addressIndex');
-		expect(wallet.data.addressIndex[wallet.addressType]).to.deep.equal(
-			first.value
-		);
-		const current = await wallet.getReceiveAddress({});
-		expect(current.isOk() && current.value).to.equal(first.value.address);
 
 		refused.clear();
 		const retried = await wallet.generateNewReceiveAddress();
 		if (retried.isErr()) throw retried.error;
-		expect(retried.value.index).to.equal(first.value.index + 1);
+		expect(retried.value.address).to.not.equal(served.value);
+		expect(retried.value.index).to.equal(first.value.index + 2);
 		const saved = stored(store, 'addressIndex') as IWalletData['addressIndex'];
 		expect(saved[wallet.addressType].index).to.equal(retried.value.index);
 	});
