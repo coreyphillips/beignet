@@ -35,6 +35,7 @@ import {
 	IGetAddress,
 	IGetAddressBalanceRes,
 	IGetAddressByPath,
+	IGetAddressHistoryResponse,
 	IGetAddressesFromPrivateKey,
 	IGetAddressResponse,
 	IGetFeeEstimatesResponse,
@@ -3637,10 +3638,16 @@ export class Wallet {
 			return ok(undefined);
 		}
 
+		// The history has an entry for every wallet address a transaction
+		// touches. Fetch each transaction once. Its last entry is the one kept,
+		// since that is whose address formatTransactions recorded when it was
+		// handed every copy.
+		const byTxHash = new Map<string, IGetAddressHistoryResponse>();
+		for (const entry of history.value) byTxHash.set(entry.tx_hash, entry);
 		// Filter out transactions that are already confirmed.
-		let filteredTxHashes = history.value;
+		let filteredTxHashes = [...byTxHash.values()];
 		if (!replaceStoredTransactions) {
-			filteredTxHashes = history.value.filter((tx) => {
+			filteredTxHashes = filteredTxHashes.filter((tx) => {
 				return !((this.data.transactions[tx.tx_hash]?.height ?? 0) >= 6);
 			});
 		}

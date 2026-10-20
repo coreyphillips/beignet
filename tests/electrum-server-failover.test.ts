@@ -2460,27 +2460,23 @@ describe('Electrum lifecycle and disconnect races', () => {
 		}
 	});
 
-	it('does not query the mempool after disconnect during the history batch delay', async () => {
+	it('stops a history scan before the next batch after disconnect', async () => {
 		await electrum.connectToElectrum({ servers: serverA });
 		await flush();
 		const history = sinon
 			.stub(electrumHelpers, 'getAddressScriptHashesHistory')
 			.resolves({ error: false, data: [] });
-		const mempool = sinon
-			.stub(electrumHelpers, 'getAddressScriptHashesMempool')
-			.resolves({ error: false, data: [] });
+		electrum.batchLimit = 1;
 		const clock = useFakeClock();
 		try {
 			const scan = electrum.getAddressHistory({
-				scriptHashes: [
-					{
-						scriptHash: 'aaaa',
-						index: 0,
-						path: '0',
-						address: '',
-						publicKey: ''
-					}
-				]
+				scriptHashes: ['aaaa', 'bbbb'].map((scriptHash, index) => ({
+					scriptHash,
+					index,
+					path: `${index}`,
+					address: '',
+					publicKey: ''
+				}))
 			});
 			await clock.tickAsync(0);
 			expect(history.callCount).to.equal(1);
@@ -2488,7 +2484,10 @@ describe('Electrum lifecycle and disconnect races', () => {
 			await clock.tickAsync(electrum.batchDelay * 2);
 
 			expect((await scan).isErr()).to.equal(true);
-			expect(mempool.callCount).to.equal(0);
+			expect(
+				history.callCount,
+				'a later helper call can reopen the socket'
+			).to.equal(1);
 			expect(electrum.connectedToElectrum).to.equal(false);
 		} finally {
 			clock.restore();
