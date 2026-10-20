@@ -28360,6 +28360,18 @@ export class LightningNode extends EventEmitter {
 				usableChannelWith: (peerHex) => this.usableChannelWith(peerHex),
 				spliceChangeDustFloorSat: (channelId) =>
 					this.getRawChannel(channelId)?.spliceInteractiveTxDustFloor() ?? null,
+				// The same balance and reserve the channel's own splice-in refusal
+				// reads in initiateSplice.
+				spliceReserveShortfallSat: (channelId, relativeSats) => {
+					const channel = this.getRawChannel(channelId);
+					if (!channel) return null;
+					const reserveSats = channel.spliceReserveWeKeepSats(
+						channel.getFundingSatoshis() + relativeSats
+					);
+					const postLocalSats =
+						channel.getBalances().localMsat / 1000n + relativeSats;
+					return postLocalSats < reserveSats ? reserveSats - postLocalSats : 0n;
+				},
 				spliceInFlightWith: (peerHex) => this.spliceInFlightWith(peerHex),
 				fundingPubkeys: (channelId) =>
 					this.getRawChannel(channelId)?.getFundingPubkeys() ?? null,

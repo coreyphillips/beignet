@@ -306,6 +306,18 @@ export interface IDfReceiverDeps {
 	 */
 	spliceChangeDustFloorSat?(channelId: Buffer): bigint | null;
 	/**
+	 * How many sats our balance on this channel would sit below the reserve
+	 * at the new capacity after a splice-in of `relativeSats`, 0 when it
+	 * clears it. A splice-in that keeps a change output is refused by the
+	 * channel while this is above 0 (BOLT 2, issue #423), so the quote declines
+	 * it before the ack (issue #1646). Optional, and null for an unknown
+	 * channel: the quote then leaves the rule to the channel.
+	 */
+	spliceReserveShortfallSat?(
+		channelId: Buffer,
+		relativeSats: bigint
+	): bigint | null;
+	/**
 	 * Is a splice with this peer still in flight (negotiating, or signed and
 	 * waiting on depth)? Issue #760: while one is, no second funding into that
 	 * peer is started, splice or open.

@@ -42,6 +42,7 @@ import { EventEmitter } from 'events';
 import * as bitcoin from 'bitcoinjs-lib';
 import type { ISpliceWalletInput } from '../../channel/channel';
 import {
+	estimateSpliceTxWeight,
 	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../../channel/splice-weight';
@@ -1291,27 +1292,35 @@ export class DirectFundingReceiver extends EventEmitter {
 		}
 
 		// 11d. The splice's quote, taken before anything is charged. A coin and
-		// fee ceiling that cannot carry the relay floor are known from the
-		// offer alone. Refused after the ack, they would cost the request an
-		// attempt and the coin its cooldown with nothing broadcast (issue
-		// #1647).
+		// fee ceiling that cannot carry the relay floor, or a change output the
+		// channel's reserve rule refuses, are known from the offer alone.
+		// Refused after the ack, they would cost the request an attempt and the
+		// coin its cooldown with nothing broadcast (issues #1647, #1646).
 		const spliceChannel = this.spliceTarget(paired, coinConfirmed, lsp);
 		let splice: IDfSpliceQuote | undefined;
 		if (spliceChannel) {
+			let feeratePerKw: number;
 			try {
-				splice = {
-					channelId: spliceChannel,
-					feeratePerKw: this.spliceFeerateFor(
-						offer,
-						offerIdHex,
-						spliceChannel,
-						liveSpliceFeeratePerKw
-					)
-				};
+				feeratePerKw = this.spliceFeerateFor(
+					offer,
+					offerIdHex,
+					spliceChannel,
+					liveSpliceFeeratePerKw
+				);
 			} catch (err) {
 				decline(errorText(err));
 				return;
 			}
+			const reserveRefusal = this.spliceReserveRefusal(
+				offer,
+				spliceChannel,
+				feeratePerKw
+			);
+			if (reserveRefusal) {
+				decline(reserveRefusal);
+				return;
+			}
+			splice = { channelId: spliceChannel, feeratePerKw };
 		}
 
 		const outpoint = outpointKey(txidHex, offer.vout);
@@ -2157,15 +2166,7 @@ export class DirectFundingReceiver extends EventEmitter {
 			),
 			MAX_SPLICE_FEERATE_PERKW
 		);
-		// Never under the generic floor, whatever the host reports: the
-		// channel's own floor is at least that.
-		const reportedFloor = this.deps.spliceChangeDustFloorSat?.(channelId);
-		const dustFloorSat =
-			reportedFloor !== null &&
-			reportedFloor !== undefined &&
-			reportedFloor > DUST_LIMIT_SATS
-				? reportedFloor
-				: DUST_LIMIT_SATS;
+		const dustFloorSat = this.spliceChangeDustFloor(channelId);
 		const ceiling = spliceFeerateCeiling({
 			valueSat: offer.valueSat,
 			amountSat: offer.amountSat,
@@ -2190,6 +2191,50 @@ export class DirectFundingReceiver extends EventEmitter {
 			feeSat: spliceFeeSats(ceiling.weight, feeratePerKw).toString()
 		});
 		return feeratePerKw;
+	}
+
+	/** The smallest change output a splice on this channel keeps. */
+	private spliceChangeDustFloor(channelId: Buffer): bigint {
+		// Never under the generic floor, whatever the host reports: the
+		// channel's own floor is at least that.
+		const reportedFloor = this.deps.spliceChangeDustFloorSat?.(channelId);
+		return reportedFloor !== null &&
+			reportedFloor !== undefined &&
+			reportedFloor > DUST_LIMIT_SATS
+			? reportedFloor
+			: DUST_LIMIT_SATS;
+	}
+
+	/**
+	 * Why the channel would refuse this splice under BOLT 2's reserve rule,
+	 * or null (issue #1646). A change output the channel keeps is a
+	 * non-funding output, which it refuses at initiation and at the
+	 * tx_complete audit while our balance after the splice is under the
+	 * reserve at the new capacity (issue #423). A change under the dust floor
+	 * becomes fee and leaves the rule unarmed.
+	 */
+	private spliceReserveRefusal(
+		offer: IDfOffer,
+		channelId: Buffer,
+		feeratePerKw: number
+	): string | null {
+		const shortfall = this.deps.spliceReserveShortfallSat?.(
+			channelId,
+			offer.amountSat
+		);
+		if (shortfall === null || shortfall === undefined || shortfall <= 0n) {
+			return null;
+		}
+		const feeSat = spliceFeeSats(
+			estimateSpliceTxWeight({
+				walletInputCount: 1,
+				changeScriptLen: offer.changeScript.length
+			}),
+			feeratePerKw
+		);
+		const changeSat = offer.valueSat - offer.amountSat - feeSat;
+		if (changeSat < this.spliceChangeDustFloor(channelId)) return null;
+		return `the payer's ${changeSat} sat change output would leave our channel balance ${shortfall} sat under its reserve after this splice; pay the address`;
 	}
 
 	/**
