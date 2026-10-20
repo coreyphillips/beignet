@@ -9,6 +9,7 @@ import { expect } from 'chai';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getOpenApiSpec } from '../../src/cli/openapi';
+import { daemonRouteKeys } from './helpers/daemon-routes';
 
 describe('OpenAPI Spec Completeness', () => {
 	const raw = getOpenApiSpec();
@@ -36,32 +37,11 @@ describe('OpenAPI Spec Completeness', () => {
 
 	// ─────────────── Route Coverage ───────────────
 
-	// Every route key in daemon.ts source, read the same way as the scope and
-	// CLI-parity drift tests, so a route added to the daemon fails here until
-	// the spec describes it. Covers the routes dispatched outside the routes map
-	// (/stop, /events, /metrics) because their keys are literals there too.
-	function daemonRouteKeys(): string[] {
-		const daemonSrc = fs.readFileSync(
-			path.join(__dirname, '../../src/cli/daemon.ts'),
-			'utf8'
-		);
-		const keys = new Set<string>();
-		const re = /'((?:GET|POST|DELETE) \/[^']+)'/g;
-		let m: RegExpExecArray | null;
-		while ((m = re.exec(daemonSrc)) !== null) {
-			keys.add(m[1]);
-		}
-		return [...keys];
-	}
-
 	// The document does not list the route that serves it.
 	const UNDOCUMENTED_ROUTES = new Set(['GET /openapi.json']);
 
 	it('documents every daemon route with its method', () => {
-		const routeKeys = daemonRouteKeys();
-		// A scan that stops matching must not pass by finding nothing.
-		expect(routeKeys).to.include('GET /info');
-		const missing = routeKeys.filter((key) => {
+		const missing = [...daemonRouteKeys()].filter((key) => {
 			if (UNDOCUMENTED_ROUTES.has(key)) return false;
 			const [method, routePath] = key.split(' ');
 			return !spec.paths[routePath]?.[method.toLowerCase()];
@@ -69,6 +49,19 @@ describe('OpenAPI Spec Completeness', () => {
 		expect(
 			missing,
 			`daemon routes missing from src/cli/openapi.ts: ${missing.join(', ')}`
+		).to.deep.equal([]);
+	});
+
+	it('documents no operation the daemon does not serve', () => {
+		const routeKeys = daemonRouteKeys();
+		const stale = Object.entries(spec.paths).flatMap(([routePath, ops]) =>
+			Object.keys(ops)
+				.map((method) => `${method.toUpperCase()} ${routePath}`)
+				.filter((key) => !routeKeys.has(key))
+		);
+		expect(
+			stale,
+			`src/cli/openapi.ts operations with no daemon route: ${stale.join(', ')}`
 		).to.deep.equal([]);
 	});
 
