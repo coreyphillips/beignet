@@ -61,6 +61,7 @@ import {
 	decodeStfuMessage,
 	encodeStfuMessage
 } from '../../src/lightning/message/stfu';
+import { QuiescenceState } from '../../src/lightning/channel/quiescence';
 import { decodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
 import { decodeErrorMessage } from '../../src/lightning/message/error';
 import {
@@ -9834,6 +9835,89 @@ describe('Splice', function () {
 			);
 			expect(sent, 'the echo is not answered').to.deep.equal([]);
 			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('leaves peer-owned quiescence when it refuses tx_init_rbf with nothing to replace, so HTLC traffic resumes (issue #1733)', function () {
+			const {
+				openerManager,
+				acceptorManager,
+				openerChannel,
+				acceptorPubkey,
+				channelId
+			} = createNormalChannelPair();
+			openerManager.removeAllListeners('message:outbound');
+			acceptorManager.removeAllListeners('message:outbound');
+			const sent: number[] = [];
+			openerManager.on('message:outbound', (pk, type) => {
+				if (pk === acceptorPubkey) sent.push(type);
+			});
+			const ended: string[] = [];
+			openerManager.on('quiescence:ended', (id: string) => ended.push(id));
+
+			openerManager.handleMessage(
+				acceptorPubkey,
+				MessageType.STFU,
+				encodeStfuMessage({ channelId, initiator: true })
+			);
+			expect(openerChannel.isQuiescent()).to.equal(true);
+			expect(openerChannel.isQuiescenceInitiator()).to.equal(false);
+			openerManager.handleMessage(
+				acceptorPubkey,
+				MessageType.TX_INIT_RBF,
+				encodeTxInitRbfMessage({
+					channelId,
+					locktime: 0,
+					feerate: 2000,
+					fundingOutputContribution: 0n
+				})
+			);
+			expect(sent).to.deep.equal([MessageType.STFU, MessageType.TX_ABORT]);
+			expect(ended).to.deep.equal([channelId.toString('hex')]);
+			expect(openerChannel.isQuiescent()).to.equal(false);
+			expect(openerChannel.getFullState().quiescenceState).to.equal(
+				QuiescenceState.NORMAL
+			);
+			expect(openerChannel.getFullState().quiescenceInitiator).to.equal(false);
+			sent.length = 0;
+
+			openerManager.handleMessage(
+				acceptorPubkey,
+				MessageType.TX_ABORT,
+				encodeTxAbortMessage({ channelId, data: Buffer.alloc(0) })
+			);
+			expect(sent, 'the echo is not answered').to.deep.equal([]);
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(
+				openerManager.addHtlc(
+					channelId,
+					15_000_000n,
+					crypto.randomBytes(32),
+					500000,
+					crypto.randomBytes(1366)
+				).ok,
+				'HTLC accepted after the refusal'
+			).to.equal(true);
+			expect(sent).to.include(MessageType.UPDATE_ADD_HTLC);
+		});
+
+		it('keeps its own quiescence when it refuses tx_init_rbf with nothing to replace (issue #1733)', function () {
+			const { openerManager, acceptorManager, openerChannel, channelId } =
+				createNormalChannelPair();
+			openerManager.initiateQuiescence(channelId);
+			expect(openerChannel.isQuiescent()).to.equal(true);
+			expect(openerChannel.isQuiescenceInitiator()).to.equal(true);
+			openerManager.removeAllListeners('message:outbound');
+			acceptorManager.removeAllListeners('message:outbound');
+
+			const actions = openerChannel.handleTxInitRbf({
+				channelId,
+				locktime: 0,
+				feerate: 2000,
+				fundingOutputContribution: 0n
+			});
+			expect(findSendAction(actions, MessageType.TX_ABORT)).to.exist;
+			expect(openerChannel.isQuiescent()).to.equal(true);
+			expect(openerChannel.isQuiescenceInitiator()).to.equal(true);
 		});
 
 		it('refuses a start_batch larger than two during pending-lock before collecting any of it (issue #765)', function () {

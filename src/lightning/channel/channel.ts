@@ -22865,8 +22865,14 @@ export class Channel {
 		const session = this._state.dualFundingSession;
 		if (!session) {
 			// The local error alone never reaches the wire, and BOLT 2 owes the
-			// peer a tx_ack_rbf or tx_abort.
+			// peer a tx_ack_rbf or tx_abort. A peer that quiesced to ask has
+			// nothing left to do in the session, and the echo of our abort is
+			// swallowed without touching quiescence, so leave it here or updates
+			// stay frozen. A session we own is left to whatever we quiesced for.
+			const peerQuiesced =
+				this._quiescence.isQuiescent() && !this._quiescence.isInitiator();
 			return [
+				...(peerQuiesced ? this.exitQuiescence() : []),
 				this._txAbort(
 					this._state.channelId ?? msg.channelId,
 					'no transaction to replace'
