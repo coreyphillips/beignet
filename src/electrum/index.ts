@@ -1383,7 +1383,20 @@ export class Electrum {
 			const addressIndexes = currentWallet.addressIndex;
 			const changeAddressIndexes = currentWallet.changeAddressIndex;
 
-			if (scriptHashes.length < 1) {
+			// One request per script hash: a UTXO's address is usually also in
+			// the gap limit window, and the first entry seen is kept.
+			const toScan = new Map<string, IAddress>();
+			const addToScan = (list: IAddress[]): void => {
+				for (const entry of list) {
+					if (!toScan.has(entry.scriptHash))
+						toScan.set(entry.scriptHash, entry);
+				}
+			};
+
+			if (scriptHashes.length > 0) {
+				addToScan(scriptHashes);
+			} else {
+				addToScan(currentWallet.utxos);
 				const addressTypeKeys = this._wallet.addressTypesToMonitor;
 				addressTypeKeys.forEach((addressType) => {
 					const addresses = currentAddresses[addressType];
@@ -1413,20 +1426,11 @@ export class Electrum {
 							change: true
 						});
 					}
-					const utxoScriptHashes: IAddress[] = currentWallet.utxos;
-
-					scriptHashes = [
-						...utxoScriptHashes,
-						...scriptHashes,
-						...addressValues,
-						...changeAddressValues
-					];
+					addToScan(addressValues);
+					addToScan(changeAddressValues);
 				});
 			}
-			// remove items with same path
-			scriptHashes = scriptHashes.filter((sh, index, arr) => {
-				return index === arr.findIndex((v) => sh.path === v.path);
-			});
+			scriptHashes = [...toScan.values()];
 			if (scriptHashes.length < 1) {
 				return err('No scriptHashes available to check.');
 			}
@@ -1442,16 +1446,10 @@ export class Electrum {
 					key: 'scriptHash',
 					data: chunk
 				};
+				// get_history already lists unconfirmed entries (height 0 or -1),
+				// so get_mempool would only repeat them.
 				promises.push(
 					electrum.getAddressScriptHashesHistory({
-						scriptHashes: payload,
-						network: this.electrumNetwork
-					})
-				);
-				await sleep(this.batchDelay);
-				if (this._disconnected) return err(DISCONNECTED_ERROR);
-				promises.push(
-					electrum.getAddressScriptHashesMempool({
 						scriptHashes: payload,
 						network: this.electrumNetwork
 					})

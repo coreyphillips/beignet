@@ -302,9 +302,6 @@ describe('Wallet.create while storage is still loading (issue #1615)', function 
 		sinon
 			.stub(electrumHelpers, 'getAddressScriptHashesHistory')
 			.callsFake(never);
-		sinon
-			.stub(electrumHelpers, 'getAddressScriptHashesMempool')
-			.callsFake(never);
 
 		const creating = Wallet.create({
 			mnemonic: MNEMONIC,
