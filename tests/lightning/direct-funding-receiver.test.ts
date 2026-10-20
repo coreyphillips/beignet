@@ -3597,6 +3597,38 @@ describe('Direct funding receiver: live splice feerate (issue #763)', () => {
 		h.engine.stop();
 	});
 
+	it('refuses a ceiling under the relay floor without charging the request or holding the coin (issue #1647)', async () => {
+		const h = spliceHarness({}, { maxTotalFeeSat: 100n });
+		h.node.feeSatPerVbyte = 10;
+		await h.sendOffer();
+		const acks = h.acks();
+		expect(acks).to.have.length(1);
+		expect(acks[0].accepted).to.equal(false);
+		expect(acks[0].reason).to.contain('under the 253 sat/kw relay floor');
+		expect(
+			h.node.requests.attemptsFor(h.offer.receiptHash.toString('hex')).attempts
+		).to.equal(0);
+
+		// The same coin, offered to another request, is not on a cooldown.
+		const other = new FakePayerLane(
+			h.node.mintRequest(),
+			'other-lane',
+			'payer-node-id'
+		);
+		h.engine.handleFrame(
+			other.offerFrame(
+				buildOffer(other.requestRecord, h.coin, {
+					amountSat: 60_000n,
+					maxTotalFeeSat: 50_000n
+				})
+			)
+		);
+		await flush();
+		expect(decodeDfOfferAck(other.bodiesOf(ACK)[0]).accepted).to.equal(true);
+		expect(h.node.splices).to.have.length(1);
+		h.engine.stop();
+	});
+
 	it('uses a pinned feerate as given, without asking the estimator', async () => {
 		const h = spliceHarness(
 			{ spliceFeeratePerKw: 700 },
