@@ -540,6 +540,19 @@ export type TMessageDataMap = {
 	reorg: IUtxo[];
 	rbf: string[];
 	connectedToElectrum: boolean; // True if connected, false if disconnected.
+	storageWriteFailed: TStorageWriteFailure;
+};
+
+/**
+ * A write the storage adapter refused or threw on. Sent for every such write,
+ * including those whose method also returns the error: storage still holds
+ * the value from before, and the next start loads it.
+ */
+export type TStorageWriteFailure = {
+	key: TWalletDataKeys;
+	/** The key handed to setData, which names the wallet and network. */
+	storageKey: string;
+	error: string;
 };
 
 export type TTransactionMessage = {

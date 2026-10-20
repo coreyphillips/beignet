@@ -1246,9 +1246,13 @@ export class Wallet {
 		if (res.isErr()) return err(res.error.message);
 		// No id found, it is safe to save to storage.
 		if (!res.value) {
-			// Save id to storage.
+			// Save id to storage. Without it the next wallet created under this
+			// name finds no id either, and writes over this one's data.
 			this._data.id = id;
-			await this.saveWalletData('id', id);
+			const saved = await this.saveWalletData('id', id);
+			if (saved.isErr()) {
+				return err(`Unable to save the wallet id: ${saved.error.message}`);
+			}
 			return ok('Saved ID to storage.');
 		}
 		// If the ID saved in storage does not match return an error and notify the developer.
@@ -2685,10 +2689,7 @@ export class Wallet {
 
 			// Check if the next address index already exists or if it needs to be generated.
 			if (nextAddressIndex) {
-				// Update addressIndex and return the address content.
-				this._data.addressIndex[addressType] = nextAddressIndex;
-				await this.saveWalletData('addressIndex', this._data.addressIndex);
-				return ok(nextAddressIndex);
+				return this.issueReceiveAddress(addressType, nextAddressIndex);
 			}
 
 			// We need to generate, save and return the new address.
@@ -2731,12 +2732,37 @@ export class Wallet {
 							: this.gapLimitOptions.lookAheadChange
 				});
 			}
-			this._data.addressIndex[addressType] = addressIndex;
-			await this.saveWalletData('addressIndex', this._data.addressIndex);
-			return ok(addressIndex);
+			return this.issueReceiveAddress(addressType, addressIndex);
 		} catch (e) {
 			return err(e);
 		}
+	}
+
+	/**
+	 * Moves the receive index to `next` and saves it, failing if storage
+	 * refuses the write. The index stays moved even then: getReceiveAddress
+	 * may already have served `next` while the write was out, and moving back
+	 * would issue it again.
+	 * @private
+	 * @param {EAddressType} addressType
+	 * @param {IAddress} next
+	 * @returns {Promise<Result<IAddress>>}
+	 */
+	private async issueReceiveAddress(
+		addressType: EAddressType,
+		next: IAddress
+	): Promise<Result<IAddress>> {
+		this._data.addressIndex[addressType] = next;
+		const saved = await this.saveWalletData(
+			'addressIndex',
+			this._data.addressIndex
+		);
+		if (saved.isErr()) {
+			return err(
+				`Failed to persist the receive address index: ${saved.error.message}`
+			);
+		}
+		return ok(next);
 	}
 
 	/**
@@ -3288,7 +3314,11 @@ export class Wallet {
 		} else {
 			this._data.addressLabels[address] = label;
 		}
-		await this.saveWalletData('addressLabels', this._data.addressLabels);
+		const saved = await this.saveWalletData(
+			'addressLabels',
+			this._data.addressLabels
+		);
+		if (saved.isErr()) return err(saved.error.message);
 		return ok(label === '' ? 'Label removed.' : 'Label saved.');
 	}
 
@@ -3539,13 +3569,13 @@ export class Wallet {
 			this.waitingWrites[key] = next;
 			operation = this.savingOperations[key].then(() => {
 				if (this.waitingWrites[key] === next) delete this.waitingWrites[key];
-				return this.writeWalletData(next.walletDataKey, next.data);
+				return this.writeWalletData(key, next.walletDataKey, next.data);
 			});
 			this.savingOperations[key] = operation;
 		} else {
 			// With nothing queued for the key the write is issued in this same
 			// tick, so a stop() that follows the call cannot get in ahead of it.
-			operation = this.writeWalletData(walletDataKey, data);
+			operation = this.writeWalletData(key, walletDataKey, data);
 			this.savingOperations[key] = operation;
 		}
 		const saved = await operation;
@@ -3559,15 +3589,22 @@ export class Wallet {
 	/**
 	 * Hands one write to the storage adapter, for saveWalletData once the
 	 * write's turn has come. Never rejects.
+	 *
+	 * A refusal is reported to onMessage here, once per write the adapter
+	 * made, because many writers have no caller to answer to: refresh steps,
+	 * startup and background updates.
 	 * @private
+	 * @param {TWalletDataKeys} key
 	 * @param {string} walletDataKey The storage key, fixed when the write was issued.
 	 * @param {IWalletData[K]} data
 	 * @returns {Promise<Result<string>>}
 	 */
 	private async writeWalletData<K extends keyof IWalletData>(
+		key: TWalletDataKeys,
 		walletDataKey: string,
 		data: IWalletData[K]
 	): Promise<Result<string>> {
+		let cause: string;
 		try {
 			// stop() clears the adapter on purpose, so that work it walked away
 			// from cannot write after it. A write still waiting its turn then
@@ -3580,15 +3617,27 @@ export class Wallet {
 			const res = await this._setData(walletDataKey, data);
 			// Adapters written in JS may resolve something that is not a
 			// Result at all; only an explicit Err counts as a failure.
-			if (typeof res?.isErr === 'function' && res.isErr()) {
-				return err(
-					`Error saving wallet data for ${walletDataKey}: ${res.error.message}`
-				);
+			if (!(typeof res?.isErr === 'function' && res.isErr())) {
+				return ok(`${walletDataKey} data saved successfully`);
 			}
-			return ok(`${walletDataKey} data saved successfully`);
+			cause = res.error.message;
 		} catch (error) {
-			return err(`Error saving wallet data for ${walletDataKey}: ${error}`);
+			cause = `${error}`;
 		}
+		// An adapter that throws synchronously lands here before saveWalletData
+		// has registered this write. A listener that saves again has to find it
+		// registered, or its write skips the queue and can land after a newer one.
+		await Promise.resolve();
+		try {
+			this.sendMessage('storageWriteFailed', {
+				key,
+				storageKey: walletDataKey,
+				error: cause
+			});
+		} catch {
+			// A listener that throws must not make this write reject.
+		}
+		return err(`Error saving wallet data for ${walletDataKey}: ${cause}`);
 	}
 
 	//TODO: Implement this as a way to better update and save state so we can consolidate this.data[key] updates.
@@ -4415,10 +4464,11 @@ export class Wallet {
 				...unconfirmedTransactions
 			};
 
-			await this.saveWalletData(
+			const saved = await this.saveWalletData(
 				'unconfirmedTransactions',
 				this._data.unconfirmedTransactions
 			);
+			if (saved.isErr()) return err(saved.error.message);
 			return ok('Successfully updated unconfirmed transactions.');
 		} catch (e) {
 			this.logger.error('Failed to update unconfirmed transactions.', e);
@@ -6403,12 +6453,13 @@ export class Wallet {
 	/**
 	 * Deletes a given on-chain transaction by id.
 	 * @param {string} txid
+	 * @returns {Promise<Result<string>>} Err naming the refused write.
 	 */
 	async deleteOnChainTransactionById({
 		txid
 	}: {
 		txid: string;
-	}): Promise<void> {
+	}): Promise<Result<string>> {
 		const transactions = this._data.transactions;
 		const unconfirmed = this._data.unconfirmedTransactions;
 		if (txid in transactions) {
@@ -6419,8 +6470,17 @@ export class Wallet {
 		}
 		// No longer observed, so a count of its misses is over (issue #935).
 		this._noTxindexMisses.delete(txid);
-		await this.saveWalletData('transactions', transactions);
-		await this.saveWalletData('unconfirmedTransactions', unconfirmed);
+		const saved = await this.saveWalletData('transactions', transactions);
+		// Storage still holds the record, so it must keep the unconfirmed copy
+		// that watches it as well. Without that copy the record is back after a
+		// restart and nothing checks it again (#940).
+		if (saved.isErr()) return err(saved.error.message);
+		const savedUnconfirmed = await this.saveWalletData(
+			'unconfirmedTransactions',
+			unconfirmed
+		);
+		if (savedUnconfirmed.isErr()) return err(savedUnconfirmed.error.message);
+		return ok(`Deleted transaction ${txid}.`);
 	}
 
 	/**
@@ -6429,13 +6489,23 @@ export class Wallet {
 	 * sets it back to true (issue #945). One whose lookup was already in flight
 	 * leaves it false and does not watch it again (issue #964).
 	 * @param {string} txid
+	 * @returns {Promise<Result<string>>}
 	 */
-	async addGhostTransaction({ txid }: { txid: string }): Promise<void> {
+	async addGhostTransaction({
+		txid
+	}: {
+		txid: string;
+	}): Promise<Result<string>> {
 		if (txid in this._data.transactions) {
 			this._data.transactions[txid].exists = false;
 			this._ghostClearings.set(txid, (this._ghostClearings.get(txid) ?? 0) + 1);
 		}
-		await this.saveWalletData('transactions', this._data.transactions);
+		const saved = await this.saveWalletData(
+			'transactions',
+			this._data.transactions
+		);
+		if (saved.isErr()) return err(saved.error.message);
+		return ok(`Marked transaction ${txid} as gone.`);
 	}
 
 	/**
@@ -6563,14 +6633,17 @@ export class Wallet {
 			};
 
 			// Only delete the old transaction if it was an RBF
-			if (type === EBoostType.rbf) {
-				await this.deleteOnChainTransactionById({ txid: oldTxId });
-			}
+			const deleted =
+				type === EBoostType.rbf
+					? await this.deleteOnChainTransactionById({ txid: oldTxId })
+					: undefined;
 
-			await this.saveWalletData(
+			const saved = await this.saveWalletData(
 				'boostedTransactions',
 				this._data.boostedTransactions
 			);
+			if (deleted?.isErr()) return err(deleted.error.message);
+			if (saved.isErr()) return err(saved.error.message);
 			return ok(boostedTx);
 		} catch (e) {
 			return err(e);
