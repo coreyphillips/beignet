@@ -605,7 +605,11 @@ describe('Daemon: updateChannelFee route', () => {
 					}
 				);
 
-				expect(resp.status).to.equal(200);
+				expect(resp.status).to.equal(409);
+				expect(resp.body.ok).to.be.false;
+				expect((resp.body.error as { code: string }).code).to.equal(
+					'UPDATE_FEE_FAILED'
+				);
 
 				const resp2 = await httpRequest(
 					addr.port,
@@ -628,7 +632,11 @@ describe('Daemon: updateChannelFee route', () => {
 						feeratePerKw: 500
 					}
 				);
-				expect(resp3.status).to.equal(200);
+				expect(resp3.status).to.equal(409);
+				expect(resp3.body.ok).to.be.false;
+				expect((resp3.body.error as { code: string }).code).to.equal(
+					'UPDATE_FEE_FAILED'
+				);
 			} finally {
 				await node.destroy();
 				server.close();
