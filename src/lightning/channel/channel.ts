@@ -22834,7 +22834,27 @@ export class Channel {
 		// tx_abort (the channel itself is unaffected) instead of a generic
 		// error the peer cannot interpret.
 		if (this._spliceSession && !this._spliceSession.isComplete()) {
+			// BOLT 2: a splice tx_init_rbf comes only while quiescent and only
+			// from the quiescence initiator (not necessarily the splice
+			// initiator). A violation earns a warning and disconnect or an
+			// error that fails the channel; there is no warning-plus-disconnect
+			// action, so the channel fails, as on the zero-conf arm above.
+			if (!this._quiescence.isQuiescent()) {
+				return this._failChannelWithWireError(
+					'splice tx_init_rbf while not quiescent'
+				);
+			}
+			if (this._quiescence.isInitiator()) {
+				return this._failChannelWithWireError(
+					'splice tx_init_rbf from the quiescence non-initiator'
+				);
+			}
+			// On a signed splice the peer quiesced only to ask, and leaves the
+			// session on our tx_abort: leave it here too, or updates stay
+			// frozen until the quiescence watchdog fires. Before both
+			// tx_signatures the quiescence belongs to the splice negotiation.
 			return [
+				...(this.isSplicePendingLock() ? this.exitQuiescence() : []),
 				this._txAbort(
 					this._state.channelId ?? msg.channelId,
 					'splice RBF not supported'
@@ -22844,7 +22864,13 @@ export class Channel {
 
 		const session = this._state.dualFundingSession;
 		if (!session) {
+			// The local error alone never reaches the wire, and BOLT 2 owes the
+			// peer a tx_ack_rbf or tx_abort.
 			return [
+				this._txAbort(
+					this._state.channelId ?? msg.channelId,
+					'no transaction to replace'
+				),
 				{ type: ChannelActionType.ERROR, message: 'No dual-funding session' }
 			];
 		}
