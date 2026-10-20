@@ -1928,4 +1928,57 @@ describe('a reorg repair that storage refuses (issue #870)', function () {
 		expect(stored('transactions')[TXID].height).to.equal(0);
 		expect(stored('transactions')[OTHER_TXID].exists).to.equal(false);
 	});
+
+	it('keeps observing a transaction whose deletion was refused (issue #1735)', async function () {
+		await seed({ [TXID]: mempoolRecord() }, { [TXID]: mempoolRecord() });
+		failMainWrite.on = true;
+		const deleted = await wallet.deleteOnChainTransactionById({ txid: TXID });
+		expect(deleted.isErr(), 'the deletion reports the write it lost').to.equal(
+			true
+		);
+
+		answerWith(txAnswer(0));
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isOk(), 'the check ran').to.equal(true);
+		expect(
+			stored('unconfirmedTransactions')[TXID]?.height,
+			'the check keeps the copy watching the stored record'
+		).to.equal(0);
+
+		await restart();
+		expect(wallet.transactions[TXID], 'the record is back').to.not.equal(
+			undefined
+		);
+		expect(
+			wallet.getUnconfirmedTransactions()[TXID]?.height,
+			'and still observed'
+		).to.equal(0);
+	});
+
+	it('keeps counting the misses of a transaction whose deletion was refused (issue #1735)', async function () {
+		await seed({ [TXID]: mempoolRecord() }, { [TXID]: mempoolRecord() });
+		answerWith(txAnswer(undefined, { code: 2, message: NO_TXINDEX_MISS }));
+		const rescan = stubRescan();
+		await wallet.checkUnconfirmedTransactions();
+
+		failMainWrite.on = true;
+		const deleted = await wallet.deleteOnChainTransactionById({ txid: TXID });
+		expect(deleted.isErr()).to.equal(true);
+
+		failMainWrite.on = false;
+		wallet.data.header = { height: TIP + 2, hash: '', hex: '' };
+		const res = await wallet.checkUnconfirmedTransactions();
+		expect(res.isOk(), 'the check ran').to.equal(true);
+
+		expect(
+			sent('rbf'),
+			'the miss is final two blocks after the first, not counted afresh'
+		).to.have.length(1);
+		expect(rescan.callCount).to.equal(1);
+		expect(
+			stored('transactions')[TXID],
+			'and the deletion lands with its write'
+		).to.equal(undefined);
+		expect(stored('unconfirmedTransactions')[TXID]).to.equal(undefined);
+	});
 });

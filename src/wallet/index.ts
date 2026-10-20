@@ -6461,20 +6461,22 @@ export class Wallet {
 		txid: string;
 	}): Promise<Result<string>> {
 		const transactions = this._data.transactions;
-		const unconfirmed = this._data.unconfirmedTransactions;
 		if (txid in transactions) {
 			delete transactions[txid];
 		}
+		const saved = await this.saveWalletData('transactions', transactions);
+		// Storage still holds the record, so it must keep the unconfirmed copy
+		// that watches it as well, and so must memory, which the next check
+		// writes over the stored copy. Without that copy the record is back
+		// after a restart and nothing checks it again (#940, #1735).
+		if (saved.isErr()) return err(saved.error.message);
+		// Read after the write, since a check may have replaced the map.
+		const unconfirmed = this._data.unconfirmedTransactions;
 		if (txid in unconfirmed) {
 			delete unconfirmed[txid];
 		}
 		// No longer observed, so a count of its misses is over (issue #935).
 		this._noTxindexMisses.delete(txid);
-		const saved = await this.saveWalletData('transactions', transactions);
-		// Storage still holds the record, so it must keep the unconfirmed copy
-		// that watches it as well. Without that copy the record is back after a
-		// restart and nothing checks it again (#940).
-		if (saved.isErr()) return err(saved.error.message);
 		const savedUnconfirmed = await this.saveWalletData(
 			'unconfirmedTransactions',
 			unconfirmed
