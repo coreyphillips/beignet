@@ -674,4 +674,26 @@ describe('Wallet address map writes on refresh (#1655)', function () {
 			GAP_LIMIT
 		);
 	});
+
+	it('writes the map on the next refresh when a new receive address failed to save', async () => {
+		// Indexes 1 to GAP_LIMIT - 1 are already stored, so only the last
+		// call generates an address.
+		for (let i = 1; i < GAP_LIMIT; i++) {
+			const res = await wallet.generateNewReceiveAddress();
+			if (res.isErr()) throw res.error;
+		}
+		mapWrites = [];
+		failAddressWrites = true;
+		const issued = await wallet.generateNewReceiveAddress();
+		if (issued.isErr()) throw issued.error;
+		expect(issued.value.index).to.equal(GAP_LIMIT);
+		expect(countOf(addressesKey), 'the failed write').to.equal(1);
+
+		failAddressWrites = false;
+		await refresh();
+		expect(countOf(addressesKey), 'the retry').to.equal(1);
+		expect(storedIndexes(addressesKey, wallet.addressType)).to.include(
+			GAP_LIMIT
+		);
+	});
 });

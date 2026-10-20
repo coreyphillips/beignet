@@ -2243,8 +2243,9 @@ export class Wallet {
 		}
 	}
 
-	// The address maps getNextAvailableAddress grew and has not saved yet.
-	// Each map holds every address type, so saving one that did not grow
+	// The address maps storage may hold an older copy of: grown by
+	// getNextAvailableAddress and not saved yet, or whose last write failed.
+	// Each map holds every address type, so saving one that is not marked
 	// only writes storage the bytes it already has.
 	private unsavedAddressMaps = new Set<'addresses' | 'changeAddresses'>();
 
@@ -2276,12 +2277,22 @@ export class Wallet {
 	private async saveGrownAddressMaps(): Promise<void> {
 		const keys = [...this.unsavedAddressMaps];
 		this.unsavedAddressMaps.clear();
-		await Promise.all(
-			keys.map(async (key) => {
-				const saved = await this.saveWalletData(key, this._data[key]);
-				if (saved.isErr()) this.unsavedAddressMaps.add(key);
-			})
-		);
+		await Promise.all(keys.map((key) => this.saveAddressMap(key)));
+	}
+
+	/**
+	 * Saves one address map, and marks it when the write fails so the next
+	 * gap scan saves it again. Nothing else rewrites a map that has not grown.
+	 * @private
+	 * @async
+	 * @param {'addresses' | 'changeAddresses'} key
+	 * @returns {Promise<void>}
+	 */
+	private async saveAddressMap(
+		key: 'addresses' | 'changeAddresses'
+	): Promise<void> {
+		const saved = await this.saveWalletData(key, this._data[key]);
+		if (saved.isErr()) this.unsavedAddressMaps.add(key);
 	}
 
 	/**
@@ -2379,19 +2390,14 @@ export class Wallet {
 				...this.data.addresses[addressType],
 				...addresses
 			};
-			if (saveAddresses)
-				await this.saveWalletData('addresses', this._data.addresses);
+			if (saveAddresses) await this.saveAddressMap('addresses');
 		}
 		if (Object.keys(changeAddresses).length) {
 			this._data.changeAddresses[addressType] = {
 				...this.data.changeAddresses[addressType],
 				...changeAddresses
 			};
-			if (saveAddresses)
-				await this.saveWalletData(
-					'changeAddresses',
-					this._data.changeAddresses
-				);
+			if (saveAddresses) await this.saveAddressMap('changeAddresses');
 		}
 
 		return ok({ ...generatedAddresses.value, addressType: type });
@@ -4323,8 +4329,8 @@ export class Wallet {
 		this._data.addresses = getAddressTypeContent<IAddresses>({});
 		this._data.changeAddresses = getAddressTypeContent<IAddresses>({});
 		await Promise.all([
-			this.saveWalletData('addresses', this._data.addresses),
-			this.saveWalletData('changeAddresses', this._data.changeAddresses)
+			this.saveAddressMap('addresses'),
+			this.saveAddressMap('changeAddresses')
 		]);
 		return 'Successfully reset transactions.';
 	}
@@ -5956,7 +5962,7 @@ export class Wallet {
 		if (saveAddressIndexes) {
 			await Promise.all([
 				this.saveWalletData('addressIndex', this._data.addressIndex),
-				this.saveWalletData('addresses', this._data.addresses)
+				this.saveAddressMap('addresses')
 			]);
 		}
 		if (saveChangeAddressIndexes) {
@@ -5965,7 +5971,7 @@ export class Wallet {
 					'changeAddressIndex',
 					this._data.changeAddressIndex
 				),
-				this.saveWalletData('changeAddresses', this._data.changeAddresses)
+				this.saveAddressMap('changeAddresses')
 			]);
 		}
 
