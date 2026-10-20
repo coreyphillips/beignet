@@ -44,7 +44,8 @@ const ENGINE_METHODS = [
 	'setChannelPolicy',
 	'getChannelPolicy',
 	'waitForChannelReady',
-	'listChannels'
+	'listChannels',
+	'rebalanceChannel'
 ];
 
 /** A BeignetNode whose engine fails the test if the id guard is skipped. */
@@ -71,7 +72,18 @@ const METHODS: Array<[string, (bn: BeignetNode, id: string) => unknown]> = [
 		(bn, id): unknown => bn.updateChannelPolicy(id, { feeBaseMsat: 1 })
 	],
 	['getChannelPolicy', (bn, id): unknown => bn.getChannelPolicy(id)],
-	['waitForChannelReady', (bn, id): unknown => bn.waitForChannelReady(id, 10)]
+	['waitForChannelReady', (bn, id): unknown => bn.waitForChannelReady(id, 10)],
+	// Issue #1653: these checked inline with their own wording.
+	['fforEpoch', (bn, id): unknown => bn.fforEpoch(id)],
+	['forceCloseChannel', (bn, id): unknown => bn.forceCloseChannel(id)],
+	[
+		'rebalanceChannel (from)',
+		(bn, id): unknown => bn.rebalanceChannel(id, CHANNEL_ID, 1000, 10)
+	],
+	[
+		'rebalanceChannel (to)',
+		(bn, id): unknown => bn.rebalanceChannel(CHANNEL_ID, id, 1000, 10)
+	]
 ];
 
 describe('Issue #1603: channel methods refuse a malformed channel id', () => {
@@ -85,6 +97,9 @@ describe('Issue #1603: channel methods refuse a malformed channel id', () => {
 					const code = (err as BeignetError).code;
 					expect(code).to.equal(BeignetErrorCode.INVALID_PARAMS);
 					expect(statusForErrorCode(code)).to.equal(400);
+					expect((err as Error).message).to.match(
+						/^\w+ must be a 64-character hex channel id$/
+					);
 					return;
 				}
 				expect.fail(`${method}: expected a refusal`);
@@ -125,6 +140,50 @@ describe('Issue #1603: channel methods refuse a malformed channel id', () => {
 			policies: []
 		});
 		expect(target).to.equal('all');
+	});
+});
+
+/**
+ * Every `Buffer.from(` in the source whose first argument names a channel id,
+ * as `line: argument`. requireChannelIdHex decodes its parameter `value`, so
+ * the helper itself never matches. A short channel id is a different thing.
+ */
+function rawChannelIdDecodes(source: string): string[] {
+	const hits: string[] = [];
+	const decode = /Buffer\.from\(\s*((?:[\w$]+[!?]?\.)*([\w$]+))(?![\w$.([])/g;
+	for (const m of source.matchAll(decode)) {
+		if (!/channelid/i.test(m[2]) || /^shortchannelid/i.test(m[2])) continue;
+		const line = source.slice(0, m.index).split('\n').length;
+		hits.push(`${line}: ${m[1]}`);
+	}
+	return hits;
+}
+
+describe('Issue #1653: beignet-node.ts decodes channel ids only through requireChannelIdHex', () => {
+	it('has no raw Buffer.from of a channel id', () => {
+		const source = fs.readFileSync(
+			path.join(__dirname, '../../src/cli/beignet-node.ts'),
+			'utf8'
+		);
+		expect(rawChannelIdDecodes(source)).to.deep.equal([]);
+	});
+
+	it('catches an inline decode reintroduced', () => {
+		const planted = [
+			"const a = Buffer.from(channelId, 'hex');",
+			'const b = Buffer.from(',
+			'\tbody.toChannelId,',
+			"\t'hex'",
+			');',
+			"const c = Buffer.from(params?.channelIdHex as string, 'hex');",
+			"const d = Buffer.from(h.shortChannelId, 'hex');",
+			"const e = Buffer.from(value, 'hex');"
+		].join('\n');
+		expect(rawChannelIdDecodes(planted)).to.deep.equal([
+			'1: channelId',
+			'2: body.toChannelId',
+			'6: params?.channelIdHex'
+		]);
 	});
 });
 
