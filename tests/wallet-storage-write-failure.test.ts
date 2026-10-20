@@ -372,4 +372,55 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 
 		expect(saved.isErr()).to.equal(true);
 	});
+
+	it('queues a save the listener makes behind the write that threw', async function () {
+		const { storage, store } = memoryStorage();
+		const header = (height: number): IWalletData['header'] => ({
+			height,
+			hash: '',
+			hex: ''
+		});
+		let throwNext = false;
+		let release = (): void => undefined;
+		const released = new Promise<void>((resolve) => (release = resolve));
+		let wallet: Wallet | undefined = undefined;
+		let retry: Promise<Result<string>> | undefined;
+		const res = await create(
+			{
+				...storage,
+				setData: <K extends keyof IWalletData>(
+					key: string,
+					value: IWalletData[K]
+				): Promise<Result<boolean>> => {
+					if (key === storageKey('header') && throwNext) {
+						throwNext = false;
+						throw new Error('adapter crashed');
+					}
+					if ((value as IWalletData['header'])?.height === 2) {
+						return released.then(() => storage.setData(key, value));
+					}
+					return storage.setData(key, value);
+				}
+			},
+			{
+				onMessage: (key): void => {
+					if (key === 'storageWriteFailed' && wallet && !retry) {
+						retry = wallet.saveWalletData('header', header(2));
+					}
+				}
+			}
+		);
+		if (res.isErr()) throw res.error;
+		wallet = res.value;
+		throwNext = true;
+
+		const first = await wallet.saveWalletData('header', header(1));
+		const third = wallet.saveWalletData('header', header(3));
+		release();
+
+		expect(first.isErr()).to.equal(true);
+		expect((await retry)?.isOk()).to.equal(true);
+		expect((await third).isOk()).to.equal(true);
+		expect(stored(store, 'header')).to.deep.equal(header(3));
+	});
 });

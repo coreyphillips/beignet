@@ -3624,6 +3624,10 @@ export class Wallet {
 		} catch (error) {
 			cause = `${error}`;
 		}
+		// An adapter that throws synchronously lands here before saveWalletData
+		// has registered this write. A listener that saves again has to find it
+		// registered, or its write skips the queue and can land after a newer one.
+		await Promise.resolve();
 		try {
 			this.sendMessage('storageWriteFailed', {
 				key,
