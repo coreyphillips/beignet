@@ -41,7 +41,10 @@ import {
 	DEFAULT_CHANNEL_CONFIG,
 	HtlcState
 } from '../../src/lightning/channel/types';
-import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import {
+	ChannelAction,
+	ChannelActionType
+} from '../../src/lightning/channel/channel-actions';
 import {
 	buildLocalCommitment,
 	calculateCommitmentFee
@@ -5686,6 +5689,139 @@ describe('Splice', function () {
 					expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
 					expect(pair.acceptor.getFullState().spliceInFlight).to.be.null;
 					expect(pair.errors).to.be.empty;
+				});
+			});
+
+			describe('splice RBF refusal of an unsigned splice (issue #1732)', function () {
+				// The opener quiesced to splice, so it is the side BOLT 2 lets ask.
+				function requestRbf(pair: IWirePair): ChannelAction[] {
+					return pair.acceptor.handleTxInitRbf({
+						channelId: pair.acceptor.getChannelId()!,
+						locktime: 0,
+						feerate: 2000,
+						fundingOutputContribution: 0n
+					});
+				}
+
+				/** Deliver the refusal and pump; returns how many tx_abort crossed. */
+				function deliverRefusal(
+					pair: IWirePair,
+					actions: ChannelAction[]
+				): number {
+					let aborts = 0;
+					pair.intercept(MessageType.TX_ABORT, (payload) => {
+						aborts++;
+						return payload;
+					});
+					pair.enqueue(pair.opener, pair.acceptor, actions);
+					pair.pump();
+					return aborts;
+				}
+
+				function expectBothUnwound(pair: IWirePair): void {
+					for (const [side, ch] of [
+						['opener', pair.opener],
+						['acceptor', pair.acceptor]
+					] as const) {
+						expect(ch.getState(), side).to.equal(ChannelState.NORMAL);
+						expect(ch.getSpliceSession(), side).to.be.null;
+						expect(ch.getFullState().spliceInFlight, side).to.be.null;
+						expect(ch.isQuiescent(), side).to.equal(false);
+						expect(ch.isQuiescing(), side).to.equal(false);
+						expect(ch.getFullState().quiescenceState, side).to.equal(
+							QuiescenceState.NORMAL
+						);
+					}
+				}
+
+				it('unwinds a splice refused before the commitment round, on both sides after the echo', function () {
+					const pair = makeWirePair();
+					// The acceptor holds the session from splice_init and stops there.
+					pair.drop(MessageType.SPLICE_ACK);
+					startSpliceOut(pair);
+					expect(pair.acceptor.getState()).to.equal(ChannelState.SPLICING);
+					expect(pair.acceptor.isQuiescent()).to.equal(true);
+					expect(pair.acceptor.isQuiescenceInitiator()).to.equal(false);
+					expect(pair.acceptor.getFullState().spliceInFlight).to.be.null;
+					pair.clearDrops();
+
+					const actions = requestRbf(pair);
+					const abort = findSendAction(actions, MessageType.TX_ABORT);
+					expect(abort, 'refused').to.exist;
+					expect(
+						decodeTxAbortMessage(abort.payload).data.toString('utf8')
+					).to.equal('splice RBF not supported');
+					expect(findAction(actions, ChannelActionType.SPLICE_ABORTED)).to
+						.exist;
+					expect(
+						findAction(actions, ChannelActionType.PERSIST_STATE),
+						'nothing durable to clear'
+					).to.not.exist;
+					expect(findAction(actions, ChannelActionType.ERROR)).to.not.exist;
+
+					// The requester unwinds and echoes; the echo goes unanswered.
+					expect(deliverRefusal(pair, actions), 'refusal and echo').to.equal(2);
+					expectBothUnwound(pair);
+					expect(pair.errors).to.deep.equal([]);
+				});
+
+				it('persists the cleared record ahead of the refusal and unwinds both sides after the echo', function () {
+					const pair = makeWirePair();
+					// Every commitment_signed is lost: each side holds the record its
+					// own splice commitment created, and nothing is signed.
+					pair.drop(MessageType.COMMITMENT_SIGNED);
+					startSpliceOut(pair);
+					const record = pair.acceptor.getFullState().spliceInFlight;
+					expect(record, 'in-flight record exists').to.not.be.null;
+					expect(record!.sentTxSignatures).to.be.false;
+					expect(record!.receivedTxSignatures).to.be.false;
+					pair.clearDrops();
+
+					const actions = requestRbf(pair);
+					const persistIndex = actions.findIndex(
+						(a) => a.type === ChannelActionType.PERSIST_STATE
+					);
+					const abortIndex = actions.indexOf(
+						findSendAction(actions, MessageType.TX_ABORT)
+					);
+					expect(persistIndex, 'unwind persisted').to.not.equal(-1);
+					expect(abortIndex, 'refused').to.not.equal(-1);
+					expect(persistIndex, 'persist leads the refusal').to.be.lessThan(
+						abortIndex
+					);
+					expect(pair.acceptor.getFullState().spliceInFlight).to.be.null;
+
+					expect(deliverRefusal(pair, actions), 'refusal and echo').to.equal(2);
+					expectBothUnwound(pair);
+					expect(pair.errors).to.deep.equal([]);
+				});
+
+				it('keeps a splice whose tx_signatures already left and refuses only the RBF', function () {
+					const pair = makeWirePair();
+					// The acceptor signs first and its tx_signatures are lost: the
+					// opener can still receive them and broadcast the splice.
+					pair.drop(MessageType.TX_SIGNATURES);
+					startSpliceOut(pair);
+					const record = pair.acceptor.getFullState().spliceInFlight!;
+					expect(record.sentTxSignatures).to.be.true;
+					expect(record.receivedTxSignatures).to.be.false;
+					const spliceTxid = Buffer.from(record.spliceTxid);
+
+					const actions = requestRbf(pair);
+					expect(findSendAction(actions, MessageType.TX_ABORT), 'refused').to
+						.exist;
+					expect(findAction(actions, ChannelActionType.SPLICE_ABORTED)).to.not
+						.exist;
+					expect(findAction(actions, ChannelActionType.PERSIST_STATE)).to.not
+						.exist;
+					expect(findAction(actions, ChannelActionType.ERROR)).to.not.exist;
+					expect(pair.acceptor.getState()).to.equal(ChannelState.SPLICING);
+					expect(pair.acceptor.getSpliceSession()).to.not.be.null;
+					expect(
+						pair.acceptor
+							.getFullState()
+							.spliceInFlight!.spliceTxid.equals(spliceTxid)
+					).to.equal(true);
 				});
 			});
 

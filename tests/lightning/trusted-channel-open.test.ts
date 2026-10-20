@@ -836,7 +836,11 @@ describe('Zero-conf splice semantics (BOLT 2)', function () {
 		// BOLT 2 allows a splice tx_init_rbf only from the quiescence initiator.
 		ch.handleStfuMessage({ channelId, initiator: true });
 		expect(ch.isQuiescent()).to.equal(true);
-		ch._spliceSession = { isComplete: () => false };
+		// The unsigned splice unwinds on the refusal, so the stub must abort.
+		ch._spliceSession = {
+			isComplete: () => false,
+			abort: () => ({ ok: true })
+		};
 
 		const actions = ch.handleTxInitRbf({
 			channelId,
