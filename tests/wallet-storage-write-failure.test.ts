@@ -17,7 +17,10 @@ import {
 	EProtocol,
 	err,
 	getWalletDataStorageKey,
+	IAddress,
 	IFormattedTransaction,
+	IGetAddressHistoryResponse,
+	IGetUtxosResponse,
 	IOnchainFees,
 	IWallet,
 	IWalletData,
@@ -140,6 +143,39 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 			{ key, storageKey: storageKey(key), error: 'storage is full' }
 		]);
 	};
+
+	/**
+	 * Lets refreshWallet run offline. Electrum is stubbed at the wallet's
+	 * edges, so the real gap scan runs against a server that reports history
+	 * only for the script hashes in `used`.
+	 */
+	const stubRefresh = (wallet: Wallet, used: Set<string>): void => {
+		wallet.checkElectrumConnection = async (): Promise<Result<string>> =>
+			ok('connected');
+		wallet.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
+			ok(wallet.feeEstimates);
+		wallet.getUtxos = async (): Promise<Result<IGetUtxosResponse>> =>
+			ok({ utxos: [], balance: 0 });
+		wallet.updateTransactions = async (): Promise<Result<string | undefined>> =>
+			ok(undefined);
+		wallet.electrum.subscribeToAddresses = async (): Promise<Result<string>> =>
+			ok('subscribed');
+		wallet.electrum.getAddressHistory = async ({
+			scriptHashes = []
+		}: {
+			scriptHashes?: IAddress[];
+		}): Promise<Result<IGetAddressHistoryResponse[]>> =>
+			ok(
+				scriptHashes
+					.filter((address) => used.has(address.scriptHash))
+					.map((address) => ({ ...address, tx_hash: TXID, height: 1 }))
+			);
+	};
+
+	const savedIndex = (store: Map<string, string>, wallet: Wallet): number =>
+		(stored(store, 'addressIndex') as IWalletData['addressIndex'])[
+			wallet.addressType
+		].index;
 
 	beforeEach(function () {
 		reports = [];
@@ -544,6 +580,100 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		const next = await restarted.generateNewReceiveAddress();
 		if (next.isErr()) throw next.error;
 		expect(next.value.index).to.equal(issued.value.index + 1);
+	});
+
+	// Issue #1745: a refresh that found the current address used moved the
+	// index in memory and threw away the result of its write. The getter then
+	// served the moved index as saved, and a restart came back to the used
+	// address.
+	it('saves the index a refresh moved before getReceiveAddress returns it, when the refresh write was refused (issue #1745)', async function () {
+		const { storage, store, refused } = memoryStorage();
+		let indexWrites = 0;
+		const counted: TStorage = {
+			...storage,
+			setData: async <K extends keyof IWalletData>(
+				key: string,
+				value: IWalletData[K]
+			): Promise<Result<boolean>> => {
+				if (key === storageKey('addressIndex')) indexWrites++;
+				return storage.setData(key, value);
+			}
+		};
+		const wallet = await open(counted);
+		const type = wallet.addressType;
+		const used = new Set<string>();
+		stubRefresh(wallet, used);
+		const first = await wallet.refreshWallet({});
+		if (first.isErr()) throw first.error;
+		expect(wallet.data.addressIndex[type].index).to.equal(0);
+		expect(savedIndex(store, wallet)).to.equal(0);
+
+		// A payment reaches address 0, and storage refuses the index the
+		// refresh moves on to.
+		used.add(wallet.data.addressIndex[type].scriptHash);
+		refused.add('addressIndex');
+		const second = await wallet.refreshWallet({});
+		if (second.isErr()) throw second.error;
+		expect(wallet.data.addressIndex[type].index).to.equal(1);
+		expect(savedIndex(store, wallet)).to.equal(0);
+		expectReported('addressIndex');
+
+		const whileRefused = await wallet.getReceiveAddress({});
+		expect(whileRefused.isErr()).to.equal(true);
+		if (whileRefused.isOk()) return;
+		expect(whileRefused.error.message).to.contain('receive address index');
+
+		refused.clear();
+		indexWrites = 0;
+		const current = await wallet.getReceiveAddress({});
+		if (current.isErr()) throw current.error;
+		expect(current.value).to.equal(wallet.data.addressIndex[type].address);
+		expect(indexWrites).to.equal(1);
+		expect(savedIndex(store, wallet)).to.equal(1);
+		const again = await wallet.getReceiveAddress({});
+		if (again.isErr()) throw again.error;
+		expect(indexWrites, 'a read of a saved index writes nothing').to.equal(1);
+
+		await wallet.stop();
+		const restarted = await open(counted);
+		const afterRestart = await restarted.getReceiveAddress({});
+		if (afterRestart.isErr()) throw afterRestart.error;
+		expect(afterRestart.value).to.equal(current.value);
+	});
+
+	it('saves the index the first refresh set before getReceiveAddress returns it, when that write was refused (issue #1745)', async function () {
+		const { storage, store, refused } = memoryStorage();
+		const wallet = await open(storage);
+		const type = wallet.addressType;
+		stubRefresh(wallet, new Set());
+		refused.add('addressIndex');
+		const refreshed = await wallet.refreshWallet({});
+		if (refreshed.isErr()) throw refreshed.error;
+		expect(wallet.data.addressIndex[type].index).to.equal(0);
+		expect(stored(store, 'addressIndex')).to.equal(undefined);
+		expectReported('addressIndex');
+
+		const whileRefused = await wallet.getReceiveAddress({});
+		expect(whileRefused.isErr()).to.equal(true);
+		if (whileRefused.isOk()) return;
+		expect(whileRefused.error.message).to.contain('receive address index');
+
+		refused.clear();
+		const current = await wallet.getReceiveAddress({});
+		if (current.isErr()) throw current.error;
+		expect(current.value).to.equal(wallet.data.addressIndex[type].address);
+		expect(savedIndex(store, wallet)).to.equal(0);
+
+		// Without the saved index a restart would start over at -1 and issue
+		// address 0, the one just given out, as its first new address.
+		await wallet.stop();
+		const restarted = await open(storage);
+		const afterRestart = await restarted.getReceiveAddress({});
+		if (afterRestart.isErr()) throw afterRestart.error;
+		expect(afterRestart.value).to.equal(current.value);
+		const next = await restarted.generateNewReceiveAddress();
+		if (next.isErr()) throw next.error;
+		expect(next.value.index).to.equal(1);
 	});
 
 	it('reports refused index writes from resetAddressIndexes', async function () {
