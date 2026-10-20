@@ -238,6 +238,43 @@ describe('Event granularity (M4 batch 2b)', () => {
 			);
 			expect(emitted).to.have.length(3);
 		});
+
+		// Issue #1737: a refused header write returns nothing to the daemon, so
+		// the wallet's message is the operator's only sign of it.
+		it('logs a refused wallet write at error level', () => {
+			const logged: Array<[string, string, unknown]> = [];
+			const record =
+				(level: string) =>
+				(message: string, data?: unknown): void => {
+					logged.push([level, message, data]);
+				};
+			const fake = {
+				logLevel: 'info',
+				logger: {
+					debug: record('debug'),
+					info: record('info'),
+					warn: record('warn'),
+					error: record('error')
+				},
+				emit: (): boolean => true,
+				log: (BeignetNode.prototype as any).log
+			};
+			const failure = {
+				key: 'header',
+				storageKey: 'wallet0-bitcoinRegtest-header',
+				error: 'storage is full'
+			};
+
+			(BeignetNode.prototype as any).onWalletMessage.call(
+				fake,
+				'storageWriteFailed',
+				failure
+			);
+
+			expect(logged).to.deep.equal([
+				['error', 'Wallet storage write failed', failure]
+			]);
+		});
 	});
 
 	describe('daemon wiring', () => {

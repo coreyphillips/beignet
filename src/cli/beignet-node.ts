@@ -7472,6 +7472,17 @@ export class BeignetNode extends EventEmitter {
 			this.emit('onchain:rbf', { txids: data as string[] });
 			return;
 		}
+		// Some writes (the header, the fee cache) return nothing a caller could
+		// check, so this message is the only sign that storage is now stale.
+		if (key === 'storageWriteFailed') {
+			const failure = data as TMessageDataMap['storageWriteFailed'];
+			this.log('error', 'Wallet storage write failed', {
+				key: failure.key,
+				storageKey: failure.storageKey,
+				error: failure.error
+			});
+			return;
+		}
 		const relayed = {
 			transactionReceived: {
 				event: 'transaction:received',
