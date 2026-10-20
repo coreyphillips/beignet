@@ -993,7 +993,9 @@ export class Wallet {
 			// running here settles against it, and the one started below queues
 			// behind that refresh. So does the write queue: a write still waiting
 			// for storage has to stay ahead of later writes to its key, including
-			// ones made after switching back to its network.
+			// ones made after switching back to its network. So do the receive
+			// index counters: an issuance still out settles against them, and
+			// against fresh ones it would mark later unsaved moves as saved.
 			const kept = new Set([
 				'isSwitchingNetworks',
 				'isRefreshing',
@@ -1002,7 +1004,9 @@ export class Wallet {
 				'_pendingRefreshPromises',
 				'_refreshStartCallbacks',
 				'savingOperations',
-				'waitingWrites'
+				'waitingWrites',
+				'receiveIndexMoves',
+				'receiveIndexMovesSaved'
 			]);
 			Object.assign(
 				this,
@@ -2663,9 +2667,7 @@ export class Wallet {
 				addressDelta >= this.gapLimitOptions.lookBehind &&
 				!overrideGapLimit
 			) {
-				const addressIndex = currentWallet.addressIndex;
-				const receiveAddress = addressIndex[addressType];
-				return ok(receiveAddress);
+				return this.savedReceiveAddress(addressType);
 			}
 
 			const { path } = addressTypes[addressType];
@@ -2738,11 +2740,16 @@ export class Wallet {
 		}
 	}
 
+	// How many times the receive index has moved, and the newest of those
+	// moves a successful addressIndex write is known to carry.
+	private receiveIndexMoves = 0;
+	private receiveIndexMovesSaved = 0;
+
 	/**
 	 * Moves the receive index to `next` and saves it, failing if storage
-	 * refuses the write. The index stays moved even then: getReceiveAddress
-	 * may already have served `next` while the write was out, and moving back
-	 * would issue it again.
+	 * refuses the write. The index stays moved even then: an overlapping
+	 * request may already have saved a later index, and moving back would
+	 * issue that one again.
 	 * @private
 	 * @param {EAddressType} addressType
 	 * @param {IAddress} next
@@ -2753,6 +2760,25 @@ export class Wallet {
 		next: IAddress
 	): Promise<Result<IAddress>> {
 		this._data.addressIndex[addressType] = next;
+		this.receiveIndexMoves++;
+		return this.savedReceiveAddress(addressType);
+	}
+
+	/**
+	 * The current receive address, once storage holds its index. While an
+	 * issuance write is out or was refused, this saves the index again and
+	 * fails if storage refuses that write too: a restart would otherwise come
+	 * back to an older address and issue it a second time.
+	 * @private
+	 * @param {EAddressType} addressType
+	 * @returns {Promise<Result<IAddress>>}
+	 */
+	private async savedReceiveAddress(
+		addressType: EAddressType
+	): Promise<Result<IAddress>> {
+		const current = this._data.addressIndex[addressType];
+		const moves = this.receiveIndexMoves;
+		if (this.receiveIndexMovesSaved >= moves) return ok(current);
 		const saved = await this.saveWalletData(
 			'addressIndex',
 			this._data.addressIndex
@@ -2762,7 +2788,8 @@ export class Wallet {
 				`Failed to persist the receive address index: ${saved.error.message}`
 			);
 		}
-		return ok(next);
+		this.receiveIndexMovesSaved = Math.max(this.receiveIndexMovesSaved, moves);
+		return ok(current);
 	}
 
 	/**
@@ -6177,9 +6204,10 @@ export class Wallet {
 		try {
 			const wallet = this.data;
 			const addressIndex = wallet.addressIndex;
-			const receiveAddress = addressIndex[addressType].address;
-			if (receiveAddress) {
-				return ok(receiveAddress);
+			if (addressIndex[addressType].address) {
+				const saved = await this.savedReceiveAddress(addressType);
+				if (saved.isErr()) return err(saved.error.message);
+				return ok(saved.value.address);
 			}
 			const addresses = wallet?.addresses[addressType];
 
