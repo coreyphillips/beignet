@@ -29,6 +29,7 @@ import {
 	InvalidSpliceError,
 	ChannelFundingUnavailableError,
 	ChannelFundingUnavailableCode,
+	IDirectFundingNodeConfig,
 	ISpliceRequestResult,
 	SpliceRefusalCode
 } from '../../src/lightning/node/types';
@@ -56,7 +57,10 @@ function makeBasepoints(seed: Buffer): IChannelBasepoints {
 
 const FUNDING_SATOSHIS = 1_000_000n;
 
-function createTestNode(localFeatures?: FeatureFlags): LightningNode {
+function createTestNode(
+	localFeatures?: FeatureFlags,
+	directFunding?: IDirectFundingNodeConfig
+): LightningNode {
 	const seed = crypto
 		.createHash('sha256')
 		.update('splice-validation-node')
@@ -74,7 +78,8 @@ function createTestNode(localFeatures?: FeatureFlags): LightningNode {
 			.update(Buffer.from([0]))
 			.digest(),
 		network: Network.REGTEST,
-		...(localFeatures ? { localFeatures } : {})
+		...(localFeatures ? { localFeatures } : {}),
+		...(directFunding ? { directFunding } : {})
 	});
 	node.on('error', () => {});
 	node.on('node:error', () => {});
@@ -450,6 +455,89 @@ describe('LightningNode splice validation', function () {
 			'no reserve refusal for a no-change selection'
 		).to.not.match(/below the channel reserve/);
 		admittingNode.destroy();
+	});
+
+	it("gives the direct-funding receiver the reserve shortfall the channel's splice-in refusal uses (issue #1646)", function () {
+		const changeScript = Buffer.concat([
+			Buffer.from([0x00, 0x14]),
+			crypto.randomBytes(20)
+		]);
+		const fee = spliceFeeSats(
+			estimateSpliceTxWeight({
+				walletInputCount: 1,
+				changeScriptLen: changeScript.length
+			}),
+			253
+		);
+		// A coin paying `amount` in and keeping 2,000 sat of change.
+		const withChange = (amount: bigint): ISpliceWalletInput => {
+			const value = Number(amount + fee + 2_000n);
+			const prevTx = new bitcoin.Transaction();
+			prevTx.version = 2;
+			prevTx.addInput(crypto.randomBytes(32), 0);
+			prevTx.addOutput(changeScript, value);
+			return {
+				prevTx: prevTx.toBuffer(),
+				prevOutputIndex: 0,
+				value: BigInt(value),
+				sequence: 0xfffffffd,
+				signWitness: (): Buffer[] => []
+			};
+		};
+		const lowBalanceNode = (): { node: LightningNode; channelId: Buffer } => {
+			const node = createTestNode(undefined, {});
+			const channelId = injectNormalChannel(node);
+			const state = (node as any).channelManager.channels
+				.get(channelId.toString('hex'))
+				.getFullState();
+			state.localBalanceMsat = 2_000_000n;
+			state.remoteBalanceMsat = 998_000_000n;
+			state.remoteBasepoints = makeBasepoints(
+				crypto.createHash('sha256').update('splice-validation-peer').digest()
+			);
+			return { node, channelId };
+		};
+		const shortfallOf = (
+			node: LightningNode,
+			channelId: Buffer,
+			amount: bigint
+		): bigint | null =>
+			(node as any).directFunding.receiver.deps.spliceReserveShortfallSat(
+				channelId,
+				amount
+			);
+
+		// 2k + 3k = 5k, under v2ReserveWeKeep(1_003_000) = 10_030.
+		const under = lowBalanceNode();
+		expect(shortfallOf(under.node, under.channelId, 3_000n)).to.equal(5_030n);
+		expect(
+			under.node.spliceInWithInputs(
+				under.channelId,
+				3_000n,
+				[withChange(3_000n)],
+				changeScript,
+				253
+			).error
+		).to.match(/below the channel reserve/);
+		expect(
+			shortfallOf(under.node, crypto.randomBytes(32), 3_000n),
+			'unknown channel'
+		).to.equal(null);
+		under.node.destroy();
+
+		// 2k + 8.1k = 10_100, over v2ReserveWeKeep(1_008_100) = 10_081.
+		const clear = lowBalanceNode();
+		expect(shortfallOf(clear.node, clear.channelId, 8_100n)).to.equal(0n);
+		expect(
+			clear.node.spliceInWithInputs(
+				clear.channelId,
+				8_100n,
+				[withChange(8_100n)],
+				changeScript,
+				253
+			).error ?? ''
+		).to.not.match(/below the channel reserve/);
+		clear.node.destroy();
 	});
 
 	it('spliceQuote maxAmountSats is exactly the largest amount spliceOut admits (issue #423)', function () {

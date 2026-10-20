@@ -522,6 +522,9 @@ export class FakeDfNode implements IDfReceiverDeps {
 	readonly feeEstimateCalls: number[] = [];
 	/** What `spliceChangeDustFloorSat` answers: the channel's negotiated floor. */
 	spliceDustFloorSat: bigint | null = 546n;
+	/** What `spliceReserveShortfallSat` answers; 0 is a balance at or over the reserve. */
+	spliceReserveShortfall: bigint | null = 0n;
+	readonly spliceReserveQueries: bigint[] = [];
 	openThrows: Error | null = null;
 	lspPubkey: string | null = LSP_PUBKEY;
 	spliceChannel: Buffer | null = null;
@@ -678,6 +681,14 @@ export class FakeDfNode implements IDfReceiverDeps {
 
 	spliceChangeDustFloorSat(): bigint | null {
 		return this.spliceDustFloorSat;
+	}
+
+	spliceReserveShortfallSat(
+		_channelId: Buffer,
+		relativeSats: bigint
+	): bigint | null {
+		this.spliceReserveQueries.push(relativeSats);
+		return this.spliceReserveShortfall;
 	}
 
 	async estimateFeeSatPerVbyte(targetBlocks: number): Promise<number | null> {

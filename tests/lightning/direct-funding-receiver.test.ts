@@ -3629,6 +3629,70 @@ describe('Direct funding receiver: live splice feerate (issue #763)', () => {
 		h.engine.stop();
 	});
 
+	it('declines before the ack a splice whose change output the reserve rule refuses (issue #1646)', async () => {
+		const h = spliceHarness({}, { maxTotalFeeSat: 50_000n });
+		h.node.feeSatPerVbyte = 10;
+		h.node.spliceReserveShortfall = 4_000n;
+		// What the channel answers once the splice starts: never reached.
+		h.node.spliceError =
+			'Cannot splice-in: the change output makes this a composition the peer must abort';
+		await h.sendOffer();
+		const change =
+			h.offer.valueSat -
+			h.offer.amountSat -
+			spliceFeeSats(spliceWeight(h), 2_500);
+		expect(h.acks()).to.deep.equal([
+			{
+				accepted: false,
+				reason: `the payer's ${change} sat change output would leave our channel balance 4000 sat under its reserve after this splice; pay the address`
+			}
+		]);
+		expect(h.node.spliceReserveQueries).to.deep.equal([h.offer.amountSat]);
+		expect(h.node.splices).to.have.length(0);
+		expect(h.node.aborts).to.have.length(0);
+		expect(h.engine.inflightCount()).to.equal(0);
+		expect(
+			h.node.requests.attemptsFor(h.offer.receiptHash.toString('hex')).attempts
+		).to.equal(0);
+		h.engine.stop();
+	});
+
+	it('splices under the reserve when the change is below the dust floor and becomes fee (issue #1646)', async () => {
+		// At 2,500 sat/kw the channel keeps a change of exactly the 546 sat
+		// floor from the first coin and drops the 545 sat one from the second.
+		const fee = spliceFeeSats(
+			estimateSpliceTxWeight({ walletInputCount: 1, changeScriptLen: 22 }),
+			2_500
+		);
+		const atFloor = spliceHarness(
+			{},
+			{ amountSat: 50_000n, maxTotalFeeSat: 50_000n },
+			Number(50_000n + fee + 546n)
+		);
+		expect(atFloor.offer.changeScript.length).to.equal(22);
+		atFloor.node.feeSatPerVbyte = 10;
+		atFloor.node.spliceReserveShortfall = 4_000n;
+		await atFloor.sendOffer();
+		expect(atFloor.lastAck()?.reason).to.contain(
+			"the payer's 546 sat change output"
+		);
+		expect(atFloor.node.splices).to.have.length(0);
+		atFloor.engine.stop();
+
+		const underFloor = spliceHarness(
+			{},
+			{ amountSat: 50_000n, maxTotalFeeSat: 50_000n },
+			Number(50_000n + fee + 545n)
+		);
+		underFloor.node.feeSatPerVbyte = 10;
+		underFloor.node.spliceReserveShortfall = 4_000n;
+		await underFloor.sendOffer();
+		expect(underFloor.lastAck()?.accepted).to.equal(true);
+		expect(underFloor.node.splices).to.have.length(1);
+		expect(underFloor.node.splices[0].feeratePerKw).to.equal(2_500);
+		underFloor.engine.stop();
+	});
+
 	it('uses a pinned feerate as given, without asking the estimator', async () => {
 		const h = spliceHarness(
 			{ spliceFeeratePerKw: 700 },
