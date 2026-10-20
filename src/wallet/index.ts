@@ -2739,6 +2739,25 @@ export class Wallet {
 	}
 
 	/**
+	 * Serializes issueReceiveAddress. Two overlapping requests that derive the
+	 * same next address hold the same object for it, so a refused write
+	 * cannot tell its own move from the other request's, and would roll back
+	 * an index the other request saved and handed out.
+	 */
+	private receiveIndexLock: Promise<unknown> = Promise.resolve();
+
+	private issueReceiveAddress(
+		addressType: EAddressType,
+		next: IAddress
+	): Promise<Result<IAddress>> {
+		const run = this.receiveIndexLock.then(() =>
+			this.saveReceiveAddress(addressType, next)
+		);
+		this.receiveIndexLock = run.catch(() => undefined);
+		return run;
+	}
+
+	/**
 	 * Moves the receive index to `next` and saves it. A refused write moves
 	 * it back, so `next` is not handed out at all: the next start loads the
 	 * old index and would issue `next` again, and getReceiveAddress serves
@@ -2748,7 +2767,7 @@ export class Wallet {
 	 * @param {IAddress} next
 	 * @returns {Promise<Result<IAddress>>}
 	 */
-	private async issueReceiveAddress(
+	private async saveReceiveAddress(
 		addressType: EAddressType,
 		next: IAddress
 	): Promise<Result<IAddress>> {
@@ -2759,7 +2778,7 @@ export class Wallet {
 			this._data.addressIndex
 		);
 		if (saved.isErr()) {
-			// A later call that moved the index on owns it now.
+			// A refresh that moved the index on meanwhile owns it now.
 			if (this._data.addressIndex[addressType] === next) {
 				this._data.addressIndex[addressType] = previous;
 			}

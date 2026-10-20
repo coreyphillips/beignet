@@ -204,6 +204,49 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		expect(saved[wallet.addressType].index).to.equal(retried.value.index);
 	});
 
+	it('keeps a receive address an overlapping request saved when the first request is refused', async function () {
+		const { storage, store } = memoryStorage();
+		let refuseNext = false;
+		const wallet = await open({
+			...storage,
+			setData: async <K extends keyof IWalletData>(
+				key: string,
+				value: IWalletData[K]
+			): Promise<Result<boolean>> => {
+				if (refuseNext && key === storageKey('addressIndex')) {
+					refuseNext = false;
+					// Slow enough for the second request to move the index
+					// while this write is still out.
+					await new Promise((resolve) => setTimeout(resolve, 50));
+					return err('storage is full');
+				}
+				return storage.setData(key, value);
+			}
+		});
+		const type = wallet.addressType;
+		const first = await wallet.generateNewReceiveAddress();
+		if (first.isErr()) throw first.error;
+		refuseNext = true;
+
+		// The create-time refresh is off, so nothing past the current index is
+		// derived yet: both requests derive the next address and hold the same
+		// object for it.
+		const [refusedRes, issued] = await Promise.all([
+			wallet.generateNewReceiveAddress(),
+			wallet.generateNewReceiveAddress()
+		]);
+
+		expect(refusedRes.isErr()).to.equal(true);
+		if (issued.isErr()) throw issued.error;
+		expect(issued.value.index).to.equal(first.value.index + 1);
+		expect(wallet.data.addressIndex[type].index).to.equal(issued.value.index);
+		const saved = stored(store, 'addressIndex') as IWalletData['addressIndex'];
+		expect(saved[type].index).to.equal(issued.value.index);
+		const next = await wallet.generateNewReceiveAddress();
+		if (next.isErr()) throw next.error;
+		expect(next.value.index).to.equal(issued.value.index + 1);
+	});
+
 	it('reports refused index writes from resetAddressIndexes', async function () {
 		const { storage, refused } = memoryStorage();
 		const wallet = await open(storage);
