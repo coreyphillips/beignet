@@ -28,6 +28,7 @@ import { BeignetNode } from '../../src/cli/beignet-node';
 import { BeignetError } from '../../src/cli/errors';
 import { resolveConfig } from '../../src/cli/config';
 import { getOpenApiSpec } from '../../src/cli/openapi';
+import { daemonRouteKeys } from './helpers/daemon-routes';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -35,24 +36,6 @@ const MNEMONIC =
 // ─────────────── Route classification drift test ───────────────
 
 describe('Route scope classification (drift test)', () => {
-	const daemonSrc = fs.readFileSync(
-		path.join(__dirname, '../../src/cli/daemon.ts'),
-		'utf8'
-	);
-
-	/** Every route key in daemon.ts source, plus specially handled POST /stop. */
-	function daemonRouteKeys(): Set<string> {
-		const keys = new Set<string>();
-		const re = /'((?:GET|POST|DELETE) \/[^']+)'/g;
-		let m: RegExpExecArray | null;
-		while ((m = re.exec(daemonSrc)) !== null) {
-			keys.add(m[1]);
-		}
-		// /stop is dispatched via req.method/pathname, not the routes map
-		keys.add('POST /stop');
-		return keys;
-	}
-
 	it('every daemon route is classified in ROUTE_SCOPES or auth-exempt', () => {
 		const unclassified = [...daemonRouteKeys()].filter(
 			(key) => !AUTH_EXEMPT_ROUTES.has(key) && !(key in ROUTE_SCOPES)

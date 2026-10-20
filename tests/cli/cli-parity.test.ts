@@ -7,11 +7,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { expect } from 'chai';
+import { daemonRoutePaths } from './helpers/daemon-routes';
 
-const daemonSrc = fs.readFileSync(
-	path.join(__dirname, '../../src/cli/daemon.ts'),
-	'utf8'
-);
 // The start command's config-to-options mapping lives in its own module (so a
 // test can reach it without cli.ts running main()), and the wiring assertions
 // below read it as part of the CLI's source.
@@ -62,21 +59,6 @@ const INTENTIONALLY_NO_CLI = new Set([
 	'/ffor/issuer/issued'
 ]);
 
-/** All route paths declared in the daemon routes map (plus special routes). */
-function daemonRoutePaths(): string[] {
-	const paths = new Set<string>();
-	const re = /'(GET|POST|DELETE) (\/[^']+)'/g;
-	let m: RegExpExecArray | null;
-	while ((m = re.exec(daemonSrc)) !== null) {
-		paths.add(m[2]);
-	}
-	// /stop and /events are handled outside the routes map
-	paths.add('/stop');
-	paths.add('/events');
-	paths.add('/metrics');
-	return [...paths];
-}
-
 /**
  * All daemon paths the CLI can hit: string/template literals passed to
  * httpRequest plus the raw /metrics request, normalized by stripping query
@@ -96,7 +78,7 @@ function cliRequestPaths(): Set<string> {
 describe('CLI parity with daemon routes (M4 batch 2b)', () => {
 	it('every daemon route has a CLI command (or a documented exception)', () => {
 		const cliPaths = cliRequestPaths();
-		const missing = daemonRoutePaths().filter(
+		const missing = [...daemonRoutePaths()].filter(
 			(p) => !INTENTIONALLY_NO_CLI.has(p) && !cliPaths.has(p)
 		);
 		expect(
