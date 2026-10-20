@@ -2614,6 +2614,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'400': {
 							description:
 								'INVALID_PARAMS: forceCloseIfUnreachable on a recency-held channel without acceptStaleStateRisk: true'
+						},
+						'500': {
+							description:
+								'FORCE_CLOSE_FAILED: forceCloseIfUnreachable reached the engine and it refused the force close, as on /channel/forceclose'
 						}
 					}
 				}

@@ -8637,6 +8637,14 @@ export class BeignetNode extends EventEmitter {
 				}
 				throw err;
 			});
+		// Same code as /channel/forceclose and /ffor/enforce: nothing was
+		// broadcast, and the operator asked for a close.
+		if (r.action === 'force-close-refused') {
+			throw new BeignetError(
+				BeignetErrorCode.FORCE_CLOSE_FAILED,
+				r.error ?? 'Force close failed'
+			);
+		}
 		return {
 			action: r.action,
 			preimagesKnown: r.preimagesKnown,

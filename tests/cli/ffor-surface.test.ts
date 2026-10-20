@@ -747,6 +747,53 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 		}
 	});
 
+	it('POST /ffor/recover answers a refused force close as FORCE_CLOSE_FAILED with the engine reason (issue #1734)', async () => {
+		const inner = daemon.node.getNode();
+		const { ChannelState } = require('../../src/lightning/channel/types');
+		const fx = installChannel(false);
+		// S unreachable, so the route goes past the cooperative close.
+		inner.getChannelManager().getChannel(fx.idBuf)!.getFullState().state =
+			ChannelState.AWAITING_REESTABLISH;
+		const forceClose = sinon.spy(inner.getChannelManager(), 'forceClose');
+		try {
+			const port = portOf(daemon);
+			const res = await request(port, 'POST', '/ffor/recover', {
+				channelId: fx.channelId,
+				forceCloseIfUnreachable: true
+			});
+			expect(forceClose.calledOnce).to.equal(true);
+			const reason = forceClose.firstCall.returnValue.error;
+			expect(reason).to.be.a('string');
+			expect(reason!.length).to.be.greaterThan(0);
+			expect(res.status).to.equal(500);
+			expect(errorOf(res).code).to.equal('FORCE_CLOSE_FAILED');
+			expect(errorOf(res).message).to.equal(reason);
+
+			const direct = await inner.rescueFforEpoch(fx.channelId, {
+				forceCloseIfUnreachable: true,
+				destinationScript: Buffer.from('0014' + '22'.repeat(20), 'hex')
+			});
+			expect(direct.action).to.equal('force-close-refused');
+			expect(direct.error).to.equal(reason);
+
+			// 'nothing' keeps its meaning: an epoch already past ACTIVE.
+			fx.record.state = FforState.DRAINING;
+			forceClose.resetHistory();
+			const draining = await request(port, 'POST', '/ffor/recover', {
+				channelId: fx.channelId,
+				forceCloseIfUnreachable: true
+			});
+			expect(draining.status).to.equal(200);
+			expect((draining.body.result as { action: string }).action).to.equal(
+				'nothing'
+			);
+			expect(forceClose.called).to.equal(false);
+		} finally {
+			forceClose.restore();
+			fx.remove();
+		}
+	});
+
 	it('all force-close routes require exact acknowledgement for a reestablish hold', async () => {
 		const inner = daemon.node.getNode();
 		const forceClose = sinon.spy(inner.getChannelManager(), 'forceClose');
@@ -795,11 +842,11 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 							...body,
 							acceptStaleStateRisk: true
 						});
-						// This fixture has no remote commitment signature. Both
-						// force-close routes surface that engine refusal as 500;
-						// /ffor/recover returns its result.
-						expect(accepted.status, route).to.equal(
-							route === '/ffor/recover' ? 200 : 500
+						// This fixture has no remote commitment signature. Every
+						// force-close route surfaces that engine refusal as 500.
+						expect(accepted.status, route).to.equal(500);
+						expect(errorOf(accepted).code, route).to.equal(
+							'FORCE_CLOSE_FAILED'
 						);
 						expect(errorOf(accepted).message ?? '').to.not.match(
 							/acceptStaleStateRisk/
@@ -882,7 +929,9 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 				release();
 				const result = await pending;
 				if (flag === true) {
-					expect(result.status).to.equal(200);
+					// Acknowledged, so the engine's own refusal of this fixture.
+					expect(result.status).to.equal(500);
+					expect(errorOf(result).code).to.equal('FORCE_CLOSE_FAILED');
 					expect(forceClose.calledOnce).to.equal(true);
 				} else {
 					expect(result.status).to.equal(400);
@@ -1027,8 +1076,9 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 							acceptStaleStateRisk: true
 						});
 						// The fixture has no remote commitment signature, as above.
-						expect(accepted.status, `${kind} ${route}`).to.equal(
-							route === '/ffor/recover' ? 200 : 500
+						expect(accepted.status, `${kind} ${route}`).to.equal(500);
+						expect(errorOf(accepted).code, `${kind} ${route}`).to.equal(
+							'FORCE_CLOSE_FAILED'
 						);
 						expect(errorOf(accepted).message ?? '').to.not.match(
 							/acceptStaleStateRisk/
@@ -1097,7 +1147,9 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 				release();
 				const result = await pending;
 				if (flag === true) {
-					expect(result.status).to.equal(200);
+					// Acknowledged, so the engine's own refusal of this fixture.
+					expect(result.status).to.equal(500);
+					expect(errorOf(result).code).to.equal('FORCE_CLOSE_FAILED');
 					expect(forceClose.calledOnce).to.equal(true);
 				} else {
 					expect(result.status).to.equal(400);

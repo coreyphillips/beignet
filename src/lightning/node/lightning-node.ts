@@ -20359,7 +20359,14 @@ export class LightningNode extends EventEmitter {
 	): Promise<{
 		preimagesKnown: number[];
 		witnesses: Awaited<ReturnType<LightningNode['fetchFforWitnessRecords']>>;
-		action: 'closed' | 'force-closed' | 'nothing' | 'synced';
+		action:
+			| 'closed'
+			| 'force-closed'
+			| 'force-close-refused'
+			| 'nothing'
+			| 'synced';
+		/** The engine's reason, with action 'force-close-refused'. */
+		error?: string;
 	}> {
 		const channelId = Buffer.from(channelIdHex, 'hex');
 		const channel = this.channelManager.getChannel(channelId);
@@ -20433,6 +20440,12 @@ export class LightningNode extends EventEmitter {
 				this.getBitcoinNetwork()
 			);
 			if (res.ok) return { preimagesKnown, witnesses, action: 'force-closed' };
+			return {
+				preimagesKnown,
+				witnesses,
+				action: 'force-close-refused',
+				error: res.error ?? 'Force close failed'
+			};
 		}
 		return { preimagesKnown, witnesses, action: 'nothing' };
 	}
