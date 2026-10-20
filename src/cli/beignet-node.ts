@@ -260,6 +260,7 @@ import {
 	PaymentValidationCheck,
 	PaymentValidationStatus,
 	ChannelPolicyInfo,
+	ChannelPolicyUpdateParams,
 	HoldInvoiceInfo,
 	HoldInvoiceEvent,
 	GraphInfo,
@@ -12307,20 +12308,42 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
-	 * Set the ROUTING fee policy for one channel or all channels. Msat fields
-	 * accept number or decimal string (they are bigint in the library).
-	 * Regenerates and re-broadcasts the channel_update. Throws on invalid
-	 * values or unknown channelId.
+	 * Set the ROUTING fee policy for one channel. Msat fields accept number or
+	 * decimal string (they are bigint in the library). Regenerates and
+	 * re-broadcasts the channel_update. Throws on invalid values or unknown
+	 * channelId.
 	 */
 	updateChannelPolicy(
-		channelId: string | 'all',
-		policy: {
-			feeBaseMsat?: number;
-			feeProportionalMillionths?: number;
-			cltvExpiryDelta?: number;
-			htlcMinimumMsat?: number | string;
-			htlcMaximumMsat?: number | string;
-		}
+		channelId: string,
+		policy: ChannelPolicyUpdateParams
+	): { updated: number; policies: ChannelPolicyInfo[] } {
+		return this.applyChannelPolicy(
+			requireChannelIdHex(channelId),
+			[channelId],
+			policy
+		);
+	}
+
+	/**
+	 * updateChannelPolicy for every channel. A separate method rather than a
+	 * channelId of 'all', so no string a caller passes as an id can address
+	 * every channel.
+	 */
+	updateAllChannelPolicies(policy: ChannelPolicyUpdateParams): {
+		updated: number;
+		policies: ChannelPolicyInfo[];
+	} {
+		return this.applyChannelPolicy(
+			'all',
+			this.node.listChannels().map((ch) => ch.channelId.toString('hex')),
+			policy
+		);
+	}
+
+	private applyChannelPolicy(
+		target: Buffer | 'all',
+		channelIds: string[],
+		policy: ChannelPolicyUpdateParams
 	): { updated: number; policies: ChannelPolicyInfo[] } {
 		const update: import('../lightning/node/types').IChannelPolicyUpdate = {};
 		if (policy.feeBaseMsat !== undefined)
@@ -12345,15 +12368,8 @@ export class BeignetNode extends EventEmitter {
 				'htlcMaximumMsat'
 			);
 
-		const targets =
-			channelId === 'all'
-				? this.node.listChannels().map((ch) => ch.channelId.toString('hex'))
-				: [channelId];
-		this.node.setChannelPolicy(
-			channelId === 'all' ? 'all' : requireChannelIdHex(channelId),
-			update
-		);
-		const policies = targets
+		this.node.setChannelPolicy(target, update);
+		const policies = channelIds
 			.map((id) => this.getChannelPolicy(id))
 			.filter((p): p is ChannelPolicyInfo => p !== null);
 		return { updated: policies.length, policies };

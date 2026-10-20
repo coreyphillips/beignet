@@ -281,6 +281,16 @@ export interface ChannelPolicyInfo {
 	source: 'override' | 'default';
 }
 
+/** Routing policy fields to change; an omitted field keeps its value. */
+export interface ChannelPolicyUpdateParams {
+	feeBaseMsat?: number;
+	feeProportionalMillionths?: number;
+	cltvExpiryDelta?: number;
+	/** Number or decimal string (bigint in the library) */
+	htlcMinimumMsat?: number | string;
+	htlcMaximumMsat?: number | string;
+}
+
 export interface PaymentRouteHop {
 	pubkey: string;
 	shortChannelId: string;
