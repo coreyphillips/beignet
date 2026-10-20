@@ -2578,7 +2578,7 @@ export class Wallet {
 					)[0];
 				}
 
-				this._data.addressIndex[addressTypeKey] = addressIndex;
+				this.moveReceiveIndex(addressTypeKey, addressIndex);
 				this._data.changeAddressIndex[addressTypeKey] = changeAddressIndex;
 				this._data.lastUsedAddressIndex[addressTypeKey] = lastUsedAddressIndex;
 				this._data.lastUsedChangeAddressIndex[addressTypeKey] =
@@ -2591,7 +2591,7 @@ export class Wallet {
 			await Promise.all(promises);
 			if (updated) {
 				await Promise.all([
-					this.saveWalletData('addressIndex', this._data.addressIndex),
+					this.saveReceiveIndex(),
 					this.saveWalletData(
 						'changeAddressIndex',
 						this._data.changeAddressIndex
@@ -2753,6 +2753,44 @@ export class Wallet {
 	private receiveIndexMovesSaved = 0;
 
 	/**
+	 * Moves the receive index to `next` in memory. Every move to an address
+	 * goes through here, the refresh's included: a move made without the
+	 * count, whose write storage then refused, would be served as saved, and
+	 * a restart would come back to the address before it.
+	 * @private
+	 * @param {EAddressType} addressType
+	 * @param {IAddress} next
+	 * @returns {void}
+	 */
+	private moveReceiveIndex(addressType: EAddressType, next: IAddress): void {
+		if (next.index !== this._data.addressIndex[addressType].index) {
+			this.receiveIndexMoves++;
+		}
+		this._data.addressIndex[addressType] = next;
+	}
+
+	/**
+	 * Saves the receive index and, if storage takes the write, records the
+	 * moves made so far as saved.
+	 * @private
+	 * @returns {Promise<Result<string>>}
+	 */
+	private async saveReceiveIndex(): Promise<Result<string>> {
+		const moves = this.receiveIndexMoves;
+		const saved = await this.saveWalletData(
+			'addressIndex',
+			this._data.addressIndex
+		);
+		if (saved.isOk()) {
+			this.receiveIndexMovesSaved = Math.max(
+				this.receiveIndexMovesSaved,
+				moves
+			);
+		}
+		return saved;
+	}
+
+	/**
 	 * Moves the receive index to `next` and saves it, failing if storage
 	 * refuses the write. The index stays moved even then: an overlapping
 	 * request may already have saved a later index, and moving back would
@@ -2766,16 +2804,16 @@ export class Wallet {
 		addressType: EAddressType,
 		next: IAddress
 	): Promise<Result<IAddress>> {
-		this._data.addressIndex[addressType] = next;
-		this.receiveIndexMoves++;
+		this.moveReceiveIndex(addressType, next);
 		return this.savedReceiveAddress(addressType);
 	}
 
 	/**
-	 * The current receive address, once storage holds its index. While an
-	 * issuance write is out or was refused, this saves the index again and
-	 * fails if storage refuses that write too: a restart would otherwise come
-	 * back to an older address and issue it a second time.
+	 * The current receive address, once storage holds its index. While the
+	 * write for a move is out or was refused, an issuance's or a refresh's,
+	 * this saves the index again and fails if storage refuses that write too:
+	 * a restart would otherwise come back to an older address and issue it a
+	 * second time.
 	 * @private
 	 * @param {EAddressType} addressType
 	 * @returns {Promise<Result<IAddress>>}
@@ -2784,18 +2822,15 @@ export class Wallet {
 		addressType: EAddressType
 	): Promise<Result<IAddress>> {
 		const current = this._data.addressIndex[addressType];
-		const moves = this.receiveIndexMoves;
-		if (this.receiveIndexMovesSaved >= moves) return ok(current);
-		const saved = await this.saveWalletData(
-			'addressIndex',
-			this._data.addressIndex
-		);
+		if (this.receiveIndexMovesSaved >= this.receiveIndexMoves) {
+			return ok(current);
+		}
+		const saved = await this.saveReceiveIndex();
 		if (saved.isErr()) {
 			return err(
 				`Failed to persist the receive address index: ${saved.error.message}`
 			);
 		}
-		this.receiveIndexMovesSaved = Math.max(this.receiveIndexMovesSaved, moves);
 		return ok(current);
 	}
 
@@ -6108,7 +6143,7 @@ export class Wallet {
 
 		if (saveAddressIndexes) {
 			await Promise.all([
-				this.saveWalletData('addressIndex', this._data.addressIndex),
+				this.saveReceiveIndex(),
 				this.saveAddressMap('addresses')
 			]);
 		}
@@ -6151,8 +6186,12 @@ export class Wallet {
 			: 'addressIndex';
 		if (address.isOk()) {
 			const key = isChangeAddress ? 'changeAddresses' : 'addresses';
-			this._data[indexToUpdate][addressType] =
-				address.value[key][Object.keys(address.value[key])[0]];
+			const next = address.value[key][Object.keys(address.value[key])[0]];
+			if (isChangeAddress) {
+				this._data.changeAddressIndex[addressType] = next;
+			} else {
+				this.moveReceiveIndex(addressType, next);
+			}
 		}
 		// Ensure we have addresses to pull from.
 		let addresses = {};
