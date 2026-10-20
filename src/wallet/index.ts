@@ -991,6 +991,9 @@ export class Wallet {
 			// a fee update on it, connecting an instance nobody holds.
 			const next = new Wallet(params);
 			await next.electrum.abandon();
+			// An addressIndex write that lands from here on may be missing from
+			// the read below, and is adopted once that read is installed.
+			this.landedReceiveIndex = undefined;
 			const res = await next.setWalletData();
 			if (res.isErr()) return err(res.error.message);
 			await this.electrum.disconnect();
@@ -1001,7 +1004,8 @@ export class Wallet {
 			// for storage has to stay ahead of later writes to its key, including
 			// ones made after switching back to its network. So does the receive
 			// index move count: an issuance still out settles against it, and
-			// against a fresh one it would mark later unsaved moves as saved.
+			// against a fresh one it would mark later unsaved moves as saved. So
+			// does the newest landed index write, for the adoption below.
 			const kept = new Set([
 				'isSwitchingNetworks',
 				'isRefreshing',
@@ -1011,7 +1015,8 @@ export class Wallet {
 				'_refreshStartCallbacks',
 				'savingOperations',
 				'waitingWrites',
-				'receiveIndexMoves'
+				'receiveIndexMoves',
+				'landedReceiveIndex'
 			]);
 			Object.assign(
 				this,
@@ -1023,8 +1028,10 @@ export class Wallet {
 			);
 			// The receive index was just read from storage, so it has nothing to
 			// save. Writing it again could land behind an issuance still out and
-			// put storage back on an older index.
+			// put storage back on an older index. A write that landed while the
+			// read was out is already in storage, and only needs adopting here.
 			this.receiveIndexMovesSaved = this.receiveIndexMoves;
+			this.adoptLandedReceiveIndex();
 			// Both point back at the wallet that constructed them.
 			this.transaction = new Transaction({ wallet: this });
 			this.electrum = new Electrum({
@@ -2751,6 +2758,12 @@ export class Wallet {
 	// moves a successful addressIndex write is known to carry.
 	private receiveIndexMoves = 0;
 	private receiveIndexMovesSaved = 0;
+	// The newest addressIndex write storage has taken, under the storage key
+	// it went to, since the last switchNetwork began reading storage.
+	private landedReceiveIndex?: {
+		walletDataKey: string;
+		written: IWalletData['addressIndex'];
+	};
 
 	/**
 	 * Moves the receive index to `next` in memory. Every move to an address
@@ -2784,7 +2797,10 @@ export class Wallet {
 	private async saveReceiveIndex(): Promise<Result<string>> {
 		const moves = this.receiveIndexMoves;
 		const data = this._data;
-		const written = data.addressIndex;
+		// A copy: a later move changes the live map while this write is out,
+		// and the write, and what is adopted from it, must hold what storage
+		// was handed, or a refused later move could be served as saved.
+		const written = { ...data.addressIndex };
 		const walletDataKey = this.getWalletDataKey('addressIndex');
 		const saved = await this.saveWalletDataAt(
 			'addressIndex',
@@ -2793,22 +2809,36 @@ export class Wallet {
 		);
 		if (saved.isErr()) return saved;
 		this.receiveIndexMovesSaved = Math.max(this.receiveIndexMovesSaved, moves);
-		// Only a network switch replaces _data. The index it reloaded is behind
-		// this write only if the wallet is on the network the write went to. A
-		// wallet still away reads the index this write stored when it returns.
+		this.landedReceiveIndex = { walletDataKey, written };
+		// Only a network switch replaces _data. A switch that read storage
+		// before this write landed, but has not installed that read yet, is
+		// still on the network it is leaving, and adopts the write itself.
+		if (this._data !== data) this.adoptLandedReceiveIndex();
+		return saved;
+	}
+
+	/**
+	 * Brings the live receive index forward to the newest landed write, for
+	 * each address type the live index is behind it on. A write to another
+	 * network's key is left alone: switching back reads the index it stored.
+	 * @private
+	 * @returns {void}
+	 */
+	private adoptLandedReceiveIndex(): void {
+		const landed = this.landedReceiveIndex;
 		if (
-			this._data !== data &&
-			this.getWalletDataKey('addressIndex') === walletDataKey
+			!landed ||
+			landed.walletDataKey !== this.getWalletDataKey('addressIndex')
 		) {
-			for (const addressType of Object.keys(written) as EAddressType[]) {
-				const landed = written[addressType];
-				const live = this._data.addressIndex[addressType];
-				if (landed && (!live || live.index < landed.index)) {
-					this._data.addressIndex[addressType] = landed;
-				}
+			return;
+		}
+		for (const addressType of Object.keys(landed.written) as EAddressType[]) {
+			const written = landed.written[addressType];
+			const live = this._data.addressIndex[addressType];
+			if (written && (!live || live.index < written.index)) {
+				this._data.addressIndex[addressType] = written;
 			}
 		}
-		return saved;
 	}
 
 	/**
