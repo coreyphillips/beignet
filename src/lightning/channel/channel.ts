@@ -22849,17 +22849,29 @@ export class Channel {
 					'splice tx_init_rbf from the quiescence non-initiator'
 				);
 			}
+			const reason = 'splice RBF not supported';
+			const channelId = this._state.channelId ?? msg.channelId;
 			// On a signed splice the peer quiesced only to ask, and leaves the
 			// session on our tx_abort: leave it here too, or updates stay
-			// frozen until the quiescence watchdog fires. Before both
-			// tx_signatures the quiescence belongs to the splice negotiation.
-			return [
-				...(this.isSplicePendingLock() ? this.exitQuiescence() : []),
-				this._txAbort(
-					this._state.channelId ?? msg.channelId,
-					'splice RBF not supported'
-				)
-			];
+			// frozen until the quiescence watchdog fires.
+			if (this.isSplicePendingLock()) {
+				return [...this.exitQuiescence(), this._txAbort(channelId, reason)];
+			}
+			// Before any tx_signatures the peer forgets the whole negotiation on
+			// our tx_abort, and the latch swallows its echo, so unwind here. A
+			// record was persisted at the commitment round: persist its clear
+			// ahead of the abort, or a restart resumes the splice. Once either
+			// side's tx_signatures moved, abortSplice refuses and the splice is
+			// kept.
+			const hadRecord = !!this._state.spliceInFlight;
+			const unwind = this.abortSplice(reason);
+			if (unwind.some((a) => a.type === ChannelActionType.ERROR)) {
+				return [this._txAbort(channelId, reason)];
+			}
+			const persist: ChannelAction[] = hadRecord
+				? [{ type: ChannelActionType.PERSIST_STATE }]
+				: [];
+			return [...persist, this._txAbort(channelId, reason), ...unwind];
 		}
 
 		const session = this._state.dualFundingSession;
