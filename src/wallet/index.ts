@@ -993,7 +993,7 @@ export class Wallet {
 			await next.electrum.abandon();
 			// An addressIndex write that lands from here on may be missing from
 			// the read below, and is adopted once that read is installed.
-			this.landedReceiveIndex = undefined;
+			this.landedReceiveIndex = {};
 			const res = await next.setWalletData();
 			if (res.isErr()) return err(res.error.message);
 			await this.electrum.disconnect();
@@ -1005,7 +1005,7 @@ export class Wallet {
 			// ones made after switching back to its network. So does the receive
 			// index move count: an issuance still out settles against it, and
 			// against a fresh one it would mark later unsaved moves as saved. So
-			// does the newest landed index write, for the adoption below.
+			// do the landed index writes, for the adoption below.
 			const kept = new Set([
 				'isSwitchingNetworks',
 				'isRefreshing',
@@ -2758,12 +2758,11 @@ export class Wallet {
 	// moves a successful addressIndex write is known to carry.
 	private receiveIndexMoves = 0;
 	private receiveIndexMovesSaved = 0;
-	// The newest addressIndex write storage has taken, under the storage key
-	// it went to, since the last switchNetwork began reading storage.
-	private landedReceiveIndex?: {
-		walletDataKey: string;
-		written: IWalletData['addressIndex'];
-	};
+	// The newest addressIndex write storage has taken under each storage key,
+	// since the last switchNetwork began reading storage. Index writes share
+	// one queue across networks, so one for another network's key can land
+	// after the one this network's reload needs.
+	private landedReceiveIndex: Record<string, IWalletData['addressIndex']> = {};
 
 	/**
 	 * Moves the receive index to `next` in memory. Every move to an address
@@ -2809,7 +2808,7 @@ export class Wallet {
 		);
 		if (saved.isErr()) return saved;
 		this.receiveIndexMovesSaved = Math.max(this.receiveIndexMovesSaved, moves);
-		this.landedReceiveIndex = { walletDataKey, written };
+		this.landedReceiveIndex[walletDataKey] = written;
 		// Only a network switch replaces _data. A switch that read storage
 		// before this write landed, but has not installed that read yet, is
 		// still on the network it is leaving, and adopts the write itself.
@@ -2825,15 +2824,11 @@ export class Wallet {
 	 * @returns {void}
 	 */
 	private adoptLandedReceiveIndex(): void {
-		const landed = this.landedReceiveIndex;
-		if (
-			!landed ||
-			landed.walletDataKey !== this.getWalletDataKey('addressIndex')
-		) {
-			return;
-		}
-		for (const addressType of Object.keys(landed.written) as EAddressType[]) {
-			const written = landed.written[addressType];
+		const landed =
+			this.landedReceiveIndex[this.getWalletDataKey('addressIndex')];
+		if (!landed) return;
+		for (const addressType of Object.keys(landed) as EAddressType[]) {
+			const written = landed[addressType];
 			const live = this._data.addressIndex[addressType];
 			if (written && (!live || live.index < written.index)) {
 				this._data.addressIndex[addressType] = written;
