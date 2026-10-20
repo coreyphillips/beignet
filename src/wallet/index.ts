@@ -993,9 +993,9 @@ export class Wallet {
 			// running here settles against it, and the one started below queues
 			// behind that refresh. So does the write queue: a write still waiting
 			// for storage has to stay ahead of later writes to its key, including
-			// ones made after switching back to its network. So do the receive
-			// index counters: an issuance still out settles against them, and
-			// against fresh ones it would mark later unsaved moves as saved.
+			// ones made after switching back to its network. So does the receive
+			// index move count: an issuance still out settles against it, and
+			// against a fresh one it would mark later unsaved moves as saved.
 			const kept = new Set([
 				'isSwitchingNetworks',
 				'isRefreshing',
@@ -1005,8 +1005,7 @@ export class Wallet {
 				'_refreshStartCallbacks',
 				'savingOperations',
 				'waitingWrites',
-				'receiveIndexMoves',
-				'receiveIndexMovesSaved'
+				'receiveIndexMoves'
 			]);
 			Object.assign(
 				this,
@@ -1016,6 +1015,10 @@ export class Wallet {
 					)
 				)
 			);
+			// The receive index was just read from storage, so it has nothing to
+			// save. Writing it again could land behind an issuance still out and
+			// put storage back on an older index.
+			this.receiveIndexMovesSaved = this.receiveIndexMoves;
 			// Both point back at the wallet that constructed them.
 			this.transaction = new Transaction({ wallet: this });
 			this.electrum = new Electrum({

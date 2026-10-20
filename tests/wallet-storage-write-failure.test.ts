@@ -18,6 +18,7 @@ import {
 	err,
 	getWalletDataStorageKey,
 	IFormattedTransaction,
+	IOnchainFees,
 	IWallet,
 	IWalletData,
 	ok,
@@ -358,6 +359,73 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		expect(wallet.data.addressIndex[type].index).to.equal(issued.value.index);
 		const saved = stored(store, 'addressIndex') as IWalletData['addressIndex'];
 		expect(saved[type].index).to.equal(issued.value.index);
+	});
+
+	it('does not write the index a network switch reloads over an issuance still out (issue #1736)', async function () {
+		const { storage, store } = memoryStorage();
+		const indexWrites: IWalletData['addressIndex'][] = [];
+		let hold = false;
+		let writeOut = (): void => undefined;
+		const out = new Promise<void>((resolve) => (writeOut = resolve));
+		let release = (): void => undefined;
+		const released = new Promise<void>((resolve) => (release = resolve));
+		const wallet = await open({
+			...storage,
+			setData: async <K extends keyof IWalletData>(
+				key: string,
+				value: IWalletData[K]
+			): Promise<Result<boolean>> => {
+				if (key === storageKey('addressIndex')) {
+					indexWrites.push(value as IWalletData['addressIndex']);
+					if (hold) {
+						hold = false;
+						writeOut();
+						await released;
+					}
+				}
+				return storage.setData(key, value);
+			}
+		});
+		wallet.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
+			ok(wallet.feeEstimates);
+		(
+			wallet as unknown as { _runRefresh: () => Promise<Result<IWalletData>> }
+		)._runRefresh = async (): Promise<Result<IWalletData>> => ok(wallet.data);
+		const type = wallet.addressType;
+		const first = await wallet.generateNewReceiveAddress();
+		if (first.isErr()) throw first.error;
+		const before = first.value.index;
+		indexWrites.length = 0;
+
+		hold = true;
+		const pending = wallet.generateNewReceiveAddress();
+		await out;
+		const away = await wallet.switchNetwork(
+			EAvailableNetworks.signet,
+			electrumOptions.servers
+		);
+		if (away.isErr()) throw away.error;
+		wallet.electrum.disconnect = async (): Promise<void> => undefined;
+		const back = await wallet.switchNetwork(NETWORK, electrumOptions.servers);
+		if (back.isErr()) throw back.error;
+		const read = wallet.getReceiveAddress({});
+		release();
+		const issued = await pending;
+		const current = await read;
+
+		if (issued.isErr()) throw issued.error;
+		if (current.isErr()) throw current.error;
+		expect(issued.value.index).to.equal(before + 1);
+		expect(indexWrites.map((written) => written[type].index)).to.deep.equal([
+			before + 1
+		]);
+		const saved = stored(store, 'addressIndex') as IWalletData['addressIndex'];
+		expect(saved[type].index).to.equal(issued.value.index);
+		await wallet.stop();
+		const restarted = await open(storage);
+		const next = await restarted.generateNewReceiveAddress();
+		if (next.isErr()) throw next.error;
+		expect(next.value.index).to.equal(issued.value.index + 1);
 	});
 
 	it('reports refused index writes from resetAddressIndexes', async function () {
