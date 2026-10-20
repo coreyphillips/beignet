@@ -1431,6 +1431,10 @@ export class DirectFundingReceiver extends EventEmitter {
 			funding,
 			channelId
 		);
+		// A stopped engine answers nothing, as admission rules: the listeners
+		// that would finish or unwind the funding served from here are gone. The
+		// payer's re-send is judged afresh by whatever runs next.
+		if (!this.started) return;
 		if (settledTx) {
 			this.completeFunding(
 				frame,

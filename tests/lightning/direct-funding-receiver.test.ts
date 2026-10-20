@@ -1354,6 +1354,42 @@ describe('Direct funding receiver: a restart mid-funding (issue #635)', () => {
 		engine.stop();
 	});
 
+	it('serves nothing when stopped while the funding is being recovered (issue #1648)', async () => {
+		const c = await crashAfterSignRequest();
+		const fundingTxid = c.signedTx.getId();
+		let release: (() => void) | undefined;
+		const getTransaction = c.second.chain.getTransaction;
+		c.second.chain.getTransaction = (txid): Promise<Buffer> =>
+			txid === fundingTxid
+				? new Promise((resolve, reject) => {
+						release = (): void => {
+							getTransaction(txid).then(resolve, reject);
+						};
+				  })
+				: getTransaction(txid);
+		const again = new FakePayerLane(c.record, 'lane-after');
+		const engine = restart(c.second);
+		const accepted: unknown[] = [];
+		engine.on('offer:accepted', (e) => accepted.push(e));
+		engine.handleFrame(again.offerFrame(c.offer));
+		await flush();
+		expect(release, 'the completed-funding lookup is held').to.not.equal(
+			undefined
+		);
+
+		// The channel answers for the funding by the time the chain does, which
+		// is what would otherwise send the resumed offer on into a session.
+		engine.stop();
+		c.second.stagePendingV2(c.channelId, c.coin, c.offer);
+		release!();
+		await flush();
+
+		expect(accepted).to.have.length(0);
+		expect(engine.sessionCount()).to.equal(0);
+		expect(again.bodiesOf(ACK)).to.have.length(0);
+		expect(again.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+	});
+
 	it('resumes a splice from the channel it was negotiated into', async () => {
 		const storage = memoryStorage();
 		const first = new FakeDfNode(storage);
