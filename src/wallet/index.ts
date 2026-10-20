@@ -1896,6 +1896,10 @@ export class Wallet {
 		if (!isConnected) {
 			return await this.connectToElectrum();
 		}
+		// A refresh reaches this before each of its steps, and the step before
+		// has usually just been answered.
+		if (this.electrum.answeredRecently())
+			return ok('Is connected to Electrum.');
 		// Ensure we're connected by pinging the server.
 		const pingRes = await this.electrum.isConnected();
 		if (pingRes) return ok('Is connected to Electrum.Z');

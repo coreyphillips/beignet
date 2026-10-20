@@ -83,6 +83,13 @@ const LIVENESS_SCRIPT_HASH =
 	'77ca78f9a84b48041ad71f7cc6ff6c33460c25f0cb99f558f9813ed9e63727dd';
 
 /**
+ * How long an answer from our own peer stands in for a liveness ping. A socket
+ * that died since then fails the next request just as it would fail the ping,
+ * and a failed ping does not reconnect either.
+ */
+const RECENT_ANSWER_MS = 5000;
+
+/**
  * Bitcoin Core's "not found" from a node without a txindex, in the current
  * wording ("... Use -txindex or provide a block hash ...") and the one before
  * 0.17 ("... Use -txindex to enable ..."), as electrs relays it: unchanged, at
@@ -580,6 +587,8 @@ export class Electrum {
 	 *  header that arrives too far away to be compared is read as a rollback
 	 *  rather than as growth: see applyHeader. */
 	private _tipUnverified = false;
+	/** When the server last answered a request without an error. */
+	private _answeredAt = 0;
 
 	public servers?: TServer | TServer[];
 	public network: EAvailableNetworks;
@@ -932,6 +941,7 @@ export class Electrum {
 				scriptHash: LIVENESS_SCRIPT_HASH,
 				network: electrumNetwork
 			});
+			if (electrumNetwork === this.electrumNetwork) this.noteAnswer(response);
 			return !response?.error;
 		} catch {
 			return false;
@@ -1199,6 +1209,18 @@ export class Electrum {
 	}
 
 	/**
+	 * Whether our own peer answered a request within RECENT_ANSWER_MS, which
+	 * says as much as isConnected() would without the round trip.
+	 */
+	public answeredRecently(): boolean {
+		return Date.now() - this._answeredAt < RECENT_ANSWER_MS && this.isOurPeer();
+	}
+
+	private noteAnswer(response: { error?: boolean } | undefined): void {
+		if (response && !response.error) this._answeredAt = Date.now();
+	}
+
+	/**
 	 * Whether the client this process holds for our network is the one this
 	 * instance connected.
 	 *
@@ -1313,17 +1335,24 @@ export class Electrum {
 			const addressBatches = splitAddresses(addresses, this.batchLimit);
 			let balance = 0;
 			const utxos: IUtxo[] = [];
-			for (const batch of addressBatches) {
+			const promises: Promise<TUnspentAddressScriptHashResponse>[] = [];
+			for (let i = 0; i < addressBatches.length; i++) {
+				if (i > 0) await sleep(this.batchDelay);
 				if (this._disconnected) return err(DISCONNECTED_ERROR);
-				const unspentAddressResult: TUnspentAddressScriptHashResponse =
-					await electrum.listUnspentAddressScriptHashes({
+				promises.push(
+					electrum.listUnspentAddressScriptHashes({
 						scriptHashes: {
 							key: 'scriptHash',
-							data: batch
+							data: addressBatches[i]
 						},
 						network: this.electrumNetwork
-					});
+					})
+				);
+			}
 
+			const responses = await Promise.all(promises);
+			responses.forEach((response) => this.noteAnswer(response));
+			for (const unspentAddressResult of responses) {
 				if (unspentAddressResult.error) {
 					return err(JSON.stringify(unspentAddressResult?.data ?? ''));
 				}
@@ -1345,7 +1374,6 @@ export class Electrum {
 						}
 					}
 				);
-				await sleep(this.batchDelay);
 			}
 
 			return ok({ utxos, balance });
@@ -1440,6 +1468,7 @@ export class Electrum {
 
 			// split payload in chunks of 10 addresses per-request
 			for (let i = 0; i < scriptHashes.length; i += this.batchLimit) {
+				if (i > 0) await sleep(this.batchDelay);
 				if (this._disconnected) return err(DISCONNECTED_ERROR);
 				const chunk = scriptHashes.slice(i, i + this.batchLimit);
 				const payload = {
@@ -1454,11 +1483,11 @@ export class Electrum {
 						network: this.electrumNetwork
 					})
 				);
-				await sleep(this.batchDelay);
 			}
 
 			const responses = await Promise.all(promises);
 			responses.forEach((response) => {
+				this.noteAnswer(response);
 				if (!response.error) {
 					combinedResponse.push(...response.data);
 				}
@@ -1739,6 +1768,7 @@ export class Electrum {
 
 			// split payload in chunks of 10 transactions per-request
 			for (let i = 0; i < txHashes.length; i += this.batchLimit) {
+				if (i > 0) await sleep(this.batchDelay);
 				if (this._disconnected) return err(DISCONNECTED_ERROR);
 				const chunk = txHashes.slice(i, i + this.batchLimit);
 
@@ -1753,10 +1783,10 @@ export class Electrum {
 						network: this.electrumNetwork
 					})
 				);
-				await sleep(this.batchDelay);
 			}
 			const responses = await Promise.all(promises);
 			responses.forEach((response) => {
+				this.noteAnswer(response);
 				if (!response.error) result.push(...response.data);
 			});
 			return ok({
