@@ -6,13 +6,32 @@
 
 import * as http from 'http';
 import * as fs from 'fs';
+import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
+import * as tls from 'tls';
 import { expect } from 'chai';
 import { formatSseFrame, getRelayedEvents } from '../../src/cli/daemon';
 import { WebhookManager } from '../../src/cli/webhooks';
 import { BeignetNode, holdInvoiceEvent } from '../../src/cli/beignet-node';
+import {
+	createConsoleLogger,
+	EAvailableNetworks,
+	EProtocol,
+	err,
+	getWalletDataStorageKey,
+	IOnchainFees,
+	IWalletData,
+	ok,
+	Result,
+	TMessageDataMap,
+	TStorage,
+	TWalletDataKeys,
+	Wallet
+} from '../../src';
+import { getDefaultSendTransaction } from '../../src/shapes/wallet';
 import { EPaymentType } from '../../src/types/wallet';
+import { TEST_MNEMONIC } from '../constants';
 
 const NEW_EVENTS = [
 	'invoice:settled',
@@ -274,6 +293,153 @@ describe('Event granularity (M4 batch 2b)', () => {
 			expect(logged).to.deep.equal([
 				['error', 'Wallet storage write failed', failure]
 			]);
+		});
+
+		// Issue #1744: the daemon's wallet holds every message until its first
+		// refresh ends, so a write refused at startup or during the initial
+		// sync never reached the handler above, and the stale stored copy went
+		// unreported. The wallet here is created the way initNode creates it,
+		// wired to the handler, with no Electrum server to reach.
+		describe('refused writes before the first refresh ends (issue #1744)', function () {
+			this.timeout(20_000);
+			const NAME = 'daemonwallet';
+			const NETWORK = EAvailableNetworks.regtest;
+			const storageKey = (key: TWalletDataKeys): string =>
+				getWalletDataStorageKey(NAME, NETWORK, key);
+			const electrumOptions = {
+				net,
+				tls,
+				servers: {
+					host: '127.0.0.1',
+					ssl: 65522,
+					tcp: 65522,
+					protocol: EProtocol.tcp
+				}
+			};
+			const store = new Map<string, string>();
+			const refused = new Set<TWalletDataKeys>();
+			const storage: TStorage = {
+				getData: async <K extends keyof IWalletData>(
+					key: string
+				): Promise<Result<IWalletData[K]>> => {
+					const raw = store.get(key);
+					if (raw === undefined)
+						return ok(undefined as unknown as IWalletData[K]);
+					return ok(JSON.parse(raw));
+				},
+				setData: async <K extends keyof IWalletData>(
+					key: string,
+					value: IWalletData[K]
+				): Promise<Result<boolean>> => {
+					if ([...refused].some((k) => key === storageKey(k))) {
+						return err('storage is full');
+					}
+					store.set(key, JSON.stringify(value));
+					return ok(true);
+				}
+			};
+			const errors: Array<[string, unknown]> = [];
+			const record =
+				(level: string) =>
+				(message: string, data?: unknown): void => {
+					if (level === 'error') errors.push([message, data]);
+				};
+			const daemon = {
+				logLevel: 'info',
+				logger: {
+					debug: record('debug'),
+					info: record('info'),
+					warn: record('warn'),
+					error: record('error')
+				},
+				emit: (): boolean => true,
+				log: (BeignetNode.prototype as any).log
+			};
+			const failed = (key: TWalletDataKeys): [string, unknown] => [
+				'Wallet storage write failed',
+				{ key, storageKey: storageKey(key), error: 'storage is full' }
+			];
+			const header = (height: number): IWalletData['header'] => ({
+				height,
+				hash: 'aa'.repeat(32),
+				hex: ''
+			});
+			let wallet: Wallet | undefined;
+
+			const create = async (): Promise<Wallet> => {
+				const res = await Wallet.create({
+					mnemonic: TEST_MNEMONIC,
+					network: NETWORK,
+					name: NAME,
+					electrumOptions,
+					storage,
+					disableRefreshOnCreate: true,
+					disableMessagesOnCreate: true,
+					logger: createConsoleLogger('silent'),
+					onMessage: <K extends keyof TMessageDataMap>(
+						key: K,
+						data: TMessageDataMap[K]
+					): void =>
+						(BeignetNode.prototype as any).onWalletMessage.call(
+							daemon,
+							key,
+							data
+						)
+				});
+				if (res.isErr()) throw res.error;
+				return res.value;
+			};
+
+			afterEach(async () => {
+				await wallet?.stop();
+				wallet = undefined;
+			});
+
+			it('logs a scrub refused at startup and a header write refused during the initial sync', async () => {
+				// The first start saves the id the staged send is seeded under.
+				wallet = await create();
+				await wallet.stop();
+				store.set(
+					storageKey('transaction'),
+					JSON.stringify({
+						...getDefaultSendTransaction(),
+						outputs: [{ address: 'bcrt1qrecipient', value: 1000, index: 0 }]
+					})
+				);
+				refused.add('transaction');
+				errors.length = 0;
+
+				wallet = await create();
+
+				expect(wallet.data.transaction.outputs).to.deep.equal([]);
+				expect(errors).to.deep.equal([failed('transaction')]);
+
+				// The initial sync, as waitForInitialSync drives it.
+				const synced = wallet;
+				synced.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
+					ok(synced.feeEstimates);
+				(
+					synced as unknown as {
+						_runRefresh: () => Promise<Result<IWalletData>>;
+					}
+				)._runRefresh = async (): Promise<Result<IWalletData>> => {
+					await synced.updateHeader(header(10));
+					return ok(synced.data);
+				};
+				refused.clear();
+				refused.add('header');
+				errors.length = 0;
+
+				const refreshed = await synced.refreshWallet({});
+
+				if (refreshed.isErr()) throw refreshed.error;
+				expect(errors).to.deep.equal([failed('header')]);
+
+				// After it, as the daemon always has.
+				errors.length = 0;
+				await synced.updateHeader(header(11));
+				expect(errors).to.deep.equal([failed('header')]);
+			});
 		});
 	});
 

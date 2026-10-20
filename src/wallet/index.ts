@@ -236,7 +236,13 @@ export class Wallet {
 	// least recently used first. A txid commits to its outputs, so an answer
 	// never goes stale, confirmed or not. Memory only.
 	private readonly _prevouts: Map<string, InputData[string]> = new Map();
-	private _disableMessagesOnCreate: boolean;
+	// Raised by disableMessagesOnCreate, lowered when the first refresh ends.
+	// What the wallet reports before then is its stored history coming back,
+	// not news, so onMessage hears none of it. A refused storage write is not
+	// history, and the message is the only word a host gets of one, so it is
+	// the one message that still passes (issue #1744). Separate from
+	// disableMessages, which the host owns and stop() raises for good.
+	private _quietUntilFirstRefresh: boolean;
 	private _disableRefreshOnCreate: boolean;
 	// Raised by stop(). Work that outlived the shutdown, above all the refresh
 	// its deadline walked away from, must not undo the teardown.
@@ -411,7 +417,7 @@ export class Wallet {
 		this._getData = storage?.getData ?? getDataFallback;
 		this._setData = storage?.setData;
 		this._resetOnReadFailure = resetOnReadFailure;
-		this._disableMessagesOnCreate = disableMessagesOnCreate;
+		this._quietUntilFirstRefresh = disableMessagesOnCreate;
 		this._disableRefreshOnCreate = disableRefreshOnCreate;
 		if (customGetAddress) this._customGetAddress = customGetAddress;
 		if (customGetScriptHash) this._customGetScriptHash = customGetScriptHash;
@@ -427,6 +433,7 @@ export class Wallet {
 			data: TMessageDataMap[K]
 		): void => {
 			if (this.disableMessages) return;
+			if (this._quietUntilFirstRefresh && key !== 'storageWriteFailed') return;
 			onMessage(key, data);
 		};
 		this.electrumOptions = electrumOptions;
@@ -528,7 +535,6 @@ export class Wallet {
 		let wallet: Wallet | undefined;
 		try {
 			wallet = new Wallet(params);
-			if (wallet._disableMessagesOnCreate) wallet.disableMessages = true;
 			const res = await wallet.setWalletData();
 			if (res.isErr()) {
 				await wallet._abandonFailedCreate();
@@ -1133,11 +1139,9 @@ export class Wallet {
 			}
 		} finally {
 			this._activeRefreshes -= 1;
-			// Not for a refresh that outlived stop(): the teardown disabled
-			// messages on purpose, and a wallet that has shut down must not send
-			// its consumer anything more.
-			if (this._disableMessagesOnCreate && !this._stopped)
-				this.disableMessages = false;
+			// Harmless after stop(): disableMessages, which the teardown raised,
+			// still silences everything.
+			this._quietUntilFirstRefresh = false;
 		}
 		if (this._activeRefreshes === 0) {
 			this._resolveAllPendingRefreshPromises(result);

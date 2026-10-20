@@ -281,6 +281,9 @@ export interface IWallet {
 	selectedFeeId?: EFeeId;
 	feeEstimationSource?: TFeeEstimationSource;
 	disableMessages?: boolean;
+	/** Hold onMessage until the first refresh ends, so stored history does not
+	 *  replay as news. A storageWriteFailed message still passes: it is the
+	 *  only word a host gets of a write that storage refused at startup. */
 	disableMessagesOnCreate?: boolean;
 	/** Skip the refreshWallet Wallet.create fires in the background, for a
 	 *  host that owns the startup refresh itself and needs to hold the ONE
