@@ -952,11 +952,11 @@ describe('Channel Routing Policy (M3)', function () {
 			});
 			try {
 				// No channels yet: 'all' is a no-op but must still validate fields
-				const result = node.updateChannelPolicy('all', { feeBaseMsat: 100 });
+				const result = node.updateAllChannelPolicies({ feeBaseMsat: 100 });
 				expect(result.updated).to.equal(0);
 				expect(result.policies).to.deep.equal([]);
 				expect(() =>
-					node.updateChannelPolicy('all', { cltvExpiryDelta: 0 })
+					node.updateAllChannelPolicies({ cltvExpiryDelta: 0 })
 				).to.throw('cltvExpiryDelta');
 				// Unknown channel: policy lookup is null, update throws
 				expect(node.getChannelPolicy('bb'.repeat(32))).to.be.null;

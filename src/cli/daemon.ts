@@ -2053,15 +2053,18 @@ async function bootDaemon(
 			};
 			if (!channelId && all !== true)
 				return failure('INVALID_PARAMS', 'channelId or all:true required');
+			const policy = {
+				feeBaseMsat,
+				feeProportionalMillionths,
+				cltvExpiryDelta,
+				htlcMinimumMsat,
+				htlcMaximumMsat
+			};
 			try {
 				return success(
-					node.updateChannelPolicy(all === true ? 'all' : channelId!, {
-						feeBaseMsat,
-						feeProportionalMillionths,
-						cltvExpiryDelta,
-						htlcMinimumMsat,
-						htlcMaximumMsat
-					})
+					all === true
+						? node.updateAllChannelPolicies(policy)
+						: node.updateChannelPolicy(channelId!, policy)
 				);
 			} catch (err) {
 				return failure('INVALID_PARAMS', (err as Error).message);

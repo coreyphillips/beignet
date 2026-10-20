@@ -125,21 +125,38 @@ describe('Issue #1603: channel methods refuse a malformed channel id', () => {
 		]);
 	});
 
-	it("keeps updateChannelPolicy's 'all' sentinel", () => {
+	// Issue #1654: 'all' was a sentinel here, so a body channelId of "all"
+	// rewrote every channel's policy without all:true.
+	it("refuses 'all' as a channel id", () => {
+		expect(() =>
+			guardedNode().updateChannelPolicy('all', { feeBaseMsat: 1 })
+		).to.throw(BeignetError, 'channelId must be a 64-character hex channel id');
+	});
+
+	it('updateAllChannelPolicies updates every channel', () => {
+		const ids = ['aa'.repeat(32), 'bb'.repeat(32)];
 		let target: unknown;
 		const bn = Object.assign(Object.create(BeignetNode.prototype), {
 			node: {
-				listChannels: (): unknown[] => [],
+				listChannels: (): Array<{ channelId: Buffer }> =>
+					ids.map((id) => ({ channelId: Buffer.from(id, 'hex') })),
 				setChannelPolicy: (id: unknown): void => {
 					target = id;
-				}
+				},
+				getChannelPolicy: (): Record<string, unknown> => ({
+					feeBaseMsat: 1,
+					feeProportionalMillionths: 0,
+					cltvExpiryDelta: 40,
+					htlcMinimumMsat: 1000n,
+					htlcMaximumMsat: 2000n,
+					source: 'override'
+				})
 			}
 		}) as unknown as BeignetNode;
-		expect(bn.updateChannelPolicy('all', { feeBaseMsat: 1 })).to.deep.equal({
-			updated: 0,
-			policies: []
-		});
+		const result = bn.updateAllChannelPolicies({ feeBaseMsat: 1 });
 		expect(target).to.equal('all');
+		expect(result.updated).to.equal(2);
+		expect(result.policies.map((p) => p.channelId)).to.deep.equal(ids);
 	});
 });
 
@@ -292,6 +309,39 @@ describe('Issue #1603: channel routes answer a malformed id with 400', function 
 			}
 		});
 	}
+
+	it('POST /channel/update-policy takes all:true, not a channelId of "all"', async () => {
+		const engine = (daemon.node as unknown as { node: Record<string, unknown> })
+			.node;
+		const targets: unknown[] = [];
+		const setChannelPolicy = engine.setChannelPolicy as (
+			...args: unknown[]
+		) => void;
+		engine.setChannelPolicy = (...args: unknown[]): void => {
+			targets.push(args[0]);
+			setChannelPolicy.apply(engine, args);
+		};
+		try {
+			const refused = await request(port, 'POST', '/channel/update-policy', {
+				channelId: 'all',
+				feeBaseMsat: 0
+			});
+			expect(refused.status).to.equal(400);
+			expect((refused.body.error as { code: string }).code).to.equal(
+				'INVALID_PARAMS'
+			);
+			expect(targets).to.deep.equal([]);
+
+			const bulk = await request(port, 'POST', '/channel/update-policy', {
+				all: true,
+				feeBaseMsat: 0
+			});
+			expect(bulk.status).to.equal(200);
+			expect(targets).to.deep.equal(['all']);
+		} finally {
+			engine.setChannelPolicy = setChannelPolicy;
+		}
+	});
 
 	it('still answers a well-formed unknown id as not found', async () => {
 		const res = await request(
