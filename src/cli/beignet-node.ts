@@ -2744,7 +2744,9 @@ export class BeignetNode extends EventEmitter {
 			// through the initial sync above, so history never replays as
 			// arrivals; what reaches the handler happened while the daemon was
 			// watching, or was found new at a catch-up sync, which is still
-			// news to whoever runs the node.
+			// news to whoever runs the node. A refused storage write is the one
+			// message that passes even then: startup is when the stored copy
+			// is most likely to be left stale, and nothing else reports it.
 			onMessage: (key, data) => this.onWalletMessage(key, data),
 			// Route wallet diagnostics through the injected logger when provided;
 			// otherwise keep the wallet's default console logger (status quo).

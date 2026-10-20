@@ -178,6 +178,124 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		expectReported('transaction');
 	});
 
+	// Issue #1744: the daemon creates its wallet with disableMessagesOnCreate,
+	// which held back every message until the first refresh ended, this report
+	// among them. A write refused at startup or during that refresh left
+	// storage stale and told nobody.
+	describe('created with disableMessagesOnCreate (issue #1744)', function () {
+		/** Every message the listener heard, in order, by key. */
+		let heard: string[];
+
+		const openQuiet = async (storage: TStorage): Promise<Wallet> => {
+			heard = [];
+			const res = await create(storage, {
+				disableMessagesOnCreate: true,
+				onMessage: <K extends keyof TMessageDataMap>(
+					key: K,
+					data: TMessageDataMap[K]
+				): void => {
+					// The connection poll announces its own state changes on its own
+					// schedule, so it is left out of the order asserted below.
+					if (key === 'connectedToElectrum') return;
+					heard.push(key);
+					if (key === 'storageWriteFailed') {
+						reports.push(data as TStorageWriteFailure);
+					}
+				}
+			});
+			if (res.isErr()) throw res.error;
+			return res.value;
+		};
+
+		it('reports a refused scrub of the stored send at startup', async function () {
+			const { storage, store, refused } = memoryStorage();
+			await open(storage);
+			const left = {
+				...getDefaultSendTransaction(),
+				outputs: [{ address: 'bcrt1qrecipient', value: 1000, index: 0 }]
+			};
+			store.set(storageKey('transaction'), JSON.stringify(left));
+			refused.add('transaction');
+			reports = [];
+
+			const wallet = await openQuiet(storage);
+
+			expect(wallet.data.transaction.outputs).to.deep.equal([]);
+			expect(stored(store, 'transaction')).to.deep.equal(left);
+			expectReported('transaction');
+			expect(heard).to.deep.equal(['storageWriteFailed']);
+		});
+
+		it('reports a refused header write during the first refresh, and holds the rest until it ends', async function () {
+			const { storage, refused } = memoryStorage();
+			const wallet = await openQuiet(storage);
+			wallet.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
+				ok(wallet.feeEstimates);
+			const header = (height: number): IWalletData['header'] => ({
+				height,
+				hash: 'aa'.repeat(32),
+				hex: ''
+			});
+			(
+				wallet as unknown as { _runRefresh: () => Promise<Result<IWalletData>> }
+			)._runRefresh = async (): Promise<Result<IWalletData>> => {
+				// What the first refresh finds is history to this host.
+				wallet.sendMessage('transactionReceived', {
+					transaction: transaction(TXID)
+				});
+				await wallet.updateHeader(header(10));
+				return ok(wallet.data);
+			};
+			refused.add('header');
+
+			const refreshed = await wallet.refreshWallet({});
+
+			if (refreshed.isErr()) throw refreshed.error;
+			expectReported('header');
+			expect(heard).to.deep.equal(['storageWriteFailed']);
+
+			// The refresh's end lifts the hold on everything else.
+			reports = [];
+			heard = [];
+			wallet.sendMessage('transactionReceived', {
+				transaction: transaction(TXID)
+			});
+			await wallet.updateHeader(header(11));
+			expectReported('header');
+			expect(heard).to.deep.equal([
+				'transactionReceived',
+				'storageWriteFailed'
+			]);
+		});
+
+		it('keeps reports silent too once the wallet has stopped', async function () {
+			const { storage, refused } = memoryStorage();
+			let release = (): void => undefined;
+			const released = new Promise<void>((resolve) => (release = resolve));
+			const wallet = await openQuiet({
+				...storage,
+				setData: async <K extends keyof IWalletData>(
+					key: string,
+					value: IWalletData[K]
+				): Promise<Result<boolean>> => {
+					if (key === storageKey('header')) await released;
+					return storage.setData(key, value);
+				}
+			});
+			refused.add('header');
+
+			// A write out at the adapter when stop() gives up on it.
+			const pending = wallet.updateHeader({ height: 1, hash: '', hex: '' });
+			const stopped = await wallet.stop({ refreshTimeout: 50 });
+			if (stopped.isErr()) throw stopped.error;
+			release();
+			await pending;
+
+			expect(reports).to.deep.equal([]);
+			expect(heard).to.deep.equal([]);
+		});
+	});
+
 	it('fails a new receive address whose index cannot be saved, and a read made while its write was out', async function () {
 		const { storage, store, refused } = memoryStorage();
 		let writeOut = (): void => undefined;

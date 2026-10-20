@@ -48,7 +48,7 @@ const electrumOptions = {
 type TWalletInternals = {
 	setZeroIndexAddresses: () => Promise<Result<string>>;
 	updateAddressIndexes: () => Promise<Result<string>>;
-	_disableMessagesOnCreate: boolean;
+	_quietUntilFirstRefresh: boolean;
 	_setData?: (key: string, data: unknown) => Promise<Result<string>>;
 	processUnconfirmedTransactions: () => Promise<Result<unknown>>;
 };
@@ -222,9 +222,9 @@ describe('stop() refresh deadline', function () {
 		const connectStub = sinon
 			.stub(wallet, 'connectToElectrum')
 			.resolves(ok('connected'));
-		// The daemon creates its wallet this way, so the refresh ends by putting
-		// messages back.
-		(wallet as unknown as TWalletInternals)._disableMessagesOnCreate = true;
+		// The daemon creates its wallet this way: the refresh's end is what lifts
+		// the hold on messages, and it once did so by writing disableMessages.
+		(wallet as unknown as TWalletInternals)._quietUntilFirstRefresh = true;
 		wallet.disableMessages = false;
 
 		parkedRefresh = wallet.refreshWallet();
