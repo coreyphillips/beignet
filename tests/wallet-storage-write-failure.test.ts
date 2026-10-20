@@ -582,6 +582,76 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		expect(next.value.index).to.equal(issued.value.index + 1);
 	});
 
+	// Issue #1746: switching away and back while an issuance write was out
+	// reloaded the index storage held before that write landed. The write then
+	// landed without moving the reloaded index, so the next generation on the
+	// same instance moved to the index just issued and gave its address out
+	// again.
+	it('advances the next address past an issuance that landed across a switch away and back (issue #1746)', async function () {
+		const { storage, store } = memoryStorage();
+		let hold = false;
+		let writeOut = (): void => undefined;
+		const out = new Promise<void>((resolve) => (writeOut = resolve));
+		let release = (): void => undefined;
+		const released = new Promise<void>((resolve) => (release = resolve));
+		const wallet = await open({
+			...storage,
+			setData: async <K extends keyof IWalletData>(
+				key: string,
+				value: IWalletData[K]
+			): Promise<Result<boolean>> => {
+				if (hold && key === storageKey('addressIndex')) {
+					hold = false;
+					writeOut();
+					await released;
+				}
+				return storage.setData(key, value);
+			}
+		});
+		wallet.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
+			ok(wallet.feeEstimates);
+		(
+			wallet as unknown as { _runRefresh: () => Promise<Result<IWalletData>> }
+		)._runRefresh = async (): Promise<Result<IWalletData>> => ok(wallet.data);
+		const type = wallet.addressType;
+		const first = await wallet.generateNewReceiveAddress();
+		if (first.isErr()) throw first.error;
+		expect(savedIndex(store, wallet)).to.equal(first.value.index);
+
+		hold = true;
+		const pending = wallet.generateNewReceiveAddress();
+		await out;
+		const away = await wallet.switchNetwork(
+			EAvailableNetworks.signet,
+			electrumOptions.servers
+		);
+		if (away.isErr()) throw away.error;
+		wallet.electrum.disconnect = async (): Promise<void> => undefined;
+		const back = await wallet.switchNetwork(NETWORK, electrumOptions.servers);
+		if (back.isErr()) throw back.error;
+		release();
+		const issued = await pending;
+
+		if (issued.isErr()) throw issued.error;
+		expect(issued.value.index).to.equal(first.value.index + 1);
+		expect(savedIndex(store, wallet)).to.equal(issued.value.index);
+		expect(
+			wallet.data.addressIndex[type].index,
+			'the live index holds the issuance'
+		).to.equal(issued.value.index);
+		const current = await wallet.getReceiveAddress({});
+		if (current.isErr()) throw current.error;
+		expect(current.value).to.equal(issued.value.address);
+
+		// On the same instance, before any restart.
+		const next = await wallet.generateNewReceiveAddress();
+		if (next.isErr()) throw next.error;
+		expect(next.value.index).to.equal(issued.value.index + 1);
+		expect(next.value.address).to.not.equal(issued.value.address);
+		expect(wallet.data.addressIndex[type].index).to.equal(next.value.index);
+		expect(savedIndex(store, wallet)).to.equal(next.value.index);
+	});
+
 	// Issue #1745: a refresh that found the current address used moved the
 	// index in memory and threw away the result of its write. The getter then
 	// served the moved index as saved, and a restart came back to the used

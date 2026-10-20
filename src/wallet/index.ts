@@ -2772,20 +2772,41 @@ export class Wallet {
 	/**
 	 * Saves the receive index and, if storage takes the write, records the
 	 * moves made so far as saved.
+	 *
+	 * A switch away and back while the write was out reloads the index from
+	 * storage before the write lands, and that reload is what the wallet is
+	 * then live on. Once the write lands, the live index is brought forward
+	 * to it where it fell behind, so the next issuance advances past the
+	 * address this write issued instead of giving it out again (#1746).
 	 * @private
 	 * @returns {Promise<Result<string>>}
 	 */
 	private async saveReceiveIndex(): Promise<Result<string>> {
 		const moves = this.receiveIndexMoves;
-		const saved = await this.saveWalletData(
+		const data = this._data;
+		const written = data.addressIndex;
+		const walletDataKey = this.getWalletDataKey('addressIndex');
+		const saved = await this.saveWalletDataAt(
 			'addressIndex',
-			this._data.addressIndex
+			walletDataKey,
+			written
 		);
-		if (saved.isOk()) {
-			this.receiveIndexMovesSaved = Math.max(
-				this.receiveIndexMovesSaved,
-				moves
-			);
+		if (saved.isErr()) return saved;
+		this.receiveIndexMovesSaved = Math.max(this.receiveIndexMovesSaved, moves);
+		// Only a network switch replaces _data. The index it reloaded is behind
+		// this write only if the wallet is on the network the write went to. A
+		// wallet still away reads the index this write stored when it returns.
+		if (
+			this._data !== data &&
+			this.getWalletDataKey('addressIndex') === walletDataKey
+		) {
+			for (const addressType of Object.keys(written) as EAddressType[]) {
+				const landed = written[addressType];
+				const live = this._data.addressIndex[addressType];
+				if (landed && (!live || live.index < landed.index)) {
+					this._data.addressIndex[addressType] = landed;
+				}
+			}
 		}
 		return saved;
 	}
