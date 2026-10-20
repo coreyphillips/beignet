@@ -5050,7 +5050,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			schemas: {
 				ApiEnvelope: {
 					type: 'object',
-					description: 'All responses use this envelope format',
+					description:
+						'Every JSON response uses this envelope except GET /openapi.json, which returns this document bare. GET /metrics (text/plain) and GET /events (text/event-stream) are not JSON',
 					properties: {
 						ok: {
 							type: 'boolean',
@@ -5183,7 +5184,18 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						height: { type: 'integer' },
 						confirmed: { type: 'boolean' },
 						timestamp: { type: 'integer' },
-						confirmTimestamp: { type: 'integer' }
+						confirmTimestamp: { type: 'integer' },
+						source: {
+							type: 'string',
+							enum: ['cooperative-close', 'onchain-sweep'],
+							description:
+								'Set on records that come from a cooperative close paid to an external address, or from a durable sweep, rather than from the wallet'
+						},
+						channelId: {
+							type: 'string',
+							description:
+								'The closed channel (64 hex characters); present with source cooperative-close'
+						}
 					}
 				},
 				UtxoInfo: {
