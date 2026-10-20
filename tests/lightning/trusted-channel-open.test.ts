@@ -833,6 +833,9 @@ describe('Zero-conf splice semantics (BOLT 2)', function () {
 		const { manager, channelId } = normalChannel(false);
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const ch = manager.getChannel(channelId)! as any;
+		// BOLT 2 allows a splice tx_init_rbf only from the quiescence initiator.
+		ch.handleStfuMessage({ channelId, initiator: true });
+		expect(ch.isQuiescent()).to.equal(true);
 		ch._spliceSession = { isComplete: () => false };
 
 		const actions = ch.handleTxInitRbf({
