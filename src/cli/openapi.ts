@@ -969,16 +969,18 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}),
 					responses: {
 						'200': {
-							description:
-								'Commitment feerate updated. ok false, with error, is an update the engine refused',
+							description: 'Commitment feerate update sent',
 							content: jsonContent({
 								type: 'object',
-								required: ['ok'],
+								required: ['updated'],
 								properties: {
-									ok: { type: 'boolean' },
-									error: { type: 'string' }
+									updated: { type: 'boolean', enum: [true] }
 								}
 							})
+						},
+						'409': {
+							description:
+								'UPDATE_FEE_FAILED: the channel would not take the feerate (its state, not the opener, an FFOR epoch, the bounds or the reserve)'
 						}
 					}
 				}
@@ -995,16 +997,18 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}),
 					responses: {
 						'200': {
-							description:
-								'Commitment feerate updated. ok false, with error, is an update the engine refused',
+							description: 'Commitment feerate update sent',
 							content: jsonContent({
 								type: 'object',
-								required: ['ok'],
+								required: ['updated'],
 								properties: {
-									ok: { type: 'boolean' },
-									error: { type: 'string' }
+									updated: { type: 'boolean', enum: [true] }
 								}
 							})
+						},
+						'409': {
+							description:
+								'UPDATE_FEE_FAILED: the channel would not take the feerate (its state, not the opener, an FFOR epoch, the bounds or the reserve)'
 						}
 					}
 				}
@@ -2627,14 +2631,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}),
 					responses: {
 						'200': {
-							description:
-								'ok, commitmentTxid, preimagesKnown. ok false, with error, is a force close the engine refused',
+							description: 'commitmentTxid, preimagesKnown',
 							content: jsonContent({
 								type: 'object',
-								required: ['ok', 'preimagesKnown'],
+								required: ['preimagesKnown'],
 								properties: {
-									ok: { type: 'boolean' },
-									error: { type: 'string' },
 									commitmentTxid: { type: 'string' },
 									preimagesKnown: {
 										type: 'integer',
@@ -2646,6 +2647,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'400': {
 							description:
 								'INVALID_PARAMS: a recency-held channel without acceptStaleStateRisk: true'
+						},
+						'500': {
+							description:
+								'FORCE_CLOSE_FAILED: the engine refused the force close, as on /channel/forceclose'
 						}
 					}
 				}
@@ -2800,12 +2805,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'ok, numSlots, issued (the issued bitmap, hex), slots [{ k, payerId, metadataHash, issuedUnixTime }], error (the issuer refusal when ok is false)',
+								'numSlots, issued (the issued bitmap, hex), slots [{ k, payerId, metadataHash, issuedUnixTime }]',
 							content: jsonContent({
 								type: 'object',
-								required: ['ok', 'numSlots', 'issued', 'slots', 'error'],
+								required: ['numSlots', 'issued', 'slots'],
 								properties: {
-									ok: { type: 'boolean' },
 									numSlots: { type: 'integer' },
 									issued: { type: 'string' },
 									slots: {
@@ -2825,14 +2829,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 												issuedUnixTime: { type: 'integer' }
 											}
 										}
-									},
-									error: { type: 'string', nullable: true }
+									}
 								}
 							})
 						},
 						'400': {
 							description:
-								'INVALID_PARAMS: channelId or issuerNodeId missing or malformed. FFOR_REFUSED: no provision for that issuer, or it did not answer'
+								'INVALID_PARAMS: channelId or issuerNodeId missing or malformed. FFOR_REFUSED: no provision for that issuer, it did not answer, or it refused'
 						},
 						'404': { description: 'CHANNEL_NOT_FOUND' }
 					}

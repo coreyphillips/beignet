@@ -497,6 +497,9 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// Its transient sibling (issue #633): the splice was held off by a state
 	// that ends on its own, so waiting genuinely changes the answer.
 	SPLICE_BUSY: 503,
+	// A commitment feerate the channel would not take: its state, the opener
+	// rule, an FFOR epoch's frozen feerate, the bounds or the reserve.
+	UPDATE_FEE_FAILED: 409,
 	CHANNEL_NOT_FOUND: 404,
 	// A hold settle or cancel that left parts parked (issue #823): the hold is
 	// live, not absent, and a reestablish or the settle already under way
@@ -2029,7 +2032,13 @@ async function bootDaemon(
 			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
 			if (feeratePerKw === undefined)
 				return failure('INVALID_PARAMS', 'feeratePerKw required');
-			return success(node.updateChannelFee(channelId, feeratePerKw));
+			const result = node.updateChannelFee(channelId, feeratePerKw);
+			if (!result.ok)
+				return failure(
+					'UPDATE_FEE_FAILED',
+					result.error || 'Commitment feerate update failed'
+				);
+			return success({ updated: true });
 		},
 		// Sets the ROUTING fee policy advertised in channel_update. Unrelated to
 		// the commitment feerate endpoint above.
@@ -3335,9 +3344,17 @@ async function bootDaemon(
 			// Strict boolean, the rule /channel/forceclose uses: this route
 			// publishes the same commitment, so a capsule-restored channel
 			// needs the same acknowledgement (issue #908).
-			return success(
-				node.fforEnforce(channelId, acceptStaleStateRisk === true)
+			const { ok, error, ...enforced } = node.fforEnforce(
+				channelId,
+				acceptStaleStateRisk === true
 			);
+			// The engine refuses in band; same code as /channel/forceclose.
+			if (ok !== true)
+				return failure(
+					'FORCE_CLOSE_FAILED',
+					String(error || 'Force close failed')
+				);
+			return success(enforced);
 		},
 		'POST /ffor/witness/close': async (body) => {
 			const { channelId } = body as { channelId?: string };
@@ -3348,12 +3365,14 @@ async function bootDaemon(
 		'GET /ffor/issuer/status': () => success(node.fforIssuerStatus()),
 		'GET /ffor/issuer/issued': async (body, query) => {
 			const b = body as { channelId?: string; issuerNodeId?: string };
-			return success(
-				await node.fforIssuedSlots(
-					query.get('channelId') || b.channelId,
-					query.get('issuerNodeId') || b.issuerNodeId
-				)
+			const { ok, error, ...issued } = await node.fforIssuedSlots(
+				query.get('channelId') || b.channelId,
+				query.get('issuerNodeId') || b.issuerNodeId
 			);
+			// The issuer's ff_issuer_status_resp refusal, answered in band.
+			if (ok !== true)
+				return failure('FFOR_REFUSED', String(error || 'issuer refused'));
+			return success(issued);
 		},
 		// Reverse swap provider (issue #737): terms and exposure, the ledger,
 		// and an operator cancel of a swap nothing has moved for yet.

@@ -368,4 +368,116 @@ describe('Issue #1616: daemon replies validate against the spec', function () {
 		);
 		expect(problems).to.deep.equal([]);
 	});
+
+	// Issue #1650: each route wrapped the engine's in-band refusal in
+	// success(), so a refusal answered 200 ok:true with ok:false inside.
+	describe('Issue #1650: an engine refusal is a failure envelope', () => {
+		const channelId = 'ab'.repeat(32);
+		const issuerNodeId = '02' + 'cd'.repeat(32);
+		type Stubbed = Record<string, (...args: unknown[]) => unknown>;
+		const cases: Array<{
+			route: string;
+			method: 'POST' | 'GET';
+			stub: string;
+			body?: Record<string, unknown>;
+			refused: Record<string, unknown>;
+			accepted: Record<string, unknown>;
+			code: string;
+			status: number;
+		}> = [
+			{
+				route: '/channel/update-commitment-feerate',
+				method: 'POST',
+				stub: 'updateChannelFee',
+				body: { channelId, feeratePerKw: 1000 },
+				refused: { ok: false, error: 'Only opener can update fee' },
+				accepted: { ok: true },
+				code: 'UPDATE_FEE_FAILED',
+				status: 409
+			},
+			{
+				route: '/channel/update-fee',
+				method: 'POST',
+				stub: 'updateChannelFee',
+				body: { channelId, feeratePerKw: 1000 },
+				refused: { ok: false, error: 'Only opener can update fee' },
+				accepted: { ok: true },
+				code: 'UPDATE_FEE_FAILED',
+				status: 409
+			},
+			{
+				route: '/ffor/enforce',
+				method: 'POST',
+				stub: 'fforEnforce',
+				body: { channelId },
+				refused: {
+					ok: false,
+					error: 'Cannot force close: wrong state',
+					preimagesKnown: 1
+				},
+				accepted: {
+					ok: true,
+					commitmentTxid: 'ef'.repeat(32),
+					preimagesKnown: 1
+				},
+				// /channel/forceclose's code, which keeps the 500 default (#474).
+				code: 'FORCE_CLOSE_FAILED',
+				status: 500
+			},
+			{
+				route: `/ffor/issuer/issued?channelId=${channelId}&issuerNodeId=${issuerNodeId}`,
+				method: 'GET',
+				stub: 'fforIssuedSlots',
+				refused: {
+					ok: false,
+					numSlots: 0,
+					issued: '',
+					slots: [],
+					error: 'unknown mailbox'
+				},
+				accepted: {
+					ok: true,
+					numSlots: 3,
+					issued: '00',
+					slots: [],
+					error: null
+				},
+				code: 'FFOR_REFUSED',
+				status: 400
+			}
+		];
+
+		for (const c of cases) {
+			const pathname = c.route.split('?')[0];
+			it(`${c.method} ${pathname}`, async () => {
+				const node = daemon.node as unknown as Stubbed;
+				const original = node[c.stub];
+				let answer = c.refused;
+				node[c.stub] = (): unknown =>
+					c.method === 'GET' ? Promise.resolve(answer) : answer;
+				try {
+					const refused = await request(port, c.route, c.method, c.body);
+					expect(refused.status).to.equal(c.status);
+					expect(refused.body).to.deep.equal({
+						ok: false,
+						error: { code: c.code, message: c.refused.error }
+					});
+
+					answer = c.accepted;
+					const accepted = await request(port, c.route, c.method, c.body);
+					expect(accepted.status).to.equal(200);
+					const body = accepted.body as {
+						ok: boolean;
+						result: Record<string, unknown>;
+					};
+					expect(body.ok).to.equal(true);
+					expect(body.result).to.not.have.any.keys('ok', 'error');
+					const schema = successSchema(pathname, c.method.toLowerCase());
+					expect(validate(schema, body)).to.deep.equal([]);
+				} finally {
+					node[c.stub] = original;
+				}
+			});
+		}
+	});
 });
