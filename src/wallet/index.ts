@@ -995,7 +995,8 @@ export class Wallet {
 				'_refreshOwed',
 				'_pendingRefreshPromises',
 				'_refreshStartCallbacks',
-				'savingOperations'
+				'savingOperations',
+				'waitingWrites'
 			]);
 			Object.assign(
 				this,
@@ -1949,8 +1950,6 @@ export class Wallet {
 			);
 			const addressesToGenerate =
 				this.gapLimitOptions.lookAhead - addressIndexDiff;
-			let shouldSaveAddresses = false;
-			let shouldSaveChangeAddresses = false;
 			if (addressesToGenerate > 0) {
 				const generatedAddresses = await this.addAddresses({
 					addressAmount: addressesToGenerate,
@@ -1963,7 +1962,7 @@ export class Wallet {
 				if (generatedAddresses.isErr()) {
 					return err(generatedAddresses.error);
 				}
-				shouldSaveAddresses = true;
+				this.markGrownAddressMaps(generatedAddresses.value);
 				if (addressIndex.index < 0) {
 					const addresses = generatedAddresses.value.addresses;
 					const sorted = Object.values(addresses).sort(
@@ -1993,7 +1992,7 @@ export class Wallet {
 				if (generatedAddresses.isErr()) {
 					return err(generatedAddresses.error);
 				}
-				shouldSaveChangeAddresses = true;
+				this.markGrownAddressMaps(generatedAddresses.value);
 				if (changeAddressIndex.index < 0) {
 					const changeAddresses = generatedAddresses.value.changeAddresses;
 					const sorted = Object.values(changeAddresses).sort(
@@ -2005,16 +2004,7 @@ export class Wallet {
 			}
 
 			// Save any addresses that have been created thus far if necessary.
-			const promises: Promise<Result<string>>[] = [];
-			if (shouldSaveAddresses) {
-				promises.push(this.saveWalletData('addresses', this._data.addresses));
-			}
-			if (shouldSaveChangeAddresses) {
-				promises.push(
-					this.saveWalletData('changeAddresses', this._data.changeAddresses)
-				);
-			}
-			await Promise.all(promises);
+			await this.saveGrownAddressMaps();
 
 			let addresses = filterAddressesObjForGapLimit({
 				addresses: this._data.addresses[addressType],
@@ -2172,10 +2162,7 @@ export class Wallet {
 					if (!nextAvailableAddress || !nextAvailableChangeAddress) {
 						return lastKnownIndexes;
 					}
-					await Promise.all([
-						this.saveWalletData('addresses', this._data.addresses),
-						this.saveWalletData('changeAddresses', this._data.changeAddresses)
-					]);
+					await this.saveGrownAddressMaps();
 					return ok({
 						addressIndex: nextAvailableAddress,
 						lastUsedAddressIndex,
@@ -2202,6 +2189,7 @@ export class Wallet {
 						saveAddresses: false
 					});
 					if (newAddresses.isOk()) {
+						this.markGrownAddressMaps(newAddresses.value);
 						addresses = newAddresses.value.addresses || {};
 					}
 				}
@@ -2224,6 +2212,7 @@ export class Wallet {
 						saveAddresses: false
 					});
 					if (newChangeAddresses.isOk()) {
+						this.markGrownAddressMaps(newChangeAddresses.value);
 						changeAddresses = newChangeAddresses.value.changeAddresses || {};
 					}
 				}
@@ -2246,15 +2235,64 @@ export class Wallet {
 				});
 			}
 
-			await Promise.all([
-				this.saveWalletData('addresses', this._data.addresses),
-				this.saveWalletData('changeAddresses', this._data.changeAddresses)
-			]);
+			await this.saveGrownAddressMaps();
 
 			return lastKnownIndexes;
 		} catch (e) {
 			return err(e);
 		}
+	}
+
+	// The address maps storage may hold an older copy of: grown by
+	// getNextAvailableAddress and not saved yet, or whose last write failed.
+	// Each map holds every address type, so saving one that is not marked
+	// only writes storage the bytes it already has.
+	private unsavedAddressMaps = new Set<'addresses' | 'changeAddresses'>();
+
+	/**
+	 * Marks the maps an addAddresses call grew, read from its answer, which
+	 * holds only the addresses it stored.
+	 * @private
+	 * @param {IGenerateAddressesResponse} added
+	 */
+	private markGrownAddressMaps({
+		addresses,
+		changeAddresses
+	}: IGenerateAddressesResponse): void {
+		if (Object.keys(addresses).length) {
+			this.unsavedAddressMaps.add('addresses');
+		}
+		if (Object.keys(changeAddresses).length) {
+			this.unsavedAddressMaps.add('changeAddresses');
+		}
+	}
+
+	/**
+	 * Saves the address maps marked since their last successful save. A map
+	 * whose write fails stays marked, so the next call tries it again.
+	 * @private
+	 * @async
+	 * @returns {Promise<void>}
+	 */
+	private async saveGrownAddressMaps(): Promise<void> {
+		const keys = [...this.unsavedAddressMaps];
+		this.unsavedAddressMaps.clear();
+		await Promise.all(keys.map((key) => this.saveAddressMap(key)));
+	}
+
+	/**
+	 * Saves one address map, and marks it when the write fails so the next
+	 * gap scan saves it again. Nothing else rewrites a map that has not grown.
+	 * @private
+	 * @async
+	 * @param {'addresses' | 'changeAddresses'} key
+	 * @returns {Promise<void>}
+	 */
+	private async saveAddressMap(
+		key: 'addresses' | 'changeAddresses'
+	): Promise<void> {
+		const saved = await this.saveWalletData(key, this._data[key]);
+		if (saved.isErr()) this.unsavedAddressMaps.add(key);
 	}
 
 	/**
@@ -2352,19 +2390,14 @@ export class Wallet {
 				...this.data.addresses[addressType],
 				...addresses
 			};
-			if (saveAddresses)
-				await this.saveWalletData('addresses', this._data.addresses);
+			if (saveAddresses) await this.saveAddressMap('addresses');
 		}
 		if (Object.keys(changeAddresses).length) {
 			this._data.changeAddresses[addressType] = {
 				...this.data.changeAddresses[addressType],
 				...changeAddresses
 			};
-			if (saveAddresses)
-				await this.saveWalletData(
-					'changeAddresses',
-					this._data.changeAddresses
-				);
+			if (saveAddresses) await this.saveAddressMap('changeAddresses');
 		}
 
 		return ok({ ...generatedAddresses.value, addressType: type });
@@ -3426,6 +3459,13 @@ export class Wallet {
 	// never rejects.
 	private savingOperations: Record<string, Promise<Result<string>>> = {};
 
+	// What the newest write queued for each key will store, while that write
+	// still waits for the one ahead of it.
+	private waitingWrites: Record<
+		string,
+		{ walletDataKey: string; data: IWalletData[keyof IWalletData] }
+	> = {};
+
 	/**
 	 * Saves the wallet data object to storage if able.
 	 *
@@ -3439,9 +3479,13 @@ export class Wallet {
 	 *
 	 * Writes to one key reach storage one at a time, in the order they were
 	 * issued, so an adapter that completes writes out of order still ends up
-	 * holding the last value written. Never rejects: an adapter that throws,
-	 * before or after returning its promise, answers Err, and so does a write
-	 * stop() dropped while it waited its turn (#946).
+	 * holding the last value written. A write still waiting its turn takes any
+	 * newer value for its storage key rather than have a second write queue
+	 * behind it, and every caller that shares it gets its result.
+	 *
+	 * Never rejects: an adapter that throws, before or after returning its
+	 * promise, answers Err, and so does a write stop() dropped while it waited
+	 * its turn (#946).
 	 * @private
 	 * @async
 	 * @param {TWalletDataKeys} key
@@ -3473,15 +3517,27 @@ export class Wallet {
 		data: IWalletData[K]
 	): Promise<Result<string>> {
 		if (!this._setData) return ok('No setData method has been provided');
-		// With nothing queued for the key the write is issued in this same
-		// tick, so a stop() that follows the call cannot get in ahead of it.
-		const operation =
-			key in this.savingOperations
-				? this.savingOperations[key].then(() =>
-						this.writeWalletData(walletDataKey, data)
-				  )
-				: this.writeWalletData(walletDataKey, data);
-		this.savingOperations[key] = operation;
+		const waiting = this.waitingWrites[key];
+		let operation: Promise<Result<string>>;
+		if (waiting?.walletDataKey === walletDataKey) {
+			// The newest queued write has not started, so it can carry this
+			// value. A write to another network's key cannot, and queues below.
+			waiting.data = data;
+			operation = this.savingOperations[key];
+		} else if (key in this.savingOperations) {
+			const next = { walletDataKey, data };
+			this.waitingWrites[key] = next;
+			operation = this.savingOperations[key].then(() => {
+				if (this.waitingWrites[key] === next) delete this.waitingWrites[key];
+				return this.writeWalletData(next.walletDataKey, next.data);
+			});
+			this.savingOperations[key] = operation;
+		} else {
+			// With nothing queued for the key the write is issued in this same
+			// tick, so a stop() that follows the call cannot get in ahead of it.
+			operation = this.writeWalletData(walletDataKey, data);
+			this.savingOperations[key] = operation;
+		}
 		const saved = await operation;
 		// A newer write that queued behind this one owns the entry now.
 		if (this.savingOperations[key] === operation) {
@@ -4273,8 +4329,8 @@ export class Wallet {
 		this._data.addresses = getAddressTypeContent<IAddresses>({});
 		this._data.changeAddresses = getAddressTypeContent<IAddresses>({});
 		await Promise.all([
-			this.saveWalletData('addresses', this._data.addresses),
-			this.saveWalletData('changeAddresses', this._data.changeAddresses)
+			this.saveAddressMap('addresses'),
+			this.saveAddressMap('changeAddresses')
 		]);
 		return 'Successfully reset transactions.';
 	}
@@ -5906,7 +5962,7 @@ export class Wallet {
 		if (saveAddressIndexes) {
 			await Promise.all([
 				this.saveWalletData('addressIndex', this._data.addressIndex),
-				this.saveWalletData('addresses', this._data.addresses)
+				this.saveAddressMap('addresses')
 			]);
 		}
 		if (saveChangeAddressIndexes) {
@@ -5915,7 +5971,7 @@ export class Wallet {
 					'changeAddressIndex',
 					this._data.changeAddressIndex
 				),
-				this.saveWalletData('changeAddresses', this._data.changeAddresses)
+				this.saveAddressMap('changeAddresses')
 			]);
 		}
 

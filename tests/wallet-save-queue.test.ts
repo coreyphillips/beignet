@@ -24,14 +24,19 @@ import sinon from 'sinon';
 import tls from 'tls';
 
 import {
+	EAddressType,
 	EAvailableNetworks,
 	EProtocol,
+	IAddress,
 	IWalletData,
 	Result,
 	TStorage,
 	Wallet,
+	err,
+	getWalletDataStorageKey,
 	ok
 } from '../src';
+import { GAP_LIMIT, GAP_LIMIT_CHANGE } from '../src/wallet/constants';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -224,8 +229,9 @@ describe('Wallet storage writes (#946)', function () {
 		for (const res of await Promise.all(issued)) {
 			expect(res.isOk(), 'every write answered ok').to.equal(true);
 		}
+		// 2 never started before 3 replaced it (#1655).
 		expect(landed, 'the writes reached storage in call order').to.deep.equal([
-			1, 2, 3
+			1, 3
 		]);
 		expect(store.get(BALANCE_KEY), 'the last value issued is stored').to.equal(
 			3
@@ -241,28 +247,29 @@ describe('Wallet storage writes (#946)', function () {
 		expect(writes, 'only the first write reached storage').to.have.length(1);
 		writes[0].land();
 		await flush();
-		expect(writes, 'the second followed the first').to.have.length(2);
-		writes[1].land();
-		await flush();
-		expect(writes, 'the third followed the second').to.have.length(3);
+		expect(writes, 'one queued write followed the first').to.have.length(2);
+		expect(
+			writes[1].value,
+			'it carried the newest value issued while it waited (#1655)'
+		).to.equal(3);
 
-		// The third is in flight. A fourth must still wait for it.
+		// That write is in flight. A fourth must still wait for it.
 		issued.push(settle(wallet.saveWalletData('balance', 4), 'write 4'));
 		await flush();
 		expect(
 			writes,
-			'the fourth write did not overtake the third'
-		).to.have.length(3);
+			'the fourth write did not overtake the one in flight'
+		).to.have.length(2);
 
-		writes[2].land();
+		writes[1].land();
 		await flush();
-		expect(writes, 'the fourth followed the third').to.have.length(4);
-		writes[3].land();
+		expect(writes, 'the fourth followed it').to.have.length(3);
+		writes[2].land();
 
 		for (const res of await Promise.all(issued)) {
 			expect(res.isOk()).to.equal(true);
 		}
-		expect(landed).to.deep.equal([1, 2, 3, 4]);
+		expect(landed).to.deep.equal([1, 3, 4]);
 		expect(store.get(BALANCE_KEY)).to.equal(4);
 		expect(
 			Object.keys(
@@ -354,6 +361,33 @@ describe('Wallet storage writes (#946)', function () {
 			store.has(`${NAME}-testnet-balance`),
 			'nothing landed under the new network'
 		).to.equal(false);
+	});
+
+	it('gives a queued write no value issued for another network (#1655)', async () => {
+		control.defer = true;
+		const first = settle(wallet.saveWalletData('balance', 1), 'write 1');
+		const second = settle(wallet.saveWalletData('balance', 2), 'write 2');
+		await flush();
+
+		const internals = wallet as unknown as { _network: EAvailableNetworks };
+		internals._network = EAvailableNetworks.testnet;
+		const third = settle(wallet.saveWalletData('balance', 3), 'write 3');
+		internals._network = EAvailableNetworks.regtest;
+
+		writes[0].land();
+		await waitFor(() => writes.length === 2, 5000, 'the second write');
+		expect(writes[1].value, 'the regtest write kept its value').to.equal(2);
+		expect(
+			store.has(`${NAME}-testnet-balance`),
+			'the testnet write waits behind it'
+		).to.equal(false);
+		writes[1].land();
+
+		for (const res of await Promise.all([first, second, third])) {
+			expect(res.isOk()).to.equal(true);
+		}
+		expect(store.get(BALANCE_KEY)).to.equal(2);
+		expect(store.get(`${NAME}-testnet-balance`)).to.equal(3);
 	});
 
 	it('tears down in the same tick when no refresh or write is pending', async () => {
@@ -480,5 +514,186 @@ describe('Wallet storage writes (#946)', function () {
 
 		writes[0].land();
 		expect((await first).isOk()).to.equal(true);
+	});
+});
+
+/**
+ * Issue #1655: each refresh scans every monitored address type, and each scan
+ * saved both full address maps (which hold every type) whether or not it
+ * added an address. Electrum is stubbed at the wallet's edges, so the real
+ * gap scan runs against a server that reports history only for `used`.
+ */
+describe('Wallet address map writes on refresh (#1655)', function () {
+	this.timeout(60000);
+
+	const name = 'mapwrites';
+	const addressesKey = getWalletDataStorageKey(
+		name,
+		EAvailableNetworks.regtest,
+		'addresses'
+	);
+	const changeAddressesKey = getWalletDataStorageKey(
+		name,
+		EAvailableNetworks.regtest,
+		'changeAddresses'
+	);
+
+	let wallet: Wallet;
+	let store: Map<string, unknown>;
+	let mapWrites: string[];
+	let failAddressWrites: boolean;
+	const used = new Set<string>();
+
+	const countOf = (key: string): number =>
+		mapWrites.filter((written) => written === key).length;
+
+	const refresh = async (): Promise<void> => {
+		mapWrites = [];
+		const res = await wallet.refreshWallet();
+		if (res.isErr()) throw res.error;
+	};
+
+	const scriptHashAt = (
+		type: EAddressType,
+		change: boolean,
+		index: number
+	): string => {
+		const map = change
+			? wallet.data.changeAddresses[type]
+			: wallet.data.addresses[type];
+		const found = Object.values(map).find((a) => a.index === index);
+		if (!found) throw new Error(`no ${type} address at ${index}`);
+		return found.scriptHash;
+	};
+
+	const storedIndexes = (key: string, type: EAddressType): number[] =>
+		Object.values(
+			(store.get(key) as Record<EAddressType, Record<string, IAddress>>)[type]
+		).map((a) => a.index);
+
+	beforeEach(async function () {
+		store = new Map();
+		mapWrites = [];
+		failAddressWrites = false;
+		used.clear();
+		const storage: TStorage = {
+			getData: async <K extends keyof IWalletData>(
+				key: string
+			): Promise<Result<IWalletData[K]>> =>
+				ok(store.get(key) as IWalletData[K]),
+			setData: async <K extends keyof IWalletData>(
+				key: string,
+				value: IWalletData[K]
+			): Promise<Result<boolean>> => {
+				if (key === addressesKey || key === changeAddressesKey) {
+					mapWrites.push(key);
+				}
+				if (key === addressesKey && failAddressWrites) {
+					return err('storage is full');
+				}
+				// A copy, so the store shows what was written rather than the
+				// wallet's live map.
+				store.set(key, JSON.parse(JSON.stringify(value)));
+				return ok(true);
+			}
+		};
+		const res = await Wallet.create({
+			mnemonic: MNEMONIC,
+			name,
+			network: EAvailableNetworks.regtest,
+			storage,
+			electrumOptions,
+			disableRefreshOnCreate: true
+		});
+		if (res.isErr()) throw res.error;
+		wallet = res.value;
+		await flush();
+
+		sinon.stub(wallet, 'checkElectrumConnection').resolves(ok('connected'));
+		sinon.stub(wallet, 'updateFeeEstimates').resolves(ok(wallet.feeEstimates));
+		sinon.stub(wallet, 'getUtxos').resolves(ok({ utxos: [], balance: 0 }));
+		sinon.stub(wallet, 'updateTransactions').resolves(ok(undefined));
+		sinon.stub(wallet.electrum, 'subscribeToAddresses').resolves(ok('ok'));
+		sinon
+			.stub(wallet.electrum, 'getAddressHistory')
+			.callsFake(async ({ scriptHashes = [] }: { scriptHashes?: IAddress[] }) =>
+				ok(
+					scriptHashes
+						.filter((a) => used.has(a.scriptHash))
+						.map((a) => ({ ...a, tx_hash: 'ab'.repeat(32), height: 1 }))
+				)
+			);
+
+		// A mnemonic wallet monitors all four single-sig types.
+		expect(wallet.addressTypesToMonitor).to.have.length(4);
+		// The first refresh generates and stores the gap windows.
+		await refresh();
+	});
+
+	afterEach(async function () {
+		sinon.restore();
+		await wallet?.stop({ refreshTimeout: 1000 });
+	});
+
+	it('writes neither map on a refresh that adds no address', async () => {
+		await refresh();
+		expect(countOf(addressesKey), 'addresses writes').to.equal(0);
+		expect(countOf(changeAddressesKey), 'changeAddresses writes').to.equal(0);
+	});
+
+	it('writes each map once when a refresh adds one address to it', async () => {
+		used.add(scriptHashAt(EAddressType.p2wpkh, false, 0));
+		used.add(scriptHashAt(EAddressType.p2tr, true, 0));
+		await refresh();
+		expect(countOf(addressesKey), 'addresses writes').to.equal(1);
+		expect(countOf(changeAddressesKey), 'changeAddresses writes').to.equal(1);
+		expect(
+			storedIndexes(addressesKey, EAddressType.p2wpkh),
+			'the stored receive map has the new address'
+		).to.include(GAP_LIMIT);
+		expect(
+			storedIndexes(changeAddressesKey, EAddressType.p2tr),
+			'the stored change map has the new address'
+		).to.include(GAP_LIMIT_CHANGE);
+
+		await refresh();
+		expect(mapWrites, 'the refresh after it writes neither').to.deep.equal([]);
+	});
+
+	it('writes a map again on the next refresh when its write failed', async () => {
+		used.add(scriptHashAt(EAddressType.p2wpkh, false, 0));
+		failAddressWrites = true;
+		await refresh();
+		expect(countOf(addressesKey), 'the failed write').to.equal(1);
+
+		failAddressWrites = false;
+		await refresh();
+		expect(countOf(addressesKey), 'the retry').to.equal(1);
+		expect(countOf(changeAddressesKey)).to.equal(0);
+		expect(storedIndexes(addressesKey, EAddressType.p2wpkh)).to.include(
+			GAP_LIMIT
+		);
+	});
+
+	it('writes the map on the next refresh when a new receive address failed to save', async () => {
+		// Indexes 1 to GAP_LIMIT - 1 are already stored, so only the last
+		// call generates an address.
+		for (let i = 1; i < GAP_LIMIT; i++) {
+			const res = await wallet.generateNewReceiveAddress();
+			if (res.isErr()) throw res.error;
+		}
+		mapWrites = [];
+		failAddressWrites = true;
+		const issued = await wallet.generateNewReceiveAddress();
+		if (issued.isErr()) throw issued.error;
+		expect(issued.value.index).to.equal(GAP_LIMIT);
+		expect(countOf(addressesKey), 'the failed write').to.equal(1);
+
+		failAddressWrites = false;
+		await refresh();
+		expect(countOf(addressesKey), 'the retry').to.equal(1);
+		expect(storedIndexes(addressesKey, wallet.addressType)).to.include(
+			GAP_LIMIT
+		);
 	});
 });
