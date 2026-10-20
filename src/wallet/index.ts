@@ -142,6 +142,7 @@ import { Transaction } from '../transaction';
 import {
 	GAP_LIMIT,
 	GAP_LIMIT_CHANGE,
+	MAX_REMEMBERED_PREVOUTS,
 	MAX_REMEMBERED_PSBT_BUILDS,
 	STOP_REFRESH_WAIT_MS,
 	TRANSACTION_DEFAULTS
@@ -231,6 +232,10 @@ export class Wallet {
 	// else unless the caller hands it the unsigned PSBT, so an output rewritten
 	// between build and sign is refused. Memory only.
 	private readonly _builtPsbts: Map<string, bitcoin.TxOutput[]> = new Map();
+	// The previous outputs _getInputData has looked up, keyed as InputData is,
+	// least recently used first. A txid commits to its outputs, so an answer
+	// never goes stale, confirmed or not. Memory only.
+	private readonly _prevouts: Map<string, InputData[string]> = new Map();
 	private _disableMessagesOnCreate: boolean;
 	private _disableRefreshOnCreate: boolean;
 	// Raised by stop(). Work that outlived the shutdown, above all the refresh
@@ -4721,6 +4726,9 @@ export class Wallet {
 	 * `${tx_hash}${vout}`, taken from the request. An input the server calls
 	 * too large to send is neither retried nor unresolved, since that answer
 	 * does not change (issue #965).
+	 *
+	 * Each parent transaction is requested once however many inputs spend it,
+	 * and an output looked up before is not requested again (issue #1658).
 	 * @private
 	 * @async
 	 * @param {{tx_hash: string, vout: number}[]} inputs
@@ -4745,28 +4753,53 @@ export class Wallet {
 			// them again, so they are logged and skipped.
 			const tooLarge = new Set<string>();
 
+			// The inputs still to look up, by the transaction they spend. One
+			// answer serves every input spending that transaction.
+			const byParent = new Map<string, { tx_hash: string; vout: number }[]>();
+			for (const input of inputs) {
+				const key = `${input.tx_hash}${input.vout}`;
+				const known = this._prevouts.get(key);
+				if (known) {
+					this._rememberPrevout(key, known);
+					inputData[key] = { ...known, addresses: [...known.addresses] };
+					continue;
+				}
+				const spending = byParent.get(input.tx_hash);
+				if (spending) spending.push(input);
+				else byParent.set(input.tx_hash, [input]);
+			}
+
 			const read = (
 				answers: ITransaction<{ tx_hash: string; vout: number }>[]
 			): void => {
 				for (const { data, result, error } of answers) {
 					if (!data) continue;
-					const key = `${data.tx_hash}${data.vout}`;
-					const output = result?.vout?.[data.vout];
-					if (output?.scriptPubKey) {
-						inputData[key] = this._extractVoutData(output);
-					} else if (error) {
-						errors.set(key, error);
-						if (/response too large/i.test(error.message ?? '')) {
-							tooLarge.add(key);
-							this._logGetInputDataError(error, data);
+					for (const input of byParent.get(data.tx_hash) ?? []) {
+						const key = `${input.tx_hash}${input.vout}`;
+						const output = result?.vout?.[input.vout];
+						if (output?.scriptPubKey) {
+							const prevout = this._extractVoutData(output);
+							inputData[key] = prevout;
+							this._rememberPrevout(key, {
+								...prevout,
+								addresses: [...prevout.addresses]
+							});
+						} else if (error) {
+							errors.set(key, error);
+							if (/response too large/i.test(error.message ?? '')) {
+								tooLarge.add(key);
+								this._logGetInputDataError(error, input);
+							}
 						}
 					}
 				}
 			};
 
+			// Each parent is asked for under the first input spending it.
+			const requests = [...byParent.values()].map((spending) => spending[0]);
 			const batchLimit = this.electrum.batchLimit;
-			for (let i = 0; i < inputs.length; i += batchLimit) {
-				const chunk = inputs.slice(i, i + batchLimit);
+			for (let i = 0; i < requests.length; i += batchLimit) {
+				const chunk = requests.slice(i, i + batchLimit);
 
 				const getTransactionsResponse =
 					await this.electrum.getTransactionsFromInputs({
@@ -4782,15 +4815,18 @@ export class Wallet {
 				read(getTransactionsResponse.value.data);
 			}
 
-			// Every input still without a usable answer, each asked once more.
+			// Every input still without a usable answer. Its parent is asked once
+			// more.
 			const missing = new Map<string, { tx_hash: string; vout: number }>();
+			const retry = new Map<string, { tx_hash: string; vout: number }>();
 			for (const input of inputs) {
 				const key = `${input.tx_hash}${input.vout}`;
 				if (!(key in inputData) && !tooLarge.has(key)) {
 					missing.set(key, input);
+					if (!retry.has(input.tx_hash)) retry.set(input.tx_hash, input);
 				}
 			}
-			for (const input of missing.values()) {
+			for (const input of retry.values()) {
 				const getTransactionsResponse =
 					await this.electrum.getTransactionsFromInputs({
 						txHashes: [input]
@@ -4819,6 +4855,22 @@ export class Wallet {
 			return ok({ inputData, unresolved });
 		} catch (e) {
 			return err(e);
+		}
+	}
+
+	/**
+	 * Stores a looked up previous output as the most recently used. Only the
+	 * last MAX_REMEMBERED_PREVOUTS are kept.
+	 * @private
+	 * @param {string} key
+	 * @param {InputData[string]} prevout
+	 */
+	private _rememberPrevout(key: string, prevout: InputData[string]): void {
+		this._prevouts.delete(key);
+		this._prevouts.set(key, prevout);
+		for (const oldest of this._prevouts.keys()) {
+			if (this._prevouts.size <= MAX_REMEMBERED_PREVOUTS) break;
+			this._prevouts.delete(oldest);
 		}
 	}
 
