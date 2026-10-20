@@ -7,6 +7,7 @@
  */
 
 import { expect } from 'chai';
+import * as bitcoin from 'bitcoinjs-lib';
 import * as fs from 'fs';
 import * as http from 'http';
 import * as os from 'os';
@@ -14,6 +15,7 @@ import * as path from 'path';
 import { AddressInfo } from 'net';
 import { IStartedDaemon, startDaemon } from '../../src/cli/daemon';
 import { getOpenApiSpec } from '../../src/cli/openapi';
+import { OnchainSweepInfo } from '../../src/cli/onchain-sweep';
 
 type Schema = Record<string, unknown>;
 type Operation = {
@@ -69,6 +71,11 @@ function validate(schema: Schema, value: unknown, at = '$'): string[] {
 		const props = (schema.properties ?? {}) as Record<string, Schema>;
 		for (const [key, sub] of Object.entries(props)) {
 			if (key in obj) problems.push(...validate(sub, obj[key], `${at}.${key}`));
+		}
+		if (schema.additionalProperties === false) {
+			for (const key of Object.keys(obj)) {
+				if (!(key in props)) problems.push(`${at}: unexpected ${key}`);
+			}
 		}
 	}
 	if (actual === 'array' && schema.items) {
@@ -290,5 +297,75 @@ describe('Issue #1616: daemon replies validate against the spec', function () {
 		expect(validate(schema, { ok: true, result: {} })).to.deep.equal([
 			'$.result: missing unregistered'
 		]);
+	});
+
+	// Issue #1651: OnchainTxInfo omitted source and channelId, so a client
+	// generated from it dropped both from close payouts and sweeps.
+	it('GET /transactions: close payout and sweep records', async () => {
+		const address = bitcoin.payments.p2wpkh({
+			pubkey: Buffer.from(
+				'0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798',
+				'hex'
+			),
+			network: bitcoin.networks.regtest
+		});
+		const sweep: OnchainSweepInfo = {
+			requestId: 'openapi-sweep-1651',
+			address: address.address!,
+			status: 'submitted',
+			debitSats: 10000,
+			amountSats: 9800,
+			feeSats: 200,
+			satsPerVbyte: 1.4,
+			txid: 'cd'.repeat(32),
+			createdAt: 1
+		};
+		type Sweeps = { list: () => OnchainSweepInfo[] };
+		const internals = daemon.node as unknown as {
+			node: { listExternalClosePayments: () => unknown[] };
+			onchainSweeps: () => Sweeps;
+		};
+		const listCloses = internals.node.listExternalClosePayments;
+		const onchainSweeps = internals.onchainSweeps;
+		let res: { status: number; body: unknown };
+		try {
+			internals.node.listExternalClosePayments = (): unknown[] => [
+				{
+					channelId: 'ef'.repeat(32),
+					txid: 'ab'.repeat(32),
+					scriptHex: address.output!.toString('hex'),
+					amountSats: 99800,
+					feeSats: 200,
+					networkFeeSats: 200,
+					satsPerVbyte: 1.2,
+					timestamp: 2,
+					confirmationHeight: 100
+				}
+			];
+			internals.onchainSweeps = (): Sweeps => ({
+				list: (): OnchainSweepInfo[] => [sweep]
+			});
+			res = await request(port, '/transactions');
+		} finally {
+			internals.node.listExternalClosePayments = listCloses;
+			internals.onchainSweeps = onchainSweeps;
+		}
+		expect(res.status).to.equal(200);
+		const body = res.body as { result: Array<Record<string, unknown>> };
+		expect(body.result.map((tx) => tx.source)).to.deep.equal([
+			'cooperative-close',
+			'onchain-sweep'
+		]);
+		expect(validate(successSchema('/transactions'), body)).to.deep.equal([]);
+		// The spec leaves objects open, so only a closed copy shows a field
+		// the schema does not list.
+		const closed = {
+			...spec.components.schemas.OnchainTxInfo,
+			additionalProperties: false
+		};
+		const problems = body.result.flatMap((tx, i) =>
+			validate(closed, tx, `$.result[${i}]`)
+		);
+		expect(problems).to.deep.equal([]);
 	});
 });
