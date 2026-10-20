@@ -37,6 +37,12 @@ export const STOP_REFRESH_WAIT_MS = 30_000;
  */
 export const MAX_REMEMBERED_PSBT_BUILDS = 50;
 
+/**
+ * How many previous outputs formatTransactions remembers between refreshes.
+ * The least recently used is forgotten first and looked up again when needed.
+ */
+export const MAX_REMEMBERED_PREVOUTS = 5_000;
+
 export const TRANSACTION_DEFAULTS = {
 	recommendedBaseFee: 256, // Total recommended tx base fee in sats
 	dustLimit: 546, // Minimum value in sats for an output. Outputs below the dust limit may not be processed because the fees required to include them in a block would be greater than the value of the transaction itself.
