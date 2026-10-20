@@ -396,11 +396,11 @@ describe('LFBW app surface (issue #614)', () => {
 		// The third shape: a 200 whose `result` carries its own ok:false. The
 		// app defends against it on splice-out ONLY, so a refusal on any other
 		// route in this set reads to the app as a success. Growing this set is
-		// therefore a decision rather than a detail. The six after the splice
-		// pair sent it before their bodies were documented (issue #1624): the
-		// commitment feerate pair, /ffor/enforce and /ffor/issuer/issued can
-		// carry a refusal there, /payment/cancel's ok is always true, and
-		// /ffor/witness/close's is per witness.
+		// therefore a decision rather than a detail. The two after the splice
+		// pair carry no refusal there: /payment/cancel's ok is always true, and
+		// /ffor/witness/close's is per witness. The commitment feerate pair,
+		// /ffor/enforce and /ffor/issuer/issued answer theirs as a failure
+		// envelope (issue #1650).
 		it('only the listed routes answer with an ok inside result', () => {
 			const nested = everyOperation()
 				.filter(([method, route]) =>
@@ -410,12 +410,8 @@ describe('LFBW app surface (issue #614)', () => {
 			expect(nested).to.have.members([
 				'POST /channel/splice-in',
 				'POST /channel/splice-out',
-				'POST /channel/update-commitment-feerate',
-				'POST /channel/update-fee',
 				'POST /payment/cancel',
-				'POST /ffor/enforce',
-				'POST /ffor/witness/close',
-				'GET /ffor/issuer/issued'
+				'POST /ffor/witness/close'
 			]);
 		});
 	});

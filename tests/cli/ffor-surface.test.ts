@@ -643,21 +643,18 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 				expect(errorOf(res).message, label).to.match(/acceptStaleStateRisk/);
 			}
 
-			// With the acknowledgement the call reaches forceCloseChannel and
-			// answers with the enforce shape: whatever the engine says about
-			// this fixture's commitment, the hold is no longer what stops it.
+			// With the acknowledgement the call reaches forceCloseChannel. The
+			// fixture has no remote commitment signature, so the engine refuses,
+			// and the hold is no longer what stops it.
 			const accepted = await request(port, 'POST', '/ffor/enforce', {
 				channelId: fx.channelId,
 				acceptStaleStateRisk: true
 			});
-			expect(accepted.status).to.equal(200);
+			expect(accepted.status).to.equal(500);
+			expect(errorOf(accepted).code).to.equal('FORCE_CLOSE_FAILED');
 			expect(errorOf(accepted).message ?? '').to.not.match(
 				/acceptStaleStateRisk/
 			);
-			const result = accepted.body.result as Record<string, unknown>;
-			expect(result).to.have.property('ok');
-			expect(result.preimagesKnown).to.equal(1);
-			expect(String(result.error ?? '')).to.not.match(/acceptStaleStateRisk/);
 		} finally {
 			fx.remove();
 		}
@@ -674,13 +671,28 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 			]) {
 				const res = await request(port, 'POST', '/ffor/enforce', body);
 				const label = JSON.stringify(body);
-				expect(res.status, label).to.equal(200);
-				const result = res.body.result as Record<string, unknown>;
-				expect(result, label).to.have.property('ok');
-				expect(result.preimagesKnown, label).to.equal(1);
-				expect(String(result.error ?? ''), label).to.not.match(
+				// The engine's refusal of this fixture, never the hold's.
+				expect(res.status, label).to.equal(500);
+				expect(errorOf(res).code, label).to.equal('FORCE_CLOSE_FAILED');
+				expect(errorOf(res).message ?? '', label).to.not.match(
 					/acceptStaleStateRisk/
 				);
+			}
+			const commitmentTxid = 'cd'.repeat(32);
+			const engine = sinon
+				.stub(daemon.node.getNode(), 'forceCloseChannel')
+				.returns({ ok: true, commitmentTxid });
+			try {
+				const res = await request(port, 'POST', '/ffor/enforce', {
+					channelId: fx.channelId
+				});
+				expect(res.status).to.equal(200);
+				expect(res.body.result).to.deep.equal({
+					commitmentTxid,
+					preimagesKnown: 1
+				});
+			} finally {
+				engine.restore();
 			}
 		} finally {
 			fx.remove();
@@ -783,10 +795,11 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 							...body,
 							acceptStaleStateRisk: true
 						});
-						// This fixture has no remote commitment signature. The channel
-						// route surfaces that engine refusal as 500; FFOR returns its result.
+						// This fixture has no remote commitment signature. Both
+						// force-close routes surface that engine refusal as 500;
+						// /ffor/recover returns its result.
 						expect(accepted.status, route).to.equal(
-							route === '/channel/forceclose' ? 500 : 200
+							route === '/ffor/recover' ? 200 : 500
 						);
 						expect(errorOf(accepted).message ?? '').to.not.match(
 							/acceptStaleStateRisk/
@@ -1015,7 +1028,7 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 						});
 						// The fixture has no remote commitment signature, as above.
 						expect(accepted.status, `${kind} ${route}`).to.equal(
-							route === '/channel/forceclose' ? 500 : 200
+							route === '/ffor/recover' ? 200 : 500
 						);
 						expect(errorOf(accepted).message ?? '').to.not.match(
 							/acceptStaleStateRisk/

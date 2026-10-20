@@ -1341,6 +1341,7 @@ not repeat a 4xx unchanged.
 | `SPLICING_NOT_NEGOTIATED` | Channels | 409 | `option_splice`/`option_quiesce` is missing on one side of the pair |
 | `SPLICE_REFUSED` | Channels | 409 | The channel exists but would not start the splice (state, peer, size) |
 | `SPLICE_BUSY` | Channels | 503 | The channel would splice but is held off by a state that ends on its own; retry the same request |
+| `UPDATE_FEE_FAILED` | Channels | 409 | The channel would not take the commitment feerate (its state, not the opener, an FFOR epoch, the bounds or the reserve) |
 | `PEER_NOT_CONNECTED` | Peers | 409 | Peer is not connected |
 | `HOLD_RESOLUTION_PENDING` | Invoices | 503 | `settleHoldInvoice`/`cancelHoldInvoice` left HTLCs parked for the hash: a channel refused them, or a settle or cancel is already under way. The hold is live; do not switch to the other action |
 | `JIT_REFUSED` | Invoices | 400 | JIT receive: the LSP declined the intent, quoted above the wallet's ceiling, or answered with no intercept scid; the message carries the reason |
