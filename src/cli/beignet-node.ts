@@ -8118,13 +8118,7 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── FFOR: offline receive (issue #729) ───────────────
 
 	private fforChannelId(channelId: unknown): Buffer {
-		if (typeof channelId !== 'string' || !/^[0-9a-fA-F]{64}$/.test(channelId)) {
-			throw new BeignetError(
-				'INVALID_PARAMS',
-				'channelId must be 64 hex characters'
-			);
-		}
-		const idBuf = Buffer.from(channelId, 'hex');
+		const idBuf = requireChannelIdHex(channelId);
 		if (!this.node.getChannel(idBuf)) {
 			throw new BeignetError(
 				BeignetErrorCode.CHANNEL_NOT_FOUND,
@@ -8783,13 +8777,7 @@ export class BeignetNode extends EventEmitter {
 		// caller's spelling is not an identity: 'AB...' and 'ab...xyz' both
 		// decode to the same channel while matching no canonical id, which
 		// walked straight past the acknowledgement below.
-		if (!/^[0-9a-fA-F]{64}$/.test(channelId)) {
-			throw new BeignetError(
-				'INVALID_PARAMS',
-				'channelId must be 64 hex characters'
-			);
-		}
-		const idBuf = Buffer.from(channelId, 'hex');
+		const idBuf = requireChannelIdHex(channelId);
 		// Same reason closeChannel refuses one: an unknown channel is a caller
 		// mistake, and FORCE_CLOSE_FAILED carries no status, so it shipped as a
 		// 500 (issue #474). Checked before the acknowledgement so a typo is
@@ -13515,16 +13503,8 @@ export class BeignetNode extends EventEmitter {
 		maxFeeSats: number
 	): Promise<RebalanceResult> {
 		if (this.isGraphRestoring()) await this.whenGraphRestored();
-		if (!/^[0-9a-fA-F]{64}$/.test(fromChannelId))
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'fromChannelId must be 64 hex chars'
-			);
-		if (!/^[0-9a-fA-F]{64}$/.test(toChannelId))
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'toChannelId must be 64 hex chars'
-			);
+		const fromIdBuf = requireChannelIdHex(fromChannelId, 'fromChannelId');
+		const toIdBuf = requireChannelIdHex(toChannelId, 'toChannelId');
 		if (!Number.isInteger(amountSats) || amountSats <= 0)
 			throw new BeignetError(
 				BeignetErrorCode.INVALID_PARAMS,
@@ -13557,8 +13537,8 @@ export class BeignetNode extends EventEmitter {
 		let result: IRebalanceResult;
 		try {
 			result = await this.node.rebalanceChannel({
-				fromChannelId: Buffer.from(fromChannelId, 'hex'),
-				toChannelId: Buffer.from(toChannelId, 'hex'),
+				fromChannelId: fromIdBuf,
+				toChannelId: toIdBuf,
 				amountSats: BigInt(amountSats),
 				maxFeeSats: BigInt(maxFeeSats)
 			});
