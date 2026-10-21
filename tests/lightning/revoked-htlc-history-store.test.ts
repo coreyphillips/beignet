@@ -40,6 +40,7 @@ import {
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { encryptValue } from '../../src/lightning/storage/encryption';
+import { withStorageTransaction } from '../../src/lightning/storage/transaction';
 import { serializeChannelState } from '../../src/lightning/storage/serialization';
 import {
 	RecoveryCriticality,
@@ -369,6 +370,42 @@ describe('Revoked HTLC snapshot store', function () {
 			storage.close();
 		}
 	});
+
+	for (const wrapper of ['storage.transaction', 'withStorageTransaction']) {
+		for (const loader of ['loadChannel', 'loadAllChannels']) {
+			it(`writes snapshots ${loader} read inside a rolled-back ${wrapper}`, () => {
+				const storage = new SqliteStorage(':memory:');
+				storage.open();
+				const manager = new RecoveryManager(storage);
+				try {
+					const { opener, acceptor } = setupNormalChannels();
+					const channelId = opener.getChannelId()!.toString('hex');
+					offerHtlc(opener, acceptor, crypto.randomBytes(32));
+					exchangeCommitments(opener, acceptor);
+					let loaded: IChannelState | undefined;
+					const inner = (): never => {
+						expect(save(manager, channelId, opener.getFullState())).to.be.true;
+						loaded =
+							loader === 'loadChannel'
+								? storage.loadChannel(channelId)!.state
+								: storage.loadAllChannels()[0].state;
+						throw new Error('outer rollback');
+					};
+					expect(() =>
+						wrapper === 'storage.transaction'
+							? storage.transaction(inner)
+							: withStorageTransaction(storage, inner)
+					).to.throw('outer rollback');
+					expect(snapshotRows(storage, channelId)).to.equal(0);
+
+					expect(save(manager, channelId, loaded!)).to.be.true;
+					expect(snapshotRows(storage, channelId)).to.equal(1);
+				} finally {
+					storage.close();
+				}
+			});
+		}
+	}
 
 	it('writes the whole history into a store the state was not saved to', () => {
 		const stores: SqliteStorage[] = [];

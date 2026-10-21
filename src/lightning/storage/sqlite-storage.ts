@@ -941,7 +941,9 @@ export class SqliteStorage implements IStorageBackend {
 	/**
 	 * Give a loaded channel its stored snapshots. A row the 18->19 migration
 	 * could not read still carries its own; they are kept, and stay unsaved so
-	 * the channel's next save moves them into the table.
+	 * the channel's next save moves them into the table. Rows read inside an
+	 * open transaction may still roll back, so that state is left untracked
+	 * and its next save writes its whole history.
 	 */
 	private _attachRevokedHtlcSnapshots(
 		state: IChannelState,
@@ -955,6 +957,7 @@ export class SqliteStorage implements IStorageBackend {
 			}
 		}
 		state.revokedHtlcSnapshots = history?.size ? history : undefined;
+		if (this.db.inTransaction) return;
 		markRevokedHtlcSnapshotsSaved(state, this, stored?.keys() ?? []);
 	}
 
