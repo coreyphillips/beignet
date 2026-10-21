@@ -11,6 +11,7 @@
  */
 
 import { SUPERSEDES_OWN_KIND_MESSAGE_TYPES } from '../channel/channel-actions';
+import { IChannelState } from '../channel/channel-state';
 import {
 	markRevokedHtlcSnapshotsSaved,
 	unsavedRevokedHtlcSnapshots
@@ -128,36 +129,39 @@ export class RecoveryManager {
 			return { committed: false, released: [], error, frameSequence: null };
 		}
 
-		// The HTLC snapshots each channel write adds, which the journal frame
-		// encodes too. Only a transaction this commit owns may mark them saved:
-		// one it joins can still roll back after this returns, while a snapshot
-		// left unmarked is merely written again. With a journal they also wait
-		// for a commit that wrote a frame, since later frames omit them.
-		// withStorageTransaction does not see a raw backend transaction, so
-		// the backend is asked too.
-		const historyWritten =
-			isStorageTransactionActive(this.storage) ||
-			this.storage.inTransaction?.() === true
-				? []
-				: mutations.flatMap((mutation) =>
-						mutation.type === 'channel_state'
-							? [
-									{
-										state: mutation.state,
-										keys: [
-											...(unsavedRevokedHtlcSnapshots(
-												mutation.state,
-												this.storage
-											)?.keys() ?? [])
-										]
-									}
-							  ]
-							: []
-				  );
+		let historyWritten: Array<{ state: IChannelState; keys: string[] }> = [];
 		const outboxIds: Array<number | null> = [];
 		let journaled = false;
 		let frameSequence: bigint | null = null;
 		try {
+			// The HTLC snapshots each channel write adds, which the journal
+			// frame encodes too. Only a transaction this commit owns may mark
+			// them saved: one it joins can still roll back after this returns,
+			// while a snapshot left unmarked is merely written again. With a
+			// journal they also wait for a commit that wrote a frame, since
+			// later frames omit them. withStorageTransaction does not see a raw
+			// backend transaction, so the backend is asked too. Inside the try:
+			// a closed backend throws on that question, and that is a failed
+			// commit, not an exception out of commit().
+			historyWritten =
+				isStorageTransactionActive(this.storage) ||
+				this.storage.inTransaction?.() === true
+					? []
+					: mutations.flatMap((mutation) =>
+							mutation.type === 'channel_state'
+								? [
+										{
+											state: mutation.state,
+											keys: [
+												...(unsavedRevokedHtlcSnapshots(
+													mutation.state,
+													this.storage
+												)?.keys() ?? [])
+											]
+										}
+								  ]
+								: []
+					  );
 			// Joins an outer transaction when one is active (reconstruction
 			// replays commits inside a single install transaction); opens
 			// its own otherwise. See withStorageTransaction.
