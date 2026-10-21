@@ -488,6 +488,50 @@ describe('Forwarding History (M3)', function () {
 				storage.close();
 			}
 		});
+
+		it('holds exactly the newest cap ids after cap + 500 inserts', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				storage.forwardingEventsMaxRows = 1000;
+				for (let i = 1; i <= 1500; i++) {
+					storage.saveForwardingEvent(makeEvent({ settledAt: i }));
+				}
+				const ids = storage
+					.listForwardingEvents({ limit: 2000 })
+					.map((e) => e.id);
+				expect(ids).to.have.length(1000);
+				expect(ids[0]).to.equal(1500);
+				expect(ids[999]).to.equal(501);
+			} finally {
+				storage.close();
+			}
+		});
+
+		it('counts rows rather than assuming the ids are contiguous', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				storage.forwardingEventsMaxRows = 5;
+				for (let i = 1; i <= 5; i++) {
+					storage.saveForwardingEvent(makeEvent({ settledAt: i }));
+				}
+				(storage as any).db
+					.prepare('DELETE FROM forwarding_events WHERE id = 3')
+					.run();
+				const ids = (): number[] =>
+					storage.listForwardingEvents().map((e) => e.id);
+
+				// Back at the cap, not over it: nothing is pruned
+				storage.saveForwardingEvent(makeEvent({ settledAt: 6 }));
+				expect(ids()).to.deep.equal([6, 5, 4, 2, 1]);
+
+				storage.saveForwardingEvent(makeEvent({ settledAt: 7 }));
+				expect(ids()).to.deep.equal([7, 6, 5, 4, 2]);
+			} finally {
+				storage.close();
+			}
+		});
 	});
 
 	describe('persistence and schema', function () {

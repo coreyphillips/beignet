@@ -261,6 +261,82 @@ describe('Action Log', () => {
 		expect(latest[0].action).to.equal('cap-test');
 	});
 
+	it('holds exactly the newest 10k ids after 500 inserts past the cap', function () {
+		this.timeout(30_000);
+
+		const db = (storage as any).db;
+		const insertStmt = db.prepare(
+			'INSERT INTO action_log (category, action, timestamp, data) VALUES (?, ?, ?, ?)'
+		);
+		db.transaction(() => {
+			for (let i = 0; i < 10_000; i++) {
+				insertStmt.run('payment', 'sent', i, '{}');
+			}
+		})();
+
+		for (let i = 0; i < 500; i++) {
+			storage.saveActionLog!({
+				category: 'payment',
+				action: 'sent',
+				timestamp: 10_000 + i,
+				data: '{}'
+			});
+		}
+
+		expect(
+			db
+				.prepare(
+					'SELECT COUNT(*) AS n, MIN(id) AS lo, MAX(id) AS hi FROM action_log'
+				)
+				.get()
+		).to.deep.equal({ n: 10_000, lo: 501, hi: 10_500 });
+	});
+
+	it('prunes at the cap at least 10x faster than a NOT IN prune', function () {
+		this.timeout(60_000);
+
+		// In memory, so the comparison measures the prune and not fsync
+		const mem = new SqliteStorage(':memory:');
+		mem.open();
+		try {
+			const db = (mem as any).db;
+			const insertStmt = db.prepare(
+				'INSERT INTO action_log (category, action, timestamp, data) VALUES (?, ?, ?, ?)'
+			);
+			db.transaction(() => {
+				for (let i = 0; i < 10_000; i++) {
+					insertStmt.run('payment', 'sent', i, '{}');
+				}
+			})();
+			const time = (fn: (i: number) => void): number => {
+				const start = process.hrtime.bigint();
+				for (let i = 0; i < 1000; i++) fn(i);
+				return Number(process.hrtime.bigint() - start);
+			};
+
+			const current = time((i) =>
+				mem.saveActionLog!({
+					category: 'payment',
+					action: 'sent',
+					timestamp: 20_000 + i,
+					data: '{}'
+				})
+			);
+			// The per-insert prune saveActionLog used before, on the same table
+			const notInPrune = db.prepare(
+				'DELETE FROM action_log WHERE id NOT IN (SELECT id FROM action_log ORDER BY id DESC LIMIT 10000)'
+			);
+			const previous = time((i) => {
+				insertStmt.run('payment', 'sent', 30_000 + i, '{}');
+				notInPrune.run();
+			});
+
+			expect(current * 10).to.be.below(previous);
+		} finally {
+			mem.close();
+		}
+	});
+
 	it('emitStructuredLog persists to storage via LightningNode', () => {
 		const node = new LightningNode(makeNodeConfig(1, storage));
 		node.on('error', () => {}); // prevent uncaught
