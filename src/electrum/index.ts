@@ -2726,8 +2726,12 @@ export class Electrum {
 				sub.unconfirmedCallbacks?.delete(onReceive);
 			}
 			// The scan before this subscribe may have missed what the status
-			// shows, and only a full refresh reads it.
-			if (router.noteSubscribed(scriptHash, response)) {
+			// shows, and only a full refresh reads it. A record this subscribe
+			// created has heard no status of its own, whatever the router held.
+			if (
+				router.noteSubscribed(scriptHash, response) ||
+				(created && router.statuses.get(scriptHash) !== null)
+			) {
 				this._fullRefreshOwed = true;
 			}
 		});
@@ -2761,7 +2765,10 @@ export class Electrum {
 			) {
 				sub.unconfirmedCallbacks?.delete(onReceive);
 			}
-			if (router.noteSubscribed(utxo.scriptHash, response)) {
+			if (
+				router.noteSubscribed(utxo.scriptHash, response) ||
+				(created && router.statuses.get(utxo.scriptHash) !== null)
+			) {
 				this._fullRefreshOwed = true;
 			}
 		});

@@ -18,6 +18,7 @@ import {
 	EAvailableNetworks,
 	EPaymentType,
 	EProtocol,
+	err,
 	IAddress,
 	IWalletData,
 	ok,
@@ -140,6 +141,8 @@ describe('block notification refresh requests (#1663)', function () {
 	let onFirstSubscribe: ((scriptHash: string) => void) | undefined;
 	/** Whether a script hash not yet subscribed is refused. */
 	let refuseNewSubscriptions: boolean;
+	/** Whether storage refuses the UTXO set write. */
+	let refuseUtxoWrite: boolean;
 	let transactionsAsked: string[];
 	let messages: (keyof TMessageDataMap)[];
 
@@ -159,6 +162,7 @@ describe('block notification refresh requests (#1663)', function () {
 		failUtxoEntryOf = undefined;
 		onFirstSubscribe = undefined;
 		refuseNewSubscriptions = false;
+		refuseUtxoWrite = false;
 		transactionsAsked = [];
 		messages = [];
 		const heightOf = (scriptHash: string): number =>
@@ -293,6 +297,18 @@ describe('block notification refresh requests (#1663)', function () {
 				}
 			);
 
+		wallet = await createWallet();
+		await connect();
+		const refreshed = await wallet.refreshWallet();
+		if (refreshed.isErr()) throw refreshed.error;
+	});
+
+	afterEach(async function () {
+		await wallet?.stop();
+		sinon.restore();
+	});
+
+	const createWallet = async (): Promise<Wallet> => {
 		const res = await Wallet.create({
 			mnemonic: MNEMONIC,
 			network: EAvailableNetworks.regtest,
@@ -308,24 +324,19 @@ describe('block notification refresh requests (#1663)', function () {
 			},
 			storage: {
 				setData: async <K extends keyof IWalletData>(
-					_key: string,
+					key: string,
 					_value: IWalletData[K]
-				): Promise<Result<boolean>> => ok(true)
+				): Promise<Result<boolean>> =>
+					refuseUtxoWrite && key === wallet.getWalletDataKey('utxos')
+						? err('Storage refused the write.')
+						: ok(true)
 			}
 		});
 		if (res.isErr()) throw res.error;
-		wallet = res.value;
-		wallet.electrum.stopConnectionPolling();
-		wallet.electrum.batchDelay = 0;
-		await connect();
-		const refreshed = await wallet.refreshWallet();
-		if (refreshed.isErr()) throw refreshed.error;
-	});
-
-	afterEach(async function () {
-		await wallet?.stop();
-		sinon.restore();
-	});
+		res.value.electrum.stopConnectionPolling();
+		res.value.electrum.batchDelay = 0;
+		return res.value;
+	};
 
 	/** Connects and waits for the restore to wire the header subscription. */
 	const connect = async (): Promise<void> => {
@@ -359,10 +370,10 @@ describe('block notification refresh requests (#1663)', function () {
 		waitFor(() => !wallet.isRefreshing, 'the refresh to settle');
 
 	/** Issues receive addresses until one past those generated up front. */
-	const issuePastGenerated = async (): Promise<IAddress> => {
+	const issuePastGenerated = async (from = wallet): Promise<IAddress> => {
 		let issued: IAddress | undefined;
 		for (let i = 0; i < 20; i++) {
-			const res = await wallet.generateNewReceiveAddress();
+			const res = await from.generateNewReceiveAddress();
 			if (res.isErr()) throw new Error(res.error.message);
 			issued = res.value;
 		}
@@ -582,6 +593,49 @@ describe('block notification refresh requests (#1663)', function () {
 
 		expect(wallet.data.utxos.map((u) => u.tx_hash)).to.deep.equal([txid]);
 		expect(wallet.data.transactions[txid]?.height).to.equal(101);
+	});
+
+	it('scans on the next block after a status first heard by another wallet', async function () {
+		await block(101);
+		const other = await createWallet();
+		try {
+			const connected = await other.connectToElectrum();
+			if (connected.isErr()) throw connected.error;
+			const refreshed = await other.refreshWallet();
+			if (refreshed.isErr()) throw refreshed.error;
+			const txid = '8b'.repeat(32);
+			onFirstSubscribe = (scriptHash): void => {
+				const address = Object.values(
+					other.data.addresses[EAddressType.p2wpkh]
+				).find((a) => a.scriptHash === scriptHash);
+				if (address?.index === 20) pay(address, txid, 101);
+			};
+			await issuePastGenerated(other);
+			onFirstSubscribe = undefined;
+			// Answered "Already Subscribed.", with the status the other heard.
+			const issued = await issuePastGenerated();
+			expect(paid.get(issued.scriptHash)).to.equal(txid);
+
+			await block(102);
+
+			expect(wallet.data.utxos.map((u) => u.tx_hash)).to.deep.equal([txid]);
+		} finally {
+			await other.stop();
+		}
+	});
+
+	it('scans on the next block after the UTXO set write was refused', async function () {
+		await block(101);
+		const receive = wallet.data.addressIndex[EAddressType.p2wpkh];
+		pay(receive, '9c'.repeat(32), 101);
+		refuseUtxoWrite = true;
+		await notify(receive.scriptHash);
+		await settled();
+		refuseUtxoWrite = false;
+		resetCounts();
+
+		await block(102);
+		expect(listings, 'the block writes the set again').to.be.greaterThan(0);
 	});
 
 	it('subscribes on the next block a window address whose subscription failed', async function () {

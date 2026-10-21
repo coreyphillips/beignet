@@ -3220,9 +3220,10 @@ export class Wallet {
 		this._data.utxos = utxos;
 		this._data.balance = balance;
 		// A refused write is logged and left to the next scan, which writes both
-		// again. An Err here would stop refreshWallet before updateTransactions
-		// and subscribeToAddresses, and deposits would go unseen.
-		await this.saveUtxoState();
+		// again and which the next block now owes. An Err here would stop
+		// refreshWallet before updateTransactions and subscribeToAddresses, and
+		// deposits would go unseen.
+		if ((await this.saveUtxoState()).isErr()) this._refreshFailed = true;
 		return ok({ utxos, balance });
 	}
 
