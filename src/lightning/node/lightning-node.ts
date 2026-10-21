@@ -24799,12 +24799,41 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
+		const part: IForwardablePart = {
+			inChannelId,
+			inHtlcId,
+			paymentHash,
+			forwardAmountMsat: forwardAmount,
+			incomingAmountMsat,
+			forwardCltv,
+			incomingCltvExpiry,
+			nextPacket,
+			nextBlindingPoint,
+			failIncoming
+		};
+
 		// Look up outgoing channel via SCID (real SCID for blinded hops) BEFORE
 		// the policy checks: the fee/CLTV we enforce is the OUTGOING channel's
 		// effective policy (per-channel override or node defaults).
 		const scidHex = outgoingScid.toString('hex');
 		const outChannelId = this.scidToChannelId.get(scidHex);
 		if (!outChannelId) {
+			// A JIT part held for reestablish names an intercept SCID that no
+			// channel answers to, and its intent went with the funding: the
+			// hold row is what knows the channel it waits on.
+			const held = this.heldForwardLedger.byIncoming(
+				inChannelId.toString('hex'),
+				inHtlcId
+			);
+			if (
+				held &&
+				this.rearmReestablishHold(
+					Buffer.from(held.outChannelIdHex, 'hex'),
+					part
+				)
+			) {
+				return;
+			}
 			// JIT receive (LSP role): an unknown SCID may be an intercept SCID we
 			// minted for a wallet peer, so hold the HTLC and fund a channel to it
 			// rather than failing. Before the outgoing-policy, fee and CLTV checks
@@ -24914,18 +24943,6 @@ export class LightningNode extends EventEmitter {
 		// (on release) with a current HTLC counter. Synchronous loopback may
 		// complete the whole fulfillment chain during addHtlc, so we track the
 		// outgoing→incoming link BEFORE forwarding (same timing as payment storage).
-		const part: IForwardablePart = {
-			inChannelId,
-			inHtlcId,
-			paymentHash,
-			forwardAmountMsat: forwardAmount,
-			incomingAmountMsat,
-			forwardCltv,
-			incomingCltvExpiry,
-			nextPacket,
-			nextBlindingPoint,
-			failIncoming
-		};
 		const performForward = (
 			fail: (code: number) => boolean = failIncoming,
 			refundOwner: 'engine' | 'caller' = 'engine'
@@ -25340,13 +25357,19 @@ export class LightningNode extends EventEmitter {
 	): IHeldForwardDriver {
 		return {
 			forward: (): ReturnType<IHeldForwardDriver['forward']> => {
-				// Past the window only the timer acts on the row. A restart's
-				// redispatch drives the row before that timer is armed.
-				const holdUntil = this.heldForwardLedger.byIncoming(
+				// Past the window only the timer acts on the row, and past the
+				// cutoff only the block scan or the timer: a restart's redispatch
+				// drives the row before either has run.
+				const row = this.heldForwardLedger.byIncoming(
 					part.inChannelId.toString('hex'),
 					part.inHtlcId
-				)?.holdUntil;
-				if (holdUntil !== undefined && Date.now() >= holdUntil) {
+				);
+				if (
+					row &&
+					((row.holdUntil !== undefined && Date.now() >= row.holdUntil) ||
+						(this.currentBlockHeight > 0 &&
+							this.currentBlockHeight >= row.cutoffHeight))
+				) {
 					return 'deferred';
 				}
 				return this.placeHeldForward({
