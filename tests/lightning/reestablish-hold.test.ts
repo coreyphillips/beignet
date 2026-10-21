@@ -75,6 +75,22 @@ async function holdWorld(
 	return w;
 }
 
+/** Restart the LSP over the same file, as a new process would. */
+function restartLsp(w: IWorld, dbPath: string): LightningNode {
+	const lspId = w.lsp.getNodeId();
+	w.lsp.destroy();
+	w.alice.getChannelManager().handlePeerDisconnected(lspId);
+	w.carol.getChannelManager().handlePeerDisconnected(lspId);
+	w.alice.removeAllListeners('message:outbound');
+	w.carol.removeAllListeners('message:outbound');
+	const reopened = new SqliteStorage(dbPath);
+	reopened.open();
+	return createNode(LSP_SEED, reopened, {
+		asyncReceiveService: { enabled: false },
+		...lspExtra()
+	});
+}
+
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /** Move Carol's disconnect back in time, as if she had been away that long. */
 function awayFor(w: IWorld, ms: number): void {
@@ -120,7 +136,7 @@ function failsToPayer(w: IWorld): () => number {
 }
 
 /** Carol's JIT intent, registered the way the request handler does. */
-function registerIntent(w: IWorld): void {
+function registerIntent(w: IWorld, acceptsSkimmedFee?: boolean): void {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const ack = (w.lsp as any).jitReceiveManager.registerIntent(
 		w.carol.getNodeId(),
@@ -128,7 +144,8 @@ function registerIntent(w: IWorld): void {
 			requestId: crypto.randomBytes(8),
 			maxAmountMsat: 10_000_000n,
 			targetRemainingInboundSat: 0n,
-			expirySeconds: 600
+			expirySeconds: 600,
+			acceptsSkimmedFee
 		}
 	);
 	expect(ack.accepted, ack.reason).to.equal(true);
@@ -376,6 +393,8 @@ describe('Reestablish hold (issue #1726)', () => {
 		it('fails at once a part for a wallet gone longer than the window', async () => {
 			const w = await holdWorld();
 			const { alice, lsp, carol } = w;
+			// Nor does a live JIT intent queue it for a splice instead.
+			registerIntent(w);
 			const log = htlcLog(lsp);
 			const invoice = invoiceFor(w);
 			await disconnect(lsp, carol, w.cutBC);
@@ -418,6 +437,8 @@ describe('Reestablish hold (issue #1726)', () => {
 		it('refuses the eleventh part for one wallet and holds the ten before it', async () => {
 			const w = await holdWorld();
 			const { alice, lsp, carol } = w;
+			// Nor does a live JIT intent queue it for a splice instead.
+			registerIntent(w);
 			const log = htlcLog(lsp);
 			const invoices = Array.from({ length: 11 }, () =>
 				invoiceFor(w, 1_000_000n)
@@ -500,18 +521,7 @@ describe('Reestablish hold (issue #1726)', () => {
 			const [before] = holds(lsp);
 			expect(before.state).to.equal('RELEASING');
 
-			const lspId = lsp.getNodeId();
-			lsp.destroy();
-			alice.getChannelManager().handlePeerDisconnected(lspId);
-			carol.getChannelManager().handlePeerDisconnected(lspId);
-			alice.removeAllListeners('message:outbound');
-			carol.removeAllListeners('message:outbound');
-			const reopened = new SqliteStorage(dbPath);
-			reopened.open();
-			const restored = createNode(LSP_SEED, reopened, {
-				asyncReceiveService: { enabled: false },
-				...lspExtra()
-			});
+			const restored = restartLsp(w, dbPath);
 			const [after] = holds(restored);
 			expect(after.id, 'the row survived the restart').to.equal(before.id);
 			expect(after.state).to.equal('RELEASING');
@@ -532,6 +542,87 @@ describe('Reestablish hold (issue #1726)', () => {
 				'the payment to complete once the wallet is back'
 			);
 			expect(holds(restored)[0].state).to.equal('RELEASED');
+			destroyAll(alice, restored, carol);
+		});
+
+		it('fails a restored hold whose window ended before the payer came back', async () => {
+			const dbPath = tempDb('reestablish-hold-expired-restart');
+			const disk = new SqliteStorage(dbPath);
+			disk.open();
+			const w = await holdWorld({}, disk);
+			const { alice, lsp, carol } = w;
+			const invoice = invoiceFor(w);
+			await disconnect(lsp, carol, w.cutBC);
+			awayFor(w, DEFAULT_REESTABLISH_HOLD_MS - 500);
+			alice.sendPayment(invoice.bolt11);
+			await settle();
+			const [held] = holds(lsp);
+
+			const restored = restartLsp(w, dbPath);
+			await reconnectRestarted(restored, carol);
+			await new Promise((r) =>
+				setTimeout(r, Math.max(0, held.holdUntil! - Date.now()) + 50)
+			);
+			await reconnectRestarted(restored, alice);
+			await waitFor(
+				() =>
+					paymentStatus(alice, invoice.paymentHash) === PaymentStatus.FAILED,
+				'the payer to be refunded',
+				5_000
+			);
+			expect(alice.getPayment(invoice.paymentHash)!.failureCode).to.equal(
+				TEMPORARY_CHANNEL_FAILURE
+			);
+			const [row] = holds(restored);
+			expect(row.state).to.equal('FAILED');
+			expect(row.failReason).to.equal('hold_expired');
+			destroyAll(alice, restored, carol);
+		});
+
+		it('a held JIT part keeps its opening fee across a restart', async () => {
+			const dbPath = tempDb('reestablish-hold-jit-fee-restart');
+			const disk = new SqliteStorage(dbPath);
+			disk.open();
+			const w = await setupWorld({
+				lspStorage: disk,
+				carolRegisters: false,
+				lspService: { enabled: false },
+				lspExtra: {
+					jitReceive: { enabled: true, flatFeeSat: 100n },
+					reestablishHold: { enabled: true }
+				}
+			});
+			makeUnannounced(w);
+			const { alice, lsp, carol } = w;
+			registerIntent(w, true);
+			const restoreCapacity = shrinkChannel(w);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(lsp as any).spliceInAndWait = async (): Promise<void> => {
+				restoreCapacity();
+				await disconnect(lsp, carol, w.cutBC);
+			};
+			const invoice = carol.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'away',
+				jitFeeAllowance: { flatFeeSat: 100, feePpm: 0 }
+			});
+			alice.sendPayment(invoice.bolt11);
+			await waitFor(() => holds(lsp).length === 1, 'the part to be held');
+			expect(holds(lsp)[0].forwardAmountMsat).to.equal('4900000');
+
+			const restored = restartLsp(w, dbPath);
+			const forwarded: bigint[] = [];
+			restored.on('htlc:forward', (_in, _out, amountMsat: bigint) =>
+				forwarded.push(amountMsat)
+			);
+			await reconnectRestarted(restored, alice);
+			await reconnectRestarted(restored, carol);
+			await waitFor(
+				() =>
+					paymentStatus(alice, invoice.paymentHash) === PaymentStatus.COMPLETED,
+				'the payment to complete once the wallet is back'
+			);
+			expect(forwarded).to.deep.equal([4_900_000n]);
 			destroyAll(alice, restored, carol);
 		});
 

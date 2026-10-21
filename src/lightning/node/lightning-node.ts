@@ -24990,8 +24990,9 @@ export class LightningNode extends EventEmitter {
 		// rather than refused. Judged here so a hold never shows as a refused
 		// add; the add path judges only what reaches it some other way.
 		if (this.rearmReestablishHold(outChannelId, part)) return;
-		if (this.holdForReestablish(outChannelId, part)) return;
-		this.forwardHtlcOnto(outChannelId, part, 'engine', false);
+		const reestablishHold = this.holdForReestablish(outChannelId, part);
+		if (reestablishHold === 'held') return;
+		this.forwardHtlcOnto(outChannelId, part, 'engine', reestablishHold);
 	}
 
 	/**
@@ -25197,9 +25198,11 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * Reestablish hold (issue #1726): park a forward to a liquidity client
-	 * whose channel is awaiting reestablish instead of failing it. True when
-	 * the part is now the hold's and the caller must leave it alone; false
-	 * leaves the caller to forward (or fail) it as before.
+	 * whose channel is awaiting reestablish instead of failing it. 'held'
+	 * when the part is now the hold's and the caller must leave it alone;
+	 * 'refused' when the window or a cap turned it down, so nothing else may
+	 * hold it for the absent wallet either; 'ineligible' leaves the caller to
+	 * forward (or fail) it as before.
 	 *
 	 * A liquidity client is the peer on an unannounced channel that this node
 	 * opened or whose peer holds a JIT intent, and only while this node runs
@@ -25209,26 +25212,26 @@ export class LightningNode extends EventEmitter {
 	private holdForReestablish(
 		outChannelId: Buffer,
 		part: IForwardablePart
-	): boolean {
+	): 'held' | 'refused' | 'ineligible' {
 		const limits = this.reestablishHold;
-		if (!limits || !this.jitReceiveManager) return false;
+		if (!limits || !this.jitReceiveManager) return 'ineligible';
 		const channel = this.channelManager.getChannel(outChannelId);
 		if (channel?.getState() !== ChannelState.AWAITING_REESTABLISH) {
-			return false;
+			return 'ineligible';
 		}
 		const peer = this.channelManager.getPeerForChannel(outChannelId);
-		if (!peer) return false;
+		if (!peer) return 'ineligible';
 		const channelState = channel.getFullState();
 		if (
 			channelState.announceChannel ||
 			(channelState.role !== ChannelRole.OPENER &&
 				!this.channelManager.isJitClient(peer))
 		) {
-			return false;
+			return 'ineligible';
 		}
 		const inChannelIdHex = part.inChannelId.toString('hex');
 		if (this.heldForwardLedger.byIncoming(inChannelIdHex, part.inHtlcId)) {
-			return false;
+			return 'ineligible';
 		}
 		const outChannelIdHex = outChannelId.toString('hex');
 		// The cutoff parkHeldForward fixes: the wallet's final-hop headroom, or
@@ -25287,10 +25290,10 @@ export class LightningNode extends EventEmitter {
 				outChannelId: outChannelIdHex,
 				reason: 'refused' in outcome ? outcome.refused : 'storage_failed'
 			});
-			return false;
+			return 'refused';
 		}
 		this.armReestablishHoldTimer(outcome.record);
-		return true;
+		return 'held';
 	}
 
 	/**
@@ -25308,9 +25311,14 @@ export class LightningNode extends EventEmitter {
 			part.inHtlcId
 		);
 		if (!existing || !isReestablishHold(existing)) return false;
+		// The row's amount, not the onion's: a JIT part was held after its
+		// opening fee came off.
 		const outcome = this.asyncPaymentManager.registerHold(
 			existing,
-			this.reestablishHoldDriver(outChannelId, part)
+			this.reestablishHoldDriver(outChannelId, {
+				...part,
+				forwardAmountMsat: BigInt(existing.forwardAmountMsat)
+			})
 		);
 		if (!('record' in outcome)) return true;
 		if (
@@ -25331,8 +25339,17 @@ export class LightningNode extends EventEmitter {
 		part: IForwardablePart
 	): IHeldForwardDriver {
 		return {
-			forward: () =>
-				this.placeHeldForward({
+			forward: (): ReturnType<IHeldForwardDriver['forward']> => {
+				// Past the window only the timer acts on the row. A restart's
+				// redispatch drives the row before that timer is armed.
+				const holdUntil = this.heldForwardLedger.byIncoming(
+					part.inChannelId.toString('hex'),
+					part.inHtlcId
+				)?.holdUntil;
+				if (holdUntil !== undefined && Date.now() >= holdUntil) {
+					return 'deferred';
+				}
+				return this.placeHeldForward({
 					inChannelId: part.inChannelId,
 					inHtlcId: part.inHtlcId,
 					outChannelId,
@@ -25343,7 +25360,8 @@ export class LightningNode extends EventEmitter {
 							refundOwner
 						),
 					failIncoming: part.failIncoming
-				}),
+				});
+			},
 			// Never a code a payer reads as final: the payment can be retried
 			// once the wallet is back.
 			fail: () => part.failIncoming(TEMPORARY_CHANNEL_FAILURE)
@@ -25522,8 +25540,8 @@ export class LightningNode extends EventEmitter {
 		outChannelId: Buffer,
 		part: IHeldJitPart,
 		refundOwner: 'engine' | 'caller' = 'engine',
-		/** False when the caller already asked holdForReestablish. */
-		mayHoldForReestablish = true
+		/** holdForReestablish's verdict, when the caller already asked it. */
+		reestablishHold?: 'refused' | 'ineligible'
 	): ForwardPlacement {
 		// The tip may have moved since the forward was judged (issue #1009): a
 		// JIT part held for a splice, a held forward its receiver releases and
@@ -25603,11 +25621,12 @@ export class LightningNode extends EventEmitter {
 					// channel awaiting reestablish is not short of liquidity.
 					// Never for a held-forward driver ('caller'): its row
 					// already owns the part.
-					if (
-						mayHoldForReestablish &&
-						refundOwner === 'engine' &&
-						this.holdForReestablish(outChannelId, part)
-					) {
+					const hold =
+						reestablishHold ??
+						(refundOwner === 'engine'
+							? this.holdForReestablish(outChannelId, part)
+							: 'ineligible');
+					if (hold === 'held') {
 						placement = 'held';
 						return;
 					}
@@ -25618,7 +25637,12 @@ export class LightningNode extends EventEmitter {
 					// linkage rollback, because a held-for-splice part is a
 					// forward whose linkage was deliberately rolled back and is
 					// re-registered when the retry re-enters this method.
-					if (this.jitReceiveManager?.tryHoldForSplice(outChannelId, part)) {
+					// Not for a part the reestablish hold refused: the splice
+					// also waits for the absent wallet, past the hold's caps.
+					if (
+						hold !== 'refused' &&
+						this.jitReceiveManager?.tryHoldForSplice(outChannelId, part)
+					) {
 						this.emitStructuredLog('htlc', 'jit_held_for_splice', {
 							channelId: outChannelId.toString('hex'),
 							paymentHash: part.paymentHash.toString('hex'),
