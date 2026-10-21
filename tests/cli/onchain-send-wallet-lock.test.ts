@@ -7,6 +7,10 @@
  * Issue #1626: BeignetNode.prepareOnchainSweep reset and staged the wallet's
  * transaction under the node's lock alone, wiping a direct send the same way.
  *
+ * Issue #1638: the session Wallet.withSendLock hands its fn kept working after
+ * fn settled, so a caller that held on to it could stage on the shared
+ * transaction with no lock held.
+ *
  * Fully OFFLINE: the wallet points at an unreachable Electrum port, UTXOs are
  * injected into wallet data, and the broadcast is stubbed.
  */
@@ -35,6 +39,7 @@ import {
 	err,
 	ok
 } from '../../src';
+import { getDefaultSendTransaction } from '../../src/shapes';
 
 // The raw module.exports object, which src/electrum reads live (see
 // broadcast-spent-utxos.test.ts).
@@ -96,6 +101,9 @@ const pays = (hex: string): string[] =>
 			`${bitcoinAddress.fromOutputScript(out.script, network)}:${out.value}`
 	);
 
+/** What Wallet.withSendLock hands its fn. */
+type SendLockSession = Pick<Wallet, 'send' | 'sendMax' | 'buildPsbt'>;
+
 /** A promise and the function that resolves it. */
 const gate = (): { opened: Promise<void>; open: () => void } => {
 	let open!: () => void;
@@ -103,7 +111,7 @@ const gate = (): { opened: Promise<void>; open: () => void } => {
 	return { opened, open };
 };
 
-describe('CLI on-chain sends hold the wallet send lock (#1617, #1626)', function () {
+describe('CLI on-chain sends hold the wallet send lock (#1617, #1626, #1638)', function () {
 	this.timeout(60000);
 
 	let wallet: Wallet;
@@ -273,5 +281,74 @@ describe('CLI on-chain sends hold the wallet send lock (#1617, #1626)', function
 		expect(pays(record.hex)).to.deep.equal([
 			`${SWEEP_PAYEE}:${prepared.amountSats}`
 		]);
+	});
+
+	it('a withSendLock session refuses to stage once its fn has settled', async () => {
+		let session!: SendLockSession;
+		await wallet.withSendLock(async (locked) => {
+			session = locked;
+			// The session works while fn runs: this is the path the node uses.
+			const built = await locked.send({
+				address: DIRECT_PAYEE,
+				amount: 10_000,
+				satsPerByte: 2,
+				broadcast: false
+			});
+			if (built.isErr()) expect.fail(built.error.message);
+			expect(spends(built.value)).to.deep.equal([`${LARGE_COIN}:0`]);
+			await wallet.resetSendTransaction();
+		});
+
+		const late = {
+			send: await session.send({
+				address: DIRECT_PAYEE,
+				amount: 10_000,
+				satsPerByte: 2,
+				broadcast: false
+			}),
+			sendMax: await session.sendMax({
+				address: DIRECT_PAYEE,
+				satsPerByte: 2,
+				broadcast: false
+			}),
+			buildPsbt: await session.buildPsbt({
+				address: DIRECT_PAYEE,
+				amount: 10_000,
+				satsPerByte: 2
+			})
+		};
+		for (const [method, result] of Object.entries(late)) {
+			if (result.isOk()) expect.fail(`${method} ran after the session settled`);
+			expect(result.error.message, method).to.equal(
+				'withSendLock session used after it settled'
+			);
+		}
+		// A call that ran would have left its inputs in the live staged copy.
+		expect(wallet.transaction.data).to.deep.equal(getDefaultSendTransaction());
+	});
+
+	it('a withSendLock session is settled by an fn that throws', async () => {
+		let session!: SendLockSession;
+		await wallet
+			.withSendLock(async (locked) => {
+				session = locked;
+				throw new Error('fn failed');
+			})
+			.then(
+				() => expect.fail('fn did not throw'),
+				(error: Error) => expect(error.message).to.equal('fn failed')
+			);
+
+		const late = await session.send({
+			address: DIRECT_PAYEE,
+			amount: 10_000,
+			satsPerByte: 2,
+			broadcast: false
+		});
+		if (late.isOk()) expect.fail('send ran after the session settled');
+		expect(late.error.message).to.equal(
+			'withSendLock session used after it settled'
+		);
+		expect(wallet.transaction.data).to.deep.equal(getDefaultSendTransaction());
 	});
 });

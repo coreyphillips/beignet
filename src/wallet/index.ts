@@ -5355,24 +5355,37 @@ export class Wallet {
 	 * Runs fn under the send lock, for a caller whose send is more than one
 	 * call: reading what it staged, broadcasting the hex, resetting the staged
 	 * transaction. fn gets send, sendMax and buildPsbt without the queue, since
-	 * fn already holds the lock, so they must not be called once fn settles.
-	 * The wallet's own send methods, called from fn, wait on the lock fn holds
-	 * and never settle.
+	 * fn already holds the lock. Once fn settles the lock is gone, so each of
+	 * them returns an Err from then on instead of staging on the shared
+	 * transaction unlocked (#1638). The wallet's own send methods, called from
+	 * fn, wait on the lock fn holds and never settle.
 	 */
 	public withSendLock<T>(
 		fn: (locked: Pick<Wallet, 'send' | 'sendMax' | 'buildPsbt'>) => Promise<T>
 	): Promise<T> {
-		return this.runSend(() =>
-			fn({
-				send: ({ address, amount, message = '', ...options }) =>
-					this.sendManyLocked({
-						txs: [{ address, amount, message }],
-						...options
-					}),
-				sendMax: (options) => this.sendMaxLocked(options),
-				buildPsbt: (args) => this.buildPsbtLocked(args)
-			})
-		);
+		return this.runSend(async () => {
+			let settled = false;
+			const guard =
+				<A, R>(run: (args: A) => Promise<Result<R>>) =>
+				async (args: A): Promise<Result<R>> =>
+					settled
+						? err('withSendLock session used after it settled')
+						: run(args);
+			try {
+				return await fn({
+					send: guard(({ address, amount, message = '', ...options }) =>
+						this.sendManyLocked({
+							txs: [{ address, amount, message }],
+							...options
+						})
+					),
+					sendMax: guard((options) => this.sendMaxLocked(options)),
+					buildPsbt: guard((args) => this.buildPsbtLocked(args))
+				});
+			} finally {
+				settled = true;
+			}
+		});
 	}
 
 	/**
