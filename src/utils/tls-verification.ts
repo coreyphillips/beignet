@@ -15,6 +15,12 @@ const normalizeFingerprint = (fingerprint: string): string =>
  * host name, or when its SHA-256 fingerprint is one of `fingerprints` (for
  * servers with self-signed certificates). Anything else fails the connect.
  *
+ * A caller that resolves a host name itself and dials the address it got (the
+ * daemon pins its Electrum host to IPv4) names the original host in
+ * `servernames`, keyed by the address it dials. The host name check and SNI
+ * then use that name rather than the bare address, which a certificate
+ * issued for the name would never match (issue #1776).
+ *
  * Node only: under React Native the client builds its TLS socket without
  * calling `connect`, so the wrapper refuses to be created there rather than
  * verify nothing.
@@ -22,11 +28,16 @@ const normalizeFingerprint = (fingerprint: string): string =>
  * @param {Tls} tls Node's `tls` module
  * @param {string[]} [fingerprints] SHA-256 certificate fingerprints, hex with
  * or without colons, as printed by `openssl x509 -noout -fingerprint -sha256`
+ * @param {Record<string, string>} [servernames] the host name to check for
+ * each dialed host, for a caller that dials an address it resolved itself
  * @returns {Tls}
  */
 export const withTlsVerification = (
 	tls: Tls,
-	{ fingerprints = [] }: { fingerprints?: string[] } = {}
+	{
+		fingerprints = [],
+		servernames = {}
+	}: { fingerprints?: string[]; servernames?: Record<string, string> } = {}
 ): Tls => {
 	if (typeof process === 'undefined' || process.release?.name !== 'node') {
 		throw new Error('withTlsVerification needs Node.js');
@@ -37,15 +48,22 @@ export const withTlsVerification = (
 			throw new Error(`Invalid SHA-256 fingerprint: ${fingerprint}`);
 		}
 	}
+	const names = new Map(Object.entries(servernames));
 	// Only the options form: it is the one rn-electrum-client calls.
 	const connect = (
 		options: ConnectionOptions,
 		secureConnectListener?: () => void
 	): TLSSocket => {
+		const servername =
+			typeof options.host === 'string' ? names.get(options.host) : undefined;
 		// Verification is decided here rather than by rejectUnauthorized, which
 		// would also refuse a pinned self-signed certificate.
 		const socket = tls.connect(
-			{ ...options, rejectUnauthorized: false },
+			{
+				...options,
+				...(servername ? { servername } : {}),
+				rejectUnauthorized: false
+			},
 			() => {
 				const fingerprint = socket.getPeerCertificate().fingerprint256;
 				if (

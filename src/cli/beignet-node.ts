@@ -6,13 +6,17 @@
  */
 
 import { IrohDaemonConfig, validateIrohConfig } from './iroh-config';
+import {
+	ElectrumTlsConfig,
+	electrumTlsModule,
+	validateElectrumTlsConfig
+} from './electrum-tls-config';
 import { createNodeIrohEndpoint } from '../lightning/transport/iroh-node';
 import { OfflineReceive } from './offline-receive';
 import { FforReceiveService, FforReceiveFunding } from './ffor-receive';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as net from 'net';
-import * as tls from 'tls';
 import { promises as dnsPromises } from 'dns';
 import {
 	acquireInstanceLock,
@@ -291,7 +295,9 @@ export interface LogEntry {
 	timestamp: number;
 }
 
-export interface BeignetNodeOptions extends IrohDaemonConfig {
+export interface BeignetNodeOptions
+	extends IrohDaemonConfig,
+		ElectrumTlsConfig {
 	/** Primary-only switch for new private client channels. Default false. */
 	waiveClientReserve?: boolean;
 	mnemonic?: string;
@@ -2336,6 +2342,7 @@ export class BeignetNode extends EventEmitter {
 	static async create(opts: BeignetNodeOptions = {}): Promise<BeignetNode> {
 		try {
 			validateIrohConfig(opts);
+			validateElectrumTlsConfig(opts);
 		} catch (err) {
 			throw new BeignetError('INVALID_PARAMS', (err as Error).message);
 		}
@@ -2702,6 +2709,15 @@ export class BeignetNode extends EventEmitter {
 				ipv4: electrumHost
 			});
 		}
+		// Certificate verification (issue #1776) checks every TLS connection the
+		// wallet opens, the public fallback peers included, and keeps the
+		// configured name for the check when the pin above replaced it.
+		const walletTls = electrumTlsModule(opts, electrumHost, rawElectrumHost);
+		if (opts.electrumTlsVerify === true) {
+			this.log('info', 'Verifying Electrum TLS certificates', {
+				pinnedFingerprints: opts.electrumTlsFingerprints?.length ?? 0
+			});
+		}
 
 		// 1. Map network name to beignet types
 		const beignetNetwork = this.toBeignetNetwork(networkName);
@@ -2735,7 +2751,7 @@ export class BeignetNode extends EventEmitter {
 				: {}),
 			electrumOptions: {
 				net,
-				tls,
+				tls: walletTls,
 				servers: electrumServer
 			},
 			disableMessagesOnCreate: true,
