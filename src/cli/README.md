@@ -74,7 +74,9 @@ const node = await BeignetNode.create({
   dataDir?: string,         // SQLite + data dir (default: ~/.beignet/data)
   electrumHost?: string,    // Electrum server host
   electrumPort?: number,    // Electrum server port
-  electrumTls?: boolean,    // use TLS for Electrum (encrypted, but the server certificate is not verified)
+  electrumTls?: boolean,    // use TLS for Electrum (encrypted; the certificate is checked only with electrumTlsVerify)
+  electrumTlsVerify?: boolean,         // verify Electrum TLS certificates, fallback peers included (default: false)
+  electrumTlsFingerprints?: string[],  // SHA-256 fingerprints to accept for self-signed servers (needs electrumTlsVerify)
   listenPort?: number,      // listen for inbound Lightning connections
   preferAnchors?: boolean,  // anchor channels (default: true); set false for legacy static_remotekey
   autoBootstrap?: boolean,  // auto-connect to DNS seed peers on start
@@ -2062,6 +2064,8 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_ELECTRUM_HOST` | Electrum server hostname |
 | `BEIGNET_ELECTRUM_PORT` | Electrum server port |
 | `BEIGNET_ELECTRUM_TLS` | `true` or `false` |
+| `BEIGNET_ELECTRUM_TLS_VERIFY` | `true` checks Electrum TLS certificates (default off); anything but `true`, `false` or empty refuses startup |
+| `BEIGNET_ELECTRUM_TLS_FINGERPRINTS` | Comma-separated SHA-256 certificate fingerprints to accept for self-signed servers; needs `BEIGNET_ELECTRUM_TLS_VERIFY=true` |
 | `BEIGNET_LISTEN_PORT` | Lightning listen port |
 | `BEIGNET_MAX_INBOUND_PEERS` | Inbound peer connections (default 125); once this many are up, only peers holding a channel with this node are admitted |
 | `BEIGNET_DAEMON_HOST` | HTTP daemon bind address (default: `127.0.0.1`) |
@@ -2240,6 +2244,31 @@ CLI flags > environment variables > config file > defaults.
 > development against your own regtest node, override it with
 > `BEIGNET_ELECTRUM_HOST`/`BEIGNET_ELECTRUM_PORT` or the `electrumHost`/
 > `electrumPort` options.
+
+**Certificate verification.** A TLS Electrum connection is encrypted, but by
+default it accepts any certificate, so an on-path attacker can stand in for the
+server. With `BEIGNET_ELECTRUM_TLS_VERIFY=true` (`electrumTlsVerify`) the daemon
+accepts only a certificate that chains to a trusted CA and matches the host
+name, or one whose SHA-256 fingerprint is listed in
+`BEIGNET_ELECTRUM_TLS_FINGERPRINTS` (`electrumTlsFingerprints`, from
+`openssl x509 -noout -fingerprint -sha256`). The check covers the public
+fallback servers too, and a host the daemon pins to IPv4 before dialing is
+still checked against the name you configured. Fingerprints without
+verification refuse startup rather than being ignored. With
+`BEIGNET_ELECTRUM_TLS=false` the configured server is plain TCP and is never
+checked, so only the TLS fallback servers are verified; the daemon starts
+anyway and logs a warning saying so.
+
+Nodes created in one process (`BeignetNode.create`) share a single Electrum
+connection per network, so they must use the same `electrumTlsVerify` and
+`electrumTlsFingerprints`. A node whose settings differ from those of a node
+already running on the same network is refused with `INVALID_PARAMS`.
+
+Turn it on together with your own server. As of October 2026 none of the
+built-in mainnet servers passes: `fulcrum.bitkit.blocktank.to` serves an
+expired certificate, and the fallback peers serve self-signed ones. With
+verification on and no pin, the daemon refuses all of them and stays without
+Electrum until a server it can verify answers.
 
 ---
 

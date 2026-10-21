@@ -25,6 +25,8 @@ export function daemonOptions(
 		electrumHost: config.electrumHost,
 		electrumPort: config.electrumPort,
 		electrumTls: config.electrumTls,
+		electrumTlsVerify: config.electrumTlsVerify,
+		electrumTlsFingerprints: config.electrumTlsFingerprints,
 		electrumServers: config.electrumServers,
 		feeEstimationSource: config.feeEstimationSource,
 		listenPort: config.listenPort,

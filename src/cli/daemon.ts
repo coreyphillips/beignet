@@ -5,6 +5,7 @@
  */
 
 import { validateIrohConfig } from './iroh-config';
+import { validateElectrumTlsConfig } from './electrum-tls-config';
 import {
 	normalizeIrohEndpointId,
 	validateIrohRelayUrl
@@ -939,6 +940,7 @@ async function bootDaemon(
 	// caller no handle to destroy.
 	try {
 		validateIrohConfig(opts);
+		validateElectrumTlsConfig(opts);
 	} catch (err) {
 		throw new BeignetError('INVALID_PARAMS', (err as Error).message);
 	}
