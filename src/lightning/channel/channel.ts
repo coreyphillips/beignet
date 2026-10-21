@@ -115,6 +115,7 @@ import {
 	RecoveryCloseReason,
 	ChannelCloseReason
 } from './channel-state';
+import { recordRevokedHtlcSnapshot } from './htlc-snapshots';
 import { ChannelRecoveryStatus } from '../recovery/channel-status';
 import {
 	deriveChannelId,
@@ -3037,14 +3038,16 @@ export class Channel {
 		);
 
 		// Generate SCID alias for private channels
-		if (!this._state.scidAlias) {
-			this._state.scidAlias = crypto.randomBytes(8);
+		let scidAlias = this._state.scidAlias;
+		if (!scidAlias) {
+			scidAlias = crypto.randomBytes(8);
+			this._setScid('scidAlias', scidAlias);
 		}
 
 		const msg: IChannelReadyMessage = {
 			channelId: this._state.channelId!,
 			secondPerCommitmentPoint: secondPoint,
-			shortChannelId: this._state.scidAlias
+			shortChannelId: scidAlias
 		};
 
 		// option_taproot: seed the verification-nonce pipeline — advertise our nonce
@@ -3115,7 +3118,7 @@ export class Channel {
 			this._state.remoteNonce = early.nextLocalNonce;
 		}
 		if (early.shortChannelId) {
-			this._state.remoteScidAlias = early.shortChannelId;
+			this._setScid('remoteScidAlias', early.shortChannelId);
 		}
 	}
 
@@ -3299,7 +3302,7 @@ export class Channel {
 
 		// Store remote's SCID alias if provided
 		if (msg.shortChannelId) {
-			this._state.remoteScidAlias = msg.shortChannelId;
+			this._setScid('remoteScidAlias', msg.shortChannelId);
 		}
 
 		if (this._state.localChannelReady) {
@@ -4794,7 +4797,8 @@ export class Channel {
 	/**
 	 * Record which HTLCs are present in a given remote commitment so the penalty
 	 * path can reconstruct their outputs after they settle. Only HTLCs that
-	 * actually appear in the commitment (PENDING/COMMITTED) are captured.
+	 * actually appear in the commitment (PENDING/COMMITTED) are captured, and a
+	 * commitment without any records nothing.
 	 */
 	private _snapshotRemoteCommitmentHtlcs(commitmentNumber: bigint): void {
 		const entries: IHtlcSnapshotEntry[] = [];
@@ -4813,10 +4817,11 @@ export class Channel {
 				});
 			}
 		}
-		if (!this._state.revokedHtlcSnapshots) {
-			this._state.revokedHtlcSnapshots = new Map();
-		}
-		this._state.revokedHtlcSnapshots.set(commitmentNumber.toString(), entries);
+		recordRevokedHtlcSnapshot(
+			this._state,
+			commitmentNumber.toString(),
+			entries
+		);
 	}
 
 	/**
@@ -17184,7 +17189,7 @@ export class Channel {
 			txIndex,
 			outputIndex: this._state.fundingOutputIndex
 		});
-		this._state.shortChannelId = scid;
+		this._setScid('shortChannelId', scid);
 		this._state.fundingConfirmationHeight = blockHeight;
 		this._state.fundingTxIndex = txIndex;
 
@@ -17267,7 +17272,7 @@ export class Channel {
 			this._state.shortChannelId &&
 			!this._state.shortChannelId.equals(msg.shortChannelId)
 		) {
-			this._state.shortChannelId = msg.shortChannelId;
+			this._setScid('shortChannelId', msg.shortChannelId);
 			this._state.announcementSigsSent = false;
 			this._state.localAnnouncementNodeSig = null;
 			this._state.localAnnouncementBitcoinSig = null;
@@ -17279,7 +17284,7 @@ export class Channel {
 
 		// If we don't have an SCID yet, use theirs
 		if (!this._state.shortChannelId) {
-			this._state.shortChannelId = msg.shortChannelId;
+			this._setScid('shortChannelId', msg.shortChannelId);
 		}
 
 		// Persist exchanged signatures + adopted SCID so a restart doesn't
@@ -17350,6 +17355,28 @@ export class Channel {
 		}
 		this._state.localAnnouncementBitcoinSig = fresh;
 		return fresh;
+	}
+
+	/**
+	 * Counts changes to any channel's real SCID or either alias, so an index
+	 * of them (ChannelManager.getChannelsByScid) can tell it is stale. Every
+	 * such write goes through _setScid.
+	 */
+	private static scidRevision = 0;
+
+	static getScidRevision(): number {
+		return Channel.scidRevision;
+	}
+
+	private _setScid(
+		field: 'shortChannelId' | 'scidAlias' | 'remoteScidAlias',
+		scid: Buffer
+	): void {
+		// A retransmitted channel_ready rewrites the same alias; that is no
+		// reason for every node's index to rebuild.
+		if (this._state[field]?.equals(scid)) return;
+		this._state[field] = scid;
+		Channel.scidRevision++;
 	}
 
 	/**

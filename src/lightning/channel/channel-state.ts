@@ -476,6 +476,8 @@ export interface IChannelState {
 	 * since settled and been removed from `htlcs`, the justice/penalty transaction
 	 * can still reconstruct and sweep those HTLC outputs. Without it, a cheater
 	 * reclaims formerly-in-flight HTLC value the penalty was meant to confiscate.
+	 * Commitments without HTLCs have no entry. Storage keeps these outside the
+	 * channel row and a save writes only new ones (see htlc-snapshots.ts).
 	 */
 	revokedHtlcSnapshots?: Map<string, IHtlcSnapshotEntry[]>;
 	/** Sticky once a concurrent book is adopted, including after retirement. */
@@ -596,7 +598,11 @@ export interface IChannelState {
 	 */
 	awaitingClosingSig?: boolean;
 
-	/** Channel announcement: SCID (set at 6 confirmations) */
+	/**
+	 * Channel announcement: SCID (set at 6 confirmations). This and the two
+	 * aliases are written only through Channel._setScid, which is what keeps
+	 * ChannelManager.getChannelsByScid current.
+	 */
 	shortChannelId: Buffer | null;
 	/** Channel announcement: funding confirmation block height */
 	fundingConfirmationHeight: number;

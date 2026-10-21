@@ -117,7 +117,7 @@ import {
 
 ### Prerequisites
 
-- Node.js 18+ with the `crypto` module
+- Node.js 22.23.4+, 24.22.1+ or 26.12.1+ with the `crypto` module
 - `bitcoinjs-lib` with `@bitcoinerlab/secp256k1`
 - `bech32` (BOLT 11 invoices), `better-sqlite3` (storage backend)
 

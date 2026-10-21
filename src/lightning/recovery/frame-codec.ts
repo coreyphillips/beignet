@@ -139,7 +139,7 @@ function decodeForwardingEvent(
 }
 
 interface IEncodedFrame {
-	version: 1 | 2;
+	version: RecoveryFrame['version'];
 	writerEpoch: string;
 	sequence: string;
 	previousFrameHash: string;
@@ -160,7 +160,7 @@ const DURABILITY_VALUES: readonly RecoveryDurability[] = [
 
 function encodeMutation(
 	mutation: RecoveryMutation,
-	version: 1 | 2 = 2
+	version: RecoveryFrame['version'] = 2
 ): IEncodedMutation {
 	switch (mutation.type) {
 		case 'ffor_voucher':
@@ -172,8 +172,11 @@ function encodeMutation(
 			return {
 				type: mutation.type,
 				channelId: mutation.channelId,
+				// Only the snapshots this commit writes: the snapshot frame and
+				// the deltas before this one carry the rest.
 				state: serializeChannelState(mutation.state, {
-					legacyHtlcHistory: version === 1
+					legacyHtlcHistory: version === 1,
+					htlcHistory: 'unsaved'
 				}),
 				peerPubkey: mutation.peerPubkey
 			};
@@ -403,7 +406,7 @@ function decodeOutboundMessage(
 
 function encodeSnapshot(
 	snapshot: RecoverySnapshot,
-	version: 1 | 2
+	version: RecoveryFrame['version']
 ): IEncodedSnapshot {
 	return {
 		// Pure passthrough, no default: a decoded pre-field frame must
@@ -577,16 +580,21 @@ export function encodedMutationBytes(mutation: RecoveryMutation): number {
 	return Buffer.byteLength(JSON.stringify(encodeMutation(mutation)), 'utf8');
 }
 
-/** Select the format for newly written frames. Historical frames retain theirs. */
-export function frameVersionForContent(frame: RecoveryFrame): 1 | 2 {
-	return frame.mutations.some(
-		(mutation) =>
-			mutation.type === 'channel_state' &&
-			usesCompactHtlcHistory(mutation.state)
-	) ||
-		frame.snapshot?.channels.some((channel) =>
-			usesCompactHtlcHistory(channel.state)
-		)
+/**
+ * Select the format for newly written frames. Historical frames retain theirs.
+ * A channel state in a version 3 frame carries only the HTLC snapshots its
+ * commit added. Releases before it replace the stored history with what a
+ * frame carries, so they must refuse the version rather than replay it.
+ */
+export function frameVersionForContent(
+	frame: RecoveryFrame
+): RecoveryFrame['version'] {
+	if (frame.mutations.some((mutation) => mutation.type === 'channel_state')) {
+		return 3;
+	}
+	return frame.snapshot?.channels.some((channel) =>
+		usesCompactHtlcHistory(channel.state)
+	)
 		? 2
 		: 1;
 }
@@ -628,7 +636,7 @@ export function encodeFrame(frame: RecoveryFrame): Buffer {
 /** Decode plaintext frame bytes. Throws on any malformed content. */
 export function decodeFrame(plaintext: Buffer): RecoveryFrame {
 	const encoded = JSON.parse(plaintext.toString('utf8')) as IEncodedFrame;
-	if (encoded.version !== 1 && encoded.version !== 2) {
+	if (encoded.version !== 1 && encoded.version !== 2 && encoded.version !== 3) {
 		throw new Error(`Unsupported recovery frame version: ${encoded.version}`);
 	}
 	if (

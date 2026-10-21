@@ -669,11 +669,44 @@ function wireErrorPayloadFor(channelId: Buffer, reason: string): Buffer | null {
 	});
 }
 
+/**
+ * A Map that counts its writes, so an index derived from it can tell it is
+ * stale without a hook at each of the manager's many write sites.
+ */
+class CountedMap<K, V> extends Map<K, V> {
+	writes = 0;
+
+	set(key: K, value: V): this {
+		this.writes++;
+		return super.set(key, value);
+	}
+
+	delete(key: K): boolean {
+		this.writes++;
+		return super.delete(key);
+	}
+
+	clear(): void {
+		this.writes++;
+		super.clear();
+	}
+}
+
 export class ChannelManager extends EventEmitter {
 	private config: IChannelManagerConfig;
-	private channels: Map<string, Channel> = new Map();
-	private tempChannels: Map<string, Channel> = new Map();
-	private channelPeers: Map<string, string> = new Map();
+	private channels: CountedMap<string, Channel> = new CountedMap();
+	private tempChannels: CountedMap<string, Channel> = new CountedMap();
+	private channelPeers: CountedMap<string, string> = new CountedMap();
+	/**
+	 * Every channel by each scid naming it, and the peers of every channel
+	 * with a channel id, for per-message gossip checks. Rebuilt on the first
+	 * read after the maps above or any channel's scids change.
+	 */
+	private ownChannelIndex: {
+		revision: number;
+		byScid: Map<string, Channel[]>;
+		peers: Set<string>;
+	} | null = null;
 	/** Synchronous funding promotions reserved across reentrant observers. */
 	private channelIdReservations: Map<string, Channel> = new Map();
 	/**
@@ -2869,6 +2902,60 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Channels whose real SCID or either side's alias equals `scid`, in
+	 * listChannels order. More than one when a peer-chosen alias collides
+	 * with another channel's SCID.
+	 */
+	getChannelsByScid(scid: Buffer): readonly Channel[] {
+		return this.getOwnChannelIndex().byScid.get(scid.toString('hex')) ?? [];
+	}
+
+	/**
+	 * Whether `pubkey` is the peer of a channel that has a channel id. Unlike
+	 * listChannelPeers, a peer with only a pending open does not count.
+	 */
+	hasChannelWithPeer(pubkey: string): boolean {
+		return this.getOwnChannelIndex().peers.has(pubkey);
+	}
+
+	private getOwnChannelIndex(): {
+		byScid: Map<string, Channel[]>;
+		peers: Set<string>;
+	} {
+		// Every counter only grows, so the sum changes whenever any of them does.
+		const revision =
+			this.channels.writes +
+			this.tempChannels.writes +
+			this.channelPeers.writes +
+			Channel.getScidRevision();
+		if (this.ownChannelIndex?.revision === revision)
+			return this.ownChannelIndex;
+		const byScid = new Map<string, Channel[]>();
+		const peers = new Set<string>();
+		for (const map of [this.channels, this.tempChannels]) {
+			for (const channel of map.values()) {
+				const state = channel.getFullState();
+				for (const scid of [
+					state.shortChannelId,
+					state.scidAlias,
+					state.remoteScidAlias
+				]) {
+					if (!scid) continue;
+					const key = scid.toString('hex');
+					const named = byScid.get(key);
+					if (!named) byScid.set(key, [channel]);
+					else if (named[named.length - 1] !== channel) named.push(channel);
+				}
+				const channelId = channel.getChannelId();
+				const peer = channelId && this.getPeerForChannel(channelId);
+				if (peer) peers.add(peer);
+			}
+		}
+		this.ownChannelIndex = { revision, byScid, peers };
+		return this.ownChannelIndex;
+	}
+
+	/**
 	 * Notify that a funding transaction has been confirmed.
 	 * `confirmedTxidHex` (display byte order) names WHICH candidate reached
 	 * depth when the watcher tracks several (post-signatures RBF); omitted
@@ -3528,8 +3615,13 @@ export class ChannelManager extends EventEmitter {
 	 */
 	restoreMonitor(channelId: string, monitor: ChainMonitor): void {
 		this.monitors.set(channelId, monitor);
+		// Before the harvest, so the only preimages dropped are ones the node
+		// read back from its own store, never one durable only in this monitor.
+		const trimmed =
+			typeof monitor.dropUnusedPreimages === 'function' &&
+			monitor.dropUnusedPreimages(this._knownPreimages) > 0;
 		this._harvestMonitorPreimages(monitor);
-		this._seedMonitorPreimages(channelId, monitor);
+		this._seedMonitorPreimages(channelId, monitor, trimmed);
 	}
 
 	/**
@@ -3560,10 +3652,11 @@ export class ChannelManager extends EventEmitter {
 	 * Get the chain monitor for a specific channel.
 	 */
 	/**
-	 * Record a learned payment preimage and deliver it to every chain monitor so
-	 * a received HTLC can be claimed on-chain after a force-close. Without this
-	 * wiring node-held preimages never reach the monitors (ChainMonitor.addPreimage
-	 * had no production caller), so an inbound HTLC that must be settled on-chain
+	 * Record a learned payment preimage and deliver it to the chain monitors
+	 * whose channel carries an HTLC of that hash, so a received HTLC can be
+	 * claimed on-chain after a force-close. Without this wiring node-held
+	 * preimages never reach the monitors (ChainMonitor.addPreimage had no
+	 * production caller), so an inbound HTLC that must be settled on-chain
 	 * — a hold-invoice, or a crash between learning the preimage and fulfilling —
 	 * would fall to the counterparty's timeout path: direct loss of the HTLC value.
 	 * Preimages are retained so monitors created later (on force-close) are seeded.
@@ -3571,6 +3664,14 @@ export class ChannelManager extends EventEmitter {
 	recordPreimage(paymentHash: Buffer, preimage: Buffer): void {
 		this._knownPreimages.set(paymentHash.toString('hex'), preimage);
 		for (const [channelIdHex, monitor] of this.monitors) {
+			// A monitor that does not want it stores and builds nothing, so it
+			// is not saved either. A stub that cannot answer is fed as before.
+			if (
+				typeof monitor.wantsPreimage === 'function' &&
+				!monitor.wantsPreimage(paymentHash)
+			) {
+				continue;
+			}
 			const actions = monitor.addPreimage(paymentHash, preimage);
 			// Request persistence of the preimage and any newly built sweep before
 			// exposing a broadcast side effect. This also covers an uneconomic claim
@@ -3584,16 +3685,19 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
-	 * Seed a freshly created/restored monitor with all known preimages.
+	 * Seed a freshly created/restored monitor with the known preimages it
+	 * wants (ChainMonitor.wantsPreimage).
 	 *
 	 * Skip redundant saves only for fully resolved monitors that already
-	 * hold every known preimage. Active monitors can build held claims
+	 * hold every preimage they want. Active monitors can build held claims
 	 * without returning an action, so they must still be saved. A monitor
 	 * that cannot report its preimages or resolution state is saved as before.
+	 * `changed` says the caller already changed the monitor, so it is saved.
 	 */
 	private _seedMonitorPreimages(
 		channelIdHex: string,
-		monitor: ChainMonitor
+		monitor: ChainMonitor,
+		changed = false
 	): void {
 		if (this._knownPreimages.size === 0) return;
 		const channelId = Buffer.from(channelIdHex, 'hex');
@@ -3606,7 +3710,7 @@ export class ChannelManager extends EventEmitter {
 				? monitor.getKnownPreimages()
 				: null;
 		let learned = false;
-		for (const [hashHex, preimage] of this._knownPreimages) {
+		for (const [hashHex, preimage] of this._preimagesWantedBy(monitor)) {
 			// Read before addPreimage, which writes the same map.
 			if (!held?.get(hashHex)?.equals(preimage)) learned = true;
 			const actions = monitor.addPreimage(
@@ -3615,7 +3719,9 @@ export class ChannelManager extends EventEmitter {
 			);
 			pendingActions.push(...actions);
 		}
-		if (fullyResolved && !learned && pendingActions.length === 0) return;
+		if (fullyResolved && !learned && !changed && pendingActions.length === 0) {
+			return;
+		}
 
 		// Request a save of every seeded preimage and built claim before routing.
 		this.emit('monitor:updated', channelIdHex, monitor);
@@ -3623,6 +3729,25 @@ export class ChannelManager extends EventEmitter {
 			this.processChainActions(channelId, pendingActions);
 			this.emit('monitor:updated', channelIdHex, monitor);
 		}
+	}
+
+	/**
+	 * The known preimages a monitor wants, looked up by its own payment hashes
+	 * rather than by offering it every preimage the node has learned. A
+	 * monitor that cannot list them is offered all of them, as before.
+	 */
+	private _preimagesWantedBy(
+		monitor: ChainMonitor
+	): Iterable<[string, Buffer]> {
+		if (typeof monitor.getWantedPaymentHashes !== 'function') {
+			return this._knownPreimages;
+		}
+		const wanted: [string, Buffer][] = [];
+		for (const hashHex of monitor.getWantedPaymentHashes()) {
+			const preimage = this._knownPreimages.get(hashHex);
+			if (preimage) wanted.push([hashHex, preimage]);
+		}
+		return wanted;
 	}
 
 	getMonitor(channelId: Buffer): ChainMonitor | undefined {
@@ -8907,6 +9032,10 @@ export class ChannelManager extends EventEmitter {
 		this.channelPeers.delete(idHex);
 		this.txSignaturesDropped.delete(idHex);
 		this.channelsAwaitingRestoreRepair.delete(idHex);
+		// A force close before the funding vanished leaves a monitor behind.
+		// The void retires the funding watch that fed it, and startup restores
+		// no monitor without its channel, so it goes with the channel.
+		this.monitors.delete(idHex);
 		return true;
 	}
 

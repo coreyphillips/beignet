@@ -32,7 +32,8 @@ import { usesCompactHtlcHistory } from '../storage/htlc-history';
 import {
 	CorruptRecoveryRowError,
 	IStorageBackend,
-	IStoredRecoveryFrame
+	IStoredRecoveryFrame,
+	IStoredRecoveryFrameHeader
 } from '../storage/types';
 import {
 	isStorageTransactionActive,
@@ -206,16 +207,54 @@ export function resolveWatermarkAnchor(
 	sequence: bigint
 ): Buffer | null {
 	if (sequence < 1n) return null;
-	const rows = storage.loadRecoveryFrames?.(Number(sequence) - 1) ?? [];
-	if (rows.length === 0) return null;
-	const first = rows[0];
-	const firstSequence = BigInt(first.sequence);
-	if (firstSequence === sequence) return first.frameHash;
-	if (firstSequence !== sequence + 1n) return null;
+	const receipted = storedFrameHeaderAt(storage, sequence);
+	if (receipted) return receipted.frameHash;
+	const successor = storedFrameHeaderAt(storage, sequence + 1n);
+	if (!successor) return null;
 	const base = storage.getRecoveryMeta?.(META_LAST_SNAPSHOT);
 	if (base == null || !/^[1-9]\d*$/.test(base)) return null;
-	if (BigInt(base) !== firstSequence) return null;
-	return first.previousFrameHash;
+	if (BigInt(base) !== sequence + 1n) return null;
+	return successor.previousFrameHash;
+}
+
+/** The stored frame at exactly `sequence`, or null. */
+function storedFrameAt(
+	storage: IStorageBackend,
+	sequence: bigint
+): IStoredRecoveryFrame | null {
+	if (storage.loadRecoveryFrame) {
+		return storage.loadRecoveryFrame(Number(sequence));
+	}
+	const [row] = storage.loadRecoveryFrames?.(Number(sequence) - 1) ?? [];
+	return row && BigInt(row.sequence) === sequence ? row : null;
+}
+
+/** The cleartext columns of the stored frame at exactly `sequence`, or null. */
+function storedFrameHeaderAt(
+	storage: IStorageBackend,
+	sequence: bigint
+): IStoredRecoveryFrameHeader | null {
+	if (storage.loadRecoveryFrameHeader) {
+		return storage.loadRecoveryFrameHeader(Number(sequence));
+	}
+	return storedFrameAt(storage, sequence);
+}
+
+/** Row count and sequence span of the frame store, null when empty. */
+function storedFrameSpan(storage: IStorageBackend): {
+	count: number;
+	minSequence: number;
+	maxSequence: number;
+} | null {
+	const stats = storage.recoveryFrameStats?.();
+	if (stats !== undefined) return stats;
+	const rows = storage.loadRecoveryFrames?.() ?? [];
+	if (rows.length === 0) return null;
+	return {
+		count: rows.length,
+		minSequence: rows[0].sequence,
+		maxSequence: rows[rows.length - 1].sequence
+	};
 }
 
 /**
@@ -773,18 +812,19 @@ export function chainLostBackfill(storage: IStorageBackend): string | null {
 export function storedTipSequence(storage: IStorageBackend): bigint | null {
 	const tip = storage.getRecoveryMeta?.(META_TIP_SEQUENCE);
 	const tipHash = storage.getRecoveryMeta?.(META_TIP_HASH);
-	const empty = (storage.loadRecoveryFrames?.(0) ?? []).length === 0;
+	const span = storedFrameSpan(storage);
 	if (tip == null || tipHash == null || !/^\d+$/.test(tip)) {
 		// A virgin database is the only honest reading of "no tip", so a frame
 		// underneath one means the bookkeeping does not describe the frames.
-		return empty ? 0n : null;
+		return span == null ? 0n : null;
 	}
 	const sequence = BigInt(tip);
-	if (sequence === 0n) return empty ? 0n : null;
-	// Only the tip row: sequence > tip-1 is exactly the newest frame.
-	const rows = storage.loadRecoveryFrames?.(Number(sequence) - 1) ?? [];
-	const row = rows[rows.length - 1];
-	if (!row || BigInt(row.sequence) !== sequence) return null;
+	if (sequence === 0n) return span == null ? 0n : null;
+	// The newest row must BE the tip: a row above it is as much a mismatch
+	// as a missing one.
+	if (span == null || BigInt(span.maxSequence) !== sequence) return null;
+	const row = storedFrameHeaderAt(storage, sequence);
+	if (!row) return null;
 	let recorded: Buffer;
 	try {
 		// Strict: bare Buffer.from would decode a valid prefix of a malformed
@@ -1404,7 +1444,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 					}
 				}
 			}
-			if (this.recoveryFrameCount() > 0) {
+			if (storedFrameSpan(this.storage) != null) {
 				throw new Error(
 					'recovery: frames exist without a recorded tip; refusing to write'
 				);
@@ -1438,7 +1478,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		// maximum and exact count prove the retained chain lost nothing (a
 		// deleted tail, a deleted PREFIX, or a deleted middle frame all
 		// fail here on the very next write instead of after a restart).
-		const stats = this.recoveryFrameSpan();
+		const stats = storedFrameSpan(this.storage);
 		const expectedMin = this.expectedRetainedMin;
 		if (
 			stats == null ||
@@ -1452,7 +1492,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 					`${sequence}; refusing to write`
 			);
 		}
-		const tipRow = this.loadFrameRow(sequence);
+		const tipRow = storedFrameAt(this.storage, sequence);
 		if (
 			tipRow == null ||
 			!tipRow.frameHash.equals(
@@ -1513,39 +1553,6 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			}
 		}
 		this.tipFloor = sequence;
-	}
-
-	/** One stored frame row by exact sequence, null when absent. */
-	private loadFrameRow(sequence: bigint): IStoredRecoveryFrame | null {
-		const rows = this.storage.loadRecoveryFrames!(Number(sequence) - 1);
-		if (rows.length === 0 || BigInt(rows[0].sequence) !== sequence) {
-			return null;
-		}
-		return rows[0];
-	}
-
-	/** Row count of the frame store (stats API when available). */
-	private recoveryFrameCount(): number {
-		const stats = this.storage.recoveryFrameStats?.();
-		if (stats !== undefined) return stats?.count ?? 0;
-		return this.storage.loadRecoveryFrames!().length;
-	}
-
-	/** Span statistics of the frame store, null when empty. */
-	private recoveryFrameSpan(): {
-		count: number;
-		minSequence: number;
-		maxSequence: number;
-	} | null {
-		const stats = this.storage.recoveryFrameStats?.();
-		if (stats !== undefined) return stats;
-		const rows = this.storage.loadRecoveryFrames!();
-		if (rows.length === 0) return null;
-		return {
-			count: rows.length,
-			minSequence: rows[0].sequence,
-			maxSequence: rows[rows.length - 1].sequence
-		};
 	}
 
 	/** Encode, hash, encrypt and store one frame; advance the tip. */

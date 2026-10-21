@@ -1123,12 +1123,12 @@ describe('Documentation Accuracy', () => {
 		expect(readme.toLowerCase()).to.include('interop');
 	});
 
-	it('README.md includes Node.js 18+ requirement', () => {
+	it('README.md states the patched Node.js releases it requires (issue #1773)', () => {
 		const readme = fs.readFileSync(
 			path.join(__dirname, '../../README.md'),
 			'utf-8'
 		);
-		expect(readme).to.include('Node.js 18+');
+		expect(readme).to.include('Node.js 22.23.4+, 24.22.1+ or 26.12.1+');
 	});
 
 	it('package.json files array includes docs/', () => {

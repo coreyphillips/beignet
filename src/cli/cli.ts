@@ -24,6 +24,7 @@ import {
 } from './config';
 import { AUTH_OFF_WARNING, startDaemon } from './daemon';
 import { daemonOptions } from './daemon-options';
+import { unpatchedNodeWarning } from '../utils/node-version';
 import { defaultDataDirForMnemonic } from './beignet-node';
 import { performDbRestore } from './restore';
 import { deriveBackupMacKey } from './backup-mac';
@@ -569,6 +570,12 @@ async function handleStart(): Promise<void> {
 			config.logLevel === 'warn';
 		if (!hasApiCredential(config) && !daemonWarns) {
 			process.stderr.write(`beignet: warning: ${AUTH_OFF_WARNING}\n`);
+		}
+		// The same goes for a Node.js release without the October 21, 2026
+		// security fixes (issue #1773).
+		const nodeWarning = unpatchedNodeWarning(process.versions.node);
+		if (nodeWarning && !daemonWarns) {
+			process.stderr.write(`beignet: warning: ${nodeWarning}\n`);
 		}
 
 		// A fault nothing caught (an unhandled rejection, an uncaught

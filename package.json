@@ -1,6 +1,6 @@
 {
   "name": "beignet",
-  "version": "0.30.2",
+  "version": "0.31.0",
   "description": "A self-custodial, JS Bitcoin wallet + Lightning Network management library.",
   "main": "dist/index.js",
   "bin": {
@@ -73,7 +73,7 @@
     }
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": "^22.23.4 || ^24.22.1 || >=26.12.1"
   },
   "files": [
     "dist/",
@@ -132,5 +132,8 @@
   },
   "optionalDependencies": {
     "@number0/iroh": "1.1.0"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.6.2": true
   }
 }

@@ -43,6 +43,7 @@ import {
 	decodeHtlcHistory,
 	usesCompactHtlcHistory
 } from './htlc-history';
+import { unsavedRevokedHtlcSnapshots } from '../channel/htlc-snapshots';
 
 // ─── Primitive helpers ───
 
@@ -189,6 +190,28 @@ export interface ISerializedHtlcSnapshot {
 		cltvExpiry: number;
 		direction: string;
 	}>;
+}
+
+export function serializeHtlcSnapshotEntries(
+	entries: IHtlcSnapshotEntry[]
+): ISerializedHtlcSnapshot['htlcs'] {
+	return entries.map((e) => ({
+		paymentHash: e.paymentHash.toString('hex'),
+		amountMsat: bigintToStr(e.amountMsat),
+		cltvExpiry: e.cltvExpiry,
+		direction: e.direction
+	}));
+}
+
+export function deserializeHtlcSnapshotEntries(
+	htlcs: ISerializedHtlcSnapshot['htlcs']
+): IHtlcSnapshotEntry[] {
+	return htlcs.map((e) => ({
+		paymentHash: Buffer.from(e.paymentHash, 'hex'),
+		amountMsat: strToBigint(e.amountMsat),
+		cltvExpiry: e.cltvExpiry,
+		direction: e.direction as HtlcDirection
+	}));
 }
 
 export function serializeHtlcEntry(
@@ -884,31 +907,37 @@ export function deserializeV2InFlight(s: ISerializedV2InFlight): IV2InFlight {
 
 export function serializeChannelState(
 	s: IChannelState,
-	options: { legacyHtlcHistory?: boolean } = {}
+	options: {
+		legacyHtlcHistory?: boolean;
+		/**
+		 * Which revoked-commitment snapshots to write. Storage keeps them in
+		 * a table of their own, so its channel row takes none and a journal
+		 * delta only those not saved yet; a reader applies whatever it finds
+		 * as additions to that table.
+		 */
+		htlcHistory?: 'all' | 'unsaved' | 'none';
+	} = {}
 ): ISerializedChannelState {
 	const htlcs: ISerializedHtlcEntry[] = [];
 	for (const [key, entry] of s.htlcs) {
 		htlcs.push(serializeHtlcEntry(key, entry));
 	}
 
+	const history =
+		options.htlcHistory === 'none'
+			? undefined
+			: options.htlcHistory === 'unsaved'
+			? unsavedRevokedHtlcSnapshots(s)
+			: s.revokedHtlcSnapshots;
 	let revokedHtlcSnapshots: ISerializedHtlcSnapshot[] | undefined;
 	const compactHistory =
 		!options.legacyHtlcHistory && usesCompactHtlcHistory(s);
-	if (
-		!compactHistory &&
-		s.revokedHtlcSnapshots &&
-		s.revokedHtlcSnapshots.size > 0
-	) {
+	if (!compactHistory && history && history.size > 0) {
 		revokedHtlcSnapshots = [];
-		for (const [commitmentNumber, entries] of s.revokedHtlcSnapshots) {
+		for (const [commitmentNumber, entries] of history) {
 			revokedHtlcSnapshots.push({
 				commitmentNumber,
-				htlcs: entries.map((e) => ({
-					paymentHash: e.paymentHash.toString('hex'),
-					amountMsat: bigintToStr(e.amountMsat),
-					cltvExpiry: e.cltvExpiry,
-					direction: e.direction
-				}))
+				htlcs: serializeHtlcSnapshotEntries(entries)
 			});
 		}
 	}
@@ -968,7 +997,7 @@ export function serializeChannelState(
 			: undefined,
 		revokedHtlcSnapshots,
 		...(compactHistory
-			? { compactHtlcHistory: encodeHtlcHistory(s.revokedHtlcSnapshots) }
+			? { compactHtlcHistory: encodeHtlcHistory(history) }
 			: {}),
 		watchtowerRemoteCommitmentTxs: s.watchtowerRemoteCommitmentTxs?.size
 			? [...s.watchtowerRemoteCommitmentTxs].flatMap(([point, txs]) =>
@@ -1540,12 +1569,7 @@ export function deserializeChannelState(
 		for (const snap of s.revokedHtlcSnapshots) {
 			revokedHtlcSnapshots.set(
 				snap.commitmentNumber,
-				snap.htlcs.map((e) => ({
-					paymentHash: Buffer.from(e.paymentHash, 'hex'),
-					amountMsat: strToBigint(e.amountMsat),
-					cltvExpiry: e.cltvExpiry,
-					direction: e.direction as HtlcDirection
-				}))
+				deserializeHtlcSnapshotEntries(snap.htlcs)
 			);
 		}
 	}

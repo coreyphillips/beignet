@@ -7,7 +7,7 @@ Two layers, one mnemonic:
 - **On-chain wallet:** HD keys, address generation, UTXO tracking, transaction building, PSBT/hardware signing, multisig, watch-only, Electrum connectivity.
 - **Lightning:** channel lifecycle, onion-routed payments, BOLT 11 invoices, BOLT 12 offers, gossip and pathfinding, anchors, splicing, taproot channels, watchtower client. Interop-tested against LND, Core Lightning and Eclair on regtest.
 
-Requires **Node.js 18+**. MIT licensed.
+Requires **Node.js 22.23.4+, 24.22.1+ or 26.12.1+**. Earlier releases on those lines, and all of Node.js 18 and 20, lack the October 21, 2026 Node.js security fixes; the daemon warns at startup when it runs on one. MIT licensed.
 
 **Jump to:** [Install](#install) · [Examples](#try-the-examples) · [On-chain wallet](#on-chain-wallet) · [Lightning](#lightning) · [Daemon & CLI](#http-daemon--cli) · [Protocol layer](#protocol-layer-advanced) · [Tests](#tests) · [Status & limitations](#status--limitations)
 
@@ -162,7 +162,7 @@ const res = await Wallet.create({
 ```
 
 - **Failover:** with multiple servers the wallet rotates through them in order on connect/reconnect failure, then through hardcoded fallback peers for the network, with a per-server cooldown so dead servers are not hammered. Inspect `wallet.electrum.currentServer` and `wallet.electrum.rotationCount`.
-- **Certificate verification:** by default a TLS Electrum connection is encrypted but the server certificate is not checked, because the client library dials with `rejectUnauthorized: false`. An on-path attacker can therefore stand in for the server. On Node, pass `tls: withTlsVerification(tls)` to accept only certificates that chain to a trusted CA and match the host, and add `{ fingerprints: ['AB:CD:…'] }` to also accept self-signed servers by SHA-256 fingerprint (`openssl x509 -noout -fingerprint -sha256`). The CLI/daemon and React Native do not verify yet.
+- **Certificate verification:** by default a TLS Electrum connection is encrypted but the server certificate is not checked, because the client library dials with `rejectUnauthorized: false`. An on-path attacker can therefore stand in for the server. On Node, pass `tls: withTlsVerification(tls)` to accept only certificates that chain to a trusted CA and match the host, and add `{ fingerprints: ['AB:CD:…'] }` to also accept self-signed servers by SHA-256 fingerprint (`openssl x509 -noout -fingerprint -sha256`). A caller that resolves the host itself and dials the address passes `{ servernames: { [address]: hostName } }` so the check still uses the name. The client library keeps one connection per network for the whole process, shared by every wallet on that network, so wallets in one process should all pass the same `tls`. The daemon verifies when `BEIGNET_ELECTRUM_TLS_VERIFY=true` (see `src/cli/README.md`); it is off by default. React Native does not verify yet.
 - **Fee source:** `'electrum'` queries only the connected server via `blockchain.estimatefee`, so fee lookups never leak to mempool.space/blocktank over clearnet. `'auto'` prefers Electrum and falls back to HTTP. All remote rates are clamped to 5000 sat/vB.
 - **Networks:** mainnet, testnet, regtest and signet work end to end (wallet, Electrum, CLI/daemon `--network signet`, Lightning chain hash and `tbs` invoice prefix). Signet shares testnet address formats and coin type 1.
 - **BIP21:** `encodeBip21({ address, amountSats?, label?, message? })` builds a `bitcoin:` URI.
@@ -676,9 +676,8 @@ LightningNode              High-level API (EventEmitter)
 
 ## Tests
 
-Use **Node.js 20 (20.19+)** for development and `npm ci` to install the locked tools.
-The linter and test runner have newer Node requirements than the library API.
-CI uses Node.js 20.
+Use **Node.js 24 (24.22.1+)** for development and `npm ci` to install the locked tools.
+CI uses Node.js 24.22.1.
 
 The lint configuration keeps the established CommonJS imports, enum aliases,
 unused catch bindings, `any` warnings and Chai assertion style. Rules removed

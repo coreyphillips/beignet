@@ -32,7 +32,23 @@ export interface IStorageBackend {
 	close(): void;
 
 	// ─── Channels ───
+	/**
+	 * Persist a channel. Its revokedHtlcSnapshots are ADDED to the ones already
+	 * stored for the channel rather than replacing them: a journal delta
+	 * carries only the snapshots its commit wrote, and the penalty path needs
+	 * every one the channel ever signed. Loading returns the full set.
+	 */
 	saveChannel(id: string, state: IChannelState, peerPubkey: string): void;
+	/**
+	 * The object saveChannel and the channel loaders record saved HTLC
+	 * snapshots against (htlc-snapshots.ts). A caller that records them
+	 * itself, as RecoveryManager does, has to use the same one, or each of
+	 * its saves looks like a first save into another store and rewrites the
+	 * whole history. That happens when the caller holds a wrapper whose
+	 * methods run on the backend underneath. Without this method the
+	 * backend is its own identity.
+	 */
+	revokedHtlcSnapshotStore?(): object;
 	loadChannel(id: string): { state: IChannelState; peerPubkey: string } | null;
 	loadAllChannels(): Array<{
 		channelId: string;
@@ -220,6 +236,8 @@ export interface IStorageBackend {
 
 	// ─── Transaction wrapper ───
 	transaction<T>(fn: () => T): T;
+	/** True while any transaction is open on this backend, however opened. */
+	inTransaction?(): boolean;
 
 	// ─── WAL Checkpoint (optional) ───
 	/** Checkpoint the WAL file, flushing pending writes to the main database. */
@@ -371,6 +389,14 @@ export interface IStorageBackend {
 	saveRecoveryFrame?(frame: IStoredRecoveryFrame): void;
 	/** Load frames in sequence order, optionally after a given sequence. */
 	loadRecoveryFrames?(afterSequence?: number): IStoredRecoveryFrame[];
+	/** Load the one frame stored at exactly this sequence, or null. */
+	loadRecoveryFrame?(sequence: number): IStoredRecoveryFrame | null;
+	/**
+	 * The cleartext columns of the frame at exactly this sequence, without
+	 * reading its ciphertext, or null. Lets a per-write check that only
+	 * compares hashes skip copying a frame that can be a full channel state.
+	 */
+	loadRecoveryFrameHeader?(sequence: number): IStoredRecoveryFrameHeader | null;
 	/**
 	 * Compaction: drop every frame with sequence below the given one. Part of
 	 * the journalSupported contract, not a nice-to-have: verification requires
@@ -496,6 +522,12 @@ export interface IStoredRecoveryFrame {
 	ciphertext: Buffer;
 	createdAt: number;
 }
+
+/** A stored frame's cleartext columns, as loadRecoveryFrameHeader returns. */
+export type IStoredRecoveryFrameHeader = Pick<
+	IStoredRecoveryFrame,
+	'sequence' | 'writerEpoch' | 'frameHash' | 'previousFrameHash'
+>;
 
 export interface IRecoveryOutboxMessage {
 	/** Peer node id, hex. */

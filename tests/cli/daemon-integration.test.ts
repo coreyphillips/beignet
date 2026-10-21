@@ -199,7 +199,12 @@ describe('HTTP Route Fixes', () => {
 		});
 		const addr = server.address() as { port: number };
 		try {
-			const resp = await httpGet(addr.port, '/channel?channelId=aabbccdd');
+			// Well formed, so NOT_FOUND shows the id was read from the query: a
+			// missing or malformed one is INVALID_PARAMS (#1605).
+			const resp = await httpGet(
+				addr.port,
+				`/channel?channelId=${'aabbccdd'.repeat(8)}`
+			);
 			expect(resp.body.ok).to.be.false;
 			expect((resp.body.error as { code: string }).code).to.equal('NOT_FOUND');
 		} finally {

@@ -17023,18 +17023,6 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
-	/** Pubkeys of every peer we currently have a channel with. */
-	private channelPeerPubkeys(): Set<string> {
-		const peers = new Set<string>();
-		for (const channel of this.channelManager.listChannels()) {
-			const channelId = channel.getChannelId();
-			if (!channelId) continue;
-			const peer = this.channelManager.getPeerForChannel(channelId);
-			if (peer) peers.add(peer);
-		}
-		return peers;
-	}
-
 	/**
 	 * Keep a channel peer's announced addresses as reconnect fallbacks and
 	 * persist them (with the announcement timestamp) so the peer stays
@@ -17055,7 +17043,7 @@ export class LightningNode extends EventEmitter {
 	): boolean {
 		if (!this.peerManager) return false;
 		const pubkey = msg.nodeId.toString('hex');
-		if (!this.channelPeerPubkeys().has(pubkey)) return false;
+		if (!this.channelManager.hasChannelWithPeer(pubkey)) return false;
 		const previous = this.announcedPeerAddresses.get(pubkey);
 		return !previous || msg.timestamp > previous.timestamp;
 	}
@@ -17063,7 +17051,7 @@ export class LightningNode extends EventEmitter {
 	private captureChannelPeerAddresses(msg: INodeAnnouncementMessage): void {
 		if (!this.peerManager) return;
 		const pubkey = msg.nodeId.toString('hex');
-		if (!this.channelPeerPubkeys().has(pubkey)) return;
+		if (!this.channelManager.hasChannelWithPeer(pubkey)) return;
 		// A valid signature does not make an old announcement current: reject
 		// anything not strictly newer than what we already hold (mirrors the
 		// graph's freshness rule, which cannot cover private-only peers).
@@ -17207,20 +17195,11 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Whether a channel_update's SCID (real or either side's alias) names one
 	 * of our own channels: the intake fork between the synchronous own-channel
-	 * path and the queued crowd-gossip path. Mirrors the candidate matching in
-	 * maybeAdoptPeerChannelPolicy below; they must not drift.
+	 * path and the queued crowd-gossip path. Uses the same candidates as
+	 * maybeAdoptPeerChannelPolicy below.
 	 */
 	private channelUpdateTargetsOurChannel(msg: IChannelUpdateMessage): boolean {
-		for (const channel of this.channelManager.listChannels()) {
-			const state = channel.getFullState();
-			const scids = [
-				state.shortChannelId,
-				state.scidAlias,
-				state.remoteScidAlias
-			].filter((s): s is Buffer => s !== null);
-			if (scids.some((s) => s.equals(msg.shortChannelId))) return true;
-		}
-		return false;
+		return this.channelManager.getChannelsByScid(msg.shortChannelId).length > 0;
 	}
 
 	private maybeAdoptPeerChannelPolicy(
@@ -17236,15 +17215,9 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 		const ourNodeId = this.ownNodeId();
-		for (const channel of this.channelManager.listChannels()) {
-			const state = channel.getFullState();
-			const scids = [
-				state.shortChannelId,
-				state.scidAlias,
-				state.remoteScidAlias
-			].filter((s): s is Buffer => s !== null);
-			if (!scids.some((s) => s.equals(msg.shortChannelId))) continue;
-
+		for (const channel of this.channelManager.getChannelsByScid(
+			msg.shortChannelId
+		)) {
 			// A non-matching candidate must NOT end the scan: remoteScidAlias is a
 			// peer-chosen value, so a malicious peer could otherwise alias-collide
 			// with the real SCID of an honest peer's channel and (by sorting
@@ -20789,8 +20762,10 @@ export class LightningNode extends EventEmitter {
 				};
 				mutations.push(mutation);
 			}
+			// The copy carries only the HTLC snapshots storage lacks, which is
+			// all a save of it writes.
 			mutation.state = deserializeChannelState(
-				serializeChannelState(mutation.state)
+				serializeChannelState(mutation.state, { htlcHistory: 'unsaved' })
 			);
 			const durable = mutation.state.ffor;
 			if (
