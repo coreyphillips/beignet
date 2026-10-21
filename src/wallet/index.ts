@@ -200,6 +200,8 @@ export class Wallet {
 	// moment answers from a server that has not seen the spend yet and would
 	// put the coin back; the marks are what tell the two apart. Memory only:
 	// a wallet that restarts scans against a server that knows the spend.
+	// Both survive switchNetwork as a pair: a mark only means something
+	// against the count it was taken from.
 	private readonly _spentOutpoints: Map<string, number> = new Map();
 	private _spendSeq = 0;
 	// The mark every getUtxos query still in flight was issued at. A record can
@@ -947,6 +949,20 @@ export class Wallet {
 		this.coinSelectPreference = coinSelectPreference;
 	}
 
+	/**
+	 * Switches the wallet to another network, replacing its data, Transaction
+	 * and Electrum with that network's.
+	 *
+	 * Runs under the send lock. A send, boost, sweep or PSBT build in flight
+	 * stages on the Transaction and broadcasts on the Electrum this replaces,
+	 * so it finishes on the network it started on first, and one that arrives
+	 * meanwhile runs on the new network once the switch is done (#1636). Like
+	 * the wallet's own send methods, a switch called from inside a withSendLock
+	 * session waits on the lock that session holds and never settles.
+	 * @param {EAvailableNetworks} network
+	 * @param {TServer | TServer[]} [servers]
+	 * @returns {Promise<Result<Wallet>>}
+	 */
 	public async switchNetwork(
 		network: EAvailableNetworks,
 		servers?: TServer | TServer[]
@@ -965,6 +981,13 @@ export class Wallet {
 				'Watch-only wallets cannot switch networks. Create a new watch-only wallet with an xpub for the target network.'
 			);
 		}
+		return this.runSend(() => this.switchNetworkLocked(network, servers));
+	}
+
+	private async switchNetworkLocked(
+		network: EAvailableNetworks,
+		servers?: TServer | TServer[]
+	): Promise<Result<Wallet>> {
 		this.isSwitchingNetworks = true;
 		const params: IWallet = {
 			...this,
@@ -1011,7 +1034,14 @@ export class Wallet {
 			// ones made after switching back to its network. So does the receive
 			// index move count: an issuance still out settles against it, and
 			// against a fresh one it would mark later unsaved moves as saved. So
-			// do the landed index writes, for the adoption below.
+			// do the landed index writes, for the adoption below. So does the
+			// send lock: this switch holds it, and the sends queued behind it are
+			// chained on it, so a fresh one would let a send that arrives later
+			// run alongside them. So does what this session remembers across
+			// sends and refreshes: the PSBTs it built, each transaction's
+			// clearing count, which must never repeat, the txindex misses it is
+			// counting, and the outpoints its broadcasts spent, together with the
+			// count their marks are measured against (#1636).
 			const kept = new Set([
 				'isSwitchingNetworks',
 				'isRefreshing',
@@ -1022,7 +1052,13 @@ export class Wallet {
 				'savingOperations',
 				'waitingWrites',
 				'receiveIndexMoves',
-				'landedReceiveIndex'
+				'landedReceiveIndex',
+				'sendLock',
+				'_builtPsbts',
+				'_ghostClearings',
+				'_noTxindexMisses',
+				'_spentOutpoints',
+				'_spendSeq'
 			]);
 			Object.assign(
 				this,
@@ -1038,7 +1074,9 @@ export class Wallet {
 			// read was out is already in storage, and only needs adopting here.
 			this.receiveIndexMovesSaved = this.receiveIndexMoves;
 			this.adoptLandedReceiveIndex();
-			// Both point back at the wallet that constructed them.
+			// Both point back at the wallet that constructed them. Nothing is
+			// staged on the Transaction replaced here: the send lock this switch
+			// holds is what every staging call runs under.
 			this.transaction = new Transaction({ wallet: this });
 			this.electrum = new Electrum({
 				wallet: this,
@@ -2502,6 +2540,13 @@ export class Wallet {
 		const checkRes = await this.checkElectrumConnection();
 		if (checkRes.isErr()) return err(checkRes.error.message);
 		const currentWallet = this.data;
+		// switchNetwork replaces the Electrum instance along with the data, so
+		// a scan answered after it has looked up the network the wallet left,
+		// and what it found would be written as this network's indexes (#1636).
+		const electrum = this.electrum;
+		const switched = new Error(
+			'The wallet switched networks while the address indexes were scanned.'
+		);
 
 		let updated = false;
 
@@ -2591,6 +2636,7 @@ export class Wallet {
 					)[0];
 				}
 
+				if (this.electrum !== electrum) throw switched;
 				this.moveReceiveIndex(addressTypeKey, addressIndex);
 				this._data.changeAddressIndex[addressTypeKey] = changeAddressIndex;
 				this._data.lastUsedAddressIndex[addressTypeKey] = lastUsedAddressIndex;
@@ -2602,6 +2648,7 @@ export class Wallet {
 		});
 		try {
 			await Promise.all(promises);
+			if (this.electrum !== electrum) throw switched;
 			if (updated) {
 				await Promise.all([
 					this.saveReceiveIndex(),
@@ -2952,9 +2999,9 @@ export class Wallet {
 		// known to be newer than the answer it returns.
 		const spendMark = this._spendSeq;
 		// The mark comes out of the array it went into. switchNetwork replaces
-		// the array and restarts the spend count, so a scan from before the
-		// switch would otherwise find a later scan's equal mark in the new array
-		// and take that one out (#1635).
+		// the array, so a scan from before the switch would otherwise find a
+		// later scan's equal mark in the new array and take that one out
+		// (#1635).
 		const scanMarks = this._scanMarks;
 		scanMarks.push(spendMark);
 		const scanSeq = ++this._scanSeq;
@@ -3797,9 +3844,17 @@ export class Wallet {
 		scanAllAddresses?: boolean;
 		replaceStoredTransactions?: boolean;
 	}): Promise<Result<string | undefined>> {
+		// The whole lookup goes to one Electrum instance. switchNetwork replaces
+		// it along with the data, so a history answered after it is the network
+		// the wallet left, and merging it would file that network's transactions
+		// under this one (#1636).
+		const electrum = this.electrum;
+		const switched =
+			'The wallet switched networks while the transactions were read.';
 		//Check existing unconfirmed transactions and remove any that are confirmed.
 		//If the tx is reorg'd or bumped from the mempool and no longer exists, the transaction will be removed from the store and updated in the activity list.
 		await this.checkUnconfirmedTransactions();
+		if (this.electrum !== electrum) return err(switched);
 
 		// Every transaction's clearing count as this refresh's lookup goes out.
 		// A record's height and address come from its address history entry, so
@@ -3812,7 +3867,7 @@ export class Wallet {
 		// are done by now, so neither counts as newer (issues #945 and #964).
 		const clearingsAtLookup = new Map(this._ghostClearings);
 
-		const history = await this.electrum.getAddressHistory({
+		const history = await electrum.getAddressHistory({
 			scanAllAddresses: scanAllAddresses || replaceStoredTransactions
 		});
 		if (history.isErr()) {
@@ -3835,7 +3890,7 @@ export class Wallet {
 				return !((this.data.transactions[tx.tx_hash]?.height ?? 0) >= 6);
 			});
 		}
-		const getTransactionsResponse = await this.electrum.getTransactions({
+		const getTransactionsResponse = await electrum.getTransactions({
 			txHashes: filteredTxHashes
 		});
 		if (getTransactionsResponse.isErr()) {
@@ -3848,6 +3903,9 @@ export class Wallet {
 		if (formatTransactionsResponse.isErr()) {
 			return err(formatTransactionsResponse.error.message);
 		}
+		// Nothing below awaits before the records are merged, so this is the
+		// last point a switch can have landed before the write.
+		if (this.electrum !== electrum) return err(switched);
 		// The answers this refresh may still act on: every transaction no
 		// clearing has landed on since its lookup went out. Both the watch
 		// below and the record writes are taken from this one map, since
@@ -4033,9 +4091,18 @@ export class Wallet {
 			// What the check below looks up. An entry a refresh adds while it
 			// waits is in none of its results, and both branches below keep it.
 			const observed = new Set(Object.keys(this.getUnconfirmedTransactions()));
+			// switchNetwork replaces the Electrum instance along with the data. A
+			// check answered after it judged the network the wallet left, and
+			// every repair below would write that verdict into this one (#1636).
+			const electrum = this.electrum;
 			const processRes = await this.processUnconfirmedTransactions();
 			if (processRes.isErr()) {
 				return err(processRes.error.message);
+			}
+			if (this.electrum !== electrum) {
+				return err(
+					'The wallet switched networks while the unconfirmed transactions were checked.'
+				);
 			}
 
 			const { unconfirmedTxs, outdatedTxs, ghostTxs } = processRes.value;
@@ -5357,8 +5424,9 @@ export class Wallet {
 	 * transaction. fn gets send, sendMax and buildPsbt without the queue, since
 	 * fn already holds the lock. Once fn settles the lock is gone, so each of
 	 * them returns an Err from then on instead of staging on the shared
-	 * transaction unlocked (#1638). The wallet's own send methods, called from
-	 * fn, wait on the lock fn holds and never settle.
+	 * transaction unlocked (#1638). The wallet's own send methods, and
+	 * switchNetwork, called from fn, wait on the lock fn holds and never
+	 * settle.
 	 */
 	public withSendLock<T>(
 		fn: (locked: Pick<Wallet, 'send' | 'sendMax' | 'buildPsbt'>) => Promise<T>
