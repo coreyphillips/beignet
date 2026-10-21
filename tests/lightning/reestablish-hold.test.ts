@@ -28,6 +28,7 @@ import {
 import {
 	IWorld,
 	LSP_SEED,
+	asyncInvoice,
 	createNode,
 	destroyAll,
 	disconnect,
@@ -623,6 +624,44 @@ describe('Reestablish hold (issue #1726)', () => {
 			destroyAll(alice, restored, carol);
 		});
 
+		it('never places a restored hold past its cutoff when the part also carries hold_htlc', async () => {
+			const dbPath = tempDb('reestablish-hold-marker-restart');
+			const disk = new SqliteStorage(dbPath);
+			disk.open();
+			// Carol registered while the LSP ran the async service; it has
+			// since been turned off, so her path's marker is ignored.
+			const w = await setupWorld({ lspStorage: disk, lspExtra: lspExtra() });
+			makeUnannounced(w);
+			const { alice, lsp, carol } = w;
+			/* eslint-disable @typescript-eslint/no-explicit-any */
+			(lsp as any).asyncReceiveService.isEnabled = (): boolean => false;
+			const invoice = asyncInvoice(carol, 5_000_000n);
+			await disconnect(lsp, carol, w.cutBC);
+			awayFor(w, DEFAULT_REESTABLISH_HOLD_MS - 3_000);
+			alice.sendPayment(invoice.bolt11);
+			await settle();
+			const [held] = holds(lsp);
+			expect(held?.state).to.equal('RELEASING');
+			(lsp as any).asyncPaymentManager.scan = (): void => undefined;
+			/* eslint-enable @typescript-eslint/no-explicit-any */
+			lsp.handleNewBlock(held.cutoffHeight + 1);
+
+			const restored = restartLsp(w, dbPath);
+			let forwards = 0;
+			restored.on('htlc:forward', () => forwards++);
+			await reconnectRestarted(restored, carol);
+			await reconnectRestarted(restored, alice);
+			await waitFor(
+				() =>
+					paymentStatus(alice, invoice.paymentHash) === PaymentStatus.FAILED,
+				'the payer to be refunded',
+				5_000
+			);
+			expect(forwards, 'nothing placed past the cutoff').to.equal(0);
+			expect(holds(restored)[0].state).to.equal('FAILED');
+			destroyAll(alice, restored, carol);
+		});
+
 		it('re-arms a held JIT part paid to its intercept SCID across a restart', async () => {
 			const dbPath = tempDb('reestablish-hold-intercept-restart');
 			const disk = new SqliteStorage(dbPath);
@@ -761,6 +800,47 @@ describe('Reestablish hold (issue #1726)', () => {
 			);
 			expect(spliceSawState).to.deep.equal([ChannelState.NORMAL]);
 			expect(failures).to.deep.equal([]);
+			destroyAll(alice, lsp, carol);
+		});
+
+		it('JIT, channel too small with the hold on: the part goes to the splice, not the hold', async () => {
+			const w = await setupWorld({
+				carolRegisters: false,
+				lspService: { enabled: false },
+				lspExtra: {
+					jitReceive: { enabled: true, fundingRetryDelayMs: 1 },
+					reestablishHold: { enabled: true }
+				}
+			});
+			makeUnannounced(w);
+			const { alice, lsp, carol } = w;
+			registerIntent(w);
+			const restoreCapacity = shrinkChannel(w);
+			// Below the part, so the hold's value cap refuses it.
+			const channel = lsp.getChannelManager().getChannel(w.bcChannelId)!;
+			channel.getSpendableOutboundMsat = (): bigint => 1_000_000n;
+			let splices = 0;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(lsp as any).spliceInAndWait = async (): Promise<void> => {
+				splices++;
+				restoreCapacity();
+				delete (channel as Partial<typeof channel>).getSpendableOutboundMsat;
+			};
+			const fails = failsToPayer(w);
+			const invoice = invoiceFor(w);
+			await disconnect(lsp, carol, w.cutBC);
+			alice.sendPayment(invoice.bolt11);
+			await new Promise((r) => setTimeout(r, 100));
+			expect(holds(lsp), 'not held for reestablish').to.have.length(0);
+			expect(fails(), 'nothing failed back').to.equal(0);
+
+			await reconnect(lsp, carol, w.cutBC, w.gateBC);
+			await waitFor(
+				() =>
+					paymentStatus(alice, invoice.paymentHash) === PaymentStatus.COMPLETED,
+				'the payment to complete over the spliced channel'
+			);
+			expect(splices).to.equal(1);
 			destroyAll(alice, lsp, carol);
 		});
 

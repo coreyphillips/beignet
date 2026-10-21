@@ -24953,6 +24953,13 @@ export class LightningNode extends EventEmitter {
 				refundOwner
 			);
 
+		// Reestablish hold (issue #1726): a restart's redispatch of a part the
+		// hold already owns is driven from its row, never forwarded around it.
+		// Ahead of the async hold: a part that also carries hold_htlc would
+		// otherwise be re-parked under a driver that knows neither the window
+		// nor the timer.
+		if (this.rearmReestablishHold(outChannelId, part)) return;
+
 		// Async payments (LSP role, issue #708): the recipient's blinded path
 		// marked this hop hold_htlc, so park the forward in the durable
 		// held-forward ledger and wait for a receiver-signed release
@@ -25001,12 +25008,9 @@ export class LightningNode extends EventEmitter {
 			});
 		}
 
-		// Reestablish hold (issue #1726): a restart's redispatch of a part the
-		// hold already owns is driven from its row, never forwarded around it,
-		// and a wallet whose channel is awaiting reestablish gets the part held
+		// A wallet whose channel is awaiting reestablish gets the part held
 		// rather than refused. Judged here so a hold never shows as a refused
 		// add; the add path judges only what reaches it some other way.
-		if (this.rearmReestablishHold(outChannelId, part)) return;
 		const reestablishHold = this.holdForReestablish(outChannelId, part);
 		if (reestablishHold === 'held') return;
 		this.forwardHtlcOnto(outChannelId, part, 'engine', reestablishHold);
@@ -25217,9 +25221,9 @@ export class LightningNode extends EventEmitter {
 	 * Reestablish hold (issue #1726): park a forward to a liquidity client
 	 * whose channel is awaiting reestablish instead of failing it. 'held'
 	 * when the part is now the hold's and the caller must leave it alone;
-	 * 'refused' when the window or a cap turned it down, so nothing else may
-	 * hold it for the absent wallet either; 'ineligible' leaves the caller to
-	 * forward (or fail) it as before.
+	 * 'refused' when the window or a count cap turned it down, so nothing else
+	 * may hold it for the absent wallet either; 'ineligible' leaves the caller
+	 * to forward (or fail) it as before, and so does the value cap.
 	 *
 	 * A liquidity client is the peer on an unannounced channel that this node
 	 * opened or whose peer holds a JIT intent, and only while this node runs
@@ -25307,7 +25311,10 @@ export class LightningNode extends EventEmitter {
 				outChannelId: outChannelIdHex,
 				reason: 'refused' in outcome ? outcome.refused : 'storage_failed'
 			});
-			return 'refused';
+			// A channel too small for the part is what a JIT splice is for.
+			return 'refused' in outcome && outcome.refused === 'channel_value'
+				? 'ineligible'
+				: 'refused';
 		}
 		this.armReestablishHoldTimer(outcome.record);
 		return 'held';
