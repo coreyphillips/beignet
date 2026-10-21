@@ -31,6 +31,7 @@ import {
 	IRecoveryOutboxMessage,
 	IRecoveryOutboxStoredMessage,
 	IStoredRecoveryFrame,
+	IStoredRecoveryFrameHeader,
 	CorruptRecoveryRowError,
 	RecoveryOutboxDisposition
 } from './types';
@@ -116,6 +117,80 @@ function restrictFileMode(filePath: string): void {
 	} catch {
 		// Missing sidecar, or a filesystem without permission bits.
 	}
+}
+
+/** A recovery_frames row as read; a header query leaves out the last two. */
+interface IRecoveryFrameRow {
+	sequence: unknown;
+	writer_epoch: unknown;
+	frame_hash: unknown;
+	previous_hash: unknown;
+	ciphertext?: unknown;
+	created_at?: unknown;
+}
+
+// Decode EXACTLY or throw: SQLite column affinity does not enforce types, so
+// a physically corrupt row (TEXT in a BLOB column, a float or string
+// sequence) would otherwise be coerced into plausible bytes that chain
+// verification then runs over (issue #317). Frame corruption always
+// propagates; it is never routed through reportCorruptRow's skip path.
+function frameRowLabel(row: IRecoveryFrameRow): string {
+	return `recovery frame row ${String(row.sequence)}`;
+}
+
+function frameRowInt(
+	row: IRecoveryFrameRow,
+	value: unknown,
+	field: string,
+	min: number
+): number {
+	if (
+		typeof value !== 'number' ||
+		!Number.isSafeInteger(value) ||
+		value < min
+	) {
+		throw new CorruptRecoveryRowError(
+			`${frameRowLabel(row)}: ${field} is not an integer >= ${min}`
+		);
+	}
+	return value;
+}
+
+function frameRowHash(
+	row: IRecoveryFrameRow,
+	value: unknown,
+	field: string
+): Buffer {
+	if (!Buffer.isBuffer(value) || value.length !== 32) {
+		throw new CorruptRecoveryRowError(
+			`${frameRowLabel(row)}: ${field} is not a 32-byte buffer`
+		);
+	}
+	return Buffer.from(value);
+}
+
+function decodeRecoveryFrameHeader(
+	row: IRecoveryFrameRow
+): IStoredRecoveryFrameHeader {
+	return {
+		sequence: frameRowInt(row, row.sequence, 'sequence', 1),
+		writerEpoch: frameRowInt(row, row.writer_epoch, 'writer_epoch', 1),
+		frameHash: frameRowHash(row, row.frame_hash, 'frame_hash'),
+		previousFrameHash: frameRowHash(row, row.previous_hash, 'previous_hash')
+	};
+}
+
+function decodeRecoveryFrameRow(row: IRecoveryFrameRow): IStoredRecoveryFrame {
+	if (!Buffer.isBuffer(row.ciphertext) || row.ciphertext.length === 0) {
+		throw new CorruptRecoveryRowError(
+			`${frameRowLabel(row)}: ciphertext is not a non-empty buffer`
+		);
+	}
+	return {
+		...decodeRecoveryFrameHeader(row),
+		ciphertext: Buffer.from(row.ciphertext),
+		createdAt: frameRowInt(row, row.created_at, 'created_at', 0)
+	};
 }
 
 export class SqliteStorage implements IStorageBackend {
@@ -2554,56 +2629,27 @@ export class SqliteStorage implements IStorageBackend {
 				: this.db
 						.prepare('SELECT * FROM recovery_frames ORDER BY sequence ASC')
 						.all()
-		) as Array<{
-			sequence: unknown;
-			writer_epoch: unknown;
-			frame_hash: unknown;
-			previous_hash: unknown;
-			ciphertext: unknown;
-			created_at: unknown;
-		}>;
-		// Decode EXACTLY or throw: SQLite column affinity does not enforce
-		// types, so a physically corrupt row (TEXT in a BLOB column, a float
-		// or string sequence) would otherwise be coerced into plausible bytes
-		// that chain verification then runs over (issue #317). Frame
-		// corruption always propagates; it is never routed through
-		// reportCorruptRow's skip path.
-		return rows.map((row) => {
-			const label = `recovery frame row ${String(row.sequence)}`;
-			const frameInt = (value: unknown, field: string, min: number): number => {
-				if (
-					typeof value !== 'number' ||
-					!Number.isSafeInteger(value) ||
-					value < min
-				) {
-					throw new CorruptRecoveryRowError(
-						`${label}: ${field} is not an integer >= ${min}`
-					);
-				}
-				return value;
-			};
-			const frameHash = (value: unknown, field: string): Buffer => {
-				if (!Buffer.isBuffer(value) || value.length !== 32) {
-					throw new CorruptRecoveryRowError(
-						`${label}: ${field} is not a 32-byte buffer`
-					);
-				}
-				return Buffer.from(value);
-			};
-			if (!Buffer.isBuffer(row.ciphertext) || row.ciphertext.length === 0) {
-				throw new CorruptRecoveryRowError(
-					`${label}: ciphertext is not a non-empty buffer`
-				);
-			}
-			return {
-				sequence: frameInt(row.sequence, 'sequence', 1),
-				writerEpoch: frameInt(row.writer_epoch, 'writer_epoch', 1),
-				frameHash: frameHash(row.frame_hash, 'frame_hash'),
-				previousFrameHash: frameHash(row.previous_hash, 'previous_hash'),
-				ciphertext: Buffer.from(row.ciphertext),
-				createdAt: frameInt(row.created_at, 'created_at', 0)
-			};
-		});
+		) as IRecoveryFrameRow[];
+		return rows.map(decodeRecoveryFrameRow);
+	}
+
+	loadRecoveryFrame(sequence: number): IStoredRecoveryFrame | null {
+		const row = this.db
+			.prepare('SELECT * FROM recovery_frames WHERE sequence = ?')
+			.get(sequence) as IRecoveryFrameRow | undefined;
+		return row ? decodeRecoveryFrameRow(row) : null;
+	}
+
+	loadRecoveryFrameHeader(sequence: number): IStoredRecoveryFrameHeader | null {
+		// created_at is stored after the ciphertext, so selecting it would
+		// still walk the blob's overflow pages.
+		const row = this.db
+			.prepare(
+				`SELECT sequence, writer_epoch, frame_hash, previous_hash
+				 FROM recovery_frames WHERE sequence = ?`
+			)
+			.get(sequence) as IRecoveryFrameRow | undefined;
+		return row ? decodeRecoveryFrameHeader(row) : null;
 	}
 
 	setOutboxFrameSequence(ids: number[], frameSequence: number): void {
