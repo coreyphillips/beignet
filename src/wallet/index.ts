@@ -973,16 +973,22 @@ export class Wallet {
 			account: Number(this._account),
 			birthdayHeight: this._birthdayHeightOption,
 			network,
+			// The servers were for the network being left; everything else about
+			// the Electrum connection still applies.
 			electrumOptions: {
-				servers,
-				tls: this.electrumOptions?.tls,
-				net: this.electrumOptions?.net
+				...this.electrumOptions,
+				servers
 			},
 			storage: {
 				getData: this._getData,
 				setData: this._setData
 			},
 			resetOnReadFailure: this._resetOnReadFailure,
+			// The constructor reads the public option names, not the private
+			// fields the spread above carries, and the result is copied back onto
+			// this wallet below.
+			disableMessagesOnCreate: this._quietUntilFirstRefresh,
+			disableRefreshOnCreate: this._disableRefreshOnCreate,
 			data: getDefaultWalletData(),
 			onMessage: this.sendMessage
 		};
