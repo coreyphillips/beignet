@@ -633,7 +633,42 @@ export class Transaction {
 		transaction?: Partial<ISendTransaction>;
 		fundingLightning?: boolean;
 		coinSelectPreference?: ECoinSelectPreference;
-	} = {}): Result<TGetTotalFeeObj> => {
+	} = {}): Result<TGetTotalFeeObj> =>
+		this.quoteTotalFee(
+			{
+				satsPerByte,
+				message,
+				transaction,
+				fundingLightning,
+				coinSelectPreference
+			},
+			new Map()
+		);
+
+	/**
+	 * getTotalFeeObj, given the fees coin selection has already priced for
+	 * this quote. Its searches and its quote at a capped rate ask for the same
+	 * rates more than once, and each one selects coins again.
+	 * @private
+	 * @param {Map<string, number>} selectedFees getTotalFee by rate and generatesChange.
+	 * @returns {Result<TGetTotalFeeObj>}
+	 */
+	private quoteTotalFee(
+		{
+			satsPerByte,
+			message,
+			transaction,
+			fundingLightning,
+			coinSelectPreference
+		}: {
+			satsPerByte: number;
+			message: string;
+			transaction: Partial<ISendTransaction>;
+			fundingLightning: boolean;
+			coinSelectPreference: ECoinSelectPreference;
+		},
+		selectedFees: Map<string, number>
+	): Result<TGetTotalFeeObj> {
 		try {
 			// With no inputs, price the transaction against every spendable UTXO, as
 			// setupTransaction would gather them, but in memory. Staging them here
@@ -794,17 +829,23 @@ export class Transaction {
 			// updateFee refuses a fee of exactly half the balance. A rate that drops
 			// the change output pays only the leftover, which is under half. A
 			// lower rate can also select fewer coins than this quote did.
-			const feeAt = (rate: number, generatesChange = true): number =>
-				selectsCoins
-					? this.getTotalFee({
-							satsPerByte: rate,
-							message,
-							transaction,
-							fundingLightning,
-							coinSelectPreference,
-							generatesChange
-					  })
-					: quoteAt(rate).totalFee;
+			const feeAt = (rate: number, generatesChange = true): number => {
+				if (!selectsCoins) return quoteAt(rate).totalFee;
+				const key = `${rate}:${generatesChange}`;
+				let fee = selectedFees.get(key);
+				if (fee === undefined) {
+					fee = this.getTotalFee({
+						satsPerByte: rate,
+						message,
+						transaction,
+						fundingLightning,
+						coinSelectPreference,
+						generatesChange
+					});
+					selectedFees.set(key, fee);
+				}
+				return fee;
+			};
 			// The highest rate below `over` that fits.
 			const highestFitting = (
 				over: number,
@@ -907,13 +948,16 @@ export class Transaction {
 				// quoteAt prices the coins selected at the requested rate. The capped
 				// rate can select fewer, and their change can be dust.
 				if (selectsCoins && maxSatPerByte) {
-					const atMax = this.getTotalFeeObj({
-						satsPerByte: maxSatPerByte,
-						message,
-						transaction,
-						fundingLightning,
-						coinSelectPreference
-					});
+					const atMax = this.quoteTotalFee(
+						{
+							satsPerByte: maxSatPerByte,
+							message,
+							transaction,
+							fundingLightning,
+							coinSelectPreference
+						},
+						selectedFees
+					);
 					if (atMax.isErr()) return atMax;
 					return ok({
 						totalFee: atMax.value.totalFee,
@@ -939,7 +983,7 @@ export class Transaction {
 		} catch (e) {
 			return err(e);
 		}
-	};
+	}
 
 	/**
 	 * Returns the maximum sats per byte that can be used for a given transaction.
@@ -2569,6 +2613,9 @@ export class Transaction {
 			}
 			const amountToSend = amountToSendRes.value;
 
+			// Sorted as a copy: callers pass the staged transaction's inputs, and a
+			// fee quote must not reorder what the send will spend.
+			inputs = [...inputs];
 			switch (coinSelectPreference) {
 				case 'large':
 					// Sort by the largest UTXO amount (Lowest fee, but reveals your largest UTXO's)
@@ -2638,8 +2685,7 @@ export class Transaction {
 			}
 
 			// Output address types for the fee calculation, with and without the
-			// change output. Input types are counted per selection in calculateFee
-			// below, since the selection can grow.
+			// change output. Input types are counted below, as the selection grows.
 			const countOutputTypes = (
 				addresses: string[]
 			): IAddressTypesIO['outputs'] => {
@@ -2667,30 +2713,67 @@ export class Transaction {
 				? countOutputTypes([...paymentAddresses, changeAddress])
 				: noChangeOutputTypes;
 
-			//Price the current selection. Every input added costs weight, so this
-			//has to be recomputed whenever the selection changes.
-			const calculateFee = (selected: IUtxo[], types = outputTypes): number => {
-				const inputTypes = {} as IAddressTypesIO['inputs'];
-				selected.forEach(({ address }) => {
-					const validateResponse = getAddressInfo(address);
-					if (!validateResponse) {
-						return;
-					}
-					const type = validateResponse.type.toUpperCase() as EAddressType;
-					if (type in inputTypes) {
-						inputTypes[type] = inputTypes[type] + 1;
-					} else {
-						inputTypes[type] = 1;
-					}
-				});
+			// A selection is priced from its count of inputs per script type, and
+			// each coin's address is decoded once. The top-up below reprices after
+			// every coin it adds, so walking the whole selection each time is
+			// quadratic in the number of coins.
+			const addressTypes = new Map<IUtxo, string>();
+			const typeOf = (input: IUtxo): string => {
+				let type = addressTypes.get(input);
+				if (type === undefined) {
+					type = getAddressInfo(input.address).type.toUpperCase();
+					addressTypes.set(input, type);
+				}
+				return type;
+			};
+			type TSelection = { types: Record<string, number>; uncompressed: number };
+			// Adds `input` to the counts, or with -1 takes it out. A type with none
+			// left is dropped, as a fresh count would have it. A zero P2WSH count
+			// is not rewritten by applyMultisigInputWeights, and getByteCount has
+			// no plain P2WSH input weight.
+			const count = (
+				selection: TSelection,
+				input: IUtxo,
+				by: 1 | -1 = 1
+			): TSelection => {
+				const type = typeOf(input);
+				const left = (selection.types[type] ?? 0) + by;
+				if (left) selection.types[type] = left;
+				else delete selection.types[type];
+				// See uncompressedKeyBytes.
+				if (type === 'P2PKH' && input.keyPair?.publicKey.length === 65) {
+					selection.uncompressed += by;
+				}
+				return selection;
+			};
+			const countAll = (selected: IUtxo[]): TSelection => {
+				const selection: TSelection = { types: {}, uncompressed: 0 };
+				selected.forEach((input) => count(selection, input));
+				return selection;
+			};
+			const copyOf = (selection: TSelection): TSelection => ({
+				types: { ...selection.types },
+				uncompressed: selection.uncompressed
+			});
+
+			//Price a selection. Every input added costs weight, so this has to be
+			//recomputed whenever the selection changes.
+			const calculateFee = (
+				selection: TSelection,
+				types = outputTypes
+			): number => {
 				// See getTotalFee: priced at its size, without the 166 vB floor.
+				// applyMultisigInputWeights rewrites the counts it is given.
 				let baseFee =
 					getByteCount(
-						this.applyMultisigInputWeights(inputTypes),
+						this.applyMultisigInputWeights({
+							...selection.types
+						} as TGetByteCountInputs),
 						types,
 						message,
 						0
-					) + this.uncompressedKeyBytes(selected);
+					) +
+					selection.uncompressed * 32;
 				if (satsPerByte < 2) {
 					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
 					if (baseFee < minByteCount) baseFee = minByteCount;
@@ -2698,11 +2781,13 @@ export class Transaction {
 				return baseFee * satsPerByte;
 			};
 
-			let fee = calculateFee(newInputs);
+			const selection = countAll(newInputs);
+			let fee = calculateFee(selection);
 			// The top-up below can add a coin worth less than its own weight costs,
 			// leaving a selection that no longer pays the rate even without change.
-			// The last one that did is kept to fall back on.
-			let noChangeInputs: IUtxo[] | undefined;
+			// The last one that did is kept to fall back on. The top-up only
+			// appends, so that selection is a prefix of newInputs.
+			let noChangeLength: number | undefined;
 			let noChangeAmount = 0;
 
 			//Ensure we can still cover the transaction with the previously selected UTXO's. Add more UTXO's if not.
@@ -2714,14 +2799,14 @@ export class Transaction {
 					if (inputAmount >= amountToSend + fee) break;
 					if (
 						inputAmount >=
-						amountToSend + calculateFee(newInputs, noChangeOutputTypes)
+						amountToSend + calculateFee(selection, noChangeOutputTypes)
 					) {
-						noChangeInputs = [...newInputs];
+						noChangeLength = newInputs.length;
 						noChangeAmount = inputAmount;
 					}
 					inputAmount += input.value;
 					newInputs.push(input);
-					fee = calculateFee(newInputs);
+					fee = calculateFee(count(selection, input));
 				}
 			}
 
@@ -2733,9 +2818,9 @@ export class Transaction {
 				// The payment can still meet the rate without its change output.
 				// getTotalFee then quotes the whole leftover as the fee, and the
 				// builder finds no change to add.
-				const noChangeFee = calculateFee(newInputs, noChangeOutputTypes);
+				const noChangeFee = calculateFee(selection, noChangeOutputTypes);
 				if (inputAmount < amountToSend + noChangeFee) {
-					if (!noChangeInputs) {
+					if (noChangeLength === undefined) {
 						if (coinSelectPreference === 'consolidate' || !amountToSend) {
 							return err('Not enough funds');
 						}
@@ -2744,18 +2829,16 @@ export class Transaction {
 						// what it adds to the fee is left out by selecting again.
 						// Inputs of one type and key size add the same, so each kind is
 						// priced once.
-						const kindOf = (input: IUtxo): string => {
-							const { type } = getAddressInfo(input.address);
-							return `${type}:${input.keyPair?.publicKey.length}`;
-						};
+						const kindOf = (input: IUtxo): string =>
+							`${typeOf(input)}:${input.keyPair?.publicKey.length}`;
 						const added = new Map<string, number>();
 						const economic: IUtxo[] = [];
 						const dropped: IUtxo[] = [];
-						newInputs.forEach((input, i) => {
+						newInputs.forEach((input) => {
 							const kind = kindOf(input);
 							let cost = added.get(kind);
 							if (cost === undefined) {
-								cost = fee - calculateFee(newInputs.filter((_, j) => j !== i));
+								cost = fee - calculateFee(count(copyOf(selection), input, -1));
 								added.set(kind, cost);
 							}
 							(input.value > cost ? economic : dropped).push(input);
@@ -2771,13 +2854,15 @@ export class Transaction {
 						// ones of that kind are too.
 						dropped.sort((a, b) => b.value - a.value);
 						const refused = new Set<string>();
-						let keptFee = calculateFee(economic);
+						const kept = countAll(economic);
+						let keptFee = calculateFee(kept);
 						for (const input of dropped) {
 							const kind = kindOf(input);
 							if (refused.has(kind)) continue;
-							const withInput = calculateFee([...economic, input]);
+							const withInput = calculateFee(count(copyOf(kept), input));
 							if (input.value > withInput - keptFee) {
 								economic.push(input);
+								count(kept, input);
 								keptFee = withInput;
 							} else {
 								refused.add(kind);
@@ -2795,7 +2880,7 @@ export class Transaction {
 							coinSelectPreference
 						});
 					}
-					newInputs = noChangeInputs;
+					newInputs = newInputs.slice(0, noChangeLength);
 					inputAmount = noChangeAmount;
 				}
 				fee = inputAmount - amountToSend;
