@@ -375,13 +375,95 @@ describe('Reestablish hold (issue #1726)', () => {
 			await settle();
 			const [held] = holds(lsp);
 			expect(held.cutoffHeight).to.equal(
-				Math.min(held.forwardCltv - 40, held.incomingCltvExpiry - 18)
+				Math.min(held.forwardCltv - 40 + 1, held.incomingCltvExpiry - 18)
 			);
 
 			lsp.handleNewBlock(held.cutoffHeight - 1);
 			await settle();
 			expect(holds(lsp)[0].state, 'a block short of it').to.equal('RELEASING');
 			lsp.handleNewBlock(held.cutoffHeight);
+			await waitFor(
+				() =>
+					paymentStatus(alice, invoice.paymentHash) === PaymentStatus.FAILED,
+				'the payer to be refunded at the cutoff',
+				5_000
+			);
+			expect(alice.getPayment(invoice.paymentHash)!.failureCode).to.equal(
+				TEMPORARY_CHANNEL_FAILURE
+			);
+			expect(holds(lsp)[0].failReason).to.equal('cutoff_unplaced');
+			destroyAll(alice, lsp, carol);
+		});
+
+		/** Alice pays Carol at height 1000 with exactly `finalDelta` blocks. */
+		function payAtHeight1000(
+			w: IWorld,
+			invoice: ReturnType<LightningNode['createInvoice']>,
+			finalDelta: number
+		): void {
+			for (const node of [w.alice, w.lsp, w.carol]) node.handleNewBlock(1000);
+			const amountMsat = 5_000_000n;
+			w.alice.sendPaymentToRoute(
+				{
+					hops: [
+						{
+							pubkey: nodePubkey(LSP_SEED),
+							shortChannelId: w.scidAB,
+							amountToForwardMsat: amountMsat + 100_000n,
+							outgoingCltvValue: 400
+						},
+						{
+							pubkey: Buffer.from(w.carol.getNodeId(), 'hex'),
+							shortChannelId: w.scidBC,
+							amountToForwardMsat: amountMsat,
+							outgoingCltvValue: finalDelta
+						}
+					]
+				},
+				invoice.paymentHash,
+				finalDelta,
+				invoice.paymentSecret,
+				amountMsat
+			);
+		}
+
+		it('holds a part that carries exactly the invoice delta and places it at the same height', async () => {
+			const w = await holdWorld();
+			const { alice, lsp, carol } = w;
+			const invoice = invoiceFor(w);
+			await disconnect(lsp, carol, w.cutBC);
+			payAtHeight1000(w, invoice, 40);
+			await settle();
+			const [held] = holds(lsp);
+			expect(held, 'the part is held').to.not.equal(undefined);
+			expect(held.cutoffHeight).to.equal(1001);
+
+			await reconnect(lsp, carol, w.cutBC, w.gateBC);
+			await waitFor(
+				() =>
+					paymentStatus(alice, invoice.paymentHash) === PaymentStatus.COMPLETED,
+				'the payment to complete after the reestablish'
+			);
+			destroyAll(alice, lsp, carol);
+		});
+
+		it("fails a JIT client's part with temporary_channel_failure once a block leaves it under the JIT invoice delta", async () => {
+			const w = await holdWorld();
+			const { alice, lsp, carol } = w;
+			registerIntent(w);
+			// What createJitInvoice mints over an existing channel.
+			const invoice = carol.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'away',
+				minFinalCltvExpiry: 72
+			});
+			await disconnect(lsp, carol, w.cutBC);
+			payAtHeight1000(w, invoice, 72);
+			await settle();
+			const [held] = holds(lsp);
+			expect(held.cutoffHeight).to.equal(1001);
+
+			for (const node of [alice, lsp, carol]) node.handleNewBlock(1001);
 			await waitFor(
 				() =>
 					paymentStatus(alice, invoice.paymentHash) === PaymentStatus.FAILED,

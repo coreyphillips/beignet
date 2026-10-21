@@ -25255,10 +25255,17 @@ export class LightningNode extends EventEmitter {
 			return 'ineligible';
 		}
 		const outChannelIdHex = outChannelId.toString('hex');
-		// The cutoff parkHeldForward fixes: the wallet's final-hop headroom, or
-		// our own margin on the inbound leg, whichever comes first.
+		// Release is allowed strictly below the cutoff, so the wallet's term is
+		// the first height at which it would refuse the part, and a payer that
+		// padded nothing can still be held until a block arrives. The wallet's
+		// delta is not in the onion: a JIT client may be paid on a JIT invoice,
+		// which asks for more than the default. The other term is our own
+		// margin on the inbound leg.
+		const walletFinalCltv = this.channelManager.isJitClient(peer)
+			? JIT_RECEIVE_MIN_FINAL_CLTV_EXPIRY
+			: DEFAULT_MIN_FINAL_CLTV_EXPIRY;
 		const cutoffHeight = Math.min(
-			part.forwardCltv - DEFAULT_MIN_FINAL_CLTV_EXPIRY,
+			part.forwardCltv - walletFinalCltv + 1,
 			part.incomingCltvExpiry -
 				Math.max(HELD_HTLC_EXPIRY_MARGIN, this.htlcSafetyMargin)
 		);
