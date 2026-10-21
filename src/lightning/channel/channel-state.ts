@@ -598,7 +598,11 @@ export interface IChannelState {
 	 */
 	awaitingClosingSig?: boolean;
 
-	/** Channel announcement: SCID (set at 6 confirmations) */
+	/**
+	 * Channel announcement: SCID (set at 6 confirmations). This and the two
+	 * aliases are written only through Channel._setScid, which is what keeps
+	 * ChannelManager.getChannelsByScid current.
+	 */
 	shortChannelId: Buffer | null;
 	/** Channel announcement: funding confirmation block height */
 	fundingConfirmationHeight: number;

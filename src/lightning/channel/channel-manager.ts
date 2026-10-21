@@ -669,11 +669,44 @@ function wireErrorPayloadFor(channelId: Buffer, reason: string): Buffer | null {
 	});
 }
 
+/**
+ * A Map that counts its writes, so an index derived from it can tell it is
+ * stale without a hook at each of the manager's many write sites.
+ */
+class CountedMap<K, V> extends Map<K, V> {
+	writes = 0;
+
+	set(key: K, value: V): this {
+		this.writes++;
+		return super.set(key, value);
+	}
+
+	delete(key: K): boolean {
+		this.writes++;
+		return super.delete(key);
+	}
+
+	clear(): void {
+		this.writes++;
+		super.clear();
+	}
+}
+
 export class ChannelManager extends EventEmitter {
 	private config: IChannelManagerConfig;
-	private channels: Map<string, Channel> = new Map();
-	private tempChannels: Map<string, Channel> = new Map();
-	private channelPeers: Map<string, string> = new Map();
+	private channels: CountedMap<string, Channel> = new CountedMap();
+	private tempChannels: CountedMap<string, Channel> = new CountedMap();
+	private channelPeers: CountedMap<string, string> = new CountedMap();
+	/**
+	 * Every channel by each scid naming it, and the peers of every channel
+	 * with a channel id, for per-message gossip checks. Rebuilt on the first
+	 * read after the maps above or any channel's scids change.
+	 */
+	private ownChannelIndex: {
+		revision: number;
+		byScid: Map<string, Channel[]>;
+		peers: Set<string>;
+	} | null = null;
 	/** Synchronous funding promotions reserved across reentrant observers. */
 	private channelIdReservations: Map<string, Channel> = new Map();
 	/**
@@ -2866,6 +2899,60 @@ export class ChannelManager extends EventEmitter {
 	 */
 	listChannelPeers(): string[] {
 		return [...new Set(this.channelPeers.values())];
+	}
+
+	/**
+	 * Channels whose real SCID or either side's alias equals `scid`, in
+	 * listChannels order. More than one when a peer-chosen alias collides
+	 * with another channel's SCID.
+	 */
+	getChannelsByScid(scid: Buffer): readonly Channel[] {
+		return this.getOwnChannelIndex().byScid.get(scid.toString('hex')) ?? [];
+	}
+
+	/**
+	 * Whether `pubkey` is the peer of a channel that has a channel id. Unlike
+	 * listChannelPeers, a peer with only a pending open does not count.
+	 */
+	hasChannelWithPeer(pubkey: string): boolean {
+		return this.getOwnChannelIndex().peers.has(pubkey);
+	}
+
+	private getOwnChannelIndex(): {
+		byScid: Map<string, Channel[]>;
+		peers: Set<string>;
+	} {
+		// Every counter only grows, so the sum changes whenever any of them does.
+		const revision =
+			this.channels.writes +
+			this.tempChannels.writes +
+			this.channelPeers.writes +
+			Channel.getScidRevision();
+		if (this.ownChannelIndex?.revision === revision)
+			return this.ownChannelIndex;
+		const byScid = new Map<string, Channel[]>();
+		const peers = new Set<string>();
+		for (const map of [this.channels, this.tempChannels]) {
+			for (const channel of map.values()) {
+				const state = channel.getFullState();
+				for (const scid of [
+					state.shortChannelId,
+					state.scidAlias,
+					state.remoteScidAlias
+				]) {
+					if (!scid) continue;
+					const key = scid.toString('hex');
+					const named = byScid.get(key);
+					if (!named) byScid.set(key, [channel]);
+					else if (named[named.length - 1] !== channel) named.push(channel);
+				}
+				const channelId = channel.getChannelId();
+				const peer = channelId && this.getPeerForChannel(channelId);
+				if (peer) peers.add(peer);
+			}
+		}
+		this.ownChannelIndex = { revision, byScid, peers };
+		return this.ownChannelIndex;
 	}
 
 	/**
