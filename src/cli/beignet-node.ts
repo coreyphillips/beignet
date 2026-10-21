@@ -85,6 +85,7 @@ import {
 	readCappedBody
 } from '../lightning/l402';
 import { ILightningError, IPaymentInfo } from '../lightning/node/types';
+import { MAX_REESTABLISH_HOLD_MS } from '../lightning/async-payments/reestablish-hold';
 import { IInvoiceInfo } from '../lightning/storage/types';
 import { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
 import { normalizeHexPubkey } from '../lightning/validation';
@@ -391,6 +392,9 @@ export interface BeignetNodeOptions
 	 * this node accepts when it asks an LSP for a JIT receive of its own.
 	 * maxClientFundingSats / maxConcurrentFundings / maxTotalFundingSats bound
 	 * what the LSP role fronts (issue #665); unset keeps the library defaults.
+	 * reestablishHoldMs (issue #1726) holds a forward to a wallet whose
+	 * channel is awaiting reestablish for that long after its disconnect
+	 * instead of failing it; unset or 0 is off.
 	 */
 	jitReceive?: {
 		enabled?: boolean;
@@ -401,6 +405,7 @@ export interface BeignetNodeOptions
 		maxClientFundingSats?: number;
 		maxConcurrentFundings?: number;
 		maxTotalFundingSats?: number;
+		reestablishHoldMs?: number;
 	};
 	/**
 	 * Reverse swap provider (issue #737): on only with enabled === true. The
@@ -1681,7 +1686,9 @@ const JIT_FEE_FIELD_MAX: ReadonlyArray<[string, number]> = [
 	// range, and a small count of fundings in flight at once.
 	['maxClientFundingSats', Number.MAX_SAFE_INTEGER],
 	['maxConcurrentFundings', 1_000],
-	['maxTotalFundingSats', Number.MAX_SAFE_INTEGER]
+	['maxTotalFundingSats', Number.MAX_SAFE_INTEGER],
+	// The JIT engine's own hold budget is the ceiling (issue #1726).
+	['reestablishHoldMs', MAX_REESTABLISH_HOLD_MS]
 ];
 
 /**
@@ -3060,6 +3067,11 @@ export class BeignetNode extends EventEmitter {
 								  }
 								: {})
 					  }
+					: undefined,
+			reestablishHold:
+				opts.jitReceive?.enabled === true &&
+				(opts.jitReceive.reestablishHoldMs ?? 0) > 0
+					? { enabled: true, holdMs: opts.jitReceive.reestablishHoldMs }
 					: undefined,
 			// Reverse swap provider (issue #737): the role runs only when the
 			// operator says enabled; every other field is optional and the

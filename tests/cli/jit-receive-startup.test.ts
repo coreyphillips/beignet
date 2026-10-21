@@ -96,6 +96,18 @@ describe('daemon startup JIT receive config', function () {
 		);
 	});
 
+	// Issue #1726: the JIT engine's own hold budget is the ceiling.
+	it('refuses a reestablish hold window past 300 s or not a whole number', async () => {
+		await expectStartRefused(
+			{ enabled: true, reestablishHoldMs: 300_001 },
+			/reestablishHoldMs must be an integer between 0 and 300000/
+		);
+		await expectStartRefused(
+			{ enabled: true, reestablishHoldMs: Number.NaN },
+			/reestablishHoldMs must be an integer/
+		);
+	});
+
 	it('refuses a non-boolean enabled', async () => {
 		await expectStartRefused({ enabled: 'true' }, /enabled must be a boolean/);
 	});
@@ -119,7 +131,8 @@ describe('JIT receive daemon surface', function () {
 				maxFeePpm: 3_000,
 				maxClientFundingSats: 400_000,
 				maxConcurrentFundings: 2,
-				maxTotalFundingSats: 5_000_000
+				maxTotalFundingSats: 5_000_000,
+				reestablishHoldMs: 120_000
 			}
 		});
 	});
@@ -181,6 +194,17 @@ describe('JIT receive daemon surface', function () {
 		expect(manager.cfg.maxClientFundingSats).to.equal(400_000n);
 		expect(manager.cfg.maxConcurrentFundings).to.equal(2);
 		expect(manager.cfg.maxTotalFundingSats).to.equal(5_000_000n);
+	});
+
+	it('threads the reestablish hold window into the library node', () => {
+		const inner = (daemon.node as unknown as { node: LightningNode }).node;
+		const hold = (inner as unknown as { reestablishHold: unknown })
+			.reestablishHold;
+		expect(hold).to.deep.equal({
+			holdMs: 120_000,
+			maxPartsPerPeer: 10,
+			maxHolds: 200
+		});
 	});
 
 	it('puts minFinalCltvExpiry into the invoice c tag', () => {

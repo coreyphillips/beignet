@@ -67,6 +67,11 @@ interface IHarness {
 	fundable: { value: bigint | null };
 	/** Whether a splice is already awaiting the chain on the channel (#760). */
 	splicePending: { fn: (channelId: Buffer) => boolean };
+	/** The wallet is disconnected (issue #1726); `back` emits when it returns. */
+	walletAway: { value: boolean };
+	walletEvents: EventEmitter;
+	/** Whether the channel could carry the queued parts without a splice. */
+	canCarry: { fn: (channelId: Buffer, amounts: bigint[]) => boolean };
 }
 
 function makeHarness(
@@ -92,7 +97,10 @@ function makeHarness(
 		failsDeliver: { value: true },
 		storageWrites: { failKeys: new Set<string>() },
 		fundable: { value: null },
-		splicePending: { fn: (): boolean => false }
+		splicePending: { fn: (): boolean => false },
+		walletAway: { value: false },
+		walletEvents: new EventEmitter(),
+		canCarry: { fn: (): boolean => false }
 	};
 
 	const deps: IJitManagerDeps = {
@@ -119,6 +127,18 @@ function makeHarness(
 		},
 		maxFundableSats: () => h.fundable.value,
 		splicePendingLock: (channelId) => h.splicePending.fn(channelId),
+		walletReachable: () => !h.walletAway.value,
+		walletMayBeReachable: (_pubkey, _channelId, timeoutMs) =>
+			new Promise<void>((resolve) => {
+				const done = (): void => {
+					clearTimeout(timer);
+					h.walletEvents.removeListener('back', done);
+					resolve();
+				};
+				const timer = setTimeout(done, timeoutMs);
+				h.walletEvents.once('back', done);
+			}),
+		canOfferHtlcs: (channelId, amounts) => h.canCarry.fn(channelId, amounts),
 		storage: {
 			saveMetadata: (k, v) => {
 				if (h.storageWrites.failKeys.has(k)) {
@@ -1824,5 +1844,160 @@ describe('JIT hold behind a depth-locked splice (issue #760)', () => {
 			TEMPORARY_CHANNEL_FAILURE
 		]);
 		expect(h.forwarded).to.have.length(0);
+	});
+});
+
+describe('JIT waits for an absent wallet (issue #1726)', () => {
+	/** Let the engine reach its wait, then bring the wallet back. */
+	async function comeBack(h: IHarness, afterMs = 20): Promise<void> {
+		await new Promise((r) => setTimeout(r, afterMs));
+		h.walletAway.value = false;
+		h.walletEvents.emit('back');
+	}
+
+	it('no channel yet: the open waits for the wallet and completes when it is back', async () => {
+		const h = makeHarness();
+		h.walletAway.value = true;
+		const ack = h.manager.registerIntent(CLIENT, auth());
+		const waiting = waitFor<{ walletPubkeyHex: string }>(
+			h.manager,
+			'jit:waiting-for-wallet'
+		);
+		const forwarded = waitFor(h.manager, 'jit:forwarded');
+		expect(
+			h.manager.tryInterceptUnknownScid(
+				ack.interceptScid.toString('hex'),
+				makePart(h)
+			)
+		).to.equal(true);
+		expect((await waiting).walletPubkeyHex).to.equal(CLIENT);
+		await new Promise((r) => setTimeout(r, 20));
+		expect(h.opens, 'no open into an absent wallet').to.have.length(0);
+
+		await comeBack(h);
+		await forwarded;
+		expect(h.opens).to.have.length(1);
+		expect(h.forwarded).to.have.length(1);
+		expect(h.failed).to.have.length(0);
+	});
+
+	it('channel too small: the splice waits for the wallet and completes when it is back', async () => {
+		const h = makeHarness();
+		h.walletAway.value = true;
+		h.manager.registerIntent(CLIENT, auth());
+		const channelId = crypto.randomBytes(32);
+		const forwarded = waitFor(h.manager, 'jit:forwarded');
+		expect(h.manager.tryHoldForSplice(channelId, makePart(h))).to.equal(true);
+		await new Promise((r) => setTimeout(r, 20));
+		expect(h.splices, 'no splice while the channel reconnects').to.have.length(
+			0
+		);
+
+		await comeBack(h);
+		await forwarded;
+		expect(h.splices).to.have.length(1);
+		expect(h.forwarded).to.have.length(1);
+		expect(h.failed).to.have.length(0);
+	});
+
+	it('a wallet back to a channel that carries the part needs no splice, and spends no intent', async () => {
+		const h = makeHarness({ flatFeeSat: 100n });
+		h.walletAway.value = true;
+		h.canCarry.fn = (): boolean => true;
+		h.manager.registerIntent(CLIENT, auth({ acceptsSkimmedFee: true }));
+		const forwarded = waitFor<{ spliced?: boolean }>(
+			h.manager,
+			'jit:forwarded'
+		);
+		h.manager.tryHoldForSplice(
+			crypto.randomBytes(32),
+			makePart(h, { amountMsat: 2_000_000n })
+		);
+		await comeBack(h);
+		expect((await forwarded).spliced).to.equal(false);
+		expect(h.splices).to.have.length(0);
+		expect(
+			h.forwarded[0].part.forwardAmountMsat,
+			'no opening fee without an opening'
+		).to.equal(2_000_000n);
+		expect(h.manager.listIntents()).to.have.length(1);
+		expect(h.manager.getFrontedTotalSats()).to.equal(0n);
+	});
+
+	for (const path of ['open', 'splice'] as const) {
+		it(`${path}: a wallet that never returns fails cleanly at the hold budget`, async () => {
+			const h = makeHarness({ maxHoldMs: 60 });
+			h.walletAway.value = true;
+			const ack = h.manager.registerIntent(CLIENT, auth());
+			const failure = waitFor<{ reason: string }>(h.manager, 'jit:failed');
+			if (path === 'open') {
+				h.manager.tryInterceptUnknownScid(
+					ack.interceptScid.toString('hex'),
+					makePart(h)
+				);
+			} else {
+				h.manager.tryHoldForSplice(crypto.randomBytes(32), makePart(h));
+			}
+			expect((await failure).reason).to.match(/did not come back/);
+			expect(h.opens).to.have.length(0);
+			expect(h.splices).to.have.length(0);
+			expect(h.failed.map((f) => f.code)).to.deep.equal([
+				TEMPORARY_CHANNEL_FAILURE
+			]);
+			expect(h.manager.getFrontedTotalSats()).to.equal(0n);
+		});
+	}
+
+	it('a part the deadline revokes ends the wait at its next check, not at the budget', async () => {
+		const h = makeHarness();
+		h.walletAway.value = true;
+		const ack = h.manager.registerIntent(CLIENT, auth());
+		const reasons: string[] = [];
+		h.manager.on('jit:failed', (e: { reason: string }) =>
+			reasons.push(e.reason)
+		);
+		h.manager.tryInterceptUnknownScid(
+			ack.interceptScid.toString('hex'),
+			makePart(h, { forwardCltv: 800_050, incomingCltvExpiry: 800_100 })
+		);
+		await new Promise((r) => setTimeout(r, 20));
+		h.height.value = 800_090;
+		h.manager.scanExpiringHolds();
+		// The revocation fails the part; the funding that was waiting for the
+		// wallet then ends on its next check instead of at the budget.
+		const started = Date.now();
+		while (reasons.length < 2 && Date.now() - started < 3_000) {
+			await new Promise((r) => setTimeout(r, 10));
+		}
+		expect(reasons).to.deep.equal([
+			'held part reached its inbound CLTV deadline',
+			'every held part was resolved before funding'
+		]);
+		expect(h.opens, 'the wait ended without an open').to.have.length(0);
+		expect(h.failed.map((f) => f.code)).to.deep.equal([EXPIRY_TOO_SOON]);
+	});
+
+	it('an open refused because the wallet dropped mid-attempt is retried once it is back', async () => {
+		const h = makeHarness({ fundingAttempts: 3 });
+		let calls = 0;
+		h.openResult.fn = async (): Promise<Buffer> => {
+			if (++calls === 1) {
+				h.walletAway.value = true;
+				throw new InvalidChannelOpenError(
+					'Peer did not negotiate option_zeroconf and option_scid_alias'
+				);
+			}
+			return crypto.randomBytes(32);
+		};
+		const ack = h.manager.registerIntent(CLIENT, auth());
+		const forwarded = waitFor(h.manager, 'jit:forwarded');
+		h.manager.tryInterceptUnknownScid(
+			ack.interceptScid.toString('hex'),
+			makePart(h)
+		);
+		await comeBack(h);
+		await forwarded;
+		expect(calls).to.equal(2);
+		expect(h.failed).to.have.length(0);
 	});
 });

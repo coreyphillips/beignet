@@ -516,6 +516,15 @@ export interface INodeConfig {
 	 */
 	jitReceive?: import('../liquidity/jit-receive').IJitReceiveConfig;
 	/**
+	 * Part of the same LSP role (issue #1726): a forward to a wallet whose
+	 * channel is awaiting reestablish is held for a window measured from the
+	 * wallet's disconnect, and placed when the channel reestablishes, instead
+	 * of failed at once. Only for unannounced channels to a JIT client or
+	 * opened by this node, and only while `jitReceive` is enabled. Off unless
+	 * `enabled` is set; the window defaults to 180 s and is capped at 300 s.
+	 */
+	reestablishHold?: import('../async-payments/reestablish-hold').IReestablishHoldConfig;
+	/**
 	 * JIT channel receive, WALLET role (issue #595): the most this node will
 	 * let an LSP quote before `requestJitReceive` refuses the ack. Separate
 	 * from `jitReceive`, which is the LSP role: a wallet that only receives

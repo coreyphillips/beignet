@@ -1005,8 +1005,11 @@ export interface BeignetConfig extends IrohDaemonConfig, ElectrumTlsConfig {
 	 *  BEIGNET_JIT_MAX_CLIENT_FUNDING_SAT, BEIGNET_JIT_MAX_CONCURRENT_FUNDINGS
 	 *  and BEIGNET_JIT_MAX_TOTAL_FUNDING_SAT bound what the LSP role fronts
 	 *  (per client, in flight at once, and cumulatively across restarts; the
-	 *  last unset means no lifetime budget), issue #665. Whole integers;
-	 *  anything else refuses startup. */
+	 *  last unset means no lifetime budget), issue #665.
+	 *  BEIGNET_JIT_REESTABLISH_HOLD_MS (issue #1726) holds a forward to a
+	 *  wallet whose channel is awaiting reestablish for that long after the
+	 *  wallet's disconnect, instead of failing it; at most 300000, unset or 0
+	 *  is off. Whole integers; anything else refuses startup. */
 	jitReceive?: {
 		enabled?: boolean;
 		flatFeeSat?: number;
@@ -1016,6 +1019,7 @@ export interface BeignetConfig extends IrohDaemonConfig, ElectrumTlsConfig {
 		maxClientFundingSats?: number;
 		maxConcurrentFundings?: number;
 		maxTotalFundingSats?: number;
+		reestablishHoldMs?: number;
 	};
 	/** Reverse swap provider (issue #737): BEIGNET_SWAPS exact 'true'/'false'
 	 *  switches the role on; the rest name its fee, its exposure caps and its
