@@ -51,30 +51,10 @@ import { toXOnly } from 'bitcoinjs-lib/src/psbt/bip371';
 bitcoin.initEccLib(ecc);
 
 /**
- * The staged send as it may be written to wallet storage. The live copy keeps
- * each input's key pair so that signing works; the stored copy never carries
- * one. Storage adapters JSON-stringify what they are handed, and an ECPair or
- * BIP32 node stringifies with its private key, so a key handed to
- * sweepPrivateKey or addExternalInputs used to sit in storage in the clear
- * (#1011). The inputs, outputs and tags are copied too: saveWalletData queues
- * a write behind the previous one for the same key, so a write serialises
- * what the arrays hold when its turn comes, not when it was issued.
- * @param {ISendTransaction} data
- * @returns {ISendTransaction}
+ * The staged send lives in memory only and is never written to wallet
+ * storage. Nothing reads a stored copy, and one has replayed recipients after
+ * a restart (#1002) and leaked swept key pairs (#1011).
  */
-export const persistableTransaction = (
-	data: ISendTransaction
-): ISendTransaction => ({
-	...data,
-	outputs: data.outputs.map((output) => ({ ...output })),
-	tags: [...(data.tags ?? [])],
-	inputs: data.inputs.map((input) => {
-		const { keyPair, ...rest } = input;
-		void keyPair;
-		return rest;
-	})
-});
-
 export class Transaction {
 	private _data: ISendTransaction;
 	private readonly _wallet: Wallet;
@@ -91,9 +71,8 @@ export class Transaction {
 	/**
 	 * Sets up a transaction for a given wallet by gathering inputs, setting the next available change address as an output and sets up the baseline fee structure.
 	 * This function will not override previously set transaction data. To do that you'll need to call resetSendTransaction.
-	 * Outputs come only from the outputs argument. The copy of the staged send
-	 * that wallet storage holds is never read, so a restart cannot replay an
-	 * earlier call's recipients (#1002).
+	 * Outputs come only from the outputs argument, so a restart cannot replay
+	 * an earlier call's recipients (#1002).
 	 * @param {string[]} [inputTxHashes] Errs when none of them has a spendable UTXO.
 	 * @param {IUtxo[]} [utxos]
 	 * @param {boolean} [rbf]
@@ -220,8 +199,6 @@ export class Transaction {
 				...payload
 			};
 
-			await this._persist();
-
 			return ok(payload);
 		} catch (e) {
 			return err(e);
@@ -239,8 +216,6 @@ export class Transaction {
 		};
 		this._data = data;
 
-		await this._persist();
-
 		return ok(data);
 	}
 
@@ -250,34 +225,7 @@ export class Transaction {
 	 */
 	async resetSendTransaction(): Promise<Result<string>> {
 		this._data = getDefaultSendTransaction();
-		await this._persist();
 		return ok('Transaction reset.');
-	}
-
-	/**
-	 * Drops the stored copy of the staged send and leaves the live copy in
-	 * place. The send and build paths call this on their way out: what they
-	 * staged stays readable to the caller (the fee, the inputs) until the next
-	 * call resets it, and nothing of it outlives the process (#1002).
-	 * @returns {Promise<Result<string>>}
-	 */
-	async clearStoredSendTransaction(): Promise<Result<string>> {
-		return await this._wallet.saveWalletData(
-			'transaction',
-			getDefaultSendTransaction()
-		);
-	}
-
-	/**
-	 * Writes the staged send to wallet storage without its signing keys.
-	 * @private
-	 * @returns {Promise<Result<string>>}
-	 */
-	private async _persist(): Promise<Result<string>> {
-		return await this._wallet.saveWalletData(
-			'transaction',
-			persistableTransaction(this._data)
-		);
 	}
 
 	/**
@@ -2013,8 +1961,6 @@ export class Transaction {
 				...transaction
 			};
 
-			void this._persist();
-
 			return ok('Transaction updated');
 		} catch (e) {
 			return err(e);
@@ -2603,7 +2549,7 @@ export class Transaction {
 			}
 			// A malformed output value must not become 0. amountToSend being falsy
 			// takes the consolidate branch below, which selects every UTXO in the
-			// wallet, and applyAutoCoinSelect persists that selection before
+			// wallet, and applyAutoCoinSelect stages that selection before
 			// validateTransaction ever sees the transaction. reduceValue tells a
 			// genuine 0, which legitimately means "spend everything", apart from
 			// non-numeric data, which does not.

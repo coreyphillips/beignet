@@ -11,6 +11,8 @@
  * #1011: sweepPrivateKey and addExternalInputs attach the signing key pair to
  * the staged inputs, and the storage adapters JSON-stringify the staged send,
  * so the swept private key was written to wallet storage.
+ *
+ * #1665: the staged send is no longer written to storage at all.
  */
 
 import { expect } from 'chai';
@@ -129,6 +131,12 @@ const storedTransaction = (
 	return JSON.parse(raw) as ISendTransaction;
 };
 
+/** Every write of the staged send so far, as the adapter saw it. */
+const stagedWrites = (json: IJsonStorage, name: string): string[] =>
+	json.history
+		.filter((entry) => entry.key === transactionKey(name))
+		.map((entry) => entry.value);
+
 /** Opens a wallet on the given storage, as a process start would. */
 const createWallet = async (
 	name: string,
@@ -242,22 +250,7 @@ const expectRecipientsAndChange = (
 	);
 };
 
-/** A stored input keeps every field but keyPair: nothing else is stripped. */
-const expectStoredInput = (stored: ISendTransaction, utxo: IUtxo): void => {
-	const input = stored.inputs.find((entry) => entry.tx_hash === utxo.tx_hash);
-	expect(input, `stored input ${utxo.tx_hash}`).to.not.equal(undefined);
-	expect(input).to.include({
-		tx_hash: utxo.tx_hash,
-		tx_pos: utxo.tx_pos,
-		value: utxo.value,
-		publicKey: utxo.publicKey,
-		path: utxo.path,
-		address: utxo.address
-	});
-	expect(input).to.not.have.property('keyPair');
-};
-
-/** Lets a write issued without await (updateSendTransaction) land. */
+/** Lets a write issued without await land before storage is read. */
 const settle = (): Promise<void> =>
 	new Promise((resolve) => setImmediate(resolve));
 
@@ -265,13 +258,14 @@ describe('Staged send replay after a restart (#1002)', function () {
 	this.timeout(testTimeout);
 
 	const NAME = 'stagedreplay';
-	let store: Map<string, string>;
+	let shared: IJsonStorage;
 	let storage: TStorage;
 	let wallet1: Wallet;
 	const wallets: Wallet[] = [];
 
 	before(function () {
-		({ store, storage } = makeJsonStorage());
+		shared = makeJsonStorage();
+		storage = shared.storage;
 	});
 
 	after(async function () {
@@ -316,10 +310,8 @@ describe('Staged send replay after a restart (#1002)', function () {
 		for (const stale of [RECIPIENT_A, RECIPIENT_B, RECIPIENT_C]) {
 			expect(paidTo(decoded, stale), `still paying ${stale}`).to.equal(0);
 		}
-		// Storage holds nothing of either send once the calls have returned.
-		expect(storedTransaction(store, NAME)).to.deep.equal(
-			getDefaultSendTransaction()
-		);
+		// Neither send wrote its staged send to storage.
+		expect(stagedWrites(shared, NAME)).to.deep.equal([]);
 	});
 
 	it('sendMax after the restart spends to its one recipient', async () => {
@@ -335,9 +327,7 @@ describe('Staged send replay after a restart (#1002)', function () {
 		const decoded = decode(wallet3, res.value);
 		expect(decoded.vout).to.have.length(1);
 		expect(decoded.vout[0].scriptPubKey.address).to.equal(RECIPIENT_E);
-		expect(storedTransaction(store, NAME)).to.deep.equal(
-			getDefaultSendTransaction()
-		);
+		expect(stagedWrites(shared, NAME)).to.deep.equal([]);
 	});
 
 	it('a later send in the same process carries only its own recipient', async () => {
@@ -351,9 +341,7 @@ describe('Staged send replay after a restart (#1002)', function () {
 		if (again.isErr()) throw again.error;
 		const decoded = decode(wallet1, again.value);
 		expectRecipientsAndChange(wallet1, decoded, { [RECIPIENT_D]: 25_000 });
-		expect(storedTransaction(store, NAME)).to.deep.equal(
-			getDefaultSendTransaction()
-		);
+		expect(stagedWrites(shared, NAME)).to.deep.equal([]);
 	});
 
 	it('a multi-recipient buildPsbt leaves nothing staged for the next call', async () => {
@@ -387,9 +375,7 @@ describe('Staged send replay after a restart (#1002)', function () {
 		if (send.isErr()) throw send.error;
 		const decoded = decode(reloaded, send.value);
 		expectRecipientsAndChange(reloaded, decoded, { [RECIPIENT_D]: 25_000 });
-		expect(storedTransaction(json.store, name)).to.deep.equal(
-			getDefaultSendTransaction()
-		);
+		expect(stagedWrites(json, name)).to.deep.equal([]);
 	});
 });
 
@@ -430,17 +416,12 @@ describe('Signing keys never reach wallet storage (#1011)', function () {
 		await wallet?.stop();
 	});
 
-	/** Every write of the staged send so far, as the adapter saw it. */
-	const stagedWrites = (): string[] =>
-		json.history
-			.filter((entry) => entry.key === transactionKey(NAME))
-			.map((entry) => entry.value);
-
-	const expectKeyFree = (writes: string[]): void => {
-		expect(writes.length, 'the staged send was written').to.be.greaterThan(0);
-		for (const text of writes) {
+	/** The staged send was never written, and no other write carries the key. */
+	const expectKeyFree = (): void => {
+		expect(stagedWrites(json, NAME), 'staged send writes').to.deep.equal([]);
+		for (const { key, value } of json.history) {
 			for (const secret of secrets) {
-				expect(text, `storage carries ${secret.slice(0, 12)}`).to.not.include(
+				expect(value, `${key} carries ${secret.slice(0, 12)}`).to.not.include(
 					secret
 				);
 			}
@@ -466,16 +447,15 @@ describe('Signing keys never reach wallet storage (#1011)', function () {
 		if (added.isErr()) throw added.error;
 		await settle();
 
-		expectKeyFree(stagedWrites());
-		// Only keyPair is stripped: both inputs keep their other fields.
-		const stored = storedTransaction(json.store, NAME);
-		expectStoredInput(stored, external);
-		expectStoredInput(stored, walletUtxo);
-		// The live copy still carries the key pair, which is what signs.
+		expectKeyFree();
+		// The live copy carries the key pair, which is what signs.
 		const live = wallet.transaction.data.inputs.find(
 			(input) => input.tx_hash === TXID_EXTERNAL
 		);
 		expect(live?.keyPair).to.equal(keyPair);
+		expect(
+			wallet.transaction.data.inputs.map((input) => input.tx_hash)
+		).to.include(walletUtxo.tx_hash);
 
 		const fee = wallet.transaction.updateFee({ satsPerByte: 2 });
 		if (fee.isErr()) throw fee.error;
@@ -487,7 +467,8 @@ describe('Signing keys never reach wallet storage (#1011)', function () {
 			expect(vin.txinwitness, `input ${vin.txid} is signed`).to.have.length(2);
 		}
 		expect(paidTo(decoded, RECIPIENT_D)).to.equal(70_000);
-		expectKeyFree(stagedWrites());
+		await settle();
+		expectKeyFree();
 		await wallet.resetSendTransaction();
 	});
 
@@ -498,7 +479,6 @@ describe('Signing keys never reach wallet storage (#1011)', function () {
 			.resolves(
 				ok({ balance: 50_000, utxos: [swept], keyPair, addresses: [] })
 			);
-		const writesBefore = stagedWrites().length;
 
 		const res = await wallet.sweepPrivateKey({
 			privateKey: wif,
@@ -519,20 +499,9 @@ describe('Signing keys never reach wallet storage (#1011)', function () {
 		expect(res.value.balance).to.equal(50_000);
 
 		// No write during the sweep carried the key, in any form.
-		const writes = stagedWrites().slice(writesBefore);
-		expectKeyFree(writes);
-		// The stripped writes keep every other field of the swept input.
-		const stagedSweep = writes
-			.map((text) => JSON.parse(text) as ISendTransaction)
-			.find((staged) =>
-				staged.inputs.some((input) => input.tx_hash === TXID_SWEPT)
-			);
-		expect(stagedSweep, 'a write with the swept input').to.not.equal(undefined);
-		expectStoredInput(stagedSweep as ISendTransaction, swept);
-		// Nothing of the sweep is left, in storage or in the live copy.
-		expect(storedTransaction(json.store, NAME)).to.deep.equal(
-			getDefaultSendTransaction()
-		);
+		await settle();
+		expectKeyFree();
+		// Nothing of the sweep is left in the live copy.
 		expect(wallet.transaction.data.inputs).to.have.length(0);
 		expect(wallet.transaction.data.outputs).to.have.length(0);
 	});
@@ -615,6 +584,70 @@ describe('A no-arg fee quote leaves the staged send alone (#1367)', function () 
 });
 
 /**
+ * #1665: every change to the staged send wrote all of it to storage, one
+ * unawaited write per recipient among them, though nothing reads it back.
+ */
+describe('The staged send is never written to storage (#1665)', function () {
+	this.timeout(testTimeout);
+
+	const NAME = 'stagednowrite';
+	let wallet: Wallet;
+	let json: IJsonStorage;
+
+	before(async function () {
+		json = makeJsonStorage();
+		wallet = await createWallet(NAME, json.storage);
+		injectUtxo(wallet, TXID_A, 300_000);
+		injectUtxo(wallet, TXID_B, 300_000);
+	});
+
+	after(async function () {
+		await wallet?.stop();
+	});
+
+	it('a three-recipient sendMany writes nothing to the transaction key', async () => {
+		const sent = await wallet.sendMany({
+			txs: [
+				{ address: RECIPIENT_A, amount: 20_000 },
+				{ address: RECIPIENT_B, amount: 30_000 },
+				{ address: RECIPIENT_C, amount: 40_000 }
+			],
+			satsPerByte: 2,
+			broadcast: false
+		});
+		if (sent.isErr()) throw sent.error;
+		await settle();
+
+		expect(stagedWrites(json, NAME)).to.deep.equal([]);
+		// The live copy is still staged, readable until the next call.
+		expect(
+			wallet.transaction.data.outputs.map((output) => output.address)
+		).to.include.members([RECIPIENT_A, RECIPIENT_B, RECIPIENT_C]);
+	});
+
+	it('staging, pricing, building and resetting directly write nothing either', async () => {
+		const setup = await wallet.transaction.setupTransaction({ satsPerByte: 2 });
+		if (setup.isErr()) throw setup.error;
+		const updated = wallet.transaction.updateSendTransaction({
+			transaction: {
+				outputs: [{ address: RECIPIENT_D, value: 25_000, index: 0 }]
+			}
+		});
+		if (updated.isErr()) throw updated.error;
+		const fee = wallet.transaction.updateFee({ satsPerByte: 2 });
+		if (fee.isErr()) throw fee.error;
+		const created = await wallet.transaction.createTransaction({
+			runCoinSelect: true
+		});
+		if (created.isErr()) throw created.error;
+		await wallet.resetSendTransaction();
+		await settle();
+
+		expect(stagedWrites(json, NAME)).to.deep.equal([]);
+	});
+});
+
+/**
  * Upgrade path: a wallet that ran 0.22.0 or earlier may hold a staged send in
  * storage with recipients and, after a key sweep, the key pair written the
  * way JSON.stringify renders an ECPair. It is dropped at boot, never read.
@@ -647,11 +680,6 @@ describe('A stored staged send from an older version is scrubbed at boot', funct
 		wallets.push(res.value);
 		return res.value;
 	};
-
-	const stagedWrites = (json: IJsonStorage, name: string): string[] =>
-		json.history
-			.filter((entry) => entry.key === transactionKey(name))
-			.map((entry) => entry.value);
 
 	it('drops a dirty blob with one write, and the next send pays only its recipient', async () => {
 		const name = 'stagedlegacy';
