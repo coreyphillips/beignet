@@ -8,7 +8,10 @@
 import { IrohDaemonConfig, validateIrohConfig } from './iroh-config';
 import {
 	ElectrumTlsConfig,
+	checkElectrumTls,
+	claimElectrumTls,
 	electrumTlsModule,
+	releaseElectrumTls,
 	validateElectrumTlsConfig
 } from './electrum-tls-config';
 import { createNodeIrohEndpoint } from '../lightning/transport/iroh-node';
@@ -2365,6 +2368,13 @@ export class BeignetNode extends EventEmitter {
 		}
 		const mnemonic = opts.mnemonic || generateMnemonic();
 		const networkName = opts.network;
+		// Before the lock and the database, so a node refused for another
+		// node's Electrum TLS setting leaves nothing held. initNode claims it.
+		try {
+			checkElectrumTls(networkName, opts);
+		} catch (err) {
+			throw new BeignetError('INVALID_PARAMS', (err as Error).message);
+		}
 		// Namespace the default storage per-wallet so different mnemonics never
 		// share a database (which would load another seed's channels/identity).
 		// An explicit dataDir is respected as-is (one wallet per dataDir).
@@ -2713,10 +2723,30 @@ export class BeignetNode extends EventEmitter {
 		// wallet opens, the public fallback peers included, and keeps the
 		// configured name for the check when the pin above replaced it.
 		const walletTls = electrumTlsModule(opts, electrumHost, rawElectrumHost);
+		// Every node in this process shares the network's Electrum connection,
+		// so one with another setting would make this one's moot. create()
+		// already checked; the claim also refuses a node that raced it there.
+		// Released once the wallet has stopped, or now if it never existed.
+		try {
+			claimElectrumTls(this, networkName, opts);
+		} catch (err) {
+			throw new BeignetError('INVALID_PARAMS', (err as Error).message);
+		}
 		if (opts.electrumTlsVerify === true) {
+			const pinnedFingerprints = opts.electrumTlsFingerprints?.length ?? 0;
 			this.log('info', 'Verifying Electrum TLS certificates', {
-				pinnedFingerprints: opts.electrumTlsFingerprints?.length ?? 0
+				pinnedFingerprints
 			});
+			// Not refused: verification still covers the TLS fallback peers.
+			if (!electrumTls) {
+				this.log(
+					'warn',
+					'The configured Electrum server is plain TCP, so its certificate is ' +
+						'never checked and pinned fingerprints are not used for it; only ' +
+						'the TLS fallback servers are verified',
+					{ host: rawElectrumHost, port: electrumPort, pinnedFingerprints }
+				);
+			}
 		}
 
 		// 1. Map network name to beignet types
@@ -2779,6 +2809,7 @@ export class BeignetNode extends EventEmitter {
 			storage: createWalletStorage(this.storage)
 		});
 		if (walletResult.isErr()) {
+			releaseElectrumTls(this);
 			throw new BeignetError(
 				'WALLET_CREATE_FAILED',
 				walletResult.error.message
@@ -15358,7 +15389,10 @@ export class BeignetNode extends EventEmitter {
 		this._nodeStorageView?.close();
 		this.removeAllListeners();
 		try {
-			await (this.wallet as Wallet | undefined)?.stop();
+			const stopped = await (this.wallet as Wallet | undefined)?.stop();
+			// A wallet whose Electrum client did not stop may still hold the
+			// shared connection, so its claim on the TLS setting stays.
+			if (!stopped?.isErr()) releaseElectrumTls(this);
 		} catch {
 			// Ignore shutdown errors
 		}

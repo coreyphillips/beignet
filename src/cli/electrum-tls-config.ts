@@ -1,6 +1,9 @@
 import * as tls from 'tls';
 import { Tls } from '../types/electrum';
-import { withTlsVerification } from '../utils/tls-verification';
+import {
+	normalizeFingerprint,
+	withTlsVerification
+} from '../utils/tls-verification';
 
 /**
  * Electrum TLS certificate verification for the daemon (issue #1776). Off by
@@ -94,4 +97,69 @@ export function electrumTlsModule(
 		servernames:
 			dialedHost !== configuredHost ? { [dialedHost]: configuredHost } : {}
 	});
+}
+
+/**
+ * The Electrum TLS setting of every node holding a wallet, by network.
+ *
+ * rn-electrum-client keeps one client per network for the whole process, and
+ * every wallet on that network sends its requests over it, whichever wallet
+ * dialed it. A node that verifies would otherwise ride a socket a sibling
+ * opened without checking the certificate, or with other pins, and a sibling
+ * that reconnects later would swap such a socket in under it. Nodes on one
+ * network therefore have to agree (issue #1776).
+ */
+const electrumTlsClaims = new Map<string, Map<object, string>>();
+
+/** One string per accepted certificate set, however the pins are written. */
+function electrumTlsPolicy(config: ElectrumTlsConfig): string {
+	if (config.electrumTlsVerify !== true) return 'off';
+	const pins = new Set(
+		(config.electrumTlsFingerprints ?? []).map(normalizeFingerprint)
+	);
+	return ['verify', ...[...pins].sort()].join(' ');
+}
+
+/**
+ * Refuses `config` on `network` when a holder other than `holder` claimed a
+ * different setting there. Without a holder, every claim counts: the check a
+ * node runs before it takes its lock and opens its database, so a refused
+ * node leaves nothing held.
+ */
+export function checkElectrumTls(
+	network: string,
+	config: ElectrumTlsConfig,
+	holder?: object
+): void {
+	const policy = electrumTlsPolicy(config);
+	for (const [other, otherPolicy] of electrumTlsClaims.get(network) ?? []) {
+		if (other !== holder && otherPolicy !== policy) {
+			throw new Error(
+				`Another node in this process uses ${network} Electrum with a different electrumTlsVerify or electrumTlsFingerprints. Nodes on one network share a single Electrum connection, so they must use the same settings.`
+			);
+		}
+	}
+}
+
+/**
+ * Records `holder`'s setting on `network`, refusing it as checkElectrumTls
+ * does. A holder claiming again replaces its own entry.
+ */
+export function claimElectrumTls(
+	holder: object,
+	network: string,
+	config: ElectrumTlsConfig
+): void {
+	checkElectrumTls(network, config, holder);
+	const claims = electrumTlsClaims.get(network) ?? new Map<object, string>();
+	claims.set(holder, electrumTlsPolicy(config));
+	electrumTlsClaims.set(network, claims);
+}
+
+/** Drops `holder`'s claim on every network. Safe to call more than once. */
+export function releaseElectrumTls(holder: object): void {
+	for (const [network, claims] of electrumTlsClaims) {
+		claims.delete(holder);
+		if (!claims.size) electrumTlsClaims.delete(network);
+	}
 }

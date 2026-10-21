@@ -2254,7 +2254,15 @@ name, or one whose SHA-256 fingerprint is listed in
 `openssl x509 -noout -fingerprint -sha256`). The check covers the public
 fallback servers too, and a host the daemon pins to IPv4 before dialing is
 still checked against the name you configured. Fingerprints without
-verification refuse startup rather than being ignored.
+verification refuse startup rather than being ignored. With
+`BEIGNET_ELECTRUM_TLS=false` the configured server is plain TCP and is never
+checked, so only the TLS fallback servers are verified; the daemon starts
+anyway and logs a warning saying so.
+
+Nodes created in one process (`BeignetNode.create`) share a single Electrum
+connection per network, so they must use the same `electrumTlsVerify` and
+`electrumTlsFingerprints`. A node whose settings differ from those of a node
+already running on the same network is refused with `INVALID_PARAMS`.
 
 Turn it on together with your own server. As of October 2026 none of the
 built-in mainnet servers passes: `fulcrum.bitkit.blocktank.to` serves an

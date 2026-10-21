@@ -20,6 +20,11 @@ import { BeignetNode } from '../../src/cli/beignet-node';
 import { resolveConfig, saveConfig } from '../../src/cli/config';
 import { startDaemon } from '../../src/cli/daemon';
 import { daemonOptions } from '../../src/cli/daemon-options';
+import {
+	checkElectrumTls,
+	claimElectrumTls,
+	releaseElectrumTls
+} from '../../src/cli/electrum-tls-config';
 import { BeignetError } from '../../src/cli/errors';
 
 const MNEMONIC =
@@ -115,6 +120,69 @@ describe('resolveConfig electrumTlsVerify and electrumTlsFingerprints', () => {
 	});
 });
 
+describe('claimElectrumTls', () => {
+	// Network names no real node uses, so a node another test file left
+	// running in this worker cannot hold a claim on them.
+	const NET = 'claim-test-net';
+	const OTHER_NET = 'claim-test-other-net';
+	const VERIFY = { electrumTlsVerify: true };
+	const PINNED = { electrumTlsVerify: true, electrumTlsFingerprints: [PIN] };
+	const DIFFERENT = /different electrumTlsVerify or electrumTlsFingerprints/;
+	const a = {};
+	const b = {};
+
+	afterEach(() => {
+		releaseElectrumTls(a);
+		releaseElectrumTls(b);
+	});
+
+	it('refuses a second holder with another setting on the same network', () => {
+		claimElectrumTls(a, NET, {});
+		expect(() => claimElectrumTls(b, NET, VERIFY)).to.throw(DIFFERENT);
+		expect(() => checkElectrumTls(NET, PINNED)).to.throw(DIFFERENT);
+		releaseElectrumTls(a);
+
+		claimElectrumTls(a, NET, PINNED);
+		expect(() => claimElectrumTls(b, NET, VERIFY)).to.throw(DIFFERENT);
+		expect(() => claimElectrumTls(b, NET, {})).to.throw(DIFFERENT);
+	});
+
+	it('accepts the same setting, however the pins are written', () => {
+		claimElectrumTls(a, NET, { electrumTlsVerify: false });
+		claimElectrumTls(b, NET, {});
+		releaseElectrumTls(a);
+		releaseElectrumTls(b);
+
+		const other = 'cd'.repeat(32);
+		claimElectrumTls(a, NET, {
+			electrumTlsVerify: true,
+			electrumTlsFingerprints: [PIN, other]
+		});
+		claimElectrumTls(b, NET, {
+			electrumTlsVerify: true,
+			electrumTlsFingerprints: [
+				other.toUpperCase(),
+				PIN.match(/../g)!.join(':'),
+				PIN
+			]
+		});
+	});
+
+	it('keeps networks apart', () => {
+		claimElectrumTls(a, NET, {});
+		claimElectrumTls(b, OTHER_NET, PINNED);
+	});
+
+	it('lets a holder claim again, and frees the network once it releases', () => {
+		claimElectrumTls(a, NET, {});
+		claimElectrumTls(a, NET, PINNED);
+		expect(() => claimElectrumTls(b, NET, {})).to.throw(DIFFERENT);
+		releaseElectrumTls(a);
+		releaseElectrumTls(a);
+		claimElectrumTls(b, NET, {});
+	});
+});
+
 describe('electrumTlsVerify at startup', function () {
 	this.timeout(60_000);
 
@@ -171,6 +239,36 @@ describe('electrumTlsVerify at startup', function () {
 			{ electrumTlsVerify: 'yes' },
 			/electrumTlsVerify must be a boolean/
 		);
+	});
+
+	it('warns, rather than refuses, when the configured server is plain TCP', async () => {
+		// Verification still covers the TLS fallback servers, so this is not
+		// an error, but the pin is never used for the configured server.
+		const warnings: string[] = [];
+		const ignore = (): void => undefined;
+		const node = await BeignetNode.create({
+			...OFFLINE,
+			mnemonic: MNEMONIC,
+			dataDir: dir,
+			electrumTlsVerify: true,
+			electrumTlsFingerprints: [PIN],
+			logLevel: 'warn',
+			logger: {
+				debug: ignore,
+				info: ignore,
+				warn: (message: string) => warnings.push(message),
+				error: ignore
+			}
+		});
+		await node.destroy();
+		expect(
+			warnings.some((w) =>
+				/configured Electrum server is plain TCP, so its certificate is never checked/.test(
+					w
+				)
+			),
+			warnings.join('\n')
+		).to.equal(true);
 	});
 
 	describe('against a self-signed Electrum server', () => {
@@ -244,29 +342,46 @@ describe('electrumTlsVerify at startup', function () {
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 		});
 
-		const boot = async (opts: Record<string, unknown>): Promise<void> => {
+		const create = (
+			opts: Record<string, unknown>,
+			dataDir = dir
+		): Promise<BeignetNode> =>
 			// "localhost" so the daemon pins it to 127.0.0.1 before dialing,
 			// which is the case the configured name has to survive.
-			const node = await BeignetNode.create({
+			BeignetNode.create({
 				...OFFLINE,
 				mnemonic: MNEMONIC,
-				dataDir: dir,
+				dataDir,
 				electrumHost: 'localhost',
 				electrumPort: port,
 				electrumTls: true,
 				...opts
 			});
+
+		/** Waits for a dial past `before`, then for the request that follows. */
+		const settle = async (before: number): Promise<void> => {
+			const deadline = Date.now() + 10_000;
+			while (dials === before && Date.now() < deadline) {
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+			// A request, when one comes, follows the handshake at once.
+			await new Promise((resolve) => setTimeout(resolve, 200));
+		};
+
+		const boot = async (
+			opts: Record<string, unknown>,
+			dataDir = dir
+		): Promise<void> => {
+			const before = dials;
+			const node = await create(opts, dataDir);
 			try {
-				const deadline = Date.now() + 10_000;
-				while (dials === 0 && Date.now() < deadline) {
-					await new Promise((resolve) => setTimeout(resolve, 50));
-				}
-				// A request, when one comes, follows the handshake at once.
-				await new Promise((resolve) => setTimeout(resolve, 200));
+				await settle(before);
 			} finally {
 				await node.destroy();
 			}
 		};
+
+		const requests = (): number => seen.filter((s) => s.requested).length;
 
 		it('accepts the certificate unchecked when verification is off (the default)', async () => {
 			await boot({});
@@ -288,6 +403,55 @@ describe('electrumTlsVerify at startup', function () {
 			// Without the mapping the dial goes to 127.0.0.1 with no SNI at
 			// all, and a CA-issued certificate for the name would never match.
 			expect(seen.map((s) => s.servername)).to.include('localhost');
+		});
+
+		it('refuses a node whose setting differs from a running node on the network, in either order', async () => {
+			// rn-electrum-client shares one client per network across the
+			// process, so the second node would otherwise send its requests
+			// over the first one's socket without checking it (or, the other
+			// way round, have it swapped for an unchecked one).
+			const otherDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), 'beignet-tls-verify-boot-')
+			);
+			const pinned = {
+				electrumTlsVerify: true,
+				electrumTlsFingerprints: [fingerprint]
+			};
+			try {
+				for (const [first, second] of [
+					[{}, pinned],
+					[pinned, {}]
+				]) {
+					const before = dials;
+					const running = await create(first);
+					try {
+						await settle(before);
+						let error: unknown;
+						try {
+							await (await create(second, otherDir)).destroy();
+						} catch (e) {
+							error = e;
+						}
+						expect(
+							error,
+							'expected the second node to be refused'
+						).to.be.instanceOf(BeignetError);
+						expect((error as BeignetError).code).to.equal('INVALID_PARAMS');
+						expect((error as Error).message).to.match(
+							/different electrumTlsVerify or electrumTlsFingerprints/
+						);
+					} finally {
+						await running.destroy();
+					}
+					// The refusal held nothing: once the first node is gone the
+					// same data directory boots with the other setting.
+					const sent = requests();
+					await boot(second, otherDir);
+					expect(requests()).to.be.greaterThan(sent);
+				}
+			} finally {
+				fs.rmSync(otherDir, { recursive: true, force: true });
+			}
 		});
 	});
 });
