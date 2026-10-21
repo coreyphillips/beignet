@@ -16,6 +16,7 @@ import {
 	IChannelUpdateMessage,
 	INodeAnnouncementMessage,
 	IGraphChannel,
+	IGraphEdge,
 	IGraphNode,
 	TGossipVerified,
 	CHANNEL_FLAG_DIRECTION,
@@ -161,6 +162,17 @@ export class NetworkGraph {
 	static MAX_CHANNELS = 100_000;
 
 	private _channels: Map<string, IGraphChannel> = new Map();
+	/**
+	 * Every held channel as a routing edge, keyed by scidHex. Invariant: the
+	 * same keys as _channels, each edge wrapping the channel object _channels
+	 * holds; every site that writes _channels writes this too.
+	 */
+	private _edges: Map<string, IGraphEdge> = new Map();
+	/**
+	 * One hex key per node with channels, so every edge at a node shares a
+	 * single string rather than holding its own 66-character copy.
+	 */
+	private _nodeKeys: Map<string, string> = new Map();
 	/**
 	 * scidHex of every held channel whose announcement is not settled
 	 * verified: the first eviction candidates, indexed so admission at the
@@ -314,6 +326,30 @@ export class NetworkGraph {
 		}
 		this._onChannelEvicted?.(victim.value);
 		return true;
+	}
+
+	/** Store a channel in _channels and _edges together. */
+	private _setChannel(
+		scidHex: string,
+		channel: IGraphChannel,
+		node1Hex: string,
+		node2Hex: string
+	): void {
+		this._channels.set(scidHex, channel);
+		this._edges.set(scidHex, {
+			channel,
+			scidHex,
+			node1Hex: this._nodeKey(node1Hex),
+			node2Hex: this._nodeKey(node2Hex)
+		});
+	}
+
+	/** The shared instance of a node's hex key (see _nodeKeys). */
+	private _nodeKey(nodeHex: string): string {
+		const key = this._nodeKeys.get(nodeHex);
+		if (key !== undefined) return key;
+		this._nodeKeys.set(nodeHex, nodeHex);
+		return nodeHex;
 	}
 
 	getChannelCount(): number {
@@ -473,7 +509,7 @@ export class NetworkGraph {
 			announcementVerified: pair.verified,
 			announcementVerifyDeferred: pair.deferred
 		};
-		this._channels.set(scidHex, channel);
+		this._setChannel(scidHex, channel, node1Hex, node2Hex);
 		this._syncUnverifiedIndex(scidHex, channel);
 
 		// Ensure node entries exist and link channel
@@ -800,6 +836,22 @@ export class NetworkGraph {
 	}
 
 	/**
+	 * The channels at a node as routing edges, in getNodeChannels order. A
+	 * route search calls this for every node it settles, so it takes the
+	 * node's hex key and derives nothing per channel.
+	 */
+	getNodeEdges(nodeIdHex: string): IGraphEdge[] {
+		const node = this._nodes.get(nodeIdHex);
+		if (!node) return [];
+		const result: IGraphEdge[] = [];
+		for (const scidHex of node.channels) {
+			const edge = this._edges.get(scidHex);
+			if (edge) result.push(edge);
+		}
+		return result;
+	}
+
+	/**
 	 * Remove a channel and clean up orphaned nodes.
 	 */
 	removeChannel(shortChannelId: Buffer): boolean {
@@ -808,6 +860,7 @@ export class NetworkGraph {
 		if (!channel) return false;
 
 		this._channels.delete(scidHex);
+		this._edges.delete(scidHex);
 		this._unverifiedChannels.delete(scidHex);
 		this._unfundedChannels.delete(scidHex);
 
@@ -822,6 +875,7 @@ export class NetworkGraph {
 			node1.channels.delete(scidHex);
 			if (node1.channels.size === 0) {
 				this._nodes.delete(node1Hex);
+				this._nodeKeys.delete(node1Hex);
 				evictedNodes.push(node1Hex);
 			}
 		}
@@ -831,6 +885,7 @@ export class NetworkGraph {
 			node2.channels.delete(scidHex);
 			if (node2.channels.size === 0) {
 				this._nodes.delete(node2Hex);
+				this._nodeKeys.delete(node2Hex);
 				evictedNodes.push(node2Hex);
 			}
 		}
@@ -1012,13 +1067,12 @@ export class NetworkGraph {
 			}
 		}
 
-		this._channels.set(scidHex, channel);
+		const node1Hex = channel.nodeId1.toString('hex');
+		const node2Hex = channel.nodeId2.toString('hex');
+		this._setChannel(scidHex, channel, node1Hex, node2Hex);
 		this._syncUnverifiedIndex(scidHex, channel);
 
 		// Ensure node entries exist and link channel
-		const node1Hex = channel.nodeId1.toString('hex');
-		const node2Hex = channel.nodeId2.toString('hex');
-
 		if (!this._nodes.has(node1Hex)) {
 			this._nodes.set(node1Hex, {
 				nodeId: Buffer.from(channel.nodeId1),
@@ -1087,6 +1141,22 @@ export class NetworkGraph {
 	 */
 	getAllChannels(): IGraphChannel[] {
 		return [...this._channels.values()];
+	}
+
+	/**
+	 * Up to `limit` channels from position `offset` (at least 0) of the
+	 * getAllChannels order, without copying the rest of the graph.
+	 */
+	getChannelPage(offset: number, limit: number): IGraphChannel[] {
+		const page: IGraphChannel[] = [];
+		if (limit <= 0) return page;
+		let index = 0;
+		for (const channel of this._channels.values()) {
+			if (index++ < offset) continue;
+			page.push(channel);
+			if (page.length === limit) break;
+		}
+		return page;
 	}
 
 	/**

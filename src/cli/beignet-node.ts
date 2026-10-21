@@ -13858,13 +13858,13 @@ export class BeignetNode extends EventEmitter {
 			GRAPH_DESCRIBE_MAX_LIMIT
 		);
 		const safeOffset = Math.max(0, Math.floor(offset ?? 0));
-		const all = this.node.getGraph().getAllChannels();
+		const graph = this.node.getGraph();
 		return {
-			totalChannels: all.length,
+			totalChannels: graph.getChannelCount(),
 			limit: cappedLimit,
 			offset: safeOffset,
-			channels: all
-				.slice(safeOffset, safeOffset + cappedLimit)
+			channels: graph
+				.getChannelPage(safeOffset, cappedLimit)
 				.map((ch) => this.toGraphChannelInfo(ch))
 		};
 	}

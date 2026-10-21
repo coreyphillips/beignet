@@ -225,6 +225,18 @@ export interface IGraphChannel {
 	fundingVerified?: boolean;
 }
 
+/**
+ * A channel as pathfinding sees it: the channel plus the hex keys a route
+ * search compares on every edge it relaxes, derived once when the channel
+ * enters the graph. Held in memory only, never persisted.
+ */
+export interface IGraphEdge {
+	readonly channel: IGraphChannel;
+	readonly scidHex: string;
+	readonly node1Hex: string;
+	readonly node2Hex: string;
+}
+
 export interface IGraphNode {
 	nodeId: Buffer;
 	announcement?: INodeAnnouncementMessage;
