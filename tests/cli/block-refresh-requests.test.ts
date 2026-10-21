@@ -27,6 +27,7 @@ import {
 	TTxDetails,
 	Wallet
 } from '../../src';
+import { ElectrumBackend } from '../../src/lightning/chain/electrum-backend';
 
 // The raw module.exports object, which src/electrum reads live (see
 // broadcast-spent-utxos.test.ts).
@@ -616,6 +617,31 @@ describe('block notification refresh requests (#1663)', function () {
 			const issued = await issuePastGenerated();
 			expect(paid.get(issued.scriptHash)).to.equal(txid);
 
+			await block(102);
+
+			expect(wallet.data.utxos.map((u) => u.tx_hash)).to.deep.equal([txid]);
+		} finally {
+			await other.stop();
+		}
+	});
+
+	it('still refreshes for a window address after a chain watch on it is dropped', async function () {
+		await block(101);
+		const other = await createWallet();
+		try {
+			const connected = await other.connectToElectrum();
+			if (connected.isErr()) throw connected.error;
+			const refreshed = await other.refreshWallet();
+			if (refreshed.isErr()) throw refreshed.error;
+			const receive = wallet.data.addressIndex[EAddressType.p2wpkh];
+			const backend = new ElectrumBackend(wallet.electrum);
+			await backend.subscribeToScriptHash(receive.scriptHash, () => {});
+			backend.unsubscribeScriptHash(receive.scriptHash);
+			const txid = 'ad'.repeat(32);
+			pay(receive, txid, 0);
+
+			await notify(receive.scriptHash);
+			await settled();
 			await block(102);
 
 			expect(wallet.data.utxos.map((u) => u.tx_hash)).to.deep.equal([txid]);

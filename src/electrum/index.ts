@@ -107,6 +107,10 @@ type TScriptHashSubscription = {
 	/** Address index of a UTXO tracked beyond the gap limit; that index is
 	 *  rescanned before the wallet refresh on notification. */
 	utxoIndex?: number;
+	/** Set when the hash is in the wallet's own gap windows. A block does not
+	 *  refresh for these (see _onNewBlock), so the record outlives any
+	 *  callback detached from it. */
+	inWindow?: boolean;
 	/** The status this instance heard before disconnect() withdrew it, kept
 	 *  when a sibling held the hash meanwhile: the router's status may already
 	 *  reflect a change only the sibling was refreshed for. */
@@ -2542,7 +2546,11 @@ export class Electrum {
 		}
 		const removed = sub.callbacks.delete(onReceive);
 		sub.unconfirmedCallbacks?.delete(onReceive);
-		if (sub.callbacks.size === 0 && sub.utxoIndex === undefined) {
+		if (
+			sub.callbacks.size === 0 &&
+			sub.utxoIndex === undefined &&
+			!sub.inWindow
+		) {
 			subs.delete(this);
 			if (subs.size === 0) {
 				router.subscriptions.delete(scriptHash);
@@ -2648,7 +2656,8 @@ export class Electrum {
 		// scripthashes were provided. These are the windows a refresh scans, so a
 		// status notification is the only signal a new block needs: see
 		// _onNewBlock.
-		if (!scriptHashes.length) {
+		const inWindow = !scriptHashes.length;
+		if (inWindow) {
 			const chains = [
 				{
 					addresses: currentWallet.addresses,
@@ -2700,6 +2709,7 @@ export class Electrum {
 		const allScriptHashesPromises = scriptHashes.map(async (scriptHash) => {
 			const created = !router.subscriptions.get(scriptHash)?.has(this);
 			const sub = this._scriptHashRecord(scriptHash);
+			if (inWindow) sub.inWindow = true;
 			const unconfirmed = onReceive
 				? this.addScriptHashCallback(sub, onReceive, created)
 				: undefined;
