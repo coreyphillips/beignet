@@ -6538,6 +6538,19 @@ export class Wallet {
 			})
 		);
 		const { vins, vouts } = insAndOuts[0];
+		// Every parent in one lookup rather than a round trip per input. Answers
+		// are keyed by the txid Electrum tags them with.
+		const parentsRes = await this.electrum.getTransactions({
+			txHashes: [
+				...new Set(vins.flatMap((vin) => ('txid' in vin ? [vin.txid] : [])))
+			].map((tx_hash) => ({ tx_hash }))
+		});
+		if (parentsRes.isErr()) {
+			return err(parentsRes.error.message);
+		}
+		const parents = new Map(
+			parentsRes.value.data.map(({ data, result }) => [data?.tx_hash, result])
+		);
 		// The original fee is read from the inputs rebuilt here, and the
 		// replacement spends only those. An input this wallet cannot sign is
 		// refused, because skipping it would understate that fee.
@@ -6551,14 +6564,10 @@ export class Wallet {
 				if (!('txid' in input)) {
 					return err('Cannot rebuild a coinbase transaction.');
 				}
-				const txId = input.txid;
-				const tx = await this.electrum.getTransactions({
-					txHashes: [{ tx_hash: txId }]
-				});
-				if (tx.isErr()) {
-					return err(tx.error.message);
+				const txVout = parents.get(input.txid)?.vout?.[input.vout];
+				if (!txVout) {
+					return err('Failed to get input value. Unable to RBF.');
 				}
-				const txVout = tx.value.data[0].result.vout[input.vout];
 				if (txVout.scriptPubKey?.address) {
 					address = txVout.scriptPubKey.address;
 				} else if (

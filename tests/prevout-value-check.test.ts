@@ -116,10 +116,17 @@ const fund = async ({
 	};
 	wallet.data.utxos = [utxo];
 	const electrum = wallet.electrum as unknown as {
-		getTransactions: () => Promise<unknown>;
+		getTransactions: (args: {
+			txHashes: { tx_hash: string }[];
+		}) => Promise<unknown>;
 	};
-	electrum.getTransactions = async (): Promise<unknown> =>
-		ok({ data: [{ result: { hex: servedTx.toHex() } }] });
+	electrum.getTransactions = async ({ txHashes }): Promise<unknown> =>
+		ok({
+			data: txHashes.map(({ tx_hash }) => ({
+				data: { tx_hash },
+				result: { hex: servedTx.toHex() }
+			}))
+		});
 };
 
 /** Stages and signs a send the way send() does, without broadcasting it. */

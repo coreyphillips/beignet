@@ -26,6 +26,9 @@ export interface IAddInput {
 	// wallet's cosigner set rather than a single key.
 	keyPair?: BIP32Interface | ECPairInterface;
 	input: IUtxo;
+	// Raw previous transactions by txid, fetched once for a whole build. When
+	// absent, addInput fetches this input's own.
+	prevTxs?: Result<Map<string, string>>;
 }
 
 export interface ITargets {

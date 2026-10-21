@@ -94,10 +94,17 @@ describe('Relayable segwit change (#1432)', function () {
 			publicKey: node.value.publicKey.toString('hex')
 		};
 		const electrum = wallet.electrum as unknown as {
-			getTransactions: () => Promise<unknown>;
+			getTransactions: (args: {
+				txHashes: { tx_hash: string }[];
+			}) => Promise<unknown>;
 		};
-		electrum.getTransactions = async (): Promise<unknown> =>
-			ok({ data: [{ result: { hex: prevTx.toHex() } }] });
+		electrum.getTransactions = async ({ txHashes }): Promise<unknown> =>
+			ok({
+				data: txHashes.map(({ tx_hash }) => ({
+					data: { tx_hash },
+					result: { hex: prevTx.toHex() }
+				}))
+			});
 	});
 
 	after(async () => {

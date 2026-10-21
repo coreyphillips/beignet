@@ -1255,6 +1255,7 @@ export class Transaction {
 
 		const root = bip32Interface;
 		const psbt = new bitcoin.Psbt({ network });
+		const prevTxs = await this.fetchPrevTxs(inputs);
 
 		//Add Inputs from inputs array
 		try {
@@ -1262,7 +1263,7 @@ export class Transaction {
 				if (this._wallet.isMultisig) {
 					// Multisig inputs are built from the sortedmulti script, not a
 					// single key pair (watch-only multisig has no derivable key).
-					const addRes = await this.addInput({ psbt, input });
+					const addRes = await this.addInput({ psbt, input, prevTxs });
 					if (addRes.isErr()) return err(addRes.error.message);
 					continue;
 				}
@@ -1285,7 +1286,8 @@ export class Transaction {
 				const addRes = await this.addInput({
 					psbt,
 					keyPair,
-					input
+					input,
+					prevTxs
 				});
 				if (addRes.isErr()) return err(addRes.error.message);
 			}
@@ -1563,7 +1565,40 @@ export class Transaction {
 	}
 
 	/**
-	 * Fetches the full previous transaction for a PSBT input, as a spreadable
+	 * Fetches the raw previous transaction of every input that attaches one
+	 * (all but p2tr) in one batched lookup rather than a round trip per input,
+	 * once per distinct parent. Answers are keyed by the txid Electrum tags
+	 * them with, since a batch may be answered in any order.
+	 * @param {IUtxo[]} inputs
+	 * @returns {Promise<Result<Map<string, string>>>} hex by txid
+	 * @private
+	 */
+	private async fetchPrevTxs(
+		inputs: IUtxo[]
+	): Promise<Result<Map<string, string>>> {
+		const txHashes = [
+			...new Set(
+				inputs
+					.filter(({ address }) => !isP2trPrefix(address))
+					.map(({ tx_hash }) => tx_hash)
+			)
+		].map((tx_hash) => ({ tx_hash }));
+		const hexes = new Map<string, string>();
+		if (!txHashes.length) return ok(hexes);
+		try {
+			const res = await this._wallet.electrum.getTransactions({ txHashes });
+			if (res.isErr()) return err(res.error.message);
+			for (const { data, result } of res.value.data) {
+				if (data?.tx_hash && result?.hex) hexes.set(data.tx_hash, result.hex);
+			}
+			return ok(hexes);
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Looks up the full previous transaction for a PSBT input, as a spreadable
 	 * { nonWitnessUtxo } field. Segwit v0 signers postdating CVE-2020-14199
 	 * (Ledger 2.x, Trezor >= 2.3.5) require non_witness_utxo alongside
 	 * witness_utxo to verify input amounts. Returns {} when the backend
@@ -1572,23 +1607,17 @@ export class Transaction {
 	 * contradicts the input (see checkPrevTx).
 	 * @param {IUtxo} input
 	 * @param {Buffer} script
-	 * @returns {Promise<Result<{ nonWitnessUtxo: Buffer } | Record<string, never>>>}
+	 * @param {Result<Map<string, string>>} prevTxs from fetchPrevTxs
+	 * @returns {Result<{ nonWitnessUtxo: Buffer } | Record<string, never>>}
 	 * @private
 	 */
-	private async nonWitnessUtxoField(
+	private nonWitnessUtxoField(
 		input: IUtxo,
-		script: Buffer
-	): Promise<Result<{ nonWitnessUtxo: Buffer } | Record<string, never>>> {
-		let hex: string | undefined;
-		try {
-			const transaction = await this._wallet.electrum.getTransactions({
-				txHashes: [{ tx_hash: input.tx_hash }]
-			});
-			if (transaction.isErr()) return ok({});
-			hex = transaction.value.data[0]?.result?.hex;
-		} catch {
-			return ok({});
-		}
+		script: Buffer,
+		prevTxs: Result<Map<string, string>>
+	): Result<{ nonWitnessUtxo: Buffer } | Record<string, never>> {
+		if (prevTxs.isErr()) return ok({});
+		const hex = prevTxs.value.get(input.tx_hash);
 		if (!hex) return ok({});
 		const prevTxRes = this.checkPrevTx({ hex, input, script });
 		if (prevTxRes.isErr()) return err(prevTxRes.error.message);
@@ -1642,7 +1671,8 @@ export class Transaction {
 	addInput = async ({
 		psbt,
 		keyPair,
-		input
+		input,
+		prevTxs
 	}: IAddInput): Promise<Result<string>> => {
 		try {
 			const network = getBitcoinJsNetwork(this._wallet.network);
@@ -1661,6 +1691,8 @@ export class Transaction {
 				keyPair = input.keyPair;
 			}
 
+			prevTxs = prevTxs ?? (await this.fetchPrevTxs([input]));
+
 			if (type === 'p2wsh') {
 				// Sorted-multisig input: the witnessScript comes from the wallet's
 				// multisig configuration, keyed by the input's BIP 48 path.
@@ -1672,7 +1704,7 @@ export class Transaction {
 						`Multisig script for path ${input.path} does not produce address ${input.address}.`
 					);
 				}
-				const prevTxRes = await this.nonWitnessUtxoField(input, output);
+				const prevTxRes = this.nonWitnessUtxoField(input, output, prevTxs);
 				if (prevTxRes.isErr()) return err(prevTxRes.error.message);
 				psbt.addInput({
 					hash: input.tx_hash,
@@ -1699,7 +1731,11 @@ export class Transaction {
 				if (!p2wpkh?.output) {
 					return err('p2wpkh.output is undefined.');
 				}
-				const prevTxRes = await this.nonWitnessUtxoField(input, p2wpkh.output);
+				const prevTxRes = this.nonWitnessUtxoField(
+					input,
+					p2wpkh.output,
+					prevTxs
+				);
 				if (prevTxRes.isErr()) return err(prevTxRes.error.message);
 				psbt.addInput({
 					hash: input.tx_hash,
@@ -1724,7 +1760,7 @@ export class Transaction {
 				if (!p2sh?.redeem) {
 					return err('p2sh.redeem.output is undefined.');
 				}
-				const prevTxRes = await this.nonWitnessUtxoField(input, p2sh.output);
+				const prevTxRes = this.nonWitnessUtxoField(input, p2sh.output, prevTxs);
 				if (prevTxRes.isErr()) return err(prevTxRes.error.message);
 				psbt.addInput({
 					hash: input.tx_hash,
@@ -1746,13 +1782,13 @@ export class Transaction {
 				if (!p2pkh?.output) {
 					return err('p2pkh.output is undefined.');
 				}
-				const transaction = await this._wallet.electrum.getTransactions({
-					txHashes: [{ tx_hash: input.tx_hash }]
-				});
-				if (transaction.isErr()) {
-					return err(transaction.error.message);
+				if (prevTxs.isErr()) return err(prevTxs.error.message);
+				const hex = prevTxs.value.get(input.tx_hash);
+				if (!hex) {
+					return err(
+						`Previous transaction for ${input.tx_hash}:${input.tx_pos} is unavailable.`
+					);
 				}
-				const hex = transaction.value.data[0].result.hex;
 				const prevTxRes = this.checkPrevTx({
 					hex,
 					input,
