@@ -13,10 +13,9 @@ const pkg = JSON.parse(
 );
 
 describe('package.json', () => {
-	it('should have engines.node >= 18', () => {
+	it('should ask engines.node for a Node.js release with the October 21, 2026 security fixes (issue #1773)', () => {
 		expect(pkg.engines).to.be.an('object');
-		expect(pkg.engines.node).to.be.a('string');
-		expect(pkg.engines.node).to.include('18');
+		expect(pkg.engines.node).to.equal('^22.23.4 || ^24.22.1 || >=26.12.1');
 	});
 
 	it('should have files array to limit publish size', () => {

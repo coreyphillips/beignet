@@ -587,6 +587,11 @@ describe('Retained peer prev_tx bytes (issue #1457)', () => {
 			return new WeakRef(kept.buffer);
 		}
 
+		/** Move Buffer.allocUnsafe on to a fresh pool slab. */
+		function rotateBufferPool(): void {
+			for (let i = 0; i < 16; i++) Buffer.allocUnsafe(Buffer.poolSize / 2 - 1);
+		}
+
 		/** A full collection, once this job's WeakRef targets are released. */
 		async function collectGarbage(): Promise<void> {
 			await new Promise((resolve) => setImmediate(resolve));
@@ -631,6 +636,11 @@ describe('Retained peer prev_tx bytes (issue #1457)', () => {
 			const victim = makeManager('victim-pooled', 0, {
 				verifyRemoteFundingInput: deferredVerifier(checks)
 			});
+			// The victim's basepoints came from the pool and it rightly keeps them.
+			// Node 24 pools in 64 KiB slabs rather than 8 KiB, so without a fresh
+			// slab the prev_txs below share one with those keys and it stays
+			// reachable whatever the session does (issue #1773).
+			rotateBufferPool();
 			const watched: Array<WeakRef<ArrayBufferLike>> = [];
 			for (let i = 0; i < 16; i++) {
 				const id = acceptV2(victim, PEER_A, `pooled-${i}`);
@@ -644,7 +654,7 @@ describe('Retained peer prev_tx bytes (issue #1457)', () => {
 			expect(victim.listChannels()).to.have.length(0);
 
 			// The active buffer pool itself keeps its current slab alive.
-			for (let i = 0; i < 16; i++) Buffer.allocUnsafe(Buffer.poolSize / 2 - 1);
+			rotateBufferPool();
 			await collectGarbage();
 			expect(
 				watched.filter((ref) => ref.deref() !== undefined),
