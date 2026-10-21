@@ -257,6 +257,8 @@ describe('Revoked HTLC snapshot store', function () {
 			(m) => m.type === 'channel_state'
 		);
 		expect(last?.type).to.equal('channel_state');
+		// Older readers accept versions 1 and 2 and would replace the history.
+		expect(frames[frames.length - 1].version).to.equal(3);
 		if (last?.type !== 'channel_state') return;
 		expect([...last.state.revokedHtlcSnapshots!.keys()]).to.deep.equal([
 			[...live.revokedHtlcSnapshots!.keys()].pop()
@@ -341,6 +343,86 @@ describe('Revoked HTLC snapshot store', function () {
 			).to.deep.equal(opener.getFullState().revokedHtlcSnapshots);
 		} finally {
 			storage.close();
+		}
+	});
+
+	it('writes the whole history into a store the state was not saved to', () => {
+		const stores: SqliteStorage[] = [];
+		const open = (): { storage: SqliteStorage; journal: RecoveryJournal } => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			stores.push(storage);
+			const journal = new RecoveryJournal(
+				storage,
+				Buffer.alloc(32, 1),
+				Buffer.from(PEER, 'hex'),
+				Buffer.alloc(32, 2)
+			);
+			return { storage, journal };
+		};
+		try {
+			const source = open();
+			const manager = new RecoveryManager(source.storage, {
+				journal: source.journal
+			});
+			const { opener, acceptor } = setupNormalChannels();
+			const channelId = opener.getChannelId()!.toString('hex');
+			offerHtlc(opener, acceptor, crypto.randomBytes(32));
+			expect(save(manager, channelId, opener.getFullState())).to.be.true;
+			for (let i = 0; i < 3; i++) {
+				exchangeCommitments(opener, acceptor);
+				expect(save(manager, channelId, opener.getFullState())).to.be.true;
+			}
+			const history = opener.getFullState().revokedHtlcSnapshots;
+			expect(history!.size).to.equal(3);
+			const holdsHistory = (storage: SqliteStorage): void => {
+				expect(
+					storage.loadChannel(channelId)!.state.revokedHtlcSnapshots
+				).to.deep.equal(history);
+			};
+
+			const copy = open().storage;
+			copy.saveChannel(
+				channelId,
+				source.storage.loadChannel(channelId)!.state,
+				PEER
+			);
+			holdsHistory(copy);
+
+			const frames = source.journal.loadVerifiedFrames();
+			for (let i = 0; i < 2; i++) {
+				const target = open().storage;
+				reconstructFromFrames(target, frames);
+				holdsHistory(target);
+			}
+
+			// The first commit bootstraps this journal, so the loaded state
+			// lands in a delta frame, which has to carry all of it.
+			const other = open();
+			const otherManager = new RecoveryManager(other.storage, {
+				journal: other.journal
+			});
+			expect(
+				otherManager.commit({
+					criticality: RecoveryCriticality.SafetyCritical,
+					mutations: [
+						{ type: 'channel_key_index', channelId, channelIndex: 1 }
+					],
+					outboundMessages: []
+				}).committed
+			).to.be.true;
+			expect(
+				save(
+					otherManager,
+					channelId,
+					source.storage.loadChannel(channelId)!.state
+				)
+			).to.be.true;
+			const restored = open().storage;
+			reconstructFromFrames(restored, other.journal.loadVerifiedFrames());
+			holdsHistory(restored);
+		} finally {
+			for (const storage of stores) storage.close();
 		}
 	});
 

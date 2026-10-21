@@ -141,8 +141,10 @@ export class RecoveryManager {
 								{
 									state: mutation.state,
 									keys: [
-										...(unsavedRevokedHtlcSnapshots(mutation.state)?.keys() ??
-											[])
+										...(unsavedRevokedHtlcSnapshots(
+											mutation.state,
+											this.storage
+										)?.keys() ?? [])
 									]
 								}
 						  ]
@@ -229,7 +231,7 @@ export class RecoveryManager {
 		}
 		if (journaled || !this.options.journal) {
 			for (const { state, keys } of historyWritten) {
-				markRevokedHtlcSnapshotsSaved(state, keys);
+				markRevokedHtlcSnapshotsSaved(state, this.storage, keys);
 			}
 		}
 

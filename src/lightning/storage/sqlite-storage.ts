@@ -818,7 +818,7 @@ export class SqliteStorage implements IStorageBackend {
 		const json = JSON.stringify(
 			serializeChannelState(state, { htlcHistory: 'none' })
 		);
-		const history = unsavedRevokedHtlcSnapshots(state);
+		const history = unsavedRevokedHtlcSnapshots(state, this);
 		this.db.transaction(() => {
 			this.db
 				.prepare(
@@ -955,7 +955,7 @@ export class SqliteStorage implements IStorageBackend {
 			}
 		}
 		state.revokedHtlcSnapshots = history?.size ? history : undefined;
-		markRevokedHtlcSnapshotsSaved(state, stored?.keys() ?? []);
+		markRevokedHtlcSnapshotsSaved(state, this, stored?.keys() ?? []);
 	}
 
 	deleteChannel(id: string): void {

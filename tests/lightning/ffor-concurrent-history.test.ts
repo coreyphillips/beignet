@@ -285,7 +285,7 @@ describe('Concurrent commitment history persistence', function () {
 				save();
 				const frames = journal.loadVerifiedFrames();
 				expect(frames[0].version).to.equal(paged ? 2 : 1);
-				expect(frames[frames.length - 1].version).to.equal(2);
+				expect(frames[frames.length - 1].version).to.equal(3);
 				if (paged) {
 					expect(frames[0].snapshot!.schemaVersion).to.equal(
 						'2+ffor-vouchers+htlc-history+pages'
