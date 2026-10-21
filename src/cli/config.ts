@@ -4,6 +4,10 @@
  */
 
 import { irohBooleanEnv, irohRelaysEnv } from './iroh-config';
+import {
+	electrumTlsFingerprintsEnv,
+	electrumTlsVerifyEnv
+} from './electrum-tls-config';
 import * as fs from 'fs';
 import * as path from 'path';
 import { BeignetConfig } from './types';
@@ -428,6 +432,14 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? process.env.BEIGNET_ELECTRUM_TLS === 'true'
 				: undefined) ??
 			file.electrumTls,
+		electrumTlsVerify:
+			cliFlags.electrumTlsVerify ??
+			electrumTlsVerifyEnv() ??
+			file.electrumTlsVerify,
+		electrumTlsFingerprints:
+			cliFlags.electrumTlsFingerprints ??
+			electrumTlsFingerprintsEnv() ??
+			file.electrumTlsFingerprints,
 		listenPort:
 			cliFlags.listenPort ||
 			(process.env.BEIGNET_LISTEN_PORT

@@ -83,6 +83,18 @@ describe('Electrum TLS verification (#1046)', () => {
 		fs.rmSync(dir, { recursive: true, force: true });
 	});
 
+	// Stands in for the system CA store: the certificate is its own CA.
+	// family 4 keeps "localhost" on the loopback address the server holds
+	// (a net option the tls typings leave out).
+	const trustingTls = (): Tls =>
+		({
+			...tls,
+			connect: (options: tls.ConnectionOptions, listener?: () => void) => {
+				const withCa = { ...options, ca: cert, family: 4 };
+				return tls.connect(withCa, listener);
+			}
+		}) as Tls;
+
 	it('the plain tls module accepts a self-signed certificate', async () => {
 		const res = await connectThrough(tls, '127.0.0.1', port);
 		expect(res).to.deep.equal({ error: false, pong: 'pong' });
@@ -125,16 +137,7 @@ describe('Electrum TLS verification (#1046)', () => {
 	});
 
 	it('accepts a CA-verified certificate only for the host it names', async () => {
-		// Stands in for the system CA store: the certificate is its own CA.
-		// family 4 keeps "localhost" on the loopback address the server holds
-		// (a net option the tls typings leave out).
-		const trusting = {
-			...tls,
-			connect: (options: tls.ConnectionOptions, listener?: () => void) => {
-				const withCa = { ...options, ca: cert, family: 4 };
-				return tls.connect(withCa, listener);
-			}
-		} as Tls;
+		const trusting = trustingTls();
 		const named = await connectThrough(
 			withTlsVerification(trusting),
 			'localhost',
@@ -148,6 +151,38 @@ describe('Electrum TLS verification (#1046)', () => {
 			port
 		);
 		expect(mismatched.error).to.equal(true);
+	});
+
+	it('checks a dialed address against the host name it was resolved from (#1776)', async () => {
+		// The daemon pins its Electrum host to IPv4 before dialing. Without the
+		// mapping the check runs against 127.0.0.1 and fails (the case above).
+		const mapped = await connectThrough(
+			withTlsVerification(trustingTls(), {
+				servernames: { '127.0.0.1': 'localhost' }
+			}),
+			'127.0.0.1',
+			port
+		);
+		expect(mapped).to.deep.equal({ error: false, pong: 'pong' });
+
+		const wrongName = await connectThrough(
+			withTlsVerification(trustingTls(), {
+				servernames: { '127.0.0.1': 'example.com' }
+			}),
+			'127.0.0.1',
+			port
+		);
+		expect(wrongName.error).to.equal(true);
+
+		// A mapping for another address leaves this dial checked by its own.
+		const unrelated = await connectThrough(
+			withTlsVerification(trustingTls(), {
+				servernames: { '127.0.0.2': 'localhost' }
+			}),
+			'127.0.0.1',
+			port
+		);
+		expect(unrelated.error).to.equal(true);
 	});
 
 	it('rejects a malformed fingerprint up front', () => {
