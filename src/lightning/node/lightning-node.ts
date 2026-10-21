@@ -1174,6 +1174,11 @@ export class LightningNode extends EventEmitter {
 	private static readonly GOSSIP_INTAKE_MAX = 30_000;
 	private static readonly GOSSIP_INTAKE_SLICE_MS = 10;
 	/**
+	 * The gossip row writes of the drain slice now running, keyed by row,
+	 * committed together when it ends (see writeGossipRow). Null outside one.
+	 */
+	private gossipRowWrites: Map<string, () => void> | null = null;
+	/**
 	 * Peers' gossip queries share this much main-thread time per window
 	 * (issue #1398). A 40-byte query_channel_range scans and sorts the whole
 	 * graph, about 50 ms at NetworkGraph.MAX_CHANNELS, so answering every
@@ -2166,7 +2171,8 @@ export class LightningNode extends EventEmitter {
 			onChannelEvicted: (scidHex) => {
 				this.gossipFundingQueue.delete(scidHex);
 				if (typeof this.storage?.deleteGossipChannel === 'function') {
-					this.safeStorage(
+					this.writeGossipRow(
+						`channel:${scidHex}`,
 						() => this.storage!.deleteGossipChannel!(scidHex),
 						'deleteGossipChannel'
 					);
@@ -2185,7 +2191,8 @@ export class LightningNode extends EventEmitter {
 					typeof this.storage?.deleteGossipNode === 'function' &&
 					typeof this.storage.deleteGossipChannel === 'function'
 				) {
-					this.safeStorage(
+					this.writeGossipRow(
+						`node:${nodeIdHex}`,
 						() => this.storage!.deleteGossipNode!(nodeIdHex),
 						'deleteGossipNode'
 					);
@@ -2204,7 +2211,8 @@ export class LightningNode extends EventEmitter {
 			onChannelAnnouncementFailed: (scidHex): void => {
 				const channel = this.graph.getChannel(Buffer.from(scidHex, 'hex'));
 				if (channel) {
-					this.safeStorage(
+					this.writeGossipRow(
+						`channel:${scidHex}`,
 						() => this.storage!.saveGossipChannel(scidHex, channel),
 						'saveGossipChannel'
 					);
@@ -4722,7 +4730,7 @@ export class LightningNode extends EventEmitter {
 		// the channel deletes back until here cannot change what the node
 		// rows were judged against on disk.
 		if (complete) {
-			this.batchStorageDeletes(
+			this.batchStorageWrites(
 				run.restore.staleRowDeletes,
 				'gossipRestoreCleanup'
 			);
@@ -4868,32 +4876,33 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Run a batch of best-effort storage deletes as ONE transaction.
+	 * Run a batch of best-effort storage writes as ONE transaction.
 	 *
-	 * Each delete used to commit on its own, and the SQLite backend opens
+	 * Each write used to commit on its own, and the SQLite backend opens
 	 * `journal_mode = WAL` with `synchronous = FULL`, so every row cost a
 	 * separate fsync on the daemon's only thread. Deleting a mainnet-sized
 	 * graph's worth of stale rows that way blocks the event loop for as long
 	 * as the disk takes: /health goes silent, and peers pass their BOLT 1
 	 * ping timeout and drop the connection. One transaction is one fsync.
 	 *
-	 * The deletes stay best-effort. A row that throws is counted and skipped
+	 * The writes stay best-effort. A row that throws is counted and skipped
 	 * rather than rolling the batch back, and a backend whose transaction
-	 * will not open falls back to the plain loop. Deleting by primary key is
-	 * idempotent, so that fallback cannot double-delete anything.
+	 * will not open falls back to the plain loop. Every write must be
+	 * idempotent (a delete or an upsert by primary key), since that fallback
+	 * runs the batch again.
 	 */
-	private batchStorageDeletes(
-		deletes: Array<() => void>,
+	private batchStorageWrites(
+		writes: Array<() => void>,
 		operation: string
 	): void {
-		if (!this.storage || deletes.length === 0) return;
+		if (!this.storage || writes.length === 0) return;
 		let failed = 0;
 		let lastError = '';
 		const run = (): void => {
 			failed = 0;
-			for (const del of deletes) {
+			for (const write of writes) {
 				try {
-					del();
+					write();
 				} catch (err) {
 					failed++;
 					lastError = (err as Error).message;
@@ -4911,7 +4920,7 @@ export class LightningNode extends EventEmitter {
 		if (failed > 0) {
 			this.emit('node:error', {
 				code: 'PERSISTENCE_ERROR',
-				message: `${operation}: ${failed} of ${deletes.length} deletes failed (${lastError})`,
+				message: `${operation}: ${failed} of ${writes.length} writes failed (${lastError})`,
 				timestamp: Date.now()
 			} as ILightningError);
 		}
@@ -16576,31 +16585,38 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 		const sliceStart = Date.now();
-		while (
-			this.gossipIntakeHead < this.gossipIntake.length &&
-			!this._destroyed &&
-			Date.now() - sliceStart < LightningNode.GOSSIP_INTAKE_SLICE_MS
-		) {
-			const item = this.gossipIntake[this.gossipIntakeHead++];
-			try {
-				switch (item.type) {
-					case MessageType.CHANNEL_ANNOUNCEMENT:
-						this.handleChannelAnnouncement(item.payload);
-						break;
-					case MessageType.NODE_ANNOUNCEMENT:
-						this.handleNodeAnnouncement(item.payload);
-						break;
-					case MessageType.CHANNEL_UPDATE:
-						this.handleChannelUpdate(item.payload);
-						break;
+		const writes = new Map<string, () => void>();
+		this.gossipRowWrites = writes;
+		try {
+			while (
+				this.gossipIntakeHead < this.gossipIntake.length &&
+				!this._destroyed &&
+				Date.now() - sliceStart < LightningNode.GOSSIP_INTAKE_SLICE_MS
+			) {
+				const item = this.gossipIntake[this.gossipIntakeHead++];
+				try {
+					switch (item.type) {
+						case MessageType.CHANNEL_ANNOUNCEMENT:
+							this.handleChannelAnnouncement(item.payload);
+							break;
+						case MessageType.NODE_ANNOUNCEMENT:
+							this.handleNodeAnnouncement(item.payload);
+							break;
+						case MessageType.CHANNEL_UPDATE:
+							this.handleChannelUpdate(item.payload);
+							break;
+					}
+				} catch (err) {
+					this.emitStructuredLog('peer', 'gossip_intake_failed', {
+						pubkey: item.pubkey,
+						type: item.type,
+						error: err instanceof Error ? err.message : String(err)
+					});
 				}
-			} catch (err) {
-				this.emitStructuredLog('peer', 'gossip_intake_failed', {
-					pubkey: item.pubkey,
-					type: item.type,
-					error: err instanceof Error ? err.message : String(err)
-				});
 			}
+		} finally {
+			this.gossipRowWrites = null;
+			this.batchStorageWrites([...writes.values()], 'gossipIntake');
 		}
 		if (this.gossipIntakeHead < this.gossipIntake.length && !this._destroyed) {
 			setImmediate(() => this.drainGossipIntake());
@@ -16615,6 +16631,28 @@ export class LightningNode extends EventEmitter {
 			});
 			this.gossipIntakeDropped = 0;
 		}
+	}
+
+	/**
+	 * Write one gossip_channels or gossip_nodes row. During a drain slice
+	 * the rows wait and commit together when it ends: under
+	 * `synchronous = FULL` every commit is an fsync, and a first sync
+	 * accepts hundreds of thousands of messages. Only the last write to a
+	 * row counts, an eviction's delete included. The handlers themselves
+	 * stay outside that transaction, because an update for one of our
+	 * channels persists channel state through a journaled commit, which
+	 * refuses to join one.
+	 */
+	private writeGossipRow(
+		row: string,
+		write: () => void,
+		operation: string
+	): void {
+		if (this.gossipRowWrites) {
+			this.gossipRowWrites.set(row, write);
+			return;
+		}
+		this.safeStorage(write, operation);
 	}
 
 	/**
@@ -16921,13 +16959,11 @@ export class LightningNode extends EventEmitter {
 		}
 		if (this.graph.addChannelAnnouncement(msg, { verified })) {
 			const ch = this.graph.getChannel(msg.shortChannelId);
+			const scidHex = msg.shortChannelId.toString('hex');
 			if (ch)
-				this.safeStorage(
-					() =>
-						this.storage!.saveGossipChannel(
-							msg.shortChannelId.toString('hex'),
-							ch
-						),
+				this.writeGossipRow(
+					`channel:${scidHex}`,
+					() => this.storage!.saveGossipChannel(scidHex, ch),
 					'saveGossipChannel'
 				);
 		}
@@ -16977,9 +17013,11 @@ export class LightningNode extends EventEmitter {
 		}
 		if (this.graph.applyNodeAnnouncement(msg, { verified })) {
 			const node = this.graph.getNode(msg.nodeId);
+			const nodeIdHex = msg.nodeId.toString('hex');
 			if (node)
-				this.safeStorage(
-					() => this.storage!.saveGossipNode(msg.nodeId.toString('hex'), node),
+				this.writeGossipRow(
+					`node:${nodeIdHex}`,
+					() => this.storage!.saveGossipNode(nodeIdHex, node),
 					'saveGossipNode'
 				);
 		}
@@ -17100,13 +17138,11 @@ export class LightningNode extends EventEmitter {
 		}
 		if (this.graph.applyChannelUpdate(msg, { verified })) {
 			const ch = this.graph.getChannel(msg.shortChannelId);
+			const scidHex = msg.shortChannelId.toString('hex');
 			if (ch)
-				this.safeStorage(
-					() =>
-						this.storage!.saveGossipChannel(
-							msg.shortChannelId.toString('hex'),
-							ch
-						),
+				this.writeGossipRow(
+					`channel:${scidHex}`,
+					() => this.storage!.saveGossipChannel(scidHex, ch),
 					'saveGossipChannel'
 				);
 		}
@@ -33003,12 +33039,12 @@ export class LightningNode extends EventEmitter {
 		// Delete from storage, in one transaction rather than one per row.
 		// This runs hourly against the whole graph, and a bare loop fsyncs
 		// once per channel with the daemon's only thread held (see
-		// batchStorageDeletes).
+		// batchStorageWrites).
 		if (
 			this.storage &&
 			typeof this.storage.deleteGossipChannel === 'function'
 		) {
-			this.batchStorageDeletes(
+			this.batchStorageWrites(
 				staleScids.map(
 					(scidHex) => () => this.storage!.deleteGossipChannel!(scidHex)
 				),
