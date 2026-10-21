@@ -340,6 +340,12 @@ export interface IChainWatcherConfig {
 	 * Defaults to 30 seconds; tests pass 0.
 	 */
 	missingDebounceMs?: number;
+	/**
+	 * Bytes of confirmed transactions the spend scans keep so a sweep does not
+	 * download them again; least recently used goes first. Defaults to 4 MiB;
+	 * 0 turns the cache off.
+	 */
+	confirmedTxCacheBytes?: number;
 }
 
 const DEFAULT_MISSING_DEBOUNCE_MS = 30_000;
@@ -598,6 +604,14 @@ const MAX_BROADCAST_RETRIES = 12;
 const RECHECK_INTERVAL_MS = 60_000;
 
 /**
+ * Default byte budget for the confirmed transactions the spend scans keep in
+ * memory (issue #1678). Every block and every recheck re-reads each watched
+ * script's history, and a spliced channel's history keeps every earlier
+ * splice, so without this each sweep downloads those transactions again.
+ */
+const DEFAULT_CONFIRMED_TX_CACHE_BYTES = 4 * 1024 * 1024;
+
+/**
  * What a confirmation scan hands the spend scan it starts (issue #775): the
  * outpoint it actually saw in a block, since a watch below `minimumDepth`
  * may still name another RBF attempt, and the history it already holds, so
@@ -679,6 +693,14 @@ export class ChainWatcher extends EventEmitter {
 		string,
 		{ height?: number; sequence: number }
 	> = new Map();
+	/**
+	 * Raw bytes of transactions the spend scans read at a confirmed height,
+	 * keyed by display txid, oldest use first. See
+	 * DEFAULT_CONFIRMED_TX_CACHE_BYTES.
+	 */
+	private confirmedTxs: Map<string, Buffer> = new Map();
+	private confirmedTxBytes = 0;
+	private readonly confirmedTxCacheBytes: number;
 	private failedFundingWatches: IFailedFundingWatch[] = [];
 	private failedOutputWatches: IFailedOutputWatch[] = [];
 	private failedBroadcasts: IFailedBroadcast[] = [];
@@ -717,6 +739,8 @@ export class ChainWatcher extends EventEmitter {
 		this.getSweepFeeRatePerVbyte = config.getSweepFeeRatePerVbyte;
 		this.missingDebounceMs =
 			config.missingDebounceMs ?? DEFAULT_MISSING_DEBOUNCE_MS;
+		this.confirmedTxCacheBytes =
+			config.confirmedTxCacheBytes ?? DEFAULT_CONFIRMED_TX_CACHE_BYTES;
 
 		this.wireChannelManagerEvents();
 	}
@@ -909,6 +933,8 @@ export class ChainWatcher extends EventEmitter {
 		this.watchedOutputs.clear();
 		this.outputSpendVerdicts.clear();
 		this.watchedSpliceInputs.clear();
+		this.confirmedTxs.clear();
+		this.confirmedTxBytes = 0;
 		this.failedFundingWatches.length = 0;
 		this.failedOutputWatches.length = 0;
 		this.failedBroadcasts.length = 0;
@@ -2453,7 +2479,7 @@ export class ChainWatcher extends EventEmitter {
 				continue;
 			}
 
-			const rawTx = await this.backend.getTransaction(entry.txid);
+			const rawTx = await this.getHistoryTransaction(entry.txid, entry.height);
 			if (superseded()) return;
 			const spendingTx = bitcoin.Transaction.fromBuffer(rawTx);
 
@@ -2517,7 +2543,10 @@ export class ChainWatcher extends EventEmitter {
 			// and reading the wrong one as final would retire a breach watch
 			// early. The fetch is gated on the depth test, so it happens once,
 			// at retirement, and not on every sweep.
-			const rawIgnored = await this.backend.getTransaction(ignoredSpend.txid);
+			const rawIgnored = await this.getHistoryTransaction(
+				ignoredSpend.txid,
+				ignoredSpend.height
+			);
 			if (superseded()) return;
 			const ignoredTx = bitcoin.Transaction.fromBuffer(rawIgnored);
 			const spendsOurs = ignoredTx.ins.some((txIn) => {
@@ -2699,6 +2728,61 @@ export class ChainWatcher extends EventEmitter {
 		state.appliedTicket = Math.max(state.appliedTicket, ticket);
 	}
 
+	/**
+	 * The transaction behind a script history entry, from memory when a
+	 * confirmed entry has already been read (issue #1678). Only a confirmed
+	 * read is kept, and only once the bytes hash to the txid asked for: a
+	 * server that answered with the wrong transaction must not have that
+	 * answer replayed to every later scan. A hit is served whatever the
+	 * entry's height now, since the txid fixes everything a scan reads.
+	 */
+	private async getHistoryTransaction(
+		txid: string,
+		height: number
+	): Promise<Buffer> {
+		const cached = this.confirmedTxs.get(txid);
+		if (cached) {
+			this.confirmedTxs.delete(txid);
+			this.confirmedTxs.set(txid, cached);
+			// A copy: a parsed transaction's inputs are views into its buffer,
+			// and the parsed transaction goes on to the ChannelManager.
+			return Buffer.from(cached);
+		}
+		const raw = await this.backend.getTransaction(txid);
+		if (height > 0 && this.hashesTo(raw, txid)) {
+			this.cacheConfirmedTransaction(txid, raw);
+		}
+		return raw;
+	}
+
+	private hashesTo(raw: Buffer, txid: string): boolean {
+		try {
+			return bitcoin.Transaction.fromBuffer(raw).getId() === txid;
+		} catch {
+			return false;
+		}
+	}
+
+	private cacheConfirmedTransaction(txid: string, raw: Buffer): void {
+		if (raw.length > this.confirmedTxCacheBytes) return;
+		const previous = this.confirmedTxs.get(txid);
+		if (previous) {
+			this.confirmedTxs.delete(txid);
+			this.confirmedTxBytes -= previous.length;
+		}
+		// Not Buffer.from: a small copy is a slice of the shared allocation
+		// pool, and keeping it would pin the whole pool slab.
+		const copy = Buffer.alloc(raw.length);
+		raw.copy(copy);
+		this.confirmedTxs.set(txid, copy);
+		this.confirmedTxBytes += copy.length;
+		for (const [oldest, bytes] of this.confirmedTxs) {
+			if (this.confirmedTxBytes <= this.confirmedTxCacheBytes) break;
+			this.confirmedTxs.delete(oldest);
+			this.confirmedTxBytes -= bytes.length;
+		}
+	}
+
 	private findChannelByFunding(
 		txidHex: string,
 		outputIndex: number
@@ -2816,7 +2900,10 @@ export class ChainWatcher extends EventEmitter {
 			for (const entry of history) {
 				if (entry.txid === watched.txid || entry.height <= 0) continue;
 
-				const rawTx = await this.backend.getTransaction(entry.txid);
+				const rawTx = await this.getHistoryTransaction(
+					entry.txid,
+					entry.height
+				);
 				if (superseded()) return;
 				const spendingTx = bitcoin.Transaction.fromBuffer(rawTx);
 

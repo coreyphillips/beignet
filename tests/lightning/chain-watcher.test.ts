@@ -181,7 +181,11 @@ class MockChainBackend implements IChainBackend {
 		this.transactionFailures = count;
 	}
 
+	/** Transaction fetches asked of this backend, per txid. */
+	transactionReads: Map<string, number> = new Map();
+
 	async getTransaction(txid: string): Promise<Buffer> {
+		this.transactionReads.set(txid, (this.transactionReads.get(txid) ?? 0) + 1);
 		if (this.transactionFailures > 0) {
 			this.transactionFailures--;
 			throw new Error(`Transaction unavailable: ${txid}`);
@@ -2382,7 +2386,11 @@ describe('Phase 4: Chain Watcher', () => {
 			watcher = new ChainWatcher({
 				backend,
 				channelManager,
-				missingDebounceMs: 0
+				missingDebounceMs: 0,
+				// The races below stall a scan re-reading a spend an earlier scan
+				// already read. A cached spend is never re-read, so they run as
+				// the watcher does once the cache has let it go.
+				confirmedTxCacheBytes: 0
 			});
 			await watcher.start();
 		});
@@ -3202,6 +3210,270 @@ describe('Phase 4: Chain Watcher', () => {
 			expect(held.spendTxid, 'the watch still reads unspent').to.equal(
 				undefined
 			);
+		});
+	});
+
+	// Every block and every recheck re-reads each watched script's history,
+	// but a confirmed transaction it names is downloaded once (issue #1678).
+	describe('Confirmed transaction cache (issue #1678)', () => {
+		const CLOSE_SCRIPT = Buffer.from('0014' + '22'.repeat(20), 'hex');
+		let backend: MockChainBackend;
+		let channelManager: ChannelManager;
+		let watcher: ChainWatcher;
+		let closes: string[];
+
+		beforeEach(() => {
+			const seed = crypto.randomBytes(32);
+			backend = new MockChainBackend();
+			channelManager = new ChannelManager({
+				localBasepoints: makeBasepoints(seed),
+				localPerCommitmentSeed: crypto.randomBytes(32),
+				localFundingPrivkey: crypto.randomBytes(32)
+			});
+			channelManager.on('error', () => {});
+			closes = [];
+		});
+
+		afterEach(() => {
+			watcher.stop();
+		});
+
+		async function startWatcher(confirmedTxCacheBytes?: number): Promise<void> {
+			watcher = new ChainWatcher({
+				backend,
+				channelManager,
+				missingDebounceMs: 0,
+				confirmedTxCacheBytes
+			});
+			watcher.on('funding:spent', (_cid: Buffer, tx: bitcoin.Transaction) =>
+				closes.push(tx.getId())
+			);
+			await watcher.start();
+		}
+
+		function settle(): Promise<void> {
+			return new Promise((resolve) => setTimeout(resolve, 20));
+		}
+
+		function reads(txid: string): number {
+			return backend.transactionReads.get(txid) ?? 0;
+		}
+
+		function randomScript(): Buffer {
+			return Buffer.from(
+				'0020' + crypto.randomBytes(32).toString('hex'),
+				'hex'
+			);
+		}
+
+		/** A transaction spending `prevTxid`:0 into `script`, served by the backend. */
+		function spendOf(prevTxid: string, script: Buffer): bitcoin.Transaction {
+			const tx = new bitcoin.Transaction();
+			tx.version = 2;
+			tx.addInput(Buffer.from(prevTxid, 'hex').reverse(), 0, 0xffffffff);
+			tx.addOutput(script, 100_000);
+			backend.setTransaction(tx.getId(), tx.toBuffer());
+			return tx;
+		}
+
+		/**
+		 * A channel spliced twice, watched on the second splice's output. The
+		 * funding script's history holds three confirmed entries, and the two
+		 * the watch is not on are what every spend scan has to read.
+		 */
+		async function armSplicedChannel(): Promise<{
+			scriptHash: string;
+			history: Array<{ txid: string; height: number }>;
+			spliceTxid: string;
+		}> {
+			const script = randomScript();
+			const scriptHash = computeScriptHash(script);
+			const funding = spendOf(crypto.randomBytes(32).toString('hex'), script);
+			const firstSplice = spendOf(funding.getId(), script);
+			const secondSplice = spendOf(firstSplice.getId(), script);
+			const history = [
+				{ txid: funding.getId(), height: 90 },
+				{ txid: firstSplice.getId(), height: 95 },
+				{ txid: secondSplice.getId(), height: 98 }
+			];
+			backend.setHistory(scriptHash, history);
+			backend.simulateNewBlock(100);
+			await watcher.watchFundingOutput(
+				crypto.randomBytes(32),
+				secondSplice.getId(),
+				0,
+				3,
+				script
+			);
+			await settle();
+			return { scriptHash, history, spliceTxid: secondSplice.getId() };
+		}
+
+		it('reads the earlier splices of a channel once across blocks and rechecks', async () => {
+			await startWatcher();
+			const { history, spliceTxid } = await armSplicedChannel();
+
+			for (let height = 101; height <= 105; height++) {
+				backend.simulateNewBlock(height);
+				watcher.recheckAllWatches();
+				await settle();
+			}
+
+			expect(
+				history.slice(0, 2).map(({ txid }) => reads(txid)),
+				'five blocks and five rechecks read each earlier splice once'
+			).to.deep.equal([1, 1]);
+			expect(
+				reads(spliceTxid),
+				'the watched transaction is never read'
+			).to.equal(0);
+			expect(closes).to.deep.equal([]);
+		});
+
+		it('still finds a close on the next block, and reads it once', async () => {
+			await startWatcher();
+			const { scriptHash, history, spliceTxid } = await armSplicedChannel();
+
+			const close = spendOf(spliceTxid, CLOSE_SCRIPT);
+			backend.setHistory(scriptHash, [
+				...history,
+				{ txid: close.getId(), height: 101 }
+			]);
+			backend.simulateNewBlock(101);
+			await settle();
+			expect(closes, 'the next block found the close').to.deep.equal([
+				close.getId()
+			]);
+
+			for (let height = 102; height <= 105; height++) {
+				backend.simulateNewBlock(height);
+				await settle();
+			}
+			expect(reads(close.getId())).to.equal(1);
+		});
+
+		it('reads a mempool spender again on every scan until it confirms', async () => {
+			await startWatcher();
+			const { scriptHash, history, spliceTxid } = await armSplicedChannel();
+
+			const close = spendOf(spliceTxid, CLOSE_SCRIPT);
+			backend.setHistory(scriptHash, [
+				...history,
+				{ txid: close.getId(), height: 0 }
+			]);
+			for (let height = 101; height <= 103; height++) {
+				backend.simulateNewBlock(height);
+				await settle();
+			}
+			expect(
+				reads(close.getId()),
+				'one read per block in the mempool'
+			).to.equal(3);
+
+			backend.setHistory(scriptHash, [
+				...history,
+				{ txid: close.getId(), height: 104 }
+			]);
+			for (let height = 104; height <= 106; height++) {
+				backend.simulateNewBlock(height);
+				await settle();
+			}
+			expect(reads(close.getId()), 'and one more once confirmed').to.equal(4);
+		});
+
+		it('does not keep bytes that do not hash to the txid asked for', async () => {
+			await startWatcher();
+			const { scriptHash, history } = await armSplicedChannel();
+
+			const unrelated = new bitcoin.Transaction();
+			unrelated.addInput(crypto.randomBytes(32), 0);
+			unrelated.addOutput(CLOSE_SCRIPT, 1_000);
+			const named = crypto.randomBytes(32).toString('hex');
+			backend.setTransaction(named, unrelated.toBuffer());
+			backend.setHistory(scriptHash, [
+				...history,
+				{ txid: named, height: 101 }
+			]);
+
+			for (let height = 101; height <= 103; height++) {
+				backend.simulateNewBlock(height);
+				await settle();
+			}
+			expect(reads(named), 'asked again on every block').to.equal(3);
+		});
+
+		it('lets the least recently used transaction go once the budget is full', async () => {
+			const script = randomScript();
+			const scriptHash = computeScriptHash(script);
+			const watched = crypto.randomBytes(32).toString('hex');
+			// Same shape, so the same size: the budget holds exactly two.
+			const txs = [0, 1, 2].map(() =>
+				spendOf(crypto.randomBytes(32).toString('hex'), script)
+			);
+			const [a, b, c] = txs.map((tx) => tx.getId());
+			await startWatcher(2 * txs[0].byteLength());
+
+			backend.setHistory(scriptHash, [
+				{ txid: watched, height: 98 },
+				{ txid: a, height: 99 },
+				{ txid: b, height: 99 }
+			]);
+			backend.simulateNewBlock(100);
+			await watcher.watchFundingOutput(
+				crypto.randomBytes(32),
+				watched,
+				0,
+				1,
+				script
+			);
+			await settle();
+
+			// c pushes out a, which this scan no longer touches.
+			backend.setHistory(scriptHash, [
+				{ txid: watched, height: 98 },
+				{ txid: b, height: 99 },
+				{ txid: c, height: 101 }
+			]);
+			backend.simulateNewBlock(101);
+			await settle();
+			backend.simulateNewBlock(102);
+			await settle();
+			expect([a, b, c].map(reads), 'b and c stay held').to.deep.equal([
+				1, 1, 1
+			]);
+
+			backend.setHistory(scriptHash, [
+				{ txid: watched, height: 98 },
+				{ txid: a, height: 99 }
+			]);
+			backend.simulateNewBlock(103);
+			await settle();
+			expect(reads(a), 'a was let go').to.equal(2);
+		});
+
+		it("reads a watched output's spender once while the watch waits for finality", async () => {
+			await startWatcher();
+			const script = randomScript();
+			const scriptHash = computeScriptHash(script);
+			const parent = crypto.randomBytes(32).toString('hex');
+			// Address reuse puts a stranger in the history ahead of the spend.
+			const stranger = spendOf(crypto.randomBytes(32).toString('hex'), script);
+			const spend = spendOf(parent, CLOSE_SCRIPT);
+			backend.setHistory(scriptHash, [
+				{ txid: parent, height: 99 },
+				{ txid: stranger.getId(), height: 100 },
+				{ txid: spend.getId(), height: 101 }
+			]);
+			backend.simulateNewBlock(102);
+			await watcher.watchOutput(parent, 0, script);
+
+			for (let sweep = 0; sweep < 5; sweep++) {
+				watcher.recheckAllWatches();
+				await settle();
+			}
+			expect([stranger.getId(), spend.getId()].map(reads)).to.deep.equal([
+				1, 1
+			]);
 		});
 	});
 
