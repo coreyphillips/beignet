@@ -1,4 +1,5 @@
 import type { BeignetNode } from './beignet-node';
+import type { ChannelInfo } from './types';
 import { BeignetError } from './errors';
 import { DEFAULT_CHANNEL_CONFIG } from '../lightning/channel/types';
 
@@ -56,6 +57,16 @@ export type OfflineReceiveResult = {
 };
 /** A job with no kind predates the split and is a bolt11 job. */
 const kindOf = (j: OfflineReceiveJob): OfflineReceiveKind => j.kind ?? 'bolt11';
+/** Items by channelId, the first winning as find() would. */
+const firstByChannelId = <T extends { channelId?: unknown }>(
+	items: T[]
+): Map<unknown, T> => {
+	const byId = new Map<unknown, T>();
+	for (const item of items) {
+		if (!byId.has(item.channelId)) byId.set(item.channelId, item);
+	}
+	return byId;
+};
 export class OfflineReceive {
 	private jobs: OfflineReceiveJob[];
 	private creating = false;
@@ -621,19 +632,25 @@ export class OfflineReceive {
 		if (this.syncing || this.creating || this.stopped) return;
 		this.syncing = true;
 		try {
+			// One view of the channels and receive epochs per tick, taken again
+			// after a job has run, since the awaits below let either move.
+			let view: {
+				channels: Map<unknown, ChannelInfo>;
+				epochs: Map<unknown, Record<string, unknown>>;
+			} | null = null;
 			for (const job of this.jobs) {
 				if (this.stopped) return;
 				// A direct-funded request has no epoch and no reservation: there is
 				// nothing here to reconcile or release.
 				if (kindOf(job) === 'direct-funding') continue;
 				if (job.done || !job.channelId) continue;
-				const channel = this.node
-					.listChannels()
-					.find((c) => c.channelId === job.channelId);
+				view ??= {
+					channels: firstByChannelId(this.node.listChannels()),
+					epochs: firstByChannelId(this.node.fforEpochs('R'))
+				};
+				const channel = view.channels.get(job.channelId);
 				if (!channel || channel.state !== 'NORMAL') continue;
-				const epoch: any = this.node
-					.fforEpochs('R')
-					.find((e) => e.channelId === job.channelId);
+				const epoch: any = view.epochs.get(job.channelId);
 				if (!epoch) continue;
 				if (job.epochId && job.epochId !== epoch.epochId) continue;
 				if (!job.epochId) {
@@ -660,6 +677,7 @@ export class OfflineReceive {
 					job.expiresAt = (Number(d.timestamp) + Number(d.expiry)) * 1000;
 					this.persist();
 				}
+				view = null;
 				try {
 					if (epoch.concurrentVersion) this.node.fforSync(job.channelId);
 					else await this.node.getFforReceiveService().receipts(job.channelId);

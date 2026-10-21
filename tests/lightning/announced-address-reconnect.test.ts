@@ -275,11 +275,11 @@ describe('LightningNode: channel peer address capture', function () {
 		const peerKey = crypto.randomBytes(32);
 		const peerPub = getPublicKey(peerKey).toString('hex');
 		const internal = node as unknown as {
-			channelPeerPubkeys(): Set<string>;
 			handleNodeAnnouncement(payload: Buffer): void;
 			peerManager: PeerManager;
 		};
-		internal.channelPeerPubkeys = (): Set<string> => new Set([peerPub]);
+		node.getChannelManager().hasChannelWithPeer = (pubkey): boolean =>
+			pubkey === peerPub;
 		return {
 			node,
 			peerKey,
@@ -1196,7 +1196,6 @@ describe('inbound channel peer reconnects via its announced address', function (
 			await a.listen(0);
 			await b.listen(0);
 			const aInternal = a as unknown as {
-				channelPeerPubkeys(): Set<string>;
 				handleNodeAnnouncement(payload: Buffer): void;
 				peerManager: PeerManager;
 			};
@@ -1215,7 +1214,8 @@ describe('inbound channel peer reconnects via its announced address', function (
 			expect(aInternal.peerManager.getPeerAddress(bPub)).to.equal(undefined);
 
 			// A treats B as a channel peer and receives B's node_announcement.
-			aInternal.channelPeerPubkeys = (): Set<string> => new Set([bPub]);
+			a.getChannelManager().hasChannelWithPeer = (pubkey): boolean =>
+				pubkey === bPub;
 			aInternal.handleNodeAnnouncement(
 				makeAnnouncement(bKey, [
 					{ type: ADDRESS_TYPE_IPV4, host: '127.0.0.1', port: bPort }
