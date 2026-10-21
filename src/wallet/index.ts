@@ -1220,7 +1220,10 @@ export class Wallet {
 		// Electrum's own _disconnected flag and leaves a socket running behind a
 		// wallet that has shut down.
 		const stopped = 'Wallet stopped.';
-		await this.setZeroIndexAddresses();
+		const r0 = await this.setZeroIndexAddresses();
+		if (r0.isErr()) {
+			return err(r0.error.message);
+		}
 		if (this._stopped) return err(stopped);
 		const r1 = await this.updateAddressIndexes();
 		if (r1.isErr()) {
@@ -2427,6 +2430,7 @@ export class Wallet {
 		saveAddresses = true
 	}: IGenerateAddresses): Promise<Result<IGenerateAddressesResponse>> {
 		const network = this._network;
+		const electrum = this.electrum;
 		const { path, type } = addressTypes[addressType];
 		if (!keyDerivationPath) {
 			const keyDerivationPathResponse = getKeyDerivationPathObject({
@@ -2458,22 +2462,36 @@ export class Wallet {
 		if (removeDuplicateResponse.isErr()) {
 			return err(removeDuplicateResponse.error.message);
 		}
+		// switchNetwork replaces the Electrum instance along with the data, so
+		// addresses derived before it would be filed under the network that
+		// replaced theirs (#1636).
+		if (this.electrum !== electrum) {
+			return err(
+				'The wallet switched networks while the addresses were generated.'
+			);
+		}
 
+		// Both maps are written, and their saves issued, before anything awaits,
+		// so a switch cannot land between them.
 		const addresses = removeDuplicateResponse.value.addresses;
 		const changeAddresses = removeDuplicateResponse.value.changeAddresses;
+		const grown: ('addresses' | 'changeAddresses')[] = [];
 		if (Object.keys(addresses).length) {
 			this._data.addresses[addressType] = {
 				...this.data.addresses[addressType],
 				...addresses
 			};
-			if (saveAddresses) await this.saveAddressMap('addresses');
+			grown.push('addresses');
 		}
 		if (Object.keys(changeAddresses).length) {
 			this._data.changeAddresses[addressType] = {
 				...this.data.changeAddresses[addressType],
 				...changeAddresses
 			};
-			if (saveAddresses) await this.saveAddressMap('changeAddresses');
+			grown.push('changeAddresses');
+		}
+		if (saveAddresses) {
+			await Promise.all(grown.map((key) => this.saveAddressMap(key)));
 		}
 
 		return ok({ ...generatedAddresses.value, addressType: type });
@@ -4095,15 +4113,13 @@ export class Wallet {
 			// check answered after it judged the network the wallet left, and
 			// every repair below would write that verdict into this one (#1636).
 			const electrum = this.electrum;
+			const switched =
+				'The wallet switched networks while the unconfirmed transactions were checked.';
 			const processRes = await this.processUnconfirmedTransactions();
 			if (processRes.isErr()) {
 				return err(processRes.error.message);
 			}
-			if (this.electrum !== electrum) {
-				return err(
-					'The wallet switched networks while the unconfirmed transactions were checked.'
-				);
-			}
+			if (this.electrum !== electrum) return err(switched);
 
 			const { unconfirmedTxs, outdatedTxs, ghostTxs } = processRes.value;
 			// Each repair below returns early on a write that did not land, so Ok
@@ -4124,6 +4140,9 @@ export class Wallet {
 				// transactions map, and a restart before then reads the lost block
 				// from the stored record itself (issue #870).
 				if (updated.isErr()) return err(updated.error.message);
+				// That write was keyed to the network checked, but everything below
+				// writes to whichever network is live once it lands.
+				if (this.electrum !== electrum) return err(switched);
 			}
 			if (ghostTxs.length > 0) {
 				this.sendMessage('rbf', ghostTxs);
@@ -4417,6 +4436,12 @@ export class Wallet {
 		observed: Set<string>;
 	}): Promise<Result<string>> {
 		try {
+			// The check calls this right after confirming the network it judged
+			// is still live. Each step below writes to the live one, so each
+			// confirms it again after an await (#1636).
+			const electrum = this.electrum;
+			const switched =
+				'The wallet switched networks while the ghost transactions were removed.';
 			const transactions = this.data.transactions;
 			txIds.forEach((txId) => {
 				if (txId in transactions) {
@@ -4446,6 +4471,7 @@ export class Wallet {
 			// refresh runs this check again, and a ghost still observed would
 			// come straight back here (issue #870).
 			if (saved.isErr()) return err(saved.error.message);
+			if (this.electrum !== electrum) return err(switched);
 
 			// The check's own map rather than the old one less these ghosts: a
 			// transaction the same round found back in the mempool is observed at
@@ -4474,6 +4500,9 @@ export class Wallet {
 				'unconfirmedTransactions',
 				next
 			);
+			// The rescan would reset the indexes and UTXOs of the network switched
+			// to, whose balance these ghosts never touched.
+			if (this.electrum !== electrum) return err(switched);
 
 			//Rescan the addresses to get the correct balance.
 			await this.rescanAddresses({
@@ -6259,6 +6288,11 @@ export class Wallet {
 	 */
 	private async setZeroIndexAddresses(): Promise<Result<string>> {
 		const currentWallet = this.data;
+		// switchNetwork replaces the Electrum instance along with the data. An
+		// address derived before it is for the network the wallet left, and an
+		// index read before it is that network's, so neither is written into
+		// the data that replaced it (#1636).
+		const electrum = this.electrum;
 		let saveAddressIndexes = false;
 		let saveChangeAddressIndexes = false;
 
@@ -6269,15 +6303,20 @@ export class Wallet {
 					currentWallet.changeAddressIndex[addressType];
 
 				if (addressIndex?.index < 0) {
-					await this.updateAddressIndex(addressType, false);
+					await this.updateAddressIndex(addressType, false, electrum);
 					saveAddressIndexes = true;
 				}
 				if (changeAddressIndex?.index < 0) {
-					await this.updateAddressIndex(addressType, true);
+					await this.updateAddressIndex(addressType, true, electrum);
 					saveChangeAddressIndexes = true;
 				}
 			})
 		);
+		if (this.electrum !== electrum) {
+			return err(
+				'The wallet switched networks while the zero index addresses were set.'
+			);
+		}
 
 		if (saveAddressIndexes) {
 			await Promise.all([
@@ -6304,14 +6343,18 @@ export class Wallet {
 	 * @async
 	 * @param {EAddressType} addressType
 	 * @param {boolean} isChangeAddress
+	 * @param {Electrum} electrum The instance live when the caller read the
+	 * index. Nothing is written once the wallet has switched away from it.
 	 * @param {number} [index]
 	 * @returns {Promise<void>}
 	 */
 	private async updateAddressIndex(
 		addressType: EAddressType,
 		isChangeAddress: boolean,
+		electrum: Electrum,
 		index = 0
 	): Promise<void> {
+		if (this.electrum !== electrum) return;
 		const address = await this.generateAddresses({
 			addressAmount: isChangeAddress ? 0 : 1,
 			addressIndex: index,
@@ -6319,6 +6362,7 @@ export class Wallet {
 			changeAddressIndex: index,
 			addressType
 		});
+		if (this.electrum !== electrum) return;
 		const indexToUpdate = isChangeAddress
 			? 'changeAddressIndex'
 			: 'addressIndex';
