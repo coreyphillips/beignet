@@ -107,6 +107,10 @@ type TScriptHashSubscription = {
 	/** Address index of a UTXO tracked beyond the gap limit; that index is
 	 *  rescanned before the wallet refresh on notification. */
 	utxoIndex?: number;
+	/** Set when the hash is in the wallet's own gap windows. A block does not
+	 *  refresh for these (see _onNewBlock), so the record outlives any
+	 *  callback detached from it. */
+	inWindow?: boolean;
 	/** The status this instance heard before disconnect() withdrew it, kept
 	 *  when a sibling held the hash meanwhile: the router's status may already
 	 *  reflect a change only the sibling was refreshed for. */
@@ -151,8 +155,13 @@ type TScriptHashRouter = {
 	 *  or a notification. */
 	statuses: Map<string, string | null>;
 	/** Records the status a subscribe answered with, and dispatches one that
-	 *  differs from the last heard as the notification it stands for. */
-	noteSubscribed: (scriptHash: string, response: ISubscribeToAddress) => void;
+	 *  differs from the last heard as the notification it stands for. Returns
+	 *  whether it was the first status heard for the hash and shows history,
+	 *  which nothing will notify. */
+	noteSubscribed: (
+		scriptHash: string,
+		response: ISubscribeToAddress
+	) => boolean;
 };
 
 /** The status the instance behind `sub` last heard for a hash the router holds
@@ -446,12 +455,13 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 			instances: new Set(),
 			subscriptions: new Map(),
 			statuses: new Map(),
-			noteSubscribed: (scriptHash, response): void => {
+			noteSubscribed: (scriptHash, response): boolean => {
 				const data: unknown = response.data;
-				if (response.error) return;
+				if (response.error) return false;
 				// Withdrawn while the subscribe was in flight.
 				const subs = created.subscriptions.get(scriptHash);
-				if (!subs) return;
+				if (!subs) return false;
+				let unheard = false;
 				// "Already Subscribed." carries no status: the subscription was
 				// never lost, so neither was a notification. A hash with no history
 				// answers null, which the client hands back as the whole message.
@@ -465,13 +475,14 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 					// before it as what each instance last heard.
 					if (known && previous !== status) {
 						void created.dispatch([scriptHash, status as string]);
-						return;
+						return false;
 					}
+					unheard = !known && status !== null;
 					created.statuses.set(scriptHash, status);
 				}
 				// A returning instance whose sibling kept the hash has no status
 				// of its own in the router to compare, so it is compared here.
-				if (!created.statuses.has(scriptHash)) return;
+				if (!created.statuses.has(scriptHash)) return false;
 				const current = created.statuses.get(scriptHash) ?? null;
 				for (const [instance, sub] of subs) {
 					if (sub.savedStatus === undefined) continue;
@@ -482,6 +493,7 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 						void deliver(instance, subs, [scriptHash, current as string], sub);
 					}
 				}
+				return unheard;
 			},
 			dispatch: async (data: TSubscribedReceive): Promise<void> => {
 				const scriptHash = Array.isArray(data) ? data[0] : undefined;
@@ -587,6 +599,15 @@ export class Electrum {
 	 *  header that arrives too far away to be compared is read as a rollback
 	 *  rather than as growth: see applyHeader. */
 	private _tipUnverified = false;
+	/** Whether the next block runs a full wallet refresh rather than the
+	 *  unconfirmed check alone. Owed from construction and after every connect,
+	 *  because a subscribe that first hears a status has nothing to compare it
+	 *  with and a dropped socket loses notifications, and after a rollback,
+	 *  which moves confirmed history. Also owed when a later subscribe first
+	 *  hears a status with history, which may have landed after the scan
+	 *  before it, and when a history or UTXO listing is answered in part,
+	 *  since the failed part is left out rather than failing the listing. */
+	private _fullRefreshOwed = true;
 	/** When the server last answered a request without an error. */
 	private _answeredAt = 0;
 
@@ -812,6 +833,7 @@ export class Electrum {
 			return err(DISCONNECTED_ERROR);
 		}
 		this.publishConnectionChange(true);
+		this._fullRefreshOwed = true;
 		// Unconditional, because a connect cannot tell whether the client it now
 		// holds is the one that was subscribed. Our own teardown resets it on a
 		// server change, and rn-electrum-client resets it behind our back on the
@@ -1363,6 +1385,7 @@ export class Electrum {
 
 				unspentAddressResult.data.forEach(
 					({ data, result: unspentAddresses }) => {
+						if (!Array.isArray(unspentAddresses)) this._fullRefreshOwed = true;
 						if (unspentAddresses?.length > 0) {
 							unspentAddresses.forEach((unspentAddress) => {
 								balance += unspentAddress.value;
@@ -1496,12 +1519,16 @@ export class Electrum {
 			const results = new Map<string, TTxResult[]>();
 			responses.forEach((response) => {
 				this.noteAnswer(response);
-				if (response.error) return;
+				if (response.error) {
+					this._fullRefreshOwed = true;
+					return;
+				}
 				response.data.forEach(({ data, result }: TTxResponse) => {
 					if (!data?.scriptHash) return;
 					results.set(data.scriptHash, result);
 					// An entry the server answered with an error is asked again.
 					if (Array.isArray(result)) answered?.set(data.scriptHash, result);
+					else this._fullRefreshOwed = true;
 				});
 			});
 
@@ -2150,7 +2177,10 @@ export class Electrum {
 		// replaced the height the rollback was read from. The debt has to
 		// outlive the write as well as the reconciliation, and be retried by
 		// the next header rather than forgotten.
-		if (reorgDetected) this._reorgOwed = true;
+		if (reorgDetected) {
+			this._reorgOwed = true;
+			this._fullRefreshOwed = true;
+		}
 		await this._wallet.updateHeader(header);
 		// The tip this doubt was about has been replaced.
 		this._tipUnverified = false;
@@ -2231,7 +2261,19 @@ export class Electrum {
 		// not be refreshed or called back into. Checked after applyHeader, so a
 		// reconciliation this instance owes is still recorded in _reorgOwed.
 		if (this._disconnected) return;
-		await this._wallet.refreshWallet();
+		if (this._fullRefreshOwed || this._wallet.refreshFailed) {
+			this._fullRefreshOwed = false;
+			await this._wallet.refreshWallet();
+		} else {
+			// Every script a refresh scans is subscribed, and a status change
+			// refreshes on its own, so a block that changed none of them only
+			// moves what is counted from the tip: the confirmations and reorgs of
+			// the transactions still observed. Fee estimates rode on the refresh.
+			void this._wallet.updateFeeEstimates();
+			if (Object.keys(this._wallet.getUnconfirmedTransactions()).length) {
+				await this._wallet.checkUnconfirmedTransactions();
+			}
+		}
 		this.onReceive?.(data);
 		this.sendMessage(onMessageKeys.newBlock, data[0]);
 	};
@@ -2504,7 +2546,11 @@ export class Electrum {
 		}
 		const removed = sub.callbacks.delete(onReceive);
 		sub.unconfirmedCallbacks?.delete(onReceive);
-		if (sub.callbacks.size === 0 && sub.utxoIndex === undefined) {
+		if (
+			sub.callbacks.size === 0 &&
+			sub.utxoIndex === undefined &&
+			!sub.inWindow
+		) {
 			subs.delete(this);
 			if (subs.size === 0) {
 				router.subscriptions.delete(scriptHash);
@@ -2540,10 +2586,11 @@ export class Electrum {
 	 * attempt with it on `sub` is still waiting or has succeeded. Nothing is
 	 * touched once `sub` is no longer this instance's record: a disconnect
 	 * withdrew it, and whatever stands in its place belongs to a later
-	 * subscribe. The record itself goes only if an attempt created it, and
-	 * then the status it last heard goes back to _withdrawnStatuses, where
-	 * _scriptHashRecord may have just taken it from, so the retry still has
-	 * something to compare the server's answer with.
+	 * subscribe. The record itself goes only if an attempt created it and it
+	 * is not in the wallet's gap windows, and then the status it last heard
+	 * goes back to _withdrawnStatuses, where _scriptHashRecord may have just
+	 * taken it from, so the retry still has something to compare the
+	 * server's answer with.
 	 */
 	private rollBackScriptHashCallback(
 		scriptHash: string,
@@ -2560,13 +2607,16 @@ export class Electrum {
 		const subs = router?.subscriptions.get(scriptHash);
 		if (!router || !subs || subs.get(this) !== sub) return;
 		sub.callbacks.delete(onReceive);
-		if (
-			!unconfirmed.created ||
-			sub.callbacks.size > 0 ||
-			sub.utxoIndex !== undefined
-		) {
+		if (!unconfirmed.created) return;
+		// A window subscribe that found this record standing left its first
+		// status to the attempt that created it, which is this one, and only a
+		// full refresh reads what that status shows. The record stays: a block
+		// does not refresh for a window hash (see _onNewBlock).
+		if (sub.inWindow) {
+			this._fullRefreshOwed = true;
 			return;
 		}
+		if (sub.callbacks.size > 0 || sub.utxoIndex !== undefined) return;
 		const heard = router.statuses.has(scriptHash)
 			? lastHeardStatus(router, scriptHash, sub)
 			: undefined;
@@ -2606,28 +2656,41 @@ export class Electrum {
 		const allUtxos: IUtxo[] = [];
 		const currentWallet = this._wallet.data;
 		const addressTypeKeys = this._wallet.addressTypesToMonitor;
-		// Gather the receiving address scripthash for each address type if no scripthashes were provided.
-		if (!scriptHashes.length) {
+		// Gather the receive and change gap windows for each address type if no
+		// scripthashes were provided. These are the windows a refresh scans, so a
+		// status notification is the only signal a new block needs: see
+		// _onNewBlock.
+		const inWindow = !scriptHashes.length;
+		if (inWindow) {
+			const chains = [
+				{
+					addresses: currentWallet.addresses,
+					indexes: currentWallet.addressIndex,
+					change: false
+				},
+				{
+					addresses: currentWallet.changeAddresses,
+					indexes: currentWallet.changeAddressIndex,
+					change: true
+				}
+			];
 			for (const addressType of addressTypeKeys) {
-				const addresses = currentWallet.addresses[addressType];
-				const addressCount = Object.keys(addresses).length;
-
-				// Check if addresses of this type have been generated. If not, skip.
-				if (addressCount > 0) {
-					let addressIndex = currentWallet.addressIndex[addressType]?.index;
-					addressIndex = addressIndex > 0 ? addressIndex : 0;
+				for (const { addresses, indexes, change } of chains) {
+					const values = Object.values(addresses[addressType] ?? {});
+					// Check if addresses of this chain have been generated. If not, skip.
+					if (!values.length) continue;
+					const index = indexes[addressType]?.index;
 
 					// Only subscribe up to the gap limit.
 					const addressesInRangeToSubscribe = filterAddressesForGapLimit({
-						addresses: Object.values(addresses),
-						index: addressIndex,
+						addresses: values,
+						index: index > 0 ? index : 0,
 						gapLimitOptions: this._wallet.gapLimitOptions,
-						change: false
+						change
 					});
-					const _scriptHashes = addressesInRangeToSubscribe.map(
-						(address) => address.scriptHash
+					scriptHashes.push(
+						...addressesInRangeToSubscribe.map((address) => address.scriptHash)
 					);
-					scriptHashes.push(..._scriptHashes);
 				}
 			}
 			// Keep an eye on existing UTXO's regardless of the gap limit.
@@ -2650,6 +2713,7 @@ export class Electrum {
 		const allScriptHashesPromises = scriptHashes.map(async (scriptHash) => {
 			const created = !router.subscriptions.get(scriptHash)?.has(this);
 			const sub = this._scriptHashRecord(scriptHash);
+			if (inWindow) sub.inWindow = true;
 			const unconfirmed = onReceive
 				? this.addScriptHashCallback(sub, onReceive, created)
 				: undefined;
@@ -2675,7 +2739,15 @@ export class Electrum {
 			) {
 				sub.unconfirmedCallbacks?.delete(onReceive);
 			}
-			router.noteSubscribed(scriptHash, response);
+			// The scan before this subscribe may have missed what the status
+			// shows, and only a full refresh reads it. A record this subscribe
+			// created has heard no status of its own, whatever the router held.
+			if (
+				router.noteSubscribed(scriptHash, response) ||
+				(created && router.statuses.get(scriptHash) !== null)
+			) {
+				this._fullRefreshOwed = true;
+			}
 		});
 
 		const allUtxosPromises = allUtxos.map(async (utxo) => {
@@ -2707,7 +2779,12 @@ export class Electrum {
 			) {
 				sub.unconfirmedCallbacks?.delete(onReceive);
 			}
-			router.noteSubscribed(utxo.scriptHash, response);
+			if (
+				router.noteSubscribed(utxo.scriptHash, response) ||
+				(created && router.statuses.get(utxo.scriptHash) !== null)
+			) {
+				this._fullRefreshOwed = true;
+			}
 		});
 
 		try {
