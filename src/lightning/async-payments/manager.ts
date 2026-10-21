@@ -192,7 +192,8 @@ export class AsyncPaymentManager extends EventEmitter {
 	registerHold(
 		fields: Parameters<HeldForwardLedger['register']>[0],
 		driver: IHeldForwardDriver,
-		judge?: HoldAdmissionJudge
+		judge?: HoldAdmissionJudge,
+		initialState: 'HELD' | 'RELEASING' = 'HELD'
 	): RegisterHoldOutcome {
 		// An inbound HTLC that already has a row is a redispatch: its
 		// resources were reserved when the row was written, so admission is
@@ -209,7 +210,7 @@ export class AsyncPaymentManager extends EventEmitter {
 			if (!verdict.ok) return { refused: verdict.reason };
 			if (verdict.patch) toRegister = { ...fields, ...verdict.patch };
 		}
-		const result = this.ledger.register(toRegister);
+		const result = this.ledger.register(toRegister, initialState);
 		if (!result) return { storageFailed: true };
 		const { record, created } = result;
 		if (!created && record.state !== 'HELD') {

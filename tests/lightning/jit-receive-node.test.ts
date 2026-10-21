@@ -955,3 +955,48 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 		}
 	});
 });
+
+describe('JIT receive waits for an absent wallet (issue #1726)', function () {
+	this.timeout(15_000);
+
+	it('opens once the wallet is back, instead of failing an open it has no init for', async function () {
+		const pair = nodePair();
+		const { alice, bob } = pair;
+		try {
+			const ack = registerIntent(pair);
+			// The wallet goes quiet: alice holds no init for it, which is
+			// exactly what a zero-conf open is refused for.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const peerManager = (alice as any).peerManager;
+			const connectedPeer = peerManager.getPeer;
+			peerManager.getPeer = (): undefined => undefined;
+			const waiting: unknown[] = [];
+			alice.on('jit:waiting-for-wallet', (e) => waiting.push(e));
+			const failures: string[] = [];
+			alice.on('jit:failed', (d: { reason: string }) =>
+				failures.push(d.reason)
+			);
+			const forwarded = new Promise<void>((resolve) =>
+				alice.once('jit:forwarded', () => resolve())
+			);
+
+			driveForward(alice, ack.interceptScid);
+			await new Promise((r) => setTimeout(r, 50));
+			expect(waiting).to.have.length(1);
+			expect(
+				alice.listChannels(),
+				'no open into an absent wallet'
+			).to.have.length(0);
+			expect(failures).to.deep.equal([]);
+
+			peerManager.getPeer = connectedPeer;
+			alice.emit('peer:connect', bob.getNodeId());
+			await forwarded;
+			expect(alice.listChannels()).to.have.length(1);
+			expect(alice.listChannels()[0].state).to.equal(ChannelState.NORMAL);
+			expect(failures).to.deep.equal([]);
+		} finally {
+			pair.destroy();
+		}
+	});
+});

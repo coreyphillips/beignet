@@ -343,6 +343,7 @@ import {
 	IChannelPolicy,
 	IChannelPolicyUpdate,
 	ForwardPlacement,
+	IForwardablePart,
 	clampFeeRateSatPerVbyte,
 	IAutoRebalanceConfig,
 	IAutoTuneFeesConfig,
@@ -487,6 +488,12 @@ import {
 	IHeldForwardRecord,
 	heldForwardCodec
 } from '../async-payments/held-forward-ledger';
+import {
+	IReestablishHoldLimits,
+	isReestablishHold,
+	judgeReestablishHold,
+	resolveReestablishHold
+} from '../async-payments/reestablish-hold';
 import {
 	FF_WITNESS_MAILBOX_LEDGER_PREFIX,
 	FF_WITNESS_RECORD_LEDGER_PREFIX,
@@ -1453,6 +1460,12 @@ export class LightningNode extends EventEmitter {
 	private asyncPaymentManager: AsyncPaymentManager;
 	/** JIT channel receive engine (LSP role); set when config.jitReceive.enabled. */
 	private jitReceiveManager?: JitReceiveManager;
+	/** Reestablish hold limits (issue #1726); null when the hold is off. */
+	private reestablishHold: IReestablishHoldLimits | null = null;
+	/** When each peer's channels last went to reestablish, unix ms. */
+	private peerDisconnectedAt = new Map<string, number>();
+	/** One wall-clock deadline per reestablish hold, by hold id. */
+	private reestablishHoldTimers = new Map<string, NodeJS.Timeout>();
 	/** JIT receive, wallet role: refusal ceilings on an LSP's fee quote. */
 	private readonly jitClientMaxFlatFeeSat: bigint;
 	private readonly jitClientMaxFeePpm: number;
@@ -2446,6 +2459,27 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 		this.asyncPaymentManager.on('held', (record: IHeldForwardRecord) => {
+			if (isReestablishHold(record)) {
+				this.emit('htlc:held-for-reestablish', {
+					holdId: Buffer.from(record.id, 'hex'),
+					peer: record.receiverNodeIdHex,
+					channelId: Buffer.from(record.outChannelIdHex, 'hex'),
+					paymentHash: Buffer.from(record.paymentHashHex, 'hex'),
+					amountMsat: BigInt(record.forwardAmountMsat),
+					holdUntil: record.holdUntil,
+					cutoffHeight: record.cutoffHeight
+				});
+				this.emitStructuredLog('htlc', 'held_for_reestablish', {
+					holdId: record.id,
+					paymentHash: record.paymentHashHex,
+					peer: record.receiverNodeIdHex,
+					outChannelId: record.outChannelIdHex,
+					amountMsat: record.forwardAmountMsat,
+					holdUntil: record.holdUntil,
+					cutoffHeight: record.cutoffHeight
+				});
+				return;
+			}
 			this.emit('htlc:held-forward', {
 				holdId: Buffer.from(record.id, 'hex'),
 				paymentHash: Buffer.from(record.paymentHashHex, 'hex'),
@@ -2469,6 +2503,17 @@ export class LightningNode extends EventEmitter {
 			}
 		});
 		this.asyncPaymentManager.on('released', (record: IHeldForwardRecord) => {
+			if (isReestablishHold(record)) {
+				this.clearReestablishHoldTimer(record.id);
+				this.emitStructuredLog('htlc', 'released_after_reestablish', {
+					holdId: record.id,
+					paymentHash: record.paymentHashHex,
+					outChannelId: record.outChannelIdHex,
+					heldMs: (record.resolvedAt ?? Date.now()) - record.createdAt,
+					...(record.heldBySplice ? { heldBySplice: true } : {})
+				});
+				return;
+			}
 			this.asyncReceiveService.noteReleased();
 			this.emit('htlc:held-forward-released', record);
 			this.emitStructuredLog('htlc', 'held_forward_released', {
@@ -2477,6 +2522,23 @@ export class LightningNode extends EventEmitter {
 			});
 		});
 		this.asyncPaymentManager.on('failed', (record: IHeldForwardRecord) => {
+			if (isReestablishHold(record)) {
+				this.clearReestablishHoldTimer(record.id);
+				const expired =
+					record.failReason === 'hold_expired' ||
+					record.failReason === 'cutoff_unplaced';
+				this.emitStructuredLog(
+					'htlc',
+					expired ? 'hold_expired' : 'reestablish_hold_failed',
+					{
+						holdId: record.id,
+						paymentHash: record.paymentHashHex,
+						outChannelId: record.outChannelIdHex,
+						reason: record.failReason
+					}
+				);
+				return;
+			}
 			this.asyncReceiveService.noteFailed(record);
 			this.emit('htlc:held-forward-failed', record);
 			this.emitStructuredLog('htlc', 'held_forward_failed', {
@@ -2494,6 +2556,7 @@ export class LightningNode extends EventEmitter {
 
 		if (config.jitReceive?.enabled) {
 			this.wireJitReceive(config.jitReceive);
+			this.reestablishHold = resolveReestablishHold(config.reestablishHold);
 		}
 		if (config.directFunding) {
 			// At CONSTRUCTION, like the JIT engine: the lanes have to be subscribed
@@ -5009,9 +5072,23 @@ export class LightningNode extends EventEmitter {
 			this.retryOwedHeldForwardFailures(channelId.toString('hex'));
 			this.retryHeldResolutions(channelId);
 			const peer = this.channelManager.getPeerForChannel(channelId);
-			if (peer) this.asyncPaymentManager.sendNotice(peer);
+			if (peer) {
+				this.peerDisconnectedAt.delete(peer);
+				this.asyncPaymentManager.sendNotice(peer);
+			}
+		});
+		// A reestablish hold's window runs from the first disconnect its
+		// channel has not come back from (issue #1726): a link that flaps
+		// without reestablishing does not restart it.
+		this.channelManager.on('peer:disconnected', (peer: string) => {
+			if (!this.reestablishHold || this.peerDisconnectedAt.has(peer)) return;
+			if (this.channelManager.getChannelsByPeer(peer).length === 0) return;
+			this.peerDisconnectedAt.set(peer, Date.now());
 		});
 		this.channelManager.on('channel:ready', (channelId: Buffer) => {
+			// A new channel with a peer whose old one closed while it was away.
+			const readyPeer = this.channelManager.getPeerForChannel(channelId);
+			if (readyPeer) this.peerDisconnectedAt.delete(readyPeer);
 			this.registerChannelScids(channelId);
 			this.persistChannel(channelId);
 			// Clear reestablish stuck tracker when channel reaches NORMAL
@@ -11453,6 +11530,10 @@ export class LightningNode extends EventEmitter {
 		// must not keep the process alive.
 		this.recoveryBarrier?.stop();
 		this.jitReceiveManager?.destroy();
+		for (const timer of this.reestablishHoldTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.reestablishHoldTimers.clear();
 		this.stopDirectFunding();
 		this.stopSwapProvider();
 		this.stopCleanupTimer();
@@ -23363,6 +23444,18 @@ export class LightningNode extends EventEmitter {
 				splicePendingLock: (channelId): boolean =>
 					this.channelManager.getChannel(channelId)?.isSplicePendingLock() ===
 					true,
+				walletReachable: (walletPubkeyHex, channelId): boolean =>
+					this.jitWalletReachable(walletPubkeyHex, channelId),
+				walletMayBeReachable: (
+					walletPubkeyHex,
+					channelId,
+					timeoutMs
+				): Promise<void> =>
+					this.jitWalletMayBeReachable(walletPubkeyHex, channelId, timeoutMs),
+				canOfferHtlcs: (channelId, amountsMsat): boolean =>
+					this.channelManager
+						.getChannel(channelId)
+						?.canOfferHtlcSet(amountsMsat) === true,
 				maxFundableSats: () => this.jitMaxFundableSats(),
 				storage: this.storage ?? undefined,
 				failRestoredHtlc: (part) => this.failRestoredHeldHtlc(part)
@@ -23384,10 +23477,17 @@ export class LightningNode extends EventEmitter {
 			'jit:funding',
 			'jit:forwarded',
 			'jit:failed',
-			'jit:restored-failed'
+			'jit:restored-failed',
+			'jit:waiting-for-wallet'
 		]) {
 			this.jitReceiveManager.on(evt, (data) => this.emit(evt, data));
 		}
+		this.jitReceiveManager.on(
+			'jit:waiting-for-wallet',
+			(data: { walletPubkeyHex: string; channelIdHex?: string }) => {
+				this.emitStructuredLog('htlc', 'jit_waiting_for_wallet', data);
+			}
+		);
 		// Ride the ISOLATED custom-message dispatch (issue #546) rather than
 		// handling the subtype inline before it: a malformed authorization must
 		// not cost the peer its connection. Our own handler is additionally
@@ -23407,6 +23507,52 @@ export class LightningNode extends EventEmitter {
 				}
 			}
 		);
+	}
+
+	/**
+	 * Whether a JIT funding can reach its wallet now (issue #1726): an open
+	 * needs the wallet's init, which is what openChannel reads its zero-conf
+	 * and dual-fund support from, and a splice needs the channel back from
+	 * reestablish. Without a peer manager there is no connection to judge,
+	 * so only the channel is.
+	 */
+	private jitWalletReachable(
+		walletPubkeyHex: string,
+		channelId?: Buffer
+	): boolean {
+		if (channelId) {
+			return (
+				this.channelManager.getChannel(channelId)?.getState() !==
+				ChannelState.AWAITING_REESTABLISH
+			);
+		}
+		if (!this.peerManager) return true;
+		return this.peerManager.getPeer(walletPubkeyHex)?.getRemoteInit() != null;
+	}
+
+	/** Resolves on a connect or a reestablish, or after `timeoutMs`. */
+	private jitWalletMayBeReachable(
+		walletPubkeyHex: string,
+		channelId: Buffer | undefined,
+		timeoutMs: number
+	): Promise<void> {
+		return new Promise<void>((resolve) => {
+			const done = (): void => {
+				clearTimeout(timer);
+				this.removeListener('peer:connect', onEvent);
+				this.channelManager.removeListener('channel:reestablished', onEvent);
+				this._activeWaitCleanups.delete(done);
+				resolve();
+			};
+			const onEvent = (): void => {
+				if (this.jitWalletReachable(walletPubkeyHex, channelId)) done();
+			};
+			const timer = setTimeout(done, timeoutMs);
+			timer.unref?.();
+			this._activeWaitCleanups.add(done);
+			this.on('peer:connect', onEvent);
+			this.channelManager.on('channel:reestablished', onEvent);
+		});
 	}
 
 	/**
@@ -24653,12 +24799,41 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
+		const part: IForwardablePart = {
+			inChannelId,
+			inHtlcId,
+			paymentHash,
+			forwardAmountMsat: forwardAmount,
+			incomingAmountMsat,
+			forwardCltv,
+			incomingCltvExpiry,
+			nextPacket,
+			nextBlindingPoint,
+			failIncoming
+		};
+
 		// Look up outgoing channel via SCID (real SCID for blinded hops) BEFORE
 		// the policy checks: the fee/CLTV we enforce is the OUTGOING channel's
 		// effective policy (per-channel override or node defaults).
 		const scidHex = outgoingScid.toString('hex');
 		const outChannelId = this.scidToChannelId.get(scidHex);
 		if (!outChannelId) {
+			// A JIT part held for reestablish names an intercept SCID that no
+			// channel answers to, and its intent went with the funding: the
+			// hold row is what knows the channel it waits on.
+			const held = this.heldForwardLedger.byIncoming(
+				inChannelId.toString('hex'),
+				inHtlcId
+			);
+			if (
+				held &&
+				this.rearmReestablishHold(
+					Buffer.from(held.outChannelIdHex, 'hex'),
+					part
+				)
+			) {
+				return;
+			}
 			// JIT receive (LSP role): an unknown SCID may be an intercept SCID we
 			// minted for a wallet peer, so hold the HTLC and fund a channel to it
 			// rather than failing. Before the outgoing-policy, fee and CLTV checks
@@ -24774,20 +24949,16 @@ export class LightningNode extends EventEmitter {
 		): ForwardPlacement =>
 			this.forwardHtlcOnto(
 				outChannelId,
-				{
-					inChannelId,
-					inHtlcId,
-					paymentHash,
-					forwardAmountMsat: forwardAmount,
-					incomingAmountMsat,
-					forwardCltv,
-					incomingCltvExpiry,
-					nextPacket,
-					nextBlindingPoint,
-					failIncoming: fail
-				},
+				{ ...part, failIncoming: fail },
 				refundOwner
 			);
+
+		// Reestablish hold (issue #1726): a restart's redispatch of a part the
+		// hold already owns is driven from its row, never forwarded around it.
+		// Ahead of the async hold: a part that also carries hold_htlc would
+		// otherwise be re-parked under a driver that knows neither the window
+		// nor the timer.
+		if (this.rearmReestablishHold(outChannelId, part)) return;
 
 		// Async payments (LSP role, issue #708): the recipient's blinded path
 		// marked this hop hold_htlc, so park the forward in the durable
@@ -24837,7 +25008,12 @@ export class LightningNode extends EventEmitter {
 			});
 		}
 
-		performForward();
+		// A wallet whose channel is awaiting reestablish gets the part held
+		// rather than refused. Judged here so a hold never shows as a refused
+		// add; the add path judges only what reaches it some other way.
+		const reestablishHold = this.holdForReestablish(outChannelId, part);
+		if (reestablishHold === 'held') return;
+		this.forwardHtlcOnto(outChannelId, part, 'engine', reestablishHold);
 	}
 
 	/**
@@ -24916,60 +25092,7 @@ export class LightningNode extends EventEmitter {
 			};
 		};
 		const driver: IHeldForwardDriver = {
-			forward: () => {
-				const outChannel = this.channelManager.getChannel(args.outChannelId);
-				if (!outChannel) {
-					// The outgoing channel is gone: nothing can ever place this
-					// add, so the release resolves as a refusal upstream.
-					return args.failIncoming(UNKNOWN_NEXT_PEER) ? 'refused' : 'deferred';
-				}
-				const state = outChannel.getState();
-				if (
-					state === ChannelState.AWAITING_REESTABLISH ||
-					state === ChannelState.SPLICING ||
-					(state === ChannelState.NORMAL && outChannel.isQuiescing())
-				) {
-					return 'deferred';
-				}
-				if (state !== ChannelState.NORMAL) {
-					return args.failIncoming(UNKNOWN_NEXT_PEER) ? 'refused' : 'deferred';
-				}
-				// Judged by the add's acceptance, not by the linkage row: a
-				// synchronous loopback can run the whole fulfill chain inside
-				// the add and consume the row before this returns.
-				let inboundResolved = false;
-				const tracked = (code: number): boolean => {
-					const ok = args.failIncoming(code);
-					if (ok) inboundResolved = true;
-					return ok;
-				};
-				// The refund for a refused part is owed HERE (issue #722): the
-				// placement is told so, and the JIT engine registers no owed
-				// failure of its own for it, so exactly one ledger retries it.
-				const placement = args.performForward(tracked, 'caller');
-				if (placement === 'forwarded') return 'forwarded';
-				if (placement === 'held') {
-					// The JIT engine took the part for a splice and owns it from
-					// here: it forwards it once the splice locks or fails it
-					// upstream itself. Failing it here would pay downstream for
-					// an inbound leg already refunded.
-					this.emitStructuredLog('htlc', 'held_forward_to_splice', {
-						inChannelId: args.inChannelId.toString('hex'),
-						inHtlcId: Number(args.inHtlcId)
-					});
-					return 'held';
-				}
-				// The refusal path fails the inbound HTLC; when its channel
-				// could not carry that (reestablishing), the row still goes
-				// terminal and the refund is owed here, retried on reestablish
-				// and per block.
-				if (!inboundResolved) {
-					this.oweHeldForwardFailure(args.inChannelId, args.inHtlcId, () =>
-						args.failIncoming(TEMPORARY_CHANNEL_FAILURE)
-					);
-				}
-				return 'refused';
-			},
+			forward: () => this.placeHeldForward(args),
 			fail: () => args.failIncoming(UNKNOWN_NEXT_PEER)
 		};
 		const outcome = this.asyncPaymentManager.registerHold(
@@ -25023,6 +25146,303 @@ export class LightningNode extends EventEmitter {
 		// A NEW hold surfaces through the manager's 'held' event (wired in
 		// the constructor); a re-registration after a restart is silent.
 	}
+
+	/**
+	 * Place a held forward's onward add, for the ledger driver of an async
+	 * hold or a reestablish hold: deferred while the outgoing channel cannot
+	 * take adds yet, refused (with the refund carried or owed) when it never
+	 * will or the add is refused.
+	 */
+	private placeHeldForward(args: {
+		inChannelId: Buffer;
+		inHtlcId: bigint;
+		outChannelId: Buffer;
+		performForward: (
+			fail?: (code: number) => boolean,
+			refundOwner?: 'engine' | 'caller'
+		) => ForwardPlacement;
+		failIncoming: (code: number) => boolean;
+	}): ReturnType<IHeldForwardDriver['forward']> {
+		const outChannel = this.channelManager.getChannel(args.outChannelId);
+		if (!outChannel) {
+			// The outgoing channel is gone: nothing can ever place this
+			// add, so the release resolves as a refusal upstream.
+			return args.failIncoming(UNKNOWN_NEXT_PEER) ? 'refused' : 'deferred';
+		}
+		const state = outChannel.getState();
+		if (
+			state === ChannelState.AWAITING_REESTABLISH ||
+			state === ChannelState.SPLICING ||
+			(state === ChannelState.NORMAL && outChannel.isQuiescing())
+		) {
+			return 'deferred';
+		}
+		if (state !== ChannelState.NORMAL) {
+			return args.failIncoming(UNKNOWN_NEXT_PEER) ? 'refused' : 'deferred';
+		}
+		// Judged by the add's acceptance, not by the linkage row: a
+		// synchronous loopback can run the whole fulfill chain inside
+		// the add and consume the row before this returns.
+		let inboundResolved = false;
+		const tracked = (code: number): boolean => {
+			const ok = args.failIncoming(code);
+			if (ok) inboundResolved = true;
+			return ok;
+		};
+		// The refund for a refused part is owed HERE (issue #722): the
+		// placement is told so, and the JIT engine registers no owed
+		// failure of its own for it, so exactly one ledger retries it.
+		const placement = args.performForward(tracked, 'caller');
+		if (placement === 'forwarded') return 'forwarded';
+		if (placement === 'held') {
+			// The JIT engine took the part for a splice and owns it from
+			// here: it forwards it once the splice locks or fails it
+			// upstream itself. Failing it here would pay downstream for
+			// an inbound leg already refunded.
+			this.emitStructuredLog('htlc', 'held_forward_to_splice', {
+				inChannelId: args.inChannelId.toString('hex'),
+				inHtlcId: Number(args.inHtlcId)
+			});
+			return 'held';
+		}
+		// The refusal path fails the inbound HTLC; when its channel
+		// could not carry that (reestablishing), the row still goes
+		// terminal and the refund is owed here, retried on reestablish
+		// and per block.
+		if (!inboundResolved) {
+			this.oweHeldForwardFailure(args.inChannelId, args.inHtlcId, () =>
+				args.failIncoming(TEMPORARY_CHANNEL_FAILURE)
+			);
+		}
+		return 'refused';
+	}
+
+	/**
+	 * Reestablish hold (issue #1726): park a forward to a liquidity client
+	 * whose channel is awaiting reestablish instead of failing it. 'held'
+	 * when the part is now the hold's and the caller must leave it alone;
+	 * 'refused' when the window or a count cap turned it down, so nothing else
+	 * may hold it for the absent wallet either; 'ineligible' leaves the caller
+	 * to forward (or fail) it as before, and so does the value cap.
+	 *
+	 * A liquidity client is the peer on an unannounced channel that this node
+	 * opened or whose peer holds a JIT intent, and only while this node runs
+	 * the JIT receive role. The window and the caps are judged in the same
+	 * synchronous step as the durable write (judgeReestablishHold).
+	 */
+	private holdForReestablish(
+		outChannelId: Buffer,
+		part: IForwardablePart
+	): 'held' | 'refused' | 'ineligible' {
+		const limits = this.reestablishHold;
+		if (!limits || !this.jitReceiveManager) return 'ineligible';
+		const channel = this.channelManager.getChannel(outChannelId);
+		if (channel?.getState() !== ChannelState.AWAITING_REESTABLISH) {
+			return 'ineligible';
+		}
+		const peer = this.channelManager.getPeerForChannel(outChannelId);
+		if (!peer) return 'ineligible';
+		const channelState = channel.getFullState();
+		if (
+			channelState.announceChannel ||
+			(channelState.role !== ChannelRole.OPENER &&
+				!this.channelManager.isJitClient(peer))
+		) {
+			return 'ineligible';
+		}
+		const inChannelIdHex = part.inChannelId.toString('hex');
+		if (this.heldForwardLedger.byIncoming(inChannelIdHex, part.inHtlcId)) {
+			return 'ineligible';
+		}
+		const outChannelIdHex = outChannelId.toString('hex');
+		// Release is allowed strictly below the cutoff, so the wallet's term is
+		// the first height at which it would refuse the part, and a payer that
+		// padded nothing can still be held until a block arrives. The wallet's
+		// delta is not in the onion: a JIT client may be paid on a JIT invoice,
+		// which asks for more than the default. The other term is our own
+		// margin on the inbound leg.
+		const walletFinalCltv = this.channelManager.isJitClient(peer)
+			? JIT_RECEIVE_MIN_FINAL_CLTV_EXPIRY
+			: DEFAULT_MIN_FINAL_CLTV_EXPIRY;
+		const cutoffHeight = Math.min(
+			part.forwardCltv - walletFinalCltv + 1,
+			part.incomingCltvExpiry -
+				Math.max(HELD_HTLC_EXPIRY_MARGIN, this.htlcSafetyMargin)
+		);
+		const judge = (): ReturnType<HoldAdmissionJudge> => {
+			const verdict = judgeReestablishHold(
+				{
+					peerHex: peer,
+					outChannelIdHex,
+					forwardAmountMsat: part.forwardAmountMsat,
+					cutoffHeight,
+					channelSendableMsat: channel.getSpendableOutboundMsat(),
+					disconnectedAt: this.peerDisconnectedAt.get(peer),
+					now: Date.now(),
+					height: this.currentBlockHeight
+				},
+				this.heldForwardLedger.unresolved(),
+				limits
+			);
+			if (!verdict.ok) return { ok: false, reason: verdict.reason };
+			return {
+				ok: true,
+				patch: { kind: 'reestablish', holdUntil: verdict.holdUntil }
+			};
+		};
+		const outcome = this.asyncPaymentManager.registerHold(
+			{
+				inChannelIdHex,
+				inHtlcId: part.inHtlcId.toString(),
+				paymentHashHex: part.paymentHash.toString('hex'),
+				outChannelIdHex,
+				receiverNodeIdHex: peer,
+				// No grant names this hold, as for a pre-#709 marker.
+				registrationIdHex: '00'.repeat(32),
+				incomingAmountMsat: (
+					part.incomingAmountMsat ?? part.forwardAmountMsat
+				).toString(),
+				forwardAmountMsat: part.forwardAmountMsat.toString(),
+				forwardCltv: part.forwardCltv,
+				incomingCltvExpiry: part.incomingCltvExpiry,
+				cutoffHeight
+			},
+			this.reestablishHoldDriver(outChannelId, part),
+			judge,
+			'RELEASING'
+		);
+		if ('refused' in outcome || 'storageFailed' in outcome) {
+			this.emitStructuredLog('htlc', 'reestablish_hold_refused', {
+				paymentHash: part.paymentHash.toString('hex'),
+				peer,
+				outChannelId: outChannelIdHex,
+				reason: 'refused' in outcome ? outcome.refused : 'storage_failed'
+			});
+			// A channel too small for the part is what a JIT splice is for.
+			return 'refused' in outcome && outcome.refused === 'channel_value'
+				? 'ineligible'
+				: 'refused';
+		}
+		this.armReestablishHoldTimer(outcome.record);
+		return 'held';
+	}
+
+	/**
+	 * A restart's redispatch of an inbound HTLC a reestablish hold already
+	 * owns: the driver and the deadline are re-armed from the row and nothing
+	 * is judged again, the same rule parkHeldForward applies. False when no
+	 * such row exists.
+	 */
+	private rearmReestablishHold(
+		outChannelId: Buffer,
+		part: IForwardablePart
+	): boolean {
+		const existing = this.heldForwardLedger.byIncoming(
+			part.inChannelId.toString('hex'),
+			part.inHtlcId
+		);
+		if (!existing || !isReestablishHold(existing)) return false;
+		// The row's amount, not the onion's: a JIT part was held after its
+		// opening fee came off.
+		const outcome = this.asyncPaymentManager.registerHold(
+			existing,
+			this.reestablishHoldDriver(outChannelId, {
+				...part,
+				forwardAmountMsat: BigInt(existing.forwardAmountMsat)
+			})
+		);
+		if (!('record' in outcome)) return true;
+		if (
+			outcome.record.state === 'FAILED' &&
+			this.findOutgoingLeg(part.inChannelId, part.inHtlcId) === null
+		) {
+			this.oweHeldForwardFailure(part.inChannelId, part.inHtlcId, () =>
+				part.failIncoming(TEMPORARY_CHANNEL_FAILURE)
+			);
+			this.retryOwedHeldForwardFailures(part.inChannelId.toString('hex'));
+		}
+		this.armReestablishHoldTimer(outcome.record);
+		return true;
+	}
+
+	private reestablishHoldDriver(
+		outChannelId: Buffer,
+		part: IForwardablePart
+	): IHeldForwardDriver {
+		return {
+			forward: (): ReturnType<IHeldForwardDriver['forward']> => {
+				// Past the window only the timer acts on the row, and past the
+				// cutoff only the block scan or the timer: a restart's redispatch
+				// drives the row before either has run.
+				const row = this.heldForwardLedger.byIncoming(
+					part.inChannelId.toString('hex'),
+					part.inHtlcId
+				);
+				if (
+					row &&
+					((row.holdUntil !== undefined && Date.now() >= row.holdUntil) ||
+						(this.currentBlockHeight > 0 &&
+							this.currentBlockHeight >= row.cutoffHeight))
+				) {
+					return 'deferred';
+				}
+				return this.placeHeldForward({
+					inChannelId: part.inChannelId,
+					inHtlcId: part.inHtlcId,
+					outChannelId,
+					performForward: (fail = part.failIncoming, refundOwner = 'engine') =>
+						this.forwardHtlcOnto(
+							outChannelId,
+							{ ...part, failIncoming: fail },
+							refundOwner
+						),
+					failIncoming: part.failIncoming
+				});
+			},
+			// Never a code a payer reads as final: the payment can be retried
+			// once the wallet is back.
+			fail: () => part.failIncoming(TEMPORARY_CHANNEL_FAILURE)
+		};
+	}
+
+	/** The wall-clock end of a reestablish hold, one unref'd timer per row. */
+	private armReestablishHoldTimer(record: IHeldForwardRecord): void {
+		if (record.state !== 'RELEASING' || record.holdUntil === undefined) return;
+		if (this.reestablishHoldTimers.has(record.id)) return;
+		const timer = setTimeout(
+			() => {
+				this.reestablishHoldTimers.delete(record.id);
+				this.asyncPaymentManager.failHeldForward(record.id, 'hold_expired');
+			},
+			Math.max(0, record.holdUntil - Date.now())
+		);
+		timer.unref?.();
+		this.reestablishHoldTimers.set(record.id, timer);
+	}
+
+	private clearReestablishHoldTimer(holdIdHex: string): void {
+		const timer = this.reestablishHoldTimers.get(holdIdHex);
+		if (timer) clearTimeout(timer);
+		this.reestablishHoldTimers.delete(holdIdHex);
+	}
+
+	/**
+	 * Drop reestablish hold rows a day after they resolved, once their
+	 * inbound HTLC is gone too. Until then a FAILED row is what stops a
+	 * restart from forwarding a part whose refund is still owed. Async hold
+	 * rows are an operator's record and stay.
+	 */
+	private pruneReestablishHolds(): void {
+		const before = Date.now() - LightningNode.REESTABLISH_HOLD_RETAIN_MS;
+		for (const r of this.heldForwardLedger.list()) {
+			if (!isReestablishHold(r) || r.resolvedAt === undefined) continue;
+			if (r.resolvedAt > before) continue;
+			if (this.heldForwardIncomingUnresolved(r)) continue;
+			this.heldForwardLedger.forget(r.id);
+		}
+	}
+
+	private static readonly REESTABLISH_HOLD_RETAIN_MS = 24 * 60 * 60 * 1000;
 
 	private oweHeldForwardFailure(
 		inChannelId: Buffer,
@@ -25145,8 +25565,9 @@ export class LightningNode extends EventEmitter {
 	 * patching up half a transition from outside it.
 	 *
 	 * A refused part has exactly one owner afterwards (issue #722). When the
-	 * JIT engine takes it for a splice the placement is `held` and the
-	 * engine forwards or fails it; nobody else may touch it. Otherwise the
+	 * JIT engine takes it for a splice, or a reestablish hold parks it (issue
+	 * #1726), the placement is `held` and that owner forwards or fails it;
+	 * nobody else may touch it. Otherwise the
 	 * refusal fails the inbound HTLC, and when that channel cannot carry the
 	 * failure right now the refund is owed by ONE retry ledger: the engine's
 	 * (`refundOwner: 'engine'`, the ordinary and JIT paths) or the caller's
@@ -25155,7 +25576,9 @@ export class LightningNode extends EventEmitter {
 	private forwardHtlcOnto(
 		outChannelId: Buffer,
 		part: IHeldJitPart,
-		refundOwner: 'engine' | 'caller' = 'engine'
+		refundOwner: 'engine' | 'caller' = 'engine',
+		/** holdForReestablish's verdict, when the caller already asked it. */
+		reestablishHold?: 'refused' | 'ineligible'
 	): ForwardPlacement {
 		// The tip may have moved since the forward was judged (issue #1009): a
 		// JIT part held for a splice, a held forward its receiver releases and
@@ -25229,6 +25652,21 @@ export class LightningNode extends EventEmitter {
 			this.withStagedMutations(
 				[{ type: 'delete_forwarded_htlc', outKey }],
 				() => {
+					// A wallet that went quiet between the decision to forward
+					// and the add (a JIT funding's forward, say) is waited for,
+					// not refused (issue #1726). Ahead of the splice hook: a
+					// channel awaiting reestablish is not short of liquidity.
+					// Never for a held-forward driver ('caller'): its row
+					// already owns the part.
+					const hold =
+						reestablishHold ??
+						(refundOwner === 'engine'
+							? this.holdForReestablish(outChannelId, part)
+							: 'ineligible');
+					if (hold === 'held') {
+						placement = 'held';
+						return;
+					}
 					// JIT receive: for a channel whose peer is a JIT client this
 					// refusal is a liquidity shortfall, not a dead end. Hold the
 					// part, splice our own funds in, and retry the forward once.
@@ -25236,7 +25674,12 @@ export class LightningNode extends EventEmitter {
 					// linkage rollback, because a held-for-splice part is a
 					// forward whose linkage was deliberately rolled back and is
 					// re-registered when the retry re-enters this method.
-					if (this.jitReceiveManager?.tryHoldForSplice(outChannelId, part)) {
+					// Not for a part the reestablish hold refused: the splice
+					// also waits for the absent wallet, past the hold's caps.
+					if (
+						hold !== 'refused' &&
+						this.jitReceiveManager?.tryHoldForSplice(outChannelId, part)
+					) {
 						this.emitStructuredLog('htlc', 'jit_held_for_splice', {
 							channelId: outChannelId.toString('hex'),
 							paymentHash: part.paymentHash.toString('hex'),
@@ -29278,6 +29721,7 @@ export class LightningNode extends EventEmitter {
 			this.scanExpiringHeldHtlcs(blockHeight);
 		}
 		this.asyncPaymentManager.scan(blockHeight);
+		this.pruneReestablishHolds();
 		this.scanForwardTimeouts(blockHeight);
 		this.scanStuckChannels(blockHeight);
 		this.reviewFundingMissingClocks(blockHeight);
@@ -30436,6 +30880,7 @@ export class LightningNode extends EventEmitter {
 			forwardingFeePropMillionths?: number;
 			forwardingCltvDelta?: number;
 			jitReceive?: INodeConfig['jitReceive'];
+			reestablishHold?: INodeConfig['reestablishHold'];
 			jitReceiveClient?: INodeConfig['jitReceiveClient'];
 			directFunding?: INodeConfig['directFunding'];
 			swaps?: INodeConfig['swaps'];
@@ -30522,6 +30967,7 @@ export class LightningNode extends EventEmitter {
 			forwardingFeePropMillionths: options?.forwardingFeePropMillionths,
 			forwardingCltvDelta: options?.forwardingCltvDelta,
 			jitReceive: options?.jitReceive,
+			reestablishHold: options?.reestablishHold,
 			jitReceiveClient: options?.jitReceiveClient,
 			directFunding: options?.directFunding,
 			swaps: options?.swaps,

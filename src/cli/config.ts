@@ -218,7 +218,7 @@ function leaseRatesEnv(raw: string | undefined): BeignetConfig['leaseRates'] {
 /**
  * BEIGNET_JIT_RECEIVE / _FLAT_FEE_SAT / _FEE_PPM / _MAX_FLAT_FEE_SAT /
  * _MAX_FEE_PPM / _MAX_CLIENT_FUNDING_SAT / _MAX_CONCURRENT_FUNDINGS /
- * _MAX_TOTAL_FUNDING_SAT, assembled into one config block. A variable that is not set
+ * _MAX_TOTAL_FUNDING_SAT / _REESTABLISH_HOLD_MS, assembled into one config block. A variable that is not set
  * leaves its field out rather than writing an undefined, so mergeJitReceive
  * can let the config file answer for that field alone.
  *
@@ -251,6 +251,10 @@ function jitReceiveEnv(): BeignetConfig['jitReceive'] {
 	const maxTotalFundingSats = integerEnv(
 		process.env.BEIGNET_JIT_MAX_TOTAL_FUNDING_SAT
 	);
+	// The reestablish hold (issue #1726), part of the same LSP role.
+	const reestablishHoldMs = integerEnv(
+		process.env.BEIGNET_JIT_REESTABLISH_HOLD_MS
+	);
 	if (
 		enabled === undefined &&
 		flatFeeSat === undefined &&
@@ -259,7 +263,8 @@ function jitReceiveEnv(): BeignetConfig['jitReceive'] {
 		maxFeePpm === undefined &&
 		maxClientFundingSats === undefined &&
 		maxConcurrentFundings === undefined &&
-		maxTotalFundingSats === undefined
+		maxTotalFundingSats === undefined &&
+		reestablishHoldMs === undefined
 	) {
 		return undefined;
 	}
@@ -271,7 +276,8 @@ function jitReceiveEnv(): BeignetConfig['jitReceive'] {
 		...(maxFeePpm !== undefined ? { maxFeePpm } : {}),
 		...(maxClientFundingSats !== undefined ? { maxClientFundingSats } : {}),
 		...(maxConcurrentFundings !== undefined ? { maxConcurrentFundings } : {}),
-		...(maxTotalFundingSats !== undefined ? { maxTotalFundingSats } : {})
+		...(maxTotalFundingSats !== undefined ? { maxTotalFundingSats } : {}),
+		...(reestablishHoldMs !== undefined ? { reestablishHoldMs } : {})
 	};
 }
 
@@ -389,6 +395,8 @@ function mergeJitReceive(
 		cli?.maxTotalFundingSats ??
 		env?.maxTotalFundingSats ??
 		file?.maxTotalFundingSats;
+	const reestablishHoldMs =
+		cli?.reestablishHoldMs ?? env?.reestablishHoldMs ?? file?.reestablishHoldMs;
 	return {
 		...(enabled !== undefined ? { enabled } : {}),
 		...(flatFeeSat !== undefined ? { flatFeeSat } : {}),
@@ -397,7 +405,8 @@ function mergeJitReceive(
 		...(maxFeePpm !== undefined ? { maxFeePpm } : {}),
 		...(maxClientFundingSats !== undefined ? { maxClientFundingSats } : {}),
 		...(maxConcurrentFundings !== undefined ? { maxConcurrentFundings } : {}),
-		...(maxTotalFundingSats !== undefined ? { maxTotalFundingSats } : {})
+		...(maxTotalFundingSats !== undefined ? { maxTotalFundingSats } : {}),
+		...(reestablishHoldMs !== undefined ? { reestablishHoldMs } : {})
 	};
 }
 

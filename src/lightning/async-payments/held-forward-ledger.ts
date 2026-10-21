@@ -20,6 +20,8 @@
  *                                       JIT engine took the part for a
  *                                       splice; the engine alone forwards
  *                                       or fails it from here, issue #722)
+ *   (new) -> RELEASING                 (a reestablish hold, issue #1726: no
+ *                                       release is owed, only the channel)
  *
  * The CLTV cutoff. A hold's `cutoffHeight` is fixed when it is parked:
  *
@@ -105,6 +107,14 @@ export interface IHeldForwardRecord extends ILedgerRecord {
 	 * the engine's `jit:forwarded` / `jit:failed`, not this row's.
 	 */
 	heldBySplice?: boolean;
+	/**
+	 * A reestablish hold (issue #1726): a forward to a liquidity client whose
+	 * channel was awaiting reestablish, written RELEASING because nobody
+	 * signs a release for it. The channel's reestablish places it; the cutoff
+	 * or `holdUntil` (unix ms, measured from the peer's disconnect) fails it.
+	 */
+	kind?: 'reestablish';
+	holdUntil?: number;
 }
 
 export const HELD_FORWARD_LEDGER_PREFIX = 'held_forward';
@@ -158,13 +168,28 @@ export interface IHeldForwardOccupancy {
 
 export class HeldForwardLedger {
 	private readonly ledger: DurableLedger<IHeldForwardRecord>;
+	/**
+	 * hold_id by inbound HTLC. Every forward asks whether a reestablish hold
+	 * owns it (issue #1726), so the lookup cannot be a scan of the ledger.
+	 */
+	private readonly idByIncoming = new Map<string, string>();
 
 	constructor(store: IDurableLedgerStore<IHeldForwardRecord>) {
 		this.ledger = new DurableLedger(store);
 	}
 
+	private static incomingKey(inChannelIdHex: string, inHtlcId: string): string {
+		return `${inChannelIdHex}:${inHtlcId}`;
+	}
+
 	rehydrate(): number {
-		return this.ledger.rehydrate();
+		const count = this.ledger.rehydrate();
+		this.idByIncoming.clear();
+		for (const r of this.ledger.list()) {
+			const key = HeldForwardLedger.incomingKey(r.inChannelIdHex, r.inHtlcId);
+			if (!this.idByIncoming.has(key)) this.idByIncoming.set(key, r.id);
+		}
+		return count;
 	}
 
 	isRehydrated(): boolean {
@@ -188,10 +213,10 @@ export class HeldForwardLedger {
 		inChannelIdHex: string,
 		inHtlcId: bigint
 	): IHeldForwardRecord | undefined {
-		const id = inHtlcId.toString();
-		return this.ledger.find(
-			(r) => r.inChannelIdHex === inChannelIdHex && r.inHtlcId === id
-		)[0];
+		const id = this.idByIncoming.get(
+			HeldForwardLedger.incomingKey(inChannelIdHex, inHtlcId.toString())
+		);
+		return id === undefined ? undefined : this.ledger.get(id);
 	}
 
 	/** Payment-level index: every part parked under one hash. */
@@ -236,13 +261,14 @@ export class HeldForwardLedger {
 	 * Park a new hold. Idempotent on the canonical identity: an inbound HTLC
 	 * that already has a record (a restart's redispatch, a replayed add)
 	 * gets that record back, keeping the hold_id any capability already
-	 * names.
+	 * names. A hold with no release to wait for is written RELEASING.
 	 */
 	register(
 		fields: Omit<
 			IHeldForwardRecord,
 			'id' | 'state' | 'createdAt' | 'releaseNonceHex' | 'failReason'
-		>
+		>,
+		initialState: 'HELD' | 'RELEASING' = 'HELD'
 	): { record: IHeldForwardRecord; created: boolean } | null {
 		const existing = this.byIncoming(
 			fields.inChannelIdHex,
@@ -252,11 +278,15 @@ export class HeldForwardLedger {
 		const record: IHeldForwardRecord = {
 			...fields,
 			id: crypto.randomBytes(32).toString('hex'),
-			state: 'HELD',
+			state: initialState,
 			createdAt: Date.now()
 		};
 		const result = this.ledger.insert(record);
 		if (result.outcome !== 'applied' || !result.record) return null;
+		this.idByIncoming.set(
+			HeldForwardLedger.incomingKey(record.inChannelIdHex, record.inHtlcId),
+			record.id
+		);
 		return { record: result.record, created: true };
 	}
 
@@ -333,6 +363,9 @@ export class HeldForwardLedger {
 	forget(holdIdHex: string): boolean {
 		const r = this.ledger.get(holdIdHex);
 		if (!r || isUnresolvedHeldForward(r.state)) return false;
-		return this.ledger.remove(holdIdHex);
+		if (!this.ledger.remove(holdIdHex)) return false;
+		const key = HeldForwardLedger.incomingKey(r.inChannelIdHex, r.inHtlcId);
+		if (this.idByIncoming.get(key) === holdIdHex) this.idByIncoming.delete(key);
+		return true;
 	}
 }

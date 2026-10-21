@@ -2573,6 +2573,8 @@ export class ChannelManager extends EventEmitter {
 			// this sweep.
 			this.releaseAbandonedV2Pledges(channel);
 		}
+		// The moment a reestablish hold measures its window from (issue #1726).
+		this.emit('peer:disconnected', peerPubkey);
 	}
 
 	/**

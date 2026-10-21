@@ -495,6 +495,28 @@ export interface IJitManagerDeps {
 	 */
 	splicePendingLock?(outChannelId: Buffer): boolean;
 	/**
+	 * Whether the wallet can take a funding right now (issue #1726):
+	 * connected, and for a splice, its channel reestablished. A phone that
+	 * went quiet comes back within the hold budget far more often than not,
+	 * so a funding waits for it rather than failing into its absence.
+	 * Absent: always reachable.
+	 */
+	walletReachable?(walletPubkeyHex: string, channelId?: Buffer): boolean;
+	/**
+	 * Resolve once something happened that may have made the wallet
+	 * reachable (a connect, a reestablish), or after `timeoutMs`.
+	 */
+	walletMayBeReachable?(
+		walletPubkeyHex: string,
+		channelId: Buffer | undefined,
+		timeoutMs: number
+	): Promise<void>;
+	/**
+	 * Could this channel take these adds as it stands? A part queued for a
+	 * splice because its wallet was away may need no splice once it is back.
+	 */
+	canOfferHtlcs?(channelId: Buffer, amountsMsat: bigint[]): boolean;
+	/**
 	 * Most the node could front from its on-chain funds right now, priced at
 	 * the current feerate (sat), or null when no figure is available (no
 	 * funding provider, or a fee estimator that has not delivered a sample
@@ -566,6 +588,12 @@ const DEFAULTS = {
 	fundingRetryDelayMs: 2_000,
 	maxHoldMs: 300_000
 };
+
+/**
+ * How long one wait for an absent wallet lasts before the held parts are
+ * checked again: a wait must not outlive a part the deadline revoked.
+ */
+const WALLET_WAIT_SLICE_MS = 1_000;
 
 type ResolvedConfig = Omit<
 	Required<IJitReceiveConfig>,
@@ -1362,7 +1390,8 @@ export class JitReceiveManager extends EventEmitter {
 						fundingSats,
 						timeoutMs
 					),
-				() => this.heldParts.get(scidHex) ?? []
+				() => this.heldParts.get(scidHex) ?? [],
+				{ pubkeyHex: intent.walletPubkeyHex }
 			);
 			fronted = true;
 
@@ -1517,28 +1546,43 @@ export class JitReceiveManager extends EventEmitter {
 
 		this.spliceInFlight.add(key);
 		let fronted = false;
+		let spliced = false;
 		try {
 			this.safeEmit('jit:funding', {
 				channelIdHex: key,
 				fundingSats: amountSats
 			});
+			const walletPubkeyHex = this.deps.peerForChannel?.(outChannelId);
 			await this.attempt(
-				(timeoutMs) => {
+				async (timeoutMs) => {
 					// The channel went mid-splice between the hold and this
 					// attempt (issue #760): a retry loop would run out the hold
 					// budget against a splice that locks in blocks, so fail now.
 					if (this.deps.splicePendingLock?.(outChannelId) === true) {
 						throw new SplicePendingLockError(key);
 					}
-					return this.deps.spliceInAndWait!(
-						outChannelId,
-						amountSats,
-						timeoutMs
-					);
+					// A wallet that was away when the add was refused may have
+					// come back to a channel that carries the queue as it is
+					// (issue #1726): its absence was the refusal, not a
+					// shortfall, and nothing needs fronting.
+					const waiting = this.spliceQueues.get(key) ?? [];
+					if (
+						this.deps.canOfferHtlcs?.(
+							outChannelId,
+							waiting.map((p) => p.forwardAmountMsat)
+						) === true
+					) {
+						return;
+					}
+					await this.deps.spliceInAndWait!(outChannelId, amountSats, timeoutMs);
+					spliced = true;
 				},
-				() => this.spliceQueues.get(key) ?? []
+				() => this.spliceQueues.get(key) ?? [],
+				walletPubkeyHex
+					? { pubkeyHex: walletPubkeyHex, channelId: outChannelId }
+					: undefined
 			);
-			fronted = true;
+			fronted = spliced;
 
 			const toForward = this.spliceQueues.get(key) ?? [];
 			if (toForward.length === 0) {
@@ -1563,21 +1607,26 @@ export class JitReceiveManager extends EventEmitter {
 				});
 				return;
 			}
-			this.applyFee(toForward, forwardIntents);
+			// The opening fee pays for a splice: with none, the parts go at
+			// their full amount and the intents stay unspent.
+			if (spliced) this.applyFee(toForward, forwardIntents);
 			for (const part of toForward) {
 				part.spliceRetried = true;
 				this.forwardOrFail(outChannelId, part);
 			}
-			// The intents these parts spent are consumed, exactly as the open
-			// path consumes the one it funded against.
-			for (const intent of forwardIntents) {
-				this.intents.delete(intent.interceptScidHex);
+			if (spliced) {
+				// The intents these parts spent are consumed, exactly as the open
+				// path consumes the one it funded against.
+				for (const intent of forwardIntents) {
+					this.intents.delete(intent.interceptScidHex);
+				}
+				this.persistIntents();
+				this.refreshJitClients();
 			}
-			this.persistIntents();
-			this.refreshJitClients();
 			this.safeEmit('jit:forwarded', {
 				channelIdHex: key,
-				parts: toForward.length
+				parts: toForward.length,
+				...(spliced ? {} : { spliced: false })
 			});
 		} catch (err) {
 			// As in fund(): a timeout leaves the splice live, so it is charged.
@@ -1595,16 +1644,21 @@ export class JitReceiveManager extends EventEmitter {
 	 * Run one funding to success or to the end of its budget. Every attempt is
 	 * preceded by a deadline re-check, so a hold never rides past the point
 	 * where its inbound leg can still be refunded cleanly, and the whole loop
-	 * is bounded by maxHoldMs rather than by attempts alone.
+	 * is bounded by maxHoldMs rather than by attempts alone. An attempt waits
+	 * first for a `wallet` that is away (issue #1726): an open needs its init
+	 * and a splice its reestablished channel, and an attempt made without
+	 * them fails for a reason the next minute may well remove.
 	 */
 	private async attempt<T>(
 		run: (timeoutMs: number) => Promise<T>,
-		parts: () => IHeldJitPart[]
+		parts: () => IHeldJitPart[],
+		wallet?: { pubkeyHex: string; channelId?: Buffer }
 	): Promise<T> {
 		const budgetEndsAt = Date.now() + this.cfg.maxHoldMs;
 		let lastErr: unknown = new Error('funding made no attempt');
 		for (let i = 0; i < this.cfg.fundingAttempts; i++) {
 			if (this.destroyed) throw new Error('node destroyed');
+			if (wallet) await this.waitForWallet(wallet, budgetEndsAt, parts);
 			// Each attempt gets what is LEFT of the budget, not a fresh timeout,
 			// so the total hold is maxHoldMs rather than attempts times the
 			// per-attempt timeout (the fork could hold for about 730 seconds).
@@ -1623,7 +1677,14 @@ export class JitReceiveManager extends EventEmitter {
 				return await run(Math.min(this.cfg.fundingAttemptTimeoutMs, remaining));
 			} catch (err) {
 				lastErr = err;
-				if (isPermanentFundingRefusal(err)) throw err;
+				// A wallet that left while the attempt ran refused it by its
+				// absence, which the next attempt waits out.
+				if (
+					isPermanentFundingRefusal(err) &&
+					!(wallet && !this.walletReachable(wallet))
+				) {
+					throw err;
+				}
 				// A timeout says only that the funding did not FINISH. The open
 				// or splice it started is still live, and a second attempt would
 				// run a duplicate beside it: two channels for one payment, both
@@ -1639,6 +1700,64 @@ export class JitReceiveManager extends EventEmitter {
 			}
 		}
 		throw lastErr;
+	}
+
+	private walletReachable(wallet: {
+		pubkeyHex: string;
+		channelId?: Buffer;
+	}): boolean {
+		return (
+			this.deps.walletReachable?.(wallet.pubkeyHex, wallet.channelId) ?? true
+		);
+	}
+
+	/**
+	 * Wait, inside the hold budget, for a wallet that is away. Throws what the
+	 * attempt loop would: the budget ran out, or a held part was resolved or
+	 * reached its deadline meanwhile.
+	 */
+	private async waitForWallet(
+		wallet: { pubkeyHex: string; channelId?: Buffer },
+		budgetEndsAt: number,
+		parts: () => IHeldJitPart[]
+	): Promise<void> {
+		let waited = false;
+		while (!this.walletReachable(wallet)) {
+			if (this.destroyed) throw new Error('node destroyed');
+			const remaining = budgetEndsAt - Date.now();
+			if (remaining <= 0) {
+				throw new Error('the wallet did not come back within the hold budget');
+			}
+			const held = parts();
+			if (held.length === 0) {
+				throw new Error('every held part was resolved before funding');
+			}
+			if (held.some((p) => p.revoked || this.pastDeadline(p))) {
+				throw new Error('held part reached its inbound CLTV deadline');
+			}
+			if (!waited) {
+				waited = true;
+				this.safeEmit('jit:waiting-for-wallet', {
+					walletPubkeyHex: wallet.pubkeyHex,
+					...(wallet.channelId
+						? { channelIdHex: wallet.channelId.toString('hex') }
+						: {})
+				});
+			}
+			const slice = Math.min(remaining, WALLET_WAIT_SLICE_MS);
+			if (this.deps.walletMayBeReachable) {
+				await this.deps.walletMayBeReachable(
+					wallet.pubkeyHex,
+					wallet.channelId,
+					slice
+				);
+			} else {
+				await new Promise((r) => {
+					const t = setTimeout(r, slice);
+					(t as NodeJS.Timeout).unref?.();
+				});
+			}
+		}
 	}
 
 	/**

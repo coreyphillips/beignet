@@ -27,7 +27,8 @@ const VARS = [
 	'BEIGNET_JIT_MAX_FEE_PPM',
 	'BEIGNET_JIT_MAX_CLIENT_FUNDING_SAT',
 	'BEIGNET_JIT_MAX_CONCURRENT_FUNDINGS',
-	'BEIGNET_JIT_MAX_TOTAL_FUNDING_SAT'
+	'BEIGNET_JIT_MAX_TOTAL_FUNDING_SAT',
+	'BEIGNET_JIT_REESTABLISH_HOLD_MS'
 ];
 
 describe('resolveConfig jitReceive', () => {
@@ -89,6 +90,20 @@ describe('resolveConfig jitReceive', () => {
 			maxConcurrentFundings: 2,
 			maxTotalFundingSats: 5_000_000
 		});
+	});
+
+	// Issue #1726: the reestablish hold rides the LSP role's block.
+	it('resolves the reestablish hold window, and a partly numeric one as NaN', () => {
+		process.env.BEIGNET_JIT_RECEIVE = 'true';
+		process.env.BEIGNET_JIT_REESTABLISH_HOLD_MS = '180000';
+		expect(resolveConfig({}).jitReceive).to.deep.equal({
+			enabled: true,
+			reestablishHoldMs: 180_000
+		});
+		process.env.BEIGNET_JIT_REESTABLISH_HOLD_MS = '3m';
+		expect(
+			Number.isNaN(resolveConfig({}).jitReceive?.reestablishHoldMs)
+		).to.equal(true);
 	});
 
 	it('leaves an unset cap out, so the library default keeps answering', () => {
