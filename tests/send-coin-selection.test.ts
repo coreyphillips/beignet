@@ -242,6 +242,42 @@ describe('sendMany coin selection (#1360)', function () {
 		expect(second.value.inputs).to.have.length(4);
 	});
 
+	// Coin selection sorted the array it was given, and a quote gives it the
+	// staged inputs (#1664).
+	it('leaves the staged inputs in order when quoting', function () {
+		const values = [40_000, 10_000, 30_000, 20_000, 50_000];
+		const heights = [105, 101, 103, 102, 104];
+		wallet.data.utxos.forEach((utxo, i) => {
+			wallet.data.balance += values[i] - utxo.value;
+			utxo.value = values[i];
+			utxo.height = heights[i];
+		});
+		const staged = wallet.transaction.updateSendTransaction({
+			transaction: {
+				inputs: [...wallet.data.utxos],
+				outputs: [{ address: RECIPIENT, value: 15_000, index: 0 }]
+			}
+		});
+		if (staged.isErr()) throw staged.error;
+
+		for (const coinSelectPreference of [
+			ECoinSelectPreference.small,
+			ECoinSelectPreference.large,
+			ECoinSelectPreference.firstInFirstOut,
+			ECoinSelectPreference.lastInFirstOut
+		]) {
+			const estimate = wallet.getFeeInfo({
+				satsPerByte: 10,
+				coinSelectPreference
+			});
+			if (estimate.isErr()) throw estimate.error;
+			expect(
+				wallet.transaction.data.inputs.map(({ value }) => value),
+				coinSelectPreference
+			).to.deep.equal(values);
+		}
+	});
+
 	// Four coins pay 36,560 sats at 10 sat/vB and leave 3,440, exactly the fee
 	// without change. Coin selection priced a change output as well and
 	// refused the payment.
@@ -672,6 +708,40 @@ describe('sendMany coin selection (#1360)', function () {
 			const tx = BitcoinTransaction.fromHex(res.value);
 			expect(tx.outs).to.have.length(2);
 			expect(feeOf(tx)).to.equal(estimate.value.totalFee);
+		});
+	});
+
+	// About 420 coins cover the payment and 70 more its fee at 20 sat/vB. A
+	// quote selects coins at every rate its searches try, and repricing the
+	// whole selection for each coin added made every quote quadratic in the
+	// number of coins (#1664).
+	describe('with 500 coins (#1664)', function () {
+		const AMOUNT = 4_200_000;
+
+		beforeEach(function () {
+			for (const utxo of wallet.data.utxos.splice(0)) {
+				wallet.data.balance -= utxo.value;
+				injected.delete(utxo.tx_hash);
+			}
+			for (let i = 0; i < 500; i++) {
+				injectUtxo(i.toString(16).padStart(64, '0'), 10_000 + (i % 7) * 13);
+			}
+			wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
+		});
+
+		it('quotes a range of rates in well under a second', function () {
+			const started = Date.now();
+			for (const satsPerByte of [1, 2, 5, 10, 20]) {
+				const estimate = wallet.getFeeInfo({
+					satsPerByte,
+					transaction: {
+						outputs: [{ address: RECIPIENT, value: AMOUNT, index: 0 }]
+					}
+				});
+				if (estimate.isErr()) throw estimate.error;
+				expect(estimate.value.satsPerByte).to.equal(satsPerByte);
+			}
+			expect(Date.now() - started).to.be.below(1_000);
 		});
 	});
 });
