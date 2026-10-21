@@ -665,8 +665,20 @@ describe('Production Hardening 8 Phase 1: Fund Safety', function () {
 	// ─── Fix 3: ChainMonitor _knownPreimages persistence ──────────────────
 
 	describe('Fix 3: ChainMonitor _knownPreimages persistence', () => {
-		function makeMonitor(): ChainMonitor {
-			const state = makeMinimalChannelState();
+		function makeMonitor(htlcHash?: Buffer): ChainMonitor {
+			const htlcs = new Map();
+			if (htlcHash) {
+				htlcs.set('received-0', {
+					id: 0n,
+					direction: HtlcDirection.RECEIVED,
+					amountMsat: 30000000n,
+					paymentHash: htlcHash,
+					cltvExpiry: 500,
+					onionRoutingPacket: Buffer.alloc(1366),
+					state: HtlcState.COMMITTED
+				});
+			}
+			const state = makeMinimalChannelState({ htlcs });
 			return new ChainMonitor(
 				state,
 				Buffer.alloc(22, 0x00),
@@ -677,11 +689,11 @@ describe('Production Hardening 8 Phase 1: Fund Safety', function () {
 		}
 
 		it('getFullState() includes knownPreimages as Record<string, string>', () => {
-			const monitor = makeMonitor();
 			const paymentHash = crypto.randomBytes(32);
 			const preimage = crypto.randomBytes(32);
+			const monitor = makeMonitor(paymentHash);
 
-			// Add a preimage
+			// Add a preimage for the channel's HTLC
 			monitor.addPreimage(paymentHash, preimage);
 
 			const fullState = monitor.getFullState();
