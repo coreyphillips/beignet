@@ -44,6 +44,7 @@ import {
 	clientKeyForRequest
 } from './http-rate-limiter';
 import { encodeBip21 } from '../utils/transaction';
+import { unpatchedNodeWarning } from '../utils/node-version';
 import {
 	ApiKeyAuthenticator,
 	ApiKeyDefinition,
@@ -4225,6 +4226,11 @@ async function bootDaemon(
 		server.listen(port, host, () => {
 			logger?.info(`Daemon listening on ${host}:${port}`);
 			if (!authenticator.enabled) logger?.warn(AUTH_OFF_WARNING);
+			// A Node.js release without the October 21, 2026 security fixes
+			// (issue #1773). Warn and keep running: the operator owns the
+			// runtime, and refusing to start would take the node offline.
+			const nodeWarning = unpatchedNodeWarning(process.versions.node);
+			if (nodeWarning) logger?.warn(nodeWarning);
 			// The queue's start (once the node can pay, issue #967) and its
 			// poke on channel:usable were wired when the node built it above;
 			// stop() halts the queue first, so a start that comes after it

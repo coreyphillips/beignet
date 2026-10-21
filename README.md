@@ -7,7 +7,7 @@ Two layers, one mnemonic:
 - **On-chain wallet:** HD keys, address generation, UTXO tracking, transaction building, PSBT/hardware signing, multisig, watch-only, Electrum connectivity.
 - **Lightning:** channel lifecycle, onion-routed payments, BOLT 11 invoices, BOLT 12 offers, gossip and pathfinding, anchors, splicing, taproot channels, watchtower client. Interop-tested against LND, Core Lightning and Eclair on regtest.
 
-Requires **Node.js 18+**. MIT licensed.
+Requires **Node.js 22.23.4+, 24.22.1+ or 26.12.1+**. Earlier releases on those lines, and all of Node.js 18 and 20, lack the October 21, 2026 Node.js security fixes; the daemon warns at startup when it runs on one. MIT licensed.
 
 **Jump to:** [Install](#install) · [Examples](#try-the-examples) · [On-chain wallet](#on-chain-wallet) · [Lightning](#lightning) · [Daemon & CLI](#http-daemon--cli) · [Protocol layer](#protocol-layer-advanced) · [Tests](#tests) · [Status & limitations](#status--limitations)
 
@@ -676,9 +676,8 @@ LightningNode              High-level API (EventEmitter)
 
 ## Tests
 
-Use **Node.js 20 (20.19+)** for development and `npm ci` to install the locked tools.
-The linter and test runner have newer Node requirements than the library API.
-CI uses Node.js 20.
+Use **Node.js 24 (24.22.1+)** for development and `npm ci` to install the locked tools.
+CI uses Node.js 24.22.1.
 
 The lint configuration keeps the established CommonJS imports, enum aliases,
 unused catch bindings, `any` warnings and Chai assertion style. Rules removed
