@@ -142,6 +142,10 @@ describe('block notification refresh requests (#1663)', function () {
 	let onFirstSubscribe: ((scriptHash: string) => void) | undefined;
 	/** Whether a script hash not yet subscribed is refused. */
 	let refuseNewSubscriptions: boolean;
+	/** A script hash whose next first subscribe waits for releaseHeld, then
+	 *  fails, as a request that timed out would. */
+	let holdSubscribeOf: string | undefined;
+	let releaseHeld: (() => void) | undefined;
 	/** Whether storage refuses the UTXO set write. */
 	let refuseUtxoWrite: boolean;
 	let transactionsAsked: string[];
@@ -163,6 +167,8 @@ describe('block notification refresh requests (#1663)', function () {
 		failUtxoEntryOf = undefined;
 		onFirstSubscribe = undefined;
 		refuseNewSubscriptions = false;
+		holdSubscribeOf = undefined;
+		releaseHeld = undefined;
 		refuseUtxoWrite = false;
 		transactionsAsked = [];
 		messages = [];
@@ -210,6 +216,15 @@ describe('block notification refresh requests (#1663)', function () {
 					scriptHashHandler ??= onReceive;
 					if (subscribed.has(scriptHash)) {
 						return { error: false, data: 'Already Subscribed.' };
+					}
+					// The client records a hash only once the server answers, so a
+					// subscribe sent while this one waits goes to the server too.
+					if (scriptHash === holdSubscribeOf) {
+						holdSubscribeOf = undefined;
+						await new Promise<void>((resolve) => {
+							releaseHeld = resolve;
+						});
+						return { error: true, data: 'Server busy.' };
 					}
 					if (refuseNewSubscriptions) {
 						return { error: true, data: 'Server busy.' };
@@ -380,6 +395,35 @@ describe('block notification refresh requests (#1663)', function () {
 		}
 		expect(issued?.index).to.equal(20);
 		return issued as IAddress;
+	};
+
+	/** Starts a chain watch on the receive address issuePastGenerated will
+	 *  issue, before the wallet has it, and holds its subscribe until
+	 *  releaseHeld fails it. Resolves once the watch has settled. */
+	const holdWatchOnNextIssued = async (): Promise<{
+		next: IAddress;
+		watch: Promise<void>;
+	}> => {
+		const generated = await wallet.generateAddresses({
+			addressAmount: 1,
+			addressIndex: 20,
+			changeAddressAmount: 0,
+			addressType: EAddressType.p2wpkh
+		});
+		if (generated.isErr()) throw new Error(generated.error.message);
+		const next = Object.values(generated.value.addresses)[0];
+		holdSubscribeOf = next.scriptHash;
+		const backend = new ElectrumBackend(wallet.electrum);
+		const watch = backend
+			.subscribeToScriptHash(next.scriptHash, () => {})
+			.then(
+				() => {
+					throw new Error('The held subscribe succeeded.');
+				},
+				() => undefined
+			);
+		await waitFor(() => !!releaseHeld, 'the held subscribe');
+		return { next, watch };
 	};
 
 	/** One coin to `address` from an external parent, in block `height` (the
@@ -684,5 +728,62 @@ describe('block notification refresh requests (#1663)', function () {
 		await notify(issued.scriptHash);
 		await settled();
 		expect(wallet.data.utxos.map((u) => u.tx_hash)).to.deep.equal([txid]);
+	});
+
+	it('still refreshes for a window address after a chain watch on it failed', async function () {
+		await block(101);
+		const other = await createWallet();
+		try {
+			const connected = await other.connectToElectrum();
+			if (connected.isErr()) throw connected.error;
+			const refreshed = await other.refreshWallet();
+			if (refreshed.isErr()) throw refreshed.error;
+			const { next, watch } = await holdWatchOnNextIssued();
+			// The window's own subscribe for the hash is answered while the
+			// watch's still waits.
+			const issued = await issuePastGenerated();
+			expect(issued.scriptHash).to.equal(next.scriptHash);
+			// Held by another wallet too, so its notification is routed rather
+			// than handed to every wallet.
+			await issuePastGenerated(other);
+			releaseHeld?.();
+			await watch;
+			const txid = 'c4'.repeat(32);
+			pay(issued, txid, 0);
+
+			await notify(issued.scriptHash);
+			await settled();
+
+			expect(wallet.data.utxos.map((u) => u.tx_hash)).to.deep.equal([txid]);
+		} finally {
+			await other.stop();
+		}
+	});
+
+	it('scans on the next block after a chain watch failed on a window address another wallet heard first', async function () {
+		await block(101);
+		const other = await createWallet();
+		try {
+			const connected = await other.connectToElectrum();
+			if (connected.isErr()) throw connected.error;
+			const refreshed = await other.refreshWallet();
+			if (refreshed.isErr()) throw refreshed.error;
+			const { next, watch } = await holdWatchOnNextIssued();
+			const txid = 'd5'.repeat(32);
+			pay(next, txid, 101);
+			// The other wallet's subscribe hears the status, so this wallet's is
+			// answered "Already Subscribed." and the status is left unheard here.
+			await issuePastGenerated(other);
+			const issued = await issuePastGenerated();
+			expect(issued.scriptHash).to.equal(next.scriptHash);
+			releaseHeld?.();
+			await watch;
+
+			await block(102);
+
+			expect(wallet.data.utxos.map((u) => u.tx_hash)).to.deep.equal([txid]);
+		} finally {
+			await other.stop();
+		}
 	});
 });

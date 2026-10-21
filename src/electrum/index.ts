@@ -2586,10 +2586,11 @@ export class Electrum {
 	 * attempt with it on `sub` is still waiting or has succeeded. Nothing is
 	 * touched once `sub` is no longer this instance's record: a disconnect
 	 * withdrew it, and whatever stands in its place belongs to a later
-	 * subscribe. The record itself goes only if an attempt created it, and
-	 * then the status it last heard goes back to _withdrawnStatuses, where
-	 * _scriptHashRecord may have just taken it from, so the retry still has
-	 * something to compare the server's answer with.
+	 * subscribe. The record itself goes only if an attempt created it and it
+	 * is not in the wallet's gap windows, and then the status it last heard
+	 * goes back to _withdrawnStatuses, where _scriptHashRecord may have just
+	 * taken it from, so the retry still has something to compare the
+	 * server's answer with.
 	 */
 	private rollBackScriptHashCallback(
 		scriptHash: string,
@@ -2606,13 +2607,16 @@ export class Electrum {
 		const subs = router?.subscriptions.get(scriptHash);
 		if (!router || !subs || subs.get(this) !== sub) return;
 		sub.callbacks.delete(onReceive);
-		if (
-			!unconfirmed.created ||
-			sub.callbacks.size > 0 ||
-			sub.utxoIndex !== undefined
-		) {
+		if (!unconfirmed.created) return;
+		// A window subscribe that found this record standing left its first
+		// status to the attempt that created it, which is this one, and only a
+		// full refresh reads what that status shows. The record stays: a block
+		// does not refresh for a window hash (see _onNewBlock).
+		if (sub.inWindow) {
+			this._fullRefreshOwed = true;
 			return;
 		}
+		if (sub.callbacks.size > 0 || sub.utxoIndex !== undefined) return;
 		const heard = router.statuses.has(scriptHash)
 			? lastHeardStatus(router, scriptHash, sub)
 			: undefined;
