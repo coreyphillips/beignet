@@ -2146,19 +2146,28 @@ export class Wallet {
 			let lastUsedChangeAddressIndex =
 				currentWallet.lastUsedChangeAddressIndex[addressType];
 
-			const originalHighestStoredIndexes = this.getHighestStoredAddressIndex({
-				addressType
-			});
-			if (originalHighestStoredIndexes.isErr()) {
-				return err(originalHighestStoredIndexes.error.message);
-			}
-			const originalHighestStoredIndex =
-				originalHighestStoredIndexes.value.addressIndex;
-			const originalHighestStoredChangeIndex =
-				originalHighestStoredIndexes.value.changeAddressIndex;
+			// A call that gets here before the first refresh has stored any
+			// addresses finds a chain with none. That chain reads as -1, so its
+			// first window is derived below.
+			const highestIndex = (stored: IAddresses): number =>
+				Object.values(stored).reduce(
+					(highest, { index }) => Math.max(highest, index),
+					-1
+				);
+			// Read from the map, not from what addAddresses answered: a refresh
+			// running beside this call may have stored the same window first, and
+			// addAddresses answers only the addresses it added itself.
+			const lowestAddress = (stored: IAddresses): IAddress | undefined =>
+				Object.values(stored).sort((a, b) => a.index - b.index)[0];
+			const originalHighestStoredIndex = highestIndex(
+				currentWallet.addresses[addressType]
+			);
+			const originalHighestStoredChangeIndex = highestIndex(
+				currentWallet.changeAddresses[addressType]
+			);
 
 			const addressIndexDiff = getAddressIndexDiff(
-				originalHighestStoredIndex.index,
+				originalHighestStoredIndex,
 				lastUsedAddressIndex.index
 			);
 			const addressesToGenerate =
@@ -2167,7 +2176,7 @@ export class Wallet {
 				// Every address below this one is already stored.
 				const generatedAddresses = await this.addAddresses({
 					addressAmount: addressesToGenerate,
-					addressIndex: originalHighestStoredIndex.index + 1,
+					addressIndex: originalHighestStoredIndex + 1,
 					changeAddressAmount: 0,
 					keyDerivationPath,
 					addressType,
@@ -2177,18 +2186,14 @@ export class Wallet {
 					return err(generatedAddresses.error);
 				}
 				this.markGrownAddressMaps(generatedAddresses.value);
-				if (addressIndex.index < 0) {
-					const addresses = generatedAddresses.value.addresses;
-					const sorted = Object.values(addresses).sort(
-						(a, b) => a.index - b.index
-					);
-					if (sorted.length >= 1 && sorted[0].index >= 0)
-						addressIndex = sorted[0];
-				}
+			}
+			if (addressIndex.index < 0) {
+				const lowest = lowestAddress(this._data.addresses[addressType]);
+				if (lowest && lowest.index >= 0) addressIndex = lowest;
 			}
 
 			const changeAddressIndexDiff = getAddressIndexDiff(
-				originalHighestStoredChangeIndex.index,
+				originalHighestStoredChangeIndex,
 				lastUsedChangeAddressIndex.index
 			);
 			const changeAddressesToGenerate =
@@ -2198,7 +2203,7 @@ export class Wallet {
 				const generatedAddresses = await this.addAddresses({
 					addressAmount: 0,
 					changeAddressAmount: changeAddressesToGenerate,
-					changeAddressIndex: originalHighestStoredChangeIndex.index + 1,
+					changeAddressIndex: originalHighestStoredChangeIndex + 1,
 					keyDerivationPath,
 					addressType,
 					saveAddresses: false
@@ -2207,14 +2212,10 @@ export class Wallet {
 					return err(generatedAddresses.error);
 				}
 				this.markGrownAddressMaps(generatedAddresses.value);
-				if (changeAddressIndex.index < 0) {
-					const changeAddresses = generatedAddresses.value.changeAddresses;
-					const sorted = Object.values(changeAddresses).sort(
-						(a, b) => a.index - b.index
-					);
-					if (sorted.length >= 1 && sorted[0].index >= 0)
-						changeAddressIndex = sorted[0];
-				}
+			}
+			if (changeAddressIndex.index < 0) {
+				const lowest = lowestAddress(this._data.changeAddresses[addressType]);
+				if (lowest && lowest.index >= 0) changeAddressIndex = lowest;
 			}
 
 			// Save any addresses that have been created thus far if necessary.
@@ -2518,6 +2519,7 @@ export class Wallet {
 	/**
 	 * Returns the highest address and change address index stored in the app for the specified wallet and network.
 	 * Retrives the highest stored address index for the provided address type.
+	 * Errs when either chain has none stored, as before the first refresh.
 	 * @param {EAddressType} addressType
 	 * @returns {Result<{ addressIndex: IAddress; changeAddressIndex: IAddress }>}
 	 */
@@ -2531,15 +2533,20 @@ export class Wallet {
 	}> {
 		try {
 			const currentWallet = this.data;
-			const addresses = currentWallet.addresses[addressType];
-			const changeAddresses = currentWallet.changeAddresses[addressType];
+			const addresses = Object.values(currentWallet.addresses[addressType]);
+			const changeAddresses = Object.values(
+				currentWallet.changeAddresses[addressType]
+			);
+			if (!addresses.length || !changeAddresses.length) {
+				return err('No addresses stored yet.');
+			}
 
-			const addressIndex = Object.values(addresses).reduce((prev, current) => {
+			const addressIndex = addresses.reduce((prev, current) => {
 				return prev.index > current.index ? prev : current;
 			});
 
-			const changeAddressIndex = Object.values(changeAddresses).reduce(
-				(prev, current) => (prev.index > current.index ? prev : current)
+			const changeAddressIndex = changeAddresses.reduce((prev, current) =>
+				prev.index > current.index ? prev : current
 			);
 
 			return ok({ addressIndex, changeAddressIndex });
