@@ -25,6 +25,7 @@ import {
 	IGetTransactions,
 	IGetUtxosResponse,
 	IOnchainFees,
+	ITransaction,
 	IUtxo,
 	IWalletData,
 	err,
@@ -142,6 +143,78 @@ const offline = (electrum: Electrum): void => {
 		Result<IGetAddressHistoryResponse[]>
 	> => ok([]);
 	electrum.subscribeToAddresses = async (): Promise<Result<string>> => ok('');
+};
+
+/** A received payment to PAYEE, last seen at `height`. */
+const payment = (txid: string, height: number): IFormattedTransaction => ({
+	address: PAYEE,
+	scriptHash: '00'.repeat(32),
+	height,
+	totalInputValue: 0.002,
+	matchedInputValue: 0,
+	totalOutputValue: 0.0019,
+	matchedOutputValue: 0.001,
+	fee: 0.0001,
+	satsPerByte: 10,
+	type: EPaymentType.received,
+	value: 0.001,
+	txid,
+	messages: [],
+	vin: [],
+	timestamp: 1,
+	vsize: 100
+});
+
+/** A getTransactions answer with one entry per txid. */
+const answer = (entries: {
+	[txid: string]: {
+		result?: { confirmations: number };
+		error?: { code: number; message: string };
+	};
+}): Result<IGetTransactions> =>
+	ok({
+		error: false,
+		id: 0,
+		method: 'getTransactions',
+		network,
+		data: Object.entries(entries).map(
+			([txid, entry]) =>
+				({
+					...entry,
+					data: { tx_hash: txid }
+				}) as unknown as ITransaction<IUtxo>
+		)
+	});
+
+/** makeStorage, holding the next write to the key passed to holdNext. */
+const holdingStorage = (
+	store: Map<string, unknown>
+): ReturnType<typeof holdable> & {
+	storage: TStorage;
+	holdNext: (key: string) => void;
+} => {
+	const gate = holdable();
+	let at: string | undefined;
+	return {
+		...gate,
+		holdNext: (key: string): void => {
+			at = key;
+		},
+		storage: {
+			getData: makeStorage(store).getData,
+			setData: async <K extends keyof IWalletData>(
+				key: string,
+				value: IWalletData[K]
+			): Promise<Result<boolean>> => {
+				if (key === at) {
+					at = undefined;
+					await gate.hold();
+				}
+				store.set(key, value);
+				return ok(true);
+			}
+		}
+	};
 };
 
 describe('switchNetwork against an unreachable target', function () {
@@ -947,6 +1020,243 @@ describe('switchNetwork against an unreachable target', function () {
 			await w.stop();
 		}
 	});
+
+	// Index 0 is the address the refresh moves the receive index to. Index 1
+	// is in the lookahead it then fills the address map with.
+	for (const heldIndex of [0, 1]) {
+		it(`drops the zero index addresses a refresh derived across the switch, held at index ${heldIndex} (#1754)`, async function () {
+			const name = `switchzero${heldIndex}`;
+			const store = new Map<string, unknown>();
+			const res = await Wallet.create({
+				mnemonic: MNEMONIC,
+				name,
+				network,
+				addressType: EAddressType.p2wpkh,
+				electrumOptions,
+				storage: makeStorage(store),
+				feeEstimationSource: 'electrum',
+				disableRefreshOnCreate: true
+			});
+			if (res.isErr()) throw res.error;
+			const w = res.value;
+			w.checkElectrumConnection = async (): Promise<Result<string>> =>
+				ok('connected');
+			w.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
+				ok(w.feeEstimates);
+			offline(w.electrum);
+			const generated = await w.generateAddresses({
+				addressAmount: 1,
+				changeAddressAmount: 0,
+				addressIndex: heldIndex,
+				addressType: EAddressType.p2wpkh
+			});
+			if (generated.isErr()) throw generated.error;
+			const held = Object.values(generated.value.addresses)[0].address;
+			const deriving = holdable();
+			const getScriptHash = w.getScriptHash.bind(w);
+			w.getScriptHash = async (options): Promise<string> => {
+				const scriptHash = await getScriptHash(options);
+				if (options.address === held) await deriving.hold();
+				return scriptHash;
+			};
+			try {
+				const spanning = w.refreshWallet();
+				await deriving.held;
+				const switched = await w.switchNetwork(
+					EAvailableNetworks.signet,
+					otherServer
+				);
+				if (switched.isErr()) throw switched.error;
+				offline(w.electrum);
+				deriving.release();
+				expect(await settles(spanning)).to.equal(true);
+				expect(w.isRefreshing).to.equal(false);
+
+				// The refresh the switch started set signet's own index 0.
+				const index = w.data.addressIndex[EAddressType.p2wpkh];
+				expect(index.index).to.equal(0);
+				expect(index.address.startsWith('tb1q')).to.equal(true);
+				expect(JSON.stringify(w.data)).not.to.include('bcrt1');
+				const stored = store.get(
+					getWalletDataStorageKey(
+						name,
+						EAvailableNetworks.signet,
+						'addressIndex'
+					)
+				) as IWalletData['addressIndex'];
+				expect(stored[EAddressType.p2wpkh]).to.deep.equal(index);
+				const signetValues = [...store.entries()]
+					.filter(([at]) => at.includes(EAvailableNetworks.signet))
+					.map(([, value]) => JSON.stringify(value));
+				expect(signetValues.some((value) => value.includes('bcrt1'))).to.equal(
+					false
+				);
+			} finally {
+				deriving.release();
+				await w.stop();
+			}
+		});
+	}
+
+	it('drops a reorg repair a switch lands in the write of (#1754)', async function () {
+		const name = 'switchreorg';
+		const store = new Map<string, unknown>();
+		const key = (on: EAvailableNetworks, field: keyof IWalletData): string =>
+			getWalletDataStorageKey(name, on, field);
+		const saving = holdingStorage(store);
+		const res = await Wallet.create({
+			mnemonic: MNEMONIC,
+			name,
+			network,
+			addressType: EAddressType.p2wpkh,
+			electrumOptions,
+			storage: saving.storage,
+			feeEstimationSource: 'electrum',
+			disableRefreshOnCreate: true
+		});
+		if (res.isErr()) throw res.error;
+		const w = res.value;
+		w.checkElectrumConnection = async (): Promise<Result<string>> =>
+			ok('connected');
+		w.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
+			ok(w.feeEstimates);
+		offline(w.electrum);
+		// Seen in block 100, and back in the mempool once the refresh asks.
+		const txid = 'ee'.repeat(32);
+		w.data.transactions = { [txid]: payment(txid, 100) };
+		w.data.unconfirmedTransactions = { [txid]: payment(txid, 100) };
+		w.data.header.height = 101;
+		w.electrum.getTransactions = async (): Promise<Result<IGetTransactions>> =>
+			answer({ [txid]: { result: { confirmations: 0 } } });
+		try {
+			// Nothing in the refresh writes regtest's transactions before the
+			// repair does.
+			saving.holdNext(key(network, 'transactions'));
+			const spanning = w.refreshWallet();
+			await saving.held;
+			const switched = await w.switchNetwork(
+				EAvailableNetworks.signet,
+				otherServer
+			);
+			if (switched.isErr()) throw switched.error;
+			offline(w.electrum);
+			saving.release();
+			expect(await settles(spanning)).to.equal(true);
+			expect(w.isRefreshing).to.equal(false);
+
+			expect(w.data.transactions).to.deep.equal({});
+			expect(w.data.unconfirmedTransactions).to.deep.equal({});
+			const signetValues = [...store.entries()]
+				.filter(([at]) => at.includes(EAvailableNetworks.signet))
+				.map(([, value]) => JSON.stringify(value));
+			expect(signetValues.some((value) => value.includes(txid))).to.equal(
+				false
+			);
+			// The repair still landed on the network it was made for.
+			const repaired = store.get(
+				key(network, 'transactions')
+			) as IFormattedTransactions;
+			expect(repaired[txid].height).to.equal(0);
+		} finally {
+			saving.release();
+			await w.stop();
+		}
+	});
+
+	// The ghost repair writes the transactions map, then the unconfirmed map,
+	// then rescans the addresses. A switch can land in either write.
+	for (const field of ['transactions', 'unconfirmedTransactions'] as const) {
+		it(`drops a ghost repair a switch lands in the ${field} write of (#1754)`, async function () {
+			const name = `switchghost${field}`;
+			const store = new Map<string, unknown>();
+			const key = (on: EAvailableNetworks, at: keyof IWalletData): string =>
+				getWalletDataStorageKey(name, on, at);
+			const saving = holdingStorage(store);
+			const res = await Wallet.create({
+				mnemonic: MNEMONIC,
+				name,
+				network,
+				addressType: EAddressType.p2wpkh,
+				electrumOptions,
+				storage: saving.storage,
+				feeEstimationSource: 'electrum',
+				disableRefreshOnCreate: true
+			});
+			if (res.isErr()) throw res.error;
+			const w = res.value;
+			w.checkElectrumConnection = async (): Promise<Result<string>> =>
+				ok('connected');
+			w.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
+				ok(w.feeEstimates);
+			offline(w.electrum);
+			// One transaction gone from both the chain and the mempool, and one
+			// still in the mempool.
+			const ghost = 'ee'.repeat(32);
+			const pending = 'ef'.repeat(32);
+			w.data.transactions = {
+				[ghost]: payment(ghost, 100),
+				[pending]: payment(pending, 0)
+			};
+			w.data.unconfirmedTransactions = { ...w.data.transactions };
+			w.data.header.height = 101;
+			w.electrum.getTransactions = async (): Promise<
+				Result<IGetTransactions>
+			> =>
+				answer({
+					[ghost]: {
+						error: {
+							code: 2,
+							message: 'No such mempool or blockchain transaction'
+						}
+					},
+					[pending]: { result: { confirmations: 0 } }
+				});
+			let rescans = 0;
+			const rescanAddresses = w.rescanAddresses.bind(w);
+			w.rescanAddresses = async (options): Promise<Result<IWalletData>> => {
+				rescans += 1;
+				return rescanAddresses(options);
+			};
+			try {
+				// Nothing in the refresh writes either map on regtest before the
+				// repair does.
+				saving.holdNext(key(network, field));
+				const spanning = w.refreshWallet();
+				await saving.held;
+				const switched = await w.switchNetwork(
+					EAvailableNetworks.signet,
+					otherServer
+				);
+				if (switched.isErr()) throw switched.error;
+				offline(w.electrum);
+				saving.release();
+				expect(await settles(spanning)).to.equal(true);
+				expect(w.isRefreshing).to.equal(false);
+
+				expect(w.data.transactions).to.deep.equal({});
+				expect(w.data.unconfirmedTransactions).to.deep.equal({});
+				const signetValues = [...store.entries()]
+					.filter(([at]) => at.includes(EAvailableNetworks.signet))
+					.map(([, value]) => JSON.stringify(value));
+				expect(
+					signetValues.some(
+						(value) => value.includes(ghost) || value.includes(pending)
+					)
+				).to.equal(false);
+				// Signet's indexes and UTXOs are left alone: the rescan was for
+				// regtest's balance.
+				expect(rescans).to.equal(0);
+				// The ghost is still cleared on the network it was found on.
+				const repaired = store.get(
+					key(network, 'transactions')
+				) as IFormattedTransactions;
+				expect(repaired[ghost].exists).to.equal(false);
+			} finally {
+				saving.release();
+				await w.stop();
+			}
+		});
+	}
 
 	it('keeps what the session remembers across sends and refreshes (#1636)', async function () {
 		const res = await Wallet.create({
