@@ -180,19 +180,21 @@ export function findPayAllRoute(options: {
 			};
 		}
 		if (candidate.edges.length >= 20 || candidate.cltv > maxCltv) continue;
-		const channels = [
+		const adjacent = [
 			...graph
-				.getNodeChannels(Buffer.from(candidate.node, 'hex'))
-				.filter((c) => !shadowedScids.has(c.shortChannelId.toString('hex'))),
+				.getNodeEdges(candidate.node)
+				.filter((e) => !shadowedScids.has(e.scidHex)),
 			...(syntheticEdges.get(candidate.node) ?? [])
 		];
-		for (const channel of channels) {
-			const scid = channel.shortChannelId.toString('hex');
+		for (const {
+			channel,
+			scidHex: scid,
+			node1Hex: node1,
+			node2Hex: node2
+		} of adjacent) {
 			if (excludedChannels?.has(scid)) continue;
 			const hintDest = hintDestMap.get(scid);
 			if (hintDest !== undefined && hintDest !== candidate.node) continue;
-			const node1 = channel.nodeId1.toString('hex');
-			const node2 = channel.nodeId2.toString('hex');
 			const from =
 				hintDest !== undefined || candidate.node === node2 ? node1 : node2;
 			if (from === destHex || candidate.edges.some((e) => e.from === from))

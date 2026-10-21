@@ -7,6 +7,7 @@
 
 import {
 	IGraphChannel,
+	IGraphEdge,
 	IChannelUpdateMessage,
 	IRoute,
 	IRouteHop,
@@ -188,8 +189,8 @@ function buildSyntheticEdges(
 	hints: IRoutingHintHop[][],
 	graph: NetworkGraph,
 	destination: Buffer
-): Map<string, IGraphChannel[]> {
-	const syntheticEdges = new Map<string, IGraphChannel[]>();
+): Map<string, IGraphEdge[]> {
+	const syntheticEdges = new Map<string, IGraphEdge[]>();
 	const destHex = destination.toString('hex');
 
 	for (const hintRoute of hints) {
@@ -242,10 +243,16 @@ function buildSyntheticEdges(
 					htlcMaximumMsat: 0xffffffffffffffffn
 				}
 			};
+			const pubkeyHex = hop.pubkey.toString('hex');
 
 			// Index by the destination (next node key) for backward Dijkstra
 			const existing = syntheticEdges.get(nextNodeHex) ?? [];
-			existing.push(synthetic);
+			existing.push({
+				channel: synthetic,
+				scidHex: hop.shortChannelId.toString('hex'),
+				node1Hex: pubkeyHex,
+				node2Hex: pubkeyHex
+			});
 			syntheticEdges.set(nextNodeHex, existing);
 		}
 	}
@@ -343,6 +350,14 @@ function makeLocalChannelEdge(
 	};
 }
 
+/** The edges a search adds to the gossip graph (see buildEdgeOverlay). */
+export interface IEdgeOverlay {
+	syntheticEdges: Map<string, IGraphEdge[]>;
+	hintDestMap: Map<string, string>;
+	shadowedScids: Set<string>;
+	localFirstHopScids: Set<string> | null;
+}
+
 /**
  * Combine routing-hint synthetic edges and local-channel edges into a single
  * overlay (edges keyed by destination-side node, plus a SCID→destination map)
@@ -354,13 +369,8 @@ export function buildEdgeOverlay(
 	destination: Buffer,
 	routingHints?: IRoutingHintHop[][],
 	localChannels?: ILocalChannelEdge[]
-): {
-	syntheticEdges: Map<string, IGraphChannel[]>;
-	hintDestMap: Map<string, string>;
-	shadowedScids: Set<string>;
-	localFirstHopScids: Set<string> | null;
-} {
-	const syntheticEdges = new Map<string, IGraphChannel[]>();
+): IEdgeOverlay {
+	const syntheticEdges = new Map<string, IGraphEdge[]>();
 	const hintDestMap = new Map<string, string>();
 	// SCIDs whose graph copy must be skipped during traversal because a local
 	// overlay edge replaces it. Only local channels ever shadow a graph entry;
@@ -420,6 +430,7 @@ export function buildEdgeOverlay(
 	}
 
 	if (localChannels) {
+		const sourceHex = source.toString('hex');
 		for (const lc of localChannels) {
 			// The owner is authoritative about its own channel. The graph copy
 			// advertises htlc_maximum_msat — a public ceiling routinely far
@@ -433,16 +444,22 @@ export function buildEdgeOverlay(
 			// situations — a missing own-side update, and the BOLT 7 disable
 			// bit (an advertisement to THIRD PARTIES; the owner always routes
 			// over its own channels, matching LND/CLN/LDK).
+			const scidHex = lc.shortChannelId.toString('hex');
 			if (graph.getChannel(lc.shortChannelId)) {
-				shadowedScids.add(lc.shortChannelId.toString('hex'));
+				shadowedScids.add(scidHex);
 			}
 			const peerHex = lc.peer.toString('hex');
-			const edge = makeLocalChannelEdge(source, lc);
+			const edge: IGraphEdge = {
+				channel: makeLocalChannelEdge(source, lc),
+				scidHex,
+				node1Hex: sourceHex,
+				node2Hex: peerHex
+			};
 			syntheticEdges.set(peerHex, [
 				...(syntheticEdges.get(peerHex) ?? []),
 				edge
 			]);
-			hintDestMap.set(lc.shortChannelId.toString('hex'), peerHex);
+			hintDestMap.set(scidHex, peerHex);
 		}
 	}
 
@@ -461,6 +478,27 @@ interface IPredecessor {
 	cltvExpiryDelta: number;
 }
 
+/** Default maximum CLTV lockup budget in blocks (~2 weeks). */
+const DEFAULT_MAX_CLTV_EXPIRY = 2016;
+
+/**
+ * Everything a route search reads besides the amount, so the searches of
+ * one multi-path payment share a single overlay.
+ */
+interface IRouteSearch {
+	graph: NetworkGraph;
+	sourceHex: string;
+	destHex: string;
+	finalCltvExpiry: number;
+	maxHops: number;
+	maxCltvExpiry: number;
+	overlay: IEdgeOverlay;
+	excludedChannels?: Set<string>;
+	missionControl?: MissionControl;
+	currentTimestamp?: number;
+	policyOverrides?: TPolicyOverrides;
+}
+
 /**
  * Find a route from source to destination through the network graph.
  *
@@ -474,9 +512,6 @@ interface IPredecessor {
  * @param finalCltvExpiry - CLTV expiry for the final hop
  * @param maxHops - Maximum number of hops (default 20)
  */
-/** Default maximum CLTV lockup budget in blocks (~2 weeks). */
-const DEFAULT_MAX_CLTV_EXPIRY = 2016;
-
 export function findRoute(
 	graph: NetworkGraph,
 	source: Buffer,
@@ -492,17 +527,60 @@ export function findRoute(
 	localChannels?: ILocalChannelEdge[],
 	policyOverrides?: TPolicyOverrides
 ): IRoute | null {
-	const sourceHex = source.toString('hex');
-	const destHex = destination.toString('hex');
+	return searchRoute(
+		{
+			graph,
+			sourceHex: source.toString('hex'),
+			destHex: destination.toString('hex'),
+			finalCltvExpiry,
+			maxHops,
+			maxCltvExpiry,
+			// Overlay edges: routing-hint private channels + our own local channels
+			// (so a direct payment to a channel peer routes even when unannounced).
+			overlay: buildEdgeOverlay(
+				graph,
+				source,
+				destination,
+				routingHints,
+				localChannels
+			),
+			excludedChannels,
+			missionControl,
+			currentTimestamp,
+			policyOverrides
+		},
+		amountMsat
+	);
+}
+
+/**
+ * The search behind findRoute and findMultiPathRoute. With usedCapacity,
+ * each channel's limit is reduced by what earlier parts of a multi-path
+ * payment already route over it.
+ */
+function searchRoute(
+	search: IRouteSearch,
+	amountMsat: bigint,
+	usedCapacity?: Map<string, bigint>
+): IRoute | null {
+	const {
+		graph,
+		sourceHex,
+		destHex,
+		finalCltvExpiry,
+		maxHops,
+		maxCltvExpiry,
+		excludedChannels,
+		missionControl,
+		currentTimestamp,
+		policyOverrides
+	} = search;
+	const { syntheticEdges, hintDestMap, shadowedScids, localFirstHopScids } =
+		search.overlay;
 
 	if (sourceHex === destHex) {
 		return null;
 	}
-
-	// Overlay edges: routing-hint private channels + our own local channels
-	// (so a direct payment to a channel peer routes even when unannounced).
-	const { syntheticEdges, hintDestMap, shadowedScids, localFirstHopScids } =
-		buildEdgeOverlay(graph, source, destination, routingHints, localChannels);
 
 	// Best known cost to reach each node (working backwards from dest)
 	const bestCost = new Map<string, bigint>();
@@ -543,45 +621,32 @@ export function findRoute(
 		// An overlay edge claims its SCID: skip the graph copy so the synthetic
 		// edge (a private hint, or a local channel shadowing a graph entry that
 		// is missing our own update) is the single description of that channel.
-		const nodeIdBuf = Buffer.from(current.nodeId, 'hex');
-		const allGraphChannels = graph.getNodeChannels(nodeIdBuf);
-		const graphChannels =
+		const allGraphEdges = graph.getNodeEdges(current.nodeId);
+		const graphEdges =
 			shadowedScids.size > 0
-				? allGraphChannels.filter(
-						(ch) => !shadowedScids.has(ch.shortChannelId.toString('hex'))
-				  )
-				: allGraphChannels;
-		const hintChannels = syntheticEdges?.get(current.nodeId) ?? [];
-		const channels =
-			hintChannels.length > 0
-				? [...graphChannels, ...hintChannels]
-				: graphChannels;
+				? allGraphEdges.filter((edge) => !shadowedScids.has(edge.scidHex))
+				: allGraphEdges;
+		const hintEdges = syntheticEdges.get(current.nodeId);
+		const edges = hintEdges ? [...graphEdges, ...hintEdges] : graphEdges;
 
-		for (const channel of channels) {
+		for (const { channel, scidHex, node1Hex, node2Hex } of edges) {
 			// Skip excluded channels (used for payment retry)
-			if (
-				excludedChannels &&
-				excludedChannels.has(channel.shortChannelId.toString('hex'))
-			) {
+			if (excludedChannels && excludedChannels.has(scidHex)) {
 				continue;
 			}
 
 			// For synthetic hint channels, resolve the upstream node from the hint map
-			const scidHex = channel.shortChannelId.toString('hex');
-			const hintDest = hintDestMap?.get(scidHex);
+			const hintDest = hintDestMap.get(scidHex);
 			let upstreamNodeHex: string;
 			let update: typeof channel.update1;
 
 			if (hintDest !== undefined) {
 				// Synthetic hint channel: the hop pubkey is the upstream node
-				upstreamNodeHex = channel.nodeId1.toString('hex');
+				upstreamNodeHex = node1Hex;
 				update = channel.update1;
 				// Only use this edge if it leads to the current node
 				if (hintDest !== current.nodeId) continue;
 			} else {
-				const node1Hex = channel.nodeId1.toString('hex');
-				const node2Hex = channel.nodeId2.toString('hex');
-
 				// The upstream node is the one that is NOT current
 				const isCurrentNode2 = current.nodeId === node2Hex;
 				upstreamNodeHex = isCurrentNode2 ? node1Hex : node2Hex;
@@ -592,8 +657,8 @@ export function findRoute(
 				// With a local overlay, only CURRENT local channels may serve as
 				// the source's first hop: a stale source-adjacent graph entry
 				// (closed or spliced-away SCID the graph has not pruned) would
-				// otherwise size the hop by advertised gossip capacity the
-				// source cannot dispatch on.
+				// otherwise size the hop (or an MPP part) by advertised gossip
+				// capacity the source cannot dispatch on.
 				if (
 					localFirstHopScids !== null &&
 					upstreamNodeHex === sourceHex &&
@@ -624,12 +689,20 @@ export function findRoute(
 				if (update.timestamp < staleCutoff) continue;
 			}
 
-			// Check amount bounds
+			// Check amount bounds, less what earlier MPP parts already use
 			if (current.amountMsat < update.htlcMinimumMsat) continue;
-			if (
-				(update.messageFlags & MESSAGE_FLAG_HTLC_MAX) !== 0 &&
-				update.htlcMaximumMsat !== undefined &&
-				current.amountMsat > update.htlcMaximumMsat
+			const htlcMaximumMsat =
+				(update.messageFlags & MESSAGE_FLAG_HTLC_MAX) !== 0
+					? update.htlcMaximumMsat
+					: undefined;
+			if (usedCapacity) {
+				const used = usedCapacity.get(scidHex) ?? 0n;
+				const maxCapacity = htlcMaximumMsat ?? 0xffffffffffffffffn;
+				const availableCapacity = maxCapacity > used ? maxCapacity - used : 0n;
+				if (current.amountMsat > availableCapacity) continue;
+			} else if (
+				htlcMaximumMsat !== undefined &&
+				current.amountMsat > htlcMaximumMsat
 			) {
 				continue;
 			}
@@ -652,9 +725,7 @@ export function findRoute(
 			// CLTV budget check: prune routes exceeding max lockup (Fix 3.4)
 			if (newCltv > maxCltvExpiry) continue;
 
-			const penalty = missionControl
-				? missionControl.getPenalty(channel.shortChannelId.toString('hex'))
-				: 0n;
+			const penalty = missionControl ? missionControl.getPenalty(scidHex) : 0n;
 			// Accumulate a per-hop penalty so shorter, more reliable routes win.
 			const newCost =
 				newAmount + penalty + BigInt(current.hops + 1) * HOP_PENALTY_MSAT;
@@ -719,7 +790,7 @@ export function findRoute(
 	}
 
 	// Final CLTV budget check on the reconstructed route (Fix 3.4)
-	if (hops.length > 0 && hops[0].outgoingCltvValue > maxCltvExpiry) {
+	if (hops[0].outgoingCltvValue > maxCltvExpiry) {
 		return null;
 	}
 
@@ -772,6 +843,27 @@ export function findMultiPathRoute(
 	maxCltvExpiry: number = DEFAULT_MAX_CLTV_EXPIRY,
 	policyOverrides?: TPolicyOverrides
 ): IMultiPathRoute | null {
+	// Every search below runs against the same graph, so they share one
+	// overlay.
+	const search: IRouteSearch = {
+		graph,
+		sourceHex: source.toString('hex'),
+		destHex: destination.toString('hex'),
+		finalCltvExpiry,
+		maxHops,
+		maxCltvExpiry,
+		overlay: buildEdgeOverlay(
+			graph,
+			source,
+			destination,
+			routingHints,
+			localChannels
+		),
+		excludedChannels,
+		missionControl,
+		currentTimestamp,
+		policyOverrides
+	};
 	// Track used capacity per SCID to avoid reusing same liquidity
 	const usedCapacity = new Map<string, bigint>();
 	const parts: IRoute[] = [];
@@ -779,43 +871,13 @@ export function findMultiPathRoute(
 
 	for (let i = 0; i < maxParts && remaining > 0n; i++) {
 		// Try to route the full remaining amount first
-		let route = findRouteWithCapacityLimits(
-			graph,
-			source,
-			destination,
-			remaining,
-			finalCltvExpiry,
-			maxHops,
-			usedCapacity,
-			missionControl,
-			routingHints,
-			currentTimestamp,
-			localChannels,
-			excludedChannels,
-			maxCltvExpiry,
-			policyOverrides
-		);
+		let route = searchRoute(search, remaining, usedCapacity);
 
 		// If that fails, try halving the amount until we find a path or give up
 		if (!route) {
 			let tryAmount = remaining / 2n;
 			for (let attempt = 0; attempt < 8 && tryAmount > 0n; attempt++) {
-				route = findRouteWithCapacityLimits(
-					graph,
-					source,
-					destination,
-					tryAmount,
-					finalCltvExpiry,
-					maxHops,
-					usedCapacity,
-					missionControl,
-					routingHints,
-					currentTimestamp,
-					localChannels,
-					excludedChannels,
-					maxCltvExpiry,
-					policyOverrides
-				);
+				route = searchRoute(search, tryAmount, usedCapacity);
 				if (route) break;
 				tryAmount = tryAmount / 2n;
 			}
@@ -851,221 +913,6 @@ export function findMultiPathRoute(
 	}
 
 	return { parts, totalAmountMsat, totalFeeMsat };
-}
-
-/**
- * Find a route respecting already-used capacity on channels.
- */
-function findRouteWithCapacityLimits(
-	graph: NetworkGraph,
-	source: Buffer,
-	destination: Buffer,
-	amountMsat: bigint,
-	finalCltvExpiry: number,
-	maxHops: number,
-	usedCapacity: Map<string, bigint>,
-	missionControl?: MissionControl,
-	routingHints?: IRoutingHintHop[][],
-	currentTimestamp?: number,
-	localChannels?: ILocalChannelEdge[],
-	excludedChannels?: Set<string>,
-	maxCltvExpiry: number = DEFAULT_MAX_CLTV_EXPIRY,
-	policyOverrides?: TPolicyOverrides
-): IRoute | null {
-	const sourceHex = source.toString('hex');
-	const destHex = destination.toString('hex');
-
-	if (sourceHex === destHex) return null;
-
-	// Overlay edges: routing-hint private channels + our own local channels.
-	const { syntheticEdges, hintDestMap, shadowedScids, localFirstHopScids } =
-		buildEdgeOverlay(graph, source, destination, routingHints, localChannels);
-
-	const bestCost = new Map<string, bigint>();
-	const predecessors = new Map<string, IPredecessor>();
-	const heap = new MinHeap();
-
-	heap.push({
-		cost: amountMsat,
-		nodeId: destHex,
-		amountMsat,
-		cltvValue: finalCltvExpiry,
-		hops: 0
-	});
-	bestCost.set(destHex, amountMsat);
-
-	while (heap.size > 0) {
-		const current = heap.pop()!;
-
-		const known = bestCost.get(current.nodeId);
-		if (known !== undefined && current.cost > known) continue;
-
-		if (current.nodeId === sourceHex) break;
-		if (current.hops >= maxHops) continue;
-
-		const nodeIdBuf = Buffer.from(current.nodeId, 'hex');
-		// Overlay SCIDs shadow their graph copies (see findRoute).
-		const allGraphChannels = graph.getNodeChannels(nodeIdBuf);
-		const graphChannels =
-			shadowedScids.size > 0
-				? allGraphChannels.filter(
-						(ch) => !shadowedScids.has(ch.shortChannelId.toString('hex'))
-				  )
-				: allGraphChannels;
-		const hintChannels = syntheticEdges?.get(current.nodeId) ?? [];
-		const channels =
-			hintChannels.length > 0
-				? [...graphChannels, ...hintChannels]
-				: graphChannels;
-
-		for (const channel of channels) {
-			const scidHex = channel.shortChannelId.toString('hex');
-
-			// Skip excluded channels (used for payment retry)
-			if (excludedChannels && excludedChannels.has(scidHex)) continue;
-
-			const hintDest = hintDestMap?.get(scidHex);
-			let upstreamNodeHex: string;
-			let update: typeof channel.update1;
-
-			if (hintDest !== undefined) {
-				upstreamNodeHex = channel.nodeId1.toString('hex');
-				update = channel.update1;
-				if (hintDest !== current.nodeId) continue;
-			} else {
-				const node1Hex = channel.nodeId1.toString('hex');
-				const node2Hex = channel.nodeId2.toString('hex');
-				const isCurrentNode2 = current.nodeId === node2Hex;
-				upstreamNodeHex = isCurrentNode2 ? node1Hex : node2Hex;
-				update = isCurrentNode2 ? channel.update1 : channel.update2;
-
-				// Only CURRENT local channels may serve as the source's first
-				// hop when a local overlay is supplied (see findRoute): a stale
-				// source-adjacent graph SCID would let MPP size a part by
-				// gossip capacity the source cannot dispatch on.
-				if (
-					localFirstHopScids !== null &&
-					upstreamNodeHex === sourceHex &&
-					!localFirstHopScids.has(scidHex)
-				) {
-					continue;
-				}
-			}
-
-			// A retry's payment-scoped policy replaces the graph's (see
-			// findRoute, issue #1056).
-			update = policyFor(
-				update,
-				policyOverrides,
-				scidHex,
-				upstreamNodeHex,
-				current.nodeId
-			);
-			if (!update) continue;
-			if ((update.channelFlags & CHANNEL_FLAG_DISABLED) !== 0) continue;
-
-			// Skip stale channel_updates (>2 weeks old per BOLT 7) — but not synthetic hints
-			if (currentTimestamp !== undefined && hintDest === undefined) {
-				const staleCutoff = currentTimestamp - DEFAULT_PRUNE_MAX_AGE;
-				if (update.timestamp < staleCutoff) continue;
-			}
-
-			// Check remaining capacity after used amounts
-			const used = usedCapacity.get(scidHex) ?? 0n;
-			const maxCapacity =
-				(update.messageFlags & MESSAGE_FLAG_HTLC_MAX) !== 0 &&
-				update.htlcMaximumMsat !== undefined
-					? update.htlcMaximumMsat
-					: 0xffffffffffffffffn;
-			const availableCapacity = maxCapacity > used ? maxCapacity - used : 0n;
-
-			if (current.amountMsat < update.htlcMinimumMsat) continue;
-			if (current.amountMsat > availableCapacity) continue;
-
-			const fee = calculateFee(
-				current.amountMsat,
-				update.feeBaseMsat,
-				update.feeProportionalMillionths
-			);
-			const newAmount = current.amountMsat + fee;
-			// The sender applies no delta of its own (see findRoute).
-			const newCltv =
-				upstreamNodeHex === sourceHex
-					? current.cltvValue
-					: current.cltvValue + update.cltvExpiryDelta;
-
-			// CLTV budget check: prune routes exceeding max lockup (see findRoute)
-			if (newCltv > maxCltvExpiry) continue;
-
-			const penalty = missionControl ? missionControl.getPenalty(scidHex) : 0n;
-			// Accumulate a per-hop penalty so shorter, more reliable routes win.
-			const newCost =
-				newAmount + penalty + BigInt(current.hops + 1) * HOP_PENALTY_MSAT;
-
-			const existingBest = bestCost.get(upstreamNodeHex);
-			if (existingBest !== undefined && newCost >= existingBest) continue;
-
-			bestCost.set(upstreamNodeHex, newCost);
-			predecessors.set(upstreamNodeHex, {
-				channel,
-				nextNodeId: current.nodeId,
-				amountMsat: current.amountMsat,
-				cltvValue: current.cltvValue,
-				feeBaseMsat: update.feeBaseMsat,
-				feeProportionalMillionths: update.feeProportionalMillionths,
-				cltvExpiryDelta: update.cltvExpiryDelta
-			});
-
-			heap.push({
-				cost: newCost,
-				nodeId: upstreamNodeHex,
-				amountMsat: newAmount,
-				cltvValue: newCltv,
-				hops: current.hops + 1
-			});
-		}
-	}
-
-	if (!predecessors.has(sourceHex)) return null;
-
-	const hops: IRouteHop[] = [];
-	let currentNode = sourceHex;
-
-	while (currentNode !== destHex) {
-		const pred = predecessors.get(currentNode);
-		if (!pred) break;
-
-		const hopNodeHex = pred.nextNodeId;
-		const hopPred = predecessors.get(hopNodeHex);
-
-		hops.push({
-			pubkey: Buffer.from(hopNodeHex, 'hex'),
-			shortChannelId: Buffer.from(pred.channel.shortChannelId),
-			amountToForwardMsat: pred.amountMsat,
-			outgoingCltvValue: pred.cltvValue,
-			cltvExpiryDelta: pred.cltvExpiryDelta,
-			feeBaseMsat: hopPred ? hopPred.feeBaseMsat : 0,
-			feeProportionalMillionths: hopPred ? hopPred.feeProportionalMillionths : 0
-		});
-
-		currentNode = hopNodeHex;
-	}
-
-	if (hops.length === 0) return null;
-
-	// Final CLTV budget check on the reconstructed route (see findRoute)
-	if (hops[0].outgoingCltvValue > maxCltvExpiry) return null;
-
-	const totalAmountMsat = hops[0].amountToForwardMsat;
-	const deliveredMsat = hops[hops.length - 1].amountToForwardMsat;
-	const totalFeeMsat = totalAmountMsat - deliveredMsat;
-
-	let totalCltvDelta = 0;
-	for (const hop of hops) {
-		totalCltvDelta += hop.cltvExpiryDelta;
-	}
-
-	return { hops, totalAmountMsat, totalCltvDelta, totalFeeMsat };
 }
 
 // ── Blinded Path Route Finding ──────────────────────────────────────
