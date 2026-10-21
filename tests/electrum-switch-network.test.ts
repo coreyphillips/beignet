@@ -544,6 +544,76 @@ describe('switchNetwork against an unreachable target', function () {
 		}
 	});
 
+	it('keeps the Electrum batch options and the create-time flags across a switch (#1637)', async function () {
+		const heard: string[] = [];
+		const res = await Wallet.create({
+			mnemonic: MNEMONIC,
+			network,
+			electrumOptions: { ...electrumOptions, batchLimit: 5, batchDelay: 1 },
+			feeEstimationSource: 'electrum',
+			disableMessagesOnCreate: true,
+			disableRefreshOnCreate: true,
+			onMessage: (key): void => {
+				heard.push(key);
+			}
+		});
+		if (res.isErr()) throw res.error;
+		const w = res.value;
+		const stubs = w as unknown as {
+			_quietUntilFirstRefresh: boolean;
+			_disableRefreshOnCreate: boolean;
+			_runRefresh: () => Promise<Result<IWalletData>>;
+		};
+		w.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
+			ok(w.feeEstimates);
+		// The switch starts a refresh, and the first refresh to end lowers the
+		// message hold. Holding it keeps the flags as the switch left them.
+		let release = (): void => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		stubs._runRefresh = async (): Promise<Result<IWalletData>> => {
+			await gate;
+			return ok(w.data);
+		};
+		try {
+			expect(w.electrum.batchLimit).to.equal(5);
+			expect(w.electrum.batchDelay).to.equal(1);
+			expect(stubs._quietUntilFirstRefresh).to.equal(true);
+			expect(stubs._disableRefreshOnCreate).to.equal(true);
+
+			const switched = await w.switchNetwork(
+				EAvailableNetworks.signet,
+				otherServer
+			);
+			if (switched.isErr()) throw switched.error;
+			expect([w.electrum.servers].flat()).to.deep.equal([otherServer]);
+			expect(w.electrum.batchLimit).to.equal(5);
+			expect(w.electrum.batchDelay).to.equal(1);
+			// A later switch builds from these, so they have to be complete too.
+			expect(w.electrumOptions).to.include({
+				batchLimit: 5,
+				batchDelay: 1,
+				servers: otherServer
+			});
+			expect(stubs._disableRefreshOnCreate).to.equal(true);
+			expect(stubs._quietUntilFirstRefresh).to.equal(true);
+			w.sendMessage('reorg', []);
+			expect(heard).to.not.include('reorg');
+
+			// The hold still ends with the first refresh, which is the switch's.
+			const later = w.refreshWallet();
+			release();
+			await later;
+			expect(stubs._quietUntilFirstRefresh).to.equal(false);
+			w.sendMessage('reorg', []);
+			expect(heard).to.include('reorg');
+		} finally {
+			release();
+			await w.stop();
+		}
+	});
+
 	it('leaves the wallet untouched when the target network fails to load (#1595)', async function () {
 		const name = 'switchfail';
 		const store = new Map<string, unknown>();
