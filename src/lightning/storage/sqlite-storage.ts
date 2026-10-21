@@ -2891,6 +2891,10 @@ export class SqliteStorage implements IStorageBackend {
 		return this.db.transaction(fn)();
 	}
 
+	inTransaction(): boolean {
+		return this.db.inTransaction;
+	}
+
 	// ─── Webhooks (CLI layer persistence) ───
 
 	saveWebhook(

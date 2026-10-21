@@ -133,23 +133,27 @@ export class RecoveryManager {
 		// one it joins can still roll back after this returns, while a snapshot
 		// left unmarked is merely written again. With a journal they also wait
 		// for a commit that wrote a frame, since later frames omit them.
-		const historyWritten = isStorageTransactionActive(this.storage)
-			? []
-			: mutations.flatMap((mutation) =>
-					mutation.type === 'channel_state'
-						? [
-								{
-									state: mutation.state,
-									keys: [
-										...(unsavedRevokedHtlcSnapshots(
-											mutation.state,
-											this.storage
-										)?.keys() ?? [])
-									]
-								}
-						  ]
-						: []
-			  );
+		// withStorageTransaction does not see a raw backend transaction, so
+		// the backend is asked too.
+		const historyWritten =
+			isStorageTransactionActive(this.storage) ||
+			this.storage.inTransaction?.() === true
+				? []
+				: mutations.flatMap((mutation) =>
+						mutation.type === 'channel_state'
+							? [
+									{
+										state: mutation.state,
+										keys: [
+											...(unsavedRevokedHtlcSnapshots(
+												mutation.state,
+												this.storage
+											)?.keys() ?? [])
+										]
+									}
+							  ]
+							: []
+				  );
 		const outboxIds: Array<number | null> = [];
 		let journaled = false;
 		let frameSequence: bigint | null = null;

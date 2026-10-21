@@ -226,6 +226,8 @@ export interface IStorageBackend {
 
 	// ─── Transaction wrapper ───
 	transaction<T>(fn: () => T): T;
+	/** True while any transaction is open on this backend, however opened. */
+	inTransaction?(): boolean;
 
 	// ─── WAL Checkpoint (optional) ───
 	/** Checkpoint the WAL file, flushing pending writes to the main database. */

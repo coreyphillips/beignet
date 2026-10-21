@@ -346,6 +346,30 @@ describe('Revoked HTLC snapshot store', function () {
 		}
 	});
 
+	it('writes a snapshot again after an outer storage transaction rolls back', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const manager = new RecoveryManager(storage);
+		try {
+			const { opener, acceptor } = setupNormalChannels();
+			const channelId = opener.getChannelId()!.toString('hex');
+			offerHtlc(opener, acceptor, crypto.randomBytes(32));
+			exchangeCommitments(opener, acceptor);
+			expect(() =>
+				storage.transaction(() => {
+					expect(save(manager, channelId, opener.getFullState())).to.be.true;
+					throw new Error('outer rollback');
+				})
+			).to.throw('outer rollback');
+			expect(snapshotRows(storage, channelId)).to.equal(0);
+
+			expect(save(manager, channelId, opener.getFullState())).to.be.true;
+			expect(snapshotRows(storage, channelId)).to.equal(1);
+		} finally {
+			storage.close();
+		}
+	});
+
 	it('writes the whole history into a store the state was not saved to', () => {
 		const stores: SqliteStorage[] = [];
 		const open = (): { storage: SqliteStorage; journal: RecoveryJournal } => {
