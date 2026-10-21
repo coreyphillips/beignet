@@ -11654,9 +11654,43 @@ export class LightningNode extends EventEmitter {
 		// not history yet: its outcome, and the preimage a late fulfil
 		// reveals, still belong to it (#743 audit). A COMPLETED incoming record
 		// with a part whose fulfill was refused is still owed that fulfill.
+		//
+		// getOutgoingHtlcs walks every channel and the whole htlcPaymentMap, so
+		// it is asked only about a hash that can have a non-terminal HTLC: one
+		// a channel still carries as offered, or one mapped to a channel with a
+		// monitor (a mapped HTLC on a channel without one is terminal). The set
+		// is built once per pass, and only if a candidate needs it.
+		let possiblyLive: Set<string> | undefined;
+		const mayHaveLiveHtlc = (hash: string): boolean => {
+			if (!possiblyLive) {
+				const hashes = new Set<string>();
+				for (const channel of this.channelManager.listChannels()) {
+					for (const [key, htlc] of channel.getFullState().htlcs) {
+						if (key.startsWith('offered-')) {
+							hashes.add(htlc.paymentHash.toString('hex'));
+						}
+					}
+				}
+				const monitored = new Map<string, boolean>();
+				for (const [key, hashHex] of this.htlcPaymentMap) {
+					const channelHex = key.slice(0, key.indexOf(':'));
+					let hasMonitor = monitored.get(channelHex);
+					if (hasMonitor === undefined) {
+						hasMonitor =
+							this.channelManager.getMonitor(Buffer.from(channelHex, 'hex')) !==
+							undefined;
+						monitored.set(channelHex, hasMonitor);
+					}
+					if (hasMonitor) hashes.add(hashHex);
+				}
+				possiblyLive = hashes;
+			}
+			return possiblyLive.has(hash);
+		};
 		const stillLive = (hash: string, payment: IPaymentInfo): boolean =>
 			payment.direction === PaymentDirection.OUTGOING
-				? !this.getOutgoingHtlcs(Buffer.from(hash, 'hex')).resolved
+				? mayHaveLiveHtlc(hash) &&
+				  !this.getOutgoingHtlcs(Buffer.from(hash, 'hex')).resolved
 				: this.owesSettledFulfill(payment);
 
 		const forget = (hash: string, payment: IPaymentInfo): void => {
@@ -11700,26 +11734,39 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
-		// Phase 2: If still over cap, remove oldest completed/failed first
-		const completed: [string, IPaymentInfo][] = [];
-		for (const entry of this.payments) {
+		// Phase 2: If still over cap, remove oldest completed/failed first. Live
+		// records do not count toward the cap, so with every terminal record
+		// under it there is nothing to prune and no liveness to check.
+		let terminal = 0;
+		for (const payment of this.payments.values()) {
 			if (
-				(entry[1].status === PaymentStatus.COMPLETED ||
-					entry[1].status === PaymentStatus.FAILED) &&
-				!stillLive(entry[0], entry[1])
+				payment.status === PaymentStatus.COMPLETED ||
+				payment.status === PaymentStatus.FAILED
 			) {
-				completed.push(entry);
+				terminal++;
 			}
 		}
-		if (completed.length > max) {
-			completed.sort(
-				(a, b) =>
-					(a[1].completedAt || a[1].createdAt) -
-					(b[1].completedAt || b[1].createdAt)
-			);
-			const toRemove = completed.length - max;
-			for (let i = 0; i < toRemove; i++) {
-				forget(completed[i][0], completed[i][1]);
+		if (terminal > max) {
+			const completed: [string, IPaymentInfo][] = [];
+			for (const entry of this.payments) {
+				if (
+					(entry[1].status === PaymentStatus.COMPLETED ||
+						entry[1].status === PaymentStatus.FAILED) &&
+					!stillLive(entry[0], entry[1])
+				) {
+					completed.push(entry);
+				}
+			}
+			if (completed.length > max) {
+				completed.sort(
+					(a, b) =>
+						(a[1].completedAt || a[1].createdAt) -
+						(b[1].completedAt || b[1].createdAt)
+				);
+				const toRemove = completed.length - max;
+				for (let i = 0; i < toRemove; i++) {
+					forget(completed[i][0], completed[i][1]);
+				}
 			}
 		}
 
@@ -31944,6 +31991,10 @@ export class LightningNode extends EventEmitter {
 	 * from their monitors. `resolved` is never true while any HTLC is
 	 * non-terminal, whatever the record says: a wall-clock failPayment is not
 	 * an outcome.
+	 *
+	 * pruneCompletedPayments skips this call for a hash that no channel
+	 * carries as offered and that is mapped to no channel with a monitor, so
+	 * only those two may yield a non-terminal view.
 	 */
 	getOutgoingHtlcs(paymentHash: Buffer): IOutgoingPaymentResolution {
 		const hashHex = paymentHash.toString('hex');
