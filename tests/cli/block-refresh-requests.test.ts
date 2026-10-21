@@ -122,6 +122,10 @@ describe('block notification refresh requests (#1663)', function () {
 	let historyAsked: string[];
 	let listings: number;
 	let failNextListing: boolean;
+	/** A transaction whose batch fails once. */
+	let failBatchOf: string | undefined;
+	/** Whether a script hash not yet subscribed is refused. */
+	let refuseNewSubscriptions: boolean;
 	let transactionsAsked: string[];
 	let messages: (keyof TMessageDataMap)[];
 
@@ -135,6 +139,8 @@ describe('block notification refresh requests (#1663)', function () {
 		historyAsked = [];
 		listings = 0;
 		failNextListing = false;
+		failBatchOf = undefined;
+		refuseNewSubscriptions = false;
 		transactionsAsked = [];
 		messages = [];
 		const heightOf = (scriptHash: string): number =>
@@ -181,6 +187,9 @@ describe('block notification refresh requests (#1663)', function () {
 					scriptHashHandler ??= onReceive;
 					if (subscribed.has(scriptHash)) {
 						return { error: false, data: 'Already Subscribed.' };
+					}
+					if (refuseNewSubscriptions) {
+						return { error: true, data: 'Server busy.' };
 					}
 					subscribed.add(scriptHash);
 					return { error: false, data: null };
@@ -242,6 +251,10 @@ describe('block notification refresh requests (#1663)', function () {
 			.callsFake(
 				async ({ txHashes }: { txHashes: TBatch<{ tx_hash: string }> }) => {
 					transactionsAsked.push(...txHashes.data.map((h) => h.tx_hash));
+					if (txHashes.data.some((h) => h.tx_hash === failBatchOf)) {
+						failBatchOf = undefined;
+						return { error: true, data: 'Server busy.' };
+					}
 					return {
 						error: false,
 						data: txHashes.data.map((h) => ({
@@ -317,6 +330,18 @@ describe('block notification refresh requests (#1663)', function () {
 
 	const settled = (): Promise<void> =>
 		waitFor(() => !wallet.isRefreshing, 'the refresh to settle');
+
+	/** Issues receive addresses until one past those generated up front. */
+	const issuePastGenerated = async (): Promise<IAddress> => {
+		let issued: IAddress | undefined;
+		for (let i = 0; i < 20; i++) {
+			const res = await wallet.generateNewReceiveAddress();
+			if (res.isErr()) throw new Error(res.error.message);
+			issued = res.value;
+		}
+		expect(issued?.index).to.equal(20);
+		return issued as IAddress;
+	};
 
 	/** One coin to `address` from an external parent, in block `height` (the
 	 *  tip when it is not 0, the mempool). */
@@ -455,5 +480,64 @@ describe('block notification refresh requests (#1663)', function () {
 		expect(transactionsAsked).to.deep.equal([txid]);
 		expect(listings).to.equal(0);
 		expect(historyAsked).to.deep.equal([]);
+	});
+
+	it('subscribes a receive address issued past the subscribed window', async function () {
+		await block(101);
+		const issued = await issuePastGenerated();
+		expect(subscribed.has(issued.scriptHash)).to.equal(true);
+		const txid = '4d'.repeat(32);
+		pay(issued, txid, 0);
+
+		await notify(issued.scriptHash);
+		await settled();
+
+		expect(wallet.data.utxos.map((u) => u.tx_hash)).to.deep.equal([txid]);
+	});
+
+	it('scans on the next block after a transaction batch failed', async function () {
+		await block(101);
+		const receive = wallet.data.addressIndex[EAddressType.p2wpkh];
+		const txid = '5e'.repeat(32);
+		pay(receive, txid, 101);
+		failBatchOf = txid;
+
+		await notify(receive.scriptHash);
+		await settled();
+		expect(wallet.data.utxos.map((u) => u.tx_hash)).to.deep.equal([txid]);
+		expect(wallet.data.transactions[txid], 'its batch failed').to.equal(
+			undefined
+		);
+		resetCounts();
+
+		await block(102);
+		expect(transactionsAsked, 'the block asks again').to.include(txid);
+		expect(wallet.data.transactions[txid]?.height).to.equal(101);
+
+		resetCounts();
+		await block(103);
+		expect(listings, 'and stops once it succeeded').to.equal(0);
+	});
+
+	it('subscribes on the next block a window address whose subscription failed', async function () {
+		await block(101);
+		refuseNewSubscriptions = true;
+		const issued = await issuePastGenerated();
+		// A refresh before the server recovers fails to subscribe it as well.
+		const refreshed = await wallet.refreshWallet();
+		expect(refreshed.isOk()).to.equal(true);
+		expect(subscribed.has(issued.scriptHash)).to.equal(false);
+		refuseNewSubscriptions = false;
+		resetCounts();
+
+		await block(102);
+		expect(listings, 'the block retries the refresh').to.be.greaterThan(0);
+		expect(subscribed.has(issued.scriptHash)).to.equal(true);
+
+		const txid = '6f'.repeat(32);
+		pay(issued, txid, 0);
+		await notify(issued.scriptHash);
+		await settled();
+		expect(wallet.data.utxos.map((u) => u.tx_hash)).to.deep.equal([txid]);
 	});
 });

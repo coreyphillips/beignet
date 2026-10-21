@@ -215,8 +215,10 @@ export class Wallet {
 	private _refreshOwed = false;
 	// onStart callbacks of refresh calls whose body has not started yet.
 	private _refreshStartCallbacks: Array<() => void> = [];
-	// Whether the last refresh body to finish failed. A new block only runs a
-	// full refresh when something calls for one, and this is what retries it.
+	// Whether a refresh failed, or left a transaction unread or a window
+	// address unsubscribed, since the last refresh body started. A new block
+	// only runs a full refresh when something calls for one, and this is what
+	// retries it.
 	private _refreshFailed = false;
 	// Outpoints our own broadcasts have spent, keyed 'txid:vout', each holding
 	// the value _spendSeq had when the broadcast landed. The UTXO set is only
@@ -529,8 +531,9 @@ export class Wallet {
 		return this._data.balance;
 	}
 
-	/** Whether the last refresh failed. The next block refreshes in full while
-	 *  it is set. */
+	/** Whether a refresh failed, or left a transaction unread or a window
+	 *  address unsubscribed, since the last refresh began. The next block
+	 *  refreshes in full while it is set. */
 	public get refreshFailed(): boolean {
 		return this._refreshFailed;
 	}
@@ -1209,12 +1212,13 @@ export class Wallet {
 						// A caller's hook must not cost the refresh.
 					}
 				}
+				this._refreshFailed = false;
 				try {
 					result = await this._runRefresh(scan);
 				} catch (e) {
 					result = err(e);
 				}
-				this._refreshFailed = result.isErr();
+				if (result.isErr()) this._refreshFailed = true;
 				// A call queued while this body ran is answered with a scan that
 				// starts after it, however many were queued. Only the last body in
 				// flight answers the queue, so a nested or sibling forced refresh
@@ -1288,8 +1292,20 @@ export class Wallet {
 			return err(r3.error.message);
 		}
 		if (this._stopped) return err(stopped);
-		await this.electrum.subscribeToAddresses();
+		await this.subscribeWindows();
 		return ok(this.data);
+	}
+
+	/**
+	 * Subscribes the receive and change gap windows. An address left
+	 * unsubscribed is only read again by a full refresh, so a failure owes the
+	 * next block one.
+	 * @private
+	 * @returns {Promise<void>}
+	 */
+	private async subscribeWindows(): Promise<void> {
+		const subscribed = await this.electrum.subscribeToAddresses();
+		if (subscribed.isErr()) this._refreshFailed = true;
 	}
 
 	/** Releases the refresh flag and hands `result` to every queued caller. */
@@ -3050,7 +3066,13 @@ export class Wallet {
 		next: IAddress
 	): Promise<Result<IAddress>> {
 		this.moveReceiveIndex(addressType, next);
-		return this.savedReceiveAddress(addressType);
+		const issued = await this.savedReceiveAddress(addressType);
+		// A block no longer rescans the receive window, so the window this move
+		// shifted is subscribed before the address is handed out. Not before the
+		// index is read, which a concurrent issuance could move meanwhile, and
+		// never while disconnected, when the client would dial a random peer.
+		if (this.electrum.connectedToElectrum) await this.subscribeWindows();
+		return issued;
 	}
 
 	/**
@@ -4055,6 +4077,11 @@ export class Wallet {
 		});
 		if (getTransactionsResponse.isErr()) {
 			return err(getTransactionsResponse.error.message);
+		}
+		// A failed batch is left out of the answer rather than failing it, and
+		// only a full refresh asks for its transactions again.
+		if (getTransactionsResponse.value.data.length < filteredTxHashes.length) {
+			this._refreshFailed = true;
 		}
 
 		const formatTransactionsResponse = await this.formatTransactions({
