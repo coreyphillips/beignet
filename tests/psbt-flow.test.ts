@@ -414,11 +414,18 @@ describe('External-Signer PSBT Flow', function () {
 				})
 			);
 			const electrum = p2pkhWallet.electrum as unknown as {
-				getTransactions: () => Promise<unknown>;
+				getTransactions: (args: {
+					txHashes: { tx_hash: string }[];
+				}) => Promise<unknown>;
 			};
 			const originalGetTransactions = electrum.getTransactions;
-			electrum.getTransactions = async (): Promise<unknown> =>
-				ok({ data: [{ result: { hex: prevTx.toHex() } }] });
+			electrum.getTransactions = async ({ txHashes }): Promise<unknown> =>
+				ok({
+					data: txHashes.map(({ tx_hash }) => ({
+						data: { tx_hash },
+						result: { hex: prevTx.toHex() }
+					}))
+				});
 			try {
 				const res = await p2pkhWallet.buildPsbt({
 					address: RECIPIENT,

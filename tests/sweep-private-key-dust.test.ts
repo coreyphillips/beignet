@@ -105,9 +105,14 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 		// cannot be fetched.
 		sinon
 			.stub(wallet.electrum, 'getTransactions')
-			.resolves(
+			.callsFake(async ({ txHashes }: { txHashes: { tx_hash: string }[] }) =>
 				prevTx
-					? (ok({ data: [{ result: { hex: prevTx.toHex() } }] }) as never)
+					? (ok({
+							data: txHashes.map(({ tx_hash }) => ({
+								data: { tx_hash },
+								result: { hex: prevTx.toHex() }
+							}))
+					  }) as never)
 					: err('offline')
 			);
 	};

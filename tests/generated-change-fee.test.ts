@@ -114,10 +114,17 @@ describe('Fee estimation with generated change (#1465)', function () {
 		}));
 		for (const target of [wallet, freshWallet]) {
 			const electrum = target.electrum as unknown as {
-				getTransactions: () => Promise<unknown>;
+				getTransactions: (args: {
+					txHashes: { tx_hash: string }[];
+				}) => Promise<unknown>;
 			};
-			electrum.getTransactions = async (): Promise<unknown> =>
-				ok({ data: [{ result: { hex: prevTx.toHex() } }] });
+			electrum.getTransactions = async ({ txHashes }): Promise<unknown> =>
+				ok({
+					data: txHashes.map(({ tx_hash }) => ({
+						data: { tx_hash },
+						result: { hex: prevTx.toHex() }
+					}))
+				});
 		}
 	});
 

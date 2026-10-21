@@ -91,6 +91,7 @@ describe('Staged fee the inputs cannot cover (#1361)', function () {
 		electrum.getTransactions = async ({ txHashes }): Promise<unknown> =>
 			ok({
 				data: txHashes.map(({ tx_hash }) => ({
+					data: { tx_hash },
 					result: {
 						hex: prevTxs.find((tx) => tx.getId() === tx_hash)?.toHex()
 					}

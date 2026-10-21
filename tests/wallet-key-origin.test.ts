@@ -320,11 +320,18 @@ describe('Wallet key-origin metadata (S-B.H1/M1/M2)', function () {
 				publicKey: rootA.derivePath("m/84'/1'/0'/0/0").publicKey.toString('hex')
 			});
 			const electrum = wallet.electrum as unknown as {
-				getTransactions: () => Promise<unknown>;
+				getTransactions: (args: {
+					txHashes: { tx_hash: string }[];
+				}) => Promise<unknown>;
 			};
 			const original = electrum.getTransactions;
-			electrum.getTransactions = async (): Promise<unknown> =>
-				ok({ data: [{ result: { hex: prevTx.toHex() } }] });
+			electrum.getTransactions = async ({ txHashes }): Promise<unknown> =>
+				ok({
+					data: txHashes.map(({ tx_hash }) => ({
+						data: { tx_hash },
+						result: { hex: prevTx.toHex() }
+					}))
+				});
 			try {
 				const built = await wallet.buildPsbt({
 					address: RECIPIENT,
