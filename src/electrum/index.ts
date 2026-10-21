@@ -1386,14 +1386,19 @@ export class Electrum {
 	 * Returns the available history for the provided address script hashes.
 	 * @param {IAddress[]} [scriptHashes]
 	 * @param {boolean} [scanAllAddresses]
+	 * @param {Map<string, TTxResult[]>} [answered] The history already
+	 * answered for each script hash. A script hash found here is not asked
+	 * again, and every one the server answers is added to it.
 	 * @returns {Promise<Result<IGetAddressHistoryResponse[]>>}
 	 */
 	async getAddressHistory({
 		scriptHashes = [],
-		scanAllAddresses = false
+		scanAllAddresses = false,
+		answered
 	}: {
 		scriptHashes?: IAddress[];
 		scanAllAddresses?: boolean;
+		answered?: Map<string, TTxResult[]>;
 	}): Promise<Result<IGetAddressHistoryResponse[]>> {
 		try {
 			if (this._disconnected) return err(DISCONNECTED_ERROR);
@@ -1463,14 +1468,16 @@ export class Electrum {
 				return err('No scriptHashes available to check.');
 			}
 
-			const combinedResponse: TTxResponse[] = [];
+			const toAsk = answered
+				? scriptHashes.filter(({ scriptHash }) => !answered.has(scriptHash))
+				: scriptHashes;
 			const promises: Promise<IGetAddressScriptHashesHistoryResponse>[] = [];
 
 			// split payload in chunks of 10 addresses per-request
-			for (let i = 0; i < scriptHashes.length; i += this.batchLimit) {
+			for (let i = 0; i < toAsk.length; i += this.batchLimit) {
 				if (i > 0) await sleep(this.batchDelay);
 				if (this._disconnected) return err(DISCONNECTED_ERROR);
-				const chunk = scriptHashes.slice(i, i + this.batchLimit);
+				const chunk = toAsk.slice(i, i + this.batchLimit);
 				const payload = {
 					key: 'scriptHash',
 					data: chunk
@@ -1486,23 +1493,29 @@ export class Electrum {
 			}
 
 			const responses = await Promise.all(promises);
+			const results = new Map<string, TTxResult[]>();
 			responses.forEach((response) => {
 				this.noteAnswer(response);
-				if (!response.error) {
-					combinedResponse.push(...response.data);
-				}
+				if (response.error) return;
+				response.data.forEach(({ data, result }: TTxResponse) => {
+					if (!data?.scriptHash) return;
+					results.set(data.scriptHash, result);
+					// An entry the server answered with an error is asked again.
+					if (Array.isArray(result)) answered?.set(data.scriptHash, result);
+				});
 			});
 
+			// In the order asked for, wherever each answer came from.
 			const history: IGetAddressHistoryResponse[] = [];
-			combinedResponse.forEach(
-				({ data, result }: { data: IAddress; result: TTxResult[] }): void => {
-					if (result && result?.length > 0) {
-						result.forEach((item) => {
-							history.push({ ...data, ...item });
-						});
-					}
+			for (const data of scriptHashes) {
+				const result =
+					results.get(data.scriptHash) ?? answered?.get(data.scriptHash);
+				if (result && result?.length > 0) {
+					result.forEach((item) => {
+						history.push({ ...data, ...item });
+					});
 				}
-			);
+			}
 			return ok(history);
 		} catch (e) {
 			return err(e);
@@ -1579,9 +1592,69 @@ export class Electrum {
 	 * @param {number} changeAddressIndex
 	 * @param {EAddressType[]} [addressTypesToCheck]
 	 * @additionalAddresses {string[]} [additionalAddresses]
+	 * @param {IAddresses} [additionalScriptHashes] Listed besides the
+	 * addresses the strategy picks.
 	 * @returns {Promise<Result<IGetUtxosResponse>>}
 	 */
 	async getUtxos({
+		scanningStrategy = EScanningStrategy.gapLimit,
+		addressIndex,
+		changeAddressIndex,
+		addressTypesToCheck = this._wallet.addressTypesToMonitor,
+		additionalAddresses = [],
+		additionalScriptHashes = {}
+	}: {
+		scanningStrategy?: EScanningStrategy;
+		addressIndex?: number;
+		changeAddressIndex?: number;
+		addressTypesToCheck?: EAddressType[];
+		additionalAddresses?: string[];
+		additionalScriptHashes?: IAddresses;
+	}): Promise<Result<IGetUtxosResponse>> {
+		try {
+			if (this._disconnected) return err(DISCONNECTED_ERROR);
+			if (!this.connectedToElectrum)
+				await this.connectToElectrum({
+					network: this.network,
+					servers: this.servers
+				});
+			const addresses = this.utxoScanAddresses({
+				scanningStrategy,
+				addressIndex,
+				changeAddressIndex,
+				addressTypesToCheck,
+				additionalAddresses
+			});
+			const existingUtxos: { [key: string]: IUtxo } = {};
+
+			// Make sure we're re-check existing utxos that may exist outside the gap limit and putting them in the necessary format.
+			this._wallet.data.utxos.map((utxo) => {
+				existingUtxos[utxo.scriptHash] = utxo;
+			});
+
+			const data: TUnspentAddressScriptHashData = {
+				...addresses,
+				...additionalScriptHashes,
+				...existingUtxos
+			};
+
+			return this.listUnspentAddressScriptHashes({ addresses: data });
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * The addresses getUtxos picks for these options, before it adds the
+	 * wallet's existing UTXOs.
+	 * @param {EScanningStrategy} [scanningStrategy]
+	 * @param {number} addressIndex
+	 * @param {number} changeAddressIndex
+	 * @param {EAddressType[]} [addressTypesToCheck]
+	 * @additionalAddresses {string[]} [additionalAddresses]
+	 * @returns {IAddresses}
+	 */
+	utxoScanAddresses({
 		scanningStrategy = EScanningStrategy.gapLimit,
 		addressIndex,
 		changeAddressIndex,
@@ -1593,153 +1666,131 @@ export class Electrum {
 		changeAddressIndex?: number;
 		addressTypesToCheck?: EAddressType[];
 		additionalAddresses?: string[];
-	}): Promise<Result<IGetUtxosResponse>> {
-		try {
-			if (this._disconnected) return err(DISCONNECTED_ERROR);
-			if (!this.connectedToElectrum)
-				await this.connectToElectrum({
-					network: this.network,
-					servers: this.servers
-				});
-			const currentWallet = this._wallet.data;
+	}): IAddresses {
+		const currentWallet = this._wallet.data;
 
-			let addresses = {} as IAddresses;
-			let changeAddresses = {} as IAddresses;
-			const existingUtxos: { [key: string]: IUtxo } = {};
+		let addresses = {} as IAddresses;
+		let changeAddresses = {} as IAddresses;
 
-			for (const addressType of addressTypesToCheck) {
-				// Grab all addresses and change addresses.
-				const allAddresses = currentWallet.addresses[addressType] ?? {};
-				const allChangeAddresses =
-					currentWallet.changeAddresses[addressType] ?? {};
+		for (const addressType of addressTypesToCheck) {
+			// Grab all addresses and change addresses.
+			const allAddresses = currentWallet.addresses[addressType] ?? {};
+			const allChangeAddresses =
+				currentWallet.changeAddresses[addressType] ?? {};
 
-				// Skip a type only when NEITHER collection has been generated.
-				// Two things to note here:
-				//   - `continue`, not `break`: address types are independent, and a
-				//     `break` dropped every LATER type from the query. Since p2tr is
-				//     last in EAddressType, a wallet with no p2sh addresses returned
-				//     zero UTXOs for its own p2tr addresses, indistinguishable from
-				//     having no funds.
-				//   - both collections are checked: getChangeAddress generates with
-				//     `addressAmount: 0`, so a type can hold change addresses and no
-				//     receiving addresses. Testing only the receiving side skipped
-				//     those change addresses, dropping real UTXOs from the scan.
-				if (
-					Object.keys(allAddresses).length === 0 &&
-					Object.keys(allChangeAddresses).length === 0
-				) {
-					continue;
-				}
-
-				if (scanningStrategy === EScanningStrategy.all) {
-					addresses = { ...addresses, ...allAddresses };
-					changeAddresses = { ...changeAddresses, ...allChangeAddresses };
-				} else {
-					// Grab the current index for address/change addresses if none were provided.
-					const _addressIndex =
-						addressIndex === undefined
-							? currentWallet.addressIndex[addressType].index
-							: addressIndex;
-					const _changeAddressIndex =
-						changeAddressIndex === undefined
-							? currentWallet.changeAddressIndex[addressType].index
-							: changeAddressIndex;
-
-					// Use the lowest index to ensure we're not starting above our current index.
-					// TODO: Consider removing this entirely or at least updating it to allow up to the max stored address/change address index.
-					const lowestAddressIndex = Math.min(
-						_addressIndex,
-						currentWallet.addressIndex[addressType].index
-					);
-					const lowestChangeAddressIndex = Math.min(
-						_changeAddressIndex,
-						currentWallet.changeAddressIndex[addressType].index
-					);
-
-					switch (scanningStrategy) {
-						case EScanningStrategy.gapLimit:
-							addresses = {
-								...addresses,
-								...filterAddressesObjForGapLimit({
-									addresses: allAddresses,
-									index: lowestAddressIndex,
-									gapLimitOptions: this._wallet.gapLimitOptions,
-									change: false
-								}),
-								...filterAddressesObjForAddressesList({
-									addresses: allAddresses,
-									additionalAddresses
-								})
-							};
-							changeAddresses = {
-								...changeAddresses,
-								...filterAddressesObjForGapLimit({
-									addresses: allChangeAddresses,
-									index: lowestChangeAddressIndex,
-									gapLimitOptions: this._wallet.gapLimitOptions,
-									change: true
-								})
-							};
-							break;
-						case EScanningStrategy.startingIndex:
-							addresses = {
-								...addresses,
-								...filterAddressesObjForStartingIndex({
-									addresses: allAddresses,
-									index: lowestAddressIndex
-								}),
-								...filterAddressesObjForAddressesList({
-									addresses: allAddresses,
-									additionalAddresses
-								})
-							};
-							changeAddresses = {
-								...changeAddresses,
-								...filterAddressesObjForStartingIndex({
-									addresses: allChangeAddresses,
-									index: lowestChangeAddressIndex
-								})
-							};
-							break;
-						case EScanningStrategy.singleIndex:
-							addresses = {
-								...addresses,
-								...filterAddressesObjForSingleIndex({
-									addresses: allAddresses,
-									addressIndex: _addressIndex
-								}),
-								...filterAddressesObjForAddressesList({
-									addresses: allAddresses,
-									additionalAddresses
-								})
-							};
-							changeAddresses = {
-								...changeAddresses,
-								...filterAddressesObjForSingleIndex({
-									addresses: allChangeAddresses,
-									addressIndex: _changeAddressIndex
-								})
-							};
-							break;
-					}
-				}
+			// Skip a type only when NEITHER collection has been generated.
+			// Two things to note here:
+			//   - `continue`, not `break`: address types are independent, and a
+			//     `break` dropped every LATER type from the query. Since p2tr is
+			//     last in EAddressType, a wallet with no p2sh addresses returned
+			//     zero UTXOs for its own p2tr addresses, indistinguishable from
+			//     having no funds.
+			//   - both collections are checked: getChangeAddress generates with
+			//     `addressAmount: 0`, so a type can hold change addresses and no
+			//     receiving addresses. Testing only the receiving side skipped
+			//     those change addresses, dropping real UTXOs from the scan.
+			if (
+				Object.keys(allAddresses).length === 0 &&
+				Object.keys(allChangeAddresses).length === 0
+			) {
+				continue;
 			}
 
-			// Make sure we're re-check existing utxos that may exist outside the gap limit and putting them in the necessary format.
-			currentWallet.utxos.map((utxo) => {
-				existingUtxos[utxo.scriptHash] = utxo;
-			});
+			if (scanningStrategy === EScanningStrategy.all) {
+				addresses = { ...addresses, ...allAddresses };
+				changeAddresses = { ...changeAddresses, ...allChangeAddresses };
+			} else {
+				// Grab the current index for address/change addresses if none were provided.
+				const _addressIndex =
+					addressIndex === undefined
+						? currentWallet.addressIndex[addressType].index
+						: addressIndex;
+				const _changeAddressIndex =
+					changeAddressIndex === undefined
+						? currentWallet.changeAddressIndex[addressType].index
+						: changeAddressIndex;
 
-			const data: TUnspentAddressScriptHashData = {
-				...addresses,
-				...changeAddresses,
-				...existingUtxos
-			};
+				// Use the lowest index to ensure we're not starting above our current index.
+				// TODO: Consider removing this entirely or at least updating it to allow up to the max stored address/change address index.
+				const lowestAddressIndex = Math.min(
+					_addressIndex,
+					currentWallet.addressIndex[addressType].index
+				);
+				const lowestChangeAddressIndex = Math.min(
+					_changeAddressIndex,
+					currentWallet.changeAddressIndex[addressType].index
+				);
 
-			return this.listUnspentAddressScriptHashes({ addresses: data });
-		} catch (e) {
-			return err(e);
+				switch (scanningStrategy) {
+					case EScanningStrategy.gapLimit:
+						addresses = {
+							...addresses,
+							...filterAddressesObjForGapLimit({
+								addresses: allAddresses,
+								index: lowestAddressIndex,
+								gapLimitOptions: this._wallet.gapLimitOptions,
+								change: false
+							}),
+							...filterAddressesObjForAddressesList({
+								addresses: allAddresses,
+								additionalAddresses
+							})
+						};
+						changeAddresses = {
+							...changeAddresses,
+							...filterAddressesObjForGapLimit({
+								addresses: allChangeAddresses,
+								index: lowestChangeAddressIndex,
+								gapLimitOptions: this._wallet.gapLimitOptions,
+								change: true
+							})
+						};
+						break;
+					case EScanningStrategy.startingIndex:
+						addresses = {
+							...addresses,
+							...filterAddressesObjForStartingIndex({
+								addresses: allAddresses,
+								index: lowestAddressIndex
+							}),
+							...filterAddressesObjForAddressesList({
+								addresses: allAddresses,
+								additionalAddresses
+							})
+						};
+						changeAddresses = {
+							...changeAddresses,
+							...filterAddressesObjForStartingIndex({
+								addresses: allChangeAddresses,
+								index: lowestChangeAddressIndex
+							})
+						};
+						break;
+					case EScanningStrategy.singleIndex:
+						addresses = {
+							...addresses,
+							...filterAddressesObjForSingleIndex({
+								addresses: allAddresses,
+								addressIndex: _addressIndex
+							}),
+							...filterAddressesObjForAddressesList({
+								addresses: allAddresses,
+								additionalAddresses
+							})
+						};
+						changeAddresses = {
+							...changeAddresses,
+							...filterAddressesObjForSingleIndex({
+								addresses: allChangeAddresses,
+								addressIndex: _changeAddressIndex
+							})
+						};
+						break;
+				}
+			}
 		}
+
+		return { ...addresses, ...changeAddresses };
 	}
 
 	/**
