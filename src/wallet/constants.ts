@@ -43,6 +43,13 @@ export const MAX_REMEMBERED_PSBT_BUILDS = 50;
  */
 export const MAX_REMEMBERED_PREVOUTS = 5_000;
 
+/**
+ * How many derivation branch nodes a wallet keeps. Its own address types
+ * need a few dozen. Callers can pass any path to getAddressByPath, and a
+ * PSBT to sign can carry any, so past this the cache starts over.
+ */
+export const MAX_CACHED_BRANCHES = 256;
+
 export const TRANSACTION_DEFAULTS = {
 	recommendedBaseFee: 256, // Total recommended tx base fee in sats
 	dustLimit: 546, // Minimum value in sats for an output. Outputs below the dust limit may not be processed because the fees required to include them in a block would be greater than the value of the transaction itself.

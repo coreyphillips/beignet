@@ -101,9 +101,37 @@ export const buildSortedMultisigPayment = ({
 	network: Network;
 }): Result<ISortedMultisigPayment> => {
 	try {
-		const sortedPublicKeys = cosignerNodes
-			.map((node) => node.derive(change).derive(index).publicKey)
-			.sort((a, b) => a.compare(b));
+		return buildSortedMultisigPaymentFromKeys({
+			threshold,
+			publicKeys: cosignerNodes.map(
+				(node) => node.derive(change).derive(index).publicKey
+			),
+			network
+		});
+	} catch (e) {
+		return err(e);
+	}
+};
+
+/**
+ * buildSortedMultisigPayment for cosigner child keys already derived at
+ * change/index, in any order.
+ * @param {number} threshold
+ * @param {Buffer[]} publicKeys
+ * @param {Network} network
+ * @returns {Result<ISortedMultisigPayment>}
+ */
+export const buildSortedMultisigPaymentFromKeys = ({
+	threshold,
+	publicKeys,
+	network
+}: {
+	threshold: number;
+	publicKeys: Buffer[];
+	network: Network;
+}): Result<ISortedMultisigPayment> => {
+	try {
+		const sortedPublicKeys = [...publicKeys].sort((a, b) => a.compare(b));
 		const p2ms = bitcoin.payments.p2ms({
 			m: threshold,
 			pubkeys: sortedPublicKeys,

@@ -24,6 +24,7 @@ import {
 } from '../utils';
 import { getBitcoinJsNetwork, reduceValue, shuffleArray } from '../utils';
 import { btcToSats } from '../utils/conversion';
+import { derivePathCached } from '../utils/derive-path-cached';
 import { TRANSACTION_DEFAULTS } from '../wallet/constants';
 import {
 	constructByteCountParam,
@@ -1013,12 +1014,16 @@ export class Transaction {
 			if (bip32InterfaceRes.isErr()) {
 				return err(bip32InterfaceRes.error.message);
 			}
+			// The build fills it and the signer reads it, so each input's key is
+			// derived once.
+			const keys = new Map<string, BIP32Interface>();
 
 			//Create PSBT before signing inputs
 			const psbtRes = await this.createPsbtFromTransactionData({
 				transactionData: transaction,
 				bip32Interface: bip32InterfaceRes.value,
-				shuffleTargets: shuffleOutputs
+				shuffleTargets: shuffleOutputs,
+				keys
 			});
 
 			if (psbtRes.isErr()) {
@@ -1041,7 +1046,8 @@ export class Transaction {
 
 			const signedPsbtRes = await this.signPsbt({
 				psbt,
-				bip32Interface: bip32InterfaceRes.value
+				bip32Interface: bip32InterfaceRes.value,
+				keys
 			});
 
 			if (signedPsbtRes.isErr()) {
@@ -1087,17 +1093,42 @@ export class Transaction {
 	};
 
 	/**
+	 * The key at an input's path, read from `keys` or derived into it along
+	 * with the branch nodes above it.
+	 * @param {BIP32Interface} root
+	 * @param {string} path
+	 * @param {Map<string, BIP32Interface>} keys Nodes derived from root only.
+	 * @returns {BIP32Interface}
+	 * @private
+	 */
+	private inputKey(
+		root: BIP32Interface,
+		path: string,
+		keys: Map<string, BIP32Interface>
+	): BIP32Interface {
+		let key = keys.get(path);
+		if (!key) {
+			key = derivePathCached(root, path, keys);
+			keys.set(path, key);
+		}
+		return key;
+	}
+
+	/**
 	 * Loops through inputs and signs them
 	 * @param {Psbt} psbt
 	 * @param {BIP32Interface} bip32Interface
+	 * @param {Map<string, BIP32Interface>} [keys] Keys createPsbtFromTransactionData derived from the same bip32Interface.
 	 * @returns {Promise<Result<Psbt>>}
 	 */
 	signPsbt = async ({
 		psbt,
-		bip32Interface
+		bip32Interface,
+		keys = new Map()
 	}: {
 		psbt: Psbt;
 		bip32Interface: BIP32Interface;
+		keys?: Map<string, BIP32Interface>;
 	}): Promise<Result<Psbt>> => {
 		const transactionDataRes = this.data;
 
@@ -1106,7 +1137,7 @@ export class Transaction {
 			try {
 				let keyPair = input?.keyPair;
 				if (!keyPair && input?.path) {
-					keyPair = bip32Interface.derivePath(input.path);
+					keyPair = this.inputKey(bip32Interface, input.path, keys);
 				}
 				if (!keyPair) return err('Unable to derive keyPair.');
 				if (isP2trPrefix(input.address)) {
@@ -1138,16 +1169,19 @@ export class Transaction {
 	 * @param {ISendTransaction} transactionData
 	 * @param {BIP32Interface} bip32Interface
 	 * @param shuffleTargets
+	 * @param {Map<string, BIP32Interface>} [keys] Filled with the input keys derived from bip32Interface, for signPsbt to reuse.
 	 * @returns {Promise<Result<Psbt>>}
 	 */
 	createPsbtFromTransactionData = async ({
 		transactionData,
 		bip32Interface,
-		shuffleTargets = true
+		shuffleTargets = true,
+		keys = new Map()
 	}: {
 		transactionData: ISendTransaction;
 		bip32Interface?: BIP32Interface;
 		shuffleTargets?: boolean;
+		keys?: Map<string, BIP32Interface>;
 	}): Promise<Result<Psbt>> => {
 		const { inputs, outputs, fee, rbf, message } = transactionData;
 		let { changeAddress } = transactionData;
@@ -1248,7 +1282,7 @@ export class Transaction {
 					input?.keyPair;
 				if (!keyPair && input?.path) {
 					if (root) {
-						keyPair = root.derivePath(input.path);
+						keyPair = this.inputKey(root, input.path, keys);
 					} else {
 						const publicNodeRes = this._wallet.derivePublicNode(input.path);
 						if (publicNodeRes.isErr()) {

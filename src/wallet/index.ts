@@ -89,7 +89,7 @@ import {
 import {
 	appendDescriptorChecksum,
 	BoostError,
-	buildSortedMultisigPayment,
+	buildSortedMultisigPaymentFromKeys,
 	clampFeeRate,
 	createOpReturnScript,
 	decodeOpReturnMessage,
@@ -143,12 +143,14 @@ import { Transaction } from '../transaction';
 import {
 	GAP_LIMIT,
 	GAP_LIMIT_CHANGE,
+	MAX_CACHED_BRANCHES,
 	MAX_REMEMBERED_PREVOUTS,
 	MAX_REMEMBERED_PSBT_BUILDS,
 	STOP_REFRESH_WAIT_MS,
 	TRANSACTION_DEFAULTS
 } from './constants';
 import { btcToSats } from '../utils/conversion';
+import { derivePathCached } from '../utils/derive-path-cached';
 import { ILogger, createConsoleLogger } from '../logger';
 
 type TAddressLookup = {
@@ -156,6 +158,14 @@ type TAddressLookup = {
 	byScriptHash: Map<string, IAddress>;
 	addresses: Set<string>;
 	changeAddresses: Set<string>;
+};
+
+type TCosigner = {
+	node: BIP32Interface;
+	isOurs: boolean;
+	keyOrigin?: IKeyOrigin;
+	// The node's change-level children, for derivePathCached.
+	branches: Map<string, BIP32Interface>;
 };
 
 export class Wallet {
@@ -174,12 +184,13 @@ export class Wallet {
 	// each cosigner's true key origin when supplied.
 	private readonly _multisig?: {
 		threshold: number;
-		cosigners: {
-			node: BIP32Interface;
-			isOurs: boolean;
-			keyOrigin?: IKeyOrigin;
-		}[];
+		cosigners: TCosigner[];
 	};
+	// Every node above the leaf of each path derived from _root (or from
+	// _accountNode, for a watch-only wallet, which has no root), by path
+	// prefix, for derivePathCached. switchNetwork swaps in the map of the
+	// wallet it builds along with that wallet's root.
+	private readonly _branches: Map<string, BIP32Interface> = new Map();
 	private _data: IWalletData;
 	private _getData: TGetData;
 	private _setData?: TSetData;
@@ -647,7 +658,8 @@ export class Wallet {
 	 * account-level PUBLIC node. Requires _network/_account/_root to be set.
 	 * The cosigner list is stored sorted by account public key so every
 	 * instance of the same quorum is deterministic (BIP 67 ordering of the
-	 * DERIVED child keys happens per address in buildSortedMultisigPayment).
+	 * DERIVED child keys happens per address in
+	 * buildSortedMultisigPaymentFromKeys).
 	 * @private
 	 * @param {IMultisigOptions} multisig
 	 * @returns {{ config; id }}
@@ -655,11 +667,7 @@ export class Wallet {
 	private _initMultisig(multisig: IMultisigOptions): {
 		config: {
 			threshold: number;
-			cosigners: {
-				node: BIP32Interface;
-				isOurs: boolean;
-				keyOrigin?: IKeyOrigin;
-			}[];
+			cosigners: TCosigner[];
 		};
 		id: string;
 	} {
@@ -669,11 +677,7 @@ export class Wallet {
 		}
 		const keyId = (node: BIP32Interface): string =>
 			Buffer.concat([node.publicKey, node.chainCode]).toString('hex');
-		const entries: {
-			node: BIP32Interface;
-			isOurs: boolean;
-			keyOrigin?: IKeyOrigin;
-		}[] = [];
+		const entries: TCosigner[] = [];
 		const addCosigner = (cosigner: string | IMultisigCosigner): void => {
 			const info: IMultisigCosigner =
 				typeof cosigner === 'string' ? { xpub: cosigner } : cosigner;
@@ -694,7 +698,7 @@ export class Wallet {
 					`Cosigner ${xpub} has an originPath but no masterFingerprint.`
 				);
 			}
-			entries.push({ node, isOurs: false, keyOrigin });
+			entries.push({ node, isOurs: false, keyOrigin, branches: new Map() });
 		};
 		for (const cosigner of cosigners ?? []) addCosigner(cosigner);
 		if (this._root) {
@@ -716,7 +720,7 @@ export class Wallet {
 			if (existing) {
 				existing.isOurs = true;
 			} else {
-				entries.push({ node: ourNode, isOurs: true });
+				entries.push({ node: ourNode, isOurs: true, branches: new Map() });
 			}
 		} else if (ourXpub) {
 			// Watch-only multisig: ourXpub is just another cosigner key.
@@ -776,16 +780,18 @@ export class Wallet {
 					`Path ${path} does not match this wallet (expected m/48'/${expectedCoin}'/${this._account}'/2'/change/index).`
 				);
 			}
-			const payment = buildSortedMultisigPayment({
+			const childKeys = this._multisig.cosigners.map(
+				(c) =>
+					derivePathCached(c.node, `${change}/${index}`, c.branches).publicKey
+			);
+			const payment = buildSortedMultisigPaymentFromKeys({
 				threshold: this._multisig.threshold,
-				cosignerNodes: this._multisig.cosigners.map((c) => c.node),
-				change,
-				index,
+				publicKeys: childKeys,
 				network: this.getBitcoinNetwork()
 			});
 			if (payment.isErr()) return err(payment.error.message);
 			const perCosigner = this._multisig.cosigners
-				.map((c) => {
+				.map((c, i) => {
 					let masterFingerprint: Buffer;
 					let cosignerPath = path;
 					if (c.isOurs && this._root) {
@@ -807,7 +813,7 @@ export class Wallet {
 					return {
 						masterFingerprint,
 						path: cosignerPath,
-						pubkey: c.node.derive(change).derive(index).publicKey,
+						pubkey: childKeys[i],
 						isOurs: c.isOurs
 					};
 				})
@@ -1530,8 +1536,21 @@ export class Wallet {
 	 * @private
 	 */
 	private _derivePathKeyPair(path: string): BIP32Interface {
-		if (this._root) return this._root.derivePath(path);
+		if (this._root) return this._deriveCached(this._root, path);
 		return this._deriveWatchOnlyNode(path);
+	}
+
+	/**
+	 * Derives `path` from `node`, which is _root, or _accountNode for a
+	 * watch-only wallet, through the branch nodes in _branches.
+	 * @param {BIP32Interface} node
+	 * @param {string} path
+	 * @returns {BIP32Interface}
+	 * @private
+	 */
+	private _deriveCached(node: BIP32Interface, path: string): BIP32Interface {
+		if (this._branches.size >= MAX_CACHED_BRANCHES) this._branches.clear();
+		return derivePathCached(node, path, this._branches);
 	}
 
 	/**
@@ -1572,7 +1591,7 @@ export class Wallet {
 		) {
 			throw new Error(`Invalid change/index segments in path: ${path}`);
 		}
-		return this._accountNode.derive(change).derive(index);
+		return this._deriveCached(this._accountNode, `${change}/${index}`);
 	}
 
 	/**
@@ -1582,7 +1601,9 @@ export class Wallet {
 	 */
 	public derivePublicNode(path: string): Result<BIP32Interface> {
 		try {
-			if (this._root) return ok(this._root.derivePath(path).neutered());
+			if (this._root) {
+				return ok(this._deriveCached(this._root, path).neutered());
+			}
 			return ok(this._deriveWatchOnlyNode(path));
 		} catch (e) {
 			return err(e);
@@ -1659,6 +1680,7 @@ export class Wallet {
 				};
 				const res = await this._customGetAddress(data);
 				if (res.isErr()) return err(res.error.message);
+				return ok(res.value);
 			}
 			const keyPair = this._derivePathKeyPair(path);
 			const network = this.getBitcoinNetwork(this._network);
@@ -1841,7 +1863,7 @@ export class Wallet {
 	 */
 	getPrivateKey(path: string): string {
 		if (!this._root) throw new WatchOnlySigningError();
-		const keyPair = this._root.derivePath(path);
+		const keyPair = this._deriveCached(this._root, path);
 		return keyPair.toWIF();
 	}
 
@@ -6171,7 +6193,7 @@ export class Wallet {
 				for (const derivation of input.bip32Derivation ?? []) {
 					let keyPair: BIP32Interface;
 					try {
-						keyPair = this._root.derivePath(derivation.path);
+						keyPair = this._deriveCached(this._root, derivation.path);
 					} catch {
 						continue;
 					}

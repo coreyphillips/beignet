@@ -11,6 +11,7 @@ import { expect } from 'chai';
 import net from 'net';
 import tls from 'tls';
 import { networks, payments } from 'bitcoinjs-lib';
+import { BIP32Interface } from 'bip32';
 import {
 	EAddressType,
 	EAvailableNetworks,
@@ -35,6 +36,7 @@ import {
 	Wallet
 } from '../src';
 import { getWalletDataStorageKey } from '../src/utils/wallet';
+import { bip32 } from '../src/utils/ecc-apis';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -331,6 +333,38 @@ describe('switchNetwork against an unreachable target', function () {
 			const receive = await w.getReceiveAddress({});
 			if (receive.isErr()) throw receive.error;
 			expect(receive.value.startsWith('bcrt1p')).to.equal(true);
+		} finally {
+			await w.stop();
+		}
+	});
+
+	it('derives through the new root, not branch nodes cached before the switch (#1660)', async function () {
+		const res = await Wallet.create({
+			mnemonic: MNEMONIC,
+			network,
+			electrumOptions,
+			feeEstimationSource: 'electrum'
+		});
+		if (res.isErr()) throw res.error;
+		const w = res.value;
+		try {
+			const path = "m/84'/1'/0'/0/3";
+			const wif = w.getPrivateKey(path);
+			// Stands in for a branch the old root left behind: on a switch
+			// between mainnet and a test network its nodes carry the wrong
+			// network, which this regtest-only suite cannot reach.
+			const { _branches } = w as unknown as {
+				_branches: Map<string, BIP32Interface>;
+			};
+			_branches.set("m/84'/1'/0'/0", bip32.fromSeed(Buffer.alloc(32, 9)));
+			expect(w.getPrivateKey(path)).to.not.equal(wif);
+
+			const switched = await w.switchNetwork(
+				EAvailableNetworks.regtest,
+				otherServer
+			);
+			if (switched.isErr()) throw switched.error;
+			expect(w.getPrivateKey(path)).to.equal(wif);
 		} finally {
 			await w.stop();
 		}
