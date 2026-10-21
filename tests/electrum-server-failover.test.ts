@@ -512,6 +512,9 @@ const createFakeWallet = (
 			if (header.reconcileFails) return err('Unable to reconcile.');
 			return ok('Reconciled.');
 		},
+		// What a block that owes no full refresh reads instead.
+		getUnconfirmedTransactions: () => ({}),
+		updateFeeEstimates: async (): Promise<void> => {},
 		addressTypesToMonitor: [EAddressType.p2wpkh],
 		gapLimitOptions: {
 			lookAhead: 2,
@@ -528,7 +531,8 @@ const createFakeWallet = (
 						'0': { index: 0, scriptHash }
 					}
 				},
-				addressIndex: { [EAddressType.p2wpkh]: { index: 0 } }
+				addressIndex: { [EAddressType.p2wpkh]: { index: 0 } },
+				changeAddresses: { [EAddressType.p2wpkh]: {} }
 			};
 		}
 	} as unknown as Wallet;

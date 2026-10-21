@@ -215,6 +215,9 @@ export class Wallet {
 	private _refreshOwed = false;
 	// onStart callbacks of refresh calls whose body has not started yet.
 	private _refreshStartCallbacks: Array<() => void> = [];
+	// Whether the last refresh body to finish failed. A new block only runs a
+	// full refresh when something calls for one, and this is what retries it.
+	private _refreshFailed = false;
 	// Outpoints our own broadcasts have spent, keyed 'txid:vout', each holding
 	// the value _spendSeq had when the broadcast landed. The UTXO set is only
 	// ever replaced wholesale by a scan, so a scan already in flight at that
@@ -524,6 +527,12 @@ export class Wallet {
 
 	public get balance(): number {
 		return this._data.balance;
+	}
+
+	/** Whether the last refresh failed. The next block refreshes in full while
+	 *  it is set. */
+	public get refreshFailed(): boolean {
+		return this._refreshFailed;
 	}
 
 	public get network(): EAvailableNetworks {
@@ -1205,6 +1214,7 @@ export class Wallet {
 				} catch (e) {
 					result = err(e);
 				}
+				this._refreshFailed = result.isErr();
 				// A call queued while this body ran is answered with a scan that
 				// starts after it, however many were queued. Only the last body in
 				// flight answers the queue, so a nested or sibling forced refresh

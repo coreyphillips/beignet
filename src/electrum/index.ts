@@ -587,6 +587,12 @@ export class Electrum {
 	 *  header that arrives too far away to be compared is read as a rollback
 	 *  rather than as growth: see applyHeader. */
 	private _tipUnverified = false;
+	/** Whether the next block runs a full wallet refresh rather than the
+	 *  unconfirmed check alone. Owed from construction and after every connect,
+	 *  because a subscribe that first hears a status has nothing to compare it
+	 *  with and a dropped socket loses notifications, and after a rollback,
+	 *  which moves confirmed history. */
+	private _fullRefreshOwed = true;
 	/** When the server last answered a request without an error. */
 	private _answeredAt = 0;
 
@@ -812,6 +818,7 @@ export class Electrum {
 			return err(DISCONNECTED_ERROR);
 		}
 		this.publishConnectionChange(true);
+		this._fullRefreshOwed = true;
 		// Unconditional, because a connect cannot tell whether the client it now
 		// holds is the one that was subscribed. Our own teardown resets it on a
 		// server change, and rn-electrum-client resets it behind our back on the
@@ -2150,7 +2157,10 @@ export class Electrum {
 		// replaced the height the rollback was read from. The debt has to
 		// outlive the write as well as the reconciliation, and be retried by
 		// the next header rather than forgotten.
-		if (reorgDetected) this._reorgOwed = true;
+		if (reorgDetected) {
+			this._reorgOwed = true;
+			this._fullRefreshOwed = true;
+		}
 		await this._wallet.updateHeader(header);
 		// The tip this doubt was about has been replaced.
 		this._tipUnverified = false;
@@ -2231,7 +2241,19 @@ export class Electrum {
 		// not be refreshed or called back into. Checked after applyHeader, so a
 		// reconciliation this instance owes is still recorded in _reorgOwed.
 		if (this._disconnected) return;
-		await this._wallet.refreshWallet();
+		if (this._fullRefreshOwed || this._wallet.refreshFailed) {
+			this._fullRefreshOwed = false;
+			await this._wallet.refreshWallet();
+		} else {
+			// Every script a refresh scans is subscribed, and a status change
+			// refreshes on its own, so a block that changed none of them only
+			// moves what is counted from the tip: the confirmations and reorgs of
+			// the transactions still observed. Fee estimates rode on the refresh.
+			void this._wallet.updateFeeEstimates();
+			if (Object.keys(this._wallet.getUnconfirmedTransactions()).length) {
+				await this._wallet.checkUnconfirmedTransactions();
+			}
+		}
 		this.onReceive?.(data);
 		this.sendMessage(onMessageKeys.newBlock, data[0]);
 	};
@@ -2606,28 +2628,40 @@ export class Electrum {
 		const allUtxos: IUtxo[] = [];
 		const currentWallet = this._wallet.data;
 		const addressTypeKeys = this._wallet.addressTypesToMonitor;
-		// Gather the receiving address scripthash for each address type if no scripthashes were provided.
+		// Gather the receive and change gap windows for each address type if no
+		// scripthashes were provided. These are the windows a refresh scans, so a
+		// status notification is the only signal a new block needs: see
+		// _onNewBlock.
 		if (!scriptHashes.length) {
+			const chains = [
+				{
+					addresses: currentWallet.addresses,
+					indexes: currentWallet.addressIndex,
+					change: false
+				},
+				{
+					addresses: currentWallet.changeAddresses,
+					indexes: currentWallet.changeAddressIndex,
+					change: true
+				}
+			];
 			for (const addressType of addressTypeKeys) {
-				const addresses = currentWallet.addresses[addressType];
-				const addressCount = Object.keys(addresses).length;
-
-				// Check if addresses of this type have been generated. If not, skip.
-				if (addressCount > 0) {
-					let addressIndex = currentWallet.addressIndex[addressType]?.index;
-					addressIndex = addressIndex > 0 ? addressIndex : 0;
+				for (const { addresses, indexes, change } of chains) {
+					const values = Object.values(addresses[addressType] ?? {});
+					// Check if addresses of this chain have been generated. If not, skip.
+					if (!values.length) continue;
+					const index = indexes[addressType]?.index;
 
 					// Only subscribe up to the gap limit.
 					const addressesInRangeToSubscribe = filterAddressesForGapLimit({
-						addresses: Object.values(addresses),
-						index: addressIndex,
+						addresses: values,
+						index: index > 0 ? index : 0,
 						gapLimitOptions: this._wallet.gapLimitOptions,
-						change: false
+						change
 					});
-					const _scriptHashes = addressesInRangeToSubscribe.map(
-						(address) => address.scriptHash
+					scriptHashes.push(
+						...addressesInRangeToSubscribe.map((address) => address.scriptHash)
 					);
-					scriptHashes.push(..._scriptHashes);
 				}
 			}
 			// Keep an eye on existing UTXO's regardless of the gap limit.
