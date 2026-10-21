@@ -151,6 +151,13 @@ import {
 import { btcToSats } from '../utils/conversion';
 import { ILogger, createConsoleLogger } from '../logger';
 
+type TAddressLookup = {
+	maps: (IAddresses | undefined)[];
+	byScriptHash: Map<string, IAddress>;
+	addresses: Set<string>;
+	changeAddresses: Set<string>;
+};
+
 export class Wallet {
 	private _network: EAvailableNetworks;
 	private readonly _mnemonic?: string;
@@ -244,6 +251,11 @@ export class Wallet {
 	// least recently used first. A txid commits to its outputs, so an answer
 	// never goes stale, confirmed or not. Memory only.
 	private readonly _prevouts: Map<string, InputData[string]> = new Map();
+	// Every stored address by script hash and by address, with the per-type
+	// maps it was built from. A map replaced since then triggers a rebuild, so
+	// writers must replace a map, never add to it in place. A built index is
+	// never mutated, so one held across an await is a snapshot.
+	private _addressLookup?: TAddressLookup;
 	// Raised by disableMessagesOnCreate, lowered when the first refresh ends.
 	// What the wallet reports before then is its stored history coming back,
 	// not news, so onMessage hears none of it. A refused storage write is not
@@ -4843,38 +4855,8 @@ export class Wallet {
 				inputDataResponse.error?.message ?? 'Unable to get input data.'
 			);
 		}
-		const addressTypeKeys = Object.values(EAddressType);
 		const { inputData, unresolved } = inputDataResponse.value;
-		const currentAddresses = currentWallet.addresses;
-		const currentChangeAddresses = currentWallet.changeAddresses;
-
-		let addresses = {} as IAddresses;
-		let changeAddresses = {} as IAddresses;
-
-		addressTypeKeys.map((addressType) => {
-			// Check if addresses of this type have been generated. If not, skip.
-			if (Object.keys(currentAddresses[addressType])?.length > 0) {
-				addresses = {
-					...addresses,
-					...currentAddresses[addressType]
-				};
-			}
-			// Check if change addresses of this type have been generated. If not, skip.
-			if (Object.keys(currentChangeAddresses[addressType])?.length > 0) {
-				changeAddresses = {
-					...changeAddresses,
-					...currentChangeAddresses[addressType]
-				};
-			}
-		});
-
-		// Create combined address/change-address object for easier/faster reference later on.
-		const combinedAddressObj: { [key: string]: IAddress } = {};
-		[...Object.values(addresses), ...Object.values(changeAddresses)].map(
-			(data) => {
-				combinedAddressObj[data.address] = data;
-			}
-		);
+		const ownAddresses = this._getAddressLookup(currentWallet).addresses;
 
 		const formattedTransactions: IFormattedTransactions = {};
 		const heldBack: string[] = [];
@@ -4952,7 +4934,7 @@ export class Wallet {
 					const { addresses: _addresses, value } = inputData[key];
 					totalInputValue = totalInputValue + value;
 					_addresses.map((address) => {
-						if (address in combinedAddressObj) {
+						if (ownAddresses.has(address)) {
 							matchedInputValue = matchedInputValue + value;
 						}
 					});
@@ -4968,7 +4950,7 @@ export class Wallet {
 					: [];
 				totalOutputValue = totalOutputValue + value;
 				_addresses.map((address) => {
-					if (address in combinedAddressObj) {
+					if (ownAddresses.has(address)) {
 						matchedOutputValue = matchedOutputValue + value;
 					}
 				});
@@ -6321,16 +6303,52 @@ export class Wallet {
 	 * @returns {IAddress | undefined}
 	 */
 	public getAddressFromScriptHash(scriptHash: string): IAddress | undefined {
-		const addresses: TAddressTypeContent<IAddresses> = this.data.addresses;
-		const changeAddresses: TAddressTypeContent<IAddresses> =
-			this.data.changeAddresses;
-		const combinedAddresses: IAddress[] = [
-			...Object.values(addresses),
-			...Object.values(changeAddresses)
-		].flatMap((addressGroup: IAddresses) => Object.values(addressGroup));
-		return combinedAddresses.find(
-			(addressObj: IAddress) => addressObj.scriptHash === scriptHash
-		);
+		return this._getAddressLookup().byScriptHash.get(scriptHash);
+	}
+
+	/**
+	 * Whether the address is one of this wallet's stored change addresses.
+	 * @param {string} address
+	 * @returns {boolean}
+	 */
+	public isChangeAddress(address: string): boolean {
+		return this._getAddressLookup().changeAddresses.has(address);
+	}
+
+	/**
+	 * The index of every address stored in `data`, rebuilt only when one of
+	 * its per-type maps has been replaced since the last build.
+	 * @private
+	 * @param {IWalletData} [data]
+	 */
+	private _getAddressLookup(data: IWalletData = this._data): TAddressLookup {
+		const types = Object.values(EAddressType);
+		const maps = [
+			...types.map((type) => data.addresses[type]),
+			...types.map((type) => data.changeAddresses[type])
+		];
+		const cached = this._addressLookup;
+		if (cached && maps.every((map, i) => map === cached.maps[i])) {
+			return cached;
+		}
+		const lookup: TAddressLookup = {
+			maps,
+			byScriptHash: new Map(),
+			addresses: new Set(),
+			changeAddresses: new Set()
+		};
+		maps.forEach((map, i) => {
+			const change = i >= types.length;
+			Object.values(map ?? {}).forEach((record) => {
+				if (!lookup.byScriptHash.has(record.scriptHash)) {
+					lookup.byScriptHash.set(record.scriptHash, record);
+				}
+				lookup.addresses.add(record.address);
+				if (change) lookup.changeAddresses.add(record.address);
+			});
+		});
+		this._addressLookup = lookup;
+		return lookup;
 	}
 
 	/**
@@ -6545,27 +6563,7 @@ export class Wallet {
 			return err('Transaction is already confirmed. Unable to RBF.');
 		}
 
-		const wallet = this.data;
-		const addressTypeKeys = objectKeys(EAddressType);
-		const addresses = wallet.addresses;
-		const changeAddresses = wallet.changeAddresses;
-
-		let allAddresses = {} as IAddresses;
-		let allChangeAddresses = {} as IAddresses;
-
-		await Promise.all(
-			addressTypeKeys.map((addressType) => {
-				allAddresses = {
-					...allAddresses,
-					...addresses[addressType],
-					...changeAddresses[addressType]
-				};
-				allChangeAddresses = {
-					...allChangeAddresses,
-					...changeAddresses[addressType]
-				};
-			})
-		);
+		const ownScriptHashes = this._getAddressLookup().byScriptHash;
 
 		let changeAddressData: IOutput = {
 			address: '',
@@ -6637,14 +6635,15 @@ export class Wallet {
 				}
 				scriptHash = getScriptHash({ address, network: this._network });
 				// Check that we are in possession of this scriptHash.
-				if (!(scriptHash in allAddresses)) {
+				const owned = ownScriptHashes.get(scriptHash);
+				if (!owned) {
 					return err(
 						'Transaction spends an input this wallet does not own. Unable to RBF.'
 					);
 				}
-				path = allAddresses[scriptHash].path;
+				path = owned.path;
 				value = btcToSats(txVout.value);
-				const publicKey = allAddresses[scriptHash].publicKey;
+				const publicKey = owned.publicKey;
 				inputs.push({
 					tx_hash: input.txid,
 					index: input.vout,
@@ -6704,7 +6703,7 @@ export class Wallet {
 			});
 
 			// If the address scripthash matches one of our address scripthashes, add it accordingly. Otherwise, add it as another output.
-			if (Object.keys(allAddresses).includes(changeAddressScriptHash)) {
+			if (ownScriptHashes.has(changeAddressScriptHash)) {
 				changeAddressData = {
 					address,
 					value: voutValue,
