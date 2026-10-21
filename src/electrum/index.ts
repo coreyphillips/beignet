@@ -151,8 +151,13 @@ type TScriptHashRouter = {
 	 *  or a notification. */
 	statuses: Map<string, string | null>;
 	/** Records the status a subscribe answered with, and dispatches one that
-	 *  differs from the last heard as the notification it stands for. */
-	noteSubscribed: (scriptHash: string, response: ISubscribeToAddress) => void;
+	 *  differs from the last heard as the notification it stands for. Returns
+	 *  whether it was the first status heard for the hash and shows history,
+	 *  which nothing will notify. */
+	noteSubscribed: (
+		scriptHash: string,
+		response: ISubscribeToAddress
+	) => boolean;
 };
 
 /** The status the instance behind `sub` last heard for a hash the router holds
@@ -446,12 +451,13 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 			instances: new Set(),
 			subscriptions: new Map(),
 			statuses: new Map(),
-			noteSubscribed: (scriptHash, response): void => {
+			noteSubscribed: (scriptHash, response): boolean => {
 				const data: unknown = response.data;
-				if (response.error) return;
+				if (response.error) return false;
 				// Withdrawn while the subscribe was in flight.
 				const subs = created.subscriptions.get(scriptHash);
-				if (!subs) return;
+				if (!subs) return false;
+				let unheard = false;
 				// "Already Subscribed." carries no status: the subscription was
 				// never lost, so neither was a notification. A hash with no history
 				// answers null, which the client hands back as the whole message.
@@ -465,13 +471,14 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 					// before it as what each instance last heard.
 					if (known && previous !== status) {
 						void created.dispatch([scriptHash, status as string]);
-						return;
+						return false;
 					}
+					unheard = !known && status !== null;
 					created.statuses.set(scriptHash, status);
 				}
 				// A returning instance whose sibling kept the hash has no status
 				// of its own in the router to compare, so it is compared here.
-				if (!created.statuses.has(scriptHash)) return;
+				if (!created.statuses.has(scriptHash)) return false;
 				const current = created.statuses.get(scriptHash) ?? null;
 				for (const [instance, sub] of subs) {
 					if (sub.savedStatus === undefined) continue;
@@ -482,6 +489,7 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 						void deliver(instance, subs, [scriptHash, current as string], sub);
 					}
 				}
+				return unheard;
 			},
 			dispatch: async (data: TSubscribedReceive): Promise<void> => {
 				const scriptHash = Array.isArray(data) ? data[0] : undefined;
@@ -591,7 +599,10 @@ export class Electrum {
 	 *  unconfirmed check alone. Owed from construction and after every connect,
 	 *  because a subscribe that first hears a status has nothing to compare it
 	 *  with and a dropped socket loses notifications, and after a rollback,
-	 *  which moves confirmed history. */
+	 *  which moves confirmed history. Also owed when a later subscribe first
+	 *  hears a status with history, which may have landed after the scan
+	 *  before it, and when a history or UTXO listing is answered in part,
+	 *  since the failed part is left out rather than failing the listing. */
 	private _fullRefreshOwed = true;
 	/** When the server last answered a request without an error. */
 	private _answeredAt = 0;
@@ -1370,6 +1381,7 @@ export class Electrum {
 
 				unspentAddressResult.data.forEach(
 					({ data, result: unspentAddresses }) => {
+						if (!Array.isArray(unspentAddresses)) this._fullRefreshOwed = true;
 						if (unspentAddresses?.length > 0) {
 							unspentAddresses.forEach((unspentAddress) => {
 								balance += unspentAddress.value;
@@ -1503,12 +1515,16 @@ export class Electrum {
 			const results = new Map<string, TTxResult[]>();
 			responses.forEach((response) => {
 				this.noteAnswer(response);
-				if (response.error) return;
+				if (response.error) {
+					this._fullRefreshOwed = true;
+					return;
+				}
 				response.data.forEach(({ data, result }: TTxResponse) => {
 					if (!data?.scriptHash) return;
 					results.set(data.scriptHash, result);
 					// An entry the server answered with an error is asked again.
 					if (Array.isArray(result)) answered?.set(data.scriptHash, result);
+					else this._fullRefreshOwed = true;
 				});
 			});
 
@@ -2709,7 +2725,11 @@ export class Electrum {
 			) {
 				sub.unconfirmedCallbacks?.delete(onReceive);
 			}
-			router.noteSubscribed(scriptHash, response);
+			// The scan before this subscribe may have missed what the status
+			// shows, and only a full refresh reads it.
+			if (router.noteSubscribed(scriptHash, response)) {
+				this._fullRefreshOwed = true;
+			}
 		});
 
 		const allUtxosPromises = allUtxos.map(async (utxo) => {
@@ -2741,7 +2761,9 @@ export class Electrum {
 			) {
 				sub.unconfirmedCallbacks?.delete(onReceive);
 			}
-			router.noteSubscribed(utxo.scriptHash, response);
+			if (router.noteSubscribed(utxo.scriptHash, response)) {
+				this._fullRefreshOwed = true;
+			}
 		});
 
 		try {

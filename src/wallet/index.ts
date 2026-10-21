@@ -4078,17 +4078,21 @@ export class Wallet {
 		if (getTransactionsResponse.isErr()) {
 			return err(getTransactionsResponse.error.message);
 		}
-		// A failed batch is left out of the answer rather than failing it, and
-		// only a full refresh asks for its transactions again.
-		if (getTransactionsResponse.value.data.length < filteredTxHashes.length) {
-			this._refreshFailed = true;
-		}
 
 		const formatTransactionsResponse = await this.formatTransactions({
 			transactions: getTransactionsResponse.value.data
 		});
 		if (formatTransactionsResponse.isErr()) {
 			return err(formatTransactionsResponse.error.message);
+		}
+		// A transaction whose batch or entry failed, or whose inputs could not
+		// all be looked up, is left out of the answer rather than failing it,
+		// and only a full refresh asks for it again.
+		if (
+			Object.keys(formatTransactionsResponse.value).length <
+			filteredTxHashes.length
+		) {
+			this._refreshFailed = true;
 		}
 		// Nothing below awaits before the records are merged, so this is the
 		// last point a switch can have landed before the write.

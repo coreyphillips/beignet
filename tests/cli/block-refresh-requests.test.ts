@@ -45,6 +45,12 @@ const SERVER = {
 /** Not this wallet's: the BIP173 test vector. */
 const EXTERNAL = 'bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080';
 
+/** The transaction every payment in these tests spends. */
+const PARENT = 'ee'.repeat(32);
+
+/** How a server answers one entry of a batch it could not serve. */
+const BUSY = { code: -32603, message: 'Server busy.' };
+
 type TBatch<T> = { key: string; data: T[] };
 /** The UTXO listing sends its batch keyed by script hash. */
 type TUtxoBatch = { key: string; data: Record<string, IAddress> };
@@ -124,6 +130,14 @@ describe('block notification refresh requests (#1663)', function () {
 	let failNextListing: boolean;
 	/** A transaction whose batch fails once. */
 	let failBatchOf: string | undefined;
+	/** A transaction whose own entry is answered with an error. */
+	let failEntryOf: string | undefined;
+	/** A script hash whose history batch fails. */
+	let failHistoryOf: string | undefined;
+	/** A script hash whose UTXO entry is answered with an error. */
+	let failUtxoEntryOf: string | undefined;
+	/** Called as a script hash is first subscribed, before it is answered. */
+	let onFirstSubscribe: ((scriptHash: string) => void) | undefined;
 	/** Whether a script hash not yet subscribed is refused. */
 	let refuseNewSubscriptions: boolean;
 	let transactionsAsked: string[];
@@ -140,6 +154,10 @@ describe('block notification refresh requests (#1663)', function () {
 		listings = 0;
 		failNextListing = false;
 		failBatchOf = undefined;
+		failEntryOf = undefined;
+		failHistoryOf = undefined;
+		failUtxoEntryOf = undefined;
+		onFirstSubscribe = undefined;
 		refuseNewSubscriptions = false;
 		transactionsAsked = [];
 		messages = [];
@@ -192,7 +210,9 @@ describe('block notification refresh requests (#1663)', function () {
 						return { error: true, data: 'Server busy.' };
 					}
 					subscribed.add(scriptHash);
-					return { error: false, data: null };
+					onFirstSubscribe?.(scriptHash);
+					const txid = paid.get(scriptHash);
+					return { error: false, data: txid ? `status-${txid}` : null };
 				}
 			);
 		sinon
@@ -203,6 +223,9 @@ describe('block notification refresh requests (#1663)', function () {
 			.callsFake(
 				async ({ scriptHashes }: { scriptHashes: TBatch<IAddress> }) => {
 					historyAsked.push(...scriptHashes.data.map((a) => a.scriptHash));
+					if (scriptHashes.data.some((a) => a.scriptHash === failHistoryOf)) {
+						return { error: true, data: 'Server busy.' };
+					}
 					return {
 						error: false,
 						data: scriptHashes.data.map((a) => ({
@@ -233,16 +256,20 @@ describe('block notification refresh requests (#1663)', function () {
 					data: Object.values(scriptHashes.data).map((a) => ({
 						data: a,
 						param: a.scriptHash,
-						result: paid.has(a.scriptHash)
-							? [
-									{
-										tx_hash: paid.get(a.scriptHash),
-										tx_pos: 0,
-										height: heightOf(a.scriptHash),
-										value: 100_000
-									}
-							  ]
-							: []
+						...(a.scriptHash === failUtxoEntryOf && { error: BUSY }),
+						result:
+							a.scriptHash === failUtxoEntryOf
+								? undefined
+								: paid.has(a.scriptHash)
+								? [
+										{
+											tx_hash: paid.get(a.scriptHash),
+											tx_pos: 0,
+											height: heightOf(a.scriptHash),
+											value: 100_000
+										}
+								  ]
+								: []
 					}))
 				};
 			});
@@ -257,11 +284,11 @@ describe('block notification refresh requests (#1663)', function () {
 					}
 					return {
 						error: false,
-						data: txHashes.data.map((h) => ({
-							data: h,
-							param: h.tx_hash,
-							result: served.get(h.tx_hash)
-						}))
+						data: txHashes.data.map((h) =>
+							h.tx_hash === failEntryOf
+								? { data: h, param: h.tx_hash, error: BUSY }
+								: { data: h, param: h.tx_hash, result: served.get(h.tx_hash) }
+						)
 					};
 				}
 			);
@@ -346,17 +373,16 @@ describe('block notification refresh requests (#1663)', function () {
 	/** One coin to `address` from an external parent, in block `height` (the
 	 *  tip when it is not 0, the mempool). */
 	const pay = (address: IAddress, txid: string, height: number): void => {
-		const parent = 'ee'.repeat(32);
 		paid.set(address.scriptHash, txid);
 		mined.set(txid, height);
 		served.set(
-			parent,
-			details(parent, [{ txid: 'dd'.repeat(32), vout: 0 }], [[EXTERNAL, 1]])
+			PARENT,
+			details(PARENT, [{ txid: 'dd'.repeat(32), vout: 0 }], [[EXTERNAL, 1]])
 		);
 		served.set(txid, {
 			...details(
 				txid,
-				[{ txid: parent, vout: 0 }],
+				[{ txid: PARENT, vout: 0 }],
 				[
 					[address.address, 0.001],
 					[EXTERNAL, 0.9989]
@@ -495,28 +521,67 @@ describe('block notification refresh requests (#1663)', function () {
 		expect(wallet.data.utxos.map((u) => u.tx_hash)).to.deep.equal([txid]);
 	});
 
-	it('scans on the next block after a transaction batch failed', async function () {
-		await block(101);
-		const receive = wallet.data.addressIndex[EAddressType.p2wpkh];
-		const txid = '5e'.repeat(32);
-		pay(receive, txid, 101);
-		failBatchOf = txid;
+	/** Each answer a server can fail in part without failing the refresh. */
+	const partialFailures: Array<
+		[string, (receive: IAddress, txid: string) => void]
+	> = [
+		['a transaction batch', (_, txid): void => void (failBatchOf = txid)],
+		['a transaction entry', (_, txid): void => void (failEntryOf = txid)],
+		["an input's parent", (): void => void (failEntryOf = PARENT)],
+		[
+			'a history batch',
+			(receive): void => void (failHistoryOf = receive.scriptHash)
+		],
+		[
+			'a UTXO entry',
+			(receive): void => void (failUtxoEntryOf = receive.scriptHash)
+		]
+	];
+	for (const [what, fail] of partialFailures) {
+		it(`scans on the next block after ${what} failed`, async function () {
+			await block(101);
+			const receive = wallet.data.addressIndex[EAddressType.p2wpkh];
+			const txid = '5e'.repeat(32);
+			pay(receive, txid, 101);
+			fail(receive, txid);
+			const found = (): boolean =>
+				wallet.data.utxos.some((u) => u.tx_hash === txid) &&
+				wallet.data.transactions[txid]?.height === 101;
 
-		await notify(receive.scriptHash);
-		await settled();
-		expect(wallet.data.utxos.map((u) => u.tx_hash)).to.deep.equal([txid]);
-		expect(wallet.data.transactions[txid], 'its batch failed').to.equal(
-			undefined
-		);
-		resetCounts();
+			await notify(receive.scriptHash);
+			await settled();
+			expect(found(), 'the refresh read it in part').to.equal(false);
+			failBatchOf = failEntryOf = failHistoryOf = failUtxoEntryOf = undefined;
+			resetCounts();
+
+			await block(102);
+			expect(found(), 'the block reads it again').to.equal(true);
+
+			resetCounts();
+			await block(103);
+			expect(listings, 'and stops once it succeeded').to.equal(0);
+		});
+	}
+
+	it('scans on the next block after a first subscription found history', async function () {
+		await block(101);
+		const txid = '7a'.repeat(32);
+		// The payment lands after the address is generated and before its
+		// subscription is answered.
+		onFirstSubscribe = (scriptHash): void => {
+			const address = Object.values(
+				wallet.data.addresses[EAddressType.p2wpkh]
+			).find((a) => a.scriptHash === scriptHash);
+			if (address?.index === 20) pay(address, txid, 101);
+		};
+		const issued = await issuePastGenerated();
+		onFirstSubscribe = undefined;
+		expect(paid.get(issued.scriptHash)).to.equal(txid);
 
 		await block(102);
-		expect(transactionsAsked, 'the block asks again').to.include(txid);
-		expect(wallet.data.transactions[txid]?.height).to.equal(101);
 
-		resetCounts();
-		await block(103);
-		expect(listings, 'and stops once it succeeded').to.equal(0);
+		expect(wallet.data.utxos.map((u) => u.tx_hash)).to.deep.equal([txid]);
+		expect(wallet.data.transactions[txid]?.height).to.equal(101);
 	});
 
 	it('subscribes on the next block a window address whose subscription failed', async function () {
