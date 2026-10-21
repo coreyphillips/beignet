@@ -114,6 +114,7 @@ import {
 	getScriptHash,
 	getSeed,
 	getWalletDataStorageKey,
+	hasUntrimmedInputs,
 	IKeyOrigin,
 	isPositive,
 	MultisigSpendError,
@@ -126,6 +127,7 @@ import {
 	removeDustUtxos,
 	Result,
 	shuffleArray,
+	trimInputs,
 	validateAddress,
 	validateMnemonic,
 	validatePsbtSignature,
@@ -1308,6 +1310,7 @@ export class Wallet {
 				return err(walletDataResponse.error.message);
 			this._data = walletDataResponse.value;
 			await this._scrubStoredSendTransaction();
+			await this._trimStoredTransactionInputs();
 			await this._applyBirthdayHeightOption();
 			return ok(true);
 		} catch (e) {
@@ -1330,6 +1333,30 @@ export class Wallet {
 		if (!stored?.inputs?.length && !stored?.outputs?.length) return;
 		this._data.transaction = getDefaultSendTransaction();
 		await this.saveWalletData('transaction', this._data.transaction);
+	}
+
+	/**
+	 * Records formatted before inputs were trimmed still carry every input's
+	 * scriptSig and witness, which each later save of their map writes again.
+	 * Trims them once, writing only a map that held such a record. After a
+	 * refused write the next load trims them again.
+	 * @private
+	 * @async
+	 * @returns {Promise<void>}
+	 */
+	private async _trimStoredTransactionInputs(): Promise<void> {
+		for (const key of ['transactions', 'unconfirmedTransactions'] as const) {
+			const records = this._data[key];
+			let trimmed = false;
+			for (const record of Object.values(records)) {
+				if (!Array.isArray(record?.vin) || !hasUntrimmedInputs(record.vin)) {
+					continue;
+				}
+				record.vin = trimInputs(record.vin);
+				trimmed = true;
+			}
+			if (trimmed) await this.saveWalletData(key, records);
+		}
 	}
 
 	/**
@@ -5025,7 +5052,7 @@ export class Wallet {
 				messages,
 				timestamp,
 				confirmTimestamp,
-				vin: result.vin,
+				vin: trimInputs(result.vin),
 				rbf,
 				exists: true,
 				vsize

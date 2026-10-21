@@ -116,6 +116,16 @@ export interface ICoinbaseVin {
 
 export type TVin = IVin | ICoinbaseVin;
 
+/**
+ * An input as a formatted transaction stores it: the outpoint it spends, or
+ * the coinbase marker. The scriptSig and witness are dropped, since nothing
+ * reads them and they made up most of the stored history. Narrow with
+ * `'txid' in vin`.
+ */
+export type TFormattedVin =
+	| Pick<IVin, 'txid' | 'vout' | 'sequence'>
+	| Pick<ICoinbaseVin, 'coinbase' | 'sequence'>;
+
 export interface IFormattedTransaction {
 	address: string;
 	blockhash?: string;
@@ -135,7 +145,7 @@ export interface IFormattedTransaction {
 	value: number; // BTC
 	txid: string;
 	messages: string[];
-	vin: TVin[];
+	vin: TFormattedVin[];
 	timestamp: number;
 	confirmTimestamp?: number;
 	exists?: boolean;

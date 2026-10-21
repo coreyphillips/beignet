@@ -12,9 +12,11 @@ import {
 	IUtxo,
 	IWalletData,
 	ObjectKeys,
+	TFormattedVin,
 	TGapLimitOptions,
 	TGetData,
-	TKeyDerivationPurpose
+	TKeyDerivationPurpose,
+	TVin
 } from '../types';
 import { err, ok, Result } from './result';
 import {
@@ -321,6 +323,31 @@ export const decodeOpReturnMessage = (opReturn = ''): string[] => {
 		return messages;
 	}
 };
+
+const STORED_INPUT_FIELDS = new Set(['txid', 'vout', 'sequence', 'coinbase']);
+
+/**
+ * Returns the inputs as a formatted transaction stores them.
+ * @param {(TVin | TFormattedVin)[]} vin
+ * @returns {TFormattedVin[]}
+ */
+export const trimInputs = (vin: (TVin | TFormattedVin)[]): TFormattedVin[] =>
+	vin.map((input) =>
+		'coinbase' in input
+			? { coinbase: input.coinbase, sequence: input.sequence }
+			: { txid: input.txid, vout: input.vout, sequence: input.sequence }
+	);
+
+/**
+ * Whether any input carries a field trimInputs drops, as records stored
+ * before inputs were trimmed do.
+ * @param {(TVin | TFormattedVin)[]} vin
+ * @returns {boolean}
+ */
+export const hasUntrimmedInputs = (vin: (TVin | TFormattedVin)[]): boolean =>
+	vin.some((input) =>
+		Object.keys(input).some((field) => !STORED_INPUT_FIELDS.has(field))
+	);
 
 /**
  * Returns the seed for a given mnemonic and passphrase.
