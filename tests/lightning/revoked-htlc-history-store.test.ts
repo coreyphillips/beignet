@@ -38,6 +38,7 @@ import {
 	resolveRevokedCommitmentOutputs
 } from '../../src/lightning/chain/output-resolver';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { nodeStorageView } from '../../src/cli/node-storage-view';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { encryptValue } from '../../src/lightning/storage/encryption';
 import { withStorageTransaction } from '../../src/lightning/storage/transaction';
@@ -68,6 +69,23 @@ function snapshotRows(storage: SqliteStorage, channelId: string): number {
 			)
 			.get(channelId) as { n: number }
 	).n;
+}
+
+/** Counts snapshot rows written from now on, replaced ones included. */
+function countSnapshotWrites(storage: SqliteStorage): () => number {
+	const db = (storage as unknown as { db: Database.Database }).db;
+	db.exec(`
+		CREATE TEMP TABLE snapshot_writes (n INTEGER);
+		CREATE TEMP TRIGGER count_snapshot_writes
+			AFTER INSERT ON main.revoked_htlc_snapshots
+			BEGIN INSERT INTO snapshot_writes VALUES (1); END;
+	`);
+	return () =>
+		(
+			db.prepare('SELECT COUNT(*) AS n FROM snapshot_writes').get() as {
+				n: number;
+			}
+		).n;
 }
 
 function rowBytes(storage: SqliteStorage, channelId: string): number {
@@ -313,6 +331,56 @@ describe('Revoked HTLC snapshot store', function () {
 			storage.close();
 		}
 	});
+
+	for (const journaled of [false, true]) {
+		it(`writes one snapshot per save through the CLI's node storage view${
+			journaled ? ', and its frame carries only that one' : ''
+		}`, () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			// The daemon's recovery manager and journal hold the view, while
+			// saveChannel runs on the instance underneath it.
+			const view = nodeStorageView(storage);
+			const journal = journaled
+				? new RecoveryJournal(
+						view,
+						Buffer.alloc(32, 1),
+						Buffer.from(PEER, 'hex'),
+						Buffer.alloc(32, 2)
+				  )
+				: undefined;
+			const manager = new RecoveryManager(view, { journal });
+			try {
+				const writes = countSnapshotWrites(storage);
+				const { opener, acceptor } = setupNormalChannels();
+				const channelId = opener.getChannelId()!.toString('hex');
+				offerHtlc(opener, acceptor, crypto.randomBytes(32));
+				expect(save(manager, channelId, opener.getFullState())).to.be.true;
+				const COMMITMENTS = 20;
+				for (let i = 1; i <= COMMITMENTS; i++) {
+					if (i === 1) exchangeCommitments(opener, acceptor);
+					else signOnce(opener, acceptor);
+					const before = writes();
+					expect(save(manager, channelId, opener.getFullState())).to.be.true;
+					expect(writes() - before).to.equal(1);
+				}
+				expect(snapshotRows(storage, channelId)).to.equal(COMMITMENTS);
+				if (!journal) return;
+
+				const frames = journal.loadVerifiedFrames();
+				const last = frames[frames.length - 1].mutations.find(
+					(m) => m.type === 'channel_state'
+				);
+				expect(last?.type).to.equal('channel_state');
+				if (last?.type !== 'channel_state') return;
+				expect([...last.state.revokedHtlcSnapshots!.keys()]).to.deep.equal([
+					[...opener.getFullState().revokedHtlcSnapshots!.keys()].pop()
+				]);
+			} finally {
+				storage.close();
+			}
+		});
+	}
 
 	it('writes a snapshot again after the commit that carried it rolls back', () => {
 		const storage = new SqliteStorage(':memory:');
