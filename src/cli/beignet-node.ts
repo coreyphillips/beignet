@@ -13124,8 +13124,9 @@ export class BeignetNode extends EventEmitter {
 	/**
 	 * Every invoice with its status, judged as getInvoice judges one. The
 	 * durable rows are read at most once per call, for the invoices the map
-	 * has no record of; a wallet polls this every few seconds, and a row
-	 * lookup per invoice would not scale with its history.
+	 * has no record of, and only their plaintext status and direction: a
+	 * wallet polls this every few seconds, and decrypting a row per invoice,
+	 * or every row, would not scale with its history (issue #1675).
 	 */
 	listInvoices(): InvoiceInfo[] {
 		let durablePaid: Set<string> | undefined;
@@ -13135,20 +13136,17 @@ export class BeignetNode extends EventEmitter {
 			if (live) {
 				paid = settlesInvoice(live);
 			} else {
-				if (!durablePaid) durablePaid = this.durablePaidHashes();
+				// The two fields settlesInvoice reads, so the answer is the same.
+				if (!durablePaid) {
+					durablePaid = this.storage.paymentHashesWith({
+						status: 'COMPLETED',
+						direction: 'INCOMING'
+					});
+				}
 				paid = durablePaid.has(inv.paymentHash);
 			}
 			return this.toInvoiceInfo(inv, paid);
 		});
-	}
-
-	/** The hashes whose durable row is a completed receive. */
-	private durablePaidHashes(): Set<string> {
-		const paid = new Set<string>();
-		for (const { paymentHash, payment } of this.storage.loadAllPayments()) {
-			if (settlesInvoice(payment)) paid.add(paymentHash);
-		}
-		return paid;
 	}
 
 	private toInvoiceInfo(inv: IInvoiceInfo, paid: boolean): InvoiceInfo {
