@@ -2945,7 +2945,12 @@ export class Wallet {
 		// Read before the query so a broadcast landing while it is in flight is
 		// known to be newer than the answer it returns.
 		const spendMark = this._spendSeq;
-		this._scanMarks.push(spendMark);
+		// The mark comes out of the array it went into. switchNetwork replaces
+		// the array and restarts the spend count, so a scan from before the
+		// switch would otherwise find a later scan's equal mark in the new array
+		// and take that one out (#1635).
+		const scanMarks = this._scanMarks;
+		scanMarks.push(spendMark);
 		const scanSeq = ++this._scanSeq;
 		// switchNetwork replaces the Electrum instance and restarts the scan
 		// numbers, so an answer from the one this query went to is another
@@ -2961,8 +2966,8 @@ export class Wallet {
 				additionalAddresses
 			});
 		} finally {
-			const at = this._scanMarks.indexOf(spendMark);
-			if (at !== -1) this._scanMarks.splice(at, 1);
+			const at = scanMarks.indexOf(spendMark);
+			if (at !== -1) scanMarks.splice(at, 1);
 		}
 		if (getUtxosRes.isErr()) {
 			return err(getUtxosRes.error.message);

@@ -313,6 +313,84 @@ describe('switchNetwork against an unreachable target', function () {
 		}
 	});
 
+	it('keeps the mark of a scan started after the switch when one from before it lands (#1635)', async function () {
+		const res = await Wallet.create({
+			mnemonic: MNEMONIC,
+			network,
+			electrumOptions,
+			feeEstimationSource: 'electrum',
+			disableRefreshOnCreate: true
+		});
+		if (res.isErr()) throw res.error;
+		const w = res.value;
+		const stubs = w as unknown as {
+			_scanMarks: number[];
+			_runRefresh: () => Promise<Result<IWalletData>>;
+		};
+		w.checkElectrumConnection = async (): Promise<Result<string>> =>
+			ok('connected');
+		w.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
+			ok(w.feeEstimates);
+		stubs._runRefresh = async (): Promise<Result<IWalletData>> => ok(w.data);
+		// Each stub answers once released, and reports when its query is out,
+		// since getUtxos registers the mark only after a connection check.
+		const held = (): {
+			issued: Promise<void>;
+			release: () => void;
+			getUtxos: () => Promise<Result<IGetUtxosResponse>>;
+		} => {
+			let release = (): void => {};
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			let issue = (): void => {};
+			const issued = new Promise<void>((resolve) => {
+				issue = resolve;
+			});
+			return {
+				issued,
+				release,
+				getUtxos: async (): Promise<Result<IGetUtxosResponse>> => {
+					issue();
+					await gate;
+					return ok({ utxos: [utxo(30000, 1)], balance: 30000 });
+				}
+			};
+		};
+		const before = held();
+		const after = held();
+		w.electrum.getUtxos = before.getUtxos;
+		try {
+			const stale = w.getUtxos({});
+			await before.issued;
+			const switched = await w.switchNetwork(
+				EAvailableNetworks.signet,
+				otherServer
+			);
+			if (switched.isErr()) throw switched.error;
+			w.electrum.getUtxos = after.getUtxos;
+			const later = w.getUtxos({});
+			await after.issued;
+			// Both generations number their marks from zero.
+			expect(stubs._scanMarks).to.deep.equal([0]);
+
+			before.release();
+			expect((await stale).isErr()).to.equal(true);
+			expect(stubs._scanMarks).to.deep.equal([0]);
+
+			after.release();
+			const laterRes = await later;
+			if (laterRes.isErr()) throw laterRes.error;
+			expect(stubs._scanMarks).to.deep.equal([]);
+			expect(w.data.utxos).to.deep.equal([utxo(30000, 1)]);
+			expect(w.data.balance).to.equal(30000);
+		} finally {
+			before.release();
+			after.release();
+			await w.stop();
+		}
+	});
+
 	it('writes a pending UTXO pair under the network it was scanned on (#1623)', async function () {
 		const name = 'switchsave';
 		const store = new Map<string, unknown>();
