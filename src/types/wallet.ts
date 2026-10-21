@@ -273,6 +273,9 @@ export interface IWallet {
 	};
 	remainOffline?: boolean;
 	onMessage?: TOnMessage;
+	// Answers every single-key address in place of the wallet's own
+	// derivation. The answer is used as given, so it must be the address
+	// and public key at the path asked for.
 	customGetAddress?: (
 		data: ICustomGetAddress
 	) => Promise<Result<IGetAddressResponse>>;
