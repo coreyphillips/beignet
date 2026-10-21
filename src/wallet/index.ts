@@ -66,6 +66,7 @@ import {
 	Net,
 	TAddressIndexInfo,
 	TAddressLabels,
+	TAddressScan,
 	TAddressTypeContent,
 	TAvailableNetworks,
 	TFeeEstimationSource,
@@ -225,6 +226,11 @@ export class Wallet {
 	// the record, which would read it as back, nor watches it again. Never
 	// reset, so a count never repeats (issues #945 and #964).
 	private readonly _ghostClearings: Map<string, number> = new Map();
+	// Counts every clearing of a stored transaction record and every lost
+	// block taken off one. A refresh reuses the history its address scan was
+	// answered only while this holds still: an answer from before a repair
+	// would undo it.
+	private _recordRepairs = 0;
 	// The highest tip updateHeader has replaced. A failover to a server
 	// further behind lowers the tip, and that server may announce new blocks
 	// while it catches up to the one a transaction was mined in (issue #935).
@@ -1225,20 +1231,29 @@ export class Wallet {
 			return err(r0.error.message);
 		}
 		if (this._stopped) return err(stopped);
-		const r1 = await this.updateAddressIndexes();
+		const electrum = this.electrum;
+		const repairs = this._recordRepairs;
+		const scan: TAddressScan = {
+			history: new Map(),
+			current: () =>
+				this.electrum === electrum && this._recordRepairs === repairs,
+			utxoAddresses: {}
+		};
+		const r1 = await this.updateAddressIndexes(scan);
 		if (r1.isErr()) {
 			return err(r1.error.message);
 		}
 		if (this._stopped) return err(stopped);
 		const r2 = await this.getUtxos({
 			scanningStrategy: scanAllAddresses ? EScanningStrategy.all : undefined,
-			additionalAddresses
+			additionalAddresses,
+			additionalScriptHashes: scan.utxoAddresses
 		});
 		if (r2.isErr()) {
 			return err(r2.error.message);
 		}
 		if (this._stopped) return err(stopped);
-		const r3 = await this.updateTransactions({ scanAllAddresses });
+		const r3 = await this.updateTransactions({ scanAllAddresses, scan });
 		if (r3.isErr()) {
 			return err(r3.error.message);
 		}
@@ -1983,10 +1998,42 @@ export class Wallet {
 	/**
 	 * Returns the next available address for the given addresstype.
 	 * @param {EAddressType} addressType
+	 * @param {TAddressScan} [scan] A refresh's scan, which collects the history
+	 * answered and leaves the UTXOs to the refresh's own scan. Without one,
+	 * the UTXOs on the addresses the extension rounds reach are listed before
+	 * this returns.
 	 * @returns {Promise<Result<IGetNextAvailableAddressResponse>>}
 	 */
 	public async getNextAvailableAddress(
-		addressType?: EAddressType
+		addressType?: EAddressType,
+		scan?: TAddressScan
+	): Promise<Result<IGetNextAvailableAddressResponse>> {
+		if (scan) return this.scanNextAvailableAddress(addressType, scan);
+		const own: TAddressScan = {
+			history: new Map(),
+			current: () => false,
+			utxoAddresses: {}
+		};
+		const res = await this.scanNextAvailableAddress(addressType, own);
+		if (Object.keys(own.utxoAddresses).length) {
+			await this.getUtxos({
+				addressTypesToCheck: [],
+				additionalScriptHashes: own.utxoAddresses
+			});
+		}
+		return res;
+	}
+
+	/**
+	 * The gap-limit scan behind getNextAvailableAddress.
+	 * @private
+	 * @param {EAddressType} [addressType]
+	 * @param {TAddressScan} scan
+	 * @returns {Promise<Result<IGetNextAvailableAddressResponse>>}
+	 */
+	private async scanNextAvailableAddress(
+		addressType: EAddressType | undefined,
+		scan: TAddressScan
 	): Promise<Result<IGetNextAvailableAddressResponse>> {
 		const checkRes = await this.checkElectrumConnection();
 		if (checkRes.isErr()) return err(checkRes.error.message);
@@ -2030,9 +2077,10 @@ export class Wallet {
 			const addressesToGenerate =
 				this.gapLimitOptions.lookAhead - addressIndexDiff;
 			if (addressesToGenerate > 0) {
+				// Every address below this one is already stored.
 				const generatedAddresses = await this.addAddresses({
 					addressAmount: addressesToGenerate,
-					addressIndex: 0,
+					addressIndex: originalHighestStoredIndex.index + 1,
 					changeAddressAmount: 0,
 					keyDerivationPath,
 					addressType,
@@ -2063,7 +2111,7 @@ export class Wallet {
 				const generatedAddresses = await this.addAddresses({
 					addressAmount: 0,
 					changeAddressAmount: changeAddressesToGenerate,
-					changeAddressIndex: 0,
+					changeAddressIndex: originalHighestStoredChangeIndex.index + 1,
 					keyDerivationPath,
 					addressType,
 					saveAddresses: false
@@ -2133,7 +2181,8 @@ export class Wallet {
 			while (!foundLastUsedAddress || !foundLastUsedChangeAddress) {
 				//Check if transactions are pending in the mempool.
 				const addressHistory = await this.electrum.getAddressHistory({
-					scriptHashes: combinedAddressesToScan
+					scriptHashes: combinedAddressesToScan,
+					answered: scan.history
 				});
 
 				if (addressHistory.isErr()) {
@@ -2306,12 +2355,17 @@ export class Wallet {
 				// Store the newly created addresses used for this method.
 				allAddresses = [...allAddresses, ...addressesToScan];
 				allChangeAddresses = [...allChangeAddresses, ...changeAddressesToScan];
-				// Check UTXO's as we generate addresses.
-				await this.getUtxos({
-					addressIndex: addressIndex.index,
-					changeAddressIndex: changeAddressIndex.index,
-					addressTypesToCheck: [addressType]
-				});
+				// What a UTXO scan of this round would list. It is listed once,
+				// after the gap scan, since each listing also repeats every UTXO
+				// the wallet holds.
+				Object.assign(
+					scan.utxoAddresses,
+					this.electrum.utxoScanAddresses({
+						addressIndex: addressIndex.index,
+						changeAddressIndex: changeAddressIndex.index,
+						addressTypesToCheck: [addressType]
+					})
+				);
 			}
 
 			await this.saveGrownAddressMaps();
@@ -2552,9 +2606,12 @@ export class Wallet {
 	 * This method updates the next available (zero-balance) address & changeAddress index.
 	 * @private
 	 * @async
+	 * @param {TAddressScan} scan The refresh's scan, shared by every type.
 	 * @returns {Promise<Result<string>>}
 	 */
-	private async updateAddressIndexes(): Promise<Result<string>> {
+	private async updateAddressIndexes(
+		scan: TAddressScan
+	): Promise<Result<string>> {
 		const checkRes = await this.checkElectrumConnection();
 		if (checkRes.isErr()) return err(checkRes.error.message);
 		const currentWallet = this.data;
@@ -2569,7 +2626,7 @@ export class Wallet {
 		let updated = false;
 
 		const promises = this.addressTypesToMonitor.map(async (addressTypeKey) => {
-			const response = await this.getNextAvailableAddress(addressTypeKey);
+			const response = await this.getNextAvailableAddress(addressTypeKey, scan);
 			if (response.isErr()) {
 				throw response.error;
 			}
@@ -2991,6 +3048,8 @@ export class Wallet {
 	 * @param {number} addressIndex
 	 * @param {number} changeAddressIndex
 	 * @param {EAddressType[]} [addressTypesToCheck]
+	 * @param {IAddresses} [additionalScriptHashes] Listed besides the
+	 * addresses the strategy picks.
 	 * @returns {Promise<Result<IGetUtxosResponse>>} The pair the scan applied
 	 * to memory, or, when a newer scan already landed, memory's pair as it
 	 * stands, applied and written by that scan instead. Err, with nothing
@@ -3003,13 +3062,15 @@ export class Wallet {
 		addressIndex,
 		changeAddressIndex,
 		addressTypesToCheck,
-		additionalAddresses = []
+		additionalAddresses = [],
+		additionalScriptHashes
 	}: {
 		scanningStrategy?: EScanningStrategy;
 		addressIndex?: number;
 		changeAddressIndex?: number;
 		addressTypesToCheck?: EAddressType[];
 		additionalAddresses?: string[];
+		additionalScriptHashes?: IAddresses;
 	}): Promise<Result<IGetUtxosResponse>> {
 		const checkRes = await this.checkElectrumConnection();
 		if (checkRes.isErr()) return err(checkRes.error.message);
@@ -3034,7 +3095,8 @@ export class Wallet {
 				addressIndex,
 				changeAddressIndex,
 				addressTypesToCheck,
-				additionalAddresses
+				additionalAddresses,
+				additionalScriptHashes
 			});
 		} finally {
 			const at = scanMarks.indexOf(spendMark);
@@ -3853,14 +3915,18 @@ export class Wallet {
 	 * Retrieves, formats & stores the transaction history for the selected wallet/network.
 	 * @param {boolean} [scanAllAddresses]
 	 * @param {boolean} [replaceStoredTransactions] Setting this to true will set scanAllAddresses to true as well.
+	 * @param {TAddressScan} [scan] A refresh's gap-limit scan. While it is
+	 * current, the history it was answered is not asked for again.
 	 * @returns {Promise<Result<string | undefined>>}
 	 */
 	public async updateTransactions({
 		scanAllAddresses = false,
-		replaceStoredTransactions = false
+		replaceStoredTransactions = false,
+		scan
 	}: {
 		scanAllAddresses?: boolean;
 		replaceStoredTransactions?: boolean;
+		scan?: TAddressScan;
 	}): Promise<Result<string | undefined>> {
 		// The whole lookup goes to one Electrum instance. switchNetwork replaces
 		// it along with the data, so a history answered after it is the network
@@ -3885,8 +3951,13 @@ export class Wallet {
 		// are done by now, so neither counts as newer (issues #945 and #964).
 		const clearingsAtLookup = new Map(this._ghostClearings);
 
+		// The gap-limit scan's answers are older than the check above, so they
+		// stand in for this lookup only if nothing has been cleared or repaired
+		// since they were asked for. Then the counts above are also the ones
+		// they went out at, and no answer can undo a repair.
 		const history = await electrum.getAddressHistory({
-			scanAllAddresses: scanAllAddresses || replaceStoredTransactions
+			scanAllAddresses: scanAllAddresses || replaceStoredTransactions,
+			answered: scan?.current() ? scan.history : undefined
 		});
 		if (history.isErr()) {
 			return err(history.error.message);
@@ -4450,6 +4521,7 @@ export class Wallet {
 						txId,
 						(this._ghostClearings.get(txId) ?? 0) + 1
 					);
+					this._recordRepairs += 1;
 					// A reorg'd out transaction no mempool took back is answered "no
 					// such transaction" rather than with no confirmations: by a server
 					// with a txindex always, and by electrs on a node without one for
@@ -4644,6 +4716,7 @@ export class Wallet {
 				transactions[txId].height = 0;
 				delete transactions[txId].blockhash;
 				delete transactions[txId].confirmTimestamp;
+				this._recordRepairs += 1;
 				needsSave = true;
 			}
 		});
@@ -6766,6 +6839,7 @@ export class Wallet {
 		if (txid in this._data.transactions) {
 			this._data.transactions[txid].exists = false;
 			this._ghostClearings.set(txid, (this._ghostClearings.get(txid) ?? 0) + 1);
+			this._recordRepairs += 1;
 		}
 		const saved = await this.saveWalletData(
 			'transactions',

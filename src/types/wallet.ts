@@ -405,6 +405,23 @@ export interface IGetNextAvailableAddressResponse {
 	lastUsedChangeAddressIndex: IAddress;
 }
 
+/**
+ * What a refresh's gap-limit scan hands the steps after it, so each script
+ * hash's history is asked for once and the UTXOs are listed once.
+ */
+export type TAddressScan = {
+	/** The history answered so far, by script hash. */
+	history: Map<string, TTxResult[]>;
+	/**
+	 * Whether those answers can stand in for a new lookup: the wallet is on
+	 * the network that gave them, and no stored transaction has been cleared
+	 * or repaired since the first was asked for.
+	 */
+	current: () => boolean;
+	/** What the UTXO scan of each extension round would have listed. */
+	utxoAddresses: IAddresses;
+};
+
 export interface ITxHashes extends TTxResult {
 	scriptHash: string;
 }
