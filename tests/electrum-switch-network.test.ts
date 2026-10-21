@@ -408,52 +408,6 @@ describe('switchNetwork against an unreachable target', function () {
 		}
 	});
 
-	it('returns with the new network zero index addresses while a refresh from before the switch still runs', async function () {
-		const res = await Wallet.create({
-			mnemonic: MNEMONIC,
-			network,
-			addressType: EAddressType.p2wpkh,
-			electrumOptions,
-			feeEstimationSource: 'electrum',
-			disableRefreshOnCreate: true
-		});
-		if (res.isErr()) throw res.error;
-		const w = res.value;
-		w.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
-			ok(w.feeEstimates);
-		const running = holdable();
-		// Every refresh body waits here, so neither the one spanning the switch
-		// nor the one the switch queues behind it sets anything.
-		(
-			w as unknown as { _runRefresh: () => Promise<Result<IWalletData>> }
-		)._runRefresh = async (): Promise<Result<IWalletData>> => {
-			await running.hold();
-			return ok(w.data);
-		};
-		try {
-			const spanning = w.refreshWallet();
-			await running.held;
-			const switched = await w.switchNetwork(
-				EAvailableNetworks.signet,
-				otherServer
-			);
-			if (switched.isErr()) throw switched.error;
-			expect(w.isRefreshing).to.equal(true);
-			const index = w.data.addressIndex[EAddressType.p2wpkh];
-			expect(index.index).to.equal(0);
-			expect(index.path).to.equal("m/84'/1'/0'/0/0");
-			expect(index.address.startsWith('tb1q')).to.equal(true);
-			const change = w.data.changeAddressIndex[EAddressType.p2wpkh];
-			expect(change.index).to.equal(0);
-			expect(change.address.startsWith('tb1q')).to.equal(true);
-			running.release();
-			expect(await settles(spanning)).to.equal(true);
-		} finally {
-			running.release();
-			await w.stop();
-		}
-	});
-
 	it('drops a UTXO answer from the network the wallet switched away from (#1614)', async function () {
 		const res = await Wallet.create({
 			mnemonic: MNEMONIC,

@@ -1109,11 +1109,6 @@ export class Wallet {
 				network,
 				...params.electrumOptions
 			});
-			// The refresh below queues behind one still running from before the
-			// switch, and only it would set the new network's zero index
-			// addresses, so the switch would return with no receive index until
-			// that older refresh finished. Setting them needs no server.
-			await this.setZeroIndexAddresses();
 			void this.refreshWallet({});
 			await this.updateFeeEstimates(true);
 			return ok(this);

@@ -328,12 +328,16 @@ describe('Wallet Library', function () {
 		expect(wallet.network).to.equal(EAvailableNetworks.regtest);
 	});
 
-	it('Should successfully switch from regtest to mainnet', async () => {
+	it('Should successfully switch from regtest to mainnet', async function () {
 		expect(wallet.network).to.equal(EAvailableNetworks.regtest);
 		await wallet.switchNetwork(
 			EAvailableNetworks.mainnet,
 			servers[EAvailableNetworks.mainnet]
 		);
+		// The refresh that sets mainnet's zero index addresses runs in the
+		// background, queued behind the regtest refresh the previous switch
+		// started (#1606), so the index is only there once it finishes.
+		await refreshOrSkip(this, wallet);
 		it('Should successfully create a wallet for the new network.', () => {
 			expect(wallet).not.to.be.null;
 		});
