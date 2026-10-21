@@ -1736,17 +1736,36 @@ export class SqliteStorage implements IStorageBackend {
 		timestamp: number;
 		data: string;
 	}): void {
+		this.db.transaction(() => {
+			this.db
+				.prepare(
+					'INSERT INTO action_log (category, action, timestamp, data) VALUES (?, ?, ?, ?)'
+				)
+				.run(entry.category, entry.action, entry.timestamp, entry.data);
+			// Cap at 10k rows, pruning oldest first
+			this._pruneOldestRows('action_log', 10_000);
+		})();
+	}
+
+	/**
+	 * Delete all but the newest `cap` rows (by id) of an append-only log table.
+	 * Runs on every insert. COUNT(*) reads the smallest index rather than the
+	 * rows, and the delete visits only the rows it removes, so at the cap an
+	 * insert costs one index count and a single-row delete.
+	 */
+	private _pruneOldestRows(
+		table: 'action_log' | 'forwarding_events',
+		cap: number
+	): void {
+		const { n } = this.db
+			.prepare(`SELECT COUNT(*) AS n FROM ${table}`)
+			.get() as { n: number };
+		if (n <= cap) return;
 		this.db
 			.prepare(
-				'INSERT INTO action_log (category, action, timestamp, data) VALUES (?, ?, ?, ?)'
+				`DELETE FROM ${table} WHERE id <= (SELECT id FROM ${table} ORDER BY id LIMIT 1 OFFSET ?)`
 			)
-			.run(entry.category, entry.action, entry.timestamp, entry.data);
-		// Cap at 10k rows — delete oldest
-		this.db
-			.prepare(
-				'DELETE FROM action_log WHERE id NOT IN (SELECT id FROM action_log ORDER BY id DESC LIMIT 10000)'
-			)
-			.run();
+			.run(n - cap - 1);
 	}
 
 	loadActionLog(options?: {
@@ -2593,29 +2612,27 @@ export class SqliteStorage implements IStorageBackend {
 	// filters/index need SQL access to the raw columns.
 
 	saveForwardingEvent(event: Omit<IForwardingEvent, 'id'>): void {
-		this.db
-			.prepare(
-				`INSERT INTO forwarding_events
-					(settled_at, in_channel_id, out_channel_id, in_scid, out_scid,
-					 amount_in_msat, amount_out_msat, fee_msat)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-			)
-			.run(
-				event.settledAt,
-				event.inChannelId,
-				event.outChannelId,
-				event.inScid ?? null,
-				event.outScid ?? null,
-				event.amountInMsat.toString(),
-				event.amountOutMsat.toString(),
-				event.feeMsat.toString()
-			);
-		// Cap the ledger (default 100k rows), pruning oldest first
-		this.db
-			.prepare(
-				'DELETE FROM forwarding_events WHERE id NOT IN (SELECT id FROM forwarding_events ORDER BY id DESC LIMIT ?)'
-			)
-			.run(this.forwardingEventsMaxRows);
+		this.db.transaction(() => {
+			this.db
+				.prepare(
+					`INSERT INTO forwarding_events
+						(settled_at, in_channel_id, out_channel_id, in_scid, out_scid,
+						 amount_in_msat, amount_out_msat, fee_msat)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+				)
+				.run(
+					event.settledAt,
+					event.inChannelId,
+					event.outChannelId,
+					event.inScid ?? null,
+					event.outScid ?? null,
+					event.amountInMsat.toString(),
+					event.amountOutMsat.toString(),
+					event.feeMsat.toString()
+				);
+			// Cap the ledger (default 100k rows), pruning oldest first
+			this._pruneOldestRows('forwarding_events', this.forwardingEventsMaxRows);
+		})();
 	}
 
 	listForwardingEvents(filter?: IForwardingEventFilter): IForwardingEvent[] {
