@@ -155,9 +155,9 @@ describe('value accumulators', function () {
 
 		// Erring rather than treating the term as 0: a falsy amountToSend takes
 		// the consolidate branch, and createTransaction({runCoinSelect: true})
-		// persists that selection through applyAutoCoinSelect before
+		// stages that selection through applyAutoCoinSelect before
 		// validateTransaction ever runs. The full-wallet selection would already
-		// be saved by the time anything downstream complained.
+		// be staged by the time anything downstream complained.
 		it('rejects a malformed output instead of consolidating the wallet', function () {
 			const res = select([malformed]);
 			expect(res.isErr(), 'a malformed-only output set is an error').to.equal(

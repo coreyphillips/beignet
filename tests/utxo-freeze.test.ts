@@ -742,17 +742,18 @@ describe('UTXO freeze/unfreeze', function () {
 		}
 	});
 
-	it('exports no coin frozen during the final cleanup of buildPsbt (#1548)', async () => {
+	it('exports no coin frozen after createUnsignedPsbt checked it (#1548)', async () => {
 		const transaction = wallet.transaction;
-		const clear = transaction.clearStoredSendTransaction;
+		const build = transaction.createUnsignedPsbt;
 		const paused = deferred();
 		const resume = deferred();
-		transaction.clearStoredSendTransaction = async (): ReturnType<
-			typeof clear
-		> => {
+		transaction.createUnsignedPsbt = async (
+			...args: Parameters<typeof build>
+		): ReturnType<typeof build> => {
+			const built = await build(...args);
 			paused.resolve();
 			await resume.promise;
-			return clear.call(transaction);
+			return built;
 		};
 		try {
 			// 80k needs both coins, so utxoB is selected.
@@ -777,26 +778,27 @@ describe('UTXO freeze/unfreeze', function () {
 				);
 			}
 		} finally {
-			transaction.clearStoredSendTransaction = clear;
+			transaction.createUnsignedPsbt = build;
 			await wallet.unfreezeUtxo({ txid: utxoB.tx_hash, index: utxoB.tx_pos });
 			await wallet.resetSendTransaction();
 		}
 	});
 
-	/** Freezes utxoB while the send's final cleanup is paused. */
-	const freezeDuringCleanup = async (
+	/** Freezes utxoB after the send's createTransaction signed, before it returns. */
+	const freezeAfterSigning = async (
 		send: () => Promise<Result<string>>
 	): Promise<Result<string>> => {
 		const transaction = wallet.transaction;
-		const clear = transaction.clearStoredSendTransaction;
+		const create = transaction.createTransaction;
 		const paused = deferred();
 		const resume = deferred();
-		transaction.clearStoredSendTransaction = async (): ReturnType<
-			typeof clear
-		> => {
+		transaction.createTransaction = async (
+			...args: Parameters<typeof create>
+		): ReturnType<typeof create> => {
+			const created = await create(...args);
 			paused.resolve();
 			await resume.promise;
-			return clear.call(transaction);
+			return created;
 		};
 		try {
 			const sending = send();
@@ -809,14 +811,14 @@ describe('UTXO freeze/unfreeze', function () {
 			resume.resolve();
 			return await sending;
 		} finally {
-			transaction.clearStoredSendTransaction = clear;
+			transaction.createTransaction = create;
 		}
 	};
 
-	it('returns no signed hex spending a coin frozen during the final cleanup of sendMany (#1564)', async () => {
+	it('returns no signed hex spending a coin frozen after sendMany signed (#1564)', async () => {
 		try {
 			// 80k needs both coins, so utxoB is selected.
-			const sent = await freezeDuringCleanup(() =>
+			const sent = await freezeAfterSigning(() =>
 				wallet.sendMany({
 					txs: [
 						{
@@ -841,9 +843,9 @@ describe('UTXO freeze/unfreeze', function () {
 		}
 	});
 
-	it('returns no signed hex spending a coin frozen during the final cleanup of sendMax (#1564)', async () => {
+	it('returns no signed hex spending a coin frozen after sendMax signed (#1564)', async () => {
 		try {
-			const sent = await freezeDuringCleanup(() =>
+			const sent = await freezeAfterSigning(() =>
 				wallet.sendMax({
 					address: 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk',
 					satsPerByte: 2,

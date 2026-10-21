@@ -1298,11 +1298,11 @@ export class Wallet {
 	}
 
 	/**
-	 * The staged send is a per-call working area, never a draft to restore:
-	 * nothing reads the stored copy, and a copy an older version left behind
-	 * can carry an earlier call's recipients (#1002) and, after a key sweep,
-	 * the swept key pair (#1011). Drop it rather than keep it, in memory and
-	 * in storage, and only write when there is something to drop.
+	 * The staged send is a per-call working area, never a draft to restore,
+	 * and this wallet never writes it to storage. A copy an older version
+	 * left behind can carry an earlier call's recipients (#1002) and, after a
+	 * key sweep, the swept key pair (#1011). Drop it rather than keep it, in
+	 * memory and in storage, and only write when there is something to drop.
 	 * @private
 	 * @async
 	 * @returns {Promise<void>}
@@ -5592,82 +5592,73 @@ export class Wallet {
 		if (!this.data.utxos.length) {
 			return err('No UTXOs available.');
 		}
-		// The staged send is a per-call working area. It starts empty, so
-		// nothing an earlier call staged rides along (#1002), and its stored
-		// copy is dropped on the way out, so nothing of this call outlives the
-		// process. The live copy stays readable (fee, inputs) until the next
-		// call resets it.
+		// The staged send is a per-call working area, held only in memory. It
+		// starts empty, so nothing an earlier call staged rides along (#1002),
+		// and stays readable (fee, inputs) until the next call resets it.
 		await this.resetSendTransaction();
-		let hex: string;
-		try {
-			const setupTransactionRes = await this.transaction.setupTransaction({
-				rbf
-			});
-			if (setupTransactionRes.isErr()) {
-				return err(setupTransactionRes.error.message);
-			}
+		const setupTransactionRes = await this.transaction.setupTransaction({
+			rbf
+		});
+		if (setupTransactionRes.isErr()) {
+			return err(setupTransactionRes.error.message);
+		}
 
-			if (!Array.isArray(txs)) txs = [txs];
+		if (!Array.isArray(txs)) txs = [txs];
 
-			const shuffledTxs = shuffleOutputs ? shuffleArray(txs) : txs;
-			let index = 0;
-			for (const tx of shuffledTxs) {
-				const updateSendTransactionRes = this.transaction.updateSendTransaction(
-					{
-						transaction: {
-							label: tx.message,
-							outputs: [{ address: tx.address, value: tx.amount, index }]
-						}
-					}
-				);
-				if (updateSendTransactionRes.isErr())
-					return err(updateSendTransactionRes.error.message);
-				index++;
-			}
-
-			const updateFeeRes = this.transaction.updateFee({ satsPerByte });
-			if (updateFeeRes.isErr()) {
-				if (updateFeeRes.error.message.includes('Unable to increase the fee')) {
-					const feeInfo = this.getFeeInfo({ satsPerByte: 1 });
-					if (feeInfo.isOk()) {
-						return err(
-							`Fee is too high. The maximum fee for this transaction is ${feeInfo.value.maxSatPerByte}`
-						);
-					}
+		const shuffledTxs = shuffleOutputs ? shuffleArray(txs) : txs;
+		let index = 0;
+		for (const tx of shuffledTxs) {
+			const updateSendTransactionRes = this.transaction.updateSendTransaction({
+				transaction: {
+					label: tx.message,
+					outputs: [{ address: tx.address, value: tx.amount, index }]
 				}
-				// The fee probe above only refines the message. Either way the fee
-				// was never updated, so never fall through to build and broadcast.
-				return err(updateFeeRes.error.message);
-			}
-
-			// updateFee priced only the coins the wallet's coinSelectPreference
-			// selects, so build from those coins. Every staged UTXO would pay that
-			// smaller transaction's fee at a fraction of the requested rate.
-			const createRes = await this.transaction.createTransaction({
-				shuffleOutputs,
-				runCoinSelect: true
 			});
-			if (createRes.isErr()) return err(createRes.error.message);
-			hex = createRes.value.hex;
-			if (broadcast) {
-				const broadcastRes = await this.electrum.broadcastTransaction({
-					rawTx: hex
-				});
-				if (broadcastRes.isErr()) return err(broadcastRes.error.message);
-				return ok(broadcastRes.value);
+			if (updateSendTransactionRes.isErr())
+				return err(updateSendTransactionRes.error.message);
+			index++;
+		}
+
+		const updateFeeRes = this.transaction.updateFee({ satsPerByte });
+		if (updateFeeRes.isErr()) {
+			if (updateFeeRes.error.message.includes('Unable to increase the fee')) {
+				const feeInfo = this.getFeeInfo({ satsPerByte: 1 });
+				if (feeInfo.isOk()) {
+					return err(
+						`Fee is too high. The maximum fee for this transaction is ${feeInfo.value.maxSatPerByte}`
+					);
+				}
 			}
-		} finally {
-			await this.transaction.clearStoredSendTransaction();
+			// The fee probe above only refines the message. Either way the fee
+			// was never updated, so never fall through to build and broadcast.
+			return err(updateFeeRes.error.message);
+		}
+
+		// updateFee priced only the coins the wallet's coinSelectPreference
+		// selects, so build from those coins. Every staged UTXO would pay that
+		// smaller transaction's fee at a fraction of the requested rate.
+		const createRes = await this.transaction.createTransaction({
+			shuffleOutputs,
+			runCoinSelect: true
+		});
+		if (createRes.isErr()) return err(createRes.error.message);
+		const hex = createRes.value.hex;
+		if (broadcast) {
+			const broadcastRes = await this.electrum.broadcastTransaction({
+				rawTx: hex
+			});
+			if (broadcastRes.isErr()) return err(broadcastRes.error.message);
+			return ok(broadcastRes.value);
 		}
 		return this.unfrozenSignedHex(hex);
 	}
 
 	/**
 	 * Returns the signed hex of an unbroadcast send unless it spends a frozen
-	 * coin. createTransaction checked for frozen inputs before the send's
-	 * final cleanup awaited storage, and a freeze can complete during that
-	 * await. Callers run this after the cleanup with no await between it and
-	 * their return.
+	 * coin. createTransaction checked for frozen inputs before it signed, and
+	 * a freeze can complete while the signing and createTransaction's return
+	 * are awaited. Callers run this with no await between it and their
+	 * return.
 	 * @param {string} hex
 	 * @returns {Result<string>}
 	 */
@@ -5712,43 +5703,38 @@ export class Wallet {
 		if (!this.data.utxos.length) {
 			return err('No UTXOs available.');
 		}
-		// Same working-area rule as sendMany: empty on entry, dropped from
-		// storage on exit, live copy readable until the next call.
+		// Same working-area rule as sendMany: empty on entry, readable until
+		// the next call.
 		await this.resetSendTransaction();
-		let hex: string;
-		try {
-			// transaction.sendMax only stages rbf when it does the setup itself,
-			// which it skips once inputs are staged here.
-			const setupTransactionRes = await this.transaction.setupTransaction({
-				rbf
-			});
-			if (setupTransactionRes.isErr()) {
-				return err(setupTransactionRes.error.message);
-			}
-			const sendMaxRes = await this.transaction.sendMax({
-				address,
-				satsPerByte,
-				rbf
-			});
+		// transaction.sendMax only stages rbf when it does the setup itself,
+		// which it skips once inputs are staged here.
+		const setupTransactionRes = await this.transaction.setupTransaction({
+			rbf
+		});
+		if (setupTransactionRes.isErr()) {
+			return err(setupTransactionRes.error.message);
+		}
+		const sendMaxRes = await this.transaction.sendMax({
+			address,
+			satsPerByte,
+			rbf
+		});
 
-			if (sendMaxRes.isErr()) {
-				return err(sendMaxRes.error.message);
-			}
+		if (sendMaxRes.isErr()) {
+			return err(sendMaxRes.error.message);
+		}
 
-			const createRes = await this.transaction.createTransaction({
-				shuffleOutputs: true
+		const createRes = await this.transaction.createTransaction({
+			shuffleOutputs: true
+		});
+		if (createRes.isErr()) return err(createRes.error.message);
+		const hex = createRes.value.hex;
+		if (broadcast) {
+			const broadcastRes = await this.electrum.broadcastTransaction({
+				rawTx: hex
 			});
-			if (createRes.isErr()) return err(createRes.error.message);
-			hex = createRes.value.hex;
-			if (broadcast) {
-				const broadcastRes = await this.electrum.broadcastTransaction({
-					rawTx: hex
-				});
-				if (broadcastRes.isErr()) return err(broadcastRes.error.message);
-				return ok(broadcastRes.value);
-			}
-		} finally {
-			await this.transaction.clearStoredSendTransaction();
+			if (broadcastRes.isErr()) return err(broadcastRes.error.message);
+			return ok(broadcastRes.value);
 		}
 		return this.unfrozenSignedHex(hex);
 	}
@@ -5919,15 +5905,10 @@ export class Wallet {
 			};
 		} catch (e) {
 			return err(e);
-		} finally {
-			// The response carries everything the caller needs, and none of
-			// the later steps (signPsbtWithOurKey, combinePsbts,
-			// importSignedPsbt) reads the staged send.
-			await this.transaction.clearStoredSendTransaction();
 		}
-		// createUnsignedPsbt checked for frozen inputs before the cleanup
-		// above awaited storage, and a freeze can complete during that await.
-		// No await may sit between this check and return.
+		// createUnsignedPsbt checked for frozen inputs before its return was
+		// awaited, and a freeze can complete during that await. No await may
+		// sit between this check and return.
 		for (const { hash, index } of psbt.txInputs) {
 			const txid = Buffer.from(hash).reverse().toString('hex');
 			if (this.isUtxoFrozen(txid, index)) {
@@ -7406,9 +7387,9 @@ export class Wallet {
 			response.id = broadcastResponse.value;
 			return ok(response);
 		} finally {
-			// The staged inputs carry the swept key pair, so the live copy goes
-			// too, not only the stored one (#1011). The response already holds
-			// the hex and the balance.
+			// The staged inputs carry the swept key pair, so they do not stay
+			// staged (#1011). The response already holds the hex and the
+			// balance.
 			await this.transaction.resetSendTransaction();
 		}
 	}
