@@ -74,6 +74,8 @@ const DEFAULT_MAX_OUTBOX_ROWS_PER_CHANNEL = 512;
 
 export class RecoveryManager {
 	private readonly storage: IStorageBackend;
+	/** Where saved HTLC snapshots are recorded (revokedHtlcSnapshotStore). */
+	private readonly snapshotStore: object;
 	private readonly options: IRecoveryManagerOptions;
 	private readonly maxOutboxRows: number;
 	/** Lazily seeded row counts per channel, to avoid a COUNT per commit. */
@@ -81,6 +83,7 @@ export class RecoveryManager {
 
 	constructor(storage: IStorageBackend, options: IRecoveryManagerOptions = {}) {
 		this.storage = storage;
+		this.snapshotStore = storage.revokedHtlcSnapshotStore?.() ?? storage;
 		this.options = options;
 		this.maxOutboxRows =
 			options.maxOutboxRowsPerChannel ?? DEFAULT_MAX_OUTBOX_ROWS_PER_CHANNEL;
@@ -155,7 +158,7 @@ export class RecoveryManager {
 											keys: [
 												...(unsavedRevokedHtlcSnapshots(
 													mutation.state,
-													this.storage
+													this.snapshotStore
 												)?.keys() ?? [])
 											]
 										}
@@ -239,7 +242,7 @@ export class RecoveryManager {
 		}
 		if (journaled || !this.options.journal) {
 			for (const { state, keys } of historyWritten) {
-				markRevokedHtlcSnapshotsSaved(state, this.storage, keys);
+				markRevokedHtlcSnapshotsSaved(state, this.snapshotStore, keys);
 			}
 		}
 
