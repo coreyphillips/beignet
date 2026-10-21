@@ -23,7 +23,9 @@ import { INodeConfig } from '../../src/lightning/node/types';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
 	CorruptRecoveryRowError,
-	IStorageBackend
+	IStorageBackend,
+	IStoredRecoveryFrame,
+	IStoredRecoveryFrameHeader
 } from '../../src/lightning/storage/types';
 import {
 	assertEmptyTarget,
@@ -3416,6 +3418,124 @@ describe('Recovery phase 2: snapshots page what a guardian record cannot hold (i
 				`page count ${JSON.stringify(bad)}`
 			).to.throw(/positive integer/);
 		}
+		storage.close();
+	});
+});
+
+describe('Recovery phase 2: per-write frame reads stay bounded (issue #1671)', () => {
+	function commitPreimage(
+		manager: RecoveryManager,
+		fill: number
+	): ReturnType<RecoveryManager['commit']> {
+		return manager.commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, fill).toString('hex'),
+					preimage: Buffer.alloc(32, fill)
+				}
+			],
+			outboundMessages: []
+		});
+	}
+
+	/** Count every frame read the storage serves from here on. */
+	function countFrameReads(storage: SqliteStorage): {
+		rangeQueries: number;
+		rows: number;
+		headers: number;
+	} {
+		const counts = { rangeQueries: 0, rows: 0, headers: 0 };
+		const loadFrames = storage.loadRecoveryFrames.bind(storage);
+		const loadFrame = storage.loadRecoveryFrame.bind(storage);
+		const loadHeader = storage.loadRecoveryFrameHeader.bind(storage);
+		storage.loadRecoveryFrames = (
+			afterSequence?: number
+		): IStoredRecoveryFrame[] => {
+			counts.rangeQueries++;
+			return loadFrames(afterSequence);
+		};
+		storage.loadRecoveryFrame = (
+			sequence: number
+		): IStoredRecoveryFrame | null => {
+			counts.rows++;
+			return loadFrame(sequence);
+		};
+		storage.loadRecoveryFrameHeader = (
+			sequence: number
+		): IStoredRecoveryFrameHeader | null => {
+			counts.headers++;
+			return loadHeader(sequence);
+		};
+		return counts;
+	}
+
+	it('reads one frame row per write while a guardian holds 1024 frames back', () => {
+		const storage = openStorage();
+		const journal = new RecoveryJournal(
+			storage,
+			MASTER_KEY,
+			NODE_ID,
+			RECOVERY_ID,
+			{ retainFrom: (): bigint => 2n }
+		);
+		const manager = new RecoveryManager(storage, { journal });
+		expect(commitPreimage(manager, 0).committed).to.equal(true);
+		const receipted = storage.loadRecoveryFrame(1)!;
+		storage.setRecoveryMeta(META_REPLICATED_THROUGH, '1');
+		storage.setRecoveryMeta(
+			META_REPLICATED_THROUGH_HASH,
+			receipted.frameHash.toString('hex')
+		);
+		for (let i = 1; storage.recoveryFrameStats()!.count < 1024; i++) {
+			expect(commitPreimage(manager, i).committed).to.equal(true);
+		}
+		expect(storage.recoveryFrameStats()).to.deep.equal({
+			count: 1024,
+			minSequence: 1,
+			maxSequence: 1024
+		});
+
+		const counts = countFrameReads(storage);
+		expect(commitPreimage(manager, 7).committed).to.equal(true);
+		expect(storage.recoveryFrameStats()!.maxSequence).to.equal(1025);
+		expect(counts, 'only the tip row and the anchor header').to.deep.equal({
+			rangeQueries: 0,
+			rows: 1,
+			headers: 1
+		});
+
+		// The anchor is still checked on every write, through the header.
+		storage.setRecoveryMeta(META_REPLICATED_THROUGH_HASH, 'cd'.repeat(32));
+		const result = commitPreimage(manager, 8);
+		expect(result.committed).to.equal(false);
+		expect(String(result.error?.message)).to.match(
+			/is not the receipted frame/
+		);
+		storage.close();
+	});
+
+	it('storedTipSequence reads the tip header, not the frame store', () => {
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		for (let i = 0; i < 5; i++) {
+			expect(commitPreimage(manager, i).committed).to.equal(true);
+		}
+		const counts = countFrameReads(storage);
+		expect(storedTipSequence(storage)).to.equal(5n);
+		expect(counts).to.deep.equal({ rangeQueries: 0, rows: 0, headers: 1 });
+
+		// A row above the recorded tip still means the bookkeeping is stale.
+		storage.saveRecoveryFrame({
+			sequence: 6,
+			writerEpoch: 1,
+			frameHash: Buffer.alloc(32, 1),
+			previousFrameHash: Buffer.alloc(32, 2),
+			ciphertext: Buffer.alloc(64),
+			createdAt: 0
+		});
+		expect(storedTipSequence(storage)).to.equal(null);
 		storage.close();
 	});
 });

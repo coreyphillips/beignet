@@ -379,6 +379,14 @@ export interface IStorageBackend {
 	saveRecoveryFrame?(frame: IStoredRecoveryFrame): void;
 	/** Load frames in sequence order, optionally after a given sequence. */
 	loadRecoveryFrames?(afterSequence?: number): IStoredRecoveryFrame[];
+	/** Load the one frame stored at exactly this sequence, or null. */
+	loadRecoveryFrame?(sequence: number): IStoredRecoveryFrame | null;
+	/**
+	 * The cleartext columns of the frame at exactly this sequence, without
+	 * reading its ciphertext, or null. Lets a per-write check that only
+	 * compares hashes skip copying a frame that can be a full channel state.
+	 */
+	loadRecoveryFrameHeader?(sequence: number): IStoredRecoveryFrameHeader | null;
 	/**
 	 * Compaction: drop every frame with sequence below the given one. Part of
 	 * the journalSupported contract, not a nice-to-have: verification requires
@@ -504,6 +512,12 @@ export interface IStoredRecoveryFrame {
 	ciphertext: Buffer;
 	createdAt: number;
 }
+
+/** A stored frame's cleartext columns, as loadRecoveryFrameHeader returns. */
+export type IStoredRecoveryFrameHeader = Pick<
+	IStoredRecoveryFrame,
+	'sequence' | 'writerEpoch' | 'frameHash' | 'previousFrameHash'
+>;
 
 export interface IRecoveryOutboxMessage {
 	/** Peer node id, hex. */
