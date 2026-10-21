@@ -3,7 +3,6 @@ import {
 	EBoostType,
 	ECoinSelectPreference,
 	EFeeId,
-	IAddresses,
 	IAddressTypesIO,
 	ICoinSelectResponse,
 	IOutput,
@@ -137,20 +136,6 @@ export class Transaction {
 				return err('No inputs specified in setupTransaction.');
 			}
 
-			const currentChangeAddresses = currentWallet.changeAddresses;
-
-			const addressTypeKeys = Object.values(EAddressType);
-			let changeAddresses: IAddresses = {};
-			addressTypeKeys.forEach((key) => {
-				changeAddresses = {
-					...changeAddresses,
-					...currentChangeAddresses[key]
-				};
-			});
-			const changeAddressesArr = Object.values(changeAddresses).map(
-				({ address }) => address
-			);
-
 			const changeAddressIndexContent =
 				currentWallet.changeAddressIndex[addressType];
 			// Set the current change address.
@@ -169,7 +154,7 @@ export class Transaction {
 				//Remove any potential change address that may have been included from a previous tx attempt.
 				outputs = outputs.filter((output) => {
 					return !!(
-						output.address && !changeAddressesArr.includes(output.address)
+						output.address && !this._wallet.isChangeAddress(output.address)
 					);
 				});
 			}

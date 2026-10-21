@@ -2631,8 +2631,9 @@ export class Electrum {
 				}
 			}
 			// Keep an eye on existing UTXO's regardless of the gap limit.
+			const inRange = new Set(scriptHashes);
 			currentWallet.utxos.forEach((utxo) => {
-				if (!scriptHashes.includes(utxo.scriptHash)) {
+				if (!inRange.has(utxo.scriptHash)) {
 					allUtxos.push(utxo);
 				}
 			});
