@@ -1018,6 +1018,22 @@ export class SqliteStorage implements IStorageBackend {
 		}
 	}
 
+	/**
+	 * The hashes of the payment rows with this status and direction, read
+	 * from the lookup columns alone, so no row is decrypted (issue #1675).
+	 * A row that cannot be decoded holds NULL there and is left out, as the
+	 * loadAll* readers skip it.
+	 */
+	paymentHashesWith(match: { status: string; direction: string }): Set<string> {
+		const hashes = this.db
+			.prepare(
+				'SELECT payment_hash FROM payments WHERE status = ? AND direction = ?'
+			)
+			.pluck()
+			.all(match.status, match.direction) as string[];
+		return new Set(hashes);
+	}
+
 	deletePayment(paymentHash: string): void {
 		this.db
 			.prepare('DELETE FROM payments WHERE payment_hash = ?')

@@ -439,7 +439,7 @@ describe('Pruned payments stay readable from their durable rows (issue #1063)', 
 		// A record the map still holds: an unpaid invoice of this run.
 		const liveInvoice = node.createInvoice(700, 'still in the map', 3_600);
 
-		sinon.stub(storage, 'loadAllPayments').throws(new Error('disk gone'));
+		sinon.stub(storage, 'paymentHashesWith').throws(new Error('disk gone'));
 		sinon.stub(storage, 'paymentsNewestFirst').throws(new Error('disk gone'));
 		expect(() => node.listPayments()).to.throw('disk gone');
 		expect(() => node.listPayments({ direction: 'INCOMING' })).to.throw(
@@ -465,12 +465,146 @@ describe('Pruned payments stay readable from their durable rows (issue #1063)', 
 
 	it('listInvoices reads the rows once for all its invoices, never one per invoice', () => {
 		const storage = node.getStorage();
+		const paidHashes = sinon.spy(storage, 'paymentHashesWith');
 		const all = sinon.spy(storage, 'loadAllPayments');
 		const one = sinon.spy(storage, 'loadPayment');
 		const listed = node.listInvoices();
 		expect(listed.length).to.be.at.least(2);
-		expect(all.callCount).to.equal(1);
+		expect(paidHashes.callCount).to.equal(1);
+		expect(all.callCount).to.equal(0);
 		expect(one.callCount).to.equal(0);
+	});
+});
+
+describe('listInvoices decrypts no payment row to find the paid ones (issue #1675)', function () {
+	this.timeout(60_000);
+
+	/** Pruned history around the invoices, none of it theirs. */
+	const HISTORY = 1_000;
+
+	let tmpDir: string;
+	let node: BeignetNode;
+	/** A completed receive: PAID. */
+	let paid: string;
+	/** A receive that failed: not paid. */
+	let failedReceive: string;
+	/** A completed send for the invoice's hash: not paid either. */
+	let sentOnly: string;
+	let invoiceHashes: string[];
+
+	before(async () => {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-invoice-paid-'));
+		const first = await bootNode(tmpDir);
+		try {
+			const invoice = (label: string): string =>
+				first.createInvoice(1_000, label, 3_600).paymentHash;
+			paid = invoice('paid a day ago');
+			failedReceive = invoice('receive failed');
+			sentOnly = invoice('only a send for this hash');
+			invoiceHashes = [paid, failedReceive, sentOnly];
+			const old = (
+				paymentHash: Buffer,
+				direction: PaymentDirection,
+				status: PaymentStatus,
+				label: string
+			): string =>
+				saveRecord(first, {
+					paymentHash,
+					direction,
+					status,
+					amountSats: 1_000,
+					completedAgoMs: A_DAY_AND_AN_HOUR_MS,
+					label
+				});
+			const theirs: Array<[string, PaymentDirection, PaymentStatus]> = [
+				[paid, PaymentDirection.INCOMING, PaymentStatus.COMPLETED],
+				[failedReceive, PaymentDirection.INCOMING, PaymentStatus.FAILED],
+				[sentOnly, PaymentDirection.OUTGOING, PaymentStatus.COMPLETED]
+			];
+			first.getStorage().transaction(() => {
+				for (let i = 0; i < HISTORY; i++) {
+					old(
+						crypto.randomBytes(32),
+						i % 2 === 0 ? PaymentDirection.INCOMING : PaymentDirection.OUTGOING,
+						i % 3 === 0 ? PaymentStatus.FAILED : PaymentStatus.COMPLETED,
+						`history-${i}`
+					);
+				}
+				for (const [h, direction, status] of theirs) {
+					old(Buffer.from(h, 'hex'), direction, status, h);
+				}
+			});
+		} finally {
+			await first.destroy();
+		}
+		node = await bootNode(tmpDir);
+		expect(node.getNode().pruneCompletedPayments()).to.be.at.least(
+			HISTORY + invoiceHashes.length
+		);
+		for (const h of invoiceHashes) {
+			expect(node.getNode().getPayment(Buffer.from(h, 'hex')), h).to.equal(
+				undefined
+			);
+		}
+	});
+
+	afterEach(() => {
+		sinon.restore();
+	});
+
+	after(async () => {
+		await node?.destroy();
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	const statusOf = (hashHex: string): string | undefined =>
+		node.listInvoices().find((i) => i.paymentHash === hashHex)?.status;
+
+	it('answers what decrypting every row answered, decrypting none', () => {
+		const storage = node.getStorage();
+		const settled = new Set(
+			storage
+				.loadAllPayments()
+				.filter(
+					({ payment }) =>
+						payment.status === PaymentStatus.COMPLETED &&
+						payment.direction === PaymentDirection.INCOMING
+				)
+				.map(({ paymentHash }) => paymentHash)
+		);
+		expect(settled.size, 'history holds other receives').to.be.greaterThan(1);
+
+		// Every payment row read goes through _dec once.
+		const decodes = sinon.spy(
+			storage as unknown as { _dec: (v: string) => string },
+			'_dec'
+		);
+		const listed = node.listInvoices();
+		expect(decodes.callCount).to.equal(0);
+
+		const statuses = new Map(listed.map((i) => [i.paymentHash, i.status]));
+		for (const h of invoiceHashes) {
+			expect(statuses.get(h) === 'PAID', h).to.equal(settled.has(h));
+		}
+		expect(statuses.get(paid)).to.equal('PAID');
+		expect(statuses.get(failedReceive)).to.equal('PENDING');
+		expect(statuses.get(sentOnly)).to.equal('PENDING');
+	});
+
+	it('reads a receive recorded since the last call as PAID on the next', () => {
+		expect(statusOf(failedReceive)).to.equal('PENDING');
+		const storage = node.getStorage();
+		const row = storage.loadPayment(failedReceive)!;
+		storage.savePayment(failedReceive, {
+			...row,
+			status: PaymentStatus.COMPLETED
+		});
+		try {
+			expect(statusOf(failedReceive)).to.equal('PAID');
+		} finally {
+			storage.savePayment(failedReceive, row);
+		}
+		expect(statusOf(failedReceive)).to.equal('PENDING');
 	});
 });
 
@@ -618,7 +752,7 @@ describe('GET /payments, /payment, /invoices and /invoice after the prune (issue
 
 	it('a database read that fails answers 500, never a shorter list or NOT_FOUND', async () => {
 		const storage = daemon.node.getStorage();
-		sinon.stub(storage, 'loadAllPayments').throws(new Error('disk gone'));
+		sinon.stub(storage, 'paymentHashesWith').throws(new Error('disk gone'));
 		sinon.stub(storage, 'paymentsNewestFirst').throws(new Error('disk gone'));
 		sinon.stub(storage, 'loadPayment').throws(new Error('disk gone'));
 		for (const p of [
