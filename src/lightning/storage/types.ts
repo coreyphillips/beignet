@@ -32,6 +32,12 @@ export interface IStorageBackend {
 	close(): void;
 
 	// ─── Channels ───
+	/**
+	 * Persist a channel. Its revokedHtlcSnapshots are ADDED to the ones already
+	 * stored for the channel rather than replacing them: a journal delta
+	 * carries only the snapshots its commit wrote, and the penalty path needs
+	 * every one the channel ever signed. Loading returns the full set.
+	 */
 	saveChannel(id: string, state: IChannelState, peerPubkey: string): void;
 	loadChannel(id: string): { state: IChannelState; peerPubkey: string } | null;
 	loadAllChannels(): Array<{

@@ -172,8 +172,11 @@ function encodeMutation(
 			return {
 				type: mutation.type,
 				channelId: mutation.channelId,
+				// Only the snapshots this commit writes: the snapshot frame and
+				// the deltas before this one carry the rest.
 				state: serializeChannelState(mutation.state, {
-					legacyHtlcHistory: version === 1
+					legacyHtlcHistory: version === 1,
+					htlcHistory: 'unsaved'
 				}),
 				peerPubkey: mutation.peerPubkey
 			};
