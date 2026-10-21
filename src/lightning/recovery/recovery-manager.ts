@@ -11,6 +11,10 @@
  */
 
 import { SUPERSEDES_OWN_KIND_MESSAGE_TYPES } from '../channel/channel-actions';
+import {
+	markRevokedHtlcSnapshotsSaved,
+	unsavedRevokedHtlcSnapshots
+} from '../channel/htlc-snapshots';
 import { IStorageBackend } from '../storage/types';
 import {
 	isStorageTransactionActive,
@@ -124,6 +128,32 @@ export class RecoveryManager {
 			return { committed: false, released: [], error, frameSequence: null };
 		}
 
+		// The HTLC snapshots each channel write adds, which the journal frame
+		// encodes too. Only a transaction this commit owns may mark them saved:
+		// one it joins can still roll back after this returns, while a snapshot
+		// left unmarked is merely written again. With a journal they also wait
+		// for a commit that wrote a frame, since later frames omit them.
+		// withStorageTransaction does not see a raw backend transaction, so
+		// the backend is asked too.
+		const historyWritten =
+			isStorageTransactionActive(this.storage) ||
+			this.storage.inTransaction?.() === true
+				? []
+				: mutations.flatMap((mutation) =>
+						mutation.type === 'channel_state'
+							? [
+									{
+										state: mutation.state,
+										keys: [
+											...(unsavedRevokedHtlcSnapshots(
+												mutation.state,
+												this.storage
+											)?.keys() ?? [])
+										]
+									}
+							  ]
+							: []
+				  );
 		const outboxIds: Array<number | null> = [];
 		let journaled = false;
 		let frameSequence: bigint | null = null;
@@ -202,6 +232,11 @@ export class RecoveryManager {
 		// checkpoint (its in-memory expectations are now durable facts).
 		if (journaled) {
 			this.options.journal?.onCommitCommitted?.();
+		}
+		if (journaled || !this.options.journal) {
+			for (const { state, keys } of historyWritten) {
+				markRevokedHtlcSnapshotsSaved(state, this.storage, keys);
+			}
 		}
 
 		// channel_closed deleted the channel's outbox rows with it (the storage

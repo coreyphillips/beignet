@@ -61,7 +61,11 @@ import {
 	VerifiedRecoveryChain
 } from './types';
 import { createOpenerState, IChannelState } from '../channel/channel-state';
-import { ChannelState, DEFAULT_CHANNEL_CONFIG } from '../channel/types';
+import {
+	ChannelState,
+	DEFAULT_CHANNEL_CONFIG,
+	HtlcDirection
+} from '../channel/types';
 import { MonitorState } from '../chain/types';
 import { PaymentDirection, PaymentStatus } from '../node/types';
 
@@ -212,6 +216,20 @@ function probeChannelState(): IChannelState {
 		localPerCommitmentSeed: Buffer.alloc(32, 9)
 	});
 	state.channelId = Buffer.from(PROBE_CHANNEL_ID, 'hex');
+	// So the replay writes the HTLC snapshot table as well as the row.
+	state.revokedHtlcSnapshots = new Map([
+		[
+			'0',
+			[
+				{
+					paymentHash: Buffer.from(PROBE_HASH, 'hex'),
+					amountMsat: 1_000n,
+					cltvExpiry: 1,
+					direction: HtlcDirection.OFFERED
+				}
+			]
+		]
+	]);
 	return state;
 }
 

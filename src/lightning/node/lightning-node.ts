@@ -20789,8 +20789,10 @@ export class LightningNode extends EventEmitter {
 				};
 				mutations.push(mutation);
 			}
+			// The copy carries only the HTLC snapshots storage lacks, which is
+			// all a save of it writes.
 			mutation.state = deserializeChannelState(
-				serializeChannelState(mutation.state)
+				serializeChannelState(mutation.state, { htlcHistory: 'unsaved' })
 			);
 			const durable = mutation.state.ffor;
 			if (

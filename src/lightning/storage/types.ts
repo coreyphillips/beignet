@@ -32,6 +32,12 @@ export interface IStorageBackend {
 	close(): void;
 
 	// ─── Channels ───
+	/**
+	 * Persist a channel. Its revokedHtlcSnapshots are ADDED to the ones already
+	 * stored for the channel rather than replacing them: a journal delta
+	 * carries only the snapshots its commit wrote, and the penalty path needs
+	 * every one the channel ever signed. Loading returns the full set.
+	 */
 	saveChannel(id: string, state: IChannelState, peerPubkey: string): void;
 	loadChannel(id: string): { state: IChannelState; peerPubkey: string } | null;
 	loadAllChannels(): Array<{
@@ -220,6 +226,8 @@ export interface IStorageBackend {
 
 	// ─── Transaction wrapper ───
 	transaction<T>(fn: () => T): T;
+	/** True while any transaction is open on this backend, however opened. */
+	inTransaction?(): boolean;
 
 	// ─── WAL Checkpoint (optional) ───
 	/** Checkpoint the WAL file, flushing pending writes to the main database. */

@@ -36,12 +36,20 @@ import {
 } from './types';
 import { IWatchtowerSession, IWatchtowerUpdate } from '../watchtower/types';
 import { IChannelState } from '../channel/channel-state';
+import { IHtlcSnapshotEntry } from '../channel/types';
+import {
+	markRevokedHtlcSnapshotsSaved,
+	unsavedRevokedHtlcSnapshots
+} from '../channel/htlc-snapshots';
 import { IPaymentInfo } from '../node/types';
 import { IChainMonitorState } from '../chain/chain-monitor';
 import { IGraphChannel, IGraphNode } from '../gossip/types';
 import {
+	ISerializedChannelState,
 	serializeChannelState,
 	deserializeChannelState,
+	serializeHtlcSnapshotEntries,
+	deserializeHtlcSnapshotEntries,
 	serializePaymentInfo,
 	deserializePaymentInfo,
 	serializeChainMonitorState,
@@ -78,6 +86,12 @@ export interface IStoredPaymentRef {
 	createdAt: number;
 	/** Null when the row is gone or cannot be decoded. */
 	load(): IPaymentInfo | null;
+}
+
+interface IRevokedHtlcSnapshotRow {
+	channel_id: string;
+	commitment_number: string;
+	htlcs_json: string;
 }
 
 /** What paymentsNewestFirst tests a row on besides its age. */
@@ -267,7 +281,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 18;
+	static readonly CURRENT_SCHEMA_VERSION = 19;
 
 	/**
 	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
@@ -288,6 +302,7 @@ export class SqliteStorage implements IStorageBackend {
 		columns: string[];
 	}> = [
 		{ table: 'channels', pk: 'channel_id', columns: ['state_json'] },
+		{ table: 'revoked_htlc_snapshots', pk: 'rowid', columns: ['htlcs_json'] },
 		{ table: 'payments', pk: 'payment_hash', columns: ['payment_json'] },
 		{ table: 'ffor_vouchers', pk: 'id', columns: ['record_json'] },
 		{ table: 'preimages', pk: 'payment_hash', columns: ['preimage'] },
@@ -546,6 +561,16 @@ export class SqliteStorage implements IStorageBackend {
 				peer_pubkey TEXT NOT NULL
 			);
 
+			-- The HTLCs of each remote commitment a channel signed, which a
+			-- penalty needs once they leave the live state. Kept out of the
+			-- channel row, so a save writes only the commitments it adds.
+			CREATE TABLE IF NOT EXISTS revoked_htlc_snapshots (
+				channel_id TEXT NOT NULL,
+				commitment_number TEXT NOT NULL,
+				htlcs_json TEXT NOT NULL,
+				PRIMARY KEY (channel_id, commitment_number)
+			);
+
 			CREATE TABLE IF NOT EXISTS ffor_vouchers (
 				id TEXT PRIMARY KEY,
 				record_json TEXT NOT NULL
@@ -790,13 +815,30 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Channels ───
 
 	saveChannel(id: string, state: IChannelState, peerPubkey: string): void {
-		const serialized = serializeChannelState(state);
-		const json = JSON.stringify(serialized);
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO channels (channel_id, state_json, peer_pubkey) VALUES (?, ?, ?)'
-			)
-			.run(id, this._enc(json), peerPubkey);
+		const json = JSON.stringify(
+			serializeChannelState(state, { htlcHistory: 'none' })
+		);
+		const history = unsavedRevokedHtlcSnapshots(state, this);
+		this.db.transaction(() => {
+			this.db
+				.prepare(
+					'INSERT OR REPLACE INTO channels (channel_id, state_json, peer_pubkey) VALUES (?, ?, ?)'
+				)
+				.run(id, this._enc(json), peerPubkey);
+			if (!history?.size) return;
+			const insert = this.db.prepare(
+				'INSERT OR REPLACE INTO revoked_htlc_snapshots ' +
+					'(channel_id, commitment_number, htlcs_json) VALUES (?, ?, ?)'
+			);
+			for (const [commitmentNumber, entries] of history) {
+				if (entries.length === 0) continue;
+				insert.run(
+					id,
+					commitmentNumber,
+					this._enc(JSON.stringify(serializeHtlcSnapshotEntries(entries)))
+				);
+			}
+		})();
 	}
 
 	loadChannel(id: string): { state: IChannelState; peerPubkey: string } | null {
@@ -806,10 +848,20 @@ export class SqliteStorage implements IStorageBackend {
 			)
 			.get(id) as { state_json: string; peer_pubkey: string } | undefined;
 		if (!row) return null;
-		return {
-			state: deserializeChannelState(JSON.parse(this._dec(row.state_json))),
-			peerPubkey: row.peer_pubkey
-		};
+		const state = deserializeChannelState(
+			JSON.parse(this._dec(row.state_json))
+		);
+		const history = this._readRevokedHtlcSnapshots(
+			this.db
+				.prepare(
+					'SELECT channel_id, commitment_number, htlcs_json ' +
+						'FROM revoked_htlc_snapshots WHERE channel_id = ? ' +
+						'ORDER BY length(commitment_number), commitment_number'
+				)
+				.all(id) as IRevokedHtlcSnapshotRow[]
+		);
+		this._attachRevokedHtlcSnapshots(state, history.get(id));
+		return { state, peerPubkey: row.peer_pubkey };
 	}
 
 	loadAllChannels(): Array<{
@@ -824,6 +876,15 @@ export class SqliteStorage implements IStorageBackend {
 			state_json: string;
 			peer_pubkey: string;
 		}>;
+		const history = this._readRevokedHtlcSnapshots(
+			this.db
+				.prepare(
+					'SELECT channel_id, commitment_number, htlcs_json ' +
+						'FROM revoked_htlc_snapshots ' +
+						'ORDER BY channel_id, length(commitment_number), commitment_number'
+				)
+				.all() as IRevokedHtlcSnapshotRow[]
+		);
 		const results: Array<{
 			channelId: string;
 			state: IChannelState;
@@ -831,9 +892,13 @@ export class SqliteStorage implements IStorageBackend {
 		}> = [];
 		for (const row of rows) {
 			try {
+				const state = deserializeChannelState(
+					JSON.parse(this._dec(row.state_json))
+				);
+				this._attachRevokedHtlcSnapshots(state, history.get(row.channel_id));
 				results.push({
 					channelId: row.channel_id,
-					state: deserializeChannelState(JSON.parse(this._dec(row.state_json))),
+					state,
 					peerPubkey: row.peer_pubkey
 				});
 			} catch (err) {
@@ -844,11 +909,66 @@ export class SqliteStorage implements IStorageBackend {
 		return results;
 	}
 
+	/**
+	 * Decode snapshot rows, grouped by channel. A row that does not decode is
+	 * skipped and counted, as a channel row is, so recovery-critical readers
+	 * refuse rather than carry a history with a hole in it.
+	 */
+	private _readRevokedHtlcSnapshots(
+		rows: IRevokedHtlcSnapshotRow[]
+	): Map<string, Map<string, IHtlcSnapshotEntry[]>> {
+		const byChannel = new Map<string, Map<string, IHtlcSnapshotEntry[]>>();
+		for (const row of rows) {
+			let entries: IHtlcSnapshotEntry[];
+			try {
+				entries = deserializeHtlcSnapshotEntries(
+					JSON.parse(this._dec(row.htlcs_json))
+				);
+			} catch (err) {
+				this.reportCorruptRow(err);
+				continue;
+			}
+			let history = byChannel.get(row.channel_id);
+			if (!history) {
+				history = new Map();
+				byChannel.set(row.channel_id, history);
+			}
+			history.set(row.commitment_number, entries);
+		}
+		return byChannel;
+	}
+
+	/**
+	 * Give a loaded channel its stored snapshots. A row the 18->19 migration
+	 * could not read still carries its own; they are kept, and stay unsaved so
+	 * the channel's next save moves them into the table. Rows read inside an
+	 * open transaction may still roll back, so that state is left untracked
+	 * and its next save writes its whole history.
+	 */
+	private _attachRevokedHtlcSnapshots(
+		state: IChannelState,
+		stored: Map<string, IHtlcSnapshotEntry[]> | undefined
+	): void {
+		let history = stored;
+		if (state.revokedHtlcSnapshots?.size) {
+			history = new Map(stored);
+			for (const [key, entries] of state.revokedHtlcSnapshots) {
+				if (entries.length > 0 && !history.has(key)) history.set(key, entries);
+			}
+		}
+		state.revokedHtlcSnapshots = history?.size ? history : undefined;
+		if (this.db.inTransaction) return;
+		markRevokedHtlcSnapshotsSaved(state, this, stored?.keys() ?? []);
+	}
+
 	deleteChannel(id: string): void {
-		// Drop the channel's retained outbound bytes with it: their only consumer
-		// is reestablish retransmission on a channel that no longer exists.
+		// Drop the channel's retained outbound bytes and HTLC snapshots with
+		// it: retransmission and penalties both need the channel row too.
 		this.db.transaction(() => {
 			this.db.prepare('DELETE FROM channels WHERE channel_id = ?').run(id);
+			this.db
+				.prepare('DELETE FROM revoked_htlc_snapshots WHERE channel_id = ?')
+				.run(id);
 			this.db
 				.prepare('DELETE FROM recovery_outbox WHERE channel_id = ?')
 				.run(id);
@@ -2004,6 +2124,50 @@ export class SqliteStorage implements IStorageBackend {
 				db.exec(
 					'INSERT OR IGNORE INTO encryption_scrub_pending (id) VALUES (1)'
 				);
+			},
+			// Migration 18->19: revoked-commitment HTLC snapshots leave the
+			// channel row for revoked_htlc_snapshots (issue #1670), so a save no
+			// longer rewrites the channel's whole history. A row that cannot be
+			// moved here keeps them: loading still finds them, and the channel's
+			// next save moves them. A plaintext row rewritten under a key leaves
+			// its old bytes in freed pages, so that schedules the scrub.
+			(db): void => {
+				const rows = db
+					.prepare('SELECT channel_id, state_json, peer_pubkey FROM channels')
+					.all() as Array<{
+					channel_id: string;
+					state_json: string;
+					peer_pubkey: string;
+				}>;
+				let scrub = false;
+				for (const row of rows) {
+					try {
+						const serialized = JSON.parse(
+							this._dec(row.state_json)
+						) as ISerializedChannelState;
+						if (
+							serialized.revokedHtlcSnapshots === undefined &&
+							!serialized.compactHtlcHistory?.snapshots?.length
+						) {
+							continue;
+						}
+						this.saveChannel(
+							row.channel_id,
+							deserializeChannelState(serialized),
+							row.peer_pubkey
+						);
+					} catch {
+						continue;
+					}
+					if (this.encryptionKey && !isEncryptedValue(row.state_json)) {
+						scrub = true;
+					}
+				}
+				if (scrub) {
+					db.exec(
+						'INSERT OR IGNORE INTO encryption_scrub_pending (id) VALUES (1)'
+					);
+				}
 			}
 		];
 
@@ -2728,6 +2892,10 @@ export class SqliteStorage implements IStorageBackend {
 
 	transaction<T>(fn: () => T): T {
 		return this.db.transaction(fn)();
+	}
+
+	inTransaction(): boolean {
+		return this.db.inTransaction;
 	}
 
 	// ─── Webhooks (CLI layer persistence) ───

@@ -314,6 +314,8 @@ A snapshot must fit the smallest `maxCiphertextBytes` the guardian set advertise
 
 Concurrent receive channels encode their complete revoked HTLC history using a tuple dictionary and ordered snapshot changes. Frames containing this encoding declare version 2. Whole snapshots declare `2+ffor-vouchers+htlc-history`, and paged snapshots append `+pages`. Older readers reject the frame version before attempting to restore channel data. Version 1 frames retain their original serialization, including after decoding, so their stored hashes remain verifiable. A mixed journal can start with a legacy snapshot and continue with compact channel deltas. The compact flag remains on the channel after the concurrent book retires. Key derivation, AEAD associated data and the encrypted transport envelope remain unchanged. Direct database downgrade to binaries predating this format is unsupported.
 
+A channel state in a delta frame carries only the revoked HTLC snapshots its commit added, and a reader adds them to the ones it already holds. Frames with a channel state declare version 3 for this, since older readers would replace the history with the delta. Snapshot frames still carry the whole history.
+
 New tables: `recovery_frames(sequence PRIMARY KEY, writer_epoch, frame_hash, previous_hash, ciphertext, created_at)` and `recovery_meta(key, value)` for the current epoch, tip hash, and snapshot sequence.
 
 Deterministic reconstruction: `reconstructFromFrames(snapshot, deltas)` rebuilds every safety-critical table byte-identically. This must be property-tested (section 10).

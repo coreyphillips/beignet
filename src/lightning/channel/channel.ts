@@ -115,6 +115,7 @@ import {
 	RecoveryCloseReason,
 	ChannelCloseReason
 } from './channel-state';
+import { recordRevokedHtlcSnapshot } from './htlc-snapshots';
 import { ChannelRecoveryStatus } from '../recovery/channel-status';
 import {
 	deriveChannelId,
@@ -4794,7 +4795,8 @@ export class Channel {
 	/**
 	 * Record which HTLCs are present in a given remote commitment so the penalty
 	 * path can reconstruct their outputs after they settle. Only HTLCs that
-	 * actually appear in the commitment (PENDING/COMMITTED) are captured.
+	 * actually appear in the commitment (PENDING/COMMITTED) are captured, and a
+	 * commitment without any records nothing.
 	 */
 	private _snapshotRemoteCommitmentHtlcs(commitmentNumber: bigint): void {
 		const entries: IHtlcSnapshotEntry[] = [];
@@ -4813,10 +4815,11 @@ export class Channel {
 				});
 			}
 		}
-		if (!this._state.revokedHtlcSnapshots) {
-			this._state.revokedHtlcSnapshots = new Map();
-		}
-		this._state.revokedHtlcSnapshots.set(commitmentNumber.toString(), entries);
+		recordRevokedHtlcSnapshot(
+			this._state,
+			commitmentNumber.toString(),
+			entries
+		);
 	}
 
 	/**
