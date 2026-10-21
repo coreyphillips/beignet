@@ -52,7 +52,7 @@ export interface IChainMonitorState {
 	commitmentBroadcast: ICommitmentBroadcast | null;
 	trackedOutputs: ITrackedOutput[];
 	currentBlockHeight: number;
-	/** Persisted preimages for HTLC claims (paymentHashHex → preimageHex) */
+	/** Preimages of this channel's HTLCs (paymentHashHex → preimageHex) */
 	knownPreimages?: Record<string, string>;
 }
 
@@ -1697,10 +1697,74 @@ export class ChainMonitor {
 	}
 
 	/**
+	 * Whether a preimage for `paymentHash` is any use to this monitor: the
+	 * hash is one of this channel's HTLCs and the close is not fully resolved.
+	 * addPreimage ignores every other preimage, so a caller offering each
+	 * learned preimage to every monitor can skip, and need not save, the
+	 * monitors this answers false for.
+	 */
+	wantsPreimage(paymentHash: Buffer): boolean {
+		if (this._state === MonitorState.FULLY_RESOLVED) return false;
+		for (const hash of this._ownPaymentHashes()) {
+			if (hash.equals(paymentHash)) return true;
+		}
+		return false;
+	}
+
+	/** Hex payment hashes wantsPreimage answers true for. */
+	getWantedPaymentHashes(): Set<string> {
+		const wanted = new Set<string>();
+		if (this._state === MonitorState.FULLY_RESOLVED) return wanted;
+		for (const hash of this._ownPaymentHashes()) {
+			wanted.add(hash.toString('hex'));
+		}
+		return wanted;
+	}
+
+	/**
+	 * Drop the preimages of other channels' HTLCs that `heldElsewhere` holds
+	 * too, as monitors saved by earlier versions hold every preimage the node
+	 * had learned. This channel's own are kept even once fully resolved, since
+	 * a reorg can reopen its claims. Returns how many were dropped.
+	 */
+	dropUnusedPreimages(heldElsewhere: ReadonlyMap<string, Buffer>): number {
+		const own = new Set<string>();
+		for (const hash of this._ownPaymentHashes()) own.add(hash.toString('hex'));
+		let dropped = 0;
+		for (const [hashHex, preimage] of this._knownPreimages) {
+			if (own.has(hashHex) || !heldElsewhere.get(hashHex)?.equals(preimage)) {
+				continue;
+			}
+			this._knownPreimages.delete(hashHex);
+			dropped++;
+		}
+		return dropped;
+	}
+
+	/**
+	 * Payment hashes of the HTLCs this channel's commitments can carry: the
+	 * tracked outputs, the channel's HTLC entries, and the received removals
+	 * our commitment still holds. A claim that needs a preimage is only ever
+	 * built for an output attributed from one of these.
+	 */
+	private *_ownPaymentHashes(): Generator<Buffer> {
+		for (const output of this._trackedOutputs) {
+			if (output.paymentHash) yield output.paymentHash;
+		}
+		for (const htlc of this._channelState.htlcs.values()) {
+			yield htlc.paymentHash;
+		}
+		for (const htlc of this._channelState.signedLocalRemovals ?? []) {
+			yield htlc.paymentHash;
+		}
+	}
+
+	/**
 	 * Add a preimage for an HTLC, enabling resolution of previously
-	 * unclaimable outputs.
+	 * unclaimable outputs. A preimage wantsPreimage refuses is not stored.
 	 */
 	addPreimage(paymentHash: Buffer, preimage: Buffer): ChainAction[] {
+		if (!this.wantsPreimage(paymentHash)) return [];
 		this._knownPreimages.set(paymentHash.toString('hex'), preimage);
 
 		const actions: ChainAction[] = [];
