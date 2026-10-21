@@ -39,6 +39,16 @@ export interface IStorageBackend {
 	 * every one the channel ever signed. Loading returns the full set.
 	 */
 	saveChannel(id: string, state: IChannelState, peerPubkey: string): void;
+	/**
+	 * The object saveChannel and the channel loaders record saved HTLC
+	 * snapshots against (htlc-snapshots.ts). A caller that records them
+	 * itself, as RecoveryManager does, has to use the same one, or each of
+	 * its saves looks like a first save into another store and rewrites the
+	 * whole history. That happens when the caller holds a wrapper whose
+	 * methods run on the backend underneath. Without this method the
+	 * backend is its own identity.
+	 */
+	revokedHtlcSnapshotStore?(): object;
 	loadChannel(id: string): { state: IChannelState; peerPubkey: string } | null;
 	loadAllChannels(): Array<{
 		channelId: string;

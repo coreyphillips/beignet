@@ -8,11 +8,25 @@
  */
 
 import { expect } from 'chai';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import Database from 'better-sqlite3';
+import { BeignetNode } from '../../src/cli/beignet-node';
 import { nodeStorageView } from '../../src/cli/node-storage-view';
+import { decodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
+import { MessageType } from '../../src/lightning/message/types';
+import {
+	RecoveryCriticality,
+	RecoveryManager
+} from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import {
+	exchangeCommitments,
+	findSendAction,
+	setupNormalChannels
+} from '../lightning/helpers/revoked-commitment-fixture';
 
 const CLOSED = 'The database connection is not open';
 
@@ -116,5 +130,88 @@ describe('nodeStorageView (issue #958)', () => {
 		expect(() => view.close()).to.not.throw();
 		expect(isOpen(storage)).to.equal(true);
 		expect(() => view.saveMetadata('k', 'v')).to.throw(TypeError, CLOSED);
+	});
+
+	it('names the instance as the store HTLC snapshots are saved to', () => {
+		expect(nodeStorageView(storage).revokedHtlcSnapshotStore()).to.equal(
+			storage
+		);
+	});
+});
+
+describe('HTLC snapshots saved by a BeignetNode (issue #1777)', function () {
+	this.timeout(60_000);
+
+	it('each channel save writes only the snapshot it adds', async () => {
+		const dataDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), 'beignet-node-view-htlc-')
+		);
+		const node = await BeignetNode.create({
+			network: 'regtest',
+			dataDir,
+			logLevel: 'silent',
+			autoGossipSync: false,
+			rapidGossipSync: false,
+			electrumHost: '127.0.0.1',
+			electrumPort: 65529,
+			electrumTls: false
+		});
+		try {
+			const recovery = (
+				node.getNode() as unknown as { recovery: RecoveryManager }
+			).recovery;
+			const db = (node as unknown as { storage: { db: Database.Database } })
+				.storage.db;
+			db.exec(`
+				CREATE TEMP TABLE snapshot_writes (n INTEGER);
+				CREATE TEMP TRIGGER count_snapshot_writes
+					AFTER INSERT ON main.revoked_htlc_snapshots
+					BEGIN INSERT INTO snapshot_writes VALUES (1); END;
+			`);
+			const writes = (): number =>
+				(
+					db.prepare('SELECT COUNT(*) AS n FROM snapshot_writes').get() as {
+						n: number;
+					}
+				).n;
+
+			const { opener, acceptor } = setupNormalChannels();
+			const channelId = opener.getChannelId()!.toString('hex');
+			const add = findSendAction(
+				opener.addHtlc(
+					10_000_000n,
+					crypto.randomBytes(32),
+					500,
+					Buffer.alloc(1366)
+				),
+				MessageType.UPDATE_ADD_HTLC
+			);
+			acceptor.handleUpdateAddHtlc(decodeUpdateAddHtlcMessage(add.payload));
+			const save = (): void => {
+				const result = recovery.commit({
+					criticality: RecoveryCriticality.SafetyCritical,
+					mutations: [
+						{
+							type: 'channel_state',
+							channelId,
+							state: opener.getFullState(),
+							peerPubkey: '02'.padEnd(66, '1')
+						}
+					],
+					outboundMessages: []
+				});
+				expect(result.committed).to.equal(true);
+			};
+			save();
+			for (let i = 0; i < 5; i++) {
+				exchangeCommitments(opener, acceptor);
+				const before = writes();
+				save();
+				expect(writes() - before).to.equal(1);
+			}
+		} finally {
+			await node.destroy();
+			fs.rmSync(dataDir, { recursive: true, force: true });
+		}
 	});
 });

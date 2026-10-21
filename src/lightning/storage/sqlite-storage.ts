@@ -916,6 +916,12 @@ export class SqliteStorage implements IStorageBackend {
 		})();
 	}
 
+	revokedHtlcSnapshotStore(): object {
+		// Through a wrapper such as the CLI's node storage view this still
+		// returns the instance, which is what saveChannel marks against.
+		return this;
+	}
+
 	loadChannel(id: string): { state: IChannelState; peerPubkey: string } | null {
 		const row = this.db
 			.prepare(
