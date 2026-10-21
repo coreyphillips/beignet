@@ -930,13 +930,15 @@ describe('Gossip intake queue (LightningNode)', () => {
 
 	it('the event loop keeps ticking while a dump drains', async () => {
 		// The tick floor below only exists when intake verifies (issue #437's
-		// contract); the lazy default admits a 40-message dump in one slice.
+		// contract); the lazy default admits this dump in one slice. The dump
+		// is sized for verification alone: a slice commits its rows once, so
+		// no per-message fsync stretches the drain.
 		// destroy() closes the storage handle, so build a fresh one.
 		node.destroy();
 		storage = new SqliteStorage(dbPath);
 		storage.open();
 		node = new LightningNode(makeConfig(true));
-		for (let i = 0; i < 40; i++) {
+		for (let i = 0; i < 200; i++) {
 			const ann = buildAnnouncement(400 + i, REGTEST_CHAIN_HASH);
 			feed(MessageType.CHANNEL_ANNOUNCEMENT, ann.payload);
 		}
@@ -950,8 +952,8 @@ describe('Gossip intake queue (LightningNode)', () => {
 		setImmediate(tick);
 		await node.flushGossip();
 		counting = false;
-		expect(graphOf(node).getChannelCount()).to.equal(40);
-		// 160 pure-JS signature verifications cannot have run in one slice;
+		expect(graphOf(node).getChannelCount()).to.equal(200);
+		// 800 pure-JS signature verifications cannot have run in one slice;
 		// the loop must have turned between slices.
 		expect(ticks).to.be.at.least(5);
 	});
@@ -1663,6 +1665,140 @@ describe('Gossip intake queue (LightningNode)', () => {
 			node.handleNewBlock(1011);
 			await settleFundingChecks();
 			expect(channel.fundingVerified).to.equal(true);
+		});
+	});
+
+	describe('storage commits (issue #1673)', () => {
+		/** Count backend transactions, and gossip channel saves made outside one. */
+		const countCommits = (): {
+			transactions: number;
+			saves: number;
+			savesOutside: number;
+		} => {
+			const counts = { transactions: 0, saves: 0, savesOutside: 0 };
+			let inTransaction = false;
+			const transaction = storage.transaction.bind(storage);
+			storage.transaction = <T>(fn: () => T): T => {
+				counts.transactions++;
+				inTransaction = true;
+				try {
+					return transaction(fn);
+				} finally {
+					inTransaction = false;
+				}
+			};
+			const save = storage.saveGossipChannel.bind(storage);
+			storage.saveGossipChannel = (scidHex, channel): void => {
+				counts.saves++;
+				if (!inTransaction) counts.savesOutside++;
+				save(scidHex, channel);
+			};
+			return counts;
+		};
+
+		it('accepted gossip commits once per drain slice, not once per message', async () => {
+			// Lazy intake checks no signature, so unsigned messages are
+			// accepted and the test pays only for the intake itself.
+			const MESSAGES = 2000;
+			const { key1, key2 } = makeOrderedKeypairs();
+			const timestamp = Math.floor(Date.now() / 1000) - 60;
+			const scids = Array.from({ length: MESSAGES }, (_, i) =>
+				encodeShortChannelId({ block: 1000 + i, txIndex: 1, outputIndex: 0 })
+			);
+			for (const shortChannelId of scids) {
+				feed(
+					MessageType.CHANNEL_ANNOUNCEMENT,
+					encodeChannelAnnouncementMessage({
+						nodeSignature1: Buffer.alloc(64),
+						nodeSignature2: Buffer.alloc(64),
+						bitcoinSignature1: Buffer.alloc(64),
+						bitcoinSignature2: Buffer.alloc(64),
+						features: Buffer.alloc(0),
+						chainHash: REGTEST_CHAIN_HASH,
+						shortChannelId,
+						nodeId1: key1.publicKey,
+						nodeId2: key2.publicKey,
+						bitcoinKey1: key1.publicKey,
+						bitcoinKey2: key2.publicKey
+					})
+				);
+			}
+			await node.flushGossip();
+
+			const counts = countCommits();
+			const internals = node as unknown as { drainGossipIntake(): void };
+			const drain = internals.drainGossipIntake.bind(node);
+			let slices = 0;
+			internals.drainGossipIntake = (): void => {
+				slices++;
+				drain();
+			};
+			for (const shortChannelId of scids) {
+				feed(
+					MessageType.CHANNEL_UPDATE,
+					encodeChannelUpdateMessage({
+						signature: Buffer.alloc(64),
+						chainHash: REGTEST_CHAIN_HASH,
+						shortChannelId,
+						timestamp,
+						messageFlags: 1,
+						channelFlags: 0,
+						cltvExpiryDelta: 40,
+						htlcMinimumMsat: 1000n,
+						feeBaseMsat: 1000,
+						feeProportionalMillionths: 100,
+						htlcMaximumMsat: 100_000_000n
+					})
+				);
+			}
+			await node.flushGossip();
+
+			expect(counts.saves).to.equal(MESSAGES);
+			expect(counts.savesOutside).to.equal(0);
+			expect(counts.transactions).to.be.at.least(1).and.at.most(slices);
+			const rows = storage.loadAllGossipChannels();
+			expect(rows).to.have.length(MESSAGES);
+			expect(
+				rows.every((row) => row.update1?.timestamp === timestamp)
+			).to.equal(true);
+		});
+
+		it('a row saved and evicted in the same slice stays deleted', async () => {
+			// One slice takes both announcements, so the eviction's delete and
+			// the evicted row's save are in the same commit.
+			const statics = LightningNode as unknown as {
+				GOSSIP_INTAKE_SLICE_MS: number;
+			};
+			const savedSlice = statics.GOSSIP_INTAKE_SLICE_MS;
+			const savedCap = NetworkGraph.MAX_CHANNELS;
+			statics.GOSSIP_INTAKE_SLICE_MS = 60_000;
+			try {
+				// Eager, so the second announcement is verified and may evict.
+				node.destroy();
+				storage = new SqliteStorage(dbPath);
+				storage.open();
+				node = new LightningNode(makeConfig(true));
+				NetworkGraph.MAX_CHANNELS = 1;
+				const counts = countCommits();
+				const evicted = buildAnnouncement(1100, REGTEST_CHAIN_HASH);
+				const admitted = buildAnnouncement(1101, REGTEST_CHAIN_HASH);
+				feed(MessageType.CHANNEL_ANNOUNCEMENT, evicted.payload);
+				feed(MessageType.CHANNEL_ANNOUNCEMENT, admitted.payload);
+				await node.flushGossip();
+
+				expect(graphOf(node).getChannel(evicted.msg.shortChannelId)).to.equal(
+					undefined
+				);
+				expect(counts.transactions).to.equal(1);
+				expect(
+					storage
+						.loadAllGossipChannels()
+						.map((row) => row.shortChannelId.toString('hex'))
+				).to.deep.equal([admitted.msg.shortChannelId.toString('hex')]);
+			} finally {
+				statics.GOSSIP_INTAKE_SLICE_MS = savedSlice;
+				NetworkGraph.MAX_CHANNELS = savedCap;
+			}
 		});
 	});
 });

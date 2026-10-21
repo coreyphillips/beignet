@@ -52,7 +52,7 @@ export class GossipGraphRestore {
 	/**
 	 * Every row the restore condemned, to delete together once it is done.
 	 * One at a time is the same fsync storm as the hourly prune (see
-	 * batchStorageDeletes), and it runs before the daemon can listen, so it
+	 * batchStorageWrites), and it runs before the daemon can listen, so it
 	 * surfaces as a node that takes minutes to start rather than as a node
 	 * that stalls.
 	 */
