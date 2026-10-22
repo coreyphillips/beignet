@@ -7565,10 +7565,10 @@ describe('Splice', function () {
 
 			const openerErrors: string[] = [];
 			const acceptorErrors: string[] = [];
-			openerManager.on('error', (_id: Buffer, message: string) => {
+			openerManager.on('error', (_id: Buffer | null, message: string) => {
 				openerErrors.push(message);
 			});
-			acceptorManager.on('error', (_id: Buffer, message: string) => {
+			acceptorManager.on('error', (_id: Buffer | null, message: string) => {
 				acceptorErrors.push(message);
 			});
 
@@ -7793,8 +7793,12 @@ describe('Splice', function () {
 
 			const errors: string[] = [];
 			openerManager.on('channel:error' as never, (() => {}) as never);
-			openerManager.on('error', (_id: Buffer, m: string) => errors.push(m));
-			acceptorManager.on('error', (_id: Buffer, m: string) => errors.push(m));
+			openerManager.on('error', (_id: Buffer | null, m: string) =>
+				errors.push(m)
+			);
+			acceptorManager.on('error', (_id: Buffer | null, m: string) =>
+				errors.push(m)
+			);
 
 			const openerCommitBefore =
 				openerChannel.getFullState().localCommitmentNumber;
@@ -8962,7 +8966,7 @@ describe('Splice', function () {
 				'transition:terminal-override',
 				'transition:begin',
 				'transition:end'
-			]) {
+			] as const) {
 				const pair = pendingLockPair();
 				parkABatch(pair);
 				const broadcasts: Buffer[] = [];
@@ -9734,7 +9738,9 @@ describe('Splice', function () {
 				if (pk === openerPubkey) sent.push({ type, payload });
 			});
 			const errors: string[] = [];
-			acceptorManager.on('error', (_id: Buffer, m: string) => errors.push(m));
+			acceptorManager.on('error', (_id: Buffer | null, m: string) =>
+				errors.push(m)
+			);
 			const spliceTxidBefore = Buffer.from(
 				acceptorChannel.getFullState().spliceInFlight!.spliceTxid
 			);

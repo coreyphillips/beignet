@@ -143,9 +143,6 @@ describe('Interop chaos: CLN splice tx_signatures crash-resume (regtest)', funct
 		n.on('node:error', () => {
 			/* absorb */
 		});
-		n.on('error', () => {
-			/* absorb */
-		});
 		return n;
 	};
 

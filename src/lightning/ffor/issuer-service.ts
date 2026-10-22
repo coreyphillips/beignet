@@ -58,6 +58,24 @@ export interface IFforIssuerConfig {
 	enabled: boolean;
 }
 
+/** The delegated BOLT 12 issuer's events (section 9.7), relayed by LightningNode. */
+export interface FforIssuerEvents {
+	/** Issuer role: a receiver delegated an offer and provisioned its slots. */
+	'ffor:issuer-provisioned': (data: {
+		mailboxId: Buffer;
+		offerId: Buffer;
+		slots: number;
+	}) => void;
+	/** Issuer role: an invoice was issued against slot `k` to a payer. */
+	'ffor:issuer-issued': (data: {
+		mailboxId: Buffer;
+		k: number;
+		payerId: Buffer;
+	}) => void;
+	/** Issuer role: a delegated offer stopped issuing, with the reason. */
+	'ffor:issuer-retired': (data: { mailboxId: Buffer; reason: string }) => void;
+}
+
 export interface IFforIssuerDeps {
 	ledger: FforIssuerLedger;
 	witnessLedger: FforWitnessLedger;
@@ -66,7 +84,10 @@ export interface IFforIssuerDeps {
 	currentHeight: () => number;
 	send: (peer: string, type: number, payload: Buffer) => void;
 	log: (action: string, data: Record<string, unknown>) => void;
-	emit: (event: string, data: unknown) => void;
+	emit: <K extends keyof FforIssuerEvents>(
+		event: K,
+		...args: Parameters<FforIssuerEvents[K]>
+	) => void;
 	offers: {
 		registerDelegatedOffer(offer: IOffer, policy: IssuancePolicy): string;
 		unregisterDelegatedOffer(offerIdHex: string): void;

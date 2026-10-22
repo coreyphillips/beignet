@@ -475,7 +475,6 @@ export function createChaosNode(
 	options: IChaosNodeOptions = {}
 ): LightningNode {
 	const node = new LightningNode(makeChaosNodeConfig(seedId, options));
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }
@@ -843,10 +842,10 @@ function watchBroadcasts(
 	into: Array<{ when: 'alive' | 'dead' | 'restored'; txHex: string }>,
 	restored: boolean
 ): void {
-	node.on('broadcast:tx', (txHex: string) => {
+	node.on('broadcast:tx', (tx: Buffer) => {
 		into.push({
 			when: restored ? 'restored' : kill.killed ? 'dead' : 'alive',
-			txHex
+			txHex: tx.toString('hex')
 		});
 	});
 }

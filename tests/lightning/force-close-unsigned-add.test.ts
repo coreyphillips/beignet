@@ -99,7 +99,6 @@ function makeNodeConfig(seedId: number, taproot = false): INodeConfig {
 
 function createNode(seedId: number, taproot = false): LightningNode {
 	const node = new LightningNode(makeNodeConfig(seedId, taproot));
-	node.on('error', () => {});
 	return node;
 }
 

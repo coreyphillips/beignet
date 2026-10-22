@@ -130,7 +130,6 @@ describe('Issue #177: forwarding failures carry their BOLT 4 data', function () 
 			failHtlcCalls.push({ reason });
 			return { ok: true };
 		};
-		node.on('error', () => {});
 	});
 
 	afterEach(function () {

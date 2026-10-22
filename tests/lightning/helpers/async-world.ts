@@ -117,7 +117,6 @@ export function createNode(
 	extra: Partial<INodeConfig> = {}
 ): LightningNode {
 	const node = new LightningNode(makeNodeConfig(seedId, storage, extra));
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

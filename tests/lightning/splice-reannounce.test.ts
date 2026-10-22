@@ -742,7 +742,6 @@ describe('Post-splice channel re-announcement', function () {
 				network: Network.REGTEST,
 				chainBackend: backend
 			});
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 
 			const { opener } = setupNormalChannels();
@@ -924,7 +923,6 @@ describe('Post-splice channel re-announcement', function () {
 				network: Network.REGTEST,
 				chainBackend: backend
 			});
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 
 			const { opener } = setupNormalChannels();

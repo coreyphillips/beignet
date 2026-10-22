@@ -132,7 +132,6 @@ function makeNodeConfig(seedId: number): INodeConfig {
 
 function createNode(seedId: number): LightningNode {
 	const node = new LightningNode(makeNodeConfig(seedId));
-	node.on('error', () => {});
 	return node;
 }
 
@@ -307,7 +306,6 @@ describe('Production Hardening', () => {
 				network: Network.REGTEST,
 				coinType: LnCoinType.REGTEST
 			});
-			node.on('error', () => {});
 
 			const cm = node.getChannelManager();
 			expect(cm).to.not.be.null;
@@ -346,7 +344,6 @@ describe('Production Hardening', () => {
 			};
 
 			const node = new LightningNode(config);
-			node.on('error', () => {});
 			expect(node.getNodeId()).to.be.a('string');
 			node.destroy();
 		});
@@ -361,7 +358,6 @@ describe('Production Hardening', () => {
 			config.chainBackend = backend;
 
 			const node = new LightningNode(config);
-			node.on('error', () => {});
 
 			const watcher = node.getChainWatcher();
 			expect(watcher).to.not.be.null;
@@ -420,7 +416,6 @@ describe('Production Hardening', () => {
 				coinType: LnCoinType.REGTEST,
 				chainBackend: backend
 			});
-			node.on('error', () => {});
 
 			expect(node.getChainWatcher()).to.not.be.null;
 			node.destroy();
@@ -446,7 +441,6 @@ describe('Production Hardening', () => {
 				coinType: LnCoinType.REGTEST,
 				chainBackend: backend
 			});
-			node.on('error', () => {});
 
 			await node.startChainWatcher();
 			expect(headerCallbackCalled).to.be.true;
@@ -464,7 +458,6 @@ describe('Production Hardening', () => {
 				coinType: LnCoinType.REGTEST,
 				chainBackend: backend
 			});
-			node.on('error', () => {});
 
 			await node.restoreChainWatches();
 			node.destroy();
@@ -807,7 +800,6 @@ describe('Production Hardening', () => {
 			config.enableNetworking = true;
 
 			const node = new LightningNode(config);
-			node.on('error', () => {});
 			node.destroy();
 		});
 
@@ -817,7 +809,6 @@ describe('Production Hardening', () => {
 			config.enableNetworking = true;
 
 			const node = new LightningNode(config);
-			node.on('error', () => {});
 			node.destroy();
 		});
 
@@ -828,7 +819,6 @@ describe('Production Hardening', () => {
 			config.enableNetworking = true;
 
 			const node = new LightningNode(config);
-			node.on('error', () => {});
 			node.destroy();
 			// Second destroy should be safe
 			node.destroy();

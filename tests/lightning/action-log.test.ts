@@ -339,7 +339,6 @@ describe('Action Log', () => {
 
 	it('emitStructuredLog persists to storage via LightningNode', () => {
 		const node = new LightningNode(makeNodeConfig(1, storage));
-		node.on('error', () => {}); // prevent uncaught
 
 		// First confirm the log is empty (or count initial entries)
 		const logsBefore = node.getActionLog();
@@ -368,7 +367,6 @@ describe('Action Log', () => {
 
 	it('getActionLog returns parsed entries with data objects', () => {
 		const node = new LightningNode(makeNodeConfig(2, storage));
-		node.on('error', () => {}); // prevent uncaught
 
 		// Insert structured data into storage
 		storage.saveActionLog!({

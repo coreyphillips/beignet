@@ -616,7 +616,6 @@ function createNode(
 	recovery = false
 ): LightningNode {
 	const node = new LightningNode(makeNodeConfig(seedId, storage, recovery));
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

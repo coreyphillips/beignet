@@ -859,7 +859,6 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 			enableNetworking: true,
 			autoReconnect: true
 		});
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 		// The constructor's dial pass selected the recovery-close channel's
 		// peer: a reconnect timer is armed for it.

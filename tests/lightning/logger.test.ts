@@ -249,7 +249,6 @@ describe('LightningNode logger injection', () => {
 	it('mirrors structured action log entries to logger.debug', () => {
 		const { calls, logger } = makeLogger();
 		const node = new LightningNode(makeNodeConfig(1, logger));
-		node.on('error', () => {}); // absorb node error events
 
 		(
 			node as unknown as { emitStructuredLog: TEmitStructuredLog }
@@ -268,7 +267,6 @@ describe('LightningNode logger injection', () => {
 
 	it('defaults to a silent no-op logger (no throw, no output)', () => {
 		const node = new LightningNode(makeNodeConfig(2));
-		node.on('error', () => {}); // absorb node error events
 
 		expect(() => {
 			(

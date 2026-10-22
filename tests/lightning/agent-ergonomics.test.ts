@@ -79,7 +79,6 @@ function createTestNode(storage?: IStorageBackend): LightningNode {
 		network: Network.REGTEST,
 		storage
 	});
-	node.on('error', () => {});
 	return node;
 }
 
@@ -549,7 +548,6 @@ describe('Phase 4: Agent Ergonomics', () => {
 				fundingPrivkey,
 				network: Network.REGTEST
 			});
-			node.on('error', () => {});
 
 			// Create a channel in NORMAL state and inject it into the channelManager
 			const channelId = crypto.randomBytes(32);
@@ -672,7 +670,6 @@ describe('Phase 4: Agent Ergonomics', () => {
 				network: Network.REGTEST,
 				storage
 			});
-			node1.on('error', () => {});
 
 			node1.createInvoice({
 				description: 'persistent-invoice',
@@ -693,7 +690,6 @@ describe('Phase 4: Agent Ergonomics', () => {
 				network: Network.REGTEST,
 				storage
 			});
-			node2.on('error', () => {});
 
 			const invoicesAfter = node2.listInvoices();
 			expect(invoicesAfter).to.have.length(1);

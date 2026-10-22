@@ -45,7 +45,6 @@ function makeNode(
 		localFeatures: LightningNode.defaultFeatures(),
 		...extra
 	});
-	node.on('error', () => {});
 	return node;
 }
 
@@ -496,7 +495,6 @@ describe('Issue #158: openChannel routes v1 vs v2 by peer features', function ()
 			localFeatures: LightningNode.defaultFeatures(),
 			preferTaproot: true
 		});
-		taprootNode.on('error', () => {});
 		expect(() =>
 			taprootNode.openChannelV2(peerPubkey, { fundingSatoshis: 100_000n })
 		).to.throw(/does not advertise option_dual_fund/);
@@ -562,7 +560,6 @@ describe('Issue #158: openChannel routes v1 vs v2 by peer features', function ()
 			fundingPrivkey: crypto.randomBytes(32),
 			localFeatures: flags
 		});
-		bare.on('error', () => {});
 		const saved = node;
 		node = bare; // reuse wirePeer/afterEach against this node
 		wirePeer(true);

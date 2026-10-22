@@ -185,6 +185,24 @@ export interface IDfReceiverConfig {
 	allowZeroConf?: boolean;
 }
 
+// ─────────────── Events ───────────────
+
+/** What the receiver reports about each payer's offer (issue #669). */
+export interface DirectFundingReceiverEvents {
+	/** The offer was accepted. `paired` says whether it came from a peer in the trusted set, which decides zero-conf and the splice path; `resumed` marks one picked up again after a restart. */
+	'offer:accepted': (data: {
+		offerId: string;
+		paired: boolean;
+		resumed?: boolean;
+	}) => void;
+	/** The offer was declined with the reason. */
+	'offer:declined': (data: { offerId: string; reason: string }) => void;
+	/** An accepted offer failed with the reason. */
+	'offer:failed': (data: { offerId: string; reason: string }) => void;
+	/** The offer completed with the funding out. */
+	'offer:completed': (data: { offerId: string }) => void;
+}
+
 // ─────────────── Node surface ───────────────
 
 /**

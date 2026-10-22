@@ -125,7 +125,6 @@ function nodePair(
 	});
 	const bob = new LightningNode(makeNodeConfig(2));
 	for (const n of [alice, bob]) {
-		n.on('error', () => {});
 		n.on('node:error', () => {});
 	}
 	alice.on('message:outbound', (pk: string, t: number, p: Buffer) => {

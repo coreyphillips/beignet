@@ -35,7 +35,7 @@
  * race a client already claiming).
  */
 
-import { EventEmitter } from 'events';
+import { TypedEmitter } from '../../utils/typed-emitter';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import { getPublicKey } from '../crypto/ecdh';
@@ -69,6 +69,7 @@ import {
 	validateSwapExposurePolicy
 } from './exposure';
 import {
+	ISwapEvent,
 	SWAP_DUST_FLOOR_SAT,
 	exposureRefusal,
 	htlcOfRecord as htlcOf,
@@ -295,6 +296,10 @@ export const REVERSE_SWAP_EVENTS: readonly SwapEventName[] = [
 	'swap:failed'
 ];
 
+export type ReverseSwapEvents = {
+	[K in SwapEventName]: (event: ISwapEvent) => void;
+};
+
 const CLAIMABLE_STATES: readonly SwapState[] = [
 	'FUNDING_BROADCAST',
 	'FUNDED',
@@ -333,7 +338,7 @@ function owesHoldCancel(record: ISwapRecord): boolean {
 	);
 }
 
-export class ReverseSwapProvider extends EventEmitter {
+export class ReverseSwapProvider extends TypedEmitter<ReverseSwapEvents> {
 	readonly config: IReverseSwapProviderConfig;
 	private readonly unsubscribe: Array<() => void> = [];
 	private readonly requestBudget: PeerRateLimiter;

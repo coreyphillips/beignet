@@ -81,7 +81,6 @@ function createTestNode(
 		...(localFeatures ? { localFeatures } : {}),
 		...(directFunding ? { directFunding } : {})
 	});
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

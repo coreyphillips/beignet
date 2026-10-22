@@ -321,9 +321,6 @@ describe('Interop chaos: LND taproot stale-copy DLP (regtest)', function () {
 		n.on('node:error', () => {
 			/* absorb */
 		});
-		n.on('error', () => {
-			/* absorb */
-		});
 		return n;
 	};
 

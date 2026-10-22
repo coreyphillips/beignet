@@ -171,9 +171,6 @@ describe('Interop chaos: LND taproot crash-resume (regtest)', function () {
 		n.on('node:error', () => {
 			/* absorb */
 		});
-		n.on('error', () => {
-			/* absorb */
-		});
 		return n;
 	};
 

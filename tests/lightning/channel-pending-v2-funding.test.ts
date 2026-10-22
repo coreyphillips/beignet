@@ -399,7 +399,6 @@ function nodeHolding(acceptor: Channel, barrier?: unknown): LightningNode {
 		fundingPrivkey: crypto.randomBytes(32),
 		network: Network.REGTEST
 	});
-	node.on('error', () => undefined);
 	node.on('node:error', () => undefined);
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const internals = (node as any).channelManager;

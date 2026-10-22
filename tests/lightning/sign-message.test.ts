@@ -171,7 +171,6 @@ describe('Message Signing (LND-compatible)', function () {
 	describe('LightningNode.signMessage / verifyMessage', function () {
 		it('signs with the node identity key and reports graph knowledge', function () {
 			const node = makeNode(1);
-			node.on('error', () => {});
 			const signature = node.signMessage('node level message');
 
 			const result = node.verifyMessage('node level message', signature);
@@ -184,8 +183,6 @@ describe('Message Signing (LND-compatible)', function () {
 		it('two nodes verify each other', function () {
 			const alice = makeNode(2);
 			const bob = makeNode(3);
-			alice.on('error', () => {});
-			bob.on('error', () => {});
 			const sig = alice.signMessage('cross check');
 			const result = bob.verifyMessage('cross check', sig);
 			expect(result.valid).to.be.true;

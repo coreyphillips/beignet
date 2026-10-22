@@ -1100,10 +1100,10 @@ function racePair(seed: number): IRacePair {
 		wireErrors: 0,
 		ready: [] as Buffer[]
 	};
-	openerManager.on('error', (_id: Buffer, msg: string) =>
+	openerManager.on('error', (_id: Buffer | null, msg: string) =>
 		errors.push({ node: 'opener', msg })
 	);
-	acceptorManager.on('error', (_id: Buffer, msg: string) =>
+	acceptorManager.on('error', (_id: Buffer | null, msg: string) =>
 		errors.push({ node: 'acceptor', msg })
 	);
 	let holding = false;
@@ -1479,7 +1479,6 @@ function route(
 }
 
 function observe(name: string, n: LightningNode, fx: INodeFixture): void {
-	n.on('error', () => {});
 	n.on('node:error', (e: { code: string }) =>
 		fx.errors.push({ node: name, code: e.code })
 	);

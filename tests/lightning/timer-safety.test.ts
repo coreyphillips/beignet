@@ -12,7 +12,11 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { INodeConfig } from '../../src/lightning/node/types';
+import {
+	INodeConfig,
+	PaymentDirection,
+	PaymentStatus
+} from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
@@ -234,7 +238,6 @@ describe('Auto-reconnect Timer Tracking', () => {
 			enableNetworking: true,
 			autoReconnect: true
 		});
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 
 		// Destroy immediately — timers should be cleaned up
@@ -289,7 +292,6 @@ describe('Auto-reconnect Timer Tracking', () => {
 		node.on('node:error', () => {
 			errorCount++;
 		});
-		node.on('error', () => {});
 
 		// Destroy immediately
 		node.destroy();
@@ -323,7 +325,6 @@ describe('Wait Promise Timer Cleanup', () => {
 
 	beforeEach(() => {
 		node = new LightningNode(makeNodeConfig(40));
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 	});
 
@@ -411,8 +412,8 @@ describe('Wait Promise Timer Cleanup', () => {
 		node.emit('payment:sent', {
 			paymentHash: hash,
 			amountMsat: 1000n,
-			status: 'COMPLETED',
-			direction: 'outbound',
+			status: PaymentStatus.COMPLETED,
+			direction: PaymentDirection.OUTGOING,
 			createdAt: Date.now()
 		});
 

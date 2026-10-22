@@ -113,7 +113,6 @@ describe('BOLT 12 async offer (M2.4)', function () {
 			fundingPrivkey: validPriv(),
 			network: Network.REGTEST
 		});
-		node.on('error', () => {});
 
 		// Inject a NORMAL channel to an LSP peer (whose privkey we keep to decrypt).
 		const lspPriv = validPriv();
@@ -189,7 +188,6 @@ describe('BOLT 12 async offer (M2.4)', function () {
 			fundingPrivkey: validPriv(),
 			network: Network.REGTEST
 		});
-		node.on('error', () => {});
 
 		// LSP channel whose peer charges REAL forwarding fees. Reusing the
 		// offer's message paths as invoice payment paths advertised fabricated
@@ -326,7 +324,6 @@ describe('BOLT 12 async offer (M2.4)', function () {
 			fundingPrivkey: validPriv(),
 			network: Network.REGTEST
 		});
-		node.on('error', () => {});
 
 		// A normal offer with no channels has no auto-built path.
 		const { offer } = node.createOffer({ description: 'plain' });

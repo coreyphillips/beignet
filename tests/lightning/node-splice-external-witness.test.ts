@@ -82,7 +82,6 @@ function createTestNode(
 		network: Network.REGTEST,
 		fundingProvider: fundingProvider as IFundingProvider
 	});
-	node.on('error', () => undefined);
 	node.on('node:error', () => undefined);
 	return node;
 }

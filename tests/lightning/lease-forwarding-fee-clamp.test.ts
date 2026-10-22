@@ -100,8 +100,6 @@ function openNormalChannel(a: LightningNode, b: LightningNode): Buffer {
 function leasedNode(): { alice: LightningNode; channelId: Buffer } {
 	const alice = new LightningNode(nodeConfig(1));
 	const bob = new LightningNode(nodeConfig(2));
-	alice.on('error', () => {});
-	bob.on('error', () => {});
 	const channelId = openNormalChannel(alice, bob);
 	const st = alice.getChannelManager().getChannel(channelId)!.getFullState();
 	st.isLessor = true;
@@ -173,8 +171,6 @@ describe('Lessor fee caps bind advertisement AND enforcement', () => {
 	it('leaves a non-lessor channel untouched', () => {
 		const alice = new LightningNode(nodeConfig(3));
 		const bob = new LightningNode(nodeConfig(4));
-		alice.on('error', () => {});
-		bob.on('error', () => {});
 		const channelId = openNormalChannel(alice, bob);
 		try {
 			alice.setChannelPolicy(channelId, {

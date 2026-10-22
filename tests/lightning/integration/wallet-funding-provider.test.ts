@@ -106,7 +106,6 @@ function makeNode(
 		chainHashes: [REGTEST_CHAIN_HASH],
 		fundingProvider
 	});
-	node.on('error', () => {});
 	return node;
 }
 

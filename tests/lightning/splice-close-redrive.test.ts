@@ -118,9 +118,7 @@ async function setup(seedBase: number): Promise<IFixture> {
 	configA.chainBackend = backend;
 	const alice = new LightningNode(configA);
 	const bob = new LightningNode(makeNodeConfig(seedBase + 1));
-	alice.on('error', () => {});
 	alice.on('node:error', () => {});
-	bob.on('error', () => {});
 	bob.on('node:error', () => {});
 	alice.on(
 		'message:outbound',

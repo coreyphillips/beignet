@@ -53,7 +53,6 @@ function networkedNode(
 		...(networkedConfig(label) as INodeConfig),
 		...extra
 	});
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

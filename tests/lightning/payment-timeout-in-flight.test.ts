@@ -92,7 +92,6 @@ function createNode(seedId: number, storage?: SqliteStorage): LightningNode {
 		...makeNodeConfig(seedId),
 		...(storage ? { storage } : {})
 	});
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

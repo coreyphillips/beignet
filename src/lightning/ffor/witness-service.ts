@@ -92,6 +92,37 @@ export interface IFforWitnessFulfil {
 
 export type FforWitnessIntercept = 'none' | 'recorded' | 'held';
 
+/** The receipt witness's events (section 9.6), relayed by LightningNode. */
+export interface FforWitnessEvents {
+	/** Witness role: a receiver provisioned a mailbox on this node. */
+	'ffor:witness-provisioned': (data: {
+		mailboxId: Buffer;
+		slots: number;
+		retentionUntil: number;
+		peer: string;
+	}) => void;
+	/** Witness role: a provision was refused with the reason. */
+	'ffor:witness-refused': (data: { peer: string; reason: string }) => void;
+	/** Witness role: a delegated preimage's record was stored; `unbarriered` when the fulfil had already gone out at the deadline. */
+	'ffor:witness-recorded': (data: {
+		mailboxId: Buffer;
+		k: number;
+		outKey: string;
+		unbarriered: boolean;
+	}) => void;
+	/** Witness role: a held fulfil was propagated, once recorded or at its CLTV deadline. */
+	'ffor:witness-released': (data: {
+		outKey: string;
+		mailboxId: Buffer;
+		k: number;
+		reason: 'recorded' | 'deadline';
+	}) => void;
+	/** Witness role: the receiver closed its mailbox; `held` records remain. */
+	'ffor:witness-closed': (data: { mailboxId: Buffer; held: number }) => void;
+	/** Witness role: a mailbox passed its retention and expired. */
+	'ffor:witness-expired': (data: { mailboxId: Buffer }) => void;
+}
+
 export interface IFforWitnessDeps {
 	ledger: FforWitnessLedger;
 	nodePrivkey: Buffer;
@@ -99,7 +130,10 @@ export interface IFforWitnessDeps {
 	currentHeight: () => number;
 	send: (peer: string, type: number, payload: Buffer) => void;
 	log: (action: string, data: Record<string, unknown>) => void;
-	emit: (event: string, data: unknown) => void;
+	emit: <K extends keyof FforWitnessEvents>(
+		event: K,
+		...args: Parameters<FforWitnessEvents[K]>
+	) => void;
 	/**
 	 * Propagate a fulfil the service held (section 9.6.5 step 5): the node
 	 * settles the forward upstream now, whatever the record's state.

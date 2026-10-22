@@ -206,7 +206,6 @@ function createNode(
 	recovery: INodeConfig['recovery']
 ): LightningNode {
 	const node = new LightningNode(makeNodeConfig(storage, recovery));
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }
@@ -2007,7 +2006,6 @@ describe('Recovery phase 6: barrier disconnects reach the host on external trans
 		const config = makeNodeConfig(storage, undefined);
 		config.enableNetworking = true;
 		const node = new LightningNode(config);
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 		const resets = spyOnResets(node);
 		const requests = collectRequests(node);
@@ -2060,7 +2058,6 @@ describe('Recovery phase 6: barrier disconnects reach the host on external trans
 		const config = makeNodeConfig(storage, undefined);
 		config.enableNetworking = true;
 		const node = new LightningNode(config);
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 		const resets = spyOnResets(node);
 		const requests = collectRequests(node);

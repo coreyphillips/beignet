@@ -56,7 +56,7 @@
  *    makes us accept an INBOUND zero-conf channel from them.
  */
 
-import { EventEmitter } from 'events';
+import { TypedEmitter } from '../../utils/typed-emitter';
 import * as crypto from 'crypto';
 import { encodeShortChannelId } from '../gossip/types';
 import {
@@ -438,6 +438,48 @@ export interface IJitIntent {
 	feeMode: JitFeeMode;
 }
 
+/**
+ * The LSP-side JIT receive progress (issue #669). A funding is keyed by the
+ * intercept scid on the open path and by the channel id on the splice path,
+ * so exactly one of `scidHex` and `channelIdHex` is set.
+ */
+export interface JitReceiveEvents {
+	/** A wallet's request was accepted, keyed by the intercept scid this LSP minted for it. */
+	'jit:intent': (intent: IJitIntent) => void;
+	/** An idle intent was replaced by a newer one from the same wallet. */
+	'jit:intent-superseded': (data: {
+		scidHex: string;
+		walletPubkeyHex: string;
+	}) => void;
+	/** A payment part was held for an intent, or on the splice path for an existing channel. */
+	'jit:intercepted': (data: {
+		scidHex?: string;
+		channelIdHex?: string;
+		amountMsat: bigint;
+	}) => void;
+	/** The zero-conf open or the splice that funds the held parts started. */
+	'jit:funding': (data: {
+		scidHex?: string;
+		channelIdHex?: string;
+		fundingSats: bigint;
+	}) => void;
+	/** The held parts were delivered over the new liquidity. */
+	'jit:forwarded': (data: {
+		scidHex?: string;
+		channelIdHex?: string;
+		parts: number;
+	}) => void;
+	/** The held parts were failed back upstream with the reason. */
+	'jit:failed': (data: {
+		scidHex?: string;
+		channelIdHex?: string;
+		parts?: number;
+		reason: string;
+	}) => void;
+	/** Holds restored from storage were failed back; `remaining` are still owed a failure and retried every block. */
+	'jit:restored-failed': (data: { remaining: number }) => void;
+}
+
 /** A forward held by the engine, plus the engine's own bookkeeping. */
 export interface IHeldJitPart extends IForwardablePart {
 	/**
@@ -608,7 +650,7 @@ function isPermanentFundingRefusal(err: unknown): boolean {
 	return false;
 }
 
-export class JitReceiveManager extends EventEmitter {
+export class JitReceiveManager extends TypedEmitter<JitReceiveEvents> {
 	private intents = new Map<string, IJitIntent>();
 	/** Parts held for a zero-conf open, per intercept scid. */
 	private heldParts = new Map<string, IHeldJitPart[]>();
@@ -1933,9 +1975,12 @@ export class JitReceiveManager extends EventEmitter {
 	}
 
 	/** An observer's failure must never take a hold down with it. */
-	private safeEmit(event: string, payload: unknown): void {
+	private safeEmit<K extends keyof JitReceiveEvents>(
+		event: K,
+		...payload: Parameters<JitReceiveEvents[K]>
+	): void {
 		try {
-			this.emit(event, payload);
+			this.emit(event, ...payload);
 		} catch {
 			// deliberately swallowed; see the method comment
 		}

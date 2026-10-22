@@ -192,7 +192,6 @@ function createNode(
 	gate?: FakeGate
 ): LightningNode {
 	const node = new LightningNode(makeNodeConfig(seedId, backend, gate));
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

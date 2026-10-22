@@ -87,7 +87,6 @@ describe('createInvoice blinded paths (M1.2)', function () {
 			fundingPrivkey: validPriv(),
 			network: Network.REGTEST
 		});
-		node.on('error', () => {});
 		return node;
 	}
 

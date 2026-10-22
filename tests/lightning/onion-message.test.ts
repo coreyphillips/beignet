@@ -1425,8 +1425,6 @@ describe('Onion Messages (Phase 8)', () => {
 				perCommitmentSeed: crypto.randomBytes(32),
 				fundingPrivkey: crypto.randomBytes(32)
 			});
-			// Absorb errors
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 			return node;
 		}
@@ -1474,7 +1472,6 @@ describe('Onion Messages (Phase 8)', () => {
 				perCommitmentSeed: crypto.randomBytes(32),
 				fundingPrivkey: crypto.randomBytes(32)
 			});
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 
 			const received: IOnionMessagePayload[] = [];

@@ -192,7 +192,6 @@ describe('Interop: default openChannel auto-funds a v2 open vs CLN (regtest)', f
 		node.on('node:error', (e: { code?: string; message?: string }) => {
 			peerErrors.push(`${e.code}: ${e.message}`);
 		});
-		node.on('error', () => {});
 		// No chain watcher in this harness: relay broadcast:tx to bitcoind
 		// ourselves (the daemon's Electrum chain watcher does this in
 		// production). Duplicate submissions are fine; CLN may broadcast too.

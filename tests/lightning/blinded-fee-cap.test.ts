@@ -113,7 +113,6 @@ function createNode(
 	extra: Partial<INodeConfig> = {}
 ): LightningNode {
 	const node = new LightningNode({ ...makeNodeConfig(seedId), ...extra });
-	node.on('error', () => {});
 	return node;
 }
 

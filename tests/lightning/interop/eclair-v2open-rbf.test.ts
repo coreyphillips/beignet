@@ -154,9 +154,6 @@ describe('Interop: v2 open RBF completes vs Eclair (regtest, issue 360)', functi
 		n.on('node:error', () => {
 			/* absorb */
 		});
-		n.on('error', () => {
-			/* absorb */
-		});
 		// No chain watcher in this harness: relay broadcast:tx to bitcoind
 		// ourselves. Eclair broadcasts the funding tx too; duplicates are fine.
 		n.on('broadcast:tx', (tx: Buffer) => {

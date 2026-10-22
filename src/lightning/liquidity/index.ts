@@ -21,5 +21,6 @@ export type {
 	IJitReceiveConfig,
 	IJitReceiveQuote,
 	IJitReceiveQuoteRequest,
-	IPersistedHeldPart
+	IPersistedHeldPart,
+	JitReceiveEvents
 } from './jit-receive';

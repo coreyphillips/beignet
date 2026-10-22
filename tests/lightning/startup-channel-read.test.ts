@@ -149,7 +149,6 @@ describe('Startup reads the channels table once (issue #1681)', function () {
 		const reads = countChannelReads(storage);
 
 		const node = new LightningNode(makeNodeConfig(storage));
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 		try {
 			expect(reads()).to.equal(1);
@@ -175,7 +174,6 @@ describe('Startup reads the channels table once (issue #1681)', function () {
 		const reads = countChannelReads(storage);
 
 		const node = new LightningNode(makeNodeConfig(storage, quorumRecovery()));
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 		try {
 			expect(reads()).to.equal(1);
@@ -195,7 +193,6 @@ describe('Startup reads the channels table once (issue #1681)', function () {
 			storage.saveChannel(state.channelId!.toString('hex'), state, PEER);
 
 		const node = new LightningNode(makeNodeConfig(storage));
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 		try {
 			expect(

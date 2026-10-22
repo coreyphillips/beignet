@@ -78,7 +78,6 @@ function makeNode(
 		localFeatures: features,
 		...overrides
 	});
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

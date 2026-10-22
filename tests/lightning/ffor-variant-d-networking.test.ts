@@ -57,7 +57,6 @@ function makeNode(seedId: number): LightningNode {
 		localFeatures: features
 	};
 	const node = new LightningNode(config);
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

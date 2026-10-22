@@ -28,7 +28,13 @@ import { parseGuardianEntry } from '../lightning/recovery';
 import { ILogger, createConsoleLogger } from '../logger';
 import { BeignetError } from './errors';
 import { L402Error } from '../lightning/l402';
-import { ApiResponse, PaymentInfo, RouteHop, SpliceResult } from './types';
+import {
+	ApiResponse,
+	BeignetNodeEvents,
+	PaymentInfo,
+	RouteHop,
+	SpliceResult
+} from './types';
 import { getOpenApiSpec } from './openapi';
 import { resolveBackupDestination } from './backup-destination';
 import { backupMacPath } from './backup-mac';
@@ -675,8 +681,10 @@ export function parseIntParam(
  * Node events relayed to SSE clients and webhooks. Per-HTLC events are opt-in
  * via htlcEvents because routing nodes generate one event per HTLC.
  */
-export function getRelayedEvents(htlcEvents?: boolean): string[] {
-	const events = [
+export function getRelayedEvents(
+	htlcEvents?: boolean
+): Array<keyof BeignetNodeEvents> {
+	const events: Array<keyof BeignetNodeEvents> = [
 		'payment:received',
 		'payment:sent',
 		'payment:failed',

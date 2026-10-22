@@ -181,7 +181,7 @@ function scene(
 		'swap:hold-cancelled',
 		'swap:exposed',
 		'swap:failed'
-	]) {
+	] as const) {
 		bob.on(evt, () => events.push(evt));
 	}
 	return { alice, bob, chain, fp, events, channels: ids };

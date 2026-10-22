@@ -125,7 +125,6 @@ describe('Issue #176: forwarding opt-out and forward logging', function () {
 			return { ok: true };
 		};
 		node.on('log', (l: IStructuredLog) => logs.push(l));
-		node.on('error', () => {});
 	}
 
 	afterEach(function () {

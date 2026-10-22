@@ -87,7 +87,6 @@ describe('Pathfinding: announced-channel routing hints', function () {
 		const alice = new LightningNode(makeNodeConfig(1));
 		const bob = new LightningNode(makeNodeConfig(2));
 		for (const n of [alice, bob]) {
-			n.on('error', () => {});
 			n.on('node:error', () => {});
 		}
 		alice.on('message:outbound', (pk: string, t: number, p: Buffer) => {

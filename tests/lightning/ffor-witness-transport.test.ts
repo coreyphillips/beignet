@@ -275,7 +275,6 @@ describe('FFOR receipt witness transport (M9.0)', function () {
 				localFeatures: features,
 				...extra
 			});
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 			return node;
 		};

@@ -82,7 +82,6 @@ function createTestNode(opts?: {
 		enableNetworking: opts?.enableNetworking,
 		storage: opts?.storage
 	});
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

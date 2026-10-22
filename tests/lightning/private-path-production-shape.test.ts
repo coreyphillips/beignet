@@ -83,7 +83,6 @@ function nodeWithChannel(): IHarness {
 		fundingPrivkey: validPriv(),
 		network: Network.REGTEST
 	});
-	node.on('error', () => {});
 	const peerPriv = validPriv();
 	const peerPubkey = getPublicKey(peerPriv);
 	const scid = encodeShortChannelId({

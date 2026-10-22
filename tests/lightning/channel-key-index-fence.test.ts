@@ -280,7 +280,6 @@ function bootNode(storage?: IStorageBackend): LightningNode {
 		storage,
 		enableNetworking: false
 	});
-	node.on('error', noop);
 	node.on('node:error', noop);
 	return node;
 }
@@ -481,7 +480,6 @@ describe('Channel key index fence (issue #906)', () => {
 			enableNetworking: false,
 			newChannelsRefused: (): string | null => REASON
 		});
-		node.on('error', noop);
 		node.on('node:error', noop);
 		try {
 			const manager = node.getChannelManager();

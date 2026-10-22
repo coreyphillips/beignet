@@ -28,6 +28,7 @@ import {
 } from './instance-lock';
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
+import { TypedEmitter } from '../utils/typed-emitter';
 import { Wallet } from '../wallet';
 import { getDefaultSendTransaction } from '../shapes/wallet';
 import { EAddressType, ISendTransaction } from '../types/wallet';
@@ -1846,9 +1847,11 @@ function canBecomeUsable(channel: Channel): boolean {
  * Private trigger for the pay-readiness wait: a channel closed, failed or
  * went away, so "no live channel left" may now hold (issue #967). A symbol,
  * so it is no public event, and shutdown's removeAllListeners() takes its
- * listeners with the rest.
+ * listeners with the rest. Being outside BeignetNodeEvents, it goes through
+ * EventEmitter's own methods.
  */
 const CHANNELS_CHANGED = Symbol('channels-changed');
+const untypedEmitter = EventEmitter.prototype;
 
 /**
  * The refusal an operator force close of a capsule-restored channel gets
@@ -1936,7 +1939,7 @@ function listenerLabel(kind: ListenerKind): string {
 		: 'WebSocket listener';
 }
 
-export class BeignetNode extends EventEmitter {
+export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private fforReceiveService?: FforReceiveService;
 	private offlineReceive?: OfflineReceive;
 	private offlineReceiveTimer?: ReturnType<typeof setInterval>;
@@ -1961,34 +1964,6 @@ export class BeignetNode extends EventEmitter {
 			);
 		return this.fforReceiveService;
 	}
-	// ─── Typed event overloads ───
-	on<K extends keyof BeignetNodeEvents>(
-		event: K,
-		listener: BeignetNodeEvents[K]
-	): this;
-	on(event: string | symbol, listener: (...args: unknown[]) => void): this;
-	on(event: string | symbol, listener: (...args: unknown[]) => void): this {
-		return super.on(event, listener);
-	}
-
-	once<K extends keyof BeignetNodeEvents>(
-		event: K,
-		listener: BeignetNodeEvents[K]
-	): this;
-	once(event: string | symbol, listener: (...args: unknown[]) => void): this;
-	once(event: string | symbol, listener: (...args: unknown[]) => void): this {
-		return super.once(event, listener);
-	}
-
-	emit<K extends keyof BeignetNodeEvents>(
-		event: K,
-		...args: Parameters<BeignetNodeEvents[K]>
-	): boolean;
-	emit(event: string | symbol, ...args: unknown[]): boolean;
-	emit(event: string | symbol, ...args: unknown[]): boolean {
-		return super.emit(event, ...args);
-	}
-
 	private wallet!: Wallet;
 	private node!: LightningNode;
 	private storage!: SqliteStorage;
@@ -3369,7 +3344,7 @@ export class BeignetNode extends EventEmitter {
 			'splice:complete',
 			'splice:aborted',
 			'splice:reverted'
-		]) {
+		] as const) {
 			this.node.on(event, (data: { channelId: Buffer }) =>
 				announceUsable(data.channelId)
 			);
@@ -3383,14 +3358,14 @@ export class BeignetNode extends EventEmitter {
 		// A channel that closed, failed or went away may have been the last
 		// live one; the pay-readiness wait then stops waiting.
 		const channelsChanged = (): void =>
-			deferEmit(() => this.emit(CHANNELS_CHANGED));
+			deferEmit(() => untypedEmitter.emit.call(this, CHANNELS_CHANGED));
 		for (const event of [
 			'channel:pending-close',
 			'channel:force-closing',
 			'channel:closed',
 			'channel:voided',
 			'channel:aborted'
-		]) {
+		] as const) {
 			this.node.on(event, channelsChanged);
 		}
 		this.node.getChannelManager().on('channel:errored', channelsChanged);
@@ -3849,7 +3824,7 @@ export class BeignetNode extends EventEmitter {
 		this.node.on('recovery:durable', (through: bigint) => {
 			this.emit('recovery:durable', { through: through.toString() });
 		});
-		this.node.on('recovery:fenced', (superseding?: GuardianState) => {
+		this.node.on('recovery:fenced', (superseding) => {
 			this.log(
 				'error',
 				'Recovery fenced: a newer writer epoch owns this namespace; ' +
@@ -4453,7 +4428,9 @@ export class BeignetNode extends EventEmitter {
 	 * check), with one payload shape. The lease check has nothing left to
 	 * learn once the device is fenced, so it stops here too.
 	 */
-	private relayRecoveryFenced(supersededBy: GuardianState | undefined): void {
+	private relayRecoveryFenced(
+		supersededBy: GuardianState | null | undefined
+	): void {
 		this.stopRecoveryLeaseCheck();
 		// The fence closed every listener and a held one never binds: say so
 		// rather than report one bound or held forever.
@@ -14337,11 +14314,11 @@ export class BeignetNode extends EventEmitter {
 					const recheck = (): void => {
 						if (live() && !this.canCarryHtlc()) return;
 						this.removeListener('channel:usable', recheck);
-						this.removeListener(CHANNELS_CHANGED, recheck);
+						untypedEmitter.removeListener.call(this, CHANNELS_CHANGED, recheck);
 						if (live()) run();
 					};
 					this.on('channel:usable', recheck);
-					this.on(CHANNELS_CHANGED, recheck);
+					untypedEmitter.on.call(this, CHANNELS_CHANGED, recheck);
 				},
 				() => {
 					// Destroyed (a shutdown, or a capsule restore rebuilding the

@@ -50,7 +50,8 @@ import {
 	ISpliceConflictAckMessage,
 	ISpliceConflictMessage
 } from '../message/splice-conflict';
-import { EventEmitter } from 'events';
+import { TypedEmitter } from '../../utils/typed-emitter';
+import { LightningNodeEvents, NodeErrorCode } from './events';
 import crypto from 'crypto';
 import { ILogger, noopLogger } from '../../logger';
 import { getPublicKey } from '../crypto/ecdh';
@@ -496,8 +497,8 @@ import {
 	fforWitnessMailboxCodec,
 	fforWitnessRecordCodec
 } from '../ffor/witness-ledger';
-import { FforWitnessService } from '../ffor/witness-service';
-import { FforIssuerService } from '../ffor/issuer-service';
+import { FforWitnessEvents, FforWitnessService } from '../ffor/witness-service';
+import { FforIssuerEvents, FforIssuerService } from '../ffor/issuer-service';
 import { encodeOfferTlv } from '../offer/tlv';
 import {
 	FF_ISSUER_MANIFEST_LEDGER_PREFIX,
@@ -604,37 +605,6 @@ import {
 } from '../advisor/fee-tuner';
 
 bitcoin.initEccLib(ecc);
-
-/**
- * Top-level Lightning node orchestrator.
- *
- * Events:
- * - 'payment:received' (paymentInfo: IPaymentInfo)
- * - 'payment:sent' (paymentInfo: IPaymentInfo)
- * - 'payment:failed' (paymentInfo: IPaymentInfo)
- * - 'channel:ready' ({ channelId: Buffer })
- * - 'channel:closed' ({ channelId: Buffer })
- * - 'channel:resolved' ({ channelId: Buffer }) — close fully resolved on-chain
- * - 'channel:aborted' (temporaryChannelId: Buffer, reason: string) — a negotiated-but-unfunded open was torn down (funding failed after accept_channel)
- * - 'message:outbound' (peerPubkey: string, type: number, payload: Buffer)
- * - 'htlc:forward' (fromChannelId: Buffer, toChannelId: Buffer, amountMsat: bigint, paymentHash: Buffer)
- * - 'htlc:forward-failed' ({ inChannelId: Buffer, outChannelId: Buffer }) — a forwarded HTLC failed downstream
- * - 'peer:connect' (pubkey: string)
- * - 'peer:disconnect' (pubkey: string)
- * - 'peer:disconnect-requested' (pubkey: string): external-transport (message:outbound) mode only; the host must sever its connection to this peer, the protocol side (channels marked for reestablish) is already applied
- * - 'peer:error' (pubkey: string, error: Error)
- * - 'peer_storage:retrieved' (peerPubkey: string, blob: Buffer)
- * - 'recovery:reestablish-held' (peerPubkey: string, channelIdHex: string, expiresAt: number): a peer's channel_reestablish for a channel this node has no record of was parked instead of failed, because the node may still be an incomplete restore target (issue #462)
- * - 'sweep:uneconomic' (channelId: Buffer, action: ISweepUneconomicChainAction): an on-chain claim was declined because it cannot pay its own fee
- * - 'htlc:held' ({ paymentHash: Buffer, amountMsat: bigint }): one part of a hold invoice was parked; read getHeldInvoiceSnapshot for the full committed set
- * - 'hold:accepted' (event: IHoldInvoiceStateEvent): a part joined a hold invoice's parked set, carrying the set's running total; a re-park on reestablish is not a transition and does not fire
- * - 'hold:settled' (event: IHoldInvoiceStateEvent): a hold invoice's preimage was revealed and every parked part fulfilled
- * - 'hold:cancelled' (event: IHoldCancelledEvent): a hold invoice was cancelled by the CLTV sweeper or by the API; every parked part was failed back
- * - 'payment:htlc-resolved' (event: IPaymentHtlcResolvedEvent): one offered HTLC of an outgoing payment reached a terminal state (fulfilled, irrevocably failed, or resolved on chain)
- * - 'payment:preimage' (event: IPaymentPreimageEvent): the preimage of an outgoing payment became known, from update_fulfill_htlc or from an on-chain claim, whatever the record's status was
- * - 'block:processed' (height: number): the per-block work for this height has run
- * - 'swap:*': the swap provider engines' progress (see REVERSE_SWAP_EVENTS and SUBMARINE_SWAP_EVENTS); payloads are JSON-safe
- */
 
 /**
  * How often to refresh + re-broadcast our own gossip (node_announcement) so the
@@ -969,6 +939,11 @@ type TGossipQuery =
 			msg: IQueryShortChannelIdsMessage;
 	  };
 
+/** A hold invoice transition waiting its turn in emitHoldInvoiceEvent. */
+type THoldInvoiceEvent =
+	| { name: 'hold:accepted' | 'hold:settled'; event: IHoldInvoiceStateEvent }
+	| { name: 'hold:cancelled'; event: IHoldCancelledEvent };
+
 /** A cooperative restore of the stored network map (beginGraphRestore). */
 interface IGraphRestoreRun {
 	restore: GossipGraphRestore;
@@ -979,7 +954,11 @@ interface IGraphRestoreRun {
 	resolve: (restored: boolean) => void;
 }
 
-export class LightningNode extends EventEmitter {
+/**
+ * Top-level Lightning node orchestrator. Its events and their listener
+ * signatures are LightningNodeEvents (./events.ts).
+ */
+export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private nodePrivkey: Buffer;
 	/**
 	 * Our node's public key, derived from nodePrivkey once. Deriving it is a
@@ -1324,10 +1303,7 @@ export class LightningNode extends EventEmitter {
 			  }
 		) & { resolved: Array<{ amountMsat: bigint; cltvExpiry: number }> }
 	> = new Map();
-	private holdInvoiceEventQueue: Array<{
-		name: 'hold:accepted' | 'hold:settled' | 'hold:cancelled';
-		event: IHoldInvoiceStateEvent | IHoldCancelledEvent;
-	}> = [];
+	private holdInvoiceEventQueue: THoldInvoiceEvent[] = [];
 	private emittingHoldInvoiceEvent = false;
 	private mppTimeoutMs: number;
 	private alias?: string;
@@ -1883,7 +1859,7 @@ export class LightningNode extends EventEmitter {
 							code: 'PERSISTENCE_ERROR',
 							message: `safety transition failed: ${err.message}`,
 							timestamp: Date.now()
-						} as ILightningError);
+						});
 					}
 			  })
 			: null;
@@ -2356,7 +2332,9 @@ export class LightningNode extends EventEmitter {
 				currentHeight: () => this.currentBlockHeight,
 				send: (peer, type, payload) => this.emitOutbound(peer, type, payload),
 				log: (action, data) => this.emitStructuredLog('htlc', action, data),
-				emit: (event, data) => this.emit(event, data),
+				emit: (event, ...args): void => {
+					this.emit<keyof FforWitnessEvents>(event, ...args);
+				},
 				release: (fulfil) => this.releaseWitnessHeldForward(fulfil)
 			});
 			if (config.fforIssuer?.enabled) {
@@ -2387,7 +2365,9 @@ export class LightningNode extends EventEmitter {
 					currentHeight: () => this.currentBlockHeight,
 					send: (peer, type, payload) => this.emitOutbound(peer, type, payload),
 					log: (action, data) => this.emitStructuredLog('htlc', action, data),
-					emit: (event, data) => this.emit(event, data),
+					emit: (event, ...args): void => {
+						this.emit<keyof FforIssuerEvents>(event, ...args);
+					},
 					offers: this.offerManager
 				});
 				this.fforIssuer.rehydrate();
@@ -2844,7 +2824,7 @@ export class LightningNode extends EventEmitter {
 										`by a guardian quorum (${outcome.reason}); the ` +
 										`node stays quarantined`,
 									timestamp: Date.now()
-								} as ILightningError);
+								});
 							} catch {
 								// Observer threw; quarantine already holds.
 							}
@@ -2875,7 +2855,7 @@ export class LightningNode extends EventEmitter {
 										err instanceof Error ? err.message : String(err)
 									}; the node stays quarantined`,
 									timestamp: Date.now()
-								} as ILightningError);
+								});
 							} catch {
 								// Observer threw; quarantine already holds.
 							}
@@ -2894,7 +2874,7 @@ export class LightningNode extends EventEmitter {
 										err instanceof Error ? err.message : String(err)
 									}`,
 									timestamp: Date.now()
-								} as ILightningError);
+								});
 							} catch {
 								// Observer threw; ready still fires below.
 							}
@@ -2914,7 +2894,7 @@ export class LightningNode extends EventEmitter {
 									err instanceof Error ? err.message : String(err)
 								}; the node stays quarantined`,
 								timestamp: Date.now()
-							} as ILightningError);
+							});
 						} catch {
 							// Observer threw; quarantine already holds.
 						}
@@ -2973,7 +2953,7 @@ export class LightningNode extends EventEmitter {
 								(err as Error).message
 							}`,
 							timestamp: Date.now()
-						} as ILightningError);
+						});
 					}
 				}
 			}, 300_000);
@@ -3030,7 +3010,7 @@ export class LightningNode extends EventEmitter {
 						code: 'WAL_CHECKPOINT_FAILED',
 						message: `WAL checkpoint failed: ${(err as Error).message}`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				}
 			}, 1_800_000); // 30 minutes
 			if (this.walCheckpointTimer.unref) {
@@ -3045,7 +3025,7 @@ export class LightningNode extends EventEmitter {
 					code: 'CHAIN_WATCHER_START_FAILED',
 					message: (err as Error).message,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			});
 		}
 	}
@@ -3574,7 +3554,7 @@ export class LightningNode extends EventEmitter {
 						(err as Error).message
 					}`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		}
 
@@ -4009,7 +3989,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: `Failed to persist recovered channel: ${result.error?.message}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		}
 		return result.committed;
 	}
@@ -4122,7 +4102,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: 'Storage cannot preserve concurrent voucher custody',
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return;
 		}
 		let settledSlots: { record: IFforEpochRecord; k: number }[] = [];
@@ -4228,7 +4208,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: `Failed to persist channel: ${result.error?.message}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		} else {
 			for (const { record, k } of settledSlots)
 				record.slotStates[k - 1] = FforSlotState.SETTLED;
@@ -4351,10 +4331,10 @@ export class LightningNode extends EventEmitter {
 	 */
 	private dropUnencodable(mutations: RecoveryMutation[]): {
 		encodable: RecoveryMutation[];
-		dropped: ILightningError[];
+		dropped: ILightningError<NodeErrorCode>[];
 	} {
 		const encodable: RecoveryMutation[] = [];
-		const dropped: ILightningError[] = [];
+		const dropped: ILightningError<NodeErrorCode>[] = [];
 		for (const mutation of mutations) {
 			try {
 				assertMutationEncodable(mutation);
@@ -4365,7 +4345,7 @@ export class LightningNode extends EventEmitter {
 					code: 'PERSISTENCE_ERROR',
 					message: `Dropped a staged ${mutation.type} mutation that cannot be encoded: ${reason}`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		}
 		return { encodable, dropped };
@@ -4537,7 +4517,7 @@ export class LightningNode extends EventEmitter {
 				code: 'PERSISTENCE_ERROR',
 				message: `${label}: ${result.error?.message}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		}
 		return result.committed;
 	}
@@ -4611,7 +4591,7 @@ export class LightningNode extends EventEmitter {
 				code: 'PERSISTENCE_ERROR',
 				message: `persistInvoiceRecords: payment record missing: ${hashHex}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return;
 		}
 		mutations.push(payment);
@@ -4642,7 +4622,7 @@ export class LightningNode extends EventEmitter {
 				code: 'PERSISTENCE_ERROR',
 				message: `${operation}: ${(err as Error).message}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return false;
 		}
 	}
@@ -4955,7 +4935,7 @@ export class LightningNode extends EventEmitter {
 				code: 'PERSISTENCE_ERROR',
 				message: `${operation}: ${failed} of ${writes.length} writes failed (${lastError})`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		}
 	}
 
@@ -5698,7 +5678,7 @@ export class LightningNode extends EventEmitter {
 						'publishes a commitment the peer may already hold a ' +
 						'revocation for',
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		);
 
@@ -5745,7 +5725,7 @@ export class LightningNode extends EventEmitter {
 						`held messages were refused by the durability barrier (${reason}); ` +
 						'the channel resumes through reestablish once the quorum is reachable',
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 				if (reason === 'fenced') return;
 				setImmediate(() => {
 					this.requestPeerDisconnect(peerPubkey);
@@ -5780,7 +5760,7 @@ export class LightningNode extends EventEmitter {
 						`a released batch failed partway through dispatch (${reason}); ` +
 						'the connection is dropped so reestablish can replay from durable state',
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 				setImmediate(() => {
 					this.requestPeerDisconnect(peerPubkey);
 				});
@@ -5902,7 +5882,7 @@ export class LightningNode extends EventEmitter {
 					this.requestedFundingFeeRates.delete(channelId.toString('hex'));
 					this.fundingMaxRequests.delete(channelId.toString('hex'));
 				}
-				const err: ILightningError = {
+				const err: ILightningError<NodeErrorCode> = {
 					code: 'CHANNEL_ERROR',
 					channelId: channelId ?? undefined,
 					message,
@@ -7644,7 +7624,7 @@ export class LightningNode extends EventEmitter {
 								(err as Error).message
 							}`,
 							timestamp: Date.now()
-						} as ILightningError);
+						});
 					})
 					.finally(() => {
 						this._pendingReconnects--;
@@ -7694,7 +7674,7 @@ export class LightningNode extends EventEmitter {
 							(err as Error).message
 						}`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				}
 			);
 		}
@@ -7850,7 +7830,7 @@ export class LightningNode extends EventEmitter {
 					code: 'AUTO_FUNDING_FAILED',
 					message: (err as Error).message,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 				// The build succeeded but the open died before funding_created
 				// went out (the same boundary abortPendingOpen no-ops past):
 				// the peer never had anything to sign and nothing was
@@ -8240,7 +8220,7 @@ export class LightningNode extends EventEmitter {
 				retained: true,
 				message: `splice ${txid} refused by the chain backend: ${reason}; the node still holds the transaction and rebroadcasts it on every block until it confirms`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		});
 	}
 
@@ -8431,7 +8411,7 @@ export class LightningNode extends EventEmitter {
 					code: 'FUNDING_BROADCAST_FAILED',
 					message: `${message} (funding tx ${displayTxid}${of} retained; will retry)`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			});
 	}
 
@@ -8931,7 +8911,7 @@ export class LightningNode extends EventEmitter {
 						code: 'PERSISTENCE_ERROR',
 						message: `saveRecoveryPeerAddress: ${message}`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 					continue;
 				}
 			}
@@ -8999,7 +8979,7 @@ export class LightningNode extends EventEmitter {
 							(err as Error).message
 						}`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				}
 			}
 
@@ -9884,7 +9864,7 @@ export class LightningNode extends EventEmitter {
 						(err as Error).message
 					}`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		});
 		this.chainWatcher.on('error', (err: Error) => {
@@ -9892,7 +9872,7 @@ export class LightningNode extends EventEmitter {
 				code: 'CHAIN_WATCHER_ERROR',
 				message: err.message,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		});
 		// A close tx we registered reached the network: record it so
 		// closeStatus.broadcast can answer honestly before the spend is
@@ -9914,7 +9894,7 @@ export class LightningNode extends EventEmitter {
 				...about,
 				message: this._broadcastErrorMessage(err.message, about.retained),
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		});
 		// The watcher's own retries ran out and it drops the transaction from
 		// its list (issue #756). The block-driven obligations (pending fundings,
@@ -9938,7 +9918,7 @@ export class LightningNode extends EventEmitter {
 					...about,
 					message: this._broadcastErrorMessage(err.message, about.retained),
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		);
 		// Wire watch:output:requested — handle sweep output watching after force-close
@@ -9967,7 +9947,7 @@ export class LightningNode extends EventEmitter {
 							(err as Error).message
 						}`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				});
 			}
 		);
@@ -10009,7 +9989,7 @@ export class LightningNode extends EventEmitter {
 					channelId,
 					message: `funding tx ${txid} disappeared from mempool and chain before confirming`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 				this.disposeMissingFunding(channelId, txid);
 			}
 		);
@@ -10605,7 +10585,7 @@ export class LightningNode extends EventEmitter {
 					code: 'CHAIN_RESTORE_WATCH_FAILED',
 					message: `Failed to restore chain watches: ${(err as Error).message}`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 			// destroy() during the restore must not let the rest of startup run:
 			// it would retry funding broadcasts and restart the reconnect monitor
@@ -10779,7 +10759,7 @@ export class LightningNode extends EventEmitter {
 								(err as Error).message
 							}`,
 							timestamp: Date.now()
-						} as ILightningError);
+						});
 					}
 				}
 				continue;
@@ -10825,7 +10805,7 @@ export class LightningNode extends EventEmitter {
 							(err as Error).message
 						}`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				}
 			}
 
@@ -11075,7 +11055,7 @@ export class LightningNode extends EventEmitter {
 						leg.outputIndex
 					}: ${(err as Error).message}`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		}
 	}
@@ -11571,7 +11551,7 @@ export class LightningNode extends EventEmitter {
 						(err as Error).message
 					}`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		}
 		// Close storage to release WAL file handles
@@ -12531,7 +12511,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: result.error!,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, error: result.error };
 		}
 		// initiateShutdown's own action batch carries no persist of the stamp,
@@ -12586,7 +12566,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: result.error!,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, error: result.error };
 		}
 		return { ok: true };
@@ -12643,7 +12623,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: result.error!,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, error: result.error };
 		}
 		return { ok: true, sendsWithheld: result.sendsWithheld === true };
@@ -12696,7 +12676,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: result.error!,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, error: result.error };
 		}
 		return { ok: true, sendsWithheld: result.sendsWithheld === true };
@@ -12821,7 +12801,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: result.error!,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, error: result.error };
 		}
 		return { ok: true };
@@ -13419,7 +13399,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: revoked,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, error: revoked };
 		}
 		const result = this._forceCloseWithReason(
@@ -13434,7 +13414,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: result.error!,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, error: result.error };
 		}
 		// Extract commitment txid from BROADCAST_TX action
@@ -13933,7 +13913,7 @@ export class LightningNode extends EventEmitter {
 						channelId,
 						message: directedError,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 					return;
 				}
 				channel.setSpliceInInputs(inputs, changeScript);
@@ -13948,7 +13928,7 @@ export class LightningNode extends EventEmitter {
 						channelId,
 						message: result.error ?? SPLICE_NOT_STARTED,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				}
 			})
 			.catch((err) => {
@@ -13957,7 +13937,7 @@ export class LightningNode extends EventEmitter {
 					channelId,
 					message: (err as Error).message,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			})
 			// After initiateSplice above, so the reservation is only dropped once
 			// the channel itself holds the request.
@@ -14376,7 +14356,7 @@ export class LightningNode extends EventEmitter {
 						channelId,
 						message: result.error!,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				}
 			})
 			.catch((err) => {
@@ -14385,7 +14365,7 @@ export class LightningNode extends EventEmitter {
 					channelId,
 					message: (err as Error).message,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			});
 		return { ok: true };
 	}
@@ -14634,7 +14614,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: refusal.error,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, ...refusal };
 		}
 
@@ -14665,7 +14645,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: error,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, error, code: spliceRefusalCodeFor(result) };
 		}
 
@@ -17377,7 +17357,7 @@ export class LightningNode extends EventEmitter {
 					message:
 						'Invoice created without routing hints despite having a channel with inbound liquidity (likely missing a usable SCID/alias). Payers may not find a route.',
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		}
 
@@ -19462,7 +19442,7 @@ export class LightningNode extends EventEmitter {
 					'hex'
 				)}: ${(err as Error).message || 'unknown'}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			// BOLT 4 route blinding: an HTLC that arrived with a blinding point is
 			// inside a blinded route, so even an unparseable onion must surface as
 			// invalid_onion_blinding via update_fail_malformed_htlc.
@@ -22039,11 +22019,8 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/** Finish notifying every listener before delivering a nested transition. */
-	private emitHoldInvoiceEvent(
-		name: 'hold:accepted' | 'hold:settled' | 'hold:cancelled',
-		event: IHoldInvoiceStateEvent | IHoldCancelledEvent
-	): void {
-		this.holdInvoiceEventQueue.push({ name, event });
+	private emitHoldInvoiceEvent(transition: THoldInvoiceEvent): void {
+		this.holdInvoiceEventQueue.push(transition);
 		if (this.emittingHoldInvoiceEvent) return;
 		this.emittingHoldInvoiceEvent = true;
 		let failure: { error: unknown } | undefined;
@@ -22051,7 +22028,8 @@ export class LightningNode extends EventEmitter {
 			for (let i = 0; i < this.holdInvoiceEventQueue.length; i++) {
 				const next = this.holdInvoiceEventQueue[i];
 				try {
-					this.emit(next.name, next.event);
+					if (next.name === 'hold:cancelled') this.emit(next.name, next.event);
+					else this.emit(next.name, next.event);
 				} catch (error) {
 					// A listener may resolve a hold and then throw. Deliver the
 					// queued transition before propagating the first failure.
@@ -22105,7 +22083,7 @@ export class LightningNode extends EventEmitter {
 					htlcCount: parked.length,
 					...this.heldSetExpiry(hashHex, parked)
 				};
-				this.emitHoldInvoiceEvent('hold:accepted', event);
+				this.emitHoldInvoiceEvent({ name: 'hold:accepted', event });
 			}
 		}
 		this.emitStructuredLog('htlc', 'held', {
@@ -22238,7 +22216,7 @@ export class LightningNode extends EventEmitter {
 			htlcCount: settledSet.length,
 			...this.heldSetExpiry(hashHex, settledSet)
 		};
-		this.emitHoldInvoiceEvent('hold:settled', event);
+		this.emitHoldInvoiceEvent({ name: 'hold:settled', event });
 		return true;
 	}
 
@@ -22493,7 +22471,7 @@ export class LightningNode extends EventEmitter {
 			heldAmountMsat,
 			...expiry
 		};
-		this.emitHoldInvoiceEvent('hold:cancelled', event);
+		this.emitHoldInvoiceEvent({ name: 'hold:cancelled', event });
 	}
 
 	/**
@@ -23418,17 +23396,16 @@ export class LightningNode extends EventEmitter {
 					Math.max(HELD_HTLC_EXPIRY_MARGIN, this.htlcSafetyMargin)
 			}
 		);
-		for (const evt of [
-			'jit:intent',
-			'jit:intent-superseded',
-			'jit:intercepted',
-			'jit:funding',
-			'jit:forwarded',
-			'jit:failed',
-			'jit:restored-failed'
-		]) {
-			this.jitReceiveManager.on(evt, (data) => this.emit(evt, data));
-		}
+		const jit = this.jitReceiveManager;
+		jit.on('jit:intent', (e) => this.emit('jit:intent', e));
+		jit.on('jit:intent-superseded', (e) =>
+			this.emit('jit:intent-superseded', e)
+		);
+		jit.on('jit:intercepted', (e) => this.emit('jit:intercepted', e));
+		jit.on('jit:funding', (e) => this.emit('jit:funding', e));
+		jit.on('jit:forwarded', (e) => this.emit('jit:forwarded', e));
+		jit.on('jit:failed', (e) => this.emit('jit:failed', e));
+		jit.on('jit:restored-failed', (e) => this.emit('jit:restored-failed', e));
 		// Ride the ISOLATED custom-message dispatch (issue #546) rather than
 		// handling the subtype inline before it: a malformed authorization must
 		// not cost the peer its connection. Our own handler is additionally
@@ -27425,7 +27402,7 @@ export class LightningNode extends EventEmitter {
 				code: 'MESSAGE_TOO_LARGE',
 				message: `Message payload ${payload.length} bytes exceeds maximum ${MAX_MESSAGE_SIZE}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return;
 		}
 		// Route gossip messages (including query types 261-265)
@@ -27676,7 +27653,7 @@ export class LightningNode extends EventEmitter {
 			channelId,
 			message: `splice ${spliceTxid} cannot confirm: input ${inputIndex} was spent by ${conflictTxid} at height ${height}; reverting to the pre-splice funding`,
 			timestamp: Date.now()
-		} as ILightningError);
+		});
 		try {
 			this.emit('splice:conflicted', {
 				channelId,
@@ -28582,14 +28559,18 @@ export class LightningNode extends EventEmitter {
 					: {})
 			}
 		);
-		for (const evt of [
-			'offer:accepted',
-			'offer:declined',
-			'offer:failed',
-			'offer:completed'
-		]) {
-			receiver.on(evt, (data) => this.emit(`direct-funding:${evt}`, data));
-		}
+		receiver.on('offer:accepted', (e) =>
+			this.emit('direct-funding:offer:accepted', e)
+		);
+		receiver.on('offer:declined', (e) =>
+			this.emit('direct-funding:offer:declined', e)
+		);
+		receiver.on('offer:failed', (e) =>
+			this.emit('direct-funding:offer:failed', e)
+		);
+		receiver.on('offer:completed', (e) =>
+			this.emit('direct-funding:offer:completed', e)
+		);
 		this.directFunding = {
 			requests,
 			registry,
@@ -29528,7 +29509,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: `channel failed (${reason}); unable to force-close: ${result.error}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			this.emitStructuredLog('channel', 'errored_force_close_failed', {
 				channelId: channelId.toString('hex'),
 				reason,
@@ -29541,7 +29522,7 @@ export class LightningNode extends EventEmitter {
 			channelId,
 			message: `channel failed (${reason}); force-closing to resolve on chain`,
 			timestamp: Date.now()
-		} as ILightningError);
+		});
 		this.emitStructuredLog('channel', 'errored_force_closing', {
 			channelId: channelId.toString('hex'),
 			reason
@@ -29690,7 +29671,7 @@ export class LightningNode extends EventEmitter {
 				`(CLI: channel forceclose --accept-stale-state-risk), which ` +
 				`publishes a commitment the peer may already hold a revocation for`,
 			timestamp: Date.now()
-		} as ILightningError);
+		});
 	}
 
 	/**
@@ -29993,7 +29974,7 @@ export class LightningNode extends EventEmitter {
 							? `inbound HTLC ${htlc.id} fulfilled but still in our commitment ${claimBuffer} blocks before expiry (${htlc.cltvExpiry}), the peer has not signed it away; force-closing to claim via HTLC-success`
 							: `inbound HTLC ${htlc.id} preimage held but unacked ${claimBuffer} blocks before expiry (${htlc.cltvExpiry}); force-closing to claim via HTLC-success`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 					this._forceCloseWithReason(
 						channelId,
 						this.getSweepDestinationScript(),
@@ -30105,7 +30086,7 @@ export class LightningNode extends EventEmitter {
 							channelId,
 							message: `forwarded HTLC ${htlc.id} inbound expiry near (${htlc.cltvExpiry}) with outbound leg unresolved; force-closing inbound to resolve on-chain`,
 							timestamp: Date.now()
-						} as ILightningError);
+						});
 						this._forceCloseWithReason(
 							channelId,
 							this.getSweepDestinationScript(),
@@ -30286,7 +30267,7 @@ export class LightningNode extends EventEmitter {
 					channelId,
 					message: `forwarded HTLC ${htlc.id} inbound expiry near (${htlc.cltvExpiry}) with outbound leg unresolved; force-closing inbound to resolve on-chain`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 				this._forceCloseWithReason(
 					channelId,
 					this.getSweepDestinationScript(),
@@ -30724,7 +30705,7 @@ export class LightningNode extends EventEmitter {
 					code: 'ONION_MESSAGE_ERROR',
 					message: err.message,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		);
 	}
@@ -31499,7 +31480,7 @@ export class LightningNode extends EventEmitter {
 				code: 'BOLT12_INVOICE_ERROR',
 				message: error.error,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		});
 	}
 
@@ -31777,7 +31758,7 @@ export class LightningNode extends EventEmitter {
 						channelId,
 						message: `offered HTLC ${htlc.id} still active ${graceBlocks} blocks past expiry (${htlc.cltvExpiry}); force-closing to claim via timeout path`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 					this._forceCloseWithReason(
 						channelId,
 						this.getSweepDestinationScript(),
@@ -32792,7 +32773,7 @@ export class LightningNode extends EventEmitter {
 							'hex'
 						)} stuck in AWAITING_FUNDING_CONFIRMED for > 2016 blocks`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				}
 			}
 
@@ -32843,7 +32824,7 @@ export class LightningNode extends EventEmitter {
 									this.reestablishTimeoutBlocks
 								} blocks, force-closing`,
 								timestamp: Date.now()
-							} as ILightningError);
+							});
 						} catch {
 							// Ignore force-close errors
 						}
@@ -32900,7 +32881,7 @@ export class LightningNode extends EventEmitter {
 										this.reestablishTimeoutBlocks
 									} blocks with no close from the peer; force-closing to recover funds`,
 									timestamp: Date.now()
-								} as ILightningError);
+								});
 							} catch {
 								// Ignore force-close errors
 							}
@@ -32952,7 +32933,7 @@ export class LightningNode extends EventEmitter {
 									state.state
 								} for > 10 blocks, force-closing`,
 								timestamp: Date.now()
-							} as ILightningError);
+							});
 						} catch {
 							// Ignore force-close errors
 						}

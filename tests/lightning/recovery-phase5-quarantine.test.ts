@@ -517,7 +517,6 @@ describe('Recovery phase 5: startup quarantine', () => {
 		const configA = makeNodeConfig(4, storageA);
 		configA.recovery = { enabled: true, startupGate: gate };
 		const nodeA = new LightningNode(configA);
-		nodeA.on('error', () => {});
 		nodeA.on('node:error', () => {});
 		const wireMessages: Array<{ peer: string; type: number }> = [];
 		nodeA.on('message:outbound', (peer: string, type: number) => {
@@ -560,7 +559,6 @@ describe('Recovery phase 5: startup quarantine', () => {
 		// silently quarantined.
 		const storage = openStorage();
 		const node = new LightningNode(makeNodeConfig(5, storage));
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 		expect(node.getRecoveryGateState()).to.equal('disabled');
 		node.destroy();
@@ -588,13 +586,11 @@ describe('Recovery phase 5: startup quarantine', () => {
 		const configA = { ...makeNodeConfig(6, storageA), enableNetworking: true };
 		configA.recovery = { enabled: true, startupGate: gate };
 		const a = new LightningNode(configA);
-		a.on('error', () => {});
 		a.on('node:error', () => {});
 
 		const storageB = openStorage();
 		const configB = { ...makeNodeConfig(7, storageB), enableNetworking: true };
 		const b = new LightningNode(configB);
-		b.on('error', () => {});
 		b.on('node:error', () => {});
 
 		try {
@@ -722,7 +718,6 @@ describe('Recovery phase 5: startup quarantine', () => {
 		const peerKey = getPublicKey(makeSeed(98)).toString('hex');
 
 		const plain = new LightningNode(makeNodeConfig(88, openStorage()));
-		plain.on('error', () => {});
 		plain.on('node:error', () => {});
 		let plainEmitted = 0;
 		plain.on('message:outbound', () => {
@@ -742,7 +737,6 @@ describe('Recovery phase 5: startup quarantine', () => {
 			startupGate: gateFor(storage, rep, events)
 		};
 		const gated = new LightningNode(config);
-		gated.on('error', () => {});
 		gated.on('node:error', () => {});
 		let emitted = 0;
 		gated.on('message:outbound', () => {
@@ -768,7 +762,6 @@ describe('Recovery phase 5: startup quarantine', () => {
 		const errorPayload = Buffer.alloc(34);
 
 		const plain = new LightningNode(makeNodeConfig(89, openStorage()));
-		plain.on('error', () => {});
 		plain.on('node:error', () => {});
 		let plainHandled = 0;
 		const plainCm = plain.getChannelManager() as any;
@@ -791,7 +784,6 @@ describe('Recovery phase 5: startup quarantine', () => {
 			startupGate: gateFor(storage, rep, events)
 		};
 		const gated = new LightningNode(config);
-		gated.on('error', () => {});
 		gated.on('node:error', () => {});
 		let handled = 0;
 		const cm = gated.getChannelManager() as any;
@@ -825,7 +817,6 @@ describe('Recovery phase 5: startup quarantine', () => {
 		const config = { ...makeNodeConfig(11, storage), enableNetworking: true };
 		config.recovery = { enabled: true, startupGate: gate };
 		const node = new LightningNode(config);
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 		expect((node as any)._autoReconnectDeferred).to.equal(true);
 		expect((node as any)._reconnectTimers.size).to.equal(0);

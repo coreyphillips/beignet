@@ -1309,8 +1309,14 @@ export interface INodeInfo {
 	asyncReceiveService: import('../async-payments/types').IAsyncReceiveServiceMetrics;
 }
 
-export interface ILightningError {
-	code: string;
+/**
+ * A `node:error` payload. Listeners receive `ILightningError<NodeErrorCode>`,
+ * so a switch over `code` can be exhaustive. The parameter defaults to string
+ * for one minor release, so code that builds an ILightningError of its own
+ * keeps compiling; the default becomes NodeErrorCode after that.
+ */
+export interface ILightningError<C extends string = string> {
+	code: C;
 	channelId?: Buffer;
 	message: string;
 	timestamp: number;

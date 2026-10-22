@@ -60,7 +60,6 @@ function createTestNode(): LightningNode {
 		fundingPrivkey,
 		network: Network.REGTEST
 	});
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

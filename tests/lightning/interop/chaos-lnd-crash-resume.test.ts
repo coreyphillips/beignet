@@ -127,9 +127,6 @@ describe('Interop chaos: LND crash-resume (regtest)', function () {
 		n.on('node:error', () => {
 			/* absorb */
 		});
-		n.on('error', () => {
-			/* absorb */
-		});
 		return n;
 	};
 

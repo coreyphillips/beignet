@@ -166,7 +166,6 @@ function nodePair(
 	});
 	const bob = new LightningNode(nodeConfig('bob'));
 	for (const n of [alice, bob]) {
-		n.on('error', () => undefined);
 		n.on('node:error', () => undefined);
 	}
 	const deliver = (from: LightningNode, to: LightningNode) => {
@@ -786,7 +785,6 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 			storage,
 			jitReceive: { enabled: true }
 		});
-		node.on('error', () => undefined);
 		node.on('node:error', () => undefined);
 		try {
 			// The channel and its committed inbound HTLC come back from channel
@@ -897,7 +895,6 @@ describe('JIT receive on LightningNode (issue #594)', function () {
 			storage,
 			jitReceive: { enabled: true }
 		});
-		node.on('error', () => undefined);
 		node.on('node:error', () => undefined);
 		try {
 			const state = createOpenerState({

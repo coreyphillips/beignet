@@ -1218,7 +1218,9 @@ interface ReadinessCheck {
   message: string;
 }
 
-// BeignetNode extends EventEmitter and emits these typed events:
+// BeignetNode is a typed emitter: on, once and emit accept only the events of
+// BeignetNodeEvents (src/cli/types.ts), so a misspelled name does not compile.
+// Some of them:
 interface BeignetNodeEvents {
   'payment:received': (info: PaymentInfo) => void;
   'payment:sent': (info: PaymentInfo) => void;

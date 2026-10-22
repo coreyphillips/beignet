@@ -50,7 +50,6 @@ function makeNode(): LightningNode {
 		fundingPrivkey: crypto.randomBytes(32),
 		localFeatures: LightningNode.defaultFeatures()
 	});
-	node.on('error', () => {});
 	return node;
 }
 

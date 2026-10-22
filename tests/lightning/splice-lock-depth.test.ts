@@ -1426,7 +1426,6 @@ describe('Splice lock depth on the node (issue #760)', function () {
 		const alice = new LightningNode(configA);
 		const bob = new LightningNode(makeNodeConfig(seedBase + 1));
 		for (const n of [alice, bob]) {
-			n.on('error', () => {});
 			n.on('node:error', () => {});
 		}
 		const outbound: number[] = [];
