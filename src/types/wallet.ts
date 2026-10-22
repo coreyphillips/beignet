@@ -134,26 +134,28 @@ export interface IFormattedTransaction {
 	scriptHash: string;
 	// Each amount is held in sats (the *Sats fields) and in BTC, as decoded
 	// from the raw transaction. The BTC fields are deprecated and go in the
-	// next major release.
+	// next major release. Until then the sats fields are optional, so code
+	// that builds or stores records without them still compiles. The wallet
+	// sets them on every record it formats or loads.
 	/** @deprecated BTC: use totalInputSats. */
 	totalInputValue: number;
 	/** The sum of the outputs the inputs spend. */
-	totalInputSats: Sats;
+	totalInputSats?: Sats;
 	/** @deprecated BTC: use matchedInputSats. */
 	matchedInputValue: number;
 	/** The part of totalInputSats this wallet's addresses held. */
-	matchedInputSats: Sats;
+	matchedInputSats?: Sats;
 	/** @deprecated BTC: use totalOutputSats. */
 	totalOutputValue: number;
-	totalOutputSats: Sats;
+	totalOutputSats?: Sats;
 	/** @deprecated BTC: use matchedOutputSats. */
 	matchedOutputValue: number;
 	/** The part of totalOutputSats paid to this wallet's addresses. */
-	matchedOutputSats: Sats;
+	matchedOutputSats?: Sats;
 	/** @deprecated BTC: use feeSats. */
 	fee: number;
 	/** 0 for a coinbase, which pays no fee. */
-	feeSats: Sats;
+	feeSats?: Sats;
 	/** The fee rate in sat/vB, rounded to a whole number. */
 	satsPerByte: number;
 	type: EPaymentType;
@@ -163,7 +165,7 @@ export interface IFormattedTransaction {
 	 * matchedOutputSats minus matchedInputSats: negative for a send, and then
 	 * it includes the fee.
 	 */
-	valueSats: Sats;
+	valueSats?: Sats;
 	txid: string;
 	messages: string[];
 	vin: TFormattedVin[];
