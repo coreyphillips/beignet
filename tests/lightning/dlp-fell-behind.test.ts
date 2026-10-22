@@ -65,6 +65,7 @@ import {
 	realInitialCommitmentSig,
 	realCommitmentSigs
 } from './helpers/real-signing';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -568,7 +569,7 @@ describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 	describe('forceClose - broadcast refusal after data loss', function () {
 		it('refuses to broadcast the stale commitment once dataLossDetected is set', function () {
 			const { opener, openerPrivkeys } = setupNormalChannels();
-			opener.getFullState().dataLossDetected = true;
+			writableState(opener).dataLossDetected = true;
 
 			const signer = new ChannelSigner(openerPrivkeys[0]);
 			const actions = opener.forceClose(signer);
@@ -603,7 +604,7 @@ describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 	describe('Serialization - DLP fields round-trip', function () {
 		it('preserves dataLossDetected and dlpRemotePerCommitmentPoint', function () {
 			const { opener } = setupNormalChannels();
-			const state = opener.getFullState();
+			const state = writableState(opener);
 			const point = makeForeignPoint('serialized-point');
 			state.dataLossDetected = true;
 			state.dlpRemotePerCommitmentPoint = point;
@@ -643,7 +644,7 @@ describe('DLP fell-behind recovery (BOLT 2 data loss protection)', function () {
 				onionRoutingPacket: Buffer.alloc(1366)
 			});
 
-			const state = opener.getFullState();
+			const state = writableState(opener);
 			const futurePoint = makeForeignPoint('monitor-future-point');
 			state.dataLossDetected = true;
 			state.dlpRemotePerCommitmentPoint = futurePoint;

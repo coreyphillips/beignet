@@ -68,6 +68,7 @@ import {
 	realInitialCommitmentSig,
 	realCommitmentSigs
 } from './helpers/real-signing';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -312,7 +313,7 @@ describe('Chain Integration (Phase 4D)', function () {
 			const signer = new ChannelSigner(openerPrivkeys[0]);
 
 			// A cooperatively-closed channel has nothing to force close.
-			opener.getFullState().state = ChannelState.CLOSED;
+			writableState(opener).state = ChannelState.CLOSED;
 			const actions = opener.forceClose(signer);
 			const errorAction = actions.find(
 				(a) => a.type === ChannelActionType.ERROR

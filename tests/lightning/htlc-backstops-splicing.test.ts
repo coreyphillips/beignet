@@ -30,6 +30,7 @@ import { ChannelSigner } from '../../src/lightning/keys/signer';
 import { buildLocalCommitment } from '../../src/lightning/channel/commitment-builder';
 import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivation';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -367,10 +368,9 @@ describe('Issue #774: the HTLC backstops on a splicing channel', function () {
 		it('is admitted through the reestablish wrapper', async () => {
 			const fx = await setup(7761);
 			putInSplicing(fx.alice, fx.channelId);
-			const state = fx.alice
-				.getChannelManager()
-				.getChannel(fx.channelId)!
-				.getFullState();
+			const state = writableState(
+				fx.alice.getChannelManager().getChannel(fx.channelId)!
+			);
 			state.preReestablishState = ChannelState.SPLICING;
 			state.state = ChannelState.AWAITING_REESTABLISH;
 			heldInbound(fx);

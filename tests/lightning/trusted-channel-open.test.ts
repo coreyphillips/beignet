@@ -39,6 +39,7 @@ import { MessageType } from '../../src/lightning/message/types';
 import { SpliceState } from '../../src/lightning/channel/splice';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import * as bitcoin from 'bitcoinjs-lib';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -576,7 +577,7 @@ describe('Trusted channel payments (LightningNode level)', function () {
 			g.applyChannelUpdate({ ...base });
 			g.applyChannelUpdate({ ...base, channelFlags: 1 });
 			const ch = n.getChannelManager().getChannel(channelId);
-			if (ch) ch.getFullState().shortChannelId = scid;
+			if (ch) writableState(ch).shortChannelId = scid;
 			n.registerChannelScid(channelId, scid);
 		}
 

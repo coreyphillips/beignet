@@ -55,6 +55,7 @@ import {
 	setupNormalChannels
 } from './helpers/revoked-commitment-fixture';
 import { realCommitmentSigs } from './helpers/real-signing';
+import { writableState } from './helpers/writable-state';
 
 const NETWORK = bitcoin.networks.regtest;
 const PEER = getPublicKey(Buffer.alloc(32, 7)).toString('hex');
@@ -619,7 +620,7 @@ describe('Revoked HTLC snapshot store', function () {
 		): { channelId: string; history: Map<string, IHtlcSnapshotEntry[]> } {
 			const { opener } = setupNormalChannels();
 			const channelId = opener.getChannelId()!.toString('hex');
-			const state = opener.getFullState();
+			const state = writableState(opener);
 			if (compact) state.compactHtlcHistory = true;
 			state.revokedHtlcSnapshots = new Map([
 				['0', []],

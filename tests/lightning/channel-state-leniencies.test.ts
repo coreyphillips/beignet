@@ -32,6 +32,7 @@ import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { IUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
 import { MessageType } from '../../src/lightning/message/types';
+import { writableState } from './helpers/writable-state';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -242,7 +243,7 @@ describe('Channel state-machine leniencies (issue #1047)', function () {
 					}
 				]
 			});
-			channel.getFullState().pendingFeeratePerKw = 5_000;
+			writableState(channel).pendingFeeratePerKw = 5_000;
 			const actions = channel.handleUpdateAddHtlc(addMsg(channel, 1_000n));
 			expect(errorOf(actions)).to.equal(
 				'Remote cannot afford HTLC above channel reserve'

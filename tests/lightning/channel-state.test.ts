@@ -43,6 +43,7 @@ import {
 	realCommitmentSigs
 } from './helpers/real-signing';
 import { expectWireFailure, wireRefusalOf } from './helpers/open-refusal';
+import { writableState } from './helpers/writable-state';
 
 /** Sign the peer's next commitment for real and send commitment_signed. */
 function signRealCommitment(channel: ChannelClass): any[] {
@@ -1376,7 +1377,7 @@ describe('Channel State Machine', function () {
 				signRealCommitment(opener),
 				MessageType.COMMITMENT_SIGNED
 			);
-			acceptor.getFullState().remoteBasepoints = null;
+			writableState(acceptor).remoteBasepoints = null;
 			const actions = acceptor.handleCommitmentSigned(
 				decodeCommitmentSignedMessage(sigMsg.payload)
 			);

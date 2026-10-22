@@ -62,6 +62,7 @@ import {
 	realCommitmentSigs
 } from './helpers/real-signing';
 import { expectWireFailure } from './helpers/open-refusal';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -202,8 +203,8 @@ function setupLeasedPair(): {
 
 	// Dress as a leased anchor channel: seller is the lessor.
 	const anchorType = makeAnchorChannelType();
-	const bs = buyer.getFullState();
-	const ss = seller.getFullState();
+	const bs = writableState(buyer);
+	const ss = writableState(seller);
 	bs.channelType = anchorType;
 	ss.channelType = anchorType;
 	bs.leaseExpiry = LEASE_EXPIRY;
@@ -284,7 +285,7 @@ describe('update_blockheight (bLIP-0051, lessor side)', function () {
 
 	it('fails the channel on the wire on a non-leased channel', function () {
 		const { seller } = setupLeasedPair();
-		seller.getFullState().leaseExpiry = undefined;
+		writableState(seller).leaseExpiry = undefined;
 		const actions = seller.handleUpdateBlockheight(updateMsg(seller, NEW_BH));
 		expectWireFailure(
 			actions,
@@ -340,7 +341,7 @@ describe('update_blockheight (bLIP-0051, lessor side)', function () {
 
 	it('applies the staged height to the opener-signed commitment immediately, and to commitments we sign only once signable', function () {
 		const { seller } = setupLeasedPair();
-		const ss = seller.getFullState();
+		const ss = writableState(seller);
 		seller.setBlockHeight(NEW_BH);
 		seller.handleUpdateBlockheight(updateMsg(seller, NEW_BH));
 
@@ -380,7 +381,7 @@ describe('update_blockheight (bLIP-0051, lessor side)', function () {
 		seller.handleUpdateBlockheight(updateMsg(seller, NEW_BH));
 		// Emulate the CLN buyer: it bakes the new height into everything it
 		// signs from the moment it sends update_blockheight.
-		buyer.getFullState().leaseCommitBlockheight = NEW_BH;
+		writableState(buyer).leaseCommitBlockheight = NEW_BH;
 
 		exchangeCommitments(buyer, seller);
 
@@ -407,7 +408,7 @@ describe('update_blockheight (bLIP-0051, lessor side)', function () {
 		const b = setupLeasedPair();
 		b.seller.setBlockHeight(NEW_BH);
 		b.seller.handleUpdateBlockheight(updateMsg(b.seller, NEW_BH));
-		b.seller.getFullState().pendingLeaseBlockheightSignable = true;
+		writableState(b.seller).pendingLeaseBlockheightSignable = true;
 		b.seller.markForReestablish();
 		expect(b.seller.getFullState().pendingLeaseBlockheight).to.equal(NEW_BH);
 	});
@@ -422,7 +423,7 @@ describe('update_blockheight (bLIP-0051, lessor side)', function () {
 
 	it('classifies a to_remote built at an OLD height via the height history', function () {
 		const { seller } = setupLeasedPair();
-		const ss = seller.getFullState();
+		const ss = writableState(seller);
 		// The channel advanced through two update_blockheight rounds.
 		ss.leaseCommitBlockheight = NEW_BH + 50;
 		ss.leaseHeightHistory = [OPEN_BH, NEW_BH, NEW_BH + 50];

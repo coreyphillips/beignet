@@ -47,6 +47,7 @@ import {
 	vouchers,
 	why
 } from './helpers/ffor-concurrent-pair';
+import { writableState } from './helpers/writable-state';
 
 /** Whole-satoshi vouchers, all above the dust limit. */
 const BOOK = [1_000_000n, 2_000_000n, 50_000_000n];
@@ -112,8 +113,8 @@ function funderHeadroomMsat(pair: IPair): bigint {
  * of that size would have left the channel, without the rounds.
  */
 function setFunderHeadroom(pair: IPair, headroomMsat: bigint): void {
-	const f = channel(pair, pair.funder).getFullState();
-	const o = channel(pair, other(pair.funder)).getFullState();
+	const f = writableState(channel(pair, pair.funder));
+	const o = writableState(channel(pair, other(pair.funder)));
 	const delta = f.localBalanceMsat - (funderReserveMsat(pair) + headroomMsat);
 	f.localBalanceMsat -= delta;
 	o.remoteBalanceMsat -= delta;
@@ -492,8 +493,8 @@ describe('FFOR concurrent receive: capacity (CONCURRENT-RECEIVE.md 3.1, 4)', fun
 		/** R's ledger loses voucher k on both books, as a local fault would. */
 		function dropVoucher(pair: IPair, k: number): bigint {
 			const id = record(pair.rChannel).sHtlcIdBase! + BigInt(k - 1);
-			const r = pair.rChannel.getFullState();
-			const s = pair.sChannel.getFullState();
+			const r = writableState(pair.rChannel);
+			const s = writableState(pair.sChannel);
 			const amount = r.htlcs.get(`received-${id}`)!.amountMsat;
 			r.htlcs.delete(`received-${id}`);
 			s.htlcs.delete(`offered-${id}`);

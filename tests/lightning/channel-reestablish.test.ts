@@ -43,6 +43,7 @@ import {
 	realInitialCommitmentSig,
 	realCommitmentSigs
 } from './helpers/real-signing';
+import { writableState } from './helpers/writable-state';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	// Real curve points: open/accept validation now rejects off-curve
@@ -640,8 +641,8 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 		// next_revocation 5, and one behind at 5 and 4.
 		const atFive = (): { opener: Channel; openerSeed: Buffer } => {
 			const { opener, openerSeed } = setupNormalChannels();
-			opener.getFullState().localCommitmentNumber = 5n;
-			opener.getFullState().remoteCommitmentNumber = 5n;
+			writableState(opener).localCommitmentNumber = 5n;
+			writableState(opener).remoteCommitmentNumber = 5n;
 			opener.markForReestablish();
 			return { opener, openerSeed };
 		};
@@ -697,7 +698,7 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 
 		it('keeps a held row held when failing a peer that is behind (issue #1047)', function () {
 			const { opener, openerSeed } = atFive();
-			opener.getFullState().restoreRecencyUnproven = true;
+			writableState(opener).restoreRecencyUnproven = true;
 			opener.handleReestablish(reestablishAt(opener, openerSeed, 4n, 5n));
 			expect(opener.getState()).to.equal(ChannelState.ERRORED);
 			expect(opener.getRecoveryCloseReason()).to.equal('restore-unproven');
@@ -897,7 +898,7 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			opener.signCommitment(crypto.randomBytes(64), [crypto.randomBytes(64)]);
 			opener.markForReestablish();
 
-			const state = opener.getFullState();
+			const state = writableState(opener);
 			// option_taproot: the peer's signing nonce for the current commitment is
 			// persisted so a restored taproot channel can still force-close.
 			state.remoteSigningNonce = crypto.randomBytes(66);
@@ -1312,7 +1313,7 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 				dustLimitSatoshis: '1062',
 				fundingVersion: 2
 			});
-			const state = channel.getFullState();
+			const state = writableState(channel);
 			state.localBalanceMsat = 1_200_000n;
 			state.role = ChannelRole.ACCEPTOR;
 			// The row was serialised from the OPENER, so its remote balance is

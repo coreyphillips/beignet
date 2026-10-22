@@ -3652,7 +3652,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					restoredCommitment?.commitmentType ===
 						CommitmentType.THEIR_REVOKED_COMMITMENT
 				) {
-					channelState.state = ChannelState.FORCE_CLOSED;
+					channel.reopenForceCloseResolution();
 					this.dirtyMonitors.add(channelId);
 					this.persistChannel(Buffer.from(channelId, 'hex'));
 					this.emitStructuredLog('channel', 'resolution_reopened', {
@@ -7809,8 +7809,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				builtTxHex = txHex;
 				builtTxidHex = txid.toString('hex');
 				// Set funding outpoint on state before signing (required for commitment building)
-				state.fundingTxid = txid;
-				state.fundingOutputIndex = outputIndex;
+				channel.setFundingOutpoint(txid, outputIndex);
 
 				// Sign the remote's initial commitment (use channel signer for per-channel keys)
 				const signer =
@@ -7835,7 +7834,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				// funding_signed carries the bytes beside the obligation and a
 				// guardian restore can actually discharge what it restores. The
 				// node's own map stays as the runtime index.
-				state.pendingFundingTxHex = txHex;
+				channel.retainFundingPayload(txHex);
 				this.setPendingFundingTx(txid.toString('hex'), txHex);
 
 				// Send funding_created. The broadcast now waits for the
@@ -8099,9 +8098,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// obligation; losing it costs nothing, since by then the funding is
 		// confirmed or the channel is gone.
 		for (const channel of this.channelManager.listChannels()) {
-			const state = channel.getFullState();
-			if (state.fundingTxid?.toString('hex') !== txidHex) continue;
-			delete state.pendingFundingTxHex;
+			if (channel.getFullState().fundingTxid?.toString('hex') !== txidHex) {
+				continue;
+			}
+			channel.clearRetainedFundingPayload();
 			break;
 		}
 		if (this.pendingFundingTxs.delete(txidHex)) {
@@ -11031,15 +11031,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		outputIndex: number
 	): void {
 		const channel = this.channelManager.getChannel(channelId);
-		if (!channel) return;
-		const state = channel.getFullState();
-		const remaining = (state.preSpliceSpendWatches ?? []).filter(
-			(w) => !(w.txid === txid && w.outputIndex === outputIndex)
-		);
-		if (remaining.length === (state.preSpliceSpendWatches ?? []).length) {
-			return;
-		}
-		state.preSpliceSpendWatches = remaining.length ? remaining : undefined;
+		if (!channel?.retirePreSpliceSpendWatch(txid, outputIndex)) return;
 		this.persistChannel(channelId);
 	}
 
@@ -32802,9 +32794,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					: state.state;
 			if (effectiveState === ChannelState.AWAITING_FUNDING_CONFIRMED) {
 				// Stamp broadcast height on first observation (lazy init for channels created before this field)
-				if (state.fundingBroadcastHeight === 0 && blockHeight > 0) {
-					state.fundingBroadcastHeight = blockHeight;
-				}
+				channel.stampFundingBroadcastHeight(blockHeight);
 				// If channel has been waiting for funding confirmation for > 2016 blocks
 				if (
 					state.fundingBroadcastHeight > 0 &&

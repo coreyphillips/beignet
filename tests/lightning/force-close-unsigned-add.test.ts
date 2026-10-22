@@ -40,6 +40,7 @@ import {
 } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { MessageType } from '../../src/lightning/message/types';
+import { writableState } from './helpers/writable-state';
 
 // ─── Node plumbing (model: errored-channel-backstops.test.ts) ───
 
@@ -614,7 +615,7 @@ describe('The force-close rebuild and an unsigned add (issue #643)', function ()
 		const f = stalledAdd(670, { signsTheAdd: false });
 		delete f.entry.addRemoteSigned;
 		const channel = f.alice.getChannelManager().getChannel(f.channelId)!;
-		channel.getFullState().remoteCommitmentSignature = crypto.randomBytes(64);
+		writableState(channel).remoteCommitmentSignature = crypto.randomBytes(64);
 
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const manager = f.alice.getChannelManager() as any;

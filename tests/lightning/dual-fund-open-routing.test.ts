@@ -20,6 +20,7 @@ import {
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
+import { writableState } from './helpers/writable-state';
 
 function makeBasepoints(): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -465,7 +466,7 @@ describe('Issue #158: openChannel routes v1 vs v2 by peer features', function ()
 		const channel = node.openChannelV2(peerPubkey, {
 			fundingSatoshis: 100_000n
 		});
-		channel.getFullState().channelId = crypto.randomBytes(32);
+		writableState(channel).channelId = crypto.randomBytes(32);
 		const infos = node.listChannels();
 		expect(infos.length).to.equal(1);
 		expect(infos[0].peerPubkey, 'peer resolved via temp id').to.equal(

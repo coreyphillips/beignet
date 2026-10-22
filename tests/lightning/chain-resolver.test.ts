@@ -68,6 +68,7 @@ import {
 	realInitialCommitmentSig,
 	realCommitmentSigs
 } from './helpers/real-signing';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -541,7 +542,7 @@ describe('Output Resolver (Phase 4B)', function () {
 			const sigs = realCommitmentSigs(opener);
 			opener.signCommitment(sigs.signature, sigs.htlcSignatures);
 
-			const winState = opener.getFullState();
+			const winState = writableState(opener);
 			expect(winState.localCommitmentNumber).to.equal(0n);
 			expect(winState.remoteCommitmentNumber).to.equal(1n);
 			expect(winState.remoteRevocationNumber).to.equal(0n);
@@ -596,7 +597,7 @@ describe('Output Resolver (Phase 4B)', function () {
 			const { opener, acceptor, acceptorCommitmentSeed } =
 				setupNormalChannels();
 			exchangeCommitments(opener, acceptor);
-			const winState = acceptor.getFullState();
+			const winState = writableState(acceptor);
 			winState.remoteCommitmentNumber = 2n;
 			winState.remoteRevocationNumber = 1n;
 			winState.localBalanceMsat = 0n;
@@ -671,7 +672,7 @@ describe('Output Resolver (Phase 4B)', function () {
 
 			const sigs = realCommitmentSigs(opener);
 			opener.signCommitment(sigs.signature, sigs.htlcSignatures);
-			const winState = opener.getFullState();
+			const winState = writableState(opener);
 
 			const peerNewTx = buildRemoteCommitment(winState, nextPoint, 1n).result
 				.tx;
@@ -912,7 +913,7 @@ describe('Output Resolver (Phase 4B)', function () {
 
 		it('classifies our leased (lessor) commitment and tracks the locked to_local', function () {
 			const { opener } = setupNormalChannels();
-			const state = opener.getFullState();
+			const state = writableState(opener);
 			state.isLessor = true;
 			state.leaseExpiry = LEASE_EXPIRY;
 			state.leaseCommitBlockheight = LEASE_COMMIT_BH;
@@ -956,7 +957,7 @@ describe('Output Resolver (Phase 4B)', function () {
 
 		it('classifies the lessor peer commitment and tracks their locked to_local', function () {
 			const { opener } = setupNormalChannels();
-			const state = opener.getFullState();
+			const state = writableState(opener);
 			state.isLessor = false;
 			state.leaseExpiry = LEASE_EXPIRY;
 			state.leaseCommitBlockheight = LEASE_COMMIT_BH;
@@ -986,7 +987,7 @@ describe('Output Resolver (Phase 4B)', function () {
 
 		it('penalizes the locked to_local of a revoked leased peer commitment', function () {
 			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
-			const preState = opener.getFullState();
+			const preState = writableState(opener);
 			preState.isLessor = false;
 			preState.leaseExpiry = LEASE_EXPIRY;
 			preState.leaseCommitBlockheight = LEASE_COMMIT_BH;
@@ -1056,7 +1057,7 @@ describe('Output Resolver (Phase 4B)', function () {
 		// witnessScript fails (BIP65) and the entire lessor to_local is stranded.
 		it('builds our lessor to_local sweep with input sequence = lease_csv, no nLockTime', function () {
 			const { opener } = setupNormalChannels();
-			const state = opener.getFullState();
+			const state = writableState(opener);
 			state.isLessor = true;
 			state.leaseExpiry = LEASE_EXPIRY;
 			state.leaseCommitBlockheight = LEASE_COMMIT_BH;
@@ -1350,7 +1351,7 @@ describe('Output Resolver (Phase 4B)', function () {
 		it('H2: penalizes a revoked HTLC output reconstructed from the snapshot (HTLC gone from live state)', function () {
 			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
 			exchangeCommitments(opener, acceptor);
-			const state = opener.getFullState();
+			const state = writableState(opener);
 
 			const secret = state.shaChainStore.getSecret(MAX_INDEX - 0n)!;
 			const revokedPoint = perCommitmentPointFromSecret(secret);
@@ -1544,7 +1545,7 @@ describe('Output Resolver (Phase 4B)', function () {
 			} = require('../../src/lightning/keys/derivation');
 
 			const { opener, openerPrivkeys } = setupNormalChannels();
-			const state = opener.getFullState();
+			const state = writableState(opener);
 			const flags = FeatureFlags.empty();
 			flags.setCompulsory(Feature.OPTION_TAPROOT);
 			state.channelType = flags.toBuffer();

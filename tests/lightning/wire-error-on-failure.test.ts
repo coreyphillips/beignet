@@ -39,6 +39,7 @@ import {
 	createOpenerState,
 	IV2InFlight
 } from '../../src/lightning/channel/channel-state';
+import { writableState } from './helpers/writable-state';
 
 const sha256 = (b: Buffer): Buffer =>
 	crypto.createHash('sha256').update(b).digest();
@@ -365,8 +366,8 @@ describe('wire error + channel failure on peer protocol violations', function ()
 				[t.aChannel, 700_000_000n, 300_000_000n],
 				[t.bChannel, 300_000_000n, 700_000_000n]
 			] as const) {
-				ch.getFullState().localBalanceMsat = local;
-				ch.getFullState().remoteBalanceMsat = remote;
+				writableState(ch).localBalanceMsat = local;
+				writableState(ch).remoteBalanceMsat = remote;
 			}
 			// Freeze the negotiation right after the shutdown exchange: A's first
 			// closing_signed is dropped, so both sides hold scripts + state and
@@ -490,8 +491,8 @@ describe('wire error + channel failure on peer protocol violations', function ()
 
 		/** Leave A (the opener) `aSat` of the 1M sat channel. */
 		function setOpenerSats(t: IPair, aSat: bigint): void {
-			const a = t.aChannel.getFullState();
-			const b = t.bChannel.getFullState();
+			const a = writableState(t.aChannel);
+			const b = writableState(t.bChannel);
 			a.localBalanceMsat = b.remoteBalanceMsat = aSat * 1000n;
 			a.remoteBalanceMsat = b.localBalanceMsat = (1_000_000n - aSat) * 1000n;
 		}
@@ -665,8 +666,8 @@ describe('undecodable-payload decode guards (issue 426)', function () {
 		// cleanup, NO PERSIST_STATE and no condemned stamp (the same rule as
 		// the other pre-funding arms).
 		const channel = makeV2SigStageChannel();
-		channel.getFullState().state = ChannelState.DUAL_FUNDING_V2;
-		channel.getFullState().v2InFlight = null;
+		writableState(channel).state = ChannelState.DUAL_FUNDING_V2;
+		writableState(channel).v2InFlight = null;
 
 		const actions = channel.failFromMalformedPeerMessage(
 			'Undecodable tx_add_output: boom'
@@ -688,8 +689,8 @@ describe('undecodable-payload decode guards (issue 426)', function () {
 		// registration and the record must all survive (cleanup 'none'), and
 		// the row is NOT condemned.
 		const channel = makeV2SigStageChannel();
-		channel.getFullState().v2InFlight = makeV2Record();
-		channel.getFullState().pendingFundingTxHex = 'aa';
+		writableState(channel).v2InFlight = makeV2Record();
+		writableState(channel).pendingFundingTxHex = 'aa';
 		expect(channel.isV2AttemptBroadcastable()).to.equal(true);
 
 		const actions = channel.failFromMalformedPeerMessage(
@@ -725,7 +726,7 @@ describe('undecodable-payload decode guards (issue 426)', function () {
 		// non-broadcastable attempt and void the channel instead of
 		// force-closing into a funding tx that can never exist.
 		const channel = makeV2SigStageChannel();
-		channel.getFullState().v2InFlight = makeV2Record();
+		writableState(channel).v2InFlight = makeV2Record();
 		expect(channel.isV2AttemptBroadcastable()).to.equal(false);
 
 		const actions = channel.failFromMalformedPeerMessage(
@@ -761,8 +762,8 @@ describe('undecodable-payload decode guards (issue 426)', function () {
 		const replacement = makeV2Record();
 		replacement.fundingTxid = Buffer.alloc(32, 0x0a);
 		replacement.rbfAttempt = 1;
-		channel.getFullState().v2InFlight = replacement;
-		channel.getFullState().v2PreviousAttempts = [previous];
+		writableState(channel).v2InFlight = replacement;
+		writableState(channel).v2PreviousAttempts = [previous];
 
 		const actions = channel.failFromMalformedPeerMessage(
 			'Undecodable commitment_signed: boom'
@@ -791,9 +792,9 @@ describe('undecodable-payload decode guards (issue 426)', function () {
 		// and reestablish recovery; the channel itself is healthy and funded,
 		// so garbage mid-splice must not wire-fail it.
 		const channel = makeV2SigStageChannel();
-		channel.getFullState().fundingVersion = 1;
-		channel.getFullState().v2InFlight = null;
-		channel.getFullState().state = ChannelState.SPLICING;
+		writableState(channel).fundingVersion = 1;
+		writableState(channel).v2InFlight = null;
+		writableState(channel).state = ChannelState.SPLICING;
 
 		const actions = channel.failFromMalformedPeerMessage(
 			'Undecodable tx_add_input: boom'

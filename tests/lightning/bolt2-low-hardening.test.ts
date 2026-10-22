@@ -63,6 +63,7 @@ import {
 import { decodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
 import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivation';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
+import { writableState } from './helpers/writable-state';
 
 function realBasepoints(seed?: Buffer): IChannelBasepoints {
 	// With a seed, derive with the seedKey convention so signerFromSeed(seed)
@@ -886,11 +887,11 @@ describe('BOLT 2 LOW hardening batch', function () {
 						MAX_INDEX - n
 					)
 				);
-			opener.getFullState().remoteNextPerCommitmentPoint = pointAt(
+			writableState(opener).remoteNextPerCommitmentPoint = pointAt(
 				acceptor,
 				1n
 			);
-			acceptor.getFullState().remoteNextPerCommitmentPoint = pointAt(
+			writableState(acceptor).remoteNextPerCommitmentPoint = pointAt(
 				opener,
 				1n
 			);

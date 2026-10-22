@@ -59,6 +59,7 @@ import { MessageType } from '../../src/lightning/message/types';
 import { decodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
 import { PeerManager } from '../../src/lightning/transport/peer-manager';
 import * as lightning from '../../src/lightning';
+import { writableState } from './helpers/writable-state';
 
 // ─────────────── Helpers ───────────────
 
@@ -217,7 +218,7 @@ function openReadyChannel(
 	// to path topology, so pin the published branch on both nodes.
 	for (const n of [alice, bob]) {
 		for (const ch of n.getChannelManager().listChannels()) {
-			const st = ch.getFullState();
+			const st = writableState(ch);
 			st.announceChannel = true;
 			st.announcementSigsSent = true;
 			st.announcementSigsReceived = true;
@@ -1738,10 +1739,9 @@ describe('Lightning Node', function () {
 			});
 			lsp.registerChannelScid(abChannelId, scidAB);
 			lsp.registerChannelScid(bcChannelId, scidBC);
-			carol
-				.getChannelManager()
-				.getChannel(bcChannelId)!
-				.getFullState().shortChannelId = scidBC;
+			writableState(
+				carol.getChannelManager().getChannel(bcChannelId)!
+			).shortChannelId = scidBC;
 
 			buildThreeNodeGraph(alice, lsp, carol, scidAB, scidBC);
 			await registerAsyncReceive(carol, lsp, scidBC);
@@ -1827,10 +1827,9 @@ describe('Lightning Node', function () {
 			});
 			lsp.registerChannelScid(abChannelId, scidAB);
 			lsp.registerChannelScid(bcChannelId, scidBC);
-			carol
-				.getChannelManager()
-				.getChannel(bcChannelId)!
-				.getFullState().shortChannelId = scidBC;
+			writableState(
+				carol.getChannelManager().getChannel(bcChannelId)!
+			).shortChannelId = scidBC;
 			buildThreeNodeGraph(alice, lsp, carol, scidAB, scidBC);
 			await registerAsyncReceive(carol, lsp, scidBC);
 
@@ -2060,7 +2059,7 @@ describe('Lightning Node', function () {
 			// Dave's channel needs an SCID Carol recognizes so the generated peer
 			// hop can name the forwarding channel.
 			const daveChannel = dave.getChannelManager().getChannel(cdChannelId)!;
-			daveChannel.getFullState().scidAlias = scidCD;
+			writableState(daveChannel).scidAlias = scidCD;
 
 			// Dave's graph knows the public Bob↔Carol edge (Bob's policy authored
 			// for the Bob→Carol direction) — the raw material for the extension.
@@ -2298,10 +2297,9 @@ describe('Lightning Node', function () {
 			bob.registerChannelScid(bcChannelId, scidBC);
 
 			// Charlie must embed scidBC in its blinded path so Bob can forward to it.
-			charlie
-				.getChannelManager()
-				.getChannel(bcChannelId)!
-				.getFullState().shortChannelId = scidBC;
+			writableState(
+				charlie.getChannelManager().getChannel(bcChannelId)!
+			).shortChannelId = scidBC;
 
 			// Alice needs a route to the introduction node (Bob).
 			buildThreeNodeGraph(alice, bob, charlie, scidAB, scidBC);

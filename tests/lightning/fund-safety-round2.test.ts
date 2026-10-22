@@ -17,6 +17,7 @@ import {
 } from '../../src/lightning/keys/derivation';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { writableState } from './helpers/writable-state';
 
 function getPerCommitmentPoint(seed: Buffer, commitmentNumber: bigint): Buffer {
 	return perCommitmentPointFromSecret(
@@ -181,7 +182,7 @@ describe('Fund safety round 2', function () {
 	describe('Commitment fee saturation', function () {
 		it('never produces a negative opener balance when the fee exceeds it', function () {
 			const channel = makeNormalOpenerChannel();
-			const state = channel.getFullState();
+			const state = writableState(channel);
 			// Opener holds 100 sats; at 5000 sat/kw the commitment fee (~3620 sats)
 			// vastly exceeds it.
 			state.localBalanceMsat = 100_000n;

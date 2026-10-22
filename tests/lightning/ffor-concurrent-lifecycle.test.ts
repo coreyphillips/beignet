@@ -25,6 +25,7 @@ import {
 	restart,
 	vouchers
 } from './helpers/ffor-concurrent-pair';
+import { writableState } from './helpers/writable-state';
 
 const BOOK = [1000000n, 2000000n];
 
@@ -143,8 +144,8 @@ describe('Concurrent receive profile lifecycle qualification', function () {
 			}
 			it(`version 2 ${phase}, ${funder} funds: a nonfunder add requires the twice-rate mixed output buffer`, () => {
 				const pair = makePair();
-				const funded = channel(pair, funder).getFullState();
-				const unfunded = channel(pair, other(funder)).getFullState();
+				const funded = writableState(channel(pair, funder));
+				const unfunded = writableState(channel(pair, other(funder)));
 				const reserve = funded.remoteConfig.channelReserveSatoshis * 1000n;
 				const need =
 					funderCommitmentCostSats(

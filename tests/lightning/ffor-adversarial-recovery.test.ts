@@ -55,6 +55,7 @@ import { encodeShortChannelId } from '../../src/lightning/gossip/types';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IChannelState } from '../../src/lightning/channel/channel-state';
 import { bitmapGet } from '../../src/lightning/ffor/messages';
+import { writableState } from './helpers/writable-state';
 
 // ─────────────── Shared ───────────────
 
@@ -441,7 +442,7 @@ function openReadyChannel(
 	acceptor.handleFundingConfirmed(channelId);
 	for (const n of [opener, acceptor]) {
 		for (const ch of n.getChannelManager().listChannels()) {
-			const st = ch.getFullState();
+			const st = writableState(ch);
 			st.announceChannel = true;
 			st.announcementSigsSent = true;
 			st.announcementSigsReceived = true;

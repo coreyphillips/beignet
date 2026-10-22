@@ -5,7 +5,8 @@ import * as ecc from '@bitcoinerlab/secp256k1';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	createOpenerState,
-	createAcceptorState
+	createAcceptorState,
+	IChannelState
 } from '../../src/lightning/channel/channel-state';
 import {
 	ChannelState,
@@ -61,6 +62,7 @@ import {
 	realInitialCommitmentSig,
 	realCommitmentSigs
 } from './helpers/real-signing';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -329,12 +331,12 @@ describe('Chain Monitor (Phase 4C)', function () {
 		function coopCloseFixture(): {
 			monitor: ChainMonitor;
 			closingTx: bitcoin.Transaction;
-			state: ReturnType<Channel['getFullState']>;
+			state: IChannelState;
 			destScript: Buffer;
 			openerPrivkeys: Buffer[];
 		} {
 			const { opener, openerPrivkeys } = setupNormalChannels();
-			const state = opener.getFullState();
+			const state = writableState(opener);
 			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
 			const monitor = new ChainMonitor(
 				state,
@@ -1938,7 +1940,7 @@ describe('Chain Monitor (Phase 4C)', function () {
 			bump: () => any;
 		} {
 			const { opener, openerPrivkeys } = setupNormalChannels();
-			const state = opener.getFullState();
+			const state = writableState(opener);
 			const flags = FeatureFlags.empty();
 			flags.setCompulsory(Feature.STATIC_REMOTE_KEY);
 			if (anchor) flags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);

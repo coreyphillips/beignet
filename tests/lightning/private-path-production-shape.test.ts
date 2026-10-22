@@ -23,7 +23,10 @@ import crypto from 'crypto';
 import * as secp from '@noble/secp256k1';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { Channel } from '../../src/lightning/channel/channel';
-import { createOpenerState } from '../../src/lightning/channel/channel-state';
+import {
+	createOpenerState,
+	IChannelState
+} from '../../src/lightning/channel/channel-state';
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG
@@ -38,6 +41,7 @@ import {
 } from '../../src/lightning/onion/blinded-path';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
+import { writableState } from './helpers/writable-state';
 
 function validPriv(): Buffer {
 	let k: Buffer;
@@ -72,7 +76,7 @@ interface IHarness {
 	peerPriv: Buffer;
 	peerPubkey: Buffer;
 	scid: Buffer;
-	state: ReturnType<Channel['getFullState']>;
+	state: IChannelState;
 }
 
 function nodeWithChannel(): IHarness {
@@ -104,9 +108,10 @@ function nodeWithChannel(): IHarness {
 	state.remoteScidAlias = scid;
 	state.remoteForwardingPolicy = { ...PEER_POLICY };
 	const cm = (node as any).channelManager;
-	cm.channels.set(channelId.toString('hex'), new Channel(state));
+	const channel = new Channel(state);
+	cm.channels.set(channelId.toString('hex'), channel);
 	cm.channelPeers.set(channelId.toString('hex'), peerPubkey.toString('hex'));
-	return { node, peerPriv, peerPubkey, scid, state };
+	return { node, peerPriv, peerPubkey, scid, state: writableState(channel) };
 }
 
 type NodeInternals = {

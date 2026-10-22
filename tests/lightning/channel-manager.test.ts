@@ -23,6 +23,7 @@ import {
 } from '../../src/lightning/message/error';
 import * as bitcoin from 'bitcoinjs-lib';
 import type { IFundingProvider } from '../../src/lightning/node/types';
+import { writableState } from './helpers/writable-state';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -909,7 +910,7 @@ describe('Channel Manager', function () {
 			bob.on('error', () => {
 				/* loopback delivers alice's error to bob */
 			});
-			alice.getChannel(channelId)!.getFullState().state =
+			writableState(alice.getChannel(channelId)!).state =
 				ChannelState.FORCE_CLOSED;
 
 			const sent: Array<{ type: number }> = [];
@@ -1367,7 +1368,7 @@ describe('Channel Manager', function () {
 			);
 			// The node retains the signed tx on channel state right before
 			// createFunding (lightning-node handleAutoFunding); mirror it.
-			channel.getFullState().pendingFundingTxHex = fundingTx.toHex();
+			channel.retainFundingPayload(fundingTx.toHex());
 
 			await drain();
 			await drain();
@@ -1460,7 +1461,7 @@ describe('Channel Manager', function () {
 			expect(channelId, 'promoted before funding_signed arrived').to.not.equal(
 				null
 			);
-			channel.getFullState().pendingFundingTxHex = fundingTx.toHex();
+			channel.retainFundingPayload(fundingTx.toHex());
 
 			await drain();
 			await drain();
@@ -1556,7 +1557,7 @@ describe('Channel Manager', function () {
 			const channel = alice.openChannel(bobPubkey, 1_000_000n);
 			await drain();
 			alice.createFunding(channel, fundingTx.getHash(), 0, Buffer.alloc(64));
-			channel.getFullState().pendingFundingTxHex = fundingTx.toHex();
+			channel.retainFundingPayload(fundingTx.toHex());
 
 			await drain();
 			await drain();
@@ -1798,7 +1799,7 @@ describe('Channel Manager', function () {
 				Buffer.alloc(64)
 			);
 			expect(channelId, 'promoted').to.not.equal(null);
-			channel.getFullState().pendingFundingTxHex = fundingTx.toHex();
+			channel.retainFundingPayload(fundingTx.toHex());
 
 			// The peer disconnects while withholding funding_signed.
 			alice.handlePeerDisconnected(bobPubkey);

@@ -115,6 +115,7 @@ import {
 	realCommitmentSigs
 } from './helpers/real-signing';
 import { settle } from './helpers/settle';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -305,7 +306,7 @@ function buildRevokedContextFor(
 ): { ctx: IJusticeContext; revokedTx: bitcoin.Transaction } {
 	const pair = freshPair(seedTag);
 	exchangeOnce(pair.opener, pair.acceptor);
-	const state = pair.opener.getFullState();
+	const state = writableState(pair.opener);
 	state.channelType =
 		kind === 'anchor'
 			? channelTypeOf(Feature.STATIC_REMOTE_KEY, Feature.ANCHOR_ZERO_FEE_HTLC)
@@ -748,9 +749,9 @@ describe('watchtower v1 kit against a REAL revoked taproot commitment', function
 		// and the acceptor needs a verification nonce for the opener to co-sign
 		// against, as channel_ready would have advertised on a negotiated
 		// taproot channel.
-		const state = pair.opener.getFullState();
+		const state = writableState(pair.opener);
 		state.channelType = channelTypeOf(Feature.OPTION_TAPROOT);
-		const acceptorState = pair.acceptor.getFullState();
+		const acceptorState = writableState(pair.acceptor);
 		acceptorState.channelType = state.channelType;
 		acceptorState.localNextNonce = generateNonce({
 			publicKey: acceptorState.localBasepoints.fundingPubkey,

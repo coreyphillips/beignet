@@ -20,6 +20,7 @@ import { MessageType } from '../../src/lightning/message/types';
 import { decodeChannelReadyMessage } from '../../src/lightning/message/channel-funding';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
+import { writableState } from './helpers/writable-state';
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -64,7 +65,7 @@ function makeAcceptorChannel(): Channel {
  * Move channel to AWAITING_FUNDING_CONFIRMED so fundingConfirmed() can proceed.
  */
 function setupChannelToAwaitFunding(channel: Channel): void {
-	const state = channel.getFullState();
+	const state = writableState(channel);
 	state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 	state.channelId = crypto.randomBytes(32);
 	state.fundingTxid = crypto.randomBytes(32);
@@ -113,8 +114,8 @@ describe('SCID Aliases (Phase 8)', function () {
 			const firstAlias = Buffer.from(channel.getFullState().scidAlias!);
 
 			// Reset to allow second call
-			channel.getFullState().state = ChannelState.AWAITING_FUNDING_CONFIRMED;
-			channel.getFullState().localChannelReady = false;
+			writableState(channel).state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+			writableState(channel).localChannelReady = false;
 
 			channel.fundingConfirmed();
 			const secondAlias = channel.getFullState().scidAlias!;
@@ -140,7 +141,7 @@ describe('SCID Aliases (Phase 8)', function () {
 	describe('Remote Alias Storage', function () {
 		it('should store remote SCID alias from channel_ready', function () {
 			const channel = makeAcceptorChannel();
-			const state = channel.getFullState();
+			const state = writableState(channel);
 			state.state = ChannelState.AWAITING_CHANNEL_READY;
 			state.channelId = crypto.randomBytes(32);
 			state.localChannelReady = true;
@@ -158,7 +159,7 @@ describe('SCID Aliases (Phase 8)', function () {
 
 		it('should not set remoteScidAlias when channel_ready has no TLV', function () {
 			const channel = makeAcceptorChannel();
-			const state = channel.getFullState();
+			const state = writableState(channel);
 			state.state = ChannelState.AWAITING_CHANNEL_READY;
 			state.channelId = crypto.randomBytes(32);
 			state.localChannelReady = true;
@@ -175,7 +176,7 @@ describe('SCID Aliases (Phase 8)', function () {
 	describe('Getters', function () {
 		it('getScidAlias() should return local alias', function () {
 			const channel = makeOpenerChannel();
-			const state = channel.getFullState();
+			const state = writableState(channel);
 			state.scidAlias = crypto.randomBytes(8);
 
 			expect(channel.getScidAlias()!.equals(state.scidAlias)).to.be.true;
@@ -183,7 +184,7 @@ describe('SCID Aliases (Phase 8)', function () {
 
 		it('getRemoteScidAlias() should return remote alias', function () {
 			const channel = makeOpenerChannel();
-			const state = channel.getFullState();
+			const state = writableState(channel);
 			state.remoteScidAlias = crypto.randomBytes(8);
 
 			expect(channel.getRemoteScidAlias()!.equals(state.remoteScidAlias)).to.be

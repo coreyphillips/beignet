@@ -45,6 +45,7 @@ import {
 } from '../../src/lightning/message/channel-funding';
 import { expectWireRefusal, wireRefusalOf } from './helpers/open-refusal';
 import { seedKey, signerFromSeed } from './helpers/real-signing';
+import { writableState } from './helpers/writable-state';
 
 function realBasepoints(seed: Buffer): IChannelBasepoints {
 	return {
@@ -217,7 +218,7 @@ describe('The v1 handshake refuses ON THE WIRE (issue 393)', function () {
 
 		it('a zero_conf accept_channel with a non-zero minimum_depth', function () {
 			const p = pair();
-			p.opener.getFullState().channelType = zeroConfType();
+			writableState(p.opener).channelType = zeroConfType();
 			const actions = p.opener.handleAcceptChannel({
 				...p.accept,
 				channelType: zeroConfType(),
@@ -302,7 +303,7 @@ describe('The v1 handshake refuses ON THE WIRE (issue 393)', function () {
 
 		it('and the reserved all-zero id is refused silently', function () {
 			const p = pair();
-			p.opener.getFullState().temporaryChannelId = Buffer.alloc(32);
+			writableState(p.opener).temporaryChannelId = Buffer.alloc(32);
 			const actions = p.opener.handleAcceptChannel({
 				...p.accept,
 				temporaryChannelId: Buffer.alloc(32),
@@ -349,7 +350,7 @@ describe('The v1 handshake refuses ON THE WIRE (issue 393)', function () {
 
 		it('but a funding_created for a LIVE negotiation stays local', function () {
 			const p = pair();
-			p.acceptor.getFullState().state = ChannelState.NORMAL;
+			writableState(p.acceptor).state = ChannelState.NORMAL;
 			const actions = p.acceptor.handleFundingCreated(
 				fundingCreated(p),
 				crypto.randomBytes(64),
@@ -372,7 +373,7 @@ describe('The v1 handshake refuses ON THE WIRE (issue 393)', function () {
 
 		it('and a peer-supplied all-zero id is refused silently', function () {
 			const p = pair();
-			p.acceptor.getFullState().temporaryChannelId = Buffer.alloc(32);
+			writableState(p.acceptor).temporaryChannelId = Buffer.alloc(32);
 			const actions = p.acceptor.handleFundingCreated(
 				{ ...fundingCreated(p), temporaryChannelId: Buffer.alloc(32) },
 				crypto.randomBytes(64),
@@ -451,7 +452,7 @@ describe('The v1 handshake refuses ON THE WIRE (issue 393)', function () {
 		it('but a replayed funding_signed for a LIVE channel stays local', function () {
 			const p = pair();
 			driveToFundingCreated(p);
-			p.opener.getFullState().state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+			writableState(p.opener).state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 			const actions = p.opener.handleFundingSigned(fundingSigned(p));
 			expect(errorOf(actions)).to.match(/Unexpected funding_signed/);
 			expect(wireRefusalOf(actions), 'nothing on the wire').to.equal(null);
@@ -472,7 +473,7 @@ describe('The v1 handshake refuses ON THE WIRE (issue 393)', function () {
 			const p = pair();
 			driveToFundingCreated(p);
 			const zeroed = Buffer.alloc(32);
-			p.opener.getFullState().channelId = zeroed;
+			writableState(p.opener).channelId = zeroed;
 			const actions = p.opener.handleFundingSigned({
 				channelId: zeroed,
 				signature: crypto.randomBytes(64)

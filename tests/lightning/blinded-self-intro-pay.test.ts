@@ -37,6 +37,7 @@ import {
 	IBlindedHopData,
 	IBlindedPath
 } from '../../src/lightning/onion/blinded-path';
+import { writableState } from './helpers/writable-state';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -274,7 +275,7 @@ describe('Blinded-path payer self-relay (issue #550)', function () {
 			// Break the SCID mapping: force-drop the channel from alice's view
 			// of usable channels by closing it locally.
 			for (const ch of alice.getChannelManager().listChannels()) {
-				const st = ch.getFullState();
+				const st = writableState(ch);
 				st.remoteScidAlias = null;
 				st.scidAlias = null;
 				st.shortChannelId = null;

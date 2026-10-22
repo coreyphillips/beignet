@@ -39,6 +39,7 @@ import {
 	encodeShutdownMessage
 } from '../../src/lightning/message/channel-close';
 import { expectWireFailure, wireRefusalOf } from './helpers/open-refusal';
+import { writableState } from './helpers/writable-state';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -478,7 +479,7 @@ describe('Taproot cooperative close (MuSig2)', function () {
 		);
 		expect(bobChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
 
-		bobChannel.getFullState().remoteBalanceMsat = 100_000n; // 100 sat
+		writableState(bobChannel).remoteBalanceMsat = 100_000n; // 100 sat
 		const actions = bobChannel.handleClosingSigned(
 			{
 				channelId,
@@ -675,7 +676,7 @@ describe('Taproot cooperative close (MuSig2)', function () {
 			driveOpenerIntoResponderBranch();
 		// Our whole balance is one sat short of covering fee + dust, so a normal
 		// (mid-band) fee would push our output below the dust limit.
-		aliceChannel.getFullState().localBalanceMsat =
+		writableState(aliceChannel).localBalanceMsat =
 			(idealFee + dust - 1n) * 1000n;
 
 		const actions = aliceChannel.handleClosingSigned(
@@ -694,7 +695,7 @@ describe('Taproot cooperative close (MuSig2)', function () {
 	it('responder-as-opener accepts a fee that leaves exactly the dust reserve', function () {
 		const { aliceChannel, channelId, idealFee, dust } =
 			driveOpenerIntoResponderBranch();
-		aliceChannel.getFullState().localBalanceMsat = (idealFee + dust) * 1000n;
+		writableState(aliceChannel).localBalanceMsat = (idealFee + dust) * 1000n;
 
 		const actions = aliceChannel.handleClosingSigned(
 			{

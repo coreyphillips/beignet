@@ -36,6 +36,7 @@ import {
 } from '../../src/lightning/advisor/rebalance-planner';
 import { computeFeeTuneAdjustments } from '../../src/lightning/advisor/fee-tuner';
 import { IChannelSnapshot } from '../../src/lightning/advisor/liquidity-advisor';
+import { writableState } from './helpers/writable-state';
 
 // ─────────────── Helpers (mirrors tests/lightning/channel-policy.test.ts) ───────────────
 
@@ -187,7 +188,7 @@ function setScidAlias(
 	channelId: Buffer,
 	scid: Buffer
 ): void {
-	node.getChannelManager().getChannel(channelId)!.getFullState().scidAlias =
+	writableState(node.getChannelManager().getChannel(channelId)!).scidAlias =
 		scid;
 }
 

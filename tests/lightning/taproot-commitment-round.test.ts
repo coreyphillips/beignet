@@ -28,6 +28,7 @@ import { MessageType } from '../../src/lightning/message/types';
 import { decodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
 import { decodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
 import { expectWireFailure } from './helpers/open-refusal';
+import { writableState } from './helpers/writable-state';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -336,7 +337,7 @@ describe('option_taproot commitment round + nonce rotation (Stage B)', function 
 		// Simulate a reconnect: the in-memory MuSig2 nonces are lost (never
 		// serialized) and the channel re-enters AWAITING_REESTABLISH.
 		for (const ch of [aliceChannel, bobChannel]) {
-			const s = ch.getFullState();
+			const s = writableState(ch);
 			s.preReestablishState = s.state;
 			s.state = ChannelState.AWAITING_REESTABLISH;
 			s.localNonce = undefined;
@@ -452,7 +453,7 @@ describe('option_taproot commitment round + nonce rotation (Stage B)', function 
 		expect(beforeNext, 'localNextNonce present').to.exist;
 
 		// Simulate the reconnect nonce loss, then rebuild via createReestablish.
-		const s = aliceChannel.getFullState();
+		const s = writableState(aliceChannel);
 		s.preReestablishState = s.state;
 		s.state = ChannelState.AWAITING_REESTABLISH;
 		s.localNonce = undefined;
@@ -486,7 +487,7 @@ describe('option_taproot commitment round + nonce rotation (Stage B)', function 
 		// Simulate a reconnect that loses the in-memory verification nonces (exactly
 		// the scenario that previously made the pre-reconnect commitment
 		// un-force-closeable). remoteSigningNonce survives the reconnect in memory.
-		const s = aliceChannel.getFullState();
+		const s = writableState(aliceChannel);
 		s.preReestablishState = s.state;
 		s.state = ChannelState.AWAITING_REESTABLISH;
 		s.localNonce = undefined;

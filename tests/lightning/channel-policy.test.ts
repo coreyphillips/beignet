@@ -36,6 +36,7 @@ import {
 } from './helpers/signed-gossip';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { BeignetNode } from '../../src/cli/beignet-node';
+import { writableState } from './helpers/writable-state';
 
 // Electrum intentionally unreachable: nothing below needs a live chain, and a
 // refused loopback connect returns ECONNREFUSED instantly. Without this the
@@ -394,10 +395,9 @@ describe('Channel Routing Policy (M3)', function () {
 			const splicer = createNode(13);
 			connectNodes(splicer, bounded);
 			const chId = openReadyChannel(splicer, bounded);
-			const state = splicer
-				.getChannelManager()
-				.getChannel(chId)!
-				.getFullState();
+			const state = writableState(
+				splicer.getChannelManager().getChannel(chId)!
+			);
 
 			// Baseline: 1M-sat capacity below the peer's 1.5M-sat limit.
 			expect(splicer.getChannelPolicy(chId)!.htlcMaximumMsat).to.equal(
@@ -427,10 +427,9 @@ describe('Channel Routing Policy (M3)', function () {
 			const grower = createNode(16);
 			connectNodes(grower, roomy);
 			const growId = openReadyChannel(grower, roomy);
-			const growState = grower
-				.getChannelManager()
-				.getChannel(growId)!
-				.getFullState();
+			const growState = writableState(
+				grower.getChannelManager().getChannel(growId)!
+			);
 			growState.fundingSatoshis = 2_000_000n;
 			expect(grower.getChannelPolicy(growId)!.htlcMaximumMsat).to.equal(
 				2_000_000_000n
@@ -705,14 +704,12 @@ describe('Channel Routing Policy (M3)', function () {
 				// remoteScidAlias. BOLT 7 says bob's direct channel_update must name
 				// an alias RECEIVED from the peer, so bob addresses it with
 				// remoteScidAlias and carol matches it against her own.
-				bob
-					.getChannelManager()
-					.getChannel(bcChannelId)!
-					.getFullState().remoteScidAlias = scidBC;
-				carol
-					.getChannelManager()
-					.getChannel(bcChannelId)!
-					.getFullState().scidAlias = scidBC;
+				writableState(
+					bob.getChannelManager().getChannel(bcChannelId)!
+				).remoteScidAlias = scidBC;
+				writableState(
+					carol.getChannelManager().getChannel(bcChannelId)!
+				).scidAlias = scidBC;
 
 				bob.setChannelPolicy(bcChannelId, {
 					feeBaseMsat: 7777,
@@ -770,10 +767,9 @@ describe('Channel Routing Policy (M3)', function () {
 			alice.registerChannelScid(abChannelId, scidAB);
 			// Charlie's hint names the SCID Bob forwards over, which per BOLT 2 is
 			// the alias BOB generated and sent charlie, stored as remoteScidAlias.
-			charlie
-				.getChannelManager()
-				.getChannel(bcChannelId)!
-				.getFullState().remoteScidAlias = scidBC;
+			writableState(
+				charlie.getChannelManager().getChannel(bcChannelId)!
+			).remoteScidAlias = scidBC;
 
 			addGraphChannel(alice, scidAB, nodePubkey(1), nodePubkey(2));
 			return { alice, bob, charlie, bcChannelId };
@@ -850,10 +846,9 @@ describe('Channel Routing Policy (M3)', function () {
 					outputIndex: 0
 				});
 				// Bob's direct channel_update names an alias received from the peer.
-				bob
-					.getChannelManager()
-					.getChannel(bcChannelId)!
-					.getFullState().remoteScidAlias = scidBC;
+				writableState(
+					bob.getChannelManager().getChannel(bcChannelId)!
+				).remoteScidAlias = scidBC;
 
 				bob.setChannelPolicy(bcChannelId, {
 					feeBaseMsat: 5000,

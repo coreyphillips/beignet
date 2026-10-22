@@ -33,6 +33,7 @@ import {
 	IWireDurabilityBarrier
 } from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
+import { IDLE_CHANNEL_MEMBERS } from './helpers/channel-stub';
 
 // ─────────────── Fixtures ───────────────
 
@@ -41,6 +42,7 @@ const OTHER_PEER = 'bb'.repeat(33);
 
 function stubChannel(channelId: Buffer): Channel {
 	return {
+		...IDLE_CHANNEL_MEMBERS,
 		setLocalNodeIdLower: (): void => undefined,
 		getChannelId: (): Buffer => channelId,
 		getTemporaryChannelId: (): Buffer | null => null,
@@ -726,6 +728,7 @@ describe('Recovery phase 6: the peer-close request survives a refusal', () => {
 	/** An ERRORED channel whose disposition regenerates the close request. */
 	function erroredRecoveryChannel(channelId: Buffer): Channel {
 		return {
+			...IDLE_CHANNEL_MEMBERS,
 			setLocalNodeIdLower: (): void => undefined,
 			getChannelId: (): Buffer => channelId,
 			getTemporaryChannelId: (): Buffer | null => null,
@@ -1065,6 +1068,7 @@ describe('Recovery phase 6: a restart asks the barrier, it does not assume', () 
 	/** A restored channel that still owes its funding broadcast. */
 	function restoredFunder(channelId: Buffer, txid: Buffer): Channel {
 		return {
+			...IDLE_CHANNEL_MEMBERS,
 			setLocalNodeIdLower: (): void => undefined,
 			getChannelId: (): Buffer => channelId,
 			getTemporaryChannelId: (): Buffer | null => null,
@@ -1199,6 +1203,7 @@ describe('Recovery phase 6: a refused terminal close leaves the queue alone', ()
 		// (a missing peer nonce), where there is real state to compare byte
 		// for byte.
 		const channel = {
+			...IDLE_CHANNEL_MEMBERS,
 			setLocalNodeIdLower: (): void => undefined,
 			getChannelId: (): Buffer => channelId,
 			getTemporaryChannelId: (): Buffer | null => null,

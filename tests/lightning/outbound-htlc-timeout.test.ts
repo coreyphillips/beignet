@@ -28,6 +28,7 @@ import {
 	encodeShortChannelId
 } from '../../src/lightning/gossip/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
+import { writableState } from './helpers/writable-state';
 
 // ─────────────── Helpers ───────────────
 
@@ -612,10 +613,9 @@ describe('Phase 2: Outbound HTLC Timeout + Payment Cleanup', function () {
 		it('stays away from a shutting-down channel with detected data loss', function () {
 			const { alice, bob, channelId, cltvExpiry, errors } =
 				setupShuttingDownPayment();
-			alice
-				.getChannelManager()
-				.getChannel(channelId)!
-				.getFullState().dataLossDetected = true;
+			writableState(
+				alice.getChannelManager().getChannel(channelId)!
+			).dataLossDetected = true;
 
 			alice.handleNewBlock(cltvExpiry + 6);
 

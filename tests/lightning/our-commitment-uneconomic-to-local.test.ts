@@ -26,6 +26,7 @@ import {
 	OutputType
 } from '../../src/lightning/chain/types';
 import { setupNormalChannels } from './helpers/revoked-commitment-fixture';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -61,7 +62,7 @@ function ourCommitmentWithReceivedHtlc(
 		onionRoutingPacket: Buffer.alloc(1366)
 	});
 
-	const state = opener.getFullState();
+	const state = writableState(opener);
 	state.localBalanceMsat = LOCAL_BALANCE_SATS * 1000n;
 	// The monitor does not verify the peer's HTLC signature, only needs one to
 	// build the HTLC-success witness.

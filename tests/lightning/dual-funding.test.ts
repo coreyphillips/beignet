@@ -84,6 +84,7 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { deriveV2TemporaryChannelId } from '../../src/lightning/channel/validation';
 import { signWillFund } from '../../src/lightning/channel/liquidity-ads';
+import { writableState } from './helpers/writable-state';
 
 // ─────────────── Helpers ───────────────
 
@@ -2910,8 +2911,8 @@ describe('Round 17: v2 channel_type admission', () => {
 			owner: string
 		): Channel {
 			const victim = makeDetachedChannel(crypto.randomBytes(32));
-			victim.getFullState().state = ChannelState.NORMAL;
-			victim.getFullState().channelId = channelId;
+			writableState(victim).state = ChannelState.NORMAL;
+			writableState(victim).channelId = channelId;
 			const maps = mapsOf(mgr);
 			maps.channels.set(channelId.toString('hex'), victim);
 			maps.channelPeers.set(channelId.toString('hex'), owner);
@@ -4451,8 +4452,8 @@ describe('Round 17: v2 channel_type admission', () => {
 			);
 			const tempId = channel.getTemporaryChannelId();
 			const permanentId = crypto.randomBytes(32);
-			channel.getFullState().channelId = permanentId;
-			channel.getFullState().state = ChannelState.ERRORED;
+			writableState(channel).channelId = permanentId;
+			writableState(channel).state = ChannelState.ERRORED;
 			const lifecycle = channel as unknown as {
 				handleTxAbort: () => ChannelAction[];
 				isAbandonedV2Open: () => boolean;
@@ -5114,7 +5115,7 @@ describe('Round 17: v2 channel_type admission', () => {
 			const channel = mgr.openChannel(owner, 100_000n);
 			const tempId = channel.getTemporaryChannelId();
 			const permanentId = crypto.randomBytes(32);
-			channel.getFullState().channelId = permanentId;
+			writableState(channel).channelId = permanentId;
 			(
 				channel as unknown as {
 					handleFundingSigned: () => ChannelAction[];

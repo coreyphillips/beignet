@@ -23,6 +23,7 @@ import {
 	serializeChannelState,
 	deserializeChannelState
 } from '../../src/lightning/storage/serialization';
+import { writableState } from './helpers/writable-state';
 
 // ─── Helpers (model: error-forecloses-channel.test.ts) ───
 
@@ -194,7 +195,7 @@ describe('Issue #214: persisted close reason', function () {
 
 	it('a refused force-close leaves no stale stamp', () => {
 		const fx = setup(41);
-		fx.channel.getFullState().dataLossDetected = true;
+		writableState(fx.channel).dataLossDetected = true;
 
 		const result = fx.alice.forceCloseChannel(
 			fx.channelId,

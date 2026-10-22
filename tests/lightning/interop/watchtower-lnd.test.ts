@@ -62,6 +62,7 @@ import {
 	realInitialCommitmentSig,
 	realCommitmentSigs
 } from '../helpers/real-signing';
+import { writableState } from '../helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -234,7 +235,7 @@ function buildRevokedContexts(
 		exchangeOnce(opener, acceptor);
 	}
 
-	const state = opener.getFullState();
+	const state = writableState(opener);
 	state.channelType = channelTypeFor(kind);
 	const sweepScript = bitcoin.payments.p2wpkh({
 		pubkey: getPublicKey(crypto.randomBytes(32)),

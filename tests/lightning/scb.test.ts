@@ -34,6 +34,7 @@ import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { BeignetNode } from '../../src/cli/beignet-node';
+import { writableState } from './helpers/writable-state';
 
 // Electrum intentionally unreachable: nothing below needs a live chain, and a
 // refused loopback connect returns ECONNREFUSED instantly. Without this the
@@ -578,10 +579,9 @@ describe('Static Channel Backup (SCB)', function () {
 			const { alice, bob } = createNodePair();
 			try {
 				const { channelId } = openReadyChannel(alice, bob);
-				const state = alice
-					.getChannelManager()
-					.getChannel(channelId)!
-					.getFullState();
+				const state = writableState(
+					alice.getChannelManager().getChannel(channelId)!
+				);
 
 				state.state = ChannelState.ERRORED;
 				expect(alice.buildStaticChannelBackupData().channels).to.have.length(1);

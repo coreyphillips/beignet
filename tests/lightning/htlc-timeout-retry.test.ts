@@ -25,6 +25,7 @@ import {
 } from '../../src/lightning/chain/types';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { setupNormalChannels } from './helpers/revoked-commitment-fixture';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -92,7 +93,7 @@ function currentPeerHtlc(
 		}
 	}
 
-	const state = opener.getFullState();
+	const state = writableState(opener);
 	if (options.taproot) {
 		state.channelType = taprootChannelType();
 	} else if (options.anchor) {

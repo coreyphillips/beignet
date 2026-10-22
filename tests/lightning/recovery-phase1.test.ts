@@ -62,6 +62,7 @@ import {
 	IChannelUpdateMessage,
 	encodeShortChannelId
 } from '../../src/lightning/gossip/types';
+import { IDLE_CHANNEL_MEMBERS } from './helpers/channel-stub';
 
 // ─────────────── Fixtures ───────────────
 
@@ -1002,6 +1003,7 @@ describe('Recovery phase 1: a failed transition strands nothing on disk', () => 
 describe('Recovery phase 1: batch dispatch invariants', () => {
 	function stubChannel(channelId: Buffer): Channel {
 		return {
+			...IDLE_CHANNEL_MEMBERS,
 			getFullState: (): Record<string, unknown> => ({}),
 			getChannelId: (): Buffer => channelId,
 			getTemporaryChannelId: (): Buffer | null => null,

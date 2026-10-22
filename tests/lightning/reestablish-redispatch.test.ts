@@ -64,6 +64,7 @@ import {
 	FINAL_INCORRECT_HTLC_AMOUNT,
 	MPP_TIMEOUT
 } from '../../src/lightning/onion/types';
+import { writableState } from './helpers/writable-state';
 
 function makeSeed(id: number): Buffer {
 	return crypto.createHash('sha256').update(`redispatch-seed-${id}`).digest();
@@ -1320,8 +1321,8 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		// Only bob's side is modelled; alice never sees the fulfill.
 		gate.hold = true;
 		const channel = bob.getChannelManager().getChannel(aliceChannelId)!;
-		channel.getFullState().state = ChannelState.NORMAL;
-		channel.getFullState().preReestablishState = null;
+		writableState(channel).state = ChannelState.NORMAL;
+		writableState(channel).preReestablishState = null;
 		bob.getChannelManager().emit('splice:complete', aliceChannelId);
 		await settle();
 
@@ -1357,8 +1358,8 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 			// Only bob's side is modelled; alice never sees the fulfill.
 			gate.hold = true;
 			const channel = bob.getChannelManager().getChannel(aliceChannelId)!;
-			channel.getFullState().state = ChannelState.NORMAL;
-			channel.getFullState().preReestablishState = null;
+			writableState(channel).state = ChannelState.NORMAL;
+			writableState(channel).preReestablishState = null;
 			emitExit(bob.getChannelManager(), aliceChannelId);
 			await settle();
 
@@ -1412,7 +1413,7 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 			txIndex: 2,
 			outputIndex: 0
 		});
-		bob.getChannelManager().getChannel(outId)!.getFullState().scidAlias =
+		writableState(bob.getChannelManager().getChannel(outId)!).scidAlias =
 			outScid;
 		alice.registerChannelScid(inId, inScid);
 		openReadyChannel(carol, bob);

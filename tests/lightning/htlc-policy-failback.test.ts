@@ -47,6 +47,7 @@ import { MessageType } from '../../src/lightning/message/types';
 import { Channel } from '../../src/lightning/channel/channel';
 import { createOpenerState } from '../../src/lightning/channel/channel-state';
 import { HtlcDirection, HtlcState } from '../../src/lightning/channel/types';
+import { writableState } from './helpers/writable-state';
 
 // ─────────────── Harness (mirrors hold-invoices.test.ts) ───────────────
 
@@ -288,10 +289,9 @@ describe('Policy fail-backs and quiescence parking (issues 410/411)', function (
 		// BOB's side of the channel came from a Recovery Capsule, so it takes
 		// no new HTLCs. Alice's side is ordinary, so she still routes over it
 		// and the refusal has to travel back to her as a readable failure.
-		bob
-			.getChannelManager()
-			.getChannel(channelId)!
-			.getFullState().restoreRecencyUnproven = true;
+		writableState(
+			bob.getChannelManager().getChannel(channelId)!
+		).restoreRecencyUnproven = true;
 
 		const inv = bob.createInvoice({
 			amountMsat: 50_000n,

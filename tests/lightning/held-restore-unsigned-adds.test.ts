@@ -26,6 +26,7 @@ import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -101,7 +102,7 @@ describe('Issue #469: a held restore forgets its unsigned adds', function () {
 	it('drops the queued add, refunds the balance and reports it', () => {
 		const { channel, htlcId, amountMsat, balanceBefore } =
 			channelWithUnsignedAdd();
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		state.restoreRecencyUnproven = true;
 
 		const abandoned = channel.markForReestablish();
@@ -123,7 +124,7 @@ describe('Issue #469: a held restore forgets its unsigned adds', function () {
 
 	it('never touches an add our commitment_signed covers', () => {
 		const { channel, htlcId } = channelWithUnsignedAdd();
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		// The shape signCommitment leaves behind: the queued update is covered
 		// by our outstanding signature and MUST be retransmitted (BOLT 2).
 		state.pendingLocalUpdatesSignedCount = state.pendingLocalUpdates.length;
@@ -158,7 +159,7 @@ describe('Issue #469: a held restore forgets its unsigned adds', function () {
 		// treats as channel-fatal. The gap can never be observed, because
 		// addHtlc refuses every subsequent add while the hold stands.
 		const { channel } = channelWithUnsignedAdd();
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		const counterBefore = state.localHtlcCounter;
 		state.restoreRecencyUnproven = true;
 
@@ -174,7 +175,7 @@ describe('Issue #469: a held restore forgets its unsigned adds', function () {
 		// NOT, which CLN answers with an error - force-closing the one channel
 		// that must not be force-closed.
 		const { channel } = channelWithUnsignedAdd();
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		expect(state.needsCommitment, 'the add set the debt').to.equal(true);
 		state.restoreRecencyUnproven = true;
 
@@ -187,7 +188,7 @@ describe('Issue #469: a held restore forgets its unsigned adds', function () {
 
 	it('keeps the commitment debt when something else still owes one', () => {
 		const { channel } = channelWithUnsignedAdd();
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		// A peer update we have revoked for but not yet covered by a signature
 		// of ours: still owed, whatever happens to our own add.
 		state.htlcs.set('received-9', {
@@ -213,7 +214,7 @@ describe('Issue #469: a held restore forgets its unsigned adds', function () {
 		// to - so the rollback has to reach it another way, or the add is
 		// replayed the moment the peer reconnects.
 		const { channel, htlcId } = channelWithUnsignedAdd();
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		state.preReestablishState = ChannelState.NORMAL;
 		state.state = ChannelState.AWAITING_REESTABLISH;
 		state.restoreRecencyUnproven = true;
@@ -235,7 +236,7 @@ describe('Issue #469: a held restore forgets its unsigned adds', function () {
 
 	it('the reestablish replay carries no dropped add', () => {
 		const { channel, htlcId } = channelWithUnsignedAdd();
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		state.restoreRecencyUnproven = true;
 		channel.markForReestablish();
 

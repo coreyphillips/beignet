@@ -99,6 +99,7 @@ import {
 	realInitialCommitmentSig,
 	realCommitmentSigs
 } from './helpers/real-signing';
+import { writableState } from './helpers/writable-state';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -2579,13 +2580,13 @@ describe('Splice', function () {
 		): Channel {
 			const { opener } = makeNormalChannel();
 			if (shape?.unstamped) {
-				delete opener.getFullState().channelReserveVersion;
+				delete writableState(opener).channelReserveVersion;
 			}
 			if (shape?.fundingVersion !== undefined) {
-				opener.getFullState().fundingVersion = shape.fundingVersion;
+				writableState(opener).fundingVersion = shape.fundingVersion;
 			}
 			if (shape?.peerDustLimitSatoshis !== undefined) {
-				opener.getFullState().remoteConfig = {
+				writableState(opener).remoteConfig = {
 					...opener.getFullState().remoteConfig,
 					dustLimitSatoshis: shape.peerDustLimitSatoshis
 				};
@@ -7327,7 +7328,7 @@ describe('Splice', function () {
 			// higher phase-aware rate immediately, or an add admitted at the old
 			// rate would not fit the commitment the builder actually produces.
 			const pair = createNormalChannelPair();
-			const st = pair.openerChannel.getFullState();
+			const st = writableState(pair.openerChannel);
 			const before = pair.openerChannel.getSpendableOutboundMsat();
 			const oldRate = st.localConfig.feeratePerKw;
 			st.pendingFeeratePerKw = oldRate * 4;
@@ -8283,8 +8284,8 @@ describe('Splice', function () {
 			).to.be.true;
 
 			// Recover the wire and lock; NORMAL is usable.
-			openerChannel.getFullState().state = ChannelState.SPLICING;
-			openerChannel.getFullState().preReestablishState = null;
+			writableState(openerChannel).state = ChannelState.SPLICING;
+			writableState(openerChannel).preReestablishState = null;
 			openerManager.sendSpliceLocked(channelId);
 			acceptorManager.sendSpliceLocked(channelId);
 			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
@@ -9166,7 +9167,7 @@ describe('Splice', function () {
 			const flags = FeatureFlags.empty();
 			flags.setCompulsory(Feature.OPTION_TAPROOT);
 			const originalType = acceptorChannel.getFullState().channelType;
-			acceptorChannel.getFullState().channelType = flags.toBuffer();
+			writableState(acceptorChannel).channelType = flags.toBuffer();
 
 			const sent: number[] = [];
 			acceptorManager.on('message:outbound', (pk, type) => {
@@ -9202,7 +9203,7 @@ describe('Splice', function () {
 			// real channel type first: the fake taproot flag exists only to
 			// drive the refusal; the usability claim is about the quiescence
 			// unwind, and a genuinely-taproot pair would sign via MuSig2.)
-			acceptorChannel.getFullState().channelType = originalType;
+			writableState(acceptorChannel).channelType = originalType;
 			const preimage = crypto.randomBytes(32);
 			expect(
 				openerManager.addHtlc(
@@ -9217,7 +9218,7 @@ describe('Splice', function () {
 			expect(openerChannel.getFullState().htlcs.size).to.equal(0);
 
 			// And the initiator-side up-front refusal, for completeness.
-			openerChannel.getFullState().channelType = flags.toBuffer();
+			writableState(openerChannel).channelType = flags.toBuffer();
 			const initActions = openerChannel.initiateSplice(50_000n, 253);
 			const initErr = findAction(initActions, ChannelActionType.ERROR);
 			expect(initErr, 'initiator refused').to.not.equal(undefined);
@@ -9417,7 +9418,7 @@ describe('Splice', function () {
 
 			// A staged fee the acceptor has not signed at (getLocalCommitmentFeeRate
 			// would return it for the ACCEPTOR role — the fallback this guards).
-			acceptorChannel.getFullState().pendingFeeratePerKw = rateA! * 4;
+			writableState(acceptorChannel).pendingFeeratePerKw = rateA! * 4;
 			acceptorChannel.markSpliceConfirmed();
 
 			const dest = Buffer.concat([

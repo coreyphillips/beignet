@@ -57,6 +57,7 @@ import {
 	signerFromSeed,
 	realInitialCommitmentSig
 } from './helpers/real-signing';
+import { writableState } from './helpers/writable-state';
 
 // ─────────────── Helpers ───────────────
 
@@ -458,7 +459,7 @@ describe('Post-splice channel re-announcement', function () {
 		const anyOpener = opener as any;
 
 		// Simulate an announced channel mid-splice
-		const st = opener.getFullState();
+		const st = writableState(opener);
 		st.shortChannelId = Buffer.from(SCID_A);
 		st.announcementSigsSent = true;
 		st.announcementSigsReceived = true;

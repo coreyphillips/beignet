@@ -36,6 +36,7 @@ import { ILightningError, INodeConfig } from '../../src/lightning/node/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Network } from '../../src/lightning/invoice/types';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -263,7 +264,7 @@ describe('Zero-conf splice broadcast obligation (issue #756)', () => {
 		const original = channel.getFullState().fundingTxid!.toString('hex');
 		expect(channel.getFullState().previousFundingTxids).to.equal(undefined);
 		complete(channel);
-		const once = channel.getFullState();
+		const once = writableState(channel);
 		expect(once.fundingTxid!.equals(spliceTxid)).to.equal(true);
 		expect(hexOf(once.previousFundingTxids)).to.deep.equal([original]);
 
@@ -423,7 +424,7 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 		// lock adopt it, the way tx_signatures + splice_locked do on a
 		// zero-conf channel: the record is consumed with zero confirmations.
 		const ch = alice.getChannelManager().getChannel(channelId)!;
-		const raw = ch.getFullState();
+		const raw = writableState(ch);
 		raw.channelType = zeroConfType();
 		const spliceTx = spliceTxFor(raw.fundingTxid!);
 		raw.spliceInFlight = {
@@ -574,7 +575,7 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 
 		// A second splice at its point of no return whose frame the quorum
 		// has not released yet.
-		const raw = manager.getChannel(fx.channelId)!.getFullState();
+		const raw = writableState(manager.getChannel(fx.channelId)!);
 		const second = spliceTxFor(raw.fundingTxid!);
 		raw.spliceInFlight = inflightFor(second);
 		const idHex = fx.channelId.toString('hex');
@@ -634,10 +635,9 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 		// A second splice at its point of no return: the txid is present
 		// exactly when the pending balance is, and the list is untouched
 		// until this one is adopted too.
-		const raw = fx.alice
-			.getChannelManager()
-			.getChannel(fx.channelId)!
-			.getFullState();
+		const raw = writableState(
+			fx.alice.getChannelManager().getChannel(fx.channelId)!
+		);
 		const second = spliceTxFor(raw.fundingTxid!);
 		raw.spliceInFlight = inflightFor(second);
 		const mid = listed();
@@ -676,10 +676,9 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 		const fx = await setup(7571);
 		const errors: ILightningError[] = [];
 		fx.alice.on('node:error', (e: ILightningError) => errors.push(e));
-		const raw = fx.alice
-			.getChannelManager()
-			.getChannel(fx.channelId)!
-			.getFullState();
+		const raw = writableState(
+			fx.alice.getChannelManager().getChannel(fx.channelId)!
+		);
 		const second = spliceTxFor(raw.fundingTxid!);
 		raw.spliceInFlight = inflightFor(second);
 		const watcher = fx.alice.getChainWatcher()!;

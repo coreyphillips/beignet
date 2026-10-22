@@ -24,6 +24,7 @@ import {
 } from '../../src/lightning/message/channel-open';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
+import { writableState } from './helpers/writable-state';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -117,7 +118,7 @@ describe('Zero-conf channel_type gating', function () {
 
 		const acceptor = makeAcceptor(open.temporaryChannelId);
 		// Mirror ChannelManager's trusted-peer wiring before handleOpenChannel.
-		const state = acceptor.getFullState();
+		const state = writableState(acceptor);
 		state.trustedPeer = true;
 		state.zeroConfEnabled = true;
 		state.minimumDepth = 0;

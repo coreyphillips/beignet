@@ -44,6 +44,7 @@ import {
 	signerFromSeed,
 	realInitialCommitmentSig
 } from './helpers/real-signing';
+import { writableState } from './helpers/writable-state';
 
 const network = bitcoin.networks.regtest;
 
@@ -181,7 +182,7 @@ function setupNormalChannel(): { opener: Channel; openerPrivkeys: Buffer[] } {
 describe('Lease-locked to_remote sweep release (issue #537)', function () {
 	it('holds the lessor to_remote until the lease CSV matures, then releases it', function () {
 		const { opener, openerPrivkeys } = setupNormalChannel();
-		const state = opener.getFullState();
+		const state = writableState(opener);
 		state.channelType = ANCHOR_CHANNEL_TYPE;
 		state.isLessor = true;
 		state.leaseExpiry = LEASE_EXPIRY;

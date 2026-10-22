@@ -49,6 +49,7 @@ import {
 	IInvoiceRequest,
 	IBolt12Invoice
 } from '../../src/lightning/offer';
+import { writableState } from './helpers/writable-state';
 
 // ─────────────── Mock Storage ───────────────
 
@@ -385,7 +386,7 @@ function openReadyChannel(
 	// to path topology, so pin the published branch on both nodes.
 	for (const n of [alice, bob]) {
 		for (const ch of n.getChannelManager().listChannels()) {
-			const st = ch.getFullState();
+			const st = writableState(ch);
 			st.announceChannel = true;
 			st.announcementSigsSent = true;
 			st.announcementSigsReceived = true;
@@ -1082,7 +1083,7 @@ describe('Crash-Safe State Persistence', function () {
 		function reconnect(node: LightningNode, channelId: Buffer): void {
 			const channel = node.getChannelManager().getChannel(channelId);
 			expect(channel, 'expected the channel to have been restored').to.exist;
-			channel!.getFullState().state = ChannelState.NORMAL;
+			writableState(channel!).state = ChannelState.NORMAL;
 			node.getChannelManager().emit('channel:restore-ready', channelId);
 		}
 
@@ -1397,7 +1398,7 @@ describe('Crash-Safe State Persistence', function () {
 		function reconnect(node: LightningNode, channelId: Buffer): void {
 			const channel = node.getChannelManager().getChannel(channelId);
 			expect(channel, 'expected the channel to have been restored').to.exist;
-			channel!.getFullState().state = ChannelState.NORMAL;
+			writableState(channel!).state = ChannelState.NORMAL;
 			node.getChannelManager().emit('channel:restore-ready', channelId);
 		}
 

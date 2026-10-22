@@ -1551,9 +1551,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// initial commitment (#0). Mirrors the acceptor-side signing in
 		// handleFundingCreated above. Falls back to the passed signature only if
 		// the remote's per-commitment point isn't available yet.
+		channel.setFundingOutpoint(fundingTxid, fundingOutputIndex);
 		const fundingState = channel.getFullState();
-		fundingState.fundingTxid = fundingTxid;
-		fundingState.fundingOutputIndex = fundingOutputIndex;
 		let initialSignature = signature;
 		let partialSignatureWithNonce: Buffer | undefined;
 		if (fundingState.remoteCurrentPerCommitmentPoint) {
@@ -2133,18 +2132,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			!progress.sendsHeld &&
 			!progress.attemptedMessageTypes.has(MessageType.SHUTDOWN)
 		) {
-			const current = channel.getFullState();
-			if (current.state === ChannelState.SHUTTING_DOWN)
-				current.state = previous.state;
-			else if (
-				current.state === ChannelState.AWAITING_REESTABLISH &&
-				current.preReestablishState === ChannelState.SHUTTING_DOWN
-			)
-				current.preReestablishState = previous.state;
-			current.localShutdownScript = previous.localShutdownScript;
-			current.externalClose = previous.externalClose;
-			current.staleCloseRiskAccepted = previous.staleCloseRiskAccepted;
-			current.simpleClose = previous.simpleClose;
+			channel.rollbackShutdown(previous);
 			return {
 				ok: false,
 				actions: [],
@@ -2184,7 +2172,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// BOLT 2 quiescence: update_fee is an update message too. Dropped, not
 		// deferred: fee refresh is periodic and idempotent, the next cycle
 		// re-proposes once the session ends.
-		if (typeof channel.isQuiescing === 'function' && channel.isQuiescing()) {
+		if (channel.isQuiescing()) {
 			return {
 				ok: false,
 				actions: [],
@@ -2543,7 +2531,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				}
 			}
 
-			channel.getFullState().state = ChannelState.ERRORED;
+			channel.failOpenOnDisconnect();
 			this.tempChannels.delete(tempId);
 			this.channelPeers.delete(tempId);
 			this.emit(
@@ -4211,7 +4199,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			// ONLY when the opener explicitly proposed the zero_conf channel type:
 			// membership alone must not change how ordinary opens validate.
 			if (this.zeroConfManager.isTrustedPeer(peerPubkey)) {
-				channel.getFullState().trustedPeer = true;
+				channel.setTrustedPeer();
 			}
 
 			actions = channel.handleOpenChannel(msg);
@@ -4313,9 +4301,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 
 		// Set funding outpoint on state before signing (handleFundingCreated also sets these)
+		channel.setFundingOutpoint(msg.fundingTxid, msg.fundingOutputIndex);
 		const channelState = channel.getFullState();
-		channelState.fundingTxid = msg.fundingTxid;
-		channelState.fundingOutputIndex = msg.fundingOutputIndex;
 
 		// Sign the remote's initial commitment transaction with the channel's signer
 		const signer = this.signerFor(channel, true);
@@ -4946,7 +4933,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				// the lie. Roll it back to NEGOTIATING_CLOSING and persist THAT, so
 				// every recovery path (retry, reconnect with fresh session, operator
 				// force close) stays open.
-				channel.getFullState().state = ChannelState.NEGOTIATING_CLOSING;
+				channel.markNegotiatingClosing();
 				this.emit(
 					'error',
 					msg.channelId,
@@ -6162,11 +6149,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// admissions, the CURRENT init exchange must advertise the base and
 		// concurrent capabilities on both sides. Judged here, on every
 		// reestablish, and handed to the channel before it runs.
-		if (typeof channel.setFforCapabilities === 'function') {
-			channel.setFforCapabilities(
-				this.peerNegotiatedFforConcurrent(peerPubkey)
-			);
-		}
+		channel.setFforCapabilities(this.peerNegotiatedFforConcurrent(peerPubkey));
 		const actions = channel.handleReestablish(msg);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -6446,8 +6429,6 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	}
 
 	private _fforEnsureContext(peerPubkey: string, channel: Channel): void {
-		// Recovery suites drive dispatch with channel-shaped stubs.
-		if (typeof channel.setFforContext !== 'function') return;
 		if (!/^[0-9a-f]{66}$/i.test(peerPubkey)) return;
 		const nodeKey = this.config.nodePrivateKey ?? null;
 		channel.setFforContext({
@@ -6463,7 +6444,6 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	/** Emit 'ffor:state' (channelId, state, record) when the state moved. */
 	private _fforEmitStateChange(channel: Channel): void {
-		if (typeof channel.getFforEpoch !== 'function') return;
 		const channelId = channel.getChannelId();
 		if (!channelId) return;
 		const hex = channelId.toString('hex');
@@ -6623,11 +6603,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// way a blocked transition does, so an HTLC the node holds the
 		// preimage for is settled after one reconnect instead of riding to
 		// its on-chain deadline. A failed write has already asked.
-		if (
-			typeof channel.fforTakeReconnectRequest === 'function' &&
-			channel.fforTakeReconnectRequest() &&
-			!progress.sendsWithheld
-		) {
+		if (channel.fforTakeReconnectRequest() && !progress.sendsWithheld) {
 			this.emit('transition:blocked', peerPubkey, channelId);
 		}
 		if (progress.sendsWithheld) {
@@ -7911,7 +7887,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			// semantics when (and only when) the opener proposed the zero_conf
 			// channel type. Mirrors the v1 acceptor path.
 			if (this.zeroConfManager.isTrustedPeer(peerPubkey)) {
-				state.trustedPeer = true;
+				channel.setTrustedPeer();
 			}
 
 			// Generate per-commitment points for local params
@@ -9474,8 +9450,6 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * timing out when the session is already over.
 	 */
 	private _syncQuiescenceWatchdog(channel: Channel): void {
-		// Tolerate partial channel doubles in tests and recovery shims.
-		if (typeof channel.isQuiescing !== 'function') return;
 		const channelIdHex = channel.getChannelId()?.toString('hex');
 		if (!channelIdHex) return;
 		const timer = this.quiescenceTimers.get(channelIdHex);
@@ -9520,9 +9494,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					failureCode: number;
 			  }
 	): boolean {
-		if (typeof channel.isQuiescing !== 'function' || !channel.isQuiescing()) {
-			return false;
-		}
+		if (!channel.isQuiescing()) return false;
 		const list = this.pendingQuiescentSettles.get(channelIdHex) ?? [];
 		list.push(op);
 		this.pendingQuiescentSettles.set(channelIdHex, list);
@@ -9629,10 +9601,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// releases them in order behind the chain. The rest of the batch (its
 		// persist, its events) runs now. The state did commit and the wire
 		// is owed in order, which is what sendsHeld reports.
-		const actions =
-			typeof channel.fforHoldStream === 'function'
-				? channel.fforHoldStream(produced)
-				: produced;
+		const actions = channel.fforHoldStream(produced);
 		if (actions !== produced) dispatchProgress.sendsHeld = true;
 		const errorIndex = actions.findIndex(
 			(action) => action.type === ChannelActionType.ERROR
@@ -9934,10 +9903,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					// R can take what a concurrent S originates from here on.
 					// Told to the channel before the transport call, so an
 					// answer the peer returns on this stack already finds it.
-					if (
-						action.messageType === MessageType.FF_ACTIVATE_ACK &&
-						typeof channel.fforNoteActivateAckSent === 'function'
-					) {
+					if (action.messageType === MessageType.FF_ACTIVATE_ACK) {
 						channel.fforNoteActivateAckSent();
 					}
 					this.sendMessage(peerPubkey, action.messageType, action.payload);
@@ -10184,9 +10150,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					// No listener (or no storage) leaves committed true, which is
 					// the pre-outbox behavior for a node that persists nothing.
 					if (persistRequest && !persistRequest.committed) {
-						if (typeof channel.fforNoteStateWritten === 'function') {
-							channel.fforNoteStateWritten(false);
-						}
+						channel.fforNoteStateWritten(false);
 						this.persistFailed.add(channel.getChannelId()!.toString('hex'));
 						setSendsBlocked(true);
 						break;
@@ -10197,20 +10161,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					// The channel learns that its state is on disk: what it
 					// still owed to storage (an observed capability hold of a
 					// concurrent FFOR epoch) is no longer owed.
-					if (typeof channel.fforNoteStateWritten === 'function') {
-						channel.fforNoteStateWritten(true);
-					}
+					channel.fforNoteStateWritten(true);
 					// The FFOR state this write made durable, captured HERE: a
 					// nested dispatch may move the in-memory record before this
 					// batch's tail announces anything.
-					if (typeof channel.getFforEpoch === 'function') {
-						const durableId = channel.getChannelId();
-						if (durableId) {
-							this._fforDurableState.set(
-								durableId.toString('hex'),
-								channel.getFforEpoch()?.state ?? null
-							);
-						}
+					const durableId = channel.getChannelId();
+					if (durableId) {
+						this._fforDurableState.set(
+							durableId.toString('hex'),
+							channel.getFforEpoch()?.state ?? null
+						);
 					}
 					// The frame this transition landed in is only known now, so
 					// the barrier question is asked here and nowhere else. A

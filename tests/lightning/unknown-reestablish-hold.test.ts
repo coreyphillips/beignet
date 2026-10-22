@@ -24,6 +24,7 @@ import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { MessageType } from '../../src/lightning/message/types';
 import { encodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
+import { writableState } from './helpers/writable-state';
 
 // ─── Harness (model: channel-manager.test.ts) ───
 
@@ -454,7 +455,7 @@ describe('Unknown-channel reestablish hold (issue #462)', function () {
 
 		it('answers a force-closed channel at once even with a window set', function () {
 			const { alice, channelId } = openAndReadyChannel(5_000);
-			alice.getChannel(channelId)!.getFullState().state =
+			writableState(alice.getChannel(channelId)!).state =
 				ChannelState.FORCE_CLOSED;
 
 			const sent: Array<{ type: number }> = [];
