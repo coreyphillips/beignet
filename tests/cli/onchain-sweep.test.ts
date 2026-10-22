@@ -58,17 +58,17 @@ function harness(storageOverride?: SqliteStorage) {
 		listFrozenUtxos: () => frozen,
 		freezeUtxoIfUnfrozen: async ({
 			txid,
-			index,
+			vout,
 			tag
 		}: {
 			txid: string;
-			index: number;
+			vout: number;
 			tag?: string;
 		}) => {
-			if (frozen.some((coin) => coin.tx_hash === txid && coin.tx_pos === index))
+			if (frozen.some((coin) => coin.tx_hash === txid && coin.tx_pos === vout))
 				return ok({ created: false });
 			const coin = coins.find(
-				(item) => item.tx_hash === txid && item.tx_pos === index
+				(item) => item.tx_hash === txid && item.tx_pos === vout
 			);
 			if (!coin) return err('Unknown input');
 			frozen.push({ ...coin, freezeTag: tag });
@@ -77,18 +77,18 @@ function harness(storageOverride?: SqliteStorage) {
 		},
 		unfreezeUtxoIfTagged: async ({
 			txid,
-			index,
+			vout,
 			tag
 		}: {
 			txid: string;
-			index: number;
+			vout: number;
 			tag: string;
 		}) => {
 			if (failRelease) return err('disk full');
 			const found = frozen.findIndex(
 				(coin) =>
 					coin.tx_hash === txid &&
-					coin.tx_pos === index &&
+					coin.tx_pos === vout &&
 					coin.freezeTag === tag
 			);
 			if (found >= 0) frozen.splice(found, 1);

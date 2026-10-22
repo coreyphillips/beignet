@@ -92,13 +92,13 @@ describe('stop() refresh deadline', function () {
 	this.timeout(60000);
 
 	let wallet: Wallet;
-	let getUtxosStub: sinon.SinonStub;
+	let refreshUtxosStub: sinon.SinonStub;
 	let setZeroIndexStub: sinon.SinonStub;
 	let updateAddressIndexesStub: sinon.SinonStub;
 	let updateTransactionsStub: sinon.SinonStub;
 	let subscribeStub: sinon.SinonStub;
 	let disconnectStub: sinon.SinonStub;
-	/** Releases whatever refresh is parked in getUtxos. */
+	/** Releases whatever refresh is parked in refreshUtxos. */
 	let releaseRefresh: () => void = () => undefined;
 	let parkedRefresh: Promise<unknown> | null = null;
 	let refreshSettled = false;
@@ -130,7 +130,7 @@ describe('stop() refresh deadline', function () {
 		updateAddressIndexesStub = sinon
 			.stub(wallet as unknown as TWalletInternals, 'updateAddressIndexes')
 			.resolves(ok('stubbed'));
-		getUtxosStub = sinon.stub(wallet, 'getUtxos');
+		refreshUtxosStub = sinon.stub(wallet, 'refreshUtxos');
 		updateTransactionsStub = sinon
 			.stub(wallet, 'updateTransactions')
 			.resolves(ok<string | undefined>(undefined));
@@ -148,7 +148,7 @@ describe('stop() refresh deadline', function () {
 		const parked = new Promise<void>((resolve) => {
 			releaseRefresh = resolve;
 		});
-		getUtxosStub.callsFake(async () => {
+		refreshUtxosStub.callsFake(async () => {
 			await parked;
 			return ok<IGetUtxosResponse>({ utxos: [], balance: 0 });
 		});
@@ -165,15 +165,15 @@ describe('stop() refresh deadline', function () {
 		await wallet?.stop();
 	});
 
-	/** Starts a refresh and parks it in getUtxos with the flag up. */
+	/** Starts a refresh and parks it in refreshUtxos with the flag up. */
 	const parkARefresh = async (): Promise<void> => {
 		parkedRefresh = wallet.refreshWallet().then(() => {
 			refreshSettled = true;
 		});
 		await waitFor(
-			() => getUtxosStub.callCount === 1,
+			() => refreshUtxosStub.callCount === 1,
 			5000,
-			'the refresh to reach getUtxos'
+			'the refresh to reach refreshUtxos'
 		);
 		expect(wallet.isRefreshing, 'the refresh raised the flag').to.equal(true);
 	};
@@ -243,7 +243,7 @@ describe('stop() refresh deadline', function () {
 
 		releaseFirstStep();
 		// The refused connection check ends the refresh there. A refresh that
-		// reconnects instead carries on to the park in getUtxos, which only
+		// reconnects instead carries on to the park in refreshUtxos, which only
 		// afterEach releases.
 		await withDeadline(
 			parkedRefresh,
@@ -262,7 +262,7 @@ describe('stop() refresh deadline', function () {
 	});
 
 	it('ends a refresh abandoned past its connection check', async function () {
-		// The park here is in getUtxos, downstream of the connection check the
+		// The park here is in refreshUtxos, downstream of the connection check the
 		// refresh already passed, so the guard on that check cannot catch it. The
 		// steps after it go to Electrum, which dials again when it finds itself
 		// disconnected.
@@ -271,7 +271,7 @@ describe('stop() refresh deadline', function () {
 		const stopped = await withDeadline(
 			wallet.stop({ refreshTimeout: 50 }),
 			5000,
-			'stop() behind a refresh parked in getUtxos'
+			'stop() behind a refresh parked in refreshUtxos'
 		);
 		expect(stopped.isOk(), 'the wallet stopped').to.equal(true);
 
@@ -290,7 +290,7 @@ describe('stop() refresh deadline', function () {
 
 	it('does not reconnect when a transaction refresh resumes from storage', async function () {
 		updateTransactionsStub.restore();
-		getUtxosStub.resolves(ok<IGetUtxosResponse>({ utxos: [], balance: 0 }));
+		refreshUtxosStub.resolves(ok<IGetUtxosResponse>({ utxos: [], balance: 0 }));
 		// Keep the real transaction refresh and unconfirmed-transaction storage
 		// path, but remove transaction lookups and network I/O from this case.
 		sinon
@@ -347,9 +347,10 @@ describe('stop() refresh deadline', function () {
 			if (result.isErr())
 				expect(result.error.message).to.equal('Wallet stopped.');
 		}
-		expect(getUtxosStub.callCount, 'no additional refresh body ran').to.equal(
-			1
-		);
+		expect(
+			refreshUtxosStub.callCount,
+			'no additional refresh body ran'
+		).to.equal(1);
 	});
 
 	it('reports disconnect failure after disabling messages and storage', async function () {
@@ -425,7 +426,7 @@ describe('stop() refresh deadline', function () {
 		);
 
 		expect(stopped.isOk()).to.equal(true);
-		expect(getUtxosStub.callCount, 'no refresh was started').to.equal(0);
+		expect(refreshUtxosStub.callCount, 'no refresh was started').to.equal(0);
 		expect(disconnectStub.callCount).to.equal(1);
 	});
 });

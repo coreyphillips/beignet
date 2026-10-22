@@ -49,7 +49,7 @@ const FUNDING_ADDR = p2wpkh(7);
 const scriptOf = (addr: string): Buffer =>
 	bitcoin.address.toOutputScript(addr, bitcoin.networks.regtest);
 
-/** getNextAvailableAddress as the wallet answers it: BOTH chains. */
+/** fetchNextAvailableAddress as the wallet answers it: BOTH chains. */
 const bothChains = (): unknown => ({
 	isOk: (): boolean => true,
 	isErr: (): boolean => false,
@@ -120,7 +120,7 @@ describe('closeChannel wallet-credited payout (issue #542)', () => {
 		const bn = closableNode({
 			capture,
 			wallet: {
-				getNextAvailableAddress: async (): Promise<unknown> => bothChains()
+				fetchNextAvailableAddress: async (): Promise<unknown> => bothChains()
 			}
 		});
 		const result = await bn.closeChannel(CHANNEL_ID);
@@ -137,7 +137,7 @@ describe('closeChannel wallet-credited payout (issue #542)', () => {
 		const bn = closableNode({
 			capture,
 			wallet: {
-				getNextAvailableAddress: async (): Promise<unknown> => bothChains()
+				fetchNextAvailableAddress: async (): Promise<unknown> => bothChains()
 			}
 		});
 		const requestAddress = await bn.getNewAddress();
@@ -148,7 +148,7 @@ describe('closeChannel wallet-credited payout (issue #542)', () => {
 	});
 
 	it('a never-settling address lookup cannot park the close (issue #542 review)', async () => {
-		// getNextAvailableAddress can enter an Electrum handshake with no
+		// fetchNextAvailableAddress can enter an Electrum handshake with no
 		// timeout of its own. The close must fall through to the cached
 		// script at the bound instead of waiting forever.
 		const capture: ICloseCapture = {};
@@ -158,7 +158,7 @@ describe('closeChannel wallet-credited payout (issue #542)', () => {
 			sweepDestinationScript: sweepScript,
 			lookupTimeoutMs: 50,
 			wallet: {
-				getNextAvailableAddress: (): Promise<never> =>
+				fetchNextAvailableAddress: (): Promise<never> =>
 					new Promise<never>(() => {
 						/* never settles */
 					})
@@ -180,7 +180,7 @@ describe('closeChannel wallet-credited payout (issue #542)', () => {
 		const bn = closableNode({
 			capture,
 			wallet: {
-				getNextAvailableAddress: async (): Promise<never> => {
+				fetchNextAvailableAddress: async (): Promise<never> => {
 					throw new Error('electrum down');
 				},
 				getChangeAddress: async (): Promise<unknown> => storedChange(),
@@ -202,7 +202,7 @@ describe('closeChannel wallet-credited payout (issue #542)', () => {
 			capture,
 			sweepDestinationScript: sweepScript,
 			wallet: {
-				getNextAvailableAddress: async (): Promise<never> => {
+				fetchNextAvailableAddress: async (): Promise<never> => {
 					throw new Error('electrum down');
 				},
 				getChangeAddress: async (): Promise<unknown> => storedChange(),
@@ -220,7 +220,7 @@ describe('closeChannel wallet-credited payout (issue #542)', () => {
 		const bn = closableNode({
 			capture,
 			wallet: {
-				getNextAvailableAddress: async (): Promise<never> => {
+				fetchNextAvailableAddress: async (): Promise<never> => {
 					throw new Error('electrum down');
 				},
 				getChangeAddress: async (): Promise<never> => {
@@ -240,7 +240,7 @@ describe('closeChannel wallet-credited payout (issue #542)', () => {
 		const bn = closableNode({
 			capture,
 			wallet: {
-				getNextAvailableAddress: async (): Promise<unknown> => bothChains()
+				fetchNextAvailableAddress: async (): Promise<unknown> => bothChains()
 			}
 		});
 		await bn.closeChannel(CHANNEL_ID, true);
@@ -253,7 +253,7 @@ describe('closeChannel wallet-credited payout (issue #542)', () => {
 		const node = closableNode({
 			capture,
 			wallet: {
-				getNextAvailableAddress: () => {
+				fetchNextAvailableAddress: () => {
 					lookups++;
 					throw new Error('unexpected lookup');
 				}

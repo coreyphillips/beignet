@@ -360,7 +360,7 @@ export class OnchainSweeps {
 		for (const point of record.request.inputOutpoints) {
 			const result = await this.deps.wallet.freezeUtxoIfUnfrozen({
 				txid: point.txid,
-				index: point.vout,
+				vout: point.vout,
 				tag: this.tag(record.requestId)
 			});
 			if (result.isErr()) refuse('SWEEP_NOT_PERSISTED', result.error.message);
@@ -373,7 +373,7 @@ export class OnchainSweeps {
 		for (const point of record.request.inputOutpoints) {
 			const result = await this.deps.wallet.unfreezeUtxoIfTagged({
 				txid: point.txid,
-				index: point.vout,
+				vout: point.vout,
 				tag: this.tag(record.requestId)
 			});
 			if (result.isErr()) refuse('SWEEP_NOT_PERSISTED', result.error.message);

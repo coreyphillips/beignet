@@ -314,7 +314,11 @@ export class FforReceiveService {
 				.getNode()
 				.getChannelManager()
 				.isTrustedPeer(peer);
-			const opened = this.host.openChannel(peer, amount, 0, 2, false, trusted);
+			const opened = this.host.openChannel(peer, amount, {
+				pushSats: 0,
+				satsPerVbyte: 2,
+				trusted
+			});
 			allocation.channelId = opened.channelId;
 			allocation.temporaryId = opened.channelId;
 			this.host

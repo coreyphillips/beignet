@@ -289,7 +289,9 @@ describe('automatic receive service', () => {
 				(untrusted.service as unknown as Allocator).serve(peer, request),
 				/funding failed/
 			);
-			assert.deepEqual(untrusted.opened, [[peer, 60000, 0, 2, false, false]]);
+			assert.deepEqual(untrusted.opened, [
+				[peer, 60000, { pushSats: 0, satsPerVbyte: 2, trusted: false }]
+			]);
 		} finally {
 			untrusted.service.stop();
 		}
@@ -300,7 +302,9 @@ describe('automatic receive service', () => {
 				(trusted.service as unknown as Allocator).serve(peer, request),
 				/funding failed/
 			);
-			assert.deepEqual(trusted.opened, [[peer, 60000, 0, 2, false, true]]);
+			assert.deepEqual(trusted.opened, [
+				[peer, 60000, { pushSats: 0, satsPerVbyte: 2, trusted: true }]
+			]);
 		} finally {
 			trusted.service.stop();
 		}

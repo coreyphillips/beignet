@@ -587,9 +587,9 @@ describe('Electrum notifications during a running refresh (issue #808)', functio
 	this.timeout(60000);
 
 	let wallet: Wallet;
-	let getUtxosStub: sinon.SinonStub;
+	let refreshUtxosStub: sinon.SinonStub;
 	let updateAddressIndexesStub: sinon.SinonStub;
-	/** One gate per getUtxos call, so each refresh body can be held and counted. */
+	/** One gate per refreshUtxos call, so each refresh body can be held and counted. */
 	let gates: Array<() => void>;
 	let headerHandler: ((data: unknown[]) => Promise<void>) | null;
 	/** The status a fresh subscription answers with, per script hash. */
@@ -691,10 +691,12 @@ describe('Electrum notifications during a running refresh (issue #808)', functio
 			.stub(wallet, 'updateTransactions')
 			.resolves(ok<string | undefined>(undefined));
 		sinon.stub(wallet, 'updateFeeEstimates').resolves(ok(wallet.feeEstimates));
-		getUtxosStub = sinon.stub(wallet, 'getUtxos').callsFake(async () => {
-			await new Promise<void>((resolve) => gates.push(resolve));
-			return ok<IGetUtxosResponse>({ utxos: [], balance: 0 });
-		});
+		refreshUtxosStub = sinon
+			.stub(wallet, 'refreshUtxos')
+			.callsFake(async () => {
+				await new Promise<void>((resolve) => gates.push(resolve));
+				return ok<IGetUtxosResponse>({ utxos: [], balance: 0 });
+			});
 	});
 
 	afterEach(async function () {
@@ -704,11 +706,14 @@ describe('Electrum notifications during a running refresh (issue #808)', functio
 		await wallet.stop();
 	});
 
-	/** Starts a refresh and holds it inside getUtxos. Wrapped, because an
+	/** Starts a refresh and holds it inside refreshUtxos. Wrapped, because an
 	 *  async function returning the refresh would wait for it. */
 	const holdARefresh = async (): Promise<{ running: Promise<unknown> }> => {
 		const running = wallet.refreshWallet({});
-		await waitFor(() => gates.length === 1, 'the refresh to reach getUtxos');
+		await waitFor(
+			() => gates.length === 1,
+			'the refresh to reach refreshUtxos'
+		);
 		return { running };
 	};
 
@@ -721,9 +726,10 @@ describe('Electrum notifications during a running refresh (issue #808)', functio
 		gates[1]();
 		await running;
 		await new Promise((resolve) => setTimeout(resolve, 50));
-		expect(getUtxosStub.callCount, 'one scan after the held refresh').to.equal(
-			2
-		);
+		expect(
+			refreshUtxosStub.callCount,
+			'one scan after the held refresh'
+		).to.equal(2);
 	};
 
 	it('scans after a script hash notification that lands mid-refresh', async function () {
@@ -783,16 +789,17 @@ describe('Electrum notifications during a running refresh (issue #808)', functio
 		await wallet.electrum.disconnect();
 		gates[0]();
 		await running;
-		expect(getUtxosStub.callCount, 'the queued rerun failed to scan').to.equal(
-			1
-		);
+		expect(
+			refreshUtxosStub.callCount,
+			'the queued rerun failed to scan'
+		).to.equal(1);
 
 		await reconnect();
 		await waitFor(() => gates.length === 2, 'a scan after the reconnect');
 		gates[1]();
 		await new Promise((resolve) => setTimeout(resolve, 50));
 
-		expect(getUtxosStub.callCount).to.equal(2);
+		expect(refreshUtxosStub.callCount).to.equal(2);
 	});
 
 	it('does not scan again after a reconnect when the queued refresh had started (issue #838)', async function () {
@@ -809,6 +816,6 @@ describe('Electrum notifications during a running refresh (issue #808)', functio
 		await reconnect();
 		await new Promise((resolve) => setTimeout(resolve, 50));
 
-		expect(getUtxosStub.callCount).to.equal(2);
+		expect(refreshUtxosStub.callCount).to.equal(2);
 	});
 });

@@ -490,7 +490,7 @@ describe('switchNetwork against an unreachable target', function () {
 			ok(w.feeEstimates);
 		stubs._runRefresh = async (): Promise<Result<IWalletData>> => ok(w.data);
 		// Each stub answers once released, and reports when its query is out,
-		// since getUtxos registers the mark only after a connection check.
+		// since refreshUtxos registers the mark only after a connection check.
 		const held = (): {
 			issued: Promise<void>;
 			release: () => void;
@@ -913,7 +913,7 @@ describe('switchNetwork against an unreachable target', function () {
 		const usedChange = Object.values(generated.value.changeAddresses)[0];
 		const scanning = holdable();
 		let first = true;
-		w.getNextAvailableAddress = async (
+		w.fetchNextAvailableAddress = async (
 			addressType = EAddressType.p2wpkh
 		): Promise<Result<IGetNextAvailableAddressResponse>> => {
 			if (first) {

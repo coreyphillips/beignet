@@ -279,6 +279,8 @@ import {
 	ReadinessCheck,
 	RetryPaymentOptions,
 	RetryPaymentResult,
+	IPayInvoiceOptions,
+	IOpenChannelOptions,
 	PaymentValidation,
 	PaymentValidationCheck,
 	PaymentValidationStatus,
@@ -1695,6 +1697,44 @@ function requireOpenAmounts(amountSats: unknown, pushSats?: unknown): void {
 }
 
 /**
+ * payInvoice's options from either call form. An options object followed by
+ * positional values is refused: one of the two would be dropped, and a dropped
+ * fee cap pays under the default one.
+ */
+function payInvoiceOptions(
+	first: IPayInvoiceOptions | number | undefined,
+	positional: Omit<IPayInvoiceOptions, 'timeoutMs'>
+): IPayInvoiceOptions {
+	if (first === null || typeof first !== 'object') {
+		return { timeoutMs: first ?? undefined, ...positional };
+	}
+	if (Object.values(positional).some((value) => value !== undefined)) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			'Pass payment options either as an object or positionally, not both'
+		);
+	}
+	return first;
+}
+
+/** openChannel's options from either call form, on payInvoiceOptions' terms. */
+function openChannelOptions(
+	first: IOpenChannelOptions | number | undefined,
+	positional: Omit<IOpenChannelOptions, 'pushSats'>
+): IOpenChannelOptions {
+	if (first === null || typeof first !== 'object') {
+		return { pushSats: first ?? undefined, ...positional };
+	}
+	if (Object.values(positional).some((value) => value !== undefined)) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			'Pass channel options either as an object or positionally, not both'
+		);
+	}
+	return first;
+}
+
+/**
  * A value the wire carries as a u32 (feerate_perkw, locktime). Buffer's
  * writeUInt32BE truncates 1.5 to 1 and throws on 2^32, and both happen after
  * the channel's state machine has moved, so the bound is enforced here.
@@ -2098,7 +2138,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private _autoRebalanceTimer?: ReturnType<typeof setInterval>;
 	/**
 	 * Bound on the cooperative close's wallet-address lookup (issue #542
-	 * review): getNextAvailableAddress can enter an Electrum reconnect whose
+	 * review): fetchNextAvailableAddress can enter an Electrum reconnect whose
 	 * server_version handshake carries no timeout of its own (the same hazard
 	 * HEADER_SUBSCRIBE_GATE_MS bounds in electrum/index.ts), and an unbounded
 	 * wait here means the close never reaches the engine and the cached or
@@ -6784,7 +6824,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * The next unused change address as an output script, or undefined when
 	 * the wallet cannot produce one (Electrum needed for the gap scan).
 	 * The change chain, never the receive chain: see resolveWalletSweepScript
-	 * (issue #1064). The lookup is the same getNextAvailableAddress call that
+	 * (issue #1064). The lookup is the same fetchNextAvailableAddress call that
 	 * gap-scans both chains, so the Electrum dependency and the timeouts the
 	 * callers wrap around it are unchanged; only the chain read out differs.
 	 */
@@ -6793,7 +6833,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	> {
 		const bitcoin = require('bitcoinjs-lib');
 		try {
-			const res = await this.wallet.getNextAvailableAddress();
+			const res = await this.wallet.fetchNextAvailableAddress();
 			if (res.isOk()) {
 				return bitcoin.address.toOutputScript(
 					res.value.changeAddressIndex.address,
@@ -6865,7 +6905,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	// ─────────────── On-chain ───────────────
 
 	async getNewAddress(): Promise<string> {
-		const result = await this.wallet.getNextAvailableAddress();
+		const result = await this.wallet.fetchNextAvailableAddress();
 		if (result.isErr()) {
 			throw new BeignetError('ADDRESS_FAILED', result.error.message);
 		}
@@ -7556,7 +7596,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// spendable ones here.
 		const utxoCount = this.wallet
 			.listUtxos()
-			.filter((u) => !this.wallet.isUtxoFrozen(u.tx_hash, u.tx_pos)).length;
+			.filter(
+				(u) => !this.wallet.isUtxoFrozen({ txid: u.tx_hash, vout: u.tx_pos })
+			).length;
 		if (utxoCount < 2) {
 			throw new BeignetError(
 				BeignetErrorCode.NOTHING_TO_CONSOLIDATE,
@@ -7736,7 +7778,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			address: utxo.address,
 			valueSats: utxo.value,
 			height: utxo.height,
-			frozen: this.wallet.isUtxoFrozen(utxo.tx_hash, utxo.tx_pos)
+			frozen: this.wallet.isUtxoFrozen({
+				txid: utxo.tx_hash,
+				vout: utxo.tx_pos
+			})
 		}));
 	}
 
@@ -7745,7 +7790,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		this._validateTxid(txid);
 		return this._runOnchainSend(async () => {
 			this.onchainSweeps().assertInputMutable(txid, index);
-			const res = await this.wallet.freezeUtxo({ txid, index });
+			const res = await this.wallet.freezeUtxo({ txid, vout: index });
 			if (res.isErr())
 				throw new BeignetError(
 					BeignetErrorCode.INVALID_PARAMS,
@@ -7763,7 +7808,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		this._validateTxid(txid);
 		return this._runOnchainSend(async () => {
 			this.onchainSweeps().assertInputMutable(txid, index);
-			const res = await this.wallet.unfreezeUtxo({ txid, index });
+			const res = await this.wallet.unfreezeUtxo({ txid, vout: index });
 			if (res.isErr())
 				throw new BeignetError(
 					BeignetErrorCode.INVALID_PARAMS,
@@ -7804,7 +7849,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 	async getFeeEstimates(): Promise<IOnchainFees> {
 		try {
-			return await this.wallet.getFeeEstimates();
+			return await this.wallet.fetchFeeEstimates();
 		} catch (e) {
 			throw new BeignetError(
 				'FEE_ESTIMATE_FAILED',
@@ -8027,13 +8072,48 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 	// ─────────────── Channels ───────────────
 
+	/**
+	 * Open a channel to a connected peer, funded from the on-chain wallet.
+	 * Returns once the open is under way, before the peer accepts it.
+	 */
+	openChannel(
+		pubkey: string,
+		amountSats: number,
+		opts?: IOpenChannelOptions
+	): ChannelInfo;
+	/**
+	 * @deprecated Pass an {@link IOpenChannelOptions} object after
+	 * amountSats. Removed in the next major release.
+	 */
 	openChannel(
 		pubkey: string,
 		amountSats: number,
 		pushSats?: number,
 		satsPerVbyte?: number,
-		max = false,
-		trusted = false
+		max?: boolean,
+		trusted?: boolean
+	): ChannelInfo;
+	openChannel(
+		pubkey: string,
+		amountSats: number,
+		opts?: IOpenChannelOptions | number,
+		satsPerVbyte?: number,
+		max?: boolean,
+		trusted?: boolean
+	): ChannelInfo {
+		const options = openChannelOptions(opts, { satsPerVbyte, max, trusted });
+		return this._openChannel(pubkey, amountSats, options);
+	}
+
+	private _openChannel(
+		pubkey: string,
+		amountSats: number,
+		{
+			pushSats,
+			satsPerVbyte,
+			max = false,
+			trusted = false
+		}: IOpenChannelOptions
 	): ChannelInfo {
 		requireOpenAmounts(amountSats, pushSats);
 		const fundingSatoshis = BigInt(amountSats);
@@ -8072,7 +8152,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		amountSats: number,
 		opts?: { pushSats?: number; timeoutMs?: number }
 	): Promise<ChannelInfo> {
-		const info = this.openChannel(pubkey, amountSats, opts?.pushSats);
+		const info = this.openChannel(pubkey, amountSats, {
+			pushSats: opts?.pushSats
+		});
 		await this.waitForChannelReady(info.channelId, opts?.timeoutMs ?? 120_000);
 		// Refresh channel info after it's ready
 		const updated = this.getChannel(info.channelId);
@@ -8097,14 +8179,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (opts?.trusted) {
 			this.node.addTrustedPeer(pubkey);
 		}
-		return this.openChannel(
-			pubkey,
-			amountSats,
-			opts?.pushSats,
-			opts?.satsPerVbyte,
-			opts?.max,
-			opts?.trusted ?? false
-		);
+		return this.openChannel(pubkey, amountSats, {
+			pushSats: opts?.pushSats,
+			satsPerVbyte: opts?.satsPerVbyte,
+			max: opts?.max,
+			trusted: opts?.trusted
+		});
 	}
 
 	async ensureMinimumChannels(
@@ -11496,14 +11576,53 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		);
 	}
 
-	async payInvoice(
+	/**
+	 * Pay a BOLT 11 invoice and wait until it settles, fails or times out.
+	 * src/cli/README.md describes the timeout and fee-cap rules.
+	 */
+	payInvoice(bolt11: string, opts?: IPayInvoiceOptions): Promise<PaymentInfo>;
+	/**
+	 * @deprecated Pass an {@link IPayInvoiceOptions} object after the
+	 * invoice. Removed in the next major release.
+	 */
+	payInvoice(
 		bolt11: string,
-		timeoutMs = 60_000,
+		timeoutMs?: number,
 		maxFeeSats?: number,
 		amountSats?: number,
 		metadata?: Record<string, string>,
 		cltvLimit?: number,
-		maxFeeMsatCap?: number | string
+		maxFeeMsat?: number | string
+	): Promise<PaymentInfo>;
+	async payInvoice(
+		bolt11: string,
+		opts?: IPayInvoiceOptions | number,
+		maxFeeSats?: number,
+		amountSats?: number,
+		metadata?: Record<string, string>,
+		cltvLimit?: number,
+		maxFeeMsat?: number | string
+	): Promise<PaymentInfo> {
+		const options = payInvoiceOptions(opts, {
+			maxFeeSats,
+			amountSats,
+			metadata,
+			cltvLimit,
+			maxFeeMsat
+		});
+		return this._payInvoice(bolt11, options);
+	}
+
+	private async _payInvoice(
+		bolt11: string,
+		{
+			timeoutMs = 60_000,
+			maxFeeSats,
+			amountSats,
+			metadata,
+			cltvLimit,
+			maxFeeMsat: maxFeeMsatCap
+		}: IPayInvoiceOptions
 	): Promise<PaymentInfo> {
 		this._checkDraining();
 		if (this.isGraphRestoring()) await this.whenGraphRestored();
@@ -11655,9 +11774,26 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * engine refused from, the durable row included (#975). Otherwise a
 	 * synthetic FAILED record whose failureDescription carries the code.
 	 */
+	payInvoiceSafe(
+		bolt11: string,
+		opts?: IPayInvoiceOptions
+	): Promise<PaymentInfo>;
+	/**
+	 * @deprecated Pass an {@link IPayInvoiceOptions} object after the
+	 * invoice. Removed in the next major release.
+	 */
+	payInvoiceSafe(
+		bolt11: string,
+		timeoutMs?: number,
+		maxFeeSats?: number,
+		amountSats?: number,
+		metadata?: Record<string, string>,
+		cltvLimit?: number,
+		maxFeeMsat?: number | string
+	): Promise<PaymentInfo>;
 	async payInvoiceSafe(
 		bolt11: string,
-		timeoutMs = 60_000,
+		opts?: IPayInvoiceOptions | number,
 		maxFeeSats?: number,
 		amountSats?: number,
 		metadata?: Record<string, string>,
@@ -11667,12 +11803,13 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		try {
 			return await this.payInvoice(
 				bolt11,
-				timeoutMs,
-				maxFeeSats,
-				amountSats,
-				metadata,
-				cltvLimit,
-				maxFeeMsat
+				payInvoiceOptions(opts, {
+					maxFeeSats,
+					amountSats,
+					metadata,
+					cltvLimit,
+					maxFeeMsat
+				})
 			);
 		} catch (err: unknown) {
 			// Extract payment hash if possible (bolt11 itself may be invalid)
@@ -11722,14 +11859,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 		for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
 			try {
-				const result = await this.payInvoice(
-					bolt11,
-					60_000,
-					opts.maxFeeSats,
-					opts.amountSats,
-					opts.metadata,
-					opts.cltvLimit
-				);
+				const result = await this.payInvoice(bolt11, {
+					maxFeeSats: opts.maxFeeSats,
+					amountSats: opts.amountSats,
+					metadata: opts.metadata,
+					cltvLimit: opts.cltvLimit
+				});
 				return { ...result, attempts: attempt };
 			} catch (err: unknown) {
 				if (!(err instanceof BeignetError)) throw err;
@@ -12331,11 +12466,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					bolt11: string,
 					payOptions
 				): Promise<{ preimage: Buffer }> => {
-					const info = await this.payInvoice(
-						bolt11,
-						payOptions.timeoutMs ?? 60_000,
-						payOptions.maxFeeSats
-					);
+					const info = await this.payInvoice(bolt11, {
+						timeoutMs: payOptions.timeoutMs,
+						maxFeeSats: payOptions.maxFeeSats
+					});
 					if (!info.preimage) {
 						throw new BeignetError(
 							'PAYMENT_FAILED',
@@ -14448,7 +14582,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (!this.paymentQueue) {
 			this.paymentQueue = new PaymentQueue(
 				(bolt11, timeout, maxFee, amount, meta) =>
-					this.payInvoiceSafe(bolt11, timeout, maxFee, amount, meta),
+					this.payInvoiceSafe(bolt11, {
+						timeoutMs: timeout,
+						maxFeeSats: maxFee,
+						amountSats: amount,
+						metadata: meta
+					}),
 				// No node yet (a guardian restore pending): no capacity, for
 				// now, rather than a throw (issue #967).
 				(amount) =>

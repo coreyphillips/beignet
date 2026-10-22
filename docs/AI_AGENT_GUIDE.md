@@ -485,9 +485,8 @@ Agents can store request IDs in payment metadata and query by them later:
 
 ```typescript
 // Attach metadata when paying
-await node.payInvoice(bolt11, 60_000, undefined, undefined, {
-  requestId: 'order-12345',
-  agent: 'purchasing-bot',
+await node.payInvoice(bolt11, {
+  metadata: { requestId: 'order-12345', agent: 'purchasing-bot' }
 });
 
 // Later, filter payments by metadata

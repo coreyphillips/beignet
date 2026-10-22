@@ -1971,7 +1971,7 @@ async function bootDaemon(
 			if (!pubkey || amountSats === undefined)
 				return failure('INVALID_PARAMS', 'pubkey and amountSats required');
 			return success(
-				node.openChannel(pubkey, amountSats, pushSats, satsPerVbyte, max)
+				node.openChannel(pubkey, amountSats, { pushSats, satsPerVbyte, max })
 			);
 		},
 		'POST /channel/close-quote': async (body) => {
@@ -2505,15 +2505,14 @@ async function bootDaemon(
 			};
 			if (!bolt11) return failure('INVALID_PARAMS', 'bolt11 required');
 			return success(
-				await node.payInvoice(
-					bolt11,
+				await node.payInvoice(bolt11, {
 					timeoutMs,
 					maxFeeSats,
+					maxFeeMsat,
 					amountSats,
 					metadata,
-					cltvLimit,
-					maxFeeMsat
-				)
+					cltvLimit
+				})
 			);
 		},
 		'POST /invoice/pay-async': (body) => {
@@ -2565,15 +2564,14 @@ async function bootDaemon(
 			};
 			if (!bolt11) return failure('INVALID_PARAMS', 'bolt11 required');
 			return success(
-				await node.payInvoiceSafe(
-					bolt11,
+				await node.payInvoiceSafe(bolt11, {
 					timeoutMs,
 					maxFeeSats,
+					maxFeeMsat,
 					amountSats,
 					metadata,
-					cltvLimit,
-					maxFeeMsat
-				)
+					cltvLimit
+				})
 			);
 		},
 		'POST /invoice/pay-retry': async (body) => {

@@ -132,16 +132,22 @@ await wallet.send({ address: 'bc1q...', amount: 50_000, satsPerByte: 2 });
 await wallet.sendMany({ txs: [{ address: 'bc1q...', amount: 1000 }] });
 await wallet.refreshWallet();
 
-const utxos = wallet.listUtxos();
-const history = await wallet.getAddressHistory('bc1q...');
+const utxos = wallet.listUtxos(); // what the last refresh stored
+const history = await wallet.fetchAddressHistory('bc1q...'); // asks Electrum
+
+// Build and sign without broadcasting, then broadcast separately
+const signed = await wallet.createSignedTransaction({ address: 'bc1q...', amount: 50_000 });
+if (signed.isOk()) await wallet.broadcastTransaction(signed.value.txHex);
 ```
+
+A method's verb says where its answer comes from: `get*` and `list*` read what the wallet holds, `fetch*` asks Electrum, and `refresh*` asks Electrum and stores the answer. [docs/API-CONVENTIONS.md](docs/API-CONVENTIONS.md) lists the older names, which still work and go in the next major release.
 
 Most fallible calls return a `Result<T>`: check `isErr()` before reading `.value`. The error is a `CodedError`: branch on `error.code`, never on the message, which can be reworded. The code is an `EWalletErrorCode` (`UNSPECIFIED` when the failure has no code of its own), or the code of an error passed through unchanged, such as `WATCH_ONLY_CANNOT_SIGN` or a `BoostError`'s. `error.cause` holds the failure it wraps, when there is one.
 
 A few calls do not return a `Result`, so check them differently:
 
 - `getAddress()` resolves to `''` when it cannot derive an address.
-- `getFeeEstimates()` never errs. When its sources fail it returns the previous estimates or built-in defaults (fixed values on regtest).
+- `fetchFeeEstimates()` never errs. When its sources fail it returns the previous estimates or built-in defaults (fixed values on regtest).
 - `updateAddressType()` throws on a type the wallet cannot use, and `resetAddressIndexes()` resolves to nothing.
 
 Balances, UTXO values and send amounts are satoshis, and fee rates are sat/vB: every `satsPerByte` option and field is sat/vB despite its name. Stored transactions (`wallet.transactions`) carry their amounts in satoshis as `valueSats`, `feeSats`, `totalInputSats`, `matchedInputSats`, `totalOutputSats` and `matchedOutputSats`. Their older BTC twins (`value`, `fee`, `totalInputValue` and the rest) are deprecated and go in the next major release. `btcToSats`, `satsToMsat` and `msatToSatsFloor` convert between units.
@@ -154,7 +160,7 @@ Options worth knowing on `Wallet.create`: `network` (`Network.bitcoin` | `testne
 ```typescript
 import { EBoostType } from 'beignet';
 
-const fees = await wallet.getFeeEstimates(); // { fast, normal, slow, minimum, timestamp }, sat/vB
+const fees = await wallet.fetchFeeEstimates(); // { fast, normal, slow, minimum, timestamp }, sat/vB
 await wallet.sendMax({ address: 'bc1q...', satsPerByte: fees.normal }); // sweeps every unfrozen coin
 
 // Fee bumping an unconfirmed transaction
@@ -163,8 +169,8 @@ wallet.getBoostableTransactions();         // { rbf: [...], cpfp: [...] }
 await wallet.boost({ txid, type: EBoostType.rbf, satsPerByte: 20 }); // or EBoostType.cpfp
 
 // Coin control: a frozen coin is left out of every coin selection
-await wallet.freezeUtxo({ txid, index: 0 });
-await wallet.unfreezeUtxo({ txid, index: 0 });
+await wallet.freezeUtxo({ txid, vout: 0 });
+await wallet.unfreezeUtxo({ txid, vout: 0 });
 wallet.listUtxos();           // every coin, frozen ones included
 wallet.listFrozenUtxos();
 wallet.getBalanceBreakdown(); // { total, spendable, frozen }
