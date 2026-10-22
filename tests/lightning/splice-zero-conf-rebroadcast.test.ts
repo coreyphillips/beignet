@@ -373,7 +373,10 @@ function authorizedSplices(node: LightningNode): Set<string> {
 describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 	this.timeout(10_000);
 
-	async function setup(seedBase: number): Promise<{
+	async function setup(
+		seedBase: number,
+		withBackend = true
+	): Promise<{
 		alice: LightningNode;
 		bob: LightningNode;
 		channelId: Buffer;
@@ -385,7 +388,7 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 	}> {
 		const backend = new ControlledBackend();
 		const configA = makeNodeConfig(seedBase);
-		configA.chainBackend = backend;
+		if (withBackend) configA.chainBackend = backend;
 		const alice = new LightningNode(configA);
 		const bob = new LightningNode(makeNodeConfig(seedBase + 1));
 		for (const n of [alice, bob]) {
@@ -533,6 +536,29 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 		await tick();
 		expect(count()).to.equal(2);
 		expect(authorizedSplices(fx.alice).size).to.equal(0);
+		fx.destroy();
+	});
+
+	it('without a chain backend, an authorized splice is still re-sent through broadcast:tx', async () => {
+		const fx = await setup(7581, false);
+		const hex = fx.spliceTx.toHex();
+		const sent: number[] = [];
+		let count = 0;
+		fx.alice.on('broadcast:tx', (tx: Buffer) => {
+			if (tx.toString('hex') === hex) count += 1;
+		});
+		let persists = 0;
+		fx.alice.getChannelManager().on('channel:persist', () => {
+			persists += 1;
+		});
+		for (const height of [150, 151, 152]) {
+			elapse(fx.alice);
+			fx.alice.handleNewBlock(height);
+			await tick();
+			sent.push(count);
+		}
+		expect(sent).to.deep.equal([1, 2, 3]);
+		expect(persists, 'authorized once, by the first block').to.equal(1);
 		fx.destroy();
 	});
 

@@ -8209,7 +8209,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * a fresh frame per retry window, buys nothing.
 	 */
 	private rebroadcastAuthorizedSplice(idHex: string, txHex: string): void {
-		if (!this._chainBackend) return;
+		// Without a backend, the consumer's broadcast:tx listener is the only
+		// broadcaster this node has.
+		if (!this._chainBackend) {
+			this.emit('broadcast:tx', Buffer.from(txHex, 'hex'));
+			return;
+		}
 		this._chainBackend.broadcastTransaction(txHex).catch((err) => {
 			const reason = (err as Error)?.message ?? String(err);
 			// Already in mempool or confirmed, or a backend hiccup. The watch
