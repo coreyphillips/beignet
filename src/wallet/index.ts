@@ -3959,11 +3959,11 @@ export class Wallet {
 	// never rejects.
 	private savingOperations: Record<string, Promise<Result<string>>> = {};
 
-	// What the newest write queued for each key will store, while that write
+	// What each write queued for a key will store, oldest first, while it
 	// still waits for the one ahead of it.
 	private waitingWrites: Record<
 		string,
-		{ walletDataKey: string; write: TWalletWrite }
+		{ walletDataKey: string; write: TWalletWrite }[]
 	> = {};
 
 	// Refused writes of the transaction map, by storage key, until the next
@@ -4075,7 +4075,8 @@ export class Wallet {
 			this.refusedTransactionWrites.delete(walletDataKey);
 			write = mergeWrites(refused, write);
 		}
-		const waiting = this.waitingWrites[key];
+		const queued = this.waitingWrites[key];
+		const waiting = queued?.[queued.length - 1];
 		let operation: Promise<Result<string>>;
 		if (waiting?.walletDataKey === walletDataKey) {
 			// The newest queued write has not started, so it can carry this
@@ -4084,9 +4085,11 @@ export class Wallet {
 			operation = this.savingOperations[key];
 		} else if (key in this.savingOperations) {
 			const next = { walletDataKey, write };
-			this.waitingWrites[key] = next;
+			(this.waitingWrites[key] ??= []).push(next);
 			operation = this.savingOperations[key].then(() => {
-				if (this.waitingWrites[key] === next) delete this.waitingWrites[key];
+				// Writes start in the order they queued, so this one is first.
+				this.waitingWrites[key].shift();
+				if (!this.waitingWrites[key].length) delete this.waitingWrites[key];
 				return this.writeWalletData(key, next.walletDataKey, next.write);
 			});
 			this.savingOperations[key] = operation;
@@ -4168,7 +4171,9 @@ export class Wallet {
 
 	/**
 	 * Hands a refused write of the transaction map to the next write of it:
-	 * the one waiting its turn behind this one, or else the next one issued.
+	 * the first one waiting its turn behind this one, or else the next one
+	 * issued. A write to another network's key may have queued after that
+	 * first one, so it need not be the newest.
 	 * @private
 	 * @param {string} walletDataKey
 	 * @param {TWalletWrite} write
@@ -4177,8 +4182,10 @@ export class Wallet {
 		walletDataKey: string,
 		write: TWalletWrite
 	): void {
-		const waiting = this.waitingWrites.transactions;
-		if (waiting?.walletDataKey === walletDataKey) {
+		const waiting = this.waitingWrites.transactions?.find(
+			(queued) => queued.walletDataKey === walletDataKey
+		);
+		if (waiting) {
 			waiting.write = mergeWrites(write, waiting.write);
 			return;
 		}

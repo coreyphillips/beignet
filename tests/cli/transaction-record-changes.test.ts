@@ -544,6 +544,43 @@ describe('transaction record changes (#1810)', function () {
 		expect(stored()).to.not.have.property(OTHERS[0]);
 	});
 
+	it('carries a refused change past a write to another network queued behind it', async function () {
+		const w = await seed(0);
+		const internals = w as unknown as {
+			saveWalletDataAt: (
+				key: string,
+				walletDataKey: string,
+				data: IFormattedTransactions
+			) => Promise<Result<string>>;
+		};
+		hold = true;
+		refuse = true;
+		const first = w.addGhostTransaction({ txid: T });
+		await flush();
+		const second = w.deleteOnChainTransactionById({ txid: OTHERS[0] });
+		// What a switchNetwork leaves queued: a write under the other key.
+		const other = internals.saveWalletDataAt(
+			'transactions',
+			`${key('transactions')}-signet`,
+			{}
+		);
+		await flush();
+
+		held[0].land();
+		expect((await first).isErr()).to.equal(true);
+		refuse = false;
+		await flush();
+		expect(held).to.have.length(2);
+		held[1].land();
+		expect((await second).isOk()).to.equal(true);
+		expect((await other).isOk()).to.equal(true);
+
+		expect(Object.keys(changeWrites[1].changes.set)).to.deep.equal([T]);
+		expect(changeWrites[1].changes.deleted).to.deep.equal([OTHERS[0]]);
+		expect(stored()[T].exists).to.equal(false);
+		expect(stored()).to.not.have.property(OTHERS[0]);
+	});
+
 	it('merges changes issued while a write is in flight into one write', async function () {
 		const w = await seed(0);
 		hold = true;
