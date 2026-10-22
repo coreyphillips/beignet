@@ -27,6 +27,7 @@ import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IForwardingEvent } from '../../src/lightning/storage/types';
 import { BeignetNode } from '../../src/cli/beignet-node';
+import { writableState } from './helpers/writable-state';
 
 // Electrum intentionally unreachable: nothing below needs a live chain, and a
 // refused loopback connect returns ECONNREFUSED instantly. Without this the
@@ -225,14 +226,12 @@ function setupForwarding(bobStorage?: SqliteStorage): IForwardSetup {
 	// remoteScidAlias: BOLT 7 has Bob address his direct channel_update with an
 	// alias RECEIVED from the peer, and BOLT 2 has Charlie's invoice hint name the
 	// alias Bob generated. Bob resolves scidBC via the registerChannelScid above.
-	bob
-		.getChannelManager()
-		.getChannel(bcChannelId)!
-		.getFullState().remoteScidAlias = scidBC;
-	charlie
-		.getChannelManager()
-		.getChannel(bcChannelId)!
-		.getFullState().remoteScidAlias = scidBC;
+	writableState(
+		bob.getChannelManager().getChannel(bcChannelId)!
+	).remoteScidAlias = scidBC;
+	writableState(
+		charlie.getChannelManager().getChannel(bcChannelId)!
+	).remoteScidAlias = scidBC;
 
 	addGraphChannel(alice, scidAB, nodePubkey(1), nodePubkey(2));
 

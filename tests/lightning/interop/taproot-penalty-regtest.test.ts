@@ -41,6 +41,7 @@ import {
 import { MAX_INDEX } from '../../../src/lightning/keys/shachain';
 import { getPublicKey } from '../../../src/lightning/crypto/ecdh';
 import { bitcoinRpc, mineBlocks, ensureBitcoindFunds } from './shared-helpers';
+import { writableState } from '../helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 const NETWORK = bitcoin.networks.regtest;
@@ -297,7 +298,7 @@ describe('Interop: option_taproot revoked-commitment penalty sweep (regtest, P6c
 		bob.handleFundingConfirmed(channelId);
 		expect(alice.updateChannelFee(channelId, 700).ok).to.equal(true);
 		expect(alice.updateChannelFee(channelId, 800).ok).to.equal(true);
-		const aliceState = aliceChannel.getFullState();
+		const aliceState = writableState(aliceChannel);
 
 		const bobSecret1 = aliceState.shaChainStore.getSecret(MAX_INDEX - 1n)!;
 		const bobPoint1 = perCommitmentPointFromSecret(bobSecret1);

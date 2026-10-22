@@ -87,6 +87,7 @@ import {
 } from '../../src/lightning/message/channel-commitment';
 import { buildVoucherOnion } from '../../src/lightning/ffor/voucher';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 const REGTEST = bitcoin.networks.regtest;
@@ -433,7 +434,7 @@ function openReadyChannel(
 	acceptor.handleFundingConfirmed(channelId);
 	for (const n of [opener, acceptor]) {
 		for (const ch of n.getChannelManager().listChannels()) {
-			const st = ch.getFullState();
+			const st = writableState(ch);
 			st.announceChannel = true;
 			st.announcementSigsSent = true;
 			st.announcementSigsReceived = true;

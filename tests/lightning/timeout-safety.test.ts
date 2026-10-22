@@ -27,6 +27,7 @@ import { decodeChannelReestablishMessage } from '../../src/lightning/message/cha
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Network } from '../../src/lightning/invoice/types';
+import { writableState } from './helpers/writable-state';
 
 // ─────────────── Helpers ───────────────
 
@@ -250,7 +251,7 @@ describe('Phase 6: Timeout Safety Nets', () => {
 				.listChannels()
 				.find((c) => c.getFullState().channelId?.equals(channelId));
 			expect(rawChannel).to.exist;
-			const fullState = rawChannel!.getFullState();
+			const fullState = writableState(rawChannel!);
 			// Set fundingBroadcastHeight to simulate that funding was broadcast at block 100
 			fullState.fundingBroadcastHeight = 100;
 

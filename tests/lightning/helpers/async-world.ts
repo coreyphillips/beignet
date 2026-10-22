@@ -45,6 +45,7 @@ import {
 	RELEASE_HELD_HTLC_TLV_TYPE
 } from '../../../src/lightning/async-payments/types';
 import { settle as waitUntil } from './settle';
+import { writableState } from './writable-state';
 
 export const ALICE_SEED = 91;
 export const LSP_SEED = 92;
@@ -529,14 +530,12 @@ export async function setupWorld(opts: {
 	lsp.registerChannelScid(abChannelId, scidAB);
 	lsp.registerChannelScid(bcChannelId, scidBC);
 	alice.registerChannelScid(abChannelId, scidAB);
-	lsp
-		.getChannelManager()
-		.getChannel(bcChannelId)!
-		.getFullState().remoteScidAlias = scidBC;
-	carol
-		.getChannelManager()
-		.getChannel(bcChannelId)!
-		.getFullState().remoteScidAlias = scidBC;
+	writableState(
+		lsp.getChannelManager().getChannel(bcChannelId)!
+	).remoteScidAlias = scidBC;
+	writableState(
+		carol.getChannelManager().getChannel(bcChannelId)!
+	).remoteScidAlias = scidBC;
 	addGraphChannel(alice, scidAB, nodePubkey(ALICE_SEED), nodePubkey(LSP_SEED));
 	announceFeatures(carol, lsp, scidBC);
 	if (opts.carolRegisters ?? true) {

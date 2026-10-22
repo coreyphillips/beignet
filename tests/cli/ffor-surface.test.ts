@@ -28,6 +28,7 @@ import {
 } from '../../src/lightning/ffor/types';
 import { decodeRequestEnvelope } from '../../src/lightning/direct-funding/envelope';
 import { BeignetCustomSubtype } from '../../src/lightning/message/custom';
+import { writableState } from '../lightning/helpers/writable-state';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -752,7 +753,7 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 		const { ChannelState } = require('../../src/lightning/channel/types');
 		const fx = installChannel(false);
 		// S unreachable, so the route goes past the cooperative close.
-		inner.getChannelManager().getChannel(fx.idBuf)!.getFullState().state =
+		writableState(inner.getChannelManager().getChannel(fx.idBuf)!).state =
 			ChannelState.AWAITING_REESTABLISH;
 		const forceClose = sinon.spy(inner.getChannelManager(), 'forceClose');
 		try {
@@ -959,7 +960,7 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 				const fx = installChannel(hold);
 				try {
 					const { ChannelState } = require('../../src/lightning/channel/types');
-					inner.getChannelManager().getChannel(fx.idBuf)!.getFullState().state =
+					writableState(inner.getChannelManager().getChannel(fx.idBuf)!).state =
 						ChannelState.ERRORED;
 					for (const flag of [undefined, false, 'true', 1]) {
 						forceClose.resetHistory();
@@ -1029,7 +1030,7 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 				// as every channel on a frozen device is, so /ffor/recover reaches
 				// its force close rather than the cooperative path.
 				const fx = installChannel(false);
-				inner.getChannelManager().getChannel(fx.idBuf)!.getFullState().state =
+				writableState(inner.getChannelManager().getChannel(fx.idBuf)!).state =
 					ChannelState.AWAITING_REESTABLISH;
 				const restore = withRecoveryState(kind);
 				try {
@@ -1104,7 +1105,7 @@ describe('FFOR surface: enforcement on recency-held channels (issues #908 and #9
 		const { ChannelState } = require('../../src/lightning/channel/types');
 		for (const flag of [undefined, 'true', true]) {
 			const fx = installChannel(false);
-			inner.getChannelManager().getChannel(fx.idBuf)!.getFullState().state =
+			writableState(inner.getChannelManager().getChannel(fx.idBuf)!).state =
 				ChannelState.AWAITING_REESTABLISH;
 			fx.record.witnesses = [
 				{

@@ -69,6 +69,7 @@ import {
 	realInitialCommitmentSig,
 	realCommitmentSigs
 } from './helpers/real-signing';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -435,7 +436,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		exchangeCommitments(opener, acceptor);
 
 		// The restore driver's marking: this state cannot be proven current.
-		opener.getFullState().stateUncertain = true;
+		writableState(opener).stateUncertain = true;
 		expect(opener.getRecoveryStatus()).to.equal(
 			ChannelRecoveryStatus.StateUncertain
 		);
@@ -590,7 +591,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 	it('an ERRORED capsule-restored channel reports the hold, not a force close (issue #469)', function () {
 		const { opener, acceptor } = setupNormalChannels();
 		exchangeCommitments(opener, acceptor);
-		const state = opener.getFullState();
+		const state = writableState(opener);
 		state.restoreRecencyUnproven = true;
 		const restored = new Channel(
 			deserializeChannelState(serializeChannelState(state))
@@ -610,7 +611,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 	it('an irrecoverable counter gap on a held channel ends in a peer-close request, not limbo (issue #469)', function () {
 		const { opener, acceptor, openerCommitmentSeed } = setupNormalChannels();
 		exchangeCommitments(opener, acceptor);
-		const state = opener.getFullState();
+		const state = writableState(opener);
 		state.restoreRecencyUnproven = true;
 		opener.markForReestablish();
 
@@ -725,7 +726,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 	it('an uncertain channel shown a future state upgrades to LocalDataLoss', function () {
 		const { opener, acceptor, openerCommitmentSeed } = setupNormalChannels();
 		exchangeCommitments(opener, acceptor);
-		opener.getFullState().stateUncertain = true;
+		writableState(opener).stateUncertain = true;
 
 		const pre = opener.getFullState();
 		const nextRevocationNumber = pre.localCommitmentNumber + 2n;
@@ -759,7 +760,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		// the deterministic error on the next reconnect.
 		const { opener, acceptor } = setupNormalChannels();
 		exchangeCommitments(opener, acceptor);
-		opener.getFullState().stateUncertain = true;
+		writableState(opener).stateUncertain = true;
 		opener.markForReestablish();
 		// The exchange routes to the DLP path... and the error send is LOST.
 		opener.handleReestablish(cleanReestablishFor(opener));
@@ -820,7 +821,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		// recovery-close channels alongside reestablish-needing ones.
 		const { opener, acceptor } = setupNormalChannels();
 		exchangeCommitments(opener, acceptor);
-		opener.getFullState().stateUncertain = true;
+		writableState(opener).stateUncertain = true;
 		opener.markForReestablish();
 		opener.handleReestablish(cleanReestablishFor(opener));
 		const state = deserializeChannelState(
@@ -876,7 +877,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		// reconnect chasing the peer. Case 1: next_commitment_number of 0.
 		const { opener, acceptor } = setupNormalChannels();
 		exchangeCommitments(opener, acceptor);
-		opener.getFullState().stateUncertain = true;
+		writableState(opener).stateUncertain = true;
 		opener.markForReestablish();
 		opener.handleReestablish({
 			channelId: opener.getChannelId()!,
@@ -913,7 +914,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		// ride that persist too.
 		const { opener, acceptor } = setupNormalChannels();
 		exchangeCommitments(opener, acceptor);
-		opener.getFullState().stateUncertain = true;
+		writableState(opener).stateUncertain = true;
 		const pre = opener.getFullState();
 		opener.markForReestablish();
 		opener.handleReestablish({
@@ -942,7 +943,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		// disposition from the durable safety flags.
 		const { opener, acceptor } = setupNormalChannels();
 		exchangeCommitments(opener, acceptor);
-		const state = opener.getFullState();
+		const state = writableState(opener);
 		state.dataLossDetected = true;
 		state.state = ChannelState.ERRORED;
 		const serialized = serializeChannelState(state);
@@ -973,7 +974,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 	it('stateUncertain survives the serialization round trip', function () {
 		const { opener, acceptor } = setupNormalChannels();
 		exchangeCommitments(opener, acceptor);
-		const state = opener.getFullState();
+		const state = writableState(opener);
 		state.stateUncertain = true;
 		const restored = deserializeChannelState(serializeChannelState(state));
 		expect(restored.stateUncertain).to.equal(true);
@@ -983,7 +984,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 	it('the capsule restore hold survives the serialization round trip, and does not become the never-broadcast flag (issue #469)', function () {
 		const { opener, acceptor } = setupNormalChannels();
 		exchangeCommitments(opener, acceptor);
-		const state = opener.getFullState();
+		const state = writableState(opener);
 		state.restoreRecencyUnproven = true;
 		const restored = deserializeChannelState(serializeChannelState(state));
 		// A restart between the restore and the first reconnect must not

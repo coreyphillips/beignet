@@ -48,6 +48,7 @@ import { REGTEST_CHAIN_HASH } from '../../src/lightning/channel/types';
 import { decodeErrorMessage } from '../../src/lightning/message/error';
 import { MessageType } from '../../src/lightning/message/types';
 import * as bip39 from 'bip39';
+import { writableState } from '../lightning/helpers/writable-state';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -899,7 +900,7 @@ describe('Recovery surface: status and refusals on a running daemon', () => {
 		const channelId = state.channelId.toString('hex');
 		// A RESUMED held channel: restoreChannel wraps the row for
 		// reestablish, and a shutdown is only legal from NORMAL.
-		node.getChannelManager().getChannel(state.channelId)!.getFullState().state =
+		writableState(node.getChannelManager().getChannel(state.channelId)!).state =
 			ChannelState.NORMAL;
 
 		try {

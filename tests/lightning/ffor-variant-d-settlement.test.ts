@@ -59,6 +59,7 @@ import {
 	inverseAmtToForward,
 	roundingSlackMsat
 } from '../../src/lightning/ffor/amounts';
+import { writableState } from './helpers/writable-state';
 
 // ─────────────── Harness ───────────────
 
@@ -181,7 +182,7 @@ function openReadyChannel(
 	acceptor.handleFundingConfirmed(channelId);
 	for (const n of [opener, acceptor]) {
 		for (const ch of n.getChannelManager().listChannels()) {
-			const st = ch.getFullState();
+			const st = writableState(ch);
 			st.announceChannel = true;
 			st.announcementSigsSent = true;
 			st.announcementSigsReceived = true;
@@ -249,7 +250,7 @@ function announceSR(
 	channelId = w.srChannelId,
 	peer = w.r
 ): void {
-	const st = w.s.getChannelManager().getChannel(channelId)!.getFullState();
+	const st = writableState(w.s.getChannelManager().getChannel(channelId)!);
 	st.shortChannelId = scid;
 	const sk = Buffer.from(w.s.getNodeId(), 'hex');
 	const rk = Buffer.from(peer.getNodeId(), 'hex');
@@ -737,10 +738,9 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 			const w = createWorld();
 			const toR = kind !== 'toP';
 			const named = toR ? openReadyChannel(w.s, w.r) : w.psChannelId;
-			w.s
-				.getChannelManager()
-				.getChannel(named)!
-				.getFullState().announceChannel = kind !== 'private';
+			writableState(
+				w.s.getChannelManager().getChannel(named)!
+			).announceChannel = kind !== 'private';
 			activate(w);
 			const { inv } = exposeOverSecondEdge(
 				w,
@@ -771,7 +771,7 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 		});
 		activate(w);
 		const { inv, scid } = exposeOverSecondEdge(w, w.psChannelId, w.p, true);
-		w.s.getChannelManager().getChannel(moved)!.getFullState().shortChannelId =
+		writableState(w.s.getChannelManager().getChannel(moved)!).shortChannelId =
 			scid;
 		const failures: { reason: string }[] = [];
 		w.s.on('ffor:delegated-failed', (e: { reason: string }) =>
@@ -789,10 +789,9 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 		// one under a key the sibling's announcement does not carry.
 		const w = createWorld();
 		const moved = openReadyChannel(w.s, w.r);
-		const movedState = w.s
-			.getChannelManager()
-			.getChannel(moved)!
-			.getFullState();
+		const movedState = writableState(
+			w.s.getChannelManager().getChannel(moved)!
+		);
 		movedState.remoteBasepoints!.fundingPubkey = getPublicKey(sha('other-key'));
 		w.s.setChannelPolicy(moved, {
 			feeBaseMsat: 0,
@@ -803,10 +802,9 @@ describe('FFOR Variant D: silent settlement (M8.2)', function () {
 		const scid = decodeInvoice(inv).routingHints![0][0].shortChannelId;
 		publishChannel(w.p, w.s, w.r, w.srChannelId, scid, 0, 0);
 		announceSR(w, scid, true);
-		w.s
-			.getChannelManager()
-			.getChannel(w.srChannelId)!
-			.getFullState().shortChannelId = encodeShortChannelId({
+		writableState(
+			w.s.getChannelManager().getChannel(w.srChannelId)!
+		).shortChannelId = encodeShortChannelId({
 			block: 500,
 			txIndex: 4,
 			outputIndex: 0
@@ -1412,7 +1410,7 @@ function exchangeAnnouncement(
 	txIndex: number
 ): Buffer {
 	for (const n of [w.s, w.r]) {
-		const st = n.getChannelManager().getChannel(channelId)!.getFullState();
+		const st = writableState(n.getChannelManager().getChannel(channelId)!);
 		st.announcementSigsSent = false;
 		st.announcementSigsReceived = false;
 	}

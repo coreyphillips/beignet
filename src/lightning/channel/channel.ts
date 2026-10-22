@@ -1489,6 +1489,15 @@ export class Channel {
 	}
 
 	/**
+	 * Record that the peer is in the node's trusted set. Membership alone
+	 * changes nothing: zero-conf semantics still need the opener to propose
+	 * the zero_conf channel type. Set before the open message is handled.
+	 */
+	setTrustedPeer(): void {
+		this._state.trustedPeer = true;
+	}
+
+	/**
 	 * Get the per-channel key derivation index (null if using shared keys).
 	 */
 	get channelKeyIndex(): number | null {
@@ -1622,7 +1631,12 @@ export class Channel {
 		};
 	}
 
-	getFullState(): IChannelState {
+	/**
+	 * The live channel state, typed read-only: change it through a named
+	 * transition. Still the same object, so a reference taken earlier sees
+	 * later transitions.
+	 */
+	getFullState(): Readonly<IChannelState> {
 		return this._state;
 	}
 
@@ -1643,6 +1657,16 @@ export class Channel {
 		this._state.lastCooperativeCloseTxHex = txHex;
 		if (localFeeSats !== undefined)
 			this.recordExternalCloseCandidate(txHex, localFeeSats);
+	}
+
+	/**
+	 * Return to NEGOTIATING_CLOSING after closing_signed agreement committed
+	 * CLOSED but the mutual-close tx could not be built, so nothing was
+	 * broadcast. Leaves every close recovery path (retry, reconnect, force
+	 * close) open instead of a CLOSED channel with no close tx.
+	 */
+	markNegotiatingClosing(): void {
+		this._state.state = ChannelState.NEGOTIATING_CLOSING;
 	}
 
 	/** Candidate identity is history data, never a rebroadcast payload. */
@@ -2227,6 +2251,16 @@ export class Channel {
 
 		this._state.state = ChannelState.SENT_ACCEPT;
 		return [];
+	}
+
+	/**
+	 * Point the channel at its funding outpoint ahead of the handshake step
+	 * that records it (createFundingCreated, handleFundingCreated), so the
+	 * initial commitment can be signed first.
+	 */
+	setFundingOutpoint(fundingTxid: Buffer, fundingOutputIndex: number): void {
+		this._state.fundingTxid = fundingTxid;
+		this._state.fundingOutputIndex = fundingOutputIndex;
 	}
 
 	/**
@@ -6636,6 +6670,18 @@ export class Channel {
 	}
 
 	/**
+	 * Reverse markResolved for a close whose monitor turns out to have more
+	 * to resolve: CLOSED goes back to FORCE_CLOSED, so the channel is again
+	 * counted as a pending close. Returns false, changing nothing, unless the
+	 * channel is CLOSED.
+	 */
+	reopenForceCloseResolution(): boolean {
+		if (this._state.state !== ChannelState.CLOSED) return false;
+		this._state.state = ChannelState.FORCE_CLOSED;
+		return true;
+	}
+
+	/**
 	 * Force close the channel by broadcasting the latest local commitment.
 	 * Returns the commitment transaction to broadcast and a CHANNEL_CLOSED action.
 	 */
@@ -7065,6 +7111,29 @@ export class Channel {
 		if (this._state.pendingFundingTxHex === undefined) return false;
 		delete this._state.pendingFundingTxHex;
 		return true;
+	}
+
+	/**
+	 * Retain the opener's funding tx with the channel state before
+	 * funding_created goes out, so the frame that records funding_signed
+	 * carries the bytes. A candidate only: nothing may broadcast it until the
+	 * authorization action.
+	 */
+	retainFundingPayload(txHex: string): void {
+		this._state.pendingFundingTxHex = txHex;
+	}
+
+	/**
+	 * Stamp the height a funding was first seen waiting for confirmation, for
+	 * channels created before the field existed. Returns true when this call
+	 * stamped it; a stamp already set, or no chain tip yet, changes nothing.
+	 */
+	stampFundingBroadcastHeight(height: number): boolean {
+		if (this._state.fundingBroadcastHeight === 0 && height > 0) {
+			this._state.fundingBroadcastHeight = height;
+			return true;
+		}
+		return false;
 	}
 
 	/**
@@ -8026,6 +8095,35 @@ export class Channel {
 			feePayer: localPays ? 'local' : 'remote',
 			feeEstimated: true
 		};
+	}
+
+	/**
+	 * Undo an initiateShutdown whose shutdown never reached the wire, because
+	 * the external close intent it depends on was not persisted. `previous`
+	 * holds what these fields were before that call.
+	 */
+	rollbackShutdown(
+		previous: Pick<
+			IChannelState,
+			| 'state'
+			| 'localShutdownScript'
+			| 'externalClose'
+			| 'staleCloseRiskAccepted'
+			| 'simpleClose'
+		>
+	): void {
+		const state = this._state;
+		if (state.state === ChannelState.SHUTTING_DOWN)
+			state.state = previous.state;
+		else if (
+			state.state === ChannelState.AWAITING_REESTABLISH &&
+			state.preReestablishState === ChannelState.SHUTTING_DOWN
+		)
+			state.preReestablishState = previous.state;
+		state.localShutdownScript = previous.localShutdownScript;
+		state.externalClose = previous.externalClose;
+		state.staleCloseRiskAccepted = previous.staleCloseRiskAccepted;
+		state.simpleClose = previous.simpleClose;
 	}
 
 	/** Initiate cooperative close by sending shutdown. */
@@ -9640,6 +9738,17 @@ export class Channel {
 		this._normalizeV2AttemptForFailure();
 		this._state.state = ChannelState.ERRORED;
 		return true;
+	}
+
+	/**
+	 * Fail an open whose peer disconnected before it reached a state that
+	 * reestablish resumes. Only sets ERRORED, which is what lets
+	 * isAbandonedV2Open release the open's funding pledges. Unlike
+	 * markErrored it runs no splice or v2 attempt repairs: the manager drops
+	 * the channel instead of keeping it to close.
+	 */
+	failOpenOnDisconnect(): void {
+		this._state.state = ChannelState.ERRORED;
 	}
 
 	/**
@@ -20070,6 +20179,23 @@ export class Channel {
 		const before = this._state.preSpliceSpendWatches?.length ?? 0;
 		this._recordPreSpliceSpendWatch(record.spliceTxid);
 		return (this._state.preSpliceSpendWatches?.length ?? 0) !== before;
+	}
+
+	/**
+	 * Drop the pre-splice spend watch for this outpoint once the watcher has
+	 * retired it. Returns whether the list changed, so the caller knows to
+	 * persist. An emptied list is removed rather than stored empty.
+	 */
+	retirePreSpliceSpendWatch(txid: string, outputIndex: number): boolean {
+		const watches = this._state.preSpliceSpendWatches ?? [];
+		const remaining = watches.filter(
+			(w) => !(w.txid === txid && w.outputIndex === outputIndex)
+		);
+		if (remaining.length === watches.length) return false;
+		this._state.preSpliceSpendWatches = remaining.length
+			? remaining
+			: undefined;
+		return true;
 	}
 
 	/**

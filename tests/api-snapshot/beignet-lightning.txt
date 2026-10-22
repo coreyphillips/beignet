@@ -960,6 +960,7 @@ method channel.Channel.exitQuiescence(): channel.ChannelAction[]
 method channel.Channel.failFromMalformedPeerMessage(reason: string): channel.ChannelAction[]
 method channel.Channel.failHtlc(htlcId: bigint, reason: Buffer, direction?: channel.HtlcDirection): channel.ChannelAction[]
 method channel.Channel.failMalformedHtlc(htlcId: bigint, sha256OfOnion: Buffer, failureCode: number): channel.ChannelAction[]
+method channel.Channel.failOpenOnDisconnect(): void
 method channel.Channel.fforAddPreimage(preimage: Buffer): channel.ChannelAction[]
 method channel.Channel.fforAdmissionHold(): string | null
 method channel.Channel.fforBookEntries(): ffor.IFforBookEntry[] | null
@@ -992,7 +993,7 @@ method channel.Channel.getCurrentChannelId(): Buffer
 method channel.Channel.getDualFundingSession(): channel.DualFundingSession | null
 method channel.Channel.getFforEpoch(): ffor.IFforEpochRecord | null
 method channel.Channel.getForceCloseBroadcastView(): channel.IChannelState | null
-method channel.Channel.getFullState(): channel.IChannelState
+method channel.Channel.getFullState(): Readonly<channel.IChannelState>
 method channel.Channel.getFundingPubkeys(): { local: Buffer; remote: Buffer; } | null
 method channel.Channel.getFundingSatoshis(): bigint
 method channel.Channel.getPendingSpliceLocalBalanceMsat(): bigint | null
@@ -1095,6 +1096,7 @@ method channel.Channel.markClosedOnChain(force: boolean): boolean
 method channel.Channel.markErrored(): boolean
 method channel.Channel.markForReestablish(): channel.IAbandonedLocalAdd[]
 method channel.Channel.markFundingUnaccounted(): boolean
+method channel.Channel.markNegotiatingClosing(): void
 method channel.Channel.markRecordRestoredFromDisk(): void
 method channel.Channel.markResolved(): boolean
 method channel.Channel.markSpliceConfirmed(): void
@@ -1123,6 +1125,7 @@ method channel.Channel.refuseSpliceInit(wireReason: string, errorMessage: string
 method channel.Channel.refuseUnviableV2InFlight(): 'none' | 'rolled-back' | 'refused'
 method channel.Channel.removeTxInput(serialId: bigint): channel.ChannelAction[]
 method channel.Channel.removeTxOutput(serialId: bigint): channel.ChannelAction[]
+method channel.Channel.reopenForceCloseResolution(): boolean
 method channel.Channel.repairEnforcedChannelReserve(): void
 method channel.Channel.repairKeptChannelReserve(): void
 method channel.Channel.repairLegacyV2OpenerDepth(): boolean
@@ -1132,7 +1135,10 @@ method channel.Channel.resetSimpleCloseNegotiation(): void
 method channel.Channel.restoreLastSentBatch(startBatch: Buffer, commitments: Buffer[]): void
 method channel.Channel.restoreSpliceInFlight(): void
 method channel.Channel.restoreV2InFlight(): void
+method channel.Channel.retainFundingPayload(txHex: string): void
+method channel.Channel.retirePreSpliceSpendWatch(txid: string, outputIndex: number): boolean
 method channel.Channel.revertConflictedSplice(): channel.ChannelAction[]
+method channel.Channel.rollbackShutdown(previous: Pick<channel.IChannelState, 'state' | 'localShutdownScript' | 'externalClose' | 'staleCloseRiskAccepted' | 'simpleClose'>): void
 method channel.Channel.sendClosingComplete(feeSatoshis: bigint, locktime: number, signFn: (variant: message.ClosingSigVariant, feeSatoshis: bigint, locktime: number, closerScriptPubkey: Buffer, closeeScriptPubkey: Buffer) => Buffer): channel.ChannelAction[]
 method channel.Channel.sendSpliceLocked(): channel.ChannelAction[]
 method channel.Channel.sendTxComplete(): channel.ChannelAction[]
@@ -1142,6 +1148,7 @@ method channel.Channel.setClosingFeeratePerKw(feeratePerKw: number): void
 method channel.Channel.setDualFundingContribution(inputs: channel.ISpliceWalletInput[], changeScript: Buffer, contributionSats: bigint, feeratePerKw: number): void
 method channel.Channel.setFforCapabilities(concurrentNegotiated: boolean): void
 method channel.Channel.setFforContext(ctx: ffor.IFforChannelContext): void
+method channel.Channel.setFundingOutpoint(fundingTxid: Buffer, fundingOutputIndex: number): void
 method channel.Channel.setLocalNodeIdLower(lower: boolean): void
 method channel.Channel.setMaxFundingSatoshis(max: bigint): void
 method channel.Channel.setSigner(signer: keys.ISigner): void
@@ -1149,6 +1156,7 @@ method channel.Channel.setSimpleClose(simple: boolean): void
 method channel.Channel.setSpliceInInputs(inputs: channel.ISpliceWalletInput[], changeScript: Buffer, options?: { lockAtDepth?: number; }): void
 method channel.Channel.setSpliceOutDestination(script: Buffer, sats: bigint): void
 method channel.Channel.setTaprootClosingCache(cache: channel.ITaprootClosingCache | null): void
+method channel.Channel.setTrustedPeer(): void
 method channel.Channel.setZeroReservePolicy(policy: IZeroReservePolicy): void
 method channel.Channel.shouldRetransmitReestablish(): boolean
 method channel.Channel.signCommitment(signature: Buffer, htlcSignatures: Buffer[], partialSignatureWithNonce?: Buffer, spliceBatch?: { spliceSignature: Buffer; spliceHtlcSignatures: Buffer[]; }): channel.ChannelAction[]
@@ -1158,6 +1166,7 @@ method channel.Channel.spliceOutCommitmentCostSats(): bigint
 method channel.Channel.spliceOutCommitmentRefusal(withdrawSats: bigint): string | null
 method channel.Channel.spliceReserveWeKeepSats(capacitySats: bigint): bigint
 method channel.Channel.spliceSeenOnChain(): boolean
+method channel.Channel.stampFundingBroadcastHeight(height: number): boolean
 method channel.Channel.takeDanglingV2TopUpPledgeOutpoints(clear?: boolean): Array<{ txid: string; vout: number; }>
 method channel.Channel.takeOwedWatchtowerBackups(): Array<{ perCommitmentSecret: Buffer; tx: Buffer; }>
 method channel.Channel.takeReestablishSecretMissingNotice(): { revocationIndex: bigint; secretIndex: bigint; } | null

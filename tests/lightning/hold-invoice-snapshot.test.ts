@@ -33,6 +33,7 @@ import {
 	parkedCltvExpiry,
 	scidForIndex
 } from './helpers/loopback-nodes';
+import { writableState } from './helpers/writable-state';
 
 const TAG = 'hold-snapshot';
 
@@ -504,8 +505,8 @@ describe('Hold invoice snapshot (issue #737 phase 2)', function () {
 		// Data loss forbids broadcasting our commitment, so the channel stays
 		// ERRORED until the peer closes it.
 		const channel = bob.getChannelManager().getChannel(carolChannel)!;
-		channel.getFullState().dataLossDetected = true;
-		channel.getFullState().state = ChannelState.ERRORED;
+		writableState(channel).dataLossDetected = true;
+		writableState(channel).state = ChannelState.ERRORED;
 		(bob as any).handleChannelErrored(carolChannel, 'test'); // eslint-disable-line @typescript-eslint/no-explicit-any
 		let refusedFails = 0;
 		bob.getChannelManager().on('error', () => refusedFails++);

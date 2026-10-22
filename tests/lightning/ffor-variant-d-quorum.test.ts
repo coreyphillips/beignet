@@ -36,6 +36,7 @@ import {
 	registerQuorumNamespace,
 	waitFor
 } from './helpers/chaos-quorum';
+import { writableState } from './helpers/writable-state';
 
 const TIP = 795_000;
 const T_EXP = 800_000;
@@ -91,10 +92,9 @@ describe('FFOR Variant D on a quorum-mode settlement peer', function () {
 			s.registerChannelScid(psId, scidPS);
 			s.registerChannelScid(srId, scidSR);
 			recipient.registerChannelScid(srId, scidSR);
-			recipient
-				.getChannelManager()
-				.getChannel(srId)!
-				.getFullState().remoteScidAlias = scidSR;
+			writableState(
+				recipient.getChannelManager().getChannel(srId)!
+			).remoteScidAlias = scidSR;
 			addGraphChannel(
 				payer,
 				scidPS,

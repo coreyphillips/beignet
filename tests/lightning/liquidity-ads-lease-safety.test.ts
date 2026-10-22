@@ -39,6 +39,7 @@ import {
 	decodeChannelUpdateMessage
 } from '../../src/lightning/gossip/messages';
 import { BITCOIN_CHAIN_HASH } from '../../src/lightning/channel/types';
+import { writableState } from './helpers/writable-state';
 
 function validPriv(): Buffer {
 	let k: Buffer;
@@ -321,7 +322,7 @@ describe('Liquidity ads lessor channel_update fee cap', function () {
 
 		// Mark this channel as our lease (we are the lessor) with tight fee caps,
 		// then set a channel policy that WOULD exceed them.
-		const st = alice.getChannelManager().getChannel(channelId)!.getFullState();
+		const st = writableState(alice.getChannelManager().getChannel(channelId)!);
 		st.isLessor = true;
 		st.leaseExpiry = 900_000;
 		st.leaseChannelFeeMaxBaseMsat = 5000;
@@ -351,7 +352,7 @@ describe('Liquidity ads lessor channel_update fee cap', function () {
 		const bob = new LightningNode(nodeConfig(4));
 		const channelId = openNormalChannel(alice, bob);
 
-		const st = alice.getChannelManager().getChannel(channelId)!.getFullState();
+		const st = writableState(alice.getChannelManager().getChannel(channelId)!);
 		st.isLessor = true;
 		st.leaseExpiry = 900_000;
 		st.leaseChannelFeeMaxBaseMsat = 5000;

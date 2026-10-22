@@ -36,6 +36,7 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
 import { MessageType } from '../../src/lightning/message/types';
 import { settle as waitUntil } from './helpers/settle';
+import { writableState } from './helpers/writable-state';
 
 // ─── Shared node plumbing ───
 
@@ -490,14 +491,12 @@ async function setupWorld(): Promise<IWorld> {
 	bob.registerChannelScid(abChannelId, scidAB);
 	bob.registerChannelScid(bcChannelId, scidBC);
 	alice.registerChannelScid(abChannelId, scidAB);
-	bob
-		.getChannelManager()
-		.getChannel(bcChannelId)!
-		.getFullState().remoteScidAlias = scidBC;
-	charlie
-		.getChannelManager()
-		.getChannel(bcChannelId)!
-		.getFullState().remoteScidAlias = scidBC;
+	writableState(
+		bob.getChannelManager().getChannel(bcChannelId)!
+	).remoteScidAlias = scidBC;
+	writableState(
+		charlie.getChannelManager().getChannel(bcChannelId)!
+	).remoteScidAlias = scidBC;
 	addGraphChannel(alice, scidAB, nodePubkey(ALICE_SEED), nodePubkey(BOB_SEED));
 	bob.setChannelPolicy(bcChannelId, {
 		feeBaseMsat: 5000,

@@ -31,6 +31,7 @@ import {
 	signerFromSeed,
 	realInitialCommitmentSig
 } from './helpers/real-signing';
+import { writableState } from './helpers/writable-state';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	return {
@@ -160,7 +161,7 @@ function setupNormalChannels(): {
 	opener.handleAcceptChannel(acceptMsg);
 
 	// Set announceChannel on opener too
-	opener.getFullState().announceChannel = true;
+	writableState(opener).announceChannel = true;
 
 	const fundingTxid = crypto.randomBytes(32);
 	const sig = realInitialCommitmentSig(opener, fundingTxid, 0);
@@ -307,7 +308,7 @@ describe('Channel Announcements (Phase 6)', function () {
 
 		it('should do nothing for private channel', function () {
 			const { opener } = setupNormalChannels();
-			opener.getFullState().announceChannel = false;
+			writableState(opener).announceChannel = false;
 			const { nodeId1, nodeId2 } = makeOrderedNodeIds();
 
 			const actions = opener.handleAnnouncementDepthReached(

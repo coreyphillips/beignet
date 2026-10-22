@@ -71,6 +71,7 @@ import {
 } from '../../src/lightning/ffor/messages';
 import { FF_ABORT_TYPE, FF_ACCEPT_TYPE } from '../../src/lightning/ffor/types';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
+import { writableState } from './helpers/writable-state';
 
 // ─────────────── Harness ───────────────
 
@@ -755,7 +756,7 @@ describe('FFOR Variant D: voucher book setup and activation (M8.1)', function ()
 
 		// Force a book past R's precheck that S refuses: R's check uses its
 		// view of S's balance, so lower S's real balance behind R's back.
-		const sState = pair.sChannel.getFullState();
+		const sState = writableState(pair.sChannel);
 		const saved = sState.localBalanceMsat;
 		sState.localBalanceMsat = 20_000_000n;
 		const res3 = pair.rManager.initiateFforEpoch(pair.channelId, terms());
@@ -1151,7 +1152,7 @@ describe('FFOR Variant D: review round 1 (setup)', function () {
 		expect(record(pair.rChannel).state).to.equal(FforState.NEGOTIATING);
 		pair.link.drop = null;
 		// R has seen 2100 of S's per-commitment secrets.
-		const rState = pair.rChannel.getFullState();
+		const rState = writableState(pair.rChannel);
 		const sSeed = pair.sConfig.localPerCommitmentSeed;
 		const secretOf = (n: bigint): Buffer =>
 			generateFromSeed(sSeed, MAX_INDEX - n);

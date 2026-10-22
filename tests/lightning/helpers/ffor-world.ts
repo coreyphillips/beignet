@@ -31,6 +31,7 @@ import { ChannelActionType } from '../../../src/lightning/channel/channel-action
 import { ChannelManager } from '../../../src/lightning/channel/channel-manager';
 import { CommitmentType } from '../../../src/lightning/chain/types';
 import { FforState, IFforEpochRecord } from '../../../src/lightning/ffor/types';
+import { writableState } from './writable-state';
 
 export const REGTEST = bitcoin.networks.regtest;
 
@@ -185,7 +186,7 @@ export function openReadyChannel(
 	acceptor.handleFundingConfirmed(channelId);
 	for (const n of [opener, acceptor]) {
 		for (const ch of n.getChannelManager().listChannels()) {
-			const st = ch.getFullState();
+			const st = writableState(ch);
 			st.announceChannel = true;
 			st.announcementSigsSent = true;
 			st.announcementSigsReceived = true;

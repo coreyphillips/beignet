@@ -71,6 +71,7 @@ import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivatio
 import * as bip32 from 'bip32';
 import * as bip39 from 'bip39';
 import * as ecc from '@bitcoinerlab/secp256k1';
+import { writableState } from './helpers/writable-state';
 
 const BIP32Factory = bip32.BIP32Factory(ecc);
 
@@ -400,7 +401,7 @@ describe('Production Hardening 3: Fund Safety', function () {
 
 			// Verify signer is set by checking it can be used (channel has _signer)
 			// setSigner is also called on restore
-			const state = channel.getFullState();
+			const state = writableState(channel);
 			state.state = ChannelState.NORMAL;
 			state.channelId = crypto.randomBytes(32);
 

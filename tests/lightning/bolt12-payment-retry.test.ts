@@ -41,6 +41,7 @@ import {
 import { constructBlindedPath } from '../../src/lightning/onion/blinded-path';
 import { MessageType } from '../../src/lightning/message/types';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
+import { writableState } from './helpers/writable-state';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -136,7 +137,7 @@ function setupPair(
 	// to path topology, so pin the published branch on both nodes.
 	for (const n of [alice, bob]) {
 		for (const ch of n.getChannelManager().listChannels()) {
-			const st = ch.getFullState();
+			const st = writableState(ch);
 			st.announceChannel = true;
 			st.announcementSigsSent = true;
 			st.announcementSigsReceived = true;

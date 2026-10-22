@@ -49,6 +49,7 @@ import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -534,8 +535,8 @@ describe('Production Hardening 11', function () {
 				const cm = (alice as any).channelManager as ChannelManager;
 				const channel = cm.getChannel(channelId);
 				if (channel) {
-					channel.getFullState().state = ChannelState.AWAITING_REESTABLISH;
-					channel.getFullState().preReestablishState = ChannelState.NORMAL;
+					writableState(channel).state = ChannelState.AWAITING_REESTABLISH;
+					writableState(channel).preReestablishState = ChannelState.NORMAL;
 				}
 
 				let forceCloseEmitted = false;
@@ -564,8 +565,8 @@ describe('Production Hardening 11', function () {
 				const cm = (alice as any).channelManager as ChannelManager;
 				const channel = cm.getChannel(channelId);
 				if (channel) {
-					channel.getFullState().state = ChannelState.AWAITING_REESTABLISH;
-					channel.getFullState().preReestablishState = ChannelState.NORMAL;
+					writableState(channel).state = ChannelState.AWAITING_REESTABLISH;
+					writableState(channel).preReestablishState = ChannelState.NORMAL;
 				}
 
 				let forceCloseEmitted = false;
@@ -592,8 +593,8 @@ describe('Production Hardening 11', function () {
 				const cm = (alice as any).channelManager as ChannelManager;
 				const channel = cm.getChannel(channelId);
 				if (channel) {
-					channel.getFullState().state = ChannelState.AWAITING_REESTABLISH;
-					channel.getFullState().preReestablishState = ChannelState.NORMAL;
+					writableState(channel).state = ChannelState.AWAITING_REESTABLISH;
+					writableState(channel).preReestablishState = ChannelState.NORMAL;
 				}
 
 				let forceCloseEmitted = false;
@@ -620,14 +621,14 @@ describe('Production Hardening 11', function () {
 				const cm = (alice as any).channelManager as ChannelManager;
 				const channel = cm.getChannel(channelId);
 				if (channel) {
-					channel.getFullState().state = ChannelState.AWAITING_REESTABLISH;
-					channel.getFullState().preReestablishState = ChannelState.NORMAL;
+					writableState(channel).state = ChannelState.AWAITING_REESTABLISH;
+					writableState(channel).preReestablishState = ChannelState.NORMAL;
 				}
 
 				(alice as any).scanStuckChannels(100);
 
 				// Simulate channel back to NORMAL → emit channel:ready
-				if (channel) channel.getFullState().state = ChannelState.NORMAL;
+				if (channel) writableState(channel).state = ChannelState.NORMAL;
 				// The channel:ready handler clears the tracker
 				(alice as any)._stuckChannelTracker.delete(
 					`reestablish:${channelId.toString('hex')}`
@@ -663,8 +664,8 @@ describe('Production Hardening 11', function () {
 				const cm = (alice as any).channelManager as ChannelManager;
 				const channel = cm.getChannel(channelId);
 				if (channel) {
-					channel.getFullState().state = ChannelState.AWAITING_REESTABLISH;
-					channel.getFullState().preReestablishState = ChannelState.NORMAL;
+					writableState(channel).state = ChannelState.AWAITING_REESTABLISH;
+					writableState(channel).preReestablishState = ChannelState.NORMAL;
 				}
 
 				const errors: Array<{ code: string; message: string }> = [];
@@ -1491,7 +1492,7 @@ describe('Production Hardening 11', function () {
 
 				const cm = (node as any).channelManager as ChannelManager;
 				const ch = cm.getChannel(channelId);
-				if (ch) ch.getFullState().state = ChannelState.AWAITING_REESTABLISH;
+				if (ch) writableState(ch).state = ChannelState.AWAITING_REESTABLISH;
 				(node as any)._readyEmitted = false;
 
 				try {
@@ -1537,7 +1538,7 @@ describe('Production Hardening 11', function () {
 
 				const cm = (node as any).channelManager as ChannelManager;
 				const ch = cm.getChannel(channelId);
-				if (ch) ch.getFullState().state = ChannelState.AWAITING_REESTABLISH;
+				if (ch) writableState(ch).state = ChannelState.AWAITING_REESTABLISH;
 				(node as any)._readyEmitted = false;
 
 				const waitPromise = node.waitForReady(30_000);

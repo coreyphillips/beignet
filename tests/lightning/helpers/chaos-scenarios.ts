@@ -36,6 +36,7 @@ import {
 	makeChaosNodeConfig,
 	openReadyChannelChaos
 } from './chaos-harness';
+import { writableState } from './writable-state';
 
 export const CHAOS_VICTIM_SEED = 71;
 export const CHAOS_PEER_SEED = 72;
@@ -207,14 +208,12 @@ export function s2ForwarderDies(): IChaosScenario {
 			env.victim.registerChannelScid(inboundId, scidIn);
 			env.victim.registerChannelScid(outboundId, scidOut);
 			payer.registerChannelScid(inboundId, scidIn);
-			env.victim
-				.getChannelManager()
-				.getChannel(outboundId)!
-				.getFullState().remoteScidAlias = scidOut;
-			payee
-				.getChannelManager()
-				.getChannel(outboundId)!
-				.getFullState().remoteScidAlias = scidOut;
+			writableState(
+				env.victim.getChannelManager().getChannel(outboundId)!
+			).remoteScidAlias = scidOut;
+			writableState(
+				payee.getChannelManager().getChannel(outboundId)!
+			).remoteScidAlias = scidOut;
 			addGraphChannel(
 				payer,
 				scidIn,

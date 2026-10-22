@@ -23,6 +23,7 @@ import {
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -433,7 +434,7 @@ describe('Pre-splice spend watch record (issue #479)', () => {
 		// spender, and the watcher would report that splice's own valid
 		// transaction as a close.
 		const { channel } = makeSplicingChannel();
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		state.preSpliceSpendWatches = undefined;
 		state.spliceInFlight!.sentTxSignatures = false;
 

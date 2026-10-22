@@ -115,6 +115,7 @@ import {
 	computeScriptHash
 } from '../../src/lightning/chain/chain-watcher';
 import { settle, neverSettles } from './helpers/settle';
+import { writableState } from './helpers/writable-state';
 
 // ─────────────── Channel-level helpers ───────────────
 
@@ -801,7 +802,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
 		h.opener.markForReestablish();
-		h.opener.getFullState().restoreRecencyUnproven = true;
+		writableState(h.opener).restoreRecencyUnproven = true;
 
 		const divergent: IChannelReestablishMessage = {
 			channelId: h.opener.getChannelId()!,
@@ -2971,7 +2972,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
 		completeExchange(h);
-		const st = h.opener.getFullState();
+		const st = writableState(h.opener);
 		const prev = { ...st.v2InFlight! };
 		st.v2PreviousAttempts = [prev];
 		const json = JSON.parse(JSON.stringify(serializeChannelState(st)));
@@ -4169,7 +4170,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(findError(g.opener.abortDualFunding('too late'))).to.contain(
 			'after tx_signatures'
 		);
-		g.opener.getFullState().state = ChannelState.ERRORED;
+		writableState(g.opener).state = ChannelState.ERRORED;
 		expect(g.opener.isAbandonedV2Open()).to.be.false;
 	});
 
@@ -6206,7 +6207,7 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 	it('the live resync resumes a fully signed attempt on the chain, not on the peer (issue 376)', async function () {
 		const t = await driveNonLeaseOpen(143, 144, [makeWalletInput(200_000)]);
 		try {
-			const row = t.acceptorChannel.getFullState();
+			const row = writableState(t.acceptorChannel);
 			expect(row.v2InFlight!.sentTxSignatures).to.equal(true);
 			// The shape the resync sees: a provisionally accepted RBF whose
 			// persist failed, rolled back to a retained attempt that already
@@ -6753,7 +6754,7 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 					outputIndex: closeTx.ins[0].index
 				}
 			);
-			delete t.channel.getFullState().closeSpendsFundingTxid;
+			delete writableState(t.channel).closeSpendsFundingTxid;
 			const actions: string[] = [];
 			t.opener.on('log', (log: { action: string }) => actions.push(log.action));
 

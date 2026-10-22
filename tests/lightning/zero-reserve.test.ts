@@ -41,6 +41,7 @@ import {
 	connectNodes,
 	openReadyChannel
 } from './helpers/loopback-nodes';
+import { writableState } from './helpers/writable-state';
 
 const walletPolicy = {
 	acceptWaiver: true,
@@ -79,9 +80,9 @@ function pair(
 		})
 	);
 	for (const channel of [opener, acceptor]) {
-		channel.getFullState().trustedPeer = trusted;
-		channel.getFullState().zeroConfEnabled = trusted;
-		if (trusted) channel.getFullState().minimumDepth = 0;
+		writableState(channel).trustedPeer = trusted;
+		writableState(channel).zeroConfEnabled = trusted;
+		if (trusted) writableState(channel).minimumDepth = 0;
 	}
 	opener.setZeroReservePolicy(primaryOpens ? primaryPolicy : walletPolicy);
 	acceptor.setZeroReservePolicy(primaryOpens ? walletPolicy : primaryPolicy);
@@ -247,17 +248,17 @@ describe('One-way zero reserve negotiation', () => {
 			primaryOpens ? 'primary' : 'wallet'
 		} opens`, () => {
 			const { opener, acceptor } = pair(primaryOpens, false);
-			opener.getFullState().announceChannel = false;
-			opener.getFullState().fundingSatoshis = 800_000n;
-			opener.getFullState().localBalanceMsat = 800_000_000n;
-			opener.getFullState().remoteBalanceMsat = 0n;
+			writableState(opener).announceChannel = false;
+			writableState(opener).fundingSatoshis = 800_000n;
+			writableState(opener).localBalanceMsat = 800_000_000n;
+			writableState(opener).remoteBalanceMsat = 0n;
 			const open = decodeOpenChannel2Message(
 				payload(
 					opener.initiateOpenV2(v2Params(opener, 800_000n)),
 					MessageType.OPEN_CHANNEL2
 				)
 			);
-			acceptor.getFullState().temporaryChannelId = open.channelId;
+			writableState(acceptor).temporaryChannelId = open.channelId;
 			const accept = decodeAcceptChannel2Message(
 				payload(
 					acceptor.handleOpenChannel2(open, v2Params(acceptor, 200_000n)),
@@ -317,7 +318,7 @@ describe('One-way zero reserve negotiation', () => {
 					MessageType.OPEN_CHANNEL2
 				)
 			);
-			acceptor.getFullState().temporaryChannelId = open.channelId;
+			writableState(acceptor).temporaryChannelId = open.channelId;
 			const accept = decodeAcceptChannel2Message(
 				payload(
 					acceptor.handleOpenChannel2(open, v2Params(acceptor, 0n)),
@@ -394,9 +395,9 @@ describe('Zero reserve amount and commitment checks', () => {
 			: openReadyChannel(primary, wallet);
 		const client = wallet.getChannelManager().getChannel(id)!;
 		const server = primary.getChannelManager().getChannel(id)!;
-		client.getFullState().localReserveWaived = true;
+		writableState(client).localReserveWaived = true;
 		client.getFullState().remoteConfig.channelReserveSatoshis = 0n;
-		server.getFullState().remoteReserveWaived = true;
+		writableState(server).remoteReserveWaived = true;
 		server.getFullState().localConfig.channelReserveSatoshis = 0n;
 		return { primary, wallet, client, server, id };
 	}
@@ -441,10 +442,10 @@ describe('Zero reserve amount and commitment checks', () => {
 				354n
 			);
 			try {
-				client.getFullState().localBalanceMsat = 2_071_000n;
-				client.getFullState().remoteBalanceMsat = 0n;
-				server.getFullState().localBalanceMsat = 0n;
-				server.getFullState().remoteBalanceMsat = 2_071_000n;
+				writableState(client).localBalanceMsat = 2_071_000n;
+				writableState(client).remoteBalanceMsat = 0n;
+				writableState(server).localBalanceMsat = 0n;
+				writableState(server).remoteBalanceMsat = 2_071_000n;
 				const channel = receiving ? server : client;
 				const actions = receiving
 					? channel.handleUpdateFee({
@@ -470,7 +471,7 @@ describe('Zero reserve amount and commitment checks', () => {
 	it('rejects an outgoing dust HTLC that would leave the high-dust commitment empty before mutation', () => {
 		const { primary, wallet, client } = fundedPair(false, 1000n, 354n);
 		try {
-			const s = client.getFullState();
+			const s = writableState(client);
 			s.localBalanceMsat = 1_000_000n;
 			s.remoteBalanceMsat = 1_400_000n;
 			s.fundingSatoshis = 2400n;
@@ -501,7 +502,7 @@ describe('Zero reserve amount and commitment checks', () => {
 	it('refuses a received dust HTLC that would leave our commitment empty', () => {
 		const { primary, wallet, client, id } = fundedPair(false, 1000n, 354n);
 		try {
-			const s = client.getFullState();
+			const s = writableState(client);
 			s.localBalanceMsat = 0n;
 			s.remoteBalanceMsat = 1_944_000n;
 			s.fundingSatoshis = 1944n;
@@ -530,8 +531,8 @@ describe('Zero reserve amount and commitment checks', () => {
 	it('refuses a fee increase the pending-splice opener balance cannot fund', () => {
 		const { primary, wallet, server, id } = fundedPair(true);
 		try {
-			server.getFullState().localBalanceMsat = 100_000_000n;
-			server.getFullState().remoteBalanceMsat = 900_000_000n;
+			writableState(server).localBalanceMsat = 100_000_000n;
+			writableState(server).remoteBalanceMsat = 900_000_000n;
 			server.isSplicePendingLock = () => true;
 			server['_splicedState'] = (view) => ({
 				...view!,
@@ -566,7 +567,7 @@ describe('Zero reserve amount and commitment checks', () => {
 					amountMsat: 100_000_000n
 				}).bolt11
 			);
-			const s = client.getFullState();
+			const s = writableState(client);
 			s.localBalanceMsat -= 1000n;
 			s.htlcs.set('offered-0', {
 				id: 0n,
@@ -627,10 +628,10 @@ describe('Zero reserve amount and commitment checks', () => {
 				}).bolt11
 			);
 			const channel = wallet.getChannelManager().getChannel(id)!;
-			channel.getFullState().localReserveWaived = true;
+			writableState(channel).localReserveWaived = true;
 			channel.getFullState().remoteConfig.channelReserveSatoshis = 0n;
 			const peer = primary.getChannelManager().getChannel(id)!;
-			peer.getFullState().remoteReserveWaived = true;
+			writableState(peer).remoteReserveWaived = true;
 			peer.getFullState().localConfig.channelReserveSatoshis = 0n;
 			expect(channel.getSpendableOutboundMsat()).to.equal(100_000_001n);
 			expect(channel.spliceOutCommitmentCostSats()).to.equal(0n);
@@ -646,8 +647,8 @@ describe('Zero reserve amount and commitment checks', () => {
 			expect(peer.getFullState().remoteConfig.channelReserveSatoshis).to.equal(
 				10_000n
 			);
-			channel.getFullState().fundingVersion = 2;
-			channel.getFullState().spliceFundingTxid = crypto.randomBytes(32);
+			writableState(channel).fundingVersion = 2;
+			writableState(channel).spliceFundingTxid = crypto.randomBytes(32);
 			channel.repairKeptChannelReserve();
 			expect(channel.spliceReserveWeKeepSats(5_000_000n)).to.equal(0n);
 			expect(

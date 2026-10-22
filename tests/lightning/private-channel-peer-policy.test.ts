@@ -29,6 +29,7 @@ import {
 	serializeChannelState,
 	deserializeChannelState
 } from '../../src/lightning/storage/serialization';
+import { writableState } from './helpers/writable-state';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -160,10 +161,9 @@ describe('Private-channel peer forwarding policy', function () {
 		// Private channel: no announcement, no real SCID in the graph — give it
 		// the alias the peer would use to route to alice.
 		const scid = crypto.randomBytes(8);
-		const state = alice
-			.getChannelManager()
-			.getChannel(channelId)!
-			.getFullState();
+		const state = writableState(
+			alice.getChannelManager().getChannel(channelId)!
+		);
 		state.scidAlias = scid;
 
 		// Direction bit: the update author is the LEXICOGRAPHICALLY ordered side.
@@ -354,13 +354,12 @@ describe('Private-channel peer forwarding policy', function () {
 		const bobCid = openTo(bob);
 
 		const bobScid = crypto.randomBytes(8);
-		alice.getChannelManager().getChannel(bobCid)!.getFullState().scidAlias =
+		writableState(alice.getChannelManager().getChannel(bobCid)!).scidAlias =
 			bobScid;
 		// Mallory (peer-chosen) aliases its channel to bob's real SCID.
-		alice
-			.getChannelManager()
-			.getChannel(malloryCid)!
-			.getFullState().remoteScidAlias = bobScid;
+		writableState(
+			alice.getChannelManager().getChannel(malloryCid)!
+		).remoteScidAlias = bobScid;
 
 		const aliceId = Buffer.from(alice.getNodeId(), 'hex');
 		const bobId = Buffer.from(bob.getNodeId(), 'hex');

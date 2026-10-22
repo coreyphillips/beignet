@@ -22,6 +22,7 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { buildRemoteCommitment } from '../../src/lightning/channel/commitment-builder';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { setupNormalChannels } from './helpers/revoked-commitment-fixture';
+import { writableState } from './helpers/writable-state';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -136,7 +137,7 @@ describe('ChannelManager: seeding a restored monitor', function () {
 			cltvExpiry: 120,
 			onionRoutingPacket: Buffer.alloc(1366)
 		});
-		const state = opener.getFullState();
+		const state = writableState(opener);
 		for (const entry of state.htlcs.values()) entry.addLocallyRevoked = true;
 		const flags = FeatureFlags.empty();
 		flags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);

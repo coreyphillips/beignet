@@ -68,6 +68,7 @@ import {
 } from '../../src/lightning/message/interactive-tx';
 import { decodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
 import { verifyRemoteCommitmentSig } from '../../src/lightning/channel/commitment-builder';
+import { writableState } from './helpers/writable-state';
 
 // ─────────────── Helpers ───────────────
 
@@ -645,7 +646,7 @@ describe('Dual Funding v2 commitment_signed exchange (e2e, real keys)', () => {
 	it('fails a commitment_signed when remote basepoints are missing', () => {
 		const h = driveToCommitmentExchange();
 
-		h.acceptor.getFullState().remoteBasepoints = null;
+		writableState(h.acceptor).remoteBasepoints = null;
 		const actions = h.acceptor.handleCommitmentSigned(
 			decodeCommitmentSignedMessage(h.openerCommit)
 		);

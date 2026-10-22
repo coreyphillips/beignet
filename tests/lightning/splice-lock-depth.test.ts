@@ -97,6 +97,7 @@ import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import { InvalidSpliceError } from '../../src/lightning/node/types';
+import { writableState } from './helpers/writable-state';
 
 const FUNDING_SATOSHIS = 1_000_000n;
 const SPLICE_AMOUNT = 300_000n;
@@ -531,7 +532,7 @@ interface IWirePair {
 function makeZeroConfWirePair(): IWirePair {
 	const { opener, acceptor } = makeNormalChannel();
 	for (const ch of [opener, acceptor]) {
-		const state = ch.getFullState();
+		const state = writableState(ch);
 		state.channelType = zeroConfType();
 		state.minimumDepth = 0;
 	}
@@ -1543,7 +1544,7 @@ describe('Splice lock depth on the node (issue #760)', function () {
 		// point of no return: signatures exchanged, transaction fully signed,
 		// record waiting for the chain.
 		const channel = fx.alice.getChannelManager().getChannel(fx.channelId)!;
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		state.channelType = zeroConfType();
 		state.minimumDepth = 0;
 		state.state = ChannelState.SPLICING;
@@ -1576,7 +1577,7 @@ describe('Splice lock depth on the node (issue #760)', function () {
 	it('control: a restored zero-conf splice without a lock depth is watched at the channel minimum', async () => {
 		const fx = await setup(7605);
 		const channel = fx.alice.getChannelManager().getChannel(fx.channelId)!;
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		state.channelType = zeroConfType();
 		state.minimumDepth = 0;
 		state.state = ChannelState.SPLICING;

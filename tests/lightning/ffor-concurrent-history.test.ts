@@ -36,6 +36,7 @@ import {
 	restart,
 	expectVouchersCarried
 } from './helpers/ffor-concurrent-pair';
+import { writableState } from './helpers/writable-state';
 
 function sampleHistory(): Map<string, IHtlcSnapshotEntry[]> {
 	const first: IHtlcSnapshotEntry = {
@@ -94,7 +95,7 @@ describe('Concurrent commitment history persistence', function () {
 
 	it('keeps legacy channel and frame bytes while upgrading the next durable channel row', () => {
 		const pair = createPair();
-		const baseline = pair.rChannel.getFullState();
+		const baseline = writableState(pair.rChannel);
 		baseline.revokedHtlcSnapshots = sampleHistory();
 		expect(JSON.stringify(serializeChannelState(baseline))).to.equal(
 			JSON.stringify(

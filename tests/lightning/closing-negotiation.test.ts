@@ -24,6 +24,7 @@ import {
 	realInitialCommitmentSig
 } from './helpers/real-signing';
 import { expectWireFailure, wireRefusalOf } from './helpers/open-refusal';
+import { writableState } from './helpers/writable-state';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	return {
@@ -77,7 +78,7 @@ function signFn(_fee: bigint): Buffer {
  * have to keep summing to the funding value for that fee to be the real one.
  */
 function setOpenerBalance(opener: Channel, balanceMsat: bigint): void {
-	const state = opener.getFullState();
+	const state = writableState(opener);
 	state.remoteBalanceMsat += state.localBalanceMsat - balanceMsat;
 	state.localBalanceMsat = balanceMsat;
 }
@@ -754,7 +755,7 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 				channelId: opener.getChannelId()!,
 				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
 			});
-			const state = opener.getFullState();
+			const state = writableState(opener);
 			state.closingFeeMin = 85n;
 			state.closingFeeMax = 342n;
 			state.lastProposedClosingFeeSat = 90n;
@@ -818,7 +819,7 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 			// feeratePerKw 253 is 44 sat, so the 2x cap is 88 sat. With 400 sat of
 			// balance the old cap (whole balance) allowed fees up to 88 sat,
 			// leaving 312 sat < 354 dust and burning our output.
-			opener.getFullState().localBalanceMsat = 400_000n;
+			writableState(opener).localBalanceMsat = 400_000n;
 
 			opener.handleClosingSigned(
 				{
@@ -842,7 +843,7 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 				channelId: opener.getChannelId()!,
 				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
 			});
-			opener.getFullState().localShutdownScript = Buffer.from(
+			writableState(opener).localShutdownScript = Buffer.from(
 				'76a914' + '11'.repeat(20) + '88ac',
 				'hex'
 			);

@@ -84,6 +84,7 @@ import {
 	LSP_PUBKEY,
 	makeCoin
 } from './helpers/df-receiver';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -689,7 +690,7 @@ describe('Channel splice revert (issue #760)', function () {
 		const { channel } = splicingChannel();
 		const seen: string[] = [];
 		for (let i = 0; i < REVERTED_SPLICES_KEPT + 3; i++) {
-			const state = channel.getFullState();
+			const state = writableState(channel);
 			if (!state.spliceInFlight) {
 				// Graft the next conflicted splice the way the previous one sat.
 				const { tx: coin, script } = makeCoinTx(50_000 + i);
@@ -765,7 +766,7 @@ describe('Channel splice revert (issue #760)', function () {
 		).to.match(/splice_locked already sent/);
 
 		const adopted = splicingChannel();
-		adopted.channel.getFullState().state = ChannelState.NORMAL;
+		writableState(adopted.channel).state = ChannelState.NORMAL;
 		expect(
 			(adopted.channel.revertConflictedSplice()[0] as { message: string })
 				.message
@@ -819,7 +820,7 @@ describe('Channel splice revert (issue #760)', function () {
 
 	it('a disconnected channel reverts through its wrapped state', () => {
 		const { channel, oldFundingTxid } = splicingChannel();
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		state.preReestablishState = ChannelState.SPLICING;
 		state.state = ChannelState.AWAITING_REESTABLISH;
 		const actions = channel.revertConflictedSplice();
@@ -1508,7 +1509,7 @@ function graft(
 	role: 'initiator' | 'acceptor' = 'initiator'
 ): void {
 	const ch = node.getChannelManager().getChannel(channelId)!;
-	const raw = ch.getFullState();
+	const raw = writableState(ch);
 	raw.state = ChannelState.SPLICING;
 	raw.preSpliceState = ChannelState.NORMAL;
 	raw.spliceInFlight = inflightFor(spliceTx, coinScript);

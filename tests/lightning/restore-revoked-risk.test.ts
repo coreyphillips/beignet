@@ -71,6 +71,7 @@ import {
 	realInitialCommitmentSig,
 	realCommitmentSigs
 } from './helpers/real-signing';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -252,7 +253,7 @@ function heldOpener(hold = true): {
 } {
 	const { opener, acceptor, openerCommitmentSeed } = setupNormalChannels();
 	exchangeCommitments(opener, acceptor);
-	const state = opener.getFullState();
+	const state = writableState(opener);
 	if (hold) state.restoreRecencyUnproven = true;
 	opener.markForReestablish();
 	return {

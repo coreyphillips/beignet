@@ -49,6 +49,7 @@ import {
 import { LightningNode } from '../../../src/lightning/node/lightning-node';
 import { ChannelState } from '../../../src/lightning/channel/types';
 import { decode as decodeInvoice } from '../../../src/lightning/invoice/decode';
+import { writableState } from '../helpers/writable-state';
 
 /** Convert an LND chan_id (decimal uint64 string) to an 8-byte SCID buffer. */
 function chanIdToScid(chanId: string): Buffer {
@@ -123,7 +124,7 @@ describe('Interop: LND as introduction node (blinded payment)', function () {
 			.listChannels()
 			.find((c) => c.getState() === ChannelState.NORMAL);
 		expect(b2Channel, 'beignet2 channel to LND is NORMAL').to.exist;
-		b2Channel!.getFullState().shortChannelId = lndScid;
+		writableState(b2Channel!).shortChannelId = lndScid;
 
 		// The blinded path must encode LND'S forwarding policy for the LND→us
 		// hop (TimeLockDelta 80, BaseFee 1000, FeeRate 1). beignet2 has no graph
@@ -214,7 +215,7 @@ describe('Interop: LND as introduction node (blinded payment)', function () {
 			.listChannels()
 			.find((c) => c.getState() === ChannelState.NORMAL);
 		expect(b2Channel, 'beignet2 channel to LND is NORMAL').to.exist;
-		const b2State = b2Channel!.getFullState();
+		const b2State = writableState(b2Channel!);
 		b2State.shortChannelId = lndScid;
 
 		// LND sends its channel_update for the private channel directly to the

@@ -12,6 +12,7 @@ import {
 	createNode,
 	openReadyChannel
 } from '../lightning/helpers/loopback-nodes';
+import { writableState } from '../lightning/helpers/writable-state';
 
 // Exercise the real CLI serializers and engine channels without booting a
 // second wallet. These read-only methods need only the wrapped engine.
@@ -94,7 +95,7 @@ describe('Exact outbound send ceiling on channel and liquidity snapshots', funct
 
 	it('follows the peer-funder guard down to a trimmed HTLC and then zero', () => {
 		const channel = bob.getChannelManager().getChannel(channelId)!;
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		const receiver = wrap(bob);
 		const reserve = state.localConfig.channelReserveSatoshis * 1000n;
 		const cost =
@@ -130,10 +131,9 @@ describe('Exact outbound send ceiling on channel and liquidity snapshots', funct
 		'reestablish'
 	] as const) {
 		it(`reports no send ceiling while ${held} blocks new HTLCs without hiding balance`, () => {
-			const state = alice
-				.getChannelManager()
-				.getChannel(channelId)!
-				.getFullState();
+			const state = writableState(
+				alice.getChannelManager().getChannel(channelId)!
+			);
 			if (held === 'restore') state.restoreRecencyUnproven = true;
 			if (held === 'funding') state.fundingUnaccounted = true;
 			if (held === 'closing') state.state = ChannelState.SHUTTING_DOWN;
@@ -161,7 +161,7 @@ describe('Exact outbound send ceiling on channel and liquidity snapshots', funct
 		let total = 0n;
 		for (const id of [channelId, second]) {
 			const channel = alice.getChannelManager().getChannel(id)!;
-			const state = channel.getFullState();
+			const state = writableState(channel);
 			state.localBalanceMsat -= 1n;
 			state.remoteBalanceMsat += 1n;
 			const msat = channel.getSpendableOutboundMsat();
@@ -178,7 +178,7 @@ describe('Exact outbound send ceiling on channel and liquidity snapshots', funct
 	it('uses the persisted pending splice balance in the ceiling', () => {
 		const channel = alice.getChannelManager().getChannel(channelId)!;
 		const before = cli.listChannels()[0].maxSendableSats!;
-		channel.getFullState().spliceInFlight = {
+		writableState(channel).spliceInFlight = {
 			newFundingSatoshis: 900_000n,
 			localRelativeSatoshis: -100_000n,
 			remoteRelativeSatoshis: 0n,

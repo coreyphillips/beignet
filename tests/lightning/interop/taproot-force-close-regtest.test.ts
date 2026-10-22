@@ -30,6 +30,7 @@ import { createTaprootFundingScript } from '../../../src/lightning/script/fundin
 import { IChannelBasepoints } from '../../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../../src/lightning/crypto/ecdh';
 import { bitcoinRpc, mineBlocks, ensureBitcoindFunds } from './shared-helpers';
+import { writableState } from '../helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 const NETWORK = bitcoin.networks.regtest;
@@ -252,7 +253,7 @@ describe('Interop: option_taproot force-close (regtest)', function () {
 		// Simulate a reconnect that loses the in-memory verification nonces — the
 		// scenario that previously made the pre-reconnect commitment
 		// un-force-closeable. createReestablish re-derives them deterministically.
-		const s = aliceChannel.getFullState();
+		const s = writableState(aliceChannel);
 		s.preReestablishState = s.state;
 		s.state = ChannelState.AWAITING_REESTABLISH;
 		s.localNonce = undefined;

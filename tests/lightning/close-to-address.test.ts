@@ -22,6 +22,7 @@ import {
 	connectNodes,
 	openReadyChannel
 } from './helpers/loopback-nodes';
+import { writableState } from './helpers/writable-state';
 
 const DESTINATION = Buffer.from(
 	'512079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798',
@@ -264,14 +265,12 @@ describe('External cooperative close', function () {
 	it('keeps the earlier simple-close candidate when it wins confirmation', () => {
 		const flags = FeatureFlags.empty();
 		flags.setOptional(Feature.SIMPLE_CLOSE);
-		const aliceState = alice
-			.getChannelManager()
-			.getChannel(channelId)!
-			.getFullState();
-		const bobState = bob
-			.getChannelManager()
-			.getChannel(channelId)!
-			.getFullState();
+		const aliceState = writableState(
+			alice.getChannelManager().getChannel(channelId)!
+		);
+		const bobState = writableState(
+			bob.getChannelManager().getChannel(channelId)!
+		);
 		aliceState.localBalanceMsat = bobState.remoteBalanceMsat = 600_000_000n;
 		aliceState.remoteBalanceMsat = bobState.localBalanceMsat = 400_000_000n;
 		for (const node of [alice, bob]) {
@@ -324,7 +323,7 @@ describe('External cooperative close', function () {
 	]) {
 		it(`refuses external close in ${state}`, () => {
 			const channel = alice.getChannelManager().getChannel(channelId)!;
-			channel.getFullState().state = state;
+			writableState(channel).state = state;
 			expect(() => alice.closeQuote(channelId, DESTINATION)).to.throw(
 				'not ready'
 			);
@@ -394,7 +393,7 @@ describe('External cooperative close', function () {
 
 	it('allows a relayable legacy close whose remote funder output is trimmed', () => {
 		const channel = alice.getChannelManager().getChannel(channelId)!;
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		state.role = ChannelRole.ACCEPTOR;
 		state.localBalanceMsat = 999_800_000n;
 		state.remoteBalanceMsat = 200_000n;
@@ -408,7 +407,7 @@ describe('External cooperative close', function () {
 
 	it('refuses a later simple-close fee that would discard the external payout', () => {
 		const channel = alice.getChannelManager().getChannel(channelId)!;
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		state.localBalanceMsat = 1_000_000n;
 		state.remoteBalanceMsat = 999_000_000n;
 		state.localConfig.feeratePerKw = 253;

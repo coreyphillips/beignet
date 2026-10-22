@@ -51,6 +51,7 @@ import {
 	connectNodes,
 	openReadyChannel
 } from './helpers/loopback-nodes';
+import { writableState } from './helpers/writable-state';
 
 const HEIGHT = 800_000;
 
@@ -298,10 +299,9 @@ describe('Receiver side: an inbound add admitted past its expiry (issue #1009)',
 		// The loopback funding never touched a chain: give Bob's channel the
 		// depth the issue #413 gate wants, so the claim arm is really reachable
 		// and would really close the channel rather than being skipped.
-		bob
-			.getChannelManager()
-			.getChannel(channelId)!
-			.getFullState().fundingConfirmationHeight = 100;
+		writableState(
+			bob.getChannelManager().getChannel(channelId)!
+		).fundingConfirmationHeight = 100;
 		const errorCodes: string[] = [];
 		bob.on('node:error', (e: { code: string }) => errorCodes.push(e.code));
 		const logs: unknown[] = [];

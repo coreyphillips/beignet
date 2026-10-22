@@ -14,6 +14,7 @@ import {
 	openReadyChannel,
 	scidForIndex
 } from './helpers/loopback-nodes';
+import { writableState } from './helpers/writable-state';
 
 describe('Pay-all multi-hop settlement', function () {
 	this.timeout(20_000);
@@ -40,9 +41,9 @@ describe('Pay-all multi-hop settlement', function () {
 		bob.registerChannelScid(ab, scidForIndex(0));
 		bob.registerChannelScid(bc, scidForIndex(1));
 		carol.registerChannelScid(bc, scidForIndex(1));
-		bob.getChannelManager().getChannel(bc)!.getFullState().shortChannelId =
+		writableState(bob.getChannelManager().getChannel(bc)!).shortChannelId =
 			scidForIndex(1);
-		carol.getChannelManager().getChannel(bc)!.getFullState().shortChannelId =
+		writableState(carol.getChannelManager().getChannel(bc)!).shortChannelId =
 			scidForIndex(1);
 		const b = Buffer.from(bob.getNodeId(), 'hex');
 		const c = Buffer.from(carol.getNodeId(), 'hex');

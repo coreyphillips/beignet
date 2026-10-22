@@ -24,6 +24,7 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import * as bitcoin from 'bitcoinjs-lib';
+import { writableState } from './helpers/writable-state';
 
 bitcoin.initEccLib(ecc);
 
@@ -158,7 +159,7 @@ describe('Pathfinding: announced-channel routing hints', function () {
 			g.applyChannelUpdate({ ...base });
 			g.applyChannelUpdate({ ...base, channelFlags: 1 });
 			const ch = n.getChannelManager().getChannel(channelId);
-			if (ch) ch.getFullState().shortChannelId = scid;
+			if (ch) writableState(ch).shortChannelId = scid;
 			n.registerChannelScid(channelId, scid);
 		}
 

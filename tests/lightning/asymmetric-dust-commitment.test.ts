@@ -17,6 +17,7 @@ import { buildLocalCommitment } from '../../src/lightning/channel/commitment-bui
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
 import { IUpdateFeeMessage } from '../../src/lightning/message/channel-update';
+import { writableState } from './helpers/writable-state';
 
 /**
  * Issue 386: the reserve we ENFORCE on the peer floors at the LOWER of the two
@@ -225,7 +226,7 @@ describe('Asymmetric dust limits vs peer-driven updates (issue 386)', function (
 			capacitySats: 3_000n,
 			theirMsat: 2_500_000n
 		});
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		state.remoteBalanceMsat = 1_200_000n;
 		state.htlcs.set('received-7', {
 			id: 7n,
@@ -280,7 +281,7 @@ describe('Asymmetric dust limits vs peer-driven updates (issue 386)', function (
 
 	it('refuses to plan a force close whose commitment has no outputs', function () {
 		const channel = makeChannel();
-		const state = channel.getFullState();
+		const state = writableState(channel);
 		// Reach the state the guards above prevent, by writing it directly.
 		state.remoteBalanceMsat = 1_017_000n;
 		state.remoteCommitmentSignature = crypto.randomBytes(64);

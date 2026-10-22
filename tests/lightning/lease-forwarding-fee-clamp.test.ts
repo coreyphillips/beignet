@@ -23,6 +23,7 @@ import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
+import { writableState } from './helpers/writable-state';
 
 interface IForwardingPolicy {
 	feeBaseMsat: number;
@@ -101,7 +102,7 @@ function leasedNode(): { alice: LightningNode; channelId: Buffer } {
 	const alice = new LightningNode(nodeConfig(1));
 	const bob = new LightningNode(nodeConfig(2));
 	const channelId = openNormalChannel(alice, bob);
-	const st = alice.getChannelManager().getChannel(channelId)!.getFullState();
+	const st = writableState(alice.getChannelManager().getChannel(channelId)!);
 	st.isLessor = true;
 	st.leaseExpiry = 900_000;
 	st.leaseChannelFeeMaxBaseMsat = 5000;

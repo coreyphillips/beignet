@@ -81,6 +81,7 @@ import {
 	serializeChannelState,
 	deserializeChannelState
 } from '../../src/lightning/storage/serialization';
+import { writableState } from './helpers/writable-state';
 
 const sha256 = (b: Buffer): Buffer =>
 	crypto.createHash('sha256').update(b).digest();
@@ -1234,7 +1235,7 @@ describe('cooperative close waits for every HTLC to be resolved (issue #1307)', 
 					// What the old close path had persisted by now: the shutdown
 					// exchange saw no PENDING or COMMITTED entry and moved on.
 					for (const side of ['A', 'B'] as Side[]) {
-						const state = chanOf(t, side).getFullState();
+						const state = writableState(chanOf(t, side));
 						state.state = ChannelState.NEGOTIATING_CLOSING;
 						t.wire.rows[side] = JSON.stringify(serializeChannelState(state));
 					}
@@ -1469,7 +1470,7 @@ describe('cooperative close waits for every HTLC to be resolved (issue #1307)', 
 							flavor
 						);
 						t.wire.manual(true);
-						t.aChannel().getFullState().needsCommitment = true;
+						writableState(t.aChannel()).needsCommitment = true;
 						expect(t.aChannel().closingBlockedBy()).to.equal('pending updates');
 						expect(t.A().autoSignAndSendCommitment(t.channelId).ok).to.equal(
 							true
@@ -1848,7 +1849,7 @@ describe('cooperative close waits for every HTLC to be resolved (issue #1307)', 
 		it('each kind of pending update blocks on its own', function () {
 			const t = makeFundedPair('predicate-each');
 			const c = t.aChannel();
-			const state = c.getFullState();
+			const state = writableState(c);
 			expect(c.closingBlockedBy()).to.equal(null);
 			/** Set one thing, read the gate, put it back. */
 			const withOnly = (set: () => void, undo: () => void): string | null => {
@@ -1952,7 +1953,7 @@ describe('cooperative close waits for every HTLC to be resolved (issue #1307)', 
 						const queued = t.wire.pendingTypes(side);
 						expect(queued[queued.length - 1]).to.equal(SHUTDOWN);
 						const c = chanOf(t, side);
-						c.getFullState().remoteShutdownScript = scriptOf(other(side));
+						writableState(c).remoteShutdownScript = scriptOf(other(side));
 					}
 					for (const side of ['A', 'B'] as Side[]) {
 						const c = chanOf(t, side);
@@ -2015,7 +2016,7 @@ describe('cooperative close waits for every HTLC to be resolved (issue #1307)', 
 									// Only NEGOTIATING_CLOSING reaches this stage, and
 									// nothing enters a channel there, so it takes a row
 									// from before the gate to arrive with an entry.
-									const state = c.getFullState();
+									const state = writableState(c);
 									state.state = ChannelState.NEGOTIATING_CLOSING;
 									try {
 										return c.handleClosingSig(
