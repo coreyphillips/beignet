@@ -918,6 +918,9 @@ interface IForwardingPolicyTerms {
 /** Ten minutes: the grace LND gives a superseded channel_update. */
 const DEFAULT_FORWARDING_POLICY_GRACE_MS = 10 * 60 * 1000;
 
+/** The channel rows startup reads once and shares across its passes. */
+type StoredChannelRows = ReturnType<IStorageBackend['loadAllChannels']>;
+
 interface IPendingFundingTx {
 	txHex: string;
 	phase: 'candidate' | 'authorized' | 'restored';
@@ -2653,6 +2656,11 @@ export class LightningNode extends EventEmitter {
 
 		// Restore from storage if available
 		if (this.storage) {
+			// Every startup pass over the channel rows shares this one read:
+			// each read decrypts and deserializes the whole table, revoked
+			// HTLC history included. Nothing writes a channel row before
+			// restore's main loop has walked them.
+			const storedChannels = this.storage.loadAllChannels();
 			// The quorum eligibility preflight runs BEFORE restoration touches
 			// anything: restore deletes record-less DUAL_FUNDING_V2 rows
 			// durably (RBF residue) and can journal the first quorum frame
@@ -2662,6 +2670,7 @@ export class LightningNode extends EventEmitter {
 			let carriedV2Rows: string[] = [];
 			if (barrier?.enforcing === true) {
 				carriedV2Rows = this.assertQuorumCanCarryStoredV2Opens(
+					storedChannels,
 					chainPromisedQuorum(
 						this.storage,
 						deriveRecoveryMasterKey(config.nodePrivateKey),
@@ -2709,7 +2718,7 @@ export class LightningNode extends EventEmitter {
 				this.storage.setRecoveryMeta?.(REPAIR_TAIL_KEY, 'owed');
 			}
 			const restoreStarted = Date.now();
-			this.restoreFromStorage();
+			this.restoreFromStorage(storedChannels);
 			this.storageRestoreMs = Date.now() - restoreStarted;
 			// Inline, the network map is already back; in slices, it reports
 			// once it is.
@@ -3073,9 +3082,12 @@ export class LightningNode extends EventEmitter {
 	 * the resumability this preflight polices, and none of which is
 	 * broadcastable, so wire safety is untouched.
 	 */
-	private assertQuorumCanCarryStoredV2Opens(alreadyQuorum: boolean): string[] {
+	private assertQuorumCanCarryStoredV2Opens(
+		storedChannels: StoredChannelRows,
+		alreadyQuorum: boolean
+	): string[] {
 		const carried: string[] = [];
-		for (const row of this.storage!.loadAllChannels()) {
+		for (const row of storedChannels) {
 			const state = row.state;
 			if (state.v2InFlight) continue;
 			// A row persisted mid-reestablish carries the state it will
@@ -3116,9 +3128,9 @@ export class LightningNode extends EventEmitter {
 		return carried;
 	}
 
-	private restoreFromStorage(): void {
+	private restoreFromStorage(storedChannels: StoredChannelRows): void {
 		if (!this.storage) return;
-		this.restoreFforVoucherIdentities();
+		this.restoreFforVoucherIdentities(storedChannels);
 
 		// Seed the per-channel key index from storage FIRST: restoreChannel
 		// advances it from each restored row, but a row removed below never
@@ -3192,11 +3204,8 @@ export class LightningNode extends EventEmitter {
 			!floorPersisted && (keyIndexTableEmpty || persistedFloor === 0);
 
 		// Restore channels — look up per-channel key index for each
-		for (const {
-			channelId,
-			state,
-			peerPubkey
-		} of this.storage.loadAllChannels()) {
+		const removedRows = new Set<string>();
+		for (const { channelId, state, peerPubkey } of storedChannels) {
 			// A CONDEMNED row's removal was already decided; the intent rides
 			// the row itself, so there is no separate store whose read can
 			// fail and silently resurrect it. Retry the deletion now; a row
@@ -3205,6 +3214,7 @@ export class LightningNode extends EventEmitter {
 			// exactly once, when the deletion lands.
 			if (state.condemned) {
 				if (this.deleteChannelDurably(channelId)) {
+					removedRows.add(channelId);
 					this.emitStructuredLog('channel', 'condemned_row_removed', {
 						channelId
 					});
@@ -3255,6 +3265,7 @@ export class LightningNode extends EventEmitter {
 			// the attempt up.
 			if (state.state === ChannelState.DUAL_FUNDING_V2) {
 				if (this.deleteChannelDurably(channelId)) {
+					removedRows.add(channelId);
 					this.emitStructuredLog('channel', 'v2_rbf_residue_removed', {
 						channelId
 					});
@@ -3324,7 +3335,10 @@ export class LightningNode extends EventEmitter {
 		// learned to register them. Without this, an existing announced channel stays
 		// unforwardable until it is reopened. registerChannelScid persists the mapping,
 		// so this is a one-time repair rather than work repeated every boot.
-		for (const { state } of this.storage.loadAllChannels()) {
+		// A row the loop above deleted is no channel at all. The others may
+		// have had their state rewritten there, but not the fields read here.
+		for (const { channelId, state } of storedChannels) {
+			if (removedRows.has(channelId)) continue;
 			const scid = state.shortChannelId;
 			if (!scid || !state.channelId) continue;
 			if (!this.shouldAcceptRealScid(state)) continue;
@@ -20804,13 +20818,15 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/** Backfill retained books before restored channels can receive traffic or be pruned. */
-	private restoreFforVoucherIdentities(): void {
+	private restoreFforVoucherIdentities(
+		storedChannels: StoredChannelRows
+	): void {
 		if (!this.storage?.loadAllFforVouchers) return;
 		const candidate = new FforVoucherIndex();
 		for (const record of this.fforArchivedVouchers.values())
 			candidate.remember(record);
 		const mutations: RecoveryMutation[] = [];
-		for (const row of this.storage.loadAllChannels()) {
+		for (const row of storedChannels) {
 			if (!row.state.ffor) continue;
 			for (const record of archiveFforVouchers(row.channelId, row.state.ffor)) {
 				candidate.remember(record);
