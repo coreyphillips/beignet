@@ -566,7 +566,6 @@ describe('Phase 5: Defense in Depth', function () {
 
 			// Create a node with this storage — it should restore MC during construction
 			const node = new LightningNode(makeNodeConfig(50, { storage }));
-			node.on('error', () => {});
 
 			// The node's internal MC is private, but we can verify via destroy()
 			// which saves MC back. If the restore worked, the MC will have data.
@@ -590,7 +589,6 @@ describe('Phase 5: Defense in Depth', function () {
 
 			// Create a node with storage but NO pre-existing MC data
 			const node = new LightningNode(makeNodeConfig(51, { storage }));
-			node.on('error', () => {});
 
 			// We cannot directly call missionControl.recordFailure on the node,
 			// but we can use handlePeerMessage to trigger HTLC failure path, etc.
@@ -603,7 +601,6 @@ describe('Phase 5: Defense in Depth', function () {
 
 			// Create fresh node with the same storage that now has MC data
 			const node2 = new LightningNode(makeNodeConfig(52, { storage }));
-			node2.on('error', () => {});
 			storage._saveMissionControlCalled = false;
 
 			node2.destroy();

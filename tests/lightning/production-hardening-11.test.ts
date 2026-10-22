@@ -109,7 +109,6 @@ function createNode(
 ): LightningNode {
 	const config = { ...makeNodeConfig(seedId), ...extra };
 	const node = new LightningNode(config);
-	node.on('error', () => {});
 	return node;
 }
 
@@ -881,7 +880,6 @@ describe('Production Hardening 11', function () {
 				const config = makeNodeConfig(500);
 				config.storage = storage;
 				const node = new LightningNode(config);
-				node.on('error', () => {});
 
 				expect((node as any).walCheckpointTimer).to.not.be.null;
 				node.destroy();
@@ -897,7 +895,6 @@ describe('Production Hardening 11', function () {
 				const config = makeNodeConfig(502);
 				config.storage = storage;
 				const node = new LightningNode(config);
-				node.on('error', () => {});
 
 				node.destroy();
 				expect((node as any).walCheckpointTimer).to.be.null;
@@ -989,7 +986,6 @@ describe('Production Hardening 11', function () {
 				const config = makeNodeConfig(505);
 				config.storage = storage;
 				const node = new LightningNode(config);
-				node.on('error', () => {});
 
 				const now = Math.floor(Date.now() / 1000);
 				const staleTs = now - DEFAULT_PRUNE_MAX_AGE - 100;
@@ -1073,7 +1069,6 @@ describe('Production Hardening 11', function () {
 				const config = makeNodeConfig(506);
 				config.storage = storage;
 				const node = new LightningNode(config);
-				node.on('error', () => {});
 
 				const now = Math.floor(Date.now() / 1000);
 				const staleTs = now - DEFAULT_PRUNE_MAX_AGE - 100;
@@ -1147,7 +1142,6 @@ describe('Production Hardening 11', function () {
 				const config = makeNodeConfig(507);
 				config.storage = storage;
 				const node = new LightningNode(config);
-				node.on('error', () => {});
 
 				const now = Math.floor(Date.now() / 1000);
 				const staleTs = now - DEFAULT_PRUNE_MAX_AGE - 100;
@@ -1216,7 +1210,6 @@ describe('Production Hardening 11', function () {
 				const config = makeNodeConfig(508);
 				config.storage = storage;
 				const node = new LightningNode(config);
-				node.on('error', () => {});
 
 				const now = Math.floor(Date.now() / 1000);
 				const staleTs = now - DEFAULT_PRUNE_MAX_AGE - 100;
@@ -1341,7 +1334,6 @@ describe('Production Hardening 11', function () {
 				const config = makeNodeConfig(seedId);
 				config.storage = storage;
 				const node = new LightningNode(config);
-				node.on('error', () => {});
 				const staleTs =
 					Math.floor(Date.now() / 1000) - DEFAULT_PRUNE_MAX_AGE - 100;
 				const scids: string[] = [];

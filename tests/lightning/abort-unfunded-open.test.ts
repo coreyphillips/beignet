@@ -101,7 +101,6 @@ function makeNode(fundingProvider?: IFundingProvider): LightningNode {
 		htlcBasepointSecret: htlcSecret,
 		fundingProvider
 	});
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

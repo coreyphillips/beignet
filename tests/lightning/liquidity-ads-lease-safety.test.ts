@@ -317,8 +317,6 @@ describe('Liquidity ads lessor channel_update fee cap', function () {
 	it('clamps our advertised fees to the signed caps while the lease is active', function () {
 		const alice = new LightningNode(nodeConfig(1));
 		const bob = new LightningNode(nodeConfig(2));
-		alice.on('error', () => {});
-		bob.on('error', () => {});
 		const channelId = openNormalChannel(alice, bob);
 
 		// Mark this channel as our lease (we are the lessor) with tight fee caps,
@@ -351,8 +349,6 @@ describe('Liquidity ads lessor channel_update fee cap', function () {
 	it('does not clamp once the lease has expired', function () {
 		const alice = new LightningNode(nodeConfig(3));
 		const bob = new LightningNode(nodeConfig(4));
-		alice.on('error', () => {});
-		bob.on('error', () => {});
 		const channelId = openNormalChannel(alice, bob);
 
 		const st = alice.getChannelManager().getChannel(channelId)!.getFullState();

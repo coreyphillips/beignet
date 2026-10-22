@@ -20,7 +20,6 @@ import { encodeTxAbortMessage } from '../../src/lightning/message/interactive-tx
 import { encodeStfuMessage } from '../../src/lightning/message/stfu';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
-import { ILightningError } from '../../src/lightning/node/types';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -62,7 +61,6 @@ function createTestNode(): LightningNode {
 			.digest(),
 		network: Network.REGTEST
 	});
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }
@@ -138,19 +136,19 @@ describe('LightningNode.spliceInAndWait (issue #572)', function () {
 			channelId: crypto.randomBytes(32),
 			message: 'someone else',
 			timestamp: Date.now()
-		} as ILightningError);
+		});
 		node.emit('node:error', {
 			code: 'CHANNEL_ERROR',
 			channelId,
 			message: 'unrelated',
 			timestamp: Date.now()
-		} as ILightningError);
+		});
 		node.emit('node:error', {
 			code: 'SPLICE_IN_FAILED',
 			channelId,
 			message: 'wallet selection failed',
 			timestamp: Date.now()
-		} as ILightningError);
+		});
 
 		let error = '';
 		try {

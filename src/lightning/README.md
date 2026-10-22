@@ -1139,55 +1139,125 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 
 ## Events Reference
 
+`LightningNode` is a typed emitter: `on`, `once`, `off` and `emit` accept only the events below, with these listener signatures, so a listener on a misspelled or undeclared event does not compile. The table is generated from `LightningNodeEvents` in `node/events.ts` by `npm run docs:events`; edit the map, not the table. `ChannelManager` declares its own positional events in `channel/events.ts` (`ChannelManagerEvents`).
+
+<!-- events:LightningNodeEvents:start -->
 | Event | Arguments | Description |
 |-------|-----------|-------------|
-| `payment:received` | `(payment: IPaymentInfo)` | Incoming HTLC fulfilled |
-| `payment:sent` | `(payment: IPaymentInfo)` | Outgoing payment completed |
-| `payment:failed` | `(payment: IPaymentInfo)` | Outgoing payment failed |
-| `preimage:learned` | `(paymentHash: Buffer, preimage: Buffer)` | Preimage recorded (forwarding/settlement chokepoint) |
-| `invoice:settled` | `({ paymentHash, bolt11, amountMsat })` | Invoice we issued was settled |
-| `channel:opening` | `({ channelId, fundingTxid })` | Funding flow started |
-| `channel:ready` | `({ channelId })` | Channel reached NORMAL state |
-| `channel:closed` | `({ channelId })` | Channel closed |
-| `channel:resolved` | `({ channelId })` | All on-chain outputs resolved |
-| `channel:aborted` | `(temporaryChannelId: Buffer, reason: string)` | Open aborted before funding |
-| `channel:voided` | `({ channelId })` | Unfunded/abandoned channel discarded |
-| `splice:complete` | `({ channelId, fundingTxid })` | splice_locked exchanged both ways |
-| `splice:conflicted` | `({ channelId, spliceTxid, conflictTxid, inputIndex, height })` | An input of an in-flight splice that this node does not vouch for (a depth-locked splice carrying a stranger's coin, issue #760) was spent by another transaction, confirmed six deep while the splice is not on chain: the splice can never confirm. The node records it durably, raises `node:error` code `SPLICE_INPUT_CONFLICT`, and asks the peer to verify and revert; the request is re-sent every block and on reconnect until agreed |
-| `splice:reverted` | `({ channelId, spliceTxid, conflictTxid })` | A conflicted splice was unwound by agreement: both sides verified the conflict on their own chain view and returned to the pre-splice funding, which both still hold valid commitments for. The channel is NORMAL on the old outpoint, its watch re-armed; a `spliceInAndWait` on that splice rejects, and a direct-funding request behind it is failed (`direct-funding:offer:failed`, "the payer spent the offered coin elsewhere") |
-| `announcement:ready` | `(channelId: Buffer)` | Channel eligible for announcement |
-| `message:outbound` | `(peerPubkey: string, type: number, payload: Buffer)` | Message to send to peer |
-| `htlc:forwarded` | `({ inChannelId, outChannelId, amountInMsat, amountOutMsat, feeMsat })` | HTLC relayed to the next hop |
-| `htlc:fulfilled` | `({ channelId, htlcId })` | Forwarded HTLC fulfilled |
-| `htlc:failed` | `({ channelId, htlcId })` | Forwarded HTLC failed |
-| `htlc:held` | `({ paymentHash, amountMsat })` | HTLC parked by a hold invoice (one part; read `getHeldInvoiceSnapshot` for the committed set) |
-| `hold:accepted` | `({ paymentHash, state, heldAmountMsat, htlcCount })` | A part joined a hold invoice's parked set, with the set's running total (a re-park on reestablish does not fire) |
-| `hold:settled` | `({ paymentHash, state, heldAmountMsat, htlcCount })` | A hold invoice's preimage was revealed and every parked part fulfilled |
-| `hold:cancelled` | `({ paymentHash, reason, htlcsFailed, heldAmountMsat })` | A hold invoice was cancelled by the CLTV sweeper (`expiry-scan`) or the API |
-| `payment:htlc-resolved` | `({ paymentHash, channelId, htlcId, state })` | One offered HTLC of an outgoing payment reached a terminal state |
-| `payment:preimage` | `({ paymentHash, preimage, source })` | An outgoing payment's preimage became known, from update_fulfill_htlc or an on-chain claim |
-| `swap:*` | `({ swapId, paymentHash, state, ... })` | Reverse swap provider progress: created, held, funding, funded, claimed, settled, refund-broadcast, refunded, hold-cancelled, exposed, failed |
-| `sweep:uneconomic` | `(channelId: Buffer, action: ISweepUneconomicChainAction)` | An on-chain claim was declined because it cannot pay its own fee (`reason: 'skipped'`), or a competing spend path opened while it stayed unclaimed (`reason: 'contested'`). Retries continue in both cases, until the outpoint is spent |
-| `peer:connect` | `(pubkey: string)` | Peer connected (networking mode) |
-| `peer:disconnect` | `(pubkey: string)` | Peer disconnected (networking mode) |
-| `peer:disconnect-requested` | `(pubkey: string)` | The node needs this peer's connection severed but holds no socket for it (event-transport mode, or an unconnected peer): the HOST must close its transport. The protocol side (channels marked for reestablish) is already applied; reconnect and reestablish as usual |
-| `peer:error` | `(pubkey: string, error: Error)` | Peer error (networking mode) |
-| `broadcast:tx` | `(tx: Buffer)` | Transaction to broadcast on-chain |
-| `onion:received` | `(payload: IOnionMessagePayload)` | Onion message received (type 513) |
-| `offer:created` | `(offer: IOffer)` | BOLT 12 offer created |
-| `bolt12:invoice:received` | `(invoice: IBolt12Invoice)` | BOLT 12 invoice received |
-| `bolt12:invoice:issued` | `(invoice: IBolt12Invoice)` | BOLT 12 invoice issued to a payer |
-| `log` | `(entry: IStructuredLog)` | Structured action log entry |
-| `node:error` | `(error: ILightningError)` | Operational error (non-fatal) |
-| `node:ready` | `()` | Node fully operational (peers reconnected, channels restored) |
+| `payment:received` | `(payment: IPaymentInfo)` | Incoming payment settled. |
+| `payment:sent` | `(payment: IPaymentInfo)` | Outgoing payment completed. |
+| `payment:failed` | `(payment: IPaymentInfo)` | Outgoing payment failed. |
+| `payment:htlc-resolved` | `(event: IPaymentHtlcResolvedEvent)` | One offered HTLC of an outgoing payment reached a terminal state (fulfilled, irrevocably failed, or resolved on chain). |
+| `payment:preimage` | `(event: IPaymentPreimageEvent)` | An outgoing payment's preimage became known, from update_fulfill_htlc or an on-chain claim, whatever the record's status was. |
+| `preimage:learned` | `(paymentHash: Buffer, preimage: Buffer)` | Preimage recorded (forwarding and settlement chokepoint). |
+| `invoice:settled` | `(data: { paymentHash: Buffer; bolt11: string; amountMsat: bigint })` | Invoice this node issued was settled. |
+| `htlc:held` | `(data: { paymentHash: Buffer; amountMsat: bigint })` | HTLC parked by a hold invoice (one part; read `getHeldInvoiceSnapshot` for the committed set). |
+| `hold:accepted` | `(event: IHoldInvoiceStateEvent)` | A part joined a hold invoice's parked set, with the set's running total. A re-park on reestablish does not fire. Acceptance can be a partial MPP payment: compare `heldAmountMsat` with the full expected amount before committing funds. |
+| `hold:settled` | `(event: IHoldInvoiceStateEvent)` | A hold invoice's preimage was revealed and every parked part fulfilled. |
+| `hold:cancelled` | `(event: IHoldCancelledEvent)` | A hold invoice was cancelled by the CLTV sweeper (`expiry-scan`) or the API; every parked part was failed back. |
+| `payment:async-wake` | `(paymentHash: Buffer \| undefined)` | Receiver side: a wake message says a sender is waiting. Reconnect to the LSP so it can release the held HTLC. |
+| `payment:held-notice` | `(data: { lspNodeId: Buffer; notice: IHeldForwardNotice })` | Receiver side: the LSP reported forwards it holds for this node. With `autoReleaseHeldForwards` off, release them with `sendAsyncRelease`. |
+| `async-receive:granted` | `(grant: IReceiverGrant)` | Receiver side: an LSP granted this node an async receive registration. |
+| `htlc:held-forward` | `(data: { holdId: Buffer; paymentHash: Buffer; amountMsat: bigint; cutoffHeight: number })` | LSP side: a forward to an offline receiver was parked until the receiver releases it or `cutoffHeight` passes. |
+| `htlc:held-forward-released` | `(record: IHeldForwardRecord)` | LSP side: a parked forward was released to the receiver. |
+| `htlc:held-forward-failed` | `(record: IHeldForwardRecord)` | LSP side: a parked forward was failed back upstream. |
+| `channel:opening` | `(data: { channelId: Buffer; fundingTxid: Buffer })` | Funding flow started. |
+| `channel:ready` | `(data: { channelId: Buffer })` | Channel reached NORMAL state. |
+| `channel:txsigs-needed` | `(data: { channelId: Buffer; fundingTxid: Buffer; fundingOutputIndex: number; inputIndices: number[]; externalInputIndices?: number[] })` | A caller-driven v2 open owes its tx_signatures and only the embedder holds the witnesses: answer with `sendTxSignatures`. `externalInputIndices` names the inputs a third party owes, answered with `provideV2ExternalWitness`. |
+| `channel:splice-txsigs-needed` | `(data: { channelId: Buffer; spliceTxid: Buffer; newFundingOutputIndex: number; externalInputIndices: number[] })` | A splice is withholding its tx_signatures on external inputs whose witnesses a third party owes: collect them and answer with `provideSpliceExternalWitness`. Re-armed per connection cycle. |
+| `channel:pending-close` | `(data: { channelId: Buffer; initiator: 'local' \| 'remote' })` | A cooperative close started. |
+| `channel:force-closing` | `(data: { channelId: Buffer; initiator: 'local' \| 'remote' })` | A force close started: this node broadcast its commitment (`local`) or the peer's appeared on chain (`remote`). |
+| `channel:closed` | `(data: { channelId: Buffer })` | Channel closed. |
+| `channel:resolved` | `(data: { channelId: Buffer })` | All on-chain outputs of the close resolved. |
+| `channel:aborted` | `(temporaryChannelId: Buffer, reason: string)` | A negotiated but unfunded open was torn down. |
+| `channel:voided` | `(data: { channelId: Buffer })` | Unfunded or abandoned channel discarded. |
+| `announcement:ready` | `(channelId: Buffer)` | Channel eligible for announcement. |
+| `splice:complete` | `(data: { channelId: Buffer; fundingTxid: Buffer \| null \| undefined })` | splice_locked exchanged both ways: the channel runs on the new funding. |
+| `splice:aborted` | `(data: { channelId: Buffer; reason: string })` | A splice negotiation was unwound by tx_abort before its point of no return. |
+| `splice:conflicted` | `(data: { channelId: Buffer; spliceTxid: string; conflictTxid: string; inputIndex: number; height: number })` | An input of an in-flight splice that this node does not vouch for (a depth-locked splice carrying a stranger's coin, issue #760) was spent by another transaction, confirmed six deep while the splice is not on chain: the splice can never confirm. The node records it durably, raises `node:error` code `SPLICE_INPUT_CONFLICT`, and asks the peer to verify and revert; the request is re-sent every block and on reconnect until agreed. |
+| `splice:reverted` | `(data: { channelId: Buffer; spliceTxid: string; conflictTxid: string })` | A conflicted splice was unwound by agreement: both sides verified the conflict on their own chain view and returned to the pre-splice funding, which both still hold valid commitments for. The channel is NORMAL on the old outpoint, its watch re-armed; a `spliceInAndWait` on that splice rejects, and a direct-funding request behind it is failed (`direct-funding:offer:failed`, "the payer spent the offered coin elsewhere"). |
+| `htlc:forward` | `(inChannelId: Buffer, outChannelId: Buffer, amountMsat: bigint, paymentHash: Buffer)` | An HTLC was relayed to the next hop. |
+| `htlc:forwarded` | `(data: { inChannelId: Buffer; outChannelId: Buffer; amountInMsat: bigint; amountOutMsat: bigint; feeMsat: bigint })` | A forwarded HTLC settled: the fee was earned. |
+| `htlc:forward-failed` | `(data: { inChannelId: Buffer; outChannelId: Buffer })` | A forwarded HTLC failed downstream. |
+| `htlc:fulfilled` | `(data: { channelId: Buffer; htlcId: bigint })` | The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
+| `htlc:failed` | `(data: { channelId: Buffer; htlcId: bigint })` | The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
+| `broadcast:tx` | `(tx: Buffer)` | Transaction to broadcast on chain. |
+| `sweep:uneconomic` | `(channelId: Buffer, action: ISweepUneconomicChainAction)` | An on-chain claim was declined because it cannot pay its own fee (`reason: 'skipped'`), or a competing spend path opened while it stayed unclaimed (`reason: 'contested'`). Retries continue in both cases, until the outpoint is spent. |
+| `block:processed` | `(height: number)` | The per-block work for this height has run. |
+| `message:outbound` | `(peerPubkey: string, type: number, payload: Buffer)` | Message to send to a peer (event-transport mode). |
+| `peer:connect` | `(pubkey: string)` | Peer connected (networking mode). |
+| `peer:disconnect` | `(pubkey: string)` | Peer disconnected (networking mode). |
+| `peer:disconnect-requested` | `(pubkey: string)` | The node needs this peer's connection severed but holds no socket for it (event-transport mode, or an unconnected peer): the host must close its transport. The protocol side (channels marked for reestablish) is already applied; reconnect and reestablish as usual. |
+| `peer:error` | `(pubkey: string, error: Error)` | Peer error (networking mode). |
+| `custom-message` | `(message: { peerPubkey: string; version: number; subtype: number; payload: Buffer })` | A beignet custom message (type 44069) arrived from a peer. |
+| `peer_storage:retrieved` | `(peerPubkey: string, blob: Buffer)` | A peer returned the blob it stores for this node (BOLT 1 peer storage), unpadded. |
+| `onion:received` | `(payload: IOnionMessagePayload)` | Onion message received (type 513). |
+| `offer:created` | `(offer: IOffer)` | BOLT 12 offer created. |
+| `bolt12:invoice:received` | `(invoice: IBolt12Invoice)` | BOLT 12 invoice received. |
+| `bolt12:invoice:issued` | `(invoice: IBolt12Invoice)` | BOLT 12 invoice issued to a payer. |
+| `recovery:durable` | `(through: bigint)` | The recovery journal is durable through this frame sequence. |
+| `recovery:fenced` | `(supersededBy: GuardianState \| null \| undefined)` | A newer writer epoch owns this recovery namespace: this device must not send another channel message. Carries the superseding writer's guardian state when the barrier saw one, null or undefined otherwise (as after the node rotated away from its guardian set). |
+| `recovery:backfill-lost` | `(detail: string)` | The journal was compacted past frames a guardian had not yet received, so that guardian cannot be backfilled. |
+| `recovery:reestablish-held` | `(peerPubkey: string, channelIdHex: string, expiresAt: number)` | A peer's channel_reestablish for a channel this node has no record of was parked instead of failed, because the node may still be an incomplete restore target (issue #462). Apply a Recovery Capsule before `expiresAt` or the peer force-closes. |
+| `graph:restored` | `(stats: IGraphRestoreStats)` | A deferred restore of the stored network map (`deferGraphRestore`) ended; the same figures `getGraphRestoreStats()` returns. |
+| `ffor:state` | `(data: { channelId: Buffer; state: FforState; record: IFforEpochRecord })` | An FFOR epoch's committed state changed. |
+| `ffor:enforce` | `(data: { channelId: Buffer; record: IFforEpochRecord })` | A peer contradicted an ACTIVE FFOR epoch: enforce it on chain (`fforEnforce`). |
+| `ffor:settled` | `(data: { channelId: Buffer; k: number; paymentHash: Buffer; upstreamChannelId: Buffer; upstreamHtlcId: bigint })` | Settlement peer side: a delegated slot settled upstream. |
+| `ffor:delegated-failed` | `(data: { channelId: Buffer; k: number; paymentHash: Buffer; upstreamChannelId: Buffer; upstreamHtlcId: bigint; reason: string })` | Settlement peer side: a delegated slot's payment was failed back upstream. |
+| `ffor:slot-resolved` | `(data: { channelId: string; epochId: string; k: number; paymentHash: string; amountMsat: string; outcome: 'fulfilled' \| 'cancelled' })` | A concurrent-profile slot reached its terminal outcome. JSON-safe: hex and decimal strings. |
+| `ffor:witness-audit` | `(data: { channelId: Buffer; witnessNodeId: Buffer; k: number; reason: string \| undefined })` | A witness record fetched for a slot failed verification. |
+| `direct-funding:offer:accepted` | `(data: { offerId: string; paired: boolean; resumed?: boolean })` | A payer's offer was accepted. `paired` says whether it came from a peer in the trusted set, which decides zero-conf and the splice path; `resumed` marks one picked up again after a restart. |
+| `direct-funding:offer:declined` | `(data: { offerId: string; reason: string })` | A payer's offer was declined with the reason. |
+| `direct-funding:offer:failed` | `(data: { offerId: string; reason: string })` | An accepted offer failed with the reason. |
+| `direct-funding:offer:completed` | `(data: { offerId: string })` | An offer completed with the funding out. |
+| `swap:created` | `(event: ISwapEvent)` | A swap row was created: for a reverse swap with its hold invoice minted, for a submarine swap once its terms verified. |
+| `swap:held` | `(event: ISwapEvent)` | Reverse swap: the complete committed payment set is held by the hold invoice; a partial MPP set never funds. |
+| `swap:funding` | `(event: ISwapEvent)` | Reverse swap: the funding transaction was built, verified and recorded, and is being broadcast (`fundingTxid`, `fundingVout`). |
+| `swap:funded` | `(event: ISwapEvent)` | The swap's funding confirmed to the configured depth (`fundingHeight` on a reverse swap). |
+| `swap:claimed` | `(event: ISwapEvent)` | Reverse swap: a claim spend with a verified preimage was seen at any depth (`claimTxid`); the preimage is recorded before the hold settles. |
+| `swap:settled` | `(event: ISwapEvent)` | Reverse swap: the hold was released with the claimed preimage. |
+| `swap:refund-broadcast` | `(event: ISwapEvent)` | Reverse swap: no claim by the refund height, so a refund to the node's sweep destination was broadcast. |
+| `swap:refunded` | `(event: ISwapEvent)` | Reverse swap: the refund confirmed, and only then the hold is cancelled. |
+| `swap:hold-cancelled` | `(event: ISwapEvent)` | Reverse swap: the hold invoice was cancelled. |
+| `swap:exposed` | `(event: ISwapEvent)` | Funds are at risk (`reason`, `previousState`): on a reverse swap the hold was cancelled while coins were or may be on chain; on a submarine swap a payment is out while the contract is not claimable. |
+| `swap:failed` | `(event: ISwapEvent)` | The swap failed (`reason`). |
+| `swap:funding-seen` | `(event: ISwapEvent)` | Submarine swap: an output paying the contract, of at least the amount, was seen at any depth. |
+| `swap:funding-lost` | `(event: ISwapEvent)` | Submarine swap: the unconfirmed funding was replaced or vanished and none is left. |
+| `swap:paying` | `(event: ISwapEvent)` | Submarine swap: this node started paying the client's invoice under the swap's expiry ceiling. |
+| `swap:payment-unresolved` | `(event: ISwapEvent)` | Submarine swap: HTLCs are still out past `unresolvedAfterBlocks` (informational). |
+| `swap:preimage` | `(event: ISwapEvent)` | Submarine swap: the payment's preimage is known, from a fulfil or a claim seen on chain downstream. |
+| `swap:claim-broadcast` | `(event: ISwapEvent)` | Submarine swap: the claim to the sweep destination was built, persisted and broadcast. |
+| `swap:claim-confirmed` | `(event: ISwapEvent)` | Submarine swap: the claim confirmed to the resolution depth. |
+| `swap:payment-failed` | `(event: ISwapEvent)` | Submarine swap: every HTLC ended without a preimage; a preimage learned later still promotes the row. |
+| `swap:cancelled` | `(event: ISwapEvent)` | Submarine swap: cancelled before anything was paid (invoice expired, ceiling no longer fits, client spent the funding, or the operator cancelled). |
+| `log` | `(entry: IStructuredLog)` | Structured action log entry. |
+| `node:error` | `(error: ILightningError<NodeErrorCode>)` | Operational error (non-fatal). LightningNode never emits the bare `'error'` event. |
+| `node:ready` | `()` | Node fully operational (peers reconnected, channels restored). |
+| `jit:intent` | `(intent: IJitIntent)` | A wallet's request was accepted, keyed by the intercept scid this LSP minted for it. |
+| `jit:intent-superseded` | `(data: { scidHex: string; walletPubkeyHex: string })` | An idle intent was replaced by a newer one from the same wallet. |
+| `jit:intercepted` | `(data: { scidHex?: string; channelIdHex?: string; amountMsat: bigint })` | A payment part was held for an intent, or on the splice path for an existing channel. |
+| `jit:funding` | `(data: { scidHex?: string; channelIdHex?: string; fundingSats: bigint })` | The zero-conf open or the splice that funds the held parts started. |
+| `jit:forwarded` | `(data: { scidHex?: string; channelIdHex?: string; parts: number })` | The held parts were delivered over the new liquidity. |
+| `jit:failed` | `(data: { scidHex?: string; channelIdHex?: string; parts?: number; reason: string })` | The held parts were failed back upstream with the reason. |
+| `jit:restored-failed` | `(data: { remaining: number })` | Holds restored from storage were failed back; `remaining` are still owed a failure and retried every block. |
+| `ffor:witness-provisioned` | `(data: { mailboxId: Buffer; slots: number; retentionUntil: number; peer: string })` | Witness role: a receiver provisioned a mailbox on this node. |
+| `ffor:witness-refused` | `(data: { peer: string; reason: string })` | Witness role: a provision was refused with the reason. |
+| `ffor:witness-recorded` | `(data: { mailboxId: Buffer; k: number; outKey: string; unbarriered: boolean })` | Witness role: a delegated preimage's record was stored; `unbarriered` when the fulfil had already gone out at the deadline. |
+| `ffor:witness-released` | `(data: { outKey: string; mailboxId: Buffer; k: number; reason: 'recorded' \| 'deadline' })` | Witness role: a held fulfil was propagated, once recorded or at its CLTV deadline. |
+| `ffor:witness-closed` | `(data: { mailboxId: Buffer; held: number })` | Witness role: the receiver closed its mailbox; `held` records remain. |
+| `ffor:witness-expired` | `(data: { mailboxId: Buffer })` | Witness role: a mailbox passed its retention and expired. |
+| `ffor:issuer-provisioned` | `(data: { mailboxId: Buffer; offerId: Buffer; slots: number })` | Issuer role: a receiver delegated an offer and provisioned its slots. |
+| `ffor:issuer-issued` | `(data: { mailboxId: Buffer; k: number; payerId: Buffer })` | Issuer role: an invoice was issued against slot `k` to a payer. |
+| `ffor:issuer-retired` | `(data: { mailboxId: Buffer; reason: string })` | Issuer role: a delegated offer stopped issuing, with the reason. |
+<!-- events:LightningNodeEvents:end -->
 
 ### Beignet custom messages (type 44069)
 
 Beignet-to-beignet extensions ride one odd BOLT 1 message type, `44069`, as `[u16 version][u16 subtype][payload]`; other implementations ignore it (`message/custom.ts`, `BeignetCustomSubtype`). Reserved subtypes: 1 to 5 JIT receive, 16 to 22 direct funding, 32 to 33 recovery guardian sessions, 48 to 55 the swap provider (`swaps/README.md`), and 64 to 65 splice conflict recovery (issue #760): `SPLICE_CONFLICT` (64) `[32 channel_id][32 splice_txid][32 conflict_txid][u16 input_index]` asks the peer to verify on its own chain that the named splice input was spent elsewhere at depth and to revert to the pre-splice funding; `SPLICE_CONFLICT_ACK` (65) `[32 channel_id][32 splice_txid][u8 agreed][u16 reason_len][reason]` reports the outcome. Txids are in `tx.getHash()` byte order. A receiver never reverts on the peer's word: it fetches the spender, checks it takes an input other than the shared funding input, reads the depth from the outpoint's own history, and refuses (`agreed=0`, with a reason) on any shortfall; the requester re-asks on every block and on reconnect (`message/splice-conflict.ts`).
 
-Channel-scoped events carry an **object**, not a bare id: `node.on('channel:ready', ({ channelId }) => ...)`, where `channelId` is a 32-byte Buffer. `announcement:ready` is the exception and passes the Buffer directly. `BeignetNode` normalizes all of these to hex strings.
+Channel-scoped events carry an **object**, not a bare id: `node.on('channel:ready', ({ channelId }) => ...)`, where `channelId` is a 32-byte Buffer. `announcement:ready`, `channel:aborted` and `sweep:uneconomic` are the exceptions and pass the Buffer as their first argument. `BeignetNode` normalizes all of these to hex strings.
 
-`LightningNode` reports operational problems through `node:error` and never emits the bare `'error'` event. Splice conflict recovery (issue #760) adds the code `SPLICE_INPUT_CONFLICT`, raised once per conflicted splice alongside `splice:conflicted`. `ChannelManager` does emit `'error'` as `(channelId: Buffer | null, error: string)`, so code that drives a `ChannelManager` directly (most unit tests) should attach a listener, even a noop, to avoid unhandled-error throws.
+`LightningNode` reports operational problems through `node:error` and never emits the bare `'error'` event, so `node.on('error', ...)` does not compile. The error's `code` is a `NodeErrorCode`, a closed union of every code the node raises, so a `switch` over it can be exhaustive. Splice conflict recovery (issue #760) adds the code `SPLICE_INPUT_CONFLICT`, raised once per conflicted splice alongside `splice:conflicted`. `ChannelManager` does emit `'error'` as `(channelId: Buffer | null, error: string)`, so code that drives a `ChannelManager` directly (most unit tests) should attach a listener, even a noop, to avoid unhandled-error throws.
 
 ## Typed Payment Errors
 

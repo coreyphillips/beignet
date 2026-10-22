@@ -259,9 +259,6 @@ describe('Interop chaos: Eclair v2 open crash-resume (regtest)', function () {
 		n.on('node:error', () => {
 			/* absorb */
 		});
-		n.on('error', () => {
-			/* absorb */
-		});
 		// No chain watcher in this harness: relay broadcast:tx to bitcoind
 		// ourselves (the daemon's Electrum chain watcher does this in
 		// production). Duplicate submissions are fine; Eclair may broadcast

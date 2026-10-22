@@ -38,7 +38,7 @@
  *    over: delivering the witness is the only exit the channel left.
  */
 
-import { EventEmitter } from 'events';
+import { TypedEmitter } from '../../../utils/typed-emitter';
 import * as bitcoin from 'bitcoinjs-lib';
 import type { ISpliceWalletInput } from '../../channel/channel';
 import {
@@ -115,6 +115,7 @@ import {
 	DF_RECEIVER_SWEEP_INTERVAL_MS,
 	DF_WITNESS_TIMEOUT_MS,
 	DfOfferDropReason,
+	DirectFundingReceiverEvents,
 	IDfChannelHandle,
 	IDfExternalInput,
 	IDfPendingSpliceTx,
@@ -283,7 +284,7 @@ type ResolvedConfig = Required<
 		'minAmountSat' | 'maxAmountSat' | 'requiredSequence' | 'spliceFeeratePerKw'
 	>;
 
-export class DirectFundingReceiver extends EventEmitter {
+export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEvents> {
 	private readonly state: DfOfferSessions;
 	private readonly cfg: ResolvedConfig;
 	private readonly v2Waiters = new Map<string, DfFinalTxWaiter>();

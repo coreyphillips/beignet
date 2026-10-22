@@ -333,7 +333,6 @@ function makeNodeConfig(seedId: number, storage?: IStorageBackend) {
 
 function createTestNode(storage?: IStorageBackend): LightningNode {
 	const node = new LightningNode(makeNodeConfig(1, storage));
-	node.on('error', () => {});
 	return node;
 }
 
@@ -342,7 +341,6 @@ function createTestNodeWithId(
 	storage?: IStorageBackend
 ): LightningNode {
 	const node = new LightningNode(makeNodeConfig(seedId, storage));
-	node.on('error', () => {});
 	return node;
 }
 
@@ -1029,9 +1027,7 @@ describe('Crash-Safe State Persistence', function () {
 
 			const alice = createTestNodeWithId(1, storage);
 			const bob = createTestNodeWithId(2, storage);
-			alice.on('error', () => {});
 			alice.on('node:error', () => {});
-			bob.on('error', () => {});
 			bob.on('node:error', () => {});
 
 			connectNodes(alice, bob);

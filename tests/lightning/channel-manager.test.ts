@@ -170,7 +170,7 @@ describe('Channel Manager', function () {
 			connectManagers(alice, alicePubkey, bobRegtest, bobPubkey);
 
 			const errors: string[] = [];
-			bobRegtest.on('error', (_id: Buffer, message: string) =>
+			bobRegtest.on('error', (_id: Buffer | null, message: string) =>
 				errors.push(message)
 			);
 

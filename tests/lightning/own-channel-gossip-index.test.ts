@@ -70,7 +70,6 @@ function makeNode(
 		network: Network.REGTEST,
 		enableNetworking
 	});
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

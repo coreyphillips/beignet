@@ -36,6 +36,7 @@
     "tsc:check:tests": "tsc -p tsconfig.test.json --noEmit",
     "build": "tsc",
     "prepublishOnly": "npm run build",
+    "docs:events": "ts-node scripts/event-docs.ts",
     "docs:markdown": "npx typedoc --plugin typedoc-plugin-markdown --out docs/markdown src/index.ts",
     "docs:html": "npx typedoc --out docs/html",
     "docs": "npm run build && npm run docs:markdown && npm run docs:html"

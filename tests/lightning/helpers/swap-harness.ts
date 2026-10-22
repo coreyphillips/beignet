@@ -471,7 +471,7 @@ export async function harness(
 		'swap:hold-cancelled',
 		'swap:exposed',
 		'swap:failed'
-	]) {
+	] as const) {
 		engine.on(evt, (data) => events.push({ name: evt, data }));
 	}
 	if (options.start !== false) await engine.start();

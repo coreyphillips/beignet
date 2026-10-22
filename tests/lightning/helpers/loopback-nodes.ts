@@ -98,7 +98,6 @@ export function createNode(
 		...makeNodeConfig(tag, seedId, storage),
 		...extra
 	});
-	node.on('error', () => {});
 	return node;
 }
 

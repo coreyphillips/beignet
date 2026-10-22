@@ -619,7 +619,6 @@ describe('ISigner injection via signerFactory', function () {
 			}
 		};
 		const node = new LightningNode(config);
-		node.on('error', () => {});
 
 		const channel = node.openChannel('02' + '66'.repeat(32), 100_000n);
 		expect(injected).to.have.length(1);

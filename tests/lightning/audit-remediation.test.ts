@@ -88,7 +88,6 @@ function makeNodeConfig(seedId: number): INodeConfig {
 
 function createNode(seedId: number): LightningNode {
 	const node = new LightningNode(makeNodeConfig(seedId));
-	node.on('error', () => {});
 	return node;
 }
 
@@ -627,7 +626,6 @@ describe('Audit MEDIUM-5: restore re-arms CPFP on estimator failure', function (
 			cfg.feeEstimator = feeEstimator;
 
 			const node = new LightningNode(cfg);
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 
 			// Let the estimateFee().catch microtask run.

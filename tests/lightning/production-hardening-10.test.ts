@@ -88,7 +88,6 @@ function makeNodeConfig(seedId: number): INodeConfig {
 function createTestNode(seedId: number): LightningNode {
 	const config = makeNodeConfig(seedId);
 	const node = new LightningNode(config);
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }
@@ -466,7 +465,6 @@ describe('Production Hardening 10', () => {
 			const config = makeNodeConfig(220);
 			config.storage = storage;
 			const node = new LightningNode(config);
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 
 			// Block height should be restored
@@ -486,7 +484,6 @@ describe('Production Hardening 10', () => {
 			const config = makeNodeConfig(221);
 			config.storage = storage;
 			const node = new LightningNode(config);
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 
 			node.handleNewBlock(850000);

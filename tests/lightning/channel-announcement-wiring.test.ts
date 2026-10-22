@@ -86,7 +86,6 @@ function makeNodeConfig(seedId: number): INodeConfig {
 
 function createNode(seedId: number): LightningNode {
 	const node = new LightningNode(makeNodeConfig(seedId));
-	node.on('error', () => {});
 	return node;
 }
 

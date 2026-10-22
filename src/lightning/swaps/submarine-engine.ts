@@ -42,7 +42,7 @@
  * a status answer before the attempt marker is written.
  */
 
-import { EventEmitter } from 'events';
+import { TypedEmitter } from '../../utils/typed-emitter';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import { getPublicKey } from '../crypto/ecdh';
@@ -82,6 +82,7 @@ import {
 	validateSwapExposurePolicy
 } from './exposure';
 import {
+	ISwapEvent,
 	SWAP_DUST_FLOOR_SAT,
 	exposureRefusal,
 	htlcOfRecord,
@@ -314,6 +315,10 @@ export const SUBMARINE_SWAP_EVENTS: readonly SubmarineSwapEventName[] = [
 	'swap:failed'
 ];
 
+export type SubmarineSwapEvents = {
+	[K in SubmarineSwapEventName]: (event: ISwapEvent) => void;
+};
+
 /** Rows a cancel may still end: nothing has been paid. */
 const CANCELLABLE_STATES: readonly SwapState[] = [
 	'CREATED',
@@ -357,7 +362,7 @@ interface IInvoiceFacts {
 	expiresAt: number;
 }
 
-export class SubmarineSwapProvider extends EventEmitter {
+export class SubmarineSwapProvider extends TypedEmitter<SubmarineSwapEvents> {
 	readonly config: ISubmarineSwapProviderConfig;
 	private readonly unsubscribe: Array<() => void> = [];
 	private readonly requestBudget: PeerRateLimiter;

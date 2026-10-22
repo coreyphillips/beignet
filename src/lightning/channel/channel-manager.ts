@@ -6,7 +6,8 @@
  * Channel state machine to the actual transport layer.
  */
 
-import { EventEmitter } from 'events';
+import { TypedEmitter } from '../../utils/typed-emitter';
+import { ChannelManagerEvents } from './events';
 import crypto from 'crypto';
 import { MessageType } from '../message/types';
 import {
@@ -484,45 +485,6 @@ export interface IChannelManagerConfig {
 }
 
 /**
- * Manages multiple channels, dispatching messages between PeerManager
- * and Channel instances.
- *
- * Events:
- * - 'channel:opened' (channelId: Buffer)
- * - 'channel:opening' (channelId: Buffer, fundingTxid: Buffer)
- * - 'channel:ready' (channelId: Buffer)
- * - 'channel:restore-ready' (channelId: Buffer) — a channel RESTORED FROM
- *   PERSISTENCE this process has completed reestablishment; fires at most
- *   once per channel and never for a channel that stayed live
- * - 'channel:reestablished' (channelId: Buffer) — a channel completed
- *   reestablishment back to NORMAL; fires on EVERY reconnect, so listeners
- *   must gate on durable facts, never on in-memory state having been lost
- * - 'channel:scid-assigned' (channelId: Buffer, shortChannelId: Buffer)
- * - 'channel:pending-close' (channelId: Buffer, initiator: 'local' | 'remote')
- * - 'channel:force-closing' (channelId: Buffer, initiator: 'local' | 'remote')
- * - 'channel:closed' (channelId: Buffer)
- * - 'htlc:forwarded' (channelId: Buffer, htlcId: bigint, amountMsat: bigint, paymentHash: Buffer)
- * - 'htlc:fulfilled' (channelId: Buffer, htlcId: bigint, preimage: Buffer)
- * - 'htlc:failed' (channelId: Buffer, htlcId: bigint, reason: Buffer,
- *   malformedCode?: number): malformedCode is set only for
- *   update_fail_malformed_htlc
- * - 'htlc:claimed-onchain' (channelId: Buffer, paymentHash: Buffer, preimage: Buffer,
- *   claimTxid: string): a confirmed spend of a received HTLC output revealed
- *   its preimage; repeats when the spend is re-reported
- * - 'quiescence:ended' (channelIdHex: string) — the channel left quiescence;
- *   parked HTLC dispositions may resume
- * - 'quiescence:timeout' (channelIdHex: string, peerPubkey: string) — BOLT 2's
- *   60-second quiescence window elapsed with HTLCs pending; the peer must be
- *   disconnected
- * - 'reestablish:held' (peerPubkey: string, channelId: Buffer, expiresAt: number):
- *   a peer's channel_reestablish for a channel we have no record of was parked
- *   rather than failed, because this node may still be an incomplete restore
- *   target (issue #462); the operator has until expiresAt to install the state
- *   that answers it
- * - 'error' (channelId: Buffer | null, message: string)
- */
-
-/**
  * Blocks to wait between re-CPFP attempts on a stuck anchor force-close commitment
  * package (matches the ChainMonitor sweep rebroadcast cadence).
  */
@@ -692,7 +654,12 @@ class CountedMap<K, V> extends Map<K, V> {
 	}
 }
 
-export class ChannelManager extends EventEmitter {
+/**
+ * Manages multiple channels, dispatching messages between PeerManager
+ * and Channel instances. Its events and their listener signatures are
+ * ChannelManagerEvents (./events.ts).
+ */
+export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private config: IChannelManagerConfig;
 	private channels: CountedMap<string, Channel> = new CountedMap();
 	private tempChannels: CountedMap<string, Channel> = new CountedMap();
@@ -2503,7 +2470,7 @@ export class ChannelManager extends EventEmitter {
 				this.txSignaturesDropped.delete(channelIdHex);
 				this.emit(
 					'channel:abandoned',
-					channel.getChannelId(),
+					channel.getChannelId()!,
 					'dead unfunded v2 open removed on disconnect'
 				);
 				this.releaseAbandonedV2Pledges(channel);
@@ -10010,7 +9977,7 @@ export class ChannelManager extends EventEmitter {
 					try {
 						this.emit(
 							'htlc:forwarded',
-							channel.getChannelId(),
+							channel.getChannelId()!,
 							action.htlcId,
 							action.amountMsat,
 							action.paymentHash
@@ -10028,7 +9995,7 @@ export class ChannelManager extends EventEmitter {
 				case ChannelActionType.HTLC_FULFILLED:
 					this.emit(
 						'htlc:fulfilled',
-						channel.getChannelId(),
+						channel.getChannelId()!,
 						action.htlcId,
 						action.paymentPreimage
 					);
@@ -10036,7 +10003,7 @@ export class ChannelManager extends EventEmitter {
 				case ChannelActionType.HTLC_FAILED:
 					this.emit(
 						'htlc:failed',
-						channel.getChannelId(),
+						channel.getChannelId()!,
 						action.htlcId,
 						action.reason,
 						action.malformedCode
@@ -10222,7 +10189,7 @@ export class ChannelManager extends EventEmitter {
 					}
 					break;
 				case ChannelActionType.SPLICE_COMPLETE:
-					this.emit('splice:complete', channel.getChannelId());
+					this.emit('splice:complete', channel.getChannelId()!);
 					break;
 				case ChannelActionType.SPLICE_ABORTED:
 					// The channel's newly-aborted signal (issue #581): the ONE
@@ -10874,7 +10841,10 @@ export class ChannelManager extends EventEmitter {
 	 * emit, for the terminal teardown paths, where a throwing listener must
 	 * not propagate. Everything these announce has already happened.
 	 */
-	private emitContained(event: string, ...args: unknown[]): void {
+	private emitContained<K extends keyof ChannelManagerEvents & string>(
+		event: K,
+		...args: Parameters<ChannelManagerEvents[K]>
+	): void {
 		try {
 			this.emit(event, ...args);
 		} catch {

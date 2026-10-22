@@ -570,7 +570,6 @@ describe('Phase 6: Mission Control + Enhanced Payment Retry', () => {
 			const node = new LightningNode(
 				makeNodeConfig(300, { maxPaymentRetries: 5 })
 			);
-			node.on('error', () => {}); // absorb errors
 			expect(node).to.be.instanceOf(LightningNode);
 			node.destroy();
 		});
@@ -581,7 +580,6 @@ describe('Phase 6: Mission Control + Enhanced Payment Retry', () => {
 			// is set internally). The actual value is a private field, so we verify
 			// the node is functional.
 			const node = new LightningNode(makeNodeConfig(301));
-			node.on('error', () => {}); // absorb errors
 			const info = node.getNodeInfo();
 			expect(info).to.not.be.null;
 			expect(info.nodeId).to.be.a('string');

@@ -400,7 +400,6 @@ describe('Trusted channel payments (LightningNode level)', function () {
 		const alice = new LightningNode(makeNodeConfig(1));
 		const bob = new LightningNode(makeNodeConfig(2));
 		for (const n of [alice, bob]) {
-			n.on('error', () => {});
 			n.on('node:error', () => {});
 		}
 		alice.on('message:outbound', (pk: string, t: number, p: Buffer) => {
@@ -440,7 +439,6 @@ describe('Trusted channel payments (LightningNode level)', function () {
 		const alice = new LightningNode(makeNodeConfig(1));
 		const bob = new LightningNode(makeNodeConfig(2));
 		for (const n of [alice, bob]) {
-			n.on('error', () => {});
 			n.on('node:error', () => {});
 		}
 		alice.on('message:outbound', (pk: string, t: number, p: Buffer) => {
@@ -468,7 +466,6 @@ describe('Trusted channel payments (LightningNode level)', function () {
 		// An untrusted peer now throws (the routed path validates trust up
 		// front) instead of the old emit-error-and-return-null behavior.
 		const carol = new LightningNode(makeNodeConfig(3));
-		carol.on('error', () => {});
 		expect(() =>
 			carol.openZeroConfChannel(alice.getNodeId(), 1_000_000n)
 		).to.throw('not in the trusted set');
@@ -478,7 +475,6 @@ describe('Trusted channel payments (LightningNode level)', function () {
 		// The mixed-version case proper: our features are fine, the stored
 		// remote init (an older daemon) is missing option_zeroconf/scid_alias.
 		const alice = new LightningNode(makeNodeConfig(1));
-		alice.on('error', () => {});
 		const peer = getPublicKey(crypto.randomBytes(32)).toString('hex');
 		alice.addTrustedPeer(peer);
 
@@ -511,7 +507,6 @@ describe('Trusted channel payments (LightningNode level)', function () {
 			...makeNodeConfig(1),
 			localFeatures: bare
 		});
-		alice.on('error', () => {});
 		const peer = getPublicKey(crypto.randomBytes(32)).toString('hex');
 		alice.addTrustedPeer(peer);
 		expect(() =>

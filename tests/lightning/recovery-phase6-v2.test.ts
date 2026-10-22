@@ -443,7 +443,6 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 			})
 		);
 		node.on('node:error', () => {});
-		node.on('error', () => {});
 		return node;
 	}
 
@@ -2159,7 +2158,6 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 			}
 		});
 		node.on('node:error', () => {});
-		node.on('error', () => {});
 		const manager = managerOf(node);
 		const errors: string[] = [];
 		manager.on('error', (_id: Buffer | null, message: string) => {
@@ -2224,7 +2222,6 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 			preferTaproot: true
 		});
 		node.on('node:error', () => {});
-		node.on('error', () => {});
 		const manager = managerOf(node);
 		const errors: string[] = [];
 		manager.on('error', (_id: Buffer | null, message: string) => {

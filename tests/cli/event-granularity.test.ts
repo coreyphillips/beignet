@@ -51,7 +51,11 @@ const HTLC_EVENTS = ['htlc:forwarded', 'htlc:fulfilled', 'htlc:failed'];
  * ACCEPTED edge is what a swap provider commits its own money on, so these are
  * never behind the htlcEvents gate that per-forward volume earned.
  */
-const HOLD_EVENTS = ['hold:accepted', 'hold:settled', 'hold:cancelled'];
+const HOLD_EVENTS = [
+	'hold:accepted',
+	'hold:settled',
+	'hold:cancelled'
+] as const;
 /** Recovery events LightningNode emits and BeignetNode relays JSON-safe. */
 const RECOVERY_NODE_EVENTS = [
 	'recovery:durable',
@@ -81,7 +85,7 @@ const FFOR_ROLE_EVENTS = [
 	'ffor:witness-expired',
 	'ffor:witness-audit',
 	'ffor:issuer-retired'
-];
+] as const;
 const BASE_EVENTS = [
 	'payment:received',
 	'payment:sent',

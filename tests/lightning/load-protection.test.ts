@@ -148,7 +148,6 @@ describe('Load Protection — Phase 7', () => {
 		it('should create LightningNode with maxTotalInFlightHtlcs config', () => {
 			const config = makeNodeConfig(300, { maxTotalInFlightHtlcs: 500 });
 			const node = new LightningNode(config);
-			node.on('error', () => {});
 			expect(node).to.be.instanceOf(LightningNode);
 			node.destroy();
 		});
@@ -158,7 +157,6 @@ describe('Load Protection — Phase 7', () => {
 				rateLimitConfig: { maxHtlcsPerSecond: 10, burstMultiplier: 3 }
 			});
 			const node = new LightningNode(config);
-			node.on('error', () => {});
 			expect(node).to.be.instanceOf(LightningNode);
 			node.destroy();
 		});
@@ -166,7 +164,6 @@ describe('Load Protection — Phase 7', () => {
 		it('should return 0 for getTotalInFlightHtlcCount on a fresh node', () => {
 			const config = makeNodeConfig(302);
 			const node = new LightningNode(config);
-			node.on('error', () => {});
 			expect(node.getTotalInFlightHtlcCount()).to.equal(0);
 			node.destroy();
 		});

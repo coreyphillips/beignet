@@ -110,7 +110,6 @@ function makeNode(
 		...extra
 	});
 	node.on('node:error', () => undefined);
-	node.on('error', () => undefined);
 	return node;
 }
 

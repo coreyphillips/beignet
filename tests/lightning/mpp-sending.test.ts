@@ -110,7 +110,6 @@ function makeNodeConfig(seedId: number): INodeConfig {
 
 function createNode(seedId: number): LightningNode {
 	const node = new LightningNode(makeNodeConfig(seedId));
-	node.on('error', () => {});
 	return node;
 }
 
@@ -701,12 +700,10 @@ describe('MPP Sending (Phase 5)', function () {
 				...makeNodeConfig(64),
 				htlcBasepointSecret: htlcSecretFor(64)
 			});
-			alice.on('error', () => {});
 			const bob = new LightningNode({
 				...makeNodeConfig(65),
 				htlcBasepointSecret: htlcSecretFor(65)
 			});
-			bob.on('error', () => {});
 			connectNodes(alice, bob);
 
 			// Two real channels; the amount below fits neither alone, so the
@@ -799,12 +796,10 @@ describe('MPP Sending (Phase 5)', function () {
 				...makeNodeConfig(68),
 				htlcBasepointSecret: htlcSecretFor(68)
 			});
-			alice.on('error', () => {});
 			const bob = new LightningNode({
 				...makeNodeConfig(69),
 				htlcBasepointSecret: htlcSecretFor(69)
 			});
-			bob.on('error', () => {});
 			connectNodes(alice, bob);
 
 			openReadyChannel(alice, bob, 200_000n);
@@ -848,12 +843,10 @@ describe('MPP Sending (Phase 5)', function () {
 				...makeNodeConfig(78),
 				htlcBasepointSecret: htlcSecretFor(78)
 			});
-			alice.on('error', () => {});
 			const bob = new LightningNode({
 				...makeNodeConfig(79),
 				htlcBasepointSecret: htlcSecretFor(79)
 			});
-			bob.on('error', () => {});
 			connectNodes(alice, bob);
 
 			openReadyChannel(alice, bob, 200_000n);
@@ -903,13 +896,11 @@ describe('MPP Sending (Phase 5)', function () {
 				...makeNodeConfig(88),
 				htlcBasepointSecret: htlcSecretFor(88)
 			});
-			alice.on('error', () => {});
 			const bob = new LightningNode({
 				...makeNodeConfig(89),
 				htlcBasepointSecret: htlcSecretFor(89),
 				storage
 			});
-			bob.on('error', () => {});
 			connectNodes(alice, bob);
 
 			openReadyChannel(alice, bob, 200_000n);
@@ -1250,12 +1241,10 @@ describe('MPP Sending (Phase 5)', function () {
 				...makeNodeConfig(72),
 				htlcBasepointSecret: htlcSecretFor(72)
 			});
-			alice.on('error', () => {});
 			const bob = new LightningNode({
 				...makeNodeConfig(73),
 				htlcBasepointSecret: htlcSecretFor(73)
 			});
-			bob.on('error', () => {});
 			connectNodes(alice, bob);
 
 			const channelIds = [
@@ -1365,12 +1354,10 @@ describe('MPP Sending (Phase 5)', function () {
 				...makeNodeConfig(74),
 				htlcBasepointSecret: htlcSecretFor(74)
 			});
-			alice.on('error', () => {});
 			const bob = new LightningNode({
 				...makeNodeConfig(75),
 				htlcBasepointSecret: htlcSecretFor(75)
 			});
-			bob.on('error', () => {});
 			connectNodes(alice, bob);
 
 			const smallChannelId = openReadyChannel(alice, bob, 200_000n);
@@ -1479,12 +1466,10 @@ describe('MPP Sending (Phase 5)', function () {
 				...makeNodeConfig(76),
 				htlcBasepointSecret: htlcSecretFor(76)
 			});
-			alice.on('error', () => {});
 			const bob = new LightningNode({
 				...makeNodeConfig(77),
 				htlcBasepointSecret: htlcSecretFor(77)
 			});
-			bob.on('error', () => {});
 			connectNodes(alice, bob);
 
 			const channelA = openReadyChannel(alice, bob, 200_000n);

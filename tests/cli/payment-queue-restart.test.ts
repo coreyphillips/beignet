@@ -508,7 +508,12 @@ describe('BeignetNode.whenReadyToPay (issue #967)', function () {
 		} finally {
 			flags._restorePending = false;
 		}
-		node.emit('recovery:restored', {});
+		node.emit('recovery:restored', {
+			exact: true,
+			framesApplied: 0,
+			guardiansRepaired: 0,
+			epoch: '1'
+		});
 		await settle();
 		expect(runs).to.equal(1);
 		expect(node.listenerCount('recovery:restored')).to.equal(before);
@@ -780,7 +785,7 @@ describe('Restored queue entries wait for a channel that can carry an HTLC (issu
 		node
 			.getNode()
 			.getChannelManager()
-			.emit('channel:reestablished', channel.getChannelId());
+			.emit('channel:reestablished', channel.getChannelId()!);
 
 		expect((await queueEntryOnceFinal(node, 'q-1-no-amount')).status).to.equal(
 			'completed'
@@ -812,7 +817,7 @@ describe('Restored queue entries wait for a channel that can carry an HTLC (issu
 		node
 			.getNode()
 			.getChannelManager()
-			.emit('channel:reestablished', channel.getChannelId());
+			.emit('channel:reestablished', channel.getChannelId()!);
 
 		expect((await queueEntryOnceFinal(node, entry.id)).status).to.equal(
 			'completed'
@@ -899,7 +904,7 @@ describe('Restored queue entries wait for a channel that can carry an HTLC (issu
 
 		setState(channel, ChannelState.NORMAL);
 		node.getNode().emit('splice:complete', {
-			channelId: channel.getChannelId(),
+			channelId: channel.getChannelId()!,
 			fundingTxid: channel.getFullState().fundingTxid
 		});
 
@@ -981,7 +986,7 @@ describe('Restored queue entries wait for a channel that can carry an HTLC (issu
 
 		setState(channel, ChannelState.FORCE_CLOSED);
 		node.getNode().emit('channel:force-closing', {
-			channelId: channel.getChannelId(),
+			channelId: channel.getChannelId()!,
 			initiator: 'remote'
 		});
 		await settle(200);
@@ -1008,7 +1013,7 @@ describe('Restored queue entries wait for a channel that can carry an HTLC (issu
 			node
 				.getNode()
 				.getChannelManager()
-				.emit('channel:reestablished', channel.getChannelId());
+				.emit('channel:reestablished', channel.getChannelId()!);
 			await settle();
 			expect(usable).to.equal(0);
 		} finally {
@@ -1017,7 +1022,7 @@ describe('Restored queue entries wait for a channel that can carry an HTLC (issu
 		node
 			.getNode()
 			.getChannelManager()
-			.emit('channel:reestablished', channel.getChannelId());
+			.emit('channel:reestablished', channel.getChannelId()!);
 		await settle();
 		expect(usable).to.equal(1);
 	});

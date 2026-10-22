@@ -124,7 +124,6 @@ function makeNodeConfig(
 
 function createNode(seedId: number, storage?: IStorageBackend): LightningNode {
 	const node = new LightningNode(makeNodeConfig(seedId, storage));
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }
@@ -976,7 +975,6 @@ describe('Recovery phase 1: a failed transition strands nothing on disk', () => 
 		storage.open();
 		const guarded = failingStorage(storage, 'saveChannel');
 		const node = new LightningNode(makeNodeConfig(1, guarded));
-		node.on('error', () => {});
 		const errors: string[] = [];
 		node.on('node:error', (err: { code: string; message: string }) => {
 			if (err.code === 'PERSISTENCE_ERROR') errors.push(err.message);

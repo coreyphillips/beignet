@@ -291,7 +291,7 @@ describe('The daemon and BeignetNode run one payment queue (issue #978)', functi
 		node
 			.getNode()
 			.getChannelManager()
-			.emit('channel:reestablished', channel.getChannelId());
+			.emit('channel:reestablished', channel.getChannelId()!);
 
 		expect((await queueEntryOnceFinal(node, 'q-1-restored')).status).to.equal(
 			'completed'

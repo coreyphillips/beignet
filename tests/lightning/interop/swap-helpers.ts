@@ -189,7 +189,6 @@ export function makeSwapNode(
 		...extra
 	});
 	node.on('node:error', () => undefined);
-	node.on('error', () => undefined);
 	return node;
 }
 

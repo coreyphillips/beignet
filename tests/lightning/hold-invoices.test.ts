@@ -124,7 +124,6 @@ function makeNodeConfig(seedId: number, storage?: SqliteStorage): INodeConfig {
 
 function createNode(seedId: number, storage?: SqliteStorage): LightningNode {
 	const node = new LightningNode(makeNodeConfig(seedId, storage));
-	node.on('error', () => {});
 	return node;
 }
 
@@ -791,7 +790,11 @@ describe('Hold Invoices (M4 batch 1)', function () {
 		): Array<[string, IHoldInvoiceStateEvent | IHoldCancelledEvent]> {
 			const out: Array<[string, IHoldInvoiceStateEvent | IHoldCancelledEvent]> =
 				[];
-			for (const name of ['hold:accepted', 'hold:settled', 'hold:cancelled']) {
+			for (const name of [
+				'hold:accepted',
+				'hold:settled',
+				'hold:cancelled'
+			] as const) {
 				node.on(name, (e: IHoldInvoiceStateEvent | IHoldCancelledEvent) =>
 					out.push([name, e])
 				);

@@ -425,7 +425,6 @@ describe('Pending-close resolution', function () {
 				network: Network.REGTEST,
 				storage
 			});
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 
 			const { opener } = setupNormalChannels();
@@ -502,7 +501,6 @@ describe('Pending-close resolution', function () {
 				network: Network.REGTEST,
 				storage
 			});
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 
 			const restored = node.getChannelManager().getChannel(channelId);
@@ -567,7 +565,6 @@ describe('Pending-close resolution', function () {
 				network: Network.REGTEST,
 				storage
 			});
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 
 			expect(
@@ -912,7 +909,6 @@ describe('Pending-close resolution', function () {
 				chainBackend: opts.backend,
 				sweepDestinationScript: opts.sweepDestinationScript
 			});
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 			return { node, fundingPubkey: keys.basepoints.fundingPubkey };
 		}
@@ -1043,7 +1039,6 @@ describe('Pending-close resolution', function () {
 				chainBackend: backend,
 				sweepDestinationScript: fallbackScript
 			});
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 			expect(await node.recoverFallbackFunds({ feeRatePerVbyte: 5 })).to.be
 				.null;

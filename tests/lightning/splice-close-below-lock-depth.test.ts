@@ -378,7 +378,6 @@ describe('Issue #764: a splice on chain below its lock depth', function () {
 			const alice = new LightningNode(configA);
 			const bob = new LightningNode(makeNodeConfig(seedBase + 1));
 			for (const node of [alice, bob]) {
-				node.on('error', () => {});
 				node.on('node:error', () => {});
 			}
 			alice.on('message:outbound', (pubkey, type, payload) => {
@@ -844,7 +843,6 @@ describe('Issue #764: a splice on chain below its lock depth', function () {
 				// eslint-disable-next-line @typescript-eslint/no-explicit-any
 				(ChainMonitor as any).restore = restore;
 			}
-			alice2.on('error', () => {});
 			alice2.on('node:error', () => {});
 
 			expect(seenByRestore.length, 'one monitor restored').to.equal(1);

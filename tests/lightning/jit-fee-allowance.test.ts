@@ -73,7 +73,6 @@ function makeNode(label: string, storage?: SqliteStorage): LightningNode {
 			.digest(),
 		network: Network.REGTEST
 	});
-	node.on('error', () => undefined);
 	node.on('node:error', () => undefined);
 	return node;
 }

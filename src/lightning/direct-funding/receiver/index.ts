@@ -32,6 +32,7 @@ export {
 	DfOfferDropReason
 } from './types';
 export type {
+	DirectFundingReceiverEvents,
 	IDfChainSource,
 	IDfChannelHandle,
 	IDfExternalInput,

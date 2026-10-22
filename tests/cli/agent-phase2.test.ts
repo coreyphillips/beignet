@@ -94,7 +94,6 @@ describe('LightningNode Event Forwarding', () => {
 
 	beforeEach(() => {
 		node = new LightningNode(makeNodeConfig(10));
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 	});
 
@@ -187,7 +186,6 @@ describe('Payment Metadata', () => {
 
 	beforeEach(() => {
 		node = new LightningNode(makeNodeConfig(20));
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 	});
 
@@ -281,7 +279,6 @@ describe('Route Fee Estimation', () => {
 
 	beforeEach(() => {
 		node = new LightningNode(makeNodeConfig(30));
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 	});
 
@@ -314,7 +311,6 @@ describe('Payment Filtering & Pagination', () => {
 
 	beforeEach(() => {
 		node = new LightningNode(makeNodeConfig(40));
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 
 		// Populate payments
@@ -361,7 +357,6 @@ describe('Channel Readiness', () => {
 
 	beforeEach(() => {
 		node = new LightningNode(makeNodeConfig(50));
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 	});
 

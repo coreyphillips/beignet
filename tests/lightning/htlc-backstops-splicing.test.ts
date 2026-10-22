@@ -124,9 +124,6 @@ async function setup(seedBase: number): Promise<IFixture> {
 	configA.chainBackend = backend;
 	const alice = new LightningNode(configA);
 	const bob = new LightningNode(makeNodeConfig(seedBase + 1));
-	for (const node of [alice, bob]) {
-		node.on('error', () => {});
-	}
 	bob.on('node:error', () => {});
 	const events: string[] = [];
 	alice.on('node:error', (err: { code: string }) => events.push(err.code));
@@ -488,7 +485,6 @@ describe('Issue #774: the HTLC backstops on a splicing channel', function () {
 			const fx = await setup(seedBase);
 			putInSplicing(fx.alice, fx.channelId, { pendingLock: opts.pendingLock });
 			const carol = new LightningNode(makeNodeConfig(seedBase + 2));
-			carol.on('error', () => {});
 			carol.on('node:error', () => {});
 			fx.alice.on('message:outbound', (pubkey, type, payload) => {
 				if (pubkey === carol.getNodeId())

@@ -43,7 +43,6 @@ function fixture(): { dir: string; node: LightningNode } {
 		storage,
 		enableNetworking: false
 	});
-	node.on('error', noop);
 	node.on('node:error', noop);
 	return { dir, node };
 }

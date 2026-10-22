@@ -254,7 +254,6 @@ describe('BOLT 11 payer safety', function () {
 	describe('payer feature/secret checks (S-4.M7)', function () {
 		it('refuses to pay an invoice requiring an unknown even feature bit', function () {
 			const node = new LightningNode(makeNodeConfig('payer'));
-			node.on('error', () => {});
 
 			const features = FeatureFlags.empty();
 			features.setCompulsory(Feature.TLV_ONION);
@@ -277,7 +276,6 @@ describe('BOLT 11 payer safety', function () {
 
 		it('ignores unknown odd feature bits', function () {
 			const node = new LightningNode(makeNodeConfig('payer-odd'));
-			node.on('error', () => {});
 
 			const features = FeatureFlags.empty();
 			features.setCompulsory(Feature.TLV_ONION);
@@ -346,7 +344,6 @@ describe('BOLT 11 payer safety', function () {
 
 		it('refuses to pay an invoice for another network', function () {
 			const node = new LightningNode(makeNodeConfig('payer-network'));
-			node.on('error', () => {});
 			const inv = encodeInvoice({
 				network: Network.TESTNET,
 				paymentHash: crypto.randomBytes(32),
@@ -373,7 +370,6 @@ describe('BOLT 11 payer safety', function () {
 
 		it('refuses a zero amountMsat for an amountless invoice', function () {
 			const node = new LightningNode(makeNodeConfig('payer-zero'));
-			node.on('error', () => {});
 			expect(() =>
 				node.sendPayment(regtestInvoice(), undefined, undefined, 0n)
 			).to.throw('amountMsat must be positive');
@@ -383,7 +379,6 @@ describe('BOLT 11 payer safety', function () {
 
 		it("refuses an offer whose offer_chains do not include the node's chain", async function () {
 			const node = new LightningNode(makeNodeConfig('payer-offer'));
-			node.on('error', () => {});
 			const offerManager = node.getOfferManager();
 			const requested: Array<{ chain?: Buffer } | undefined> = [];
 			offerManager.requestInvoice = (_offer, options): Promise<never> => {

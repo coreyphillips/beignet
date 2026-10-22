@@ -30,6 +30,7 @@ import { FeatureFlags } from '../../src/lightning/features/flags';
 import { IInvoiceInfo } from '../../src/lightning/storage/types';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
 import {
+	BEIGNET_CUSTOM_PROTOCOL_VERSION,
 	BeignetCustomSubtype,
 	decodeCustomMessage
 } from '../../src/lightning/message/custom';
@@ -103,7 +104,6 @@ function nodePair(
 	});
 	const bob = new LightningNode({ ...nodeConfig('bob'), ...walletConfig });
 	for (const n of [alice, bob]) {
-		n.on('error', () => undefined);
 		n.on('node:error', () => undefined);
 	}
 	const deliver =
@@ -425,6 +425,7 @@ describe('JIT receive wallet side (issue #595)', function () {
 		const deliverAck = (payload: Buffer): void => {
 			pair.bob.emit('custom-message', {
 				peerPubkey: pair.alice.getNodeId(),
+				version: BEIGNET_CUSTOM_PROTOCOL_VERSION,
 				subtype: BeignetCustomSubtype.JIT_RECEIVE_ACK,
 				payload
 			});

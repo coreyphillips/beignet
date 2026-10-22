@@ -89,7 +89,6 @@ describe('Channel Readiness Helpers', () => {
 
 	beforeEach(() => {
 		node = new LightningNode(makeNodeConfig(10));
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 	});
 

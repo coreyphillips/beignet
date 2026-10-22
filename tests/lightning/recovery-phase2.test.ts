@@ -1664,7 +1664,6 @@ describe('Recovery phase 2: wiring and defaults', () => {
 					: undefined
 			};
 			const node = new LightningNode(config);
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 			return node;
 		};

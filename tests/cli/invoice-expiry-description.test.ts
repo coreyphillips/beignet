@@ -46,7 +46,6 @@ function makeEngine(): LightningNode {
 		fundingPrivkey: key('1043-funding'),
 		network: Network.REGTEST
 	});
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

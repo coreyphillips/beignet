@@ -126,7 +126,9 @@ function spliceWithheldPair(): IHarness {
 	const openerManager = new ChannelManager(openerConfig);
 	const acceptorManager = new ChannelManager(acceptorConfig);
 	const errors: string[] = [];
-	openerManager.on('error', (_id: Buffer, err: string) => errors.push(err));
+	openerManager.on('error', (_id: Buffer | null, err: string) =>
+		errors.push(err)
+	);
 	acceptorManager.on('error', () => undefined);
 
 	openerManager.on(
@@ -420,7 +422,9 @@ function directFundedSplice(
 	const openerManager = new ChannelManager(openerConfig);
 	const acceptorManager = new ChannelManager(acceptorConfig);
 	const errors: string[] = [];
-	openerManager.on('error', (_id: Buffer, err: string) => errors.push(err));
+	openerManager.on('error', (_id: Buffer | null, err: string) =>
+		errors.push(err)
+	);
 	acceptorManager.on('error', () => undefined);
 	openerManager.on(
 		'message:outbound',

@@ -195,7 +195,6 @@ function createNode(
 	recovery?: INodeConfig['recovery']
 ): LightningNode {
 	const node = new LightningNode(makeNodeConfig(id, storage, recovery));
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

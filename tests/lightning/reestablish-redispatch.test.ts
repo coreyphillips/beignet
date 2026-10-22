@@ -34,6 +34,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
+import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	INodeConfig,
@@ -120,7 +121,6 @@ function makeNodeConfig(
 
 function createNode(seedId: number, storage?: IStorageBackend): LightningNode {
 	const node = new LightningNode(makeNodeConfig(seedId, storage));
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }
@@ -1159,7 +1159,6 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 			...makeNodeConfig(BOB_SEED, bobStorage),
 			resourceConfig: { maxCompletedPayments: 0 }
 		});
-		bob.on('error', () => {});
 		bob.on('node:error', () => {});
 		const carol = createNode(CAROL_SEED);
 		const dead = { val: false };
@@ -1293,7 +1292,6 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 			...makeNodeConfig(BOB_SEED, reopened),
 			maxTotalInFlightHtlcs: 0
 		});
-		restarted.on('error', () => {});
 		restarted.on('node:error', () => {});
 		await reconnect(restarted, alice);
 
@@ -1337,11 +1335,19 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		alice.destroy();
 	});
 
-	const spliceExits: Array<[string, unknown[]]> = [
-		['splice:aborted', ['peer aborted']],
-		['splice:reverted', ['aa'.repeat(32), 'bb'.repeat(32)]]
-	];
-	for (const [exit, args] of spliceExits) {
+	const spliceExits: Array<[string, (cm: ChannelManager, id: Buffer) => void]> =
+		[
+			[
+				'splice:aborted',
+				(cm, id) => cm.emit('splice:aborted', id, 'peer aborted')
+			],
+			[
+				'splice:reverted',
+				(cm, id) =>
+					cm.emit('splice:reverted', id, 'aa'.repeat(32), 'bb'.repeat(32))
+			]
+		];
+	for (const [exit, emitExit] of spliceExits) {
 		it(`an MPP part refused mid-reconnect is fulfilled when a resumed splice exits by ${exit} (#1196)`, async function () {
 			this.timeout(20_000);
 			// The resumed splice returns to NORMAL without splice:complete, and
@@ -1353,7 +1359,7 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 			const channel = bob.getChannelManager().getChannel(aliceChannelId)!;
 			channel.getFullState().state = ChannelState.NORMAL;
 			channel.getFullState().preReestablishState = null;
-			bob.getChannelManager().emit(exit, aliceChannelId, ...args);
+			emitExit(bob.getChannelManager(), aliceChannelId);
 			await settle();
 
 			expect(

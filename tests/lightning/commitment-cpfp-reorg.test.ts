@@ -140,7 +140,6 @@ async function setup(seedBase: number): Promise<IFixture> {
 	const alice = new LightningNode(configA);
 	const bob = new LightningNode(makeNodeConfig(seedBase + 1));
 	for (const n of [alice, bob]) {
-		n.on('error', () => {});
 		n.on('node:error', () => {});
 	}
 	alice.on(

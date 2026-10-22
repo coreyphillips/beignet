@@ -154,7 +154,6 @@ function createNode(
 ): LightningNode {
 	const config = { ...makeNodeConfig(seedId), ...extra };
 	const node = new LightningNode(config);
-	node.on('error', () => {});
 	return node;
 }
 

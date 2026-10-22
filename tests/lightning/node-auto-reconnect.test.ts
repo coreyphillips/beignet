@@ -66,7 +66,6 @@ function createTestNode(autoReconnect: boolean): LightningNode {
 		network: Network.REGTEST,
 		autoReconnect
 	});
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

@@ -75,7 +75,6 @@ function createTestNode(opts?: {
 		enableNetworking: opts?.enableNetworking,
 		autoReconnect: opts?.autoReconnect
 	});
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }
@@ -314,7 +313,6 @@ describe('Fix 1.3: Default autoReconnect to true when networking enabled', () =>
 				network: Network.REGTEST
 			}
 		);
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 		expect(node.getNodeInfo().networkingEnabled).to.equal(true);
 		node.destroy();

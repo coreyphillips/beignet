@@ -158,7 +158,6 @@ function createNode(
 	recovery = false
 ): LightningNode {
 	const node = new LightningNode(makeNodeConfig(seedId, storage, recovery));
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }
@@ -1331,7 +1330,6 @@ describe('Recovery phase 3: capsule guardian locators (issue #457)', () => {
 			? { enabled: true, guardians }
 			: { enabled: true };
 		const node = new LightningNode(config);
-		node.on('error', () => {});
 		node.on('node:error', () => {});
 		try {
 			node.createInvoice({ amountMsat: 1_000n, description: 'locators' });

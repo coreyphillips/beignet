@@ -121,7 +121,6 @@ function makeNodeConfig(
 
 function createNode(seedId: number, storage?: IStorageBackend): LightningNode {
 	const node = new LightningNode(makeNodeConfig(seedId, storage));
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

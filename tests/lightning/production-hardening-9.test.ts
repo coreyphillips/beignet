@@ -71,7 +71,6 @@ function createTestNode(seed?: Buffer): LightningNode {
 		fundingPrivkey,
 		network: Network.REGTEST
 	});
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }
@@ -134,7 +133,6 @@ describe('Production Hardening 9 — Fund Safety', () => {
 			node = LightningNode.fromMnemonic(TEST_MNEMONIC, {
 				network: Network.REGTEST
 			});
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 			// Access internal channelManager config
 			const cm = node.getChannelManager();
@@ -146,7 +144,6 @@ describe('Production Hardening 9 — Fund Safety', () => {
 			node = LightningNode.fromMnemonic(TEST_MNEMONIC, {
 				network: Network.REGTEST
 			});
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 			const cm = node.getChannelManager();
 			const deriver = (cm as any).config.channelKeyDeriver as (
@@ -163,7 +160,6 @@ describe('Production Hardening 9 — Fund Safety', () => {
 			node = LightningNode.fromMnemonic(TEST_MNEMONIC, {
 				network: Network.REGTEST
 			});
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 			const cm = node.getChannelManager();
 			const deriver = (cm as any).config.channelKeyDeriver as (
@@ -191,7 +187,6 @@ describe('Production Hardening 9 — Fund Safety', () => {
 				network: Network.REGTEST,
 				channelKeyDeriver: customDeriver
 			});
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 			const cm = node.getChannelManager();
 			const deriver = (cm as any).config.channelKeyDeriver;
@@ -355,7 +350,6 @@ describe('Production Hardening 9 — Fund Safety', () => {
 				network: Network.REGTEST,
 				storage: storageInst
 			});
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 			node.destroy();
 			// After destroy, the db should be closed — trying to query should throw
@@ -379,7 +373,6 @@ describe('Production Hardening 9 — Fund Safety', () => {
 				network: Network.REGTEST,
 				storage: storageInst
 			});
-			node.on('error', () => {});
 			node.on('node:error', () => {});
 			await node.gracefulShutdown(1000);
 			const db = (storageInst as any).db;

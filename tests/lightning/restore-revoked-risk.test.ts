@@ -342,7 +342,6 @@ function nodeForState(state: IChannelState): {
 		storage,
 		enableNetworking: false
 	});
-	node.on('error', () => {});
 	const errors: ILightningError[] = [];
 	node.on('node:error', (e: ILightningError) => errors.push(e));
 	return { node, storage, idHex, errors };

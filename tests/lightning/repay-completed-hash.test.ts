@@ -114,7 +114,6 @@ function createNode(
 		...(storage ? { storage } : {}),
 		...extra
 	});
-	node.on('error', () => {});
 	node.on('node:error', () => {});
 	return node;
 }

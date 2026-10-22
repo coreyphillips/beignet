@@ -104,7 +104,6 @@ describe('Regtest: negotiated zero reserve and splice max', function () {
 								waiveClientReserve: role === 'primary'
 							}
 						});
-						node.on('error', () => undefined);
 						node.on('broadcast:tx', (raw: Buffer) => {
 							provider
 								.broadcastTransaction(raw.toString('hex'))

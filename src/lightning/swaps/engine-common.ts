@@ -17,6 +17,23 @@ import {
 /** Below this an output is dust for every destination the builders accept. */
 export const SWAP_DUST_FLOOR_SAT = 330n;
 
+/**
+ * Payload of every `swap:*` event, already JSON-safe. The transition adds
+ * its own facts (fundingTxid, claimTxid, reason and so on) to the envelope.
+ */
+export interface ISwapEvent {
+	swapId: string;
+	/** Present on submarine swaps only. */
+	direction?: 'submarine';
+	paymentHash: string;
+	peer: string;
+	state: SwapState;
+	onchainSat: string;
+	invoiceMsat: string;
+	refundHeight: number;
+	[fact: string]: unknown;
+}
+
 export function exposureRefusal(
 	reason: SwapExposureRefusal
 ): SwapRefusalReason {

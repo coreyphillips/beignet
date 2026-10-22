@@ -45,7 +45,6 @@ function makeNode(): LightningNode {
 		channelBasepoints: makeBasepoints(),
 		fundingPrivkey: crypto.randomBytes(32)
 	});
-	node.on('error', () => {});
 	return node;
 }
 
