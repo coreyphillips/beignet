@@ -670,7 +670,7 @@ LightningNode              High-level API (EventEmitter)
 | `storage/` | SQLite persistence backend, channel state serialization |
 | `validation/` | Input validation shared across modules |
 
-`beignet/lightning` re-exports each of these as a namespace (`crypto`, `message`, `node`, ...). `async-payments` and `watchtower` are reachable via their source paths.
+`beignet/lightning` re-exports each of these as a namespace, camel-casing hyphenated names: `import { asyncPayments, ffor, watchtower } from 'beignet/lightning'`.
 
 </details>
 

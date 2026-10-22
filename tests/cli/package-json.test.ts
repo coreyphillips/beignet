@@ -31,6 +31,32 @@ describe('package.json', () => {
 		expect(pkg.exports['./cli']).to.have.property('default');
 	});
 
+	it('should export ./package.json (issue #1683)', () => {
+		expect(pkg.exports['./package.json']).to.equal('./package.json');
+	});
+
+	// node10 resolution ignores `exports`, so each typed subpath needs a
+	// typesVersions entry or a CommonJS TypeScript consumer gets no types.
+	it('should map every typed subpath export in typesVersions (issue #1683)', () => {
+		const mapped = pkg.typesVersions['*'];
+		const subpaths = Object.keys(pkg.exports).filter(
+			(key) => key !== '.' && typeof pkg.exports[key] === 'object'
+		);
+		expect(subpaths).to.include.members([
+			'./lightning',
+			'./cli',
+			'./lightning/iroh-node'
+		]);
+		expect(Object.keys(mapped)).to.have.members(
+			subpaths.map((key) => key.slice(2))
+		);
+		for (const key of subpaths) {
+			expect(mapped[key.slice(2)], key).to.deep.equal([
+				pkg.exports[key].types.slice(2)
+			]);
+		}
+	});
+
 	it('should have lightning-related keywords', () => {
 		expect(pkg.keywords).to.be.an('array');
 		expect(pkg.keywords).to.include('lightning');

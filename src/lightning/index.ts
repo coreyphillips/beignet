@@ -24,3 +24,6 @@ export * as liquidity from './liquidity';
 export * as directFunding from './direct-funding';
 export * as l402 from './l402';
 export * as swaps from './swaps';
+export * as ffor from './ffor';
+export * as asyncPayments from './async-payments';
+export * as watchtower from './watchtower';

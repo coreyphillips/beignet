@@ -1250,6 +1250,7 @@ faster than anything else in this document. Use `ls src/lightning/<module>` inst
 | `onion-message` | `OnionMessageManager`, `constructSimpleOnionMessage`, `processOnionMessage` | 4 |
 | `offer` | `OfferManager`, `encodeOffer`, `decodeOffer`, TLV, Schnorr, merkle | 12 |
 | `async-payments` | `AsyncPaymentManager`, `HeldForwardLedger`, release capability (held forward, notice, release, wake) | 4, 11 |
+| `ffor` | `FforWitnessService`, `FforIssuerService`, epoch messages, voucher book checks, transcript hashes | -- |
 | `watchtower` | `WatchtowerClient`, `wtwire`, justice blob, tower connection | -- |
 | `backup` | Static channel backup (SCB) encode/decode | -- |
 | `node` | `LightningNode`, `INodeConfig`, rate limiter | -- |
@@ -1258,7 +1259,7 @@ faster than anything else in this document. Use `ls src/lightning/<module>` inst
 | `advisor` | `LiquidityAdvisor`, `FeeAdvisor`, `ChannelSuggestions`, rebalance/fee executors | -- |
 | `validation` | Input validation utilities | -- |
 
-`async-payments` and `watchtower` are not yet re-exported as namespaces from `beignet/lightning`; import them from their source paths. Everything else is on the barrel.
+Each module is a namespace on `beignet/lightning`, camel-casing hyphenated names: `import { asyncPayments, ffor, watchtower } from 'beignet/lightning'`.
 
 ## Testing
 
