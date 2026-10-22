@@ -850,7 +850,7 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			previous.addOutput(script, 100_000);
 			const originalFee = 2_550;
 			wallet.feeEstimates = { ...wallet.feeEstimates, fast: 2, slow: 1 };
-			sinon.stub(wallet, 'getRbfData').resolves(
+			sinon.stub(wallet, 'fetchRbfData').resolves(
 				ok({
 					inputs: [0, 1].map((index) => ({
 						...source,

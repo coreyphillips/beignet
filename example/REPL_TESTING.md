@@ -111,7 +111,7 @@ await node.connectToSeeds(3);  // connect to a few seed peers
 const peer = '028a8910b0048630d4eb17af25668cdd7ea6f2d8ae20956e7a06e2ae46ebcb69fc';
 
 // Fire-and-forget open:
-node.openChannel(peer, 200000, 0);   // 200k sat channel, 0 pushed
+node.openChannel(peer, 200000, { pushSats: 0 });   // 200k sat channel, 0 pushed
 
 // Or open and block until it's NORMAL:
 const ch = await node.openChannelAndWait(peer, 200000, { timeoutMs: 120000 });

@@ -104,7 +104,8 @@ export function directFundingWallet(
 			for (const utxo of wallet.listUtxos() ?? []) {
 				// A frozen coin is one another funding already committed, or one the
 				// operator withheld. Either way it is not ours to offer.
-				if (wallet.isUtxoFrozen(utxo.tx_hash, utxo.tx_pos)) continue;
+				if (wallet.isUtxoFrozen({ txid: utxo.tx_hash, vout: utxo.tx_pos }))
+					continue;
 				const script = scriptFor(utxo.address);
 				// Only the two kinds whose witness a receiver can verify and whose
 				// ownership proof the protocol defines.
@@ -307,7 +308,7 @@ export function directFundingWallet(
 			// queued ahead of this call creates it first, and it is not ours.
 			const result = await wallet.freezeUtxoIfUnfrozen({
 				txid: txidHex,
-				index: vout,
+				vout,
 				tag: DF_FREEZE_TAG
 			});
 			return result.isOk() && result.value.created;
@@ -322,7 +323,7 @@ export function directFundingWallet(
 			// release, and false would keep the payer holding a spendable coin.
 			const result = await wallet.unfreezeUtxoIfTagged({
 				txid: txidHex,
-				index: vout,
+				vout,
 				tag: DF_FREEZE_TAG
 			});
 			return result.isOk() && result.value.unfrozen;

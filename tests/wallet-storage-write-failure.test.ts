@@ -154,7 +154,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 			ok('connected');
 		wallet.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
 			ok(wallet.feeEstimates);
-		wallet.getUtxos = async (): Promise<Result<IGetUtxosResponse>> =>
+		wallet.refreshUtxos = async (): Promise<Result<IGetUtxosResponse>> =>
 			ok({ utxos: [], balance: 0 });
 		wallet.updateTransactions = async (): Promise<Result<string | undefined>> =>
 			ok(undefined);

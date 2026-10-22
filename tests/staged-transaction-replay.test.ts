@@ -475,7 +475,7 @@ describe('Signing keys never reach wallet storage (#1011)', function () {
 	it('sweepPrivateKey signs with the swept key, writes none of it and leaves nothing staged', async () => {
 		const swept = externalUtxo(keyPair, TXID_SWEPT, 50_000);
 		sinon
-			.stub(wallet, 'getPrivateKeyInfo')
+			.stub(wallet, 'fetchPrivateKeyInfo')
 			.resolves(
 				ok({ balance: 50_000, utxos: [swept], keyPair, addresses: [] })
 			);

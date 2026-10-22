@@ -93,7 +93,7 @@ describe('refreshWallet flag lifecycle', function () {
 
 	let wallet: Wallet;
 	let updateTransactionsStub: sinon.SinonStub;
-	let getUtxosStub: sinon.SinonStub;
+	let refreshUtxosStub: sinon.SinonStub;
 
 	beforeEach(async function () {
 		const res = await Wallet.create({
@@ -123,8 +123,8 @@ describe('refreshWallet flag lifecycle', function () {
 		sinon
 			.stub(wallet as unknown as TRefreshInternals, 'updateAddressIndexes')
 			.resolves(ok('stubbed'));
-		getUtxosStub = sinon
-			.stub(wallet, 'getUtxos')
+		refreshUtxosStub = sinon
+			.stub(wallet, 'refreshUtxos')
 			.resolves(ok<IGetUtxosResponse>({ utxos: [], balance: 0 }));
 		updateTransactionsStub = sinon
 			.stub(wallet, 'updateTransactions')
@@ -160,7 +160,7 @@ describe('refreshWallet flag lifecycle', function () {
 	});
 
 	it('releases the flag when a forced refresh it owns throws', async function () {
-		getUtxosStub.rejects(new Error('electrum went away'));
+		refreshUtxosStub.rejects(new Error('electrum went away'));
 
 		const forced = await wallet.refreshWallet({ force: true });
 		expect(forced.isErr(), 'the throw is reported to the caller').to.equal(
@@ -194,7 +194,7 @@ describe('refreshWallet flag lifecycle', function () {
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
 		});
-		getUtxosStub.callsFake(async () => {
+		refreshUtxosStub.callsFake(async () => {
 			await gate;
 			return ok<IGetUtxosResponse>({ utxos: [], balance: 0 });
 		});
@@ -219,10 +219,10 @@ describe('refreshWallet flag lifecycle', function () {
 	});
 
 	it('keeps the flag up until a sibling forced refresh finishes too', async function () {
-		// One gate per getUtxos call, so the two refreshes can be finished in a
+		// One gate per refreshUtxos call, so the two refreshes can be finished in a
 		// chosen order rather than whichever one the runtime happens to pick.
 		const gates: Array<() => void> = [];
-		getUtxosStub.callsFake(async () => {
+		refreshUtxosStub.callsFake(async () => {
 			await new Promise<void>((resolve) => gates.push(resolve));
 			return ok<IGetUtxosResponse>({ utxos: [], balance: 0 });
 		});
@@ -231,7 +231,7 @@ describe('refreshWallet flag lifecycle', function () {
 		await waitFor(
 			() => gates.length === 1,
 			5000,
-			'the first refresh to reach getUtxos'
+			'the first refresh to reach refreshUtxos'
 		);
 		// rescanAddresses forces its way past the guard, so this one runs
 		// alongside the first rather than queueing behind it.
@@ -239,7 +239,7 @@ describe('refreshWallet flag lifecycle', function () {
 		await waitFor(
 			() => gates.length === 2,
 			5000,
-			'the forced refresh to reach getUtxos'
+			'the forced refresh to reach refreshUtxos'
 		);
 
 		let queuedSettled = false;
@@ -281,12 +281,12 @@ describe('refreshWallet flag lifecycle', function () {
 	});
 
 	describe('a call queued behind a running refresh (issue #808)', function () {
-		/** One gate per getUtxos call, so each body can be held and counted. */
+		/** One gate per refreshUtxos call, so each body can be held and counted. */
 		let gates: Array<() => void>;
 
 		beforeEach(function () {
 			gates = [];
-			getUtxosStub.callsFake(async () => {
+			refreshUtxosStub.callsFake(async () => {
 				await new Promise<void>((resolve) => gates.push(resolve));
 				return ok<IGetUtxosResponse>({ utxos: [], balance: 0 });
 			});
@@ -296,7 +296,7 @@ describe('refreshWallet flag lifecycle', function () {
 			const running = wallet.refreshWallet({});
 			await waitFor(() => gates.length === 1, 5000, 'the first body');
 
-			// The running body has read past getUtxos, so it cannot see whatever
+			// The running body has read past refreshUtxos, so it cannot see whatever
 			// prompted this call.
 			let queuedSettled = false;
 			const queued = wallet.refreshWallet({});
@@ -320,7 +320,7 @@ describe('refreshWallet flag lifecycle', function () {
 			);
 			expect(runningRes.isOk()).to.equal(true);
 			expect(queuedRes.isOk()).to.equal(true);
-			expect(getUtxosStub.callCount, 'the body ran twice').to.equal(2);
+			expect(refreshUtxosStub.callCount, 'the body ran twice').to.equal(2);
 			expect(wallet.isRefreshing).to.equal(false);
 		});
 
@@ -338,9 +338,11 @@ describe('refreshWallet flag lifecycle', function () {
 				'the refresh and every queued call'
 			);
 			expect(results.every((r) => r.isOk())).to.equal(true);
-			// Long enough for a third body to have reached getUtxos.
+			// Long enough for a third body to have reached refreshUtxos.
 			await new Promise((resolve) => setTimeout(resolve, 50));
-			expect(getUtxosStub.callCount, 'the body ran exactly twice').to.equal(2);
+			expect(refreshUtxosStub.callCount, 'the body ran exactly twice').to.equal(
+				2
+			);
 		});
 
 		it('does not re-run for stop(), and stop() still settles', async function () {
@@ -365,7 +367,7 @@ describe('refreshWallet flag lifecycle', function () {
 				'the refresh and the call queued behind it'
 			);
 			await new Promise((resolve) => setTimeout(resolve, 50));
-			expect(getUtxosStub.callCount, 'no re-run was started').to.equal(1);
+			expect(refreshUtxosStub.callCount, 'no re-run was started').to.equal(1);
 		});
 	});
 

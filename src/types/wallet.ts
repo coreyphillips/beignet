@@ -743,6 +743,36 @@ export interface IImportSignedPsbtResponse {
 	txid: string;
 }
 
+/**
+ * A transaction output: the txid of the transaction that created it, in
+ * display order, and the output's position in that transaction.
+ */
+export interface IOutpoint {
+	txid: string;
+	vout: number;
+}
+
+/** The outpoint shape the freeze methods took before {@link IOutpoint}. */
+export interface IIndexedOutpoint {
+	txid: string;
+	/** @deprecated Use `vout`. Removed in the next major release. */
+	index: number;
+}
+
+export interface ICreateSignedTransactionArgs extends IBuildPsbtArgs {
+	/**
+	 * Spend every unfrozen coin to `address`, less the fee, as sendMax does.
+	 * Refused alongside `amount` or `txs`.
+	 */
+	max?: boolean;
+}
+
+/** A signed transaction that has not been broadcast. */
+export interface ISignedTransaction {
+	txHex: string;
+	txid: string;
+}
+
 export type TAddressIndexInfo = {
 	addressIndex: IAddress;
 	changeAddressIndex: IAddress;

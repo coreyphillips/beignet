@@ -78,7 +78,7 @@ function callResolve(wallet: any): Promise<Buffer | undefined> {
 	return fakeNode(wallet).resolveWalletSweepScript();
 }
 
-/** getNextAvailableAddress as the wallet answers it: BOTH chains. */
+/** fetchNextAvailableAddress as the wallet answers it: BOTH chains. */
 const okResult = (
 	receive: string = RECEIVE_ADDR,
 	change: string = CHANGE_ADDR
@@ -108,7 +108,7 @@ const notReached = (what: string) => async (): Promise<never> => {
 
 /** A wallet whose Electrum gap scan works. */
 const onlineWallet = (): any => ({
-	getNextAvailableAddress: async () => okResult(),
+	fetchNextAvailableAddress: async () => okResult(),
 	getChangeAddress: notReached('getChangeAddress (the stored-change leg)'),
 	getAddress: notReached('getAddress (the removed receive index 0 leg)')
 });
@@ -136,7 +136,7 @@ describe('Force-close sweep destination resolution', () => {
 	it('falls back to the stored change address when the unused lookup fails (Electrum down)', async () => {
 		let storedChangeReads = 0;
 		const wallet = {
-			getNextAvailableAddress: async () => errResult(),
+			fetchNextAvailableAddress: async () => errResult(),
 			getChangeAddress: async () => {
 				storedChangeReads++;
 				return okChange();
@@ -156,7 +156,7 @@ describe('Force-close sweep destination resolution', () => {
 
 	it('falls back to the stored change address when the unused lookup throws', async () => {
 		const wallet = {
-			getNextAvailableAddress: async () => {
+			fetchNextAvailableAddress: async () => {
 				throw new Error('electrum timeout');
 			},
 			getChangeAddress: async () => okChange(),
@@ -168,7 +168,7 @@ describe('Force-close sweep destination resolution', () => {
 
 	it('returns undefined only when both the unused lookup AND the stored change address fail', async () => {
 		const errs = {
-			getNextAvailableAddress: async () => errResult(),
+			fetchNextAvailableAddress: async () => errResult(),
 			getChangeAddress: async () => ({
 				isOk: () => false,
 				isErr: () => true,
@@ -205,7 +205,7 @@ describe('Force-close sweep destination resolution', () => {
 			let calls = 0;
 			const bn = fakeNode(
 				{
-					getNextAvailableAddress: async () =>
+					fetchNextAvailableAddress: async () =>
 						++calls === 1 ? errResult() : okResult(),
 					getChangeAddress: async () => errResult(),
 					getAddress: notReached('getAddress')

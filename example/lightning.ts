@@ -483,7 +483,7 @@ const runBeignetExample = async (
     node.listTrustedPeers()                     List trusted peers
 
   Channels
-    node.openChannel(pubkey, sats, pushSats?)   Open a channel
+    node.openChannel(pubkey, sats, opts?)       Open a channel ({ pushSats, satsPerVbyte, ... })
     node.openChannelAndWait(pubkey, sats, opts?)        Open + await ready (async)
     node.connectAndOpenChannel(pubkey, host, port, sats, ...)  Connect + open (async)
     node.openZeroConfChannel(pubkey, sats, pushSats?)   Zero-conf channel
@@ -518,8 +518,8 @@ const runBeignetExample = async (
     node.payOffer(offer, amountSats?)           Pay an offer (async)
 
   Payments
-    node.payInvoice(bolt11, ms?, maxFeeSats?, amountSats?)   Pay (throws on fail, async)
-    node.payInvoiceSafe(bolt11, ...)            Pay — never throws (async)
+    node.payInvoice(bolt11, opts?)              Pay (throws on fail, async). opts: { timeoutMs, maxFeeSats, amountSats, ... }
+    node.payInvoiceSafe(bolt11, opts?)          Pay — never throws (async)
     node.payInvoiceWithRetry(bolt11, opts)      Pay w/ backoff retry (async)
     node.sendPaymentAsync(bolt11, ...)          Fire-and-forget; returns paymentHash
     node.sendKeysend(pubkey, sats, ...)         Spontaneous payment (async)

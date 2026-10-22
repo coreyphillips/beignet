@@ -253,7 +253,7 @@ The signatures name three of those IDs: `ChannelIdHex` and `PaymentHashHex` (32 
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `openChannel(pubkey, amountSats, pushSats?)` | `ChannelInfo` | Open channel, auto-funded from wallet |
+| `openChannel(pubkey, amountSats, opts?)` | `ChannelInfo` | Open channel, auto-funded from wallet. `opts: { pushSats?, satsPerVbyte?, max?, trusted? }`; `max` funds from the whole spendable balance and needs `satsPerVbyte`. The positional form `(pubkey, amountSats, pushSats?, satsPerVbyte?, max?, trusted?)` is deprecated |
 | `openChannelAndWait(pubkey, amountSats, opts?)` | `Promise<ChannelInfo>` | Open channel + wait for NORMAL state. `opts: { pushSats?, timeoutMs? }` |
 | `openZeroConfChannel(pubkey, sats, pushSats?)` | `ChannelInfo` | Open zero-conf channel (peer must be trusted) |
 | `openChannelV2(pubkey, params)` | `ChannelInfo` | Open dual-funded v2 channel |
@@ -307,8 +307,8 @@ verify the Lightning leg outlives its on-chain refund before funding.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `payInvoice(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?, maxFeeMsat?)` | `Promise<PaymentInfo>` | Pay invoice. **Blocks until settled or timeout** (default 60s). At the timeout the payment is failed only when no HTLC is out for it; with one still in flight the record stays `PENDING` until that HTLC resolves, no further route is tried after the timeout, and the record is failed when the HTLC fails or its on-chain timeout resolves; the `PAYMENT_TIMEOUT` message says so (issue #976). `maxFeeSats` caps routing fees in whole sats; `maxFeeMsat` (a number or a decimal string) caps them exactly, for a caller holding an exact quote such as `estimatePayment`'s `estimatedFeeMsat`; with neither, the cap is 1% of the amount, never below 50 sats. The spending limits count the amount plus the cap (see Spending Limits). Pass one or the other: both at once is refused with `INVALID_PARAMS`; a route over the cap is refused with `FEE_EXCEEDS_MAX` (409 over HTTP, permanent for `isRetryableError` and `payInvoiceWithRetry`) and nothing is sent. `amountSats` is required for amount-less invoices. `metadata` attaches key-value labels. `cltvLimit` caps the payment's total CLTV expiry at that many blocks above the current tip (every attempt, retry and MPP part); when no route fits it fails with `CLTV_EXCEEDS_MAX` and nothing is sent. A swap provider paying the counterparty's invoice sets it from the on-chain refund height (#751). |
-| `payInvoiceSafe(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?, maxFeeMsat?)` | `Promise<PaymentInfo>` | Like `payInvoice` but **never throws**: catches all errors and resolves with the hash's existing record when there is one (after a timeout with an HTLC still out, the `PENDING` record, which no further route is tried for and which is failed when that HTLC fails or its on-chain timeout resolves; for a duplicate refusal, the record the engine refused from) and otherwise with `status: 'FAILED'`. The `failureDescription` field contains `[ERROR_CODE] message` for machine parsing. |
+| `payInvoice(bolt11, opts?)` | `Promise<PaymentInfo>` | Pay invoice. `opts: { timeoutMs?, maxFeeSats?, maxFeeMsat?, amountSats?, metadata?, cltvLimit? }`; the positional form `(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?, maxFeeMsat?)` is deprecated. **Blocks until settled or timeout** (default 60s). At the timeout the payment is failed only when no HTLC is out for it; with one still in flight the record stays `PENDING` until that HTLC resolves, no further route is tried after the timeout, and the record is failed when the HTLC fails or its on-chain timeout resolves; the `PAYMENT_TIMEOUT` message says so (issue #976). `maxFeeSats` caps routing fees in whole sats; `maxFeeMsat` (a number or a decimal string) caps them exactly, for a caller holding an exact quote such as `estimatePayment`'s `estimatedFeeMsat`; with neither, the cap is 1% of the amount, never below 50 sats. The spending limits count the amount plus the cap (see Spending Limits). Pass one or the other: both at once is refused with `INVALID_PARAMS`; a route over the cap is refused with `FEE_EXCEEDS_MAX` (409 over HTTP, permanent for `isRetryableError` and `payInvoiceWithRetry`) and nothing is sent. `amountSats` is required for amount-less invoices. `metadata` attaches key-value labels. `cltvLimit` caps the payment's total CLTV expiry at that many blocks above the current tip (every attempt, retry and MPP part); when no route fits it fails with `CLTV_EXCEEDS_MAX` and nothing is sent. A swap provider paying the counterparty's invoice sets it from the on-chain refund height (#751). |
+| `payInvoiceSafe(bolt11, opts?)` | `Promise<PaymentInfo>` | Takes `payInvoice`'s options (the positional form is deprecated here too). Like `payInvoice` but **never throws**: catches all errors and resolves with the hash's existing record when there is one (after a timeout with an HTLC still out, the `PENDING` record, which no further route is tried for and which is failed when that HTLC fails or its on-chain timeout resolves; for a duplicate refusal, the record the engine refused from) and otherwise with `status: 'FAILED'`. The `failureDescription` field contains `[ERROR_CODE] message` for machine parsing. |
 | `sendPaymentAsync(bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `{ paymentHash, status: 'PENDING' \| 'FAILED' }` | Fire-and-forget pay. Returns immediately, `FAILED` when the engine refused the submission outright (an expired invoice, an HTLC the channel would not take). Poll `getPayment()` for settlement. Drain mode and the spending limits are applied at submission, so it can throw `SERVICE_DRAINING` or `SPENDING_LIMIT_EXCEEDED`; the limits use the invoice's own amount whenever it carries one, since that is what gets paid. |
 | `payInvoiceWithRetry(bolt11, opts?)` | `Promise<RetryPaymentResult>` | Pay with exponential backoff retry. `opts: { maxRetries? (3), backoffMs? (2000), maxFeeSats?, amountSats?, metadata?, cltvLimit? }`. Emits `payment:retry` events. |
 | `cancelPayment(paymentHash)` | `{ ok: true }` | Cancel a pending outbound payment (marks as FAILED). The HTLC cannot be retracted, so a cancelled payment keeps holding its amount against the daily limit until that HTLC settles or fails back, or the 24h window ends; `getDailySpendInfo().pendingSats` shows what is held. |
@@ -1566,7 +1566,7 @@ A channel open the engine refuses on the caller's own arguments (a push toward a
 import { BeignetError } from 'beignet/cli';
 
 try {
-  node.openChannel(peerPubkey, 100_000, 50_000);
+  node.openChannel(peerPubkey, 100_000, { pushSats: 50_000 });
 } catch (err) {
   if (err instanceof BeignetError && err.code === 'INVALID_PARAMS') {
     // The request cannot be served as written; err.message says why.
@@ -1591,7 +1591,7 @@ A request the node cannot serve for its **own** state or configuration is a diff
 import { BeignetError, isRetryableError } from 'beignet/cli';
 
 try {
-  node.openChannel(peerPubkey, 100_000, undefined, 5, true); // max open
+  node.openChannel(peerPubkey, 100_000, { satsPerVbyte: 5, max: true });
 } catch (err) {
   if (err instanceof BeignetError && isRetryableError(err)) {
     // FEE_ESTIMATE_NOT_READY: the estimator's first sample lands in

@@ -1,0 +1,57 @@
+# API conventions
+
+The rules for new public API, and the old names they replaced. Existing internals keep their names. A public name changes only behind a deprecated wrapper, which stays for at least one minor release and goes in the next major.
+
+## Rules for new code
+
+**Type prefixes.** Interfaces take `I` (`IOutpoint`). Type aliases and enums take no prefix. Most of the code already follows this; older types that do not (the `E` and `T` prefixes of the on-chain types, the unprefixed `BeignetNode` types) keep their names.
+
+**Verbs say where the answer comes from.**
+
+| Prefix | Meaning |
+|--------|---------|
+| `get*`, `list*` | Reads memory or storage, never the network. `list*` returns a collection. |
+| `fetch*` | Asks the network and returns its answer. |
+| `refresh*` | Asks the network and stores what it learns, for `get*` and `list*` to read. |
+
+**Parameters.** A function that takes more than three parameters takes an options object instead. A required argument or two followed by an optional options object is fine: `openChannel(pubkey, amountSats, opts)`.
+
+**Outpoints.** An outpoint is `{ txid, vout }` (`IOutpoint`), with the txid in display order. Stored UTXO records keep Electrum's `tx_hash` and `tx_pos`.
+
+**One result per method.** No flag switches a method between two return types. `send` broadcasts and returns the txid; `createSignedTransaction` returns the signed transaction without broadcasting it.
+
+## Deprecated names
+
+Each old name still works and forwards to its replacement.
+
+### `Wallet`
+
+| Deprecated | Use |
+|------------|-----|
+| `getUtxos(opts)` | `refreshUtxos(opts)` |
+| `getGapLimit(opts)` | `getAddressGap(opts)`, which returns the current gap, not the gap limit |
+| `getNextAvailableAddress(type?)` | `fetchNextAvailableAddress(type?)` |
+| `getAddressBalance(address)` | `fetchAddressBalance(address)` |
+| `getAddressesBalance(addresses)` | `fetchAddressesBalance(addresses)` |
+| `getScriptHashBalance(scriptHash)` | `fetchScriptHashBalance(scriptHash)` |
+| `getAddressHistory(address)` | `fetchAddressHistory(address)` |
+| `getTransactionDetails(txid)` | `fetchTransactionDetails(txid)` |
+| `getFeeEstimates(network?)` | `fetchFeeEstimates(network?)` |
+| `getFeeEstimatesFromElectrum()` | `fetchFeeEstimatesFromElectrum()` |
+| `getFeeEstimatesFromHttp(network?)` | `fetchFeeEstimatesFromHttp(network?)` |
+| `getFallbackFeeEstimates(network?)` | `fetchFallbackFeeEstimates(network?)` |
+| `getPrivateKeyInfo(wif)` | `fetchPrivateKeyInfo(wif)` |
+| `getInputData({ inputs: [{ tx_hash, vout }] })` | `fetchInputData({ inputs: [{ txid, vout }] })` |
+| `getRbfData({ txHash: { tx_hash } })` | `fetchRbfData({ txid })` |
+| `isUtxoFrozen(txid, index)` | `isUtxoFrozen({ txid, vout })` |
+| `{ txid, index }` passed to `freezeUtxo`, `freezeUtxoIfUnfrozen`, `unfreezeUtxo` or `unfreezeUtxoIfTagged` | `{ txid, vout }` |
+| `send` or `sendMany` with `broadcast: false` | `createSignedTransaction({ address, amount })` or `createSignedTransaction({ txs })` |
+| `sendMax` with `broadcast: false` | `createSignedTransaction({ address, max: true })` |
+
+### `BeignetNode`
+
+| Deprecated | Use |
+|------------|-----|
+| `payInvoice(bolt11, timeoutMs, maxFeeSats, amountSats, metadata, cltvLimit, maxFeeMsat)` | `payInvoice(bolt11, { timeoutMs, maxFeeSats, amountSats, metadata, cltvLimit, maxFeeMsat })` |
+| `payInvoiceSafe(bolt11, timeoutMs, ...)` | `payInvoiceSafe(bolt11, { timeoutMs, ... })` |
+| `openChannel(pubkey, amountSats, pushSats, satsPerVbyte, max, trusted)` | `openChannel(pubkey, amountSats, { pushSats, satsPerVbyte, max, trusted })` |

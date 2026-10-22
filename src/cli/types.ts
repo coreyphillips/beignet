@@ -1390,6 +1390,44 @@ export interface RetryPaymentResult extends PaymentInfo {
 	attempts: number;
 }
 
+/** What payInvoice and payInvoiceSafe take beside the invoice. */
+export interface IPayInvoiceOptions {
+	/** How long to wait for the payment to settle (default 60,000 ms). */
+	timeoutMs?: number;
+	/** Routing fee cap in whole sats. Refused alongside maxFeeMsat. */
+	maxFeeSats?: number;
+	/**
+	 * Routing fee cap in msat, a number or a decimal string. Refused
+	 * alongside maxFeeSats. With neither, the cap is 1% of the amount, never
+	 * below 50 sats.
+	 */
+	maxFeeMsat?: number | string;
+	/** The amount to pay, in sats. Required for an amountless invoice. */
+	amountSats?: number;
+	/** Key-value labels stored with the payment. */
+	metadata?: Record<string, string>;
+	/**
+	 * Blocks above the current tip that no HTLC of the payment may expire
+	 * after (#751). Absent: no bound beyond the engine's own.
+	 */
+	cltvLimit?: number;
+}
+
+/** What openChannel takes beside the peer and the funding amount. */
+export interface IOpenChannelOptions {
+	/** Sats pushed to the peer at open. */
+	pushSats?: number;
+	/** Funding feerate in sat/vB. A max open needs one. */
+	satsPerVbyte?: number;
+	/** Fund the channel with the whole spendable on-chain balance. */
+	max?: boolean;
+	/**
+	 * Open a zero-conf channel toward a peer in the trusted set
+	 * (addTrustedPeer), usable before the funding confirms.
+	 */
+	trusted?: boolean;
+}
+
 export type PaymentValidationStatus = 'OK' | 'WARN' | 'FAIL';
 
 export interface PaymentValidation {

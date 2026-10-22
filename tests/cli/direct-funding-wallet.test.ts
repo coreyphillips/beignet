@@ -30,7 +30,7 @@ import {
 	DirectFundingErrorCode
 } from '../../src/lightning/direct-funding/types';
 import { Network } from '../../src/lightning/invoice/types';
-import { IUtxo } from '../../src/types';
+import { IOutpoint, IUtxo } from '../../src/types';
 import { err, ok, Result } from '../../src/utils';
 import {
 	acceptingReceiver,
@@ -49,7 +49,7 @@ const CONFLICT = 'bb'.repeat(32);
 
 interface IStubWallet extends IDfWallet {
 	frozen: IUtxo[];
-	freezes: Array<{ txid: string; index: number; tag?: string }>;
+	freezes: Array<{ txid: string; vout: number; tag?: string }>;
 }
 
 /** A wallet holding one coin, with whatever freezes and transactions a test sets. */
@@ -72,14 +72,14 @@ function stubWallet(
 	} as unknown as IUtxo;
 	const stub = {
 		frozen: opts.frozen ?? [],
-		freezes: [] as Array<{ txid: string; index: number; tag?: string }>,
+		freezes: [] as Array<{ txid: string; vout: number; tag?: string }>,
 		listUtxos: (): IUtxo[] => [utxo],
 		listFrozenUtxos: (): IUtxo[] => stub.frozen,
-		isUtxoFrozen: (txid: string, index: number): boolean =>
-			stub.frozen.some((f) => f.tx_hash === txid && f.tx_pos === index),
+		isUtxoFrozen: ({ txid, vout }: IOutpoint): boolean =>
+			stub.frozen.some((f) => f.tx_hash === txid && f.tx_pos === vout),
 		freezeUtxoIfUnfrozen: async (args: {
 			txid: string;
-			index: number;
+			vout: number;
 			tag?: string;
 		}): Promise<Result<{ created: boolean }>> => {
 			stub.freezes.push(args);
@@ -91,11 +91,11 @@ function stubWallet(
 		},
 		unfreezeUtxoIfTagged: async (args: {
 			txid: string;
-			index: number;
+			vout: number;
 			tag: string;
 		}): Promise<Result<{ unfrozen: boolean }>> => {
 			const on = (f: IUtxo): boolean =>
-				f.tx_hash === args.txid && f.tx_pos === args.index;
+				f.tx_hash === args.txid && f.tx_pos === args.vout;
 			if (stub.frozen.some((f) => on(f) && f.freezeTag !== args.tag)) {
 				return ok({ unfrozen: false });
 			}

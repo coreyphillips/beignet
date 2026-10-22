@@ -79,7 +79,7 @@ const runExample = async (
   Wallet
     wallet.getBalance()                         Confirmed + unconfirmed balance (sats)
     wallet.getAddress()                         Receiving address (async)
-    wallet.getNextAvailableAddress()            Next unused address data (async)
+    wallet.fetchNextAvailableAddress()          Next unused address data (async)
     wallet.refreshWallet()                      Resync wallet (async)
     wallet.validateAddress(addr)                Validate a bitcoin address
 
@@ -88,19 +88,19 @@ const runExample = async (
     wallet.unconfirmedTransactions              Txs with <6 confirmations
     wallet.listUtxos()                          All UTXOs, frozen ones included
     wallet.getBalanceBreakdown()                { total, spendable, frozen } (sats)
-    wallet.getTransactionDetails(txid)          Full tx details (async)
+    wallet.fetchTransactionDetails(txid)        Full tx details (async)
 
   Fees
-    wallet.getFeeEstimates()                    Fee estimates in sats/vB (async)
+    wallet.fetchFeeEstimates()                  Fee estimates in sats/vB (async)
     wallet.getFeeInfo({ satsPerByte })          Fee info for a transaction
 
   Sending
-    wallet.send({ address, amount, satsPerByte, broadcast })
-                                                Send sats (async). broadcast: false
-                                                returns raw tx hex without sending.
+    wallet.send({ address, amount, satsPerByte })
+                                                Send sats (async)
     wallet.sendMax({ address, satsPerByte })    Send entire balance (async)
-    wallet.electrum.broadcastTransaction({ rawTx })
-                                                Broadcast a raw tx (async)
+    wallet.createSignedTransaction({ address, amount, satsPerByte })
+                                                Sign without sending (async)
+    wallet.broadcastTransaction(txHex)          Broadcast a raw tx (async)
 
   Boosting (RBF)
     wallet.getBoostableTransactions()           Txs eligible for fee boosting

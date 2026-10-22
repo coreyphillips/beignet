@@ -990,7 +990,7 @@ export class Transaction {
 		// until something restages, and sendMax turning max off does not.
 		if (!spendFrozen) {
 			const frozen = transaction.inputs.find((input) =>
-				this._wallet.isUtxoFrozen(input.tx_hash, input.tx_pos)
+				this._wallet.isUtxoFrozen({ txid: input.tx_hash, vout: input.tx_pos })
 			);
 			if (frozen) {
 				return err(
@@ -1039,7 +1039,7 @@ export class Transaction {
 			if (!spendFrozen) {
 				for (const { hash, index } of psbt.txInputs) {
 					const txid = Buffer.from(hash).reverse().toString('hex');
-					if (this._wallet.isUtxoFrozen(txid, index)) {
+					if (this._wallet.isUtxoFrozen({ txid, vout: index })) {
 						return err(`Staged input ${txid}:${index} is frozen.`);
 					}
 				}
@@ -1396,7 +1396,7 @@ export class Transaction {
 			if (!spendFrozen) {
 				for (const { hash, index } of psbt.txInputs) {
 					const txid = Buffer.from(hash).reverse().toString('hex');
-					if (this._wallet.isUtxoFrozen(txid, index)) {
+					if (this._wallet.isUtxoFrozen({ txid, vout: index })) {
 						return err(`Staged input ${txid}:${index} is frozen.`);
 					}
 				}
@@ -2443,9 +2443,7 @@ export class Transaction {
 				return err(setupTransactionRes.error);
 			}
 
-			const response = await this._wallet.getRbfData({
-				txHash: { tx_hash: txid }
-			});
+			const response = await this._wallet.fetchRbfData({ txid });
 			if (response.isErr()) {
 				return err(response.error);
 			}

@@ -611,7 +611,7 @@ describe('Wallet address map writes on refresh (#1655)', function () {
 
 		sinon.stub(wallet, 'checkElectrumConnection').resolves(ok('connected'));
 		sinon.stub(wallet, 'updateFeeEstimates').resolves(ok(wallet.feeEstimates));
-		sinon.stub(wallet, 'getUtxos').resolves(ok({ utxos: [], balance: 0 }));
+		sinon.stub(wallet, 'refreshUtxos').resolves(ok({ utxos: [], balance: 0 }));
 		sinon.stub(wallet, 'updateTransactions').resolves(ok(undefined));
 		sinon.stub(wallet.electrum, 'subscribeToAddresses').resolves(ok('ok'));
 		sinon
