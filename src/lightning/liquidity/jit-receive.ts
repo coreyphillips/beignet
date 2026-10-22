@@ -1792,6 +1792,12 @@ export class JitReceiveManager extends EventEmitter {
 				});
 			}
 		}
+		if (waited) {
+			// A part that joined during the last slice was never marked, so a
+			// block in that slice did not hold it to the wallet's cutoff.
+			for (const p of parts()) p.waitedForWallet = true;
+			this.scanExpiringHolds();
+		}
 	}
 
 	/**

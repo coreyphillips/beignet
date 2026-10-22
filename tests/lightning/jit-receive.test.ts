@@ -2010,6 +2010,27 @@ describe('JIT waits for an absent wallet (issue #1726)', () => {
 		expect(h.forwarded.map((f) => f.part)).to.deep.equal([padded]);
 	});
 
+	it("a part that joined during the wait's last slice is held to the wallet's cutoff when the wallet returns", async () => {
+		const h = makeHarness();
+		h.walletAway.value = true;
+		h.manager.registerIntent(CLIENT, auth());
+		const channelId = crypto.randomBytes(32);
+		const forwarded = waitFor(h.manager, 'jit:forwarded');
+		const padded = makePart(h, { forwardCltv: 800_073 });
+		const tight = makePart(h, { forwardCltv: 800_072 });
+		h.manager.tryHoldForSplice(channelId, padded);
+		h.manager.tryHoldForSplice(channelId, tight);
+		h.height.value = 800_001;
+		h.manager.scanExpiringHolds();
+
+		await comeBack(h);
+		await forwarded;
+		expect(h.failed.map((f) => [f.part, f.code])).to.deep.equal([
+			[tight, TEMPORARY_CHANNEL_FAILURE]
+		]);
+		expect(h.forwarded.map((f) => f.part)).to.deep.equal([padded]);
+	});
+
 	it('an open refused because the wallet dropped mid-attempt is retried once it is back', async () => {
 		const h = makeHarness({ fundingAttempts: 3 });
 		let calls = 0;
