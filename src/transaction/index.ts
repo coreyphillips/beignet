@@ -692,9 +692,18 @@ export class Transaction {
 				}
 
 				// See getTotalFee: priced at its size, without the 166 vB floor.
-				let transactionByteCount =
-					getByteCount(inputParam, outputParam, message, 0) +
-					this.uncompressedKeyBytes(inputs);
+				const size = getByteCount(inputParam, outputParam, message, 0);
+				// For a type it has no weight for, such as a P2WSH input outside a
+				// multisig wallet, getByteCount returns the minimum it is given, 0
+				// here. Every rate fits a transaction of no size, so the rate
+				// searches below would never end, and under 2 sat/vB the size floor
+				// would hide it instead. The catch below returns this as the error.
+				if (!size) {
+					throw new Error(
+						'Unable to size the transaction for its fee. A P2WSH input is only sized in a multisig wallet.'
+					);
+				}
+				let transactionByteCount = size + this.uncompressedKeyBytes(inputs);
 				if (rate < 2 && !this.skipsSizeFloor(transaction, inputs)) {
 					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
 					if (transactionByteCount < minByteCount)
