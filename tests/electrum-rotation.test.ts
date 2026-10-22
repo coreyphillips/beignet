@@ -34,7 +34,8 @@ const serverB: TServer = {
 
 const createElectrum = (
 	servers: TServer | TServer[],
-	network = EAvailableNetworks.testnet
+	network = EAvailableNetworks.testnet,
+	{ disableFallbackServers }: { disableFallbackServers?: boolean } = {}
 ): Electrum => {
 	const fakeWallet = {
 		sendMessage: (): void => {},
@@ -45,7 +46,8 @@ const createElectrum = (
 		network,
 		net,
 		tls,
-		servers
+		servers,
+		disableFallbackServers
 	});
 	// No background pings during tests.
 	electrum.stopConnectionPolling();
@@ -223,6 +225,48 @@ describe('Electrum multi-server rotation', () => {
 		const res = await electrum.connectToElectrum({});
 		expect(res.isErr()).to.equal(true);
 		expect(attempts).to.deep.equal([serverA.host]);
+	});
+
+	it('never dials a fallback peer when they are disabled', async () => {
+		const electrum = createElectrum([serverA, serverB], undefined, {
+			disableFallbackServers: true
+		});
+		const attempts: string[] = [];
+		stubConnections(electrum, new Set([serverA.host, serverB.host]), attempts);
+
+		const res = await electrum.connectToElectrum({});
+		expect(res.isErr()).to.equal(true);
+		expect(attempts).to.deep.equal([serverA.host, serverB.host]);
+		expect(electrum.currentServer).to.equal(null);
+		expect(electrum.connectedToElectrum).to.equal(false);
+	});
+
+	it('still rotates through the given servers when fallback peers are disabled', async () => {
+		const electrum = createElectrum([serverA, serverB], undefined, {
+			disableFallbackServers: true
+		});
+		const attempts: string[] = [];
+		stubConnections(electrum, new Set([serverA.host]), attempts);
+
+		const res = await electrum.connectToElectrum({});
+		expect(res.isOk()).to.equal(true);
+		expect(attempts).to.deep.equal([serverA.host, serverB.host]);
+		expect(electrum.currentServer?.host).to.equal(serverB.host);
+	});
+
+	it('errs without dialling when fallback peers are disabled and no server is given', async () => {
+		const electrum = createElectrum([], undefined, {
+			disableFallbackServers: true
+		});
+		const attempts: string[] = [];
+		stubConnections(electrum, new Set(), attempts);
+
+		const res = await electrum.connectToElectrum({});
+		expect(res.isErr()).to.equal(true);
+		if (res.isErr()) {
+			expect(res.error.message).to.match(/fallback servers are disabled/);
+		}
+		expect(attempts).to.have.length(0);
 	});
 
 	it('provides a signet fallback peer entry', () => {

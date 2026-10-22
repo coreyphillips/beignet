@@ -6,6 +6,7 @@ import type {
 	IAddress,
 	IAddresses,
 	IElectrumGetAddressBalanceRes,
+	IElectrumOptions,
 	IGetAddressHistoryResponse,
 	IGetAddressScriptHashBalances,
 	IGetAddressScriptHashesHistoryResponse,
@@ -546,6 +547,8 @@ export class Electrum {
 	private connectionPollingInterval: NodeJS.Timeout | null;
 	private net: Net;
 	private tls: Tls;
+	/** Set by IElectrumOptions.disableFallbackServers. */
+	private readonly _disableFallbackServers: boolean;
 	/** Shared in-flight connect, so concurrent callers don't race (see connectToElectrum). */
 	private _connectInFlight: Promise<Result<TConnectToElectrumRes>> | null =
 		null;
@@ -626,16 +629,12 @@ export class Electrum {
 		servers,
 		batchLimit = 20,
 		batchDelay = 50,
+		disableFallbackServers = false,
 		onReceive,
 		pollConnection = true
-	}: {
+	}: IElectrumOptions & {
 		wallet: Wallet;
 		network: Network;
-		net: Net;
-		tls: Tls;
-		servers?: TServer | TServer[];
-		batchLimit?: number;
-		batchDelay?: number;
 		onReceive?: (data: unknown) => void;
 		/** False leaves the poll to an explicit startConnectionPolling(). */
 		pollConnection?: boolean;
@@ -643,6 +642,7 @@ export class Electrum {
 		this._wallet = wallet;
 		this.sendMessage = wallet.sendMessage;
 		this.servers = servers ?? [];
+		this._disableFallbackServers = disableFallbackServers;
 		this.network = network;
 		this.electrumNetwork = toElectrumNetwork(this.network);
 		this.connectedToElectrum = false;
@@ -725,7 +725,10 @@ export class Electrum {
 		}
 		const candidates = this.getServerCandidates(customPeers, electrumNetwork);
 		let connected = false;
-		let lastError = 'No Electrum servers available.';
+		// Only reported when there was no candidate to try.
+		let lastError = this._disableFallbackServers
+			? 'No Electrum server was given and fallback servers are disabled.'
+			: 'No Electrum servers available.';
 		/** Whether any candidate got past the teardown and reached a socket. */
 		let dialledAny = false;
 		/** Whether any candidate was refused because the peer would not stop. */
@@ -1098,13 +1101,15 @@ export class Electrum {
 
 	/**
 	 * Ordered rotation candidates: user-provided servers first, then the
-	 * hardcoded fallback peers for the network (never for regtest), deduped.
+	 * hardcoded fallback peers for the network (never for regtest, nor when
+	 * disableFallbackServers is set), deduped.
 	 */
 	private getServerCandidates(
 		customPeers: TServer[],
 		electrumNetwork: EElectrumNetworks
 	): TServer[] {
 		const fallback =
+			this._disableFallbackServers ||
 			electrumNetwork === EElectrumNetworks.bitcoinRegtest
 				? []
 				: defaultElectrumPeers[electrumNetwork] ?? [];

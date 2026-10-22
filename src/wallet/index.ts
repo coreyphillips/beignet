@@ -20,6 +20,7 @@ import type {
 	ICreateSignedTransactionArgs,
 	ICustomGetAddress,
 	ICustomGetScriptHash,
+	IElectrumOptions,
 	IExportDescriptorsResponse,
 	IExportedDescriptor,
 	IFormattedTransaction,
@@ -60,7 +61,6 @@ import type {
 	IWallet,
 	IWalletData,
 	IWatchOnlyWallet,
-	Net,
 	TAddressIndexInfo,
 	TAddressLabels,
 	TAddressScan,
@@ -69,7 +69,6 @@ import type {
 	TGapLimitOptions,
 	TGetData,
 	TGetTotalFeeObj,
-	Tls,
 	TMessageDataMap,
 	TOnMessage,
 	TProcessUnconfirmedTransactions,
@@ -333,13 +332,7 @@ export class Wallet {
 	public isSwitchingNetworks: boolean;
 	public readonly id: string;
 	public readonly name: string;
-	public electrumOptions?: {
-		net: Net;
-		tls: Tls;
-		servers?: TServer | TServer[];
-		batchLimit?: number; // Maximum number of requests to be sent in a single batch
-		batchDelay?: number; // Delay (in milliseconds) between each batch of requests
-	};
+	public electrumOptions?: IElectrumOptions;
 	public electrum: Electrum;
 	public addressType: EAddressType;
 	public sendMessage: TOnMessage;

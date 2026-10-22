@@ -2,12 +2,10 @@ import type { Result } from '../utils/result';
 import type { Sats } from '../utils/conversion';
 import type {
 	EElectrumNetworks,
+	IElectrumOptions,
 	IHeader,
 	INewBlock,
-	Net,
-	TServer,
-	TTxResult,
-	Tls
+	TTxResult
 } from './electrum';
 import type {
 	ECoinSelectPreference,
@@ -326,13 +324,7 @@ export interface IWallet {
 	// default for it. Off by default: the wallet's next save then overwrites
 	// whatever the storage could not read, frozen coins and labels included.
 	resetOnReadFailure?: boolean;
-	electrumOptions: {
-		net: Net;
-		tls: Tls;
-		servers?: TServer | TServer[];
-		batchLimit?: number; // Maximum number of requests to be sent in a single batch
-		batchDelay?: number; // Delay (in milliseconds) between each batch of requests
-	};
+	electrumOptions: IElectrumOptions;
 	remainOffline?: boolean;
 	onMessage?: TOnMessage;
 	// Answers every single-key address in place of the wallet's own
