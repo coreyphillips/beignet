@@ -34,7 +34,8 @@ function addChannel(
 	lo: Buffer,
 	hi: Buffer,
 	block: number,
-	feeBaseMsat = 0
+	feeBaseMsat = 0,
+	htlcMaximumMsat = 1_000_000_000n
 ): Buffer {
 	const scid = encodeShortChannelId({ block, txIndex: 0, outputIndex: 0 });
 	graph.addChannelAnnouncement({
@@ -62,7 +63,7 @@ function addChannel(
 			htlcMinimumMsat: 0n,
 			feeBaseMsat,
 			feeProportionalMillionths: 0,
-			htlcMaximumMsat: 1_000_000_000n
+			htlcMaximumMsat
 		});
 	}
 	return scid;
@@ -133,5 +134,30 @@ describe('Pathfinding: mission-control penalties (issue #1809)', () => {
 			D.toString('hex')
 		]);
 		expect(route!.totalFeeMsat).to.equal(1000n);
+	});
+
+	it('still routes over a penalized path when the cheaper one does not fit', () => {
+		// Once the X-D penalty counts, A-Y-D is A's cheapest path, but its
+		// 1000 msat fee at Y needs 11,000 msat on S-A, which carries 10,000.
+		const X = makeNodeId(3);
+		const Y = makeNodeId(5);
+		const g = new NetworkGraph();
+		addChannel(g, A, X, 300);
+		const scidXD = addChannel(g, X, D, 301);
+		addChannel(g, A, Y, 302);
+		addChannel(g, D, Y, 303, 1000);
+		addChannel(g, S, A, 304, 0, 10_000n);
+		const history = new MissionControl();
+		history.recordFailure(scidXD.toString('hex'));
+		const viaX = [A, X, D].map((node) => node.toString('hex'));
+
+		const route = findRoute(g, S, D, 10_000n, 40, 20, undefined, history);
+		expect(route).to.not.equal(null);
+		expect(hopPubkeys(route!.hops)).to.deep.equal(viaX);
+
+		const mpp = findMultiPathRoute(g, S, D, 10_000n, 40, 4, 20, history);
+		expect(mpp).to.not.equal(null);
+		expect(mpp!.parts).to.have.length(1);
+		expect(hopPubkeys(mpp!.parts[0].hops)).to.deep.equal(viaX);
 	});
 });

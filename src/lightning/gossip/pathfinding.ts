@@ -565,6 +565,24 @@ function searchRoute(
 	amountMsat: bigint,
 	usedCapacity?: Map<string, bigint>
 ): IRoute | null {
+	const route = searchCheapestRoute(search, amountMsat, usedCapacity);
+	if (route || !search.missionControl) return route;
+	// Each node keeps only its cheapest path. A penalty can make that a path
+	// needing more than an upstream channel carries, and drop the penalized
+	// one that fits. Penalties only rank routes, so they must not leave a
+	// payment with none.
+	return searchCheapestRoute(
+		{ ...search, missionControl: undefined },
+		amountMsat,
+		usedCapacity
+	);
+}
+
+function searchCheapestRoute(
+	search: IRouteSearch,
+	amountMsat: bigint,
+	usedCapacity?: Map<string, bigint>
+): IRoute | null {
 	const {
 		graph,
 		sourceHex,
