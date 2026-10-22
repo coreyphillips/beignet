@@ -41,6 +41,15 @@ beignet: property Wallet.sendMany.broadcast?: boolean
 beignet: property Wallet.sendMax.broadcast?: boolean
 beignet: const getBitcoinJsNetwork: (network: Network | `${Network}`) => bitcoinjs-lib#Network
 beignet: const getElectrumNetwork: (network: Network) => EElectrumNetworks
+beignet/lightning: property node.INodeConfig.fforConcurrent?: { enabled: boolean; }
+beignet/lightning: property node.INodeConfig.fforIssuer?: ffor.IFforIssuerConfig
+beignet/lightning: property node.INodeConfig.fforSettle?: ffor.IFforSettlePolicy
+beignet/lightning: property node.INodeConfig.fforWitness?: ffor.IFforWitnessConfig
+beignet/lightning: property node.INodeConfig.forwardingCltvDelta?: number
+beignet/lightning: property node.INodeConfig.forwardingEnabled?: boolean
+beignet/lightning: property node.INodeConfig.forwardingFeeBaseMsat?: number
+beignet/lightning: property node.INodeConfig.forwardingFeePropMillionths?: number
+beignet/lightning: property node.INodeConfig.forwardingPolicyGraceMs?: number
 beignet/lightning: method node.LightningNode.openZeroConfChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint): channel.Channel
 beignet/lightning: const recovery.GuardianStore: typeof beignet/lightning/sqlite#GuardianStore
 beignet/lightning: type recovery.GuardianStore = beignet/lightning/sqlite#GuardianStore

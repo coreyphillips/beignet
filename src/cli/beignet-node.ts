@@ -402,8 +402,8 @@ export interface BeignetNodeOptions
 	forwardingEnabled?: boolean;
 	/**
 	 * Node-wide default routing fee policy advertised in channel_update, mapped
-	 * onto the library's forwardingFeeBaseMsat / forwardingFeePropMillionths /
-	 * forwardingCltvDelta (defaults 1000 / 1 / 40). BOLT 7 encodes them as
+	 * onto the library's forwarding.feeBaseMsat / forwarding.feePropMillionths /
+	 * forwarding.cltvDelta (defaults 1000 / 1 / 40). BOLT 7 encodes them as
 	 * u32 / u32 / u16; out-of-range values are refused in init because the wire
 	 * write would otherwise wrap or throw only after gossip is being built.
 	 * Per-channel overrides via updateChannelPolicy win over these defaults.
@@ -3108,50 +3108,54 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				: undefined,
 			autoReconnect: opts.autoReconnect ?? true,
 			autoUpdateChannelFees: opts.autoUpdateChannelFees ?? false,
-			forwardingEnabled: opts.forwardingEnabled ?? true,
 			// The routing* -> forwarding* rename seam: the CLI layer speaks the
 			// operator vocabulary (and the BEIGNET_FEE_* envs), the library
 			// speaks BOLT 7 forwarding terms. Undefined keeps the library
 			// defaults (1000 / 1 / 40).
-			forwardingFeeBaseMsat: opts.routingFeeBaseMsat,
-			forwardingFeePropMillionths: opts.routingFeePpm,
-			forwardingCltvDelta: opts.routingCltvDelta,
+			forwarding: {
+				enabled: opts.forwardingEnabled ?? true,
+				feeBaseMsat: opts.routingFeeBaseMsat,
+				feePropMillionths: opts.routingFeePpm,
+				cltvDelta: opts.routingCltvDelta
+			},
 			leaseRates: opts.leaseRates,
 			// FFOR roles (issue #729). Settlement is an explicit opt-in: a
 			// daemon that was not told to answers no ff_init, whatever the
 			// feature bit says. The witness and the issuer are services this
 			// node runs for others and are off unless switched on.
-			fforConcurrent: { enabled: opts.fforConcurrent !== false },
-			fforSettle: {
-				enabled: opts.fforSettle?.enabled === true,
-				allowConcurrent: opts.fforSettleConcurrent !== false,
-				...(opts.fforSettle?.maxBudgetMsat !== undefined
-					? { maxBudgetMsat: BigInt(opts.fforSettle.maxBudgetMsat) }
+			ffor: {
+				concurrent: { enabled: opts.fforConcurrent !== false },
+				settle: {
+					enabled: opts.fforSettle?.enabled === true,
+					allowConcurrent: opts.fforSettleConcurrent !== false,
+					...(opts.fforSettle?.maxBudgetMsat !== undefined
+						? { maxBudgetMsat: BigInt(opts.fforSettle.maxBudgetMsat) }
+						: {}),
+					...(opts.fforSettle?.maxEpochBlocks !== undefined
+						? { maxEpochBlocks: opts.fforSettle.maxEpochBlocks }
+						: {}),
+					...(opts.fforSettle?.feeBaseMsat !== undefined
+						? { minFeeBaseMsat: opts.fforSettle.feeBaseMsat }
+						: {}),
+					...(opts.fforSettle?.feePpm !== undefined
+						? { minFeeProportionalMillionths: opts.fforSettle.feePpm }
+						: {})
+				},
+				...(opts.fforWitness?.enabled === true
+					? {
+							witness: {
+								enabled: true,
+								...(opts.fforWitness.maxMailboxes !== undefined
+									? { maxMailboxes: opts.fforWitness.maxMailboxes }
+									: {}),
+								...(opts.fforWitness.maxBytes !== undefined
+									? { maxBytes: opts.fforWitness.maxBytes }
+									: {})
+							}
+					  }
 					: {}),
-				...(opts.fforSettle?.maxEpochBlocks !== undefined
-					? { maxEpochBlocks: opts.fforSettle.maxEpochBlocks }
-					: {}),
-				...(opts.fforSettle?.feeBaseMsat !== undefined
-					? { minFeeBaseMsat: opts.fforSettle.feeBaseMsat }
-					: {}),
-				...(opts.fforSettle?.feePpm !== undefined
-					? { minFeeProportionalMillionths: opts.fforSettle.feePpm }
-					: {})
+				...(opts.fforIssuer === true ? { issuer: { enabled: true } } : {})
 			},
-			...(opts.fforWitness?.enabled === true
-				? {
-						fforWitness: {
-							enabled: true,
-							...(opts.fforWitness.maxMailboxes !== undefined
-								? { maxMailboxes: opts.fforWitness.maxMailboxes }
-								: {}),
-							...(opts.fforWitness.maxBytes !== undefined
-								? { maxBytes: opts.fforWitness.maxBytes }
-								: {})
-						}
-				  }
-				: {}),
-			...(opts.fforIssuer === true ? { fforIssuer: { enabled: true } } : {}),
 			// The LSP engine only exists when explicitly switched on; the client
 			// ceilings apply either way, because asking an LSP for a JIT receive
 			// is not the same role as being one.

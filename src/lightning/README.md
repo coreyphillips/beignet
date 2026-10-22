@@ -198,7 +198,9 @@ await node.destroy();
 
 ### Creating a LightningNode
 
-`fromMnemonic()` covers most cases. Use the constructor when you need a config field it does not expose (for example `channelConfig`, `reestablishTimeoutBlocks`, `htlcSafetyMargin`, `signerFactory`, `resourceConfig`, or the individual basepoint secrets).
+`fromMnemonic()` takes every `INodeConfig` option except the key material, which it derives from the seed. Use the constructor when the keys come from somewhere else.
+
+`node.resolveNodeConfig(config)` returns the config a node runs with: every default filled in and the deprecated flat names folded into their groups. It holds every default the node applies; options it hands straight to a component, such as `channelConfig` or `maxInboundPeers`, keep that component's default.
 
 ```typescript
 const config: ln.INodeConfig = {
@@ -252,10 +254,16 @@ Generated from `node/types.ts` by `npm run docs:tables`; edit the doc comments t
 | `autoReconnect?` | `boolean` | Enable auto-reconnection (default false) |
 | `autoReleaseHeldForwards?` | `boolean` | Async receive (issue #708): when an LSP reports holds parked for this node, sign and send the release capability automatically for holds whose payment the node can vouch for (default true). Off, the host releases from the 'payment:held-notice' event via sendAsyncRelease. |
 | `asyncReceiveService?` | `IAsyncReceiveServiceConfig` | Async receive service, LSP role (issue #709). Absent or `enabled: false` (the default): this node parks NO hold_htlc forward, advertises no ASYNC_RECEIVE_SERVICE bit and answers no registration; the marker is treated as an unknown odd TLV. Enabled: channel peers may register (signed grant with the ceilings and fee schedule below) and only holds under an active registration are admitted, within the limits. |
-| `fforWitness?` | `IFforWitnessConfig` | FFOR D-R receipt witness (spec section 9.6): store a receiver-encrypted record of every delegated preimage this node relays, before propagating the fulfil, and serve it to the receiver on return. Disabled by default. |
-| `fforIssuer?` | `IFforIssuerConfig` | FFOR BOLT 12 issuer (spec section 9.7): answer invoice_requests for offers a receiver delegated to this node, one fixed-amount slot per invoice. Needs `fforWitness` (the issuer is co-hosted with the first witness, whose mailbox holds the book). Disabled by default. |
-| `fforSettle?` | `IFforSettlePolicy` | Whether this node answers ff_init as a settlement peer, and on what terms (issue #729). Absent answers on any terms (the library default); a daemon passes `enabled: false` unless its operator opted in. |
-| `fforConcurrent?` | `object` | FFOR concurrent receive (docs/specs/CONCURRENT-RECEIVE.md). Enabled by default when option_ff_receive and option_quiesce are present. Explicit true requires both dependencies. Explicit false clears bits 562/563 and refuses peers requiring the feature. Epochs still select their profile explicitly. To refuse only new concurrent books, set `fforSettle.allowConcurrent: false` and retain this advertisement for existing books. The feature assignment remains experimental. |
+| `ffor?` | `object` | The FFOR roles this node plays for its peers. |
+| `ffor.settle?` | `IFforSettlePolicy` | Whether this node answers ff_init as a settlement peer, and on what terms (issue #729). Absent answers on any terms (the library default); a daemon passes `enabled: false` unless its operator opted in. |
+| `ffor.concurrent?` | `object` | FFOR concurrent receive (docs/specs/CONCURRENT-RECEIVE.md). Enabled by default when option_ff_receive and option_quiesce are present. Explicit true requires both dependencies. Explicit false clears bits 562/563 and refuses peers requiring the feature. Epochs still select their profile explicitly. To refuse only new concurrent books, set `ffor.settle.allowConcurrent: false` and retain this advertisement for existing books. The feature assignment remains experimental. |
+| `ffor.concurrent.enabled` | `boolean` | Advertise concurrent receive, feature bits 562/563. |
+| `ffor.witness?` | `IFforWitnessConfig` | FFOR D-R receipt witness (spec section 9.6): store a receiver-encrypted record of every delegated preimage this node relays, before propagating the fulfil, and serve it to the receiver on return. Disabled by default. |
+| `ffor.issuer?` | `IFforIssuerConfig` | FFOR BOLT 12 issuer (spec section 9.7): answer invoice_requests for offers a receiver delegated to this node, one fixed-amount slot per invoice. Needs `ffor.witness` (the issuer is co-hosted with the first witness, whose mailbox holds the book). Disabled by default. |
+| `fforWitness?` | `IFforWitnessConfig` | **Deprecated.** Use `ffor.witness`. |
+| `fforIssuer?` | `IFforIssuerConfig` | **Deprecated.** Use `ffor.issuer`. |
+| `fforSettle?` | `IFforSettlePolicy` | **Deprecated.** Use `ffor.settle`. |
+| `fforConcurrent?` | `object` | **Deprecated.** Use `ffor.concurrent`. |
 | `fforConcurrent.enabled` | `boolean` | Advertise concurrent receive, feature bits 562/563. |
 | `maxReconnectDelay?` | `number` | Max reconnect delay in ms |
 | `maxInboundPeers?` | `number` | Inbound peer connections (default 125). Once this many are up, only peers holding a channel with this node are admitted. |
@@ -274,7 +282,13 @@ Generated from `node/types.ts` by `npm run docs:tables`; edit the doc comments t
 | `recovery.unknownChannelReestablishHoldMs?` | `number` | How long an inbound channel_reestablish naming a channel this node has NO record of is held before the BOLT 1 error goes out (5.7, issue #462). Absent or 0 answers immediately, which is what every mode but peer-storage wants. |
 | `chainBackend?` | `IChainBackend` | Chain backend for blockchain monitoring (Electrum, Esplora, etc.) |
 | `htlcSafetyMargin?` | `number` | HTLC safety margin in blocks before force-failing expiring HTLCs (default 6) |
-| `forwardingEnabled?` | `boolean` | Whether to relay third-party HTLCs (be a routing hop). Default true, which preserves the historical behaviour: any node with an announced channel forwards. Set false to decline all forwards (a wallet that does not want to route); declined forwards fail back promptly with temporary_node_failure, and our channel_updates advertise the BOLT 7 disable bit so route finders stop selecting us. Does not affect our own sends or receives. |
+| `forwarding?` | `object` | Whether and on what terms this node relays third-party HTLCs. |
+| `forwarding.enabled?` | `boolean` | Whether to relay third-party HTLCs (be a routing hop). Default true, which preserves the historical behaviour: any node with an announced channel forwards. Set false to decline all forwards (a wallet that does not want to route); declined forwards fail back promptly with temporary_node_failure, and our channel_updates advertise the BOLT 7 disable bit so route finders stop selecting us. Does not affect our own sends or receives. |
+| `forwarding.cltvDelta?` | `number` | CLTV delta for forwarding (default 40). |
+| `forwarding.feeBaseMsat?` | `number` | Base fee in msat for forwarding (default 1000). |
+| `forwarding.feePropMillionths?` | `number` | Proportional fee in millionths for forwarding (default 1). |
+| `forwarding.policyGraceMs?` | `number` | How long a forward may still satisfy the PREVIOUS policy after a fee or CLTV increase on a channel (default 600000, ten minutes; 0 disables). A receiver authors the relay terms of a blinded path from the policy it read at build time and a blinded payer cannot retry with new terms, so the window lets outstanding invoices survive a bump, the way a channel_update's grace does for cleartext forwards. |
+| `forwardingEnabled?` | `boolean` | **Deprecated.** Use `forwarding.enabled`. |
 | `eagerGossipVerify?` | `boolean` | Whether to signature-verify foreign broadcast gossip at intake. Default false: entries are admitted with deferred provenance and verified only when a gossip query asks for them, which skips nearly the entire first-dump verification cost for wallet nodes (issue #443). Nothing unverified is ever served to gossip queries in either mode. Set true on relay-class nodes that want to serve the graph: intake and restore then verify eagerly, and signatureless RGS-primed entries are re-requested from peers so their signed copies become servable. |
 | `cooperativeGraphRestore?` | `boolean` | Bring back the stored network map a time slice at a time after the constructor returns, rather than inside it (default false). A phone's JavaScript thread is otherwise held for seconds as its wallet opens. Until the restore ends, gossip that would write the graph waits for it, and route finding finishes it first (whenGraphRestored). |
 | `jitReceive?` | `IJitReceiveConfig` | JIT channel receive, LSP role (issue #594): hold HTLCs addressed to intercept SCIDs this node minted for wallet peers, fund a zero-conf channel to the client (or splice its existing one bigger), then forward. Off unless `enabled` is set; the caps in IJitReceiveConfig are the only ceiling on what this node will front with its own coins. |
@@ -283,10 +297,10 @@ Generated from `node/types.ts` by `npm run docs:tables`; edit the doc comments t
 | `jitReceiveClient.maxFeePpm?` | `number` | Proportional part ceiling (ppm); default JIT_CLIENT_MAX_FEE_PPM. |
 | `directFunding?` | `IDirectFundingNodeConfig` | Third-party direct funding (issue #532 phase 4): an unrelated payer's on-chain payment becomes this node's channel funding. Absent means the whole feature, lanes included, is never constructed. |
 | `swaps?` | `ISwapNodeConfig` | Swap provider foundations (issue #737): the durable swap ledger and the operator's exposure and confirmation policies. The provider engines arrive separately; with `enabled` the ledger is built and rehydrated at construction so no engine ever serves from an empty view. |
-| `forwardingCltvDelta?` | `number` | CLTV delta for forwarding (default 40) |
-| `forwardingFeeBaseMsat?` | `number` | Base fee in msat for forwarding (default 1000) |
-| `forwardingFeePropMillionths?` | `number` | Proportional fee in millionths for forwarding (default 1) |
-| `forwardingPolicyGraceMs?` | `number` | How long a forward may still satisfy the PREVIOUS policy after a fee or CLTV increase on a channel (default 600000, ten minutes; 0 disables). A receiver authors the relay terms of a blinded path from the policy it read at build time and a blinded payer cannot retry with new terms, so the window lets outstanding invoices survive a bump, the way a channel_update's grace does for cleartext forwards. |
+| `forwardingCltvDelta?` | `number` | **Deprecated.** Use `forwarding.cltvDelta`. |
+| `forwardingFeeBaseMsat?` | `number` | **Deprecated.** Use `forwarding.feeBaseMsat`. |
+| `forwardingFeePropMillionths?` | `number` | **Deprecated.** Use `forwarding.feePropMillionths`. |
+| `forwardingPolicyGraceMs?` | `number` | **Deprecated.** Use `forwarding.policyGraceMs`. |
 | `mppTimeoutMs?` | `number` | MPP partial payment timeout in ms (default 60000) |
 | `alias?` | `string` | Human-readable node alias (max 32 bytes UTF-8, per BOLT 7) |
 | `announcedAddresses?` | `INodeAddress[]` | Addresses to advertise in our node_announcement (BOLT 7 descriptors, e.g. from parseAnnouncedAddress). Only meaningful once the node has at least one announced (public) channel. |
@@ -1220,7 +1234,7 @@ node.on('htlc:forwarded', (info) => {
 });
 ```
 
-Set `forwardingEnabled: false` to decline all third-party forwards: they fail back promptly with `temporary_node_failure` and our `channel_update`s advertise the BOLT 7 disable bit. This does not affect our own sends and receives.
+Set `forwarding: { enabled: false }` to decline all third-party forwards: they fail back promptly with `temporary_node_failure` and our `channel_update`s advertise the BOLT 7 disable bit. This does not affect our own sends and receives.
 
 ### Chain Monitoring
 
@@ -1422,7 +1436,7 @@ The `node:ready` event fires once when the node is fully operational. If no peer
 
 ## Stuck-Channel Timeout: `reestablishTimeoutBlocks`
 
-Channels stuck in `AWAITING_REESTABLISH` (peer disappeared permanently) are auto-force-closed after `reestablishTimeoutBlocks` blocks (default 2016, roughly 2 weeks). This is an `INodeConfig` field, so it goes through the constructor: `fromMnemonic()` does not expose it.
+Channels stuck in `AWAITING_REESTABLISH` (peer disappeared permanently) are auto-force-closed after `reestablishTimeoutBlocks` blocks (default 2016, roughly 2 weeks). Set it with the `reestablishTimeoutBlocks` option.
 
 ```typescript
 const node = new ln.LightningNode({
