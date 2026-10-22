@@ -994,7 +994,17 @@ export class LightningNode extends EventEmitter {
 	private peerManager: PeerManager | null = null;
 	private payments: Map<string, IPaymentInfo> = new Map();
 	private prunedPayAllBudgets = new Map<string, IPayAllBudget>();
+	/**
+	 * Every archive row storage holds: loaded at startup, and only replaced by
+	 * rememberFforVoucher after the commit that wrote it. Custody preparation
+	 * reads previous rows from here, not from storage.
+	 */
 	private fforArchivedVouchers = new Map<string, IFforVoucherArchive>();
+	/** The same records by channel id, for preparation that runs on every save. */
+	private fforArchivedVouchersByChannel = new Map<
+		string,
+		Map<string, IFforVoucherArchive>
+	>();
 	private readonly fforVoucherIndex = new FforVoucherIndex();
 	private pendingFforVoucherCredits = new Map<string, IFforVoucherCredit>();
 	private preimages: Map<string, Buffer> = new Map();
@@ -4078,11 +4088,11 @@ export class LightningNode extends EventEmitter {
 					const records = archiveFforVouchers(channelIdHex, epoch);
 					this.fforVoucherIndex.assertAvailableAll(records);
 					for (const record of records) {
-						const previous = this.storage!.loadFforVoucher!(
-							fforVoucherArchiveId(record)
-						);
+						const previous =
+							this.fforArchivedVouchers.get(fforVoucherArchiveId(record)) ??
+							null;
 						const merged = mergeFforVoucherArchive(previous, record);
-						if (JSON.stringify(previous) !== JSON.stringify(merged)) {
+						if (merged !== previous) {
 							mutations.push({ type: 'ffor_voucher', record: merged });
 						}
 					}
@@ -4462,18 +4472,27 @@ export class LightningNode extends EventEmitter {
 			return true;
 		return this.safeStorage(() => {
 			const records = new Map(
-				[...this.fforArchivedVouchers].filter(
-					([, r]) => r.channelId === channelId
-				)
+				this.fforArchivedVouchersByChannel.get(channelId)
 			);
-			for (const mutation of mutations) {
-				if (mutation.type === 'ffor_voucher')
-					records.set(fforVoucherArchiveId(mutation.record), mutation.record);
-			}
-			for (const record of records.values()) {
+			const queued = new Map<string, number>();
+			mutations.forEach((mutation, i) => {
+				if (mutation.type !== 'ffor_voucher') return;
+				const id = fforVoucherArchiveId(mutation.record);
+				records.set(id, mutation.record);
+				queued.set(id, i);
+			});
+			for (const [id, record] of records) {
 				const next = archiveFforChainEvidence(record, monitor.state);
-				if (JSON.stringify(next) !== JSON.stringify(record))
-					mutations.push({ type: 'ffor_voucher', record: next });
+				if (next === record) continue;
+				// A slot this transaction already writes takes the extended
+				// record in place, so it is written once.
+				const i = queued.get(id);
+				const mutation: RecoveryMutation = {
+					type: 'ffor_voucher',
+					record: next
+				};
+				if (i === undefined) mutations.push(mutation);
+				else mutations[i] = mutation;
 			}
 		}, 'prepare voucher chain custody');
 	}
@@ -20798,7 +20817,7 @@ export class LightningNode extends EventEmitter {
 				const previous =
 					this.fforArchivedVouchers.get(fforVoucherArchiveId(record)) ?? null;
 				const merged = mergeFforVoucherArchive(previous, record);
-				if (JSON.stringify(previous) !== JSON.stringify(merged))
+				if (merged !== previous)
 					mutations.push({ type: 'ffor_voucher', record: merged });
 			}
 		}
@@ -20822,6 +20841,12 @@ export class LightningNode extends EventEmitter {
 		const id = fforVoucherArchiveId(record);
 		const previous = this.fforArchivedVouchers.get(id);
 		this.fforArchivedVouchers.set(id, record);
+		let channel = this.fforArchivedVouchersByChannel.get(record.channelId);
+		if (!channel) {
+			channel = new Map();
+			this.fforArchivedVouchersByChannel.set(record.channelId, channel);
+		}
+		channel.set(id, record);
 		if (
 			previous &&
 			!previous.outcome &&
@@ -20859,13 +20884,13 @@ export class LightningNode extends EventEmitter {
 				);
 			}
 		}
-		const records = [...this.fforArchivedVouchers].filter(
-			([, record]) => record.channelId === channelIdHex
-		);
+		const records = [
+			...(this.fforArchivedVouchersByChannel.get(channelIdHex)?.values() ?? [])
+		];
 		if (!records.length) return;
 		const monitor = this.channelManager.getMonitor(channelId)?.getFullState();
 		if (!monitor) return;
-		for (const [, record] of records) {
+		for (const record of records) {
 			this.rememberFforVoucher(archiveFforChainEvidence(record, monitor));
 		}
 	}

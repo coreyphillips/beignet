@@ -176,7 +176,11 @@ export function validateFforVoucherArchive(
 	return record;
 }
 
-/** Merge only additional evidence. Neither identity nor a terminal outcome can change. */
+/**
+ * Merge only additional evidence. Neither identity nor a terminal outcome can
+ * change. Returns `previous` itself when `incoming` adds nothing, so callers
+ * can tell whether a write is needed by comparing references.
+ */
 export function mergeFforVoucherArchive(
 	previous: IFforVoucherArchive | null,
 	incoming: IFforVoucherArchive
@@ -233,6 +237,14 @@ export function mergeFforVoucherArchive(
 		previous.creditedReceiptId !== incoming.creditedReceiptId
 	)
 		throw new Error('FFOR voucher credit source changed');
+	if (
+		chainResolutions.length === (previous.chainResolutions?.length ?? 0) &&
+		chainObservations.length === (previous.chainObservations?.length ?? 0) &&
+		(!incoming.preimage || previous.preimage) &&
+		(!incoming.outcome || previous.outcome) &&
+		(!incoming.creditedReceiptId || previous.creditedReceiptId)
+	)
+		return previous;
 	return validateFforVoucherArchive({
 		...incoming,
 		...(previous.preimage ? { preimage: previous.preimage } : {}),
