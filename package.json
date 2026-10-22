@@ -152,9 +152,9 @@
   },
   "optionalDependencies": {
     "@number0/iroh": "1.1.0",
-    "better-sqlite3": "^12.6.2"
+    "better-sqlite3": "^12.11.1"
   },
   "allowScripts": {
-    "better-sqlite3@12.6.2": true
+    "better-sqlite3@12.11.1": true
   }
 }
