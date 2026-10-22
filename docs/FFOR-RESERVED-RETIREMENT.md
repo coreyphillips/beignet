@@ -4,7 +4,7 @@ Concurrent version 2 preserves unresolved voucher claims when a receiver closes
 an offline receive book early. Ordinary online payments can continue using the
 channel's remaining capacity. This extension is experimental. Feature bits
 562/563 are advertised by default when their dependencies are enabled. Explicit
-`fforConcurrent.enabled: false` disables advertisement; `fforSettle.allowConcurrent:
+`ffor.concurrent.enabled: false` disables advertisement; `ffor.settle.allowConcurrent:
 false` refuses new books while retaining support for existing ones.
 
 ## Negotiation and retirement

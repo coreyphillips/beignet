@@ -57,7 +57,6 @@ import type { TxidHex } from '../../utils/identifiers';
 import type { LightningNodeEvents, NodeErrorCode } from './events';
 import { randomBytes, sha256 } from '../crypto/provider';
 import type { ILogger } from '../../logger';
-import { noopLogger } from '../../logger';
 import { getPublicKey } from '../crypto/ecdh';
 import {
 	signMessageWithKey,
@@ -247,7 +246,6 @@ import { GuardianHost } from '../recovery/guardian-host';
 import { JOURNAL_META_KEYS } from '../recovery/journal';
 import type {
 	IHeldJitPart,
-	IJitReceiveConfig,
 	IJitReceiveQuote,
 	JitFeeMode,
 	IPersistedHeldPart
@@ -274,7 +272,6 @@ import type {
 	DfTransportDescriptor
 } from '../direct-funding';
 import {
-	DF_DEFAULT_REQUEST_TTL_MS,
 	DfTransportType,
 	DirectFundingReceiver,
 	DirectFundingRequestStore,
@@ -301,12 +298,17 @@ import {
 	ReverseSwapProvider,
 	REVERSE_SWAP_EVENTS,
 	SubmarineSwapProvider,
-	SUBMARINE_SWAP_EVENTS,
-	REVERSE_SWAP_DEFAULTS,
-	REVERSE_SWAP_DEFAULT_EXPOSURE
+	SUBMARINE_SWAP_EVENTS
 } from '../swaps';
+import {
+	HELD_HTLC_EXPIRY_MARGIN,
+	INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
+	resolveNodeConfig
+} from './config';
+import type { ResolvedNodeConfig } from './config';
 import type {
 	INodeConfig,
+	LightningNodeSeedOptions,
 	IResourceConfig,
 	IPaymentInfo,
 	ICreateInvoiceOptions,
@@ -331,7 +333,6 @@ import type {
 	HoldCancelReason,
 	HoldInvoiceState,
 	ISendPaymentOptions,
-	ISwapNodeConfig,
 	IOutgoingPaymentResolution,
 	IOutgoingHtlcView,
 	OutgoingHtlcState,
@@ -348,12 +349,9 @@ import type {
 	IChannelPolicy,
 	IChannelPolicyUpdate,
 	ForwardPlacement,
-	IAutoRebalanceConfig,
-	IAutoTuneFeesConfig,
 	IRebalanceResult,
 	IRebalanceAttempt,
 	IRebalanceExecutionSummary,
-	IDirectFundingNodeConfig,
 	IDirectFundingPolicy
 } from './types';
 import {
@@ -623,11 +621,7 @@ import {
 	MIN_REBALANCE_SATS
 } from '../advisor/rebalance-planner';
 import type { IFeeTuneInput, IFeeTuneAdjustment } from '../advisor/fee-tuner';
-import {
-	computeFeeTuneAdjustments,
-	DEFAULT_FEE_TUNE_FLOOR_PPM,
-	DEFAULT_FEE_TUNE_CEIL_PPM
-} from '../advisor/fee-tuner';
+import { computeFeeTuneAdjustments } from '../advisor/fee-tuner';
 
 bitcoin.initEccLib(ecc);
 
@@ -638,12 +632,11 @@ bitcoin.initEccLib(ecc);
  */
 const GOSSIP_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
-/**
- * Blocks of headroom before a parked hold-invoice HTLC's CLTV expiry at which we
- * auto-fail it off-chain, rather than letting it force an on-chain timeout (which
- * would close the channel). Mirrors the safety margin used for forwarded HTLCs.
- */
-export const HELD_HTLC_EXPIRY_MARGIN = 18;
+export {
+	HELD_HTLC_EXPIRY_MARGIN,
+	JIT_CLIENT_MAX_FLAT_FEE_SAT,
+	JIT_CLIENT_MAX_FEE_PPM
+} from './config';
 /**
  * Parts one hold invoice may park at once. Each parked part holds an inbound
  * HTLC slot until the hold resolves, and a swap hands out hold invoices to
@@ -870,15 +863,6 @@ const JIT_RECEIVE_HINT_CLTV_DELTA = 80;
 const JIT_RECEIVE_MIN_FINAL_CLTV_EXPIRY = 72;
 
 /**
- * Wallet-role refusal ceilings on an LSP's opening-fee quote. Blunt guards,
- * not a price: they exist so a peer cannot answer an intent with a quote the
- * operator never agreed to and have the wallet register an allowance for it.
- * Both are configurable through `jitReceiveClient`.
- */
-export const JIT_CLIENT_MAX_FLAT_FEE_SAT = 10_000n;
-export const JIT_CLIENT_MAX_FEE_PPM = 50_000;
-
-/**
  * Wallet-data key holding the direct-funding operator policy (issue #613). The
  * colon segments can never collide with on-chain wallet keys, which always end
  * in an IWalletData field name.
@@ -909,9 +893,6 @@ interface IForwardingPolicyTerms {
 	feeProportionalMillionths: number;
 	cltvExpiryDelta: number;
 }
-
-/** Ten minutes: the grace LND gives a superseded channel_update. */
-const DEFAULT_FORWARDING_POLICY_GRACE_MS = 10 * 60 * 1000;
 
 /** The channel rows startup reads once and shares across its passes. */
 type StoredChannelRows = ReturnType<IStorageBackend['loadAllChannels']>;
@@ -1615,8 +1596,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private feeAdvisor = new FeeAdvisor();
 	private channelSuggestions = new ChannelSuggestions();
 	// Advisor execution (both OFF by default; see INodeConfig)
-	private autoRebalanceConfig: IAutoRebalanceConfig;
-	private autoTuneFeesConfig: IAutoTuneFeesConfig;
+	private autoRebalanceConfig: ResolvedNodeConfig['autoRebalance'];
+	private autoTuneFeesConfig: ResolvedNodeConfig['autoTuneFees'];
 	private autoRebalanceTimer: ReturnType<typeof setInterval> | null = null;
 	private autoTuneFeesTimer: ReturnType<typeof setInterval> | null = null;
 	/** Rebalance-fee spend for the current UTC day (mirrors persisted metadata). */
@@ -1699,14 +1680,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	/** A journaled commit landed after the last compose (see connect path). */
 	private capsuleDirty = false;
 
-	constructor(config: INodeConfig) {
+	constructor(nodeConfig: INodeConfig) {
 		super();
 		this.setMaxListeners(50);
+		const config = resolveNodeConfig(nodeConfig);
 
 		this.nodePrivkey = config.nodePrivateKey;
 		this.ownNodeIdBytes = getPublicKey(config.nodePrivateKey);
 		this.nodeId = this.ownNodeIdBytes.toString('hex');
-		this.network = config.network || Network.REGTEST;
+		this.network = config.network;
 		this.acceptableChainHashes = config.chainHashes ?? [];
 		this.storage = config.storage || null;
 		if (this.storage) {
@@ -1746,18 +1728,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// frame part of every safety transition's atomicity.
 		// Phase 6 (5.8): the durability mode every frame declares, and the
 		// barrier that holds wire messages until their frame is replicated.
-		// async-remote is the default because it is exactly the node's
-		// pre-Phase-6 conduct.
-		const barrier = config.recovery?.barrier;
+		const barrier = config.recovery.barrier;
 		// The journal is built before the logger field is assigned, and its
 		// sticky-durability check reports through onDurabilityRefused during
 		// construction, so the message is captured and logged below rather
 		// than reaching for a logger that does not exist yet.
 		let durabilityRefusal: string | null = null;
 		const journal =
-			this.storage &&
-			config.recovery?.enabled === true &&
-			journalSupported(this.storage)
+			this.storage && config.recovery.enabled && journalSupported(this.storage)
 				? new RecoveryJournal(
 						this.storage,
 						deriveRecoveryMasterKey(config.nodePrivateKey),
@@ -1766,7 +1744,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						// (wire spec 1.1, 3.2); never the public node id.
 						deriveRecoveryRoot(config.nodePrivateKey).recoveryId,
 						{
-							durability: config.recovery.durability ?? 'async-remote',
+							durability: config.recovery.durability,
 							// Binds every frame's epoch to the ACTIVE lease
 							// (import-cycle-free injection): a mismatched or
 							// vanished epoch record refuses the write instead
@@ -1864,7 +1842,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// the peer_storage Recovery Capsule.
 		this.recoveryCapsuleActive = journal !== undefined;
 		this.recoveryJournal = journal;
-		this.recoveryGuardians = config.recovery?.guardians ?? [];
+		this.recoveryGuardians = config.recovery.guardians;
 		this.recovery = this.storage
 			? new RecoveryManager(this.storage, {
 					journal,
@@ -1893,29 +1871,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			  })
 			: null;
 
-		this.resourceConfig = {
-			maxCompletedPayments:
-				config.resourceConfig?.maxCompletedPayments ?? 10_000,
-			completedPaymentTtlMs:
-				config.resourceConfig?.completedPaymentTtlMs ?? 86_400_000,
-			cleanupIntervalMs: config.resourceConfig?.cleanupIntervalMs ?? 60_000
-		};
+		this.resourceConfig = { ...config.resourceConfig };
 
-		this.htlcSafetyMargin = config.htlcSafetyMargin ?? 6;
-		this.forwardingEnabled = config.forwardingEnabled ?? true;
-		this.eagerGossipVerify = config.eagerGossipVerify ?? false;
-		this.cooperativeGraphRestore = config.cooperativeGraphRestore ?? false;
-		this.forwardingCltvDelta = config.forwardingCltvDelta ?? 40;
-		this.forwardingFeeBaseMsat = config.forwardingFeeBaseMsat ?? 1000;
-		this.forwardingFeePropMillionths = config.forwardingFeePropMillionths ?? 1;
-		this.forwardingPolicyGraceMs =
-			config.forwardingPolicyGraceMs ?? DEFAULT_FORWARDING_POLICY_GRACE_MS;
-		this.mppTimeoutMs = config.mppTimeoutMs ?? 60_000;
+		this.htlcSafetyMargin = config.htlcSafetyMargin;
+		this.forwardingEnabled = config.forwarding.enabled;
+		this.eagerGossipVerify = config.eagerGossipVerify;
+		this.cooperativeGraphRestore = config.cooperativeGraphRestore;
+		this.forwardingCltvDelta = config.forwarding.cltvDelta;
+		this.forwardingFeeBaseMsat = config.forwarding.feeBaseMsat;
+		this.forwardingFeePropMillionths = config.forwarding.feePropMillionths;
+		this.forwardingPolicyGraceMs = config.forwarding.policyGraceMs;
+		this.mppTimeoutMs = config.mppTimeoutMs;
 		this.alias = config.alias;
-		// BOLT 7 requires address descriptors in ascending order by type.
-		this.announcedAddresses = [...(config.announcedAddresses ?? [])].sort(
-			(a, b) => a.type - b.type
-		);
+		this.announcedAddresses = config.announcedAddresses;
 		this.fundingPubkey = config.channelBasepoints.fundingPubkey;
 		this.fundingProvider = config.fundingProvider || null;
 		this.fundingPrivkey = config.fundingPrivkey;
@@ -1927,26 +1895,24 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.paymentBasepointSecret = config.paymentBasepointSecret;
 		this.feeEstimator = config.feeEstimator || null;
 		this.socks5Proxy = config.socks5Proxy ?? null;
-		this.socks5ProxyScope = config.socks5ProxyScope ?? 'all';
-		this.initWatchtowerClient(config.watchtowers ?? []);
-		this.logger = config.logger ?? noopLogger;
+		this.socks5ProxyScope = config.socks5ProxyScope;
+		this.initWatchtowerClient(config.watchtowers);
+		this.logger = config.logger;
 		if (durabilityRefusal) {
 			this.logger.warn(`recovery durability: ${durabilityRefusal}`);
 		}
 		this.missionControl = new MissionControl();
-		this.maxPaymentRetries = config.maxPaymentRetries ?? 3;
-		this.maxTotalInFlightHtlcs = config.maxTotalInFlightHtlcs ?? 1000;
+		this.maxPaymentRetries = config.maxPaymentRetries;
+		this.maxTotalInFlightHtlcs = config.maxTotalInFlightHtlcs;
 		this.rateLimiter = new PeerRateLimiter(config.rateLimitConfig);
-		this.reestablishTimeoutBlocks = config.reestablishTimeoutBlocks ?? 2016;
-		// Off by default: periodically bumping the commitment feerate via update_fee
-		// repeatedly desynced channels (the fee round must complete with the peer, and
-		// a stale/uncommitted bump breaks every subsequent HTLC). A payment-focused
+		this.reestablishTimeoutBlocks = config.reestablishTimeoutBlocks;
+		// Periodically bumping the commitment feerate via update_fee repeatedly
+		// desynced channels (the fee round must complete with the peer, and a
+		// stale/uncommitted bump breaks every subsequent HTLC). A payment-focused
 		// node rarely needs it; opt in explicitly if you route and must track fees.
-		this.autoUpdateChannelFees = config.autoUpdateChannelFees ?? false;
-		// Anchors are the default channel type now that wallet-funded fee bumping
-		// (zero-fee HTLC fee-attach + commitment CPFP) makes their force-close safe.
-		// Escape hatch: pass preferAnchors: false to negotiate legacy static_remotekey.
-		const preferAnchors = config.preferAnchors ?? true;
+		this.autoUpdateChannelFees = config.autoUpdateChannelFees;
+		// Pass preferAnchors: false to negotiate legacy static_remotekey.
+		const preferAnchors = config.preferAnchors;
 
 		// Set default features if not provided (includes static_remotekey).
 		// Computed before the ChannelManager so per-peer feature-dependent
@@ -1960,12 +1926,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		) {
 			localFeatures.setOptional(Feature.ANCHOR_ZERO_FEE_HTLC);
 		}
-		// option_wumbo: advertise large_channels by default, matching LND, CLN and
-		// Eclair, which all default to wumbo. The bit only invites peers to propose
-		// > 2^24 sat fundings; the cap is lifted for a given peer only when wumbo is
-		// advertised on BOTH sides (see maxFundingForPeer), so a non-wumbo peer still
-		// gets the 2^24 cap. Opt out with largeChannels: false.
-		this.largeChannels = config.largeChannels ?? true;
+		// option_wumbo: the bit only invites peers to propose > 2^24 sat
+		// fundings; the cap is lifted for a given peer only when wumbo is
+		// advertised on BOTH sides (see maxFundingForPeer), so a non-wumbo peer
+		// still gets the 2^24 cap. Opt out with largeChannels: false.
+		this.largeChannels = config.largeChannels;
 		if (this.largeChannels) {
 			localFeatures.setOptional(Feature.LARGE_CHANNELS);
 		}
@@ -1979,10 +1944,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (config.leaseRates) {
 			localFeatures.setOptional(Feature.OPTION_WILL_FUND);
 		}
-		// Peer storage (option_provide_storage): on by default. When disabled,
-		// the bit must not be advertised: advertising it obliges us to store
-		// and return blobs (BOLT 1).
-		this.peerStorageEnabled = config.peerStorageEnabled ?? true;
+		// Peer storage (option_provide_storage). When disabled, the bit must
+		// not be advertised: advertising it obliges us to store and return
+		// blobs (BOLT 1).
+		this.peerStorageEnabled = config.peerStorageEnabled;
 		if (!this.peerStorageEnabled) {
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE);
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE + 1);
@@ -2018,29 +1983,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const concurrentDependencies =
 			localFeatures.hasFeature(Feature.OPTION_FF_RECEIVE) &&
 			localFeatures.hasFeature(Feature.QUIESCE);
-		if (config.fforConcurrent?.enabled === true && !concurrentDependencies) {
+		if (config.ffor.concurrent?.enabled === true && !concurrentDependencies) {
 			throw new Error(
 				'fforConcurrent needs option_ff_receive and option_quiesce in the feature set'
 			);
 		}
-		if (config.fforConcurrent?.enabled !== false && concurrentDependencies) {
+		if (config.ffor.concurrent?.enabled !== false && concurrentDependencies) {
 			localFeatures.setOptional(Feature.OPTION_FF_CONCURRENT);
 		} else {
 			localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT);
 			localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT + 1);
 		}
-		const zeroReserveRole =
-			config.zeroReserve?.role ??
-			(config.jitReceive?.enabled || config.zeroReserve?.waiveClientReserve
-				? 'primary'
-				: 'wallet');
-		// Qualified wallets accept waivers by default. Primaries still need
-		// the operator setting, and an explicit advertisement opt-out wins.
-		const advertiseZeroReserve =
-			config.zeroReserve?.advertise ??
-			(zeroReserveRole === 'wallet' ||
-				config.zeroReserve?.waiveClientReserve === true);
-		if (advertiseZeroReserve) {
+		if (config.zeroReserve.advertise) {
 			localFeatures.setOptional(Feature.OPTION_ZERO_RESERVE);
 		} else {
 			localFeatures.clearBit(Feature.OPTION_ZERO_RESERVE);
@@ -2054,10 +2008,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					? undefined
 					: (hash) => this.fforVoucherIndex.get(hash),
 			localFeatures,
-			zeroReserve: {
-				...config.zeroReserve,
-				role: zeroReserveRole
-			},
+			zeroReserve: { ...config.zeroReserve },
 			localConfig: config.channelConfig,
 			localBasepoints: config.channelBasepoints,
 			localPerCommitmentSeed: config.perCommitmentSeed,
@@ -2098,7 +2049,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// for this long instead of failing it. Unset everywhere else, where
 			// the manager answers immediately exactly as before.
 			unknownChannelReestablishHoldMs:
-				config.recovery?.unknownChannelReestablishHoldMs,
+				config.recovery.unknownChannelReestablishHoldMs,
 			// Liquidity ads seller policy (bLIP-0051): sign will_fund for inbound
 			// request_funds and fund the contribution via the fundingProvider.
 			leaseRates: config.leaseRates,
@@ -2314,15 +2265,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			);
 			this.swapLedger.rehydrate();
 		}
-		this.autoReleaseHeldForwards = config.autoReleaseHeldForwards ?? true;
+		this.autoReleaseHeldForwards = config.autoReleaseHeldForwards;
 		// FFOR settlement peer (issue #729): whether ff_init is answered here.
-		if (config.fforSettle) {
-			this.channelManager.setFforSettlePolicy(config.fforSettle);
+		if (config.ffor.settle) {
+			this.channelManager.setFforSettlePolicy(config.ffor.settle);
 		}
 		// FFOR receipt witness (section 9.6, Appendix F.5): rehydrated here,
 		// before any transport exists, so a record is served from disk with
 		// R offline and nothing is ever judged against an empty ledger.
-		if (config.fforWitness?.enabled) {
+		if (config.ffor.witness?.enabled) {
 			const ledger = new FforWitnessLedger(
 				this.storage
 					? new MetadataLedgerStore<IFforWitnessMailboxRecord>(
@@ -2342,31 +2293,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					: new MemoryLedgerStore<IFforWitnessRecordRow>()
 			);
 			ledger.rehydrate();
-			// The barrier's CLTV arm must fire before scanExpiringHtlcs would
-			// force-close the inbound channel to claim the HTLC we now hold the
-			// preimage for: one block earlier than that buffer.
-			const witnessConfig = {
-				...config.fforWitness,
-				safetyDelta:
-					config.fforWitness.safetyDelta ??
-					Math.max(
-						LightningNode.INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
-						this.htlcSafetyMargin
-					) + 1
-			};
-			this.fforWitness = new FforWitnessService(witnessConfig, {
-				ledger,
-				nodePrivkey: this.nodePrivkey,
-				nodeId: this.ownNodeId(),
-				currentHeight: () => this.currentBlockHeight,
-				send: (peer, type, payload) => this.emitOutbound(peer, type, payload),
-				log: (action, data) => this.emitStructuredLog('htlc', action, data),
-				emit: (event, ...args): void => {
-					this.emit<keyof FforWitnessEvents>(event, ...args);
-				},
-				release: (fulfil) => this.releaseWitnessHeldForward(fulfil)
-			});
-			if (config.fforIssuer?.enabled) {
+			this.fforWitness = new FforWitnessService(
+				{ ...config.ffor.witness },
+				{
+					ledger,
+					nodePrivkey: this.nodePrivkey,
+					nodeId: this.ownNodeId(),
+					currentHeight: () => this.currentBlockHeight,
+					send: (peer, type, payload) => this.emitOutbound(peer, type, payload),
+					log: (action, data) => this.emitStructuredLog('htlc', action, data),
+					emit: (event, ...args): void => {
+						this.emit<keyof FforWitnessEvents>(event, ...args);
+					},
+					release: (fulfil) => this.releaseWitnessHeldForward(fulfil)
+				}
+			);
+			if (config.ffor.issuer?.enabled) {
 				const issuerLedger = new FforIssuerLedger(
 					this.storage
 						? new MetadataLedgerStore<IFforIssuerManifestRecord>(
@@ -2386,7 +2328,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						: new MemoryLedgerStore<IFforIssuerSlotRecord>()
 				);
 				issuerLedger.rehydrate();
-				this.fforIssuer = new FforIssuerService(config.fforIssuer, {
+				this.fforIssuer = new FforIssuerService(config.ffor.issuer, {
 					ledger: issuerLedger,
 					witnessLedger: ledger,
 					nodePrivkey: this.nodePrivkey,
@@ -2401,7 +2343,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				});
 				this.fforIssuer.rehydrate();
 			}
-		} else if (config.fforIssuer?.enabled) {
+		} else if (config.ffor.issuer?.enabled) {
 			this.emitStructuredLog('htlc', 'ffor_issuer_needs_witness', {});
 		}
 		// Async receive service (issue #709): registrations live in their own
@@ -2527,23 +2469,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (config.swaps?.enabled) {
 			this.wireSwapProvider(config.swaps);
 		}
-		this.jitClientMaxFlatFeeSat =
-			config.jitReceiveClient?.maxFlatFeeSat ?? JIT_CLIENT_MAX_FLAT_FEE_SAT;
-		this.jitClientMaxFeePpm =
-			config.jitReceiveClient?.maxFeePpm ?? JIT_CLIENT_MAX_FEE_PPM;
+		this.jitClientMaxFlatFeeSat = config.jitReceiveClient.maxFlatFeeSat;
+		this.jitClientMaxFeePpm = config.jitReceiveClient.maxFeePpm;
 
-		// Resolved once and held: the PeerManager's disconnect-time redials and
-		// the startup recovery below must answer to the same switch, or turning
+		// Held once: the PeerManager's disconnect-time redials and the startup
+		// recovery below must answer to the same switch, or turning
 		// auto-reconnect off silences one and not the other.
-		this.autoReconnect =
-			config.autoReconnect ?? config.enableNetworking ?? false;
+		this.autoReconnect = config.autoReconnect;
 
 		// Startup ownership quarantine (recovery 5.6) arrives at CONSTRUCTION,
 		// before any networking exists, so no dial, listener or inbound
 		// handshake can race the gate's installation. A gate attached after
 		// construction would lose that race: autoReconnectPeers() below
 		// schedules real dials on zero-delay timers.
-		this.recoveryGate = config.recovery?.startupGate;
+		this.recoveryGate = config.recovery.startupGate;
 		// The barrier is wired FIRST so its own gate hook is registered before
 		// the gate's peer bring-up runs: replication is then already in flight
 		// when the first batch arrives to be held.
@@ -2992,21 +2931,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 
 		// Advisor execution timers -- both features are opt-in (enabled: true).
-		this.autoRebalanceConfig = config.autoRebalance ?? {};
-		this.autoTuneFeesConfig = config.autoTuneFees ?? {};
-		if (this.autoRebalanceConfig.enabled === true) {
+		this.autoRebalanceConfig = config.autoRebalance;
+		this.autoTuneFeesConfig = config.autoTuneFees;
+		if (this.autoRebalanceConfig.enabled) {
 			this.autoRebalanceTimer = setInterval(() => {
 				this.executeRebalanceRecommendations().catch((err) => {
 					this.emitStructuredLog('payment', 'auto_rebalance_failed', {
 						error: err instanceof Error ? err.message : String(err)
 					});
 				});
-			}, this.autoRebalanceConfig.intervalMs ?? 3_600_000);
+			}, this.autoRebalanceConfig.intervalMs);
 			if (this.autoRebalanceTimer.unref) {
 				this.autoRebalanceTimer.unref();
 			}
 		}
-		if (this.autoTuneFeesConfig.enabled === true) {
+		if (this.autoTuneFeesConfig.enabled) {
 			this.autoTuneFeesTimer = setInterval(() => {
 				try {
 					this.runFeeTuneOnce();
@@ -3015,7 +2954,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						error: err instanceof Error ? err.message : String(err)
 					});
 				}
-			}, this.autoTuneFeesConfig.intervalMs ?? 21_600_000);
+			}, this.autoTuneFeesConfig.intervalMs);
 			if (this.autoTuneFeesTimer.unref) {
 				this.autoTuneFeesTimer.unref();
 			}
@@ -15235,9 +15174,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * the one given, else the configured autoRebalance budget, else 1000 sats.
 	 */
 	rebalanceBudgetSatsPerDay(budgetSatsPerDay?: number): number {
-		return (
-			budgetSatsPerDay ?? this.autoRebalanceConfig.budgetSatsPerDay ?? 1_000
-		);
+		return budgetSatsPerDay ?? this.autoRebalanceConfig.budgetSatsPerDay;
 	}
 
 	/**
@@ -15369,11 +15306,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * `now` is injectable for tests; the periodic timer passes the real clock.
 	 */
 	runFeeTuneOnce(now: number = Date.now()): IFeeTuneAdjustment[] {
-		const intervalMs = this.autoTuneFeesConfig.intervalMs ?? 21_600_000;
-		const floorPpm =
-			this.autoTuneFeesConfig.floorPpm ?? DEFAULT_FEE_TUNE_FLOOR_PPM;
-		const ceilPpm =
-			this.autoTuneFeesConfig.ceilPpm ?? DEFAULT_FEE_TUNE_CEIL_PPM;
+		const { intervalMs, floorPpm, ceilPpm } = this.autoTuneFeesConfig;
 		if (floorPpm < 0 || ceilPpm < floorPpm) {
 			throw new Error('autoTuneFees requires 0 <= floorPpm <= ceilPpm');
 		}
@@ -23379,7 +23312,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		return this.jitReceiveManager;
 	}
 
-	private wireJitReceive(config: IJitReceiveConfig): void {
+	private wireJitReceive(
+		config: NonNullable<ResolvedNodeConfig['jitReceive']>
+	): void {
 		this.jitReceiveManager = new JitReceiveManager(
 			{
 				currentBlockHeight: () => this.currentBlockHeight,
@@ -23412,15 +23347,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				storage: this.storage ?? undefined,
 				failRestoredHtlc: (part) => this.failRestoredHeldHtlc(part)
 			},
-			{
-				...config,
-				// A hold must be revoked no later than the node's own expiring-HTLC
-				// scan would fail the same leg, or that scan refunds upstream while
-				// the engine still believes it may forward.
-				holdExpiryMarginBlocks:
-					config.holdExpiryMarginBlocks ??
-					Math.max(HELD_HTLC_EXPIRY_MARGIN, this.htlcSafetyMargin)
-			}
+			{ ...config }
 		);
 		const jit = this.jitReceiveManager;
 		jit.on('jit:intent', (e) => this.emit('jit:intent', e));
@@ -28365,7 +28292,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * What this does at construction is make sure a request minted later can be
 	 * ANSWERED, which needs the lanes subscribed before the first frame arrives.
 	 */
-	private wireDirectFunding(config: IDirectFundingNodeConfig): void {
+	private wireDirectFunding(
+		config: NonNullable<ResolvedNodeConfig['directFunding']>
+	): void {
 		const log = (action: string, data: Record<string, unknown>): void => {
 			this.emitStructuredLog('channel', action, data);
 		};
@@ -28376,9 +28305,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			{
 				...(this.walletDataStore() ? { storage: this.walletDataStore()! } : {})
 			},
-			config.requestTtlMs !== undefined
-				? { requestTtlMs: config.requestTtlMs }
-				: {}
+			{ requestTtlMs: config.requestTtlMs }
 		);
 		const { registry, forwarder } = createDirectFundingTransports(
 			{
@@ -28607,7 +28534,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			forwarder,
 			receiver,
 			policy,
-			requestTtlMs: config.requestTtlMs ?? DF_DEFAULT_REQUEST_TTL_MS
+			requestTtlMs: config.requestTtlMs
 		};
 	}
 
@@ -28745,7 +28672,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.submarineSwapProvider?.stop();
 	}
 
-	private wireSwapProvider(config: ISwapNodeConfig): void {
+	private wireSwapProvider(
+		config: NonNullable<ResolvedNodeConfig['swaps']>
+	): void {
 		if (!this.swapLedger) return;
 		const chainSource = config.chainSource;
 		const resolverSource: ISwapChainSource = chainSource ?? {
@@ -28758,14 +28687,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			broadcastTransaction: (rawTxHex) =>
 				this.swapChain().broadcastTransaction(rawTxHex)
 		};
-		const confirmations = {
-			fundingConfirmations:
-				config.confirmations?.fundingConfirmations ??
-				REVERSE_SWAP_DEFAULTS.fundingConfirmations,
-			resolutionConfirmations:
-				config.confirmations?.resolutionConfirmations ??
-				REVERSE_SWAP_DEFAULTS.resolutionConfirmations
-		};
+		const confirmations = { ...config.confirmations };
 		const resolver = new SwapChainResolver(
 			resolverSource,
 			confirmations,
@@ -28909,10 +28831,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				...(config.fee?.feePpm !== undefined
 					? { feePpm: config.fee.feePpm }
 					: {}),
-				exposure: {
-					...REVERSE_SWAP_DEFAULT_EXPOSURE,
-					...(config.exposure ?? {})
-				},
+				exposure: { ...config.exposure },
 				...confirmations,
 				...(config.timeouts ?? {}),
 				// A hold must outlive the node's own expiring-HTLC scan, which
@@ -28990,10 +28909,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				...(config.fee?.feePpm !== undefined
 					? { feePpm: config.fee.feePpm }
 					: {}),
-				exposure: {
-					...REVERSE_SWAP_DEFAULT_EXPOSURE,
-					...(config.exposure ?? {})
-				},
+				exposure: { ...config.exposure },
 				...confirmations,
 				...(config.timeouts?.maxFeeRateSatPerVbyte !== undefined
 					? { maxFeeRateSatPerVbyte: config.timeouts.maxFeeRateSatPerVbyte }
@@ -29843,15 +29759,6 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
-	 * Blocks before an inbound HTLC's cltv_expiry at which, if we hold its
-	 * preimage but the off-chain fulfill has not been acked, we force-close the
-	 * inbound channel to claim on-chain. Must leave enough room for our
-	 * HTLC-success to confirm before the peer's HTLC-timeout becomes spendable at
-	 * cltv_expiry (LDK-style CLTV_CLAIM_BUFFER).
-	 */
-	private static readonly INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER = 18;
-
-	/**
 	 * Scan all channels for received HTLCs that are close to expiry.
 	 * Auto-fail any that are within the safety margin. Separately, force-close to
 	 * claim any inbound HTLC we already hold the preimage for (or that is
@@ -29860,7 +29767,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private scanExpiringHtlcs(blockHeight: number): void {
 		const claimBuffer = Math.max(
-			LightningNode.INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
+			INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
 			this.htlcSafetyMargin
 		);
 		const channels = this.channelManager.listChannels();
@@ -30448,70 +30355,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	// ─────────────── Static Factories ───────────────
 
 	/**
-	 * Create a LightningNode from a BIP39 mnemonic.
-	 * Derives all necessary keys automatically.
+	 * Create a LightningNode from a BIP39 mnemonic. Derives every key from the
+	 * seed and takes every other INodeConfig option as given.
 	 */
 	static fromMnemonic(
 		mnemonic: string,
-		options?: {
-			passphrase?: string;
-			/**
-			 * The BIP39 seed of `mnemonic` and `passphrase`, for a caller that
-			 * already holds it: skips the PBKDF2 pass. It is not checked against
-			 * the mnemonic, so it must be that mnemonic's seed.
-			 */
-			seed?: Buffer;
-			coinType?: number;
-			network?: Network;
-			storage?: IStorageBackend;
-			enableNetworking?: boolean;
-			localFeatures?: FeatureFlags;
-			zeroReserve?: INodeConfig['zeroReserve'];
-			chainHashes?: Buffer[];
-			alias?: string;
-			announcedAddresses?: INodeAddress[];
-			fundingProvider?: IFundingProvider;
-			feeEstimator?: IFeeEstimator;
-			logger?: ILogger;
-			socks5Proxy?: { host: string; port: number };
-			socks5ProxyScope?: Socks5ProxyScope;
-			maxInboundPeers?: number;
-			webSocketImpl?: import('../transport/websocket').WebSocketConstructor;
-			iroh?: Omit<import('../transport/iroh').IIrohConfig, 'secretKey'>;
-			preferAnchors?: boolean;
-			largeChannels?: boolean;
-			chainBackend?: import('../chain/chain-watcher').IChainBackend;
-			autoReconnect?: boolean;
-			autoUpdateChannelFees?: boolean;
-			forwardingEnabled?: boolean;
-			forwardingFeeBaseMsat?: number;
-			forwardingFeePropMillionths?: number;
-			forwardingCltvDelta?: number;
-			jitReceive?: INodeConfig['jitReceive'];
-			jitReceiveClient?: INodeConfig['jitReceiveClient'];
-			directFunding?: INodeConfig['directFunding'];
-			swaps?: INodeConfig['swaps'];
-			fforSettle?: INodeConfig['fforSettle'];
-			fforConcurrent?: INodeConfig['fforConcurrent'];
-			fforWitness?: INodeConfig['fforWitness'];
-			fforIssuer?: INodeConfig['fforIssuer'];
-			leaseRates?: import('../gossip/types').ILeaseRates;
-			eagerGossipVerify?: boolean;
-			cooperativeGraphRestore?: boolean;
-			sweepDestinationScript?: Buffer;
-			peerStorageEnabled?: boolean;
-			autoRebalance?: IAutoRebalanceConfig;
-			autoTuneFees?: IAutoTuneFeesConfig;
-			watchtowers?: string[];
-			recovery?: INodeConfig['recovery'];
-			guardianHost?: INodeConfig['guardianHost'];
-			channelKeyDeriver?: (
-				channelIndex: number
-			) => import('../channel/channel-manager').IPerChannelKeys;
-			newChannelsRefused?: INodeConfig['newChannelsRefused'];
-		}
+		options?: LightningNodeSeedOptions
 	): LightningNode {
-		const coinType = options?.coinType ?? LnCoinType.REGTEST;
+		const {
+			passphrase,
+			seed: givenSeed,
+			coinType: givenCoinType,
+			iroh,
+			channelKeyDeriver: givenChannelKeyDeriver,
+			...config
+		} = options ?? {};
+		const coinType = givenCoinType ?? LnCoinType.REGTEST;
 		if (!bip39.validateMnemonic(mnemonic)) {
 			throw new Error('Invalid BIP39 mnemonic');
 		}
@@ -30519,8 +30378,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// keys and the Iroh identity. The PBKDF2 pass behind the seed is the
 		// slow step (a phone runs it on the JS thread), so it runs at most
 		// once here, and not at all when the caller passes the seed.
-		const seed =
-			options?.seed ?? bip39.mnemonicToSeedSync(mnemonic, options?.passphrase);
+		const seed = givenSeed ?? bip39.mnemonicToSeedSync(mnemonic, passphrase);
 		const root = bip32RootFromSeed(seed);
 		const keys = deriveLightningKeys(root, coinType);
 
@@ -30531,7 +30389,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// arithmetic runs in JavaScript, each derivation costs a sizeable
 		// fraction of a second. Every caller gets its own copies, so none can
 		// change what the next one is handed.
-		let channelKeyDeriver = options?.channelKeyDeriver;
+		let channelKeyDeriver = givenChannelKeyDeriver;
 		if (!channelKeyDeriver) {
 			const derived = new Map<number, ReturnType<typeof deriveChannelKeys>>();
 			channelKeyDeriver = (
@@ -30556,6 +30414,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 
 		return new LightningNode({
+			...config,
 			nodePrivateKey: keys.nodePrivateKey,
 			channelBasepoints: keys.channelBasepoints,
 			perCommitmentSeed: keys.perCommitmentSeed,
@@ -30564,56 +30423,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			revocationBasepointSecret: keys.revocationBasepointSecret,
 			paymentBasepointSecret: keys.paymentBasepointSecret,
 			delayedPaymentBasepointSecret: keys.delayedPaymentBasepointSecret,
-			network: options?.network,
-			storage: options?.storage,
-			enableNetworking: options?.enableNetworking,
-			autoReconnect: options?.autoReconnect,
-			autoUpdateChannelFees: options?.autoUpdateChannelFees,
-			forwardingEnabled: options?.forwardingEnabled,
-			forwardingFeeBaseMsat: options?.forwardingFeeBaseMsat,
-			forwardingFeePropMillionths: options?.forwardingFeePropMillionths,
-			forwardingCltvDelta: options?.forwardingCltvDelta,
-			jitReceive: options?.jitReceive,
-			jitReceiveClient: options?.jitReceiveClient,
-			directFunding: options?.directFunding,
-			swaps: options?.swaps,
-			fforSettle: options?.fforSettle,
-			fforConcurrent: options?.fforConcurrent,
-			fforWitness: options?.fforWitness,
-			fforIssuer: options?.fforIssuer,
-			leaseRates: options?.leaseRates,
-			eagerGossipVerify: options?.eagerGossipVerify,
-			cooperativeGraphRestore: options?.cooperativeGraphRestore,
-			localFeatures: options?.localFeatures,
-			zeroReserve: options?.zeroReserve,
-			chainHashes: options?.chainHashes,
-			alias: options?.alias,
-			announcedAddresses: options?.announcedAddresses,
-			fundingProvider: options?.fundingProvider,
-			feeEstimator: options?.feeEstimator,
-			logger: options?.logger,
-			socks5Proxy: options?.socks5Proxy,
-			socks5ProxyScope: options?.socks5ProxyScope,
-			maxInboundPeers: options?.maxInboundPeers,
-			webSocketImpl: options?.webSocketImpl,
-			iroh: options?.iroh
-				? {
-						...options.iroh,
-						secretKey: deriveIrohSecretKey(seed)
-				  }
+			iroh: iroh
+				? { ...iroh, secretKey: deriveIrohSecretKey(seed) }
 				: undefined,
-			preferAnchors: options?.preferAnchors,
-			largeChannels: options?.largeChannels,
-			chainBackend: options?.chainBackend,
-			sweepDestinationScript: options?.sweepDestinationScript,
-			peerStorageEnabled: options?.peerStorageEnabled,
-			autoRebalance: options?.autoRebalance,
-			autoTuneFees: options?.autoTuneFees,
-			watchtowers: options?.watchtowers,
-			recovery: options?.recovery,
-			guardianHost: options?.guardianHost,
-			channelKeyDeriver,
-			newChannelsRefused: options?.newChannelsRefused
+			channelKeyDeriver
 		});
 	}
 

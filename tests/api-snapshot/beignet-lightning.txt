@@ -1,4 +1,5 @@
 # The exported API of beignet/lightning. Regenerate with npm run api:snapshot; do not edit.
+unexported type DeprecatedNodeConfigKey = 'forwardingEnabled' | 'forwardingCltvDelta' | 'forwardingFeeBaseMsat' | 'forwardingFeePropMillionths' | 'forwardingPolicyGraceMs' | 'fforSettle' | 'fforConcurrent' | 'fforWitness' | 'fforIssuer'
 unexported type EventMap<E> = { [K in keyof E]: (...args: any[]) => void; }
 unexported interface ICompactHtlcHistory
 property ICompactHtlcHistory.entries: IHistoryEntry[]
@@ -37,6 +38,37 @@ unexported interface ILedgerTransitionResult<R extends ILedgerRecord>
 property ILedgerTransitionResult.actualState?: string
 property ILedgerTransitionResult.outcome: LedgerTransitionOutcome
 property ILedgerTransitionResult.record?: R
+unexported interface IResolvedNodeDefaults
+property IResolvedNodeDefaults.announcedAddresses: gossip.INodeAddress[]
+property IResolvedNodeDefaults.autoRebalance: Readonly<Required<node.IAutoRebalanceConfig>>
+property IResolvedNodeDefaults.autoReconnect: boolean
+property IResolvedNodeDefaults.autoReleaseHeldForwards: boolean
+property IResolvedNodeDefaults.autoTuneFees: Readonly<Required<node.IAutoTuneFeesConfig>>
+property IResolvedNodeDefaults.autoUpdateChannelFees: boolean
+property IResolvedNodeDefaults.cooperativeGraphRestore: boolean
+property IResolvedNodeDefaults.directFunding?: Readonly<node.IDirectFundingNodeConfig & { requestTtlMs: number; }>
+property IResolvedNodeDefaults.eagerGossipVerify: boolean
+property IResolvedNodeDefaults.enableNetworking: boolean
+property IResolvedNodeDefaults.ffor: Readonly<{ settle?: NonNullable<node.INodeConfig['ffor']>['settle']; concurrent?: NonNullable<node.INodeConfig['ffor']>['concurrent']; witness?: Readonly<ffor.IFforWitnessConfig & { safetyDelta: number; }>; issuer?: NonNullable<node.INodeConfig['ffor']>['issuer']; }>
+property IResolvedNodeDefaults.forwarding: Readonly<Required<NonNullable<node.INodeConfig['forwarding']>>>
+property IResolvedNodeDefaults.htlcSafetyMargin: number
+property IResolvedNodeDefaults.jitReceive?: Readonly<liquidity.IJitReceiveConfig & { holdExpiryMarginBlocks: number; }>
+property IResolvedNodeDefaults.jitReceiveClient: Readonly<Required<NonNullable<node.INodeConfig['jitReceiveClient']>>>
+property IResolvedNodeDefaults.largeChannels: boolean
+property IResolvedNodeDefaults.logger: beignet#ILogger
+property IResolvedNodeDefaults.maxPaymentRetries: number
+property IResolvedNodeDefaults.maxTotalInFlightHtlcs: number
+property IResolvedNodeDefaults.mppTimeoutMs: number
+property IResolvedNodeDefaults.network: invoice.Network
+property IResolvedNodeDefaults.peerStorageEnabled: boolean
+property IResolvedNodeDefaults.preferAnchors: boolean
+property IResolvedNodeDefaults.recovery: Readonly<NonNullable<node.INodeConfig['recovery']> & { enabled: boolean; durability: recovery.RecoveryDurability; guardians: recovery.GuardianDescriptor[]; }>
+property IResolvedNodeDefaults.reestablishTimeoutBlocks: number
+property IResolvedNodeDefaults.resourceConfig: Readonly<Required<node.IResourceConfig>>
+property IResolvedNodeDefaults.socks5ProxyScope: transport.Socks5ProxyScope
+property IResolvedNodeDefaults.swaps?: Readonly<node.ISwapNodeConfig & { exposure: swaps.ISwapExposurePolicy; confirmations: swaps.ISwapConfirmationPolicy; }>
+property IResolvedNodeDefaults.watchtowers: string[]
+property IResolvedNodeDefaults.zeroReserve: Readonly<IZeroReserveConfig & Required<Pick<IZeroReserveConfig, 'role' | 'advertise'>>>
 unexported interface IResult
 method IResult.isErr(): boolean
 method IResult.isOk(): boolean
@@ -66,6 +98,7 @@ unexported type JitFeeMode = 'skim' | 'hop'
 unexported type LedgerTransitionOutcome = 'applied' | 'stale' | 'missing' | 'storage_failed' | 'not_rehydrated'
 unexported type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void
 unexported type PeerState = 'disconnected' | 'connecting' | 'handshaking' | 'init' | 'ready' | 'closing'
+unexported type SeedDerivedNodeConfigKey = 'nodePrivateKey' | 'channelBasepoints' | 'perCommitmentSeed' | 'fundingPrivkey' | 'htlcBasepointSecret' | 'revocationBasepointSecret' | 'paymentBasepointSecret' | 'delayedPaymentBasepointSecret'
 unexported type SubmarineSwapEventName = 'swap:created' | 'swap:funding-seen' | 'swap:funded' | 'swap:funding-lost' | 'swap:paying' | 'swap:payment-unresolved' | 'swap:preimage' | 'swap:claim-broadcast' | 'swap:claim-confirmed' | 'swap:payment-failed' | 'swap:exposed' | 'swap:cancelled' | 'swap:failed'
 unexported type SwapEventName = 'swap:created' | 'swap:held' | 'swap:funding' | 'swap:funded' | 'swap:claimed' | 'swap:settled' | 'swap:refund-broadcast' | 'swap:refunded' | 'swap:hold-cancelled' | 'swap:exposed' | 'swap:failed'
 unexported type SyncSnapshot = Pick<ffor.IFforSyncReplyMessage, 'numSlots' | 'settled' | 'preimages'>
@@ -5206,10 +5239,12 @@ property node.INodeConfig.directFunding?: node.IDirectFundingNodeConfig
 property node.INodeConfig.eagerGossipVerify?: boolean
 property node.INodeConfig.enableNetworking?: boolean
 property node.INodeConfig.feeEstimator?: node.IFeeEstimator
+property node.INodeConfig.ffor?: { settle?: ffor.IFforSettlePolicy; concurrent?: { enabled: boolean; }; witness?: ffor.IFforWitnessConfig; issuer?: ffor.IFforIssuerConfig; }
 property node.INodeConfig.fforConcurrent?: { enabled: boolean; }
 property node.INodeConfig.fforIssuer?: ffor.IFforIssuerConfig
 property node.INodeConfig.fforSettle?: ffor.IFforSettlePolicy
 property node.INodeConfig.fforWitness?: ffor.IFforWitnessConfig
+property node.INodeConfig.forwarding?: { enabled?: boolean; cltvDelta?: number; feeBaseMsat?: number; feePropMillionths?: number; policyGraceMs?: number; }
 property node.INodeConfig.forwardingCltvDelta?: number
 property node.INodeConfig.forwardingEnabled?: boolean
 property node.INodeConfig.forwardingFeeBaseMsat?: number
@@ -5453,7 +5488,7 @@ member node.LightningErrorCode.PAY_ALL_BUDGET_MISMATCH = "PAY_ALL_BUDGET_MISMATC
 member node.LightningErrorCode.PAY_ALL_REMAINDER = "PAY_ALL_REMAINDER"
 member node.LightningErrorCode.PAY_ALL_REVIEW_EXPIRED = "PAY_ALL_REVIEW_EXPIRED"
 class node.LightningNode extends TypedEmitter<node.LightningNodeEvents>
-constructor node.LightningNode(config: node.INodeConfig)
+constructor node.LightningNode(nodeConfig: node.INodeConfig)
 static property node.LightningNode.AFTER_GRAPH_RESTORE_MAX: number
 static property node.LightningNode.GRAPH_RESTORE_SLICE_MS: number
 static property node.LightningNode.RAPID_GOSSIP_SLICE_MS: number
@@ -5500,7 +5535,7 @@ method node.LightningNode.fforSync(channelIdHex: string): channel.ChannelResult
 method node.LightningNode.flushGossip(): Promise<void>
 method node.LightningNode.forceCloseChannel(channelId: Buffer, destinationScript: Buffer): { ok: boolean; error?: string; commitmentTxid?: string; }
 method node.LightningNode.forgetAsyncReceiveGrant(lspNodeIdHex: string): boolean
-static method node.LightningNode.fromMnemonic(mnemonic: string, options?: { passphrase?: string; seed?: Buffer; coinType?: number; network?: invoice.Network; storage?: storage.IStorageBackend; enableNetworking?: boolean; localFeatures?: features.FeatureFlags; zeroReserve?: node.INodeConfig['zeroReserve']; chainHashes?: Buffer[]; alias?: string; announcedAddresses?: gossip.INodeAddress[]; fundingProvider?: node.IFundingProvider; feeEstimator?: node.IFeeEstimator; logger?: beignet#ILogger; socks5Proxy?: { host: string; port: number; }; socks5ProxyScope?: transport.Socks5ProxyScope; maxInboundPeers?: number; webSocketImpl?: transport.WebSocketConstructor; iroh?: Omit<transport.IIrohConfig, 'secretKey'>; preferAnchors?: boolean; largeChannels?: boolean; chainBackend?: chain.IChainBackend; autoReconnect?: boolean; autoUpdateChannelFees?: boolean; forwardingEnabled?: boolean; forwardingFeeBaseMsat?: number; forwardingFeePropMillionths?: number; forwardingCltvDelta?: number; jitReceive?: node.INodeConfig['jitReceive']; jitReceiveClient?: node.INodeConfig['jitReceiveClient']; directFunding?: node.INodeConfig['directFunding']; swaps?: node.INodeConfig['swaps']; fforSettle?: node.INodeConfig['fforSettle']; fforConcurrent?: node.INodeConfig['fforConcurrent']; fforWitness?: node.INodeConfig['fforWitness']; fforIssuer?: node.INodeConfig['fforIssuer']; leaseRates?: gossip.ILeaseRates; eagerGossipVerify?: boolean; cooperativeGraphRestore?: boolean; sweepDestinationScript?: Buffer; peerStorageEnabled?: boolean; autoRebalance?: node.IAutoRebalanceConfig; autoTuneFees?: node.IAutoTuneFeesConfig; watchtowers?: string[]; recovery?: node.INodeConfig['recovery']; guardianHost?: node.INodeConfig['guardianHost']; channelKeyDeriver?: (channelIndex: number) => channel.IPerChannelKeys; newChannelsRefused?: node.INodeConfig['newChannelsRefused']; }): node.LightningNode
+static method node.LightningNode.fromMnemonic(mnemonic: string, options?: node.LightningNodeSeedOptions): node.LightningNode
 method node.LightningNode.getActionLog(options?: { category?: string; since?: number; limit?: number; }): node.IStructuredLog[]
 method node.LightningNode.getAsyncPaymentManager(): asyncPayments.AsyncPaymentManager
 method node.LightningNode.getAsyncReceiveService(): asyncPayments.AsyncReceiveService
@@ -5757,6 +5792,7 @@ property node.LightningNodeEvents.'swap:refunded': (event: swaps.ISwapEvent) => 
 property node.LightningNodeEvents.'swap:settled': (event: swaps.ISwapEvent) => void
 property node.LightningNodeEvents.'sweep:uneconomic': (channelId: Buffer, action: chain.ISweepUneconomicChainAction) => void
 property node.LightningNodeEvents.log: (entry: node.IStructuredLog) => void
+type node.LightningNodeSeedOptions = Omit<node.INodeConfig, SeedDerivedNodeConfigKey | 'iroh'> & { passphrase?: string; seed?: Buffer; coinType?: number; iroh?: Omit<transport.IIrohConfig, 'secretKey'>; }
 class node.LightningPaymentError extends beignet#CodedError<node.LightningErrorCode>
 constructor node.LightningPaymentError(code: node.LightningErrorCode, message: string)
 const node.MAX_FEE_RATE_SAT_PER_VBYTE = 5000
@@ -5778,6 +5814,7 @@ method node.PeerRateLimiter.clear(): void
 method node.PeerRateLimiter.removePeer(peerPubkey: string): void
 get node.PeerRateLimiter.size(): number
 method node.PeerRateLimiter.tryConsume(peerPubkey: string): boolean
+type node.ResolvedNodeConfig = Omit<node.INodeConfig, DeprecatedNodeConfigKey | keyof IResolvedNodeDefaults> & IResolvedNodeDefaults
 const node.SPLICE_CONFLICT_REFUTATION_TTL_MS = 30000
 const node.SPLICE_CONFLICT_REQUEST_BACKOFF_MS: number
 const node.SPLICE_CONFLICT_REQUEST_TIMEOUT_MS = 60000
@@ -5790,6 +5827,7 @@ member node.SpliceRefusalCode.SPLICE_BUSY = "SPLICE_BUSY"
 member node.SpliceRefusalCode.SPLICE_REFUSED = "SPLICE_REFUSED"
 member node.SpliceRefusalCode.SPLICING_NOT_NEGOTIATED = "SPLICING_NOT_NEGOTIATED"
 function node.clampFeeRateSatPerVbyte(satPerVbyte: number, onClamp?: (original: number, clamped: number) => void): number
+function node.resolveNodeConfig(input: node.INodeConfig): Readonly<node.ResolvedNodeConfig>
 namespace offer
 interface offer.IBlindedPayInfo
 property offer.IBlindedPayInfo.cltvExpiryDelta: number

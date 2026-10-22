@@ -35,6 +35,10 @@ import type {
 	ISwapConfirmationPolicy,
 	ISwapExposurePolicy
 } from '../swaps';
+import type { IFforSettlePolicy } from '../ffor/types';
+import type { IFforWitnessConfig } from '../ffor/witness-service';
+import type { IFforIssuerConfig } from '../ffor/issuer-service';
+import type { IIrohConfig } from '../transport/iroh';
 import type { IPayAllBudget, PaymentStatus } from './payment-types';
 
 export type { IInvoiceInfo };
@@ -274,7 +278,8 @@ export interface IFundingProvider {
 /**
  * LightningNode construction options. The INodeConfig table in
  * src/lightning/README.md is generated from this interface (`npm run
- * docs:tables`), so the description of each field lives here.
+ * docs:tables`), so the description of each field lives here. The defaults
+ * live in `resolveNodeConfig`.
  */
 export interface INodeConfig {
 	/** One-way reserve waivers for new private home channels. */
@@ -338,34 +343,50 @@ export interface INodeConfig {
 	 * under an active registration are admitted, within the limits.
 	 */
 	asyncReceiveService?: import('../async-payments/types').IAsyncReceiveServiceConfig;
-	/**
-	 * FFOR D-R receipt witness (spec section 9.6): store a receiver-encrypted
-	 * record of every delegated preimage this node relays, before propagating
-	 * the fulfil, and serve it to the receiver on return. Disabled by default.
-	 */
-	fforWitness?: import('../ffor/witness-service').IFforWitnessConfig;
-	/**
-	 * FFOR BOLT 12 issuer (spec section 9.7): answer invoice_requests for
-	 * offers a receiver delegated to this node, one fixed-amount slot per
-	 * invoice. Needs `fforWitness` (the issuer is co-hosted with the first
-	 * witness, whose mailbox holds the book). Disabled by default.
-	 */
-	fforIssuer?: import('../ffor/issuer-service').IFforIssuerConfig;
-	/**
-	 * Whether this node answers ff_init as a settlement peer, and on what
-	 * terms (issue #729). Absent answers on any terms (the library default);
-	 * a daemon passes `enabled: false` unless its operator opted in.
-	 */
-	fforSettle?: import('../ffor/types').IFforSettlePolicy;
-	/**
-	 * FFOR concurrent receive (docs/specs/CONCURRENT-RECEIVE.md). Enabled by
-	 * default when option_ff_receive and option_quiesce are present.
-	 * Explicit true requires both dependencies. Explicit false clears bits
-	 * 562/563 and refuses peers requiring the feature. Epochs still select
-	 * their profile explicitly. To refuse only new concurrent books, set
-	 * `fforSettle.allowConcurrent: false` and retain this advertisement for
-	 * existing books. The feature assignment remains experimental.
-	 */
+	/** The FFOR roles this node plays for its peers. */
+	ffor?: {
+		/**
+		 * Whether this node answers ff_init as a settlement peer, and on what
+		 * terms (issue #729). Absent answers on any terms (the library
+		 * default); a daemon passes `enabled: false` unless its operator
+		 * opted in.
+		 */
+		settle?: IFforSettlePolicy;
+		/**
+		 * FFOR concurrent receive (docs/specs/CONCURRENT-RECEIVE.md). Enabled
+		 * by default when option_ff_receive and option_quiesce are present.
+		 * Explicit true requires both dependencies. Explicit false clears bits
+		 * 562/563 and refuses peers requiring the feature. Epochs still select
+		 * their profile explicitly. To refuse only new concurrent books, set
+		 * `ffor.settle.allowConcurrent: false` and retain this advertisement
+		 * for existing books. The feature assignment remains experimental.
+		 */
+		concurrent?: {
+			/** Advertise concurrent receive, feature bits 562/563. */
+			enabled: boolean;
+		};
+		/**
+		 * FFOR D-R receipt witness (spec section 9.6): store a
+		 * receiver-encrypted record of every delegated preimage this node
+		 * relays, before propagating the fulfil, and serve it to the receiver
+		 * on return. Disabled by default.
+		 */
+		witness?: IFforWitnessConfig;
+		/**
+		 * FFOR BOLT 12 issuer (spec section 9.7): answer invoice_requests for
+		 * offers a receiver delegated to this node, one fixed-amount slot per
+		 * invoice. Needs `ffor.witness` (the issuer is co-hosted with the
+		 * first witness, whose mailbox holds the book). Disabled by default.
+		 */
+		issuer?: IFforIssuerConfig;
+	};
+	/** @deprecated Use `ffor.witness`. */
+	fforWitness?: IFforWitnessConfig;
+	/** @deprecated Use `ffor.issuer`. */
+	fforIssuer?: IFforIssuerConfig;
+	/** @deprecated Use `ffor.settle`. */
+	fforSettle?: IFforSettlePolicy;
+	/** @deprecated Use `ffor.concurrent`. */
 	fforConcurrent?: {
 		/** Advertise concurrent receive, feature bits 562/563. */
 		enabled: boolean;
@@ -511,14 +532,35 @@ export interface INodeConfig {
 	chainBackend?: IChainBackend;
 	/** HTLC safety margin in blocks before force-failing expiring HTLCs (default 6) */
 	htlcSafetyMargin?: number;
-	/**
-	 * Whether to relay third-party HTLCs (be a routing hop). Default true, which
-	 * preserves the historical behaviour: any node with an announced channel
-	 * forwards. Set false to decline all forwards (a wallet that does not want to
-	 * route); declined forwards fail back promptly with temporary_node_failure,
-	 * and our channel_updates advertise the BOLT 7 disable bit so route finders
-	 * stop selecting us. Does not affect our own sends or receives.
-	 */
+	/** Whether and on what terms this node relays third-party HTLCs. */
+	forwarding?: {
+		/**
+		 * Whether to relay third-party HTLCs (be a routing hop). Default true,
+		 * which preserves the historical behaviour: any node with an announced
+		 * channel forwards. Set false to decline all forwards (a wallet that
+		 * does not want to route); declined forwards fail back promptly with
+		 * temporary_node_failure, and our channel_updates advertise the BOLT 7
+		 * disable bit so route finders stop selecting us. Does not affect our
+		 * own sends or receives.
+		 */
+		enabled?: boolean;
+		/** CLTV delta for forwarding (default 40). */
+		cltvDelta?: number;
+		/** Base fee in msat for forwarding (default 1000). */
+		feeBaseMsat?: number;
+		/** Proportional fee in millionths for forwarding (default 1). */
+		feePropMillionths?: number;
+		/**
+		 * How long a forward may still satisfy the PREVIOUS policy after a fee
+		 * or CLTV increase on a channel (default 600000, ten minutes; 0
+		 * disables). A receiver authors the relay terms of a blinded path from
+		 * the policy it read at build time and a blinded payer cannot retry
+		 * with new terms, so the window lets outstanding invoices survive a
+		 * bump, the way a channel_update's grace does for cleartext forwards.
+		 */
+		policyGraceMs?: number;
+	};
+	/** @deprecated Use `forwarding.enabled`. */
 	forwardingEnabled?: boolean;
 	/**
 	 * Whether to signature-verify foreign broadcast gossip at intake. Default
@@ -577,20 +619,13 @@ export interface INodeConfig {
 	 * construction so no engine ever serves from an empty view.
 	 */
 	swaps?: ISwapNodeConfig;
-	/** CLTV delta for forwarding (default 40) */
+	/** @deprecated Use `forwarding.cltvDelta`. */
 	forwardingCltvDelta?: number;
-	/** Base fee in msat for forwarding (default 1000) */
+	/** @deprecated Use `forwarding.feeBaseMsat`. */
 	forwardingFeeBaseMsat?: number;
-	/** Proportional fee in millionths for forwarding (default 1) */
+	/** @deprecated Use `forwarding.feePropMillionths`. */
 	forwardingFeePropMillionths?: number;
-	/**
-	 * How long a forward may still satisfy the PREVIOUS policy after a fee or
-	 * CLTV increase on a channel (default 600000, ten minutes; 0 disables). A
-	 * receiver authors the relay terms of a blinded path from the policy it
-	 * read at build time and a blinded payer cannot retry with new terms, so
-	 * the window lets outstanding invoices survive a bump, the way a
-	 * channel_update's grace does for cleartext forwards.
-	 */
+	/** @deprecated Use `forwarding.policyGraceMs`. */
 	forwardingPolicyGraceMs?: number;
 	/** MPP partial payment timeout in ms (default 60000) */
 	mppTimeoutMs?: number;
@@ -743,6 +778,39 @@ export interface INodeConfig {
 	 */
 	autoTuneFees?: IAutoTuneFeesConfig;
 }
+
+/** The INodeConfig fields `LightningNode.fromMnemonic` derives from the seed. */
+type SeedDerivedNodeConfigKey =
+	| 'nodePrivateKey'
+	| 'channelBasepoints'
+	| 'perCommitmentSeed'
+	| 'fundingPrivkey'
+	| 'htlcBasepointSecret'
+	| 'revocationBasepointSecret'
+	| 'paymentBasepointSecret'
+	| 'delayedPaymentBasepointSecret';
+
+/**
+ * Options for `LightningNode.fromMnemonic`: every INodeConfig option except
+ * the key material, which is derived from the seed.
+ */
+export type LightningNodeSeedOptions = Omit<
+	INodeConfig,
+	SeedDerivedNodeConfigKey | 'iroh'
+> & {
+	/** BIP39 passphrase. */
+	passphrase?: string;
+	/**
+	 * The BIP39 seed of `mnemonic` and `passphrase`, for a caller that
+	 * already holds it: skips the PBKDF2 pass. It is not checked against
+	 * the mnemonic, so it must be that mnemonic's seed.
+	 */
+	seed?: Buffer;
+	/** BIP32 coin type of the Lightning key paths (default LnCoinType.REGTEST). */
+	coinType?: number;
+	/** Opt-in Iroh endpoint. Its secret key is derived from the seed. */
+	iroh?: Omit<IIrohConfig, 'secretKey'>;
+};
 
 // ─── Direct funding ───
 

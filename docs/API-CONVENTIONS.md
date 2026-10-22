@@ -66,6 +66,22 @@ The four `IWallet` options were never read, so passing one does nothing. The `IS
 | `ISendTransaction.fiatAmount`, `slashTagsUrl`, `lightningInvoice`, `EUnit` | Nothing |
 | `TStorage` | `IWalletStorage` |
 
+### `INodeConfig`
+
+`resolveNodeConfig` folds each flat name into its group, so both forms work. Where both are given, the group wins.
+
+| Deprecated | Use |
+|------------|-----|
+| `forwardingEnabled` | `forwarding.enabled` |
+| `forwardingCltvDelta` | `forwarding.cltvDelta` |
+| `forwardingFeeBaseMsat` | `forwarding.feeBaseMsat` |
+| `forwardingFeePropMillionths` | `forwarding.feePropMillionths` |
+| `forwardingPolicyGraceMs` | `forwarding.policyGraceMs` |
+| `fforSettle` | `ffor.settle` |
+| `fforConcurrent` | `ffor.concurrent` |
+| `fforWitness` | `ffor.witness` |
+| `fforIssuer` | `ffor.issuer` |
+
 ### `BeignetNode`
 
 | Deprecated | Use |
