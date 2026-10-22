@@ -70,6 +70,9 @@ export interface IElectrumOptions {
 	 * public servers for its network, and those learn every address the wallet
 	 * watches. With this set the connect fails instead, and the connection
 	 * poll keeps retrying `servers`. Regtest never uses public servers.
+	 *
+	 * Wallets on one network in a process share one connection, so while any
+	 * of them sets this, none of them falls back to public servers.
 	 */
 	disableFallbackServers?: boolean;
 }

@@ -32,6 +32,10 @@ const serverB: TServer = {
 	protocol: EProtocol.ssl
 };
 
+// An instance with fallback peers disabled bars them for every instance on its
+// network until it disconnects, so none may outlive its test.
+const refusingFallbacks: Electrum[] = [];
+
 const createElectrum = (
 	servers: TServer | TServer[],
 	network = EAvailableNetworks.testnet,
@@ -49,6 +53,7 @@ const createElectrum = (
 		servers,
 		disableFallbackServers
 	});
+	if (disableFallbackServers) refusingFallbacks.push(electrum);
 	// No background pings during tests.
 	electrum.stopConnectionPolling();
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -74,6 +79,12 @@ const stubConnections = (
 };
 
 describe('Electrum multi-server rotation', () => {
+	afterEach(async () => {
+		for (const electrum of refusingFallbacks.splice(0)) {
+			await electrum.disconnect();
+		}
+	});
+
 	it('starts with no current server and zero rotations', () => {
 		const electrum = createElectrum([serverA, serverB]);
 		expect(electrum.currentServer).to.equal(null);
@@ -267,6 +278,27 @@ describe('Electrum multi-server rotation', () => {
 			expect(res.error.message).to.match(/fallback servers are disabled/);
 		}
 		expect(attempts).to.have.length(0);
+	});
+
+	it('keeps every instance on the network off fallback peers while one disables them', async () => {
+		const fallbackHosts = (
+			defaultElectrumPeers[EElectrumNetworks.bitcoinTestnet] ?? []
+		).map((s) => s.host);
+		const strict = createElectrum([serverA], undefined, {
+			disableFallbackServers: true
+		});
+		stubConnections(strict, new Set(), []);
+		expect((await strict.connectToElectrum({})).isOk()).to.equal(true);
+
+		const permissive = createElectrum([]);
+		const attempts: string[] = [];
+		stubConnections(permissive, new Set(), attempts);
+		expect((await permissive.connectToElectrum({})).isErr()).to.equal(true);
+		expect(attempts).to.have.length(0);
+
+		await strict.disconnect();
+		expect((await permissive.connectToElectrum({})).isOk()).to.equal(true);
+		expect(attempts).to.deep.equal([fallbackHosts[0]]);
 	});
 
 	it('provides a signet fallback peer entry', () => {
