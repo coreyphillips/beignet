@@ -56,7 +56,7 @@ import {
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivation';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { IStorageBackend } from '../../src/lightning/storage/types';
+import { MemoryStorage } from '../../src/lightning/storage/memory-storage';
 import {
 	serializeChainMonitorState,
 	deserializeChainMonitorState,
@@ -213,124 +213,6 @@ function makeP2wpkhScript(pubkey: Buffer): Buffer {
 	return bitcoin.payments.p2wpkh({ pubkey, network }).output!;
 }
 
-/** Minimal in-memory IStorageBackend (mirrors persistence-crash-safety). */
-class MockStorage implements IStorageBackend {
-	channels = new Map<string, { state: any; peerPubkey: string }>();
-	chainMonitors = new Map<string, any>();
-
-	open(): void {}
-	close(): void {}
-	saveChannel(id: string, state: any, peerPubkey: string): void {
-		this.channels.set(id, { state, peerPubkey });
-	}
-	loadChannel(id: string): any {
-		return this.channels.get(id) || null;
-	}
-	loadAllChannels(): Array<any> {
-		return [...this.channels].map(([channelId, v]) => ({
-			channelId,
-			state: v.state,
-			peerPubkey: v.peerPubkey
-		}));
-	}
-	deleteChannel(id: string): void {
-		this.channels.delete(id);
-	}
-	savePayment(): void {}
-	loadPayment(): any {
-		return null;
-	}
-	loadAllPayments(): Array<any> {
-		return [];
-	}
-	deletePayment(): void {}
-	savePreimage(): void {}
-	loadPreimage(): Buffer | null {
-		return null;
-	}
-	loadAllPreimages(): Array<any> {
-		return [];
-	}
-	deletePreimage(): void {}
-	deleteInvoicePathId(): void {}
-	saveScidMapping(): void {}
-	loadAllScidMappings(): Array<any> {
-		return [];
-	}
-	saveHtlcPaymentMapping(): void {}
-	loadAllHtlcPaymentMappings(): Array<any> {
-		return [];
-	}
-	deleteHtlcPaymentMapping(): void {}
-	saveForwardedHtlc(): void {}
-	loadAllForwardedHtlcs(): Array<any> {
-		return [];
-	}
-	deleteForwardedHtlc(): void {}
-	saveChainMonitor(channelId: string, state: any): void {
-		this.chainMonitors.set(channelId, state);
-	}
-	loadChainMonitor(channelId: string): any {
-		return this.chainMonitors.get(channelId) || null;
-	}
-	loadAllChainMonitors(): Array<any> {
-		return [...this.chainMonitors].map(([channelId, state]) => ({
-			channelId,
-			state
-		}));
-	}
-	saveGossipChannel(): void {}
-	loadAllGossipChannels(): any[] {
-		return [];
-	}
-	saveGossipNode(): void {}
-	loadAllGossipNodes(): any[] {
-		return [];
-	}
-	savePaymentSecret(): void {}
-	loadAllPaymentSecrets(): Array<{ paymentHashHex: string; secret: Buffer }> {
-		return [];
-	}
-	deletePaymentSecret(): void {}
-	saveInvoice(): void {}
-	loadAllInvoices(): Array<any> {
-		return [];
-	}
-	deleteInvoice(): void {}
-	saveMissionControl(): void {}
-	loadMissionControl(): string | null {
-		return null;
-	}
-	savePeerAddress(): void {}
-	loadAllPeerAddresses(): Array<{
-		pubkey: string;
-		host: string;
-		port: number;
-	}> {
-		return [];
-	}
-	deletePeerAddress(): void {}
-	saveChannelKeyIndex(): void {}
-	loadChannelKeyIndex(): number | null {
-		return null;
-	}
-	loadNextChannelIndex(): number {
-		return 1;
-	}
-	saveMetadata(): void {}
-	loadMetadata(): string | null {
-		return null;
-	}
-	saveHtlcSharedSecret(): void {}
-	deleteHtlcSharedSecret(): void {}
-	loadAllHtlcSharedSecrets(): Array<{ key: string; secret: Buffer }> {
-		return [];
-	}
-	transaction<T>(fn: () => T): T {
-		return fn();
-	}
-}
-
 function makeNodeKeys(tag: string): {
 	nodePrivateKey: Buffer;
 	basepoints: IChannelBasepoints;
@@ -416,7 +298,7 @@ describe('Pending-close resolution', function () {
 	describe('LightningNode channel:resolved wiring', function () {
 		it('transitions the channel to CLOSED, persists, and re-emits publicly', function () {
 			const keys = makeNodeKeys('node-resolved');
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			const node = new LightningNode({
 				nodePrivateKey: keys.nodePrivateKey,
 				channelBasepoints: keys.basepoints,
@@ -445,7 +327,7 @@ describe('Pending-close resolution', function () {
 			expect(opener.getState()).to.equal(ChannelState.CLOSED);
 			expect(publicEvent).to.not.be.null;
 			expect(publicEvent!.equals(channelId)).to.be.true;
-			const saved = storage.channels.get(channelId.toString('hex'));
+			const saved = storage.loadChannel(channelId.toString('hex'));
 			expect(saved, 'channel persisted').to.exist;
 			expect(saved!.state.state).to.equal(ChannelState.CLOSED);
 			node.destroy();
@@ -484,7 +366,7 @@ describe('Pending-close resolution', function () {
 
 			// Persist the stale shape: channel FORCE_CLOSED, monitor FULLY_RESOLVED.
 			opener.markClosedOnChain(true);
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			storage.saveChannel(
 				channelIdHex,
 				opener.getFullState(),
@@ -506,7 +388,7 @@ describe('Pending-close resolution', function () {
 			const restored = node.getChannelManager().getChannel(channelId);
 			expect(restored, 'channel restored').to.exist;
 			expect(restored!.getState()).to.equal(ChannelState.CLOSED);
-			expect(storage.channels.get(channelIdHex)!.state.state).to.equal(
+			expect(storage.loadChannel(channelIdHex)!.state.state).to.equal(
 				ChannelState.CLOSED
 			);
 			node.destroy();
@@ -548,7 +430,7 @@ describe('Pending-close resolution', function () {
 			opener.markClosedOnChain(true);
 			opener.markResolved();
 			expect(opener.getState()).to.equal(ChannelState.CLOSED);
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			storage.saveChannel(
 				channelIdHex,
 				opener.getFullState(),
@@ -573,10 +455,10 @@ describe('Pending-close resolution', function () {
 			expect(
 				node.getChannelManager().getChannel(channelId)?.getState()
 			).to.equal(ChannelState.FORCE_CLOSED);
-			expect(storage.channels.get(channelIdHex)?.state.state).to.equal(
+			expect(storage.loadChannel(channelIdHex)?.state.state).to.equal(
 				ChannelState.FORCE_CLOSED
 			);
-			expect(storage.chainMonitors.get(channelIdHex)?.monitorState).to.equal(
+			expect(storage.loadChainMonitor(channelIdHex)?.monitorState).to.equal(
 				MonitorState.RESOLVING
 			);
 			node.destroy();

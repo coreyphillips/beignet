@@ -113,8 +113,9 @@ export interface ICapsuleRestoreOptions {
 	 * Factory for a FRESH, empty storage backend used to dry-run the
 	 * candidate's reconstruction before the real target is written (see
 	 * CapsuleReplayError). Supply an in-memory backend (e.g.
-	 * `() => new SqliteStorage(':memory:')`, opened). Kept injectable so
-	 * the recovery core stays free of a concrete backend dependency.
+	 * `() => new MemoryStorage()`, or `new SqliteStorage(':memory:')`,
+	 * opened). Kept injectable so the recovery core stays free of a
+	 * concrete backend dependency.
 	 * OPTIONAL for the single-capsule restore (a throw is a throw there);
 	 * REQUIRED by restoreBestRecoveryCapsule whenever the target supports
 	 * Tier 2, because its candidate/Tier-1 fallback contract depends on

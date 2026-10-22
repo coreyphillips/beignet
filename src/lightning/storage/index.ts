@@ -4,6 +4,19 @@ export * from './types';
 export * from './serialization';
 export { IStoredPaymentRef, IPaymentRowMatch } from './sqlite-storage';
 export * from './encryption';
+export { MemoryStorage } from './memory-storage';
+export {
+	STORAGE_CAPABILITIES,
+	storageCapabilityMembers,
+	hasStorageCapability,
+	hasRecoveryStorage,
+	partialStorageCapabilities
+} from './capabilities';
+export {
+	IStorageConformanceCheck,
+	storageConformanceChecks,
+	runStorageConformanceSuite
+} from './conformance';
 
 // An alias rather than a re-export: TypeScript drops @deprecated on export
 // specifiers, so editors would not flag the old path.

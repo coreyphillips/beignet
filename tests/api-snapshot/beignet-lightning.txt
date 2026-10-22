@@ -7334,6 +7334,23 @@ namespace storage
 class storage.CorruptRecoveryRowError extends Error
 constructor storage.CorruptRecoveryRowError(message: string)
 const storage.ENC_PREFIX = "enc1:"
+interface storage.IActionLogStorage
+method storage.IActionLogStorage.loadActionLog(options?: { category?: string; since?: number; limit?: number; }): Array<{ category: string; action: string; timestamp: number; data: string; }>
+method storage.IActionLogStorage.saveActionLog(entry: { category: string; action: string; timestamp: number; data: string; }): void
+interface storage.IAnnouncedPeerAddressStorage
+method storage.IAnnouncedPeerAddressStorage.loadAllAnnouncedPeerAddresses(): Array<{ pubkey: string; timestamp: number; addresses: Array<{ host: string; port: number; }>; }>
+method storage.IAnnouncedPeerAddressStorage.saveAnnouncedPeerAddresses(pubkey: string, timestamp: number, addresses: Array<{ host: string; port: number; }>): void
+interface storage.IChannelKeyIndexHistoryStorage
+method storage.IChannelKeyIndexHistoryStorage.hasChannelKeyIndices(): boolean
+method storage.IChannelKeyIndexHistoryStorage.loadAllChannelKeyIndices(): Array<{ channelId: string; channelIndex: number; }>
+interface storage.IChannelPolicyStorage
+method storage.IChannelPolicyStorage.deleteChannelPolicy(channelId: string): void
+method storage.IChannelPolicyStorage.loadAllChannelPolicies(): Array<{ channelId: string; policy: storage.IPersistedChannelPolicy; }>
+method storage.IChannelPolicyStorage.saveChannelPolicy(channelId: string, policy: storage.IPersistedChannelPolicy): void
+interface storage.IFforStorage
+method storage.IFforStorage.loadAllFforVouchers(): ffor.IFforVoucherArchive[]
+method storage.IFforStorage.loadFforVoucher(id: string): ffor.IFforVoucherArchive | null
+method storage.IFforStorage.saveFforVoucher(record: ffor.IFforVoucherArchive): void
 interface storage.IForwardingEvent
 property storage.IForwardingEvent.amountInMsat: bigint
 property storage.IForwardingEvent.amountOutMsat: bigint
@@ -7350,10 +7367,20 @@ property storage.IForwardingEventFilter.limit?: number
 property storage.IForwardingEventFilter.offset?: number
 property storage.IForwardingEventFilter.since?: number
 property storage.IForwardingEventFilter.until?: number
+interface storage.IForwardingStorage
+method storage.IForwardingStorage.getForwardingSummary(options?: { since?: number; }): storage.IForwardingSummary
+method storage.IForwardingStorage.listForwardingEvents(filter?: storage.IForwardingEventFilter): storage.IForwardingEvent[]
+method storage.IForwardingStorage.saveForwardingEvent(event: Omit<storage.IForwardingEvent, 'id'>): void
 interface storage.IForwardingSummary
 property storage.IForwardingSummary.count: number
 property storage.IForwardingSummary.feesEarnedMsat: bigint
 property storage.IForwardingSummary.volumeOutMsat: bigint
+interface storage.IGossipPagingStorage
+method storage.IGossipPagingStorage.loadGossipChannelsAfter(afterRowid: number, limit: number): storage.IGossipRowPage<gossip.IGraphChannel>
+method storage.IGossipPagingStorage.loadGossipNodesAfter(afterRowid: number, limit: number): storage.IGossipRowPage<gossip.IGraphNode>
+interface storage.IGossipPruningStorage
+method storage.IGossipPruningStorage.deleteGossipChannel(scidHex: string): void
+method storage.IGossipPruningStorage.deleteGossipNode(nodeIdHex: string): void
 interface storage.IGossipRowPage<T>
 property storage.IGossipRowPage.cursor: number
 property storage.IGossipRowPage.done: boolean
@@ -7370,26 +7397,60 @@ property storage.IInvoiceInfo.hold?: boolean
 property storage.IInvoiceInfo.jitFee?: { flatFeeSat: number; feePpm: number; }
 property storage.IInvoiceInfo.minFinalCltvExpiry?: number
 property storage.IInvoiceInfo.paymentHash: string
+interface storage.IInvoicePathIdStorage
+method storage.IInvoicePathIdStorage.loadAllInvoicePathIds(): Array<{ paymentHashHex: string; pathId: Buffer; }>
+method storage.IInvoicePathIdStorage.saveInvoicePathId(paymentHashHex: string, pathId: Buffer): void
+interface storage.IMetadataScanStorage
+method storage.IMetadataScanStorage.deleteMetadata(key: string): void
+method storage.IMetadataScanStorage.loadMetadataByPrefix(prefix: string): Array<{ key: string; value: string; }>
+interface storage.IOfferStorage
+method storage.IOfferStorage.deleteOffer(offerIdHex: string): void
+method storage.IOfferStorage.loadAllOffers(): Array<{ offerIdHex: string; encoded: string; pathId: Buffer | null; createdAt: number; asyncHold?: boolean; }>
+method storage.IOfferStorage.saveOffer(offerIdHex: string, encoded: string, pathId: Buffer | null, createdAt: number, asyncHold?: boolean): void
 interface storage.IPaymentRowMatch
 property storage.IPaymentRowMatch.direction?: string
 property storage.IPaymentRowMatch.metadata?: { key: string; value?: string; }
 property storage.IPaymentRowMatch.status?: string
+interface storage.IPeerStorageBlobStorage
+method storage.IPeerStorageBlobStorage.deletePeerStorageBlob(peerPubkey: string): void
+method storage.IPeerStorageBlobStorage.loadPeerStorageBlob(peerPubkey: string): { blob: Buffer; receivedAt: number; } | null
+method storage.IPeerStorageBlobStorage.savePeerStorageBlob(peerPubkey: string, blob: Buffer, receivedAt: number): void
 interface storage.IPersistedChannelPolicy
 property storage.IPersistedChannelPolicy.cltvExpiryDelta?: number
 property storage.IPersistedChannelPolicy.feeBaseMsat?: number
 property storage.IPersistedChannelPolicy.feeProportionalMillionths?: number
 property storage.IPersistedChannelPolicy.htlcMaximumMsat?: string
 property storage.IPersistedChannelPolicy.htlcMinimumMsat?: string
+interface storage.IRecoveryJournalStorage
+method storage.IRecoveryJournalStorage.deleteRecoveryFramesBelow(sequence: number): void
+method storage.IRecoveryJournalStorage.deleteRecoveryMeta(key: string): void
+method storage.IRecoveryJournalStorage.getRecoveryMeta(key: string): string | null
+method storage.IRecoveryJournalStorage.listRecoveryMetaKeys(): string[]
+method storage.IRecoveryJournalStorage.loadRecoveryFrame(sequence: number): storage.IStoredRecoveryFrame | null
+method storage.IRecoveryJournalStorage.loadRecoveryFrameHeader(sequence: number): storage.IStoredRecoveryFrameHeader | null
+method storage.IRecoveryJournalStorage.loadRecoveryFrames(afterSequence?: number): storage.IStoredRecoveryFrame[]
+method storage.IRecoveryJournalStorage.recoveryFrameStats(): { count: number; minSequence: number; maxSequence: number; } | null
+method storage.IRecoveryJournalStorage.saveRecoveryFrame(frame: storage.IStoredRecoveryFrame): void
+method storage.IRecoveryJournalStorage.setOutboxFrameSequence(ids: number[], frameSequence: number): void
+method storage.IRecoveryJournalStorage.setRecoveryMeta(key: string, value: string): void
 interface storage.IRecoveryOutboxMessage
 property storage.IRecoveryOutboxMessage.channelId?: string
 property storage.IRecoveryOutboxMessage.disposition: recovery.RecoveryOutboxDisposition
 property storage.IRecoveryOutboxMessage.messageType: number
 property storage.IRecoveryOutboxMessage.peerId: string
 property storage.IRecoveryOutboxMessage.wireMessage: Buffer
+interface storage.IRecoveryOutboxStorage
+method storage.IRecoveryOutboxStorage.countOutboxMessages(channelId: string): number
+method storage.IRecoveryOutboxStorage.deleteOutboxMessages(channelId: string, messageTypes?: number[]): void
+method storage.IRecoveryOutboxStorage.loadOutboxMessages(channelId?: string): storage.IRecoveryOutboxStoredMessage[]
+method storage.IRecoveryOutboxStorage.pruneOutboxMessages(channelId: string, keepNewest: number): void
+method storage.IRecoveryOutboxStorage.saveOutboxMessage(message: storage.IRecoveryOutboxMessage): number
+method storage.IRecoveryOutboxStorage.setOutboxDisposition(id: number, disposition: 'pending_send' | 'sent_unacked' | 'superseded'): void
 interface storage.IRecoveryOutboxStoredMessage extends storage.IRecoveryOutboxMessage
 property storage.IRecoveryOutboxStoredMessage.createdAt: number
 property storage.IRecoveryOutboxStoredMessage.frameSequence: number | null
 property storage.IRecoveryOutboxStoredMessage.id: number
+interface storage.IRecoveryStorage extends storage.IRecoveryOutboxStorage, storage.IRecoveryJournalStorage
 interface storage.ISerializedBasepoints
 property storage.ISerializedBasepoints.delayedPaymentBasepoint: string
 property storage.ISerializedBasepoints.firstPerCommitmentPoint: string
@@ -7605,6 +7666,18 @@ property storage.ISerializedHtlcEntry.state: string
 interface storage.ISerializedHtlcSnapshot
 property storage.ISerializedHtlcSnapshot.commitmentNumber: string
 property storage.ISerializedHtlcSnapshot.htlcs: Array<{ paymentHash: string; amountMsat: string; cltvExpiry: number; direction: string; }>
+interface storage.ISerializedInvoiceInfo
+property storage.ISerializedInvoiceInfo.amountMsat?: string
+property storage.ISerializedInvoiceInfo.bolt11: string
+property storage.ISerializedInvoiceInfo.bolt12?: boolean
+property storage.ISerializedInvoiceInfo.cancelledAt?: number
+property storage.ISerializedInvoiceInfo.createdAt: number
+property storage.ISerializedInvoiceInfo.description?: string
+property storage.ISerializedInvoiceInfo.expiry: number
+property storage.ISerializedInvoiceInfo.hold?: boolean
+property storage.ISerializedInvoiceInfo.jitFee?: { flatFeeSat: number; feePpm: number; }
+property storage.ISerializedInvoiceInfo.minFinalCltvExpiry?: number
+property storage.ISerializedInvoiceInfo.paymentHash: string
 interface storage.ISerializedPaymentInfo
 property storage.ISerializedPaymentInfo.amountMsat: string
 property storage.ISerializedPaymentInfo.completedAt?: number
@@ -7676,117 +7749,84 @@ property storage.ISerializedV2InFlight.remoteCommitmentSig: string | null
 property storage.ISerializedV2InFlight.remoteContributionSats: string
 property storage.ISerializedV2InFlight.sentTxSignatures: boolean
 property storage.ISerializedV2InFlight.weSignFirst: boolean
-interface storage.IStorageBackend
-method storage.IStorageBackend.addWatchtowerUpdate?(update: watchtower.IWatchtowerUpdate): number
+interface storage.IStorageBackend extends storage.IStorageCore, Partial<storage.IFforStorage>, Partial<storage.IInvoicePathIdStorage>, Partial<storage.IAnnouncedPeerAddressStorage>, Partial<storage.IChannelKeyIndexHistoryStorage>, Partial<storage.IMetadataScanStorage>, Partial<storage.IWalletDataStorage>, Partial<storage.IGossipPagingStorage>, Partial<storage.IGossipPruningStorage>, Partial<storage.IChannelPolicyStorage>, Partial<storage.IPeerStorageBlobStorage>, Partial<storage.IForwardingStorage>, Partial<storage.IActionLogStorage>, Partial<storage.IWatchtowerStorage>, Partial<storage.IRecoveryOutboxStorage>, Partial<storage.IRecoveryJournalStorage>, Partial<storage.IOfferStorage>
 method storage.IStorageBackend.checkpoint?(): void
-method storage.IStorageBackend.close(): void
 method storage.IStorageBackend.corruptRowCount?(): number
-method storage.IStorageBackend.countOutboxMessages?(channelId: string): number
-method storage.IStorageBackend.deleteChannel(id: string): void
-method storage.IStorageBackend.deleteChannelPolicy?(channelId: string): void
-method storage.IStorageBackend.deleteForwardedHtlc(outKey: string): void
-method storage.IStorageBackend.deleteGossipChannel?(scidHex: string): void
-method storage.IStorageBackend.deleteGossipNode?(nodeIdHex: string): void
-method storage.IStorageBackend.deleteHtlcPaymentMapping(key: string): void
-method storage.IStorageBackend.deleteHtlcSharedSecret(key: string): void
-method storage.IStorageBackend.deleteInvoice(paymentHashHex: string): void
-method storage.IStorageBackend.deleteInvoicePathId(paymentHashHex: string): void
-method storage.IStorageBackend.deleteMetadata?(key: string): void
-method storage.IStorageBackend.deleteOffer?(offerIdHex: string): void
-method storage.IStorageBackend.deleteOutboxMessages?(channelId: string, messageTypes?: number[]): void
-method storage.IStorageBackend.deletePayment(paymentHash: string): void
-method storage.IStorageBackend.deletePaymentSecret(paymentHashHex: string): void
-method storage.IStorageBackend.deletePeerAddress(pubkey: string): void
-method storage.IStorageBackend.deletePeerStorageBlob?(peerPubkey: string): void
-method storage.IStorageBackend.deletePreimage(paymentHash: string): void
-method storage.IStorageBackend.deleteRecoveryFramesBelow?(sequence: number): void
-method storage.IStorageBackend.deleteRecoveryMeta?(key: string): void
-method storage.IStorageBackend.deleteWatchtowerTower?(towerUri: string): void
-method storage.IStorageBackend.getForwardingSummary?(options?: { since?: number; }): storage.IForwardingSummary
-method storage.IStorageBackend.getRecoveryMeta?(key: string): string | null
-method storage.IStorageBackend.hasChannelKeyIndices?(): boolean
 method storage.IStorageBackend.inTransaction?(): boolean
-method storage.IStorageBackend.listForwardingEvents?(filter?: storage.IForwardingEventFilter): storage.IForwardingEvent[]
-method storage.IStorageBackend.listRecoveryMetaKeys?(): string[]
-method storage.IStorageBackend.loadActionLog?(options?: { category?: string; since?: number; limit?: number; }): Array<{ category: string; action: string; timestamp: number; data: string; }>
-method storage.IStorageBackend.loadAllAnnouncedPeerAddresses?(): Array<{ pubkey: string; timestamp: number; addresses: Array<{ host: string; port: number; }>; }>
-method storage.IStorageBackend.loadAllChainMonitors(): Array<{ channelId: string; state: chain.IChainMonitorState; }>
-method storage.IStorageBackend.loadAllChannelKeyIndices?(): Array<{ channelId: string; channelIndex: number; }>
-method storage.IStorageBackend.loadAllChannelPolicies?(): Array<{ channelId: string; policy: storage.IPersistedChannelPolicy; }>
-method storage.IStorageBackend.loadAllChannels(): Array<{ channelId: string; state: channel.IChannelState; peerPubkey: string; }>
-method storage.IStorageBackend.loadAllFforVouchers?(): ffor.IFforVoucherArchive[]
-method storage.IStorageBackend.loadAllForwardedHtlcs(): Array<{ outKey: string; inChannelId: Buffer; inHtlcId: bigint; }>
-method storage.IStorageBackend.loadAllGossipChannels(): gossip.IGraphChannel[]
-method storage.IStorageBackend.loadAllGossipNodes(): gossip.IGraphNode[]
-method storage.IStorageBackend.loadAllHtlcPaymentMappings(): Array<{ key: string; paymentHashHex: string; }>
-method storage.IStorageBackend.loadAllHtlcSharedSecrets(): Array<{ key: string; secret: Buffer; }>
-method storage.IStorageBackend.loadAllInvoicePathIds?(): Array<{ paymentHashHex: string; pathId: Buffer; }>
-method storage.IStorageBackend.loadAllInvoices(): Array<{ paymentHashHex: string; invoice: node.IInvoiceInfo; }>
-method storage.IStorageBackend.loadAllOffers?(): Array<{ offerIdHex: string; encoded: string; pathId: Buffer | null; createdAt: number; asyncHold?: boolean; }>
-method storage.IStorageBackend.loadAllPaymentSecrets(): Array<{ paymentHashHex: string; secret: Buffer; }>
-method storage.IStorageBackend.loadAllPayments(): Array<{ paymentHash: string; payment: node.IPaymentInfo; }>
-method storage.IStorageBackend.loadAllPeerAddresses(): Array<{ pubkey: string; host: string; port: number; transport?: transport.IPeerTransportOptions; }>
-method storage.IStorageBackend.loadAllPreimages(): Array<{ paymentHash: string; preimage: Buffer; }>
-method storage.IStorageBackend.loadAllScidMappings(): Array<{ scidHex: string; channelId: Buffer; }>
-method storage.IStorageBackend.loadChainMonitor(channelId: string): chain.IChainMonitorState | null
-method storage.IStorageBackend.loadChannel(id: string): { state: channel.IChannelState; peerPubkey: string; } | null
-method storage.IStorageBackend.loadChannelKeyIndex(channelId: string): number | null
-method storage.IStorageBackend.loadFforVoucher?(id: string): ffor.IFforVoucherArchive | null
-method storage.IStorageBackend.loadGossipChannelsAfter?(afterRowid: number, limit: number): storage.IGossipRowPage<gossip.IGraphChannel>
-method storage.IStorageBackend.loadGossipNodesAfter?(afterRowid: number, limit: number): storage.IGossipRowPage<gossip.IGraphNode>
-method storage.IStorageBackend.loadMetadata(key: string): string | null
-method storage.IStorageBackend.loadMetadataByPrefix?(prefix: string): Array<{ key: string; value: string; }>
-method storage.IStorageBackend.loadMissionControl(): string | null
-method storage.IStorageBackend.loadNextChannelIndex(): number
-method storage.IStorageBackend.loadOutboxMessages?(channelId?: string): storage.IRecoveryOutboxStoredMessage[]
-method storage.IStorageBackend.loadPayment(paymentHash: string): node.IPaymentInfo | null
-method storage.IStorageBackend.loadPeerStorageBlob?(peerPubkey: string): { blob: Buffer; receivedAt: number; } | null
-method storage.IStorageBackend.loadPendingWatchtowerUpdates?(): Array<watchtower.IWatchtowerUpdate & { id: number; }>
-method storage.IStorageBackend.loadPreimage(paymentHash: string): Buffer | null
-method storage.IStorageBackend.loadRecoveryFrame?(sequence: number): storage.IStoredRecoveryFrame | null
-method storage.IStorageBackend.loadRecoveryFrameHeader?(sequence: number): storage.IStoredRecoveryFrameHeader | null
-method storage.IStorageBackend.loadRecoveryFrames?(afterSequence?: number): storage.IStoredRecoveryFrame[]
-method storage.IStorageBackend.loadWalletData?(key: string): string | null
-method storage.IStorageBackend.loadWatchtowerSessions?(): Array<watchtower.IWatchtowerSession & { sessionKey: Buffer; }>
-method storage.IStorageBackend.markWatchtowerUpdateAcked?(id: number, seqNum: number): void
-method storage.IStorageBackend.open(): void
-method storage.IStorageBackend.pruneOutboxMessages?(channelId: string, keepNewest: number): void
-method storage.IStorageBackend.recoveryFrameStats?(): { count: number; minSequence: number; maxSequence: number; } | null
 method storage.IStorageBackend.revokedHtlcSnapshotStore?(): object
-method storage.IStorageBackend.saveActionLog?(entry: { category: string; action: string; timestamp: number; data: string; }): void
-method storage.IStorageBackend.saveAnnouncedPeerAddresses?(pubkey: string, timestamp: number, addresses: Array<{ host: string; port: number; }>): void
-method storage.IStorageBackend.saveChainMonitor(channelId: string, state: chain.IChainMonitorState): void
-method storage.IStorageBackend.saveChannel(id: string, state: channel.IChannelState, peerPubkey: string): void
-method storage.IStorageBackend.saveChannelKeyIndex(channelId: string, channelIndex: number): void
-method storage.IStorageBackend.saveChannelPolicy?(channelId: string, policy: storage.IPersistedChannelPolicy): void
-method storage.IStorageBackend.saveFforVoucher?(record: ffor.IFforVoucherArchive): void
-method storage.IStorageBackend.saveForwardedHtlc(outKey: string, inChannelId: Buffer, inHtlcId: bigint): void
-method storage.IStorageBackend.saveForwardingEvent?(event: Omit<storage.IForwardingEvent, 'id'>): void
-method storage.IStorageBackend.saveGossipChannel(scidHex: string, channel: gossip.IGraphChannel): void
-method storage.IStorageBackend.saveGossipNode(nodeIdHex: string, node: gossip.IGraphNode): void
-method storage.IStorageBackend.saveHtlcPaymentMapping(key: string, paymentHashHex: string): void
-method storage.IStorageBackend.saveHtlcSharedSecret(key: string, secret: Buffer): void
-method storage.IStorageBackend.saveInvoice(paymentHashHex: string, invoice: node.IInvoiceInfo): void
-method storage.IStorageBackend.saveInvoicePathId?(paymentHashHex: string, pathId: Buffer): void
-method storage.IStorageBackend.saveMetadata(key: string, value: string): void
-method storage.IStorageBackend.saveMissionControl(json: string): void
-method storage.IStorageBackend.saveOffer?(offerIdHex: string, encoded: string, pathId: Buffer | null, createdAt: number, asyncHold?: boolean): void
-method storage.IStorageBackend.saveOutboxMessage?(message: storage.IRecoveryOutboxMessage): number
-method storage.IStorageBackend.savePayment(paymentHash: string, payment: node.IPaymentInfo): void
-method storage.IStorageBackend.savePaymentSecret(paymentHashHex: string, secret: Buffer): void
-method storage.IStorageBackend.savePeerAddress(pubkey: string, host: string, port: number, transport?: transport.IPeerTransportOptions): void
-method storage.IStorageBackend.savePeerStorageBlob?(peerPubkey: string, blob: Buffer, receivedAt: number): void
-method storage.IStorageBackend.savePreimage(paymentHash: string, preimage: Buffer): void
-method storage.IStorageBackend.saveRecoveryFrame?(frame: storage.IStoredRecoveryFrame): void
-method storage.IStorageBackend.saveScidMapping(scidHex: string, channelId: Buffer): void
-method storage.IStorageBackend.saveWalletData?(key: string, value: string): void
-method storage.IStorageBackend.saveWatchtowerSession?(session: watchtower.IWatchtowerSession, sessionKey: Buffer): void
 method storage.IStorageBackend.secretsEncryptedAtRest?(): boolean
-method storage.IStorageBackend.setOutboxDisposition?(id: number, disposition: 'pending_send' | 'sent_unacked' | 'superseded'): void
-method storage.IStorageBackend.setOutboxFrameSequence?(ids: number[], frameSequence: number): void
-method storage.IStorageBackend.setRecoveryMeta?(key: string, value: string): void
-method storage.IStorageBackend.setWatchtowerSessionProgress?(sessionId: string, seqNum: number, lastApplied: number): void
-method storage.IStorageBackend.transaction<T>(fn: () => T): T
+interface storage.IStorageCapabilities
+property storage.IStorageCapabilities.actionLog: storage.IActionLogStorage
+property storage.IStorageCapabilities.announcedPeerAddresses: storage.IAnnouncedPeerAddressStorage
+property storage.IStorageCapabilities.channelKeyIndexHistory: storage.IChannelKeyIndexHistoryStorage
+property storage.IStorageCapabilities.channelPolicies: storage.IChannelPolicyStorage
+property storage.IStorageCapabilities.ffor: storage.IFforStorage
+property storage.IStorageCapabilities.forwarding: storage.IForwardingStorage
+property storage.IStorageCapabilities.gossipPaging: storage.IGossipPagingStorage
+property storage.IStorageCapabilities.gossipPruning: storage.IGossipPruningStorage
+property storage.IStorageCapabilities.invoicePathIds: storage.IInvoicePathIdStorage
+property storage.IStorageCapabilities.metadataScan: storage.IMetadataScanStorage
+property storage.IStorageCapabilities.offers: storage.IOfferStorage
+property storage.IStorageCapabilities.peerStorageBlobs: storage.IPeerStorageBlobStorage
+property storage.IStorageCapabilities.recoveryJournal: storage.IRecoveryJournalStorage
+property storage.IStorageCapabilities.recoveryOutbox: storage.IRecoveryOutboxStorage
+property storage.IStorageCapabilities.walletData: storage.IWalletDataStorage
+property storage.IStorageCapabilities.watchtower: storage.IWatchtowerStorage
+interface storage.IStorageConformanceCheck
+property storage.IStorageConformanceCheck.capability?: storage.StorageCapability
+property storage.IStorageConformanceCheck.name: string
+method storage.IStorageConformanceCheck.run(): 'passed' | 'skipped'
+interface storage.IStorageCore
+method storage.IStorageCore.close(): void
+method storage.IStorageCore.deleteChannel(id: string): void
+method storage.IStorageCore.deleteForwardedHtlc(outKey: string): void
+method storage.IStorageCore.deleteHtlcPaymentMapping(key: string): void
+method storage.IStorageCore.deleteHtlcSharedSecret(key: string): void
+method storage.IStorageCore.deleteInvoice(paymentHashHex: string): void
+method storage.IStorageCore.deleteInvoicePathId(paymentHashHex: string): void
+method storage.IStorageCore.deletePayment(paymentHash: string): void
+method storage.IStorageCore.deletePaymentSecret(paymentHashHex: string): void
+method storage.IStorageCore.deletePeerAddress(pubkey: string): void
+method storage.IStorageCore.deletePreimage(paymentHash: string): void
+method storage.IStorageCore.loadAllChainMonitors(): Array<{ channelId: string; state: chain.IChainMonitorState; }>
+method storage.IStorageCore.loadAllChannels(): Array<{ channelId: string; state: channel.IChannelState; peerPubkey: string; }>
+method storage.IStorageCore.loadAllForwardedHtlcs(): Array<{ outKey: string; inChannelId: Buffer; inHtlcId: bigint; }>
+method storage.IStorageCore.loadAllGossipChannels(): gossip.IGraphChannel[]
+method storage.IStorageCore.loadAllGossipNodes(): gossip.IGraphNode[]
+method storage.IStorageCore.loadAllHtlcPaymentMappings(): Array<{ key: string; paymentHashHex: string; }>
+method storage.IStorageCore.loadAllHtlcSharedSecrets(): Array<{ key: string; secret: Buffer; }>
+method storage.IStorageCore.loadAllInvoices(): Array<{ paymentHashHex: string; invoice: node.IInvoiceInfo; }>
+method storage.IStorageCore.loadAllPaymentSecrets(): Array<{ paymentHashHex: string; secret: Buffer; }>
+method storage.IStorageCore.loadAllPayments(): Array<{ paymentHash: string; payment: node.IPaymentInfo; }>
+method storage.IStorageCore.loadAllPeerAddresses(): Array<{ pubkey: string; host: string; port: number; transport?: transport.IPeerTransportOptions; }>
+method storage.IStorageCore.loadAllPreimages(): Array<{ paymentHash: string; preimage: Buffer; }>
+method storage.IStorageCore.loadAllScidMappings(): Array<{ scidHex: string; channelId: Buffer; }>
+method storage.IStorageCore.loadChainMonitor(channelId: string): chain.IChainMonitorState | null
+method storage.IStorageCore.loadChannel(id: string): { state: channel.IChannelState; peerPubkey: string; } | null
+method storage.IStorageCore.loadChannelKeyIndex(channelId: string): number | null
+method storage.IStorageCore.loadMetadata(key: string): string | null
+method storage.IStorageCore.loadMissionControl(): string | null
+method storage.IStorageCore.loadNextChannelIndex(): number
+method storage.IStorageCore.loadPayment(paymentHash: string): node.IPaymentInfo | null
+method storage.IStorageCore.loadPreimage(paymentHash: string): Buffer | null
+method storage.IStorageCore.open(): void
+method storage.IStorageCore.saveChainMonitor(channelId: string, state: chain.IChainMonitorState): void
+method storage.IStorageCore.saveChannel(id: string, state: channel.IChannelState, peerPubkey: string): void
+method storage.IStorageCore.saveChannelKeyIndex(channelId: string, channelIndex: number): void
+method storage.IStorageCore.saveForwardedHtlc(outKey: string, inChannelId: Buffer, inHtlcId: bigint): void
+method storage.IStorageCore.saveGossipChannel(scidHex: string, channel: gossip.IGraphChannel): void
+method storage.IStorageCore.saveGossipNode(nodeIdHex: string, node: gossip.IGraphNode): void
+method storage.IStorageCore.saveHtlcPaymentMapping(key: string, paymentHashHex: string): void
+method storage.IStorageCore.saveHtlcSharedSecret(key: string, secret: Buffer): void
+method storage.IStorageCore.saveInvoice(paymentHashHex: string, invoice: node.IInvoiceInfo): void
+method storage.IStorageCore.saveMetadata(key: string, value: string): void
+method storage.IStorageCore.saveMissionControl(json: string): void
+method storage.IStorageCore.savePayment(paymentHash: string, payment: node.IPaymentInfo): void
+method storage.IStorageCore.savePaymentSecret(paymentHashHex: string, secret: Buffer): void
+method storage.IStorageCore.savePeerAddress(pubkey: string, host: string, port: number, transport?: transport.IPeerTransportOptions): void
+method storage.IStorageCore.savePreimage(paymentHash: string, preimage: Buffer): void
+method storage.IStorageCore.saveScidMapping(scidHex: string, channelId: Buffer): void
+method storage.IStorageCore.transaction<T>(fn: () => T): T
 interface storage.IStoredPaymentRef
 property storage.IStoredPaymentRef.createdAt: number
 method storage.IStoredPaymentRef.load(): node.IPaymentInfo | null
@@ -7799,9 +7839,133 @@ property storage.IStoredRecoveryFrame.previousFrameHash: Buffer
 property storage.IStoredRecoveryFrame.sequence: number
 property storage.IStoredRecoveryFrame.writerEpoch: number
 type storage.IStoredRecoveryFrameHeader = Pick<storage.IStoredRecoveryFrame, 'sequence' | 'writerEpoch' | 'frameHash' | 'previousFrameHash'>
+interface storage.IWalletDataStorage
+method storage.IWalletDataStorage.loadWalletData(key: string): string | null
+method storage.IWalletDataStorage.saveWalletData(key: string, value: string): void
+interface storage.IWatchtowerStorage
+method storage.IWatchtowerStorage.addWatchtowerUpdate(update: watchtower.IWatchtowerUpdate): number
+method storage.IWatchtowerStorage.deleteWatchtowerTower(towerUri: string): void
+method storage.IWatchtowerStorage.loadPendingWatchtowerUpdates(): Array<watchtower.IWatchtowerUpdate & { id: number; }>
+method storage.IWatchtowerStorage.loadWatchtowerSessions(): Array<watchtower.IWatchtowerSession & { sessionKey: Buffer; }>
+method storage.IWatchtowerStorage.markWatchtowerUpdateAcked(id: number, seqNum: number): void
+method storage.IWatchtowerStorage.saveWatchtowerSession(session: watchtower.IWatchtowerSession, sessionKey: Buffer): void
+method storage.IWatchtowerStorage.setWatchtowerSessionProgress(sessionId: string, seqNum: number, lastApplied: number): void
+class storage.MemoryStorage implements storage.IStorageBackend
+method storage.MemoryStorage.addWatchtowerUpdate(update: watchtower.IWatchtowerUpdate): number
+method storage.MemoryStorage.close(): void
+method storage.MemoryStorage.corruptRowCount(): number
+method storage.MemoryStorage.countOutboxMessages(channelId: string): number
+method storage.MemoryStorage.deleteChannel(id: string): void
+method storage.MemoryStorage.deleteChannelPolicy(channelId: string): void
+method storage.MemoryStorage.deleteForwardedHtlc(outKey: string): void
+method storage.MemoryStorage.deleteGossipChannel(scidHex: string): void
+method storage.MemoryStorage.deleteGossipNode(nodeIdHex: string): void
+method storage.MemoryStorage.deleteHtlcPaymentMapping(key: string): void
+method storage.MemoryStorage.deleteHtlcSharedSecret(key: string): void
+method storage.MemoryStorage.deleteInvoice(paymentHashHex: string): void
+method storage.MemoryStorage.deleteInvoicePathId(paymentHashHex: string): void
+method storage.MemoryStorage.deleteMetadata(key: string): void
+method storage.MemoryStorage.deleteOffer(offerIdHex: string): void
+method storage.MemoryStorage.deleteOutboxMessages(channelId: string, messageTypes?: number[]): void
+method storage.MemoryStorage.deletePayment(paymentHash: string): void
+method storage.MemoryStorage.deletePaymentSecret(paymentHashHex: string): void
+method storage.MemoryStorage.deletePeerAddress(pubkey: string): void
+method storage.MemoryStorage.deletePeerStorageBlob(peerPubkey: string): void
+method storage.MemoryStorage.deletePreimage(paymentHash: string): void
+method storage.MemoryStorage.deleteRecoveryFramesBelow(sequence: number): void
+method storage.MemoryStorage.deleteRecoveryMeta(key: string): void
+method storage.MemoryStorage.deleteWatchtowerTower(towerUri: string): void
+property storage.MemoryStorage.forwardingEventsMaxRows: number
+method storage.MemoryStorage.getForwardingSummary(options?: { since?: number; }): storage.IForwardingSummary
+method storage.MemoryStorage.getRecoveryMeta(key: string): string | null
+method storage.MemoryStorage.hasChannelKeyIndices(): boolean
+method storage.MemoryStorage.inTransaction(): boolean
+method storage.MemoryStorage.listForwardingEvents(filter?: storage.IForwardingEventFilter): storage.IForwardingEvent[]
+method storage.MemoryStorage.listRecoveryMetaKeys(): string[]
+method storage.MemoryStorage.loadActionLog(options?: { category?: string; since?: number; limit?: number; }): Array<{ category: string; action: string; timestamp: number; data: string; }>
+method storage.MemoryStorage.loadAllAnnouncedPeerAddresses(): Array<{ pubkey: string; timestamp: number; addresses: Array<{ host: string; port: number; }>; }>
+method storage.MemoryStorage.loadAllChainMonitors(): Array<{ channelId: string; state: chain.IChainMonitorState; }>
+method storage.MemoryStorage.loadAllChannelKeyIndices(): Array<{ channelId: string; channelIndex: number; }>
+method storage.MemoryStorage.loadAllChannelPolicies(): Array<{ channelId: string; policy: storage.IPersistedChannelPolicy; }>
+method storage.MemoryStorage.loadAllChannels(): Array<{ channelId: string; state: channel.IChannelState; peerPubkey: string; }>
+method storage.MemoryStorage.loadAllFforVouchers(): ffor.IFforVoucherArchive[]
+method storage.MemoryStorage.loadAllForwardedHtlcs(): Array<{ outKey: string; inChannelId: Buffer; inHtlcId: bigint; }>
+method storage.MemoryStorage.loadAllGossipChannels(): gossip.IGraphChannel[]
+method storage.MemoryStorage.loadAllGossipNodes(): gossip.IGraphNode[]
+method storage.MemoryStorage.loadAllHtlcPaymentMappings(): Array<{ key: string; paymentHashHex: string; }>
+method storage.MemoryStorage.loadAllHtlcSharedSecrets(): Array<{ key: string; secret: Buffer; }>
+method storage.MemoryStorage.loadAllInvoicePathIds(): Array<{ paymentHashHex: string; pathId: Buffer; }>
+method storage.MemoryStorage.loadAllInvoices(): Array<{ paymentHashHex: string; invoice: node.IInvoiceInfo; }>
+method storage.MemoryStorage.loadAllOffers(): Array<{ offerIdHex: string; encoded: string; pathId: Buffer | null; createdAt: number; asyncHold: boolean; }>
+method storage.MemoryStorage.loadAllPaymentSecrets(): Array<{ paymentHashHex: string; secret: Buffer; }>
+method storage.MemoryStorage.loadAllPayments(): Array<{ paymentHash: string; payment: node.IPaymentInfo; }>
+method storage.MemoryStorage.loadAllPeerAddresses(): Array<{ pubkey: string; host: string; port: number; transport?: transport.IPeerTransportOptions; }>
+method storage.MemoryStorage.loadAllPreimages(): Array<{ paymentHash: string; preimage: Buffer; }>
+method storage.MemoryStorage.loadAllScidMappings(): Array<{ scidHex: string; channelId: Buffer; }>
+method storage.MemoryStorage.loadChainMonitor(channelId: string): chain.IChainMonitorState | null
+method storage.MemoryStorage.loadChannel(id: string): { state: channel.IChannelState; peerPubkey: string; } | null
+method storage.MemoryStorage.loadChannelKeyIndex(channelId: string): number | null
+method storage.MemoryStorage.loadFforVoucher(id: string): ffor.IFforVoucherArchive | null
+method storage.MemoryStorage.loadGossipChannelsAfter(afterRowid: number, limit: number): storage.IGossipRowPage<gossip.IGraphChannel>
+method storage.MemoryStorage.loadGossipNodesAfter(afterRowid: number, limit: number): storage.IGossipRowPage<gossip.IGraphNode>
+method storage.MemoryStorage.loadMetadata(key: string): string | null
+method storage.MemoryStorage.loadMetadataByPrefix(prefix: string): Array<{ key: string; value: string; }>
+method storage.MemoryStorage.loadMissionControl(): string | null
+method storage.MemoryStorage.loadNextChannelIndex(): number
+method storage.MemoryStorage.loadOutboxMessages(channelId?: string): storage.IRecoveryOutboxStoredMessage[]
+method storage.MemoryStorage.loadPayment(paymentHash: string): node.IPaymentInfo | null
+method storage.MemoryStorage.loadPeerStorageBlob(peerPubkey: string): { blob: Buffer; receivedAt: number; } | null
+method storage.MemoryStorage.loadPendingWatchtowerUpdates(): Array<watchtower.IWatchtowerUpdate & { id: number; }>
+method storage.MemoryStorage.loadPreimage(paymentHash: string): Buffer | null
+method storage.MemoryStorage.loadRecoveryFrame(sequence: number): storage.IStoredRecoveryFrame | null
+method storage.MemoryStorage.loadRecoveryFrameHeader(sequence: number): storage.IStoredRecoveryFrameHeader | null
+method storage.MemoryStorage.loadRecoveryFrames(afterSequence?: number): storage.IStoredRecoveryFrame[]
+method storage.MemoryStorage.loadWalletData(key: string): string | null
+method storage.MemoryStorage.loadWatchtowerSessions(): Array<watchtower.IWatchtowerSession & { sessionKey: Buffer; }>
+method storage.MemoryStorage.markWatchtowerUpdateAcked(id: number, seqNum: number): void
+method storage.MemoryStorage.open(): void
+method storage.MemoryStorage.pruneOutboxMessages(channelId: string, keepNewest: number): void
+method storage.MemoryStorage.recoveryFrameStats(): { count: number; minSequence: number; maxSequence: number; } | null
+method storage.MemoryStorage.revokedHtlcSnapshotStore(): object
+method storage.MemoryStorage.saveActionLog(entry: { category: string; action: string; timestamp: number; data: string; }): void
+method storage.MemoryStorage.saveAnnouncedPeerAddresses(pubkey: string, timestamp: number, addresses: Array<{ host: string; port: number; }>): void
+method storage.MemoryStorage.saveChainMonitor(channelId: string, state: chain.IChainMonitorState): void
+method storage.MemoryStorage.saveChannel(id: string, state: channel.IChannelState, peerPubkey: string): void
+method storage.MemoryStorage.saveChannelKeyIndex(channelId: string, channelIndex: number): void
+method storage.MemoryStorage.saveChannelPolicy(channelId: string, policy: storage.IPersistedChannelPolicy): void
+method storage.MemoryStorage.saveFforVoucher(record: ffor.IFforVoucherArchive): void
+method storage.MemoryStorage.saveForwardedHtlc(outKey: string, inChannelId: Buffer, inHtlcId: bigint): void
+method storage.MemoryStorage.saveForwardingEvent(event: Omit<storage.IForwardingEvent, 'id'>): void
+method storage.MemoryStorage.saveGossipChannel(scidHex: string, channel: gossip.IGraphChannel): void
+method storage.MemoryStorage.saveGossipNode(nodeIdHex: string, node: gossip.IGraphNode): void
+method storage.MemoryStorage.saveHtlcPaymentMapping(key: string, paymentHashHex: string): void
+method storage.MemoryStorage.saveHtlcSharedSecret(key: string, secret: Buffer): void
+method storage.MemoryStorage.saveInvoice(paymentHashHex: string, invoice: node.IInvoiceInfo): void
+method storage.MemoryStorage.saveInvoicePathId(paymentHashHex: string, pathId: Buffer): void
+method storage.MemoryStorage.saveMetadata(key: string, value: string): void
+method storage.MemoryStorage.saveMissionControl(json: string): void
+method storage.MemoryStorage.saveOffer(offerIdHex: string, encoded: string, pathId: Buffer | null, createdAt: number, asyncHold?: boolean): void
+method storage.MemoryStorage.saveOutboxMessage(message: storage.IRecoveryOutboxMessage): number
+method storage.MemoryStorage.savePayment(paymentHash: string, payment: node.IPaymentInfo): void
+method storage.MemoryStorage.savePaymentSecret(paymentHashHex: string, secret: Buffer): void
+method storage.MemoryStorage.savePeerAddress(pubkey: string, host: string, port: number, transport?: transport.IPeerTransportOptions): void
+method storage.MemoryStorage.savePeerStorageBlob(peerPubkey: string, blob: Buffer, receivedAt: number): void
+method storage.MemoryStorage.savePreimage(paymentHash: string, preimage: Buffer): void
+method storage.MemoryStorage.saveRecoveryFrame(frame: storage.IStoredRecoveryFrame): void
+method storage.MemoryStorage.saveScidMapping(scidHex: string, channelId: Buffer): void
+method storage.MemoryStorage.saveWalletData(key: string, value: string): void
+method storage.MemoryStorage.saveWatchtowerSession(session: watchtower.IWatchtowerSession, sessionKey: Buffer): void
+method storage.MemoryStorage.secretsEncryptedAtRest(): boolean
+method storage.MemoryStorage.setOutboxDisposition(id: number, disposition: recovery.RecoveryOutboxDisposition): void
+method storage.MemoryStorage.setOutboxFrameSequence(ids: number[], frameSequence: number): void
+method storage.MemoryStorage.setRecoveryMeta(key: string, value: string): void
+method storage.MemoryStorage.setWatchtowerSessionProgress(sessionId: string, seqNum: number, lastApplied: number): void
+method storage.MemoryStorage.transaction<T>(fn: () => T): T
 type storage.RecoveryOutboxDisposition = 'pending_send' | 'sent_unacked' | 'superseded'
+const storage.STORAGE_CAPABILITIES: (keyof storage.IStorageCapabilities)[]
 const storage.SqliteStorage: typeof beignet/lightning/sqlite#SqliteStorage
 type storage.SqliteStorage = beignet/lightning/sqlite#SqliteStorage
+type storage.StorageCapability = keyof storage.IStorageCapabilities
 class storage.StorageEncryptedError extends Error
 constructor storage.StorageEncryptedError()
 function storage.bigintToStr(val: bigint): string
@@ -7818,15 +7982,20 @@ function storage.deserializeGraphChannel(json: string): gossip.IGraphChannel
 function storage.deserializeGraphNode(json: string): gossip.IGraphNode
 function storage.deserializeHtlcEntry(s: storage.ISerializedHtlcEntry): { key: string; entry: channel.IHtlcEntry; }
 function storage.deserializeHtlcSnapshotEntries(htlcs: storage.ISerializedHtlcSnapshot['htlcs']): channel.IHtlcSnapshotEntry[]
+function storage.deserializeInvoiceInfo(s: storage.ISerializedInvoiceInfo): node.IInvoiceInfo
 function storage.deserializePaymentInfo(s: storage.ISerializedPaymentInfo): node.IPaymentInfo
 function storage.deserializeShaChainStore(data: { entries: storage.ISerializedShaChainEntry[]; knownCount: string; }): keys.ShaChainStore
 function storage.deserializeSpliceInFlight(s: storage.ISerializedSpliceInFlight): channel.ISpliceInFlight
 function storage.deserializeV2InFlight(s: storage.ISerializedV2InFlight): channel.IV2InFlight
 function storage.encryptValue(key: Uint8Array, plaintext: string): string
 function storage.encryptWithPrefix(key: Uint8Array, plaintext: string, prefix: string): string
+function storage.hasRecoveryStorage<S extends storage.IStorageBackend>(storage: S): storage is S & storage.IRecoveryStorage
+function storage.hasStorageCapability<S extends storage.IStorageBackend, K extends storage.StorageCapability>(storage: S, capability: K): storage is S & storage.IStorageCapabilities[K]
 function storage.hexToBuf(hex: string | null | undefined): Buffer | null
 function storage.hkdfKey(secret: Uint8Array, info: string): Buffer
 function storage.isEncryptedValue(value: string): boolean
+function storage.partialStorageCapabilities(storage: storage.IStorageBackend): storage.StorageCapability[]
+function storage.runStorageConformanceSuite(factory: () => storage.IStorageBackend, options?: { name?: string; }): void
 function storage.serializeBasepoints(bp: keys.IChannelBasepoints): storage.ISerializedBasepoints
 function storage.serializeChainMonitorState(s: chain.IChainMonitorState): string
 function storage.serializeChannelConfig(c: channel.IChannelConfig): storage.ISerializedChannelConfig
@@ -7836,10 +8005,13 @@ function storage.serializeGraphChannel(ch: gossip.IGraphChannel): string
 function storage.serializeGraphNode(node: gossip.IGraphNode): string
 function storage.serializeHtlcEntry(key: string, e: channel.IHtlcEntry): storage.ISerializedHtlcEntry
 function storage.serializeHtlcSnapshotEntries(entries: channel.IHtlcSnapshotEntry[]): storage.ISerializedHtlcSnapshot['htlcs']
+function storage.serializeInvoiceInfo(invoice: node.IInvoiceInfo): storage.ISerializedInvoiceInfo
 function storage.serializePaymentInfo(p: node.IPaymentInfo): storage.ISerializedPaymentInfo
 function storage.serializeShaChainEntries(store: keys.ShaChainStore): { entries: storage.ISerializedShaChainEntry[]; knownCount: string; }
 function storage.serializeSpliceInFlight(f: channel.ISpliceInFlight): storage.ISerializedSpliceInFlight
 function storage.serializeV2InFlight(f: channel.IV2InFlight): storage.ISerializedV2InFlight
+function storage.storageCapabilityMembers(capability: storage.StorageCapability): string[]
+function storage.storageConformanceChecks(factory: () => storage.IStorageBackend): storage.IStorageConformanceCheck[]
 function storage.strToBigint(val: string): bigint
 namespace swaps
 interface swaps.ICommittedSwapHtlc

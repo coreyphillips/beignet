@@ -57,6 +57,32 @@ export function unsavedRevokedHtlcSnapshots(
 	return delta;
 }
 
+/**
+ * Give a channel loaded from `storage` the snapshots stored for it. A state
+ * that still carries snapshots of its own (a row written before they had a
+ * table of their own) keeps them, and they stay unsaved, so its next save
+ * moves them there. Rows read inside an open transaction may still roll
+ * back: pass `track` false there, which leaves the state untracked, so its
+ * next save writes its whole history.
+ */
+export function attachStoredRevokedHtlcSnapshots(
+	state: IChannelState,
+	stored: Map<string, IHtlcSnapshotEntry[]> | undefined,
+	storage: object,
+	track: boolean
+): void {
+	let history = stored;
+	if (state.revokedHtlcSnapshots?.size) {
+		history = new Map(stored);
+		for (const [key, entries] of state.revokedHtlcSnapshots) {
+			if (entries.length > 0 && !history.has(key)) history.set(key, entries);
+		}
+	}
+	state.revokedHtlcSnapshots = history?.size ? history : undefined;
+	if (track)
+		markRevokedHtlcSnapshotsSaved(state, storage, stored?.keys() ?? []);
+}
+
 /** Note that `storage` holds these commitments' snapshots. */
 export function markRevokedHtlcSnapshotsSaved(
 	state: IChannelState,

@@ -42,6 +42,7 @@ import type {
 } from '../node/payment-types';
 import type { IChainMonitorState } from '../chain/chain-monitor';
 import type { IGraphChannel, IGraphNode } from '../gossip/types';
+import type { IInvoiceInfo } from './types';
 import type { ICompactHtlcHistory } from './htlc-history';
 import {
 	encodeHtlcHistory,
@@ -2040,4 +2041,62 @@ export function deserializeGraphNode(json: string): IGraphNode {
 		...parsed,
 		channels: new Set(parsed.channels as string[])
 	} as IGraphNode;
+}
+
+/** The JSON-safe form of an IInvoiceInfo: amountMsat as a decimal string. */
+export interface ISerializedInvoiceInfo {
+	paymentHash: string;
+	bolt11: string;
+	amountMsat?: string;
+	description?: string;
+	expiry: number;
+	createdAt: number;
+	hold?: boolean;
+	bolt12?: boolean;
+	cancelledAt?: number;
+	jitFee?: { flatFeeSat: number; feePpm: number };
+	minFinalCltvExpiry?: number;
+}
+
+export function serializeInvoiceInfo(
+	invoice: IInvoiceInfo
+): ISerializedInvoiceInfo {
+	return {
+		paymentHash: invoice.paymentHash,
+		bolt11: invoice.bolt11,
+		amountMsat:
+			invoice.amountMsat !== undefined
+				? invoice.amountMsat.toString()
+				: undefined,
+		description: invoice.description,
+		expiry: invoice.expiry,
+		createdAt: invoice.createdAt,
+		hold: invoice.hold,
+		bolt12: invoice.bolt12,
+		cancelledAt: invoice.cancelledAt,
+		jitFee: invoice.jitFee,
+		minFinalCltvExpiry: invoice.minFinalCltvExpiry
+	};
+}
+
+export function deserializeInvoiceInfo(
+	s: ISerializedInvoiceInfo
+): IInvoiceInfo {
+	return {
+		paymentHash: s.paymentHash,
+		bolt11: s.bolt11,
+		amountMsat: s.amountMsat !== undefined ? BigInt(s.amountMsat) : undefined,
+		description: s.description,
+		expiry: s.expiry,
+		createdAt: s.createdAt,
+		hold: s.hold,
+		bolt12: s.bolt12,
+		cancelledAt: s.cancelledAt,
+		// A row written before #595 has none; the allowance is then absent
+		// and the final hop enforces BOLT 4 unchanged.
+		jitFee: s.jitFee,
+		// A row written before #770 has none: the final hop then enforces
+		// the node default, which is what it advertised.
+		minFinalCltvExpiry: s.minFinalCltvExpiry
+	};
 }

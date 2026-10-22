@@ -20,6 +20,7 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { IStorageBackend } from '../../src/lightning/storage/types';
+import { MemoryStorage } from '../../src/lightning/storage/memory-storage';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { PaymentStatus } from '../../src/lightning/node/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -50,227 +51,6 @@ import {
 	IBolt12Invoice
 } from '../../src/lightning/offer';
 import { writableState } from './helpers/writable-state';
-
-// ─────────────── Mock Storage ───────────────
-
-class MockStorage implements IStorageBackend {
-	channels = new Map<string, { state: any; peerPubkey: string }>();
-	payments = new Map<string, any>();
-	preimages = new Map<string, Buffer>();
-	scidMappings = new Map<string, Buffer>();
-	htlcPaymentMappings = new Map<string, string>();
-	forwardedHtlcs = new Map<string, { inChannelId: Buffer; inHtlcId: bigint }>();
-	chainMonitors = new Map<string, any>();
-	gossipChannels = new Map<string, any>();
-	gossipNodes = new Map<string, any>();
-	paymentSecrets = new Map<string, Buffer>();
-	invoices = new Map<string, any>();
-	missionControlData: string | null = null;
-
-	open(): void {}
-	close(): void {}
-
-	saveChannel(id: string, state: any, peerPubkey: string): void {
-		this.channels.set(id, { state, peerPubkey });
-	}
-	loadChannel(id: string): any {
-		return this.channels.get(id) || null;
-	}
-	loadAllChannels(): Array<any> {
-		const result: Array<any> = [];
-		for (const [channelId, val] of this.channels) {
-			result.push({ channelId, state: val.state, peerPubkey: val.peerPubkey });
-		}
-		return result;
-	}
-	deleteChannel(id: string): void {
-		this.channels.delete(id);
-	}
-
-	savePayment(paymentHash: string, payment: any): void {
-		this.payments.set(paymentHash, payment);
-	}
-	loadPayment(paymentHash: string): any {
-		return this.payments.get(paymentHash) || null;
-	}
-	loadAllPayments(): Array<any> {
-		const result: Array<any> = [];
-		for (const [paymentHash, payment] of this.payments) {
-			result.push({ paymentHash, payment });
-		}
-		return result;
-	}
-	deletePayment(paymentHash: string): void {
-		this.payments.delete(paymentHash);
-	}
-
-	savePreimage(paymentHash: string, preimage: Buffer): void {
-		this.preimages.set(paymentHash, preimage);
-	}
-	loadPreimage(paymentHash: string): Buffer | null {
-		return this.preimages.get(paymentHash) || null;
-	}
-	loadAllPreimages(): Array<any> {
-		const result: Array<any> = [];
-		for (const [paymentHash, preimage] of this.preimages) {
-			result.push({ paymentHash, preimage });
-		}
-		return result;
-	}
-	deletePreimage(paymentHash: string): void {
-		this.preimages.delete(paymentHash);
-	}
-	deleteInvoicePathId(): void {}
-
-	saveScidMapping(scidHex: string, channelId: Buffer): void {
-		this.scidMappings.set(scidHex, channelId);
-	}
-	loadAllScidMappings(): Array<any> {
-		const result: Array<any> = [];
-		for (const [scidHex, channelId] of this.scidMappings) {
-			result.push({ scidHex, channelId });
-		}
-		return result;
-	}
-
-	saveHtlcPaymentMapping(key: string, paymentHashHex: string): void {
-		this.htlcPaymentMappings.set(key, paymentHashHex);
-	}
-	loadAllHtlcPaymentMappings(): Array<any> {
-		const result: Array<any> = [];
-		for (const [key, paymentHashHex] of this.htlcPaymentMappings) {
-			result.push({ key, paymentHashHex });
-		}
-		return result;
-	}
-	deleteHtlcPaymentMapping(key: string): void {
-		this.htlcPaymentMappings.delete(key);
-	}
-
-	saveForwardedHtlc(
-		outKey: string,
-		inChannelId: Buffer,
-		inHtlcId: bigint
-	): void {
-		this.forwardedHtlcs.set(outKey, { inChannelId, inHtlcId });
-	}
-	loadAllForwardedHtlcs(): Array<any> {
-		const result: Array<any> = [];
-		for (const [outKey, val] of this.forwardedHtlcs) {
-			result.push({
-				outKey,
-				inChannelId: val.inChannelId,
-				inHtlcId: val.inHtlcId
-			});
-		}
-		return result;
-	}
-	deleteForwardedHtlc(outKey: string): void {
-		this.forwardedHtlcs.delete(outKey);
-	}
-
-	saveChainMonitor(channelId: string, state: any): void {
-		this.chainMonitors.set(channelId, state);
-	}
-	loadChainMonitor(channelId: string): any {
-		return this.chainMonitors.get(channelId) || null;
-	}
-	loadAllChainMonitors(): Array<any> {
-		const result: Array<any> = [];
-		for (const [channelId, state] of this.chainMonitors) {
-			result.push({ channelId, state });
-		}
-		return result;
-	}
-
-	saveGossipChannel(scidHex: string, channel: any): void {
-		this.gossipChannels.set(scidHex, channel);
-	}
-	loadAllGossipChannels(): any[] {
-		return [...this.gossipChannels.values()];
-	}
-	saveGossipNode(nodeIdHex: string, node: any): void {
-		this.gossipNodes.set(nodeIdHex, node);
-	}
-	loadAllGossipNodes(): any[] {
-		return [...this.gossipNodes.values()];
-	}
-
-	savePaymentSecret(paymentHashHex: string, secret: Buffer): void {
-		this.paymentSecrets.set(paymentHashHex, secret);
-	}
-	loadAllPaymentSecrets(): Array<{ paymentHashHex: string; secret: Buffer }> {
-		const result: Array<{ paymentHashHex: string; secret: Buffer }> = [];
-		for (const [paymentHashHex, secret] of this.paymentSecrets) {
-			result.push({ paymentHashHex, secret });
-		}
-		return result;
-	}
-	deletePaymentSecret(paymentHashHex: string): void {
-		this.paymentSecrets.delete(paymentHashHex);
-	}
-
-	saveInvoice(paymentHashHex: string, invoice: any): void {
-		this.invoices.set(paymentHashHex, invoice);
-	}
-	loadAllInvoices(): Array<any> {
-		const result: Array<any> = [];
-		for (const [paymentHashHex, invoice] of this.invoices) {
-			result.push({ paymentHashHex, invoice });
-		}
-		return result;
-	}
-	deleteInvoice(paymentHashHex: string): void {
-		this.invoices.delete(paymentHashHex);
-	}
-
-	saveMissionControl(json: string): void {
-		this.missionControlData = json;
-	}
-	loadMissionControl(): string | null {
-		return this.missionControlData;
-	}
-
-	savePeerAddress(): void {}
-	loadAllPeerAddresses(): Array<{
-		pubkey: string;
-		host: string;
-		port: number;
-	}> {
-		return [];
-	}
-	deletePeerAddress(): void {}
-	saveChannelKeyIndex(): void {}
-	loadChannelKeyIndex(): number | null {
-		return null;
-	}
-	loadNextChannelIndex(): number {
-		return 1;
-	}
-
-	saveMetadata(_key: string, _value: string): void {}
-	loadMetadata(_key: string): string | null {
-		return null;
-	}
-
-	// ─── HTLC Shared Secrets ───
-	private htlcSharedSecrets = new Map<string, Buffer>();
-	saveHtlcSharedSecret(key: string, secret: Buffer): void {
-		this.htlcSharedSecrets.set(key, secret);
-	}
-	deleteHtlcSharedSecret(key: string): void {
-		this.htlcSharedSecrets.delete(key);
-	}
-	loadAllHtlcSharedSecrets(): Array<{ key: string; secret: Buffer }> {
-		return Array.from(this.htlcSharedSecrets.entries()).map(
-			([key, secret]) => ({ key, secret })
-		);
-	}
-
-	transaction<T>(fn: () => T): T {
-		return fn();
-	}
-}
 
 // ─────────────── Helpers ───────────────
 
@@ -463,7 +243,7 @@ describe('Crash-Safe State Persistence', function () {
 
 	describe('htlcPaymentMap Persistence', function () {
 		it('should persist htlcPaymentMap after sendPaymentToRoute', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			const alice = createTestNodeWithId(1, storage);
 			const bob = createTestNodeWithId(2);
 			connectNodes(alice, bob);
@@ -484,7 +264,7 @@ describe('Crash-Safe State Persistence', function () {
 			// For a pending payment (no loopback), the mapping would remain.
 			// Verify storage had saveHtlcPaymentMapping called (it was saved before being deleted).
 			// The payment itself should be persisted.
-			expect(storage.payments.size).to.be.greaterThan(0);
+			expect(storage.loadAllPayments().length).to.be.greaterThan(0);
 
 			alice.destroy();
 			bob.destroy();
@@ -495,7 +275,7 @@ describe('Crash-Safe State Persistence', function () {
 			// We verify the code path by checking that storage.saveHtlcPaymentMapping
 			// is called. In the loopback case it completes immediately,
 			// but with no route found for multi-path, we test the single-part path.
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			const alice = createTestNodeWithId(1, storage);
 			const bob = createTestNodeWithId(2);
 			connectNodes(alice, bob);
@@ -511,7 +291,7 @@ describe('Crash-Safe State Persistence', function () {
 			// sendPayment tries single path first, falls back to MPP.
 			// Either way, htlcPaymentMapping is persisted.
 			alice.sendPayment(invoice.bolt11);
-			expect(storage.payments.size).to.be.greaterThan(0);
+			expect(storage.loadAllPayments().length).to.be.greaterThan(0);
 
 			alice.destroy();
 			bob.destroy();
@@ -520,7 +300,7 @@ describe('Crash-Safe State Persistence', function () {
 
 	describe('forwardedHtlcs Persistence', function () {
 		it('should persist forwardedHtlcs after handleForwardHtlc', function () {
-			const storageB = new MockStorage();
+			const storageB = new MemoryStorage();
 			const alice = createTestNodeWithId(1);
 			const bob = createTestNodeWithId(2, storageB);
 			const charlie = createTestNodeWithId(3);
@@ -644,32 +424,32 @@ describe('Crash-Safe State Persistence', function () {
 		});
 
 		it('should clean up forwardedHtlcs from storage after handleHtlcFulfilled', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			// Manually verify: when a forwarded HTLC is fulfilled, deleteForwardedHtlc is called.
 			// We simulate by directly saving and then verifying delete removes it.
 			const outKey = 'abc123:offered-0';
 			storage.saveForwardedHtlc(outKey, Buffer.alloc(32), 0n);
-			expect(storage.forwardedHtlcs.size).to.equal(1);
+			expect(storage.loadAllForwardedHtlcs().length).to.equal(1);
 
 			storage.deleteForwardedHtlc(outKey);
-			expect(storage.forwardedHtlcs.size).to.equal(0);
+			expect(storage.loadAllForwardedHtlcs().length).to.equal(0);
 		});
 
 		it('should clean up forwardedHtlcs from storage after handleHtlcFailed', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			// Same pattern as fulfill: deleteForwardedHtlc is called on failure.
 			const outKey = 'def456:offered-1';
 			storage.saveForwardedHtlc(outKey, Buffer.alloc(32), 1n);
-			expect(storage.forwardedHtlcs.size).to.equal(1);
+			expect(storage.loadAllForwardedHtlcs().length).to.equal(1);
 
 			storage.deleteForwardedHtlc(outKey);
-			expect(storage.forwardedHtlcs.size).to.equal(0);
+			expect(storage.loadAllForwardedHtlcs().length).to.equal(0);
 		});
 	});
 
 	describe('htlcPaymentMap Cleanup', function () {
 		it('should clean up htlcPaymentMap from storage after handleHtlcFulfilled', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			const alice = createTestNodeWithId(1, storage);
 			const bob = createTestNodeWithId(2);
 			connectNodes(alice, bob);
@@ -687,28 +467,28 @@ describe('Crash-Safe State Persistence', function () {
 			alice.sendPayment(invoice.bolt11);
 
 			// After successful payment, htlcPaymentMappings should be cleaned up
-			expect(storage.htlcPaymentMappings.size).to.equal(0);
+			expect(storage.loadAllHtlcPaymentMappings().length).to.equal(0);
 
 			alice.destroy();
 			bob.destroy();
 		});
 
 		it('should clean up htlcPaymentMap from storage after handleHtlcFailed', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			// When a payment fails permanently, deleteHtlcPaymentMapping is called.
 			// Verify the storage delete works.
 			const key = 'channelHex:offered-0';
 			storage.saveHtlcPaymentMapping(key, 'paymenthashHex');
-			expect(storage.htlcPaymentMappings.size).to.equal(1);
+			expect(storage.loadAllHtlcPaymentMappings().length).to.equal(1);
 
 			storage.deleteHtlcPaymentMapping(key);
-			expect(storage.htlcPaymentMappings.size).to.equal(0);
+			expect(storage.loadAllHtlcPaymentMappings().length).to.equal(0);
 		});
 	});
 
 	describe('paymentSecrets Persistence', function () {
 		it('should persist paymentSecrets in createInvoice', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			const node = createTestNode(storage);
 
 			node.createInvoice({
@@ -716,7 +496,7 @@ describe('Crash-Safe State Persistence', function () {
 				description: 'payment-secret-persist'
 			});
 
-			expect(storage.paymentSecrets.size).to.equal(1);
+			expect(storage.loadAllPaymentSecrets().length).to.equal(1);
 			const entry = storage.loadAllPaymentSecrets()[0];
 			expect(entry.secret).to.be.instanceOf(Buffer);
 			expect(entry.secret.length).to.equal(32);
@@ -725,7 +505,7 @@ describe('Crash-Safe State Persistence', function () {
 		});
 
 		it('should restore paymentSecrets from storage on node init', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			// Pre-populate storage with a payment secret
 			const paymentHashHex = crypto.randomBytes(32).toString('hex');
 			const secret = crypto.randomBytes(32);
@@ -741,13 +521,13 @@ describe('Crash-Safe State Persistence', function () {
 			// The payment secret should be restored in-memory.
 			// We verify by checking that the storage still has it (restore reads from storage,
 			// doesn't delete from it).
-			expect(storage.paymentSecrets.size).to.equal(1);
+			expect(storage.loadAllPaymentSecrets().length).to.equal(1);
 
 			node.destroy();
 		});
 
 		it('should delete paymentSecret from storage after fulfillPayment', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			const alice = createTestNodeWithId(1);
 			const bob = createTestNodeWithId(2, storage);
 			connectNodes(alice, bob);
@@ -764,13 +544,21 @@ describe('Crash-Safe State Persistence', function () {
 			const hashHex = decoded.paymentHash.toString('hex');
 
 			// Before payment, Bob's storage should have the payment secret
-			expect(storage.paymentSecrets.has(hashHex)).to.be.true;
+			expect(
+				storage
+					.loadAllPaymentSecrets()
+					.some((row) => row.paymentHashHex === hashHex)
+			).to.be.true;
 
 			// Alice pays Bob
 			alice.sendPayment(invoice.bolt11);
 
 			// After fulfillment, the payment secret should be cleaned up
-			expect(storage.paymentSecrets.has(hashHex)).to.be.false;
+			expect(
+				storage
+					.loadAllPaymentSecrets()
+					.some((row) => row.paymentHashHex === hashHex)
+			).to.be.false;
 
 			alice.destroy();
 			bob.destroy();
@@ -779,7 +567,7 @@ describe('Crash-Safe State Persistence', function () {
 
 	describe('Channel State Persistence', function () {
 		it('should persist channel state on htlc:forwarded event', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			const alice = createTestNodeWithId(1);
 			const bob = createTestNodeWithId(2, storage);
 			connectNodes(alice, bob);
@@ -797,14 +585,14 @@ describe('Crash-Safe State Persistence', function () {
 
 			// Bob's storage should have the channel persisted
 			const channelIdHex = channelId.toString('hex');
-			expect(storage.channels.has(channelIdHex)).to.be.true;
+			expect(storage.loadChannel(channelIdHex)).to.not.equal(null);
 
 			alice.destroy();
 			bob.destroy();
 		});
 
 		it('should persist channel state on commitment_signed/revoke_and_ack outbound messages', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			const alice = createTestNodeWithId(1, storage);
 			const bob = createTestNodeWithId(2);
 			connectNodes(alice, bob);
@@ -822,7 +610,7 @@ describe('Crash-Safe State Persistence', function () {
 			// After payment flow, Alice's storage should have persisted the channel
 			// (commitment_signed and revoke_and_ack messages trigger persistChannel)
 			const channelIdHex = channelId.toString('hex');
-			expect(storage.channels.has(channelIdHex)).to.be.true;
+			expect(storage.loadChannel(channelIdHex)).to.not.equal(null);
 
 			alice.destroy();
 			bob.destroy();
@@ -831,7 +619,7 @@ describe('Crash-Safe State Persistence', function () {
 
 	describe('Invoice Persistence', function () {
 		it('should persist invoices in createInvoice', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			const node = createTestNode(storage);
 
 			const invoiceStr = node.createInvoice({
@@ -840,7 +628,7 @@ describe('Crash-Safe State Persistence', function () {
 				expiry: 3600
 			});
 
-			expect(storage.invoices.size).to.equal(1);
+			expect(storage.loadAllInvoices().length).to.equal(1);
 			const entry = storage.loadAllInvoices()[0];
 			expect(entry.invoice.bolt11).to.equal(invoiceStr.bolt11);
 			expect(entry.invoice.description).to.equal('persisted invoice');
@@ -850,7 +638,7 @@ describe('Crash-Safe State Persistence', function () {
 		});
 
 		it('should restore invoices from storage on node init', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			const node1 = createTestNode(storage);
 
 			node1.createInvoice({
@@ -863,7 +651,7 @@ describe('Crash-Safe State Persistence', function () {
 				description: 'second invoice'
 			});
 
-			expect(storage.invoices.size).to.equal(2);
+			expect(storage.loadAllInvoices().length).to.equal(2);
 
 			node1.destroy();
 
@@ -881,7 +669,7 @@ describe('Crash-Safe State Persistence', function () {
 		});
 
 		it('should list all created invoices via listInvoices', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			const node = createTestNode(storage);
 
 			node.createInvoice({ amountMsat: 100_000n, description: 'inv1' });
@@ -902,7 +690,7 @@ describe('Crash-Safe State Persistence', function () {
 
 	describe('Mission Control Persistence', function () {
 		it('should persist mission control data on destroy and restore on init', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			const alice = createTestNodeWithId(1, storage);
 			const bob = createTestNodeWithId(2);
 			connectNodes(alice, bob);
@@ -921,8 +709,8 @@ describe('Crash-Safe State Persistence', function () {
 			alice.destroy();
 
 			// Check that mission control data was persisted
-			expect(storage.missionControlData).to.not.be.null;
-			const mcData = JSON.parse(storage.missionControlData!);
+			expect(storage.loadMissionControl()).to.not.be.null;
+			const mcData = JSON.parse(storage.loadMissionControl()!);
 			expect(mcData).to.be.an('array');
 			expect(mcData.length).to.be.greaterThan(0);
 
@@ -940,7 +728,7 @@ describe('Crash-Safe State Persistence', function () {
 
 	describe('Full Crash Simulation', function () {
 		it('should survive a simulated crash: state persists across destroy/recreate', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 
 			// Phase 1: Create a node and add various state
 			const node1 = createTestNode(storage);
@@ -957,9 +745,9 @@ describe('Crash-Safe State Persistence', function () {
 
 			// Verify state exists before crash
 			expect(node1.listInvoices().length).to.equal(2);
-			expect(storage.paymentSecrets.size).to.equal(2);
-			expect(storage.preimages.size).to.equal(2);
-			expect(storage.invoices.size).to.equal(2);
+			expect(storage.loadAllPaymentSecrets().length).to.equal(2);
+			expect(storage.loadAllPreimages().length).to.equal(2);
+			expect(storage.loadAllInvoices().length).to.equal(2);
 
 			// Phase 2: Simulate crash
 			node1.destroy();
@@ -1018,7 +806,7 @@ describe('Crash-Safe State Persistence', function () {
 
 	describe('Atomic Cross-Table Persistence', () => {
 		it('payment settlement persists atomically via transaction()', () => {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			let transactionCallCount = 0;
 			const origTransaction = storage.transaction.bind(storage);
 			storage.transaction = <T>(fn: () => T): T => {
@@ -1056,11 +844,12 @@ describe('Crash-Safe State Persistence', function () {
 		// handling would leave the HTLC committed with nothing left to act on it.
 		// restoreFromStorage re-dispatches those, and only those.
 		function strandOneHtlc(
-			storage: MockStorage,
+			storage: MemoryStorage,
 			channelId: Buffer,
 			forwardEmitted: boolean
 		): void {
-			const stored = storage.channels.get(channelId.toString('hex'));
+			const id = channelId.toString('hex');
+			const stored = storage.loadChannel(id);
 			expect(stored, 'expected the channel to have been persisted').to.exist;
 			stored!.state.htlcs.set('received-0', {
 				id: 0n,
@@ -1072,6 +861,7 @@ describe('Crash-Safe State Persistence', function () {
 				state: HtlcState.COMMITTED,
 				...(forwardEmitted ? { forwardEmitted: true } : {})
 			});
+			storage.saveChannel(id, stored!.state, stored!.peerPubkey);
 		}
 
 		// A restored channel comes back in AWAITING_REESTABLISH and can send
@@ -1099,7 +889,7 @@ describe('Crash-Safe State Persistence', function () {
 		}
 
 		it('acts on a committed received HTLC that was dispatched but never handled', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			const alice = createTestNodeWithId(1);
 			const bob = createTestNodeWithId(2, storage);
 			connectNodes(alice, bob);
@@ -1125,7 +915,7 @@ describe('Crash-Safe State Persistence', function () {
 		});
 
 		it('leaves alone an HTLC whose forward is already in flight', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			const alice = createTestNodeWithId(1);
 			const bob = createTestNodeWithId(2, storage);
 			connectNodes(alice, bob);
@@ -1137,9 +927,10 @@ describe('Crash-Safe State Persistence', function () {
 			// A restored forward mapping means the outgoing leg went out before the
 			// crash. Re-dispatching would offer a second outgoing HTLC for one
 			// inbound payment, which is the duplication the marker exists to stop.
-			storage.forwardedHtlcs.set(
+			storage.saveForwardedHtlc(
 				`${crypto.randomBytes(32).toString('hex')}:offered-0`,
-				{ inChannelId: channelId, inHtlcId: 0n }
+				channelId,
+				0n
 			);
 
 			const bob2 = createTestNodeWithId(2, storage);
@@ -1153,7 +944,7 @@ describe('Crash-Safe State Persistence', function () {
 		});
 
 		it('leaves alone an HTLC that was never dispatched', function () {
-			const storage = new MockStorage();
+			const storage = new MemoryStorage();
 			const alice = createTestNodeWithId(1);
 			const bob = createTestNodeWithId(2, storage);
 			connectNodes(alice, bob);
