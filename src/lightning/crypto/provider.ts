@@ -110,7 +110,8 @@ const SELF_TESTS: Record<CryptoPrimitive, (p: ICryptoProvider) => boolean> = {
 			),
 			hex('5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843')
 		),
-	// RFC 5869 test case 1.
+	// RFC 5869 test cases 1 and 3. Every storage, backup and recovery key the
+	// library derives uses an empty salt, which only test case 3 covers.
 	hkdfSha256: (p) =>
 		equal(
 			p.hkdfSha256(
@@ -122,6 +123,18 @@ const SELF_TESTS: Record<CryptoPrimitive, (p: ICryptoProvider) => boolean> = {
 			hex(
 				'3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf' +
 					'34007208d5b887185865'
+			)
+		) &&
+		equal(
+			p.hkdfSha256(
+				Buffer.alloc(22, 0x0b),
+				Buffer.alloc(0),
+				Buffer.alloc(0),
+				42
+			),
+			hex(
+				'8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d' +
+					'9d201395faa4b61a96c8'
 			)
 		),
 	// McGrew and Viega, "The Galois/Counter Mode of Operation", test case 16.
@@ -342,7 +355,9 @@ function providerFor(primitive: CryptoPrimitive): ICryptoProvider {
 /**
  * Replace the platform's crypto for the whole process, or pass null to go
  * back to Node's. A provider that fails any vector is refused and the
- * current one stays.
+ * current one stays. The vectors catch a missing or broken primitive, not a
+ * weak one: no test can tell predictable randomness from secure randomness,
+ * so randomBytes must come from the platform's secure generator.
  * @throws when the provider fails its self-test
  */
 export function setCryptoProvider(provider: ICryptoProvider | null): void {
@@ -361,10 +376,20 @@ export function setCryptoProvider(provider: ICryptoProvider | null): void {
 	}
 }
 
+/**
+ * A provider's result, copied into a Buffer the caller owns. A provider that
+ * hands back a view into memory it reuses, as WASM-backed libraries can,
+ * would otherwise let a later call overwrite a key or preimage that an
+ * earlier call returned. The copy is not gated on an installed provider:
+ * on React Native the default wraps whatever 'crypto' shim the app ships,
+ * and only real Node is known to return fresh bytes. The copy is off the
+ * shared Buffer pool, as Node's own digests are: a key the library keeps
+ * must not pin a pool slab that also holds bytes it meant to drop.
+ */
 function toBuffer(bytes: Uint8Array): Buffer {
-	return Buffer.isBuffer(bytes)
-		? bytes
-		: Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const copy = Buffer.allocUnsafeSlow(bytes.length);
+	copy.set(bytes);
+	return copy;
 }
 
 export function sha256(data: Uint8Array): Buffer {
