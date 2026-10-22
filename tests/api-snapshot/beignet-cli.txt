@@ -1,0 +1,1409 @@
+# The exported API of beignet/cli. Regenerate with npm run api:snapshot; do not edit.
+unexported interface ./webhooks#WebhookRegistration
+property ./webhooks#WebhookRegistration.createdAt: number
+property ./webhooks#WebhookRegistration.events: string[]
+property ./webhooks#WebhookRegistration.id: string
+property ./webhooks#WebhookRegistration.secret?: string
+property ./webhooks#WebhookRegistration.url: string
+interface ActionLogEntry
+property ActionLogEntry.action: string
+property ActionLogEntry.category: string
+property ActionLogEntry.data: Record<string, unknown>
+property ActionLogEntry.timestamp: number
+interface AdvisorRecommendations extends LiquiditySnapshot
+property AdvisorRecommendations.rebalancePlan: RebalancePlanInfo[]
+class ApiKeyAuthenticator
+constructor ApiKeyAuthenticator(apiToken?: string, apiKeys?: ApiKeyDefinition[])
+method ApiKeyAuthenticator.attachOverrideStore(store: AuthOverrideStore): void
+method ApiKeyAuthenticator.authenticate(header: string | undefined): AuthResult
+get ApiKeyAuthenticator.enabled(): boolean
+method ApiKeyAuthenticator.listKeys(): Array<{ name: string; scopes: ApiScope[]; revoked: boolean; expired: boolean; expiresAt?: string; rotatedAt?: string; }>
+method ApiKeyAuthenticator.revoke(name: string): boolean
+method ApiKeyAuthenticator.rotate(name: string): { name: string; key: string; rotatedAt: string; } | null
+interface ApiKeyDefinition
+property ApiKeyDefinition.expiresAt?: string
+property ApiKeyDefinition.key: string
+property ApiKeyDefinition.name: string
+property ApiKeyDefinition.scopes: ApiScope[]
+interface ApiResponse<T>
+property ApiResponse.error?: { code: string; message: string; paymentHash?: PaymentHashHex; }
+property ApiResponse.ok: boolean
+property ApiResponse.result?: T
+type ApiScope = 'readonly' | 'invoice' | 'admin'
+unexported interface AuthFailure
+property AuthFailure.ok: false
+unexported interface AuthOverrideStore
+method AuthOverrideStore.load(): Record<string, StoredKeyOverride> | null
+method AuthOverrideStore.save(overrides: Record<string, StoredKeyOverride>): void
+type AuthResult = AuthSuccess | AuthFailure
+interface AuthSuccess
+property AuthSuccess.keyName: string | null
+property AuthSuccess.ok: true
+property AuthSuccess.scopes: ReadonlySet<ApiScope>
+interface BalanceInfo
+property BalanceInfo.lightning: number
+property BalanceInfo.onchain: number
+property BalanceInfo.splicingSats?: number
+property BalanceInfo.total: number
+property BalanceInfo.unsettledSats?: number
+interface BeignetConfig extends IrohDaemonConfig, ElectrumTlsConfig
+property BeignetConfig.alias?: string
+property BeignetConfig.announceAddresses?: string[]
+property BeignetConfig.apiKeys?: Array<{ name: string; key: string; scopes: Array<'readonly' | 'invoice' | 'admin'>; expiresAt?: string; }>
+property BeignetConfig.apiToken?: string
+property BeignetConfig.autoBootstrap?: boolean
+property BeignetConfig.autoReconnect?: boolean
+property BeignetConfig.backupIntervalMs?: number
+property BeignetConfig.backupPath?: string
+property BeignetConfig.connectTimeoutMs?: number
+property BeignetConfig.daemonHost?: string
+property BeignetConfig.daemonPort?: number
+property BeignetConfig.dailySpendLimitSats?: number
+property BeignetConfig.dataDir?: string
+property BeignetConfig.dfMinAmountSat?: number
+property BeignetConfig.dfRelay?: boolean
+property BeignetConfig.eagerGossipVerify?: boolean
+property BeignetConfig.electrumHost?: string
+property BeignetConfig.electrumPort?: number
+property BeignetConfig.electrumServers?: Array<{ host: string; port: number; tls?: boolean; }>
+property BeignetConfig.electrumTls?: boolean
+property BeignetConfig.feeEstimationSource?: 'electrum' | 'http' | 'auto'
+property BeignetConfig.fforConcurrent?: boolean
+property BeignetConfig.fforIssuer?: boolean
+property BeignetConfig.fforReceiveFunding?: FforReceiveFunding
+property BeignetConfig.fforSettle?: { enabled: boolean; maxBudgetMsat?: string | number; maxEpochBlocks?: number; feeBaseMsat?: number; feePpm?: number; }
+property BeignetConfig.fforSettleConcurrent?: boolean
+property BeignetConfig.fforWitness?: { enabled: boolean; maxMailboxes?: number; maxBytes?: number; }
+property BeignetConfig.forwardingEnabled?: boolean
+property BeignetConfig.guardianMaxBytesPerSet?: number
+property BeignetConfig.guardianMaxCiphertextBytes?: number
+property BeignetConfig.guardianMaxSets?: number
+property BeignetConfig.guardianServe?: boolean
+property BeignetConfig.guardianToken?: string
+property BeignetConfig.htlcEvents?: boolean
+property BeignetConfig.insecure?: boolean
+property BeignetConfig.jitReceive?: { enabled?: boolean; flatFeeSat?: number; feePpm?: number; maxFlatFeeSat?: number; maxFeePpm?: number; maxClientFundingSats?: number; maxConcurrentFundings?: number; maxTotalFundingSats?: number; }
+property BeignetConfig.largeChannels?: boolean
+property BeignetConfig.leaseRates?: beignet/lightning#gossip.ILeaseRates
+property BeignetConfig.listenPort?: number
+property BeignetConfig.logLevel?: beignet#TLogLevel
+property BeignetConfig.maxInboundPeers?: number
+property BeignetConfig.metricsPublic?: boolean
+property BeignetConfig.mnemonic?: string
+property BeignetConfig.network?: 'mainnet' | 'testnet' | 'regtest' | 'signet'
+property BeignetConfig.preferAnchors?: boolean
+property BeignetConfig.rateLimit?: RateLimitOptions
+property BeignetConfig.recoveryAutoApply?: boolean
+property BeignetConfig.recoveryAutoApplyMaxWaitMs?: number
+property BeignetConfig.recoveryAutoApplySettleMs?: number
+property BeignetConfig.recoveryGuardians?: Array<string | beignet/lightning#recovery.IGuardianConfigEntry>
+property BeignetConfig.recoveryLeaseCheckIntervalMs?: number
+property BeignetConfig.recoveryMode?: string
+property BeignetConfig.recoveryProfile?: string
+property BeignetConfig.recoveryReestablishHoldMs?: number
+property BeignetConfig.routingCltvDelta?: number
+property BeignetConfig.routingFeeBaseMsat?: number
+property BeignetConfig.routingFeePpm?: number
+property BeignetConfig.swaps?: { enabled?: boolean; flatFeeSat?: number; feePpm?: number; minSat?: number; maxSat?: number; maxExposureSat?: number; maxConcurrent?: number; refundDeltaBlocks?: number; fundingConfs?: number; resolutionConfs?: number; submarine?: boolean; claimSafetyBlocks?: number; paymentMaxFeePpm?: number; claimBumpIntervalBlocks?: number; submarineRefundDeltaBlocks?: number; }
+property BeignetConfig.tlsCert?: string
+property BeignetConfig.tlsKey?: string
+property BeignetConfig.torProxy?: string
+property BeignetConfig.torProxyOnionOnly?: boolean
+property BeignetConfig.waiveClientReserve?: boolean
+property BeignetConfig.watchtowers?: string[]
+property BeignetConfig.websocketPort?: number
+class BeignetError extends CodedError<BeignetErrorCodeValue>
+constructor BeignetError(code: BeignetErrorCodeValue, message: string, failureCode?: number)
+property BeignetError.failureCode?: number
+property BeignetError.paymentHash?: string
+method BeignetError.toJSON(): { code: string; message: string; failureCode?: number; paymentHash?: string; }
+enum BeignetErrorCode
+member BeignetErrorCode.ADDRESS_FAILED = "ADDRESS_FAILED"
+member BeignetErrorCode.AMOUNT_MISMATCH = "AMOUNT_MISMATCH"
+member BeignetErrorCode.AMOUNT_REQUIRED = "AMOUNT_REQUIRED"
+member BeignetErrorCode.AMOUNT_TOO_SMALL = "AMOUNT_TOO_SMALL"
+member BeignetErrorCode.BODY_TOO_LARGE = "BODY_TOO_LARGE"
+member BeignetErrorCode.CAPSULE_RESTORE_FAILED = "CAPSULE_RESTORE_FAILED"
+member BeignetErrorCode.CAPSULE_RESTORE_GUARDIAN_BACKED = "CAPSULE_RESTORE_GUARDIAN_BACKED"
+member BeignetErrorCode.CAPSULE_RESTORE_INSTALL_FAILED = "CAPSULE_RESTORE_INSTALL_FAILED"
+member BeignetErrorCode.CAPSULE_RESTORE_NO_CANDIDATES = "CAPSULE_RESTORE_NO_CANDIDATES"
+member BeignetErrorCode.CAPSULE_RESTORE_QUORUM_NAMESPACE = "CAPSULE_RESTORE_QUORUM_NAMESPACE"
+member BeignetErrorCode.CAPSULE_RESTORE_TARGET_DIRTY = "CAPSULE_RESTORE_TARGET_DIRTY"
+member BeignetErrorCode.CAPSULE_RESTORE_UNSUPPORTED = "CAPSULE_RESTORE_UNSUPPORTED"
+member BeignetErrorCode.CHAIN_NOT_SYNCED = "CHAIN_NOT_SYNCED"
+member BeignetErrorCode.CHANNEL_NOT_FOUND = "CHANNEL_NOT_FOUND"
+member BeignetErrorCode.CHANNEL_NOT_READY = "CHANNEL_NOT_READY"
+member BeignetErrorCode.CLOSE_FAILED = "CLOSE_FAILED"
+member BeignetErrorCode.CLOSE_UNAVAILABLE = "CLOSE_UNAVAILABLE"
+member BeignetErrorCode.CLTV_EXCEEDS_MAX = "CLTV_EXCEEDS_MAX"
+member BeignetErrorCode.CONNECT_FAILED = "CONNECT_FAILED"
+member BeignetErrorCode.CONNECT_TIMEOUT = "CONNECT_TIMEOUT"
+member BeignetErrorCode.CROSS_SITE_REQUEST_REFUSED = "CROSS_SITE_REQUEST_REFUSED"
+member BeignetErrorCode.DESCRIPTOR_EXPORT_FAILED = "DESCRIPTOR_EXPORT_FAILED"
+member BeignetErrorCode.DUPLICATE_PAYMENT = "DUPLICATE_PAYMENT"
+member BeignetErrorCode.DURABILITY_FAILED = "DURABILITY_FAILED"
+member BeignetErrorCode.EXCHANGE_TIMEOUT = "EXCHANGE_TIMEOUT"
+member BeignetErrorCode.EXPIRED = "EXPIRED"
+member BeignetErrorCode.EXPIRY_TOO_DISTANT = "EXPIRY_TOO_DISTANT"
+member BeignetErrorCode.FEE_CHANGED = "FEE_CHANGED"
+member BeignetErrorCode.FEE_ESTIMATE_FAILED = "FEE_ESTIMATE_FAILED"
+member BeignetErrorCode.FEE_ESTIMATE_NOT_READY = "FEE_ESTIMATE_NOT_READY"
+member BeignetErrorCode.FEE_EXCEEDS_MAX = "FEE_EXCEEDS_MAX"
+member BeignetErrorCode.FFOR_REFUSED = "FFOR_REFUSED"
+member BeignetErrorCode.FORBIDDEN = "FORBIDDEN"
+member BeignetErrorCode.FORCE_CLOSE_FAILED = "FORCE_CLOSE_FAILED"
+member BeignetErrorCode.FORCE_CLOSE_REVOKED = "FORCE_CLOSE_REVOKED"
+member BeignetErrorCode.FUNDING_PROVIDER_REQUIRED = "FUNDING_PROVIDER_REQUIRED"
+member BeignetErrorCode.GUARDIAN_UNREACHABLE = "GUARDIAN_UNREACHABLE"
+member BeignetErrorCode.HOLD_RESOLUTION_PENDING = "HOLD_RESOLUTION_PENDING"
+member BeignetErrorCode.HOST_NOT_ALLOWED = "HOST_NOT_ALLOWED"
+member BeignetErrorCode.IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
+member BeignetErrorCode.INSTANCE_ALREADY_RUNNING = "INSTANCE_ALREADY_RUNNING"
+member BeignetErrorCode.INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
+member BeignetErrorCode.INTERNAL_ERROR = "INTERNAL_ERROR"
+member BeignetErrorCode.INVALID_INVOICE = "INVALID_INVOICE"
+member BeignetErrorCode.INVALID_JSON = "INVALID_JSON"
+member BeignetErrorCode.INVALID_OFFER = "INVALID_OFFER"
+member BeignetErrorCode.INVALID_PARAMS = "INVALID_PARAMS"
+member BeignetErrorCode.INVALID_REVIEW = "INVALID_REVIEW"
+member BeignetErrorCode.INVALID_SIGNATURE = "INVALID_SIGNATURE"
+member BeignetErrorCode.INVOICE_EXPIRED = "INVOICE_EXPIRED"
+member BeignetErrorCode.JIT_REFUSED = "JIT_REFUSED"
+member BeignetErrorCode.JIT_TIMEOUT = "JIT_TIMEOUT"
+member BeignetErrorCode.L402_AMOUNTLESS_INVOICE = "L402_AMOUNTLESS_INVOICE"
+member BeignetErrorCode.L402_CROSS_ORIGIN_CHALLENGE = "L402_CROSS_ORIGIN_CHALLENGE"
+member BeignetErrorCode.L402_FETCH_FAILED = "L402_FETCH_FAILED"
+member BeignetErrorCode.L402_HASH_COMMITMENT_MISMATCH = "L402_HASH_COMMITMENT_MISMATCH"
+member BeignetErrorCode.L402_INVALID_INVOICE = "L402_INVALID_INVOICE"
+member BeignetErrorCode.L402_NO_PAYER = "L402_NO_PAYER"
+member BeignetErrorCode.L402_PREIMAGE_MISMATCH = "L402_PREIMAGE_MISMATCH"
+member BeignetErrorCode.L402_PRICE_ABOVE_CAP = "L402_PRICE_ABOVE_CAP"
+member BeignetErrorCode.L402_UNUSABLE_MACAROON = "L402_UNUSABLE_MACAROON"
+member BeignetErrorCode.L402_UNVERIFIABLE_MACAROON = "L402_UNVERIFIABLE_MACAROON"
+member BeignetErrorCode.MALFORMED = "MALFORMED"
+member BeignetErrorCode.MNEMONIC_REQUIRES_AUTH = "MNEMONIC_REQUIRES_AUTH"
+member BeignetErrorCode.NEW_CHANNELS_REFUSED = "NEW_CHANNELS_REFUSED"
+member BeignetErrorCode.NODE_DESTROYED = "NODE_DESTROYED"
+member BeignetErrorCode.NODE_RESTART_REQUIRED = "NODE_RESTART_REQUIRED"
+member BeignetErrorCode.NODE_RESTORE_PENDING = "NODE_RESTORE_PENDING"
+member BeignetErrorCode.NOTHING_TO_CONSOLIDATE = "NOTHING_TO_CONSOLIDATE"
+member BeignetErrorCode.NOT_BOOSTABLE = "NOT_BOOSTABLE"
+member BeignetErrorCode.NOT_FOUND = "NOT_FOUND"
+member BeignetErrorCode.NOT_PERSISTED = "NOT_PERSISTED"
+member BeignetErrorCode.NO_CHANNEL_TO_HOP = "NO_CHANNEL_TO_HOP"
+member BeignetErrorCode.NO_DATA = "NO_DATA"
+member BeignetErrorCode.NO_ROUTE = "NO_ROUTE"
+member BeignetErrorCode.NO_SUITABLE_UTXO = "NO_SUITABLE_UTXO"
+member BeignetErrorCode.OFFER_DECLINED = "OFFER_DECLINED"
+member BeignetErrorCode.OPEN_FAILED = "OPEN_FAILED"
+member BeignetErrorCode.PAYMENT_FAILED = "PAYMENT_FAILED"
+member BeignetErrorCode.PAYMENT_TIMEOUT = "PAYMENT_TIMEOUT"
+member BeignetErrorCode.PAY_ALL_BUDGET_MISMATCH = "PAY_ALL_BUDGET_MISMATCH"
+member BeignetErrorCode.PAY_ALL_REMAINDER = "PAY_ALL_REMAINDER"
+member BeignetErrorCode.PAY_ALL_REVIEW_EXPIRED = "PAY_ALL_REVIEW_EXPIRED"
+member BeignetErrorCode.PEER_NOT_CONNECTED = "PEER_NOT_CONNECTED"
+member BeignetErrorCode.PRIVATE_NETWORK_REFUSED = "PRIVATE_NETWORK_REFUSED"
+member BeignetErrorCode.PSBT_BUILD_FAILED = "PSBT_BUILD_FAILED"
+member BeignetErrorCode.PSBT_COMBINE_FAILED = "PSBT_COMBINE_FAILED"
+member BeignetErrorCode.PSBT_IMPORT_FAILED = "PSBT_IMPORT_FAILED"
+member BeignetErrorCode.QUOTE_EXPIRED = "QUOTE_EXPIRED"
+member BeignetErrorCode.RATE_LIMITED = "RATE_LIMITED"
+member BeignetErrorCode.REBROADCAST_FAILED = "REBROADCAST_FAILED"
+member BeignetErrorCode.RECEIVE_BUSY = "RECEIVE_BUSY"
+member BeignetErrorCode.RECEIVE_PENDING = "RECEIVE_PENDING"
+member BeignetErrorCode.RECEIVE_UNAVAILABLE = "RECEIVE_UNAVAILABLE"
+member BeignetErrorCode.RECOVERY_UNAVAILABLE = "RECOVERY_UNAVAILABLE"
+member BeignetErrorCode.REFRESH_FAILED = "REFRESH_FAILED"
+member BeignetErrorCode.REQUEST_ID_CONFLICT = "REQUEST_ID_CONFLICT"
+member BeignetErrorCode.RESPONSE_TOO_LARGE = "RESPONSE_TOO_LARGE"
+member BeignetErrorCode.RESTORE_CAS_EXHAUSTED = "RESTORE_CAS_EXHAUSTED"
+member BeignetErrorCode.RESTORE_CONFLICT = "RESTORE_CONFLICT"
+member BeignetErrorCode.RESTORE_HEAD_UNVERIFIABLE = "RESTORE_HEAD_UNVERIFIABLE"
+member BeignetErrorCode.RESTORE_IN_PROGRESS = "RESTORE_IN_PROGRESS"
+member BeignetErrorCode.RESTORE_NOT_PENDING = "RESTORE_NOT_PENDING"
+member BeignetErrorCode.RESTORE_NO_QUORUM = "RESTORE_NO_QUORUM"
+member BeignetErrorCode.RESTORE_ROTATED = "RESTORE_ROTATED"
+member BeignetErrorCode.RESTORE_TARGET_UNSUPPORTED = "RESTORE_TARGET_UNSUPPORTED"
+member BeignetErrorCode.RESTORE_UNKNOWN_NAMESPACE = "RESTORE_UNKNOWN_NAMESPACE"
+member BeignetErrorCode.ROTATION_IN_PROGRESS = "ROTATION_IN_PROGRESS"
+member BeignetErrorCode.ROTATION_NOT_CATCHING_UP = "ROTATION_NOT_CATCHING_UP"
+member BeignetErrorCode.ROTATION_NO_QUORUM = "ROTATION_NO_QUORUM"
+member BeignetErrorCode.ROTATION_UNAVAILABLE = "ROTATION_UNAVAILABLE"
+member BeignetErrorCode.SEND_FAILED = "SEND_FAILED"
+member BeignetErrorCode.SERVICE_DRAINING = "SERVICE_DRAINING"
+member BeignetErrorCode.SIGN_REQUEST_REFUSED = "SIGN_REQUEST_REFUSED"
+member BeignetErrorCode.SPENDING_LIMIT_EXCEEDED = "SPENDING_LIMIT_EXCEEDED"
+member BeignetErrorCode.SPLICE_BUSY = "SPLICE_BUSY"
+member BeignetErrorCode.SPLICE_REFUSED = "SPLICE_REFUSED"
+member BeignetErrorCode.SPLICING_NOT_NEGOTIATED = "SPLICING_NOT_NEGOTIATED"
+member BeignetErrorCode.SWAP_NOT_CANCELLABLE = "SWAP_NOT_CANCELLABLE"
+member BeignetErrorCode.SWEEP_ALREADY_SUBMITTED = "SWEEP_ALREADY_SUBMITTED"
+member BeignetErrorCode.SWEEP_INPUT_RESERVED = "SWEEP_INPUT_RESERVED"
+member BeignetErrorCode.SWEEP_INPUT_UNAVAILABLE = "SWEEP_INPUT_UNAVAILABLE"
+member BeignetErrorCode.SWEEP_JOURNAL_CONFLICT = "SWEEP_JOURNAL_CONFLICT"
+member BeignetErrorCode.SWEEP_JOURNAL_FULL = "SWEEP_JOURNAL_FULL"
+member BeignetErrorCode.SWEEP_JOURNAL_INVALID = "SWEEP_JOURNAL_INVALID"
+member BeignetErrorCode.SWEEP_NOT_PERSISTED = "SWEEP_NOT_PERSISTED"
+member BeignetErrorCode.SWEEP_NOT_PREPARED = "SWEEP_NOT_PREPARED"
+member BeignetErrorCode.SWEEP_PENDING = "SWEEP_PENDING"
+member BeignetErrorCode.SWEEP_QUOTE_EXPIRED = "SWEEP_QUOTE_EXPIRED"
+member BeignetErrorCode.SWEEP_UNAVAILABLE = "SWEEP_UNAVAILABLE"
+member BeignetErrorCode.TOO_MANY_REQUESTS = "TOO_MANY_REQUESTS"
+member BeignetErrorCode.UNAUTHORIZED = "UNAUTHORIZED"
+member BeignetErrorCode.UNREACHABLE = "UNREACHABLE"
+member BeignetErrorCode.UNSUPPORTED_MEDIA_TYPE = "UNSUPPORTED_MEDIA_TYPE"
+member BeignetErrorCode.UNSUPPORTED_VERSION = "UNSUPPORTED_VERSION"
+member BeignetErrorCode.UPDATE_FEE_FAILED = "UPDATE_FEE_FAILED"
+member BeignetErrorCode.WALLET_CREATE_FAILED = "WALLET_CREATE_FAILED"
+member BeignetErrorCode.WRONG_CHAIN = "WRONG_CHAIN"
+member BeignetErrorCode.WRONG_SIGNER = "WRONG_SIGNER"
+member BeignetErrorCode.ZERO_CONF_FAILED = "ZERO_CONF_FAILED"
+type BeignetErrorCodeValue = `${BeignetErrorCode}`
+class BeignetNode extends TypedEmitter<BeignetNodeEvents>
+private constructor BeignetNode()
+static property BeignetNode.INITIAL_GOSSIP_PRIME_TIMEOUT_MS: number
+method BeignetNode.addTrustedPeer(pubkey: string): TrustedPeerInfo
+method BeignetNode.addWatchtower(uri: string): void
+method BeignetNode.backup(destPath: string): Promise<void>
+method BeignetNode.boostOnchain(txid: TxidHex, satsPerVbyte?: number): Promise<BoostResult>
+method BeignetNode.bootstrapPeers(): Promise<BootstrapPeerInfo[]>
+method BeignetNode.buildPsbt(outputs: Array<{ address: string; amountSats: number; }>, satsPerVbyte?: number): Promise<PsbtBuildInfo>
+method BeignetNode.bumpFeeOnchain(txid: TxidHex, satsPerVbyte: number): Promise<BoostResult>
+method BeignetNode.canReceive(amountSats: number): { canReceive: boolean; bestChannelId?: string; availableSats: number; }
+method BeignetNode.canSend(amountSats: number): { canSend: boolean; bestChannelId?: string; availableSats: number; }
+method BeignetNode.cancelHoldInvoice(paymentHash: PaymentHashHex): { paymentHash: PaymentHashHex; htlcsFailed: number; }
+method BeignetNode.cancelOnchainSweep(requestId: string): Promise<OnchainSweepInfo>
+method BeignetNode.cancelPayment(paymentHash: PaymentHashHex): { ok: true; }
+method BeignetNode.cancelQueuedPayment(id: string): boolean
+method BeignetNode.cancelSwap(id: string): { ok: boolean; reason?: string; }
+method BeignetNode.closeChannel(channelId: ChannelIdHex, acceptStaleStateRisk?: boolean, address?: string): Promise<{ ok: boolean; error?: string; }>
+method BeignetNode.closeQuote(channelId: ChannelIdHex, address?: string, acceptStaleStateRisk?: boolean): Promise<ReturnType<beignet/lightning#node.LightningNode['closeQuote']>>
+method BeignetNode.combinePsbts(psbts: string[]): { psbtBase64: string; }
+method BeignetNode.configureDirectFunding(update: { lspPubkey?: string; lspHost?: string; lspPort?: number; targetInboundSat?: number; trusted?: boolean; allowSplice?: boolean; allowUnpairedSplice?: boolean; unpairedSpliceDepth?: number; minAmountSat?: number; }): DirectFundingConfigInfo
+method BeignetNode.connectAndOpenChannel(pubkey: string, host: string, port: number, amountSats: number, opts?: { pushSats?: number; satsPerVbyte?: number; max?: boolean; trusted?: boolean; }): Promise<ChannelInfo>
+method BeignetNode.connectPeer(pubkey: string, host?: string, port?: number, transport?: beignet/lightning#transport.IPeerTransportOptions): Promise<PeerInfo>
+method BeignetNode.connectToSeeds(maxPeers?: number): Promise<string[]>
+method BeignetNode.consolidateUtxos(satsPerVbyte?: number): Promise<ConsolidateResult>
+static method BeignetNode.create(opts?: BeignetNodeOptions): Promise<BeignetNode>
+method BeignetNode.createDirectFundingRequest(opts: { host?: string; port?: number; amountSats?: number; }): { paymentHash: PaymentHashHex; expiresAt: number; request: string; }
+method BeignetNode.createHoldInvoice(opts: { paymentHash: PaymentHashHex; amountMsat?: bigint; amountSats?: number; description?: string; expiry?: number; minFinalCltvExpiry?: number; }): InvoiceInfo
+method BeignetNode.createInvoice(amountSats?: number, description?: string, expirySecs?: number, descriptionHash?: Buffer, minFinalCltvExpiry?: number): InvoiceInfo
+method BeignetNode.createJitInvoice(opts: { lspPubkey: string; amountSats?: number; description?: string; expirySecs?: number; targetRemainingInboundSat?: number; maxFlatFeeSat?: number; maxFeePpm?: number; feeMode?: 'skim' | 'hop'; }): Promise<InvoiceInfo & { flatFeeSat: number; feePpm: number; feeMode: 'skim' | 'hop'; }>
+method BeignetNode.createOffer(options: { description: string; amountSats?: number; issuer?: string; expirySecs?: number; }): OfferInfo
+method BeignetNode.decodeInvoice(bolt11: string): DecodedInvoice
+method BeignetNode.decodeOfferString(offerStr: string): OfferInfo
+method BeignetNode.describeGraph(limit?: number, offset?: number): GraphDescribeResult
+method BeignetNode.destroy(): Promise<void>
+method BeignetNode.disconnectPeer(pubkey: string): void
+method BeignetNode.enqueuePayment(bolt11: string, priority?: number, opts?: { amountSats?: number; maxFeeSats?: number; metadata?: Record<string, string>; }): QueuedPayment
+method BeignetNode.ensureMinimumChannels(count: number, satsPerChannel: number, _opts?: { timeoutMs?: number; }): Promise<ChannelInfo[]>
+method BeignetNode.estimatePayment(bolt11: string, amountSats?: number): PaymentEstimate | null
+method BeignetNode.estimateRouteFee(bolt11: string, amountSats?: number): RouteEstimate | null
+method BeignetNode.executeRebalances(budgetSatsPerDay?: number): Promise<RebalanceExecutionSummary>
+method BeignetNode.exportDescriptors(): DescriptorsInfo
+method BeignetNode.exportStaticChannelBackup(): { encoded: string; channelCount: number; path: string; }
+method BeignetNode.fforAbortEpoch(body: { channelId?: ChannelIdHex; reason?: number; text?: string; }): Record<string, unknown>
+method BeignetNode.fforAddPreimage(body: { channelId?: ChannelIdHex; preimage?: string; }): Record<string, unknown>
+method BeignetNode.fforCloseEpoch(channelId: ChannelIdHex): Record<string, unknown>
+method BeignetNode.fforCloseWitnesses(channelId: ChannelIdHex): Promise<Record<string, unknown>[]>
+method BeignetNode.fforConcurrentNegotiated(peer: string): boolean
+method BeignetNode.fforCreateInvoice(body: { expirySecs?: number; channelId?: ChannelIdHex; k?: number; description?: string; }): Record<string, unknown>
+method BeignetNode.fforEnforce(channelId: ChannelIdHex, acceptStaleStateRisk?: boolean): Record<string, unknown>
+method BeignetNode.fforEpoch(channelId: ChannelIdHex): Record<string, unknown>
+method BeignetNode.fforEpochs(role?: 'R' | 'S'): Record<string, unknown>[]
+method BeignetNode.fforIssuedSlots(channelId: ChannelIdHex | undefined, issuerNodeId: string | undefined): Promise<Record<string, unknown>>
+method BeignetNode.fforIssuerOffer(body: { issuerNodeId?: string; description?: string; amountMsat?: string | number; quantityMax?: number; }): Record<string, unknown>
+method BeignetNode.fforIssuerStatus(): Record<string, unknown>
+method BeignetNode.fforProvisionIssuer(body: { channelId?: ChannelIdHex; issuerNodeId?: string; offer?: string; witnessHops?: Array<{ nodeId: string; shortChannelId: string; feeBaseMsat: number; feeProportionalMillionths: number; cltvExpiryDelta: number; htlcMinimumMsat?: string | number; htlcMaximumMsat?: string | number; }>; issueUntil?: number; }): Promise<Record<string, unknown>>
+method BeignetNode.fforProvisionWitness(body: { channelId?: ChannelIdHex; witnessNodeId?: string; retentionUntil?: number; minReceipts?: number; }): Promise<Record<string, unknown>>
+method BeignetNode.fforRecover(body: { channelId?: ChannelIdHex; forceCloseIfUnreachable?: boolean; acceptStaleStateRisk?: boolean; }): Promise<Record<string, unknown>>
+method BeignetNode.fforStartEpoch(body: { channelId?: ChannelIdHex; voucherAmountsMsat?: Array<string | number>; settlementDeadline?: number; voucherExpiry?: number; feeBaseMsat?: number; feeProportionalMillionths?: number; hashChain?: boolean; witnessPeers?: string[]; concurrent?: boolean; concurrentVersion?: 1 | 2; }): Record<string, unknown>
+method BeignetNode.fforSync(channelId: ChannelIdHex): Record<string, unknown>
+method BeignetNode.fforWitnessStatus(): Record<string, unknown>
+method BeignetNode.forceCloseChannel(channelId: ChannelIdHex, acceptStaleStateRisk?: boolean): { ok: boolean; error?: string; commitmentTxid?: TxidHex; }
+method BeignetNode.forgetL402Credential(scope: string): void
+method BeignetNode.freezeUtxo(txid: TxidHex, index: number): Promise<{ frozen: string; }>
+method BeignetNode.getActionLog(options?: { category?: string; since?: number; limit?: number; }): ActionLogEntry[]
+method BeignetNode.getAdvisorRecommendations(): AdvisorRecommendations
+method BeignetNode.getBalance(): BalanceInfo
+method BeignetNode.getChannel(channelId: ChannelIdHex): ChannelInfo | null
+method BeignetNode.getChannelDiagnostics(channelId: ChannelIdHex): Record<string, unknown> | null
+method BeignetNode.getChannelHealth(channelId: ChannelIdHex): IChannelHealth | null
+method BeignetNode.getChannelPolicy(channelId: ChannelIdHex): ChannelPolicyInfo | null
+method BeignetNode.getChannelSuggestions(count?: number): ChannelSuggestion[]
+method BeignetNode.getDailySpendInfo(): { limitSats: number | null; spentSats: number; remainingSats: number; pendingSats: number; resetsAt: number; totalSats: number; lightningSats: number; onchainSats: number; }
+method BeignetNode.getDirectFundingConfig(): DirectFundingConfigInfo
+method BeignetNode.getFeeEstimates(): Promise<beignet#IOnchainFees>
+method BeignetNode.getFeeSnapshot(): FeeSnapshot | null
+method BeignetNode.getFforReceiveService(): FforReceiveService
+method BeignetNode.getForwardingSummary(since?: number): ForwardingSummaryInfo
+method BeignetNode.getGraphChannel(scid: string): GraphChannelInfo | null
+method BeignetNode.getGraphInfo(): GraphInfo
+method BeignetNode.getGraphNode(pubkey: string): GraphNodeInfo | null
+method BeignetNode.getGraphRestoreStats(): IGraphRestoreStats | null
+method BeignetNode.getGuardianHostSurfaceStatus(): { serving: boolean; listenError?: ListenerProblem; } & Partial<beignet/lightning#recovery.IGuardianHostStatus>
+method BeignetNode.getHealth(): HealthInfo
+method BeignetNode.getInfo(): NodeInfo
+method BeignetNode.getInvoice(paymentHash: PaymentHashHex): InvoiceInfo | null
+method BeignetNode.getJitQuote(opts: { lspPubkey: string; amountSats?: number; targetRemainingInboundSat?: number; }): Promise<JitQuoteInfo>
+method BeignetNode.getJitStatus(): JitStatusInfo
+method BeignetNode.getLiquiditySnapshot(): LiquiditySnapshot
+method BeignetNode.getMainnetReadiness(): ReadinessReport
+method BeignetNode.getMetrics(): string
+method BeignetNode.getMnemonic(): string
+method BeignetNode.getNewAddress(): Promise<string>
+method BeignetNode.getNode(): beignet/lightning#node.LightningNode
+method BeignetNode.getNodeUri(externalHost?: string): string | null
+method BeignetNode.getOfflineReceive(): OfflineReceive
+method BeignetNode.getOnchainSweep(requestId: string): OnchainSweepInfo | null
+method BeignetNode.getPayment(paymentHash: PaymentHashHex): PaymentInfo | null
+method BeignetNode.getPaymentProof(paymentHash: PaymentHashHex): PaymentProof | null
+method BeignetNode.getPaymentQueue(): PaymentQueue
+method BeignetNode.getPeerRetrievedBackup(): { encoded: string; createdAt: number; fromPeer: string; channelCount: number; source: 'scb' | 'capsule'; } | null
+method BeignetNode.getReadyChannels(): ChannelInfo[]
+method BeignetNode.getRecoverySurfaceStatus(): { mode: RecoveryMode; profile: 'crash-v1' | null; generation: string; configuredSetStale: boolean; rotation: { inProgress: boolean; pending: boolean; retirePending: boolean; lastEvent: { type: string; detail: string; } | null; followed: { generation: string; from: string[]; to: string[]; } | null; }; guardians: Array<{ guardianId: string; url: string; }>; state: 'disabled' | 'running' | 'restore-required' | 'restoring' | 'restart-required' | 'fenced'; node: ReturnType<beignet/lightning#node.LightningNode['getRecoveryStatus']> | null; capsules: { candidates: number; best: { writerEpoch: string; latestSequence: string; inline: boolean; channelCount: number; guardians: IReportedGuardian[]; fromPeer: string; receivedAt: number; } | null; }; restore?: { inProgress: boolean; lastEvent?: { type: string; detail: string; }; }; autoApply: { enabled: boolean; phase: 'idle' | 'settling' | 'applying' | 'applied' | 'refused'; settleUntil: number | null; lastReason: string | null; }; }
+method BeignetNode.getStats(windowMs?: number): NodeStats
+method BeignetNode.getStorage(): beignet/lightning/sqlite#SqliteStorage
+method BeignetNode.getSwapsStatus(): SwapsStatusInfo
+method BeignetNode.getWallet(): beignet#Wallet
+method BeignetNode.gracefulShutdown(timeoutMs?: number): Promise<void>
+method BeignetNode.hasPendingPayments(): boolean
+method BeignetNode.importSignedPsbt(psbtBase64: string, unsignedPsbtBase64?: string): PsbtImportInfo
+method BeignetNode.isDraining(): boolean
+method BeignetNode.isGraphRestoring(): boolean
+method BeignetNode.isReady(): boolean
+method BeignetNode.l402Fetch(url: string, init: beignet/lightning#l402.IL402RequestInit | undefined, options: { maxPriceSats: number; maxFeeSats?: number; timeoutMs?: number; fetchTimeoutMs?: number; scopePerPath?: boolean; allowUnverifiedMacaroon?: boolean; allowCrossOriginChallenge?: boolean; allowPrivateNetwork?: boolean; maxResponseBytes?: number; }): Promise<{ status: number; body: string; truncated: boolean; paid: boolean; amountPaidSats: number; paymentHash?: PaymentHashHex; }>
+get BeignetNode.lightningNode(): beignet/lightning#node.LightningNode
+method BeignetNode.listAddressLabels(): Record<string, string>
+method BeignetNode.listBoostableTransactions(): BoostableTransactions
+method BeignetNode.listChannels(): ChannelInfo[]
+method BeignetNode.listDirectFundingPayments(): beignet/lightning#directFunding.IDfPaymentRecord[]
+method BeignetNode.listForwards(filter?: ForwardsFilter): ForwardingEventInfo[]
+method BeignetNode.listHoldInvoices(): HoldInvoiceInfo[]
+method BeignetNode.listInvoices(): InvoiceInfo[]
+method BeignetNode.listL402Credentials(): beignet/lightning#l402.IL402Credential[]
+method BeignetNode.listOffers(): OfferInfo[]
+method BeignetNode.listOnchainTransactions(): OnchainTxInfo[]
+method BeignetNode.listPayments(filter?: PaymentFilter): PaymentInfo[]
+method BeignetNode.listPeers(): PeerInfo[]
+method BeignetNode.listQueue(): QueuedPayment[]
+method BeignetNode.listSwaps(id?: string): Record<string, unknown>[]
+method BeignetNode.listTrustedPeers(): TrustedPeerInfo[]
+method BeignetNode.listUtxos(): UtxoInfo[]
+method BeignetNode.listWatchtowers(): ReturnType<beignet/lightning#node.LightningNode['getWatchtowers']>
+get BeignetNode.onchainWallet(): beignet#Wallet
+method BeignetNode.openChannel(pubkey: string, amountSats: number, opts?: IOpenChannelOptions): ChannelInfo
+method BeignetNode.openChannel(pubkey: string, amountSats: number, pushSats?: number, satsPerVbyte?: number, max?: boolean, trusted?: boolean): ChannelInfo
+method BeignetNode.openChannelAndWait(pubkey: string, amountSats: number, opts?: { pushSats?: number; timeoutMs?: number; }): Promise<ChannelInfo>
+method BeignetNode.openChannelV2(peerPubkey: string, params: { amountSats: number; fundingFeeratePerkw?: number; commitmentFeeratePerkw?: number; locktime?: number; requestFunds?: { requestedSats: number; blockheight: number; }; maxLeaseRates?: beignet/lightning#gossip.ILeaseRates; }): ChannelInfo
+method BeignetNode.openZeroConfChannel(peerPubkey: string, amountSats: number, pushSats?: number): ChannelInfo
+method BeignetNode.payInvoice(bolt11: string, opts?: IPayInvoiceOptions): Promise<PaymentInfo>
+method BeignetNode.payInvoice(bolt11: string, timeoutMs?: number, maxFeeSats?: number, amountSats?: number, metadata?: Record<string, string>, cltvLimit?: number, maxFeeMsat?: number | string): Promise<PaymentInfo>
+method BeignetNode.payInvoiceAll(bolt11: string, debitMsat: number | string, maxFeeMsat: number | string, timeoutMs?: number): Promise<PaymentInfo>
+method BeignetNode.payInvoiceSafe(bolt11: string, opts?: IPayInvoiceOptions): Promise<PaymentInfo>
+method BeignetNode.payInvoiceSafe(bolt11: string, timeoutMs?: number, maxFeeSats?: number, amountSats?: number, metadata?: Record<string, string>, cltvLimit?: number, maxFeeMsat?: number | string): Promise<PaymentInfo>
+method BeignetNode.payInvoiceWithRetry(bolt11: string, opts?: RetryPaymentOptions): Promise<RetryPaymentResult>
+method BeignetNode.payOffer(offerStr: string, amountSats?: number, timeoutMs?: number, maxFeeSats?: number, maxFeeMsatCap?: number | string, onPaymentHash?: (paymentHash: PaymentHashHex) => void): Promise<PaymentInfo>
+method BeignetNode.paymentOutcome(paymentHash: PaymentHashHex): 'settled' | 'live' | 'gone'
+method BeignetNode.prepareDirectFunding(opts: { request?: string; }): beignet/lightning#directFunding.IDfPrepareResult
+method BeignetNode.prepareOnchainSweep(request: OnchainSweepRequest): Promise<OnchainSweepInfo>
+method BeignetNode.probeRoute(destination: string, amountSats: number): { success: boolean; feeSats?: number; feeMsat?: string; hops?: number; path?: Array<{ pubkey: string; shortChannelId: string; }>; }
+method BeignetNode.queryRoute(destination: string, amountSats: number, maxFeeSats?: number): RouteQueryResult
+method BeignetNode.quoteChannelFunding({ peerPubkey, satsPerVbyte }: { peerPubkey: string; satsPerVbyte?: number; }): Promise<TChannelFundingQuote>
+method BeignetNode.quoteOnchain({ address, amountSats, satsPerVbyte, max, channelFunding }?: { address?: string; amountSats?: number; satsPerVbyte?: number; max?: boolean; channelFunding?: boolean; }): Promise<TOnchainQuote>
+method BeignetNode.quotePayAll(bolt11: string, maxFeeMsat: number | string): PayAllQuote
+method BeignetNode.rebalanceChannel(fromChannelId: ChannelIdHex, toChannelId: ChannelIdHex, amountSats: number, maxFeeSats: number): Promise<RebalanceResult>
+method BeignetNode.rebroadcastClose(channelId: ChannelIdHex): Promise<{ ok: boolean; error?: string; txid?: TxidHex; broadcastOk?: boolean; }>
+method BeignetNode.recoverFallbackFunds(opts?: { feeRatePerVbyte?: number; }): Promise<{ txid: TxidHex; amountSat: number; inputCount: number; } | null>
+method BeignetNode.refreshWallet(): Promise<void>
+method BeignetNode.removeOffer(offerId: string): boolean
+method BeignetNode.removeTrustedPeer(pubkey: string): TrustedPeerInfo
+method BeignetNode.removeWatchtower(uri: string): void
+method BeignetNode.resolveGuardianUri(uri: string): Promise<{ guardianId: string; url: string; entry: string; guardianSetIds: string[]; maxCiphertextBytes: number; }>
+method BeignetNode.resolveInterruptedPayment(bolt11: string): Promise<InterruptedPaymentOutcome>
+get BeignetNode.restartRequired(): boolean
+method BeignetNode.restoreFromCapsules(options?: { unfenced?: boolean; resume?: boolean; }): Promise<{ tier: 1 | 2; channelCount: number; framesApplied: number; head: { writerEpoch: string; latestSequence: string; }; newestSeenHead: { writerEpoch: string; latestSequence: string; }; rejectedCandidates: number; restartRequired: boolean; resumed?: boolean; uncovered?: string[]; unfenced?: { guardians: IReportedGuardian[]; }; recovering?: string[]; skipped?: Array<{ channelId: ChannelIdHex; reason: string; }>; }>
+method BeignetNode.restoreFromGuardians(): Promise<{ exact: boolean; framesApplied: number; guardiansRepaired: number; epoch: string; }>
+method BeignetNode.restoreFromScb(encoded: string): Promise<{ recovering: string[]; skipped: Array<{ channelId: ChannelIdHex; reason: string; }>; channelCount: number; }>
+get BeignetNode.restorePending(): boolean
+get BeignetNode.resuming(): boolean
+method BeignetNode.revealCapsuleGuardians(): { fromPeer: string; head: { writerEpoch: string; latestSequence: string; }; guardians: beignet/lightning#recovery.GuardianDescriptor[]; entries: beignet/lightning#recovery.IGuardianConfigEntry[]; }
+method BeignetNode.rotateGuardians(entries: Array<string | beignet/lightning#recovery.IGuardianConfigEntry>): Promise<{ generation: string; guardians: Array<{ guardianId: string; url: string; }>; retired: number; }>
+method BeignetNode.sendDirectFunding(opts: { request?: string; amountSats?: number; maxTotalFeeSat?: number; feeHeadroomSats?: number; recoverReceipt?: boolean; }): Promise<beignet/lightning#directFunding.IDfSendResult>
+method BeignetNode.sendKeysend(pubkey: string, amountSats: number, timeoutMs?: number, maxFeeSats?: number, metadata?: Record<string, string>, onPaymentHash?: (paymentHash: PaymentHashHex) => void): Promise<PaymentInfo>
+method BeignetNode.sendKeysendSafe(pubkey: string, amountSats: number, timeoutMs?: number, maxFeeSats?: number, metadata?: Record<string, string>): Promise<PaymentInfo>
+method BeignetNode.sendMaxOnchain(address: string, satsPerVbyte?: number): Promise<TxInfo>
+method BeignetNode.sendOnchain(address: string, amountSats: number, satsPerVbyte?: number): Promise<TxInfo>
+method BeignetNode.sendPaymentAsync(bolt11: string, maxFeeSats?: number, amountSats?: number, metadata?: Record<string, string>, cltvLimit?: number): { paymentHash: PaymentHashHex; status: 'PENDING' | 'FAILED'; }
+method BeignetNode.sendToRoute(paymentHash: PaymentHashHex, route: { hops: RouteHop[]; }, paymentSecret?: string): PaymentInfo
+method BeignetNode.setAddressLabel(address: string, label: string): Promise<{ address: string; label: string; }>
+method BeignetNode.setDraining(enabled: boolean): void
+method BeignetNode.setPaymentMetadata(paymentHash: PaymentHashHex, metadata: Record<string, string>): void
+method BeignetNode.settleHoldInvoice(preimage: string): { paymentHash: PaymentHashHex; }
+method BeignetNode.signMessage(message: string): { signature: string; pubkey: string; }
+method BeignetNode.spliceIn(channelId: ChannelIdHex, amountSats: number, feeratePerkw: number, fundingUtxos?: { utxos: Array<{ txid: TxidHex; vout: number; }>; allowTopUp?: boolean; }): SpliceResult
+method BeignetNode.spliceOut(channelId: ChannelIdHex, amountSats: number, feeratePerkw: number, destinationAddress?: string): SpliceResult
+method BeignetNode.spliceQuote(channelId: ChannelIdHex, direction: 'in' | 'out', feeratePerkw: number, destinationAddress?: string): ReturnType<beignet/lightning#node.LightningNode['spliceQuote']>
+method BeignetNode.storageFiles(): string[]
+method BeignetNode.submitOnchainSweep(requestId: string): Promise<OnchainSweepInfo>
+method BeignetNode.syncGossip(pubkey?: string): string[]
+method BeignetNode.syncRapidGossip(): Promise<{ channelsAdded: number; updatesApplied: number; } | null>
+method BeignetNode.triggerBackup(): void
+method BeignetNode.unfreezeUtxo(txid: TxidHex, index: number): Promise<{ unfrozen: string; }>
+method BeignetNode.updateAllChannelPolicies(policy: ChannelPolicyUpdateParams): { updated: number; policies: ChannelPolicyInfo[]; }
+method BeignetNode.updateChannelFee(channelId: ChannelIdHex, feeratePerKw: number): { ok: boolean; error?: string; }
+method BeignetNode.updateChannelPolicy(channelId: ChannelIdHex, policy: ChannelPolicyUpdateParams): { updated: number; policies: ChannelPolicyInfo[]; }
+method BeignetNode.validateAddress(address: string): boolean
+method BeignetNode.validatePayment(bolt11: string, amountSats?: number, maxFeeSats?: number): PaymentValidation
+method BeignetNode.verifyMessage(message: string, signature: string): { valid: boolean; pubkey: string | null; knownNode: boolean; }
+method BeignetNode.verifyPaymentProof(paymentHash: PaymentHashHex): PaymentProofVerification
+method BeignetNode.waitForChannelReady(channelId: ChannelIdHex, timeoutMs?: number): Promise<void>
+method BeignetNode.waitForInitialSync(): Promise<void>
+method BeignetNode.waitForPayment(paymentHash: PaymentHashHex, timeoutMs?: number): Promise<PaymentInfo>
+method BeignetNode.waitForReady(timeoutMs?: number): Promise<void>
+method BeignetNode.whenGraphRestored(): Promise<boolean>
+method BeignetNode.whenReadyToPay(run: () => void): void
+interface BeignetNodeEvents
+property BeignetNodeEvents.'backup:completed': (data: { path: string; timestamp: number; }) => void
+property BeignetNodeEvents.'backup:failed': (data: { path: string; error: string; timestamp: number; }) => void
+property BeignetNodeEvents.'channel:closed': (data: { channelId: ChannelIdHex; }) => void
+property BeignetNodeEvents.'channel:force-closing': (data: { channelId: ChannelIdHex; initiator: 'local' | 'remote'; }) => void
+property BeignetNodeEvents.'channel:opening': (data: { channelId: ChannelIdHex; fundingTxid: TxidHex; }) => void
+property BeignetNodeEvents.'channel:pending-close': (data: { channelId: ChannelIdHex; initiator: 'local' | 'remote'; }) => void
+property BeignetNodeEvents.'channel:ready': (data: { channelId: ChannelIdHex; }) => void
+property BeignetNodeEvents.'channel:resolved': (data: { channelId: ChannelIdHex; }) => void
+property BeignetNodeEvents.'channel:usable': (data: { channelId: ChannelIdHex; }) => void
+property BeignetNodeEvents.'channel:voided': (data: { channelId: ChannelIdHex; }) => void
+property BeignetNodeEvents.'direct-funding:offer:accepted': (data: { offerId: string; paired: boolean; resumed?: boolean; }) => void
+property BeignetNodeEvents.'direct-funding:offer:completed': (data: { offerId: string; }) => void
+property BeignetNodeEvents.'direct-funding:offer:declined': (data: { offerId: string; reason: string; }) => void
+property BeignetNodeEvents.'direct-funding:offer:failed': (data: { offerId: string; reason: string; }) => void
+property BeignetNodeEvents.'electrum:failover': (data: { from: { host: string; port: number; }; to: { host: string; port: number; }; timestamp: number; }) => void
+property BeignetNodeEvents.'ffor:delegated-failed': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'ffor:enforce': (data: { channelId: ChannelIdHex; epoch: Record<string, unknown>; restoreRecencyUnproven?: true; reestablishRecencyUnproven?: true; reestablishSecretMissing?: true; }) => void
+property BeignetNodeEvents.'ffor:issuer-issued': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'ffor:issuer-provisioned': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'ffor:issuer-retired': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'ffor:settled': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'ffor:slot-resolved': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'ffor:state': (data: { channelId: ChannelIdHex; state: string; epoch: Record<string, unknown>; }) => void
+property BeignetNodeEvents.'ffor:witness-audit': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'ffor:witness-closed': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'ffor:witness-expired': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'ffor:witness-provisioned': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'ffor:witness-recorded': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'ffor:witness-refused': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'ffor:witness-released': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'gossip:synced': (data: { channelsAdded: number; updatesApplied: number; downloadMs: number; applyMs: number; busyMs: number; slices: number; }) => void
+property BeignetNodeEvents.'graph:restored': (stats: IGraphRestoreStats) => void
+property BeignetNodeEvents.'guardian:quota-refused': (data: { detail: string; setId?: string; }) => void
+property BeignetNodeEvents.'guardian:session-violation': (data: { detail: string; peer?: string; }) => void
+property BeignetNodeEvents.'guardian:set-registered': (data: { detail: string; setId?: string; }) => void
+property BeignetNodeEvents.'hold:accepted': (data: HoldInvoiceEvent) => void
+property BeignetNodeEvents.'hold:cancelled': (data: HoldInvoiceEvent & { reason: beignet/lightning#node.HoldCancelReason; }) => void
+property BeignetNodeEvents.'hold:settled': (data: HoldInvoiceEvent) => void
+property BeignetNodeEvents.'htlc:failed': (data: { channelId: ChannelIdHex; htlcId: string; }) => void
+property BeignetNodeEvents.'htlc:forwarded': (data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountInMsat: string; amountOutMsat: string; feeMsat: string; }) => void
+property BeignetNodeEvents.'htlc:fulfilled': (data: { channelId: ChannelIdHex; htlcId: string; }) => void
+property BeignetNodeEvents.'invoice:settled': (data: { paymentHash: PaymentHashHex; bolt11: string; amountSats: number; }) => void
+property BeignetNodeEvents.'jit:failed': (data: { scidHex?: string; channelIdHex?: string; parts: number; reason: string; }) => void
+property BeignetNodeEvents.'jit:forwarded': (data: { scidHex?: string; channelIdHex?: string; parts: number; }) => void
+property BeignetNodeEvents.'jit:funding': (data: { scidHex?: string; channelIdHex?: string; fundingSats: string; }) => void
+property BeignetNodeEvents.'jit:intent': (data: { scidHex: string; walletPubkeyHex: string; paymentHashHex?: string; maxAmountMsat: string; expectedTotalMsat?: string; targetRemainingInboundSat: string; expiresAt: number; }) => void
+property BeignetNodeEvents.'jit:intent-superseded': (data: { scidHex: string; walletPubkeyHex: string; }) => void
+property BeignetNodeEvents.'jit:intercepted': (data: { scidHex?: string; channelIdHex?: string; amountMsat: string; }) => void
+property BeignetNodeEvents.'node:error': (data: { code: string; message: string; timestamp: number; channelId?: ChannelIdHex; txid?: TxidHex; retained?: boolean; channelErrorCode?: beignet/lightning#channel.ChannelErrorCode; }) => void
+property BeignetNodeEvents.'node:ready': () => void
+property BeignetNodeEvents.'onchain:rbf': (data: { txids: TxidHex[]; }) => void
+property BeignetNodeEvents.'payment:failed': (info: PaymentInfo) => void
+property BeignetNodeEvents.'payment:received': (info: PaymentInfo) => void
+property BeignetNodeEvents.'payment:retry': (data: { paymentHash: PaymentHashHex; attempt: number; maxRetries: number; nextRetryMs: number; error: string; }) => void
+property BeignetNodeEvents.'payment:sent': (info: PaymentInfo) => void
+property BeignetNodeEvents.'peer:connect': (data: { pubkey: string; }) => void
+property BeignetNodeEvents.'peer:disconnect': (data: { pubkey: string; }) => void
+property BeignetNodeEvents.'peer:error': (data: { pubkey: string; message: string; }) => void
+property BeignetNodeEvents.'recovery:backfill-lost': (data: { detail: string; }) => void
+property BeignetNodeEvents.'recovery:capsule-retrieved': (data: { fromPeer: string; writerEpoch: string; latestSequence: string; inline: boolean; channelCount: number; candidates: number; }) => void
+property BeignetNodeEvents.'recovery:durable': (data: { through: string; }) => void
+property BeignetNodeEvents.'recovery:fenced': (data: { supersededBy: { epoch: string; writerPublicKey: string; sequence: string; frameHash: string; } | null; }) => void
+property BeignetNodeEvents.'recovery:guardian_unreachable': (data: { detail: string; sequence?: string; }) => void
+property BeignetNodeEvents.'recovery:reestablish-held': (data: { peerPubkey: string; channelId: ChannelIdHex; expiresAt: number; }) => void
+property BeignetNodeEvents.'recovery:restore-progress': (data: { type: string; detail: string; }) => void
+property BeignetNodeEvents.'recovery:restored': (data: { exact: boolean; framesApplied: number; guardiansRepaired: number; epoch: string; tier?: 1 | 2; restartRequired?: boolean; resumed?: boolean; }) => void
+property BeignetNodeEvents.'recovery:rotated': (data: { generation: string; guardians: Array<{ guardianId: string; url: string; }>; }) => void
+property BeignetNodeEvents.'recovery:rotation-followed': (data: { generation: string; from: string[]; to: string[]; }) => void
+property BeignetNodeEvents.'recovery:rotation-progress': (data: { type: string; detail: string; generation?: string; }) => void
+property BeignetNodeEvents.'splice:aborted': (data: { channelId: ChannelIdHex; reason: string; }) => void
+property BeignetNodeEvents.'splice:complete': (data: { channelId: ChannelIdHex; fundingTxid?: TxidHex; }) => void
+property BeignetNodeEvents.'splice:conflicted': (data: { channelId: ChannelIdHex; spliceTxid: TxidHex; conflictTxid: TxidHex; inputIndex: number; height: number; }) => void
+property BeignetNodeEvents.'splice:reverted': (data: { channelId: ChannelIdHex; spliceTxid: TxidHex; conflictTxid: TxidHex; }) => void
+property BeignetNodeEvents.'swap:cancelled': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:claim-broadcast': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:claim-confirmed': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:claimed': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:created': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:exposed': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:failed': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:funded': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:funding': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:funding-lost': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:funding-seen': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:held': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:hold-cancelled': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:paying': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:payment-failed': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:payment-unresolved': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:preimage': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:refund-broadcast': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:refunded': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'swap:settled': (data: Record<string, unknown>) => void
+property BeignetNodeEvents.'transaction:confirmed': (info: OnchainTxInfo) => void
+property BeignetNodeEvents.'transaction:received': (info: OnchainTxInfo) => void
+property BeignetNodeEvents.'transaction:sent': (info: OnchainTxInfo) => void
+property BeignetNodeEvents.log: (entry: { level: string; message: string; data?: Record<string, unknown>; timestamp: number; }) => void
+interface BeignetNodeOptions extends IrohDaemonConfig, ElectrumTlsConfig
+property BeignetNodeOptions.addressType?: 'p2wpkh' | 'p2tr'
+property BeignetNodeOptions.alias?: string
+property BeignetNodeOptions.allowMultipleInstances?: boolean
+property BeignetNodeOptions.announceAddresses?: string[]
+property BeignetNodeOptions.autoBootstrap?: boolean
+property BeignetNodeOptions.autoGossipSync?: boolean
+property BeignetNodeOptions.autoRebalance?: { enabled?: boolean; budgetSatsPerDay?: number; minImbalancePct?: number; intervalMs?: number; }
+property BeignetNodeOptions.autoReconnect?: boolean
+property BeignetNodeOptions.autoTuneFees?: { enabled?: boolean; intervalMs?: number; floorPpm?: number; ceilPpm?: number; }
+property BeignetNodeOptions.autoUpdateChannelFees?: boolean
+property BeignetNodeOptions.backupIntervalMs?: number
+property BeignetNodeOptions.backupPath?: string
+property BeignetNodeOptions.connectTimeoutMs?: number
+property BeignetNodeOptions.dailySpendLimitSats?: number
+property BeignetNodeOptions.dataDir?: string
+property BeignetNodeOptions.deferGraphRestore?: boolean
+property BeignetNodeOptions.dfMinAmountSat?: number
+property BeignetNodeOptions.dfRelay?: boolean
+property BeignetNodeOptions.eagerGossipVerify?: boolean
+property BeignetNodeOptions.electrumHost?: string
+property BeignetNodeOptions.electrumPort?: number
+property BeignetNodeOptions.electrumServers?: Array<{ host: string; port: number; tls?: boolean; }>
+property BeignetNodeOptions.electrumTls?: boolean
+property BeignetNodeOptions.feeEstimationSource?: 'electrum' | 'http' | 'auto'
+property BeignetNodeOptions.fforConcurrent?: boolean
+property BeignetNodeOptions.fforIssuer?: boolean
+property BeignetNodeOptions.fforReceiveFunding?: FforReceiveFunding
+property BeignetNodeOptions.fforSettle?: { enabled: boolean; maxBudgetMsat?: string | number; maxEpochBlocks?: number; feeBaseMsat?: number; feePpm?: number; }
+property BeignetNodeOptions.fforSettleConcurrent?: boolean
+property BeignetNodeOptions.fforWitness?: { enabled: boolean; maxMailboxes?: number; maxBytes?: number; }
+property BeignetNodeOptions.forwardingEnabled?: boolean
+property BeignetNodeOptions.guardianMaxBytesPerSet?: number
+property BeignetNodeOptions.guardianMaxCiphertextBytes?: number
+property BeignetNodeOptions.guardianMaxSets?: number
+property BeignetNodeOptions.guardianServe?: boolean
+property BeignetNodeOptions.guardianToken?: string
+property BeignetNodeOptions.jitReceive?: { enabled?: boolean; flatFeeSat?: number; feePpm?: number; maxFlatFeeSat?: number; maxFeePpm?: number; maxClientFundingSats?: number; maxConcurrentFundings?: number; maxTotalFundingSats?: number; }
+property BeignetNodeOptions.largeChannels?: boolean
+property BeignetNodeOptions.leaseRates?: beignet/lightning#gossip.ILeaseRates
+property BeignetNodeOptions.listenPort?: number
+property BeignetNodeOptions.logLevel?: LogLevel
+property BeignetNodeOptions.logger?: beignet#ILogger
+property BeignetNodeOptions.maxInboundPeers?: number
+property BeignetNodeOptions.maxPaymentSats?: number
+property BeignetNodeOptions.mnemonic?: string
+property BeignetNodeOptions.network?: 'mainnet' | 'testnet' | 'regtest' | 'signet'
+property BeignetNodeOptions.onError?: (error: { code: string; message: string; timestamp: number; channelId?: ChannelIdHex; txid?: TxidHex; retained?: boolean; channelErrorCode?: beignet/lightning#channel.ChannelErrorCode; }) => void
+property BeignetNodeOptions.peerStorageEnabled?: boolean
+property BeignetNodeOptions.preferAnchors?: boolean
+property BeignetNodeOptions.rapidGossipSync?: boolean
+property BeignetNodeOptions.rapidGossipSyncUrl?: string
+property BeignetNodeOptions.recoveryAutoApply?: boolean
+property BeignetNodeOptions.recoveryAutoApplyMaxWaitMs?: number
+property BeignetNodeOptions.recoveryAutoApplySettleMs?: number
+property BeignetNodeOptions.recoveryGuardians?: Array<string | beignet/lightning#recovery.IGuardianConfigEntry>
+property BeignetNodeOptions.recoveryLeaseCheckIntervalMs?: number
+property BeignetNodeOptions.recoveryMode?: string
+property BeignetNodeOptions.recoveryProfile?: string
+property BeignetNodeOptions.recoveryReestablishHoldMs?: number
+property BeignetNodeOptions.routingCltvDelta?: number
+property BeignetNodeOptions.routingFeeBaseMsat?: number
+property BeignetNodeOptions.routingFeePpm?: number
+property BeignetNodeOptions.storageEncryption?: boolean
+property BeignetNodeOptions.swaps?: { enabled?: boolean; flatFeeSat?: number; feePpm?: number; minSat?: number; maxSat?: number; maxExposureSat?: number; maxConcurrent?: number; refundDeltaBlocks?: number; fundingConfs?: number; resolutionConfs?: number; submarine?: boolean; claimSafetyBlocks?: number; paymentMaxFeePpm?: number; claimBumpIntervalBlocks?: number; submarineRefundDeltaBlocks?: number; }
+property BeignetNodeOptions.torProxy?: string
+property BeignetNodeOptions.torProxyOnionOnly?: boolean
+property BeignetNodeOptions.waiveClientReserve?: boolean
+property BeignetNodeOptions.watchtowers?: string[]
+property BeignetNodeOptions.websocketPort?: number
+interface Bolt12InvoiceInfo
+property Bolt12InvoiceInfo.amountSats: number
+property Bolt12InvoiceInfo.createdAt: number
+property Bolt12InvoiceInfo.description: string
+property Bolt12InvoiceInfo.nodeId: string
+property Bolt12InvoiceInfo.paymentHash: PaymentHashHex
+property Bolt12InvoiceInfo.relativeExpiry?: number
+interface BoostResult
+property BoostResult.boostType: 'rbf' | 'cpfp'
+property BoostResult.feeSats: number
+property BoostResult.hex: string
+property BoostResult.originalTxid: TxidHex
+property BoostResult.txid: TxidHex
+interface BoostableTransactions
+property BoostableTransactions.cpfp: OnchainTxInfo[]
+property BoostableTransactions.rbf: OnchainTxInfo[]
+interface BootstrapPeerInfo
+property BootstrapPeerInfo.host: string
+property BootstrapPeerInfo.port: number
+property BootstrapPeerInfo.pubkey: string
+unexported type CanSendFn = (amountSats: number) => { canSend: boolean; availableSats: number; }
+enum ChannelFundingUnavailableCode
+member ChannelFundingUnavailableCode.CHANNEL_NOT_FOUND = "CHANNEL_NOT_FOUND"
+member ChannelFundingUnavailableCode.FEE_ESTIMATE_NOT_READY = "FEE_ESTIMATE_NOT_READY"
+member ChannelFundingUnavailableCode.FUNDING_PROVIDER_REQUIRED = "FUNDING_PROVIDER_REQUIRED"
+member ChannelFundingUnavailableCode.INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
+class ChannelFundingUnavailableError extends CodedError<ChannelFundingUnavailableCode>
+constructor ChannelFundingUnavailableError(code: ChannelFundingUnavailableCode, message: string)
+type ChannelIdHex = string
+interface ChannelInfo
+property ChannelInfo.capacitySats: number
+property ChannelInfo.channelId: ChannelIdHex
+property ChannelInfo.closeStatus?: CloseStatus
+property ChannelInfo.cltvExpiryDelta?: number
+property ChannelInfo.feeBaseMsat?: number
+property ChannelInfo.feeProportionalMillionths?: number
+property ChannelInfo.feeratePerKw?: number
+property ChannelInfo.ffor?: { state: string; concurrent: boolean; concurrentVersion?: 1 | 2; reservedInboundSats: number; unresolvedSlots: number; }
+property ChannelInfo.fundingOutputIndex?: number
+property ChannelInfo.fundingTxid?: TxidHex
+property ChannelInfo.fundingUnaccounted?: boolean
+property ChannelInfo.htlcCount?: number
+property ChannelInfo.htlcMaximumMsat?: string
+property ChannelInfo.htlcMinimumMsat?: string
+property ChannelInfo.htlcUsable?: boolean
+property ChannelInfo.isAnchor: boolean
+property ChannelInfo.isOpener?: boolean
+property ChannelInfo.isPrivate?: boolean
+property ChannelInfo.localBalanceSats: number
+property ChannelInfo.localReserveSats?: number
+property ChannelInfo.localReserveWaived?: boolean
+property ChannelInfo.maxSendableSats?: number
+property ChannelInfo.payThroughSplice?: boolean
+property ChannelInfo.peerPubkey: string
+property ChannelInfo.peerSupportsSplicing?: boolean
+property ChannelInfo.pendingSpliceLocalBalanceSats?: number
+property ChannelInfo.pendingSpliceTxid?: TxidHex
+property ChannelInfo.previousFundingTxids?: TxidHex[]
+property ChannelInfo.reestablishRecencyUnproven?: boolean
+property ChannelInfo.reestablishSecretMissing?: boolean
+property ChannelInfo.remoteBalanceSats: number
+property ChannelInfo.remoteReserveSats?: number
+property ChannelInfo.remoteReserveWaived?: boolean
+property ChannelInfo.restoreRecencyUnproven?: boolean
+property ChannelInfo.restoreRevokedRisk?: boolean
+property ChannelInfo.revertedSplices?: Array<{ spliceTxid: TxidHex; conflictTxid: TxidHex; revertedAt: number; }>
+property ChannelInfo.shortChannelId?: string
+property ChannelInfo.state: ChannelStateString
+interface ChannelPolicyInfo
+property ChannelPolicyInfo.channelId: ChannelIdHex
+property ChannelPolicyInfo.cltvExpiryDelta: number
+property ChannelPolicyInfo.feeBaseMsat: number
+property ChannelPolicyInfo.feeProportionalMillionths: number
+property ChannelPolicyInfo.htlcMaximumMsat: string
+property ChannelPolicyInfo.htlcMinimumMsat: string
+property ChannelPolicyInfo.source: 'override' | 'default'
+interface ChannelPolicyUpdateParams
+property ChannelPolicyUpdateParams.cltvExpiryDelta?: number
+property ChannelPolicyUpdateParams.feeBaseMsat?: number
+property ChannelPolicyUpdateParams.feeProportionalMillionths?: number
+property ChannelPolicyUpdateParams.htlcMaximumMsat?: number | string
+property ChannelPolicyUpdateParams.htlcMinimumMsat?: number | string
+type ChannelStateString = 'NONE' | 'AWAITING_FUNDING_CONFIRMED' | 'AWAITING_CHANNEL_READY' | 'NORMAL' | 'SHUTTING_DOWN' | 'NEGOTIATING_CLOSING' | 'FORCE_CLOSED' | 'AWAITING_REESTABLISH' | 'CLOSED' | 'ERRORED' | 'ANNOUNCEMENT_READY'
+interface ChannelSuggestion
+property ChannelSuggestion.alias?: string
+property ChannelSuggestion.channelCount: number
+property ChannelSuggestion.nodeId: string
+property ChannelSuggestion.reason: string
+property ChannelSuggestion.score: number
+property ChannelSuggestion.totalCapacitySats: number
+interface CloseStatus
+property CloseStatus.broadcast: boolean
+property CloseStatus.closer: 'local' | 'remote' | 'cooperative' | 'unknown'
+property CloseStatus.closingTxid?: TxidHex
+property CloseStatus.confirmationHeight: number
+property CloseStatus.fundsAvailableHeight?: number
+property CloseStatus.reason?: string
+property CloseStatus.resolution: 'pending' | 'sweeping' | 'resolved'
+class CodedError<C extends string = string> extends Error
+constructor CodedError(code: C, message: string, options?: { cause?: unknown; })
+readonly property CodedError.cause?: unknown
+readonly property CodedError.code: C
+interface ConsolidateResult
+property ConsolidateResult.address: string
+property ConsolidateResult.feeSats: number
+property ConsolidateResult.hex: string
+property ConsolidateResult.txid: TxidHex
+property ConsolidateResult.utxosConsolidated: number
+interface DaemonOptions extends BeignetNodeOptions
+property DaemonOptions.apiKeys?: ApiKeyDefinition[]
+property DaemonOptions.apiToken?: string
+property DaemonOptions.cors?: boolean | string
+property DaemonOptions.daemonHost?: string
+property DaemonOptions.daemonPort?: number
+property DaemonOptions.htlcEvents?: boolean
+property DaemonOptions.insecure?: boolean
+property DaemonOptions.metricsPublic?: boolean
+property DaemonOptions.rateLimit?: RateLimitOptions
+property DaemonOptions.tlsCert?: string
+property DaemonOptions.tlsKey?: string
+interface DecodedInvoice
+property DecodedInvoice.amountSats?: number
+property DecodedInvoice.description?: string
+property DecodedInvoice.expiry?: number
+property DecodedInvoice.minFinalCltvExpiry?: number
+property DecodedInvoice.network: string
+property DecodedInvoice.payeeNodeKey?: string
+property DecodedInvoice.paymentHash: PaymentHashHex
+property DecodedInvoice.paymentSecret?: string
+property DecodedInvoice.routingHints?: Array<Array<{ pubkey: string; shortChannelId: string; feeBaseMsat: number; feeProportionalMillionths: number; cltvExpiryDelta: number; }>>
+property DecodedInvoice.timestamp: number
+property DecodedInvoice.warnings?: string[]
+interface DescriptorsInfo
+property DescriptorsInfo.account: number
+property DescriptorsInfo.birthdayHeight?: number
+property DescriptorsInfo.descriptors: Array<{ addressType: string; external: string; internal: string; }>
+property DescriptorsInfo.fingerprint: string
+property DescriptorsInfo.network: string
+property DescriptorsInfo.watchOnly: boolean
+interface DirectFundingConfigInfo
+property DirectFundingConfigInfo.allowSplice: boolean
+property DirectFundingConfigInfo.allowUnpairedSplice: boolean
+property DirectFundingConfigInfo.lspHost: string | null
+property DirectFundingConfigInfo.lspPort: number | null
+property DirectFundingConfigInfo.lspPubkey: string | null
+property DirectFundingConfigInfo.minAmountSat: number
+property DirectFundingConfigInfo.targetInboundSat: number
+property DirectFundingConfigInfo.trusted: boolean
+property DirectFundingConfigInfo.unpairedSpliceDepth: number
+unexported interface ElectrumTlsConfig
+property ElectrumTlsConfig.electrumTlsFingerprints?: string[]
+property ElectrumTlsConfig.electrumTlsVerify?: boolean
+unexported type EventMap<E> = { [K in keyof E]: (...args: any[]) => void; }
+interface EventMessage
+property EventMessage.data: Record<string, unknown>
+property EventMessage.type: string
+interface FeeSnapshot
+property FeeSnapshot.avgSatPerVbyte: number
+property FeeSnapshot.currentSatPerVbyte: number
+property FeeSnapshot.estimatedOpenChannelCostSats: number
+property FeeSnapshot.maxSatPerVbyte: number
+property FeeSnapshot.minSatPerVbyte: number
+property FeeSnapshot.percentile: number
+property FeeSnapshot.recommendation: 'OPEN_NOW' | 'WAIT' | 'NEUTRAL'
+property FeeSnapshot.sampleCount: number
+property FeeSnapshot.trend: 'RISING' | 'FALLING' | 'STABLE'
+unexported interface FforReceiveFunding
+property FforReceiveFunding.enabled: boolean
+property FforReceiveFunding.maxChannelSats: number
+property FforReceiveFunding.maxChannels: number
+property FforReceiveFunding.maxChannelsPerPeer: number
+property FforReceiveFunding.maxTotalSats: number
+unexported class FforReceiveService
+constructor FforReceiveService(host: BeignetNode, settle: { enabled: boolean; feeBaseMsat?: number; feePpm?: number; } | undefined, funding?: FforReceiveFunding | undefined, concurrent?: boolean)
+method FforReceiveService.receipts(channelId: string): Promise<void>
+method FforReceiveService.request(peer: string, body: Record<string, unknown>, timeout?: number): Promise<any>
+method FforReceiveService.stop(): void
+interface ForwardingEventInfo
+property ForwardingEventInfo.amountInMsat: string
+property ForwardingEventInfo.amountOutMsat: string
+property ForwardingEventInfo.feeMsat: string
+property ForwardingEventInfo.id: number
+property ForwardingEventInfo.inChannelId: ChannelIdHex
+property ForwardingEventInfo.inScid?: string
+property ForwardingEventInfo.outChannelId: ChannelIdHex
+property ForwardingEventInfo.outScid?: string
+property ForwardingEventInfo.settledAt: number
+interface ForwardingSummaryInfo
+property ForwardingSummaryInfo.count: number
+property ForwardingSummaryInfo.feesEarnedMsat: string
+property ForwardingSummaryInfo.volumeOutMsat: string
+interface ForwardsFilter
+property ForwardsFilter.channelId?: ChannelIdHex
+property ForwardsFilter.limit?: number
+property ForwardsFilter.offset?: number
+property ForwardsFilter.since?: number
+property ForwardsFilter.until?: number
+interface GraphChannelInfo
+property GraphChannelInfo.capacitySats?: number
+property GraphChannelInfo.node1Policy?: GraphChannelPolicy
+property GraphChannelInfo.node1Pubkey: string
+property GraphChannelInfo.node2Policy?: GraphChannelPolicy
+property GraphChannelInfo.node2Pubkey: string
+property GraphChannelInfo.shortChannelId: string
+interface GraphChannelPolicy
+property GraphChannelPolicy.cltvExpiryDelta: number
+property GraphChannelPolicy.disabled: boolean
+property GraphChannelPolicy.feeBaseMsat: number
+property GraphChannelPolicy.feeProportionalMillionths: number
+property GraphChannelPolicy.htlcMaximumMsat?: string
+property GraphChannelPolicy.htlcMinimumMsat: string
+property GraphChannelPolicy.lastUpdate: number
+interface GraphDescribeResult
+property GraphDescribeResult.channels: GraphChannelInfo[]
+property GraphDescribeResult.limit: number
+property GraphDescribeResult.offset: number
+property GraphDescribeResult.totalChannels: number
+interface GraphInfo
+property GraphInfo.channelCount: number
+property GraphInfo.lastSyncAt?: number
+property GraphInfo.nodeCount: number
+property GraphInfo.restoring?: boolean
+interface GraphNodeInfo
+property GraphNodeInfo.addresses?: Array<{ type: number; host: string; port: number; }>
+property GraphNodeInfo.alias?: string
+property GraphNodeInfo.channelCount: number
+property GraphNodeInfo.channels: string[]
+property GraphNodeInfo.color?: string
+property GraphNodeInfo.featuresHex?: string
+property GraphNodeInfo.lastUpdate?: number
+property GraphNodeInfo.pubkey: string
+interface HealthInfo
+property HealthInfo.blockHeight: number
+property HealthInfo.channelCount: number
+property HealthInfo.electrumConnected: boolean
+property HealthInfo.graphChannels: number
+property HealthInfo.graphNodes: number
+property HealthInfo.peerCount: number
+property HealthInfo.readyChannelCount: number
+property HealthInfo.status: 'ready' | 'syncing' | 'degraded'
+property HealthInfo.uptime: number
+interface HoldInvoiceEvent
+property HoldInvoiceEvent.cancelHeight: number | null
+property HoldInvoiceEvent.cancelMarginBlocks: number
+property HoldInvoiceEvent.earliestExpiry: number | null
+property HoldInvoiceEvent.heldAmountMsat: string
+property HoldInvoiceEvent.htlcCount: number
+property HoldInvoiceEvent.minFinalCltvExpiry: number
+property HoldInvoiceEvent.paymentHash: PaymentHashHex
+property HoldInvoiceEvent.state: HoldInvoiceInfo['state']
+interface HoldInvoiceInfo
+property HoldInvoiceInfo.amountSats?: number
+property HoldInvoiceInfo.bolt11: string
+property HoldInvoiceInfo.cancelHeight: number | null
+property HoldInvoiceInfo.cancelMarginBlocks: number
+property HoldInvoiceInfo.createdAt: number
+property HoldInvoiceInfo.description?: string
+property HoldInvoiceInfo.earliestExpiry: number | null
+property HoldInvoiceInfo.expiry: number
+property HoldInvoiceInfo.heldAmountMsat: string
+property HoldInvoiceInfo.htlcCount: number
+property HoldInvoiceInfo.minFinalCltvExpiry: number
+property HoldInvoiceInfo.paymentHash: PaymentHashHex
+property HoldInvoiceInfo.state: 'OPEN' | 'ACCEPTED' | 'SETTLED' | 'CANCELLED'
+class HttpRateLimiter
+constructor HttpRateLimiter(options?: RateLimitOptions)
+method HttpRateLimiter.destroy(): void
+method HttpRateLimiter.isAllowed(clientKey: string): boolean
+method HttpRateLimiter.prune(): number
+get HttpRateLimiter.size(): number
+interface IChannelHealth
+property IChannelHealth.capacitySats: number
+property IChannelHealth.channelId: string
+property IChannelHealth.htlcCount: number
+property IChannelHealth.localBalancePct: number
+property IChannelHealth.maxHtlcs: number
+property IChannelHealth.remoteBalancePct: number
+property IChannelHealth.state: string
+property IChannelHealth.warnings: string[]
+interface IGraphRestoreStats
+property IGraphRestoreStats.busyMs: number
+property IGraphRestoreStats.channelRows: number
+property IGraphRestoreStats.constructMs?: number
+property IGraphRestoreStats.cooperative: boolean
+property IGraphRestoreStats.deleteMs: number
+property IGraphRestoreStats.graphChannels: number
+property IGraphRestoreStats.graphMs: number
+property IGraphRestoreStats.graphNodes: number
+property IGraphRestoreStats.loadChannelsMs: number
+property IGraphRestoreStats.loadNodesMs: number
+property IGraphRestoreStats.nodeRows: number
+property IGraphRestoreStats.orphanNodes: number
+property IGraphRestoreStats.pruneMs: number
+property IGraphRestoreStats.reannounceMs: number
+property IGraphRestoreStats.restoreChannelsMs: number
+property IGraphRestoreStats.restoreMs: number
+property IGraphRestoreStats.restoreNodesMs: number
+property IGraphRestoreStats.slices: number
+property IGraphRestoreStats.staleChannels: number
+interface IKeysendOptions
+property IKeysendOptions.amountMsat: bigint
+property IKeysendOptions.customRecords?: Map<number, Buffer>
+property IKeysendOptions.destination: Buffer
+property IKeysendOptions.maxFeeMsat?: bigint
+property IKeysendOptions.metadata?: Record<string, string>
+property IKeysendOptions.preimage?: Buffer
+const INTERRUPTED_PAYMENT_ERROR: string
+interface IOpenChannelOptions
+property IOpenChannelOptions.max?: boolean
+property IOpenChannelOptions.pushSats?: number
+property IOpenChannelOptions.satsPerVbyte?: number
+property IOpenChannelOptions.trusted?: boolean
+interface IPayInvoiceOptions
+property IPayInvoiceOptions.amountSats?: number
+property IPayInvoiceOptions.cltvLimit?: number
+property IPayInvoiceOptions.maxFeeMsat?: number | string
+property IPayInvoiceOptions.maxFeeSats?: number
+property IPayInvoiceOptions.metadata?: Record<string, string>
+property IPayInvoiceOptions.timeoutMs?: number
+interface IPaymentProof
+property IPaymentProof.amountMsat: bigint
+property IPaymentProof.completedAt: number
+property IPaymentProof.invoice?: string
+property IPaymentProof.paymentHash: Buffer
+property IPaymentProof.preimage: Buffer
+property IPaymentProof.route?: beignet/lightning#gossip.IRoute
+interface IPaymentQueueStorage
+method IPaymentQueueStorage.deleteQueueEntry(id: string): void
+method IPaymentQueueStorage.loadAllQueueEntries(): Array<{ id: string; bolt11: string; priority: number; status: string; amountSats?: number; maxFeeSats?: number; metadata?: string; error?: string; createdAt: number; completedAt?: number; }>
+method IPaymentQueueStorage.saveQueueEntry(entry: { id: string; bolt11: string; priority: number; status: string; amountSats?: number; maxFeeSats?: number; metadata?: string; createdAt: number; }): void
+method IPaymentQueueStorage.updateQueueEntryStatus(id: string, status: string, error?: string, completedAt?: number): void
+unexported interface IReportedGuardian
+property IReportedGuardian.guardianId: string
+property IReportedGuardian.transports: Array<{ type: beignet/lightning#recovery.GuardianTransportType; url: string; }>
+interface IStartedDaemon
+property IStartedDaemon.logger?: beignet#ILogger
+property IStartedDaemon.node: BeignetNode
+property IStartedDaemon.server: http#Server
+property IStartedDaemon.stop: (timeoutMs?: number) => Promise<void>
+interface IStructuredLog
+property IStructuredLog.action: string
+property IStructuredLog.category: 'payment' | 'channel' | 'htlc' | 'fee' | 'peer' | 'chain' | 'watchtower' | 'splice' | 'error'
+property IStructuredLog.data: Record<string, unknown>
+property IStructuredLog.timestamp: number
+interface IWebhookStorage
+method IWebhookStorage.deleteAllWebhooks(): void
+method IWebhookStorage.deleteWebhook(id: string): void
+method IWebhookStorage.loadAllWebhooks(): Array<{ id: string; url: string; events: string[]; secretHash?: string; createdAt: number; }>
+method IWebhookStorage.loadWebhookSecrets?(): Record<string, string> | null
+method IWebhookStorage.saveWebhook(id: string, url: string, events: string[], secretHash?: string, createdAt?: number): void
+method IWebhookStorage.saveWebhookSecrets?(secrets: Record<string, string>): void
+type InterruptedPaymentOutcome = { status: 'completed'; paymentHash: string; } | { status: 'unpaid'; }
+class InvalidChannelOpenError extends beignet/lightning#node.InvalidRequestError
+constructor InvalidChannelOpenError(message: string)
+class InvalidSpliceError extends beignet/lightning#node.InvalidRequestError
+constructor InvalidSpliceError(message: string)
+interface InvoiceInfo
+property InvoiceInfo.amountSats?: number
+property InvoiceInfo.bolt11: string
+property InvoiceInfo.createdAt?: number
+property InvoiceInfo.description?: string
+property InvoiceInfo.expiry?: number
+property InvoiceInfo.paymentHash: PaymentHashHex
+property InvoiceInfo.paymentSecret?: string
+property InvoiceInfo.status?: 'PENDING' | 'PAID' | 'EXPIRED'
+unexported interface IrohDaemonConfig
+property IrohDaemonConfig.iroh?: boolean
+property IrohDaemonConfig.irohDiscovery?: boolean
+property IrohDaemonConfig.irohRelays?: string[]
+interface JitQuoteInfo
+property JitQuoteInfo.accepted: boolean
+property JitQuoteInfo.amountSats: number | null
+property JitQuoteInfo.client: { maxFlatFeeSat: number; maxFeePpm: number; }
+property JitQuoteInfo.feePpm: number
+property JitQuoteInfo.feeSats: number
+property JitQuoteInfo.flatFeeSat: number
+property JitQuoteInfo.fundingSats: number
+property JitQuoteInfo.lspPubkey: string
+property JitQuoteInfo.maxClientFundingSats: number
+property JitQuoteInfo.reason: string | null
+property JitQuoteInfo.withinCeilings: boolean
+interface JitStatusInfo
+property JitStatusInfo.client: { maxFlatFeeSat: number; maxFeePpm: number; }
+property JitStatusInfo.enabled: boolean
+property JitStatusInfo.lsp: { flatFeeSat: number; feePpm: number; maxClientFundingSats: number; maxConcurrentFundings: number; maxTotalFundingSats: number | null; maxLiveIntentsPerPeer: number; maxLiveIntents: number; reservedSats: number; frontedSats: number; liveIntents: number; heldParts: number; fundingsInFlight: number; } | null
+enum LightningErrorCode
+member LightningErrorCode.CLTV_EXCEEDS_MAX = "CLTV_EXCEEDS_MAX"
+member LightningErrorCode.DUPLICATE_PAYMENT = "DUPLICATE_PAYMENT"
+member LightningErrorCode.FEE_EXCEEDS_MAX = "FEE_EXCEEDS_MAX"
+member LightningErrorCode.INVALID_INVOICE = "INVALID_INVOICE"
+member LightningErrorCode.INVALID_KEYSEND = "INVALID_KEYSEND"
+member LightningErrorCode.INVOICE_EXPIRED = "INVOICE_EXPIRED"
+member LightningErrorCode.MISSING_AMOUNT = "MISSING_AMOUNT"
+member LightningErrorCode.NO_CHANNEL_TO_HOP = "NO_CHANNEL_TO_HOP"
+member LightningErrorCode.NO_ROUTE = "NO_ROUTE"
+member LightningErrorCode.PAY_ALL_BUDGET_MISMATCH = "PAY_ALL_BUDGET_MISMATCH"
+member LightningErrorCode.PAY_ALL_REMAINDER = "PAY_ALL_REMAINDER"
+member LightningErrorCode.PAY_ALL_REVIEW_EXPIRED = "PAY_ALL_REVIEW_EXPIRED"
+class LightningPaymentError extends CodedError<LightningErrorCode>
+constructor LightningPaymentError(code: LightningErrorCode, message: string)
+interface LiquidityRecommendation
+property LiquidityRecommendation.channelId?: ChannelIdHex
+property LiquidityRecommendation.priority: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'INFO'
+property LiquidityRecommendation.reason: string
+property LiquidityRecommendation.type: 'OPEN_CHANNEL' | 'CLOSE_CHANNEL' | 'REBALANCE_NEEDED' | 'BUY_LEASE'
+interface LiquiditySnapshot
+property LiquiditySnapshot.activeChannelCount: number
+property LiquiditySnapshot.channelCount: number
+property LiquiditySnapshot.inboundLiquidityPct: number
+property LiquiditySnapshot.maxSendableSats: number
+property LiquiditySnapshot.outboundLiquidityPct: number
+property LiquiditySnapshot.recommendations: LiquidityRecommendation[]
+property LiquiditySnapshot.reserveSats: number
+property LiquiditySnapshot.sendableSats: number
+property LiquiditySnapshot.totalCapacitySats: number
+property LiquiditySnapshot.totalLocalBalanceSats: number
+property LiquiditySnapshot.totalRemoteBalanceSats: number
+interface ListenerProblem
+property ListenerProblem.errno?: string
+property ListenerProblem.message: string
+property ListenerProblem.port: number
+property ListenerProblem.state: 'failed' | 'held' | 'fenced'
+interface LogEntry
+property LogEntry.data?: Record<string, unknown>
+property LogEntry.level: LogLevel
+property LogEntry.message: string
+property LogEntry.timestamp: number
+type LogLevel = beignet#TLogLevel
+interface NodeInfo
+property NodeInfo.alias?: string
+property NodeInfo.blockHeight: number
+property NodeInfo.channelCount: number
+property NodeInfo.erroredBalanceSats: number
+property NodeInfo.irohAvailable?: boolean
+property NodeInfo.irohListenError?: ListenerProblem
+property NodeInfo.irohUri?: string
+property NodeInfo.lightningBalanceSats: number
+property NodeInfo.listenError?: ListenerProblem
+property NodeInfo.listenPort?: number
+property NodeInfo.listening: boolean
+property NodeInfo.network: string
+property NodeInfo.nodeId: string
+property NodeInfo.onchainBalanceSats: number
+property NodeInfo.openChannelCount: number
+property NodeInfo.peerCount: number
+property NodeInfo.pendingCloseBalanceSats: number
+property NodeInfo.splicingBalanceSats: number
+property NodeInfo.websocketListenError?: ListenerProblem
+property NodeInfo.websocketPort?: number
+interface NodeStats
+property NodeStats.avgFeePct?: number
+property NodeStats.avgPaymentTimeSec?: number
+property NodeStats.successRate: number
+property NodeStats.totalFeesPaid: number
+property NodeStats.totalPaymentsFailed: number
+property NodeStats.totalPaymentsReceived: number
+property NodeStats.totalPaymentsSent: number
+property NodeStats.totalSatsReceived: number
+property NodeStats.totalSatsSent: number
+property NodeStats.uptimeMs: number
+property NodeStats.windowMs?: number
+interface OfferInfo
+property OfferInfo.absoluteExpiry?: number
+property OfferInfo.amountSats?: number
+property OfferInfo.description: string
+property OfferInfo.encoded?: string
+property OfferInfo.issuer?: string
+property OfferInfo.issuerId?: string
+property OfferInfo.offerId: string
+property OfferInfo.quantityMax?: number
+unexported class OfflineReceive
+constructor OfflineReceive(node: BeignetNode, save: (jobs: OfflineReceiveJob[]) => void, initial: OfflineReceiveJob[], now?: () => number)
+method OfflineReceive.create(body: any, peer: string): Promise<any>
+method OfflineReceive.ownsInvoice(hash: string): boolean
+method OfflineReceive.quote(peer: string, amountSats: number, requestId?: string): Promise<any>
+method OfflineReceive.reservedIds(): Set<string>
+method OfflineReceive.status(): { available: boolean; reservedChannelIds: string[]; requests: { reservedInboundSats?: number | undefined; unresolvedSlots?: number | undefined; kind: OfflineReceiveKind; id: string; peer: string; amountSats: number; allocationId?: string | undefined; channelId?: string | undefined; epochId?: string | undefined; concurrent?: boolean | undefined; concurrentVersion?: 1 | 2 | undefined; previousEpochId?: string | undefined; expiresAt?: number | undefined; invoice?: any; request?: string | undefined; paymentHash?: string | undefined; done?: boolean | undefined; }[]; }
+method OfflineReceive.stop(): void
+method OfflineReceive.sync(): Promise<void>
+unexported type OfflineReceiveJob = { id: string; peer: string; amountSats: number; kind?: OfflineReceiveKind; allocationId?: string; channelId?: string; epochId?: string; concurrent?: boolean; concurrentVersion?: 1 | 2; previousEpochId?: string; expiresAt?: number; invoice?: any; request?: string; paymentHash?: string; done?: boolean; }
+unexported type OfflineReceiveKind = 'bolt11' | 'direct-funding'
+interface OnchainSweepInfo
+property OnchainSweepInfo.address: string
+property OnchainSweepInfo.amountSats?: number
+property OnchainSweepInfo.broadcastAccepted?: boolean
+property OnchainSweepInfo.createdAt: number
+property OnchainSweepInfo.debitSats: number
+property OnchainSweepInfo.error?: string
+property OnchainSweepInfo.feeSats?: number
+property OnchainSweepInfo.requestId: string
+property OnchainSweepInfo.satsPerVbyte?: number
+property OnchainSweepInfo.status: 'preparing' | 'prepared' | 'submitted' | 'confirmed' | 'cancelling' | 'cancelled'
+property OnchainSweepInfo.txid?: TxidHex
+interface OnchainSweepRequest
+property OnchainSweepRequest.address: string
+property OnchainSweepRequest.debitSats: number
+property OnchainSweepRequest.inputOutpoints: Array<{ txid: TxidHex; vout: number; }>
+property OnchainSweepRequest.maxFeeSats: number
+property OnchainSweepRequest.requestId: string
+property OnchainSweepRequest.satsPerVbyte: number
+interface OnchainTxInfo
+property OnchainTxInfo.address: string
+property OnchainTxInfo.channelId?: ChannelIdHex
+property OnchainTxInfo.confirmTimestamp?: number
+property OnchainTxInfo.confirmed: boolean
+property OnchainTxInfo.feeSats: number
+property OnchainTxInfo.height?: number
+property OnchainTxInfo.satsPerVbyte: number
+property OnchainTxInfo.source?: 'cooperative-close' | 'onchain-sweep'
+property OnchainTxInfo.timestamp: number
+property OnchainTxInfo.txid: TxidHex
+property OnchainTxInfo.type: 'sent' | 'received'
+property OnchainTxInfo.valueSats: number
+interface PayAllPayment
+property PayAllPayment.debitMsat: string
+property PayAllPayment.deliveredMsat: string
+property PayAllPayment.feeMsat: string
+property PayAllPayment.maxFeeMsat: string
+property PayAllPayment.remainderMsat: string
+interface PayAllQuote
+property PayAllQuote.debitMsat: string
+property PayAllQuote.maxFeeMsat: string
+property PayAllQuote.minRecipientMsat: string
+property PayAllQuote.remainderMsat: string
+property PayAllQuote.routeFound: boolean
+property PayAllQuote.searchExhausted: boolean
+unexported type PayInvoiceSafeFn = (bolt11: string, timeoutMs?: number, maxFeeSats?: number, amountSats?: number, metadata?: Record<string, string>) => Promise<{ status: string; paymentHash: string; }>
+interface PaymentEstimate
+property PaymentEstimate.alternativeAvailable: boolean
+property PaymentEstimate.estimatedFeeMsat: string
+property PaymentEstimate.estimatedFeeSats: number
+property PaymentEstimate.estimatedTimeMs: number
+property PaymentEstimate.hopCount: number
+property PaymentEstimate.routeQuality: 'HIGH' | 'MEDIUM' | 'LOW'
+property PaymentEstimate.successProbabilityPct: number
+property PaymentEstimate.warning?: string
+interface PaymentFilter
+property PaymentFilter.direction?: 'OUTGOING' | 'INCOMING'
+property PaymentFilter.limit?: number
+property PaymentFilter.metadataKey?: string
+property PaymentFilter.metadataValue?: string
+property PaymentFilter.offset?: number
+property PaymentFilter.since?: number
+property PaymentFilter.status?: 'PENDING' | 'COMPLETED' | 'FAILED'
+type PaymentHashHex = string
+interface PaymentInfo
+property PaymentInfo.amountSats: number
+property PaymentInfo.completedAt?: number
+property PaymentInfo.createdAt: number
+property PaymentInfo.direction: 'OUTGOING' | 'INCOMING'
+property PaymentInfo.failureCode?: number
+property PaymentInfo.failureDescription?: string
+property PaymentInfo.feeSats?: number
+property PaymentInfo.metadata?: Record<string, string>
+property PaymentInfo.payAll?: PayAllPayment
+property PaymentInfo.paymentHash: PaymentHashHex
+property PaymentInfo.preimage?: string
+property PaymentInfo.route?: PaymentRoute
+property PaymentInfo.status: 'PENDING' | 'COMPLETED' | 'FAILED'
+interface PaymentProof
+property PaymentProof.amountSats: number
+property PaymentProof.completedAt: number
+property PaymentProof.feeSats?: number
+property PaymentProof.hopCount?: number
+property PaymentProof.invoice?: string
+property PaymentProof.payAll?: PayAllPayment
+property PaymentProof.paymentHash: PaymentHashHex
+property PaymentProof.preimage: string
+interface PaymentProofVerification
+property PaymentProofVerification.error?: string
+property PaymentProofVerification.proof?: PaymentProof
+property PaymentProofVerification.valid: boolean
+class PaymentQueue extends EventEmitter
+constructor PaymentQueue(payInvoiceSafe: PayInvoiceSafeFn, canSend: CanSendFn, options?: PaymentQueueOptions, storage?: IPaymentQueueStorage)
+get PaymentQueue.activePayments(): number
+method PaymentQueue.cancel(id: string): boolean
+method PaymentQueue.enqueue(bolt11: string, priority?: number, opts?: { amountSats?: number; maxFeeSats?: number; metadata?: Record<string, string>; }): QueuedPayment
+method PaymentQueue.list(): QueuedPayment[]
+get PaymentQueue.pendingCount(): number
+method PaymentQueue.poke(): void
+method PaymentQueue.prune(): number
+method PaymentQueue.resettle(): void
+method PaymentQueue.start(): void
+method PaymentQueue.stop(): void
+interface PaymentQueueOptions
+property PaymentQueueOptions.invoiceAmountSats?: (bolt11: string) => number | undefined
+property PaymentQueueOptions.maxConcurrent?: number
+property PaymentQueueOptions.paymentTimeoutMs?: number
+property PaymentQueueOptions.resolveInterrupted?: (bolt11: string) => Promise<InterruptedPaymentOutcome>
+interface PaymentRoute
+property PaymentRoute.hopCount: number
+property PaymentRoute.hops: PaymentRouteHop[]
+property PaymentRoute.totalFeeMsat: number
+interface PaymentRouteHop
+property PaymentRouteHop.feeMsat: number
+property PaymentRouteHop.pubkey: string
+property PaymentRouteHop.shortChannelId: string
+interface PaymentValidation
+property PaymentValidation.checks: PaymentValidationCheck[]
+property PaymentValidation.invoice?: DecodedInvoice
+property PaymentValidation.status: PaymentValidationStatus
+property PaymentValidation.summary: string
+interface PaymentValidationCheck
+property PaymentValidationCheck.message: string
+property PaymentValidationCheck.name: string
+property PaymentValidationCheck.status: PaymentValidationStatus
+type PaymentValidationStatus = 'OK' | 'WARN' | 'FAIL'
+interface PeerInfo
+property PeerInfo.host: string
+property PeerInfo.iroh?: beignet/lightning#transport.IIrohDiagnostics
+property PeerInfo.port: number
+property PeerInfo.pubkey: string
+property PeerInfo.state: PeerState
+property PeerInfo.transport?: 'tcp' | 'ws' | 'iroh'
+type PeerState = 'ready' | 'connected' | 'connecting' | 'disconnected'
+interface PsbtBuildInfo
+property PsbtBuildInfo.feeSats: number
+property PsbtBuildInfo.inputs: Array<{ txid: TxidHex; vout: number; address: string; valueSats: number; path: string; }>
+property PsbtBuildInfo.outputs: Array<{ address?: string; valueSats: number; }>
+property PsbtBuildInfo.psbtBase64: string
+property PsbtBuildInfo.satsPerVbyte: number
+property PsbtBuildInfo.vsizeEstimate: number
+interface PsbtImportInfo
+property PsbtImportInfo.txHex: string
+property PsbtImportInfo.txid: TxidHex
+interface QueuedPayment
+property QueuedPayment.amountSats?: number
+property QueuedPayment.bolt11: string
+property QueuedPayment.completedAt?: number
+property QueuedPayment.createdAt: number
+property QueuedPayment.error?: string
+property QueuedPayment.id: string
+property QueuedPayment.maxFeeSats?: number
+property QueuedPayment.metadata?: Record<string, string>
+property QueuedPayment.priority: number
+property QueuedPayment.status: 'queued' | 'dispatching' | 'completed' | 'failed' | 'cancelled'
+const ROUTE_SCOPES: Record<string, ApiScope[]>
+interface RateLimitOptions
+property RateLimitOptions.maxClients?: number
+property RateLimitOptions.maxRequests?: number
+property RateLimitOptions.trustedProxies?: string[]
+property RateLimitOptions.windowMs?: number
+interface ReadinessCheck
+property ReadinessCheck.message: string
+property ReadinessCheck.name: string
+property ReadinessCheck.severity: 'CRITICAL' | 'WARNING' | 'INFO'
+property ReadinessCheck.status: 'PASS' | 'WARN' | 'FAIL'
+interface ReadinessReport
+property ReadinessReport.checks: ReadinessCheck[]
+property ReadinessReport.ready: boolean
+property ReadinessReport.score: number
+interface RebalanceAttemptInfo
+property RebalanceAttemptInfo.amountSats: number
+property RebalanceAttemptInfo.error?: string
+property RebalanceAttemptInfo.feeMsat?: string
+property RebalanceAttemptInfo.fromChannelId: ChannelIdHex
+property RebalanceAttemptInfo.status: 'SUCCEEDED' | 'FAILED' | 'SKIPPED_BUDGET'
+property RebalanceAttemptInfo.toChannelId: ChannelIdHex
+interface RebalanceExecutionSummary
+property RebalanceExecutionSummary.attempts: RebalanceAttemptInfo[]
+property RebalanceExecutionSummary.budgetRemainingMsat: string
+property RebalanceExecutionSummary.failed: number
+property RebalanceExecutionSummary.feeSpentMsat: string
+property RebalanceExecutionSummary.skippedBudget: number
+property RebalanceExecutionSummary.succeeded: number
+interface RebalancePlanInfo
+property RebalancePlanInfo.amountSats: number
+property RebalancePlanInfo.fromChannelId: ChannelIdHex
+property RebalancePlanInfo.reason: string
+property RebalancePlanInfo.toChannelId: ChannelIdHex
+interface RebalanceResult
+property RebalanceResult.amountSats: number
+property RebalanceResult.feeMsat: string
+property RebalanceResult.feeSats: number
+property RebalanceResult.hops: number
+property RebalanceResult.paymentHash: PaymentHashHex
+unexported type RecoveryMode = 'off' | 'peer-storage' | 'async-remote' | 'quorum'
+interface RetryPaymentOptions
+property RetryPaymentOptions.amountSats?: number
+property RetryPaymentOptions.backoffMs?: number
+property RetryPaymentOptions.cltvLimit?: number
+property RetryPaymentOptions.maxFeeSats?: number
+property RetryPaymentOptions.maxRetries?: number
+property RetryPaymentOptions.metadata?: Record<string, string>
+interface RetryPaymentResult extends PaymentInfo
+property RetryPaymentResult.attempts: number
+interface RouteEstimate
+property RouteEstimate.cltvDelta: number
+property RouteEstimate.feeMsat: string
+property RouteEstimate.feeSats: number
+property RouteEstimate.hops: number
+interface RouteHop
+property RouteHop.amountToForwardMsat: string
+property RouteHop.cltvExpiryDelta: number
+property RouteHop.feeMsat: string
+property RouteHop.outgoingCltvValue: number
+property RouteHop.pubkey: string
+property RouteHop.shortChannelId: string
+interface RouteQueryResult
+property RouteQueryResult.amountSats: number
+property RouteQueryResult.destination: string
+property RouteQueryResult.finalCltvExpiry: number
+property RouteQueryResult.hops: RouteHop[]
+property RouteQueryResult.totalAmountMsat: string
+property RouteQueryResult.totalCltvDelta: number
+property RouteQueryResult.totalFeeMsat: string
+interface SpliceResult
+property SpliceResult.code?: beignet/lightning#node.SpliceRefusalCode
+property SpliceResult.error?: string
+property SpliceResult.ok: boolean
+unexported interface StoredKeyOverride
+property StoredKeyOverride.configDigest: string
+property StoredKeyOverride.expiresAt?: string
+property StoredKeyOverride.keyDigest?: string
+property StoredKeyOverride.revoked?: boolean
+property StoredKeyOverride.rotatedAt?: string
+interface SwapsStatusInfo
+property SwapsStatusInfo.counts?: Record<string, number>
+property SwapsStatusInfo.enabled: boolean
+property SwapsStatusInfo.exposedCount?: number
+property SwapsStatusInfo.exposedSat?: number
+property SwapsStatusInfo.fee?: { flatFeeSat: number; feePpm: number; }
+property SwapsStatusInfo.limits?: { minSwapSat: number; maxSwapSat: number; maxTotalExposureSat: number; maxConcurrentSwaps: number; }
+property SwapsStatusInfo.submarine?: { enabled: boolean; fee?: { flatFeeSat: number; feePpm: number; }; limits?: { minSwapSat: number; maxSwapSat: number; maxTotalExposureSat: number; maxConcurrentSwaps: number; }; timeouts?: { refundDeltaBlocks: number; fundingConfirmations: number; resolutionConfirmations: number; claimSafetyBlocks: number; paymentMaxFeePpm: number; }; counts?: Record<string, number>; exposedSat?: number; exposedCount?: number; }
+property SwapsStatusInfo.timeouts?: { refundDeltaBlocks: number; fundingConfirmations: number; resolutionConfirmations: number; }
+type TChannelFundingQuote = { method: 'v1' | 'v2'; peerKnown: boolean; satsPerVbyte: number; fundingSatoshis: number; feeSats: number; feeratePerKw?: number; spendableSats?: number; inputCount?: number; vsize?: number; maxSatsPerVbyte?: number; }
+type TOnchainQuote = { satsPerVbyte: number; feeSats: number; vsize: number; maxSendSats?: number; maxSatsPerVbyte: number; }
+interface TrustedPeerInfo
+property TrustedPeerInfo.pubkey: string
+property TrustedPeerInfo.trusted: boolean
+interface TxInfo
+property TxInfo.hex: string
+property TxInfo.txid: TxidHex
+type TxidHex = string
+unexported class TypedEmitter<E extends EventMap<E>> extends EventEmitter
+method TypedEmitter.addListener<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.emit<K extends keyof E & string>(event: K, ...args: Parameters<E[K]>): boolean
+method TypedEmitter.listenerCount<K extends keyof E & string>(event: K): number
+method TypedEmitter.listeners<K extends keyof E & string>(event: K): E[K][]
+method TypedEmitter.off<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.on<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.once<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.prependListener<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.prependOnceListener<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.rawListeners<K extends keyof E & string>(event: K): E[K][]
+method TypedEmitter.removeAllListeners<K extends keyof E & string>(event?: K): this
+method TypedEmitter.removeListener<K extends keyof E & string>(event: K, listener: E[K]): this
+interface UtxoInfo
+property UtxoInfo.address: string
+property UtxoInfo.frozen: boolean
+property UtxoInfo.height: number
+property UtxoInfo.txid: TxidHex
+property UtxoInfo.valueSats: number
+property UtxoInfo.vout: number
+class WebhookManager
+constructor WebhookManager(storage?: IWebhookStorage)
+method WebhookManager.clear(): void
+method WebhookManager.dispatch(eventType: string, data: unknown): void
+method WebhookManager.list(): ./webhooks#WebhookRegistration[]
+method WebhookManager.register(url: string, events: string[], secret?: string): ./webhooks#WebhookRegistration
+get WebhookManager.size(): number
+method WebhookManager.unregister(id: string): boolean
+interface WebhookRegistration
+property WebhookRegistration.createdAt: number
+property WebhookRegistration.events: string[]
+property WebhookRegistration.id: string
+property WebhookRegistration.secret?: string
+property WebhookRegistration.url: string
+function describeFailureCode(code: number): string
+function getOpenApiSpec(): Record<string, unknown>
+function getRouteScopes(routeKey: string): ApiScope[]
+function isBeignetErrorCode(code: unknown): code is BeignetErrorCodeValue
+function isPermanentFailure(err: BeignetError): boolean
+function isRetryableError(err: BeignetError): boolean
+function scopesAllowRoute(scopes: ReadonlySet<ApiScope>, routeKey: string): boolean
+function startDaemon(opts: DaemonOptions): Promise<IStartedDaemon>

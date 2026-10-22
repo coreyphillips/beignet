@@ -23,6 +23,7 @@
     "test:interop:ffor": "npx mocha --exit --timeout 600000 -r ts-node/register tests/lightning/interop/ffor-variant-d-regtest.test.ts",
     "test:interop:ffor-concurrent": "npx mocha --exit --timeout 600000 -r ts-node/register 'tests/lightning/interop/ffor-concurrent-*-regtest.test.ts' tests/lightning/interop/ffor-concurrent-regtest.test.ts",
     "test:local": "node scripts/run-suites.js",
+    "test:api": "npx mocha --exit -r ts-node/register 'tests/api-snapshot/*.test.ts'",
     "example": "ts-node example",
     "beignet": "ts-node src/cli/cli.ts",
     "test:cli": "npx mocha --exit --parallel --timeout 20000 -r ts-node/register --ignore 'tests/cli/daemon-security.test.ts' --ignore 'tests/cli/daemon-integration.test.ts' 'tests/cli/**/*.test.ts'",
@@ -40,6 +41,7 @@
     "docs:tables": "ts-node scripts/doc-tables.ts",
     "docs:check": "ts-node scripts/doc-tables.ts --check",
     "docs:paths": "ts-node scripts/comment-paths.ts",
+    "api:snapshot": "ts-node scripts/api-snapshot.ts",
     "docs:html": "typedoc --out api-docs/html",
     "docs:markdown": "typedoc --plugin typedoc-plugin-markdown --out api-docs/markdown",
     "docs": "npm run docs:tables && npm run docs:html && npm run docs:markdown"

@@ -1,0 +1,960 @@
+# The exported API of beignet. Regenerate with npm run api:snapshot; do not edit.
+const BIP48_SCRIPT_TYPE = "2"
+class BoostError extends CodedError<'NOT_BOOSTABLE' | 'INVALID_FEE' | 'SEND_FAILED'>
+constructor BoostError(code: 'NOT_BOOSTABLE' | 'INVALID_FEE' | 'SEND_FAILED', message: string, cause?: unknown)
+class CodedError<C extends string = string> extends Error
+constructor CodedError(code: C, message: string, options?: { cause?: unknown; })
+readonly property CodedError.cause?: unknown
+readonly property CodedError.code: C
+type CryptoPrimitive = 'sha256' | 'hmacSha256' | 'hkdfSha256' | 'aes256Gcm' | 'chacha20Poly1305' | 'chacha20' | 'randomBytes'
+enum EAddressType
+member EAddressType.p2pkh = "p2pkh"
+member EAddressType.p2sh = "p2sh"
+member EAddressType.p2tr = "p2tr"
+member EAddressType.p2wpkh = "p2wpkh"
+member EAddressType.p2wsh = "p2wsh"
+type EAvailableNetworks = Network
+namespace EAvailableNetworks
+const EAvailableNetworks.bitcoin = Network.bitcoin
+type EAvailableNetworks.bitcoin = Network.bitcoin
+const EAvailableNetworks.bitcoinMainnet = Network.bitcoin
+type EAvailableNetworks.bitcoinMainnet = Network.bitcoin
+const EAvailableNetworks.bitcoinRegtest = Network.regtest
+type EAvailableNetworks.bitcoinRegtest = Network.regtest
+const EAvailableNetworks.bitcoinSignet = Network.signet
+type EAvailableNetworks.bitcoinSignet = Network.signet
+const EAvailableNetworks.bitcoinTestnet = Network.testnet
+type EAvailableNetworks.bitcoinTestnet = Network.testnet
+const EAvailableNetworks.mainnet = Network.bitcoin
+type EAvailableNetworks.mainnet = Network.bitcoin
+const EAvailableNetworks.regtest = Network.regtest
+type EAvailableNetworks.regtest = Network.regtest
+const EAvailableNetworks.signet = Network.signet
+type EAvailableNetworks.signet = Network.signet
+const EAvailableNetworks.testnet = Network.testnet
+type EAvailableNetworks.testnet = Network.testnet
+enum EBoostType
+member EBoostType.cpfp = "cpfp"
+member EBoostType.rbf = "rbf"
+enum ECoinSelectPreference
+member ECoinSelectPreference.consolidate = "consolidate"
+member ECoinSelectPreference.firstInFirstOut = "firstInFirstOut"
+member ECoinSelectPreference.large = "large"
+member ECoinSelectPreference.lastInFirstOut = "lastInFirstOut"
+member ECoinSelectPreference.small = "small"
+enum EElectrumNetworks
+member EElectrumNetworks.bitcoin = "bitcoin"
+member EElectrumNetworks.bitcoinRegtest = "bitcoinRegtest"
+member EElectrumNetworks.bitcoinSignet = "bitcoinSignet"
+member EElectrumNetworks.bitcoinTestnet = "bitcoinTestnet"
+enum EFeeId
+member EFeeId.custom = "custom"
+member EFeeId.fast = "fast"
+member EFeeId.none = "none"
+member EFeeId.normal = "normal"
+member EFeeId.slow = "slow"
+enum EPaymentType
+member EPaymentType.received = "received"
+member EPaymentType.sent = "sent"
+enum EProtocol
+member EProtocol.ssl = "ssl"
+member EProtocol.tcp = "tcp"
+enum EScanningStrategy
+member EScanningStrategy.all = "all"
+member EScanningStrategy.gapLimit = "gapLimit"
+member EScanningStrategy.singleIndex = "singleIndex"
+member EScanningStrategy.startingIndex = "startingIndex"
+enum EUnit
+member EUnit.BTC = "BTC"
+member EUnit.fiat = "fiat"
+member EUnit.satoshi = "satoshi"
+enum EWalletErrorCode
+member EWalletErrorCode.FEE_EXCEEDS_HALF_INPUTS = "FEE_EXCEEDS_HALF_INPUTS"
+member EWalletErrorCode.FEE_EXCEEDS_HALF_OUTPUTS = "FEE_EXCEEDS_HALF_OUTPUTS"
+member EWalletErrorCode.REPLACEMENT_FEE_TOO_LOW = "REPLACEMENT_FEE_TOO_LOW"
+member EWalletErrorCode.UNSPECIFIED = "UNSPECIFIED"
+class Electrum
+constructor Electrum({ wallet, network, net, tls, servers, batchLimit, batchDelay, onReceive, pollConnection }: { wallet: Wallet; network: Network; net: Net; tls: Tls; servers?: TServer | TServer[]; batchLimit?: number; batchDelay?: number; onReceive?: (data: unknown) => void; pollConnection?: boolean; })
+method Electrum.abandon(): Promise<void>
+method Electrum.answeredRecently(): boolean
+property Electrum.batchDelay: number
+property Electrum.batchLimit: number
+method Electrum.broadcastTransaction({ rawTx, subscribeToOutputAddress }: { rawTx: string; subscribeToOutputAddress?: boolean; }): Promise<Result<string>>
+method Electrum.connectToElectrum(args: { network?: Network; servers?: TServer | TServer[]; disableRegtestCheck?: boolean; }): Promise<Result<TConnectToElectrumRes>>
+property Electrum.connectedToElectrum: boolean
+get Electrum.currentServer(): TServer | null
+method Electrum.disconnect(): Promise<void>
+property Electrum.electrumNetwork: EElectrumNetworks
+method Electrum.getAddressBalance(scriptHash: string): Promise<IElectrumGetAddressBalanceRes>
+method Electrum.getAddressHistory({ scriptHashes, scanAllAddresses, answered }: { scriptHashes?: IAddress[]; scanAllAddresses?: boolean; answered?: Map<string, TTxResult[]>; }): Promise<Result<IGetAddressHistoryResponse[]>>
+method Electrum.getAddressScriptHashBalances(scriptHashes: string[]): Promise<IGetAddressScriptHashBalances>
+method Electrum.getAddressScriptHashesHistory(scriptHashes?: string[]): Promise<Result<IGetAddressTxResponse>>
+method Electrum.getBlockHashFromHex({ blockHex }: { blockHex?: string; }): string
+method Electrum.getBlockHeader(): IHeader
+method Electrum.getBlockHex({ height }: { height?: number; }): Promise<Result<string>>
+method Electrum.getConnectedPeer(): Promise<Result<IPeerData>>
+method Electrum.getFeeEstimate(blocksWillingToWait: number): Promise<Result<number>>
+method Electrum.getScriptPubKeyHistory(scriptPubkey: string): Promise<TGetAddressHistory[]>
+method Electrum.getTransactionMerkle({ tx_hash, height }: { tx_hash: string; height: number; }): Promise<{ merkle: string[]; block_height: number; pos: number; }>
+method Electrum.getTransactions({ txHashes }: { txHashes: ITxHash[]; }): Promise<Result<IGetTransactions>>
+method Electrum.getTransactionsFromInputs({ txHashes }: { txHashes: ITxHash[]; }): Promise<Result<IGetTransactionsFromInputs>>
+method Electrum.getUtxos({ scanningStrategy, addressIndex, changeAddressIndex, addressTypesToCheck, additionalAddresses, additionalScriptHashes }: { scanningStrategy?: EScanningStrategy; addressIndex?: number; changeAddressIndex?: number; addressTypesToCheck?: EAddressType[]; additionalAddresses?: string[]; additionalScriptHashes?: IAddresses; }): Promise<Result<IGetUtxosResponse>>
+method Electrum.isConnected(): Promise<boolean>
+get Electrum.isDisconnected(): boolean
+method Electrum.listUnspentAddressScriptHashes({ addresses, rejectFailedEntries }: { addresses: TUnspentAddressScriptHashData; rejectFailedEntries?: boolean; }): Promise<Result<IGetUtxosResponse>>
+property Electrum.network: Network
+property Electrum.onReceive?: (data: unknown) => void
+method Electrum.pingHeaderSubscription(): Promise<Result<IHeader>>
+method Electrum.removeScriptHashCallback({ scriptHash, onReceive }: { scriptHash: string; onReceive: (data: TSubscribedReceive) => void; }): boolean
+get Electrum.rotationCount(): number
+property Electrum.servers?: TServer | TServer[]
+method Electrum.startConnectionPolling(): void
+method Electrum.stopConnectionPolling(): void
+method Electrum.subscribeToAddresses({ scriptHashes, onReceive }?: { scriptHashes?: string[]; onReceive?: (data: TSubscribedReceive) => void; }): Promise<Result<string>>
+method Electrum.subscribeToHeader(): Promise<Result<IHeader>>
+method Electrum.transactionExists(txData: ITransaction<IUtxo>): boolean
+method Electrum.transactionMissingWithoutTxindex(txData: ITransaction<IUtxo>): boolean
+method Electrum.utxoScanAddresses({ scanningStrategy, addressIndex, changeAddressIndex, addressTypesToCheck, additionalAddresses }: { scanningStrategy?: EScanningStrategy; addressIndex?: number; changeAddressIndex?: number; addressTypesToCheck?: EAddressType[]; additionalAddresses?: string[]; }): IAddresses
+get Electrum.wallet(): Wallet
+type ElectrumConnectionPubSub = { publish: (isConnected: boolean) => void; subscribe: (callback: (isConnected: boolean) => void) => ElectrumConnectionSubscription; }
+type ElectrumConnectionSubscription = { remove(): void; }
+unexported class Err<T>
+constructor Err(error: CodedError)
+readonly property Err.error: CodedError
+method Err.isErr(): this is Err<T>
+method Err.isOk(): this is Ok<T>
+interface IAddInput
+property IAddInput.input: IUtxo
+property IAddInput.keyPair?: bip32#BIP32Interface | ecpair#ECPairInterface
+property IAddInput.prevTxs?: Result<Map<string, string>>
+property IAddInput.psbt: bitcoinjs-lib#Psbt
+interface IAddress
+property IAddress.address: string
+property IAddress.index: number
+property IAddress.path: string
+property IAddress.publicKey: string
+property IAddress.scriptHash: string
+interface IAddressData
+property IAddressData.label: string
+property IAddressData.path: string
+property IAddressData.type: 'p2wpkh' | 'p2sh' | 'p2pkh'
+interface IAddressType
+index IAddressType[key: string]: IAddressData
+interface IAddressTypeData
+property IAddressTypeData.description: string
+property IAddressTypeData.example: string
+property IAddressTypeData.name: string
+property IAddressTypeData.path: string
+property IAddressTypeData.shortName: string
+property IAddressTypeData.type: EAddressType
+interface IAddressTypesIO
+property IAddressTypesIO.inputs: { [key in EAddressType]: number; }
+property IAddressTypesIO.outputs: { [key in EAddressType]: number; }
+interface IAddresses
+index IAddresses[scriptHash: string]: IAddress
+interface IBalanceBreakdown
+property IBalanceBreakdown.frozen: number
+property IBalanceBreakdown.spendable: number
+property IBalanceBreakdown.total: number
+interface IBoost
+property IBoost.satsPerByte?: number
+property IBoost.txid: string
+property IBoost.type: EBoostType
+interface IBoostRes
+property IBoostRes.fee: number
+property IBoostRes.hex: string
+property IBoostRes.id: string
+interface IBoostedTransaction
+property IBoostedTransaction.childTransaction: string
+property IBoostedTransaction.fee: number
+property IBoostedTransaction.parentTransactions: string[]
+property IBoostedTransaction.type: EBoostType
+interface IBoostedTransactions
+index IBoostedTransactions[txId: string]: IBoostedTransaction
+interface IBtInfo
+property IBtInfo.nodes: ILspNode[]
+property IBtInfo.onchain: { network: Network; feeRates: { fast: number; mid: number; slow: number; }; }
+property IBtInfo.options: { minChannelSizeSat: number; maxChannelSizeSat: number; minExpiryWeeks: number; maxExpiryWeeks: number; minPaymentConfirmations: number; minHighRiskPaymentConfirmations: number; max0ConfClientBalanceSat: number; maxClientBalanceSat: number; }
+property IBtInfo.version: number
+property IBtInfo.versions: { http: string; btc: string; ln2: string; }
+interface IBuildPsbtArgs
+property IBuildPsbtArgs.address?: string
+property IBuildPsbtArgs.amount?: number
+property IBuildPsbtArgs.message?: string
+property IBuildPsbtArgs.rbf?: boolean
+property IBuildPsbtArgs.satsPerByte?: number
+property IBuildPsbtArgs.shuffleOutputs?: boolean
+property IBuildPsbtArgs.txs?: ISendTx[]
+interface IBuildPsbtInputSummary
+property IBuildPsbtInputSummary.address: string
+property IBuildPsbtInputSummary.path: string
+property IBuildPsbtInputSummary.tx_hash: string
+property IBuildPsbtInputSummary.tx_pos: number
+property IBuildPsbtInputSummary.value: number
+interface IBuildPsbtOutputSummary
+property IBuildPsbtOutputSummary.address?: string
+property IBuildPsbtOutputSummary.index: number
+property IBuildPsbtOutputSummary.value: number
+interface IBuildPsbtResponse
+property IBuildPsbtResponse.fee: number
+property IBuildPsbtResponse.inputs: IBuildPsbtInputSummary[]
+property IBuildPsbtResponse.outputs: IBuildPsbtOutputSummary[]
+property IBuildPsbtResponse.psbtBase64: string
+property IBuildPsbtResponse.satsPerByte: number
+property IBuildPsbtResponse.vsizeEstimate: number
+interface ICanBoostResponse
+property ICanBoostResponse.canBoost: boolean
+property ICanBoostResponse.cpfp: boolean
+property ICanBoostResponse.rbf: boolean
+interface ICoinSelectResponse
+property ICoinSelectResponse.fee: number
+property ICoinSelectResponse.inputs: IUtxo[]
+property ICoinSelectResponse.outputs: IOutput[]
+interface ICoinbaseVin
+property ICoinbaseVin.coinbase: string
+property ICoinbaseVin.sequence: number
+property ICoinbaseVin.txinwitness?: string[]
+interface IConsoleSink
+method IConsoleSink.debug(message?: unknown, ...optionalParams: unknown[]): void
+method IConsoleSink.error(message?: unknown, ...optionalParams: unknown[]): void
+method IConsoleSink.info(message?: unknown, ...optionalParams: unknown[]): void
+method IConsoleSink.warn(message?: unknown, ...optionalParams: unknown[]): void
+interface ICreateSignedTransactionArgs extends IBuildPsbtArgs
+property ICreateSignedTransactionArgs.max?: boolean
+interface ICreateTransaction
+property ICreateTransaction.runCoinSelect?: boolean
+property ICreateTransaction.shuffleOutputs?: boolean
+property ICreateTransaction.spendFrozen?: boolean
+property ICreateTransaction.transactionData?: ISendTransaction
+interface ICryptoProvider
+method ICryptoProvider.aes256GcmDecrypt(key: Uint8Array, iv: Uint8Array, sealed: Uint8Array, aad: Uint8Array): Uint8Array
+method ICryptoProvider.aes256GcmEncrypt(key: Uint8Array, iv: Uint8Array, plaintext: Uint8Array, aad: Uint8Array): Uint8Array
+method ICryptoProvider.chacha20(key: Uint8Array, nonce: Uint8Array, data: Uint8Array): Uint8Array
+method ICryptoProvider.chacha20Poly1305Decrypt(key: Uint8Array, nonce: Uint8Array, sealed: Uint8Array, aad: Uint8Array): Uint8Array
+method ICryptoProvider.chacha20Poly1305Encrypt(key: Uint8Array, nonce: Uint8Array, plaintext: Uint8Array, aad: Uint8Array): Uint8Array
+method ICryptoProvider.hkdfSha256(ikm: Uint8Array, salt: Uint8Array, info: Uint8Array, length: number): Uint8Array
+method ICryptoProvider.hmacSha256(key: Uint8Array, data: Uint8Array): Uint8Array
+method ICryptoProvider.randomBytes(size: number): Uint8Array
+method ICryptoProvider.sha256(data: Uint8Array): Uint8Array
+interface ICustomGetAddress
+property ICustomGetAddress.path: string
+property ICustomGetAddress.selectedNetwork: EElectrumNetworks
+property ICustomGetAddress.type: EAddressType
+interface ICustomGetScriptHash
+property ICustomGetScriptHash.address: string
+property ICustomGetScriptHash.selectedNetwork: EElectrumNetworks
+interface IElectrumGetAddressBalanceRes extends IGetAddressBalanceRes
+property IElectrumGetAddressBalanceRes.error: boolean
+interface IEncodeBip21
+property IEncodeBip21.address: string
+property IEncodeBip21.amountSats?: number
+property IEncodeBip21.label?: string
+property IEncodeBip21.message?: string
+interface IExportDescriptorsResponse
+property IExportDescriptorsResponse.account: number
+property IExportDescriptorsResponse.birthdayHeight?: number
+property IExportDescriptorsResponse.descriptors: IExportedDescriptor[]
+property IExportDescriptorsResponse.fingerprint: string
+property IExportDescriptorsResponse.network: Network
+property IExportDescriptorsResponse.watchOnly: boolean
+interface IExportedDescriptor
+property IExportedDescriptor.addressType: EAddressType
+property IExportedDescriptor.external: string
+property IExportedDescriptor.internal: string
+interface IFormattedPeerData
+property IFormattedPeerData.host: string
+property IFormattedPeerData.ip?: string
+property IFormattedPeerData.ssl: string | number
+property IFormattedPeerData.tcp: string | number
+property IFormattedPeerData.version?: string
+interface IFormattedTransaction
+property IFormattedTransaction.address: string
+property IFormattedTransaction.blockhash?: string
+property IFormattedTransaction.confirmTimestamp?: number
+property IFormattedTransaction.exists?: boolean
+property IFormattedTransaction.fee: number
+property IFormattedTransaction.feeSats?: Sats
+property IFormattedTransaction.height?: number
+property IFormattedTransaction.matchedInputSats?: Sats
+property IFormattedTransaction.matchedInputValue: number
+property IFormattedTransaction.matchedOutputSats?: Sats
+property IFormattedTransaction.matchedOutputValue: number
+property IFormattedTransaction.messages: string[]
+property IFormattedTransaction.rbf?: boolean
+property IFormattedTransaction.satsPerByte: number
+property IFormattedTransaction.scriptHash: string
+property IFormattedTransaction.timestamp: number
+property IFormattedTransaction.totalInputSats?: Sats
+property IFormattedTransaction.totalInputValue: number
+property IFormattedTransaction.totalOutputSats?: Sats
+property IFormattedTransaction.totalOutputValue: number
+property IFormattedTransaction.txid: string
+property IFormattedTransaction.type: EPaymentType
+property IFormattedTransaction.value: number
+property IFormattedTransaction.valueSats?: Sats
+property IFormattedTransaction.vin: TFormattedVin[]
+property IFormattedTransaction.vsize: number
+interface IFormattedTransactions
+index IFormattedTransactions[key: string]: IFormattedTransaction
+interface IGenerateAddresses
+property IGenerateAddresses.addressAmount?: number
+property IGenerateAddresses.addressIndex?: number
+property IGenerateAddresses.addressType?: EAddressType
+property IGenerateAddresses.changeAddressAmount?: number
+property IGenerateAddresses.changeAddressIndex?: number
+property IGenerateAddresses.keyDerivationPath?: IKeyDerivationPath
+property IGenerateAddresses.saveAddresses?: boolean
+interface IGenerateAddressesResponse
+property IGenerateAddressesResponse.addresses: IAddresses
+property IGenerateAddressesResponse.changeAddresses: IAddresses
+interface IGetAddress
+property IGetAddress.addressType?: EAddressType
+property IGetAddress.changeAddress?: boolean
+property IGetAddress.index?: TKeyDerivationIndex
+interface IGetAddressBalanceRes
+property IGetAddressBalanceRes.confirmed: number
+property IGetAddressBalanceRes.unconfirmed: number
+interface IGetAddressByPath
+property IGetAddressByPath.addressType?: EAddressType
+property IGetAddressByPath.path: string
+interface IGetAddressHistoryResponse extends TTxResult, IAddress
+interface IGetAddressResponse
+property IGetAddressResponse.address: string
+property IGetAddressResponse.path: string
+property IGetAddressResponse.publicKey: string
+interface IGetAddressScriptHashBalances
+property IGetAddressScriptHashBalances.data: Array<{ id: number; jsonrpc: string; result: { confirmed: number; unconfirmed: number; }; param: string; data: Record<string, unknown>; }> | string
+property IGetAddressScriptHashBalances.error: boolean
+property IGetAddressScriptHashBalances.id: number
+property IGetAddressScriptHashBalances.method: string
+property IGetAddressScriptHashBalances.network: EElectrumNetworks
+interface IGetAddressScriptHashesHistoryResponse
+property IGetAddressScriptHashesHistoryResponse.data: TTxResponse[]
+property IGetAddressScriptHashesHistoryResponse.error: boolean
+property IGetAddressScriptHashesHistoryResponse.id: number
+property IGetAddressScriptHashesHistoryResponse.method: string
+property IGetAddressScriptHashesHistoryResponse.network: string
+interface IGetAddressTxResponse
+property IGetAddressTxResponse.data: TAddressTxResponse[]
+property IGetAddressTxResponse.error: boolean
+property IGetAddressTxResponse.id: number
+property IGetAddressTxResponse.method: string
+property IGetAddressTxResponse.network: string
+interface IGetAddressesFromKeyPair
+property IGetAddressesFromKeyPair.address: string
+property IGetAddressesFromKeyPair.publicKey: string
+interface IGetAddressesFromPrivateKey
+property IGetAddressesFromPrivateKey.addresses: IGetAddressesFromKeyPair[]
+property IGetAddressesFromPrivateKey.keyPair: bip32#BIP32Interface | ecpair#ECPairInterface
+interface IGetDerivationPath extends IKeyDerivationPath
+property IGetDerivationPath.addressType?: EAddressType
+interface IGetFeeEstimatesResponse
+property IGetFeeEstimatesResponse.fastestFee: number
+property IGetFeeEstimatesResponse.halfHourFee: number
+property IGetFeeEstimatesResponse.hourFee: number
+property IGetFeeEstimatesResponse.minimumFee: number
+interface IGetHeaderResponse
+property IGetHeaderResponse.data: string
+property IGetHeaderResponse.error: boolean
+property IGetHeaderResponse.id: number
+property IGetHeaderResponse.method: 'getHeader'
+property IGetHeaderResponse.network: Network
+interface IGetNextAvailableAddressResponse
+property IGetNextAvailableAddressResponse.addressIndex: IAddress
+property IGetNextAvailableAddressResponse.changeAddressIndex: IAddress
+property IGetNextAvailableAddressResponse.lastUsedAddressIndex: IAddress
+property IGetNextAvailableAddressResponse.lastUsedChangeAddressIndex: IAddress
+interface IGetTransactions
+property IGetTransactions.data: ITransaction<IUtxo>[]
+property IGetTransactions.error: boolean
+property IGetTransactions.id: number
+property IGetTransactions.method: string
+property IGetTransactions.network: string
+interface IGetTransactionsFromInputs
+property IGetTransactionsFromInputs.data: ITransaction<{ tx_hash: string; vout: number; }>[]
+property IGetTransactionsFromInputs.error: boolean
+property IGetTransactionsFromInputs.id: number
+property IGetTransactionsFromInputs.method: string
+property IGetTransactionsFromInputs.network: string
+interface IGetUtxosResponse
+property IGetUtxosResponse.balance: number
+property IGetUtxosResponse.utxos: IUtxo[]
+interface IHeader
+property IHeader.hash: string
+property IHeader.height: number
+property IHeader.hex: string
+interface IImportSignedPsbtResponse
+property IImportSignedPsbtResponse.txHex: string
+property IImportSignedPsbtResponse.txid: string
+interface IIndexedOutpoint
+property IIndexedOutpoint.index: number
+property IIndexedOutpoint.txid: string
+interface IIndexes
+property IIndexes.addressIndex: IAddress
+property IIndexes.changeAddressIndex: IAddress
+property IIndexes.foundAddressIndex: boolean
+property IIndexes.foundChangeAddressIndex: boolean
+interface IKeyDerivationPath
+property IKeyDerivationPath.account?: TKeyDerivationAccount
+property IKeyDerivationPath.change?: TKeyDerivationChange
+property IKeyDerivationPath.coinType?: TKeyDerivationCoinType
+property IKeyDerivationPath.index?: TKeyDerivationIndex
+property IKeyDerivationPath.purpose?: TKeyDerivationPurpose
+interface IKeyDerivationPathData
+property IKeyDerivationPathData.pathObject: IKeyDerivationPath
+property IKeyDerivationPathData.pathString: string
+interface IKeyOrigin
+property IKeyOrigin.fingerprint: Buffer
+property IKeyOrigin.path?: string
+interface ILogger
+method ILogger.debug(message: string, meta?: unknown): void
+method ILogger.error(message: string, meta?: unknown): void
+method ILogger.info(message: string, meta?: unknown): void
+method ILogger.warn(message: string, meta?: unknown): void
+unexported interface ILspNode
+property ILspNode.alias: string
+property ILspNode.connectionStrings: string[]
+property ILspNode.pubkey: string
+interface IMultisigCosigner
+property IMultisigCosigner.masterFingerprint?: string
+property IMultisigCosigner.originPath?: string
+property IMultisigCosigner.xpub: string
+interface IMultisigOptions
+property IMultisigOptions.cosigners: (string | IMultisigCosigner)[]
+property IMultisigOptions.ourXpub?: string
+property IMultisigOptions.threshold: number
+type IMultisigWallet = Omit<IWallet, 'xpub' | 'addressType'> & IMultisigOptions
+interface INewBlock
+property INewBlock.height: number
+property INewBlock.hex: string
+interface IOnchainFees
+property IOnchainFees.fast: number
+property IOnchainFees.minimum: number
+property IOnchainFees.normal: number
+property IOnchainFees.slow: number
+property IOnchainFees.timestamp: number
+interface IOutpoint
+property IOutpoint.txid: string
+property IOutpoint.vout: number
+interface IOutput
+property IOutput.address: string
+property IOutput.index: number
+property IOutput.value: number
+interface IParsedBip48Path
+property IParsedBip48Path.account: string
+property IParsedBip48Path.change: number
+property IParsedBip48Path.coinType: string
+property IParsedBip48Path.index: number
+interface IParsedExtendedPublicKey
+property IParsedExtendedPublicKey.addressType?: EAddressType
+property IParsedExtendedPublicKey.node: bip32#BIP32Interface
+interface IPeerData
+property IPeerData.host: string
+property IPeerData.port: string
+property IPeerData.protocol: `${EProtocol}`
+interface IPrivateKeyInfo
+property IPrivateKeyInfo.addresses: IGetAddressesFromKeyPair[]
+property IPrivateKeyInfo.balance: number
+property IPrivateKeyInfo.keyPair: ecpair#ECPairInterface | bip32#BIP32Interface
+property IPrivateKeyInfo.utxos: IUtxo[]
+interface IRbfData
+property IRbfData.addressType: EAddressType
+property IRbfData.balance: number
+property IRbfData.changeAddress: string
+property IRbfData.fee: number
+property IRbfData.inputs: IUtxo[]
+property IRbfData.message: string
+property IRbfData.outputs: IOutput[]
+interface ISend
+property ISend.satsPerByte?: number
+property ISend.txs: ISendTx | ISendTx[]
+interface ISendTransaction
+property ISendTransaction.boostType: EBoostType
+property ISendTransaction.changeAddress: string
+property ISendTransaction.fee: number
+property ISendTransaction.fiatAmount: number
+property ISendTransaction.inputs: IUtxo[]
+property ISendTransaction.label: string
+property ISendTransaction.lightningInvoice?: string
+property ISendTransaction.max: boolean
+property ISendTransaction.message: string
+property ISendTransaction.minFee: number
+property ISendTransaction.outputs: IOutput[]
+property ISendTransaction.rbf: boolean
+property ISendTransaction.satsPerByte: number
+property ISendTransaction.selectedFeeId: EFeeId
+property ISendTransaction.slashTagsUrl?: string
+property ISendTransaction.tags: string[]
+interface ISendTx
+property ISendTx.address: string
+property ISendTx.amount: number
+property ISendTx.message?: string
+interface ISetupTransaction
+property ISetupTransaction.inputTxHashes?: string[]
+property ISetupTransaction.outputs?: IOutput[]
+property ISetupTransaction.rbf?: boolean
+property ISetupTransaction.satsPerByte?: number
+property ISetupTransaction.utxos?: IUtxo[]
+interface ISignedTransaction
+property ISignedTransaction.txHex: string
+property ISignedTransaction.txid: string
+interface ISortedMultisigPayment
+property ISortedMultisigPayment.address: string
+property ISortedMultisigPayment.output: Buffer
+property ISortedMultisigPayment.sortedPublicKeys: Buffer[]
+property ISortedMultisigPayment.witnessScript: Buffer
+interface ISubscribeToAddress
+property ISubscribeToAddress.data: { id: number; jsonrpc: string; result: null; }
+property ISubscribeToAddress.error: boolean
+property ISubscribeToAddress.id: number
+property ISubscribeToAddress.method: string
+interface ISubscribeToHeader
+property ISubscribeToHeader.data: { height: number; hex: string; }
+property ISubscribeToHeader.error: boolean
+property ISubscribeToHeader.id: string
+property ISubscribeToHeader.method: string
+interface ISweepPrivateKey
+property ISweepPrivateKey.broadcast?: boolean
+property ISweepPrivateKey.combineWithWalletUtxos?: boolean
+property ISweepPrivateKey.privateKey: string
+property ISweepPrivateKey.satsPerByte?: number
+property ISweepPrivateKey.toAddress: string
+interface ISweepPrivateKeyRes
+property ISweepPrivateKeyRes.balance: number
+property ISweepPrivateKeyRes.hex: string
+property ISweepPrivateKeyRes.id: string
+interface ITargets
+property ITargets.address?: string
+property ITargets.index: number
+property ITargets.script?: Buffer
+property ITargets.value: number
+interface ITransaction<T>
+property ITransaction.data: T
+property ITransaction.error?: { code: number; message: string; }
+property ITransaction.id: number
+property ITransaction.jsonrpc: string
+property ITransaction.param: string
+property ITransaction.result: TTxDetails
+interface ITxHash
+property ITxHash.tx_hash: string
+interface ITxHashes extends TTxResult
+property ITxHashes.scriptHash: string
+interface IUtxo
+property IUtxo.address: string
+property IUtxo.freezeTag?: string
+property IUtxo.frozenAt?: number
+property IUtxo.height: number
+property IUtxo.index: number
+property IUtxo.keyPair?: bip32#BIP32Interface | ecpair#ECPairInterface
+property IUtxo.path: string
+property IUtxo.publicKey: string
+property IUtxo.scriptHash: string
+property IUtxo.tx_hash: string
+property IUtxo.tx_pos: number
+property IUtxo.value: number
+interface IVin
+property IVin.scriptSig: { asm: string; hex: string; }
+property IVin.sequence: number
+property IVin.txid: string
+property IVin.txinwitness: string[]
+property IVin.vout: number
+interface IVout
+property IVout.n: number
+property IVout.scriptPubKey: { addresses?: string[]; address?: string; asm: string; hex: string; reqSigs?: number; type?: string; }
+property IVout.value: number
+interface IWallet
+property IWallet.account?: number
+property IWallet.addressLookAhead?: number
+property IWallet.addressLookBehind?: number
+property IWallet.addressType?: EAddressType
+property IWallet.addressTypesToMonitor?: EAddressType[]
+property IWallet.birthdayHeight?: number
+property IWallet.coinSelectPreference?: ECoinSelectPreference
+property IWallet.customGetAddress?: (data: ICustomGetAddress) => Promise<Result<IGetAddressResponse>>
+property IWallet.customGetScriptHash?: (data: ICustomGetScriptHash) => Promise<string>
+property IWallet.data?: IWalletData
+property IWallet.disableMessages?: boolean
+property IWallet.disableMessagesOnCreate?: boolean
+property IWallet.disableRefreshOnCreate?: boolean
+property IWallet.electrumOptions: { net: Net; tls: Tls; servers?: TServer | TServer[]; batchLimit?: number; batchDelay?: number; }
+property IWallet.feeEstimationSource?: TFeeEstimationSource
+property IWallet.gapLimitOptions?: TGapLimitOptions
+property IWallet.id?: string
+property IWallet.logger?: ILogger
+property IWallet.masterFingerprint?: string
+property IWallet.mnemonic?: string
+property IWallet.multisig?: IMultisigOptions
+property IWallet.name?: string
+property IWallet.network?: Network
+property IWallet.onMessage?: TOnMessage
+property IWallet.originPath?: string
+property IWallet.passphrase?: string
+property IWallet.rbf?: boolean
+property IWallet.remainOffline?: boolean
+property IWallet.resetOnReadFailure?: boolean
+property IWallet.seed?: Buffer
+property IWallet.selectedFeeId?: EFeeId
+property IWallet.storage?: TStorage
+property IWallet.xpub?: string
+interface IWalletData
+property IWalletData.addressIndex: TAddressTypeContent<IAddress>
+property IWalletData.addressLabels: TAddressLabels
+property IWalletData.addressType: EAddressType
+property IWalletData.addresses: TAddressTypeContent<IAddresses>
+property IWalletData.balance: number
+property IWalletData.birthdayHeight: number
+property IWalletData.blacklistedUtxos: IUtxo[]
+property IWalletData.boostedTransactions: IBoostedTransactions
+property IWalletData.changeAddressIndex: TAddressTypeContent<IAddress>
+property IWalletData.changeAddresses: TAddressTypeContent<IAddresses>
+property IWalletData.feeEstimates: IOnchainFees
+property IWalletData.header: IHeader
+property IWalletData.id: string
+property IWalletData.lastUsedAddressIndex: TAddressTypeContent<IAddress>
+property IWalletData.lastUsedChangeAddressIndex: TAddressTypeContent<IAddress>
+property IWalletData.selectedFeeId: EFeeId
+property IWalletData.transaction: ISendTransaction
+property IWalletData.transactions: IFormattedTransactions
+property IWalletData.unconfirmedTransactions: IFormattedTransactions
+property IWalletData.utxos: IUtxo[]
+type IWatchOnlyWallet = Omit<IWallet, 'mnemonic' | 'passphrase' | 'seed' | 'xpub'> & { xpub: string; }
+type InputData = { [key: string]: { addresses: string[]; value: number; }; }
+const LOG_LEVEL_PRIORITY: Record<TLogLevel, number>
+const MAX_FEE_RATE_SAT_PER_VBYTE = 5000
+type Msat = bigint
+class MultisigSpendError extends CodedError<'MULTISIG_REQUIRES_PSBT'>
+constructor MultisigSpendError(message?: string)
+type Net = typeof import('net')
+enum Network
+member Network.bitcoin = "bitcoin"
+member Network.regtest = "regtest"
+member Network.signet = "signet"
+member Network.testnet = "testnet"
+type ObjectKeys<T extends object> = `${Exclude<keyof T, symbol>}`
+unexported class Ok<T>
+constructor Ok(value: T)
+method Ok.isErr(): this is Err<T>
+method Ok.isOk(): this is Ok<T>
+readonly property Ok.value: T
+type Result<T> = Ok<T> | Err<T>
+type Sats = number
+type TAddressIndexInfo = { addressIndex: IAddress; changeAddressIndex: IAddress; lastUsedAddressIndex: IAddress; lastUsedChangeAddressIndex: IAddress; }
+type TAddressLabel = 'bech32' | 'segwit' | 'legacy'
+type TAddressLabels = { [address: string]: string; }
+type TAddressScan = { history: Map<string, TTxResult[]>; current: () => boolean; utxoAddresses: IAddresses; }
+type TAddressTxResponse = { data: string; id: number; jsonrpc: string; param: string; result: TTxResult[]; error?: { code: number; message: string; }; }
+type TAddressType = 'p2wpkh' | 'p2sh' | 'p2pkh'
+type TAddressTypeContent<T> = { [key in EAddressType]: T; }
+type TAddressTypes = { [key in EAddressType]: Readonly<IAddressTypeData>; }
+type TAvailableNetworks = `${Network}`
+type TConnectToElectrumRes = string
+type TDecodeRawTx = { txid: string; tx_hash: string; size: number; vsize: number; weight: number; version: number; locktime: number; vin: IVin[]; vout: IVout[]; }
+type TFeeEstimationSource = 'electrum' | 'http' | 'auto'
+type TFormattedVin = Pick<IVin, 'txid' | 'vout' | 'sequence'> | Pick<ICoinbaseVin, 'coinbase' | 'sequence'>
+type TGapLimitOptions = { lookAhead: number; lookBehind: number; lookAheadChange: number; lookBehindChange: number; }
+type TGetAddressHistory = { txid: string; height: number; }
+type TGetByteCountInput = `MULTISIG-P2SH:${number}-${number}` | `MULTISIG-P2WSH:${number}-${number}` | `MULTISIG-P2SH-P2WSH:${number}-${number}` | 'P2SH-P2WPKH' | 'P2PKH' | 'p2pkh' | 'P2WPKH' | 'p2wpkh' | 'P2SH' | 'p2sh' | 'P2TR' | 'p2tr'
+type TGetByteCountInputs = { [key in TGetByteCountInput]?: number; }
+type TGetByteCountOutput = 'P2SH' | 'P2PKH' | 'P2WPKH' | 'P2WSH' | 'p2wpkh' | 'p2sh' | 'p2pkh' | 'P2TR' | 'p2tr'
+type TGetByteCountOutputs = { [key in TGetByteCountOutput]?: number; }
+type TGetData = <K extends keyof IWalletData>(key: string) => Promise<Result<IWalletData[K]>>
+type TGetTotalFeeObj = { totalFee: number; transactionByteCount: number; satsPerByte: number; maxSatPerByte: number; }
+type TKeyDerivationAccount = '0' | string
+type TKeyDerivationChange = '0' | '1'
+type TKeyDerivationCoinType = '0' | '1' | string
+type TKeyDerivationIndex = string
+type TKeyDerivationPurpose = '84' | '49' | '44' | string
+type TLogLevel = 'debug' | 'info' | 'warn' | 'error' | 'silent'
+type TMessageDataMap = { newBlock: INewBlock; transactionReceived: TTransactionMessage; transactionConfirmed: TTransactionMessage; transactionSent: TTransactionMessage; reorg: IUtxo[]; rbf: string[]; connectedToElectrum: boolean; storageWriteFailed: TStorageWriteFailure; }
+type TMessageKeys = keyof TMessageDataMap
+type TOnMessage = <K extends keyof TMessageDataMap>(key: K, data: TMessageDataMap[K]) => void
+type TProcessUnconfirmedTransactions = { unconfirmedTxs: IFormattedTransactions; outdatedTxs: IUtxo[]; ghostTxs: string[]; }
+type TProtocol = `${EProtocol}`
+type TServer = { host: string; ssl: number; tcp: number; protocol: EProtocol; }
+type TSetData = <K extends keyof IWalletData>(key: string, value: IWalletData[K]) => Promise<Result<boolean>>
+type TSetTransactionChanges = (key: string, changes: TTransactionChanges) => Promise<Result<boolean>>
+type TSetupTransactionResponse = Result<Partial<ISendTransaction>>
+type TStorage = { getData?: TGetData; setData?: TSetData; setTransactionChanges?: TSetTransactionChanges; }
+type TStorageWriteFailure = { key: TWalletDataKeys; storageKey: string; error: string; }
+type TSubscribedReceive = [ string, string ]
+type TTransactionChanges = { set: IFormattedTransactions; deleted: string[]; }
+type TTransactionMessage = { transaction: IFormattedTransaction; }
+type TTxDetails = { blockhash?: string; confirmations?: number; hash: string; hex: string; locktime: number; size: number; txid: string; version: number; vin: TVin[]; vout: IVout[]; vsize: number; weight: number; blocktime?: number; time?: number; }
+type TTxResponse = { data: IAddress; id: number; jsonrpc: string; param: string; result: TTxResult[]; }
+type TTxResult = { tx_hash: string; height: number; }
+type TUnspentAddressScriptHash = { height: number; tx_hash: string; tx_pos: number; value: number; }
+type TUnspentAddressScriptHashData = { [x: string]: IUtxo | IAddress; }
+type TUnspentAddressScriptHashResponse = { id: number; error: boolean; method: string; data: TUnspentAddressScriptHashResult[]; network: string; }
+type TUnspentAddressScriptHashResult = { id: number; jsonrpc: string; result: TUnspentAddressScriptHash[]; param: string; data: IAddress; }
+type TVin = IVin | ICoinbaseVin
+type TWalletDataKeys = keyof IWalletData
+type Tls = typeof import('tls')
+class Transaction
+constructor Transaction({ wallet }: { wallet: Wallet; })
+method Transaction.addExternalInputs({ inputs, keyPair }: { inputs: IUtxo[]; keyPair: bip32#BIP32Interface | ecpair#ECPairInterface; }): Result<IUtxo[]>
+property Transaction.addInput: ({ psbt, keyPair, input, prevTxs }: IAddInput) => Promise<Result<string>>
+property Transaction.addOutput: ({ address, value, index }: IOutput) => Promise<Result<string>>
+method Transaction.applyAutoCoinSelect({ coinSelectRes }: { coinSelectRes: ICoinSelectResponse; }): Promise<Result<ISendTransaction>>
+method Transaction.autoCoinSelect({ inputs, outputs, changeAddress, satsPerByte, message, coinSelectPreference }: { inputs: IUtxo[]; outputs: IOutput[]; changeAddress?: string; satsPerByte?: number; message?: string; coinSelectPreference?: ECoinSelectPreference; }): Result<ICoinSelectResponse>
+property Transaction.createPsbtFromTransactionData: ({ transactionData, bip32Interface, shuffleTargets, keys }: { transactionData: ISendTransaction; bip32Interface?: bip32#BIP32Interface | undefined; shuffleTargets?: boolean | undefined; keys?: Map<string, bip32#BIP32Interface> | undefined; }) => Promise<Result<bitcoinjs-lib#Psbt>>
+property Transaction.createTransaction: ({ transactionData, shuffleOutputs, runCoinSelect, spendFrozen }?: ICreateTransaction) => Promise<Result<{ id: string; hex: string; }>>
+property Transaction.createUnsignedPsbt: ({ transactionData, shuffleOutputs, spendFrozen }?: { transactionData?: ISendTransaction | undefined; shuffleOutputs?: boolean | undefined; spendFrozen?: boolean | undefined; }) => Promise<Result<bitcoinjs-lib#Psbt>>
+get Transaction.data(): ISendTransaction
+property Transaction.estimateTransactionCosts: ({ transaction, customFeeRate }: { transaction?: ISendTransaction | undefined; customFeeRate?: number | undefined; }) => Result<{ amount: number; fee: number; satsPerByte: number; }>
+property Transaction.getMaxSatsPerByte: ({ transactionByteCount, balance }: { transactionByteCount: number; balance?: number | undefined; }) => number
+method Transaction.getMaxSendAmount({ satsPerByte, selectedFeeId, transaction }: { satsPerByte: number; selectedFeeId?: EFeeId; transaction?: ISendTransaction; }): Result<{ amount: number; fee: number; }>
+property Transaction.getTotalFee: ({ satsPerByte, message, transaction, fundingLightning, coinSelectPreference, generatesChange }: { satsPerByte: number; message?: string | undefined; transaction?: Partial<ISendTransaction> | undefined; fundingLightning?: boolean | undefined; coinSelectPreference?: ECoinSelectPreference | undefined; generatesChange?: boolean | undefined; }) => number
+property Transaction.getTotalFeeObj: ({ satsPerByte, transaction, message, fundingLightning, coinSelectPreference }?: { satsPerByte?: number | undefined; message?: string | undefined; transaction?: Partial<ISendTransaction> | undefined; fundingLightning?: boolean | undefined; coinSelectPreference?: ECoinSelectPreference | undefined; }) => Result<TGetTotalFeeObj>
+property Transaction.getTransactionInputValue: ({ inputs }: { inputs?: IUtxo[] | undefined; }) => number
+property Transaction.getTransactionOutputValue: ({ outputs }?: { outputs?: IOutput[] | undefined; }) => number
+method Transaction.removeBlackListedUtxos(utxos?: IUtxo[]): IUtxo[]
+method Transaction.resetSendTransaction(): Promise<Result<string>>
+property Transaction.sendMax: ({ address, transaction, index, satsPerByte, rbf, spendFrozen }?: { address?: string | undefined; transaction?: ISendTransaction | undefined; index?: number | undefined; satsPerByte?: number | undefined; rbf?: boolean | undefined; spendFrozen?: boolean | undefined; }) => Promise<Result<string>>
+method Transaction.setupCpfp({ txid, satsPerByte }: { txid?: string; satsPerByte?: number; }): Promise<Result<ISendTransaction>>
+method Transaction.setupRbf({ txid }: { txid: string; }): Promise<Result<ISendTransaction>>
+method Transaction.setupTransaction({ inputTxHashes, utxos, rbf, satsPerByte, outputs }?: ISetupTransaction): Promise<TSetupTransactionResponse>
+property Transaction.signPsbt: ({ psbt, bip32Interface, keys }: { psbt: bitcoinjs-lib#Psbt; bip32Interface: bip32#BIP32Interface; keys?: Map<string, bip32#BIP32Interface> | undefined; }) => Promise<Result<bitcoinjs-lib#Psbt>>
+method Transaction.updateFee({ satsPerByte, selectedFeeId, index, transaction }: { satsPerByte: number; selectedFeeId?: EFeeId; index?: number; transaction?: ISendTransaction; }): Result<{ fee: number; }>
+property Transaction.updateSendTransaction: ({ transaction }: { transaction: Partial<ISendTransaction>; }) => Result<string>
+class Wallet
+private constructor Wallet()
+get Wallet.account(): number
+method Wallet.addGhostTransaction({ txid }: { txid: string; }): Promise<Result<string>>
+method Wallet.addTxInput({ input }: { input: IUtxo; }): Result<IUtxo[]>
+method Wallet.addTxTag({ tag }: { tag: string; }): Result<string>
+property Wallet.addressType: EAddressType
+property Wallet.addressTypesToMonitor: EAddressType[]
+get Wallet.balance(): number
+get Wallet.birthdayHeight(): number
+method Wallet.blockHeightToConfirmations({ blockHeight, currentHeight }: { blockHeight?: number; currentHeight?: number; }): number
+method Wallet.boost(params: IBoost): Promise<Result<IBoostRes>>
+method Wallet.broadcastTransaction(txHex: string): Promise<Result<string>>
+method Wallet.buildPsbt(args: IBuildPsbtArgs): Promise<Result<IBuildPsbtResponse>>
+method Wallet.canBoost(txid: string): ICanBoostResponse
+method Wallet.checkElectrumConnection(): Promise<Result<string>>
+method Wallet.checkUnconfirmedTransactions(reorgDetected?: boolean): Promise<Result<string>>
+method Wallet.clearUtxos(): Promise<string>
+property Wallet.coinSelectPreference: ECoinSelectPreference
+method Wallet.combinePsbts(psbts: string[]): Result<string>
+method Wallet.confirmationsToBlockHeight({ confirmations, currentHeight }: { confirmations: number; currentHeight?: number; }): number
+method Wallet.connectToElectrum(servers?: TServer | TServer[]): Promise<Result<string>>
+static method Wallet.create(params: IWallet): Promise<Result<Wallet>>
+static method Wallet.createMultisig(params: IMultisigWallet): Promise<Result<Wallet>>
+method Wallet.createSignedTransaction(args: ICreateSignedTransactionArgs): Promise<Result<ISignedTransaction>>
+static method Wallet.createWatchOnly(params: IWatchOnlyWallet): Promise<Result<Wallet>>
+get Wallet.data(): IWalletData
+method Wallet.deleteOnChainTransactionById({ txid }: { txid: string; }): Promise<Result<string>>
+method Wallet.derivePublicNode(path: string): Result<bip32#BIP32Interface>
+property Wallet.disableMessages: boolean
+property Wallet.electrum: Electrum
+property Wallet.electrumOptions?: { net: Net; tls: Tls; servers?: TServer | TServer[]; batchLimit?: number; batchDelay?: number; }
+method Wallet.exportDescriptors(): Result<IExportDescriptorsResponse>
+property Wallet.feeEstimates: IOnchainFees
+property Wallet.feeEstimationSource: TFeeEstimationSource
+method Wallet.fetchAddressBalance(address: string): Promise<Result<IGetAddressBalanceRes>>
+method Wallet.fetchAddressHistory(address: string): Promise<Result<TTxResult[]>>
+method Wallet.fetchAddressesBalance(addresses?: string[]): Promise<Result<number>>
+method Wallet.fetchFallbackFeeEstimates(network?: Network): Promise<IOnchainFees>
+method Wallet.fetchFeeEstimates(network?: Network): Promise<IOnchainFees>
+method Wallet.fetchFeeEstimatesFromElectrum(): Promise<Result<IOnchainFees>>
+method Wallet.fetchFeeEstimatesFromHttp(network?: Network): Promise<IOnchainFees>
+method Wallet.fetchInputData({ inputs }: { inputs: IOutpoint[]; }): Promise<Result<InputData>>
+method Wallet.fetchNextAvailableAddress(addressType?: EAddressType, scan?: TAddressScan): Promise<Result<IGetNextAvailableAddressResponse>>
+method Wallet.fetchPrivateKeyInfo(privateKey: string): Promise<Result<IPrivateKeyInfo>>
+method Wallet.fetchRbfData({ txid }: { txid: string; }): Promise<Result<IRbfData>>
+method Wallet.fetchScriptHashBalance(scriptHash: string): Promise<Result<IGetAddressBalanceRes>>
+method Wallet.fetchTransactionDetails(txid: string): Promise<Result<TTxDetails>>
+method Wallet.formatTransactions({ transactions }: { transactions: ITransaction<IUtxo>[]; }): Promise<Result<IFormattedTransactions>>
+method Wallet.freezeUtxo(params: (IOutpoint | IIndexedOutpoint) & { tag?: string; }): Promise<Result<string>>
+method Wallet.freezeUtxoIfUnfrozen(params: (IOutpoint | IIndexedOutpoint) & { tag?: string; }): Promise<Result<{ created: boolean; }>>
+property Wallet.gapLimitOptions: TGapLimitOptions
+method Wallet.generateAddresses({ addressAmount, changeAddressAmount, addressIndex, changeAddressIndex, keyDerivationPath, addressType }: IGenerateAddresses): Promise<Result<IGenerateAddressesResponse>>
+method Wallet.generateNewReceiveAddress({ addressType, overrideGapLimit, keyDerivationPath }?: { addressType?: EAddressType; overrideGapLimit?: boolean; keyDerivationPath?: IKeyDerivationPath; }): Promise<Result<IAddress>>
+method Wallet.getAddress({ index, changeAddress, addressType }?: IGetAddress): Promise<string>
+method Wallet.getAddressBalance(address: string): Promise<Result<IGetAddressBalanceRes>>
+method Wallet.getAddressByPath({ path, addressType }: IGetAddressByPath): Promise<Result<IGetAddressResponse>>
+method Wallet.getAddressFromScriptHash(scriptHash: string): IAddress | undefined
+method Wallet.getAddressGap({ addressType }: { addressType?: EAddressType; }): Result<{ addressDelta: number; changeAddressDelta: number; }>
+method Wallet.getAddressHistory(address: string): Promise<Result<TTxResult[]>>
+method Wallet.getAddressIndexInfo(): TAddressIndexInfo
+method Wallet.getAddressInfoFromScriptHash(scriptHash: string): Result<{ address: IAddress; addressType: EAddressType; }>
+method Wallet.getAddressLabel(address: string): string | undefined
+method Wallet.getAddressesBalance(addresses?: string[]): Promise<Result<number>>
+method Wallet.getAddressesFromPrivateKey(privateKey: string, _addressTypes?: EAddressType[]): Result<IGetAddressesFromPrivateKey>
+method Wallet.getBalance(): number
+method Wallet.getBalanceBreakdown(): IBalanceBreakdown
+property Wallet.getBip32Interface: () => Promise<Result<bip32#BIP32Interface>>
+method Wallet.getBoostableTransactions(): { cpfp: IFormattedTransaction[]; rbf: IFormattedTransaction[]; }
+property Wallet.getBoostedTransactionParents: ({ txid, boostedTransactions }: { txid: string; boostedTransactions?: IBoostedTransactions | undefined; }) => string[]
+property Wallet.getBoostedTransactions: () => IBoostedTransactions
+method Wallet.getChangeAddress(addressType?: EAddressType): Promise<Result<IAddress>>
+method Wallet.getFallbackFeeEstimates(network?: Network): Promise<IOnchainFees>
+method Wallet.getFeeEstimates(network?: Network): Promise<IOnchainFees>
+method Wallet.getFeeEstimatesFromElectrum(): Promise<Result<IOnchainFees>>
+method Wallet.getFeeEstimatesFromHttp(network?: Network): Promise<IOnchainFees>
+method Wallet.getFeeInfo({ satsPerByte, message, transaction, fundingLightning, coinSelectPreference }?: { satsPerByte?: number; message?: string; transaction?: Partial<ISendTransaction>; fundingLightning?: boolean; coinSelectPreference?: ECoinSelectPreference; }): Result<TGetTotalFeeObj>
+method Wallet.getGapLimit(params: Parameters<Wallet['getAddressGap']>[0]): Result<{ addressDelta: number; changeAddressDelta: number; }>
+method Wallet.getHighestStoredAddressIndex({ addressType }: { addressType: EAddressType; }): Result<{ addressIndex: IAddress; changeAddressIndex: IAddress; }>
+method Wallet.getInputData({ inputs }: { inputs: { tx_hash: string; vout: number; }[]; }): Promise<Result<InputData>>
+method Wallet.getMasterFingerprint(): Buffer
+method Wallet.getMultisigPayment(path: string): Result<{ address: string; output: Buffer; witnessScript: Buffer; publicKey: string; derivations: { masterFingerprint: Buffer; path: string; pubkey: Buffer; }[]; }>
+method Wallet.getNextAvailableAddress(addressType?: EAddressType, scan?: TAddressScan): Promise<Result<IGetNextAvailableAddressResponse>>
+method Wallet.getPrivateKey(path: string): string
+method Wallet.getPrivateKeyInfo(privateKey: string): Promise<Result<IPrivateKeyInfo>>
+method Wallet.getRbfData({ txHash }: { txHash: ITxHash; }): Promise<Result<IRbfData>>
+property Wallet.getReceiveAddress: ({ addressType }: { addressType?: EAddressType | undefined; }) => Promise<Result<string>>
+method Wallet.getScriptHash({ address, network }: { address: string; network: Network; }): Promise<string>
+method Wallet.getScriptHashBalance(scriptHash: string): Promise<Result<IGetAddressBalanceRes>>
+method Wallet.getTransactionDetails(tx_hash: string): Promise<Result<TTxDetails>>
+method Wallet.getUnconfirmedTransactions(): IFormattedTransactions
+method Wallet.getUtxos(params: Parameters<Wallet['refreshUtxos']>[0]): Promise<Result<IGetUtxosResponse>>
+method Wallet.getWalletData(): Promise<Result<IWalletData>>
+method Wallet.getWalletDataKey(key: keyof IWalletData): string
+readonly property Wallet.id: string
+method Wallet.importSignedPsbt(psbtBase64: string, unsignedPsbtBase64?: string): Result<IImportSignedPsbtResponse>
+method Wallet.isChangeAddress(address: string): boolean
+get Wallet.isMultisig(): boolean
+property Wallet.isRefreshing: boolean
+property Wallet.isSwitchingNetworks: boolean
+method Wallet.isUtxoFrozen(outpoint: IOutpoint): boolean
+method Wallet.isUtxoFrozen(txid: string, index: number): boolean
+method Wallet.isValid(mnemonic: string): boolean
+readonly property Wallet.isWatchOnly: boolean
+method Wallet.listAddressLabels(): TAddressLabels
+method Wallet.listFrozenUtxos(): IUtxo[]
+method Wallet.listUtxos(): IUtxo[]
+readonly property Wallet.logger: ILogger
+method Wallet.mapPathToKeyOrigin(path: string): string
+get Wallet.multisigInfo(): { threshold: number; totalCosigners: number; } | undefined
+readonly property Wallet.name: string
+get Wallet.network(): Network
+property Wallet.rbf: boolean
+get Wallet.refreshFailed(): boolean
+method Wallet.refreshUtxos({ scanningStrategy, addressIndex, changeAddressIndex, addressTypesToCheck, additionalAddresses, additionalScriptHashes }: { scanningStrategy?: EScanningStrategy; addressIndex?: number; changeAddressIndex?: number; addressTypesToCheck?: EAddressType[]; additionalAddresses?: string[]; additionalScriptHashes?: IAddresses; }): Promise<Result<IGetUtxosResponse>>
+method Wallet.refreshWallet({ scanAllAddresses, additionalAddresses, force, onStart }?: { scanAllAddresses?: boolean; additionalAddresses?: string[]; force?: boolean; onStart?: () => void; }): Promise<Result<IWalletData>>
+method Wallet.removeSpentUtxos(rawTx: string): Promise<Result<IUtxo[]>>
+method Wallet.removeTxInput({ input }: { input: IUtxo; }): Result<IUtxo[]>
+method Wallet.removeTxTag({ tag }: { tag: string; }): Result<string>
+method Wallet.rescanAddresses({ shouldClearAddresses, shouldClearTransactions }: { shouldClearAddresses?: boolean; shouldClearTransactions?: boolean; }): Promise<Result<IWalletData>>
+method Wallet.resetAddressIndexes(): Promise<void>
+method Wallet.resetSendTransaction(): Promise<Result<string>>
+method Wallet.saveWalletData<K extends keyof IWalletData>(key: TWalletDataKeys, data: IWalletData[K]): Promise<Result<string>>
+property Wallet.selectedFeeId: EFeeId
+method Wallet.send({ address, amount, message, satsPerByte, rbf, broadcast, shuffleOutputs }: { address: string; amount: number; message?: string; satsPerByte?: number; rbf?: boolean; broadcast?: boolean; shuffleOutputs?: boolean; }): Promise<Result<string>>
+method Wallet.sendMany(params: { txs: ISendTx[]; satsPerByte?: number; rbf?: boolean; broadcast?: boolean; shuffleOutputs?: boolean; }): Promise<Result<string>>
+method Wallet.sendMax(params?: { address?: string; satsPerByte?: number; rbf?: boolean; broadcast?: boolean; }): Promise<Result<string>>
+property Wallet.sendMessage: TOnMessage
+method Wallet.setAddressLabel(address: string, label: string): Promise<Result<string>>
+method Wallet.setupFeeForOnChainTransaction({ satsPerByte, selectedFeeId }: { satsPerByte?: number; selectedFeeId?: EFeeId; }): Result<string>
+method Wallet.setupTransaction(params?: ISetupTransaction): Promise<TSetupTransactionResponse>
+method Wallet.signPsbtWithOurKey(psbtBase64: string): Result<string>
+method Wallet.stop({ refreshTimeout }?: { refreshTimeout?: number; }): Promise<Result<string>>
+method Wallet.sweepPrivateKey(params: ISweepPrivateKey): Promise<Result<ISweepPrivateKeyRes>>
+method Wallet.switchNetwork(network: Network, servers?: TServer | TServer[]): Promise<Result<Wallet>>
+property Wallet.transaction: Transaction
+get Wallet.transactions(): IFormattedTransactions
+get Wallet.unconfirmedTransactions(): IFormattedTransactions
+method Wallet.unfreezeUtxo(params: IOutpoint | IIndexedOutpoint): Promise<Result<string>>
+method Wallet.unfreezeUtxoIfTagged(params: (IOutpoint | IIndexedOutpoint) & { tag: string; }): Promise<Result<{ unfrozen: boolean; }>>
+method Wallet.updateAddressType(addressType: EAddressType): Promise<void>
+method Wallet.updateCoinSelectPreference(coinSelectPreference: ECoinSelectPreference): void
+method Wallet.updateFeeEstimates(forceUpdate?: boolean): Promise<Result<IOnchainFees>>
+method Wallet.updateGapLimit(gapLimitOptions: TGapLimitOptions): Result<TGapLimitOptions>
+method Wallet.updateHeader(headerData: IHeader): Promise<void>
+method Wallet.updateTransactions({ scanAllAddresses, replaceStoredTransactions, scan }: { scanAllAddresses?: boolean; replaceStoredTransactions?: boolean; scan?: TAddressScan; }): Promise<Result<string | undefined>>
+method Wallet.updateWalletBalance({ balance }: { balance: number; }): Result<string>
+get Wallet.utxos(): IUtxo[]
+method Wallet.validateAddress(address: string): boolean
+method Wallet.withSendLock<T>(fn: (locked: Pick<Wallet, 'send' | 'sendMax' | 'createSignedTransaction' | 'buildPsbt'>) => Promise<T>): Promise<T>
+class WatchOnlySigningError extends CodedError<'WATCH_ONLY_CANNOT_SIGN'>
+constructor WatchOnlySigningError(message?: string)
+const appendDescriptorChecksum: (descriptor: string) => string
+const availableNetworks: () => Network[]
+const btcPerKbToSatPerVbyte: (btcPerKb: number) => number
+const btcToSats: (btc: number) => Sats
+const buildSortedMultisigPayment: ({ threshold, cosignerNodes, change, index, network }: { threshold: number; cosignerNodes: bip32#BIP32Interface[]; change: number; index: number; network: bitcoinjs-lib#Network; }) => Result<ISortedMultisigPayment>
+const buildSortedMultisigPaymentFromKeys: ({ threshold, publicKeys, network }: { threshold: number; publicKeys: Buffer[]; network: bitcoinjs-lib#Network; }) => Result<ISortedMultisigPayment>
+const clampFeeRate: (rate: number) => number
+const constructByteCountParam: (addresses: string[], increaseAddressCount?: { addrType: EAddressType; count: number; }[]) => TGetByteCountInputs | TGetByteCountOutputs
+function createConsoleLogger(level?: TLogLevel, sink?: IConsoleSink): ILogger
+const createEncryptedStorage: (inner: TStorage, seed: Buffer) => TStorage
+const createOpReturnScript: (message?: string) => Buffer | undefined
+const decodeOpReturnMessage: (opReturn?: string) => string[]
+const decodeRawTransaction: (hex: string, _network: Network) => Result<TDecodeRawTx>
+const defaultElectrumPorts: string[]
+const descriptorChecksum: (descriptor: string) => string | null
+const electrumConnection: ElectrumConnectionPubSub
+const encodeBip21: ({ address, amountSats, label, message }: IEncodeBip21) => Result<string>
+function err<T>(code: string, message: string, cause?: unknown): Err<T>
+function err<T>(error: Error | string): Err<T>
+const filterAddressesForGapLimit: ({ addresses, index, gapLimitOptions, change }: { addresses: IAddress[]; index: number; gapLimitOptions: TGapLimitOptions; change: boolean; }) => IAddress[]
+const filterAddressesObjForAddressesList: ({ addresses, additionalAddresses }: { addresses: IAddresses; additionalAddresses: string[]; }) => IAddresses
+const filterAddressesObjForGapLimit: ({ addresses, index, gapLimitOptions, change }: { addresses: IAddresses; index: number; gapLimitOptions: TGapLimitOptions; change: boolean; }) => IAddresses
+const filterAddressesObjForSingleIndex: ({ addresses, addressIndex }: { addresses: IAddresses; addressIndex: number; }) => IAddresses
+const filterAddressesObjForStartingIndex: ({ addresses, index }: { addresses: IAddresses; index: number; }) => IAddresses
+const formatKeyDerivationPath: ({ path, purpose, network, changeAddress, index, addressType }: { path: IKeyDerivationPath | string; purpose?: string | undefined; network: Network; changeAddress?: boolean | undefined; index?: string | undefined; addressType?: EAddressType | undefined; }) => Result<IKeyDerivationPathData>
+const formatPeerData: (data: [ string, string, [ string, string, string ] ]) => Result<IFormattedPeerData>
+const generateMnemonic: (strength?: number, rng?: ((size: number) => Buffer) | undefined, wordlist?: string[]) => string
+const generateWalletId: (seed: Buffer) => string
+const getAddressFromKeyPair: ({ keyPair, addressType, network }: { keyPair: bip32#BIP32Interface | ecpair#ECPairInterface; addressType: EAddressType; network: bitcoinjs-lib#Network; }) => Result<IGetAddressesFromKeyPair>
+const getAddressFromScriptPubKey: (scriptPubKey: string, selectedNetwork: Network) => string
+const getAddressIndexDiff: (addrIndex1?: number, addrIndex2?: number) => number
+const getAddressTypeFromPath: (path: string | IKeyDerivationPath) => Result<EAddressType>
+const getAddressesFromPrivateKey: ({ privateKey, addrTypes, network }: { privateKey: string; addrTypes?: EAddressType[] | undefined; network?: bitcoinjs-lib#Network | undefined; }) => Result<IGetAddressesFromPrivateKey>
+const getBitcoinJsNetwork: (network: Network | `${Network}`) => bitcoinjs-lib#Network
+const getByteCount: (inputs: TGetByteCountInputs, outputs: TGetByteCountOutputs, message?: string, minByteCount?: number) => number
+const getDataFallback: TGetData
+const getDefaultPort: (selectedNetwork: Network, protocol: `${EProtocol}`) => number
+const getDefaultWalletData: () => IWalletData
+const getDefaultWalletDataKeys: () => (keyof IWalletData)[]
+const getDustThreshold: (address: string) => number
+const getElectrumNetwork: (network: Network) => EElectrumNetworks
+const getHighestUsedIndexFromTxHashes: ({ txHashes, addresses, changeAddresses, addressIndex, changeAddressIndex }: { txHashes: ITxHashes[]; addresses: IAddresses; changeAddresses: IAddresses; addressIndex: IAddress; changeAddressIndex: IAddress; }) => Result<IIndexes>
+const getKeyDerivationPath: ({ addressType, network }: { addressType: EAddressType; network: Network; }) => Result<IKeyDerivationPath>
+const getKeyDerivationPathObject: ({ path, purpose, changeAddress, index, network }: { path: string; purpose?: string | undefined; changeAddress?: boolean | undefined; index?: string | undefined; network: Network; }) => Result<IKeyDerivationPath>
+const getKeyDerivationPathString: ({ addressType, path, purpose, accountType, changeAddress, index, network }: { addressType: EAddressType; path?: IKeyDerivationPath | undefined; purpose?: string | undefined; accountType?: string | number | undefined; changeAddress?: boolean | undefined; index?: string | number | undefined; network: Network; }) => Result<string>
+const getKeyValue: (key: string) => string
+const getPeers: ({ selectedNetwork }: { selectedNetwork: Network; }) => Promise<Result<IFormattedPeerData[]>>
+const getProtocolForPort: (port: string, network: Network) => EProtocol | undefined
+const getScriptHash: ({ address, network }: { address: string; network: Network; }) => string
+const getSeed: (mnemonic: string, bip39Passphrase?: string) => Buffer
+const getSeedHash: (seed: Buffer) => string
+const getSha256: (str: string) => string
+const getStorageKeyValues: (storageKey: string) => { walletName: string; network: Network; account: number; value: keyof IWalletData; } | undefined
+const getTapRootAddressFromPublicKey: ({ publicKey, network }: { publicKey: Buffer; network: bitcoinjs-lib#Network; }) => Result<{ address: string; output: Buffer; internalPubkey: Buffer; }>
+const getTxFee: ({ satsPerByte, transactionByteCount }: { satsPerByte: number; transactionByteCount: number; }) => number
+const getWalletDataStorageKey: (name: string, network: Network, key: keyof IWalletData, account?: number) => string
+const hasUntrimmedInputs: (vin: (TVin | TFormattedVin)[]) => boolean
+const isP2trPrefix: (address: string) => boolean
+const isPositive: (num: number) => boolean
+const isValidBech32mEncodedString: (address: string) => { isValid: boolean; network: Network; }
+const msatToSatsFloor: (msat: Msat) => Sats
+const noopLogger: ILogger
+const normalizeFingerprint: (fingerprint: string) => string
+const normalizeKeyOrigin: (masterFingerprint: string, originPath?: string) => Result<IKeyOrigin>
+const objectKeys: <Type extends object>(value: Type) => `${Exclude<keyof Type, symbol>}`[]
+const objectsMatch: (obj1: unknown, obj2: unknown) => boolean
+const ok: <T>(value: T) => Ok<T>
+const parseBip48Path: (path: string) => Result<IParsedBip48Path>
+const parseExtendedPublicKey: (extendedKey: string, network: Network) => Result<IParsedExtendedPublicKey>
+const parseOnChainPaymentRequest: (data: string, network?: Network) => Result<{ address: string; network: Network; sats: number; message: string; }>
+const reduceValue: <T>({ arr, value }: { arr: T[]; value: keyof T; }) => Result<number>
+const removeDustOutputs: (outputs: IOutput[]) => IOutput[]
+const removeDustUtxos: (utxos: IUtxo[]) => IUtxo[]
+const satsToBtc: (sats: Sats) => number
+const satsToMsat: (sats: Sats) => Msat
+function selfTestCryptoProvider(provider: ICryptoProvider): CryptoPrimitive[]
+function setCryptoProvider(provider: ICryptoProvider | null): void
+const setReplaceByFee: ({ psbt, setRbf }: { psbt: bitcoinjs-lib#Psbt; setRbf: boolean; }) => void
+function shouldLog(level: Exclude<TLogLevel, 'silent'>, threshold: TLogLevel): boolean
+const shuffleArray: <T>(array: T[]) => T[]
+const sleep: (ms: number) => Promise<void>
+const splitAddresses: (addresses: IAddresses, batchLimit: number) => IAddresses[]
+const toBitcoinJsNetwork: (network: Network) => bitcoinjs-lib#Network
+const toElectrumNetwork: (network: Network) => EElectrumNetworks
+const trimInputs: (vin: (TVin | TFormattedVin)[]) => TFormattedVin[]
+const validateAddress: ({ address, network }: { address: string; network?: Network | undefined; }) => { isValid: boolean; network: Network; }
+const validateMnemonic: (mnemonic?: string) => boolean
+const validatePsbtSignature: (pubkey: Buffer, msghash: Buffer, signature: Buffer) => boolean
+const validateTransaction: (transaction: ISendTransaction) => Result<string>
+const withTlsVerification: (tls: Tls, { fingerprints, servernames }?: { fingerprints?: string[] | undefined; servernames?: Record<string, string> | undefined; }) => Tls
