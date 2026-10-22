@@ -21,6 +21,7 @@ import { MuSigFactory } from '@brandonblack/musig';
 import type { Crypto, KeyGenContext, SessionKey } from '@brandonblack/musig';
 import { ecc } from '../../utils/ecc';
 import { sha256 as nobleSha256 } from '@noble/hashes/sha256';
+import { taggedHash } from './hash';
 
 // base_crypto provides the library's pure-BigInt scalar/field math. It is a
 // package "exports" subpath, which classic (node) TS module resolution can't see
@@ -29,16 +30,6 @@ import { sha256 as nobleSha256 } from '@noble/hashes/sha256';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const baseCrypto =
 	require('@brandonblack/musig/base_crypto') as Partial<Crypto>;
-
-/** BIP340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg...). */
-function taggedHash(tag: string, ...messages: Uint8Array[]): Uint8Array {
-	const tagHash = nobleSha256(Buffer.from(tag, 'utf8'));
-	const h = nobleSha256.create();
-	h.update(tagHash);
-	h.update(tagHash);
-	for (const m of messages) h.update(m);
-	return h.digest();
-}
 
 function sha256(...messages: Uint8Array[]): Uint8Array {
 	const h = nobleSha256.create();
@@ -49,7 +40,8 @@ function sha256(...messages: Uint8Array[]): Uint8Array {
 /**
  * Crypto backend for the MuSig factory. Scalar/field math comes from the
  * library's base_crypto; elliptic-curve point operations from the tiny-secp256k1
- * compatible @bitcoinerlab/secp256k1; hashing from @noble/hashes.
+ * compatible @bitcoinerlab/secp256k1; SHA-256 from @noble/hashes and tagged
+ * hashes from ./hash.
  */
 const cryptoBackend = {
 	...baseCrypto,
@@ -156,7 +148,7 @@ export function deriveTaprootFundingKey(
 		remoteFundingPubkey
 	);
 	const internalKey = Buffer.from(musig.getXOnlyPubkey(baseCtx));
-	const tweak = Buffer.from(taggedHash('TapTweak', internalKey));
+	const tweak = taggedHash('TapTweak', internalKey);
 	const tweakedCtx = musig.addTweaks(baseCtx, { tweak, xOnly: true });
 	const outputKey = Buffer.from(musig.getXOnlyPubkey(tweakedCtx));
 	return { tweakedCtx, internalKey, outputKey, tweak };
