@@ -42,12 +42,14 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import type {
+	IGuardianInfoResponse,
+	IGuardianRegisterNodeRequest
+} from './guardian';
 import {
 	GUARDIAN_RECORD_OVERHEAD_BYTES,
 	GUARDIAN_REGISTRATION_BYTES,
 	GuardianStatus,
-	IGuardianInfoResponse,
-	IGuardianRegisterNodeRequest,
 	ReferenceGuardian,
 	registrationAdmissionProblem
 } from './guardian';
@@ -67,16 +69,12 @@ import {
 	decodeSyncEpochRequest,
 	decodeSyncRecordRequest
 } from './guardian-proto';
-import {
-	GuardianVerbName,
-	IGuardianVerbOutcome,
-	encodeGuardianVerbRefusal,
-	runGuardianVerb
-} from './guardian-http';
+import type { GuardianVerbName, IGuardianVerbOutcome } from './guardian-http';
+import { encodeGuardianVerbRefusal, runGuardianVerb } from './guardian-http';
+import type { IGuardianResolver } from './guardian-bolt8';
 import {
 	GuardianBolt8FrameError,
 	GuardianBolt8Responder,
-	IGuardianResolver,
 	bolt8BearerAuthenticator
 } from './guardian-bolt8';
 

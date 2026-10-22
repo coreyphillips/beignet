@@ -12,11 +12,11 @@
  * unconditionally (spec 5.1, "backward compatibility requirement").
  */
 
-import { IFforVoucherArchive } from '../ffor/voucher-archive';
-import { IChannelState } from '../channel/channel-state';
-import { IChainMonitorState } from '../chain/chain-monitor';
-import { IPaymentInfo } from '../node/types';
-import {
+import type { IFforVoucherArchive } from '../ffor/voucher-archive';
+import type { IChannelState } from '../channel/channel-state';
+import type { IChainMonitorState } from '../chain/chain-monitor';
+import type { IPaymentInfo } from '../node/payment-types';
+import type {
 	IForwardingEvent,
 	IInvoiceInfo,
 	IRecoveryOutboxMessage,
@@ -334,7 +334,7 @@ export interface RecoverySnapshot {
 	preimages: Array<{ paymentHash: string; preimage: Buffer }>;
 	payments: Array<{
 		paymentHash: string;
-		payment: import('../node/types').IPaymentInfo;
+		payment: IPaymentInfo;
 	}>;
 	paymentSecrets: Array<{ paymentHash: string; secret: Buffer }>;
 	htlcPaymentMappings: Array<{ key: string; paymentHash: string }>;

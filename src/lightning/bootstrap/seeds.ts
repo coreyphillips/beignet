@@ -1,7 +1,7 @@
 /**
  * BOLT 10: Default DNS seeds and bootstrap aggregation.
  */
-import { IDnsSeedConfig, IPeerAddress, IBootstrapConfig } from './types';
+import type { IDnsSeedConfig, IPeerAddress, IBootstrapConfig } from './types';
 import { resolveDnsSeed } from './dns';
 
 /** Well-known DNS seeds for Lightning mainnet. */

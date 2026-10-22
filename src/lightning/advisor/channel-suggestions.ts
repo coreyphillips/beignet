@@ -9,7 +9,7 @@
  *   - Relevance (20pts): whether node is a payment destination or neighbor of one
  */
 
-import { NetworkGraph } from '../gossip/network-graph';
+import type { NetworkGraph } from '../gossip/network-graph';
 
 export interface IChannelSuggestion {
 	nodeId: string;

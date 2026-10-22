@@ -19,7 +19,7 @@ import {
 	processOnionPacket
 } from '../onion';
 import { voucherPaymentSecret } from './transcript';
-import { IFforBookEntry } from './types';
+import type { IFforBookEntry } from './types';
 
 export interface IVoucherOnionInput {
 	recipientNodeId: Buffer;

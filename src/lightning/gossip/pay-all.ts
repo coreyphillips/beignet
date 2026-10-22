@@ -1,19 +1,13 @@
-import { NetworkGraph } from './network-graph';
-import {
-	buildEdgeOverlay,
-	calculateFee,
-	ILocalChannelEdge,
-	policyFor,
-	TPolicyOverrides
-} from './pathfinding';
+import type { NetworkGraph } from './network-graph';
+import type { ILocalChannelEdge, TPolicyOverrides } from './pathfinding';
+import { buildEdgeOverlay, calculateFee, policyFor } from './pathfinding';
+import type { IChannelUpdateMessage, IRoute } from './types';
 import {
 	CHANNEL_FLAG_DISABLED,
 	DEFAULT_PRUNE_MAX_AGE,
-	IChannelUpdateMessage,
-	IRoute,
 	MESSAGE_FLAG_HTLC_MAX
 } from './types';
-import { IRoutingHintHop } from '../invoice/types';
+import type { IRoutingHintHop } from '../invoice/types';
 
 interface Edge {
 	from: string;

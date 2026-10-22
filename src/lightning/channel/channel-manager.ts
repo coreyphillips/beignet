@@ -8,7 +8,7 @@
 
 import { TypedEmitter } from '../../utils/typed-emitter';
 import type { TxidHex } from '../../utils/identifiers';
-import { ChannelManagerEvents } from './events';
+import type { ChannelManagerEvents } from './events';
 import crypto from 'crypto';
 import { MessageType } from '../message/types';
 import {
@@ -32,14 +32,14 @@ import {
 	decodeCommitmentSignedMessage,
 	decodeRevokeAndAckMessage
 } from '../message/channel-commitment';
+import type { IClosingCompleteMessage } from '../message/channel-close';
 import {
 	decodeShutdownMessage,
 	encodeShutdownMessage,
 	decodeClosingSignedMessage,
 	decodeClosingCompleteMessage,
 	decodeClosingSigMessage,
-	ClosingSigVariant,
-	IClosingCompleteMessage
+	ClosingSigVariant
 } from '../message/channel-close';
 import {
 	canScopeWireError,
@@ -56,28 +56,32 @@ import {
 	decodeSpliceLockedMessage,
 	decodeStartBatchMessage
 } from '../message/splice';
-import {
+import type {
 	ChannelAction,
-	ChannelActionType,
-	ChannelErrorCode,
 	IBroadcastTxAction,
 	IChannelPersistEvent,
 	IChannelPersistRequest,
 	IErrorAction,
 	ISendMessageAction,
-	IWireDurabilityBarrier,
+	IWireDurabilityBarrier
+} from './channel-actions';
+import {
+	ChannelActionType,
+	ChannelErrorCode,
 	QUORUM_BARRIER_MESSAGE_TYPES,
 	RETRANSMITTABLE_MESSAGE_TYPES,
 	SUPERSEDED_ON_REVOKE_MESSAGE_TYPES
 } from './channel-actions';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ChainMonitor } from '../chain/chain-monitor';
-import {
+import type {
 	ChainAction,
+	IFeeBumpAndBroadcastChainAction,
+	IFundingSpendScan
+} from '../chain/types';
+import {
 	ChainActionType,
 	CommitmentType,
-	IFeeBumpAndBroadcastChainAction,
-	IFundingSpendScan,
 	IRREVOCABLE_DEPTH,
 	OutputType,
 	satPerVbyteToSatPerKw
@@ -99,7 +103,8 @@ import {
 	verifyDirectedSelection
 } from '../node/funding-selection';
 import type { IDualFundingSelection } from '../node/funding-selection';
-import { ChannelSigner, ISigner, SignerFactory } from '../keys/signer';
+import type { ISigner, SignerFactory } from '../keys/signer';
+import { ChannelSigner } from '../keys/signer';
 import {
 	signRemoteCommitment,
 	signRemoteCommitmentPartial,
@@ -118,21 +123,18 @@ import {
 } from '../script/funding-taproot';
 import { buildTaprootAnchorOutput } from '../script/commitment-taproot';
 import { ecc } from '../../utils/ecc';
-import { Channel, ISpliceWalletInput, ITaprootClosingCache } from './channel';
-import {
-	createOpenerState,
-	createAcceptorState,
-	IChannelState
-} from './channel-state';
+import type { ISpliceWalletInput, ITaprootClosingCache } from './channel';
+import { Channel } from './channel';
+import type { IChannelState } from './channel-state';
+import { createOpenerState, createAcceptorState } from './channel-state';
 import {
 	deriveChannelId,
 	deriveV2TemporaryChannelId,
 	isValidShutdownScript
 } from './validation';
+import type { IChannelConfig, ChannelResult } from './types';
 import {
-	IChannelConfig,
 	DEFAULT_CHANNEL_CONFIG,
-	ChannelResult,
 	ChannelState,
 	ChannelRole,
 	HtlcDirection,
@@ -145,24 +147,22 @@ import {
 	MAX_FUNDING_SATOSHIS,
 	MAX_WUMBO_FUNDING_SATOSHIS
 } from './types';
+import type { IChannelBasepoints } from '../keys/derivation';
 import {
-	IChannelBasepoints,
 	perCommitmentPointFromSecret,
 	derivePublicKey,
 	derivePrivateKey
 } from '../keys/derivation';
 import { getPublicKey } from '../crypto/ecdh';
 import { generateFromSeed } from '../keys/shachain';
-import {
-	PeerError,
-	PeerErrorCode,
-	PeerManager
-} from '../transport/peer-manager';
+import type { PeerManager } from '../transport/peer-manager';
+import { PeerError, PeerErrorCode } from '../transport/peer-manager';
 import { ZeroConfManager } from './zero-conf';
 import {
 	decodeOpenChannel2Message,
 	decodeAcceptChannel2Message
 } from '../message/dual-funding';
+import type { ITxAddInputMessage } from '../message/interactive-tx';
 import {
 	decodeTxAddInputMessage,
 	decodeTxAddOutputMessage,
@@ -172,15 +172,11 @@ import {
 	decodeTxSignaturesMessage,
 	decodeTxInitRbfMessage,
 	decodeTxAckRbfMessage,
-	decodeTxAbortMessage,
-	ITxAddInputMessage
+	decodeTxAbortMessage
 } from '../message/interactive-tx';
-import {
-	DualFundingSession,
-	DualFundingState,
-	IDualFundingParams
-} from './dual-funding';
-import { ILeaseRates } from '../gossip/types';
+import type { DualFundingSession, IDualFundingParams } from './dual-funding';
+import { DualFundingState } from './dual-funding';
+import type { ILeaseRates } from '../gossip/types';
 import {
 	LEASE_DURATION_BLOCKS,
 	signWillFund,
@@ -190,18 +186,20 @@ import { decodeAnnouncementSignaturesMessage } from '../gossip/messages';
 import { Feature, FeatureFlags } from '../features/flags';
 import { sign as signWithNodeKey } from '../crypto/ecdh';
 import { decodeFforHeader } from '../ffor/messages';
-import {
+import type {
 	IFforSettlePolicy,
+	FforSlotState,
+	IFforBookEntry,
+	IFforEpochRecord
+} from '../ffor/types';
+import {
 	FF_ACTIVATION_TIMEOUT_MS,
 	FforAbortReason,
-	FforSlotState,
 	FforState,
-	IFforBookEntry,
-	IFforEpochRecord,
 	isFforConcurrentVersion
 } from '../ffor/types';
-import { IFforWitnessProvision } from '../ffor/witness-types';
-import { IFforVoucherArchive } from '../ffor/voucher-archive';
+import type { IFforWitnessProvision } from '../ffor/witness-types';
+import type { IFforVoucherArchive } from '../ffor/voucher-archive';
 
 /**
  * The outpoints a raw transaction spends, txid in display-order hex (the

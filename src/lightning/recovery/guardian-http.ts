@@ -15,9 +15,11 @@
  * and never participates in record acceptance.
  */
 
-import { IncomingMessage, Server, ServerResponse, createServer } from 'http';
+import type { IncomingMessage, Server, ServerResponse } from 'http';
+import { createServer } from 'http';
 import { timingSafeEqual } from 'crypto';
-import { GuardianStatus, ReferenceGuardian } from './guardian';
+import type { ReferenceGuardian } from './guardian';
+import { GuardianStatus } from './guardian';
 import {
 	GUARDIAN_CONTENT_TYPE,
 	GUARDIAN_HTTP_BASE_PATH,

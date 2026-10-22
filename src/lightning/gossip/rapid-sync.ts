@@ -38,10 +38,12 @@
 
 import * as https from 'https';
 import { readBigSizeParts } from '../message/codec';
-import { NetworkGraph } from './network-graph';
-import {
+import type { NetworkGraph } from './network-graph';
+import type {
 	IChannelAnnouncementMessage,
-	IChannelUpdateMessage,
+	IChannelUpdateMessage
+} from './types';
+import {
 	CHANNEL_FLAG_DIRECTION,
 	CHANNEL_FLAG_DISABLED,
 	MESSAGE_FLAG_HTLC_MAX

@@ -1,8 +1,4 @@
-import {
-	EAddressType,
-	EBoostType,
-	ECoinSelectPreference,
-	EFeeId,
+import type {
 	IAddressTypesIO,
 	ICoinSelectResponse,
 	IOutput,
@@ -12,10 +8,16 @@ import {
 	TGetByteCountOutputs,
 	TGetTotalFeeObj
 } from '../types';
-import { getDefaultSendTransaction } from '../shapes';
-import { Wallet } from '../wallet';
 import {
-	Result,
+	EAddressType,
+	EBoostType,
+	ECoinSelectPreference,
+	EFeeId
+} from '../types';
+import { getDefaultSendTransaction } from '../shapes';
+import type { Wallet } from '../wallet';
+import type { Result } from '../utils';
+import {
 	ok,
 	err,
 	EWalletErrorCode,
@@ -34,19 +36,19 @@ import {
 	getDustThreshold,
 	setReplaceByFee
 } from '../utils';
-import {
+import type {
 	IAddInput,
 	ICreateTransaction,
 	ISetupTransaction,
 	ITargets,
 	TSetupTransactionResponse
 } from '../types';
-import { Psbt } from 'bitcoinjs-lib';
-import { BIP32Interface } from 'bip32';
+import type { Psbt } from 'bitcoinjs-lib';
+import type { BIP32Interface } from 'bip32';
 import { ecc } from '../utils/ecc';
 import * as bitcoin from 'bitcoinjs-lib';
 import { getAddressInfo } from 'bitcoin-address-validation';
-import { ECPairInterface } from 'ecpair';
+import type { ECPairInterface } from 'ecpair';
 import { toXOnly } from 'bitcoinjs-lib/src/psbt/bip371';
 
 bitcoin.initEccLib(ecc);

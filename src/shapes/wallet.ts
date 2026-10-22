@@ -1,4 +1,4 @@
-import {
+import type {
 	IAddresses,
 	TAddressTypeContent,
 	IHeader,
@@ -6,13 +6,8 @@ import {
 	IOnchainFees
 } from '../types';
 import cloneDeep from 'lodash.clonedeep';
-import {
-	EBoostType,
-	IAddress,
-	ISendTransaction,
-	IWalletData,
-	EAddressType
-} from '../types';
+import type { IAddress, ISendTransaction, IWalletData } from '../types';
+import { EBoostType, EAddressType } from '../types';
 import { EFeeId } from '../types';
 
 export const addressTypes: Readonly<TAddressTypes> = {

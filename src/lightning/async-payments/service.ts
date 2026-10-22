@@ -55,22 +55,21 @@
 
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
-import {
-	DurableLedger,
+import type {
 	IDurableLedgerStore,
 	ILedgerCodec,
 	ILedgerRecord
 } from '../storage/durable-ledger';
+import { DurableLedger } from '../storage/durable-ledger';
 import { Feature } from '../features/flags';
+import type { IHeldForwardRecord } from './held-forward-ledger';
 import {
 	HeldForwardLedger,
-	IHeldForwardRecord,
 	isUnresolvedHeldForward
 } from './held-forward-ledger';
+import type { IReceiverGrant, IRegistrationReply } from './receiver-grant';
 import {
 	FEE_COLLECTION_PREPAID_ADMISSION_SENDER_HOLDING,
-	IReceiverGrant,
-	IRegistrationReply,
 	REGISTRATION_REQUEST_MAX_AGE_SEC,
 	decodeReceiverGrant,
 	decodeRegistrationRequest,
@@ -79,7 +78,7 @@ import {
 	signReceiverGrant,
 	verifyRegistrationRequest
 } from './receiver-grant';
-import {
+import type {
 	IAsyncReceiveServiceConfig,
 	IAsyncReceiveServiceMetrics
 } from './types';

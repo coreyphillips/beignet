@@ -1,14 +1,15 @@
-import {
-	EAddressType,
+import type {
 	IKeyDerivationPath,
 	TKeyDerivationAccount,
 	TKeyDerivationChange,
 	TKeyDerivationCoinType,
 	TKeyDerivationPurpose
 } from '../types';
+import { EAddressType } from '../types';
 import { Network } from '../network';
 import { addressTypes } from '../shapes';
-import { err, ok, Result } from './result';
+import type { Result } from './result';
+import { err, ok } from './result';
 
 /**
  * Parses a key derivation path in string format Ex: "m/84'/0'/0'/0/0" and returns IKeyDerivationPath.

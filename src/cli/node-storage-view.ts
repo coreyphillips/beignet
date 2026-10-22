@@ -31,7 +31,7 @@
  *   closed connection.
  */
 
-import { SqliteStorage } from '../lightning/storage/sqlite-storage';
+import type { SqliteStorage } from '../lightning/storage/sqlite-storage';
 
 /** better-sqlite3's error, word for word, for any use of a closed connection. */
 const CLOSED_CONNECTION = 'The database connection is not open';

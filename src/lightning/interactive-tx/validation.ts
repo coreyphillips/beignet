@@ -10,7 +10,7 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
-import { IInteractiveTxInput, IInteractiveTxOutput } from './types';
+import type { IInteractiveTxInput, IInteractiveTxOutput } from './types';
 
 export const DUST_LIMIT_SATS = 546n;
 

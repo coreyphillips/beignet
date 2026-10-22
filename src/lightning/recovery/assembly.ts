@@ -25,49 +25,41 @@
  */
 
 import { ecc } from '../../utils/ecc';
-import { IStorageBackend } from '../storage/types';
-import { INodeConfig } from '../node/types';
+import type { IStorageBackend } from '../storage/types';
+import type { INodeConfig } from '../node/types';
 import { getPublicKey } from '../crypto/ecdh';
+import type { GuardianState } from './guardian-wire';
 import {
 	CRASH_V1_PROFILE,
-	GuardianState,
 	computeGuardianSetId,
 	deriveRecoveryRoot
 } from './guardian-wire';
-import { IGuardianRotateSetRequest } from './guardian';
+import type { IGuardianRotateSetRequest } from './guardian';
+import type {
+	GuardianHttpTransport,
+	IBoundGuardianClient,
+	IGuardianSetContext
+} from './guardian-client';
 import {
 	GUARDIAN_BOLT8_SCHEME,
 	GuardianClient,
-	GuardianHttpTransport,
-	IBoundGuardianClient,
-	IGuardianSetContext,
 	isOnionV3Hostname,
 	parseBolt8GuardianUrl
 } from './guardian-client';
-import {
+import type {
 	GuardianAuth,
 	GuardianDescriptor,
-	GuardianTransportType,
-	assertGuardianAuth
+	GuardianTransportType
 } from './capsule';
-import {
-	GuardianReplicator,
-	IGuardianReplicationEvent
-} from './guardian-replication';
-import {
-	DurabilityBarrier,
-	IDurabilityBarrierEvent
-} from './durability-barrier';
-import {
-	GuardianStartupGate,
-	IConfirmationOutcome,
-	IStartupGateEvent
-} from './startup-gate';
-import {
-	IRestoreEvent,
-	RestoreDriver,
-	rotationEntries
-} from './restore-driver';
+import { assertGuardianAuth } from './capsule';
+import type { IGuardianReplicationEvent } from './guardian-replication';
+import { GuardianReplicator } from './guardian-replication';
+import type { IDurabilityBarrierEvent } from './durability-barrier';
+import { DurabilityBarrier } from './durability-barrier';
+import type { IConfirmationOutcome, IStartupGateEvent } from './startup-gate';
+import { GuardianStartupGate } from './startup-gate';
+import type { IRestoreEvent } from './restore-driver';
+import { RestoreDriver, rotationEntries } from './restore-driver';
 import { deriveRecoveryMasterKey } from './journal';
 
 /** One configured guardian: its committed identity and where to reach it. */

@@ -5,14 +5,13 @@
  * to/from JSON-safe representations for SQLite storage.
  */
 
-import {
+import type {
 	IChannelState,
 	ISpliceInFlight,
 	IV2InFlight,
 	ChannelCloseReason
 } from '../channel/channel-state';
-import {
-	isFforConcurrentVersion,
+import type {
 	FforConcurrentVersion,
 	FforAbortReason,
 	FforRole,
@@ -20,25 +19,31 @@ import {
 	FforState,
 	IFforEpochRecord
 } from '../ffor/types';
+import { isFforConcurrentVersion } from '../ffor/types';
 import { fforTranscriptConcurrentVersion } from '../ffor/messages';
 import { validateFforSyncState } from '../ffor/sync-state';
-import { ShaChainStore, IShaChainEntry } from '../keys/shachain';
-import { IChannelBasepoints } from '../keys/derivation';
-import {
+import type { IShaChainEntry } from '../keys/shachain';
+import { ShaChainStore } from '../keys/shachain';
+import type { IChannelBasepoints } from '../keys/derivation';
+import type {
 	ChannelState,
 	ChannelRole,
 	IChannelConfig,
 	IHtlcEntry,
 	IHtlcSnapshotEntry,
 	HtlcDirection,
-	HtlcState,
-	DEFAULT_CHANNEL_CONFIG
+	HtlcState
 } from '../channel/types';
-import { IPaymentInfo, PaymentStatus, PaymentDirection } from '../node/types';
-import { IChainMonitorState } from '../chain/chain-monitor';
-import { IGraphChannel, IGraphNode } from '../gossip/types';
+import { DEFAULT_CHANNEL_CONFIG } from '../channel/types';
+import type {
+	IPaymentInfo,
+	PaymentStatus,
+	PaymentDirection
+} from '../node/payment-types';
+import type { IChainMonitorState } from '../chain/chain-monitor';
+import type { IGraphChannel, IGraphNode } from '../gossip/types';
+import type { ICompactHtlcHistory } from './htlc-history';
 import {
-	ICompactHtlcHistory,
 	encodeHtlcHistory,
 	decodeHtlcHistory,
 	usesCompactHtlcHistory

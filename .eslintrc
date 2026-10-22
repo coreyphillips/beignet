@@ -62,6 +62,15 @@
       }
     },
     {
+      "files": ["src/**/*.ts"],
+      "rules": {
+        "@typescript-eslint/consistent-type-imports": [
+          "error",
+          { "disallowTypeAnnotations": false }
+        ]
+      }
+    },
+    {
       "files": ["tests/**/*.ts"],
       "rules": {
         "@typescript-eslint/no-var-requires": "off",

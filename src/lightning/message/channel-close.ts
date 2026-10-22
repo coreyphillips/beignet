@@ -28,7 +28,8 @@
  * machine, not the codec).
  */
 
-import { ITlvRecord, decodeTlvStream, encodeTlvStream } from './tlv';
+import type { ITlvRecord } from './tlv';
+import { decodeTlvStream, encodeTlvStream } from './tlv';
 
 export interface IShutdownMessage {
 	channelId: Buffer;

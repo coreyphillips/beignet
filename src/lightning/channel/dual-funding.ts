@@ -123,12 +123,12 @@
  */
 
 import { InteractiveTxBuilder } from '../interactive-tx/builder';
-import {
+import type {
 	InteractiveTxState,
 	IInteractiveTxInput,
 	IInteractiveTxOutput
 } from '../interactive-tx/types';
-import {
+import type {
 	IOpenChannel2Message,
 	IAcceptChannel2Message,
 	IRequestFunds,
@@ -143,8 +143,8 @@ import {
 	MAX_MINIMUM_DEPTH
 } from './types';
 import { validateChannelPoints } from './validation';
-import { IChannelBasepoints } from '../keys/derivation';
-import { ILeaseRates } from '../gossip/types';
+import type { IChannelBasepoints } from '../keys/derivation';
+import type { ILeaseRates } from '../gossip/types';
 
 /**
  * BOLT 2: the minimum feerate for an RBF attempt is the greater of 25/24 of

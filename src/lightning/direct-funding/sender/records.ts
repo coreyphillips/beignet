@@ -16,11 +16,8 @@
  * wallet-data store, the same place 4A's request records live.
  */
 
-import {
-	DF_POST_WITNESS_STATES,
-	DfPaymentStatus,
-	IDfPaymentRecord
-} from './types';
+import type { DfPaymentStatus, IDfPaymentRecord } from './types';
+import { DF_POST_WITNESS_STATES } from './types';
 
 /** Wallet-data key holding every payment record. */
 export const DF_PAYMENTS_STORAGE_KEY = 'df:payments';

@@ -11,8 +11,8 @@
  * carries its whole history there.
  */
 
-import { IChannelState } from './channel-state';
-import { IHtlcSnapshotEntry } from './types';
+import type { IChannelState } from './channel-state';
+import type { IHtlcSnapshotEntry } from './types';
 
 const tracked = new WeakMap<
 	IChannelState,

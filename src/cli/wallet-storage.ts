@@ -14,9 +14,10 @@
  * itself is per-network, so networks can never mix.
  */
 
-import { IStorageBackend } from '../lightning/storage/types';
-import { IWalletData, TStorage } from '../types/wallet';
-import { Result, ok, err } from '../utils/result';
+import type { IStorageBackend } from '../lightning/storage/types';
+import type { IWalletData, TStorage } from '../types/wallet';
+import type { Result } from '../utils/result';
+import { ok, err } from '../utils/result';
 
 export function createWalletStorage(storage: IStorageBackend): TStorage {
 	if (!storage.saveWalletData || !storage.loadWalletData) {

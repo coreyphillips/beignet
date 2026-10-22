@@ -25,11 +25,10 @@
 
 import { createHash } from 'crypto';
 import { ecc } from '../../utils/ecc';
+import type { GuardianState, LogHead } from './guardian-wire';
 import {
 	CRASH_V1_PROFILE,
 	GUARDIAN_PROTOCOL_VERSION,
-	GuardianState,
-	LogHead,
 	acquireTranscriptHash,
 	computeGuardianSetId,
 	isGenesisLogHead,
@@ -47,15 +46,13 @@ import {
 	rotateTranscriptHash,
 	rotationEvidenceProblem
 } from './guardian-wire';
-import {
-	GuardianStore,
+import type {
 	IGuardianEpochRow,
 	IGuardianNamespaceRow,
 	IGuardianOrphanRow,
-	IGuardianRecordRow,
-	readU64be,
-	u64be
+	IGuardianRecordRow
 } from './guardian-store';
+import { GuardianStore, readU64be, u64be } from './guardian-store';
 import {
 	decodeRotateSetRequest,
 	encodeRotateSetRequest

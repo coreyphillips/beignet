@@ -16,12 +16,14 @@
  *     (Decode also accepts legacy type 0 = bare 32-byte txid.)
  */
 
-import { encodeTlvStream, decodeTlvStream, ITlvRecord } from './tlv';
+import type { ITlvRecord } from './tlv';
+import { encodeTlvStream, decodeTlvStream } from './tlv';
 import {
 	decodeFforReestablishTlv,
 	encodeFforReestablishTlv
 } from '../ffor/messages';
-import { FF_REESTABLISH_TLV_TYPE, IFforReestablishTlv } from '../ffor/types';
+import type { IFforReestablishTlv } from '../ffor/types';
+import { FF_REESTABLISH_TLV_TYPE } from '../ffor/types';
 
 export interface IChannelReestablishMessage {
 	channelId: Buffer;

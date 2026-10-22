@@ -20,14 +20,11 @@
  * because a quarantined node simply does nothing.
  */
 
-import { GuardianState } from './guardian-wire';
-import { GuardianReplicator } from './guardian-replication';
-import {
-	IWriterLeaseKeys,
-	markLeaseConfirmed,
-	publicLease
-} from './writer-lease';
-import { IStorageBackend } from '../storage/types';
+import type { GuardianState } from './guardian-wire';
+import type { GuardianReplicator } from './guardian-replication';
+import type { IWriterLeaseKeys } from './writer-lease';
+import { markLeaseConfirmed, publicLease } from './writer-lease';
+import type { IStorageBackend } from '../storage/types';
 
 export type StartupGateState =
 	/** Nothing may reach a channel peer. The starting state, and the safe one. */

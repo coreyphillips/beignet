@@ -1,5 +1,5 @@
 import * as tls from 'tls';
-import { Tls } from '../types/electrum';
+import type { Tls } from '../types/electrum';
 import {
 	normalizeFingerprint,
 	withTlsVerification

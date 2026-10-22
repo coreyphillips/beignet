@@ -3,7 +3,7 @@
  * backlog persistence shapes, and health reporting.
  */
 
-import { EventEmitter } from 'events';
+import type { EventEmitter } from 'events';
 
 /** A parsed `pubkey@host:port` tower address. */
 export interface ITowerAddress {

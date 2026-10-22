@@ -1,4 +1,5 @@
-import { Network as BitcoinJsNetwork, networks } from 'bitcoinjs-lib';
+import type { Network as BitcoinJsNetwork } from 'bitcoinjs-lib';
+import { networks } from 'bitcoinjs-lib';
 import { EElectrumNetworks } from './types/electrum';
 
 /**

@@ -16,7 +16,7 @@ import {
 import { encodeNodeAnnouncementMessage } from '../../src/lightning/gossip/messages';
 import { ADDRESS_TYPE_DNS } from '../../src/lightning/gossip/types';
 import { buildJusticeBackup } from '../../src/lightning/watchtower/justice';
-import { isValidBech32mEncodedString } from '../../src/utils/wallet';
+import { isValidBech32mEncodedString } from '../../src/utils/common';
 
 describe('LOW hardening batch', function () {
 	describe('BOLT 7 required-feature check vs the IMPLEMENTED set', function () {

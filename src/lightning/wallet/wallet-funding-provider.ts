@@ -8,8 +8,8 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
 import { getECPair } from '../../utils/ecc-apis';
-import { IFundingProvider, IUtxoSelectionOpts } from '../node/types';
-import { ISpliceWalletInput } from '../channel/channel';
+import type { IFundingProvider, IUtxoSelectionOpts } from '../node/types';
+import type { ISpliceWalletInput } from '../channel/channel';
 import {
 	estimateSpliceTxWeight,
 	spliceFeeSats,

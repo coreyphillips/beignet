@@ -11,8 +11,8 @@ import {
 } from '../transport/iroh';
 import { parseWebSocketUrl } from '../transport/websocket';
 import type { IPeerTransportOptions } from '../transport/duplex-transport';
+import type { IFforVoucherArchive } from '../ffor/voucher-archive';
 import {
-	IFforVoucherArchive,
 	fforVoucherArchiveId,
 	mergeFforVoucherArchive,
 	validateFforVoucherArchive
@@ -21,7 +21,7 @@ import type Database from 'better-sqlite3';
 import { loadBetterSqlite3 } from './sqlite-binding';
 import { createHmac } from 'crypto';
 import * as fs from 'fs';
-import {
+import type {
 	IStorageBackend,
 	IGossipRowPage,
 	IInvoiceInfo,
@@ -33,21 +33,24 @@ import {
 	IRecoveryOutboxStoredMessage,
 	IStoredRecoveryFrame,
 	IStoredRecoveryFrameHeader,
-	CorruptRecoveryRowError,
 	RecoveryOutboxDisposition
 } from './types';
-import { IWatchtowerSession, IWatchtowerUpdate } from '../watchtower/types';
-import { IChannelState } from '../channel/channel-state';
-import { IHtlcSnapshotEntry } from '../channel/types';
+import { CorruptRecoveryRowError } from './types';
+import type {
+	IWatchtowerSession,
+	IWatchtowerUpdate
+} from '../watchtower/types';
+import type { IChannelState } from '../channel/channel-state';
+import type { IHtlcSnapshotEntry } from '../channel/types';
 import {
 	markRevokedHtlcSnapshotsSaved,
 	unsavedRevokedHtlcSnapshots
 } from '../channel/htlc-snapshots';
-import { IPaymentInfo } from '../node/types';
-import { IChainMonitorState } from '../chain/chain-monitor';
-import { IGraphChannel, IGraphNode } from '../gossip/types';
+import type { IPaymentInfo } from '../node/payment-types';
+import type { IChainMonitorState } from '../chain/chain-monitor';
+import type { IGraphChannel, IGraphNode } from '../gossip/types';
+import type { ISerializedChannelState } from './serialization';
 import {
-	ISerializedChannelState,
 	serializeChannelState,
 	deserializeChannelState,
 	serializeHtlcSnapshotEntries,

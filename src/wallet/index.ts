@@ -1,16 +1,10 @@
 import * as bitcoin from 'bitcoinjs-lib';
-import { Network as BitcoinJsNetwork } from 'bitcoinjs-lib';
-import { BIP32Interface } from 'bip32';
+import type { Network as BitcoinJsNetwork } from 'bitcoinjs-lib';
+import type { BIP32Interface } from 'bip32';
 import { bip32 } from '../utils/ecc-apis';
 import cloneDeep from 'lodash.clonedeep';
 
-import {
-	EAddressType,
-	EBoostType,
-	ECoinSelectPreference,
-	EFeeId,
-	EPaymentType,
-	EScanningStrategy,
+import type {
 	IAddress,
 	IAddresses,
 	IBalanceBreakdown,
@@ -88,7 +82,16 @@ import {
 	TUnspentAddressScriptHashData,
 	TWalletDataKeys
 } from '../types';
+import {
+	EAddressType,
+	EBoostType,
+	ECoinSelectPreference,
+	EFeeId,
+	EPaymentType,
+	EScanningStrategy
+} from '../types';
 import { Network, toBitcoinJsNetwork, toElectrumNetwork } from '../network';
+import type { IKeyOrigin, Result } from '../utils';
 import {
 	appendDescriptorChecksum,
 	BoostError,
@@ -117,7 +120,6 @@ import {
 	getSeed,
 	getWalletDataStorageKey,
 	hasUntrimmedInputs,
-	IKeyOrigin,
 	isPositive,
 	MultisigSpendError,
 	normalizeKeyOrigin,
@@ -127,7 +129,6 @@ import {
 	parseBip48Path,
 	parseExtendedPublicKey,
 	removeDustUtxos,
-	Result,
 	shuffleArray,
 	trimInputs,
 	validateAddress,
@@ -155,7 +156,8 @@ import {
 } from './constants';
 import { btcToSats } from '../utils/conversion';
 import { derivePathCached } from '../utils/derive-path-cached';
-import { ILogger, createConsoleLogger } from '../logger';
+import type { ILogger } from '../logger';
+import { createConsoleLogger } from '../logger';
 
 type TAddressLookup = {
 	maps: (IAddresses | undefined)[];

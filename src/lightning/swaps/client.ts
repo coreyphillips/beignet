@@ -12,14 +12,15 @@ import {
 	DEFAULT_MIN_FINAL_CLTV_EXPIRY,
 	Network
 } from '../invoice/types';
-import { buildSwapHtlc, ISwapHtlc } from './htlc';
-import {
+import type { ISwapHtlc } from './htlc';
+import { buildSwapHtlc } from './htlc';
+import type {
 	ISwapCreate,
 	ISwapCreateAck,
 	ISwapSubmarineCreate,
-	ISwapSubmarineCreateAck,
-	SwapRefusalReason
+	ISwapSubmarineCreateAck
 } from './messages';
+import { SwapRefusalReason } from './messages';
 
 export interface IReverseSwapFeeTerms {
 	flatFeeSat: bigint;

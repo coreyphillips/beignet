@@ -22,11 +22,11 @@ import { schnorrVerify } from '../../offer/schnorr';
 import { isValidShutdownScript } from '../../channel/validation';
 import { estimateSpliceTxWeight } from '../../channel/splice-weight';
 import { scriptKind } from '../../wallet/wallet-funding-provider';
+import type { IDfOffer } from '../messages';
 import {
 	bitcoinMessageHash,
 	deriveOfferId,
 	DF_MESSAGE_SIGNATURE_BYTES,
-	IDfOffer,
 	ownershipDigest,
 	ownershipMessage,
 	ownershipProbeTransaction
@@ -37,11 +37,8 @@ import {
 	DF_MAX_TX_OUTPUTS,
 	DF_NODE_ID_BYTES
 } from '../types';
-import {
-	DF_HARD_MIN_OFFER_AMOUNT_SAT,
-	IDfChainSource,
-	IDfReceiverConfig
-} from './types';
+import type { IDfChainSource, IDfReceiverConfig } from './types';
+import { DF_HARD_MIN_OFFER_AMOUNT_SAT } from './types';
 
 const XONLY_PUBKEY_BYTES = 32;
 

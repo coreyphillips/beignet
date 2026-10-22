@@ -43,12 +43,10 @@
  */
 
 import { BITCOIN_CHAIN_HASH } from '../channel/types';
-import { decodeTlvStream, encodeTlvStream, ITlvRecord } from './tlv';
-import {
-	ILeaseRates,
-	encodeLeaseRates,
-	decodeLeaseRates
-} from '../gossip/types';
+import type { ITlvRecord } from './tlv';
+import { decodeTlvStream, encodeTlvStream } from './tlv';
+import type { ILeaseRates } from '../gossip/types';
+import { encodeLeaseRates, decodeLeaseRates } from '../gossip/types';
 
 /** TLV type for channel_type */
 const TLV_CHANNEL_TYPE = 1n;

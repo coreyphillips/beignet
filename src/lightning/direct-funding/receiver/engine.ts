@@ -51,39 +51,28 @@ import { ChainBackendUnavailableError } from '../../chain/chain-watcher';
 import { BeignetCustomSubtype } from '../../message/custom';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX } from '../../message/splice';
 import { zbase32Decode } from '../../crypto/message-signing';
+import type { IDfLaneKeys, IDfWireFrame } from '../frames';
 import {
 	decodeSealedFrame,
 	encodeSealedFrame,
-	IDfLaneKeys,
-	IDfWireFrame,
 	openFrame,
 	sealFrame
 } from '../frames';
+import type { IDfOffer, IDfPrevout, IDfWitness } from '../messages';
 import {
 	attestationMessage,
 	decodeDfOffer,
 	decodeDfWitness,
 	encodeDfOfferAck,
 	encodeDfReceipt,
-	encodeDfSignRequest,
-	IDfOffer,
-	IDfPrevout,
-	IDfWitness
+	encodeDfSignRequest
 } from '../messages';
-import {
-	DF_SIGNATURE_BYTES,
-	DirectFundingError,
-	IDfAttemptFunding,
-	IDfRequestRecord
-} from '../types';
+import type { IDfAttemptFunding, IDfRequestRecord } from '../types';
+import { DF_SIGNATURE_BYTES, DirectFundingError } from '../types';
 import type { DfTransportRegistry } from '../transport/registry';
 import type { IDfInboundFrame, IDfLaneSender } from '../transport/types';
-import {
-	contentHashOf,
-	DfOfferSessions,
-	IDfOfferSession,
-	outpointKey
-} from './sessions';
+import type { IDfOfferSession } from './sessions';
+import { contentHashOf, DfOfferSessions, outpointKey } from './sessions';
 import {
 	classifyOfferedCoin,
 	fundingTransactionProblem,
@@ -91,6 +80,15 @@ import {
 	ownershipProblem,
 	spliceFeerateCeiling
 } from './verify';
+import type {
+	DirectFundingReceiverEvents,
+	IDfChannelHandle,
+	IDfExternalInput,
+	IDfPendingSpliceTx,
+	IDfPendingV2FundingTx,
+	IDfReceiverConfig,
+	IDfReceiverDeps
+} from './types';
 import {
 	DF_CHAIN_RETRY_INTERVAL_MS,
 	DF_CHAIN_WAIT_MS,
@@ -114,14 +112,7 @@ import {
 	DF_OUTPOINT_COOLDOWN_MS,
 	DF_RECEIVER_SWEEP_INTERVAL_MS,
 	DF_WITNESS_TIMEOUT_MS,
-	DfOfferDropReason,
-	DirectFundingReceiverEvents,
-	IDfChannelHandle,
-	IDfExternalInput,
-	IDfPendingSpliceTx,
-	IDfPendingV2FundingTx,
-	IDfReceiverConfig,
-	IDfReceiverDeps
+	DfOfferDropReason
 } from './types';
 
 /** What a funding given up with its request is aborted with (issue #644). */

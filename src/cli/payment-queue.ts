@@ -19,7 +19,7 @@
 
 import { EventEmitter } from 'events';
 import { BeignetError, BeignetErrorCode } from './errors';
-import { QueuedPayment } from './types';
+import type { QueuedPayment } from './types';
 
 const SATS_MESSAGE = 'must be a whole number of satoshis, zero or greater';
 

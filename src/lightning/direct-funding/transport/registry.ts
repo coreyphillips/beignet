@@ -17,19 +17,19 @@
  *    treated as an error. Type 4 is exactly that until #533 lands.
  */
 
-import {
+import type {
 	DfTransportDescriptor,
-	DfTransportType,
-	DirectFundingError,
-	DirectFundingErrorCode,
 	IDfDirectPeerTransport,
 	IDfOnionTransport,
 	IDfRelayTransport
 } from '../types';
 import {
-	DF_LOG_LANE_SKIPPED,
+	DfTransportType,
+	DirectFundingError,
+	DirectFundingErrorCode
+} from '../types';
+import type {
 	DfFrameHandler,
-	DfLaneSkipReason,
 	DfTransportLog,
 	IDfLaneFactory,
 	IDfLaneRegistration,
@@ -37,6 +37,7 @@ import {
 	IDfTransport,
 	IDfWarmResult
 } from './types';
+import { DF_LOG_LANE_SKIPPED, DfLaneSkipReason } from './types';
 
 /** A registration plus whatever its loader has produced so far. */
 interface IResolvedRegistration extends IDfLaneRegistration {

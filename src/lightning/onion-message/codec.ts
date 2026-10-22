@@ -11,18 +11,15 @@
  * accepted and preserved when forwarding.
  */
 
-import { IOnionMessage } from './types';
+import type { IOnionMessage } from './types';
+import type { IOnionMessagePayload } from './types';
 import {
-	IOnionMessagePayload,
 	TLV_ENCRYPTED_RECIPIENT_DATA,
 	TLV_REPLY_PATH,
 	TLV_MESSAGE_DATA_BASE
 } from './types';
-import {
-	IBlindedPath,
-	encodeBlindedPath,
-	decodeBlindedPath
-} from '../onion/blinded-path';
+import type { IBlindedPath } from '../onion/blinded-path';
+import { encodeBlindedPath, decodeBlindedPath } from '../onion/blinded-path';
 import { encodeBigSize, decodeBigSize } from '../message/codec';
 
 /**

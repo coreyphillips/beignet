@@ -14,8 +14,9 @@
  */
 
 import type * as Encryption from '../lightning/storage/encryption';
-import { IWalletData, TStorage } from '../types';
-import { err, ok, Result } from './result';
+import type { IWalletData, TStorage } from '../types';
+import type { Result } from './result';
+import { err, ok } from './result';
 
 const WALLET_ENC_PREFIX = 'encw1:';
 const WALLET_HKDF_INFO = 'beignet-wallet-storage-v1';

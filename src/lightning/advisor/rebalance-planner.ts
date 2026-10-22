@@ -3,7 +3,7 @@
  * pairs. Pure and deterministic -- no side effects, no clock, no network.
  */
 
-import { IChannelSnapshot } from './liquidity-advisor';
+import type { IChannelSnapshot } from './liquidity-advisor';
 
 /** A concrete circular-rebalance instruction (execution decides fee caps). */
 export interface IRebalancePlan {

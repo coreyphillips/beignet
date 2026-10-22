@@ -1,11 +1,12 @@
 import * as bitcoin from 'bitcoinjs-lib';
-import { BIP32Interface } from 'bip32';
+import type { BIP32Interface } from 'bip32';
 import { bip32 } from './ecc-apis';
 
 import { EAddressType } from '../types';
 import { Network } from '../network';
 import { CodedError } from './errors';
-import { err, ok, Result } from './result';
+import type { Result } from './result';
+import { err, ok } from './result';
 
 /**
  * Typed error thrown/returned whenever a watch-only wallet is asked to

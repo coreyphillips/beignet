@@ -1,9 +1,10 @@
 import * as bitcoin from 'bitcoinjs-lib';
-import { BIP32Interface } from 'bip32';
-import { Network } from 'bitcoinjs-lib';
+import type { BIP32Interface } from 'bip32';
+import type { Network } from 'bitcoinjs-lib';
 
 import { CodedError } from './errors';
-import { err, ok, Result } from './result';
+import type { Result } from './result';
+import { err, ok } from './result';
 
 /**
  * Typed error returned when a direct spend (send/sendMany/sendMax/sweep) is

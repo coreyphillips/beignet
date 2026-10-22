@@ -9,12 +9,8 @@
  */
 
 import crypto from 'crypto';
-import {
-	IHopPayload,
-	IOnionPacket,
-	ONION_VERSION,
-	ROUTING_INFO_LENGTH
-} from './types';
+import type { IHopPayload, IOnionPacket } from './types';
+import { ONION_VERSION, ROUTING_INFO_LENGTH } from './types';
 import {
 	computeSharedSecrets,
 	deriveHopKeys,

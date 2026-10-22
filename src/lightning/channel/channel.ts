@@ -21,54 +21,64 @@ import {
 	encodeChannelUpdateMessage
 } from '../gossip/messages';
 import { MessageType } from '../message/types';
-import {
-	encodeOpenChannelMessage,
+import type {
 	IOpenChannelMessage,
-	encodeAcceptChannelMessage,
 	IAcceptChannelMessage
 } from '../message/channel-open';
 import {
-	encodeFundingCreatedMessage,
+	encodeOpenChannelMessage,
+	encodeAcceptChannelMessage
+} from '../message/channel-open';
+import type {
 	IFundingCreatedMessage,
-	encodeFundingSignedMessage,
 	IFundingSignedMessage,
-	encodeChannelReadyMessage,
 	IChannelReadyMessage
 } from '../message/channel-funding';
 import {
-	decodeUpdateAddHtlcMessage,
-	encodeUpdateAddHtlcMessage,
+	encodeFundingCreatedMessage,
+	encodeFundingSignedMessage,
+	encodeChannelReadyMessage
+} from '../message/channel-funding';
+import type {
 	IUpdateAddHtlcMessage,
-	encodeUpdateFulfillHtlcMessage,
 	IUpdateFulfillHtlcMessage,
-	encodeUpdateFailHtlcMessage,
 	IUpdateFailHtlcMessage,
-	encodeUpdateFailMalformedHtlcMessage,
 	IUpdateFailMalformedHtlcMessage,
-	encodeUpdateFeeMessage,
 	IUpdateFeeMessage,
 	IUpdateBlockheightMessage
 } from '../message/channel-update';
 import {
-	encodeCommitmentSignedMessage,
-	decodeCommitmentSignedMessage,
+	decodeUpdateAddHtlcMessage,
+	encodeUpdateAddHtlcMessage,
+	encodeUpdateFulfillHtlcMessage,
+	encodeUpdateFailHtlcMessage,
+	encodeUpdateFailMalformedHtlcMessage,
+	encodeUpdateFeeMessage
+} from '../message/channel-update';
+import type {
 	ICommitmentSignedMessage,
-	encodeRevokeAndAckMessage,
 	IRevokeAndAckMessage
 } from '../message/channel-commitment';
 import {
-	encodeShutdownMessage,
+	encodeCommitmentSignedMessage,
+	decodeCommitmentSignedMessage,
+	encodeRevokeAndAckMessage
+} from '../message/channel-commitment';
+import type {
 	IShutdownMessage,
-	encodeClosingSignedMessage,
 	IClosingSignedMessage,
-	ClosingSigVariant,
 	IClosingCompleteMessage,
-	IClosingSigMessage,
+	IClosingSigMessage
+} from '../message/channel-close';
+import {
+	encodeShutdownMessage,
+	encodeClosingSignedMessage,
+	ClosingSigVariant,
 	encodeClosingCompleteMessage,
 	encodeClosingSigMessage
 } from '../message/channel-close';
+import type { ICooperativeCloseQuote } from '../chain/closing';
 import {
-	ICooperativeCloseQuote,
 	isDustOutput,
 	calculateClosingFee,
 	closingTxWeight,
@@ -76,24 +86,19 @@ import {
 	closingOutputDustLimit,
 	minRelayFeeForWeight
 } from '../chain/closing';
-import {
-	encodeChannelReestablishMessage,
-	IChannelReestablishMessage
-} from '../message/channel-reestablish';
+import type { IChannelReestablishMessage } from '../message/channel-reestablish';
+import { encodeChannelReestablishMessage } from '../message/channel-reestablish';
 import { canScopeWireError, encodeErrorMessage } from '../message/error';
-import {
+import type {
 	ChannelAction,
-	ChannelActionType,
-	ChannelErrorCode,
 	ISendMessageAction,
 	IErrorAction
 } from './channel-actions';
+import { ChannelActionType, ChannelErrorCode } from './channel-actions';
+import type { IChannelConfig, IHtlcEntry, IHtlcSnapshotEntry } from './types';
 import {
 	ChannelState,
 	ChannelRole,
-	IChannelConfig,
-	IHtlcEntry,
-	IHtlcSnapshotEntry,
 	HtlcDirection,
 	HtlcState,
 	BITCOIN_CHAIN_HASH,
@@ -102,19 +107,21 @@ import {
 	DEFAULT_MINIMUM_DEPTH,
 	MAX_MINIMUM_DEPTH
 } from './types';
-import {
+import type {
 	IAbandonedLocalAdd,
 	IChannelState,
 	IRemoteForwardingPolicy,
 	ISpliceInFlight,
 	IV2InFlight,
+	RecoveryCloseReason,
+	ChannelCloseReason
+} from './channel-state';
+import {
 	createOpenerState,
 	createAcceptorState,
 	mustNotBroadcastCommitment,
 	isRecencyUnproven,
-	recencyHoldOrigin,
-	RecoveryCloseReason,
-	ChannelCloseReason
+	recencyHoldOrigin
 } from './channel-state';
 import { recordRevokedHtlcSnapshot } from './htlc-snapshots';
 import { ChannelRecoveryStatus } from '../recovery/channel-status';
@@ -128,15 +135,16 @@ import {
 	validateU64,
 	isValidShutdownScript
 } from './validation';
-import { IChannelBasepoints } from '../keys/derivation';
+import type { IChannelBasepoints } from '../keys/derivation';
 import { FeatureFlags, Feature } from '../features/flags';
 import { generateFromSeed, MAX_INDEX } from '../keys/shachain';
 import { perCommitmentPointFromSecret } from '../keys/derivation';
-import { ChannelSigner, ISigner } from '../keys/signer';
+import type { ISigner } from '../keys/signer';
+import { ChannelSigner } from '../keys/signer';
+import type { IBuiltCommitment } from './commitment-builder';
 import {
 	buildLocalCommitment,
 	aggregateLocalCommitmentSig,
-	IBuiltCommitment,
 	buildRemoteCommitment,
 	signRemoteCommitment,
 	verifyRemoteCommitmentSig,
@@ -166,27 +174,11 @@ import {
 	verifyPartialCommitmentSig
 } from './commitment-musig';
 import { isValidPublicKey } from '../crypto/ecdh';
-import { IStfuMessage, encodeStfuMessage } from '../message/stfu';
+import type { IStfuMessage } from '../message/stfu';
+import { encodeStfuMessage } from '../message/stfu';
 import { QuiescenceManager, QuiescenceState } from './quiescence';
-import {
-	FF_ABORT_TYPE,
-	FF_ACCEPT_TYPE,
-	FF_ACTIVATE_ACK_TYPE,
-	FF_ACTIVATE_TYPE,
-	FF_CLOSE_ACK_TYPE,
-	FF_CLOSE_TYPE,
-	FF_CONCURRENT_VERSION,
-	FF_CONCURRENT_RESERVED_VERSION,
-	isFforConcurrentVersion,
-	FF_EPOCH_START_TOLERANCE_BLOCKS,
-	FF_INIT_TYPE,
-	FF_SYNC_TYPE,
-	FF_SYNC_REPLY_TYPE,
-	FforAbortReason,
+import type {
 	FforRole,
-	FforSlotState,
-	FforState,
-	FforVariant,
 	IFforAbortMessage,
 	IFforAcceptMessage,
 	IFforActivateAckMessage,
@@ -203,7 +195,26 @@ import {
 	IFforSyncMessage,
 	IFforSyncReplyMessage
 } from '../ffor/types';
-import { IFforWitnessProvision } from '../ffor/witness-types';
+import {
+	FF_ABORT_TYPE,
+	FF_ACCEPT_TYPE,
+	FF_ACTIVATE_ACK_TYPE,
+	FF_ACTIVATE_TYPE,
+	FF_CLOSE_ACK_TYPE,
+	FF_CLOSE_TYPE,
+	FF_CONCURRENT_VERSION,
+	FF_CONCURRENT_RESERVED_VERSION,
+	isFforConcurrentVersion,
+	FF_EPOCH_START_TOLERANCE_BLOCKS,
+	FF_INIT_TYPE,
+	FF_SYNC_TYPE,
+	FF_SYNC_REPLY_TYPE,
+	FforAbortReason,
+	FforSlotState,
+	FforState,
+	FforVariant
+} from '../ffor/types';
+import type { IFforWitnessProvision } from '../ffor/witness-types';
 import {
 	bitmapGet,
 	bitmapLength,
@@ -241,11 +252,8 @@ import {
 	computeTInit,
 	computeTSetup
 } from '../ffor/transcript';
-import {
-	checkVoucherBook,
-	IFforBookCheckContext,
-	U64_MAX
-} from '../ffor/amounts';
+import type { IFforBookCheckContext } from '../ffor/amounts';
+import { checkVoucherBook, U64_MAX } from '../ffor/amounts';
 import {
 	buildVoucherOnion,
 	matchVoucher,
@@ -257,18 +265,21 @@ import {
 	FAILURE_MESSAGE_LENGTH
 } from '../onion/failures';
 import { TEMPORARY_NODE_FAILURE } from '../onion/types';
-import {
+import type {
 	ISpliceMessage,
 	ISpliceAckMessage,
 	ISpliceLockedMessage,
-	IStartBatchMessage,
+	IStartBatchMessage
+} from '../message/splice';
+import {
 	encodeSpliceMessage,
 	encodeSpliceAckMessage,
 	SPLICE_LOCK_DEPTH_ACCEPT_MAX,
 	encodeSpliceLockedMessage,
 	encodeStartBatchMessage
 } from '../message/splice';
-import { SpliceSession, SpliceState, ISpliceSessionParams } from './splice';
+import type { ISpliceSessionParams } from './splice';
+import { SpliceSession, SpliceState } from './splice';
 import {
 	estimateSpliceTxWeight,
 	spliceFeeSats,
@@ -277,39 +288,31 @@ import {
 	SHARED_FUNDING_INPUT_WEIGHT,
 	outputWeight
 } from './splice-weight';
+import type { ISpliceTxInput, ISpliceTxOutput } from './splice-tx';
 import {
 	buildSpliceTx,
 	findInputIndex,
 	findOutputIndex,
 	signSpliceSharedInput,
 	verifySpliceSharedInput,
-	finalizeSpliceSharedWitness,
-	ISpliceTxInput,
-	ISpliceTxOutput
+	finalizeSpliceSharedWitness
 } from './splice-tx';
-import {
-	encodeOpenChannel2Message,
+import type {
 	IOpenChannel2Message,
-	encodeAcceptChannel2Message,
 	IAcceptChannel2Message
 } from '../message/dual-funding';
 import {
+	encodeOpenChannel2Message,
+	encodeAcceptChannel2Message
+} from '../message/dual-funding';
+import type { IDualFundingParams } from './dual-funding';
+import {
 	DualFundingSession,
 	DualFundingState,
-	IDualFundingParams,
 	rbfFeerateFloor
 } from './dual-funding';
 import { computeLeaseFeeSat, computeLeaseExpiry } from './liquidity-ads';
-import {
-	encodeTxCompleteMessage,
-	encodeTxSignaturesMessage,
-	encodeTxAddInputMessage,
-	encodeTxAddOutputMessage,
-	encodeTxRemoveInputMessage,
-	encodeTxRemoveOutputMessage,
-	encodeTxInitRbfMessage,
-	encodeTxAckRbfMessage,
-	encodeTxAbortMessage,
+import type {
 	ITxAddInputMessage,
 	ITxAddOutputMessage,
 	ITxRemoveInputMessage,
@@ -319,10 +322,21 @@ import {
 	ITxAckRbfMessage
 } from '../message/interactive-tx';
 import {
+	encodeTxCompleteMessage,
+	encodeTxSignaturesMessage,
+	encodeTxAddInputMessage,
+	encodeTxAddOutputMessage,
+	encodeTxRemoveInputMessage,
+	encodeTxRemoveOutputMessage,
+	encodeTxInitRbfMessage,
+	encodeTxAckRbfMessage,
+	encodeTxAbortMessage
+} from '../message/interactive-tx';
+import type {
 	IInteractiveTxInput,
-	IInteractiveTxOutput,
-	InteractiveTxState
+	IInteractiveTxOutput
 } from '../interactive-tx/types';
+import { InteractiveTxState } from '../interactive-tx/types';
 import {
 	DUST_LIMIT_SATS,
 	validateCompletedInteractiveTx

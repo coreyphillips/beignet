@@ -14,7 +14,7 @@
  */
 
 import { EventEmitter } from 'events';
-import { IDuplexTransport } from './duplex-transport';
+import type { IDuplexTransport } from './duplex-transport';
 
 // ─── Standard-API structural types (no DOM lib dependency) ─────
 

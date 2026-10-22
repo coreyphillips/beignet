@@ -1,10 +1,8 @@
 import { Block } from 'bitcoinjs-lib';
 import * as electrum from 'rn-electrum-client/helpers';
 
-import {
+import type {
 	EAddressType,
-	EElectrumNetworks,
-	EScanningStrategy,
 	IAddress,
 	IAddresses,
 	IElectrumGetAddressBalanceRes,
@@ -37,7 +35,10 @@ import {
 	TUnspentAddressScriptHashResponse,
 	Tls
 } from '../types';
-import { Network, toElectrumNetwork } from '../network';
+import { EElectrumNetworks, EScanningStrategy } from '../types';
+import type { Network } from '../network';
+import { toElectrumNetwork } from '../network';
+import type { Result } from '../utils';
 import {
 	btcPerKbToSatPerVbyte,
 	err,
@@ -49,11 +50,10 @@ import {
 	getAddressFromScriptPubKey,
 	getScriptHash,
 	ok,
-	Result,
 	sleep,
 	splitAddresses
 } from '../utils';
-import { Wallet } from '../wallet';
+import type { Wallet } from '../wallet';
 import {
 	defaultElectrumPeers,
 	ELECTRUM_SERVER_COOLDOWN_MS,

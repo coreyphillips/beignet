@@ -5,9 +5,8 @@
  * plus encode/decode helpers for each type.
  */
 
-import { encodeBigSize } from '../message/codec';
+import type { ITlvRecord } from '../message/tlv';
 import {
-	ITlvRecord,
 	encodeTlvStream,
 	decodeTlvStream,
 	findTlvRecord
@@ -20,15 +19,13 @@ import {
 } from '../onion/blinded-path';
 import { isValidPublicKey } from '../crypto/ecdh';
 import { Feature, FeatureFlags } from '../features/flags';
-import {
+import type {
 	IOffer,
 	IInvoiceRequest,
 	IBolt12Invoice,
 	IInvoiceError,
 	IFallbackAddress
 } from './types';
-// Note: merkle.ts also imports from this module; both imports are used only at
-// call time, so the module cycle is benign under CommonJS.
 import { computeOfferId } from './merkle';
 
 // ── Offer TLV Types (BOLT 12) ──────────────────────────────────────
@@ -868,8 +865,4 @@ export function getTlvRecordsForSigning(data: Buffer): ITlvRecord[] {
  * Encode individual TLV records (for merkle root computation).
  * Each record is encoded as type || length || value.
  */
-export function encodeTlvRecordRaw(record: ITlvRecord): Buffer {
-	const typeBytes = encodeBigSize(record.type);
-	const lengthBytes = encodeBigSize(BigInt(record.value.length));
-	return Buffer.concat([typeBytes, lengthBytes, record.value]);
-}
+export { encodeTlvRecord as encodeTlvRecordRaw } from '../message/tlv';

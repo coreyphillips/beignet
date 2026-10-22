@@ -9,7 +9,8 @@
  * hold and the wallet's own coin selection is the last line.
  */
 
-import { ISwapRecord, SwapDirection, isSwapExposure } from './ledger';
+import type { ISwapRecord, SwapDirection } from './ledger';
+import { isSwapExposure } from './ledger';
 
 export interface ISwapExposurePolicy {
 	minSwapSat: bigint;

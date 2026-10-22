@@ -3,7 +3,7 @@
  */
 
 import crypto from 'crypto';
-import {
+import type {
 	IOpenChannelMessage,
 	IAcceptChannelMessage
 } from '../message/channel-open';

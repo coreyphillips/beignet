@@ -7,12 +7,12 @@
  */
 
 import { calculateCommitmentFee } from '../channel/commitment-builder';
+import type { IFforEpochParams } from './types';
 import {
 	FF_BLINDED_HOPS_N,
 	FF_MAX_K,
 	FF_RECONCILE_MARGIN_BLOCKS,
-	FforVariant,
-	IFforEpochParams
+	FforVariant
 } from './types';
 
 export const U64_MAX = (1n << 64n) - 1n;

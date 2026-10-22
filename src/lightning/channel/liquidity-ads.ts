@@ -10,7 +10,7 @@
 
 import crypto from 'crypto';
 import { sign, verify } from '../crypto/ecdh';
-import { ILeaseRates } from '../gossip/types';
+import type { ILeaseRates } from '../gossip/types';
 
 /** Lease duration in blocks (bLIP-0051): ~4 weeks. */
 export const LEASE_DURATION_BLOCKS = 4032;

@@ -10,7 +10,7 @@
 
 import dns from 'dns';
 import { bech32 } from 'bech32';
-import { IDnsSeedConfig, IPeerAddress } from './types';
+import type { IDnsSeedConfig, IPeerAddress } from './types';
 
 /** Default Lightning Network port per BOLT 1. */
 const DEFAULT_LIGHTNING_PORT = 9735;

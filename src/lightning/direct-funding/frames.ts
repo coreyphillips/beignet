@@ -31,11 +31,8 @@ import crypto from 'crypto';
 import { decrypt, encrypt } from '../crypto/chacha20poly1305';
 import { ecdh, getPublicKey, isValidPrivateKey } from '../crypto/ecdh';
 import { hkdf } from '../crypto/hkdf';
-import {
-	DF_NODE_ID_BYTES,
-	DF_REQUEST_ID_BYTES,
-	IDfRequestEnvelope
-} from './types';
+import type { IDfRequestEnvelope } from './types';
+import { DF_NODE_ID_BYTES, DF_REQUEST_ID_BYTES } from './types';
 
 /** Byte-exact HKDF info strings; both sides derive from the same pair. */
 export const DF_INFO_SENDER_TO_RECEIVER = 'beignet-df:v3:sender-to-receiver';

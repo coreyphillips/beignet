@@ -1,5 +1,5 @@
 /** Portable BOLT 8 over Iroh contracts and byte-stream adapter. */
-import { IDuplexTransport } from './duplex-transport';
+import type { IDuplexTransport } from './duplex-transport';
 import { BufferedDataEmitter } from './websocket';
 import { hkdf } from '../crypto/hkdf';
 

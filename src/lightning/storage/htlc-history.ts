@@ -1,5 +1,6 @@
-import { IChannelState } from '../channel/channel-state';
-import { HtlcDirection, IHtlcSnapshotEntry } from '../channel/types';
+import type { IChannelState } from '../channel/channel-state';
+import type { IHtlcSnapshotEntry } from '../channel/types';
+import { HtlcDirection } from '../channel/types';
 import { isFforConcurrentVersion } from '../ffor/types';
 
 interface IHistoryEntry {

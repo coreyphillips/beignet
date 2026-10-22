@@ -13,7 +13,7 @@
 
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
-import {
+import type {
 	IBlindedPayInfo,
 	IOffer,
 	IInvoiceRequest,
@@ -40,14 +40,11 @@ import {
 import { schnorrSign, schnorrVerify, toXOnlyPubkey } from './schnorr';
 import { encodeOffer } from './encode';
 import { decodeNoChecksum } from './bech32-nochecksum';
-import { ITlvRecord } from '../message/tlv';
+import type { ITlvRecord } from '../message/tlv';
 import type { IStorageBackend } from '../storage/types';
-import {
-	IBlindedPath,
-	IBlindedPaymentPath,
-	constructBlindedPath
-} from '../onion/blinded-path';
-import { OnionMessageManager } from '../onion-message/manager';
+import type { IBlindedPath, IBlindedPaymentPath } from '../onion/blinded-path';
+import { constructBlindedPath } from '../onion/blinded-path';
+import type { OnionMessageManager } from '../onion-message/manager';
 import { getPublicKey } from '../crypto/ecdh';
 import { BITCOIN_CHAIN_HASH } from '../channel/types';
 

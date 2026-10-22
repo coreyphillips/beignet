@@ -4,7 +4,8 @@
  * a factory is made, and the engine made three of each.
  */
 import { BIP32Factory } from 'bip32';
-import { ECPairAPI, ECPairFactory } from 'ecpair';
+import type { ECPairAPI } from 'ecpair';
+import { ECPairFactory } from 'ecpair';
 import { ecc } from './ecc';
 
 let ecpair: ECPairAPI | undefined;

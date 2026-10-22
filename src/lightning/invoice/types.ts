@@ -2,8 +2,8 @@
  * BOLT 11: Invoice (Payment Request) types and constants.
  */
 
-import { FeatureFlags } from '../features/flags';
-import { IBlindedPaymentPath } from '../onion/blinded-path';
+import type { FeatureFlags } from '../features/flags';
+import type { IBlindedPaymentPath } from '../onion/blinded-path';
 
 /**
  * Lightning network prefixes for HRP. Separate from the wallet's `Network`

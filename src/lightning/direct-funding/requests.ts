@@ -18,13 +18,10 @@
  */
 
 import crypto from 'crypto';
-import {
-	IDfLaneKeys,
-	IDfWireFrame,
-	mintRequestEncryptionKeys,
-	receiverLaneKeys
-} from './frames';
+import type { IDfLaneKeys, IDfWireFrame } from './frames';
+import { mintRequestEncryptionKeys, receiverLaneKeys } from './frames';
 import { getPublicKey } from '../crypto/ecdh';
+import type { IDfAttemptFunding, IDfRequestRecord } from './types';
 import {
 	DF_DEFAULT_REQUEST_TTL_MS,
 	DF_MAX_AMOUNT_SAT,
@@ -36,8 +33,6 @@ import {
 	DF_REQUEST_ID_BYTES,
 	DirectFundingError,
 	DirectFundingErrorCode,
-	IDfAttemptFunding,
-	IDfRequestRecord,
 	malformed
 } from './types';
 

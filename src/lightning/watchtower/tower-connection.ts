@@ -11,13 +11,11 @@ import * as net from 'net';
 import { EventEmitter } from 'events';
 import { SocksClient } from 'socks';
 import { createInitiatorHandshake } from '../transport/noise';
-import { TransportCipher } from '../transport/cipher';
-import {
-	Socks5ProxyScope,
-	selectOutboundProxy
-} from '../transport/peer-manager';
+import type { TransportCipher } from '../transport/cipher';
+import type { Socks5ProxyScope } from '../transport/peer-manager';
+import { selectOutboundProxy } from '../transport/peer-manager';
 import { encodeMessage, decodeMessage } from '../message/codec';
-import { ITowerAddress, ITowerTransport } from './types';
+import type { ITowerAddress, ITowerTransport } from './types';
 
 const ENCRYPTED_LENGTH_SIZE = 18;
 const MAC_SIZE = 16;

@@ -18,7 +18,8 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
-import { ChannelSigner, ISigner } from '../keys/signer';
+import type { ISigner } from '../keys/signer';
+import { ChannelSigner } from '../keys/signer';
 import { createFundingScript } from '../script/funding';
 
 bitcoin.initEccLib(ecc);

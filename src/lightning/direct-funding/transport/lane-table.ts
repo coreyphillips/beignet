@@ -20,7 +20,7 @@
  * `claim()` and the returned release, and the registry releases in a `finally`.
  */
 
-import { IDfInboundFrame, DfFrameHandler } from './types';
+import type { IDfInboundFrame, DfFrameHandler } from './types';
 
 interface IDfLaneClaim {
 	/** Hex request id this lane is paying. */

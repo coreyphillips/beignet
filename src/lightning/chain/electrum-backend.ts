@@ -3,9 +3,10 @@
  * to implement the IChainBackend interface for Lightning chain monitoring.
  */
 
-import { ChainBackendUnavailableError, IChainBackend } from './chain-watcher';
-import { IFeeEstimator } from '../node/types';
-import { Electrum } from '../../electrum';
+import type { IChainBackend } from './chain-watcher';
+import { ChainBackendUnavailableError } from './chain-watcher';
+import type { IFeeEstimator } from '../node/types';
+import type { Electrum } from '../../electrum';
 
 /**
  * Wraps beignet's Electrum class to implement IChainBackend.

@@ -18,14 +18,15 @@
 import net from 'net';
 import tls from 'tls';
 import crypto from 'crypto';
-import { IWebSocketLike, parseWebSocketUrl } from './websocket';
+import type { IWebSocketLike } from './websocket';
+import { parseWebSocketUrl } from './websocket';
 import { computeWebSocketAccept } from './websocket-server';
+import type { IWsFrame } from './websocket-frame';
 import {
 	WsFrameParser,
 	WsProtocolError,
 	WsOpcode,
 	WsCloseCode,
-	IWsFrame,
 	encodeWsFrame,
 	encodeWsClosePayload,
 	DEFAULT_MAX_WS_PAYLOAD_BYTES

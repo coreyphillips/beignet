@@ -7,7 +7,7 @@
 import crypto from 'crypto';
 import { sign, verifySha256d } from '../crypto/ecdh';
 import { CHANNEL_FLAG_DIRECTION } from './types';
-import {
+import type {
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
 	INodeAnnouncementMessage

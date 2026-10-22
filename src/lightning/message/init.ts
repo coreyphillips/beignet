@@ -16,7 +16,8 @@
  */
 
 import { FeatureFlags } from '../features/flags';
-import { decodeTlvStream, encodeTlvStream, ITlvRecord } from './tlv';
+import type { ITlvRecord } from './tlv';
+import { decodeTlvStream, encodeTlvStream } from './tlv';
 
 /** Well-known TLV types in init message */
 const INIT_TLV_NETWORKS = 1n;

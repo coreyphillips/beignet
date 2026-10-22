@@ -1,6 +1,7 @@
 import type { BeignetNode } from './beignet-node';
 import type { ChannelInfo } from './types';
-import { BeignetError, BeignetErrorCodeValue } from './errors';
+import type { BeignetErrorCodeValue } from './errors';
+import { BeignetError } from './errors';
 import { DEFAULT_CHANNEL_CONFIG } from '../lightning/channel/types';
 
 /**

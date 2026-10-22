@@ -6,7 +6,7 @@
 import type { IrohDaemonConfig } from './iroh-config';
 import type { ElectrumTlsConfig } from './electrum-tls-config';
 import type { IIrohDiagnostics } from '../lightning/transport/iroh';
-import { TLogLevel } from '../logger';
+import type { TLogLevel } from '../logger';
 import type { IGuardianConfigEntry } from '../lightning/recovery/assembly';
 import type { IGraphRestoreStats } from '../lightning/node/types';
 import type { ChannelErrorCode } from '../lightning/channel/channel-actions';

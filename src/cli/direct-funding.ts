@@ -17,7 +17,7 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../utils/ecc';
-import { ECPairInterface } from 'ecpair';
+import type { ECPairInterface } from 'ecpair';
 import { getECPair } from '../utils/ecc-apis';
 import type { Wallet } from '../wallet';
 import type { IUtxo } from '../types';
@@ -28,7 +28,7 @@ import {
 import { computeScriptHash } from '../lightning/chain/chain-watcher';
 import { schnorrSign } from '../lightning/offer/schnorr';
 import { getPublicKey } from '../lightning/crypto/ecdh';
-import {
+import type {
 	IDfCoinSigner,
 	IDfSenderCoin,
 	IDfSenderWallet

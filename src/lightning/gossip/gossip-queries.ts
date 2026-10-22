@@ -29,7 +29,7 @@
  *   [4: timestamp_range]
  */
 
-import {
+import type {
 	IQueryChannelRangeMessage,
 	IReplyChannelRangeMessage,
 	IQueryShortChannelIdsMessage,

@@ -18,7 +18,8 @@
  *   [channel_ready_tlvs]
  */
 
-import { decodeTlvStream, encodeTlvStream, ITlvRecord } from './tlv';
+import type { ITlvRecord } from './tlv';
+import { decodeTlvStream, encodeTlvStream } from './tlv';
 
 const TLV_SHORT_CHANNEL_ID = 1n;
 // option_taproot: next_local_nonce verification nonce (TLV type 4, matching the

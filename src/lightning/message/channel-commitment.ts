@@ -21,7 +21,8 @@
  *   [33: next_per_commitment_point]
  */
 
-import { encodeTlvStream, decodeTlvStream, ITlvRecord } from './tlv';
+import type { ITlvRecord } from './tlv';
+import { encodeTlvStream, decodeTlvStream } from './tlv';
 
 export interface ICommitmentSignedMessage {
 	channelId: Buffer;

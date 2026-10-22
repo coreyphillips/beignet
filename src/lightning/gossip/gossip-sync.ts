@@ -37,7 +37,7 @@ import {
 	encodeNodeAnnouncementMessage
 } from './messages';
 import { MessageType } from '../message/types';
-import {
+import type {
 	IReplyChannelRangeMessage,
 	IReplyShortChannelIdsEndMessage,
 	IQueryChannelRangeMessage,

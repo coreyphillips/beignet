@@ -22,18 +22,14 @@
 
 import * as crypto from 'crypto';
 import { decode as decodeInvoice } from '../invoice/decode';
+import type { IL402Challenge } from './challenge';
 import {
 	buildL402AuthorizationHeader,
-	IL402Challenge,
 	isHeaderSafeMacaroon,
 	parseL402Challenge
 } from './challenge';
-import {
-	credentialScope,
-	IL402Credential,
-	IL402CredentialStore,
-	MemoryL402CredentialStore
-} from './credentials';
+import type { IL402Credential, IL402CredentialStore } from './credentials';
+import { credentialScope, MemoryL402CredentialStore } from './credentials';
 import { macaroonPaymentHash } from './macaroon';
 import { CodedError } from '../../utils/errors';
 

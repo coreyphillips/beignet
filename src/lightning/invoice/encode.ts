@@ -5,11 +5,13 @@
  */
 
 import { bech32 } from 'bech32';
-import { FeatureFlags } from '../features/flags';
-import {
+import type { FeatureFlags } from '../features/flags';
+import type {
 	IInvoiceCreationOptions,
 	IRoutingHintHop,
-	IFallbackAddress,
+	IFallbackAddress
+} from './types';
+import {
 	TagType,
 	BECH32_MAX_LIMIT,
 	TIMESTAMP_WORDS,

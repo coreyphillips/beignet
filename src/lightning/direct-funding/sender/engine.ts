@@ -30,19 +30,17 @@
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import { BeignetCustomSubtype } from '../../message/custom';
-import {
-	decodeRequestEnvelope,
-	IDfVerifyOptions,
-	verifyRequestEnvelope
-} from '../envelope';
+import type { IDfVerifyOptions } from '../envelope';
+import { decodeRequestEnvelope, verifyRequestEnvelope } from '../envelope';
+import type { IDfSenderLane } from '../frames';
 import {
 	decodeSealedFrame,
 	encodeSealedFrame,
-	IDfSenderLane,
 	openFrame,
 	sealFrame,
 	senderLaneKeysForEnvelope
 } from '../frames';
+import type { IDfOffer, IDfPrevout, IDfSignRequest } from '../messages';
 import {
 	decodeDfOffer,
 	decodeDfOfferAck,
@@ -51,20 +49,23 @@ import {
 	deriveOfferId,
 	encodeDfOffer,
 	encodeDfWitness,
-	IDfOffer,
-	IDfPrevout,
-	IDfSignRequest,
 	ownershipDigest,
 	ownershipMessage,
 	ownershipProbeTransaction
 } from '../messages';
-import {
-	DirectFundingError,
-	DirectFundingErrorCode,
-	IDfRequestEnvelope
-} from '../types';
+import type { IDfRequestEnvelope } from '../types';
+import { DirectFundingError, DirectFundingErrorCode } from '../types';
 import type { IDfInboundFrame, IDfTransport } from '../transport/types';
 import { prevoutProblem, signRequestProblem } from './verify';
+import type {
+	IDfCoinSigner,
+	IDfPaymentRecord,
+	IDfPrepareResult,
+	IDfSenderCoin,
+	IDfSenderConfig,
+	IDfSenderDeps,
+	IDfSendResult
+} from './types';
 import {
 	DF_COIN_HELD_STATES,
 	DF_DEFAULT_MAX_TOTAL_FEE_SAT,
@@ -83,14 +84,7 @@ import {
 	DF_PAYER_SEQUENCE,
 	DF_POST_WITNESS_STATES,
 	DF_RECEIPT_TIMEOUT_MS,
-	DF_SENDER_SWEEP_INTERVAL_MS,
-	IDfCoinSigner,
-	IDfPaymentRecord,
-	IDfPrepareResult,
-	IDfSenderCoin,
-	IDfSenderConfig,
-	IDfSenderDeps,
-	IDfSendResult
+	DF_SENDER_SWEEP_INTERVAL_MS
 } from './types';
 
 export interface IDfSendOptions {

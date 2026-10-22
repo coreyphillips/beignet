@@ -40,34 +40,36 @@
  */
 
 import crypto from 'crypto';
-import { OnionMessageManager } from '../../onion-message/manager';
-import { IBlindedPath, constructBlindedPath } from '../../onion/blinded-path';
+import type { OnionMessageManager } from '../../onion-message/manager';
+import type { IBlindedPath } from '../../onion/blinded-path';
+import { constructBlindedPath } from '../../onion/blinded-path';
 import { BEIGNET_CUSTOM_MESSAGE_TYPE } from '../../message/custom';
 import { decodeSealedFrame } from '../frames';
+import type { DfTransportDescriptor, IDfOnionTransport } from '../types';
 import {
 	DF_PATH_SECRET_BYTES,
-	DfTransportDescriptor,
 	DfTransportType,
 	DirectFundingError,
 	DirectFundingErrorCode,
-	IDfOnionTransport,
 	malformed
 } from '../types';
 import { deliverIsolated } from './lane-table';
-import {
-	DF_FRAME_SUBTYPES,
-	DF_LOG_FRAME_DROPPED,
-	DF_MAX_FRAME_BYTES,
-	DfDropReason,
+import type {
 	DfFrameHandler,
 	DfTransportLog,
-	establishPeer,
 	IDfInboundFrame,
 	IDfLaneFactory,
 	IDfLaneSender,
 	IDfOpenContext,
 	IDfPeerMessaging,
 	IDfTransport
+} from './types';
+import {
+	DF_FRAME_SUBTYPES,
+	DF_LOG_FRAME_DROPPED,
+	DF_MAX_FRAME_BYTES,
+	DfDropReason,
+	establishPeer
 } from './types';
 
 /**

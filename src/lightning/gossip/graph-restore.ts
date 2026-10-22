@@ -9,13 +9,10 @@
  * behind it on disk condemned rather than restored. Condemned rows are only
  * deleted when the caller runs `staleRowDeletes`, after the last step.
  */
-import { IStorageBackend } from '../storage/types';
-import { NetworkGraph } from './network-graph';
-import {
-	IGraphChannel,
-	IGraphNode,
-	gossipTimestampTooFarFuture
-} from './types';
+import type { IStorageBackend } from '../storage/types';
+import type { NetworkGraph } from './network-graph';
+import type { IGraphChannel, IGraphNode } from './types';
+import { gossipTimestampTooFarFuture } from './types';
 
 /** Rows read in a page when a restore starts, before it has timed any. */
 const FIRST_PAGE_ROWS = 16;

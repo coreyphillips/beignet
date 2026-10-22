@@ -8,7 +8,7 @@
  */
 
 import crypto from 'crypto';
-import {
+import type {
 	IOnionMessage,
 	IOnionMessagePayload,
 	ISendOnionMessageOptions
@@ -26,7 +26,7 @@ import {
 	generateKey
 } from '../onion/sphinx-crypto';
 import { getPublicKey } from '../crypto/ecdh';
-import { IBlindedPath } from '../onion/blinded-path';
+import type { IBlindedPath } from '../onion/blinded-path';
 import { encodeOnionPacket } from '../onion/construct';
 
 /**

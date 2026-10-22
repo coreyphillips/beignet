@@ -29,12 +29,12 @@ import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
 import { deriveFrameIv } from './guardian-wire';
 import { hkdfKey } from '../storage/encryption';
 import { usesCompactHtlcHistory } from '../storage/htlc-history';
-import {
-	CorruptRecoveryRowError,
+import type {
 	IStorageBackend,
 	IStoredRecoveryFrame,
 	IStoredRecoveryFrameHeader
 } from '../storage/types';
+import { CorruptRecoveryRowError } from '../storage/types';
 import {
 	isStorageTransactionActive,
 	withStorageTransaction
@@ -46,11 +46,10 @@ import {
 	frameVersionForContent,
 	hashFrame
 } from './frame-codec';
-import { PaymentDirection, PaymentStatus } from '../node/types';
+import { PaymentDirection, PaymentStatus } from '../node/payment-types';
 import { RecoveryManager } from './recovery-manager';
-import {
+import type {
 	IRecoveryJournalSink,
-	RecoveryCriticality,
 	RecoveryDurability,
 	RecoveryFrame,
 	RecoveryMutation,
@@ -58,6 +57,7 @@ import {
 	RecoverySnapshot,
 	VerifiedRecoveryChain
 } from './types';
+import { RecoveryCriticality } from './types';
 
 const IV_LENGTH = 12;
 const TAG_LENGTH = 16;

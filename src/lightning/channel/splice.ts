@@ -16,12 +16,12 @@
  */
 
 import { InteractiveTxBuilder } from '../interactive-tx/builder';
-import {
+import type {
 	IInteractiveTxInput,
 	IInteractiveTxOutput,
 	InteractiveTxState
 } from '../interactive-tx/types';
-import {
+import type {
 	ISpliceMessage,
 	ISpliceAckMessage,
 	ISpliceLockedMessage

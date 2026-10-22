@@ -9,13 +9,15 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import { derivePublicKey, deriveRevocationPubkey } from '../keys/derivation';
 import { verify } from '../crypto/ecdh';
-import { ISigner } from '../keys/signer';
-import {
-	buildCommitmentTx,
-	calculateObscuredCommitmentNumber,
+import type { ISigner } from '../keys/signer';
+import type {
 	ICommitmentTxParams,
 	ICommitmentTxResult,
 	IHtlcOutput
+} from '../script/commitment';
+import {
+	buildCommitmentTx,
+	calculateObscuredCommitmentNumber
 } from '../script/commitment';
 import { createFundingScript } from '../script/funding';
 import {
@@ -25,13 +27,13 @@ import {
 	buildHtlcTimeoutTx
 } from '../script/htlc';
 import { ANCHOR_TOTAL_COST } from '../script/anchor';
-import { IChannelState } from './channel-state';
+import type { IChannelState } from './channel-state';
 import { leaseCsvBlocks } from './liquidity-ads';
+import type { IHtlcEntry } from './types';
 import {
 	ChannelRole,
 	HtlcDirection,
 	HtlcState,
-	IHtlcEntry,
 	isAnchorChannel,
 	isTaprootChannel
 } from './types';

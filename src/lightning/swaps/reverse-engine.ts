@@ -47,29 +47,22 @@ import type {
 } from '../direct-funding/transport/types';
 import type { IHeldInvoiceSnapshot } from '../node/types';
 import { PeerRateLimiter } from '../node/rate-limiter';
-import { buildSwapHtlc, ISwapHtlc } from './htlc';
+import type { ISwapHtlc } from './htlc';
+import { buildSwapHtlc } from './htlc';
 import { buildSwapRefundTx } from './transactions';
 import { validateReverseSwapAdmission } from './policy';
 import { deriveSwapId } from './keys';
-import {
-	ISwapRecord,
-	ISwapResolutionRecord,
-	SwapLedger,
-	SwapState,
-	isTerminalSwapState
-} from './ledger';
-import {
+import type { ISwapRecord, ISwapResolutionRecord, SwapState } from './ledger';
+import { SwapLedger, isTerminalSwapState } from './ledger';
+import type {
 	ISwapChainObservation,
 	ISwapSpendObservation,
 	SwapChainResolver
 } from './chain-resolver';
+import type { ISwapExposurePolicy } from './exposure';
+import { evaluateSwapExposure, validateSwapExposurePolicy } from './exposure';
+import type { ISwapEvent } from './engine-common';
 import {
-	ISwapExposurePolicy,
-	evaluateSwapExposure,
-	validateSwapExposurePolicy
-} from './exposure';
-import {
-	ISwapEvent,
 	SWAP_DUST_FLOOR_SAT,
 	exposureRefusal,
 	htlcOfRecord as htlcOf,
@@ -77,13 +70,15 @@ import {
 	swapWireResolution as wireResolution,
 	swapWireState as wireState
 } from './engine-common';
-import {
+import type {
 	ISwapCreate,
 	ISwapCreateAck,
 	ISwapQuote,
 	ISwapQuoteRequest,
 	ISwapStatus,
-	ISwapStatusRequest,
+	ISwapStatusRequest
+} from './messages';
+import {
 	SWAP_MAX_FUNDING_TX_BYTES,
 	SwapMessageError,
 	SwapRefusalReason,

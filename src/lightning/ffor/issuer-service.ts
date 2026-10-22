@@ -15,13 +15,13 @@ import { getPublicKey } from '../crypto/ecdh';
 import { deriveBlindedPrivkey } from '../onion/blinded-path';
 import { decodeOfferTlv, getTlvRecords } from '../offer/tlv';
 import { computeOfferId } from '../offer/merkle';
-import { IOffer } from '../offer/types';
-import {
+import type { IOffer } from '../offer/types';
+import type {
 	IIssuanceContext,
 	IssuanceAnswer,
 	IssuancePolicy
 } from '../offer/offer-manager';
-import { FforWitnessLedger } from './witness-ledger';
+import type { FforWitnessLedger } from './witness-ledger';
 import {
 	FF_ISSUER_ACK_TYPE,
 	FF_ISSUER_PROVISION_TYPE,
@@ -29,11 +29,11 @@ import {
 	FF_ISSUER_STATUS_TYPE,
 	FF_WITNESS_REQUEST_ID_LEN
 } from './witness-types';
+import type { IFforIssuerHop } from './issuer-messages';
 import {
 	FF_ISSUER_ATTESTATION_TLV,
 	FF_ISSUER_MANIFEST_VERSION,
 	FF_ISSUER_REFUSAL,
-	IFforIssuerHop,
 	decodeIssuerProvision,
 	decodeIssuerStatus,
 	encodeAttestationTlvValue,
@@ -42,12 +42,12 @@ import {
 	verifyAttestation,
 	verifyIssuerStatus
 } from './issuer-messages';
-import {
+import type {
 	FforIssuerLedger,
 	IFforIssuerHopRow,
-	IFforIssuerManifestRecord,
-	slotId
+	IFforIssuerManifestRecord
 } from './issuer-ledger';
+import { slotId } from './issuer-ledger';
 import {
 	buildIssuerPaymentPath,
 	conservativeExpirySeconds

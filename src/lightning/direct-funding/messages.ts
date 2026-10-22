@@ -26,7 +26,8 @@
 
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
-import { decodeTlvStream, encodeTlvStream, ITlvRecord } from '../message/tlv';
+import type { ITlvRecord } from '../message/tlv';
+import { decodeTlvStream, encodeTlvStream } from '../message/tlv';
 import {
 	ByteReader,
 	DF_MAX_MESSAGE_BYTES,

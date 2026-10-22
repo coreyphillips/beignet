@@ -20,27 +20,25 @@
 
 import { BeignetCustomSubtype } from '../../message/custom';
 import { decodeSealedFrame } from '../frames';
-import {
-	DfTransportDescriptor,
-	DfTransportType,
-	IDfDirectPeerTransport,
-	malformed
-} from '../types';
+import type { DfTransportDescriptor, IDfDirectPeerTransport } from '../types';
+import { DfTransportType, malformed } from '../types';
 import { DfLaneTable, deliverIsolated } from './lane-table';
-import {
-	DF_FRAME_SUBTYPES,
-	DF_LOG_FRAME_DROPPED,
-	DF_MAX_FRAME_BYTES,
-	DfDropReason,
+import type {
 	DfFrameHandler,
 	DfTransportLog,
-	establishPeer,
 	IDfCustomMessage,
 	IDfInboundFrame,
 	IDfLaneFactory,
 	IDfOpenContext,
 	IDfPeerMessaging,
-	IDfTransport,
+	IDfTransport
+} from './types';
+import {
+	DF_FRAME_SUBTYPES,
+	DF_LOG_FRAME_DROPPED,
+	DF_MAX_FRAME_BYTES,
+	DfDropReason,
+	establishPeer,
 	isSupportedDfVersion
 } from './types';
 

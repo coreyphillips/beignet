@@ -32,7 +32,7 @@ import * as bip39 from 'bip39';
 import { InstanceLockError } from './instance-lock';
 import { installProcessFaultHandlers } from './process-faults';
 import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
-import { ApiResponse, BeignetConfig } from './types';
+import type { ApiResponse, BeignetConfig } from './types';
 
 const args = process.argv.slice(2);
 const pretty = args.includes('--pretty');

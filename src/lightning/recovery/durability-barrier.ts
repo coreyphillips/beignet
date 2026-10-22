@@ -32,10 +32,10 @@
  * that `quorum` waits on.
  */
 
-import { GuardianState } from './guardian-wire';
-import { GuardianReplicator } from './guardian-replication';
-import { IWriterLeaseKeys } from './writer-lease';
-import { RecoveryDurability } from './types';
+import type { GuardianState } from './guardian-wire';
+import type { GuardianReplicator } from './guardian-replication';
+import type { IWriterLeaseKeys } from './writer-lease';
+import type { RecoveryDurability } from './types';
 
 /** Why a barrier let a message go, or refused to. */
 export type BarrierOutcome =

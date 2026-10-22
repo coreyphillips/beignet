@@ -18,7 +18,8 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { computeScriptHash } from '../chain/chain-watcher';
-import { buildSwapHtlc, ISwapHtlc } from './htlc';
+import type { ISwapHtlc } from './htlc';
+import { buildSwapHtlc } from './htlc';
 import { extractSwapPreimage } from './transactions';
 
 /** A copy of the first 32-byte witness element hashing to the payment hash. */
@@ -36,7 +37,7 @@ function preimageInWitness(
 	}
 	return undefined;
 }
-import { SwapResolutionKind } from './ledger';
+import type { SwapResolutionKind } from './ledger';
 
 /** The narrow chain view a swap engine needs; IChainBackend satisfies it. */
 export interface ISwapChainSource {

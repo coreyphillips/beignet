@@ -1,5 +1,5 @@
 import type { ConnectionOptions, TLSSocket } from 'tls';
-import { Tls } from '../types';
+import type { Tls } from '../types';
 
 export const normalizeFingerprint = (fingerprint: string): string =>
 	fingerprint.replace(/:/g, '').toUpperCase();
