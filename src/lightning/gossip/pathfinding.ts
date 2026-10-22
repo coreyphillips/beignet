@@ -728,9 +728,10 @@ function searchRoute(
 			if (newCltv > maxCltvExpiry) continue;
 
 			const penalty = missionControl ? missionControl.getPenalty(scidHex) : 0n;
-			// Accumulate a per-hop penalty so shorter, more reliable routes win.
-			const newCost =
-				newAmount + penalty + BigInt(current.hops + 1) * HOP_PENALTY_MSAT;
+			// Cost accumulates along the path, so a penalty weighs on every
+			// route through its edge. Each edge also strictly raises the cost,
+			// which keeps the predecessor map free of cycles.
+			const newCost = current.cost + fee + penalty + HOP_PENALTY_MSAT;
 
 			const existingBest = bestCost.get(upstreamNodeHex);
 			if (existingBest !== undefined && newCost >= existingBest) {
@@ -765,12 +766,17 @@ function searchRoute(
 
 	const hops: IRouteHop[] = [];
 	let currentNode = sourceHex;
+	// A chain that revisits a node would loop here forever, adding hops
+	// until memory runs out.
+	const visited = new Set<string>([sourceHex]);
 
 	while (currentNode !== destHex) {
 		const pred = predecessors.get(currentNode);
 		if (!pred) break;
 
 		const hopNodeHex = pred.nextNodeId;
+		if (visited.has(hopNodeHex)) return null;
+		visited.add(hopNodeHex);
 		// Look ahead: the hop's own forwarding fee comes from its own predecessor entry
 		const hopPred = predecessors.get(hopNodeHex);
 
