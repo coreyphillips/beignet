@@ -14,6 +14,13 @@ import type {
 	HoldCancelReason,
 	SpliceRefusalCode
 } from '../lightning/node/types';
+import type {
+	ChannelIdHex,
+	PaymentHashHex,
+	TxidHex
+} from '../utils/identifiers';
+
+export type { ChannelIdHex, PaymentHashHex, TxidHex };
 
 export interface NodeInfo {
 	/** True when this engine includes the opt-in Iroh integration. */
@@ -131,7 +138,7 @@ export interface CloseStatus {
 	 */
 	reason?: string;
 	/** Txid of the commitment or mutual close transaction, when known. */
-	closingTxid?: string;
+	closingTxid?: TxidHex;
 	/**
 	 * Whether the daemon believes the close tx reached the network: the last
 	 * broadcast attempt succeeded or the spend was observed on chain.
@@ -155,7 +162,7 @@ export interface ChannelInfo {
 	isOpener?: boolean;
 	localReserveSats?: number;
 	remoteReserveSats?: number;
-	channelId: string;
+	channelId: ChannelIdHex;
 	peerPubkey: string;
 	state: ChannelStateString;
 	localBalanceSats: number;
@@ -167,7 +174,7 @@ export interface ChannelInfo {
 	capacitySats: number;
 	isAnchor: boolean;
 	isPrivate?: boolean;
-	fundingTxid?: string;
+	fundingTxid?: TxidHex;
 	/** Funding output index in fundingTxid; present exactly when it is. */
 	fundingOutputIndex?: number;
 	shortChannelId?: string;
@@ -185,13 +192,13 @@ export interface ChannelInfo {
 	 * tell the transaction moving its coins is this channel's splice and not
 	 * a send (issue #1060).
 	 */
-	pendingSpliceTxid?: string;
+	pendingSpliceTxid?: TxidHex;
 	/**
 	 * Funding txids this channel ran on before fundingTxid, oldest first
 	 * (display byte order), one per adopted splice. Absent on a channel that
 	 * has never been spliced (issue #1060).
 	 */
-	previousFundingTxids?: string[];
+	previousFundingTxids?: TxidHex[];
 	/** Whether the channel will accept a NEW HTLC (0.6.0+). */
 	htlcUsable?: boolean;
 	ffor?: {
@@ -250,8 +257,8 @@ export interface ChannelInfo {
 	 * Txids in display order; revertedAt in ms since the epoch.
 	 */
 	revertedSplices?: Array<{
-		spliceTxid: string;
-		conflictTxid: string;
+		spliceTxid: TxidHex;
+		conflictTxid: TxidHex;
 		revertedAt: number;
 	}>;
 	/**
@@ -272,7 +279,7 @@ export interface ChannelInfo {
 }
 
 export interface ChannelPolicyInfo {
-	channelId: string;
+	channelId: ChannelIdHex;
 	feeBaseMsat: number;
 	feeProportionalMillionths: number;
 	cltvExpiryDelta: number;
@@ -328,7 +335,7 @@ export interface PayAllPayment {
 
 export interface PaymentInfo {
 	payAll?: PayAllPayment;
-	paymentHash: string;
+	paymentHash: PaymentHashHex;
 	preimage?: string;
 	amountSats: number;
 	feeSats?: number;
@@ -344,7 +351,7 @@ export interface PaymentInfo {
 
 export interface PaymentProof {
 	payAll?: PayAllPayment;
-	paymentHash: string;
+	paymentHash: PaymentHashHex;
 	preimage: string;
 	amountSats: number;
 	completedAt: number;
@@ -361,7 +368,7 @@ export interface PaymentProofVerification {
 
 export interface InvoiceInfo {
 	bolt11: string;
-	paymentHash: string;
+	paymentHash: PaymentHashHex;
 	paymentSecret?: string;
 	amountSats?: number;
 	description?: string;
@@ -516,7 +523,7 @@ export interface DirectFundingConfigInfo {
 }
 
 export interface HoldInvoiceInfo {
-	paymentHash: string;
+	paymentHash: PaymentHashHex;
 	bolt11: string;
 	/** OPEN: unpaid. ACCEPTED: HTLC(s) parked. SETTLED / CANCELLED: resolved. */
 	state: 'OPEN' | 'ACCEPTED' | 'SETTLED' | 'CANCELLED';
@@ -549,7 +556,7 @@ export interface HoldInvoiceInfo {
  * parked parts.
  */
 export interface HoldInvoiceEvent {
-	paymentHash: string;
+	paymentHash: PaymentHashHex;
 	state: HoldInvoiceInfo['state'];
 	heldAmountMsat: string;
 	htlcCount: number;
@@ -563,7 +570,7 @@ export interface DecodedInvoice {
 	network: string;
 	amountSats?: number;
 	timestamp: number;
-	paymentHash: string;
+	paymentHash: PaymentHashHex;
 	paymentSecret?: string;
 	description?: string;
 	payeeNodeKey?: string;
@@ -582,7 +589,7 @@ export interface DecodedInvoice {
 }
 
 export interface TxInfo {
-	txid: string;
+	txid: TxidHex;
 	hex: string;
 }
 
@@ -642,8 +649,8 @@ export type TChannelFundingQuote = {
 export interface OnchainTxInfo {
 	/** External cooperative payouts are retained with their channel record. */
 	source?: 'cooperative-close' | 'onchain-sweep';
-	channelId?: string;
-	txid: string;
+	channelId?: ChannelIdHex;
+	txid: TxidHex;
 	type: 'sent' | 'received';
 	valueSats: number;
 	feeSats: number;
@@ -656,7 +663,7 @@ export interface OnchainTxInfo {
 }
 
 export interface UtxoInfo {
-	txid: string;
+	txid: TxidHex;
 	vout: number;
 	address: string;
 	valueSats: number;
@@ -689,7 +696,7 @@ export interface PsbtBuildInfo {
 	vsizeEstimate: number;
 	satsPerVbyte: number;
 	inputs: Array<{
-		txid: string;
+		txid: TxidHex;
 		vout: number;
 		address: string;
 		valueSats: number;
@@ -703,20 +710,20 @@ export interface PsbtBuildInfo {
 
 /** Finalized transaction extracted from a signed PSBT. NOT broadcast. */
 export interface PsbtImportInfo {
-	txid: string;
+	txid: TxidHex;
 	txHex: string;
 }
 
 /** Result of an RBF/CPFP fee bump. */
 export interface BoostResult {
 	/** Txid of the replacement (RBF) or child (CPFP) transaction. */
-	txid: string;
+	txid: TxidHex;
 	hex: string;
 	boostType: 'rbf' | 'cpfp';
 	/** Total fee paid by the new transaction, in sats. */
 	feeSats: number;
 	/** The transaction that was boosted. */
-	originalTxid: string;
+	originalTxid: TxidHex;
 }
 
 /** Unconfirmed wallet transactions eligible for fee bumping, by method. */
@@ -727,7 +734,7 @@ export interface BoostableTransactions {
 
 /** Result of a UTXO consolidation (send-max-to-self). */
 export interface ConsolidateResult {
-	txid: string;
+	txid: TxidHex;
 	hex: string;
 	/** Number of UTXOs spent into the single output. */
 	utxosConsolidated: number;
@@ -788,7 +795,7 @@ export interface BootstrapPeerInfo {
 }
 
 export interface Bolt12InvoiceInfo {
-	paymentHash: string;
+	paymentHash: PaymentHashHex;
 	amountSats: number;
 	description: string;
 	nodeId: string;
@@ -1071,7 +1078,7 @@ export interface EventMessage {
 export interface ApiResponse<T> {
 	ok: boolean;
 	result?: T;
-	error?: { code: string; message: string; paymentHash?: string };
+	error?: { code: string; message: string; paymentHash?: PaymentHashHex };
 }
 
 export interface PaymentFilter {
@@ -1092,15 +1099,15 @@ export interface ForwardsFilter {
 	limit?: number;
 	offset?: number;
 	/** Match events where this channel was the inbound OR outbound leg. */
-	channelId?: string;
+	channelId?: ChannelIdHex;
 }
 
 /** One settled forward. Msat values are decimal strings (JSON-safe bigint). */
 export interface ForwardingEventInfo {
 	id: number;
 	settledAt: number;
-	inChannelId: string;
-	outChannelId: string;
+	inChannelId: ChannelIdHex;
+	outChannelId: ChannelIdHex;
 	inScid?: string;
 	outScid?: string;
 	amountInMsat: string;
@@ -1227,7 +1234,7 @@ export interface LiquidityRecommendation {
 	type: 'OPEN_CHANNEL' | 'CLOSE_CHANNEL' | 'REBALANCE_NEEDED' | 'BUY_LEASE';
 	priority: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'INFO';
 	reason: string;
-	channelId?: string;
+	channelId?: ChannelIdHex;
 }
 
 export interface LiquiditySnapshot {
@@ -1252,8 +1259,8 @@ export interface LiquiditySnapshot {
 
 /** One planned circular rebalance (not yet executed). */
 export interface RebalancePlanInfo {
-	fromChannelId: string;
-	toChannelId: string;
+	fromChannelId: ChannelIdHex;
+	toChannelId: ChannelIdHex;
 	amountSats: number;
 	reason: string;
 }
@@ -1265,7 +1272,7 @@ export interface AdvisorRecommendations extends LiquiditySnapshot {
 
 /** Outcome of one circular rebalance. Msat values are decimal strings. */
 export interface RebalanceResult {
-	paymentHash: string;
+	paymentHash: PaymentHashHex;
 	amountSats: number;
 	feeMsat: string;
 	feeSats: number;
@@ -1273,8 +1280,8 @@ export interface RebalanceResult {
 }
 
 export interface RebalanceAttemptInfo {
-	fromChannelId: string;
-	toChannelId: string;
+	fromChannelId: ChannelIdHex;
+	toChannelId: ChannelIdHex;
 	amountSats: number;
 	status: 'SUCCEEDED' | 'FAILED' | 'SKIPPED_BUDGET';
 	feeMsat?: string;
@@ -1416,7 +1423,7 @@ export interface BeignetNodeEvents {
 	'payment:failed': (info: PaymentInfo) => void;
 	/** payInvoiceWithRetry is about to wait nextRetryMs and try again after a retryable failure. */
 	'payment:retry': (data: {
-		paymentHash: string;
+		paymentHash: PaymentHashHex;
 		attempt: number;
 		maxRetries: number;
 		nextRetryMs: number;
@@ -1424,7 +1431,7 @@ export interface BeignetNodeEvents {
 	}) => void;
 	/** An invoice this node issued was paid. A keysend fires only `payment:received`. */
 	'invoice:settled': (data: {
-		paymentHash: string;
+		paymentHash: PaymentHashHex;
 		bolt11: string;
 		amountSats: number;
 	}) => void;
@@ -1461,67 +1468,70 @@ export interface BeignetNodeEvents {
 	'transaction:confirmed': (info: OnchainTxInfo) => void;
 	/** A replacement was observed: the listed txids were replaced (RBF) and
 	 *  are dead; whatever was watching them should stop (issue #548). */
-	'onchain:rbf': (data: { txids: string[] }) => void;
+	'onchain:rbf': (data: { txids: TxidHex[] }) => void;
 	/** Funding was negotiated and the funding transaction broadcast or watched. */
-	'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
+	'channel:opening': (data: {
+		channelId: ChannelIdHex;
+		fundingTxid: TxidHex;
+	}) => void;
 	/** The channel reached NORMAL state. */
-	'channel:ready': (data: { channelId: string }) => void;
+	'channel:ready': (data: { channelId: ChannelIdHex }) => void;
 	/**
 	 * The channel can take a new HTLC again: it reached NORMAL on
 	 * channel_ready, finished reestablishing on a reconnect, a splice locked
 	 * or unwound, or its funding quarantine lifted. Fires on every reconnect.
 	 * The payment queues start and retry on it (issue #967).
 	 */
-	'channel:usable': (data: { channelId: string }) => void;
+	'channel:usable': (data: { channelId: ChannelIdHex }) => void;
 	/** A cooperative close started, by this node (`local`) or the peer (`remote`). */
 	'channel:pending-close': (data: {
-		channelId: string;
+		channelId: ChannelIdHex;
 		initiator: 'local' | 'remote';
 	}) => void;
 	/** A force close started: this node broadcast its commitment (`local`) or the peer's appeared on chain (`remote`). */
 	'channel:force-closing': (data: {
-		channelId: string;
+		channelId: ChannelIdHex;
 		initiator: 'local' | 'remote';
 	}) => void;
 	/** The funding output was spent and the spend classified. Outputs may still be unswept: `channel:resolved` is the terminal event. */
-	'channel:closed': (data: { channelId: string }) => void;
+	'channel:closed': (data: { channelId: ChannelIdHex }) => void;
 	/** The true terminal event of a close: every on-chain output of the channel is irrevocably swept or claimed and the channel state becomes CLOSED. */
-	'channel:resolved': (data: { channelId: string }) => void;
+	'channel:resolved': (data: { channelId: ChannelIdHex }) => void;
 	/** The channel was removed with nothing to close on chain, and its persisted state was durably deleted: its unconfirmed funding tx vanished from mempool and chain, or the open was aborted or abandoned before any funding existed. */
-	'channel:voided': (data: { channelId: string }) => void;
+	'channel:voided': (data: { channelId: ChannelIdHex }) => void;
 	/** splice_locked exchanged both ways: the channel runs on the new funding (fundingTxid, display order). */
 	'splice:complete': (data: {
-		channelId: string;
-		fundingTxid?: string;
+		channelId: ChannelIdHex;
+		fundingTxid?: TxidHex;
 	}) => void;
 	/** A splice negotiation was unwound by tx_abort before its point of no return. */
-	'splice:aborted': (data: { channelId: string; reason: string }) => void;
+	'splice:aborted': (data: { channelId: ChannelIdHex; reason: string }) => void;
 	/** An input of an in-flight splice that this node does not vouch for was spent by conflictTxid, confirmed six deep while the splice is not on chain: the splice can never confirm, and the peer is being asked to revert (issue #760). */
 	'splice:conflicted': (data: {
-		channelId: string;
-		spliceTxid: string;
-		conflictTxid: string;
+		channelId: ChannelIdHex;
+		spliceTxid: TxidHex;
+		conflictTxid: TxidHex;
 		inputIndex: number;
 		height: number;
 	}) => void;
 	/** Both sides verified the conflict on their own chain view and returned to the pre-splice funding; the channel is NORMAL on the old outpoint (issue #760). */
 	'splice:reverted': (data: {
-		channelId: string;
-		spliceTxid: string;
-		conflictTxid: string;
+		channelId: ChannelIdHex;
+		spliceTxid: TxidHex;
+		conflictTxid: TxidHex;
 	}) => void;
 	/** A forward through this node settled and earned feeMsat. Msat values are decimal strings. */
 	'htlc:forwarded': (data: {
-		inChannelId: string;
-		outChannelId: string;
+		inChannelId: ChannelIdHex;
+		outChannelId: ChannelIdHex;
 		amountInMsat: string;
 		amountOutMsat: string;
 		feeMsat: string;
 	}) => void;
 	/** The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */
-	'htlc:fulfilled': (data: { channelId: string; htlcId: string }) => void;
+	'htlc:fulfilled': (data: { channelId: ChannelIdHex; htlcId: string }) => void;
 	/** The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */
-	'htlc:failed': (data: { channelId: string; htlcId: string }) => void;
+	'htlc:failed': (data: { channelId: ChannelIdHex; htlcId: string }) => void;
 	/** A peer connected. */
 	'peer:connect': (data: { pubkey: string }) => void;
 	/** A peer disconnected. */
@@ -1539,14 +1549,14 @@ export interface BeignetNodeEvents {
 		 * missing from this signature, so a typed subscriber could not read the
 		 * one field that says which open just failed.
 		 */
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		/**
 		 * The transaction a broadcast error is about (display byte order):
 		 * BROADCAST_FAILED, BROADCAST_PERMANENT_FAILURE and
 		 * SPLICE_BROADCAST_REFUSED carry it when the watcher could name it
 		 * (issue #1062).
 		 */
-		txid?: string;
+		txid?: TxidHex;
 		/**
 		 * True when the node still holds that transaction and rebroadcasts it
 		 * on every block (a pending funding or an unconfirmed splice), so the
@@ -1618,7 +1628,7 @@ export interface BeignetNodeEvents {
 	 *  Recovery Capsule before expiresAt or the peer force-closes. */
 	'recovery:reestablish-held': (data: {
 		peerPubkey: string;
-		channelId: string;
+		channelId: ChannelIdHex;
 		expiresAt: number;
 	}) => void;
 	/** A durability barrier could not reach a guardian. */
@@ -1684,7 +1694,7 @@ export interface BeignetNodeEvents {
 	// amounts as decimal strings.
 	/** An FFOR epoch's committed state changed, with the same record view GET /ffor/epoch serves. */
 	'ffor:state': (data: {
-		channelId: string;
+		channelId: ChannelIdHex;
 		state: string;
 		epoch: Record<string, unknown>;
 	}) => void;
@@ -1696,7 +1706,7 @@ export interface BeignetNodeEvents {
 	'ffor:delegated-failed': (data: Record<string, unknown>) => void;
 	/** A peer contradicted an ACTIVE FFOR epoch: enforce it on chain (POST /ffor/enforce). */
 	'ffor:enforce': (data: {
-		channelId: string;
+		channelId: ChannelIdHex;
 		epoch: Record<string, unknown>;
 		/**
 		 * The channel is a capsule restore whose recency nothing has proven,

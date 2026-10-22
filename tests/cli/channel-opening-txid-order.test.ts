@@ -62,5 +62,32 @@ describe('channel:opening funding txid order (issue #681)', function () {
 			'7529353996a0085bc0a7107bfd2bb5070957f8448ad553ea32a4c92ac1984ba5'
 		);
 		expect(event.channelId).to.equal('07'.repeat(32));
+		// The relay reverses a copy: the engine's buffer is channel state.
+		expect(hash.toString('hex')).to.equal(
+			'a54b98c12ac9a432ea53d58a44f8570907b52bfd7b10a7c05b08a09639352975'
+		);
+	});
+
+	// Issue #1691: the same flip, for the funding a splice locked onto.
+	it('relays a splice:complete funding txid in display order', async () => {
+		const inner = (daemon.node as unknown as { node: LightningNode }).node;
+		const hash = Buffer.from(
+			'a54b98c12ac9a432ea53d58a44f8570907b52bfd7b10a7c05b08a09639352975',
+			'hex'
+		);
+		const seen = new Promise<{ channelId: string; fundingTxid?: string }>(
+			(resolve) => daemon.node.once('splice:complete', resolve)
+		);
+		inner.emit('splice:complete', {
+			channelId: Buffer.alloc(32, 7),
+			fundingTxid: hash
+		});
+		const event = await seen;
+		expect(event.fundingTxid).to.equal(
+			'7529353996a0085bc0a7107bfd2bb5070957f8448ad553ea32a4c92ac1984ba5'
+		);
+		expect(hash.toString('hex')).to.equal(
+			'a54b98c12ac9a432ea53d58a44f8570907b52bfd7b10a7c05b08a09639352975'
+		);
 	});
 });

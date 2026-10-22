@@ -127,7 +127,7 @@ await node.destroy();
 | `rapidGossipSyncUrl?` | `string` | Rapid Gossip Sync snapshot URL (defaults to the public LDK endpoint). |
 | `eagerGossipVerify?` | `boolean` | Signature-verify foreign broadcast gossip at intake (default false). By default verification is deferred until a gossip query asks for an entry, which skips nearly the whole first-dump verification cost; nothing unverified is ever served either way. Set true on relay-class nodes that serve the graph: intake and restore verify eagerly and signatureless RGS-primed entries are re-fetched signed from peers. |
 | `deferGraphRestore?` | `boolean` | Bring back the stored network map in time slices after create() returns, rather than inside it (default false). For a node that runs on an app's only JavaScript thread, as a phone wallet's does: a large map otherwise holds that thread for seconds as the wallet opens. Until it is back, payments, rebalances and channel suggestions wait for it, a synchronous route query (estimateRouteFee, probeRoute, queryRoute, quotePayAll) finishes it first, gossip that would write the graph and the boot RGS import wait for it, and getGraphInfo() says `restoring`. The waits are skipped while no restore runs, so a node that restores inline sees no change. getGraphRestoreStats() is null until then, and `graph:restored` reports it. |
-| `onError?` | `(error: { code: string; message: string; timestamp: number; channelId?: string; txid?: string; retained?: boolean; channelErrorCode?: ChannelErrorCode }) => void` | Optional error callback — receives all node:error events instead of silently absorbing them |
+| `onError?` | `(error: { code: string; message: string; timestamp: number; channelId?: ChannelIdHex; txid?: TxidHex; retained?: boolean; channelErrorCode?: ChannelErrorCode }) => void` | Optional error callback — receives all node:error events instead of silently absorbing them |
 | `logLevel?` | `LogLevel` | Log level (default 'info'). Set to 'silent' to suppress. |
 | `logger?` | `ILogger` | Leveled diagnostic logger. When set, every log entry that passes logLevel is forwarded to it (in addition to the 'log' event) and it is injected into the underlying Wallet and LightningNode. When unset, behavior is unchanged: BeignetNode only emits 'log' events and the wallet keeps its default console output. |
 | `electrumServers?` | `Array<{ host: string; port: number; tls?: boolean }>` | Multiple Electrum servers for failover redundancy |
@@ -191,6 +191,8 @@ Internally wires together: `Wallet` + `LightningNode` + `SqliteStorage` + `Walle
 ### Methods
 
 All methods return plain objects. IDs are hex strings. Amounts are numbers in satoshis.
+
+The signatures name three of those IDs: `ChannelIdHex` and `PaymentHashHex` (32 bytes, 64 hex characters) and `TxidHex` (64 hex characters in display byte order, as bitcoind and block explorers print a txid). All three are aliases of `string` and exported from `beignet/cli`. A method that looks up or acts on a channel or a payment by its id refuses a malformed one as `INVALID_PARAMS`.
 
 #### Info
 
@@ -930,34 +932,34 @@ The table is generated from `BeignetNodeEvents` by `npm run docs:tables`. The SS
 | `payment:received` | `(info: PaymentInfo)` | yes | Incoming payment settled. |
 | `payment:sent` | `(info: PaymentInfo)` | yes | Outgoing payment completed. |
 | `payment:failed` | `(info: PaymentInfo)` | yes | Outgoing payment failed. |
-| `payment:retry` | `(data: { paymentHash: string; attempt: number; maxRetries: number; nextRetryMs: number; error: string })` | no | payInvoiceWithRetry is about to wait nextRetryMs and try again after a retryable failure. |
-| `invoice:settled` | `(data: { paymentHash: string; bolt11: string; amountSats: number })` | yes | An invoice this node issued was paid. A keysend fires only `payment:received`. |
+| `payment:retry` | `(data: { paymentHash: PaymentHashHex; attempt: number; maxRetries: number; nextRetryMs: number; error: string })` | no | payInvoiceWithRetry is about to wait nextRetryMs and try again after a retryable failure. |
+| `invoice:settled` | `(data: { paymentHash: PaymentHashHex; bolt11: string; amountSats: number })` | yes | An invoice this node issued was paid. A keysend fires only `payment:received`. |
 | `hold:accepted` | `(data: HoldInvoiceEvent)` | yes | A part joined a hold invoice's parked set (issue #746), fired for each new part, including partial MPP payments. Before funding a swap, compare BigInt(heldAmountMsat) with the full expected amount in msat: ACCEPTED alone does not mean the invoice is fully funded. |
 | `hold:settled` | `(data: HoldInvoiceEvent)` | yes | A hold invoice's preimage was revealed and every parked part fulfilled. |
 | `hold:cancelled` | `(data: HoldInvoiceEvent & { reason: HoldCancelReason })` | yes | A hold invoice was cancelled and every parked part failed back. |
 | `transaction:received` | `(info: OnchainTxInfo)` | yes | An incoming on-chain transaction first appeared. It may already carry a height when it was found at a catch-up sync after downtime, and no separate `transaction:confirmed` fires then. Initial-sync history does not replay as events. |
 | `transaction:sent` | `(info: OnchainTxInfo)` | yes | An outgoing on-chain transaction first appeared; the same rules as `transaction:received`. |
 | `transaction:confirmed` | `(info: OnchainTxInfo)` | yes | A transaction the wallet already held moved from the mempool into a block, in either direction (`info.type` says which). At most one per transaction. |
-| `onchain:rbf` | `(data: { txids: string[] })` | no | A replacement was observed: the listed txids were replaced (RBF) and are dead; whatever was watching them should stop (issue #548). |
-| `channel:opening` | `(data: { channelId: string; fundingTxid: string })` | yes | Funding was negotiated and the funding transaction broadcast or watched. |
-| `channel:ready` | `(data: { channelId: string })` | yes | The channel reached NORMAL state. |
-| `channel:usable` | `(data: { channelId: string })` | no | The channel can take a new HTLC again: it reached NORMAL on channel_ready, finished reestablishing on a reconnect, a splice locked or unwound, or its funding quarantine lifted. Fires on every reconnect. The payment queues start and retry on it (issue #967). |
-| `channel:pending-close` | `(data: { channelId: string; initiator: 'local' \| 'remote' })` | yes | A cooperative close started, by this node (`local`) or the peer (`remote`). |
-| `channel:force-closing` | `(data: { channelId: string; initiator: 'local' \| 'remote' })` | yes | A force close started: this node broadcast its commitment (`local`) or the peer's appeared on chain (`remote`). |
-| `channel:closed` | `(data: { channelId: string })` | yes | The funding output was spent and the spend classified. Outputs may still be unswept: `channel:resolved` is the terminal event. |
-| `channel:resolved` | `(data: { channelId: string })` | yes | The true terminal event of a close: every on-chain output of the channel is irrevocably swept or claimed and the channel state becomes CLOSED. |
-| `channel:voided` | `(data: { channelId: string })` | no | The channel was removed with nothing to close on chain, and its persisted state was durably deleted: its unconfirmed funding tx vanished from mempool and chain, or the open was aborted or abandoned before any funding existed. |
-| `splice:complete` | `(data: { channelId: string; fundingTxid?: string })` | yes | splice_locked exchanged both ways: the channel runs on the new funding (fundingTxid, display order). |
-| `splice:aborted` | `(data: { channelId: string; reason: string })` | yes | A splice negotiation was unwound by tx_abort before its point of no return. |
-| `splice:conflicted` | `(data: { channelId: string; spliceTxid: string; conflictTxid: string; inputIndex: number; height: number })` | yes | An input of an in-flight splice that this node does not vouch for was spent by conflictTxid, confirmed six deep while the splice is not on chain: the splice can never confirm, and the peer is being asked to revert (issue #760). |
-| `splice:reverted` | `(data: { channelId: string; spliceTxid: string; conflictTxid: string })` | yes | Both sides verified the conflict on their own chain view and returned to the pre-splice funding; the channel is NORMAL on the old outpoint (issue #760). |
-| `htlc:forwarded` | `(data: { inChannelId: string; outChannelId: string; amountInMsat: string; amountOutMsat: string; feeMsat: string })` | `htlcEvents` | A forward through this node settled and earned feeMsat. Msat values are decimal strings. |
-| `htlc:fulfilled` | `(data: { channelId: string; htlcId: string })` | `htlcEvents` | The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
-| `htlc:failed` | `(data: { channelId: string; htlcId: string })` | `htlcEvents` | The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
+| `onchain:rbf` | `(data: { txids: TxidHex[] })` | no | A replacement was observed: the listed txids were replaced (RBF) and are dead; whatever was watching them should stop (issue #548). |
+| `channel:opening` | `(data: { channelId: ChannelIdHex; fundingTxid: TxidHex })` | yes | Funding was negotiated and the funding transaction broadcast or watched. |
+| `channel:ready` | `(data: { channelId: ChannelIdHex })` | yes | The channel reached NORMAL state. |
+| `channel:usable` | `(data: { channelId: ChannelIdHex })` | no | The channel can take a new HTLC again: it reached NORMAL on channel_ready, finished reestablishing on a reconnect, a splice locked or unwound, or its funding quarantine lifted. Fires on every reconnect. The payment queues start and retry on it (issue #967). |
+| `channel:pending-close` | `(data: { channelId: ChannelIdHex; initiator: 'local' \| 'remote' })` | yes | A cooperative close started, by this node (`local`) or the peer (`remote`). |
+| `channel:force-closing` | `(data: { channelId: ChannelIdHex; initiator: 'local' \| 'remote' })` | yes | A force close started: this node broadcast its commitment (`local`) or the peer's appeared on chain (`remote`). |
+| `channel:closed` | `(data: { channelId: ChannelIdHex })` | yes | The funding output was spent and the spend classified. Outputs may still be unswept: `channel:resolved` is the terminal event. |
+| `channel:resolved` | `(data: { channelId: ChannelIdHex })` | yes | The true terminal event of a close: every on-chain output of the channel is irrevocably swept or claimed and the channel state becomes CLOSED. |
+| `channel:voided` | `(data: { channelId: ChannelIdHex })` | no | The channel was removed with nothing to close on chain, and its persisted state was durably deleted: its unconfirmed funding tx vanished from mempool and chain, or the open was aborted or abandoned before any funding existed. |
+| `splice:complete` | `(data: { channelId: ChannelIdHex; fundingTxid?: TxidHex })` | yes | splice_locked exchanged both ways: the channel runs on the new funding (fundingTxid, display order). |
+| `splice:aborted` | `(data: { channelId: ChannelIdHex; reason: string })` | yes | A splice negotiation was unwound by tx_abort before its point of no return. |
+| `splice:conflicted` | `(data: { channelId: ChannelIdHex; spliceTxid: TxidHex; conflictTxid: TxidHex; inputIndex: number; height: number })` | yes | An input of an in-flight splice that this node does not vouch for was spent by conflictTxid, confirmed six deep while the splice is not on chain: the splice can never confirm, and the peer is being asked to revert (issue #760). |
+| `splice:reverted` | `(data: { channelId: ChannelIdHex; spliceTxid: TxidHex; conflictTxid: TxidHex })` | yes | Both sides verified the conflict on their own chain view and returned to the pre-splice funding; the channel is NORMAL on the old outpoint (issue #760). |
+| `htlc:forwarded` | `(data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountInMsat: string; amountOutMsat: string; feeMsat: string })` | `htlcEvents` | A forward through this node settled and earned feeMsat. Msat values are decimal strings. |
+| `htlc:fulfilled` | `(data: { channelId: ChannelIdHex; htlcId: string })` | `htlcEvents` | The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
+| `htlc:failed` | `(data: { channelId: ChannelIdHex; htlcId: string })` | `htlcEvents` | The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
 | `peer:connect` | `(data: { pubkey: string })` | yes | A peer connected. |
 | `peer:disconnect` | `(data: { pubkey: string })` | yes | A peer disconnected. |
 | `peer:error` | `(data: { pubkey: string; message: string })` | no | A peer connection reported an error. |
-| `node:error` | `(data: { code: string; message: string; timestamp: number; channelId?: string; txid?: string; retained?: boolean; channelErrorCode?: ChannelErrorCode })` | yes | An operational error (non-fatal), also passed to the onError option. `code` is a NodeErrorCode or one BeignetNode raises itself, such as ELECTRUM_FAILOVER_FAILED. |
+| `node:error` | `(data: { code: string; message: string; timestamp: number; channelId?: ChannelIdHex; txid?: TxidHex; retained?: boolean; channelErrorCode?: ChannelErrorCode })` | yes | An operational error (non-fatal), also passed to the onError option. `code` is a NodeErrorCode or one BeignetNode raises itself, such as ELECTRUM_FAILOVER_FAILED. |
 | `node:ready` | `()` | yes | The node is fully operational: peers reconnected and channels restored. |
 | `graph:restored` | `(stats: IGraphRestoreStats)` | no | A deferred restore of the stored network map (deferGraphRestore) ended: how it went, as getGraphRestoreStats() returns it. An inline restore ends inside create(), before anyone can listen, so it is read from the getter instead. |
 | `gossip:synced` | `(data: { channelsAdded: number; updatesApplied: number; downloadMs: number; applyMs: number; busyMs: number; slices: number })` | no | A Rapid Gossip Sync snapshot was downloaded and applied. downloadMs is the fetch; applyMs is the import from start to finish, of which busyMs was spent applying, in `slices` turns of the event loop (the rest went to other work between slices). |
@@ -968,7 +970,7 @@ The table is generated from `BeignetNodeEvents` by `npm run docs:tables`. The SS
 | `recovery:durable` | `(data: { through: string })` | yes | Recovery Protocol (docs/RECOVERY-PROTOCOL.md section 8): the journal is durable through this frame sequence. |
 | `recovery:fenced` | `(data: { supersededBy: { epoch: string; writerPublicKey: string; sequence: string; frameHash: string } \| null })` | yes | A newer writer epoch owns this recovery namespace: this device must not send another channel message. supersededBy is the superseding writer's guardian state when the barrier saw one. |
 | `recovery:backfill-lost` | `(data: { detail: string })` | yes | The journal was compacted past frames a guardian had not yet received, so that guardian cannot be backfilled. |
-| `recovery:reestablish-held` | `(data: { peerPubkey: string; channelId: string; expiresAt: number })` | yes | peer-storage mode: a peer's channel_reestablish for a channel this node has no record of was held instead of failed (issue #462). Apply a Recovery Capsule before expiresAt or the peer force-closes. |
+| `recovery:reestablish-held` | `(data: { peerPubkey: string; channelId: ChannelIdHex; expiresAt: number })` | yes | peer-storage mode: a peer's channel_reestablish for a channel this node has no record of was held instead of failed (issue #462). Apply a Recovery Capsule before expiresAt or the peer force-closes. |
 | `recovery:guardian_unreachable` | `(data: { detail: string; sequence?: string })` | yes | A durability barrier could not reach a guardian. |
 | `recovery:capsule-retrieved` | `(data: { fromPeer: string; writerEpoch: string; latestSequence: string; inline: boolean; channelCount: number; candidates: number })` | yes | A storage peer returned a Recovery Capsule that became (or replaced) this node's best candidate from that peer (issue #690). Only newer heads are announced, so an equal-head re-send after a reconnect is silent. candidates counts the peers holding a valid capsule. |
 | `recovery:restore-progress` | `(data: { type: string; detail: string })` | yes | A step of a guardian or capsule restore. |
@@ -979,11 +981,11 @@ The table is generated from `BeignetNodeEvents` by `npm run docs:tables`. The SS
 | `recovery:rotation-progress` | `(data: { type: string; detail: string; generation?: string })` | yes | Guardian-set rotation (wire 5.9, issue #701): a step of a rotation this node runs. |
 | `recovery:rotated` | `(data: { generation: string; guardians: Array<{ guardianId: string; url: string }> })` | yes | Guardian-set rotation: the switch, with the set that carries the journal from then on. |
 | `recovery:rotation-followed` | `(data: { generation: string; from: string[]; to: string[] })` | yes | Guardian-set rotation: this boot followed a retired set to the live one. |
-| `ffor:state` | `(data: { channelId: string; state: string; epoch: Record<string, unknown> })` | yes | An FFOR epoch's committed state changed, with the same record view GET /ffor/epoch serves. |
+| `ffor:state` | `(data: { channelId: ChannelIdHex; state: string; epoch: Record<string, unknown> })` | yes | An FFOR epoch's committed state changed, with the same record view GET /ffor/epoch serves. |
 | `ffor:settled` | `(data: Record<string, unknown>)` | yes | Settlement peer side: a delegated slot settled upstream. |
 | `ffor:slot-resolved` | `(data: Record<string, unknown>)` | yes | A concurrent-profile slot reached its terminal outcome. |
 | `ffor:delegated-failed` | `(data: Record<string, unknown>)` | yes | Settlement peer side: a delegated slot's payment was failed back upstream. |
-| `ffor:enforce` | `(data: { channelId: string; epoch: Record<string, unknown>; restoreRecencyUnproven?: true; reestablishRecencyUnproven?: true; reestablishSecretMissing?: true })` | yes | A peer contradicted an ACTIVE FFOR epoch: enforce it on chain (POST /ffor/enforce). |
+| `ffor:enforce` | `(data: { channelId: ChannelIdHex; epoch: Record<string, unknown>; restoreRecencyUnproven?: true; reestablishRecencyUnproven?: true; reestablishSecretMissing?: true })` | yes | A peer contradicted an ACTIVE FFOR epoch: enforce it on chain (POST /ffor/enforce). |
 | `ffor:witness-provisioned` | `(data: Record<string, unknown>)` | yes | Witness role: a receiver provisioned a mailbox on this node. |
 | `ffor:witness-recorded` | `(data: Record<string, unknown>)` | yes | Witness role: a delegated preimage's record was stored. |
 | `ffor:witness-released` | `(data: Record<string, unknown>)` | yes | Witness role: a held fulfil was propagated, once recorded or at its CLTV deadline. |

@@ -349,6 +349,44 @@ describe('Durable on-chain sweep', () => {
 		expect(h.charges()).to.equal(1);
 	});
 
+	// Issue #1691: COIN's txid reads the same in either byte order, so it
+	// cannot tell whether the signed inputs are matched to the request in the
+	// right one. The genesis coinbase txid can.
+	it('matches signed inputs to the requested outpoints in display byte order', async () => {
+		const txid =
+			'4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b';
+		const coin = { tx_hash: txid, tx_pos: 0, value: 10000 };
+		const request = { ...REQUEST, inputOutpoints: [{ txid, vout: 0 }] };
+
+		const h = harness();
+		h.coins.splice(0, 1, coin);
+		const prepared = await h.create().prepare(request);
+		expect(prepared.status).to.equal('prepared');
+		const signed = bitcoin.Transaction.fromHex(
+			JSON.parse(h.data.get(ONCHAIN_SWEEPS_KEY)!)[0].hex
+		);
+		expect(signed.ins[0].hash.toString('hex')).to.equal(
+			'3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a'
+		);
+
+		// The same sweep with the txid written into the outpoint unreversed,
+		// which spends some other transaction's output.
+		const wrong = harness();
+		wrong.coins.splice(0, 1, coin);
+		wrong.wallet.transaction.createTransaction = async (): ReturnType<
+			typeof wrong.wallet.transaction.createTransaction
+		> => {
+			const tx = new bitcoin.Transaction();
+			tx.addInput(Buffer.from(txid, 'hex'), 0);
+			tx.addOutput(
+				bitcoin.address.toOutputScript(ADDRESS, bitcoin.networks.regtest),
+				9800
+			);
+			return ok({ hex: tx.toHex() });
+		};
+		await rejectsCode(wrong.create().prepare(request), 'SWEEP_QUOTE_EXPIRED');
+	});
+
 	it('malformed or altered journal transactions fail closed', async () => {
 		const h = harness();
 		await h.create().prepare(REQUEST);
