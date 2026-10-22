@@ -390,14 +390,25 @@ describe('WalletFundingProvider', () => {
 		const { ECPairFactory } = require('ecpair');
 		const ECPair = ECPairFactory(ecc);
 
+		// The address and WIF parameters each wallet network really uses.
+		const paramsByNetwork = {
+			bitcoin: bitcoin.networks.bitcoin,
+			testnet: bitcoin.networks.testnet,
+			regtest: bitcoin.networks.regtest,
+			signet: bitcoin.networks.testnet
+		};
+
 		interface IMockUtxoSetup {
 			utxos: Array<{ valueSats: number; height?: number; nonP2wpkh?: boolean }>;
+			walletNetwork?: keyof typeof paramsByNetwork;
 		}
 
 		function createSpliceMockWallet(setup: IMockUtxoSetup): {
 			wallet: IWalletLike;
 			changeAddress: string;
 		} {
+			const walletNetwork = setup.walletNetwork ?? 'regtest';
+			const params = paramsByNetwork[walletNetwork];
 			const wifByPath = new Map<string, string>();
 			const txByHash = new Map<string, { txid: string; hex: string }>();
 			const utxos: any[] = [];
@@ -407,7 +418,7 @@ describe('WalletFundingProvider', () => {
 					.createHash('sha256')
 					.update(`splice-utxo-${i}`)
 					.digest();
-				const keyPair = ECPair.fromPrivateKey(priv, { network });
+				const keyPair = ECPair.fromPrivateKey(priv, { network: params });
 				const pubkey = Buffer.from(keyPair.publicKey);
 				const path = `m/84'/0'/0'/0/${i}`;
 				wifByPath.set(path, keyPair.toWIF());
@@ -417,10 +428,10 @@ describe('WalletFundingProvider', () => {
 							redeem: {
 								output: bitcoin.script.compile([bitcoin.opcodes.OP_1])
 							},
-							network
+							network: params
 					  }).output!
-					: bitcoin.payments.p2wpkh({ pubkey, network }).output!;
-				const address = bitcoin.address.fromOutputScript(script, network);
+					: bitcoin.payments.p2wpkh({ pubkey, network: params }).output!;
+				const address = bitcoin.address.fromOutputScript(script, params);
 
 				const prevTx = new bitcoin.Transaction();
 				prevTx.version = 2;
@@ -446,10 +457,10 @@ describe('WalletFundingProvider', () => {
 				.createHash('sha256')
 				.update('splice-change')
 				.digest();
-			const changeKey = ECPair.fromPrivateKey(changePriv, { network });
+			const changeKey = ECPair.fromPrivateKey(changePriv, { network: params });
 			const changeAddress = bitcoin.payments.p2wpkh({
 				pubkey: Buffer.from(changeKey.publicKey),
-				network
+				network: params
 			}).address!;
 
 			const wallet: IWalletLike = {
@@ -476,7 +487,7 @@ describe('WalletFundingProvider', () => {
 						isOk: () => true,
 						value: { address: changeAddress }
 					}) as any,
-				network: 'regtest'
+				network: walletNetwork
 			};
 
 			return { wallet, changeAddress };
@@ -638,6 +649,60 @@ describe('WalletFundingProvider', () => {
 
 				const q = provider.quoteSpliceIn(50_000);
 				expect(q.maxAmountSats).to.equal(0n);
+			});
+		});
+
+		describe('wallet network parameters', () => {
+			for (const walletNetwork of [
+				'bitcoin',
+				'testnet',
+				'regtest',
+				'signet'
+			] as const) {
+				it(`counts a ${walletNetwork} P2WPKH UTXO as spendable`, () => {
+					const { wallet } = createSpliceMockWallet({
+						utxos: [{ valueSats: 100_000 }],
+						walletNetwork
+					});
+					const provider = new WalletFundingProvider(wallet);
+
+					const q = provider.quoteSpliceIn(1000);
+					expect(q.spendableSats).to.equal(100_000n);
+					expect(q.inputCount).to.equal(1);
+				});
+			}
+
+			it('selects a signet UTXO and pays change to the signet change address', async () => {
+				const { wallet, changeAddress } = createSpliceMockWallet({
+					utxos: [{ valueSats: 100_000 }],
+					walletNetwork: 'signet'
+				});
+				const provider = new WalletFundingProvider(wallet);
+
+				const { inputs, changeScript } = await provider.selectSpliceInputs(
+					50_000n,
+					253
+				);
+				expect(inputs.length).to.equal(1);
+				expect(changeAddress.startsWith('tb1')).to.be.true;
+				expect(
+					changeScript.equals(
+						bitcoin.address.toOutputScript(
+							changeAddress,
+							bitcoin.networks.testnet
+						)
+					)
+				).to.be.true;
+			});
+
+			it('does not count a regtest address on a signet wallet', () => {
+				const { wallet } = createSpliceMockWallet({
+					utxos: [{ valueSats: 100_000 }]
+				});
+				wallet.network = 'signet';
+				const provider = new WalletFundingProvider(wallet);
+
+				expect(provider.quoteSpliceIn(1000).inputCount).to.equal(0);
 			});
 		});
 

@@ -1116,6 +1116,9 @@ export class WalletFundingProvider implements IFundingProvider {
 				return bitcoin.networks.bitcoin;
 			case 'testnet':
 				return bitcoin.networks.testnet;
+			// Signet shares testnet's address prefixes and WIF version.
+			case 'signet':
+				return bitcoin.networks.testnet;
 			case 'regtest':
 				return bitcoin.networks.regtest;
 			default:
