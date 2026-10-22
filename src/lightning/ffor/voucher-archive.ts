@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { IFforEpochRecord } from './types';
+import type { IFforEpochRecord } from './types';
 import { IRREVOCABLE_DEPTH } from '../chain/types';
 
 /** Observed spend identity. Its presence alone never establishes final value. */

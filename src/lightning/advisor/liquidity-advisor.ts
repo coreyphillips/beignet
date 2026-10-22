@@ -3,7 +3,7 @@
  * Pure analysis class -- no side effects, no network calls.
  */
 
-import { ILeaseRates } from '../gossip/types';
+import type { ILeaseRates } from '../gossip/types';
 import { computeLeaseFeeSat } from '../channel/liquidity-ads';
 
 export enum RecommendationType {

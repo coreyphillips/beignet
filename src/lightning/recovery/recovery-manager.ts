@@ -11,25 +11,25 @@
  */
 
 import { SUPERSEDES_OWN_KIND_MESSAGE_TYPES } from '../channel/channel-actions';
-import { IChannelState } from '../channel/channel-state';
+import type { IChannelState } from '../channel/channel-state';
 import {
 	markRevokedHtlcSnapshotsSaved,
 	unsavedRevokedHtlcSnapshots
 } from '../channel/htlc-snapshots';
-import { IStorageBackend } from '../storage/types';
+import type { IStorageBackend } from '../storage/types';
 import {
 	isStorageTransactionActive,
 	withStorageTransaction
 } from '../storage/transaction';
-import {
+import type {
 	IRecoveryCommitResult,
 	IRecoveryJournalSink,
 	IRecoveryOutboxRow,
-	RecoveryCriticality,
 	RecoveryMutation,
 	RecoveryOutboundMessage,
 	SafetyTransition
 } from './types';
+import { RecoveryCriticality } from './types';
 
 /** Optional hooks, kept narrow so the node can log without owning the class. */
 export interface IRecoveryManagerOptions {

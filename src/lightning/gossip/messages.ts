@@ -46,12 +46,14 @@
  *   [64: bitcoin_signature]
  */
 
-import {
+import type {
 	IChannelAnnouncementMessage,
 	INodeAnnouncementMessage,
 	IChannelUpdateMessage,
 	IAnnouncementSignaturesMessage,
-	INodeAddress,
+	INodeAddress
+} from './types';
+import {
 	ADDRESS_TYPE_IPV4,
 	ADDRESS_TYPE_IPV6,
 	ADDRESS_TYPE_TORV2,

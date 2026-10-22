@@ -1,4 +1,5 @@
-import { fforVoucherArchiveId, IFforVoucherArchive } from './voucher-archive';
+import type { IFforVoucherArchive } from './voucher-archive';
+import { fforVoucherArchiveId } from './voucher-archive';
 
 /** Permanent book identity, rebuilt from custody before accepting peer traffic. */
 export class FforVoucherIndex {

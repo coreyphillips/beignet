@@ -8,10 +8,8 @@
  * - Reconnection with exponential backoff
  */
 
+import type { IIrohConfig, IIrohEndpoint, IIrohDiagnostics } from './iroh';
 import {
-	IIrohConfig,
-	IIrohEndpoint,
-	IIrohDiagnostics,
 	formatIrohAddress,
 	connectIrohWithFallback,
 	normalizeIrohEndpointId
@@ -22,14 +20,14 @@ import { SocksClient } from 'socks';
 import { getPublicKey } from '../crypto/ecdh';
 import { Peer } from './peer';
 import { FeatureFlags } from '../features/flags';
-import { IInitMessage } from '../message/init';
+import type { IInitMessage } from '../message/init';
 import { captureWireMessage, captureWireEvent } from './wire-capture';
-import { IDuplexTransport, IPeerTransportOptions } from './duplex-transport';
-import {
-	connectWebSocket,
-	buildWebSocketUrl,
-	WebSocketConstructor
-} from './websocket';
+import type {
+	IDuplexTransport,
+	IPeerTransportOptions
+} from './duplex-transport';
+import type { WebSocketConstructor } from './websocket';
+import { connectWebSocket, buildWebSocketUrl } from './websocket';
 import { WebSocketServer } from './websocket-server';
 import { NodeWebSocket } from './websocket-node-client';
 import { normalizeHexPubkey } from '../validation';

@@ -14,28 +14,28 @@
  * module keeps fixed, so hashing the encoded bytes is stable.
  */
 
-import {
-	IFforVoucherArchive,
-	validateFforVoucherArchive
-} from '../ffor/voucher-archive';
+import type { IFforVoucherArchive } from '../ffor/voucher-archive';
+import { validateFforVoucherArchive } from '../ffor/voucher-archive';
 import { createHash } from 'crypto';
+import type {
+	ISerializedChannelState,
+	ISerializedPaymentInfo
+} from '../storage/serialization';
 import {
 	serializeChannelState,
 	deserializeChannelState,
 	serializeChainMonitorState,
 	deserializeChainMonitorState,
 	serializePaymentInfo,
-	deserializePaymentInfo,
-	ISerializedChannelState,
-	ISerializedPaymentInfo
+	deserializePaymentInfo
 } from '../storage/serialization';
 import { usesCompactHtlcHistory } from '../storage/htlc-history';
-import {
+import type {
 	IForwardingEvent,
 	IInvoiceInfo,
 	IRecoveryOutboxMessage
 } from '../storage/types';
-import {
+import type {
 	RecoveryDurability,
 	RecoveryFrame,
 	RecoveryMutation,

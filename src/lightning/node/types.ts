@@ -6,33 +6,40 @@
  * channel/node info queries.
  */
 
-import { IRoutingHintHop, Network } from '../invoice/types';
-import { IBolt12Invoice } from '../offer/types';
-import { IChannelConfig, ChannelState } from '../channel/types';
+import type { IRoutingHintHop, Network } from '../invoice/types';
+import type { IBolt12Invoice } from '../offer/types';
+import type { IChannelConfig, ChannelState } from '../channel/types';
 import type { ChannelErrorCode } from '../channel/channel-actions';
 import { CodedError } from '../../utils/errors';
-import { IChannelBasepoints } from '../keys/derivation';
-import { IRoute, INodeAddress, IChannelUpdateMessage } from '../gossip/types';
-import { FeatureFlags } from '../features/flags';
-import { IStorageBackend, IInvoiceInfo } from '../storage/types';
-import { IChainBackend } from '../chain/chain-watcher';
-import { ILogger } from '../../logger';
-import { IPerChannelKeys } from '../channel/channel-manager';
-import { SignerFactory } from '../keys/signer';
-import { WebSocketConstructor } from '../transport/websocket';
-import { Socks5ProxyScope } from '../transport/peer-manager';
-import { GuardianStartupGate } from '../recovery/startup-gate';
-import { DurabilityBarrier } from '../recovery/durability-barrier';
-import { IGuardianHostConfig } from '../recovery/guardian-host';
-import { RecoveryDurability } from '../recovery/types';
+import type { IChannelBasepoints } from '../keys/derivation';
+import type {
+	IRoute,
+	INodeAddress,
+	IChannelUpdateMessage
+} from '../gossip/types';
+import type { FeatureFlags } from '../features/flags';
+import type { IStorageBackend, IInvoiceInfo } from '../storage/types';
+import type { IChainBackend } from '../chain/chain-watcher';
+import type { ILogger } from '../../logger';
+import type { IPerChannelKeys } from '../channel/channel-manager';
+import type { SignerFactory } from '../keys/signer';
+import type { WebSocketConstructor } from '../transport/websocket';
+import type { Socks5ProxyScope } from '../transport/peer-manager';
+import type { GuardianStartupGate } from '../recovery/startup-gate';
+import type { DurabilityBarrier } from '../recovery/durability-barrier';
+import type { IGuardianHostConfig } from '../recovery/guardian-host';
+import type { RecoveryDurability } from '../recovery/types';
 import type { GuardianDescriptor } from '../recovery/capsule';
 import type {
 	ISwapChainSource,
 	ISwapConfirmationPolicy,
 	ISwapExposurePolicy
 } from '../swaps';
+import type { IPayAllBudget, PaymentStatus } from './payment-types';
 
 export type { IInvoiceInfo };
+
+export * from './payment-types';
 
 export interface IResourceConfig {
 	/** Maximum completed/failed payments to retain (default 10_000) */
@@ -858,83 +865,6 @@ export interface IRebalanceExecutionSummary {
 	feeSpentMsat: bigint;
 	/** Remaining fee budget for the current UTC day in msat. */
 	budgetRemainingMsat: bigint;
-}
-
-export enum PaymentStatus {
-	PENDING = 'PENDING',
-	COMPLETED = 'COMPLETED',
-	FAILED = 'FAILED'
-}
-
-export enum PaymentDirection {
-	OUTGOING = 'OUTGOING',
-	INCOMING = 'INCOMING'
-}
-
-export interface IPayAllBudget {
-	debitMsat: bigint;
-	maxFeeMsat: bigint;
-}
-
-export interface IPayAllQuote extends IPayAllBudget {
-	minRecipientMsat: bigint;
-	routeFound: boolean;
-	remainderMsat: bigint;
-	searchExhausted: boolean;
-}
-
-/** Planned figures while pending; exact settled figures when completed. */
-export interface IPayAllPayment extends IPayAllBudget {
-	deliveredMsat: bigint;
-	feeMsat: bigint;
-	/** Unspent part of the approved debit, excluding reserves and later receipts. */
-	remainderMsat: bigint;
-}
-
-export interface IPaymentInfo {
-	payAll?: IPayAllPayment;
-	paymentHash: Buffer;
-	preimage?: Buffer;
-	amountMsat: bigint;
-	/**
-	 * The msat that left this node, fees included, when amountMsat is not
-	 * that figure. A single-path send records its first-hop amount in
-	 * amountMsat, so it needs nothing here; an MPP send records the invoice
-	 * amount there and the sum of its parts' first-hop amounts here, written
-	 * with the record's first persist. A part refused at dispatch is not
-	 * subtracted, so this can overstate by that part.
-	 */
-	sentMsat?: bigint;
-	status: PaymentStatus;
-	direction: PaymentDirection;
-	route?: IRoute;
-	sharedSecrets?: Buffer[];
-	failureCode?: number;
-	failureSourceIndex?: number;
-	/**
-	 * Why a payment failed when no onion failure code is available: it failed
-	 * LOCALLY, before the HTLC ever reached the network, or a peer's failure came
-	 * back undecryptable. Without this a local failure is indistinguishable from a
-	 * remote one, since both surface only as an absent failureCode.
-	 */
-	failureReason?: string;
-	retryCount?: number;
-	/**
-	 * Block height this attempt converted its relative route CLTV deltas against.
-	 * A payee reporting a height at or below this cannot be telling us anything
-	 * new, so it is what a height-skew failure must be judged against, not our
-	 * live height.
-	 */
-	cltvBaseHeight?: number;
-	createdAt: number;
-	completedAt?: number;
-	/**
-	 * The received HTLCs (`channelIdHex:htlcId`) that completed an incoming
-	 * payment. A restart redispatch fulfills only these for a completed hash;
-	 * any other HTLC for it is a replay.
-	 */
-	settledHtlcs?: string[];
-	metadata?: Record<string, string>;
 }
 
 /** A keysend has no invoice to re-pay, so a retry replays these instead. */

@@ -10,8 +10,8 @@
  * then never handed to the node, so an operator who had configured a swap
  * provider got GET /swaps/status answering enabled:false with no reason why.
  */
-import { DaemonOptions } from './daemon';
-import { BeignetConfig } from './types';
+import type { DaemonOptions } from './daemon';
+import type { BeignetConfig } from './types';
 
 export function daemonOptions(
 	config: BeignetConfig,

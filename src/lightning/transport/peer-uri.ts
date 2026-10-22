@@ -7,7 +7,7 @@
  * Iroh form:                    pubkey@iroh:<endpoint-id>?relay=<url>
  */
 
-import { IPeerTransportOptions } from './duplex-transport';
+import type { IPeerTransportOptions } from './duplex-transport';
 import { parseWebSocketUrl } from './websocket';
 import { parseIrohAddress } from './iroh';
 

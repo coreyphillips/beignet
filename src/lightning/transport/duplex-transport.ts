@@ -15,7 +15,7 @@
  *                                    must NOT close the transport by itself
  */
 
-import { EventEmitter } from 'events';
+import type { EventEmitter } from 'events';
 import type { IIrohDiagnostics } from './iroh';
 
 export interface IDuplexTransport extends EventEmitter {

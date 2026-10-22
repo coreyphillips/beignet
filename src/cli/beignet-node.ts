@@ -5,9 +5,10 @@
  * and ElectrumBackend behind a single class with plain JSON return types.
  */
 
-import { IrohDaemonConfig, validateIrohConfig } from './iroh-config';
+import type { IrohDaemonConfig } from './iroh-config';
+import { validateIrohConfig } from './iroh-config';
+import type { ElectrumTlsConfig } from './electrum-tls-config';
 import {
-	ElectrumTlsConfig,
 	checkElectrumTls,
 	claimElectrumTls,
 	electrumTlsModule,
@@ -16,7 +17,8 @@ import {
 } from './electrum-tls-config';
 import { createNodeIrohEndpoint } from '../lightning/transport/iroh-node';
 import { OfflineReceive } from './offline-receive';
-import { FforReceiveService, FforReceiveFunding } from './ffor-receive';
+import type { FforReceiveFunding } from './ffor-receive';
+import { FforReceiveService } from './ffor-receive';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as net from 'net';
@@ -31,31 +33,28 @@ import { EventEmitter } from 'events';
 import { TypedEmitter } from '../utils/typed-emitter';
 import { Wallet } from '../wallet';
 import { getDefaultSendTransaction } from '../shapes/wallet';
-import { EAddressType, ISendTransaction } from '../types/wallet';
-import { ILogger, TLogLevel, LOG_LEVEL_PRIORITY } from '../logger';
+import type { EAddressType, ISendTransaction } from '../types/wallet';
+import type { ILogger, TLogLevel } from '../logger';
+import { LOG_LEVEL_PRIORITY } from '../logger';
 import { generateMnemonic } from '../utils/helpers';
 import { Network, toBitcoinJsNetwork } from '../network';
 import { btcToSats } from '../utils/conversion';
 import { BoostError } from '../utils/boost';
-import {
+import type {
 	ChannelIdHex,
 	PaymentHashHex,
-	TxidHex,
-	txidToDisplayHex
+	TxidHex
 } from '../utils/identifiers';
-import {
-	EBoostType,
-	EPaymentType,
+import { txidToDisplayHex } from '../utils/identifiers';
+import type {
 	IFormattedTransaction,
 	IOnchainFees,
 	TMessageDataMap
 } from '../types/wallet';
+import { EBoostType, EPaymentType } from '../types/wallet';
 import { createWalletStorage } from './wallet-storage';
-import {
-	OnchainSweeps,
-	OnchainSweepInfo,
-	OnchainSweepRequest
-} from './onchain-sweep';
+import type { OnchainSweepInfo, OnchainSweepRequest } from './onchain-sweep';
+import { OnchainSweeps } from './onchain-sweep';
 import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
 import { holdDbRestoredChannels } from './restore';
 import { deriveBackupMacKey, writeBackupMac } from './backup-mac';
@@ -65,47 +64,41 @@ import { LightningNode } from '../lightning/node/lightning-node';
 import { CommitmentType, OutputType } from '../lightning/chain/types';
 import { DF_DEFAULT_UNPAIRED_SPLICE_DEPTH } from '../lightning/direct-funding/receiver/types';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX as DF_UNPAIRED_SPLICE_DEPTH_MAX } from '../lightning/message/splice';
+import type { IFforEpochRecord } from '../lightning/ffor/types';
 import {
 	FforAbortReason,
 	FforSlotState,
 	FforState,
-	isFforConcurrentVersion,
-	IFforEpochRecord
+	isFforConcurrentVersion
 } from '../lightning/ffor/types';
 import {
 	bitmapGet,
 	decodeFforSyncReplyMessage
 } from '../lightning/ffor/messages';
-import { IFforIssuerStatusResp } from '../lightning/ffor/issuer-messages';
-import { IOffer } from '../lightning/offer/types';
+import type { IFforIssuerStatusResp } from '../lightning/ffor/issuer-messages';
+import type { IOffer } from '../lightning/offer/types';
 import {
 	estimateSpliceTxWeight,
 	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../lightning/channel/splice-weight';
+import type { IL402Credential, IL402RequestInit } from '../lightning/l402';
 import {
 	isPrivateNetworkUrl,
 	l402Fetch,
-	IL402Credential,
-	IL402RequestInit,
 	MemoryL402CredentialStore,
 	readCappedBody
 } from '../lightning/l402';
-import { ILightningError, IPaymentInfo } from '../lightning/node/types';
-import { IInvoiceInfo } from '../lightning/storage/types';
-import { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
+import type { ILightningError, IPaymentInfo } from '../lightning/node/types';
+import type { IInvoiceInfo } from '../lightning/storage/types';
+import type { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
 import { normalizeHexPubkey } from '../lightning/validation';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
-import {
-	IStoredPaymentRef,
-	SqliteStorage
-} from '../lightning/storage/sqlite-storage';
+import type { IStoredPaymentRef } from '../lightning/storage/sqlite-storage';
+import { SqliteStorage } from '../lightning/storage/sqlite-storage';
 import { deriveStorageKey } from '../lightning/storage/encryption';
-import {
-	encodeScb,
-	decodeScb,
-	IStaticChannelBackup
-} from '../lightning/backup/scb';
+import type { IStaticChannelBackup } from '../lightning/backup/scb';
+import { encodeScb, decodeScb } from '../lightning/backup/scb';
 import * as bip39 from 'bip39';
 import {
 	fetchRapidGossipSnapshot,
@@ -113,11 +106,13 @@ import {
 	RapidGossipCancelledError
 } from '../lightning/gossip/rapid-sync';
 import { parseAnnouncedAddress } from '../lightning/gossip/messages';
-import {
+import type {
 	INodeAddress,
 	IGraphChannel,
 	IChannelUpdateMessage,
-	IRoute,
+	IRoute
+} from '../lightning/gossip/types';
+import {
 	CHANNEL_FLAG_DISABLED,
 	encodeShortChannelId,
 	decodeShortChannelId
@@ -131,13 +126,22 @@ import {
 	LnCoinType,
 	deriveLightningKeysFromSeed
 } from '../lightning/keys/wallet-keys';
-import {
+import type {
 	GuardianBootDecision,
 	GuardianState,
 	IGuardianConfigEntry,
 	IParsedGuardian,
 	IRestoreEvent,
 	IRestoreResult,
+	GuardianDescriptor,
+	GuardianTransportType,
+	IBolt8GuardianTransport,
+	IGuardianHostEvent,
+	IGuardianHostStatus,
+	IRotationEvent,
+	IGuardianReplicationEvent
+} from '../lightning/recovery';
+import {
 	RestoreRefusedError,
 	RestoreRotatedError,
 	buildGuardianRecovery,
@@ -146,15 +150,10 @@ import {
 	restoreBestRecoveryCapsule,
 	assertEmptyTarget,
 	CapsuleCandidateError,
-	GuardianDescriptor,
 	chainPromisedQuorum,
 	deriveRecoveryMasterKey,
 	PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES,
-	GuardianTransportType,
 	GuardianClient,
-	IBolt8GuardianTransport,
-	IGuardianHostEvent,
-	IGuardianHostStatus,
 	bolt8GuardianTransport,
 	deriveGuardianRoot,
 	GuardianRotation,
@@ -170,15 +169,13 @@ import {
 	CRASH_V1_PROFILE,
 	JOURNAL_META_KEYS,
 	REPLICATION_META_KEYS,
-	IRotationEvent,
-	IGuardianReplicationEvent,
 	isOnionV3Hostname,
 	parseBolt8GuardianUrl
 } from '../lightning/recovery';
+import type { Socks5ProxyScope } from '../lightning/transport/peer-manager';
 import {
 	PeerError,
 	PeerErrorCode,
-	Socks5ProxyScope,
 	socks5SocketFactory
 } from '../lightning/transport/peer-manager';
 import {
@@ -187,32 +184,36 @@ import {
 } from '../lightning/liquidity/jit-receive';
 import { parsePeerUri } from '../lightning/transport/peer-uri';
 import { getPublicKey } from '../lightning/crypto/ecdh';
+import type {
+	IDfPaymentRecord,
+	IDfPrepareResult,
+	IDfSendResult
+} from '../lightning/direct-funding';
 import {
 	DF_HARD_MIN_OFFER_AMOUNT_SAT,
 	DF_POST_WITNESS_STATES,
 	DirectFundingError,
 	DirectFundingPaymentStore,
 	DirectFundingSender,
-	IDfPaymentRecord,
-	IDfPrepareResult,
-	IDfSendResult,
 	chainHashForNetwork
 } from '../lightning/direct-funding';
 import { directFundingWallet } from './direct-funding';
 import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from './auth';
 import { WEBHOOK_SECRETS_STORAGE_KEY } from './webhooks';
-import {
+import type {
 	INodeConfig,
-	InvalidRequestError,
-	ChannelFundingUnavailableError,
-	ChannelFundingUnavailableCode,
-	SpliceRefusalCode,
 	IHoldCancelledEvent,
 	IHoldInvoiceStateEvent,
 	IStructuredLog,
 	IGraphRestoreStats,
 	IRebalanceExecutionSummary,
-	IRebalanceResult,
+	IRebalanceResult
+} from '../lightning/node/types';
+import {
+	InvalidRequestError,
+	ChannelFundingUnavailableError,
+	ChannelFundingUnavailableCode,
+	SpliceRefusalCode,
 	PaymentDirection,
 	PaymentStatus,
 	PaymentWaitTimeoutError
@@ -223,20 +224,20 @@ import { isRecencyUnproven } from '../lightning/channel/channel-state';
 import type { Channel } from '../lightning/channel/channel';
 import { decode as decodeInvoice } from '../lightning/invoice/decode';
 import { decodeOffer } from '../lightning/offer/decode';
+import type { BeignetErrorCodeValue } from './errors';
 import {
 	BeignetError,
 	BeignetErrorCode,
-	BeignetErrorCodeValue,
 	describeFailureCode,
 	isBeignetErrorCode,
 	isRetryableError
 } from './errors';
-import {
+import type {
 	IPaymentQueueStorage,
-	InterruptedPaymentOutcome,
-	PaymentQueue
+	InterruptedPaymentOutcome
 } from './payment-queue';
-import {
+import { PaymentQueue } from './payment-queue';
+import type {
 	ListenerProblem,
 	NodeInfo,
 	PeerInfo,

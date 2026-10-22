@@ -11,14 +11,16 @@
  */
 
 import { BITCOIN_CHAIN_HASH } from '../channel/types';
-import {
+import type {
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
 	INodeAnnouncementMessage,
 	IGraphChannel,
 	IGraphEdge,
 	IGraphNode,
-	TGossipVerified,
+	TGossipVerified
+} from './types';
+import {
 	CHANNEL_FLAG_DIRECTION,
 	DEFAULT_PRUNE_MAX_AGE,
 	gossipTimestampTooFarFuture,

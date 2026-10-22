@@ -33,12 +33,10 @@
 
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
 import { hkdfKey } from '../storage/encryption';
-import {
-	CorruptRecoveryRowError,
-	IStorageBackend,
-	IStoredRecoveryFrame
-} from '../storage/types';
-import { IStaticChannelBackup, decodeScb } from '../backup/scb';
+import type { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
+import { CorruptRecoveryRowError } from '../storage/types';
+import type { IStaticChannelBackup } from '../backup/scb';
+import { decodeScb } from '../backup/scb';
 import { PEER_STORAGE_MAX_BYTES } from '../message/peer-storage';
 import { getPublicKey } from '../crypto/ecdh';
 import {
@@ -54,20 +52,21 @@ import {
 	verifyFrameChain
 } from './journal';
 import { withStorageTransaction } from '../storage/transaction';
-import {
+import type {
 	RecoveryFrame,
 	RecoveryMutation,
 	RecoverySnapshot,
 	VerifiedRecoveryChain
 } from './types';
-import { createOpenerState, IChannelState } from '../channel/channel-state';
+import type { IChannelState } from '../channel/channel-state';
+import { createOpenerState } from '../channel/channel-state';
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
 	HtlcDirection
 } from '../channel/types';
 import { MonitorState } from '../chain/types';
-import { PaymentDirection, PaymentStatus } from '../node/types';
+import { PaymentDirection, PaymentStatus } from '../node/payment-types';
 
 /**
  * A capsule whose CONTENT could not replay (the chain verified, but a

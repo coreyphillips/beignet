@@ -47,10 +47,10 @@
  */
 
 import { createHash } from 'crypto';
-import { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
+import type { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
 import { withStorageTransaction } from '../storage/transaction';
+import type { GuardianState } from './guardian-wire';
 import {
-	GuardianState,
 	genesisLogHead,
 	isGenesisLogHead,
 	parseStateBytes,
@@ -58,19 +58,21 @@ import {
 	statesEqual,
 	xOnlyFromSecret
 } from './guardian-wire';
-import {
-	GuardianStatus,
+import type {
 	IGuardianAcquireEpochRequest,
 	IGuardianGetHeadResponse,
 	IGuardianRecord,
 	IGuardianRotateSetRequest,
 	IGuardianTakeoverCertificate
 } from './guardian';
-import {
+import { GuardianStatus } from './guardian';
+import type {
 	GuardianClient,
 	IBoundGuardianClient,
 	IGuardianFanOutResult,
-	IGuardianSetContext,
+	IGuardianSetContext
+} from './guardian-client';
+import {
 	boundFanOut,
 	verifyGuardianBindings,
 	verifyGuardianCertificate,
@@ -85,14 +87,11 @@ import {
 	reconstructFromFrames,
 	verifyFrameChain
 } from './journal';
-import {
-	IWireSafetyProof,
-	deriveWireSafetyProof,
-	verifyWireSafetyProof
-} from './wire-safety';
+import type { IWireSafetyProof } from './wire-safety';
+import { deriveWireSafetyProof, verifyWireSafetyProof } from './wire-safety';
 import { REPLICATION_META_KEYS } from './guardian-replication';
+import type { IWriterLeaseKeys } from './writer-lease';
 import {
-	IWriterLeaseKeys,
 	generateWriterKey,
 	prepareWriterLease,
 	requireEncryptedSecretStorage,

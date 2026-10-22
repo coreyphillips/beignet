@@ -6,10 +6,8 @@
 
 import { bech32 } from 'bech32';
 import { FeatureFlags } from '../features/flags';
+import type { IInvoice, IRoutingHintHop, IFallbackAddress } from './types';
 import {
-	IInvoice,
-	IRoutingHintHop,
-	IFallbackAddress,
 	TagType,
 	BECH32_MAX_LIMIT,
 	TIMESTAMP_WORDS,
@@ -19,10 +17,8 @@ import {
 import { parseHrp } from './amount';
 import { wordsToBuffer, decodeUintFromWords, decodeTaggedField } from './words';
 import { verifyInvoice } from './signing';
-import {
-	IBlindedPaymentPath,
-	decodeInvoiceBlindedPaymentPaths
-} from '../onion/blinded-path';
+import type { IBlindedPaymentPath } from '../onion/blinded-path';
+import { decodeInvoiceBlindedPaymentPaths } from '../onion/blinded-path';
 
 /**
  * BOLT 11 exact data_lengths (in 5-bit words) for the fixed-length tagged

@@ -10,8 +10,8 @@ import {
 } from './electrum-tls-config';
 import * as fs from 'fs';
 import * as path from 'path';
-import { BeignetConfig } from './types';
-import { TLogLevel } from '../logger';
+import type { BeignetConfig } from './types';
+import type { TLogLevel } from '../logger';
 import {
 	ensurePrivateDir,
 	SECRET_DIR_MODE,

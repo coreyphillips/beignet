@@ -11,13 +11,17 @@
  * needs, and it needs nothing else from core.
  */
 
-import { OnionMessageManager } from '../../onion-message/manager';
+import type { OnionMessageManager } from '../../onion-message/manager';
 import { DfTransportType } from '../types';
 import { DfDirectPeerLaneFactory } from './direct-peer';
 import { DfOnionLaneFactory } from './onion';
 import { DfRelayForwarder, DfRelayLaneFactory } from './relay';
 import { DfTransportRegistry } from './registry';
-import { DfTransportLog, IDfPeerMessaging, IDfTransportConfig } from './types';
+import type {
+	DfTransportLog,
+	IDfPeerMessaging,
+	IDfTransportConfig
+} from './types';
 
 export { DfTransportRegistry, withSynthesizedRelay } from './registry';
 export type { IDfRegistryPeerView } from './registry';

@@ -5,11 +5,11 @@ import {
 	decodeFforSyncReplyMessage,
 	verifyFforMessage
 } from './messages';
+import type { IFforEpochRecord } from './types';
 import {
 	FF_SYNC_TYPE,
 	FF_SYNC_REPLY_TYPE,
 	FforSlotState,
-	IFforEpochRecord,
 	isFforConcurrentVersion
 } from './types';
 

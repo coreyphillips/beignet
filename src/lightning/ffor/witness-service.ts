@@ -14,6 +14,10 @@ import { Channel } from '../channel/channel';
 import { sign } from '../crypto/ecdh';
 import { computeHAct, computeHBook, decodeVoucherBook } from './transcript';
 import { sealRecordBody } from './witness-crypto';
+import type {
+	IFforWitnessRecord,
+	IFforWitnessRecordHeader
+} from './witness-types';
 import {
 	FF_WITNESS_ACK_TYPE,
 	FF_WITNESS_BARRIER_MS,
@@ -27,8 +31,6 @@ import {
 	FF_WITNESS_REQUEST_ID_LEN,
 	FF_WITNESS_RETENTION_MARGIN_BLOCKS,
 	FF_WITNESS_VERSION,
-	IFforWitnessRecord,
-	IFforWitnessRecordHeader,
 	FF_WITNESS_FETCH_PAGE_BYTES
 } from './witness-types';
 import {
@@ -49,12 +51,12 @@ import {
 	verifyWitnessClose,
 	verifyWitnessFetch
 } from './witness-messages';
-import {
-	FF_WITNESS_RECORD_RESERVE_BYTES,
+import type {
 	FforWitnessLedger,
 	IFforWitnessEntry,
 	IFforWitnessMailboxRecord
 } from './witness-ledger';
+import { FF_WITNESS_RECORD_RESERVE_BYTES } from './witness-ledger';
 
 export interface IFforWitnessConfig {
 	enabled: boolean;

@@ -32,26 +32,14 @@
 import { PeerRateLimiter } from '../../node/rate-limiter';
 import { BeignetCustomSubtype } from '../../message/custom';
 import { decodeSealedFrame } from '../frames';
-import {
-	IDfRelayFrame,
-	decodeDfRelayFrame,
-	encodeDfRelayFrame
-} from '../messages';
-import {
-	DF_MAX_MESSAGE_BYTES,
-	DfTransportDescriptor,
-	DfTransportType,
-	IDfRelayTransport,
-	malformed
-} from '../types';
+import type { IDfRelayFrame } from '../messages';
+import { decodeDfRelayFrame, encodeDfRelayFrame } from '../messages';
+import type { DfTransportDescriptor, IDfRelayTransport } from '../types';
+import { DF_MAX_MESSAGE_BYTES, DfTransportType, malformed } from '../types';
 import { DfLaneTable, deliverIsolated } from './lane-table';
-import {
-	DF_FRAME_SUBTYPES,
-	DF_LOG_FRAME_DROPPED,
-	DfDropReason,
+import type {
 	DfFrameHandler,
 	DfTransportLog,
-	establishPeer,
 	IDfCustomMessage,
 	IDfInboundFrame,
 	IDfLaneFactory,
@@ -59,7 +47,13 @@ import {
 	IDfOpenContext,
 	IDfPeerMessaging,
 	IDfRelayServerConfig,
-	IDfTransport,
+	IDfTransport
+} from './types';
+import {
+	DF_FRAME_SUBTYPES,
+	DF_LOG_FRAME_DROPPED,
+	DfDropReason,
+	establishPeer,
 	isSupportedDfVersion
 } from './types';
 

@@ -5,19 +5,21 @@
  * since fees accumulate at each hop. Minimizes total cost to the sender.
  */
 
-import {
+import type {
 	IGraphChannel,
 	IGraphEdge,
 	IChannelUpdateMessage,
 	IRoute,
-	IRouteHop,
+	IRouteHop
+} from './types';
+import {
 	CHANNEL_FLAG_DISABLED,
 	MESSAGE_FLAG_HTLC_MAX,
 	DEFAULT_PRUNE_MAX_AGE
 } from './types';
-import { NetworkGraph } from './network-graph';
-import { MissionControl } from './mission-control';
-import { IRoutingHintHop } from '../invoice/types';
+import type { NetworkGraph } from './network-graph';
+import type { MissionControl } from './mission-control';
+import type { IRoutingHintHop } from '../invoice/types';
 
 /** Default max hops per BOLT 4. */
 const DEFAULT_MAX_HOPS = 20;
@@ -917,7 +919,7 @@ export function findMultiPathRoute(
 
 // ── Blinded Path Route Finding ──────────────────────────────────────
 
-import { IBlindedPath, IBlindedPayInfo } from '../onion/blinded-path';
+import type { IBlindedPath, IBlindedPayInfo } from '../onion/blinded-path';
 
 /**
  * Find a route from `source` through a blinded path to the recipient.

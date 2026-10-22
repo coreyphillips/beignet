@@ -8,7 +8,7 @@
  * large 32768-byte form when the hop payloads need it.
  */
 
-import { IBlindedPath } from '../onion/blinded-path';
+import type { IBlindedPath } from '../onion/blinded-path';
 
 // ── Constants ───────────────────────────────────────────────────────
 

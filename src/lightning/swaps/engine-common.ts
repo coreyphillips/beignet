@@ -5,9 +5,9 @@
  * functions only; the engines own every side effect.
  */
 
-import { ISwapHtlc } from './htlc';
-import { ISwapRecord, ISwapResolutionRecord, SwapState } from './ledger';
-import { SwapExposureRefusal } from './exposure';
+import type { ISwapHtlc } from './htlc';
+import type { ISwapRecord, ISwapResolutionRecord, SwapState } from './ledger';
+import type { SwapExposureRefusal } from './exposure';
 import {
 	SwapRefusalReason,
 	SwapWireResolutionKind,

@@ -15,15 +15,15 @@
 import { request as httpRequest } from 'http';
 import { request as httpsRequest } from 'https';
 import { ecc } from '../../utils/ecc';
+import type { GuardianState } from './guardian-wire';
 import {
 	GUARDIAN_PROTOCOL_VERSION,
-	GuardianState,
 	receiptTranscriptHash,
 	rotationEvidenceProblem,
 	takeoverTranscriptHash,
 	verifyTranscript
 } from './guardian-wire';
-import {
+import type {
 	IGuardianAcquireEpochRequest,
 	IGuardianAcquireEpochResponse,
 	IGuardianGetHeadResponse,
@@ -62,7 +62,7 @@ import {
 	encodeRotateSetRequest,
 	decodeRotateSetResponse
 } from './guardian-proto';
-import {
+import type {
 	GuardianAuth,
 	GuardianDescriptor,
 	GuardianTransportType

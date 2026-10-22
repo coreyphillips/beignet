@@ -13,7 +13,8 @@
  */
 
 import crypto from 'crypto';
-import { FF_PROFILE_FIXED_AMOUNT, FforVariant, IFforBookEntry } from './types';
+import type { FforVariant, IFforBookEntry } from './types';
+import { FF_PROFILE_FIXED_AMOUNT } from './types';
 
 function sha256(...parts: Buffer[]): Buffer {
 	const h = crypto.createHash('sha256');

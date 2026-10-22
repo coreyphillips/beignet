@@ -34,6 +34,11 @@ import {
 	zbase32Encode
 } from '../crypto/message-signing';
 import { isValidPublicKey } from '../crypto/ecdh';
+import type {
+	DfTransportDescriptor,
+	IDfRequestEnvelope,
+	IDfUnknownTransport
+} from './types';
 import {
 	ByteReader,
 	DF_BIP21_PARAM,
@@ -50,12 +55,9 @@ import {
 	DF_RECEIPT_HASH_BYTES,
 	DF_REQUEST_ID_BYTES,
 	DF_SIGNATURE_BYTES,
-	DfTransportDescriptor,
 	DfTransportType,
 	DirectFundingError,
 	DirectFundingErrorCode,
-	IDfRequestEnvelope,
-	IDfUnknownTransport,
 	isUnknownTransport,
 	malformed
 } from './types';

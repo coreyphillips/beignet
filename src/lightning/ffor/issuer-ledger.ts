@@ -5,13 +5,13 @@
  * and the send re-answers identical metadata with the same invoice.
  */
 
-import {
-	DurableLedger,
+import type {
 	IDurableLedgerStore,
 	ILedgerCodec,
 	ILedgerRecord,
 	ILedgerTransitionResult
 } from '../storage/durable-ledger';
+import { DurableLedger } from '../storage/durable-ledger';
 
 export const FF_ISSUER_MANIFEST_LEDGER_PREFIX = 'ffor_issuer_manifest';
 export const FF_ISSUER_SLOT_LEDGER_PREFIX = 'ffor_issuer_slot';

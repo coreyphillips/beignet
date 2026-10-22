@@ -8,16 +8,18 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
 import crypto from 'crypto';
-import {
+import type {
 	ChainAction,
+	ITrackedOutput,
+	ICommitmentBroadcast,
+	IFundingSpendScan
+} from './types';
+import {
 	ChainActionType,
 	MonitorState,
 	CommitmentType,
 	OutputStatus,
 	OutputType,
-	ITrackedOutput,
-	ICommitmentBroadcast,
-	IFundingSpendScan,
 	IRREVOCABLE_DEPTH
 } from './types';
 import {
@@ -32,7 +34,7 @@ import {
 	selectTheirPerCommitmentPoint
 } from './output-resolver';
 import { csvFromToLocalScript } from '../script/commitment';
-import { IChannelState } from '../channel/channel-state';
+import type { IChannelState } from '../channel/channel-state';
 import { isAnchorChannel } from '../channel/types';
 
 /** Number of blocks before re-broadcasting unconfirmed sweeps */

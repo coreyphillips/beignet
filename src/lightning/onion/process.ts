@@ -13,9 +13,8 @@
 import crypto from 'crypto';
 import { ecdh, isValidPublicKey, pointMultiply } from '../crypto/ecdh';
 import { encodeBigSize } from '../message/codec';
+import type { IOnionPacket, IProcessedOnion } from './types';
 import {
-	IOnionPacket,
-	IProcessedOnion,
 	INVALID_ONION_HMAC,
 	INVALID_ONION_KEY,
 	INVALID_ONION_PAYLOAD,

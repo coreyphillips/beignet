@@ -11,7 +11,8 @@
  */
 
 import { encodeBigSize, decodeBigSize } from '../message/codec';
-import { IHopPayload, KEYSEND_TLV_TYPE } from './types';
+import type { IHopPayload } from './types';
+import { KEYSEND_TLV_TYPE } from './types';
 
 /**
  * Encode a value as a truncated unsigned integer (minimal big-endian).

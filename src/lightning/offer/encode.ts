@@ -9,8 +9,9 @@
  * The data portion is the TLV stream converted to 5-bit words.
  */
 
-import { IOffer, IInvoiceRequest, IBolt12Invoice } from './types';
-import { ITlvRecord, encodeTlvStream } from '../message/tlv';
+import type { IOffer, IInvoiceRequest, IBolt12Invoice } from './types';
+import type { ITlvRecord } from '../message/tlv';
+import { encodeTlvStream } from '../message/tlv';
 import {
 	encodeOfferTlv,
 	encodeInvoiceRequestTlv,

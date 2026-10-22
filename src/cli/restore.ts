@@ -22,7 +22,7 @@ import { acquireInstanceLock, releaseInstanceLock } from './instance-lock';
 import { SECRET_FILE_MODE, tightenMode, writeFileAtomic } from './fs-utils';
 import { backupMacPath, fileMac, readBackupMac } from './backup-mac';
 import { ChannelState } from '../lightning/channel/types';
-import { IStorageBackend } from '../lightning/storage/types';
+import type { IStorageBackend } from '../lightning/storage/types';
 
 /** First 16 bytes of every SQLite 3 database file. */
 export const SQLITE_HEADER = Buffer.from('SQLite format 3\0', 'ascii');

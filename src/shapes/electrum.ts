@@ -1,4 +1,5 @@
-import { EElectrumNetworks, EProtocol, TMessageKeys, TServer } from '../types';
+import type { TMessageKeys, TServer } from '../types';
+import { EElectrumNetworks, EProtocol } from '../types';
 
 export const onMessageKeys: { [K in TMessageKeys]: K } = {
 	newBlock: 'newBlock',

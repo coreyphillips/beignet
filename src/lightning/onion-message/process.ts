@@ -16,7 +16,7 @@ import {
 } from '../onion/sphinx-crypto';
 import { decodeOnionPacket, encodeOnionPacket } from '../onion/construct';
 import { decodeOnionMessagePayload } from './codec';
-import { OnionMessageProcessResult } from './types';
+import type { OnionMessageProcessResult } from './types';
 import {
 	decodeBlindedHopData,
 	deriveBlindedPrivkey

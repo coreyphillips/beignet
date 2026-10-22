@@ -9,7 +9,7 @@
  * never installs these: a host owns its process.
  */
 
-import { ILogger } from '../logger';
+import type { ILogger } from '../logger';
 
 export interface IProcessFaultHandlers {
 	onUnhandledRejection: (reason: unknown) => void;

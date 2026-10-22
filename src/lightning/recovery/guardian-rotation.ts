@@ -28,7 +28,7 @@
  * the switch simply replicates to the incoming set as the next record.
  */
 
-import { IStorageBackend } from '../storage/types';
+import type { IStorageBackend } from '../storage/types';
 import {
 	CRASH_V1_PROFILE,
 	computeGuardianSetId,
@@ -36,27 +36,27 @@ import {
 	signTranscript
 } from './guardian-wire';
 import { JOURNAL_META_KEYS, storedTipSequence } from './journal';
+import type { IGuardianReplicationEvent } from './guardian-replication';
 import {
 	GuardianReplicator,
-	IGuardianReplicationEvent,
 	REPLICATION_META_KEYS
 } from './guardian-replication';
-import {
-	GuardianBindingError,
+import type {
 	GuardianClient,
 	IBoundGuardianClient,
-	IGuardianSetContext,
+	IGuardianSetContext
+} from './guardian-client';
+import {
+	GuardianBindingError,
 	boundFanOut,
 	verifyGuardianBindings
 } from './guardian-client';
-import { GuardianStatus, IGuardianRotateSetRequest } from './guardian';
-import { IWriterLeaseKeys } from './writer-lease';
-import { GuardianDescriptor } from './capsule';
-import {
-	IGuardianConfigEntry,
-	IParsedGuardian,
-	guardianDescriptorFor
-} from './assembly';
+import type { IGuardianRotateSetRequest } from './guardian';
+import { GuardianStatus } from './guardian';
+import type { IWriterLeaseKeys } from './writer-lease';
+import type { GuardianDescriptor } from './capsule';
+import type { IGuardianConfigEntry, IParsedGuardian } from './assembly';
+import { guardianDescriptorFor } from './assembly';
 import {
 	decodeRotateSetRequest,
 	encodeRotateSetRequest

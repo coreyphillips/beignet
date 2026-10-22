@@ -7,14 +7,12 @@
  */
 
 import { ShaChainStore } from '../keys/shachain';
-import { IChannelBasepoints } from '../keys/derivation';
+import type { IChannelBasepoints } from '../keys/derivation';
 import type { IFforEpochRecord } from '../ffor/types';
+import type { IChannelConfig, IHtlcEntry, IHtlcSnapshotEntry } from './types';
 import {
 	ChannelState,
 	ChannelRole,
-	IChannelConfig,
-	IHtlcEntry,
-	IHtlcSnapshotEntry,
 	DEFAULT_CHANNEL_CONFIG,
 	DEFAULT_MINIMUM_DEPTH
 } from './types';

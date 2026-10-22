@@ -6,13 +6,13 @@
  */
 
 import crypto from 'crypto';
-import {
+import type {
 	IBlindedHopData,
-	IBlindedPaymentPath,
-	constructBlindedPath
+	IBlindedPaymentPath
 } from '../onion/blinded-path';
-import { IBlindedPayInfo } from '../offer/types';
-import { IFforIssuerHop } from './issuer-messages';
+import { constructBlindedPath } from '../onion/blinded-path';
+import type { IBlindedPayInfo } from '../offer/types';
+import type { IFforIssuerHop } from './issuer-messages';
 
 /**
  * Fold relay terms upstream-first into one blinded_payinfo, the way the

@@ -45,13 +45,13 @@
  */
 
 import crypto from 'crypto';
-import {
-	DurableLedger,
+import type {
 	IDurableLedgerStore,
 	ILedgerCodec,
 	ILedgerRecord,
 	ILedgerTransitionResult
 } from '../storage/durable-ledger';
+import { DurableLedger } from '../storage/durable-ledger';
 
 export type HeldForwardState =
 	| 'HELD'

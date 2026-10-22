@@ -22,7 +22,7 @@
 
 import { EventEmitter } from 'events';
 import { randomBytes } from 'crypto';
-import * as bitcoin from 'bitcoinjs-lib';
+import type * as bitcoin from 'bitcoinjs-lib';
 import { getPublicKey } from '../crypto/ecdh';
 import {
 	WtMessageType,
@@ -36,14 +36,11 @@ import {
 	decodeStateUpdateReply,
 	decodeError
 } from './wtwire';
-import {
-	buildJusticeBackup,
-	blobTypeForChannel,
-	IJusticeContext
-} from './justice';
+import type { IJusticeContext } from './justice';
+import { buildJusticeBackup, blobTypeForChannel } from './justice';
 import { TowerConnection, parseTowerUri } from './tower-connection';
-import { Socks5ProxyScope } from '../transport/peer-manager';
-import {
+import type { Socks5ProxyScope } from '../transport/peer-manager';
+import type {
 	ITowerAddress,
 	ITowerTransport,
 	TowerTransportFactory,

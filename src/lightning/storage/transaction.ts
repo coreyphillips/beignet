@@ -18,7 +18,7 @@
  * users keeps the backend's own (unspecified) nesting behavior.
  */
 
-import { IStorageBackend } from './types';
+import type { IStorageBackend } from './types';
 
 const activeTransactions = new WeakSet<IStorageBackend>();
 

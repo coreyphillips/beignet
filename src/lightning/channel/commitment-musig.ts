@@ -16,7 +16,7 @@
  * state machine owns the nonce lifecycle.
  */
 
-import * as bitcoin from 'bitcoinjs-lib';
+import type * as bitcoin from 'bitcoinjs-lib';
 import { taprootKeySpendSighash } from '../script/funding-taproot';
 import {
 	deriveTaprootFundingKey,

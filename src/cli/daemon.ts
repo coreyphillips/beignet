@@ -16,19 +16,21 @@ import * as https from 'https';
 import * as fs from 'fs';
 import { createHash } from 'crypto';
 import { Console } from 'console';
+import type { BeignetNodeOptions } from './beignet-node';
 import {
 	BeignetNode,
-	BeignetNodeOptions,
 	jitReceiveRefusal,
 	leaseRatesRefusal,
 	parseRecoveryMode,
 	spliceRefusalError
 } from './beignet-node';
 import { parseGuardianEntry } from '../lightning/recovery';
-import { ILogger, createConsoleLogger } from '../logger';
-import { BeignetError, BeignetErrorCodeValue } from './errors';
+import type { ILogger } from '../logger';
+import { createConsoleLogger } from '../logger';
+import type { BeignetErrorCodeValue } from './errors';
+import { BeignetError } from './errors';
 import { L402Error } from '../lightning/l402';
-import {
+import type {
 	ApiResponse,
 	BeignetNodeEvents,
 	PaymentInfo,
@@ -39,25 +41,20 @@ import { getOpenApiSpec } from './openapi';
 import { resolveBackupDestination } from './backup-destination';
 import { backupMacPath } from './backup-mac';
 import { configPath, pidPath } from './config';
+import type { IWebhookStorage } from './webhooks';
 import {
-	IWebhookStorage,
 	WEBHOOK_SECRETS_STORAGE_KEY,
 	WebhookManager,
 	webhookTargetRefusal
 } from './webhooks';
-import {
-	HttpRateLimiter,
-	RateLimitOptions,
-	clientKeyForRequest
-} from './http-rate-limiter';
+import type { RateLimitOptions } from './http-rate-limiter';
+import { HttpRateLimiter, clientKeyForRequest } from './http-rate-limiter';
 import { encodeBip21 } from '../utils/transaction';
 import { unpatchedNodeWarning } from '../utils/node-version';
+import type { ApiKeyDefinition, AuthSuccess, StoredKeyOverride } from './auth';
 import {
 	ApiKeyAuthenticator,
-	ApiKeyDefinition,
-	AuthSuccess,
 	AUTH_KEY_OVERRIDES_STORAGE_KEY,
-	StoredKeyOverride,
 	getRouteScopes,
 	scopesAllowRoute
 } from './auth';

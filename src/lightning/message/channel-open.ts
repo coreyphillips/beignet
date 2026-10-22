@@ -40,7 +40,8 @@
  *   [accept_channel_tlvs]
  */
 
-import { decodeTlvStream, encodeTlvStream, ITlvRecord } from './tlv';
+import type { ITlvRecord } from './tlv';
+import { decodeTlvStream, encodeTlvStream } from './tlv';
 
 /** TLV types for open_channel / accept_channel */
 const TLV_UPFRONT_SHUTDOWN_SCRIPT = 0n;

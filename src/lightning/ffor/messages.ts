@@ -19,12 +19,27 @@
 
 import crypto from 'crypto';
 import { sign, verify } from '../crypto/ecdh';
+import type { ITlvRecord } from '../message/tlv';
 import {
 	decodeTlvStream,
 	encodeTlvStream,
-	findTlvRecord,
-	ITlvRecord
+	findTlvRecord
 } from '../message/tlv';
+import type {
+	FforAbortReason,
+	IFforAbortMessage,
+	IFforAcceptMessage,
+	IFforActivateAckMessage,
+	IFforActivateMessage,
+	IFforCloseAckMessage,
+	IFforCloseMessage,
+	IFforErrorMessage,
+	IFforInitMessage,
+	IFforInvoicesMessage,
+	IFforReestablishTlv,
+	IFforSyncMessage,
+	IFforSyncReplyMessage
+} from './types';
 import {
 	FF_ABORT_TYPE,
 	FF_ACCEPT_TYPE,
@@ -39,20 +54,7 @@ import {
 	FF_REESTABLISH_TLV_TYPE,
 	FF_SYNC_TYPE,
 	FF_SYNC_REPLY_TYPE,
-	FforAbortReason,
-	FforState,
-	IFforAbortMessage,
-	IFforAcceptMessage,
-	IFforActivateAckMessage,
-	IFforActivateMessage,
-	IFforCloseAckMessage,
-	IFforCloseMessage,
-	IFforErrorMessage,
-	IFforInitMessage,
-	IFforInvoicesMessage,
-	IFforReestablishTlv,
-	IFforSyncMessage,
-	IFforSyncReplyMessage
+	FforState
 } from './types';
 
 const HEADER_LEN = 64;

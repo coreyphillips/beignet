@@ -12,7 +12,7 @@
 
 import { EventEmitter } from 'events';
 import net from 'net';
-import { IDuplexTransport } from './duplex-transport';
+import type { IDuplexTransport } from './duplex-transport';
 import {
 	createInitiatorHandshake,
 	createResponderHandshake,
@@ -20,13 +20,10 @@ import {
 	ACT_TWO_LENGTH,
 	ACT_THREE_LENGTH
 } from './noise';
-import { TransportCipher } from './cipher';
+import type { TransportCipher } from './cipher';
 import { encodeMessage, decodeMessage } from '../message/codec';
-import {
-	encodeInitMessage,
-	decodeInitMessage,
-	IInitMessage
-} from '../message/init';
+import type { IInitMessage } from '../message/init';
+import { encodeInitMessage, decodeInitMessage } from '../message/init';
 import { MessageType, isRequiredMessageType } from '../message/types';
 import {
 	FeatureFlags,

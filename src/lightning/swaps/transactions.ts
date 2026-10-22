@@ -1,6 +1,7 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import { getPublicKey, isValidPrivateKey, sign, verify } from '../crypto/ecdh';
-import { buildSwapHtlc, ISwapHtlc } from './htlc';
+import type { ISwapHtlc } from './htlc';
+import { buildSwapHtlc } from './htlc';
 import { assertSatoshis } from './validation';
 
 export interface ISwapFunding {

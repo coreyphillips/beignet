@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import type { BeignetNode } from './beignet-node';
-import { BeignetError, BeignetErrorCodeValue } from './errors';
+import type { BeignetErrorCodeValue } from './errors';
+import { BeignetError } from './errors';
 import { FforSlotState, FforState } from '../lightning/ffor/types';
 import { BeignetCustomSubtype } from '../lightning/message/custom';
 

@@ -18,7 +18,8 @@ import {
 	verifyMessageSignature
 } from '../../crypto/message-signing';
 import { createFundingScript } from '../../script/funding';
-import { attestationMessage, IDfPrevout, IDfSignRequest } from '../messages';
+import type { IDfPrevout, IDfSignRequest } from '../messages';
+import { attestationMessage } from '../messages';
 import { DF_MAX_PREVOUTS, DF_MAX_TX_OUTPUTS } from '../types';
 
 /** Rev 2: height-based locktimes only, so the transaction is final on a block. */

@@ -6,12 +6,15 @@
  */
 
 import type { IPeerTransportOptions } from '../transport/duplex-transport';
-import { IFforVoucherArchive } from '../ffor/voucher-archive';
-import { IChannelState } from '../channel/channel-state';
-import { IPaymentInfo } from '../node/types';
-import { IChainMonitorState } from '../chain/chain-monitor';
-import { IGraphChannel, IGraphNode } from '../gossip/types';
-import { IWatchtowerSession, IWatchtowerUpdate } from '../watchtower/types';
+import type { IFforVoucherArchive } from '../ffor/voucher-archive';
+import type { IChannelState } from '../channel/channel-state';
+import type { IPaymentInfo } from '../node/payment-types';
+import type { IChainMonitorState } from '../chain/chain-monitor';
+import type { IGraphChannel, IGraphNode } from '../gossip/types';
+import type {
+	IWatchtowerSession,
+	IWatchtowerUpdate
+} from '../watchtower/types';
 
 /**
  * One page of stored gossip rows (loadGossipChannelsAfter). `cursor` is the

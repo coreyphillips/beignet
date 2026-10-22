@@ -1,8 +1,10 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import type { Wallet } from '../wallet';
 import type { SqliteStorage } from '../lightning/storage/sqlite-storage';
-import { BeignetError, BeignetErrorCodeValue } from './errors';
-import { TxidHex, txidToDisplayHex } from '../utils/identifiers';
+import type { BeignetErrorCodeValue } from './errors';
+import { BeignetError } from './errors';
+import type { TxidHex } from '../utils/identifiers';
+import { txidToDisplayHex } from '../utils/identifiers';
 
 export const ONCHAIN_SWEEPS_KEY = 'daemon:onchain-sweeps:v1';
 

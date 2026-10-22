@@ -10,11 +10,14 @@ import { EventEmitter } from 'events';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
-import { ChannelManager } from '../channel/channel-manager';
+import type { Channel } from '../channel/channel';
+import type { ChannelManagerEvents } from '../channel/events';
+import type { TxidHex } from '../../utils/identifiers';
 import { createFundingScript } from '../script/funding';
 import { createTaprootFundingScript } from '../script/funding-taproot';
 import { isTaprootChannel } from '../channel/types';
 import { decodeShortChannelId } from '../gossip/types';
+import type { IFundingSpendScan } from './types';
 import { IRREVOCABLE_DEPTH } from './types';
 import { isDuplicateBroadcastRejection } from './broadcast-rejection';
 
@@ -318,9 +321,50 @@ function spliceInputWatchKey(
 	return `${channelId.toString('hex')}:${spliceTxid}:${inputIndex}`;
 }
 
+/**
+ * The part of ChannelManager the watcher drives, so the chain layer does not
+ * depend on the concrete manager. ChannelManager satisfies it.
+ */
+export interface IChainWatcherChannelManager {
+	on<K extends 'watch:funding' | 'broadcast:tx' | 'watch:output'>(
+		event: K,
+		listener: ChannelManagerEvents[K]
+	): void;
+	off<K extends 'watch:funding' | 'broadcast:tx' | 'watch:output'>(
+		event: K,
+		listener: ChannelManagerEvents[K]
+	): void;
+	listChannels(): Channel[];
+	handleNewBlock(blockHeight: number): void;
+	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: TxidHex): void;
+	handleFundingSpent(
+		channelId: Buffer,
+		spendingTx: bitcoin.Transaction,
+		blockHeight: number,
+		destinationScript: Buffer,
+		feeRatePerVbyte?: number,
+		revocationBasepointSecret?: Buffer,
+		paymentPrivkey?: Buffer,
+		network?: bitcoin.Network,
+		spentOutpoint?: { txid: string; outputIndex: number }
+	): void;
+	handleFundingSpendAbsent(
+		channelId: Buffer,
+		scan?: IFundingSpendScan,
+		feeRatePerVbyte?: number
+	): boolean;
+	handleOutputSpent(
+		txid: string,
+		outputIndex: number,
+		spendingTx: bitcoin.Transaction,
+		blockHeight: number
+	): void;
+	handleOutputUnspent(txid: string, outputIndex: number): void;
+}
+
 export interface IChainWatcherConfig {
 	backend: IChainBackend;
-	channelManager: ChannelManager;
+	channelManager: IChainWatcherChannelManager;
 	/** Destination script for sweep outputs (P2WPKH). Falls back to zeros if not set. */
 	destinationScript?: Buffer;
 	/**
@@ -644,7 +688,7 @@ interface IChannelSpendScan {
 
 export class ChainWatcher extends EventEmitter {
 	private backend: IChainBackend;
-	private channelManager: ChannelManager;
+	private channelManager: IChainWatcherChannelManager;
 	private watchedFundings: Map<string, IWatchedFunding> = new Map(); // channelIdHex → funding
 	/**
 	 * Spend-scan arbitration, per CHANNEL (issues #468, #479).
@@ -2786,7 +2830,7 @@ export class ChainWatcher extends EventEmitter {
 	private findChannelByFunding(
 		txidHex: string,
 		outputIndex: number
-	): import('../channel/channel').Channel | undefined {
+	): Channel | undefined {
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
 			// Match the current funding outpoint.

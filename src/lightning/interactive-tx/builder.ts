@@ -6,12 +6,12 @@
  * When both signal complete, the transaction is finalized.
  */
 
-import {
-	InteractiveTxState,
+import type {
 	IInteractiveTxInput,
 	IInteractiveTxOutput,
 	IInteractiveTxSession
 } from './types';
+import { InteractiveTxState } from './types';
 import {
 	validateSerialIdParity,
 	validatePeerSerialIdParity,

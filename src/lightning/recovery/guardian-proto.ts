@@ -17,8 +17,8 @@
  * absent bytes as empty, absent messages as undefined.
  */
 
-import { GuardianState } from './guardian-wire';
-import {
+import type { GuardianState } from './guardian-wire';
+import type {
 	IGuardianAcquireEpochRequest,
 	IGuardianAcquireEpochResponse,
 	IGuardianGetHeadRequest,

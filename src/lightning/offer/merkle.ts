@@ -18,8 +18,8 @@
 
 import crypto from 'crypto';
 import { decodeBigSize } from '../message/codec';
-import { ITlvRecord } from '../message/tlv';
-import { encodeTlvRecordRaw } from './tlv';
+import type { ITlvRecord } from '../message/tlv';
+import { encodeTlvRecord } from '../message/tlv';
 
 const LN_LEAF_TAG = Buffer.from('LnLeaf');
 const LN_NONCE_TAG = Buffer.from('LnNonce');
@@ -88,7 +88,7 @@ export function computeMerkleRoot(encodedRecords: Buffer[]): Buffer {
 
 /** Compute the BOLT 12 merkle root from decoded TLV records. */
 export function computeMerkleRootFromRecords(records: ITlvRecord[]): Buffer {
-	return computeMerkleRoot(records.map((r) => encodeTlvRecordRaw(r)));
+	return computeMerkleRoot(records.map((r) => encodeTlvRecord(r)));
 }
 
 /**

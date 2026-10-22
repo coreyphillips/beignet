@@ -1,24 +1,23 @@
-import {
-	EAddressType,
+import type {
 	IGetAddressesFromKeyPair,
 	IGetAddressesFromPrivateKey,
 	IKeyDerivationPath
 } from '../types';
+import { EAddressType } from '../types';
 import { Network, toBitcoinJsNetwork } from '../network';
-import {
-	address as bitcoinJSAddress,
-	Network as BitcoinJsNetwork
-} from 'bitcoinjs-lib';
+import type { Network as BitcoinJsNetwork } from 'bitcoinjs-lib';
+import { address as bitcoinJSAddress } from 'bitcoinjs-lib';
 import * as bip39 from 'bip39';
 import * as bitcoin from 'bitcoinjs-lib';
-import { availableNetworks, isValidBech32mEncodedString } from './wallet';
-import { err, ok, Result } from './result';
+import { availableNetworks, isValidBech32mEncodedString } from './common';
+import type { Result } from './result';
+import { err, ok } from './result';
 import { addressTypes, getAddressTypes } from '../shapes';
 import { getKeyDerivationPathObject } from './derivation-path';
-import { ECPairInterface } from 'ecpair';
+import type { ECPairInterface } from 'ecpair';
 import { ecc } from './ecc';
 import { getECPair } from './ecc-apis';
-import { BIP32Interface } from 'bip32';
+import type { BIP32Interface } from 'bip32';
 import { toXOnly } from 'bitcoinjs-lib/src/psbt/bip371';
 
 bitcoin.initEccLib(ecc);
@@ -368,18 +367,6 @@ export const sleep = (ms: number): Promise<void> => {
 	return new Promise((resolve) => {
 		setTimeout(resolve, ms);
 	});
-};
-
-/**
- * Returns the difference between two address indexes.
- * @param addrIndex1
- * @param addrIndex2
- * @returns number
- */
-export const getAddressIndexDiff = (addrIndex1 = 0, addrIndex2 = 0): number => {
-	if (addrIndex1 < 0) addrIndex1 = -1;
-	if (addrIndex2 < 0) addrIndex2 = -1;
-	return Math.abs(addrIndex1 - addrIndex2);
 };
 
 export const isPositive = (num: number): boolean => num > 0;

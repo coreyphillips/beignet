@@ -7,7 +7,7 @@
  */
 
 import { MessageType } from '../message/types';
-import { IRecoveryOutboxMessage } from '../storage/types';
+import type { IRecoveryOutboxMessage } from '../storage/types';
 import type { Channel } from './channel';
 
 export enum ChannelActionType {

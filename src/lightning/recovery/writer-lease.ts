@@ -36,14 +36,14 @@
 
 import { randomBytes } from 'crypto';
 import { ecc } from '../../utils/ecc';
-import { IStorageBackend } from '../storage/types';
+import type { IStorageBackend } from '../storage/types';
+import type { GuardianState } from './guardian-wire';
 import {
-	GuardianState,
 	acquireTranscriptHash,
 	signTranscript,
 	xOnlyFromSecret
 } from './guardian-wire';
-import { IGuardianTakeoverCertificate } from './guardian';
+import type { IGuardianTakeoverCertificate } from './guardian';
 import { JOURNAL_META_KEYS } from './journal';
 
 /** The single lease blob; the journal owns the epoch key it rides with. */

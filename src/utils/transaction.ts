@@ -1,7 +1,8 @@
 import * as bitcoin from 'bitcoinjs-lib';
-import { Psbt } from 'bitcoinjs-lib';
-import { err, ok, Result } from './result';
-import {
+import type { Psbt } from 'bitcoinjs-lib';
+import type { Result } from './result';
+import { err, ok } from './result';
+import type {
 	EAddressType,
 	IOutput,
 	ISendTransaction,
@@ -11,12 +12,13 @@ import {
 	TGetByteCountOutput,
 	TGetByteCountOutputs
 } from '../types';
-import { availableNetworks, reduceValue } from './wallet';
+import { availableNetworks, reduceValue } from './common';
 import validate, { getAddressInfo } from 'bitcoin-address-validation';
 import * as bip21 from 'bip21';
 import { TRANSACTION_DEFAULTS } from '../wallet/constants';
 import { validateAddress } from './helpers';
-import { Network, toBitcoinJsNetwork } from '../network';
+import type { Network } from '../network';
+import { toBitcoinJsNetwork } from '../network';
 import { btcToSats } from './conversion';
 
 /**

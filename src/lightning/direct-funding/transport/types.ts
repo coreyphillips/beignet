@@ -23,12 +23,11 @@ import {
 	BeignetCustomSubtype
 } from '../../message/custom';
 import { DF_FRAME_NONCE_BYTES, DF_FRAME_TAG_BYTES } from '../frames';
+import type { DfTransportDescriptor, DfTransportType } from '../types';
 import {
 	DF_MAX_MESSAGE_BYTES,
 	DF_NODE_ID_BYTES,
-	DF_REQUEST_ID_BYTES,
-	DfTransportDescriptor,
-	DfTransportType
+	DF_REQUEST_ID_BYTES
 } from '../types';
 
 // ─────────────── Sizes ───────────────

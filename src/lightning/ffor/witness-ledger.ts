@@ -13,13 +13,13 @@
  * `retention_until`.
  */
 
-import {
-	DurableLedger,
+import type {
 	IDurableLedgerStore,
 	ILedgerCodec,
 	ILedgerRecord,
 	ILedgerTransitionResult
 } from '../storage/durable-ledger';
+import { DurableLedger } from '../storage/durable-ledger';
 
 export const FF_WITNESS_MAILBOX_LEDGER_PREFIX = 'ffor_witness_mailbox';
 export const FF_WITNESS_RECORD_LEDGER_PREFIX = 'ffor_witness_record';

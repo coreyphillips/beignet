@@ -8,7 +8,7 @@
  * - IInvoiceError: Error response to an invoice request
  */
 
-import { IBlindedPath } from '../onion/blinded-path';
+import type { IBlindedPath } from '../onion/blinded-path';
 
 // ── Offer (lno) ─────────────────────────────────────────────────────
 

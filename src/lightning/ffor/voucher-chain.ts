@@ -1,17 +1,16 @@
-import { IChainMonitorState } from '../chain/chain-monitor';
+import type { IChainMonitorState } from '../chain/chain-monitor';
+import type { ITrackedOutput } from '../chain/types';
 import {
 	CommitmentType,
 	IRREVOCABLE_DEPTH,
-	ITrackedOutput,
 	OutputStatus,
 	OutputType
 } from '../chain/types';
-import {
-	fforChainReceiptId,
+import type {
 	IFforVoucherArchive,
-	IFforVoucherChainResolution,
-	mergeFforVoucherArchive
+	IFforVoucherChainResolution
 } from './voucher-archive';
+import { fforChainReceiptId, mergeFforVoucherArchive } from './voucher-archive';
 
 /** Preserve observed proof and archive final value with its owning monitor write. */
 export function archiveFforChainEvidence(

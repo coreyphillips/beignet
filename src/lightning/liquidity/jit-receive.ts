@@ -60,11 +60,11 @@ import { TypedEmitter } from '../../utils/typed-emitter';
 import { CodedError } from '../../utils/errors';
 import * as crypto from 'crypto';
 import { encodeShortChannelId } from '../gossip/types';
+import type { IForwardablePart } from '../node/types';
 import {
 	ChannelFundingUnavailableCode,
 	ChannelFundingUnavailableError,
 	FundingWaitTimeoutError,
-	IForwardablePart,
 	InvalidRequestError
 } from '../node/types';
 

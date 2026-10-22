@@ -38,10 +38,9 @@ import {
 	toXOnly
 } from '../script/commitment-taproot';
 import { tapleafHash } from '../script/htlc-taproot';
+import type { IJusticeKitV0, IJusticeKitV1 } from './blob';
 import {
 	BlobType,
-	IJusticeKitV0,
-	IJusticeKitV1,
 	breachHintFromTxid,
 	breachKeyFromTxid,
 	encryptJusticeKitV0,

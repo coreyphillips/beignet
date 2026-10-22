@@ -16,8 +16,8 @@
  */
 
 import crypto from 'crypto';
+import type { IOnionFailure } from './types';
 import {
-	IOnionFailure,
 	INVALID_ONION_VERSION,
 	INVALID_ONION_HMAC,
 	INVALID_ONION_KEY,

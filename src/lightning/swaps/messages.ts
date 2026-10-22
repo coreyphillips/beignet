@@ -30,7 +30,8 @@
  * provider requires of the client's invoice at create time.
  */
 
-import { decodeTlvStream, encodeTlvStream, ITlvRecord } from '../message/tlv';
+import type { ITlvRecord } from '../message/tlv';
+import { decodeTlvStream, encodeTlvStream } from '../message/tlv';
 import { isValidPublicKey } from '../crypto/ecdh';
 import { SWAP_ID_BYTES } from './keys';
 import { CodedError } from '../../utils/errors';

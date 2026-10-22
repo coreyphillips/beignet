@@ -1,6 +1,6 @@
-import { Result } from '../utils';
+import type { Result } from '../utils/result';
 import type { Sats } from '../utils/conversion';
-import {
+import type {
 	EElectrumNetworks,
 	IHeader,
 	INewBlock,
@@ -9,10 +9,14 @@ import {
 	TTxResult,
 	Tls
 } from './electrum';
-import { ECoinSelectPreference, EFeeId, TGapLimitOptions } from './transaction';
-import { ECPairInterface } from 'ecpair';
-import { BIP32Interface } from 'bip32';
-import { ILogger } from '../logger';
+import type {
+	ECoinSelectPreference,
+	EFeeId,
+	TGapLimitOptions
+} from './transaction';
+import type { ECPairInterface } from 'ecpair';
+import type { BIP32Interface } from 'bip32';
+import type { ILogger } from '../logger';
 import { Network } from '../network';
 
 /**

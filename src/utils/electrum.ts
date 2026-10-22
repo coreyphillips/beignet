@@ -1,15 +1,17 @@
 import * as electrum from 'rn-electrum-client/helpers';
-import { err, ok, Result } from './result';
+import type { Result } from './result';
+import { err, ok } from './result';
 
-import {
+import type {
 	EElectrumNetworks,
 	ElectrumConnectionPubSub,
 	ElectrumConnectionSubscription,
-	EProtocol,
 	IAddresses,
 	IFormattedPeerData
 } from '../types';
-import { Network, toElectrumNetwork } from '../network';
+import { EProtocol } from '../types';
+import type { Network } from '../network';
+import { toElectrumNetwork } from '../network';
 import { defaultElectrumPeers } from '../shapes/electrum';
 import { createConsoleLogger } from '../logger';
 

@@ -57,13 +57,13 @@
  * private key is ever stored (keys.ts re-derives them).
  */
 
-import {
-	DurableLedger,
+import type {
 	IDurableLedgerStore,
 	ILedgerCodec,
 	ILedgerRecord,
 	ILedgerTransitionResult
 } from '../storage/durable-ledger';
+import { DurableLedger } from '../storage/durable-ledger';
 
 export type SwapDirection = 'reverse' | 'submarine';
 

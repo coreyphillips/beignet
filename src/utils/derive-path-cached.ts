@@ -1,4 +1,4 @@
-import { BIP32Interface } from 'bip32';
+import type { BIP32Interface } from 'bip32';
 
 // The grammar derivePath accepts: an optional "m/", then decimal segments,
 // each hardened by a trailing apostrophe.

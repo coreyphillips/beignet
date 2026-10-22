@@ -58,9 +58,9 @@
  */
 
 import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
-import { GuardianState } from './guardian-wire';
+import type { GuardianState } from './guardian-wire';
 import { lastAppliedFrameIndex } from './journal';
-import { RecoveryFrame, VerifiedRecoveryChain } from './types';
+import type { RecoveryFrame, VerifiedRecoveryChain } from './types';
 
 /**
  * Evidence that a restore at this head is exact. Every field is part of the

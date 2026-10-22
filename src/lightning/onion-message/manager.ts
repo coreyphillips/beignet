@@ -7,7 +7,7 @@
 
 import crypto from 'crypto';
 import { EventEmitter } from 'events';
-import {
+import type {
 	IOnionMessage,
 	IOnionMessagePayload,
 	ISendOnionMessageOptions,
@@ -19,7 +19,8 @@ import {
 } from './codec';
 import { constructReplyOnionMessage } from './construct';
 import { processOnionMessage } from './process';
-import { IBlindedPath, constructBlindedPath } from '../onion/blinded-path';
+import type { IBlindedPath } from '../onion/blinded-path';
+import { constructBlindedPath } from '../onion/blinded-path';
 
 /** TLV type handler callback */
 type TlvHandler = (

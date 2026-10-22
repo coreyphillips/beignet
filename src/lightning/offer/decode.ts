@@ -5,7 +5,7 @@
  * split with `+`); see bech32-nochecksum.ts.
  */
 
-import { IOffer, IInvoiceRequest, IBolt12Invoice } from './types';
+import type { IOffer, IInvoiceRequest, IBolt12Invoice } from './types';
 import {
 	decodeOfferTlv,
 	decodeInvoiceRequestTlv,

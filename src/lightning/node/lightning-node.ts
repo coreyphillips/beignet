@@ -12,9 +12,9 @@ import {
 	normalizeIrohEndpointId,
 	validateIrohRelayUrl
 } from '../transport/iroh';
+import type { IFforVoucherArchive } from '../ffor/voucher-archive';
 import {
 	archiveFforVouchers,
-	IFforVoucherArchive,
 	fforVoucherArchiveId,
 	fforChainReceiptId,
 	fforVoucherReceiptIds,
@@ -42,86 +42,91 @@ export const SPLICE_CONFLICT_REQUEST_BACKOFF_MS = 10 * 60_000;
  * the peer's next session is a round trip away in any case.
  */
 export const SPLICE_CONFLICT_REFUTATION_TTL_MS = 30_000;
+import type {
+	ISpliceConflictAckMessage,
+	ISpliceConflictMessage
+} from '../message/splice-conflict';
 import {
 	decodeSpliceConflict,
 	decodeSpliceConflictAck,
 	encodeSpliceConflict,
-	encodeSpliceConflictAck,
-	ISpliceConflictAckMessage,
-	ISpliceConflictMessage
+	encodeSpliceConflictAck
 } from '../message/splice-conflict';
 import { TypedEmitter } from '../../utils/typed-emitter';
 import type { TxidHex } from '../../utils/identifiers';
-import { LightningNodeEvents, NodeErrorCode } from './events';
+import type { LightningNodeEvents, NodeErrorCode } from './events';
 import crypto from 'crypto';
-import { ILogger, noopLogger } from '../../logger';
+import type { ILogger } from '../../logger';
+import { noopLogger } from '../../logger';
 import { getPublicKey } from '../crypto/ecdh';
 import {
 	signMessageWithKey,
 	verifyMessageSignature
 } from '../crypto/message-signing';
-import {
-	constructBlindedPath,
-	processBlindedHop,
-	deriveBlindedPrivkey,
+import type {
 	IBlindedHopData,
 	IBlindedPath,
 	IBlindedPaymentPath
 } from '../onion/blinded-path';
 import {
-	ChannelManager,
-	IPerChannelKeys,
-	txInputOutpoints
-} from '../channel/channel-manager';
-import { ChannelResult } from '../channel/types';
-import { Channel, ISpliceWalletInput } from '../channel/channel';
+	constructBlindedPath,
+	processBlindedHop,
+	deriveBlindedPrivkey
+} from '../onion/blinded-path';
+import type { IPerChannelKeys } from '../channel/channel-manager';
+import { ChannelManager, txInputOutpoints } from '../channel/channel-manager';
+import type { ChannelResult } from '../channel/types';
+import type { ISpliceWalletInput } from '../channel/channel';
+import { Channel } from '../channel/channel';
 import { isValidShutdownScript } from '../channel/validation';
 import {
 	estimateSpliceTxWeight,
 	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../channel/splice-weight';
+import type { IHtlcEntry } from '../channel/types';
 import {
 	ChannelState,
 	ChannelRole,
 	HtlcState,
 	HtlcDirection,
-	IHtlcEntry,
 	DEFAULT_CHANNEL_CONFIG,
 	BITCOIN_CHAIN_HASH,
 	TESTNET_CHAIN_HASH,
 	REGTEST_CHAIN_HASH,
 	SIGNET_CHAIN_HASH
 } from '../channel/types';
-import {
-	PeerManager,
+import type {
 	IPeerDialOptions,
 	IPeerInfo,
-	PeerDialCancelledError,
 	Socks5ProxyScope
 } from '../transport/peer-manager';
-import { IPeerTransportOptions } from '../transport/duplex-transport';
+import { PeerManager, PeerDialCancelledError } from '../transport/peer-manager';
+import type { IPeerTransportOptions } from '../transport/duplex-transport';
 import { parseWebSocketUrl } from '../transport/websocket';
 import { NetworkGraph } from '../gossip/network-graph';
+import type {
+	ILocalChannelEdge,
+	TPolicyOverrides
+} from '../gossip/pathfinding';
 import {
 	findRoute,
 	findMultiPathRoute,
 	findRouteToBlindedPath,
 	calculateFee,
-	ILocalChannelEdge,
-	TPolicyOverrides,
 	policyOverrideKey
 } from '../gossip/pathfinding';
-import { findPayAllRoute, IPayAllRouteResult } from '../gossip/pay-all';
-import { IPayAllBudget, IPayAllQuote } from './types';
+import type { IPayAllRouteResult } from '../gossip/pay-all';
+import { findPayAllRoute } from '../gossip/pay-all';
+import type { IPayAllBudget, IPayAllQuote } from './types';
+import type { IRapidGossipResult } from '../gossip/rapid-sync';
 import {
 	applyRapidGossipSnapshot,
-	applyRapidGossipSnapshotAsync,
-	IRapidGossipResult
+	applyRapidGossipSnapshotAsync
 } from '../gossip/rapid-sync';
 import { MissionControl } from '../gossip/mission-control';
 import { GossipGraphRestore } from '../gossip/graph-restore';
-import {
+import type {
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
 	INodeAnnouncementMessage,
@@ -130,7 +135,9 @@ import {
 	IQueryShortChannelIdsMessage,
 	IRoute,
 	IRouteHop,
-	TGossipVerified,
+	TGossipVerified
+} from '../gossip/types';
+import {
 	ADDRESS_TYPE_TORV2,
 	ADDRESS_TYPE_TORV3,
 	DEFAULT_PRUNE_MAX_AGE,
@@ -155,7 +162,8 @@ import {
 	decodeQueryShortChannelIdsMessage,
 	decodeGossipTimestampFilterMessage
 } from '../gossip/gossip-queries';
-import { GossipSyncManager, IGossipSyncMessage } from '../gossip/gossip-sync';
+import type { IGossipSyncMessage } from '../gossip/gossip-sync';
+import { GossipSyncManager } from '../gossip/gossip-sync';
 import {
 	verifyChannelAnnouncement,
 	verifyNodeAnnouncement,
@@ -181,8 +189,8 @@ import {
 	extractChannelUpdate,
 	FAILURE_MESSAGE_LENGTH
 } from '../onion/failures';
+import type { IHopPayload, IProcessedOnion } from '../onion/types';
 import {
-	IHopPayload,
 	KEYSEND_TLV_TYPE,
 	INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
 	FINAL_INCORRECT_CLTV_EXPIRY,
@@ -201,24 +209,23 @@ import {
 	CHANNEL_DISABLED,
 	MPP_TIMEOUT,
 	TEMPORARY_NODE_FAILURE,
-	IProcessedOnion,
 	EXPIRY_TOO_FAR
 } from '../onion/types';
 import { checkDelegatedAmounts } from '../ffor/amounts';
+import type { IFforEpochRecord } from '../ffor/types';
 import {
 	FforAbortReason,
 	FforSlotState,
 	FforState,
-	IFforEpochRecord,
 	isFforConcurrentVersion
 } from '../ffor/types';
 import { encode as encodeInvoice } from '../invoice/encode';
 import { decode as decodeInvoice } from '../invoice/decode';
+import type { IRoutingHintHop } from '../invoice/types';
 import {
 	Network,
 	DEFAULT_MIN_FINAL_CLTV_EXPIRY,
-	DEFAULT_EXPIRY,
-	IRoutingHintHop
+	DEFAULT_EXPIRY
 } from '../invoice/types';
 import { MessageType } from '../message/types';
 import {
@@ -228,21 +235,24 @@ import {
 	encodePeerStorageRetrievalMessage,
 	decodePeerStorageRetrievalMessage
 } from '../message/peer-storage';
+import type { ICustomMessage } from '../message/custom';
 import {
 	BEIGNET_CUSTOM_MESSAGE_TYPE,
 	BeignetCustomSubtype,
-	ICustomMessage,
 	encodeCustomMessage,
 	decodeCustomMessage
 } from '../message/custom';
-import { GuardianHost, IGuardianHostStatus } from '../recovery/guardian-host';
+import type { IGuardianHostStatus } from '../recovery/guardian-host';
+import { GuardianHost } from '../recovery/guardian-host';
 import { JOURNAL_META_KEYS } from '../recovery/journal';
-import {
+import type {
 	IHeldJitPart,
 	IJitReceiveConfig,
 	IJitReceiveQuote,
 	JitFeeMode,
-	IPersistedHeldPart,
+	IPersistedHeldPart
+} from '../liquidity/jit-receive';
+import {
 	JitReceiveManager,
 	decodeJitAck,
 	decodeJitAuthorization,
@@ -256,16 +266,18 @@ import {
 	JitReceiveError,
 	JitReceiveErrorCode
 } from '../liquidity/jit-receive';
+import type {
+	DfRelayForwarder,
+	DfTransportRegistry,
+	IDfRequestRecord,
+	IDfOnionTransport,
+	DfTransportDescriptor
+} from '../direct-funding';
 import {
 	DF_DEFAULT_REQUEST_TTL_MS,
 	DfTransportType,
 	DirectFundingReceiver,
 	DirectFundingRequestStore,
-	DfRelayForwarder,
-	DfTransportRegistry,
-	IDfRequestRecord,
-	IDfOnionTransport,
-	DfTransportDescriptor,
 	chainHashForNetwork as dfChainHashForNetwork,
 	createDirectFundingTransports,
 	encodeRequestEnvelope,
@@ -273,27 +285,28 @@ import {
 	mintRequestEnvelope,
 	requestEncryptionPublicKey
 } from '../direct-funding';
+import type {
+	ISwapRecord,
+	ISwapChainSource,
+	SwapKeyRole,
+	ISubmarineSwapStatus,
+	IReverseSwapStatus
+} from '../swaps';
 import {
 	SwapLedger,
 	swapCodec,
 	SWAP_LEDGER_PREFIX,
-	ISwapRecord,
-	ISwapChainSource,
-	SwapKeyRole,
 	deriveSwapKey,
 	SwapChainResolver,
 	ReverseSwapProvider,
 	REVERSE_SWAP_EVENTS,
 	SubmarineSwapProvider,
 	SUBMARINE_SWAP_EVENTS,
-	ISubmarineSwapStatus,
 	REVERSE_SWAP_DEFAULTS,
-	REVERSE_SWAP_DEFAULT_EXPOSURE,
-	IReverseSwapStatus
+	REVERSE_SWAP_DEFAULT_EXPOSURE
 } from '../swaps';
-import {
+import type {
 	INodeConfig,
-	InvalidRequestError,
 	IResourceConfig,
 	IPaymentInfo,
 	ICreateInvoiceOptions,
@@ -308,8 +321,6 @@ import {
 	IFeeEstimator,
 	IPaymentRetryContext,
 	IOutboundMppState,
-	PaymentStatus,
-	PaymentDirection,
 	IPendingMppPayment,
 	IPaymentPart,
 	IInvoiceInfo,
@@ -326,18 +337,8 @@ import {
 	OutgoingHtlcState,
 	IPaymentHtlcResolvedEvent,
 	IPaymentPreimageEvent,
-	LightningErrorCode,
-	LightningPaymentError,
-	PaymentWaitTimeoutError,
-	InvalidChannelOpenError,
-	ChannelFundingUnavailableError,
-	ChannelFundingUnavailableCode,
-	InvalidSpliceError,
-	SpliceRefusalCode,
 	ISpliceRefusal,
 	ISpliceRequestResult,
-	InvalidPeerConnectError,
-	FundingWaitTimeoutError,
 	IChannelHealth,
 	IStructuredLog,
 	IGraphRestoreStats,
@@ -347,7 +348,6 @@ import {
 	IChannelPolicy,
 	IChannelPolicyUpdate,
 	ForwardPlacement,
-	clampFeeRateSatPerVbyte,
 	IAutoRebalanceConfig,
 	IAutoTuneFeesConfig,
 	IRebalanceResult,
@@ -355,6 +355,22 @@ import {
 	IRebalanceExecutionSummary,
 	IDirectFundingNodeConfig,
 	IDirectFundingPolicy
+} from './types';
+import {
+	InvalidRequestError,
+	PaymentStatus,
+	PaymentDirection,
+	LightningErrorCode,
+	LightningPaymentError,
+	PaymentWaitTimeoutError,
+	InvalidChannelOpenError,
+	ChannelFundingUnavailableError,
+	ChannelFundingUnavailableCode,
+	InvalidSpliceError,
+	SpliceRefusalCode,
+	InvalidPeerConnectError,
+	FundingWaitTimeoutError,
+	clampFeeRateSatPerVbyte
 } from './types';
 import {
 	canSelectDualFundingInputs,
@@ -377,7 +393,7 @@ import {
 } from '../validation';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
-import {
+import type {
 	IStorageBackend,
 	IPersistedChannelPolicy,
 	IForwardingEvent,
@@ -385,19 +401,22 @@ import {
 	IForwardingSummary
 } from '../storage/types';
 import { withStorageTransaction } from '../storage/transaction';
-import {
-	RecoveryManager,
-	RecoveryCriticality,
+import type {
 	RecoveryMutation,
 	IRecoveryCommitResult,
-	assertMutationEncodable,
 	GuardianStartupGate,
 	DurabilityBarrier,
 	IBarrierLatency,
+	RecoveryDurability,
+	GuardianDescriptor
+} from '../recovery';
+import {
+	RecoveryManager,
+	RecoveryCriticality,
+	assertMutationEncodable,
 	chainLostBackfill,
 	chainPromisedQuorum,
 	storedTipSequence,
-	RecoveryDurability,
 	ChannelRecoveryStatus,
 	RecoveryJournal,
 	deriveRecoveryMasterKey,
@@ -406,14 +425,13 @@ import {
 	journalSupported,
 	loadWriterLease,
 	composeRecoveryCapsule,
-	assertEmptyTarget,
-	GuardianDescriptor
+	assertEmptyTarget
 } from '../recovery';
-import {
-	ChannelErrorCode,
+import type {
 	IChannelPersistEvent,
 	IChannelPersistRequest
 } from '../channel/channel-actions';
+import { ChannelErrorCode } from '../channel/channel-actions';
 import { FeatureFlags, Feature } from '../features/flags';
 import {
 	ChainWatcher,
@@ -423,23 +441,19 @@ import {
 } from '../chain/chain-watcher';
 import { signP2wpkhInput } from '../chain/sweep';
 import { isDuplicateBroadcastRejection } from '../chain/broadcast-rejection';
+import type { ISweepUneconomicChainAction } from '../chain/types';
 import {
 	satPerVbyteToSatPerKw,
 	MIN_FEERATE_PER_KW,
 	CommitmentType,
 	MonitorState,
 	OutputStatus,
-	OutputType,
-	ISweepUneconomicChainAction
+	OutputType
 } from '../chain/types';
 import { ChainMonitor } from '../chain/chain-monitor';
-import { ElectrumBackend } from '../chain/electrum-backend';
-import {
-	WatchtowerClient,
-	IWatchtowerStore,
-	IJusticeContext,
-	chainHashForNetwork
-} from '../watchtower';
+import type { ElectrumBackend } from '../chain/electrum-backend';
+import type { IWatchtowerStore, IJusticeContext } from '../watchtower';
+import { WatchtowerClient, chainHashForNetwork } from '../watchtower';
 import {
 	bip32RootFromSeed,
 	deriveLightningKeys,
@@ -459,63 +473,69 @@ import {
 	hasScidAliasChannelType,
 	receivedAddIrrevocablyCommitted
 } from '../channel/types';
-import {
-	createOpenerState,
-	createAcceptorState,
+import type {
 	IAbandonedLocalAdd,
 	IChannelState,
 	ISpliceInFlight,
 	IV2InFlight,
-	mustNotBroadcastCommitment,
-	isRecencyUnproven,
-	recencyHoldOrigin,
 	ChannelCloseReason
 } from '../channel/channel-state';
 import {
-	IScbChannelEntry,
-	encodeScb,
-	parseScbAddress,
-	validateScbEntry
-} from '../backup/scb';
+	createOpenerState,
+	createAcceptorState,
+	mustNotBroadcastCommitment,
+	isRecencyUnproven,
+	recencyHoldOrigin
+} from '../channel/channel-state';
+import type { IScbChannelEntry } from '../backup/scb';
+import { encodeScb, parseScbAddress, validateScbEntry } from '../backup/scb';
 import { signRemoteCommitment } from '../channel/commitment-builder';
-import { ChannelSigner, SignerFactory } from '../keys/signer';
-import { bootstrapPeers, IPeerAddress, IBootstrapConfig } from '../bootstrap';
+import type { SignerFactory } from '../keys/signer';
+import { ChannelSigner } from '../keys/signer';
+import type { IPeerAddress, IBootstrapConfig } from '../bootstrap';
+import { bootstrapPeers } from '../bootstrap';
 import { OnionMessageManager } from '../onion-message/manager';
-import {
-	AsyncPaymentManager,
+import type {
 	HoldAdmissionJudge,
 	IHeldForwardDriver
 } from '../async-payments/manager';
+import { AsyncPaymentManager } from '../async-payments/manager';
+import type { IHeldForwardRecord } from '../async-payments/held-forward-ledger';
 import {
 	HELD_FORWARD_LEDGER_PREFIX,
 	HeldForwardLedger,
-	IHeldForwardRecord,
 	heldForwardCodec
 } from '../async-payments/held-forward-ledger';
+import type {
+	IFforWitnessMailboxRecord,
+	IFforWitnessRecordRow
+} from '../ffor/witness-ledger';
 import {
 	FF_WITNESS_MAILBOX_LEDGER_PREFIX,
 	FF_WITNESS_RECORD_LEDGER_PREFIX,
 	FforWitnessLedger,
-	IFforWitnessMailboxRecord,
-	IFforWitnessRecordRow,
 	fforWitnessMailboxCodec,
 	fforWitnessRecordCodec
 } from '../ffor/witness-ledger';
-import { FforWitnessEvents, FforWitnessService } from '../ffor/witness-service';
-import { FforIssuerEvents, FforIssuerService } from '../ffor/issuer-service';
+import type { FforWitnessEvents } from '../ffor/witness-service';
+import { FforWitnessService } from '../ffor/witness-service';
+import type { FforIssuerEvents } from '../ffor/issuer-service';
+import { FforIssuerService } from '../ffor/issuer-service';
 import { encodeOfferTlv } from '../offer/tlv';
+import type {
+	IFforIssuerManifestRecord,
+	IFforIssuerSlotRecord
+} from '../ffor/issuer-ledger';
 import {
 	FF_ISSUER_MANIFEST_LEDGER_PREFIX,
 	FF_ISSUER_SLOT_LEDGER_PREFIX,
 	FforIssuerLedger,
-	IFforIssuerManifestRecord,
-	IFforIssuerSlotRecord,
 	fforIssuerManifestCodec,
 	fforIssuerSlotCodec
 } from '../ffor/issuer-ledger';
+import type { IFforIssuerHop } from '../ffor/issuer-messages';
 import {
 	FF_ISSUER_MANIFEST_VERSION,
-	IFforIssuerHop,
 	decodeIssuerAck,
 	decodeIssuerStatusResp,
 	encodeIssuerManifest,
@@ -523,6 +543,7 @@ import {
 	encodeIssuerStatus,
 	signAttestation
 } from '../ffor/issuer-messages';
+import type { IFforWitnessProvision } from '../ffor/witness-types';
 import {
 	FF_ISSUER_PROVISION_TYPE,
 	FF_ISSUER_STATUS_RESP_TYPE,
@@ -533,7 +554,6 @@ import {
 	FF_WITNESS_PROVISION_TYPE,
 	FF_WITNESS_RETENTION_MARGIN_BLOCKS,
 	FF_WITNESS_VERSION,
-	IFforWitnessProvision,
 	isFforWitnessMessageType,
 	isFforWitnessResponseType
 } from '../ffor/witness-types';
@@ -550,20 +570,22 @@ import {
 } from '../ffor/witness-messages';
 import { buildVoucherBook } from '../ffor/transcript';
 import { deriveHoldRegistrationId } from '../async-payments/release-capability';
-import {
-	ASYNC_REGISTRATION_REPLY_TLV_TYPE,
-	ASYNC_REGISTRATION_REQUEST_TLV_TYPE,
+import type {
 	IAsyncReceiveServiceMetrics,
 	IHeldForwardNotice
 } from '../async-payments/types';
 import {
+	ASYNC_REGISTRATION_REPLY_TLV_TYPE,
+	ASYNC_REGISTRATION_REQUEST_TLV_TYPE
+} from '../async-payments/types';
+import type { IAsyncRegistrationRecord } from '../async-payments/service';
+import {
 	ASYNC_REGISTRATION_LEDGER_PREFIX,
 	AsyncReceiveService,
-	IAsyncRegistrationRecord,
 	asyncRegistrationCodec
 } from '../async-payments/service';
+import type { IReceiverGrant } from '../async-payments/receiver-grant';
 import {
-	IReceiverGrant,
 	decodeReceiverGrant,
 	decodeRegistrationReply,
 	encodeReceiverGrant,
@@ -578,32 +600,31 @@ import {
 	MemoryLedgerStore,
 	MetadataLedgerStore
 } from '../storage/durable-ledger';
-import {
+import type {
 	IOnionMessagePayload,
 	ISendOnionMessageOptions
 } from '../onion-message/types';
-import { OfferManager, ICreateOfferOptions } from '../offer/offer-manager';
-import { IOffer, IBolt12Invoice } from '../offer/types';
+import type { ICreateOfferOptions } from '../offer/offer-manager';
+import { OfferManager } from '../offer/offer-manager';
+import type { IOffer, IBolt12Invoice } from '../offer/types';
 import { PeerRateLimiter } from './rate-limiter';
-import {
-	LiquidityAdvisor,
+import type {
 	ILiquiditySnapshot,
 	IChannelSnapshot
 } from '../advisor/liquidity-advisor';
-import { FeeAdvisor, IFeeSnapshot } from '../advisor/fee-advisor';
-import {
-	ChannelSuggestions,
-	IChannelSuggestion
-} from '../advisor/channel-suggestions';
+import { LiquidityAdvisor } from '../advisor/liquidity-advisor';
+import type { IFeeSnapshot } from '../advisor/fee-advisor';
+import { FeeAdvisor } from '../advisor/fee-advisor';
+import type { IChannelSuggestion } from '../advisor/channel-suggestions';
+import { ChannelSuggestions } from '../advisor/channel-suggestions';
+import type { IRebalancePlan } from '../advisor/rebalance-planner';
 import {
 	planRebalances,
-	IRebalancePlan,
 	MIN_REBALANCE_SATS
 } from '../advisor/rebalance-planner';
+import type { IFeeTuneInput, IFeeTuneAdjustment } from '../advisor/fee-tuner';
 import {
 	computeFeeTuneAdjustments,
-	IFeeTuneInput,
-	IFeeTuneAdjustment,
 	DEFAULT_FEE_TUNE_FLOOR_PPM,
 	DEFAULT_FEE_TUNE_CEIL_PPM
 } from '../advisor/fee-tuner';

@@ -22,9 +22,9 @@
  */
 
 import { createHash } from 'crypto';
-import { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
+import type { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
+import type { GuardianState } from './guardian-wire';
 import {
-	GuardianState,
 	genesisLogHead,
 	parseStateBytes,
 	recordTranscriptHash,
@@ -36,8 +36,7 @@ import {
 	xOnlyFromSecret
 } from './guardian-wire';
 import { ecc } from '../../utils/ecc';
-import {
-	GuardianStatus,
+import type {
 	IGuardianRecord,
 	IGuardianReceipt,
 	IGuardianRegisterNodeRequest,
@@ -46,17 +45,20 @@ import {
 	IGuardianGetHeadResponse,
 	IGuardianGetStateResponse
 } from './guardian';
+import { GuardianStatus } from './guardian';
+import type {
+	IBoundGuardianClient,
+	IGuardianSetContext,
+	IGuardianFanOutResult
+} from './guardian-client';
 import {
 	GuardianProtocolMismatchError,
 	GuardianTransportError,
-	IBoundGuardianClient,
-	IGuardianSetContext,
 	boundFanOut,
 	countReceiptQuorum,
 	verifyGuardianBindings,
 	verifyGuardianReceipt,
-	verifyGuardianRotation,
-	IGuardianFanOutResult
+	verifyGuardianRotation
 } from './guardian-client';
 import { GUARDIAN_HOST_DEFAULT_MAX_CIPHERTEXT_BYTES } from './guardian-host';
 import {
@@ -70,8 +72,8 @@ import {
 	META_REPLICATED_THROUGH,
 	META_REPLICATED_THROUGH_HASH
 } from './journal';
+import type { IWriterLeaseKeys } from './writer-lease';
 import {
-	IWriterLeaseKeys,
 	generateWriterKey,
 	loadWriterLease,
 	prepareWriterLease,

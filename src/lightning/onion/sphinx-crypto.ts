@@ -12,7 +12,7 @@ import {
 	pointMultiply,
 	privateMultiply
 } from '../crypto/ecdh';
-import { IHopKeys } from './types';
+import type { IHopKeys } from './types';
 
 /**
  * Generate a shared secret between a session key and a hop's public key.
