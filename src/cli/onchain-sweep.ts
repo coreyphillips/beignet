@@ -2,6 +2,7 @@ import * as bitcoin from 'bitcoinjs-lib';
 import type { Wallet } from '../wallet';
 import type { SqliteStorage } from '../lightning/storage/sqlite-storage';
 import { BeignetError, BeignetErrorCodeValue } from './errors';
+import { TxidHex, txidToDisplayHex } from '../utils/identifiers';
 
 export const ONCHAIN_SWEEPS_KEY = 'daemon:onchain-sweeps:v1';
 
@@ -9,7 +10,7 @@ export interface OnchainSweepRequest {
 	requestId: string;
 	address: string;
 	satsPerVbyte: number;
-	inputOutpoints: Array<{ txid: string; vout: number }>;
+	inputOutpoints: Array<{ txid: TxidHex; vout: number }>;
 	debitSats: number;
 	maxFeeSats: number;
 }
@@ -28,7 +29,7 @@ export interface OnchainSweepInfo {
 	amountSats?: number;
 	feeSats?: number;
 	satsPerVbyte?: number;
-	txid?: string;
+	txid?: TxidHex;
 	createdAt: number;
 	broadcastAccepted?: boolean;
 	error?: string;
@@ -387,10 +388,7 @@ export class OnchainSweeps {
 			.map((point) => `${point.txid}:${point.vout}`)
 			.sort();
 		const actual = tx.ins
-			.map(
-				(input) =>
-					`${Buffer.from(input.hash).reverse().toString('hex')}:${input.index}`
-			)
+			.map((input) => `${txidToDisplayHex(input.hash)}:${input.index}`)
 			.sort();
 		const script = bitcoin.address.toOutputScript(
 			record.address,

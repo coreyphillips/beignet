@@ -37,6 +37,12 @@ import { generateMnemonic, getBitcoinJsNetwork } from '../utils/helpers';
 import { btcToSats } from '../utils/conversion';
 import { BoostError } from '../utils/boost';
 import {
+	ChannelIdHex,
+	PaymentHashHex,
+	TxidHex,
+	txidToDisplayHex
+} from '../utils/identifiers';
+import {
 	EAvailableNetworks,
 	EBoostType,
 	EPaymentType,
@@ -537,9 +543,9 @@ export interface BeignetNodeOptions
 		code: string;
 		message: string;
 		timestamp: number;
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		/** The transaction a broadcast error is about, display order (issue #1062). */
-		txid?: string;
+		txid?: TxidHex;
 		/** The node still holds that transaction and rebroadcasts it every block. */
 		retained?: boolean;
 		/** Why the channel refused, when the refusing arm said so (a ChannelErrorCode). */
@@ -1881,6 +1887,21 @@ function requireChannelIdHex(value: unknown, field = 'channelId'): Buffer {
 		throw new BeignetError(
 			BeignetErrorCode.INVALID_PARAMS,
 			`${field} must be a 64-character hex channel id`
+		);
+	}
+	return Buffer.from(value, 'hex');
+}
+
+/**
+ * A 32-byte payment hash as hex, checked for the reason requireChannelIdHex
+ * checks a channel id: unchecked, a malformed hash decodes to a short buffer
+ * that matches nothing, and a cancel or a metadata write answers success.
+ */
+function requirePaymentHashHex(value: unknown, field = 'paymentHash'): Buffer {
+	if (typeof value !== 'string' || !/^[0-9a-fA-F]{64}$/.test(value)) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`${field} must be a 64-character hex payment hash`
 		);
 	}
 	return Buffer.from(value, 'hex');
@@ -3512,7 +3533,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				this.refreshStaticChannelBackup();
 				const channelId = data.channelId.toString('hex');
 				const fundingTxid = data.fundingTxid
-					? Buffer.from(data.fundingTxid).reverse().toString('hex')
+					? txidToDisplayHex(data.fundingTxid)
 					: undefined;
 				this.log('info', 'Splice complete', { channelId, fundingTxid });
 				this.emit('splice:complete', { channelId, fundingTxid });
@@ -3590,9 +3611,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				// bitcoind) names a transaction in display order. Printed the
 				// other way round, an operator grepping the log for the id they
 				// see on screen found nothing (issue #681).
-				const fundingTxid = Buffer.from(data.fundingTxid)
-					.reverse()
-					.toString('hex');
+				const fundingTxid = txidToDisplayHex(data.fundingTxid);
 				this.log('info', 'Channel opening', { channelId, fundingTxid });
 				this.emit('channel:opening', { channelId, fundingTxid });
 			}
@@ -4883,7 +4902,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		 */
 		unfenced?: { guardians: IReportedGuardian[] };
 		recovering?: string[];
-		skipped?: Array<{ channelId: string; reason: string }>;
+		skipped?: Array<{ channelId: ChannelIdHex; reason: string }>;
 	}> {
 		if (this._restoreInFlight) {
 			throw new BeignetError(
@@ -6413,7 +6432,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 */
 	async recoverFallbackFunds(opts?: {
 		feeRatePerVbyte?: number;
-	}): Promise<{ txid: string; amountSat: number; inputCount: number } | null> {
+	}): Promise<{ txid: TxidHex; amountSat: number; inputCount: number } | null> {
 		const result = await this.node.recoverFallbackFunds(opts);
 		if (result) {
 			this.log('info', 'Recovered fallback funds to wallet', {
@@ -7428,7 +7447,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * Fee-only operation: EXCLUDED from the daily spend limit by design.
 	 */
 	async bumpFeeOnchain(
-		txid: string,
+		txid: TxidHex,
 		satsPerVbyte: number
 	): Promise<BoostResult> {
 		this._validateTxid(txid);
@@ -7452,7 +7471,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * Fee-only operation: EXCLUDED from the daily spend limit by design.
 	 */
 	async boostOnchain(
-		txid: string,
+		txid: TxidHex,
 		satsPerVbyte?: number
 	): Promise<BoostResult> {
 		this._validateTxid(txid);
@@ -7722,7 +7741,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	/** Freeze a UTXO: excluded from all coin selection until unfrozen. */
-	async freezeUtxo(txid: string, index: number): Promise<{ frozen: string }> {
+	async freezeUtxo(txid: TxidHex, index: number): Promise<{ frozen: string }> {
 		this._validateTxid(txid);
 		return this._runOnchainSend(async () => {
 			this.onchainSweeps().assertInputMutable(txid, index);
@@ -7738,7 +7757,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 	/** Unfreeze a previously frozen UTXO. */
 	async unfreezeUtxo(
-		txid: string,
+		txid: TxidHex,
 		index: number
 	): Promise<{ unfrozen: string }> {
 		this._validateTxid(txid);
@@ -8151,7 +8170,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	async closeQuote(
-		channelId: string,
+		channelId: ChannelIdHex,
 		address?: string,
 		acceptStaleStateRisk = false
 	): Promise<ReturnType<LightningNode['closeQuote']>> {
@@ -8171,7 +8190,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	async closeChannel(
-		channelId: string,
+		channelId: ChannelIdHex,
 		// Required for a capsule-restored channel, whose balances nothing can
 		// prove current: a mutual close signs the allocation this row carries,
 		// and a stale one is peer-favourable by construction (issue #469).
@@ -8396,7 +8415,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		return this.node.getChannelManager().peerNegotiatedFforConcurrent(peer);
 	}
 
-	fforSync(channelId: string): Record<string, unknown> {
+	fforSync(channelId: ChannelIdHex): Record<string, unknown> {
 		const id = this.fforChannelId(channelId).toString('hex');
 		const result = this.node.fforSync(id);
 		if (!result.ok)
@@ -8404,7 +8423,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		return this.fforEpoch(id);
 	}
 
-	fforEpoch(channelId: string): Record<string, unknown> {
+	fforEpoch(channelId: ChannelIdHex): Record<string, unknown> {
 		const idBuf = this.fforChannelId(channelId);
 		const f = this.node.getFforEpoch(idBuf.toString('hex'));
 		if (!f) {
@@ -8417,7 +8436,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	fforStartEpoch(body: {
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		voucherAmountsMsat?: Array<string | number>;
 		settlementDeadline?: number;
 		voucherExpiry?: number;
@@ -8503,7 +8522,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 	fforCreateInvoice(body: {
 		expirySecs?: number;
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		k?: number;
 		description?: string;
 	}): Record<string, unknown> {
@@ -8530,7 +8549,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		}
 	}
 
-	fforCloseEpoch(channelId: string): Record<string, unknown> {
+	fforCloseEpoch(channelId: ChannelIdHex): Record<string, unknown> {
 		const idBuf = this.fforChannelId(channelId);
 		const res = this.node.closeFforEpoch(idBuf.toString('hex'));
 		if (!res.ok)
@@ -8539,7 +8558,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	fforAbortEpoch(body: {
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		reason?: number;
 		text?: string;
 	}): Record<string, unknown> {
@@ -8557,7 +8576,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	fforAddPreimage(body: {
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		preimage?: string;
 	}): Record<string, unknown> {
 		const idBuf = this.fforChannelId(body.channelId);
@@ -8580,7 +8599,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	async fforProvisionWitness(body: {
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		witnessNodeId?: string;
 		retentionUntil?: number;
 		minReceipts?: number;
@@ -8651,7 +8670,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	async fforProvisionIssuer(body: {
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		issuerNodeId?: string;
 		offer?: string;
 		witnessHops?: Array<{
@@ -8721,7 +8740,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	async fforRecover(body: {
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		forceCloseIfUnreachable?: boolean;
 		acceptStaleStateRisk?: boolean;
 	}): Promise<Record<string, unknown>> {
@@ -8783,7 +8802,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	async fforCloseWitnesses(
-		channelId: string
+		channelId: ChannelIdHex
 	): Promise<Record<string, unknown>[]> {
 		const idBuf = this.fforChannelId(channelId);
 		const f = this.node.getFforEpoch(idBuf.toString('hex'));
@@ -8816,7 +8835,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	async fforIssuedSlots(
-		channelId: string | undefined,
+		channelId: ChannelIdHex | undefined,
 		issuerNodeId: string | undefined
 	): Promise<Record<string, unknown>> {
 		const idBuf = this.fforChannelId(channelId);
@@ -8853,7 +8872,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	fforEnforce(
-		channelId: string,
+		channelId: ChannelIdHex,
 		// The RECOVERY-PROTOCOL 5.6 acknowledgement forceCloseChannel asks
 		// for on a capsule-restored channel (issue #469). This route publishes
 		// the same commitment, so it takes the same flag and refuses without
@@ -8920,7 +8939,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	forceCloseChannel(
-		channelId: string,
+		channelId: ChannelIdHex,
 		// The labelled risk acknowledgement RECOVERY-PROTOCOL 5.6 asks for
 		// (issues #469 and #907). Required for either recency hold, and on a
 		// fenced or quarantined device (issue #1013): this node refuses to
@@ -8932,7 +8951,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	): {
 		ok: boolean;
 		error?: string;
-		commitmentTxid?: string;
+		commitmentTxid?: TxidHex;
 	} {
 		// Validate before deciding anything from it. Buffer.from(x, 'hex')
 		// truncates at the first non-hex pair and is case insensitive, so a
@@ -9059,10 +9078,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * always rebuilds from the latest state, so no older commitment can be
 	 * selected.
 	 */
-	async rebroadcastClose(channelId: string): Promise<{
+	async rebroadcastClose(channelId: ChannelIdHex): Promise<{
 		ok: boolean;
 		error?: string;
-		txid?: string;
+		txid?: TxidHex;
 		broadcastOk?: boolean;
 	}> {
 		return this.node.rebroadcastClose(requireChannelIdHex(channelId));
@@ -9072,19 +9091,21 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		return this.node.listChannels().map((ch) => this.toChannelInfo(ch));
 	}
 
-	getChannel(channelId: string): ChannelInfo | null {
+	getChannel(channelId: ChannelIdHex): ChannelInfo | null {
 		const ch = this.node.getChannel(requireChannelIdHex(channelId));
 		if (!ch) return null;
 		return this.toChannelInfo(ch);
 	}
 
 	getChannelHealth(
-		channelId: string
+		channelId: ChannelIdHex
 	): import('../lightning/node/types').IChannelHealth | null {
 		return this.node.getChannelHealth(requireChannelIdHex(channelId));
 	}
 
-	getChannelDiagnostics(channelId: string): Record<string, unknown> | null {
+	getChannelDiagnostics(
+		channelId: ChannelIdHex
+	): Record<string, unknown> | null {
 		const channelIdBuf = requireChannelIdHex(channelId);
 		const channel = this.node.getChannelManager().getChannel(channelIdBuf);
 		if (!channel) return null;
@@ -9868,7 +9889,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		host?: string;
 		port?: number;
 		amountSats?: number;
-	}): { paymentHash: string; expiresAt: number; request: string } {
+	}): { paymentHash: PaymentHashHex; expiresAt: number; request: string } {
 		if (opts.port !== undefined) {
 			if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
 				throw new BeignetError(
@@ -10086,7 +10107,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 */
 	createHoldInvoice(opts: {
 		/** 32-byte payment hash, hex. sha256(preimage) held by the caller. */
-		paymentHash: string;
+		paymentHash: PaymentHashHex;
 		amountMsat?: bigint;
 		amountSats?: number;
 		description?: string;
@@ -10101,12 +10122,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		 */
 		minFinalCltvExpiry?: number;
 	}): InvoiceInfo {
-		if (!/^[0-9a-fA-F]{64}$/.test(opts.paymentHash)) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'paymentHash must be 32 bytes hex (64 hex chars)'
-			);
-		}
+		const paymentHash = requirePaymentHashHex(opts.paymentHash);
 		const amountMsat =
 			opts.amountMsat ??
 			(opts.amountSats !== undefined && opts.amountSats !== 0
@@ -10120,7 +10136,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			description: opts.description || '',
 			expiry: opts.expiry,
 			hold: true,
-			paymentHash: Buffer.from(opts.paymentHash, 'hex'),
+			paymentHash,
 			...(opts.minFinalCltvExpiry !== undefined
 				? {
 						minFinalCltvExpiry: requireFinalCltvExpiry(opts.minFinalCltvExpiry)
@@ -10165,7 +10181,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * MPP part). Throws NOT_FOUND when nothing is parked for the hash, and
 	 * HOLD_RESOLUTION_PENDING when parts stay parked after the call.
 	 */
-	settleHoldInvoice(preimage: string): { paymentHash: string } {
+	settleHoldInvoice(preimage: string): { paymentHash: PaymentHashHex } {
 		if (!/^[0-9a-fA-F]{64}$/.test(preimage)) {
 			throw new BeignetError(
 				BeignetErrorCode.INVALID_PARAMS,
@@ -10194,17 +10210,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * HTLCs. Throws NOT_FOUND when the hash is not a known open hold invoice,
 	 * and HOLD_RESOLUTION_PENDING when parts stay parked after the call.
 	 */
-	cancelHoldInvoice(paymentHash: string): {
-		paymentHash: string;
+	cancelHoldInvoice(paymentHash: PaymentHashHex): {
+		paymentHash: PaymentHashHex;
 		htlcsFailed: number;
 	} {
-		if (!/^[0-9a-fA-F]{64}$/.test(paymentHash)) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'paymentHash must be 32 bytes hex (64 hex chars)'
-			);
-		}
-		const hash = Buffer.from(paymentHash, 'hex');
+		const hash = requirePaymentHashHex(paymentHash);
 		const result = this.node.cancelHoldInvoice(hash);
 		if (!result) {
 			throw this.holdResolutionRefusal(
@@ -11828,7 +11838,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		amountSats?: number,
 		metadata?: Record<string, string>,
 		cltvLimit?: number
-	): { paymentHash: string; status: 'PENDING' | 'FAILED' } {
+	): { paymentHash: PaymentHashHex; status: 'PENDING' | 'FAILED' } {
 		// Returning before the payment settles is the point of this method, not
 		// a licence to skip admission: drain mode, the per-payment limit and the
 		// daily limit all apply, and the claim they raise is charged by the
@@ -11915,7 +11925,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		timeoutMs = 60_000,
 		maxFeeSats?: number,
 		metadata?: Record<string, string>,
-		onPaymentHash?: (paymentHash: string) => void
+		onPaymentHash?: (paymentHash: PaymentHashHex) => void
 	): Promise<PaymentInfo> {
 		this._checkDraining();
 		if (this.isGraphRestoring()) await this.whenGraphRestored();
@@ -12164,10 +12174,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * a NOT_FOUND for a payment the caller already knew is the answer this
 	 * exists to prevent.
 	 */
-	getPayment(paymentHash: string): PaymentInfo | null {
-		const live = this.livePayment(paymentHash);
+	getPayment(paymentHash: PaymentHashHex): PaymentInfo | null {
+		const hashHex = requirePaymentHashHex(paymentHash).toString('hex');
+		const live = this.livePayment(hashHex);
 		if (live) return live;
-		const durable = this.storage.loadPayment(paymentHash);
+		const durable = this.storage.loadPayment(hashHex);
 		return durable ? this.toPaymentInfo(durable) : null;
 	}
 
@@ -12177,11 +12188,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * PENDING or an HTLC is still out for it, 'gone' when nothing sent for it
 	 * can settle any more. A durable row that cannot be read reads as live.
 	 */
-	paymentOutcome(paymentHash: string): 'settled' | 'live' | 'gone' {
-		return this._spendClaimOutcomeAtBoot(
-			Buffer.from(paymentHash, 'hex'),
-			paymentHash
-		);
+	paymentOutcome(paymentHash: PaymentHashHex): 'settled' | 'live' | 'gone' {
+		const hash = requirePaymentHashHex(paymentHash);
+		return this._spendClaimOutcomeAtBoot(hash, hash.toString('hex'));
 	}
 
 	/**
@@ -12300,7 +12309,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		truncated: boolean;
 		paid: boolean;
 		amountPaidSats: number;
-		paymentHash?: string;
+		paymentHash?: PaymentHashHex;
 	}> {
 		this._checkDraining();
 		// This method is reachable over the daemon API, which makes it a
@@ -12409,8 +12418,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		this._l402Credentials.delete(scope);
 	}
 
-	getPaymentProof(paymentHash: string): PaymentProof | null {
-		const hash = Buffer.from(paymentHash, 'hex');
+	getPaymentProof(paymentHash: PaymentHashHex): PaymentProof | null {
+		const hash = requirePaymentHashHex(paymentHash);
 		const proof = this.node.getPaymentProof(hash);
 		// The proof is built from this record, so both exist or neither does.
 		// The sats come from the record, as getPayment's do: the proof carries
@@ -12431,7 +12440,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		};
 	}
 
-	verifyPaymentProof(paymentHash: string): PaymentProofVerification {
+	verifyPaymentProof(paymentHash: PaymentHashHex): PaymentProofVerification {
 		const proof = this.getPaymentProof(paymentHash);
 		if (!proof) return { valid: false, error: 'No proof found' };
 		const computed = crypto
@@ -12454,7 +12463,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * proportional millionths); see updateChannelPolicy for that.
 	 */
 	updateChannelFee(
-		channelId: string,
+		channelId: ChannelIdHex,
 		feeratePerKw: number
 	): { ok: boolean; error?: string } {
 		return this.node.updateChannelFee(
@@ -12470,7 +12479,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * channelId.
 	 */
 	updateChannelPolicy(
-		channelId: string,
+		channelId: ChannelIdHex,
 		policy: ChannelPolicyUpdateParams
 	): { updated: number; policies: ChannelPolicyInfo[] } {
 		return this.applyChannelPolicy(
@@ -12532,7 +12541,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	/** Effective routing policy for a channel, or null if unknown. */
-	getChannelPolicy(channelId: string): ChannelPolicyInfo | null {
+	getChannelPolicy(channelId: ChannelIdHex): ChannelPolicyInfo | null {
 		const policy = this.node.getChannelPolicy(requireChannelIdHex(channelId));
 		if (!policy) return null;
 		return {
@@ -12553,8 +12562,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * refusal here has to be a thrown BeignetError, so the daemon answers with
 	 * the failure envelope and a status to match.
 	 */
-	cancelPayment(paymentHash: string): { ok: true } {
-		this.node.failPayment(Buffer.from(paymentHash, 'hex'));
+	cancelPayment(paymentHash: PaymentHashHex): { ok: true } {
+		this.node.failPayment(requirePaymentHashHex(paymentHash));
 		return { ok: true };
 	}
 
@@ -12654,7 +12663,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	// ─────────────── Wait APIs ───────────────
 
 	async waitForChannelReady(
-		channelId: string,
+		channelId: ChannelIdHex,
 		timeoutMs = 60_000
 	): Promise<void> {
 		return this.node.waitForChannelReady(
@@ -12672,11 +12681,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	async waitForPayment(
-		paymentHash: string,
+		paymentHash: PaymentHashHex,
 		timeoutMs = 60_000
 	): Promise<PaymentInfo> {
 		const info = await this.node.waitForPayment(
-			Buffer.from(paymentHash, 'hex'),
+			requirePaymentHashHex(paymentHash),
 			timeoutMs
 		);
 		return this.toPaymentInfo(info);
@@ -12845,7 +12854,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	// ─────────────── Splicing ───────────────
 
 	spliceQuote(
-		channelId: string,
+		channelId: ChannelIdHex,
 		direction: 'in' | 'out',
 		feeratePerkw: number,
 		destinationAddress?: string
@@ -12863,11 +12872,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	spliceIn(
-		channelId: string,
+		channelId: ChannelIdHex,
 		amountSats: number,
 		feeratePerkw: number,
 		fundingUtxos?: {
-			utxos: Array<{ txid: string; vout: number }>;
+			utxos: Array<{ txid: TxidHex; vout: number }>;
 			allowTopUp?: boolean;
 		}
 	): SpliceResult {
@@ -12924,7 +12933,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	spliceOut(
-		channelId: string,
+		channelId: ChannelIdHex,
 		amountSats: number,
 		feeratePerkw: number,
 		destinationAddress?: string
@@ -13069,7 +13078,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		timeoutMs = 60_000,
 		maxFeeSats?: number,
 		maxFeeMsatCap?: number | string,
-		onPaymentHash?: (paymentHash: string) => void
+		onPaymentHash?: (paymentHash: PaymentHashHex) => void
 	): Promise<PaymentInfo> {
 		if (this.isGraphRestoring()) await this.whenGraphRestored();
 		// Paying an offer spends outbound liquidity exactly as payInvoice does,
@@ -13227,8 +13236,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * from the in-memory record or, once that is pruned, the durable row
 	 * (issue #1063); EXPIRED past its expiry otherwise; PENDING until then.
 	 */
-	getInvoice(paymentHash: string): InvoiceInfo | null {
-		const inv = this.node.getInvoice(paymentHash);
+	getInvoice(paymentHash: PaymentHashHex): InvoiceInfo | null {
+		const inv = this.node.getInvoice(
+			requirePaymentHashHex(paymentHash).toString('hex')
+		);
 		if (!inv) return null;
 		const live = this.node.getPayment(Buffer.from(inv.paymentHash, 'hex'));
 		const paid = live
@@ -13667,8 +13678,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * maxFeeSats.
 	 */
 	async rebalanceChannel(
-		fromChannelId: string,
-		toChannelId: string,
+		fromChannelId: ChannelIdHex,
+		toChannelId: ChannelIdHex,
 		amountSats: number,
 		maxFeeSats: number
 	): Promise<RebalanceResult> {
@@ -14092,16 +14103,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * claim, was never charged.
 	 */
 	sendToRoute(
-		paymentHash: string,
+		paymentHash: PaymentHashHex,
 		route: { hops: RouteHop[] },
 		paymentSecret?: string
 	): PaymentInfo {
-		if (!/^[0-9a-fA-F]{64}$/.test(paymentHash)) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'paymentHash must be a 32-byte hex string'
-			);
-		}
+		const paymentHashBuf = requirePaymentHashHex(paymentHash);
 		if (!route || !Array.isArray(route.hops) || route.hops.length === 0) {
 			throw new BeignetError(
 				BeignetErrorCode.INVALID_PARAMS,
@@ -14121,9 +14127,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const hops = jsonToRouteHops(route.hops);
 		const finalHop = hops[hops.length - 1];
 		// The claim is keyed the way the settlement will look it up: the
-		// engine reports the hash as lowercase hex, and the regex above admits
+		// engine reports the hash as lowercase hex, and the caller may send
 		// uppercase.
-		const paymentHashHex = paymentHash.toLowerCase();
+		const paymentHashHex = paymentHashBuf.toString('hex');
 		// The wire amount is what the first hop is asked to carry.
 		const sentMsat = hops[0].amountToForwardMsat;
 		if (sentMsat < finalHop.amountToForwardMsat) {
@@ -14145,7 +14151,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		try {
 			payment = this.node.sendPaymentToRoute(
 				wireRoute,
-				Buffer.from(paymentHashHex, 'hex'),
+				paymentHashBuf,
 				finalHop.outgoingCltvValue,
 				paymentSecret ? Buffer.from(paymentSecret, 'hex') : undefined,
 				finalHop.amountToForwardMsat
@@ -14256,11 +14262,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	// ─────────────── Payment Metadata ───────────────
 
 	setPaymentMetadata(
-		paymentHash: string,
+		paymentHash: PaymentHashHex,
 		metadata: Record<string, string>
 	): void {
+		const hash = requirePaymentHashHex(paymentHash);
 		try {
-			this.node.setPaymentMetadata(Buffer.from(paymentHash, 'hex'), metadata);
+			this.node.setPaymentMetadata(hash, metadata);
 		} catch (err: unknown) {
 			if (err instanceof InvalidRequestError) {
 				throw new BeignetError(BeignetErrorCode.INVALID_PARAMS, err.message);
@@ -14796,7 +14803,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 */
 	async restoreFromScb(encoded: string): Promise<{
 		recovering: string[];
-		skipped: Array<{ channelId: string; reason: string }>;
+		skipped: Array<{ channelId: ChannelIdHex; reason: string }>;
 		channelCount: number;
 	}> {
 		const seed = this.walletSeed();

@@ -7,6 +7,7 @@
  */
 
 import { TypedEmitter } from '../../utils/typed-emitter';
+import type { TxidHex } from '../../utils/identifiers';
 import { ChannelManagerEvents } from './events';
 import crypto from 'crypto';
 import { MessageType } from '../message/types';
@@ -2946,7 +2947,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * depth when the watcher tracks several (post-signatures RBF); omitted
 	 * means the channel's current funding tx.
 	 */
-	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: string): void {
+	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: TxidHex): void {
 		const channel = this.channels.get(channelId.toString('hex'));
 		if (!channel) return;
 

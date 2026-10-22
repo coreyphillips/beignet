@@ -51,6 +51,7 @@ import {
 	ISpliceConflictMessage
 } from '../message/splice-conflict';
 import { TypedEmitter } from '../../utils/typed-emitter';
+import type { TxidHex } from '../../utils/identifiers';
 import { LightningNodeEvents, NodeErrorCode } from './events';
 import crypto from 'crypto';
 import { ILogger, noopLogger } from '../../logger';
@@ -12349,7 +12350,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		);
 	}
 
-	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: string): void {
+	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: TxidHex): void {
 		this.channelManager.handleFundingConfirmed(channelId, confirmedTxidHex);
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) return;

@@ -225,7 +225,12 @@ describe('HTTP Route Fixes', () => {
 		});
 		const addr = server.address() as { port: number };
 		try {
-			const resp = await httpGet(addr.port, '/payment?paymentHash=aabbccdd');
+			// Well formed, as for GET /channel above: a malformed hash is
+			// INVALID_PARAMS.
+			const resp = await httpGet(
+				addr.port,
+				`/payment?paymentHash=${'aabbccdd'.repeat(8)}`
+			);
 			expect(resp.body.ok).to.be.false;
 			expect((resp.body.error as { code: string }).code).to.equal('NOT_FOUND');
 		} finally {
