@@ -144,7 +144,7 @@ A few calls do not return a `Result`, so check them differently:
 - `getFeeEstimates()` never errs. When its sources fail it returns the previous estimates or built-in defaults (fixed values on regtest).
 - `updateAddressType()` throws on a type the wallet cannot use, and `resetAddressIndexes()` resolves to nothing.
 
-Balances, UTXO values and send amounts are satoshis, and fee rates are sat/vB. The value fields of stored transactions (`wallet.transactions`, `IFormattedTransaction.value`, `fee`, `totalInputValue` and the rest) are **BTC**, as decoded from the raw transaction: convert them with `btcToSats` before comparing them with anything else.
+Balances, UTXO values and send amounts are satoshis, and fee rates are sat/vB: every `satsPerByte` option and field is sat/vB despite its name. Stored transactions (`wallet.transactions`) carry their amounts in satoshis as `valueSats`, `feeSats`, `totalInputSats`, `matchedInputSats`, `totalOutputSats` and `matchedOutputSats`. Their older BTC twins (`value`, `fee`, `totalInputValue` and the rest) are deprecated and go in the next major release. `btcToSats`, `satsToMsat` and `msatToSatsFloor` convert between units.
 
 Options worth knowing on `Wallet.create`: `network` (`EAvailableNetworks.mainnet` | `testnet` | `regtest` | `signet`), `addressType` (`EAddressType.p2wpkh` default, `p2sh` for P2SH-wrapped segwit, `p2pkh`, `p2tr`), `passphrase`, `account`, `storage`, `logger`, `onMessage`, `coinSelectPreference`, `feeEstimationSource`, `gapLimitOptions`.
 

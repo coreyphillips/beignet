@@ -921,7 +921,7 @@ export class Transaction {
 	}
 
 	/**
-	 * Returns the maximum sats per byte that can be used for a given transaction.
+	 * Returns the maximum fee rate, in sat/vB, that can be used for a given transaction.
 	 * @param {number} transactionByteCount
 	 * @param {number} [balance]
 	 * @returns {number}

@@ -171,6 +171,16 @@ type TCosigner = {
 	branches: Map<string, BIP32Interface>;
 };
 
+// Each BTC field of a formatted transaction and the sats field beside it.
+const SATS_FIELDS = [
+	['totalInputValue', 'totalInputSats'],
+	['matchedInputValue', 'matchedInputSats'],
+	['totalOutputValue', 'totalOutputSats'],
+	['matchedOutputValue', 'matchedOutputSats'],
+	['fee', 'feeSats'],
+	['value', 'valueSats']
+] as const;
+
 export class Wallet {
 	private _network: EAvailableNetworks;
 	private readonly _mnemonic?: string;
@@ -1335,7 +1345,7 @@ export class Wallet {
 			if (walletDataResponse.isErr()) return err(walletDataResponse.error);
 			this._data = walletDataResponse.value;
 			await this._scrubStoredSendTransaction();
-			await this._trimStoredTransactionInputs();
+			await this._upgradeStoredTransactions();
 			await this._applyBirthdayHeightOption();
 			return ok(true);
 		} catch (e) {
@@ -1361,26 +1371,33 @@ export class Wallet {
 	}
 
 	/**
-	 * Records formatted before inputs were trimmed still carry every input's
-	 * scriptSig and witness, which each later save of their map writes again.
-	 * Trims them once, writing only a map that held such a record. After a
-	 * refused write the next load trims them again.
+	 * Brings records stored by older versions to the current shape once,
+	 * writing only a map that held such a record. After a refused write the
+	 * next load does it again. Records formatted before inputs were trimmed
+	 * still carry every input's scriptSig and witness, which each later save
+	 * of their map writes again. Records formatted before the sats fields
+	 * existed get them from their BTC fields.
 	 * @private
 	 * @async
 	 * @returns {Promise<void>}
 	 */
-	private async _trimStoredTransactionInputs(): Promise<void> {
+	private async _upgradeStoredTransactions(): Promise<void> {
 		for (const key of ['transactions', 'unconfirmedTransactions'] as const) {
 			const records = this._data[key];
-			let trimmed = false;
+			let changed = false;
 			for (const record of Object.values(records)) {
-				if (!Array.isArray(record?.vin) || !hasUntrimmedInputs(record.vin)) {
-					continue;
+				if (!record) continue;
+				if (Array.isArray(record.vin) && hasUntrimmedInputs(record.vin)) {
+					record.vin = trimInputs(record.vin);
+					changed = true;
 				}
-				record.vin = trimInputs(record.vin);
-				trimmed = true;
+				for (const [btc, sats] of SATS_FIELDS) {
+					if (typeof record[sats] === 'number') continue;
+					record[sats] = btcToSats(record[btc]);
+					changed = true;
+				}
 			}
-			if (trimmed) await this.saveWalletData(key, records);
+			if (changed) await this.saveWalletData(key, records);
 		}
 	}
 
@@ -5003,6 +5020,12 @@ export class Wallet {
 			let matchedInputValue = 0; // Total value of all inputs with addresses that belong to this wallet.
 			let totalOutputValue = 0; // Total value of all outputs.
 			let matchedOutputValue = 0; // Total value of all outputs with addresses that belong to this wallet.
+			// The same four in sats, summed per input and output so no rounding
+			// of the BTC sums reaches them.
+			let totalInputSats = 0;
+			let matchedInputSats = 0;
+			let totalOutputSats = 0;
+			let matchedOutputSats = 0;
 			let messages: string[] = []; // Array of OP_RETURN messages.
 
 			//Iterate over each input
@@ -5041,10 +5064,13 @@ export class Wallet {
 				const key = `${vin.txid}${vin.vout}`;
 				if (key in inputData) {
 					const { addresses: _addresses, value } = inputData[key];
+					const sats = btcToSats(value);
 					totalInputValue = totalInputValue + value;
+					totalInputSats += sats;
 					_addresses.map((address) => {
 						if (ownAddresses.has(address)) {
 							matchedInputValue = matchedInputValue + value;
+							matchedInputSats += sats;
 						}
 					});
 				}
@@ -5057,10 +5083,13 @@ export class Wallet {
 					: scriptPubKey.address
 					? [scriptPubKey.address]
 					: [];
+				const sats = btcToSats(value);
 				totalOutputValue = totalOutputValue + value;
+				totalOutputSats += sats;
 				_addresses.map((address) => {
 					if (ownAddresses.has(address)) {
 						matchedOutputValue = matchedOutputValue + value;
+						matchedOutputSats += sats;
 					}
 				});
 			});
@@ -5080,8 +5109,11 @@ export class Wallet {
 			// collects the block's fees.
 			const totalValue = isCoinbase ? 0 : totalInputValue - totalOutputValue;
 			const fee = Number(Math.abs(totalValue).toFixed(8));
+			const feeSats = isCoinbase
+				? 0
+				: Math.abs(totalInputSats - totalOutputSats);
 			const vsize = result.vsize;
-			const satsPerByte = Math.round(btcToSats(fee) / vsize);
+			const satsPerByte = Math.round(feeSats / vsize);
 			const { address, height, scriptHash } = data;
 			let timestamp = Date.now();
 			let confirmTimestamp: number | undefined;
@@ -5101,13 +5133,19 @@ export class Wallet {
 				height,
 				scriptHash,
 				totalInputValue,
+				totalInputSats,
 				matchedInputValue,
+				matchedInputSats,
 				totalOutputValue,
+				totalOutputSats,
 				matchedOutputValue,
+				matchedOutputSats,
 				fee,
+				feeSats,
 				satsPerByte,
 				type,
 				value,
+				valueSats: matchedOutputSats - matchedInputSats,
 				txid,
 				messages,
 				timestamp,

@@ -12,3 +12,4 @@ export * from './descriptors';
 export * from './transaction';
 export * from './errors';
 export * from './result';
+export * from './conversion';

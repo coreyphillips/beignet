@@ -1,4 +1,5 @@
 import { Result } from '../utils';
+import type { Sats } from '../utils/conversion';
 import {
 	EElectrumNetworks,
 	IHeader,
@@ -131,18 +132,40 @@ export interface IFormattedTransaction {
 	blockhash?: string;
 	height?: number;
 	scriptHash: string;
-	// The value fields below are denominated in BTC, not sats, because they are
-	// taken from the decoded raw transaction. Convert with btcToSats before
-	// comparing them against anything in sats. ISendTransaction.fee and
-	// IRbfData.fee are sats.
-	totalInputValue: number; // BTC
-	matchedInputValue: number; // BTC
-	totalOutputValue: number; // BTC
-	matchedOutputValue: number; // BTC
-	fee: number; // BTC
+	// Each amount is held in sats (the *Sats fields) and in BTC, as decoded
+	// from the raw transaction. The BTC fields are deprecated and go in the
+	// next major release. Until then the sats fields are optional, so code
+	// that builds or stores records without them still compiles. The wallet
+	// sets them on every record it formats or loads.
+	/** @deprecated BTC: use totalInputSats. */
+	totalInputValue: number;
+	/** The sum of the outputs the inputs spend. */
+	totalInputSats?: Sats;
+	/** @deprecated BTC: use matchedInputSats. */
+	matchedInputValue: number;
+	/** The part of totalInputSats this wallet's addresses held. */
+	matchedInputSats?: Sats;
+	/** @deprecated BTC: use totalOutputSats. */
+	totalOutputValue: number;
+	totalOutputSats?: Sats;
+	/** @deprecated BTC: use matchedOutputSats. */
+	matchedOutputValue: number;
+	/** The part of totalOutputSats paid to this wallet's addresses. */
+	matchedOutputSats?: Sats;
+	/** @deprecated BTC: use feeSats. */
+	fee: number;
+	/** 0 for a coinbase, which pays no fee. */
+	feeSats?: Sats;
+	/** The fee rate in sat/vB, rounded to a whole number. */
 	satsPerByte: number;
 	type: EPaymentType;
-	value: number; // BTC
+	/** @deprecated BTC: use valueSats. */
+	value: number;
+	/**
+	 * matchedOutputSats minus matchedInputSats: negative for a send, and then
+	 * it includes the fee.
+	 */
+	valueSats?: Sats;
 	txid: string;
 	messages: string[];
 	vin: TFormattedVin[];
@@ -174,7 +197,7 @@ export interface ISendTransaction {
 	changeAddress: string;
 	fiatAmount: number;
 	fee: number; //Total fee in sats
-	satsPerByte: number;
+	satsPerByte: number; // sat/vB
 	selectedFeeId: EFeeId;
 	message: string; // OP_RETURN data for a given transaction.
 	label: string; // User set label for a given transaction.
@@ -613,7 +636,7 @@ export interface ISendTx {
 
 export interface ISend {
 	txs: ISendTx | ISendTx[];
-	satsPerByte?: number;
+	satsPerByte?: number; // sat/vB
 }
 
 // Watch-only wallets are constructed from an account-level xpub; mnemonic,
@@ -662,7 +685,7 @@ export interface IBuildPsbtArgs {
 	address?: string;
 	amount?: number; // sats
 	message?: string;
-	satsPerByte?: number;
+	satsPerByte?: number; // sat/vB
 	rbf?: boolean;
 	shuffleOutputs?: boolean;
 }
@@ -685,7 +708,7 @@ export interface IBuildPsbtResponse {
 	psbtBase64: string;
 	fee: number; // sats
 	vsizeEstimate: number; // vbytes
-	satsPerByte: number;
+	satsPerByte: number; // sat/vB
 	inputs: IBuildPsbtInputSummary[];
 	outputs: IBuildPsbtOutputSummary[];
 }
@@ -731,7 +754,7 @@ export interface IBoostedTransactions {
 export interface IBoost {
 	txid: string;
 	type: EBoostType;
-	/** Defaults to the rate setupRbf or setupCpfp picks. */
+	/** In sat/vB. Defaults to the rate setupRbf or setupCpfp picks. */
 	satsPerByte?: number;
 }
 
@@ -753,7 +776,7 @@ export interface IPrivateKeyInfo {
 export interface ISweepPrivateKey {
 	privateKey: string;
 	toAddress: string;
-	satsPerByte?: number;
+	satsPerByte?: number; // sat/vB
 	broadcast?: boolean;
 	combineWithWalletUtxos?: boolean;
 }

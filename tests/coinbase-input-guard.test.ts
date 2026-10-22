@@ -137,10 +137,12 @@ describe('Coinbase transaction handling (issue #548)', function () {
 			expect(formatted, 'coinbase tx formatted').to.exist;
 			// A coinbase pays no fee; it collects the block's fees.
 			expect(formatted.fee).to.equal(0);
+			expect(formatted.feeSats).to.equal(0);
 			expect(formatted.satsPerByte).to.equal(0);
 			// The output value is intact and the coinbase vin rides through
 			// under its own union member.
 			expect(formatted.totalOutputValue).to.equal(50);
+			expect(formatted.totalOutputSats).to.equal(5_000_000_000);
 			expect('coinbase' in formatted.vin[0]).to.equal(true);
 		}
 	});
