@@ -40,6 +40,9 @@ export const createEncryptedStorage = (
 	const key = hkdfKey(seed, WALLET_HKDF_INFO);
 	const innerGetData = inner.getData;
 	const innerSetData = inner.setData;
+	// No setTransactionChanges, even when inner has one: inner holds each map
+	// as one ciphertext and cannot apply changes to it. The wallet then writes
+	// the whole map through setData.
 	const storage: TStorage = {};
 	if (innerGetData) {
 		storage.getData = async <K extends keyof IWalletData>(

@@ -294,6 +294,27 @@ export type TSetData = <K extends keyof IWalletData>(
 	value: IWalletData[K]
 ) => Promise<Result<boolean>>;
 
+/**
+ * The records of the transaction map that changed since the write before
+ * this one. Each record in `set` is added or replaces the stored record with
+ * its txid, and each txid in `deleted` is removed. A txid is in at most one
+ * of the two.
+ */
+export type TTransactionChanges = {
+	set: IFormattedTransactions;
+	deleted: string[];
+};
+
+/**
+ * Applies changes to the transaction map stored under `key`. getData for that
+ * key must then return the map with every change applied, and a setData for
+ * it replaces the whole map, earlier changes included.
+ */
+export type TSetTransactionChanges = (
+	key: string,
+	changes: TTransactionChanges
+) => Promise<Result<boolean>>;
+
 export interface IWallet {
 	mnemonic?: string;
 	// Account-level extended public key (xpub/ypub/zpub/tpub/upub/vpub) for
@@ -787,6 +808,13 @@ export type TAddressIndexInfo = {
 export type TStorage = {
 	getData?: TGetData;
 	setData?: TSetData;
+	/**
+	 * Optional, and used only alongside setData. With it, a change to some
+	 * transaction records writes only those records, where setData would be
+	 * handed the whole history. Replacing or clearing the history, and
+	 * upgrading records on load, still go through setData.
+	 */
+	setTransactionChanges?: TSetTransactionChanges;
 };
 
 export interface IRbfData {

@@ -59,13 +59,13 @@ const electrumOptions = {
  * Err and leaves the stored value as it was.
  */
 const memoryStorage = (): {
-	storage: Required<TStorage>;
+	storage: Required<Pick<TStorage, 'getData' | 'setData'>>;
 	store: Map<string, string>;
 	refused: Set<TWalletDataKeys>;
 } => {
 	const store = new Map<string, string>();
 	const refused = new Set<TWalletDataKeys>();
-	const storage: Required<TStorage> = {
+	const storage: Required<Pick<TStorage, 'getData' | 'setData'>> = {
 		getData: async <K extends keyof IWalletData>(
 			key: string
 		): Promise<Result<IWalletData[K]>> => {

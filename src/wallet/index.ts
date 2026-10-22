@@ -75,7 +75,9 @@ import type {
 	TProcessUnconfirmedTransactions,
 	TServer,
 	TSetData,
+	TSetTransactionChanges,
 	TSetupTransactionResponse,
+	TTransactionChanges,
 	TTransactionMessage,
 	TTxDetails,
 	TTxResult,
@@ -199,6 +201,42 @@ const toOutpoint = (
 	return ok({ txid: outpoint.txid, vout: (vout ?? index) as number });
 };
 
+/**
+ * What one queued write stores: a whole value, or, for the transaction map on
+ * an adapter with setTransactionChanges, the records changed since the write
+ * before it.
+ */
+type TWalletWrite =
+	| { data: IWalletData[keyof IWalletData] }
+	| { changes: TTransactionChanges };
+
+/** The one write that leaves storage as `older` and then `newer` would. */
+const mergeWrites = (
+	older: TWalletWrite,
+	newer: TWalletWrite
+): TWalletWrite => {
+	if ('data' in newer) return newer;
+	const { set, deleted } = newer.changes;
+	if ('data' in older) {
+		// Only the transaction map is ever written as changes.
+		const data: IFormattedTransactions = {
+			...(older.data as IFormattedTransactions),
+			...set
+		};
+		for (const txid of deleted) delete data[txid];
+		return { data };
+	}
+	const merged: TTransactionChanges = {
+		set: { ...older.changes.set, ...set },
+		deleted: older.changes.deleted.filter((txid) => !(txid in set))
+	};
+	for (const txid of deleted) {
+		delete merged.set[txid];
+		if (!merged.deleted.includes(txid)) merged.deleted.push(txid);
+	}
+	return { changes: merged };
+};
+
 export class Wallet {
 	private _network: Network;
 	private readonly _mnemonic?: string;
@@ -225,6 +263,7 @@ export class Wallet {
 	private _data: IWalletData;
 	private _getData: TGetData;
 	private _setData?: TSetData;
+	private _setTransactionChanges?: TSetTransactionChanges;
 	private _customGetAddress?: (
 		data: ICustomGetAddress
 	) => Promise<Result<IGetAddressResponse>>; // For use with Bitkit.
@@ -484,6 +523,7 @@ export class Wallet {
 		this._data = getDefaultWalletData();
 		this._getData = storage?.getData ?? getDataFallback;
 		this._setData = storage?.setData;
+		this._setTransactionChanges = storage?.setTransactionChanges;
 		this._resetOnReadFailure = resetOnReadFailure;
 		this._quietUntilFirstRefresh = disableMessagesOnCreate;
 		this._disableRefreshOnCreate = disableRefreshOnCreate;
@@ -922,6 +962,7 @@ export class Wallet {
 				this.disableMessages = true;
 				// disable saving to storage
 				this._setData = undefined;
+				this._setTransactionChanges = undefined;
 				// Nothing checks again here, and a new wallet counts afresh.
 				this._noTxindexMisses.clear();
 				// disconnect from Electrum
@@ -1071,7 +1112,8 @@ export class Wallet {
 			},
 			storage: {
 				getData: this._getData,
-				setData: this._setData
+				setData: this._setData,
+				setTransactionChanges: this._setTransactionChanges
 			},
 			resetOnReadFailure: this._resetOnReadFailure,
 			// The constructor reads the public option names, not the private
@@ -3921,8 +3963,15 @@ export class Wallet {
 	// still waits for the one ahead of it.
 	private waitingWrites: Record<
 		string,
-		{ walletDataKey: string; data: IWalletData[keyof IWalletData] }
+		{ walletDataKey: string; write: TWalletWrite }
 	> = {};
+
+	// Refused writes of the transaction map, by storage key, until the next
+	// write of that map carries them. An adapter that takes changes is never
+	// handed the whole map again, so a change it refused would otherwise
+	// never reach it. switchNetwork drops them along with the data they came
+	// from: switching back reads that data from storage again.
+	private refusedTransactionWrites: Map<string, TWalletWrite> = new Map();
 
 	/**
 	 * Saves the wallet data object to storage if able.
@@ -3973,26 +4022,78 @@ export class Wallet {
 		walletDataKey: string,
 		data: IWalletData[K]
 	): Promise<Result<string>> {
+		return this.queueWrite(key, walletDataKey, { data });
+	}
+
+	/**
+	 * Saves the records of the given transactions. On an adapter that takes
+	 * changes only those records are written, and a txid the map no longer
+	 * holds is written as deleted. Otherwise the whole map is.
+	 * @private
+	 * @param {Iterable<string>} txids
+	 * @returns {Promise<Result<string>>}
+	 */
+	private async saveTransactions(
+		txids: Iterable<string>
+	): Promise<Result<string>> {
+		const transactions = this._data.transactions;
+		if (!this._setTransactionChanges) {
+			return this.saveWalletData('transactions', transactions);
+		}
+		const changes: TTransactionChanges = { set: {}, deleted: [] };
+		for (const txid of new Set(txids)) {
+			const record = transactions[txid];
+			if (record) changes.set[txid] = record;
+			else changes.deleted.push(txid);
+		}
+		return this.queueWrite(
+			'transactions',
+			this.getWalletDataKey('transactions'),
+			{ changes }
+		);
+	}
+
+	/**
+	 * The queue behind saveWalletData and saveTransactions.
+	 * @private
+	 * @param {TWalletDataKeys} key
+	 * @param {string} walletDataKey The storage key, from getWalletDataKey.
+	 * @param {TWalletWrite} write
+	 * @returns {Promise<Result<string>>}
+	 */
+	private async queueWrite(
+		key: TWalletDataKeys,
+		walletDataKey: string,
+		write: TWalletWrite
+	): Promise<Result<string>> {
 		if (!this._setData) return ok('No setData method has been provided');
+		const refused =
+			key === 'transactions'
+				? this.refusedTransactionWrites.get(walletDataKey)
+				: undefined;
+		if (refused) {
+			this.refusedTransactionWrites.delete(walletDataKey);
+			write = mergeWrites(refused, write);
+		}
 		const waiting = this.waitingWrites[key];
 		let operation: Promise<Result<string>>;
 		if (waiting?.walletDataKey === walletDataKey) {
 			// The newest queued write has not started, so it can carry this
 			// value. A write to another network's key cannot, and queues below.
-			waiting.data = data;
+			waiting.write = mergeWrites(waiting.write, write);
 			operation = this.savingOperations[key];
 		} else if (key in this.savingOperations) {
-			const next = { walletDataKey, data };
+			const next = { walletDataKey, write };
 			this.waitingWrites[key] = next;
 			operation = this.savingOperations[key].then(() => {
 				if (this.waitingWrites[key] === next) delete this.waitingWrites[key];
-				return this.writeWalletData(key, next.walletDataKey, next.data);
+				return this.writeWalletData(key, next.walletDataKey, next.write);
 			});
 			this.savingOperations[key] = operation;
 		} else {
 			// With nothing queued for the key the write is issued in this same
 			// tick, so a stop() that follows the call cannot get in ahead of it.
-			operation = this.writeWalletData(key, walletDataKey, data);
+			operation = this.writeWalletData(key, walletDataKey, write);
 			this.savingOperations[key] = operation;
 		}
 		const saved = await operation;
@@ -4013,13 +4114,13 @@ export class Wallet {
 	 * @private
 	 * @param {TWalletDataKeys} key
 	 * @param {string} walletDataKey The storage key, fixed when the write was issued.
-	 * @param {IWalletData[K]} data
+	 * @param {TWalletWrite} write
 	 * @returns {Promise<Result<string>>}
 	 */
-	private async writeWalletData<K extends keyof IWalletData>(
+	private async writeWalletData(
 		key: TWalletDataKeys,
 		walletDataKey: string,
-		data: IWalletData[K]
+		write: TWalletWrite
 	): Promise<Result<string>> {
 		let cause: string;
 		try {
@@ -4031,7 +4132,12 @@ export class Wallet {
 					`Wallet stopped before the queued write of ${walletDataKey} could run; it was not saved.`
 				);
 			}
-			const res = await this._setData(walletDataKey, data);
+			// Changes are only queued with setTransactionChanges set, and stop()
+			// clears it along with setData.
+			const res =
+				'changes' in write
+					? await this._setTransactionChanges!(walletDataKey, write.changes)
+					: await this._setData(walletDataKey, write.data);
 			// Adapters written in JS may resolve something that is not a
 			// Result at all; only an explicit Err counts as a failure.
 			if (!(typeof res?.isErr === 'function' && res.isErr())) {
@@ -4045,6 +4151,9 @@ export class Wallet {
 		// has registered this write. A listener that saves again has to find it
 		// registered, or its write skips the queue and can land after a newer one.
 		await Promise.resolve();
+		if (key === 'transactions') {
+			this.keepRefusedTransactions(walletDataKey, write);
+		}
 		try {
 			this.sendMessage('storageWriteFailed', {
 				key,
@@ -4055,6 +4164,29 @@ export class Wallet {
 			// A listener that throws must not make this write reject.
 		}
 		return err(`Error saving wallet data for ${walletDataKey}: ${cause}`);
+	}
+
+	/**
+	 * Hands a refused write of the transaction map to the next write of it:
+	 * the one waiting its turn behind this one, or else the next one issued.
+	 * @private
+	 * @param {string} walletDataKey
+	 * @param {TWalletWrite} write
+	 */
+	private keepRefusedTransactions(
+		walletDataKey: string,
+		write: TWalletWrite
+	): void {
+		const waiting = this.waitingWrites.transactions;
+		if (waiting?.walletDataKey === walletDataKey) {
+			waiting.write = mergeWrites(write, waiting.write);
+			return;
+		}
+		const older = this.refusedTransactionWrites.get(walletDataKey);
+		this.refusedTransactionWrites.set(
+			walletDataKey,
+			older ? mergeWrites(older, write) : write
+		);
 	}
 
 	//TODO: Implement this as a way to better update and save state so we can consolidate this.data[key] updates.
@@ -4276,7 +4408,7 @@ export class Wallet {
 			...this._data.transactions,
 			...formattedTransactions
 		};
-		await this.saveWalletData('transactions', this._data.transactions);
+		await this.saveTransactions(Object.keys(formattedTransactions));
 
 		confirmedTxs.forEach((tx) => {
 			this.sendMessage('transactionConfirmed', tx);
@@ -4707,7 +4839,9 @@ export class Wallet {
 				}
 			});
 			this._data.transactions = transactions;
-			const saved = await this.saveWalletData('transactions', transactions);
+			const saved = await this.saveTransactions(
+				txIds.filter((txId) => txId in transactions)
+			);
 			// Dropping the unconfirmed copy is what stops this transaction being
 			// looked up again, so it may only happen once the repaired record is
 			// durable. Otherwise a failed write leaves it stored as confirmed at a
@@ -4893,7 +5027,7 @@ export class Wallet {
 	private async updateTransactionHeights(
 		txs: IUtxo[]
 	): Promise<Result<string>> {
-		let needsSave = false;
+		const updated: string[] = [];
 		const transactions = this.data.transactions;
 		txs.forEach((tx) => {
 			const txId = tx.tx_hash;
@@ -4906,11 +5040,11 @@ export class Wallet {
 				delete transactions[txId].blockhash;
 				delete transactions[txId].confirmTimestamp;
 				this._recordRepairs += 1;
-				needsSave = true;
+				updated.push(txId);
 			}
 		});
-		if (needsSave) {
-			const saved = await this.saveWalletData('transactions', transactions);
+		if (updated.length) {
+			const saved = await this.saveTransactions(updated);
 			if (saved.isErr()) return err(saved.error);
 		}
 		return ok('Successfully updated reorg transactions.');
@@ -7070,7 +7204,7 @@ export class Wallet {
 		if (txid in transactions) {
 			delete transactions[txid];
 		}
-		const saved = await this.saveWalletData('transactions', transactions);
+		const saved = await this.saveTransactions([txid]);
 		// Storage still holds the record, so it must keep the unconfirmed copy
 		// that watches it as well, and so must memory, which the next check
 		// writes over the stored copy. Without that copy the record is back
@@ -7104,15 +7238,13 @@ export class Wallet {
 	}: {
 		txid: string;
 	}): Promise<Result<string>> {
-		if (txid in this._data.transactions) {
+		const held = txid in this._data.transactions;
+		if (held) {
 			this._data.transactions[txid].exists = false;
 			this._ghostClearings.set(txid, (this._ghostClearings.get(txid) ?? 0) + 1);
 			this._recordRepairs += 1;
 		}
-		const saved = await this.saveWalletData(
-			'transactions',
-			this._data.transactions
-		);
+		const saved = await this.saveTransactions(held ? [txid] : []);
 		if (saved.isErr()) return err(saved.error);
 		return ok(`Marked transaction ${txid} as gone.`);
 	}
