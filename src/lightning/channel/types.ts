@@ -390,7 +390,7 @@ export interface IHtlcEntry {
 	 * temporary_channel_failure forwarding, incorrect_or_unknown_payment_
 	 * details at the final hop). The band's bound holds per add on the live
 	 * state; across a fee-rate promotion or an add of our own the sign-time
-	 * backstop (Channel._funderOutputTrimmedRefusal) holds it instead.
+	 * backstop (funderOutputTrimmedRefusal, htlc-policy.ts) holds it instead.
 	 * Stamped at admission for the same reason as dustExposureFailback: the
 	 * classification is order-dependent within a batch, and a restart replay
 	 * must answer identically. Persisted.

@@ -63,7 +63,7 @@ function anchorType(): Buffer {
 
 /**
  * A NORMAL channel where the PEER funds, with default dust limits (354 sat)
- * and a 10,000-sat reserve both ways, so _localCommitmentEmptyRefusal
+ * and a 10,000-sat reserve both ways, so localCommitmentEmptyRefusal
  * short-circuits and no guard reaches the builder or a signer.
  */
 function makeChannel(opts: {
