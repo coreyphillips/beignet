@@ -3,7 +3,8 @@ import crypto from 'crypto';
 import {
 	IFforVoucherArchive,
 	fforVoucherArchiveId,
-	fforVoucherReceiptIds
+	fforVoucherReceiptIds,
+	mergeFforVoucherArchive
 } from '../../src/lightning/ffor/voucher-archive';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
@@ -84,6 +85,78 @@ describe('FFOR durable voucher archive', function () {
 		).to.throw('outcome changed');
 		s.deleteChannel(row.channelId);
 		expect(s.loadAllFforVouchers()).to.deep.equal([row]);
+	});
+
+	it('returns the stored record when a merge adds no evidence', () => {
+		const row = voucher();
+		const { preimage: _proof, outcome: _outcome, ...identity } = row;
+		expect(mergeFforVoucherArchive(row, identity)).to.equal(row);
+		expect(mergeFforVoucherArchive(row, { ...row })).to.equal(row);
+		const extended = mergeFforVoucherArchive(identity, row);
+		expect(extended).to.not.equal(identity);
+		expect(extended).to.deep.equal(row);
+	});
+
+	it('prepares channel custody without reading archive rows back from storage', () => {
+		const s = store();
+		// Rows of 20 other channels, which this channel's saves must not touch.
+		for (let c = 0; c < 20; c++) {
+			const channelId = crypto.randomBytes(32).toString('hex');
+			for (let slot = 1; slot <= 10; slot++) {
+				const { preimage: _proof, outcome: _outcome, ...row } = voucher(slot);
+				s.saveFforVoucher({
+					...row,
+					channelId,
+					paymentHash: crypto.randomBytes(32).toString('hex')
+				});
+			}
+		}
+		expect(s.loadAllFforVouchers()).to.have.length(200);
+		let reads = 0;
+		let saving = false;
+		const written: string[] = [];
+		const load = s.loadFforVoucher.bind(s);
+		const save = s.saveFforVoucher.bind(s);
+		s.loadFforVoucher = (id): IFforVoucherArchive | null => {
+			// The backend's own merge read inside a write is not the node's.
+			if (!saving) reads++;
+			return load(id);
+		};
+		s.saveFforVoucher = (row): void => {
+			written.push(fforVoucherArchiveId(row));
+			saving = true;
+			try {
+				save(row);
+			} finally {
+				saving = false;
+			}
+		};
+		const w = createConcurrentWorld({ rStorage: s });
+		nodes.push(w.p, w.s, w.r);
+		activateWorld(w, true, undefined, 2);
+		const epochId = record(w.r, w.srHex).epochId.toString('hex');
+		// Each slot is written once, by the save that adopts the book.
+		expect([...written].sort()).to.deep.equal(
+			[1, 2, 3].map((k) => `${w.srHex}:${epochId}:${k}`)
+		);
+		expect(reads).to.equal(0);
+
+		written.length = 0;
+		(w.r as unknown as { persistChannel(id: Buffer): void }).persistChannel(
+			w.srChannelId
+		);
+		w.r.handleNewBlock(TIP + 1);
+		expect(written).to.deep.equal([]);
+		expect(reads).to.equal(0);
+		expect(s.loadAllFforVouchers()).to.have.length(203);
+
+		// Only the paid slot gains evidence (its proof, outcome and credit).
+		const [invoice] = exposeAndLeave(w, [1]);
+		expect(pay(w, invoice).status).to.equal(PaymentStatus.COMPLETED);
+		w.sr.reconnect();
+		expect(w.r.closeFforEpoch(w.srHex).ok).to.be.true;
+		expect([...new Set(written)]).to.deep.equal([`${w.srHex}:${epochId}:1`]);
+		expect(reads).to.equal(0);
 	});
 
 	for (const paged of [false, true]) {
