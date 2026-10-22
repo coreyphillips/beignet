@@ -55,7 +55,7 @@ import {
 import { TypedEmitter } from '../../utils/typed-emitter';
 import type { TxidHex } from '../../utils/identifiers';
 import type { LightningNodeEvents, NodeErrorCode } from './events';
-import crypto from 'crypto';
+import { randomBytes, sha256 } from '../crypto/provider';
 import type { ILogger } from '../../logger';
 import { noopLogger } from '../../logger';
 import { getPublicKey } from '../crypto/ecdh';
@@ -6393,10 +6393,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		channelId: Buffer
 	): (data: Buffer) => { nodeSig: Buffer; bitcoinSig: Buffer } {
 		return (data: Buffer): { nodeSig: Buffer; bitcoinSig: Buffer } => {
-			const hash = crypto
-				.createHash('sha256')
-				.update(crypto.createHash('sha256').update(data).digest())
-				.digest();
+			const hash = sha256(sha256(data));
 			const nodeSig = Buffer.from(ecc.sign(hash, this.nodePrivkey));
 			const signer = this.channelManager.getChannel(channelId)?.getSigner();
 			const bitcoinSig = signer
@@ -16374,11 +16371,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 			let path;
 			try {
-				path = constructBlindedPath(
-					crypto.randomBytes(32),
-					nodeIds,
-					hopDataList
-				);
+				path = constructBlindedPath(randomBytes(32), nodeIds, hopDataList);
 			} catch {
 				continue; // skip a channel whose key can't be blinded
 			}
@@ -16450,9 +16443,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				}
 			}
 			try {
-				paths.push(
-					constructBlindedPath(crypto.randomBytes(32), nodeIds, hopDataList)
-				);
+				paths.push(constructBlindedPath(randomBytes(32), nodeIds, hopDataList));
 			} catch {
 				continue; // skip a channel whose key can't be blinded
 			}
@@ -17356,10 +17347,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (externalHash && this.paymentHashInUse(externalHash)) {
 			throw new Error('paymentHash is already in use by this node');
 		}
-		const preimage = externalHash ? undefined : crypto.randomBytes(32);
-		const paymentHash =
-			externalHash ?? crypto.createHash('sha256').update(preimage!).digest();
-		const paymentSecret = crypto.randomBytes(32);
+		const preimage = externalHash ? undefined : randomBytes(32);
+		const paymentHash = externalHash ?? sha256(preimage!);
+		const paymentSecret = randomBytes(32);
 
 		if (preimage) {
 			this.preimages.set(paymentHash.toString('hex'), preimage);
@@ -18314,7 +18304,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		);
 
 		// Generate session key and compute shared secrets for failure decryption
-		const sessionKey = crypto.randomBytes(32);
+		const sessionKey = randomBytes(32);
 		const hopPubkeys = hops.map((h) => h.pubkey);
 		const { sharedSecrets } = computeSharedSecrets(sessionKey, hopPubkeys);
 
@@ -18885,17 +18875,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// dispatchKeysend refuses only a PENDING record, which a random
 			// preimage never meets again. A reused one would pay a second time
 			// under a hash the first payee already knows the preimage of.
-			this.assertHashUnpaid(
-				crypto.createHash('sha256').update(options.preimage).digest(),
-				'any-pending'
-			);
+			this.assertHashUnpaid(sha256(options.preimage), 'any-pending');
 		}
 		// A fresh preimage per call unless the caller picked one, so each
 		// keysend is its own payment.
-		return this.dispatchKeysend(
-			options,
-			options.preimage ?? crypto.randomBytes(32)
-		);
+		return this.dispatchKeysend(options, options.preimage ?? randomBytes(32));
 	}
 
 	/**
@@ -18944,7 +18928,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			);
 		}
 
-		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		const paymentHash = sha256(preimage);
 		const hashHex = paymentHash.toString('hex');
 
 		// Payment deduplication
@@ -19019,7 +19003,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 		);
 
-		const sessionKey = crypto.randomBytes(32);
+		const sessionKey = randomBytes(32);
 		const hopPubkeys = hops.map((h) => h.pubkey);
 		const { sharedSecrets } = computeSharedSecrets(sessionKey, hopPubkeys);
 		const onionPacket = constructOnionPacket(
@@ -19279,7 +19263,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				}
 			);
 
-			const sessionKey = crypto.randomBytes(32);
+			const sessionKey = randomBytes(32);
 			const hopPubkeys = hops.map((h) => h.pubkey);
 			const { sharedSecrets } = computeSharedSecrets(sessionKey, hopPubkeys);
 
@@ -19487,7 +19471,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				this.channelManager.failMalformedHtlc(
 					channelId,
 					htlcId,
-					crypto.createHash('sha256').update(onionBuf).digest(),
+					sha256(onionBuf),
 					INVALID_ONION_BLINDING
 				);
 				return;
@@ -19512,7 +19496,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			this.channelManager.failMalformedHtlc(
 				channelId,
 				htlcId,
-				crypto.createHash('sha256').update(onionBuf).digest(),
+				sha256(onionBuf),
 				err instanceof OnionProcessingError
 					? err.failureCode
 					: INVALID_ONION_HMAC
@@ -20130,7 +20114,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				actions: [],
 				error: 'FFOR preimage must be 32 bytes'
 			};
-		const hashHex = crypto.createHash('sha256').update(preimage).digest('hex');
+		const hashHex = sha256(preimage).toString('hex');
 		const live = this.channelManager.getFforEpoch(channelId);
 		if (!live?.paymentHashes.some((h) => h.toString('hex') === hashHex)) {
 			const archived = [...this.fforArchivedVouchers.values()].filter(
@@ -20173,7 +20157,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 		const result = this.channelManager.fforAddPreimage(channelId, preimage);
 		if (result.ok) {
-			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+			const paymentHash = sha256(preimage);
 			this.preimages.set(hashHex, preimage);
 			this.commitMutations(
 				'savePreimage',
@@ -20219,9 +20203,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const entries = channel.fforBookEntries();
 		if (!entries) throw new Error('no book to provision');
 		const witnessNodeId = Buffer.from(witnessNodeIdHex, 'hex');
-		const fetchPrivkey = crypto.randomBytes(32);
-		const encPrivkey = crypto.randomBytes(32);
-		const mailboxId = crypto.randomBytes(32);
+		const fetchPrivkey = randomBytes(32);
+		const encPrivkey = randomBytes(32);
+		const mailboxId = randomBytes(32);
 		const retentionUntil =
 			opts.retentionUntil ??
 			record.params.voucherExpiry + 2 * FF_WITNESS_RETENTION_MARGIN_BLOCKS;
@@ -20357,7 +20341,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					break;
 				}
 				const requestId = FforWitnessService.freshRequestId();
-				const nonce = crypto.randomBytes(32);
+				const nonce = randomBytes(32);
 				let body: Buffer;
 				try {
 					body = await this.sendFforWitnessRequest(
@@ -20590,7 +20574,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 								hAct,
 								K,
 								settled,
-								crypto.randomBytes(32),
+								randomBytes(32),
 								w.fetchPrivkey
 							),
 							requestId,
@@ -21559,10 +21543,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				this.channelManager.failHtlc(channelId, htlcId, reason);
 				return;
 			}
-			const expectedHash = crypto
-				.createHash('sha256')
-				.update(keysendPreimage)
-				.digest();
+			const expectedHash = sha256(keysendPreimage);
 			if (!expectedHash.equals(paymentHash)) {
 				const reason = sharedSecret
 					? createFailureMessage(
@@ -22156,7 +22137,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (!pre) {
 			throw new Error('settleHeldHtlc: no preimage available for hold invoice');
 		}
-		const hash = crypto.createHash('sha256').update(pre).digest();
+		const hash = sha256(pre);
 		if (!hash.equals(paymentHash)) {
 			throw new Error('settleHeldHtlc: preimage does not match payment hash');
 		}
@@ -22986,7 +22967,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				`no addressable channel with ${lspNodeIdHex} to register`
 			);
 		}
-		const nonce = crypto.randomBytes(32);
+		const nonce = randomBytes(32);
 		const request = encodeRegistrationRequest(
 			signRegistrationRequest(
 				{
@@ -23628,7 +23609,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (maxAmountMsat <= 0n) {
 			throw new Error('maxAmountMsat must be positive');
 		}
-		const requestId = crypto.randomBytes(8);
+		const requestId = randomBytes(8);
 		const { reply, cleanup } = this.awaitJitReply(
 			lspPubkeyHex,
 			BeignetCustomSubtype.JIT_RECEIVE_QUOTE_ACK,
@@ -23720,7 +23701,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 		// Our own correlation id: the LSP mints the SCID, so until the ack
 		// arrives this is the only thing tying an answer to this request.
-		const requestId = crypto.randomBytes(8);
+		const requestId = randomBytes(8);
 
 		const { reply: ackPromise, cleanup } = this.awaitJitReply(
 			lspPubkeyHex,
@@ -25540,7 +25521,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		preimage: Buffer
 	): void {
 		// Persist preimage immediately (proof of payment) before any message sends
-		const preimageHash = crypto.createHash('sha256').update(preimage).digest();
+		const preimageHash = sha256(preimage);
 		this.preimages.set(preimageHash.toString('hex'), preimage);
 		this.commitMutations(
 			'savePreimage',
@@ -25584,7 +25565,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 
 		// Hash preimage to find the payment
-		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		const paymentHash = sha256(preimage);
 		const hashHex = paymentHash.toString('hex');
 		const payment = this.payments.get(hashHex);
 
@@ -26264,10 +26245,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			?.getFullState()
 			.htlcs.get(`received-${inHtlcId}`);
 		const sha256OfOnion = htlcEntry?.onionRoutingPacket
-			? crypto
-					.createHash('sha256')
-					.update(htlcEntry.onionRoutingPacket)
-					.digest()
+			? sha256(htlcEntry.onionRoutingPacket)
 			: Buffer.alloc(32);
 		const secret =
 			sharedSecret ?? this.receivedHtlcSharedSecrets.get(inHtlcSecretKey);
@@ -26403,9 +26381,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			.getChannel(outChannelId)
 			?.getFullState()
 			.htlcs.get(`offered-${outHtlcId}`)?.onionRoutingPacket;
-		const sha256OfOnion = onion
-			? crypto.createHash('sha256').update(onion).digest()
-			: Buffer.alloc(32);
+		const sha256OfOnion = onion ? sha256(onion) : Buffer.alloc(32);
 		return createFailureMessage(sharedSecret, code, sha256OfOnion);
 	}
 
@@ -30883,7 +30859,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 	): { offer: IOffer; encoded: string } {
 		const issuer = Buffer.from(issuerNodeIdHex, 'hex');
-		const path = constructBlindedPath(crypto.randomBytes(32), [issuer], [{}]);
+		const path = constructBlindedPath(randomBytes(32), [issuer], [{}]);
 		return this.offerManager.createOffer({
 			description: opts.description,
 			...(opts.amountMsat !== undefined ? { amount: opts.amountMsat } : {}),
@@ -31014,7 +30990,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			encodeIssuerStatus(
 				requestId,
 				witness.mailboxId,
-				crypto.randomBytes(32),
+				randomBytes(32),
 				witness.fetchPrivkey
 			),
 			requestId,
@@ -31117,7 +31093,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// node's offer to carry reachable paths, because an external payer
 			// cannot deliver an invoice_request to a node id that is in no
 			// public graph (issue #544 review).
-			const pathId = crypto.randomBytes(32);
+			const pathId = randomBytes(32);
 			const paths = this.buildBlindedMessagePaths(
 				createOpts.asyncHold ? 3 : 2,
 				pathId

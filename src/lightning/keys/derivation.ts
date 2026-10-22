@@ -6,7 +6,7 @@
  * transactions, HTLC scripts, and penalty transactions.
  */
 
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import {
 	getPublicKey,
 	pointAdd,
@@ -14,10 +14,6 @@ import {
 	privateAdd,
 	privateMultiply
 } from '../crypto/ecdh';
-
-function sha256(data: Buffer): Buffer {
-	return crypto.createHash('sha256').update(data).digest();
-}
 
 /**
  * The 6 basepoints each side of a channel contributes.

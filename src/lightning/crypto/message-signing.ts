@@ -9,7 +9,7 @@
  */
 
 import * as secp from '@noble/secp256k1';
-import crypto from 'crypto';
+import { sha256 } from './provider';
 import { ensureHmac } from '../invoice/signing';
 
 const SIGNED_MSG_PREFIX = 'Lightning Signed Message:';
@@ -62,11 +62,10 @@ export function zbase32Decode(text: string): Buffer | null {
 function messageDigest(message: string | Buffer): Buffer {
 	const msg =
 		typeof message === 'string' ? Buffer.from(message, 'utf8') : message;
-	const first = crypto
-		.createHash('sha256')
-		.update(Buffer.concat([Buffer.from(SIGNED_MSG_PREFIX, 'utf8'), msg]))
-		.digest();
-	return crypto.createHash('sha256').update(first).digest();
+	const first = sha256(
+		Buffer.concat([Buffer.from(SIGNED_MSG_PREFIX, 'utf8'), msg])
+	);
+	return sha256(first);
 }
 
 /** Sign a message with the node key. Returns the zbase32 signature string. */

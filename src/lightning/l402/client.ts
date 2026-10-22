@@ -20,7 +20,7 @@
  *   server cannot drive a payment loop.
  */
 
-import * as crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import { decode as decodeInvoice } from '../invoice/decode';
 import type { IL402Challenge } from './challenge';
 import {
@@ -364,9 +364,7 @@ export async function l402Fetch(
 		// returning one that does not open the invoice's hash has handed us a
 		// credential that cannot work. Say so instead of storing it and letting
 		// every later request fail with an opaque 401.
-		if (
-			!crypto.createHash('sha256').update(preimage).digest().equals(paymentHash)
-		) {
+		if (!sha256(preimage).equals(paymentHash)) {
 			throw new L402Error(
 				'L402 payment returned a preimage that does not hash to the invoice payment hash',
 				'PREIMAGE_MISMATCH'

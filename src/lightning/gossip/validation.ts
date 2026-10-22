@@ -4,7 +4,7 @@
  * BOLT 7 signatures are computed over the double-SHA256 of the signed data.
  */
 
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import { sign, verifySha256d } from '../crypto/ecdh';
 import { CHANNEL_FLAG_DIRECTION } from './types';
 import type {
@@ -24,7 +24,7 @@ import {
  * fast backend can apply the second round itself (issue #441).
  */
 function computeGossipFirstHash(data: Buffer): Buffer {
-	return crypto.createHash('sha256').update(data).digest();
+	return sha256(data);
 }
 
 /**
@@ -32,7 +32,7 @@ function computeGossipFirstHash(data: Buffer): Buffer {
  */
 export function computeGossipSignatureHash(data: Buffer): Buffer {
 	const first = computeGossipFirstHash(data);
-	return crypto.createHash('sha256').update(first).digest();
+	return sha256(first);
 }
 
 /**

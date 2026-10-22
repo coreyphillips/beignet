@@ -1,6 +1,7 @@
 import { ecc } from '../../utils/ecc';
-import crypto from 'crypto';
+import type * as NodeCrypto from 'crypto';
 import type { KeyObject } from 'crypto';
+import { sha256 } from './provider';
 
 /**
  * Perform ECDH key agreement and return SHA256 of the shared point.
@@ -27,7 +28,7 @@ export function ecdh(privateKey: Buffer, publicKey: Buffer): Buffer {
 	}
 
 	// Return SHA256 of the compressed shared point (per Noise protocol)
-	return crypto.createHash('sha256').update(sharedPoint).digest();
+	return sha256(sharedPoint);
 }
 
 /**
@@ -219,7 +220,20 @@ const SECP256K1_SPKI_PREFIX = Buffer.from(
 const SHA256D_KEY_CACHE_MAX = 16384;
 
 let sha256dBackend: 'node' | 'js' | null = null;
+let nodeCrypto: typeof NodeCrypto | null = null;
 const sha256dKeyCache = new Map<string, KeyObject>();
+
+/**
+ * Node's 'crypto', loaded on first use so that a platform without it takes
+ * the JS path instead of failing to load this module.
+ */
+function loadNodeCrypto(): typeof NodeCrypto {
+	if (nodeCrypto === null) {
+		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		nodeCrypto = require('crypto') as typeof NodeCrypto;
+	}
+	return nodeCrypto;
+}
 
 /**
  * Select the verification backend for verifySha256d, once. The platform must
@@ -236,6 +250,7 @@ function resolveSha256dBackend(): 'node' | 'js' {
 	}
 	sha256dBackend = 'js';
 	try {
+		const crypto = loadNodeCrypto();
 		if (
 			typeof crypto.verify !== 'function' ||
 			typeof crypto.createPublicKey !== 'function' ||
@@ -298,7 +313,7 @@ function getCachedVerifyKey(publicKey: Buffer): KeyObject | null {
 	}
 	let key: KeyObject;
 	try {
-		key = crypto.createPublicKey({
+		key = loadNodeCrypto().createPublicKey({
 			key: Buffer.concat([SECP256K1_SPKI_PREFIX, publicKey]),
 			format: 'der',
 			type: 'spki'
@@ -340,7 +355,7 @@ export function verifySha256d(
 			return false;
 		}
 		try {
-			return crypto.verify(
+			return loadNodeCrypto().verify(
 				'sha256',
 				firstHash,
 				{ key, dsaEncoding: 'ieee-p1363' },
@@ -363,8 +378,7 @@ export function verifySha256dJs(
 	publicKey: Buffer,
 	signature: Buffer
 ): boolean {
-	const digest = crypto.createHash('sha256').update(firstHash).digest();
-	return verify(digest, publicKey, signature);
+	return verify(sha256(firstHash), publicKey, signature);
 }
 
 /**

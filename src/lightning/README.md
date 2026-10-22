@@ -1428,7 +1428,7 @@ One row per namespace `beignet/lightning` exports (a test checks this table agai
 | Module | Key Exports | BOLT |
 |--------|-------------|------|
 | `bootstrap` | `bootstrapPeers`, `resolveDnsSeed`, `DEFAULT_DNS_SEEDS` | 10 |
-| `crypto` | `chacha20poly1305`, `ecdh`, `hkdf`, MuSig2 (BIP 327) | 8, 3 |
+| `crypto` | `chacha20poly1305`, `ecdh`, `hkdf`, MuSig2 (BIP 327), `setCryptoProvider` | 8, 3 |
 | `message` | Message encode/decode for all types, `codec`, `tlv`, `stfu`, interactive-tx, dual-funding, splice | 1, 2 |
 | `features` | `FeatureFlags` | 9 |
 | `transport` | `Peer`, `PeerManager`, `CipherState`, Noise_XK handshake functions, WebSocket and Iroh transports, wire capture | 8 |

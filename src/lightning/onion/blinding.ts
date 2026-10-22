@@ -15,7 +15,7 @@
  *   Encrypt with ChaCha20-Poly1305 using rho as key
  */
 
-import crypto from 'crypto';
+import { hmacSha256, sha256 } from '../crypto/provider';
 import {
 	ecdh,
 	pointMultiply,
@@ -42,11 +42,7 @@ export function deriveBlindingFactor(
 	blindingKey: Buffer,
 	sharedSecret: Buffer
 ): Buffer {
-	return crypto
-		.createHash('sha256')
-		.update(blindingKey)
-		.update(sharedSecret)
-		.digest();
+	return sha256(Buffer.concat([blindingKey, sharedSecret]));
 }
 
 /**
@@ -67,10 +63,7 @@ export function deriveNextBlindingKey(
  * the private key — they must use the SAME tweak so the keys correspond.
  */
 export function deriveBlindedNodeIdTweak(sharedSecret: Buffer): Buffer {
-	return crypto
-		.createHmac('sha256', Buffer.from('blinded_node_id'))
-		.update(sharedSecret)
-		.digest();
+	return hmacSha256(Buffer.from('blinded_node_id'), sharedSecret);
 }
 
 /**
@@ -90,10 +83,7 @@ export function computeBlindedNodeId(
  * "blinded_node_id") is what lets LND/CLN decrypt our encrypted_recipient_data.
  */
 export function deriveBlindingEncryptionKey(sharedSecret: Buffer): Buffer {
-	return crypto
-		.createHmac('sha256', Buffer.from('rho'))
-		.update(sharedSecret)
-		.digest();
+	return hmacSha256(Buffer.from('rho'), sharedSecret);
 }
 
 /**

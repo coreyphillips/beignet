@@ -8,7 +8,7 @@
  * and HMAC.
  */
 
-import crypto from 'crypto';
+import { hmacSha256 } from '../crypto/provider';
 import type { IHopPayload, IOnionPacket } from './types';
 import { ONION_VERSION, ROUTING_INFO_LENGTH } from './types';
 import {
@@ -128,11 +128,12 @@ export function constructOnionPacket(
 		}
 
 		// Compute HMAC for this hop (BOLT 4: HMAC(mu, routing_info || associated_data))
-		const hmacCalc = crypto.createHmac('sha256', keys.mu).update(routingInfo);
-		if (associatedData) {
-			hmacCalc.update(associatedData);
-		}
-		currentHmac = Buffer.from(hmacCalc.digest());
+		currentHmac = hmacSha256(
+			keys.mu,
+			associatedData
+				? Buffer.concat([routingInfo, associatedData])
+				: routingInfo
+		);
 	}
 
 	return {

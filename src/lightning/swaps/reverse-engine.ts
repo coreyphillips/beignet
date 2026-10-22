@@ -36,7 +36,7 @@
  */
 
 import { TypedEmitter } from '../../utils/typed-emitter';
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import * as bitcoin from 'bitcoinjs-lib';
 import { getPublicKey } from '../crypto/ecdh';
 import { decode as decodeInvoice } from '../invoice/decode';
@@ -1925,13 +1925,7 @@ export class ReverseSwapProvider extends TypedEmitter<ReverseSwapEvents> {
 		observation: ISwapChainObservation
 	): Promise<void> {
 		const preimage = claim.preimage!;
-		if (
-			!crypto
-				.createHash('sha256')
-				.update(preimage)
-				.digest()
-				.equals(Buffer.from(record.paymentHashHex, 'hex'))
-		) {
+		if (!sha256(preimage).equals(Buffer.from(record.paymentHashHex, 'hex'))) {
 			this.deps.log('swap_claim_hash_mismatch', {
 				swapId: record.id,
 				txid: claim.txid

@@ -13,7 +13,7 @@
  * beginAttempt/endAttempt), whose life it was already bound to.
  */
 
-import crypto from 'crypto';
+import { sha256 } from '../../crypto/provider';
 import type { IDfLaneKeys } from '../frames';
 import type { IDfWitness } from '../messages';
 import type { IDfLaneSender } from '../transport/types';
@@ -236,5 +236,5 @@ export function outpointKey(txidDisplayHex: string, vout: number): string {
 }
 
 export function contentHashOf(offerBytes: Buffer): string {
-	return crypto.createHash('sha256').update(offerBytes).digest('hex');
+	return sha256(offerBytes).toString('hex');
 }

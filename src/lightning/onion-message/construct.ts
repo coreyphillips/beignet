@@ -7,7 +7,7 @@
  * hop payloads need it.
  */
 
-import crypto from 'crypto';
+import { hmacSha256, randomBytes } from '../crypto/provider';
 import type {
 	IOnionMessage,
 	IOnionMessagePayload,
@@ -147,9 +147,7 @@ export function constructOnionMessagePacket(
 
 		// Compute HMAC for this hop. The HMAC covers the whole routing info,
 		// so it also authenticates which of the two forms was used.
-		currentHmac = Buffer.from(
-			crypto.createHmac('sha256', keys.mu).update(routingInfo).digest()
-		);
+		currentHmac = Buffer.from(hmacSha256(keys.mu, routingInfo));
 	}
 
 	return encodeOnionPacket({
@@ -209,7 +207,7 @@ export function constructSimpleOnionMessage(
 	sessionKey?: Buffer,
 	options?: ISendOnionMessageOptions
 ): IOnionMessage {
-	const sessKey = sessionKey || crypto.randomBytes(32);
+	const sessKey = sessionKey || randomBytes(32);
 
 	// Build the final hop payload
 	const finalPayload: IOnionMessagePayload = {
@@ -236,7 +234,7 @@ export function constructReplyOnionMessage(
 	sessionKey?: Buffer,
 	options?: ISendOnionMessageOptions
 ): IOnionMessage {
-	const sessKey = sessionKey || crypto.randomBytes(32);
+	const sessKey = sessionKey || randomBytes(32);
 
 	// The reply uses the blinded path's introduction node as the first hop.
 	// The blinded hops contain encrypted routing data.

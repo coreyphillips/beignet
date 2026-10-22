@@ -9,7 +9,7 @@
  * ones, so probing learns nothing.
  */
 
-import crypto from 'crypto';
+import { randomBytes, sha256 } from '../crypto/provider';
 import { Channel } from '../channel/channel';
 import { sign } from '../crypto/ecdh';
 import { computeHAct, computeHBook, decodeVoucherBook } from './transcript';
@@ -213,7 +213,7 @@ export class FforWitnessService {
 		const hashHex = fulfil.paymentHash.toString('hex');
 		const hit = this.deps.ledger.byHash(hashHex);
 		if (!hit || hit.mailbox.state === 'CLOSED') return 'none';
-		const t = crypto.createHash('sha256').update(fulfil.preimage).digest();
+		const t = sha256(fulfil.preimage);
 		if (!t.equals(fulfil.paymentHash)) return 'none';
 		const already = this.pending.get(fulfil.outKey);
 		if (already && !already.released) return 'held';
@@ -337,7 +337,7 @@ export class FforWitnessService {
 			version: FF_WITNESS_VERSION,
 			profile: FF_WITNESS_PROFILE_DR,
 			mailboxId: Buffer.from(mailbox.id, 'hex'),
-			recordId: crypto.randomBytes(32),
+			recordId: randomBytes(32),
 			k,
 			hAct: Buffer.from(mailbox.hActHex, 'hex'),
 			termsHash: Buffer.from(entry.termsHashHex, 'hex'),
@@ -352,10 +352,7 @@ export class FforWitnessService {
 			recordAad(header),
 			body
 		);
-		header.ciphertextHash = crypto
-			.createHash('sha256')
-			.update(ciphertext)
-			.digest();
+		header.ciphertextHash = sha256(ciphertext);
 		const record: IFforWitnessRecord = {
 			header,
 			witnessSig: sign(
@@ -790,6 +787,6 @@ export class FforWitnessService {
 	}
 
 	static freshRequestId(): Buffer {
-		return crypto.randomBytes(FF_WITNESS_REQUEST_ID_LEN);
+		return randomBytes(FF_WITNESS_REQUEST_ID_LEN);
 	}
 }

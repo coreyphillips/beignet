@@ -8,11 +8,11 @@
  */
 
 import {
-	hkdfSync,
-	randomBytes,
-	createCipheriv,
-	createDecipheriv
-} from 'crypto';
+	aes256GcmDecrypt,
+	aes256GcmEncrypt,
+	hkdfSha256,
+	randomBytes
+} from '../crypto/provider';
 
 /** Leads every value encryptValue writes; isEncryptedValue tests for it. */
 export const ENC_PREFIX = 'enc1:';
@@ -26,9 +26,12 @@ const TAG_LENGTH = 16;
  * The info string domain-separates keys so different subsystems (storage at
  * rest, static channel backups, ...) never share an encryption key.
  */
-export function hkdfKey(secret: Buffer, info: string): Buffer {
-	return Buffer.from(
-		hkdfSync('sha256', secret, Buffer.alloc(0), info, KEY_LENGTH)
+export function hkdfKey(secret: Uint8Array, info: string): Buffer {
+	return hkdfSha256(
+		secret,
+		Buffer.alloc(0),
+		Buffer.from(info, 'utf8'),
+		KEY_LENGTH
 	);
 }
 
@@ -37,7 +40,7 @@ export function hkdfKey(secret: Buffer, info: string): Buffer {
  * Deterministic: the same secret always yields the same key, so a database
  * restored from backup is readable with the same mnemonic.
  */
-export function deriveStorageKey(secret: Buffer): Buffer {
+export function deriveStorageKey(secret: Uint8Array): Buffer {
 	return hkdfKey(secret, HKDF_INFO);
 }
 
@@ -46,20 +49,15 @@ export function deriveStorageKey(secret: Buffer): Buffer {
  * Output format: prefix + base64(iv || authTag || ciphertext).
  */
 export function encryptWithPrefix(
-	key: Buffer,
+	key: Uint8Array,
 	plaintext: string,
 	prefix: string
 ): string {
 	const iv = randomBytes(IV_LENGTH);
-	const cipher = createCipheriv('aes-256-gcm', key, iv);
-	const ciphertext = Buffer.concat([
-		cipher.update(plaintext, 'utf8'),
-		cipher.final()
-	]);
-	return (
-		prefix +
-		Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString('base64')
-	);
+	const sealed = aes256GcmEncrypt(key, iv, Buffer.from(plaintext, 'utf8'));
+	const tag = sealed.subarray(sealed.length - TAG_LENGTH);
+	const ciphertext = sealed.subarray(0, sealed.length - TAG_LENGTH);
+	return prefix + Buffer.concat([iv, tag, ciphertext]).toString('base64');
 }
 
 /**
@@ -67,7 +65,7 @@ export function encryptWithPrefix(
  * or failed auth tag (wrong key or tampered ciphertext).
  */
 export function decryptWithPrefix(
-	key: Buffer,
+	key: Uint8Array,
 	value: string,
 	prefix: string
 ): string {
@@ -81,18 +79,15 @@ export function decryptWithPrefix(
 	const iv = payload.subarray(0, IV_LENGTH);
 	const tag = payload.subarray(IV_LENGTH, IV_LENGTH + TAG_LENGTH);
 	const ciphertext = payload.subarray(IV_LENGTH + TAG_LENGTH);
-	const decipher = createDecipheriv('aes-256-gcm', key, iv);
-	decipher.setAuthTag(tag);
-	return Buffer.concat([
-		decipher.update(ciphertext),
-		decipher.final()
-	]).toString('utf8');
+	return aes256GcmDecrypt(key, iv, Buffer.concat([ciphertext, tag])).toString(
+		'utf8'
+	);
 }
 
 /**
  * Encrypt a plaintext value. Output format: 'enc1:' + base64(iv || authTag || ciphertext).
  */
-export function encryptValue(key: Buffer, plaintext: string): string {
+export function encryptValue(key: Uint8Array, plaintext: string): string {
 	return encryptWithPrefix(key, plaintext, ENC_PREFIX);
 }
 
@@ -100,7 +95,7 @@ export function encryptValue(key: Buffer, plaintext: string): string {
  * Decrypt an 'enc1:' value. Throws on a malformed value or failed auth tag
  * (wrong key or tampered ciphertext).
  */
-export function decryptValue(key: Buffer, value: string): string {
+export function decryptValue(key: Uint8Array, value: string): string {
 	return decryptWithPrefix(key, value, ENC_PREFIX);
 }
 

@@ -10,7 +10,7 @@
  * R recognises a voucher from the book alone and never acts on the payload.
  */
 
-import crypto from 'crypto';
+import { randomBytes } from '../crypto/provider';
 import {
 	constructOnionPacket,
 	decodeOnionPacket,
@@ -34,7 +34,7 @@ export interface IVoucherOnionInput {
 
 /** The 1366-byte onion_routing_packet of voucher k. */
 export function buildVoucherOnion(input: IVoucherOnionInput): Buffer {
-	const sessionKey = input.sessionKey ?? crypto.randomBytes(32);
+	const sessionKey = input.sessionKey ?? randomBytes(32);
 	const packet = constructOnionPacket(
 		sessionKey,
 		[

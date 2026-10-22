@@ -6,7 +6,7 @@
  * actual transport/broadcast operations.
  */
 
-import crypto from 'crypto';
+import { hmacSha256, randomBytes, sha256 } from '../crypto/provider';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
 import { createFundingScript } from '../script/funding';
@@ -1888,11 +1888,13 @@ export class Channel {
 	private _deriveVerificationNonce(height: bigint): Uint8Array {
 		const heightBuf = Buffer.alloc(8);
 		heightBuf.writeBigUInt64BE(height);
-		const sessionId = crypto
-			.createHmac('sha256', this._state.localPerCommitmentSeed)
-			.update(Buffer.from('beignet-taproot-verification-nonce', 'utf8'))
-			.update(heightBuf)
-			.digest();
+		const sessionId = hmacSha256(
+			this._state.localPerCommitmentSeed,
+			Buffer.concat([
+				Buffer.from('beignet-taproot-verification-nonce', 'utf8'),
+				heightBuf
+			])
+		);
 		return generateNonce({
 			publicKey: this._state.localBasepoints.fundingPubkey,
 			sessionId
@@ -1910,7 +1912,7 @@ export class Channel {
 	private _refreshOurClosingNonce(): Buffer {
 		this._ourClosingNonce = generateNonce({
 			publicKey: this._state.localBasepoints.fundingPubkey,
-			sessionId: crypto.randomBytes(32)
+			sessionId: randomBytes(32)
 		});
 		this._taprootClosingCache = null;
 		this._hasSignedClosing = false;
@@ -3068,7 +3070,7 @@ export class Channel {
 		// Generate SCID alias for private channels
 		let scidAlias = this._state.scidAlias;
 		if (!scidAlias) {
-			scidAlias = crypto.randomBytes(8);
+			scidAlias = randomBytes(8);
 			this._setScid('scidAlias', scidAlias);
 		}
 
@@ -4256,7 +4258,7 @@ export class Channel {
 		// Verify preimage. Checked before the repeat guard so a caller passing a
 		// preimage that does not hash to this HTLC is told so either way, rather
 		// than getting a silent no-op because the entry happens to be settled.
-		const hash = crypto.createHash('sha256').update(paymentPreimage).digest();
+		const hash = sha256(paymentPreimage);
 		if (!hash.equals(entry.paymentHash)) {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Invalid preimage for HTLC' }
@@ -4369,10 +4371,7 @@ export class Channel {
 		// direct theft of every HTLC we offer. Mirrors the receive-side check in
 		// fulfillHtlc(). Checked before the repeat branch below so a replay
 		// carrying a bogus preimage is rejected, not silently tolerated.
-		const fulfillHash = crypto
-			.createHash('sha256')
-			.update(msg.paymentPreimage)
-			.digest();
+		const fulfillHash = sha256(msg.paymentPreimage);
 		if (!fulfillHash.equals(entry.paymentHash)) {
 			// An attempted theft answered with silence was the worst of the bare
 			// arms (issue 409): the peer kept the bogus fulfill in its book and
@@ -17444,10 +17443,7 @@ export class Channel {
 		storedSig: Buffer
 	): Buffer {
 		const data = this.buildAnnouncementData(localNodeId, remoteNodeId);
-		const hash = crypto
-			.createHash('sha256')
-			.update(crypto.createHash('sha256').update(data).digest())
-			.digest();
+		const hash = sha256(sha256(data));
 		try {
 			if (
 				ecc.verify(hash, this._state.localBasepoints.fundingPubkey, storedSig)
@@ -24810,7 +24806,7 @@ export class Channel {
 				}
 			];
 		}
-		const epochId = request.epochId ?? crypto.randomBytes(32);
+		const epochId = request.epochId ?? randomBytes(32);
 		if (epochId.length !== 32 || this._fforEpochIdUsed(epochId)) {
 			return [
 				{
@@ -25164,17 +25160,15 @@ export class Channel {
 		// every lower slot's preimage. Otherwise K independent secrets.
 		const preimages: Buffer[] = [];
 		if (params.hashChain) {
-			let x = crypto.randomBytes(32);
+			let x = randomBytes(32);
 			for (let j = K; j >= 1; j--) {
 				preimages[j - 1] = x;
-				x = crypto.createHash('sha256').update(x).digest();
+				x = sha256(x);
 			}
 		} else {
-			for (let j = 0; j < K; j++) preimages.push(crypto.randomBytes(32));
+			for (let j = 0; j < K; j++) preimages.push(randomBytes(32));
 		}
-		const hashes = preimages.map((p) =>
-			crypto.createHash('sha256').update(p).digest()
-		);
+		const hashes = preimages.map((p) => sha256(p));
 		const sHtlcIdBase = this._state.localHtlcCounter;
 		const acceptBody = this._fforSign(
 			FF_ACCEPT_TYPE,
@@ -25473,7 +25467,7 @@ export class Channel {
 		for (let i = 0n; i < revealed; i++) {
 			const secret = this._state.shaChainStore.getSecret(MAX_INDEX - i);
 			if (!secret) continue;
-			const h = crypto.createHash('sha256').update(secret).digest();
+			const h = sha256(secret);
 			if (hashesHex.has(h.toString('hex'))) return true;
 		}
 		return false;
@@ -26392,7 +26386,7 @@ export class Channel {
 					channelId: this._state.channelId!,
 					epochId: f.epochId,
 					activationHash: f.hAct,
-					nonce: crypto.randomBytes(32)
+					nonce: randomBytes(32)
 				})
 			);
 			if (!body)
@@ -26486,14 +26480,7 @@ export class Channel {
 			)
 				continue;
 			const preimage = f.preimages[k - 1];
-			if (
-				!preimage ||
-				!crypto
-					.createHash('sha256')
-					.update(preimage)
-					.digest()
-					.equals(f.paymentHashes[k - 1])
-			)
+			if (!preimage || !sha256(preimage).equals(f.paymentHashes[k - 1]))
 				return refuse('reportable slot lacks its claim proof');
 			bitmapSet(settled, k);
 			preimages.push({ k, preimage });
@@ -26558,12 +26545,7 @@ export class Channel {
 			return refuse('invalid ff_sync_reply identity or signature');
 		if (
 			msg.preimages.some(
-				(p) =>
-					!crypto
-						.createHash('sha256')
-						.update(p.preimage)
-						.digest()
-						.equals(f.paymentHashes[p.k - 1])
+				(p) => !sha256(p.preimage).equals(f.paymentHashes[p.k - 1])
 			)
 		)
 			return refuse('ff_sync_reply preimage does not match its slot');
@@ -26898,7 +26880,7 @@ export class Channel {
 					}
 				];
 			}
-			const h = crypto.createHash('sha256').update(p.preimage).digest();
+			const h = sha256(p.preimage);
 			if (!h.equals(f.paymentHashes[p.k - 1])) {
 				return [
 					{
@@ -27068,7 +27050,7 @@ export class Channel {
 		f: IFforEpochRecord,
 		preimage: Buffer
 	): ChannelAction[] | null {
-		const h = crypto.createHash('sha256').update(preimage).digest();
+		const h = sha256(preimage);
 		const idx = f.paymentHashes.findIndex((x) => x.equals(h));
 		if (idx < 0) return null;
 		const learned: ChannelAction[] = [];
@@ -27087,7 +27069,7 @@ export class Channel {
 			for (let j = idx - 1; j >= 0; j--) {
 				if (f.knownPreimages[j]) continue;
 				const derived = f.paymentHashes[j + 1];
-				const below = crypto.createHash('sha256').update(derived).digest();
+				const below = sha256(derived);
 				if (!below.equals(f.paymentHashes[j])) break;
 				f.knownPreimages[j] = Buffer.from(derived);
 				learned.push({
@@ -27761,7 +27743,7 @@ export function createOpenerChannel(params: {
 	localPerCommitmentSeed: Buffer;
 }): Channel {
 	const state = createOpenerState({
-		temporaryChannelId: crypto.randomBytes(32),
+		temporaryChannelId: randomBytes(32),
 		fundingSatoshis: params.fundingSatoshis,
 		pushMsat: params.pushMsat || 0n,
 		localConfig: params.localConfig || DEFAULT_CHANNEL_CONFIG,
@@ -27803,7 +27785,7 @@ export function createAcceptorChannel(params: {
 /** Section 9.5.4: SHA256(H_j) == H_{j-1} for every j > 1. */
 function isHashChain(hashes: Buffer[]): boolean {
 	for (let j = 1; j < hashes.length; j++) {
-		const h = crypto.createHash('sha256').update(hashes[j]).digest();
+		const h = sha256(hashes[j]);
 		if (!h.equals(hashes[j - 1])) return false;
 	}
 	return true;

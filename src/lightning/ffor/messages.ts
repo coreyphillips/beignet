@@ -17,7 +17,7 @@
  * `[2: type] || body` exactly as sent.
  */
 
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import { sign, verify } from '../crypto/ecdh';
 import type { ITlvRecord } from '../message/tlv';
 import {
@@ -194,12 +194,7 @@ export class Reader {
 
 /** SHA256("ffor/msg" || type || body_excluding_the_signature). */
 export function fforMessageDigest(type: number, unsignedBody: Buffer): Buffer {
-	return crypto
-		.createHash('sha256')
-		.update(MSG_TAG)
-		.update(u16(type))
-		.update(unsignedBody)
-		.digest();
+	return sha256(Buffer.concat([MSG_TAG, u16(type), unsignedBody]));
 }
 
 /** Append the node-key signature to an unsigned body, giving the wire body. */

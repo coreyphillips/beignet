@@ -18,6 +18,10 @@ The rules for new public API, and the old names they replaced. Existing internal
 
 **Outpoints.** An outpoint is `{ txid, vout }` (`IOutpoint`), with the txid in display order. Stored UTXO records keep Electrum's `tx_hash` and `tx_pos`.
 
+**Bytes.** A parameter that takes bytes is typed `Uint8Array`, which a `Buffer` already is. Returns stay `Buffer` until the major release that moves to bitcoinjs-lib 7, because changing a return type breaks callers and widening a parameter does not.
+
+**Crypto.** Under `src/lightning`, hashing, HMAC, HKDF, the AEADs and randomness go through `crypto/provider.ts`, not Node's `crypto`, so a host without Node's `crypto` can supply its own with `setCryptoProvider`. `tests/lightning/crypto-provider.test.ts` lists the few files allowed to load Node's `crypto`, and why. The CLI runs only on Node and uses it directly.
+
 **One result per method.** No flag switches a method between two return types. `send` broadcasts and returns the txid; `createSignedTransaction` returns the signed transaction without broadcasting it.
 
 ## Deprecated names

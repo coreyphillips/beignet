@@ -16,7 +16,7 @@
  * The signature hash is H("lightning" || messagename || fieldname, merkle_root).
  */
 
-import crypto from 'crypto';
+import { sha256 as sha256Digest } from '../crypto/provider';
 import { decodeBigSize } from '../message/codec';
 import type { ITlvRecord } from '../message/tlv';
 import { encodeTlvRecord } from '../message/tlv';
@@ -29,9 +29,7 @@ const LN_BRANCH_TAG = Buffer.from('LnBranch');
 const SIGNATURE_TLV_TYPE = 240n;
 
 function sha256(...parts: Buffer[]): Buffer {
-	const h = crypto.createHash('sha256');
-	for (const p of parts) h.update(p);
-	return h.digest();
+	return sha256Digest(Buffer.concat(parts));
 }
 
 /** Tagged hash H(tag, msg) = SHA256(SHA256(tag) || SHA256(tag) || msg). */

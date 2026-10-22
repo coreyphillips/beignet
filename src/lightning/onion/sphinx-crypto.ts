@@ -5,7 +5,7 @@
  * and pseudo-random stream generation for onion routing.
  */
 
-import crypto from 'crypto';
+import { chacha20, hmacSha256, sha256 } from '../crypto/provider';
 import {
 	ecdh,
 	getPublicKey,
@@ -33,11 +33,7 @@ export function computeBlindingFactor(
 	ephemeralKey: Buffer,
 	sharedSecret: Buffer
 ): Buffer {
-	return crypto
-		.createHash('sha256')
-		.update(ephemeralKey)
-		.update(sharedSecret)
-		.digest();
+	return sha256(Buffer.concat([ephemeralKey, sharedSecret]));
 }
 
 /**
@@ -46,12 +42,7 @@ export function computeBlindingFactor(
  * pad stream (secret = the SESSION private key, so no hop can regenerate it).
  */
 export function generateKey(keyType: string, secret: Buffer): Buffer {
-	return Buffer.from(
-		crypto
-			.createHmac('sha256', Buffer.from(keyType, 'ascii'))
-			.update(secret)
-			.digest()
-	);
+	return Buffer.from(hmacSha256(Buffer.from(keyType, 'ascii'), secret));
 }
 
 /**
@@ -73,9 +64,7 @@ export function deriveHopKeys(sharedSecret: Buffer): IHopKeys {
  * Used for XOR-based encryption/decryption of routing info.
  */
 export function generateCipherStream(key: Buffer, length: number): Buffer {
-	const nonce = Buffer.alloc(16); // ChaCha20 uses 16-byte nonce (4 counter + 12 nonce)
-	const cipher = crypto.createCipheriv('chacha20', key, nonce);
-	return Buffer.from(cipher.update(Buffer.alloc(length)));
+	return chacha20(key, Buffer.alloc(12), Buffer.alloc(length));
 }
 
 /**

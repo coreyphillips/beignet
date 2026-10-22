@@ -8,7 +8,7 @@
 import * as secp from '@noble/secp256k1';
 import { hmac } from '@noble/hashes/hmac';
 import { sha256 } from '@noble/hashes/sha256';
-import crypto from 'crypto';
+import { sha256 as sha256Digest } from '../crypto/provider';
 
 let hmacSetup = false;
 
@@ -66,7 +66,7 @@ export function computeSigningHash(hrp: string, dataWords: number[]): Buffer {
 	const hrpBytes = Buffer.from(hrp, 'utf8');
 	const dataBytes = wordsToSigningBytes(dataWords);
 	const preimage = Buffer.concat([hrpBytes, dataBytes]);
-	return crypto.createHash('sha256').update(preimage).digest();
+	return sha256Digest(preimage);
 }
 
 /**

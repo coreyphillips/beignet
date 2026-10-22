@@ -43,7 +43,8 @@
  * `GuardianHttpTransport` function shape.
  */
 
-import { randomBytes, timingSafeEqual } from 'crypto';
+import { timingSafeEqual } from 'crypto';
+import { randomBytes } from '../crypto/provider';
 import { ecc } from '../../utils/ecc';
 import { Peer } from '../transport/peer';
 import type { IDuplexTransport } from '../transport/duplex-transport';

@@ -12,14 +12,12 @@
  * big-endian, the height u32 big-endian, txids in internal byte order.
  */
 
-import crypto from 'crypto';
+import { sha256 as sha256Digest } from '../crypto/provider';
 import type { FforVariant, IFforBookEntry } from './types';
 import { FF_PROFILE_FIXED_AMOUNT } from './types';
 
 function sha256(...parts: Buffer[]): Buffer {
-	const h = crypto.createHash('sha256');
-	for (const p of parts) h.update(p);
-	return h.digest();
+	return sha256Digest(Buffer.concat(parts));
 }
 
 function ascii(s: string): Buffer {

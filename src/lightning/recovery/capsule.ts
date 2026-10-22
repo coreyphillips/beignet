@@ -31,7 +31,11 @@
  * tests prove.
  */
 
-import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
+import {
+	aes256GcmDecrypt,
+	aes256GcmEncrypt,
+	randomBytes
+} from '../crypto/provider';
 import { hkdfKey } from '../storage/encryption';
 import type { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
 import { CorruptRecoveryRowError } from '../storage/types';
@@ -853,17 +857,17 @@ export function encryptRecoveryCapsule(
 ): Buffer {
 	const key = deriveCapsuleKey(nodeSecret);
 	const iv = randomBytes(IV_LENGTH);
-	const cipher = createCipheriv('aes-256-gcm', key, iv);
-	cipher.setAAD(Buffer.from(CAPSULE_HKDF_INFO, 'ascii'));
-	const ciphertext = Buffer.concat([
-		cipher.update(encodeCapsule(capsule)),
-		cipher.final()
-	]);
+	const sealed = aes256GcmEncrypt(
+		key,
+		iv,
+		encodeCapsule(capsule),
+		Buffer.from(CAPSULE_HKDF_INFO, 'ascii')
+	);
 	return Buffer.concat([
 		Buffer.from(CAPSULE_MAGIC, 'ascii'),
 		iv,
-		cipher.getAuthTag(),
-		ciphertext
+		sealed.subarray(sealed.length - TAG_LENGTH),
+		sealed.subarray(0, sealed.length - TAG_LENGTH)
 	]);
 }
 
@@ -895,17 +899,12 @@ export function decodeRecoveryCapsuleBlob(
 		CAPSULE_MAGIC.length + IV_LENGTH + TAG_LENGTH
 	);
 	try {
-		const decipher = createDecipheriv(
-			'aes-256-gcm',
+		const plaintext = aes256GcmDecrypt(
 			deriveCapsuleKey(nodeSecret),
-			iv
+			iv,
+			Buffer.concat([ciphertext, tag]),
+			Buffer.from(CAPSULE_HKDF_INFO, 'ascii')
 		);
-		decipher.setAAD(Buffer.from(CAPSULE_HKDF_INFO, 'ascii'));
-		decipher.setAuthTag(tag);
-		const plaintext = Buffer.concat([
-			decipher.update(ciphertext),
-			decipher.final()
-		]);
 		return decodeCapsule(plaintext);
 	} catch {
 		return null;

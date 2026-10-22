@@ -21,7 +21,7 @@
  */
 
 import { EventEmitter } from 'events';
-import { randomBytes } from 'crypto';
+import { randomBytes } from '../crypto/provider';
 import type * as bitcoin from 'bitcoinjs-lib';
 import { getPublicKey } from '../crypto/ecdh';
 import {

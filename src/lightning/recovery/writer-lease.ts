@@ -34,7 +34,7 @@
  *   rest, and never leaves the device.
  */
 
-import { randomBytes } from 'crypto';
+import { randomBytes } from '../crypto/provider';
 import { ecc } from '../../utils/ecc';
 import type { IStorageBackend } from '../storage/types';
 import type { GuardianState } from './guardian-wire';

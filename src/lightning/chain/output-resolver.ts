@@ -7,7 +7,7 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import type { ITrackedOutput } from './types';
 import { CommitmentType, OutputType, OutputStatus } from './types';
 import {
@@ -154,11 +154,9 @@ export function extractCommitmentNumber(
 	const obscured = (upper24 << 24n) | lower24;
 
 	// Compute the mask to un-obscure
-	const hash = crypto
-		.createHash('sha256')
-		.update(openPaymentBasepoint)
-		.update(acceptPaymentBasepoint)
-		.digest();
+	const hash = sha256(
+		Buffer.concat([openPaymentBasepoint, acceptPaymentBasepoint])
+	);
 
 	let mask = 0n;
 	for (let i = 26; i < 32; i++) {

@@ -1,6 +1,5 @@
-import crypto from 'crypto';
+import { chacha20Poly1305Decrypt, chacha20Poly1305Encrypt } from './provider';
 
-const ALGORITHM = 'chacha20-poly1305';
 const KEY_LENGTH = 32;
 const NONCE_LENGTH = 12;
 const TAG_LENGTH = 16;
@@ -14,10 +13,10 @@ const TAG_LENGTH = 16;
  * @returns Ciphertext with 16-byte authentication tag appended
  */
 export function encrypt(
-	key: Buffer,
-	nonce: Buffer,
-	plaintext: Buffer,
-	aad: Buffer = Buffer.alloc(0)
+	key: Uint8Array,
+	nonce: Uint8Array,
+	plaintext: Uint8Array,
+	aad: Uint8Array = Buffer.alloc(0)
 ): Buffer {
 	if (key.length !== KEY_LENGTH) {
 		throw new Error(`Key must be ${KEY_LENGTH} bytes, got ${key.length}`);
@@ -26,17 +25,7 @@ export function encrypt(
 		throw new Error(`Nonce must be ${NONCE_LENGTH} bytes, got ${nonce.length}`);
 	}
 
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any -- Node's createCipheriv overloads omit chacha20-poly1305 + authTagLength; runtime supports both
-	const cipher = crypto.createCipheriv(ALGORITHM as any, key, nonce, {
-		authTagLength: TAG_LENGTH
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any -- see above
-	} as any) as crypto.CipherGCM;
-	cipher.setAAD(aad);
-
-	const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-	const tag = cipher.getAuthTag();
-
-	return Buffer.concat([encrypted, tag]);
+	return chacha20Poly1305Encrypt(key, nonce, plaintext, aad);
 }
 
 /**
@@ -49,10 +38,10 @@ export function encrypt(
  * @throws If authentication fails (tag mismatch)
  */
 export function decrypt(
-	key: Buffer,
-	nonce: Buffer,
-	ciphertextWithTag: Buffer,
-	aad: Buffer = Buffer.alloc(0)
+	key: Uint8Array,
+	nonce: Uint8Array,
+	ciphertextWithTag: Uint8Array,
+	aad: Uint8Array = Buffer.alloc(0)
 ): Buffer {
 	if (key.length !== KEY_LENGTH) {
 		throw new Error(`Key must be ${KEY_LENGTH} bytes, got ${key.length}`);
@@ -64,21 +53,7 @@ export function decrypt(
 		throw new Error('Ciphertext too short to contain authentication tag');
 	}
 
-	const ciphertext = ciphertextWithTag.subarray(
-		0,
-		ciphertextWithTag.length - TAG_LENGTH
-	);
-	const tag = ciphertextWithTag.subarray(ciphertextWithTag.length - TAG_LENGTH);
-
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any -- Node's createDecipheriv overloads omit chacha20-poly1305 + authTagLength; runtime supports both
-	const decipher = crypto.createDecipheriv(ALGORITHM as any, key, nonce, {
-		authTagLength: TAG_LENGTH
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any -- see above
-	} as any) as crypto.DecipherGCM;
-	decipher.setAAD(aad);
-	decipher.setAuthTag(tag);
-
-	return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+	return chacha20Poly1305Decrypt(key, nonce, ciphertextWithTag, aad);
 }
 
 /**

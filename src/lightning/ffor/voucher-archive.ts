@@ -1,4 +1,4 @@
-import { createHash } from 'crypto';
+import { sha256 } from '../crypto/provider';
 import type { IFforEpochRecord } from './types';
 import { IRREVOCABLE_DEPTH } from '../chain/types';
 
@@ -105,9 +105,8 @@ export function validateFforVoucherArchive(
 	if (
 		record.preimage !== undefined &&
 		(!hex(record.preimage) ||
-			createHash('sha256')
-				.update(Buffer.from(record.preimage, 'hex'))
-				.digest('hex') !== record.paymentHash)
+			sha256(Buffer.from(record.preimage, 'hex')).toString('hex') !==
+				record.paymentHash)
 	) {
 		throw new Error('Invalid FFOR voucher archive preimage');
 	}
@@ -135,9 +134,8 @@ export function validateFforVoucherArchive(
 				r.outputIndex > 0xffffffff ||
 				(r.preimage !== undefined &&
 					(!hex(r.preimage) ||
-						createHash('sha256')
-							.update(Buffer.from(r.preimage, 'hex'))
-							.digest('hex') !== record.paymentHash))
+						sha256(Buffer.from(r.preimage, 'hex')).toString('hex') !==
+							record.paymentHash))
 			) {
 				throw new Error('Invalid FFOR voucher chain observation');
 			}

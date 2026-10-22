@@ -5,7 +5,7 @@
  * Handles construction, processing, forwarding, and rate limiting.
  */
 
-import crypto from 'crypto';
+import { randomBytes } from '../crypto/provider';
 import { EventEmitter } from 'events';
 import type {
 	IOnionMessage,
@@ -152,7 +152,7 @@ export class OnionMessageManager extends EventEmitter {
 				? { pathId: options.pathId }
 				: {}
 		);
-		const path = constructBlindedPath(crypto.randomBytes(32), nodeIds, hopData);
+		const path = constructBlindedPath(randomBytes(32), nodeIds, hopData);
 		const msg = constructReplyOnionMessage(
 			path,
 			messageData,

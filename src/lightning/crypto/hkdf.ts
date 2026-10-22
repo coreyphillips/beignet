@@ -1,6 +1,5 @@
-import crypto from 'crypto';
+import { hmacSha256 } from './provider';
 
-const HASH_ALGORITHM = 'sha256';
 const HASH_LENGTH = 32;
 
 /**
@@ -9,11 +8,11 @@ const HASH_LENGTH = 32;
  * @param ikm - Input keying material
  * @returns Pseudorandom key (32 bytes)
  */
-export function hkdfExtract(salt: Buffer, ikm: Buffer): Buffer {
+export function hkdfExtract(salt: Uint8Array, ikm: Uint8Array): Buffer {
 	if (salt.length === 0) {
 		salt = Buffer.alloc(HASH_LENGTH);
 	}
-	return crypto.createHmac(HASH_ALGORITHM, salt).update(ikm).digest();
+	return hmacSha256(salt, ikm);
 }
 
 /**
@@ -23,7 +22,11 @@ export function hkdfExtract(salt: Buffer, ikm: Buffer): Buffer {
  * @param length - Desired output length in bytes (max 255 * 32)
  * @returns Output keying material of specified length
  */
-export function hkdfExpand(prk: Buffer, info: Buffer, length: number): Buffer {
+export function hkdfExpand(
+	prk: Uint8Array,
+	info: Uint8Array,
+	length: number
+): Buffer {
 	const maxLength = 255 * HASH_LENGTH;
 	if (length > maxLength) {
 		throw new Error(`Output length ${length} exceeds maximum ${maxLength}`);
@@ -34,12 +37,7 @@ export function hkdfExpand(prk: Buffer, info: Buffer, length: number): Buffer {
 	let prev = Buffer.alloc(0);
 
 	for (let i = 1; i <= n; i++) {
-		prev = crypto
-			.createHmac(HASH_ALGORITHM, prk)
-			.update(prev)
-			.update(info)
-			.update(Buffer.from([i]))
-			.digest();
+		prev = hmacSha256(prk, Buffer.concat([prev, info, Buffer.from([i])]));
 		prev.copy(okm, (i - 1) * HASH_LENGTH);
 	}
 
@@ -55,9 +53,9 @@ export function hkdfExpand(prk: Buffer, info: Buffer, length: number): Buffer {
  * @returns Derived key material
  */
 export function hkdf(
-	salt: Buffer,
-	ikm: Buffer,
-	info: Buffer = Buffer.alloc(0),
+	salt: Uint8Array,
+	ikm: Uint8Array,
+	info: Uint8Array = Buffer.alloc(0),
 	length = 64
 ): Buffer {
 	const prk = hkdfExtract(salt, ikm);
@@ -72,7 +70,7 @@ export function hkdf(
  * @param ikm - Input keying material
  * @returns Tuple of [chaining_key, key]
  */
-export function hkdf2(salt: Buffer, ikm: Buffer): [Buffer, Buffer] {
+export function hkdf2(salt: Uint8Array, ikm: Uint8Array): [Buffer, Buffer] {
 	const output = hkdf(salt, ikm, Buffer.alloc(0), 64);
 	return [output.subarray(0, 32), output.subarray(32, 64)];
 }
@@ -85,7 +83,10 @@ export function hkdf2(salt: Buffer, ikm: Buffer): [Buffer, Buffer] {
  * @param ikm - Input keying material
  * @returns Tuple of [chaining_key, key1, key2]
  */
-export function hkdf3(salt: Buffer, ikm: Buffer): [Buffer, Buffer, Buffer] {
+export function hkdf3(
+	salt: Uint8Array,
+	ikm: Uint8Array
+): [Buffer, Buffer, Buffer] {
 	const output = hkdf(salt, ikm, Buffer.alloc(0), 96);
 	return [
 		output.subarray(0, 32),

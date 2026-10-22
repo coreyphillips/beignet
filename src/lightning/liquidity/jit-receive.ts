@@ -58,7 +58,7 @@
 
 import { TypedEmitter } from '../../utils/typed-emitter';
 import { CodedError } from '../../utils/errors';
-import * as crypto from 'crypto';
+import { randomBytes } from '../crypto/provider';
 import { encodeShortChannelId } from '../gossip/types';
 import type { IForwardablePart } from '../node/types';
 import {
@@ -391,7 +391,7 @@ export function mintInterceptScid(
 	attempts = 8
 ): Buffer | null {
 	for (let i = 0; i < attempts; i++) {
-		const random = crypto.randomBytes(5);
+		const random = randomBytes(5);
 		const scid = encodeShortChannelId({
 			block: JIT_INTERCEPT_SCID_BLOCK,
 			txIndex: random.readUIntBE(0, 3),

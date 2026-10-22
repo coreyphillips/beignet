@@ -7,7 +7,7 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 
 // Ensure ECC is initialized for bitcoinjs-lib
 bitcoin.initEccLib(ecc);
@@ -78,5 +78,5 @@ export function createFundingScript(
  * This is the hash used in the P2WSH output.
  */
 export function getFundingScriptHash(witnessScript: Buffer): Buffer {
-	return crypto.createHash('sha256').update(witnessScript).digest();
+	return sha256(witnessScript);
 }

@@ -8,14 +8,10 @@
  * Maximum index is 2^48 - 1 (281 trillion commitments).
  */
 
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 
 const MAX_INDEX = 0xffffffffffffn; // 2^48 - 1
 const INDEX_BITS = 48;
-
-function sha256(data: Buffer): Buffer {
-	return crypto.createHash('sha256').update(data).digest();
-}
 
 /**
  * Generate a secret at a given index from a seed.

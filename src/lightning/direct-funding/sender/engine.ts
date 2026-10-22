@@ -27,7 +27,7 @@
  * a `caveat` saying what was lost.
  */
 
-import crypto from 'crypto';
+import { sha256 } from '../../crypto/provider';
 import * as bitcoin from 'bitcoinjs-lib';
 import { BeignetCustomSubtype } from '../../message/custom';
 import type { IDfVerifyOptions } from '../envelope';
@@ -1554,10 +1554,7 @@ export class DirectFundingSender {
 			reject('no witness has left this device');
 			return;
 		}
-		const hash = crypto
-			.createHash('sha256')
-			.update(receipt.preimage)
-			.digest('hex');
+		const hash = sha256(receipt.preimage).toString('hex');
 		if (hash !== attempt.record.receiptHash) {
 			reject('the preimage does not open the request receipt hash');
 			return;

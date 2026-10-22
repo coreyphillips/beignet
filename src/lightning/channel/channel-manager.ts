@@ -9,7 +9,7 @@
 import { TypedEmitter } from '../../utils/typed-emitter';
 import type { TxidHex } from '../../utils/identifiers';
 import type { ChannelManagerEvents } from './events';
-import crypto from 'crypto';
+import { randomBytes, sha256 } from '../crypto/provider';
 import { MessageType } from '../message/types';
 import {
 	decodeOpenChannelMessage,
@@ -1335,7 +1335,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createOpenerState({
-			temporaryChannelId: crypto.randomBytes(32),
+			temporaryChannelId: randomBytes(32),
 			fundingSatoshis,
 			pushMsat: pushMsat || 0n,
 			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
@@ -1409,7 +1409,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createOpenerState({
-			temporaryChannelId: crypto.randomBytes(32),
+			temporaryChannelId: randomBytes(32),
 			fundingSatoshis,
 			pushMsat: pushMsat || 0n,
 			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
@@ -1656,7 +1656,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		}
 		const signingNonce = generateNonce({
 			publicKey: state.localBasepoints.fundingPubkey,
-			sessionId: crypto.randomBytes(32)
+			sessionId: randomBytes(32)
 		});
 		const partial = signRemoteCommitmentPartial(
 			state,
@@ -1765,7 +1765,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// settle path that forgets is covered here, making the C4 class of bug
 		// (preimage learned but never wired to the monitor → on-chain loss)
 		// structurally impossible rather than relying on every caller.
-		const preimageHash = crypto.createHash('sha256').update(preimage).digest();
+		const preimageHash = sha256(preimage);
 		this.recordPreimage(preimageHash, preimage);
 
 		// BOLT 2 quiescence: no update messages after stfu (issue 430). The
@@ -3555,9 +3555,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			const paymentHash = output?.paymentHash;
 			if (!paymentHash) continue;
 			const preimage = (input.witness ?? []).find(
-				(el) =>
-					el.length === 32 &&
-					crypto.createHash('sha256').update(el).digest().equals(paymentHash)
+				(el) => el.length === 32 && sha256(el).equals(paymentHash)
 			);
 			if (!preimage) continue;
 			this.emit(
@@ -7516,7 +7514,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		this._assertNamespaceCanRecordANewChannel();
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createOpenerState({
-			temporaryChannelId: crypto.randomBytes(32),
+			temporaryChannelId: randomBytes(32),
 			fundingSatoshis: params.fundingSatoshis,
 			pushMsat: 0n,
 			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,

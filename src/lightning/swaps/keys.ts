@@ -5,7 +5,7 @@
  * key so the derivation can be checked against it at use.
  */
 
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import { hkdfExpand, hkdfExtract } from '../crypto/hkdf';
 import { isValidPrivateKey } from '../crypto/ecdh';
 
@@ -26,13 +26,9 @@ export function deriveSwapId(peerNodeId: Buffer, paymentHash: Buffer): Buffer {
 	if (!Buffer.isBuffer(paymentHash) || paymentHash.length !== 32) {
 		throw new Error('Payment hash must be 32 bytes');
 	}
-	return crypto
-		.createHash('sha256')
-		.update(SWAP_KEY_SALT)
-		.update(peerNodeId)
-		.update(paymentHash)
-		.digest()
-		.subarray(0, SWAP_ID_BYTES);
+	return sha256(
+		Buffer.concat([SWAP_KEY_SALT, peerNodeId, paymentHash])
+	).subarray(0, SWAP_ID_BYTES);
 }
 
 /**

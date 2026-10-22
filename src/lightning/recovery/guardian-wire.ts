@@ -10,8 +10,7 @@
  * specification wins and this module has a bug.
  */
 
-import { createHash } from 'crypto';
-import { hkdfSync } from 'crypto';
+import { hkdfSha256, sha256 } from '../crypto/provider';
 import { schnorrSign, schnorrVerify } from '../offer/schnorr';
 import { ecc } from '../../utils/ecc';
 
@@ -42,12 +41,8 @@ const ZERO32 = Buffer.alloc(32);
 
 /** BIP340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg). */
 export function guardianTaggedHash(tag: string, message: Buffer): Buffer {
-	const tagHash = createHash('sha256').update(tag, 'utf8').digest();
-	return createHash('sha256')
-		.update(tagHash)
-		.update(tagHash)
-		.update(message)
-		.digest();
+	const tagHash = sha256(Buffer.from(tag, 'utf8'));
+	return sha256(Buffer.concat([tagHash, tagHash, message]));
 }
 
 function u16(value: number): Buffer {
@@ -92,14 +87,11 @@ export function deriveRecoveryRoot(nodeSecret: Buffer): {
 			'nodeSecret must be a valid 32-byte secp256k1 identity secret'
 		);
 	}
-	const okm = Buffer.from(
-		hkdfSync(
-			'sha256',
-			nodeSecret,
-			Buffer.alloc(0),
-			'beignet-recovery-root-v1',
-			32
-		)
+	const okm = hkdfSha256(
+		nodeSecret,
+		Buffer.alloc(0),
+		Buffer.from('beignet-recovery-root-v1', 'utf8'),
+		32
 	);
 	let scalar = 0n;
 	for (const byte of okm) scalar = (scalar << 8n) | BigInt(byte);
@@ -132,14 +124,11 @@ export function deriveGuardianRoot(nodeSecret: Buffer): {
 			'nodeSecret must be a valid 32-byte secp256k1 identity secret'
 		);
 	}
-	const okm = Buffer.from(
-		hkdfSync(
-			'sha256',
-			nodeSecret,
-			Buffer.alloc(0),
-			'beignet-guardian-root-v1',
-			32
-		)
+	const okm = hkdfSha256(
+		nodeSecret,
+		Buffer.alloc(0),
+		Buffer.from('beignet-guardian-root-v1', 'utf8'),
+		32
 	);
 	let scalar = 0n;
 	for (const byte of okm) scalar = (scalar << 8n) | BigInt(byte);

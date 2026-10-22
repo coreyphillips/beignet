@@ -24,7 +24,7 @@
  * breaking a decoder and cannot add a required one silently.
  */
 
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import * as bitcoin from 'bitcoinjs-lib';
 import type { ITlvRecord } from '../message/tlv';
 import { decodeTlvStream, encodeTlvStream } from '../message/tlv';
@@ -818,11 +818,9 @@ export function deriveOfferId(
 	amountSat: bigint
 ): Buffer {
 	fixed(txid, TXID_BYTES, 'txid');
-	return crypto
-		.createHash('sha256')
-		.update(`${txid.toString('hex')}:${vout}:${amountSat}`, 'utf8')
-		.digest()
-		.subarray(0, DF_OFFER_ID_BYTES);
+	return sha256(
+		Buffer.from(`${txid.toString('hex')}:${vout}:${amountSat}`, 'utf8')
+	).subarray(0, DF_OFFER_ID_BYTES);
 }
 
 /**
@@ -867,9 +865,8 @@ export function ownershipDigest(
 	receiptHash: Buffer,
 	receiverNodeId: Buffer
 ): Buffer {
-	return crypto
-		.createHash('sha256')
-		.update(
+	return sha256(
+		Buffer.from(
 			ownershipMessage(
 				offerId,
 				txid,
@@ -880,7 +877,7 @@ export function ownershipDigest(
 			),
 			'utf8'
 		)
-		.digest();
+	);
 }
 
 /**
@@ -947,11 +944,9 @@ export function ownershipProbeTransaction(
 
 /** The poison input's "txid", as the input's hash field carries it. */
 export function ownershipProbePoisonTxid(offerId: Buffer): Buffer {
-	return crypto
-		.createHash('sha256')
-		.update('lfbw-direct-funding-poison', 'utf8')
-		.update(offerId)
-		.digest();
+	return sha256(
+		Buffer.concat([Buffer.from('lfbw-direct-funding-poison', 'utf8'), offerId])
+	);
 }
 
 /** OP_RETURN "lfbw-poison": what the poison input is defined to spend. */
@@ -990,8 +985,8 @@ export function bitcoinMessageHash(message: string): Buffer {
 		compactSize(body.length),
 		body
 	]);
-	const once = crypto.createHash('sha256').update(envelope).digest();
-	return crypto.createHash('sha256').update(once).digest();
+	const once = sha256(envelope);
+	return sha256(once);
 }
 
 /**
@@ -1010,7 +1005,7 @@ export function attestationMessage(
 ): string {
 	fixed(offerId, DF_OFFER_ID_BYTES, 'offer id');
 	fixed(localFundingPubkey, DF_NODE_ID_BYTES, 'local funding pubkey');
-	const txHash = crypto.createHash('sha256').update(rawTx).digest('hex');
+	const txHash = sha256(rawTx).toString('hex');
 	return (
 		`lfbw-direct-funding-attest:${offerId.toString('hex')}:${txHash}:` +
 		`${fundingOutputIndex}:${localFundingPubkey.toString('hex')}`
