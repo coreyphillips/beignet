@@ -1,2 +1,2 @@
 # The exported API of beignet/lightning/iroh-node. Regenerate with npm run api:snapshot; do not edit.
-function createNodeIrohEndpoint(options: IIrohEndpointOptions): Promise<IIrohEndpoint>
+function createNodeIrohEndpoint(options: beignet/lightning#transport.IIrohEndpointOptions): Promise<beignet/lightning#transport.IIrohEndpoint>

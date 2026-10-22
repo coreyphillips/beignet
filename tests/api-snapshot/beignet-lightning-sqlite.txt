@@ -94,12 +94,12 @@ property IPaymentRowMatch.metadata?: { key: string; value?: string; }
 property IPaymentRowMatch.status?: string
 interface IStoredPaymentRef
 property IStoredPaymentRef.createdAt: number
-method IStoredPaymentRef.load(): IPaymentInfo | null
+method IStoredPaymentRef.load(): beignet/lightning#node.IPaymentInfo | null
 property IStoredPaymentRef.paymentHash: string
-class SqliteStorage implements IStorageBackend
+class SqliteStorage implements beignet/lightning#storage.IStorageBackend
 constructor SqliteStorage(dbPath: string, onCorruptRow?: (error: unknown) => void, opts?: { encryptionKey?: Buffer; })
 static readonly property SqliteStorage.CURRENT_SCHEMA_VERSION = 19
-method SqliteStorage.addWatchtowerUpdate(update: IWatchtowerUpdate): number
+method SqliteStorage.addWatchtowerUpdate(update: beignet/lightning#watchtower.IWatchtowerUpdate): number
 method SqliteStorage.backup(destPath: string): Promise<void>
 method SqliteStorage.checkpoint(): void
 method SqliteStorage.close(): void
@@ -129,55 +129,55 @@ method SqliteStorage.deleteRecoveryMeta(key: string): void
 method SqliteStorage.deleteWatchtowerTower(towerUri: string): void
 method SqliteStorage.deleteWebhook(id: string): void
 property SqliteStorage.forwardingEventsMaxRows: number
-method SqliteStorage.getForwardingSummary(options?: { since?: number; }): IForwardingSummary
+method SqliteStorage.getForwardingSummary(options?: { since?: number; }): beignet/lightning#storage.IForwardingSummary
 method SqliteStorage.getRecoveryMeta(key: string): string | null
 method SqliteStorage.getSchemaVersion(): number
 method SqliteStorage.hasChannelKeyIndices(): boolean
 method SqliteStorage.inTransaction(): boolean
-method SqliteStorage.listForwardingEvents(filter?: IForwardingEventFilter): IForwardingEvent[]
+method SqliteStorage.listForwardingEvents(filter?: beignet/lightning#storage.IForwardingEventFilter): beignet/lightning#storage.IForwardingEvent[]
 method SqliteStorage.listRecoveryMetaKeys(): string[]
 method SqliteStorage.loadActionLog(options?: { category?: string; since?: number; limit?: number; }): Array<{ category: string; action: string; timestamp: number; data: string; }>
 method SqliteStorage.loadAllAnnouncedPeerAddresses(): Array<{ pubkey: string; timestamp: number; addresses: Array<{ host: string; port: number; }>; }>
-method SqliteStorage.loadAllChainMonitors(): Array<{ channelId: string; state: IChainMonitorState; }>
+method SqliteStorage.loadAllChainMonitors(): Array<{ channelId: string; state: beignet/lightning#chain.IChainMonitorState; }>
 method SqliteStorage.loadAllChannelKeyIndices(): Array<{ channelId: string; channelIndex: number; }>
-method SqliteStorage.loadAllChannelPolicies(): Array<{ channelId: string; policy: IPersistedChannelPolicy; }>
-method SqliteStorage.loadAllChannels(): Array<{ channelId: string; state: IChannelState; peerPubkey: string; }>
-method SqliteStorage.loadAllFforVouchers(): IFforVoucherArchive[]
+method SqliteStorage.loadAllChannelPolicies(): Array<{ channelId: string; policy: beignet/lightning#storage.IPersistedChannelPolicy; }>
+method SqliteStorage.loadAllChannels(): Array<{ channelId: string; state: beignet/lightning#channel.IChannelState; peerPubkey: string; }>
+method SqliteStorage.loadAllFforVouchers(): beignet/lightning#ffor.IFforVoucherArchive[]
 method SqliteStorage.loadAllForwardedHtlcs(): Array<{ outKey: string; inChannelId: Buffer; inHtlcId: bigint; }>
-method SqliteStorage.loadAllGossipChannels(): IGraphChannel[]
-method SqliteStorage.loadAllGossipNodes(): IGraphNode[]
+method SqliteStorage.loadAllGossipChannels(): beignet/lightning#gossip.IGraphChannel[]
+method SqliteStorage.loadAllGossipNodes(): beignet/lightning#gossip.IGraphNode[]
 method SqliteStorage.loadAllHtlcPaymentMappings(): Array<{ key: string; paymentHashHex: string; }>
 method SqliteStorage.loadAllHtlcSharedSecrets(): Array<{ key: string; secret: Buffer; }>
 method SqliteStorage.loadAllInvoicePathIds(): Array<{ paymentHashHex: string; pathId: Buffer; }>
-method SqliteStorage.loadAllInvoices(): Array<{ paymentHashHex: string; invoice: IInvoiceInfo; }>
+method SqliteStorage.loadAllInvoices(): Array<{ paymentHashHex: string; invoice: beignet/lightning#node.IInvoiceInfo; }>
 method SqliteStorage.loadAllOffers(): Array<{ offerIdHex: string; encoded: string; pathId: Buffer | null; createdAt: number; asyncHold: boolean; }>
 method SqliteStorage.loadAllPaymentSecrets(): Array<{ paymentHashHex: string; secret: Buffer; }>
-method SqliteStorage.loadAllPayments(): Array<{ paymentHash: string; payment: IPaymentInfo; }>
-method SqliteStorage.loadAllPeerAddresses(): Array<{ pubkey: string; host: string; port: number; transport?: IPeerTransportOptions; }>
+method SqliteStorage.loadAllPayments(): Array<{ paymentHash: string; payment: beignet/lightning#node.IPaymentInfo; }>
+method SqliteStorage.loadAllPeerAddresses(): Array<{ pubkey: string; host: string; port: number; transport?: beignet/lightning#transport.IPeerTransportOptions; }>
 method SqliteStorage.loadAllPreimages(): Array<{ paymentHash: string; preimage: Buffer; }>
 method SqliteStorage.loadAllQueueEntries(): Array<{ id: string; bolt11: string; priority: number; status: string; amountSats?: number; maxFeeSats?: number; metadata?: string; error?: string; createdAt: number; completedAt?: number; }>
 method SqliteStorage.loadAllScidMappings(): Array<{ scidHex: string; channelId: Buffer; }>
 method SqliteStorage.loadAllWebhooks(): Array<{ id: string; url: string; events: string[]; secretHash?: string; createdAt: number; }>
-method SqliteStorage.loadChainMonitor(channelId: string): IChainMonitorState | null
-method SqliteStorage.loadChannel(id: string): { state: IChannelState; peerPubkey: string; } | null
+method SqliteStorage.loadChainMonitor(channelId: string): beignet/lightning#chain.IChainMonitorState | null
+method SqliteStorage.loadChannel(id: string): { state: beignet/lightning#channel.IChannelState; peerPubkey: string; } | null
 method SqliteStorage.loadChannelKeyIndex(channelId: string): number | null
-method SqliteStorage.loadFforVoucher(id: string): IFforVoucherArchive | null
-method SqliteStorage.loadGossipChannelsAfter(afterRowid: number, limit: number): IGossipRowPage<IGraphChannel>
-method SqliteStorage.loadGossipNodesAfter(afterRowid: number, limit: number): IGossipRowPage<IGraphNode>
+method SqliteStorage.loadFforVoucher(id: string): beignet/lightning#ffor.IFforVoucherArchive | null
+method SqliteStorage.loadGossipChannelsAfter(afterRowid: number, limit: number): beignet/lightning#storage.IGossipRowPage<beignet/lightning#gossip.IGraphChannel>
+method SqliteStorage.loadGossipNodesAfter(afterRowid: number, limit: number): beignet/lightning#storage.IGossipRowPage<beignet/lightning#gossip.IGraphNode>
 method SqliteStorage.loadMetadata(key: string): string | null
 method SqliteStorage.loadMetadataByPrefix(prefix: string): Array<{ key: string; value: string; }>
 method SqliteStorage.loadMissionControl(): string | null
 method SqliteStorage.loadNextChannelIndex(): number
-method SqliteStorage.loadOutboxMessages(channelId?: string): IRecoveryOutboxStoredMessage[]
-method SqliteStorage.loadPayment(paymentHash: string): IPaymentInfo | null
+method SqliteStorage.loadOutboxMessages(channelId?: string): beignet/lightning#storage.IRecoveryOutboxStoredMessage[]
+method SqliteStorage.loadPayment(paymentHash: string): beignet/lightning#node.IPaymentInfo | null
 method SqliteStorage.loadPeerStorageBlob(peerPubkey: string): { blob: Buffer; receivedAt: number; } | null
-method SqliteStorage.loadPendingWatchtowerUpdates(): Array<IWatchtowerUpdate & { id: number; }>
+method SqliteStorage.loadPendingWatchtowerUpdates(): Array<beignet/lightning#watchtower.IWatchtowerUpdate & { id: number; }>
 method SqliteStorage.loadPreimage(paymentHash: string): Buffer | null
-method SqliteStorage.loadRecoveryFrame(sequence: number): IStoredRecoveryFrame | null
-method SqliteStorage.loadRecoveryFrameHeader(sequence: number): IStoredRecoveryFrameHeader | null
-method SqliteStorage.loadRecoveryFrames(afterSequence?: number): IStoredRecoveryFrame[]
+method SqliteStorage.loadRecoveryFrame(sequence: number): beignet/lightning#storage.IStoredRecoveryFrame | null
+method SqliteStorage.loadRecoveryFrameHeader(sequence: number): beignet/lightning#storage.IStoredRecoveryFrameHeader | null
+method SqliteStorage.loadRecoveryFrames(afterSequence?: number): beignet/lightning#storage.IStoredRecoveryFrame[]
 method SqliteStorage.loadWalletData(key: string): string | null
-method SqliteStorage.loadWatchtowerSessions(): Array<IWatchtowerSession & { sessionKey: Buffer; }>
+method SqliteStorage.loadWatchtowerSessions(): Array<beignet/lightning#watchtower.IWatchtowerSession & { sessionKey: Buffer; }>
 method SqliteStorage.markWatchtowerUpdateAcked(id: number, seqNum: number): void
 method SqliteStorage.open(opts?: { synchronous?: 'FULL' | 'NORMAL'; }): void
 method SqliteStorage.paymentHashesWith(match: { status: string; direction: string; }): Set<string>
@@ -187,36 +187,36 @@ method SqliteStorage.recoveryFrameStats(): { count: number; minSequence: number;
 method SqliteStorage.revokedHtlcSnapshotStore(): object
 method SqliteStorage.saveActionLog(entry: { category: string; action: string; timestamp: number; data: string; }): void
 method SqliteStorage.saveAnnouncedPeerAddresses(pubkey: string, timestamp: number, addresses: Array<{ host: string; port: number; }>): void
-method SqliteStorage.saveChainMonitor(channelId: string, state: IChainMonitorState): void
-method SqliteStorage.saveChannel(id: string, state: IChannelState, peerPubkey: string): void
+method SqliteStorage.saveChainMonitor(channelId: string, state: beignet/lightning#chain.IChainMonitorState): void
+method SqliteStorage.saveChannel(id: string, state: beignet/lightning#channel.IChannelState, peerPubkey: string): void
 method SqliteStorage.saveChannelKeyIndex(channelId: string, channelIndex: number): void
-method SqliteStorage.saveChannelPolicy(channelId: string, policy: IPersistedChannelPolicy): void
-method SqliteStorage.saveFforVoucher(record: IFforVoucherArchive): void
+method SqliteStorage.saveChannelPolicy(channelId: string, policy: beignet/lightning#storage.IPersistedChannelPolicy): void
+method SqliteStorage.saveFforVoucher(record: beignet/lightning#ffor.IFforVoucherArchive): void
 method SqliteStorage.saveForwardedHtlc(outKey: string, inChannelId: Buffer, inHtlcId: bigint): void
-method SqliteStorage.saveForwardingEvent(event: Omit<IForwardingEvent, 'id'>): void
-method SqliteStorage.saveGossipChannel(scidHex: string, channel: IGraphChannel): void
-method SqliteStorage.saveGossipNode(nodeIdHex: string, node: IGraphNode): void
+method SqliteStorage.saveForwardingEvent(event: Omit<beignet/lightning#storage.IForwardingEvent, 'id'>): void
+method SqliteStorage.saveGossipChannel(scidHex: string, channel: beignet/lightning#gossip.IGraphChannel): void
+method SqliteStorage.saveGossipNode(nodeIdHex: string, node: beignet/lightning#gossip.IGraphNode): void
 method SqliteStorage.saveHtlcPaymentMapping(key: string, paymentHashHex: string): void
 method SqliteStorage.saveHtlcSharedSecret(key: string, secret: Buffer): void
-method SqliteStorage.saveInvoice(paymentHashHex: string, invoice: IInvoiceInfo): void
+method SqliteStorage.saveInvoice(paymentHashHex: string, invoice: beignet/lightning#node.IInvoiceInfo): void
 method SqliteStorage.saveInvoicePathId(paymentHashHex: string, pathId: Buffer): void
 method SqliteStorage.saveMetadata(key: string, value: string): void
 method SqliteStorage.saveMissionControl(json: string): void
 method SqliteStorage.saveOffer(offerIdHex: string, encoded: string, pathId: Buffer | null, createdAt: number, asyncHold?: boolean): void
-method SqliteStorage.saveOutboxMessage(message: IRecoveryOutboxMessage): number
-method SqliteStorage.savePayment(paymentHash: string, payment: IPaymentInfo): void
+method SqliteStorage.saveOutboxMessage(message: beignet/lightning#storage.IRecoveryOutboxMessage): number
+method SqliteStorage.savePayment(paymentHash: string, payment: beignet/lightning#node.IPaymentInfo): void
 method SqliteStorage.savePaymentSecret(paymentHashHex: string, secret: Buffer): void
-method SqliteStorage.savePeerAddress(pubkey: string, host: string, port: number, transport?: IPeerTransportOptions): void
+method SqliteStorage.savePeerAddress(pubkey: string, host: string, port: number, transport?: beignet/lightning#transport.IPeerTransportOptions): void
 method SqliteStorage.savePeerStorageBlob(peerPubkey: string, blob: Buffer, receivedAt: number): void
 method SqliteStorage.savePreimage(paymentHash: string, preimage: Buffer): void
 method SqliteStorage.saveQueueEntry(entry: { id: string; bolt11: string; priority: number; status: string; amountSats?: number; maxFeeSats?: number; metadata?: string; createdAt: number; }): void
-method SqliteStorage.saveRecoveryFrame(frame: IStoredRecoveryFrame): void
+method SqliteStorage.saveRecoveryFrame(frame: beignet/lightning#storage.IStoredRecoveryFrame): void
 method SqliteStorage.saveScidMapping(scidHex: string, channelId: Buffer): void
 method SqliteStorage.saveWalletData(key: string, value: string): void
-method SqliteStorage.saveWatchtowerSession(session: IWatchtowerSession, sessionKey: Buffer): void
+method SqliteStorage.saveWatchtowerSession(session: beignet/lightning#watchtower.IWatchtowerSession, sessionKey: Buffer): void
 method SqliteStorage.saveWebhook(id: string, url: string, events: string[], secretHash?: string, createdAt?: number): void
 method SqliteStorage.secretsEncryptedAtRest(): boolean
-method SqliteStorage.setOutboxDisposition(id: number, disposition: RecoveryOutboxDisposition): void
+method SqliteStorage.setOutboxDisposition(id: number, disposition: beignet/lightning#recovery.RecoveryOutboxDisposition): void
 method SqliteStorage.setOutboxFrameSequence(ids: number[], frameSequence: number): void
 method SqliteStorage.setRecoveryMeta(key: string, value: string): void
 method SqliteStorage.setWatchtowerSessionProgress(sessionId: string, seqNum: number, lastApplied: number): void

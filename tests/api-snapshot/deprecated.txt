@@ -32,11 +32,11 @@ beignet: property Wallet.sendMany.broadcast?: boolean
 beignet: property Wallet.sendMax.broadcast?: boolean
 beignet: const getBitcoinJsNetwork: (network: Network | `${Network}`) => BitcoinJsNetwork
 beignet: const getElectrumNetwork: (network: Network) => EElectrumNetworks
-beignet/lightning: method node.LightningNode.openZeroConfChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint): Channel
-beignet/lightning: const recovery.GuardianStore: typeof GuardianStoreClass
-beignet/lightning: type recovery.GuardianStore = GuardianStoreClass
-beignet/lightning: const storage.SqliteStorage: typeof SqliteStorageClass
-beignet/lightning: type storage.SqliteStorage = SqliteStorageClass
+beignet/lightning: method node.LightningNode.openZeroConfChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint): channel.Channel
+beignet/lightning: const recovery.GuardianStore: typeof beignet/lightning/sqlite#GuardianStore
+beignet/lightning: type recovery.GuardianStore = beignet/lightning/sqlite#GuardianStore
+beignet/lightning: const storage.SqliteStorage: typeof beignet/lightning/sqlite#SqliteStorage
+beignet/lightning: type storage.SqliteStorage = beignet/lightning/sqlite#SqliteStorage
 beignet/cli: method BeignetNode.openChannel(pubkey: string, amountSats: number, pushSats?: number, satsPerVbyte?: number, max?: boolean, trusted?: boolean): ChannelInfo
 beignet/cli: method BeignetNode.payInvoice(bolt11: string, timeoutMs?: number, maxFeeSats?: number, amountSats?: number, metadata?: Record<string, string>, cltvLimit?: number, maxFeeMsat?: number | string): Promise<PaymentInfo>
 beignet/cli: method BeignetNode.payInvoiceSafe(bolt11: string, timeoutMs?: number, maxFeeSats?: number, amountSats?: number, metadata?: Record<string, string>, cltvLimit?: number, maxFeeMsat?: number | string): Promise<PaymentInfo>

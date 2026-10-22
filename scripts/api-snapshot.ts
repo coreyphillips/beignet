@@ -142,13 +142,35 @@ export function declarationProgram(
 	return ts.createProgram(roots, { ...options, noEmit: true }, host);
 }
 
-const printer = ts.createPrinter({ removeComments: true });
+/**
+ * The name a recorded signature gives the declaration a reference resolves
+ * to, set by apiLines for each entry point. That is the name the entry point
+ * exports it under, or `beignet#Wallet` for one another entry point exports.
+ * An unexported declaration keeps its own name, with its file in front
+ * (`./webhooks#WebhookRegistration`) when another declaration has that name.
+ * Without it, `invoice.IFallbackAddress` and `offer.IFallbackAddress` would
+ * both print as `IFallbackAddress`, and switching between them would show no
+ * change.
+ */
+let identityOf: (node: ts.Node) => string | undefined = () => undefined;
+
+const printer = ts.createPrinter(
+	{ removeComments: true },
+	{
+		substituteNode: (_, node) => {
+			const identity = identityOf(node);
+			return identity === undefined
+				? node
+				: ts.factory.createIdentifier(identity);
+		}
+	}
+);
 
 /**
  * A node as declared, on one line. Whitespace inside string and template
- * literals is part of the type, so it is kept. Module paths in
- * `import("...").X` types are dropped, so moving a file inside src/ does not
- * change the snapshot.
+ * literals is part of the type, so it is kept. References print as
+ * identityOf names them, and module paths in `import("...").X` types are
+ * dropped: moving a file inside src/ is not an API change.
  */
 function print(node: ts.Node): string {
 	return printer
@@ -355,18 +377,18 @@ function declaresApi(node: ts.Node): boolean {
 }
 
 /**
- * Lines for the declarations that recorded signatures use but no entry point
- * exports, such as a base class, marked `unexported`: consumers depend on
- * their members as much as on the exported ones.
+ * The declarations that recorded signatures use but no entry point exports,
+ * such as a base class: consumers depend on their members as much as on the
+ * exported ones.
  */
-function unexportedLines(
+function unexportedDeclarations(
 	program: ts.Program,
 	declared: ts.Node[],
 	exported: Set<ts.Symbol>
-): IApiLine[] {
+): Map<ts.Symbol, ts.Declaration[]> {
 	const checker = program.getTypeChecker();
 	const seen = new Set(exported);
-	const lines: IApiLine[] = [];
+	const found = new Map<ts.Symbol, ts.Declaration[]>();
 	const visit = (node: ts.Node): void => {
 		const reference = ts.isTypeReferenceNode(node)
 			? node.typeName
@@ -376,6 +398,8 @@ function unexportedLines(
 			? node.exprName
 			: ts.isImportTypeNode(node)
 			? node.qualifier
+			: ts.isComputedPropertyName(node)
+			? node.expression
 			: undefined;
 		let symbol = reference && checker.getSymbolAtLocation(reference);
 		if (symbol && symbol.flags & ts.SymbolFlags.Alias) {
@@ -392,19 +416,14 @@ function unexportedLines(
 				) {
 					continue;
 				}
-				const [head, ...rest] = declarationLines(
-					symbol.name,
-					declaration,
-					false
-				);
-				lines.push({ ...head, text: `unexported ${head.text}` }, ...rest);
+				found.set(symbol, [...(found.get(symbol) ?? []), declaration]);
 				visit(declaration);
 			}
 		}
 		ts.forEachChild(node, visit);
 	};
 	declared.forEach(visit);
-	return lines;
+	return found;
 }
 
 /**
@@ -413,15 +432,23 @@ function unexportedLines(
  * qualified name so a class's members follow it. Within a name they keep
  * declaration order, as overload order changes what a consumer's types see.
  */
-export function apiLines(program: ts.Program, entries: string[]): IApiLine[][] {
+export function apiLines(
+	program: ts.Program,
+	entries: Pick<IEntryPoint, 'specifier' | 'types'>[]
+): IApiLine[][] {
 	const checker = program.getTypeChecker();
 	const exported = new Set<ts.Symbol>();
 	const walked = entries.map((entry) => {
-		const source = program.getSourceFile(entry);
+		const file = path.resolve(ROOT, entry.types);
+		const source = program.getSourceFile(file);
 		const moduleSymbol = source && checker.getSymbolAtLocation(source);
-		if (!moduleSymbol) throw new Error(`${entry} is not an emitted module`);
-		const lines: IApiLine[] = [];
+		if (!moduleSymbol) throw new Error(`${file} is not an emitted module`);
+		// Printed once every entry point's names are known, as a signature can
+		// use a declaration only another entry point exports.
+		const pending: (() => IApiLine[])[] = [];
 		const declared: ts.Node[] = [];
+		// The first in sort order, when one is exported under several names.
+		const names = new Map<ts.Symbol, string>();
 		const walk = (
 			container: ts.Symbol,
 			prefix: string,
@@ -438,6 +465,10 @@ export function apiLines(program: ts.Program, entries: string[]): IApiLine[][] {
 					throw new Error(`${name} does not resolve to a declaration`);
 				}
 				exported.add(target);
+				const known = names.get(target);
+				if (known === undefined || compare(name, known) < 0) {
+					names.set(target, name);
+				}
 				const typeOnly =
 					isTypeOnlyExport(checker, symbol) &&
 					(target.flags & ts.SymbolFlags.Value) !== 0;
@@ -446,16 +477,14 @@ export function apiLines(program: ts.Program, entries: string[]): IApiLine[][] {
 				);
 				for (const node of declarations) {
 					if (!namespaces.includes(node)) {
-						lines.push(...declarationLines(name, node, typeOnly));
+						pending.push(() => declarationLines(name, node, typeOnly));
 						declared.push(node);
 					}
 				}
 				if (!namespaces.length) continue;
-				lines.push({
-					name,
-					text: `${typeOnly ? 'type-only ' : ''}namespace ${name}`,
-					deprecated: namespaces.some(isDeprecated)
-				});
+				const text = `${typeOnly ? 'type-only ' : ''}namespace ${name}`;
+				const deprecated = namespaces.some(isDeprecated);
+				pending.push(() => [{ name, text, deprecated }]);
 				if (open.includes(target)) {
 					throw new Error(`${name} re-exports a namespace that contains it`);
 				}
@@ -463,10 +492,59 @@ export function apiLines(program: ts.Program, entries: string[]): IApiLine[][] {
 			}
 		};
 		walk(moduleSymbol, '', [moduleSymbol]);
-		return { lines, declared };
+		return { file, pending, declared, names };
 	});
-	return walked.map(({ lines, declared }) => {
-		lines.push(...unexportedLines(program, declared, exported));
+	return walked.map(({ file, pending, declared, names }) => {
+		const unexported = unexportedDeclarations(program, declared, exported);
+		const identities = new Map(names);
+		const uses = new Map<string, number>();
+		for (const name of names.values()) uses.set(name, 1);
+		for (const { name } of unexported.keys()) {
+			uses.set(name, (uses.get(name) ?? 0) + 1);
+		}
+		for (const [symbol, [first]] of unexported) {
+			// Named by file as well when another declaration has its name.
+			const from = path
+				.relative(path.dirname(file), first.getSourceFile().fileName)
+				.replace(/\.d\.ts$/, '');
+			identities.set(
+				symbol,
+				uses.get(symbol.name) === 1
+					? symbol.name
+					: `${from.startsWith('.') ? '' : './'}${from}#${symbol.name}`
+			);
+		}
+		identityOf = (node): string | undefined => {
+			if (
+				!ts.isIdentifier(node) &&
+				!ts.isQualifiedName(node) &&
+				!ts.isPropertyAccessExpression(node)
+			) {
+				return undefined;
+			}
+			let symbol = checker.getSymbolAtLocation(node);
+			if (symbol && symbol.flags & ts.SymbolFlags.Alias) {
+				symbol = checker.getAliasedSymbol(symbol);
+			}
+			if (!symbol) return undefined;
+			const own = identities.get(symbol);
+			if (own !== undefined) return own;
+			const i = walked.findIndex((other) => other.names.has(symbol!));
+			return i < 0
+				? undefined
+				: `${entries[i].specifier}#${walked[i].names.get(symbol)}`;
+		};
+		const lines = pending.flatMap((render) => render());
+		for (const [symbol, declarations] of unexported) {
+			for (const declaration of declarations) {
+				const [head, ...rest] = declarationLines(
+					identities.get(symbol)!,
+					declaration,
+					false
+				);
+				lines.push({ ...head, text: `unexported ${head.text}` }, ...rest);
+			}
+		}
 		lines.sort((a, b) => compare(a.name, b.name));
 		return lines.filter(
 			(line, i) => i === 0 || line.text !== lines[i - 1].text
@@ -488,10 +566,7 @@ export function renderSnapshots(): Map<string, string> {
 	);
 	const snapshots = new Map<string, string>();
 	const deprecated: string[] = [];
-	const perEntry = apiLines(
-		program,
-		entries.map((entry) => path.join(ROOT, entry.types))
-	);
+	const perEntry = apiLines(program, entries);
 	for (const [i, entry] of entries.entries()) {
 		const lines = perEntry[i];
 		snapshots.set(

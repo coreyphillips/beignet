@@ -85,7 +85,7 @@ describe('API snapshot lines (issue #1713)', () => {
 			[entry],
 			{ types: [] }
 		);
-		return apiLines(program, [entry])[0];
+		return apiLines(program, [{ specifier: 'fixture', types: entry }])[0];
 	}
 
 	const texts = (files: Record<string, string>): string[] =>
@@ -110,6 +110,8 @@ describe('API snapshot lines (issue #1713)', () => {
 					'    get(key: string): T | undefined;',
 					'}',
 					"export declare function open(path: string, mode?: 'r' | 'w'): Promise<void>;",
+					'declare const brand: unique symbol;',
+					'export type Verified = string[] & { readonly [brand]: true };',
 					'export {};'
 				].join('\n')
 			})
@@ -124,7 +126,55 @@ describe('API snapshot lines (issue #1713)', () => {
 			'protected method Store.guard(): void',
 			'static method Store.open(path: string): Store<string>',
 			'readonly property Store.size: number',
+			'type Verified = string[] & { readonly [brand]: true; }',
+			'unexported const brand: unique symbol',
 			"function open(path: string, mode?: 'r' | 'w'): Promise<void>"
+		]);
+	});
+
+	it('prints a reference as its export name, or with its file when an unexported declaration shares that name', () => {
+		expect(
+			texts({
+				'index.d.ts': [
+					"export * as invoice from './invoice';",
+					"export * as offer from './offer';",
+					"export * from './entry';",
+					"export * from './store';"
+				].join('\n'),
+				'invoice.d.ts': 'export interface Fallback {\n    hash: Uint8Array;\n}',
+				'offer.d.ts': [
+					'export interface Fallback {',
+					'    program: Uint8Array;',
+					'}',
+					'export interface Invoice {',
+					'    mine: Fallback;',
+					'    theirs: import("./invoice").Fallback;',
+					'}'
+				].join('\n'),
+				'entry.d.ts': 'export interface Entry {\n    id: string;\n}',
+				'store.d.ts': [
+					'interface Entry {',
+					'    key: string;',
+					'}',
+					'export declare function list(): Entry[];',
+					'export {};'
+				].join('\n')
+			})
+		).to.deep.equal([
+			'unexported interface ./store#Entry',
+			'property ./store#Entry.key: string',
+			'interface Entry',
+			'property Entry.id: string',
+			'namespace invoice',
+			'interface invoice.Fallback',
+			'property invoice.Fallback.hash: Uint8Array',
+			'function list(): ./store#Entry[]',
+			'namespace offer',
+			'interface offer.Fallback',
+			'property offer.Fallback.program: Uint8Array',
+			'interface offer.Invoice',
+			'property offer.Invoice.mine: offer.Fallback',
+			'property offer.Invoice.theirs: invoice.Fallback'
 		]);
 	});
 
