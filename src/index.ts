@@ -10,3 +10,11 @@ export * from './utils';
 export * from './electrum';
 export * from './transaction';
 export * from './utils/result';
+export {
+	selfTestCryptoProvider,
+	setCryptoProvider
+} from './lightning/crypto/provider';
+export type {
+	CryptoPrimitive,
+	ICryptoProvider
+} from './lightning/crypto/provider';

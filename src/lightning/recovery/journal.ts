@@ -24,7 +24,7 @@
  * originals, which is what makes the rebuilt tables byte-identical.
  */
 
-import { createCipheriv, createDecipheriv } from 'crypto';
+import { aes256GcmDecrypt, aes256GcmEncrypt } from '../crypto/provider';
 import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
 import { deriveFrameIv } from './guardian-wire';
 import { hkdfKey } from '../storage/encryption';
@@ -565,10 +565,12 @@ export function encryptFrame(
 	if (iv.length !== IV_LENGTH) {
 		throw new Error(`Frame IV must be ${IV_LENGTH} bytes, got ${iv.length}`);
 	}
-	const cipher = createCipheriv('aes-256-gcm', frameKey, iv);
-	cipher.setAAD(aad);
-	const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-	return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]);
+	const sealed = aes256GcmEncrypt(frameKey, iv, plaintext, aad);
+	return Buffer.concat([
+		iv,
+		sealed.subarray(sealed.length - TAG_LENGTH),
+		sealed.subarray(0, sealed.length - TAG_LENGTH)
+	]);
 }
 
 export function decryptFrame(
@@ -582,10 +584,7 @@ export function decryptFrame(
 	const iv = payload.subarray(0, IV_LENGTH);
 	const tag = payload.subarray(IV_LENGTH, IV_LENGTH + TAG_LENGTH);
 	const ciphertext = payload.subarray(IV_LENGTH + TAG_LENGTH);
-	const decipher = createDecipheriv('aes-256-gcm', frameKey, iv);
-	decipher.setAAD(aad);
-	decipher.setAuthTag(tag);
-	return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+	return aes256GcmDecrypt(frameKey, iv, Buffer.concat([ciphertext, tag]), aad);
 }
 
 /**

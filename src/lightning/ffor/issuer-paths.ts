@@ -5,7 +5,7 @@
  * bound on an invoice's expiry (section 7.5.6).
  */
 
-import crypto from 'crypto';
+import { randomBytes } from '../crypto/provider';
 import type {
 	IBlindedHopData,
 	IBlindedPaymentPath
@@ -80,7 +80,7 @@ export function buildIssuerPaymentPath(
 	}));
 	hopData.push({ paymentConstraints: { maxCltvExpiry, htlcMinimumMsat: 0n } });
 	const path = constructBlindedPath(
-		crypto.randomBytes(32),
+		randomBytes(32),
 		hops.map((h) => h.nodeId),
 		hopData
 	);

@@ -19,7 +19,7 @@ import {
 } from '../ffor/voucher-archive';
 import type Database from 'better-sqlite3';
 import { loadBetterSqlite3 } from './sqlite-binding';
-import { createHmac } from 'crypto';
+import { hmacSha256 } from '../crypto/provider';
 import * as fs from 'fs';
 import type {
 	IStorageBackend,
@@ -647,9 +647,11 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	private _metadataTag(key: string, value?: string): string {
-		return createHmac('sha256', this.metadataTagKey)
-			.update(JSON.stringify(value === undefined ? [key] : [key, value]))
-			.digest('hex')
+		return hmacSha256(
+			this.metadataTagKey,
+			Buffer.from(JSON.stringify(value === undefined ? [key] : [key, value]))
+		)
+			.toString('hex')
 			.slice(0, METADATA_TAG_HEX);
 	}
 

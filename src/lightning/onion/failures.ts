@@ -15,7 +15,7 @@
  * Then XOR with generateCipherStream(ammag, 292).
  */
 
-import crypto from 'crypto';
+import { hmacSha256 } from '../crypto/provider';
 import type { IOnionFailure } from './types';
 import {
 	INVALID_ONION_VERSION,
@@ -82,7 +82,7 @@ export function createFailureMessage(
 	// The HMAC covers everything after itself:
 	// failure_len || failuremsg || pad_len || pad (spec plaintext).
 	const plaintext = encodeFailurePayload(failureCode, failureData);
-	const hmac = crypto.createHmac('sha256', keys.um).update(plaintext).digest();
+	const hmac = hmacSha256(keys.um, plaintext);
 
 	const inner = Buffer.concat([hmac, plaintext]);
 
@@ -136,10 +136,7 @@ export function decryptFailureMessage(
 		// Check HMAC
 		const hmac = decrypted.subarray(0, 32);
 		const lenAndPad = decrypted.subarray(32);
-		const expectedHmac = crypto
-			.createHmac('sha256', keys.um)
-			.update(lenAndPad)
-			.digest();
+		const expectedHmac = hmacSha256(keys.um, lenAndPad);
 
 		if (hmac.equals(expectedHmac)) {
 			// Valid! Decode failure

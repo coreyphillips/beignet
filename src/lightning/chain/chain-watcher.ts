@@ -7,7 +7,7 @@
  */
 
 import { EventEmitter } from 'events';
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
 import type { Channel } from '../channel/channel';
@@ -399,7 +399,7 @@ const DEFAULT_MISSING_DEBOUNCE_MS = 30_000;
  * SHA256(scriptPubkey) with bytes reversed (little-endian hex).
  */
 export function computeScriptHash(scriptPubkey: Buffer): string {
-	const hash = crypto.createHash('sha256').update(scriptPubkey).digest();
+	const hash = sha256(scriptPubkey);
 	return Buffer.from(hash).reverse().toString('hex');
 }
 

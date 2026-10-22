@@ -6,7 +6,7 @@
  * - Delivery: decrypted payload for the final destination
  */
 
-import crypto from 'crypto';
+import { hmacSha256 } from '../crypto/provider';
 import { ecdh, pointMultiply } from '../crypto/ecdh';
 import { ONION_VERSION } from '../onion/types';
 import {
@@ -71,10 +71,7 @@ export function processOnionMessage(
 	for (const candidate of candidateKeys) {
 		const ss = ecdh(candidate, packet.ephemeralKey);
 		const k = deriveHopKeys(ss);
-		const expectedHmac = crypto
-			.createHmac('sha256', k.mu)
-			.update(packet.routingInfo)
-			.digest();
+		const expectedHmac = hmacSha256(k.mu, packet.routingInfo);
 		if (packet.hmac.equals(expectedHmac)) {
 			sharedSecret = ss;
 			keys = k;

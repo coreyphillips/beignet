@@ -4,7 +4,8 @@
  * A React Native host that injects only net and tls has no Node 'crypto', so a
  * module-scope import of it anywhere on the `beignet` load path breaks wallets
  * that never use the one feature needing it. Storage encryption is the only
- * root export that does, so it loads crypto on first use.
+ * root export that does: it asks the crypto provider, whose Node default loads
+ * crypto on first use, and a host can install its own instead (issue #1696).
  */
 
 import { expect } from 'chai';
@@ -20,6 +21,9 @@ const repoRoot = path.resolve(__dirname, '..', '..');
 // require it, and their package.json `browser` field swaps those out on React
 // Native, so refusing them here would fail on something the host never loads.
 const CHILD = `
+// Built before the refusal below, the way a host builds its own provider.
+const { createCountingCryptoProvider } = require('./tests/lightning/helpers/counting-crypto-provider');
+const hostProvider = createCountingCryptoProvider().provider;
 const Module = require('module');
 const path = require('path');
 const load = Module._load;
@@ -34,25 +38,42 @@ Module._load = function (request, parent) {
 	return load.apply(this, arguments);
 };
 const report = { refused };
-try {
-	const beignet = require('./src');
-	report.loaded = typeof beignet.Wallet === 'function';
+(async () => {
 	try {
-		beignet.createEncryptedStorage({}, Buffer.alloc(64));
+		const beignet = require('./src');
+		report.loaded = typeof beignet.Wallet === 'function';
+		try {
+			beignet.createEncryptedStorage({}, Buffer.alloc(64));
+		} catch (e) {
+			report.encryptionError = e.message;
+		}
+		beignet.setCryptoProvider(hostProvider);
+		const rows = new Map();
+		const storage = beignet.createEncryptedStorage(
+			{
+				getData: async (key) => beignet.ok(rows.get(key)),
+				setData: async (key, value) => {
+					rows.set(key, value);
+					return beignet.ok(true);
+				}
+			},
+			Buffer.alloc(64)
+		);
+		await storage.setData('wallet', { balance: 1 });
+		report.sealed = String(rows.get('wallet')).startsWith('encw1:');
+		report.opened = (await storage.getData('wallet')).value;
 	} catch (e) {
-		report.encryptionError = e.message;
+		report.loadError = e.message;
 	}
-} catch (e) {
-	report.loadError = e.message;
-}
-process.stdout.write(JSON.stringify(report));
+	process.stdout.write(JSON.stringify(report));
+})();
 `;
 
 describe('beignet root entry', function () {
 	// ts-node compiles the whole root load path in the child.
 	this.timeout(120_000);
 
-	it('loads with Node crypto unavailable, and encryption asks for it on first use (issue #1686)', async () => {
+	it('loads with Node crypto unavailable, and encryption asks for it on first use or takes a host provider (issues #1686, #1696)', async () => {
 		const { stdout } = await run(
 			process.execPath,
 			['-r', 'ts-node/register', '-e', CHILD],
@@ -64,9 +85,14 @@ describe('beignet root entry', function () {
 		);
 		expect(report.loaded).to.equal(true);
 		// Proves the stub is live: the lazy require hits it once encryption runs.
-		expect(report.encryptionError).to.equal('crypto is unavailable');
+		expect(report.encryptionError).to.include('crypto is unavailable');
+		expect(report.encryptionError).to.include('setCryptoProvider');
 		expect(report.refused).to.deep.equal([
-			path.join('src', 'lightning', 'storage', 'encryption.ts')
+			path.join('src', 'lightning', 'crypto', 'provider.ts')
 		]);
+		// With a host provider installed, encryption runs and nothing in
+		// beignet asks for Node crypto again (issue #1696).
+		expect(report.sealed).to.equal(true);
+		expect(report.opened).to.deep.equal({ balance: 1 });
 	});
 });

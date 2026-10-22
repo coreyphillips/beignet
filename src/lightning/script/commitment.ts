@@ -8,7 +8,7 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import {
 	buildAnchorOutput,
 	buildToRemoteAnchorOutput,
@@ -36,11 +36,9 @@ export function calculateObscuredCommitmentNumber(
 	acceptPaymentBasepoint: Buffer,
 	commitmentNumber: bigint
 ): bigint {
-	const hash = crypto
-		.createHash('sha256')
-		.update(openPaymentBasepoint)
-		.update(acceptPaymentBasepoint)
-		.digest();
+	const hash = sha256(
+		Buffer.concat([openPaymentBasepoint, acceptPaymentBasepoint])
+	);
 
 	// Take last 6 bytes as mask
 	let mask = 0n;

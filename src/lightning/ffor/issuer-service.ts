@@ -10,7 +10,7 @@
  * exist, not whether issuance has ended.
  */
 
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import { getPublicKey } from '../crypto/ecdh';
 import { deriveBlindedPrivkey } from '../onion/blinded-path';
 import { decodeOfferTlv, getTlvRecords } from '../offer/tlv';
@@ -346,10 +346,9 @@ export class FforIssuerService {
 		if (requested === undefined || requested <= 0n) return refusal;
 		if (!ctx.blindingPoint) return refusal; // not over a signed path
 		const payerIdHex = ctx.request.payerKey.toString('hex');
-		const metadataHashHex = crypto
-			.createHash('sha256')
-			.update(ctx.request.metadata ?? Buffer.alloc(0))
-			.digest('hex');
+		const metadataHashHex = sha256(
+			ctx.request.metadata ?? Buffer.alloc(0)
+		).toString('hex');
 		// Identical metadata from the same payer: the same invoice, byte for
 		// byte, or the same slot again when the crash came before the store.
 		let slot = this.deps.ledger.issuedFor(

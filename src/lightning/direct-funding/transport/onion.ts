@@ -39,7 +39,7 @@
  * in config with a stated reason.
  */
 
-import crypto from 'crypto';
+import { randomBytes } from '../../crypto/provider';
 import type { OnionMessageManager } from '../../onion-message/manager';
 import type { IBlindedPath } from '../../onion/blinded-path';
 import { constructBlindedPath } from '../../onion/blinded-path';
@@ -117,7 +117,7 @@ export function mintDfBlindedPath(
 	pathId: Buffer
 ): IBlindedPath {
 	return constructBlindedPath(
-		crypto.randomBytes(32),
+		randomBytes(32),
 		[viaNodeId, selfNodeId],
 		[{ nextNodeId: selfNodeId }, { pathId }]
 	);
@@ -198,7 +198,7 @@ export class DfOnionLaneFactory implements IDfLaneFactory {
 		}
 		// Minted per lane, never derived from anything the receiver holds: this
 		// is the id the RECEIVER's answers come back on, and it is ours alone.
-		const localPathId = crypto.randomBytes(DF_PATH_SECRET_BYTES);
+		const localPathId = randomBytes(DF_PATH_SECRET_BYTES);
 		let replyPath: IBlindedPath;
 		try {
 			replyPath = mintDfBlindedPath(

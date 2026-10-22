@@ -46,7 +46,7 @@
  * generation is live.
  */
 
-import { createHash } from 'crypto';
+import { sha256 } from '../crypto/provider';
 import type { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
 import { withStorageTransaction } from '../storage/transaction';
 import type { GuardianState } from './guardian-wire';
@@ -1480,10 +1480,7 @@ export class RestoreDriver {
 				!record ||
 				record.epoch !== head.recordEpoch ||
 				!record.frameHash.equals(head.frameHash) ||
-				!createHash('sha256')
-					.update(record.ciphertext)
-					.digest()
-					.equals(head.ciphertextHash)
+				!sha256(record.ciphertext).equals(head.ciphertextHash)
 			) {
 				throw new RestoreRefusedError(
 					'conflict',

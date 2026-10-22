@@ -8,7 +8,7 @@
  * later milestone). This module is pure: fee math + signature auth only.
  */
 
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import { sign, verify } from '../crypto/ecdh';
 import type { ILeaseRates } from '../gossip/types';
 
@@ -101,10 +101,7 @@ function leaseSigHash(
 	blockheight: number,
 	rates: ILeaseRates
 ): Buffer {
-	return crypto
-		.createHash('sha256')
-		.update(leaseWitnessData(sellerFundingPubkey, blockheight, rates))
-		.digest();
+	return sha256(leaseWitnessData(sellerFundingPubkey, blockheight, rates));
 }
 
 /** Seller: sign a will_fund commitment with the node key that advertised the rates. */

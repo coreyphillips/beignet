@@ -9,7 +9,7 @@
  * associated data. ciphertext = [33: e_pub] || aead_output.
  */
 
-import crypto from 'crypto';
+import { randomBytes } from '../crypto/provider';
 import { ecdh, getPublicKey } from '../crypto/ecdh';
 import { hkdf } from '../crypto/hkdf';
 import { decrypt, encrypt } from '../crypto/chacha20poly1305';
@@ -32,7 +32,7 @@ export function sealRecordBody(
 	headerBytes: Buffer,
 	body: Buffer
 ): Buffer {
-	const e = crypto.randomBytes(32);
+	const e = randomBytes(32);
 	const ePub = getPublicKey(e);
 	const key = keyFor(ecdh(e, encPubkey));
 	return Buffer.concat([ePub, encrypt(key, NONCE, body, headerBytes)]);

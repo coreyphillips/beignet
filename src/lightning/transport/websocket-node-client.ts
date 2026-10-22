@@ -17,7 +17,7 @@
 
 import net from 'net';
 import tls from 'tls';
-import crypto from 'crypto';
+import { randomBytes } from '../crypto/provider';
 import type { IWebSocketLike } from './websocket';
 import { parseWebSocketUrl } from './websocket';
 import { computeWebSocketAccept } from './websocket-server';
@@ -73,7 +73,7 @@ export class NodeWebSocket implements IWebSocketLike {
 
 	constructor(url: string) {
 		const { host, port, secure } = parseWebSocketUrl(url);
-		const key = crypto.randomBytes(16).toString('base64');
+		const key = randomBytes(16).toString('base64');
 		const parsedPath = ((): string => {
 			try {
 				const u = new URL(url);
@@ -143,7 +143,7 @@ export class NodeWebSocket implements IWebSocketLike {
 			encodeWsFrame({
 				opcode: WsOpcode.BINARY,
 				payload,
-				maskKey: crypto.randomBytes(4) // client frames MUST be masked
+				maskKey: randomBytes(4) // client frames MUST be masked
 			})
 		);
 	}
@@ -275,7 +275,7 @@ export class NodeWebSocket implements IWebSocketLike {
 						encodeWsFrame({
 							opcode: WsOpcode.PONG,
 							payload: frame.payload,
-							maskKey: crypto.randomBytes(4)
+							maskKey: randomBytes(4)
 						})
 					);
 				}
@@ -345,7 +345,7 @@ export class NodeWebSocket implements IWebSocketLike {
 				encodeWsFrame({
 					opcode: WsOpcode.CLOSE,
 					payload: encodeWsClosePayload(code, reason),
-					maskKey: crypto.randomBytes(4)
+					maskKey: randomBytes(4)
 				})
 			);
 		} catch {

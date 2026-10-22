@@ -10,7 +10,7 @@
  * during construction) rather than being zero-padded.
  */
 
-import crypto from 'crypto';
+import { hmacSha256 } from '../crypto/provider';
 import { ecdh, isValidPublicKey, pointMultiply } from '../crypto/ecdh';
 import { encodeBigSize } from '../message/codec';
 import type { IOnionPacket, IProcessedOnion } from './types';
@@ -85,13 +85,12 @@ export function processOnionPacket(
 	const keys = deriveHopKeys(sharedSecret);
 
 	// Verify HMAC on the encrypted routing info (BOLT 4: HMAC(mu, routing_info || associated_data))
-	const hmacCalc = crypto
-		.createHmac('sha256', keys.mu)
-		.update(packet.routingInfo);
-	if (associatedData) {
-		hmacCalc.update(associatedData);
-	}
-	const expectedHmac = hmacCalc.digest();
+	const expectedHmac = hmacSha256(
+		keys.mu,
+		associatedData
+			? Buffer.concat([packet.routingInfo, associatedData])
+			: packet.routingInfo
+	);
 
 	if (!packet.hmac.equals(expectedHmac)) {
 		throw new OnionProcessingError(

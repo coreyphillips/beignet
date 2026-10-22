@@ -21,7 +21,7 @@
  * never an input to authorization.
  */
 
-import crypto from 'crypto';
+import { randomBytes } from '../crypto/provider';
 import { EventEmitter } from 'events';
 import type { OnionMessageManager } from '../onion-message/manager';
 import type { IHeldForwardNotice, IHeldForwardNoticeEntry } from './types';
@@ -557,7 +557,7 @@ export class AsyncPaymentManager extends EventEmitter {
 				expiresAt: BigInt(
 					nowSec + (options?.ttlSec ?? DEFAULT_CAPABILITY_TTL_SEC)
 				),
-				nonce: crypto.randomBytes(32),
+				nonce: randomBytes(32),
 				holdIds
 			},
 			this.deps.nodePrivkey

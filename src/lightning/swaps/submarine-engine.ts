@@ -43,7 +43,7 @@
  */
 
 import { TypedEmitter } from '../../utils/typed-emitter';
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import type * as bitcoin from 'bitcoinjs-lib';
 import { getPublicKey } from '../crypto/ecdh';
 import { decode as decodeInvoice } from '../invoice/decode';
@@ -1742,13 +1742,7 @@ export class SubmarineSwapProvider extends TypedEmitter<SubmarineSwapEvents> {
 		let current: ISwapRecord | undefined = this.deps.ledger.get(record.id);
 		if (!current) return undefined;
 		if (view.preimage) {
-			if (
-				!crypto
-					.createHash('sha256')
-					.update(view.preimage)
-					.digest()
-					.equals(paymentHash)
-			) {
+			if (!sha256(view.preimage).equals(paymentHash)) {
 				this.deps.log('swap_preimage_hash_mismatch', {
 					swapId: current.id,
 					trigger

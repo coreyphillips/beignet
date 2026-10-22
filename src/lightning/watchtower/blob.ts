@@ -17,7 +17,7 @@
  * Both share the same envelope: 24-byte XNonce || ciphertext || 16-byte MAC.
  */
 
-import { createHash, randomBytes } from 'crypto';
+import { randomBytes, sha256 } from '../crypto/provider';
 import {
 	encrypt as xEncrypt,
 	decrypt as xDecrypt
@@ -61,10 +61,7 @@ export function breachHintFromTxid(txidInternal: Buffer): Buffer {
 	if (txidInternal.length !== 32) {
 		throw new Error('breach hint: txid must be 32 bytes');
 	}
-	return createHash('sha256')
-		.update(txidInternal)
-		.digest()
-		.subarray(0, BREACH_HINT_SIZE);
+	return sha256(txidInternal).subarray(0, BREACH_HINT_SIZE);
 }
 
 /** Breach key = SHA256(txid || txid), used to encrypt/decrypt the blob. */
@@ -72,10 +69,7 @@ export function breachKeyFromTxid(txidInternal: Buffer): Buffer {
 	if (txidInternal.length !== 32) {
 		throw new Error('breach key: txid must be 32 bytes');
 	}
-	return createHash('sha256')
-		.update(txidInternal)
-		.update(txidInternal)
-		.digest();
+	return sha256(Buffer.concat([txidInternal, txidInternal]));
 }
 
 /** Version-0 justice kit fields (watchtower/blob/justice_kit_packet.go). */

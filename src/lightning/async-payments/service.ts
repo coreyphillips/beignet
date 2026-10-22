@@ -54,7 +54,7 @@
  */
 
 import { EventEmitter } from 'events';
-import crypto from 'crypto';
+import { randomBytes } from '../crypto/provider';
 import type {
 	IDurableLedgerStore,
 	ILedgerCodec,
@@ -412,7 +412,7 @@ export class AsyncReceiveService extends EventEmitter {
 				chainHash: this.deps.chainHash,
 				receiverNodeId: req.receiverNodeId,
 				lspNodeId: this.deps.nodeId,
-				registrationId: crypto.randomBytes(32),
+				registrationId: randomBytes(32),
 				scid: req.scid,
 				maxPartMsat: L.maxPartMsat,
 				maxPaymentMsat: L.maxPaymentMsat,

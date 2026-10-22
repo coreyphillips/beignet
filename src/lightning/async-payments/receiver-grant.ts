@@ -79,7 +79,7 @@
  * followed by the request nonce and a UTF-8 reason).
  */
 
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import { sign, verify } from '../crypto/ecdh';
 
 export const RECEIVER_GRANT_VERSION = 1;
@@ -173,13 +173,8 @@ export type IRegistrationReply =
 
 /** BIP340-style tagged hash. */
 function taggedHash(tag: string, data: Buffer): Buffer {
-	const tagHash = crypto.createHash('sha256').update(tag).digest();
-	return crypto
-		.createHash('sha256')
-		.update(tagHash)
-		.update(tagHash)
-		.update(data)
-		.digest();
+	const tagHash = sha256(Buffer.from(tag));
+	return sha256(Buffer.concat([tagHash, tagHash, data]));
 }
 
 function expectLen(buf: Buffer, len: number, what: string): void {

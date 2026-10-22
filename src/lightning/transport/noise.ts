@@ -12,7 +12,7 @@
  *   Act 3: Initiator → Responder (66 bytes)
  */
 
-import crypto from 'crypto';
+import { randomBytes, sha256 } from '../crypto/provider';
 import { ecdh, getPublicKey, isValidPublicKey } from '../crypto/ecdh';
 import { hkdf2 } from '../crypto/hkdf';
 import { encrypt, decrypt } from '../crypto/chacha20poly1305';
@@ -24,10 +24,6 @@ const ACT_ONE_LENGTH = 50;
 const ACT_TWO_LENGTH = 50;
 const ACT_THREE_LENGTH = 66;
 const VERSION = 0x00;
-
-function sha256(data: Buffer): Buffer {
-	return crypto.createHash('sha256').update(data).digest();
-}
 
 /**
  * Internal handshake state that is updated through each act.
@@ -94,7 +90,7 @@ function generateEphemeral(privOverride?: Buffer): {
 	priv: Buffer;
 	pub: Buffer;
 } {
-	const priv = privOverride || crypto.randomBytes(32);
+	const priv = privOverride || randomBytes(32);
 	const pub = getPublicKey(priv);
 	return { priv, pub };
 }

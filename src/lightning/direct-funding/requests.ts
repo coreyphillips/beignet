@@ -17,7 +17,7 @@
  * The file path was never a consumer contract; nothing reads it.
  */
 
-import crypto from 'crypto';
+import { randomBytes, sha256 } from '../crypto/provider';
 import type { IDfLaneKeys, IDfWireFrame } from './frames';
 import { mintRequestEncryptionKeys, receiverLaneKeys } from './frames';
 import { getPublicKey } from '../crypto/ecdh';
@@ -209,20 +209,18 @@ export class DirectFundingRequestStore {
 			throw malformed(`amount_sat out of range: ${opts.amountSat}`);
 		}
 		const ttl = Math.min(opts.ttlMs ?? this.ttlMs, DF_MAX_REQUEST_TTL_MS);
-		const preimage = crypto.randomBytes(DF_PREIMAGE_BYTES);
+		const preimage = randomBytes(DF_PREIMAGE_BYTES);
 		const encryption = mintRequestEncryptionKeys();
 		const record: IDfRequestRecord = {
-			requestId: crypto.randomBytes(DF_REQUEST_ID_BYTES).toString('hex'),
-			receiptHash: crypto.createHash('sha256').update(preimage).digest('hex'),
+			requestId: randomBytes(DF_REQUEST_ID_BYTES).toString('hex'),
+			receiptHash: sha256(preimage).toString('hex'),
 			preimageHex: preimage.toString('hex'),
 			encryptionPrivateKeyHex: encryption.privateKey.toString('hex'),
 			// Minted for every request whether or not an onion descriptor ends
 			// up in the envelope: it is the index a blinded-path delivery
 			// resolves on, and it must never be derivable from anything the
 			// payer holds.
-			onionPathSecretHex: crypto
-				.randomBytes(DF_PATH_SECRET_BYTES)
-				.toString('hex'),
+			onionPathSecretHex: randomBytes(DF_PATH_SECRET_BYTES).toString('hex'),
 			expiresAt: this.now() + ttl,
 			...(opts.amountSat !== undefined
 				? { amountSat: opts.amountSat.toString() }

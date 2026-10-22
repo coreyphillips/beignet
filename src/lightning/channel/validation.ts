@@ -2,7 +2,7 @@
  * BOLT 2: Channel parameter validation and channel ID derivation.
  */
 
-import crypto from 'crypto';
+import { randomBytes, sha256 } from '../crypto/provider';
 import type {
 	IOpenChannelMessage,
 	IAcceptChannelMessage
@@ -72,7 +72,7 @@ export function deriveChannelId(
  * Generate a random 32-byte temporary channel ID.
  */
 export function generateTemporaryChannelId(): Buffer {
-	return crypto.randomBytes(32);
+	return randomBytes(32);
 }
 
 /**
@@ -90,10 +90,7 @@ export function deriveV2ChannelId(
 		Buffer.compare(revocationBasepointA, revocationBasepointB) <= 0
 			? [revocationBasepointA, revocationBasepointB]
 			: [revocationBasepointB, revocationBasepointA];
-	return crypto
-		.createHash('sha256')
-		.update(Buffer.concat([lesser, greater]))
-		.digest();
+	return sha256(Buffer.concat([lesser, greater]));
 }
 
 /**

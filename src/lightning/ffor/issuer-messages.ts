@@ -5,7 +5,7 @@
  * big-endian integers, authorization under the mailbox's fetch_key.
  */
 
-import crypto from 'crypto';
+import { sha256 as sha256Digest } from '../crypto/provider';
 import { sign, verify } from '../crypto/ecdh';
 import { Reader, u16, u32, u64, u8 } from './messages';
 import {
@@ -42,11 +42,11 @@ export interface IFforIssuerManifest {
 }
 
 function sha256(...parts: (Buffer | string)[]): Buffer {
-	const h = crypto.createHash('sha256');
-	for (const p of parts) {
-		h.update(typeof p === 'string' ? Buffer.from(p, 'ascii') : p);
-	}
-	return h.digest();
+	return sha256Digest(
+		Buffer.concat(
+			parts.map((p) => (typeof p === 'string' ? Buffer.from(p, 'ascii') : p))
+		)
+	);
 }
 
 function needId(b: Buffer): void {

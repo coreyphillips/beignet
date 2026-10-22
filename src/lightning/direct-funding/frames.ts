@@ -27,7 +27,7 @@
  *    funding attestation; the per-request key does all sealing.
  */
 
-import crypto from 'crypto';
+import { randomBytes } from '../crypto/provider';
 import { decrypt, encrypt } from '../crypto/chacha20poly1305';
 import { ecdh, getPublicKey, isValidPrivateKey } from '../crypto/ecdh';
 import { hkdf } from '../crypto/hkdf';
@@ -84,7 +84,7 @@ export interface IDfRequestEncryptionKeys {
 function randomPrivateKey(): Buffer {
 	let key: Buffer;
 	do {
-		key = crypto.randomBytes(32);
+		key = randomBytes(32);
 	} while (!isValidPrivateKey(key));
 	return key;
 }
@@ -182,7 +182,7 @@ export function sealFrame(
 	plaintext: Buffer
 ): IDfSealedFrame {
 	const aad = frameAad(requestId, subtype);
-	const nonce = crypto.randomBytes(DF_FRAME_NONCE_BYTES);
+	const nonce = randomBytes(DF_FRAME_NONCE_BYTES);
 	return { nonce, ciphertext: encrypt(key, nonce, plaintext, aad) };
 }
 

@@ -7,13 +7,11 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 
 bitcoin.initEccLib(ecc);
 
-function ripemd160(data: Buffer): Buffer {
-	return crypto.createHash('ripemd160').update(data).digest();
-}
+const { ripemd160 } = bitcoin.crypto;
 
 /**
  * Build the offered HTLC script (we offered, remote can claim with preimage).
@@ -45,9 +43,7 @@ export function buildOfferedHtlcScript(
 		throw new Error(`Payment hash must be 32 bytes, got ${paymentHash.length}`);
 	}
 
-	const revocationHash = ripemd160(
-		crypto.createHash('sha256').update(revocationPubkey).digest()
-	);
+	const revocationHash = ripemd160(sha256(revocationPubkey));
 	const ripemdPaymentHash = ripemd160(paymentHash);
 
 	return bitcoin.script.compile([
@@ -120,9 +116,7 @@ export function buildReceivedHtlcScript(
 		throw new Error(`Payment hash must be 32 bytes, got ${paymentHash.length}`);
 	}
 
-	const revocationHash = ripemd160(
-		crypto.createHash('sha256').update(revocationPubkey).digest()
-	);
+	const revocationHash = ripemd160(sha256(revocationPubkey));
 	const ripemdPaymentHash = ripemd160(paymentHash);
 
 	return bitcoin.script.compile([

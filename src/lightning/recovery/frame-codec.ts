@@ -16,7 +16,7 @@
 
 import type { IFforVoucherArchive } from '../ffor/voucher-archive';
 import { validateFforVoucherArchive } from '../ffor/voucher-archive';
-import { createHash } from 'crypto';
+import { sha256 } from '../crypto/provider';
 import type {
 	ISerializedChannelState,
 	ISerializedPaymentInfo
@@ -705,5 +705,5 @@ export function decodeFrame(plaintext: Buffer): RecoveryFrame {
 
 /** SHA-256 over the plaintext frame bytes: the hash the chain links. */
 export function hashFrame(plaintext: Buffer): Buffer {
-	return createHash('sha256').update(plaintext).digest();
+	return sha256(plaintext);
 }

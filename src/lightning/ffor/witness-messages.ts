@@ -5,7 +5,7 @@
  * its response.
  */
 
-import crypto from 'crypto';
+import { sha256 as sha256Digest } from '../crypto/provider';
 import { sign, verify } from '../crypto/ecdh';
 import type { IFforBookEntry } from './types';
 import { Reader, splitFixed, u16, u32, u64, u8 } from './messages';
@@ -37,10 +37,11 @@ import {
 } from './witness-types';
 
 function sha256(...parts: (Buffer | string)[]): Buffer {
-	const h = crypto.createHash('sha256');
-	for (const p of parts)
-		h.update(typeof p === 'string' ? Buffer.from(p, 'ascii') : p);
-	return h.digest();
+	return sha256Digest(
+		Buffer.concat(
+			parts.map((p) => (typeof p === 'string' ? Buffer.from(p, 'ascii') : p))
+		)
+	);
 }
 
 function need32(b: Buffer, name: string): void {
