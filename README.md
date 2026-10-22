@@ -146,7 +146,7 @@ A few calls do not return a `Result`, so check them differently:
 
 Balances, UTXO values and send amounts are satoshis, and fee rates are sat/vB: every `satsPerByte` option and field is sat/vB despite its name. Stored transactions (`wallet.transactions`) carry their amounts in satoshis as `valueSats`, `feeSats`, `totalInputSats`, `matchedInputSats`, `totalOutputSats` and `matchedOutputSats`. Their older BTC twins (`value`, `fee`, `totalInputValue` and the rest) are deprecated and go in the next major release. `btcToSats`, `satsToMsat` and `msatToSatsFloor` convert between units.
 
-Options worth knowing on `Wallet.create`: `network` (`EAvailableNetworks.mainnet` | `testnet` | `regtest` | `signet`), `addressType` (`EAddressType.p2wpkh` default, `p2sh` for P2SH-wrapped segwit, `p2pkh`, `p2tr`), `passphrase`, `account`, `storage`, `logger`, `onMessage`, `coinSelectPreference`, `feeEstimationSource`, `gapLimitOptions`.
+Options worth knowing on `Wallet.create`: `network` (`Network.bitcoin` | `testnet` | `regtest` | `signet`), `addressType` (`EAddressType.p2wpkh` default, `p2sh` for P2SH-wrapped segwit, `p2pkh`, `p2tr`), `passphrase`, `account`, `storage`, `logger`, `onMessage`, `coinSelectPreference`, `feeEstimationSource`, `gapLimitOptions`.
 
 <details>
 <summary><b>Fees, sweeping, boosting, coin control, events and shutdown</b></summary>
@@ -181,11 +181,11 @@ await wallet.stop();
 <summary><b>Custom Electrum servers, failover, fee sources, BIP21</b></summary>
 
 ```typescript
-import { EAvailableNetworks, EProtocol, Wallet } from 'beignet';
+import { EProtocol, Network, Wallet } from 'beignet';
 
 const res = await Wallet.create({
   mnemonic,
-  network: EAvailableNetworks.mainnet,
+  network: Network.bitcoin,
   feeEstimationSource: 'electrum', // 'electrum' | 'http' | 'auto' (default)
   electrumOptions: {
     net,
@@ -214,7 +214,7 @@ Built from an account-level extended public key instead of a mnemonic. The key i
 ```typescript
 const res = await Wallet.createWatchOnly({
   xpub: 'zpub6r...',
-  network: EAvailableNetworks.mainnet,
+  network: Network.bitcoin,
   electrumOptions: { net, tls }
 });
 if (res.isErr()) return;
@@ -281,7 +281,7 @@ const a = await Wallet.createMultisig({
   threshold: 2,
   mnemonic: mnemonicA,       // we are one cosigner; our xpub is added automatically
   cosigners: [xpubB, xpubC],
-  network: EAvailableNetworks.mainnet,
+  network: Network.bitcoin,
   electrumOptions: { net, tls }
 });
 const b = await Wallet.createMultisig({ threshold: 2, mnemonic: mnemonicB, cosigners: [xpubA, xpubC], /* ... */ });

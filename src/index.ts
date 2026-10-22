@@ -4,6 +4,7 @@
  */
 export * from './logger';
 export * from './wallet/index';
+export * from './network';
 export * from './types';
 export * from './utils';
 export * from './electrum';

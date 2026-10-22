@@ -33,7 +33,8 @@ import { Wallet } from '../wallet';
 import { getDefaultSendTransaction } from '../shapes/wallet';
 import { EAddressType, ISendTransaction } from '../types/wallet';
 import { ILogger, TLogLevel, LOG_LEVEL_PRIORITY } from '../logger';
-import { generateMnemonic, getBitcoinJsNetwork } from '../utils/helpers';
+import { generateMnemonic } from '../utils/helpers';
+import { Network, toBitcoinJsNetwork } from '../network';
 import { btcToSats } from '../utils/conversion';
 import { BoostError } from '../utils/boost';
 import {
@@ -43,7 +44,6 @@ import {
 	txidToDisplayHex
 } from '../utils/identifiers';
 import {
-	EAvailableNetworks,
 	EBoostType,
 	EPaymentType,
 	IFormattedTransaction,
@@ -124,7 +124,7 @@ import {
 } from '../lightning/gossip/types';
 import { ElectrumBackend } from '../lightning/chain/electrum-backend';
 import {
-	Network,
+	Network as LnNetwork,
 	DEFAULT_MIN_FINAL_CLTV_EXPIRY
 } from '../lightning/invoice/types';
 import {
@@ -15494,31 +15494,31 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 	// ─────────────── Internal Helpers ───────────────
 
-	private toBeignetNetwork(network: NetworkName): EAvailableNetworks {
+	private toBeignetNetwork(network: NetworkName): Network {
 		switch (network) {
 			case 'mainnet':
-				return EAvailableNetworks.bitcoin;
+				return Network.bitcoin;
 			case 'testnet':
-				return EAvailableNetworks.testnet;
+				return Network.testnet;
 			case 'regtest':
-				return EAvailableNetworks.regtest;
+				return Network.regtest;
 			case 'signet':
-				return EAvailableNetworks.signet;
+				return Network.signet;
 			default:
 				return unknownNetwork(network);
 		}
 	}
 
-	private toLnNetwork(network: NetworkName): Network {
+	private toLnNetwork(network: NetworkName): LnNetwork {
 		switch (network) {
 			case 'mainnet':
-				return Network.MAINNET;
+				return LnNetwork.MAINNET;
 			case 'testnet':
-				return Network.TESTNET;
+				return LnNetwork.TESTNET;
 			case 'regtest':
-				return Network.REGTEST;
+				return LnNetwork.REGTEST;
 			case 'signet':
-				return Network.SIGNET;
+				return LnNetwork.SIGNET;
 			default:
 				return unknownNetwork(network);
 		}
@@ -15540,8 +15540,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	private getBitcoinNetwork(): unknown {
-		// getBitcoinJsNetwork covers signet, which bitcoinjs-lib's networks
+		// toBitcoinJsNetwork covers signet, which bitcoinjs-lib's networks
 		// object lacks.
-		return getBitcoinJsNetwork(this.toBeignetNetwork(this.networkName));
+		return toBitcoinJsNetwork(this.toBeignetNetwork(this.networkName));
 	}
 }

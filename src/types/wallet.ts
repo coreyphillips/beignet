@@ -13,8 +13,12 @@ import { ECoinSelectPreference, EFeeId, TGapLimitOptions } from './transaction';
 import { ECPairInterface } from 'ecpair';
 import { BIP32Interface } from 'bip32';
 import { ILogger } from '../logger';
+import { Network } from '../network';
 
-export type TAvailableNetworks = 'bitcoin' | 'testnet' | 'regtest' | 'signet';
+/**
+ * @deprecated Use {@link Network}. Removed in the next major release.
+ */
+export type TAvailableNetworks = `${Network}`;
 export type TAddressType = 'p2wpkh' | 'p2sh' | 'p2pkh';
 export type TAddressLabel = 'bech32' | 'segwit' | 'legacy';
 export type TKeyDerivationPurpose = '84' | '49' | '44' | string; //"p2wpkh" | "p2sh" | "p2pkh";
@@ -25,17 +29,38 @@ export type TKeyDerivationIndex = string;
 export type TAddressTypes = {
 	[key in EAddressType]: Readonly<IAddressTypeData>;
 };
-export enum EAvailableNetworks {
-	bitcoin = 'bitcoin',
-	mainnet = 'bitcoin',
-	bitcoinMainnet = 'bitcoin',
-	testnet = 'testnet',
-	bitcoinTestnet = 'testnet',
-	regtest = 'regtest',
-	bitcoinRegtest = 'regtest',
-	signet = 'signet',
-	bitcoinSignet = 'signet'
+// A namespace rather than an object so the alias still behaves like the enum
+// it replaced: its const members widen to Network where an enum member would,
+// and its type members keep `EAvailableNetworks.mainnet` usable as a type.
+/**
+ * @deprecated Use {@link Network}. The extra member names are spellings of
+ * its four values. Removed in the next major release.
+ */
+// eslint-disable-next-line @typescript-eslint/no-namespace
+export namespace EAvailableNetworks {
+	export const bitcoin = Network.bitcoin;
+	export const mainnet = Network.bitcoin;
+	export const bitcoinMainnet = Network.bitcoin;
+	export const testnet = Network.testnet;
+	export const bitcoinTestnet = Network.testnet;
+	export const regtest = Network.regtest;
+	export const bitcoinRegtest = Network.regtest;
+	export const signet = Network.signet;
+	export const bitcoinSignet = Network.signet;
+	export type bitcoin = Network.bitcoin;
+	export type mainnet = Network.bitcoin;
+	export type bitcoinMainnet = Network.bitcoin;
+	export type testnet = Network.testnet;
+	export type bitcoinTestnet = Network.testnet;
+	export type regtest = Network.regtest;
+	export type bitcoinRegtest = Network.regtest;
+	export type signet = Network.signet;
+	export type bitcoinSignet = Network.signet;
 }
+/**
+ * @deprecated Use {@link Network}. Removed in the next major release.
+ */
+export type EAvailableNetworks = Network;
 
 /**
  * Where getFeeEstimates sources its data:
@@ -278,7 +303,7 @@ export interface IWallet {
 	// its PBKDF2 pass. It is not checked against the mnemonic, so it must be
 	// that mnemonic's seed. Ignored without a mnemonic.
 	seed?: Buffer;
-	network?: EAvailableNetworks;
+	network?: Network;
 	addressType?: EAddressType;
 	// BIP32 account index (m/purpose'/coin'/ACCOUNT'/change/index). Defaults
 	// to 0. Non-zero accounts use distinct storage keys so instances over the
@@ -848,7 +873,7 @@ export interface IBtInfo {
 		ln2: string;
 	};
 	onchain: {
-		network: EAvailableNetworks;
+		network: Network;
 		feeRates: {
 			/**
 			 * Fast fee in sat/vbyte.
@@ -895,7 +920,7 @@ export interface IExportedDescriptor {
 
 export interface IExportDescriptorsResponse {
 	fingerprint: string; // Master fingerprint hex (see getMasterFingerprint)
-	network: EAvailableNetworks;
+	network: Network;
 	account: number;
 	// Present when a birthday was recorded; helps a restore bound its scan.
 	birthdayHeight?: number;

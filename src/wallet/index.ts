@@ -1,12 +1,11 @@
 import * as bitcoin from 'bitcoinjs-lib';
-import { Network } from 'bitcoinjs-lib';
+import { Network as BitcoinJsNetwork } from 'bitcoinjs-lib';
 import { BIP32Interface } from 'bip32';
 import { bip32 } from '../utils/ecc-apis';
 import cloneDeep from 'lodash.clonedeep';
 
 import {
 	EAddressType,
-	EAvailableNetworks,
 	EBoostType,
 	ECoinSelectPreference,
 	EFeeId,
@@ -68,7 +67,6 @@ import {
 	TAddressLabels,
 	TAddressScan,
 	TAddressTypeContent,
-	TAvailableNetworks,
 	TFeeEstimationSource,
 	TGapLimitOptions,
 	TGetData,
@@ -86,6 +84,7 @@ import {
 	TUnspentAddressScriptHashData,
 	TWalletDataKeys
 } from '../types';
+import { Network, toBitcoinJsNetwork, toElectrumNetwork } from '../network';
 import {
 	appendDescriptorChecksum,
 	BoostError,
@@ -106,8 +105,6 @@ import {
 	getDefaultWalletData,
 	getDefaultWalletDataKeys,
 	getDustThreshold,
-	getBitcoinJsNetwork,
-	getElectrumNetwork,
 	getHighestUsedIndexFromTxHashes,
 	getKeyDerivationPath,
 	getKeyDerivationPathObject,
@@ -182,7 +179,7 @@ const SATS_FIELDS = [
 ] as const;
 
 export class Wallet {
-	private _network: EAvailableNetworks;
+	private _network: Network;
 	private readonly _mnemonic?: string;
 	private readonly _passphrase: string;
 	private readonly _seed?: Buffer;
@@ -342,7 +339,7 @@ export class Wallet {
 		passphrase,
 		seed,
 		name,
-		network = EAvailableNetworks.mainnet,
+		network = Network.bitcoin,
 		addressType,
 		account = 0,
 		birthdayHeight,
@@ -549,7 +546,7 @@ export class Wallet {
 		return this._refreshFailed;
 	}
 
-	public get network(): EAvailableNetworks {
+	public get network(): Network {
 		return this._network;
 	}
 
@@ -728,7 +725,7 @@ export class Wallet {
 		for (const cosigner of cosigners ?? []) addCosigner(cosigner);
 		if (this._root) {
 			// We are a cosigner: derive our BIP 48 account xpub and include it.
-			const coinType = this._network === EAvailableNetworks.bitcoin ? '0' : '1';
+			const coinType = this._network === Network.bitcoin ? '0' : '1';
 			const ourNode = this._root
 				.derivePath(`m/48'/${coinType}'/${this._account}'/2'`)
 				.neutered();
@@ -798,8 +795,7 @@ export class Wallet {
 			const parsed = parseBip48Path(path);
 			if (parsed.isErr()) return err(parsed.error);
 			const { coinType, account, change, index } = parsed.value;
-			const expectedCoin =
-				this._network === EAvailableNetworks.bitcoin ? '0' : '1';
+			const expectedCoin = this._network === Network.bitcoin ? '0' : '1';
 			if (coinType !== expectedCoin || account !== this._account) {
 				return err(
 					`Path ${path} does not match this wallet (expected m/48'/${expectedCoin}'/${this._account}'/2'/change/index).`
@@ -1008,12 +1004,12 @@ export class Wallet {
 	 * meanwhile runs on the new network once the switch is done (#1636). Like
 	 * the wallet's own send methods, a switch called from inside a withSendLock
 	 * session waits on the lock that session holds and never settles.
-	 * @param {EAvailableNetworks} network
+	 * @param {Network} network
 	 * @param {TServer | TServer[]} [servers]
 	 * @returns {Promise<Result<Wallet>>}
 	 */
 	public async switchNetwork(
-		network: EAvailableNetworks,
+		network: Network,
 		servers?: TServer | TServer[]
 	): Promise<Result<Wallet>> {
 		if (this._multisig) {
@@ -1034,7 +1030,7 @@ export class Wallet {
 	}
 
 	private async switchNetworkLocked(
-		network: EAvailableNetworks,
+		network: Network,
 		servers?: TServer | TServer[]
 	): Promise<Result<Wallet>> {
 		this.isSwitchingNetworks = true;
@@ -1580,12 +1576,12 @@ export class Wallet {
 
 	/**
 	 * Returns the Network object of the currently selected network (bitcoin or testnet).
-	 * @param {TAvailableNetworks} [network]
-	 * @returns {Network}
+	 * @param {Network} [network]
+	 * @returns {BitcoinJsNetwork}
 	 */
-	private getBitcoinNetwork(network?: TAvailableNetworks): Network {
+	private getBitcoinNetwork(network?: Network): BitcoinJsNetwork {
 		if (!network) network = this._network;
-		return getBitcoinJsNetwork(network);
+		return toBitcoinJsNetwork(network);
 	}
 
 	/**
@@ -1749,7 +1745,7 @@ export class Wallet {
 				const data = {
 					path,
 					type: addressType,
-					selectedNetwork: getElectrumNetwork(this._network)
+					selectedNetwork: toElectrumNetwork(this._network)
 				};
 				const res = await this._customGetAddress(data);
 				if (res.isErr()) return err(res.error);
@@ -1912,7 +1908,7 @@ export class Wallet {
 	/**
 	 * Get scriptHash for a given address
 	 * @param {string} address
-	 * @param {EAvailableNetworks} network
+	 * @param {Network} network
 	 * @returns {Promise<string>}
 	 */
 	public async getScriptHash({
@@ -1920,10 +1916,10 @@ export class Wallet {
 		network
 	}: {
 		address: string;
-		network: EAvailableNetworks;
+		network: Network;
 	}): Promise<string> {
 		if (this._customGetScriptHash) {
-			const selectedNetwork = getElectrumNetwork(network);
+			const selectedNetwork = toElectrumNetwork(network);
 			return await this._customGetScriptHash({ address, selectedNetwork });
 		}
 		return getScriptHash({ address, network });
@@ -3757,8 +3753,7 @@ export class Wallet {
 				// origin (master fingerprint + BIP 48 path); cosigners known only
 				// as xpubs carry a fingerprint-only origin (the account key's
 				// parent fingerprint, the watch-only single-sig convention).
-				const coinType =
-					this._network === EAvailableNetworks.bitcoin ? '0' : '1';
+				const coinType = this._network === Network.bitcoin ? '0' : '1';
 				const keyExpr = (chain: 0 | 1): string => {
 					const keys = this._multisig!.cosigners.map((cosigner) => {
 						const xpub = this._toStandardBase58(cosigner.node);
@@ -3808,8 +3803,7 @@ export class Wallet {
 				});
 			} else {
 				if (!this._root) return err('Wallet root is unavailable.');
-				const coinType =
-					this._network === EAvailableNetworks.bitcoin ? '0' : '1';
+				const coinType = this._network === Network.bitcoin ? '0' : '1';
 				// p2wsh is multisig-only and has no single-key descriptor.
 				const singleSigTypes = Object.values(EAddressType).filter(
 					(type) => type !== EAddressType.p2wsh
@@ -3872,7 +3866,7 @@ export class Wallet {
 			Object.getPrototypeOf(node),
 			Object.getOwnPropertyDescriptors(node)
 		) as BIP32Interface;
-		(clone as { network: Network }).network = standard;
+		(clone as { network: BitcoinJsNetwork }).network = standard;
 		return clone.toBase58();
 	}
 
@@ -4565,7 +4559,7 @@ export class Wallet {
 	 * Returns the block height for a given number of confirmations from storage.
 	 * @param {number} confirmations
 	 * @param {number} [currentHeight]
-	 * @param {TAvailableNetworks} [selectedNetwork]
+	 * @param {Network} [selectedNetwork]
 	 * @returns {number}
 	 */
 	public confirmationsToBlockHeight({
@@ -5456,7 +5450,7 @@ export class Wallet {
 	 * @returns {Promise<IOnchainFees>}
 	 */
 	public async getFeeEstimates(network = this._network): Promise<IOnchainFees> {
-		if (network === EAvailableNetworks.bitcoinRegtest) {
+		if (network === Network.regtest) {
 			return { ...defaultFeesShape, timestamp: Date.now() };
 		}
 		if (this.feeEstimationSource !== 'http') {
@@ -5504,7 +5498,7 @@ export class Wallet {
 	 * Fetches fee estimates over HTTP from mempool.space, falling back to
 	 * blocktank if mempool.space is down.
 	 * @async
-	 * @param {EAvailableNetworks} network
+	 * @param {Network} network
 	 * @returns {Promise<IOnchainFees>}
 	 */
 	public async getFeeEstimatesFromHttp(
@@ -5512,9 +5506,8 @@ export class Wallet {
 	): Promise<IOnchainFees> {
 		try {
 			let urlModifier = '';
-			if (network !== EAvailableNetworks.bitcoinMainnet) {
-				urlModifier =
-					network === EAvailableNetworks.bitcoinSignet ? 'signet/' : 'testnet/';
+			if (network !== Network.bitcoin) {
+				urlModifier = network === Network.signet ? 'signet/' : 'testnet/';
 			}
 			const response = await fetch(
 				`https://mempool.space/${urlModifier}api/v1/fees/recommended`
@@ -5544,14 +5537,14 @@ export class Wallet {
 
 	/**
 	 * Fallback method to use blocktank for fee estimates if mempool.space is down.
-	 * @param {EAvailableNetworks} network
+	 * @param {Network} network
 	 * @returns {Promise<IOnchainFees>}
 	 */
 	public async getFallbackFeeEstimates(
 		network = this._network
 	): Promise<IOnchainFees> {
 		try {
-			if (network !== EAvailableNetworks.bitcoinMainnet) {
+			if (network !== Network.bitcoin) {
 				return defaultFeesShape;
 			}
 			const url = 'https://api1.blocktank.to/api/info';
@@ -7209,7 +7202,7 @@ export class Wallet {
 			const root = bip32.fromPrivateKey(
 				Buffer.from(this._root.privateKey!),
 				Buffer.from(this._root.chainCode),
-				getBitcoinJsNetwork(this._network)
+				toBitcoinJsNetwork(this._network)
 			);
 			return ok(root);
 		} catch (e) {

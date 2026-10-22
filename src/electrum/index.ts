@@ -3,7 +3,6 @@ import * as electrum from 'rn-electrum-client/helpers';
 
 import {
 	EAddressType,
-	EAvailableNetworks,
 	EElectrumNetworks,
 	EScanningStrategy,
 	IAddress,
@@ -38,6 +37,7 @@ import {
 	TUnspentAddressScriptHashResponse,
 	Tls
 } from '../types';
+import { Network, toElectrumNetwork } from '../network';
 import {
 	btcPerKbToSatPerVbyte,
 	err,
@@ -47,7 +47,6 @@ import {
 	filterAddressesObjForSingleIndex,
 	filterAddressesObjForStartingIndex,
 	getAddressFromScriptPubKey,
-	getElectrumNetwork,
 	getScriptHash,
 	ok,
 	Result,
@@ -612,7 +611,7 @@ export class Electrum {
 	private _answeredAt = 0;
 
 	public servers?: TServer | TServer[];
-	public network: EAvailableNetworks;
+	public network: Network;
 	public electrumNetwork: EElectrumNetworks;
 	public connectedToElectrum: boolean;
 	public onReceive?: (data: unknown) => void;
@@ -631,7 +630,7 @@ export class Electrum {
 		pollConnection = true
 	}: {
 		wallet: Wallet;
-		network: EAvailableNetworks;
+		network: Network;
 		net: Net;
 		tls: Tls;
 		servers?: TServer | TServer[];
@@ -645,7 +644,7 @@ export class Electrum {
 		this.sendMessage = wallet.sendMessage;
 		this.servers = servers ?? [];
 		this.network = network;
-		this.electrumNetwork = getElectrumNetwork(this.network);
+		this.electrumNetwork = toElectrumNetwork(this.network);
 		this.connectedToElectrum = false;
 		this.onReceive = onReceive;
 		this.net = net;
@@ -686,7 +685,7 @@ export class Electrum {
 	 * real connect, so the others simply join its result.
 	 */
 	async connectToElectrum(args: {
-		network?: EAvailableNetworks;
+		network?: Network;
 		servers?: TServer | TServer[];
 		disableRegtestCheck?: boolean;
 	}): Promise<Result<TConnectToElectrumRes>> {
@@ -706,7 +705,7 @@ export class Electrum {
 		servers,
 		disableRegtestCheck = false // Used to ignore regtest check for certain tests.
 	}: {
-		network?: EAvailableNetworks;
+		network?: Network;
 		servers?: TServer | TServer[];
 		disableRegtestCheck?: boolean;
 	}): Promise<Result<TConnectToElectrumRes>> {
@@ -716,7 +715,7 @@ export class Electrum {
 		const customPeers = givenPeers.length
 			? givenPeers
 			: toServerList(this.servers);
-		const electrumNetwork = getElectrumNetwork(network);
+		const electrumNetwork = toElectrumNetwork(network);
 		if (
 			!disableRegtestCheck &&
 			electrumNetwork === 'bitcoinRegtest' &&
@@ -1929,7 +1928,7 @@ export class Electrum {
 	/**
 	 * Returns the block hex of the provided block height.
 	 * @param {number} [height]
-	 * @param {TAvailableNetworks} [selectedNetwork]
+	 * @param {Network} [selectedNetwork]
 	 * @returns {Promise<Result<string>>}
 	 */
 	public async getBlockHex({
@@ -1952,7 +1951,7 @@ export class Electrum {
 	 * Returns the block hash given a block hex.
 	 * Leaving blockHex empty will return the last known block hash from storage.
 	 * @param {string} [blockHex]
-	 * @param {TAvailableNetworks} [selectedNetwork]
+	 * @param {Network} [selectedNetwork]
 	 * @returns {string}
 	 */
 	public getBlockHashFromHex({ blockHex }: { blockHex?: string }): string {

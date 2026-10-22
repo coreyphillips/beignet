@@ -2,14 +2,14 @@ import * as electrum from 'rn-electrum-client/helpers';
 import { err, ok, Result } from './result';
 
 import {
-	EAvailableNetworks,
 	EElectrumNetworks,
 	ElectrumConnectionPubSub,
 	ElectrumConnectionSubscription,
+	EProtocol,
 	IAddresses,
-	IFormattedPeerData,
-	TProtocol
+	IFormattedPeerData
 } from '../types';
+import { Network, toElectrumNetwork } from '../network';
 import { defaultElectrumPeers } from '../shapes/electrum';
 import { createConsoleLogger } from '../logger';
 
@@ -21,13 +21,13 @@ export const defaultElectrumPorts = ['51002', '50002', '51001', '50001'];
 
 /**
  * Returns the default port for the given network and protocol.
- * @param {EAvailableNetworks} [selectedNetwork]
+ * @param {Network} [selectedNetwork]
  * @param {string} [protocol]
  * @returns {number}
  */
 export const getDefaultPort = (
-	selectedNetwork: EAvailableNetworks,
-	protocol: TProtocol
+	selectedNetwork: Network,
+	protocol: `${EProtocol}`
 ): number => {
 	if (selectedNetwork === 'signet') {
 		return protocol === 'ssl' ? 60602 : 60601;
@@ -42,26 +42,26 @@ export const getDefaultPort = (
 /**
  * Returns the protocol for the given network and default port.
  * @param {string} [port]
- * @param {EAvailableNetworks} [network]
- * @returns {TProtocol | undefined}
+ * @param {Network} [network]
+ * @returns {EProtocol | undefined}
  */
 export const getProtocolForPort = (
 	port: string,
-	network: EAvailableNetworks
-): TProtocol | undefined => {
+	network: Network
+): EProtocol | undefined => {
 	if (port === '443') {
-		return 'ssl';
+		return EProtocol.ssl;
 	}
 
 	if (network === 'testnet') {
-		return port === '51002' ? 'ssl' : 'tcp';
+		return port === '51002' ? EProtocol.ssl : EProtocol.tcp;
 	}
 
 	if (network === 'signet') {
-		return port === '60602' ? 'ssl' : 'tcp';
+		return port === '60602' ? EProtocol.ssl : EProtocol.tcp;
 	}
 
-	return port === '50002' ? 'ssl' : 'tcp';
+	return port === '50002' ? EProtocol.ssl : EProtocol.tcp;
 };
 
 /**
@@ -102,13 +102,13 @@ export const formatPeerData = (
 /**
  * Returns an array of peers.
  * If unable to acquire peers from an Electrum server the method will default to the hardcoded peers in peers.json.
- * @param {EAvailableNetworks} [selectedNetwork]
+ * @param {Network} [selectedNetwork]
  * @returns Promise<Result<IFormattedPeerData[]>>
  */
 export const getPeers = async ({
 	selectedNetwork
 }: {
-	selectedNetwork: EAvailableNetworks;
+	selectedNetwork: Network;
 }): Promise<Result<IFormattedPeerData[]>> => {
 	try {
 		const response = await electrum.getPeers({ network: selectedNetwork });
@@ -130,7 +130,7 @@ export const getPeers = async ({
 			}
 		}
 		// No peers available grab hardcoded peers instead.
-		return ok(defaultElectrumPeers[getElectrumNetwork(selectedNetwork)] ?? []);
+		return ok(defaultElectrumPeers[toElectrumNetwork(selectedNetwork)] ?? []);
 	} catch (e) {
 		if (typeof e === 'string' || e instanceof Error) {
 			return err(e);
@@ -224,26 +224,12 @@ export const electrumConnection = ((
 })();
 
 /**
- * Returns the network string for use with Electrum methods.
- * @param {EAvailableNetworks} [network]
+ * @deprecated Use `toElectrumNetwork`. Removed in the next major release.
+ * @param {Network} network
  * @return {EElectrumNetworks}
  */
-export const getElectrumNetwork = (
-	network: EAvailableNetworks
-): EElectrumNetworks => {
-	switch (network) {
-		case 'bitcoin':
-			return EElectrumNetworks.bitcoin;
-		case 'testnet':
-			return EElectrumNetworks.bitcoinTestnet;
-		case 'regtest':
-			return EElectrumNetworks.bitcoinRegtest;
-		case 'signet':
-			return EElectrumNetworks.bitcoinSignet;
-		default:
-			return EElectrumNetworks.bitcoinTestnet;
-	}
-};
+export const getElectrumNetwork = (network: Network): EElectrumNetworks =>
+	toElectrumNetwork(network);
 
 /**
  * Splits the addresses into chunks of the specified batch limit.

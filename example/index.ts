@@ -1,7 +1,7 @@
 import {
-	EAvailableNetworks,
 	ECoinSelectPreference,
 	generateMnemonic,
+	Network,
 	Wallet
 } from '../src';
 import { getData, onMessage, servers, setData } from './helpers';
@@ -11,13 +11,11 @@ import tls from 'tls';
 
 const NETWORKS = new Map<
 	string,
-	| EAvailableNetworks.mainnet
-	| EAvailableNetworks.testnet
-	| EAvailableNetworks.regtest
+	Network.bitcoin | Network.testnet | Network.regtest
 >([
-	['mainnet', EAvailableNetworks.mainnet],
-	['testnet', EAvailableNetworks.testnet],
-	['regtest', EAvailableNetworks.regtest]
+	['mainnet', Network.bitcoin],
+	['testnet', Network.testnet],
+	['regtest', Network.regtest]
 ]);
 
 const runExample = async (

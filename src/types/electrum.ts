@@ -1,5 +1,5 @@
-import {
-	EAvailableNetworks,
+import type { Network } from '../network';
+import type {
 	IAddress,
 	IGetAddressBalanceRes,
 	ITransaction,
@@ -9,11 +9,11 @@ import {
 export type Net = typeof import('net');
 export type Tls = typeof import('tls');
 
-export type TElectrumNetworks =
-	| 'bitcoin'
-	| 'bitcoinTestnet'
-	| 'bitcoinRegtest'
-	| 'bitcoinSignet';
+/**
+ * The names rn-electrum-client keys its per-network state by, which is why
+ * they differ from {@link Network}'s values. `toElectrumNetwork` maps one to
+ * the other.
+ */
 export enum EElectrumNetworks {
 	bitcoin = 'bitcoin',
 	bitcoinTestnet = 'bitcoinTestnet',
@@ -32,11 +32,14 @@ export type TServer = {
 	tcp: number;
 	protocol: EProtocol;
 };
-export type TProtocol = 'tcp' | 'ssl';
 export enum EProtocol {
 	tcp = 'tcp',
 	ssl = 'ssl'
 }
+/**
+ * @deprecated Use {@link EProtocol}. Removed in the next major release.
+ */
+export type TProtocol = `${EProtocol}`;
 
 export enum EScanningStrategy {
 	all = 'all', // Scan all addresses/scripthashes
@@ -128,7 +131,7 @@ export interface IGetHeaderResponse {
 	error: boolean;
 	method: 'getHeader';
 	data: string;
-	network: EAvailableNetworks;
+	network: Network;
 }
 
 export interface IGetTransactionsFromInputs {
@@ -176,7 +179,7 @@ export interface IFormattedPeerData {
 export interface IPeerData {
 	host: string;
 	port: string;
-	protocol: TProtocol;
+	protocol: `${EProtocol}`;
 }
 
 export type ElectrumConnectionPubSub = {

@@ -2,7 +2,6 @@ import { defaultWalletData } from '../shapes';
 import cloneDeep from 'lodash.clonedeep';
 import {
 	EAddressType,
-	EAvailableNetworks,
 	IAddress,
 	IAddresses,
 	IIndexes,
@@ -18,6 +17,7 @@ import {
 	TKeyDerivationPurpose,
 	TVin
 } from '../types';
+import { Network } from '../network';
 import { err, ok, Result } from './result';
 import {
 	getAddressTypeFromPath,
@@ -76,7 +76,7 @@ export const objectKeys = Object.keys as <Type extends object>(
  * @param {TKeyDerivationPurpose | string} [purpose]
  * @param {boolean} [changeAddress]
  * @param {string} [addressIndex]
- * @param {EAvailableNetworks} [network]
+ * @param {Network} [network]
  * @returns {Result<{IKeyDerivationPathData}>} Derivation Path Data
  */
 export const formatKeyDerivationPath = ({
@@ -89,7 +89,7 @@ export const formatKeyDerivationPath = ({
 }: {
 	path: IKeyDerivationPath | string;
 	purpose?: TKeyDerivationPurpose;
-	network: EAvailableNetworks;
+	network: Network;
 	changeAddress?: boolean;
 	index?: string;
 	addressType?: EAddressType;
@@ -187,14 +187,14 @@ export const getHighestUsedIndexFromTxHashes = ({
 /**
  * Returns if the provided string is a valid Bech32m encoded string (taproot/p2tr address).
  * @param {string} address
- * @returns { isValid: boolean; network: EAvailableNetworks }
+ * @returns { isValid: boolean; network: Network }
  */
 export const isValidBech32mEncodedString = (
 	address: string
-): { isValid: boolean; network: EAvailableNetworks } => {
+): { isValid: boolean; network: Network } => {
 	const invalid = {
 		isValid: false,
-		network: EAvailableNetworks.bitcoin
+		network: Network.bitcoin
 	};
 	try {
 		const decoded = bech32m.decode(address);
@@ -209,13 +209,13 @@ export const isValidBech32mEncodedString = (
 		if (version === 1 && program.length !== 32) return invalid;
 		switch (decoded.prefix) {
 			case 'bc':
-				return { isValid: true, network: EAvailableNetworks.bitcoin };
+				return { isValid: true, network: Network.bitcoin };
 			case 'tb':
 				// 'tb' is shared by testnet and signet; beignet models signet
 				// under the testnet params, so it is reported as testnet.
-				return { isValid: true, network: EAvailableNetworks.bitcoinTestnet };
+				return { isValid: true, network: Network.testnet };
 			case 'bcrt':
-				return { isValid: true, network: EAvailableNetworks.bitcoinRegtest };
+				return { isValid: true, network: Network.regtest };
 			default:
 				return invalid;
 		}
@@ -225,11 +225,10 @@ export const isValidBech32mEncodedString = (
 };
 
 /**
- * Returns an array of all available networks from the networks object.
- * @returns {EAvailableNetworks[]}
+ * Returns each network once.
+ * @returns {Network[]}
  */
-export const availableNetworks = (): EAvailableNetworks[] =>
-	Object.values(EAvailableNetworks);
+export const availableNetworks = (): Network[] => Object.values(Network);
 
 /**
  * Sum a specific value in an array of objects.
@@ -378,7 +377,7 @@ export const generateWalletId = (seed: Buffer): string => {
 
 export const getWalletDataStorageKey = (
 	name: string,
-	network: EAvailableNetworks,
+	network: Network,
 	key: keyof IWalletData,
 	account = 0
 ): string => {
@@ -392,7 +391,7 @@ export const getWalletDataStorageKey = (
 // The network is spelled out rather than matched as any segment: the name may
 // contain hyphens, and a generic segment would read "acct1" as the network.
 const STORAGE_KEY_PATTERN = new RegExp(
-	`^(.*)-(${[...new Set(Object.values(EAvailableNetworks))].join('|')})` +
+	`^(.*)-(${Object.values(Network).join('|')})` +
 		'(?:-acct([1-9]\\d*))?-([^-]+)$'
 );
 
@@ -406,7 +405,7 @@ export const getStorageKeyValues = (
 ):
 	| {
 			walletName: string;
-			network: EAvailableNetworks;
+			network: Network;
 			account: number;
 			value: keyof IWalletData;
 	  }
@@ -419,7 +418,7 @@ export const getStorageKeyValues = (
 	}
 	return {
 		walletName,
-		network: network as EAvailableNetworks,
+		network: network as Network,
 		account: account === undefined ? 0 : Number(account),
 		value: value as keyof IWalletData
 	};
