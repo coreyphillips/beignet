@@ -733,6 +733,20 @@ export class Electrum {
 			return err('Regtest requires that you pre-specify a server.');
 		}
 		const candidates = this.getServerCandidates(customPeers, electrumNetwork);
+		const ownKeys = new Set(customPeers.map((s) => this.serverKey(s)));
+		// A sibling may already sit on a fallback peer, and the one client per
+		// network would carry this instance's requests there whether or not
+		// its own connect succeeds.
+		if (this._disableFallbackServers) {
+			const peer = electrum.getConnectedPeer(electrumNetwork);
+			const peerKey = `${peer?.host}|${peer?.protocol}|${peer?.port}`;
+			const onFallback = (defaultElectrumPeers[electrumNetwork] ?? []).some(
+				(s) => this.serverKey(s) === peerKey
+			);
+			if (onFallback && !ownKeys.has(peerKey)) {
+				await electrum.stop({ network: electrumNetwork });
+			}
+		}
 		let connected = false;
 		// Only reported when there was no candidate to try.
 		let lastError = this._disableFallbackServers
@@ -744,6 +758,14 @@ export class Electrum {
 		let refusedAny = false;
 		for (const candidate of this.orderCandidates(candidates)) {
 			if (this._disconnected) return err(DISCONNECTED_ERROR);
+			// The candidates predate the dials before this one, and an instance
+			// that disables fallback peers may have joined the network since.
+			if (
+				!ownKeys.has(this.serverKey(candidate)) &&
+				this.refusesFallbackPeers(electrumNetwork)
+			) {
+				continue;
+			}
 			const startResponse = await this.attemptConnect(
 				candidate,
 				electrumNetwork
@@ -1117,15 +1139,9 @@ export class Electrum {
 		customPeers: TServer[],
 		electrumNetwork: EElectrumNetworks
 	): TServer[] {
-		// Own flag checked too: a network switch computes the candidates before
-		// this.electrumNetwork moves to the target.
-		const refused =
-			this._disableFallbackServers ||
-			[...fallbackServersRefusedBy].some(
-				(instance) => instance.electrumNetwork === electrumNetwork
-			);
 		const fallback =
-			refused || electrumNetwork === EElectrumNetworks.bitcoinRegtest
+			this.refusesFallbackPeers(electrumNetwork) ||
+			electrumNetwork === EElectrumNetworks.bitcoinRegtest
 				? []
 				: defaultElectrumPeers[electrumNetwork] ?? [];
 		const candidates: TServer[] = [];
@@ -1137,6 +1153,18 @@ export class Electrum {
 			candidates.push(server);
 		}
 		return candidates;
+	}
+
+	/** Whether this instance, or any instance on the network, bars fallback peers. */
+	private refusesFallbackPeers(electrumNetwork: EElectrumNetworks): boolean {
+		// Own flag checked too: a network switch computes the candidates before
+		// this.electrumNetwork moves to the target.
+		return (
+			this._disableFallbackServers ||
+			[...fallbackServersRefusedBy].some(
+				(instance) => instance.electrumNetwork === electrumNetwork
+			)
+		);
 	}
 
 	/**
