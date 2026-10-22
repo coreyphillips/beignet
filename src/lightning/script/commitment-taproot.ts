@@ -17,7 +17,7 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
-import { sha256 } from '../crypto/provider';
+import { taggedHash } from '../crypto/hash';
 
 bitcoin.initEccLib(ecc);
 
@@ -54,11 +54,6 @@ export function toXOnly(pubkey: Buffer): Buffer {
 		throw new Error(`Expected 33-byte compressed or 32-byte x-only key`);
 	}
 	return pubkey.subarray(1);
-}
-
-function taggedHash(tag: string, data: Buffer): Buffer {
-	const t = sha256(Buffer.from(tag));
-	return sha256(Buffer.concat([t, t, data]));
 }
 
 /**

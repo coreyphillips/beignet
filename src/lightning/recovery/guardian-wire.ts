@@ -10,7 +10,8 @@
  * specification wins and this module has a bug.
  */
 
-import { hkdfSha256, sha256 } from '../crypto/provider';
+import { taggedHash } from '../crypto/hash';
+import { hkdfSha256 } from '../crypto/provider';
 import { schnorrSign, schnorrVerify } from '../offer/schnorr';
 import { ecc } from '../../utils/ecc';
 
@@ -41,8 +42,7 @@ const ZERO32 = Buffer.alloc(32);
 
 /** BIP340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg). */
 export function guardianTaggedHash(tag: string, message: Buffer): Buffer {
-	const tagHash = sha256(Buffer.from(tag, 'utf8'));
-	return sha256(Buffer.concat([tagHash, tagHash, message]));
+	return taggedHash(tag, message);
 }
 
 function u16(value: number): Buffer {

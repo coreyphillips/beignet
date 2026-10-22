@@ -16,7 +16,7 @@
  * The signature hash is H("lightning" || messagename || fieldname, merkle_root).
  */
 
-import { sha256 as sha256Digest } from '../crypto/provider';
+import { taggedHash } from '../crypto/hash';
 import { decodeBigSize } from '../message/codec';
 import type { ITlvRecord } from '../message/tlv';
 import { encodeTlvRecord } from '../message/tlv';
@@ -28,24 +28,9 @@ const LN_BRANCH_TAG = Buffer.from('LnBranch');
 /** BOLT 12 signature field TLV type; excluded from the signed merkle tree. */
 const SIGNATURE_TLV_TYPE = 240n;
 
-function sha256(...parts: Buffer[]): Buffer {
-	return sha256Digest(Buffer.concat(parts));
-}
-
-/** Tagged hash H(tag, msg) = SHA256(SHA256(tag) || SHA256(tag) || msg). */
-function taggedHashBuf(tag: Buffer, msg: Buffer): Buffer {
-	const th = sha256(tag);
-	return sha256(th, th, msg);
-}
-
-/** String-tag convenience wrapper (used for the signature hash). */
-function taggedHash(tag: string, data: Buffer): Buffer {
-	return taggedHashBuf(Buffer.from(tag), data);
-}
-
 function branchHash(a: Buffer, b: Buffer): Buffer {
 	const [first, second] = a.compare(b) <= 0 ? [a, b] : [b, a];
-	return taggedHashBuf(LN_BRANCH_TAG, Buffer.concat([first, second]));
+	return taggedHash(LN_BRANCH_TAG, first, second);
 }
 
 /**
@@ -64,11 +49,8 @@ export function computeMerkleRoot(encodedRecords: Buffer[]): Buffer {
 	// Per-TLV node = branch(H("LnLeaf", record), H("LnNonce"||first, type-bytes)).
 	let level = records.map((record) => {
 		const typeBytes = record.subarray(0, decodeBigSize(record, 0).bytesRead);
-		const leaf = taggedHashBuf(LN_LEAF_TAG, record);
-		const nonce = taggedHashBuf(
-			Buffer.concat([LN_NONCE_TAG, first]),
-			typeBytes
-		);
+		const leaf = taggedHash(LN_LEAF_TAG, record);
+		const nonce = taggedHash(Buffer.concat([LN_NONCE_TAG, first]), typeBytes);
 		return branchHash(leaf, nonce);
 	});
 
