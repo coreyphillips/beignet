@@ -165,7 +165,7 @@ node.on('payment:sent', (payment) => {
 });
 ```
 
-`network` is the `Network` enum (`Network.MAINNET` = `'bc'`, `TESTNET` = `'tb'`, `REGTEST` = `'bcrt'`, `SIGNET` = `'tbs'`), not a bare string.
+`network` is the `invoice.Network` enum (`Network.MAINNET` = `'bc'`, `TESTNET` = `'tb'`, `REGTEST` = `'bcrt'`, `SIGNET` = `'tbs'`), not a bare string. Its values are BOLT 11 invoice prefixes, so it is not the wallet's `Network` from `beignet`, whose values are `'bitcoin'`, `'testnet'`, `'regtest'` and `'signet'`.
 
 > **Important**: `sendPayment()` returns synchronously with PENDING status.
 > For AI agents and async workflows, use `sendPaymentAsync()`, which returns a

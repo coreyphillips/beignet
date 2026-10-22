@@ -3,7 +3,6 @@ import { Psbt } from 'bitcoinjs-lib';
 import { err, ok, Result } from './result';
 import {
 	EAddressType,
-	EAvailableNetworks,
 	IOutput,
 	ISendTransaction,
 	TDecodeRawTx,
@@ -16,7 +15,8 @@ import { availableNetworks, reduceValue } from './wallet';
 import validate, { getAddressInfo } from 'bitcoin-address-validation';
 import * as bip21 from 'bip21';
 import { TRANSACTION_DEFAULTS } from '../wallet/constants';
-import { getBitcoinJsNetwork, validateAddress } from './helpers';
+import { validateAddress } from './helpers';
+import { Network, toBitcoinJsNetwork } from '../network';
 import { btcToSats } from './conversion';
 
 /**
@@ -103,15 +103,15 @@ export const encodeBip21 = ({
  * Attempts to parse any given string as an on-chain payment request.
  * Returns an error if invalid.
  * @param {string} data
- * @param {EAvailableNetworks} [network]
- * @returns {Result<{address: string; network: EAvailableNetworks; sats: number; message: string;}>}
+ * @param {Network} [network]
+ * @returns {Result<{address: string; network: Network; sats: number; message: string;}>}
  */
 export const parseOnChainPaymentRequest = (
 	data: string,
-	network?: EAvailableNetworks
+	network?: Network
 ): Result<{
 	address: string;
-	network: EAvailableNetworks;
+	network: Network;
 	sats: number;
 	message: string;
 }> => {
@@ -454,7 +454,7 @@ export const getDustThreshold = (address: string): number => {
 	try {
 		const { version } = bitcoin.address.fromBase58Check(address);
 		const isP2sh = availableNetworks().some(
-			(network) => getBitcoinJsNetwork(network).scriptHash === version
+			(network) => toBitcoinJsNetwork(network).scriptHash === version
 		);
 		// P2SH is OP_HASH160 <20 bytes> OP_EQUAL. P2PKH wraps the same hash in
 		// OP_DUP, OP_HASH160, OP_EQUALVERIFY and OP_CHECKSIG.
@@ -553,15 +553,15 @@ export const validateTransaction = (
  * Attempts to decode a raw tx hex.
  * Source: https://github.com/bitcoinjs/bitcoinjs-lib/issues/1606#issuecomment-664740672
  * @param {string} hex
- * @param {EAvailableNetworks} [_network]
+ * @param {Network} [_network]
  * @returns {Result<TDecodeRawTx>}
  */
 export const decodeRawTransaction = (
 	hex: string,
-	_network: EAvailableNetworks
+	_network: Network
 ): Result<TDecodeRawTx> => {
 	try {
-		const network = getBitcoinJsNetwork(_network);
+		const network = toBitcoinJsNetwork(_network);
 		const tx = bitcoin.Transaction.fromHex(hex);
 		return ok({
 			txid: tx.getId(),

@@ -2,7 +2,8 @@ import * as bitcoin from 'bitcoinjs-lib';
 import { BIP32Interface } from 'bip32';
 import { bip32 } from './ecc-apis';
 
-import { EAddressType, EAvailableNetworks } from '../types';
+import { EAddressType } from '../types';
+import { Network } from '../network';
 import { CodedError } from './errors';
 import { err, ok, Result } from './result';
 
@@ -98,12 +99,12 @@ export interface IParsedExtendedPublicKey {
  * and normalizes its version bytes to the provided network. The key is
  * assumed to be the ACCOUNT node (depth 3, m/purpose'/coin'/account').
  * @param {string} extendedKey
- * @param {EAvailableNetworks} network
+ * @param {Network} network
  * @returns {Result<IParsedExtendedPublicKey>}
  */
 export const parseExtendedPublicKey = (
 	extendedKey: string,
-	network: EAvailableNetworks
+	network: Network
 ): Result<IParsedExtendedPublicKey> => {
 	try {
 		if (!extendedKey) return err('No extended public key provided.');
@@ -121,7 +122,7 @@ export const parseExtendedPublicKey = (
 				).join(', ')}.`
 			);
 		}
-		const isMainnet = network === EAvailableNetworks.bitcoin;
+		const isMainnet = network === Network.bitcoin;
 		if (entry.mainnet !== isMainnet) {
 			return err(
 				`Extended public key prefix ${prefix} does not match the ${network} network.`

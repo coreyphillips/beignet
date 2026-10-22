@@ -1,12 +1,14 @@
 import {
 	EAddressType,
-	EAvailableNetworks,
 	IGetAddressesFromKeyPair,
 	IGetAddressesFromPrivateKey,
-	IKeyDerivationPath,
-	TAvailableNetworks
+	IKeyDerivationPath
 } from '../types';
-import { address as bitcoinJSAddress, Network, networks } from 'bitcoinjs-lib';
+import { Network, toBitcoinJsNetwork } from '../network';
+import {
+	address as bitcoinJSAddress,
+	Network as BitcoinJsNetwork
+} from 'bitcoinjs-lib';
 import * as bip39 from 'bip39';
 import * as bitcoin from 'bitcoinjs-lib';
 import { availableNetworks, isValidBech32mEncodedString } from './wallet';
@@ -41,26 +43,14 @@ export const validatePsbtSignature = (
 };
 
 /**
- * Signet shares testnet's address prefixes, bech32 hrp ('tb') and BIP32
- * versions; only the genesis block differs, so bitcoinjs-lib ships no
- * dedicated network entry for it.
- */
-const signetNetwork: Network = { ...networks.testnet };
-
-/**
- * Returns the bitcoinjs-lib Network object for the given beignet network.
- * Required because bitcoinjs-lib's networks object has no 'signet' key.
- * @param {EAvailableNetworks} network
- * @returns {Network}
+ * @deprecated Use `toBitcoinJsNetwork`. Removed in the next major release.
+ * @param {Network} network
+ * @returns {BitcoinJsNetwork}
  */
 export const getBitcoinJsNetwork = (
-	network: EAvailableNetworks | TAvailableNetworks
-): Network => {
-	if (network === EAvailableNetworks.signet) {
-		return signetNetwork;
-	}
-	return networks[network];
-};
+	network: Network | `${Network}`
+): BitcoinJsNetwork => toBitcoinJsNetwork(network as Network);
+
 /**
  * Get address for a given scriptPubKey.
  * @param scriptPubKey
@@ -69,9 +59,9 @@ export const getBitcoinJsNetwork = (
  */
 export const getAddressFromScriptPubKey = (
 	scriptPubKey: string,
-	selectedNetwork: EAvailableNetworks
+	selectedNetwork: Network
 ): string => {
-	const network = getBitcoinJsNetwork(selectedNetwork);
+	const network = toBitcoinJsNetwork(selectedNetwork);
 	return bitcoin.address.fromOutputScript(
 		Buffer.from(scriptPubKey, 'hex'),
 		network
@@ -93,18 +83,18 @@ export const getSha256 = (str: string): string => {
  * Validate address for a given network.
  * If no address is provided, it will attempt to validate the address for all available networks.
  * @param {string} address
- * @param {EAvailableNetworks} network
- * @returns {{isValid: boolean, network: EAvailableNetworks}}
+ * @param {Network} network
+ * @returns {{isValid: boolean, network: Network}}
  */
 export const validateAddress = ({
 	address,
 	network
 }: {
 	address: string;
-	network?: EAvailableNetworks;
+	network?: Network;
 }): {
 	isValid: boolean;
-	network: EAvailableNetworks;
+	network: Network;
 } => {
 	try {
 		//Validate address for all available networks
@@ -114,7 +104,7 @@ export const validateAddress = ({
 		//Validate address for a specific network
 		if (network !== undefined) {
 			try {
-				bitcoinJSAddress.toOutputScript(address, getBitcoinJsNetwork(network));
+				bitcoinJSAddress.toOutputScript(address, toBitcoinJsNetwork(network));
 				return { isValid: true, network };
 			} catch {
 				// In the event the normal check fails, determine if this is a taproot address.
@@ -137,16 +127,16 @@ export const validateAddress = ({
 				break;
 			}
 		}
-		return { isValid, network: network ?? EAvailableNetworks.bitcoin };
+		return { isValid, network: network ?? Network.bitcoin };
 	} catch {
-		return { isValid: false, network: EAvailableNetworks.bitcoin };
+		return { isValid: false, network: Network.bitcoin };
 	}
 };
 
 /**
  * Returns the derivation path object for the specified addressType and network.
  * @param {EAddressType} addressType
- * @param {EAvailableNetworks} [selectedNetwork]
+ * @param {Network} [selectedNetwork]
  * @returns Result<IKeyDerivationPath>
  */
 export const getKeyDerivationPath = ({
@@ -154,7 +144,7 @@ export const getKeyDerivationPath = ({
 	network
 }: {
 	addressType: EAddressType;
-	network: EAvailableNetworks;
+	network: Network;
 }): Result<IKeyDerivationPath> => {
 	try {
 		const keyDerivationPathResponse = getKeyDerivationPathObject({
@@ -173,7 +163,7 @@ export const getKeyDerivationPath = ({
 /**
  * Get scriptHash for a given address
  * @param {string} address
- * @param {EAvailableNetworks} network
+ * @param {Network} network
  * @returns {string}
  */
 export const getScriptHash = ({
@@ -181,10 +171,10 @@ export const getScriptHash = ({
 	network
 }: {
 	address: string;
-	network: EAvailableNetworks;
+	network: Network;
 }): string => {
 	try {
-		const _network: Network = getBitcoinJsNetwork(network);
+		const _network = toBitcoinJsNetwork(network);
 		const script = bitcoin.address.toOutputScript(address, _network);
 		const hash = bitcoin.crypto.sha256(script);
 		const reversedHash = Buffer.from(hash.reverse());
@@ -248,7 +238,7 @@ export const objectsMatch = (obj1: unknown, obj2: unknown): boolean => {
  * Get address from key pair.
  * @param {BIP32Interface | ECPairInterface} keyPair
  * @param {EAddressType} addressType
- * @param {Network} network
+ * @param {BitcoinJsNetwork} network
  * @returns {IGetAddressesFromKeyPair}
  */
 export const getAddressFromKeyPair = ({
@@ -258,7 +248,7 @@ export const getAddressFromKeyPair = ({
 }: {
 	keyPair: BIP32Interface | ECPairInterface;
 	addressType: EAddressType;
-	network: Network;
+	network: BitcoinJsNetwork;
 }): Result<IGetAddressesFromKeyPair> => {
 	let address = '';
 	switch (addressType) {
@@ -312,7 +302,7 @@ export const getAddressFromKeyPair = ({
 /**
  * Returns taproot address information from the provided public key.
  * @param {Buffer} publicKey
- * @param {Network} network
+ * @param {BitcoinJsNetwork} network
  * @returns {Result<{ address: string; output: Buffer; internalPubkey: Buffer; }>}
  */
 export const getTapRootAddressFromPublicKey = ({
@@ -320,7 +310,7 @@ export const getTapRootAddressFromPublicKey = ({
 	network
 }: {
 	publicKey: Buffer;
-	network: Network;
+	network: BitcoinJsNetwork;
 }): Result<{ address: string; output: Buffer; internalPubkey: Buffer }> => {
 	try {
 		const internalPubkey = toXOnly(publicKey);
@@ -340,7 +330,7 @@ export const getTapRootAddressFromPublicKey = ({
  * Get addresses from a private key.
  * @param {string} privateKey
  * @param {EAddressType[]} [addrTypes]
- * @param {Network} [network]
+ * @param {BitcoinJsNetwork} [network]
  */
 export const getAddressesFromPrivateKey = ({
 	privateKey,
@@ -350,7 +340,7 @@ export const getAddressesFromPrivateKey = ({
 }: {
 	privateKey: string;
 	addrTypes?: EAddressType[];
-	network?: Network;
+	network?: BitcoinJsNetwork;
 }): Result<IGetAddressesFromPrivateKey> => {
 	try {
 		if (!privateKey) return err('No private key provided.');

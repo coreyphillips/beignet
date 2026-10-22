@@ -128,7 +128,7 @@ export interface IWalletLike {
 	getPrivateKey?(path: string): string;
 	/** Returns Result<{ address: string }>. */
 	getChangeAddress?(): Promise<IResult>;
-	/** 'bitcoin' | 'testnet' | 'regtest' (beignet EAvailableNetworks). */
+	/** A beignet `Network` value: 'bitcoin' | 'testnet' | 'regtest' | 'signet'. */
 	network?: string;
 	/** UTXO freeze API, used to pledge inputs to in-flight fundings so two
 	 *  concurrent fundings can never select (and double-spend) the same coin. */

@@ -5,7 +5,10 @@
 import { FeatureFlags } from '../features/flags';
 import { IBlindedPaymentPath } from '../onion/blinded-path';
 
-/** Lightning network prefixes for HRP. */
+/**
+ * Lightning network prefixes for HRP. Separate from the wallet's `Network`
+ * because these values are written into invoices and static channel backups.
+ */
 export enum Network {
 	MAINNET = 'bc',
 	TESTNET = 'tb',

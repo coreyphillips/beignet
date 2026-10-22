@@ -1,11 +1,5 @@
 import { promises as fs } from 'fs';
-import {
-	TGetData,
-	TSetData,
-	IWalletData,
-	EAvailableNetworks,
-	EProtocol
-} from '../src';
+import { TGetData, TSetData, IWalletData, EProtocol, Network } from '../src';
 import { err, Result, ok } from '../src';
 
 // The TGetData contract: ok(undefined) for a key never saved, and the wallet
@@ -57,7 +51,7 @@ export const onMessage = (id: unknown, data: unknown): void => {
 };
 
 export const servers = {
-	[EAvailableNetworks.mainnet]: [
+	[Network.bitcoin]: [
 		{
 			host: '35.187.18.233',
 			ssl: 8900,
@@ -65,7 +59,7 @@ export const servers = {
 			protocol: EProtocol.ssl
 		}
 	],
-	[EAvailableNetworks.testnet]: [
+	[Network.testnet]: [
 		{
 			host: 'testnet.aranguren.org',
 			ssl: 51002,
@@ -73,7 +67,7 @@ export const servers = {
 			protocol: EProtocol.ssl
 		}
 	],
-	[EAvailableNetworks.regtest]: [
+	[Network.regtest]: [
 		{
 			host: '35.233.47.252',
 			ssl: 18484,
