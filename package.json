@@ -28,7 +28,7 @@
     "test:cli": "npx mocha --exit --parallel --timeout 20000 -r ts-node/register --ignore 'tests/cli/daemon-security.test.ts' --ignore 'tests/cli/daemon-integration.test.ts' 'tests/cli/**/*.test.ts'",
     "test:integration": "npx mocha --exit --timeout 60000 -r ts-node/register 'tests/cli/daemon-security.test.ts' 'tests/cli/daemon-integration.test.ts'",
     "test:all": "npx mocha --exit --timeout 120000 -r ts-node/register 'tests/lightning/**/*.test.ts' 'tests/cli/**/*.test.ts'",
-    "example:lightning": "ts-node example/lightning.ts",
+    "example:lightning": "npm run build && ts-node example/lightning.ts",
     "lint": "eslint . --cache --ext .js,.jsx,.ts,.tsx",
     "lint:check": "eslint . --ext .js,.jsx,.ts,.tsx",
     "lint:fix": "eslint . --fix --ext .js,.jsx,.ts,.tsx",

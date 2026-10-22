@@ -1,7 +1,15 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "noEmit": true
+    "noEmit": true,
+    // node10 resolution has no package self-reference, so the examples' imports
+    // of the public entry points are type-checked against the sources they are
+    // built from. At runtime Node resolves them through `exports` to dist/.
+    "paths": {
+      "beignet": ["./src/index.ts"],
+      "beignet/cli": ["./src/cli/index.ts"],
+      "beignet/lightning": ["./src/lightning/index.ts"]
+    }
   },
   "include": [
     "src/**/*.ts",

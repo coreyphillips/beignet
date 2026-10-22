@@ -13,11 +13,7 @@
  * and channel-backup keys derived from the same seed.
  */
 
-import {
-	decryptWithPrefix,
-	encryptWithPrefix,
-	hkdfKey
-} from '../lightning/storage/encryption';
+import type * as Encryption from '../lightning/storage/encryption';
 import { IWalletData, TStorage } from '../types';
 import { err, ok, Result } from './result';
 
@@ -34,6 +30,12 @@ export const createEncryptedStorage = (
 	inner: TStorage,
 	seed: Buffer
 ): TStorage => {
+	// Required here, not at module scope: the root entry reaches this file, and
+	// the helper imports Node 'crypto', which a React Native host that injects
+	// only net and tls does not provide.
+	const { decryptWithPrefix, encryptWithPrefix, hkdfKey } =
+		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		require('../lightning/storage/encryption') as typeof Encryption;
 	const key = hkdfKey(seed, WALLET_HKDF_INFO);
 	const innerGetData = inner.getData;
 	const innerSetData = inner.setData;
