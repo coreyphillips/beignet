@@ -349,6 +349,33 @@ describe('Crypto provider (issue #1696)', () => {
 		).to.not.throw();
 	});
 
+	it('copies what the platform returns, so a crypto shim cannot alias keys', () => {
+		// A React Native app that ships a 'crypto' shim never installs a
+		// provider, so the default wraps the shim. Reused output memory on
+		// that path must be copied just as a host provider's is.
+		const original = nodeCrypto.randomBytes;
+		const slots = [Buffer.alloc(64), Buffer.alloc(64)];
+		let turn = 0;
+		const patched = ((size: number) => {
+			const slot = slots[turn++ % 2].subarray(0, size);
+			slot.set(original(size));
+			return slot;
+		}) as typeof original;
+		(nodeCrypto as { randomBytes: typeof original }).randomBytes = patched;
+		try {
+			setCryptoProvider(null);
+			const preimage = randomBytes(32);
+			const drawn = Buffer.from(preimage);
+			randomBytes(32);
+			const sessionKey = randomBytes(32);
+			expect(preimage.equals(drawn)).to.equal(true);
+			expect(preimage.equals(sessionKey)).to.equal(false);
+		} finally {
+			(nodeCrypto as { randomBytes: typeof original }).randomBytes = original;
+			setCryptoProvider(null);
+		}
+	});
+
 	it('leaves Node crypto to a short list of files in src/lightning', () => {
 		const loading = tsFiles(SRC_LIGHTNING)
 			.filter((file) => NODE_CRYPTO_LOAD.test(fs.readFileSync(file, 'utf8')))

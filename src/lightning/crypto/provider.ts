@@ -377,17 +377,19 @@ export function setCryptoProvider(provider: ICryptoProvider | null): void {
 }
 
 /**
- * A provider's result as a Buffer the caller owns. Node's default returns
- * fresh bytes, so its result is wrapped as is. A host provider's result is
- * copied: one that hands back a view into memory it reuses, as WASM-backed
- * libraries can, would otherwise let a later call overwrite a key or
- * preimage that an earlier call returned.
+ * A provider's result, copied into a Buffer the caller owns. A provider that
+ * hands back a view into memory it reuses, as WASM-backed libraries can,
+ * would otherwise let a later call overwrite a key or preimage that an
+ * earlier call returned. The copy is not gated on an installed provider:
+ * on React Native the default wraps whatever 'crypto' shim the app ships,
+ * and only real Node is known to return fresh bytes. The copy is off the
+ * shared Buffer pool, as Node's own digests are: a key the library keeps
+ * must not pin a pool slab that also holds bytes it meant to drop.
  */
 function toBuffer(bytes: Uint8Array): Buffer {
-	if (installed !== null) return Buffer.from(bytes);
-	return Buffer.isBuffer(bytes)
-		? bytes
-		: Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const copy = Buffer.allocUnsafeSlow(bytes.length);
+	copy.set(bytes);
+	return copy;
 }
 
 export function sha256(data: Uint8Array): Buffer {
