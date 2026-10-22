@@ -92,7 +92,7 @@ These facts were audited directly and are the foundation the design builds on. T
 
 ### 3.1 Storage layer
 
-- Interface: `IStorageBackend` in `src/lightning/storage/types.ts`. Only implementation: `SqliteStorage` in `src/lightning/storage/sqlite-storage.ts` (better-sqlite3).
+- Interface: `IStorageBackend` in `src/lightning/storage/types.ts`. Only implementation: `SqliteStorage` in `src/lightning/storage/sqlite-storage.ts` (better-sqlite3). A pure-JS `MemoryStorage` (`memory-storage.ts`) came later; the outbox and journal methods are `IRecoveryStorage` there.
 - Durability: `journal_mode = WAL`, `synchronous = FULL` by default (overridable to NORMAL), `busy_timeout = 5000`, `foreign_keys = ON`. `checkpoint()` runs `wal_checkpoint(TRUNCATE)`. `SqliteStorage.backup(destPath)` wraps the SQLite online backup API (concrete method, not on the interface).
 - A `transaction<T>(fn)` wrapper exists on the interface (`types.ts` around line 132) and is implemented via `this.db.transaction(fn)()`.
 - Safety-critical tables: `channels`, `chain_monitors`, `preimages`, `htlc_payment_map`, `forwarded_htlcs`, `htlc_shared_secrets`, `channel_key_indices`, `payments`, `payment_secrets`. Also relevant: `peer_storage_blobs`, `watchtower_sessions`, `watchtower_updates`. Schema version constant `CURRENT_SCHEMA_VERSION` was 9 when this was written; it reached 11 before Phase 1 landed, and Phase 1 took it to 12 by adding `recovery_outbox`.

@@ -123,6 +123,16 @@ import { SqliteStorage, GuardianStore } from 'beignet/lightning/sqlite';
 
 `better-sqlite3` is an optional dependency. npm installs it by default, and each store loads it when constructed. Without it, `beignet/lightning` still loads, and constructing a store throws an error naming the missing module. `BeignetNode` and the `beignet` CLI build on `SqliteStorage`, so they need it too. `storage.SqliteStorage` and `recovery.GuardianStore` still work but are deprecated, and go in the next major release.
 
+`storage.MemoryStorage` is a pure-JS backend that keeps everything in memory, and the starting point for a backend of your own (on a React Native SQLite binding, say). `IStorageBackend` is `IStorageCore`, which every backend implements, plus optional capability groups such as `IRecoveryStorage` and `IWatchtowerStorage`, named in `IStorageCapabilities`. `storage.hasStorageCapability(backend, 'watchtower')` says whether a backend has one. To check a backend, register the conformance suite from a mocha, Jest or Vitest test file:
+
+```typescript
+import { storage } from 'beignet/lightning';
+
+storage.runStorageConformanceSuite(() => new MyStorage());
+```
+
+Keep the backend synchronous: persist-before-send relies on `transaction()` having committed when it returns.
+
 Every example below assumes `node` is a `LightningNode` instance and uses these namespace aliases:
 
 ```typescript
@@ -1452,7 +1462,7 @@ One row per namespace `beignet/lightning` exports (a test checks this table agai
 | `watchtower` | `WatchtowerClient`, `wtwire`, justice blob, tower connection | -- |
 | `backup` | Static channel backup (SCB) encode/decode | -- |
 | `node` | `LightningNode`, `INodeConfig`, rate limiter | -- |
-| `storage` | `IStorageBackend`, `serialization` (`SqliteStorage` is in `beignet/lightning/sqlite`) | -- |
+| `storage` | `IStorageBackend` and its capability groups, `MemoryStorage`, `runStorageConformanceSuite`, `serialization` (`SqliteStorage` is in `beignet/lightning/sqlite`) | -- |
 | `wallet` | `WalletFundingProvider`, `IFundingProvider` | -- |
 | `advisor` | `LiquidityAdvisor`, `FeeAdvisor`, `ChannelSuggestions`, rebalance/fee executors | -- |
 | `validation` | Input validation utilities | -- |

@@ -28,9 +28,15 @@ export interface IGossipRowPage<T> {
 }
 
 /**
- * Abstract storage backend. SqliteStorage implements this.
+ * The members every storage backend implements: channels, payments,
+ * preimages, invoices, HTLC bookkeeping, chain monitors, gossip, peers, key
+ * indices, metadata and the transaction wrapper.
+ *
+ * Every member is synchronous, and must stay so: persist-before-send relies
+ * on a transaction that has committed by the time transaction() returns,
+ * before any wire message it justifies is sent.
  */
-export interface IStorageBackend {
+export interface IStorageCore {
 	open(): void;
 	close(): void;
 
@@ -42,28 +48,18 @@ export interface IStorageBackend {
 	 * every one the channel ever signed. Loading returns the full set.
 	 */
 	saveChannel(id: string, state: IChannelState, peerPubkey: string): void;
-	/**
-	 * The object saveChannel and the channel loaders record saved HTLC
-	 * snapshots against (htlc-snapshots.ts). A caller that records them
-	 * itself, as RecoveryManager does, has to use the same one, or each of
-	 * its saves looks like a first save into another store and rewrites the
-	 * whole history. That happens when the caller holds a wrapper whose
-	 * methods run on the backend underneath. Without this method the
-	 * backend is its own identity.
-	 */
-	revokedHtlcSnapshotStore?(): object;
 	loadChannel(id: string): { state: IChannelState; peerPubkey: string } | null;
 	loadAllChannels(): Array<{
 		channelId: string;
 		state: IChannelState;
 		peerPubkey: string;
 	}>;
+	/**
+	 * Delete a channel with its HTLC snapshots and its recovery outbox rows:
+	 * penalties and retransmission both need the channel row. Its key index
+	 * stays, as the high-water mark that prevents key reuse.
+	 */
 	deleteChannel(id: string): void;
-
-	/** Required for FFOR archive custody and journal snapshots that contain it. */
-	saveFforVoucher?(record: IFforVoucherArchive): void;
-	loadFforVoucher?(id: string): IFforVoucherArchive | null;
-	loadAllFforVouchers?(): IFforVoucherArchive[];
 
 	// ─── Payments ───
 	savePayment(paymentHash: string, payment: IPaymentInfo): void;
@@ -127,24 +123,12 @@ export interface IStorageBackend {
 	deletePaymentSecret(paymentHashHex: string): void;
 
 	/**
-	 * Persist the expected blinded-path path_id of a BOLT 12 invoice WE issued,
-	 * the receive-side authentication analogue of a BOLT 11 payment secret.
-	 * Written in the same transaction as the invoice's preimage so
-	 * authentication state can never be lost while the payment stays claimable.
-	 *
-	 * save/loadAll are optional in the TYPE so partial test backends keep
-	 * compiling, but MANDATORY for journal-capable storage: journalSupported()
-	 * refuses a backend without them, because a snapshot or restore that drops
-	 * path_ids leaves claimable BOLT 12 invoices permanently unpayable (every
-	 * incoming HTLC fails payment_path_id_mismatch), silently (issue #316).
-	 */
-	saveInvoicePathId?(paymentHashHex: string, pathId: Buffer): void;
-	loadAllInvoicePathIds?(): Array<{ paymentHashHex: string; pathId: Buffer }>;
-	/**
-	 * REQUIRED even though save/load are optional: a backend that persisted
-	 * path_ids but could not delete them would accumulate rows forever, the
-	 * amplification the issued-invoice sweep exists to stop. Backends that do
-	 * not persist path_ids implement this as a no-op.
+	 * Delete the expected path_id of a BOLT 12 invoice we issued.
+	 * REQUIRED even though saving and loading them is optional
+	 * (IInvoicePathIdStorage): a backend that persisted path_ids but could
+	 * not delete them would accumulate rows forever, the amplification the
+	 * issued-invoice sweep exists to stop. Backends that do not persist
+	 * path_ids implement this as a no-op.
 	 */
 	deleteInvoicePathId(paymentHashHex: string): void;
 
@@ -172,79 +156,22 @@ export interface IStorageBackend {
 	}>;
 	deletePeerAddress(pubkey: string): void;
 
-	// ─── Announced Peer Addresses (optional) ───
-	// Reconnect fallbacks from a channel peer's signature-verified
-	// node_announcement, kept separate from peer_addresses: those hold
-	// last-known-good addresses proven by a successful outbound dial, while
-	// these are unproven claims that the peer's next announcement (tracked by
-	// its timestamp) supersedes — including down to an empty list.
-	/** Persist the newest announced address set for a channel peer. */
-	saveAnnouncedPeerAddresses?(
-		pubkey: string,
-		timestamp: number,
-		addresses: Array<{ host: string; port: number }>
-	): void;
-	/** Load every persisted announced address set. */
-	loadAllAnnouncedPeerAddresses?(): Array<{
-		pubkey: string;
-		timestamp: number;
-		addresses: Array<{ host: string; port: number }>;
-	}>;
-
 	// ─── Channel Key Indices ───
 	saveChannelKeyIndex(channelId: string, channelIndex: number): void;
 	loadChannelKeyIndex(channelId: string): number | null;
 	loadNextChannelIndex(): number;
-	/**
-	 * Whether the key-index table holds ANY row, deleted channels included.
-	 * loadNextChannelIndex answers 1 both for an empty table and for one
-	 * whose highest index is 0, and only the empty one has no high-water
-	 * mark at all: that is the boot whose next index is floored at the
-	 * chain tip (issue #906). Optional so partial backends keep compiling;
-	 * without it the node falls back to loadAllChannelKeyIndices, then to
-	 * the next index itself.
-	 */
-	hasChannelKeyIndices?(): boolean;
-	/**
-	 * Every stored key-index row, INCLUDING entries whose channel was
-	 * deleted (deletion keeps them: they are the high-water mark that
-	 * prevents key reuse). Optional in the TYPE so partial test backends
-	 * keep compiling, but MANDATORY for journal-capable storage:
-	 * journalSupported() refuses a backend without it, because a snapshot
-	 * that can only enumerate live channels hands reconstruction a reset
-	 * next-index and reopens key reuse.
-	 */
-	loadAllChannelKeyIndices?(): Array<{
-		channelId: string;
-		channelIndex: number;
-	}>;
 
 	// ─── Metadata (key/value) ───
 	saveMetadata(key: string, value: string): void;
 	loadMetadata(key: string): string | null;
-	/**
-	 * Every metadata row whose key starts with `prefix`, in key order.
-	 * Optional so partial backends keep compiling; a ledger store without it
-	 * (or without deleteMetadata) keeps its id index instead.
-	 */
-	loadMetadataByPrefix?(prefix: string): Array<{ key: string; value: string }>;
-	/** Delete one metadata row; a missing key is not an error. */
-	deleteMetadata?(key: string): void;
-
-	// ─── On-chain Wallet Data (optional, key/value) ───
-	/** Persist one on-chain wallet data value (JSON string) under its key. */
-	saveWalletData?(key: string, value: string): void;
-	/** Load one on-chain wallet data value, or null when absent. */
-	loadWalletData?(key: string): string | null;
 
 	// ─── Transaction wrapper ───
+	/**
+	 * Run `fn` atomically: if it throws, every write it made is undone and
+	 * the error rethrown. Nesting is not promised (see
+	 * withStorageTransaction).
+	 */
 	transaction<T>(fn: () => T): T;
-	/** True while any transaction is open on this backend, however opened. */
-	inTransaction?(): boolean;
-
-	// ─── WAL Checkpoint (optional) ───
-	/** Checkpoint the WAL file, flushing pending writes to the main database. */
-	checkpoint?(): void;
 
 	// ─── HTLC Shared Secrets ───
 	/** Save an HTLC shared secret for failure decryption. */
@@ -253,73 +180,182 @@ export interface IStorageBackend {
 	deleteHtlcSharedSecret(key: string): void;
 	/** Load all persisted HTLC shared secrets. */
 	loadAllHtlcSharedSecrets(): Array<{ key: string; secret: Buffer }>;
+}
 
-	// ─── Gossip Pages (optional) ───
+/**
+ * FFOR voucher archive custody. saveFforVoucher merges with the stored
+ * record (mergeFforVoucherArchive), so a save can add evidence but never
+ * drop it. Required for FFOR archive custody and journal snapshots that
+ * contain it.
+ */
+export interface IFforStorage {
+	saveFforVoucher(record: IFforVoucherArchive): void;
+	loadFforVoucher(id: string): IFforVoucherArchive | null;
+	loadAllFforVouchers(): IFforVoucherArchive[];
+}
+
+/**
+ * The expected blinded-path path_id of each BOLT 12 invoice WE issued, the
+ * receive-side authentication analogue of a BOLT 11 payment secret.
+ * Written in the same transaction as the invoice's preimage so
+ * authentication state can never be lost while the payment stays claimable.
+ *
+ * Optional so partial test backends keep compiling, but MANDATORY for
+ * journal-capable storage: journalSupported() refuses a backend without it,
+ * because a snapshot or restore that drops path_ids leaves claimable BOLT 12
+ * invoices permanently unpayable (every incoming HTLC fails
+ * payment_path_id_mismatch), silently (issue #316). Deleting is in
+ * IStorageCore.
+ */
+export interface IInvoicePathIdStorage {
+	saveInvoicePathId(paymentHashHex: string, pathId: Buffer): void;
+	loadAllInvoicePathIds(): Array<{ paymentHashHex: string; pathId: Buffer }>;
+}
+
+/**
+ * Reconnect fallbacks from a channel peer's signature-verified
+ * node_announcement, kept separate from peer_addresses: those hold
+ * last-known-good addresses proven by a successful outbound dial, while
+ * these are unproven claims that the peer's next announcement (tracked by
+ * its timestamp) supersedes, including down to an empty list.
+ */
+export interface IAnnouncedPeerAddressStorage {
+	/** Persist the newest announced address set for a channel peer. */
+	saveAnnouncedPeerAddresses(
+		pubkey: string,
+		timestamp: number,
+		addresses: Array<{ host: string; port: number }>
+	): void;
+	/** Load every persisted announced address set. */
+	loadAllAnnouncedPeerAddresses(): Array<{
+		pubkey: string;
+		timestamp: number;
+		addresses: Array<{ host: string; port: number }>;
+	}>;
+}
+
+/** The key-index table read whole, deleted channels' rows included. */
+export interface IChannelKeyIndexHistoryStorage {
+	/**
+	 * Whether the key-index table holds ANY row, deleted channels included.
+	 * loadNextChannelIndex answers 1 both for an empty table and for one
+	 * whose highest index is 0, and only the empty one has no high-water
+	 * mark at all: that is the boot whose next index is floored at the
+	 * chain tip (issue #906). Without it the node falls back to
+	 * loadAllChannelKeyIndices, then to the next index itself.
+	 */
+	hasChannelKeyIndices(): boolean;
+	/**
+	 * Every stored key-index row, INCLUDING entries whose channel was
+	 * deleted (deletion keeps them: they are the high-water mark that
+	 * prevents key reuse). MANDATORY for journal-capable storage:
+	 * journalSupported() refuses a backend without it, because a snapshot
+	 * that can only enumerate live channels hands reconstruction a reset
+	 * next-index and reopens key reuse.
+	 */
+	loadAllChannelKeyIndices(): Array<{
+		channelId: string;
+		channelIndex: number;
+	}>;
+}
+
+/**
+ * Metadata enumeration and deletion. A ledger store without them keeps its
+ * id index instead.
+ */
+export interface IMetadataScanStorage {
+	/** Every metadata row whose key starts with `prefix`, in key order. */
+	loadMetadataByPrefix(prefix: string): Array<{ key: string; value: string }>;
+	/** Delete one metadata row; a missing key is not an error. */
+	deleteMetadata(key: string): void;
+}
+
+/** On-chain wallet data, key/value. */
+export interface IWalletDataStorage {
+	/** Persist one on-chain wallet data value (JSON string) under its key. */
+	saveWalletData(key: string, value: string): void;
+	/** Load one on-chain wallet data value, or null when absent. */
+	loadWalletData(key: string): string | null;
+}
+
+/**
+ * The network map read a page at a time. Without these a restore reads it
+ * whole.
+ */
+export interface IGossipPagingStorage {
 	/**
 	 * Up to `limit` stored channel rows after the row `afterRowid`, in the
-	 * order loadAllGossipChannels reads them, so a restore can read the
-	 * network map a page at a time instead of in one call. Without these
-	 * methods a restore reads it whole.
+	 * order loadAllGossipChannels reads them. Start from 0.
 	 */
-	loadGossipChannelsAfter?(
+	loadGossipChannelsAfter(
 		afterRowid: number,
 		limit: number
 	): IGossipRowPage<IGraphChannel>;
 	/** loadGossipChannelsAfter, for the stored node rows. */
-	loadGossipNodesAfter?(
+	loadGossipNodesAfter(
 		afterRowid: number,
 		limit: number
 	): IGossipRowPage<IGraphNode>;
+}
 
-	// ─── Gossip Cleanup (optional) ───
-	/** Delete a gossip channel by SCID hex. Used during graph pruning. */
-	deleteGossipChannel?(scidHex: string): void;
+/** Gossip deletion, used by graph pruning. */
+export interface IGossipPruningStorage {
+	/** Delete a gossip channel by SCID hex. */
+	deleteGossipChannel(scidHex: string): void;
 	/** Delete a gossip node by node id hex once its last channel goes (issue #447). */
-	deleteGossipNode?(nodeIdHex: string): void;
+	deleteGossipNode(nodeIdHex: string): void;
+}
 
-	// ─── Channel Routing Policies (optional) ───
+/** Per-channel routing-policy overrides. */
+export interface IChannelPolicyStorage {
 	/** Save a per-channel routing-policy override (msat fields as strings). */
-	saveChannelPolicy?(channelId: string, policy: IPersistedChannelPolicy): void;
+	saveChannelPolicy(channelId: string, policy: IPersistedChannelPolicy): void;
 	/** Load all persisted routing-policy overrides. */
-	loadAllChannelPolicies?(): Array<{
+	loadAllChannelPolicies(): Array<{
 		channelId: string;
 		policy: IPersistedChannelPolicy;
 	}>;
 	/** Delete a per-channel routing-policy override. */
-	deleteChannelPolicy?(channelId: string): void;
+	deleteChannelPolicy(channelId: string): void;
+}
 
-	// ─── Peer Storage Blobs (optional, BOLT 1 option_provide_storage) ───
-	/** Persist the latest peer_storage blob for a peer (one blob per peer). */
-	savePeerStorageBlob?(
+/** Peer storage blobs (BOLT 1 option_provide_storage), one per peer. */
+export interface IPeerStorageBlobStorage {
+	/** Persist the latest peer_storage blob for a peer. */
+	savePeerStorageBlob(
 		peerPubkey: string,
 		blob: Buffer,
 		receivedAt: number
 	): void;
 	/** Load the stored peer_storage blob for a peer. */
-	loadPeerStorageBlob?(
+	loadPeerStorageBlob(
 		peerPubkey: string
 	): { blob: Buffer; receivedAt: number } | null;
 	/** Delete the stored peer_storage blob for a peer. */
-	deletePeerStorageBlob?(peerPubkey: string): void;
+	deletePeerStorageBlob(peerPubkey: string): void;
+}
 
-	// ─── Forwarding Events (optional, settled-forward ledger) ───
+/** The settled-forward ledger. */
+export interface IForwardingStorage {
 	/** Persist one settled forward (both legs fulfilled). */
-	saveForwardingEvent?(event: Omit<IForwardingEvent, 'id'>): void;
+	saveForwardingEvent(event: Omit<IForwardingEvent, 'id'>): void;
 	/** List settled forwards, newest first. */
-	listForwardingEvents?(filter?: IForwardingEventFilter): IForwardingEvent[];
+	listForwardingEvents(filter?: IForwardingEventFilter): IForwardingEvent[];
 	/** Aggregate totals over settled forwards. */
-	getForwardingSummary?(options?: { since?: number }): IForwardingSummary;
+	getForwardingSummary(options?: { since?: number }): IForwardingSummary;
+}
 
-	// ─── Action Log (optional) ───
+/** The structured action log. */
+export interface IActionLogStorage {
 	/** Save a structured log entry. Capped at maxRows (default 10000). */
-	saveActionLog?(entry: {
+	saveActionLog(entry: {
 		category: string;
 		action: string;
 		timestamp: number;
 		data: string;
 	}): void;
 	/** Load action log entries with optional filters. */
-	loadActionLog?(options?: {
+	loadActionLog(options?: {
 		category?: string;
 		since?: number;
 		limit?: number;
@@ -329,47 +365,53 @@ export interface IStorageBackend {
 		timestamp: number;
 		data: string;
 	}>;
+}
 
-	// ─── Watchtower (optional, LND altruist client) ───
+/** Watchtower sessions and justice updates (LND altruist client). */
+export interface IWatchtowerStorage {
 	/** Persist a negotiated tower session plus its per-session Noise key. */
-	saveWatchtowerSession?(session: IWatchtowerSession, sessionKey: Buffer): void;
+	saveWatchtowerSession(session: IWatchtowerSession, sessionKey: Buffer): void;
 	/** Load all persisted tower sessions with their session keys. */
-	loadWatchtowerSessions?(): Array<IWatchtowerSession & { sessionKey: Buffer }>;
+	loadWatchtowerSessions(): Array<IWatchtowerSession & { sessionKey: Buffer }>;
 	/** Advance a session's shipped/acked sequence counters. */
-	setWatchtowerSessionProgress?(
+	setWatchtowerSessionProgress(
 		sessionId: string,
 		seqNum: number,
 		lastApplied: number
 	): void;
 	/** Drop all sessions + queued updates for a removed tower. */
-	deleteWatchtowerTower?(towerUri: string): void;
+	deleteWatchtowerTower(towerUri: string): void;
 	/** Queue an un-acked justice update; returns its row id. */
-	addWatchtowerUpdate?(update: IWatchtowerUpdate): number;
+	addWatchtowerUpdate(update: IWatchtowerUpdate): number;
 	/** Load the un-acked backlog (oldest first). */
-	loadPendingWatchtowerUpdates?(): Array<IWatchtowerUpdate & { id: number }>;
+	loadPendingWatchtowerUpdates(): Array<IWatchtowerUpdate & { id: number }>;
 	/** Mark a queued update acked at the given sequence number. */
-	markWatchtowerUpdateAcked?(id: number, seqNum: number): void;
+	markWatchtowerUpdateAcked(id: number, seqNum: number): void;
+}
 
-	// ─── Recovery Outbox (optional, docs/RECOVERY-PROTOCOL.md 5.2) ───
-	// The transactional outbox: a row commits in the SAME transaction as the
-	// state that makes its message necessary, and the socket write happens only
-	// after that commit. Optional rather than required because a backend
-	// without it degrades to reconstructing retransmissions from channel state,
-	// which is exactly the pre-outbox behavior; the atomicity fixes in
-	// RecoveryManager hold either way. Contrast deletePreimage, which is
-	// required because its absence would leave a claimable hash behind.
+/**
+ * The recovery outbox (docs/RECOVERY-PROTOCOL.md 5.2). A row commits in the
+ * SAME transaction as the state that makes its message necessary, and the
+ * socket write happens only after that commit. Optional rather than
+ * required because a backend without it degrades to reconstructing
+ * retransmissions from channel state, which is exactly the pre-outbox
+ * behavior; the atomicity fixes in RecoveryManager hold either way.
+ * Contrast deletePreimage, which is required because its absence would
+ * leave a claimable hash behind.
+ */
+export interface IRecoveryOutboxStorage {
 	/** Persist one outbound message; returns the new row id. */
-	saveOutboxMessage?(message: IRecoveryOutboxMessage): number;
+	saveOutboxMessage(message: IRecoveryOutboxMessage): number;
 	/** Load retained rows, oldest first, optionally for one channel. */
-	loadOutboxMessages?(channelId?: string): IRecoveryOutboxStoredMessage[];
+	loadOutboxMessages(channelId?: string): IRecoveryOutboxStoredMessage[];
 	/**
 	 * Count a channel's retained rows. Kept separate from loadOutboxMessages
 	 * so the per-channel row cap can be enforced without decrypting every
 	 * retained wire message just to take the length of the result.
 	 */
-	countOutboxMessages?(channelId: string): number;
+	countOutboxMessages(channelId: string): number;
 	/** Advance one row's disposition (e.g. after the socket write). */
-	setOutboxDisposition?(
+	setOutboxDisposition(
 		id: number,
 		disposition: 'pending_send' | 'sent_unacked' | 'superseded'
 	): void;
@@ -377,60 +419,164 @@ export interface IStorageBackend {
 	 * Delete a channel's rows, optionally only those of the given message
 	 * types. Used when reestablish proves the peer already holds them.
 	 */
-	deleteOutboxMessages?(channelId: string, messageTypes?: number[]): void;
+	deleteOutboxMessages(channelId: string, messageTypes?: number[]): void;
 	/** Keep only the newest `keepNewest` rows for a channel. */
-	pruneOutboxMessages?(channelId: string, keepNewest: number): void;
+	pruneOutboxMessages(channelId: string, keepNewest: number): void;
+}
 
-	// ─── Recovery Journal (optional, docs/RECOVERY-PROTOCOL.md 5.3) ───
-	// Append-only hash-chained frames plus the journal's own metadata (tip,
-	// epoch, last snapshot). Rows are written INSIDE the same transaction as
-	// the transition they record; the ciphertext arrives already
-	// AEAD-encrypted with the per-epoch frame key, so it is deliberately NOT
-	// in ENCRYPTED_COLUMNS (a second storage-key layer would add nothing and
-	// break the AAD binding checks on load).
+/**
+ * The recovery journal (docs/RECOVERY-PROTOCOL.md 5.3): append-only
+ * hash-chained frames plus the journal's own metadata (tip, epoch, last
+ * snapshot). Rows are written INSIDE the same transaction as the transition
+ * they record; the ciphertext arrives already AEAD-encrypted with the
+ * per-epoch frame key, so a backend stores it as it is.
+ */
+export interface IRecoveryJournalStorage {
 	/** Append one encrypted frame. Throws if the sequence already exists. */
-	saveRecoveryFrame?(frame: IStoredRecoveryFrame): void;
+	saveRecoveryFrame(frame: IStoredRecoveryFrame): void;
 	/** Load frames in sequence order, optionally after a given sequence. */
-	loadRecoveryFrames?(afterSequence?: number): IStoredRecoveryFrame[];
+	loadRecoveryFrames(afterSequence?: number): IStoredRecoveryFrame[];
 	/** Load the one frame stored at exactly this sequence, or null. */
-	loadRecoveryFrame?(sequence: number): IStoredRecoveryFrame | null;
+	loadRecoveryFrame(sequence: number): IStoredRecoveryFrame | null;
 	/**
 	 * The cleartext columns of the frame at exactly this sequence, without
 	 * reading its ciphertext, or null. Lets a per-write check that only
 	 * compares hashes skip copying a frame that can be a full channel state.
 	 */
-	loadRecoveryFrameHeader?(sequence: number): IStoredRecoveryFrameHeader | null;
+	loadRecoveryFrameHeader(sequence: number): IStoredRecoveryFrameHeader | null;
 	/**
 	 * Compaction: drop every frame with sequence below the given one. Part of
 	 * the journalSupported contract, not a nice-to-have: verification requires
 	 * the first retained frame to BE the recorded snapshot, which only holds
 	 * when snapshots prune the deltas below them.
 	 */
-	deleteRecoveryFramesBelow?(sequence: number): void;
+	deleteRecoveryFramesBelow(sequence: number): void;
 	/** Stamp outbox rows with the journal frame that carried their insert. */
-	setOutboxFrameSequence?(ids: number[], frameSequence: number): void;
+	setOutboxFrameSequence(ids: number[], frameSequence: number): void;
 	/** Read one journal metadata value (tip hash, epoch, snapshot marker). */
-	getRecoveryMeta?(key: string): string | null;
+	getRecoveryMeta(key: string): string | null;
 	/** Write one journal metadata value. */
-	setRecoveryMeta?(key: string, value: string): void;
+	setRecoveryMeta(key: string, value: string): void;
 	/** Remove one journal metadata value. */
-	deleteRecoveryMeta?(key: string): void;
+	deleteRecoveryMeta(key: string): void;
 	/**
 	 * Enumerate every stored recovery metadata key. Restore-target
 	 * emptiness checks prefer this over a known-key list, so residue under
 	 * ANY key (a writer lease, a repair marker) refuses the restore.
 	 */
-	listRecoveryMetaKeys?(): string[];
+	listRecoveryMetaKeys(): string[];
 	/**
 	 * Row-count and sequence span of the stored recovery frames (null when
 	 * none). Lets per-write chain invariants prove retained-chain
 	 * contiguity without loading every ciphertext.
 	 */
-	recoveryFrameStats?(): {
+	recoveryFrameStats(): {
 		count: number;
 		minSequence: number;
 		maxSequence: number;
 	} | null;
+}
+
+/** The recovery outbox and journal together; see hasRecoveryStorage. */
+export interface IRecoveryStorage
+	extends IRecoveryOutboxStorage,
+		IRecoveryJournalStorage {}
+
+/** Created BOLT 12 offers. */
+export interface IOfferStorage {
+	/**
+	 * Persist a created offer. The bech32m encoding is the authoritative
+	 * artifact (offer, TLV bytes and offer id are all re-derived from it on
+	 * load); pathId is the secret bound into the offer's blinded paths, null
+	 * for offers without one. Saving an offer id again keeps its createdAt,
+	 * and keeps its pathId when the new one is null.
+	 */
+	saveOffer(
+		offerIdHex: string,
+		encoded: string,
+		pathId: Buffer | null,
+		createdAt: number,
+		asyncHold?: boolean
+	): void;
+	/** Load every persisted offer. */
+	loadAllOffers(): Array<{
+		offerIdHex: string;
+		encoded: string;
+		pathId: Buffer | null;
+		createdAt: number;
+		asyncHold?: boolean;
+	}>;
+	/** Delete a persisted offer. */
+	deleteOffer(offerIdHex: string): void;
+}
+
+/**
+ * The optional capability groups by name, as hasStorageCapability takes
+ * them. The library probes for a group before using it and degrades, or
+ * refuses the feature, without it. A backend should implement a group whole
+ * or not at all; runStorageConformanceSuite fails one that implements part
+ * of a group.
+ */
+export interface IStorageCapabilities {
+	ffor: IFforStorage;
+	invoicePathIds: IInvoicePathIdStorage;
+	announcedPeerAddresses: IAnnouncedPeerAddressStorage;
+	channelKeyIndexHistory: IChannelKeyIndexHistoryStorage;
+	metadataScan: IMetadataScanStorage;
+	walletData: IWalletDataStorage;
+	gossipPaging: IGossipPagingStorage;
+	gossipPruning: IGossipPruningStorage;
+	channelPolicies: IChannelPolicyStorage;
+	peerStorageBlobs: IPeerStorageBlobStorage;
+	forwarding: IForwardingStorage;
+	actionLog: IActionLogStorage;
+	watchtower: IWatchtowerStorage;
+	recoveryOutbox: IRecoveryOutboxStorage;
+	recoveryJournal: IRecoveryJournalStorage;
+	offers: IOfferStorage;
+}
+
+/** A name in IStorageCapabilities. */
+export type StorageCapability = keyof IStorageCapabilities;
+
+/**
+ * Abstract storage backend: IStorageCore plus any of the capability groups
+ * in IStorageCapabilities, each optional. SqliteStorage and MemoryStorage
+ * implement all of them. runStorageConformanceSuite checks a custom backend
+ * against the same contract.
+ */
+export interface IStorageBackend
+	extends IStorageCore,
+		Partial<IFforStorage>,
+		Partial<IInvoicePathIdStorage>,
+		Partial<IAnnouncedPeerAddressStorage>,
+		Partial<IChannelKeyIndexHistoryStorage>,
+		Partial<IMetadataScanStorage>,
+		Partial<IWalletDataStorage>,
+		Partial<IGossipPagingStorage>,
+		Partial<IGossipPruningStorage>,
+		Partial<IChannelPolicyStorage>,
+		Partial<IPeerStorageBlobStorage>,
+		Partial<IForwardingStorage>,
+		Partial<IActionLogStorage>,
+		Partial<IWatchtowerStorage>,
+		Partial<IRecoveryOutboxStorage>,
+		Partial<IRecoveryJournalStorage>,
+		Partial<IOfferStorage> {
+	/**
+	 * The object saveChannel and the channel loaders record saved HTLC
+	 * snapshots against (htlc-snapshots.ts). A caller that records them
+	 * itself, as RecoveryManager does, has to use the same one, or each of
+	 * its saves looks like a first save into another store and rewrites the
+	 * whole history. That happens when the caller holds a wrapper whose
+	 * methods run on the backend underneath. Without this method the
+	 * backend is its own identity.
+	 */
+	revokedHtlcSnapshotStore?(): object;
+	/** True while any transaction is open on this backend, however opened. */
+	inTransaction?(): boolean;
+	/** Checkpoint the WAL file, flushing pending writes to the main database. */
+	checkpoint?(): void;
 	/**
 	 * Whether secrets written through this backend are protected at rest.
 	 * The writer lease (recovery 5.6) keeps a signing key, so it refuses to
@@ -447,31 +593,6 @@ export interface IStorageBackend {
 	 * state they act on.
 	 */
 	corruptRowCount?(): number;
-
-	// ─── BOLT 12 Offers (optional) ───
-	/**
-	 * Persist a created offer. The bech32m encoding is the authoritative
-	 * artifact (offer, TLV bytes and offer id are all re-derived from it on
-	 * load); pathId is the secret bound into the offer's blinded paths, null
-	 * for offers without one.
-	 */
-	saveOffer?(
-		offerIdHex: string,
-		encoded: string,
-		pathId: Buffer | null,
-		createdAt: number,
-		asyncHold?: boolean
-	): void;
-	/** Load every persisted offer. */
-	loadAllOffers?(): Array<{
-		offerIdHex: string;
-		encoded: string;
-		pathId: Buffer | null;
-		createdAt: number;
-		asyncHold?: boolean;
-	}>;
-	/** Delete a persisted offer. */
-	deleteOffer?(offerIdHex: string): void;
 }
 
 /**

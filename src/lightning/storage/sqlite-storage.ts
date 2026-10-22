@@ -43,7 +43,7 @@ import type {
 import type { IChannelState } from '../channel/channel-state';
 import type { IHtlcSnapshotEntry } from '../channel/types';
 import {
-	markRevokedHtlcSnapshotsSaved,
+	attachStoredRevokedHtlcSnapshots,
 	unsavedRevokedHtlcSnapshots
 } from '../channel/htlc-snapshots';
 import type { IPaymentInfo } from '../node/payment-types';
@@ -62,7 +62,9 @@ import {
 	serializeGraphChannel,
 	deserializeGraphChannel,
 	serializeGraphNode,
-	deserializeGraphNode
+	deserializeGraphNode,
+	serializeInvoiceInfo,
+	deserializeInvoiceInfo
 } from './serialization';
 import {
 	ENC_PREFIX,
@@ -1040,25 +1042,18 @@ export class SqliteStorage implements IStorageBackend {
 
 	/**
 	 * Give a loaded channel its stored snapshots. A row the 18->19 migration
-	 * could not read still carries its own; they are kept, and stay unsaved so
-	 * the channel's next save moves them into the table. Rows read inside an
-	 * open transaction may still roll back, so that state is left untracked
-	 * and its next save writes its whole history.
+	 * could not read still carries its own, which attaching keeps.
 	 */
 	private _attachRevokedHtlcSnapshots(
 		state: IChannelState,
 		stored: Map<string, IHtlcSnapshotEntry[]> | undefined
 	): void {
-		let history = stored;
-		if (state.revokedHtlcSnapshots?.size) {
-			history = new Map(stored);
-			for (const [key, entries] of state.revokedHtlcSnapshots) {
-				if (entries.length > 0 && !history.has(key)) history.set(key, entries);
-			}
-		}
-		state.revokedHtlcSnapshots = history?.size ? history : undefined;
-		if (this.db.inTransaction) return;
-		markRevokedHtlcSnapshotsSaved(state, this, stored?.keys() ?? []);
+		attachStoredRevokedHtlcSnapshots(
+			state,
+			stored,
+			this,
+			!this.db.inTransaction
+		);
 	}
 
 	deleteChannel(id: string): void {
@@ -1627,22 +1622,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Invoices ───
 
 	saveInvoice(paymentHashHex: string, invoice: IInvoiceInfo): void {
-		const json = JSON.stringify({
-			paymentHash: invoice.paymentHash,
-			bolt11: invoice.bolt11,
-			amountMsat:
-				invoice.amountMsat !== undefined
-					? invoice.amountMsat.toString()
-					: undefined,
-			description: invoice.description,
-			expiry: invoice.expiry,
-			createdAt: invoice.createdAt,
-			hold: invoice.hold,
-			bolt12: invoice.bolt12,
-			cancelledAt: invoice.cancelledAt,
-			jitFee: invoice.jitFee,
-			minFinalCltvExpiry: invoice.minFinalCltvExpiry
-		});
+		const json = JSON.stringify(serializeInvoiceInfo(invoice));
 		this._stmt(
 			'INSERT OR REPLACE INTO invoices (payment_hash_hex, invoice_json) VALUES (?, ?)'
 		).run(paymentHashHex, this._enc(json));
@@ -1656,29 +1636,11 @@ export class SqliteStorage implements IStorageBackend {
 			[];
 		for (const row of rows) {
 			try {
-				const parsed = JSON.parse(this._dec(row.invoice_json));
 				results.push({
 					paymentHashHex: row.payment_hash_hex,
-					invoice: {
-						paymentHash: parsed.paymentHash,
-						bolt11: parsed.bolt11,
-						amountMsat:
-							parsed.amountMsat !== undefined
-								? BigInt(parsed.amountMsat)
-								: undefined,
-						description: parsed.description,
-						expiry: parsed.expiry,
-						createdAt: parsed.createdAt,
-						hold: parsed.hold,
-						bolt12: parsed.bolt12,
-						cancelledAt: parsed.cancelledAt,
-						// A row written before #595 has none; the allowance is then
-						// absent and the final hop enforces BOLT 4 unchanged.
-						jitFee: parsed.jitFee,
-						// A row written before #770 has none: the final hop then
-						// enforces the node default, which is what it advertised.
-						minFinalCltvExpiry: parsed.minFinalCltvExpiry
-					}
+					invoice: deserializeInvoiceInfo(
+						JSON.parse(this._dec(row.invoice_json))
+					)
 				});
 			} catch (err) {
 				// Skip corrupted row
