@@ -196,6 +196,40 @@ describe('Crypto provider (issue #1696)', () => {
 			expect(Buffer.isBuffer(randomBytes(4))).to.equal(true);
 		});
 
+		it('copies its results, so reused output memory cannot alias keys', () => {
+			// Two output slots used in turn, the way a WASM-backed library can
+			// hand back views into its heap. No vector can see this.
+			const slots = [new Uint8Array(64), new Uint8Array(64)];
+			let turn = 0;
+			const reuse = (bytes: Uint8Array): Uint8Array => {
+				const slot = slots[turn++ % 2].subarray(0, bytes.length);
+				slot.set(bytes);
+				return slot;
+			};
+			const base = createCountingCryptoProvider().provider;
+			const reusing: ICryptoProvider = {
+				...base,
+				sha256: (data) => reuse(base.sha256(data)),
+				randomBytes: (size) => reuse(base.randomBytes(size))
+			};
+			expect(selfTestCryptoProvider(reusing)).to.deep.equal([]);
+			setCryptoProvider(reusing);
+
+			const preimage = randomBytes(32);
+			const drawn = Buffer.from(preimage);
+			randomBytes(32);
+			const sessionKey = randomBytes(32);
+			expect(preimage.equals(drawn)).to.equal(true);
+			expect(preimage.equals(sessionKey)).to.equal(false);
+
+			const digest = sha256(Buffer.from('abc'));
+			sha256(Buffer.from('a'));
+			sha256(Buffer.from('b'));
+			expect(digest.toString('hex')).to.equal(
+				'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+			);
+		});
+
 		it('decrypts what the default encrypted', () => {
 			const key = deriveStorageKey(Buffer.alloc(32, 1));
 			const row = encryptValue(key, 'stored before the swap');
@@ -256,6 +290,25 @@ describe('Crypto provider (issue #1696)', () => {
 					broken({ randomBytes: (size) => new Uint8Array(size).fill(4) })
 				)
 			).to.deep.equal(['randomBytes']);
+		});
+
+		it('is refused when HKDF mishandles an empty salt', () => {
+			// Right with a salt, wrong without one, which is how every storage,
+			// backup and recovery key is derived.
+			const base = createCountingCryptoProvider().provider;
+			expect(
+				selfTestCryptoProvider(
+					broken({
+						hkdfSha256: (ikm, salt, info, length) =>
+							base.hkdfSha256(
+								ikm,
+								salt.length > 0 ? salt : Buffer.from('salt'),
+								info,
+								length
+							)
+					})
+				)
+			).to.deep.equal(['hkdfSha256']);
 		});
 
 		it('is refused when a method throws', () => {

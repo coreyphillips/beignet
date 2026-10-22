@@ -797,7 +797,7 @@ Recommended safeguards in production:
 }
 ```
 
-Nothing in the `beignet` entry loads Node `crypto` until `createEncryptedStorage` is first called. It then needs HKDF-SHA256, random bytes and AES-256-GCM. An app that encrypts wallet storage either ships a `crypto` shim that covers those, or passes its own implementation (of the `ICryptoProvider` interface) to `setCryptoProvider` before the first call. Each primitive is checked against a known-answer vector before its first use, and one that fails throws an error naming it rather than returning wrong bytes.
+Nothing in the `beignet` entry loads Node `crypto` until `createEncryptedStorage` is first called. It then needs HKDF-SHA256, random bytes and AES-256-GCM. An app that encrypts wallet storage either ships a `crypto` shim that covers those, or passes its own implementation (of the `ICryptoProvider` interface) to `setCryptoProvider` before the first call. Each primitive is checked against a known-answer vector before its first use, and one that fails throws an error naming it rather than returning wrong bytes. The check catches a missing or broken primitive, not a weak one: no test can tell predictable random bytes from secure ones, so a provider's `randomBytes` must come from the platform's secure generator.
 
 ## Documentation
 
