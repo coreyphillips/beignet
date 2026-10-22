@@ -1,12 +1,14 @@
 /**
- * FFOR Appendix D (specs/ffor-variant-d-vectors.md): the Variant D setup
- * transcript, byte for byte.
+ * FFOR Appendix D: the Variant D setup transcript, byte for byte.
  *
- * The fixture constants below are copied from the generator
- * (specs/tools/generate-ffor-variant-d-vectors.ts) and the expected values
- * from the appendix. Every signed message, every section 7.5.2 hash, both
- * commitment views and the voucher onion are rebuilt here with the ffor
- * module's codecs and beignet's own builder, and compared to the appendix.
+ * The fixture constants below are copied from the generator and the expected
+ * values from the appendix, both in the spec repository:
+ * https://github.com/coreyphillips/ffor/blob/ec77c7f44453b2d7b0124dccbeee946f5ae37fda/tools/generate-ffor-variant-d-vectors.ts
+ * https://github.com/coreyphillips/ffor/blob/ec77c7f44453b2d7b0124dccbeee946f5ae37fda/ffor-variant-d-vectors.md
+ *
+ * Every signed message, every section 7.5.2 hash, both commitment views and
+ * the voucher onion are rebuilt here with the ffor module's codecs and
+ * beignet's own builder, and compared to the appendix.
  */
 
 import { expect } from 'chai';

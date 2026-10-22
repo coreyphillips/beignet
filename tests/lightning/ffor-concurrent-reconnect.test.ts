@@ -1,6 +1,6 @@
 /**
  * FFOR concurrent receive, version 1: reconnect
- * (specs/CONCURRENT-RECEIVE.md section 8, base section 7.5.5).
+ * (docs/specs/CONCURRENT-RECEIVE.md section 8, base section 7.5.5).
  *
  * A reconnect completes the ordinary channel_reestablish and the base FFOR
  * state checks and does not close the book. Before either side resumes new

@@ -1,7 +1,7 @@
 /**
  * FFOR Variant D, M8.2 and M8.3: silent settlement and cooperative return
- * (specs/ffor-offline-receive.md sections 7.3, 7.5.4, 7.5.6, 7.6, 8, 9.5.1;
- * section 15.2 M8.2 and M8.3).
+ * (docs/specs/ffor-offline-receive.md sections 7.3, 7.5.4, 7.5.6, 7.6, 8,
+ * 9.5.1; section 15.2 M8.2 and M8.3).
  *
  * Three LightningNodes in loopback: a payer P, the settlement peer S and the
  * recipient R. Every message on every link is logged. R sets up an epoch on

@@ -45,7 +45,7 @@ export interface IChannelReestablishMessage {
 	 */
 	nextLocalNonce?: Buffer;
 	/**
-	 * FFOR (specs/ffor-offline-receive.md section 11.1): TLV 55001, the
+	 * FFOR (docs/specs/ffor-offline-receive.md section 11.1): TLV 55001, the
 	 * epoch id, lifecycle state, last_seq and H_act of the channel's epoch.
 	 * Odd, so a peer without the feature ignores it.
 	 */

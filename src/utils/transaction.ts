@@ -426,7 +426,7 @@ export const getByteCount = (
 // Bitcoin Core prices dust at three sats per vbyte (the default dust relay
 // fee) over the serialized output plus the cost of spending it: 67 vbytes for
 // a witness program, 148 for anything else. See GetDustThreshold in
-// src/policy/policy.cpp.
+// https://github.com/bitcoin/bitcoin/blob/master/src/policy/policy.cpp.
 const DUST_RELAY_SATS_PER_VBYTE = 3;
 const WITNESS_SPEND_VBYTES = 67;
 const LEGACY_SPEND_VBYTES = 148;

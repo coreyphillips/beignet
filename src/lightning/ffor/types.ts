@@ -1,10 +1,10 @@
 /**
- * FFOR: Fast-Forward Offline Receive, Variant D (specs/ffor-offline-receive.md
- * v0.9, sections 7, 7.5, 7.6, 9.5). Plain Variant D only: no tower, no
- * witnesses, no escapes, no settlement packages. The whole protocol is the
- * signed lifecycle of section 7.5 wrapped around one stock BOLT 2 voucher
- * round (section 9.5.1), silent preimage settlement (section 9.5.1
- * "Settlement") and a stock drain (section 7.5.6).
+ * FFOR: Fast-Forward Offline Receive, Variant D
+ * (docs/specs/ffor-offline-receive.md v0.9, sections 7, 7.5, 7.6, 9.5). Plain
+ * Variant D only: no tower, no witnesses, no escapes, no settlement packages.
+ * The whole protocol is the signed lifecycle of section 7.5 wrapped around one
+ * stock BOLT 2 voucher round (section 9.5.1), silent preimage settlement
+ * (section 9.5.1 "Settlement") and a stock drain (section 7.5.6).
  *
  * Message types (section 14) are odd, in the experimental range, and thus
  * ignorable by a peer that does not implement them.
@@ -30,8 +30,8 @@ export const FF_REESTABLISH_TLV_TYPE = 55001n;
 export const FF_RECEIVE_FEATURE_BIT = 560;
 
 /**
- * Feature bits 562/563, option_ff_concurrent (CONCURRENT-RECEIVE.md section
- * 1.1): the concurrent receive extension, a proposed experimental
+ * Feature bits 562/563, option_ff_concurrent (docs/specs/CONCURRENT-RECEIVE.md
+ * section 1.1): the concurrent receive extension, a proposed experimental
  * assignment.
  */
 export const FF_CONCURRENT_FEATURE_BIT = 562;
@@ -150,9 +150,9 @@ export interface IFforEpochParams {
 	 */
 	hashChain?: boolean;
 	/**
-	 * TLV 17 (CONCURRENT-RECEIVE.md section 1.1): the concurrent_version R
-	 * asked for, exactly as the wire carried it. Absent means no TLV: a
-	 * baseline epoch. A request is not a selection; see
+	 * TLV 17 (docs/specs/CONCURRENT-RECEIVE.md section 1.1): the
+	 * concurrent_version R asked for, exactly as the wire carried it. Absent
+	 * means no TLV: a baseline epoch. A request is not a selection; see
 	 * IFforEpochRecord.concurrentVersion.
 	 */
 	concurrentVersion?: number;
@@ -292,14 +292,15 @@ export interface IFforEpochRecord {
 	 *
 	 * R of a concurrent epoch also sets it when S signs a second
 	 * ff_close_ack that differs from the one R processed
-	 * (CONCURRENT-RECEIVE.md section 7: every reported settled bit must stay
-	 * set). The epoch is in dispute from then on: R takes no new ordinary
-	 * add until the book is CLOSED, and the host is told ('ffor:enforce').
+	 * (docs/specs/CONCURRENT-RECEIVE.md section 7: every reported settled bit
+	 * must stay set). The epoch is in dispute from then on: R takes no new
+	 * ordinary add until the book is CLOSED, and the host is told
+	 * ('ffor:enforce').
 	 */
 	activationMismatch: boolean;
 	/**
-	 * Both: the profile this epoch selected (CONCURRENT-RECEIVE.md section
-	 * 1.1). Absent or 0 is the baseline epoch of the base spec; 1 is
+	 * Both: the profile this epoch selected (docs/specs/CONCURRENT-RECEIVE.md
+	 * section 1.1). Absent or 0 is the baseline epoch of the base spec; 1 is
 	 * concurrent receive version 1 and 2 retains unresolved claims on close. S sets it as it answers ff_accept with
 	 * the echo; R sets it only on the exact signed echo. It never changes
 	 * afterwards and is never inferred from the features a later connection
@@ -310,8 +311,8 @@ export interface IFforEpochRecord {
 	/** Unknown or contradictory version selection: keep claims, sign no new updates. */
 	concurrentVersionMismatch?: boolean;
 	/**
-	 * Both, concurrent epochs only (CONCURRENT-RECEIVE.md section 8): the
-	 * latest reestablish ran on a connection whose init exchange did not
+	 * Both, concurrent epochs only (docs/specs/CONCURRENT-RECEIVE.md section 8):
+	 * the latest reestablish ran on a connection whose init exchange did not
 	 * advertise the base and concurrent capabilities on both sides. While
 	 * set, an ACTIVE or DRAINING epoch takes no new ordinary add of ours, no
 	 * new delegated settlement and exposes no invoice; fulfils, fails,
@@ -348,8 +349,8 @@ export interface IFforSettlePolicy {
 	minFeeProportionalMillionths?: number;
 	/**
 	 * Answer an ff_init that asks for the concurrent profile (TLV 17,
-	 * CONCURRENT-RECEIVE.md section 1.1). Defaults to true; explicit false
-	 * refuses new concurrent books with reason 2. Existing books and
+	 * docs/specs/CONCURRENT-RECEIVE.md section 1.1). Defaults to true; explicit
+	 * false refuses new concurrent books with reason 2. Existing books and
 	 * baseline requests are not affected. The enabled policy still applies.
 	 */
 	allowConcurrent?: boolean;
@@ -372,8 +373,8 @@ export interface IFforChannelContext {
 	/**
 	 * Whether both sides advertised option_ff_receive and
 	 * option_ff_concurrent in the current init exchange
-	 * (CONCURRENT-RECEIVE.md section 1.1). Absent reads as false: a peer
-	 * whose init is unknown has negotiated nothing.
+	 * (docs/specs/CONCURRENT-RECEIVE.md section 1.1). Absent reads as false: a
+	 * peer whose init is unknown has negotiated nothing.
 	 */
 	concurrentNegotiated?: boolean;
 }

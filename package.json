@@ -38,6 +38,7 @@
     "prepublishOnly": "npm run build",
     "docs:tables": "ts-node scripts/doc-tables.ts",
     "docs:check": "ts-node scripts/doc-tables.ts --check",
+    "docs:paths": "ts-node scripts/comment-paths.ts",
     "docs:html": "typedoc --out api-docs/html",
     "docs:markdown": "typedoc --plugin typedoc-plugin-markdown --out api-docs/markdown",
     "docs": "npm run docs:tables && npm run docs:html && npm run docs:markdown"

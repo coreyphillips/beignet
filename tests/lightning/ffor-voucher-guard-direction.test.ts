@@ -1,6 +1,7 @@
 /**
  * FFOR Variant D: the parked-voucher guard reads a settle id in the HTLC's
- * own direction (specs/ffor-offline-receive.md sections 7.5.5, 9.5.1 step 3).
+ * own direction (docs/specs/ffor-offline-receive.md sections 7.5.5, 9.5.1
+ * step 3).
  *
  * The vouchers are HTLCs S offered: `received-<id>` on R, `offered-<id>` on
  * S, ids s_htlc_id_base .. s_htlc_id_base + K - 1 of S's counter. R's own

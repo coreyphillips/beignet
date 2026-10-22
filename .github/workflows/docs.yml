@@ -32,6 +32,9 @@ jobs:
       - name: Check the generated README tables
         run: npm run docs:check
 
+      - name: Check that comments cite only files in the repository
+        run: npm run docs:paths
+
       # The reference is built from the sources on every run and published
       # as an artifact, never committed, so it cannot go stale in git.
       - name: Build the API reference

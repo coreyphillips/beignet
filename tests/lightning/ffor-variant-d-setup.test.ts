@@ -1,6 +1,7 @@
 /**
  * FFOR Variant D, M8.1: voucher book setup and signed activation
- * (specs/ffor-offline-receive.md sections 7, 7.5, 9.5.1; section 15.2 M8.1).
+ * (docs/specs/ffor-offline-receive.md sections 7, 7.5, 9.5.1; section
+ * 15.2 M8.1).
  *
  * Two ChannelManagers in loopback, peer ids = node ids, every message on a
  * wire log. The gate: the section 9.5.1 sequence exactly, no update message

@@ -105,12 +105,12 @@ export enum Feature {
 	 */
 	ASYNC_RECEIVE_SERVICE = 260,
 	/**
-	 * FFOR: Fast-Forward Offline Receive (specs/ffor-offline-receive.md
+	 * FFOR: Fast-Forward Offline Receive (docs/specs/ffor-offline-receive.md
 	 * section 5), bits 560/561, provisional in the experimental range.
 	 */
 	OPTION_FF_RECEIVE = 560,
 	/**
-	 * FFOR concurrent receive (specs/CONCURRENT-RECEIVE.md section 1.1),
+	 * FFOR concurrent receive (docs/specs/CONCURRENT-RECEIVE.md section 1.1),
 	 * bits 562/563, a proposed experimental assignment. Requires
 	 * option_ff_receive and option_quiesce. Advertised by default when both
 	 * dependencies are present; fforConcurrent.enabled can disable it.

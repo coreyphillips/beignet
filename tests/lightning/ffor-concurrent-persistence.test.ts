@@ -1,6 +1,6 @@
 /**
  * FFOR concurrent receive, version 1: the durable selected version
- * (specs/CONCURRENT-RECEIVE.md sections 1.1 and 8).
+ * (docs/specs/CONCURRENT-RECEIVE.md sections 1.1 and 8).
  *
  * The selected version is persisted with the setup transcript and compared
  * with the stored ff_init and ff_accept bytes on load. A baseline record

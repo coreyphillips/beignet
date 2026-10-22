@@ -88,7 +88,7 @@ export enum MessageType {
 	// BOLT 7: Onion messages
 	ONION_MESSAGE = 513,
 
-	// FFOR Variant D (specs/ffor-offline-receive.md section 14): odd,
+	// FFOR Variant D (docs/specs/ffor-offline-receive.md section 14): odd,
 	// experimental-range types, ignorable by a peer without the feature.
 	FF_INIT = 55001,
 	FF_ACCEPT = 55003,

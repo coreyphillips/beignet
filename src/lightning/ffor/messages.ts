@@ -359,8 +359,8 @@ export function encodeFforInitUnsigned(
 }
 
 /**
- * TLV 17 `concurrent_version` of ff_init and ff_accept (CONCURRENT-RECEIVE.md
- * section 1.1): exactly two bytes, big-endian.
+ * TLV 17 `concurrent_version` of ff_init and ff_accept, exactly two bytes,
+ * big-endian (docs/specs/CONCURRENT-RECEIVE.md section 1.1).
  */
 function encodeConcurrentVersion(version: number): Buffer {
 	if (!Number.isInteger(version) || version < 0 || version > 0xffff) {
@@ -550,8 +550,8 @@ export function decodeFforAcceptMessage(body: Buffer): IFforAcceptMessage {
 
 /**
  * What a stored setup transcript says about the concurrent profile
- * (CONCURRENT-RECEIVE.md section 1.1): the concurrent_version ff_init
- * requested and the one ff_accept echoed, read from the wire bytes the
+ * (docs/specs/CONCURRENT-RECEIVE.md section 1.1): the concurrent_version
+ * ff_init requested and the one ff_accept echoed, read from the wire bytes the
  * epoch record keeps (`[2: type] || body`). `acceptWire` is null before
  * ff_accept. Returns null when a stored message does not decode, so the
  * caller can tell "says baseline" from "cannot say".

@@ -1,7 +1,7 @@
 /**
  * FFOR Variant D: the setup admission barrier (issue #1289).
  *
- * Setup starts on an idle channel (specs/ffor-offline-receive.md section
+ * Setup starts on an idle channel (docs/specs/ffor-offline-receive.md section
  * 9.5.1 step 1) and wraps one stock commitment round around the K voucher
  * adds. From the first setup message until the epoch is ACTIVE or over,
  * neither side offers an ordinary HTLC of its own: an add that interleaves

@@ -18,7 +18,7 @@
  * exactly these bytes and nothing after them" is precise. What it cannot
  * reproduce (a genuinely dead process, real sockets, real fsync timing) is
  * covered by the process-level executor over the same matrix
- * (chaos-node-child.ts, SIGKILL).
+ * (chaos-node-child.cjs, SIGKILL).
  */
 
 import crypto from 'crypto';

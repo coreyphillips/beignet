@@ -349,7 +349,7 @@ export interface INodeConfig {
 	 */
 	fforSettle?: import('../ffor/types').IFforSettlePolicy;
 	/**
-	 * FFOR concurrent receive (specs/CONCURRENT-RECEIVE.md). Enabled by
+	 * FFOR concurrent receive (docs/specs/CONCURRENT-RECEIVE.md). Enabled by
 	 * default when option_ff_receive and option_quiesce are present.
 	 * Explicit true requires both dependencies. Explicit false clears bits
 	 * 562/563 and refuses peers requiring the feature. Epochs still select
@@ -1098,7 +1098,7 @@ export interface ICreateInvoiceOptions {
 	 */
 	asyncHold?: boolean;
 	/**
-	 * FFOR Variant D voucher invoice (specs/ffor-offline-receive.md sections
+	 * FFOR Variant D voucher invoice (docs/specs/ffor-offline-receive.md sections
 	 * 7.3, 7.6): `paymentHash` is the voucher's H_k whose preimage the
 	 * settlement peer holds, the invoice is not a hold invoice, and only the
 	 * caller's `extraRoutingHints` are emitted (the hint carrying S's fee

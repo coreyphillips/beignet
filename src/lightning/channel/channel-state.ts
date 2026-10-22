@@ -804,7 +804,7 @@ export interface IChannelState {
 	spliceAbortOwed?: boolean;
 
 	/**
-	 * FFOR Variant D (specs/ffor-offline-receive.md section 7.5.5): the
+	 * FFOR Variant D (docs/specs/ffor-offline-receive.md section 7.5.5): the
 	 * durable epoch record. Everything a restart with the peer offline needs
 	 * to serve every later transition from disk. Optional for backward
 	 * compatibility with states persisted before this field existed

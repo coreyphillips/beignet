@@ -1,6 +1,6 @@
 /**
  * FFOR concurrent receive, version 1: negotiation
- * (specs/CONCURRENT-RECEIVE.md section 1.1).
+ * (docs/specs/CONCURRENT-RECEIVE.md section 1.1).
  *
  * R asks for the profile in ff_init TLV 17 and S selects it only by the
  * exact signed echo in ff_accept. Each peer must have advertised either bit
@@ -9,11 +9,11 @@
  * all end the setup, and a failed negotiation never continues as a baseline
  * epoch under the same epoch id.
  *
- * The cases follow `selectMode` in the spec's wire model
- * (specs/tools/concurrent-receive-wire.test.mjs), one for one, against two
- * ChannelManagers in loopback. Where the model says "throws", the engine's
- * answer is named: a local refusal, an ff_abort with its reason, or a
- * message that does not decode.
+ * The cases follow `selectMode` in the spec's wire model, one for one,
+ * against two ChannelManagers in loopback:
+ * https://github.com/coreyphillips/ffor/blob/ec77c7f44453b2d7b0124dccbeee946f5ae37fda/tools/concurrent-receive-wire.test.mjs
+ * Where the model says "throws", the engine's answer is named: a local
+ * refusal, an ff_abort with its reason, or a message that does not decode.
  */
 
 import { expect } from 'chai';

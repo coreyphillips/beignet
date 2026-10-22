@@ -1,6 +1,7 @@
 /**
  * FFOR concurrent receive, version 1: adversarial recovery review of PR #1301
- * (specs/CONCURRENT-RECEIVE.md sections 3, 4, 7 and 8; base section 7.5.5).
+ * (docs/specs/CONCURRENT-RECEIVE.md sections 3, 4, 7 and 8; base
+ * section 7.5.5).
  *
  * Two HONEST nodes, and everything that can go wrong between them without
  * either one cheating: a cut connection, a restart, a lost or crossing
@@ -1042,8 +1043,8 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 	// Attack 2: the drain hold.
 	// ───────────────────────────────────────────────────────────────────
 	describe('2. the drain hold (R DRAINING, S reestablishes short of DRAINING)', () => {
-		// CONCURRENT-RECEIVE.md section 3: "A close transition MAY briefly
-		// serialize new ordinary adds, but MUST permit existing ordinary
+		// docs/specs/CONCURRENT-RECEIVE.md section 3: "A close transition MAY
+		// briefly serialize new ordinary adds, but MUST permit existing ordinary
 		// fulfill/fail and commitment progress." Section 8: "Continue safe
 		// fulfill/fail/replay work needed for existing obligations."
 		//

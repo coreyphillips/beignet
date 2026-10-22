@@ -22,8 +22,9 @@ import {
 } from '../../src/cli/beignet-node';
 import { startDaemon } from '../../src/cli/daemon';
 
-// Same rationale as tests/cli/agent-production-hardening.ts: a refused loopback
-// connect returns instantly, where the regtest default is a public host.
+// Same rationale as tests/cli/agent-production-hardening.test.ts: a refused
+// loopback connect returns instantly, where the regtest default is a public
+// host.
 const OFFLINE_ELECTRUM = {
 	electrumHost: '127.0.0.1',
 	electrumPort: 65529,

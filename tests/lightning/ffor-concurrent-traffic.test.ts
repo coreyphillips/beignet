@@ -1,6 +1,6 @@
 /**
  * FFOR concurrent receive, version 1: legal channel traffic
- * (specs/CONCURRENT-RECEIVE.md sections 1.2, 3, 4, 6 and 7).
+ * (docs/specs/CONCURRENT-RECEIVE.md sections 1.2, 3, 4, 6 and 7).
  *
  * A concurrent epoch carries ordinary adds, fulfils and fails and their
  * commitment rounds while ACTIVE and DRAINING, beside the vouchers, which
