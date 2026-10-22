@@ -16,11 +16,10 @@
  */
 
 import { expect } from 'chai';
-import * as fs from 'fs';
-import * as path from 'path';
 import {
 	BeignetError,
 	BeignetErrorCode,
+	BeignetErrorCodeValue,
 	isRetryableError
 } from '../../src/cli/errors';
 import { BeignetNode } from '../../src/cli/beignet-node';
@@ -194,52 +193,12 @@ describe('Issue #471: state and config refusals carry a code, not a 500', () => 
 });
 
 /**
- * Every code the daemon can put on the wire, read out of the source rather than
- * from the enum: BeignetError takes an arbitrary string and production uses
- * that, so walking BeignetErrorCode alone would leave codes like FEE_EXCEEDS_MAX
- * unchecked (they were falling through to 500).
+ * Every code the daemon can put on the wire. BeignetError and the daemon's
+ * failure envelope take only BeignetErrorCode values, so the enum is the
+ * whole vocabulary.
  */
-function emittedErrorCodes(): string[] {
-	const root = path.join(__dirname, '..', '..', 'src');
-	const files: string[] = [];
-	const walk = (dir: string): void => {
-		for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-			const full = path.join(dir, entry.name);
-			if (entry.isDirectory()) walk(full);
-			else if (entry.name.endsWith('.ts')) files.push(full);
-		}
-	};
-	walk(root);
-	const patterns = [
-		/new BeignetError\(\s*'([A-Z0-9_]+)'/g,
-		/new BeignetError\(\s*BeignetErrorCode\.([A-Z0-9_]+)/g,
-		/\bfailure\(\s*'([A-Z0-9_]+)'/g,
-		// An assignment inside a catch, which becomes failure(code, msg). NOT a
-		// `readonly code =` class field: those live on plain Error subclasses
-		// the daemon never unwraps, so they scrub whole (issue #474).
-		/(?<!readonly )\bcode\s*=\s*'([A-Z0-9_]+)'/g
-	];
-	const codes = new Set<string>(Object.values(BeignetErrorCode));
-	for (const file of files) {
-		const src = fs.readFileSync(file, 'utf8');
-		// The receive coordinator's fail helper throws BeignetError too.
-		if (file.endsWith(path.join('cli', 'offline-receive.ts'))) {
-			for (const match of src.matchAll(/\bfail\(\s*'([A-Z0-9_]+)'/g))
-				codes.add(match[1]);
-		}
-		for (const pattern of patterns) {
-			for (const match of src.matchAll(pattern)) codes.add(match[1]);
-		}
-		// Values of the string-keyed translation tables (payment failure codes,
-		// recovery refusal reasons) are emitted the same way.
-		for (const block of src.matchAll(
-			/(?:codeMap|RESTORE_ERROR_CODES)[^=]*=\s*\{([\s\S]*?)\n\t*\};/g
-		)) {
-			for (const match of block[1].matchAll(/:\s*'([A-Z0-9_]+)'/g))
-				codes.add(match[1]);
-		}
-	}
-	return [...codes].sort();
+function emittedErrorCodes(): BeignetErrorCodeValue[] {
+	return Object.values(BeignetErrorCode).sort();
 }
 
 describe('Issue #471: every error code the daemon emits has a decided status', () => {
@@ -252,8 +211,7 @@ describe('Issue #471: every error code the daemon emits has a decided status', (
 	 * (issue #474). INSTANCE_ALREADY_RUNNING never reaches HTTP, and
 	 * INTERNAL_ERROR is the scrub itself.
 	 *
-	 * Adding a code here must be a decision, not an oversight: that is the
-	 * whole point of reading the list out of the source.
+	 * Adding a code here must be a decision, not an oversight.
 	 */
 	const STAYS_500 = new Set<string>([
 		'WALLET_CREATE_FAILED',
@@ -271,14 +229,16 @@ describe('Issue #471: every error code the daemon emits has a decided status', (
 		'INTERNAL_ERROR',
 		'CAPSULE_RESTORE_INSTALL_FAILED',
 		// The receive invoice could not be durably written to wallet storage.
-		'DURABILITY_FAILED'
+		'DURABILITY_FAILED',
+		// Our own payer returned a preimage that does not open the hash.
+		'L402_PREIMAGE_MISMATCH'
 	]);
 
 	const CODES = emittedErrorCodes();
 
-	it('finds the codes by reading the source, not just the enum', () => {
-		// A guard on the guard: if the scan stops matching, every assertion
-		// below passes vacuously.
+	it('walks the codes production code used to throw outside the enum', () => {
+		// A guard on the guard: these were thrown as bare strings before the
+		// enum closed, and falling through to 500 is what this file catches.
 		expect(CODES.length).to.be.greaterThan(50);
 		expect(CODES).to.include('FEE_EXCEEDS_MAX');
 		expect(CODES).to.include('INVALID_REVIEW');

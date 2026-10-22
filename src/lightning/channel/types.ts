@@ -545,6 +545,8 @@ export interface ChannelResult {
 	 * absent means permanent.
 	 */
 	transient?: boolean;
+	/** Why the refusing channel arm refused, when it says (ChannelErrorCode). */
+	code?: import('./channel-actions').ChannelErrorCode;
 }
 
 /** Bitcoin mainnet chain hash */

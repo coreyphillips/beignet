@@ -94,6 +94,7 @@ import {
 	createOpReturnScript,
 	decodeOpReturnMessage,
 	err,
+	EWalletErrorCode,
 	filterAddressesObjForGapLimit,
 	formatKeyDerivationPath,
 	generateWalletId,
@@ -583,7 +584,7 @@ export class Wallet {
 			const res = await wallet.setWalletData();
 			if (res.isErr()) {
 				await wallet._abandonFailedCreate();
-				return err(res.error.message);
+				return err(res.error);
 			}
 			wallet.electrum.startConnectionPolling();
 			void wallet.updateFeeEstimates(true);
@@ -785,7 +786,7 @@ export class Wallet {
 				return err('This wallet is not a multisig wallet.');
 			}
 			const parsed = parseBip48Path(path);
-			if (parsed.isErr()) return err(parsed.error.message);
+			if (parsed.isErr()) return err(parsed.error);
 			const { coinType, account, change, index } = parsed.value;
 			const expectedCoin =
 				this._network === EAvailableNetworks.bitcoin ? '0' : '1';
@@ -803,7 +804,7 @@ export class Wallet {
 				publicKeys: childKeys,
 				network: this.getBitcoinNetwork()
 			});
-			if (payment.isErr()) return err(payment.error.message);
+			if (payment.isErr()) return err(payment.error);
 			const perCosigner = this._multisig.cosigners
 				.map((c, i) => {
 					let masterFingerprint: Buffer;
@@ -1062,7 +1063,7 @@ export class Wallet {
 			// the read below, and is adopted once that read is installed.
 			this.landedReceiveIndex = {};
 			const res = await next.setWalletData();
-			if (res.isErr()) return err(res.error.message);
+			if (res.isErr()) return err(res.error);
 			await this.electrum.disconnect();
 			// Its arrow methods and sendMessage close over it, so this wallet
 			// keeps its own. So does the refresh bookkeeping: a refresh still
@@ -1262,7 +1263,7 @@ export class Wallet {
 		const stopped = 'Wallet stopped.';
 		const r0 = await this.setZeroIndexAddresses();
 		if (r0.isErr()) {
-			return err(r0.error.message);
+			return err(r0.error);
 		}
 		if (this._stopped) return err(stopped);
 		const electrum = this.electrum;
@@ -1275,7 +1276,7 @@ export class Wallet {
 		};
 		const r1 = await this.updateAddressIndexes(scan);
 		if (r1.isErr()) {
-			return err(r1.error.message);
+			return err(r1.error);
 		}
 		if (this._stopped) return err(stopped);
 		const r2 = await this.getUtxos({
@@ -1284,12 +1285,12 @@ export class Wallet {
 			additionalScriptHashes: scan.utxoAddresses
 		});
 		if (r2.isErr()) {
-			return err(r2.error.message);
+			return err(r2.error);
 		}
 		if (this._stopped) return err(stopped);
 		const r3 = await this.updateTransactions({ scanAllAddresses, scan });
 		if (r3.isErr()) {
-			return err(r3.error.message);
+			return err(r3.error);
 		}
 		if (this._stopped) return err(stopped);
 		await this.subscribeWindows();
@@ -1328,12 +1329,10 @@ export class Wallet {
 	private async setWalletData(): Promise<Result<boolean>> {
 		try {
 			const storageIdCheckRes = await this.storageIdCheck(this.id);
-			if (storageIdCheckRes.isErr())
-				return err(storageIdCheckRes.error.message);
+			if (storageIdCheckRes.isErr()) return err(storageIdCheckRes.error);
 			this._data = getDefaultWalletData();
 			const walletDataResponse = await this.getWalletData();
-			if (walletDataResponse.isErr())
-				return err(walletDataResponse.error.message);
+			if (walletDataResponse.isErr()) return err(walletDataResponse.error);
 			this._data = walletDataResponse.value;
 			await this._scrubStoredSendTransaction();
 			await this._trimStoredTransactionInputs();
@@ -1394,7 +1393,7 @@ export class Wallet {
 	 */
 	private async storageIdCheck(id: string): Promise<Result<string>> {
 		const res = await this._readStoredValue('id');
-		if (res.isErr()) return err(res.error.message);
+		if (res.isErr()) return err(res.error);
 		// No id found, it is safe to save to storage.
 		if (!res.value) {
 			// Save id to storage. Without it the next wallet created under this
@@ -1402,7 +1401,11 @@ export class Wallet {
 			this._data.id = id;
 			const saved = await this.saveWalletData('id', id);
 			if (saved.isErr()) {
-				return err(`Unable to save the wallet id: ${saved.error.message}`);
+				return err(
+					saved.error.code,
+					`Unable to save the wallet id: ${saved.error.message}`,
+					saved.error
+				);
 			}
 			return ok('Saved ID to storage.');
 		}
@@ -1718,7 +1721,7 @@ export class Wallet {
 					);
 				}
 				const payment = this.getMultisigPayment(path);
-				if (payment.isErr()) return err(payment.error.message);
+				if (payment.isErr()) return err(payment.error);
 				return ok({
 					address: payment.value.address,
 					publicKey: payment.value.publicKey,
@@ -1732,7 +1735,7 @@ export class Wallet {
 					selectedNetwork: getElectrumNetwork(this._network)
 				};
 				const res = await this._customGetAddress(data);
-				if (res.isErr()) return err(res.error.message);
+				if (res.isErr()) return err(res.error);
 				return ok(res.value);
 			}
 			const keyPair = this._derivePathKeyPair(path);
@@ -1742,7 +1745,7 @@ export class Wallet {
 				addressType,
 				network
 			});
-			if (addressInfo.isErr()) return err(addressInfo.error.message);
+			if (addressInfo.isErr()) return err(addressInfo.error);
 			return ok({
 				...addressInfo.value,
 				path
@@ -1804,7 +1807,7 @@ export class Wallet {
 		}
 		if (!addressType) {
 			const res = getAddressTypeFromPath(path);
-			if (res.isErr()) return err(res.error.message);
+			if (res.isErr()) return err(res.error);
 			addressType = res.value;
 		}
 		try {
@@ -1970,7 +1973,7 @@ export class Wallet {
 					addressType
 				});
 				if (keyDerivationPathResponse.isErr())
-					return err(keyDerivationPathResponse.error.message);
+					return err(keyDerivationPathResponse.error);
 				keyDerivationPath = keyDerivationPathResponse.value;
 				keyDerivationPath.account = this._account;
 			}
@@ -2123,7 +2126,7 @@ export class Wallet {
 		scan: TAddressScan
 	): Promise<Result<IGetNextAvailableAddressResponse>> {
 		const checkRes = await this.checkElectrumConnection();
-		if (checkRes.isErr()) return err(checkRes.error.message);
+		if (checkRes.isErr()) return err(checkRes.error);
 		try {
 			const network = this._network;
 			addressType = addressType ?? this.addressType;
@@ -2132,7 +2135,7 @@ export class Wallet {
 			const result = formatKeyDerivationPath({ path, network });
 
 			if (result.isErr()) {
-				return err(result.error.message);
+				return err(result.error);
 			}
 
 			const { pathObject: keyDerivationPath } = result.value;
@@ -2586,7 +2589,7 @@ export class Wallet {
 				network
 			});
 			if (keyDerivationPathResponse.isErr()) {
-				return err(keyDerivationPathResponse.error.message);
+				return err(keyDerivationPathResponse.error);
 			}
 			keyDerivationPath = keyDerivationPathResponse.value;
 			keyDerivationPath.account = this._account;
@@ -2608,7 +2611,7 @@ export class Wallet {
 			changeAddresses: generatedAddresses.value.changeAddresses
 		});
 		if (removeDuplicateResponse.isErr()) {
-			return err(removeDuplicateResponse.error.message);
+			return err(removeDuplicateResponse.error);
 		}
 		// switchNetwork replaces the Electrum instance along with the data, so
 		// addresses derived before it would be filed under the network that
@@ -2707,7 +2710,7 @@ export class Wallet {
 		scan: TAddressScan
 	): Promise<Result<string>> {
 		const checkRes = await this.checkElectrumConnection();
-		if (checkRes.isErr()) return err(checkRes.error.message);
+		if (checkRes.isErr()) return err(checkRes.error);
 		const currentWallet = this.data;
 		// switchNetwork replaces the Electrum instance along with the data, so
 		// a scan answered after it has looked up the network the wallet left,
@@ -2771,7 +2774,7 @@ export class Wallet {
 						addressIndex: newIndex
 					});
 					if (_addressIndex.isErr()) {
-						return err(_addressIndex.error.message);
+						return err(_addressIndex.error);
 					}
 					addressIndex = Object.values(_addressIndex.value.addresses)[0];
 				}
@@ -2798,7 +2801,7 @@ export class Wallet {
 						changeAddressIndex: newIndex
 					});
 					if (_changeAddressIndex.isErr()) {
-						return err(_changeAddressIndex.error.message);
+						return err(_changeAddressIndex.error);
 					}
 					changeAddressIndex = Object.values(
 						_changeAddressIndex.value.changeAddresses
@@ -2894,7 +2897,7 @@ export class Wallet {
 				addressType
 			});
 			if (getGapLimitResponse.isErr()) {
-				return err(getGapLimitResponse.error.message);
+				return err(getGapLimitResponse.error);
 			}
 			const { addressDelta } = getGapLimitResponse.value;
 
@@ -2913,7 +2916,7 @@ export class Wallet {
 					path
 				});
 				if (keyDerivationPathResponse.isErr()) {
-					return err(keyDerivationPathResponse.error.message);
+					return err(keyDerivationPathResponse.error);
 				}
 				keyDerivationPath = keyDerivationPathResponse.value;
 				keyDerivationPath.account = this._account;
@@ -2940,7 +2943,7 @@ export class Wallet {
 				addressType
 			});
 			if (addAddressesRes.isErr()) {
-				return err(addAddressesRes.error.message);
+				return err(addAddressesRes.error);
 			}
 			const addressIndex = Object.values(this.data.addresses[addressType]).find(
 				(addr) => addr.index === currentAddressIndex + 1
@@ -3102,7 +3105,9 @@ export class Wallet {
 		const saved = await this.saveReceiveIndex();
 		if (saved.isErr()) {
 			return err(
-				`Failed to persist the receive address index: ${saved.error.message}`
+				saved.error.code,
+				`Failed to persist the receive address index: ${saved.error.message}`,
+				saved.error
 			);
 		}
 		return ok(current);
@@ -3173,7 +3178,7 @@ export class Wallet {
 		additionalScriptHashes?: IAddresses;
 	}): Promise<Result<IGetUtxosResponse>> {
 		const checkRes = await this.checkElectrumConnection();
-		if (checkRes.isErr()) return err(checkRes.error.message);
+		if (checkRes.isErr()) return err(checkRes.error);
 		// Read before the query so a broadcast landing while it is in flight is
 		// known to be newer than the answer it returns.
 		const spendMark = this._spendSeq;
@@ -3203,7 +3208,7 @@ export class Wallet {
 			if (at !== -1) scanMarks.splice(at, 1);
 		}
 		if (getUtxosRes.isErr()) {
-			return err(getUtxosRes.error.message);
+			return err(getUtxosRes.error);
 		}
 		if (this.electrum !== electrum) {
 			return err('The wallet switched networks while the UTXO scan ran.');
@@ -3487,7 +3492,9 @@ export class Wallet {
 			const at = this._data.blacklistedUtxos.indexOf(entry);
 			if (at !== -1) this._data.blacklistedUtxos.splice(at, 1);
 			return err(
-				`Failed to persist the freeze for UTXO ${txid}:${index}: ${saved.error.message}`
+				saved.error.code,
+				`Failed to persist the freeze for UTXO ${txid}:${index}: ${saved.error.message}`,
+				saved.error
 			);
 		}
 		return ok({ created: true });
@@ -3528,7 +3535,9 @@ export class Wallet {
 		if (saved.isErr()) {
 			swap(untagged, tagged);
 			return err(
-				`Failed to persist the freeze for UTXO ${txid}:${index}: ${saved.error.message}`
+				saved.error.code,
+				`Failed to persist the freeze for UTXO ${txid}:${index}: ${saved.error.message}`,
+				saved.error
 			);
 		}
 		return ok({ created: true });
@@ -3578,7 +3587,9 @@ export class Wallet {
 				this._data.blacklistedUtxos.push(...removed);
 			}
 			return err(
-				`Failed to persist the unfreeze for UTXO ${txid}:${index}: ${saved.error.message}`
+				saved.error.code,
+				`Failed to persist the unfreeze for UTXO ${txid}:${index}: ${saved.error.message}`,
+				saved.error
 			);
 		}
 		return ok(`UTXO ${txid}:${index} unfrozen.`);
@@ -3672,7 +3683,7 @@ export class Wallet {
 			'addressLabels',
 			this._data.addressLabels
 		);
-		if (saved.isErr()) return err(saved.error.message);
+		if (saved.isErr()) return err(saved.error);
 		return ok(label === '' ? 'Label removed.' : 'Label saved.');
 	}
 
@@ -3791,7 +3802,7 @@ export class Wallet {
 						path: addressTypes[addressType].path,
 						network: this._network
 					});
-					if (pathRes.isErr()) return err(pathRes.error.message);
+					if (pathRes.isErr()) return err(pathRes.error);
 					const purpose = pathRes.value.purpose;
 					const accountPath = `m/${purpose}'/${coinType}'/${this._account}'`;
 					// neutered(): the exported node carries public material only.
@@ -4061,7 +4072,7 @@ export class Wallet {
 			answered: scan?.current() ? scan.history : undefined
 		});
 		if (history.isErr()) {
-			return err(history.error.message);
+			return err(history.error);
 		}
 		if (!history.value.length) {
 			return ok(undefined);
@@ -4084,14 +4095,14 @@ export class Wallet {
 			txHashes: filteredTxHashes
 		});
 		if (getTransactionsResponse.isErr()) {
-			return err(getTransactionsResponse.error.message);
+			return err(getTransactionsResponse.error);
 		}
 
 		const formatTransactionsResponse = await this.formatTransactions({
 			transactions: getTransactionsResponse.value.data
 		});
 		if (formatTransactionsResponse.isErr()) {
-			return err(formatTransactionsResponse.error.message);
+			return err(formatTransactionsResponse.error);
 		}
 		// A transaction whose batch or entry failed, or whose inputs could not
 		// all be looked up, is left out of the answer rather than failing it,
@@ -4298,7 +4309,7 @@ export class Wallet {
 				'The wallet switched networks while the unconfirmed transactions were checked.';
 			const processRes = await this.processUnconfirmedTransactions();
 			if (processRes.isErr()) {
-				return err(processRes.error.message);
+				return err(processRes.error);
 			}
 			if (this.electrum !== electrum) return err(switched);
 
@@ -4320,7 +4331,7 @@ export class Wallet {
 				// memory is right either way and lands with the next write of the
 				// transactions map, and a restart before then reads the lost block
 				// from the stored record itself (issue #870).
-				if (updated.isErr()) return err(updated.error.message);
+				if (updated.isErr()) return err(updated.error);
 				// That write was keyed to the network checked, but everything below
 				// writes to whichever network is live once it lands.
 				if (this.electrum !== electrum) return err(switched);
@@ -4333,7 +4344,7 @@ export class Wallet {
 					unconfirmedTxs,
 					observed
 				});
-				if (updated.isErr()) return err(updated.error.message);
+				if (updated.isErr()) return err(updated.error);
 			} else {
 				// As on the ghost path, an entry a refresh added while this check
 				// waited is kept (issue #944).
@@ -4346,7 +4357,7 @@ export class Wallet {
 					this._data.unconfirmedTransactions
 				);
 				// Already in memory, so the next check writes it again.
-				if (saved.isErr()) return err(saved.error.message);
+				if (saved.isErr()) return err(saved.error);
 			}
 			return ok('Successfully updated unconfirmed transactions.');
 		} catch (e) {
@@ -4652,7 +4663,7 @@ export class Wallet {
 			// lost block, and unwatched. The rescan waits for it too: its forced
 			// refresh runs this check again, and a ghost still observed would
 			// come straight back here (issue #870).
-			if (saved.isErr()) return err(saved.error.message);
+			if (saved.isErr()) return err(saved.error);
 			if (this.electrum !== electrum) return err(switched);
 
 			// The check's own map rather than the old one less these ghosts: a
@@ -4693,7 +4704,7 @@ export class Wallet {
 			// Reported only after the rescan. Memory no longer observes these
 			// ghosts, so nothing in this session would rescan for them again,
 			// and a copy still on disk only repeats this repair after a restart.
-			if (savedUnconfirmed.isErr()) return err(savedUnconfirmed.error.message);
+			if (savedUnconfirmed.isErr()) return err(savedUnconfirmed.error);
 			return ok('Successfully deleted transactions.');
 		} catch (e) {
 			return err(e);
@@ -4832,7 +4843,7 @@ export class Wallet {
 		});
 		if (needsSave) {
 			const saved = await this.saveWalletData('transactions', transactions);
-			if (saved.isErr()) return err(saved.error.message);
+			if (saved.isErr()) return err(saved.error);
 		}
 		return ok('Successfully updated reorg transactions.');
 	}
@@ -4873,7 +4884,7 @@ export class Wallet {
 				'unconfirmedTransactions',
 				this._data.unconfirmedTransactions
 			);
-			if (saved.isErr()) return err(saved.error.message);
+			if (saved.isErr()) return err(saved.error);
 			return ok('Successfully updated unconfirmed transactions.');
 		} catch (e) {
 			this.logger.error('Failed to update unconfirmed transactions.', e);
@@ -5680,7 +5691,7 @@ export class Wallet {
 			rbf
 		});
 		if (setupTransactionRes.isErr()) {
-			return err(setupTransactionRes.error.message);
+			return err(setupTransactionRes.error);
 		}
 
 		if (!Array.isArray(txs)) txs = [txs];
@@ -5695,23 +5706,29 @@ export class Wallet {
 				}
 			});
 			if (updateSendTransactionRes.isErr())
-				return err(updateSendTransactionRes.error.message);
+				return err(updateSendTransactionRes.error);
 			index++;
 		}
 
 		const updateFeeRes = this.transaction.updateFee({ satsPerByte });
 		if (updateFeeRes.isErr()) {
-			if (updateFeeRes.error.message.includes('Unable to increase the fee')) {
+			const { code } = updateFeeRes.error;
+			if (
+				code === EWalletErrorCode.FEE_EXCEEDS_HALF_INPUTS ||
+				code === EWalletErrorCode.FEE_EXCEEDS_HALF_OUTPUTS
+			) {
 				const feeInfo = this.getFeeInfo({ satsPerByte: 1 });
 				if (feeInfo.isOk()) {
 					return err(
-						`Fee is too high. The maximum fee for this transaction is ${feeInfo.value.maxSatPerByte}`
+						code,
+						`Fee is too high. The maximum fee for this transaction is ${feeInfo.value.maxSatPerByte}`,
+						updateFeeRes.error
 					);
 				}
 			}
 			// The fee probe above only refines the message. Either way the fee
 			// was never updated, so never fall through to build and broadcast.
-			return err(updateFeeRes.error.message);
+			return err(updateFeeRes.error);
 		}
 
 		// updateFee priced only the coins the wallet's coinSelectPreference
@@ -5721,13 +5738,13 @@ export class Wallet {
 			shuffleOutputs,
 			runCoinSelect: true
 		});
-		if (createRes.isErr()) return err(createRes.error.message);
+		if (createRes.isErr()) return err(createRes.error);
 		const hex = createRes.value.hex;
 		if (broadcast) {
 			const broadcastRes = await this.electrum.broadcastTransaction({
 				rawTx: hex
 			});
-			if (broadcastRes.isErr()) return err(broadcastRes.error.message);
+			if (broadcastRes.isErr()) return err(broadcastRes.error);
 			return ok(broadcastRes.value);
 		}
 		return this.unfrozenSignedHex(hex);
@@ -5792,7 +5809,7 @@ export class Wallet {
 			rbf
 		});
 		if (setupTransactionRes.isErr()) {
-			return err(setupTransactionRes.error.message);
+			return err(setupTransactionRes.error);
 		}
 		const sendMaxRes = await this.transaction.sendMax({
 			address,
@@ -5801,19 +5818,19 @@ export class Wallet {
 		});
 
 		if (sendMaxRes.isErr()) {
-			return err(sendMaxRes.error.message);
+			return err(sendMaxRes.error);
 		}
 
 		const createRes = await this.transaction.createTransaction({
 			shuffleOutputs: true
 		});
-		if (createRes.isErr()) return err(createRes.error.message);
+		if (createRes.isErr()) return err(createRes.error);
 		const hex = createRes.value.hex;
 		if (broadcast) {
 			const broadcastRes = await this.electrum.broadcastTransaction({
 				rawTx: hex
 			});
-			if (broadcastRes.isErr()) return err(broadcastRes.error.message);
+			if (broadcastRes.isErr()) return err(broadcastRes.error);
 			return ok(broadcastRes.value);
 		}
 		return this.unfrozenSignedHex(hex);
@@ -5902,7 +5919,7 @@ export class Wallet {
 				satsPerByte
 			});
 			if (setupTransactionRes.isErr()) {
-				return err(setupTransactionRes.error.message);
+				return err(setupTransactionRes.error);
 			}
 			let index = 0;
 			for (const tx of sendTxs) {
@@ -5915,12 +5932,12 @@ export class Wallet {
 					}
 				);
 				if (updateSendTransactionRes.isErr()) {
-					return err(updateSendTransactionRes.error.message);
+					return err(updateSendTransactionRes.error);
 				}
 				index++;
 			}
 			const updateFeeRes = this.transaction.updateFee({ satsPerByte });
-			if (updateFeeRes.isErr()) return err(updateFeeRes.error.message);
+			if (updateFeeRes.isErr()) return err(updateFeeRes.error);
 			// updateFee priced only the coins the wallet's coinSelectPreference
 			// selects, so build from those coins, as sendMany does.
 			const staged = this.transaction.data;
@@ -5932,7 +5949,7 @@ export class Wallet {
 				message: staged.message,
 				coinSelectPreference: this.coinSelectPreference
 			});
-			if (coinSelectRes.isErr()) return err(coinSelectRes.error.message);
+			if (coinSelectRes.isErr()) return err(coinSelectRes.error);
 			// A local copy, not applyAutoCoinSelect: narrowing the shared staged
 			// inputs would shrink the pool a concurrent build is still pricing,
 			// and that build could restage the shared copy while this one awaits.
@@ -5941,7 +5958,7 @@ export class Wallet {
 				transactionData: txData,
 				shuffleOutputs
 			});
-			if (psbtRes.isErr()) return err(psbtRes.error.message);
+			if (psbtRes.isErr()) return err(psbtRes.error);
 			psbt = psbtRes.value;
 			const inputValue = this.transaction.getTransactionInputValue({
 				inputs: txData.inputs
@@ -6027,10 +6044,10 @@ export class Wallet {
 			const psbt = bitcoin.Psbt.fromBase64(psbtBase64, { network });
 			if (psbt.inputCount === 0) return err('PSBT has no inputs.');
 			const buildRes = this._checkAgainstBuild(psbt, unsignedPsbtBase64);
-			if (buildRes.isErr()) return err(buildRes.error.message);
+			if (buildRes.isErr()) return err(buildRes.error);
 			for (let i = 0; i < psbt.inputCount; i++) {
 				const prevOutCheck = this._checkPsbtPrevOut(psbt, i);
-				if (prevOutCheck.isErr()) return err(prevOutCheck.error.message);
+				if (prevOutCheck.isErr()) return err(prevOutCheck.error);
 				const input = psbt.data.inputs[i];
 				if (input.finalScriptSig || input.finalScriptWitness) {
 					return err(
@@ -6045,7 +6062,7 @@ export class Wallet {
 					return err(`Input ${i} is missing a signature.`);
 				}
 				const multisigCheck = this._enforceMultisigThreshold(psbt, i);
-				if (multisigCheck.isErr()) return err(multisigCheck.error.message);
+				if (multisigCheck.isErr()) return err(multisigCheck.error);
 				let valid = false;
 				try {
 					valid = psbt.validateSignaturesOfInput(i, validatePsbtSignature);
@@ -6280,7 +6297,7 @@ export class Wallet {
 					);
 					if (!alreadySigned) {
 						const prevOutCheck = this._checkPsbtPrevOut(psbt, i);
-						if (prevOutCheck.isErr()) return err(prevOutCheck.error.message);
+						if (prevOutCheck.isErr()) return err(prevOutCheck.error);
 						psbt.signInput(i, keyPair);
 					}
 					break;
@@ -6604,7 +6621,7 @@ export class Wallet {
 			const addressIndex = wallet.addressIndex;
 			if (addressIndex[addressType].address) {
 				const saved = await this.savedReceiveAddress(addressType);
-				if (saved.isErr()) return err(saved.error.message);
+				if (saved.isErr()) return err(saved.error);
 				return ok(saved.value.address);
 			}
 			const addresses = wallet?.addresses[addressType];
@@ -6652,7 +6669,7 @@ export class Wallet {
 			txHashes: [txHash]
 		});
 		if (txResponse.isErr()) {
-			return err(txResponse.error.message);
+			return err(txResponse.error);
 		}
 		const txData = txResponse.value.data;
 		// canBoost only reads the height stored at the last refresh. A replacement
@@ -6696,7 +6713,7 @@ export class Wallet {
 			].map((tx_hash) => ({ tx_hash }))
 		});
 		if (parentsRes.isErr()) {
-			return err(parentsRes.error.message);
+			return err(parentsRes.error);
 		}
 		const parents = new Map(
 			parentsRes.value.data.map(({ data, result }) => [data?.tx_hash, result])
@@ -6885,7 +6902,7 @@ export class Wallet {
 		// that watches it as well, and so must memory, which the next check
 		// writes over the stored copy. Without that copy the record is back
 		// after a restart and nothing checks it again (#940, #1735).
-		if (saved.isErr()) return err(saved.error.message);
+		if (saved.isErr()) return err(saved.error);
 		// Read after the write, since a check may have replaced the map.
 		const unconfirmed = this._data.unconfirmedTransactions;
 		if (txid in unconfirmed) {
@@ -6897,7 +6914,7 @@ export class Wallet {
 			'unconfirmedTransactions',
 			unconfirmed
 		);
-		if (savedUnconfirmed.isErr()) return err(savedUnconfirmed.error.message);
+		if (savedUnconfirmed.isErr()) return err(savedUnconfirmed.error);
 		return ok(`Deleted transaction ${txid}.`);
 	}
 
@@ -6923,7 +6940,7 @@ export class Wallet {
 			'transactions',
 			this._data.transactions
 		);
-		if (saved.isErr()) return err(saved.error.message);
+		if (saved.isErr()) return err(saved.error);
 		return ok(`Marked transaction ${txid} as gone.`);
 	}
 
@@ -6954,14 +6971,18 @@ export class Wallet {
 					? await this.transaction.setupRbf({ txid })
 					: await this.transaction.setupCpfp({ txid, satsPerByte });
 			if (setup.isErr()) {
-				return err(new BoostError('NOT_BOOSTABLE', setup.error.message));
+				return err(
+					new BoostError('NOT_BOOSTABLE', setup.error.message, setup.error)
+				);
 			}
 			// setupRbf stages the fast rate. updateFee applies a requested one
 			// with the fee-overpayment guards.
 			if (type === EBoostType.rbf && satsPerByte !== undefined) {
 				const feeRes = this.transaction.updateFee({ satsPerByte });
 				if (feeRes.isErr()) {
-					return err(new BoostError('INVALID_FEE', feeRes.error.message));
+					return err(
+						new BoostError('INVALID_FEE', feeRes.error.message, feeRes.error)
+					);
 				}
 			}
 			const fee = this.transaction.data.fee;
@@ -6983,14 +7004,26 @@ export class Wallet {
 			}
 			const createRes = await this.transaction.createTransaction();
 			if (createRes.isErr()) {
-				return err(new BoostError('SEND_FAILED', createRes.error.message));
+				return err(
+					new BoostError(
+						'SEND_FAILED',
+						createRes.error.message,
+						createRes.error
+					)
+				);
 			}
 			const { id, hex } = createRes.value;
 			const broadcastRes = await this.electrum.broadcastTransaction({
 				rawTx: hex
 			});
 			if (broadcastRes.isErr()) {
-				return err(new BoostError('SEND_FAILED', broadcastRes.error.message));
+				return err(
+					new BoostError(
+						'SEND_FAILED',
+						broadcastRes.error.message,
+						broadcastRes.error
+					)
+				);
 			}
 			// The boost is on the network, so failing to record it must not report
 			// it as failed.
@@ -7061,8 +7094,8 @@ export class Wallet {
 				'boostedTransactions',
 				this._data.boostedTransactions
 			);
-			if (deleted?.isErr()) return err(deleted.error.message);
-			if (saved.isErr()) return err(saved.error.message);
+			if (deleted?.isErr()) return err(deleted.error);
+			if (saved.isErr()) return err(saved.error);
 			return ok(boostedTx);
 		} catch (e) {
 			return err(e);
@@ -7164,7 +7197,7 @@ export class Wallet {
 					inputs: newInputs
 				}
 			});
-			if (updateRes.isErr()) return err(updateRes.error.message);
+			if (updateRes.isErr()) return err(updateRes.error);
 			return ok(newInputs);
 		} catch (e) {
 			this.logger.error('Failed to add transaction input.', e);
@@ -7189,7 +7222,7 @@ export class Wallet {
 					inputs: newInputs
 				}
 			});
-			if (updateRes.isErr()) return err(updateRes.error.message);
+			if (updateRes.isErr()) return err(updateRes.error);
 			return ok(newInputs);
 		} catch (e) {
 			this.logger.error('Failed to remove transaction input.', e);
@@ -7213,7 +7246,7 @@ export class Wallet {
 					tags
 				}
 			});
-			if (updateRes.isErr()) return err(updateRes.error.message);
+			if (updateRes.isErr()) return err(updateRes.error);
 			return ok('Tag successfully added');
 		} catch (e) {
 			this.logger.error('Failed to add transaction tag.', e);
@@ -7238,7 +7271,7 @@ export class Wallet {
 					tags: newTags
 				}
 			});
-			if (updateRes.isErr()) return err(updateRes.error.message);
+			if (updateRes.isErr()) return err(updateRes.error);
 			return ok('Tag successfully removed');
 		} catch (e) {
 			this.logger.error('Failed to remove transaction tag.', e);
@@ -7276,7 +7309,7 @@ export class Wallet {
 			});
 			if (res.isErr()) {
 				this.logger.warn(res.error.message);
-				return err(res.error.message);
+				return err(res.error);
 			}
 
 			return ok('Fee has been changed successfully');
@@ -7363,7 +7396,7 @@ export class Wallet {
 		if (!privateKey) return err('No private key provided.');
 		const addressesRes = this.getAddressesFromPrivateKey(privateKey);
 		if (addressesRes.isErr()) {
-			return err(addressesRes.error.message);
+			return err(addressesRes.error);
 		}
 		const { addresses, keyPair } = addressesRes.value;
 		const addressData: TUnspentAddressScriptHashData = {};
@@ -7382,7 +7415,7 @@ export class Wallet {
 			addresses: addressData
 		});
 		if (getUtxoRes.isErr()) {
-			return err(getUtxoRes.error.message);
+			return err(getUtxoRes.error);
 		}
 		const { balance, utxos } = getUtxoRes.value;
 		return ok({ balance, utxos, keyPair, addresses });
@@ -7418,7 +7451,7 @@ export class Wallet {
 		if (this.isWatchOnly) return err(new WatchOnlySigningError());
 		const privateKeyInfo = await this.getPrivateKeyInfo(privateKey);
 		if (privateKeyInfo.isErr()) {
-			return err(privateKeyInfo.error.message);
+			return err(privateKeyInfo.error);
 		}
 		const { keyPair } = privateKeyInfo.value;
 		if (!privateKeyInfo.value.utxos.length) {
@@ -7461,11 +7494,11 @@ export class Wallet {
 				}
 			});
 			if (sendMaxRes.isErr()) {
-				return err(sendMaxRes.error.message);
+				return err(sendMaxRes.error);
 			}
 			const createRes = await this.transaction.createTransaction({});
 			if (createRes.isErr()) {
-				return err(createRes.error.message);
+				return err(createRes.error);
 			}
 			const response = {
 				...createRes.value,
@@ -7479,7 +7512,7 @@ export class Wallet {
 				subscribeToOutputAddress: false
 			});
 			if (broadcastResponse.isErr()) {
-				return err(broadcastResponse.error.message);
+				return err(broadcastResponse.error);
 			}
 			response.id = broadcastResponse.value;
 			return ok(response);
@@ -7546,7 +7579,7 @@ export class Wallet {
 				scriptHash
 			]);
 			if (response.isErr()) {
-				return err(response.error.message);
+				return err(response.error);
 			}
 			if (response.value.data[0].error?.message) {
 				return err(response.value.data[0].error.message);
@@ -7570,7 +7603,7 @@ export class Wallet {
 				txHashes: [{ tx_hash }]
 			});
 			if (details.isErr()) {
-				return err(details.error.message);
+				return err(details.error);
 			}
 			if (details.value.data[0]?.error?.message) {
 				return err(details.value.data[0].error.message);

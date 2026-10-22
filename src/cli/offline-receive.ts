@@ -1,6 +1,6 @@
 import type { BeignetNode } from './beignet-node';
 import type { ChannelInfo } from './types';
-import { BeignetError } from './errors';
+import { BeignetError, BeignetErrorCodeValue } from './errors';
 import { DEFAULT_CHANNEL_CONFIG } from '../lightning/channel/types';
 
 /**
@@ -38,7 +38,7 @@ export type OfflineReceiveJob = {
 	done?: boolean;
 };
 const live = (e: any) => e && !['CLOSED', 'ABORTED'].includes(e.state);
-const fail = (code: string, message: string): never => {
+const fail = (code: BeignetErrorCodeValue, message: string): never => {
 	throw new BeignetError(code, message);
 };
 /**

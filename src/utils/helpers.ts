@@ -162,7 +162,7 @@ export const getKeyDerivationPath = ({
 			path: addressTypes[addressType].path
 		});
 		if (keyDerivationPathResponse.isErr()) {
-			return err(keyDerivationPathResponse.error.message);
+			return err(keyDerivationPathResponse.error);
 		}
 		return ok(keyDerivationPathResponse.value);
 	} catch (e) {

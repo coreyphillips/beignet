@@ -214,7 +214,7 @@ describe('sendPaymentAsync answers an engine refusal with a BeignetError (issue 
 		expect(pendingSats(node)).to.equal(0);
 	});
 
-	it('refuses a hash with an attempt still out with DUPLICATE_PAYMENT, typed or by message', () => {
+	it('refuses a hash with an attempt still out with DUPLICATE_PAYMENT, by its code', () => {
 		const { bolt11 } = invoiceFrom('in flight');
 		engineOf(node).sendPayment = (): never => {
 			throw new LightningPaymentError(
@@ -226,12 +226,13 @@ describe('sendPaymentAsync answers an engine refusal with a BeignetError (issue 
 			BeignetErrorCode.DUPLICATE_PAYMENT
 		);
 
-		// payInvoice's string fallback for an untyped throw, kept as it was.
+		// The code is the contract: the same words without it are a plain
+		// failure, never matched by their text.
 		engineOf(node).sendPayment = (): never => {
 			throw new Error('Payment already in flight');
 		};
 		expect(thrownBy(() => node.sendPaymentAsync(bolt11)).code).to.equal(
-			BeignetErrorCode.DUPLICATE_PAYMENT
+			BeignetErrorCode.PAYMENT_FAILED
 		);
 		expect(pendingSats(node)).to.equal(0);
 	});

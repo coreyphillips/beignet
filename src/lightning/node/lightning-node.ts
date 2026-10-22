@@ -251,7 +251,9 @@ import {
 	encodeJitAuthorization,
 	encodeJitQuote,
 	encodeJitQuoteRequest,
-	jitOpeningFeeMsat
+	jitOpeningFeeMsat,
+	JitReceiveError,
+	JitReceiveErrorCode
 } from '../liquidity/jit-receive';
 import {
 	DF_DEFAULT_REQUEST_TTL_MS,
@@ -407,6 +409,7 @@ import {
 	GuardianDescriptor
 } from '../recovery';
 import {
+	ChannelErrorCode,
 	IChannelPersistEvent,
 	IChannelPersistRequest
 } from '../channel/channel-actions';
@@ -5874,7 +5877,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		this.channelManager.on(
 			'error',
-			(channelId: Buffer | null, message: string) => {
+			(channelId: Buffer | null, message: string, code?: ChannelErrorCode) => {
 				// An open that failed is never funded, so the rate it asked for has
 				// nothing left to apply to. Drop it, and the max-funding flag with it,
 				// rather than hold them for a channel that no longer exists.
@@ -5888,6 +5891,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					message,
 					timestamp: Date.now()
 				};
+				if (code !== undefined) err.channelErrorCode = code;
 				this.emit('node:error', err);
 			}
 		);
@@ -11419,13 +11423,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				) {
 					return;
 				}
-				// Scoped to this open: the v2 funding failure by message, or
-				// any error that left the channel terminally ERRORED (a
-				// peer's synchronous rejection, a failed negotiation). A
-				// scoped diagnostic on a still-live channel (dispatch
-				// failures deliberately do not abort) keeps waiting.
+				// Scoped to this open: the v2 funding failure, or any error
+				// that left the channel terminally ERRORED (a peer's
+				// synchronous rejection, a failed negotiation). A scoped
+				// diagnostic on a still-live channel (dispatch failures
+				// deliberately do not abort) keeps waiting.
 				if (
-					/^v2 open not funded/.test(err.message) ||
+					err.channelErrorCode === ChannelErrorCode.OPEN_NOT_FUNDED ||
 					channel.getState() === ChannelState.ERRORED
 				) {
 					cleanup();
@@ -12476,7 +12480,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		acceptStaleStateRisk = false,
 		/** Record a payment to this destination instead of a wallet payout. */
 		externalDestination = false
-	): { ok: boolean; error?: string } {
+	): { ok: boolean; error?: string; code?: ChannelErrorCode } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
 		const scriptErr = validateBufferMinMax(
@@ -12510,9 +12514,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				code: 'CLOSE_CHANNEL_FAILED',
 				channelId,
 				message: result.error!,
-				timestamp: Date.now()
+				timestamp: Date.now(),
+				...(result.code ? { channelErrorCode: result.code } : {})
 			});
-			return { ok: false, error: result.error };
+			return {
+				ok: false,
+				error: result.error,
+				...(result.code ? { code: result.code } : {})
+			};
 		}
 		// initiateShutdown's own action batch carries no persist of the stamp,
 		// so commit it here.
@@ -12783,7 +12792,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	updateChannelFee(
 		channelId: Buffer,
 		newFeeratePerKw: number
-	): { ok: boolean; error?: string } {
+	): { ok: boolean; error?: string; code?: ChannelErrorCode } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
 		if (!Number.isInteger(newFeeratePerKw) || newFeeratePerKw < 253) {
@@ -12800,9 +12809,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				code: 'UPDATE_FEE_FAILED',
 				channelId,
 				message: result.error!,
-				timestamp: Date.now()
+				timestamp: Date.now(),
+				...(result.code ? { channelErrorCode: result.code } : {})
 			});
-			return { ok: false, error: result.error };
+			return {
+				ok: false,
+				error: result.error,
+				...(result.code ? { code: result.code } : {})
+			};
 		}
 		return { ok: true };
 	}
@@ -23526,7 +23540,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const reply = new Promise<T>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
-				reject(new Error(timeoutMessage));
+				reject(
+					new JitReceiveError(JitReceiveErrorCode.TIMEOUT, timeoutMessage)
+				);
 			}, timeoutMs);
 			timer.unref?.();
 			const onMsg = (msg: {
@@ -23722,7 +23738,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		const ack = await ackPromise;
 		if (!ack.accepted) {
-			throw new Error(
+			throw new JitReceiveError(
+				JitReceiveErrorCode.DECLINED,
 				`LSP declined the JIT receive intent: ${
 					ack.reason ?? 'no reason given'
 				}`
@@ -23731,12 +23748,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// An accepted ack whose SCID is the refusal placeholder would produce a
 		// hint routing to nothing, so the invoice would simply be unpayable.
 		if (ack.interceptScid.every((b) => b === 0)) {
-			throw new Error('LSP accepted the intent without an intercept scid');
+			throw new JitReceiveError(
+				JitReceiveErrorCode.NO_INTERCEPT_SCID,
+				'LSP accepted the intent without an intercept scid'
+			);
 		}
 		const maxFlatFeeSat = params.maxFlatFeeSat ?? this.jitClientMaxFlatFeeSat;
 		const maxFeePpm = params.maxFeePpm ?? this.jitClientMaxFeePpm;
 		if (ack.flatFeeSat > maxFlatFeeSat || ack.feePpm > maxFeePpm) {
-			throw new Error(
+			throw new JitReceiveError(
+				JitReceiveErrorCode.QUOTE_ABOVE_MAXIMUM,
 				`LSP quoted ${ack.flatFeeSat} sat + ${ack.feePpm} ppm, above the ` +
 					`accepted maximum of ${maxFlatFeeSat} sat + ${maxFeePpm} ppm`
 			);
@@ -23748,7 +23769,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// the fee twice over: once on the sender through the hint and again
 		// off the forward. The LSP never answers that way; refuse if one does.
 		if (feeMode === 'hop' && params.acceptsSkimmedFee !== false) {
-			throw new Error(
+			throw new JitReceiveError(
+				JitReceiveErrorCode.FEE_MODE_MISMATCH,
 				'LSP answered a skim-accepting intent with hop-mode fee terms'
 			);
 		}
@@ -23830,7 +23852,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (!this.liveChannelWith(lspPubkeyHex)) {
 			const refusal = this.channelManager.newChannelRefusal();
 			if (refusal) {
-				throw new Error(
+				throw new JitReceiveError(
+					JitReceiveErrorCode.NEW_CHANNELS_REFUSED,
 					'JIT receive needs a new channel from the LSP, which this node ' +
 						`cannot accept right now: ${refusal}`
 				);
@@ -31276,7 +31299,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						'Route fee exceeds maximum'
 					);
 				}
-				throw new Error('No route to BOLT 12 blinded path introduction node');
+				throw new LightningPaymentError(
+					LightningErrorCode.NO_ROUTE,
+					'No route to BOLT 12 blinded path introduction node'
+				);
 			}
 			return this.dispatchBolt12Route(
 				blindedRoute,
@@ -31305,7 +31331,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			policyOverrides
 		);
 		if (!route) {
-			throw new Error('No route found to BOLT 12 invoice destination');
+			throw new LightningPaymentError(
+				LightningErrorCode.NO_ROUTE,
+				'No route found to BOLT 12 invoice destination'
+			);
 		}
 		if (maxFeeMsat !== undefined && route.totalFeeMsat > maxFeeMsat) {
 			throw new LightningPaymentError(

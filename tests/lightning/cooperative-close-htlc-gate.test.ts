@@ -63,7 +63,10 @@ import {
 	IHtlcEntry,
 	receivedAddIrrevocablyCommitted
 } from '../../src/lightning/channel/types';
-import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import {
+	ChannelActionType,
+	ChannelErrorCode
+} from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
 import {
 	decodeClosingCompleteMessage,
@@ -1805,6 +1808,14 @@ describe('cooperative close waits for every HTLC to be resolved (issue #1307)', 
 				expect(t.errors, t.errors.join('; ')).to.have.length(0);
 			});
 		}
+
+		it("refuses the non-opener's update_fee with the channel's code", function () {
+			const t = makeFundedPair('fee-non-opener');
+			const r = t.B().updateChannelFee(t.channelId, 600);
+			expect(r.ok).to.equal(false);
+			expect(r.error).to.equal('Only opener can update fee');
+			expect(r.code).to.equal(ChannelErrorCode.NOT_PERMITTED);
+		});
 
 		it('an update_fee: every step of its round, including the signature the peer still owes at the new rate', function () {
 			const t = makeFundedPair('predicate-fee');

@@ -19,6 +19,7 @@ bitcoin.initEccLib(ecc);
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { Network } from '../../src/lightning/invoice/types';
 import { ChannelState } from '../../src/lightning/channel/types';
+import { ChannelErrorCode } from '../../src/lightning/channel/channel-actions';
 import { ISpliceWalletInput } from '../../src/lightning/channel/channel';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -219,6 +220,32 @@ describe('LightningNode.openZeroConfChannelAndWait (issue #572)', function () {
 		expect(bobInfo[0].state).to.equal(ChannelState.NORMAL);
 	});
 
+	it("hands the channel's refusal code to a node-level caller", async function () {
+		const changeScript = bitcoin.payments.p2wpkh({
+			hash: crypto.randomBytes(20)
+		}).output!;
+		const pair = nodePair(
+			autofundProvider({ inputs: [makeWalletInput(200_000)], changeScript })
+		);
+		pairs.push(pair);
+		const { alice, bob } = pair;
+		wireDualFundPeer(alice, bob.getNodeId());
+		const channelId = await alice.openZeroConfChannelAndWait(
+			bob.getNodeId(),
+			150_000n
+		);
+		const errors: (ChannelErrorCode | undefined)[] = [];
+		bob.on('node:error', (e) => {
+			if (e.code === 'UPDATE_FEE_FAILED') errors.push(e.channelErrorCode);
+		});
+
+		// Bob did not open the channel, so the fee is not his to set.
+		const result = bob.updateChannelFee(channelId, 600);
+		expect(result.ok).to.equal(false);
+		expect(result.code).to.equal(ChannelErrorCode.NOT_PERMITTED);
+		expect(errors).to.deep.equal([ChannelErrorCode.NOT_PERMITTED]);
+	});
+
 	it('rejects fast when the v2 wallet selection fails', async function () {
 		const pair = nodePair(
 			autofundProvider(async () => {
@@ -228,6 +255,10 @@ describe('LightningNode.openZeroConfChannelAndWait (issue #572)', function () {
 		pairs.push(pair);
 		const { alice, bob } = pair;
 		wireDualFundPeer(alice, bob.getNodeId());
+		const channelCodes: (ChannelErrorCode | undefined)[] = [];
+		alice.on('node:error', (e) => {
+			if (e.code === 'CHANNEL_ERROR') channelCodes.push(e.channelErrorCode);
+		});
 
 		let error = '';
 		const started = Date.now();
@@ -237,6 +268,8 @@ describe('LightningNode.openZeroConfChannelAndWait (issue #572)', function () {
 			error = (err as Error).message;
 		}
 		expect(error).to.match(/v2 open not funded/);
+		// The wait keys on the code, not the words (issue #1689).
+		expect(channelCodes).to.include(ChannelErrorCode.OPEN_NOT_FUNDED);
 		// Fast failure, not a burned timeout window.
 		expect(Date.now() - started).to.be.lessThan(2_000);
 	});

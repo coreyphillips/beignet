@@ -76,8 +76,8 @@ const OFFLINE_ELECTRUM = {
 
 describe('BeignetError', () => {
 	it('should create error with code and message', () => {
-		const err = new BeignetError('TEST_CODE', 'something went wrong');
-		expect(err.code).to.equal('TEST_CODE');
+		const err = new BeignetError('INTERNAL_ERROR', 'something went wrong');
+		expect(err.code).to.equal('INTERNAL_ERROR');
 		expect(err.message).to.equal('something went wrong');
 		expect(err.name).to.equal('BeignetError');
 		expect(err).to.be.instanceOf(Error);
@@ -93,10 +93,10 @@ describe('BeignetError', () => {
 	});
 
 	it('should serialize to JSON via JSON.stringify', () => {
-		const err = new BeignetError('PAY_ERR', 'no route');
+		const err = new BeignetError('NO_ROUTE', 'no route');
 		const str = JSON.stringify({ ok: false, error: err });
 		const parsed = JSON.parse(str);
-		expect(parsed.error.code).to.equal('PAY_ERR');
+		expect(parsed.error.code).to.equal('NO_ROUTE');
 		expect(parsed.error.message).to.equal('no route');
 	});
 });

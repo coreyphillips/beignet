@@ -9,6 +9,7 @@ import type { IIrohDiagnostics } from '../lightning/transport/iroh';
 import { TLogLevel } from '../logger';
 import type { IGuardianConfigEntry } from '../lightning/recovery/assembly';
 import type { IGraphRestoreStats } from '../lightning/node/types';
+import type { ChannelErrorCode } from '../lightning/channel/channel-actions';
 import type {
 	HoldCancelReason,
 	SpliceRefusalCode
@@ -1552,6 +1553,8 @@ export interface BeignetNodeEvents {
 		 * watcher's retry queue giving up is not the end of the attempt.
 		 */
 		retained?: boolean;
+		/** Why the channel refused, when the refusing arm said so (a ChannelErrorCode). */
+		channelErrorCode?: ChannelErrorCode;
 	}) => void;
 	/** The node is fully operational: peers reconnected and channels restored. */
 	'node:ready': () => void;

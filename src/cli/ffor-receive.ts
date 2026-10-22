@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import type { BeignetNode } from './beignet-node';
-import { BeignetError } from './errors';
+import { BeignetError, BeignetErrorCodeValue } from './errors';
 import { FforSlotState, FforState } from '../lightning/ffor/types';
 import { BeignetCustomSubtype } from '../lightning/message/custom';
 
@@ -18,7 +18,7 @@ const RESPONSE = BeignetCustomSubtype.FFOR_RECEIVE_RESPONSE;
 const KEY = 'ffor_receive_allocations_v1';
 const HEX = /^[a-f0-9]{64}$/;
 const ID = /^[a-f0-9]{32}$/;
-const fail = (code: string, message: string): never => {
+const fail = (code: BeignetErrorCodeValue, message: string): never => {
 	throw new BeignetError(code, message);
 };
 /** The longest refusal a settlement peer may put in front of the wallet. */

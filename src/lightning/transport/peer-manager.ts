@@ -33,6 +33,7 @@ import {
 import { WebSocketServer } from './websocket-server';
 import { NodeWebSocket } from './websocket-node-client';
 import { normalizeHexPubkey } from '../validation';
+import { CodedError } from '../../utils/errors';
 
 /**
  * Default WS client for outbound peers when none is injected. Under Node the
@@ -306,6 +307,30 @@ export interface IPeerDialOptions {
 
 type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void;
 
+/** Why a peer operation was refused. */
+export enum PeerErrorCode {
+	/** No connection to the peer. A host with its own transport may still carry the message. */
+	NOT_CONNECTED = 'NOT_CONNECTED',
+	/** The outbound gate (the recovery quarantine) holds traffic to this peer. */
+	OUTBOUND_GATE_REFUSED = 'OUTBOUND_GATE_REFUSED',
+	/** A lane peer carries only the message types its lane gate allows. */
+	LANE_REFUSED = 'LANE_REFUSED',
+	/** An explicit disconnectPeer() overtook the dial. */
+	DIAL_CANCELLED = 'DIAL_CANCELLED'
+}
+
+/**
+ * A peer operation refused, with the reason as a code. A gate's refusal is
+ * deliberate, so the message must not leave by another path either; only
+ * NOT_CONNECTED leaves a host's own transport to try.
+ */
+export class PeerError extends CodedError<PeerErrorCode> {
+	constructor(code: PeerErrorCode, message: string) {
+		super(code, message);
+		this.name = 'PeerError';
+	}
+}
+
 /**
  * A dial that was overtaken by an explicit disconnectPeer() for the same
  * peer. TYPED so multi-address retry loops (connectPeerById's graph and
@@ -313,9 +338,12 @@ type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void;
  * more failed address and dialing the next one under the new generation,
  * which would reverse the explicit disconnect.
  */
-export class PeerDialCancelledError extends Error {
+export class PeerDialCancelledError extends PeerError {
 	constructor(pubkey: string) {
-		super(`Connection to peer ${pubkey} was cancelled while establishing`);
+		super(
+			PeerErrorCode.DIAL_CANCELLED,
+			`Connection to peer ${pubkey} was cancelled while establishing`
+		);
 		this.name = 'PeerDialCancelledError';
 	}
 }
@@ -1267,7 +1295,8 @@ export class PeerManager extends EventEmitter {
 			// serving guardian storage for another node is unrelated to
 			// whether THIS node owns its own channels.
 			if (!this.laneGate || !this.laneGate.allows(type, payload)) {
-				throw new Error(
+				throw new PeerError(
+					PeerErrorCode.LANE_REFUSED,
 					`Lane refused message type ${type} to lane peer ${pubkey}`
 				);
 			}
@@ -1277,10 +1306,14 @@ export class PeerManager extends EventEmitter {
 		}
 		const peer = this.peers.get(pubkey);
 		if (!peer) {
-			throw new Error(`Not connected to peer ${pubkey}`);
+			throw new PeerError(
+				PeerErrorCode.NOT_CONNECTED,
+				`Not connected to peer ${pubkey}`
+			);
 		}
 		if (this.outboundGate && !this.outboundGate(pubkey, type)) {
-			throw new Error(
+			throw new PeerError(
+				PeerErrorCode.OUTBOUND_GATE_REFUSED,
 				`Outbound gate refused message type ${type} to peer ${pubkey}`
 			);
 		}

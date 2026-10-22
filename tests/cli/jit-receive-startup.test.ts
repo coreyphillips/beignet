@@ -23,6 +23,14 @@ import { jitInvoiceError } from '../../src/cli/beignet-node';
 import { BeignetError, isRetryableError } from '../../src/cli/errors';
 import { decode } from '../../src/lightning/invoice/decode';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
+import {
+	JitReceiveError,
+	JitReceiveErrorCode
+} from '../../src/lightning/liquidity/jit-receive';
+import {
+	PeerError,
+	PeerErrorCode
+} from '../../src/lightning/transport/peer-manager';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -261,39 +269,57 @@ describe('JIT receive daemon surface', function () {
 		expect((error as BeignetError).code).to.equal('PEER_NOT_CONNECTED');
 	});
 
-	// Issue #671: every refusal the wallet side throws as a plain Error has a
-	// typed code and a status the app can act on; a genuine fault stays
-	// untyped and scrubbed.
+	// Issue #671: every refusal the wallet side throws has a typed code and a
+	// status the app can act on; a genuine fault stays untyped and scrubbed.
 	it('types the LSP decline, the ceiling refusal and the ack timeout', () => {
-		const typed = (message: string): BeignetError =>
-			jitInvoiceError(new Error(message)) as BeignetError;
+		const typed = (code: JitReceiveErrorCode, message: string): BeignetError =>
+			jitInvoiceError(new JitReceiveError(code, message)) as BeignetError;
+		const declined = typed(
+			JitReceiveErrorCode.DECLINED,
+			'LSP declined the JIT receive intent: at most 2 live intents per peer'
+		);
+		expect(declined.code).to.equal('JIT_REFUSED');
+		// The reason travels.
+		expect(declined.message).to.contain('at most 2 live intents');
 		expect(
 			typed(
-				'LSP declined the JIT receive intent: at most 2 live intents per peer'
-			).code
-		).to.equal('JIT_REFUSED');
-		expect(
-			typed(
+				JitReceiveErrorCode.QUOTE_ABOVE_MAXIMUM,
 				'LSP quoted 500 sat + 0 ppm, above the accepted maximum of 250 sat + 3000 ppm'
 			).code
 		).to.equal('JIT_REFUSED');
 		expect(
-			typed('LSP accepted the intent without an intercept scid').code
+			typed(
+				JitReceiveErrorCode.NO_INTERCEPT_SCID,
+				'LSP accepted the intent without an intercept scid'
+			).code
 		).to.equal('JIT_REFUSED');
 		expect(
-			typed('timed out waiting for the LSP JIT receive ack').code
+			typed(
+				JitReceiveErrorCode.TIMEOUT,
+				'timed out waiting for the LSP JIT receive ack'
+			).code
 		).to.equal('JIT_TIMEOUT');
-		expect(typed('timed out waiting for the LSP JIT quote').code).to.equal(
-			'JIT_TIMEOUT'
+		expect(
+			(
+				jitInvoiceError(
+					new PeerError(
+						PeerErrorCode.NOT_CONNECTED,
+						'Not connected to peer 02ab'
+					)
+				) as BeignetError
+			).code
+		).to.equal('PEER_NOT_CONNECTED');
+		// An LSP answering against its own protocol is a fault.
+		const mismatch = new JitReceiveError(
+			JitReceiveErrorCode.FEE_MODE_MISMATCH,
+			'LSP answered a skim-accepting intent with hop-mode fee terms'
 		);
-		expect(typed('Not connected to peer 02ab').code).to.equal(
-			'PEER_NOT_CONNECTED'
-		);
-		expect(typed('LSP declined the JIT receive intent: x').message).to.match(
-			/at most|declined/
-		);
+		expect(jitInvoiceError(mismatch)).to.equal(mismatch);
 		const fault = new Error('database is locked');
 		expect(jitInvoiceError(fault)).to.equal(fault);
+		// The code is the contract: the same words without it stay untyped.
+		const untyped = new Error('LSP declined the JIT receive intent: x');
+		expect(jitInvoiceError(untyped)).to.equal(untyped);
 		expect(statusForErrorCode('JIT_REFUSED')).to.equal(400);
 		expect(statusForErrorCode('JIT_TIMEOUT')).to.equal(504);
 	});
@@ -304,7 +330,8 @@ describe('JIT receive daemon surface', function () {
 	// every condition the fence names lifts on its own.
 	it('types the new-channel fence as a retryable 503', () => {
 		const typed = jitInvoiceError(
-			new Error(
+			new JitReceiveError(
+				JitReceiveErrorCode.NEW_CHANNELS_REFUSED,
 				'JIT receive needs a new channel from the LSP, which this node ' +
 					'cannot accept right now: new channels are refused until the ' +
 					'chain tip is known: the channel key index floor is armed'

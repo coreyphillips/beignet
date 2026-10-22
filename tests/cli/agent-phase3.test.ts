@@ -173,9 +173,9 @@ describe('BeignetErrorCode', () => {
 		expect(err).to.be.instanceOf(Error);
 	});
 
-	it('BeignetError accepts string code (backward compat)', () => {
-		const err = new BeignetError('CUSTOM_CODE', 'custom');
-		expect(err.code).to.equal('CUSTOM_CODE');
+	it('BeignetError accepts a code as its string', () => {
+		const err = new BeignetError('CLOSE_UNAVAILABLE', 'custom');
+		expect(err.code).to.equal(BeignetErrorCode.CLOSE_UNAVAILABLE);
 	});
 
 	it('BeignetError.toJSON returns code and message', () => {

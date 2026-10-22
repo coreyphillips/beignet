@@ -318,7 +318,9 @@ describe('BOLT 12 payment retry (issue #261)', () => {
 		// registered, mirroring sendPayment and keysend.
 		const invoice = issueBolt12Invoice(bob, 936, 50_000n);
 
-		expect(() => alice.payBolt12Invoice(invoice)).to.throw(/route/i);
+		expect(() => alice.payBolt12Invoice(invoice))
+			.to.throw(LightningPaymentError, /route/i)
+			.with.property('code', LightningErrorCode.NO_ROUTE);
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const contexts = (alice as any).paymentRetryContexts as Map<
 			string,

@@ -26,7 +26,7 @@ import {
 } from './beignet-node';
 import { parseGuardianEntry } from '../lightning/recovery';
 import { ILogger, createConsoleLogger } from '../logger';
-import { BeignetError } from './errors';
+import { BeignetError, BeignetErrorCodeValue } from './errors';
 import { L402Error } from '../lightning/l402';
 import {
 	ApiResponse,
@@ -186,7 +186,10 @@ function success<T>(result: T): ApiResponse<T> {
 	return { ok: true, result };
 }
 
-function failure(code: string, message: string): ApiResponse<never> {
+function failure(
+	code: BeignetErrorCodeValue,
+	message: string
+): ApiResponse<never> {
 	return { ok: false, error: { code, message } };
 }
 
@@ -389,7 +392,7 @@ const RESTART_REQUIRED_ROUTES = new Set([
 ]);
 
 /** HTTP status for a failure envelope; unmapped codes are server faults. */
-const STATUS_BY_ERROR_CODE: Record<string, number> = {
+const STATUS_BY_ERROR_CODE: Partial<Record<BeignetErrorCodeValue, number>> = {
 	INVALID_PARAMS: 400,
 	INVALID_JSON: 400,
 	INVALID_INVOICE: 400,
@@ -418,6 +421,8 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	L402_CROSS_ORIGIN_CHALLENGE: 402,
 	L402_INVALID_INVOICE: 400,
 	L402_NO_PAYER: 400,
+	// L402_PREIMAGE_MISMATCH stays a 500: our own payer returned a preimage
+	// that does not open the invoice's hash.
 	// The caller's response-size cap and the private-target guard are caller
 	// decisions too, and a network failure reaching the TARGET is upstream
 	// trouble, not a node fault: none of them may read as a retryable 500.
@@ -490,6 +495,9 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// decide what to change, so it must not read as a retryable 5xx.
 	OPEN_FAILED: 409,
 	PEER_NOT_CONNECTED: 409,
+	// sendToRoute's name for the same condition: the route's first hop is a
+	// peer this node has no channel with.
+	NO_CHANNEL_TO_HOP: 409,
 	INSUFFICIENT_BALANCE: 409,
 	CHANNEL_NOT_READY: 409,
 	DUPLICATE_PAYMENT: 409,
@@ -531,9 +539,12 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	REQUEST_ID_CONFLICT: 409,
 	SWEEP_UNAVAILABLE: 409,
 	SWEEP_NOT_PERSISTED: 503,
-	SWEEP_JOURNAL_INVALID: 503,
-	SWEEP_JOURNAL_CONFLICT: 503,
-	SWEEP_JOURNAL_FULL: 503,
+	// The journal is unreadable, disagrees with a restored database, or holds
+	// its 1000 records, none of which it ever prunes: a retry meets the same
+	// journal, so none of them may read as a retryable 503.
+	SWEEP_JOURNAL_INVALID: 409,
+	SWEEP_JOURNAL_CONFLICT: 409,
+	SWEEP_JOURNAL_FULL: 409,
 	FEE_CHANGED: 409,
 	RECEIVE_UNAVAILABLE: 409,
 	RECEIVE_PENDING: 409,
@@ -598,7 +609,7 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 };
 
 export function statusForErrorCode(code: string): number {
-	return STATUS_BY_ERROR_CODE[code] ?? 500;
+	return STATUS_BY_ERROR_CODE[code as BeignetErrorCodeValue] ?? 500;
 }
 
 /**
@@ -3613,7 +3624,7 @@ async function bootDaemon(
 	const browserGuardRefusal = (
 		req: http.IncomingMessage,
 		allowedOrigin: string | null
-	): { code: string; message: string } | null => {
+	): { code: BeignetErrorCodeValue; message: string } | null => {
 		const hasBody =
 			req.headers['transfer-encoding'] !== undefined ||
 			Number(req.headers['content-length']) > 0;

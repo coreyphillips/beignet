@@ -84,6 +84,7 @@ import { canScopeWireError, encodeErrorMessage } from '../message/error';
 import {
 	ChannelAction,
 	ChannelActionType,
+	ChannelErrorCode,
 	ISendMessageAction,
 	IErrorAction
 } from './channel-actions';
@@ -1688,7 +1689,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Cannot initiate open: wrong state'
+					message: 'Cannot initiate open: wrong state',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -1698,7 +1700,13 @@ export class Channel {
 			'max_htlc_value_in_flight_msat'
 		);
 		if (maxHtlcErr) {
-			return [{ type: ChannelActionType.ERROR, message: maxHtlcErr }];
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: maxHtlcErr,
+					code: ChannelErrorCode.INVALID_PARAMS
+				}
+			];
 		}
 
 		const firstPoint = getPerCommitmentPoint(
@@ -1810,7 +1818,13 @@ export class Channel {
 			waivePeer
 		);
 		if (error) {
-			return [{ type: ChannelActionType.ERROR, message: error }];
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: error,
+					code: ChannelErrorCode.INVALID_PARAMS
+				}
+			];
 		}
 
 		// The reserve we just advertised IS the reserve we enforce on the peer:
@@ -3349,7 +3363,8 @@ export class Channel {
 					type: ChannelActionType.ERROR,
 					message:
 						'Cannot add HTLC: the peer holds the revocation for this ' +
-						'commitment, so its on-chain HTLC backstops are disabled'
+						'commitment, so its on-chain HTLC backstops are disabled',
+					code: ChannelErrorCode.HELD
 				}
 			];
 		}
@@ -3387,7 +3402,8 @@ export class Channel {
 							: 'Cannot add HTLC: the peer claimed at channel_reestablish that ' +
 							  'this channel state is behind and showed no proof, so its ' +
 							  'state cannot be proven current and its on-chain HTLC ' +
-							  'backstops are disabled'
+							  'backstops are disabled',
+					code: ChannelErrorCode.HELD
 				}
 			];
 		}
@@ -3402,7 +3418,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: `Cannot add HTLC: channel in ${this._state.state} state`
+					message: `Cannot add HTLC: channel in ${this._state.state} state`,
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -3419,7 +3436,8 @@ export class Channel {
 					type: ChannelActionType.ERROR,
 					message:
 						'Cannot add HTLC: the funding transaction is in neither the ' +
-						'mempool nor the chain, so the channel is quarantined'
+						'mempool nor the chain, so the channel is quarantined',
+					code: ChannelErrorCode.HELD
 				}
 			];
 		}
@@ -3429,7 +3447,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Cannot add HTLC: channel is quiescing'
+					message: 'Cannot add HTLC: channel is quiescing',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -3442,7 +3461,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: `Cannot add HTLC: ${fforAddRefusal}`
+					message: `Cannot add HTLC: ${fforAddRefusal}`,
+					code: ChannelErrorCode.FFOR_REFUSED
 				}
 			];
 		}
@@ -3454,7 +3474,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: `HTLC cltv_expiry ${cltvExpiry} is not a block height (>= 500000000)`
+					message: `HTLC cltv_expiry ${cltvExpiry} is not a block height (>= 500000000)`,
+					code: ChannelErrorCode.INVALID_PARAMS
 				}
 			];
 		}
@@ -3471,7 +3492,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: `HTLC cltv_expiry ${cltvExpiry} has already expired at height ${this._currentBlockHeight}`
+					message: `HTLC cltv_expiry ${cltvExpiry} has already expired at height ${this._currentBlockHeight}`,
+					code: ChannelErrorCode.INVALID_PARAMS
 				}
 			];
 		}
@@ -3482,7 +3504,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'HTLC amount must be positive'
+					message: 'HTLC amount must be positive',
+					code: ChannelErrorCode.INVALID_PARAMS
 				}
 			];
 		}
@@ -3492,7 +3515,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'HTLC amount below remote minimum'
+					message: 'HTLC amount below remote minimum',
+					code: ChannelErrorCode.LIMIT_EXCEEDED
 				}
 			];
 		}
@@ -3501,7 +3525,11 @@ export class Channel {
 		const pendingOffered = this.countPendingHtlcs(HtlcDirection.OFFERED);
 		if (pendingOffered >= this._state.remoteConfig.maxAcceptedHtlcs) {
 			return [
-				{ type: ChannelActionType.ERROR, message: 'Max pending HTLCs exceeded' }
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Max pending HTLCs exceeded',
+					code: ChannelErrorCode.LIMIT_EXCEEDED
+				}
 			];
 		}
 
@@ -3512,7 +3540,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Max HTLC value in flight exceeded'
+					message: 'Max HTLC value in flight exceeded',
+					code: ChannelErrorCode.LIMIT_EXCEEDED
 				}
 			];
 		}
@@ -3527,7 +3556,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Insufficient balance for HTLC'
+					message: 'Insufficient balance for HTLC',
+					code: ChannelErrorCode.INSUFFICIENT_BALANCE
 				}
 			];
 		}
@@ -3541,7 +3571,13 @@ export class Channel {
 		// channel (issue #1020).
 		const funderRefusal = this._remoteFunderFeeRefusal([amountMsat]);
 		if (funderRefusal) {
-			return [{ type: ChannelActionType.ERROR, message: funderRefusal }];
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: funderRefusal,
+					code: ChannelErrorCode.INSUFFICIENT_BALANCE
+				}
+			];
 		}
 
 		// FFOR concurrent receive: while a voucher book is live the funder,
@@ -3554,7 +3590,13 @@ export class Channel {
 			{ amountMsat, direction: HtlcDirection.OFFERED }
 		]);
 		if (mixedBufferRefusal) {
-			return [{ type: ChannelActionType.ERROR, message: mixedBufferRefusal }];
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: mixedBufferRefusal,
+					code: ChannelErrorCode.INSUFFICIENT_BALANCE
+				}
+			];
 		}
 
 		// Cap total dust-HTLC exposure (BOLT 2 recommendation): dust HTLCs are
@@ -3568,7 +3610,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Dust HTLC exposure limit exceeded'
+					message: 'Dust HTLC exposure limit exceeded',
+					code: ChannelErrorCode.LIMIT_EXCEEDED
 				}
 			];
 		}
@@ -3590,7 +3633,14 @@ export class Channel {
 					}
 				}
 			});
-			if (refusal) return [{ type: ChannelActionType.ERROR, message: refusal }];
+			if (refusal)
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: refusal,
+						code: ChannelErrorCode.INSUFFICIENT_BALANCE
+					}
+				];
 		}
 
 		return [];
@@ -6041,14 +6091,19 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Cannot update fee: wrong state'
+					message: 'Cannot update fee: wrong state',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
 
 		if (this._state.role !== ChannelRole.OPENER) {
 			return [
-				{ type: ChannelActionType.ERROR, message: 'Only opener can update fee' }
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Only opener can update fee',
+					code: ChannelErrorCode.NOT_PERMITTED
+				}
 			];
 		}
 
@@ -6059,7 +6114,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Cannot update fee: channel is quiescing'
+					message: 'Cannot update fee: channel is quiescing',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -6070,7 +6126,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: `Cannot update fee: ${fforFeeRefusal}`
+					message: `Cannot update fee: ${fforFeeRefusal}`,
+					code: ChannelErrorCode.FFOR_REFUSED
 				}
 			];
 		}
@@ -6085,7 +6142,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Fee rate below minimum relay fee (253 sat/kw)'
+					message: 'Fee rate below minimum relay fee (253 sat/kw)',
+					code: ChannelErrorCode.INVALID_PARAMS
 				}
 			];
 		}
@@ -6093,7 +6151,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Fee rate above absolute maximum (100000 sat/kw)'
+					message: 'Fee rate above absolute maximum (100000 sat/kw)',
+					code: ChannelErrorCode.INVALID_PARAMS
 				}
 			];
 		}
@@ -6130,7 +6189,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Fee rate would drain opener below channel reserve'
+					message: 'Fee rate would drain opener below channel reserve',
+					code: ChannelErrorCode.INSUFFICIENT_BALANCE
 				}
 			];
 		}
@@ -6145,7 +6205,8 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message:
-						'update_fee would raise dust HTLC exposure above limit (in-flight HTLCs would be trimmed)'
+						'update_fee would raise dust HTLC exposure above limit (in-flight HTLCs would be trimmed)',
+					code: ChannelErrorCode.LIMIT_EXCEEDED
 				}
 			];
 		}
@@ -6161,7 +6222,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Previous fee update still committing'
+					message: 'Previous fee update still committing',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -6170,7 +6232,13 @@ export class Channel {
 			pendingFeeratePerKw: feeratePerKw
 		});
 		if (emptyRefusal)
-			return [{ type: ChannelActionType.ERROR, message: emptyRefusal }];
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: emptyRefusal,
+					code: ChannelErrorCode.INSUFFICIENT_BALANCE
+				}
+			];
 
 		// Stage the new feerate as pending — do NOT apply it to the committed
 		// config yet. It is used for the commitment built in this round and only
@@ -7986,6 +8054,7 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: `Cannot close cooperatively: ${this._heldCloseOrigin()}`,
+					code: ChannelErrorCode.HELD,
 					cleanup: 'none'
 				}
 			];
@@ -8001,6 +8070,7 @@ export class Channel {
 						this._state.reestablishSecretMissing !== true
 							? 'funds received after the capsule was written'
 							: 'funds a newer state would credit us'),
+					code: ChannelErrorCode.HELD,
 					cleanup: 'none'
 				}
 			];
@@ -8014,6 +8084,7 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: `Cannot close cooperatively: ${fforShutdownRefusal}`,
+					code: ChannelErrorCode.FFOR_REFUSED,
 					cleanup: 'none'
 				}
 			];
@@ -8085,7 +8156,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Cannot shutdown: wrong state'
+					message: 'Cannot shutdown: wrong state',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -8102,7 +8174,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Invalid local shutdown scriptPubkey'
+					message: 'Invalid local shutdown scriptPubkey',
+					code: ChannelErrorCode.INVALID_PARAMS
 				}
 			];
 		}
@@ -12081,7 +12154,8 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message:
-						'Cannot request a splice revert: no conflicted splice pending lock'
+						'Cannot request a splice revert: no conflicted splice pending lock',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -12092,6 +12166,7 @@ export class Channel {
 					{
 						type: ChannelActionType.ERROR,
 						message: SPLICE_BUSY_PEER_QUIESCENCE,
+						code: ChannelErrorCode.BUSY,
 						transient: true
 					}
 				];
@@ -12104,6 +12179,7 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: SPLICE_BUSY_PEER_QUIESCENCE,
+					code: ChannelErrorCode.BUSY,
 					transient: true
 				}
 			];
@@ -12119,6 +12195,7 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: QUIESCE_BUSY_PENDING_HTLCS,
+					code: ChannelErrorCode.BUSY,
 					transient: true
 				}
 			];
@@ -12128,6 +12205,7 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'Cannot quiesce: already quiescing',
+					code: ChannelErrorCode.BUSY,
 					transient: true
 				}
 			];
@@ -12179,7 +12257,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Cannot quiesce: channel not in NORMAL state'
+					message: 'Cannot quiesce: channel not in NORMAL state',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -12193,7 +12272,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: `Cannot quiesce: ${fforStfuRefusal}`
+					message: `Cannot quiesce: ${fforStfuRefusal}`,
+					code: ChannelErrorCode.FFOR_REFUSED
 				}
 			];
 		}
@@ -12204,6 +12284,7 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: QUIESCE_BUSY_PENDING_HTLCS,
+					code: ChannelErrorCode.BUSY,
 					// They settle or fail; either way the channel quiesces after.
 					transient: true
 				}
@@ -12214,7 +12295,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Cannot quiesce: already quiescing'
+					message: 'Cannot quiesce: already quiescing',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -12546,6 +12628,7 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: `Cannot splice: ${fforSpliceRefusal}`,
+					code: ChannelErrorCode.FFOR_REFUSED,
 					cleanup: 'none'
 				}
 			];
@@ -12564,6 +12647,7 @@ export class Channel {
 					{
 						type: ChannelActionType.ERROR,
 						message: SPLICE_BUSY_RECONNECTING,
+						code: ChannelErrorCode.BUSY,
 						transient: true
 					}
 				];
@@ -12576,6 +12660,7 @@ export class Channel {
 					{
 						type: ChannelActionType.ERROR,
 						message: SPLICE_BUSY_SPLICE_ACTIVE,
+						code: ChannelErrorCode.BUSY,
 						transient: true
 					}
 				];
@@ -12583,7 +12668,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Cannot splice: channel not in NORMAL state'
+					message: 'Cannot splice: channel not in NORMAL state',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -12596,6 +12682,7 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: SPLICE_BUSY_ABORT_PENDING,
+					code: ChannelErrorCode.BUSY,
 					transient: true
 				}
 			];
@@ -12612,7 +12699,8 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message:
-						'Cannot splice: taproot (MuSig2) channels do not support splicing yet'
+						'Cannot splice: taproot (MuSig2) channels do not support splicing yet',
+					code: ChannelErrorCode.UNSUPPORTED
 				}
 			];
 		}
@@ -12621,7 +12709,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Cannot splice: no channel ID'
+					message: 'Cannot splice: no channel ID',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -12638,7 +12727,8 @@ export class Channel {
 					type: ChannelActionType.ERROR,
 					message: `Cannot splice-in: post-splice capacity ${
 						this._state.fundingSatoshis + relativeSatoshis
-					} exceeds maximum ${this._maxFundingSatoshis}`
+					} exceeds maximum ${this._maxFundingSatoshis}`,
+					code: ChannelErrorCode.INVALID_PARAMS
 				}
 			];
 		}
@@ -12684,7 +12774,8 @@ export class Channel {
 					return [
 						{
 							type: ChannelActionType.ERROR,
-							message: `Cannot splice-in: the change output makes this a composition the peer must abort, post-splice balance ${postLocalSats} sats below the channel reserve ${reserveSats} sats at the new capacity; splice in at least enough to clear the reserve`
+							message: `Cannot splice-in: the change output makes this a composition the peer must abort, post-splice balance ${postLocalSats} sats below the channel reserve ${reserveSats} sats at the new capacity; splice in at least enough to clear the reserve`,
+							code: ChannelErrorCode.INVALID_PARAMS
 						}
 					];
 				}
@@ -12700,13 +12791,20 @@ export class Channel {
 				return [
 					{
 						type: ChannelActionType.ERROR,
-						message: 'Cannot splice-out: insufficient local balance'
+						message: 'Cannot splice-out: insufficient local balance',
+						code: ChannelErrorCode.INSUFFICIENT_BALANCE
 					}
 				];
 			}
 			const commitmentRefusal = this.spliceOutCommitmentRefusal(withdrawSats);
 			if (commitmentRefusal)
-				return [{ type: ChannelActionType.ERROR, message: commitmentRefusal }];
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: commitmentRefusal,
+						code: ChannelErrorCode.INSUFFICIENT_BALANCE
+					}
+				];
 			// BOLT 2 tx_complete (issue #423): a splice-out adds a destination
 			// output, and a side that adds a non-funding output must end at or
 			// above the reserve the NEW capacity prices, or the peer MUST abort
@@ -12724,7 +12822,8 @@ export class Channel {
 						type: ChannelActionType.ERROR,
 						message: `Cannot splice-out: post-splice balance ${
 							localBalanceSats - withdrawSats
-						} sats would be below the channel reserve ${reserveSats} sats at the new capacity`
+						} sats would be below the channel reserve ${reserveSats} sats at the new capacity`,
+						code: ChannelErrorCode.INSUFFICIENT_BALANCE
 					}
 				];
 			}
@@ -12747,6 +12846,7 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: SPLICE_BUSY_PEER_QUIESCENCE,
+					code: ChannelErrorCode.BUSY,
 					transient: true
 				}
 			];
@@ -12769,6 +12869,7 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: SPLICE_BUSY_REQUEST_PENDING,
+					code: ChannelErrorCode.BUSY,
 					transient: true
 				}
 			];
@@ -12848,6 +12949,7 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: SPLICE_BUSY_ABORT_PENDING,
+					code: ChannelErrorCode.BUSY,
 					transient: true
 				}
 			];
@@ -17559,7 +17661,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Cannot initiate v2 open: wrong state'
+					message: 'Cannot initiate v2 open: wrong state',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -17569,7 +17672,13 @@ export class Channel {
 			'max_htlc_value_in_flight_msat'
 		);
 		if (v2MaxHtlcErr) {
-			return [{ type: ChannelActionType.ERROR, message: v2MaxHtlcErr }];
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: v2MaxHtlcErr,
+					code: ChannelErrorCode.INVALID_PARAMS
+				}
+			];
 		}
 
 		// BOLT 2 requires channel_type on open_channel2, so the default is
@@ -17591,7 +17700,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: `Cannot initiate v2 open: ${v2TypeErr}`
+					message: `Cannot initiate v2 open: ${v2TypeErr}`,
+					code: ChannelErrorCode.UNSUPPORTED
 				}
 			];
 		}
@@ -21690,7 +21800,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'tx_init_rbf is forbidden on an option_zeroconf channel'
+					message: 'tx_init_rbf is forbidden on an option_zeroconf channel',
+					code: ChannelErrorCode.UNSUPPORTED
 				}
 			];
 		}
@@ -21712,14 +21823,19 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: `cannot RBF a v2 open in state ${lifecycle}`
+					message: `cannot RBF a v2 open in state ${lifecycle}`,
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
 		const session = this._state.dualFundingSession;
 		if (!session) {
 			return [
-				{ type: ChannelActionType.ERROR, message: 'No dual-funding session' }
+				{
+					type: ChannelActionType.ERROR,
+					message: 'No dual-funding session',
+					code: ChannelErrorCode.WRONG_STATE
+				}
 			];
 		}
 		// BOLT 2 window: a funding tx may be replaced any time before
@@ -21732,7 +21848,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'cannot RBF a v2 open after channel_ready'
+					message: 'cannot RBF a v2 open after channel_ready',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -21742,7 +21859,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'cannot RBF a v2 open whose funding tx confirmed'
+					message: 'cannot RBF a v2 open whose funding tx confirmed',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -21754,7 +21872,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'cannot RBF while a tx_abort is awaiting its echo'
+					message: 'cannot RBF while a tx_abort is awaiting its echo',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -21764,7 +21883,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'cannot RBF a v2 open restored after a restart'
+					message: 'cannot RBF a v2 open restored after a restart',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -21773,7 +21893,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Only initiator can initiate RBF'
+					message: 'Only initiator can initiate RBF',
+					code: ChannelErrorCode.NOT_PERMITTED
 				}
 			];
 		}
@@ -21793,7 +21914,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: `cannot RBF: dual-funding session is not renegotiable in state ${sessionState}`
+					message: `cannot RBF: dual-funding session is not renegotiable in state ${sessionState}`,
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -21805,7 +21927,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'an RBF request is already pending its ack'
+					message: 'an RBF request is already pending its ack',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -21820,7 +21943,8 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message:
-						'an accepted RBF is still renegotiating; wait for the replacement attempt to be recorded'
+						'an accepted RBF is still renegotiating; wait for the replacement attempt to be recorded',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -21834,7 +21958,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'cannot RBF: no completed funding attempt is recorded'
+					message: 'cannot RBF: no completed funding attempt is recorded',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -21849,7 +21974,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'cannot RBF before the commitment exchange completes'
+					message: 'cannot RBF before the commitment exchange completes',
+					code: ChannelErrorCode.WRONG_STATE
 				}
 			];
 		}
@@ -21865,7 +21991,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: `RBF fee rate ${newFeeratePerkw} below the 25/24 floor ${floor}`
+					message: `RBF fee rate ${newFeeratePerkw} below the 25/24 floor ${floor}`,
+					code: ChannelErrorCode.INVALID_PARAMS
 				}
 			];
 		}
@@ -21880,7 +22007,8 @@ export class Channel {
 					{
 						type: ChannelActionType.ERROR,
 						message:
-							'cannot change the funding contribution: no wallet contribution is registered for this open'
+							'cannot change the funding contribution: no wallet contribution is registered for this open',
+						code: ChannelErrorCode.WRONG_STATE
 					}
 				];
 			}
@@ -21888,7 +22016,8 @@ export class Channel {
 				return [
 					{
 						type: ChannelActionType.ERROR,
-						message: 'RBF funding contribution must be greater than 0'
+						message: 'RBF funding contribution must be greater than 0',
+						code: ChannelErrorCode.INVALID_PARAMS
 					}
 				];
 			}
@@ -21897,7 +22026,13 @@ export class Channel {
 				this._state.v2InFlight.remoteContributionSats
 			);
 			if (refusal) {
-				return [{ type: ChannelActionType.ERROR, message: refusal }];
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: refusal,
+						code: ChannelErrorCode.INVALID_PARAMS
+					}
+				];
 			}
 			// A pledge that expired while this attempt sat unsigned is handed
 			// back to the wallet, so its own selection can re-offer a coin this
@@ -21937,7 +22072,13 @@ export class Channel {
 				: undefined
 		);
 		if (unaffordable) {
-			return [{ type: ChannelActionType.ERROR, message: unaffordable }];
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: unaffordable,
+					code: ChannelErrorCode.INSUFFICIENT_BALANCE
+				}
+			];
 		}
 
 		// NOTHING is replaced until tx_ack_rbf arrives: the current attempt
@@ -21975,7 +22116,8 @@ export class Channel {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: `cannot RBF: ${(err as Error).message}`
+					message: `cannot RBF: ${(err as Error).message}`,
+					code: ChannelErrorCode.INVALID_PARAMS
 				}
 			];
 		}

@@ -11,10 +11,13 @@ export {
 export {
 	BeignetError,
 	BeignetErrorCode,
+	BeignetErrorCodeValue,
 	describeFailureCode,
+	isBeignetErrorCode,
 	isRetryableError,
 	isPermanentFailure
 } from './errors';
+export { CodedError } from '../utils/errors';
 export { startDaemon, DaemonOptions, IStartedDaemon } from './daemon';
 export {
 	ApiKeyAuthenticator,

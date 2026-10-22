@@ -105,7 +105,7 @@ export const getKeyDerivationPathString = ({
 			const str = addressTypes[addressType].path;
 			const res = getKeyDerivationPathObject({ path: str, network });
 			if (res.isErr()) {
-				return err(res.error.message);
+				return err(res.error);
 			}
 			path = res.value;
 		}
