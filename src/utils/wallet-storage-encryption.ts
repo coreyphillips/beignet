@@ -1,5 +1,5 @@
 /**
- * Optional encryption wrapper for the host-injected onchain wallet TStorage.
+ * Optional encryption wrapper for the host-injected onchain IWalletStorage.
  *
  * The Wallet class hands setData plain values (objects or strings) and expects
  * getData to return them deserialized. This wrapper JSON-stringifies each
@@ -14,7 +14,12 @@
  */
 
 import type * as Encryption from '../lightning/storage/encryption';
-import type { IWalletData, TStorage } from '../types';
+import type {
+	IWalletData,
+	IWalletStorage,
+	TWalletDataKeys,
+	TWalletStorageKey
+} from '../types';
 import type { Result } from './result';
 import { err, ok } from './result';
 
@@ -22,15 +27,15 @@ const WALLET_ENC_PREFIX = 'encw1:';
 const WALLET_HKDF_INFO = 'beignet-wallet-storage-v1';
 
 /**
- * Wraps a TStorage so all values are encrypted at rest.
- * @param {TStorage} inner The host storage to wrap.
+ * Wraps an IWalletStorage so all values are encrypted at rest.
+ * @param {IWalletStorage} inner The host storage to wrap.
  * @param {Buffer} seed Wallet seed material (e.g. the BIP39 seed) to derive the key from.
- * @returns {TStorage}
+ * @returns {IWalletStorage}
  */
 export const createEncryptedStorage = (
-	inner: TStorage,
+	inner: IWalletStorage,
 	seed: Buffer
-): TStorage => {
+): IWalletStorage => {
 	// Required here, not at module scope: the root entry reaches this file, and
 	// the helper imports Node 'crypto', which a React Native host that injects
 	// only net and tls does not provide.
@@ -43,11 +48,11 @@ export const createEncryptedStorage = (
 	// No setTransactionChanges, even when inner has one: inner holds each map
 	// as one ciphertext and cannot apply changes to it. The wallet then writes
 	// the whole map through setData.
-	const storage: TStorage = {};
+	const storage: IWalletStorage = {};
 	if (innerGetData) {
-		storage.getData = async <K extends keyof IWalletData>(
-			storageKey: string
-		): Promise<Result<IWalletData[K]>> => {
+		storage.getData = async <K extends TWalletDataKeys>(
+			storageKey: TWalletStorageKey<K>
+		): Promise<Result<IWalletData[K] | undefined>> => {
 			const res = await innerGetData<K>(storageKey);
 			if (res.isErr()) return res;
 			const value: unknown = res.value;
@@ -65,8 +70,8 @@ export const createEncryptedStorage = (
 		};
 	}
 	if (innerSetData) {
-		storage.setData = async <K extends keyof IWalletData>(
-			storageKey: string,
+		storage.setData = async <K extends TWalletDataKeys>(
+			storageKey: TWalletStorageKey<K>,
 			value: IWalletData[K]
 		): Promise<Result<boolean>> => {
 			try {
@@ -77,7 +82,7 @@ export const createEncryptedStorage = (
 				);
 				// The inner storage persists an opaque string in place of the
 				// typed value; hosts already JSON-serialize values, so a string
-				// round-trips through any conforming TStorage.
+				// round-trips through any conforming IWalletStorage.
 				return await innerSetData(storageKey, ciphertext as IWalletData[K]);
 			} catch (e) {
 				return err(e);

@@ -1,7 +1,7 @@
 /**
  * Watch-only (xpub) wallet tests. Fully OFFLINE: address derivation and
- * signing guards need no Electrum connection, so the wallets point at an
- * unreachable local port and background refresh attempts fail harmlessly.
+ * signing guards need no Electrum connection, so the wallets never connect
+ * (remainOffline) and background refresh attempts fail harmlessly.
  */
 
 import { expect } from 'chai';
@@ -15,7 +15,6 @@ import * as bitcoin from 'bitcoinjs-lib';
 import {
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	Wallet,
 	WatchOnlySigningError
 } from '../src';
@@ -25,17 +24,7 @@ const bip32 = BIP32Factory(ecc);
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: these tests must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 const network = EAvailableNetworks.regtest;
 const testTimeout = 60000;
@@ -85,7 +74,8 @@ const createWatchOnly = async (
 		xpub,
 		addressType,
 		network,
-		electrumOptions
+		electrumOptions,
+		remainOffline: true
 	});
 	if (res.isErr()) throw res.error;
 	createdWallets.push(res.value);
@@ -105,7 +95,8 @@ describe('Watch-Only Wallets', function () {
 			mnemonic: MNEMONIC,
 			network,
 			addressType: EAddressType.p2wpkh,
-			electrumOptions
+			electrumOptions,
+			remainOffline: true
 		});
 		if (res.isErr()) throw res.error;
 		fullWallet = res.value;
@@ -232,7 +223,11 @@ describe('Watch-Only Wallets', function () {
 
 	describe('Invalid construction', () => {
 		it('rejects a wallet with neither mnemonic nor xpub', async () => {
-			const res = await Wallet.create({ network, electrumOptions });
+			const res = await Wallet.create({
+				network,
+				electrumOptions,
+				remainOffline: true
+			});
 			expect(res.isErr()).to.equal(true);
 			if (res.isErr()) {
 				expect(res.error.message).to.include('No mnemonic specified');
@@ -248,7 +243,8 @@ describe('Watch-Only Wallets', function () {
 			const res = await Wallet.createWatchOnly({
 				xpub,
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			expect(res.isErr()).to.equal(true);
 			if (res.isErr()) {
@@ -261,7 +257,8 @@ describe('Watch-Only Wallets', function () {
 			const res = await Wallet.createWatchOnly({
 				xpub: tprv,
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			expect(res.isErr()).to.equal(true);
 			if (res.isErr()) {
@@ -274,7 +271,8 @@ describe('Watch-Only Wallets', function () {
 				xpub: slip132Xpub(EAddressType.p2wpkh, 'vpub'),
 				addressType: EAddressType.p2pkh,
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			expect(res.isErr()).to.equal(true);
 		});
@@ -283,7 +281,8 @@ describe('Watch-Only Wallets', function () {
 			const res = await Wallet.createWatchOnly({
 				xpub: 'vpubnotarealkey',
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			expect(res.isErr()).to.equal(true);
 		});

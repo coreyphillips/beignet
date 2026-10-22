@@ -1,6 +1,7 @@
 # Every exported declaration tagged @deprecated. Regenerate with npm run api:snapshot; do not edit.
 beignet: type EAvailableNetworks = Network
 beignet: namespace EAvailableNetworks
+beignet: enum EUnit
 beignet: property IBtInfo.version: number
 beignet: property IFormattedTransaction.fee: number
 beignet: property IFormattedTransaction.matchedInputValue: number
@@ -9,8 +10,16 @@ beignet: property IFormattedTransaction.totalInputValue: number
 beignet: property IFormattedTransaction.totalOutputValue: number
 beignet: property IFormattedTransaction.value: number
 beignet: property IIndexedOutpoint.index: number
+beignet: property ISendTransaction.fiatAmount: number
+beignet: property ISendTransaction.lightningInvoice?: string
+beignet: property ISendTransaction.slashTagsUrl?: string
+beignet: property IWallet.addressLookAhead?: number
+beignet: property IWallet.addressLookBehind?: number
+beignet: property IWallet.data?: IWalletData
+beignet: property IWallet.id?: string
 beignet: type TAvailableNetworks = `${Network}`
 beignet: type TProtocol = `${EProtocol}`
+beignet: type TStorage = IWalletStorage
 beignet: method Wallet.getAddressBalance(address: string): Promise<Result<IGetAddressBalanceRes>>
 beignet: method Wallet.getAddressHistory(address: string): Promise<Result<TTxResult[]>>
 beignet: method Wallet.getAddressesBalance(addresses?: string[]): Promise<Result<number>>

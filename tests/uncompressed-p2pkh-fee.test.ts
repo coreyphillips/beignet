@@ -3,7 +3,7 @@
  * compressed. An uncompressed key is 32 bytes longer, so a payment signed
  * with one went out below the rate it was quoted at.
  *
- * Fully OFFLINE: the wallet points at an unreachable Electrum server and the
+ * Fully OFFLINE: the wallet never connects (remainOffline) and the
  * previous-transaction fetch is stubbed.
  */
 
@@ -18,7 +18,6 @@ import {
 	EAddressType,
 	EAvailableNetworks,
 	ECoinSelectPreference,
-	EProtocol,
 	IUtxo,
 	ok,
 	Result,
@@ -34,16 +33,7 @@ const regtest = bitcoin.networks.regtest;
 const RATE = 10;
 const INPUT_VALUE = 10_000;
 
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 const keyPair = ECPair.fromPrivateKey(Buffer.alloc(32, 0x5a), {
 	network: regtest,
@@ -100,6 +90,7 @@ describe('Fee estimation for an uncompressed P2PKH input (#1527)', function () {
 			network: EAvailableNetworks.regtest,
 			addressType: EAddressType.p2wpkh,
 			electrumOptions,
+			remainOffline: true,
 			name: 'uncompressedp2pkhfee'
 		});
 		if (res.isErr()) throw res.error;

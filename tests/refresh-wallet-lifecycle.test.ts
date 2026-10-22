@@ -13,8 +13,8 @@
  * -> rescanAddresses -> refreshWallet), and lowering the flag there would hand a
  * second caller a concurrent refresh.
  *
- * Fully OFFLINE: the wallet points at an unreachable port and every step of the
- * refresh is stubbed, so this asserts on the flag lifecycle alone.
+ * Fully OFFLINE: the wallet never connects (remainOffline) and every step of
+ * the refresh is stubbed, so this asserts on the flag lifecycle alone.
  */
 
 import { expect } from 'chai';
@@ -25,7 +25,6 @@ import sinon from 'sinon';
 import {
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	IGetUtxosResponse,
 	ok,
 	Result,
@@ -35,17 +34,7 @@ import {
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 /** The private steps refreshWallet runs, stubbed through a cast. */
 type TRefreshInternals = {
@@ -100,13 +89,14 @@ describe('refreshWallet flag lifecycle', function () {
 			mnemonic: MNEMONIC,
 			network: EAvailableNetworks.regtest,
 			addressType: EAddressType.p2wpkh,
-			electrumOptions
+			electrumOptions,
+			remainOffline: true
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
 
 		// Wallet.create kicks off a refresh without awaiting it. Let that one
-		// finish (it fails fast against the unreachable port) before stubbing,
+		// finish (it fails at its first network step offline) before stubbing,
 		// so the cases below own the flag from a known-idle start.
 		for (let i = 0; i < 400 && wallet.isRefreshing; i++) {
 			await new Promise((resolve) => setTimeout(resolve, 25));

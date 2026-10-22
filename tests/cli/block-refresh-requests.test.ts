@@ -559,8 +559,14 @@ describe('block notification refresh requests (#1663)', function () {
 			exists: true,
 			vsize: 141
 		};
-		wallet.data.transactions[txid] = record;
-		wallet.data.unconfirmedTransactions[txid] = record;
+		const pending = await wallet.updateData({
+			transactions: { ...wallet.data.transactions, [txid]: record },
+			unconfirmedTransactions: {
+				...wallet.data.unconfirmedTransactions,
+				[txid]: record
+			}
+		});
+		if (pending.isErr()) throw pending.error;
 		resetCounts();
 
 		await block(102);

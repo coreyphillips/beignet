@@ -5,6 +5,9 @@
  * module-global client state without request timeouts, and any other
  * wallet's failed-connect residue in the same process can wedge the awaited
  * calls in this lifecycle.
+ *
+ * Most wallets here never connect (remainOffline). The cases that assert on
+ * the connection a failed connect leaves point at an unreachable port.
  */
 
 import { expect } from 'chai';
@@ -13,6 +16,7 @@ import tls from 'tls';
 import { networks, payments } from 'bitcoinjs-lib';
 import { BIP32Interface } from 'bip32';
 import {
+	createMemoryStorage,
 	EAddressType,
 	EAvailableNetworks,
 	ECoinSelectPreference,
@@ -29,22 +33,26 @@ import {
 	ITransaction,
 	IUtxo,
 	IWalletData,
+	IWalletStorage,
 	err,
 	ok,
 	Result,
-	TStorage,
 	Wallet
 } from '../src';
 import { getWalletDataStorageKey } from '../src/utils/wallet';
 import { bip32 } from '../src/utils/ecc-apis';
+import { writableData } from './writable-wallet-data';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
-const electrumOptions = {
-	net,
-	tls,
+// No servers: the wallets are created with remainOffline, all but the ones
+// on unreachableElectrumOptions.
+const electrumOptions = { net, tls };
+
+// Unreachable on purpose, for the cases that need a real connect to fail.
+const unreachableElectrumOptions = {
+	...electrumOptions,
 	servers: {
 		host: '127.0.0.1',
 		ssl: 65528,
@@ -87,18 +95,23 @@ const utxo = (value: number, index: number): IUtxo => ({
 	publicKey: '02'.repeat(33)
 });
 
-const makeStorage = (store: Map<string, unknown>): TStorage => ({
-	getData: async <K extends keyof IWalletData>(
-		key: string
-	): Promise<Result<IWalletData[K]>> => ok(store.get(key) as IWalletData[K]),
-	setData: async <K extends keyof IWalletData>(
-		key: string,
-		value: IWalletData[K]
-	): Promise<Result<boolean>> => {
-		store.set(key, value);
-		return ok(true);
-	}
-});
+/**
+ * Storage over `store`, which holds each key's JSON. Without
+ * setTransactionChanges, so every write of the transaction map is a setData
+ * call: the cases here hold those writes and look for them.
+ */
+const makeStorage = (
+	store: Map<string, string>
+): Pick<Required<IWalletStorage>, 'getData' | 'setData'> => {
+	const { getData, setData } = createMemoryStorage(store);
+	return { getData, setData };
+};
+
+/** What `store` holds under `key`, parsed. */
+const read = (store: Map<string, string>, key: string): unknown => {
+	const json = store.get(key);
+	return json === undefined ? undefined : JSON.parse(json);
+};
 
 /** Whether the promise settles within five seconds. */
 const settles = async (pending: Promise<unknown>): Promise<boolean> => {
@@ -196,30 +209,27 @@ const answer = (entries: {
 
 /** makeStorage, holding the next write to the key passed to holdNext. */
 const holdingStorage = (
-	store: Map<string, unknown>
+	store: Map<string, string>
 ): ReturnType<typeof holdable> & {
-	storage: TStorage;
+	storage: IWalletStorage;
 	holdNext: (key: string) => void;
 } => {
 	const gate = holdable();
 	let at: string | undefined;
+	const { getData, setData } = makeStorage(store);
 	return {
 		...gate,
 		holdNext: (key: string): void => {
 			at = key;
 		},
 		storage: {
-			getData: makeStorage(store).getData,
-			setData: async <K extends keyof IWalletData>(
-				key: string,
-				value: IWalletData[K]
-			): Promise<Result<boolean>> => {
+			getData,
+			setData: async (key, value): Promise<Result<boolean>> => {
 				if (key === at) {
 					at = undefined;
 					await gate.hold();
 				}
-				store.set(key, value);
-				return ok(true);
+				return setData(key, value);
 			}
 		}
 	};
@@ -236,7 +246,7 @@ describe('switchNetwork against an unreachable target', function () {
 		const res = await Wallet.create({
 			mnemonic: MNEMONIC,
 			network,
-			electrumOptions,
+			electrumOptions: unreachableElectrumOptions,
 			feeEstimationSource: 'electrum'
 		});
 		if (res.isErr()) throw res.error;
@@ -267,6 +277,7 @@ describe('switchNetwork against an unreachable target', function () {
 			mnemonic: MNEMONIC,
 			network,
 			electrumOptions,
+			remainOffline: true,
 			feeEstimationSource: 'electrum'
 		});
 		if (res.isErr()) throw res.error;
@@ -300,7 +311,10 @@ describe('switchNetwork against an unreachable target', function () {
 			expect(w.isRefreshing).to.equal(false);
 
 			// Quotes default to the preference and fee estimate set afterwards.
-			w.data.utxos = [utxo(100000, 0), utxo(20000, 1)];
+			const funded = await w.updateData({
+				utxos: [utxo(100000, 0), utxo(20000, 1)]
+			});
+			if (funded.isErr()) throw funded.error;
 			const quote = (
 				options: {
 					satsPerByte?: number;
@@ -349,6 +363,7 @@ describe('switchNetwork against an unreachable target', function () {
 			mnemonic: MNEMONIC,
 			network,
 			electrumOptions,
+			remainOffline: true,
 			feeEstimationSource: 'electrum'
 		});
 		if (res.isErr()) throw res.error;
@@ -381,6 +396,7 @@ describe('switchNetwork against an unreachable target', function () {
 			mnemonic: MNEMONIC,
 			network,
 			electrumOptions,
+			remainOffline: true,
 			feeEstimationSource: 'electrum',
 			disableRefreshOnCreate: true
 		});
@@ -419,6 +435,7 @@ describe('switchNetwork against an unreachable target', function () {
 			mnemonic: MNEMONIC,
 			network,
 			electrumOptions,
+			remainOffline: true,
 			feeEstimationSource: 'electrum',
 			disableRefreshOnCreate: true
 		});
@@ -475,6 +492,7 @@ describe('switchNetwork against an unreachable target', function () {
 			mnemonic: MNEMONIC,
 			network,
 			electrumOptions,
+			remainOffline: true,
 			feeEstimationSource: 'electrum',
 			disableRefreshOnCreate: true
 		});
@@ -550,7 +568,7 @@ describe('switchNetwork against an unreachable target', function () {
 
 	it('writes a pending UTXO pair under the network it was scanned on (#1623)', async function () {
 		const name = 'switchsave';
-		const store = new Map<string, unknown>();
+		const store = new Map<string, string>();
 		const key = (on: EAvailableNetworks, field: keyof IWalletData): string =>
 			getWalletDataStorageKey(name, on, field);
 		let release = (): void => {};
@@ -561,23 +579,21 @@ describe('switchNetwork against an unreachable target', function () {
 		const holding = new Promise<void>((resolve) => {
 			held = resolve;
 		});
+		const { getData, setData } = makeStorage(store);
 		const res = await Wallet.create({
 			mnemonic: MNEMONIC,
 			name,
 			network,
 			electrumOptions,
+			remainOffline: true,
 			storage: {
-				...makeStorage(store),
-				setData: async <K extends keyof IWalletData>(
-					at: string,
-					value: IWalletData[K]
-				): Promise<Result<boolean>> => {
+				getData,
+				setData: async (at, value) => {
 					if (at === key(network, 'utxos')) {
 						held();
 						await gate;
 					}
-					store.set(at, value);
-					return ok(true);
+					return setData(at, value);
 				}
 			},
 			feeEstimationSource: 'electrum',
@@ -613,8 +629,10 @@ describe('switchNetwork against an unreachable target', function () {
 			expect(store.has(key(EAvailableNetworks.signet, 'balance'))).to.equal(
 				false
 			);
-			expect(store.get(key(network, 'utxos'))).to.deep.equal([utxo(100000, 0)]);
-			expect(store.get(key(network, 'balance'))).to.equal(100000);
+			expect(read(store, key(network, 'utxos'))).to.deep.equal([
+				utxo(100000, 0)
+			]);
+			expect(read(store, key(network, 'balance'))).to.equal(100000);
 		} finally {
 			release();
 			await w.stop();
@@ -623,7 +641,7 @@ describe('switchNetwork against an unreachable target', function () {
 
 	it('keeps a pending write ahead of a newer one after switching back (#1631)', async function () {
 		const name = 'switchback';
-		const store = new Map<string, unknown>();
+		const store = new Map<string, string>();
 		const key = (field: keyof IWalletData): string =>
 			getWalletDataStorageKey(name, network, field);
 		let release = (): void => {};
@@ -635,23 +653,21 @@ describe('switchNetwork against an unreachable target', function () {
 			held = resolve;
 		});
 		let holds = 1;
+		const { getData, setData } = makeStorage(store);
 		const res = await Wallet.create({
 			mnemonic: MNEMONIC,
 			name,
 			network,
 			electrumOptions,
+			remainOffline: true,
 			storage: {
-				...makeStorage(store),
-				setData: async <K extends keyof IWalletData>(
-					at: string,
-					value: IWalletData[K]
-				): Promise<Result<boolean>> => {
+				getData,
+				setData: async (at, value) => {
 					if (at === key('utxos') && holds-- > 0) {
 						held();
 						await gate;
 					}
-					store.set(at, value);
-					return ok(true);
+					return setData(at, value);
 				}
 			},
 			feeEstimationSource: 'electrum',
@@ -693,8 +709,8 @@ describe('switchNetwork against an unreachable target', function () {
 
 			expect(w.data.utxos).to.deep.equal([]);
 			expect(w.data.balance).to.equal(0);
-			expect(store.get(key('utxos'))).to.deep.equal([]);
-			expect(store.get(key('balance'))).to.equal(0);
+			expect(read(store, key('utxos'))).to.deep.equal([]);
+			expect(read(store, key('balance'))).to.equal(0);
 		} finally {
 			release();
 			await w.stop();
@@ -707,6 +723,7 @@ describe('switchNetwork against an unreachable target', function () {
 			mnemonic: MNEMONIC,
 			network,
 			electrumOptions: { ...electrumOptions, batchLimit: 5, batchDelay: 1 },
+			remainOffline: true,
 			feeEstimationSource: 'electrum',
 			disableMessagesOnCreate: true,
 			disableRefreshOnCreate: true,
@@ -777,6 +794,7 @@ describe('switchNetwork against an unreachable target', function () {
 			network,
 			addressType: EAddressType.p2wpkh,
 			electrumOptions,
+			remainOffline: true,
 			feeEstimationSource: 'electrum',
 			disableRefreshOnCreate: true
 		});
@@ -794,16 +812,19 @@ describe('switchNetwork against an unreachable target', function () {
 		// Index-0 addresses, derived offline: a coin to spend and change to pay.
 		await stubs.setZeroIndexAddresses();
 		const source = w.data.addressIndex[EAddressType.p2wpkh];
-		w.data.utxos = [
-			{
-				...source,
-				height: 1,
-				tx_hash: '11'.repeat(32),
-				tx_pos: 0,
-				value: 60000
-			}
-		];
-		w.data.balance = 60000;
+		const funded = await w.updateData({
+			utxos: [
+				{
+					...source,
+					height: 1,
+					tx_hash: '11'.repeat(32),
+					tx_pos: 0,
+					value: 60000
+				}
+			],
+			balance: 60000
+		});
+		if (funded.isErr()) throw funded.error;
 		const electrum = w.electrum;
 		const transaction = w.transaction;
 		// Segwit inputs build from witnessUtxo when the previous transaction
@@ -879,7 +900,7 @@ describe('switchNetwork against an unreachable target', function () {
 
 	it('drops the index scan of a refresh held across the switch (#1636)', async function () {
 		const name = 'switchindex';
-		const store = new Map<string, unknown>();
+		const store = new Map<string, string>();
 		const key = (on: EAvailableNetworks, field: keyof IWalletData): string =>
 			getWalletDataStorageKey(name, on, field);
 		const res = await Wallet.create({
@@ -888,6 +909,7 @@ describe('switchNetwork against an unreachable target', function () {
 			network,
 			addressType: EAddressType.p2wpkh,
 			electrumOptions,
+			remainOffline: true,
 			storage: makeStorage(store),
 			feeEstimationSource: 'electrum',
 			disableRefreshOnCreate: true
@@ -957,13 +979,14 @@ describe('switchNetwork against an unreachable target', function () {
 					'tb1q'
 				)
 			).to.equal(true);
-			const stored = store.get(
+			const stored = read(
+				store,
 				key(EAvailableNetworks.signet, 'addressIndex')
 			) as IWalletData['addressIndex'];
 			expect(stored[EAddressType.p2wpkh]).to.deep.equal(index);
 			const signetValues = [...store.entries()]
 				.filter(([at]) => at.includes(EAvailableNetworks.signet))
-				.map(([, value]) => JSON.stringify(value));
+				.map(([, value]) => value);
 			expect(signetValues.some((value) => value.includes('bcrt1'))).to.equal(
 				false
 			);
@@ -975,7 +998,7 @@ describe('switchNetwork against an unreachable target', function () {
 
 	it('drops the history a refresh held across the switch read (#1636)', async function () {
 		const name = 'switchhistory';
-		const store = new Map<string, unknown>();
+		const store = new Map<string, string>();
 		const key = (on: EAvailableNetworks, field: keyof IWalletData): string =>
 			getWalletDataStorageKey(name, on, field);
 		const res = await Wallet.create({
@@ -984,6 +1007,7 @@ describe('switchNetwork against an unreachable target', function () {
 			network,
 			addressType: EAddressType.p2wpkh,
 			electrumOptions,
+			remainOffline: true,
 			storage: makeStorage(store),
 			feeEstimationSource: 'electrum',
 			disableRefreshOnCreate: true
@@ -1058,7 +1082,7 @@ describe('switchNetwork against an unreachable target', function () {
 				store.has(key(EAvailableNetworks.signet, 'transactions'))
 			).to.equal(false);
 			expect(
-				store.get(key(EAvailableNetworks.signet, 'unconfirmedTransactions'))
+				read(store, key(EAvailableNetworks.signet, 'unconfirmedTransactions'))
 			).to.deep.equal({});
 			expect(store.has(key(network, 'transactions'))).to.equal(false);
 		} finally {
@@ -1072,13 +1096,14 @@ describe('switchNetwork against an unreachable target', function () {
 	for (const heldIndex of [0, 1]) {
 		it(`drops the zero index addresses a refresh derived across the switch, held at index ${heldIndex} (#1754)`, async function () {
 			const name = `switchzero${heldIndex}`;
-			const store = new Map<string, unknown>();
+			const store = new Map<string, string>();
 			const res = await Wallet.create({
 				mnemonic: MNEMONIC,
 				name,
 				network,
 				addressType: EAddressType.p2wpkh,
 				electrumOptions,
+				remainOffline: true,
 				storage: makeStorage(store),
 				feeEstimationSource: 'electrum',
 				disableRefreshOnCreate: true
@@ -1123,7 +1148,8 @@ describe('switchNetwork against an unreachable target', function () {
 				expect(index.index).to.equal(0);
 				expect(index.address.startsWith('tb1q')).to.equal(true);
 				expect(JSON.stringify(w.data)).not.to.include('bcrt1');
-				const stored = store.get(
+				const stored = read(
+					store,
 					getWalletDataStorageKey(
 						name,
 						EAvailableNetworks.signet,
@@ -1133,7 +1159,7 @@ describe('switchNetwork against an unreachable target', function () {
 				expect(stored[EAddressType.p2wpkh]).to.deep.equal(index);
 				const signetValues = [...store.entries()]
 					.filter(([at]) => at.includes(EAvailableNetworks.signet))
-					.map(([, value]) => JSON.stringify(value));
+					.map(([, value]) => value);
 				expect(signetValues.some((value) => value.includes('bcrt1'))).to.equal(
 					false
 				);
@@ -1146,7 +1172,7 @@ describe('switchNetwork against an unreachable target', function () {
 
 	it('drops a reorg repair a switch lands in the write of (#1754)', async function () {
 		const name = 'switchreorg';
-		const store = new Map<string, unknown>();
+		const store = new Map<string, string>();
 		const key = (on: EAvailableNetworks, field: keyof IWalletData): string =>
 			getWalletDataStorageKey(name, on, field);
 		const saving = holdingStorage(store);
@@ -1156,6 +1182,7 @@ describe('switchNetwork against an unreachable target', function () {
 			network,
 			addressType: EAddressType.p2wpkh,
 			electrumOptions,
+			remainOffline: true,
 			storage: saving.storage,
 			feeEstimationSource: 'electrum',
 			disableRefreshOnCreate: true
@@ -1169,9 +1196,12 @@ describe('switchNetwork against an unreachable target', function () {
 		offline(w.electrum);
 		// Seen in block 100, and back in the mempool once the refresh asks.
 		const txid = 'ee'.repeat(32);
-		w.data.transactions = { [txid]: payment(txid, 100) };
-		w.data.unconfirmedTransactions = { [txid]: payment(txid, 100) };
-		w.data.header.height = 101;
+		const seeded = await w.updateData({
+			transactions: { [txid]: payment(txid, 100) },
+			unconfirmedTransactions: { [txid]: payment(txid, 100) },
+			header: { ...w.data.header, height: 101 }
+		});
+		if (seeded.isErr()) throw seeded.error;
 		w.electrum.getTransactions = async (): Promise<Result<IGetTransactions>> =>
 			answer({ [txid]: { result: { confirmations: 0 } } });
 		try {
@@ -1194,12 +1224,13 @@ describe('switchNetwork against an unreachable target', function () {
 			expect(w.data.unconfirmedTransactions).to.deep.equal({});
 			const signetValues = [...store.entries()]
 				.filter(([at]) => at.includes(EAvailableNetworks.signet))
-				.map(([, value]) => JSON.stringify(value));
+				.map(([, value]) => value);
 			expect(signetValues.some((value) => value.includes(txid))).to.equal(
 				false
 			);
 			// The repair still landed on the network it was made for.
-			const repaired = store.get(
+			const repaired = read(
+				store,
 				key(network, 'transactions')
 			) as IFormattedTransactions;
 			expect(repaired[txid].height).to.equal(0);
@@ -1214,7 +1245,7 @@ describe('switchNetwork against an unreachable target', function () {
 	for (const field of ['transactions', 'unconfirmedTransactions'] as const) {
 		it(`drops a ghost repair a switch lands in the ${field} write of (#1754)`, async function () {
 			const name = `switchghost${field}`;
-			const store = new Map<string, unknown>();
+			const store = new Map<string, string>();
 			const key = (on: EAvailableNetworks, at: keyof IWalletData): string =>
 				getWalletDataStorageKey(name, on, at);
 			const saving = holdingStorage(store);
@@ -1224,6 +1255,7 @@ describe('switchNetwork against an unreachable target', function () {
 				network,
 				addressType: EAddressType.p2wpkh,
 				electrumOptions,
+				remainOffline: true,
 				storage: saving.storage,
 				feeEstimationSource: 'electrum',
 				disableRefreshOnCreate: true
@@ -1239,12 +1271,16 @@ describe('switchNetwork against an unreachable target', function () {
 			// still in the mempool.
 			const ghost = 'ee'.repeat(32);
 			const pending = 'ef'.repeat(32);
-			w.data.transactions = {
+			const transactions = {
 				[ghost]: payment(ghost, 100),
 				[pending]: payment(pending, 0)
 			};
-			w.data.unconfirmedTransactions = { ...w.data.transactions };
-			w.data.header.height = 101;
+			const seeded = await w.updateData({
+				transactions,
+				unconfirmedTransactions: { ...transactions },
+				header: { ...w.data.header, height: 101 }
+			});
+			if (seeded.isErr()) throw seeded.error;
 			w.electrum.getTransactions = async (): Promise<
 				Result<IGetTransactions>
 			> =>
@@ -1283,7 +1319,7 @@ describe('switchNetwork against an unreachable target', function () {
 				expect(w.data.unconfirmedTransactions).to.deep.equal({});
 				const signetValues = [...store.entries()]
 					.filter(([at]) => at.includes(EAvailableNetworks.signet))
-					.map(([, value]) => JSON.stringify(value));
+					.map(([, value]) => value);
 				expect(
 					signetValues.some(
 						(value) => value.includes(ghost) || value.includes(pending)
@@ -1293,7 +1329,8 @@ describe('switchNetwork against an unreachable target', function () {
 				// regtest's balance.
 				expect(rescans).to.equal(0);
 				// The ghost is still cleared on the network it was found on.
-				const repaired = store.get(
+				const repaired = read(
+					store,
 					key(network, 'transactions')
 				) as IFormattedTransactions;
 				expect(repaired[ghost].exists).to.equal(false);
@@ -1309,7 +1346,7 @@ describe('switchNetwork against an unreachable target', function () {
 	for (const field of ['utxos', 'balance'] as const) {
 		it(`keeps the receive index of the network a ghost rescan's ${field} write is switched away from (#1807)`, async function () {
 			const name = `switchrescan${field}`;
-			const store = new Map<string, unknown>();
+			const store = new Map<string, string>();
 			const key = (on: EAvailableNetworks, at: keyof IWalletData): string =>
 				getWalletDataStorageKey(name, on, at);
 			const saving = holdingStorage(store);
@@ -1321,6 +1358,7 @@ describe('switchNetwork against an unreachable target', function () {
 					network: on,
 					addressType: type,
 					electrumOptions,
+					remainOffline: true,
 					storage: saving.storage,
 					feeEstimationSource: 'electrum',
 					disableRefreshOnCreate: true
@@ -1350,9 +1388,12 @@ describe('switchNetwork against an unreachable target', function () {
 
 			const w = await create(network);
 			const ghost = 'ee'.repeat(32);
-			w.data.transactions = { [ghost]: payment(ghost, 100) };
-			w.data.unconfirmedTransactions = { [ghost]: payment(ghost, 100) };
-			w.data.header.height = 101;
+			const seeded = await w.updateData({
+				transactions: { [ghost]: payment(ghost, 100) },
+				unconfirmedTransactions: { [ghost]: payment(ghost, 100) },
+				header: { ...w.data.header, height: 101 }
+			});
+			if (seeded.isErr()) throw seeded.error;
 			w.electrum.getTransactions = async (): Promise<
 				Result<IGetTransactions>
 			> =>
@@ -1387,7 +1428,8 @@ describe('switchNetwork against an unreachable target', function () {
 
 				expect(w.data.addressIndex[type].index).to.equal(5);
 				expect(w.data.addressIndex[type].address).to.equal(issued);
-				const stored = store.get(
+				const stored = read(
+					store,
 					key(EAvailableNetworks.signet, 'addressIndex')
 				) as IWalletData['addressIndex'];
 				expect(stored[type].index).to.equal(5);
@@ -1398,7 +1440,7 @@ describe('switchNetwork against an unreachable target', function () {
 				expect(receive.value).not.to.equal(first.value);
 				expect(rescanned?.isErr()).to.equal(true);
 				// The rescan still cleared the UTXOs of the network it was for.
-				expect(store.get(key(network, 'utxos'))).to.deep.equal([]);
+				expect(read(store, key(network, 'utxos'))).to.deep.equal([]);
 			} finally {
 				saving.release();
 				await w.stop();
@@ -1411,6 +1453,7 @@ describe('switchNetwork against an unreachable target', function () {
 			mnemonic: MNEMONIC,
 			network,
 			electrumOptions,
+			remainOffline: true,
 			feeEstimationSource: 'electrum',
 			disableRefreshOnCreate: true
 		});
@@ -1457,24 +1500,27 @@ describe('switchNetwork against an unreachable target', function () {
 
 	it('leaves the wallet untouched when the target network fails to load (#1595)', async function () {
 		const name = 'switchfail';
-		const store = new Map<string, unknown>();
+		const store = new Map<string, string>();
 		// Another wallet's id under the target network's key fails the load.
 		store.set(
 			getWalletDataStorageKey(name, EAvailableNetworks.testnet, 'id'),
-			'another-wallet'
+			JSON.stringify('another-wallet')
 		);
 		const res = await Wallet.create({
 			mnemonic: MNEMONIC,
 			name,
 			network,
-			electrumOptions,
+			electrumOptions: unreachableElectrumOptions,
 			storage: makeStorage(store),
 			feeEstimationSource: 'electrum'
 		});
 		if (res.isErr()) throw res.error;
 		const w = res.value;
 		try {
-			const { data, electrum, transaction } = w;
+			const { electrum, transaction } = w;
+			// The object itself: the refresh create started goes on deriving
+			// into it, so a copy taken now would not read the same later.
+			const data = writableData(w);
 			const switched = await w.switchNetwork(
 				EAvailableNetworks.testnet,
 				otherServer
@@ -1485,7 +1531,7 @@ describe('switchNetwork against an unreachable target', function () {
 			}
 			expect(w.isSwitchingNetworks).to.equal(false);
 			expect(w.network).to.equal(network);
-			expect(w.data).to.equal(data);
+			expect(writableData(w)).to.equal(data);
 			expect(w.transaction).to.equal(transaction);
 			expect(w.electrum).to.equal(electrum);
 			expect(electrum.isDisconnected).to.equal(false);

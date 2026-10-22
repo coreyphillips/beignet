@@ -7,7 +7,7 @@
  * registration), and segwit v0 external-signer PSBTs lacked non_witness_utxo
  * (Ledger 2.x / Trezor >= 2.3.5 reject them).
  *
- * Fully OFFLINE (unreachable Electrum, fabricated UTXOs), the pattern of
+ * Fully OFFLINE (remainOffline wallets, fabricated UTXOs), the pattern of
  * psbt-flow.test.ts / multisig.test.ts.
  */
 
@@ -22,7 +22,6 @@ import * as bitcoin from 'bitcoinjs-lib';
 import {
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	getScriptHash,
 	normalizeKeyOrigin,
 	ok,
@@ -44,16 +43,7 @@ const regtest = bitcoin.networks.regtest;
 const network = EAvailableNetworks.regtest;
 const testTimeout = 120000;
 
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 const fingerprintHex = (root: BIP32Interface): string =>
 	Buffer.from(root.fingerprint).toString('hex');
@@ -107,7 +97,8 @@ describe('Wallet key-origin metadata (S-B.H1/M1/M2)', function () {
 				originPath: "m/84'/1'/0'",
 				addressType: EAddressType.p2wpkh,
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (res.isErr()) throw res.error;
 			watchOnly = track(res.value);
@@ -116,19 +107,27 @@ describe('Wallet key-origin metadata (S-B.H1/M1/M2)', function () {
 				index: '0',
 				addressType: EAddressType.p2wpkh
 			});
-			watchOnly.data.utxos.push({
-				address,
-				index: 0,
-				path: "m/84'/1'/0'/0/0",
-				scriptHash: getScriptHash({ address, network }),
-				height: 100,
-				tx_hash: Buffer.from(
-					bitcoin.crypto.sha256(Buffer.from('key-origin-utxo-0'))
-				).toString('hex'),
-				tx_pos: 0,
-				value: 60000,
-				publicKey: rootA.derivePath("m/84'/1'/0'/0/0").publicKey.toString('hex')
+			const added = await watchOnly.updateData({
+				utxos: [
+					...watchOnly.data.utxos,
+					{
+						address,
+						index: 0,
+						path: "m/84'/1'/0'/0/0",
+						scriptHash: getScriptHash({ address, network }),
+						height: 100,
+						tx_hash: Buffer.from(
+							bitcoin.crypto.sha256(Buffer.from('key-origin-utxo-0'))
+						).toString('hex'),
+						tx_pos: 0,
+						value: 60000,
+						publicKey: rootA
+							.derivePath("m/84'/1'/0'/0/0")
+							.publicKey.toString('hex')
+					}
+				]
 			});
+			if (added.isErr()) throw added.error;
 		});
 
 		it('getMasterFingerprint returns the supplied master fingerprint', () => {
@@ -182,6 +181,7 @@ describe('Wallet key-origin metadata (S-B.H1/M1/M2)', function () {
 				addressType: EAddressType.p2wpkh,
 				network,
 				electrumOptions,
+				remainOffline: true,
 				name: 'fponly'
 			});
 			if (res.isErr()) throw res.error;
@@ -200,6 +200,7 @@ describe('Wallet key-origin metadata (S-B.H1/M1/M2)', function () {
 				masterFingerprint: 'nothex!!',
 				network,
 				electrumOptions,
+				remainOffline: true,
 				name: 'badfp'
 			});
 			expect(badFp.isErr()).to.equal(true);
@@ -208,6 +209,7 @@ describe('Wallet key-origin metadata (S-B.H1/M1/M2)', function () {
 				originPath: "m/84'/1'/0'",
 				network,
 				electrumOptions,
+				remainOffline: true,
 				name: 'pathonly'
 			});
 			expect(pathOnly.isErr()).to.equal(true);
@@ -234,7 +236,8 @@ describe('Wallet key-origin metadata (S-B.H1/M1/M2)', function () {
 					}
 				],
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (res.isErr()) throw res.error;
 			walletA = track(res.value);
@@ -278,6 +281,7 @@ describe('Wallet key-origin metadata (S-B.H1/M1/M2)', function () {
 				],
 				network,
 				electrumOptions,
+				remainOffline: true,
 				name: 'legacyms'
 			});
 			if (res.isErr()) throw res.error;
@@ -296,6 +300,7 @@ describe('Wallet key-origin metadata (S-B.H1/M1/M2)', function () {
 				network,
 				addressType: EAddressType.p2wpkh,
 				electrumOptions,
+				remainOffline: true,
 				name: 'nwutxo'
 			});
 			if (res.isErr()) throw res.error;
@@ -308,17 +313,25 @@ describe('Wallet key-origin metadata (S-B.H1/M1/M2)', function () {
 			const prevTx = new bitcoin.Transaction();
 			prevTx.addInput(Buffer.alloc(32, 7), 0);
 			prevTx.addOutput(bitcoin.address.toOutputScript(address, regtest), 60000);
-			wallet.data.utxos.push({
-				address,
-				index: 0,
-				path: "m/84'/1'/0'/0/0",
-				scriptHash: getScriptHash({ address, network }),
-				height: 100,
-				tx_hash: prevTx.getId(),
-				tx_pos: 0,
-				value: 60000,
-				publicKey: rootA.derivePath("m/84'/1'/0'/0/0").publicKey.toString('hex')
+			const added = await wallet.updateData({
+				utxos: [
+					...wallet.data.utxos,
+					{
+						address,
+						index: 0,
+						path: "m/84'/1'/0'/0/0",
+						scriptHash: getScriptHash({ address, network }),
+						height: 100,
+						tx_hash: prevTx.getId(),
+						tx_pos: 0,
+						value: 60000,
+						publicKey: rootA
+							.derivePath("m/84'/1'/0'/0/0")
+							.publicKey.toString('hex')
+					}
+				]
 			});
+			if (added.isErr()) throw added.error;
 			const electrum = wallet.electrum as unknown as {
 				getTransactions: (args: {
 					txHashes: { tx_hash: string }[];
@@ -361,6 +374,7 @@ describe('Wallet key-origin metadata (S-B.H1/M1/M2)', function () {
 				network,
 				addressType: EAddressType.p2wpkh,
 				electrumOptions,
+				remainOffline: true,
 				name: 'nwutxooffline'
 			});
 			if (res.isErr()) throw res.error;
@@ -370,19 +384,27 @@ describe('Wallet key-origin metadata (S-B.H1/M1/M2)', function () {
 				index: '0',
 				addressType: EAddressType.p2wpkh
 			});
-			wallet.data.utxos.push({
-				address,
-				index: 0,
-				path: "m/84'/1'/0'/0/0",
-				scriptHash: getScriptHash({ address, network }),
-				height: 100,
-				tx_hash: Buffer.from(
-					bitcoin.crypto.sha256(Buffer.from('offline-utxo'))
-				).toString('hex'),
-				tx_pos: 0,
-				value: 60000,
-				publicKey: rootA.derivePath("m/84'/1'/0'/0/0").publicKey.toString('hex')
+			const added = await wallet.updateData({
+				utxos: [
+					...wallet.data.utxos,
+					{
+						address,
+						index: 0,
+						path: "m/84'/1'/0'/0/0",
+						scriptHash: getScriptHash({ address, network }),
+						height: 100,
+						tx_hash: Buffer.from(
+							bitcoin.crypto.sha256(Buffer.from('offline-utxo'))
+						).toString('hex'),
+						tx_pos: 0,
+						value: 60000,
+						publicKey: rootA
+							.derivePath("m/84'/1'/0'/0/0")
+							.publicKey.toString('hex')
+					}
+				]
 			});
+			if (added.isErr()) throw added.error;
 			const built = await wallet.buildPsbt({
 				address: RECIPIENT,
 				amount: 40000,

@@ -13,6 +13,7 @@ import sinon from 'sinon';
 import tls from 'tls';
 
 import {
+	createMemoryStorage,
 	EAddressType,
 	EAvailableNetworks,
 	EPaymentType,
@@ -22,9 +23,6 @@ import {
 	IGetAddressHistoryResponse,
 	ITransaction,
 	IUtxo,
-	IWalletData,
-	ok,
-	Result,
 	TTxDetails,
 	Wallet
 } from '../../src';
@@ -38,7 +36,8 @@ const electrumHelpers = require('rn-electrum-client/helpers');
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
+// Unreachable on purpose: this test must work offline. Not remainOffline,
+// which refuses each request before it reaches the fake server.
 const electrumOptions = {
 	net,
 	tls,
@@ -169,12 +168,7 @@ describe('previous output lookups (#1658)', function () {
 			feeEstimationSource: 'electrum',
 			// The test drives the refresh itself; nothing may scan behind it.
 			disableRefreshOnCreate: true,
-			storage: {
-				setData: async <K extends keyof IWalletData>(
-					_key: string,
-					_value: IWalletData[K]
-				): Promise<Result<boolean>> => ok(true)
-			}
+			storage: createMemoryStorage()
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
@@ -189,9 +183,17 @@ describe('previous output lookups (#1658)', function () {
 			addressType: EAddressType.p2wpkh
 		});
 		if (gen.isErr()) throw gen.error;
-		wallet.data.addresses[EAddressType.p2wpkh] = gen.value.addresses;
-		wallet.data.changeAddresses[EAddressType.p2wpkh] =
-			gen.value.changeAddresses;
+		const stored = await wallet.updateData({
+			addresses: {
+				...wallet.data.addresses,
+				[EAddressType.p2wpkh]: gen.value.addresses
+			},
+			changeAddresses: {
+				...wallet.data.changeAddresses,
+				[EAddressType.p2wpkh]: gen.value.changeAddresses
+			}
+		});
+		if (stored.isErr()) throw stored.error;
 		const byIndex = (book: Record<string, IAddress>, i: number): IAddress =>
 			Object.values(book).find((a) => a.index === i) as IAddress;
 		A = byIndex(gen.value.addresses, 0);

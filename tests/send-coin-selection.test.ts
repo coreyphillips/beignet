@@ -1,6 +1,6 @@
 /**
  * sendMany and buildPsbt build from the coins they priced (#1360, #1431).
- * Fully OFFLINE: the wallet points at an unreachable Electrum port, UTXOs are
+ * Fully OFFLINE: the wallet is created with remainOffline, UTXOs are
  * injected into wallet data, and nothing is broadcast.
  *
  * With any coinSelectPreference but consolidate, updateFee priced the subset
@@ -23,48 +23,18 @@ import {
 	EAddressType,
 	EAvailableNetworks,
 	ECoinSelectPreference,
-	EProtocol,
 	IUtxo,
-	IWalletData,
-	Result,
-	TStorage,
 	Wallet,
-	ok
+	createMemoryStorage
 } from '../src';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+// The wallet is created with remainOffline: this test must work offline.
+const electrumOptions = { net, tls };
 
 const RECIPIENT = bitcoinAddress.toBech32(Buffer.alloc(20, 3), 0, 'bcrt');
-
-/** An in-memory TStorage, so the wallet has somewhere to persist. */
-const memoryStorage = (): TStorage => {
-	const store = new Map<string, unknown>();
-	return {
-		getData: async <K extends keyof IWalletData>(
-			key: string
-		): Promise<Result<IWalletData[K]>> => ok(store.get(key) as IWalletData[K]),
-		setData: async <K extends keyof IWalletData>(
-			key: string,
-			value: IWalletData[K]
-		): Promise<Result<boolean>> => {
-			store.set(key, value);
-			return ok(true);
-		}
-	};
-};
 
 describe('sendMany coin selection (#1360)', function () {
 	this.timeout(60000);
@@ -73,7 +43,11 @@ describe('sendMany coin selection (#1360)', function () {
 	const injected = new Map<string, number>();
 
 	/** Fabricates a UTXO paying to the wallet's own index-0 address. */
-	const injectUtxo = (txid: string, value: number): IUtxo => {
+	const injectUtxo = async (
+		txid: string,
+		value: number,
+		height = 0
+	): Promise<IUtxo> => {
 		const source = wallet.data.addressIndex[EAddressType.p2wpkh];
 		if (!source?.address) throw new Error('No derived address available.');
 		const utxo: IUtxo = {
@@ -81,16 +55,30 @@ describe('sendMany coin selection (#1360)', function () {
 			index: source.index,
 			path: source.path,
 			scriptHash: source.scriptHash,
-			height: 0,
+			height,
 			tx_hash: txid,
 			tx_pos: 0,
 			value,
 			publicKey: source.publicKey
 		};
-		wallet.data.utxos.push(utxo);
-		wallet.data.balance += value;
+		const res = await wallet.updateData({
+			utxos: [...wallet.data.utxos, utxo],
+			balance: wallet.data.balance + value
+		});
+		if (res.isErr()) throw res.error;
 		injected.set(txid, value);
 		return utxo;
+	};
+
+	/** Drops every UTXO, as if each had been spent. */
+	const dropUtxos = async (): Promise<void> => {
+		const { utxos, balance } = wallet.data;
+		const res = await wallet.updateData({
+			utxos: [],
+			balance: utxos.reduce((sum, utxo) => sum - utxo.value, balance)
+		});
+		if (res.isErr()) throw res.error;
+		for (const utxo of utxos) injected.delete(utxo.tx_hash);
 	};
 
 	/** Fee paid by a built transaction whose inputs are all injected UTXOs. */
@@ -112,15 +100,16 @@ describe('sendMany coin selection (#1360)', function () {
 			name: 'sendcoinselect',
 			network: EAvailableNetworks.regtest,
 			addressType: EAddressType.p2wpkh,
-			storage: memoryStorage(),
-			electrumOptions
+			storage: createMemoryStorage(),
+			electrumOptions,
+			remainOffline: true
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
 		// The failed (offline) refresh still generates index-0 addresses.
 		await wallet.refreshWallet({});
 		for (let i = 1; i <= 5; i++) {
-			injectUtxo(i.toString(16).padStart(2, '0').repeat(32), 10_000);
+			await injectUtxo(i.toString(16).padStart(2, '0').repeat(32), 10_000);
 		}
 	});
 
@@ -244,14 +233,22 @@ describe('sendMany coin selection (#1360)', function () {
 
 	// Coin selection sorted the array it was given, and a quote gives it the
 	// staged inputs (#1664).
-	it('leaves the staged inputs in order when quoting', function () {
+	it('leaves the staged inputs in order when quoting', async function () {
 		const values = [40_000, 10_000, 30_000, 20_000, 50_000];
 		const heights = [105, 101, 103, 102, 104];
-		wallet.data.utxos.forEach((utxo, i) => {
-			wallet.data.balance += values[i] - utxo.value;
-			utxo.value = values[i];
-			utxo.height = heights[i];
+		const { utxos, balance } = wallet.data;
+		const updated = await wallet.updateData({
+			utxos: utxos.map((utxo, i) => ({
+				...utxo,
+				value: values[i],
+				height: heights[i]
+			})),
+			balance: utxos.reduce(
+				(sum, utxo, i) => sum + values[i] - utxo.value,
+				balance
+			)
 		});
+		if (updated.isErr()) throw updated.error;
 		const staged = wallet.transaction.updateSendTransaction({
 			transaction: {
 				inputs: [...wallet.data.utxos],
@@ -285,10 +282,15 @@ describe('sendMany coin selection (#1360)', function () {
 		const AMOUNT = 36_560;
 		const FEE = 3_440;
 
-		beforeEach(function () {
-			const fifth = wallet.data.utxos.pop();
+		beforeEach(async function () {
+			const utxos = [...wallet.data.utxos];
+			const fifth = utxos.pop();
 			if (!fifth) throw new Error('No UTXO to drop.');
-			wallet.data.balance -= fifth.value;
+			const res = await wallet.updateData({
+				utxos,
+				balance: wallet.data.balance - fifth.value
+			});
+			if (res.isErr()) throw res.error;
 			injected.delete(fifth.tx_hash);
 		});
 
@@ -353,12 +355,19 @@ describe('sendMany coin selection (#1360)', function () {
 		// leave 3,740 against a 3,820 fee without change, and coin selection
 		// gave up on the four that already paid.
 		describe('with an uneconomic coin selected last (#1549)', function () {
-			const addTrailingCoin = (preference: ECoinSelectPreference): void => {
-				for (const utxo of wallet.data.utxos) utxo.height = 100;
-				const coin = injectUtxo('ff'.repeat(32), 300);
+			const addTrailingCoin = async (
+				preference: ECoinSelectPreference
+			): Promise<void> => {
+				const res = await wallet.updateData({
+					utxos: wallet.data.utxos.map((utxo) => ({ ...utxo, height: 100 }))
+				});
+				if (res.isErr()) throw res.error;
 				// FIFO spends the oldest coin first and LIFO the newest.
-				coin.height =
-					preference === ECoinSelectPreference.lastInFirstOut ? 99 : 101;
+				await injectUtxo(
+					'ff'.repeat(32),
+					300,
+					preference === ECoinSelectPreference.lastInFirstOut ? 99 : 101
+				);
 			};
 
 			for (const preference of [
@@ -368,13 +377,13 @@ describe('sendMany coin selection (#1360)', function () {
 			]) {
 				it(`sends it under ${preference}`, async function () {
 					wallet.updateCoinSelectPreference(preference);
-					addTrailingCoin(preference);
+					await addTrailingCoin(preference);
 					await expectSends();
 				});
 
 				it(`builds it under ${preference}`, async function () {
 					wallet.updateCoinSelectPreference(preference);
-					addTrailingCoin(preference);
+					await addTrailingCoin(preference);
 					await expectBuilds();
 				});
 			}
@@ -383,12 +392,16 @@ describe('sendMany coin selection (#1360)', function () {
 		// The same coin picked before the payment is covered stayed in every
 		// selection, so even the fallback to a shorter one kept it.
 		describe('with an uneconomic coin selected first (#1566)', function () {
-			const addLeadingCoin = (): void => {
+			const addLeadingCoin = async (): Promise<void> => {
 				// FIFO and LIFO both reach the coin after two of the four.
-				wallet.data.utxos.forEach((utxo, i) => {
-					utxo.height = i < 2 ? 100 : 102;
+				const res = await wallet.updateData({
+					utxos: wallet.data.utxos.map((utxo, i) => ({
+						...utxo,
+						height: i < 2 ? 100 : 102
+					}))
 				});
-				injectUtxo('ff'.repeat(32), 300).height = 101;
+				if (res.isErr()) throw res.error;
+				await injectUtxo('ff'.repeat(32), 300, 101);
 			};
 
 			const expectQuotes = (): void => {
@@ -407,21 +420,21 @@ describe('sendMany coin selection (#1360)', function () {
 				ECoinSelectPreference.firstInFirstOut,
 				ECoinSelectPreference.lastInFirstOut
 			]) {
-				it(`quotes it under ${preference}`, function () {
+				it(`quotes it under ${preference}`, async function () {
 					wallet.updateCoinSelectPreference(preference);
-					addLeadingCoin();
+					await addLeadingCoin();
 					expectQuotes();
 				});
 
 				it(`sends it under ${preference}`, async function () {
 					wallet.updateCoinSelectPreference(preference);
-					addLeadingCoin();
+					await addLeadingCoin();
 					await expectSends();
 				});
 
 				it(`builds it under ${preference}`, async function () {
 					wallet.updateCoinSelectPreference(preference);
-					addLeadingCoin();
+					await addLeadingCoin();
 					await expectBuilds();
 				});
 			}
@@ -435,14 +448,11 @@ describe('sendMany coin selection (#1360)', function () {
 		const AMOUNT = 8_600;
 		const FEE = 1_400;
 
-		beforeEach(function () {
-			for (const utxo of wallet.data.utxos.splice(0)) {
-				wallet.data.balance -= utxo.value;
-				injected.delete(utxo.tx_hash);
-			}
-			injectUtxo('fd'.repeat(32), 300);
-			injectUtxo('fe'.repeat(32), 500);
-			injectUtxo('ff'.repeat(32), 10_000);
+		beforeEach(async function () {
+			await dropUtxos();
+			await injectUtxo('fd'.repeat(32), 300);
+			await injectUtxo('fe'.repeat(32), 500);
+			await injectUtxo('ff'.repeat(32), 10_000);
 			wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
 		});
 
@@ -508,14 +518,11 @@ describe('sendMany coin selection (#1360)', function () {
 			[8_400, 1_600, [10_000]]
 		] as const) {
 			describe(`of ${AMOUNT} from ${coins.join(', ')} sat coins`, function () {
-				beforeEach(function () {
-					for (const utxo of wallet.data.utxos.splice(0)) {
-						wallet.data.balance -= utxo.value;
-						injected.delete(utxo.tx_hash);
+				beforeEach(async function () {
+					await dropUtxos();
+					for (const [i, value] of coins.entries()) {
+						await injectUtxo((0xfd + i).toString(16).repeat(32), value);
 					}
-					coins.forEach((value, i) =>
-						injectUtxo((0xfd + i).toString(16).repeat(32), value)
-					);
 					wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
 				});
 
@@ -578,12 +585,9 @@ describe('sendMany coin selection (#1360)', function () {
 	describe('a payment whose dust change is half its fee (#1584)', function () {
 		const AMOUNT = 3_000;
 
-		beforeEach(function () {
-			for (const utxo of wallet.data.utxos.splice(0)) {
-				wallet.data.balance -= utxo.value;
-				injected.delete(utxo.tx_hash);
-			}
-			injectUtxo('ff'.repeat(32), 4_500);
+		beforeEach(async function () {
+			await dropUtxos();
+			await injectUtxo('ff'.repeat(32), 4_500);
 			wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
 		});
 
@@ -626,14 +630,11 @@ describe('sendMany coin selection (#1360)', function () {
 	describe('a capped quote that selects fewer coins (#1584)', function () {
 		const AMOUNT = 1_533;
 
-		beforeEach(function () {
-			for (const utxo of wallet.data.utxos.splice(0)) {
-				wallet.data.balance -= utxo.value;
-				injected.delete(utxo.tx_hash);
+		beforeEach(async function () {
+			await dropUtxos();
+			for (const [i, value] of [300, 300, 300, 500, 900].entries()) {
+				await injectUtxo((0xe0 + i).toString(16).repeat(32), value);
 			}
-			[300, 300, 300, 500, 900].forEach((value, i) =>
-				injectUtxo((0xe0 + i).toString(16).repeat(32), value)
-			);
 			wallet.updateCoinSelectPreference(ECoinSelectPreference.large);
 		});
 
@@ -670,12 +671,9 @@ describe('sendMany coin selection (#1360)', function () {
 	describe('a requested rate below a higher maximum that fits (#1584)', function () {
 		const AMOUNT = 1_100;
 
-		beforeEach(function () {
-			for (const utxo of wallet.data.utxos.splice(0)) {
-				wallet.data.balance -= utxo.value;
-				injected.delete(utxo.tx_hash);
-			}
-			injectUtxo('ff'.repeat(32), 1_700);
+		beforeEach(async function () {
+			await dropUtxos();
+			await injectUtxo('ff'.repeat(32), 1_700);
 			wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
 		});
 
@@ -718,13 +716,13 @@ describe('sendMany coin selection (#1360)', function () {
 	describe('with 500 coins (#1664)', function () {
 		const AMOUNT = 4_200_000;
 
-		beforeEach(function () {
-			for (const utxo of wallet.data.utxos.splice(0)) {
-				wallet.data.balance -= utxo.value;
-				injected.delete(utxo.tx_hash);
-			}
+		beforeEach(async function () {
+			await dropUtxos();
 			for (let i = 0; i < 500; i++) {
-				injectUtxo(i.toString(16).padStart(64, '0'), 10_000 + (i % 7) * 13);
+				await injectUtxo(
+					i.toString(16).padStart(64, '0'),
+					10_000 + (i % 7) * 13
+				);
 			}
 			wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
 		});

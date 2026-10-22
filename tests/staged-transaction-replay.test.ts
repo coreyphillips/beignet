@@ -1,6 +1,6 @@
 /**
- * Staged on-chain send hygiene (#1002, #1011, #1367). Fully OFFLINE: wallets point at
- * an unreachable Electrum port, UTXOs are injected directly into wallet data
+ * Staged on-chain send hygiene (#1002, #1011, #1367). Fully OFFLINE: wallets are
+ * created with remainOffline, UTXOs are injected directly into wallet data
  * (signing only needs the derivation path or the attached key pair), and
  * nothing is broadcast (broadcast: false).
  *
@@ -27,34 +27,25 @@ import {
 	decodeRawTransaction,
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	ISendTransaction,
 	IUtxo,
-	IWalletData,
+	IWalletStorage,
 	Result,
 	TDecodeRawTx,
-	TStorage,
 	Wallet,
+	createMemoryStorage,
 	ok
 } from '../src';
 import { getDefaultSendTransaction } from '../src/shapes';
+import { writableData } from './writable-wallet-data';
 
 const ECPair = ECPairFactory(ecc);
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: these tests must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+// Wallets are created with remainOffline: these tests must work offline.
+const electrumOptions = { net, tls };
 
 const network = EAvailableNetworks.regtest;
 const regtest = bitcoin.networks.regtest;
@@ -87,36 +78,28 @@ interface IJsonStorage {
 	store: Map<string, string>;
 	/** Every write, in order, as the JSON text the adapter was handed. */
 	history: { key: string; value: string }[];
-	storage: TStorage;
+	storage: IWalletStorage;
 }
 
 /**
- * A Map-backed TStorage that stores the JSON text of every value, as the real
+ * A memory storage that keeps the JSON text of every value, as the real
  * adapters do (createWalletStorage, createEncryptedStorage), so whatever
  * JSON.stringify makes of a key pair is exactly what the assertions read.
+ * It has no setTransactionChanges, so every write, transaction records
+ * included, goes through setData and into the history.
  */
 const makeJsonStorage = (): IJsonStorage => {
 	const store = new Map<string, string>();
 	const history: { key: string; value: string }[] = [];
+	const { getData, setData } = createMemoryStorage(store);
 	return {
 		store,
 		history,
 		storage: {
-			getData: async <K extends keyof IWalletData>(
-				key: string
-			): Promise<Result<IWalletData[K]>> => {
-				const raw = store.get(key);
-				const value = raw === undefined ? undefined : JSON.parse(raw);
-				return ok(value as IWalletData[K]);
-			},
-			setData: async <K extends keyof IWalletData>(
-				key: string,
-				value: IWalletData[K]
-			): Promise<Result<boolean>> => {
-				const text = JSON.stringify(value);
-				store.set(key, text);
-				history.push({ key, value: text });
-				return ok(true);
+			getData,
+			setData: async (key, value): Promise<Result<boolean>> => {
+				history.push({ key, value: JSON.stringify(value) });
+				return setData(key, value);
 			}
 		}
 	};
@@ -140,14 +123,15 @@ const stagedWrites = (json: IJsonStorage, name: string): string[] =>
 /** Opens a wallet on the given storage, as a process start would. */
 const createWallet = async (
 	name: string,
-	storage: TStorage
+	storage: IWalletStorage
 ): Promise<Wallet> => {
 	const res = await Wallet.create({
 		mnemonic: MNEMONIC,
 		name,
 		network,
 		storage,
-		electrumOptions
+		electrumOptions,
+		remainOffline: true
 	});
 	if (res.isErr()) throw res.error;
 	const wallet = res.value;
@@ -157,10 +141,10 @@ const createWallet = async (
 };
 
 /** Fabricates a UTXO paying to one of the wallet's own derived addresses. */
-const injectUtxo = (wallet: Wallet, txid: string, value: number): IUtxo => {
+const ownUtxo = (wallet: Wallet, txid: string, value: number): IUtxo => {
 	const source = wallet.data.addressIndex[EAddressType.p2wpkh];
 	if (!source?.address) throw new Error('No derived address available.');
-	const utxo: IUtxo = {
+	return {
 		address: source.address,
 		index: source.index,
 		path: source.path,
@@ -171,8 +155,20 @@ const injectUtxo = (wallet: Wallet, txid: string, value: number): IUtxo => {
 		value,
 		publicKey: source.publicKey
 	};
-	wallet.data.utxos.push(utxo);
-	wallet.data.balance += value;
+};
+
+/** Gives the wallet a UTXO of its own, and saves it. */
+const injectUtxo = async (
+	wallet: Wallet,
+	txid: string,
+	value: number
+): Promise<IUtxo> => {
+	const utxo = ownUtxo(wallet, txid, value);
+	const res = await wallet.updateData({
+		utxos: [...wallet.data.utxos, utxo],
+		balance: wallet.data.balance + value
+	});
+	if (res.isErr()) throw res.error;
 	return utxo;
 };
 
@@ -259,9 +255,21 @@ describe('Staged send replay after a restart (#1002)', function () {
 
 	const NAME = 'stagedreplay';
 	let shared: IJsonStorage;
-	let storage: TStorage;
+	let storage: IWalletStorage;
 	let wallet1: Wallet;
 	const wallets: Wallet[] = [];
+
+	/**
+	 * Gives the wallet a UTXO in memory only. These wallets restart on one
+	 * storage, and each must hold just the coin it is given: a saved coin
+	 * would come back in every later wallet, and wallet3 would hold TXID_B
+	 * twice.
+	 */
+	const injectUnsaved = (wallet: Wallet, txid: string, value: number): void => {
+		const data = writableData(wallet);
+		data.utxos.push(ownUtxo(wallet, txid, value));
+		data.balance += value;
+	};
 
 	before(function () {
 		shared = makeJsonStorage();
@@ -275,7 +283,7 @@ describe('Staged send replay after a restart (#1002)', function () {
 	it('a multi-recipient sendMany is not replayed into the sends of a wallet loaded from the same storage', async () => {
 		wallet1 = await createWallet(NAME, storage);
 		wallets.push(wallet1);
-		injectUtxo(wallet1, TXID_A, 300_000);
+		injectUnsaved(wallet1, TXID_A, 300_000);
 		const many = await wallet1.sendMany({
 			txs: [
 				{ address: RECIPIENT_A, amount: 20_000 },
@@ -296,7 +304,7 @@ describe('Staged send replay after a restart (#1002)', function () {
 		// The restart: a fresh wallet on the same name and storage.
 		const wallet2 = await createWallet(NAME, storage);
 		wallets.push(wallet2);
-		injectUtxo(wallet2, TXID_B, 300_000);
+		injectUnsaved(wallet2, TXID_B, 300_000);
 		const send = await wallet2.send({
 			address: RECIPIENT_E,
 			amount: 25_000,
@@ -317,7 +325,7 @@ describe('Staged send replay after a restart (#1002)', function () {
 	it('sendMax after the restart spends to its one recipient', async () => {
 		const wallet3 = await createWallet(NAME, storage);
 		wallets.push(wallet3);
-		injectUtxo(wallet3, TXID_B, 300_000);
+		injectUnsaved(wallet3, TXID_B, 300_000);
 		const res = await wallet3.sendMax({
 			address: RECIPIENT_E,
 			satsPerByte: 2,
@@ -349,7 +357,7 @@ describe('Staged send replay after a restart (#1002)', function () {
 		const name = 'stagedpsbt';
 		const wallet = await createWallet(name, json.storage);
 		wallets.push(wallet);
-		injectUtxo(wallet, TXID_A, 300_000);
+		injectUnsaved(wallet, TXID_A, 300_000);
 		const built = await wallet.buildPsbt({
 			txs: [
 				{ address: RECIPIENT_A, amount: 20_000 },
@@ -365,7 +373,7 @@ describe('Staged send replay after a restart (#1002)', function () {
 		// The restart: the recipients of the PSBT are not paid again.
 		const reloaded = await createWallet(name, json.storage);
 		wallets.push(reloaded);
-		injectUtxo(reloaded, TXID_B, 300_000);
+		injectUnsaved(reloaded, TXID_B, 300_000);
 		const send = await reloaded.send({
 			address: RECIPIENT_D,
 			amount: 25_000,
@@ -408,7 +416,7 @@ describe('Signing keys never reach wallet storage (#1011)', function () {
 	before(async function () {
 		json = makeJsonStorage();
 		wallet = await createWallet(NAME, json.storage);
-		walletUtxo = injectUtxo(wallet, TXID_A, 60_000);
+		walletUtxo = await injectUtxo(wallet, TXID_A, 60_000);
 	});
 
 	after(async function () {
@@ -522,7 +530,7 @@ describe('A no-arg fee quote leaves the staged send alone (#1367)', function () 
 	before(async function () {
 		json = makeJsonStorage();
 		wallet = await createWallet(NAME, json.storage);
-		injectUtxo(wallet, TXID_A, 300_000);
+		await injectUtxo(wallet, TXID_A, 300_000);
 	});
 
 	after(async function () {
@@ -597,8 +605,8 @@ describe('The staged send is never written to storage (#1665)', function () {
 	before(async function () {
 		json = makeJsonStorage();
 		wallet = await createWallet(NAME, json.storage);
-		injectUtxo(wallet, TXID_A, 300_000);
-		injectUtxo(wallet, TXID_B, 300_000);
+		await injectUtxo(wallet, TXID_A, 300_000);
+		await injectUtxo(wallet, TXID_B, 300_000);
 	});
 
 	after(async function () {
@@ -667,14 +675,15 @@ describe('A stored staged send from an older version is scrubbed at boot', funct
 	/** Opens a wallet without the offline refresh: only boot writes count. */
 	const bootWallet = async (
 		name: string,
-		storage: TStorage
+		storage: IWalletStorage
 	): Promise<Wallet> => {
 		const res = await Wallet.create({
 			mnemonic: MNEMONIC,
 			name,
 			network,
 			storage,
-			electrumOptions
+			electrumOptions,
+			remainOffline: true
 		});
 		if (res.isErr()) throw res.error;
 		wallets.push(res.value);
@@ -714,7 +723,7 @@ describe('A stored staged send from an older version is scrubbed at boot', funct
 		expect(json.store.get(transactionKey(name))).to.not.include('__D');
 
 		await wallet.refreshWallet({});
-		injectUtxo(wallet, TXID_A, 300_000);
+		await injectUtxo(wallet, TXID_A, 300_000);
 		const send = await wallet.send({
 			address: RECIPIENT_E,
 			amount: 25_000,

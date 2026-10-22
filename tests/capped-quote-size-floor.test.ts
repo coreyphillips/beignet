@@ -4,8 +4,8 @@
  * advertised 1 sat/vB for 166 sats, and updateFee then refused 256 sats
  * against the 250-sat half-output limit.
  *
- * Fully OFFLINE: the wallet points at an unreachable Electrum server and the
- * UTXOs are fabricated.
+ * Fully OFFLINE: the wallet never connects (remainOffline) and the UTXOs are
+ * fabricated.
  */
 
 import { expect } from 'chai';
@@ -16,7 +16,6 @@ import {
 	EAddressType,
 	EAvailableNetworks,
 	ECoinSelectPreference,
-	EProtocol,
 	getScriptHash,
 	IUtxo,
 	Wallet
@@ -31,16 +30,7 @@ const INPUT_VALUE = 1_000;
 const PAYMENT = 500;
 const RATE = 2;
 
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 describe('Capped fee quote below 2 sat/vB (#1543)', function () {
 	this.timeout(60000);
@@ -56,6 +46,7 @@ describe('Capped fee quote below 2 sat/vB (#1543)', function () {
 			addressType: EAddressType.p2wpkh,
 			coinSelectPreference: ECoinSelectPreference.consolidate,
 			electrumOptions,
+			remainOffline: true,
 			name: 'cappedquotesizefloor'
 		});
 		if (res.isErr()) throw res.error;

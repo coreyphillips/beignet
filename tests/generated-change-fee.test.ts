@@ -4,8 +4,8 @@
  * address and added the output anyway. Four P2WPKH inputs and 600 sats of
  * change went out at 314 sats for 344 vB, under the 1 sat/vB asked for.
  *
- * Fully OFFLINE: the wallet points at an unreachable Electrum server, the UTXOs
- * are fabricated and the previous-transaction fetch is stubbed.
+ * Fully OFFLINE: the wallets never connect (remainOffline), the UTXOs are
+ * fabricated and the previous-transaction fetch is stubbed.
  */
 
 import { expect } from 'chai';
@@ -18,7 +18,6 @@ import {
 	EAddressType,
 	EAvailableNetworks,
 	ECoinSelectPreference,
-	EProtocol,
 	getScriptHash,
 	IUtxo,
 	ok,
@@ -38,16 +37,7 @@ const INPUT_COUNT = 4;
 const INPUT_VALUE = 10_000;
 const INPUT_TOTAL = INPUT_COUNT * INPUT_VALUE;
 
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 describe('Fee estimation with generated change (#1465)', function () {
 	this.timeout(120000);
@@ -65,6 +55,7 @@ describe('Fee estimation with generated change (#1465)', function () {
 			network,
 			addressType: EAddressType.p2wpkh,
 			electrumOptions,
+			remainOffline: true,
 			name: 'generatedchangefee'
 		});
 		if (res.isErr()) throw res.error;
@@ -74,6 +65,7 @@ describe('Fee estimation with generated change (#1465)', function () {
 			network,
 			addressType: EAddressType.p2wpkh,
 			electrumOptions,
+			remainOffline: true,
 			name: 'generatedchangefeefresh',
 			disableRefreshOnCreate: true
 		});

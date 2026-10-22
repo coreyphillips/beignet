@@ -1,8 +1,8 @@
 /**
  * Keys derive through cached account and change nodes, so a new address
  * costs one derivation step and a signed input one (#1660). Fully OFFLINE:
- * the wallets point at an unreachable Electrum port and UTXOs are fabricated
- * for the wallet's own addresses. Expected keys come from a separate bip32
+ * the wallets are created with remainOffline and UTXOs are fabricated for the
+ * wallet's own addresses. Expected keys come from a separate bip32
  * instance, whose derivations the spy does not count.
  */
 
@@ -18,7 +18,6 @@ import * as bitcoin from 'bitcoinjs-lib';
 import {
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	getAddressFromKeyPair,
 	getScriptHash,
 	IGetAddressResponse,
@@ -43,17 +42,7 @@ const RECIPIENT = 'bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080';
 const regtest = bitcoin.networks.regtest;
 const network = EAvailableNetworks.regtest;
 
-// Unreachable on purpose: these tests must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 const PURPOSE: Record<Exclude<EAddressType, EAddressType.p2wsh>, number> = {
 	p2pkh: 44,
@@ -186,6 +175,7 @@ describe('Derivation cache (#1660)', function () {
 					mnemonic: MNEMONIC,
 					network,
 					electrumOptions,
+					remainOffline: true,
 					disableRefreshOnCreate: true
 				})
 			);
@@ -250,6 +240,7 @@ describe('Derivation cache (#1660)', function () {
 						network,
 						addressType,
 						electrumOptions,
+						remainOffline: true,
 						disableRefreshOnCreate: true
 					})
 				);
@@ -274,10 +265,13 @@ describe('Derivation cache (#1660)', function () {
 						value,
 						publicKey
 					};
-					wallet.data.utxos.push(utxo);
-					wallet.data.balance += value;
 					utxos.push(utxo);
 				}
+				const added = await wallet.updateData({
+					utxos: [...wallet.data.utxos, ...utxos],
+					balance: utxos.reduce((sum, u) => sum + u.value, wallet.data.balance)
+				});
+				if (added.isErr()) throw added.error;
 
 				let signed: Awaited<ReturnType<Wallet['send']>>;
 				const { steps, nodes } = await countDerivations(async () => {
@@ -341,6 +335,7 @@ describe('Derivation cache (#1660)', function () {
 					cosigners: [xpub(roots[1]), xpub(roots[2])],
 					network,
 					electrumOptions,
+					remainOffline: true,
 					disableRefreshOnCreate: true
 				})
 			);
@@ -370,6 +365,7 @@ describe('Derivation cache (#1660)', function () {
 					xpub: root.derivePath("m/84'/1'/0'").neutered().toBase58(),
 					network,
 					electrumOptions,
+					remainOffline: true,
 					disableRefreshOnCreate: true
 				})
 			);
@@ -397,6 +393,7 @@ describe('Derivation cache (#1660)', function () {
 					mnemonic: MNEMONIC,
 					network,
 					electrumOptions,
+					remainOffline: true,
 					disableRefreshOnCreate: true,
 					customGetAddress: async ({ path, type }) => {
 						asked.push(path);

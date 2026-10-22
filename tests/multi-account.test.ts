@@ -1,6 +1,6 @@
 /**
  * Multi-account wallet tests. Fully OFFLINE: address derivation is local and
- * the wallets point at an unreachable Electrum port.
+ * the wallets never connect (remainOffline).
  *
  * Two Wallet instances over the same mnemonic + storage but different
  * accounts must derive from m/purpose'/coin'/ACCOUNT' and use disjoint
@@ -20,13 +20,10 @@ import * as bitcoin from 'bitcoinjs-lib';
 import {
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
-	IWalletData,
-	Result,
-	TStorage,
+	IWalletStorage,
 	Wallet,
-	getWalletDataStorageKey,
-	ok
+	createMemoryStorage,
+	getWalletDataStorageKey
 } from '../src';
 
 const bip32 = BIP32Factory(ecc);
@@ -34,41 +31,10 @@ const bip32 = BIP32Factory(ecc);
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: these tests must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 const network = EAvailableNetworks.regtest;
 const testTimeout = 60000;
-
-const makeStorage = (): { store: Map<string, unknown>; storage: TStorage } => {
-	const store = new Map<string, unknown>();
-	return {
-		store,
-		storage: {
-			getData: async <K extends keyof IWalletData>(
-				key: string
-			): Promise<Result<IWalletData[K]>> => {
-				return ok(store.get(key) as IWalletData[K]);
-			},
-			setData: async <K extends keyof IWalletData>(
-				key: string,
-				value: IWalletData[K]
-			): Promise<Result<boolean>> => {
-				store.set(key, value);
-				return ok(true);
-			}
-		}
-	};
-};
 
 const expectedP2wpkhAddress = (
 	root: BIP32Interface,
@@ -88,8 +54,8 @@ describe('Multi-account support', function () {
 	this.timeout(testTimeout);
 
 	let root: BIP32Interface;
-	let store: Map<string, unknown>;
-	let storage: TStorage;
+	let store: Map<string, string>;
+	let storage: IWalletStorage;
 	let wallet0: Wallet;
 	let wallet1: Wallet;
 
@@ -98,13 +64,15 @@ describe('Multi-account support', function () {
 			bip39.mnemonicToSeedSync(MNEMONIC),
 			bitcoin.networks.regtest
 		);
-		({ store, storage } = makeStorage());
+		store = new Map();
+		storage = createMemoryStorage(store);
 		const res0 = await Wallet.create({
 			mnemonic: MNEMONIC,
 			name: 'accttest',
 			network,
 			storage,
-			electrumOptions
+			electrumOptions,
+			remainOffline: true
 		});
 		if (res0.isErr()) throw res0.error;
 		wallet0 = res0.value;
@@ -115,6 +83,7 @@ describe('Multi-account support', function () {
 			network,
 			storage,
 			electrumOptions,
+			remainOffline: true,
 			account: 1
 		});
 		if (res1.isErr()) throw res1.error;
@@ -132,8 +101,9 @@ describe('Multi-account support', function () {
 			const res = await Wallet.create({
 				mnemonic: MNEMONIC,
 				network,
-				storage: makeStorage().storage,
+				storage: createMemoryStorage(),
 				electrumOptions,
+				remainOffline: true,
 				account
 			});
 			expect(res.isErr(), `account ${account} should be rejected`).to.equal(
@@ -194,10 +164,14 @@ describe('Multi-account support', function () {
 		if (res.isErr()) throw res.error;
 		expect(wallet1.getAddressLabel(address)).to.equal('account one');
 		expect(wallet0.getAddressLabel(address)).to.equal(undefined);
-		expect(store.get('accttest-regtest-acct1-addressLabels')).to.deep.equal({
+		expect(
+			JSON.parse(store.get('accttest-regtest-acct1-addressLabels')!)
+		).to.deep.equal({
 			[address]: 'account one'
 		});
-		expect(store.get('accttest-regtest-addressLabels') ?? {}).to.deep.equal({});
+		expect(
+			JSON.parse(store.get('accttest-regtest-addressLabels') ?? '{}')
+		).to.deep.equal({});
 	});
 
 	it('coexists: both instances keep working after interleaved use', async () => {
@@ -236,8 +210,9 @@ describe('Wallet given its BIP39 seed', function () {
 					mnemonic: MNEMONIC,
 					seed: supplied,
 					network,
-					storage: makeStorage().storage,
+					storage: createMemoryStorage(),
 					electrumOptions,
+					remainOffline: true,
 					account: 1
 				});
 				if (res.isErr()) throw res.error;

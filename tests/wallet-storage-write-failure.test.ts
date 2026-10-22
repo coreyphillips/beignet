@@ -3,8 +3,8 @@
  * saveWalletData, so a write the storage adapter refused left memory and
  * storage disagreeing and told nobody. The next start loaded the old copy.
  *
- * Fully OFFLINE: the Electrum server is an unreachable local port and the
- * create-time refresh is disabled.
+ * Fully OFFLINE: the wallet never connects (remainOffline) and the create-time
+ * refresh is disabled.
  */
 
 import { expect } from 'chai';
@@ -13,8 +13,8 @@ import tls from 'tls';
 
 import {
 	createConsoleLogger,
+	createMemoryStorage,
 	EAvailableNetworks,
-	EProtocol,
 	err,
 	getWalletDataStorageKey,
 	IAddress,
@@ -24,12 +24,13 @@ import {
 	IOnchainFees,
 	IWallet,
 	IWalletData,
+	IWalletStorage,
 	ok,
 	Result,
 	TMessageDataMap,
-	TStorage,
 	TStorageWriteFailure,
 	TWalletDataKeys,
+	TWalletStorageKey,
 	Wallet
 } from '../src';
 import { getDefaultSendTransaction } from '../src/shapes/wallet';
@@ -42,46 +43,29 @@ const TXID = 'ab'.repeat(32);
 const storageKey = (key: TWalletDataKeys): string =>
 	getWalletDataStorageKey(WALLET_NAME, NETWORK, key);
 
-// Unreachable on purpose: this test must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65523,
-		tcp: 65523,
-		protocol: EProtocol.tcp
-	}
-};
+// No servers: the wallets are created with remainOffline.
+const electrumOptions = { net, tls };
 
 /**
  * JSON-serializing in-memory storage. A write to a key in `refused` answers
- * Err and leaves the stored value as it was.
+ * Err and leaves the stored value as it was. No setTransactionChanges, so a
+ * refused transaction map is refused on every path that writes it.
  */
 const memoryStorage = (): {
-	storage: Required<Pick<TStorage, 'getData' | 'setData'>>;
+	storage: Required<Pick<IWalletStorage, 'getData' | 'setData'>>;
 	store: Map<string, string>;
 	refused: Set<TWalletDataKeys>;
 } => {
 	const store = new Map<string, string>();
 	const refused = new Set<TWalletDataKeys>();
-	const storage: Required<Pick<TStorage, 'getData' | 'setData'>> = {
-		getData: async <K extends keyof IWalletData>(
-			key: string
-		): Promise<Result<IWalletData[K]>> => {
-			const raw = store.get(key);
-			if (raw === undefined) return ok(undefined as unknown as IWalletData[K]);
-			return ok(JSON.parse(raw));
-		},
-		setData: async <K extends keyof IWalletData>(
-			key: string,
-			value: IWalletData[K]
-		): Promise<Result<boolean>> => {
+	const memory = createMemoryStorage(store);
+	const storage: Required<Pick<IWalletStorage, 'getData' | 'setData'>> = {
+		getData: memory.getData,
+		setData: async (key, value) => {
 			if ([...refused].some((k) => key === storageKey(k))) {
 				return err('storage is full');
 			}
-			store.set(key, JSON.stringify(value));
-			return ok(true);
+			return memory.setData(key, value);
 		}
 	};
 	return { storage, store, refused };
@@ -107,7 +91,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 	let reports: TStorageWriteFailure[];
 
 	const create = async (
-		storage: TStorage,
+		storage: IWalletStorage,
 		extra: Partial<IWallet> = {}
 	): Promise<Result<Wallet>> => {
 		const res = await Wallet.create({
@@ -115,6 +99,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 			network: NETWORK,
 			name: WALLET_NAME,
 			electrumOptions,
+			remainOffline: true,
 			storage,
 			disableRefreshOnCreate: true,
 			logger: createConsoleLogger('silent'),
@@ -132,7 +117,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		return res;
 	};
 
-	const open = async (storage: TStorage): Promise<Wallet> => {
+	const open = async (storage: IWalletStorage): Promise<Wallet> => {
 		const res = await create(storage);
 		if (res.isErr()) throw res.error;
 		return res.value;
@@ -222,7 +207,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		/** Every message the listener heard, in order, by key. */
 		let heard: string[];
 
-		const openQuiet = async (storage: TStorage): Promise<Wallet> => {
+		const openQuiet = async (storage: IWalletStorage): Promise<Wallet> => {
 			heard = [];
 			const res = await create(storage, {
 				disableMessagesOnCreate: true,
@@ -230,9 +215,6 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 					key: K,
 					data: TMessageDataMap[K]
 				): void => {
-					// The connection poll announces its own state changes on its own
-					// schedule, so it is left out of the order asserted below.
-					if (key === 'connectedToElectrum') return;
 					heard.push(key);
 					if (key === 'storageWriteFailed') {
 						reports.push(data as TStorageWriteFailure);
@@ -311,7 +293,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 			const wallet = await openQuiet({
 				...storage,
 				setData: async <K extends keyof IWalletData>(
-					key: string,
+					key: TWalletStorageKey<K>,
 					value: IWalletData[K]
 				): Promise<Result<boolean>> => {
 					if (key === storageKey('header')) await released;
@@ -341,7 +323,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		const wallet = await open({
 			...storage,
 			setData: async <K extends keyof IWalletData>(
-				key: string,
+				key: TWalletStorageKey<K>,
 				value: IWalletData[K]
 			): Promise<Result<boolean>> => {
 				if (refused.has('addressIndex') && key === storageKey('addressIndex')) {
@@ -388,7 +370,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		const wallet = await open({
 			...storage,
 			setData: async <K extends keyof IWalletData>(
-				key: string,
+				key: TWalletStorageKey<K>,
 				value: IWalletData[K]
 			): Promise<Result<boolean>> => {
 				if (refuseNext && key === storageKey('addressIndex')) {
@@ -428,10 +410,10 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 	it('saves the index a retry at the gap limit returns, so a restart comes back to it (issue #1736)', async function () {
 		const { storage, store, refused } = memoryStorage();
 		let indexWrites = 0;
-		const counted: TStorage = {
+		const counted: IWalletStorage = {
 			...storage,
 			setData: async <K extends keyof IWalletData>(
-				key: string,
+				key: TWalletStorageKey<K>,
 				value: IWalletData[K]
 			): Promise<Result<boolean>> => {
 				if (key === storageKey('addressIndex')) indexWrites++;
@@ -526,7 +508,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		const wallet = await open({
 			...storage,
 			setData: async <K extends keyof IWalletData>(
-				key: string,
+				key: TWalletStorageKey<K>,
 				value: IWalletData[K]
 			): Promise<Result<boolean>> => {
 				if (key === storageKey('addressIndex')) {
@@ -554,13 +536,10 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		hold = true;
 		const pending = wallet.generateNewReceiveAddress();
 		await out;
-		const away = await wallet.switchNetwork(
-			EAvailableNetworks.signet,
-			electrumOptions.servers
-		);
+		const away = await wallet.switchNetwork(EAvailableNetworks.signet);
 		if (away.isErr()) throw away.error;
 		wallet.electrum.disconnect = async (): Promise<void> => undefined;
-		const back = await wallet.switchNetwork(NETWORK, electrumOptions.servers);
+		const back = await wallet.switchNetwork(NETWORK);
 		if (back.isErr()) throw back.error;
 		const read = wallet.getReceiveAddress({});
 		release();
@@ -597,7 +576,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		const wallet = await open({
 			...storage,
 			setData: async <K extends keyof IWalletData>(
-				key: string,
+				key: TWalletStorageKey<K>,
 				value: IWalletData[K]
 			): Promise<Result<boolean>> => {
 				if (hold && key === storageKey('addressIndex')) {
@@ -621,13 +600,10 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		hold = true;
 		const pending = wallet.generateNewReceiveAddress();
 		await out;
-		const away = await wallet.switchNetwork(
-			EAvailableNetworks.signet,
-			electrumOptions.servers
-		);
+		const away = await wallet.switchNetwork(EAvailableNetworks.signet);
 		if (away.isErr()) throw away.error;
 		wallet.electrum.disconnect = async (): Promise<void> => undefined;
-		const back = await wallet.switchNetwork(NETWORK, electrumOptions.servers);
+		const back = await wallet.switchNetwork(NETWORK);
 		if (back.isErr()) throw back.error;
 		release();
 		const issued = await pending;
@@ -662,7 +638,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		const wallet = await open({
 			...storage,
 			setData: async <K extends keyof IWalletData>(
-				key: string,
+				key: TWalletStorageKey<K>,
 				value: IWalletData[K]
 			): Promise<Result<boolean>> => {
 				if (hold && key === storageKey('addressIndex')) {
@@ -685,10 +661,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		hold = true;
 		const pending = wallet.generateNewReceiveAddress();
 		await out;
-		const away = await wallet.switchNetwork(
-			EAvailableNetworks.signet,
-			electrumOptions.servers
-		);
+		const away = await wallet.switchNetwork(EAvailableNetworks.signet);
 		if (away.isErr()) throw away.error;
 		// The switch back disconnects after it has read the index and before
 		// it installs that read. The write lands in between, on signet.
@@ -696,7 +669,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 			release();
 			await pending;
 		};
-		const back = await wallet.switchNetwork(NETWORK, electrumOptions.servers);
+		const back = await wallet.switchNetwork(NETWORK);
 		if (back.isErr()) throw back.error;
 		const issued = await pending;
 
@@ -727,7 +700,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		const wallet = await open({
 			...storage,
 			setData: async <K extends keyof IWalletData>(
-				key: string,
+				key: TWalletStorageKey<K>,
 				value: IWalletData[K]
 			): Promise<Result<boolean>> => {
 				if (hold && key === storageKey('addressIndex')) {
@@ -750,10 +723,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		hold = true;
 		const pending = wallet.generateNewReceiveAddress();
 		await out;
-		const away = await wallet.switchNetwork(
-			EAvailableNetworks.signet,
-			electrumOptions.servers
-		);
+		const away = await wallet.switchNetwork(EAvailableNetworks.signet);
 		if (away.isErr()) throw away.error;
 		// Index writes share one queue across networks, so this signet write
 		// lands right after the held one.
@@ -766,7 +736,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 			await pending;
 			await onSignet;
 		};
-		const back = await wallet.switchNetwork(NETWORK, electrumOptions.servers);
+		const back = await wallet.switchNetwork(NETWORK);
 		if (back.isErr()) throw back.error;
 		const issued = await pending;
 		const signetIssued = await onSignet;
@@ -799,7 +769,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		const wallet = await open({
 			...storage,
 			setData: async <K extends keyof IWalletData>(
-				key: string,
+				key: TWalletStorageKey<K>,
 				value: IWalletData[K]
 			): Promise<Result<boolean>> => {
 				if (key !== storageKey('addressIndex')) {
@@ -836,13 +806,10 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		expect(wallet.data.addressIndex[type].index).to.equal(
 			first.value.index + 2
 		);
-		const away = await wallet.switchNetwork(
-			EAvailableNetworks.signet,
-			electrumOptions.servers
-		);
+		const away = await wallet.switchNetwork(EAvailableNetworks.signet);
 		if (away.isErr()) throw away.error;
 		wallet.electrum.disconnect = async (): Promise<void> => undefined;
-		const back = await wallet.switchNetwork(NETWORK, electrumOptions.servers);
+		const back = await wallet.switchNetwork(NETWORK);
 		if (back.isErr()) throw back.error;
 		refused.add('addressIndex');
 		release();
@@ -876,10 +843,10 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 	it('saves the index a refresh moved before getReceiveAddress returns it, when the refresh write was refused (issue #1745)', async function () {
 		const { storage, store, refused } = memoryStorage();
 		let indexWrites = 0;
-		const counted: TStorage = {
+		const counted: IWalletStorage = {
 			...storage,
 			setData: async <K extends keyof IWalletData>(
-				key: string,
+				key: TWalletStorageKey<K>,
 				value: IWalletData[K]
 			): Promise<Result<boolean>> => {
 				if (key === storageKey('addressIndex')) indexWrites++;
@@ -1024,13 +991,14 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 	it('keeps the watched copy of a deleted transaction whose record cannot be deleted', async function () {
 		const { storage, store, refused } = memoryStorage();
 		const wallet = await open(storage);
-		wallet.data.transactions[TXID] = transaction(TXID);
-		wallet.data.unconfirmedTransactions[TXID] = transaction(TXID);
-		await wallet.saveWalletData('transactions', wallet.data.transactions);
-		await wallet.saveWalletData(
-			'unconfirmedTransactions',
-			wallet.data.unconfirmedTransactions
-		);
+		const saved = await wallet.updateData({
+			transactions: { ...wallet.data.transactions, [TXID]: transaction(TXID) },
+			unconfirmedTransactions: {
+				...wallet.data.unconfirmedTransactions,
+				[TXID]: transaction(TXID)
+			}
+		});
+		if (saved.isErr()) throw saved.error;
 		refused.add('transactions');
 
 		const res = await wallet.deleteOnChainTransactionById({ txid: TXID });
@@ -1044,7 +1012,10 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 	it('fails a ghost marking that cannot be saved', async function () {
 		const { storage, refused } = memoryStorage();
 		const wallet = await open(storage);
-		wallet.data.transactions[TXID] = transaction(TXID);
+		const held = await wallet.updateData({
+			transactions: { ...wallet.data.transactions, [TXID]: transaction(TXID) }
+		});
+		if (held.isErr()) throw held.error;
 		refused.add('transactions');
 
 		const res = await wallet.addGhostTransaction({ txid: TXID });
@@ -1088,7 +1059,7 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 			{
 				...storage,
 				setData: <K extends keyof IWalletData>(
-					key: string,
+					key: TWalletStorageKey<K>,
 					value: IWalletData[K]
 				): Promise<Result<boolean>> => {
 					if (key === storageKey('header') && throwNext) {

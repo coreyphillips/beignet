@@ -1,6 +1,6 @@
 /**
  * Descriptor export tests. Fully OFFLINE: descriptor construction is pure
- * key derivation; the wallets point at an unreachable Electrum port.
+ * key derivation; the wallets never connect (remainOffline).
  */
 
 import { expect } from 'chai';
@@ -14,7 +14,6 @@ import * as bitcoin from 'bitcoinjs-lib';
 import {
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	Wallet,
 	descriptorChecksum,
 	appendDescriptorChecksum
@@ -27,20 +26,8 @@ const MNEMONIC =
 // Master fingerprint of the BIP84 test vector seed above.
 const FINGERPRINT = '73c5da0a';
 
-// Unreachable on purpose: these tests must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
-// Regtest keeps everything offline: mainnet wallets rotate to live fallback
-// Electrum peers when the configured server is unreachable.
 const network = EAvailableNetworks.regtest;
 const testTimeout = 60000;
 
@@ -113,7 +100,8 @@ describe('Wallet.exportDescriptors', function () {
 			mnemonic: MNEMONIC,
 			name: 'desctest',
 			network,
-			electrumOptions
+			electrumOptions,
+			remainOffline: true
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
@@ -185,7 +173,8 @@ describe('Wallet.exportDescriptors', function () {
 			xpub: vpub,
 			name: 'descwatch',
 			network,
-			electrumOptions
+			electrumOptions,
+			remainOffline: true
 		});
 		if (res.isErr()) throw res.error;
 		const watchOnly = res.value;
@@ -213,6 +202,7 @@ describe('Wallet.exportDescriptors', function () {
 			name: 'descacct',
 			network,
 			electrumOptions,
+			remainOffline: true,
 			account: 2
 		});
 		if (res.isErr()) throw res.error;

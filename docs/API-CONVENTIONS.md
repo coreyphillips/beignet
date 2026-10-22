@@ -54,6 +54,18 @@ Each old name still works and forwards to its replacement.
 | `send` or `sendMany` with `broadcast: false` | `createSignedTransaction({ address, amount })` or `createSignedTransaction({ txs })` |
 | `sendMax` with `broadcast: false` | `createSignedTransaction({ address, max: true })` |
 
+### Wallet options and types
+
+The four `IWallet` options were never read, so passing one does nothing. The `ISendTransaction` fields and `EUnit` are left over from Bitkit.
+
+| Deprecated | Use |
+|------------|-----|
+| `IWallet.id` | Nothing: the id is derived from the wallet's keys |
+| `IWallet.data` | `wallet.updateData(patch)` after `Wallet.create` |
+| `IWallet.addressLookBehind`, `IWallet.addressLookAhead` | `gapLimitOptions.lookBehind`, `gapLimitOptions.lookAhead` |
+| `ISendTransaction.fiatAmount`, `slashTagsUrl`, `lightningInvoice`, `EUnit` | Nothing |
+| `TStorage` | `IWalletStorage` |
+
 ### `BeignetNode`
 
 | Deprecated | Use |

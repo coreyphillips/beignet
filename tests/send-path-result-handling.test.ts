@@ -7,7 +7,7 @@
  * had the same shape: when the follow-up fee probe also failed, neither branch
  * returned and the un-updated fee was broadcast.
  *
- * Fully OFFLINE: the wallet points at an unreachable port and every call that
+ * Fully OFFLINE: the wallet is created with remainOffline and every call that
  * would touch a server is stubbed.
  */
 
@@ -24,7 +24,6 @@ import {
 	EAddressType,
 	EAvailableNetworks,
 	EBoostType,
-	EProtocol,
 	EWalletErrorCode,
 	getDataFallback,
 	getDustThreshold,
@@ -33,6 +32,7 @@ import {
 	ok,
 	err,
 	Result,
+	TWalletStorageKey,
 	validateTransaction,
 	Wallet
 } from '../src';
@@ -42,17 +42,7 @@ import { TRANSACTION_DEFAULTS } from '../src/wallet/constants';
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 // One regtest address per output script, so the dust cases can assert the
 // threshold each script actually carries.
@@ -103,7 +93,8 @@ describe('send path result handling', function () {
 			mnemonic: MNEMONIC,
 			network: EAvailableNetworks.regtest,
 			addressType: EAddressType.p2wpkh,
-			electrumOptions
+			electrumOptions,
+			remainOffline: true
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
@@ -113,9 +104,10 @@ describe('send path result handling', function () {
 		await wallet?.electrum?.disconnect();
 	});
 
-	beforeEach(function () {
+	beforeEach(async function () {
 		// sendMany refuses to start without UTXOs.
-		wallet.data.utxos = [utxo(100000)];
+		const res = await wallet.updateData({ utxos: [utxo(100000)] });
+		if (res.isErr()) throw res.error;
 	});
 
 	afterEach(function () {
@@ -452,7 +444,9 @@ describe('send path result handling', function () {
 
 	describe('getDataFallback', function () {
 		it('errs on a key with no default', async function () {
-			const res = await getDataFallback('wallet0-regtest-notARealKey');
+			const res = await getDataFallback(
+				'wallet0-regtest-notARealKey' as TWalletStorageKey
+			);
 			expect(
 				res.isErr(),
 				'an unknown key is an error, not ok(undefined)'
@@ -462,7 +456,9 @@ describe('send path result handling', function () {
 		it('errs on an inherited Object property name', async function () {
 			// `key in defaultWalletData` would answer true for these.
 			for (const key of ['toString', 'constructor', 'hasOwnProperty']) {
-				const res = await getDataFallback(`wallet0-regtest-${key}`);
+				const res = await getDataFallback(
+					`wallet0-regtest-${key}` as TWalletStorageKey
+				);
 				expect(res.isErr(), `${key} is not wallet data`).to.equal(true);
 			}
 		});

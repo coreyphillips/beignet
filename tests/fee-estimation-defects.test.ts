@@ -27,7 +27,6 @@ import {
 	EAddressType,
 	EAvailableNetworks,
 	ECoinSelectPreference,
-	EProtocol,
 	IUtxo,
 	ok,
 	Transaction,
@@ -44,17 +43,7 @@ import {
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 const network = networks.regtest;
 // Valid curve points (G, 2G, 3G, 4G), so bitcoinjs will encode them.
@@ -301,11 +290,20 @@ describe('fee estimation defects', function () {
 		let wallet: Wallet;
 		const PARENT_TXID = 'cd'.repeat(32);
 
-		const stageParent = (feeBtc: number, vsize: number): void => {
-			wallet.data.transactions[PARENT_TXID] = {
-				fee: feeBtc,
-				vsize
-			} as IFormattedTransaction;
+		const stageParent = async (
+			feeBtc: number,
+			vsize: number
+		): Promise<void> => {
+			const res = await wallet.updateData({
+				transactions: {
+					...wallet.data.transactions,
+					[PARENT_TXID]: {
+						fee: feeBtc,
+						vsize
+					} as IFormattedTransaction
+				}
+			});
+			if (res.isErr()) throw res.error;
 		};
 
 		before(async function () {
@@ -313,7 +311,8 @@ describe('fee estimation defects', function () {
 				mnemonic: MNEMONIC,
 				network: EAvailableNetworks.regtest,
 				addressType: EAddressType.p2wpkh,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (res.isErr()) throw res.error;
 			wallet = res.value;
@@ -345,7 +344,7 @@ describe('fee estimation defects', function () {
 			// inputs, so the child is sized at its one 41 vB output.
 			// (10 * 241 - 1000) / 41 = 34.4 -> 35 sat/vB.
 			// Reading the fee as 0.00001 instead of 1000 gave 59.
-			stageParent(0.00001, 200);
+			await stageParent(0.00001, 200);
 			const sendMax = sinon
 				.stub(wallet.transaction, 'sendMax')
 				.resolves(ok(getDefaultSendTransaction()));
@@ -362,7 +361,7 @@ describe('fee estimation defects', function () {
 		it('never quotes below 1 sat/vB when the parent already overpaid', async function () {
 			// 0.001 BTC of fee on a 200 vB parent is far above the target rate, so
 			// the raw arithmetic goes negative.
-			stageParent(0.001, 200);
+			await stageParent(0.001, 200);
 			const sendMax = sinon
 				.stub(wallet.transaction, 'sendMax')
 				.resolves(ok(getDefaultSendTransaction()));

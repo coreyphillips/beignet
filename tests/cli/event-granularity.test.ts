@@ -16,16 +16,16 @@ import { WebhookManager } from '../../src/cli/webhooks';
 import { BeignetNode, holdInvoiceEvent } from '../../src/cli/beignet-node';
 import {
 	createConsoleLogger,
+	createMemoryStorage,
 	EAvailableNetworks,
-	EProtocol,
 	err,
 	getWalletDataStorageKey,
 	IOnchainFees,
 	IWalletData,
+	IWalletStorage,
 	ok,
 	Result,
 	TMessageDataMap,
-	TStorage,
 	TWalletDataKeys,
 	Wallet
 } from '../../src';
@@ -303,43 +303,24 @@ describe('Event granularity (M4 batch 2b)', () => {
 		// refresh ends, so a write refused at startup or during the initial
 		// sync never reached the handler above, and the stale stored copy went
 		// unreported. The wallet here is created the way initNode creates it,
-		// wired to the handler, with no Electrum server to reach.
+		// wired to the handler, but offline.
 		describe('refused writes before the first refresh ends (issue #1744)', function () {
 			this.timeout(20_000);
 			const NAME = 'daemonwallet';
 			const NETWORK = EAvailableNetworks.regtest;
 			const storageKey = (key: TWalletDataKeys): string =>
 				getWalletDataStorageKey(NAME, NETWORK, key);
-			const electrumOptions = {
-				net,
-				tls,
-				servers: {
-					host: '127.0.0.1',
-					ssl: 65522,
-					tcp: 65522,
-					protocol: EProtocol.tcp
-				}
-			};
 			const store = new Map<string, string>();
 			const refused = new Set<TWalletDataKeys>();
-			const storage: TStorage = {
-				getData: async <K extends keyof IWalletData>(
-					key: string
-				): Promise<Result<IWalletData[K]>> => {
-					const raw = store.get(key);
-					if (raw === undefined)
-						return ok(undefined as unknown as IWalletData[K]);
-					return ok(JSON.parse(raw));
-				},
-				setData: async <K extends keyof IWalletData>(
-					key: string,
-					value: IWalletData[K]
-				): Promise<Result<boolean>> => {
+			const memory = createMemoryStorage(store);
+			// Without setTransactionChanges, so every write meets the refusal.
+			const storage: IWalletStorage = {
+				getData: memory.getData,
+				setData: async (key, value) => {
 					if ([...refused].some((k) => key === storageKey(k))) {
 						return err('storage is full');
 					}
-					store.set(key, JSON.stringify(value));
-					return ok(true);
+					return memory.setData(key, value);
 				}
 			};
 			const errors: Array<[string, unknown]> = [];
@@ -375,7 +356,8 @@ describe('Event granularity (M4 batch 2b)', () => {
 					mnemonic: TEST_MNEMONIC,
 					network: NETWORK,
 					name: NAME,
-					electrumOptions,
+					remainOffline: true,
+					electrumOptions: { net, tls },
 					storage,
 					disableRefreshOnCreate: true,
 					disableMessagesOnCreate: true,

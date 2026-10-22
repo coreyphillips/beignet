@@ -5,8 +5,8 @@
  * whatever was left, down to a few sats, while the staged fee still read as
  * the reviewed figure. The build is now refused instead.
  *
- * Fully OFFLINE: the wallet points at an unreachable Electrum server, UTXOs
- * are fabricated and the previous-transaction fetch is stubbed.
+ * Fully OFFLINE: the wallet is created with remainOffline, UTXOs are
+ * fabricated and the previous-transaction fetch is stubbed.
  */
 
 import { expect } from 'chai';
@@ -18,7 +18,6 @@ import * as bitcoin from 'bitcoinjs-lib';
 import {
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	getScriptHash,
 	IUtxo,
 	ok,
@@ -34,16 +33,7 @@ const regtest = bitcoin.networks.regtest;
 const network = EAvailableNetworks.regtest;
 const PATH = "m/84'/1'/0'/0/0";
 
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 /** Previous transactions paying `values` to `script`, one output each. */
 const makePrevTxs = (script: Buffer, values: number[]): bitcoin.Transaction[] =>
@@ -82,7 +72,8 @@ describe('Staged fee the inputs cannot cover (#1361)', function () {
 			value: values[i],
 			publicKey: node.value.publicKey.toString('hex')
 		}));
-		wallet.data.utxos = utxos;
+		const funded = await wallet.updateData({ utxos });
+		if (funded.isErr()) throw funded.error;
 		const electrum = wallet.electrum as unknown as {
 			getTransactions: (args: {
 				txHashes: { tx_hash: string }[];
@@ -106,6 +97,7 @@ describe('Staged fee the inputs cannot cover (#1361)', function () {
 			network,
 			addressType: EAddressType.p2wpkh,
 			electrumOptions,
+			remainOffline: true,
 			name: 'stagedfeeshortfall'
 		});
 		if (res.isErr()) throw res.error;

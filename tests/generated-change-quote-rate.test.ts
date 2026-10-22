@@ -9,8 +9,8 @@
  * 1 sat/vB the fee is then 548 sats, over half the 550 payment, so no whole
  * rate fits.
  *
- * Fully OFFLINE: the wallet points at an unreachable Electrum server and the
- * UTXOs are fabricated.
+ * Fully OFFLINE: the wallet never connects (remainOffline) and the UTXOs are
+ * fabricated.
  */
 
 import { expect } from 'chai';
@@ -21,7 +21,6 @@ import {
 	EAddressType,
 	EAvailableNetworks,
 	ECoinSelectPreference,
-	EProtocol,
 	getScriptHash,
 	IUtxo,
 	Wallet
@@ -35,16 +34,7 @@ const PATH = "m/84'/1'/0'/0/0";
 const INPUT_VALUE = 366;
 const PAYMENT = 550;
 
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 describe('Generated change at the quoted maximum (#1562)', function () {
 	this.timeout(60000);
@@ -59,6 +49,7 @@ describe('Generated change at the quoted maximum (#1562)', function () {
 			addressType: EAddressType.p2wpkh,
 			coinSelectPreference: ECoinSelectPreference.consolidate,
 			electrumOptions,
+			remainOffline: true,
 			name: 'generatedchangequoterate'
 		});
 		if (res.isErr()) throw res.error;

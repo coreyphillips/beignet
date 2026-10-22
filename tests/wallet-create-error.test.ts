@@ -34,6 +34,7 @@ const electrumHelpers = require('rn-electrum-client/helpers');
 
 import {
 	createConsoleLogger,
+	createMemoryStorage,
 	EAddressType,
 	EAvailableNetworks,
 	EElectrumNetworks,
@@ -45,10 +46,8 @@ import {
 	getWalletDataStorageKey,
 	IWallet,
 	IWalletData,
-	ok,
-	Result,
+	IWalletStorage,
 	TMessageDataMap,
-	TStorage,
 	Wallet
 } from '../src';
 import { POLLING_INTERVAL } from '../src/shapes/electrum';
@@ -59,7 +58,9 @@ const MNEMONIC =
 const WALLET_NAME = 'createerrorwallet';
 const NETWORK = EAvailableNetworks.regtest;
 
-// Unreachable on purpose: this test must work offline.
+// Unreachable on purpose: this test must work offline. Not remainOffline,
+// which starts no poll and refuses every connect before the client: the
+// poll, the connect and the client's stop are what these cases watch.
 const electrumOptions = {
 	net,
 	tls,
@@ -93,23 +94,15 @@ const useFakeClock = (): TFakeClock =>
 
 /** In-memory storage, optionally holding another wallet's id under this
  *  wallet's name, which is what makes storageIdCheck refuse the create. */
-const memoryStorage = (foreignId?: string): TStorage => {
-	const store: Record<string, unknown> = {};
+const memoryStorage = (foreignId?: string): IWalletStorage => {
+	const store = new Map<string, string>();
 	if (foreignId) {
-		store[getWalletDataStorageKey(WALLET_NAME, NETWORK, 'id')] = foreignId;
+		store.set(
+			getWalletDataStorageKey(WALLET_NAME, NETWORK, 'id'),
+			JSON.stringify(foreignId)
+		);
 	}
-	return {
-		getData: async <K extends keyof IWalletData>(
-			key: string
-		): Promise<Result<IWalletData[K]>> => ok(store[key] as IWalletData[K]),
-		setData: async <K extends keyof IWalletData>(
-			key: string,
-			value: IWalletData[K]
-		): Promise<Result<boolean>> => {
-			store[key] = value;
-			return ok(true);
-		}
-	};
+	return createMemoryStorage(store);
 };
 
 const createGate = (): { promise: Promise<void>; release: () => void } => {
@@ -129,7 +122,7 @@ describe('Wallet.create returning an error (issue #966)', function () {
 	/** A wallet a case did get back, stopped after it. */
 	let created: Wallet | undefined;
 
-	const params = (storage: TStorage): IWallet => ({
+	const params = (storage: IWalletStorage): IWallet => ({
 		mnemonic: MNEMONIC,
 		network: NETWORK,
 		name: WALLET_NAME,
@@ -244,29 +237,27 @@ describe('Wallet.create while storage is still loading (issue #1615)', function 
 			scriptHash: 'aa'.repeat(32),
 			publicKey: 'bb'.repeat(33)
 		};
-		const store = new Map<string, unknown>([
-			[key('id'), generateWalletId(bip39.mnemonicToSeedSync(MNEMONIC))],
-			[key('addressIndex'), addressIndex]
+		const store = new Map<string, string>([
+			[
+				key('id'),
+				JSON.stringify(generateWalletId(bip39.mnemonicToSeedSync(MNEMONIC)))
+			],
+			[key('addressIndex'), JSON.stringify(addressIndex)]
 		]);
 		const writes: string[] = [];
 		const frozenRead = createGate();
-		const storage: TStorage = {
-			getData: async <K extends keyof IWalletData>(
-				storageKey: string
-			): Promise<Result<IWalletData[K]>> => {
+		const memory = createMemoryStorage(store);
+		const storage: IWalletStorage = {
+			getData: async (storageKey) => {
 				if (storageKey === key('blacklistedUtxos')) {
 					await frozenRead.promise;
 					return err('storage is down');
 				}
-				return ok(store.get(storageKey) as IWalletData[K]);
+				return memory.getData(storageKey);
 			},
-			setData: async <K extends keyof IWalletData>(
-				storageKey: string,
-				value: IWalletData[K]
-			): Promise<Result<boolean>> => {
+			setData: async (storageKey, value) => {
 				writes.push(storageKey);
-				store.set(storageKey, value);
-				return ok(true);
+				return memory.setData(storageKey, value);
 			}
 		};
 
@@ -326,9 +317,9 @@ describe('Wallet.create while storage is still loading (issue #1615)', function 
 		expect(res.isErr()).to.equal(true);
 		if (res.isOk()) return;
 		expect(res.error.message).to.contain('(blacklistedUtxos)');
-		const stored = store.get(
-			key('addressIndex')
-		) as IWalletData['addressIndex'];
+		const stored: IWalletData['addressIndex'] = JSON.parse(
+			store.get(key('addressIndex'))!
+		);
 		expect(stored[EAddressType.p2wpkh].index).to.equal(12);
 		expect(writes).to.deep.equal([]);
 		expect(startStub.called).to.equal(false);

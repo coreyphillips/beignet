@@ -11,11 +11,10 @@ import * as bitcoin from 'bitcoinjs-lib';
 import net from 'net';
 import tls from 'tls';
 import {
+	createMemoryStorage,
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
-	IWalletData,
-	TStorage,
+	IWalletStorage,
 	Wallet
 } from '../../src';
 import { directFundingWallet, IDfWallet } from '../../src/cli/direct-funding';
@@ -157,28 +156,22 @@ describe('direct funding wallet: a freeze queued ahead of ours (issue #1253)', f
 	const TXID_Y = '44'.repeat(32);
 
 	let wallet: Wallet;
-	let store: Map<string, unknown>;
+	let store: Map<string, string>;
 	// Every blacklist write waits on this before it reaches storage.
 	let blacklistWrite: Promise<void> = Promise.resolve();
 	let refuseBlacklistWrites = false;
 
 	beforeEach(async function () {
-		store = new Map<string, unknown>();
-		const storage: TStorage = {
-			getData: async <K extends keyof IWalletData>(
-				key: string
-			): Promise<Result<IWalletData[K]>> =>
-				ok(store.get(key) as IWalletData[K]),
-			setData: async <K extends keyof IWalletData>(
-				key: string,
-				value: IWalletData[K]
-			): Promise<Result<boolean>> => {
+		store = new Map<string, string>();
+		const memory = createMemoryStorage(store);
+		const storage: IWalletStorage = {
+			...memory,
+			setData: async (key, value) => {
 				if (key.endsWith('blacklistedUtxos')) {
 					await blacklistWrite;
 					if (refuseBlacklistWrites) return err('storage is unavailable');
 				}
-				store.set(key, value);
-				return ok(true);
+				return memory.setData(key, value);
 			}
 		};
 		const res = await Wallet.create({
@@ -186,36 +179,32 @@ describe('direct funding wallet: a freeze queued ahead of ours (issue #1253)', f
 			name: 'dfqueuedfreeze',
 			network: EAvailableNetworks.regtest,
 			storage,
-			// Unreachable on purpose: nothing here needs a server.
-			electrumOptions: {
-				net,
-				tls,
-				servers: {
-					host: '127.0.0.1',
-					ssl: 65529,
-					tcp: 65529,
-					protocol: EProtocol.tcp
-				}
-			}
+			// Nothing here needs a server.
+			remainOffline: true,
+			electrumOptions: { net, tls }
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
 		// The failed (offline) refresh still derives the index-0 address.
 		await wallet.refreshWallet({});
 		const source = wallet.data.addressIndex[EAddressType.p2wpkh];
-		for (const [i, txid] of [TXID_X, TXID_Y].entries()) {
-			wallet.data.utxos.push({
-				address: source.address,
-				index: source.index,
-				path: source.path,
-				scriptHash: source.scriptHash,
-				height: 100 + i,
-				tx_hash: txid,
-				tx_pos: 0,
-				value: 100_000,
-				publicKey: source.publicKey
-			});
-		}
+		const added = await wallet.updateData({
+			utxos: [
+				...wallet.data.utxos,
+				...[TXID_X, TXID_Y].map((txid, i) => ({
+					address: source.address,
+					index: source.index,
+					path: source.path,
+					scriptHash: source.scriptHash,
+					height: 100 + i,
+					tx_hash: txid,
+					tx_pos: 0,
+					value: 100_000,
+					publicKey: source.publicKey
+				}))
+			]
+		});
+		if (added.isErr()) throw added.error;
 	});
 
 	afterEach(async function () {
@@ -286,9 +275,9 @@ describe('direct funding wallet: a freeze queued ahead of ours (issue #1253)', f
 		expect(y.isOk() && x.isOk()).to.equal(true);
 		expect(released, 'the operator now owns the freeze').to.equal(false);
 		expect(entryX()?.freezeTag).to.equal(undefined);
-		const stored = store.get(
-			wallet.getWalletDataKey('blacklistedUtxos')
-		) as IUtxo[];
+		const stored: IUtxo[] = JSON.parse(
+			store.get(wallet.getWalletDataKey('blacklistedUtxos'))!
+		);
 		expect(
 			stored.some((f) => f.tx_hash === TXID_X && f.tx_pos === 0),
 			'the operator freeze in storage'
@@ -317,17 +306,23 @@ describe('direct funding wallet: a freeze queued ahead of ours (issue #1253)', f
 	it('clears an interrupted payment whose freeze the operator lifted, and retries it (issue #1422)', async () => {
 		const coin = makeCoin();
 		const source = wallet.data.addressIndex[EAddressType.p2wpkh];
-		wallet.data.utxos.push({
-			address: source.address,
-			index: source.index,
-			path: source.path,
-			scriptHash: source.scriptHash,
-			height: 100,
-			tx_hash: coin.txidHex,
-			tx_pos: coin.vout,
-			value: Number(coin.valueSat),
-			publicKey: source.publicKey
+		const added = await wallet.updateData({
+			utxos: [
+				...wallet.data.utxos,
+				{
+					address: source.address,
+					index: source.index,
+					path: source.path,
+					scriptHash: source.scriptHash,
+					height: 100,
+					tx_hash: coin.txidHex,
+					tx_pos: coin.vout,
+					value: Number(coin.valueSat),
+					publicKey: source.publicKey
+				}
+			]
 		});
+		if (added.isErr()) throw added.error;
 		// The test coin signs; the real wallet holds its reservation.
 		const df = directFundingWallet(wallet, NETWORK);
 		const payer = new FakeSenderWallet([coin]);
@@ -395,17 +390,23 @@ describe('direct funding wallet: a freeze queued ahead of ours (issue #1253)', f
 	it('retries cleanup an operator freeze refused once the operator lifts it (issue #1460)', async () => {
 		const coin = makeCoin();
 		const source = wallet.data.addressIndex[EAddressType.p2wpkh];
-		wallet.data.utxos.push({
-			address: source.address,
-			index: source.index,
-			path: source.path,
-			scriptHash: source.scriptHash,
-			height: 100,
-			tx_hash: coin.txidHex,
-			tx_pos: coin.vout,
-			value: Number(coin.valueSat),
-			publicKey: source.publicKey
+		const added = await wallet.updateData({
+			utxos: [
+				...wallet.data.utxos,
+				{
+					address: source.address,
+					index: source.index,
+					path: source.path,
+					scriptHash: source.scriptHash,
+					height: 100,
+					tx_hash: coin.txidHex,
+					tx_pos: coin.vout,
+					value: Number(coin.valueSat),
+					publicKey: source.publicKey
+				}
+			]
 		});
+		if (added.isErr()) throw added.error;
 		const df = directFundingWallet(wallet, NETWORK);
 		const payer = new FakeSenderWallet([coin]);
 		payer.listSpendable = (): IDfSenderCoin[] =>

@@ -15,13 +15,11 @@ import tls from 'tls';
 
 import {
 	createConsoleLogger,
+	createMemoryStorage,
 	EAddressType,
 	EAvailableNetworks,
 	EProtocol,
 	IAddress,
-	IWalletData,
-	ok,
-	Result,
 	TUnspentAddressScriptHashData,
 	Wallet
 } from '../../src';
@@ -126,12 +124,7 @@ describe('Electrum batch pacing and connection checks (#1656)', function () {
 			feeEstimationSource: 'electrum',
 			disableRefreshOnCreate: true,
 			logger: createConsoleLogger('silent'),
-			storage: {
-				setData: async <K extends keyof IWalletData>(
-					_key: string,
-					_value: IWalletData[K]
-				): Promise<Result<boolean>> => ok(true)
-			}
+			storage: createMemoryStorage()
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;

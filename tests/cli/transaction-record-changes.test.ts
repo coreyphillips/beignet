@@ -15,6 +15,7 @@ import tls from 'tls';
 
 import {
 	createEncryptedStorage,
+	createMemoryStorage,
 	EAddressType,
 	EAvailableNetworks,
 	EBoostType,
@@ -29,11 +30,15 @@ import {
 	ITransaction,
 	IUtxo,
 	IWalletData,
+	IWalletStorage,
 	ok,
 	Result,
-	TStorage,
+	TGetData,
+	TSetData,
+	TSetTransactionChanges,
 	TTransactionChanges,
 	TTxDetails,
+	TWalletStorageKey,
 	Wallet
 } from '../../src';
 
@@ -117,7 +122,7 @@ const copy = <V>(value: V): V =>
 const flush = (): Promise<void> =>
 	new Promise((resolve) => setImmediate(resolve));
 
-const key = (field: keyof IWalletData): string =>
+const key = <K extends keyof IWalletData>(field: K): TWalletStorageKey<K> =>
 	getWalletDataStorageKey(NAME, NETWORK, field);
 
 type TBatch<V> = { key: string; data: V[] };
@@ -128,7 +133,9 @@ type THeldWrite = { land: () => void };
 describe('transaction record changes (#1810)', function () {
 	this.timeout(60000);
 
-	let store: Map<string, unknown>;
+	/** Each stored value's JSON. */
+	const store = new Map<string, string>();
+	const memory = createMemoryStorage(store);
 	/** Every setData call, deep copied. */
 	let writes: { key: string; value: unknown }[];
 	/** Every setTransactionChanges call, deep copied. */
@@ -141,54 +148,43 @@ describe('transaction record changes (#1810)', function () {
 	let wallet: Wallet | undefined;
 
 	/** Waits its turn when `hold` is set, then refuses or applies the write. */
-	const transactionWrite = (apply: () => void): Promise<Result<boolean>> => {
-		const finish = (): Result<boolean> => {
-			if (refuse) return err('storage is full');
-			apply();
-			return ok(true);
-		};
-		if (!hold) return Promise.resolve(finish());
+	const transactionWrite = (
+		apply: () => Promise<Result<boolean>>
+	): Promise<Result<boolean>> => {
+		const finish = (): Promise<Result<boolean>> =>
+			refuse ? Promise.resolve(err('storage is full')) : apply();
+		if (!hold) return finish();
 		return new Promise((resolve) => {
 			held.push({ land: (): void => resolve(finish()) });
 		});
 	};
 
-	const getData = async <K extends keyof IWalletData>(
-		storageKey: string
-	): Promise<Result<IWalletData[K]>> =>
-		ok(copy(store.get(storageKey)) as IWalletData[K]);
+	const getData: TGetData = memory.getData;
 
-	const setData = async <K extends keyof IWalletData>(
-		storageKey: string,
-		value: IWalletData[K]
-	): Promise<Result<boolean>> => {
+	const setData: TSetData = async (storageKey, value) => {
+		// Copied now: a held write lands what the wallet handed over, not
+		// what its map holds by the time the test lands it.
 		const written = copy(value);
 		writes.push({ key: storageKey, value: written });
 		if (storageKey !== key('transactions')) {
-			store.set(storageKey, written);
-			return ok(true);
+			return memory.setData(storageKey, written);
 		}
-		return transactionWrite(() => store.set(storageKey, written));
+		return transactionWrite(() => memory.setData(storageKey, written));
 	};
 
 	/** Applies each change to the stored map, as getData then returns it. */
-	const setTransactionChanges = async (
-		storageKey: string,
-		changes: TTransactionChanges
-	): Promise<Result<boolean>> => {
+	const setTransactionChanges: TSetTransactionChanges = async (
+		storageKey,
+		changes
+	) => {
 		const written = copy(changes);
 		changeWrites.push({ key: storageKey, changes: written });
-		return transactionWrite(() => {
-			const map = {
-				...(store.get(storageKey) as IFormattedTransactions | undefined),
-				...written.set
-			};
-			for (const txid of written.deleted) delete map[txid];
-			store.set(storageKey, map);
-		});
+		return transactionWrite(() =>
+			memory.setTransactionChanges(storageKey, written)
+		);
 	};
 
-	const openWallet = async (storage: TStorage): Promise<Wallet> => {
+	const openWallet = async (storage: IWalletStorage): Promise<Wallet> => {
 		const res = await Wallet.create({
 			mnemonic: MNEMONIC,
 			name: NAME,
@@ -202,7 +198,10 @@ describe('transaction record changes (#1810)', function () {
 		});
 		if (res.isErr()) throw res.error;
 		res.value.electrum.stopConnectionPolling();
-		res.value.data.header = { height: TIP, hash: '', hex: '' };
+		const tip = await res.value.updateData({
+			header: { height: TIP, hash: '', hex: '' }
+		});
+		if (tip.isErr()) throw tip.error;
 		await flush();
 		// What loading wrote is not under test.
 		writes = [];
@@ -213,16 +212,18 @@ describe('transaction record changes (#1810)', function () {
 	/** Seeds storage with the history and opens a wallet over it. */
 	const seed = async (
 		height: number,
-		storage: TStorage = { getData, setData, setTransactionChanges }
+		storage: IWalletStorage = { getData, setData, setTransactionChanges }
 	): Promise<Wallet> => {
-		store.set(key('transactions'), history(height));
-		store.set(key('unconfirmedTransactions'), { [T]: record(T, height) });
+		await memory.setData(key('transactions'), history(height));
+		await memory.setData(key('unconfirmedTransactions'), {
+			[T]: record(T, height)
+		});
 		wallet = await openWallet(storage);
 		return wallet;
 	};
 
 	const stored = (): IFormattedTransactions =>
-		store.get(key('transactions')) as IFormattedTransactions;
+		JSON.parse(store.get(key('transactions'))!);
 
 	const transactionWrites = (): unknown[] =>
 		writes.filter((w) => w.key === key('transactions')).map((w) => w.value);
@@ -257,7 +258,7 @@ describe('transaction record changes (#1810)', function () {
 	};
 
 	beforeEach(function () {
-		store = new Map();
+		store.clear();
 		writes = [];
 		changeWrites = [];
 		refuse = false;
@@ -288,8 +289,14 @@ describe('transaction record changes (#1810)', function () {
 			addressType: EAddressType.p2wpkh
 		});
 		if (gen.isErr()) throw gen.error;
-		w.data.addresses.p2wpkh = gen.value.addresses;
-		w.data.changeAddresses.p2wpkh = gen.value.changeAddresses;
+		const generated = await w.updateData({
+			addresses: { ...w.data.addresses, p2wpkh: gen.value.addresses },
+			changeAddresses: {
+				...w.data.changeAddresses,
+				p2wpkh: gen.value.changeAddresses
+			}
+		});
+		if (generated.isErr()) throw generated.error;
 		const receive = Object.values(gen.value.addresses)[0] as IAddress;
 		const vin = (txid: string): TTxDetails['vin'][number] => ({
 			txid,

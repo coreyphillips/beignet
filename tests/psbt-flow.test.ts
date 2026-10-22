@@ -1,9 +1,9 @@
 /**
- * External-signer PSBT flow tests. Fully OFFLINE: wallets point at an
- * unreachable Electrum server and UTXOs are fabricated locally, so these
- * tests exercise PSBT construction, signer metadata, external signing,
- * validation, finalization and combining without any network. The daemon
- * route section boots a node against the same unreachable Electrum (the
+ * External-signer PSBT flow tests. Fully OFFLINE: wallets are created with
+ * remainOffline and UTXOs are fabricated locally, so these tests exercise
+ * PSBT construction, signer metadata, external signing, validation,
+ * finalization and combining without any network. The daemon route section
+ * boots a node against an unreachable Electrum (the
  * tests/cli/onchain-power.test.ts pattern) to exercise validation paths.
  */
 
@@ -23,7 +23,6 @@ import * as bitcoin from 'bitcoinjs-lib';
 import {
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	getScriptHash,
 	IUtxo,
 	ok,
@@ -45,16 +44,7 @@ const regtest = bitcoin.networks.regtest;
 const network = EAvailableNetworks.regtest;
 const testTimeout = 120000;
 
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 let root: BIP32Interface;
 const createdWallets: Wallet[] = [];
@@ -108,6 +98,14 @@ const makeUtxo = async (
 		value,
 		publicKey: node.value.publicKey.toString('hex')
 	};
+};
+
+/** Adds fabricated UTXOs to the wallet's data. */
+const addUtxos = async (wallet: Wallet, ...utxos: IUtxo[]): Promise<void> => {
+	const res = await wallet.updateData({
+		utxos: [...wallet.data.utxos, ...utxos]
+	});
+	if (res.isErr()) throw res.error;
 };
 
 /** Signs every input of a PSBT from its bip32 derivation metadata, acting as
@@ -173,7 +171,8 @@ const createWallet = async (
 		mnemonic: MNEMONIC,
 		network,
 		addressType,
-		electrumOptions
+		electrumOptions,
+		remainOffline: true
 	});
 	if (res.isErr()) throw res.error;
 	createdWallets.push(res.value);
@@ -189,7 +188,8 @@ const createWatchOnlyWallet = async (): Promise<Wallet> => {
 		xpub,
 		addressType: EAddressType.p2wpkh,
 		network,
-		electrumOptions
+		electrumOptions,
+		remainOffline: true
 	});
 	if (res.isErr()) throw res.error;
 	createdWallets.push(res.value);
@@ -213,7 +213,8 @@ describe('External-Signer PSBT Flow', function () {
 
 		before(async () => {
 			wallet = await createWallet();
-			wallet.data.utxos.push(
+			await addUtxos(
+				wallet,
 				await makeUtxo(wallet, { index: 0, value: 60000 }),
 				await makeUtxo(wallet, { index: 1, value: 40000 })
 			);
@@ -315,6 +316,7 @@ describe('External-Signer PSBT Flow', function () {
 				network,
 				addressType: EAddressType.p2wpkh,
 				electrumOptions,
+				remainOffline: true,
 				disableRefreshOnCreate: true
 			});
 			if (res.isErr()) throw res.error;
@@ -359,7 +361,8 @@ describe('External-Signer PSBT Flow', function () {
 
 		it('includes redeemScript for p2sh-p2wpkh inputs', async () => {
 			const p2shWallet = await createWallet(EAddressType.p2sh);
-			p2shWallet.data.utxos.push(
+			await addUtxos(
+				p2shWallet,
 				await makeUtxo(p2shWallet, {
 					index: 0,
 					value: 50000,
@@ -404,7 +407,8 @@ describe('External-Signer PSBT Flow', function () {
 			const prevTx = new bitcoin.Transaction();
 			prevTx.addInput(Buffer.alloc(32, 7), 0);
 			prevTx.addOutput(bitcoin.address.toOutputScript(address, regtest), 50000);
-			p2pkhWallet.data.utxos.push(
+			await addUtxos(
+				p2pkhWallet,
 				await makeUtxo(p2pkhWallet, {
 					index: 0,
 					value: 50000,
@@ -449,7 +453,8 @@ describe('External-Signer PSBT Flow', function () {
 
 		it('includes tapInternalKey and tapBip32Derivation for p2tr inputs', async () => {
 			const trWallet = await createWallet(EAddressType.p2tr);
-			trWallet.data.utxos.push(
+			await addUtxos(
+				trWallet,
 				await makeUtxo(trWallet, {
 					index: 0,
 					value: 50000,
@@ -511,7 +516,8 @@ describe('External-Signer PSBT Flow', function () {
 
 		before(async () => {
 			watchOnly = await createWatchOnlyWallet();
-			watchOnly.data.utxos.push(
+			await addUtxos(
+				watchOnly,
 				await makeUtxo(watchOnly, { index: 0, value: 60000 }),
 				await makeUtxo(watchOnly, { index: 1, value: 40000 })
 			);
@@ -700,7 +706,8 @@ describe('External-Signer PSBT Flow', function () {
 	describe('Taproot round trip on a full wallet', () => {
 		it('builds, signs externally (tweaked schnorr) and imports', async () => {
 			const trWallet = await createWallet(EAddressType.p2tr);
-			trWallet.data.utxos.push(
+			await addUtxos(
+				trWallet,
 				await makeUtxo(trWallet, {
 					index: 2,
 					value: 70000,
@@ -725,7 +732,8 @@ describe('External-Signer PSBT Flow', function () {
 	describe('combinePsbts', () => {
 		it('merges two partially signed copies of the same PSBT', async () => {
 			const wallet = await createWallet();
-			wallet.data.utxos.push(
+			await addUtxos(
+				wallet,
 				await makeUtxo(wallet, { index: 3, value: 30000 }),
 				await makeUtxo(wallet, { index: 4, value: 30000 })
 			);

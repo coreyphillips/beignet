@@ -14,7 +14,9 @@ import type {
 	TGapLimitOptions,
 	TGetData,
 	TKeyDerivationPurpose,
-	TVin
+	TVin,
+	TWalletDataKeys,
+	TWalletStorageKey
 } from '../types';
 import { EAddressType } from '../types';
 import { Network } from '../network';
@@ -295,17 +297,20 @@ export const generateWalletId = (seed: Buffer): string => {
 		.toString('hex');
 };
 
-export const getWalletDataStorageKey = (
+export const getWalletDataStorageKey = <K extends TWalletDataKeys>(
 	name: string,
 	network: Network,
-	key: keyof IWalletData,
+	key: K,
 	account = 0
-): string => {
+): TWalletStorageKey<K> => {
 	// Account 0 keeps the legacy key format so existing stored wallets keep
 	// loading. Non-zero accounts get their own namespace so two Wallet
 	// instances over the same mnemonic and storage never collide.
-	if (account > 0) return `${name}-${network}-acct${account}-${key}`;
-	return `${name}-${network}-${key}`;
+	const storageKey =
+		account > 0
+			? `${name}-${network}-acct${account}-${key}`
+			: `${name}-${network}-${key}`;
+	return storageKey as TWalletStorageKey<K>;
 };
 
 // The network is spelled out rather than matched as any segment: the name may

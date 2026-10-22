@@ -288,11 +288,27 @@ describe('gap-limit scan requests (#1661)', function () {
 				addressType: type
 			});
 			if (gen.isErr()) throw gen.error;
-			wallet.data.addresses[type] = gen.value.addresses;
-			wallet.data.changeAddresses[type] = gen.value.changeAddresses;
-			wallet.data.addressIndex[type] = at(gen.value.addresses, 21);
-			wallet.data.lastUsedAddressIndex[type] = at(gen.value.addresses, 20);
-			wallet.data.changeAddressIndex[type] = at(gen.value.changeAddresses, 0);
+			const data = wallet.data;
+			const scanned = await wallet.updateData({
+				addresses: { ...data.addresses, [type]: gen.value.addresses },
+				changeAddresses: {
+					...data.changeAddresses,
+					[type]: gen.value.changeAddresses
+				},
+				addressIndex: {
+					...data.addressIndex,
+					[type]: at(gen.value.addresses, 21)
+				},
+				lastUsedAddressIndex: {
+					...data.lastUsedAddressIndex,
+					[type]: at(gen.value.addresses, 20)
+				},
+				changeAddressIndex: {
+					...data.changeAddressIndex,
+					[type]: at(gen.value.changeAddresses, 0)
+				}
+			});
+			if (scanned.isErr()) throw scanned.error;
 			pay(at(gen.value.addresses, 20));
 		}
 
@@ -382,7 +398,6 @@ describe('gap-limit scan requests (#1661)', function () {
 			),
 			confirmations: 4
 		});
-		wallet.data.header = { height: 100, hash: '', hex: '' };
 		const record = {
 			address: receive.address,
 			height: 97,
@@ -408,8 +423,15 @@ describe('gap-limit scan requests (#1661)', function () {
 			exists: true,
 			vsize: 141
 		};
-		wallet.data.transactions[Y] = record;
-		wallet.data.unconfirmedTransactions[Y] = record;
+		const recorded = await wallet.updateData({
+			header: { height: 100, hash: '', hex: '' },
+			transactions: { ...wallet.data.transactions, [Y]: record },
+			unconfirmedTransactions: {
+				...wallet.data.unconfirmedTransactions,
+				[Y]: record
+			}
+		});
+		if (recorded.isErr()) throw recorded.error;
 		// Block 97 is reorged away once the gap scan has asked about address
 		// 5, and before the check in updateTransactions asks about Y.
 		onListing = (): void => {

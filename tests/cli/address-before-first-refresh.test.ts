@@ -19,13 +19,13 @@ import sinon from 'sinon';
 import tls from 'tls';
 
 import {
+	createMemoryStorage,
 	EAddressType,
 	EAvailableNetworks,
 	EProtocol,
 	IAddress,
 	IWalletData,
 	ok,
-	Result,
 	Wallet
 } from '../../src';
 import { BeignetNode } from '../../src/cli/beignet-node';
@@ -40,7 +40,8 @@ const MNEMONIC =
 // Index 0 on each p2wpkh chain of MNEMONIC on regtest.
 const FIRST_RECEIVE = 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk';
 
-// Unreachable on purpose: this test must work offline.
+// Unreachable on purpose: this test must work offline. Not remainOffline,
+// which refuses the history requests before they reach answerNoHistory.
 const ELECTRUM_PORT = 65529;
 const electrumOptions = {
 	net,
@@ -110,12 +111,7 @@ describe('an address asked for before the first refresh (#1783)', function () {
 				electrumOptions,
 				// Nothing has refreshed: the address maps are empty.
 				disableRefreshOnCreate: true,
-				storage: {
-					setData: async <K extends keyof IWalletData>(
-						_key: string,
-						_value: IWalletData[K]
-					): Promise<Result<boolean>> => ok(true)
-				}
+				storage: createMemoryStorage()
 			});
 			if (res.isErr()) throw res.error;
 			wallet = res.value;
@@ -166,11 +162,21 @@ describe('an address asked for before the first refresh (#1783)', function () {
 				.callsFake(async (...args: Parameters<Wallet['generateAddresses']>) => {
 					const res = await generate(...args);
 					if (res.isOk()) {
-						Object.assign(wallet.data.addresses.p2wpkh, res.value.addresses);
-						Object.assign(
-							wallet.data.changeAddresses.p2wpkh,
-							res.value.changeAddresses
-						);
+						const { addresses, changeAddresses } = wallet.data;
+						const stored = await wallet.updateData({
+							addresses: {
+								...addresses,
+								p2wpkh: { ...addresses.p2wpkh, ...res.value.addresses }
+							},
+							changeAddresses: {
+								...changeAddresses,
+								p2wpkh: {
+									...changeAddresses.p2wpkh,
+									...res.value.changeAddresses
+								}
+							}
+						});
+						if (stored.isErr()) throw stored.error;
 					}
 					return res;
 				});

@@ -3,8 +3,8 @@
  * only P2PKH's dust threshold. Relayable P2WPKH change of 294 to 545 sats went
  * to the miner as fee. Change is now kept at its own script's threshold.
  *
- * Fully OFFLINE: the wallet points at an unreachable Electrum server, the UTXO
- * is fabricated and the previous-transaction fetch is stubbed.
+ * Fully OFFLINE: the wallet never connects (remainOffline), the UTXO is
+ * fabricated and the previous-transaction fetch is stubbed.
  */
 
 import { expect } from 'chai';
@@ -16,7 +16,6 @@ import * as bitcoin from 'bitcoinjs-lib';
 import {
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	getScriptHash,
 	IUtxo,
 	ok,
@@ -36,16 +35,7 @@ const INPUT_VALUE = 10_000;
 const FEE = 200;
 const P2WPKH_DUST = 294;
 
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 describe('Relayable segwit change (#1432)', function () {
 	this.timeout(120000);
@@ -60,6 +50,7 @@ describe('Relayable segwit change (#1432)', function () {
 			network,
 			addressType: EAddressType.p2wpkh,
 			electrumOptions,
+			remainOffline: true,
 			name: 'relayablechange'
 		});
 		if (res.isErr()) throw res.error;

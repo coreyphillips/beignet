@@ -30,10 +30,10 @@ import {
 	IGetUtxosResponse,
 	ILogger,
 	IUtxo,
-	IWalletData,
+	IWalletStorage,
 	Result,
-	TStorage,
 	Wallet,
+	createMemoryStorage,
 	decodeRawTransaction,
 	err,
 	ok
@@ -42,7 +42,8 @@ import {
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: these tests must work offline.
+// Unreachable on purpose: these tests must work offline. Not remainOffline,
+// which refuses each broadcast before the stubbed helper runs.
 const electrumOptions = {
 	net,
 	tls,
@@ -64,41 +65,25 @@ const BROADCAST_TXID = '44'.repeat(32);
 const TXID_C = '55'.repeat(32);
 const EXTERNAL_ADDRESS = 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk';
 
-const makeStorage = (): TStorage => {
-	const store = new Map<string, unknown>();
-	return {
-		getData: async <K extends keyof IWalletData>(
-			key: string
-		): Promise<Result<IWalletData[K]>> => ok(store.get(key) as IWalletData[K]),
-		setData: async <K extends keyof IWalletData>(
-			key: string,
-			value: IWalletData[K]
-		): Promise<Result<boolean>> => {
-			store.set(key, value);
-			return ok(true);
-		}
-	};
-};
-
 /** Copies a stored value the way a serializing adapter (SQLite) would. */
 const clone = <T>(value: T): T =>
 	value === undefined ? value : JSON.parse(JSON.stringify(value));
 
 /**
- * Same, but copying on every read and write, so the store never aliases a
- * wallet array, with writes that can be refused per key (the part of the
- * storage key after the wallet name and network) and a hook that holds the
- * next write to a key until the test releases it. A held write has already
- * passed the refusal check and copied its value, as an adapter that
+ * An in-memory storage with writes that can be refused per key (the part of
+ * the storage key after the wallet name and network) and a hook that holds
+ * the next write to a key until the test releases it. A held write has
+ * already passed the refusal check and copied its value, as an adapter that
  * serializes on the call would have.
  */
 const makeFailableStorage = (): {
-	store: Map<string, unknown>;
-	storage: TStorage;
+	store: Map<string, string>;
+	storage: IWalletStorage;
 	fail: { keys: string[] };
 	holdNext: (key: string) => () => void;
 } => {
-	const store = new Map<string, unknown>();
+	const store = new Map<string, string>();
+	const memory = createMemoryStorage(store);
 	const fail = { keys: [] as string[] };
 	const holds = new Map<string, Promise<void>>();
 	const matches = (storageKey: string, key: string): boolean =>
@@ -117,14 +102,8 @@ const makeFailableStorage = (): {
 			return release;
 		},
 		storage: {
-			getData: async <K extends keyof IWalletData>(
-				key: string
-			): Promise<Result<IWalletData[K]>> =>
-				ok(clone(store.get(key)) as IWalletData[K]),
-			setData: async <K extends keyof IWalletData>(
-				key: string,
-				value: IWalletData[K]
-			): Promise<Result<boolean>> => {
+			getData: memory.getData,
+			setData: async (key, value): Promise<Result<boolean>> => {
 				if (fail.keys.some((k) => matches(key, k))) {
 					return err('storage is down');
 				}
@@ -134,20 +113,19 @@ const makeFailableStorage = (): {
 					holds.delete(held[0]);
 					await held[1];
 				}
-				store.set(key, copy);
-				return ok(true);
+				return memory.setData(key, copy);
 			}
 		}
 	};
 };
 
 /** Fabricates a UTXO paying to one of the wallet's own derived addresses. */
-const injectUtxo = (
+const injectUtxo = async (
 	wallet: Wallet,
 	txid: string,
 	value: number,
 	addressIndex = 0
-): IUtxo => {
+): Promise<IUtxo> => {
 	const source =
 		addressIndex === 0
 			? wallet.data.addressIndex[EAddressType.p2wpkh]
@@ -166,8 +144,11 @@ const injectUtxo = (
 		value,
 		publicKey: source.publicKey
 	};
-	wallet.data.utxos.push(utxo);
-	wallet.data.balance += value;
+	const res = await wallet.updateData({
+		utxos: [...wallet.data.utxos, utxo],
+		balance: wallet.data.balance + value
+	});
+	if (res.isErr()) throw res.error;
 	return utxo;
 };
 
@@ -212,15 +193,15 @@ describe('Broadcast drops the coins it spends', function () {
 			mnemonic: MNEMONIC,
 			name: 'spentutxos',
 			network,
-			storage: makeStorage(),
+			storage: createMemoryStorage(),
 			electrumOptions
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
 		// The failed (offline) refresh still generates index-0 addresses.
 		await wallet.refreshWallet({});
-		utxoA = injectUtxo(wallet, TXID_A, 60000);
-		utxoB = injectUtxo(wallet, TXID_B, 40000, 1);
+		utxoA = await injectUtxo(wallet, TXID_A, 60000);
+		utxoB = await injectUtxo(wallet, TXID_B, 40000, 1);
 		broadcast = sinon
 			.stub(electrumHelpers, 'broadcastTransaction')
 			.resolves({ error: false, data: BROADCAST_TXID });
@@ -490,8 +471,8 @@ describe('UTXO state persistence (#812)', function () {
 	const PERSIST_ERROR = 'Failed to persist the UTXO set';
 
 	let wallet: Wallet;
-	let store: Map<string, unknown>;
-	let storage: TStorage;
+	let store: Map<string, string>;
+	let storage: IWalletStorage;
 	let fail: { keys: string[] };
 	let holdNext: (key: string) => () => void;
 	let errors: string[];
@@ -499,8 +480,8 @@ describe('UTXO state persistence (#812)', function () {
 	let utxoA: IUtxo;
 	let utxoB: IUtxo;
 
-	const storedUtxos = (): IUtxo[] => store.get(UTXOS_KEY) as IUtxo[];
-	const storedBalance = (): number => store.get(BALANCE_KEY) as number;
+	const storedUtxos = (): IUtxo[] => JSON.parse(store.get(UTXOS_KEY)!);
+	const storedBalance = (): number => JSON.parse(store.get(BALANCE_KEY)!);
 	const sum = (utxos: IUtxo[]): number =>
 		utxos.reduce((total, utxo) => total + utxo.value, 0);
 	// The offline refresh logs errors of its own.
@@ -536,8 +517,8 @@ describe('UTXO state persistence (#812)', function () {
 		wallet = res.value;
 		// The failed (offline) refresh still generates index-0 addresses.
 		await wallet.refreshWallet({});
-		utxoA = injectUtxo(wallet, TXID_A, 60000);
-		utxoB = injectUtxo(wallet, TXID_B, 40000, 1);
+		utxoA = await injectUtxo(wallet, TXID_A, 60000);
+		utxoB = await injectUtxo(wallet, TXID_B, 40000, 1);
 		// The pair a scan that found both coins would have stored.
 		await wallet.saveWalletData('utxos', wallet.data.utxos);
 		await wallet.saveWalletData('balance', wallet.data.balance);

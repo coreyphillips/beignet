@@ -1,5 +1,6 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import type { Wallet } from '../wallet';
+import { liveWalletData } from '../wallet/live-data';
 import type { SqliteStorage } from '../lightning/storage/sqlite-storage';
 import type { BeignetErrorCodeValue } from './errors';
 import { BeignetError } from './errors';
@@ -335,7 +336,7 @@ export class OnchainSweeps {
 	private resolveInputs(record: SweepRecord) {
 		const wallet = this.deps.wallet;
 		return record.request.inputOutpoints.map((point) => {
-			const input = wallet.data.utxos.find(
+			const input = liveWalletData(wallet).utxos.find(
 				(coin) => coin.tx_hash === point.txid && coin.tx_pos === point.vout
 			);
 			if (!input)

@@ -13,6 +13,7 @@ import sinon from 'sinon';
 import tls from 'tls';
 
 import {
+	createMemoryStorage,
 	EAddressType,
 	EAvailableNetworks,
 	EPaymentType,
@@ -21,9 +22,8 @@ import {
 	IAddress,
 	IFormattedTransaction,
 	IWalletData,
-	ok,
+	IWalletStorage,
 	Result,
-	TStorage,
 	TTxDetails,
 	Wallet
 } from '../../src';
@@ -38,7 +38,8 @@ const MNEMONIC =
 const NAME = 'recordinputs';
 const NETWORK = EAvailableNetworks.regtest;
 
-// Unreachable on purpose: this test must work offline.
+// Unreachable on purpose: this test must work offline. Not remainOffline,
+// which refuses each request before it reaches the fake server.
 const electrumOptions = {
 	net,
 	tls,
@@ -142,23 +143,22 @@ type TBatch<T> = { key: string; data: T[] };
 describe('stored transaction inputs (#1662)', function () {
 	this.timeout(60000);
 
-	let store: Map<string, unknown>;
+	let store: Map<string, string>;
 	let writes: { key: string; value: unknown }[];
 	let wallet: Wallet | undefined;
 
-	const storage: TStorage = {
-		getData: async <K extends keyof IWalletData>(
-			key: string
-		): Promise<Result<IWalletData[K]>> =>
-			ok(copy(store.get(key)) as IWalletData[K]),
-		setData: async <K extends keyof IWalletData>(
-			key: string,
-			value: IWalletData[K]
-		): Promise<Result<boolean>> => {
-			writes.push({ key, value: copy(value) });
-			store.set(key, copy(value));
-			return ok(true);
-		}
+	/** Saves into store and records each write. */
+	const storage = (): IWalletStorage => {
+		// No setTransactionChanges: the wallet then saves each transaction map
+		// whole through setData, where the writes below record it.
+		const { getData, setData } = createMemoryStorage(store);
+		return {
+			getData,
+			setData: async (key, value): Promise<Result<boolean>> => {
+				writes.push({ key, value: copy(value) });
+				return setData(key, value);
+			}
+		};
 	};
 
 	const key = (field: keyof IWalletData): string =>
@@ -177,7 +177,7 @@ describe('stored transaction inputs (#1662)', function () {
 			electrumOptions,
 			// The test drives the refresh itself; nothing may scan behind it.
 			disableRefreshOnCreate: true,
-			storage
+			storage: storage()
 		});
 		if (res.isErr()) throw res.error;
 		res.value.electrum.stopConnectionPolling();
@@ -203,8 +203,14 @@ describe('stored transaction inputs (#1662)', function () {
 			addressType: EAddressType.p2wpkh
 		});
 		if (gen.isErr()) throw gen.error;
-		wallet.data.addresses.p2wpkh = gen.value.addresses;
-		wallet.data.changeAddresses.p2wpkh = gen.value.changeAddresses;
+		const stored = await wallet.updateData({
+			addresses: { ...wallet.data.addresses, p2wpkh: gen.value.addresses },
+			changeAddresses: {
+				...wallet.data.changeAddresses,
+				p2wpkh: gen.value.changeAddresses
+			}
+		});
+		if (stored.isErr()) throw stored.error;
 		const receive = Object.values(gen.value.addresses)[0] as IAddress;
 
 		const transactions: Record<string, TTxDetails> = {
@@ -280,8 +286,11 @@ describe('stored transaction inputs (#1662)', function () {
 			[T]: untrimmedRecord(T, [spending(P, 0), spending(P, 1)]),
 			[C]: untrimmedRecord(C, [coinbase()])
 		};
-		store.set(key('transactions'), copy(transactions));
-		store.set(key('unconfirmedTransactions'), { [T]: copy(transactions[T]) });
+		store.set(key('transactions'), JSON.stringify(transactions));
+		store.set(
+			key('unconfirmedTransactions'),
+			JSON.stringify({ [T]: transactions[T] })
+		);
 
 		wallet = await openWallet();
 		const trimmedT = [
@@ -302,7 +311,7 @@ describe('stored transaction inputs (#1662)', function () {
 		expect(writesTo('transactions')).to.have.length(1);
 		expect(writesTo('unconfirmedTransactions')).to.have.length(1);
 		for (const field of ['transactions', 'unconfirmedTransactions'] as const) {
-			const json = JSON.stringify(store.get(key(field)));
+			const json = store.get(key(field));
 			expect(json, field).to.not.include('scriptSig');
 			expect(json, field).to.not.include('txinwitness');
 		}

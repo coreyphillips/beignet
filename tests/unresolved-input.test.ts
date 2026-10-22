@@ -10,7 +10,7 @@
  * transactionReceived. Nothing rewrites a confirmed record, so it could stay
  * that way. The trigger is a server too busy to answer the lookup twice.
  *
- * Fully OFFLINE: the wallet points at an unreachable port and every Electrum
+ * Fully OFFLINE: the wallet is created with remainOffline and every Electrum
  * call a refresh makes is stubbed, so this asserts on what the wallet does
  * with each answer the prevout lookup can get.
  */
@@ -24,7 +24,6 @@ import {
 	EAddressType,
 	EAvailableNetworks,
 	EPaymentType,
-	EProtocol,
 	IAddress,
 	IFormattedTransaction,
 	IGetAddressHistoryResponse,
@@ -45,17 +44,8 @@ import {
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+// The wallet is created with remainOffline: this test must work offline.
+const electrumOptions = { net, tls };
 
 /** P: pays 0.5 BTC to the wallet's receive address. */
 const P = '1a'.repeat(32);
@@ -130,6 +120,7 @@ describe('a transaction whose inputs could not all be looked up (issue #965)', f
 			network: EAvailableNetworks.regtest,
 			addressType: EAddressType.p2wpkh,
 			electrumOptions,
+			remainOffline: true,
 			feeEstimationSource: 'electrum',
 			// This suite drives the refresh itself; nothing may scan behind it.
 			disableRefreshOnCreate: true,
@@ -153,9 +144,17 @@ describe('a transaction whose inputs could not all be looked up (issue #965)', f
 			addressType: EAddressType.p2wpkh
 		});
 		if (gen.isErr()) throw gen.error;
-		wallet.data.addresses[EAddressType.p2wpkh] = gen.value.addresses;
-		wallet.data.changeAddresses[EAddressType.p2wpkh] =
-			gen.value.changeAddresses;
+		const stored = await wallet.updateData({
+			addresses: {
+				...wallet.data.addresses,
+				[EAddressType.p2wpkh]: gen.value.addresses
+			},
+			changeAddresses: {
+				...wallet.data.changeAddresses,
+				[EAddressType.p2wpkh]: gen.value.changeAddresses
+			}
+		});
+		if (stored.isErr()) throw stored.error;
 		const byIndex = (book: Record<string, IAddress>, i: number): IAddress =>
 			Object.values(book).find((a) => a.index === i) as IAddress;
 		A = byIndex(gen.value.addresses, 0);
@@ -165,7 +164,6 @@ describe('a transaction whose inputs could not all be looked up (issue #965)', f
 
 	afterEach(async function () {
 		sinon.restore();
-		// Every Electrum instance polls its connection until stopped.
 		await wallet?.stop();
 	});
 

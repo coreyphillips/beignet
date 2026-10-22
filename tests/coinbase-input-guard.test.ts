@@ -13,30 +13,20 @@
  *
  * Offline-proof: regtest network (no public Electrum peer lists), the
  * 'electrum' fee source (no Blocktank/mempool.space HTTP), the create-time
- * refresh disabled, and an unreachable local server.
+ * refresh disabled, and remainOffline, so the wallet never connects.
  */
 
 import { expect } from 'chai';
 import net from 'net';
 import tls from 'tls';
-import { EAvailableNetworks, EProtocol, Wallet } from '../src';
+import { EAvailableNetworks, Wallet } from '../src';
 import { ICoinbaseVin, ITransaction, IUtxo } from '../src/types/wallet';
 import { TTxDetails } from '../src/types/wallet';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 describe('Coinbase transaction handling (issue #548)', function () {
 	this.timeout(30_000);
@@ -50,7 +40,8 @@ describe('Coinbase transaction handling (issue #548)', function () {
 			feeEstimationSource: 'electrum',
 			disableMessagesOnCreate: true,
 			disableRefreshOnCreate: true,
-			electrumOptions
+			electrumOptions,
+			remainOffline: true
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
@@ -72,8 +63,9 @@ describe('Coinbase transaction handling (issue #548)', function () {
 			}
 		];
 		const res = await wallet.getInputData({ inputs: coinbaseShaped });
-		// Unfiltered, these would go to the (unreachable) server and fail;
-		// filtered, there is nothing to fetch and the result is an empty ok.
+		// Unfiltered, these would reach Electrum, which refuses every request
+		// offline, and fail; filtered, there is nothing to fetch and the result
+		// is an empty ok.
 		expect(res.isOk(), res.isErr() ? res.error.message : 'ok').to.equal(true);
 		if (res.isOk()) {
 			expect(Object.keys(res.value)).to.have.length(0);
