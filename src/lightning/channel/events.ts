@@ -4,7 +4,7 @@ import type { FforState, IFforEpochRecord } from '../ffor/types';
 import type { ILeaseRates } from '../gossip/types';
 import type { MessageType } from '../message/types';
 import type { Channel } from './channel';
-import type { IChannelPersistEvent } from './channel-actions';
+import type { ChannelErrorCode, IChannelPersistEvent } from './channel-actions';
 import type { IAbandonedLocalAdd } from './channel-state';
 
 /**
@@ -284,5 +284,9 @@ export interface ChannelManagerEvents {
 	 * 'error' with no listener, so code that drives a ChannelManager directly
 	 * should attach one.
 	 */
-	error: (channelId: Buffer | null, message: string) => void;
+	error: (
+		channelId: Buffer | null,
+		message: string,
+		code?: ChannelErrorCode
+	) => void;
 }

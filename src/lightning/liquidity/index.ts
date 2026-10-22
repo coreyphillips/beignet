@@ -1,5 +1,7 @@
 export {
 	JIT_INTERCEPT_SCID_BLOCK,
+	JitReceiveError,
+	JitReceiveErrorCode,
 	JitReceiveManager,
 	decodeJitAck,
 	decodeJitAuthorization,

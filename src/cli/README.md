@@ -127,7 +127,7 @@ await node.destroy();
 | `rapidGossipSyncUrl?` | `string` | Rapid Gossip Sync snapshot URL (defaults to the public LDK endpoint). |
 | `eagerGossipVerify?` | `boolean` | Signature-verify foreign broadcast gossip at intake (default false). By default verification is deferred until a gossip query asks for an entry, which skips nearly the whole first-dump verification cost; nothing unverified is ever served either way. Set true on relay-class nodes that serve the graph: intake and restore verify eagerly and signatureless RGS-primed entries are re-fetched signed from peers. |
 | `deferGraphRestore?` | `boolean` | Bring back the stored network map in time slices after create() returns, rather than inside it (default false). For a node that runs on an app's only JavaScript thread, as a phone wallet's does: a large map otherwise holds that thread for seconds as the wallet opens. Until it is back, payments, rebalances and channel suggestions wait for it, a synchronous route query (estimateRouteFee, probeRoute, queryRoute, quotePayAll) finishes it first, gossip that would write the graph and the boot RGS import wait for it, and getGraphInfo() says `restoring`. The waits are skipped while no restore runs, so a node that restores inline sees no change. getGraphRestoreStats() is null until then, and `graph:restored` reports it. |
-| `onError?` | `(error: { code: string; message: string; timestamp: number; channelId?: string; txid?: string; retained?: boolean }) => void` | Optional error callback — receives all node:error events instead of silently absorbing them |
+| `onError?` | `(error: { code: string; message: string; timestamp: number; channelId?: string; txid?: string; retained?: boolean; channelErrorCode?: ChannelErrorCode }) => void` | Optional error callback — receives all node:error events instead of silently absorbing them |
 | `logLevel?` | `LogLevel` | Log level (default 'info'). Set to 'silent' to suppress. |
 | `logger?` | `ILogger` | Leveled diagnostic logger. When set, every log entry that passes logLevel is forwarded to it (in addition to the 'log' event) and it is injected into the underlying Wallet and LightningNode. When unset, behavior is unchanged: BeignetNode only emits 'log' events and the wallet keeps its default console output. |
 | `electrumServers?` | `Array<{ host: string; port: number; tls?: boolean }>` | Multiple Electrum servers for failover redundancy |
@@ -957,7 +957,7 @@ The table is generated from `BeignetNodeEvents` by `npm run docs:tables`. The SS
 | `peer:connect` | `(data: { pubkey: string })` | yes | A peer connected. |
 | `peer:disconnect` | `(data: { pubkey: string })` | yes | A peer disconnected. |
 | `peer:error` | `(data: { pubkey: string; message: string })` | no | A peer connection reported an error. |
-| `node:error` | `(data: { code: string; message: string; timestamp: number; channelId?: string; txid?: string; retained?: boolean })` | yes | An operational error (non-fatal), also passed to the onError option. `code` is a NodeErrorCode or one BeignetNode raises itself, such as ELECTRUM_FAILOVER_FAILED. |
+| `node:error` | `(data: { code: string; message: string; timestamp: number; channelId?: string; txid?: string; retained?: boolean; channelErrorCode?: ChannelErrorCode })` | yes | An operational error (non-fatal), also passed to the onError option. `code` is a NodeErrorCode or one BeignetNode raises itself, such as ELECTRUM_FAILOVER_FAILED. |
 | `node:ready` | `()` | yes | The node is fully operational: peers reconnected and channels restored. |
 | `graph:restored` | `(stats: IGraphRestoreStats)` | no | A deferred restore of the stored network map (deferGraphRestore) ended: how it went, as getGraphRestoreStats() returns it. An inline restore ends inside create(), before anyone can listen, so it is read from the getter instead. |
 | `gossip:synced` | `(data: { channelsAdded: number; updatesApplied: number; downloadMs: number; applyMs: number; busyMs: number; slices: number })` | no | A Rapid Gossip Sync snapshot was downloaded and applied. downloadMs is the fetch; applyMs is the import from start to finish, of which busyMs was spent applying, in `slices` turns of the event loop (the rest went to other work between slices). |
@@ -1514,6 +1514,14 @@ source: `POST /channel/close` and `POST /channel/forceclose` answer **400
 `INVALID_PARAMS`** for a malformed channel id and **404 `CHANNEL_NOT_FOUND`**
 for a channel the node does not hold, so a 500 from either now means a channel
 that exists and would not close.
+
+The table lists the common codes. `BeignetError.code` is typed
+`BeignetErrorCodeValue`, a closed union of every `BeignetErrorCode` string, so a
+`switch` over it can be exhaustive and the enum is the whole vocabulary the
+daemon answers with, recovery, sweep, receive, L402 and direct-funding codes
+included. `isBeignetErrorCode(value)` checks a code read off a response.
+`BeignetError` extends `CodedError`, the base every coded error in the library
+shares.
 
 **Retryability is one decision, not two.** Every code answered with 502, 503 or
 504 is one `isRetryableError()` returns true for, and a test walks the status map

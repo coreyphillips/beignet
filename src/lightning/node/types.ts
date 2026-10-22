@@ -9,6 +9,8 @@
 import { IRoutingHintHop, Network } from '../invoice/types';
 import { IBolt12Invoice } from '../offer/types';
 import { IChannelConfig, ChannelState } from '../channel/types';
+import type { ChannelErrorCode } from '../channel/channel-actions';
+import { CodedError } from '../../utils/errors';
 import { IChannelBasepoints } from '../keys/derivation';
 import { IRoute, INodeAddress, IChannelUpdateMessage } from '../gossip/types';
 import { FeatureFlags } from '../features/flags';
@@ -1364,6 +1366,12 @@ export interface ILightningError<C extends string = string> {
 	 * close, a sweep) or the transaction is not one this node tracks.
 	 */
 	retained?: boolean;
+	/**
+	 * Why the channel refused, on CHANNEL_ERROR, CLOSE_CHANNEL_FAILED and
+	 * UPDATE_FEE_FAILED when the refusing arm said so. Absent on refusals not
+	 * yet classified.
+	 */
+	channelErrorCode?: ChannelErrorCode;
 }
 
 export interface IPaymentPart {
@@ -1714,13 +1722,10 @@ export interface IKeysendOptions {
  * Typed error for Lightning payment failures.
  * Extends Error for backward compatibility with existing catch blocks.
  */
-export class LightningPaymentError extends Error {
-	code: LightningErrorCode;
-
+export class LightningPaymentError extends CodedError<LightningErrorCode> {
 	constructor(code: LightningErrorCode, message: string) {
-		super(message);
+		super(code, message);
 		this.name = 'LightningPaymentError';
-		this.code = code;
 	}
 }
 
@@ -1791,13 +1796,10 @@ export enum ChannelFundingUnavailableCode {
  * untyped throw to a generic 500. The sibling for argument refusals is
  * InvalidChannelOpenError; node faults stay untyped and keep scrubbing.
  */
-export class ChannelFundingUnavailableError extends Error {
-	code: ChannelFundingUnavailableCode;
-
+export class ChannelFundingUnavailableError extends CodedError<ChannelFundingUnavailableCode> {
 	constructor(code: ChannelFundingUnavailableCode, message: string) {
-		super(message);
+		super(code, message);
 		this.name = 'ChannelFundingUnavailableError';
-		this.code = code;
 	}
 }
 

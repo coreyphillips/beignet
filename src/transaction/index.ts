@@ -18,6 +18,7 @@ import {
 	Result,
 	ok,
 	err,
+	EWalletErrorCode,
 	validateTransaction,
 	getTapRootAddressFromPublicKey,
 	isP2trPrefix
@@ -1007,12 +1008,12 @@ export class Transaction {
 		}
 
 		const validateRes = validateTransaction(transaction);
-		if (validateRes.isErr()) return err(validateRes.error.message);
+		if (validateRes.isErr()) return err(validateRes.error);
 
 		try {
 			const bip32InterfaceRes = await this._wallet.getBip32Interface();
 			if (bip32InterfaceRes.isErr()) {
-				return err(bip32InterfaceRes.error.message);
+				return err(bip32InterfaceRes.error);
 			}
 			// The build fills it and the signer reads it, so each input's key is
 			// derived once.
@@ -1145,7 +1146,7 @@ export class Transaction {
 						publicKey: keyPair.publicKey,
 						network: getBitcoinJsNetwork(this._wallet.network)
 					});
-					if (tapRootAddress.isErr()) return err(tapRootAddress.error.message);
+					if (tapRootAddress.isErr()) return err(tapRootAddress.error);
 					const childNodeXOnlyPubkey = tapRootAddress.value.internalPubkey;
 					const tweakedChildNode = keyPair.tweak(
 						bitcoin.crypto.taggedHash('TapTweak', childNodeXOnlyPubkey)
@@ -1231,7 +1232,7 @@ export class Transaction {
 			const diffValue = balance - (outputValue + fee);
 			const changeAddressRes = await this._wallet.getChangeAddress();
 			if (changeAddressRes.isErr()) {
-				return err(changeAddressRes.error.message);
+				return err(changeAddressRes.error);
 			}
 			if (diffValue >= getDustThreshold(changeAddressRes.value.address)) {
 				changeAddress = changeAddressRes.value.address;
@@ -1259,7 +1260,7 @@ export class Transaction {
 		if (!bip32Interface && !this._wallet.isWatchOnly) {
 			const bip32InterfaceRes = await this._wallet.getBip32Interface();
 			if (bip32InterfaceRes.isErr()) {
-				return err(bip32InterfaceRes.error.message);
+				return err(bip32InterfaceRes.error);
 			}
 			bip32Interface = bip32InterfaceRes.value;
 		}
@@ -1275,7 +1276,7 @@ export class Transaction {
 					// Multisig inputs are built from the sortedmulti script, not a
 					// single key pair (watch-only multisig has no derivable key).
 					const addRes = await this.addInput({ psbt, input, prevTxs });
-					if (addRes.isErr()) return err(addRes.error.message);
+					if (addRes.isErr()) return err(addRes.error);
 					continue;
 				}
 				let keyPair: BIP32Interface | ECPairInterface | undefined =
@@ -1286,7 +1287,7 @@ export class Transaction {
 					} else {
 						const publicNodeRes = this._wallet.derivePublicNode(input.path);
 						if (publicNodeRes.isErr()) {
-							return err(publicNodeRes.error.message);
+							return err(publicNodeRes.error);
 						}
 						keyPair = publicNodeRes.value;
 					}
@@ -1300,7 +1301,7 @@ export class Transaction {
 					input,
 					prevTxs
 				});
-				if (addRes.isErr()) return err(addRes.error.message);
+				if (addRes.isErr()) return err(addRes.error);
 			}
 		} catch (e) {
 			return err(e);
@@ -1374,7 +1375,7 @@ export class Transaction {
 		}
 
 		const validateRes = validateTransaction(transactionData);
-		if (validateRes.isErr()) return err(validateRes.error.message);
+		if (validateRes.isErr()) return err(validateRes.error);
 
 		try {
 			const psbtRes = await this.createPsbtFromTransactionData({
@@ -1387,9 +1388,9 @@ export class Transaction {
 				psbt,
 				inputs: transactionData.inputs
 			});
-			if (metadataRes.isErr()) return err(metadataRes.error.message);
+			if (metadataRes.isErr()) return err(metadataRes.error);
 			const changeRes = await this.addChangeOutputMetadata(psbt);
-			if (changeRes.isErr()) return err(changeRes.error.message);
+			if (changeRes.isErr()) return err(changeRes.error);
 			// A coin frozen since staging, or during the awaits above, must not
 			// reach an external signer. No await may sit between this and return.
 			if (!spendFrozen) {
@@ -1433,7 +1434,7 @@ export class Transaction {
 			// holds it.
 			for (const type of this._wallet.addressTypesToMonitor) {
 				const fallbackRes = await this._wallet.getChangeAddress(type);
-				if (fallbackRes.isErr()) return err(fallbackRes.error.message);
+				if (fallbackRes.isErr()) return err(fallbackRes.error);
 				changePaths.set(fallbackRes.value.address, fallbackRes.value.path);
 			}
 			const network = getBitcoinJsNetwork(this._wallet.network);
@@ -1598,7 +1599,7 @@ export class Transaction {
 		if (!txHashes.length) return ok(hexes);
 		try {
 			const res = await this._wallet.electrum.getTransactions({ txHashes });
-			if (res.isErr()) return err(res.error.message);
+			if (res.isErr()) return err(res.error);
 			for (const { data, result } of res.value.data) {
 				if (data?.tx_hash && result?.hex) hexes.set(data.tx_hash, result.hex);
 			}
@@ -1631,7 +1632,7 @@ export class Transaction {
 		const hex = prevTxs.value.get(input.tx_hash);
 		if (!hex) return ok({});
 		const prevTxRes = this.checkPrevTx({ hex, input, script });
-		if (prevTxRes.isErr()) return err(prevTxRes.error.message);
+		if (prevTxRes.isErr()) return err(prevTxRes.error);
 		return ok({ nonWitnessUtxo: prevTxRes.value });
 	}
 
@@ -1708,7 +1709,7 @@ export class Transaction {
 				// Sorted-multisig input: the witnessScript comes from the wallet's
 				// multisig configuration, keyed by the input's BIP 48 path.
 				const paymentRes = this._wallet.getMultisigPayment(input.path);
-				if (paymentRes.isErr()) return err(paymentRes.error.message);
+				if (paymentRes.isErr()) return err(paymentRes.error);
 				const { address, output, witnessScript } = paymentRes.value;
 				if (address !== input.address) {
 					return err(
@@ -1716,7 +1717,7 @@ export class Transaction {
 					);
 				}
 				const prevTxRes = this.nonWitnessUtxoField(input, output, prevTxs);
-				if (prevTxRes.isErr()) return err(prevTxRes.error.message);
+				if (prevTxRes.isErr()) return err(prevTxRes.error);
 				psbt.addInput({
 					hash: input.tx_hash,
 					index: input.tx_pos,
@@ -1747,7 +1748,7 @@ export class Transaction {
 					p2wpkh.output,
 					prevTxs
 				);
-				if (prevTxRes.isErr()) return err(prevTxRes.error.message);
+				if (prevTxRes.isErr()) return err(prevTxRes.error);
 				psbt.addInput({
 					hash: input.tx_hash,
 					index: input.tx_pos,
@@ -1772,7 +1773,7 @@ export class Transaction {
 					return err('p2sh.redeem.output is undefined.');
 				}
 				const prevTxRes = this.nonWitnessUtxoField(input, p2sh.output, prevTxs);
-				if (prevTxRes.isErr()) return err(prevTxRes.error.message);
+				if (prevTxRes.isErr()) return err(prevTxRes.error);
 				psbt.addInput({
 					hash: input.tx_hash,
 					index: input.tx_pos,
@@ -1793,7 +1794,7 @@ export class Transaction {
 				if (!p2pkh?.output) {
 					return err('p2pkh.output is undefined.');
 				}
-				if (prevTxs.isErr()) return err(prevTxs.error.message);
+				if (prevTxs.isErr()) return err(prevTxs.error);
 				const hex = prevTxs.value.get(input.tx_hash);
 				if (!hex) {
 					return err(
@@ -1805,7 +1806,7 @@ export class Transaction {
 					input,
 					script: p2pkh.output
 				});
-				if (prevTxRes.isErr()) return err(prevTxRes.error.message);
+				if (prevTxRes.isErr()) return err(prevTxRes.error);
 				psbt.addInput({
 					hash: input.tx_hash,
 					index: input.tx_pos,
@@ -1816,7 +1817,7 @@ export class Transaction {
 			if (type === 'p2tr') {
 				if (!keyPair && input?.path) {
 					const bip32Interface = await this._wallet.getBip32Interface();
-					if (bip32Interface.isErr()) return err(bip32Interface.error.message);
+					if (bip32Interface.isErr()) return err(bip32Interface.error);
 					keyPair = bip32Interface.value.derivePath(input.path);
 				}
 				if (!keyPair) return err('No keyPair provided for p2tr input.');
@@ -1824,7 +1825,7 @@ export class Transaction {
 					publicKey: keyPair.publicKey,
 					network
 				});
-				if (p2trAddress.isErr()) return err(p2trAddress.error.message);
+				if (p2trAddress.isErr()) return err(p2trAddress.error);
 				psbt.addInput({
 					hash: input.tx_hash,
 					index: input.tx_pos,
@@ -1871,7 +1872,7 @@ export class Transaction {
 				inputs: _inputs
 			}
 		});
-		if (feeInfo.isErr()) return err(feeInfo.error.message);
+		if (feeInfo.isErr()) return err(feeInfo.error);
 		const feeUpdateRes = this.updateFee({
 			satsPerByte,
 			transaction: {
@@ -1879,13 +1880,13 @@ export class Transaction {
 				inputs: _inputs
 			}
 		});
-		if (feeUpdateRes.isErr()) return err(feeUpdateRes.error.message);
+		if (feeUpdateRes.isErr()) return err(feeUpdateRes.error);
 		const updateSendRes = this.updateSendTransaction({
 			transaction: {
 				inputs: _inputs
 			}
 		});
-		if (updateSendRes.isErr()) return err(updateSendRes.error.message);
+		if (updateSendRes.isErr()) return err(updateSendRes.error);
 		return ok(_inputs);
 	}
 
@@ -1909,7 +1910,7 @@ export class Transaction {
 		}
 		if (!this.data.inputs?.length) {
 			const setupRes = await this.setupTransaction();
-			if (setupRes.isErr()) return err(setupRes.error.message);
+			if (setupRes.isErr()) return err(setupRes.error);
 		}
 		return this.updateSendTransaction({
 			transaction: {
@@ -2012,6 +2013,7 @@ export class Transaction {
 			satsPerByte < transaction.minFee
 		) {
 			return err(
+				EWalletErrorCode.REPLACEMENT_FEE_TOO_LOW,
 				`A replacement needs at least ${transaction.minFee} sats/vbyte to outbid the original transaction.`
 			);
 		}
@@ -2041,6 +2043,7 @@ export class Transaction {
 		//Return if the new fee exceeds half of the user's input balance
 		if (newFee >= inputTotal / 2) {
 			return err(
+				EWalletErrorCode.FEE_EXCEEDS_HALF_INPUTS,
 				'Unable to increase the fee any further. Otherwise, it will exceed half the current input balance.'
 			);
 		}
@@ -2052,6 +2055,7 @@ export class Transaction {
 		//Return if the new fee exceeds half of the user's output amount
 		if (newFee >= totalTransactionValue / 2) {
 			return err(
+				EWalletErrorCode.FEE_EXCEEDS_HALF_OUTPUTS,
 				'Unable to increase the fee any further. Otherwise, it will exceed half the current sending/output amount.'
 			);
 		}
@@ -2111,7 +2115,7 @@ export class Transaction {
 			}
 			if (!transaction.inputs?.length) {
 				const setupRes = await this.setupTransaction({ rbf });
-				if (setupRes.isErr()) return err(setupRes.error.message);
+				if (setupRes.isErr()) return err(setupRes.error);
 				// Setup stages the inputs on a new _data, not on the transaction read
 				// above. Only the inputs are taken, since setup also resets the staged
 				// outputs and rate that the address and rate below fall back to.
@@ -2342,11 +2346,11 @@ export class Transaction {
 				rbf: this._wallet.rbf
 			});
 			if (setupTransactionRes.isErr()) {
-				return err(setupTransactionRes.error.message);
+				return err(setupTransactionRes.error);
 			}
 			const receiveAddress = await this._wallet.getReceiveAddress({});
 			if (receiveAddress.isErr()) {
-				return err(receiveAddress.error.message);
+				return err(receiveAddress.error);
 			}
 			const child = {
 				...this.data,
@@ -2410,7 +2414,7 @@ export class Transaction {
 				rbf: this._wallet.rbf
 			});
 			if (sendMaxRes.isErr()) {
-				return err(sendMaxRes.error.message);
+				return err(sendMaxRes.error);
 			}
 
 			this.updateSendTransaction({ transaction: { minFee } });
@@ -2436,14 +2440,14 @@ export class Transaction {
 				rbf: true
 			});
 			if (setupTransactionRes.isErr()) {
-				return err(setupTransactionRes.error.message);
+				return err(setupTransactionRes.error);
 			}
 
 			const response = await this._wallet.getRbfData({
 				txHash: { tx_hash: txid }
 			});
 			if (response.isErr()) {
-				return err(response.error.message);
+				return err(response.error);
 			}
 			const transaction = response.value;
 

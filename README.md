@@ -136,7 +136,9 @@ const utxos = wallet.listUtxos();
 const history = await wallet.getAddressHistory('bc1q...');
 ```
 
-Most fallible calls return a `Result<T>`: check `isErr()` before reading `.value`. A few do not, so check them differently:
+Most fallible calls return a `Result<T>`: check `isErr()` before reading `.value`. The error is a `CodedError`: branch on `error.code`, never on the message, which can be reworded. The code is an `EWalletErrorCode` (`UNSPECIFIED` when the failure has no code of its own), or the code of an error passed through unchanged, such as `WATCH_ONLY_CANNOT_SIGN` or a `BoostError`'s. `error.cause` holds the failure it wraps, when there is one.
+
+A few calls do not return a `Result`, so check them differently:
 
 - `getAddress()` resolves to `''` when it cannot derive an address.
 - `getFeeEstimates()` never errs. When its sources fail it returns the previous estimates or built-in defaults (fixed values on regtest).

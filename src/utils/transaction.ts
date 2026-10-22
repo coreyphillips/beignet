@@ -526,7 +526,7 @@ export const validateTransaction = (
 			value: 'value'
 		});
 		if (inputsReduce.isErr()) {
-			return err(inputsReduce.error.message);
+			return err(inputsReduce.error);
 		}
 		//Remove the change address from the outputs array, if any.
 		let filteredOutputs = outputs;
@@ -540,7 +540,7 @@ export const validateTransaction = (
 			value: 'value'
 		});
 		if (outputsReduce.isErr()) {
-			return err(outputsReduce.error.message);
+			return err(outputsReduce.error);
 		}
 
 		return ok('Transaction is valid.');

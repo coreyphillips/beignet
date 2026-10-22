@@ -25,6 +25,10 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { LnCoinType } from '../../src/lightning/keys/wallet-keys';
+import {
+	JitReceiveError,
+	JitReceiveErrorCode
+} from '../../src/lightning/liquidity/jit-receive';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 
@@ -74,12 +78,17 @@ describe('JIT invoice against the new-channel fence (issue #906)', () => {
 				node.getChannelManager().channelIndexTipFloorArmed,
 				'a birth boot arms the floor'
 			).to.equal(true);
-			const message = await rejection(
-				node.createJitInvoice({
+			const err = await node
+				.createJitInvoice({
 					lspPubkeyHex: LSP_PUBKEY,
 					amountMsat: 100_000_000n
 				})
+				.catch((e: unknown) => e);
+			expect(err).to.be.instanceOf(JitReceiveError);
+			expect((err as JitReceiveError).code).to.equal(
+				JitReceiveErrorCode.NEW_CHANNELS_REFUSED
 			);
+			const message = (err as Error).message;
 			expect(message).to.contain(
 				'JIT receive needs a new channel from the LSP'
 			);

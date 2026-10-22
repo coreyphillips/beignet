@@ -25,7 +25,10 @@ import {
 	DEFAULT_CHANNEL_CONFIG,
 	HtlcState
 } from '../../src/lightning/channel/types';
-import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import {
+	ChannelActionType,
+	ChannelErrorCode
+} from '../../src/lightning/channel/channel-actions';
 import { Channel as ChannelClass } from '../../src/lightning/channel/channel';
 import {
 	ChannelManager,
@@ -435,6 +438,8 @@ describe('Stuck forward re-drive loop', function () {
 
 			expect(result.ok).to.equal(false);
 			expect(result.error).to.contain('Insufficient balance for HTLC');
+			// The arm's code rides along with its message (issue #1689).
+			expect(result.code).to.equal(ChannelErrorCode.INSUFFICIENT_BALANCE);
 		});
 	});
 });

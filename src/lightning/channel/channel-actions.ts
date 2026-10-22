@@ -148,9 +148,45 @@ export interface IChannelClosedAction {
 	channelId: Buffer;
 }
 
+/**
+ * Why a channel refused, carried on its ERROR action so a caller can branch
+ * without reading the message. Set by the arm that refuses. The arms that
+ * serve a local request (an add, a fee update, a close, a splice, a
+ * quiescence, an open, an RBF) carry one; an arm that has not been classified
+ * yet, mostly a refusal of something the peer sent, leaves it absent.
+ */
+export enum ChannelErrorCode {
+	/** The channel's state does not allow the request. */
+	WRONG_STATE = 'WRONG_STATE',
+	/** A state that ends on its own holds the request off; set with `transient`. */
+	BUSY = 'BUSY',
+	/** The request's own values are out of range: amount, feerate, expiry, script. */
+	INVALID_PARAMS = 'INVALID_PARAMS',
+	/** The balance cannot cover the request once reserves and fees are paid. */
+	INSUFFICIENT_BALANCE = 'INSUFFICIENT_BALANCE',
+	/** A limit the peer set: HTLC count, value in flight, HTLC minimum, dust exposure. */
+	LIMIT_EXCEEDED = 'LIMIT_EXCEEDED',
+	/** Only the other side of the channel may do this, such as a fee update by the non-opener. */
+	NOT_PERMITTED = 'NOT_PERMITTED',
+	/** An FFOR epoch's rules refuse the request. */
+	FFOR_REFUSED = 'FFOR_REFUSED',
+	/**
+	 * The channel is held until the operator or the peer acts: its state cannot
+	 * be proven current, the peer has shown it is stale, or its funding
+	 * transaction is missing.
+	 */
+	HELD = 'HELD',
+	/** The channel type or negotiated features do not support the request. */
+	UNSUPPORTED = 'UNSUPPORTED',
+	/** A v2 open the opener's wallet could not fund. */
+	OPEN_NOT_FUNDED = 'OPEN_NOT_FUNDED'
+}
+
 export interface IErrorAction {
 	type: ChannelActionType.ERROR;
 	message: string;
+	/** Why the channel refused; see ChannelErrorCode. */
+	code?: ChannelErrorCode;
 	/**
 	 * What the dispatcher should do with this channel's registration.
 	 *

@@ -20,9 +20,12 @@ import { payments, networks } from 'bitcoinjs-lib';
 import { bech32m } from 'bech32';
 
 import {
+	CodedError,
 	EAddressType,
 	EAvailableNetworks,
+	EBoostType,
 	EProtocol,
+	EWalletErrorCode,
 	getDataFallback,
 	getDustThreshold,
 	ISendTransaction,
@@ -148,7 +151,9 @@ describe('send path result handling', function () {
 				.stub(wallet.transaction, 'updateSendTransaction')
 				.callsFake((): Result<string> => {
 					calls++;
-					return calls === 2 ? err('output rejected') : ok('updated');
+					return calls === 2
+						? err('OUTPUT_REJECTED', 'output rejected')
+						: ok('updated');
 				});
 
 			const res = await wallet.sendMany({
@@ -164,6 +169,8 @@ describe('send path result handling', function () {
 			expect(res.isErr(), 'the send reported the failed output').to.equal(true);
 			if (res.isErr()) {
 				expect(res.error.message).to.equal('output rejected');
+				// Passed through, not rebuilt from its message.
+				expect(res.error.code).to.equal('OUTPUT_REJECTED');
 			}
 			expect(calls, 'the loop stopped on the failed output').to.equal(2);
 			expect(create.called, 'no transaction was built').to.equal(false);
@@ -179,6 +186,7 @@ describe('send path result handling', function () {
 				.stub(wallet.transaction, 'updateFee')
 				.returns(
 					err(
+						EWalletErrorCode.FEE_EXCEEDS_HALF_INPUTS,
 						'Unable to increase the fee any further. Otherwise, it will exceed half the current input balance.'
 					)
 				);
@@ -197,9 +205,131 @@ describe('send path result handling', function () {
 			);
 			if (res.isErr()) {
 				expect(res.error.message).to.contain('Unable to increase the fee');
+				expect(res.error.code).to.equal(
+					EWalletErrorCode.FEE_EXCEEDS_HALF_INPUTS
+				);
 			}
 			expect(create.called, 'no transaction was built').to.equal(false);
 			expect(broadcast.called, 'nothing was broadcast').to.equal(false);
+		});
+
+		[
+			EWalletErrorCode.FEE_EXCEEDS_HALF_INPUTS,
+			EWalletErrorCode.FEE_EXCEEDS_HALF_OUTPUTS
+		].forEach((code) => {
+			it(`names the maximum fee for ${code}, keeping the code`, async function () {
+				const { create, broadcast } = stubDownstream();
+				sinon
+					.stub(wallet.transaction, 'updateSendTransaction')
+					.returns(ok('updated'));
+				const refusal = err<{ fee: number }>(code, 'refused');
+				sinon.stub(wallet.transaction, 'updateFee').returns(refusal);
+				sinon.stub(wallet, 'getFeeInfo').returns(ok({ maxSatPerByte: 7 }));
+
+				const res = await wallet.sendMany({
+					txs: [{ address, amount: 10000 }],
+					satsPerByte: 2,
+					shuffleOutputs: false
+				});
+
+				expect(res.isErr()).to.equal(true);
+				if (res.isErr() && refusal.isErr()) {
+					expect(res.error.message).to.equal(
+						'Fee is too high. The maximum fee for this transaction is 7'
+					);
+					expect(res.error.code).to.equal(code);
+					expect(res.error.cause).to.equal(refusal.error);
+				}
+				expect(create.called).to.equal(false);
+				expect(broadcast.called).to.equal(false);
+			});
+		});
+
+		it('reads the code, not the words, of a fee refusal', async function () {
+			const { create } = stubDownstream();
+			sinon
+				.stub(wallet.transaction, 'updateSendTransaction')
+				.returns(ok('updated'));
+			// The old prefix match would have turned this into "Fee is too high".
+			const words =
+				'Unable to increase the fee any further. Otherwise, it will exceed half the current input balance.';
+			sinon.stub(wallet.transaction, 'updateFee').returns(err(words));
+			const probe = sinon.stub(wallet, 'getFeeInfo');
+
+			const res = await wallet.sendMany({
+				txs: [{ address, amount: 10000 }],
+				satsPerByte: 2,
+				shuffleOutputs: false
+			});
+
+			expect(res.isErr()).to.equal(true);
+			if (res.isErr()) {
+				expect(res.error.message).to.equal(words);
+				expect(res.error.code).to.equal(EWalletErrorCode.UNSPECIFIED);
+			}
+			expect(probe.called, 'no fee probe for an uncoded refusal').to.equal(
+				false
+			);
+			expect(create.called).to.equal(false);
+		});
+	});
+
+	describe('updateFee refusal codes', function () {
+		const stage = async (
+			inputValue: number,
+			outputValue: number
+		): Promise<void> => {
+			await wallet.transaction.resetSendTransaction();
+			const staged = wallet.transaction.updateSendTransaction({
+				transaction: {
+					inputs: [utxo(inputValue)],
+					outputs: [{ address, value: outputValue, index: 0 }],
+					changeAddress: address
+				}
+			});
+			if (staged.isErr()) throw staged.error;
+		};
+
+		it('FEE_EXCEEDS_HALF_INPUTS when the fee would take half the inputs', async function () {
+			await stage(2000, 1000);
+			const res = wallet.transaction.updateFee({ satsPerByte: 100 });
+			expect(res.isErr()).to.equal(true);
+			if (res.isErr()) {
+				expect(res.error.code).to.equal(
+					EWalletErrorCode.FEE_EXCEEDS_HALF_INPUTS
+				);
+				expect(res.error.message).to.contain('half the current input balance');
+			}
+		});
+
+		it('FEE_EXCEEDS_HALF_OUTPUTS when the fee would take half the payment', async function () {
+			await stage(100000, 1000);
+			const res = wallet.transaction.updateFee({ satsPerByte: 10 });
+			expect(res.isErr()).to.equal(true);
+			if (res.isErr()) {
+				expect(res.error.code).to.equal(
+					EWalletErrorCode.FEE_EXCEEDS_HALF_OUTPUTS
+				);
+				expect(res.error.message).to.contain('sending/output amount');
+			}
+		});
+
+		it('REPLACEMENT_FEE_TOO_LOW under the rate that outbids the original', function () {
+			const res = wallet.transaction.updateFee({
+				satsPerByte: 5,
+				transaction: {
+					...getDefaultSendTransaction(),
+					boostType: EBoostType.rbf,
+					minFee: 10
+				}
+			});
+			expect(res.isErr()).to.equal(true);
+			if (res.isErr()) {
+				expect(res.error.code).to.equal(
+					EWalletErrorCode.REPLACEMENT_FEE_TOO_LOW
+				);
+				expect(res.error).to.be.instanceOf(CodedError);
+			}
 		});
 	});
 

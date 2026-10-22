@@ -2033,7 +2033,7 @@ export class Electrum {
 			if (response && !response.error) {
 				return ok(response);
 			} else {
-				if (response?.error?.message) return err(response.error.message);
+				if (response?.error?.message) return err(response.error);
 				return err(response ?? 'Unable to get transactions from inputs.');
 			}
 		} catch (e) {
@@ -2186,7 +2186,7 @@ export class Electrum {
 		this._tipUnverified = false;
 		if (!reorgDetected) return ok('Header stored.');
 		const reconciled = await this._wallet.checkUnconfirmedTransactions(true);
-		if (reconciled.isErr()) return err(reconciled.error.message);
+		if (reconciled.isErr()) return err(reconciled.error);
 		this._reorgOwed = false;
 		return ok('Header stored and reconciled.');
 	}

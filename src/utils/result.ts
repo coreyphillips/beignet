@@ -1,3 +1,5 @@
+import { CodedError, EWalletErrorCode } from './errors';
+
 /**
  * Represents a result that can be successful (Ok) or contain an error (Err).
  */
@@ -31,14 +33,14 @@ class Ok<T> {
 }
 
 /**
- * Represents an error result containing an error message.
+ * Represents an error result. Its error always has a `code` to branch on.
  */
 class Err<T> {
 	/**
 	 * Constructs an Err result containing the given error.
 	 * @param error - The error contained in the result.
 	 */
-	public constructor(public readonly error: Error) {}
+	public constructor(public readonly error: CodedError) {}
 
 	/**
 	 * Checks if the result is of type Ok.
@@ -66,12 +68,44 @@ export const ok = <T>(value: T): Ok<T> => new Ok(value);
 
 /**
  * Construct a new Err result value.
- * @param error - The error message or Error object to be wrapped in an Err result.
- * @returns An Err result containing the given error.
+ *
+ * `err(code, message, cause)` names the failure. `err(message)` carries
+ * UNSPECIFIED. `err(error)` returns a CodedError as it is and wraps any other
+ * error in one with the same message, keeping that error's own string code if
+ * it has one, and the error itself as the cause.
+ * @returns An Err result containing the error.
  */
-export const err = <T>(error: Error | string): Err<T> => {
-	if (typeof error === 'string') {
-		return new Err(new Error(error));
+export function err<T>(code: string, message: string, cause?: unknown): Err<T>;
+export function err<T>(error: Error | string): Err<T>;
+export function err<T>(
+	error: Error | string,
+	message?: string,
+	cause?: unknown
+): Err<T> {
+	if (message !== undefined) {
+		return new Err(
+			new CodedError(
+				error as string,
+				message,
+				cause === undefined ? undefined : { cause }
+			)
+		);
 	}
-	return new Err(error);
-};
+	if (typeof error === 'string') {
+		return new Err(new CodedError(EWalletErrorCode.UNSPECIFIED, error));
+	}
+	if (error instanceof CodedError) return new Err(error);
+	// Not every caller passes a real Error: a catch hands over whatever was
+	// thrown, and Electrum rejects with plain objects.
+	const { code, message: text } = (error ?? {}) as {
+		code?: unknown;
+		message?: unknown;
+	};
+	return new Err(
+		new CodedError(
+			typeof code === 'string' ? code : EWalletErrorCode.UNSPECIFIED,
+			typeof text === 'string' ? text : String(error),
+			{ cause: error }
+		)
+	);
+}

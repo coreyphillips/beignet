@@ -734,7 +734,12 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 
 		it('a synchronous engine throw leaves nothing claimed, on every path', async () => {
 			const invoice = invoiceFrom(1_000, 'refused');
-			stubSendPayment(node, { throws: new Error('No route found') });
+			const noRoute = (): Error =>
+				new LightningPaymentError(
+					LightningErrorCode.NO_ROUTE,
+					'No route found'
+				);
+			stubSendPayment(node, { throws: noRoute() });
 			expect(
 				await rejectionOf(node.payInvoice(invoice.bolt11, 5_000, 0))
 			).to.equal('NO_ROUTE');
@@ -742,7 +747,7 @@ describe('Issue #977: the daily spend ledger survives a restart and charges ever
 				'No route found'
 			);
 
-			stubSendKeysend(node, 1_000, { throws: new Error('No route found') });
+			stubSendKeysend(node, 1_000, { throws: noRoute() });
 			// A keysend refusal carries its code as an invoice's does (#991).
 			expect(
 				await rejectionOf(node.sendKeysend(PUBKEY, 1_000, 5_000, 0))

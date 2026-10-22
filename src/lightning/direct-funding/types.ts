@@ -19,6 +19,7 @@
  */
 
 import { Network } from '../invoice/types';
+import { CodedError } from '../../utils/errors';
 import {
 	BITCOIN_CHAIN_HASH,
 	REGTEST_CHAIN_HASH,
@@ -140,13 +141,10 @@ export enum DirectFundingErrorCode {
  * payer's device with the reason; a code rather than a message means 4D can
  * answer each with its own status without matching substrings (issue #464).
  */
-export class DirectFundingError extends Error {
-	code: DirectFundingErrorCode;
-
+export class DirectFundingError extends CodedError<DirectFundingErrorCode> {
 	constructor(code: DirectFundingErrorCode, message: string) {
-		super(message);
+		super(code, message);
 		this.name = 'DirectFundingError';
-		this.code = code;
 	}
 }
 

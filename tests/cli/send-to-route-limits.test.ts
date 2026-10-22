@@ -285,6 +285,18 @@ describe('sendToRoute admission and spend accounting (#1017)', function () {
 		expect(claimRecords(node, paymentHash)).to.equal(0);
 	});
 
+	it('answers PAYMENT_FAILED for an engine code outside the daemon vocabulary', () => {
+		stubSendToRoute(node, {
+			throws: Object.assign(new Error('boom'), { code: 'ERR_SOMETHING' })
+		});
+		const paymentHash = randomHash();
+		const err = refusalFrom(() =>
+			node.sendToRoute(paymentHash, routeOf(3_000_000n, 3_000_000n))
+		);
+		expect(err.code).to.equal(BeignetErrorCode.PAYMENT_FAILED);
+		expect(err.message).to.equal('boom');
+	});
+
 	it('releases the reservation when the engine reports a failure by return', () => {
 		stubSendToRoute(node, { status: PaymentStatus.FAILED });
 		const paymentHash = randomHash();

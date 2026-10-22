@@ -170,9 +170,15 @@ import {
 	parseBolt8GuardianUrl
 } from '../lightning/recovery';
 import {
+	PeerError,
+	PeerErrorCode,
 	Socks5ProxyScope,
 	socks5SocketFactory
 } from '../lightning/transport/peer-manager';
+import {
+	JitReceiveError,
+	JitReceiveErrorCode
+} from '../lightning/liquidity/jit-receive';
 import { parsePeerUri } from '../lightning/transport/peer-uri';
 import { getPublicKey } from '../lightning/crypto/ecdh';
 import {
@@ -206,6 +212,7 @@ import {
 	PaymentWaitTimeoutError
 } from '../lightning/node/types';
 import { isAnchorChannel, ChannelState } from '../lightning/channel/types';
+import type { ChannelErrorCode } from '../lightning/channel/channel-actions';
 import { isRecencyUnproven } from '../lightning/channel/channel-state';
 import type { Channel } from '../lightning/channel/channel';
 import { decode as decodeInvoice } from '../lightning/invoice/decode';
@@ -213,7 +220,9 @@ import { decodeOffer } from '../lightning/offer/decode';
 import {
 	BeignetError,
 	BeignetErrorCode,
+	BeignetErrorCodeValue,
 	describeFailureCode,
+	isBeignetErrorCode,
 	isRetryableError
 } from './errors';
 import {
@@ -533,6 +542,8 @@ export interface BeignetNodeOptions
 		txid?: string;
 		/** The node still holds that transaction and rebroadcasts it every block. */
 		retained?: boolean;
+		/** Why the channel refused, when the refusing arm said so (a ChannelErrorCode). */
+		channelErrorCode?: ChannelErrorCode;
 	}) => void;
 	/** Log level (default 'info'). Set to 'silent' to suppress. */
 	logLevel?: LogLevel;
@@ -864,7 +875,10 @@ function sameGuardianIds(a: string[], b: string[]): boolean {
 	return sortedA.every((id, i) => id === sortedB[i]);
 }
 
-const RESTORE_ERROR_CODES: Record<RestoreRefusedError['reason'], string> = {
+const RESTORE_ERROR_CODES: Record<
+	RestoreRefusedError['reason'],
+	BeignetErrorCodeValue
+> = {
 	'no-quorum': 'RESTORE_NO_QUORUM',
 	'unknown-namespace': 'RESTORE_UNKNOWN_NAMESPACE',
 	conflict: 'RESTORE_CONFLICT',
@@ -955,7 +969,9 @@ export function parseScid(scid: string): Buffer {
  * carries the same code, and over HTTP the same status, whichever method or
  * route it came in by.
  */
-export const ENGINE_PAYMENT_ERROR_CODES: Readonly<Record<string, string>> = {
+export const ENGINE_PAYMENT_ERROR_CODES: Readonly<
+	Record<string, BeignetErrorCodeValue>
+> = {
 	PAY_ALL_REVIEW_EXPIRED: 'PAY_ALL_REVIEW_EXPIRED',
 	PAY_ALL_REMAINDER: 'PAY_ALL_REMAINDER',
 	PAY_ALL_BUDGET_MISMATCH: 'PAY_ALL_BUDGET_MISMATCH',
@@ -1822,32 +1838,35 @@ export function holdInvoiceEvent(e: IHoldInvoiceStateEvent): HoldInvoiceEvent {
 }
 
 /**
- * The typed refusal a JIT receive request resolves to (issue #671). The
- * wallet side of the protocol throws plain Errors for the LSP's decline, a
- * quote above the configured ceiling, an ack with no intercept scid, the
- * ack window elapsing and a peer that is not connected; over the daemon a
- * plain Error is scrubbed to INTERNAL_ERROR, so the user saw "Internal
- * server error" on what is an ordinary policy refusal. Anything not
+ * The BeignetError code for each JitReceiveErrorCode the daemon answers with
+ * a reason. FEE_MODE_MISMATCH is left out: an LSP answering against its own
+ * protocol is a fault, and is scrubbed like one.
+ */
+const JIT_RECEIVE_ERROR_CODES: Partial<
+	Record<JitReceiveErrorCode, BeignetErrorCodeValue>
+> = {
+	[JitReceiveErrorCode.DECLINED]: BeignetErrorCode.JIT_REFUSED,
+	[JitReceiveErrorCode.QUOTE_ABOVE_MAXIMUM]: BeignetErrorCode.JIT_REFUSED,
+	[JitReceiveErrorCode.NO_INTERCEPT_SCID]: BeignetErrorCode.JIT_REFUSED,
+	[JitReceiveErrorCode.NEW_CHANNELS_REFUSED]:
+		BeignetErrorCode.NEW_CHANNELS_REFUSED,
+	[JitReceiveErrorCode.TIMEOUT]: BeignetErrorCode.JIT_TIMEOUT
+};
+
+/**
+ * The typed refusal a JIT receive request resolves to (issue #671). Over the
+ * daemon an untyped error is scrubbed to INTERNAL_ERROR, which is wrong for
+ * an ordinary policy refusal such as the LSP's decline. Anything not
  * recognised here stays untyped and is still scrubbed, as a fault should be.
  */
 export function jitInvoiceError(err: unknown): unknown {
 	if (err instanceof BeignetError) return err;
-	const message = err instanceof Error ? err.message : String(err);
-	if (
-		/^LSP declined the JIT receive intent|above the accepted maximum|without an intercept scid/.test(
-			message
-		)
-	) {
-		return new BeignetError(BeignetErrorCode.JIT_REFUSED, message);
+	if (err instanceof JitReceiveError) {
+		const code = JIT_RECEIVE_ERROR_CODES[err.code];
+		return code ? new BeignetError(code, err.message) : err;
 	}
-	if (/^JIT receive needs a new channel from the LSP/.test(message)) {
-		return new BeignetError(BeignetErrorCode.NEW_CHANNELS_REFUSED, message);
-	}
-	if (/timed out waiting for the LSP/.test(message)) {
-		return new BeignetError(BeignetErrorCode.JIT_TIMEOUT, message);
-	}
-	if (/^Not connected to peer/.test(message)) {
-		return new BeignetError(BeignetErrorCode.PEER_NOT_CONNECTED, message);
+	if (err instanceof PeerError && err.code === PeerErrorCode.NOT_CONNECTED) {
+		return new BeignetError(BeignetErrorCode.PEER_NOT_CONNECTED, err.message);
 	}
 	return err;
 }
@@ -6022,7 +6041,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private rotationError(error: unknown): Error {
 		if (error instanceof BeignetError) return error;
 		if (error instanceof RotationRefusedError) {
-			const code: Record<RotationRefusedError['reason'], string> = {
+			const code: Record<
+				RotationRefusedError['reason'],
+				BeignetErrorCodeValue
+			> = {
 				'in-progress': 'ROTATION_IN_PROGRESS',
 				'no-quorum': 'ROTATION_NO_QUORUM',
 				'not-catching-up': 'ROTATION_NOT_CATCHING_UP',
@@ -9189,6 +9211,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				channelId?: string;
 				txid?: string;
 				retained?: boolean;
+				channelErrorCode?: ChannelErrorCode;
 			} = {
 				code: err.code,
 				message: err.message,
@@ -9197,6 +9220,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			};
 			if (err.txid !== undefined) data.txid = err.txid;
 			if (err.retained !== undefined) data.retained = err.retained;
+			if (err.channelErrorCode !== undefined) {
+				data.channelErrorCode = err.channelErrorCode;
+			}
 			if (onError) onError(data);
 			this.emit('node:error', data);
 		});
@@ -11365,8 +11391,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 	/**
 	 * The BeignetError for a refusal the engine threw out of a send: its
-	 * LightningErrorCode through ENGINE_PAYMENT_ERROR_CODES, or, for an
-	 * untyped throw, the code its message implies. One mapping for every
+	 * LightningErrorCode through ENGINE_PAYMENT_ERROR_CODES, or PAYMENT_FAILED
+	 * for a throw with no code. The message is never read. One mapping for every
 	 * payment method (issue #991): sendPaymentAsync used to let the engine's
 	 * LightningPaymentError through untouched, and the daemon, seeing no
 	 * BeignetError, answered PAYMENT_FAILED with a 502 that told an agent to
@@ -11380,19 +11406,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (err instanceof InvalidRequestError) {
 			return new BeignetError(BeignetErrorCode.INVALID_PARAMS, msg);
 		}
-		let code = 'PAYMENT_FAILED';
+		let code: BeignetErrorCodeValue = 'PAYMENT_FAILED';
 		if (err instanceof Error && 'code' in err) {
 			const lpErr = err as { code: string };
 			code = ENGINE_PAYMENT_ERROR_CODES[lpErr.code] || 'PAYMENT_FAILED';
-		} else if (msg.includes('No route found')) {
-			code = 'NO_ROUTE';
-		} else if (msg.includes('already in flight')) {
-			code = 'DUPLICATE_PAYMENT';
-		} else if (
-			msg.includes('No channel to first hop') ||
-			msg.includes('Peer not found')
-		) {
-			code = 'PEER_NOT_CONNECTED';
 		}
 		return new BeignetError(code, msg);
 	}
@@ -14140,10 +14157,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			// Surface library payment errors (NO_CHANNEL_TO_HOP, ...) by code
 			const code =
 				err !== null && typeof err === 'object' && 'code' in err
-					? String((err as { code: unknown }).code)
-					: 'PAYMENT_FAILED';
+					? (err as { code: unknown }).code
+					: undefined;
 			throw new BeignetError(
-				code,
+				isBeignetErrorCode(code) ? code : 'PAYMENT_FAILED',
 				err instanceof Error ? err.message : String(err)
 			);
 		}

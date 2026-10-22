@@ -58,6 +58,7 @@ import {
 import {
 	ChannelAction,
 	ChannelActionType,
+	ChannelErrorCode,
 	IBroadcastTxAction,
 	IChannelPersistEvent,
 	IChannelPersistRequest,
@@ -151,7 +152,11 @@ import {
 } from '../keys/derivation';
 import { getPublicKey } from '../crypto/ecdh';
 import { generateFromSeed } from '../keys/shachain';
-import { PeerManager } from '../transport/peer-manager';
+import {
+	PeerError,
+	PeerErrorCode,
+	PeerManager
+} from '../transport/peer-manager';
 import { ZeroConfManager } from './zero-conf';
 import {
 	decodeOpenChannel2Message,
@@ -580,6 +585,16 @@ export const CHANNEL_INDEX_FLOOR_STRIDE = 128;
  * chain reaches that.
  */
 export const CHANNEL_INDEX_FLOOR_MAX = 0x7fffffff - 2 ** 20;
+
+/** A refusal's message, and its code when the refusing arm set one. */
+function refusalFields(action: IErrorAction): {
+	error: string;
+	code?: ChannelErrorCode;
+} {
+	return action.code
+		? { error: action.message, code: action.code }
+		: { error: action.message };
+}
 
 /**
  * `reason` as wire bytes, clamped to what the length prefix can carry.
@@ -1381,7 +1396,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		peerPubkey = normalizeHexPubkey(peerPubkey);
 		// Verify peer is connected before creating channel state
 		if (this.peerManager && !this.peerManager.getPeer(peerPubkey)) {
-			throw new Error(`Not connected to peer ${peerPubkey}`);
+			throw new PeerError(
+				PeerErrorCode.NOT_CONNECTED,
+				`Not connected to peer ${peerPubkey}`
+			);
 		}
 		this._assertNamespaceCanRecordANewChannel();
 		if (opts?.trusted && !this.zeroConfManager.canOpenZeroConfTo(peerPubkey)) {
@@ -1669,7 +1687,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return {
 				ok: false,
 				actions,
-				error: (errorAction as { message: string }).message
+				...refusalFields(errorAction as IErrorAction)
 			};
 		}
 		return { ok: true, actions };
@@ -2139,7 +2157,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return {
 				ok: false,
 				actions,
-				error: (errorAction as { message: string }).message
+				...refusalFields(errorAction as IErrorAction)
 			};
 		}
 		this.emit('channel:pending-close', channelId, 'local');
@@ -2183,7 +2201,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return {
 				ok: false,
 				actions,
-				error: (errorAction as { message: string }).message
+				...refusalFields(errorAction as IErrorAction)
 			};
 		}
 
@@ -2243,7 +2261,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return {
 				ok: false,
 				actions,
-				error: (errorAction as { message: string }).message
+				...refusalFields(errorAction as IErrorAction)
 			};
 		}
 		return { ok: true, actions };
@@ -2311,7 +2329,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return {
 				ok: false,
 				actions,
-				error: (errorAction as { message: string }).message
+				...refusalFields(errorAction as IErrorAction)
 			};
 		}
 		return {
@@ -2373,7 +2391,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return {
 				ok: false,
 				actions,
-				error: (errorAction as { message: string }).message
+				...refusalFields(errorAction as IErrorAction)
 			};
 		}
 		return {
@@ -5813,7 +5831,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return {
 				ok: false,
 				actions,
-				error: (errorAction as { message: string }).message
+				...refusalFields(errorAction as IErrorAction)
 			};
 		}
 		return { ok: true, actions };
@@ -7083,7 +7101,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return {
 				ok: false,
 				actions,
-				error: errorAction.message,
+				...refusalFields(errorAction),
 				transient: errorAction.transient
 			};
 		}
@@ -7249,7 +7267,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			ok: !errorAction,
 			actions,
 			...(errorAction
-				? { error: errorAction.message, transient: errorAction.transient }
+				? { ...refusalFields(errorAction), transient: errorAction.transient }
 				: {})
 		};
 	}
@@ -7277,7 +7295,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		return {
 			ok: !errorAction,
 			actions,
-			...(errorAction ? { error: errorAction.message } : {})
+			...(errorAction ? refusalFields(errorAction) : {})
 		};
 	}
 
@@ -7431,7 +7449,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (this.peerManager) {
 			const peer = this.peerManager.getPeer(peerPubkey);
 			if (!peer) {
-				throw new Error(`Not connected to peer ${peerPubkey}`);
+				throw new PeerError(
+					PeerErrorCode.NOT_CONNECTED,
+					`Not connected to peer ${peerPubkey}`
+				);
 			}
 			const remoteInit = peer.getRemoteInit();
 			if (!remoteInit) {
@@ -8238,7 +8259,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				this.emitContained(
 					'error',
 					channel.getChannelId() ?? channel.getTemporaryChannelId(),
-					'v2 open not funded: fundingUtxos requires a funding provider that can select wallet inputs'
+					'v2 open not funded: fundingUtxos requires a funding provider that can select wallet inputs',
+					ChannelErrorCode.OPEN_NOT_FUNDED
 				);
 				if (!isCurrentOpen()) return;
 				const abortActions = channel.abortDualFunding(
@@ -8317,7 +8339,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 							this.emitContained(
 								'error',
 								channel.getChannelId() ?? channel.getTemporaryChannelId(),
-								`v2 open not funded: ${directedError}`
+								`v2 open not funded: ${directedError}`,
+								ChannelErrorCode.OPEN_NOT_FUNDED
 							);
 							if (!isCurrentOpen()) return;
 							const abortActions = channel.abortDualFunding(
@@ -8354,7 +8377,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					this.emitContained(
 						'error',
 						channel.getChannelId() ?? channel.getTemporaryChannelId(),
-						`v2 open not funded: ${reason}`
+						`v2 open not funded: ${reason}`,
+						ChannelErrorCode.OPEN_NOT_FUNDED
 					);
 					// The diagnostic observer can synchronously remove or replace the
 					// open, so check ownership again before changing channel state.
@@ -9647,7 +9671,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				this.emitContained(
 					'error',
 					channel.getChannelId() ?? channel.getTemporaryChannelId(),
-					errorAction.message
+					errorAction.message,
+					errorAction.code
 				);
 			}
 			// FFOR state is announced only from a batch whose own durable write
@@ -9966,7 +9991,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					this.emit(
 						'error',
 						channel.getChannelId() ?? channel.getTemporaryChannelId(),
-						action.message
+						action.message,
+						action.code
 					);
 					break;
 				}
@@ -11683,9 +11709,13 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (this.peerManager) {
 			try {
 				this.peerManager.sendToPeer(peerPubkey, type, payload);
-			} catch {
-				// Peer not connected; emit for external handling
-				this.emit('message:outbound', peerPubkey, type, payload);
+			} catch (err) {
+				// A gate's refusal is deliberate, so the message must not leave by
+				// the host's transport either. An unconnected peer, or a socket
+				// that threw, falls back to it.
+				const refused =
+					err instanceof PeerError && err.code !== PeerErrorCode.NOT_CONNECTED;
+				if (!refused) this.emit('message:outbound', peerPubkey, type, payload);
 			}
 		} else {
 			this.emit('message:outbound', peerPubkey, type, payload);

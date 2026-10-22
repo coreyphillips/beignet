@@ -33,6 +33,7 @@
 import { decodeTlvStream, encodeTlvStream, ITlvRecord } from '../message/tlv';
 import { isValidPublicKey } from '../crypto/ecdh';
 import { SWAP_ID_BYTES } from './keys';
+import { CodedError } from '../../utils/errors';
 
 export const SWAP_MAX_MESSAGE_BYTES = 4096;
 /** SWAP_STATUS may carry the raw funding transaction. */
@@ -46,10 +47,9 @@ const P2WSH_SCRIPT_BYTES = 34;
 const PUBKEY_BYTES = 33;
 const HASH_BYTES = 32;
 
-export class SwapMessageError extends Error {
-	readonly code = 'MALFORMED';
+export class SwapMessageError extends CodedError<'MALFORMED'> {
 	constructor(message: string) {
-		super(message);
+		super('MALFORMED', message);
 		this.name = 'SwapMessageError';
 	}
 }

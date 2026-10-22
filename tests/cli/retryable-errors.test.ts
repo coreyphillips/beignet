@@ -9,8 +9,11 @@ import { expect } from 'chai';
 import {
 	BeignetError,
 	BeignetErrorCode,
+	BeignetErrorCodeValue,
+	isBeignetErrorCode,
 	isRetryableError
 } from '../../src/cli/errors';
+import { CodedError } from '../../src/utils/errors';
 
 describe('isRetryableError', () => {
 	// ─────────────── Retryable Cases ───────────────
@@ -124,7 +127,12 @@ describe('isRetryableError', () => {
 	// ─────────────── Edge Cases ───────────────
 
 	it('unknown error code is not retryable', () => {
-		const err = new BeignetError('UNKNOWN_CODE', 'something weird');
+		// A client can still hold a code this version does not know, read off
+		// a newer daemon's response.
+		const err = new BeignetError(
+			'UNKNOWN_CODE' as BeignetErrorCodeValue,
+			'something weird'
+		);
 		expect(isRetryableError(err)).to.be.false;
 	});
 });
@@ -150,5 +158,21 @@ describe('BeignetError — failureCode', () => {
 		const err = new BeignetError('PAYMENT_FAILED', 'test');
 		const json = err.toJSON();
 		expect(json).to.not.have.property('failureCode');
+	});
+});
+
+describe('BeignetError — closed code union (issue #1689)', () => {
+	it('isBeignetErrorCode accepts the enum strings and nothing else', () => {
+		expect(isBeignetErrorCode('CLOSE_UNAVAILABLE')).to.equal(true);
+		expect(isBeignetErrorCode(BeignetErrorCode.INTERNAL_ERROR)).to.equal(true);
+		expect(isBeignetErrorCode('NOT_A_CODE')).to.equal(false);
+		expect(isBeignetErrorCode(undefined)).to.equal(false);
+		expect(isBeignetErrorCode(42)).to.equal(false);
+	});
+
+	it('is a CodedError', () => {
+		const err = new BeignetError('INTERNAL_ERROR', 'scrubbed');
+		expect(err).to.be.instanceOf(CodedError);
+		expect(err.code).to.equal('INTERNAL_ERROR');
 	});
 });

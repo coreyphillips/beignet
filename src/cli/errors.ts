@@ -2,6 +2,8 @@
  * CLI error types and BOLT failure code descriptions.
  */
 
+import { CodedError } from '../utils/errors';
+
 export enum BeignetErrorCode {
 	// Wallet
 	WALLET_CREATE_FAILED = 'WALLET_CREATE_FAILED',
@@ -113,11 +115,140 @@ export enum BeignetErrorCode {
 	/** An Origin or Sec-Fetch-Site header from a page this daemon does not serve (403). */
 	CROSS_SITE_REQUEST_REFUSED = 'CROSS_SITE_REQUEST_REFUSED',
 	/** A Host header that is not the loopback name the daemon is bound on (421). */
-	HOST_NOT_ALLOWED = 'HOST_NOT_ALLOWED'
+	HOST_NOT_ALLOWED = 'HOST_NOT_ALLOWED',
+	/** A request body that is not valid JSON. */
+	INVALID_JSON = 'INVALID_JSON',
+	/** A fault the daemon will not describe; the message is scrubbed. */
+	INTERNAL_ERROR = 'INTERNAL_ERROR',
+	/** A credential without the scope the route needs (403). */
+	FORBIDDEN = 'FORBIDDEN',
+	/** A resource with nothing recorded yet, such as fee samples (404). */
+	NO_DATA = 'NO_DATA',
+
+	// On-chain wallet
+	DESCRIPTOR_EXPORT_FAILED = 'DESCRIPTOR_EXPORT_FAILED',
+	PSBT_BUILD_FAILED = 'PSBT_BUILD_FAILED',
+	PSBT_IMPORT_FAILED = 'PSBT_IMPORT_FAILED',
+	PSBT_COMBINE_FAILED = 'PSBT_COMBINE_FAILED',
+	FEE_ESTIMATE_FAILED = 'FEE_ESTIMATE_FAILED',
+
+	// Channels and payments
+	/** A cooperative close the channel cannot offer as asked. */
+	CLOSE_UNAVAILABLE = 'CLOSE_UNAVAILABLE',
+	/** A first-hop peer the route names has no channel with this node. */
+	NO_CHANNEL_TO_HOP = 'NO_CHANNEL_TO_HOP',
+	/** A commitment feerate the channel would not take. */
+	UPDATE_FEE_FAILED = 'UPDATE_FEE_FAILED',
+	/** Unknown channel, wrong state, or nothing recorded to rebroadcast. */
+	REBROADCAST_FAILED = 'REBROADCAST_FAILED',
+
+	// On-chain sweep
+	SWEEP_UNAVAILABLE = 'SWEEP_UNAVAILABLE',
+	SWEEP_INPUT_UNAVAILABLE = 'SWEEP_INPUT_UNAVAILABLE',
+	SWEEP_INPUT_RESERVED = 'SWEEP_INPUT_RESERVED',
+	SWEEP_QUOTE_EXPIRED = 'SWEEP_QUOTE_EXPIRED',
+	SWEEP_NOT_PREPARED = 'SWEEP_NOT_PREPARED',
+	SWEEP_ALREADY_SUBMITTED = 'SWEEP_ALREADY_SUBMITTED',
+	SWEEP_PENDING = 'SWEEP_PENDING',
+	SWEEP_NOT_PERSISTED = 'SWEEP_NOT_PERSISTED',
+	SWEEP_JOURNAL_INVALID = 'SWEEP_JOURNAL_INVALID',
+	SWEEP_JOURNAL_CONFLICT = 'SWEEP_JOURNAL_CONFLICT',
+	SWEEP_JOURNAL_FULL = 'SWEEP_JOURNAL_FULL',
+	/** A requestId already used for a different sweep. */
+	REQUEST_ID_CONFLICT = 'REQUEST_ID_CONFLICT',
+
+	// Automatic and FFOR receive
+	RECEIVE_UNAVAILABLE = 'RECEIVE_UNAVAILABLE',
+	RECEIVE_PENDING = 'RECEIVE_PENDING',
+	RECEIVE_BUSY = 'RECEIVE_BUSY',
+	AMOUNT_TOO_SMALL = 'AMOUNT_TOO_SMALL',
+	INVALID_REVIEW = 'INVALID_REVIEW',
+	QUOTE_EXPIRED = 'QUOTE_EXPIRED',
+	FEE_CHANGED = 'FEE_CHANGED',
+	/** A durable invoice write did not land. */
+	DURABILITY_FAILED = 'DURABILITY_FAILED',
+	/** An FFOR epoch, invoice, credit or provisioning the engine refused. */
+	FFOR_REFUSED = 'FFOR_REFUSED',
+
+	// L402 fetch: an L402Error's code under an L402_ prefix, and the fetch's
+	// own refusals
+	L402_PRICE_ABOVE_CAP = 'L402_PRICE_ABOVE_CAP',
+	L402_AMOUNTLESS_INVOICE = 'L402_AMOUNTLESS_INVOICE',
+	L402_HASH_COMMITMENT_MISMATCH = 'L402_HASH_COMMITMENT_MISMATCH',
+	L402_UNVERIFIABLE_MACAROON = 'L402_UNVERIFIABLE_MACAROON',
+	L402_UNUSABLE_MACAROON = 'L402_UNUSABLE_MACAROON',
+	L402_INVALID_INVOICE = 'L402_INVALID_INVOICE',
+	L402_NO_PAYER = 'L402_NO_PAYER',
+	L402_CROSS_ORIGIN_CHALLENGE = 'L402_CROSS_ORIGIN_CHALLENGE',
+	L402_PREIMAGE_MISMATCH = 'L402_PREIMAGE_MISMATCH',
+	L402_FETCH_FAILED = 'L402_FETCH_FAILED',
+	RESPONSE_TOO_LARGE = 'RESPONSE_TOO_LARGE',
+	PRIVATE_NETWORK_REFUSED = 'PRIVATE_NETWORK_REFUSED',
+
+	// Recovery (docs/RECOVERY-PROTOCOL.md section 8)
+	RECOVERY_UNAVAILABLE = 'RECOVERY_UNAVAILABLE',
+	GUARDIAN_UNREACHABLE = 'GUARDIAN_UNREACHABLE',
+	NODE_RESTORE_PENDING = 'NODE_RESTORE_PENDING',
+	NODE_RESTART_REQUIRED = 'NODE_RESTART_REQUIRED',
+	RESTORE_IN_PROGRESS = 'RESTORE_IN_PROGRESS',
+	RESTORE_NOT_PENDING = 'RESTORE_NOT_PENDING',
+	RESTORE_NO_QUORUM = 'RESTORE_NO_QUORUM',
+	RESTORE_UNKNOWN_NAMESPACE = 'RESTORE_UNKNOWN_NAMESPACE',
+	RESTORE_CONFLICT = 'RESTORE_CONFLICT',
+	RESTORE_CAS_EXHAUSTED = 'RESTORE_CAS_EXHAUSTED',
+	RESTORE_HEAD_UNVERIFIABLE = 'RESTORE_HEAD_UNVERIFIABLE',
+	RESTORE_TARGET_UNSUPPORTED = 'RESTORE_TARGET_UNSUPPORTED',
+	RESTORE_ROTATED = 'RESTORE_ROTATED',
+	ROTATION_IN_PROGRESS = 'ROTATION_IN_PROGRESS',
+	ROTATION_UNAVAILABLE = 'ROTATION_UNAVAILABLE',
+	ROTATION_NO_QUORUM = 'ROTATION_NO_QUORUM',
+	ROTATION_NOT_CATCHING_UP = 'ROTATION_NOT_CATCHING_UP',
+	CAPSULE_RESTORE_UNSUPPORTED = 'CAPSULE_RESTORE_UNSUPPORTED',
+	CAPSULE_RESTORE_NO_CANDIDATES = 'CAPSULE_RESTORE_NO_CANDIDATES',
+	CAPSULE_RESTORE_TARGET_DIRTY = 'CAPSULE_RESTORE_TARGET_DIRTY',
+	CAPSULE_RESTORE_FAILED = 'CAPSULE_RESTORE_FAILED',
+	CAPSULE_RESTORE_GUARDIAN_BACKED = 'CAPSULE_RESTORE_GUARDIAN_BACKED',
+	CAPSULE_RESTORE_QUORUM_NAMESPACE = 'CAPSULE_RESTORE_QUORUM_NAMESPACE',
+	CAPSULE_RESTORE_INSTALL_FAILED = 'CAPSULE_RESTORE_INSTALL_FAILED',
+
+	// Direct funding: DirectFundingErrorCode, carried through verbatim
+	MALFORMED = 'MALFORMED',
+	UNSUPPORTED_VERSION = 'UNSUPPORTED_VERSION',
+	EXPIRED = 'EXPIRED',
+	EXPIRY_TOO_DISTANT = 'EXPIRY_TOO_DISTANT',
+	INVALID_SIGNATURE = 'INVALID_SIGNATURE',
+	WRONG_SIGNER = 'WRONG_SIGNER',
+	WRONG_CHAIN = 'WRONG_CHAIN',
+	TOO_MANY_REQUESTS = 'TOO_MANY_REQUESTS',
+	NOT_PERSISTED = 'NOT_PERSISTED',
+	UNREACHABLE = 'UNREACHABLE',
+	AMOUNT_REQUIRED = 'AMOUNT_REQUIRED',
+	AMOUNT_MISMATCH = 'AMOUNT_MISMATCH',
+	NO_SUITABLE_UTXO = 'NO_SUITABLE_UTXO',
+	OFFER_DECLINED = 'OFFER_DECLINED',
+	SIGN_REQUEST_REFUSED = 'SIGN_REQUEST_REFUSED',
+	EXCHANGE_TIMEOUT = 'EXCHANGE_TIMEOUT'
 }
 
-export class BeignetError extends Error {
-	code: BeignetErrorCode | string;
+/**
+ * Every code a BeignetError can carry, as the string the daemon answers with.
+ * A closed union, so a switch over `code` can be exhaustive, and comparing
+ * against either the enum member or its string compiles.
+ */
+export type BeignetErrorCodeValue = `${BeignetErrorCode}`;
+
+const BEIGNET_ERROR_CODES: ReadonlySet<string> = new Set(
+	Object.values(BeignetErrorCode)
+);
+
+/** Whether a value is one of BeignetErrorCode's strings. */
+export function isBeignetErrorCode(
+	code: unknown
+): code is BeignetErrorCodeValue {
+	return typeof code === 'string' && BEIGNET_ERROR_CODES.has(code);
+}
+
+export class BeignetError extends CodedError<BeignetErrorCodeValue> {
 	failureCode?: number;
 	/**
 	 * The payment the error is about, hex. Set on PAYMENT_TIMEOUT, and on the
@@ -128,13 +259,12 @@ export class BeignetError extends Error {
 	paymentHash?: string;
 
 	constructor(
-		code: BeignetErrorCode | string,
+		code: BeignetErrorCodeValue,
 		message: string,
 		failureCode?: number
 	) {
-		super(message);
+		super(code, message);
 		this.name = 'BeignetError';
-		this.code = code;
 		this.failureCode = failureCode;
 	}
 
@@ -229,26 +359,29 @@ export function isRetryableError(err: BeignetError): boolean {
 		BeignetErrorCode.JIT_TIMEOUT,
 		// Reaching an upstream (the fee source, an L402 target, a guardian
 		// quorum) failed; the next attempt reaches a different world.
-		'FEE_ESTIMATE_FAILED',
-		'L402_FETCH_FAILED',
-		'RESTORE_HEAD_UNVERIFIABLE',
-		'RECOVERY_UNAVAILABLE',
+		BeignetErrorCode.FEE_ESTIMATE_FAILED,
+		BeignetErrorCode.L402_FETCH_FAILED,
+		BeignetErrorCode.RESTORE_HEAD_UNVERIFIABLE,
+		BeignetErrorCode.RECOVERY_UNAVAILABLE,
 		// A node-hosted guardian that did not answer a resolve probe (#699).
-		'GUARDIAN_UNREACHABLE',
-		'ROTATION_NO_QUORUM',
-		'ROTATION_NOT_CATCHING_UP',
+		BeignetErrorCode.GUARDIAN_UNREACHABLE,
+		BeignetErrorCode.ROTATION_NO_QUORUM,
+		BeignetErrorCode.ROTATION_NOT_CATCHING_UP,
 		// Recovery holds that resolve on their own or on a restart.
-		'NODE_RESTORE_PENDING',
-		'NODE_RESTART_REQUIRED',
-		'RESTORE_NO_QUORUM',
-		'RESTORE_CAS_EXHAUSTED',
+		BeignetErrorCode.NODE_RESTORE_PENDING,
+		BeignetErrorCode.NODE_RESTART_REQUIRED,
+		BeignetErrorCode.RESTORE_NO_QUORUM,
+		BeignetErrorCode.RESTORE_CAS_EXHAUSTED,
 		// Direct funding (issue #613): no lane could carry a frame, the receiver
 		// never finished the exchange, or a storage write did not land. All three
 		// are refused BEFORE the witness leaves, so nothing was spent and the next
 		// attempt reaches a different world.
-		'UNREACHABLE',
-		'EXCHANGE_TIMEOUT',
-		'NOT_PERSISTED'
+		BeignetErrorCode.UNREACHABLE,
+		BeignetErrorCode.EXCHANGE_TIMEOUT,
+		BeignetErrorCode.NOT_PERSISTED,
+		// A sweep's input reservation that did not reach storage, refused so
+		// the same request can run again.
+		BeignetErrorCode.SWEEP_NOT_PERSISTED
 	]);
 	if (retryableCodes.has(err.code)) return true;
 

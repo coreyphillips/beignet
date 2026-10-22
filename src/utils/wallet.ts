@@ -104,7 +104,7 @@ export const formatKeyDerivationPath = ({
 				index
 			});
 			if (derivationPathResponse.isErr()) {
-				return err(derivationPathResponse.error.message);
+				return err(derivationPathResponse.error);
 			}
 			path = derivationPathResponse.value;
 		}
@@ -119,7 +119,7 @@ export const formatKeyDerivationPath = ({
 			index
 		});
 		if (pathStringResponse.isErr()) {
-			return err(pathStringResponse.error.message);
+			return err(pathStringResponse.error);
 		}
 		const pathString = pathStringResponse.value;
 		return ok({ pathObject, pathString });

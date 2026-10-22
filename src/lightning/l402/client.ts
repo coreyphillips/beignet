@@ -35,6 +35,7 @@ import {
 	MemoryL402CredentialStore
 } from './credentials';
 import { macaroonPaymentHash } from './macaroon';
+import { CodedError } from '../../utils/errors';
 
 /** Minimal payer contract, so the protocol layer needs no node handle. */
 export interface IL402Payer {
@@ -180,22 +181,21 @@ export interface IL402FetchResult {
 	refusedReason?: string;
 }
 
+export type L402ErrorCode =
+	| 'PRICE_ABOVE_CAP'
+	| 'AMOUNTLESS_INVOICE'
+	| 'HASH_COMMITMENT_MISMATCH'
+	| 'UNVERIFIABLE_MACAROON'
+	| 'UNUSABLE_MACAROON'
+	| 'INVALID_INVOICE'
+	| 'NO_PAYER'
+	| 'CROSS_ORIGIN_CHALLENGE'
+	| 'PREIMAGE_MISMATCH';
+
 /** Errors this client raises before any payment leaves. */
-export class L402Error extends Error {
-	constructor(
-		message: string,
-		readonly code:
-			| 'PRICE_ABOVE_CAP'
-			| 'AMOUNTLESS_INVOICE'
-			| 'HASH_COMMITMENT_MISMATCH'
-			| 'UNVERIFIABLE_MACAROON'
-			| 'UNUSABLE_MACAROON'
-			| 'INVALID_INVOICE'
-			| 'NO_PAYER'
-			| 'CROSS_ORIGIN_CHALLENGE'
-			| 'PREIMAGE_MISMATCH'
-	) {
-		super(message);
+export class L402Error extends CodedError<L402ErrorCode> {
+	constructor(message: string, code: L402ErrorCode) {
+		super(code, message);
 		this.name = 'L402Error';
 	}
 }

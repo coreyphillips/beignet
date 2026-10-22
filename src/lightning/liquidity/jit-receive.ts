@@ -57,6 +57,7 @@
  */
 
 import { TypedEmitter } from '../../utils/typed-emitter';
+import { CodedError } from '../../utils/errors';
 import * as crypto from 'crypto';
 import { encodeShortChannelId } from '../gossip/types';
 import {
@@ -75,6 +76,30 @@ import {
  * invoice hint, so the forward is the full onion amount.
  */
 export type JitFeeMode = 'skim' | 'hop';
+
+/** Why a JIT receive request, the wallet side of the exchange, failed. */
+export enum JitReceiveErrorCode {
+	/** The LSP declined the intent, with its reason. */
+	DECLINED = 'DECLINED',
+	/** The LSP quoted above the ceilings this node accepts. */
+	QUOTE_ABOVE_MAXIMUM = 'QUOTE_ABOVE_MAXIMUM',
+	/** The LSP accepted without an intercept scid, so no invoice could route to it. */
+	NO_INTERCEPT_SCID = 'NO_INTERCEPT_SCID',
+	/** The LSP answered a skim-accepting intent with hop-mode fee terms. */
+	FEE_MODE_MISMATCH = 'FEE_MODE_MISMATCH',
+	/** The LSP did not answer in time. */
+	TIMEOUT = 'TIMEOUT',
+	/** The receive needs a new channel, and this node refuses new channels right now. */
+	NEW_CHANNELS_REFUSED = 'NEW_CHANNELS_REFUSED'
+}
+
+/** A JIT receive request that failed, with the reason as a code. */
+export class JitReceiveError extends CodedError<JitReceiveErrorCode> {
+	constructor(code: JitReceiveErrorCode, message: string) {
+		super(code, message);
+		this.name = 'JitReceiveError';
+	}
+}
 
 export interface IJitReceiveAuthorization {
 	/** Client-chosen correlation id, echoed in the ack. */
