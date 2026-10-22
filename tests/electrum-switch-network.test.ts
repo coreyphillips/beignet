@@ -296,6 +296,13 @@ describe('switchNetwork against an unreachable target', function () {
 			expect(w.electrum.wallet === w, 'Electrum reads this wallet').to.equal(
 				true
 			);
+			const { _coinControl } = w as unknown as {
+				_coinControl: { _wallet: Wallet };
+			};
+			expect(
+				_coinControl._wallet === w,
+				'CoinControl reads this wallet'
+			).to.equal(true);
 
 			// The refresh the switch starts runs on this wallet, so it is this
 			// wallet's flag that comes down and a later refresh is answered.

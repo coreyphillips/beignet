@@ -163,6 +163,7 @@ import { derivePathCached } from '../utils/derive-path-cached';
 import type { ILogger } from '../logger';
 import { createConsoleLogger } from '../logger';
 import { registerLiveWalletData } from './live-data';
+import { CoinControl } from './coin-control';
 
 type TAddressLookup = {
 	maps: (IAddresses | undefined)[];
@@ -188,21 +189,6 @@ const SATS_FIELDS = [
 	['fee', 'feeSats'],
 	['value', 'valueSats']
 ] as const;
-
-/**
- * Reads the deprecated `{ txid, index }` form as well. An argument carrying
- * both fields must name one output.
- */
-const toOutpoint = (
-	outpoint: IOutpoint | IIndexedOutpoint
-): Result<IOutpoint> => {
-	const { vout } = outpoint as Partial<IOutpoint>;
-	const { index } = outpoint as Partial<IIndexedOutpoint>;
-	if (vout !== undefined && index !== undefined && vout !== index) {
-		return err(`vout ${vout} and index ${index} name different outputs.`);
-	}
-	return ok({ txid: outpoint.txid, vout: (vout ?? index) as number });
-};
 
 /**
  * Freezes value and every plain object and array it holds, and returns it.
@@ -385,6 +371,9 @@ export class Wallet {
 	private readonly _birthdayHeightOption?: number;
 	// A failed storage read counts as a missing key instead of failing the load.
 	private readonly _resetOnReadFailure: boolean;
+	// Not readonly: switchNetwork rebuilds it, as it does transaction and
+	// electrum.
+	private _coinControl: CoinControl;
 
 	public addressTypesToMonitor: EAddressType[];
 	public coinSelectPreference: ECoinSelectPreference;
@@ -559,6 +548,7 @@ export class Wallet {
 		this.transaction = new Transaction({
 			wallet: this
 		});
+		this._coinControl = new CoinControl({ wallet: this });
 		this.feeEstimates = cloneDeep(defaultFeesShape);
 		this.disableMessages = disableMessages;
 		this.sendMessage = <K extends keyof TMessageDataMap>(
@@ -669,7 +659,7 @@ export class Wallet {
 			return ok('Wallet data updated.');
 		};
 		return keys.includes('blacklistedUtxos')
-			? this.runBlacklistWrite(update)
+			? this._coinControl.runBlacklistWrite(update)
 			: update();
 	}
 
@@ -1270,10 +1260,11 @@ export class Wallet {
 			// read was out is already in storage, and only needs adopting here.
 			this.receiveIndexMovesSaved = this.receiveIndexMoves;
 			this.adoptLandedReceiveIndex();
-			// Both point back at the wallet that constructed them. Nothing is
+			// Each points back at the wallet that constructed it. Nothing is
 			// staged on the Transaction replaced here: the send lock this switch
 			// holds is what every staging call runs under.
 			this.transaction = new Transaction({ wallet: this });
+			this._coinControl = new CoinControl({ wallet: this });
 			this.electrum = new Electrum({
 				wallet: this,
 				network,
@@ -3555,27 +3546,7 @@ export class Wallet {
 	 */
 	public isUtxoFrozen(txid: string, index: number): boolean;
 	public isUtxoFrozen(outpoint: IOutpoint | string, index?: number): boolean {
-		const { txid, vout } =
-			typeof outpoint === 'string' ? { txid: outpoint, vout: index } : outpoint;
-		return this._data.blacklistedUtxos.some(
-			(frozen) => frozen.tx_hash === txid && frozen.tx_pos === vout
-		);
-	}
-
-	/**
-	 * Serializes blacklist mutations. Both freezeUtxo and unfreezeUtxo publish
-	 * their change to the in-memory list before the storage write that may
-	 * force them to roll it back, so a second caller landing in that window
-	 * would read a provisional entry: it would answer "already frozen" for a
-	 * freeze that then vanished, or "not frozen" for one that came back.
-	 * Queueing the mutations means every caller decides against a settled list.
-	 */
-	private blacklistLock: Promise<unknown> = Promise.resolve();
-
-	private runBlacklistWrite<T>(fn: () => Promise<T>): Promise<T> {
-		const run = this.blacklistLock.then(fn, fn);
-		this.blacklistLock = run.catch(() => undefined);
-		return run;
+		return this._coinControl.isUtxoFrozen(outpoint, index);
 	}
 
 	/**
@@ -3592,7 +3563,7 @@ export class Wallet {
 	 * form is still read.
 	 * @returns {Promise<Result<string>>}
 	 */
-	public async freezeUtxo(
+	public freezeUtxo(
 		params: (IOutpoint | IIndexedOutpoint) & {
 			/** Optional origin marker (e.g. 'funding-pledge') persisted with the
 			 *  entry so automated freezers can recognize, and recover, their own
@@ -3600,20 +3571,7 @@ export class Wallet {
 			tag?: string;
 		}
 	): Promise<Result<string>> {
-		const outpoint = toOutpoint(params);
-		if (outpoint.isErr()) return err(outpoint.error);
-		const { txid, vout } = outpoint.value;
-		const res = await this.freezeUtxoIfUnfrozen({
-			txid,
-			vout,
-			tag: params.tag
-		});
-		if (res.isErr()) return err(res.error);
-		return ok(
-			res.value.created
-				? `UTXO ${txid}:${vout} frozen.`
-				: `UTXO ${txid}:${vout} is already frozen.`
-		);
+		return this._coinControl.freezeUtxo(params);
 	}
 
 	/**
@@ -3629,109 +3587,10 @@ export class Wallet {
 	 * @param {IOutpoint} params The coin, as freezeUtxo takes it.
 	 * @returns {Promise<Result<{ created: boolean }>>}
 	 */
-	public async freezeUtxoIfUnfrozen(
+	public freezeUtxoIfUnfrozen(
 		params: (IOutpoint | IIndexedOutpoint) & { tag?: string }
 	): Promise<Result<{ created: boolean }>> {
-		const outpoint = toOutpoint(params);
-		if (outpoint.isErr()) return err(outpoint.error);
-		const { tag } = params;
-		return this.runBlacklistWrite(() =>
-			this.freezeUtxoLocked({ ...outpoint.value, tag })
-		);
-	}
-
-	private async freezeUtxoLocked({
-		txid,
-		vout,
-		tag
-	}: IOutpoint & { tag?: string }): Promise<Result<{ created: boolean }>> {
-		if (typeof txid !== 'string' || !/^[0-9a-fA-F]{64}$/.test(txid)) {
-			return err('txid must be a 64-character hex string.');
-		}
-		if (!Number.isInteger(vout) || vout < 0) {
-			return err('vout must be a non-negative integer.');
-		}
-		const utxo = this._data.utxos.find(
-			(u) => u.tx_hash === txid && u.tx_pos === vout
-		);
-		if (!utxo) {
-			return err(`UTXO ${txid}:${vout} is not known to this wallet.`);
-		}
-		if (this.isUtxoFrozen({ txid, vout })) {
-			return tag === undefined
-				? this.untagFrozenUtxo(txid, vout)
-				: ok({ created: false });
-		}
-		// keyPair must never be persisted with the frozen entry.
-		const { keyPair, ...frozen } = utxo;
-		void keyPair;
-		const entry = {
-			...frozen,
-			...(tag !== undefined ? { freezeTag: tag, frozenAt: Date.now() } : {})
-		};
-		this._data.blacklistedUtxos.push(entry);
-		const saved = await this.saveWalletData(
-			'blacklistedUtxos',
-			this._data.blacklistedUtxos
-		);
-		if (saved.isErr()) {
-			// The row never reached storage, so the freeze dies with this
-			// process: the next run hands the coin back to coin selection while
-			// whatever reserved it (a funding pledge) believes it is held. Drop
-			// the in-memory entry so memory and storage agree, and let the
-			// caller decide whether it can proceed without the reservation.
-			const at = this._data.blacklistedUtxos.indexOf(entry);
-			if (at !== -1) this._data.blacklistedUtxos.splice(at, 1);
-			return err(
-				saved.error.code,
-				`Failed to persist the freeze for UTXO ${txid}:${vout}: ${saved.error.message}`,
-				saved.error
-			);
-		}
-		return ok({ created: true });
-	}
-
-	/**
-	 * Clears the tag on a frozen outpoint's entries. Automated freezers
-	 * recognize their own freezes by the tag, so an entry that kept it would
-	 * be lifted when that freezer lets go, taking the caller's freeze with it.
-	 */
-	private async untagFrozenUtxo(
-		txid: string,
-		vout: number
-	): Promise<Result<{ created: boolean }>> {
-		const tagged = this._data.blacklistedUtxos.filter(
-			(frozen) =>
-				frozen.tx_hash === txid &&
-				frozen.tx_pos === vout &&
-				frozen.freezeTag !== undefined
-		);
-		if (tagged.length === 0) return ok({ created: false });
-		const untagged = tagged.map((frozen) => {
-			const entry = { ...frozen };
-			delete entry.freezeTag;
-			delete entry.frozenAt;
-			return entry;
-		});
-		const swap = (from: IUtxo[], to: IUtxo[]): void => {
-			this._data.blacklistedUtxos = this._data.blacklistedUtxos.map(
-				(frozen) => to[from.indexOf(frozen)] ?? frozen
-			);
-		};
-		swap(tagged, untagged);
-		const saved = await this.saveWalletData(
-			'blacklistedUtxos',
-			this._data.blacklistedUtxos
-		);
-		if (saved.isErr()) {
-			swap(untagged, tagged);
-			return err(
-				saved.error.code,
-				`Failed to persist the freeze for UTXO ${txid}:${vout}: ${saved.error.message}`,
-				saved.error
-			);
-		}
-		return ok({ created: true });
+		return this._coinControl.freezeUtxoIfUnfrozen(params);
 	}
 
 	/**
@@ -3742,48 +3601,10 @@ export class Wallet {
 	 * form is still read.
 	 * @returns {Promise<Result<string>>}
 	 */
-	public async unfreezeUtxo(
+	public unfreezeUtxo(
 		params: IOutpoint | IIndexedOutpoint
 	): Promise<Result<string>> {
-		const outpoint = toOutpoint(params);
-		if (outpoint.isErr()) return err(outpoint.error);
-		return this.runBlacklistWrite(() =>
-			this.unfreezeUtxoLocked(outpoint.value)
-		);
-	}
-
-	private async unfreezeUtxoLocked({
-		txid,
-		vout
-	}: IOutpoint): Promise<Result<string>> {
-		const removed = this._data.blacklistedUtxos.filter(
-			(frozen) => frozen.tx_hash === txid && frozen.tx_pos === vout
-		);
-		if (removed.length === 0) {
-			return err(`UTXO ${txid}:${vout} is not frozen.`);
-		}
-		this._data.blacklistedUtxos = this._data.blacklistedUtxos.filter(
-			(frozen) => !(frozen.tx_hash === txid && frozen.tx_pos === vout)
-		);
-		const saved = await this.saveWalletData(
-			'blacklistedUtxos',
-			this._data.blacklistedUtxos
-		);
-		if (saved.isErr()) {
-			// Storage still holds the freeze, so a restart would restore it.
-			// Put the entry back rather than report a release the wallet will
-			// take away again, unless a freeze landed while the write was in
-			// flight and already owns the outpoint.
-			if (!this.isUtxoFrozen({ txid, vout })) {
-				this._data.blacklistedUtxos.push(...removed);
-			}
-			return err(
-				saved.error.code,
-				`Failed to persist the unfreeze for UTXO ${txid}:${vout}: ${saved.error.message}`,
-				saved.error
-			);
-		}
-		return ok(`UTXO ${txid}:${vout} unfrozen.`);
+		return this._coinControl.unfreezeUtxo(params);
 	}
 
 	/**
@@ -3797,24 +3618,10 @@ export class Wallet {
 	 * @param {string} params.tag
 	 * @returns {Promise<Result<{ unfrozen: boolean }>>}
 	 */
-	public async unfreezeUtxoIfTagged(
+	public unfreezeUtxoIfTagged(
 		params: (IOutpoint | IIndexedOutpoint) & { tag: string }
 	): Promise<Result<{ unfrozen: boolean }>> {
-		const outpoint = toOutpoint(params);
-		if (outpoint.isErr()) return err(outpoint.error);
-		const { txid, vout } = outpoint.value;
-		const { tag } = params;
-		return this.runBlacklistWrite(async () => {
-			const entries = this._data.blacklistedUtxos.filter(
-				(frozen) => frozen.tx_hash === txid && frozen.tx_pos === vout
-			);
-			if (entries.length === 0) return ok({ unfrozen: true });
-			const heldByOther = entries.some((frozen) => frozen.freezeTag !== tag);
-			if (heldByOther) return ok({ unfrozen: false });
-			const res = await this.unfreezeUtxoLocked(outpoint.value);
-			if (res.isErr()) return err(res.error);
-			return ok({ unfrozen: true });
-		});
+		return this._coinControl.unfreezeUtxoIfTagged(params);
 	}
 
 	/**
@@ -3824,7 +3631,7 @@ export class Wallet {
 	 * @returns {IUtxo[]}
 	 */
 	public listFrozenUtxos(): IUtxo[] {
-		return this._data.blacklistedUtxos;
+		return this._coinControl.listFrozenUtxos();
 	}
 
 	/**
@@ -3833,13 +3640,7 @@ export class Wallet {
 	 * @returns {IBalanceBreakdown}
 	 */
 	public getBalanceBreakdown(): IBalanceBreakdown {
-		const total = this.getBalance();
-		const frozen = this._data.utxos.reduce((acc, utxo) => {
-			return this.isUtxoFrozen({ txid: utxo.tx_hash, vout: utxo.tx_pos })
-				? acc + utxo.value
-				: acc;
-		}, 0);
-		return { total, spendable: total - frozen, frozen };
+		return this._coinControl.getBalanceBreakdown();
 	}
 
 	/**
