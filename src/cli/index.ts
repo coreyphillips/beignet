@@ -1,3 +1,7 @@
+/**
+ * `BeignetNode`, the HTTP daemon and the error helpers.
+ * @module beignet/cli
+ */
 export {
 	BeignetNode,
 	BeignetNodeOptions,

@@ -1,3 +1,7 @@
+/**
+ * The Lightning protocol layer, one namespace per module.
+ * @module beignet/lightning
+ */
 export * as crypto from './crypto';
 export * as message from './message';
 export * as features from './features';

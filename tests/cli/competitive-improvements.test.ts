@@ -1095,9 +1095,10 @@ describe('Documentation Accuracy', () => {
 		}
 	});
 
-	it('README.md module table covers every src/lightning module', () => {
+	it('the module reference covers every src/lightning module', () => {
+		// The root README links to this table rather than keeping a copy.
 		const readme = fs.readFileSync(
-			path.join(__dirname, '../../README.md'),
+			path.join(__dirname, '../../src/lightning/README.md'),
 			'utf-8'
 		);
 		const lightningDir = path.join(__dirname, '../../src/lightning');
@@ -1107,8 +1108,8 @@ describe('Documentation Accuracy', () => {
 			.map((entry) => entry.name);
 		expect(modules.length).to.be.greaterThan(0);
 		for (const mod of modules) {
-			expect(readme, `README module table should list \`${mod}/\``).to.include(
-				`\`${mod}/\``
+			expect(readme, `the module reference should list \`${mod}\``).to.include(
+				`| \`${mod}\` |`
 			);
 		}
 	});

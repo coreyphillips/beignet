@@ -299,15 +299,28 @@ export interface LogEntry {
 	timestamp: number;
 }
 
+/**
+ * Options for BeignetNode.create. The Factory table in src/cli/README.md is
+ * generated from this interface (`npm run docs:tables`), so the description
+ * of each option lives here.
+ */
 export interface BeignetNodeOptions
 	extends IrohDaemonConfig,
 		ElectrumTlsConfig {
 	/** Primary-only switch for new private client channels. Default false. */
 	waiveClientReserve?: boolean;
+	/** BIP39 mnemonic for the wallet and node keys. A new one is generated when omitted. */
 	mnemonic?: string;
 	/** Required by create(), which throws INVALID_PARAMS without it. */
 	network?: 'mainnet' | 'testnet' | 'regtest' | 'signet';
+	/** Node alias advertised in node_announcement. */
 	alias?: string;
+	/**
+	 * Directory for the SQLite database and the instance lock, used as given.
+	 * Default: `~/.beignet/data/<tag>`, where the tag is the first 16 hex
+	 * characters of the mnemonic's SHA-256, so each seed gets its own
+	 * database.
+	 */
 	dataDir?: string;
 	/**
 	 * Skip the single-instance lock on the data dir (default false). Leave this
@@ -316,8 +329,11 @@ export interface BeignetNodeOptions
 	 * risks database corruption.
 	 */
 	allowMultipleInstances?: boolean;
+	/** Electrum server host (default: the network's built-in server). */
 	electrumHost?: string;
+	/** Electrum server port (default: the built-in server's). */
 	electrumPort?: number;
+	/** Connect to Electrum over TLS (default: the built-in server's setting). The certificate is checked only with electrumTlsVerify. */
 	electrumTls?: boolean;
 	/**
 	 * Where the wallet sources on-chain fee estimates (default 'auto'):
@@ -332,6 +348,7 @@ export interface BeignetNodeOptions
 	 * kinds (issue #548, LFBW port #532 workstream 1F).
 	 */
 	addressType?: 'p2wpkh' | 'p2tr';
+	/** Accept inbound Lightning peers over TCP on this port. Off when unset. */
 	listenPort?: number;
 	/**
 	 * Accept inbound Lightning peers over WebSocket (RFC 6455) on this port.
@@ -341,12 +358,14 @@ export interface BeignetNodeOptions
 	/** Inbound peer connections (default 125); once this many are up, only
 	 *  peers holding a channel with this node are admitted. */
 	maxInboundPeers?: number;
+	/** Open anchor channels (default true); false opens legacy static_remotekey channels. */
 	preferAnchors?: boolean;
 	/**
 	 * option_wumbo (large_channels, default false): advertise the bit and lift
 	 * the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it.
 	 */
 	largeChannels?: boolean;
+	/** Connect to DNS seed peers (BOLT 10) at startup (default false). */
 	autoBootstrap?: boolean;
 	/** Enable auto-reconnection to peers (default true) */
 	autoReconnect?: boolean;
@@ -372,7 +391,9 @@ export interface BeignetNodeOptions
 	 * Issue #532 workstream 1B.
 	 */
 	routingFeeBaseMsat?: number;
+	/** Proportional routing fee in ppm (default 1); see routingFeeBaseMsat. */
 	routingFeePpm?: number;
+	/** CLTV delta this node requires on forwards (default 40); see routingFeeBaseMsat. */
 	routingCltvDelta?: number;
 	/**
 	 * Liquidity ads (bLIP-0051, option_will_fund) SELLER policy: answer a
@@ -394,13 +415,21 @@ export interface BeignetNodeOptions
 	 * what the LSP role fronts (issue #665); unset keeps the library defaults.
 	 */
 	jitReceive?: {
+		/** Run the LSP role. */
 		enabled?: boolean;
+		/** LSP role: flat part of the opening fee, in sats. */
 		flatFeeSat?: number;
+		/** LSP role: proportional part of the opening fee, in ppm of the held total. */
 		feePpm?: number;
+		/** Client role: the largest flat fee this node accepts from an LSP. */
 		maxFlatFeeSat?: number;
+		/** Client role: the largest proportional fee this node accepts from an LSP. */
 		maxFeePpm?: number;
+		/** LSP role: the most fronted for one client, open or splice (library default 1,000,000 sats). */
 		maxClientFundingSats?: number;
+		/** LSP role: opens plus splices in flight at once (library default 3). */
 		maxConcurrentFundings?: number;
+		/** LSP role: lifetime sats this node may front, counted across restarts. Unbounded when unset. */
 		maxTotalFundingSats?: number;
 	};
 	/**
@@ -408,15 +437,25 @@ export interface BeignetNodeOptions
 	 * numbers are whole sats/blocks; unset ones keep the library defaults.
 	 */
 	swaps?: {
+		/** Serve reverse swaps. */
 		enabled?: boolean;
+		/** Flat part of the swap fee, in sats (both directions). */
 		flatFeeSat?: number;
+		/** Proportional part of the swap fee, in ppm (both directions). */
 		feePpm?: number;
+		/** Smallest swap accepted, in sats. */
 		minSat?: number;
+		/** Largest swap accepted, in sats. */
 		maxSat?: number;
+		/** Principal at risk across every unresolved swap, in sats. */
 		maxExposureSat?: number;
+		/** Swaps whose principal may be at risk at once. */
 		maxConcurrent?: number;
+		/** Reverse swap: blocks from create to the contract's refund height. */
 		refundDeltaBlocks?: number;
+		/** Depth a funding output needs before the provider relies on it. */
 		fundingConfs?: number;
+		/** Depth a spend needs before the provider treats it as the outcome. */
 		resolutionConfs?: number;
 		/**
 		 * The submarine direction (issue #743): a peer locks coins in a
@@ -425,9 +464,13 @@ export interface BeignetNodeOptions
 		 * and caps above apply to both directions.
 		 */
 		submarine?: boolean;
+		/** Submarine: blocks between the last possible outgoing HTLC expiry and the refund height (library default 24). */
 		claimSafetyBlocks?: number;
+		/** Submarine: routing fee this node will spend, per million of the invoice (library default 5000). */
 		paymentMaxFeePpm?: number;
+		/** Submarine: blocks an unconfirmed claim waits before a rebuild at a higher fee (library default 2). */
 		claimBumpIntervalBlocks?: number;
+		/** Submarine: blocks from create to the contract's refund height (library default 288). */
 		submarineRefundDeltaBlocks?: number;
 	};
 	/**
@@ -627,18 +670,42 @@ export interface BeignetNodeOptions
 	 * writer lease is quarantined (the guardian-only lane).
 	 */
 	guardianServe?: boolean;
-	/** FFOR settlement peer, witness and issuer roles (issue #729). */
+	/**
+	 * FFOR settlement peer role (issue #729): answer ff_init for receivers.
+	 * Off by default, since an epoch locks its whole budget of this node's
+	 * liquidity.
+	 */
 	fforSettle?: {
+		/** Answer ff_init; only an exact true turns it on. */
 		enabled: boolean;
+		/** Largest epoch budget accepted, in msat. */
 		maxBudgetMsat?: string | number;
+		/** Longest epoch accepted, in blocks. */
 		maxEpochBlocks?: number;
+		/** Smallest base fee accepted, in msat. */
 		feeBaseMsat?: number;
+		/** Smallest proportional fee accepted, in ppm. */
 		feePpm?: number;
 	};
+	/** Advertise FFOR concurrent receive, feature bits 562/563 (default true). */
 	fforConcurrent?: boolean;
+	/** Accept new concurrent-profile settlements when fforSettle is on (default true). */
 	fforSettleConcurrent?: boolean;
-	fforWitness?: { enabled: boolean; maxMailboxes?: number; maxBytes?: number };
+	/**
+	 * FFOR receipt witness role: store a receiver-encrypted record of every
+	 * delegated preimage this node relays before propagating the fulfil.
+	 */
+	fforWitness?: {
+		/** Run the witness role. */
+		enabled: boolean;
+		/** Mailboxes this node hosts at once. */
+		maxMailboxes?: number;
+		/** Bytes all mailboxes may occupy. */
+		maxBytes?: number;
+	};
+	/** FFOR issuer role: answer BOLT 12 invoice requests for offers a receiver delegated to this node. Needs fforWitness. */
 	fforIssuer?: boolean;
+	/** FFOR settlement peer: policy for funding new receive channels for receivers (BEIGNET_FFOR_RECEIVE_FUNDING). Off unless enabled. */
 	fforReceiveFunding?: FforReceiveFunding;
 	/** Bearer token every guardian session must present; absent runs open. */
 	guardianToken?: string;
@@ -671,9 +738,13 @@ export interface BeignetNodeOptions
 	 * dailySpendLimitSats hold it as they hold a manual one.
 	 */
 	autoRebalance?: {
+		/** Master switch; only an explicit true turns it on. */
 		enabled?: boolean;
+		/** Most routing fees spent on rebalances per UTC day, in sats (default 1000). */
 		budgetSatsPerDay?: number;
+		/** Local-balance percent below or above which a channel is imbalanced (default 20). */
 		minImbalancePct?: number;
+		/** Run interval in ms (default 3,600,000, one hour). */
 		intervalMs?: number;
 	};
 	/**
@@ -683,9 +754,13 @@ export interface BeignetNodeOptions
 	 * no forwards in the window, clamped to [floorPpm, ceilPpm].
 	 */
 	autoTuneFees?: {
+		/** Master switch; only an explicit true turns it on. */
 		enabled?: boolean;
+		/** Tune interval and forwarding observation window in ms (default six hours). */
 		intervalMs?: number;
+		/** Lowest ppm the tuner sets (default 1). */
 		floorPpm?: number;
+		/** Highest ppm the tuner sets (default 10,000). */
 		ceilPpm?: number;
 	};
 }

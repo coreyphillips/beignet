@@ -1,3 +1,7 @@
+/**
+ * The on-chain wallet: `Wallet`, its types, storage and logging helpers.
+ * @module beignet
+ */
 export * from './logger';
 export * from './wallet/index';
 export * from './types';

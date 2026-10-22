@@ -1,4 +1,7 @@
-/** Node-only Iroh backend. Import this entry explicitly, never in portable code. */
+/**
+ * Node-only Iroh backend. Import this entry explicitly, never in portable code.
+ * @module beignet/lightning/iroh-node
+ */
 import type * as Binding from '@number0/iroh';
 import {
 	IROH_ALPN,

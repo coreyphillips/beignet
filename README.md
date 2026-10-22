@@ -136,9 +136,44 @@ const utxos = wallet.listUtxos();
 const history = await wallet.getAddressHistory('bc1q...');
 ```
 
-Every fallible call returns a `Result<T>`: check `isErr()` before reading `.value`. Amounts are always satoshis.
+Most fallible calls return a `Result<T>`: check `isErr()` before reading `.value`. A few do not, so check them differently:
 
-Options worth knowing on `Wallet.create`: `network` (`EAvailableNetworks.mainnet` | `testnet` | `regtest` | `signet`), `addressType` (`p2wpkh` default, `p2sh-p2wpkh`, `p2pkh`, `p2tr`), `passphrase`, `account`, `storage`, `logger`, `coinSelectPreference`, `feeEstimationSource`, `gapLimitOptions`.
+- `getAddress()` resolves to `''` when it cannot derive an address.
+- `getFeeEstimates()` never errs. When its sources fail it returns the previous estimates or built-in defaults (fixed values on regtest).
+- `updateAddressType()` throws on a type the wallet cannot use, and `resetAddressIndexes()` resolves to nothing.
+
+Balances, UTXO values and send amounts are satoshis, and fee rates are sat/vB. The value fields of stored transactions (`wallet.transactions`, `IFormattedTransaction.value`, `fee`, `totalInputValue` and the rest) are **BTC**, as decoded from the raw transaction: convert them with `btcToSats` before comparing them with anything else.
+
+Options worth knowing on `Wallet.create`: `network` (`EAvailableNetworks.mainnet` | `testnet` | `regtest` | `signet`), `addressType` (`EAddressType.p2wpkh` default, `p2sh` for P2SH-wrapped segwit, `p2pkh`, `p2tr`), `passphrase`, `account`, `storage`, `logger`, `onMessage`, `coinSelectPreference`, `feeEstimationSource`, `gapLimitOptions`.
+
+<details>
+<summary><b>Fees, sweeping, boosting, coin control, events and shutdown</b></summary>
+
+```typescript
+import { EBoostType } from 'beignet';
+
+const fees = await wallet.getFeeEstimates(); // { fast, normal, slow, minimum, timestamp }, sat/vB
+await wallet.sendMax({ address: 'bc1q...', satsPerByte: fees.normal }); // sweeps every unfrozen coin
+
+// Fee bumping an unconfirmed transaction
+wallet.canBoost(txid);                     // { canBoost, rbf, cpfp }
+wallet.getBoostableTransactions();         // { rbf: [...], cpfp: [...] }
+await wallet.boost({ txid, type: EBoostType.rbf, satsPerByte: 20 }); // or EBoostType.cpfp
+
+// Coin control: a frozen coin is left out of every coin selection
+await wallet.freezeUtxo({ txid, index: 0 });
+await wallet.unfreezeUtxo({ txid, index: 0 });
+wallet.listUtxos();           // every coin, frozen ones included
+wallet.listFrozenUtxos();
+wallet.getBalanceBreakdown(); // { total, spendable, frozen }
+
+// Waits (up to refreshTimeout) for an in-flight refresh and queued storage writes
+await wallet.stop();
+```
+
+`onMessage(key, data)` on `Wallet.create` receives wallet events. The keys are `newBlock`, `transactionReceived`, `transactionSent`, `transactionConfirmed` (each with `{ transaction }`), `reorg` (the affected UTXOs), `rbf` (the replaced txids), `connectedToElectrum` (`true` or `false`) and `storageWriteFailed` (a write storage refused). `disableMessages: true` silences them, and `disableMessagesOnCreate: true` holds them until the first refresh ends, so stored history does not replay as news.
+
+</details>
 
 <details>
 <summary><b>Custom Electrum servers, failover, fee sources, BIP21</b></summary>
@@ -172,7 +207,7 @@ const res = await Wallet.create({
 <details>
 <summary><b>Watch-only wallets (account xpub)</b></summary>
 
-Built from an account-level extended public key instead of a mnemonic. The key is assumed to sit at `m/purpose'/coin'/account'` (e.g. `m/84'/0'/0'`), so addresses derive as `xpub/0/i` and `xpub/1/i`. SLIP-132 version bytes are normalized: `zpub`/`vpub` implies p2wpkh, `ypub`/`upub` implies p2sh-p2wpkh, a plain `xpub`/`tpub` uses `addressType` (default p2wpkh). One account xpub yields exactly one address type, so a watch-only wallet monitors only that type.
+Built from an account-level extended public key instead of a mnemonic. The key is assumed to sit at `m/purpose'/coin'/account'` (e.g. `m/84'/0'/0'`), so addresses derive as `xpub/0/i` and `xpub/1/i`. SLIP-132 version bytes are normalized: `zpub`/`vpub` implies p2wpkh, `ypub`/`upub` implies p2sh-p2wpkh (`EAddressType.p2sh`), a plain `xpub`/`tpub` uses `addressType` (default p2wpkh). One account xpub yields exactly one address type, so a watch-only wallet monitors only that type.
 
 ```typescript
 const res = await Wallet.createWatchOnly({
@@ -280,7 +315,9 @@ await coordinator.broadcastTransaction(finalized.value.txHex);
 // 'Input 0 is below the multisig threshold: have 1 signature(s), need 2.'
 
 // Interop: import into Bitcoin Core / Sparrow / Specter.
-coordinator.exportDescriptors();
+const exported = coordinator.exportDescriptors(); // Result<IExportDescriptorsResponse>
+if (exported.isErr()) return;
+exported.value.descriptors[0].external;
 // wsh(sortedmulti(2,[fp/48h/0h/0h/2h]xpub.../0/*,[fp]xpub.../0/*,...))#checksum
 ```
 
@@ -364,7 +401,7 @@ node.listInvoices();
 await node.destroy();
 ```
 
-Events: `node:ready`, `channel:ready`, `channel:closed`, `channel:resolved`, `peer:connect`, `peer:disconnect`, `peer:error`, `payment:sent`, `payment:received`, `node:error`, `log`.
+`BeignetNode` is a typed emitter: `node.on('channel:ready', ({ channelId }) => ...)`. Every event, its payload and whether the daemon relays it over SSE is in the [generated events table](src/cli/README.md#events); every `BeignetNode.create` option is in the [options table](src/cli/README.md#factory).
 
 Useful variants: `payInvoiceSafe` (never throws), `payInvoiceWithRetry({ maxRetries, backoffMs, maxFeeSats })`, `sendPaymentAsync` (returns the hash immediately), `connectAndOpenChannel`, `openChannelAndWait`, `sendKeysend`, `createOffer`/`payOffer`, `spliceIn`/`spliceOut`, `backup`, `gracefulShutdown`.
 
@@ -513,8 +550,7 @@ node can run for others, each an explicit opt-in switched on with an exact
 | `BEIGNET_FFOR_WITNESS` | Store a receiver-encrypted record of every delegated preimage this node relays before propagating the fulfil (a receipt witness). `BEIGNET_FFOR_WITNESS_MAX_MAILBOXES` and `BEIGNET_FFOR_WITNESS_MAX_BYTES` cap it. `GET /ffor/witness/status`. |
 | `BEIGNET_FFOR_ISSUER` | Answer BOLT 12 invoice requests for offers a receiver delegated to this node, one fixed-amount slot per invoice. Needs the witness. `GET /ffor/issuer/status`. |
 
-The SSE stream carries `ffor:state`, `ffor:settled`, `ffor:slot-resolved`, `ffor:delegated-failed`,
-`ffor:enforce` and the witness and issuer events.
+The SSE stream carries every `ffor:*` event (see the [events table](src/cli/README.md#events)).
 
 The experimental concurrent profile keeps ordinary payments available
 within the channel's remaining capacity. `LightningNode.fforSync()` fetches paid
@@ -555,10 +591,8 @@ depth and been re-verified unspent immediately before the dispatch, binds
 every HTLC of the payment to `refundHeight` minus its claim margins, judges
 the payment by the node's own HTLC view (never by a wall clock or a failed
 record while an HTLC is out), and persists its claim before broadcasting it.
-The SSE stream carries `swap:created` through `swap:settled`, `swap:refunded`
-and `swap:exposed` for the reverse direction and `swap:funding-seen`,
-`swap:paying`, `swap:preimage`, `swap:claim-broadcast`,
-`swap:claim-confirmed` and `swap:payment-failed` for the submarine one.
+The SSE stream carries every `swap:*` event of both directions (see the
+[events table](src/cli/README.md#events)).
 
 ## Protocol layer (advanced)
 
@@ -600,14 +634,14 @@ node.on('node:error', (err) => console.error(`[${err.code}]`, err.message));
 Without a `fundingProvider`, build the funding transaction yourself and call `node.createFunding(channel, fundingTxid, outputIndex, signature)` after `openChannel`.
 
 ```
-LightningNode              High-level API (EventEmitter)
+LightningNode              High-level API (typed EventEmitter)
   ├── ChannelManager       Multiplexes messages to Channel instances
-  │     └── Channel        BOLT 2 state machine (returns ChannelAction[])
-  ├── PeerManager          TCP connections + Noise_XK encrypted transport
+  │     ├── Channel        BOLT 2 state machine (returns ChannelAction[])
+  │     └── ChainMonitor   BOLT 5 force-close detection + sweep
+  ├── PeerManager          TCP/WebSocket connections + Noise_XK encrypted transport
   │     └── Peer           Per-connection BOLT 8 handshake + message framing
   ├── NetworkGraph         BOLT 7 gossip topology + Dijkstra pathfinding
-  ├── InvoiceManager       BOLT 11 encode/decode/sign
-  ├── ChainMonitor         BOLT 5 force-close detection + sweep
+  ├── invoice (module)     BOLT 11 encode/decode/sign functions
   └── FundingProvider?     Auto-builds + broadcasts funding txs (via Wallet)
 ```
 
@@ -615,66 +649,9 @@ LightningNode              High-level API (EventEmitter)
 
 **→ [src/lightning/README.md](src/lightning/README.md)** documents the protocol layer in detail: data flow, events reference, typed payment errors, channel lifecycle, zero-conf, anchors, dual funding, splicing, offers, onion messages, forwarding, chain monitoring.
 
-<details>
-<summary><b>BOLT coverage</b></summary>
-
-| BOLT | Specification | Implemented |
-|------|--------------|-------------|
-| 1 | Base Protocol | Peer messaging, init, error, ping/pong, feature negotiation, peer storage |
-| 2 | Channel Management | Full state machine: open, fund, normal operation, shutdown, close, reestablish; v2 dual-funded opens (interactive-tx), splicing, quiescence |
-| 3 | Transactions | Commitment txs, HTLC scripts, funding scripts, anchor outputs, fee calculation; simple taproot channels (MuSig2 funding, Schnorr HTLC sigs) |
-| 4 | Onion Routing | Sphinx encryption, TLV hop payloads, payment_secret, failure codes, route blinding, onion messages |
-| 5 | On-Chain | Force-close detection, HTLC sweep, output resolution, chain monitoring, wallet-funded anchor fee bumping (commitment CPFP + zero-fee HTLC fee-attach) |
-| 7 | Gossip | Channel/node announcements, network graph, Dijkstra routing, gossip sync, Rapid Gossip Sync |
-| 8 | Transport | Noise_XK handshake, encrypted transport, key rotation |
-| 9 | Features | DATA_LOSS_PROTECT, STATIC_REMOTE_KEY, PAYMENT_SECRET, TLV_ONION, BASIC_MPP, CHANNEL_TYPE, GOSSIP_QUERIES, ANCHORS_ZERO_FEE_HTLC_TX (default), ROUTE_BLINDING, ONION_MESSAGES, QUIESCE, SCID_ALIAS, ZERO_CONF, KEYSEND, OPTION_TAPROOT, OPTION_WILL_FUND |
-| 10 | DNS Bootstrap | Seed resolution for discovering initial peers |
-| 11 | Invoices | Encode, decode, sign, verify, amount formatting, hold invoices |
-| 12 | Offers | Offer encode/decode, invoice_request/invoice over onion messages, receive-side settlement, async payment offers |
-| bLIP-51 | Liquidity Ads | lease_rates/request_funds/will_fund negotiation, lease fee accounting, CLTV-locked lessor to_local, advisor lease quoting |
-
-</details>
-
-<details>
-<summary><b>Module reference (<code>src/lightning/</code>)</b></summary>
-
-| Module | Description |
-|--------|-------------|
-| `crypto/` | ChaCha20-Poly1305 AEAD, ECDH, HKDF, MuSig2 (BIP 327) for taproot channels |
-| `message/` | Wire encode/decode for all channel, gossip and control messages |
-| `features/` | Feature flag bitmap management (BOLT 9) |
-| `transport/` | Noise_XK handshake, transport cipher, TCP/WebSocket peer connections, PeerManager |
-| `keys/` | HD derivation, per-commitment secrets (shachain), signing, wallet keys |
-| `script/` | Funding 2-of-2 multisig, commitment outputs, HTLC scripts, revocation, anchors, taproot scripts |
-| `channel/` | Channel state machine, ChannelManager, commitment builder, actions, validation, liquidity ads |
-| `chain/` | ChainMonitor, ChainWatcher, output resolver, closing tx, sweep tx, Electrum backend |
-| `invoice/` | BOLT 11 encoding/decoding, bech32 words, signature verification |
-| `gossip/` | NetworkGraph, Dijkstra pathfinding, gossip sync state machine, SCID encoding |
-| `onion/` | Sphinx crypto, packet construction/processing, hop payloads, failures, blinded paths |
-| `onion-message/` | Onion message construction/processing (carries BOLT 12 and async-payment messages) |
-| `offer/` | BOLT 12 offers: encode/decode, OfferManager invoice_request/invoice flows |
-| `async-payments/` | Hold invoices and AsyncPaymentManager (LSP held-forward, release_held_htlc, wake) |
-| `ffor/` | FFOR Variant D offline receive: signed epoch lifecycle, voucher book, transcript hashes, delegated settlement arithmetic |
-| `interactive-tx/` | Interactive transaction construction for v2 dual-funded opens and splicing |
-| `watchtower/` | Altruist watchtower client: wtwire protocol, justice blobs, tower sessions |
-| `backup/` | Static channel backup (SCB) export/import |
-| `recovery/` | Safety transition layer: atomic persistence, the durable outbound-message outbox, the opt-in hash-chained recovery journal, and the peer_storage Recovery Capsule |
-| `liquidity/` | JIT channel receive (LSP role): intercept SCIDs, held HTLCs, zero-conf open or splice, then forward; the opening fee is skimmed off the delivery for wallets that accept it, or charged to the sender through the invoice hint (hop mode) for wallets that cannot settle a short HTLC |
-| `direct-funding/` | Third-party direct funding: the signed payment request envelope, sealed frames, protocol messages, outstanding-request store, the transport registry with its direct-peer, onion and blind-relay lanes, the receiver engine that turns a payer's offered UTXO into channel funding, and the payer engine that verifies and signs it |
-| `swaps/` | Swaps: the P2WSH HTLC contract, claim/refund transactions, preimage extraction, admission policies, the durable swap ledger, the chain resolver, the wire protocol, and the swap provider engines (reverse: Lightning to on-chain; submarine: on-chain to Lightning) |
-| `l402/` | L402 (Lightning HTTP 402) client: challenge parsing, macaroon reading, paid credentials |
-| `node/` | LightningNode orchestrator, the main protocol-layer entry point |
-| `wallet/` | WalletFundingProvider, adapts the on-chain Wallet for auto-funded opens |
-| `bootstrap/` | DNS seed resolution for discovering initial peers |
-| `advisor/` | Liquidity, fee and channel-suggestion advisors |
-| `storage/` | SQLite persistence backend, channel state serialization |
-| `validation/` | Input validation shared across modules |
-
-`beignet/lightning` re-exports each of these as a namespace, camel-casing hyphenated names: `import { asyncPayments, ffor, watchtower } from 'beignet/lightning'`.
+The protocol-layer README has the [BOLT coverage table](src/lightning/README.md#bolt-specification-coverage) and the [module reference](src/lightning/README.md#module-reference), one row per module of `src/lightning/` with its key exports. `beignet/lightning` re-exports each module as a namespace, camel-casing hyphenated names: `import { asyncPayments, ffor, watchtower } from 'beignet/lightning'`.
 
 `SqliteStorage` and `GuardianStore` load from `beignet/lightning/sqlite`. They need `better-sqlite3`, an optional dependency that npm installs by default, and `beignet/lightning` loads without it.
-
-</details>
 
 ## Tests
 
@@ -690,19 +667,19 @@ every TypeScript file.
 
 ```bash
 npm run test:local         # test:lightning + test:cli at once; no infrastructure needed
-npm run test:lightning     # 6200+ Lightning unit tests (parallel), no infrastructure needed
-npm run test:cli           # 1350+ CLI + daemon unit tests (parallel), no infrastructure needed
-npm run test:conformance   # 250+ official BOLT vector cases (subset of test:lightning)
+npm run test:lightning     # 9500+ Lightning unit tests (parallel), no infrastructure needed
+npm run test:cli           # 2200+ CLI + daemon unit tests (parallel), no infrastructure needed
+npm run test:conformance   # 300+ official BOLT vector cases (subset of test:lightning)
 npm run test:chaos         # recovery kill matrices (parallel), split out of test:lightning
 npm run test:sigkill       # process-level SIGKILL chaos matrix (builds dist first)
 npm run test:integration   # daemon/Electrum integration (needs an Electrum server)
-npm run test:interop       # 190+ cases vs LND/CLN/Eclair (needs Docker)
+npm run test:interop       # 300+ cases vs LND/CLN/Eclair (needs Docker)
 npm run test:interop:ffor  # FFOR Variant D chain gates on regtest (needs only the bitcoind container)
 npm run test:interop:ffor-concurrent  # Concurrent receive process, durable boundary and current-chain qualification (bitcoind regtest)
 npm run test:all           # Lightning + CLI + interop (needs Docker + Electrum)
 ```
 
-Counts are floors, not snapshots. Run the suites for exact numbers.
+Counts are floors, not snapshots, and this is the only place they are kept. Run the suites for exact numbers (`npx mocha --dry-run` with a suite's arguments counts without running).
 
 `test:local` is the fast inner loop. `test:lightning` and `test:cli` are
 independent processes and neither saturates the machine alone, so running them at
@@ -816,14 +793,9 @@ Nothing in the `beignet` entry loads Node `crypto` until `createEncryptedStorage
 
 ## Documentation
 
-| Document | Contents |
-|----------|----------|
-| [example/REPL_TESTING.md](example/REPL_TESTING.md) | Copy-pasteable REPL walkthrough of the full node lifecycle |
-| [docs/AI_AGENT_GUIDE.md](docs/AI_AGENT_GUIDE.md) | Deployment, monitoring, safety rails, HTTP daemon patterns |
-| [src/lightning/README.md](src/lightning/README.md) | Protocol-layer reference and usage guide |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | Feature roadmap and progress |
-| [docs/RECOVERY-PROTOCOL.md](docs/RECOVERY-PROTOCOL.md) | Proposed replicated state-continuity design |
-| [API reference](docs/markdown/classes/Wallet.md) | Generated typedoc ([HTML](docs/html/classes/Wallet.html)) |
+[docs/README.md](docs/README.md) indexes every guide, reference and design document in the repository.
+
+The API reference for every entry point (`beignet`, `beignet/cli`, `beignet/lightning`, `beignet/lightning/sqlite`, `beignet/lightning/iroh-node`) is generated by typedoc and not kept in git. CI builds it on every run and uploads it as the `api-docs` artifact of the docs workflow; `npm run docs:html` (or `docs:markdown`) builds it locally into `api-docs/`.
 
 ## Support
 

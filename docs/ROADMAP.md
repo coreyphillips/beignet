@@ -1,5 +1,8 @@
 # Beignet Feature Roadmap
 
+> Historical. This checklist was last updated on 2026-07-24 and is no longer
+> maintained; open work is tracked in GitHub issues.
+
 Working checklist from the full feature-completeness review (2026-07-09). Items get
 checked off as they land on master. Each substantive item gets its own branch + PR.
 One milestone per session is the default pace; smaller milestones can share a session.

@@ -1401,10 +1401,19 @@ export interface PaymentValidationCheck {
 	message: string;
 }
 
+/**
+ * Every event BeignetNode emits, with its listener's signature. The Events
+ * table in src/cli/README.md is generated from this map (`npm run
+ * docs:tables`), so the description of each event lives here.
+ */
 export interface BeignetNodeEvents {
+	/** Incoming payment settled. */
 	'payment:received': (info: PaymentInfo) => void;
+	/** Outgoing payment completed. */
 	'payment:sent': (info: PaymentInfo) => void;
+	/** Outgoing payment failed. */
 	'payment:failed': (info: PaymentInfo) => void;
+	/** payInvoiceWithRetry is about to wait nextRetryMs and try again after a retryable failure. */
 	'payment:retry': (data: {
 		paymentHash: string;
 		attempt: number;
@@ -1412,20 +1421,22 @@ export interface BeignetNodeEvents {
 		nextRetryMs: number;
 		error: string;
 	}) => void;
+	/** An invoice this node issued was paid. A keysend fires only `payment:received`. */
 	'invoice:settled': (data: {
 		paymentHash: string;
 		bolt11: string;
 		amountSats: number;
 	}) => void;
 	/**
-	 * Hold-invoice lifecycle (issue #746). `hold:accepted` fires for each new
-	 * parked part, including partial MPP payments. Before funding a swap,
-	 * compare BigInt(heldAmountMsat) with the full expected amount in msat.
-	 * ACCEPTED alone does not mean the invoice is fully funded. These events
-	 * are always relayed, regardless of htlcEvents.
+	 * A part joined a hold invoice's parked set (issue #746), fired for each
+	 * new part, including partial MPP payments. Before funding a swap, compare
+	 * BigInt(heldAmountMsat) with the full expected amount in msat: ACCEPTED
+	 * alone does not mean the invoice is fully funded.
 	 */
 	'hold:accepted': (data: HoldInvoiceEvent) => void;
+	/** A hold invoice's preimage was revealed and every parked part fulfilled. */
 	'hold:settled': (data: HoldInvoiceEvent) => void;
+	/** A hold invoice was cancelled and every parked part failed back. */
 	'hold:cancelled': (
 		data: HoldInvoiceEvent & {
 			/** The CLTV sweeper (`expiry-scan`) or an explicit cancel (`api`). */
@@ -1433,23 +1444,26 @@ export interface BeignetNodeEvents {
 		}
 	) => void;
 	/**
-	 * On-chain lifecycle, one appearance and at most one confirmation per
-	 * transaction. `transaction:received` fires when an incoming transaction
-	 * first appears, `transaction:sent` when an outgoing one does; either may
-	 * already carry a height when the transaction was found at a catch-up
-	 * sync after downtime, and no separate confirmation fires for that case.
-	 * `transaction:confirmed` fires only for the transition, a transaction
-	 * the wallet already held moving from the mempool into a block, in
-	 * either direction with `info.type` saying which. Initial-sync history
-	 * does not replay as events.
+	 * An incoming on-chain transaction first appeared. It may already carry a
+	 * height when it was found at a catch-up sync after downtime, and no
+	 * separate `transaction:confirmed` fires then. Initial-sync history does
+	 * not replay as events.
 	 */
 	'transaction:received': (info: OnchainTxInfo) => void;
+	/** An outgoing on-chain transaction first appeared; the same rules as `transaction:received`. */
 	'transaction:sent': (info: OnchainTxInfo) => void;
+	/**
+	 * A transaction the wallet already held moved from the mempool into a
+	 * block, in either direction (`info.type` says which). At most one per
+	 * transaction.
+	 */
 	'transaction:confirmed': (info: OnchainTxInfo) => void;
 	/** A replacement was observed: the listed txids were replaced (RBF) and
 	 *  are dead; whatever was watching them should stop (issue #548). */
 	'onchain:rbf': (data: { txids: string[] }) => void;
+	/** Funding was negotiated and the funding transaction broadcast or watched. */
 	'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
+	/** The channel reached NORMAL state. */
 	'channel:ready': (data: { channelId: string }) => void;
 	/**
 	 * The channel can take a new HTLC again: it reached NORMAL on
@@ -1458,14 +1472,17 @@ export interface BeignetNodeEvents {
 	 * The payment queues start and retry on it (issue #967).
 	 */
 	'channel:usable': (data: { channelId: string }) => void;
+	/** A cooperative close started, by this node (`local`) or the peer (`remote`). */
 	'channel:pending-close': (data: {
 		channelId: string;
 		initiator: 'local' | 'remote';
 	}) => void;
+	/** A force close started: this node broadcast its commitment (`local`) or the peer's appeared on chain (`remote`). */
 	'channel:force-closing': (data: {
 		channelId: string;
 		initiator: 'local' | 'remote';
 	}) => void;
+	/** The funding output was spent and the spend classified. Outputs may still be unswept: `channel:resolved` is the terminal event. */
 	'channel:closed': (data: { channelId: string }) => void;
 	/** The true terminal event of a close: every on-chain output of the channel is irrevocably swept or claimed and the channel state becomes CLOSED. */
 	'channel:resolved': (data: { channelId: string }) => void;
@@ -1492,6 +1509,7 @@ export interface BeignetNodeEvents {
 		spliceTxid: string;
 		conflictTxid: string;
 	}) => void;
+	/** A forward through this node settled and earned feeMsat. Msat values are decimal strings. */
 	'htlc:forwarded': (data: {
 		inChannelId: string;
 		outChannelId: string;
@@ -1499,11 +1517,17 @@ export interface BeignetNodeEvents {
 		amountOutMsat: string;
 		feeMsat: string;
 	}) => void;
+	/** The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */
 	'htlc:fulfilled': (data: { channelId: string; htlcId: string }) => void;
+	/** The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */
 	'htlc:failed': (data: { channelId: string; htlcId: string }) => void;
+	/** A peer connected. */
 	'peer:connect': (data: { pubkey: string }) => void;
+	/** A peer disconnected. */
 	'peer:disconnect': (data: { pubkey: string }) => void;
+	/** A peer connection reported an error. */
 	'peer:error': (data: { pubkey: string; message: string }) => void;
+	/** An operational error (non-fatal), also passed to the onError option. `code` is a NodeErrorCode or one BeignetNode raises itself, such as ELECTRUM_FAILOVER_FAILED. */
 	'node:error': (data: {
 		code: string;
 		message: string;
@@ -1529,6 +1553,7 @@ export interface BeignetNodeEvents {
 		 */
 		retained?: boolean;
 	}) => void;
+	/** The node is fully operational: peers reconnected and channels restored. */
 	'node:ready': () => void;
 	/**
 	 * A deferred restore of the stored network map (deferGraphRestore)
@@ -1551,27 +1576,30 @@ export interface BeignetNodeEvents {
 		busyMs: number;
 		slices: number;
 	}) => void;
+	/** A structured log entry at or above the logLevel option. */
 	log: (entry: {
 		level: string;
 		message: string;
 		data?: Record<string, unknown>;
 		timestamp: number;
 	}) => void;
+	/** A scheduled database backup (backupPath) was written. */
 	'backup:completed': (data: { path: string; timestamp: number }) => void;
+	/** A scheduled database backup (backupPath) failed. */
 	'backup:failed': (data: {
 		path: string;
 		error: string;
 		timestamp: number;
 	}) => void;
+	/** The wallet reconnected to the next of electrumServers after the current one failed. */
 	'electrum:failover': (data: {
 		from: { host: string; port: number };
 		to: { host: string; port: number };
 		timestamp: number;
 	}) => void;
-	/** Recovery Protocol (docs/RECOVERY-PROTOCOL.md section 8). The first
-	 *  three originate in LightningNode and are relayed JSON-safe; the last
-	 *  three originate here (the daemon owns the barrier and the restore). */
+	/** Recovery Protocol (docs/RECOVERY-PROTOCOL.md section 8): the journal is durable through this frame sequence. */
 	'recovery:durable': (data: { through: string }) => void;
+	/** A newer writer epoch owns this recovery namespace: this device must not send another channel message. supersededBy is the superseding writer's guardian state when the barrier saw one. */
 	'recovery:fenced': (data: {
 		supersededBy: {
 			epoch: string;
@@ -1580,6 +1608,7 @@ export interface BeignetNodeEvents {
 			frameHash: string;
 		} | null;
 	}) => void;
+	/** The journal was compacted past frames a guardian had not yet received, so that guardian cannot be backfilled. */
 	'recovery:backfill-lost': (data: { detail: string }) => void;
 	/** peer-storage mode: a peer's channel_reestablish for a channel this node
 	 *  has no record of was held instead of failed (issue #462). Apply a
@@ -1589,6 +1618,7 @@ export interface BeignetNodeEvents {
 		channelId: string;
 		expiresAt: number;
 	}) => void;
+	/** A durability barrier could not reach a guardian. */
 	'recovery:guardian_unreachable': (data: {
 		detail: string;
 		sequence?: string;
@@ -1605,7 +1635,9 @@ export interface BeignetNodeEvents {
 		channelCount: number;
 		candidates: number;
 	}) => void;
+	/** A step of a guardian or capsule restore. */
 	'recovery:restore-progress': (data: { type: string; detail: string }) => void;
+	/** A guardian or capsule restore finished. */
 	'recovery:restored': (data: {
 		exact: boolean;
 		framesApplied: number;
@@ -1619,49 +1651,47 @@ export interface BeignetNodeEvents {
 		 *  installed state (the automatic path), so no restart follows. */
 		resumed?: boolean;
 	}) => void;
-	/**
-	 * Guardian hosting (issue #699): this node started serving a set; a
-	 * quota refused a registration or a write; a session violated framing
-	 * and was dropped.
-	 */
+	/** Guardian hosting (issue #699): this node started serving a guardian set. */
 	'guardian:set-registered': (data: { detail: string; setId?: string }) => void;
+	/** Guardian hosting: a quota refused a registration or a write. */
 	'guardian:quota-refused': (data: { detail: string; setId?: string }) => void;
+	/** Guardian hosting: a session violated framing and was dropped. */
 	'guardian:session-violation': (data: {
 		detail: string;
 		peer?: string;
 	}) => void;
-	/**
-	 * Guardian-set rotation (wire 5.9, issue #701): each step of a rotation
-	 * this node runs; the switch, with the set that carries the journal from
-	 * then on; and a boot that followed a retired set to the live one.
-	 */
+	/** Guardian-set rotation (wire 5.9, issue #701): a step of a rotation this node runs. */
 	'recovery:rotation-progress': (data: {
 		type: string;
 		detail: string;
 		generation?: string;
 	}) => void;
+	/** Guardian-set rotation: the switch, with the set that carries the journal from then on. */
 	'recovery:rotated': (data: {
 		generation: string;
 		guardians: Array<{ guardianId: string; url: string }>;
 	}) => void;
+	/** Guardian-set rotation: this boot followed a retired set to the live one. */
 	'recovery:rotation-followed': (data: {
 		generation: string;
 		from: string[];
 		to: string[];
 	}) => void;
-	/**
-	 * FFOR offline receive (issue #729). Relayed JSON-safe: buffers as hex,
-	 * amounts as decimal strings. ffor:state carries the epoch's committed
-	 * state changes with the same record view GET /ffor/epoch serves.
-	 */
+	// FFOR offline receive (issue #729). Relayed JSON-safe: buffers as hex,
+	// amounts as decimal strings.
+	/** An FFOR epoch's committed state changed, with the same record view GET /ffor/epoch serves. */
 	'ffor:state': (data: {
 		channelId: string;
 		state: string;
 		epoch: Record<string, unknown>;
 	}) => void;
+	/** Settlement peer side: a delegated slot settled upstream. */
 	'ffor:settled': (data: Record<string, unknown>) => void;
+	/** A concurrent-profile slot reached its terminal outcome. */
 	'ffor:slot-resolved': (data: Record<string, unknown>) => void;
+	/** Settlement peer side: a delegated slot's payment was failed back upstream. */
 	'ffor:delegated-failed': (data: Record<string, unknown>) => void;
+	/** A peer contradicted an ACTIVE FFOR epoch: enforce it on chain (POST /ffor/enforce). */
 	'ffor:enforce': (data: {
 		channelId: string;
 		epoch: Record<string, unknown>;
@@ -1680,50 +1710,74 @@ export interface BeignetNodeEvents {
 		 */
 		reestablishSecretMissing?: true;
 	}) => void;
+	/** Witness role: a receiver provisioned a mailbox on this node. */
 	'ffor:witness-provisioned': (data: Record<string, unknown>) => void;
+	/** Witness role: a delegated preimage's record was stored. */
 	'ffor:witness-recorded': (data: Record<string, unknown>) => void;
+	/** Witness role: a held fulfil was propagated, once recorded or at its CLTV deadline. */
 	'ffor:witness-released': (data: Record<string, unknown>) => void;
+	/** Witness role: a provision was refused with the reason. */
 	'ffor:witness-refused': (data: Record<string, unknown>) => void;
+	/** Witness role: the receiver closed its mailbox; held records remain. */
 	'ffor:witness-closed': (data: Record<string, unknown>) => void;
+	/** Witness role: a mailbox passed its retention and expired. */
 	'ffor:witness-expired': (data: Record<string, unknown>) => void;
+	/** A witness record fetched for a slot failed verification. */
 	'ffor:witness-audit': (data: Record<string, unknown>) => void;
+	/** Issuer role: a receiver delegated an offer and provisioned its slots. */
 	'ffor:issuer-provisioned': (data: Record<string, unknown>) => void;
+	/** Issuer role: an invoice was issued against a slot to a payer. */
 	'ffor:issuer-issued': (data: Record<string, unknown>) => void;
+	/** Issuer role: a delegated offer stopped issuing, with the reason. */
 	'ffor:issuer-retired': (data: Record<string, unknown>) => void;
-	// Reverse swap provider (issue #737): swapId, paymentHash (hex), state,
-	// onchainSat and invoiceMsat (decimal strings), refundHeight, plus the
-	// transition's own facts (funding txid, claim txid, refund txid, reason).
+	// Swap provider (issues #737 and #743). Every payload is an ISwapEvent:
+	// swapId, paymentHash (hex), peer, state, onchainSat and invoiceMsat
+	// (decimal strings) and refundHeight, direction 'submarine' on submarine
+	// swaps, plus the transition's own facts (funding, claim or refund txid,
+	// reason).
+	/** A swap row was created: for a reverse swap with its hold invoice minted, for a submarine swap once its terms verified. */
 	'swap:created': (data: Record<string, unknown>) => void;
+	/** Reverse swap: the complete committed payment set is held by the hold invoice; a partial MPP set never funds. */
 	'swap:held': (data: Record<string, unknown>) => void;
+	/** Reverse swap: the funding transaction was built, verified and recorded, and is being broadcast. */
 	'swap:funding': (data: Record<string, unknown>) => void;
+	/** The swap's funding confirmed to the configured depth. */
 	'swap:funded': (data: Record<string, unknown>) => void;
+	/** Reverse swap: a claim spend with a verified preimage was seen at any depth; the preimage is recorded before the hold settles. */
 	'swap:claimed': (data: Record<string, unknown>) => void;
+	/** Reverse swap: the hold was released with the claimed preimage. */
 	'swap:settled': (data: Record<string, unknown>) => void;
+	/** Reverse swap: no claim by the refund height, so a refund to the node's sweep destination was broadcast. */
 	'swap:refund-broadcast': (data: Record<string, unknown>) => void;
+	/** Reverse swap: the refund confirmed, and only then the hold is cancelled. */
 	'swap:refunded': (data: Record<string, unknown>) => void;
+	/** Reverse swap: the hold invoice was cancelled. */
 	'swap:hold-cancelled': (data: Record<string, unknown>) => void;
+	/** Funds are at risk: on a reverse swap the hold was cancelled while coins were or may be on chain; on a submarine swap a payment is out while the contract is not claimable. */
 	'swap:exposed': (data: Record<string, unknown>) => void;
+	/** The swap failed, with the reason. */
 	'swap:failed': (data: Record<string, unknown>) => void;
-	// Submarine swap provider (issue #743): the same envelope with
-	// direction 'submarine', plus the payment ceiling, claim txid and fee.
+	/** Submarine swap: an output paying the contract, of at least the amount, was seen at any depth. */
 	'swap:funding-seen': (data: Record<string, unknown>) => void;
+	/** Submarine swap: the unconfirmed funding was replaced or vanished and none is left. */
 	'swap:funding-lost': (data: Record<string, unknown>) => void;
+	/** Submarine swap: this node started paying the client's invoice under the swap's expiry ceiling. */
 	'swap:paying': (data: Record<string, unknown>) => void;
+	/** Submarine swap: HTLCs are still out past the unresolved threshold (informational). */
 	'swap:payment-unresolved': (data: Record<string, unknown>) => void;
+	/** Submarine swap: the payment's preimage is known, from a fulfil or a claim seen on chain downstream. */
 	'swap:preimage': (data: Record<string, unknown>) => void;
+	/** Submarine swap: the claim to the sweep destination was built, persisted and broadcast. */
 	'swap:claim-broadcast': (data: Record<string, unknown>) => void;
+	/** Submarine swap: the claim confirmed to the resolution depth. */
 	'swap:claim-confirmed': (data: Record<string, unknown>) => void;
+	/** Submarine swap: every HTLC ended without a preimage; a preimage learned later still promotes the row. */
 	'swap:payment-failed': (data: Record<string, unknown>) => void;
+	/** Submarine swap: cancelled before anything was paid (invoice expired, ceiling no longer fits, client spent the funding, or the operator cancelled). */
 	'swap:cancelled': (data: Record<string, unknown>) => void;
-	/**
-	 * JIT receive, LSP side (issue #669). Relayed JSON-safe: every satoshi and
-	 * millisatoshi figure is a decimal string. `jit:intent` is a wallet's
-	 * accepted request, keyed by the intercept scid the LSP minted for it;
-	 * `jit:intercepted` a payment part held for it (or, on the splice path,
-	 * for an existing channel); `jit:funding` the open or splice starting;
-	 * `jit:forwarded` the held parts delivered; `jit:failed` the parts failed
-	 * back upstream with the reason.
-	 */
+	// JIT receive, LSP side (issue #669). Relayed JSON-safe: every satoshi and
+	// millisatoshi figure is a decimal string.
+	/** A wallet's request was accepted, keyed by the intercept scid this LSP minted for it. */
 	'jit:intent': (data: {
 		scidHex: string;
 		walletPubkeyHex: string;
@@ -1733,25 +1787,30 @@ export interface BeignetNodeEvents {
 		targetRemainingInboundSat: string;
 		expiresAt: number;
 	}) => void;
+	/** An idle intent was replaced by a newer one from the same wallet. */
 	'jit:intent-superseded': (data: {
 		scidHex: string;
 		walletPubkeyHex: string;
 	}) => void;
+	/** A payment part was held for an intent, or on the splice path for an existing channel. */
 	'jit:intercepted': (data: {
 		scidHex?: string;
 		channelIdHex?: string;
 		amountMsat: string;
 	}) => void;
+	/** The zero-conf open or the splice that funds the held parts started. */
 	'jit:funding': (data: {
 		scidHex?: string;
 		channelIdHex?: string;
 		fundingSats: string;
 	}) => void;
+	/** The held parts were delivered over the new liquidity. */
 	'jit:forwarded': (data: {
 		scidHex?: string;
 		channelIdHex?: string;
 		parts: number;
 	}) => void;
+	/** The held parts were failed back upstream with the reason. */
 	'jit:failed': (data: {
 		scidHex?: string;
 		channelIdHex?: string;
@@ -1759,23 +1818,26 @@ export interface BeignetNodeEvents {
 		reason: string;
 	}) => void;
 	/**
-	 * Direct funding, receiver side (issue #669): a payer's offer accepted
-	 * (`paired` says whether it came from a peer in the trusted set, which is
-	 * what decides zero-conf and the splice path), declined or failed with the
-	 * reason, or completed with the funding out.
+	 * Direct funding, receiver side (issue #669): a payer's offer was
+	 * accepted. `paired` says whether it came from a peer in the trusted set,
+	 * which decides zero-conf and the splice path; `resumed` marks one picked
+	 * up again after a restart.
 	 */
 	'direct-funding:offer:accepted': (data: {
 		offerId: string;
 		paired: boolean;
 		resumed?: boolean;
 	}) => void;
+	/** A payer's offer was declined with the reason. */
 	'direct-funding:offer:declined': (data: {
 		offerId: string;
 		reason: string;
 	}) => void;
+	/** An accepted offer failed with the reason. */
 	'direct-funding:offer:failed': (data: {
 		offerId: string;
 		reason: string;
 	}) => void;
+	/** An offer completed with the funding out. */
 	'direct-funding:offer:completed': (data: { offerId: string }) => void;
 }

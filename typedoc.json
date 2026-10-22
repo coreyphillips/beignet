@@ -1,5 +1,11 @@
 {
-  "entryPoints": ["src"],
-  "out": "docs",
+  "entryPoints": [
+    "src/index.ts",
+    "src/cli/index.ts",
+    "src/lightning/index.ts",
+    "src/lightning/sqlite.ts",
+    "src/lightning/transport/iroh-node.ts"
+  ],
+  "out": "api-docs/html",
   "readme": "none"
 }
