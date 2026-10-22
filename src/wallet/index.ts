@@ -2188,21 +2188,31 @@ export class Wallet {
 			// A call that gets here before the first refresh has stored any
 			// addresses finds a chain with none. That chain reads as -1, so its
 			// first window is derived below.
-			const highestIndex = (stored: IAddresses): number =>
-				Object.values(stored).reduce(
-					(highest, { index }) => Math.max(highest, index),
-					-1
-				);
+			const highestIndex = (stored: IAddress[]): number =>
+				stored.reduce((highest, { index }) => Math.max(highest, index), -1);
 			// Read from the map, not from what addAddresses answered: a refresh
 			// running beside this call may have stored the same window first, and
 			// addAddresses answers only the addresses it added itself.
 			const lowestAddress = (stored: IAddresses): IAddress | undefined =>
 				Object.values(stored).sort((a, b) => a.index - b.index)[0];
+			const storedAbove = (
+				stored: IAddresses,
+				checked: number,
+				through: number
+			): IAddresses => {
+				const found: IAddresses = {};
+				for (const address of Object.values(stored)) {
+					if (address.index > checked && address.index <= through) {
+						found[address.scriptHash] = address;
+					}
+				}
+				return found;
+			};
 			const originalHighestStoredIndex = highestIndex(
-				currentWallet.addresses[addressType]
+				Object.values(currentWallet.addresses[addressType])
 			);
 			const originalHighestStoredChangeIndex = highestIndex(
-				currentWallet.changeAddresses[addressType]
+				Object.values(currentWallet.changeAddresses[addressType])
 			);
 
 			const addressIndexDiff = getAddressIndexDiff(
@@ -2344,29 +2354,18 @@ export class Wallet {
 					changeAddressHasBeenUsed = true;
 				}
 
-				const highestStoredIndex = this.getHighestStoredAddressIndex({
-					addressType
-				});
-
-				if (highestStoredIndex.isErr()) {
-					this.logger.warn(highestStoredIndex.error.message);
-					return lastKnownIndexes;
-				}
-
 				const {
 					addressIndex: highestUsedAddressIndex,
 					changeAddressIndex: highestUsedChangeAddressIndex
 				} = highestUsedIndex.value;
-				const {
-					addressIndex: highestStoredAddressIndex,
-					changeAddressIndex: highestStoredChangeAddressIndex
-				} = highestStoredIndex.value;
+				// Only history this scan was answered proves a gap. The stored maps
+				// can run past it, as when a refresh beside this call extends them.
+				const checkedIndex = highestIndex(allAddresses);
+				const checkedChangeIndex = highestIndex(allChangeAddresses);
 
 				if (
-					getAddressIndexDiff(
-						highestUsedAddressIndex.index,
-						highestStoredAddressIndex.index
-					) >= this.gapLimitOptions.lookAhead
+					getAddressIndexDiff(highestUsedAddressIndex.index, checkedIndex) >=
+					this.gapLimitOptions.lookAhead
 				) {
 					foundLastUsedAddress = true;
 				}
@@ -2374,7 +2373,7 @@ export class Wallet {
 				if (
 					getAddressIndexDiff(
 						highestUsedChangeAddressIndex.index,
-						highestStoredChangeAddressIndex.index
+						checkedChangeIndex
 					) >= this.gapLimitOptions.lookAheadChange
 				) {
 					foundLastUsedChangeAddress = true;
@@ -2426,27 +2425,30 @@ export class Wallet {
 					});
 				}
 
+				// Each round checks the addresses after the last one checked, read
+				// from the map as the first window was. A round that cannot store
+				// them would check nothing new and repeat forever.
 				//Create receiving addresses for the next round
 				if (!foundLastUsedAddress) {
 					const addressAmount =
 						this.gapLimitOptions.lookAhead -
-						getAddressIndexDiff(
-							highestUsedAddressIndex.index,
-							highestStoredAddressIndex.index
-						);
+						getAddressIndexDiff(highestUsedAddressIndex.index, checkedIndex);
 					const newAddresses = await this.addAddresses({
 						addressAmount,
 						changeAddressAmount: 0,
-						addressIndex: highestStoredIndex.value.addressIndex.index + 1,
+						addressIndex: checkedIndex + 1,
 						changeAddressIndex: 0,
 						keyDerivationPath,
 						addressType,
 						saveAddresses: false
 					});
-					if (newAddresses.isOk()) {
-						this.markGrownAddressMaps(newAddresses.value);
-						addresses = newAddresses.value.addresses || {};
-					}
+					if (newAddresses.isErr()) return err(newAddresses.error);
+					this.markGrownAddressMaps(newAddresses.value);
+					addresses = storedAbove(
+						this._data.addresses[addressType],
+						checkedIndex,
+						checkedIndex + addressAmount
+					);
 				}
 				//Create change addresses for the next round
 				if (!foundLastUsedChangeAddress) {
@@ -2454,22 +2456,26 @@ export class Wallet {
 						this.gapLimitOptions.lookAheadChange -
 						getAddressIndexDiff(
 							highestUsedChangeAddressIndex.index,
-							highestStoredChangeAddressIndex.index
+							checkedChangeIndex
 						);
 					const newChangeAddresses = await this.addAddresses({
 						addressAmount: 0,
 						changeAddressAmount,
 						addressIndex: 0,
-						changeAddressIndex:
-							highestStoredIndex.value.changeAddressIndex.index + 1,
+						changeAddressIndex: checkedChangeIndex + 1,
 						keyDerivationPath,
 						addressType,
 						saveAddresses: false
 					});
-					if (newChangeAddresses.isOk()) {
-						this.markGrownAddressMaps(newChangeAddresses.value);
-						changeAddresses = newChangeAddresses.value.changeAddresses || {};
+					if (newChangeAddresses.isErr()) {
+						return err(newChangeAddresses.error);
 					}
+					this.markGrownAddressMaps(newChangeAddresses.value);
+					changeAddresses = storedAbove(
+						this._data.changeAddresses[addressType],
+						checkedChangeIndex,
+						checkedChangeIndex + changeAddressAmount
+					);
 				}
 
 				// Store newly created addresses to scan in the next round.
