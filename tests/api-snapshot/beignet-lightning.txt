@@ -531,7 +531,7 @@ member chain.ChainActionType.WATCH_TX = "CHAIN_WATCH_TX"
 class chain.ChainBackendUnavailableError extends Error
 constructor chain.ChainBackendUnavailableError(message: string)
 class chain.ChainMonitor
-constructor chain.ChainMonitor(channelState: channel.IChannelState, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoin.Network, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer)
+constructor chain.ChainMonitor(channelState: channel.IChannelState, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer)
 method chain.ChainMonitor.addPreimage(paymentHash: Buffer, preimage: Buffer): chain.ChainAction[]
 method chain.ChainMonitor.dropUnusedPreimages(heldElsewhere: ReadonlyMap<string, Buffer>): number
 method chain.ChainMonitor.getFullState(): chain.IChainMonitorState
@@ -540,16 +540,16 @@ method chain.ChainMonitor.getState(): chain.MonitorState
 method chain.ChainMonitor.getTrackedOutputs(): chain.ITrackedOutput[]
 method chain.ChainMonitor.getWantedPaymentHashes(): Set<string>
 method chain.ChainMonitor.handleFundingSpendAbsent(scan?: chain.IFundingSpendScan): boolean
-method chain.ChainMonitor.handleFundingSpent(spendingTx: bitcoin.Transaction, blockHeight: number, spentOutpoint?: { txid: string; outputIndex: number; }): chain.ChainAction[]
+method chain.ChainMonitor.handleFundingSpent(spendingTx: bitcoinjs-lib#Transaction, blockHeight: number, spentOutpoint?: { txid: string; outputIndex: number; }): chain.ChainAction[]
 method chain.ChainMonitor.handleNewBlock(blockHeight: number): chain.ChainAction[]
-method chain.ChainMonitor.handleOutputSpent(txid: string, outputIndex: number, spendingTx: bitcoin.Transaction, blockHeight: number): chain.ChainAction[]
+method chain.ChainMonitor.handleOutputSpent(txid: string, outputIndex: number, spendingTx: bitcoinjs-lib#Transaction, blockHeight: number): chain.ChainAction[]
 method chain.ChainMonitor.handleSpendUnconfirmed(txid: string, outputIndex: number): chain.ChainAction[]
 method chain.ChainMonitor.isCommitmentConfirmed(): boolean
 method chain.ChainMonitor.isCommitmentReverifyPending(): boolean
 method chain.ChainMonitor.isFullyResolved(): boolean
-method chain.ChainMonitor.rebuildSweep(output: chain.ITrackedOutput, feeRatePerVbyte: number): bitcoin.Transaction | null
-method chain.ChainMonitor.rebuildSweeps(output: chain.ITrackedOutput, feeRatePerVbyte: number): bitcoin.Transaction[]
-static method chain.ChainMonitor.restore(saved: chain.IChainMonitorState, channelState: channel.IChannelState, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoin.Network, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer): chain.ChainMonitor
+method chain.ChainMonitor.rebuildSweep(output: chain.ITrackedOutput, feeRatePerVbyte: number): bitcoinjs-lib#Transaction | null
+method chain.ChainMonitor.rebuildSweeps(output: chain.ITrackedOutput, feeRatePerVbyte: number): bitcoinjs-lib#Transaction[]
+static method chain.ChainMonitor.restore(saved: chain.IChainMonitorState, channelState: channel.IChannelState, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer): chain.ChainMonitor
 method chain.ChainMonitor.setChannelState(channelState: channel.IChannelState): void
 method chain.ChainMonitor.setDestinationScript(destinationScript: Buffer): void
 method chain.ChainMonitor.updateFeeRate(feeRatePerKw: number): chain.ChainAction[]
@@ -620,7 +620,7 @@ property chain.IAnchorCpfpParams.walletInputs: channel.ISpliceWalletInput[]
 interface chain.IAttachFeeInputsParams
 property chain.IAttachFeeInputsParams.changeScript: Buffer
 property chain.IAttachFeeInputsParams.feeratePerVbyte: number
-property chain.IAttachFeeInputsParams.htlcTx: bitcoin.Transaction
+property chain.IAttachFeeInputsParams.htlcTx: bitcoinjs-lib#Transaction
 property chain.IAttachFeeInputsParams.htlcWitness: Buffer[]
 property chain.IAttachFeeInputsParams.walletInputs: channel.ISpliceWalletInput[]
 interface chain.IBroadcastTxChainAction
@@ -647,9 +647,9 @@ property chain.IChainMonitorState.trackedOutputs: chain.ITrackedOutput[]
 interface chain.IChainWatcherChannelManager
 method chain.IChainWatcherChannelManager.handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: beignet/cli#TxidHex): void
 method chain.IChainWatcherChannelManager.handleFundingSpendAbsent(channelId: Buffer, scan?: chain.IFundingSpendScan, feeRatePerVbyte?: number): boolean
-method chain.IChainWatcherChannelManager.handleFundingSpent(channelId: Buffer, spendingTx: bitcoin.Transaction, blockHeight: number, destinationScript: Buffer, feeRatePerVbyte?: number, revocationBasepointSecret?: Buffer, paymentPrivkey?: Buffer, network?: bitcoin.Network, spentOutpoint?: { txid: string; outputIndex: number; }): void
+method chain.IChainWatcherChannelManager.handleFundingSpent(channelId: Buffer, spendingTx: bitcoinjs-lib#Transaction, blockHeight: number, destinationScript: Buffer, feeRatePerVbyte?: number, revocationBasepointSecret?: Buffer, paymentPrivkey?: Buffer, network?: bitcoinjs-lib#Network, spentOutpoint?: { txid: string; outputIndex: number; }): void
 method chain.IChainWatcherChannelManager.handleNewBlock(blockHeight: number): void
-method chain.IChainWatcherChannelManager.handleOutputSpent(txid: string, outputIndex: number, spendingTx: bitcoin.Transaction, blockHeight: number): void
+method chain.IChainWatcherChannelManager.handleOutputSpent(txid: string, outputIndex: number, spendingTx: bitcoinjs-lib#Transaction, blockHeight: number): void
 method chain.IChainWatcherChannelManager.handleOutputUnspent(txid: string, outputIndex: number): void
 method chain.IChainWatcherChannelManager.listChannels(): channel.Channel[]
 method chain.IChainWatcherChannelManager.off<K extends 'watch:funding' | 'broadcast:tx' | 'watch:output'>(event: K, listener: channel.ChannelManagerEvents[K]): void
@@ -690,7 +690,7 @@ property chain.IClosingTxParams.remoteScriptPubkey: Buffer
 property chain.IClosingTxParams.sequence?: number
 interface chain.IClosingTxResult
 property chain.IClosingTxResult.outputMap: { local?: number; remote?: number; }
-property chain.IClosingTxResult.tx: bitcoin.Transaction
+property chain.IClosingTxResult.tx: bitcoinjs-lib#Transaction
 interface chain.ICommitmentBroadcast
 property chain.ICommitmentBroadcast.blockHeight: number
 property chain.ICommitmentBroadcast.claimedOutputIndices?: number[]
@@ -756,7 +756,7 @@ interface chain.IResolvedOutput
 property chain.IResolvedOutput.cltvExpiry?: number
 property chain.IResolvedOutput.csvDelay?: number
 property chain.IResolvedOutput.declinedAsUneconomic?: boolean
-property chain.IResolvedOutput.spendTx?: bitcoin.Transaction
+property chain.IResolvedOutput.spendTx?: bitcoinjs-lib#Transaction
 property chain.IResolvedOutput.trackedOutput: chain.ITrackedOutput
 property chain.IResolvedOutput.witness?: Buffer[]
 interface chain.IRevokedHtlcSnapshotOutput
@@ -784,7 +784,7 @@ property chain.ISimpleClosingTxParams.locktime: number
 property chain.ISimpleClosingTxParams.variant: chain.SimpleCloseVariant
 interface chain.ISimpleClosingTxResult
 property chain.ISimpleClosingTxResult.outputMap: { closer?: number; closee?: number; }
-property chain.ISimpleClosingTxResult.tx: bitcoin.Transaction
+property chain.ISimpleClosingTxResult.tx: bitcoinjs-lib#Transaction
 interface chain.ISweepUneconomicChainAction
 property chain.ISweepUneconomicChainAction.amount: bigint
 property chain.ISweepUneconomicChainAction.contestHeight?: number
@@ -864,26 +864,26 @@ enum chain.SimpleCloseVariant
 member chain.SimpleCloseVariant.CLOSEE_OUTPUT_ONLY = 2
 member chain.SimpleCloseVariant.CLOSER_AND_CLOSEE = 3
 member chain.SimpleCloseVariant.CLOSER_OUTPUT_ONLY = 1
-function chain.attachFeeInputsToZeroFeeHtlcTx(params: chain.IAttachFeeInputsParams): { tx: bitcoin.Transaction; txid: string; }
-function chain.buildAnchorCpfpTx(params: chain.IAnchorCpfpParams): { tx: bitcoin.Transaction; txid: string; }
+function chain.attachFeeInputsToZeroFeeHtlcTx(params: chain.IAttachFeeInputsParams): { tx: bitcoinjs-lib#Transaction; txid: string; }
+function chain.buildAnchorCpfpTx(params: chain.IAnchorCpfpParams): { tx: bitcoinjs-lib#Transaction; txid: string; }
 function chain.buildClosingTx(params: chain.IClosingTxParams): chain.IClosingTxResult
 function chain.buildHtlcSuccessWitness(remoteSig: Buffer, localSig: Buffer, preimage: Buffer, witnessScript: Buffer): Buffer[]
 function chain.buildHtlcTimeoutWitness(remoteSig: Buffer, localSig: Buffer, witnessScript: Buffer): Buffer[]
-function chain.buildRemoteHtlcPreimageClaimTx(params: chain.IRemoteHtlcPreimageClaimParams): bitcoin.Transaction
+function chain.buildRemoteHtlcPreimageClaimTx(params: chain.IRemoteHtlcPreimageClaimParams): bitcoinjs-lib#Transaction
 function chain.buildRemoteHtlcPreimageWitness(signature: Buffer, preimage: Buffer, witnessScript: Buffer): Buffer[]
-function chain.buildRemoteHtlcTimeoutClaimTx(params: chain.IRemoteHtlcPreimageClaimParams & { cltvExpiry: number; }): bitcoin.Transaction
+function chain.buildRemoteHtlcTimeoutClaimTx(params: chain.IRemoteHtlcPreimageClaimParams & { cltvExpiry: number; }): bitcoinjs-lib#Transaction
 function chain.buildRemoteHtlcTimeoutWitness(signature: Buffer, witnessScript: Buffer): Buffer[]
-function chain.buildSecondLevelSweepTx(params: chain.ISecondLevelSweepParams): bitcoin.Transaction
+function chain.buildSecondLevelSweepTx(params: chain.ISecondLevelSweepParams): bitcoinjs-lib#Transaction
 function chain.buildSimpleClosingTx(params: chain.ISimpleClosingTxParams): chain.ISimpleClosingTxResult
 function chain.buildToLocalDelayedWitness(signature: Buffer, witnessScript: Buffer): Buffer[]
-function chain.buildToLocalSweepTx(params: chain.IToLocalSweepParams): bitcoin.Transaction
+function chain.buildToLocalSweepTx(params: chain.IToLocalSweepParams): bitcoinjs-lib#Transaction
 function chain.buildToRemoteAnchorWitness(signature: Buffer, witnessScript: Buffer): Buffer[]
-function chain.buildToRemoteClaimTx(params: chain.IToRemoteClaimParams): bitcoin.Transaction
+function chain.buildToRemoteClaimTx(params: chain.IToRemoteClaimParams): bitcoinjs-lib#Transaction
 function chain.buildToRemoteWitness(signature: Buffer, pubkey: Buffer): Buffer[]
 function chain.calculateClosingFee(feeratePerKw: number, localScriptLen: number, remoteScriptLen: number, isTaproot?: boolean): bigint
 function chain.classifyAnnouncedChannelFunding(backend: chain.IChainBackend, announcement: { shortChannelId: Buffer; bitcoinKey1: Buffer; bitcoinKey2: Buffer; }, tipHeight: number): Promise<chain.AnnouncedFundingVerdict>
-function chain.classifyCommitmentTx(tx: bitcoin.Transaction, state: channel.IChannelState): chain.IClassifiedCommitment
-function chain.classifyOutputs(tx: bitcoin.Transaction, state: channel.IChannelState, commitmentType: chain.CommitmentType, commitmentNumber: bigint): chain.ITrackedOutput[]
+function chain.classifyCommitmentTx(tx: bitcoinjs-lib#Transaction, state: channel.IChannelState): chain.IClassifiedCommitment
+function chain.classifyOutputs(tx: bitcoinjs-lib#Transaction, state: channel.IChannelState, commitmentType: chain.CommitmentType, commitmentNumber: bigint): chain.ITrackedOutput[]
 function chain.classifyRemoteFundingInput(backend: chain.IChainBackend, outpoint: { txidDisplayHex: string; vout: number; scriptPubKey: Buffer; }): Promise<chain.RemoteInputVerdict>
 function chain.closingOutputDustLimit(scriptPubkey: Buffer, ownerDustLimit: bigint | undefined): bigint
 function chain.closingTxRelayProfile(params: chain.IClosingRelayParams): { feePaid: bigint; weight: number; }
@@ -892,22 +892,22 @@ function chain.computeScriptHash(scriptPubkey: Buffer): string
 function chain.encodeWitnessSignature(compactSig: Buffer, sighashType?: number): Buffer
 function chain.estimateSimpleCloseFee(feeratePerKw: number, closerScriptLen: number, closeeScriptLen: number): bigint
 function chain.estimateSweepVbytes(outputType: chain.OutputType, leased?: boolean): number
-function chain.extractCommitmentNumber(tx: bitcoin.Transaction, openPaymentBasepoint: Buffer, acceptPaymentBasepoint: Buffer): bigint
+function chain.extractCommitmentNumber(tx: bitcoinjs-lib#Transaction, openPaymentBasepoint: Buffer, acceptPaymentBasepoint: Buffer): bigint
 function chain.extractPreimageFromWitness(witness: Buffer[]): Buffer | null
 function chain.isDustOutput(scriptPubkey: Buffer, amountSat: bigint): boolean
 function chain.isOpReturnScript(scriptPubkey: Buffer): boolean
-function chain.matchRevokedHtlcSnapshotOutputs(state: channel.IChannelState, commitmentNumber: bigint, revokedTx: bitcoin.Transaction, network?: bitcoin.Network): Map<number, chain.IRevokedHtlcSnapshotOutput>
+function chain.matchRevokedHtlcSnapshotOutputs(state: channel.IChannelState, commitmentNumber: bigint, revokedTx: bitcoinjs-lib#Transaction, network?: bitcoinjs-lib#Network): Map<number, chain.IRevokedHtlcSnapshotOutput>
 function chain.minRelayFeeForWeight(weightUnits: number | bigint): bigint
 function chain.resolveOurCommitmentOutputs(state: channel.IChannelState, trackedOutputs: chain.ITrackedOutput[], commitmentNumber: bigint, destinationScript: Buffer, feeRatePerVbyte: number, knownPreimages: Map<string, Buffer>, delayedPaymentBasepointSecret?: Buffer, htlcBasepointSecret?: Buffer, remoteHtlcSignatures?: Buffer[]): chain.IResolvedOutput[]
-function chain.resolveRevokedCommitmentOutputs(state: channel.IChannelState, trackedOutputs: chain.ITrackedOutput[], commitmentNumber: bigint, revokedTx: bitcoin.Transaction, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoin.Network, currentHeight?: number, claimedOutputIndices?: chain.ClaimedOutputIndices): chain.IResolvedOutput[]
-function chain.resolveRevokedSecondLevelOutput(state: channel.IChannelState, spendingTx: bitcoin.Transaction, confirmationHeight: number, commitmentNumber: bigint, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, network?: bitcoin.Network): chain.IResolvedOutput[]
-function chain.resolveSecondLevelHtlcOutput(state: channel.IChannelState, htlcTx: bitcoin.Transaction, confirmationHeight: number, commitmentNumber: bigint, destinationScript: Buffer, feeRatePerVbyte: number, delayedPaymentBasepointSecret: Buffer | undefined, network?: bitcoin.Network): chain.IResolvedOutput | null
+function chain.resolveRevokedCommitmentOutputs(state: channel.IChannelState, trackedOutputs: chain.ITrackedOutput[], commitmentNumber: bigint, revokedTx: bitcoinjs-lib#Transaction, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, paymentPrivkey: Buffer, network?: bitcoinjs-lib#Network, currentHeight?: number, claimedOutputIndices?: chain.ClaimedOutputIndices): chain.IResolvedOutput[]
+function chain.resolveRevokedSecondLevelOutput(state: channel.IChannelState, spendingTx: bitcoinjs-lib#Transaction, confirmationHeight: number, commitmentNumber: bigint, destinationScript: Buffer, feeRatePerVbyte: number, revocationBasepointSecret: Buffer, network?: bitcoinjs-lib#Network): chain.IResolvedOutput[]
+function chain.resolveSecondLevelHtlcOutput(state: channel.IChannelState, htlcTx: bitcoinjs-lib#Transaction, confirmationHeight: number, commitmentNumber: bigint, destinationScript: Buffer, feeRatePerVbyte: number, delayedPaymentBasepointSecret: Buffer | undefined, network?: bitcoinjs-lib#Network): chain.IResolvedOutput | null
 function chain.resolveTheirCurrentCommitmentOutputs(state: channel.IChannelState, trackedOutputs: chain.ITrackedOutput[], destinationScript: Buffer, feeRatePerVbyte: number, knownPreimages: Map<string, Buffer>, paymentPrivkey: Buffer, htlcBasepointSecret?: Buffer, remotePerCommitmentPoint?: Buffer): chain.IResolvedOutput[]
 function chain.satPerKwToSatPerVbyte(satPerKw: number): number
 function chain.satPerVbyteToSatPerKw(satPerVbyte: number): number
-function chain.selectTheirPerCommitmentPoint(tx: bitcoin.Transaction, state: channel.IChannelState, commitmentNumber: bigint): Buffer | undefined
-function chain.signP2wpkhInput(tx: bitcoin.Transaction, inputIndex: number, pubkey: Buffer, value: number, privateKey: Buffer): Buffer
-function chain.signSweepInput(tx: bitcoin.Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
+function chain.selectTheirPerCommitmentPoint(tx: bitcoinjs-lib#Transaction, state: channel.IChannelState, commitmentNumber: bigint): Buffer | undefined
+function chain.signP2wpkhInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, pubkey: Buffer, value: number, privateKey: Buffer): Buffer
+function chain.signSweepInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, privateKey: Buffer, sighashType?: number): Buffer
 namespace channel
 const channel.BITCOIN_CHAIN_HASH: Buffer
 const channel.CHANNEL_INDEX_FLOOR_MAX: number
@@ -927,7 +927,7 @@ method channel.Channel.addTxOutput(output: interactiveTx.IInteractiveTxOutput): 
 method channel.Channel.adoptRemoteForwardingPolicy(policy: channel.IRemoteForwardingPolicy): boolean
 property channel.Channel.announcementChainHash: Buffer
 method channel.Channel.applyForceClosePlan(plan: channel.IForceClosePlanReady): channel.ChannelAction[]
-method channel.Channel.applyPeerSpliceSignature(remoteSig: Buffer, peerWalletWitnesses?: Buffer[][]): Transaction | null
+method channel.Channel.applyPeerSpliceSignature(remoteSig: Buffer, peerWalletWitnesses?: Buffer[][]): bitcoinjs-lib#Transaction | null
 method channel.Channel.beginClosingNegotiationIfReady(): boolean
 method channel.Channel.beginDualFundingContribution(): channel.ChannelAction[]
 method channel.Channel.beginFundingMissingClock(height: number): boolean
@@ -996,8 +996,8 @@ method channel.Channel.getFullState(): channel.IChannelState
 method channel.Channel.getFundingPubkeys(): { local: Buffer; remote: Buffer; } | null
 method channel.Channel.getFundingSatoshis(): bigint
 method channel.Channel.getPendingSpliceLocalBalanceMsat(): bigint | null
-method channel.Channel.getPendingSpliceTx(): { tx: Transaction; spliceTxid: Buffer; sharedInputIndex: number; newFundingOutputIndex: number; prevouts: { scripts: Buffer[]; values: bigint[]; } | null; owedExternalInputs: Array<{ inputIndex: number; prevTxid: Buffer; prevOutputIndex: number; }>; filledExternalInputs: Array<{ inputIndex: number; prevTxid: Buffer; prevOutputIndex: number; }>; sentTxSignatures: boolean; } | null
-method channel.Channel.getPendingV2FundingTx(): { tx: Transaction; fundingTxid: Buffer; fundingOutputIndex: number; prevouts: { scripts: Buffer[]; values: bigint[]; } | null; owedExternalInputs: Array<{ inputIndex: number; prevTxid: Buffer; prevOutputIndex: number; }>; filledExternalInputs: Array<{ inputIndex: number; prevTxid: Buffer; prevOutputIndex: number; }>; sentTxSignatures: boolean; } | null
+method channel.Channel.getPendingSpliceTx(): { tx: bitcoinjs-lib#Transaction; spliceTxid: Buffer; sharedInputIndex: number; newFundingOutputIndex: number; prevouts: { scripts: Buffer[]; values: bigint[]; } | null; owedExternalInputs: Array<{ inputIndex: number; prevTxid: Buffer; prevOutputIndex: number; }>; filledExternalInputs: Array<{ inputIndex: number; prevTxid: Buffer; prevOutputIndex: number; }>; sentTxSignatures: boolean; } | null
+method channel.Channel.getPendingV2FundingTx(): { tx: bitcoinjs-lib#Transaction; fundingTxid: Buffer; fundingOutputIndex: number; prevouts: { scripts: Buffer[]; values: bigint[]; } | null; owedExternalInputs: Array<{ inputIndex: number; prevTxid: Buffer; prevOutputIndex: number; }>; filledExternalInputs: Array<{ inputIndex: number; prevTxid: Buffer; prevOutputIndex: number; }>; sentTxSignatures: boolean; } | null
 method channel.Channel.getQuiescenceState(): channel.QuiescenceState
 method channel.Channel.getRecoveryCloseReason(): channel.RecoveryCloseReason | undefined
 method channel.Channel.getRecoveryStatus(): recovery.ChannelRecoveryStatus
@@ -1012,7 +1012,7 @@ method channel.Channel.getSigner(): keys.ISigner | null
 method channel.Channel.getSpendableOutboundMsat(): bigint
 method channel.Channel.getSpliceSession(): channel.SpliceSession | null
 method channel.Channel.getSpliceSharedInputIndex(): number | null
-method channel.Channel.getSpliceTransaction(): Transaction | null
+method channel.Channel.getSpliceTransaction(): bitcoinjs-lib#Transaction | null
 method channel.Channel.getSplicedStateForSigning(): channel.IChannelState | null
 method channel.Channel.getState(): channel.ChannelState
 method channel.Channel.getTaprootClosingCache(): channel.ITaprootClosingCache | null
@@ -1235,7 +1235,7 @@ method channel.ChannelManager.fforSetSlot(channelId: Buffer, k: number, state: f
 method channel.ChannelManager.fforSetupTimeout(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.fforSync(channelId: Buffer): channel.ChannelResult
 method channel.ChannelManager.fforWitnessAcked(channelId: Buffer, mailboxId: Buffer, retentionUntil: number): channel.ChannelResult
-method channel.ChannelManager.forceClose(channelId: Buffer, destinationScript: Buffer, feeRatePerVbyte?: number, network?: Network): channel.ChannelResult
+method channel.ChannelManager.forceClose(channelId: Buffer, destinationScript: Buffer, feeRatePerVbyte?: number, network?: bitcoinjs-lib#Network): channel.ChannelResult
 method channel.ChannelManager.fulfillHtlc(channelId: Buffer, htlcId: bigint, preimage: Buffer): channel.ChannelResult
 method channel.ChannelManager.getChannel(channelId: Buffer): channel.Channel | undefined
 method channel.ChannelManager.getChannelsByPeer(peerPubkey: string): channel.Channel[]
@@ -1249,10 +1249,10 @@ method channel.ChannelManager.getRecoveryChannelMaterial(channelKeyIndex: number
 method channel.ChannelManager.getTempChannel(tempChannelId: Buffer): channel.Channel | undefined
 method channel.ChannelManager.handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: beignet/cli#TxidHex): void
 method channel.ChannelManager.handleFundingSpendAbsent(channelId: Buffer, scan?: chain.IFundingSpendScan, feeRatePerVbyte?: number): boolean
-method channel.ChannelManager.handleFundingSpent(channelId: Buffer, spendingTx: Transaction, blockHeight: number, destinationScript: Buffer, feeRatePerVbyte?: number, revocationBasepointSecret?: Buffer, paymentPrivkey?: Buffer, network?: Network, spentOutpoint?: { txid: string; outputIndex: number; }): chain.ChainAction[]
+method channel.ChannelManager.handleFundingSpent(channelId: Buffer, spendingTx: bitcoinjs-lib#Transaction, blockHeight: number, destinationScript: Buffer, feeRatePerVbyte?: number, revocationBasepointSecret?: Buffer, paymentPrivkey?: Buffer, network?: bitcoinjs-lib#Network, spentOutpoint?: { txid: string; outputIndex: number; }): chain.ChainAction[]
 method channel.ChannelManager.handleMessage(peerPubkey: string, type: number, payload: Buffer): void
 method channel.ChannelManager.handleNewBlock(blockHeight: number): chain.ChainAction[]
-method channel.ChannelManager.handleOutputSpent(txid: string, outputIndex: number, spendingTx: Transaction, blockHeight: number): chain.ChainAction[]
+method channel.ChannelManager.handleOutputSpent(txid: string, outputIndex: number, spendingTx: bitcoinjs-lib#Transaction, blockHeight: number): chain.ChainAction[]
 method channel.ChannelManager.handleOutputUnspent(txid: string, outputIndex: number): chain.ChainAction[]
 method channel.ChannelManager.handlePeerDisconnected(peerPubkey: string): void
 method channel.ChannelManager.handlePeerReconnected(peerPubkey: string): void
@@ -1880,13 +1880,13 @@ property channel.ISpliceWalletInput.external?: boolean
 property channel.ISpliceWalletInput.prevOutputIndex: number
 property channel.ISpliceWalletInput.prevTx: Buffer
 property channel.ISpliceWalletInput.sequence: number
-property channel.ISpliceWalletInput.signWitness: (tx: Transaction, inputIndex: number, value: bigint, prevouts?: { scripts: Buffer[]; values: bigint[]; }) => Buffer[]
+property channel.ISpliceWalletInput.signWitness: (tx: bitcoinjs-lib#Transaction, inputIndex: number, value: bigint, prevouts?: { scripts: Buffer[]; values: bigint[]; }) => Buffer[]
 property channel.ISpliceWalletInput.value: bigint
 interface channel.ITaprootClosingCache
 property channel.ITaprootClosingCache.feeSatoshis: bigint
 property channel.ITaprootClosingCache.ourPartialSig: Buffer | null
 property channel.ITaprootClosingCache.session: unknown
-property channel.ITaprootClosingCache.tx: Transaction
+property channel.ITaprootClosingCache.tx: bitcoinjs-lib#Transaction
 interface channel.ITxSignaturesNeededAction
 property channel.ITxSignaturesNeededAction.channelId: Buffer
 property channel.ITxSignaturesNeededAction.externalInputIndices?: number[]
@@ -2418,10 +2418,10 @@ method directFunding.IDfChannelHandle.channelId(): Buffer
 interface directFunding.IDfCoinSigner
 property directFunding.IDfCoinSigner.kind: 'p2wpkh' | 'p2tr'
 property directFunding.IDfCoinSigner.ownershipPubkey: Buffer
-method directFunding.IDfCoinSigner.signInput(tx: bitcoin.Transaction, inputIndex: number, prevouts: { scripts: Buffer[]; values: bigint[]; }): Buffer[] | Promise<Buffer[]>
+method directFunding.IDfCoinSigner.signInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, prevouts: { scripts: Buffer[]; values: bigint[]; }): Buffer[] | Promise<Buffer[]>
 method directFunding.IDfCoinSigner.signOwnership(digest: Buffer): Buffer
 method directFunding.IDfCoinSigner.signOwnershipMessage?(message: string): { pubkey: Buffer; signature: Buffer; } | Promise<{ pubkey: Buffer; signature: Buffer; }>
-method directFunding.IDfCoinSigner.signOwnershipProbe?(tx: bitcoin.Transaction, prevouts: { scripts: Buffer[]; values: bigint[]; }): { pubkey: Buffer; signature: Buffer; } | Promise<{ pubkey: Buffer; signature: Buffer; }>
+method directFunding.IDfCoinSigner.signOwnershipProbe?(tx: bitcoinjs-lib#Transaction, prevouts: { scripts: Buffer[]; values: bigint[]; }): { pubkey: Buffer; signature: Buffer; } | Promise<{ pubkey: Buffer; signature: Buffer; }>
 interface directFunding.IDfCustomMessage
 property directFunding.IDfCustomMessage.payload: Buffer
 property directFunding.IDfCustomMessage.peerPubkey: string
@@ -2451,7 +2451,7 @@ property directFunding.IDfFundingCheck.offer: directFunding.IDfOffer
 property directFunding.IDfFundingCheck.owedExternalIndices: number[]
 property directFunding.IDfFundingCheck.payerPrevTxid: Buffer
 property directFunding.IDfFundingCheck.payerVout: number
-property directFunding.IDfFundingCheck.tx: bitcoin.Transaction
+property directFunding.IDfFundingCheck.tx: bitcoinjs-lib#Transaction
 interface directFunding.IDfInboundFrame
 property directFunding.IDfInboundFrame.authenticatedPeer?: string
 property directFunding.IDfInboundFrame.boundRequestId?: Buffer
@@ -2585,7 +2585,7 @@ property directFunding.IDfPendingSpliceTx.prevouts: { scripts: Buffer[]; values:
 property directFunding.IDfPendingSpliceTx.sentTxSignatures: boolean
 property directFunding.IDfPendingSpliceTx.sharedInputIndex: number
 property directFunding.IDfPendingSpliceTx.spliceTxid: Buffer
-property directFunding.IDfPendingSpliceTx.tx: Transaction
+property directFunding.IDfPendingSpliceTx.tx: bitcoinjs-lib#Transaction
 interface directFunding.IDfPendingV2FundingTx
 property directFunding.IDfPendingV2FundingTx.filledExternalInputs: directFunding.IDfExternalInput[]
 property directFunding.IDfPendingV2FundingTx.fundingOutputIndex: number
@@ -2593,7 +2593,7 @@ property directFunding.IDfPendingV2FundingTx.fundingTxid: Buffer
 property directFunding.IDfPendingV2FundingTx.owedExternalInputs: directFunding.IDfExternalInput[]
 property directFunding.IDfPendingV2FundingTx.prevouts: { scripts: Buffer[]; values: bigint[]; } | null
 property directFunding.IDfPendingV2FundingTx.sentTxSignatures: boolean
-property directFunding.IDfPendingV2FundingTx.tx: Transaction
+property directFunding.IDfPendingV2FundingTx.tx: bitcoinjs-lib#Transaction
 interface directFunding.IDfPrepareResult
 property directFunding.IDfPrepareResult.amountSat: number | null
 property directFunding.IDfPrepareResult.connection: directFunding.DfWarmConnection
@@ -2787,7 +2787,7 @@ property directFunding.IDfSignRequestCheck.receiverNodeId: Buffer
 property directFunding.IDfSignRequestCheck.request: directFunding.IDfSignRequest
 property directFunding.IDfSignRequestCheck.sequence: number
 property directFunding.IDfSignRequestCheck.tipHeight: number
-property directFunding.IDfSignRequestCheck.tx: bitcoin.Transaction
+property directFunding.IDfSignRequestCheck.tx: bitcoinjs-lib#Transaction
 interface directFunding.IDfSignRequestVerdict
 property directFunding.IDfSignRequestVerdict.fundingScript: Buffer
 property directFunding.IDfSignRequestVerdict.fundingTxidDisplay: string
@@ -2882,9 +2882,9 @@ function directFunding.outpointKey(txidDisplayHex: string, vout: number): string
 function directFunding.ownershipDigest(offerId: Buffer, txid: Buffer, vout: number, amountSat: bigint, receiptHash: Buffer, receiverNodeId: Buffer): Buffer
 function directFunding.ownershipMessage(offerId: Buffer, txid: Buffer, vout: number, amountSat: bigint, receiptHash: Buffer, receiverNodeId: Buffer): string
 function directFunding.ownershipProbePoisonTxid(offerId: Buffer): Buffer
-function directFunding.ownershipProbeTransaction(offerId: Buffer, txid: Buffer, vout: number, sequence: number, coinScript: Buffer, coinValueSat: bigint, receiptHash: Buffer, receiverNodeId: Buffer): { tx: bitcoin.Transaction; prevouts: { scripts: Buffer[]; values: bigint[]; }; }
+function directFunding.ownershipProbeTransaction(offerId: Buffer, txid: Buffer, vout: number, sequence: number, coinScript: Buffer, coinValueSat: bigint, receiptHash: Buffer, receiverNodeId: Buffer): { tx: bitcoinjs-lib#Transaction; prevouts: { scripts: Buffer[]; values: bigint[]; }; }
 function directFunding.ownershipProblem(offer: directFunding.IDfOffer, prevOutScript: Buffer, receiverNodeId: Buffer): string | null
-function directFunding.prevoutProblem(tx: bitcoin.Transaction, prevouts: directFunding.IDfPrevout[], inputIndex: number, payerScript: Buffer, payerValueSat: bigint, commitsToAllPrevouts: boolean, getTransaction: (txidHex: string) => Promise<Buffer>): Promise<string | null>
+function directFunding.prevoutProblem(tx: bitcoinjs-lib#Transaction, prevouts: directFunding.IDfPrevout[], inputIndex: number, payerScript: Buffer, payerValueSat: bigint, commitsToAllPrevouts: boolean, getTransaction: (txidHex: string) => Promise<Buffer>): Promise<string | null>
 function directFunding.receiverLaneKeys(requestPrivateKey: Buffer, ephemeralPublicKey: Buffer, requestId: Buffer): directFunding.IDfLaneKeys
 function directFunding.requestEncryptionPublicKey(record: directFunding.IDfRequestRecord): Buffer
 function directFunding.requestFromBip21(uri: string): string | null
@@ -4170,14 +4170,14 @@ static method keys.ChannelSigner.buildFundingWitness(localSig: Buffer, remoteSig
 readonly property keys.ChannelSigner.fundingPubkey: Buffer
 get keys.ChannelSigner.hasHtlcKeys(): boolean
 get keys.ChannelSigner.htlcBasepointSecret(): Buffer | undefined
-method keys.ChannelSigner.signClosingTx(tx: bitcoin.Transaction, fundingWitnessScript: Buffer, fundingAmount: number): Buffer
-method keys.ChannelSigner.signCommitmentPartial(session: SessionKey, ourPublicNonce: Uint8Array): Buffer
-method keys.ChannelSigner.signCommitmentTx(tx: bitcoin.Transaction, fundingWitnessScript: Buffer, fundingAmount: number): Buffer
+method keys.ChannelSigner.signClosingTx(tx: bitcoinjs-lib#Transaction, fundingWitnessScript: Buffer, fundingAmount: number): Buffer
+method keys.ChannelSigner.signCommitmentPartial(session: @brandonblack/musig#SessionKey, ourPublicNonce: Uint8Array): Buffer
+method keys.ChannelSigner.signCommitmentTx(tx: bitcoinjs-lib#Transaction, fundingWitnessScript: Buffer, fundingAmount: number): Buffer
 method keys.ChannelSigner.signFundingDigest(digest: Buffer): Buffer
-method keys.ChannelSigner.signHtlcTx(tx: bitcoin.Transaction, htlcWitnessScript: Buffer, htlcAmount: number, htlcPrivkey: Buffer, useAnchorSighash?: boolean): Buffer
-method keys.ChannelSigner.signHtlcTxForCommitment(tx: bitcoin.Transaction, htlcWitnessScript: Buffer, htlcAmount: number, perCommitmentPoint: Buffer, htlcBasepoint: Buffer, useAnchorSighash?: boolean): Buffer
+method keys.ChannelSigner.signHtlcTx(tx: bitcoinjs-lib#Transaction, htlcWitnessScript: Buffer, htlcAmount: number, htlcPrivkey: Buffer, useAnchorSighash?: boolean): Buffer
+method keys.ChannelSigner.signHtlcTxForCommitment(tx: bitcoinjs-lib#Transaction, htlcWitnessScript: Buffer, htlcAmount: number, perCommitmentPoint: Buffer, htlcBasepoint: Buffer, useAnchorSighash?: boolean): Buffer
 method keys.ChannelSigner.signTaprootHtlcForCommitment(sighash: Buffer, perCommitmentPoint: Buffer, htlcBasepoint: Buffer): Buffer
-method keys.ChannelSigner.verifyCommitmentSig(tx: bitcoin.Transaction, signature: Buffer, remoteFundingPubkey: Buffer, fundingWitnessScript: Buffer, fundingAmount: number): boolean
+method keys.ChannelSigner.verifyCommitmentSig(tx: bitcoinjs-lib#Transaction, signature: Buffer, remoteFundingPubkey: Buffer, fundingWitnessScript: Buffer, fundingAmount: number): boolean
 interface keys.IChannelBasepoints
 property keys.IChannelBasepoints.delayedPaymentBasepoint: Buffer
 property keys.IChannelBasepoints.firstPerCommitmentPoint: Buffer
@@ -4209,13 +4209,13 @@ property keys.IShaChainEntry.secret: Buffer
 interface keys.ISigner
 readonly property keys.ISigner.fundingPubkey: Buffer
 readonly property keys.ISigner.hasHtlcKeys: boolean
-method keys.ISigner.signClosingTx(tx: bitcoin.Transaction, fundingWitnessScript: Buffer, fundingAmount: number): Buffer
-method keys.ISigner.signCommitmentPartial(session: SessionKey, ourPublicNonce: Uint8Array): Buffer
-method keys.ISigner.signCommitmentTx(tx: bitcoin.Transaction, fundingWitnessScript: Buffer, fundingAmount: number): Buffer
+method keys.ISigner.signClosingTx(tx: bitcoinjs-lib#Transaction, fundingWitnessScript: Buffer, fundingAmount: number): Buffer
+method keys.ISigner.signCommitmentPartial(session: @brandonblack/musig#SessionKey, ourPublicNonce: Uint8Array): Buffer
+method keys.ISigner.signCommitmentTx(tx: bitcoinjs-lib#Transaction, fundingWitnessScript: Buffer, fundingAmount: number): Buffer
 method keys.ISigner.signFundingDigest(digest: Buffer): Buffer
-method keys.ISigner.signHtlcTxForCommitment(tx: bitcoin.Transaction, htlcWitnessScript: Buffer, htlcAmount: number, perCommitmentPoint: Buffer, htlcBasepoint: Buffer, useAnchorSighash?: boolean): Buffer
+method keys.ISigner.signHtlcTxForCommitment(tx: bitcoinjs-lib#Transaction, htlcWitnessScript: Buffer, htlcAmount: number, perCommitmentPoint: Buffer, htlcBasepoint: Buffer, useAnchorSighash?: boolean): Buffer
 method keys.ISigner.signTaprootHtlcForCommitment(sighash: Buffer, perCommitmentPoint: Buffer, htlcBasepoint: Buffer): Buffer
-method keys.ISigner.verifyCommitmentSig(tx: bitcoin.Transaction, signature: Buffer, remoteFundingPubkey: Buffer, fundingWitnessScript: Buffer, fundingAmount: number): boolean
+method keys.ISigner.verifyCommitmentSig(tx: bitcoinjs-lib#Transaction, signature: Buffer, remoteFundingPubkey: Buffer, fundingWitnessScript: Buffer, fundingAmount: number): boolean
 enum keys.LnCoinType
 member keys.LnCoinType.BITCOIN = 0
 member keys.LnCoinType.REGTEST = 1
@@ -4230,10 +4230,10 @@ method keys.ShaChainStore.getKnownCount(): bigint
 method keys.ShaChainStore.getSecret(index: bigint): Buffer | null
 static method keys.ShaChainStore.restore(entries: keys.IShaChainEntry[], knownCount: bigint): keys.ShaChainStore
 type keys.SignerFactory = (channelKeyIndex: number) => keys.ISigner
-function keys.bip32RootFromSeed(seed: Buffer): bip32.BIP32Interface
+function keys.bip32RootFromSeed(seed: Buffer): bip32#BIP32Interface
 function keys.copyChannelKeys(keys: keys.IChannelKeys): keys.IChannelKeys
-function keys.deriveChannelKeys(root: bip32.BIP32Interface, coinType?: number, channelIndex?: number): keys.IChannelKeys
-function keys.deriveLightningKeys(root: bip32.BIP32Interface, coinType?: number): keys.ILightningKeysFromSeed
+function keys.deriveChannelKeys(root: bip32#BIP32Interface, coinType?: number, channelIndex?: number): keys.IChannelKeys
+function keys.deriveLightningKeys(root: bip32#BIP32Interface, coinType?: number): keys.ILightningKeysFromSeed
 function keys.deriveLightningKeysFromMnemonic(mnemonic: string, passphrase?: string, coinType?: number): keys.ILightningKeysFromSeed
 function keys.deriveLightningKeysFromSeed(seed: Buffer, coinType?: number): keys.ILightningKeysFromSeed
 function keys.derivePrivateKey(basepointSecret: Buffer, perCommitmentPoint: Buffer, basepoint: Buffer): Buffer
@@ -4242,7 +4242,7 @@ function keys.deriveRevocationPrivkey(revocationBasepointSecret: Buffer, perComm
 function keys.deriveRevocationPubkey(revocationBasepoint: Buffer, perCommitmentPoint: Buffer): Buffer
 function keys.generateFromSeed(seed: Buffer, index: bigint): Buffer
 function keys.perCommitmentPointFromSecret(perCommitmentSecret: Buffer): Buffer
-function keys.verifyCommitmentSignature(tx: bitcoin.Transaction, signature: Buffer, remoteFundingPubkey: Buffer, fundingWitnessScript: Buffer, fundingAmount: number): boolean
+function keys.verifyCommitmentSignature(tx: bitcoinjs-lib#Transaction, signature: Buffer, remoteFundingPubkey: Buffer, fundingWitnessScript: Buffer, fundingAmount: number): boolean
 namespace l402
 const l402.DEFAULT_FETCH_TIMEOUT_MS = 30000
 type l402.FetchLike = (input: string, init?: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal; redirect?: 'follow' | 'manual' | 'error'; }) => Promise<l402.IL402Response>
@@ -5552,7 +5552,7 @@ method node.LightningNode.getTotalInFlightHtlcCount(): number
 method node.LightningNode.getWatchtowers(): ReturnType<watchtower.WatchtowerClient['getHealth']>
 method node.LightningNode.gracefulShutdown(timeoutMs?: number): Promise<void>
 method node.LightningNode.handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: beignet/cli#TxidHex): void
-method node.LightningNode.handleFundingSpent(channelId: Buffer, spendingTx: Transaction, blockHeight: number, destinationScript: Buffer): void
+method node.LightningNode.handleFundingSpent(channelId: Buffer, spendingTx: bitcoinjs-lib#Transaction, blockHeight: number, destinationScript: Buffer): void
 method node.LightningNode.handleNewBlock(blockHeight: number): void
 method node.LightningNode.handlePeerMessage(pubkey: string, type: number, payload: Buffer): void
 method node.LightningNode.hasHtlcInFlight(paymentHash: Buffer): boolean
@@ -6311,7 +6311,7 @@ class recovery.GuardianHttpServer
 constructor recovery.GuardianHttpServer(options: recovery.IGuardianHttpOptions)
 method recovery.GuardianHttpServer.close(): Promise<void>
 method recovery.GuardianHttpServer.listen(port: number, host?: string): Promise<number>
-readonly property recovery.GuardianHttpServer.server: Server
+readonly property recovery.GuardianHttpServer.server: http#Server
 type recovery.GuardianHttpTransport = (url: string, init: { method: 'GET' | 'POST'; headers: Record<string, string>; body?: Buffer; timeoutMs: number; maxResponseBytes: number; }) => Promise<{ status: number; body: Buffer; }>
 class recovery.GuardianProtocolMismatchError extends recovery.GuardianTransportError
 constructor recovery.GuardianProtocolMismatchError(message: string, info: recovery.IGuardianInfoResponse)
@@ -6622,7 +6622,7 @@ property recovery.IGuardianHostStatus.sessions: number
 property recovery.IGuardianHostStatus.sets: recovery.IGuardianHostSetStatus[]
 property recovery.IGuardianHostStatus.totalBytes: number
 interface recovery.IGuardianHttpOptions
-property recovery.IGuardianHttpOptions.authenticate?: (request: IncomingMessage) => boolean
+property recovery.IGuardianHttpOptions.authenticate?: (request: http#IncomingMessage) => boolean
 property recovery.IGuardianHttpOptions.guardian: recovery.ReferenceGuardian
 property recovery.IGuardianHttpOptions.maxBodyBytes?: number
 interface recovery.IGuardianInfoResponse
@@ -7102,7 +7102,7 @@ function recovery.assertGuardianAuth(value: unknown, where: string): recovery.Gu
 function recovery.assertGuardianDescriptors(value: unknown): recovery.GuardianDescriptor[]
 function recovery.assertMutationEncodable(mutation: recovery.RecoveryMutation): void
 function recovery.assertNoJournalResidue(target: storage.IStorageBackend): void
-function recovery.bearerAuthenticator(token: string): (request: IncomingMessage) => boolean
+function recovery.bearerAuthenticator(token: string): (request: http#IncomingMessage) => boolean
 function recovery.bindGuardianSet(guardians: recovery.IParsedGuardian[], options: Pick<recovery.IGuardianAssemblyConfig, 'transportFor' | 'allowUnencryptedAuth'>): { setId: Buffer; context: recovery.IGuardianSetContext; bound: recovery.IBoundGuardianClient[]; }
 function recovery.bolt8BearerAuthenticator(token: string): (auth: Buffer | undefined) => boolean
 function recovery.bolt8GuardianTransport(options?: recovery.IBolt8GuardianTransportOptions): recovery.IBolt8GuardianTransport
@@ -7113,7 +7113,7 @@ function recovery.chainPromisedQuorum(storage: storage.IStorageBackend, masterKe
 function recovery.composeRecoveryCapsule(options: recovery.IComposeCapsuleOptions): recovery.IComposedCapsule
 function recovery.computeGuardianSetId(profile: recovery.IGuardianSetProfile): Buffer
 function recovery.countReceiptQuorum(results: Array<recovery.IGuardianFanOutResult<{ receipt?: recovery.IGuardianReceipt; }>>, context: recovery.IGuardianSetContext, covers: (receiptState: recovery.GuardianState) => boolean): number
-function recovery.createGuardianRequestListener(options: recovery.IGuardianHttpOptions): (request: IncomingMessage, response: ServerResponse) => void
+function recovery.createGuardianRequestListener(options: recovery.IGuardianHttpOptions): (request: http#IncomingMessage, response: http#ServerResponse) => void
 function recovery.decodeAcquireEpochRequest(buf: Buffer): recovery.IGuardianAcquireEpochRequest
 function recovery.decodeAcquireEpochResponse(buf: Buffer): recovery.IGuardianAcquireEpochResponse
 function recovery.decodeFrame(plaintext: Buffer): recovery.RecoveryFrame
@@ -7279,7 +7279,7 @@ interface script.ICommitmentTxResult
 property script.ICommitmentTxResult.outputMap: { toLocal?: number; toRemote?: number; htlcs: number[]; htlcOriginalIndices: number[]; anchorLocal?: number; anchorRemote?: number; }
 property script.ICommitmentTxResult.toLocalScript?: Buffer
 property script.ICommitmentTxResult.toRemoteScript?: Buffer
-property script.ICommitmentTxResult.tx: bitcoin.Transaction
+property script.ICommitmentTxResult.tx: bitcoinjs-lib#Transaction
 interface script.IFundingScript
 property script.IFundingScript.address: string
 property script.IFundingScript.p2wshOutput: Buffer
@@ -7293,10 +7293,10 @@ property script.IHtlcOutput.taprootScript?: Buffer
 interface script.IPenaltyTxParams
 property script.IPenaltyTxParams.destinationAddress: string
 property script.IPenaltyTxParams.feeRatePerVbyte: number
-property script.IPenaltyTxParams.network?: bitcoin.Network
+property script.IPenaltyTxParams.network?: bitcoinjs-lib#Network
 property script.IPenaltyTxParams.outputIndices: number[]
 property script.IPenaltyTxParams.revocationPrivkey: Buffer
-property script.IPenaltyTxParams.revokedTx: bitcoin.Transaction
+property script.IPenaltyTxParams.revokedTx: bitcoinjs-lib#Transaction
 property script.IPenaltyTxParams.toLocalWitnessScript?: Buffer
 property script.IPenaltyTxParams.witnessScripts: Map<number, Buffer>
 function script.buildAnchorOutput(fundingPubkey: Buffer): { script: Buffer; witnessScript: Buffer; }
@@ -7304,22 +7304,22 @@ function script.buildAnchorScript(fundingPubkey: Buffer): Buffer
 function script.buildCommitmentTx(params: script.ICommitmentTxParams): script.ICommitmentTxResult
 function script.buildHtlcOutputScript(revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number): Buffer
 function script.buildHtlcPenaltyWitness(revocationSig: Buffer, revocationPubkey: Buffer, witnessScript: Buffer): Buffer[]
-function script.buildHtlcSuccessTx(htlcTxid: string, htlcOutputIndex: number, htlcAmount: bigint, revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number, feeSatoshis: bigint, zeroFee?: boolean): bitcoin.Transaction
-function script.buildHtlcTimeoutTx(htlcTxid: string, htlcOutputIndex: number, htlcAmount: bigint, cltvExpiry: number, revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number, feeSatoshis: bigint, zeroFee?: boolean): bitcoin.Transaction
+function script.buildHtlcSuccessTx(htlcTxid: string, htlcOutputIndex: number, htlcAmount: bigint, revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number, feeSatoshis: bigint, zeroFee?: boolean): bitcoinjs-lib#Transaction
+function script.buildHtlcTimeoutTx(htlcTxid: string, htlcOutputIndex: number, htlcAmount: bigint, cltvExpiry: number, revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number, feeSatoshis: bigint, zeroFee?: boolean): bitcoinjs-lib#Transaction
 function script.buildOfferedHtlcScript(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, useAnchors?: boolean): Buffer
-function script.buildPenaltyTx(params: script.IPenaltyTxParams): bitcoin.Transaction
+function script.buildPenaltyTx(params: script.IPenaltyTxParams): bitcoinjs-lib#Transaction
 function script.buildReceivedHtlcScript(revocationPubkey: Buffer, localHtlcPubkey: Buffer, remoteHtlcPubkey: Buffer, paymentHash: Buffer, cltvExpiry: number, useAnchors?: boolean): Buffer
 function script.buildToLocalPenaltyWitness(signature: Buffer, witnessScript: Buffer): Buffer[]
 function script.buildToLocalScript(revocationPubkey: Buffer, localDelayedPubkey: Buffer, toSelfDelay: number, leaseCsv?: number): Buffer
 function script.buildToRemoteAnchorOutput(remotePubkey: Buffer, leaseCsv?: number): { script: Buffer; witnessScript: Buffer; }
 function script.buildToRemoteAnchorScript(remotePubkey: Buffer, leaseCsv?: number): Buffer
 function script.calculateObscuredCommitmentNumber(openPaymentBasepoint: Buffer, acceptPaymentBasepoint: Buffer, commitmentNumber: bigint): bigint
-function script.createFundingScript(localFundingPubkey: Buffer, remoteFundingPubkey: Buffer, network?: bitcoin.Network): script.IFundingScript
+function script.createFundingScript(localFundingPubkey: Buffer, remoteFundingPubkey: Buffer, network?: bitcoinjs-lib#Network): script.IFundingScript
 function script.csvFromToLocalScript(witnessScript: Buffer): number | undefined
 function script.estimatePenaltyTxFee(outputIndices: number[], witnessScripts: Map<number, Buffer>, feeRatePerVbyte: number, destinationScript?: Buffer): number
 function script.getFundingScriptHash(witnessScript: Buffer): Buffer
 function script.leaseCsvFromToRemoteScript(witnessScript: Buffer): number | undefined
-function script.signPenaltyInput(tx: bitcoin.Transaction, inputIndex: number, witnessScript: Buffer, value: number, revocationPrivkey: Buffer): Buffer
+function script.signPenaltyInput(tx: bitcoinjs-lib#Transaction, inputIndex: number, witnessScript: Buffer, value: number, revocationPrivkey: Buffer): Buffer
 function script.sortCommitmentOutputs(outputs: Array<{ script: Buffer; value: bigint; }>): Array<{ script: Buffer; value: bigint; }>
 namespace storage
 class storage.CorruptRecoveryRowError extends Error
@@ -7890,7 +7890,7 @@ method swaps.IReverseSwapProviderDeps.hashInUse?(paymentHash: Buffer): boolean
 method swaps.IReverseSwapProviderDeps.heldSnapshot(paymentHash: Buffer): node.IHeldInvoiceSnapshot | null
 property swaps.IReverseSwapProviderDeps.ledger: swaps.SwapLedger
 method swaps.IReverseSwapProviderDeps.log(action: string, data: Record<string, unknown>): void
-property swaps.IReverseSwapProviderDeps.network: bitcoin.Network
+property swaps.IReverseSwapProviderDeps.network: bitcoinjs-lib#Network
 property swaps.IReverseSwapProviderDeps.networkName: swaps.ISwapRecord['network']
 method swaps.IReverseSwapProviderDeps.now?(): number
 method swaps.IReverseSwapProviderDeps.onHeld(cb: (event: { paymentHash: Buffer; }) => void): () => void
@@ -7966,7 +7966,7 @@ method swaps.ISubmarineSwapProviderDeps.hasUsableChannelWith(nodeId: Buffer): bo
 method swaps.ISubmarineSwapProviderDeps.hashInUse?(paymentHash: Buffer): boolean
 property swaps.ISubmarineSwapProviderDeps.ledger: swaps.SwapLedger
 method swaps.ISubmarineSwapProviderDeps.log(action: string, data: Record<string, unknown>): void
-property swaps.ISubmarineSwapProviderDeps.network: bitcoin.Network
+property swaps.ISubmarineSwapProviderDeps.network: bitcoinjs-lib#Network
 property swaps.ISubmarineSwapProviderDeps.networkName: swaps.ISwapRecord['network']
 method swaps.ISubmarineSwapProviderDeps.now?(): number
 method swaps.ISubmarineSwapProviderDeps.onPaymentEvent(cb: (paymentHash: Buffer) => void): () => void
@@ -8054,7 +8054,7 @@ property swaps.ISwapExposureSummary.count: number
 property swaps.ISwapExposureSummary.exposedCount: number
 property swaps.ISwapExposureSummary.exposedSat: bigint
 interface swaps.ISwapFunding
-property swaps.ISwapFunding.fundingTransaction: bitcoin.Transaction
+property swaps.ISwapFunding.fundingTransaction: bitcoinjs-lib#Transaction
 property swaps.ISwapFunding.htlc: swaps.ISwapHtlc
 property swaps.ISwapFunding.outputIndex: number
 interface swaps.ISwapFundingCandidate
@@ -8176,7 +8176,7 @@ property swaps.ISwapSpendObservation.height: number
 property swaps.ISwapSpendObservation.kind: swaps.SwapResolutionKind
 property swaps.ISwapSpendObservation.meetsPolicy: boolean
 property swaps.ISwapSpendObservation.preimage?: Buffer
-property swaps.ISwapSpendObservation.tx: bitcoin.Transaction
+property swaps.ISwapSpendObservation.tx: bitcoinjs-lib#Transaction
 property swaps.ISwapSpendObservation.txid: string
 interface swaps.ISwapStatus
 property swaps.ISwapStatus.currentHeight: number
@@ -8289,13 +8289,13 @@ type swaps.SubmarineSwapState = 'CREATED' | 'FUNDING_SEEN' | 'FUNDED' | 'FUNDING
 type swaps.SubmarineSwapTermsVerdict = { ok: true; htlc: swaps.ISwapHtlc; address: string; outputScript: Buffer; invoice: { paymentHash: Buffer; amountMsat: bigint; minFinalCltvExpiry: number; expiresAt: number; }; } | { ok: false; reason: string; refusal?: swaps.SwapRefusalReason; }
 type swaps.SwapAdmissionVerdict = { ok: true; reservedSat: bigint; } | { ok: false; reason: swaps.SwapExposureRefusal; detail: string; }
 class swaps.SwapChainResolver
-constructor swaps.SwapChainResolver(source: swaps.ISwapChainSource, policy: swaps.ISwapConfirmationPolicy, network?: bitcoin.Network)
+constructor swaps.SwapChainResolver(source: swaps.ISwapChainSource, policy: swaps.ISwapConfirmationPolicy, network?: bitcoinjs-lib#Network)
 method swaps.SwapChainResolver.broadcast(rawTxHex: string): Promise<string>
-method swaps.SwapChainResolver.conflictingSpend(tx: bitcoin.Transaction): Promise<string | undefined>
+method swaps.SwapChainResolver.conflictingSpend(tx: bitcoinjs-lib#Transaction): Promise<string | undefined>
 method swaps.SwapChainResolver.observe(params: swaps.ISwapObserveParams): Promise<swaps.ISwapChainObservation>
 type swaps.SwapDirection = 'reverse' | 'submarine'
 type swaps.SwapExposureRefusal = 'below-min' | 'above-max' | 'exposure' | 'concurrency' | 'fee-rate' | 'insufficient-balance'
-type swaps.SwapFundingStatus = { kind: 'absent'; } | { kind: 'mempool'; tx: bitcoin.Transaction; valueSat: bigint; } | { kind: 'confirmed'; tx: bitcoin.Transaction; valueSat: bigint; height: number; confirmations: number; meetsPolicy: boolean; } | { kind: 'reorged-out'; previousHeight: number; tx?: bitcoin.Transaction; }
+type swaps.SwapFundingStatus = { kind: 'absent'; } | { kind: 'mempool'; tx: bitcoinjs-lib#Transaction; valueSat: bigint; } | { kind: 'confirmed'; tx: bitcoinjs-lib#Transaction; valueSat: bigint; height: number; confirmations: number; meetsPolicy: boolean; } | { kind: 'reorged-out'; previousHeight: number; tx?: bitcoinjs-lib#Transaction; }
 type swaps.SwapKeyRole = 'claim' | 'refund'
 class swaps.SwapLedger
 constructor swaps.SwapLedger(store: IDurableLedgerStore<swaps.ISwapRecord>)
@@ -8372,9 +8372,9 @@ member swaps.SwapWireState.REFUNDED = 8
 member swaps.SwapWireState.REFUND_PENDING = 7
 member swaps.SwapWireState.SETTLED = 6
 member swaps.SwapWireState.UNKNOWN = 0
-function swaps.buildSwapClaimTx(params: swaps.ISwapSpend & { preimage: Buffer; }): bitcoin.Transaction
-function swaps.buildSwapHtlc(htlc: swaps.ISwapHtlc, network?: bitcoin.Network): swaps.ISwapHtlcOutput
-function swaps.buildSwapRefundTx(params: swaps.ISwapSpend): bitcoin.Transaction
+function swaps.buildSwapClaimTx(params: swaps.ISwapSpend & { preimage: Buffer; }): bitcoinjs-lib#Transaction
+function swaps.buildSwapHtlc(htlc: swaps.ISwapHtlc, network?: bitcoinjs-lib#Network): swaps.ISwapHtlcOutput
+function swaps.buildSwapRefundTx(params: swaps.ISwapSpend): bitcoinjs-lib#Transaction
 function swaps.decodeSwapCreate(data: Buffer): swaps.ISwapCreate
 function swaps.decodeSwapCreateAck(data: Buffer): swaps.ISwapCreateAck
 function swaps.decodeSwapQuote(data: Buffer): swaps.ISwapQuote
@@ -8395,7 +8395,7 @@ function swaps.encodeSwapSubmarineCreate(c: swaps.ISwapSubmarineCreate): Buffer
 function swaps.encodeSwapSubmarineCreateAck(a: swaps.ISwapSubmarineCreateAck): Buffer
 function swaps.evaluateSwapExposure(policy: swaps.ISwapExposurePolicy, input: swaps.ISwapExposureInput): swaps.SwapAdmissionVerdict
 function swaps.exposureRefusal(reason: swaps.SwapExposureRefusal): swaps.SwapRefusalReason
-function swaps.extractSwapPreimage(transaction: bitcoin.Transaction, funding: swaps.ISwapFunding): Buffer | undefined
+function swaps.extractSwapPreimage(transaction: bitcoinjs-lib#Transaction, funding: swaps.ISwapFunding): Buffer | undefined
 function swaps.htlcOfRecord(record: swaps.ISwapRecord): swaps.ISwapHtlc
 function swaps.isSwapExposure(record: swaps.ISwapRecord, resolutionConfirmations?: number): boolean
 function swaps.isTerminalSwapState(state: swaps.SwapState): boolean
@@ -8666,12 +8666,12 @@ const transport.WS_OPEN = 1
 type transport.WebSocketConstructor = new (url: string, protocols?: string | string[]) => transport.IWebSocketLike
 class transport.WebSocketServer extends EventEmitter
 constructor transport.WebSocketServer(options?: transport.IWebSocketServerOptions)
-method transport.WebSocketServer.address(): net.AddressInfo | string | null
+method transport.WebSocketServer.address(): net#AddressInfo | string | null
 method transport.WebSocketServer.close(): void
 method transport.WebSocketServer.isListening(): boolean
 method transport.WebSocketServer.listen(port: number, host?: string): Promise<void>
 class transport.WebSocketServerTransport extends transport.BufferedDataEmitter implements transport.IDuplexTransport
-constructor transport.WebSocketServerTransport(socket: net.Socket, opts?: { maxFramePayloadBytes?: number; initialData?: Buffer; onClosing?: () => void; })
+constructor transport.WebSocketServerTransport(socket: net#Socket, opts?: { maxFramePayloadBytes?: number; initialData?: Buffer; onClosing?: () => void; })
 method transport.WebSocketServerTransport.destroy(error?: Error): this
 method transport.WebSocketServerTransport.markEstablished(): void
 protected method transport.WebSocketServerTransport.onPendingOverflow(): void
@@ -8728,7 +8728,7 @@ function transport.responderAct2(state: transport.IHandshakeState, ephemeralPriv
 function transport.responderProcessAct1(state: transport.IHandshakeState, act1: Buffer): void
 function transport.responderProcessAct3(state: transport.IHandshakeState, act3: Buffer): Buffer
 function transport.selectOutboundProxy(host: string, proxy: { host: string; port: number; } | undefined, scope?: transport.Socks5ProxyScope): { host: string; port: number; } | undefined
-function transport.socks5SocketFactory(proxy: { host: string; port: number; }, timeoutMs?: number): (host: string, port: number) => Promise<net.Socket>
+function transport.socks5SocketFactory(proxy: { host: string; port: number; }, timeoutMs?: number): (host: string, port: number) => Promise<net#Socket>
 function transport.validateIrohRelayUrl(value: string): string
 namespace validation
 const validation.MAX_MESSAGE_SIZE = 65535
@@ -8801,13 +8801,13 @@ property watchtower.IJusticeContext.isTaproot?: boolean
 property watchtower.IJusticeContext.leaseCommitBlockheight?: number
 property watchtower.IJusticeContext.leaseExpiry?: number
 property watchtower.IJusticeContext.localPaymentPubkey?: Buffer
-property watchtower.IJusticeContext.network: bitcoin.Network
+property watchtower.IJusticeContext.network: bitcoinjs-lib#Network
 property watchtower.IJusticeContext.paymentBasepointSecret?: Buffer
 property watchtower.IJusticeContext.perCommitmentSecret: Buffer
 property watchtower.IJusticeContext.remoteDelayedBasepoint: Buffer
 property watchtower.IJusticeContext.revocationBasepoint: Buffer
 property watchtower.IJusticeContext.revocationBasepointSecret: Buffer
-property watchtower.IJusticeContext.revokedTx: bitcoin.Transaction
+property watchtower.IJusticeContext.revokedTx: bitcoinjs-lib#Transaction
 property watchtower.IJusticeContext.sweepScript: Buffer
 property watchtower.IJusticeContext.toSelfDelay: number
 interface watchtower.IJusticeKitV0
@@ -8851,7 +8851,7 @@ property watchtower.IWatchtowerClientOptions.chainHash: Buffer
 property watchtower.IWatchtowerClientOptions.connectTimeoutMs?: number
 property watchtower.IWatchtowerClientOptions.localPrivateKey: Buffer
 property watchtower.IWatchtowerClientOptions.maxUpdates?: number
-property watchtower.IWatchtowerClientOptions.network: bitcoin.Network
+property watchtower.IWatchtowerClientOptions.network: bitcoinjs-lib#Network
 property watchtower.IWatchtowerClientOptions.socks5Proxy?: { host: string; port: number; }
 property watchtower.IWatchtowerClientOptions.socks5ProxyScope?: transport.Socks5ProxyScope
 property watchtower.IWatchtowerClientOptions.store?: watchtower.IWatchtowerStore
@@ -8965,7 +8965,7 @@ function watchtower.blobTypeForChannel(isAnchor: boolean, isTaproot?: boolean): 
 function watchtower.breachHintFromTxid(txidInternal: Buffer): Buffer
 function watchtower.breachKeyFromTxid(txidInternal: Buffer): Buffer
 function watchtower.buildJusticeBackup(ctx: watchtower.IJusticeContext, policy: watchtower.ISessionPolicy): watchtower.IJusticeBackup
-function watchtower.chainHashForNetwork(network: bitcoin.Network): Buffer
+function watchtower.chainHashForNetwork(network: bitcoinjs-lib#Network): Buffer
 function watchtower.decodeCreateSession(payload: Buffer): watchtower.IWtCreateSession
 function watchtower.decodeCreateSessionReply(payload: Buffer): watchtower.IWtCreateSessionReply
 function watchtower.decodeDeleteSessionReply(payload: Buffer): watchtower.IWtDeleteSessionReply

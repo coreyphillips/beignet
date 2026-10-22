@@ -30,7 +30,7 @@ beignet: method Wallet.isUtxoFrozen(txid: string, index: number): boolean
 beignet: property Wallet.send.broadcast?: boolean
 beignet: property Wallet.sendMany.broadcast?: boolean
 beignet: property Wallet.sendMax.broadcast?: boolean
-beignet: const getBitcoinJsNetwork: (network: Network | `${Network}`) => BitcoinJsNetwork
+beignet: const getBitcoinJsNetwork: (network: Network | `${Network}`) => bitcoinjs-lib#Network
 beignet: const getElectrumNetwork: (network: Network) => EElectrumNetworks
 beignet/lightning: method node.LightningNode.openZeroConfChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint): channel.Channel
 beignet/lightning: const recovery.GuardianStore: typeof beignet/lightning/sqlite#GuardianStore

@@ -125,9 +125,9 @@ method Err.isErr(): this is Err<T>
 method Err.isOk(): this is Ok<T>
 interface IAddInput
 property IAddInput.input: IUtxo
-property IAddInput.keyPair?: BIP32Interface | ECPairInterface
+property IAddInput.keyPair?: bip32#BIP32Interface | ecpair#ECPairInterface
 property IAddInput.prevTxs?: Result<Map<string, string>>
-property IAddInput.psbt: Psbt
+property IAddInput.psbt: bitcoinjs-lib#Psbt
 interface IAddress
 property IAddress.address: string
 property IAddress.index: number
@@ -345,7 +345,7 @@ property IGetAddressesFromKeyPair.address: string
 property IGetAddressesFromKeyPair.publicKey: string
 interface IGetAddressesFromPrivateKey
 property IGetAddressesFromPrivateKey.addresses: IGetAddressesFromKeyPair[]
-property IGetAddressesFromPrivateKey.keyPair: BIP32Interface | ECPairInterface
+property IGetAddressesFromPrivateKey.keyPair: bip32#BIP32Interface | ecpair#ECPairInterface
 interface IGetDerivationPath extends IKeyDerivationPath
 property IGetDerivationPath.addressType?: EAddressType
 interface IGetFeeEstimatesResponse
@@ -447,7 +447,7 @@ property IParsedBip48Path.coinType: string
 property IParsedBip48Path.index: number
 interface IParsedExtendedPublicKey
 property IParsedExtendedPublicKey.addressType?: EAddressType
-property IParsedExtendedPublicKey.node: BIP32Interface
+property IParsedExtendedPublicKey.node: bip32#BIP32Interface
 interface IPeerData
 property IPeerData.host: string
 property IPeerData.port: string
@@ -455,7 +455,7 @@ property IPeerData.protocol: `${EProtocol}`
 interface IPrivateKeyInfo
 property IPrivateKeyInfo.addresses: IGetAddressesFromKeyPair[]
 property IPrivateKeyInfo.balance: number
-property IPrivateKeyInfo.keyPair: ECPairInterface | BIP32Interface
+property IPrivateKeyInfo.keyPair: ecpair#ECPairInterface | bip32#BIP32Interface
 property IPrivateKeyInfo.utxos: IUtxo[]
 interface IRbfData
 property IRbfData.addressType: EAddressType
@@ -545,7 +545,7 @@ property IUtxo.freezeTag?: string
 property IUtxo.frozenAt?: number
 property IUtxo.height: number
 property IUtxo.index: number
-property IUtxo.keyPair?: BIP32Interface | ECPairInterface
+property IUtxo.keyPair?: bip32#BIP32Interface | ecpair#ECPairInterface
 property IUtxo.path: string
 property IUtxo.publicKey: string
 property IUtxo.scriptHash: string
@@ -691,14 +691,14 @@ type TWalletDataKeys = keyof IWalletData
 type Tls = typeof import('tls')
 class Transaction
 constructor Transaction({ wallet }: { wallet: Wallet; })
-method Transaction.addExternalInputs({ inputs, keyPair }: { inputs: IUtxo[]; keyPair: BIP32Interface | ECPairInterface; }): Result<IUtxo[]>
+method Transaction.addExternalInputs({ inputs, keyPair }: { inputs: IUtxo[]; keyPair: bip32#BIP32Interface | ecpair#ECPairInterface; }): Result<IUtxo[]>
 property Transaction.addInput: ({ psbt, keyPair, input, prevTxs }: IAddInput) => Promise<Result<string>>
 property Transaction.addOutput: ({ address, value, index }: IOutput) => Promise<Result<string>>
 method Transaction.applyAutoCoinSelect({ coinSelectRes }: { coinSelectRes: ICoinSelectResponse; }): Promise<Result<ISendTransaction>>
 method Transaction.autoCoinSelect({ inputs, outputs, changeAddress, satsPerByte, message, coinSelectPreference }: { inputs: IUtxo[]; outputs: IOutput[]; changeAddress?: string; satsPerByte?: number; message?: string; coinSelectPreference?: ECoinSelectPreference; }): Result<ICoinSelectResponse>
-property Transaction.createPsbtFromTransactionData: ({ transactionData, bip32Interface, shuffleTargets, keys }: { transactionData: ISendTransaction; bip32Interface?: BIP32Interface | undefined; shuffleTargets?: boolean | undefined; keys?: Map<string, BIP32Interface> | undefined; }) => Promise<Result<Psbt>>
+property Transaction.createPsbtFromTransactionData: ({ transactionData, bip32Interface, shuffleTargets, keys }: { transactionData: ISendTransaction; bip32Interface?: bip32#BIP32Interface | undefined; shuffleTargets?: boolean | undefined; keys?: Map<string, bip32#BIP32Interface> | undefined; }) => Promise<Result<bitcoinjs-lib#Psbt>>
 property Transaction.createTransaction: ({ transactionData, shuffleOutputs, runCoinSelect, spendFrozen }?: ICreateTransaction) => Promise<Result<{ id: string; hex: string; }>>
-property Transaction.createUnsignedPsbt: ({ transactionData, shuffleOutputs, spendFrozen }?: { transactionData?: ISendTransaction | undefined; shuffleOutputs?: boolean | undefined; spendFrozen?: boolean | undefined; }) => Promise<Result<Psbt>>
+property Transaction.createUnsignedPsbt: ({ transactionData, shuffleOutputs, spendFrozen }?: { transactionData?: ISendTransaction | undefined; shuffleOutputs?: boolean | undefined; spendFrozen?: boolean | undefined; }) => Promise<Result<bitcoinjs-lib#Psbt>>
 get Transaction.data(): ISendTransaction
 property Transaction.estimateTransactionCosts: ({ transaction, customFeeRate }: { transaction?: ISendTransaction | undefined; customFeeRate?: number | undefined; }) => Result<{ amount: number; fee: number; satsPerByte: number; }>
 property Transaction.getMaxSatsPerByte: ({ transactionByteCount, balance }: { transactionByteCount: number; balance?: number | undefined; }) => number
@@ -713,7 +713,7 @@ property Transaction.sendMax: ({ address, transaction, index, satsPerByte, rbf, 
 method Transaction.setupCpfp({ txid, satsPerByte }: { txid?: string; satsPerByte?: number; }): Promise<Result<ISendTransaction>>
 method Transaction.setupRbf({ txid }: { txid: string; }): Promise<Result<ISendTransaction>>
 method Transaction.setupTransaction({ inputTxHashes, utxos, rbf, satsPerByte, outputs }?: ISetupTransaction): Promise<TSetupTransactionResponse>
-property Transaction.signPsbt: ({ psbt, bip32Interface, keys }: { psbt: Psbt; bip32Interface: BIP32Interface; keys?: Map<string, BIP32Interface> | undefined; }) => Promise<Result<Psbt>>
+property Transaction.signPsbt: ({ psbt, bip32Interface, keys }: { psbt: bitcoinjs-lib#Psbt; bip32Interface: bip32#BIP32Interface; keys?: Map<string, bip32#BIP32Interface> | undefined; }) => Promise<Result<bitcoinjs-lib#Psbt>>
 method Transaction.updateFee({ satsPerByte, selectedFeeId, index, transaction }: { satsPerByte: number; selectedFeeId?: EFeeId; index?: number; transaction?: ISendTransaction; }): Result<{ fee: number; }>
 property Transaction.updateSendTransaction: ({ transaction }: { transaction: Partial<ISendTransaction>; }) => Result<string>
 class Wallet
@@ -743,7 +743,7 @@ method Wallet.createSignedTransaction(args: ICreateSignedTransactionArgs): Promi
 static method Wallet.createWatchOnly(params: IWatchOnlyWallet): Promise<Result<Wallet>>
 get Wallet.data(): IWalletData
 method Wallet.deleteOnChainTransactionById({ txid }: { txid: string; }): Promise<Result<string>>
-method Wallet.derivePublicNode(path: string): Result<BIP32Interface>
+method Wallet.derivePublicNode(path: string): Result<bip32#BIP32Interface>
 property Wallet.disableMessages: boolean
 property Wallet.electrum: Electrum
 property Wallet.electrumOptions?: { net: Net; tls: Tls; servers?: TServer | TServer[]; batchLimit?: number; batchDelay?: number; }
@@ -782,7 +782,7 @@ method Wallet.getAddressesBalance(addresses?: string[]): Promise<Result<number>>
 method Wallet.getAddressesFromPrivateKey(privateKey: string, _addressTypes?: EAddressType[]): Result<IGetAddressesFromPrivateKey>
 method Wallet.getBalance(): number
 method Wallet.getBalanceBreakdown(): IBalanceBreakdown
-property Wallet.getBip32Interface: () => Promise<Result<BIP32Interface>>
+property Wallet.getBip32Interface: () => Promise<Result<bip32#BIP32Interface>>
 method Wallet.getBoostableTransactions(): { cpfp: IFormattedTransaction[]; rbf: IFormattedTransaction[]; }
 property Wallet.getBoostedTransactionParents: ({ txid, boostedTransactions }: { txid: string; boostedTransactions?: IBoostedTransactions | undefined; }) => string[]
 property Wallet.getBoostedTransactions: () => IBoostedTransactions
@@ -871,8 +871,8 @@ const appendDescriptorChecksum: (descriptor: string) => string
 const availableNetworks: () => Network[]
 const btcPerKbToSatPerVbyte: (btcPerKb: number) => number
 const btcToSats: (btc: number) => Sats
-const buildSortedMultisigPayment: ({ threshold, cosignerNodes, change, index, network }: { threshold: number; cosignerNodes: BIP32Interface[]; change: number; index: number; network: Network; }) => Result<ISortedMultisigPayment>
-const buildSortedMultisigPaymentFromKeys: ({ threshold, publicKeys, network }: { threshold: number; publicKeys: Buffer[]; network: Network; }) => Result<ISortedMultisigPayment>
+const buildSortedMultisigPayment: ({ threshold, cosignerNodes, change, index, network }: { threshold: number; cosignerNodes: bip32#BIP32Interface[]; change: number; index: number; network: bitcoinjs-lib#Network; }) => Result<ISortedMultisigPayment>
+const buildSortedMultisigPaymentFromKeys: ({ threshold, publicKeys, network }: { threshold: number; publicKeys: Buffer[]; network: bitcoinjs-lib#Network; }) => Result<ISortedMultisigPayment>
 const clampFeeRate: (rate: number) => number
 const constructByteCountParam: (addresses: string[], increaseAddressCount?: { addrType: EAddressType; count: number; }[]) => TGetByteCountInputs | TGetByteCountOutputs
 function createConsoleLogger(level?: TLogLevel, sink?: IConsoleSink): ILogger
@@ -895,12 +895,12 @@ const formatKeyDerivationPath: ({ path, purpose, network, changeAddress, index, 
 const formatPeerData: (data: [ string, string, [ string, string, string ] ]) => Result<IFormattedPeerData>
 const generateMnemonic: (strength?: number, rng?: ((size: number) => Buffer) | undefined, wordlist?: string[]) => string
 const generateWalletId: (seed: Buffer) => string
-const getAddressFromKeyPair: ({ keyPair, addressType, network }: { keyPair: BIP32Interface | ECPairInterface; addressType: EAddressType; network: BitcoinJsNetwork; }) => Result<IGetAddressesFromKeyPair>
+const getAddressFromKeyPair: ({ keyPair, addressType, network }: { keyPair: bip32#BIP32Interface | ecpair#ECPairInterface; addressType: EAddressType; network: bitcoinjs-lib#Network; }) => Result<IGetAddressesFromKeyPair>
 const getAddressFromScriptPubKey: (scriptPubKey: string, selectedNetwork: Network) => string
 const getAddressIndexDiff: (addrIndex1?: number, addrIndex2?: number) => number
 const getAddressTypeFromPath: (path: string | IKeyDerivationPath) => Result<EAddressType>
-const getAddressesFromPrivateKey: ({ privateKey, addrTypes, network }: { privateKey: string; addrTypes?: EAddressType[] | undefined; network?: BitcoinJsNetwork | undefined; }) => Result<IGetAddressesFromPrivateKey>
-const getBitcoinJsNetwork: (network: Network | `${Network}`) => BitcoinJsNetwork
+const getAddressesFromPrivateKey: ({ privateKey, addrTypes, network }: { privateKey: string; addrTypes?: EAddressType[] | undefined; network?: bitcoinjs-lib#Network | undefined; }) => Result<IGetAddressesFromPrivateKey>
+const getBitcoinJsNetwork: (network: Network | `${Network}`) => bitcoinjs-lib#Network
 const getByteCount: (inputs: TGetByteCountInputs, outputs: TGetByteCountOutputs, message?: string, minByteCount?: number) => number
 const getDataFallback: TGetData
 const getDefaultPort: (selectedNetwork: Network, protocol: `${EProtocol}`) => number
@@ -920,7 +920,7 @@ const getSeed: (mnemonic: string, bip39Passphrase?: string) => Buffer
 const getSeedHash: (seed: Buffer) => string
 const getSha256: (str: string) => string
 const getStorageKeyValues: (storageKey: string) => { walletName: string; network: Network; account: number; value: keyof IWalletData; } | undefined
-const getTapRootAddressFromPublicKey: ({ publicKey, network }: { publicKey: Buffer; network: BitcoinJsNetwork; }) => Result<{ address: string; output: Buffer; internalPubkey: Buffer; }>
+const getTapRootAddressFromPublicKey: ({ publicKey, network }: { publicKey: Buffer; network: bitcoinjs-lib#Network; }) => Result<{ address: string; output: Buffer; internalPubkey: Buffer; }>
 const getTxFee: ({ satsPerByte, transactionByteCount }: { satsPerByte: number; transactionByteCount: number; }) => number
 const getWalletDataStorageKey: (name: string, network: Network, key: keyof IWalletData, account?: number) => string
 const hasUntrimmedInputs: (vin: (TVin | TFormattedVin)[]) => boolean
@@ -944,12 +944,12 @@ const satsToBtc: (sats: Sats) => number
 const satsToMsat: (sats: Sats) => Msat
 function selfTestCryptoProvider(provider: ICryptoProvider): CryptoPrimitive[]
 function setCryptoProvider(provider: ICryptoProvider | null): void
-const setReplaceByFee: ({ psbt, setRbf }: { psbt: Psbt; setRbf: boolean; }) => void
+const setReplaceByFee: ({ psbt, setRbf }: { psbt: bitcoinjs-lib#Psbt; setRbf: boolean; }) => void
 function shouldLog(level: Exclude<TLogLevel, 'silent'>, threshold: TLogLevel): boolean
 const shuffleArray: <T>(array: T[]) => T[]
 const sleep: (ms: number) => Promise<void>
 const splitAddresses: (addresses: IAddresses, batchLimit: number) => IAddresses[]
-const toBitcoinJsNetwork: (network: Network) => BitcoinJsNetwork
+const toBitcoinJsNetwork: (network: Network) => bitcoinjs-lib#Network
 const toElectrumNetwork: (network: Network) => EElectrumNetworks
 const trimInputs: (vin: (TVin | TFormattedVin)[]) => TFormattedVin[]
 const validateAddress: ({ address, network }: { address: string; network?: Network | undefined; }) => { isValid: boolean; network: Network; }

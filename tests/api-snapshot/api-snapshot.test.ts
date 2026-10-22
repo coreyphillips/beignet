@@ -178,6 +178,27 @@ describe('API snapshot lines (issue #1713)', () => {
 		]);
 	});
 
+	it('names a dependency type by its package and declaration, whatever the import calls it', () => {
+		expect(
+			texts({
+				'index.d.ts': [
+					"import type { Transaction as Psbt } from 'pkg';",
+					'export interface Input {',
+					'    psbt: Psbt;',
+					'    other: import("pkg").Psbt;',
+					'}'
+				].join('\n'),
+				'node_modules/pkg/index.d.ts':
+					"export * from './src/tx';\nexport declare class Psbt {\n}",
+				'node_modules/pkg/src/tx.d.ts': 'export declare class Transaction {\n}'
+			})
+		).to.deep.equal([
+			'interface Input',
+			'property Input.other: pkg#Psbt',
+			'property Input.psbt: pkg#Transaction'
+		]);
+	});
+
 	it('qualifies namespace members, keeps literal spacing and drops module paths from import() types', () => {
 		expect(
 			texts({
@@ -200,9 +221,11 @@ describe('API snapshot lines (issue #1713)', () => {
 		]);
 	});
 
-	it('flags @deprecated declarations, overloads one by one, and marks type-only exports', () => {
+	it('flags @deprecated declarations, overloads and aliases one by one, and marks type-only exports', () => {
 		const result = lines({
+			'util.d.ts': 'export declare function start(): void;',
 			'index.d.ts': [
+				"export { /** @deprecated Use start. */ start as begin, start } from './util';",
 				'declare class Engine {',
 				'    start(): void;',
 				'}',
@@ -237,6 +260,7 @@ describe('API snapshot lines (issue #1713)', () => {
 		).to.deep.equal([
 			'property Options.timeout?: number',
 			'property Server.host: string',
+			'function begin(): void',
 			'function run(fast: boolean): void'
 		]);
 	});

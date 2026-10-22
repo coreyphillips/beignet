@@ -345,20 +345,43 @@ function declarationLines(
 }
 
 /**
- * Whether the name is exported with `export type`, which keeps a class,
- * enum, function or variable out of value positions.
+ * Whether an import or export the name goes through passes `test`, such as
+ * `export type`, which keeps a class, enum, function or variable out of value
+ * positions, or a @deprecated tag on `export { run as oldRun }`.
  */
-function isTypeOnlyExport(checker: ts.TypeChecker, symbol: ts.Symbol): boolean {
+function viaAlias(
+	checker: ts.TypeChecker,
+	symbol: ts.Symbol,
+	test: (node: ts.Declaration) => boolean
+): boolean {
 	for (
 		let s: ts.Symbol | undefined = symbol;
 		s && s.flags & ts.SymbolFlags.Alias;
 		s = checker.getImmediateAliasedSymbol(s)
 	) {
-		if (s.declarations?.some(ts.isTypeOnlyImportOrExportDeclaration)) {
-			return true;
-		}
+		if (s.declarations?.some(test)) return true;
 	}
 	return false;
+}
+
+/**
+ * `bitcoinjs-lib#Transaction` for a declaration a dependency exports, so a
+ * renamed import (`Transaction as Psbt`) or a same-named type from another
+ * package is a change. Globals such as Buffer keep their own name.
+ */
+function dependencyName(
+	program: ts.Program,
+	symbol: ts.Symbol
+): string | undefined {
+	const file = symbol.declarations?.[0]?.getSourceFile();
+	if (!file || !program.isSourceFileFromExternalLibrary(file)) return undefined;
+	const qualified = /^"([^"]*)"\.(.+)$/.exec(
+		program.getTypeChecker().getFullyQualifiedName(symbol)
+	);
+	if (!qualified) return undefined;
+	const [, module, name] = qualified;
+	const pkg = /.*\/node_modules\/((?:@[^/]+\/)?[^/]+)/.exec(module)?.[1];
+	return `${pkg ?? module}#${name}`;
 }
 
 function compare(a: string, b: string): number {
@@ -470,20 +493,25 @@ export function apiLines(
 					names.set(target, name);
 				}
 				const typeOnly =
-					isTypeOnlyExport(checker, symbol) &&
+					viaAlias(checker, symbol, ts.isTypeOnlyImportOrExportDeclaration) &&
 					(target.flags & ts.SymbolFlags.Value) !== 0;
+				const deprecatedName = viaAlias(checker, symbol, isDeprecated);
 				const namespaces = declarations.filter(
 					(d) => ts.isSourceFile(d) || ts.isModuleDeclaration(d)
 				);
 				for (const node of declarations) {
 					if (!namespaces.includes(node)) {
-						pending.push(() => declarationLines(name, node, typeOnly));
+						pending.push(() => {
+							const [head, ...rest] = declarationLines(name, node, typeOnly);
+							const deprecated = head.deprecated || deprecatedName;
+							return [{ ...head, deprecated }, ...rest];
+						});
 						declared.push(node);
 					}
 				}
 				if (!namespaces.length) continue;
 				const text = `${typeOnly ? 'type-only ' : ''}namespace ${name}`;
-				const deprecated = namespaces.some(isDeprecated);
+				const deprecated = deprecatedName || namespaces.some(isDeprecated);
 				pending.push(() => [{ name, text, deprecated }]);
 				if (open.includes(target)) {
 					throw new Error(`${name} re-exports a namespace that contains it`);
@@ -531,7 +559,7 @@ export function apiLines(
 			if (own !== undefined) return own;
 			const i = walked.findIndex((other) => other.names.has(symbol!));
 			return i < 0
-				? undefined
+				? dependencyName(program, symbol)
 				: `${entries[i].specifier}#${walked[i].names.get(symbol)}`;
 		};
 		const lines = pending.flatMap((render) => render());

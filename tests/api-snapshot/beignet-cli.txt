@@ -967,7 +967,7 @@ property IReportedGuardian.transports: Array<{ type: beignet/lightning#recovery.
 interface IStartedDaemon
 property IStartedDaemon.logger?: beignet#ILogger
 property IStartedDaemon.node: BeignetNode
-property IStartedDaemon.server: http.Server
+property IStartedDaemon.server: http#Server
 property IStartedDaemon.stop: (timeoutMs?: number) => Promise<void>
 interface IStructuredLog
 property IStructuredLog.action: string
