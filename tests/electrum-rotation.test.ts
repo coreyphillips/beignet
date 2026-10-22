@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import * as net from 'net';
+import sinon from 'sinon';
 import * as tls from 'tls';
 import {
 	EAvailableNetworks,
@@ -12,6 +13,10 @@ import {
 } from '../src';
 import { defaultElectrumPeers } from '../src/shapes';
 import { EElectrumNetworks, IHeader } from '../src/types';
+
+// The raw module.exports object, so stubs on it are seen by src/electrum.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const electrumHelpers = require('rn-electrum-client/helpers');
 
 /**
  * These tests run fully offline: the single-server connect attempt is stubbed
@@ -32,9 +37,14 @@ const serverB: TServer = {
 	protocol: EProtocol.ssl
 };
 
+// An instance with fallback peers disabled bars them for every instance on its
+// network until it disconnects, so none may outlive its test.
+const refusingFallbacks: Electrum[] = [];
+
 const createElectrum = (
 	servers: TServer | TServer[],
-	network = EAvailableNetworks.testnet
+	network = EAvailableNetworks.testnet,
+	{ disableFallbackServers }: { disableFallbackServers?: boolean } = {}
 ): Electrum => {
 	const fakeWallet = {
 		sendMessage: (): void => {},
@@ -45,8 +55,10 @@ const createElectrum = (
 		network,
 		net,
 		tls,
-		servers
+		servers,
+		disableFallbackServers
 	});
+	if (disableFallbackServers) refusingFallbacks.push(electrum);
 	// No background pings during tests.
 	electrum.stopConnectionPolling();
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -72,6 +84,12 @@ const stubConnections = (
 };
 
 describe('Electrum multi-server rotation', () => {
+	afterEach(async () => {
+		for (const electrum of refusingFallbacks.splice(0)) {
+			await electrum.disconnect();
+		}
+	});
+
 	it('starts with no current server and zero rotations', () => {
 		const electrum = createElectrum([serverA, serverB]);
 		expect(electrum.currentServer).to.equal(null);
@@ -223,6 +241,117 @@ describe('Electrum multi-server rotation', () => {
 		const res = await electrum.connectToElectrum({});
 		expect(res.isErr()).to.equal(true);
 		expect(attempts).to.deep.equal([serverA.host]);
+	});
+
+	it('never dials a fallback peer when they are disabled', async () => {
+		const electrum = createElectrum([serverA, serverB], undefined, {
+			disableFallbackServers: true
+		});
+		const attempts: string[] = [];
+		stubConnections(electrum, new Set([serverA.host, serverB.host]), attempts);
+
+		const res = await electrum.connectToElectrum({});
+		expect(res.isErr()).to.equal(true);
+		expect(attempts).to.deep.equal([serverA.host, serverB.host]);
+		expect(electrum.currentServer).to.equal(null);
+		expect(electrum.connectedToElectrum).to.equal(false);
+	});
+
+	it('still rotates through the given servers when fallback peers are disabled', async () => {
+		const electrum = createElectrum([serverA, serverB], undefined, {
+			disableFallbackServers: true
+		});
+		const attempts: string[] = [];
+		stubConnections(electrum, new Set([serverA.host]), attempts);
+
+		const res = await electrum.connectToElectrum({});
+		expect(res.isOk()).to.equal(true);
+		expect(attempts).to.deep.equal([serverA.host, serverB.host]);
+		expect(electrum.currentServer?.host).to.equal(serverB.host);
+	});
+
+	it('errs without dialling when fallback peers are disabled and no server is given', async () => {
+		const electrum = createElectrum([], undefined, {
+			disableFallbackServers: true
+		});
+		const attempts: string[] = [];
+		stubConnections(electrum, new Set(), attempts);
+
+		const res = await electrum.connectToElectrum({});
+		expect(res.isErr()).to.equal(true);
+		if (res.isErr()) {
+			expect(res.error.message).to.match(/fallback servers are disabled/);
+		}
+		expect(attempts).to.have.length(0);
+	});
+
+	it('keeps every instance on the network off fallback peers while one disables them', async () => {
+		const fallbackHosts = (
+			defaultElectrumPeers[EElectrumNetworks.bitcoinTestnet] ?? []
+		).map((s) => s.host);
+		const strict = createElectrum([serverA], undefined, {
+			disableFallbackServers: true
+		});
+		stubConnections(strict, new Set(), []);
+		expect((await strict.connectToElectrum({})).isOk()).to.equal(true);
+
+		const permissive = createElectrum([]);
+		const attempts: string[] = [];
+		stubConnections(permissive, new Set(), attempts);
+		expect((await permissive.connectToElectrum({})).isErr()).to.equal(true);
+		expect(attempts).to.have.length(0);
+
+		await strict.disconnect();
+		expect((await permissive.connectToElectrum({})).isOk()).to.equal(true);
+		expect(attempts).to.deep.equal([fallbackHosts[0]]);
+	});
+
+	it('skips fallback peers once an instance that disables them joins mid-rotation', async () => {
+		const permissive = createElectrum([serverB]);
+		const attempts: string[] = [];
+		let failServerB = (): void => {};
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(permissive as any).attemptConnect = async (
+			server: TServer
+		): Promise<{ error: unknown }> => {
+			attempts.push(server.host);
+			if (server.host !== serverB.host) return { error: false };
+			await new Promise<void>((resolve) => (failServerB = resolve));
+			return { error: 'connection refused' };
+		};
+		const connecting = permissive.connectToElectrum({});
+
+		const strict = createElectrum([serverA], undefined, {
+			disableFallbackServers: true
+		});
+		stubConnections(strict, new Set(), []);
+		expect((await strict.connectToElectrum({})).isOk()).to.equal(true);
+
+		failServerB();
+		expect((await connecting).isErr()).to.equal(true);
+		expect(attempts).to.deep.equal([serverB.host]);
+	});
+
+	it('drops a fallback peer a sibling holds when an instance disables them', async () => {
+		const [fallback] =
+			defaultElectrumPeers[EElectrumNetworks.bitcoinTestnet] ?? [];
+		sinon.stub(electrumHelpers, 'getConnectedPeer').returns({
+			host: fallback.host,
+			port: fallback.ssl,
+			protocol: fallback.protocol
+		});
+		const stop = sinon.stub(electrumHelpers, 'stop').resolves({ error: false });
+		try {
+			const strict = createElectrum([], undefined, {
+				disableFallbackServers: true
+			});
+			expect((await strict.connectToElectrum({})).isErr()).to.equal(true);
+			expect(
+				stop.calledWith({ network: EElectrumNetworks.bitcoinTestnet })
+			).to.equal(true);
+		} finally {
+			sinon.restore();
+		}
 	});
 
 	it('provides a signet fallback peer entry', () => {

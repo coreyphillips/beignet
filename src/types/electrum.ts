@@ -41,6 +41,42 @@ export enum EProtocol {
  */
 export type TProtocol = `${EProtocol}`;
 
+/** How a wallet reaches Electrum: `electrumOptions` on `Wallet.create`. */
+export interface IElectrumOptions {
+	/** Node's `net` module, or `react-native-tcp-socket` on React Native. */
+	net: Net;
+	/**
+	 * Node's `tls` module, or `react-native-tcp-socket` on React Native.
+	 *
+	 * With the plain module a TLS connection is encrypted but the server
+	 * certificate is not checked, because rn-electrum-client dials with
+	 * `rejectUnauthorized: false`, so an on-path attacker can stand in for the
+	 * server. On Node, pass `withTlsVerification(tls)` to check it. React
+	 * Native cannot verify yet.
+	 */
+	tls: Tls;
+	/**
+	 * Servers to connect to, tried in order. Required on regtest, and when
+	 * `disableFallbackServers` is set.
+	 */
+	servers?: TServer | TServer[];
+	/** Maximum number of requests sent in a single batch. Defaults to 20. */
+	batchLimit?: number;
+	/** Delay in milliseconds between batches. Defaults to 50. */
+	batchDelay?: number;
+	/**
+	 * Never connect to the built-in public servers. By default, once every
+	 * server in `servers` has failed (or when none is given), the wallet tries
+	 * public servers for its network, and those learn every address the wallet
+	 * watches. With this set the connect fails instead, and the connection
+	 * poll keeps retrying `servers`. Regtest never uses public servers.
+	 *
+	 * Wallets on one network in a process share one connection, so while any
+	 * of them sets this, none of them falls back to public servers.
+	 */
+	disableFallbackServers?: boolean;
+}
+
 export enum EScanningStrategy {
 	all = 'all', // Scan all addresses/scripthashes
 	gapLimit = 'gapLimit', // Adhere to the gap limit within range of the provided index when scanning addresses/scripthashes. If higher than the current index, it will be ignored

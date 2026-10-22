@@ -17,6 +17,7 @@ import {
 	EAvailableNetworks,
 	EElectrumNetworks,
 	EProtocol,
+	Network,
 	Wallet
 } from '../src';
 
@@ -143,5 +144,54 @@ describe('connectToElectrum failure reporting', function () {
 			wallet.isSwitchingNetworks = false;
 			electrumAny.attemptConnect = originalAttempt;
 		}
+	});
+});
+
+describe('connectToElectrum with fallback servers disabled', function () {
+	this.timeout(60000);
+
+	let wallet: Wallet | undefined;
+
+	after(async function () {
+		await wallet?.stop();
+	});
+
+	it('never dials a public server, before or after a network switch', async function () {
+		// Every fallback peer is TLS and the given servers are plain TCP, so a
+		// TLS dial can only be a fallback. Refused rather than made, so a
+		// regression fails here without reaching a public server.
+		const tlsDials: string[] = [];
+		const recordingTls = {
+			...tls,
+			connect: (options: tls.ConnectionOptions): tls.TLSSocket => {
+				tlsDials.push(`${options.host}:${options.port}`);
+				throw new Error('No TLS dial expected.');
+			}
+		} as typeof tls;
+		const res = await Wallet.create({
+			mnemonic: MNEMONIC,
+			network: Network.testnet,
+			electrumOptions: {
+				...electrumOptions,
+				tls: recordingTls,
+				disableFallbackServers: true
+			},
+			disableRefreshOnCreate: true,
+			// The other sources fall back to HTTP fee estimates.
+			feeEstimationSource: 'electrum'
+		});
+		if (res.isErr()) throw res.error;
+		wallet = res.value;
+
+		const connect = await wallet.connectToElectrum();
+		expect(connect.isErr()).to.equal(true);
+		expect(tlsDials).to.deep.equal([]);
+
+		// The switch builds a new Electrum instance from the wallet's options.
+		const switched = await wallet.switchNetwork(Network.bitcoin, otherServer);
+		if (switched.isErr()) throw switched.error;
+		const reconnect = await wallet.connectToElectrum();
+		expect(reconnect.isErr()).to.equal(true);
+		expect(tlsDials).to.deep.equal([]);
 	});
 });

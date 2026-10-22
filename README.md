@@ -175,7 +175,9 @@ wallet.listUtxos();           // every coin, frozen ones included
 wallet.listFrozenUtxos();
 wallet.getBalanceBreakdown(); // { total, spendable, frozen }
 
-// Waits (up to refreshTimeout) for an in-flight refresh and queued storage writes
+// Waits (up to refreshTimeout) for an in-flight refresh and queued storage
+// writes, then disconnects. Until then the Electrum socket and its connection
+// poll keep a Node process running.
 await wallet.stop();
 ```
 
@@ -205,6 +207,7 @@ const res = await Wallet.create({
 ```
 
 - **Failover:** with multiple servers the wallet rotates through them in order on connect/reconnect failure, then through hardcoded fallback peers for the network, with a per-server cooldown so dead servers are not hammered. Inspect `wallet.electrum.currentServer` and `wallet.electrum.rotationCount`.
+- **Public fallback servers:** outside regtest, the fallback peers are public servers, and once connected they learn every address the wallet watches. Pass `disableFallbackServers: true` in `electrumOptions` to only ever use `servers`: when they are all down the connect fails and the wallet keeps retrying them. Wallets on one network in a process share one connection, so while any of them sets it, none of them falls back.
 - **Certificate verification:** by default a TLS Electrum connection is encrypted but the server certificate is not checked, because the client library dials with `rejectUnauthorized: false`. An on-path attacker can therefore stand in for the server. On Node, pass `tls: withTlsVerification(tls)` to accept only certificates that chain to a trusted CA and match the host, and add `{ fingerprints: ['AB:CD:…'] }` to also accept self-signed servers by SHA-256 fingerprint (`openssl x509 -noout -fingerprint -sha256`). A caller that resolves the host itself and dials the address passes `{ servernames: { [address]: hostName } }` so the check still uses the name. The client library keeps one connection per network for the whole process, shared by every wallet on that network, so wallets in one process should all pass the same `tls`. The daemon verifies when `BEIGNET_ELECTRUM_TLS_VERIFY=true` (see `src/cli/README.md`); it is off by default. React Native does not verify yet.
 - **Fee source:** `'electrum'` queries only the connected server via `blockchain.estimatefee`, so fee lookups never leak to mempool.space/blocktank over clearnet. `'auto'` prefers Electrum and falls back to HTTP. All remote rates are clamped to 5000 sat/vB.
 - **Networks:** mainnet, testnet, regtest and signet work end to end (wallet, Electrum, CLI/daemon `--network signet`, Lightning chain hash and `tbs` invoice prefix). Signet shares testnet address formats and coin type 1.

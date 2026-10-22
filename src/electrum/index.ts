@@ -6,6 +6,7 @@ import type {
 	IAddress,
 	IAddresses,
 	IElectrumGetAddressBalanceRes,
+	IElectrumOptions,
 	IGetAddressHistoryResponse,
 	IGetAddressScriptHashBalances,
 	IGetAddressScriptHashesHistoryResponse,
@@ -322,6 +323,14 @@ const connectedServers: Map<
 	Map<string, Set<Electrum>>
 > = new Map();
 
+/**
+ * Instances that set disableFallbackServers and have not disconnected. The one
+ * client per network carries every instance's subscriptions and requests, so a
+ * sibling that dials a fallback peer would hand theirs to it as well: while one
+ * of these is on a network, no instance there dials a fallback peer.
+ */
+const fallbackServersRefusedBy: Set<Electrum> = new Set();
+
 /** Whether any instance in this process holds `serverKey` on `network`. */
 function isConnectedServer(
 	network: EElectrumNetworks,
@@ -546,6 +555,8 @@ export class Electrum {
 	private connectionPollingInterval: NodeJS.Timeout | null;
 	private net: Net;
 	private tls: Tls;
+	/** Set by IElectrumOptions.disableFallbackServers. */
+	private readonly _disableFallbackServers: boolean;
 	/** Shared in-flight connect, so concurrent callers don't race (see connectToElectrum). */
 	private _connectInFlight: Promise<Result<TConnectToElectrumRes>> | null =
 		null;
@@ -626,16 +637,12 @@ export class Electrum {
 		servers,
 		batchLimit = 20,
 		batchDelay = 50,
+		disableFallbackServers = false,
 		onReceive,
 		pollConnection = true
-	}: {
+	}: IElectrumOptions & {
 		wallet: Wallet;
 		network: Network;
-		net: Net;
-		tls: Tls;
-		servers?: TServer | TServer[];
-		batchLimit?: number;
-		batchDelay?: number;
 		onReceive?: (data: unknown) => void;
 		/** False leaves the poll to an explicit startConnectionPolling(). */
 		pollConnection?: boolean;
@@ -643,6 +650,7 @@ export class Electrum {
 		this._wallet = wallet;
 		this.sendMessage = wallet.sendMessage;
 		this.servers = servers ?? [];
+		this._disableFallbackServers = disableFallbackServers;
 		this.network = network;
 		this.electrumNetwork = toElectrumNetwork(this.network);
 		this.connectedToElectrum = false;
@@ -693,6 +701,7 @@ export class Electrum {
 		// disconnect landing mid-connect keeps the flag set, so the attempt it
 		// interrupted still declines to re-register the instance.
 		this._disconnected = false;
+		if (this._disableFallbackServers) fallbackServersRefusedBy.add(this);
 		if (this._connectInFlight) return this._connectInFlight;
 		this._connectInFlight = this._doConnect(args).finally(() => {
 			this._connectInFlight = null;
@@ -724,14 +733,39 @@ export class Electrum {
 			return err('Regtest requires that you pre-specify a server.');
 		}
 		const candidates = this.getServerCandidates(customPeers, electrumNetwork);
+		const ownKeys = new Set(customPeers.map((s) => this.serverKey(s)));
+		// A sibling may already sit on a fallback peer, and the one client per
+		// network would carry this instance's requests there whether or not
+		// its own connect succeeds.
+		if (this._disableFallbackServers) {
+			const peer = electrum.getConnectedPeer(electrumNetwork);
+			const peerKey = `${peer?.host}|${peer?.protocol}|${peer?.port}`;
+			const onFallback = (defaultElectrumPeers[electrumNetwork] ?? []).some(
+				(s) => this.serverKey(s) === peerKey
+			);
+			if (onFallback && !ownKeys.has(peerKey)) {
+				await electrum.stop({ network: electrumNetwork });
+			}
+		}
 		let connected = false;
-		let lastError = 'No Electrum servers available.';
+		// Only reported when there was no candidate to try.
+		let lastError = this._disableFallbackServers
+			? 'No Electrum server was given and fallback servers are disabled.'
+			: 'No Electrum servers available.';
 		/** Whether any candidate got past the teardown and reached a socket. */
 		let dialledAny = false;
 		/** Whether any candidate was refused because the peer would not stop. */
 		let refusedAny = false;
 		for (const candidate of this.orderCandidates(candidates)) {
 			if (this._disconnected) return err(DISCONNECTED_ERROR);
+			// The candidates predate the dials before this one, and an instance
+			// that disables fallback peers may have joined the network since.
+			if (
+				!ownKeys.has(this.serverKey(candidate)) &&
+				this.refusesFallbackPeers(electrumNetwork)
+			) {
+				continue;
+			}
 			const startResponse = await this.attemptConnect(
 				candidate,
 				electrumNetwork
@@ -1098,13 +1132,15 @@ export class Electrum {
 
 	/**
 	 * Ordered rotation candidates: user-provided servers first, then the
-	 * hardcoded fallback peers for the network (never for regtest), deduped.
+	 * hardcoded fallback peers for the network (never for regtest, nor when
+	 * any instance on the network set disableFallbackServers), deduped.
 	 */
 	private getServerCandidates(
 		customPeers: TServer[],
 		electrumNetwork: EElectrumNetworks
 	): TServer[] {
 		const fallback =
+			this.refusesFallbackPeers(electrumNetwork) ||
 			electrumNetwork === EElectrumNetworks.bitcoinRegtest
 				? []
 				: defaultElectrumPeers[electrumNetwork] ?? [];
@@ -1117,6 +1153,18 @@ export class Electrum {
 			candidates.push(server);
 		}
 		return candidates;
+	}
+
+	/** Whether this instance, or any instance on the network, bars fallback peers. */
+	private refusesFallbackPeers(electrumNetwork: EElectrumNetworks): boolean {
+		// Own flag checked too: a network switch computes the candidates before
+		// this.electrumNetwork moves to the target.
+		return (
+			this._disableFallbackServers ||
+			[...fallbackServersRefusedBy].some(
+				(instance) => instance.electrumNetwork === electrumNetwork
+			)
+		);
 	}
 
 	/**
@@ -2986,6 +3034,7 @@ export class Electrum {
 		// down. The flag keeps work still in flight (a subscription restore
 		// mid-await) from quietly registering the instance back.
 		this._disconnected = true;
+		fallbackServersRefusedBy.delete(this);
 		// This instance no longer vouches for the server it was on, so a peer
 		// left behind on it reads as a stray dial to whoever is still polling.
 		this.holdConnectedServer(null, null);
@@ -3049,6 +3098,7 @@ export class Electrum {
 		// reconnects, so it returns instead of putting the instance on the
 		// network. Only an explicit connectToElectrum clears it.
 		this._disconnected = true;
+		fallbackServersRefusedBy.delete(this);
 		const connecting = this._connectInFlight;
 		if (!this.connectedToElectrum && !connecting) return;
 		if (connecting) {
