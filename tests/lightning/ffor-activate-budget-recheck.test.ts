@@ -1,6 +1,6 @@
 /**
  * FFOR Variant D: the ff_activate recheck of the book charges the voucher
- * value once (specs/ffor-offline-receive.md sections 7.5.3, 7.6, 8).
+ * value once (docs/specs/ffor-offline-receive.md sections 7.5.3, 7.6, 8).
  *
  * The book's requirements are checked at ff_accept and rechecked at
  * ff_activate. Between the two the voucher round runs, and S's K adds take

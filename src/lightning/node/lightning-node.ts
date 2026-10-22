@@ -15816,12 +15816,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// left our BOLT 12 offers unreachable to non-direct peers. Reuse the init
 			// feature set (large_channels is already in it when wumbo is enabled).
 			//
-			// option_ff_concurrent is the one exception. CONCURRENT-RECEIVE.md
-			// section 1.1 defines it for the init context only: it qualifies a
-			// connection, both peers read it from the current init exchange,
-			// and nothing may infer a profile from an advertisement seen
-			// elsewhere. So it stays out of gossip. A node that has not opted
-			// in takes the first branch and announces the bytes it always did.
+			// option_ff_concurrent is the one exception. Section 1.1 of
+			// docs/specs/CONCURRENT-RECEIVE.md defines it for the init context
+			// only: it qualifies a connection, both peers read it from the
+			// current init exchange, and nothing may infer a profile from an
+			// advertisement seen elsewhere. So it stays out of gossip. A node
+			// that has not opted in takes the first branch and announces the
+			// bytes it always did.
 			let announcedFeatures = this.localFeatures.toBuffer();
 			if (this.localFeatures.hasFeature(Feature.OPTION_FF_CONCURRENT)) {
 				const announced = FeatureFlags.fromBuffer(announcedFeatures);
@@ -19709,7 +19710,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 	}
 
-	// ─────────────── FFOR Variant D (specs/ffor-offline-receive.md) ───────────────
+	// ─────────── FFOR Variant D (docs/specs/ffor-offline-receive.md) ───────────
 
 	/**
 	 * S: settle or fail an upstream HTLC whose hash is in a voucher book of
@@ -20028,8 +20029,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			hashChain?: boolean;
 			/**
 			 * TLV 17: ask for concurrent receive version 1
-			 * (CONCURRENT-RECEIVE.md section 1.1). Refused unless both sides
-			 * advertised option_ff_concurrent; selected only by S's echo.
+			 * (docs/specs/CONCURRENT-RECEIVE.md section 1.1). Refused unless both
+			 * sides advertised option_ff_concurrent; selected only by S's echo.
 			 */
 			concurrent?: boolean;
 			/** Exact signed profile request. Version 2 retains unresolved reserves. */
@@ -20612,9 +20613,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				'FFOR epoch is in dispute after reestablish: no invoice is exposed'
 			);
 		}
-		// CONCURRENT-RECEIVE.md section 8: an incompatible reconnect holds new
-		// admission. S refuses to settle under the hold, so an invoice exposed
-		// now is one it would not honour.
+		// docs/specs/CONCURRENT-RECEIVE.md section 8: an incompatible reconnect
+		// holds new admission. S refuses to settle under the hold, so an invoice
+		// exposed now is one it would not honour.
 		const admissionHold = channel.fforAdmissionHold();
 		if (admissionHold) {
 			throw new Error(`FFOR: no invoice is exposed while ${admissionHold}`);
@@ -30625,7 +30626,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// channel backup from us (and vice versa). Gated by peerStorageEnabled;
 		// the constructor clears the bit when that config flag is false.
 		flags.setOptional(Feature.PROVIDE_STORAGE);
-		// FFOR Variant D (specs/ffor-offline-receive.md section 5): both the
+		// FFOR Variant D (docs/specs/ffor-offline-receive.md section 5): both the
 		// recipient and the settlement-peer roles are implemented.
 		flags.setOptional(Feature.OPTION_FF_RECEIVE);
 		flags.setOptional(Feature.OPTION_FF_CONCURRENT);

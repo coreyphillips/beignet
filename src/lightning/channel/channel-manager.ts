@@ -1190,7 +1190,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			MessageType.TX_ACK_RBF,
 			MessageType.TX_ABORT,
 			MessageType.ANNOUNCEMENT_SIGNATURES,
-			// FFOR Variant D (specs/ffor-offline-receive.md section 14).
+			// FFOR Variant D (docs/specs/ffor-offline-receive.md section 14).
 			MessageType.FF_INIT,
 			MessageType.FF_ACCEPT,
 			MessageType.FF_INVOICES,
@@ -6142,8 +6142,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			if (channel.getState() === ChannelState.ERRORED) return;
 		}
 
-		// FFOR concurrent receive (CONCURRENT-RECEIVE.md section 8): before a
-		// concurrent epoch resumes new ordinary adds or new delegated
+		// FFOR concurrent receive (docs/specs/CONCURRENT-RECEIVE.md section 8):
+		// before a concurrent epoch resumes new ordinary adds or new delegated
 		// admissions, the CURRENT init exchange must advertise the base and
 		// concurrent capabilities on both sides. Judged here, on every
 		// reestablish, and handed to the channel before it runs.
@@ -6350,7 +6350,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		};
 	}
 
-	// ─────────────── FFOR Variant D (specs/ffor-offline-receive.md) ───────────────
+	// ─────────── FFOR Variant D (docs/specs/ffor-offline-receive.md) ───────────
 
 	/** Last FFOR state reported per channel, for the ffor:state event. */
 	private _fforLastState = new Map<string, FforState | null>();
@@ -6396,8 +6396,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	/**
 	 * Whether the current init exchange negotiated concurrent receive
-	 * (CONCURRENT-RECEIVE.md section 1.1): each side advertised either bit
-	 * of option_ff_receive (560/561) and either bit of option_ff_concurrent
+	 * (docs/specs/CONCURRENT-RECEIVE.md section 1.1): each side advertised either
+	 * bit of option_ff_receive (560/561) and either bit of option_ff_concurrent
 	 * (562/563). Unlike peerSupportsFfor this is FALSE when the peer's init
 	 * is unknown: an advertisement that was not seen selects nothing, and
 	 * the reconnect check of section 8 must not pass on a guess.

@@ -1,7 +1,7 @@
 /**
  * FFOR Variant D: adversarial fund-safety and protocol-safety review of
- * draft PR #718 (specs/ffor-offline-receive.md sections 7, 7.2, 7.5, 7.6, 8,
- * 9.5.1, 9.5.2, 12.1, 13.7.1).
+ * draft PR #718 (docs/specs/ffor-offline-receive.md sections 7, 7.2, 7.5, 7.6,
+ * 8, 9.5.1, 9.5.2, 12.1, 13.7.1).
  *
  * Every test encodes an outcome the spec requires against a malicious or
  * faulty S, R, payer or third party. Tests that PASS are candidates that

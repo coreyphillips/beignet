@@ -3546,8 +3546,8 @@ export class Channel {
 
 		// FFOR concurrent receive: while a voucher book is live the funder,
 		// whichever side that is, keeps the fee-spike buffer over the whole
-		// mixed commitment (CONCURRENT-RECEIVE.md section 3.1). The ceiling
-		// above already folds this in (_fforMixedBufferCeilingMsat), so an
+		// mixed commitment (docs/specs/CONCURRENT-RECEIVE.md section 3.1). The
+		// ceiling above already folds this in (_fforMixedBufferCeilingMsat), so an
 		// amount past it has met "Insufficient balance"; asked again here so
 		// the rule holds at the admission point whatever the ceiling says.
 		const mixedBufferRefusal = this._fforMixedBufferRefusal([
@@ -3945,9 +3945,9 @@ export class Channel {
 			}
 		}
 
-		// FFOR concurrent receive (CONCURRENT-RECEIVE.md section 3.1): while a
-		// voucher book is live the funder keeps the fee-spike buffer over the
-		// full mixed commitment, whoever funds and whoever adds. A peer add
+		// FFOR concurrent receive (docs/specs/CONCURRENT-RECEIVE.md section 3.1):
+		// while a voucher book is live the funder keeps the fee-spike buffer over
+		// the full mixed commitment, whoever funds and whoever adds. A peer add
 		// that breaks it is new work to reject, but never by failing the
 		// channel: that would cost the vouchers the channel they live on. It
 		// is admitted and stamped for the same fail-back as the funder-fee
@@ -5046,7 +5046,7 @@ export class Channel {
 					}
 				}
 				// FFOR concurrent receive, the voucher-subset invariant
-				// (CONCURRENT-RECEIVE.md section 4): never sign the peer a
+				// (docs/specs/CONCURRENT-RECEIVE.md section 4): never sign the peer a
 				// commitment that has dropped an unresolved voucher. Refused
 				// before anything is written, like the backstop above.
 				const subset = this._fforVoucherSubsetRefusal('remote', point, number);
@@ -5527,7 +5527,7 @@ export class Channel {
 			}
 
 			// FFOR concurrent receive, the voucher-subset invariant
-			// (CONCURRENT-RECEIVE.md section 4): the commitment these
+			// (docs/specs/CONCURRENT-RECEIVE.md section 4): the commitment these
 			// signatures cover must still carry every unresolved voucher, or
 			// the revoke_and_ack below would give up the one that does.
 			// Checked once the signatures verify and before anything is
@@ -11989,8 +11989,8 @@ export class Channel {
 		// disk.
 		//
 		// A capability hold a reestablish set or lifted is written too, even
-		// when nothing is sent (CONCURRENT-RECEIVE.md section 8: the hold
-		// lasts until a compatible init, so it must outlive this process).
+		// when nothing is sent (docs/specs/CONCURRENT-RECEIVE.md section 8: the
+		// hold lasts until a compatible init, so it must outlive this process).
 		// The marker is not consumed here: the write may fail, and then the
 		// record in memory already carries the change and no later
 		// reestablish would see one. It stands until a write lands.
@@ -23697,7 +23697,7 @@ export class Channel {
 		return actions;
 	}
 
-	// ─────────────── FFOR Variant D (specs/ffor-offline-receive.md) ───────────────
+	// ─────────── FFOR Variant D (docs/specs/ffor-offline-receive.md) ───────────
 	//
 	// The signed lifecycle of section 7.5 wrapped around one stock BOLT 2
 	// voucher round (section 9.5.1). The durable record rides
@@ -23728,8 +23728,8 @@ export class Channel {
 	/**
 	 * Section 7.5.5: from ACTIVATING on, no ordinary update from either side;
 	 * DRAINING admits only the voucher fulfils and fails and their rounds.
-	 * A concurrent epoch (CONCURRENT-RECEIVE.md section 3) is frozen only
-	 * while ACTIVATING: ACTIVE and DRAINING carry ordinary traffic.
+	 * A concurrent epoch (docs/specs/CONCURRENT-RECEIVE.md section 3) is frozen
+	 * only while ACTIVATING: ACTIVE and DRAINING carry ordinary traffic.
 	 */
 	fforIsFrozen(): boolean {
 		const f = this._fforLive();
@@ -23744,8 +23744,8 @@ export class Channel {
 
 	/**
 	 * Whether the epoch selected concurrent receive version 1
-	 * (CONCURRENT-RECEIVE.md section 1.1). Read from the record alone: the
-	 * selection is persisted with the transcript and never inferred from
+	 * (docs/specs/CONCURRENT-RECEIVE.md section 1.1). Read from the record alone:
+	 * the selection is persisted with the transcript and never inferred from
 	 * what a connection advertises.
 	 */
 	private _fforIsConcurrent(f: IFforEpochRecord): boolean {
@@ -23753,8 +23753,8 @@ export class Channel {
 	}
 
 	/**
-	 * Concurrent receive (CONCURRENT-RECEIVE.md section 8): record whether
-	 * the connection this reestablish runs on negotiated the base and
+	 * Concurrent receive (docs/specs/CONCURRENT-RECEIVE.md section 8): record
+	 * whether the connection this reestablish runs on negotiated the base and
 	 * concurrent capabilities. Called by the manager from the current init
 	 * exchange immediately before handleReestablish, on every reestablish.
 	 * An incompatible one holds new admission of a live concurrent epoch
@@ -23791,8 +23791,8 @@ export class Channel {
 			return 'the epoch is in dispute';
 		}
 		if (this._fforHolding) {
-			// CONCURRENT-RECEIVE.md section 3: a close transition may briefly
-			// serialize new ordinary adds. This one waits for the peer's
+			// docs/specs/CONCURRENT-RECEIVE.md section 3: a close transition may
+			// briefly serialize new ordinary adds. This one waits for the peer's
 			// ff_close_ack, which may never come on this connection, so a new
 			// add is refused rather than parked behind the chain.
 			return 'the close of the voucher book is being recovered with the peer';
@@ -23910,7 +23910,7 @@ export class Channel {
 
 	/**
 	 * _fforUpdateRefusal for an epoch that selected concurrent receive
-	 * version 1 (CONCURRENT-RECEIVE.md sections 1.2, 3, 6 and 7). The
+	 * version 1 (docs/specs/CONCURRENT-RECEIVE.md sections 1.2, 3, 6 and 7). The
 	 * decision table, by epoch state:
 	 *
 	 *   NEGOTIATING, VOUCHERS_COMMITTED: nothing is refused here (our own
@@ -24018,8 +24018,8 @@ export class Channel {
 	 * R, our own settle. A voucher is parked (base section 9.5.1 step 3):
 	 *   - before ACTIVE, never;
 	 *   - ACTIVE: a fulfil only from the epoch's own redemption, with a
-	 *     preimage it has verified (CONCURRENT-RECEIVE.md section 6); a fail
-	 *     never, since only the final close authorizes one (section 7);
+	 *     preimage it has verified (docs/specs/CONCURRENT-RECEIVE.md section 6);
+	 *     a fail never, since only the final close authorizes one (section 7);
 	 *   - DRAINING: a fulfil from the epoch's drain; a fail from the drain,
 	 *     and only for a slot the ff_close_ack marks unsettled for which no
 	 *     preimage is held (base section 7.5.6);
@@ -24100,8 +24100,8 @@ export class Channel {
 	}
 
 	/**
-	 * The voucher-subset invariant (CONCURRENT-RECEIVE.md section 4): every
-	 * commitment of a concurrent ACTIVE or DRAINING epoch preserves each
+	 * The voucher-subset invariant (docs/specs/CONCURRENT-RECEIVE.md section 4):
+	 * every commitment of a concurrent ACTIVE or DRAINING epoch preserves each
 	 * unresolved voucher's direction, id, hash, amount and expiry. Returns
 	 * why the commitment about to be signed (`remote`) or accepted (`local`)
 	 * does not, or null.
@@ -24201,8 +24201,8 @@ export class Channel {
 	}
 
 	/**
-	 * Whether slot k's voucher may be gone from the channel under an
-	 * authorized transition (CONCURRENT-RECEIVE.md sections 4, 6 and 7).
+	 * Whether slot k's voucher may be gone from the channel under an authorized
+	 * transition (docs/specs/CONCURRENT-RECEIVE.md sections 4, 6 and 7).
 	 *
 	 * R removes a voucher only by fulfilling it, which needs its preimage,
 	 * or by failing it in DRAINING when the ff_close_ack marks it unsettled.
@@ -24291,7 +24291,7 @@ export class Channel {
 	}
 
 	/**
-	 * CONCURRENT-RECEIVE.md section 3.1 with base section 7.6: while a
+	 * docs/specs/CONCURRENT-RECEIVE.md section 3.1 with base section 7.6: while a
 	 * concurrent voucher book is live, the funder keeps above its reserve
 	 * the commitment cost at TWICE the feerate for the full mixed
 	 * commitment, not only for the K vouchers the setup checked. Returns
@@ -24554,8 +24554,8 @@ export class Channel {
 		hashChain?: boolean;
 		/**
 		 * TLV 17: ask for the concurrent receive profile, version 1
-		 * (CONCURRENT-RECEIVE.md section 1.1). Selected only by S's exact
-		 * signed echo; independent hashes only.
+		 * (docs/specs/CONCURRENT-RECEIVE.md section 1.1). Selected only by S's
+		 * exact signed echo; independent hashes only.
 		 */
 		concurrent?: boolean;
 		/** Exact signed profile request. Version 2 retains unresolved reserves. */
@@ -24586,8 +24586,8 @@ export class Channel {
 			];
 		}
 		if (request.concurrent) {
-			// CONCURRENT-RECEIVE.md section 1.1: both feature pairs on both
-			// sides before the request, and section 1: no hash chain. Refused
+			// docs/specs/CONCURRENT-RECEIVE.md section 1.1: both feature pairs on
+			// both sides before the request, and section 1: no hash chain. Refused
 			// here rather than sent for S to refuse: an ff_init burns its
 			// epoch id.
 			const concurrentRefusal =
@@ -24924,10 +24924,10 @@ export class Channel {
 				);
 			}
 		}
-		// CONCURRENT-RECEIVE.md section 1.1: a request for the concurrent
-		// profile (TLV 17) is refused unless both feature pairs are negotiated,
-		// the profile is the one version 1 defines (Variant D, checked above,
-		// and independent hashes), the value is the one we select, and this
+		// docs/specs/CONCURRENT-RECEIVE.md section 1.1: a request for the
+		// concurrent profile (TLV 17) is refused unless both feature pairs are
+		// negotiated, the profile is the one version 1 defines (Variant D, checked
+		// above, and independent hashes), the value is the one we select, and this
 		// peer offers it. Never answered as a baseline epoch instead: the
 		// refusal burns the epoch id, and a baseline attempt is a new epoch.
 		const concurrent = msg.concurrentVersion !== undefined;
@@ -25031,7 +25031,7 @@ export class Channel {
 				voucherAmountsMsat: params.voucherAmountsMsat,
 				initHash: tInit,
 				// The exact signed echo is the only thing that selects the
-				// concurrent profile (CONCURRENT-RECEIVE.md section 1.1).
+				// concurrent profile (docs/specs/CONCURRENT-RECEIVE.md section 1.1).
 				...(concurrent ? { concurrentVersion: msg.concurrentVersion } : {})
 			})
 		);
@@ -25176,9 +25176,9 @@ export class Channel {
 				'ff_accept TLV 11 is not the digest of our ff_init'
 			);
 		}
-		// CONCURRENT-RECEIVE.md section 1.1: the concurrent profile is selected
-		// by S's exact signed echo of the value we requested and by nothing
-		// else. An echo we did not ask for is a violation; a missing or
+		// docs/specs/CONCURRENT-RECEIVE.md section 1.1: the concurrent profile is
+		// selected by S's exact signed echo of the value we requested and by
+		// nothing else. An echo we did not ask for is a violation; a missing or
 		// different one is a refusal of the terms (an older S ignores the odd
 		// TLV and answers without it). Either way the setup aborts and its
 		// epoch id is spent: it never continues as a baseline epoch.
@@ -25336,7 +25336,8 @@ export class Channel {
 		// voucher only where one can arrive: in the round window, or replayed
 		// into an aborted setup. An add that repeats a book tuple later (the
 		// slot's voucher already redeemed or drained) must not recreate the
-		// voucher (CONCURRENT-RECEIVE.md section 6); it is an ordinary HTLC.
+		// voucher (docs/specs/CONCURRENT-RECEIVE.md section 6); it is an
+		// ordinary HTLC.
 		if (
 			this._fforIsConcurrent(f) &&
 			f.state !== FforState.NEGOTIATING &&
@@ -26181,9 +26182,9 @@ export class Channel {
 		// Baseline: the channel carries nothing but the drain, so CLOSED also
 		// waits for every pending update. A concurrent epoch carries ordinary
 		// traffic, which may never pause, and CLOSED means every VOUCHER is
-		// irrevocably resolved, not every ordinary HTLC (CONCURRENT-RECEIVE.md
-		// section 7): an ordinary update in flight neither delays CLOSED nor
-		// closes the channel.
+		// irrevocably resolved, not every ordinary HTLC
+		// (docs/specs/CONCURRENT-RECEIVE.md section 7): an ordinary update in
+		// flight neither delays CLOSED nor closes the channel.
 		//
 		// Concurrent terminal records establish removal in both views.
 		if (!this._fforIsConcurrent(f) && this.hasPendingHtlcs()) return [];
@@ -27203,8 +27204,8 @@ export class Channel {
 		if (!f || f.role !== 'S') return 'no epoch';
 		if (f.state !== FforState.ACTIVE) return `epoch is ${FforState[f.state]}`;
 		if (f.activationMismatch) return 'activation hash mismatch at reestablish';
-		// CONCURRENT-RECEIVE.md section 8: no new delegated admission after an
-		// incompatible reconnect, until a compatible one. An ordinary
+		// docs/specs/CONCURRENT-RECEIVE.md section 8: no new delegated admission
+		// after an incompatible reconnect, until a compatible one. An ordinary
 		// disconnect sets no hold, so the offline service is not interrupted.
 		if (this._fforIsConcurrent(f) && f.capabilityHold === true) {
 			return 'capability hold: the peer did not advertise option_ff_receive and option_ff_concurrent on its last connection';
@@ -27358,8 +27359,8 @@ export class Channel {
 	/**
 	 * Whether the FFOR part of a reestablish answer must leave before the
 	 * BOLT 2 retransmissions: a concurrent epoch whose answer retransmits
-	 * ff_activate_ack (CONCURRENT-RECEIVE.md section 1.2 keeps base section
-	 * 7.5.5's acknowledgement-loss rule, and a concurrent S may have sent
+	 * ff_activate_ack (docs/specs/CONCURRENT-RECEIVE.md section 1.2 keeps base
+	 * section 7.5.5's acknowledgement-loss rule, and a concurrent S may have sent
 	 * updates since).
 	 */
 	private _fforAckLeadsReplay(fforActions: ChannelAction[]): boolean {

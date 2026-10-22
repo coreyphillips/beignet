@@ -73,7 +73,8 @@ const wrapExpected = (addressType: EAddressType, keyExpr: string): string => {
 };
 
 describe('Descriptor checksum (BIP 380)', () => {
-	// External vectors from Bitcoin Core (doc/descriptors.md).
+	// External vectors from Bitcoin Core:
+	// https://github.com/bitcoin/bitcoin/blob/master/doc/descriptors.md
 	it('matches the Bitcoin Core wpkh example vector', () => {
 		expect(
 			descriptorChecksum(

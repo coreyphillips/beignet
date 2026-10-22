@@ -1153,7 +1153,7 @@ export function serializeChannelState(
 	};
 }
 
-// ─── FFOR Variant D epoch record (specs/ffor-offline-receive.md 7.5.5) ───
+// ─── FFOR Variant D epoch record (docs/specs/ffor-offline-receive.md 7.5.5) ───
 
 export interface ISerializedFforEpoch {
 	role: string;
@@ -1344,9 +1344,9 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 
 /**
  * The selected profile of a stored epoch, checked against the transcript
- * it was persisted with (CONCURRENT-RECEIVE.md section 1.1: the version is
- * never inferred from features, connection status or preferences, and
- * section 8: it is compared with the persisted setup bytes).
+ * it was persisted with (docs/specs/CONCURRENT-RECEIVE.md section 1.1: the
+ * version is never inferred from features, connection status or preferences,
+ * and section 8: it is compared with the persisted setup bytes).
  *
  * The stored field and the stored ff_init and ff_accept must tell one
  * story: a request and its exact echo beside a selected version, or no

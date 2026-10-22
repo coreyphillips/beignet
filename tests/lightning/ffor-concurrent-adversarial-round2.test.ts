@@ -1,7 +1,7 @@
 /**
  * FFOR concurrent receive, version 1: round 2 of the adversarial recovery
- * review of PR #1301 (specs/CONCURRENT-RECEIVE.md sections 3, 7 and 8; base
- * sections 7.5.5 and 7.5.6).
+ * review of PR #1301 (docs/specs/CONCURRENT-RECEIVE.md sections 3, 7 and 8;
+ * base sections 7.5.5 and 7.5.6).
  *
  * Round 1 found that the drain hold let later sends overtake the held
  * chain, that a differing ff_close_ack wedged ordinary traffic, that a
@@ -1556,8 +1556,8 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 			).to.deep.equal(epochs.map((e) => e.toString('hex')));
 		});
 
-		// CONCURRENT-RECEIVE.md section 3: a close transition "MUST permit
-		// existing ordinary fulfill/fail and commitment progress".
+		// docs/specs/CONCURRENT-RECEIVE.md section 3: a close transition "MUST
+		// permit existing ordinary fulfill/fail and commitment progress".
 		//
 		// The round 1 fix refuses R's own settle while the disputed chain is
 		// held and names the remedy: "the caller keeps what it owes and

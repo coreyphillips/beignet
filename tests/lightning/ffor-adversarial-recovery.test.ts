@@ -1,10 +1,11 @@
 /**
  * FFOR Variant D: adversarial recovery review of draft PR #718.
  *
- * Every test here encodes an outcome the spec (specs/ffor-offline-receive.md,
- * sections 7.5.4, 7.5.5, 7.5.6, 9.5.1, 11.1) requires, and each one FAILS on
- * feat/variant-d at 18d4e04. The comment above each test quotes the spec
- * sentence it enforces and names the behaviour observed instead.
+ * Every test here encodes an outcome the spec
+ * (docs/specs/ffor-offline-receive.md, sections 7.5.4, 7.5.5, 7.5.6, 9.5.1,
+ * 11.1) requires, and each one FAILS on feat/variant-d at 18d4e04. The comment
+ * above each test quotes the spec sentence it enforces and names the behaviour
+ * observed instead.
  *
  * Harnesses are the ones the M8 suites use: two ChannelManagers in loopback
  * with a wire log for the channel-level matrix, three LightningNodes (payer,

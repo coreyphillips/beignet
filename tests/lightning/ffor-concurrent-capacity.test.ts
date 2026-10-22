@@ -1,6 +1,6 @@
 /**
  * FFOR concurrent receive, version 1: capacity, fees and the voucher-subset
- * invariant (specs/CONCURRENT-RECEIVE.md sections 3.1 and 4, base section
+ * invariant (docs/specs/CONCURRENT-RECEIVE.md sections 3.1 and 4, base section
  * 7.6).
  *
  * Vouchers and ordinary S-to-R HTLCs share R's count and in-flight limits;

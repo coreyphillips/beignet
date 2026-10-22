@@ -1,6 +1,6 @@
 /**
  * FFOR concurrent receive, version 1: the negotiation wire surface
- * (specs/CONCURRENT-RECEIVE.md section 1.1).
+ * (docs/specs/CONCURRENT-RECEIVE.md section 1.1).
  *
  * ff_init and ff_accept TLV 17 `concurrent_version` is exactly the two bytes
  * `00 01`. The TLV is absent in both messages of a baseline epoch, whose

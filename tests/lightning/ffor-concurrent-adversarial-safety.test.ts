@@ -1613,8 +1613,8 @@ describe('FFOR concurrent receive, adversarial: feature bit hygiene', function (
 
 	// The review observed that with the option on, bit 563 also rode in
 	// node_announcement, because the node reuses its init set there.
-	// CONCURRENT-RECEIVE.md section 1.1 names the init context only, so the
-	// announcement now leaves it out.
+	// docs/specs/CONCURRENT-RECEIVE.md section 1.1 names the init context only,
+	// so the announcement now leaves it out.
 	it('with the option on, bit 563 is advertised in init and left out of node_announcement, whose features are those of a node with the option off', () => {
 		const announce = (node: LightningNode): Buffer => {
 			const payload = (
