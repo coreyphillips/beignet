@@ -99,7 +99,7 @@ Tor, full-graph gossip, the low-level `LightningNode` variant and the non-intera
 
 Node state lives in a SQLite DB under `~/.beignet/data/<hash-of-mnemonic>/` (the `--low-level` example uses `example/lightningData/node.db`).
 
-Both examples run through `ts-node`. The on-chain example runs straight off the TypeScript sources. The Lightning example imports only the public entry points (`beignet`, `beignet/cli`, `beignet/lightning`), so `npm run example:lightning` builds `dist/` first, and the file runs unchanged in a project that installed `beignet` from npm.
+Both examples run through `ts-node`. The on-chain example runs straight off the TypeScript sources. The Lightning example imports only the public entry points (`beignet`, `beignet/cli`, `beignet/lightning`, `beignet/lightning/sqlite`), so `npm run example:lightning` builds `dist/` first, and the file runs unchanged in a project that installed `beignet` from npm.
 
 **→ [example/REPL_TESTING.md](example/REPL_TESTING.md) is a copy-pasteable walkthrough** of the whole lifecycle in the REPL: funding, peers, channels, invoices, payments, keysend, offers, splicing, closing, backup.
 
@@ -671,6 +671,8 @@ LightningNode              High-level API (EventEmitter)
 | `validation/` | Input validation shared across modules |
 
 `beignet/lightning` re-exports each of these as a namespace, camel-casing hyphenated names: `import { asyncPayments, ffor, watchtower } from 'beignet/lightning'`.
+
+`SqliteStorage` and `GuardianStore` load from `beignet/lightning/sqlite`. They need `better-sqlite3`, an optional dependency that npm installs by default, and `beignet/lightning` loads without it.
 
 </details>
 

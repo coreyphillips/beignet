@@ -104,6 +104,14 @@ import { node as ln } from 'beignet/lightning';
 const config: ln.INodeConfig = { /* ... */ };
 ```
 
+The SQLite stores have their own entry, because they need the native `better-sqlite3` module and nothing else in `beignet/lightning` does:
+
+```typescript
+import { SqliteStorage, GuardianStore } from 'beignet/lightning/sqlite';
+```
+
+`better-sqlite3` is an optional dependency. npm installs it by default, and each store loads it when constructed. Without it, `beignet/lightning` still loads, and constructing a store throws an error naming the missing module. `BeignetNode` and the `beignet` CLI build on `SqliteStorage`, so they need it too. `storage.SqliteStorage` and `recovery.GuardianStore` still work but are deprecated, and go in the next major release.
+
 Every example below assumes `node` is a `LightningNode` instance and uses these namespace aliases:
 
 ```typescript
@@ -119,7 +127,8 @@ import {
 
 - Node.js 22.23.4+, 24.22.1+ or 26.12.1+ with the `crypto` module
 - `bitcoinjs-lib` with `@bitcoinerlab/secp256k1`
-- `bech32` (BOLT 11 invoices), `better-sqlite3` (storage backend)
+- `bech32` (BOLT 11 invoices)
+- `better-sqlite3` (optional, for `beignet/lightning/sqlite`)
 
 ## Quick Start
 
@@ -1254,7 +1263,7 @@ faster than anything else in this document. Use `ls src/lightning/<module>` inst
 | `watchtower` | `WatchtowerClient`, `wtwire`, justice blob, tower connection | -- |
 | `backup` | Static channel backup (SCB) encode/decode | -- |
 | `node` | `LightningNode`, `INodeConfig`, rate limiter | -- |
-| `storage` | `SqliteStorage`, `IStorageBackend`, `serialization` | -- |
+| `storage` | `IStorageBackend`, `serialization` (`SqliteStorage` is in `beignet/lightning/sqlite`) | -- |
 | `wallet` | `WalletFundingProvider`, `IFundingProvider` | -- |
 | `advisor` | `LiquidityAdvisor`, `FeeAdvisor`, `ChannelSuggestions`, rebalance/fee executors | -- |
 | `validation` | Input validation utilities | -- |

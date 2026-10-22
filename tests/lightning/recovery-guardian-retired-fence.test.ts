@@ -36,7 +36,6 @@ import {
 	CRASH_V1_PROFILE,
 	GuardianState,
 	GuardianStatus,
-	GuardianStore,
 	IGuardianAcquireEpochRequest,
 	IGuardianAlarm,
 	IGuardianGetHeadResponse,
@@ -60,6 +59,7 @@ import {
 	takeoverTranscriptHash,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
+import { GuardianStore } from '../../src/lightning/sqlite';
 
 const sha = (s: string): Buffer =>
 	crypto.createHash('sha256').update(s).digest();

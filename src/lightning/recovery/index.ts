@@ -10,13 +10,23 @@
  * Phase 6: quorum durability barriers around irreversible transitions.
  */
 
+import { GuardianStore as GuardianStoreClass } from './guardian-store';
+
 export * from './types';
 export * from './recovery-manager';
 export * from './frame-codec';
 export * from './journal';
 export * from './capsule';
 export * from './guardian-wire';
-export * from './guardian-store';
+export {
+	u64be,
+	readU64be,
+	IGuardianNamespaceRow,
+	IGuardianRecordRow,
+	IGuardianEpochRow,
+	IGuardianRetainFloorRow,
+	IGuardianOrphanRow
+} from './guardian-store';
 export * from './guardian';
 export * from './guardian-proto';
 export * from './guardian-http';
@@ -32,3 +42,14 @@ export * from './channel-status';
 export * from './durability-barrier';
 export * from './wire-safety';
 export * from './assembly';
+
+/**
+ * @deprecated Import `GuardianStore` from `beignet/lightning/sqlite`. This
+ * re-export is removed in the next major release.
+ */
+export const GuardianStore = GuardianStoreClass;
+/**
+ * @deprecated Import `GuardianStore` from `beignet/lightning/sqlite`. This
+ * re-export is removed in the next major release.
+ */
+export type GuardianStore = GuardianStoreClass;

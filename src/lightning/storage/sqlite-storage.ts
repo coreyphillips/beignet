@@ -17,7 +17,8 @@ import {
 	mergeFforVoucherArchive,
 	validateFforVoucherArchive
 } from '../ffor/voucher-archive';
-import Database from 'better-sqlite3';
+import type Database from 'better-sqlite3';
+import { loadBetterSqlite3 } from './sqlite-binding';
 import { createHmac } from 'crypto';
 import * as fs from 'fs';
 import {
@@ -224,7 +225,8 @@ export class SqliteStorage implements IStorageBackend {
 		onCorruptRow?: (error: unknown) => void,
 		opts?: { encryptionKey?: Buffer }
 	) {
-		this.db = new Database(dbPath);
+		const Sqlite = loadBetterSqlite3();
+		this.db = new Sqlite(dbPath);
 		this.dbPath = dbPath;
 		this.onCorruptRow = onCorruptRow;
 		this.encryptionKey = opts?.encryptionKey;
