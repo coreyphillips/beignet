@@ -1,0 +1,45 @@
+name: docs
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    name: Check README tables and build the API reference
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.22.1
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Check the generated README tables
+        run: npm run docs:check
+
+      # The reference is built from the sources on every run and published
+      # as an artifact, never committed, so it cannot go stale in git.
+      - name: Build the API reference
+        run: npm run docs:html && npm run docs:markdown
+
+      - name: Upload the API reference
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: api-docs
+          path: api-docs
+          retention-days: 30

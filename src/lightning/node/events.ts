@@ -80,7 +80,7 @@ export type NodeErrorCode =
 /**
  * Every event LightningNode emits, with its listener's signature. The Events
  * Reference table in src/lightning/README.md is generated from this map
- * (`npm run docs:events`), so the description of each event lives here.
+ * (`npm run docs:tables`), so the description of each event lives here.
  *
  * Channel-scoped events carry an object with a 32-byte `channelId` Buffer;
  * `announcement:ready`, `channel:aborted` and `sweep:uneconomic` pass it as

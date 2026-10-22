@@ -86,9 +86,10 @@ const runExample = async (
     wallet.validateAddress(addr)                Validate a bitcoin address
 
   Transactions & UTXOs
-    wallet.transactions                         On-chain tx history (keyed by txid)
+    wallet.transactions                         On-chain tx history by txid (values in BTC)
     wallet.unconfirmedTransactions              Txs with <6 confirmations
-    wallet.listUtxos()                          Spendable UTXOs
+    wallet.listUtxos()                          All UTXOs, frozen ones included
+    wallet.getBalanceBreakdown()                { total, spendable, frozen } (sats)
     wallet.getTransactionDetails(txid)          Full tx details (async)
 
   Fees

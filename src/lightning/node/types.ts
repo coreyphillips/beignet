@@ -262,14 +262,28 @@ export interface IFundingProvider {
 	}>;
 }
 
+/**
+ * LightningNode construction options. The INodeConfig table in
+ * src/lightning/README.md is generated from this interface (`npm run
+ * docs:tables`), so the description of each field lives here.
+ */
 export interface INodeConfig {
 	/** One-way reserve waivers for new private home channels. */
 	zeroReserve?: import('../channel/zero-reserve').IZeroReserveConfig;
+	/** The node identity key (32 bytes); its public key is the node id. */
 	nodePrivateKey: Buffer;
+	/** The network for invoices and chain hashes (default REGTEST). */
 	network?: Network;
+	/**
+	 * Parameters for new channels. Not a partial: supply every field or omit
+	 * it to take the defaults.
+	 */
 	channelConfig?: IChannelConfig;
+	/** This node's channel basepoints, the public keys channel keys derive from. */
 	channelBasepoints: IChannelBasepoints;
+	/** 32-byte seed for the per-commitment secrets (shachain). */
 	perCommitmentSeed: Buffer;
+	/** 32-byte private key for the 2-of-2 funding output. */
 	fundingPrivkey: Buffer;
 	/**
 	 * Custom channel signer factory (ISigner) so channel signing keys can
@@ -343,7 +357,10 @@ export interface INodeConfig {
 	 * `fforSettle.allowConcurrent: false` and retain this advertisement for
 	 * existing books. The feature assignment remains experimental.
 	 */
-	fforConcurrent?: { enabled: boolean };
+	fforConcurrent?: {
+		/** Advertise concurrent receive, feature bits 562/563. */
+		enabled: boolean;
+	};
 	/** Max reconnect delay in ms */
 	maxReconnectDelay?: number;
 	/** Inbound peer connections (default 125). Once this many are up, only
@@ -373,7 +390,13 @@ export interface INodeConfig {
 	 * what lets nodes that guard each other restart together.
 	 */
 	guardianHost?: IGuardianHostConfig;
+	/**
+	 * The Recovery Protocol journal and its guardian replication
+	 * (docs/RECOVERY-PROTOCOL.md). Off unless `enabled` is true and the
+	 * storage backend supports the journal.
+	 */
 	recovery?: {
+		/** Keep the hash-chained recovery journal. */
 		enabled?: boolean;
 		/**
 		 * How durable a safety transition must be before the wire messages it
@@ -569,7 +592,12 @@ export interface INodeConfig {
 	 *  least one announced (public) channel. */
 	announcedAddresses?: INodeAddress[];
 	/** SOCKS5 proxy for outbound peer connections (e.g. Tor on 127.0.0.1:9050) */
-	socks5Proxy?: { host: string; port: number };
+	socks5Proxy?: {
+		/** Proxy host. */
+		host: string;
+		/** Proxy port. */
+		port: number;
+	};
 	/**
 	 * Which destinations ride socks5Proxy (default 'all'). 'all' sends every
 	 * public host through it; 'onion' sends only .onion hosts through it and
@@ -670,7 +698,9 @@ export interface INodeConfig {
 	newChannelsRefused?: () => string | null;
 	/** Per-peer rate limit config */
 	rateLimitConfig?: {
+		/** HTLCs per second per peer (default 30). */
 		maxHtlcsPerSecond?: number;
+		/** Bucket capacity as a multiple of maxHtlcsPerSecond (default 2). */
 		burstMultiplier?: number;
 	};
 	/** Number of blocks a channel can remain in AWAITING_REESTABLISH before force-closing (default 2016 ≈ 2 weeks) */

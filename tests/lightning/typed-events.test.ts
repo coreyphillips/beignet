@@ -1,24 +1,19 @@
 /**
  * Issue #1690: LightningNode, ChannelManager and BeignetNode take their event
  * names and listener signatures from typed maps, and the README's events
- * table is generated from LightningNodeEvents.
+ * table is generated from LightningNodeEvents (checked against the README in
+ * doc-tables.test.ts).
  *
  * The @ts-expect-error lines are the point of most of this file: they are
  * checked by `npm run tsc:check:tests`, which fails if any of them compiles.
  */
 import { expect } from 'chai';
-import * as fs from 'fs';
-import * as path from 'path';
 import { TypedEmitter } from '../../src/utils/typed-emitter';
 import type { LightningNode } from '../../src/lightning/node/lightning-node';
 import type { NodeErrorCode } from '../../src/lightning/node/events';
 import type { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import type { BeignetNode } from '../../src/cli/beignet-node';
-import {
-	EVENT_TABLES,
-	renderEventTable,
-	withTable
-} from '../../scripts/event-docs';
+import { DOC_TABLES, renderTable } from '../../scripts/doc-tables';
 
 interface ITestEvents {
 	ping: (n: number) => void;
@@ -108,23 +103,10 @@ describe('Typed event maps (issue #1690)', function () {
 		});
 	});
 
-	it('the README events tables match the maps (npm run docs:events)', function () {
-		this.timeout(60_000);
-		for (const table of EVENT_TABLES) {
-			const readme = fs.readFileSync(
-				path.join(__dirname, '../..', table.readme),
-				'utf8'
-			);
-			expect(
-				withTable(readme, table.name, renderEventTable(table)),
-				`${table.readme} is stale: run npm run docs:events`
-			).to.equal(readme);
-		}
-	});
-
 	it('the generated table lists the events the hand-written one left out', function () {
 		this.timeout(60_000);
-		const rendered = renderEventTable(EVENT_TABLES[0]);
+		const table = DOC_TABLES.find((t) => t.name === 'LightningNodeEvents');
+		const rendered = renderTable(table!);
 		for (const event of [
 			'channel:force-closing',
 			'htlc:held-forward',

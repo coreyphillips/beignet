@@ -4,7 +4,7 @@ A comprehensive guide for deploying and operating a Beignet Lightning node for A
 
 ## Prerequisites
 
-- **Node.js** 18+ (LTS recommended)
+- **Node.js** 22.23.4+, 24.22.1+ or 26.12.1+ (the releases with the October 21, 2026 security fixes)
 - **npm** 9+
 - Bitcoin on-chain funds for channel opening
 - Electrum server access (mainnet default: `fulcrum.bitkit.blocktank.to:8900`)
@@ -24,7 +24,11 @@ Get from zero to payment-ready in under 30 lines of TypeScript:
 ```typescript
 import { BeignetNode } from 'beignet/cli';
 
-// 1. Create a node (generates mnemonic if none provided)
+const peer = { pubkey: '03abc...', host: 'node.example.com', port: 9735 };
+const bolt11Invoice = 'lnbc...';
+
+// 1. Create a node (generates a mnemonic if none is provided: back up
+//    node.getMnemonic() before funding it)
 const node = await BeignetNode.create({
   network: 'mainnet',
   alias: 'my-agent',
@@ -36,10 +40,11 @@ const address = await node.getNewAddress();
 console.log('Fund this address:', address);
 
 // 3. Wait for on-chain funds, then connect + open a channel in one call
-await node.connectAndOpenChannel(peerPubkey, peerHost, peerPort, 1_000_000);
+const channel = await node.connectAndOpenChannel(peer.pubkey, peer.host, peer.port, 1_000_000);
 
-// 4. Wait for channel to become active
-await node.waitForChannelReady(channelId);
+// 4. Wait for the channel to become active. The default timeout is 60s; the
+//    funding transaction needs confirmations first, so allow for blocks.
+await node.waitForChannelReady(channel.channelId, 2 * 60 * 60_000);
 
 // 5. Pay an invoice
 const result = await node.payInvoiceSafe(bolt11Invoice);
