@@ -366,6 +366,45 @@ describe('Reestablish hold (issue #1726)', () => {
 			destroyAll(alice, lsp, carol);
 		});
 
+		it('retries the end of the window when its write fails', async () => {
+			const disk = new SqliteStorage(tempDb('reestablish-hold-expiry-write'));
+			disk.open();
+			const w = await holdWorld({}, disk);
+			const { alice, lsp, carol } = w;
+			const invoice = invoiceFor(w);
+			const save = disk.saveMetadata.bind(disk);
+			let failed = 0;
+			disk.saveMetadata = (key: string, value: string): void => {
+				if (
+					failed === 0 &&
+					key.startsWith('held_forward') &&
+					value.includes('"FAILING"')
+				) {
+					failed++;
+					throw new Error('disk full');
+				}
+				save(key, value);
+			};
+			await disconnect(lsp, carol, w.cutBC);
+			awayFor(w, DEFAULT_REESTABLISH_HOLD_MS - 400);
+			alice.sendPayment(invoice.bolt11);
+			await settle();
+			expect(holds(lsp)[0].state).to.equal('RELEASING');
+
+			await waitFor(() => failed === 1, 'the expiry write to fail', 5_000);
+			expect(holds(lsp)[0].state).to.equal('RELEASING');
+			await waitFor(
+				() =>
+					paymentStatus(alice, invoice.paymentHash) === PaymentStatus.FAILED,
+				'the payer to be refunded on the retry'
+			);
+			expect(alice.getPayment(invoice.paymentHash)!.failureCode).to.equal(
+				TEMPORARY_CHANNEL_FAILURE
+			);
+			expect(holds(lsp)[0].failReason).to.equal('hold_expired');
+			destroyAll(alice, lsp, carol);
+		});
+
 		it('fails the part early, with the same code, when a block crosses its cutoff', async () => {
 			const w = await holdWorld();
 			const { alice, lsp, carol } = w;

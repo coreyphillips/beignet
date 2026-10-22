@@ -25407,15 +25407,37 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/** The wall-clock end of a reestablish hold, one unref'd timer per row. */
-	private armReestablishHoldTimer(record: IHeldForwardRecord): void {
+	private armReestablishHoldTimer(
+		record: IHeldForwardRecord,
+		delayMs?: number
+	): void {
 		if (record.state !== 'RELEASING' || record.holdUntil === undefined) return;
 		if (this.reestablishHoldTimers.has(record.id)) return;
 		const timer = setTimeout(
 			() => {
 				this.reestablishHoldTimers.delete(record.id);
-				this.asyncPaymentManager.failHeldForward(record.id, 'hold_expired');
+				if (
+					this.asyncPaymentManager.failHeldForward(record.id, 'hold_expired')
+				) {
+					return;
+				}
+				// Past holdUntil the driver defers and the block scan waits for the
+				// cutoff, so only this timer can retry a write that failed.
+				const row = this.heldForwardLedger.get(record.id);
+				if (
+					row &&
+					this.findOutgoingLeg(
+						Buffer.from(row.inChannelIdHex, 'hex'),
+						BigInt(row.inHtlcId)
+					) === null
+				) {
+					this.armReestablishHoldTimer(
+						row,
+						LightningNode.REESTABLISH_HOLD_EXPIRY_RETRY_MS
+					);
+				}
 			},
-			Math.max(0, record.holdUntil - Date.now())
+			delayMs ?? Math.max(0, record.holdUntil - Date.now())
 		);
 		timer.unref?.();
 		this.reestablishHoldTimers.set(record.id, timer);
@@ -25444,6 +25466,7 @@ export class LightningNode extends EventEmitter {
 	}
 
 	private static readonly REESTABLISH_HOLD_RETAIN_MS = 24 * 60 * 60 * 1000;
+	private static readonly REESTABLISH_HOLD_EXPIRY_RETRY_MS = 5_000;
 
 	private oweHeldForwardFailure(
 		inChannelId: Buffer,
