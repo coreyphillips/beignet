@@ -12,8 +12,8 @@
  *     running total, and a falsy amountToSend selects every UTXO in the wallet.
  *  3. Both value getters returned 0 for any Err without a word anywhere.
  *
- * Fully OFFLINE: the reducers are pure and the wallet points at an unreachable
- * port.
+ * Fully OFFLINE: the reducers are pure and the wallet never connects
+ * (remainOffline).
  */
 
 import { expect } from 'chai';
@@ -26,7 +26,6 @@ import {
 	EAddressType,
 	EAvailableNetworks,
 	ECoinSelectPreference,
-	EProtocol,
 	IOutput,
 	IUtxo,
 	reduceValue,
@@ -37,17 +36,7 @@ import {
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 const ADDRESS = payments.p2wpkh({
 	pubkey: Buffer.from(
@@ -227,7 +216,8 @@ describe('value accumulators', function () {
 				mnemonic: MNEMONIC,
 				network: EAvailableNetworks.regtest,
 				addressType: EAddressType.p2wpkh,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (res.isErr()) throw res.error;
 			wallet = res.value;

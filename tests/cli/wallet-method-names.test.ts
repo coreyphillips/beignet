@@ -6,8 +6,8 @@
  * returned a txid or raw hex depending on a flag. The new names are tested
  * here beside the deprecated ones, which forward to them.
  *
- * Fully OFFLINE: the wallet points at an unreachable Electrum port, UTXOs are
- * injected into its data, and nothing is broadcast.
+ * Fully OFFLINE: the wallet never connects to Electrum, UTXOs are injected
+ * into its data, and nothing is broadcast.
  */
 
 import { expect } from 'chai';
@@ -17,61 +17,29 @@ import tls from 'tls';
 import * as bitcoin from 'bitcoinjs-lib';
 
 import {
+	createMemoryStorage,
 	EAddressType,
-	EProtocol,
 	EScanningStrategy,
 	IUtxo,
-	IWalletData,
 	Network,
-	ok,
-	Result,
-	TStorage,
 	Wallet
 } from '../../src';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
-
 /** Not this wallet's: the BIP173 test vector. */
 const EXTERNAL = 'bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080';
 const TXID_A = '1a'.repeat(32);
 const TXID_B = '2b'.repeat(32);
 
-const memoryStorage = (): TStorage => {
-	const store = new Map<string, unknown>();
-	return {
-		getData: async <K extends keyof IWalletData>(
-			key: string
-		): Promise<Result<IWalletData[K]>> => ok(store.get(key) as IWalletData[K]),
-		setData: async <K extends keyof IWalletData>(
-			key: string,
-			value: IWalletData[K]
-		): Promise<Result<boolean>> => {
-			store.set(key, value);
-			return ok(true);
-		}
-	};
-};
-
 /** A UTXO paying to the wallet's receive address at `addressIndex`. */
-const injectUtxo = (
+const injectUtxo = async (
 	wallet: Wallet,
 	txid: string,
 	value: number,
 	addressIndex: number
-): IUtxo => {
+): Promise<IUtxo> => {
 	const source = Object.values(wallet.data.addresses[EAddressType.p2wpkh]).find(
 		(a) => a.index === addressIndex
 	);
@@ -87,8 +55,11 @@ const injectUtxo = (
 		value,
 		publicKey: source.publicKey
 	};
-	wallet.data.utxos.push(utxo);
-	wallet.data.balance += value;
+	const injected = await wallet.updateData({
+		utxos: [...wallet.data.utxos, utxo],
+		balance: wallet.data.balance + value
+	});
+	if (injected.isErr()) throw injected.error;
 	return utxo;
 };
 
@@ -115,15 +86,16 @@ describe('Wallet method names (issue #1694)', function () {
 			mnemonic: MNEMONIC,
 			name: 'methodnames',
 			network: Network.regtest,
-			storage: memoryStorage(),
-			electrumOptions
+			storage: createMemoryStorage(),
+			remainOffline: true,
+			electrumOptions: { net, tls }
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
 		// The failed (offline) refresh still derives the first addresses.
 		await wallet.refreshWallet({});
-		injectUtxo(wallet, TXID_A, 60_000, 0);
-		injectUtxo(wallet, TXID_B, 40_000, 1);
+		await injectUtxo(wallet, TXID_A, 60_000, 0);
+		await injectUtxo(wallet, TXID_B, 40_000, 1);
 	});
 
 	after(async () => {
@@ -240,29 +212,35 @@ describe('Wallet method names (issue #1694)', function () {
 	});
 
 	describe('getAddressGap', () => {
-		it('returns how far each index is past the last used one', () => {
+		it('returns how far each index is past the last used one', async () => {
 			const type = EAddressType.p2wpkh;
 			const data = wallet.data;
 			const saved = {
-				addressIndex: data.addressIndex[type],
-				lastUsedAddressIndex: data.lastUsedAddressIndex[type],
-				changeAddressIndex: data.changeAddressIndex[type],
-				lastUsedChangeAddressIndex: data.lastUsedChangeAddressIndex[type]
+				addressIndex: data.addressIndex,
+				lastUsedAddressIndex: data.lastUsedAddressIndex,
+				changeAddressIndex: data.changeAddressIndex,
+				lastUsedChangeAddressIndex: data.lastUsedChangeAddressIndex
 			};
 			try {
-				data.addressIndex[type] = { ...saved.addressIndex, index: 7 };
-				data.lastUsedAddressIndex[type] = {
-					...saved.lastUsedAddressIndex,
-					index: 3
-				};
-				data.changeAddressIndex[type] = {
-					...saved.changeAddressIndex,
-					index: 5
-				};
-				data.lastUsedChangeAddressIndex[type] = {
-					...saved.lastUsedChangeAddressIndex,
-					index: 4
-				};
+				const moved = await wallet.updateData({
+					addressIndex: {
+						...saved.addressIndex,
+						[type]: { ...saved.addressIndex[type], index: 7 }
+					},
+					lastUsedAddressIndex: {
+						...saved.lastUsedAddressIndex,
+						[type]: { ...saved.lastUsedAddressIndex[type], index: 3 }
+					},
+					changeAddressIndex: {
+						...saved.changeAddressIndex,
+						[type]: { ...saved.changeAddressIndex[type], index: 5 }
+					},
+					lastUsedChangeAddressIndex: {
+						...saved.lastUsedChangeAddressIndex,
+						[type]: { ...saved.lastUsedChangeAddressIndex[type], index: 4 }
+					}
+				});
+				if (moved.isErr()) throw moved.error;
 				const gap = wallet.getAddressGap({ addressType: type });
 				if (gap.isErr()) throw gap.error;
 				expect(gap.value).to.deep.equal({
@@ -273,16 +251,7 @@ describe('Wallet method names (issue #1694)', function () {
 				if (old.isErr()) throw old.error;
 				expect(old.value).to.deep.equal(gap.value);
 			} finally {
-				Object.assign(data.addressIndex, { [type]: saved.addressIndex });
-				Object.assign(data.lastUsedAddressIndex, {
-					[type]: saved.lastUsedAddressIndex
-				});
-				Object.assign(data.changeAddressIndex, {
-					[type]: saved.changeAddressIndex
-				});
-				Object.assign(data.lastUsedChangeAddressIndex, {
-					[type]: saved.lastUsedChangeAddressIndex
-				});
+				await wallet.updateData(saved);
 			}
 		});
 	});

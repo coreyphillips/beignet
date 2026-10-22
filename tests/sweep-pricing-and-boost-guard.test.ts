@@ -1,6 +1,6 @@
 /**
- * Two on-chain wallet defects (#1038). Fully OFFLINE: the wallet points at an
- * unreachable Electrum port, UTXOs are injected into wallet data, and the
+ * Two on-chain wallet defects (#1038). Fully OFFLINE: the wallet is created
+ * with remainOffline, UTXOs are injected into wallet data, and the
  * transaction lookups a boost makes are stubbed.
  *
  *  1. sendMax priced its single output as the wallet's own address type, so a
@@ -28,12 +28,9 @@ import {
 	EAvailableNetworks,
 	EBoostType,
 	ECoinSelectPreference,
-	EProtocol,
 	IUtxo,
-	IWalletData,
-	Result,
-	TStorage,
 	Wallet,
+	createMemoryStorage,
 	ok
 } from '../src';
 import {
@@ -45,17 +42,8 @@ import {
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+// The wallet is created with remainOffline: this test must work offline.
+const electrumOptions = { net, tls };
 
 const P2TR = bitcoinAddress.toBech32(Buffer.alloc(32, 1), 1, 'bcrt');
 const P2WSH = bitcoinAddress.toBech32(Buffer.alloc(32, 2), 0, 'bcrt');
@@ -80,23 +68,6 @@ const BOOSTED_TXID = 'bb'.repeat(32);
 const FUNDING_TXID = 'aa'.repeat(32);
 const FOREIGN_TXID = 'cc'.repeat(32);
 
-/** An in-memory TStorage, so the wallet has somewhere to persist. */
-const memoryStorage = (): TStorage => {
-	const store = new Map<string, unknown>();
-	return {
-		getData: async <K extends keyof IWalletData>(
-			key: string
-		): Promise<Result<IWalletData[K]>> => ok(store.get(key) as IWalletData[K]),
-		setData: async <K extends keyof IWalletData>(
-			key: string,
-			value: IWalletData[K]
-		): Promise<Result<boolean>> => {
-			store.set(key, value);
-			return ok(true);
-		}
-	};
-};
-
 describe('sweep output pricing and boost confirmation guard (#1038)', function () {
 	this.timeout(60000);
 
@@ -108,7 +79,11 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		wallet.data.changeAddressIndex[EAddressType.p2wpkh].address;
 
 	/** Fabricates a UTXO paying to the wallet's own index-0 address. */
-	const injectUtxo = (txid: string, value: number, txPos = 0): IUtxo => {
+	const injectUtxo = async (
+		txid: string,
+		value: number,
+		txPos = 0
+	): Promise<IUtxo> => {
 		const source = wallet.data.addressIndex[EAddressType.p2wpkh];
 		if (!source?.address) throw new Error('No derived address available.');
 		const utxo: IUtxo = {
@@ -122,8 +97,11 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			value,
 			publicKey: source.publicKey
 		};
-		wallet.data.utxos.push(utxo);
-		wallet.data.balance += value;
+		const res = await wallet.updateData({
+			utxos: [...wallet.data.utxos, utxo],
+			balance: wallet.data.balance + value
+		});
+		if (res.isErr()) throw res.error;
 		return utxo;
 	};
 
@@ -188,8 +166,9 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			network: EAvailableNetworks.regtest,
 			addressType: EAddressType.p2wpkh,
 			rbf: true,
-			storage: memoryStorage(),
-			electrumOptions
+			storage: createMemoryStorage(),
+			electrumOptions,
+			remainOffline: true
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
@@ -211,8 +190,8 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		].forEach(({ name, to }) => {
 			it(`pays the requested rate on a sweep to ${name}`, async function () {
 				const satsPerByte = 10;
-				injectUtxo(FUNDING_TXID, 100_000);
-				injectUtxo(BOOSTED_TXID, 100_000);
+				await injectUtxo(FUNDING_TXID, 100_000);
+				await injectUtxo(BOOSTED_TXID, 100_000);
 
 				const res = await wallet.sendMax({
 					address: to,
@@ -236,8 +215,8 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		// way to bump it (#1359).
 		[true, false].forEach((rbf) => {
 			it(`stages rbf: ${rbf} in the input sequences`, async function () {
-				injectUtxo(FUNDING_TXID, 100_000);
-				injectUtxo(BOOSTED_TXID, 100_000);
+				await injectUtxo(FUNDING_TXID, 100_000);
+				await injectUtxo(BOOSTED_TXID, 100_000);
 
 				const res = await wallet.sendMax({
 					address: P2WPKH,
@@ -263,8 +242,8 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 			(preference) => {
 				it(`quotes a maximum rate that selects another coin with preference ${preference}`, async function () {
 					wallet.updateCoinSelectPreference(preference);
-					injectUtxo(FUNDING_TXID, 100_000);
-					injectUtxo(BOOSTED_TXID, 100_000);
+					await injectUtxo(FUNDING_TXID, 100_000);
+					await injectUtxo(BOOSTED_TXID, 100_000);
 					const setup = await wallet.transaction.setupTransaction();
 					if (setup.isErr()) throw setup.error;
 					const staged = wallet.transaction.updateSendTransaction({
@@ -286,8 +265,8 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 				// over half the payment down to 365.
 				it(`quotes a maximum rate whose own coin selection fits under half with preference ${preference}`, async function () {
 					wallet.updateCoinSelectPreference(preference);
-					injectUtxo(FUNDING_TXID, 185_744);
-					injectUtxo(BOOSTED_TXID, 176_152);
+					await injectUtxo(FUNDING_TXID, 185_744);
+					await injectUtxo(BOOSTED_TXID, 176_152);
 					const setup = await wallet.transaction.setupTransaction();
 					if (setup.isErr()) throw setup.error;
 					const staged = wallet.transaction.updateSendTransaction({
@@ -325,8 +304,8 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 					const [maximum, size] = oneCoin ? [95, 110] : [94, 209];
 					it(`quotes a maximum rate below a whole-leftover fee with preference ${preference} and coins of ${first} and ${second}`, async function () {
 						wallet.updateCoinSelectPreference(preference);
-						injectUtxo(FUNDING_TXID, first);
-						injectUtxo(BOOSTED_TXID, second);
+						await injectUtxo(FUNDING_TXID, first);
+						await injectUtxo(BOOSTED_TXID, second);
 						const setup = await wallet.transaction.setupTransaction();
 						if (setup.isErr()) throw setup.error;
 						const staged = wallet.transaction.updateSendTransaction({
@@ -364,8 +343,8 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		].forEach((preference) => {
 			it(`quotes a maximum rate the inputs can pay with preference ${preference}`, async function () {
 				wallet.updateCoinSelectPreference(preference);
-				injectUtxo(FUNDING_TXID, 100_000);
-				injectUtxo(BOOSTED_TXID, 100_000);
+				await injectUtxo(FUNDING_TXID, 100_000);
+				await injectUtxo(BOOSTED_TXID, 100_000);
 				const setup = await wallet.transaction.setupTransaction();
 				if (setup.isErr()) throw setup.error;
 				const staged = wallet.transaction.updateSendTransaction({
@@ -395,8 +374,8 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		// change drops and the fee is the 270 sats left over.
 		it('quotes a maximum rate that drops the change output', async function () {
 			wallet.updateCoinSelectPreference(ECoinSelectPreference.consolidate);
-			injectUtxo(FUNDING_TXID, 436);
-			injectUtxo(BOOSTED_TXID, 436);
+			await injectUtxo(FUNDING_TXID, 436);
+			await injectUtxo(BOOSTED_TXID, 436);
 			const setup = await wallet.transaction.setupTransaction();
 			if (setup.isErr()) throw setup.error;
 			const message = 'm'.repeat(80);
@@ -432,9 +411,9 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		].forEach(({ name, stagedChange }) => {
 			it(`quotes a maximum rate that selects fewer coins with ${name} change`, async function () {
 				wallet.updateCoinSelectPreference(ECoinSelectPreference.small);
-				[300, 300, 300, 300, 500, 600].forEach((value, txPos) =>
-					injectUtxo(FUNDING_TXID, value, txPos)
-				);
+				for (const [txPos, value] of [300, 300, 300, 300, 500, 600].entries()) {
+					await injectUtxo(FUNDING_TXID, value, txPos);
+				}
 				const setup = await wallet.transaction.setupTransaction();
 				if (setup.isErr()) throw setup.error;
 				const staged = wallet.transaction.updateSendTransaction({
@@ -468,8 +447,8 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		// at the maximum, so the maximum has to pay for its 31 vB.
 		it('quotes a maximum rate that pays for the change it generates', async function () {
 			wallet.updateCoinSelectPreference(ECoinSelectPreference.consolidate);
-			injectUtxo(FUNDING_TXID, 100_000);
-			injectUtxo(BOOSTED_TXID, 100_000);
+			await injectUtxo(FUNDING_TXID, 100_000);
+			await injectUtxo(BOOSTED_TXID, 100_000);
 			const setup = await wallet.transaction.setupTransaction();
 			if (setup.isErr()) throw setup.error;
 			const staged = wallet.transaction.updateSendTransaction({
@@ -508,8 +487,8 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		].forEach(({ input, payment, maximum }) => {
 			it(`prices generated change below half a ${payment}-sat payment`, async function () {
 				wallet.updateCoinSelectPreference(ECoinSelectPreference.consolidate);
-				injectUtxo(FUNDING_TXID, input);
-				injectUtxo(BOOSTED_TXID, input);
+				await injectUtxo(FUNDING_TXID, input);
+				await injectUtxo(BOOSTED_TXID, input);
 				const setup = await wallet.transaction.setupTransaction();
 				if (setup.isErr()) throw setup.error;
 				const staged = wallet.transaction.updateSendTransaction({
@@ -545,7 +524,7 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		// affordable, but the quote rounded it down to 589.
 		it('quotes a fractional rate above the integer maximum that it can pay', async function () {
 			wallet.updateCoinSelectPreference(ECoinSelectPreference.consolidate);
-			injectUtxo(FUNDING_TXID, 1_000_000);
+			await injectUtxo(FUNDING_TXID, 1_000_000);
 			const setup = await wallet.transaction.setupTransaction();
 			if (setup.isErr()) throw setup.error;
 			const staged = wallet.transaction.updateSendTransaction({
@@ -573,8 +552,8 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 	});
 
 	describe('setupRbf', function () {
-		beforeEach(function () {
-			injectUtxo(FUNDING_TXID, 100_000);
+		beforeEach(async function () {
+			await injectUtxo(FUNDING_TXID, 100_000);
 		});
 
 		it('refuses a transaction that has confirmed since the last refresh', async function () {
@@ -1375,14 +1354,17 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 	});
 
 	describe('setupCpfp', function () {
-		beforeEach(function () {
+		beforeEach(async function () {
 			// The unconfirmed parent as stored at the last refresh: 200 vB, 1000
 			// sats of fee, and an output of ours the child can spend.
-			wallet.data.transactions[BOOSTED_TXID] = {
-				fee: 0.00001,
-				vsize: 200
-			} as IFormattedTransaction;
-			injectUtxo(BOOSTED_TXID, 50_000);
+			const parent = await wallet.updateData({
+				transactions: {
+					...wallet.data.transactions,
+					[BOOSTED_TXID]: { fee: 0.00001, vsize: 200 } as IFormattedTransaction
+				}
+			});
+			if (parent.isErr()) throw parent.error;
+			await injectUtxo(BOOSTED_TXID, 50_000);
 		});
 
 		it('refuses a parent that has confirmed since the last refresh', async function () {
@@ -1421,11 +1403,17 @@ describe('sweep output pricing and boost confirmation guard (#1038)', function (
 		].forEach(({ fast, normal, parentFee }) => {
 			it(`brings a two-input child's package to fast ${fast} and normal ${normal}`, async function () {
 				const parentVsize = 141;
-				wallet.data.transactions[BOOSTED_TXID] = {
-					fee: parentFee / 1e8,
-					vsize: parentVsize
-				} as IFormattedTransaction;
-				injectUtxo(BOOSTED_TXID, 50_000, 1);
+				const parent = await wallet.updateData({
+					transactions: {
+						...wallet.data.transactions,
+						[BOOSTED_TXID]: {
+							fee: parentFee / 1e8,
+							vsize: parentVsize
+						} as IFormattedTransaction
+					}
+				});
+				if (parent.isErr()) throw parent.error;
+				await injectUtxo(BOOSTED_TXID, 50_000, 1);
 				wallet.feeEstimates = { ...wallet.feeEstimates, fast, normal };
 				stubLookups({ [BOOSTED_TXID]: {} });
 

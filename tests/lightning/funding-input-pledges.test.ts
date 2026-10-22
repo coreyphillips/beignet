@@ -17,13 +17,10 @@ import tls from 'tls';
 import {
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
-	IWalletData,
-	Result,
-	TStorage,
+	IWalletStorage,
 	Wallet,
-	err as errResultOf,
-	ok as okResult
+	createMemoryStorage,
+	err as errResultOf
 } from '../../src';
 import { WalletFundingProvider } from '../../src/lightning/wallet/wallet-funding-provider';
 
@@ -828,23 +825,16 @@ describe('Funding input pledges', function () {
 		let failBlacklistWrite = false;
 
 		beforeEach(async function () {
-			const store = new Map<string, unknown>();
-			const storage: TStorage = {
-				getData: async <K extends keyof IWalletData>(
-					key: string
-				): Promise<Result<IWalletData[K]>> =>
-					okResult(store.get(key) as IWalletData[K]),
-				setData: async <K extends keyof IWalletData>(
-					key: string,
-					value: IWalletData[K]
-				): Promise<Result<boolean>> => {
+			const memory = createMemoryStorage();
+			const storage: IWalletStorage = {
+				...memory,
+				setData: async (key, value) => {
 					if (key.endsWith('blacklistedUtxos')) {
 						const fail = failBlacklistWrite;
 						await blacklistWrite;
 						if (fail) return errResultOf('storage is down');
 					}
-					store.set(key, value);
-					return okResult(true);
+					return memory.setData(key, value);
 				}
 			};
 			const res = await Wallet.create({
@@ -852,36 +842,32 @@ describe('Funding input pledges', function () {
 				name: 'queuedfreeze',
 				network: EAvailableNetworks.regtest,
 				storage,
-				// Unreachable on purpose: nothing here needs a server.
-				electrumOptions: {
-					net,
-					tls,
-					servers: {
-						host: '127.0.0.1',
-						ssl: 65529,
-						tcp: 65529,
-						protocol: EProtocol.tcp
-					}
-				}
+				// Nothing here needs a server.
+				remainOffline: true,
+				electrumOptions: { net, tls }
 			});
 			if (res.isErr()) throw res.error;
 			wallet = res.value;
 			// The failed (offline) refresh still derives the index-0 address.
 			await wallet.refreshWallet({});
 			const source = wallet.data.addressIndex[EAddressType.p2wpkh];
-			for (const [i, txid] of [TXID_X, TXID_Y, TXID_Z].entries()) {
-				wallet.data.utxos.push({
-					address: source.address,
-					index: source.index,
-					path: source.path,
-					scriptHash: source.scriptHash,
-					height: 100 + i,
-					tx_hash: txid,
-					tx_pos: 0,
-					value: 100_000,
-					publicKey: source.publicKey
-				});
-			}
+			const added = await wallet.updateData({
+				utxos: [
+					...wallet.data.utxos,
+					...[TXID_X, TXID_Y, TXID_Z].map((txid, i) => ({
+						address: source.address,
+						index: source.index,
+						path: source.path,
+						scriptHash: source.scriptHash,
+						height: 100 + i,
+						tx_hash: txid,
+						tx_pos: 0,
+						value: 100_000,
+						publicKey: source.publicKey
+					}))
+				]
+			});
+			if (added.isErr()) throw added.error;
 		});
 
 		afterEach(async function () {
@@ -1012,8 +998,15 @@ describe('Funding input pledges', function () {
 					const renewal = provider.pledgeTransactionInputs(retained.toHex());
 					await new Promise((resolve) => setImmediate(resolve));
 					// A refresh that drops X makes the wallet refuse the renewal.
-					const at = wallet.data.utxos.findIndex((u) => u.tx_hash === TXID_X);
-					const dropped = refused ? wallet.data.utxos.splice(at, 1) : [];
+					const dropped = refused
+						? wallet.data.utxos.filter((u) => u.tx_hash === TXID_X)
+						: [];
+					if (refused) {
+						const drop = await wallet.updateData({
+							utxos: wallet.data.utxos.filter((u) => u.tx_hash !== TXID_X)
+						});
+						if (drop.isErr()) throw drop.error;
+					}
 					let finishUnfreeze!: () => void;
 					blacklistWrite = new Promise((resolve) => (finishUnfreeze = resolve));
 					failBlacklistWrite = true;
@@ -1026,7 +1019,10 @@ describe('Funding input pledges', function () {
 					expect((await userUnfreeze).isErr()).to.equal(true);
 					expect(wallet.isUtxoFrozen(TXID_X, 0)).to.equal(true);
 					failBlacklistWrite = false;
-					wallet.data.utxos.push(...dropped);
+					const restore = await wallet.updateData({
+						utxos: [...wallet.data.utxos, ...dropped]
+					});
+					if (restore.isErr()) throw restore.error;
 
 					await end(provider);
 					expect(
@@ -1286,8 +1282,11 @@ describe('Funding input pledges', function () {
 						(e: Error) => e
 					);
 					await tick();
-					const at = wallet.data.utxos.findIndex((u) => u.tx_hash === TXID_X);
-					const dropped = wallet.data.utxos.splice(at, 1);
+					const dropped = wallet.data.utxos.filter((u) => u.tx_hash === TXID_X);
+					const drop = await wallet.updateData({
+						utxos: wallet.data.utxos.filter((u) => u.tx_hash !== TXID_X)
+					});
+					if (drop.isErr()) throw drop.error;
 					let finishB!: () => void;
 					blacklistWrite = new Promise((resolve) => (finishB = resolve));
 					const userB = wallet.unfreezeUtxo({ txid: TXID_X, index: 0 });
@@ -1302,7 +1301,10 @@ describe('Funding input pledges', function () {
 						'funding-pledge'
 					);
 					failBlacklistWrite = false;
-					wallet.data.utxos.push(...dropped);
+					const restore = await wallet.updateData({
+						utxos: [...wallet.data.utxos, ...dropped]
+					});
+					if (restore.isErr()) throw restore.error;
 
 					await end(provider);
 					expect(

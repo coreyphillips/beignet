@@ -14,15 +14,13 @@ import sinon from 'sinon';
 import tls from 'tls';
 
 import {
+	createMemoryStorage,
 	EAddressType,
 	EAvailableNetworks,
 	EPaymentType,
 	EProtocol,
 	IAddress,
 	IAddresses,
-	IWalletData,
-	ok,
-	Result,
 	TTxDetails,
 	Wallet
 } from '../../src';
@@ -35,7 +33,8 @@ const electrumHelpers = require('rn-electrum-client/helpers');
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
+// Unreachable on purpose: this test must work offline. Not remainOffline,
+// which refuses each request before it reaches the fake server.
 const electrumOptions = {
 	net,
 	tls,
@@ -99,12 +98,7 @@ describe('wallet refresh Electrum requests (#1657)', function () {
 			feeEstimationSource: 'electrum',
 			// The test drives the refresh itself; nothing may scan behind it.
 			disableRefreshOnCreate: true,
-			storage: {
-				setData: async <K extends keyof IWalletData>(
-					_key: string,
-					_value: IWalletData[K]
-				): Promise<Result<boolean>> => ok(true)
-			}
+			storage: createMemoryStorage()
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
@@ -126,8 +120,17 @@ describe('wallet refresh Electrum requests (#1657)', function () {
 				addressType
 			});
 			if (gen.isErr()) throw gen.error;
-			wallet.data.addresses[addressType] = gen.value.addresses;
-			wallet.data.changeAddresses[addressType] = gen.value.changeAddresses;
+			const stored = await wallet.updateData({
+				addresses: {
+					...wallet.data.addresses,
+					[addressType]: gen.value.addresses
+				},
+				changeAddresses: {
+					...wallet.data.changeAddresses,
+					[addressType]: gen.value.changeAddresses
+				}
+			});
+			if (stored.isErr()) throw stored.error;
 			book[addressType] = {
 				addresses: gen.value.addresses,
 				change: gen.value.changeAddresses
@@ -139,15 +142,18 @@ describe('wallet refresh Electrum requests (#1657)', function () {
 		const change = at(book[EAddressType.p2wpkh].change, 1);
 		const taproot = at(book[EAddressType.p2tr].addresses, 2);
 		// T's coin on the first address, as the UTXO scan saved it.
-		wallet.data.utxos = [
-			{
-				...receive,
-				height: 0,
-				tx_hash: T,
-				tx_pos: 0,
-				value: 10_000_000
-			}
-		];
+		const utxos = await wallet.updateData({
+			utxos: [
+				{
+					...receive,
+					height: 0,
+					tx_hash: T,
+					tx_pos: 0,
+					value: 10_000_000
+				}
+			]
+		});
+		if (utxos.isErr()) throw utxos.error;
 
 		const transactions: Record<string, TTxDetails> = {
 			[P]: details(P, [{ txid: 'ee'.repeat(32), vout: 0 }], [[EXTERNAL, 1]]),

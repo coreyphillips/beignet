@@ -4,8 +4,8 @@
  * guards refused it too. Dust is a per-script threshold (294 sats for P2WPKH),
  * so a 400 sat P2WPKH coin was shown as funds that no send could ever spend.
  *
- * Fully OFFLINE: the wallet points at an unreachable Electrum port and the
- * scan is stubbed.
+ * Fully OFFLINE: the wallet never connects (remainOffline) and the scan is
+ * stubbed.
  */
 
 import { expect } from 'chai';
@@ -18,7 +18,6 @@ import { bech32m } from 'bech32';
 import {
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	IUtxo,
 	Wallet,
 	decodeRawTransaction,
@@ -30,17 +29,7 @@ import {
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: these tests must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 const EXTERNAL_ADDRESS = 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk';
 
@@ -146,7 +135,8 @@ describe('Dust thresholds for wallet coins (#1362)', function () {
 				name: 'dustutxos',
 				network: EAvailableNetworks.regtest,
 				addressType: EAddressType.p2wpkh,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (res.isErr()) throw res.error;
 			wallet = res.value;

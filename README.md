@@ -152,7 +152,11 @@ A few calls do not return a `Result`, so check them differently:
 
 Balances, UTXO values and send amounts are satoshis, and fee rates are sat/vB: every `satsPerByte` option and field is sat/vB despite its name. Stored transactions (`wallet.transactions`) carry their amounts in satoshis as `valueSats`, `feeSats`, `totalInputSats`, `matchedInputSats`, `totalOutputSats` and `matchedOutputSats`. Their older BTC twins (`value`, `fee`, `totalInputValue` and the rest) are deprecated and go in the next major release. `btcToSats`, `satsToMsat` and `msatToSatsFloor` convert between units.
 
-Options worth knowing on `Wallet.create`: `network` (`Network.bitcoin` | `testnet` | `regtest` | `signet`), `addressType` (`EAddressType.p2wpkh` default, `p2sh` for P2SH-wrapped segwit, `p2pkh`, `p2tr`), `passphrase`, `account`, `storage`, `logger`, `onMessage`, `coinSelectPreference`, `feeEstimationSource`, `gapLimitOptions`.
+Options worth knowing on `Wallet.create`: `network` (`Network.bitcoin` | `testnet` | `regtest` | `signet`), `addressType` (`EAddressType.p2wpkh` default, `p2sh` for P2SH-wrapped segwit, `p2pkh`, `p2tr`), `passphrase`, `account`, `storage`, `logger`, `onMessage`, `coinSelectPreference`, `feeEstimationSource`, `gapLimitOptions`, `remainOffline`.
+
+`remainOffline: true` makes a wallet that never opens a connection: no Electrum server, and no fee lookup over HTTP. Calls that need a server fail, and a refresh stops after deriving the first addresses.
+
+`wallet.data` is a frozen copy of the wallet's data, taken when it is read. Change data with `wallet.updateData({ utxos, balance })`, which replaces those fields and saves them in order with the wallet's own writes. Each read of `wallet.data` copies the whole history, so code reading one field often should use `wallet.balance`, `wallet.utxos` or `wallet.transactions`.
 
 <details>
 <summary><b>Fees, sweeping, boosting, coin control, events and shutdown</b></summary>
@@ -334,15 +338,19 @@ exported.value.descriptors[0].external;
 </details>
 
 <details>
-<summary><b>Encrypted storage and leveled logging</b></summary>
+<summary><b>Storage, encryption and leveled logging</b></summary>
 
-The wallet persists through the host-injected `TStorage` interface (`storage: { getData, setData }`), and values are handed over as-is, so by default they are stored in plaintext. Persisted data is addresses, indexes, UTXOs, transactions, balance and fee estimates: no private keys and no mnemonic are ever written, so exposure is a privacy concern (full wallet history), not fund loss. The staged send (`transaction`) is written without signing keys, so a key pair handed to `sweepPrivateKey` or `addExternalInputs` never reaches storage, and `send`, `sendMany`, `sendMax`, `buildPsbt` and `sweepPrivateKey` reset the staged send when they return, so a restart never replays an earlier call's recipients.
+The wallet persists through the `storage` option, an `IWalletStorage`: `getData(key)`, `setData(key, value)` and the optional `setTransactionChanges` below. It holds one value per `IWalletData` field, under `<name>-<network>-<field>` (`<name>-<network>-acct<n>-<field>` for a non-zero account), and each value is plain JSON data. `createMemoryStorage()` implements all of it in memory: use it for tests and short-lived wallets, and start from it when writing a persistent store. Without `storage` the wallet keeps its data in memory and saves nothing.
+
+Values are handed over as-is, so by default they are stored in plaintext. Persisted data is addresses, indexes, UTXOs, transactions, balance and fee estimates: no private keys and no mnemonic are ever written, so exposure is a privacy concern (full wallet history), not fund loss. The staged send (`transaction`) is written without signing keys, so a key pair handed to `sweepPrivateKey` or `addExternalInputs` never reaches storage, and `send`, `sendMany`, `sendMax`, `buildPsbt` and `sweepPrivateKey` reset the staged send when they return, so a restart never replays an earlier call's recipients.
 
 `getData` must return `ok(undefined)` for a key it does not hold and `err` only when the read fails. `Wallet.create` returns an error on a failed read rather than start from defaults and save them over the data it could not read; pass `resetOnReadFailure: true` to start from defaults anyway.
 
+`setData` must keep a copy of the value: the wallet goes on changing the object it handed over. Writes to one key arrive one at a time, in the order the wallet made them. A write that resolves `err`, or rejects, reaches `onMessage` as `storageWriteFailed`.
+
 By default every change to the transaction history hands `setData` the whole history. A storage that also implements `setTransactionChanges(key, { set, deleted })` gets only the records that changed: new transactions, confirmations, reorgs, deletions and boosts. Its `getData` must then return the history with those changes applied. Replacing or clearing the history, and the one-time upgrade of old records on load, still go through `setData`. `createEncryptedStorage` does not pass `setTransactionChanges` through, so an encrypted storage keeps receiving the whole history.
 
-Wrap any `TStorage` with `createEncryptedStorage` to encrypt at rest with AES-256-GCM under an HKDF-derived key from the seed. Pre-existing plaintext values pass through unchanged and migrate lazily as they are rewritten.
+Wrap any `IWalletStorage` with `createEncryptedStorage` to encrypt at rest with AES-256-GCM under an HKDF-derived key from the seed. Pre-existing plaintext values pass through unchanged and migrate lazily as they are rewritten.
 
 ```typescript
 import * as bip39 from 'bip39';

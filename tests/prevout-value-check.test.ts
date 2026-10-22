@@ -5,8 +5,8 @@
  * coin got a valid transaction that paid the difference as fee. Inputs are
  * now refused unless the previous transaction agrees with the reported coin.
  *
- * Fully OFFLINE: the wallet points at an unreachable Electrum server, UTXOs
- * are fabricated and the previous-transaction fetch is stubbed.
+ * Fully OFFLINE: the wallet is created with remainOffline, UTXOs are
+ * fabricated and the previous-transaction fetch is stubbed.
  */
 
 import { expect } from 'chai';
@@ -18,7 +18,6 @@ import * as bitcoin from 'bitcoinjs-lib';
 import {
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	getScriptHash,
 	IUtxo,
 	ok,
@@ -39,16 +38,7 @@ const REPORTED_VALUE = 500_000;
 const SEND_AMOUNT = 200_000;
 const SATS_PER_BYTE = 10;
 
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 const PURPOSE: Partial<Record<EAddressType, number>> = {
 	p2pkh: 44,
@@ -64,6 +54,7 @@ const createWallet = async (addressType: EAddressType): Promise<Wallet> => {
 		network,
 		addressType,
 		electrumOptions,
+		remainOffline: true,
 		name: `prevout${addressType}${createdWallets.length}`
 	});
 	if (res.isErr()) throw res.error;
@@ -114,7 +105,8 @@ const fund = async ({
 		value: reportedValue,
 		publicKey: node.value.publicKey.toString('hex')
 	};
-	wallet.data.utxos = [utxo];
+	const funded = await wallet.updateData({ utxos: [utxo] });
+	if (funded.isErr()) throw funded.error;
 	const electrum = wallet.electrum as unknown as {
 		getTransactions: (args: {
 			txHashes: { tx_hash: string }[];

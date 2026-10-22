@@ -33,7 +33,8 @@ const electrumHelpers = require('rn-electrum-client/helpers');
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
+// Unreachable on purpose: this test must work offline. Not remainOffline,
+// which refuses in the Electrum methods before the stubbed helpers run.
 const ELECTRUM_PORT = 65529;
 
 type TBatch<T> = { key: string; data: T[] };
@@ -166,9 +167,12 @@ describe('an address request during a refresh (#1811)', function () {
 
 	it('checks addresses stored past its window before trusting the gap', async () => {
 		// Stored before this scan, as by a refresh or a wider gap limit.
-		for (const a of await receiveAt(2, 5)) {
-			wallet.data.addresses.p2wpkh[a.scriptHash] = { ...a };
-		}
+		const stored = { ...wallet.data.addresses.p2wpkh };
+		for (const a of await receiveAt(2, 5)) stored[a.scriptHash] = { ...a };
+		const saved = await wallet.updateData({
+			addresses: { ...wallet.data.addresses, p2wpkh: stored }
+		});
+		if (saved.isErr()) throw saved.error;
 
 		const res = await wallet.getNextAvailableAddress();
 		if (res.isErr()) throw res.error;

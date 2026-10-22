@@ -26,10 +26,10 @@ import {
 	EBoostType,
 	EProtocol,
 	IUtxo,
-	IWalletData,
+	IWalletStorage,
 	Result,
-	TStorage,
 	Wallet,
+	createMemoryStorage,
 	err,
 	ok
 } from '../src';
@@ -45,7 +45,8 @@ const ECPair = ECPairFactory(ecc);
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: these tests must work offline.
+// Unreachable on purpose: these tests must work offline. Not remainOffline,
+// which refuses the boost's broadcast before the stubbed helper runs.
 const electrumOptions = {
 	net,
 	tls,
@@ -72,23 +73,23 @@ const KEY_ADDRESS = payments.p2wpkh({ pubkey: keyPair.publicKey, network })
 	.address as string;
 
 /**
- * An in-memory TStorage that answers each write on a later tick, as a real
- * adapter does. A write that settles at once leaves no gap between staging
- * steps for an overlapping call to land in.
+ * An in-memory IWalletStorage that answers each write on a later tick, as a
+ * real adapter does. A write that settles at once leaves no gap between
+ * staging steps for an overlapping call to land in.
  */
-const memoryStorage = (): TStorage => {
-	const store = new Map<string, unknown>();
+const memoryStorage = (): IWalletStorage => {
+	const storage = createMemoryStorage();
+	const nextTick = (): Promise<void> =>
+		new Promise((resolve) => setImmediate(resolve));
 	return {
-		getData: async <K extends keyof IWalletData>(
-			key: string
-		): Promise<Result<IWalletData[K]>> => ok(store.get(key) as IWalletData[K]),
-		setData: async <K extends keyof IWalletData>(
-			key: string,
-			value: IWalletData[K]
-		): Promise<Result<boolean>> => {
-			await new Promise((resolve) => setImmediate(resolve));
-			store.set(key, value);
-			return ok(true);
+		getData: storage.getData,
+		setData: async (key, value): Promise<Result<boolean>> => {
+			await nextTick();
+			return storage.setData(key, value);
+		},
+		setTransactionChanges: async (key, changes): Promise<Result<boolean>> => {
+			await nextTick();
+			return storage.setTransactionChanges(key, changes);
 		}
 	};
 };
@@ -160,18 +161,24 @@ describe('Sweeps and boosts queue behind sends (#1597)', function () {
 		await wallet.refreshWallet({});
 		wallet.feeEstimates = { ...wallet.feeEstimates, fast: 10, normal: 5 };
 		const source = wallet.data.addressIndex[EAddressType.p2wpkh];
-		wallet.data.utxos.push({
-			address: source.address,
-			index: source.index,
-			path: source.path,
-			scriptHash: source.scriptHash,
-			height: 1,
-			tx_hash: WALLET_TXID,
-			tx_pos: 0,
-			value: 60_000,
-			publicKey: source.publicKey
+		const injected = await wallet.updateData({
+			utxos: [
+				...wallet.data.utxos,
+				{
+					address: source.address,
+					index: source.index,
+					path: source.path,
+					scriptHash: source.scriptHash,
+					height: 1,
+					tx_hash: WALLET_TXID,
+					tx_pos: 0,
+					value: 60_000,
+					publicKey: source.publicKey
+				}
+			],
+			balance: wallet.data.balance + 60_000
 		});
-		wallet.data.balance += 60_000;
+		if (injected.isErr()) throw injected.error;
 		sinon
 			.stub(electrumHelpers, 'broadcastTransaction')
 			.resolves({ error: false, data: 'ff'.repeat(32) });

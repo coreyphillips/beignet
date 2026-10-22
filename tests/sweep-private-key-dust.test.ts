@@ -7,8 +7,8 @@
  * Issue #1466: a combined sweep also spent the wallet's frozen coins.
  * Issue #1467: a lone 500 sat coin could not pay for its own sweep at 1 sat/vB.
  *
- * Fully OFFLINE: the wallet points at an unreachable Electrum port and the
- * key's UTXO lookup is stubbed.
+ * Fully OFFLINE: the wallet is created with remainOffline and the key's UTXO
+ * lookup is stubbed.
  */
 
 import { expect } from 'chai';
@@ -26,7 +26,6 @@ import { ECPairFactory } from 'ecpair';
 import {
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	IUtxo,
 	Wallet,
 	err,
@@ -38,17 +37,7 @@ const ECPair = ECPairFactory(ecc);
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: these tests must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 const network = networks.regtest;
 const RECIPIENT = 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk';
@@ -123,7 +112,8 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 			name: 'sweepdust',
 			network: EAvailableNetworks.regtest,
 			addressType: EAddressType.p2wpkh,
-			electrumOptions
+			electrumOptions,
+			remainOffline: true
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
@@ -135,26 +125,32 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 		await wallet?.stop();
 	});
 
-	afterEach(function () {
+	afterEach(async function () {
 		sinon.restore();
-		wallet.data.utxos = [];
-		wallet.data.blacklistedUtxos = [];
+		const res = await wallet.updateData({ utxos: [], blacklistedUtxos: [] });
+		if (res.isErr()) throw res.error;
 	});
 
 	/** Adds a coin paying the wallet's own index-0 P2WPKH address. */
-	const walletHolds = (txid: string, value: number): void => {
+	const walletHolds = async (txid: string, value: number): Promise<void> => {
 		const source = wallet.data.addressIndex[EAddressType.p2wpkh];
-		wallet.data.utxos.push({
-			address: source.address,
-			index: source.index,
-			path: source.path,
-			scriptHash: source.scriptHash,
-			height: 1,
-			tx_hash: txid,
-			tx_pos: 0,
-			value,
-			publicKey: source.publicKey
+		const res = await wallet.updateData({
+			utxos: [
+				...wallet.data.utxos,
+				{
+					address: source.address,
+					index: source.index,
+					path: source.path,
+					scriptHash: source.scriptHash,
+					height: 1,
+					tx_hash: txid,
+					tx_pos: 0,
+					value,
+					publicKey: source.publicKey
+				}
+			]
 		});
+		if (res.isErr()) throw res.error;
 	};
 
 	/** The txids a signed transaction spends, in input order. */
@@ -186,7 +182,7 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 		keyHolds([keyCoin('33'.repeat(32), 293), keyCoin('44'.repeat(32), 293)]);
 		// A wallet coin, so an empty input set cannot fall back to the
 		// wallet's own coins unnoticed.
-		walletHolds('55'.repeat(32), 50_000);
+		await walletHolds('55'.repeat(32), 50_000);
 
 		const res = await wallet.sweepPrivateKey({
 			privateKey: keyPair.toWIF(),
@@ -216,7 +212,7 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 	it('sweeps a 500 sat coin together with the wallet coins', async () => {
 		const coin = keyCoin('88'.repeat(32), 500);
 		keyHolds([coin]);
-		walletHolds('99'.repeat(32), 20_000);
+		await walletHolds('99'.repeat(32), 20_000);
 
 		const res = await wallet.sweepPrivateKey({
 			privateKey: keyPair.toWIF(),
@@ -236,8 +232,8 @@ describe('Sweeping a private key that holds dust (#1434)', function () {
 	it('leaves a frozen wallet coin out of a combined sweep (#1466)', async () => {
 		const coin = keyCoin('bb'.repeat(32), 10_000);
 		keyHolds([coin]);
-		walletHolds('cc'.repeat(32), 50_000);
-		walletHolds('dd'.repeat(32), 20_000);
+		await walletHolds('cc'.repeat(32), 50_000);
+		await walletHolds('dd'.repeat(32), 20_000);
 		const frozen = await wallet.freezeUtxo({ txid: 'cc'.repeat(32), index: 0 });
 		if (frozen.isErr()) throw frozen.error;
 

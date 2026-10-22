@@ -50,17 +50,13 @@ const report = { refused };
 		beignet.setCryptoProvider(hostProvider);
 		const rows = new Map();
 		const storage = beignet.createEncryptedStorage(
-			{
-				getData: async (key) => beignet.ok(rows.get(key)),
-				setData: async (key, value) => {
-					rows.set(key, value);
-					return beignet.ok(true);
-				}
-			},
+			beignet.createMemoryStorage(rows),
 			Buffer.alloc(64)
 		);
 		await storage.setData('wallet', { balance: 1 });
-		report.sealed = String(rows.get('wallet')).startsWith('encw1:');
+		report.sealed = String(JSON.parse(rows.get('wallet') ?? 'null')).startsWith(
+			'encw1:'
+		);
 		report.opened = (await storage.getData('wallet')).value;
 	} catch (e) {
 		report.loadError = e.message;

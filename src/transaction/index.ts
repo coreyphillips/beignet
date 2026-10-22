@@ -29,6 +29,7 @@ import { getBitcoinJsNetwork, reduceValue, shuffleArray } from '../utils';
 import { btcToSats } from '../utils/conversion';
 import { derivePathCached } from '../utils/derive-path-cached';
 import { TRANSACTION_DEFAULTS } from '../wallet/constants';
+import { liveWalletData } from '../wallet/live-data';
 import {
 	constructByteCountParam,
 	createOpReturnScript,
@@ -93,7 +94,7 @@ export class Transaction {
 		try {
 			const addressType = this._wallet.addressType;
 
-			const currentWallet = this._wallet.data;
+			const currentWallet = liveWalletData(this._wallet);
 
 			// The live staged send, never currentWallet.transaction: that is the
 			// copy loaded from storage at boot, and nothing updates it after.
@@ -223,9 +224,9 @@ export class Transaction {
 	 */
 	removeBlackListedUtxos(utxos?: IUtxo[]): IUtxo[] {
 		if (!utxos) {
-			utxos = this._wallet.data.utxos;
+			utxos = liveWalletData(this._wallet).utxos;
 		}
-		const blacklistedUtxos = this._wallet.data.blacklistedUtxos;
+		const blacklistedUtxos = liveWalletData(this._wallet).blacklistedUtxos;
 		// Match by outpoint only: height changes when a frozen UTXO confirms
 		// and must not silently unfreeze it.
 		return utxos.filter((utxo) => {
@@ -322,8 +323,8 @@ export class Transaction {
 	}): { address: string; leftover: number } | undefined {
 		if (transaction.changeAddress || transaction.max) return undefined;
 		const address =
-			this._wallet.data.changeAddressIndex[this._wallet.addressType]?.address ||
-			this.changeAddressStandIn();
+			liveWalletData(this._wallet).changeAddressIndex[this._wallet.addressType]
+				?.address || this.changeAddressStandIn();
 		if (!address) return undefined;
 		const leftover =
 			this.getTransactionInputValue({ inputs }) -
@@ -613,11 +614,14 @@ export class Transaction {
 			if (!transaction.inputs?.length) {
 				transaction = {
 					...transaction,
-					inputs: this.removeBlackListedUtxos(this._wallet.data.utxos),
+					inputs: this.removeBlackListedUtxos(
+						liveWalletData(this._wallet).utxos
+					),
 					changeAddress:
 						transaction.changeAddress ||
-						this._wallet.data.changeAddressIndex[this._wallet.addressType]
-							?.address
+						liveWalletData(this._wallet).changeAddressIndex[
+							this._wallet.addressType
+						]?.address
 				};
 			}
 			let changeAddress = transaction.changeAddress;
@@ -1430,7 +1434,9 @@ export class Transaction {
 	 */
 	private async addChangeOutputMetadata(psbt: Psbt): Promise<Result<string>> {
 		try {
-			const { changeAddresses, changeAddressIndex } = this._wallet.data;
+			const { changeAddresses, changeAddressIndex } = liveWalletData(
+				this._wallet
+			);
 			const changePaths = new Map<string, string>();
 			for (const addresses of Object.values(changeAddresses)) {
 				for (const { address, path } of Object.values(addresses ?? {})) {
@@ -2210,7 +2216,7 @@ export class Transaction {
 				transaction = this.data;
 			}
 
-			const currentWallet = this._wallet.data;
+			const currentWallet = liveWalletData(this._wallet);
 			// The coins sendMax spends. The stored balance is not: it also counts
 			// frozen coins.
 			const spendableUtxos = this.removeBlackListedUtxos(currentWallet.utxos);
@@ -2373,7 +2379,7 @@ export class Transaction {
 			// child + parent combined fee rate should be higher than fastest.
 			// TODO: take all possible unconfirmed parent UTXOs into account.
 			if (!satsPerByte && txid) {
-				const parent = this._wallet.data.transactions[txid];
+				const parent = liveWalletData(this._wallet).transactions[txid];
 				if (parent) {
 					const parentVsize = parent.vsize;
 					// The child spends every output of the parent that pays us, so it

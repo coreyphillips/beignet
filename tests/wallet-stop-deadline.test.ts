@@ -10,8 +10,10 @@
  * stop() pending forever: disableMessages unset, _setData still live,
  * electrum.disconnect() never reached.
  *
- * Fully OFFLINE: the wallet points at an unreachable port and every step of the
- * refresh is stubbed, so this asserts on the shutdown path alone.
+ * Fully OFFLINE: the wallet never connects (remainOffline), but for the one
+ * case that watches Electrum's own connect path, whose wallet points at an
+ * unreachable port. Every step of the refresh is stubbed, so this asserts on
+ * the shutdown path alone.
  */
 
 import { expect } from 'chai';
@@ -32,10 +34,14 @@ import {
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
-const electrumOptions = {
-	net,
-	tls,
+// No servers: the wallets are created with remainOffline, all but the one
+// on unreachableElectrumOptions.
+const electrumOptions = { net, tls };
+
+// Unreachable on purpose, for the case that needs Electrum's own connect
+// path to run: remainOffline refuses before it.
+const unreachableElectrumOptions = {
+	...electrumOptions,
 	servers: {
 		host: '127.0.0.1',
 		ssl: 65528,
@@ -43,6 +49,10 @@ const electrumOptions = {
 		protocol: EProtocol.tcp
 	}
 };
+
+/** The case whose wallet is created with unreachableElectrumOptions. */
+const WATCHES_DIAL =
+	'does not reconnect when a transaction refresh resumes from storage';
 
 /** The private members the cases below reach through a cast. */
 type TWalletInternals = {
@@ -104,18 +114,20 @@ describe('stop() refresh deadline', function () {
 	let refreshSettled = false;
 
 	beforeEach(async function () {
+		const offline = this.currentTest?.title !== WATCHES_DIAL;
 		const res = await Wallet.create({
 			mnemonic: MNEMONIC,
 			network: EAvailableNetworks.regtest,
 			addressType: EAddressType.p2wpkh,
-			electrumOptions
+			electrumOptions: offline ? electrumOptions : unreachableElectrumOptions,
+			remainOffline: offline
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
 
 		// Wallet.create kicks off a refresh without awaiting it. Let that one
-		// finish (it fails fast against the unreachable port) before stubbing, so
-		// the cases below own the flag from a known-idle start.
+		// finish (it fails fast, offline or against the unreachable port) before
+		// stubbing, so the cases below own the flag from a known-idle start.
 		await waitFor(
 			() => !wallet.isRefreshing,
 			20000,
@@ -288,7 +300,7 @@ describe('stop() refresh deadline', function () {
 		).to.equal(0);
 	});
 
-	it('does not reconnect when a transaction refresh resumes from storage', async function () {
+	it(WATCHES_DIAL, async function () {
 		updateTransactionsStub.restore();
 		refreshUtxosStub.resolves(ok<IGetUtxosResponse>({ utxos: [], balance: 0 }));
 		// Keep the real transaction refresh and unconfirmed-transaction storage

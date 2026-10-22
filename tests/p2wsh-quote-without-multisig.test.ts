@@ -3,8 +3,8 @@
  * multisig wallet, so getTotalFeeObj sized such a send at 0 vB, took an
  * unbounded maximum rate and never returned from its rate search.
  *
- * Fully OFFLINE: the wallets point at an unreachable Electrum server and the
- * UTXOs are fabricated.
+ * Fully OFFLINE: the wallets never connect (remainOffline) and the UTXOs are
+ * fabricated.
  */
 
 import { expect } from 'chai';
@@ -19,7 +19,6 @@ import {
 	EAddressType,
 	EAvailableNetworks,
 	ECoinSelectPreference,
-	EProtocol,
 	getScriptHash,
 	IUtxo,
 	Wallet
@@ -40,16 +39,7 @@ const MULTISIG_ACCOUNT_PATH = "m/48'/1'/0'/2'";
 const INPUT_VALUE = 100_000;
 const PAYMENT = 10_000;
 
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 const utxoAt = (address: string, path: string, publicKey: string): IUtxo => ({
 	address,
@@ -85,6 +75,7 @@ describe('Fee quote for a P2WSH input outside a multisig wallet (#1808)', functi
 				addressType: EAddressType.p2wpkh,
 				coinSelectPreference: ECoinSelectPreference.consolidate,
 				electrumOptions,
+				remainOffline: true,
 				name: 'p2wshquotewithoutmultisig'
 			});
 			if (res.isErr()) throw res.error;
@@ -173,7 +164,8 @@ describe('Fee quote for a P2WSH input outside a multisig wallet (#1808)', functi
 				mnemonic: MNEMONIC,
 				cosigners,
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (res.isErr()) throw res.error;
 			wallet = res.value;

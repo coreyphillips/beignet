@@ -1,7 +1,7 @@
 /**
  * Sorted-multisig (BIP 48 / BIP 67) P2WSH wallet tests. Fully OFFLINE: the
- * wallets point at an unreachable Electrum port, addresses are pure key
- * derivation and the PSBT round trip uses fabricated UTXOs. Expected
+ * wallets are created with remainOffline, addresses are pure key derivation
+ * and the PSBT round trip uses fabricated UTXOs. Expected
  * addresses and scripts are computed INDEPENDENTLY inside the test with
  * bitcoinjs-lib (p2ms + p2wsh + lexicographic key sort), never through the
  * code under test.
@@ -21,7 +21,6 @@ import {
 	descriptorChecksum,
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	getScriptHash,
 	IUtxo,
 	MultisigSpendError,
@@ -51,17 +50,7 @@ const testTimeout = 120000;
 const PINNED_EXTERNAL_DESCRIPTOR =
 	'wsh(sortedmulti(2,[73c5da0a/48h/1h/0h/2h]tpubDFH9dgzveyD8zTbPUFuLrGmCydNvxehyNdUXKJAQN8x4aZ4j6UZqGfnqFrD4NqyaTVGKbvEW54tsvPTK2UoSbCC1PJY8iCNiwTL3RWZEheQ/0/*,[8d70f947]tpubDEwqCvJxKwKWX9xvRe48uofWJn1Y89Jn8UeH1Efrjb1UEVjUDy3URYTiqWaVCW7WdvHrL8XrSihHEhTwv5H3VDJoakjuCHiAnr6xcF2Xm4s/0/*,[67d8576d]tpubDEfobrrtptRTbKf4gysDhoabneABDTAcdj3Vbn4XwPsLE2pmqpizSPRG6zHsbAMuiSgWmWPsYCLHTKTPpyrGJ5rAoTpKoQNZcxodiPf2tSJ/0/*))#u4dz746u';
 
-// Unreachable on purpose: these tests must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 const THRESHOLD = 2;
 const ACCOUNT_PATH = "m/48'/1'/0'/2'";
@@ -146,7 +135,8 @@ describe('Multisig P2WSH Wallets', function () {
 				mnemonic: MNEMONIC_A,
 				cosigners: [xpubB, xpubC],
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (res.isErr()) throw res.error;
 			walletA = track(res.value);
@@ -184,7 +174,8 @@ describe('Multisig P2WSH Wallets', function () {
 				mnemonic: MNEMONIC_A,
 				cosigners: [xpubC, xpubB],
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (res.isErr()) throw res.error;
 			const shuffled = track(res.value);
@@ -202,7 +193,8 @@ describe('Multisig P2WSH Wallets', function () {
 				mnemonic: MNEMONIC_B,
 				cosigners: [xpubA, xpubC],
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (res.isErr()) throw res.error;
 			const walletB = track(res.value);
@@ -217,7 +209,8 @@ describe('Multisig P2WSH Wallets', function () {
 				threshold: THRESHOLD,
 				cosigners: [xpubA, xpubB, xpubC],
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (res.isErr()) throw res.error;
 			const watchOnly = track(res.value);
@@ -252,7 +245,8 @@ describe('Multisig P2WSH Wallets', function () {
 				mnemonic: MNEMONIC_A,
 				cosigners: [vpubB, xpubC],
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (res.isErr()) throw res.error;
 			const wallet = track(res.value);
@@ -278,7 +272,8 @@ describe('Multisig P2WSH Wallets', function () {
 					mnemonic: MNEMONIC_A,
 					cosigners: [xpubB, xpubC],
 					network,
-					electrumOptions
+					electrumOptions,
+					remainOffline: true
 				});
 				expect(res.isErr(), `threshold ${threshold}`).to.equal(true);
 			}
@@ -290,7 +285,8 @@ describe('Multisig P2WSH Wallets', function () {
 				mnemonic: MNEMONIC_A,
 				cosigners: [xpubB, xpubC],
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			expect(res.isErr()).to.equal(true);
 			if (res.isErr()) {
@@ -309,7 +305,8 @@ describe('Multisig P2WSH Wallets', function () {
 				threshold: 2,
 				cosigners,
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			expect(res.isErr()).to.equal(true);
 			if (res.isErr()) {
@@ -323,7 +320,8 @@ describe('Multisig P2WSH Wallets', function () {
 				mnemonic: MNEMONIC_A,
 				cosigners: [xpubB, xpubB],
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			expect(res.isErr()).to.equal(true);
 			if (res.isErr()) {
@@ -338,7 +336,8 @@ describe('Multisig P2WSH Wallets', function () {
 				cosigners: [xpubB, xpubC],
 				ourXpub: xpubB,
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			expect(res.isErr()).to.equal(true);
 			if (res.isErr()) {
@@ -353,7 +352,8 @@ describe('Multisig P2WSH Wallets', function () {
 				cosigners: [xpubB, xpubC],
 				ourXpub: xpubA,
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (explicit.isErr()) throw explicit.error;
 			track(explicit.value);
@@ -362,7 +362,8 @@ describe('Multisig P2WSH Wallets', function () {
 				mnemonic: MNEMONIC_A,
 				cosigners: [xpubA, xpubB, xpubC],
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (listed.isErr()) throw listed.error;
 			track(listed.value);
@@ -377,7 +378,8 @@ describe('Multisig P2WSH Wallets', function () {
 				mnemonic: MNEMONIC_A,
 				cosigners: ['tpubnotarealkey'],
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			expect(res.isErr()).to.equal(true);
 		});
@@ -389,7 +391,8 @@ describe('Multisig P2WSH Wallets', function () {
 				mnemonic: MNEMONIC_A,
 				cosigners: [tprv],
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			expect(res.isErr()).to.equal(true);
 			if (res.isErr()) {
@@ -402,14 +405,16 @@ describe('Multisig P2WSH Wallets', function () {
 				mnemonic: MNEMONIC_A,
 				addressType: EAddressType.p2wsh,
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			expect(full.isErr()).to.equal(true);
 			const watch = await Wallet.createWatchOnly({
 				xpub: xpubA,
 				addressType: EAddressType.p2wsh,
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			expect(watch.isErr()).to.equal(true);
 		});
@@ -428,7 +433,8 @@ describe('Multisig P2WSH Wallets', function () {
 				mnemonic: MNEMONIC_A,
 				cosigners: [xpubB, xpubC],
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (resA.isErr()) throw resA.error;
 			walletA = track(resA.value);
@@ -437,7 +443,8 @@ describe('Multisig P2WSH Wallets', function () {
 				mnemonic: MNEMONIC_B,
 				cosigners: [xpubA, xpubC],
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (resB.isErr()) throw resB.error;
 			walletB = track(resB.value);
@@ -445,17 +452,22 @@ describe('Multisig P2WSH Wallets', function () {
 				threshold: THRESHOLD,
 				cosigners: [xpubA, xpubB, xpubC],
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (resW.isErr()) throw resW.error;
 			watchOnly = track(resW.value);
 			// Populates index-0 addresses (including the change address that
 			// setupTransaction needs); the Electrum sync fails harmlessly offline.
 			await walletA.refreshWallet({});
-			walletA.data.utxos.push(
+			const utxos = [
 				await makeMultisigUtxo(walletA, { index: 0, value: 60000 }),
 				await makeMultisigUtxo(walletA, { index: 1, value: 40000 })
-			);
+			];
+			const set = await walletA.updateData({
+				utxos: [...walletA.data.utxos, ...utxos]
+			});
+			if (set.isErr()) throw set.error;
 		});
 
 		it('buildPsbt populates witnessScript and ALL cosigner bip32Derivations', async () => {
@@ -668,7 +680,10 @@ describe('Multisig P2WSH Wallets', function () {
 				1000000
 			);
 			const savedUtxos = walletA.data.utxos;
-			walletA.data.utxos = [{ ...utxo, tx_hash: prevTx.getId() }];
+			const set = await walletA.updateData({
+				utxos: [{ ...utxo, tx_hash: prevTx.getId() }]
+			});
+			if (set.isErr()) throw set.error;
 			try {
 				// Offline, so the build attaches no previous transaction and prices
 				// the fee from the reported 500000.
@@ -713,7 +728,7 @@ describe('Multisig P2WSH Wallets', function () {
 					'Input 0 claims a different previous output than the one built'
 				);
 			} finally {
-				walletA.data.utxos = savedUtxos;
+				await walletA.updateData({ utxos: savedUtxos });
 			}
 		});
 	});
@@ -727,7 +742,8 @@ describe('Multisig P2WSH Wallets', function () {
 				mnemonic: MNEMONIC_A,
 				cosigners: [xpubB, xpubC],
 				network,
-				electrumOptions
+				electrumOptions,
+				remainOffline: true
 			});
 			if (res.isErr()) throw res.error;
 			walletA = track(res.value);

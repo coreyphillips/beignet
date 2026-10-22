@@ -32,6 +32,7 @@ import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { TypedEmitter } from '../utils/typed-emitter';
 import { Wallet } from '../wallet';
+import { liveWalletData } from '../wallet/live-data';
 import { getDefaultSendTransaction } from '../shapes/wallet';
 import type { EAddressType, ISendTransaction } from '../types/wallet';
 import type { ILogger, TLogLevel } from '../logger';
@@ -7200,15 +7201,18 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 		const txn = this.wallet.transaction;
 		// The same UTXOs a send would gather: everything spendable, frozen ones out.
-		const inputs = txn.removeBlackListedUtxos(this.wallet.data.utxos);
+		const inputs = txn.removeBlackListedUtxos(
+			liveWalletData(this.wallet).utxos
+		);
 		if (!inputs.length) {
 			throw new BeignetError(
 				BeignetErrorCode.SEND_FAILED,
 				'No UTXOs available.'
 			);
 		}
-		const changeAddress =
-			this.wallet.data.changeAddressIndex[this.wallet.addressType]?.address;
+		const changeAddress = liveWalletData(this.wallet).changeAddressIndex[
+			this.wallet.addressType
+		]?.address;
 		if (!changeAddress) {
 			throw new BeignetError(
 				BeignetErrorCode.SEND_FAILED,
@@ -7284,7 +7288,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (!channelFunding) {
 			// The wallet's own current receive address, of the type it actually uses.
 			// Reading it does not consume it.
-			return this.wallet.data.addressIndex[this.wallet.addressType].address;
+			return liveWalletData(this.wallet).addressIndex[this.wallet.addressType]
+				.address;
 		}
 		const bitcoin = require('bitcoinjs-lib');
 		// A witness-v0 32-byte program: the shape of a 2-of-2 funding output. The

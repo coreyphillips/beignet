@@ -82,7 +82,8 @@ import type {
 	TTxDetails,
 	TTxResult,
 	TUnspentAddressScriptHashData,
-	TWalletDataKeys
+	TWalletDataKeys,
+	TWalletStorageKey
 } from '../types';
 import {
 	EAddressType,
@@ -141,6 +142,7 @@ import {
 import {
 	addressTypes,
 	defaultFeesShape,
+	defaultWalletData,
 	getAddressTypeContent,
 	getAddressTypes,
 	getDefaultSendTransaction
@@ -160,6 +162,7 @@ import { btcToSats } from '../utils/conversion';
 import { derivePathCached } from '../utils/derive-path-cached';
 import type { ILogger } from '../logger';
 import { createConsoleLogger } from '../logger';
+import { registerLiveWalletData } from './live-data';
 
 type TAddressLookup = {
 	maps: (IAddresses | undefined)[];
@@ -199,6 +202,24 @@ const toOutpoint = (
 		return err(`vout ${vout} and index ${index} name different outputs.`);
 	}
 	return ok({ txid: outpoint.txid, vout: (vout ?? index) as number });
+};
+
+/**
+ * Freezes value and every plain object and array it holds, and returns it.
+ * Class instances such as key pairs are left as they are: they cache derived
+ * keys on themselves, and frozen they would throw doing it.
+ */
+const deepFreeze = <T>(value: T): T => {
+	if (typeof value !== 'object' || value === null || Object.isFrozen(value)) {
+		return value;
+	}
+	const proto: unknown = Object.getPrototypeOf(value);
+	if (!Array.isArray(value) && proto !== Object.prototype && proto !== null) {
+		return value;
+	}
+	Object.freeze(value);
+	for (const child of Object.values(value)) deepFreeze(child);
+	return value;
 };
 
 /**
@@ -368,6 +389,8 @@ export class Wallet {
 	public addressTypesToMonitor: EAddressType[];
 	public coinSelectPreference: ECoinSelectPreference;
 	public readonly isWatchOnly: boolean;
+	// Set by IWallet.remainOffline: Electrum refuses every connect and request.
+	public readonly remainOffline: boolean;
 	public isRefreshing: boolean;
 	public isSwitchingNetworks: boolean;
 	public readonly id: string;
@@ -408,6 +431,7 @@ export class Wallet {
 		storage,
 		resetOnReadFailure = false,
 		electrumOptions,
+		remainOffline = false,
 		onMessage = (): null => null,
 		customGetAddress,
 		customGetScriptHash,
@@ -521,6 +545,7 @@ export class Wallet {
 		}
 		this.logger = logger ?? createConsoleLogger('info');
 		this._data = getDefaultWalletData();
+		registerLiveWalletData(this, () => this._data);
 		this._getData = storage?.getData ?? getDataFallback;
 		this._setData = storage?.setData;
 		this._setTransactionChanges = storage?.setTransactionChanges;
@@ -545,6 +570,7 @@ export class Wallet {
 			onMessage(key, data);
 		};
 		this.electrumOptions = electrumOptions;
+		this.remainOffline = remainOffline;
 		this.electrum = new Electrum({
 			wallet: this,
 			network: this.network,
@@ -581,8 +607,70 @@ export class Wallet {
 		};
 	}
 
-	public get data(): IWalletData {
-		return this._data;
+	/**
+	 * A frozen copy of the wallet's data as it is now. It does not follow
+	 * later changes, and writing to it throws: change data with updateData.
+	 * Each read copies the whole history, so code that reads one field often
+	 * should use the getter for that field (balance, utxos, transactions).
+	 */
+	public get data(): Readonly<IWalletData> {
+		return deepFreeze(cloneDeep(this._data));
+	}
+
+	/**
+	 * Replaces the given fields of the wallet's data and saves each one. The
+	 * fields change at once, and each save queues behind the writes already
+	 * made to its field, as the wallet's own saves do. The values are copied,
+	 * so changing them afterwards does not reach the wallet. Nothing derived
+	 * from a field is recalculated: new utxos leave balance as it was.
+	 *
+	 * A patch with blacklistedUtxos first waits for any freeze or unfreeze in
+	 * flight, as those wait for each other. A patch with addressIndex counts
+	 * as a move of the receive index, so getAddress saves it again before
+	 * handing it out if storage refused it here.
+	 * @param {Partial<IWalletData>} patch
+	 * @returns {Promise<Result<string>>} Err when storage refused a field.
+	 * Each refusal also reaches onMessage as storageWriteFailed.
+	 */
+	public async updateData(
+		patch: Partial<IWalletData>
+	): Promise<Result<string>> {
+		const keys = objectKeys(patch).filter((key) => patch[key] !== undefined);
+		const unknown = keys.filter(
+			(key) => !Object.prototype.hasOwnProperty.call(defaultWalletData, key)
+		);
+		if (unknown.length) {
+			return err(`Unknown wallet data fields: ${unknown.join(', ')}.`);
+		}
+		const update = async (): Promise<Result<string>> => {
+			const { addressIndex } = patch;
+			if (
+				addressIndex &&
+				Object.values(EAddressType).some(
+					(type) =>
+						addressIndex[type]?.index !== this._data.addressIndex[type]?.index
+				)
+			) {
+				this.receiveIndexMoves++;
+			}
+			const data = this._data as Record<TWalletDataKeys, unknown>;
+			for (const key of keys) data[key] = cloneDeep(patch[key]);
+			const saved = await Promise.all(
+				keys.map((key) =>
+					key === 'addressIndex'
+						? this.saveReceiveIndex()
+						: this.saveWalletData(key, this._data[key])
+				)
+			);
+			const refused = saved.flatMap((res) =>
+				res.isErr() ? [res.error.message] : []
+			);
+			if (refused.length) return err(refused.join(' '));
+			return ok('Wallet data updated.');
+		};
+		return keys.includes('blacklistedUtxos')
+			? this.runBlacklistWrite(update)
+			: update();
 	}
 
 	public get transactions(): IFormattedTransactions {
@@ -1121,7 +1209,6 @@ export class Wallet {
 			// this wallet below.
 			disableMessagesOnCreate: this._quietUntilFirstRefresh,
 			disableRefreshOnCreate: this._disableRefreshOnCreate,
-			data: getDefaultWalletData(),
 			onMessage: this.sendMessage
 		};
 		try {
@@ -1501,7 +1588,9 @@ export class Wallet {
 	 * @returns {string}
 	 * @param key
 	 */
-	public getWalletDataKey(key: keyof IWalletData): string {
+	public getWalletDataKey<K extends TWalletDataKeys>(
+		key: K
+	): TWalletStorageKey<K> {
 		return getWalletDataStorageKey(
 			this.name,
 			this._network,
@@ -1542,7 +1631,7 @@ export class Wallet {
 	private async _readStoredValue<K extends keyof IWalletData>(
 		key: K
 	): Promise<Result<IWalletData[K] | undefined>> {
-		let res: Result<IWalletData[K]>;
+		let res: Result<IWalletData[K] | undefined>;
 		try {
 			res = await this._getData<K>(this.getWalletDataKey(key));
 		} catch (e) {
@@ -1847,7 +1936,7 @@ export class Wallet {
 	}: IGetAddress = {}): Promise<string> {
 		try {
 			if (index === undefined) {
-				const addressIndex = this.data.addressIndex[addressType];
+				const addressIndex = this._data.addressIndex[addressType];
 				index = addressIndex.index >= 0 ? String(addressIndex.index) : '0';
 			}
 			const pathRes = getKeyDerivationPathString({
@@ -1904,6 +1993,9 @@ export class Wallet {
 	public async connectToElectrum(
 		servers?: TServer | TServer[]
 	): Promise<Result<string>> {
+		if (this.remainOffline) {
+			return err('The wallet was created with remainOffline.');
+		}
 		const res = await this.electrum.connectToElectrum({
 			network: this._network,
 			servers: servers ?? this.electrumOptions?.servers
@@ -2018,7 +2110,7 @@ export class Wallet {
 	 * @returns {number}
 	 */
 	public getBalance(): number {
-		return this?.data?.balance ?? 0;
+		return this._data.balance ?? 0;
 	}
 
 	/**
@@ -2208,7 +2300,7 @@ export class Wallet {
 		try {
 			const network = this._network;
 			addressType = addressType ?? this.addressType;
-			const currentWallet = this.data;
+			const currentWallet = this._data;
 			const { path } = addressTypes[addressType]; // Assuming addressTypes is globally defined.
 			const result = formatKeyDerivationPath({ path, network });
 
@@ -2619,7 +2711,7 @@ export class Wallet {
 		changeAddressIndex: IAddress;
 	}> {
 		try {
-			const currentWallet = this.data;
+			const currentWallet = this._data;
 			const addresses = Object.values(currentWallet.addresses[addressType]);
 			const changeAddresses = Object.values(
 				currentWallet.changeAddresses[addressType]
@@ -2713,14 +2805,14 @@ export class Wallet {
 		const grown: ('addresses' | 'changeAddresses')[] = [];
 		if (Object.keys(addresses).length) {
 			this._data.addresses[addressType] = {
-				...this.data.addresses[addressType],
+				...this._data.addresses[addressType],
 				...addresses
 			};
 			grown.push('addresses');
 		}
 		if (Object.keys(changeAddresses).length) {
 			this._data.changeAddresses[addressType] = {
-				...this.data.changeAddresses[addressType],
+				...this._data.changeAddresses[addressType],
 				...changeAddresses
 			};
 			grown.push('changeAddresses');
@@ -2748,7 +2840,7 @@ export class Wallet {
 		changeAddresses?: IAddresses;
 	}): Promise<Result<IGenerateAddressesResponse>> {
 		try {
-			const currentWallet: IWalletData = this.data;
+			const currentWallet: IWalletData = this._data;
 			const currentAddressTypeContent: TAddressTypeContent<IAddresses> =
 				currentWallet.addresses;
 			const currentChangeAddressTypeContent: TAddressTypeContent<IAddresses> =
@@ -2795,7 +2887,7 @@ export class Wallet {
 	): Promise<Result<string>> {
 		const checkRes = await this.checkElectrumConnection();
 		if (checkRes.isErr()) return err(checkRes.error);
-		const currentWallet = this.data;
+		const currentWallet = this._data;
 		// switchNetwork replaces the Electrum instance along with the data, so
 		// a scan answered after it has looked up the network the wallet left,
 		// and what it found would be written as this network's indexes (#1636).
@@ -2977,7 +3069,7 @@ export class Wallet {
 	} = {}): Promise<Result<IAddress>> {
 		try {
 			const network = this._network;
-			const currentWallet = this.data;
+			const currentWallet = this._data;
 
 			const getAddressGapResponse = this.getAddressGap({
 				addressType
@@ -3031,9 +3123,9 @@ export class Wallet {
 			if (addAddressesRes.isErr()) {
 				return err(addAddressesRes.error);
 			}
-			const addressIndex = Object.values(this.data.addresses[addressType]).find(
-				(addr) => addr.index === currentAddressIndex + 1
-			);
+			const addressIndex = Object.values(
+				this._data.addresses[addressType]
+			).find((addr) => addr.index === currentAddressIndex + 1);
 
 			// If for any reason we're unable to generate the new address, return error.
 			if (!addressIndex) {
@@ -3212,7 +3304,7 @@ export class Wallet {
 		addressType?: EAddressType;
 	}): Result<{ addressDelta: number; changeAddressDelta: number }> {
 		try {
-			const currentWallet = this.data;
+			const currentWallet = this._data;
 			const addressIndex = currentWallet.addressIndex[addressType].index;
 			const lastUsedAddressIndex =
 				currentWallet.lastUsedAddressIndex[addressType].index;
@@ -3332,7 +3424,7 @@ export class Wallet {
 	 * @returns {IUtxo[]}
 	 */
 	listUtxos(): IUtxo[] {
-		return this.data.utxos;
+		return this._data.utxos;
 	}
 
 	/**
@@ -3465,7 +3557,7 @@ export class Wallet {
 	public isUtxoFrozen(outpoint: IOutpoint | string, index?: number): boolean {
 		const { txid, vout } =
 			typeof outpoint === 'string' ? { txid: outpoint, vout: index } : outpoint;
-		return this.data.blacklistedUtxos.some(
+		return this._data.blacklistedUtxos.some(
 			(frozen) => frozen.tx_hash === txid && frozen.tx_pos === vout
 		);
 	}
@@ -3559,7 +3651,7 @@ export class Wallet {
 		if (!Number.isInteger(vout) || vout < 0) {
 			return err('vout must be a non-negative integer.');
 		}
-		const utxo = this.data.utxos.find(
+		const utxo = this._data.utxos.find(
 			(u) => u.tx_hash === txid && u.tx_pos === vout
 		);
 		if (!utxo) {
@@ -3732,7 +3824,7 @@ export class Wallet {
 	 * @returns {IUtxo[]}
 	 */
 	public listFrozenUtxos(): IUtxo[] {
-		return this.data.blacklistedUtxos;
+		return this._data.blacklistedUtxos;
 	}
 
 	/**
@@ -3742,7 +3834,7 @@ export class Wallet {
 	 */
 	public getBalanceBreakdown(): IBalanceBreakdown {
 		const total = this.getBalance();
-		const frozen = this.data.utxos.reduce((acc, utxo) => {
+		const frozen = this._data.utxos.reduce((acc, utxo) => {
 			return this.isUtxoFrozen({ txid: utxo.tx_hash, vout: utxo.tx_pos })
 				? acc + utxo.value
 				: acc;
@@ -3790,7 +3882,7 @@ export class Wallet {
 	 * @returns {string | undefined}
 	 */
 	public getAddressLabel(address: string): string | undefined {
-		return this.data.addressLabels[address];
+		return this._data.addressLabels[address];
 	}
 
 	/**
@@ -3798,7 +3890,7 @@ export class Wallet {
 	 * @returns {TAddressLabels}
 	 */
 	public listAddressLabels(): TAddressLabels {
-		return { ...this.data.addressLabels };
+		return { ...this._data.addressLabels };
 	}
 
 	/**
@@ -3963,7 +4055,7 @@ export class Wallet {
 	// still waits for the one ahead of it.
 	private waitingWrites: Record<
 		string,
-		{ walletDataKey: string; write: TWalletWrite }[]
+		{ walletDataKey: TWalletStorageKey; write: TWalletWrite }[]
 	> = {};
 
 	// Refused writes of the transaction map, by storage key, until the next
@@ -3971,7 +4063,8 @@ export class Wallet {
 	// handed the whole map again, so a change it refused would otherwise
 	// never reach it. switchNetwork drops them along with the data they came
 	// from: switching back reads that data from storage again.
-	private refusedTransactionWrites: Map<string, TWalletWrite> = new Map();
+	private refusedTransactionWrites: Map<TWalletStorageKey, TWalletWrite> =
+		new Map();
 
 	/**
 	 * Saves the wallet data object to storage if able.
@@ -4019,7 +4112,7 @@ export class Wallet {
 	 */
 	private async saveWalletDataAt<K extends keyof IWalletData>(
 		key: TWalletDataKeys,
-		walletDataKey: string,
+		walletDataKey: TWalletStorageKey,
 		data: IWalletData[K]
 	): Promise<Result<string>> {
 		return this.queueWrite(key, walletDataKey, { data });
@@ -4063,7 +4156,7 @@ export class Wallet {
 	 */
 	private async queueWrite(
 		key: TWalletDataKeys,
-		walletDataKey: string,
+		walletDataKey: TWalletStorageKey,
 		write: TWalletWrite
 	): Promise<Result<string>> {
 		if (!this._setData) return ok('No setData method has been provided');
@@ -4122,7 +4215,7 @@ export class Wallet {
 	 */
 	private async writeWalletData(
 		key: TWalletDataKeys,
-		walletDataKey: string,
+		walletDataKey: TWalletStorageKey,
 		write: TWalletWrite
 	): Promise<Result<string>> {
 		let cause: string;
@@ -4139,7 +4232,10 @@ export class Wallet {
 			// clears it along with setData.
 			const res =
 				'changes' in write
-					? await this._setTransactionChanges!(walletDataKey, write.changes)
+					? await this._setTransactionChanges!(
+							walletDataKey as TWalletStorageKey<'transactions'>,
+							write.changes
+					  )
 					: await this._setData(walletDataKey, write.data);
 			// Adapters written in JS may resolve something that is not a
 			// Result at all; only an explicit Err counts as a failure.
@@ -4179,7 +4275,7 @@ export class Wallet {
 	 * @param {TWalletWrite} write
 	 */
 	private keepRefusedTransactions(
-		walletDataKey: string,
+		walletDataKey: TWalletStorageKey,
 		write: TWalletWrite
 	): void {
 		const waiting = this.waitingWrites.transactions?.find(
@@ -4194,24 +4290,6 @@ export class Wallet {
 			walletDataKey,
 			older ? mergeWrites(older, write) : write
 		);
-	}
-
-	//TODO: Implement this as a way to better update and save state so we can consolidate this.data[key] updates.
-	// @ts-ignore
-	private async updateAndSaveWalletData(
-		key: TWalletDataKeys,
-		data: IWalletData,
-		addressType?: EAddressType
-	): Promise<void> {
-		if (addressType) {
-			// @ts-ignore
-			this.data[key][addressType] = data;
-			await this.saveWalletData(key, this._data[key]);
-		} else {
-			// @ts-ignore
-			this.data[key] = data;
-			await this.saveWalletData(key, this._data[key]);
-		}
 	}
 
 	/**
@@ -4279,7 +4357,7 @@ export class Wallet {
 		let filteredTxHashes = [...byTxHash.values()];
 		if (!replaceStoredTransactions) {
 			filteredTxHashes = filteredTxHashes.filter((tx) => {
-				return !((this.data.transactions[tx.tx_hash]?.height ?? 0) >= 6);
+				return !((this._data.transactions[tx.tx_hash]?.height ?? 0) >= 6);
 			});
 		}
 		const getTransactionsResponse = await electrum.getTransactions({
@@ -4353,7 +4431,7 @@ export class Wallet {
 		const formattedTransactions: IFormattedTransactions = {};
 
 		let notificationTxid: string | undefined;
-		const storedTransactions = this.data.transactions;
+		const storedTransactions = this._data.transactions;
 		const confirmedTxs: TTransactionMessage[] = [];
 		const receivedTxs: TTransactionMessage[] = [];
 		const sentTxs: TTransactionMessage[] = [];
@@ -4425,9 +4503,9 @@ export class Wallet {
 			this.sendMessage('transactionSent', tx);
 		});
 
-		const addresses = this.data.addresses;
+		const addresses = this._data.addresses;
 		const utxoScriptHashes = new Set(
-			this.data.utxos.map((utxo) => utxo.scriptHash)
+			this._data.utxos.map((utxo) => utxo.scriptHash)
 		);
 		const outsideGapLimitAddresses: {
 			[key: string]: number[];
@@ -4441,7 +4519,7 @@ export class Wallet {
 					const address = addressData[tx.transaction.scriptHash];
 					const index = address.index;
 					const currentIndex =
-						this.data.addressIndex[addressType as EAddressType].index;
+						this._data.addressIndex[addressType as EAddressType].index;
 					const diff = getAddressIndexDiff(index, currentIndex);
 					if (diff > this.gapLimitOptions.lookBehind) {
 						outsideGapLimitAddresses[addressType] = [
@@ -4583,7 +4661,7 @@ export class Wallet {
 			);
 			// A header that lands while the lookup is in flight is newer than the
 			// answer, so the rule of issue #935 below judges by this one.
-			const tipBeforeLookup = this.data.header?.height ?? 0;
+			const tipBeforeLookup = this._data.header?.height ?? 0;
 			const txs = await this.electrum.getTransactions({
 				txHashes: tx_hashes
 			});
@@ -4595,7 +4673,7 @@ export class Wallet {
 			const outdatedTxs: IUtxo[] = []; //Transactions that have been pushed back into the mempool due to a reorg. We need to update the height.
 			const ghostTxs: string[] = []; //Transactions that have been removed from the mempool and are no longer in the blockchain.
 			const answered = new Set<string>();
-			const tipHeight = this.data.header?.height ?? 0;
+			const tipHeight = this._data.header?.height ?? 0;
 			txs.value.data.forEach((txData: ITransaction<IUtxo>) => {
 				answered.add(txData.data.tx_hash);
 				// The block this wallet last saw the transaction in, zero for none.
@@ -4604,7 +4682,7 @@ export class Wallet {
 				// observed here may already read zero (issue #870).
 				const oldHeight = Math.max(
 					oldUnconfirmedTxs[txData.data.tx_hash]?.height ?? 0,
-					this.data.transactions[txData.data.tx_hash]?.height ?? 0
+					this._data.transactions[txData.data.tx_hash]?.height ?? 0
 				);
 				// Check if the transaction has been removed from the mempool/still exists.
 				if (
@@ -4730,7 +4808,7 @@ export class Wallet {
 	 * @returns {Promise<Result<IFormattedTransactions>>}
 	 */
 	public getUnconfirmedTransactions(): IFormattedTransactions {
-		const currentWallet = this.data;
+		const currentWallet = this._data;
 		return currentWallet?.unconfirmedTransactions ?? {};
 	}
 
@@ -4749,7 +4827,7 @@ export class Wallet {
 		currentHeight?: number;
 	}): number {
 		if (!currentHeight) {
-			const header = this.data.header;
+			const header = this._data.header;
 			currentHeight = header.height;
 		}
 		if (confirmations > currentHeight) {
@@ -4824,7 +4902,7 @@ export class Wallet {
 			const electrum = this.electrum;
 			const switched =
 				'The wallet switched networks while the ghost transactions were removed.';
-			const transactions = this.data.transactions;
+			const transactions = this._data.transactions;
 			txIds.forEach((txId) => {
 				if (txId in transactions) {
 					transactions[txId]['exists'] = false;
@@ -4871,8 +4949,8 @@ export class Wallet {
 			// (issue #945). A refresh whose lookup went out before these
 			// clearings leaves them be (issue #964).
 			for (const txId of txIds) {
-				const live = this.data.unconfirmedTransactions[txId];
-				const record = this.data.transactions[txId];
+				const live = this._data.unconfirmedTransactions[txId];
+				const record = this._data.transactions[txId];
 				if (live && record && record.exists !== false) next[txId] = live;
 			}
 			this._data.unconfirmedTransactions = next;
@@ -5035,7 +5113,7 @@ export class Wallet {
 		txs: IUtxo[]
 	): Promise<Result<string>> {
 		const updated: string[] = [];
-		const transactions = this.data.transactions;
+		const transactions = this._data.transactions;
 		txs.forEach((tx) => {
 			const txId = tx.tx_hash;
 			if (txId in transactions) {
@@ -5085,7 +5163,7 @@ export class Wallet {
 			}
 
 			this._data.unconfirmedTransactions = {
-				...this.data.unconfirmedTransactions,
+				...this._data.unconfirmedTransactions,
 				...unconfirmedTransactions
 			};
 
@@ -5146,7 +5224,7 @@ export class Wallet {
 		if (transactions.length < 1) {
 			return ok({});
 		}
-		const currentWallet = this.data;
+		const currentWallet = this._data;
 
 		// Batch and pre-fetch input data.
 		const inputs: { tx_hash: string; vout: number }[] = [];
@@ -5601,7 +5679,7 @@ export class Wallet {
 	public async getChangeAddress(
 		addressType = this.addressType
 	): Promise<Result<IAddress>> {
-		const currentWallet = this.data;
+		const currentWallet = this._data;
 
 		const changeAddressIndexContent =
 			currentWallet.changeAddressIndex[addressType];
@@ -5707,6 +5785,7 @@ export class Wallet {
 	public async fetchFeeEstimatesFromHttp(
 		network = this._network
 	): Promise<IOnchainFees> {
+		if (this.remainOffline) return this.feeEstimates;
 		try {
 			let urlModifier = '';
 			if (network !== Network.bitcoin) {
@@ -5746,6 +5825,7 @@ export class Wallet {
 	public async fetchFallbackFeeEstimates(
 		network = this._network
 	): Promise<IOnchainFees> {
+		if (this.remainOffline) return this.feeEstimates;
 		try {
 			if (network !== Network.bitcoin) {
 				return defaultFeesShape;
@@ -5927,7 +6007,7 @@ export class Wallet {
 	}: Parameters<Wallet['sendMany']>[0]): Promise<Result<string>> {
 		if (this._multisig) return err(new MultisigSpendError());
 		if (this.isWatchOnly) return err(new WatchOnlySigningError());
-		if (!this.data.utxos.length) {
+		if (!this._data.utxos.length) {
 			return err('No UTXOs available.');
 		}
 		// The staged send is a per-call working area, held only in memory. It
@@ -6049,7 +6129,7 @@ export class Wallet {
 	}: Parameters<Wallet['sendMax']>[0] = {}): Promise<Result<string>> {
 		if (this._multisig) return err(new MultisigSpendError());
 		if (this.isWatchOnly) return err(new WatchOnlySigningError());
-		if (!this.data.utxos.length) {
+		if (!this._data.utxos.length) {
 			return err('No UTXOs available.');
 		}
 		// Same working-area rule as sendMany: empty on entry, readable until
@@ -6224,7 +6304,7 @@ export class Wallet {
 				}
 				sendTxs = [{ address, amount, message }];
 			}
-			if (!this.data.utxos.length) {
+			if (!this._data.utxos.length) {
 				return err('No UTXOs available.');
 			}
 			await this.resetSendTransaction();
@@ -6662,7 +6742,7 @@ export class Wallet {
 		if (witnessUtxo) {
 			records.push({ source: 'its witnessUtxo', ...witnessUtxo });
 		}
-		const utxo = this.data.utxos.find(
+		const utxo = this._data.utxos.find(
 			(u) => u.tx_hash.toLowerCase() === txid && u.tx_pos === index
 		);
 		if (utxo) {
@@ -6788,7 +6868,7 @@ export class Wallet {
 	 * @returns {Promise<Result<string>>}
 	 */
 	private async setZeroIndexAddresses(): Promise<Result<string>> {
-		const currentWallet = this.data;
+		const currentWallet = this._data;
 		// switchNetwork replaces the Electrum instance along with the data. An
 		// address derived before it is for the network the wallet left, and an
 		// index read before it is that network's, so neither is written into
@@ -6879,9 +6959,9 @@ export class Wallet {
 		// Ensure we have addresses to pull from.
 		let addresses = {};
 		if (indexToUpdate === 'addressIndex') {
-			addresses = this.data.addresses[addressType];
+			addresses = this._data.addresses[addressType];
 		} else {
-			addresses = this.data.changeAddresses[addressType];
+			addresses = this._data.changeAddresses[addressType];
 		}
 		if (!Object.keys(addresses).length) {
 			await this.addAddresses({
@@ -6905,7 +6985,7 @@ export class Wallet {
 	 */
 	public getAddressIndexInfo(): TAddressIndexInfo {
 		const addressType = this.addressType;
-		const currentWallet = this.data;
+		const currentWallet = this._data;
 		const addressIndex = currentWallet.addressIndex[addressType];
 		const changeAddressIndex = currentWallet.addressIndex[addressType];
 		const lastUsedAddressIndex =
@@ -6931,7 +7011,7 @@ export class Wallet {
 		addressType?: EAddressType;
 	}): Promise<Result<string>> => {
 		try {
-			const wallet = this.data;
+			const wallet = this._data;
 			const addressIndex = wallet.addressIndex;
 			if (addressIndex[addressType].address) {
 				const saved = await this.savedReceiveAddress(addressType);
@@ -7302,8 +7382,8 @@ export class Wallet {
 				// BIP 125: a replacement that does not pay more than the original
 				// is rejected by every node.
 				const original =
-					this.data.unconfirmedTransactions[txid] ??
-					this.data.transactions[txid];
+					this._data.unconfirmedTransactions[txid] ??
+					this._data.transactions[txid];
 				const originalFee = original ? btcToSats(original.fee) : 0;
 				if (fee <= originalFee) {
 					return err(
@@ -7376,7 +7456,7 @@ export class Wallet {
 		fee: number;
 	}): Promise<Result<IBoostedTransaction>> {
 		try {
-			const boostedTransactions = this.data.boostedTransactions;
+			const boostedTransactions = this._data.boostedTransactions;
 			const parentTransactions = this.getBoostedTransactionParents({
 				txid: oldTxId,
 				boostedTransactions
@@ -7392,7 +7472,7 @@ export class Wallet {
 				[oldTxId]: boostedTx
 			};
 			this._data.boostedTransactions = {
-				...this.data.boostedTransactions,
+				...this._data.boostedTransactions,
 				...boostedTransaction
 			};
 
@@ -7442,7 +7522,7 @@ export class Wallet {
 	 * @returns {IBoostedTransactions}
 	 */
 	getBoostedTransactions = (): IBoostedTransactions => {
-		return this.data.boostedTransactions;
+		return this._data.boostedTransactions;
 	};
 
 	/**
@@ -7463,7 +7543,7 @@ export class Wallet {
 	} {
 		const cpfp: IFormattedTransaction[] = [];
 		const rbf: IFormattedTransaction[] = [];
-		Object.values(this.data.unconfirmedTransactions).map((tx) => {
+		Object.values(this._data.unconfirmedTransactions).map((tx) => {
 			if (tx.rbf) rbf.push(tx);
 			cpfp.push(tx); // All unconfirmed transactions can be cpfp'd.
 		});
@@ -7785,7 +7865,7 @@ export class Wallet {
 			// setupTransaction only drops frozen coins it gathers itself, not an
 			// explicit utxos list.
 			const walletUtxos = this.transaction.removeBlackListedUtxos(
-				this.data.utxos
+				this._data.utxos
 			);
 			utxos = [...walletUtxos, ...utxos];
 		}
@@ -7841,7 +7921,7 @@ export class Wallet {
 		address: IAddress;
 		addressType: EAddressType;
 	}> {
-		const addresses = this.data.addresses;
+		const addresses = this._data.addresses;
 		let address: { address: IAddress; addressType: EAddressType } | undefined;
 		for (const addressType in addresses) {
 			if (scriptHash in addresses[addressType as EAddressType]) {

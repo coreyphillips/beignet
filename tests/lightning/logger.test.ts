@@ -30,7 +30,7 @@ import { Network } from '../../src/lightning/invoice/types';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Wallet } from '../../src/wallet';
-import { EAvailableNetworks, EProtocol } from '../../src/types';
+import { EAvailableNetworks } from '../../src/types';
 
 // ─────────────── Test doubles ───────────────
 
@@ -283,32 +283,17 @@ describe('LightningNode logger injection', () => {
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: these tests must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+// The wallets are created with remainOffline: these tests must work offline.
+const electrumOptions = { net, tls };
 
 describe('Wallet logger injection', function () {
 	this.timeout(30000);
 
-	// Every wallet below points at an unreachable Electrum. Without teardown the
-	// connection poll installed in the Electrum constructor keeps reconnecting
-	// for the rest of the mocha process, printing
-	// `OnError:Error: connect ECONNREFUSED 127.0.0.1:65529` from
-	// rn-electrum-client onto stdout long after this file is done, which also
-	// corrupts `--reporter json` output for every suite that follows.
-	//
-	// stop() rather than electrum.disconnect(): Wallet.create fires
-	// refreshWallet() without awaiting it, so disconnect() returns while that
-	// refresh is still in flight and its work leaks into whatever file the
-	// worker picks up next. stop() awaits the refresh first, then disconnects.
+	// Each wallet below is torn down with stop() rather than
+	// electrum.disconnect(): Wallet.create fires refreshWallet() without
+	// awaiting it, so disconnect() returns while that refresh is still in
+	// flight and its work leaks into whatever file the worker picks up next.
+	// stop() awaits the refresh first, then disconnects.
 	//
 	// Tracked in an array rather than torn down inline so a failed assertion
 	// still cleans up: a leaked wallet is exactly what pollutes the other files.
@@ -327,6 +312,7 @@ describe('Wallet logger injection', function () {
 			name: 'loggertest',
 			network: EAvailableNetworks.regtest,
 			electrumOptions,
+			remainOffline: true,
 			logger
 		});
 		if (res.isErr()) throw res.error;
@@ -340,7 +326,8 @@ describe('Wallet logger injection', function () {
 			mnemonic: MNEMONIC,
 			name: 'loggerdefault',
 			network: EAvailableNetworks.regtest,
-			electrumOptions
+			electrumOptions,
+			remainOffline: true
 		});
 		if (res.isErr()) throw res.error;
 		const wallet = res.value;

@@ -5,7 +5,7 @@
  * once and rebuilt only when a stored map is replaced. These cases check that
  * the answers are the ones the merges gave, over 2,000 addresses.
  *
- * Fully OFFLINE: the wallet points at an unreachable Electrum server and the
+ * Fully OFFLINE: the wallet never connects (remainOffline) and the
  * transaction lookups getRbfData makes are a fake.
  */
 
@@ -17,9 +17,9 @@ import * as bitcoin from 'bitcoinjs-lib';
 import {
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	IAddress,
 	IAddresses,
+	IWalletData,
 	ok,
 	Wallet
 } from '../src';
@@ -35,23 +35,14 @@ const RECIPIENT = bitcoin.payments.p2wpkh({
 }).address!;
 const PER_SIDE = 1000;
 
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 /** The linear scan getAddressFromScriptHash did before the index. */
-const scan = (wallet: Wallet, scriptHash: string): IAddress | undefined =>
-	[
-		...Object.values(wallet.data.addresses),
-		...Object.values(wallet.data.changeAddresses)
-	]
+const scan = (
+	data: Readonly<IWalletData>,
+	scriptHash: string
+): IAddress | undefined =>
+	[...Object.values(data.addresses), ...Object.values(data.changeAddresses)]
 		.flatMap((group: IAddresses) => Object.values(group))
 		.find((record) => record.scriptHash === scriptHash);
 
@@ -71,6 +62,7 @@ describe('Stored address lookups read one index (#1667)', function () {
 			network: EAvailableNetworks.regtest,
 			addressType: EAddressType.p2wpkh,
 			electrumOptions,
+			remainOffline: true,
 			disableRefreshOnCreate: true
 		});
 		if (res.isErr()) throw res.error;
@@ -85,8 +77,12 @@ describe('Stored address lookups read one index (#1667)', function () {
 			addressType: EAddressType.p2wpkh
 		});
 		if (gen.isErr()) throw gen.error;
-		wallet.data.addresses.p2wpkh = gen.value.addresses;
-		wallet.data.changeAddresses.p2wpkh = gen.value.changeAddresses;
+		const { addresses, changeAddresses } = wallet.data;
+		const stored = await wallet.updateData({
+			addresses: { ...addresses, p2wpkh: gen.value.addresses },
+			changeAddresses: { ...changeAddresses, p2wpkh: gen.value.changeAddresses }
+		});
+		if (stored.isErr()) throw stored.error;
 		const byIndex = (a: IAddress, b: IAddress): number => a.index - b.index;
 		receive = Object.values(gen.value.addresses).sort(byIndex);
 		change = Object.values(gen.value.changeAddresses).sort(byIndex);
@@ -103,10 +99,14 @@ describe('Stored address lookups read one index (#1667)', function () {
 		const built = internals(wallet)._addressLookup;
 		expect(built).to.not.equal(undefined);
 
+		// The wallet stores copies of the generated records and wallet.data
+		// copies them again, so records compare by value. One read serves the
+		// whole scan: each read copies all 2,000 addresses.
+		const data = wallet.data;
 		for (const record of [...receive, ...change]) {
 			const found = wallet.getAddressFromScriptHash(record.scriptHash);
-			expect(found).to.equal(record);
-			expect(found).to.equal(scan(wallet, record.scriptHash));
+			expect(found).to.deep.equal(record);
+			expect(found).to.deep.equal(scan(data, record.scriptHash));
 		}
 		expect(wallet.getAddressFromScriptHash('00'.repeat(32))).to.equal(
 			undefined
@@ -124,6 +124,12 @@ describe('Stored address lookups read one index (#1667)', function () {
 
 	it('follows a stored map that is replaced', async () => {
 		const original = wallet.data.addresses.p2tr;
+		const storeP2tr = async (p2tr: IAddresses): Promise<void> => {
+			const res = await wallet.updateData({
+				addresses: { ...wallet.data.addresses, p2tr }
+			});
+			if (res.isErr()) throw res.error;
+		};
 		try {
 			const gen = await wallet.generateAddresses({
 				addressAmount: 1,
@@ -137,15 +143,17 @@ describe('Stored address lookups read one index (#1667)', function () {
 				undefined
 			);
 
-			wallet.data.addresses.p2tr = { ...original, ...gen.value.addresses };
-			expect(wallet.getAddressFromScriptHash(added.scriptHash)).to.equal(added);
+			await storeP2tr({ ...original, ...gen.value.addresses });
+			expect(wallet.getAddressFromScriptHash(added.scriptHash)).to.deep.equal(
+				added
+			);
 
-			wallet.data.addresses.p2tr = {};
+			await storeP2tr({});
 			expect(wallet.getAddressFromScriptHash(added.scriptHash)).to.equal(
 				undefined
 			);
 		} finally {
-			wallet.data.addresses.p2tr = original;
+			await storeP2tr(original);
 		}
 	});
 

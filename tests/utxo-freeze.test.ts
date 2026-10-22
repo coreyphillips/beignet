@@ -1,6 +1,6 @@
 /**
- * UTXO freeze/unfreeze tests. Fully OFFLINE: wallets point at an unreachable
- * Electrum port; UTXOs are injected directly into wallet data (signing only
+ * UTXO freeze/unfreeze tests. Fully OFFLINE: wallets are created with
+ * remainOffline; UTXOs are injected directly into wallet data (signing only
  * needs the derivation path), and nothing is broadcast (broadcast: false).
  */
 
@@ -15,30 +15,19 @@ import {
 	decodeRawTransaction,
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	IUtxo,
-	IWalletData,
+	IWalletStorage,
 	Result,
-	TStorage,
 	Wallet,
-	err,
-	ok
+	createMemoryStorage,
+	err
 } from '../src';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: these tests must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+// Wallets are created with remainOffline: these tests must work offline.
+const electrumOptions = { net, tls };
 
 const network = EAvailableNetworks.regtest;
 const testTimeout = 60000;
@@ -46,25 +35,12 @@ const testTimeout = 60000;
 const TXID_A = '11'.repeat(32);
 const TXID_B = '22'.repeat(32);
 
-const makeStorage = (): { store: Map<string, unknown>; storage: TStorage } => {
-	const store = new Map<string, unknown>();
-	return {
-		store,
-		storage: {
-			getData: async <K extends keyof IWalletData>(
-				key: string
-			): Promise<Result<IWalletData[K]>> => {
-				return ok(store.get(key) as IWalletData[K]);
-			},
-			setData: async <K extends keyof IWalletData>(
-				key: string,
-				value: IWalletData[K]
-			): Promise<Result<boolean>> => {
-				store.set(key, value);
-				return ok(true);
-			}
-		}
-	};
+const makeStorage = (): {
+	store: Map<string, string>;
+	storage: IWalletStorage;
+} => {
+	const store = new Map<string, string>();
+	return { store, storage: createMemoryStorage(store) };
 };
 
 /**
@@ -72,43 +48,36 @@ const makeStorage = (): { store: Map<string, unknown>; storage: TStorage } => {
  * resolved Err (what createWalletStorage produces) or as a rejection.
  */
 const makeFailableStorage = (): {
-	store: Map<string, unknown>;
-	storage: TStorage;
+	store: Map<string, string>;
+	storage: IWalletStorage;
 	fail: { on: boolean; reject: boolean };
 } => {
-	const store = new Map<string, unknown>();
+	const store = new Map<string, string>();
 	const fail = { on: false, reject: false };
+	const memory = createMemoryStorage(store);
 	return {
 		store,
 		fail,
 		storage: {
-			getData: async <K extends keyof IWalletData>(
-				key: string
-			): Promise<Result<IWalletData[K]>> => {
-				return ok(store.get(key) as IWalletData[K]);
-			},
-			setData: async <K extends keyof IWalletData>(
-				key: string,
-				value: IWalletData[K]
-			): Promise<Result<boolean>> => {
+			...memory,
+			setData: async (key, value): Promise<Result<boolean>> => {
 				if (fail.on && key.endsWith('blacklistedUtxos')) {
 					if (fail.reject) throw new Error('storage is down');
 					return err('storage is down');
 				}
-				store.set(key, value);
-				return ok(true);
+				return memory.setData(key, value);
 			}
 		}
 	};
 };
 
 /** Fabricates a UTXO paying to one of the wallet's own derived addresses. */
-const injectUtxo = (
+const injectUtxo = async (
 	wallet: Wallet,
 	txid: string,
 	value: number,
 	addressIndex = 0
-): IUtxo => {
+): Promise<IUtxo> => {
 	const source =
 		addressIndex === 0
 			? wallet.data.addressIndex[EAddressType.p2wpkh]
@@ -127,8 +96,11 @@ const injectUtxo = (
 		value,
 		publicKey: source.publicKey
 	};
-	wallet.data.utxos.push(utxo);
-	wallet.data.balance += value;
+	const res = await wallet.updateData({
+		utxos: [...wallet.data.utxos, utxo],
+		balance: wallet.data.balance + value
+	});
+	if (res.isErr()) throw res.error;
 	return utxo;
 };
 
@@ -143,8 +115,8 @@ describe('UTXO freeze/unfreeze', function () {
 	this.timeout(testTimeout);
 
 	let wallet: Wallet;
-	let store: Map<string, unknown>;
-	let storage: TStorage;
+	let store: Map<string, string>;
+	let storage: IWalletStorage;
 	let utxoA: IUtxo;
 	let utxoB: IUtxo;
 
@@ -155,14 +127,15 @@ describe('UTXO freeze/unfreeze', function () {
 			name: 'freezetest',
 			network,
 			storage,
-			electrumOptions
+			electrumOptions,
+			remainOffline: true
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
 		// The failed (offline) refresh still generates index-0 addresses.
 		await wallet.refreshWallet({});
-		utxoA = injectUtxo(wallet, TXID_A, 60000);
-		utxoB = injectUtxo(wallet, TXID_B, 40000, 1);
+		utxoA = await injectUtxo(wallet, TXID_A, 60000);
+		utxoB = await injectUtxo(wallet, TXID_B, 40000, 1);
 	});
 
 	after(async function () {
@@ -259,7 +232,10 @@ describe('UTXO freeze/unfreeze', function () {
 
 	it('estimates the max send from the coins sendMax can spend (#1365)', async () => {
 		// Electrum's balance also counts dust that refresh keeps out of the set.
-		wallet.data.balance += 500;
+		const dust = await wallet.updateData({
+			balance: wallet.data.balance + 500
+		});
+		if (dust.isErr()) throw dust.error;
 		try {
 			const estimate = wallet.transaction.estimateTransactionCosts({
 				customFeeRate: 2
@@ -281,7 +257,7 @@ describe('UTXO freeze/unfreeze', function () {
 			);
 			expect(estimate.value.amount).to.equal(outputTotal);
 		} finally {
-			wallet.data.balance -= 500;
+			await wallet.updateData({ balance: wallet.data.balance - 500 });
 			await wallet.resetSendTransaction();
 		}
 	});
@@ -305,7 +281,8 @@ describe('UTXO freeze/unfreeze', function () {
 			name: 'freezetest',
 			network,
 			storage,
-			electrumOptions
+			electrumOptions,
+			remainOffline: true
 		});
 		if (res.isErr()) throw res.error;
 		const reloaded = res.value;
@@ -927,8 +904,8 @@ describe('UTXO freeze durability', function () {
 	this.timeout(testTimeout);
 
 	let wallet: Wallet;
-	let store: Map<string, unknown>;
-	let storage: TStorage;
+	let store: Map<string, string>;
+	let storage: IWalletStorage;
 	let fail: { on: boolean; reject: boolean };
 	let utxo: IUtxo;
 
@@ -939,12 +916,13 @@ describe('UTXO freeze durability', function () {
 			name: 'freezedurability',
 			network,
 			storage,
-			electrumOptions
+			electrumOptions,
+			remainOffline: true
 		});
 		if (res.isErr()) throw res.error;
 		wallet = res.value;
 		await wallet.refreshWallet({});
-		utxo = injectUtxo(wallet, TXID_A, 60000);
+		utxo = await injectUtxo(wallet, TXID_A, 60000);
 	});
 
 	afterEach(async function () {
@@ -1023,9 +1001,9 @@ describe('UTXO freeze durability', function () {
 		expect(res.isErr()).to.equal(true);
 		expect(wallet.isUtxoFrozen(utxo.tx_hash, utxo.tx_pos)).to.equal(true);
 		// The persisted blacklist still holds it, so memory must agree.
-		const persisted = store.get(
-			'freezedurability-regtest-blacklistedUtxos'
-		) as IUtxo[];
+		const persisted: IUtxo[] = JSON.parse(
+			store.get('freezedurability-regtest-blacklistedUtxos')!
+		);
 		expect(persisted).to.have.length(1);
 		expect(persisted[0].tx_hash).to.equal(utxo.tx_hash);
 	});
@@ -1057,9 +1035,9 @@ describe('UTXO freeze durability', function () {
 		expect(first.isErr()).to.equal(false);
 		expect(second.isErr()).to.equal(false);
 		expect(wallet.listFrozenUtxos()).to.have.length(1);
-		const persisted = store.get(
-			'freezedurability-regtest-blacklistedUtxos'
-		) as IUtxo[];
+		const persisted: IUtxo[] = JSON.parse(
+			store.get('freezedurability-regtest-blacklistedUtxos')!
+		);
 		expect(persisted).to.have.length(1);
 	});
 
@@ -1100,9 +1078,9 @@ describe('UTXO freeze durability', function () {
 		expect(frozen).to.have.length(1);
 		expect(frozen[0].freezeTag).to.equal(undefined);
 		expect(frozen[0].frozenAt).to.equal(undefined);
-		const persisted = store.get(
-			'freezedurability-regtest-blacklistedUtxos'
-		) as IUtxo[];
+		const persisted: IUtxo[] = JSON.parse(
+			store.get('freezedurability-regtest-blacklistedUtxos')!
+		);
 		expect(persisted).to.have.length(1);
 		expect(persisted[0].freezeTag).to.equal(undefined);
 	});

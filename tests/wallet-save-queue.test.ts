@@ -13,9 +13,9 @@
  * last. Each write also removed the queue entry when it finished, even when a
  * newer write had replaced it, so the next caller skipped the queue entirely.
  *
- * Fully OFFLINE: the wallet points at an unreachable Electrum port, never
- * refreshes, and writes to the balance key go to a storage double the test
- * finishes by hand.
+ * Fully OFFLINE: the wallet never connects (remainOffline), never refreshes,
+ * and writes to the balance key go to a storage double the test finishes by
+ * hand.
  */
 
 import { expect } from 'chai';
@@ -24,13 +24,13 @@ import sinon from 'sinon';
 import tls from 'tls';
 
 import {
+	createMemoryStorage,
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	IAddress,
 	IWalletData,
+	IWalletStorage,
 	Result,
-	TStorage,
 	Wallet,
 	err,
 	getWalletDataStorageKey,
@@ -41,17 +41,8 @@ import { GAP_LIMIT, GAP_LIMIT_CHANGE } from '../src/wallet/constants';
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: these tests must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65526,
-		tcp: 65526,
-		protocol: EProtocol.tcp
-	}
-};
+// No servers: the wallets are created with remainOffline.
+const electrumOptions = { net, tls };
 
 const NAME = 'savequeue';
 const BALANCE_KEY = `${NAME}-regtest-balance`;
@@ -67,7 +58,7 @@ type TPendingWrite = { value: unknown; land: () => void };
  */
 const makeStorage = (): {
 	store: Map<string, unknown>;
-	storage: TStorage;
+	storage: IWalletStorage;
 	writes: TPendingWrite[];
 	landed: unknown[];
 	control: { defer: boolean; throwSync: boolean };
@@ -76,7 +67,7 @@ const makeStorage = (): {
 	const writes: TPendingWrite[] = [];
 	const landed: unknown[] = [];
 	const control = { defer: false, throwSync: false };
-	const storage: TStorage = {
+	const storage: IWalletStorage = {
 		getData: async <K extends keyof IWalletData>(
 			key: string
 		): Promise<Result<IWalletData[K]>> => ok(store.get(key) as IWalletData[K]),
@@ -170,7 +161,7 @@ describe('Wallet storage writes (#946)', function () {
 	let control: { defer: boolean; throwSync: boolean };
 
 	beforeEach(async function () {
-		let storage: TStorage;
+		let storage: IWalletStorage;
 		({ store, storage, writes, landed, control } = makeStorage());
 		const res = await Wallet.create({
 			mnemonic: MNEMONIC,
@@ -178,6 +169,7 @@ describe('Wallet storage writes (#946)', function () {
 			network: EAvailableNetworks.regtest,
 			storage,
 			electrumOptions,
+			remainOffline: true,
 			disableRefreshOnCreate: true
 		});
 		if (res.isErr()) throw res.error;
@@ -539,7 +531,7 @@ describe('Wallet address map writes on refresh (#1655)', function () {
 	);
 
 	let wallet: Wallet;
-	let store: Map<string, unknown>;
+	let store: Map<string, string>;
 	let mapWrites: string[];
 	let failAddressWrites: boolean;
 	const used = new Set<string>();
@@ -568,7 +560,12 @@ describe('Wallet address map writes on refresh (#1655)', function () {
 
 	const storedIndexes = (key: string, type: EAddressType): number[] =>
 		Object.values(
-			(store.get(key) as Record<EAddressType, Record<string, IAddress>>)[type]
+			(
+				JSON.parse(store.get(key)!) as Record<
+					EAddressType,
+					Record<string, IAddress>
+				>
+			)[type]
 		).map((a) => a.index);
 
 	beforeEach(async function () {
@@ -576,25 +573,17 @@ describe('Wallet address map writes on refresh (#1655)', function () {
 		mapWrites = [];
 		failAddressWrites = false;
 		used.clear();
-		const storage: TStorage = {
-			getData: async <K extends keyof IWalletData>(
-				key: string
-			): Promise<Result<IWalletData[K]>> =>
-				ok(store.get(key) as IWalletData[K]),
-			setData: async <K extends keyof IWalletData>(
-				key: string,
-				value: IWalletData[K]
-			): Promise<Result<boolean>> => {
+		const memory = createMemoryStorage(store);
+		const storage: IWalletStorage = {
+			getData: memory.getData,
+			setData: async (key, value) => {
 				if (key === addressesKey || key === changeAddressesKey) {
 					mapWrites.push(key);
 				}
 				if (key === addressesKey && failAddressWrites) {
 					return err('storage is full');
 				}
-				// A copy, so the store shows what was written rather than the
-				// wallet's live map.
-				store.set(key, JSON.parse(JSON.stringify(value)));
-				return ok(true);
+				return memory.setData(key, value);
 			}
 		};
 		const res = await Wallet.create({
@@ -603,6 +592,7 @@ describe('Wallet address map writes on refresh (#1655)', function () {
 			network: EAvailableNetworks.regtest,
 			storage,
 			electrumOptions,
+			remainOffline: true,
 			disableRefreshOnCreate: true
 		});
 		if (res.isErr()) throw res.error;

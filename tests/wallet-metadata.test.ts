@@ -1,7 +1,6 @@
 /**
- * Per-address label and wallet birthday tests. Fully OFFLINE: wallets point
- * at an unreachable Electrum port; labels and the birthday are pure wallet
- * data.
+ * Per-address label and wallet birthday tests. Fully OFFLINE: wallets never
+ * connect (remainOffline); labels and the birthday are pure wallet data.
  *
  * Birthday honesty note: the Electrum protocol addresses history by
  * scripthash with no height filter, so birthdayHeight cannot bound Electrum
@@ -15,56 +14,22 @@ import tls from 'tls';
 
 import {
 	EAvailableNetworks,
-	EProtocol,
-	IWalletData,
-	Result,
-	TStorage,
+	IWalletStorage,
 	Wallet,
-	ok
+	createMemoryStorage
 } from '../src';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: these tests must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 const network = EAvailableNetworks.regtest;
 const testTimeout = 60000;
 const VALID_ADDRESS = 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk';
 
-const makeStorage = (): { store: Map<string, unknown>; storage: TStorage } => {
-	const store = new Map<string, unknown>();
-	return {
-		store,
-		storage: {
-			getData: async <K extends keyof IWalletData>(
-				key: string
-			): Promise<Result<IWalletData[K]>> => {
-				return ok(store.get(key) as IWalletData[K]);
-			},
-			setData: async <K extends keyof IWalletData>(
-				key: string,
-				value: IWalletData[K]
-			): Promise<Result<boolean>> => {
-				store.set(key, value);
-				return ok(true);
-			}
-		}
-	};
-};
-
 const createWallet = async (
-	storage: TStorage,
+	storage: IWalletStorage,
 	name: string,
 	birthdayHeight?: number
 ): Promise<Wallet> => {
@@ -74,6 +39,7 @@ const createWallet = async (
 		network,
 		storage,
 		electrumOptions,
+		remainOffline: true,
 		...(birthdayHeight !== undefined ? { birthdayHeight } : {})
 	});
 	if (res.isErr()) throw res.error;
@@ -84,11 +50,12 @@ describe('Per-address labels', function () {
 	this.timeout(testTimeout);
 
 	let wallet: Wallet;
-	let store: Map<string, unknown>;
-	let storage: TStorage;
+	let store: Map<string, string>;
+	let storage: IWalletStorage;
 
 	before(async function () {
-		({ store, storage } = makeStorage());
+		store = new Map();
+		storage = createMemoryStorage(store);
 		wallet = await createWallet(storage, 'labeltest');
 	});
 
@@ -151,11 +118,12 @@ describe('Wallet birthday height', function () {
 	this.timeout(testTimeout);
 
 	const wallets: Wallet[] = [];
-	let store: Map<string, unknown>;
-	let storage: TStorage;
+	let store: Map<string, string>;
+	let storage: IWalletStorage;
 
 	before(function () {
-		({ store, storage } = makeStorage());
+		store = new Map();
+		storage = createMemoryStorage(store);
 	});
 
 	after(async function () {
@@ -173,8 +141,9 @@ describe('Wallet birthday height', function () {
 			mnemonic: MNEMONIC,
 			name: 'badbday',
 			network,
-			storage: makeStorage().storage,
+			storage: createMemoryStorage(),
 			electrumOptions,
+			remainOffline: true,
 			birthdayHeight: -5
 		});
 		expect(res.isErr()).to.equal(true);
@@ -184,7 +153,9 @@ describe('Wallet birthday height', function () {
 		const w = await createWallet(storage, 'bday', 800000);
 		wallets.push(w);
 		expect(w.birthdayHeight).to.equal(800000);
-		expect(store.get('bday-regtest-birthdayHeight')).to.equal(800000);
+		expect(JSON.parse(store.get('bday-regtest-birthdayHeight')!)).to.equal(
+			800000
+		);
 	});
 
 	it('persists across reloads without the option', async () => {
@@ -203,7 +174,9 @@ describe('Wallet birthday height', function () {
 		const w = await createWallet(storage, 'bday', 700000);
 		wallets.push(w);
 		expect(w.birthdayHeight).to.equal(700000);
-		expect(store.get('bday-regtest-birthdayHeight')).to.equal(700000);
+		expect(JSON.parse(store.get('bday-regtest-birthdayHeight')!)).to.equal(
+			700000
+		);
 	});
 
 	it('is included in the descriptor export when set', async () => {

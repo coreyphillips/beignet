@@ -23,7 +23,8 @@ import { EAddressType, EAvailableNetworks, EProtocol, Wallet } from '../src';
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
+// Unreachable on purpose: this test must work offline. Not remainOffline,
+// which would refuse the real getUtxos these cases drive.
 const electrumOptions = {
 	net,
 	tls,
@@ -63,8 +64,17 @@ describe('getUtxos address-type scan', function () {
 				addressType
 			});
 			if (gen.isErr()) throw gen.error;
-			wallet.data.addresses[addressType] = gen.value.addresses;
-			wallet.data.changeAddresses[addressType] = gen.value.changeAddresses;
+			const set = await wallet.updateData({
+				addresses: {
+					...wallet.data.addresses,
+					[addressType]: gen.value.addresses
+				},
+				changeAddresses: {
+					...wallet.data.changeAddresses,
+					[addressType]: gen.value.changeAddresses
+				}
+			});
+			if (set.isErr()) throw set.error;
 			expect(
 				Object.keys(wallet.data.addresses[addressType]).length,
 				`${addressType} addresses were generated`
@@ -85,8 +95,14 @@ describe('getUtxos address-type scan', function () {
 
 		// p2sh sits between p2wpkh and p2tr in the monitor list. Empty it, as it
 		// would be on a wallet that never generated addresses of that type.
-		wallet.data.addresses[EAddressType.p2sh] = {};
-		wallet.data.changeAddresses[EAddressType.p2sh] = {};
+		const emptied = await wallet.updateData({
+			addresses: { ...wallet.data.addresses, [EAddressType.p2sh]: {} },
+			changeAddresses: {
+				...wallet.data.changeAddresses,
+				[EAddressType.p2sh]: {}
+			}
+		});
+		if (emptied.isErr()) throw emptied.error;
 
 		const p2trAddresses = Object.values(
 			wallet.data.addresses[EAddressType.p2tr]
@@ -149,7 +165,10 @@ describe('getUtxos address-type scan', function () {
 		// getChangeAddress generates with `addressAmount: 0`, so this state is
 		// reachable through the public API: change addresses with no receiving
 		// addresses. Keying the skip on the receiving side alone dropped them.
-		wallet.data.addresses[EAddressType.p2sh] = {};
+		const emptied = await wallet.updateData({
+			addresses: { ...wallet.data.addresses, [EAddressType.p2sh]: {} }
+		});
+		if (emptied.isErr()) throw emptied.error;
 		const p2shChange = Object.values(
 			wallet.data.changeAddresses[EAddressType.p2sh]
 		);

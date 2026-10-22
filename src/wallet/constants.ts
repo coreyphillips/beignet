@@ -55,5 +55,3 @@ export const TRANSACTION_DEFAULTS = {
 	dustLimit: 546, // Minimum value in sats for an output. Outputs below the dust limit may not be processed because the fees required to include them in a block would be greater than the value of the transaction itself.
 	incrementalRelayFee: 1 // (sats/vbyte) What a replacement must pay for its own size on top of the fee it replaces (BIP 125 rule 4).
 };
-
-export const BLOCKTANK_HOST = 'https://api.stag.blocktank.to';

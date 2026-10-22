@@ -5,8 +5,8 @@
  * transaction it rebuilds. Both now fetch every distinct parent in one
  * batched lookup, and the bytes built from them are unchanged.
  *
- * Fully OFFLINE: the wallet points at an unreachable Electrum server, UTXOs
- * are fabricated and the previous-transaction fetch is a counting fake.
+ * Fully OFFLINE: the wallet is created with remainOffline, UTXOs are
+ * fabricated and the previous-transaction fetch is a counting fake.
  */
 
 import { expect } from 'chai';
@@ -16,14 +16,7 @@ import { createHash } from 'crypto';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import * as bitcoin from 'bitcoinjs-lib';
 
-import {
-	EAddressType,
-	EAvailableNetworks,
-	EProtocol,
-	IUtxo,
-	ok,
-	Wallet
-} from '../src';
+import { EAddressType, EAvailableNetworks, IUtxo, ok, Wallet } from '../src';
 import { ITxHash } from '../src/types/wallet';
 
 bitcoin.initEccLib(ecc);
@@ -45,16 +38,7 @@ const P2PKH_SIGNED_HEX_SHA256 =
 const P2WPKH_UNSIGNED_PSBT_SHA256 =
 	'9120151897537c9a49df6895915ecfab56225862289c4bb2e4c3376a7c48beae';
 
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 const sha256 = (data: string | Buffer): string =>
 	createHash('sha256').update(data).digest('hex');
@@ -74,6 +58,7 @@ describe('Previous transactions fetched in one batch (#1659)', function () {
 			network,
 			addressType,
 			electrumOptions,
+			remainOffline: true,
 			name: `prevtxbatch${addressType}`
 		});
 		if (res.isErr()) throw res.error;
@@ -89,15 +74,15 @@ describe('Previous transactions fetched in one batch (#1659)', function () {
 	 * getTransactions answers any of them, plus the verbose results `extra`
 	 * builds from the coins, and records every request it receives.
 	 */
-	const fund = (
+	const fund = async (
 		wallet: Wallet,
 		addressType: EAddressType,
 		extra: (utxos: IUtxo[]) => Record<string, unknown> = () => ({})
-	): {
+	): Promise<{
 		parents: bitcoin.Transaction[];
 		utxos: IUtxo[];
 		requests: string[][];
-	} => {
+	}> => {
 		const source = wallet.data.addressIndex[addressType];
 		const script = bitcoin.address.toOutputScript(source.address, regtest);
 		const parents = Array.from({ length: PARENTS }, (_, p) => {
@@ -121,7 +106,8 @@ describe('Previous transactions fetched in one batch (#1659)', function () {
 				publicKey: source.publicKey
 			}))
 		);
-		wallet.data.utxos = utxos;
+		const funded = await wallet.updateData({ utxos });
+		if (funded.isErr()) throw funded.error;
 
 		const verbose = (parent: bitcoin.Transaction): Record<string, unknown> => ({
 			txid: parent.getId(),
@@ -179,7 +165,7 @@ describe('Previous transactions fetched in one batch (#1659)', function () {
 
 	it('signs 30 legacy inputs from 3 parents after one lookup of the 3', async () => {
 		const wallet = await createWallet(EAddressType.p2pkh);
-		const { parents, utxos, requests } = fund(wallet, EAddressType.p2pkh);
+		const { parents, utxos, requests } = await fund(wallet, EAddressType.p2pkh);
 		await stage(wallet, utxos);
 
 		const res = await wallet.transaction.createTransaction({
@@ -196,7 +182,10 @@ describe('Previous transactions fetched in one batch (#1659)', function () {
 
 	it('attaches every segwit nonWitnessUtxo from one lookup of the 3', async () => {
 		const wallet = await createWallet(EAddressType.p2wpkh);
-		const { parents, utxos, requests } = fund(wallet, EAddressType.p2wpkh);
+		const { parents, utxos, requests } = await fund(
+			wallet,
+			EAddressType.p2wpkh
+		);
 		await stage(wallet, utxos);
 
 		const res = await wallet.transaction.createUnsignedPsbt({
@@ -219,7 +208,7 @@ describe('Previous transactions fetched in one batch (#1659)', function () {
 		const wallet = await createWallet(EAddressType.p2wpkh);
 		const replacedTxid = 'bb'.repeat(32);
 		const change = wallet.data.changeAddressIndex[EAddressType.p2wpkh].address;
-		const { parents, utxos, requests } = fund(
+		const { parents, utxos, requests } = await fund(
 			wallet,
 			EAddressType.p2wpkh,
 			(coins) => ({

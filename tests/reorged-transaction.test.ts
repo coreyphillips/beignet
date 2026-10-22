@@ -11,9 +11,10 @@
  * triggered cleared the confirmation timestamp but not the height every
  * consumer reads.
  *
- * Fully OFFLINE: the wallet points at an unreachable port and the two Electrum
- * calls the check makes are stubbed, so this asserts on what the wallet does
- * with each answer a server can give for a reorg'd out transaction.
+ * Fully OFFLINE: the wallet never connects (remainOffline) and the two
+ * Electrum calls the check makes are stubbed, so this asserts on what the
+ * wallet does with each answer a server can give for a reorg'd out
+ * transaction.
  *
  * The batched lookup case covers issue #872: a batched lookup that fails is
  * not an answer either, and dropping it stopped the monitoring that finds a
@@ -39,6 +40,7 @@ import sinon from 'sinon';
 const electrumHelpers = require('rn-electrum-client/helpers');
 
 import {
+	createMemoryStorage,
 	EAddressType,
 	EAvailableNetworks,
 	EPaymentType,
@@ -51,26 +53,30 @@ import {
 	ITxHash,
 	IUtxo,
 	IWalletData,
+	IWalletStorage,
 	ok,
 	Result,
 	TMessageDataMap,
-	TStorage,
+	TServer,
 	Wallet
 } from '../src';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
+// No servers: the wallets are created with remainOffline, all but the one
+// UNREACHABLE is for.
+const electrumOptions = { net, tls };
+
+/**
+ * Unreachable on purpose, for the one case whose batch has to fail inside
+ * Electrum's own lookup: remainOffline refuses before rn-electrum-client.
+ */
+const UNREACHABLE: TServer = {
+	host: '127.0.0.1',
+	ssl: 65529,
+	tcp: 65529,
+	protocol: EProtocol.tcp
 };
 
 const TXID = 'aab863ee62fa1d2b5c8b2f4b2b6c4d8e1f3a5c7e9b1d3f5a7c9e1b3d5f7a9c1e';
@@ -198,44 +204,67 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 	this.timeout(60000);
 
 	let wallet: Wallet;
-	/** Everything handed to storage, deep copied: what a restart would read. */
-	let saved: Record<string, unknown>;
+	/** Everything handed to storage, as JSON: what a restart would read. */
+	let saved: Map<string, string>;
 	let messages: Array<{ key: keyof TMessageDataMap; data: unknown }>;
 
-	/** A wallet writing to `saved` and reporting to `messages`. */
-	const openWallet = async (): Promise<Wallet> => {
+	/**
+	 * A wallet writing to `saved` and reporting to `messages`. It never
+	 * connects, unless given a server to try.
+	 */
+	const openWallet = async (server?: TServer): Promise<Wallet> => {
 		const res = await Wallet.create({
 			mnemonic: MNEMONIC,
 			network: EAvailableNetworks.regtest,
 			addressType: EAddressType.p2wpkh,
-			electrumOptions,
+			electrumOptions: server
+				? { ...electrumOptions, servers: server }
+				: electrumOptions,
+			remainOffline: !server,
 			// This suite drives the check itself; nothing may scan behind it.
 			disableRefreshOnCreate: true,
 			onMessage: (key, data): void => {
 				messages.push({ key, data });
 			},
-			storage: {
-				setData: async <K extends keyof IWalletData>(
-					key: string,
-					value: IWalletData[K]
-				) => {
-					saved[key] = JSON.parse(JSON.stringify(value));
-					return ok(true);
-				}
-			}
+			// Writes only, so a wallet opened here starts from what its case
+			// sets. Without setTransactionChanges every write of the transaction
+			// map goes through saveWalletData, which one case stubs to land a
+			// refresh beside it.
+			storage: { setData: createMemoryStorage(saved).setData }
 		});
 		if (res.isErr()) throw res.error;
 		return res.value;
 	};
 
+	/**
+	 * Sets the stored record of the transaction under test, and the copy under
+	 * observation, as a refresh that found it would have.
+	 */
+	const setRecord = async (record: IFormattedTransaction): Promise<void> => {
+		const res = await wallet.updateData({
+			transactions: { ...wallet.data.transactions, [TXID]: record },
+			unconfirmedTransactions: {
+				...wallet.data.unconfirmedTransactions,
+				[TXID]: record
+			}
+		});
+		if (res.isErr()) throw res.error;
+	};
+
+	/** The tip every case starts at, over a receive confirmed in a lost block. */
+	const seedReorged = async (): Promise<void> => {
+		const res = await wallet.updateData({
+			header: { height: TIP, hash: '', hex: '' }
+		});
+		if (res.isErr()) throw res.error;
+		await setRecord(confirmedRecord(REORGED_HEIGHT));
+	};
+
 	beforeEach(async function () {
-		saved = {};
+		saved = new Map();
 		messages = [];
 		wallet = await openWallet();
-
-		wallet.data.header = { height: TIP, hash: '', hex: '' };
-		wallet.data.transactions[TXID] = confirmedRecord(REORGED_HEIGHT);
-		wallet.data.unconfirmedTransactions[TXID] = confirmedRecord(REORGED_HEIGHT);
+		await seedReorged();
 	});
 
 	afterEach(async function () {
@@ -245,16 +274,19 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		await wallet?.stop();
 	});
 
+	/** A field as it was last written to storage. */
+	const savedValue = (key: keyof IWalletData): unknown => {
+		const json = saved.get(wallet.getWalletDataKey(key));
+		return json === undefined ? undefined : JSON.parse(json);
+	};
+
 	/** The stored transactions as they were last written to storage. */
 	const savedTransactions = (): Record<string, IFormattedTransaction> =>
-		saved[wallet.getWalletDataKey('transactions')] as Record<
-			string,
-			IFormattedTransaction
-		>;
+		savedValue('transactions') as Record<string, IFormattedTransaction>;
 
 	/** The transactions still under observation, as last written to storage. */
 	const savedUnconfirmed = (): Record<string, IFormattedTransaction> =>
-		saved[wallet.getWalletDataKey('unconfirmedTransactions')] as Record<
+		savedValue('unconfirmedTransactions') as Record<
 			string,
 			IFormattedTransaction
 		>;
@@ -377,8 +409,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 	});
 
 	it('does not read a transaction still in the mempool as reorged', async function () {
-		wallet.data.transactions[TXID] = confirmedRecord(0);
-		wallet.data.unconfirmedTransactions[TXID] = confirmedRecord(0);
+		await setRecord(confirmedRecord(0));
 		answerWith(txAnswer(0));
 
 		await wallet.checkUnconfirmedTransactions();
@@ -393,6 +424,11 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		// Lookups go out in batches and a batch that fails is dropped from the
 		// response, which still reports success. Nothing comes back for this
 		// hash, so the reconciliation has to notice the silence for itself.
+		// Electrum's own lookup drops the batch, and an offline wallet refuses
+		// before it, so this case runs on a wallet with a server to try.
+		await wallet.stop();
+		wallet = await openWallet(UNREACHABLE);
+		await seedReorged();
 		const batch = sinon.stub(electrumHelpers, 'getTransactions').resolves({
 			error: true,
 			id: 0,
@@ -592,8 +628,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		];
 		for (const [kind, record] of cases) {
 			it(`shows ${kind} again once it returns to the mempool`, async function () {
-				wallet.data.transactions[TXID] = record();
-				wallet.data.unconfirmedTransactions[TXID] = record();
+				await setRecord(record());
 				let back = false;
 				serveWhile(() => back);
 
@@ -654,8 +689,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 
 		it('does not undo a clearing newer than its lookup', async function () {
 			// Still in the mempool when the refresh starts.
-			wallet.data.transactions[TXID] = mempoolRecord();
-			wallet.data.unconfirmedTransactions[TXID] = mempoolRecord();
+			await setRecord(mempoolRecord());
 			loseDuringLookup();
 
 			const res = await wallet.updateTransactions({});
@@ -717,8 +751,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		});
 
 		it('keeps watching one a refresh finds back during its removal', async function () {
-			wallet.data.transactions[TXID] = mempoolRecord();
-			wallet.data.unconfirmedTransactions[TXID] = mempoolRecord();
+			await setRecord(mempoolRecord());
 			let served = false;
 			serveWhile(() => served);
 			const save = wallet.saveWalletData.bind(wallet);
@@ -774,10 +807,8 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		 */
 		describe('a clearing newer than the lookup, on every branch (issue #964)', function () {
 			/** Observes the record at this height, as a refresh would have. */
-			const observe = (height: 0 | -1 = 0): void => {
-				wallet.data.transactions[TXID] = mempoolRecord(height);
-				wallet.data.unconfirmedTransactions[TXID] = mempoolRecord(height);
-			};
+			const observe = (height: 0 | -1 = 0): Promise<void> =>
+				setRecord(mempoolRecord(height));
 
 			/** The address history lists the transaction at this height. */
 			const listedAt = (height: number): void => {
@@ -802,7 +833,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			};
 
 			it('does not watch it again', async function () {
-				observe();
+				await observe();
 				loseDuringLookup();
 
 				const res = await wallet.updateTransactions({});
@@ -819,7 +850,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 
 			it('does not rewrite it from an answer at -1', async function () {
 				// With unconfirmed parents the history lists it at -1, not 0.
-				observe(-1);
+				await observe(-1);
 				listedAt(-1);
 				loseDuringLookup();
 
@@ -830,7 +861,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 
 			it('does not rewrite it from an answer in a block', async function () {
 				// Mined as the lookup went out, then reorged out and lost.
-				observe();
+				await observe();
 				listedAt(REORGED_HEIGHT);
 				loseDuringLookup();
 
@@ -847,7 +878,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 				// The height and address come from the history, so the answer is
 				// only as new as that lookup, even when the transaction itself is
 				// fetched and served after the clearing.
-				observe();
+				await observe();
 				let lost = false;
 				sinon
 					.stub(wallet.electrum, 'getTransactions')
@@ -872,7 +903,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			});
 
 			it('keeps the cleared record when replacing the stored ones', async function () {
-				observe();
+				await observe();
 				loseDuringLookup();
 
 				const res = await wallet.updateTransactions({
@@ -883,7 +914,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			});
 
 			it('still reads it back once a later lookup finds it', async function () {
-				observe();
+				await observe();
 				const node = loseDuringLookup();
 				await wallet.updateTransactions({});
 				expect(wallet.transactions[TXID].exists, 'lost').to.equal(false);
@@ -914,8 +945,11 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 	 * seen in a block safely below the tip.
 	 */
 	describe('a node without a txindex (issue #871)', function () {
-		const tipAt = (height: number): void => {
-			wallet.data.header = { height, hash: '', hex: '' };
+		const tipAt = async (height: number): Promise<void> => {
+			const res = await wallet.updateData({
+				header: { height, hash: '', hex: '' }
+			});
+			if (res.isErr()) throw res.error;
 		};
 
 		const miss = (message: string): ITransaction<IUtxo> =>
@@ -943,9 +977,9 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			expect(rescan.callCount, 'and nothing rescanned').to.equal(0);
 		};
 
-		beforeEach(function () {
+		beforeEach(async function () {
 			// Two blocks past the record: even a server a block behind has it.
-			tipAt(REORGED_HEIGHT + 2);
+			await tipAt(REORGED_HEIGHT + 2);
 		});
 
 		it('clears the height when the node has it in neither a block nor its mempool', async function () {
@@ -981,7 +1015,13 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		it('clears a record a lost write left confirmed (issue #870)', async function () {
 			// The main record still names the block while the observed copy
 			// already reads zero. The main record is evidence of that block too.
-			wallet.data.unconfirmedTransactions[TXID] = confirmedRecord(0);
+			const res = await wallet.updateData({
+				unconfirmedTransactions: {
+					...wallet.data.unconfirmedTransactions,
+					[TXID]: confirmedRecord(0)
+				}
+			});
+			if (res.isErr()) throw res.error;
 			answerWith(miss(NO_TXINDEX_MISS));
 			stubRescan();
 
@@ -1002,7 +1042,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			const rescan = stubRescan();
 
 			for (const tip of [REORGED_HEIGHT, REORGED_HEIGHT + 1]) {
-				tipAt(tip);
+				await tipAt(tip);
 				const res = await wallet.checkUnconfirmedTransactions();
 				expect(res.isOk(), `the check ran at tip ${tip}`).to.equal(true);
 				expectKept(rescan);
@@ -1011,7 +1051,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			// The count of issue #935 is final here too: for a record seen in a
 			// block it counts from that block. The single checks above hold this
 			// rule to its own margin.
-			tipAt(REORGED_HEIGHT + 2);
+			await tipAt(REORGED_HEIGHT + 2);
 			await wallet.checkUnconfirmedTransactions();
 			expect(
 				wallet.transactions[TXID].exists,
@@ -1030,8 +1070,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			const rescan = stubRescan();
 
 			for (const height of [0, -1]) {
-				wallet.data.transactions[TXID] = confirmedRecord(height);
-				wallet.data.unconfirmedTransactions[TXID] = confirmedRecord(height);
+				await setRecord(confirmedRecord(height));
 				await wallet.checkUnconfirmedTransactions();
 				expectKept(rescan, height);
 			}
@@ -1060,7 +1099,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		});
 
 		it('does not read the miss before the wallet knows a tip', async function () {
-			tipAt(0);
+			await tipAt(0);
 			answerWith(miss(NO_TXINDEX_MISS));
 			const rescan = stubRescan();
 
@@ -1107,17 +1146,15 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 			/** Checks once at each tip in turn. */
 			const checkAt = async (...tips: number[]): Promise<void> => {
 				for (const tip of tips) {
-					tipAt(tip);
+					await tipAt(tip);
 					const res = await wallet.checkUnconfirmedTransactions();
 					expect(res.isOk(), `the check ran at tip ${tip}`).to.equal(true);
 				}
 			};
 
 			/** Observes the record at this height, as a refresh would have. */
-			const observe = (record: IFormattedTransaction): void => {
-				wallet.data.transactions[TXID] = { ...record };
-				wallet.data.unconfirmedTransactions[TXID] = { ...record };
-			};
+			const observe = (record: IFormattedTransaction): Promise<void> =>
+				setRecord(record);
 
 			/** The record is gone, reported and rescanned once, and unobserved. */
 			const expectCleared = (rescan: sinon.SinonStub): void => {
@@ -1143,14 +1180,14 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 				(w as unknown as { _noTxindexMisses: Map<string, number> })
 					._noTxindexMisses;
 
-			beforeEach(function () {
-				observe(mempoolRecord(0));
+			beforeEach(async function () {
+				await observe(mempoolRecord(0));
 			});
 
 			for (const height of [0, -1] as const) {
 				it(`clears a record at height ${height} once the miss outlasts two new blocks`, async function () {
 					// Replaced or evicted: out of the mempool, and in no block.
-					observe(mempoolRecord(height));
+					await observe(mempoolRecord(height));
 					answerWith(miss(NO_TXINDEX_MISS));
 					const rescan = stubRescan();
 
@@ -1212,7 +1249,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 				// A failover to a server further behind lowers the tip below the
 				// block the record was seen in, and that server announces new
 				// blocks while it catches up to it. Two of them are not enough.
-				observe(confirmedRecord(FIRST_MISS + 5));
+				await observe(confirmedRecord(FIRST_MISS + 5));
 				answerWith(miss(NO_TXINDEX_MISS));
 				const rescan = stubRescan();
 
@@ -1254,7 +1291,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 				// Two headers land while the next lookup is in flight, after the
 				// server answered it.
 				lookup.callsFake(async () => {
-					tipAt(FIRST_MISS + 2);
+					await tipAt(FIRST_MISS + 2);
 					return lookupReply(miss(NO_TXINDEX_MISS));
 				});
 				await wallet.checkUnconfirmedTransactions();
@@ -1272,7 +1309,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 					'server overloaded'
 				]) {
 					sinon.restore();
-					observe(mempoolRecord(0));
+					await observe(mempoolRecord(0));
 					answerWith(miss(message));
 					const rescan = stubRescan();
 
@@ -1295,7 +1332,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 
 				// Rebroadcast, say, and found again by a refresh. Its first miss
 				// may be a block electrs has not indexed yet, so it counts afresh.
-				observe(mempoolRecord(0));
+				await observe(mempoolRecord(0));
 				messages = [];
 				rescan.resetHistory();
 				await checkAt(FIRST_MISS + 10);
@@ -1309,7 +1346,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 				await checkAt(FIRST_MISS);
 
 				await wallet.deleteOnChainTransactionById({ txid: TXID });
-				observe(mempoolRecord(0));
+				await observe(mempoolRecord(0));
 				await checkAt(FIRST_MISS + 10);
 
 				expectKept(rescan, 0);
@@ -1321,11 +1358,16 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 				await checkAt(FIRST_MISS);
 
 				// Gone from observation for a check.
-				delete wallet.data.unconfirmedTransactions[TXID];
+				const unconfirmed = { ...wallet.data.unconfirmedTransactions };
+				delete unconfirmed[TXID];
+				const res = await wallet.updateData({
+					unconfirmedTransactions: unconfirmed
+				});
+				if (res.isErr()) throw res.error;
 				lookup.resolves(lookupReply());
 				await checkAt(FIRST_MISS + 1);
 
-				observe(mempoolRecord(0));
+				await observe(mempoolRecord(0));
 				lookup.resolves(lookupReply(miss(NO_TXINDEX_MISS)));
 				await checkAt(FIRST_MISS + 10);
 
@@ -1344,7 +1386,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 
 				// The count is memory only, so a restart waits longer, never less.
 				wallet = await openWallet();
-				observe(mempoolRecord(0));
+				await observe(mempoolRecord(0));
 				answerWith(miss(NO_TXINDEX_MISS));
 				const rescan = stubRescan();
 
@@ -1396,25 +1438,19 @@ describe('a reorg repair that storage refuses (issue #870)', function () {
 
 	let wallet: Wallet;
 	let messages: Array<{ key: keyof TMessageDataMap; data: unknown }>;
-	/** What a restart would read back. */
-	const store = new Map<string, unknown>();
+	/** Each key's JSON: what a restart would read back. */
+	const store = new Map<string, string>();
 	/** Refuses the main record, `transactions`. */
 	const failMainWrite = { on: false };
 	/** Refuses the copy under observation, `unconfirmedTransactions`. */
 	const failMonitorWrite = { on: false };
 
-	const copy = <T>(value: T): T =>
-		value === undefined ? value : JSON.parse(JSON.stringify(value));
-
-	const storage: TStorage = {
-		getData: async <K extends keyof IWalletData>(
-			key: string
-		): Promise<Result<IWalletData[K]>> =>
-			ok(copy(store.get(key)) as IWalletData[K]),
-		setData: async <K extends keyof IWalletData>(
-			key: string,
-			value: IWalletData[K]
-		): Promise<Result<boolean>> => {
+	const memory = createMemoryStorage(store);
+	// No setTransactionChanges: a change to the transaction map would go
+	// there instead, past the refusal below.
+	const storage: IWalletStorage = {
+		getData: memory.getData,
+		setData: async (key, value) => {
 			// Keys end in the wallet data key, and neither suffix ends the other.
 			if (failMainWrite.on && key.endsWith('-transactions')) {
 				return err('storage is down');
@@ -1422,8 +1458,7 @@ describe('a reorg repair that storage refuses (issue #870)', function () {
 			if (failMonitorWrite.on && key.endsWith('-unconfirmedTransactions')) {
 				return err('storage is down');
 			}
-			store.set(key, copy(value));
-			return ok(true);
+			return memory.setData(key, value);
 		}
 	};
 
@@ -1442,7 +1477,10 @@ describe('a reorg repair that storage refuses (issue #870)', function () {
 			storage
 		});
 		if (res.isErr()) throw res.error;
-		res.value.data.header = { height: TIP, hash: '', hex: '' };
+		const header = await res.value.updateData({
+			header: { height: TIP, hash: '', hex: '' }
+		});
+		if (header.isErr()) throw header.error;
 		return res.value;
 	};
 
@@ -1458,10 +1496,13 @@ describe('a reorg repair that storage refuses (issue #870)', function () {
 		transactions: Record<string, IFormattedTransaction>,
 		unconfirmed: Record<string, IFormattedTransaction>
 	): Promise<void> => {
-		store.set(wallet.getWalletDataKey('transactions'), copy(transactions));
+		store.set(
+			wallet.getWalletDataKey('transactions'),
+			JSON.stringify(transactions)
+		);
 		store.set(
 			wallet.getWalletDataKey('unconfirmedTransactions'),
-			copy(unconfirmed)
+			JSON.stringify(unconfirmed)
 		);
 		await restart();
 	};
@@ -1491,10 +1532,7 @@ describe('a reorg repair that storage refuses (issue #870)', function () {
 	const stored = (
 		key: 'transactions' | 'unconfirmedTransactions'
 	): Record<string, IFormattedTransaction> =>
-		store.get(wallet.getWalletDataKey(key)) as Record<
-			string,
-			IFormattedTransaction
-		>;
+		JSON.parse(store.get(wallet.getWalletDataKey(key))!);
 
 	const sent = (key: keyof TMessageDataMap): unknown[] =>
 		messages.filter((m) => m.key === key);
@@ -1662,14 +1700,17 @@ describe('a reorg repair that storage refuses (issue #870)', function () {
 		// go once the repair lands: counted again from here, the retry would
 		// wait two more blocks.
 		await seed({ [TXID]: mempoolRecord() }, { [TXID]: mempoolRecord() });
-		const tipAt = (height: number): void => {
-			wallet.data.header = { height, hash: '', hex: '' };
+		const tipAt = async (height: number): Promise<void> => {
+			const res = await wallet.updateData({
+				header: { height, hash: '', hex: '' }
+			});
+			if (res.isErr()) throw res.error;
 		};
 		answerWith(txAnswer(undefined, { code: 2, message: NO_TXINDEX_MISS }));
 		const rescan = stubRescan();
 		await wallet.checkUnconfirmedTransactions();
 
-		tipAt(TIP + 2);
+		await tipAt(TIP + 2);
 		failMainWrite.on = true;
 		const failed = await wallet.checkUnconfirmedTransactions();
 		expect(failed.isErr(), 'the check reports the write it lost').to.equal(
@@ -1972,7 +2013,10 @@ describe('a reorg repair that storage refuses (issue #870)', function () {
 		expect(deleted.isErr()).to.equal(true);
 
 		failMainWrite.on = false;
-		wallet.data.header = { height: TIP + 2, hash: '', hex: '' };
+		const tip = await wallet.updateData({
+			header: { height: TIP + 2, hash: '', hex: '' }
+		});
+		if (tip.isErr()) throw tip.error;
 		const res = await wallet.checkUnconfirmedTransactions();
 		expect(res.isOk(), 'the check ran').to.equal(true);
 

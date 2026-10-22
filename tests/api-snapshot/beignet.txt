@@ -594,7 +594,7 @@ property IWallet.remainOffline?: boolean
 property IWallet.resetOnReadFailure?: boolean
 property IWallet.seed?: Buffer
 property IWallet.selectedFeeId?: EFeeId
-property IWallet.storage?: TStorage
+property IWallet.storage?: IWalletStorage
 property IWallet.xpub?: string
 interface IWalletData
 property IWalletData.addressIndex: TAddressTypeContent<IAddress>
@@ -617,6 +617,10 @@ property IWalletData.transaction: ISendTransaction
 property IWalletData.transactions: IFormattedTransactions
 property IWalletData.unconfirmedTransactions: IFormattedTransactions
 property IWalletData.utxos: IUtxo[]
+interface IWalletStorage
+property IWalletStorage.getData?: TGetData
+property IWalletStorage.setData?: TSetData
+property IWalletStorage.setTransactionChanges?: TSetTransactionChanges
 type IWatchOnlyWallet = Omit<IWallet, 'mnemonic' | 'passphrase' | 'seed' | 'xpub'> & { xpub: string; }
 type InputData = { [key: string]: { addresses: string[]; value: number; }; }
 const LOG_LEVEL_PRIORITY: Record<TLogLevel, number>
@@ -657,7 +661,7 @@ type TGetByteCountInput = `MULTISIG-P2SH:${number}-${number}` | `MULTISIG-P2WSH:
 type TGetByteCountInputs = { [key in TGetByteCountInput]?: number; }
 type TGetByteCountOutput = 'P2SH' | 'P2PKH' | 'P2WPKH' | 'P2WSH' | 'p2wpkh' | 'p2sh' | 'p2pkh' | 'P2TR' | 'p2tr'
 type TGetByteCountOutputs = { [key in TGetByteCountOutput]?: number; }
-type TGetData = <K extends keyof IWalletData>(key: string) => Promise<Result<IWalletData[K]>>
+type TGetData = <K extends TWalletDataKeys>(key: TWalletStorageKey<K>) => Promise<Result<IWalletData[K] | undefined>>
 type TGetTotalFeeObj = { totalFee: number; transactionByteCount: number; satsPerByte: number; maxSatPerByte: number; }
 type TKeyDerivationAccount = '0' | string
 type TKeyDerivationChange = '0' | '1'
@@ -671,10 +675,10 @@ type TOnMessage = <K extends keyof TMessageDataMap>(key: K, data: TMessageDataMa
 type TProcessUnconfirmedTransactions = { unconfirmedTxs: IFormattedTransactions; outdatedTxs: IUtxo[]; ghostTxs: string[]; }
 type TProtocol = `${EProtocol}`
 type TServer = { host: string; ssl: number; tcp: number; protocol: EProtocol; }
-type TSetData = <K extends keyof IWalletData>(key: string, value: IWalletData[K]) => Promise<Result<boolean>>
-type TSetTransactionChanges = (key: string, changes: TTransactionChanges) => Promise<Result<boolean>>
+type TSetData = <K extends TWalletDataKeys>(key: TWalletStorageKey<K>, value: IWalletData[K]) => Promise<Result<boolean>>
+type TSetTransactionChanges = (key: TWalletStorageKey<'transactions'>, changes: TTransactionChanges) => Promise<Result<boolean>>
 type TSetupTransactionResponse = Result<Partial<ISendTransaction>>
-type TStorage = { getData?: TGetData; setData?: TSetData; setTransactionChanges?: TSetTransactionChanges; }
+type TStorage = IWalletStorage
 type TStorageWriteFailure = { key: TWalletDataKeys; storageKey: string; error: string; }
 type TSubscribedReceive = [ string, string ]
 type TTransactionChanges = { set: IFormattedTransactions; deleted: string[]; }
@@ -688,6 +692,7 @@ type TUnspentAddressScriptHashResponse = { id: number; error: boolean; method: s
 type TUnspentAddressScriptHashResult = { id: number; jsonrpc: string; result: TUnspentAddressScriptHash[]; param: string; data: IAddress; }
 type TVin = IVin | ICoinbaseVin
 type TWalletDataKeys = keyof IWalletData
+type TWalletStorageKey<K extends TWalletDataKeys = TWalletDataKeys> = { [P in K]: `${string}-${P}`; }[K]
 type Tls = typeof import('tls')
 class Transaction
 constructor Transaction({ wallet }: { wallet: Wallet; })
@@ -742,7 +747,7 @@ static method Wallet.create(params: IWallet): Promise<Result<Wallet>>
 static method Wallet.createMultisig(params: IMultisigWallet): Promise<Result<Wallet>>
 method Wallet.createSignedTransaction(args: ICreateSignedTransactionArgs): Promise<Result<ISignedTransaction>>
 static method Wallet.createWatchOnly(params: IWatchOnlyWallet): Promise<Result<Wallet>>
-get Wallet.data(): IWalletData
+get Wallet.data(): Readonly<IWalletData>
 method Wallet.deleteOnChainTransactionById({ txid }: { txid: string; }): Promise<Result<string>>
 method Wallet.derivePublicNode(path: string): Result<bip32#BIP32Interface>
 property Wallet.disableMessages: boolean
@@ -809,7 +814,7 @@ method Wallet.getTransactionDetails(tx_hash: string): Promise<Result<TTxDetails>
 method Wallet.getUnconfirmedTransactions(): IFormattedTransactions
 method Wallet.getUtxos(params: Parameters<Wallet['refreshUtxos']>[0]): Promise<Result<IGetUtxosResponse>>
 method Wallet.getWalletData(): Promise<Result<IWalletData>>
-method Wallet.getWalletDataKey(key: keyof IWalletData): string
+method Wallet.getWalletDataKey<K extends TWalletDataKeys>(key: K): TWalletStorageKey<K>
 readonly property Wallet.id: string
 method Wallet.importSignedPsbt(psbtBase64: string, unsignedPsbtBase64?: string): Result<IImportSignedPsbtResponse>
 method Wallet.isChangeAddress(address: string): boolean
@@ -832,6 +837,7 @@ property Wallet.rbf: boolean
 get Wallet.refreshFailed(): boolean
 method Wallet.refreshUtxos({ scanningStrategy, addressIndex, changeAddressIndex, addressTypesToCheck, additionalAddresses, additionalScriptHashes }: { scanningStrategy?: EScanningStrategy; addressIndex?: number; changeAddressIndex?: number; addressTypesToCheck?: EAddressType[]; additionalAddresses?: string[]; additionalScriptHashes?: IAddresses; }): Promise<Result<IGetUtxosResponse>>
 method Wallet.refreshWallet({ scanAllAddresses, additionalAddresses, force, onStart }?: { scanAllAddresses?: boolean; additionalAddresses?: string[]; force?: boolean; onStart?: () => void; }): Promise<Result<IWalletData>>
+readonly property Wallet.remainOffline: boolean
 method Wallet.removeSpentUtxos(rawTx: string): Promise<Result<IUtxo[]>>
 method Wallet.removeTxInput({ input }: { input: IUtxo; }): Result<IUtxo[]>
 method Wallet.removeTxTag({ tag }: { tag: string; }): Result<string>
@@ -858,6 +864,7 @@ method Wallet.unfreezeUtxo(params: IOutpoint | IIndexedOutpoint): Promise<Result
 method Wallet.unfreezeUtxoIfTagged(params: (IOutpoint | IIndexedOutpoint) & { tag: string; }): Promise<Result<{ unfrozen: boolean; }>>
 method Wallet.updateAddressType(addressType: EAddressType): Promise<void>
 method Wallet.updateCoinSelectPreference(coinSelectPreference: ECoinSelectPreference): void
+method Wallet.updateData(patch: Partial<IWalletData>): Promise<Result<string>>
 method Wallet.updateFeeEstimates(forceUpdate?: boolean): Promise<Result<IOnchainFees>>
 method Wallet.updateGapLimit(gapLimitOptions: TGapLimitOptions): Result<TGapLimitOptions>
 method Wallet.updateHeader(headerData: IHeader): Promise<void>
@@ -877,7 +884,8 @@ const buildSortedMultisigPaymentFromKeys: ({ threshold, publicKeys, network }: {
 const clampFeeRate: (rate: number) => number
 const constructByteCountParam: (addresses: string[], increaseAddressCount?: { addrType: EAddressType; count: number; }[]) => TGetByteCountInputs | TGetByteCountOutputs
 function createConsoleLogger(level?: TLogLevel, sink?: IConsoleSink): ILogger
-const createEncryptedStorage: (inner: TStorage, seed: Buffer) => TStorage
+const createEncryptedStorage: (inner: IWalletStorage, seed: Buffer) => IWalletStorage
+const createMemoryStorage: (values?: Map<string, string>) => Required<IWalletStorage>
 const createOpReturnScript: (message?: string) => Buffer | undefined
 const decodeOpReturnMessage: (opReturn?: string) => string[]
 const decodeRawTransaction: (hex: string, _network: Network) => Result<TDecodeRawTx>
@@ -923,7 +931,7 @@ const getSha256: (str: string) => string
 const getStorageKeyValues: (storageKey: string) => { walletName: string; network: Network; account: number; value: keyof IWalletData; } | undefined
 const getTapRootAddressFromPublicKey: ({ publicKey, network }: { publicKey: Buffer; network: bitcoinjs-lib#Network; }) => Result<{ address: string; output: Buffer; internalPubkey: Buffer; }>
 const getTxFee: ({ satsPerByte, transactionByteCount }: { satsPerByte: number; transactionByteCount: number; }) => number
-const getWalletDataStorageKey: (name: string, network: Network, key: keyof IWalletData, account?: number) => string
+const getWalletDataStorageKey: <K extends keyof IWalletData>(name: string, network: Network, key: K, account?: number) => TWalletStorageKey<K>
 const hasUntrimmedInputs: (vin: (TVin | TFormattedVin)[]) => boolean
 const isP2trPrefix: (address: string) => boolean
 const isPositive: (num: number) => boolean

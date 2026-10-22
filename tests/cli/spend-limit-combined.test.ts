@@ -72,12 +72,12 @@ function httpJson(
 }
 
 /** Fabricates a UTXO paying to one of the wallet's own derived addresses. */
-const injectUtxo = (
+const injectUtxo = async (
 	wallet: Wallet,
 	txid: string,
 	value: number,
 	addressIndex = 0
-): IUtxo => {
+): Promise<IUtxo> => {
 	const source =
 		addressIndex === 0
 			? wallet.data.addressIndex[EAddressType.p2wpkh]
@@ -96,8 +96,11 @@ const injectUtxo = (
 		value,
 		publicKey: source.publicKey
 	};
-	wallet.data.utxos.push(utxo);
-	wallet.data.balance += value;
+	const injected = await wallet.updateData({
+		utxos: [...wallet.data.utxos, utxo],
+		balance: wallet.data.balance + value
+	});
+	if (injected.isErr()) throw injected.error;
 	return utxo;
 };
 
@@ -137,8 +140,8 @@ describe('Combined daily spend limit + onchain controls (daemon)', function () {
 		wallet = (node as unknown as { wallet: Wallet }).wallet;
 		// The failed (offline) refresh still generates index-0 addresses.
 		await wallet.refreshWallet({});
-		injectUtxo(wallet, TXID_A, 60_000);
-		injectUtxo(wallet, TXID_B, 40_000, 1);
+		await injectUtxo(wallet, TXID_A, 60_000);
+		await injectUtxo(wallet, TXID_B, 40_000, 1);
 		// Stub the broadcast: sends succeed without a network.
 		wallet.electrum.broadcastTransaction = async (): Promise<
 			ReturnType<typeof ok<string>>

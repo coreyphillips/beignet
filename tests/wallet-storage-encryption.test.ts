@@ -5,13 +5,10 @@ import tls from 'tls';
 
 import {
 	createEncryptedStorage,
+	createMemoryStorage,
 	EAvailableNetworks,
-	EProtocol,
 	IUtxo,
-	IWalletData,
-	ok,
-	Result,
-	TStorage,
+	IWalletStorage,
 	Wallet
 } from '../src';
 import { TEST_MNEMONIC } from './constants';
@@ -19,30 +16,14 @@ import { TEST_MNEMONIC } from './constants';
 const ENC_PREFIX = 'encw1:';
 const testTimeout = 60000;
 
-// In-memory TStorage that JSON-serializes values like a typical host would,
+// In-memory storage that JSON-serializes values like a typical host would,
 // with the raw store exposed so tests can inspect what actually persists.
-const createMemoryStorage = (): {
-	storage: TStorage;
+const memoryStorage = (): {
+	storage: IWalletStorage;
 	store: Map<string, string>;
 } => {
 	const store = new Map<string, string>();
-	const storage: TStorage = {
-		getData: async <K extends keyof IWalletData>(
-			key: string
-		): Promise<Result<IWalletData[K]>> => {
-			const raw = store.get(key);
-			if (raw === undefined) return ok(undefined as unknown as IWalletData[K]);
-			return ok(JSON.parse(raw));
-		},
-		setData: async <K extends keyof IWalletData>(
-			key: string,
-			value: IWalletData[K]
-		): Promise<Result<boolean>> => {
-			store.set(key, JSON.stringify(value));
-			return ok(true);
-		}
-	};
-	return { storage, store };
+	return { storage: createMemoryStorage(store), store };
 };
 
 const seed = bip39.mnemonicToSeedSync(TEST_MNEMONIC);
@@ -65,9 +46,9 @@ const markerUtxo: IUtxo = {
 describe('Wallet Storage Encryption', function () {
 	this.timeout(testTimeout);
 
-	describe('TStorage contract', () => {
+	describe('IWalletStorage contract', () => {
 		it('Should round-trip an object value through setData/getData', async () => {
-			const { storage } = createMemoryStorage();
+			const { storage } = memoryStorage();
 			const encrypted = createEncryptedStorage(storage, seed);
 			const setRes = await encrypted.setData!('wallet0-bitcoin-utxos', [
 				markerUtxo
@@ -80,7 +61,7 @@ describe('Wallet Storage Encryption', function () {
 		});
 
 		it('Should persist a prefixed ciphertext that hides the plaintext marker', async () => {
-			const { storage, store } = createMemoryStorage();
+			const { storage, store } = memoryStorage();
 			const encrypted = createEncryptedStorage(storage, seed);
 			await encrypted.setData!('wallet0-bitcoin-utxos', [markerUtxo]);
 			const raw = store.get('wallet0-bitcoin-utxos');
@@ -93,7 +74,7 @@ describe('Wallet Storage Encryption', function () {
 		});
 
 		it('Should pass legacy plaintext values through unchanged', async () => {
-			const { storage, store } = createMemoryStorage();
+			const { storage, store } = memoryStorage();
 			// Simulate a pre-encryption row written by the raw host storage.
 			store.set('wallet0-bitcoin-utxos', JSON.stringify([markerUtxo]));
 			store.set('wallet0-bitcoin-balance', JSON.stringify(5855));
@@ -111,7 +92,7 @@ describe('Wallet Storage Encryption', function () {
 		});
 
 		it('Should fail to read a value written under a different seed', async () => {
-			const { storage } = createMemoryStorage();
+			const { storage } = memoryStorage();
 			const encrypted = createEncryptedStorage(storage, seed);
 			await encrypted.setData!('wallet0-bitcoin-utxos', [markerUtxo]);
 			const wrongKey = createEncryptedStorage(storage, wrongSeed);
@@ -128,29 +109,21 @@ describe('Wallet Storage Encryption', function () {
 
 	describe('Wallet save/load cycle', () => {
 		const walletName = 'encstoragetestwallet0';
-		const { storage, store } = createMemoryStorage();
+		const { storage, store } = memoryStorage();
 		let wallet: Wallet;
 
 		before(async function () {
 			this.timeout(testTimeout);
-			// Electrum is intentionally unreachable: persistence does not need it,
-			// and the background refresh failing exercises nothing under test.
+			// The wallet never connects: persistence does not need Electrum, and
+			// the background refresh failing exercises nothing under test.
 			const res = await Wallet.create({
 				mnemonic: TEST_MNEMONIC,
 				network: EAvailableNetworks.regtest,
 				name: walletName,
 				storage: createEncryptedStorage(storage, seed),
 				disableMessagesOnCreate: true,
-				electrumOptions: {
-					servers: {
-						host: '127.0.0.1',
-						ssl: 1,
-						tcp: 1,
-						protocol: EProtocol.tcp
-					},
-					net,
-					tls
-				}
+				electrumOptions: { net, tls },
+				remainOffline: true
 			});
 			if (res.isErr()) throw res.error;
 			wallet = res.value;

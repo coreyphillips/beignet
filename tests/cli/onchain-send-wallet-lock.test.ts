@@ -32,12 +32,11 @@ import {
 	EAvailableNetworks,
 	ECoinSelectPreference,
 	EProtocol,
-	IWalletData,
+	IWalletStorage,
 	Result,
-	TStorage,
 	Wallet,
-	err,
-	ok
+	createMemoryStorage,
+	err
 } from '../../src';
 import { getDefaultSendTransaction } from '../../src/shapes';
 
@@ -49,7 +48,8 @@ const electrumHelpers = require('rn-electrum-client/helpers');
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// Unreachable on purpose: this test must work offline.
+// Unreachable on purpose: this test must work offline. Not remainOffline,
+// which refuses the broadcast before it reaches the stubbed client helpers.
 const electrumOptions = {
 	net,
 	tls,
@@ -69,22 +69,22 @@ const LARGE_COIN = '11'.repeat(32);
 const SMALL_COIN = '22'.repeat(32);
 
 /**
- * An in-memory TStorage that answers each write on a later tick, as a real
- * adapter does.
+ * An in-memory IWalletStorage that answers each write on a later tick, as a
+ * real adapter does.
  */
-const memoryStorage = (): TStorage => {
-	const store = new Map<string, unknown>();
+const memoryStorage = (): IWalletStorage => {
+	const { getData, setData, setTransactionChanges } = createMemoryStorage();
+	const nextTick = (): Promise<void> =>
+		new Promise((resolve) => setImmediate(resolve));
 	return {
-		getData: async <K extends keyof IWalletData>(
-			key: string
-		): Promise<Result<IWalletData[K]>> => ok(store.get(key) as IWalletData[K]),
-		setData: async <K extends keyof IWalletData>(
-			key: string,
-			value: IWalletData[K]
-		): Promise<Result<boolean>> => {
-			await new Promise((resolve) => setImmediate(resolve));
-			store.set(key, value);
-			return ok(true);
+		getData,
+		setData: async (key, value): Promise<Result<boolean>> => {
+			await nextTick();
+			return setData(key, value);
+		},
+		setTransactionChanges: async (key, changes): Promise<Result<boolean>> => {
+			await nextTick();
+			return setTransactionChanges(key, changes);
 		}
 	};
 };
@@ -137,18 +137,24 @@ describe('CLI on-chain sends hold the wallet send lock (#1617, #1626, #1638)', f
 			[LARGE_COIN, 60_000],
 			[SMALL_COIN, 30_000]
 		] as const) {
-			wallet.data.utxos.push({
-				address: source.address,
-				index: source.index,
-				path: source.path,
-				scriptHash: source.scriptHash,
-				height: 1,
-				tx_hash: txid,
-				tx_pos: 0,
-				value,
-				publicKey: source.publicKey
+			const injected = await wallet.updateData({
+				utxos: [
+					...wallet.data.utxos,
+					{
+						address: source.address,
+						index: source.index,
+						path: source.path,
+						scriptHash: source.scriptHash,
+						height: 1,
+						tx_hash: txid,
+						tx_pos: 0,
+						value,
+						publicKey: source.publicKey
+					}
+				],
+				balance: wallet.data.balance + value
 			});
-			wallet.data.balance += value;
+			if (injected.isErr()) throw injected.error;
 		}
 		sinon
 			.stub(electrumHelpers, 'subscribeAddress')

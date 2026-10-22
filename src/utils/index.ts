@@ -1,6 +1,7 @@
 export * from './common';
 export * from './wallet';
 export * from './wallet-storage-encryption';
+export * from './wallet-memory-storage';
 export * from './watch-only';
 export * from './multisig';
 export * from './boost';

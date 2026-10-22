@@ -4,8 +4,8 @@
  * off by 10^8 on one side. Each record now carries sats fields beside the
  * deprecated BTC ones, and records stored before them get them on load.
  *
- * Fully OFFLINE: the wallet points at an unreachable Electrum port and every
- * lookup it makes is stubbed.
+ * Fully OFFLINE: the wallet is created with remainOffline and every lookup it
+ * makes is stubbed.
  */
 
 import { expect } from 'chai';
@@ -15,10 +15,10 @@ import tls from 'tls';
 
 import {
 	btcToSats,
+	createMemoryStorage,
 	EAddressType,
 	EAvailableNetworks,
 	EPaymentType,
-	EProtocol,
 	getWalletDataStorageKey,
 	IAddress,
 	IFormattedTransaction,
@@ -26,13 +26,13 @@ import {
 	ITransaction,
 	IUtxo,
 	IWalletData,
+	IWalletStorage,
 	Msat,
 	msatToSatsFloor,
 	ok,
 	Result,
 	Sats,
 	satsToMsat,
-	TStorage,
 	TTxDetails,
 	Wallet
 } from '../../src';
@@ -42,17 +42,8 @@ const MNEMONIC =
 const NAME = 'historysats';
 const NETWORK = EAvailableNetworks.regtest;
 
-// Unreachable on purpose: this test must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+// The wallet is created with remainOffline: this test must work offline.
+const electrumOptions = { net, tls };
 
 /** P: pays 0.5 BTC to the wallet's first receive address. */
 const P = '1a'.repeat(32);
@@ -118,23 +109,22 @@ const copy = <T>(value: T): T =>
 describe('transaction amounts in sats (#1692)', function () {
 	this.timeout(60000);
 
-	let store: Map<string, unknown>;
+	let store: Map<string, string>;
 	let writes: { key: string; value: unknown }[];
 	let wallet: Wallet | undefined;
 
-	const storage: TStorage = {
-		getData: async <K extends keyof IWalletData>(
-			key: string
-		): Promise<Result<IWalletData[K]>> =>
-			ok(copy(store.get(key)) as IWalletData[K]),
-		setData: async <K extends keyof IWalletData>(
-			key: string,
-			value: IWalletData[K]
-		): Promise<Result<boolean>> => {
-			writes.push({ key, value: copy(value) });
-			store.set(key, copy(value));
-			return ok(true);
-		}
+	/** Saves into store and records each write. */
+	const storage = (): IWalletStorage => {
+		// No setTransactionChanges: the wallet then saves each transaction map
+		// whole through setData, where the writes below count it.
+		const { getData, setData } = createMemoryStorage(store);
+		return {
+			getData,
+			setData: async (key, value): Promise<Result<boolean>> => {
+				writes.push({ key, value: copy(value) });
+				return setData(key, value);
+			}
+		};
 	};
 
 	const key = (field: keyof IWalletData): string =>
@@ -151,11 +141,11 @@ describe('transaction amounts in sats (#1692)', function () {
 			addressType: EAddressType.p2wpkh,
 			addressTypesToMonitor: [EAddressType.p2wpkh],
 			electrumOptions,
+			remainOffline: true,
 			disableRefreshOnCreate: true,
-			storage
+			storage: storage()
 		});
 		if (res.isErr()) throw res.error;
-		res.value.electrum.stopConnectionPolling();
 		return res.value;
 	};
 
@@ -204,8 +194,14 @@ describe('transaction amounts in sats (#1692)', function () {
 				addressType: EAddressType.p2wpkh
 			});
 			if (gen.isErr()) throw gen.error;
-			wallet.data.addresses.p2wpkh = gen.value.addresses;
-			wallet.data.changeAddresses.p2wpkh = gen.value.changeAddresses;
+			const stored = await wallet.updateData({
+				addresses: { ...wallet.data.addresses, p2wpkh: gen.value.addresses },
+				changeAddresses: {
+					...wallet.data.changeAddresses,
+					p2wpkh: gen.value.changeAddresses
+				}
+			});
+			if (stored.isErr()) throw stored.error;
 			const byIndex = (book: Record<string, IAddress>, i: number): IAddress =>
 				Object.values(book).find((a) => a.index === i) as IAddress;
 			A = byIndex(gen.value.addresses, 0);
@@ -330,8 +326,11 @@ describe('transaction amounts in sats (#1692)', function () {
 				[S]: btcOnly(S, EPaymentType.sent, -0.2001),
 				[R]: btcOnly(R, EPaymentType.received, 0.1)
 			};
-			store.set(key('transactions'), copy(transactions));
-			store.set(key('unconfirmedTransactions'), { [S]: copy(transactions[S]) });
+			store.set(key('transactions'), JSON.stringify(transactions));
+			store.set(
+				key('unconfirmedTransactions'),
+				JSON.stringify({ [S]: transactions[S] })
+			);
 
 			wallet = await openWallet();
 			const sent = {
@@ -359,10 +358,9 @@ describe('transaction amounts in sats (#1692)', function () {
 
 			expect(writesTo('transactions')).to.have.length(1);
 			expect(writesTo('unconfirmedTransactions')).to.have.length(1);
-			const saved = store.get(key('transactions')) as Record<
-				string,
-				IFormattedTransaction
-			>;
+			const saved: Record<string, IFormattedTransaction> = JSON.parse(
+				store.get(key('transactions'))!
+			);
 			expect(satsOf(saved[S])).to.deep.equal(sent);
 
 			// Already filled: a second load writes neither map.

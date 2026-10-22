@@ -1,7 +1,7 @@
 /**
  * Signing uses the root key the wallet derived when it was constructed
- * (#1598). Fully OFFLINE: wallets point at an unreachable Electrum port and
- * UTXOs are fabricated for the wallet's own derived addresses.
+ * (#1598). Fully OFFLINE: wallets are created with remainOffline and UTXOs
+ * are fabricated for the wallet's own derived addresses.
  */
 
 import { expect } from 'chai';
@@ -14,7 +14,6 @@ import * as bitcoin from 'bitcoinjs-lib';
 import {
 	EAddressType,
 	EAvailableNetworks,
-	EProtocol,
 	getScriptHash,
 	IUtxo,
 	ok,
@@ -31,17 +30,7 @@ const RECIPIENT = 'bcrt1q6rz28mcfaxtmd6v789l9rrlrusdprr9pz3cppk';
 const regtest = bitcoin.networks.regtest;
 const network = EAvailableNetworks.regtest;
 
-// Unreachable on purpose: these tests must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65529,
-		tcp: 65529,
-		protocol: EProtocol.tcp
-	}
-};
+const electrumOptions = { net, tls };
 
 const PURPOSE: Partial<Record<EAddressType, number>> = {
 	p2wpkh: 84,
@@ -53,7 +42,8 @@ const createWallet = async (addressType: EAddressType): Promise<Wallet> => {
 		mnemonic: MNEMONIC,
 		network,
 		addressType,
-		electrumOptions
+		electrumOptions,
+		remainOffline: true
 	});
 	if (res.isErr()) throw res.error;
 	// The failed (offline) refresh still generates the index-0 addresses,
@@ -90,8 +80,11 @@ const addUtxo = async (
 		value,
 		publicKey: node.value.publicKey.toString('hex')
 	};
-	wallet.data.utxos.push(utxo);
-	wallet.data.balance += value;
+	const added = await wallet.updateData({
+		utxos: [...wallet.data.utxos, utxo],
+		balance: wallet.data.balance + value
+	});
+	if (added.isErr()) throw added.error;
 	return utxo;
 };
 

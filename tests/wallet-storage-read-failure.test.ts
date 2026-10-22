@@ -3,8 +3,8 @@
  * as an empty store, started from defaults, and the next save wrote them over
  * the frozen coins and labels it could not read.
  *
- * Fully OFFLINE: the Electrum server is an unreachable local port and the
- * create-time refresh is disabled.
+ * Fully OFFLINE: the wallet never connects (remainOffline) and the create-time
+ * refresh is disabled.
  */
 
 import * as bip39 from 'bip39';
@@ -15,17 +15,15 @@ import tls from 'tls';
 import {
 	createConsoleLogger,
 	createEncryptedStorage,
+	createMemoryStorage,
 	EAvailableNetworks,
-	EProtocol,
 	err,
 	getDefaultWalletData,
 	getWalletDataStorageKey,
 	IUtxo,
 	IWallet,
-	IWalletData,
-	ok,
+	IWalletStorage,
 	Result,
-	TStorage,
 	Wallet
 } from '../src';
 import { TEST_MNEMONIC } from './constants';
@@ -38,17 +36,8 @@ const BLACKLIST_KEY = getWalletDataStorageKey(
 	'blacklistedUtxos'
 );
 
-// Unreachable on purpose: this test must work offline.
-const electrumOptions = {
-	net,
-	tls,
-	servers: {
-		host: '127.0.0.1',
-		ssl: 65524,
-		tcp: 65524,
-		protocol: EProtocol.tcp
-	}
-};
+// No servers: the wallets are created with remainOffline.
+const electrumOptions = { net, tls };
 
 const frozenUtxo: IUtxo = {
 	address: 'bcrt1qfrozencoin',
@@ -66,10 +55,11 @@ type TReadFailure = 'err' | 'reject' | undefined;
 
 /**
  * JSON-serializing in-memory storage that records every write. failRead
- * decides, per key, whether a read resolves to an Err or rejects.
+ * decides, per key, whether a read resolves to an Err or rejects. No
+ * setTransactionChanges, so every write goes through setData and is recorded.
  */
 const memoryStorage = (): {
-	storage: TStorage;
+	storage: IWalletStorage;
 	store: Map<string, string>;
 	writes: string[];
 	failRead: { fn: (key: string) => TReadFailure };
@@ -77,24 +67,17 @@ const memoryStorage = (): {
 	const store = new Map<string, string>();
 	const writes: string[] = [];
 	const failRead = { fn: (_key: string): TReadFailure => undefined };
-	const storage: TStorage = {
-		getData: async <K extends keyof IWalletData>(
-			key: string
-		): Promise<Result<IWalletData[K]>> => {
+	const memory = createMemoryStorage(store);
+	const storage: IWalletStorage = {
+		getData: async (key) => {
 			const failure = failRead.fn(key);
 			if (failure === 'reject') throw new Error('storage is down');
 			if (failure === 'err') return err('storage is down');
-			const raw = store.get(key);
-			if (raw === undefined) return ok(undefined as unknown as IWalletData[K]);
-			return ok(JSON.parse(raw));
+			return memory.getData(key);
 		},
-		setData: async <K extends keyof IWalletData>(
-			key: string,
-			value: IWalletData[K]
-		): Promise<Result<boolean>> => {
+		setData: async (key, value) => {
 			writes.push(key);
-			store.set(key, JSON.stringify(value));
-			return ok(true);
+			return memory.setData(key, value);
 		}
 	};
 	return { storage, store, writes, failRead };
@@ -106,7 +89,7 @@ describe('Wallet.create with a storage read that fails (issue #1596)', function 
 	const created: Wallet[] = [];
 
 	const create = async (
-		storage: TStorage,
+		storage: IWalletStorage,
 		extra: Partial<IWallet> = {}
 	): Promise<Result<Wallet>> => {
 		const res = await Wallet.create({
@@ -114,6 +97,7 @@ describe('Wallet.create with a storage read that fails (issue #1596)', function 
 			network: NETWORK,
 			name: WALLET_NAME,
 			electrumOptions,
+			remainOffline: true,
 			storage,
 			disableRefreshOnCreate: true,
 			disableMessagesOnCreate: true,
@@ -125,7 +109,7 @@ describe('Wallet.create with a storage read that fails (issue #1596)', function 
 	};
 
 	/** A wallet that has saved a frozen coin, stopped so its writes landed. */
-	const seedStore = async (storage: TStorage): Promise<void> => {
+	const seedStore = async (storage: IWalletStorage): Promise<void> => {
 		const res = await create(storage);
 		if (res.isErr()) throw res.error;
 		await res.value.saveWalletData('blacklistedUtxos', [frozenUtxo]);
