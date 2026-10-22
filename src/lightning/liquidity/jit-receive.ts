@@ -453,6 +453,8 @@ export interface IHeldJitPart extends IForwardablePart {
 	 * A revoked part is never forwarded, whatever a funding does afterwards.
 	 */
 	revoked?: boolean;
+	/** Set once a funding waited for its absent wallet with this part held. */
+	waitedForWallet?: boolean;
 }
 
 export interface IJitManagerDeps {
@@ -516,6 +518,12 @@ export interface IJitManagerDeps {
 	 * splice because its wallet was away may need no splice once it is back.
 	 */
 	canOfferHtlcs?(channelId: Buffer, amountsMsat: bigint[]): boolean;
+	/**
+	 * Final-CLTV headroom the wallet asks of a JIT payment. A part that waited
+	 * for an absent wallet is refunded once a block takes it under this,
+	 * rather than released into the wallet's refusal. Absent: no such check.
+	 */
+	walletMinFinalCltvBlocks?: number;
 	/**
 	 * Most the node could front from its on-chain funds right now, priced at
 	 * the current feerate (sat), or null when no figure is available (no
@@ -1292,12 +1300,27 @@ export class JitReceiveManager extends EventEmitter {
 	}
 
 	/**
-	 * Fail every held part whose inbound CLTV deadline is near, and sweep
-	 * expired intents. Driven from the node's per-block work, BEFORE the node's
-	 * own expiring-HTLC scan, so the engine is the one that resolves its own
-	 * holds: a part the node failed behind our back would still be forwarded by
-	 * a funding that completed afterwards, paying downstream for an inbound leg
-	 * that no longer exists.
+	 * Under the wallet's final-CLTV headroom, for a part that waited for the
+	 * wallet (issue #1726). The wallet refuses such a part as unknown payment
+	 * details, which payers treat as final. A block during an ordinary
+	 * funding is the tradeoff the JIT invoice's headroom already accepts.
+	 */
+	private pastWalletCutoff(part: IHeldJitPart): boolean {
+		const minFinal = this.deps.walletMinFinalCltvBlocks;
+		const height = this.deps.currentBlockHeight();
+		if (!part.waitedForWallet || minFinal === undefined || height <= 0) {
+			return false;
+		}
+		return part.forwardCltv - height < minFinal;
+	}
+
+	/**
+	 * Fail every held part whose inbound CLTV deadline is near or whose wallet
+	 * cutoff has passed, and sweep expired intents. Driven from the node's
+	 * per-block work, BEFORE the node's own expiring-HTLC scan, so the engine
+	 * is the one that resolves its own holds: a part the node failed behind
+	 * our back would still be forwarded by a funding that completed
+	 * afterwards, paying downstream for an inbound leg that no longer exists.
 	 */
 	scanExpiringHolds(): void {
 		if (this.deps.currentBlockHeight() <= 0) return;
@@ -1306,8 +1329,10 @@ export class JitReceiveManager extends EventEmitter {
 		// any of them to the deadline means the sender can never complete it, so
 		// forwarding the survivors would only park HTLCs on the client's fresh
 		// channel until they time out. The whole set goes.
+		const atCutoff = (p: IHeldJitPart): boolean =>
+			this.pastDeadline(p) || this.pastWalletCutoff(p);
 		for (const [scidHex, parts] of [...this.heldParts]) {
-			if (!parts.some((p) => this.pastDeadline(p))) continue;
+			if (!parts.some(atCutoff)) continue;
 			this.heldParts.delete(scidHex);
 			this.clearAggregation(scidHex);
 			this.revokeAll(parts, scidHex);
@@ -1319,7 +1344,7 @@ export class JitReceiveManager extends EventEmitter {
 			const doomed: IHeldJitPart[] = [];
 			const survivors: IHeldJitPart[] = [];
 			for (const part of parts) {
-				(this.pastDeadline(part) ? doomed : survivors).push(part);
+				(atCutoff(part) ? doomed : survivors).push(part);
 			}
 			if (doomed.length === 0) continue;
 			if (survivors.length > 0) {
@@ -1336,13 +1361,21 @@ export class JitReceiveManager extends EventEmitter {
 
 	/** Mark parts unforwardable for good, then fail them upstream. */
 	private revokeAll(parts: IHeldJitPart[], scope: string): void {
+		const atInbound = parts.some((p) => this.pastDeadline(p));
 		for (const part of parts) {
-			this.failPart(part, this.deps.failureCodes.expiryTooSoon);
+			this.failPart(
+				part,
+				atInbound
+					? this.deps.failureCodes.expiryTooSoon
+					: this.deps.failureCodes.temporaryChannelFailure
+			);
 		}
 		this.safeEmit('jit:failed', {
 			scidHex: scope,
 			parts: parts.length,
-			reason: 'held part reached its inbound CLTV deadline'
+			reason: atInbound
+				? 'held part reached its inbound CLTV deadline'
+				: "held part reached the wallet's CLTV cutoff"
 		});
 	}
 
@@ -1735,6 +1768,7 @@ export class JitReceiveManager extends EventEmitter {
 			if (held.some((p) => p.revoked || this.pastDeadline(p))) {
 				throw new Error('held part reached its inbound CLTV deadline');
 			}
+			for (const p of held) p.waitedForWallet = true;
 			if (!waited) {
 				waited = true;
 				this.safeEmit('jit:waiting-for-wallet', {

@@ -23456,6 +23456,7 @@ export class LightningNode extends EventEmitter {
 					this.channelManager
 						.getChannel(channelId)
 						?.canOfferHtlcSet(amountsMsat) === true,
+				walletMinFinalCltvBlocks: JIT_RECEIVE_MIN_FINAL_CLTV_EXPIRY,
 				maxFundableSats: () => this.jitMaxFundableSats(),
 				storage: this.storage ?? undefined,
 				failRestoredHtlc: (part) => this.failRestoredHeldHtlc(part)

@@ -139,6 +139,7 @@ function makeHarness(
 				h.walletEvents.once('back', done);
 			}),
 		canOfferHtlcs: (channelId, amounts) => h.canCarry.fn(channelId, amounts),
+		walletMinFinalCltvBlocks: 72,
 		storage: {
 			saveMetadata: (k, v) => {
 				if (h.storageWrites.failKeys.has(k)) {
@@ -1975,6 +1976,38 @@ describe('JIT waits for an absent wallet (issue #1726)', () => {
 		]);
 		expect(h.opens, 'the wait ended without an open').to.have.length(0);
 		expect(h.failed.map((f) => f.code)).to.deep.equal([EXPIRY_TOO_SOON]);
+	});
+
+	it("a block that takes a waiting part under the wallet's final CLTV refunds it, and only it", async () => {
+		const h = makeHarness();
+		h.walletAway.value = true;
+		h.manager.registerIntent(CLIENT, auth());
+		const channelId = crypto.randomBytes(32);
+		const reasons: string[] = [];
+		h.manager.on('jit:failed', (e: { reason: string }) =>
+			reasons.push(e.reason)
+		);
+		const forwarded = waitFor(h.manager, 'jit:forwarded');
+		const tight = makePart(h, { forwardCltv: 800_072 });
+		const padded = makePart(h, { forwardCltv: 800_073 });
+		h.manager.tryHoldForSplice(channelId, tight);
+		h.manager.tryHoldForSplice(channelId, padded);
+		// A wake that finds the wallet still away has the wait see both parts.
+		h.walletEvents.emit('back');
+		await new Promise((r) => setTimeout(r, 20));
+
+		h.height.value = 800_001;
+		h.manager.scanExpiringHolds();
+		expect(reasons).to.deep.equal([
+			"held part reached the wallet's CLTV cutoff"
+		]);
+		expect(h.failed).to.have.length(1);
+		expect(h.failed[0].part).to.equal(tight);
+		expect(h.failed[0].code).to.equal(TEMPORARY_CHANNEL_FAILURE);
+
+		await comeBack(h);
+		await forwarded;
+		expect(h.forwarded.map((f) => f.part)).to.deep.equal([padded]);
 	});
 
 	it('an open refused because the wallet dropped mid-attempt is retried once it is back', async () => {

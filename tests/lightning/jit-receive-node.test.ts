@@ -262,6 +262,7 @@ function driveForward(
 		amountMsat?: bigint;
 		incomingAmountMsat?: bigint;
 		incomingCltvExpiry?: number;
+		outgoingCltvValue?: number;
 		paymentHash?: Buffer;
 	} = {}
 ): { paymentHash: Buffer } {
@@ -274,7 +275,7 @@ function driveForward(
 		{
 			hopPayload: {
 				amountToForwardMsat: opts.amountMsat ?? 2_000_000n,
-				outgoingCltvValue: 800_050,
+				outgoingCltvValue: opts.outgoingCltvValue ?? 800_050,
 				shortChannelId: scid
 			},
 			nextPacket: {
@@ -995,6 +996,41 @@ describe('JIT receive waits for an absent wallet (issue #1726)', function () {
 			expect(alice.listChannels()).to.have.length(1);
 			expect(alice.listChannels()[0].state).to.equal(ChannelState.NORMAL);
 			expect(failures).to.deep.equal([]);
+		} finally {
+			pair.destroy();
+		}
+	});
+
+	it("refunds a waiting part once a block takes it under the wallet's final CLTV", async function () {
+		const pair = nodePair();
+		const { alice, bob } = pair;
+		try {
+			const ack = registerIntent(pair);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const peerManager = (alice as any).peerManager;
+			const connectedPeer = peerManager.getPeer;
+			peerManager.getPeer = (): undefined => undefined;
+			const failures: string[] = [];
+			alice.on('jit:failed', (d: { reason: string }) =>
+				failures.push(d.reason)
+			);
+
+			// The JIT invoice asks for 72 blocks and the payer sent exactly that.
+			alice.handleNewBlock(800_000);
+			driveForward(alice, ack.interceptScid, { outgoingCltvValue: 800_072 });
+			await new Promise((r) => setTimeout(r, 50));
+			alice.handleNewBlock(800_001);
+			expect(failures).to.deep.equal([
+				"held part reached the wallet's CLTV cutoff"
+			]);
+
+			peerManager.getPeer = connectedPeer;
+			alice.emit('peer:connect', bob.getNodeId());
+			await new Promise((r) => setTimeout(r, 100));
+			expect(
+				alice.listChannels(),
+				'no open for a part the wallet would refuse'
+			).to.have.length(0);
 		} finally {
 			pair.destroy();
 		}
