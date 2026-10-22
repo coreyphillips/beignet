@@ -120,7 +120,7 @@ interface IFixtureOpts {
 /**
  * A NORMAL channel with default dust limits (354 sat) and a 10,000-sat reserve
  * on both sides. The reserve stays at or above our dust limit, so
- * _localCommitmentEmptyRefusal short-circuits and no guard here ever reaches
+ * localCommitmentEmptyRefusal short-circuits and no guard here ever reaches
  * the commitment builder, a signer or a MuSig2 nonce.
  *
  * pendingFeeratePerKw is deliberately left undefined so both fee-rate getters

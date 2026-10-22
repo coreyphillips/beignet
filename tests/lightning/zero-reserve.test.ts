@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import { Channel } from '../../src/lightning/channel/channel';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import { waivedCommitmentRefusal } from '../../src/lightning/channel/htlc-policy';
 import {
 	createOpenerState,
 	createAcceptorState
@@ -599,9 +600,7 @@ describe('Zero reserve amount and commitment checks', () => {
 				remoteBalanceMsat: 0n,
 				fundingSatoshis: 100_000n
 			};
-			expect(server['_waivedCommitmentRefusal'](candidate)).to.include(
-				'commitment cost'
-			);
+			expect(waivedCommitmentRefusal(candidate)).to.include('commitment cost');
 			expect(client.spliceOutCommitmentRefusal(1_000_000n)).to.include(
 				'commitment cost'
 			);

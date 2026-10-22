@@ -36,6 +36,7 @@ import { expect } from 'chai';
 import * as bitcoin from 'bitcoinjs-lib';
 import { Channel } from '../../src/lightning/channel/channel';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import { hasPendingHtlcs } from '../../src/lightning/channel/htlc-policy';
 import {
 	ChannelState,
 	HtlcState,
@@ -140,9 +141,9 @@ function expectAlive(pair: IPair, label: string): void {
 	);
 }
 
-/** Channel.hasPendingHtlcs is private; the suites read it as the engine does. */
+/** The quiescence gate, read as the engine reads it. */
 function hasPending(ch: Channel): boolean {
-	return (ch as unknown as { hasPendingHtlcs(): boolean }).hasPendingHtlcs();
+	return hasPendingHtlcs(ch.getFullState());
 }
 
 /** Nothing owed on either side: no HTLC mid-flight, no update unsigned. */

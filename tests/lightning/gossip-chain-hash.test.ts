@@ -94,7 +94,8 @@ describe('S-7.M1: chain-scoped gossip', function () {
 			crypto.randomBytes(32)
 		]);
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const digest: Buffer = (channel as any).buildAnnouncementData(
+		const announcements = (channel as any)._announcements;
+		const digest: Buffer = announcements.buildAnnouncementData(
 			nodeId1,
 			nodeId2
 		);

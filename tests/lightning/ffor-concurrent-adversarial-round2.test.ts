@@ -28,6 +28,7 @@ import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import { Channel } from '../../src/lightning/channel/channel';
 import { buildLocalCommitment } from '../../src/lightning/channel/commitment-builder';
+import { hasPendingHtlcs } from '../../src/lightning/channel/htlc-policy';
 import {
 	ChannelAction,
 	ChannelActionType
@@ -126,7 +127,7 @@ function expectAlive(pair: IPair, label: string): void {
 }
 
 function hasPending(ch: Channel): boolean {
-	return (ch as unknown as { hasPendingHtlcs(): boolean }).hasPendingHtlcs();
+	return hasPendingHtlcs(ch.getFullState());
 }
 
 function expectSettled(pair: IPair, label: string): void {

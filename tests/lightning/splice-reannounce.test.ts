@@ -205,7 +205,7 @@ function setupNormalChannels(): {
 	};
 }
 
-/** Replicate Channel.buildAnnouncementData for a given side's view. */
+/** Replicate ChannelAnnouncements.buildAnnouncementData for a given side's view. */
 function buildAnnData(
 	scid: Buffer,
 	localNodeId: Buffer,

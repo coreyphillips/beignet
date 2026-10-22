@@ -163,7 +163,7 @@ interface IFixtureOpts {
 /**
  * A NORMAL channel with default 354-sat dust limits and a 10,000-sat reserve
  * on both sides unless overridden, at 2,500 sat/kw. The reserve stays at or
- * above our dust limit, so _localCommitmentEmptyRefusal short-circuits and
+ * above our dust limit, so localCommitmentEmptyRefusal short-circuits and
  * only the fee arithmetic under test decides. Fixture HTLCs are COMMITTED
  * with no two-phase flags unless the case sets them.
  */
