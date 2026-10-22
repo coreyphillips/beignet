@@ -1,0 +1,39 @@
+# Every exported declaration tagged @deprecated. Regenerate with npm run api:snapshot; do not edit.
+beignet: namespace EAvailableNetworks
+beignet: type EAvailableNetworks = Network
+beignet: property IBtInfo.version: number
+beignet: property IFormattedTransaction.fee: number
+beignet: property IFormattedTransaction.matchedInputValue: number
+beignet: property IFormattedTransaction.matchedOutputValue: number
+beignet: property IFormattedTransaction.totalInputValue: number
+beignet: property IFormattedTransaction.totalOutputValue: number
+beignet: property IFormattedTransaction.value: number
+beignet: property IIndexedOutpoint.index: number
+beignet: type TAvailableNetworks = `${Network}`
+beignet: type TProtocol = `${EProtocol}`
+beignet: method Wallet.getAddressBalance(address: string): Promise<Result<IGetAddressBalanceRes>>
+beignet: method Wallet.getAddressHistory(address: string): Promise<Result<TTxResult[]>>
+beignet: method Wallet.getAddressesBalance(addresses?: string[]): Promise<Result<number>>
+beignet: method Wallet.getFallbackFeeEstimates(network?: Network): Promise<IOnchainFees>
+beignet: method Wallet.getFeeEstimates(network?: Network): Promise<IOnchainFees>
+beignet: method Wallet.getFeeEstimatesFromElectrum(): Promise<Result<IOnchainFees>>
+beignet: method Wallet.getFeeEstimatesFromHttp(network?: Network): Promise<IOnchainFees>
+beignet: method Wallet.getGapLimit(params: Parameters<Wallet['getAddressGap']>[0]): Result<{ addressDelta: number; changeAddressDelta: number; }>
+beignet: method Wallet.getInputData({ inputs }: { inputs: { tx_hash: string; vout: number; }[]; }): Promise<Result<InputData>>
+beignet: method Wallet.getNextAvailableAddress(addressType?: EAddressType, scan?: TAddressScan): Promise<Result<IGetNextAvailableAddressResponse>>
+beignet: method Wallet.getPrivateKeyInfo(privateKey: string): Promise<Result<IPrivateKeyInfo>>
+beignet: method Wallet.getRbfData({ txHash }: { txHash: ITxHash; }): Promise<Result<IRbfData>>
+beignet: method Wallet.getScriptHashBalance(scriptHash: string): Promise<Result<IGetAddressBalanceRes>>
+beignet: method Wallet.getTransactionDetails(tx_hash: string): Promise<Result<TTxDetails>>
+beignet: method Wallet.getUtxos(params: Parameters<Wallet['refreshUtxos']>[0]): Promise<Result<IGetUtxosResponse>>
+beignet: method Wallet.isUtxoFrozen(txid: string, index: number): boolean
+beignet: const getBitcoinJsNetwork: (network: Network | `${Network}`) => BitcoinJsNetwork
+beignet: const getElectrumNetwork: (network: Network) => EElectrumNetworks
+beignet/lightning: method node.LightningNode.openZeroConfChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint): Channel
+beignet/lightning: const recovery.GuardianStore: typeof GuardianStoreClass
+beignet/lightning: type recovery.GuardianStore = GuardianStoreClass
+beignet/lightning: const storage.SqliteStorage: typeof SqliteStorageClass
+beignet/lightning: type storage.SqliteStorage = SqliteStorageClass
+beignet/cli: method BeignetNode.openChannel(pubkey: string, amountSats: number, pushSats?: number, satsPerVbyte?: number, max?: boolean, trusted?: boolean): ChannelInfo
+beignet/cli: method BeignetNode.payInvoice(bolt11: string, timeoutMs?: number, maxFeeSats?: number, amountSats?: number, metadata?: Record<string, string>, cltvLimit?: number, maxFeeMsat?: number | string): Promise<PaymentInfo>
+beignet/cli: method BeignetNode.payInvoiceSafe(bolt11: string, timeoutMs?: number, maxFeeSats?: number, amountSats?: number, metadata?: Record<string, string>, cltvLimit?: number, maxFeeMsat?: number | string): Promise<PaymentInfo>

@@ -1,0 +1,224 @@
+# The exported API of beignet/lightning/sqlite. Regenerate with npm run api:snapshot; do not edit.
+class GuardianStore
+constructor GuardianStore(path: string)
+method GuardianStore.archiveMalformedRecords(recoveryId: Buffer, reason: string, archivedAt: Buffer): number
+method GuardianStore.archiveRecordsAbove(recoveryId: Buffer, sequenceExclusive: Buffer, reason: string, archivedAt: Buffer): number
+method GuardianStore.archiveRecordsBelow(recoveryId: Buffer, sequenceExclusive: Buffer, reason: string, archivedAt: Buffer): number
+method GuardianStore.chargeUsage(recoveryId: Buffer, delta: number): void
+method GuardianStore.close(): void
+method GuardianStore.contentBytes(recoveryId?: Buffer): number
+method GuardianStore.countNamespaces(): number
+method GuardianStore.deleteAllEpochs(recoveryId: Buffer): void
+method GuardianStore.deleteAllRecords(recoveryId: Buffer, reason: string, archivedAt: Buffer): number
+method GuardianStore.deleteEpochsAbove(recoveryId: Buffer, epochExclusive: Buffer): void
+method GuardianStore.deleteEpochsOutsideRange(recoveryId: Buffer, minInclusive: Buffer, maxInclusive: Buffer): void
+method GuardianStore.deleteMalformedEpochs(recoveryId: Buffer): number
+method GuardianStore.deleteRecordsBelow(recoveryId: Buffer, sequenceExclusive: Buffer): void
+method GuardianStore.deleteRetainFloor(recoveryId: Buffer): void
+method GuardianStore.getEpoch(recoveryId: Buffer, epoch: Buffer): IGuardianEpochRow | null
+method GuardianStore.getErasedEpoch(recoveryId: Buffer): Buffer | null
+method GuardianStore.getNamespace(recoveryId: Buffer): IGuardianNamespaceRow | null
+method GuardianStore.getRecord(recoveryId: Buffer, sequence: Buffer): IGuardianRecordRow | null
+method GuardianStore.getRetainFloor(recoveryId: Buffer): IGuardianRetainFloorRow | null
+method GuardianStore.insertEpoch(row: IGuardianEpochRow): void
+method GuardianStore.insertNamespace(row: IGuardianNamespaceRow): void
+method GuardianStore.insertRecord(row: IGuardianRecordRow): void
+method GuardianStore.iterateRecords(recoveryId: Buffer): IterableIterator<IGuardianRecordRow>
+method GuardianStore.listEpochs(recoveryId: Buffer): IGuardianEpochRow[]
+method GuardianStore.listNamespaces(): IGuardianNamespaceRow[]
+method GuardianStore.listOrphans(recoveryId: Buffer): IGuardianOrphanRow[]
+method GuardianStore.listRecordsAfter(recoveryId: Buffer, fromExclusive: Buffer, limit: number): IGuardianRecordRow[]
+method GuardianStore.read<T>(fn: () => T): T
+method GuardianStore.reanchorNamespace(row: IGuardianNamespaceRow): void
+method GuardianStore.recordBytesBelow(recoveryId: Buffer, sequenceExclusive: Buffer): number
+method GuardianStore.rekeyNamespace(fromRecoveryId: Buffer, toRecoveryId: Buffer): void
+method GuardianStore.resetUsage(): void
+method GuardianStore.setErasedEpoch(recoveryId: Buffer, epoch: Buffer): void
+method GuardianStore.setPossiblyStale(recoveryId: Buffer, possiblyStale: boolean): void
+method GuardianStore.setRetainFloor(row: IGuardianRetainFloorRow): void
+method GuardianStore.setRotation(recoveryId: Buffer, rotation: Buffer): void
+method GuardianStore.tombstoneNamespace(recoveryId: Buffer): void
+method GuardianStore.updateNamespaceState(recoveryId: Buffer, state: Buffer, receiptIssuedAt: Buffer, receiptSignature: Buffer): void
+method GuardianStore.updateRegistrationReceipt(recoveryId: Buffer, issuedAt: Buffer, signature: Buffer): void
+method GuardianStore.usageBytes(recoveryId?: Buffer): number
+method GuardianStore.write<T>(fn: () => T): T
+interface IGuardianEpochRow
+property IGuardianEpochRow.certIssuedAt: Buffer | null
+property IGuardianEpochRow.certSignature: Buffer | null
+property IGuardianEpochRow.certSupersededState: Buffer | null
+property IGuardianEpochRow.epoch: Buffer
+property IGuardianEpochRow.receiptIssuedAt: Buffer | null
+property IGuardianEpochRow.receiptSignature: Buffer | null
+property IGuardianEpochRow.receiptState: Buffer | null
+property IGuardianEpochRow.recoveryId: Buffer
+property IGuardianEpochRow.writerPublicKey: Buffer
+interface IGuardianNamespaceRow
+property IGuardianNamespaceRow.generation: Buffer | null
+property IGuardianNamespaceRow.guardianSetId: Buffer
+property IGuardianNamespaceRow.possiblyStale: boolean
+property IGuardianNamespaceRow.receiptIssuedAt: Buffer | null
+property IGuardianNamespaceRow.receiptSignature: Buffer | null
+property IGuardianNamespaceRow.recoveryId: Buffer
+property IGuardianNamespaceRow.registrationReceiptIssuedAt: Buffer | null
+property IGuardianNamespaceRow.registrationReceiptSignature: Buffer | null
+property IGuardianNamespaceRow.registrationSignature: Buffer | null
+property IGuardianNamespaceRow.registrationState: Buffer | null
+property IGuardianNamespaceRow.rotation: Buffer | null
+property IGuardianNamespaceRow.state: Buffer | null
+interface IGuardianOrphanRow
+property IGuardianOrphanRow.ciphertextHash: Buffer
+property IGuardianOrphanRow.epoch: Buffer
+property IGuardianOrphanRow.frameHash: Buffer
+property IGuardianOrphanRow.reason: string
+property IGuardianOrphanRow.recoveryId: Buffer
+property IGuardianOrphanRow.sequence: Buffer
+interface IGuardianRecordRow
+property IGuardianRecordRow.ciphertext: Buffer
+property IGuardianRecordRow.ciphertextHash: Buffer
+property IGuardianRecordRow.epoch: Buffer
+property IGuardianRecordRow.frameHash: Buffer
+property IGuardianRecordRow.previousHash: Buffer
+property IGuardianRecordRow.recoveryId: Buffer
+property IGuardianRecordRow.sequence: Buffer
+property IGuardianRecordRow.writerSignature: Buffer
+interface IGuardianRetainFloorRow
+property IGuardianRetainFloorRow.frameHash: Buffer
+property IGuardianRetainFloorRow.issuedAt: Buffer
+property IGuardianRetainFloorRow.recoveryId: Buffer
+property IGuardianRetainFloorRow.signature: Buffer
+property IGuardianRetainFloorRow.state: Buffer
+property IGuardianRetainFloorRow.writerSignature: Buffer
+interface IPaymentRowMatch
+property IPaymentRowMatch.direction?: string
+property IPaymentRowMatch.metadata?: { key: string; value?: string; }
+property IPaymentRowMatch.status?: string
+interface IStoredPaymentRef
+property IStoredPaymentRef.createdAt: number
+method IStoredPaymentRef.load(): IPaymentInfo | null
+property IStoredPaymentRef.paymentHash: string
+class SqliteStorage implements IStorageBackend
+constructor SqliteStorage(dbPath: string, onCorruptRow?: (error: unknown) => void, opts?: { encryptionKey?: Buffer; })
+static readonly property SqliteStorage.CURRENT_SCHEMA_VERSION = 19
+method SqliteStorage.addWatchtowerUpdate(update: IWatchtowerUpdate): number
+method SqliteStorage.backup(destPath: string): Promise<void>
+method SqliteStorage.checkpoint(): void
+method SqliteStorage.close(): void
+method SqliteStorage.corruptRowCount(): number
+method SqliteStorage.countOutboxMessages(channelId: string): number
+method SqliteStorage.deleteAllWebhooks(): void
+method SqliteStorage.deleteChannel(id: string): void
+method SqliteStorage.deleteChannelPolicy(channelId: string): void
+method SqliteStorage.deleteForwardedHtlc(outKey: string): void
+method SqliteStorage.deleteGossipChannel(scidHex: string): void
+method SqliteStorage.deleteGossipNode(nodeIdHex: string): void
+method SqliteStorage.deleteHtlcPaymentMapping(key: string): void
+method SqliteStorage.deleteHtlcSharedSecret(key: string): void
+method SqliteStorage.deleteInvoice(paymentHashHex: string): void
+method SqliteStorage.deleteInvoicePathId(paymentHashHex: string): void
+method SqliteStorage.deleteMetadata(key: string): void
+method SqliteStorage.deleteOffer(offerIdHex: string): void
+method SqliteStorage.deleteOutboxMessages(channelId: string, messageTypes?: number[]): void
+method SqliteStorage.deletePayment(paymentHash: string): void
+method SqliteStorage.deletePaymentSecret(paymentHashHex: string): void
+method SqliteStorage.deletePeerAddress(pubkey: string): void
+method SqliteStorage.deletePeerStorageBlob(peerPubkey: string): void
+method SqliteStorage.deletePreimage(paymentHash: string): void
+method SqliteStorage.deleteQueueEntry(id: string): void
+method SqliteStorage.deleteRecoveryFramesBelow(sequence: number): void
+method SqliteStorage.deleteRecoveryMeta(key: string): void
+method SqliteStorage.deleteWatchtowerTower(towerUri: string): void
+method SqliteStorage.deleteWebhook(id: string): void
+property SqliteStorage.forwardingEventsMaxRows: number
+method SqliteStorage.getForwardingSummary(options?: { since?: number; }): IForwardingSummary
+method SqliteStorage.getRecoveryMeta(key: string): string | null
+method SqliteStorage.getSchemaVersion(): number
+method SqliteStorage.hasChannelKeyIndices(): boolean
+method SqliteStorage.inTransaction(): boolean
+method SqliteStorage.listForwardingEvents(filter?: IForwardingEventFilter): IForwardingEvent[]
+method SqliteStorage.listRecoveryMetaKeys(): string[]
+method SqliteStorage.loadActionLog(options?: { category?: string; since?: number; limit?: number; }): Array<{ category: string; action: string; timestamp: number; data: string; }>
+method SqliteStorage.loadAllAnnouncedPeerAddresses(): Array<{ pubkey: string; timestamp: number; addresses: Array<{ host: string; port: number; }>; }>
+method SqliteStorage.loadAllChainMonitors(): Array<{ channelId: string; state: IChainMonitorState; }>
+method SqliteStorage.loadAllChannelKeyIndices(): Array<{ channelId: string; channelIndex: number; }>
+method SqliteStorage.loadAllChannelPolicies(): Array<{ channelId: string; policy: IPersistedChannelPolicy; }>
+method SqliteStorage.loadAllChannels(): Array<{ channelId: string; state: IChannelState; peerPubkey: string; }>
+method SqliteStorage.loadAllFforVouchers(): IFforVoucherArchive[]
+method SqliteStorage.loadAllForwardedHtlcs(): Array<{ outKey: string; inChannelId: Buffer; inHtlcId: bigint; }>
+method SqliteStorage.loadAllGossipChannels(): IGraphChannel[]
+method SqliteStorage.loadAllGossipNodes(): IGraphNode[]
+method SqliteStorage.loadAllHtlcPaymentMappings(): Array<{ key: string; paymentHashHex: string; }>
+method SqliteStorage.loadAllHtlcSharedSecrets(): Array<{ key: string; secret: Buffer; }>
+method SqliteStorage.loadAllInvoicePathIds(): Array<{ paymentHashHex: string; pathId: Buffer; }>
+method SqliteStorage.loadAllInvoices(): Array<{ paymentHashHex: string; invoice: IInvoiceInfo; }>
+method SqliteStorage.loadAllOffers(): Array<{ offerIdHex: string; encoded: string; pathId: Buffer | null; createdAt: number; asyncHold: boolean; }>
+method SqliteStorage.loadAllPaymentSecrets(): Array<{ paymentHashHex: string; secret: Buffer; }>
+method SqliteStorage.loadAllPayments(): Array<{ paymentHash: string; payment: IPaymentInfo; }>
+method SqliteStorage.loadAllPeerAddresses(): Array<{ pubkey: string; host: string; port: number; transport?: IPeerTransportOptions; }>
+method SqliteStorage.loadAllPreimages(): Array<{ paymentHash: string; preimage: Buffer; }>
+method SqliteStorage.loadAllQueueEntries(): Array<{ id: string; bolt11: string; priority: number; status: string; amountSats?: number; maxFeeSats?: number; metadata?: string; error?: string; createdAt: number; completedAt?: number; }>
+method SqliteStorage.loadAllScidMappings(): Array<{ scidHex: string; channelId: Buffer; }>
+method SqliteStorage.loadAllWebhooks(): Array<{ id: string; url: string; events: string[]; secretHash?: string; createdAt: number; }>
+method SqliteStorage.loadChainMonitor(channelId: string): IChainMonitorState | null
+method SqliteStorage.loadChannel(id: string): { state: IChannelState; peerPubkey: string; } | null
+method SqliteStorage.loadChannelKeyIndex(channelId: string): number | null
+method SqliteStorage.loadFforVoucher(id: string): IFforVoucherArchive | null
+method SqliteStorage.loadGossipChannelsAfter(afterRowid: number, limit: number): IGossipRowPage<IGraphChannel>
+method SqliteStorage.loadGossipNodesAfter(afterRowid: number, limit: number): IGossipRowPage<IGraphNode>
+method SqliteStorage.loadMetadata(key: string): string | null
+method SqliteStorage.loadMetadataByPrefix(prefix: string): Array<{ key: string; value: string; }>
+method SqliteStorage.loadMissionControl(): string | null
+method SqliteStorage.loadNextChannelIndex(): number
+method SqliteStorage.loadOutboxMessages(channelId?: string): IRecoveryOutboxStoredMessage[]
+method SqliteStorage.loadPayment(paymentHash: string): IPaymentInfo | null
+method SqliteStorage.loadPeerStorageBlob(peerPubkey: string): { blob: Buffer; receivedAt: number; } | null
+method SqliteStorage.loadPendingWatchtowerUpdates(): Array<IWatchtowerUpdate & { id: number; }>
+method SqliteStorage.loadPreimage(paymentHash: string): Buffer | null
+method SqliteStorage.loadRecoveryFrame(sequence: number): IStoredRecoveryFrame | null
+method SqliteStorage.loadRecoveryFrameHeader(sequence: number): IStoredRecoveryFrameHeader | null
+method SqliteStorage.loadRecoveryFrames(afterSequence?: number): IStoredRecoveryFrame[]
+method SqliteStorage.loadWalletData(key: string): string | null
+method SqliteStorage.loadWatchtowerSessions(): Array<IWatchtowerSession & { sessionKey: Buffer; }>
+method SqliteStorage.markWatchtowerUpdateAcked(id: number, seqNum: number): void
+method SqliteStorage.open(opts?: { synchronous?: 'FULL' | 'NORMAL'; }): void
+method SqliteStorage.paymentHashesWith(match: { status: string; direction: string; }): Set<string>
+method SqliteStorage.paymentsNewestFirst(since?: number, match?: IPaymentRowMatch): Generator<IStoredPaymentRef>
+method SqliteStorage.pruneOutboxMessages(channelId: string, keepNewest: number): void
+method SqliteStorage.recoveryFrameStats(): { count: number; minSequence: number; maxSequence: number; } | null
+method SqliteStorage.revokedHtlcSnapshotStore(): object
+method SqliteStorage.saveActionLog(entry: { category: string; action: string; timestamp: number; data: string; }): void
+method SqliteStorage.saveAnnouncedPeerAddresses(pubkey: string, timestamp: number, addresses: Array<{ host: string; port: number; }>): void
+method SqliteStorage.saveChainMonitor(channelId: string, state: IChainMonitorState): void
+method SqliteStorage.saveChannel(id: string, state: IChannelState, peerPubkey: string): void
+method SqliteStorage.saveChannelKeyIndex(channelId: string, channelIndex: number): void
+method SqliteStorage.saveChannelPolicy(channelId: string, policy: IPersistedChannelPolicy): void
+method SqliteStorage.saveFforVoucher(record: IFforVoucherArchive): void
+method SqliteStorage.saveForwardedHtlc(outKey: string, inChannelId: Buffer, inHtlcId: bigint): void
+method SqliteStorage.saveForwardingEvent(event: Omit<IForwardingEvent, 'id'>): void
+method SqliteStorage.saveGossipChannel(scidHex: string, channel: IGraphChannel): void
+method SqliteStorage.saveGossipNode(nodeIdHex: string, node: IGraphNode): void
+method SqliteStorage.saveHtlcPaymentMapping(key: string, paymentHashHex: string): void
+method SqliteStorage.saveHtlcSharedSecret(key: string, secret: Buffer): void
+method SqliteStorage.saveInvoice(paymentHashHex: string, invoice: IInvoiceInfo): void
+method SqliteStorage.saveInvoicePathId(paymentHashHex: string, pathId: Buffer): void
+method SqliteStorage.saveMetadata(key: string, value: string): void
+method SqliteStorage.saveMissionControl(json: string): void
+method SqliteStorage.saveOffer(offerIdHex: string, encoded: string, pathId: Buffer | null, createdAt: number, asyncHold?: boolean): void
+method SqliteStorage.saveOutboxMessage(message: IRecoveryOutboxMessage): number
+method SqliteStorage.savePayment(paymentHash: string, payment: IPaymentInfo): void
+method SqliteStorage.savePaymentSecret(paymentHashHex: string, secret: Buffer): void
+method SqliteStorage.savePeerAddress(pubkey: string, host: string, port: number, transport?: IPeerTransportOptions): void
+method SqliteStorage.savePeerStorageBlob(peerPubkey: string, blob: Buffer, receivedAt: number): void
+method SqliteStorage.savePreimage(paymentHash: string, preimage: Buffer): void
+method SqliteStorage.saveQueueEntry(entry: { id: string; bolt11: string; priority: number; status: string; amountSats?: number; maxFeeSats?: number; metadata?: string; createdAt: number; }): void
+method SqliteStorage.saveRecoveryFrame(frame: IStoredRecoveryFrame): void
+method SqliteStorage.saveScidMapping(scidHex: string, channelId: Buffer): void
+method SqliteStorage.saveWalletData(key: string, value: string): void
+method SqliteStorage.saveWatchtowerSession(session: IWatchtowerSession, sessionKey: Buffer): void
+method SqliteStorage.saveWebhook(id: string, url: string, events: string[], secretHash?: string, createdAt?: number): void
+method SqliteStorage.secretsEncryptedAtRest(): boolean
+method SqliteStorage.setOutboxDisposition(id: number, disposition: RecoveryOutboxDisposition): void
+method SqliteStorage.setOutboxFrameSequence(ids: number[], frameSequence: number): void
+method SqliteStorage.setRecoveryMeta(key: string, value: string): void
+method SqliteStorage.setWatchtowerSessionProgress(sessionId: string, seqNum: number, lastApplied: number): void
+method SqliteStorage.transaction<T>(fn: () => T): T
+method SqliteStorage.updateQueueEntryStatus(id: string, status: string, error?: string, completedAt?: number): void

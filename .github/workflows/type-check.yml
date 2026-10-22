@@ -32,6 +32,12 @@ jobs:
       - name: Type check
         run: npm run tsc:check
 
+      # Emits the declarations in memory, so it needs no build. A PR that
+      # means to change the public API commits the regenerated snapshot
+      # (npm run api:snapshot) and the diff is reviewed with it.
+      - name: Check the exported API snapshot
+        run: npm run test:api
+
       # Several tests import the package root, whose types entry resolves to
       # dist/types/index.d.ts, so dist must exist before tests are checked.
       - name: Build
