@@ -10086,6 +10086,16 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						break;
 					}
 					this.emit('broadcast:tx', action.tx);
+					// Reaching here, a held suffix included, means the persist and
+					// the barrier both cleared. Announced after the broadcast so a
+					// throwing listener cannot withhold it.
+					if (action.fundingCritical) {
+						this.emit(
+							'funding:broadcast-authorized',
+							channel.getChannelId(),
+							action.tx
+						);
+					}
 					break;
 				case ChannelActionType.FORCE_CLOSE:
 					if (persistSeen && sendsBlocked()) {

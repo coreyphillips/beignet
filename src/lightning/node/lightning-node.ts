@@ -1384,7 +1384,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private reauthAttempts: Map<string, number> = new Map();
 	/**
-	 * Channels whose fully signed splice rebroadcast has already been
+	 * Splice transactions (raw hex) whose broadcast has already been
 	 * authorized IN THIS PROCESS.
 	 *
 	 * A splice has no equivalent of the funding map's 'authorized' phase, so
@@ -1393,6 +1393,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * Rebroadcasting is cheap and idempotent; re-authorizing is not. Process
 	 * local by the same rule as the funding phase: a restart must ask again,
 	 * because a local frame is not a quorum-durable one.
+	 *
+	 * Keyed by transaction rather than channel: a channel can owe a second
+	 * splice whose own persist failed or whose frame the barrier has not
+	 * released, and that one must not ride the first one's authorization.
 	 */
 	private authorizedSpliceBroadcasts: Set<string> = new Set();
 	/**
@@ -5961,14 +5965,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			this.broadcastPendingFundingTx(txidHex);
 		});
 
-		this.channelManager.on(
-			'funding:broadcast-authorized',
-			(channelId: Buffer | null) => {
-				if (channelId) {
-					this.authorizedSpliceBroadcasts.add(channelId.toString('hex'));
-				}
-			}
-		);
+		this.channelManager.on('funding:broadcast-authorized', (_channelId, tx) => {
+			this.authorizedSpliceBroadcasts.add(tx.toString('hex'));
+		});
 
 		// Arm spend detection on the outpoints a splice has superseded, without
 		// touching the channel's own funding watch (issue #479). Reading state
@@ -8210,7 +8209,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * a fresh frame per retry window, buys nothing.
 	 */
 	private rebroadcastAuthorizedSplice(idHex: string, txHex: string): void {
-		if (!this._chainBackend) return;
+		// Without a backend, the consumer's broadcast:tx listener is the only
+		// broadcaster this node has.
+		if (!this._chainBackend) {
+			this.emit('broadcast:tx', Buffer.from(txHex, 'hex'));
+			return;
+		}
 		this._chainBackend.broadcastTransaction(txHex).catch((err) => {
 			const reason = (err as Error)?.message ?? String(err);
 			// Already in mempool or confirmed, or a backend hiccup. The watch
@@ -8344,6 +8348,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * funding watch reporting the transaction confirmed, never by the peer.
 	 */
 	private retryPendingSpliceBroadcasts(): void {
+		const stillOwed = new Set<string>();
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
 			const inflight = state.spliceInFlight;
@@ -8354,6 +8359,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			for (const entry of state.unconfirmedSpliceTxs ?? []) {
 				if (entry.txHex && !owed.includes(entry.txHex)) owed.push(entry.txHex);
 			}
+			for (const hex of owed) stillOwed.add(hex);
 			if (owed.length === 0) continue;
 			const id = state.channelId ?? state.temporaryChannelId;
 			if (!id) continue;
@@ -8363,9 +8369,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// the same renewal as a funding one.
 			for (const hex of owed) this.renewTransactionPledges(hex);
 			// Already authorized in this process: rebroadcast without minting
-			// another frame. The barrier has answered for this splice.
-			if (this.authorizedSpliceBroadcasts.has(idHex)) {
-				for (const hex of owed) this.rebroadcastAuthorizedSplice(idHex, hex);
+			// another frame. The barrier has answered for these bytes, so they
+			// do not wait behind a later splice that is still being asked about.
+			for (const hex of owed) {
+				if (this.authorizedSpliceBroadcasts.has(hex)) {
+					this.rebroadcastAuthorizedSplice(idHex, hex);
+				}
+			}
+			if (owed.every((hex) => this.authorizedSpliceBroadcasts.has(hex))) {
 				continue;
 			}
 			if (!this.mayAskForReauthorization(idHex, idHex)) continue;
@@ -8373,6 +8384,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			if (!this.channelManager.reauthorizeSpliceBroadcast(id)) {
 				this.reauthAttempts.delete(idHex);
 			}
+		}
+		// A splice the chain confirmed is never owed again, and the v2 funding
+		// broadcasts that share the event were never owed here at all.
+		for (const hex of this.authorizedSpliceBroadcasts) {
+			if (!stillOwed.has(hex)) this.authorizedSpliceBroadcasts.delete(hex);
 		}
 	}
 

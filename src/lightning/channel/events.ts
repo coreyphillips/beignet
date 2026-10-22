@@ -88,11 +88,15 @@ export interface ChannelManagerEvents {
 	/** The funder's BOLT 2 point of no return: broadcast the funding transaction. */
 	'funding:authorized': (fundingTxid: Buffer) => void;
 	/**
-	 * LightningNode listens for this to skip re-authorizing a splice
-	 * rebroadcast already authorized in this process, but nothing emits it,
-	 * so that path only runs when a test seeds authorizedSpliceBroadcasts.
+	 * A funding-critical broadcast (a splice, or a v2 funding we contributed
+	 * to) cleared its persist and quorum gates and went out. LightningNode
+	 * remembers the bytes so a later rebroadcast of the same splice skips
+	 * another authorization.
 	 */
-	'funding:broadcast-authorized': (channelId: Buffer | null) => void;
+	'funding:broadcast-authorized': (
+		channelId: Buffer | null,
+		tx: Buffer
+	) => void;
 	/** Watch the funding output to this depth. */
 	'watch:funding': (
 		fundingTxid: Buffer,

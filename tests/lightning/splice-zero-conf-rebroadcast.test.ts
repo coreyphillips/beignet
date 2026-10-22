@@ -365,10 +365,18 @@ function elapse(node: LightningNode): void {
 	).reauthAttempts.clear();
 }
 
+function authorizedSplices(node: LightningNode): Set<string> {
+	return (node as unknown as { authorizedSpliceBroadcasts: Set<string> })
+		.authorizedSpliceBroadcasts;
+}
+
 describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 	this.timeout(10_000);
 
-	async function setup(seedBase: number): Promise<{
+	async function setup(
+		seedBase: number,
+		withBackend = true
+	): Promise<{
 		alice: LightningNode;
 		bob: LightningNode;
 		channelId: Buffer;
@@ -380,7 +388,7 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 	}> {
 		const backend = new ControlledBackend();
 		const configA = makeNodeConfig(seedBase);
-		configA.chainBackend = backend;
+		if (withBackend) configA.chainBackend = backend;
 		const alice = new LightningNode(configA);
 		const bob = new LightningNode(makeNodeConfig(seedBase + 1));
 		for (const n of [alice, bob]) {
@@ -485,6 +493,100 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 		fx.alice.handleNewBlock(152);
 		await tick();
 		expect(count()).to.equal(2);
+		fx.destroy();
+	});
+
+	// Issue #1812: the authorization the first block obtains is remembered,
+	// so the next retry window re-sends without another persist or frame.
+	it('a splice already authorized in this process is re-sent without asking again', async () => {
+		const fx = await setup(7577);
+		const hex = fx.spliceTx.toHex();
+		const count = (): number =>
+			fx.backend.broadcasts.filter((b) => b === hex).length;
+		const manager = fx.alice.getChannelManager();
+		let persists = 0;
+		manager.on('channel:persist', () => {
+			persists += 1;
+		});
+		const authorized: string[] = [];
+		manager.on('funding:broadcast-authorized', (_id, tx) =>
+			authorized.push(tx.toString('hex'))
+		);
+
+		fx.alice.handleNewBlock(150);
+		await tick();
+		expect(count()).to.equal(1);
+		expect(persists, 'the first block asks once').to.equal(1);
+		expect(authorized).to.deep.equal([hex]);
+
+		elapse(fx.alice);
+		fx.alice.handleNewBlock(151);
+		await tick();
+		expect(count()).to.equal(2);
+		expect(persists, 'no second authorization').to.equal(1);
+		expect(authorized).to.have.length(1);
+
+		// Confirmation retires the obligation, and the remembered
+		// authorization goes with it.
+		fx.alice
+			.getChainWatcher()!
+			.emit('funding:confirmed', fx.channelId, fx.spliceTx.getId());
+		await tick();
+		fx.alice.handleNewBlock(152);
+		await tick();
+		expect(count()).to.equal(2);
+		expect(authorizedSplices(fx.alice).size).to.equal(0);
+		fx.destroy();
+	});
+
+	it('without a chain backend, an authorized splice is still re-sent through broadcast:tx', async () => {
+		const fx = await setup(7581, false);
+		const hex = fx.spliceTx.toHex();
+		const sent: number[] = [];
+		let count = 0;
+		fx.alice.on('broadcast:tx', (tx: Buffer) => {
+			if (tx.toString('hex') === hex) count += 1;
+		});
+		let persists = 0;
+		fx.alice.getChannelManager().on('channel:persist', () => {
+			persists += 1;
+		});
+		for (const height of [150, 151, 152]) {
+			elapse(fx.alice);
+			fx.alice.handleNewBlock(height);
+			await tick();
+			sent.push(count);
+		}
+		expect(sent).to.deep.equal([1, 2, 3]);
+		expect(persists, 'authorized once, by the first block').to.equal(1);
+		fx.destroy();
+	});
+
+	it("a later splice still waiting on its frame does not ride the earlier one's authorization", async () => {
+		const fx = await setup(7579);
+		const first = fx.spliceTx.toHex();
+		const sent = (hex: string): number =>
+			fx.backend.broadcasts.filter((b) => b === hex).length;
+		const manager = fx.alice.getChannelManager();
+		fx.alice.handleNewBlock(150);
+		await tick();
+		expect(sent(first)).to.equal(1);
+
+		// A second splice at its point of no return whose frame the quorum
+		// has not released yet.
+		const raw = manager.getChannel(fx.channelId)!.getFullState();
+		const second = spliceTxFor(raw.fundingTxid!);
+		raw.spliceInFlight = inflightFor(second);
+		const idHex = fx.channelId.toString('hex');
+		(
+			manager as unknown as { channelsAwaitingDurability: () => Set<string> }
+		).channelsAwaitingDurability = (): Set<string> => new Set([idHex]);
+
+		elapse(fx.alice);
+		fx.alice.handleNewBlock(151);
+		await tick();
+		expect(sent(first), 'the released splice is not held back').to.equal(2);
+		expect(sent(second.toHex())).to.equal(0);
 		fx.destroy();
 	});
 
@@ -620,13 +722,13 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 		);
 		const refused = (): ILightningError[] =>
 			errors.filter((e) => e.code === 'SPLICE_BROADCAST_REFUSED');
-		// The barrier answered for this splice in this process, so the
-		// per-block driver re-sends straight at the backend.
-		(
-			fx.alice as unknown as { authorizedSpliceBroadcasts: Set<string> }
-		).authorizedSpliceBroadcasts.add(fx.channelId.toString('hex'));
-		fx.backend.failBroadcasts = true;
+		// The first block authorizes the splice through the action path, so
+		// from then on the per-block driver re-sends straight at the backend.
 		fx.alice.handleNewBlock(150);
+		await tick();
+		expect(fx.backend.broadcasts).to.include(fx.spliceTx.toHex());
+		fx.backend.failBroadcasts = true;
+		fx.alice.handleNewBlock(151);
 		await tick();
 		expect(refused()).to.have.length(1);
 		const first = refused()[0];
@@ -641,7 +743,7 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 		expect(logged.data.channelId).to.equal(fx.channelId.toString('hex'));
 		// The same refusal on the next block: the log repeats, the error
 		// does not.
-		fx.alice.handleNewBlock(151);
+		fx.alice.handleNewBlock(152);
 		await tick();
 		expect(refused()).to.have.length(1);
 		expect(
@@ -649,14 +751,14 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 		).to.have.length(2);
 		// A different reason is a different report.
 		fx.backend.failReason = 'min relay fee not met';
-		fx.alice.handleNewBlock(152);
+		fx.alice.handleNewBlock(153);
 		await tick();
 		expect(refused()).to.have.length(2);
 		expect(refused()[1].message).to.include('min relay fee not met');
 		// The network already having the transaction is the outcome wanted,
 		// never a refusal.
 		fx.backend.failReason = 'txn-already-in-mempool';
-		fx.alice.handleNewBlock(153);
+		fx.alice.handleNewBlock(154);
 		await tick();
 		expect(refused()).to.have.length(2);
 		fx.destroy();
@@ -670,9 +772,9 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 		const fx = await setup(7575);
 		const errors: ILightningError[] = [];
 		fx.alice.on('node:error', (e: ILightningError) => errors.push(e));
-		(
-			fx.alice as unknown as { authorizedSpliceBroadcasts: Set<string> }
-		).authorizedSpliceBroadcasts.add(fx.channelId.toString('hex'));
+		// Authorized by the first block, re-sent straight at the backend after.
+		fx.alice.handleNewBlock(150);
+		await tick();
 		// Count the attempts, refused ones included, so the test cannot pass
 		// on a driver that never re-sent anything.
 		const attempts: string[] = [];
@@ -684,10 +786,10 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 		fx.backend.failBroadcasts = true;
 		fx.backend.failReason =
 			'Broadcast failed: Transaction outputs already in utxo set';
-		fx.alice.handleNewBlock(150);
+		fx.alice.handleNewBlock(151);
 		await tick();
 		fx.backend.failReason = 'Transaction already in block chain';
-		fx.alice.handleNewBlock(151);
+		fx.alice.handleNewBlock(152);
 		await tick();
 		expect(
 			attempts.filter((hex) => hex === fx.spliceTx.toHex()),

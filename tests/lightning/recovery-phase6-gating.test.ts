@@ -920,6 +920,80 @@ describe('Recovery phase 6: funding does not outrun its own frame', () => {
 		]);
 		expect(harness.broadcasts).to.equal(2);
 	});
+
+	const fundingCriticalBatch = (tx: Buffer): ChannelAction[] => [
+		{ type: ChannelActionType.PERSIST_STATE },
+		{
+			type: ChannelActionType.BROADCAST_TX,
+			tx,
+			fundingCritical: true
+		} as ChannelAction
+	];
+
+	// Issue #1812: the node's splice retry only skips re-authorizing what
+	// this event reported, so it must fire exactly when the bytes went out.
+	it('a funding-critical broadcast reports its authorization once released, never on a refusal', async () => {
+		const harness = makeHarness();
+		const channelId = crypto.randomBytes(32);
+		const authorized: Array<{ channelId: Buffer | null; tx: Buffer }> = [];
+		harness.manager.on('funding:broadcast-authorized', (id, tx) =>
+			authorized.push({ channelId: id, tx })
+		);
+
+		dispatch(
+			harness.manager,
+			stubChannel(channelId),
+			fundingCriticalBatch(Buffer.from([1]))
+		);
+		expect(authorized, 'still waiting on its frame').to.have.length(0);
+		harness.barrier.advance(1n);
+		await settle();
+		expect(harness.broadcasts).to.equal(1);
+		expect(authorized).to.have.length(1);
+		expect(authorized[0].channelId!.equals(channelId)).to.equal(true);
+		expect(authorized[0].tx.equals(Buffer.from([1]))).to.equal(true);
+
+		harness.nextFrame = 2n;
+		dispatch(
+			harness.manager,
+			stubChannel(crypto.randomBytes(32)),
+			fundingCriticalBatch(Buffer.from([2]))
+		);
+		harness.barrier.refuse('timeout');
+		await settle();
+		expect(harness.broadcasts).to.equal(1);
+		expect(authorized).to.have.length(1);
+
+		// A force close is not a funding broadcast, so it authorizes nothing.
+		dispatch(harness.manager, stubChannel(crypto.randomBytes(32)), [
+			{ type: ChannelActionType.BROADCAST_TX, tx: Buffer.from([3]) }
+		]);
+		expect(harness.broadcasts).to.equal(2);
+		expect(authorized).to.have.length(1);
+	});
+
+	it('a failed persist withholds the broadcast authorization too', () => {
+		const harness = makeHarness(false);
+		const authorized: Buffer[] = [];
+		harness.manager.on('funding:broadcast-authorized', (_id, tx) =>
+			authorized.push(tx)
+		);
+		harness.manager.removeAllListeners('channel:persist');
+		harness.manager.on(
+			'channel:persist',
+			({ request }: IChannelPersistEvent) => {
+				if (request) request.committed = false;
+			}
+		);
+
+		dispatch(
+			harness.manager,
+			stubChannel(crypto.randomBytes(32)),
+			fundingCriticalBatch(Buffer.from([1]))
+		);
+		expect(harness.broadcasts).to.equal(0);
+		expect(authorized).to.have.length(0);
+	});
 });
 
 describe('Recovery phase 6: force close is the exit, never a queue entry', () => {
