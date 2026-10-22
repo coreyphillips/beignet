@@ -3045,6 +3045,14 @@ describe('Lightning Node', function () {
 			expect(lightning.node.PaymentDirection).to.exist;
 		});
 
+		it('should export the ffor, asyncPayments and watchtower namespaces (issue #1683)', function () {
+			expect(lightning.ffor.FforWitnessService).to.be.a('function');
+			expect(lightning.ffor.FforIssuerService).to.be.a('function');
+			expect(lightning.asyncPayments.AsyncPaymentManager).to.be.a('function');
+			expect(lightning.asyncPayments.HeldForwardLedger).to.be.a('function');
+			expect(lightning.watchtower.WatchtowerClient).to.be.a('function');
+		});
+
 		it('should work with NetworkGraph, pathfinding, and onion together', function () {
 			const alice = createNode(1);
 			const bob = createNode(2);
