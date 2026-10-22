@@ -7,7 +7,9 @@
     "sourceMap": true,
     "declarationDir": "./dist/types",
     "outDir": "./dist",
-    "removeComments": true,
+    // Kept off so JSDoc, including @deprecated tags, reaches consumers' editors
+    // through the emitted .d.ts files.
+    "removeComments": false,
     "allowSyntheticDefaultImports": true,
     "isolatedModules": false,
     "resolveJsonModule": true,
