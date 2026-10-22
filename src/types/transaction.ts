@@ -71,8 +71,8 @@ export type TDecodeRawTx = {
 export type TGetTotalFeeObj = {
 	totalFee: number;
 	transactionByteCount: number;
-	satsPerByte: number;
-	maxSatPerByte: number; // Max sats per byte that can be used for a given transaction without exceeding 50% of the balance.
+	satsPerByte: number; // sat/vB
+	maxSatPerByte: number; // Max sat/vB that can be used for a given transaction without exceeding 50% of the balance.
 };
 
 export type TGapLimitOptions = {
