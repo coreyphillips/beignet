@@ -717,6 +717,7 @@ property Transaction.signPsbt: ({ psbt, bip32Interface, keys }: { psbt: bitcoinj
 method Transaction.updateFee({ satsPerByte, selectedFeeId, index, transaction }: { satsPerByte: number; selectedFeeId?: EFeeId; index?: number; transaction?: ISendTransaction; }): Result<{ fee: number; }>
 property Transaction.updateSendTransaction: ({ transaction }: { transaction: Partial<ISendTransaction>; }) => Result<string>
 class Wallet
+private constructor Wallet()
 get Wallet.account(): number
 method Wallet.addGhostTransaction({ txid }: { txid: string; }): Promise<Result<string>>
 method Wallet.addTxInput({ input }: { input: IUtxo; }): Result<IUtxo[]>

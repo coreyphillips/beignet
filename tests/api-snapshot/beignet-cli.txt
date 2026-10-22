@@ -260,6 +260,7 @@ member BeignetErrorCode.WRONG_SIGNER = "WRONG_SIGNER"
 member BeignetErrorCode.ZERO_CONF_FAILED = "ZERO_CONF_FAILED"
 type BeignetErrorCodeValue = `${BeignetErrorCode}`
 class BeignetNode extends TypedEmitter<BeignetNodeEvents>
+private constructor BeignetNode()
 static property BeignetNode.INITIAL_GOSSIP_PRIME_TIMEOUT_MS: number
 method BeignetNode.addTrustedPeer(pubkey: string): TrustedPeerInfo
 method BeignetNode.addWatchtower(uri: string): void

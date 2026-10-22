@@ -167,19 +167,18 @@ const printer = ts.createPrinter(
 );
 
 /**
- * A node as declared, on one line. Whitespace inside string and template
- * literals is part of the type, so it is kept. References print as
- * identityOf names them, and module paths in `import("...").X` types are
- * dropped: moving a file inside src/ is not an API change.
+ * A node as declared, on one line. String and template literals are part of
+ * the type, so their text is kept as is. References print as identityOf
+ * names them, and module paths in `import("...").X` types are dropped:
+ * moving a file inside src/ is not an API change.
  */
 function print(node: ts.Node): string {
 	return printer
 		.printNode(ts.EmitHint.Unspecified, node, node.getSourceFile())
 		.replace(
-			/("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)|\s+/g,
-			(_, literal?: string) => literal ?? ' '
+			/("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)|(\s+)|import\((["'])[^"']*\3\)\./g,
+			(_, literal?: string, space?: string) => literal ?? (space ? ' ' : '')
 		)
-		.replace(/import\((["'])[^"']*\1\)\./g, '')
 		.trim();
 }
 
@@ -203,6 +202,7 @@ function heritage(node: ts.ClassDeclaration | ts.InterfaceDeclaration): string {
 }
 
 const MODIFIERS: [ts.ModifierFlags, string][] = [
+	[ts.ModifierFlags.Private, 'private'],
 	[ts.ModifierFlags.Protected, 'protected'],
 	[ts.ModifierFlags.Static, 'static'],
 	[ts.ModifierFlags.Abstract, 'abstract'],
@@ -243,13 +243,19 @@ function deprecatedInside(owner: string, node: ts.Node): IApiLine[] {
 	return found;
 }
 
-/** One line per member a consumer can reach; private ones are skipped. */
+/**
+ * One line per member a consumer can reach. Private ones are skipped, except
+ * a private constructor, which is what stops a consumer calling `new`.
+ */
 function memberLines(
 	owner: string,
 	members: readonly (ts.ClassElement | ts.TypeElement)[]
 ): IApiLine[] {
 	return members.flatMap((member) => {
-		if (ts.getCombinedModifierFlags(member) & ts.ModifierFlags.Private) {
+		if (
+			ts.getCombinedModifierFlags(member) & ts.ModifierFlags.Private &&
+			!ts.isConstructorDeclaration(member)
+		) {
 			return [];
 		}
 		if (member.name && ts.isPrivateIdentifier(member.name)) return [];

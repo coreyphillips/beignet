@@ -109,6 +109,9 @@ describe('API snapshot lines (issue #1713)', () => {
 					'    get(key: string, fallback: T): T;',
 					'    get(key: string): T | undefined;',
 					'}',
+					'export declare class Pool {',
+					'    private constructor();',
+					'}',
 					"export declare function open(path: string, mode?: 'r' | 'w'): Promise<void>;",
 					'declare const brand: unique symbol;',
 					'export type Verified = string[] & { readonly [brand]: true };',
@@ -118,6 +121,8 @@ describe('API snapshot lines (issue #1713)', () => {
 		).to.deep.equal([
 			'unexported class Base',
 			'method Base.on(event: string): void',
+			'class Pool',
+			'private constructor Pool()',
 			'class Store<T> extends Base',
 			'constructor Store(path: string)',
 			'static readonly property Store.VERSION = 19',
@@ -207,6 +212,7 @@ describe('API snapshot lines (issue #1713)', () => {
 				'util.d.ts': 'export interface Message {\n    type: number;\n}',
 				'wire.d.ts': [
 					'export declare const SEP = "a  b";',
+					'export declare const CODE = \'import("./util").Message\';',
 					'export declare const VERSION = 2;',
 					'export declare function encode(m: import("./util").Message): Uint8Array;'
 				].join('\n')
@@ -215,6 +221,7 @@ describe('API snapshot lines (issue #1713)', () => {
 			'interface Message',
 			'property Message.type: number',
 			'namespace wire',
+			`const wire.CODE = 'import("./util").Message'`,
 			'const wire.SEP = "a  b"',
 			'const wire.VERSION = 2',
 			'function wire.encode(m: Message): Uint8Array'
