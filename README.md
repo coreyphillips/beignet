@@ -340,6 +340,8 @@ The wallet persists through the host-injected `TStorage` interface (`storage: { 
 
 `getData` must return `ok(undefined)` for a key it does not hold and `err` only when the read fails. `Wallet.create` returns an error on a failed read rather than start from defaults and save them over the data it could not read; pass `resetOnReadFailure: true` to start from defaults anyway.
 
+By default every change to the transaction history hands `setData` the whole history. A storage that also implements `setTransactionChanges(key, { set, deleted })` gets only the records that changed: new transactions, confirmations, reorgs, deletions and boosts. Its `getData` must then return the history with those changes applied. Replacing or clearing the history, and the one-time upgrade of old records on load, still go through `setData`. `createEncryptedStorage` does not pass `setTransactionChanges` through, so an encrypted storage keeps receiving the whole history.
+
 Wrap any `TStorage` with `createEncryptedStorage` to encrypt at rest with AES-256-GCM under an HKDF-derived key from the seed. Pre-existing plaintext values pass through unchanged and migrate lazily as they are rewritten.
 
 ```typescript
