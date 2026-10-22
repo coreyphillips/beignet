@@ -85,17 +85,19 @@ describe('API snapshot lines (issue #1713)', () => {
 			[entry],
 			{ types: [] }
 		);
-		return apiLines(program, entry);
+		return apiLines(program, [entry])[0];
 	}
 
 	const texts = (files: Record<string, string>): string[] =>
 		lines(files).map((line) => line.text);
 
-	it('gives each export and each public member a line, and skips private members', () => {
+	it('gives each export, public member and unexported declaration in use a line, keeping overload order', () => {
 		expect(
 			texts({
 				'index.d.ts': [
-					'declare class Base {}',
+					'declare class Base {',
+					'    on(event: string): void;',
+					'}',
 					'export declare class Store<T> extends Base {',
 					'    private secret;',
 					'    #private;',
@@ -104,19 +106,21 @@ describe('API snapshot lines (issue #1713)', () => {
 					'    readonly size: number;',
 					'    static readonly VERSION = 19;',
 					'    constructor(path: string);',
-					'    get(key: string): T | undefined;',
 					'    get(key: string, fallback: T): T;',
+					'    get(key: string): T | undefined;',
 					'}',
 					"export declare function open(path: string, mode?: 'r' | 'w'): Promise<void>;",
 					'export {};'
 				].join('\n')
 			})
 		).to.deep.equal([
+			'unexported class Base',
+			'method Base.on(event: string): void',
 			'class Store<T> extends Base',
 			'constructor Store(path: string)',
 			'static readonly property Store.VERSION = 19',
-			'method Store.get(key: string): T | undefined',
 			'method Store.get(key: string, fallback: T): T',
+			'method Store.get(key: string): T | undefined',
 			'protected method Store.guard(): void',
 			'static method Store.open(path: string): Store<string>',
 			'readonly property Store.size: number',
@@ -124,13 +128,14 @@ describe('API snapshot lines (issue #1713)', () => {
 		]);
 	});
 
-	it('qualifies namespace members and drops module paths from import() types', () => {
+	it('qualifies namespace members, keeps literal spacing and drops module paths from import() types', () => {
 		expect(
 			texts({
 				'index.d.ts':
 					"export * as wire from './wire';\nexport * from './util';",
 				'util.d.ts': 'export interface Message {\n    type: number;\n}',
 				'wire.d.ts': [
+					'export declare const SEP = "a  b";',
 					'export declare const VERSION = 2;',
 					'export declare function encode(m: import("./util").Message): Uint8Array;'
 				].join('\n')
@@ -139,6 +144,7 @@ describe('API snapshot lines (issue #1713)', () => {
 			'interface Message',
 			'property Message.type: number',
 			'namespace wire',
+			'const wire.SEP = "a  b"',
 			'const wire.VERSION = 2',
 			'function wire.encode(m: Message): Uint8Array'
 		]);
@@ -151,6 +157,15 @@ describe('API snapshot lines (issue #1713)', () => {
 				'    start(): void;',
 				'}',
 				'export type { Engine };',
+				'declare namespace tools {',
+				'    function go(): void;',
+				'}',
+				'export type { tools };',
+				'export type Server = {',
+				'    /** @deprecated Use url. */',
+				'    host: string;',
+				'    url: string;',
+				'};',
 				'/** @deprecated Pass an options object. */',
 				'export declare function run(fast: boolean): void;',
 				'export declare function run(opts?: { fast?: boolean }): void;',
@@ -164,12 +179,14 @@ describe('API snapshot lines (issue #1713)', () => {
 		});
 		expect(result.map((line) => line.text)).to.include.members([
 			'type-only class Engine',
-			'method Engine.start(): void'
+			'method Engine.start(): void',
+			'type-only namespace tools'
 		]);
 		expect(
 			result.filter((line) => line.deprecated).map((line) => line.text)
 		).to.deep.equal([
 			'property Options.timeout?: number',
+			'property Server.host: string',
 			'function run(fast: boolean): void'
 		]);
 	});

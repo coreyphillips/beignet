@@ -30,6 +30,11 @@ export interface IApiLine {
 	/** Kind, qualified name and signature. */
 	text: string;
 	deprecated: boolean;
+	/**
+	 * A member of an object type inside another line's signature, which that
+	 * line already records, so it is listed in deprecated.txt only.
+	 */
+	inner?: boolean;
 }
 
 /** Read from package.json, so a new entry point cannot go unrecorded. */
@@ -140,13 +145,18 @@ export function declarationProgram(
 const printer = ts.createPrinter({ removeComments: true });
 
 /**
- * A node as declared, on one line. Module paths in `import("...").X` types
- * are dropped, so moving a file inside src/ does not change the snapshot.
+ * A node as declared, on one line. Whitespace inside string and template
+ * literals is part of the type, so it is kept. Module paths in
+ * `import("...").X` types are dropped, so moving a file inside src/ does not
+ * change the snapshot.
  */
 function print(node: ts.Node): string {
 	return printer
 		.printNode(ts.EmitHint.Unspecified, node, node.getSourceFile())
-		.replace(/\s+/g, ' ')
+		.replace(
+			/("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)|\s+/g,
+			(_, literal?: string) => literal ?? ' '
+		)
 		.replace(/import\((["'])[^"']*\1\)\./g, '')
 		.trim();
 }
@@ -192,6 +202,25 @@ function apiLine(name: string, text: string, node: ts.Node): IApiLine {
 	return { name, text, deprecated: isDeprecated(node) };
 }
 
+/**
+ * The members tagged @deprecated in the object types inside a one-line
+ * signature, such as an options parameter or an aliased object type.
+ */
+function deprecatedInside(owner: string, node: ts.Node): IApiLine[] {
+	const found: IApiLine[] = [];
+	const visit = (child: ts.Node): void => {
+		if (!ts.isTypeLiteralNode(child)) {
+			ts.forEachChild(child, visit);
+			return;
+		}
+		for (const line of memberLines(owner, child.members)) {
+			if (line.deprecated) found.push({ ...line, inner: true });
+		}
+	};
+	visit(node);
+	return found;
+}
+
 /** One line per member a consumer can reach; private ones are skipped. */
 function memberLines(
 	owner: string,
@@ -229,7 +258,10 @@ function memberLines(
 		} else {
 			throw new Error(`${owner}: no rule for ${ts.SyntaxKind[member.kind]}`);
 		}
-		return [apiLine(name, modifiers(member) + text, member)];
+		return [
+			apiLine(name, modifiers(member) + text, member),
+			...deprecatedInside(name, member)
+		];
 	});
 }
 
@@ -241,7 +273,8 @@ function declarationLines(
 ): IApiLine[] {
 	const only = typeOnly ? 'type-only ' : '';
 	if (ts.isFunctionDeclaration(node)) {
-		return [apiLine(name, `${only}function ${name}${signature(node)}`, node)];
+		const text = `${only}function ${name}${signature(node)}`;
+		return [apiLine(name, text, node), ...deprecatedInside(name, node)];
 	}
 	if (ts.isClassDeclaration(node)) {
 		const text = `${only}${modifiers(node)}class ${name}${typeParameters(
@@ -255,7 +288,7 @@ function declarationLines(
 	}
 	if (ts.isTypeAliasDeclaration(node)) {
 		const text = `type ${name}${typeParameters(node)} = ${print(node.type)}`;
-		return [apiLine(name, text, node)];
+		return [apiLine(name, text, node), ...deprecatedInside(name, node.type)];
 	}
 	if (ts.isEnumDeclaration(node)) {
 		const isConst = ts.getCombinedModifierFlags(node) & ts.ModifierFlags.Const;
@@ -281,7 +314,10 @@ function declarationLines(
 				: 'var';
 		const type = node.type ? `: ${print(node.type)}` : '';
 		const value = node.initializer ? ` = ${print(node.initializer)}` : '';
-		return [apiLine(name, `${only}${kind} ${name}${type}${value}`, node)];
+		return [
+			apiLine(name, `${only}${kind} ${name}${type}${value}`, node),
+			...deprecatedInside(name, node)
+		];
 	}
 	throw new Error(`${name}: no rule for ${ts.SyntaxKind[node.kind]}`);
 }
@@ -307,57 +343,135 @@ function compare(a: string, b: string): number {
 	return a < b ? -1 : a > b ? 1 : 0;
 }
 
+function declaresApi(node: ts.Node): boolean {
+	return (
+		ts.isClassDeclaration(node) ||
+		ts.isInterfaceDeclaration(node) ||
+		ts.isTypeAliasDeclaration(node) ||
+		ts.isEnumDeclaration(node) ||
+		ts.isFunctionDeclaration(node) ||
+		ts.isVariableDeclaration(node)
+	);
+}
+
 /**
- * Every exported name of the module `entry`, namespaces walked, sorted by
- * qualified name so a class's members follow it.
+ * Lines for the declarations that recorded signatures use but no entry point
+ * exports, such as a base class, marked `unexported`: consumers depend on
+ * their members as much as on the exported ones.
  */
-export function apiLines(program: ts.Program, entry: string): IApiLine[] {
+function unexportedLines(
+	program: ts.Program,
+	declared: ts.Node[],
+	exported: Set<ts.Symbol>
+): IApiLine[] {
 	const checker = program.getTypeChecker();
-	const source = program.getSourceFile(entry);
-	const moduleSymbol = source && checker.getSymbolAtLocation(source);
-	if (!moduleSymbol) throw new Error(`${entry} is not an emitted module`);
+	const seen = new Set(exported);
 	const lines: IApiLine[] = [];
-	const walk = (
-		container: ts.Symbol,
-		prefix: string,
-		open: ts.Symbol[]
-	): void => {
-		for (const exported of checker.getExportsOfModule(container)) {
-			const name = prefix + exported.name;
-			const target =
-				exported.flags & ts.SymbolFlags.Alias
-					? checker.getAliasedSymbol(exported)
-					: exported;
-			const declarations = target.declarations ?? [];
-			if (!declarations.length) {
-				throw new Error(`${name} does not resolve to a declaration`);
-			}
-			const typeOnly =
-				isTypeOnlyExport(checker, exported) &&
-				(target.flags & ts.SymbolFlags.Value) !== 0;
-			const namespaces = declarations.filter(
-				(d) => ts.isSourceFile(d) || ts.isModuleDeclaration(d)
-			);
-			for (const node of declarations) {
-				if (!namespaces.includes(node)) {
-					lines.push(...declarationLines(name, node, typeOnly));
-				}
-			}
-			if (!namespaces.length) continue;
-			lines.push({
-				name,
-				text: `namespace ${name}`,
-				deprecated: namespaces.some(isDeprecated)
-			});
-			if (open.includes(target)) {
-				throw new Error(`${name} re-exports a namespace that contains it`);
-			}
-			walk(target, `${name}.`, [...open, target]);
+	const visit = (node: ts.Node): void => {
+		const reference = ts.isTypeReferenceNode(node)
+			? node.typeName
+			: ts.isExpressionWithTypeArguments(node)
+			? node.expression
+			: ts.isTypeQueryNode(node)
+			? node.exprName
+			: ts.isImportTypeNode(node)
+			? node.qualifier
+			: undefined;
+		let symbol = reference && checker.getSymbolAtLocation(reference);
+		if (symbol && symbol.flags & ts.SymbolFlags.Alias) {
+			symbol = checker.getAliasedSymbol(symbol);
 		}
+		if (symbol && !seen.has(symbol)) {
+			seen.add(symbol);
+			for (const declaration of symbol.declarations ?? []) {
+				const file = declaration.getSourceFile();
+				if (
+					!declaresApi(declaration) ||
+					program.isSourceFileFromExternalLibrary(file) ||
+					program.isSourceFileDefaultLibrary(file)
+				) {
+					continue;
+				}
+				const [head, ...rest] = declarationLines(
+					symbol.name,
+					declaration,
+					false
+				);
+				lines.push({ ...head, text: `unexported ${head.text}` }, ...rest);
+				visit(declaration);
+			}
+		}
+		ts.forEachChild(node, visit);
 	};
-	walk(moduleSymbol, '', [moduleSymbol]);
-	lines.sort((a, b) => compare(a.name, b.name) || compare(a.text, b.text));
-	return lines.filter((line, i) => i === 0 || line.text !== lines[i - 1].text);
+	declared.forEach(visit);
+	return lines;
+}
+
+/**
+ * For each module in `entries`, every exported name, namespaces walked, and
+ * the unexported declarations their signatures use. Lines are sorted by
+ * qualified name so a class's members follow it. Within a name they keep
+ * declaration order, as overload order changes what a consumer's types see.
+ */
+export function apiLines(program: ts.Program, entries: string[]): IApiLine[][] {
+	const checker = program.getTypeChecker();
+	const exported = new Set<ts.Symbol>();
+	const walked = entries.map((entry) => {
+		const source = program.getSourceFile(entry);
+		const moduleSymbol = source && checker.getSymbolAtLocation(source);
+		if (!moduleSymbol) throw new Error(`${entry} is not an emitted module`);
+		const lines: IApiLine[] = [];
+		const declared: ts.Node[] = [];
+		const walk = (
+			container: ts.Symbol,
+			prefix: string,
+			open: ts.Symbol[]
+		): void => {
+			for (const symbol of checker.getExportsOfModule(container)) {
+				const name = prefix + symbol.name;
+				const target =
+					symbol.flags & ts.SymbolFlags.Alias
+						? checker.getAliasedSymbol(symbol)
+						: symbol;
+				const declarations = target.declarations ?? [];
+				if (!declarations.length) {
+					throw new Error(`${name} does not resolve to a declaration`);
+				}
+				exported.add(target);
+				const typeOnly =
+					isTypeOnlyExport(checker, symbol) &&
+					(target.flags & ts.SymbolFlags.Value) !== 0;
+				const namespaces = declarations.filter(
+					(d) => ts.isSourceFile(d) || ts.isModuleDeclaration(d)
+				);
+				for (const node of declarations) {
+					if (!namespaces.includes(node)) {
+						lines.push(...declarationLines(name, node, typeOnly));
+						declared.push(node);
+					}
+				}
+				if (!namespaces.length) continue;
+				lines.push({
+					name,
+					text: `${typeOnly ? 'type-only ' : ''}namespace ${name}`,
+					deprecated: namespaces.some(isDeprecated)
+				});
+				if (open.includes(target)) {
+					throw new Error(`${name} re-exports a namespace that contains it`);
+				}
+				walk(target, `${name}.`, [...open, target]);
+			}
+		};
+		walk(moduleSymbol, '', [moduleSymbol]);
+		return { lines, declared };
+	});
+	return walked.map(({ lines, declared }) => {
+		lines.push(...unexportedLines(program, declared, exported));
+		lines.sort((a, b) => compare(a.name, b.name));
+		return lines.filter(
+			(line, i) => i === 0 || line.text !== lines[i - 1].text
+		);
+	});
 }
 
 /** Every file under tests/api-snapshot/, keyed by name, as it should read. */
@@ -374,13 +488,17 @@ export function renderSnapshots(): Map<string, string> {
 	);
 	const snapshots = new Map<string, string>();
 	const deprecated: string[] = [];
-	for (const entry of entries) {
-		const lines = apiLines(program, path.join(ROOT, entry.types));
+	const perEntry = apiLines(
+		program,
+		entries.map((entry) => path.join(ROOT, entry.types))
+	);
+	for (const [i, entry] of entries.entries()) {
+		const lines = perEntry[i];
 		snapshots.set(
 			entry.file,
 			[
 				`# The exported API of ${entry.specifier}. Regenerate with npm run api:snapshot; do not edit.`,
-				...lines.map((line) => line.text),
+				...lines.filter((line) => !line.inner).map((line) => line.text),
 				''
 			].join('\n')
 		);

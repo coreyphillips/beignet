@@ -13,8 +13,8 @@ member EAddressType.p2sh = "p2sh"
 member EAddressType.p2tr = "p2tr"
 member EAddressType.p2wpkh = "p2wpkh"
 member EAddressType.p2wsh = "p2wsh"
-namespace EAvailableNetworks
 type EAvailableNetworks = Network
+namespace EAvailableNetworks
 const EAvailableNetworks.bitcoin = Network.bitcoin
 type EAvailableNetworks.bitcoin = Network.bitcoin
 const EAvailableNetworks.bitcoinMainnet = Network.bitcoin
@@ -118,6 +118,11 @@ method Electrum.utxoScanAddresses({ scanningStrategy, addressIndex, changeAddres
 get Electrum.wallet(): Wallet
 type ElectrumConnectionPubSub = { publish: (isConnected: boolean) => void; subscribe: (callback: (isConnected: boolean) => void) => ElectrumConnectionSubscription; }
 type ElectrumConnectionSubscription = { remove(): void; }
+unexported class Err<T>
+constructor Err(error: CodedError)
+readonly property Err.error: CodedError
+method Err.isErr(): this is Err<T>
+method Err.isOk(): this is Ok<T>
 interface IAddInput
 property IAddInput.input: IUtxo
 property IAddInput.keyPair?: BIP32Interface | ECPairInterface
@@ -133,8 +138,8 @@ interface IAddressData
 property IAddressData.label: string
 property IAddressData.path: string
 property IAddressData.type: 'p2wpkh' | 'p2sh' | 'p2pkh'
-index IAddressType[key: string]: IAddressData
 interface IAddressType
+index IAddressType[key: string]: IAddressData
 interface IAddressTypeData
 property IAddressTypeData.description: string
 property IAddressTypeData.example: string
@@ -145,8 +150,8 @@ property IAddressTypeData.type: EAddressType
 interface IAddressTypesIO
 property IAddressTypesIO.inputs: { [key in EAddressType]: number; }
 property IAddressTypesIO.outputs: { [key in EAddressType]: number; }
-index IAddresses[scriptHash: string]: IAddress
 interface IAddresses
+index IAddresses[scriptHash: string]: IAddress
 interface IBalanceBreakdown
 property IBalanceBreakdown.frozen: number
 property IBalanceBreakdown.spendable: number
@@ -164,8 +169,8 @@ property IBoostedTransaction.childTransaction: string
 property IBoostedTransaction.fee: number
 property IBoostedTransaction.parentTransactions: string[]
 property IBoostedTransaction.type: EBoostType
-index IBoostedTransactions[txId: string]: IBoostedTransaction
 interface IBoostedTransactions
+index IBoostedTransactions[txId: string]: IBoostedTransaction
 interface IBtInfo
 property IBtInfo.nodes: ILspNode[]
 property IBtInfo.onchain: { network: Network; feeRates: { fast: number; mid: number; slow: number; }; }
@@ -289,8 +294,8 @@ property IFormattedTransaction.value: number
 property IFormattedTransaction.valueSats?: Sats
 property IFormattedTransaction.vin: TFormattedVin[]
 property IFormattedTransaction.vsize: number
-index IFormattedTransactions[key: string]: IFormattedTransaction
 interface IFormattedTransactions
+index IFormattedTransactions[key: string]: IFormattedTransaction
 interface IGenerateAddresses
 property IGenerateAddresses.addressAmount?: number
 property IGenerateAddresses.addressIndex?: number
@@ -406,6 +411,10 @@ method ILogger.debug(message: string, meta?: unknown): void
 method ILogger.error(message: string, meta?: unknown): void
 method ILogger.info(message: string, meta?: unknown): void
 method ILogger.warn(message: string, meta?: unknown): void
+unexported interface ILspNode
+property ILspNode.alias: string
+property ILspNode.connectionStrings: string[]
+property ILspNode.pubkey: string
 interface IMultisigCosigner
 property IMultisigCosigner.masterFingerprint?: string
 property IMultisigCosigner.originPath?: string
@@ -622,6 +631,11 @@ member Network.regtest = "regtest"
 member Network.signet = "signet"
 member Network.testnet = "testnet"
 type ObjectKeys<T extends object> = `${Exclude<keyof T, symbol>}`
+unexported class Ok<T>
+constructor Ok(value: T)
+method Ok.isErr(): this is Err<T>
+method Ok.isOk(): this is Ok<T>
+readonly property Ok.value: T
 type Result<T> = Ok<T> | Err<T>
 type Sats = number
 type TAddressIndexInfo = { addressIndex: IAddress; changeAddressIndex: IAddress; lastUsedAddressIndex: IAddress; lastUsedChangeAddressIndex: IAddress; }

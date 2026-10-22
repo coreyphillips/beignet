@@ -24,6 +24,11 @@ property ApiResponse.error?: { code: string; message: string; paymentHash?: Paym
 property ApiResponse.ok: boolean
 property ApiResponse.result?: T
 type ApiScope = 'readonly' | 'invoice' | 'admin'
+unexported interface AuthFailure
+property AuthFailure.ok: false
+unexported interface AuthOverrideStore
+method AuthOverrideStore.load(): Record<string, StoredKeyOverride> | null
+method AuthOverrideStore.save(overrides: Record<string, StoredKeyOverride>): void
 type AuthResult = AuthSuccess | AuthFailure
 interface AuthSuccess
 property AuthSuccess.keyName: string | null
@@ -639,6 +644,7 @@ interface BootstrapPeerInfo
 property BootstrapPeerInfo.host: string
 property BootstrapPeerInfo.port: number
 property BootstrapPeerInfo.pubkey: string
+unexported type CanSendFn = (amountSats: number) => { canSend: boolean; availableSats: number; }
 enum ChannelFundingUnavailableCode
 member ChannelFundingUnavailableCode.CHANNEL_NOT_FOUND = "CHANNEL_NOT_FOUND"
 member ChannelFundingUnavailableCode.FEE_ESTIMATE_NOT_READY = "FEE_ESTIMATE_NOT_READY"
@@ -767,6 +773,10 @@ property DirectFundingConfigInfo.minAmountSat: number
 property DirectFundingConfigInfo.targetInboundSat: number
 property DirectFundingConfigInfo.trusted: boolean
 property DirectFundingConfigInfo.unpairedSpliceDepth: number
+unexported interface ElectrumTlsConfig
+property ElectrumTlsConfig.electrumTlsFingerprints?: string[]
+property ElectrumTlsConfig.electrumTlsVerify?: boolean
+unexported type EventMap<E> = { [K in keyof E]: (...args: any[]) => void; }
 interface EventMessage
 property EventMessage.data: Record<string, unknown>
 property EventMessage.type: string
@@ -780,6 +790,17 @@ property FeeSnapshot.percentile: number
 property FeeSnapshot.recommendation: 'OPEN_NOW' | 'WAIT' | 'NEUTRAL'
 property FeeSnapshot.sampleCount: number
 property FeeSnapshot.trend: 'RISING' | 'FALLING' | 'STABLE'
+unexported interface FforReceiveFunding
+property FforReceiveFunding.enabled: boolean
+property FforReceiveFunding.maxChannelSats: number
+property FforReceiveFunding.maxChannels: number
+property FforReceiveFunding.maxChannelsPerPeer: number
+property FforReceiveFunding.maxTotalSats: number
+unexported class FforReceiveService
+constructor FforReceiveService(host: BeignetNode, settle: { enabled: boolean; feeBaseMsat?: number; feePpm?: number; } | undefined, funding?: FforReceiveFunding | undefined, concurrent?: boolean)
+method FforReceiveService.receipts(channelId: string): Promise<void>
+method FforReceiveService.request(peer: string, body: Record<string, unknown>, timeout?: number): Promise<any>
+method FforReceiveService.stop(): void
 interface ForwardingEventInfo
 property ForwardingEventInfo.amountInMsat: string
 property ForwardingEventInfo.amountOutMsat: string
@@ -934,6 +955,9 @@ method IPaymentQueueStorage.deleteQueueEntry(id: string): void
 method IPaymentQueueStorage.loadAllQueueEntries(): Array<{ id: string; bolt11: string; priority: number; status: string; amountSats?: number; maxFeeSats?: number; metadata?: string; error?: string; createdAt: number; completedAt?: number; }>
 method IPaymentQueueStorage.saveQueueEntry(entry: { id: string; bolt11: string; priority: number; status: string; amountSats?: number; maxFeeSats?: number; metadata?: string; createdAt: number; }): void
 method IPaymentQueueStorage.updateQueueEntryStatus(id: string, status: string, error?: string, completedAt?: number): void
+unexported interface IReportedGuardian
+property IReportedGuardian.guardianId: string
+property IReportedGuardian.transports: Array<{ type: GuardianTransportType; url: string; }>
 interface IStartedDaemon
 property IStartedDaemon.logger?: ILogger
 property IStartedDaemon.node: BeignetNode
@@ -965,6 +989,10 @@ property InvoiceInfo.expiry?: number
 property InvoiceInfo.paymentHash: PaymentHashHex
 property InvoiceInfo.paymentSecret?: string
 property InvoiceInfo.status?: 'PENDING' | 'PAID' | 'EXPIRED'
+unexported interface IrohDaemonConfig
+property IrohDaemonConfig.iroh?: boolean
+property IrohDaemonConfig.irohDiscovery?: boolean
+property IrohDaemonConfig.irohRelays?: string[]
 interface JitQuoteInfo
 property JitQuoteInfo.accepted: boolean
 property JitQuoteInfo.amountSats: number | null
@@ -1066,6 +1094,17 @@ property OfferInfo.issuer?: string
 property OfferInfo.issuerId?: string
 property OfferInfo.offerId: string
 property OfferInfo.quantityMax?: number
+unexported class OfflineReceive
+constructor OfflineReceive(node: BeignetNode, save: (jobs: OfflineReceiveJob[]) => void, initial: OfflineReceiveJob[], now?: () => number)
+method OfflineReceive.create(body: any, peer: string): Promise<any>
+method OfflineReceive.ownsInvoice(hash: string): boolean
+method OfflineReceive.quote(peer: string, amountSats: number, requestId?: string): Promise<any>
+method OfflineReceive.reservedIds(): Set<string>
+method OfflineReceive.status(): { available: boolean; reservedChannelIds: string[]; requests: { reservedInboundSats?: number | undefined; unresolvedSlots?: number | undefined; kind: OfflineReceiveKind; id: string; peer: string; amountSats: number; allocationId?: string | undefined; channelId?: string | undefined; epochId?: string | undefined; concurrent?: boolean | undefined; concurrentVersion?: 1 | 2 | undefined; previousEpochId?: string | undefined; expiresAt?: number | undefined; invoice?: any; request?: string | undefined; paymentHash?: string | undefined; done?: boolean | undefined; }[]; }
+method OfflineReceive.stop(): void
+method OfflineReceive.sync(): Promise<void>
+unexported type OfflineReceiveJob = { id: string; peer: string; amountSats: number; kind?: OfflineReceiveKind; allocationId?: string; channelId?: string; epochId?: string; concurrent?: boolean; concurrentVersion?: 1 | 2; previousEpochId?: string; expiresAt?: number; invoice?: any; request?: string; paymentHash?: string; done?: boolean; }
+unexported type OfflineReceiveKind = 'bolt11' | 'direct-funding'
 interface OnchainSweepInfo
 property OnchainSweepInfo.address: string
 property OnchainSweepInfo.amountSats?: number
@@ -1111,6 +1150,7 @@ property PayAllQuote.minRecipientMsat: string
 property PayAllQuote.remainderMsat: string
 property PayAllQuote.routeFound: boolean
 property PayAllQuote.searchExhausted: boolean
+unexported type PayInvoiceSafeFn = (bolt11: string, timeoutMs?: number, maxFeeSats?: number, amountSats?: number, metadata?: Record<string, string>) => Promise<{ status: string; paymentHash: string; }>
 interface PaymentEstimate
 property PaymentEstimate.alternativeAvailable: boolean
 property PaymentEstimate.estimatedFeeMsat: string
@@ -1260,6 +1300,7 @@ property RebalanceResult.feeMsat: string
 property RebalanceResult.feeSats: number
 property RebalanceResult.hops: number
 property RebalanceResult.paymentHash: PaymentHashHex
+unexported type RecoveryMode = 'off' | 'peer-storage' | 'async-remote' | 'quorum'
 interface RetryPaymentOptions
 property RetryPaymentOptions.amountSats?: number
 property RetryPaymentOptions.backoffMs?: number
@@ -1293,6 +1334,12 @@ interface SpliceResult
 property SpliceResult.code?: SpliceRefusalCode
 property SpliceResult.error?: string
 property SpliceResult.ok: boolean
+unexported interface StoredKeyOverride
+property StoredKeyOverride.configDigest: string
+property StoredKeyOverride.expiresAt?: string
+property StoredKeyOverride.keyDigest?: string
+property StoredKeyOverride.revoked?: boolean
+property StoredKeyOverride.rotatedAt?: string
 interface SwapsStatusInfo
 property SwapsStatusInfo.counts?: Record<string, number>
 property SwapsStatusInfo.enabled: boolean
@@ -1311,6 +1358,19 @@ interface TxInfo
 property TxInfo.hex: string
 property TxInfo.txid: TxidHex
 type TxidHex = string
+unexported class TypedEmitter<E extends EventMap<E>> extends EventEmitter
+method TypedEmitter.addListener<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.emit<K extends keyof E & string>(event: K, ...args: Parameters<E[K]>): boolean
+method TypedEmitter.listenerCount<K extends keyof E & string>(event: K): number
+method TypedEmitter.listeners<K extends keyof E & string>(event: K): E[K][]
+method TypedEmitter.off<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.on<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.once<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.prependListener<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.prependOnceListener<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.rawListeners<K extends keyof E & string>(event: K): E[K][]
+method TypedEmitter.removeAllListeners<K extends keyof E & string>(event?: K): this
+method TypedEmitter.removeListener<K extends keyof E & string>(event: K, listener: E[K]): this
 interface UtxoInfo
 property UtxoInfo.address: string
 property UtxoInfo.frozen: boolean
@@ -1327,6 +1387,7 @@ method WebhookManager.register(url: string, events: string[], secret?: string): 
 get WebhookManager.size(): number
 method WebhookManager.unregister(id: string): boolean
 interface WebhookRegistration
+unexported interface WebhookRegistration
 property WebhookRegistration.createdAt: number
 property WebhookRegistration.events: string[]
 property WebhookRegistration.id: string

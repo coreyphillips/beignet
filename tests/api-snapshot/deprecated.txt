@@ -1,6 +1,6 @@
 # Every exported declaration tagged @deprecated. Regenerate with npm run api:snapshot; do not edit.
-beignet: namespace EAvailableNetworks
 beignet: type EAvailableNetworks = Network
+beignet: namespace EAvailableNetworks
 beignet: property IBtInfo.version: number
 beignet: property IFormattedTransaction.fee: number
 beignet: property IFormattedTransaction.matchedInputValue: number
@@ -27,6 +27,9 @@ beignet: method Wallet.getScriptHashBalance(scriptHash: string): Promise<Result<
 beignet: method Wallet.getTransactionDetails(tx_hash: string): Promise<Result<TTxDetails>>
 beignet: method Wallet.getUtxos(params: Parameters<Wallet['refreshUtxos']>[0]): Promise<Result<IGetUtxosResponse>>
 beignet: method Wallet.isUtxoFrozen(txid: string, index: number): boolean
+beignet: property Wallet.send.broadcast?: boolean
+beignet: property Wallet.sendMany.broadcast?: boolean
+beignet: property Wallet.sendMax.broadcast?: boolean
 beignet: const getBitcoinJsNetwork: (network: Network | `${Network}`) => BitcoinJsNetwork
 beignet: const getElectrumNetwork: (network: Network) => EElectrumNetworks
 beignet/lightning: method node.LightningNode.openZeroConfChannel(peerPubkey: string, fundingSatoshis: bigint, pushMsat?: bigint): Channel

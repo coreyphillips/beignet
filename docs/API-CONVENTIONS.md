@@ -2,7 +2,7 @@
 
 The rules for new public API, and the old names they replaced. Existing internals keep their names. A public name changes only behind a deprecated wrapper, which stays for at least one minor release and goes in the next major.
 
-`tests/api-snapshot/` records every exported name and signature, one file per entry point, and CI fails when the build no longer matches it. A change that means to alter the public API regenerates it with `npm run api:snapshot`, and the diff is reviewed with the change: outside a major release it should only add lines. `tests/api-snapshot/deprecated.txt` lists every declaration tagged `@deprecated`, which is what the next major removes.
+`tests/api-snapshot/` records every exported name and signature, one file per entry point, and CI fails when the build no longer matches it. It also records the declarations those signatures use that no entry point exports, such as a base class, marked `unexported`. A change that means to alter the public API regenerates it with `npm run api:snapshot`, and the diff is reviewed with the change: outside a major release it should only add lines. `tests/api-snapshot/deprecated.txt` lists every declaration tagged `@deprecated`, which is what the next major removes.
 
 ## Rules for new code
 

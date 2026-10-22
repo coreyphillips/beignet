@@ -1,4 +1,89 @@
 # The exported API of beignet/lightning. Regenerate with npm run api:snapshot; do not edit.
+unexported type EventMap<E> = { [K in keyof E]: (...args: any[]) => void; }
+unexported interface ICompactHtlcHistory
+property ICompactHtlcHistory.entries: IHistoryEntry[]
+property ICompactHtlcHistory.snapshots: { commitmentNumber: string; prefix: number; remove: number; add: number[]; }[]
+property ICompactHtlcHistory.version: 1
+unexported interface IDfPathClaim
+property IDfPathClaim.deliver: DfFrameHandler
+property IDfPathClaim.reply: IDfLaneSender
+property IDfPathClaim.requestIdHex: string
+unexported interface IDurableLedgerStore<R extends ILedgerRecord>
+method IDurableLedgerStore.delete(id: string): void
+method IDurableLedgerStore.load(id: string): R | null
+method IDurableLedgerStore.loadAll(): R[]
+method IDurableLedgerStore.put(record: R): void
+method IDurableLedgerStore.transaction<T>(fn: () => T): T
+unexported interface IHistoryEntry
+property IHistoryEntry.amountMsat: string
+property IHistoryEntry.cltvExpiry: number
+property IHistoryEntry.direction: HtlcDirection
+property IHistoryEntry.paymentHash: string
+unexported interface ILeaseOffer
+property ILeaseOffer.leaseRates: ILeaseRates
+property ILeaseOffer.sellerNodeId: string
+unexported interface ILeaseQuote
+property ILeaseQuote.feeRatePct: number
+property ILeaseQuote.feeSats: bigint
+property ILeaseQuote.offer: ILeaseOffer
+property ILeaseQuote.requestedSats: bigint
+unexported interface ILedgerCodec<R extends ILedgerRecord>
+method ILedgerCodec.decode(raw: string): R | null
+method ILedgerCodec.encode(record: R): string
+unexported interface ILedgerRecord
+property ILedgerRecord.id: string
+property ILedgerRecord.state: string
+unexported interface ILedgerTransitionResult<R extends ILedgerRecord>
+property ILedgerTransitionResult.actualState?: string
+property ILedgerTransitionResult.outcome: LedgerTransitionOutcome
+property ILedgerTransitionResult.record?: R
+unexported interface IResult
+method IResult.isErr(): boolean
+method IResult.isOk(): boolean
+unexported interface ISpliceUtxo
+property ISpliceUtxo.address: string
+property ISpliceUtxo.height: number
+property ISpliceUtxo.path: string
+property ISpliceUtxo.publicKey: string
+property ISpliceUtxo.tx_hash: string
+property ISpliceUtxo.tx_pos: number
+property ISpliceUtxo.value: number
+unexported interface ITowerConnectionOptions
+property ITowerConnectionOptions.address: ITowerAddress
+property ITowerConnectionOptions.connectTimeoutMs?: number
+property ITowerConnectionOptions.localPrivateKey: Buffer
+property ITowerConnectionOptions.socks5Proxy?: { host: string; port: number; }
+property ITowerConnectionOptions.socks5ProxyScope?: Socks5ProxyScope
+unexported interface IZeroReserveConfig
+property IZeroReserveConfig.advertise?: boolean
+property IZeroReserveConfig.role?: 'wallet' | 'primary'
+property IZeroReserveConfig.waiveClientReserve?: boolean
+unexported interface IZeroReservePolicy
+property IZeroReservePolicy.acceptWaiver: boolean
+property IZeroReservePolicy.waiveOnOpen: boolean
+property IZeroReservePolicy.waivePeer: boolean
+unexported type JitFeeMode = 'skim' | 'hop'
+unexported type LedgerTransitionOutcome = 'applied' | 'stale' | 'missing' | 'storage_failed' | 'not_rehydrated'
+unexported type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void
+unexported type PeerState = 'disconnected' | 'connecting' | 'handshaking' | 'init' | 'ready' | 'closing'
+unexported type SubmarineSwapEventName = 'swap:created' | 'swap:funding-seen' | 'swap:funded' | 'swap:funding-lost' | 'swap:paying' | 'swap:payment-unresolved' | 'swap:preimage' | 'swap:claim-broadcast' | 'swap:claim-confirmed' | 'swap:payment-failed' | 'swap:exposed' | 'swap:cancelled' | 'swap:failed'
+unexported type SwapEventName = 'swap:created' | 'swap:held' | 'swap:funding' | 'swap:funded' | 'swap:claimed' | 'swap:settled' | 'swap:refund-broadcast' | 'swap:refunded' | 'swap:hold-cancelled' | 'swap:exposed' | 'swap:failed'
+unexported type SyncSnapshot = Pick<IFforSyncReplyMessage, 'numSlots' | 'settled' | 'preimages'>
+unexported type TGraphRestoreStorage = Pick<IStorageBackend, 'loadAllGossipChannels' | 'loadAllGossipNodes' | 'loadGossipChannelsAfter' | 'loadGossipNodesAfter' | 'deleteGossipChannel' | 'deleteGossipNode'>
+unexported type TlvHandler = (fromPeer: string, tlvType: number, data: Buffer, replyPath?: IBlindedPath, pathId?: Buffer, blindingPoint?: Buffer) => void
+unexported class TypedEmitter<E extends EventMap<E>> extends EventEmitter
+method TypedEmitter.addListener<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.emit<K extends keyof E & string>(event: K, ...args: Parameters<E[K]>): boolean
+method TypedEmitter.listenerCount<K extends keyof E & string>(event: K): number
+method TypedEmitter.listeners<K extends keyof E & string>(event: K): E[K][]
+method TypedEmitter.off<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.on<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.once<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.prependListener<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.prependOnceListener<K extends keyof E & string>(event: K, listener: E[K]): this
+method TypedEmitter.rawListeners<K extends keyof E & string>(event: K): E[K][]
+method TypedEmitter.removeAllListeners<K extends keyof E & string>(event?: K): this
+method TypedEmitter.removeListener<K extends keyof E & string>(event: K, listener: E[K]): this
 namespace advisor
 class advisor.ChannelSuggestions
 method advisor.ChannelSuggestions.suggest(graph: NetworkGraph, ownNodeId: string, options?: IChannelSuggestionsOptions): IChannelSuggestion[]
@@ -7939,8 +8024,8 @@ property swaps.ISwapCreateAck.reason: SwapRefusalReason
 property swaps.ISwapCreateAck.reasonText?: string
 property swaps.ISwapCreateAck.requestId: Buffer
 property swaps.ISwapCreateAck.terms?: ISwapTerms
-index swaps.ISwapEvent[fact: string]: unknown
 interface swaps.ISwapEvent
+index swaps.ISwapEvent[fact: string]: unknown
 property swaps.ISwapEvent.direction?: 'submarine'
 property swaps.ISwapEvent.invoiceMsat: string
 property swaps.ISwapEvent.onchainSat: string
