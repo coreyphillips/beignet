@@ -31299,7 +31299,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						'Route fee exceeds maximum'
 					);
 				}
-				throw new Error('No route to BOLT 12 blinded path introduction node');
+				throw new LightningPaymentError(
+					LightningErrorCode.NO_ROUTE,
+					'No route to BOLT 12 blinded path introduction node'
+				);
 			}
 			return this.dispatchBolt12Route(
 				blindedRoute,
@@ -31328,7 +31331,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			policyOverrides
 		);
 		if (!route) {
-			throw new Error('No route found to BOLT 12 invoice destination');
+			throw new LightningPaymentError(
+				LightningErrorCode.NO_ROUTE,
+				'No route found to BOLT 12 invoice destination'
+			);
 		}
 		if (maxFeeMsat !== undefined && route.totalFeeMsat > maxFeeMsat) {
 			throw new LightningPaymentError(
