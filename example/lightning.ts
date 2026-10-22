@@ -3,14 +3,23 @@ import * as net from 'net';
 import * as tls from 'tls';
 import * as path from 'path';
 import { promises as fs } from 'fs';
-import { generateMnemonic, Wallet } from '../src';
-import { LightningNode } from '../src/lightning/node/lightning-node';
-import { ILightningError, IFundingProvider } from '../src/lightning/node/types';
-import { WalletFundingProvider } from '../src/lightning/wallet/wallet-funding-provider';
-import { Network } from '../src/lightning/invoice/types';
-import { BITCOIN_CHAIN_HASH } from '../src/lightning/channel/types';
-import { decode as decodeInvoice } from '../src/lightning/invoice/decode';
-import { SqliteStorage } from '../src/lightning/storage/sqlite-storage';
+import { generateMnemonic, Wallet } from 'beignet';
+import { BeignetNode } from 'beignet/cli';
+import {
+	channel as lnChannel,
+	invoice as lnInvoice,
+	node as lnNode,
+	storage as lnStorage,
+	wallet as lnWallet
+} from 'beignet/lightning';
+
+const { LightningNode } = lnNode;
+const { WalletFundingProvider } = lnWallet;
+const { Network, decode: decodeInvoice } = lnInvoice;
+const { BITCOIN_CHAIN_HASH } = lnChannel;
+const { SqliteStorage } = lnStorage;
+type ILightningError = lnNode.ILightningError;
+type IFundingProvider = lnNode.IFundingProvider;
 
 // ─────────────── CLI Arg Parsing ───────────────
 
@@ -332,8 +341,6 @@ const runExample = async (
 };
 
 // ─────────────── BeignetNode Example (simplified API) ───────────────
-
-import { BeignetNode } from '../src/cli/beignet-node';
 
 const runBeignetExample = async (
 	mnemonic = generateMnemonic(),

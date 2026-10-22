@@ -99,7 +99,7 @@ Tor, full-graph gossip, the low-level `LightningNode` variant and the non-intera
 
 Node state lives in a SQLite DB under `~/.beignet/data/<hash-of-mnemonic>/` (the `--low-level` example uses `example/lightningData/node.db`).
 
-Both examples run straight off the TypeScript sources through `ts-node`, so no build step is needed. Use `npm run build` when you want the compiled `dist/`.
+Both examples run through `ts-node`. The on-chain example runs straight off the TypeScript sources. The Lightning example imports only the public entry points (`beignet`, `beignet/cli`, `beignet/lightning`), so `npm run example:lightning` builds `dist/` first, and the file runs unchanged in a project that installed `beignet` from npm.
 
 **→ [example/REPL_TESTING.md](example/REPL_TESTING.md) is a copy-pasteable walkthrough** of the whole lifecycle in the REPL: funding, peers, channels, invoices, payments, keysend, offers, splicing, closing, backup.
 
@@ -809,6 +809,8 @@ Recommended safeguards in production:
   }
 }
 ```
+
+Nothing in the `beignet` entry loads Node `crypto` until `createEncryptedStorage` is first called. It then needs `hkdfSync`, `randomBytes`, and `aes-256-gcm` through `createCipheriv`/`createDecipheriv`, so an app that encrypts wallet storage also needs a `crypto` shim that covers those.
 
 ## Documentation
 
