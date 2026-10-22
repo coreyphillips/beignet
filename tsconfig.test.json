@@ -8,7 +8,8 @@
     "paths": {
       "beignet": ["./src/index.ts"],
       "beignet/cli": ["./src/cli/index.ts"],
-      "beignet/lightning": ["./src/lightning/index.ts"]
+      "beignet/lightning": ["./src/lightning/index.ts"],
+      "beignet/lightning/sqlite": ["./src/lightning/sqlite.ts"]
     }
   },
   "include": [

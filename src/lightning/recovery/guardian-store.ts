@@ -23,7 +23,8 @@
  * 2^63, and memcmp order equals numeric order so range scans stay correct.
  */
 
-import Database from 'better-sqlite3';
+import type Database from 'better-sqlite3';
+import { loadBetterSqlite3 } from '../storage/sqlite-binding';
 
 export function u64be(value: bigint): Buffer {
 	if (value < 0n || value > 0xffffffffffffffffn) {
@@ -239,7 +240,8 @@ export class GuardianStore {
 	>;
 
 	constructor(path: string) {
-		this.db = new Database(path);
+		const Sqlite = loadBetterSqlite3();
+		this.db = new Sqlite(path);
 		// Durability pragmas, deliberately (spec 5.5 "durable BEFORE the
 		// response leaves"): WAL + synchronous FULL fsyncs the WAL on every
 		// commit, so a transaction that returned control has reached disk. A

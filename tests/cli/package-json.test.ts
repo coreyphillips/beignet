@@ -45,7 +45,8 @@ describe('package.json', () => {
 		expect(subpaths).to.include.members([
 			'./lightning',
 			'./cli',
-			'./lightning/iroh-node'
+			'./lightning/iroh-node',
+			'./lightning/sqlite'
 		]);
 		expect(Object.keys(mapped)).to.have.members(
 			subpaths.map((key) => key.slice(2))
@@ -55,6 +56,11 @@ describe('package.json', () => {
 				pkg.exports[key].types.slice(2)
 			]);
 		}
+	});
+
+	it('should list better-sqlite3 as optional, not required (issue #1685)', () => {
+		expect(pkg.dependencies).to.not.have.property('better-sqlite3');
+		expect(pkg.optionalDependencies).to.have.property('better-sqlite3');
 	});
 
 	it('should have lightning-related keywords', () => {

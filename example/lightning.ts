@@ -9,15 +9,14 @@ import {
 	channel as lnChannel,
 	invoice as lnInvoice,
 	node as lnNode,
-	storage as lnStorage,
 	wallet as lnWallet
 } from 'beignet/lightning';
+import { SqliteStorage } from 'beignet/lightning/sqlite';
 
 const { LightningNode } = lnNode;
 const { WalletFundingProvider } = lnWallet;
 const { Network, decode: decodeInvoice } = lnInvoice;
 const { BITCOIN_CHAIN_HASH } = lnChannel;
-const { SqliteStorage } = lnStorage;
 type ILightningError = lnNode.ILightningError;
 type IFundingProvider = lnNode.IFundingProvider;
 
