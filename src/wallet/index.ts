@@ -4760,7 +4760,9 @@ export class Wallet {
 	 * This method will clear the utxo array for each address type and reset the
 	 * address indexes back to the original/default app values. Once cleared & reset
 	 * the app will rescan the wallet's addresses from index zero at the standard gap
-	 * limit or higher (if previously set higher by the user).
+	 * limit or higher (if previously set higher by the user). Stops with an Err,
+	 * leaving the network switched to untouched, if the wallet switches networks
+	 * partway.
 	 * @async
 	 * @param {boolean} [shouldClearAddresses] - Clears and re-generates all addresses when true.
 	 * @param shouldClearTransactions
@@ -4773,6 +4775,13 @@ export class Wallet {
 		shouldClearAddresses?: boolean;
 		shouldClearTransactions?: boolean;
 	}): Promise<Result<IWalletData>> {
+		// switchNetwork replaces the Electrum instance along with the data, and
+		// each step below resets whichever network is live when it starts. One
+		// started after a switch would rewind the receive index of the network
+		// switched to, and reissue its addresses (#1807).
+		const electrum = this.electrum;
+		const switched =
+			'The wallet switched networks while its addresses were rescanned.';
 		// If the gap limit settings are less than the standard, ensure we set the standard gap limit before rescanning.
 		const currentGapLimitOptions = this.gapLimitOptions;
 		if (
@@ -4800,23 +4809,31 @@ export class Wallet {
 						: currentGapLimitOptions.lookAheadChange
 			});
 		}
-		if (shouldClearAddresses) {
-			await this.clearAddresses();
+		try {
+			if (shouldClearAddresses) {
+				await this.clearAddresses();
+				if (this.electrum !== electrum) return err(switched);
+			}
+			if (shouldClearTransactions) {
+				await this.clearTransactions();
+				if (this.electrum !== electrum) return err(switched);
+			}
+			await this.clearUtxos();
+			if (this.electrum !== electrum) return err(switched);
+			await this.resetAddressIndexes();
+			if (this.electrum !== electrum) return err(switched);
+			// Wait to generate our zero index addresses.
+			await this.setZeroIndexAddresses();
+			if (this.electrum !== electrum) return err(switched);
+			return await this.refreshWallet({
+				scanAllAddresses: true,
+				force: true
+			});
+		} finally {
+			// Revert gap limit options to the original settings. They carry
+			// across a switch, so this runs on every return.
+			this.updateGapLimit(currentGapLimitOptions);
 		}
-		if (shouldClearTransactions) {
-			await this.clearTransactions();
-		}
-		await this.clearUtxos();
-		await this.resetAddressIndexes();
-		// Wait to generate our zero index addresses.
-		await this.setZeroIndexAddresses();
-		const refreshWalletRes = await this.refreshWallet({
-			scanAllAddresses: true,
-			force: true
-		});
-		// Revert gap limit options to the original settings.
-		this.updateGapLimit(currentGapLimitOptions);
-		return refreshWalletRes;
 	}
 
 	/**

@@ -1304,6 +1304,108 @@ describe('switchNetwork against an unreachable target', function () {
 		});
 	}
 
+	// The ghost repair's rescan writes the cleared UTXO set, then its balance,
+	// then resets the address indexes. A switch can land in either write.
+	for (const field of ['utxos', 'balance'] as const) {
+		it(`keeps the receive index of the network a ghost rescan's ${field} write is switched away from (#1807)`, async function () {
+			const name = `switchrescan${field}`;
+			const store = new Map<string, unknown>();
+			const key = (on: EAvailableNetworks, at: keyof IWalletData): string =>
+				getWalletDataStorageKey(name, on, at);
+			const saving = holdingStorage(store);
+			const type = EAddressType.p2wpkh;
+			const create = async (on: EAvailableNetworks): Promise<Wallet> => {
+				const res = await Wallet.create({
+					mnemonic: MNEMONIC,
+					name,
+					network: on,
+					addressType: type,
+					electrumOptions,
+					storage: saving.storage,
+					feeEstimationSource: 'electrum',
+					disableRefreshOnCreate: true
+				});
+				if (res.isErr()) throw res.error;
+				const created = res.value;
+				created.checkElectrumConnection = async (): Promise<Result<string>> =>
+					ok('connected');
+				created.updateFeeEstimates = async (): Promise<Result<IOnchainFees>> =>
+					ok(created.feeEstimates);
+				offline(created.electrum);
+				return created;
+			};
+			// Signet has handed out its addresses 0 through 5, none of them paid.
+			const signet = await create(EAvailableNetworks.signet);
+			const loaded = await signet.refreshWallet();
+			if (loaded.isErr()) throw loaded.error;
+			const first = await signet.getReceiveAddress({});
+			if (first.isErr()) throw first.error;
+			for (let i = 0; i < 5; i++) {
+				const issued = await signet.generateNewReceiveAddress();
+				if (issued.isErr()) throw issued.error;
+			}
+			const { index, address: issued } = signet.data.addressIndex[type];
+			expect(index).to.equal(5);
+			await signet.stop();
+
+			const w = await create(network);
+			const ghost = 'ee'.repeat(32);
+			w.data.transactions = { [ghost]: payment(ghost, 100) };
+			w.data.unconfirmedTransactions = { [ghost]: payment(ghost, 100) };
+			w.data.header.height = 101;
+			w.electrum.getTransactions = async (): Promise<
+				Result<IGetTransactions>
+			> =>
+				answer({
+					[ghost]: {
+						error: {
+							code: 2,
+							message: 'No such mempool or blockchain transaction'
+						}
+					}
+				});
+			let rescanned: Result<IWalletData> | undefined;
+			const rescanAddresses = w.rescanAddresses.bind(w);
+			w.rescanAddresses = async (options): Promise<Result<IWalletData>> => {
+				saving.holdNext(key(network, field));
+				rescanned = await rescanAddresses(options);
+				return rescanned;
+			};
+			try {
+				const spanning = w.refreshWallet();
+				await saving.held;
+				const switched = await w.switchNetwork(
+					EAvailableNetworks.signet,
+					otherServer
+				);
+				if (switched.isErr()) throw switched.error;
+				offline(w.electrum);
+				expect(w.data.addressIndex[type].index).to.equal(5);
+				saving.release();
+				expect(await settles(spanning)).to.equal(true);
+				expect(w.isRefreshing).to.equal(false);
+
+				expect(w.data.addressIndex[type].index).to.equal(5);
+				expect(w.data.addressIndex[type].address).to.equal(issued);
+				const stored = store.get(
+					key(EAvailableNetworks.signet, 'addressIndex')
+				) as IWalletData['addressIndex'];
+				expect(stored[type].index).to.equal(5);
+				expect(stored[type].address).to.equal(issued);
+				const receive = await w.getReceiveAddress({});
+				if (receive.isErr()) throw receive.error;
+				expect(receive.value).to.equal(issued);
+				expect(receive.value).not.to.equal(first.value);
+				expect(rescanned?.isErr()).to.equal(true);
+				// The rescan still cleared the UTXOs of the network it was for.
+				expect(store.get(key(network, 'utxos'))).to.deep.equal([]);
+			} finally {
+				saving.release();
+				await w.stop();
+			}
+		});
+	}
+
 	it('keeps what the session remembers across sends and refreshes (#1636)', async function () {
 		const res = await Wallet.create({
 			mnemonic: MNEMONIC,
