@@ -44,6 +44,7 @@ bitcoin.initEccLib(ecc);
 export type IDfWallet = Pick<
 	Wallet,
 	| 'listUtxos'
+	| 'listImmatureUtxos'
 	| 'isUtxoFrozen'
 	| 'listFrozenUtxos'
 	| 'freezeUtxoIfUnfrozen'
@@ -189,9 +190,11 @@ export function directFundingWallet(
 		ownsOutpoint(txidHex: string, vout: number): boolean {
 			// Frozen coins included on purpose: the question is whether spending
 			// this outpoint moves OUR money, and a freeze does not change that.
-			return (wallet.listUtxos() ?? []).some(
-				(u) => u.tx_hash === txidHex && u.tx_pos === vout
-			);
+			// Neither does a coinbase output that has not matured yet.
+			return [
+				...(wallet.listUtxos() ?? []),
+				...(wallet.listImmatureUtxos() ?? [])
+			].some((u) => u.tx_hash === txidHex && u.tx_pos === vout);
 		},
 
 		async getTransaction(txidHex: string): Promise<Buffer> {

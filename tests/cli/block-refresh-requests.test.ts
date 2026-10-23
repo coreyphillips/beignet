@@ -720,6 +720,37 @@ describe('block notification refresh requests (#1663)', function () {
 		expect(listings, 'the block writes the set again').to.be.greaterThan(0);
 	});
 
+	it('scans on the block that matures a coinbase output it held back (#1842)', async function () {
+		await block(101);
+		const receive = wallet.data.addressIndex[EAddressType.p2wpkh];
+		const txid = '7e'.repeat(32);
+		paid.set(receive.scriptHash, txid);
+		mined.set(txid, 102);
+		served.set(txid, {
+			...details(txid, [], [[receive.address, 0.001]]),
+			vin: [{ coinbase: '0366', sequence: 0xffffffff }],
+			confirmations: 1
+		});
+		await block(102);
+		await notify(receive.scriptHash);
+		await settled();
+		expect(wallet.data.utxos, 'immature').to.deep.equal([]);
+		expect(wallet.listImmatureUtxos().map((u) => u.tx_hash)).to.deep.equal([
+			txid
+		]);
+		resetCounts();
+
+		await block(200);
+		expect(listings, 'block 201 cannot spend it').to.equal(0);
+
+		await block(201);
+		await settled();
+		expect(listings, 'block 202 can').to.be.greaterThan(0);
+		expect(wallet.data.utxos.map((u) => u.tx_hash)).to.deep.equal([txid]);
+		expect(wallet.data.balance).to.equal(100_000);
+		expect(wallet.listImmatureUtxos()).to.deep.equal([]);
+	});
+
 	it('subscribes on the next block a window address whose subscription failed', async function () {
 		await block(101);
 		refuseNewSubscriptions = true;

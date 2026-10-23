@@ -58,6 +58,8 @@ function stubWallet(
 		transactions?: Record<string, { txid: string; height?: number; vin: [] }>;
 		/** What the stored header says, or a throw when there is none. */
 		header?: { height: number } | 'throws';
+		/** Coinbase outputs the wallet holds back until they mature. */
+		immature?: IUtxo[];
 	} = {}
 ): IStubWallet {
 	const utxo = {
@@ -73,6 +75,7 @@ function stubWallet(
 		frozen: opts.frozen ?? [],
 		freezes: [] as Array<{ txid: string; vout: number; tag?: string }>,
 		listUtxos: (): IUtxo[] => [utxo],
+		listImmatureUtxos: (): IUtxo[] => opts.immature ?? [],
 		listFrozenUtxos: (): IUtxo[] => stub.frozen,
 		isUtxoFrozen: ({ txid, vout }: IOutpoint): boolean =>
 			stub.frozen.some((f) => f.tx_hash === txid && f.tx_pos === vout),
@@ -555,5 +558,20 @@ describe('direct funding wallet: what counts as confirmed', () => {
 			NETWORK
 		);
 		expect(mined.confirmedSpendOf(TXID, 0)).to.equal(CONFLICT);
+	});
+});
+
+describe('direct funding wallet: whose outpoint is it', () => {
+	it('counts a coinbase output that has not matured as ours (#1842)', () => {
+		const reward = 'cc'.repeat(32);
+		const df = directFundingWallet(
+			stubWallet({
+				immature: [{ tx_hash: reward, tx_pos: 0 } as unknown as IUtxo]
+			}),
+			NETWORK
+		);
+		expect(df.ownsOutpoint(TXID, 0)).to.equal(true);
+		expect(df.ownsOutpoint(reward, 0)).to.equal(true);
+		expect(df.ownsOutpoint(CONFLICT, 0)).to.equal(false);
 	});
 });

@@ -2280,7 +2280,13 @@ export class Electrum {
 		// not be refreshed or called back into. Checked after applyHeader, so a
 		// reconciliation this instance owes is still recorded in _reorgOwed.
 		if (this._disconnected) return;
-		if (this._fullRefreshOwed || this._wallet.refreshFailed) {
+		// A coinbase coming of age changes no script's status, so no
+		// notification would bring it into the set.
+		if (
+			this._fullRefreshOwed ||
+			this._wallet.refreshFailed ||
+			this._wallet.coinbaseMatured
+		) {
 			this._fullRefreshOwed = false;
 			await this._wallet.refreshWallet();
 		} else {

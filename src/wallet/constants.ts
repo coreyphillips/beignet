@@ -50,6 +50,12 @@ export const MAX_REMEMBERED_PREVOUTS = 5_000;
  */
 export const MAX_CACHED_BRANCHES = 256;
 
+/**
+ * How many blocks deep a coinbase transaction must be before consensus lets a
+ * transaction in the next block spend its outputs.
+ */
+export const COINBASE_MATURITY = 100;
+
 export const TRANSACTION_DEFAULTS = {
 	recommendedBaseFee: 256, // Total recommended tx base fee in sats
 	dustLimit: 546, // Minimum value in sats for an output. Outputs below the dust limit may not be processed because the fees required to include them in a block would be greater than the value of the transaction itself.

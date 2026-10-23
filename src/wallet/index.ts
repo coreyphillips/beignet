@@ -150,6 +150,7 @@ import {
 import { Electrum } from '../electrum';
 import { Transaction } from '../transaction';
 import {
+	COINBASE_MATURITY,
 	GAP_LIMIT,
 	GAP_LIMIT_CHANGE,
 	MAX_CACHED_BRANCHES,
@@ -189,6 +190,13 @@ const SATS_FIELDS = [
 	['fee', 'feeSats'],
 	['value', 'valueSats']
 ] as const;
+
+/**
+ * Whether a coinbase output confirmed at `height` can be spent in the block
+ * after `tip`, the earliest one a transaction sent now can confirm in.
+ */
+const coinbaseSpendable = (height: number, tip: number): boolean =>
+	tip + 1 - height >= COINBASE_MATURITY;
 
 /**
  * Freezes value and every plain object and array it holds, and returns it.
@@ -315,6 +323,15 @@ export class Wallet {
 	// newer one.
 	private _scanSeq = 0;
 	private _appliedScanSeq = 0;
+	// The coinbase outputs the last applied scan left out of the UTXO set and
+	// balance because the next block cannot spend them. Later scans list their
+	// addresses, which may have left the gap window by the time they mature.
+	// Memory only.
+	private _immatureUtxos: IUtxo[] = [];
+	// Whether each young coin's transaction is a coinbase, by txid, so a coin
+	// is looked up once rather than on every scan. Kept to the young coins of
+	// the last lookup.
+	private readonly _coinbaseTxids: Map<string, boolean> = new Map();
 	// This wallet's tip at the first check a node without a txindex answered
 	// "no such mempool transaction" for a record the rule of issue #871 kept,
 	// by txid, or the highest tip it held if that was higher. A miss that
@@ -684,6 +701,16 @@ export class Wallet {
 	 *  refreshes in full while it is set. */
 	public get refreshFailed(): boolean {
 		return this._refreshFailed;
+	}
+
+	/** Whether a coinbase output the last scan held back as immature can be
+	 *  spent in the next block. The next block refreshes in full while it is
+	 *  set, which puts the coin in the UTXO set. */
+	public get coinbaseMatured(): boolean {
+		const tip = this._data.header?.height ?? 0;
+		return this._immatureUtxos.some((utxo) =>
+			coinbaseSpendable(utxo.height, tip)
+		);
 	}
 
 	public get network(): Network {
@@ -3341,7 +3368,9 @@ export class Wallet {
 
 	/**
 	 * Scans Electrum for the wallet's UTXOs, and saves the set and balance.
-	 * listUtxos reads what the last scan saved.
+	 * listUtxos reads what the last scan saved. Dust and coinbase outputs the
+	 * next block cannot spend yet are left out of both (see
+	 * listImmatureUtxos).
 	 * @param {EScanningStrategy} [scanningStrategy]
 	 * @param {number} addressIndex
 	 * @param {number} changeAddressIndex
@@ -3351,9 +3380,10 @@ export class Wallet {
 	 * @returns {Promise<Result<IGetUtxosResponse>>} The pair the scan applied
 	 * to memory, or, when a newer scan already landed, memory's pair as it
 	 * stands, applied and written by that scan instead. Err, with nothing
-	 * applied, when the wallet switched networks while the query was out. A
-	 * write that storage refuses is logged, not returned: the scan itself
-	 * succeeded.
+	 * applied, when the wallet switched networks while the query was out, or
+	 * when Electrum did not return the transaction of a coin young enough to
+	 * be an immature coinbase. A write that storage refuses is logged, not
+	 * returned: the scan itself succeeded.
 	 */
 	public async refreshUtxos({
 		scanningStrategy = EScanningStrategy.gapLimit,
@@ -3386,7 +3416,16 @@ export class Wallet {
 		// numbers, so an answer from the one this query went to is another
 		// network's coins and its number means nothing to the new count.
 		const electrum = this.electrum;
+		// The set does not hold these, so nothing else keeps their addresses in
+		// the scan once the strategy's window has moved past them.
+		const heldBack: IAddresses = {};
+		for (const { index, path, address, scriptHash, publicKey } of this
+			._immatureUtxos) {
+			heldBack[scriptHash] = { index, path, address, scriptHash, publicKey };
+		}
 		let getUtxosRes: Result<IGetUtxosResponse>;
+		let tip = 0;
+		let coinbases: Result<Set<string>> = ok(new Set());
 		try {
 			getUtxosRes = await electrum.getUtxos({
 				scanningStrategy,
@@ -3394,8 +3433,16 @@ export class Wallet {
 				changeAddressIndex,
 				addressTypesToCheck,
 				additionalAddresses,
-				additionalScriptHashes
+				additionalScriptHashes: { ...heldBack, ...additionalScriptHashes }
 			});
+			if (getUtxosRes.isOk()) {
+				tip = this._data.header?.height ?? 0;
+				coinbases = await this.findImmatureCoinbases(
+					electrum,
+					getUtxosRes.value?.utxos ?? [],
+					tip
+				);
+			}
 		} finally {
 			const at = scanMarks.indexOf(spendMark);
 			if (at !== -1) scanMarks.splice(at, 1);
@@ -3406,6 +3453,9 @@ export class Wallet {
 		if (this.electrum !== electrum) {
 			return err('The wallet switched networks while the UTXO scan ran.');
 		}
+		if (coinbases.isErr()) {
+			return err(coinbases.error);
+		}
 		if (scanSeq < this._appliedScanSeq) {
 			return ok({ utxos: this._data.utxos, balance: this._data.balance });
 		}
@@ -3414,7 +3464,12 @@ export class Wallet {
 			getUtxosRes.value?.utxos ?? [],
 			spendMark
 		);
-		const utxos = removeDustUtxos(scanned.utxos);
+		const kept = removeDustUtxos(scanned.utxos);
+		const immatureTxids = coinbases.value;
+		const immature = kept.filter((utxo) => immatureTxids.has(utxo.tx_hash));
+		const utxos = immature.length
+			? kept.filter((utxo) => !immatureTxids.has(utxo.tx_hash))
+			: kept;
 		// No send path can select a coin the set leaves out, so the balance does
 		// not count it either.
 		const droppedValue =
@@ -3424,6 +3479,7 @@ export class Wallet {
 			(getUtxosRes.value?.balance ?? 0) - scanned.spentValue - droppedValue;
 		this._data.utxos = utxos;
 		this._data.balance = balance;
+		this._immatureUtxos = immature;
 		// A refused write is logged and left to the next scan, which writes both
 		// again and which the next block now owes. An Err here would stop
 		// refreshWallet before updateTransactions and subscribeToAddresses, and
@@ -3438,6 +3494,81 @@ export class Wallet {
 	 */
 	listUtxos(): IUtxo[] {
 		return this._data.utxos;
+	}
+
+	/**
+	 * Returns the coinbase outputs the last scan left out of listUtxos and the
+	 * balance because they have not matured: a transaction in the next block
+	 * cannot spend them yet. Each one is listed again once a later scan finds
+	 * it mature. Memory only, so empty until the first scan after a restart.
+	 * @returns {IUtxo[]}
+	 */
+	listImmatureUtxos(): IUtxo[] {
+		return this._immatureUtxos;
+	}
+
+	/**
+	 * The txids among `utxos` of coinbase transactions whose outputs the block
+	 * after `tip` cannot spend. Electrum lists a coinbase output like any other
+	 * coin, so for each coin young enough to be one, the inputs of its
+	 * transaction are read from the stored history, or looked up when the
+	 * history has no record of them.
+	 * @param {Electrum} electrum The instance the scan went to.
+	 * @param {IUtxo[]} utxos
+	 * @param {number} tip
+	 * @returns {Promise<Result<Set<string>>>} Err when a transaction it needed
+	 * was not returned.
+	 */
+	private async findImmatureCoinbases(
+		electrum: Electrum,
+		utxos: IUtxo[],
+		tip: number
+	): Promise<Result<Set<string>>> {
+		// With no header yet every confirmed coin would count as young, and the
+		// whole set would be looked up.
+		if (tip <= 0) return ok(new Set());
+		const young = new Set(
+			utxos
+				.filter(
+					(utxo) => utxo.height > 0 && !coinbaseSpendable(utxo.height, tip)
+				)
+				.map((utxo) => utxo.tx_hash)
+		);
+		for (const txid of this._coinbaseTxids.keys()) {
+			if (!young.has(txid)) this._coinbaseTxids.delete(txid);
+		}
+		for (const txid of young) {
+			const vin = this._data.transactions[txid]?.vin;
+			if (!this._coinbaseTxids.has(txid) && vin?.length) {
+				this._coinbaseTxids.set(
+					txid,
+					vin.some((input) => 'coinbase' in input)
+				);
+			}
+		}
+		const unknown = [...young].filter((txid) => !this._coinbaseTxids.has(txid));
+		if (unknown.length) {
+			const res = await electrum.getTransactions({
+				txHashes: unknown.map((tx_hash) => ({ tx_hash }))
+			});
+			if (res.isErr()) return err(res.error);
+			for (const { result } of res.value.data) {
+				if (!young.has(result?.txid) || !Array.isArray(result.vin)) continue;
+				this._coinbaseTxids.set(
+					result.txid,
+					result.vin.some((vin) => 'coinbase' in vin)
+				);
+			}
+			const missing = unknown.filter((txid) => !this._coinbaseTxids.has(txid));
+			if (missing.length) {
+				return err(
+					`Unable to look up ${missing.length} transaction(s) to check for immature coinbase outputs.`
+				);
+			}
+		}
+		return ok(
+			new Set([...young].filter((txid) => this._coinbaseTxids.get(txid)))
+		);
 	}
 
 	/**
@@ -4894,8 +5025,23 @@ export class Wallet {
 	public async clearUtxos(): Promise<string> {
 		this._data.balance = 0;
 		this._data.utxos = [];
+		this._immatureUtxos = [];
 		await this.saveUtxoState();
 		return "Successfully cleared UTXO's.";
+	}
+
+	/**
+	 * What a send answers when the UTXO set is empty.
+	 * @returns {string}
+	 */
+	private noUtxosError(): string {
+		const immature = this._immatureUtxos.reduce(
+			(sum, utxo) => sum + utxo.value,
+			0
+		);
+		return immature
+			? `No spendable UTXOs available. ${immature} sats in coinbase outputs have not matured.`
+			: 'No UTXOs available.';
 	}
 
 	/**
@@ -5831,7 +5977,7 @@ export class Wallet {
 		if (this._multisig) return err(new MultisigSpendError());
 		if (this.isWatchOnly) return err(new WatchOnlySigningError());
 		if (!this._data.utxos.length) {
-			return err('No UTXOs available.');
+			return err(this.noUtxosError());
 		}
 		// The staged send is a per-call working area, held only in memory. It
 		// starts empty, so nothing an earlier call staged rides along (#1002),
@@ -5953,7 +6099,7 @@ export class Wallet {
 		if (this._multisig) return err(new MultisigSpendError());
 		if (this.isWatchOnly) return err(new WatchOnlySigningError());
 		if (!this._data.utxos.length) {
-			return err('No UTXOs available.');
+			return err(this.noUtxosError());
 		}
 		// Same working-area rule as sendMany: empty on entry, readable until
 		// the next call.
@@ -6128,7 +6274,7 @@ export class Wallet {
 				sendTxs = [{ address, amount, message }];
 			}
 			if (!this._data.utxos.length) {
-				return err('No UTXOs available.');
+				return err(this.noUtxosError());
 			}
 			await this.resetSendTransaction();
 			const setupTransactionRes = await this.transaction.setupTransaction({
