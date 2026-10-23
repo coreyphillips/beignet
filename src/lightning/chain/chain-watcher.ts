@@ -54,7 +54,11 @@ export interface IChainBackend {
 	getTransaction(txid: string): Promise<Buffer>;
 	/** Broadcast a raw transaction hex. Returns txid on success. */
 	broadcastTransaction(rawTxHex: string): Promise<string>;
-	/** Get transaction position in a block. Returns { blockHeight, txIndex }. Optional — returns null if not supported. */
+	/**
+	 * Get transaction position in a block. Returns { blockHeight, txIndex }.
+	 * Optional. Rejects when the position is unknown rather than reporting a
+	 * default, since index 0 is the coinbase.
+	 */
 	getTransactionMerkleProof?(
 		txid: string,
 		height: number
@@ -523,8 +527,8 @@ export async function classifyAnnouncedChannelFunding(
 		} catch {
 			return 'unavailable';
 		}
-		// ElectrumBackend reports a failed proof as index 0, so index 0 (the
-		// coinbase) can never prove a position.
+		// A backend that cannot place a transaction may still report index 0
+		// (the coinbase), so index 0 can never prove a position.
 		if (txIndex !== 0 && txIndex === scid.txIndex) return 'proven';
 	}
 	// The right output in a transaction at another index proves nothing
@@ -1948,10 +1952,20 @@ export class ChainWatcher extends EventEmitter {
 		const generation = this.lifecycleGeneration;
 		let txIndex = 0;
 		if (this.backend.getTransactionMerkleProof) {
-			const proof = await this.backend.getTransactionMerkleProof(
-				watched.txid,
-				watched.confirmationHeight
-			);
+			let proof: { blockHeight: number; txIndex: number };
+			try {
+				proof = await this.backend.getTransactionMerkleProof(
+					watched.txid,
+					watched.confirmationHeight
+				);
+			} catch (err) {
+				// The SCID is built from this position, so there is nothing to
+				// announce without it. Re-armed, the next block asks again.
+				if (this.isCurrentGeneration(generation)) {
+					watched.announcementTriggered = false;
+				}
+				throw err;
+			}
 			if (!this.isCurrentGeneration(generation)) return;
 			txIndex = proof.txIndex;
 		}

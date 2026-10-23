@@ -8,6 +8,19 @@ import { ChainBackendUnavailableError } from './chain-watcher';
 import type { IFeeEstimator } from '../node/types';
 import type { Electrum } from '../../electrum';
 
+/** A get_merkle answer, in either the wrapped or the bare shape. */
+interface IMerkleAnswer {
+	error?: unknown;
+	data?: { pos?: unknown } | null;
+	pos?: unknown;
+}
+
+function describeError(data: unknown): string {
+	if (typeof data === 'string') return data;
+	const message = (data as { message?: unknown } | null)?.message;
+	return typeof message === 'string' ? message : String(data);
+}
+
 /**
  * Wraps beignet's Electrum class to implement IChainBackend.
  *
@@ -533,15 +546,25 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 		txid: string,
 		height: number
 	): Promise<{ blockHeight: number; txIndex: number }> {
-		const result = await this.withTimeout(
+		const res: IMerkleAnswer | null | undefined = await this.withTimeout(
 			this.electrum.getTransactionMerkle({ tx_hash: txid, height }),
 			`getTransactionMerkleProof(${txid.slice(0, 8)}...)`
 		);
-		// rn-electrum-client wraps responses: { id, error, method, data: { pos, ... }, network }
-		// The TypeScript declaration claims { merkle, block_height, pos } but runtime wraps it
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any -- runtime shape differs from the library's declaration (see comment above)
-		const res = result as any;
-		const pos = res?.data?.pos ?? res?.pos ?? 0;
+		if (res?.error) {
+			throw new Error(
+				`Failed to get merkle proof for ${txid}: ${describeError(res.data)}`
+			);
+		}
+		// rn-electrum-client wraps the answer as { id, error, method, data, network },
+		// although Electrum declares the bare { merkle, block_height, pos }.
+		const body = res && 'data' in res ? res.data : res;
+		const pos = body?.pos;
+		// Index 0 is the coinbase, so a missing position must not default to it.
+		if (typeof pos !== 'number' || !Number.isSafeInteger(pos) || pos < 0) {
+			throw new Error(
+				`No transaction position for ${txid} at height ${height}`
+			);
+		}
 		return {
 			blockHeight: height,
 			txIndex: pos
