@@ -1,8 +1,9 @@
 /**
  * BeignetNode: Simplified wrapper class for AI-friendly Bitcoin + Lightning.
  *
- * Wires together Wallet, LightningNode, SqliteStorage, WalletFundingProvider,
- * and ElectrumBackend behind a single class with plain JSON return types.
+ * Wires together Wallet, LightningNode, its storage (SqliteStorage unless one
+ * is injected), WalletFundingProvider and ElectrumBackend behind a single
+ * class with plain JSON return types.
  */
 
 import type { IrohDaemonConfig } from './iroh-config';
@@ -20,9 +21,7 @@ import { OfflineReceive } from './offline-receive';
 import type { FforReceiveFunding } from './ffor-receive';
 import { FforReceiveService } from './ffor-receive';
 import * as path from 'path';
-import * as fs from 'fs';
-import * as net from 'net';
-import { promises as dnsPromises } from 'dns';
+import { nodeFs, nodeNet } from '../utils/node-builtins';
 import {
 	acquireInstanceLock,
 	releaseInstanceLock,
@@ -95,8 +94,18 @@ import type { IInvoiceInfo } from '../lightning/storage/types';
 import type { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
 import { normalizeHexPubkey } from '../lightning/validation';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
-import type { IStoredPaymentRef } from '../lightning/storage/sqlite-storage';
-import { SqliteStorage } from '../lightning/storage/sqlite-storage';
+import type {
+	IStoredPaymentRef,
+	SqliteStorage
+} from '../lightning/storage/sqlite-storage';
+import type {
+	IStorageBackend,
+	IWalletDataStorage
+} from '../lightning/storage/types';
+import {
+	hasStorageCapability,
+	STORAGE_CORE_MEMBERS
+} from '../lightning/storage/capabilities';
 import { deriveStorageKey } from '../lightning/storage/encryption';
 import type { IStaticChannelBackup } from '../lightning/backup/scb';
 import { encodeScb, decodeScb } from '../lightning/backup/scb';
@@ -199,8 +208,10 @@ import {
 	chainHashForNetwork
 } from '../lightning/direct-funding';
 import { directFundingWallet } from './direct-funding';
-import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from './auth';
-import { WEBHOOK_SECRETS_STORAGE_KEY } from './webhooks';
+import {
+	AUTH_KEY_OVERRIDES_STORAGE_KEY,
+	WEBHOOK_SECRETS_STORAGE_KEY
+} from './daemon-state-keys';
 import type {
 	INodeConfig,
 	IHoldCancelledEvent,
@@ -338,9 +349,20 @@ export interface BeignetNodeOptions
 	 * Directory for the SQLite database and the instance lock, used as given.
 	 * Default: `~/.beignet/data/<tag>`, where the tag is the first 16 hex
 	 * characters of the mnemonic's SHA-256, so each seed gets its own
-	 * database.
+	 * database. With `storage` there is no default, and without a dataDir
+	 * the node writes no files.
 	 */
 	dataDir?: string;
+	/**
+	 * Storage to run on instead of SQLite, such as a MemoryStorage or a
+	 * backend over a React Native database. It must implement the walletData
+	 * capability, where the node keeps its wallet state, spend ledger and
+	 * sweep journal. create() opens it and destroy() closes it. SQLite is
+	 * then never loaded, storageEncryption does not apply, the payment queue
+	 * is kept in memory, and backupPath, backup() and capsule restore, which
+	 * copy or install a SQLite file, are refused.
+	 */
+	storage?: IStorageBackend & IWalletDataStorage;
 	/**
 	 * Skip the single-instance lock on the data dir (default false). Leave this
 	 * off unless you have a specific reason — two instances sharing one data dir
@@ -799,6 +821,38 @@ function defaultDataDir(): string {
 		'.beignet',
 		'data'
 	);
+}
+
+/**
+ * Required when a node first opens a SQLite database, so a node on injected
+ * storage loads neither it nor better-sqlite3.
+ */
+function sqliteStorageClass(): typeof SqliteStorage {
+	return (
+		require('../lightning/storage/sqlite-storage') as typeof import('../lightning/storage/sqlite-storage')
+	).SqliteStorage;
+}
+
+/** Why options.storage cannot carry a node, or null when it can. */
+function injectedStorageRefusal(storage: unknown): string | null {
+	if (typeof storage !== 'object' || storage === null) {
+		return 'storage must be a storage backend';
+	}
+	const methods = storage as Record<string, unknown>;
+	const missing = Object.keys(STORAGE_CORE_MEMBERS).filter(
+		(member) => typeof methods[member] !== 'function'
+	);
+	if (missing.length > 0) {
+		return `storage does not implement ${missing.join(', ')}`;
+	}
+	if (!hasStorageCapability(storage as IStorageBackend, 'walletData')) {
+		return (
+			'storage must implement the walletData capability (saveWalletData, ' +
+			'loadWalletData): the node keeps its wallet state, spend ledger and ' +
+			'sweep journal there'
+		);
+	}
+	return null;
 }
 
 export type RecoveryMode = 'off' | 'peer-storage' | 'async-remote' | 'quorum';
@@ -1449,9 +1503,11 @@ const DEFAULT_ELECTRUM: Record<
  * the Electrum client's bare socket.connect cannot reach (no %zone id).
  */
 async function resolveHostToIPv4(host: string): Promise<string> {
-	if (net.isIP(host)) return host; // already an IP literal
 	try {
-		const { address } = await dnsPromises.lookup(host, { family: 4 });
+		if (nodeNet().isIP(host)) return host; // already an IP literal
+		// Required here: React Native has no dns, and dials the host as given.
+		const dns = require('dns') as typeof import('dns');
+		const { address } = await dns.promises.lookup(host, { family: 4 });
 		return address || host;
 	} catch {
 		return host;
@@ -2123,13 +2179,18 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 	private wallet!: Wallet;
 	private node!: LightningNode;
-	private storage!: SqliteStorage;
+	private storage!: IStorageBackend & IWalletDataStorage;
+	/**
+	 * Set when create() was given options.storage. Otherwise the storage is
+	 * the SqliteStorage this node opened in its dataDir.
+	 */
+	private storageInjected = false;
 	/**
 	 * The fenced view of the database the current node was built on (issue
 	 * #958). Kept so shutdown can fence it even when the node's own teardown
 	 * throws before its close.
 	 */
-	private _nodeStorageView?: SqliteStorage;
+	private _nodeStorageView?: IStorageBackend & IWalletDataStorage;
 	/** Wallet-owned output script that force-close sweeps pay into. */
 	private sweepDestinationScript?: Buffer;
 	/** Background timer retrying wallet sweep-address resolution (see scheduleSweepAddressRefresh). */
@@ -2248,7 +2309,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private _resuming = false;
 	private mnemonic: string;
 	private networkName: 'mainnet' | 'testnet' | 'regtest' | 'signet';
-	private dataDir: string;
+	/** Unset only for a node on injected storage that was given none. */
+	private dataDir: string | undefined;
 	/** Path to the single-instance lock file (null if locking was skipped). */
 	private _lockPath: string | null = null;
 	/** Bound process-exit handler that releases the lock; removed on destroy. */
@@ -2453,7 +2515,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private constructor(
 		mnemonic: string,
 		networkName: 'mainnet' | 'testnet' | 'regtest' | 'signet',
-		dataDir: string
+		dataDir: string | undefined
 	) {
 		super();
 		this.mnemonic = mnemonic;
@@ -2498,6 +2560,28 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				`unknown network '${opts.network}': expected 'mainnet', 'testnet', 'signet' or 'regtest'`
 			);
 		}
+		if (opts.storage !== undefined) {
+			const refusal = injectedStorageRefusal(opts.storage);
+			if (refusal !== null) throw new BeignetError('INVALID_PARAMS', refusal);
+			if (opts.backupPath !== undefined) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					'backupPath copies the SQLite database, so it does not apply with storage'
+				);
+			}
+			if (opts.recoveryAutoApply === true) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					'recoveryAutoApply installs a SQLite database, so it does not apply with storage'
+				);
+			}
+			if (opts.guardianServe && !opts.dataDir) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					'guardianServe keeps the sets it serves under dataDir, so with storage it needs one'
+				);
+			}
+		}
 		const mnemonic = opts.mnemonic || generateMnemonic();
 		const networkName = opts.network;
 		// Before the lock and the database, so a node refused for another
@@ -2510,23 +2594,96 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// Namespace the default storage per-wallet so different mnemonics never
 		// share a database (which would load another seed's channels/identity).
 		// An explicit dataDir is respected as-is (one wallet per dataDir).
-		const dataDir = opts.dataDir || defaultDataDirForMnemonic(mnemonic);
+		const dataDir =
+			opts.dataDir ||
+			(opts.storage ? undefined : defaultDataDirForMnemonic(mnemonic));
 
 		// Owner-only data directory (issue #1004): the database's lookup
 		// columns are plaintext, and mkdir leaves an existing directory's bits
 		// alone, so one created by an older release under umask 022 is
 		// tightened here. A refused chmod is logged once the logger is wired.
-		const dirMode = ensurePrivateDir(dataDir);
+		const dirMode =
+			dataDir === undefined ? undefined : ensurePrivateDir(dataDir);
 
 		const instance = new BeignetNode(mnemonic, networkName, dataDir);
 		await instance.init(opts);
-		if (dirMode.error) {
+		if (dirMode?.error) {
 			instance.log('warn', 'Could not restrict data directory permissions', {
 				dataDir,
 				error: dirMode.error.message
 			});
 		}
 		return instance;
+	}
+
+	/**
+	 * Open the SQLite database in dataDir, finishing a staged capsule swap
+	 * first and holding the channels of a database restored from a backup.
+	 */
+	private openSqliteStorage(opts: BeignetNodeOptions): void {
+		const networkName = this.networkName;
+		const dbPath = path.join(this.requireDataDir(), `${networkName}.db`);
+
+		// Backward-compat notice: earlier versions stored every wallet in a single
+		// shared `<network>.db` under the default data dir. That meant any mnemonic
+		// loaded another seed's channels. Storage is now namespaced per-wallet, so
+		// pre-existing data at the legacy path is no longer auto-loaded — surface it
+		// rather than silently appearing to have lost the channels.
+		if (!opts.dataDir) {
+			const fs = nodeFs();
+			const legacyDir = defaultDataDir();
+			const legacyDb = path.join(legacyDir, `${networkName}.db`);
+			if (fs.existsSync(legacyDb) && !fs.existsSync(dbPath)) {
+				const legacyMsg =
+					`[beignet] Found a legacy shared database at ${legacyDb}. ` +
+					`Storage is now per-wallet (${dbPath}), so it is no longer auto-loaded. ` +
+					`If it held this wallet's channels, re-run with dataDir set to "${legacyDir}" to use it.`;
+				this.log('warn', legacyMsg);
+				if (!this.logger) {
+					// Preserve the historical console notice when no logger is injected.
+					// eslint-disable-next-line no-console
+					console.warn(legacyMsg);
+				}
+			}
+		}
+
+		// Encryption at rest (default on): derive the storage key from the BIP39
+		// seed of the wallet mnemonic - the same seed material the Lightning and
+		// on-chain keys derive from - so DB files and backups are unreadable
+		// without the mnemonic. Pre-existing plaintext rows migrate on open().
+		let encryptionKey: Buffer | undefined;
+		if (opts.storageEncryption ?? true) {
+			encryptionKey = deriveStorageKey(this.walletSeed());
+		}
+
+		this._storageEncryptionKey = encryptionKey;
+		// A Tier 2 capsule restore that crashed mid-swap left its durable
+		// marker; finish the install before anything opens the database.
+		this.finishStagedCapsuleRestore(dbPath);
+		const Sqlite = sqliteStorageClass();
+		this.storage = new Sqlite(
+			dbPath,
+			(err) => {
+				this.log('warn', 'Skipped corrupted storage row during load', {
+					error: err instanceof Error ? err.message : String(err)
+				});
+			},
+			encryptionKey ? { encryptionKey } : undefined
+		);
+		this.storage.open();
+		this._bootOpts = opts;
+		// Before anything loads a channel: nothing may resume a `restore db`
+		// row unheld (issue #1363).
+		const dbRestore = holdDbRestoredChannels(dbPath, this.storage);
+		if (dbRestore) {
+			this.log(
+				'warn',
+				'Database was restored from a backup that cannot be proven ' +
+					'current, so its channels are held: no automatic force close and ' +
+					'no new HTLCs. Closing one from this node needs acceptStaleStateRisk',
+				{ ...dbRestore }
+			);
+		}
 	}
 
 	private async init(opts: BeignetNodeOptions): Promise<void> {
@@ -2682,7 +2839,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// duplicate connection → connect/disconnect storm) and one SQLite DB
 		// (corruption risk). Opt out with allowMultipleInstances if you really
 		// know the two instances won't collide.
-		if (!opts.allowMultipleInstances) {
+		if (!opts.allowMultipleInstances && this.dataDir !== undefined) {
 			const lockPath = path.join(this.dataDir, `${networkName}.lock`);
 			try {
 				// reclaimForeignHost: after a container recreate the recorded
@@ -2716,66 +2873,14 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			process.once('exit', this._lockExitHandler);
 		}
 
-		// 3. Open SQLite storage
-		const dbPath = path.join(this.dataDir, `${networkName}.db`);
-
-		// Backward-compat notice: earlier versions stored every wallet in a single
-		// shared `<network>.db` under the default data dir. That meant any mnemonic
-		// loaded another seed's channels. Storage is now namespaced per-wallet, so
-		// pre-existing data at the legacy path is no longer auto-loaded — surface it
-		// rather than silently appearing to have lost the channels.
-		if (!opts.dataDir) {
-			const legacyDir = defaultDataDir();
-			const legacyDb = path.join(legacyDir, `${networkName}.db`);
-			if (fs.existsSync(legacyDb) && !fs.existsSync(dbPath)) {
-				const legacyMsg =
-					`[beignet] Found a legacy shared database at ${legacyDb}. ` +
-					`Storage is now per-wallet (${dbPath}), so it is no longer auto-loaded. ` +
-					`If it held this wallet's channels, re-run with dataDir set to "${legacyDir}" to use it.`;
-				this.log('warn', legacyMsg);
-				if (!this.logger) {
-					// Preserve the historical console notice when no logger is injected.
-					// eslint-disable-next-line no-console
-					console.warn(legacyMsg);
-				}
-			}
-		}
-
-		// Encryption at rest (default on): derive the storage key from the BIP39
-		// seed of the wallet mnemonic - the same seed material the Lightning and
-		// on-chain keys derive from - so DB files and backups are unreadable
-		// without the mnemonic. Pre-existing plaintext rows migrate on open().
-		let encryptionKey: Buffer | undefined;
-		if (opts.storageEncryption ?? true) {
-			encryptionKey = deriveStorageKey(this.walletSeed());
-		}
-
-		this._storageEncryptionKey = encryptionKey;
-		// A Tier 2 capsule restore that crashed mid-swap left its durable
-		// marker; finish the install before anything opens the database.
-		this.finishStagedCapsuleRestore(dbPath);
-		this.storage = new SqliteStorage(
-			dbPath,
-			(err) => {
-				this.log('warn', 'Skipped corrupted storage row during load', {
-					error: err instanceof Error ? err.message : String(err)
-				});
-			},
-			encryptionKey ? { encryptionKey } : undefined
-		);
-		this.storage.open();
-		this._bootOpts = opts;
-		// Before anything loads a channel: nothing may resume a `restore db`
-		// row unheld (issue #1363).
-		const dbRestore = holdDbRestoredChannels(dbPath, this.storage);
-		if (dbRestore) {
-			this.log(
-				'warn',
-				'Database was restored from a backup that cannot be proven ' +
-					'current, so its channels are held: no automatic force close and ' +
-					'no new HTLCs. Closing one from this node needs acceptStaleStateRisk',
-				{ ...dbRestore }
-			);
+		// 3. Open storage: the caller's backend as given, else SQLite.
+		if (opts.storage) {
+			this.storageInjected = true;
+			this.storage = opts.storage;
+			this.storage.open();
+			this._bootOpts = opts;
+		} else {
+			this.openSqliteStorage(opts);
 		}
 
 		// Recovery Protocol boot decision (docs/RECOVERY-PROTOCOL.md section
@@ -2912,7 +3017,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				? { feeEstimationSource: opts.feeEstimationSource }
 				: {}),
 			electrumOptions: {
-				net,
+				net: nodeNet(),
 				tls: walletTls,
 				servers: electrumServer
 			},
@@ -3315,7 +3420,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			...(opts.guardianServe
 				? {
 						guardianHost: {
-							path: path.join(this.dataDir, 'guardian'),
+							path: path.join(this.requireDataDir(), 'guardian'),
 							guardianSecret: deriveGuardianRoot(this.nodeSecret())
 								.guardianSecret,
 							token: opts.guardianToken,
@@ -4971,6 +5076,13 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		// Rebuilding in-process needs the boot options; a caller that never
 		// booted through init holds for a restart like the manual route.
 		const resume = options.resume === true && this._bootOpts !== undefined;
+		if (this.storageInjected) {
+			throw new BeignetError(
+				'CAPSULE_RESTORE_UNSUPPORTED',
+				'Capsule restore installs a SQLite database; this node runs on ' +
+					'the storage passed to create()'
+			);
+		}
 		if (this.recoveryMode !== 'peer-storage' || this._restorePending) {
 			throw new BeignetError(
 				'CAPSULE_RESTORE_UNSUPPORTED',
@@ -5006,14 +5118,15 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			this.log('info', `Capsule restore: ${type}`, { detail });
 			this.emit('recovery:restore-progress', { type, detail });
 		};
+		const Sqlite = sqliteStorageClass();
 		const stagedPath = path.join(
-			this.dataDir,
+			this.requireDataDir(),
 			`${this.networkName}.db.capsule-restore`
 		);
 		const dropStaged = (): void => {
 			for (const suffix of ['', '-wal', '-shm']) {
 				try {
-					fs.unlinkSync(`${stagedPath}${suffix}`);
+					nodeFs().unlinkSync(`${stagedPath}${suffix}`);
 				} catch {
 					// Not there.
 				}
@@ -5047,7 +5160,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					  );
 			let staged: SqliteStorage;
 			try {
-				staged = new SqliteStorage(
+				staged = new Sqlite(
 					stagedPath,
 					() => {
 						/* a fresh file has no rows to skip */
@@ -5065,7 +5178,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			try {
 				result = restoreBestRecoveryCapsule(blobs, staged, this.nodeSecret(), {
 					scratchStorage: (): SqliteStorage => {
-						const scratch = new SqliteStorage(':memory:');
+						const scratch = new Sqlite(':memory:');
 						scratch.open();
 						return scratch;
 					}
@@ -5215,7 +5328,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			// webhooks and the peer addresses the operator just used) is
 			// carried across, or a restart would resurrect a revoked key.
 			try {
-				this.carryDaemonState(this.storage, staged);
+				this.carryDaemonState(this.sqlite()!, staged);
 			} catch (err) {
 				staged.close();
 				dropStaged();
@@ -5232,7 +5345,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			// a crash left behind before the next boot opens a database, so
 			// no restart can land on an empty one. From the marker on, only a
 			// restart serves a node again, whatever happens below.
-			const dbPath = path.join(this.dataDir, `${this.networkName}.db`);
+			const dbPath = path.join(this.requireDataDir(), `${this.networkName}.db`);
 			const keptPath = `${dbPath}.pre-capsule-restore-${new Date()
 				.toISOString()
 				.replace(/[:.]/g, '-')}`;
@@ -5314,7 +5427,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			const opts = this._bootOpts!;
 			let uncoveredEntries: IStaticChannelBackup['channels'] = [];
 			try {
-				this.storage = new SqliteStorage(
+				this.storage = new Sqlite(
 					dbPath,
 					(err) => {
 						this.log('warn', 'Skipped corrupted storage row during load', {
@@ -5457,7 +5570,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (this._restoreInFlight || this._restartRequired || this._resuming) {
 			return;
 		}
-		if (fs.existsSync(this.capsuleRestoreMarkerPath())) return;
+		if (nodeFs().existsSync(this.capsuleRestoreMarkerPath())) return;
 		if (a.phase === 'idle') {
 			const now = Date.now();
 			this._autoApply = { phase: 'settling', firstArrivalAt: now };
@@ -5741,7 +5854,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	private capsuleRestoreMarkerPath(): string {
-		return path.join(this.dataDir, `${this.networkName}.capsule-restore.json`);
+		return path.join(
+			this.requireDataDir(),
+			`${this.networkName}.capsule-restore.json`
+		);
 	}
 
 	/**
@@ -5832,6 +5948,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * after it is verified to hold no channel state.
 	 */
 	private finishStagedCapsuleRestore(dbPath: string): void {
+		const fs = nodeFs();
 		const markerPath = this.capsuleRestoreMarkerPath();
 		if (!fs.existsSync(markerPath)) return;
 		let marker: ICapsuleRestoreMarker;
@@ -5854,14 +5971,15 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				}); inspect the data directory before starting`
 			);
 		}
-		const stagedPath = path.join(this.dataDir, marker.staged);
-		const keptPath = path.join(this.dataDir, marker.keep);
+		const stagedPath = path.join(this.requireDataDir(), marker.staged);
+		const keptPath = path.join(this.requireDataDir(), marker.keep);
 		const sidecars = ['-wal', '-shm'];
 		const moveAside = (): void => {
 			// The restore verified emptiness before writing the marker; verify
 			// again here so a database that somehow gained channel state in
 			// between is never moved out from under its channels.
-			const current = new SqliteStorage(
+			const Sqlite = sqliteStorageClass();
+			const current = new Sqlite(
 				dbPath,
 				() => {
 					/* residue check only */
@@ -5944,7 +6062,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 						}
 						return viaTor(host, port);
 					}
-					return net.connect(port, host);
+					return nodeNet().connect(port, host);
 				}
 			});
 		}
@@ -9653,9 +9771,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		const payments = new DirectFundingPaymentStore({
 			storage: {
 				saveWalletData: (key, value): void =>
-					this.getStorage().saveWalletData(key, value),
+					this.getStorageBackend().saveWalletData(key, value),
 				loadWalletData: (key): string | null =>
-					this.getStorage().loadWalletData(key)
+					this.getStorageBackend().loadWalletData(key)
 			}
 		});
 		payments.restore();
@@ -10814,7 +10932,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private _persistSpendState(strict = false): void {
 		if (this._dailySpendLimitSats === undefined) return;
 		// A daemon that has not opened its database has nowhere to write.
-		const storage = this.storage as SqliteStorage | undefined;
+		const storage = this.storage as
+			| (IStorageBackend & IWalletDataStorage)
+			| undefined;
 		if (!storage) return;
 		const claims: PersistedDailySpendState['claims'] = {};
 		for (const [paymentHashHex, list] of this._asyncSpendClaims) {
@@ -12268,11 +12388,21 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				load: () => p
 			}))
 			.sort((a, b) => (newer(a, b) ? -1 : newer(b, a) ? 1 : 0));
-		const rows = this.storage.paymentsNewestFirst(since, {
-			status,
-			direction,
-			metadata
-		});
+		// Another backend has no lookup columns, so its rows are all read
+		// and tested by the same rules as the live records.
+		const sqlite = this.sqlite();
+		const rows: Iterator<IStoredPaymentRef> = sqlite
+			? sqlite.paymentsNewestFirst(since, { status, direction, metadata })
+			: this.storage
+					.loadAllPayments()
+					.filter(({ payment }) => matches(payment))
+					.map(({ paymentHash, payment }) => ({
+						paymentHash,
+						createdAt: payment.createdAt,
+						load: () => payment
+					}))
+					.sort((a, b) => (newer(a, b) ? -1 : newer(b, a) ? 1 : 0))
+					[Symbol.iterator]();
 		const nextRow = (): IStoredPaymentRef | undefined => {
 			for (let r = rows.next(); !r.done; r = rows.next()) {
 				if (!live.has(r.value.paymentHash)) return r.value;
@@ -13409,10 +13539,19 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			} else {
 				// The two fields settlesInvoice reads, so the answer is the same.
 				if (!durablePaid) {
-					durablePaid = this.storage.paymentHashesWith({
-						status: 'COMPLETED',
-						direction: 'INCOMING'
-					});
+					const match = { status: 'COMPLETED', direction: 'INCOMING' };
+					durablePaid =
+						this.sqlite()?.paymentHashesWith(match) ??
+						new Set(
+							this.storage
+								.loadAllPayments()
+								.filter(
+									({ payment }) =>
+										payment.status === match.status &&
+										payment.direction === match.direction
+								)
+								.map(({ paymentHash }) => paymentHash)
+						);
 				}
 				paid = durablePaid.has(inv.paymentHash);
 			}
@@ -14616,7 +14755,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					invoiceAmountSats: (b) =>
 						paymentSpendSats(decodeInvoiceInput(b).amountMsat)
 				},
-				this.liveQueueStorage()
+				// The queue's rows are SQLite tables, so a node on injected
+				// storage keeps its queue in memory.
+				this.storageInjected ? undefined : this.liveQueueStorage()
 			);
 			// First built after shutdown began, while the database stays open
 			// for the wallet: the rows it restored must not dispatch against
@@ -14641,12 +14782,13 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * (issue #978).
 	 */
 	private liveQueueStorage(): IPaymentQueueStorage {
+		const sqlite = (): SqliteStorage => this.sqlite()!;
 		return {
-			saveQueueEntry: (entry) => this.storage.saveQueueEntry(entry),
+			saveQueueEntry: (entry) => sqlite().saveQueueEntry(entry),
 			updateQueueEntryStatus: (id, status, error, completedAt) =>
-				this.storage.updateQueueEntryStatus(id, status, error, completedAt),
-			deleteQueueEntry: (id) => this.storage.deleteQueueEntry(id),
-			loadAllQueueEntries: () => this.storage.loadAllQueueEntries()
+				sqlite().updateQueueEntryStatus(id, status, error, completedAt),
+			deleteQueueEntry: (id) => sqlite().deleteQueueEntry(id),
+			loadAllQueueEntries: () => sqlite().loadAllQueueEntries()
 		};
 	}
 
@@ -14860,21 +15002,33 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 	/** Back up the database to `destPath`, with its MAC in backupMacPath(destPath). */
 	async backup(destPath: string): Promise<void> {
-		await this.storage.backup(destPath);
+		const sqlite = this.sqlite();
+		if (!sqlite) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'backup() copies the SQLite database; this node runs on the storage passed to create()'
+			);
+		}
+		await sqlite.backup(destPath);
 		await writeBackupMac(deriveBackupMacKey(this.walletSeed()), destPath);
 	}
 
-	/** The live database, its sidecars and the instance lock. */
+	/**
+	 * The live database, its sidecars and the instance lock. A node on
+	 * injected storage has no database file, so only its lock, if it holds one.
+	 */
 	storageFiles(): string[] {
-		const dbPath = fs.realpathSync.native(
-			path.join(this.dataDir, `${this.networkName}.db`)
+		if (this.storageInjected) return this._lockPath ? [this._lockPath] : [];
+		const dataDir = this.requireDataDir();
+		const dbPath = nodeFs().realpathSync.native(
+			path.join(dataDir, `${this.networkName}.db`)
 		);
 		return [
 			dbPath,
 			`${dbPath}-wal`,
 			`${dbPath}-shm`,
 			`${dbPath}-journal`,
-			path.join(this.dataDir, `${this.networkName}.lock`)
+			path.join(dataDir, `${this.networkName}.lock`)
 		];
 	}
 
@@ -14917,7 +15071,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * Build, encrypt, and persist the static channel backup. The blob is
 	 * encrypted under the BIP39 seed of the wallet mnemonic (same seed material
 	 * as storage encryption), written atomically to <dataDir>/channels.scb, and
-	 * also returned for out-of-band storage.
+	 * also returned for out-of-band storage. A node without a dataDir writes
+	 * no file, and returns an empty path.
 	 */
 	exportStaticChannelBackup(): {
 		encoded: string;
@@ -14933,6 +15088,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		};
 		const seed = this.walletSeed();
 		const encoded = encodeScb(backup, seed);
+		if (this.dataDir === undefined) {
+			return { encoded, channelCount: data.channels.length, path: '' };
+		}
 		const scbPath = path.join(this.dataDir, 'channels.scb');
 		// Atomic write: a crash mid-write must never leave a truncated backup.
 		// Owner-only: the blob is seed-encrypted, but it still names every
@@ -15493,10 +15651,44 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	/**
 	 * The node's current SqliteStorage. An in-process capsule resume closes
 	 * it and installs a new one, so anything that persists through it reads
-	 * this on every call instead of keeping the handle (issue #978).
+	 * this on every call instead of keeping the handle (issue #978). Throws
+	 * for a node created with options.storage; getStorageBackend() returns
+	 * either.
 	 */
 	getStorage(): SqliteStorage {
+		const sqlite = this.sqlite();
+		if (!sqlite) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'This node runs on the storage passed to create(), not SQLite; use getStorageBackend()'
+			);
+		}
+		return sqlite;
+	}
+
+	/**
+	 * The storage the node runs on: the backend passed as options.storage,
+	 * or its SqliteStorage. Read it on every call, as getStorage() says.
+	 */
+	getStorageBackend(): IStorageBackend & IWalletDataStorage {
 		return this.storage;
+	}
+
+	/** The storage as the SqliteStorage it is unless create() was given one. */
+	private sqlite(): SqliteStorage | undefined {
+		return this.storageInjected ? undefined : (this.storage as SqliteStorage);
+	}
+
+	/**
+	 * The data directory, on paths only a node with one reaches: every
+	 * SQLite node has one, and create() refuses the options that need one
+	 * on injected storage without it.
+	 */
+	private requireDataDir(): string {
+		if (this.dataDir === undefined) {
+			throw new BeignetError('INVALID_PARAMS', 'This node has no dataDir');
+		}
+		return this.dataDir;
 	}
 
 	// ─────────────── Lifecycle ───────────────

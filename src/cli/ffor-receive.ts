@@ -83,7 +83,7 @@ export class FforReceiveService {
 			] as const)
 				if (!Number.isSafeInteger(funding[k]) || funding[k] <= 0)
 					throw Error(`fforReceiveFunding.${k} must be positive`);
-		const raw = host.getStorage().loadWalletData(KEY);
+		const raw = host.getStorageBackend().loadWalletData(KEY);
 		this.allocations = raw ? JSON.parse(raw) : [];
 		if (
 			!Array.isArray(this.allocations) ||
@@ -207,8 +207,8 @@ export class FforReceiveService {
 				throw Error('Unknown receive reservation');
 			// Read only. Never reveal a preimage merely because S generated it. Only
 			// durable SETTLED slots prove the upstream fulfil has been committed.
-			const durable = this.host.getStorage().loadChannel(b.channelId)?.state
-				.ffor;
+			const durable = this.host.getStorageBackend().loadChannel(b.channelId)
+				?.state.ffor;
 			if (
 				!durable ||
 				durable.role !== 'S' ||
@@ -274,7 +274,7 @@ export class FforReceiveService {
 				throw Error('The receive channel is still being prepared.');
 			old.channelId = channel.getCurrentChannelId().toString('hex');
 			this.host
-				.getStorage()
+				.getStorageBackend()
 				.saveWalletData(KEY, JSON.stringify(this.allocations));
 			return { channelId: old.channelId };
 		}
@@ -300,7 +300,7 @@ export class FforReceiveService {
 			const allocation: Allocation = { peer, id: b.allocationId, amount };
 			this.allocations.push(allocation);
 			this.host
-				.getStorage()
+				.getStorageBackend()
 				.saveWalletData(KEY, JSON.stringify(this.allocations));
 			// Zero-conf only where the OPERATOR said so. This used to pass a
 			// hardcoded trusted=true and grant itself the authorization to match,
@@ -323,7 +323,7 @@ export class FforReceiveService {
 			allocation.channelId = opened.channelId;
 			allocation.temporaryId = opened.channelId;
 			this.host
-				.getStorage()
+				.getStorageBackend()
 				.saveWalletData(KEY, JSON.stringify(this.allocations));
 			const raw = this.host
 				.getNode()
@@ -336,7 +336,7 @@ export class FforReceiveService {
 				if (id !== allocation.channelId) {
 					allocation.channelId = id;
 					this.host
-						.getStorage()
+						.getStorageBackend()
 						.saveWalletData(KEY, JSON.stringify(this.allocations));
 				}
 				const channel = this.host

@@ -164,7 +164,7 @@ function fixture(overrides: Json = {}, opts: Opts = {}): any {
 			epochs.push(fresh);
 			return fresh;
 		},
-		getStorage: () => ({
+		getStorageBackend: () => ({
 			loadAllInvoices: () => [{ paymentHashHex: spareHash }]
 		}),
 		getFforReceiveService: () => ({

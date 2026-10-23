@@ -39,8 +39,10 @@ beignet start --network regtest
 
 ### Programmatic (TypeScript)
 
+`BeignetNode` and the error helpers are in `beignet/node`, `startDaemon` is in `beignet/daemon`, and `beignet/cli` exports both.
+
 ```typescript
-import { BeignetNode } from 'beignet/cli';
+import { BeignetNode } from 'beignet/node';
 
 const node = await BeignetNode.create({
   network: 'regtest',
@@ -75,7 +77,8 @@ await node.destroy();
 | `mnemonic?` | `string` | BIP39 mnemonic for the wallet and node keys. A new one is generated when omitted. |
 | `network?` | `'mainnet' \| 'testnet' \| 'regtest' \| 'signet'` | Required by create(), which throws INVALID_PARAMS without it. |
 | `alias?` | `string` | Node alias advertised in node_announcement. |
-| `dataDir?` | `string` | Directory for the SQLite database and the instance lock, used as given. Default: `~/.beignet/data/<tag>`, where the tag is the first 16 hex characters of the mnemonic's SHA-256, so each seed gets its own database. |
+| `dataDir?` | `string` | Directory for the SQLite database and the instance lock, used as given. Default: `~/.beignet/data/<tag>`, where the tag is the first 16 hex characters of the mnemonic's SHA-256, so each seed gets its own database. With `storage` there is no default, and without a dataDir the node writes no files. |
+| `storage?` | `IStorageBackend & IWalletDataStorage` | Storage to run on instead of SQLite, such as a MemoryStorage or a backend over a React Native database. It must implement the walletData capability, where the node keeps its wallet state, spend ledger and sweep journal. create() opens it and destroy() closes it. SQLite is then never loaded, storageEncryption does not apply, the payment queue is kept in memory, and backupPath, backup() and capsule restore, which copy or install a SQLite file, are refused. |
 | `allowMultipleInstances?` | `boolean` | Skip the single-instance lock on the data dir (default false). Leave this off unless you have a specific reason — two instances sharing one data dir share a node identity and SQLite DB, which causes connection churn and risks database corruption. |
 | `electrumHost?` | `string` | Electrum server host (default: the network's built-in server). |
 | `electrumPort?` | `number` | Electrum server port (default: the built-in server's). |
@@ -186,7 +189,7 @@ await node.destroy();
 | `electrumTlsFingerprints?` | `string[]` | SHA-256 fingerprints of Electrum certificates to accept without a CA, for servers with self-signed certificates. Hex with or without colons, as printed by `openssl x509 -noout -fingerprint -sha256`. Needs electrumTlsVerify. |
 <!-- options:BeignetNodeOptions:end -->
 
-Internally wires together: `Wallet` + `LightningNode` + `SqliteStorage` + `WalletFundingProvider` + `ElectrumBackend`.
+Internally wires together: `Wallet` + `LightningNode` + `SqliteStorage` (or the backend passed as `storage`) + `WalletFundingProvider` + `ElectrumBackend`.
 
 ### Methods
 

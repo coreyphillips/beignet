@@ -364,6 +364,7 @@ method BeignetNode.getReadyChannels(): ChannelInfo[]
 method BeignetNode.getRecoverySurfaceStatus(): { mode: RecoveryMode; profile: 'crash-v1' | null; generation: string; configuredSetStale: boolean; rotation: { inProgress: boolean; pending: boolean; retirePending: boolean; lastEvent: { type: string; detail: string; } | null; followed: { generation: string; from: string[]; to: string[]; } | null; }; guardians: Array<{ guardianId: string; url: string; }>; state: 'disabled' | 'running' | 'restore-required' | 'restoring' | 'restart-required' | 'fenced'; node: ReturnType<beignet/lightning#node.LightningNode['getRecoveryStatus']> | null; capsules: { candidates: number; best: { writerEpoch: string; latestSequence: string; inline: boolean; channelCount: number; guardians: IReportedGuardian[]; fromPeer: string; receivedAt: number; } | null; }; restore?: { inProgress: boolean; lastEvent?: { type: string; detail: string; }; }; autoApply: { enabled: boolean; phase: 'idle' | 'settling' | 'applying' | 'applied' | 'refused'; settleUntil: number | null; lastReason: string | null; }; }
 method BeignetNode.getStats(windowMs?: number): NodeStats
 method BeignetNode.getStorage(): beignet/lightning/sqlite#SqliteStorage
+method BeignetNode.getStorageBackend(): beignet/lightning#storage.IStorageBackend & beignet/lightning#storage.IWalletDataStorage
 method BeignetNode.getSwapsStatus(): SwapsStatusInfo
 method BeignetNode.getWallet(): beignet#Wallet
 method BeignetNode.gracefulShutdown(timeoutMs?: number): Promise<void>
@@ -624,6 +625,7 @@ property BeignetNodeOptions.recoveryReestablishHoldMs?: number
 property BeignetNodeOptions.routingCltvDelta?: number
 property BeignetNodeOptions.routingFeeBaseMsat?: number
 property BeignetNodeOptions.routingFeePpm?: number
+property BeignetNodeOptions.storage?: beignet/lightning#storage.IStorageBackend & beignet/lightning#storage.IWalletDataStorage
 property BeignetNodeOptions.storageEncryption?: boolean
 property BeignetNodeOptions.swaps?: { enabled?: boolean; flatFeeSat?: number; feePpm?: number; minSat?: number; maxSat?: number; maxExposureSat?: number; maxConcurrent?: number; refundDeltaBlocks?: number; fundingConfs?: number; resolutionConfs?: number; submarine?: boolean; claimSafetyBlocks?: number; paymentMaxFeePpm?: number; claimBumpIntervalBlocks?: number; submarineRefundDeltaBlocks?: number; }
 property BeignetNodeOptions.torProxy?: string
@@ -739,7 +741,7 @@ property ConsolidateResult.feeSats: number
 property ConsolidateResult.hex: string
 property ConsolidateResult.txid: TxidHex
 property ConsolidateResult.utxosConsolidated: number
-interface DaemonOptions extends BeignetNodeOptions
+interface DaemonOptions extends Omit<BeignetNodeOptions, 'storage'>
 property DaemonOptions.apiKeys?: ApiKeyDefinition[]
 property DaemonOptions.apiToken?: string
 property DaemonOptions.cors?: boolean | string

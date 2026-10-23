@@ -15,8 +15,8 @@ import {
 	normalizeIrohEndpointId
 } from './iroh';
 import { EventEmitter } from 'events';
-import net from 'net';
-import { SocksClient } from 'socks';
+import type net from 'net';
+import { nodeNet } from '../../utils/node-builtins';
 import { getPublicKey } from '../crypto/ecdh';
 import { Peer } from './peer';
 import { FeatureFlags } from '../features/flags';
@@ -193,6 +193,8 @@ export function socks5SocketFactory(
 	timeoutMs = 20_000
 ): (host: string, port: number) => Promise<net.Socket> {
 	return async (host: string, port: number): Promise<net.Socket> => {
+		// socks loads net, so it is required here rather than at module scope.
+		const { SocksClient } = require('socks') as typeof import('socks');
 		const { socket } = await SocksClient.createConnection({
 			proxy: { host: proxy.host, port: proxy.port, type: 5 },
 			command: 'connect',
@@ -1441,7 +1443,7 @@ export class PeerManager extends EventEmitter {
 			throw new Error('Already listening');
 		}
 
-		const server = net.createServer((socket) => {
+		const server = nodeNet().createServer((socket) => {
 			this.handleInboundConnection(socket);
 		});
 		server.on('error', (err) => {

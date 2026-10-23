@@ -68,6 +68,12 @@
       "cli": [
         "dist/types/cli/index.d.ts"
       ],
+      "node": [
+        "dist/types/node.d.ts"
+      ],
+      "daemon": [
+        "dist/types/daemon.d.ts"
+      ],
       "lightning/iroh-node": [
         "dist/types/lightning/transport/iroh-node.d.ts"
       ],
@@ -88,6 +94,14 @@
     "./cli": {
       "types": "./dist/types/cli/index.d.ts",
       "default": "./dist/cli/index.js"
+    },
+    "./node": {
+      "types": "./dist/types/node.d.ts",
+      "default": "./dist/node.js"
+    },
+    "./daemon": {
+      "types": "./dist/types/daemon.d.ts",
+      "default": "./dist/daemon.js"
     },
     "./lightning/iroh-node": {
       "types": "./dist/types/lightning/transport/iroh-node.d.ts",

@@ -15,8 +15,8 @@
  * builds keep using the native WebSocket.
  */
 
-import net from 'net';
-import tls from 'tls';
+import type net from 'net';
+import { nodeNet, nodeTls } from '../../utils/node-builtins';
 import { randomBytes } from '../crypto/provider';
 import type { IWebSocketLike } from './websocket';
 import { parseWebSocketUrl } from './websocket';
@@ -97,8 +97,8 @@ export class NodeWebSocket implements IWebSocketLike {
 		};
 
 		const socket = secure
-			? tls.connect({ host, port, servername: host }, onConnect)
-			: net.connect({ host, port }, onConnect);
+			? nodeTls().connect({ host, port, servername: host }, onConnect)
+			: nodeNet().connect({ host, port }, onConnect);
 		this.socket = socket;
 		socket.setNoDelay(true);
 

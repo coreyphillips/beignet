@@ -1,4 +1,4 @@
-import * as tls from 'tls';
+import { nodeTls } from '../utils/node-builtins';
 import type { Tls } from '../types/electrum';
 import {
 	normalizeFingerprint,
@@ -77,7 +77,7 @@ export function validateElectrumTlsConfig(config: ElectrumTlsConfig): void {
 			'electrumTlsFingerprints needs electrumTlsVerify: true (BEIGNET_ELECTRUM_TLS_VERIFY=true); without it no certificate is checked'
 		);
 	}
-	withTlsVerification(tls, { fingerprints });
+	withTlsVerification(nodeTls(), { fingerprints });
 }
 
 /**
@@ -91,6 +91,7 @@ export function electrumTlsModule(
 	dialedHost: string,
 	configuredHost: string
 ): Tls {
+	const tls = nodeTls();
 	if (config.electrumTlsVerify !== true) return tls;
 	return withTlsVerification(tls, {
 		fingerprints: config.electrumTlsFingerprints,

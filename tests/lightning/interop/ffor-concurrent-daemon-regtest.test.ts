@@ -179,7 +179,7 @@ describe('Concurrent receive daemon HTTP acceptance on regtest', function () {
 		const service = new FforReceiveService(
 			{
 				getNode: () => s,
-				getStorage: () => storage,
+				getStorageBackend: () => storage,
 				fforConcurrentNegotiated: (peer: string) =>
 					s.getChannelManager().peerNegotiatedFforConcurrent(peer)
 			} as unknown as BeignetNode,

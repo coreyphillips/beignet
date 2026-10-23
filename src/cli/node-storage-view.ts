@@ -24,21 +24,21 @@
  * - Other properties read and write through: a tuning field, and the
  *   class's private fields, which nothing outside the class reads.
  * - The view is a Proxy over the instance, so instanceof SqliteStorage
- *   still holds.
+ *   still holds. An injected backend gets the same view.
  * - SqliteStorage is synchronous, so a call either ran before the fence or
  *   throws; nothing can start before it and write after it. backup() is
  *   the one async method, and after the fence it rejects, as it does on a
  *   closed connection.
  */
 
-import type { SqliteStorage } from '../lightning/storage/sqlite-storage';
+import type { IStorageCore } from '../lightning/storage/types';
 
 /** better-sqlite3's error, word for word, for any use of a closed connection. */
 const CLOSED_CONNECTION = 'The database connection is not open';
 
 type Method = (...args: unknown[]) => unknown;
 
-export function nodeStorageView(storage: SqliteStorage): SqliteStorage {
+export function nodeStorageView<S extends IStorageCore>(storage: S): S {
 	let fenced = false;
 	// Idempotent, like closing a closed better-sqlite3 connection.
 	const close = (): void => {

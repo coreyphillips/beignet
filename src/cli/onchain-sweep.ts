@@ -2,6 +2,7 @@ import * as bitcoin from 'bitcoinjs-lib';
 import type { Wallet } from '../wallet';
 import { liveWalletData } from '../wallet/live-data';
 import type { SqliteStorage } from '../lightning/storage/sqlite-storage';
+import type { IWalletDataStorage } from '../lightning/storage/types';
 import type { BeignetErrorCodeValue } from './errors';
 import { BeignetError } from './errors';
 import type { TxidHex } from '../utils/identifiers';
@@ -43,7 +44,7 @@ interface SweepRecord extends OnchainSweepInfo {
 	hex?: string;
 }
 
-type SweepStorage = Pick<SqliteStorage, 'loadWalletData' | 'saveWalletData'>;
+type SweepStorage = IWalletDataStorage;
 type SweepWallet = Pick<
 	Wallet,
 	| 'data'

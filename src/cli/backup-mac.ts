@@ -9,7 +9,7 @@
  */
 
 import { createHmac } from 'crypto';
-import * as fs from 'fs';
+import { nodeFs } from '../utils/node-builtins';
 import { hkdfKey } from '../lightning/storage/encryption';
 import { writeFileAtomic } from './fs-utils';
 
@@ -28,6 +28,7 @@ export function deriveBackupMacKey(seed: Buffer): Buffer {
 
 /** HMAC-SHA256 of a file's bytes. */
 export async function fileMac(key: Buffer, filePath: string): Promise<Buffer> {
+	const fs = nodeFs();
 	const hmac = createHmac('sha256', key);
 	for await (const chunk of fs.createReadStream(filePath)) {
 		hmac.update(chunk as Buffer);
@@ -52,6 +53,7 @@ export async function writeBackupMac(
  * sidecar. Throws when the sidecar is not a MAC this release wrote.
  */
 export function readBackupMac(backupPath: string): Buffer | null {
+	const fs = nodeFs();
 	const macPath = backupMacPath(backupPath);
 	let text: string;
 	try {

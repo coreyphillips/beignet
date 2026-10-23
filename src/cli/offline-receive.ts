@@ -602,7 +602,7 @@ export class OfflineReceive {
 				  });
 			if (
 				!this.node
-					.getStorage()
+					.getStorageBackend()
 					.loadAllInvoices()
 					.some((i) => i.paymentHashHex === invoice.paymentHash)
 			)

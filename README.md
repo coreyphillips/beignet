@@ -108,7 +108,9 @@ Both examples run through `ts-node`. The on-chain example runs straight off the 
 | Import | Contains | Use when |
 |--------|----------|----------|
 | `beignet` | `Wallet`, `generateMnemonic`, types | You want the on-chain wallet |
-| `beignet/cli` | `BeignetNode`, `startDaemon`, error helpers | **You want Lightning.** Sats-denominated, string IDs, structured errors |
+| `beignet/node` | `BeignetNode`, error helpers | **You want Lightning.** Sats-denominated, string IDs, structured errors. Runs on React Native |
+| `beignet/daemon` | `startDaemon`, API keys, webhooks | You serve the HTTP API from your own Node process |
+| `beignet/cli` | Both of the above | Existing imports; it loads the daemon too |
 | `beignet/lightning` | Namespaced protocol modules (`node`, `channel`, `onion`, ...) | You need the raw BOLT layer: bigint msat, Buffer IDs, wire messages |
 
 ## On-chain wallet
@@ -381,10 +383,10 @@ Diagnostics flow through a small injectable `ILogger` (`debug`/`info`/`warn`/`er
 > putting meaningful mainnet funds behind it: this is a self-custodial Lightning
 > implementation, and channel funds are only as safe as the node watching them.
 
-`BeignetNode` from `beignet/cli` is the recommended API: it wraps the protocol layer with satoshi amounts, string channel IDs and structured error codes.
+`BeignetNode` from `beignet/node` is the recommended API: it wraps the protocol layer with satoshi amounts, string channel IDs and structured error codes. `beignet/cli` exports it too.
 
 ```typescript
-import { BeignetNode, isRetryableError } from 'beignet/cli';
+import { BeignetNode, isRetryableError } from 'beignet/node';
 
 // Creates the wallet, storage and funding provider for you
 const node = await BeignetNode.create({
@@ -548,7 +550,7 @@ curl http://localhost:2112/ready                                       # load-ba
 - Full spec at `GET /openapi.json`.
 - Authentication is on for every install `beignet init` creates (releases after 0.22.0): `init` mints a random `apiToken` and saves it in `config.json` (run `init` again on an older config to add one). Auth is off only for a config with neither `apiToken` nor `apiKeys` (named keys with `readonly`/`invoice`/`admin` scopes); `beignet start` warns on stderr in that case. `GET /health`, `/ready` and `/openapi.json` are auth-exempt; `/metrics` only with `metricsPublic`; everything else requires the bearer token. The daemon binds `127.0.0.1` by default.
 - While auth is off, three browser guards keep a web page from driving the loopback daemon (issue #1005): a request body must be `Content-Type: application/json` (else `415 UNSUPPORTED_MEDIA_TYPE`), an `Origin` other than the configured `cors` origin or a `Sec-Fetch-Site: cross-site` request is refused (`403 CROSS_SITE_REQUEST_REFUSED`), and the `Host` header must be the loopback name the daemon is bound on (else `421 HOST_NOT_ALLOWED`, which also defeats DNS rebinding). They apply to every route but `OPTIONS`; plain clients (curl, the CLI, the SDKs) send none of those headers and are unaffected, and with a token configured the guards do not run at all.
-- Embed it instead of shelling out: `import { startDaemon } from 'beignet/cli'`.
+- Embed it instead of shelling out: `import { startDaemon } from 'beignet/daemon'`.
 
 ### FFOR offline receive
 
@@ -807,13 +809,30 @@ Recommended safeguards in production:
 }
 ```
 
+`BeignetNode` runs there from `beignet/node`, on storage passed in place of SQLite:
+
+```typescript
+import { BeignetNode } from 'beignet/node';
+import { storage } from 'beignet/lightning';
+
+const node = await BeignetNode.create({
+  network: 'mainnet',
+  mnemonic,
+  storage: new storage.MemoryStorage(), // or a backend over the app's database
+});
+```
+
+Neither entry loads `fs`, `net`, `tls` or better-sqlite3 when imported. The node requires `net` and `tls` when it opens a connection, and `fs` only for a `dataDir`, which a node on `storage` does not need. Both entries still import `crypto`, `path`, `os`, `dns`, `http`, `https` and `zlib`, so the bundle needs a substitute for each.
+
+The backend must implement the `walletData` capability: the node keeps its wallet state, spend ledger and sweep journal there. `MemoryStorage` loses everything when the app exits, so a wallet needs a backend over a persistent store; [src/lightning/README.md](src/lightning/README.md) describes the interface and its conformance suite. On such a node the payment queue lives in memory, and what copies or installs a SQLite file (`backupPath`, `backup()`, capsule restore) is refused.
+
 Nothing in the `beignet` entry loads Node `crypto` until `createEncryptedStorage` is first called. It then needs HKDF-SHA256, random bytes and AES-256-GCM. An app that encrypts wallet storage either ships a `crypto` shim that covers those, or passes its own implementation (of the `ICryptoProvider` interface) to `setCryptoProvider` before the first call. Each primitive is checked against a known-answer vector before its first use, and one that fails throws an error naming it rather than returning wrong bytes. The check catches a missing or broken primitive, not a weak one: no test can tell predictable random bytes from secure ones, so a provider's `randomBytes` must come from the platform's secure generator.
 
 ## Documentation
 
 [docs/README.md](docs/README.md) indexes every guide, reference and design document in the repository.
 
-The API reference for every entry point (`beignet`, `beignet/cli`, `beignet/lightning`, `beignet/lightning/sqlite`, `beignet/lightning/iroh-node`) is generated by typedoc and not kept in git. CI builds it on every run and uploads it as the `api-docs` artifact of the docs workflow; `npm run docs:html` (or `docs:markdown`) builds it locally into `api-docs/`.
+The API reference for every entry point (`beignet`, `beignet/node`, `beignet/daemon`, `beignet/cli`, `beignet/lightning`, `beignet/lightning/sqlite`, `beignet/lightning/iroh-node`) is generated by typedoc and not kept in git. CI builds it on every run and uploads it as the `api-docs` artifact of the docs workflow; `npm run docs:html` (or `docs:markdown`) builds it locally into `api-docs/`.
 
 ## Support
 

@@ -1,6 +1,8 @@
 {
   "entryPoints": [
     "src/index.ts",
+    "src/node.ts",
+    "src/daemon.ts",
     "src/cli/index.ts",
     "src/lightning/index.ts",
     "src/lightning/sqlite.ts",
