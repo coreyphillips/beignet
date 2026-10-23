@@ -10,7 +10,7 @@
  */
 
 import { expect } from 'chai';
-import { ChannelState } from '../../src/lightning/channel/types';
+import { ChannelResult, ChannelState } from '../../src/lightning/channel/types';
 import { MessageType } from '../../src/lightning/message/types';
 import {
 	createPair,
@@ -141,6 +141,42 @@ describe('A commitment_signed after a failed write (issue #1303)', () => {
 		expect(later.ok, later.error).to.equal(true);
 		expect(later.sendsWithheld).to.equal(undefined);
 		expect(sentBy(pair, 'R')).to.deep.equal([MessageType.UPDATE_FULFILL_HTLC]);
+		expectAlive(pair, 'before the reconnect');
+
+		reconnect(pair);
+		expectUpdateBeforeSignature(pair, 'R', MessageType.UPDATE_FULFILL_HTLC);
+		expectAlive(pair, 'after the reconnect');
+		expect(pair.events.S.fulfilled).to.include.members([first.id, second.id]);
+		expect(ordinaryHtlcs(pair.sChannel)).to.deep.equal([]);
+		expect(ordinaryHtlcs(pair.rChannel)).to.deep.equal([]);
+	});
+
+	it('an error listener that fulfils on a thrown write does not sign over the withheld fulfil', () => {
+		const pair = createPair({ pushSat: 200_000n });
+		const first = offer(pair, 'S', 2_000_000n);
+		const second = offer(pair, 'S', 3_000_000n);
+		expect(first.result.ok, first.result.error).to.equal(true);
+		expect(second.result.ok, second.result.error).to.equal(true);
+		failNextWrite(pair, 'R', 'throw');
+		let later: ChannelResult | undefined;
+		pair.rManager.once('error', () => {
+			later = pair.rManager.fulfillHtlc(
+				pair.channelId,
+				second.id,
+				second.preimage
+			);
+		});
+		pair.link.log.length = 0;
+
+		const res = pair.rManager.fulfillHtlc(
+			pair.channelId,
+			first.id,
+			first.preimage
+		);
+		expect(res.sendsWithheld).to.equal(true);
+		expect(later?.ok, later?.error).to.equal(true);
+		expect(sentBy(pair, 'R')).to.deep.equal([MessageType.UPDATE_FULFILL_HTLC]);
+		pair.rErrors.length = 0;
 		expectAlive(pair, 'before the reconnect');
 
 		reconnect(pair);

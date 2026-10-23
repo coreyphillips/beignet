@@ -10213,6 +10213,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private _persistBatch(ctx: IDispatchContext): boolean {
 		const { channel, outbox } = ctx;
 		let result: IChannelPersistResult | undefined;
+		let thrown: string | undefined;
 		try {
 			result = this.persistence.persist({
 				channel,
@@ -10226,13 +10227,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			// update this batch withholds. A write without an outbox gates
 			// nothing, so its throw still goes up.
 			if (!outbox) throw err;
-			this.emitContained(
-				'error',
-				channel.getChannelId(),
-				`Channel state write threw: ${
-					err instanceof Error ? err.message : String(err)
-				}`
-			);
+			thrown = err instanceof Error ? err.message : String(err);
 		}
 		if (outbox) {
 			ctx.persisted = {
@@ -10249,6 +10244,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				// later in this batch can already auto-sign.
 				if (ctx.channelIdHex) {
 					this.sendsWithheldOnConnection.add(ctx.channelIdHex);
+				}
+				// Only after the fence: an error listener can re-enter and sign.
+				if (thrown !== undefined) {
+					this.emitContained(
+						'error',
+						channel.getChannelId(),
+						`Channel state write threw: ${thrown}`
+					);
 				}
 				return false;
 			}
