@@ -5,7 +5,7 @@
  */
 
 import { expect } from 'chai';
-import { readFileSync } from 'fs';
+import { readdirSync, readFileSync } from 'fs';
 import * as path from 'path';
 
 const pkg = JSON.parse(
@@ -61,6 +61,34 @@ describe('package.json', () => {
 	it('should list better-sqlite3 as optional, not required (issue #1685)', () => {
 		expect(pkg.dependencies).to.not.have.property('better-sqlite3');
 		expect(pkg.optionalDependencies).to.have.property('better-sqlite3');
+	});
+
+	// Metro skips a require in a try block only while the package is missing.
+	// Once installed it is bundled, and both native packages load fs at module
+	// scope, so a React Native bundle fails unless each resolves to nothing.
+	it('should resolve every optional dependency the source requires to an empty module under React Native (issue #1708)', () => {
+		const optional = Object.keys(pkg.optionalDependencies);
+		const src = path.resolve(__dirname, '../../src');
+		const specifiers: string[] = [];
+		for (const file of readdirSync(src, {
+			encoding: 'utf8',
+			recursive: true
+		})) {
+			if (!file.endsWith('.ts')) continue;
+			const text = readFileSync(path.join(src, file), 'utf8');
+			for (const [, specifier] of text.matchAll(/require\('([^']+)'\)/g)) {
+				if (
+					optional.some(
+						(dep) => specifier === dep || specifier.startsWith(`${dep}/`)
+					)
+				) {
+					specifiers.push(specifier);
+				}
+			}
+		}
+		expect(pkg['react-native']).to.deep.equal(
+			Object.fromEntries(specifiers.map((specifier) => [specifier, false]))
+		);
 	});
 
 	it('should have lightning-related keywords', () => {

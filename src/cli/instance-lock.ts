@@ -25,7 +25,7 @@
  * supported scenario — a PID probe could not arbitrate it either way.
  */
 
-import * as fs from 'fs';
+import { nodeFs } from '../utils/node-builtins';
 import * as os from 'os';
 
 export interface ILockInfo {
@@ -64,6 +64,7 @@ interface ILockFile {
 
 /** Null when the file is missing/unreadable; `info` null when it is corrupt. */
 function readLockFile(lockPath: string): ILockFile | null {
+	const fs = nodeFs();
 	let raw: string;
 	try {
 		raw = fs.readFileSync(lockPath, 'utf8');
@@ -124,6 +125,7 @@ export function acquireInstanceLock(
 	lockPath: string,
 	opts: IAcquireLockOptions = {}
 ): ILockInfo {
+	const fs = nodeFs();
 	const { now = Date.now(), reclaimForeignHost = false, onReclaim } = opts;
 	const info: ILockInfo = {
 		pid: process.pid,
@@ -217,6 +219,7 @@ export function acquireInstanceLock(
  * missing or foreign lock — it never removes another instance's lock.
  */
 export function releaseInstanceLock(lockPath: string): void {
+	const fs = nodeFs();
 	try {
 		const holder = readLockFile(lockPath)?.info;
 		// PID alone is ambiguous across hosts — require the hostname to match

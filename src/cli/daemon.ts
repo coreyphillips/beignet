@@ -59,7 +59,8 @@ import {
 	scopesAllowRoute
 } from './auth';
 
-export interface DaemonOptions extends BeignetNodeOptions {
+/** The daemon keeps its keys, webhooks and queue in SQLite, so it takes no storage. */
+export interface DaemonOptions extends Omit<BeignetNodeOptions, 'storage'> {
 	daemonPort?: number;
 	daemonHost?: string;
 	/** Legacy single bearer token. Still honored, with implicit admin scope. */
@@ -911,6 +912,12 @@ async function bootDaemon(
 			? opts.daemonPort
 			: 2112;
 	const host = opts.daemonHost || '127.0.0.1';
+	if ((opts as BeignetNodeOptions).storage !== undefined) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			'The daemon runs on SQLite in dataDir and takes no storage'
+		);
+	}
 	// Validates apiKeys (names/keys/scopes) up front; throws INVALID_PARAMS
 	// on bad config before the node is created.
 	const authenticator = new ApiKeyAuthenticator(opts.apiToken, opts.apiKeys);

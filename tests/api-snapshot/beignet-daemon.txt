@@ -1,0 +1,85 @@
+# The exported API of beignet/daemon. Regenerate with npm run api:snapshot; do not edit.
+class ApiKeyAuthenticator
+constructor ApiKeyAuthenticator(apiToken?: string, apiKeys?: ApiKeyDefinition[])
+method ApiKeyAuthenticator.attachOverrideStore(store: AuthOverrideStore): void
+method ApiKeyAuthenticator.authenticate(header: string | undefined): AuthResult
+get ApiKeyAuthenticator.enabled(): boolean
+method ApiKeyAuthenticator.listKeys(): Array<{ name: string; scopes: ApiScope[]; revoked: boolean; expired: boolean; expiresAt?: string; rotatedAt?: string; }>
+method ApiKeyAuthenticator.revoke(name: string): boolean
+method ApiKeyAuthenticator.rotate(name: string): { name: string; key: string; rotatedAt: string; } | null
+interface ApiKeyDefinition
+property ApiKeyDefinition.expiresAt?: string
+property ApiKeyDefinition.key: string
+property ApiKeyDefinition.name: string
+property ApiKeyDefinition.scopes: ApiScope[]
+type ApiScope = 'readonly' | 'invoice' | 'admin'
+unexported interface AuthFailure
+property AuthFailure.ok: false
+unexported interface AuthOverrideStore
+method AuthOverrideStore.load(): Record<string, StoredKeyOverride> | null
+method AuthOverrideStore.save(overrides: Record<string, StoredKeyOverride>): void
+type AuthResult = AuthSuccess | AuthFailure
+interface AuthSuccess
+property AuthSuccess.keyName: string | null
+property AuthSuccess.ok: true
+property AuthSuccess.scopes: ReadonlySet<ApiScope>
+interface DaemonOptions extends Omit<beignet/cli#BeignetNodeOptions, 'storage'>
+property DaemonOptions.apiKeys?: ApiKeyDefinition[]
+property DaemonOptions.apiToken?: string
+property DaemonOptions.cors?: boolean | string
+property DaemonOptions.daemonHost?: string
+property DaemonOptions.daemonPort?: number
+property DaemonOptions.htlcEvents?: boolean
+property DaemonOptions.insecure?: boolean
+property DaemonOptions.metricsPublic?: boolean
+property DaemonOptions.rateLimit?: RateLimitOptions
+property DaemonOptions.tlsCert?: string
+property DaemonOptions.tlsKey?: string
+class HttpRateLimiter
+constructor HttpRateLimiter(options?: RateLimitOptions)
+method HttpRateLimiter.destroy(): void
+method HttpRateLimiter.isAllowed(clientKey: string): boolean
+method HttpRateLimiter.prune(): number
+get HttpRateLimiter.size(): number
+interface IStartedDaemon
+property IStartedDaemon.logger?: beignet#ILogger
+property IStartedDaemon.node: beignet/cli#BeignetNode
+property IStartedDaemon.server: http#Server
+property IStartedDaemon.stop: (timeoutMs?: number) => Promise<void>
+interface IWebhookStorage
+method IWebhookStorage.deleteAllWebhooks(): void
+method IWebhookStorage.deleteWebhook(id: string): void
+method IWebhookStorage.loadAllWebhooks(): Array<{ id: string; url: string; events: string[]; secretHash?: string; createdAt: number; }>
+method IWebhookStorage.loadWebhookSecrets?(): Record<string, string> | null
+method IWebhookStorage.saveWebhook(id: string, url: string, events: string[], secretHash?: string, createdAt?: number): void
+method IWebhookStorage.saveWebhookSecrets?(secrets: Record<string, string>): void
+const ROUTE_SCOPES: Record<string, ApiScope[]>
+interface RateLimitOptions
+property RateLimitOptions.maxClients?: number
+property RateLimitOptions.maxRequests?: number
+property RateLimitOptions.trustedProxies?: string[]
+property RateLimitOptions.windowMs?: number
+unexported interface StoredKeyOverride
+property StoredKeyOverride.configDigest: string
+property StoredKeyOverride.expiresAt?: string
+property StoredKeyOverride.keyDigest?: string
+property StoredKeyOverride.revoked?: boolean
+property StoredKeyOverride.rotatedAt?: string
+class WebhookManager
+constructor WebhookManager(storage?: IWebhookStorage)
+method WebhookManager.clear(): void
+method WebhookManager.dispatch(eventType: string, data: unknown): void
+method WebhookManager.list(): WebhookRegistration[]
+method WebhookManager.register(url: string, events: string[], secret?: string): WebhookRegistration
+get WebhookManager.size(): number
+method WebhookManager.unregister(id: string): boolean
+unexported interface WebhookRegistration
+property WebhookRegistration.createdAt: number
+property WebhookRegistration.events: string[]
+property WebhookRegistration.id: string
+property WebhookRegistration.secret?: string
+property WebhookRegistration.url: string
+function getOpenApiSpec(): Record<string, unknown>
+function getRouteScopes(routeKey: string): ApiScope[]
+function scopesAllowRoute(scopes: ReadonlySet<ApiScope>, routeKey: string): boolean
+function startDaemon(opts: DaemonOptions): Promise<IStartedDaemon>

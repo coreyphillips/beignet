@@ -78,10 +78,7 @@ export interface AuthOverrideStore {
 	save(overrides: Record<string, StoredKeyOverride>): void;
 }
 
-/** wallet_data key under which auth-key overrides are persisted. The colon
- *  segments can never collide with on-chain wallet keys, which always end in
- *  an IWalletData field name ("<wallet>-<network>-<field>"). */
-export const AUTH_KEY_OVERRIDES_STORAGE_KEY = 'daemon:auth-key-overrides:v1';
+export { AUTH_KEY_OVERRIDES_STORAGE_KEY } from './daemon-state-keys';
 
 export interface AuthSuccess {
 	ok: true;

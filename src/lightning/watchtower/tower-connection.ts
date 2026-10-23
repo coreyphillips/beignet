@@ -7,9 +7,9 @@
  * mirrors Peer.processReadBuffer (18-byte encrypted length prefix, body + MAC).
  */
 
-import * as net from 'net';
+import type * as net from 'net';
 import { EventEmitter } from 'events';
-import { SocksClient } from 'socks';
+import { nodeNet } from '../../utils/node-builtins';
 import { createInitiatorHandshake } from '../transport/noise';
 import type { TransportCipher } from '../transport/cipher';
 import type { Socks5ProxyScope } from '../transport/peer-manager';
@@ -159,6 +159,8 @@ export class TowerConnection extends EventEmitter implements ITowerTransport {
 
 	private async openSocket(): Promise<net.Socket> {
 		if (this.socks5Proxy) {
+			// socks loads net, so it is required here rather than at module scope.
+			const { SocksClient } = require('socks') as typeof import('socks');
 			const { socket } = await SocksClient.createConnection({
 				proxy: {
 					host: this.socks5Proxy.host,
@@ -172,7 +174,7 @@ export class TowerConnection extends EventEmitter implements ITowerTransport {
 			return socket as net.Socket;
 		}
 		return new Promise((resolve, reject) => {
-			const socket = net.connect(
+			const socket = nodeNet().connect(
 				{ host: this.address.host, port: this.address.port },
 				() => {
 					socket.removeListener('error', reject);

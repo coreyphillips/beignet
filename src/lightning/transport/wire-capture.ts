@@ -14,7 +14,7 @@
  * keep the file readable.
  */
 
-import * as fs from 'fs';
+import { nodeFs } from '../../utils/node-builtins';
 import * as os from 'os';
 import * as path from 'path';
 import { MessageType } from '../message/types';
@@ -45,7 +45,7 @@ function resolveCapturePath(): string | null {
 	if (env === '1' || env.toLowerCase() === 'true') {
 		const dir = path.join(os.homedir(), '.beignet');
 		try {
-			fs.mkdirSync(dir, { recursive: true });
+			nodeFs().mkdirSync(dir, { recursive: true });
 		} catch {
 			// fall through; append below will fail and disable capture
 		}
@@ -65,7 +65,7 @@ function append(record: Record<string, unknown>): void {
 	const file = resolveCapturePath();
 	if (!file) return;
 	try {
-		fs.appendFileSync(
+		nodeFs().appendFileSync(
 			file,
 			JSON.stringify({ ts: new Date().toISOString(), ...record }) + '\n'
 		);

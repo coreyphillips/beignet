@@ -26,6 +26,8 @@ export async function createNodeIrohEndpoint(
 	let binding: typeof Binding;
 	try {
 		binding = require('@number0/iroh/index.js') as typeof Binding;
+		// React Native bundles resolve it to an empty module (package.json).
+		if (!binding.Endpoint) throw new Error('empty module');
 	} catch {
 		throw new Error(
 			'Iroh requires the optional @number0/iroh binding and Node >= 20.3'

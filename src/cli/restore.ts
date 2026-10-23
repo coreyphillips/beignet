@@ -17,7 +17,7 @@
  */
 
 import { timingSafeEqual } from 'crypto';
-import * as fs from 'fs';
+import { nodeFs } from '../utils/node-builtins';
 import { acquireInstanceLock, releaseInstanceLock } from './instance-lock';
 import { SECRET_FILE_MODE, tightenMode, writeFileAtomic } from './fs-utils';
 import { backupMacPath, fileMac, readBackupMac } from './backup-mac';
@@ -32,6 +32,7 @@ export const SQLITE_HEADER = Buffer.from('SQLite format 3\0', 'ascii');
  * restoring an SCB blob, a truncated copy, or an arbitrary file over the DB.
  */
 export function isSqliteFile(filePath: string): boolean {
+	const fs = nodeFs();
 	let fd: number;
 	try {
 		fd = fs.openSync(filePath, 'r');
@@ -97,6 +98,7 @@ export async function restoreDbFile(
 	dbPath: string,
 	opts: IDbRestoreOptions
 ): Promise<IDbRestoreResult> {
+	const fs = nodeFs();
 	const now = opts.now ?? Date.now();
 	if (!fs.existsSync(backupFile)) {
 		throw new Error(`Backup file not found: ${backupFile}`);
@@ -228,6 +230,7 @@ export function holdDbRestoredChannels(
 	dbPath: string,
 	storage: IStorageBackend
 ): IDbRestoreHold | null {
+	const fs = nodeFs();
 	const markerPath = dbRestoreMarkerPath(dbPath);
 	if (!fs.existsSync(markerPath)) return null;
 	let restoredAt: number | null = null;

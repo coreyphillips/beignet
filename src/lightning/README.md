@@ -121,7 +121,7 @@ The SQLite stores have their own entry, because they need the native `better-sql
 import { SqliteStorage, GuardianStore } from 'beignet/lightning/sqlite';
 ```
 
-`better-sqlite3` is an optional dependency. npm installs it by default, and each store loads it when constructed. Without it, `beignet/lightning` still loads, and constructing a store throws an error naming the missing module. `BeignetNode` and the `beignet` CLI build on `SqliteStorage`, so they need it too. `storage.SqliteStorage` and `recovery.GuardianStore` still work but are deprecated, and go in the next major release.
+`better-sqlite3` is an optional dependency. npm installs it by default, and each store loads it when constructed. Without it, `beignet/lightning` still loads, and constructing a store throws an error naming the missing module. The `beignet` CLI builds on `SqliteStorage`, so it needs it too, and so does `BeignetNode` unless it is given `storage`. `storage.SqliteStorage` and `recovery.GuardianStore` still work but are deprecated, and go in the next major release.
 
 `storage.MemoryStorage` is a pure-JS backend that keeps everything in memory, and the starting point for a backend of your own (on a React Native SQLite binding, say). `IStorageBackend` is `IStorageCore`, which every backend implements, plus optional capability groups such as `IRecoveryStorage` and `IWatchtowerStorage`, named in `IStorageCapabilities`. `storage.hasStorageCapability(backend, 'watchtower')` says whether a backend has one. To check a backend, register the conformance suite from a mocha, Jest or Vitest test file:
 

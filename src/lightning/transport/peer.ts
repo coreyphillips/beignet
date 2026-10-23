@@ -11,7 +11,7 @@
  */
 
 import { EventEmitter } from 'events';
-import net from 'net';
+import { nodeNet } from '../../utils/node-builtins';
 import type { IDuplexTransport } from './duplex-transport';
 import {
 	createInitiatorHandshake,
@@ -313,7 +313,7 @@ export class Peer extends EventEmitter {
 					this.state = 'disconnected';
 					reject(err);
 				};
-				this.socket = net.connect(this.port, this.host);
+				this.socket = nodeNet().connect(this.port, this.host);
 
 				// Set TCP connect timeout
 				this.socket.setTimeout(this.connectTimeoutMs);

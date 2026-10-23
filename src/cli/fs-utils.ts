@@ -16,7 +16,7 @@
  * so a permissions problem can never stop a node from starting.
  */
 
-import * as fs from 'fs';
+import { nodeFs } from '../utils/node-builtins';
 
 /** Owner read/write only: the mode for every file that holds secrets. */
 export const SECRET_FILE_MODE = 0o600;
@@ -44,6 +44,7 @@ export interface ITightenResult {
  * whether the operator hears about it.
  */
 export function tightenMode(filePath: string, mode: number): ITightenResult {
+	const fs = nodeFs();
 	if (!fileModesApply()) return { changed: false };
 	let current: number;
 	try {
@@ -68,6 +69,7 @@ export function tightenMode(filePath: string, mode: number): ITightenResult {
  * the chmod was refused.
  */
 export function ensurePrivateDir(dir: string): ITightenResult {
+	const fs = nodeFs();
 	fs.mkdirSync(dir, { recursive: true, mode: SECRET_DIR_MODE });
 	return tightenMode(dir, SECRET_DIR_MODE);
 }
@@ -85,6 +87,7 @@ export function writeFileAtomic(
 	content: string,
 	mode: number = SECRET_FILE_MODE
 ): void {
+	const fs = nodeFs();
 	const tmp = `${filePath}.tmp`;
 	fs.writeFileSync(tmp, content, { mode });
 	if (fileModesApply()) {

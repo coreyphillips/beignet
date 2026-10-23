@@ -20,7 +20,7 @@ import {
 import type Database from 'better-sqlite3';
 import { loadBetterSqlite3 } from './sqlite-binding';
 import { hmacSha256 } from '../crypto/provider';
-import * as fs from 'fs';
+import { nodeFs } from '../../utils/node-builtins';
 import type {
 	IStorageBackend,
 	IGossipRowPage,
@@ -115,6 +115,7 @@ export interface IPaymentRowMatch {
  * leave the file as it is.
  */
 function restrictFileMode(filePath: string): void {
+	const fs = nodeFs();
 	try {
 		const current = fs.statSync(filePath).mode & 0o777;
 		if ((current & ~OWNER_ONLY_FILE_MODE) !== 0) {

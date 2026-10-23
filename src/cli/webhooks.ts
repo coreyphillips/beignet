@@ -11,8 +11,7 @@ import * as crypto from 'crypto';
 import { BeignetError } from './errors';
 import { isPrivateNetworkUrl } from '../lightning/l402';
 
-/** wallet_data key the daemon keeps raw webhook HMAC secrets under. */
-export const WEBHOOK_SECRETS_STORAGE_KEY = 'daemon:webhook-secrets:v1';
+export { WEBHOOK_SECRETS_STORAGE_KEY } from './daemon-state-keys';
 
 /**
  * Why a URL cannot be a webhook target, or null when it can. Only http and

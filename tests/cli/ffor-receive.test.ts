@@ -74,7 +74,7 @@ function fixture(
 	const host: any = {
 		fforConcurrentNegotiated: () => concurrent,
 		getNode: () => node,
-		getStorage: () => storage,
+		getStorageBackend: () => storage,
 		openChannel: (...args: unknown[]) => {
 			opened.push(args);
 			throw Error('funding failed');
