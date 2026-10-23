@@ -1,15 +1,15 @@
 /**
  * OpenAPI Spec Completeness Tests
  *
- * Verifies that the OpenAPI spec documents all daemon routes
- * and includes all necessary component schemas.
+ * Verifies that the OpenAPI spec documents every route in ROUTES and nothing
+ * else, and includes all necessary component schemas.
  */
 
 import { expect } from 'chai';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getOpenApiSpec } from '../../src/cli/openapi';
-import { daemonRouteKeys } from './helpers/daemon-routes';
+import { ROUTES, routeKey } from '../../src/cli/routes';
 
 describe('OpenAPI Spec Completeness', () => {
 	const raw = getOpenApiSpec();
@@ -40,8 +40,10 @@ describe('OpenAPI Spec Completeness', () => {
 	// The document does not list the route that serves it.
 	const UNDOCUMENTED_ROUTES = new Set(['GET /openapi.json']);
 
+	const routeKeys = new Set(ROUTES.map(routeKey));
+
 	it('documents every daemon route with its method', () => {
-		const missing = [...daemonRouteKeys()].filter((key) => {
+		const missing = [...routeKeys].filter((key) => {
 			if (UNDOCUMENTED_ROUTES.has(key)) return false;
 			const [method, routePath] = key.split(' ');
 			return !spec.paths[routePath]?.[method.toLowerCase()];
@@ -53,7 +55,6 @@ describe('OpenAPI Spec Completeness', () => {
 	});
 
 	it('documents no operation the daemon does not serve', () => {
-		const routeKeys = daemonRouteKeys();
 		const stale = Object.entries(spec.paths).flatMap(([routePath, ops]) =>
 			Object.keys(ops)
 				.map((method) => `${method.toUpperCase()} ${routePath}`)

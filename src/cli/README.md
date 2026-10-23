@@ -2474,7 +2474,7 @@ The guards run ahead of the rate limiter and the auth middleware and apply to ev
 | `invoice` | Receive-side routes: creating invoices/offers/hold invoices, settling/cancelling holds, `POST /address/new`, invoice/offer lookups and decoding, `GET /can-receive`, `POST /payment/wait`, and the `GET /events` SSE stream. |
 | `admin` | Everything, including paying/spending, channel and peer management, PSBTs, backups, webhooks management, `POST /stop`, and API key management. |
 
-Every route is explicitly classified in `src/cli/auth.ts` (`ROUTE_SCOPES`); a drift test fails the build if a new route ships without a classification, and unclassified routes fail closed (admin-only). Notable classifications: all webhook routes including `GET /webhooks` are admin-only (callback URLs can embed credentials; management is one unit); `POST /message/sign` is admin-only because it signs with the node identity key; `GET /events` (SSE) accepts `readonly` and `invoice`.
+Every route declares its scopes in `src/cli/routes.ts` (`ROUTES`, read into `ROUTE_SCOPES`), where the field is required, and a route not in that table fails closed (admin-only). Notable classifications: all webhook routes including `GET /webhooks` are admin-only (callback URLs can embed credentials; management is one unit); `POST /message/sign` is admin-only because it signs with the node identity key; `GET /events` (SSE) accepts `readonly` and `invoice`.
 
 Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSafeEqual`), for the legacy token too. Failures return **401** `UNAUTHORIZED` for a bad or missing key and **403** `FORBIDDEN` for a valid key without a required scope.
 
@@ -2731,6 +2731,7 @@ src/cli/
   beignet-node.ts   -- Core wrapper class (most important file)
   config.ts         -- Config file + PID file management
   daemon.ts         -- HTTP daemon (http.createServer)
+  routes.ts         -- Route table: each route's scopes and request pipeline flags
   auth.ts           -- Scoped API keys: route->scope map, constant-time authenticator
   openapi.ts        -- OpenAPI 3.0 spec generator (served at GET /openapi.json)
   webhooks.ts       -- WebhookManager (register, dispatch, HMAC signing)

@@ -58,6 +58,8 @@ import {
 	getRouteScopes,
 	scopesAllowRoute
 } from './auth';
+import type { HandledRouteKey } from './routes';
+import { dispatchTable, routeKeysWhere } from './routes';
 
 /** The daemon keeps its keys, webhooks and queue in SQLite, so it takes no storage. */
 export interface DaemonOptions extends Omit<BeignetNodeOptions, 'storage'> {
@@ -96,11 +98,7 @@ const SSE_MAX_CLIENTS = 64;
 const SSE_MAX_BUFFERED_BYTES = 1_048_576;
 // Long-poll waits each hold a socket, a timer and node listeners until they
 // settle, so a credential may park only so many, for so long.
-const WAIT_ROUTES = new Set([
-	'POST /node/wait-ready',
-	'POST /channel/wait-ready',
-	'POST /payment/wait'
-]);
+const WAIT_ROUTES = routeKeysWhere((route) => route.wait === true);
 const WAIT_MAX_PER_KEY = 16;
 const WAIT_MAX_TIMEOUT_MS = 10 * 60 * 1000;
 // The most payments one GET /payments call returns, and what it returns
@@ -142,43 +140,7 @@ interface CachedResponse {
 // below (the general handler and the SSE writeHead) must agree.
 const CORS_ALLOW_HEADERS = 'Content-Type, Authorization, X-Idempotency-Key';
 
-const IDEMPOTENT_ROUTES = new Set([
-	'POST /invoice/pay',
-	'POST /invoice/pay-all',
-	'POST /invoice/pay-safe',
-	'POST /invoice/pay-async',
-	'POST /invoice/pay-retry',
-	'POST /keysend',
-	'POST /keysend/safe',
-	// An L402 fetch pays an invoice, and a retried fetch gets a fresh
-	// challenge with a fresh invoice, so an un-keyed retry pays twice.
-	'POST /l402/fetch',
-	// Fee-spending advisor execution: retries must not double-spend fees.
-	'POST /rebalance',
-	'POST /advisor/execute-rebalances',
-	// A direct-funding send spends a UTXO. The engine is idempotent on the
-	// request id whether or not a key is supplied, which is what the app needs
-	// since it sends none; this only lets a client that DOES supply one get the
-	// cached response without the engine re-deriving it.
-	'POST /direct-funding/send',
-	// An on-chain send broadcasts a transaction. A caller that loses the
-	// response cannot tell "not broadcast" from "broadcast, answer lost", and
-	// checking the chain instead races the mempool.
-	'POST /send',
-	'POST /send-max',
-	// Each call requests a fresh BOLT 12 invoice with a fresh payment hash, so
-	// the engine's duplicate-hash refusal cannot catch a retry (#1018).
-	'POST /offer/pay',
-	// A retried splice-out moves the funds twice (to an external address, a
-	// real spend), and a retried open opens a second channel. open-and-wait
-	// is left out: its wait usually outlasts the timeout, and a thrown
-	// timeout is not cached, so a keyed retry would open again anyway.
-	'POST /channel/splice-out',
-	'POST /channel/open',
-	'POST /channel/open-v2',
-	'POST /channel/open-zeroconf',
-	'POST /channel/connect-and-open'
-]);
+const IDEMPOTENT_ROUTES = routeKeysWhere((route) => route.idempotent === true);
 
 function success<T>(result: T): ApiResponse<T> {
 	return { ok: true, result };
@@ -269,13 +231,11 @@ export async function parseBody(
 	});
 }
 
-// Routes exempt from authentication. GET /metrics is deliberately absent:
-// it reports balances, so it is auth-gated unless metricsPublic opts out.
-export const AUTH_EXEMPT_ROUTES = new Set([
-	'GET /health',
-	'GET /ready',
-	'GET /openapi.json'
-]);
+// Routes exempt from authentication. GET /metrics is not one: it reports
+// balances, so it is auth-gated unless metricsPublic opts out.
+export const AUTH_EXEMPT_ROUTES = routeKeysWhere(
+	(route) => route.scopes === 'exempt'
+);
 
 /**
  * Logged once at boot when no credential is configured (issue #1005). The
@@ -367,27 +327,19 @@ export function isAllowedHostHeader(
 	return name === bound.toLowerCase();
 }
 
-/**
- * Routes a restore-pending daemon still serves (GET /events bypasses this
- * set through its own dispatcher arm, so SSE restore progress flows too).
- */
-const RESTORE_PENDING_ROUTES = new Set([
-	'GET /recovery/status',
-	'POST /recovery/restore',
-	'GET /openapi.json',
-	'POST /stop'
-]);
+/** Routes a restore-pending daemon still serves. */
+const RESTORE_PENDING_ROUTES = routeKeysWhere(
+	(route) => route.allowedDuringRestore === true
+);
 
 /**
  * Routes a daemon still serves after a Tier 2 capsule restore replaced its
  * database: the node underneath is gone until a restart builds one on the
  * restored state.
  */
-const RESTART_REQUIRED_ROUTES = new Set([
-	'GET /recovery/status',
-	'GET /openapi.json',
-	'POST /stop'
-]);
+const RESTART_REQUIRED_ROUTES = routeKeysWhere(
+	(route) => route.allowedWhileRestartRequired === true
+);
 
 /** HTTP status for a failure envelope; unmapped codes are server faults. */
 const STATUS_BY_ERROR_CODE: Partial<Record<BeignetErrorCodeValue, number>> = {
@@ -1530,7 +1482,10 @@ async function bootDaemon(
 		onPaymentHash?: (paymentHash: string) => void
 	) => unknown;
 
-	const routes: Record<string, RouteHandler> = {
+	const handlers: Omit<
+		Record<HandledRouteKey, RouteHandler>,
+		'POST /channel/update-fee'
+	> = {
 		'GET /info': () => success(node.getInfo()),
 		'GET /mnemonic': () => {
 			if (!authenticator.enabled) {
@@ -3593,10 +3548,14 @@ async function bootDaemon(
 		}
 	};
 
-	// DEPRECATED alias: the old name implied routing fee policy, but the handler
-	// sets the commitment feerate. Kept for compatibility; remove in a future major.
-	routes['POST /channel/update-fee'] =
-		routes['POST /channel/update-commitment-feerate'];
+	const routes = dispatchTable<RouteHandler>({
+		...handlers,
+		// DEPRECATED alias: the old name implied routing fee policy, but the
+		// handler sets the commitment feerate. Kept for compatibility; remove in
+		// a future major.
+		'POST /channel/update-fee':
+			handlers['POST /channel/update-commitment-feerate']
+	});
 
 	// Open event streams, each with the credential it authenticated as.
 	const sseClients = new Map<http.ServerResponse, string>();
@@ -3844,8 +3803,8 @@ async function bootDaemon(
 
 		// ── Auth middleware ──
 		// 401 for a bad/absent key, 403 for a valid key without the required
-		// scope. Unclassified routes fail closed to admin-only (see
-		// ROUTE_SCOPES in auth.ts and the drift test that keeps it complete).
+		// scope. A route not in ROUTES (src/cli/routes.ts) fails closed to
+		// admin-only.
 		let credential = 'unauthenticated';
 		if (authenticator.enabled && !authExempt) {
 			const auth = authenticator.authenticate(req.headers['authorization']);
@@ -3962,7 +3921,7 @@ async function bootDaemon(
 			return;
 		}
 
-		const handler = routes[routeKey];
+		const handler = routes.get(routeKey);
 		if (!handler) {
 			res.statusCode = 404;
 			res.end(JSON.stringify(failure('NOT_FOUND', `No route: ${routeKey}`)));
