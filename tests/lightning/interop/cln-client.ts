@@ -5,6 +5,7 @@
  * Communicates with CLN via CLNRest API (HTTPS) with rune authentication.
  */
 
+import type { OutgoingHttpHeaders } from 'http';
 import https from 'https';
 
 // ── Types ──────────────────────────────────────────────────────
@@ -136,22 +137,23 @@ export class ClnRestClient {
 		return new Promise((resolve, reject) => {
 			const bodyStr = body ? JSON.stringify(body) : undefined;
 
+			const headers: OutgoingHttpHeaders = {
+				Rune: this.rune,
+				'Content-Type': 'application/json',
+				Accept: 'application/json'
+			};
+			if (bodyStr) {
+				headers['Content-Length'] = Buffer.byteLength(bodyStr);
+			}
+
 			const options: https.RequestOptions = {
 				hostname: this.host,
 				port: this.port,
 				path,
 				method,
 				rejectUnauthorized: false,
-				headers: {
-					Rune: this.rune,
-					'Content-Type': 'application/json',
-					Accept: 'application/json'
-				}
+				headers
 			};
-
-			if (bodyStr) {
-				options.headers!['Content-Length'] = Buffer.byteLength(bodyStr);
-			}
 
 			const req = https.request(options, (res) => {
 				let data = '';

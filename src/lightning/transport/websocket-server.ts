@@ -131,7 +131,7 @@ export class WebSocketServerTransport
 		return this.socket.remotePort;
 	}
 
-	write(data: Uint8Array | string, cb?: (err?: Error) => void): boolean {
+	write(data: Uint8Array | string, cb?: (err?: Error | null) => void): boolean {
 		const payload =
 			typeof data === 'string'
 				? Buffer.from(data, 'utf8')

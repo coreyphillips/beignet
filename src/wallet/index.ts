@@ -5595,7 +5595,7 @@ export class Wallet {
 			const response = await fetch(
 				`https://mempool.space/${urlModifier}api/v1/fees/recommended`
 			);
-			const res: IGetFeeEstimatesResponse = await response.json();
+			const res = (await response.json()) as IGetFeeEstimatesResponse;
 			const fast = clampFeeRate(res.fastestFee);
 			const normal = clampFeeRate(res.halfHourFee);
 			const slow = clampFeeRate(res.hourFee);
@@ -5633,7 +5633,7 @@ export class Wallet {
 			}
 			const url = 'https://api1.blocktank.to/api/info';
 			const response = await fetch(url);
-			const res: IBtInfo = await response.json();
+			const res = (await response.json()) as IBtInfo;
 			// check the response for the expected properties
 			if (
 				!(
