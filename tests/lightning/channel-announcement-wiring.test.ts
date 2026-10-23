@@ -34,6 +34,7 @@ import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { createOpenerState } from '../../src/lightning/channel/channel-state';
 import { ElectrumBackend } from '../../src/lightning/chain/electrum-backend';
 import { COMMIT_ALL } from './helpers/channel-persistence';
+import { settle } from './helpers/settle';
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -309,6 +310,86 @@ describe('Channel Announcement Wiring (Phase 4)', () => {
 						}, 50);
 					}, 50);
 				});
+		});
+
+		// Issue #1843: the position lookup used to turn an Electrum error into
+		// index 0, which announced the coinbase's SCID.
+		it('retries a failed position lookup on the next block instead of announcing index 0', async () => {
+			const answers = [
+				{
+					id: 1,
+					error: true,
+					method: 'getTransactionMerkle',
+					data: { message: 'tx not found' },
+					network: 'regtest'
+				},
+				{
+					id: 2,
+					error: false,
+					method: 'getTransactionMerkle',
+					data: { merkle: [], block_height: 100, pos: 3 },
+					network: 'regtest'
+				}
+			];
+			const electrumBackend = new ElectrumBackend(
+				{ getTransactionMerkle: async () => answers.shift() } as never,
+				5_000
+			);
+			const backend = new MockBackend();
+			backend.getTransactionMerkleProof = (
+				txid: string,
+				height: number
+			): Promise<{ blockHeight: number; txIndex: number }> =>
+				electrumBackend.getTransactionMerkleProof(txid, height);
+
+			const cm = new ChannelManager(makeChannelManagerConfig(55));
+			cm.on('error', () => {});
+			const watcher = new ChainWatcher({ backend, channelManager: cm });
+			const errors: Error[] = [];
+			watcher.on('error', (err: Error) => errors.push(err));
+			const depths: Array<[number, number]> = [];
+			watcher.on(
+				'announcement:depth',
+				(_channelId: Buffer, blockHeight: number, txIndex: number) => {
+					depths.push([blockHeight, txIndex]);
+				}
+			);
+			let confirmed = false;
+			watcher.on('funding:confirmed', () => {
+				confirmed = true;
+			});
+
+			const channelId = crypto.randomBytes(32);
+			const txid = crypto.randomBytes(32).toString('hex');
+			const scriptPubkey = Buffer.from(
+				'0014' + crypto.randomBytes(20).toString('hex'),
+				'hex'
+			);
+			const {
+				computeScriptHash
+			} = require('../../src/lightning/chain/chain-watcher');
+			backend.setHistory(computeScriptHash(scriptPubkey), [
+				{ txid, height: 100 }
+			]);
+
+			try {
+				await watcher.watchFundingOutput(channelId, txid, 0, 1, scriptPubkey);
+				await watcher.start();
+				backend.simulateBlock(100);
+				await settle(() => confirmed);
+
+				backend.simulateBlock(105);
+				await settle(() => errors.length > 0);
+				expect(errors[0].message).to.include('tx not found');
+				expect(depths).to.deep.equal([]);
+
+				backend.simulateBlock(106);
+				await settle(() => depths.length > 0);
+				expect(depths).to.deep.equal([[100, 3]]);
+				expect(answers).to.have.length(0);
+			} finally {
+				watcher.stop();
+			}
 		});
 	});
 

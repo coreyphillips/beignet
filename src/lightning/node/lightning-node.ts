@@ -6319,8 +6319,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					displayTxid,
 					blockHeight
 				);
-				// txIndex 0 is also what a failed lookup yields (backend swallows
-				// errors) — only treat a CONFLICTING position as a mismatch.
+				// A backend that cannot place the transaction may still report
+				// index 0, so only a CONFLICTING position counts as a mismatch.
 				if (proof.txIndex !== 0 && proof.txIndex !== txIndex) {
 					this.emitStructuredLog('channel', 'announcement_scid_mismatch', {
 						channelId: channelId.toString('hex'),

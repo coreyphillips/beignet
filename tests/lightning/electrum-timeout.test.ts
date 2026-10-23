@@ -367,4 +367,90 @@ describe('ElectrumBackend — Call Timeouts', () => {
 			expect(err).to.be.instanceOf(ChainBackendUnavailableError);
 		});
 	});
+
+	// Issue #1843: index 0 is the coinbase, so a lookup with no position must
+	// fail rather than default to it.
+	describe('getTransactionMerkleProof answers', () => {
+		function proof(
+			answer: unknown
+		): Promise<{ blockHeight: number; txIndex: number }> {
+			const backend = new ElectrumBackend(
+				{ getTransactionMerkle: () => Promise.resolve(answer) } as never,
+				5_000
+			);
+			return backend.getTransactionMerkleProof('11'.repeat(32), 123);
+		}
+
+		async function failure(answer: unknown): Promise<Error> {
+			try {
+				await proof(answer);
+			} catch (err) {
+				return err as Error;
+			}
+			throw new Error('should have thrown');
+		}
+
+		const wrapped = (data: unknown, error = false): unknown => ({
+			id: 1,
+			error,
+			method: 'getTransactionMerkle',
+			data,
+			network: 'regtest'
+		});
+
+		it('rejects an error envelope', async () => {
+			const err = await failure(wrapped({ message: 'tx not found' }, true));
+			expect(err.message).to.include('tx not found');
+		});
+
+		it('rejects an error envelope that carries a position', async () => {
+			await failure(wrapped({ pos: 4 }, true));
+		});
+
+		it('rejects the client timeout envelope', async () => {
+			const err = await failure(wrapped('Timed Out.', true));
+			expect(err.message).to.include('Timed Out.');
+		});
+
+		it('rejects answers without a valid position', async () => {
+			for (const answer of [
+				undefined,
+				null,
+				{},
+				wrapped(undefined),
+				wrapped(null),
+				wrapped({ merkle: [], block_height: 123 }),
+				wrapped({ pos: -1 }),
+				wrapped({ pos: 1.5 }),
+				wrapped({ pos: '3' }),
+				wrapped({ pos: Number.NaN }),
+				{ pos: null },
+				{ pos: -2 }
+			]) {
+				const err = await failure(answer);
+				expect(err.message, JSON.stringify(answer)).to.include(
+					'No transaction position'
+				);
+			}
+		});
+
+		it('keeps the position of a wrapped answer, 0 included', async () => {
+			expect(
+				await proof(wrapped({ merkle: [], block_height: 123, pos: 7 }))
+			).to.deep.equal({ blockHeight: 123, txIndex: 7 });
+			expect(
+				await proof(wrapped({ merkle: [], block_height: 123, pos: 0 }))
+			).to.deep.equal({ blockHeight: 123, txIndex: 0 });
+		});
+
+		it('keeps the position of a bare answer, 0 included', async () => {
+			expect(
+				await proof({ merkle: [], block_height: 123, pos: 5 })
+			).to.deep.equal({ blockHeight: 123, txIndex: 5 });
+			expect(await proof({ pos: 0 })).to.deep.equal({
+				blockHeight: 123,
+				txIndex: 0
+			});
+		});
+	});
 });
