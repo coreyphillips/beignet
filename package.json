@@ -113,6 +113,10 @@
     },
     "./package.json": "./package.json"
   },
+  "react-native": {
+    "better-sqlite3": false,
+    "@number0/iroh/index.js": false
+  },
   "engines": {
     "node": "^22.23.4 || ^24.22.1 || >=26.12.1"
   },
