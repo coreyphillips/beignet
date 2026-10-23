@@ -1093,3 +1093,114 @@ describe('Async held forwards, review round 1 (issue #708)', () => {
 		});
 	});
 });
+
+describe('Async held forwards, closed inbound channel (issue #1838)', () => {
+	const sweepScript = (): Buffer =>
+		Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)]);
+
+	/**
+	 * Park Alice's HTLC for an offline Carol and take it past the cutoff
+	 * while the inbound channel cannot carry the fail, then force close
+	 * that channel. Returns the FAILING row.
+	 */
+	async function failingHoldOnForceClosedInbound(
+		w: IWorld,
+		failingWhile: 'force-closed' | 'reestablishing'
+	): Promise<IHeldForwardRecord> {
+		const { alice, lsp, carol, abChannelId } = w;
+		const invoice = asyncInvoice(carol, 5_000_000n);
+		await disconnect(lsp, carol, w.cutBC);
+		alice.sendPayment(invoice.bolt11);
+		await settle();
+		const [row] = heldRecords(lsp);
+		expect(row.state).to.equal('HELD');
+		const forceClose = (): void => {
+			expect(lsp.forceCloseChannel(abChannelId, sweepScript()).ok).to.equal(
+				true
+			);
+		};
+		if (failingWhile === 'reestablishing') {
+			await disconnect(alice, lsp, w.cutAB);
+			lsp.handleNewBlock(row.cutoffHeight);
+			await settle();
+			lsp.handleNewBlock(row.cutoffHeight + 1);
+			await settle();
+			// The channel can still reestablish and carry the fail.
+			expect(heldRecords(lsp)[0].state).to.equal('FAILING');
+			forceClose();
+		} else {
+			forceClose();
+			lsp.handleNewBlock(row.cutoffHeight);
+			await settle();
+		}
+		expect(
+			lsp.getChannelManager().getChannel(abChannelId)!.getState()
+		).to.equal(ChannelState.FORCE_CLOSED);
+		lsp.handleNewBlock(row.cutoffHeight + 2);
+		await settle();
+		// The inbound HTLC is still live on chain until the close resolves.
+		expect(heldRecords(lsp)[0].state).to.equal('FAILING');
+		expect(lsp.getAsyncReceiveServiceMetrics().occupiedSlots).to.equal(1);
+		return heldRecords(lsp)[0];
+	}
+
+	function resolveClose(lsp: LightningNode, channelId: Buffer): void {
+		lsp.getChannelManager().emit('channel:resolved', channelId);
+		expect(lsp.getChannelManager().getChannel(channelId)!.getState()).to.equal(
+			ChannelState.CLOSED
+		);
+		const htlcs = [
+			...lsp.getChannelManager().getChannel(channelId)!.getFullState().htlcs
+		];
+		expect(
+			htlcs.some(
+				([k, h]) => k.startsWith('received-') && h.state === HtlcState.COMMITTED
+			),
+			'the closed channel retains the committed entry'
+		).to.equal(true);
+	}
+
+	for (const failingWhile of ['force-closed', 'reestablishing'] as const) {
+		it(`a hold that went FAILING while the inbound channel was ${failingWhile} is FAILED once its close resolves`, async function () {
+			this.timeout(20_000);
+			const w = await setupWorld({ carolAutoRelease: true });
+			const { alice, lsp, carol, abChannelId } = w;
+			const row = await failingHoldOnForceClosedInbound(w, failingWhile);
+			resolveClose(lsp, abChannelId);
+			lsp.handleNewBlock(row.cutoffHeight + 3);
+			await settle();
+			const final = heldRecords(lsp)[0];
+			expect(final.state).to.equal('FAILED');
+			expect(final.failReason).to.equal('cutoff');
+			expect(lsp.getAsyncReceiveServiceMetrics().occupiedSlots).to.equal(0);
+			destroyAll(alice, lsp, carol);
+		});
+	}
+
+	it('a restart releases the reservation of a FAILING hold whose inbound close resolved', async function () {
+		this.timeout(30_000);
+		const dbPath = tempDb('held-forward-closed-inbound');
+		const disk = new SqliteStorage(dbPath);
+		disk.open();
+		const w = await setupWorld({ lspStorage: disk, carolAutoRelease: true });
+		const { alice, lsp, carol, abChannelId } = w;
+		const row = await failingHoldOnForceClosedInbound(w, 'force-closed');
+		resolveClose(lsp, abChannelId);
+		expect(readRow(dbPath, row.id)!.state).to.equal('FAILING');
+
+		const lspId = lsp.getNodeId();
+		lsp.destroy();
+		alice.getChannelManager().handlePeerDisconnected(lspId);
+		carol.getChannelManager().handlePeerDisconnected(lspId);
+		const reopened = new SqliteStorage(dbPath);
+		reopened.open();
+		const restored = createNode(LSP_SEED, reopened, {
+			asyncReceiveService: { enabled: true }
+		});
+		// Settled by startup reconciliation, before any block.
+		expect(heldRecords(restored)[0].state).to.equal('FAILED');
+		expect(restored.getAsyncReceiveServiceMetrics().occupiedSlots).to.equal(0);
+		expect(readRow(dbPath, row.id)!.state).to.equal('FAILED');
+		destroyAll(alice, restored, carol);
+	});
+});

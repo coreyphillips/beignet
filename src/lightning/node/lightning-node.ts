@@ -23307,13 +23307,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 	/**
 	 * Durable fact for the ledger: the parked inbound HTLC still exists and
-	 * is committed. False once it settled, failed, or its channel is gone.
+	 * is committed. False once it settled, failed, or its channel is gone or
+	 * fully resolved on chain.
 	 */
 	private heldForwardIncomingUnresolved(record: IHeldForwardRecord): boolean {
 		const channel = this.channelManager.getChannel(
 			Buffer.from(record.inChannelIdHex, 'hex')
 		);
 		if (!channel) return false;
+		// A CLOSED channel keeps its HTLC entries as they were at the close,
+		// but has nothing left to resolve. FORCE_CLOSED stays unresolved: its
+		// inbound HTLC is still live on chain.
+		if (channel.getState() === ChannelState.CLOSED) return false;
 		const htlc = channel
 			.getFullState()
 			.htlcs.get(`received-${record.inHtlcId}`);
