@@ -848,6 +848,14 @@ The API reference for every entry point (`beignet`, `beignet/node`, `beignet/dae
 
 Open an issue, or reach out on [Telegram](https://t.me/bitkitchat).
 
+## Security
+
+Report a vulnerability privately, as [SECURITY.md](SECURITY.md) describes, and not in a public issue.
+
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers setup, the checks CI runs, and the rules for pull requests.
+
 ## License
 
 MIT
