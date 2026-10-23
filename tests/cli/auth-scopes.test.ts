@@ -1,8 +1,8 @@
 /**
  * Scoped API auth (M6): named keys with readonly/invoice/admin scopes,
- * constant-time comparison, runtime revocation, 401 vs 403, and a
- * source-derived drift test that fails when a daemon route ships without a
- * scope classification (mirrors the CLI-parity pattern).
+ * constant-time comparison, runtime revocation, 401 vs 403, and the route
+ * table (src/cli/routes.ts) that ROUTE_SCOPES and the daemon's dispatch are
+ * read from.
  *
  * The daemon integration suite boots offline (unreachable Electrum, same
  * pattern as tests/cli/onchain-power.test.ts): auth decisions happen before
@@ -28,38 +28,72 @@ import { BeignetNode } from '../../src/cli/beignet-node';
 import { BeignetError } from '../../src/cli/errors';
 import { resolveConfig } from '../../src/cli/config';
 import { getOpenApiSpec } from '../../src/cli/openapi';
-import { daemonRouteKeys } from './helpers/daemon-routes';
+import type { HandledRouteKey, RouteDef } from '../../src/cli/routes';
+import { ROUTES, dispatchTable, routeKey } from '../../src/cli/routes';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
-// ─────────────── Route classification drift test ───────────────
+// ─────────────── Route table ───────────────
 
-describe('Route scope classification (drift test)', () => {
-	it('every daemon route is classified in ROUTE_SCOPES or auth-exempt', () => {
-		const unclassified = [...daemonRouteKeys()].filter(
-			(key) => !AUTH_EXEMPT_ROUTES.has(key) && !(key in ROUTE_SCOPES)
+describe('Route table and scope classification', () => {
+	const keys = ROUTES.map(routeKey);
+
+	it('declares each route once', () => {
+		const repeated = keys.filter((key, i) => keys.indexOf(key) !== i);
+		expect(repeated, 'routes declared twice in ROUTES').to.deep.equal([]);
+	});
+
+	it('ROUTE_SCOPES lists every route but the auth-exempt ones', () => {
+		expect(Object.keys(ROUTE_SCOPES).sort()).to.deep.equal(
+			keys.filter((key) => !AUTH_EXEMPT_ROUTES.has(key)).sort()
 		);
-		expect(
-			unclassified,
-			`daemon routes without a scope classification in src/cli/auth.ts ` +
-				`(they fail closed to admin-only until classified): ` +
-				unclassified.join(', ')
-		).to.deep.equal([]);
 	});
 
-	it('ROUTE_SCOPES contains no stale routes (keep the map honest)', () => {
-		const routes = daemonRouteKeys();
-		const stale = Object.keys(ROUTE_SCOPES).filter((key) => !routes.has(key));
-		expect(
-			stale,
-			`ROUTE_SCOPES entries with no matching daemon route: ${stale.join(', ')}`
-		).to.deep.equal([]);
+	it('only the liveness probes and the API document are auth-exempt', () => {
+		expect([...AUTH_EXEMPT_ROUTES].sort()).to.deep.equal([
+			'GET /health',
+			'GET /openapi.json',
+			'GET /ready'
+		]);
 	});
 
-	it('auth-exempt routes are not also classified (one source of truth)', () => {
-		const both = [...AUTH_EXEMPT_ROUTES].filter((key) => key in ROUTE_SCOPES);
-		expect(both).to.deep.equal([]);
+	it('inline routes are the ones the request pipeline answers itself', () => {
+		// Each has its own arm in handleRequest; an inline route without one
+		// would get no handler from the dispatch table and answer 404.
+		expect(
+			ROUTES.filter((route) => route.inline)
+				.map(routeKey)
+				.sort()
+		).to.deep.equal([
+			'GET /events',
+			'GET /metrics',
+			'GET /openapi.json',
+			'POST /stop'
+		]);
+	});
+
+	it('the dispatch table refuses a route without a handler, and a handler without a route', () => {
+		// The daemon builds its table with dispatchTable, so a boot (the
+		// enforcement suite below) fails the same way on real handlers.
+		const handlers = Object.fromEntries(
+			ROUTES.filter((route) => !route.inline).map((route) => [
+				routeKey(route),
+				route
+			])
+		) as Record<HandledRouteKey, RouteDef>;
+		expect(dispatchTable(handlers).size).to.equal(
+			ROUTES.filter((route) => !route.inline).length
+		);
+		const missing: Partial<Record<HandledRouteKey, RouteDef>> = {
+			...handlers
+		};
+		delete missing['GET /info'];
+		expect(() => dispatchTable(missing as typeof handlers)).to.throw(
+			'No handler for GET /info'
+		);
+		const extra = { ...handlers, 'GET /unrouted': ROUTES[0] };
+		expect(() => dispatchTable(extra)).to.throw('GET /unrouted');
 	});
 
 	it('classified scopes only use known scope names and never list admin', () => {

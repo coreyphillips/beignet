@@ -1,13 +1,13 @@
 /**
  * CLI <-> daemon parity (M4 batch 2b): every daemon route must be reachable
- * from a CLI command. The check is source-derived so a new route added to
- * daemon.ts without a CLI wrapper fails this suite.
+ * from a CLI command, so a route added to ROUTES without a CLI wrapper fails
+ * this suite.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { expect } from 'chai';
-import { daemonRoutePaths } from './helpers/daemon-routes';
+import { ROUTES } from '../../src/cli/routes';
 
 // The start command's config-to-options mapping lives in its own module (so a
 // test can reach it without cli.ts running main()), and the wiring assertions
@@ -78,7 +78,8 @@ function cliRequestPaths(): Set<string> {
 describe('CLI parity with daemon routes (M4 batch 2b)', () => {
 	it('every daemon route has a CLI command (or a documented exception)', () => {
 		const cliPaths = cliRequestPaths();
-		const missing = [...daemonRoutePaths()].filter(
+		const routePaths = new Set(ROUTES.map((route) => route.path));
+		const missing = [...routePaths].filter(
 			(p) => !INTENTIONALLY_NO_CLI.has(p) && !cliPaths.has(p)
 		);
 		expect(

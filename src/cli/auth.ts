@@ -16,14 +16,14 @@
  * - `admin`: everything, including spending, channel management, backups,
  *   webhooks, and key revocation.
  *
- * Route classification lives in ROUTE_SCOPES below. Routes absent from the
- * map FAIL CLOSED (admin-only); a drift test
- * (tests/cli/auth-scopes.test.ts) fails when a daemon route ships without
- * an explicit classification.
+ * Each route's scopes are declared with the route in ROUTES
+ * (src/cli/routes.ts), where they are required, and read into ROUTE_SCOPES
+ * below. A route the table does not list FAILS CLOSED (admin-only).
  */
 
 import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import { BeignetError } from './errors';
+import { ROUTES } from './routes';
 
 export type ApiScope = 'readonly' | 'invoice' | 'admin';
 
@@ -94,252 +94,18 @@ export interface AuthFailure {
 export type AuthResult = AuthSuccess | AuthFailure;
 
 /**
- * Non-admin scopes accepted per route. `admin` is always accepted and is
- * never listed; `[]` therefore means admin-only. Routes NOT present here
- * fail closed to admin-only, and the drift test fails the build until the
- * route is classified.
+ * Non-admin scopes accepted per route, read from ROUTES. `admin` is always
+ * accepted and is never listed; `[]` therefore means admin-only. Auth-exempt
+ * routes have no entry, and a route not in ROUTES fails closed to admin-only.
  */
-export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
-	// ── Read-only monitoring (GET) ──
-	// /metrics is served outside the routes table but goes through the same
-	// auth middleware (it reports balances; metricsPublic opts out of auth).
-	'GET /metrics': ['readonly'],
-	'GET /info': ['readonly'],
-	'GET /balance': ['readonly'],
-	'GET /peers': ['readonly'],
-	'GET /channels': ['readonly'],
-	'GET /channels/ready': ['readonly'],
-	'GET /payments': ['readonly'],
-	'GET /payment': ['readonly'],
-	'GET /onchain/sweep': ['readonly'],
-	'GET /payment/proof': ['readonly'],
-	'GET /payment/verify-proof': ['readonly'],
-	'GET /forwards': ['readonly'],
-	'GET /forwards/summary': ['readonly'],
-	'GET /readiness': ['readonly'],
-	'GET /stats': ['readonly'],
-	'GET /spend-limit': ['readonly'],
-	'GET /liquidity': ['readonly'],
-	'GET /watchtowers': ['readonly'],
-	'GET /advisor/recommendations': ['readonly'],
-	'GET /fees': ['readonly'],
-	'GET /fees/estimates': ['readonly'],
-	'GET /transactions': ['readonly'],
-	'GET /transactions/boostable': ['readonly'],
-	'GET /utxos': ['readonly'],
-	'GET /address/labels': ['readonly'],
-	'GET /wallet/descriptors': ['readonly'],
-	'GET /channel': ['readonly'],
-	'GET /channel/health': ['readonly'],
-	'GET /channel/policy': ['readonly'],
-	'GET /channel/diagnostics': ['readonly'],
-	'GET /channel/suggestions': ['readonly'],
-	'GET /logs': ['readonly'],
-	'GET /node/uri': ['readonly'],
-	'GET /trusted-peers': ['readonly'],
-	'GET /can-send': ['readonly'],
-	'GET /graph/info': ['readonly'],
-	'GET /graph/node': ['readonly'],
-	'GET /graph/channel': ['readonly'],
-	'GET /graph/describe': ['readonly'],
-	'GET /backup/scb': ['readonly'],
-	'GET /backup/peer-retrieved': ['readonly'],
-	'GET /queue': ['readonly'],
-	// Recovery Protocol status: diagnostics, like /channel/diagnostics.
-	'GET /recovery/status': ['readonly'],
-	// FFOR offline receive (issue #729). Reads are read-only; a slot invoice
-	// is an invoice; everything that starts, closes, credits or enforces an
-	// epoch moves this node's liquidity or its on-chain position and takes
-	// the full key, like a force close.
-	'GET /receive/status': ['readonly'],
-	'GET /receive/quote': ['readonly'],
-	'POST /receive/invoice': [],
-	'GET /ffor/epochs': ['readonly'],
-	'GET /ffor/settlements': ['readonly'],
-	'GET /ffor/epoch': ['readonly'],
-	'GET /ffor/witness/status': ['readonly'],
-	'GET /ffor/issuer/status': ['readonly'],
-	'GET /ffor/issuer/issued': ['readonly'],
-	'POST /ffor/invoice': ['invoice'],
-	'POST /ffor/epoch/start': [],
-	'POST /ffor/epoch/close': [],
-	'POST /ffor/epoch/abort': [],
-	'POST /ffor/preimage': [],
-	'POST /ffor/witness/provision': [],
-	'POST /ffor/witness/close': [],
-	'POST /ffor/issuer/offer': ['invoice'],
-	'POST /ffor/issuer/provision': [],
-	'POST /ffor/recover': [],
-	'POST /ffor/sync': [],
-	'POST /ffor/enforce': [],
-	// The guardian this node serves to others (issue #699).
-	'GET /guardian/status': ['readonly'],
-
-	// ── Read-only POSTs (pure queries, no state change, no funds) ──
-	'POST /route/estimate': ['readonly'],
-	'POST /route/query': ['readonly'],
-	'POST /payment/estimate': ['readonly'],
-	// Prices a transaction without building or broadcasting one. It runs the same
-	// setup and coin selection a send would, but on scratch state that is reset
-	// again, so nothing is spent and nothing is left behind.
-	'POST /tx/quote': ['readonly'],
-	'POST /message/verify': ['readonly'],
-	'POST /address/validate': ['readonly'],
-	'POST /node/wait-ready': ['readonly'],
-	'POST /channel/wait-ready': ['readonly'],
-
-	// ── Invoice/receive routes readable by monitors too ──
-	'GET /invoices': ['readonly', 'invoice'],
-	'GET /invoice': ['readonly', 'invoice'],
-	'GET /invoices/held': ['readonly', 'invoice'],
-	'GET /offers': ['readonly', 'invoice'],
-	'GET /can-receive': ['readonly', 'invoice'],
-	'GET /events': ['readonly', 'invoice'],
-	'POST /invoice/decode': ['readonly', 'invoice'],
-	'POST /invoice/pay-all/quote': ['readonly'],
-	'POST /invoice/validate': ['readonly', 'invoice'],
-	'POST /offer/decode': ['readonly', 'invoice'],
-	'POST /payment/wait': ['readonly', 'invoice'],
-
-	// ── Receive-side mutations (invoice scope) ──
-	'POST /invoice/create': ['invoice'],
-	// Same scope as any other issued invoice: it registers an intent with an
-	// LSP and returns a BOLT 11 string. The funding it may trigger is the
-	// LSP's, out of the LSP's coins, and the fee it authorizes is bounded by
-	// the node's own configured ceilings, not by the caller's.
-	'POST /jit/invoice': ['invoice'],
-	// Role readback, no secrets in it: fees, caps, sats reserved and fronted.
-	'GET /jit/status': ['readonly'],
-	// A price, asked of a peer: registers nothing, moves nothing.
-	'GET /jit/quote': ['readonly'],
-	// Reverse swap provider (issue #737): reading the ledger is readonly;
-	// cancelling an unpaid swap closes a hold invoice, admin only.
-	'GET /swaps/status': ['readonly'],
-	'GET /swaps': ['readonly'],
-	'POST /swaps/cancel': [],
-	// Mints a receipt secret and hands out a payable artifact. It moves no
-	// money: the same shape as POST /invoice/create and POST /jit/invoice.
-	// Its two siblings are admin by ABSENCE, deliberately: configure sets the
-	// liquidity peer and the trust flag, and send spends a UTXO.
-	'POST /direct-funding/request': ['invoice'],
-	// Policy readback, no secrets in it.
-	'GET /direct-funding/config': ['readonly'],
-	'POST /invoice/create-hold': ['invoice'],
-	'POST /invoice/settle-hold': ['invoice'],
-	'POST /invoice/cancel-hold': ['invoice'],
-	'POST /offer/create': ['invoice'],
-	'DELETE /offer': ['invoice'],
-	'POST /address/new': ['invoice'],
-
-	// ── Admin-only: secrets / sensitive management surface ──
-	'GET /mnemonic': [],
-	// HMAC secrets are masked in list(), but callback URLs can embed
-	// credentials; webhook management is one admin-only unit
-	'GET /webhooks': [],
-
-	// ── Admin-only: spending / fund movement ──
-	'POST /send': [],
-	'POST /send-max': [],
-	'POST /onchain/sweep/prepare': [],
-	'POST /onchain/sweep/submit': [],
-	'POST /onchain/sweep/cancel': [],
-	'POST /tx/bump-fee': [],
-	'POST /tx/boost': [],
-	'POST /consolidate': [],
-	'POST /invoice/pay': [],
-	'POST /invoice/pay-all': [],
-	'POST /invoice/pay-safe': [],
-	'POST /invoice/pay-async': [],
-	'POST /invoice/pay-retry': [],
-	'POST /keysend': [],
-	'POST /keysend/safe': [],
-	'POST /offer/pay': [],
-	// L402: fetch spends, and a credential IS a bearer token for paid access,
-	// so reading or dropping one is admin work too, not readonly.
-	'POST /l402/fetch': [],
-	'GET /l402/credentials': [],
-	'DELETE /l402/credential': [],
-	'POST /payment/send-to-route': [],
-	'POST /payment/cancel': [],
-	'POST /queue/add': [],
-	'POST /queue/cancel': [],
-	'POST /rebalance': [],
-	'POST /advisor/execute-rebalances': [],
-	'POST /recover-fallback-funds': [],
-	// Spends a UTXO into a stranger's channel funding. As fund-moving as
-	// POST /send, and the empty list is what says so.
-	'POST /direct-funding/send': [],
-
-	// ── Admin-only: on-chain wallet mutation ──
-	'POST /utxo/freeze': [],
-	'POST /utxo/unfreeze': [],
-	'POST /address/label': [],
-	'POST /wallet/refresh': [],
-	'POST /psbt/build': [],
-	'POST /psbt/import-signed': [],
-	'POST /psbt/combine': [],
-
-	// ── Admin-only: channel and peer management ──
-	'POST /peer/connect': [],
-	'POST /peer/disconnect': [],
-	// Dials the peer a stranger's request names, as POST /peer/connect would.
-	'POST /direct-funding/prepare': [],
-	'POST /peers/bootstrap': [],
-	'POST /peers/connect-seeds': [],
-	'POST /trusted-peer/add': [],
-	'POST /trusted-peer/remove': [],
-	// Sets the liquidity peer every direct-funded channel is negotiated with,
-	// and whether such an open may go zero-conf.
-	'POST /direct-funding/configure': [],
-	'POST /channel/open': [],
-	'POST /channel/open-zeroconf': [],
-	'POST /channel/open-v2': [],
-	'POST /channel/open-and-wait': [],
-	'POST /channel/connect-and-open': [],
-	'POST /channels/ensure-minimum': [],
-	'POST /channel/close': [],
-	'POST /channel/close-quote': ['readonly'],
-	'POST /channel/forceclose': [],
-	'POST /channel/rebroadcast-close': [],
-	'POST /channel/funding-quote': ['readonly'],
-	'POST /channel/splice-quote': ['readonly'],
-	'POST /channel/splice-in': [],
-	'POST /channel/splice-out': [],
-	'POST /channel/update-commitment-feerate': [],
-	'POST /channel/update-fee': [],
-	'POST /channel/update-policy': [],
-
-	// ── Admin-only: node identity, gossip, probing ──
-	'POST /message/sign': [],
-	'POST /gossip/sync': [],
-	'POST /gossip/sync-rapid': [],
-	'POST /route/probe': [],
-	'POST /payment/metadata': [],
-
-	// ── Admin-only: backups, watchtowers, webhooks, lifecycle ──
-	'POST /backup': [],
-	'POST /backup/trigger': [],
-	'POST /restore/scb': [],
-	// The guardian-restore takeover permanently fences the previous writer.
-	'POST /recovery/restore': [],
-	'POST /recovery/restore-capsule': [],
-	// Hands back a retrieved capsule's guardian credentials.
-	'POST /recovery/capsule-guardians': [],
-	// Dials a remote node to resolve its guardian entry (issue #699).
-	'POST /recovery/resolve-guardian': [],
-	// Retires the current guardian set for good.
-	'POST /recovery/rotate-guardians': [],
-	'POST /watchtower/add': [],
-	'DELETE /watchtower/remove': [],
-	'POST /webhooks/register': [],
-	'DELETE /webhooks/unregister': [],
-	'POST /stop': [],
-
-	// ── Admin-only: API key management ──
-	'GET /auth/keys': [],
-	'POST /auth/keys/revoke': [],
-	'POST /auth/keys/rotate': []
-};
+export const ROUTE_SCOPES: Record<string, ApiScope[]> = Object.fromEntries(
+	ROUTES.flatMap(
+		(route): Array<[string, ApiScope[]]> =>
+			route.scopes === 'exempt'
+				? []
+				: [[`${route.method} ${route.path}`, [...route.scopes]]]
+	)
+);
 
 /**
  * Accepted non-admin scopes for a route. Unknown routes fail closed

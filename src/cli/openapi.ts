@@ -2,10 +2,12 @@
  * OpenAPI 3.0 specification for the Beignet Lightning daemon.
  *
  * Maintained by hand; tests/cli/openapi-completeness.test.ts fails when a
- * daemon route has no entry here. Served at GET /openapi.json.
+ * route in ROUTES has no entry here, or an entry has no route. Served at
+ * GET /openapi.json.
  */
 
 import { ROUTE_SCOPES } from './auth';
+import { ROUTES } from './routes';
 
 // require, not import: importing a file outside src/ widens tsc's rootDir and
 // moves the build output. The path is the same depth from src/cli and dist/cli.
@@ -14,6 +16,9 @@ const { version: PACKAGE_VERSION } = require('../../package.json') as {
 };
 
 export function getOpenApiSpec(): Record<string, unknown> {
+	const idempotentPaths = ROUTES.filter((route) => route.idempotent)
+		.map((route) => `\`${route.path}\``)
+		.join(', ');
 	const spec: Record<string, unknown> = {
 		openapi: '3.0.3',
 		info: {
@@ -21,7 +26,9 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			version: PACKAGE_VERSION,
 			description:
 				'HTTP API for a self-custodial Bitcoin + Lightning node. Designed for AI agents.\n\n' +
-				'**Idempotency:** These endpoints support the `X-Idempotency-Key` header: `/invoice/pay`, `/invoice/pay-all`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/splice-out`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`. ' +
+				'**Idempotency:** These endpoints support the `X-Idempotency-Key` header: ' +
+				idempotentPaths +
+				'. ' +
 				'When provided, the response is cached in memory for 24 hours (or until the daemon restarts), and repeated requests with the same key and body return the cached response. ' +
 				'If the same key is reused with a different request body, a `409 IDEMPOTENCY_CONFLICT` error is returned. ' +
 				'Any other POST that carries the header answers `400 INVALID_PARAMS` without running.\n\n' +
