@@ -3381,9 +3381,9 @@ export class Wallet {
 	 * to memory, or, when a newer scan already landed, memory's pair as it
 	 * stands, applied and written by that scan instead. Err, with nothing
 	 * applied, when the wallet switched networks while the query was out, or
-	 * when Electrum did not return the transaction of a coin young enough to
-	 * be an immature coinbase. A write that storage refuses is logged, not
-	 * returned: the scan itself succeeded.
+	 * when Electrum did not return the tip or the transaction of a coin young
+	 * enough to be an immature coinbase. A write that storage refuses is
+	 * logged, not returned: the scan itself succeeded.
 	 */
 	public async refreshUtxos({
 		scanningStrategy = EScanningStrategy.gapLimit,
@@ -3423,8 +3423,17 @@ export class Wallet {
 			._immatureUtxos) {
 			heldBack[scriptHash] = { index, path, address, scriptHash, publicKey };
 		}
+		// The held-back list is memory only, so until a scan has applied since
+		// the wallet loaded, every address a stored coinbase paid stands in for
+		// it.
+		if (!this._appliedScanSeq) {
+			for (const record of Object.values(this._data.transactions)) {
+				if (!record.vin?.some((input) => 'coinbase' in input)) continue;
+				const paid = this.getAddressFromScriptHash(record.scriptHash);
+				if (paid) heldBack[paid.scriptHash] = paid;
+			}
+		}
 		let getUtxosRes: Result<IGetUtxosResponse>;
-		let tip = 0;
 		let coinbases: Result<Set<string>> = ok(new Set());
 		try {
 			getUtxosRes = await electrum.getUtxos({
@@ -3436,11 +3445,9 @@ export class Wallet {
 				additionalScriptHashes: { ...heldBack, ...additionalScriptHashes }
 			});
 			if (getUtxosRes.isOk()) {
-				tip = this._data.header?.height ?? 0;
 				coinbases = await this.findImmatureCoinbases(
 					electrum,
-					getUtxosRes.value?.utxos ?? [],
-					tip
+					getUtxosRes.value?.utxos ?? []
 				);
 			}
 		} finally {
@@ -3509,29 +3516,31 @@ export class Wallet {
 
 	/**
 	 * The txids among `utxos` of coinbase transactions whose outputs the block
-	 * after `tip` cannot spend. Electrum lists a coinbase output like any other
-	 * coin, so for each coin young enough to be one, the inputs of its
+	 * after the tip cannot spend. Electrum lists a coinbase output like any
+	 * other coin, so for each coin young enough to be one, the inputs of its
 	 * transaction are read from the stored history, or looked up when the
 	 * history has no record of them.
 	 * @param {Electrum} electrum The instance the scan went to.
 	 * @param {IUtxo[]} utxos
-	 * @param {number} tip
-	 * @returns {Promise<Result<Set<string>>>} Err when a transaction it needed
-	 * was not returned.
+	 * @returns {Promise<Result<Set<string>>>} Err when the tip or a
+	 * transaction it needed was not returned.
 	 */
 	private async findImmatureCoinbases(
 		electrum: Electrum,
-		utxos: IUtxo[],
-		tip: number
+		utxos: IUtxo[]
 	): Promise<Result<Set<string>>> {
-		// With no header yet every confirmed coin would count as young, and the
-		// whole set would be looked up.
-		if (tip <= 0) return ok(new Set());
+		const confirmed = utxos.filter((utxo) => utxo.height > 0);
+		if (!confirmed.length) return ok(new Set());
+		// A first scan can finish before the header subscription its connect
+		// started has answered. This one waits behind it.
+		if (!this._data.header?.height) await electrum.subscribeToHeader();
+		const tip = this._data.header?.height ?? 0;
+		if (!tip) {
+			return err('Unable to get the tip to check coinbase outputs against.');
+		}
 		const young = new Set(
-			utxos
-				.filter(
-					(utxo) => utxo.height > 0 && !coinbaseSpendable(utxo.height, tip)
-				)
+			confirmed
+				.filter((utxo) => !coinbaseSpendable(utxo.height, tip))
 				.map((utxo) => utxo.tx_hash)
 		);
 		for (const txid of this._coinbaseTxids.keys()) {

@@ -24,6 +24,7 @@ import {
 	TTxDetails,
 	Wallet,
 	decodeRawTransaction,
+	err,
 	ok
 } from '../src';
 
@@ -313,6 +314,54 @@ describe('Immature coinbase outputs (#1842)', function () {
 		expect(second.isErr()).to.equal(true);
 		expect(wallet.listUtxos()).to.deep.equal([old]);
 		expect(wallet.getBalance()).to.equal(60_000);
+	});
+
+	it('waits for the tip when a scan lands before the first header', async () => {
+		const reward = coin('b2'.repeat(32), 250);
+		serve(reward.tx_hash, true);
+		scanAnswers([reward]);
+		const subscribe = sinon
+			.stub(wallet.electrum, 'subscribeToHeader')
+			.resolves(err('Unable to subscribe to headers.'));
+
+		const failed = await scan();
+		expect(failed.isErr(), 'no tip, no verdict').to.equal(true);
+		expect(wallet.listUtxos()).to.deep.equal([]);
+
+		subscribe.callsFake(async () => {
+			await tipAt(300);
+			return ok(wallet.data.header);
+		});
+		const scanned = await scan();
+		if (scanned.isErr()) throw scanned.error;
+		expect(wallet.listUtxos()).to.deep.equal([]);
+		expect(wallet.listImmatureUtxos()).to.deep.equal([reward]);
+	});
+
+	it('lists the addresses stored coinbases paid in the first scan since the wallet loaded', async () => {
+		await tipAt(300);
+		const paid = wallet.data.addressIndex[EAddressType.p2wpkh];
+		const txid = 'b2'.repeat(32);
+		const record = {
+			txid,
+			scriptHash: paid.scriptHash,
+			vin: [{ coinbase: '0365', sequence: 0xffffffff }]
+		} as IFormattedTransaction;
+		const stored = await wallet.updateData({
+			transactions: { [txid]: record }
+		});
+		if (stored.isErr()) throw stored.error;
+		// Spent since, so nothing is held back.
+		scanAnswers([]);
+
+		for (let i = 0; i < 2; i++) {
+			const scanned = await scan();
+			if (scanned.isErr()) throw scanned.error;
+		}
+		const first = getUtxos.firstCall.args[0].additionalScriptHashes;
+		const second = getUtxos.secondCall.args[0].additionalScriptHashes;
+		expect(first[paid.scriptHash]).to.deep.equal(paid);
+		expect(second).to.not.have.property(paid.scriptHash);
 	});
 
 	it('lists the address of a held-back coin in the next scan', async () => {
