@@ -693,6 +693,7 @@ npm run test:cli           # 2200+ CLI + daemon unit tests (parallel), no infras
 npm run test:conformance   # 300+ official BOLT vector cases (subset of test:lightning)
 npm run test:chaos         # recovery kill matrices (parallel), split out of test:lightning
 npm run test:sigkill       # process-level SIGKILL chaos matrix (builds dist first)
+npm run test:api           # exported API vs tests/api-snapshot (npm run api:snapshot regenerates it)
 npm run test:integration   # daemon/Electrum integration (needs an Electrum server)
 npm run test:interop       # 300+ cases vs LND/CLN/Eclair (needs Docker)
 npm run test:interop:ffor  # FFOR Variant D chain gates on regtest (needs only the bitcoind container)
