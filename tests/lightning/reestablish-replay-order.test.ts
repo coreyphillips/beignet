@@ -56,6 +56,7 @@ import {
 	serializeChannelState,
 	deserializeChannelState
 } from '../../src/lightning/storage/serialization';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 const sha256 = (b: Buffer): Buffer =>
 	crypto.createHash('sha256').update(b).digest();
@@ -80,7 +81,8 @@ function makeConfig(name: string, taproot = false): IChannelManagerConfig {
 		htlcBasepointSecret: k(4),
 		nodePrivateKey: sha256(Buffer.from(`${name}-node`)),
 		preferAnchors: true,
-		...(taproot ? { preferTaproot: true } : {})
+		...(taproot ? { preferTaproot: true } : {}),
+		persistence: COMMIT_ALL
 	};
 }
 

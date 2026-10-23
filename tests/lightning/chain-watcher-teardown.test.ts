@@ -33,6 +33,7 @@ import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG
 } from '../../src/lightning/channel/types';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -505,7 +506,8 @@ describe('ChainWatcher teardown', function () {
 		channelManager = new ChannelManager({
 			localBasepoints: makeBasepoints(seed),
 			localPerCommitmentSeed: crypto.randomBytes(32),
-			localFundingPrivkey: crypto.randomBytes(32)
+			localFundingPrivkey: crypto.randomBytes(32),
+			persistence: COMMIT_ALL
 		});
 		channelManager.on('error', () => {});
 

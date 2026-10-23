@@ -30,6 +30,7 @@ import {
 } from '../../src/lightning/chain/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -65,7 +66,8 @@ function configOf(seed: Buffer, preferTaproot: boolean): IChannelManagerConfig {
 		localPerCommitmentSeed: seedFor(1000 + seed[0]),
 		localFundingPrivkey: privAt(seed, 0),
 		htlcBasepointSecret: privAt(seed, 4),
-		preferTaproot
+		preferTaproot,
+		persistence: COMMIT_ALL
 	};
 }
 function connect(

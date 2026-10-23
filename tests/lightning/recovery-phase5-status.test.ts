@@ -70,6 +70,7 @@ import {
 	realCommitmentSigs
 } from './helpers/real-signing';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -790,7 +791,8 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 			localFundingPrivkey: crypto
 				.createHash('sha256')
 				.update(Buffer.from('close-req-funding'))
-				.digest()
+				.digest(),
+			persistence: COMMIT_ALL
 		});
 		cm.on('error', () => {});
 		const peer = getPublicKey(Buffer.alloc(32, 0x72)).toString('hex');

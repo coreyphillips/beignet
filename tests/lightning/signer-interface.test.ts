@@ -40,6 +40,7 @@ import {
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // ─── Fixed key material (vectors pinned against these exact values) ─────────
 
@@ -447,7 +448,8 @@ function makeManagerConfig(seedId: number): IChannelManagerConfig {
 		localBasepoints: makeBasepoints(seed),
 		localPerCommitmentSeed: makeSeed(seedId + 100),
 		localFundingPrivkey: derivePrivkey(seed, 0),
-		htlcBasepointSecret: derivePrivkey(seed, 4)
+		htlcBasepointSecret: derivePrivkey(seed, 4),
+		persistence: COMMIT_ALL
 	};
 }
 

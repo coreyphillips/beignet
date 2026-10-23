@@ -72,6 +72,7 @@ import {
 	vouchers,
 	why
 } from './helpers/ffor-concurrent-pair';
+import { onPersist } from './helpers/channel-persistence';
 
 const BUDGET = AMOUNTS.reduce((a, b) => a + b, 0n);
 const S_START = (FUNDING_SATOSHIS - 200_000n) * 1000n;
@@ -436,7 +437,7 @@ function runCrash(
 	let writes = 0;
 	let crashed = false;
 	let row = snapshot(pair, victim);
-	manager(pair, victim).on('channel:persist', () => {
+	onPersist(manager(pair, victim), () => {
 		if (crashed) return;
 		if (writes === k && when === 'before the write') {
 			crashed = true;
@@ -1269,7 +1270,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 		it('an earlier state: S comes back from a row that predates the activation (ABORTED on reconnect); R still drains, is paid for the settled slot, and the channel carries on', () => {
 			const pair = createPair({ pushSat: 200_000n });
 			let row: string | null = null;
-			pair.sManager.on('channel:persist', () => {
+			onPersist(pair.sManager, () => {
 				if (record(pair.sChannel).state === FforState.VOUCHERS_COMMITTED) {
 					row = snapshot(pair, 'S');
 				}
@@ -1608,7 +1609,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 				settleSlot(pair, 2);
 				const backup = snapshot(pair, 'S');
 				let row: string | null = null;
-				pair.rManager.on('channel:persist', () => {
+				onPersist(pair.rManager, () => {
 					if (
 						row === null &&
 						record(pair.rChannel).state === FforState.DRAINING
@@ -1873,19 +1874,17 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 			const pair = createPair({ pushSat: 200_000n });
 			let blocked = 0;
 			let failed = 0;
-			pair.sManager.on(
-				'channel:persist',
-				(ev: { request?: { committed: boolean } }) => {
-					if (
-						failed === 0 &&
-						record(pair.sChannel).state === FforState.ACTIVE &&
-						ev.request
-					) {
-						ev.request.committed = false;
-						failed++;
-					}
+			onPersist(pair.sManager, (request, result) => {
+				if (
+					failed === 0 &&
+					record(pair.sChannel).state === FforState.ACTIVE &&
+					request.outbox
+				) {
+					failed++;
+					return { ...result, committed: false };
 				}
-			);
+				return result;
+			});
 			pair.sManager.on('transition:blocked', () => blocked++);
 			const res = pair.rManager.initiateFforEpoch(
 				pair.channelId,
@@ -1923,18 +1922,16 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 		it("the ack is replayed but its write fails again: S still originates nothing, and R's channel survives", () => {
 			const pair = createPair({ pushSat: 200_000n });
 			let failing = true;
-			pair.sManager.on(
-				'channel:persist',
-				(ev: { request?: { committed: boolean } }) => {
-					if (
-						failing &&
-						record(pair.sChannel).state === FforState.ACTIVE &&
-						ev.request
-					) {
-						ev.request.committed = false;
-					}
+			onPersist(pair.sManager, (request, result) => {
+				if (
+					failing &&
+					record(pair.sChannel).state === FforState.ACTIVE &&
+					request.outbox
+				) {
+					return { ...result, committed: false };
 				}
-			);
+				return result;
+			});
 			const res = pair.rManager.initiateFforEpoch(
 				pair.channelId,
 				terms(AMOUNTS, { concurrent: true })
@@ -1994,19 +1991,17 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 		it('control: a baseline S whose ACTIVE write fails once refuses the add locally and the channel survives', () => {
 			const pair = createPair({ pushSat: 200_000n });
 			let failed = 0;
-			pair.sManager.on(
-				'channel:persist',
-				(ev: { request?: { committed: boolean } }) => {
-					if (
-						failed === 0 &&
-						record(pair.sChannel).state === FforState.ACTIVE &&
-						ev.request
-					) {
-						ev.request.committed = false;
-						failed++;
-					}
+			onPersist(pair.sManager, (request, result) => {
+				if (
+					failed === 0 &&
+					record(pair.sChannel).state === FforState.ACTIVE &&
+					request.outbox
+				) {
+					failed++;
+					return { ...result, committed: false };
 				}
-			);
+				return result;
+			});
 			const res = pair.rManager.initiateFforEpoch(
 				pair.channelId,
 				terms(AMOUNTS)
@@ -2035,15 +2030,13 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 				const add = offer(pair, 'S', 2_000_000n);
 				expect(add.result.ok, add.result.error).to.equal(true);
 				let failed = 0;
-				pair.rManager.on(
-					'channel:persist',
-					(ev: { request?: { committed: boolean } }) => {
-						if (failed === 0 && ev.request) {
-							ev.request.committed = false;
-							failed++;
-						}
+				onPersist(pair.rManager, (request, result) => {
+					if (failed === 0 && request.outbox) {
+						failed++;
+						return { ...result, committed: false };
 					}
-				);
+					return result;
+				});
 				pair.link.log.length = 0;
 				pair.sErrors.length = 0;
 				pair.rErrors.length = 0;
@@ -2138,7 +2131,9 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 			pair.link.disconnect();
 			advertise(pair, 'R', false);
 			let persists = 0;
-			pair.sManager.on('channel:persist', () => persists++);
+			onPersist(pair.sManager, () => {
+				persists++;
+			});
 			pair.link.log.length = 0;
 			pair.link.reconnect();
 			// Nothing but the two channel_reestablish messages crossed.
@@ -2171,7 +2166,9 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301', fun
 			pair.link.disconnect();
 			advertise(pair, 'R', false);
 			let persists = 0;
-			pair.sManager.on('channel:persist', () => persists++);
+			onPersist(pair.sManager, () => {
+				persists++;
+			});
 			pair.link.reconnect();
 			expect(persists).to.equal(0);
 			for (const side of SIDES) {

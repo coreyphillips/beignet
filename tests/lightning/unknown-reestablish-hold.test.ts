@@ -25,6 +25,7 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { MessageType } from '../../src/lightning/message/types';
 import { encodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // ─── Harness (model: channel-manager.test.ts) ───
 
@@ -71,7 +72,8 @@ function makeConfig(seedId: number): IChannelManagerConfig {
 			.createHash('sha256')
 			.update(seed)
 			.update(Buffer.from([4]))
-			.digest()
+			.digest(),
+		persistence: COMMIT_ALL
 	};
 }
 

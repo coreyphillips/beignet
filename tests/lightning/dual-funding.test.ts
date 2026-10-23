@@ -62,8 +62,7 @@ import {
 } from '../../src/lightning/channel/types';
 import {
 	ChannelAction,
-	ChannelActionType,
-	IChannelPersistEvent
+	ChannelActionType
 } from '../../src/lightning/channel/channel-actions';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { MessageType } from '../../src/lightning/message/types';
@@ -85,6 +84,11 @@ import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { deriveV2TemporaryChannelId } from '../../src/lightning/channel/validation';
 import { signWillFund } from '../../src/lightning/channel/liquidity-ads';
 import { writableState } from './helpers/writable-state';
+import {
+	COMMIT_ALL,
+	COMMIT_NONE,
+	setPersistence
+} from './helpers/channel-persistence';
 
 // ─────────────── Helpers ───────────────
 
@@ -224,7 +228,8 @@ function makeChannelManagerConfig() {
 	return {
 		localBasepoints: bp,
 		localPerCommitmentSeed: crypto.randomBytes(32),
-		localFundingPrivkey: privkey
+		localFundingPrivkey: privkey,
+		persistence: COMMIT_ALL
 	};
 }
 
@@ -3070,7 +3075,8 @@ describe('Round 17: v2 channel_type admission', () => {
 			const mgr = new ChannelManager({
 				...makeChannelManagerConfig(),
 				nodePrivateKey: crypto.randomBytes(32),
-				leaseRates
+				leaseRates,
+				persistence: COMMIT_ALL
 			});
 			mgr.setFundingProvider({
 				buildFundingTransaction: async () => {
@@ -3437,7 +3443,8 @@ describe('Round 17: v2 channel_type admission', () => {
 				{
 					manager: new ChannelManager({
 						...makeChannelManagerConfig(),
-						chainHash: Buffer.alloc(32, 0x01)
+						chainHash: Buffer.alloc(32, 0x01),
+						persistence: COMMIT_ALL
 					}),
 					message: makeOpenChannel2Msg({
 						chainHash: Buffer.alloc(32, 0x02)
@@ -3457,7 +3464,8 @@ describe('Round 17: v2 channel_type admission', () => {
 								released: false,
 								reason: 'namespace-lost'
 							})
-						}
+						},
+						persistence: COMMIT_ALL
 					}),
 					message: makeOpenChannel2Msg()
 				}
@@ -4473,9 +4481,7 @@ describe('Round 17: v2 channel_type admission', () => {
 			const sent: number[] = [];
 			let blocked = 0;
 			let abandoned = 0;
-			mgr.on('channel:persist', ({ request }: IChannelPersistEvent) => {
-				if (request) request.committed = false;
-			});
+			setPersistence(mgr, COMMIT_NONE);
 			mgr.on('message:outbound', (_peer: string, type: number) => {
 				sent.push(type);
 			});
@@ -5375,7 +5381,8 @@ describe('Issue #311: fabricated prevTx defenses', () => {
 			...(opts?.verify ? { verifyRemoteFundingInput: opts.verify } : {}),
 			...(opts?.hasResumableChannelRow
 				? { hasResumableChannelRow: opts.hasResumableChannelRow }
-				: {})
+				: {}),
+			persistence: COMMIT_ALL
 		});
 		if (opts?.provider) mgr.setFundingProvider(opts.provider);
 		const sent: number[] = [];
@@ -5493,7 +5500,8 @@ describe('Issue #311: fabricated prevTx defenses', () => {
 			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
 			const mgr = new ChannelManager({
 				...makeChannelManagerConfig(),
-				verifyRemoteFundingInput: counting
+				verifyRemoteFundingInput: counting,
+				persistence: COMMIT_ALL
 			});
 			mgr.on('error', () => {});
 			mgr.on('message:outbound', () => {});

@@ -20,6 +20,7 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IDualFundingParams } from '../../src/lightning/channel/dual-funding';
 import { ILeaseRates } from '../../src/lightning/gossip/types';
 import { MessageType } from '../../src/lightning/message/types';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 function validPriv(): Buffer {
 	let k: Buffer;
@@ -91,7 +92,8 @@ function setup(sellerSells: boolean): ISellerHarness {
 		localBasepoints: makeBasepoints(),
 		localPerCommitmentSeed: crypto.randomBytes(32),
 		localFundingPrivkey: validPriv(),
-		nodePrivateKey: buyerPriv
+		nodePrivateKey: buyerPriv,
+		persistence: COMMIT_ALL
 	});
 	buyer.on('error', () => {});
 	const seller = new ChannelManager({
@@ -99,7 +101,8 @@ function setup(sellerSells: boolean): ISellerHarness {
 		localPerCommitmentSeed: crypto.randomBytes(32),
 		localFundingPrivkey: validPriv(),
 		nodePrivateKey: sellerPriv,
-		...(sellerSells ? { leaseRates: RATES } : {})
+		...(sellerSells ? { leaseRates: RATES } : {}),
+		persistence: COMMIT_ALL
 	});
 	const sellerErrors: string[] = [];
 	seller.on('error', (_id: Buffer | null, message: string) => {

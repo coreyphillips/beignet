@@ -38,6 +38,7 @@ import {
 	perCommitmentPointFromSecret
 } from '../../src/lightning/keys/derivation';
 import { generateFromSeed } from '../../src/lightning/keys/shachain';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 const ECPair = ECPairFactory(ecc);
@@ -172,7 +173,8 @@ describe('FS-4: taproot anchor commitment CPFP', () => {
 				.createHash('sha256')
 				.update('fs4-node-funding')
 				.digest(),
-			delayedPaymentBasepointSecret: delayedSecret
+			delayedPaymentBasepointSecret: delayedSecret,
+			persistence: COMMIT_ALL
 		} as any);
 		cm.on('error', () => {});
 

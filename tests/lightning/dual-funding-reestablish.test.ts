@@ -116,6 +116,7 @@ import {
 } from '../../src/lightning/chain/chain-watcher';
 import { settle, neverSettles } from './helpers/settle';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL, onPersist } from './helpers/channel-persistence';
 
 // ─────────────── Channel-level helpers ───────────────
 
@@ -1131,7 +1132,8 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 				crypto.randomBytes(32)
 			),
 			localPerCommitmentSeed: crypto.randomBytes(32),
-			localFundingPrivkey: h.acceptorFundingPriv
+			localFundingPrivkey: h.acceptorFundingPriv,
+			persistence: COMMIT_ALL
 		});
 		mgr.on('error', () => {});
 		const peerHex = getPublicKey(crypto.randomBytes(32)).toString('hex');
@@ -1239,7 +1241,8 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 				crypto.randomBytes(32)
 			),
 			localPerCommitmentSeed: crypto.randomBytes(32),
-			localFundingPrivkey: crypto.randomBytes(32)
+			localFundingPrivkey: crypto.randomBytes(32),
+			persistence: COMMIT_ALL
 		});
 		mgr.on('error', () => {});
 		const peerHex = getPublicKey(crypto.randomBytes(32)).toString('hex');
@@ -1326,7 +1329,8 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 				crypto.randomBytes(32)
 			),
 			localPerCommitmentSeed: crypto.randomBytes(32),
-			localFundingPrivkey: crypto.randomBytes(32)
+			localFundingPrivkey: crypto.randomBytes(32),
+			persistence: COMMIT_ALL
 		});
 		mgr.on('error', () => {});
 		const peerHex = getPublicKey(crypto.randomBytes(32)).toString('hex');
@@ -1341,10 +1345,11 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		);
 
 		let refusePersist = true;
-		mgr.on('channel:persist', (ev: { request?: { committed: boolean } }) => {
-			if (refusePersist && ev.request) {
-				ev.request.committed = false;
+		onPersist(mgr, (request, result) => {
+			if (refusePersist && request.outbox) {
+				return { ...result, committed: false };
 			}
+			return result;
 		});
 		let events = 0;
 		mgr.on('channel:txsigs-needed', () => {
@@ -3242,7 +3247,8 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 				crypto.randomBytes(32)
 			),
 			localPerCommitmentSeed: crypto.randomBytes(32),
-			localFundingPrivkey: crypto.randomBytes(32)
+			localFundingPrivkey: crypto.randomBytes(32),
+			persistence: COMMIT_ALL
 		});
 		const errors: string[] = [];
 		mgr.on('error', (_id: Buffer | null, message: string) => {

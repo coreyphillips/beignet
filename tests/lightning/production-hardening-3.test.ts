@@ -72,6 +72,7 @@ import * as bip32 from 'bip32';
 import * as bip39 from 'bip39';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL, onPersist } from './helpers/channel-persistence';
 
 const BIP32Factory = bip32.BIP32Factory(ecc);
 
@@ -207,7 +208,8 @@ function makeCMConfig(seed: Buffer): IChannelManagerConfig {
 			.update(Buffer.from('commit-seed'))
 			.digest(),
 		localFundingPrivkey: fundingPrivkey,
-		htlcBasepointSecret: htlcSecret
+		htlcBasepointSecret: htlcSecret,
+		persistence: COMMIT_ALL
 	};
 }
 
@@ -765,7 +767,7 @@ describe('Production Hardening 3: Crash Recovery', function () {
 			expect(actions[0].type).to.equal(ChannelActionType.PERSIST_STATE);
 		});
 
-		it('channel:persist event emitted in ChannelManager processActions', () => {
+		it('processActions commits through the injected persistence', () => {
 			const aliceConfig = makeCMConfig(makeSeed(62));
 			const bobConfig = makeCMConfig(makeSeed(63));
 			const alicePubkey =
@@ -800,13 +802,13 @@ describe('Production Hardening 3: Crash Recovery', function () {
 			bob.handleFundingConfirmed(channelId);
 
 			let persistEmitted = false;
-			alice.on('channel:persist', () => {
+			onPersist(alice, () => {
 				persistEmitted = true;
 			});
 
 			// A real commitment round (add + auto-sign, driven by the loopback)
-			// produces PERSIST_STATE actions, which processActions surfaces as
-			// channel:persist.
+			// produces PERSIST_STATE actions, which processActions hands to the
+			// manager's persistence.
 			const res = alice.addHtlc(
 				channelId,
 				10_000_000n,

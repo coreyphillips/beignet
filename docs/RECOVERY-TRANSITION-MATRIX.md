@@ -18,19 +18,20 @@ several handlers returned a send with no persist at all.
 
 Phase 1 makes it structural, in three parts:
 
-1. `ChannelManager.processActions` (`channel-manager.ts:4378`) collects every
-   retransmittable `SEND_MESSAGE` that FOLLOWS the batch's `PERSIST_STATE` and
-   hands the exact bytes to the persist listener as an `IChannelPersistRequest`.
-2. `LightningNode.persistChannel` (`lightning-node.ts:1325`) commits the channel
+1. `ChannelManager.processActions` collects every retransmittable
+   `SEND_MESSAGE` that FOLLOWS the batch's `PERSIST_STATE` and hands the exact
+   bytes to the `IChannelPersistence` the manager was constructed with, as the
+   `outbox` of an `IChannelPersistRequest`. The manager will not construct
+   without one.
+2. `LightningNode`'s implementation (`persistChannelState`) commits the channel
    state, its key index, any chain monitor delta this same action produced, any
    mutations the caller staged, AND the outbox rows for those messages in ONE
    `RecoveryManager.commit` transaction.
-3. If that transaction rolls back, the request comes back `committed: false` and
-   `_dispatchActions` (`channel-manager.ts:4450`) withholds the sends it
-   authorized. A message whose justifying state is not on disk never reaches
-   the peer. The gate covers `BROADCAST_TX` and `FORCE_CLOSE` too: a splice or
-   funding transaction whose justifying state missed disk must not reach the
-   network either.
+3. Unless `persist` returns `committed: true`, `_dispatchActions` withholds the
+   sends it authorized. A message whose justifying state is not on disk never
+   reaches the peer. The gate covers `BROADCAST_TX` and `FORCE_CLOSE` too: a
+   splice or funding transaction whose justifying state missed disk must not
+   reach the network either.
 
 A batch commits exactly once, no matter how many `PERSIST_STATE` markers it
 carries. Channel methods mutate state while BUILDING the action array, so every

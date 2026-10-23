@@ -45,6 +45,7 @@ import {
 } from '../../src/lightning/gossip/messages';
 import { MonitorState } from '../../src/lightning/chain/types';
 import { createFundingScript } from '../../src/lightning/script/funding';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 const network = bitcoin.networks.regtest;
@@ -203,7 +204,8 @@ describe('Production Bugfixes', () => {
 				localBasepoints: basepoints,
 				localPerCommitmentSeed: crypto.randomBytes(32),
 				localFundingPrivkey: privkeys[0],
-				nodePrivateKey: nodePrivkey
+				nodePrivateKey: nodePrivkey,
+				persistence: COMMIT_ALL
 			};
 
 			const cm = new ChannelManager(config);
@@ -336,7 +338,8 @@ describe('Production Bugfixes', () => {
 			const cm = new ChannelManager({
 				localBasepoints: basepoints,
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: privkeys[0]
+				localFundingPrivkey: privkeys[0],
+				persistence: COMMIT_ALL
 			});
 			cm.on('error', () => {}); // absorb
 
@@ -400,7 +403,8 @@ describe('Production Bugfixes', () => {
 			const cm = new ChannelManager({
 				localBasepoints: basepoints,
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: privkeys[0]
+				localFundingPrivkey: privkeys[0],
+				persistence: COMMIT_ALL
 			});
 			cm.on('error', () => {}); // absorb
 

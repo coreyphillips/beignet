@@ -34,6 +34,7 @@ import {
 	signerFromSeed,
 	realInitialCommitmentSig
 } from './helpers/real-signing';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -78,7 +79,8 @@ function makeConfig(seedId: number): IChannelManagerConfig {
 		localConfig: { ...DEFAULT_CHANNEL_CONFIG },
 		localBasepoints: makeBasepoints(seed),
 		localPerCommitmentSeed: makeSeed(seedId + 100),
-		localFundingPrivkey: fundingPrivkey
+		localFundingPrivkey: fundingPrivkey,
+		persistence: COMMIT_ALL
 	};
 }
 

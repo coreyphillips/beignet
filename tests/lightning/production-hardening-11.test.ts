@@ -50,6 +50,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -221,7 +222,8 @@ function makeChannelManager(): ChannelManager {
 	return new ChannelManager({
 		localBasepoints: makeBasepoints(seed),
 		localPerCommitmentSeed: makeSeed(999),
-		localFundingPrivkey: fundingPrivkey
+		localFundingPrivkey: fundingPrivkey,
+		persistence: COMMIT_ALL
 	});
 }
 

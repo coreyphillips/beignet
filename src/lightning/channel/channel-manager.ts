@@ -59,8 +59,9 @@ import {
 import type {
 	ChannelAction,
 	IBroadcastTxAction,
-	IChannelPersistEvent,
-	IChannelPersistRequest,
+	IChannelPersistence,
+	IChannelPersistOutbox,
+	IChannelPersistResult,
 	IErrorAction,
 	ISendMessageAction,
 	IWireDurabilityBarrier
@@ -282,6 +283,41 @@ function newDispatchProgress(): IActionDispatchProgress {
 	};
 }
 
+/** One run of a batch through `_dispatchActions`, and what it has learned. */
+interface IDispatchContext {
+	peerPubkey: string;
+	channel: Channel;
+	actions: ChannelAction[];
+	/**
+	 * What the batch's persist authorizes, or null when its answer gates
+	 * nothing (no permanent channel id yet, or a run with no persist ahead).
+	 */
+	outbox: IChannelPersistOutbox | null;
+	/** The persistence's answer for an `outbox`, once the persist ran. */
+	persisted: IChannelPersistResult | null;
+	/**
+	 * The channel id the batch started under. The barrier queue and the
+	 * withheld-send record are keyed by it, whatever a nested dispatch does
+	 * to the channel meanwhile.
+	 */
+	channelIdHex: string | null;
+	/** Index the run starts from; a held suffix resumes past its persist. */
+	startIndex: number;
+	/** The batch's one persist already ran before this run started. */
+	persistAlreadySeen: boolean;
+	/**
+	 * Nothing the persist authorized may leave: it failed, or the suffix is
+	 * being run for its internal effects only.
+	 */
+	sendsBlocked: boolean;
+	/**
+	 * A live batch, whose persist may park its remainder behind the quorum
+	 * barrier. A resumed or terminal run is never held again.
+	 */
+	holdable: boolean;
+	progress?: IActionDispatchProgress;
+}
+
 /** Why a new channel is refused once the recovery namespace is finished. */
 const NAMESPACE_LOST_REFUSAL =
 	'recovery: this namespace lost its guardian backfill, so a new channel ' +
@@ -309,6 +345,13 @@ interface IBarrierQueue {
 }
 
 export interface IChannelManagerConfig {
+	/**
+	 * Where each batch's PERSIST_STATE commits before the sends it authorizes
+	 * leave (Recovery Protocol 5.1). Required, and the constructor throws
+	 * without it: the answer `persist` returns is the only thing that releases
+	 * those sends. LightningNode supplies one backed by its storage.
+	 */
+	persistence: IChannelPersistence;
 	zeroReserve?: import('./zero-reserve').IZeroReserveConfig;
 	/** Durable book lookup supplied by the node's voucher custody index. */
 	fforVoucherLookup?: (paymentHash: string) => IFforVoucherArchive | undefined;
@@ -875,10 +918,21 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * only a persist that lands clears it.
 	 */
 	private readonly persistFailed = new Set<string>();
+	private readonly persistence: IChannelPersistence;
 
 	constructor(config: IChannelManagerConfig) {
 		super();
+		// No default. The one a manager used to fall back on answered
+		// committed for every write, so a consumer that wired no storage sent
+		// commitment signatures nothing would remember after a restart.
+		if (typeof config?.persistence?.persist !== 'function') {
+			throw new TypeError(
+				'ChannelManager requires config.persistence: channel state must ' +
+					'be committed before the messages it authorizes are sent'
+			);
+		}
 		this.config = config;
+		this.persistence = config.persistence;
 	}
 
 	/**
@@ -3237,11 +3291,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			// may not flip, so the persist cannot ride 'channel:closed'.
 			const peerPubkey = this.findPeerForChannel(owner);
 			if (peerPubkey) {
-				this.emit('channel:persist', {
-					channel: owner,
-					peerPubkey,
-					channelId
-				} as IChannelPersistEvent);
+				this.persistence.persist({ channel: owner, peerPubkey, channelId });
 			}
 		}
 
@@ -9095,15 +9145,10 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (!channel.markErrored()) return;
 		const channelId = channel.getChannelId() ?? channel.getTemporaryChannelId();
 		// A channel with no resolvable peer has nothing to write: the peer is
-		// half of the channel_state mutation. The listener used to discover
-		// that for itself and return; the resolution simply moved here.
+		// half of the channel_state mutation.
 		const peerPubkey = this.findPeerForChannel(channel);
 		if (peerPubkey) {
-			this.emit('channel:persist', {
-				channel,
-				peerPubkey,
-				channelId
-			} as IChannelPersistEvent);
+			this.persistence.persist({ channel, peerPubkey, channelId });
 		}
 		this.emit('channel:errored', channelId, reason);
 	}
@@ -9677,15 +9722,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// ── Structural persist-before-send (Recovery Protocol 5.1/5.2) ──
 		// Every retransmittable SEND_MESSAGE that FOLLOWS the batch's
 		// PERSIST_STATE is authorized by the state that persist writes, so its
-		// exact wire bytes are handed to the persist listener and committed in
-		// the SAME transaction. Ordering safety no longer rests on each handler
+		// exact wire bytes are handed to the persistence and committed in the
+		// SAME transaction. Ordering safety no longer rests on each handler
 		// happening to place PERSIST_STATE before its sends: a send whose
 		// justifying state failed to commit is withheld outright.
 		const batchChannelId = channel.getChannelId();
 		const persistIndex = actions.findIndex(
 			(a) => a.type === ChannelActionType.PERSIST_STATE
 		);
-		const persistRequest: IChannelPersistRequest | null =
+		const outbox: IChannelPersistOutbox | null =
 			persistIndex >= 0 && batchChannelId
 				? {
 						outbound: actions
@@ -9705,35 +9750,31 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 								messageType: a.messageType,
 								wireMessage: a.payload,
 								disposition: 'pending_send' as const
-							})),
-						committed: true,
-						outboxIds: []
+							}))
 				  }
 				: null;
-		// Fold a staged revoke supersede into this batch's persist request so
-		// the row deletions ride the same transaction as the channel state.
-		// Cleared unconditionally: it was staged for exactly this batch, and a
-		// batch it cannot ride with must not delete anything (rows are only
-		// ever retired by a transition that actually committed).
+		// Fold a staged revoke supersede into this batch's persist so the row
+		// deletions ride the same transaction as the channel state. Cleared
+		// unconditionally: it was staged for exactly this batch, and a batch it
+		// cannot ride with must not delete anything (rows are only ever retired
+		// by a transition that actually committed).
 		const pendingSupersede = this._pendingOutboxSupersede;
 		this._pendingOutboxSupersede = null;
 		if (
 			pendingSupersede &&
-			persistRequest &&
+			outbox &&
 			batchChannelId &&
 			pendingSupersede.channelIdHex === batchChannelId.toString('hex')
 		) {
-			persistRequest.supersede = {
+			outbox.supersede = {
 				messageTypes: pendingSupersede.messageTypes
 			};
 		}
-		// Set once a persist fails: nothing that persist authorized may go out.
-		let sendsBlocked = false;
 
 		// ── Quorum durability barrier (Recovery Protocol 5.8, Phase 6) ──
-		// Outside quorum mode `shouldHold` is a constant false and the whole
-		// batch dispatches synchronously exactly as before. Inside it, a batch
-		// carrying a barrier-class message whose frame is not yet quorum
+		// Outside quorum mode `_shouldHoldBatch` is a constant false and the
+		// whole batch dispatches synchronously exactly as before. Inside it, a
+		// batch carrying a barrier-class message whose frame is not yet quorum
 		// durable stops after its persist and the REMAINDER of the action list
 		// is held, so the peer sees nothing the guardians do not already hold.
 		const channelIdHex = batchChannelId?.toString('hex') ?? null;
@@ -9781,41 +9822,25 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return;
 		}
 
+		const ctx: IDispatchContext = {
+			peerPubkey,
+			channel,
+			actions,
+			outbox,
+			persisted: null,
+			channelIdHex,
+			startIndex: 0,
+			persistAlreadySeen: false,
+			sendsBlocked: false,
+			holdable: true,
+			progress
+		};
 		this.emitContained('transition:begin', channelIdHex);
 		try {
-			heldFrom = this._dispatchActions(
-				peerPubkey,
-				channel,
-				actions,
-				persistRequest,
-				() => sendsBlocked,
-				(blocked: boolean) => {
-					sendsBlocked = blocked;
-					if (blocked) {
-						progress.sendsWithheld = true;
-						// Recorded now rather than at the tail: a re-entrant
-						// listener later in this batch can already auto-sign.
-						if (channelIdHex) this.sendsWithheldOnConnection.add(channelIdHex);
-					}
-				},
-				0,
-				false,
-				(): boolean =>
-					this._shouldHoldBatch(
-						channelIdHex,
-						actions,
-						persistIndex,
-						persistRequest
-					),
-				progress
-			);
-			if (
-				heldFrom < 0 &&
-				!sendsBlocked &&
-				persistRequest &&
-				persistRequest.outboxIds.length
-			) {
-				this.emit('outbox:sent', persistRequest.outboxIds);
+			heldFrom = this._dispatchActions(ctx);
+			const sentIds = ctx.persisted?.outboxIds ?? [];
+			if (heldFrom < 0 && !ctx.sendsBlocked && sentIds.length) {
+				this.emit('outbox:sent', sentIds);
 			}
 		} finally {
 			this.emitContained('transition:end', channelIdHex);
@@ -9825,9 +9850,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			this._holdBatch(channelIdHex, peerPubkey, channel, {
 				actions,
 				from: heldFrom,
-				frameSequence: persistRequest?.frameSequence ?? null,
+				frameSequence: ctx.persisted?.frameSequence ?? null,
 				requiresDurability: this._carriesBarrierMessage(actions, heldFrom),
-				outboxIds: persistRequest ? [...persistRequest.outboxIds] : []
+				outboxIds: [...(ctx.persisted?.outboxIds ?? [])]
 			});
 		}
 		// A failed persist withheld this batch's sends. The messages are gone
@@ -9836,7 +9861,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// retries the persist. Surface that so the node can force the
 		// disconnect instead of deadlocking a live connection on a peer
 		// timeout we do not control.
-		if (sendsBlocked) {
+		if (ctx.sendsBlocked) {
 			progress.sendsWithheld = true;
 			this.emit('transition:blocked', peerPubkey, batchChannelId);
 		}
@@ -9848,7 +9873,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// stash is left intact so the batch that does commit releases them.
 		// Cheap when nothing is staged, and this is the one path every
 		// dispatch-driven rollback funnels through.
-		if (!sendsBlocked && heldFrom < 0) {
+		if (!ctx.sendsBlocked && heldFrom < 0) {
 			this.releaseDanglingV2Pledges(channel);
 		}
 	}
@@ -9866,24 +9891,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * transaction on the network before the peer saw the message authorizing
 	 * it.
 	 *
-	 * `startIndex` and `persistAlreadySeen` exist so a held suffix resumes
-	 * through this same code, keeping one implementation of every action's
-	 * meaning and preserving the one-persist-per-batch rule across the wait.
+	 * `ctx.startIndex` and `ctx.persistAlreadySeen` exist so a held suffix
+	 * resumes through this same code, keeping one implementation of every
+	 * action's meaning and preserving the one-persist-per-batch rule across
+	 * the wait.
 	 */
-	private _dispatchActions(
-		peerPubkey: string,
-		channel: Channel,
-		actions: ChannelAction[],
-		persistRequest: IChannelPersistRequest | null,
-		sendsBlocked: () => boolean,
-		setSendsBlocked: (blocked: boolean) => void,
-		startIndex = 0,
-		persistAlreadySeen = false,
-		shouldHold?: () => boolean,
-		progress?: IActionDispatchProgress
-	): number {
-		let persistSeen = persistAlreadySeen;
-		for (let index = startIndex; index < actions.length; index++) {
+	private _dispatchActions(ctx: IDispatchContext): number {
+		const { peerPubkey, channel, actions, progress } = ctx;
+		let persistSeen = ctx.persistAlreadySeen;
+		for (let index = ctx.startIndex; index < actions.length; index++) {
 			// How far the run got. A re-entrant handler can throw out of this
 			// loop, and the actions AFTER the thrower are then untouched: their
 			// committed edge-triggered effects are still owed, so the caller
@@ -9894,7 +9910,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				case ChannelActionType.SEND_MESSAGE:
 					// A message the failed persist authorized must not reach the
 					// peer: the state that justifies it is not on disk.
-					if (persistSeen && sendsBlocked()) {
+					if (persistSeen && ctx.sendsBlocked) {
 						if (progress) progress.sendsWithheld = true;
 						break;
 					}
@@ -10037,7 +10053,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					// Same guard and the same reason as BROADCAST_TX below: a
 					// funding transaction whose channel state never reached
 					// disk is a 2-of-2 no restored node can enumerate.
-					if (persistSeen && sendsBlocked()) {
+					if (persistSeen && ctx.sendsBlocked) {
 						break;
 					}
 					this.emit('funding:authorized', action.fundingTxid);
@@ -10048,7 +10064,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					// justifying state never hit disk is exactly the "network saw
 					// a tx we have no record of" crash the persist-first comments
 					// at the producers promise to prevent.
-					if (persistSeen && sendsBlocked()) {
+					if (persistSeen && ctx.sendsBlocked) {
 						break;
 					}
 					this.emit('broadcast:tx', action.tx);
@@ -10064,7 +10080,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					}
 					break;
 				case ChannelActionType.FORCE_CLOSE:
-					if (persistSeen && sendsBlocked()) {
+					if (persistSeen && ctx.sendsBlocked) {
 						break;
 					}
 					this.emit('force:close', action.channelId, action.commitmentTx);
@@ -10091,7 +10107,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					// received, which the peer rejects. Suppress instead; the
 					// reconnect that follows re-arms the reminder
 					// (markForReestablish).
-					if (persistSeen && sendsBlocked()) {
+					if (persistSeen && ctx.sendsBlocked) {
 						break;
 					}
 					this.emit(
@@ -10110,7 +10126,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					// marker withholds, ahead of a splice commitment_signed the
 					// peer never received. The reconnect re-arms the reminder
 					// (markForReestablish).
-					if (persistSeen && sendsBlocked()) {
+					if (persistSeen && ctx.sendsBlocked) {
 						break;
 					}
 					this.emit(
@@ -10140,43 +10156,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						break;
 					}
 					persistSeen = true;
-					this.emit('channel:persist', {
-						channel,
-						peerPubkey,
-						channelId:
-							channel.getChannelId() ?? channel.getTemporaryChannelId(),
-						request: persistRequest ?? undefined
-					} as IChannelPersistEvent);
-					// No listener (or no storage) leaves committed true, which is
-					// the pre-outbox behavior for a node that persists nothing.
-					if (persistRequest && !persistRequest.committed) {
-						channel.fforNoteStateWritten(false);
-						this.persistFailed.add(channel.getChannelId()!.toString('hex'));
-						setSendsBlocked(true);
+					if (!this._persistBatch(ctx)) {
 						break;
-					}
-					if (persistRequest) {
-						this.persistFailed.delete(channel.getChannelId()!.toString('hex'));
-					}
-					// The channel learns that its state is on disk: what it
-					// still owed to storage (an observed capability hold of a
-					// concurrent FFOR epoch) is no longer owed.
-					channel.fforNoteStateWritten(true);
-					// The FFOR state this write made durable, captured HERE: a
-					// nested dispatch may move the in-memory record before this
-					// batch's tail announces anything.
-					const durableId = channel.getChannelId();
-					if (durableId) {
-						this._fforDurableState.set(
-							durableId.toString('hex'),
-							channel.getFforEpoch()?.state ?? null
-						);
 					}
 					// The frame this transition landed in is only known now, so
 					// the barrier question is asked here and nowhere else. A
 					// failed persist takes precedence: there is nothing durable
 					// to wait for.
-					if (shouldHold?.()) {
+					if (ctx.holdable && this._shouldHoldBatch(ctx, index)) {
 						if (progress) progress.completedIndex = index;
 						return index + 1;
 					}
@@ -10214,6 +10201,60 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		return -1;
 	}
 
+	/**
+	 * Commit the batch's state through the injected persistence, which
+	 * answers in its return value rather than by editing what it was handed.
+	 *
+	 * Returns false when a write with an outbox did not commit: the caller
+	 * then withholds every send, broadcast and force close after it. Only an
+	 * explicit `committed: true` releases them, so an implementation that
+	 * answers nothing has written nothing.
+	 */
+	private _persistBatch(ctx: IDispatchContext): boolean {
+		const { channel, outbox } = ctx;
+		const result = this.persistence.persist({
+			channel,
+			peerPubkey: ctx.peerPubkey,
+			channelId: channel.getChannelId() ?? channel.getTemporaryChannelId(),
+			...(outbox ? { outbox } : {})
+		});
+		if (outbox) {
+			ctx.persisted = {
+				committed: result?.committed === true,
+				outboxIds: result?.outboxIds ?? [],
+				frameSequence: result?.frameSequence
+			};
+			if (!ctx.persisted.committed) {
+				channel.fforNoteStateWritten(false);
+				this.persistFailed.add(channel.getChannelId()!.toString('hex'));
+				ctx.sendsBlocked = true;
+				if (ctx.progress) ctx.progress.sendsWithheld = true;
+				// Recorded now rather than at the tail: a re-entrant listener
+				// later in this batch can already auto-sign.
+				if (ctx.channelIdHex) {
+					this.sendsWithheldOnConnection.add(ctx.channelIdHex);
+				}
+				return false;
+			}
+			this.persistFailed.delete(channel.getChannelId()!.toString('hex'));
+		}
+		// The channel learns that its state is on disk: what it still owed to
+		// storage (an observed capability hold of a concurrent FFOR epoch) is
+		// no longer owed.
+		channel.fforNoteStateWritten(true);
+		// The FFOR state this write made durable, captured HERE: a nested
+		// dispatch may move the in-memory record before this batch's tail
+		// announces anything.
+		const durableId = channel.getChannelId();
+		if (durableId) {
+			this._fforDurableState.set(
+				durableId.toString('hex'),
+				channel.getFforEpoch()?.state ?? null
+			);
+		}
+		return true;
+	}
+
 	// ─────────── Quorum durability barrier (Recovery 5.8, Phase 6) ───────────
 
 	/**
@@ -10226,16 +10267,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * message overtake a held one would reorder the channel's wire stream.
 	 */
 	private _shouldHoldBatch(
-		channelIdHex: string | null,
-		actions: ChannelAction[],
-		persistIndex: number,
-		persistRequest: IChannelPersistRequest | null
+		ctx: IDispatchContext,
+		persistIndex: number
 	): boolean {
 		const barrier = this.config.durabilityBarrier;
+		const { channelIdHex } = ctx;
 		if (!barrier || !barrier.enforcing || !channelIdHex) return false;
 		if (this.barrierQueues.has(channelIdHex)) return true;
-		if (!this._carriesBarrierMessage(actions, persistIndex + 1)) return false;
-		return !barrier.isReleased(persistRequest?.frameSequence ?? null);
+		if (!this._carriesBarrierMessage(ctx.actions, persistIndex + 1)) {
+			return false;
+		}
+		return !barrier.isReleased(ctx.persisted?.frameSequence ?? null);
 	}
 
 	/**
@@ -10619,16 +10661,18 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// already ran holding an open transition that never closes.
 		this.emitContained('transition:begin', channelIdHex);
 		try {
-			this._dispatchActions(
+			this._dispatchActions({
 				peerPubkey,
 				channel,
-				held.actions,
-				null,
-				() => true,
-				() => undefined,
-				held.from,
-				true
-			);
+				actions: held.actions,
+				outbox: null,
+				persisted: null,
+				channelIdHex,
+				startIndex: held.from,
+				persistAlreadySeen: true,
+				sendsBlocked: true,
+				holdable: false
+			});
 		} catch {
 			// One batch's internal effects failing must not strand the rest.
 		} finally {
@@ -10638,7 +10682,6 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	/** Run a released suffix through the ordinary dispatch path. */
 	private _dispatchHeld(queue: IBarrierQueue, held: IHeldBatch): void {
-		let blocked = false;
 		const channelIdHex = queue.channel.getChannelId()?.toString('hex') ?? null;
 		const progress: IActionDispatchProgress = {
 			...newDispatchProgress(),
@@ -10650,20 +10693,19 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// committing as a frame of its own.
 		this.emitContained('transition:begin', channelIdHex);
 		try {
-			this._dispatchActions(
-				queue.peerPubkey,
-				queue.channel,
-				held.actions,
-				null,
-				() => blocked,
-				(value: boolean) => {
-					blocked = value;
-				},
-				held.from,
-				true,
-				undefined,
+			this._dispatchActions({
+				peerPubkey: queue.peerPubkey,
+				channel: queue.channel,
+				actions: held.actions,
+				outbox: null,
+				persisted: null,
+				channelIdHex,
+				startIndex: held.from,
+				persistAlreadySeen: true,
+				sendsBlocked: false,
+				holdable: false,
 				progress
-			);
+			});
 		} catch (error) {
 			// The action at progress.index threw and everything after it is
 			// untouched. Those actions still owe their committed edge-triggered
@@ -10876,14 +10918,18 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const channelIdHex = channel.getChannelId()?.toString('hex') ?? null;
 		this.emitContained('transition:begin', channelIdHex);
 		try {
-			this._dispatchActions(
+			this._dispatchActions({
 				peerPubkey,
 				channel,
 				actions,
-				null,
-				() => false,
-				() => undefined
-			);
+				outbox: null,
+				persisted: null,
+				channelIdHex,
+				startIndex: 0,
+				persistAlreadySeen: false,
+				sendsBlocked: false,
+				holdable: false
+			});
 		} finally {
 			this.emitContained('transition:end', channelIdHex);
 		}

@@ -49,6 +49,7 @@ import { decodeErrorMessage } from '../../src/lightning/message/error';
 import { MessageType } from '../../src/lightning/message/types';
 import * as bip39 from 'bip39';
 import { writableState } from '../lightning/helpers/writable-state';
+import { COMMIT_ALL } from '../lightning/helpers/channel-persistence';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -3340,7 +3341,8 @@ describe('Recovery surface: automatic capsule restore (peer-storage auto-apply, 
 		localPerCommitmentSeed: fenceLspKeys.perCommitmentSeed,
 		localFundingPrivkey: fenceLspKeys.fundingPrivkey,
 		htlcBasepointSecret: fenceLspKeys.htlcBasepointSecret,
-		chainHash: REGTEST_CHAIN_HASH
+		chainHash: REGTEST_CHAIN_HASH,
+		persistence: COMMIT_ALL
 	});
 	fenceLsp.on('error', () => {});
 	const fenceOffers: Buffer[] = [];

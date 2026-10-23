@@ -22,6 +22,7 @@ import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivatio
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Channel } from '../../src/lightning/channel/channel';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -72,7 +73,8 @@ function makeConfig(
 		localPerCommitmentSeed: makeSeed(seedId + 100),
 		localFundingPrivkey: fundingPrivkey,
 		htlcBasepointSecret,
-		preferTaproot
+		preferTaproot,
+		persistence: COMMIT_ALL
 	};
 }
 

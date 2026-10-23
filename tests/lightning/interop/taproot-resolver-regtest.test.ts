@@ -29,6 +29,7 @@ import { createTaprootFundingScript } from '../../../src/lightning/script/fundin
 import { IChannelBasepoints } from '../../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../../src/lightning/crypto/ecdh';
 import { bitcoinRpc, mineBlocks, ensureBitcoindFunds } from './shared-helpers';
+import { COMMIT_ALL } from '../helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 const NETWORK = bitcoin.networks.regtest;
@@ -77,7 +78,8 @@ function configOf(seed: Buffer, preferTaproot: boolean): IChannelManagerConfig {
 		localPerCommitmentSeed: seedFor(1000 + seed[0]),
 		localFundingPrivkey: privAt(seed, 0),
 		htlcBasepointSecret: privAt(seed, 4),
-		preferTaproot
+		preferTaproot,
+		persistence: COMMIT_ALL
 	};
 }
 function connect(

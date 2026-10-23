@@ -1364,7 +1364,6 @@ property channel.ChannelManagerEvents.'channel:lease': (lease: { channelId: Buff
 property channel.ChannelManagerEvents.'channel:opened': (temporaryChannelId: Buffer) => void
 property channel.ChannelManagerEvents.'channel:opening': (channelId: Buffer, fundingTxid: Buffer) => void
 property channel.ChannelManagerEvents.'channel:pending-close': (channelId: Buffer, initiator: 'local' | 'remote') => void
-property channel.ChannelManagerEvents.'channel:persist': (event: channel.IChannelPersistEvent) => void
 property channel.ChannelManagerEvents.'channel:ready': (channelId: Buffer) => void
 property channel.ChannelManagerEvents.'channel:reestablished': (channelId: Buffer) => void
 property channel.ChannelManagerEvents.'channel:resolved': (channelId: Buffer) => void
@@ -1567,6 +1566,7 @@ property channel.IChannelManagerConfig.newChannelsRefused?: () => string | null
 property channel.IChannelManagerConfig.nodePrivateKey?: Buffer
 property channel.IChannelManagerConfig.onChannelIndexAllocated?: (channelIndex: number) => void
 property channel.IChannelManagerConfig.paymentBasepointSecret?: Buffer
+property channel.IChannelManagerConfig.persistence: channel.IChannelPersistence
 property channel.IChannelManagerConfig.preferAnchors?: boolean
 property channel.IChannelManagerConfig.preferTaproot?: boolean
 property channel.IChannelManagerConfig.quiescenceTimeoutMs?: number
@@ -1575,17 +1575,20 @@ property channel.IChannelManagerConfig.signerFactory?: keys.SignerFactory
 property channel.IChannelManagerConfig.unknownChannelReestablishHoldMs?: number
 property channel.IChannelManagerConfig.verifyRemoteFundingInput?: (input: { txid: Buffer; vout: number; scriptPubKey: Buffer; }) => Promise<'unspent' | 'spent-or-missing' | 'unknown'>
 property channel.IChannelManagerConfig.zeroReserve?: IZeroReserveConfig
-interface channel.IChannelPersistEvent
-property channel.IChannelPersistEvent.channel: channel.Channel
-property channel.IChannelPersistEvent.channelId: Buffer
-property channel.IChannelPersistEvent.peerPubkey: string
-property channel.IChannelPersistEvent.request?: channel.IChannelPersistRequest
+interface channel.IChannelPersistOutbox
+property channel.IChannelPersistOutbox.outbound: storage.IRecoveryOutboxMessage[]
+property channel.IChannelPersistOutbox.supersede?: { messageTypes: number[]; }
 interface channel.IChannelPersistRequest
-property channel.IChannelPersistRequest.committed: boolean
-property channel.IChannelPersistRequest.frameSequence?: bigint | null
-property channel.IChannelPersistRequest.outbound: storage.IRecoveryOutboxMessage[]
-property channel.IChannelPersistRequest.outboxIds: Array<number | null>
-property channel.IChannelPersistRequest.supersede?: { messageTypes: number[]; }
+property channel.IChannelPersistRequest.channel: channel.Channel
+property channel.IChannelPersistRequest.channelId: Buffer
+property channel.IChannelPersistRequest.outbox?: channel.IChannelPersistOutbox
+property channel.IChannelPersistRequest.peerPubkey: string
+interface channel.IChannelPersistResult
+property channel.IChannelPersistResult.committed: boolean
+property channel.IChannelPersistResult.frameSequence?: bigint | null
+property channel.IChannelPersistResult.outboxIds: Array<number | null>
+interface channel.IChannelPersistence
+method channel.IChannelPersistence.persist(request: channel.IChannelPersistRequest): channel.IChannelPersistResult
 interface channel.IChannelReadyAction
 property channel.IChannelReadyAction.channelId: Buffer
 property channel.IChannelReadyAction.type: channel.ChannelActionType.CHANNEL_READY

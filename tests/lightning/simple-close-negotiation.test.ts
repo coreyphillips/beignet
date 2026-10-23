@@ -37,6 +37,7 @@ import {
 	serializeChainMonitorState,
 	deserializeChainMonitorState
 } from '../../src/lightning/storage/serialization';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -88,7 +89,8 @@ function makeConfig(
 		localBasepoints: makeBasepoints(seed),
 		localPerCommitmentSeed: makeSeed(seedId + 100),
 		localFundingPrivkey: fundingPrivkey,
-		localFeatures: simpleClose ? simpleCloseFeatures() : FeatureFlags.empty()
+		localFeatures: simpleClose ? simpleCloseFeatures() : FeatureFlags.empty(),
+		persistence: COMMIT_ALL
 	};
 }
 

@@ -39,6 +39,7 @@ import { ChannelSigner } from '../../src/lightning/keys/signer';
 import { buildLocalCommitment } from '../../src/lightning/channel/commitment-builder';
 import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivation';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -148,7 +149,8 @@ describe('Issue #764: a splice on chain below its lock depth', function () {
 			const channelManager = new ChannelManager({
 				localBasepoints: makeBasepoints(makeSeed(1)),
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			channelManager.on('error', () => {});
 			watcher = new ChainWatcher({

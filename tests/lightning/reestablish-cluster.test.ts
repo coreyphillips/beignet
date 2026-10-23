@@ -42,6 +42,7 @@ import {
 	deserializeChannelState
 } from '../../src/lightning/storage/serialization';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 const sha256 = (b: Buffer): Buffer =>
 	crypto.createHash('sha256').update(b).digest();
@@ -65,7 +66,8 @@ function makeConfig(name: string): IChannelManagerConfig {
 		localFundingPrivkey: k(0),
 		htlcBasepointSecret: k(4),
 		nodePrivateKey: sha256(Buffer.from(`${name}-node`)),
-		preferAnchors: true
+		preferAnchors: true,
+		persistence: COMMIT_ALL
 	};
 }
 

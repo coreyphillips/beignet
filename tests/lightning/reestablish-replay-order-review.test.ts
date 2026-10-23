@@ -39,6 +39,7 @@ import {
 	serializeChannelState,
 	deserializeChannelState
 } from '../../src/lightning/storage/serialization';
+import { COMMIT_ALL, onPersist } from './helpers/channel-persistence';
 
 const sha256 = (b: Buffer): Buffer =>
 	crypto.createHash('sha256').update(b).digest();
@@ -63,7 +64,8 @@ function makeConfig(name: string, taproot = false): IChannelManagerConfig {
 		htlcBasepointSecret: k(4),
 		nodePrivateKey: sha256(Buffer.from(`${name}-node`)),
 		preferAnchors: true,
-		...(taproot ? { preferTaproot: true } : {})
+		...(taproot ? { preferTaproot: true } : {}),
+		persistence: COMMIT_ALL
 	};
 }
 
@@ -211,11 +213,11 @@ function makePair(
 		m.on('broadcast:tx', (tx: Buffer) =>
 			broadcasts[side].push(Buffer.from(tx))
 		);
-		m.on('channel:persist', (ev: { channel: Channel }) => {
+		onPersist(m, ({ channel }) => {
 			if (managers.get(pub) !== m) return;
 			try {
 				rows[side] = JSON.stringify(
-					serializeChannelState(ev.channel.getFullState())
+					serializeChannelState(channel.getFullState())
 				);
 			} catch {
 				// A row that cannot be written is not a restart point.

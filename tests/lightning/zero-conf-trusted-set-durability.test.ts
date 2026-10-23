@@ -42,6 +42,7 @@ import { MessageType } from '../../src/lightning/message/types';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IStorageBackend } from '../../src/lightning/storage/types';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -105,7 +106,8 @@ function zeroConfOpen(tag: string): Buffer {
 		localFundingPrivkey: derivePrivkey(seed, 0),
 		htlcBasepointSecret: derivePrivkey(seed, 4),
 		chainHash: REGTEST_CHAIN_HASH,
-		channelKeyDeriver: makePerChannelKeys
+		channelKeyDeriver: makePerChannelKeys,
+		persistence: COMMIT_ALL
 	});
 	opener.on('error', noop);
 	// The opener's own half of the trust: openChannel refuses a trusted open

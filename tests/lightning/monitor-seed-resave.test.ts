@@ -23,6 +23,7 @@ import { buildRemoteCommitment } from '../../src/lightning/channel/commitment-bu
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { setupNormalChannels } from './helpers/revoked-commitment-fixture';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -56,7 +57,8 @@ function makeManager(id: number): ChannelManager {
 	const cfg: IChannelManagerConfig = {
 		localBasepoints: makeBasepoints(makeSeed(id)),
 		localPerCommitmentSeed: makeSeed(100 + id),
-		localFundingPrivkey: makeSeed(200 + id)
+		localFundingPrivkey: makeSeed(200 + id),
+		persistence: COMMIT_ALL
 	};
 	const cm = new ChannelManager(cfg);
 	cm.on('error', () => {});

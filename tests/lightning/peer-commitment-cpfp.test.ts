@@ -38,6 +38,7 @@ import { buildTaprootAnchorOutput } from '../../src/lightning/script/commitment-
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 const ECPair = ECPairFactory(ecc);
@@ -108,7 +109,8 @@ function makeManager(): ChannelManager {
 			.update('p559-seed')
 			.digest(),
 		localFundingPrivkey: fundingPriv,
-		paymentBasepointSecret: paymentPriv
+		paymentBasepointSecret: paymentPriv,
+		persistence: COMMIT_ALL
 	} as any);
 	cm.on('error', () => {});
 	const changeScript = bitcoin.payments.p2wpkh({

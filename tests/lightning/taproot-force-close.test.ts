@@ -18,6 +18,7 @@ import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Channel } from '../../src/lightning/channel/channel';
 import { serializeChannelState } from '../../src/lightning/storage/serialization';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -68,7 +69,8 @@ function makeConfig(
 		localPerCommitmentSeed: makeSeed(seedId + 100),
 		localFundingPrivkey: fundingPrivkey,
 		htlcBasepointSecret,
-		preferTaproot
+		preferTaproot,
+		persistence: COMMIT_ALL
 	};
 }
 

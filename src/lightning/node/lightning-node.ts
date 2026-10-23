@@ -426,8 +426,9 @@ import {
 	assertEmptyTarget
 } from '../recovery';
 import type {
-	IChannelPersistEvent,
-	IChannelPersistRequest
+	IChannelPersistOutbox,
+	IChannelPersistRequest,
+	IChannelPersistResult
 } from '../channel/channel-actions';
 import { ChannelErrorCode } from '../channel/channel-actions';
 import { FeatureFlags, Feature } from '../features/flags';
@@ -2003,6 +2004,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.localFeatures = localFeatures;
 
 		this.channelManager = new ChannelManager({
+			persistence: {
+				persist: (request: IChannelPersistRequest): IChannelPersistResult =>
+					this.persistForChannelManager(request)
+			},
 			fforVoucherLookup:
 				this.storage && !this.storage.loadAllFforVouchers
 					? undefined
@@ -3978,15 +3983,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private persistChannelCommitted(channelId: Buffer): boolean {
 		if (!this.storage || !this.recovery) return true;
-		const request: IChannelPersistRequest = {
-			outbound: [],
-			// Answered by the commit itself. Anything that returns before it
-			// leaves this false, which is the fail-closed direction.
-			committed: false,
-			outboxIds: []
-		};
-		this.persistChannel(channelId, request);
-		return request.committed;
+		// An unresolvable channel never reaches the commit, and answers false,
+		// which is the fail-closed direction.
+		return this.persistChannel(channelId)?.committed === true;
 	}
 
 	/**
@@ -3997,33 +3996,73 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * it already resolved, because during a v2 open the id a channel answers
 	 * to and the id it will be keyed by are briefly different things.
 	 */
-	private persistChannel(
-		channelId: Buffer,
-		request?: IChannelPersistRequest
-	): void {
-		if (!this.storage || !this.recovery) return;
+	private persistChannel(channelId: Buffer): IChannelPersistResult | null {
+		if (!this.storage || !this.recovery) return null;
 		const channel = this.channelManager.getChannel(channelId);
-		if (!channel) return;
+		if (!channel) return null;
 		const peer = this.channelManager.getPeerForChannel(channelId);
-		if (!peer) return;
-		this.persistChannelState(channel, peer, channelId, request);
+		if (!peer) return null;
+		return this.persistChannelState(channel, peer, channelId);
 	}
 
+	/**
+	 * The ChannelManager's persistence: channel state, its key index, any
+	 * monitor delta this same action produced, and the wire bytes it
+	 * authorizes all commit in one transaction, and the manager releases the
+	 * sends only on the `committed` this returns.
+	 */
+	private persistForChannelManager(
+		request: IChannelPersistRequest
+	): IChannelPersistResult {
+		// The synchronous dispatch nests: an action earlier in this batch can
+		// have triggered a whole cascade that REMOVED this channel and deleted
+		// its row (a terminal abort handshake completing inside a send).
+		// Persisting now would resurrect a row nobody tracks. Report success
+		// so the batch finishes; any remaining sends address a negotiation the
+		// peer has already left, and its manager drops them against the
+		// missing channel.
+		if (
+			!this.channelManager.getChannel(request.channelId) &&
+			!(
+				this.channelManager as unknown as {
+					findChannelByChannelIdInTemp(id: Buffer): unknown;
+				}
+			).findChannelByChannelIdInTemp(request.channelId)
+		) {
+			return { committed: true, outboxIds: [] };
+		}
+		return this.persistChannelState(
+			request.channel,
+			request.peerPubkey,
+			request.channelId,
+			request.outbox
+		);
+	}
+
+	/**
+	 * Commit one channel's state. Only reaching recovery.commit answers
+	 * committed on a node with persistence; one with no storage at all
+	 * answers committed, having nothing to keep.
+	 */
 	private persistChannelState(
 		channel: Channel,
 		peer: string,
 		channelId: Buffer,
-		request?: IChannelPersistRequest
-	): void {
+		outbox?: IChannelPersistOutbox
+	): IChannelPersistResult {
+		const notCommitted: IChannelPersistResult = {
+			committed: false,
+			outboxIds: []
+		};
 		if (!this.storage) {
 			try {
 				this.captureInMemoryFforCustody(channelId.toString('hex'));
 			} catch {
-				if (request) request.committed = false;
+				return notCommitted;
 			}
-			return;
+			return { committed: true, outboxIds: [] };
 		}
-		if (!this.recovery) return;
+		if (!this.recovery) return { committed: true, outboxIds: [] };
 		const channelIdHex = channelId.toString('hex');
 		const keyIndex = channel.channelKeyIndex;
 		// Channel state persisted without its key index restores a channel that
@@ -4060,18 +4099,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					}
 				}, 'prepare voucher custody')
 			) {
-				if (request) request.committed = false;
-				return;
+				return notCommitted;
 			}
 		} else if (isFforConcurrentVersion(epoch?.concurrentVersion)) {
-			if (request) request.committed = false;
 			this.emit('node:error', {
 				code: 'PERSISTENCE_ERROR',
 				channelId,
 				message: 'Storage cannot preserve concurrent voucher custody',
 				timestamp: Date.now()
 			});
-			return;
+			return notCommitted;
 		}
 		let settledSlots: { record: IFforEpochRecord; k: number }[] = [];
 		if (
@@ -4079,8 +4116,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				settledSlots = this.prepareFforSettlementMutations(channel, mutations);
 			}, 'prepare delegated settlement receipt')
 		) {
-			if (request) request.committed = false;
-			return;
+			return notCommitted;
 		}
 		if (keyIndex != null) {
 			mutations.push({
@@ -4096,17 +4132,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				this.dirtyMonitors.add(channelIdHex);
 				this.monitorsAwaitingChannel.add(channelIdHex);
 			}
-			if (request) request.committed = false;
-			return;
+			return notCommitted;
 		}
 		// A peer-proven outbox supersede (its revoke_and_ack acknowledged the
 		// rows) deletes IN this same transaction: on rollback the rows survive
 		// alongside the pre-revoke state that still needs them.
-		if (request?.supersede) {
+		if (outbox?.supersede) {
 			mutations.push({
 				type: 'outbox_supersede',
 				channelId: channelIdHex,
-				messageTypes: request.supersede.messageTypes
+				messageTypes: outbox.supersede.messageTypes
 			});
 		}
 		// Whatever the caller staged for this transition (preimage before a
@@ -4129,17 +4164,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				: this.recovery.commit({
 						criticality: RecoveryCriticality.SafetyCritical,
 						mutations,
-						outboundMessages: request?.outbound ?? [],
+						outboundMessages: outbox?.outbound ?? [],
 						reportedByCaller: true
 				  });
 
-		if (request) {
-			request.committed = result.committed;
-			request.outboxIds = result.released.map((r) => r.id);
-			// The frame this transition landed in, which is what a Phase 6
-			// quorum barrier waits on before the batch's messages may go out.
-			request.frameSequence = result.frameSequence;
-		}
 		if (!result.committed) {
 			// Everything rolled back together: re-arm the monitor delta and put
 			// the staged mutations back rather than dropping writes the caller
@@ -4187,6 +4215,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 			this._failedTerminalPersists.delete(channelIdHex);
 		}
+		return {
+			committed: result.committed,
+			outboxIds: result.released.map((r) => r.id),
+			// The frame this transition landed in, which is what a Phase 6
+			// quorum barrier waits on before the batch's messages may go out.
+			frameSequence: result.frameSequence
+		};
 	}
 
 	/**
@@ -5322,45 +5357,6 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				});
 			}
 		);
-
-		// Persist-before-send: channel state, its key index, any monitor delta
-		// this same action produced, and the wire bytes it authorizes all commit
-		// in one transaction; the sends are released only if it commits.
-		this.channelManager.on('channel:persist', (event: IChannelPersistEvent) => {
-			// The synchronous dispatch nests: an action earlier in this batch
-			// can have triggered a whole cascade that REMOVED this channel
-			// and deleted its row (a terminal abort handshake completing
-			// inside a send). Persisting now would resurrect a row nobody
-			// tracks. Report success so the batch finishes; any remaining
-			// sends address a negotiation the peer has already left, and its
-			// manager drops them against the missing channel.
-			if (
-				event.channelId &&
-				!this.channelManager.getChannel(event.channelId) &&
-				!(
-					this.channelManager as unknown as {
-						findChannelByChannelIdInTemp(id: Buffer): unknown;
-					}
-				).findChannelByChannelIdInTemp(event.channelId)
-			) {
-				return;
-			}
-			// A node that HAS persistence answers for itself. The request
-			// arrives committed:true, which is the right default only for a
-			// node that persists nothing at all; leaving it true here would
-			// let a listener that returned early, or an id that resolved to
-			// nothing, read as a successful commit and release the batch's
-			// sends. Only reaching recovery.commit may say committed.
-			if (event.request && this.storage && this.recovery) {
-				event.request.committed = false;
-			}
-			this.persistChannelState(
-				event.channel,
-				event.peerPubkey,
-				event.channelId,
-				event.request
-			);
-		});
 
 		// The manager abandoned an unfunded open outright (a v2 RBF
 		// renegotiation dropped on disconnect): its row must go with it, or

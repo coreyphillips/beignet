@@ -20,6 +20,7 @@ import {
 } from '../../src/lightning/chain/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 const ECPair = ECPairFactory(ecc);
@@ -464,7 +465,8 @@ describe('anchor fee bumping', () => {
 				localFundingPrivkey: crypto
 					.createHash('sha256')
 					.update('wire-funding')
-					.digest()
+					.digest(),
+				persistence: COMMIT_ALL
 			} as any);
 			cm.on('error', () => {}); // swallow fallback warnings
 			cm.setFundingProvider(provider);

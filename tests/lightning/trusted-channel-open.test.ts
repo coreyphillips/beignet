@@ -40,6 +40,7 @@ import { SpliceState } from '../../src/lightning/channel/splice';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import * as bitcoin from 'bitcoinjs-lib';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -82,7 +83,8 @@ function makeConfig(seedId: number): IChannelManagerConfig {
 		localConfig: { ...DEFAULT_CHANNEL_CONFIG },
 		localBasepoints: makeBasepoints(seed),
 		localPerCommitmentSeed: makeSeed(seedId + 100),
-		localFundingPrivkey: fundingPrivkey
+		localFundingPrivkey: fundingPrivkey,
+		persistence: COMMIT_ALL
 	};
 }
 

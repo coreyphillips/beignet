@@ -446,21 +446,12 @@ export const SUPERSEDES_OWN_KIND_MESSAGE_TYPES: readonly number[] = [
 ];
 
 /**
- * The payload of the `channel:persist` event.
- *
- * ChannelManager fills in `outbound` (the retransmittable messages this
- * batch's PERSIST_STATE authorizes) and the listener that owns storage
- * answers with `committed` plus the ids of the rows it wrote. A listener
- * reporting `committed: false` withholds those sends: the state that
- * justifies them is not on disk.
+ * The retransmittable messages a batch's PERSIST_STATE authorizes, to be
+ * committed in the same transaction as the channel state.
  */
-export interface IChannelPersistRequest {
+export interface IChannelPersistOutbox {
 	/** Messages to commit alongside the channel state, in send order. */
 	outbound: IRecoveryOutboxMessage[];
-	/** Set false by the listener when the transaction rolled back. */
-	committed: boolean;
-	/** Row ids written for `outbound`, same order; empty without an outbox. */
-	outboxIds: Array<number | null>;
 	/**
 	 * Outbox rows of these message types are proven held by the peer (its
 	 * revoke_and_ack acknowledged them) and must be deleted IN the same
@@ -469,39 +460,67 @@ export interface IChannelPersistRequest {
 	 * pre-revoke state whose retransmission bytes are already gone.
 	 */
 	supersede?: { messageTypes: number[] };
-	/**
-	 * The recovery journal frame this transition landed in, or null when the
-	 * journal is off. Set by the listener alongside `committed`. This is the
-	 * sequence a Phase 6 quorum barrier waits on before the batch's messages
-	 * are allowed onto the wire (docs/RECOVERY-PROTOCOL.md 5.8).
-	 */
-	frameSequence?: bigint | null;
 }
 
 /**
- * The `channel:persist` event itself.
+ * One write ChannelManager asks its {@link IChannelPersistence} to make.
  *
  * The channel and its peer are passed BY REFERENCE rather than by an id the
- * listener has to resolve again, because the id a channel answers to is not
- * stable across its own opening. A v2 channel derives its permanent
+ * implementation has to resolve again, because the id a channel answers to is
+ * not stable across its own opening. A v2 channel derives its permanent
  * channel_id during accept_channel2 but stays registered under its TEMPORARY
- * id until the open leaves AWAITING_TX_SIGNATURES, so the first v2
- * commitment_signed used to emit a permanent id that resolved to nothing:
- * the listener returned without committing, the batch reported committed
- * anyway, and the message left with no state on disk behind it.
+ * id until the open leaves AWAITING_TX_SIGNATURES, so a lookup by the
+ * permanent id finds nothing.
  *
  * `channelId` is what the row is KEYED by (permanent once derived), which is
  * a separate question from which map currently holds the object.
  */
-export interface IChannelPersistEvent {
+export interface IChannelPersistRequest {
 	/** The channel to commit. Already resolved; never looked up again. */
 	channel: Channel;
 	/** The peer this channel belongs to, for the channel_state mutation. */
 	peerPubkey: string;
 	/** The id to key the persisted row by: permanent when one exists. */
 	channelId: Buffer;
-	/** Present when the batch has messages whose release depends on it. */
-	request?: IChannelPersistRequest;
+	/**
+	 * Present when sends wait on this write: a dispatched batch whose channel
+	 * has a permanent id. Absent for a pre-funding batch and for the manager's
+	 * own bookkeeping writes, whose answer withholds nothing.
+	 */
+	outbox?: IChannelPersistOutbox;
+}
+
+/** What an {@link IChannelPersistence} answers for one write. */
+export interface IChannelPersistResult {
+	/**
+	 * The write is durable. Anything else withholds every send, broadcast and
+	 * force close the batch puts after its PERSIST_STATE: the state that
+	 * justifies them is not on disk.
+	 */
+	committed: boolean;
+	/** Row ids written for `outbox.outbound`, same order; empty without one. */
+	outboxIds: Array<number | null>;
+	/**
+	 * The recovery journal frame this transition landed in, or null when the
+	 * journal is off. This is the sequence a Phase 6 quorum barrier waits on
+	 * before the batch's messages are allowed onto the wire
+	 * (docs/RECOVERY-PROTOCOL.md 5.8).
+	 */
+	frameSequence?: bigint | null;
+}
+
+/**
+ * Where ChannelManager commits channel state before anything that state
+ * authorizes leaves the node (persist-before-send, Recovery Protocol 5.1).
+ *
+ * Required: a manager with nowhere to write would sign and send commitments
+ * that no restart can remember. A consumer that genuinely keeps nothing
+ * across restarts says so by answering `committed: true` itself. `persist`
+ * runs synchronously inside the dispatch, so the answer is in hand before
+ * the first send that follows it.
+ */
+export interface IChannelPersistence {
+	persist(request: IChannelPersistRequest): IChannelPersistResult;
 }
 
 /**

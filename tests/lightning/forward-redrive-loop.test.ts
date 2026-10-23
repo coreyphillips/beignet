@@ -57,6 +57,7 @@ import {
 	realInitialCommitmentSig,
 	realCommitmentSigs
 } from './helpers/real-signing';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 const FUNDING_SATOSHIS = 1_000_000n;
 const PUSH_MSAT = 0n;
@@ -380,7 +381,8 @@ describe('Stuck forward re-drive loop', function () {
 					.createHash('sha256')
 					.update(seed)
 					.update(Buffer.from([4]))
-					.digest()
+					.digest(),
+				persistence: COMMIT_ALL
 			};
 		}
 

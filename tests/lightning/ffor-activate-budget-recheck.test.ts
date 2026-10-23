@@ -46,6 +46,7 @@ import {
 	encodeFforInitUnsigned,
 	signFforMessage
 } from '../../src/lightning/ffor/messages';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // ─────────────── Harness ───────────────
 
@@ -79,7 +80,8 @@ function makeConfig(
 		htlcBasepointSecret: sha(seed, Buffer.from([4])),
 		nodePrivateKey: sha(seed, 'node-key'),
 		// Section 5: anchor commitments.
-		preferAnchors: true
+		preferAnchors: true,
+		persistence: COMMIT_ALL
 	};
 }
 

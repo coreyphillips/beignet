@@ -55,6 +55,7 @@ import {
 	decodeTxAddOutputMessage
 } from '../../src/lightning/message/interactive-tx';
 import { decodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // ─────────────── Harness ───────────────
 
@@ -324,7 +325,8 @@ function managerHolding(
 		localPerCommitmentSeed: seed,
 		localFundingPrivkey: fundingPriv,
 		htlcBasepointSecret: crypto.randomBytes(32),
-		...(barrier ? { durabilityBarrier: barrier } : {})
+		...(barrier ? { durabilityBarrier: barrier } : {}),
+		persistence: COMMIT_ALL
 	});
 	mgr.on('error', () => {});
 	const tempHex = acceptor.getTemporaryChannelId().toString('hex');
@@ -520,7 +522,8 @@ describe('ChannelManager.createDualFundedChannel dispatch failure (issue #612)',
 			localBasepoints: makeBasepoints(getPublicKey(fundingPriv), seed),
 			localPerCommitmentSeed: seed,
 			localFundingPrivkey: fundingPriv,
-			htlcBasepointSecret: crypto.randomBytes(32)
+			htlcBasepointSecret: crypto.randomBytes(32),
+			persistence: COMMIT_ALL
 		});
 		const peer = getPublicKey(crypto.randomBytes(32)).toString('hex');
 		mgr.on('message:outbound', () => {
@@ -721,7 +724,8 @@ describe('ChannelManager.abortDualFundedOpen (issue #612)', () => {
 			localBasepoints: makeBasepoints(getPublicKey(fundingPriv), seed),
 			localPerCommitmentSeed: seed,
 			localFundingPrivkey: fundingPriv,
-			htlcBasepointSecret: crypto.randomBytes(32)
+			htlcBasepointSecret: crypto.randomBytes(32),
+			persistence: COMMIT_ALL
 		});
 		mgr.on('error', () => {});
 		const peer = getPublicKey(crypto.randomBytes(32)).toString('hex');
@@ -752,7 +756,8 @@ describe('ChannelManager.abortDualFundedOpen (issue #612)', () => {
 			localBasepoints: makeBasepoints(getPublicKey(fundingPriv), seed),
 			localPerCommitmentSeed: seed,
 			localFundingPrivkey: fundingPriv,
-			htlcBasepointSecret: crypto.randomBytes(32)
+			htlcBasepointSecret: crypto.randomBytes(32),
+			persistence: COMMIT_ALL
 		});
 		mgr.on('error', () => {});
 		const peer = getPublicKey(crypto.randomBytes(32)).toString('hex');

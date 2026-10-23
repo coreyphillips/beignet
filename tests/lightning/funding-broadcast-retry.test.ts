@@ -49,6 +49,7 @@ import {
 	deriveRecoveryRoot,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
+import { onPersist } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -1520,20 +1521,11 @@ describe('Funding authorization survives a restart', function () {
 		// channel: that persist is the frame the authorization rides, and it is
 		// the whole difference between asking again and inferring.
 		const order: string[] = [];
-		(
-			alice2 as unknown as {
-				channelManager: {
-					on(e: string, l: (...a: unknown[]) => void): void;
-				};
-			}
-		).channelManager.on('channel:persist', () => order.push('persist'));
-		(
-			alice2 as unknown as {
-				channelManager: {
-					on(e: string, l: (...a: unknown[]) => void): void;
-				};
-			}
-		).channelManager.on('funding:authorized', () => order.push('authorized'));
+		const manager2 = alice2.getChannelManager();
+		onPersist(manager2, () => {
+			order.push('persist');
+		});
+		manager2.on('funding:authorized', () => order.push('authorized'));
 
 		await tick(120);
 

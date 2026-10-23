@@ -32,6 +32,7 @@ import { createTaprootFundingScript } from '../../src/lightning/script/funding-t
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -96,7 +97,8 @@ describe('FS-2: taproot funding output watch', () => {
 		channelManager = new ChannelManager({
 			localBasepoints: makeBasepoints(seed),
 			localPerCommitmentSeed: crypto.randomBytes(32),
-			localFundingPrivkey: crypto.randomBytes(32)
+			localFundingPrivkey: crypto.randomBytes(32),
+			persistence: COMMIT_ALL
 		});
 		channelManager.on('error', () => {});
 		watcher = new ChainWatcher({ backend, channelManager });

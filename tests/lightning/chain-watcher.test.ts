@@ -26,6 +26,7 @@ import {
 } from '../../src/lightning/chain/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -253,7 +254,8 @@ describe('Phase 4: Chain Watcher', () => {
 			channelManager = new ChannelManager({
 				localBasepoints: makeBasepoints(seed),
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			// Absorb ChannelManager errors
 			channelManager.on('error', () => {});
@@ -315,7 +317,8 @@ describe('Phase 4: Chain Watcher', () => {
 			channelManager = new ChannelManager({
 				localBasepoints: makeBasepoints(seed),
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			channelManager.on('error', () => {});
 
@@ -661,7 +664,8 @@ describe('Phase 4: Chain Watcher', () => {
 			const channelManager = new ChannelManager({
 				localBasepoints: makeBasepoints(crypto.randomBytes(32)),
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			channelManager.on('error', () => {});
 			const watcher = new ChainWatcher({
@@ -742,7 +746,8 @@ describe('Phase 4: Chain Watcher', () => {
 			const channelManager = new ChannelManager({
 				localBasepoints: makeBasepoints(crypto.randomBytes(32)),
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			channelManager.on('error', () => {});
 			const watcher = new ChainWatcher({
@@ -851,7 +856,8 @@ describe('Phase 4: Chain Watcher', () => {
 			const channelManager = new ChannelManager({
 				localBasepoints: makeBasepoints(crypto.randomBytes(32)),
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			channelManager.on('error', () => {});
 			const watcher = new ChainWatcher({
@@ -940,7 +946,8 @@ describe('Phase 4: Chain Watcher', () => {
 			channelManager = new ChannelManager({
 				localBasepoints: makeBasepoints(seed),
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			channelManager.on('error', () => {});
 			absentCalls = [];
@@ -1028,7 +1035,8 @@ describe('Phase 4: Chain Watcher', () => {
 			channelManager = new ChannelManager({
 				localBasepoints: makeBasepoints(seed),
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			channelManager.on('error', () => {});
 			reported = [];
@@ -1264,7 +1272,8 @@ describe('Phase 4: Chain Watcher', () => {
 			channelManager = new ChannelManager({
 				localBasepoints: makeBasepoints(seed),
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			channelManager.on('error', () => {});
 			absentCalls = [];
@@ -2165,7 +2174,8 @@ describe('Phase 4: Chain Watcher', () => {
 			channelManager = new ChannelManager({
 				localBasepoints: makeBasepoints(seed),
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			channelManager.on('error', () => {});
 
@@ -2328,7 +2338,8 @@ describe('Phase 4: Chain Watcher', () => {
 			channelManager = new ChannelManager({
 				localBasepoints: makeBasepoints(seed),
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			channelManager.on('error', () => {});
 
@@ -2379,7 +2390,8 @@ describe('Phase 4: Chain Watcher', () => {
 			channelManager = new ChannelManager({
 				localBasepoints: makeBasepoints(seed),
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			channelManager.on('error', () => {});
 
@@ -3228,7 +3240,8 @@ describe('Phase 4: Chain Watcher', () => {
 			channelManager = new ChannelManager({
 				localBasepoints: makeBasepoints(seed),
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			channelManager.on('error', () => {});
 			closes = [];

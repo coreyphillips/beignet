@@ -18,6 +18,7 @@ import {
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -65,7 +66,8 @@ function makeConfig(seedId: number): IChannelManagerConfig {
 		localBasepoints: makeBasepoints(seed),
 		localPerCommitmentSeed: makeSeed(seedId + 100),
 		localFundingPrivkey: fundingPrivkey,
-		htlcBasepointSecret
+		htlcBasepointSecret,
+		persistence: COMMIT_ALL
 	};
 }
 

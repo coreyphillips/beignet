@@ -43,6 +43,7 @@ import {
 	openReadyChannel
 } from './helpers/loopback-nodes';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 const walletPolicy = {
 	acceptWaiver: true,
@@ -191,7 +192,8 @@ describe('One-way zero reserve negotiation', () => {
 							localFundingPrivkey: makeNodeConfig('zero-reserve-policy', 1)
 								.fundingPrivkey!,
 							localFeatures,
-							zeroReserve: { role, advertise, waiveClientReserve }
+							zeroReserve: { role, advertise, waiveClientReserve },
+							persistence: COMMIT_ALL
 						});
 						manager['peerManager'] = {
 							getPeer: () => ({

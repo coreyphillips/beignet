@@ -35,6 +35,7 @@ import { createOpenerState } from '../../src/lightning/channel/channel-state';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // ─── Helpers ───
 
@@ -435,7 +436,8 @@ describe('Audit MEDIUM-2: _seedMonitorPreimages processes broadcast actions', fu
 		const cfg: IChannelManagerConfig = {
 			localBasepoints: makeBasepoints(makeSeed(31)),
 			localPerCommitmentSeed: makeSeed(131),
-			localFundingPrivkey: makeSeed(231)
+			localFundingPrivkey: makeSeed(231),
+			persistence: COMMIT_ALL
 		};
 		const cm = new ChannelManager(cfg);
 		cm.on('error', () => {});
@@ -482,7 +484,8 @@ describe('Audit MEDIUM-3: reCpfpStuckCommitments re-broadcasts the parent', func
 		const cfg: IChannelManagerConfig = {
 			localBasepoints: makeBasepoints(makeSeed(41)),
 			localPerCommitmentSeed: makeSeed(141),
-			localFundingPrivkey: makeSeed(241)
+			localFundingPrivkey: makeSeed(241),
+			persistence: COMMIT_ALL
 		};
 		const cm = new ChannelManager(cfg);
 		cm.on('error', () => {});
@@ -537,7 +540,8 @@ describe('Audit MEDIUM-4: failed CPFP attempt is retried at unchanged feerate', 
 		const cfg: IChannelManagerConfig = {
 			localBasepoints: makeBasepoints(makeSeed(51)),
 			localPerCommitmentSeed: makeSeed(151),
-			localFundingPrivkey: makeSeed(251)
+			localFundingPrivkey: makeSeed(251),
+			persistence: COMMIT_ALL
 		};
 		const cm = new ChannelManager(cfg);
 		cm.on('error', () => {});

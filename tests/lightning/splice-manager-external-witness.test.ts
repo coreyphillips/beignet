@@ -39,6 +39,7 @@ import {
 	fundingTransactionProblem,
 	spliceFeerateCeiling
 } from '../../src/lightning/direct-funding/receiver/verify';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 const FUNDING_SATOSHIS = 1_000_000n;
 const SPLICE_AMOUNT = 300_000n;
@@ -85,7 +86,8 @@ function makeConfig(seedId: number): IChannelManagerConfig {
 			.createHash('sha256')
 			.update(seed)
 			.update(Buffer.from([4]))
-			.digest()
+			.digest(),
+		persistence: COMMIT_ALL
 	};
 }
 

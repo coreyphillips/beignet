@@ -16,6 +16,7 @@ import { IDualFundingParams } from '../../src/lightning/channel/dual-funding';
 import { ILeaseRates } from '../../src/lightning/gossip/types';
 import { computeLeaseFeeSat } from '../../src/lightning/channel/liquidity-ads';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 /** channel_type advertising option_taproot (simple taproot channels). */
 function taprootChannelType(): Buffer {
@@ -102,7 +103,8 @@ describe('Liquidity ads negotiation (M3.2)', function () {
 			localBasepoints: makeBasepoints(),
 			localPerCommitmentSeed: crypto.randomBytes(32),
 			localFundingPrivkey: validPriv(),
-			nodePrivateKey: buyerPriv
+			nodePrivateKey: buyerPriv,
+			persistence: COMMIT_ALL
 		});
 		buyer.on('error', () => {});
 		const seller = new ChannelManager({
@@ -110,7 +112,8 @@ describe('Liquidity ads negotiation (M3.2)', function () {
 			localPerCommitmentSeed: crypto.randomBytes(32),
 			localFundingPrivkey: validPriv(),
 			nodePrivateKey: sellerPriv,
-			...(sellerSells ? { leaseRates: RATES } : {})
+			...(sellerSells ? { leaseRates: RATES } : {}),
+			persistence: COMMIT_ALL
 		});
 		seller.on('error', () => {});
 

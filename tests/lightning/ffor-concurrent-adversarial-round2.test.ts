@@ -68,6 +68,7 @@ import {
 	vouchers,
 	why
 } from './helpers/ffor-concurrent-pair';
+import { onPersist } from './helpers/channel-persistence';
 
 const BUDGET = AMOUNTS.reduce((a, b) => a + b, 0n);
 const S_START = (FUNDING_SATOSHIS - 200_000n) * 1000n;
@@ -659,7 +660,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 						let crashed = false;
 						let armed = true;
 						let row = snapshot(pair, 'R');
-						pair.rManager.on('channel:persist', () => {
+						onPersist(pair.rManager, () => {
 							if (crashed || !armed) return;
 							if (writes === k && when === 'before') {
 								crashed = true;
@@ -860,7 +861,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 				settleSlot(pair, 2);
 				const backup = snapshot(pair, 'S');
 				let row: string | null = null;
-				pair.rManager.on('channel:persist', () => {
+				onPersist(pair.rManager, () => {
 					if (
 						row === null &&
 						record(pair.rChannel).state === FforState.DRAINING
@@ -966,15 +967,13 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 			const chain = heldTypes(pair.rChannel);
 			let failed = 0;
 			let blocked = 0;
-			pair.rManager.on(
-				'channel:persist',
-				(ev: { request?: { committed: boolean } }) => {
-					if (failed === 0 && ev.request) {
-						ev.request.committed = false;
-						failed++;
-					}
+			onPersist(pair.rManager, (request, result) => {
+				if (failed === 0 && request.outbox) {
+					failed++;
+					return { ...result, committed: false };
 				}
-			);
+				return result;
+			});
 			pair.rManager.on('transition:blocked', () => blocked++);
 			pair.link.release('S');
 			expect(failed).to.equal(1);
@@ -1096,7 +1095,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 				const signed = signedCommitment(pair.rChannel);
 				const close = planClose(pair, 'R');
 				let saved: string | null = null;
-				pair.rManager.on('channel:persist', () => {
+				onPersist(pair.rManager, () => {
 					if (record(pair.rChannel).knownPreimages[0]) {
 						saved = snapshot(pair, 'R');
 					}
@@ -1169,7 +1168,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 				pair.rManager.on('preimage:learned', (hash: Buffer) =>
 					hashes.push(hash.toString('hex'))
 				);
-				pair.rManager.on('channel:persist', () => {
+				onPersist(pair.rManager, () => {
 					saved = snapshot(pair, 'R');
 				});
 				const learned = pair.rManager.fforAddPreimage(pair.channelId, t1);
@@ -1270,7 +1269,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 					const pair = activePair(concurrent);
 					settleSlot(pair, 2);
 					let row: string | null = null;
-					pair.rManager.on('channel:persist', () => {
+					onPersist(pair.rManager, () => {
 						if (
 							row === null &&
 							record(pair.rChannel).state === FforState.DRAINING
@@ -1410,7 +1409,9 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 					]);
 					const failed = stateOfVoucherOne(pair);
 					let writes = 0;
-					pair.rManager.on('channel:persist', () => writes++);
+					onPersist(pair.rManager, () => {
+						writes++;
+					});
 					pair.rManager.handleMessage(
 						pair.sPub,
 						MessageType.FF_CLOSE_ACK,
@@ -1824,13 +1825,10 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 		/** What storage holds: the row of the last write that landed. */
 		function disk(pair: IPair, side: Side): { row: () => string } {
 			let row = snapshot(pair, side);
-			manager(pair, side).on(
-				'channel:persist',
-				(ev: { request?: { committed: boolean } }) => {
-					if (ev.request && ev.request.committed === false) return;
-					row = snapshot(pair, side);
-				}
-			);
+			onPersist(manager(pair, side), (request, result) => {
+				if (request.outbox && !result.committed) return;
+				row = snapshot(pair, side);
+			});
 			return { row: (): string => row };
 		}
 
@@ -1849,15 +1847,13 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 			pair.link.disconnect();
 			advertise(pair, 'R', false);
 			let failed = 0;
-			pair.sManager.on(
-				'channel:persist',
-				(ev: { request?: { committed: boolean } }) => {
-					if (failed === 0 && ev.request) {
-						ev.request.committed = false;
-						failed++;
-					}
+			onPersist(pair.sManager, (request, result) => {
+				if (failed === 0 && request.outbox) {
+					failed++;
+					return { ...result, committed: false };
 				}
-			);
+				return result;
+			});
 			const stored = disk(pair, 'S');
 			pair.link.reconnect();
 			expect(failed).to.equal(1);
@@ -1881,7 +1877,9 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 			expect(stored.row(), 'on disk now').to.include('"capabilityHold":true');
 			// Once it has landed it is not asked for a third time.
 			let writes = 0;
-			pair.sManager.on('channel:persist', () => writes++);
+			onPersist(pair.sManager, () => {
+				writes++;
+			});
 			pair.link.disconnect();
 			pair.link.reconnect();
 			expect(writes).to.equal(0);
@@ -1902,15 +1900,13 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 			pair.link.disconnect();
 			advertise(pair, 'R', true);
 			let failed = 0;
-			pair.sManager.on(
-				'channel:persist',
-				(ev: { request?: { committed: boolean } }) => {
-					if (failed === 0 && ev.request) {
-						ev.request.committed = false;
-						failed++;
-					}
+			onPersist(pair.sManager, (request, result) => {
+				if (failed === 0 && request.outbox) {
+					failed++;
+					return { ...result, committed: false };
 				}
-			);
+				return result;
+			});
 			const stored = disk(pair, 'S');
 			pair.link.reconnect();
 			expect(failed).to.equal(1);
@@ -2016,9 +2012,9 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 		} {
 			const rows: string[] = [];
 			const watch = (side: Side): void => {
-				manager(pair, side).on('channel:persist', () =>
-					rows.push(snapshot(pair, side))
-				);
+				onPersist(manager(pair, side), () => {
+					rows.push(snapshot(pair, side));
+				});
 			};
 			watch('S');
 			watch('R');
@@ -2050,7 +2046,7 @@ describe('FFOR concurrent receive: adversarial recovery review of PR #1301, roun
 			const backup = snapshot(pair, 'S');
 			settleSlot(pair, 2);
 			let drainingRow: string | null = null;
-			pair.rManager.on('channel:persist', () => {
+			onPersist(pair.rManager, () => {
 				if (
 					drainingRow === null &&
 					record(pair.rChannel).state === FforState.DRAINING

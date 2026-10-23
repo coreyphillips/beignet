@@ -31,6 +31,7 @@ import { IChannelBasepoints } from '../../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../../src/lightning/crypto/ecdh';
 import { bitcoinRpc, mineBlocks, ensureBitcoindFunds } from './shared-helpers';
 import { writableState } from '../helpers/writable-state';
+import { COMMIT_ALL } from '../helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 const NETWORK = bitcoin.networks.regtest;
@@ -93,7 +94,8 @@ function makeConfig(
 		localPerCommitmentSeed: makeSeed(seedId + 100),
 		localFundingPrivkey: fundingPrivkey,
 		htlcBasepointSecret,
-		preferTaproot
+		preferTaproot,
+		persistence: COMMIT_ALL
 	};
 }
 

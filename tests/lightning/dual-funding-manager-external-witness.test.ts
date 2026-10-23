@@ -52,6 +52,8 @@ import {
 	deserializeChannelState
 } from '../../src/lightning/storage/serialization';
 import { ChannelSigner } from '../../src/lightning/keys/signer';
+import type { IChannelPersistence } from '../../src/lightning/channel/channel-actions';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // ─────────────── Helpers ───────────────
 
@@ -62,6 +64,7 @@ interface ISide {
 		localPerCommitmentSeed: Buffer;
 		localFundingPrivkey: Buffer;
 		htlcBasepointSecret: Buffer;
+		persistence: IChannelPersistence;
 	};
 }
 
@@ -86,7 +89,8 @@ function makeSide(): ISide {
 			localBasepoints: basepoints,
 			localPerCommitmentSeed: seed,
 			localFundingPrivkey: fundingPriv,
-			htlcBasepointSecret: crypto.randomBytes(32)
+			htlcBasepointSecret: crypto.randomBytes(32),
+			persistence: COMMIT_ALL
 		}
 	};
 }

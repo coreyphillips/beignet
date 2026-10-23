@@ -4,7 +4,7 @@ import type { FforState, IFforEpochRecord } from '../ffor/types';
 import type { ILeaseRates } from '../gossip/types';
 import type { MessageType } from '../message/types';
 import type { Channel } from './channel';
-import type { ChannelErrorCode, IChannelPersistEvent } from './channel-actions';
+import type { ChannelErrorCode } from './channel-actions';
 import type { IAbandonedLocalAdd } from './channel-state';
 
 /**
@@ -78,8 +78,6 @@ export interface ChannelManagerEvents {
 	'channel:closed': (channelId: Buffer) => void;
 	/** All tracked outputs of the close were irrevocably swept or claimed. */
 	'channel:resolved': (channelId: Buffer) => void;
-	/** Channel state must be persisted before the batch's messages go out. */
-	'channel:persist': (event: IChannelPersistEvent) => void;
 	/** A remote revoke_and_ack completed a commitment round. */
 	'commitment:revoked': (channelId: Buffer) => void;
 
