@@ -88,7 +88,9 @@ const utxo = (value: number, index: number): IUtxo => ({
 	index,
 	path: `m/84'/1'/0'/0/${index}`,
 	scriptHash: '00'.repeat(32),
-	height: 1,
+	// Unconfirmed, so a scan has no coinbase check to run against a tip these
+	// wallets never receive.
+	height: 0,
 	tx_hash: 'ab'.repeat(32),
 	tx_pos: index,
 	value,

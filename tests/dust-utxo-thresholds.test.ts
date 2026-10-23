@@ -113,7 +113,9 @@ describe('Dust thresholds for wallet coins (#1362)', function () {
 				index: source.index,
 				path: source.path,
 				scriptHash: source.scriptHash,
-				height: 1,
+				// Unconfirmed, so the offline scan has no coinbase check to run
+				// against a tip it never receives.
+				height: 0,
 				tx_hash: txid,
 				tx_pos: 0,
 				value,

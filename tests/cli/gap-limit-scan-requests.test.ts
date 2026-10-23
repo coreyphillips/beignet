@@ -271,6 +271,15 @@ describe('gap-limit scan requests (#1661)', function () {
 	/** One coin to the address, in a transaction of its own. */
 	const pay = (address: IAddress): void => {
 		paid.set(address.scriptHash, address.scriptHash);
+		// The UTXO scan reads a young coin's inputs to rule out a coinbase.
+		served.set(
+			address.scriptHash,
+			details(
+				address.scriptHash,
+				[{ txid: 'ee'.repeat(32), vout: 0 }],
+				[[address.address, 0.001]]
+			)
+		);
 	};
 
 	const askedMoreThanOnce = (): string[] => {

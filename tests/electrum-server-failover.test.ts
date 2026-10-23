@@ -522,6 +522,8 @@ const createFakeWallet = (
 			lookAheadChange: 2,
 			lookBehindChange: 2
 		},
+		// No immature coinbase outputs held back.
+		listImmatureUtxos: (): [] => [],
 		get data() {
 			return {
 				utxos,

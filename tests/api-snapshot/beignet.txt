@@ -740,6 +740,7 @@ method Wallet.checkElectrumConnection(): Promise<Result<string>>
 method Wallet.checkUnconfirmedTransactions(reorgDetected?: boolean): Promise<Result<string>>
 method Wallet.clearUtxos(): Promise<string>
 property Wallet.coinSelectPreference: ECoinSelectPreference
+get Wallet.coinbaseMatured(): boolean
 method Wallet.combinePsbts(psbts: string[]): Result<string>
 method Wallet.confirmationsToBlockHeight({ confirmations, currentHeight }: { confirmations: number; currentHeight?: number; }): number
 method Wallet.connectToElectrum(servers?: TServer | TServer[]): Promise<Result<string>>
@@ -827,6 +828,7 @@ method Wallet.isValid(mnemonic: string): boolean
 readonly property Wallet.isWatchOnly: boolean
 method Wallet.listAddressLabels(): TAddressLabels
 method Wallet.listFrozenUtxos(): IUtxo[]
+method Wallet.listImmatureUtxos(): IUtxo[]
 method Wallet.listUtxos(): IUtxo[]
 readonly property Wallet.logger: ILogger
 method Wallet.mapPathToKeyOrigin(path: string): string
