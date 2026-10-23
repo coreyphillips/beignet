@@ -1,8 +1,13 @@
 /**
- * Regression test for issue #1811: an address request whose gap scan was
- * still waiting on history when a refresh extended the address maps judged
- * its gap against addresses it had never checked, and answered the used
- * receive index it started from.
+ * Regression tests for the gap scan behind an address request.
+ *
+ * Issue #1811: a scan still waiting on history when a refresh extended the
+ * address maps judged its gap against addresses it had never checked, and
+ * answered the used receive index it started from.
+ *
+ * Issue #1822: a history batch the server failed was read as unused
+ * addresses, so the scan counted them toward its gap and answered a used
+ * index.
  *
  * Fully OFFLINE: the wallet points at an unreachable Electrum port, the
  * connection reads as answered recently, and the client helpers answer
@@ -39,7 +44,7 @@ const ELECTRUM_PORT = 65529;
 
 type TBatch<T> = { key: string; data: T[] };
 
-describe('an address request during a refresh (#1811)', function () {
+describe('an address request gap scan (#1811, #1822)', function () {
 	this.timeout(60000);
 
 	let wallet: Wallet;
@@ -48,6 +53,8 @@ describe('an address request during a refresh (#1811)', function () {
 	let holdNext = false;
 	let held: Promise<void> | undefined;
 	let release = (): void => undefined;
+	// Answers history requests in place of the server while it returns one.
+	let answer: ((batch: IAddress[]) => unknown) | undefined;
 
 	const receiveAt = async (
 		from: number,
@@ -67,6 +74,7 @@ describe('an address request during a refresh (#1811)', function () {
 		used.clear();
 		holdNext = false;
 		held = undefined;
+		answer = undefined;
 		const res = await Wallet.create({
 			mnemonic: MNEMONIC,
 			network: EAvailableNetworks.regtest,
@@ -119,6 +127,8 @@ describe('an address request during a refresh (#1811)', function () {
 						});
 						await held;
 					}
+					const answered = answer?.(scriptHashes.data);
+					if (answered) return answered;
 					return {
 						error: false,
 						data: scriptHashes.data.map((a) => ({
@@ -178,5 +188,50 @@ describe('an address request during a refresh (#1811)', function () {
 		if (res.isErr()) throw res.error;
 		expect(res.value.addressIndex.index).to.equal(5);
 		expect(res.value.lastUsedAddressIndex.index).to.equal(4);
+	});
+
+	// The first round finds indexes 0 and 1 used. Only the second asks for
+	// the extension, which reaches the used indexes 2 and 3.
+	const failExtension = (fail: (batch: IAddress[]) => unknown): void => {
+		let requests = 0;
+		answer = (batch): unknown => (++requests === 2 ? fail(batch) : undefined);
+	};
+
+	const expectIndexFiveOnRetry = async (): Promise<void> => {
+		answer = undefined;
+		const res = await wallet.fetchNextAvailableAddress();
+		if (res.isErr()) throw res.error;
+		expect(res.value.addressIndex.index).to.equal(5);
+		expect(res.value.lastUsedAddressIndex.index).to.equal(4);
+	};
+
+	it('errs when the server fails an extension batch', async () => {
+		failExtension(() => ({ error: true, data: 'Server busy.' }));
+		const res = await wallet.fetchNextAvailableAddress();
+		expect(res.isOk() && res.value.addressIndex.index).to.equal(false);
+		await expectIndexFiveOnRetry();
+	});
+
+	it('errs when the server fails each entry of an extension batch', async () => {
+		failExtension((batch) => ({
+			error: false,
+			data: batch.map((a) => ({
+				data: a,
+				param: a.scriptHash,
+				error: { code: -32603, message: 'Server busy.' }
+			}))
+		}));
+		const res = await wallet.fetchNextAvailableAddress();
+		expect(res.isOk() && res.value.addressIndex.index).to.equal(false);
+		await expectIndexFiveOnRetry();
+	});
+
+	it('errs rather than answer its starting index once it has found that used', async () => {
+		failExtension(() => {
+			throw new Error('Socket closed.');
+		});
+		const res = await wallet.fetchNextAvailableAddress();
+		expect(res.isOk() && res.value.addressIndex.index).to.equal(false);
+		await expectIndexFiveOnRetry();
 	});
 });
