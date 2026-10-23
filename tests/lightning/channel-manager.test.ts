@@ -24,7 +24,7 @@ import {
 import * as bitcoin from 'bitcoinjs-lib';
 import type { IFundingProvider } from '../../src/lightning/node/types';
 import { writableState } from './helpers/writable-state';
-import { COMMIT_ALL } from './helpers/channel-persistence';
+import { COMMIT_ALL, onPersist } from './helpers/channel-persistence';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -995,6 +995,38 @@ describe('Channel Manager', function () {
 			expect(alice.getChannel(channelId)!.getState()).to.equal(
 				ChannelState.ERRORED
 			);
+		});
+
+		it('still requests the close when the ERRORED write throws (issue #1845)', function () {
+			const { alice, channelId } = openAndReadyChannel();
+			const errors: string[] = [];
+			alice.on('error', (_cid: Buffer | null, message: string) =>
+				errors.push(message)
+			);
+			const errored: string[] = [];
+			alice.on('channel:errored', (_cid: Buffer, reason: string) =>
+				errored.push(reason)
+			);
+			let thrown = false;
+			onPersist(alice, () => {
+				if (thrown) return;
+				thrown = true;
+				throw new Error('disk unavailable');
+			});
+			const payload = encodeErrorMessage({
+				channelId,
+				data: Buffer.from('it broke', 'utf8')
+			});
+
+			alice.handleMessage(bobPubkey, 17, payload);
+			alice.handleMessage(bobPubkey, 17, payload);
+
+			expect(thrown).to.equal(true);
+			expect(alice.getChannel(channelId)!.getState()).to.equal(
+				ChannelState.ERRORED
+			);
+			expect(errored).to.deep.equal(['Remote error: it broke']);
+			expect(errors).to.include('Channel state write threw: disk unavailable');
 		});
 
 		it('surfaces a remote warning without failing the channel', function () {

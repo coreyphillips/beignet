@@ -9148,7 +9148,19 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// half of the channel_state mutation.
 		const peerPubkey = this.findPeerForChannel(channel);
 		if (peerPubkey) {
-			this.persistence.persist({ channel, peerPubkey, channelId });
+			try {
+				this.persistence.persist({ channel, peerPubkey, channelId });
+			} catch (err) {
+				// Escaping here would skip the close request for good: markErrored
+				// has latched, so every later error returns above. Contained, so
+				// an error listener cannot skip it either.
+				const thrown = err instanceof Error ? err.message : String(err);
+				this.emitContained(
+					'error',
+					channelId,
+					`Channel state write threw: ${thrown}`
+				);
+			}
 		}
 		this.emit('channel:errored', channelId, reason);
 	}
