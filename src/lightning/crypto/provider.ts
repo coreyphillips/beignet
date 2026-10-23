@@ -242,8 +242,8 @@ export function selfTestCryptoProvider(
 function createNodeCryptoProvider(
 	nodeCrypto: typeof NodeCrypto
 ): ICryptoProvider {
-	// @types/node files chacha20-poly1305 under CCM, whose setAAD demands a
-	// plaintext length. Node runs it like GCM.
+	// Typed as a GCM name so one seal/open pair serves both AEADs: Node runs
+	// chacha20-poly1305 through the same setAAD and auth tag calls as GCM.
 	const chachaPoly = 'chacha20-poly1305' as NodeCrypto.CipherGCMTypes;
 	const seal = (
 		algorithm: NodeCrypto.CipherGCMTypes,

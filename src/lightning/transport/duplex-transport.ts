@@ -24,8 +24,9 @@ export interface IDuplexTransport extends EventEmitter {
 	/**
 	 * Queue bytes for sending. The optional callback fires once the data has
 	 * been handed to the underlying transport (or with an error on failure).
+	 * `null` is allowed because Node's `net.Socket` reports success with it.
 	 */
-	write(data: Uint8Array | string, cb?: (err?: Error) => void): boolean;
+	write(data: Uint8Array | string, cb?: (err?: Error | null) => void): boolean;
 	/** Bytes queued but not yet flushed — the backpressure signal. */
 	readonly writableLength: number;
 	/**

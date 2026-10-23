@@ -8667,7 +8667,7 @@ method transport.IDuplexTransport.setKeepAlive(enable?: boolean, initialDelay?: 
 method transport.IDuplexTransport.setTimeout(timeout: number, callback?: () => void): this
 readonly property transport.IDuplexTransport.transportType?: 'tcp' | 'ws' | 'iroh'
 readonly property transport.IDuplexTransport.writableLength: number
-method transport.IDuplexTransport.write(data: Uint8Array | string, cb?: (err?: Error) => void): boolean
+method transport.IDuplexTransport.write(data: Uint8Array | string, cb?: (err?: Error | null) => void): boolean
 interface transport.IHandshakeResult
 property transport.IHandshakeResult.remoteStaticPubkey: Buffer
 property transport.IHandshakeResult.transport: transport.TransportCipher
@@ -8903,7 +8903,7 @@ get transport.WebSocketServerTransport.remotePort(): number | undefined
 method transport.WebSocketServerTransport.setKeepAlive(enable?: boolean, initialDelay?: number): this
 method transport.WebSocketServerTransport.setTimeout(timeout: number, callback?: () => void): this
 get transport.WebSocketServerTransport.writableLength(): number
-method transport.WebSocketServerTransport.write(data: Uint8Array | string, cb?: (err?: Error) => void): boolean
+method transport.WebSocketServerTransport.write(data: Uint8Array | string, cb?: (err?: Error | null) => void): boolean
 class transport.WebSocketTransport extends transport.BufferedDataEmitter implements transport.IDuplexTransport
 constructor transport.WebSocketTransport(ws: transport.IWebSocketLike, remote?: { address?: string; port?: number; })
 method transport.WebSocketTransport.destroy(error?: Error): this

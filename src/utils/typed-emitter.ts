@@ -13,9 +13,10 @@ export type EventMap<E> = {
 /**
  * An EventEmitter whose event names and listener signatures come from a map.
  * A listener on an event the map does not declare does not compile, and
- * neither does an emit whose arguments do not match. The installed
- * @types/node has no generic EventEmitter, so the typed signatures are
- * declared here; at runtime each one is the base method.
+ * neither does an emit whose arguments do not match. The typed signatures
+ * are declared here because the generic EventEmitter in @types/node maps
+ * events to argument tuples and is missing from the older @types/node a
+ * consumer may compile against; at runtime each one is the base method.
  */
 export class TypedEmitter<E extends EventMap<E>> extends EventEmitter {
 	on<K extends keyof E & string>(event: K, listener: E[K]): this {
