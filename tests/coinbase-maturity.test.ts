@@ -4,7 +4,8 @@
  * at broadcast with "coinbase immature" while mature coins covered it.
  *
  * Fully OFFLINE: the wallet never connects (remainOffline), and the UTXO
- * listing and transaction lookups are stubbed.
+ * listing and transaction lookups are stubbed. The restart case points at an
+ * unreachable port instead, and the client helpers answer for the server.
  */
 
 import { expect } from 'chai';
@@ -15,6 +16,7 @@ import tls from 'tls';
 import {
 	EAddressType,
 	EAvailableNetworks,
+	EProtocol,
 	EScanningStrategy,
 	IAddress,
 	IFormattedTransaction,
@@ -25,10 +27,16 @@ import {
 	Result,
 	TTxDetails,
 	Wallet,
+	createMemoryStorage,
 	decodeRawTransaction,
 	err,
 	ok
 } from '../src';
+
+// The raw module.exports object, which src/electrum reads live (see
+// broadcast-spent-utxos.test.ts).
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const electrumHelpers = require('rn-electrum-client/helpers');
 
 const MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -441,5 +449,219 @@ describe('Immature coinbase outputs (#1842)', function () {
 			scriptHash: reward.scriptHash,
 			publicKey: reward.publicKey
 		});
+	});
+});
+
+describe('Immature coinbase outputs across a restart (#1842)', function () {
+	this.timeout(60000);
+
+	type TBatch<T> = { key: string; data: T[] };
+	type TEntry = { tx_hash: string; height: number };
+
+	/** Unreachable on purpose: the client helpers answer in its place. */
+	const ELECTRUM_PORT = 65529;
+	const COINBASE = 'b2'.repeat(32);
+	const FUNDING = 'ee'.repeat(32);
+
+	let values: Map<string, string>;
+	let wallet: Wallet;
+	/** What the server lists for each script hash. */
+	let history: Map<string, TEntry[]>;
+	let unspent: Map<string, (TEntry & { tx_pos: number; value: number })[]>;
+	let served: Map<string, TTxDetails>;
+	let subscribed: string[];
+
+	const open = async (): Promise<Wallet> => {
+		const res = await Wallet.create({
+			mnemonic: MNEMONIC,
+			name: 'coinbaserestart',
+			network: EAvailableNetworks.regtest,
+			addressType: EAddressType.p2wpkh,
+			addressTypesToMonitor: [EAddressType.p2wpkh],
+			electrumOptions: {
+				net,
+				tls,
+				servers: {
+					host: '127.0.0.1',
+					ssl: ELECTRUM_PORT,
+					tcp: ELECTRUM_PORT,
+					protocol: EProtocol.tcp
+				}
+			},
+			disableRefreshOnCreate: true,
+			storage: createMemoryStorage(values)
+		});
+		if (res.isErr()) throw res.error;
+		const opened = res.value;
+		opened.electrum.stopConnectionPolling();
+		opened.electrum.connectedToElectrum = true;
+		opened.electrum.batchDelay = 0;
+		sinon.stub(opened.electrum, 'answeredRecently').returns(true);
+		sinon.stub(opened.electrum, 'isConnected').resolves(true);
+		sinon.stub(opened, 'updateFeeEstimates').resolves(ok(opened.feeEstimates));
+		return opened;
+	};
+
+	const tx = (
+		txid: string,
+		vin: TTxDetails['vin'],
+		vout: [string, number][]
+	): void => {
+		served.set(txid, {
+			txid,
+			hash: txid,
+			hex: '',
+			locktime: 0,
+			size: 0,
+			vsize: 0,
+			weight: 0,
+			version: 2,
+			vin,
+			vout: vout.map(([address, value], n) => ({
+				n,
+				value,
+				scriptPubKey: { address, asm: '', hex: '' }
+			}))
+		});
+	};
+
+	/** Puts a transaction paying `to` on the server at `height`. */
+	const pay = (
+		txid: string,
+		to: IAddress,
+		height: number,
+		sats: number
+	): void => {
+		history.set(to.scriptHash, [{ tx_hash: txid, height }]);
+		unspent.set(to.scriptHash, [
+			{ tx_hash: txid, height, tx_pos: 0, value: sats }
+		]);
+	};
+
+	const answer = <T extends { scriptHash: string }>(
+		batch: T[],
+		of: Map<string, unknown[]>
+	): unknown => ({
+		error: false,
+		data: batch.map((a) => ({
+			data: a,
+			param: a.scriptHash,
+			result: of.get(a.scriptHash) ?? []
+		}))
+	});
+
+	beforeEach(() => {
+		values = new Map();
+		history = new Map();
+		unspent = new Map();
+		served = new Map();
+		subscribed = [];
+		sinon
+			.stub(electrumHelpers, 'getAddressScriptHashesHistory')
+			.callsFake(async ({ scriptHashes }: { scriptHashes: TBatch<IAddress> }) =>
+				answer(scriptHashes.data, history)
+			);
+		// Listings go out keyed by script hash, not as a list.
+		sinon
+			.stub(electrumHelpers, 'listUnspentAddressScriptHashes')
+			.callsFake(
+				async ({
+					scriptHashes
+				}: {
+					scriptHashes: { data: Record<string, IAddress> };
+				}) => answer(Object.values(scriptHashes.data), unspent)
+			);
+		sinon
+			.stub(electrumHelpers, 'getTransactions')
+			.callsFake(async ({ txHashes }: { txHashes: TBatch<ITxHash> }) => ({
+				error: false,
+				data: txHashes.data.map((data) => ({
+					id: 0,
+					jsonrpc: '2.0',
+					param: data.tx_hash,
+					data,
+					result: served.get(data.tx_hash)
+				}))
+			}));
+		sinon
+			.stub(electrumHelpers, 'subscribeAddress')
+			.callsFake(async ({ scriptHash }: { scriptHash: string }) => {
+				subscribed.push(scriptHash);
+				return {
+					error: false,
+					id: 0,
+					method: 'subscribeAddress',
+					data: { id: 0, jsonrpc: '2.0', result: null }
+				};
+			});
+	});
+
+	afterEach(async () => {
+		sinon.restore();
+		await wallet?.stop();
+	});
+
+	it('finds a coinbase the receive window passed while it was immature, once it matures after a restart', async () => {
+		wallet = await open();
+		const gen = await wallet.generateAddresses({
+			addressAmount: 45,
+			changeAddressAmount: 0,
+			addressType: EAddressType.p2wpkh
+		});
+		if (gen.isErr()) throw gen.error;
+		const at = (index: number): IAddress =>
+			Object.values(gen.value.addresses).find(
+				(a) => a.index === index
+			) as IAddress;
+		// A reward at index 3, then payments that move the window past it.
+		tx(
+			COINBASE,
+			[{ coinbase: '0365', sequence: 0xffffffff }],
+			[[at(3).address, REWARD / 1e8]]
+		);
+		tx(
+			FUNDING,
+			[{ coinbase: '0366', sequence: 0xffffffff }],
+			[
+				[EXTERNAL, 1],
+				[EXTERNAL, 1]
+			]
+		);
+		const spend = (vout: number): TTxDetails['vin'] => [
+			{
+				txid: FUNDING,
+				vout,
+				scriptSig: { asm: '', hex: '' },
+				txinwitness: [],
+				sequence: 0xfffffffd
+			}
+		];
+		tx('a1'.repeat(32), spend(0), [[at(22).address, 0.001]]);
+		tx('a2'.repeat(32), spend(1), [[at(41).address, 0.002]]);
+		pay(COINBASE, at(3), 100, REWARD);
+		pay('a1'.repeat(32), at(22), 50, 100_000);
+		pay('a2'.repeat(32), at(41), 60, 200_000);
+
+		await wallet.updateHeader({ height: 100, hash: '', hex: '' });
+		const first = await wallet.refreshWallet();
+		if (first.isErr()) throw first.error;
+		expect(wallet.data.addressIndex.p2wpkh.index).to.equal(42);
+		expect(outpoints(wallet.listImmatureUtxos())).to.deep.equal([
+			`${COINBASE}:0`
+		]);
+		expect(wallet.getBalance()).to.equal(300_000);
+		expect(subscribed, 'watched outside the window').to.include(
+			at(3).scriptHash
+		);
+
+		await wallet.stop();
+		wallet = await open();
+		await wallet.updateHeader({ height: 199, hash: '', hex: '' });
+		for (let i = 0; i < 2; i++) {
+			const refreshed = await wallet.refreshWallet();
+			if (refreshed.isErr()) throw refreshed.error;
+			expect(outpoints(wallet.listUtxos())).to.include(`${COINBASE}:0`);
+			expect(wallet.getBalance()).to.equal(REWARD + 300_000);
+		}
 	});
 });

@@ -78,6 +78,7 @@ const createFakeWallet = (refreshSpy: sinon.SinonStub): Wallet => {
 			return refreshSpy(options);
 		},
 		addressTypesToMonitor: [],
+		listImmatureUtxos: (): [] => [],
 		data: { utxos: [] }
 	} as unknown as Wallet;
 };

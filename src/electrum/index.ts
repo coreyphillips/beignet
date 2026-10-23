@@ -1471,6 +1471,10 @@ export class Electrum {
 				addToScan(scriptHashes);
 			} else {
 				addToScan(currentWallet.utxos);
+				// The set leaves immature coinbase outputs out, and a restart finds
+				// them again only through their stored record, so their history is
+				// read wherever the gap window has moved.
+				addToScan(this._wallet.listImmatureUtxos());
 				const addressTypeKeys = this._wallet.addressTypesToMonitor;
 				addressTypeKeys.forEach((addressType) => {
 					const addresses = currentAddresses[addressType];
@@ -2718,13 +2722,16 @@ export class Electrum {
 					);
 				}
 			}
-			// Keep an eye on existing UTXO's regardless of the gap limit.
+			// Keep an eye on existing UTXO's regardless of the gap limit, and on
+			// the immature coinbase outputs the set leaves out.
 			const inRange = new Set(scriptHashes);
-			currentWallet.utxos.forEach((utxo) => {
-				if (!inRange.has(utxo.scriptHash)) {
-					allUtxos.push(utxo);
+			[...currentWallet.utxos, ...this._wallet.listImmatureUtxos()].forEach(
+				(utxo) => {
+					if (!inRange.has(utxo.scriptHash)) {
+						allUtxos.push(utxo);
+					}
 				}
-			});
+			);
 		}
 
 		// Subscribe to all provided script hashes. Callbacks are registered
