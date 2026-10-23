@@ -141,7 +141,8 @@ describe('Generated README tables (issue #1687)', function () {
 			}
 		};
 		for (const dir of ['docs', 'src', 'example', 'scripts', 'tests']) walk(dir);
-		found.push('README.md');
+		// Named rather than walked: the root also holds untracked scratch notes.
+		found.push('README.md', 'SECURITY.md', 'CONTRIBUTING.md');
 		const linked = [
 			...read('docs/README.md').matchAll(/\]\(([^)#]+)(?:#[^)]*)?\)/g)
 		].map((match) => path.posix.normalize(path.posix.join('docs', match[1])));
@@ -150,5 +151,12 @@ describe('Generated README tables (issue #1687)', function () {
 		}
 		const missing = found.filter((file) => !linked.includes(file));
 		expect(missing, 'add these to docs/README.md').to.deep.equal([]);
+	});
+
+	it('README.md links the security policy and the contributing guide (issue #1712)', () => {
+		const readme = read('README.md');
+		for (const file of ['SECURITY.md', 'CONTRIBUTING.md']) {
+			expect(readme, file).to.include(`](${file})`);
+		}
 	});
 });

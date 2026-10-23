@@ -8,6 +8,8 @@ Every document in the repository, by what it is for. A test (`tests/lightning/do
 |----------|----------|
 | [README.md](../README.md) | What Beignet is, install, the entry points, one example each, status and limitations |
 | [example/REPL_TESTING.md](../example/REPL_TESTING.md) | Copy-pasteable REPL walkthrough of the full node lifecycle |
+| [SECURITY.md](../SECURITY.md) | How to report a vulnerability privately, and what happens after |
+| [CONTRIBUTING.md](../CONTRIBUTING.md) | Setup, the checks CI runs, and the rules for pull requests |
 
 ## Guides
 
