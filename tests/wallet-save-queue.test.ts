@@ -31,6 +31,7 @@ import {
 	IWalletData,
 	IWalletStorage,
 	Result,
+	TTxResult,
 	Wallet,
 	err,
 	getWalletDataStorageKey,
@@ -606,12 +607,25 @@ describe('Wallet address map writes on refresh (#1655)', function () {
 		sinon.stub(wallet.electrum, 'subscribeToAddresses').resolves(ok('ok'));
 		sinon
 			.stub(wallet.electrum, 'getAddressHistory')
-			.callsFake(async ({ scriptHashes = [] }: { scriptHashes?: IAddress[] }) =>
-				ok(
-					scriptHashes
-						.filter((a) => used.has(a.scriptHash))
-						.map((a) => ({ ...a, tx_hash: 'ab'.repeat(32), height: 1 }))
-				)
+			.callsFake(
+				async ({
+					scriptHashes = [],
+					answered
+				}: {
+					scriptHashes?: IAddress[];
+					answered?: Map<string, TTxResult[]>;
+				}) => {
+					const tx = { tx_hash: 'ab'.repeat(32), height: 1 };
+					// The gap scan reads an address missing from here as unanswered.
+					for (const { scriptHash } of scriptHashes) {
+						answered?.set(scriptHash, used.has(scriptHash) ? [tx] : []);
+					}
+					return ok(
+						scriptHashes
+							.filter((a) => used.has(a.scriptHash))
+							.map((a) => ({ ...a, ...tx }))
+					);
+				}
 			);
 
 		// A mnemonic wallet monitors all four single-sig types.

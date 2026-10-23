@@ -2432,13 +2432,19 @@ export class Wallet {
 			let addressHasBeenUsed = false;
 			let changeAddressHasBeenUsed = false;
 
-			// If an error occurs, return last known/available indexes.
-			const lastKnownIndexes = ok({
+			// If an error occurs, return last known/available indexes. Not once
+			// the scan has found an address at or past them used: they would
+			// answer that used address.
+			const known = ok({
 				addressIndex,
 				lastUsedAddressIndex,
 				changeAddressIndex,
 				lastUsedChangeAddressIndex
 			});
+			const lastKnownIndexes = (
+				error: Error | string
+			): Result<IGetNextAvailableAddressResponse> =>
+				addressHasBeenUsed || changeAddressHasBeenUsed ? err(error) : known;
 
 			while (!foundLastUsedAddress || !foundLastUsedChangeAddress) {
 				//Check if transactions are pending in the mempool.
@@ -2449,7 +2455,7 @@ export class Wallet {
 
 				if (addressHistory.isErr()) {
 					this.logger.warn(addressHistory.error.message);
-					return lastKnownIndexes;
+					return lastKnownIndexes(addressHistory.error);
 				}
 
 				const txHashes = addressHistory.value;
@@ -2464,7 +2470,7 @@ export class Wallet {
 
 				if (highestUsedIndex.isErr()) {
 					this.logger.warn(highestUsedIndex.error.message);
-					return lastKnownIndexes;
+					return lastKnownIndexes(highestUsedIndex.error);
 				}
 
 				if (highestUsedIndex.value.foundAddressIndex) {
@@ -2477,6 +2483,20 @@ export class Wallet {
 						highestUsedIndex.value.changeAddressIndex;
 					changeAddressIndex = highestUsedIndex.value.changeAddressIndex;
 					changeAddressHasBeenUsed = true;
+				}
+
+				// A script hash the server failed is left out of the history, just
+				// as an unused one is, and only the answered ones are added to
+				// scan.history. Counted toward the gap, it could hide a used address.
+				if (
+					combinedAddressesToScan.some(
+						({ scriptHash }) => !scan.history.has(scriptHash)
+					)
+				) {
+					const unanswered =
+						'Electrum did not answer the history of every address checked.';
+					this.logger.warn(unanswered);
+					return lastKnownIndexes(unanswered);
 				}
 
 				const {
@@ -2539,7 +2559,9 @@ export class Wallet {
 						allChangeAddresses
 					).find(({ index }) => index === newChangeAddressIndex);
 					if (!nextAvailableAddress || !nextAvailableChangeAddress) {
-						return lastKnownIndexes;
+						return lastKnownIndexes(
+							'Unable to find the next available address.'
+						);
 					}
 					await this.saveGrownAddressMaps();
 					return ok({
@@ -2628,7 +2650,7 @@ export class Wallet {
 
 			await this.saveGrownAddressMaps();
 
-			return lastKnownIndexes;
+			return lastKnownIndexes('Unable to find the next available address.');
 		} catch (e) {
 			return err(e);
 		}

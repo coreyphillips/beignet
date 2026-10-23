@@ -29,6 +29,7 @@ import {
 	Result,
 	TMessageDataMap,
 	TStorageWriteFailure,
+	TTxResult,
 	TWalletDataKeys,
 	TWalletStorageKey,
 	Wallet
@@ -146,15 +147,24 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		wallet.electrum.subscribeToAddresses = async (): Promise<Result<string>> =>
 			ok('subscribed');
 		wallet.electrum.getAddressHistory = async ({
-			scriptHashes = []
+			scriptHashes = [],
+			answered
 		}: {
 			scriptHashes?: IAddress[];
-		}): Promise<Result<IGetAddressHistoryResponse[]>> =>
-			ok(
-				scriptHashes
-					.filter((address) => used.has(address.scriptHash))
-					.map((address) => ({ ...address, tx_hash: TXID, height: 1 }))
-			);
+			answered?: Map<string, TTxResult[]>;
+		}): Promise<Result<IGetAddressHistoryResponse[]>> => {
+			const history = scriptHashes
+				.filter((address) => used.has(address.scriptHash))
+				.map((address) => ({ ...address, tx_hash: TXID, height: 1 }));
+			// The gap scan reads an address missing from here as unanswered.
+			for (const { scriptHash } of scriptHashes) {
+				answered?.set(
+					scriptHash,
+					used.has(scriptHash) ? [{ tx_hash: TXID, height: 1 }] : []
+				);
+			}
+			return ok(history);
+		};
 	};
 
 	const savedIndex = (store: Map<string, string>, wallet: Wallet): number =>

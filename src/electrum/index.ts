@@ -1428,7 +1428,8 @@ export class Electrum {
 	 * @param {boolean} [scanAllAddresses]
 	 * @param {Map<string, TTxResult[]>} [answered] The history already
 	 * answered for each script hash. A script hash found here is not asked
-	 * again, and every one the server answers is added to it.
+	 * again, and every one the server answers is added to it. One the server
+	 * failed is left out, which is how the gap scan tells it from unused.
 	 * @returns {Promise<Result<IGetAddressHistoryResponse[]>>}
 	 */
 	async getAddressHistory({
