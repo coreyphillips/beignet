@@ -687,6 +687,7 @@ every TypeScript file.
 
 ```bash
 npm run test:local         # test:lightning + test:cli at once; no infrastructure needed
+npm run coverage           # test:local under c8, with a coverage summary of src
 npm run test:lightning     # 9500+ Lightning unit tests (parallel), no infrastructure needed
 npm run test:cli           # 2200+ CLI + daemon unit tests (parallel), no infrastructure needed
 npm run test:conformance   # 300+ official BOLT vector cases (subset of test:lightning)
@@ -714,6 +715,15 @@ quorum barrier to 20s), and sharing the machine ate one of them: running all
 three concurrently failed with `chaosWait timed out with the victim alive` while
 the same suite passes 30/30 on its own. Run it separately. See
 `scripts/run-suites.js` for the worker split and why more workers is not better.
+
+`npm run coverage` prints a line, branch and function summary for `src`, and
+writes per-file numbers to `coverage/coverage-summary.json` and per-line hits to
+`coverage/lcov.info`. CI prints a summary per suite at the end of its
+`test:lightning` and `test:cli` steps. The numbers are information, not a gate:
+no threshold is set, and nothing fails on a percentage. A file the run never
+loads counts as wholly uncovered. Two runs of the same tree can differ by a few
+covered lines, because tests with random keys reach different branches. c8 also
+counts a comment or type declaration as covered when the code around it ran.
 
 The on-chain wallet suites live in `tests/*.test.ts` and connect to **live public
 Electrum servers**, so they need network access and can fail on a server outage

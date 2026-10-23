@@ -80,8 +80,11 @@ jobs:
       # The eight in-process recovery kill matrices used to be covered here by
       # falling inside the glob; they now run in the `chaos` job below, and the
       # two file sets together are exactly the set this step used to cover.
+      # c8 adds a coverage summary of src to the end of the step. It is
+      # information, not a gate: .c8rc.json sets no threshold and c8 exits with
+      # mocha's code.
       - name: Run lightning unit tests
-        run: npm run test:lightning
+        run: npx c8 npm run test:lightning
 
       # test:sigkill and test:cli used to run here. They were 325s and 230s of a
       # 17m30s job that is the whole workflow's critical path, and neither needs
@@ -188,5 +191,6 @@ jobs:
       - name: Install Node.js dependencies
         run: npm ci
 
+      # Under c8 for a coverage summary, as with the lightning step.
       - name: Run CLI unit tests
-        run: npm run test:cli
+        run: npx c8 npm run test:cli
