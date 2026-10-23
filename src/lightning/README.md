@@ -198,7 +198,7 @@ await node.destroy();
 
 ### Creating a LightningNode
 
-`fromMnemonic()` takes every `INodeConfig` option except the key material, which it derives from the seed. Use the constructor when the keys come from somewhere else.
+`fromMnemonic()` takes every `INodeConfig` option except the key material, which it derives from the seed. Use `await LightningNode.create(config)` when the keys come from somewhere else. It builds the node, restores it from storage, then starts its timers, peer redials and chain watcher. `new LightningNode(config)` does the same until the next major release, when the constructor stops at building.
 
 `node.resolveNodeConfig(config)` returns the config a node runs with: every default filled in and the deprecated flat names folded into their groups. It holds every default the node applies; options it hands straight to a component, such as `channelConfig` or `maxInboundPeers`, keep that component's default.
 

@@ -5511,6 +5511,7 @@ method node.LightningNode.closeFforWitnesses(channelIdHex: string, timeoutMs?: n
 method node.LightningNode.closeQuote(channelId: Buffer, scriptPubkey: Buffer, acceptStaleStateRisk?: boolean): chain.ICooperativeCloseQuote
 method node.LightningNode.connectPeer(pubkey: string, host?: string, port?: number, transport?: transport.IPeerTransportOptions, options?: transport.IPeerDialOptions): Promise<void>
 method node.LightningNode.connectToSeeds(maxPeers?: number, config?: bootstrap.IBootstrapConfig): Promise<string[]>
+static method node.LightningNode.create(config: node.INodeConfig): Promise<node.LightningNode>
 method node.LightningNode.createFforIssuerOffer(issuerNodeIdHex: string, opts: { description: string; amountMsat?: bigint; quantityMax?: bigint; absoluteExpiry?: bigint; }): { offer: offer.IOffer; encoded: string; }
 method node.LightningNode.createFforVoucherInvoice(channelIdHex: string, k: number, description?: string, expirySecs?: number): node.ICreateInvoiceResult
 method node.LightningNode.createFunding(channel: channel.Channel, fundingTxid: Buffer, outputIndex: number, signature: Buffer): Buffer | null
