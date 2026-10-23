@@ -3423,21 +3423,22 @@ export class Wallet {
 			._immatureUtxos) {
 			heldBack[scriptHash] = { index, path, address, scriptHash, publicKey };
 		}
-		// The held-back list is memory only, so until a scan has applied since
-		// the wallet loaded, every address a stored coinbase paid stands in for
-		// it.
-		if (!this._appliedScanSeq) {
-			for (const record of Object.values(this._data.transactions)) {
-				if (!record.vin?.some((input) => 'coinbase' in input)) continue;
-				const paid = this.getAddressFromScriptHash(record.scriptHash);
-				if (paid) heldBack[paid.scriptHash] = paid;
-			}
-		}
+		// The held-back list is memory only, and a stored record names just one
+		// of the addresses its transaction paid. So until a scan has applied
+		// since the wallet loaded, a stored coinbase makes the scan list every
+		// address.
+		const strategy =
+			!this._appliedScanSeq &&
+			Object.values(this._data.transactions).some(
+				(record) => record.vin?.some((input) => 'coinbase' in input)
+			)
+				? EScanningStrategy.all
+				: scanningStrategy;
 		let getUtxosRes: Result<IGetUtxosResponse>;
 		let coinbases: Result<Set<string>> = ok(new Set());
 		try {
 			getUtxosRes = await electrum.getUtxos({
-				scanningStrategy,
+				scanningStrategy: strategy,
 				addressIndex,
 				changeAddressIndex,
 				addressTypesToCheck,

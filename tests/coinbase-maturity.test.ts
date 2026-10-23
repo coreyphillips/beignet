@@ -15,6 +15,8 @@ import tls from 'tls';
 import {
 	EAddressType,
 	EAvailableNetworks,
+	EScanningStrategy,
+	IAddress,
 	IFormattedTransaction,
 	IGetUtxosResponse,
 	ITransaction,
@@ -338,13 +340,12 @@ describe('Immature coinbase outputs (#1842)', function () {
 		expect(wallet.listImmatureUtxos()).to.deep.equal([reward]);
 	});
 
-	it('lists the addresses stored coinbases paid in the first scan since the wallet loaded', async () => {
+	it('scans every address in the first scan since the wallet loaded when a coinbase is stored', async () => {
 		await tipAt(300);
-		const paid = wallet.data.addressIndex[EAddressType.p2wpkh];
 		const txid = 'b2'.repeat(32);
 		const record = {
 			txid,
-			scriptHash: paid.scriptHash,
+			scriptHash: wallet.data.addressIndex[EAddressType.p2wpkh].scriptHash,
 			vin: [{ coinbase: '0365', sequence: 0xffffffff }]
 		} as IFormattedTransaction;
 		const stored = await wallet.updateData({
@@ -358,10 +359,68 @@ describe('Immature coinbase outputs (#1842)', function () {
 			const scanned = await scan();
 			if (scanned.isErr()) throw scanned.error;
 		}
-		const first = getUtxos.firstCall.args[0].additionalScriptHashes;
-		const second = getUtxos.secondCall.args[0].additionalScriptHashes;
-		expect(first[paid.scriptHash]).to.deep.equal(paid);
-		expect(second).to.not.have.property(paid.scriptHash);
+		expect(getUtxos.firstCall.args[0].scanningStrategy).to.equal(
+			EScanningStrategy.all
+		);
+		expect(getUtxos.secondCall.args[0].scanningStrategy).to.equal(
+			EScanningStrategy.gapLimit
+		);
+	});
+
+	it('finds every address a stored coinbase paid in the first scan since the wallet loaded', async () => {
+		await tipAt(300);
+		const gen = await wallet.generateAddresses({
+			addressAmount: 45,
+			changeAddressAmount: 0,
+			addressType: EAddressType.p2wpkh
+		});
+		if (gen.isErr()) throw gen.error;
+		const receive = Object.values(gen.value.addresses);
+		const at = (index: number): IAddress =>
+			receive.find((a) => a.index === index) as IAddress;
+		const txid = 'b2'.repeat(32);
+		// A record names one address, however many its transaction paid.
+		const record = {
+			txid,
+			scriptHash: at(0).scriptHash,
+			vin: [{ coinbase: '0365', sequence: 0xffffffff }]
+		} as IFormattedTransaction;
+		const stored = await wallet.updateData({
+			addresses: { ...wallet.data.addresses, p2wpkh: gen.value.addresses },
+			addressIndex: { ...wallet.data.addressIndex, p2wpkh: at(40) },
+			transactions: { [txid]: record }
+		});
+		if (stored.isErr()) throw stored.error;
+		// Both outside the gap window at index 40, and mature at block 301.
+		const outputs: IUtxo[] = [0, 1].map((index) => {
+			const { address, path, scriptHash, publicKey } = at(index);
+			return {
+				address,
+				index,
+				path,
+				scriptHash,
+				publicKey,
+				height: 201,
+				tx_hash: txid,
+				tx_pos: index,
+				value: REWARD
+			};
+		});
+		serve(txid, true);
+		type TScanArgs = Parameters<Wallet['electrum']['getUtxos']>[0];
+		getUtxos.callsFake(async (args: TScanArgs) => {
+			const listed = {
+				...wallet.electrum.utxoScanAddresses(args),
+				...args.additionalScriptHashes
+			};
+			const utxos = outputs.filter((utxo) => listed[utxo.scriptHash]);
+			return ok({ utxos, balance: sum(utxos) });
+		});
+
+		const scanned = await scan();
+		if (scanned.isErr()) throw scanned.error;
+		expect(outpoints(wallet.listUtxos())).to.have.members(outpoints(outputs));
+		expect(wallet.getBalance()).to.equal(2 * REWARD);
 	});
 
 	it('lists the address of a held-back coin in the next scan', async () => {
