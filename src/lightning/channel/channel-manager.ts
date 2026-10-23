@@ -10208,16 +10208,27 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * Returns false when a write with an outbox did not commit: the caller
 	 * then withholds every send, broadcast and force close after it. Only an
 	 * explicit `committed: true` releases them, so an implementation that
-	 * answers nothing has written nothing.
+	 * answers nothing, or throws, has written nothing.
 	 */
 	private _persistBatch(ctx: IDispatchContext): boolean {
 		const { channel, outbox } = ctx;
-		const result = this.persistence.persist({
-			channel,
-			peerPubkey: ctx.peerPubkey,
-			channelId: channel.getChannelId() ?? channel.getTemporaryChannelId(),
-			...(outbox ? { outbox } : {})
-		});
+		let result: IChannelPersistResult | undefined;
+		let thrown: string | undefined;
+		try {
+			result = this.persistence.persist({
+				channel,
+				peerPubkey: ctx.peerPubkey,
+				channelId: channel.getChannelId() ?? channel.getTemporaryChannelId(),
+				...(outbox ? { outbox } : {})
+			});
+		} catch (err) {
+			// Escaping here would skip the fence below and the batch's
+			// transition:blocked, leaving the next auto-sign free to cover the
+			// update this batch withholds. A write without an outbox gates
+			// nothing, so its throw still goes up.
+			if (!outbox) throw err;
+			thrown = err instanceof Error ? err.message : String(err);
+		}
 		if (outbox) {
 			ctx.persisted = {
 				committed: result?.committed === true,
@@ -10233,6 +10244,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				// later in this batch can already auto-sign.
 				if (ctx.channelIdHex) {
 					this.sendsWithheldOnConnection.add(ctx.channelIdHex);
+				}
+				// Only after the fence: an error listener can re-enter and sign.
+				if (thrown !== undefined) {
+					this.emitContained(
+						'error',
+						channel.getChannelId(),
+						`Channel state write threw: ${thrown}`
+					);
 				}
 				return false;
 			}
