@@ -33,6 +33,7 @@ import { verifyRemoteCommitmentSig } from '../../src/lightning/channel/commitmen
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivation';
 import { IChannelState } from '../../src/lightning/channel/channel-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -79,7 +80,8 @@ function makeConfig(seedId: number): IChannelManagerConfig {
 		localBasepoints: makeBasepoints(seed),
 		localPerCommitmentSeed: makeSeed(seedId + 100),
 		localFundingPrivkey: fundingPrivkey,
-		htlcBasepointSecret
+		htlcBasepointSecret,
+		persistence: COMMIT_ALL
 	};
 }
 

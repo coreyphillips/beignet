@@ -85,6 +85,7 @@ import {
 	makeCoin
 } from './helpers/df-receiver';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -266,7 +267,8 @@ describe('Splice input conflict watch (issue #760)', function () {
 		cm = new ChannelManager({
 			localBasepoints: makeBasepoints(crypto.randomBytes(32)),
 			localPerCommitmentSeed: crypto.randomBytes(32),
-			localFundingPrivkey: crypto.randomBytes(32)
+			localFundingPrivkey: crypto.randomBytes(32),
+			persistence: COMMIT_ALL
 		});
 		cm.on('error', () => {});
 		watcher = new ChainWatcher({ backend, channelManager: cm });
@@ -856,7 +858,8 @@ function makeConfig(seedId: number): IChannelManagerConfig {
 			.createHash('sha256')
 			.update(seed)
 			.update(Buffer.from([4]))
-			.digest()
+			.digest(),
+		persistence: COMMIT_ALL
 	};
 }
 

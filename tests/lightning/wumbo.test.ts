@@ -28,6 +28,7 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { Network } from '../../src/lightning/invoice/types';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 const WUMBO_FUNDING = 20_000_000n; // above 2^24, below the wumbo ceiling
 
@@ -75,7 +76,8 @@ function makeConfig(seedId: number): IChannelManagerConfig {
 		localBasepoints: makeBasepoints(seed),
 		localPerCommitmentSeed: makeSeed(seedId + 100),
 		localFundingPrivkey: fundingPrivkey,
-		htlcBasepointSecret
+		htlcBasepointSecret,
+		persistence: COMMIT_ALL
 	};
 }
 

@@ -28,6 +28,7 @@ import { IChannelBasepoints } from '../../../src/lightning/keys/derivation';
 import { MAX_INDEX } from '../../../src/lightning/keys/shachain';
 import { getPublicKey } from '../../../src/lightning/crypto/ecdh';
 import { IChannelState } from '../../../src/lightning/channel/channel-state';
+import { COMMIT_ALL } from './channel-persistence';
 
 bitcoin.initEccLib(ecc);
 export const NETWORK = bitcoin.networks.regtest;
@@ -68,7 +69,8 @@ export function configOf(
 		localPerCommitmentSeed: seedFor(1000 + seed[0]),
 		localFundingPrivkey: privAt(seed, 0),
 		htlcBasepointSecret: privAt(seed, 4),
-		preferTaproot
+		preferTaproot,
+		persistence: COMMIT_ALL
 	};
 }
 

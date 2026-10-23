@@ -17,6 +17,7 @@ import {
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -111,7 +112,8 @@ describe('Issue #775: funding spend detection below minimumDepth', function () {
 		const cm = new ChannelManager({
 			localBasepoints: makeBasepoints(crypto.randomBytes(32)),
 			localPerCommitmentSeed: crypto.randomBytes(32),
-			localFundingPrivkey: crypto.randomBytes(32)
+			localFundingPrivkey: crypto.randomBytes(32),
+			persistence: COMMIT_ALL
 		});
 		cm.on('error', () => {});
 		reported = [];

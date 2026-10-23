@@ -68,6 +68,7 @@ import { MessageType } from '../../src/lightning/message/types';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IStorageBackend } from '../../src/lightning/storage/types';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 const BIP32Factory = bip32.BIP32Factory(ecc);
 const MNEMONIC =
@@ -144,7 +145,8 @@ function makeManagerConfig(
 		htlcBasepointSecret: derivePrivkey(seed, 4),
 		chainHash: REGTEST_CHAIN_HASH,
 		channelKeyDeriver: makePerChannelKeys,
-		...extra
+		...extra,
+		persistence: COMMIT_ALL
 	};
 }
 

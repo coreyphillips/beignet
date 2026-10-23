@@ -72,6 +72,7 @@ import {
 import { FF_ABORT_TYPE, FF_ACCEPT_TYPE } from '../../src/lightning/ffor/types';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // ─────────────── Harness ───────────────
 
@@ -105,7 +106,8 @@ function makeConfig(
 		htlcBasepointSecret: sha(seed, Buffer.from([4])),
 		nodePrivateKey: sha(seed, 'node-key'),
 		// Section 5: anchor commitments.
-		preferAnchors: true
+		preferAnchors: true,
+		persistence: COMMIT_ALL
 	};
 }
 

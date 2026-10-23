@@ -107,6 +107,7 @@ import {
 	openReadyChannel
 } from './helpers/loopback-nodes';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
+import { onPersist } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -1522,7 +1523,7 @@ describe('watchtower hand-off on revoke_and_ack (#1029)', function () {
 		);
 		// A restart after the revoke's persist must find the backup queued.
 		let handedOffAtRevokePersist: boolean | null = null;
-		bobCm.on('channel:persist', ({ channel }: { channel: Channel }) => {
+		onPersist(bobCm, ({ channel }) => {
 			if (
 				handedOffAtRevokePersist === null &&
 				channel.getFullState().remoteRevocationNumber === 1n

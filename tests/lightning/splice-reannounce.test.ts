@@ -58,6 +58,7 @@ import {
 	realInitialCommitmentSig
 } from './helpers/real-signing';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // ─────────────── Helpers ───────────────
 
@@ -510,7 +511,8 @@ describe('Post-splice channel re-announcement', function () {
 			localBasepoints: openerBasepoints,
 			localPerCommitmentSeed: openerCommitmentSeed,
 			localFundingPrivkey: openerPrivkeys[0],
-			nodePrivateKey: localNodePriv
+			nodePrivateKey: localNodePriv,
+			persistence: COMMIT_ALL
 		};
 		const manager = new ChannelManager(config);
 		const channelId = opener.getChannelId()!;
@@ -590,7 +592,8 @@ describe('Post-splice channel re-announcement', function () {
 			const manager = new ChannelManager({
 				localBasepoints: openerBasepoints,
 				localPerCommitmentSeed: openerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			});
 			const channelId = opener.getChannelId()!;
 			(manager as any).channels.set(channelId.toString('hex'), opener);

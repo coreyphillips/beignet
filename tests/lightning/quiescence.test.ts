@@ -42,6 +42,7 @@ import {
 	signerFromSeed,
 	realInitialCommitmentSig
 } from './helpers/real-signing';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -99,7 +100,8 @@ function makeConfig(seedId: number): IChannelManagerConfig {
 			.createHash('sha256')
 			.update(seed)
 			.update(Buffer.from([4]))
-			.digest()
+			.digest(),
+		persistence: COMMIT_ALL
 	};
 }
 

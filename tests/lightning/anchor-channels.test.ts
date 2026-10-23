@@ -60,6 +60,7 @@ import {
 	OutputStatus,
 	ITrackedOutput
 } from '../../src/lightning/chain/types';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -696,7 +697,8 @@ describe('Anchor Channels (option_anchors_zero_fee_htlc_tx)', function () {
 				localPerCommitmentSeed: commitSeed,
 				localFundingPrivkey: getFundingPrivkey(seed),
 				htlcBasepointSecret: getHtlcBasepointSecret(seed),
-				preferAnchors
+				preferAnchors,
+				persistence: COMMIT_ALL
 			};
 		}
 
@@ -1082,7 +1084,8 @@ describe('Anchor Channels (option_anchors_zero_fee_htlc_tx)', function () {
 						delayedPaymentBasepointSecret: sk(seed, 3),
 						htlcBasepointSecret: sk(seed, 4)
 					};
-				}
+				},
+				persistence: COMMIT_ALL
 			};
 
 			const manager = new ChannelManager(config);

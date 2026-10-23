@@ -55,6 +55,7 @@ import {
 	deserializeChannelState,
 	serializeChannelState
 } from '../../src/lightning/storage/serialization';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // lib is pinned to es2020, which predates WeakRef; Node has it.
 declare class WeakRef<T extends object> {
@@ -123,7 +124,8 @@ function makeManager(
 		chainHash: REGTEST_CHAIN_HASH,
 		channelKeyDeriver: (index: number): IPerChannelKeys =>
 			makePerChannelKeys(index + keyOffset),
-		...extra
+		...extra,
+		persistence: COMMIT_ALL
 	});
 	manager.on('error', noop);
 	return manager;

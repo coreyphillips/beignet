@@ -37,6 +37,7 @@ import {
 	serializeChannelState
 } from '../../src/lightning/storage/serialization';
 import { settle } from './helpers/settle';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -224,7 +225,8 @@ describe('Funding-missing watchdog', function () {
 		const channelManager = new ChannelManager({
 			localBasepoints: makeBasepoints(makeSeed(1)),
 			localPerCommitmentSeed: crypto.randomBytes(32),
-			localFundingPrivkey: crypto.randomBytes(32)
+			localFundingPrivkey: crypto.randomBytes(32),
+			persistence: COMMIT_ALL
 		});
 		channelManager.on('error', () => {});
 		watcher = new ChainWatcher({
@@ -283,7 +285,8 @@ describe('Funding-missing watchdog', function () {
 		const cm = new ChannelManager({
 			localBasepoints: makeBasepoints(makeSeed(2)),
 			localPerCommitmentSeed: crypto.randomBytes(32),
-			localFundingPrivkey: crypto.randomBytes(32)
+			localFundingPrivkey: crypto.randomBytes(32),
+			persistence: COMMIT_ALL
 		});
 		cm.on('error', () => {});
 		// The floor is far longer than the burst below can take, and the run's
@@ -412,7 +415,8 @@ describe('Funding-missing watchdog', function () {
 		const channelManager = new ChannelManager({
 			localBasepoints: makeBasepoints(makeSeed(2)),
 			localPerCommitmentSeed: crypto.randomBytes(32),
-			localFundingPrivkey: crypto.randomBytes(32)
+			localFundingPrivkey: crypto.randomBytes(32),
+			persistence: COMMIT_ALL
 		});
 		channelManager.on('error', () => {});
 		const w = new ChainWatcher({

@@ -20,6 +20,7 @@ import { IDualFundingParams } from '../../src/lightning/channel/dual-funding';
 import { MessageType } from '../../src/lightning/message/types';
 import { encodeTxAddInputMessage } from '../../src/lightning/message/interactive-tx';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 function validPriv(): Buffer {
 	let k: Buffer;
@@ -62,7 +63,8 @@ function makeManager(nodePrivateKey: Buffer): ChannelManager {
 		localBasepoints: makeBasepoints(),
 		localPerCommitmentSeed: crypto.randomBytes(32),
 		localFundingPrivkey: validPriv(),
-		nodePrivateKey
+		nodePrivateKey,
+		persistence: COMMIT_ALL
 	});
 	mgr.on('error', () => {});
 	return mgr;

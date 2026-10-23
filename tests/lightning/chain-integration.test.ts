@@ -69,6 +69,7 @@ import {
 	realCommitmentSigs
 } from './helpers/real-signing';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -352,7 +353,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: openerBasepoints,
 				localPerCommitmentSeed: openerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 
 			const manager = new ChannelManager(config);
@@ -391,7 +393,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: openerBasepoints,
 				localPerCommitmentSeed: openerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 			const manager = new ChannelManager(config);
 			const channelId = opener.getChannelId()!;
@@ -416,7 +419,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: openerBasepoints,
 				localPerCommitmentSeed: openerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 			const manager = new ChannelManager(config);
 			const channelIdHex = opener.getChannelId()!.toString('hex');
@@ -484,7 +488,8 @@ describe('Chain Integration (Phase 4D)', function () {
 				localBasepoints: openerBasepoints,
 				localPerCommitmentSeed: openerCommitmentSeed,
 				localFundingPrivkey: openerPrivkeys[0],
-				htlcBasepointSecret: openerPrivkeys[4]
+				htlcBasepointSecret: openerPrivkeys[4],
+				persistence: COMMIT_ALL
 			});
 			const channelIdHex = opener.getChannelId()!.toString('hex');
 			manager.restoreMonitor(channelIdHex, monitor);
@@ -526,7 +531,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const manager = new ChannelManager({
 				localBasepoints: openerBasepoints,
 				localPerCommitmentSeed: openerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			});
 			manager.restoreMonitor(channelIdHex, monitor);
 			return manager;
@@ -795,7 +801,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: state.localBasepoints,
 				localPerCommitmentSeed: state.localPerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 
 			const manager = new ChannelManager(config);
@@ -872,7 +879,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: state.localBasepoints,
 				localPerCommitmentSeed: state.localPerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 			const manager = new ChannelManager(config);
 			const channelId = opener.getChannelId()!;
@@ -920,7 +928,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: state.localBasepoints,
 				localPerCommitmentSeed: state.localPerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 			const manager = new ChannelManager(config);
 			manager.on('error', () => {});
@@ -957,7 +966,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: state.localBasepoints,
 				localPerCommitmentSeed: state.localPerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 			const manager = new ChannelManager(config);
 			const channelId = opener.getChannelId()!;
@@ -1040,7 +1050,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: openerBasepoints,
 				localPerCommitmentSeed: openerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 			const manager = new ChannelManager(config);
 			(manager as any).channels.set(channelId.toString('hex'), opener);
@@ -1074,7 +1085,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: state.localBasepoints,
 				localPerCommitmentSeed: state.localPerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 			const manager = new ChannelManager(config);
 			const channelId = opener.getChannelId()!;
@@ -1157,7 +1169,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: openerBasepoints,
 				localPerCommitmentSeed: openerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 			const manager = new ChannelManager(config);
 			(manager as any).channels.set(channelId.toString('hex'), opener);
@@ -1383,7 +1396,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const manager = new ChannelManager({
 				localBasepoints: openerBasepoints,
 				localPerCommitmentSeed: openerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			});
 			(manager as any).channels.set(channelId.toString('hex'), opener);
 
@@ -1428,7 +1442,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: openerBasepoints,
 				localPerCommitmentSeed: openerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 
 			const manager = new ChannelManager(config);
@@ -1487,7 +1502,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: openerBasepoints,
 				localPerCommitmentSeed: openerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 
 			const manager = new ChannelManager(config);
@@ -1591,7 +1607,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: openerBasepoints,
 				localPerCommitmentSeed: openerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 
 			const manager = new ChannelManager(config);
@@ -1643,7 +1660,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: openerBasepoints,
 				localPerCommitmentSeed: openerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 			const manager = new ChannelManager(config);
 			(manager as any).channels.set(channelId.toString('hex'), opener);
@@ -1755,7 +1773,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: bp1,
 				localPerCommitmentSeed: cs1,
-				localFundingPrivkey: pk1[0]
+				localFundingPrivkey: pk1[0],
+				persistence: COMMIT_ALL
 			};
 
 			const manager = new ChannelManager(config);
@@ -1831,7 +1850,8 @@ describe('Chain Integration (Phase 4D)', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: openerBasepoints,
 				localPerCommitmentSeed: openerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 
 			const manager = new ChannelManager(config);

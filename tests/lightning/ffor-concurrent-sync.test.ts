@@ -2,7 +2,6 @@ import { expect } from 'chai';
 import { decodeFforSyncReplyMessage } from '../../src/lightning/ffor/messages';
 import { FforSlotState, FforState } from '../../src/lightning/ffor/types';
 import { MessageType } from '../../src/lightning/message/types';
-import { IChannelPersistEvent } from '../../src/lightning/channel/channel-actions';
 import {
 	activate,
 	AMOUNTS,
@@ -15,6 +14,7 @@ import {
 	restart,
 	vouchers
 } from './helpers/ffor-concurrent-pair';
+import { onPersist } from './helpers/channel-persistence';
 
 describe('FFOR nonterminal receipt synchronization', function () {
 	this.timeout(30_000);
@@ -206,12 +206,14 @@ describe('FFOR nonterminal receipt synchronization', function () {
 			}
 		};
 		let persisted: Buffer | undefined;
-		pair.sManager.on('channel:persist', ({ request }: IChannelPersistEvent) => {
-			if (!request) return;
+		onPersist(pair.sManager, ({ outbox }) => {
+			if (!outbox) return;
 			persisted = Buffer.from(record(pair.sChannel).syncSnapshotWire!);
-			request.committed = true;
-			request.frameSequence = 7n;
-			request.outboxIds = request.outbound.map((_, i) => i + 1);
+			return {
+				committed: true,
+				frameSequence: 7n,
+				outboxIds: outbox.outbound.map((_, i) => i + 1)
+			};
 		});
 		expect(pair.rManager.fforSync(pair.channelId).ok).to.be.true;
 		expect(persisted).not.to.equal(undefined);

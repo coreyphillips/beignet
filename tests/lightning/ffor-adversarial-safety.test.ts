@@ -88,6 +88,7 @@ import {
 import { buildVoucherOnion } from '../../src/lightning/ffor/voucher';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 const REGTEST = bitcoin.networks.regtest;
@@ -154,7 +155,8 @@ function makeManagerConfig(
 		localFundingPrivkey: sha(seed, Buffer.from([0])),
 		htlcBasepointSecret: sha(seed, Buffer.from([4])),
 		nodePrivateKey: sha(seed, 'node-key'),
-		preferAnchors: true
+		preferAnchors: true,
+		persistence: COMMIT_ALL
 	};
 }
 

@@ -44,6 +44,7 @@ import {
 	realCommitmentSigs
 } from './helpers/real-signing';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	// Real curve points: open/accept validation now rejects off-curve
@@ -829,7 +830,8 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			const manager = new ChannelManager({
 				localBasepoints: basepoints,
 				localPerCommitmentSeed: seed,
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			manager.on('error', () => {}); // absorb
 
@@ -858,7 +860,8 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			const manager = new ChannelManager({
 				localBasepoints: basepoints,
 				localPerCommitmentSeed: seed,
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			manager.on('error', () => {}); // absorb
 
@@ -1200,7 +1203,8 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 				localBasepoints: makeBasepoints(crypto.randomBytes(32)),
 				localPerCommitmentSeed: crypto.randomBytes(32),
 				localFundingPrivkey: crypto.randomBytes(32),
-				htlcBasepointSecret: crypto.randomBytes(32)
+				htlcBasepointSecret: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			manager.on('error', () => {
 				/* restore emits nothing here; absorb regardless */
@@ -1338,7 +1342,8 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 				localBasepoints: makeBasepoints(crypto.randomBytes(32)),
 				localPerCommitmentSeed: crypto.randomBytes(32),
 				localFundingPrivkey: crypto.randomBytes(32),
-				htlcBasepointSecret: crypto.randomBytes(32)
+				htlcBasepointSecret: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			manager.on('error', () => {
 				/* restore emits nothing here; absorb regardless */

@@ -24,6 +24,7 @@ import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -110,7 +111,8 @@ describe('FS-6: pre-splice funding output spend watch', () => {
 		cm = new ChannelManager({
 			localBasepoints: makeBasepoints(crypto.randomBytes(32)),
 			localPerCommitmentSeed: crypto.randomBytes(32),
-			localFundingPrivkey: crypto.randomBytes(32)
+			localFundingPrivkey: crypto.randomBytes(32),
+			persistence: COMMIT_ALL
 		});
 		cm.on('error', () => {});
 		watcher = new ChainWatcher({ backend, channelManager: cm });

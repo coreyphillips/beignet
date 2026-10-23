@@ -40,6 +40,7 @@ import {
 } from '../../src/lightning/message/channel-close';
 import { expectWireFailure, wireRefusalOf } from './helpers/open-refusal';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -90,7 +91,8 @@ function makeConfig(
 		localPerCommitmentSeed: makeSeed(seedId + 100),
 		localFundingPrivkey: fundingPrivkey,
 		htlcBasepointSecret,
-		preferTaproot
+		preferTaproot,
+		persistence: COMMIT_ALL
 	};
 }
 

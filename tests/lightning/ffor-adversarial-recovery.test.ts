@@ -56,6 +56,7 @@ import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IChannelState } from '../../src/lightning/channel/channel-state';
 import { bitmapGet } from '../../src/lightning/ffor/messages';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // ─────────────── Shared ───────────────
 
@@ -94,7 +95,8 @@ function makeConfig(
 		localFundingPrivkey: sha(seed, Buffer.from([0])),
 		htlcBasepointSecret: sha(seed, Buffer.from([4])),
 		nodePrivateKey: sha(seed, 'node-key'),
-		preferAnchors: true
+		preferAnchors: true,
+		persistence: COMMIT_ALL
 	};
 }
 

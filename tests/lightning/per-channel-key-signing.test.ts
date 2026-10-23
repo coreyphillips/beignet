@@ -32,6 +32,7 @@ import {
 import { MessageType } from '../../src/lightning/message/types';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { deriveV2TemporaryChannelId } from '../../src/lightning/channel/validation';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // ─── Helpers ───
 
@@ -94,7 +95,8 @@ function makeManagerConfig(withDeriver = true): IChannelManagerConfig {
 		localPerCommitmentSeed: makeSeed(100),
 		localFundingPrivkey: globalFundingPrivkey,
 		htlcBasepointSecret: globalHtlcSecret,
-		channelKeyDeriver: withDeriver ? makePerChannelKeys : undefined
+		channelKeyDeriver: withDeriver ? makePerChannelKeys : undefined,
+		persistence: COMMIT_ALL
 	};
 }
 

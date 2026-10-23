@@ -50,6 +50,7 @@ import {
 	buildOfferedHtlcScript,
 	buildReceivedHtlcScript
 } from '../../src/lightning/script/htlc';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
 
@@ -201,7 +202,8 @@ function makeSharedConfig(seed: Buffer): IChannelManagerConfig {
 		localBasepoints: basepoints,
 		localPerCommitmentSeed: perCommitmentSeed,
 		localFundingPrivkey: fundingPrivkey,
-		htlcBasepointSecret: makePrivkey(seed, 4)
+		htlcBasepointSecret: makePrivkey(seed, 4),
+		persistence: COMMIT_ALL
 	};
 }
 

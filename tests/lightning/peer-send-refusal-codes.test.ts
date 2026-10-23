@@ -19,6 +19,7 @@ import {
 	PeerErrorCode,
 	PeerManager
 } from '../../src/lightning/transport/peer-manager';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 const PEER = getPublicKey(Buffer.alloc(32, 7)).toString('hex');
 
@@ -40,7 +41,8 @@ function makeConfig(): IChannelManagerConfig {
 		},
 		localPerCommitmentSeed: key('seed'),
 		localFundingPrivkey: key('funding'),
-		htlcBasepointSecret: key('htlc')
+		htlcBasepointSecret: key('htlc'),
+		persistence: COMMIT_ALL
 	};
 }
 

@@ -54,8 +54,9 @@ import { MessageType } from '../../src/lightning/message/types';
 import {
 	ChannelAction,
 	ChannelActionType,
-	IChannelPersistEvent,
-	IChannelPersistRequest
+	IChannelPersistence,
+	IChannelPersistOutbox,
+	IChannelPersistResult
 } from '../../src/lightning/channel/channel-actions';
 import {
 	IChannelAnnouncementMessage,
@@ -63,6 +64,7 @@ import {
 	encodeShortChannelId
 } from '../../src/lightning/gossip/types';
 import { IDLE_CHANNEL_MEMBERS } from './helpers/channel-stub';
+import { COMMIT_ALL, COMMIT_NONE } from './helpers/channel-persistence';
 
 // ─────────────── Fixtures ───────────────
 
@@ -1011,10 +1013,12 @@ describe('Recovery phase 1: batch dispatch invariants', () => {
 		} as unknown as Channel;
 	}
 
-	function makeManager(): ChannelManager {
-		return new ChannelManager(
-			{} as unknown as ConstructorParameters<typeof ChannelManager>[0]
-		);
+	function makeManager(
+		persistence: IChannelPersistence = COMMIT_ALL
+	): ChannelManager {
+		return new ChannelManager({
+			persistence
+		} as unknown as ConstructorParameters<typeof ChannelManager>[0]);
 	}
 
 	function dispatch(
@@ -1033,19 +1037,20 @@ describe('Recovery phase 1: batch dispatch invariants', () => {
 		).processActions('aa'.repeat(33), channel, actions);
 	}
 
-	it('emits ONE persist per batch no matter how many markers it carries', () => {
+	it('commits ONCE per batch no matter how many markers it carries', () => {
 		// The v2 open and splice signing flows compose helpers that each lead
 		// with their own PERSIST_STATE. Channel methods mutate state while
 		// BUILDING the action array, so every marker would write identical
 		// state; re-emitting used to re-commit the same outbound list per
 		// marker and duplicate its outbox rows.
-		const manager = makeManager();
-		const channel = stubChannel(crypto.randomBytes(32));
-
-		const persists: IChannelPersistRequest[] = [];
-		manager.on('channel:persist', ({ request }: IChannelPersistEvent) => {
-			if (request) persists.push(request);
+		const persists: IChannelPersistOutbox[] = [];
+		const manager = makeManager({
+			persist: (request): IChannelPersistResult => {
+				if (request.outbox) persists.push(request.outbox);
+				return { committed: true, outboxIds: [] };
+			}
 		});
+		const channel = stubChannel(crypto.randomBytes(32));
 		const sent: number[] = [];
 		manager.on('message:outbound', (_pk: string, type: number) => {
 			sent.push(type);
@@ -1084,12 +1089,9 @@ describe('Recovery phase 1: batch dispatch invariants', () => {
 		// network never sees a tx whose justifying state missed disk; the gate
 		// must therefore cover BROADCAST_TX and FORCE_CLOSE, not just wire
 		// messages.
-		const manager = makeManager();
+		const manager = makeManager(COMMIT_NONE);
 		const channel = stubChannel(crypto.randomBytes(32));
 
-		manager.on('channel:persist', ({ request }: IChannelPersistEvent) => {
-			if (request) request.committed = false;
-		});
 		const leaked: string[] = [];
 		manager.on('message:outbound', () => leaked.push('send'));
 		manager.on('broadcast:tx', () => leaked.push('broadcast'));
@@ -1121,11 +1123,8 @@ describe('Recovery phase 1: batch dispatch invariants', () => {
 	});
 
 	it('raises no blocked signal when the persist commits', () => {
-		const manager = makeManager();
+		const manager = makeManager(COMMIT_ALL);
 		const channel = stubChannel(crypto.randomBytes(32));
-		manager.on('channel:persist', ({ request }: IChannelPersistEvent) => {
-			if (request) request.committed = true;
-		});
 		let blockedCount = 0;
 		manager.on('transition:blocked', () => {
 			blockedCount++;
@@ -1139,6 +1138,85 @@ describe('Recovery phase 1: batch dispatch invariants', () => {
 			}
 		]);
 		expect(blockedCount).to.equal(0);
+	});
+
+	it('refuses to construct without a persistence (issue #1706)', () => {
+		// The old fallback answered committed for every write, so a manager
+		// built from the public barrel with nothing wired sent commitment
+		// signatures no restart would remember.
+		expect(
+			() =>
+				new ChannelManager(
+					{} as unknown as ConstructorParameters<typeof ChannelManager>[0]
+				)
+		).to.throw(TypeError, /persistence/);
+		expect(
+			() =>
+				new ChannelManager({
+					persistence: {}
+				} as unknown as ConstructorParameters<typeof ChannelManager>[0])
+		).to.throw(TypeError, /persistence/);
+	});
+
+	it('withholds the sends when the persistence answers nothing', () => {
+		// Only an explicit commit releases what the persist authorized. A
+		// JavaScript implementation that returns early has written nothing.
+		const manager = makeManager({
+			persist: () => undefined as unknown as IChannelPersistResult
+		});
+		const channel = stubChannel(crypto.randomBytes(32));
+		const leaked: string[] = [];
+		manager.on('message:outbound', () => leaked.push('send'));
+		manager.on('broadcast:tx', () => leaked.push('broadcast'));
+		let blocked = 0;
+		manager.on('transition:blocked', () => blocked++);
+
+		dispatch(manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			{
+				type: ChannelActionType.SEND_MESSAGE,
+				messageType: MessageType.COMMITMENT_SIGNED,
+				payload: Buffer.from([1])
+			},
+			{ type: ChannelActionType.BROADCAST_TX, tx: Buffer.from([2]) }
+		]);
+
+		expect(leaked).to.deep.equal([]);
+		expect(blocked).to.equal(1);
+	});
+
+	it('marks sent exactly the outbox rows the persistence answered with', () => {
+		const manager = makeManager({
+			persist: (): IChannelPersistResult => ({
+				committed: true,
+				outboxIds: [7, null]
+			})
+		});
+		const channel = stubChannel(crypto.randomBytes(32));
+		const order: string[] = [];
+		manager.on('message:outbound', () => order.push('send'));
+		const sent: Array<Array<number | null>> = [];
+		manager.on('outbox:sent', (ids: Array<number | null>) => {
+			order.push('outbox:sent');
+			sent.push(ids);
+		});
+
+		dispatch(manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			{
+				type: ChannelActionType.SEND_MESSAGE,
+				messageType: MessageType.COMMITMENT_SIGNED,
+				payload: Buffer.from([1])
+			},
+			{
+				type: ChannelActionType.SEND_MESSAGE,
+				messageType: MessageType.UPDATE_ADD_HTLC,
+				payload: Buffer.from([2])
+			}
+		]);
+
+		expect(sent).to.deep.equal([[7, null]]);
+		expect(order).to.deep.equal(['send', 'send', 'outbox:sent']);
 	});
 });
 

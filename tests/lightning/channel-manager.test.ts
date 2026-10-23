@@ -24,6 +24,7 @@ import {
 import * as bitcoin from 'bitcoinjs-lib';
 import type { IFundingProvider } from '../../src/lightning/node/types';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -72,7 +73,8 @@ function makeConfig(seedId: number): IChannelManagerConfig {
 		localBasepoints: makeBasepoints(seed),
 		localPerCommitmentSeed: makeSeed(seedId + 100),
 		localFundingPrivkey: fundingPrivkey,
-		htlcBasepointSecret
+		htlcBasepointSecret,
+		persistence: COMMIT_ALL
 	};
 }
 

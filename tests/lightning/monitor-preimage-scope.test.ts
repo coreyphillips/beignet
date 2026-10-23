@@ -28,6 +28,7 @@ import { Channel } from '../../src/lightning/channel/channel';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { buildRemoteCommitment } from '../../src/lightning/channel/commitment-builder';
 import { setupNormalChannels } from './helpers/revoked-commitment-fixture';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 const network = bitcoin.networks.regtest;
 
@@ -63,7 +64,8 @@ function makeManager(id: number): ChannelManager {
 	const cfg: IChannelManagerConfig = {
 		localBasepoints: makeBasepoints(makeSeed(id)),
 		localPerCommitmentSeed: makeSeed(100 + id),
-		localFundingPrivkey: makeSeed(200 + id)
+		localFundingPrivkey: makeSeed(200 + id),
+		persistence: COMMIT_ALL
 	};
 	const cm = new ChannelManager(cfg);
 	cm.on('error', () => {});

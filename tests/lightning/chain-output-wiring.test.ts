@@ -21,6 +21,7 @@ import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Network } from '../../src/lightning/invoice/types';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -154,7 +155,8 @@ describe('Phase 3: Chain Event Wiring + Error Visibility', () => {
 			channelManager = new ChannelManager({
 				localBasepoints: makeBasepoints(seed),
 				localPerCommitmentSeed: crypto.randomBytes(32),
-				localFundingPrivkey: crypto.randomBytes(32)
+				localFundingPrivkey: crypto.randomBytes(32),
+				persistence: COMMIT_ALL
 			});
 			channelManager.on('error', () => {});
 

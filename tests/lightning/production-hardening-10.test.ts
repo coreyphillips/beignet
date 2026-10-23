@@ -27,6 +27,7 @@ import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { MessageType } from '../../src/lightning/message/types';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // ─────────────── Helpers ───────────────
 
@@ -109,7 +110,8 @@ function makeChannelManagerConfig(seedId: number): IChannelManagerConfig {
 	return {
 		localBasepoints: basepoints,
 		localPerCommitmentSeed: perCommitmentSeed,
-		localFundingPrivkey: fundingPrivkey
+		localFundingPrivkey: fundingPrivkey,
+		persistence: COMMIT_ALL
 	};
 }
 

@@ -11,10 +11,7 @@ import {
 	ChannelRole,
 	isTaprootChannel
 } from '../../src/lightning/channel/types';
-import {
-	ChannelActionType,
-	IChannelPersistEvent
-} from '../../src/lightning/channel/channel-actions';
+import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import {
@@ -23,6 +20,7 @@ import {
 	openReadyChannel
 } from './helpers/loopback-nodes';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_NONE, setPersistence } from './helpers/channel-persistence';
 
 const DESTINATION = Buffer.from(
 	'512079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798',
@@ -361,10 +359,7 @@ describe('External cooperative close', function () {
 	for (const disconnect of [false, true]) {
 		it(`refuses a failed intent write and rolls back unsent state, disconnect=${disconnect}`, () => {
 			const manager = alice.getChannelManager();
-			manager.removeAllListeners('channel:persist');
-			manager.on('channel:persist', (event: IChannelPersistEvent) => {
-				event.request!.committed = false;
-			});
+			setPersistence(manager, COMMIT_NONE);
 			if (disconnect)
 				manager.on('transition:blocked', () =>
 					manager.handlePeerDisconnected(bob.getNodeId())

@@ -61,6 +61,7 @@ import { IStorageBackend } from '../../src/lightning/storage/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { createOpenerState } from '../../src/lightning/channel/channel-state';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 const sha = (s: string): Buffer =>
 	crypto.createHash('sha256').update(s).digest();
@@ -564,7 +565,8 @@ describe('Recovery phase 6: a quorum claim names the policy behind it', () => {
 		const barrierClass = (action: ChannelAction): boolean =>
 			(
 				new ChannelManager({
-					durabilityBarrier: { enforcing: true }
+					durabilityBarrier: { enforcing: true },
+					persistence: COMMIT_ALL
 				} as unknown as ConstructorParameters<
 					typeof ChannelManager
 				>[0]) as unknown as { _isBarrierClass(a: ChannelAction): boolean }

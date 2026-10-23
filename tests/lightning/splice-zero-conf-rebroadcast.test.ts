@@ -37,6 +37,7 @@ import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Network } from '../../src/lightning/invoice/types';
 import { writableState } from './helpers/writable-state';
+import { onPersist } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -506,7 +507,7 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 			fx.backend.broadcasts.filter((b) => b === hex).length;
 		const manager = fx.alice.getChannelManager();
 		let persists = 0;
-		manager.on('channel:persist', () => {
+		onPersist(manager, () => {
 			persists += 1;
 		});
 		const authorized: string[] = [];
@@ -549,7 +550,7 @@ describe('Zero-conf splice rebroadcast on the node (issue #756)', function () {
 			if (tx.toString('hex') === hex) count += 1;
 		});
 		let persists = 0;
-		fx.alice.getChannelManager().on('channel:persist', () => {
+		onPersist(fx.alice.getChannelManager(), () => {
 			persists += 1;
 		});
 		for (const height of [150, 151, 152]) {

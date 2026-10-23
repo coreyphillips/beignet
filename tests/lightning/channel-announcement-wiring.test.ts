@@ -33,6 +33,7 @@ import { encodeShortChannelId } from '../../src/lightning/gossip/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { createOpenerState } from '../../src/lightning/channel/channel-state';
 import { ElectrumBackend } from '../../src/lightning/chain/electrum-backend';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -98,7 +99,8 @@ function makeChannelManagerConfig(seedId: number): IChannelManagerConfig {
 			.createHash('sha256')
 			.update(seed)
 			.update(Buffer.from([0]))
-			.digest()
+			.digest(),
+		persistence: COMMIT_ALL
 	};
 }
 

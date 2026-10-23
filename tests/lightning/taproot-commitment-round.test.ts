@@ -29,6 +29,7 @@ import { decodeChannelReestablishMessage } from '../../src/lightning/message/cha
 import { decodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
 import { expectWireFailure } from './helpers/open-refusal';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -79,7 +80,8 @@ function makeConfig(
 		localPerCommitmentSeed: makeSeed(seedId + 100),
 		localFundingPrivkey: fundingPrivkey,
 		htlcBasepointSecret,
-		preferTaproot
+		preferTaproot,
+		persistence: COMMIT_ALL
 	};
 }
 

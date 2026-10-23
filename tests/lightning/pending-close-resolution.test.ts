@@ -72,6 +72,7 @@ import {
 	signerFromSeed,
 	realInitialCommitmentSig
 } from './helpers/real-signing';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 
@@ -267,7 +268,8 @@ describe('Pending-close resolution', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: basepoints,
 				localPerCommitmentSeed: perCommitmentSeed,
-				localFundingPrivkey: fundingPrivkey
+				localFundingPrivkey: fundingPrivkey,
+				persistence: COMMIT_ALL
 			};
 			const manager = new ChannelManager(config);
 			expect(manager.markChannelResolved(crypto.randomBytes(32))).to.be.false;
@@ -279,7 +281,8 @@ describe('Pending-close resolution', function () {
 			const config: IChannelManagerConfig = {
 				localBasepoints: openerBasepoints,
 				localPerCommitmentSeed: openerCommitmentSeed,
-				localFundingPrivkey: openerPrivkeys[0]
+				localFundingPrivkey: openerPrivkeys[0],
+				persistence: COMMIT_ALL
 			};
 			const manager = new ChannelManager(config);
 			const channelId = opener.getChannelId()!;

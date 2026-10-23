@@ -32,6 +32,7 @@ import {
 } from '../../src/lightning/channel/types';
 import { IChannelState } from '../../src/lightning/channel/channel-state';
 import { ShaChainStore } from '../../src/lightning/keys/shachain';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 const TEST_MNEMONIC =
 	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -398,7 +399,8 @@ describe('Production Hardening 9 — Reliability', () => {
 			const cm = new ChannelManager({
 				localBasepoints: makeBasepoints(seed),
 				localPerCommitmentSeed: seed,
-				localFundingPrivkey: makePrivkey(seed, 1)
+				localFundingPrivkey: makePrivkey(seed, 1),
+				persistence: COMMIT_ALL
 			});
 			cm.on('error', () => {});
 			return cm;

@@ -29,11 +29,13 @@ import { ChannelState } from '../../src/lightning/channel/types';
 import {
 	ChannelAction,
 	ChannelActionType,
-	IChannelPersistEvent,
+	IChannelPersistRequest,
+	IChannelPersistResult,
 	IWireDurabilityBarrier
 } from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
 import { IDLE_CHANNEL_MEMBERS } from './helpers/channel-stub';
+import { COMMIT_NONE, setPersistence } from './helpers/channel-persistence';
 
 // ─────────────── Fixtures ───────────────
 
@@ -124,7 +126,7 @@ interface IHarness {
 	errors: string[];
 	held: string[];
 	outboxSent: Array<Array<number | null>>;
-	/** Next frame sequence the persist listener will report. */
+	/** Next frame sequence the persistence will report. */
 	nextFrame: bigint;
 }
 
@@ -132,7 +134,16 @@ function makeHarness(enforcing = true): IHarness {
 	const barrier = new ScriptedBarrier();
 	barrier.enforcing = enforcing;
 	const manager = new ChannelManager({
-		durabilityBarrier: barrier
+		durabilityBarrier: barrier,
+		persistence: {
+			persist: (request: IChannelPersistRequest): IChannelPersistResult => ({
+				committed: true,
+				frameSequence: harness.nextFrame,
+				outboxIds: (request.outbox?.outbound ?? []).map(
+					(_m, index) => index + 1
+				)
+			})
+		}
 	} as unknown as ConstructorParameters<typeof ChannelManager>[0]);
 
 	const harness: IHarness = {
@@ -151,12 +162,6 @@ function makeHarness(enforcing = true): IHarness {
 	// throws out of the call that produced it.
 	manager.on('error', (_id: Buffer | null, message: string) => {
 		harness.errors.push(message);
-	});
-	manager.on('channel:persist', ({ request }: IChannelPersistEvent) => {
-		if (!request) return;
-		request.committed = true;
-		request.frameSequence = harness.nextFrame;
-		request.outboxIds = request.outbound.map((_m, index) => index + 1);
 	});
 	manager.on('message:outbound', (peer: string, type: number) => {
 		harness.sent.push({ peer, type });
@@ -875,13 +880,7 @@ describe('Recovery phase 6: funding does not outrun its own frame', () => {
 		const channel = stubChannel(crypto.randomBytes(32));
 		const authorized: number[] = [];
 		harness.manager.on('funding:authorized', () => authorized.push(1));
-		harness.manager.removeAllListeners('channel:persist');
-		harness.manager.on(
-			'channel:persist',
-			({ request }: IChannelPersistEvent) => {
-				if (request) request.committed = false;
-			}
-		);
+		setPersistence(harness.manager, COMMIT_NONE);
 
 		// Independent of quorum mode: a funding transaction whose channel state
 		// never reached disk is a 2-of-2 no restored node can enumerate. As a
@@ -981,13 +980,7 @@ describe('Recovery phase 6: funding does not outrun its own frame', () => {
 		harness.manager.on('funding:broadcast-authorized', (_id, tx) =>
 			authorized.push(tx)
 		);
-		harness.manager.removeAllListeners('channel:persist');
-		harness.manager.on(
-			'channel:persist',
-			({ request }: IChannelPersistEvent) => {
-				if (request) request.committed = false;
-			}
-		);
+		setPersistence(harness.manager, COMMIT_NONE);
 
 		dispatch(
 			harness.manager,

@@ -21,6 +21,7 @@ import { ChainActionType } from '../../src/lightning/chain/types';
 import { buildAnchorScript } from '../../src/lightning/script/anchor';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 bitcoin.initEccLib(ecc);
 const network = bitcoin.networks.regtest;
@@ -109,7 +110,8 @@ describe('FS-9: anchor CPFP input provisioning', () => {
 			localFundingPrivkey: crypto
 				.createHash('sha256')
 				.update('cpfp-funding')
-				.digest()
+				.digest(),
+			persistence: COMMIT_ALL
 		});
 		cm.on('error', () => {});
 		return cm;

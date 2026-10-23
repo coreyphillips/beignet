@@ -20,6 +20,7 @@ import {
 	Side,
 	why
 } from './helpers/ffor-concurrent-pair';
+import { onPersist } from './helpers/channel-persistence';
 
 function sentBy(pair: IPair, side: Side): number[] {
 	return pair.link.log.filter((e) => e.from === side).map((e) => e.type);
@@ -30,11 +31,10 @@ function failNextWrite(pair: IPair, side: Side): { blocked: number } {
 	const mgr = side === 'S' ? pair.sManager : pair.rManager;
 	const seen = { blocked: 0 };
 	let failed = false;
-	mgr.on('channel:persist', (ev: { request?: { committed: boolean } }) => {
-		if (!failed && ev.request) {
-			ev.request.committed = false;
-			failed = true;
-		}
+	onPersist(mgr, (request, result) => {
+		if (failed || !request.outbox) return;
+		failed = true;
+		return { ...result, committed: false };
 	});
 	mgr.on('transition:blocked', () => seen.blocked++);
 	return seen;

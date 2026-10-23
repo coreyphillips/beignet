@@ -60,6 +60,7 @@ import {
 	deriveLightningKeysFromMnemonic,
 	LnCoinType
 } from '../../src/lightning/keys/wallet-keys';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // ─────────────── Helpers ───────────────
 
@@ -369,7 +370,8 @@ describe('Production Hardening', () => {
 			const cmConfig: IChannelManagerConfig = {
 				localBasepoints: makeBasepoints(makeSeed(511)),
 				localPerCommitmentSeed: makeSeed(611),
-				localFundingPrivkey: makeSeed(711)
+				localFundingPrivkey: makeSeed(711),
+				persistence: COMMIT_ALL
 			};
 			const cm = new ChannelManager(cmConfig);
 			cm.on('error', () => {});
@@ -389,7 +391,8 @@ describe('Production Hardening', () => {
 			const cmConfig: IChannelManagerConfig = {
 				localBasepoints: makeBasepoints(makeSeed(512)),
 				localPerCommitmentSeed: makeSeed(612),
-				localFundingPrivkey: makeSeed(712)
+				localFundingPrivkey: makeSeed(712),
+				persistence: COMMIT_ALL
 			};
 			const cm = new ChannelManager(cmConfig);
 			cm.on('error', () => {});
@@ -652,7 +655,8 @@ describe('Production Hardening', () => {
 			const cmConfig: IChannelManagerConfig = {
 				localBasepoints: makeBasepoints(makeSeed(530)),
 				localPerCommitmentSeed: makeSeed(630),
-				localFundingPrivkey: makeSeed(730)
+				localFundingPrivkey: makeSeed(730),
+				persistence: COMMIT_ALL
 			};
 			const cm = new ChannelManager(cmConfig);
 			cm.on('error', () => {});
@@ -679,7 +683,8 @@ describe('Production Hardening', () => {
 			const cmConfig: IChannelManagerConfig = {
 				localBasepoints: makeBasepoints(makeSeed(531)),
 				localPerCommitmentSeed: makeSeed(631),
-				localFundingPrivkey: makeSeed(731)
+				localFundingPrivkey: makeSeed(731),
+				persistence: COMMIT_ALL
 			};
 			const cm = new ChannelManager(cmConfig);
 			cm.on('error', () => {});
@@ -705,7 +710,8 @@ describe('Production Hardening', () => {
 			const cmConfig: IChannelManagerConfig = {
 				localBasepoints: makeBasepoints(makeSeed(532)),
 				localPerCommitmentSeed: makeSeed(632),
-				localFundingPrivkey: makeSeed(732)
+				localFundingPrivkey: makeSeed(732),
+				persistence: COMMIT_ALL
 			};
 			const cm = new ChannelManager(cmConfig);
 			cm.on('error', () => {});
@@ -861,7 +867,8 @@ describe('Production Hardening', () => {
 			const cmConfig: IChannelManagerConfig = {
 				localBasepoints: makeBasepoints(makeSeed(564)),
 				localPerCommitmentSeed: makeSeed(664),
-				localFundingPrivkey: makeSeed(764)
+				localFundingPrivkey: makeSeed(764),
+				persistence: COMMIT_ALL
 			};
 			const cm = new ChannelManager(cmConfig);
 			cm.on('error', () => {});

@@ -48,6 +48,7 @@ import {
 } from '../../src/lightning/node/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { COMMIT_ALL } from './helpers/channel-persistence';
 
 // ─────────────── Helpers ───────────────
 
@@ -147,7 +148,8 @@ function makeManager(
 					perCommitmentSeed: crypto.randomBytes(32),
 					fundingPrivkey: crypto.randomBytes(32)
 			  })
-			: undefined
+			: undefined,
+		persistence: COMMIT_ALL
 	});
 	mgr.setFundingProvider({
 		buildFundingTransaction: async () => {

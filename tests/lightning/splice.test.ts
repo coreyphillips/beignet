@@ -100,6 +100,7 @@ import {
 	realCommitmentSigs
 } from './helpers/real-signing';
 import { writableState } from './helpers/writable-state';
+import { COMMIT_ALL, onPersist } from './helpers/channel-persistence';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -176,7 +177,8 @@ function makeConfig(seedId: number): IChannelManagerConfig {
 			.createHash('sha256')
 			.update(seed)
 			.update(Buffer.from([4]))
-			.digest()
+			.digest(),
+		persistence: COMMIT_ALL
 	};
 }
 
@@ -7432,8 +7434,8 @@ describe('Splice', function () {
 			let openerDisk = JSON.parse(
 				JSON.stringify(serializeChannelState(openerChannel.getFullState()))
 			);
-			openerManager.on('channel:persist', (ev: { channel: Channel }) => {
-				if (ev.channel === openerChannel) {
+			onPersist(openerManager, ({ channel }) => {
+				if (channel === openerChannel) {
 					openerDisk = JSON.parse(
 						JSON.stringify(serializeChannelState(openerChannel.getFullState()))
 					);

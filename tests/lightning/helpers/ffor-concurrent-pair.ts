@@ -58,6 +58,7 @@ import {
 	IFforEpochRecord,
 	IFforSettlePolicy
 } from '../../../src/lightning/ffor/types';
+import { COMMIT_ALL } from './channel-persistence';
 
 export type Side = 'S' | 'R';
 
@@ -110,7 +111,8 @@ function makeConfig(
 		preferAnchors: true,
 		// What this side advertises: its own half of the negotiation, and what
 		// the peer's manager reads as our init (the feature seam).
-		localFeatures: advertisedFeatures(concurrent)
+		localFeatures: advertisedFeatures(concurrent),
+		persistence: COMMIT_ALL
 	};
 }
 
