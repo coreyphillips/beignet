@@ -1486,14 +1486,26 @@ function unknownNetwork(network: never): never {
 	);
 }
 
+/**
+ * Mainnet and regtest are the servers the Bitkit app uses (bitkit-android,
+ * `Env.kt`), each with a certificate a public authority signed for its name,
+ * so `electrumTlsVerify` passes on them with no pin. They replace
+ * `fulcrum.bitkit.blocktank.to:8900`, whose certificate expired on May 10,
+ * 2026, and the plaintext `34.65.252.32:18483`, which serves the same regtest
+ * chain.
+ */
 const DEFAULT_ELECTRUM: Record<
 	string,
 	{ host: string; port: number; useTls: boolean }
 > = {
-	mainnet: { host: 'fulcrum.bitkit.blocktank.to', port: 8900, useTls: true },
+	mainnet: { host: 'bitkit.to', port: 9999, useTls: true },
 	testnet: { host: 'electrum.blockstream.info', port: 60002, useTls: true },
 	signet: { host: 'mempool.space', port: 60602, useTls: true },
-	regtest: { host: '34.65.252.32', port: 18483, useTls: false }
+	regtest: {
+		host: 'electrs.bitkit.stag0.blocktank.to',
+		port: 9999,
+		useTls: true
+	}
 };
 
 /**

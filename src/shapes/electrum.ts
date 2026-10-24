@@ -23,14 +23,18 @@ export const ELECTRUM_SERVER_COOLDOWN_MS = 1000 * 60;
 /**
  * Fallback Electrum peers per network, tried after any user-provided servers.
  * Mirrors rn-electrum-client/helpers/peers.json plus networks the library
- * lacks (signet). Regtest is intentionally absent: a regtest wallet must
- * pre-specify its server, never silently reach an external host.
+ * lacks (signet), except that Bitkit's entry is the server the Bitkit app uses
+ * now, `bitkit.to:9999`, not the library's `35.187.18.233:8900`: that one is
+ * the old server by IP, with a certificate no name check can pass. It has no
+ * plaintext port, so `tcp` is 0, as for a TLS-only server the CLI builds.
+ * Regtest is intentionally absent: a regtest wallet must pre-specify its
+ * server, never silently reach an external host.
  */
 export const defaultElectrumPeers: Partial<
 	Record<EElectrumNetworks, TServer[]>
 > = {
 	[EElectrumNetworks.bitcoin]: [
-		{ host: '35.187.18.233', ssl: 8900, tcp: 8911, protocol: EProtocol.ssl },
+		{ host: 'bitkit.to', ssl: 9999, tcp: 0, protocol: EProtocol.ssl },
 		{
 			host: 'electrum.aantonop.com',
 			ssl: 50002,

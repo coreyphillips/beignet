@@ -53,9 +53,9 @@ export const onMessage = (id: unknown, data: unknown): void => {
 export const servers = {
 	[Network.bitcoin]: [
 		{
-			host: '35.187.18.233',
-			ssl: 8900,
-			tcp: 8911,
+			host: 'bitkit.to',
+			ssl: 9999,
+			tcp: 0,
 			protocol: EProtocol.ssl
 		}
 	],
@@ -69,10 +69,10 @@ export const servers = {
 	],
 	[Network.regtest]: [
 		{
-			host: '35.233.47.252',
-			ssl: 18484,
-			tcp: 18483,
-			protocol: EProtocol.tcp
+			host: 'electrs.bitkit.stag0.blocktank.to',
+			ssl: 9999,
+			tcp: 0,
+			protocol: EProtocol.ssl
 		}
 	]
 };

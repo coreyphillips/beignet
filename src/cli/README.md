@@ -2393,9 +2393,11 @@ CLI flags > environment variables > config file > defaults.
 
 | Network | Host | Port | TLS |
 |---------|------|------|-----|
-| mainnet | `fulcrum.bitkit.blocktank.to` | 8900 | yes |
+| mainnet | `bitkit.to` | 9999 | yes |
 | testnet | `electrum.blockstream.info` | 60002 | yes |
-| regtest | `34.65.252.32` | 18483 | no |
+| regtest | `electrs.bitkit.stag0.blocktank.to` | 9999 | yes |
+
+The mainnet and regtest defaults are the servers the Bitkit app uses.
 
 > The regtest default is a hosted Synonym regtest Electrum server. For local
 > development against your own regtest node, override it with
@@ -2421,11 +2423,13 @@ connection per network, so they must use the same `electrumTlsVerify` and
 `electrumTlsFingerprints`. A node whose settings differ from those of a node
 already running on the same network is refused with `INVALID_PARAMS`.
 
-Turn it on together with your own server. As of October 2026 none of the
-built-in mainnet servers passes: `fulcrum.bitkit.blocktank.to` serves an
-expired certificate, and the fallback peers serve self-signed ones. With
-verification on and no pin, the daemon refuses all of them and stays without
-Electrum until a server it can verify answers.
+The mainnet and regtest defaults pass with no pin: each serves a certificate a
+public authority signed for its name. Of the mainnet fallback peers, as of
+October 2026 only `bitkit.to` passes; `bitcoin.lu.ke` and `kirsche.emzy.de`
+serve self-signed certificates and `electrum.aantonop.com` does not answer. So
+with verification on, an outage of `bitkit.to` leaves the daemon without
+Electrum until a server it can verify answers. Run your own server as well if
+that matters.
 
 ---
 
