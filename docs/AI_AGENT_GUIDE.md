@@ -7,7 +7,7 @@ A comprehensive guide for deploying and operating a Beignet Lightning node for A
 - **Node.js** 22.23.4+, 24.22.1+ or 26.12.1+ (the releases with the October 21, 2026 security fixes)
 - **npm** 9+
 - Bitcoin on-chain funds for channel opening
-- Electrum server access (mainnet default: `fulcrum.bitkit.blocktank.to:8900`)
+- Electrum server access (mainnet default: `bitkit.to:9999`)
 
 ## Import Paths
 
@@ -511,8 +511,8 @@ For production reliability, configure multiple Electrum servers:
 const node = await BeignetNode.create({
   network: 'mainnet',
   electrumServers: [
-    { host: 'fulcrum.bitkit.blocktank.to', port: 8900, tls: true },
-    { host: 'electrum.blockstream.info', port: 700, tls: true },
+    { host: 'bitkit.to', port: 9999, tls: true },
+    { host: 'electrum.blockstream.info', port: 50002, tls: true },
   ],
 });
 
