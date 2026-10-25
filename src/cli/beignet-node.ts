@@ -14804,7 +14804,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			updateQueueEntryStatus: (id, status, error, completedAt) =>
 				sqlite().updateQueueEntryStatus(id, status, error, completedAt),
 			deleteQueueEntry: (id) => sqlite().deleteQueueEntry(id),
-			loadAllQueueEntries: () => sqlite().loadAllQueueEntries()
+			loadAllQueueEntries: () => sqlite().loadAllQueueEntries(),
+			loadActiveQueueEntries: () => sqlite().loadActiveQueueEntries(),
+			loadQueueHistory: (limit, before) =>
+				sqlite().loadQueueHistory(limit, before),
+			loadQueueEntry: (id) => sqlite().loadQueueEntry(id)
 		};
 	}
 
@@ -14822,6 +14826,17 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 	listQueue(): QueuedPayment[] {
 		return this.getPaymentQueue().list();
+	}
+
+	getQueuedPayment(id: string): QueuedPayment | undefined {
+		return this.getPaymentQueue().get(id);
+	}
+
+	listQueueHistory(opts?: {
+		limit?: number;
+		before?: string;
+	}): QueuedPayment[] {
+		return this.getPaymentQueue().history(opts);
 	}
 
 	cancelQueuedPayment(id: string): boolean {

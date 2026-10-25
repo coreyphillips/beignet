@@ -99,6 +99,8 @@ const ROUTE_TABLE = [
 	{ method: 'GET', path: '/backup/scb', scopes: ['readonly'] },
 	{ method: 'GET', path: '/backup/peer-retrieved', scopes: ['readonly'] },
 	{ method: 'GET', path: '/queue', scopes: ['readonly'] },
+	{ method: 'GET', path: '/queue/history', scopes: ['readonly'] },
+	{ method: 'GET', path: '/queue/entry', scopes: ['readonly'] },
 	// Recovery Protocol status: diagnostics, like /channel/diagnostics.
 	{
 		method: 'GET',

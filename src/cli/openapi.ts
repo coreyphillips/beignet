@@ -4922,7 +4922,9 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/queue': {
 				get: {
 					summary:
-						'List all payments in the queue (includes entries restored after restart)',
+						'List the queued and dispatching payments, with the most recently finished ones (includes entries restored after restart)',
+					description:
+						'Finished entries beyond the 1000 most recently finished are left out; GET /queue/history pages through all of them, and GET /queue/entry finds any one by id.',
 					tags: ['Queue'],
 					responses: {
 						'200': {
@@ -4932,6 +4934,53 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								items: { $ref: '#/components/schemas/QueuedPayment' }
 							})
 						}
+					}
+				}
+			},
+			'/queue/history': {
+				get: {
+					summary:
+						'Finished queue entries (completed, failed, cancelled), the most recently finished first',
+					description:
+						'One page of up to limit entries (default 100, at most 1000). Pass the id of the last entry of a page as before for the next one; a before that is no finished entry gives an empty page. Every finished entry stays stored until it is pruned.',
+					tags: ['Queue'],
+					parameters: [
+						{ name: 'limit', in: 'query', schema: { type: 'integer' } },
+						{ name: 'before', in: 'query', schema: { type: 'string' } }
+					],
+					responses: {
+						'200': {
+							description: 'Finished queue entries',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/QueuedPayment' }
+							})
+						}
+					}
+				}
+			},
+			'/queue/entry': {
+				get: {
+					summary: 'Get one queue entry by id, whatever its status',
+					description:
+						'From memory, else from the database, so an entry GET /queue no longer lists is still found. NOT_FOUND only when neither holds it.',
+					tags: ['Queue'],
+					parameters: [
+						{
+							name: 'id',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Queued payment',
+							content: jsonContent({
+								$ref: '#/components/schemas/QueuedPayment'
+							})
+						},
+						'404': { description: 'Queued payment not found' }
 					}
 				}
 			},

@@ -2,7 +2,11 @@ import { SqliteStorage as SqliteStorageClass } from './sqlite-storage';
 
 export * from './types';
 export * from './serialization';
-export { IStoredPaymentRef, IPaymentRowMatch } from './sqlite-storage';
+export {
+	IStoredPaymentRef,
+	IPaymentRowMatch,
+	IQueueEntryRow
+} from './sqlite-storage';
 export * from './encryption';
 export { MemoryStorage } from './memory-storage';
 export {

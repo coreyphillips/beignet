@@ -311,3 +311,94 @@ describe('The daemon and BeignetNode run one payment queue (issue #978)', functi
 		).to.deep.equal(['completed']);
 	});
 });
+
+describe('GET /queue/entry and GET /queue/history read what GET /queue no longer lists (issue #1866)', function () {
+	this.timeout(60_000);
+
+	let tmpDir: string;
+	let daemon: IStartedDaemon | undefined;
+
+	beforeEach(() => {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-queue-history-'));
+		daemon = undefined;
+	});
+
+	afterEach(async () => {
+		await daemon?.stop();
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	it('finds an entry and pages history past the 1000 finished entries memory keeps', async () => {
+		// Run 1 leaves more finished rows than a start keeps in memory.
+		const seeded = await BeignetNode.create({ ...BOOT, dataDir: tmpDir });
+		try {
+			const storage = seeded.getStorage();
+			const db = (
+				storage as unknown as {
+					db: { transaction(fn: () => void): () => void };
+				}
+			).db;
+			db.transaction(() => {
+				for (let i = 1; i <= 1_002; i++) {
+					storage.saveQueueEntry({
+						id: `q-${i}-old`,
+						bolt11: `lnbc_old_${i}`,
+						priority: 5,
+						status: 'completed',
+						createdAt: i
+					});
+					storage.updateQueueEntryStatus(
+						`q-${i}-old`,
+						'completed',
+						undefined,
+						10_000 + i
+					);
+				}
+			})();
+		} finally {
+			await seeded.destroy();
+		}
+
+		daemon = await startDaemon({
+			...BOOT,
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: TOKEN
+		});
+		const port = (daemon.server.address() as AddressInfo).port;
+		const listed = await listedIds(port);
+		expect(listed).to.have.length(1_000);
+		expect(listed).to.not.include('q-1-old');
+
+		const entry = await request(port, 'GET', '/queue/entry?id=q-1-old');
+		expect(entry.status, JSON.stringify(entry.body)).to.equal(200);
+		expect((entry.body.result as QueuedPayment).bolt11).to.equal('lnbc_old_1');
+		expect(
+			(await request(port, 'GET', '/queue/entry?id=nope')).status
+		).to.equal(404);
+		expect((await request(port, 'GET', '/queue/entry')).status).to.equal(400);
+
+		const page = await request(
+			port,
+			'GET',
+			'/queue/history?limit=2&before=q-3-old'
+		);
+		expect(page.status, JSON.stringify(page.body)).to.equal(200);
+		expect(
+			(page.body.result as QueuedPayment[]).map((e) => e.id)
+		).to.deep.equal(['q-2-old', 'q-1-old']);
+		const first = await request(port, 'GET', '/queue/history');
+		expect(first.body.result as QueuedPayment[]).to.have.length(100);
+		expect((first.body.result as QueuedPayment[])[0].id).to.equal('q-1002-old');
+		expect(
+			(await request(port, 'GET', '/queue/history?limit=0')).status
+		).to.equal(400);
+
+		// The node's methods read the same queue.
+		const node = daemon.node;
+		expect(node.getQueuedPayment('q-1-old')?.status).to.equal('completed');
+		expect(
+			node.listQueueHistory({ limit: 1, before: 'q-2-old' }).map((e) => e.id)
+		).to.deep.equal(['q-1-old']);
+	});
+});

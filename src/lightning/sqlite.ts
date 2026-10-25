@@ -7,7 +7,8 @@
 export {
 	SqliteStorage,
 	IStoredPaymentRef,
-	IPaymentRowMatch
+	IPaymentRowMatch,
+	IQueueEntryRow
 } from './storage/sqlite-storage';
 export {
 	GuardianStore,

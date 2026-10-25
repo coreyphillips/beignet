@@ -3507,6 +3507,18 @@ async function bootDaemon(
 			);
 		},
 		'GET /queue': () => success(paymentQueue.list()),
+		'GET /queue/history': (_body, query) => {
+			const limit = parseIntParam(query, 'limit', { min: 1 });
+			const before = query.get('before') || undefined;
+			return success(paymentQueue.history({ limit, before }));
+		},
+		'GET /queue/entry': (_body, query) => {
+			const id = query.get('id');
+			if (!id) return failure('INVALID_PARAMS', 'id required');
+			const entry = paymentQueue.get(id);
+			if (!entry) return failure('NOT_FOUND', 'Queued payment not found');
+			return success(entry);
+		},
 		'POST /queue/cancel': (body) => {
 			const { id } = body as { id: string };
 			if (!id) return failure('INVALID_PARAMS', 'id required');

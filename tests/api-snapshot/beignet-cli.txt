@@ -360,6 +360,7 @@ method BeignetNode.getPayment(paymentHash: PaymentHashHex): PaymentInfo | null
 method BeignetNode.getPaymentProof(paymentHash: PaymentHashHex): PaymentProof | null
 method BeignetNode.getPaymentQueue(): PaymentQueue
 method BeignetNode.getPeerRetrievedBackup(): { encoded: string; createdAt: number; fromPeer: string; channelCount: number; source: 'scb' | 'capsule'; } | null
+method BeignetNode.getQueuedPayment(id: string): QueuedPayment | undefined
 method BeignetNode.getReadyChannels(): ChannelInfo[]
 method BeignetNode.getRecoverySurfaceStatus(): { mode: RecoveryMode; profile: 'crash-v1' | null; generation: string; configuredSetStale: boolean; rotation: { inProgress: boolean; pending: boolean; retirePending: boolean; lastEvent: { type: string; detail: string; } | null; followed: { generation: string; from: string[]; to: string[]; } | null; }; guardians: Array<{ guardianId: string; url: string; }>; state: 'disabled' | 'running' | 'restore-required' | 'restoring' | 'restart-required' | 'fenced'; node: ReturnType<beignet/lightning#node.LightningNode['getRecoveryStatus']> | null; capsules: { candidates: number; best: { writerEpoch: string; latestSequence: string; inline: boolean; channelCount: number; guardians: IReportedGuardian[]; fromPeer: string; receivedAt: number; } | null; }; restore?: { inProgress: boolean; lastEvent?: { type: string; detail: string; }; }; autoApply: { enabled: boolean; phase: 'idle' | 'settling' | 'applying' | 'applied' | 'refused'; settleUntil: number | null; lastReason: string | null; }; }
 method BeignetNode.getStats(windowMs?: number): NodeStats
@@ -388,6 +389,7 @@ method BeignetNode.listOnchainTransactions(): OnchainTxInfo[]
 method BeignetNode.listPayments(filter?: PaymentFilter): PaymentInfo[]
 method BeignetNode.listPeers(): PeerInfo[]
 method BeignetNode.listQueue(): QueuedPayment[]
+method BeignetNode.listQueueHistory(opts?: { limit?: number; before?: string; }): QueuedPayment[]
 method BeignetNode.listSwaps(id?: string): Record<string, unknown>[]
 method BeignetNode.listTrustedPeers(): TrustedPeerInfo[]
 method BeignetNode.listUtxos(): UtxoInfo[]
@@ -961,7 +963,10 @@ property IPaymentProof.preimage: Buffer
 property IPaymentProof.route?: beignet/lightning#gossip.IRoute
 interface IPaymentQueueStorage
 method IPaymentQueueStorage.deleteQueueEntry(id: string): void
-method IPaymentQueueStorage.loadAllQueueEntries(): Array<{ id: string; bolt11: string; priority: number; status: string; amountSats?: number; maxFeeSats?: number; metadata?: string; error?: string; createdAt: number; completedAt?: number; }>
+method IPaymentQueueStorage.loadActiveQueueEntries?(): PaymentQueueRow[]
+method IPaymentQueueStorage.loadAllQueueEntries(): PaymentQueueRow[]
+method IPaymentQueueStorage.loadQueueEntry?(id: string): PaymentQueueRow | undefined
+method IPaymentQueueStorage.loadQueueHistory?(limit: number, before?: string): PaymentQueueRow[]
 method IPaymentQueueStorage.saveQueueEntry(entry: { id: string; bolt11: string; priority: number; status: string; amountSats?: number; maxFeeSats?: number; metadata?: string; createdAt: number; }): void
 method IPaymentQueueStorage.updateQueueEntryStatus(id: string, status: string, error?: string, completedAt?: number): void
 unexported interface IReportedGuardian
@@ -1210,6 +1215,8 @@ constructor PaymentQueue(payInvoiceSafe: PayInvoiceSafeFn, canSend: CanSendFn, o
 get PaymentQueue.activePayments(): number
 method PaymentQueue.cancel(id: string): boolean
 method PaymentQueue.enqueue(bolt11: string, priority?: number, opts?: { amountSats?: number; maxFeeSats?: number; metadata?: Record<string, string>; }): QueuedPayment
+method PaymentQueue.get(id: string): QueuedPayment | undefined
+method PaymentQueue.history(opts?: { limit?: number; before?: string; }): QueuedPayment[]
 method PaymentQueue.list(): QueuedPayment[]
 get PaymentQueue.pendingCount(): number
 method PaymentQueue.poke(): void
@@ -1220,8 +1227,20 @@ method PaymentQueue.stop(): void
 interface PaymentQueueOptions
 property PaymentQueueOptions.invoiceAmountSats?: (bolt11: string) => number | undefined
 property PaymentQueueOptions.maxConcurrent?: number
+property PaymentQueueOptions.maxRetainedHistory?: number
 property PaymentQueueOptions.paymentTimeoutMs?: number
 property PaymentQueueOptions.resolveInterrupted?: (bolt11: string) => Promise<InterruptedPaymentOutcome>
+interface PaymentQueueRow
+property PaymentQueueRow.amountSats?: number
+property PaymentQueueRow.bolt11: string
+property PaymentQueueRow.completedAt?: number
+property PaymentQueueRow.createdAt: number
+property PaymentQueueRow.error?: string
+property PaymentQueueRow.id: string
+property PaymentQueueRow.maxFeeSats?: number
+property PaymentQueueRow.metadata?: string
+property PaymentQueueRow.priority: number
+property PaymentQueueRow.status: string
 interface PaymentRoute
 property PaymentRoute.hopCount: number
 property PaymentRoute.hops: PaymentRouteHop[]

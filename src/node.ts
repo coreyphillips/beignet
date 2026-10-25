@@ -25,6 +25,7 @@ export {
 	PaymentQueue,
 	IPaymentQueueStorage,
 	PaymentQueueOptions,
+	PaymentQueueRow,
 	InterruptedPaymentOutcome,
 	INTERRUPTED_PAYMENT_ERROR
 } from './cli/payment-queue';
