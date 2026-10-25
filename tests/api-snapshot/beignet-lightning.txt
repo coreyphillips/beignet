@@ -7468,6 +7468,17 @@ property storage.IPersistedChannelPolicy.feeBaseMsat?: number
 property storage.IPersistedChannelPolicy.feeProportionalMillionths?: number
 property storage.IPersistedChannelPolicy.htlcMaximumMsat?: string
 property storage.IPersistedChannelPolicy.htlcMinimumMsat?: string
+interface storage.IQueueEntryRow
+property storage.IQueueEntryRow.amountSats?: number
+property storage.IQueueEntryRow.bolt11: string
+property storage.IQueueEntryRow.completedAt?: number
+property storage.IQueueEntryRow.createdAt: number
+property storage.IQueueEntryRow.error?: string
+property storage.IQueueEntryRow.id: string
+property storage.IQueueEntryRow.maxFeeSats?: number
+property storage.IQueueEntryRow.metadata?: string
+property storage.IQueueEntryRow.priority: number
+property storage.IQueueEntryRow.status: string
 interface storage.IRecoveryJournalStorage
 method storage.IRecoveryJournalStorage.deleteRecoveryFramesBelow(sequence: number): void
 method storage.IRecoveryJournalStorage.deleteRecoveryMeta(key: string): void

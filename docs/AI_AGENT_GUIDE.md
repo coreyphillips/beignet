@@ -302,11 +302,14 @@ if (result.status === 'COMPLETED') {
 ### Payment queuing
 For batch payments with concurrency control. The queue is **persistent**: queued payments survive daemon restarts and crashes, and dispatch once a channel can carry them after the next start. A payment that was mid-dispatch at the restart is checked against the node's own record for its invoice before anything sends it again: one that was paid is recorded `completed`, one whose HTLCs are still out stays `dispatching` until they resolve, and only one that paid nothing is queued again. A dispatch whose HTLC is still out when the queue's own payment timeout fires (60 s by default) is not recorded `failed` either: it stays `dispatching` and is recorded from the node's outcome, `completed` when the payment settles and `failed` once every HTLC resolved with nothing paid (issue #976). A `failed` entry is a verdict; a `dispatching` one is still being paid, so do not enqueue its invoice again.
 
+`listQueue()` holds every queued and dispatching entry but only the 1000 most recently finished ones. Look an entry up by id to follow it: `getQueuedPayment(id)` reads the database for one that is no longer listed, and `listQueueHistory({ limit, before })` pages through every finished entry, newest first.
+
 ```typescript
 const queue = node.enqueuePayment(bolt11, 1); // priority 1 (highest)
 console.log('Queued:', queue.id);
 
 // Monitor progress
+const entry = node.getQueuedPayment(queue.id);
 const items = node.listQueue();
 ```
 

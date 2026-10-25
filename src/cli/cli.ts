@@ -2068,12 +2068,31 @@ async function handleQueue(): Promise<void> {
 			);
 		case 'list':
 			return outputResult(await httpRequest('GET', '/queue'));
+		case 'get':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/queue/entry?id=${encodeURIComponent(filteredArgs[2] || '')}`
+				)
+			);
+		case 'history': {
+			const params = new URLSearchParams();
+			const limit = parseFlag('--limit');
+			if (limit !== undefined) params.set('limit', limit);
+			const before = parseFlag('--before');
+			if (before !== undefined) params.set('before', before);
+			const qs = params.toString();
+			return outputResult(
+				await httpRequest('GET', `/queue/history${qs ? `?${qs}` : ''}`)
+			);
+		}
 		default:
 			output({
 				ok: false,
 				error: {
 					code: 'UNKNOWN_COMMAND',
-					message: 'Usage: beignet queue [add <bolt11>|cancel <id>|list]'
+					message:
+						'Usage: beignet queue [add <bolt11>|cancel <id>|list|get <id>|history]'
 				}
 			});
 			process.exitCode = 1;
@@ -3189,6 +3208,9 @@ Swaps (reverse: a peer pays us over Lightning, we fund an on-chain contract;
                                          Enqueue a payment for ordered dispatch
   queue cancel <id>                      Cancel a queued payment
   queue list                             List the payment queue
+  queue get <id>                         Look up one queue entry by id
+  queue history [--limit N] [--before <id>]
+                                         Finished entries, newest first, a page at a time
   l402 fetch <url> --max-price N         Fetch an L402-gated URL, paying up to N sats
   l402 credentials                       List paid L402 credentials
   l402 forget <scope>                    Drop a credential so the next fetch pays again

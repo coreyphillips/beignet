@@ -15,6 +15,12 @@
  * as for an entry a restart interrupted (issue #976). Without a resolver
  * such an entry is recorded 'failed' with its outcome unknown, as a restored
  * in-flight entry is, never as a failure to send again.
+ *
+ * Queued and dispatching entries are held apart from finished ones (issue
+ * #1866): a pass reads the next queued entry from the front of its own list,
+ * and memory keeps only the most recently finished entries, up to
+ * maxRetainedHistory. Storage keeps every entry until prune(), and get() and
+ * history() read the ones memory no longer holds.
  */
 
 import { EventEmitter } from 'events';
@@ -22,6 +28,12 @@ import { BeignetError, BeignetErrorCode } from './errors';
 import type { QueuedPayment } from './types';
 
 const SATS_MESSAGE = 'must be a whole number of satoshis, zero or greater';
+
+/** The default for PaymentQueueOptions.maxRetainedHistory. */
+const DEFAULT_RETAINED_HISTORY = 1000;
+/** The page size history() uses without a limit, and the most it returns. */
+const DEFAULT_HISTORY_PAGE = 100;
+const MAX_HISTORY_PAGE = 1000;
 
 /** A whole number of satoshis, zero or greater. */
 function isWholeSats(value: unknown): value is number {
@@ -86,6 +98,17 @@ export interface PaymentQueueOptions {
 	 * amountSats would have waited for capacity.
 	 */
 	invoiceAmountSats?: (bolt11: string) => number | undefined;
+	/**
+	 * How many finished entries (completed, failed, or cancelled in an
+	 * earlier process) list() keeps: the most recently finished, 1000 by
+	 * default. Infinity keeps every one, as before issue #1866. An older entry
+	 * leaves memory only: storage still holds it, get() and history() still
+	 * read it, and only prune() deletes it. Queued and dispatching entries
+	 * are never counted against this or dropped, however many there are.
+	 * Without storage, where a dropped entry is gone, an entry whose outcome
+	 * is unknown stays past this limit too, until prune().
+	 */
+	maxRetainedHistory?: number;
 }
 
 /** Recorded on a restored in-flight entry when no resolver can settle it. */
@@ -110,6 +133,20 @@ export const IN_FLIGHT_PAYMENT_ERROR =
 export const TIMED_OUT_PAYMENT_ERROR =
 	'Payment was left pending by the dispatch and then failed without paying';
 
+/** A payment queue entry as storage holds it. */
+export interface PaymentQueueRow {
+	id: string;
+	bolt11: string;
+	priority: number;
+	status: string;
+	amountSats?: number;
+	maxFeeSats?: number;
+	metadata?: string;
+	error?: string;
+	createdAt: number;
+	completedAt?: number;
+}
+
 export interface IPaymentQueueStorage {
 	saveQueueEntry(entry: {
 		id: string;
@@ -128,18 +165,75 @@ export interface IPaymentQueueStorage {
 		completedAt?: number
 	): void;
 	deleteQueueEntry(id: string): void;
-	loadAllQueueEntries(): Array<{
-		id: string;
-		bolt11: string;
-		priority: number;
-		status: string;
-		amountSats?: number;
-		maxFeeSats?: number;
-		metadata?: string;
-		error?: string;
-		createdAt: number;
-		completedAt?: number;
-	}>;
+	loadAllQueueEntries(): PaymentQueueRow[];
+	/**
+	 * The rows still 'queued' or 'dispatching'. With loadQueueHistory, a
+	 * start reads only these and the history it keeps; without them it reads
+	 * every row (issue #1866).
+	 */
+	loadActiveQueueEntries?(): PaymentQueueRow[];
+	/**
+	 * Up to limit finished rows (any status but 'queued' and 'dispatching'),
+	 * the most recently finished first: by completedAt, or createdAt for a
+	 * row without one, then by id, both descending. With before, the rows
+	 * after that finished row in this order, and none when no finished row
+	 * has that id. Without it, history() sorts loadAllQueueEntries().
+	 */
+	loadQueueHistory?(limit: number, before?: string): PaymentQueueRow[];
+	/** The row with this id. Without it, get() searches loadAllQueueEntries(). */
+	loadQueueEntry?(id: string): PaymentQueueRow | undefined;
+}
+
+function isActiveStatus(status: string): boolean {
+	return status === 'queued' || status === 'dispatching';
+}
+
+/** history() order: the most recently finished first, as loadQueueHistory. */
+function newestFinishedFirst(
+	a: { id: string; createdAt: number; completedAt?: number },
+	b: { id: string; createdAt: number; completedAt?: number }
+): number {
+	const at = (b.completedAt ?? b.createdAt) - (a.completedAt ?? a.createdAt);
+	if (at !== 0) return at;
+	return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+}
+
+/** The page of sorted history after the entry with id before. */
+function historyPage<T extends { id: string }>(
+	sorted: T[],
+	limit: number,
+	before?: string
+): T[] {
+	if (before === undefined) return sorted.slice(0, limit);
+	const at = sorted.findIndex((e) => e.id === before);
+	return at < 0 ? [] : sorted.slice(at + 1, at + 1 + limit);
+}
+
+function entryFromRow(row: PaymentQueueRow): QueuedPayment {
+	return {
+		id: row.id,
+		bolt11: row.bolt11,
+		priority: row.priority,
+		status: row.status as QueuedPayment['status'],
+		amountSats: row.amountSats,
+		maxFeeSats: row.maxFeeSats,
+		metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
+		error: row.error,
+		createdAt: row.createdAt,
+		completedAt: row.completedAt
+	};
+}
+
+/**
+ * A failed entry the queue could not settle: its payment may have been
+ * made, and nothing but this record says to check before paying again.
+ */
+function isOutcomeUnknown(entry: QueuedPayment): boolean {
+	return (
+		entry.status === 'failed' &&
+		(entry.error === INTERRUPTED_PAYMENT_ERROR ||
+			entry.error === IN_FLIGHT_PAYMENT_ERROR)
+	);
 }
 
 type PayInvoiceSafeFn = (
@@ -155,7 +249,29 @@ type CanSendFn = (amountSats: number) => {
 };
 
 export class PaymentQueue extends EventEmitter {
-	private queue: QueuedPayment[] = [];
+	/**
+	 * Queued and dispatching entries, by id. None is ever dropped to bound
+	 * memory: each may yet be sent, or is still out.
+	 */
+	private active = new Map<string, QueuedPayment>();
+	/**
+	 * The queued entries of active in dispatch order (priority, then the
+	 * order they were queued in), so a pass reads the next one from the front
+	 * rather than searching past finished ones (issue #1866).
+	 */
+	private pending: QueuedPayment[] = [];
+	/** Finished entries list() shows, oldest finished first. */
+	private finished = new Map<string, QueuedPayment>();
+	/**
+	 * Finished entries whose outcome is unknown, in a queue without storage.
+	 * They are the only record that the payment needs checking before it is
+	 * paid again, so maxRetainedHistory does not drop them; prune() does.
+	 */
+	private unknownOutcomes = new Map<string, QueuedPayment>();
+	/** Where each entry falls among those of its priority in list() order. */
+	private sequence = new WeakMap<QueuedPayment, number>();
+	private nextSequence = 0;
+	private maxRetainedHistory: number;
 	private activeCount = 0;
 	private maxConcurrent: number;
 	private paymentTimeoutMs: number;
@@ -180,10 +296,9 @@ export class PaymentQueue extends EventEmitter {
 	 */
 	private interrupted = new Set<string>();
 	/**
-	 * Entries restored from storage, including an interrupted one queued
-	 * again as unpaid. Only start() releases them: an enqueue() before it
-	 * dispatches its own entry, never these into channels that cannot carry
-	 * them yet (issue #967).
+	 * Entries restored from storage still queued or dispatching. Only start()
+	 * releases them: an enqueue() before it dispatches its own entry, never
+	 * these into channels that cannot carry them yet (issue #967).
 	 */
 	private restored = new Set<string>();
 	/**
@@ -208,45 +323,61 @@ export class PaymentQueue extends EventEmitter {
 		this.resolveInterrupted = options?.resolveInterrupted;
 		this.invoiceAmountSats = options?.invoiceAmountSats;
 		this.storage = storage ?? null;
+		const retained = options?.maxRetainedHistory ?? DEFAULT_RETAINED_HISTORY;
+		if (
+			retained !== Infinity &&
+			!(Number.isSafeInteger(retained) && retained >= 0)
+		) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'maxRetainedHistory must be a whole number, zero or greater, or Infinity'
+			);
+		}
+		this.maxRetainedHistory = retained;
 
 		// Restore persisted queue entries. Nothing dispatches here: start()
 		// does, once the payer can pay (issue #967).
 		if (this.storage) {
 			try {
-				for (const row of this.storage.loadAllQueueEntries()) {
-					const entry: QueuedPayment = {
-						id: row.id,
-						bolt11: row.bolt11,
-						priority: row.priority,
-						status: row.status as QueuedPayment['status'],
-						amountSats: row.amountSats,
-						maxFeeSats: row.maxFeeSats,
-						metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
-						error: row.error,
-						createdAt: row.createdAt,
-						completedAt: row.completedAt
-					};
-					this.queue.push(entry);
-					this.restored.add(row.id);
-
-					// A row still 'dispatching' was in flight when the process
-					// stopped, and its payment may have been made. Sending it
-					// again is not safe: the node refuses a second payment to the
-					// same hash only while the first is pending, so one that
-					// already completed would be paid twice (issue #967). It
-					// stays 'dispatching' until start() has the resolver settle
-					// it. With no resolver it is recorded 'failed', for the
-					// operator to check.
-					if (row.status === 'dispatching') {
+				const entries: QueuedPayment[] = [];
+				for (const row of this.restoredRows(this.storage)) {
+					try {
+						entries.push(entryFromRow(row));
+					} catch {
+						// Metadata that does not parse: the row stays in
+						// storage, and the rest are restored.
+					}
+				}
+				entries.sort(
+					(a, b) => a.priority - b.priority || a.createdAt - b.createdAt
+				);
+				const finished: QueuedPayment[] = [];
+				for (const entry of entries) {
+					this.sequence.set(entry, this.nextSequence++);
+					if (entry.status === 'queued') {
+						this.active.set(entry.id, entry);
+						this.pending.push(entry);
+						this.restored.add(entry.id);
+					} else if (entry.status === 'dispatching') {
+						// A row still 'dispatching' was in flight when the
+						// process stopped, and its payment may have been made.
+						// Sending it again is not safe: the node refuses a
+						// second payment to the same hash only while the first
+						// is pending, so one that already completed would be
+						// paid twice (issue #967). It stays 'dispatching' until
+						// start() has the resolver settle it. With no resolver
+						// it is recorded 'failed', for the operator to check.
 						if (this.resolveInterrupted) {
-							this.interrupted.add(row.id);
+							this.active.set(entry.id, entry);
+							this.restored.add(entry.id);
+							this.interrupted.add(entry.id);
 						} else {
 							entry.status = 'failed';
 							entry.error = INTERRUPTED_PAYMENT_ERROR;
 							entry.completedAt = Date.now();
 							try {
 								this.storage.updateQueueEntryStatus(
-									row.id,
+									entry.id,
 									entry.status,
 									entry.error,
 									entry.completedAt
@@ -254,22 +385,50 @@ export class PaymentQueue extends EventEmitter {
 							} catch {
 								/* best-effort */
 							}
+							finished.push(entry);
 						}
+					} else {
+						finished.push(entry);
 					}
 
 					// Track max ID counter for new entries
-					const idParts = row.id.match(/^q-(\d+)-/);
+					const idParts = entry.id.match(/^q-(\d+)-/);
 					if (idParts) {
 						const num = parseInt(idParts[1], 10);
 						if (num > this.idCounter) this.idCounter = num;
 					}
 				}
-				// Re-sort by priority
-				this.queue.sort((a, b) => a.priority - b.priority);
+				finished.sort((a, b) => newestFinishedFirst(b, a));
+				for (const entry of finished) this.retire(entry);
 			} catch {
 				// Storage failure should not prevent startup
 			}
 		}
+	}
+
+	/**
+	 * The rows a start restores: every queued and dispatching one, and the
+	 * most recently finished up to maxRetainedHistory. Older finished rows
+	 * stay in storage, unread (issue #1866).
+	 */
+	private restoredRows(storage: IPaymentQueueStorage): PaymentQueueRow[] {
+		const keep = this.maxRetainedHistory;
+		if (storage.loadActiveQueueEntries && storage.loadQueueHistory) {
+			const active = storage.loadActiveQueueEntries();
+			if (keep === 0) return active;
+			return [
+				...active,
+				...storage.loadQueueHistory(Math.min(keep, Number.MAX_SAFE_INTEGER))
+			];
+		}
+		const rows = storage.loadAllQueueEntries();
+		return [
+			...rows.filter((row) => isActiveStatus(row.status)),
+			...rows
+				.filter((row) => !isActiveStatus(row.status))
+				.sort(newestFinishedFirst)
+				.slice(0, keep)
+		];
 	}
 
 	/**
@@ -316,9 +475,9 @@ export class PaymentQueue extends EventEmitter {
 			metadata: opts?.metadata,
 			createdAt: Date.now()
 		};
-		this.queue.push(entry);
-		// Sort by priority (lower number = higher priority)
-		this.queue.sort((a, b) => a.priority - b.priority);
+		this.sequence.set(entry, this.nextSequence++);
+		this.active.set(entry.id, entry);
+		this.addPending(entry);
 
 		// Persist to storage
 		if (this.storage) {
@@ -352,11 +511,13 @@ export class PaymentQueue extends EventEmitter {
 	 * @returns true if the payment was found and cancelled
 	 */
 	cancel(id: string): boolean {
-		const entry = this.queue.find((e) => e.id === id);
+		const entry = this.active.get(id);
 		if (!entry) return false;
 		if (entry.status !== 'queued') return false;
 		entry.status = 'cancelled';
-		this.queue = this.queue.filter((e) => e.id !== id);
+		this.active.delete(id);
+		const at = this.pending.indexOf(entry);
+		if (at >= 0) this.pending.splice(at, 1);
 
 		if (this.storage) {
 			try {
@@ -370,17 +531,86 @@ export class PaymentQueue extends EventEmitter {
 	}
 
 	/**
-	 * List all items in the queue (including completed/failed for recent history).
+	 * Every queued and dispatching entry, with the most recently finished
+	 * ones (up to maxRetainedHistory), by priority and then in the order they
+	 * were queued. history() pages through every finished entry storage
+	 * holds, and get() finds any one by id.
 	 */
 	list(): QueuedPayment[] {
-		return this.queue.map((e) => ({ ...e }));
+		return [
+			...this.active.values(),
+			...this.finished.values(),
+			...this.unknownOutcomes.values()
+		]
+			.sort(this.inListOrder)
+			.map((e) => ({ ...e }));
+	}
+
+	/**
+	 * The entry with this id, whatever its status: from memory, else from
+	 * storage, so an entry list() no longer holds is still found (issue
+	 * #1866). Undefined when neither holds it. A storage read that fails
+	 * throws rather than answering that there is no such entry.
+	 */
+	get(id: string): QueuedPayment | undefined {
+		const held =
+			this.active.get(id) ??
+			this.finished.get(id) ??
+			this.unknownOutcomes.get(id);
+		if (held) return { ...held };
+		if (!this.storage) return undefined;
+		const row = this.storage.loadQueueEntry
+			? this.storage.loadQueueEntry(id)
+			: this.storage.loadAllQueueEntries().find((r) => r.id === id);
+		return row ? entryFromRow(row) : undefined;
+	}
+
+	/**
+	 * Finished entries (completed, failed, cancelled), the most recently
+	 * finished first, one page at a time (issue #1866): up to limit (100 by
+	 * default, at most 1000), after the entry with id before when given, so
+	 * the last id of one page asks for the next. With storage it reads every
+	 * finished entry stored, which prune() alone deletes; without storage,
+	 * those memory holds. A before that is no finished entry's id gives an
+	 * empty page. A storage read that fails throws.
+	 */
+	history(opts?: { limit?: number; before?: string }): QueuedPayment[] {
+		const limit = opts?.limit ?? DEFAULT_HISTORY_PAGE;
+		if (!(Number.isSafeInteger(limit) && limit >= 1)) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'limit must be a whole number, 1 or greater'
+			);
+		}
+		const size = Math.min(limit, MAX_HISTORY_PAGE);
+		const before = opts?.before;
+		if (!this.storage) {
+			const held = [
+				...this.finished.values(),
+				...this.unknownOutcomes.values()
+			];
+			return historyPage(held.sort(newestFinishedFirst), size, before).map(
+				(e) => ({ ...e })
+			);
+		}
+		const rows = this.storage.loadQueueHistory
+			? this.storage.loadQueueHistory(size, before)
+			: historyPage(
+					this.storage
+						.loadAllQueueEntries()
+						.filter((row) => !isActiveStatus(row.status))
+						.sort(newestFinishedFirst),
+					size,
+					before
+			  );
+		return rows.map(entryFromRow);
 	}
 
 	/**
 	 * Get the number of pending items.
 	 */
 	get pendingCount(): number {
-		return this.queue.filter((e) => e.status === 'queued').length;
+		return this.pending.length;
 	}
 
 	/**
@@ -391,28 +621,61 @@ export class PaymentQueue extends EventEmitter {
 	}
 
 	/**
-	 * Clear completed/failed entries from the queue.
+	 * Delete every finished entry (completed, failed, cancelled), from memory
+	 * and from storage, those memory no longer holds included: this is the
+	 * only call that deletes queue history. Queued and dispatching entries,
+	 * an in-flight one the resolver has not settled among them, are never
+	 * touched. Returns how many entries it removed.
 	 */
 	prune(): number {
-		const before = this.queue.length;
-		const toRemove = this.queue.filter(
-			(e) => e.status !== 'queued' && e.status !== 'dispatching'
-		);
-		this.queue = this.queue.filter(
-			(e) => e.status === 'queued' || e.status === 'dispatching'
-		);
+		const removed = new Set<string>([
+			...this.finished.keys(),
+			...this.unknownOutcomes.keys()
+		]);
+		this.finished.clear();
+		this.unknownOutcomes.clear();
 
 		if (this.storage) {
-			for (const entry of toRemove) {
+			try {
+				for (const id of this.storedHistoryIds(this.storage)) {
+					if (!this.active.has(id)) removed.add(id);
+				}
+			} catch {
+				/* best-effort */
+			}
+			for (const id of removed) {
 				try {
-					this.storage.deleteQueueEntry(entry.id);
+					this.storage.deleteQueueEntry(id);
 				} catch {
 					/* best-effort */
 				}
 			}
 		}
 
-		return before - this.queue.length;
+		return removed.size;
+	}
+
+	/** The id of every finished row in storage, read a page at a time. */
+	private storedHistoryIds(storage: IPaymentQueueStorage): Set<string> {
+		const ids = new Set<string>();
+		if (!storage.loadQueueHistory) {
+			for (const row of storage.loadAllQueueEntries()) {
+				if (!isActiveStatus(row.status)) ids.add(row.id);
+			}
+			return ids;
+		}
+		let page = storage.loadQueueHistory(MAX_HISTORY_PAGE);
+		for (;;) {
+			const known = ids.size;
+			for (const row of page) ids.add(row.id);
+			// A page with nothing new ends it too: a storage that ignores
+			// before would otherwise answer the same page forever.
+			if (page.length < MAX_HISTORY_PAGE || ids.size === known) return ids;
+			page = storage.loadQueueHistory(
+				MAX_HISTORY_PAGE,
+				page[page.length - 1].id
+			);
+		}
 	}
 
 	/**
@@ -432,7 +695,12 @@ export class PaymentQueue extends EventEmitter {
 	start(): void {
 		if (this.stopped || this.started) return;
 		this.started = true;
-		const interrupted = this.queue.filter((e) => this.interrupted.has(e.id));
+		this.restored.clear();
+		const interrupted: QueuedPayment[] = [];
+		for (const id of this.interrupted) {
+			const entry = this.active.get(id);
+			if (entry) interrupted.push(entry);
+		}
 		this.interrupted.clear();
 		// Before the restored rows, so a refusal they meet just now is not
 		// asked about again in the same pass.
@@ -552,6 +820,7 @@ export class PaymentQueue extends EventEmitter {
 					/* best-effort */
 				}
 			}
+			this.retire(entry);
 			this.emit('queue:completed', {
 				id: entry.id,
 				paymentHash: result.paymentHash
@@ -572,6 +841,7 @@ export class PaymentQueue extends EventEmitter {
 		// Every HTLC it offered resolved and none paid, so nothing was paid:
 		// it takes its turn again like any queued payment.
 		entry.status = 'queued';
+		this.addPending(entry);
 		if (this.storage) {
 			try {
 				this.storage.updateQueueEntryStatus(entry.id, entry.status);
@@ -591,12 +861,11 @@ export class PaymentQueue extends EventEmitter {
 		try {
 			// Process all eligible entries
 			while (this.activeCount < this.maxConcurrent) {
-				// A restored entry waits for start() (issue #967).
-				const next = this.queue.find(
-					(e) =>
-						e.status === 'queued' && (this.started || !this.restored.has(e.id))
-				);
-				if (!next) break;
+				// A restored entry waits for start() (issue #967), which
+				// empties restored: from then on this is the front entry.
+				const index = this.pending.findIndex((e) => !this.restored.has(e.id));
+				if (index < 0) break;
+				const next = this.pending[index];
 
 				// Check capacity for the entry's amountSats or, when that is
 				// absent, the amount its invoice carries (issue #981). Zero,
@@ -608,6 +877,7 @@ export class PaymentQueue extends EventEmitter {
 					// amountSats can be anything else here): the check refuses
 					// it on every pass, so fail it rather than hold the rest
 					// behind it.
+					this.pending.splice(index, 1);
 					this.recordFailed(next, new Error(`amountSats ${SATS_MESSAGE}`));
 					continue;
 				}
@@ -623,6 +893,7 @@ export class PaymentQueue extends EventEmitter {
 					if (!check.canSend) break; // No capacity, stop processing
 				}
 
+				this.pending.splice(index, 1);
 				next.status = 'dispatching';
 				this.activeCount++;
 				this.emit('queue:dispatched', { id: next.id, bolt11: next.bolt11 });
@@ -666,8 +937,44 @@ export class PaymentQueue extends EventEmitter {
 				/* best-effort */
 			}
 		}
+		this.retire(entry);
 		this.emit('queue:failed', { id: entry.id, error: entry.error });
 	}
+
+	/** Place a queued entry in pending, in dispatch order. */
+	private addPending(entry: QueuedPayment): void {
+		let low = 0;
+		let high = this.pending.length;
+		while (low < high) {
+			const mid = (low + high) >>> 1;
+			if (this.inListOrder(this.pending[mid], entry) < 0) low = mid + 1;
+			else high = mid;
+		}
+		this.pending.splice(low, 0, entry);
+	}
+
+	/**
+	 * Move an entry that has just finished out of active and into the
+	 * history list() shows, dropping the oldest finished entries past
+	 * maxRetainedHistory. Storage keeps every one of them.
+	 */
+	private retire(entry: QueuedPayment): void {
+		this.active.delete(entry.id);
+		if (!this.storage && isOutcomeUnknown(entry)) {
+			this.unknownOutcomes.set(entry.id, entry);
+			return;
+		}
+		this.finished.set(entry.id, entry);
+		for (const id of this.finished.keys()) {
+			if (this.finished.size <= this.maxRetainedHistory) break;
+			this.finished.delete(id);
+		}
+	}
+
+	/** list() order: priority, then the order the entries were queued in. */
+	private inListOrder = (a: QueuedPayment, b: QueuedPayment): number =>
+		a.priority - b.priority ||
+		(this.sequence.get(a) ?? 0) - (this.sequence.get(b) ?? 0);
 
 	/**
 	 * The amount the invoice of an entry without amountSats carries, from the
@@ -752,6 +1059,7 @@ export class PaymentQueue extends EventEmitter {
 					/* best-effort */
 				}
 			}
+			if (!stillOut) this.retire(entry);
 			// The slot goes once, here, whatever the outcome: an entry still
 			// out holds none while the resolver waits (a stuck HTLC can last
 			// until its expiry, and canSend already counts what it holds).

@@ -90,6 +90,27 @@ const METADATA_TAG_INFO = 'beignet-payment-metadata-tag-v1';
 /** Hex characters kept of each metadata tag's HMAC. */
 const METADATA_TAG_HEX = 32;
 
+const QUEUE_COLUMNS =
+	'id, bolt11, priority, status, amount_sats, max_fee_sats, metadata, error, created_at, completed_at';
+/** A payment_queue row the queue no longer dispatches. */
+const QUEUE_FINISHED = "status NOT IN ('queued', 'dispatching')";
+/** When a row finished; idx_payment_queue_finished indexes this expression. */
+const QUEUE_FINISHED_AT = 'COALESCE(completed_at, created_at)';
+
+/** A payment_queue row, as the CLI payment queue stores it. */
+export interface IQueueEntryRow {
+	id: string;
+	bolt11: string;
+	priority: number;
+	status: string;
+	amountSats?: number;
+	maxFeeSats?: number;
+	metadata?: string;
+	error?: string;
+	createdAt: number;
+	completedAt?: number;
+}
+
 /** A payment row's key from paymentsNewestFirst; load() decodes the row. */
 export interface IStoredPaymentRef {
 	paymentHash: string;
@@ -875,6 +896,11 @@ export class SqliteStorage implements IStorageBackend {
 				created_at INTEGER NOT NULL,
 				completed_at INTEGER
 			);
+			-- A start reads the active rows and the newest finished ones,
+			-- however long the history (issue #1866).
+			CREATE INDEX IF NOT EXISTS idx_payment_queue_status ON payment_queue(status);
+			CREATE INDEX IF NOT EXISTS idx_payment_queue_finished
+				ON payment_queue(COALESCE(completed_at, created_at), id);
 
 			CREATE TABLE IF NOT EXISTS channel_policies (
 				channel_id TEXT PRIMARY KEY,
@@ -2967,21 +2993,50 @@ export class SqliteStorage implements IStorageBackend {
 		this._stmt('DELETE FROM payment_queue WHERE id = ?').run(id);
 	}
 
-	loadAllQueueEntries(): Array<{
-		id: string;
-		bolt11: string;
-		priority: number;
-		status: string;
-		amountSats?: number;
-		maxFeeSats?: number;
-		metadata?: string;
-		error?: string;
-		createdAt: number;
-		completedAt?: number;
-	}> {
-		const rows = this._stmt(
-			'SELECT id, bolt11, priority, status, amount_sats, max_fee_sats, metadata, error, created_at, completed_at FROM payment_queue ORDER BY priority ASC, created_at ASC'
-		).all() as Array<{
+	loadAllQueueEntries(): IQueueEntryRow[] {
+		return this._queueRows(
+			`SELECT ${QUEUE_COLUMNS} FROM payment_queue ORDER BY priority ASC, created_at ASC`
+		);
+	}
+
+	/** The rows still 'queued' or 'dispatching', in loadAllQueueEntries order. */
+	loadActiveQueueEntries(): IQueueEntryRow[] {
+		return this._queueRows(
+			`SELECT ${QUEUE_COLUMNS} FROM payment_queue WHERE status IN ('queued', 'dispatching') ORDER BY priority ASC, created_at ASC`
+		);
+	}
+
+	/**
+	 * Up to limit finished rows (any status but 'queued' and 'dispatching'),
+	 * the most recently finished first: by completed_at, or created_at for a
+	 * row without one, then by id. With before, the rows after that finished
+	 * row in this order, and none when no finished row has that id.
+	 */
+	loadQueueHistory(limit: number, before?: string): IQueueEntryRow[] {
+		if (before === undefined) {
+			return this._queueRows(
+				`SELECT ${QUEUE_COLUMNS} FROM payment_queue WHERE ${QUEUE_FINISHED} ORDER BY ${QUEUE_FINISHED_AT} DESC, id DESC LIMIT ?`,
+				limit
+			);
+		}
+		// The <= term alone is what lets SQLite seek the index to the
+		// cursor; the OR that settles a tie on the time does not.
+		return this._queueRows(
+			`SELECT ${QUEUE_COLUMNS} FROM payment_queue, (SELECT ${QUEUE_FINISHED_AT} AS cursor_at, id AS cursor_id FROM payment_queue WHERE id = ? AND ${QUEUE_FINISHED}) WHERE ${QUEUE_FINISHED} AND ${QUEUE_FINISHED_AT} <= cursor_at AND (${QUEUE_FINISHED_AT} < cursor_at OR id < cursor_id) ORDER BY ${QUEUE_FINISHED_AT} DESC, id DESC LIMIT ?`,
+			before,
+			limit
+		);
+	}
+
+	loadQueueEntry(id: string): IQueueEntryRow | undefined {
+		return this._queueRows(
+			`SELECT ${QUEUE_COLUMNS} FROM payment_queue WHERE id = ?`,
+			id
+		)[0];
+	}
+
+	private _queueRows(sql: string, ...params: unknown[]): IQueueEntryRow[] {
+		const rows = this._stmt(sql).all(...params) as Array<{
 			id: string;
 			bolt11: string;
 			priority: number;
