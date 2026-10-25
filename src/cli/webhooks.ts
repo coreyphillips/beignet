@@ -78,10 +78,109 @@ export interface IWebhookStorage {
 	loadWebhookSecrets?(): Record<string, string> | null;
 }
 
+/**
+ * Ceilings on the delivery work a WebhookManager holds at once. An event that
+ * would take a registration, or all of them, past its byte ceiling is dropped
+ * for that registration and counted as an overflow.
+ */
+export interface WebhookDeliveryOptions {
+	/** Deliveries in flight or waiting to retry, across registrations (default 32) */
+	maxActiveDeliveries?: number;
+	/** Deliveries in flight or waiting to retry, per registration (default 4) */
+	maxActivePerWebhook?: number;
+	/**
+	 * Payload bytes held by queued and active deliveries, across registrations
+	 * (default 8 MiB). An event matching several registrations counts once
+	 * for each.
+	 */
+	maxQueuedBytes?: number;
+	/** Payload bytes held by queued and active deliveries, per registration (default 1 MiB) */
+	maxQueuedBytesPerWebhook?: number;
+	/** Longest one attempt may take, response body included (default 5000) */
+	timeoutMs?: number;
+	/** Pause before the one retry of a failed attempt (default 2000) */
+	retryDelayMs?: number;
+}
+
+/** What a WebhookManager holds now, and what its deliveries came to. */
+export interface WebhookDeliveryStats {
+	/** Deliveries in flight or waiting to retry */
+	active: number;
+	/** Deliveries waiting for a free worker */
+	queued: number;
+	/** Payload bytes held by queued and active deliveries */
+	queuedBytes: number;
+	/** Deliveries a recipient answered with 2xx */
+	delivered: number;
+	/** Deliveries dropped after both attempts failed */
+	failed: number;
+	/** Deliveries refused at dispatch because a byte ceiling was reached */
+	overflowed: number;
+	/** Deliveries dropped because their registration was removed or the manager stopped */
+	discarded: number;
+}
+
+/** Prometheus text lines for a manager's delivery stats. */
+export function webhookMetrics(stats: WebhookDeliveryStats): string {
+	const outcomes: Array<[string, number]> = [
+		['delivered', stats.delivered],
+		['failed', stats.failed],
+		['overflow', stats.overflowed],
+		['discarded', stats.discarded]
+	];
+	return (
+		[
+			'# HELP beignet_webhook_deliveries_active Webhook deliveries in flight or waiting to retry',
+			'# TYPE beignet_webhook_deliveries_active gauge',
+			`beignet_webhook_deliveries_active ${stats.active}`,
+			'# HELP beignet_webhook_deliveries_queued Webhook deliveries waiting for a worker',
+			'# TYPE beignet_webhook_deliveries_queued gauge',
+			`beignet_webhook_deliveries_queued ${stats.queued}`,
+			'# HELP beignet_webhook_queued_bytes Payload bytes held by queued and active webhook deliveries',
+			'# TYPE beignet_webhook_queued_bytes gauge',
+			`beignet_webhook_queued_bytes ${stats.queuedBytes}`,
+			'# HELP beignet_webhook_deliveries_total Webhook deliveries by outcome',
+			'# TYPE beignet_webhook_deliveries_total counter',
+			...outcomes.map(
+				([outcome, count]) =>
+					`beignet_webhook_deliveries_total{outcome="${outcome}"} ${count}`
+			)
+		].join('\n') + '\n'
+	);
+}
+
 interface WebhookEntry extends WebhookRegistration {
 	// internal: secretHash for storage (not the raw secret)
 	secretHash?: string;
 }
+
+interface QueuedDelivery {
+	eventType: string;
+	payload: string;
+	bytes: number;
+	paymentHash?: string;
+}
+
+/** One registration's share of the delivery work. */
+interface Destination {
+	webhook: WebhookEntry;
+	ready: QueuedDelivery[];
+	// Hold deliveries waiting behind an earlier one for the same payment hash.
+	// A hash is a key while that earlier delivery is in `ready` or running.
+	lanes: Map<string, QueuedDelivery[]>;
+	active: number;
+	bytes: number;
+	inLine: boolean;
+	removed: boolean;
+}
+
+interface RunningDelivery {
+	destination: Destination;
+	request?: http.ClientRequest;
+	endPause?: () => void;
+}
+
+type DeliveryOutcome = 'delivered' | 'failed' | 'discarded';
 
 function sha256Hex(value: string): string {
 	return crypto.createHash('sha256').update(value).digest('hex');
@@ -106,16 +205,56 @@ function withoutPreimage(data: unknown): unknown {
 	return copy;
 }
 
-const DELIVERY_TIMEOUT_MS = 5000;
-const RETRY_DELAY_MS = 2000;
+const DEFAULT_MAX_ACTIVE_DELIVERIES = 32;
+const DEFAULT_MAX_ACTIVE_PER_WEBHOOK = 4;
+const DEFAULT_MAX_QUEUED_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_QUEUED_BYTES_PER_WEBHOOK = 1024 * 1024;
+const DEFAULT_TIMEOUT_MS = 5000;
+const DEFAULT_RETRY_DELAY_MS = 2000;
 
 export class WebhookManager {
 	private webhooks: Map<string, WebhookEntry> = new Map();
-	private holdDeliveries = new Map<string, Map<string, Promise<void>>>();
 	private storage: IWebhookStorage | null;
+	private maxActiveDeliveries: number;
+	private maxActivePerWebhook: number;
+	private maxQueuedBytes: number;
+	private maxQueuedBytesPerWebhook: number;
+	private timeoutMs: number;
+	private retryDelayMs: number;
+	private destinations = new Map<string, Destination>();
+	// Destinations with a ready delivery and a free worker of their own. Each
+	// turn starts one delivery, so a backlog at one cannot starve the rest.
+	private line: Destination[] = [];
+	private running = new Set<RunningDelivery>();
+	private queued = 0;
+	private queuedBytes = 0;
+	private outcomes = { delivered: 0, failed: 0, overflowed: 0, discarded: 0 };
+	private stopped = false;
+	private idleWaiters: Array<() => void> = [];
 
-	constructor(storage?: IWebhookStorage) {
+	constructor(storage?: IWebhookStorage, options?: WebhookDeliveryOptions) {
 		this.storage = storage ?? null;
+		this.maxActiveDeliveries = Math.max(
+			1,
+			options?.maxActiveDeliveries ?? DEFAULT_MAX_ACTIVE_DELIVERIES
+		);
+		this.maxActivePerWebhook = Math.max(
+			1,
+			options?.maxActivePerWebhook ?? DEFAULT_MAX_ACTIVE_PER_WEBHOOK
+		);
+		this.maxQueuedBytes = Math.max(
+			1,
+			options?.maxQueuedBytes ?? DEFAULT_MAX_QUEUED_BYTES
+		);
+		this.maxQueuedBytesPerWebhook = Math.max(
+			1,
+			options?.maxQueuedBytesPerWebhook ?? DEFAULT_MAX_QUEUED_BYTES_PER_WEBHOOK
+		);
+		this.timeoutMs = Math.max(1, options?.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+		this.retryDelayMs = Math.max(
+			0,
+			options?.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS
+		);
 
 		// Restore persisted webhooks
 		if (this.storage) {
@@ -195,7 +334,8 @@ export class WebhookManager {
 	unregister(id: string): boolean {
 		const secret = this.webhooks.get(id)?.secret;
 		const deleted = this.webhooks.delete(id);
-		this.holdDeliveries.delete(id);
+		const destination = this.destinations.get(id);
+		if (destination) this.discard(destination);
 		if (deleted && this.storage) {
 			try {
 				this.storage.deleteWebhook(id);
@@ -216,11 +356,14 @@ export class WebhookManager {
 
 	/**
 	 * Dispatch an event to all matching webhooks.
-	 * Fire-and-forget with 1 retry after 2s delay.
+	 * Best effort, with 1 retry after a failed attempt. Deliveries wait for a
+	 * worker within the configured ceilings; one that would pass a byte
+	 * ceiling is dropped and counted in deliveryStats().overflowed.
 	 * Hold lifecycle deliveries, including retries, run in order per webhook
 	 * registration and payment hash.
 	 */
 	dispatch(eventType: string, data: unknown): void {
+		if (this.stopped) return;
 		let payload: string;
 		try {
 			// Snapshot once so queued deliveries and retries preserve the event identity.
@@ -232,39 +375,67 @@ export class WebhookManager {
 		} catch {
 			return;
 		}
+		const bytes = Buffer.byteLength(payload);
 		const paymentHash = this.holdPaymentHash(eventType, data);
 
 		for (const webhook of this.webhooks.values()) {
-			if (webhook.events.includes(eventType) || webhook.events.includes('*')) {
-				const deliver = (): Promise<void> =>
-					this.deliverWithRetry(webhook, eventType, payload);
-				if (paymentHash === undefined) {
-					void deliver();
-					continue;
-				}
-
-				let deliveries = this.holdDeliveries.get(webhook.id);
-				if (!deliveries) {
-					deliveries = new Map();
-					this.holdDeliveries.set(webhook.id, deliveries);
-				}
-				const previous = deliveries.get(paymentHash);
-				const delivery = previous ? previous.then(deliver) : deliver();
-				deliveries.set(paymentHash, delivery);
-				const queue = deliveries;
-				void delivery.then(() => {
-					if (queue.get(paymentHash) === delivery) {
-						queue.delete(paymentHash);
-						if (
-							queue.size === 0 &&
-							this.holdDeliveries.get(webhook.id) === queue
-						) {
-							this.holdDeliveries.delete(webhook.id);
-						}
-					}
-				});
+			if (
+				!webhook.events.includes(eventType) &&
+				!webhook.events.includes('*')
+			) {
+				continue;
 			}
+			let destination = this.destinations.get(webhook.id);
+			if (
+				(destination?.bytes ?? 0) + bytes > this.maxQueuedBytesPerWebhook ||
+				this.queuedBytes + bytes > this.maxQueuedBytes
+			) {
+				this.outcomes.overflowed++;
+				continue;
+			}
+			if (!destination) {
+				destination = {
+					webhook,
+					ready: [],
+					lanes: new Map(),
+					active: 0,
+					bytes: 0,
+					inLine: false,
+					removed: false
+				};
+				this.destinations.set(webhook.id, destination);
+			}
+			destination.bytes += bytes;
+			this.queuedBytes += bytes;
+			this.queued++;
+			this.enqueue(destination, { eventType, payload, bytes, paymentHash });
 		}
+		this.pump();
+	}
+
+	/** Work held now, and running totals of how deliveries ended. */
+	deliveryStats(): WebhookDeliveryStats {
+		return {
+			active: this.running.size,
+			queued: this.queued,
+			queuedBytes: this.queuedBytes,
+			...this.outcomes
+		};
+	}
+
+	/**
+	 * Stop delivering, for good: queued deliveries are dropped, retry pauses
+	 * end, requests in flight are aborted and later dispatches are ignored.
+	 * Registrations are kept. Resolves once no delivery is running.
+	 */
+	stop(): Promise<void> {
+		this.stopped = true;
+		for (const destination of [...this.destinations.values()]) {
+			this.discard(destination);
+		}
+		for (const run of this.running) run.request?.destroy();
+		if (this.running.size === 0) return Promise.resolve();
+		return new Promise((resolve) => this.idleWaiters.push(resolve));
 	}
 
 	/**
@@ -279,7 +450,9 @@ export class WebhookManager {
 	 */
 	clear(): void {
 		this.webhooks.clear();
-		this.holdDeliveries.clear();
+		for (const destination of [...this.destinations.values()]) {
+			this.discard(destination);
+		}
 		if (this.storage) {
 			try {
 				this.storage.deleteAllWebhooks();
@@ -324,30 +497,149 @@ export class WebhookManager {
 		return undefined;
 	}
 
-	private async deliverWithRetry(
-		webhook: WebhookEntry,
-		eventType: string,
-		payload: string
-	): Promise<void> {
-		for (let attempt = 0; attempt < 2; attempt++) {
-			if (this.webhooks.get(webhook.id) !== webhook) return;
-			try {
-				await this.deliver(webhook, eventType, payload);
+	private enqueue(destination: Destination, delivery: QueuedDelivery): void {
+		const hash = delivery.paymentHash;
+		if (hash !== undefined) {
+			const lane = destination.lanes.get(hash);
+			if (lane) {
+				lane.push(delivery);
 				return;
+			}
+			destination.lanes.set(hash, []);
+		}
+		destination.ready.push(delivery);
+		this.joinLine(destination);
+	}
+
+	private joinLine(destination: Destination): void {
+		if (
+			destination.inLine ||
+			destination.removed ||
+			destination.ready.length === 0 ||
+			destination.active >= this.maxActivePerWebhook
+		) {
+			return;
+		}
+		destination.inLine = true;
+		this.line.push(destination);
+	}
+
+	private pump(): void {
+		while (
+			this.running.size < this.maxActiveDeliveries &&
+			this.line.length > 0
+		) {
+			const destination = this.line.shift()!;
+			destination.inLine = false;
+			const delivery = destination.ready.shift();
+			if (destination.removed || !delivery) continue;
+			this.start(destination, delivery);
+			this.joinLine(destination);
+		}
+	}
+
+	private start(destination: Destination, delivery: QueuedDelivery): void {
+		const run: RunningDelivery = { destination };
+		this.running.add(run);
+		destination.active++;
+		this.queued--;
+		void this.deliverWithRetry(run, delivery).then((outcome) => {
+			this.outcomes[outcome]++;
+			this.running.delete(run);
+			destination.active--;
+			destination.bytes -= delivery.bytes;
+			this.queuedBytes -= delivery.bytes;
+			if (delivery.paymentHash !== undefined && !destination.removed) {
+				const lane = destination.lanes.get(delivery.paymentHash);
+				const next = lane?.shift();
+				if (next) destination.ready.push(next);
+				else destination.lanes.delete(delivery.paymentHash);
+			}
+			if (
+				destination.active === 0 &&
+				destination.ready.length === 0 &&
+				this.destinations.get(destination.webhook.id) === destination
+			) {
+				this.destinations.delete(destination.webhook.id);
+			}
+			this.joinLine(destination);
+			this.pump();
+			if (this.running.size === 0) {
+				const waiters = this.idleWaiters;
+				this.idleWaiters = [];
+				for (const resolve of waiters) resolve();
+			}
+		});
+	}
+
+	/**
+	 * Drop a registration's queued deliveries and end its retry pauses. Its
+	 * requests in flight finish on their own and keep their bytes until then.
+	 */
+	private discard(destination: Destination): void {
+		destination.removed = true;
+		if (this.destinations.get(destination.webhook.id) === destination) {
+			this.destinations.delete(destination.webhook.id);
+		}
+		const dropped = [
+			...destination.ready,
+			...[...destination.lanes.values()].flat()
+		];
+		destination.ready = [];
+		destination.lanes.clear();
+		for (const delivery of dropped) {
+			destination.bytes -= delivery.bytes;
+			this.queuedBytes -= delivery.bytes;
+		}
+		this.queued -= dropped.length;
+		this.outcomes.discarded += dropped.length;
+		for (const run of this.running) {
+			if (run.destination === destination) run.endPause?.();
+		}
+	}
+
+	private isCurrent(destination: Destination): boolean {
+		return (
+			!destination.removed &&
+			this.webhooks.get(destination.webhook.id) === destination.webhook
+		);
+	}
+
+	/** Never rejects: the outcome is all its caller needs. */
+	private async deliverWithRetry(
+		run: RunningDelivery,
+		delivery: QueuedDelivery
+	): Promise<DeliveryOutcome> {
+		for (let attempt = 0; ; attempt++) {
+			if (!this.isCurrent(run.destination)) return 'discarded';
+			try {
+				await this.deliver(run, delivery);
+				return 'delivered';
 			} catch {
-				if (attempt === 0 && this.webhooks.get(webhook.id) === webhook) {
-					await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
-				}
-				// Silently drop after the retry so the next queued event can proceed.
+				if (!this.isCurrent(run.destination)) return 'discarded';
+				// Drop after the retry so the next queued event can proceed.
+				if (attempt === 1) return 'failed';
+				await this.pause(run);
 			}
 		}
 	}
 
+	private pause(run: RunningDelivery): Promise<void> {
+		return new Promise((resolve) => {
+			const timer = setTimeout(() => run.endPause?.(), this.retryDelayMs);
+			run.endPause = (): void => {
+				clearTimeout(timer);
+				run.endPause = undefined;
+				resolve();
+			};
+		});
+	}
+
 	private async deliver(
-		webhook: WebhookEntry,
-		eventType: string,
-		payload: string
+		run: RunningDelivery,
+		{ eventType, payload }: QueuedDelivery
 	): Promise<void> {
+		const webhook = run.destination.webhook;
 		const url = new URL(webhook.url);
 		// A row stored before register() checked the scheme.
 		if (url.protocol !== 'http:' && url.protocol !== 'https:') {
@@ -372,36 +664,48 @@ export class WebhookManager {
 			headers['X-Webhook-Signature'] = `sha256=${sig}`;
 		}
 
+		// Settled on the request's close, which comes after the response body
+		// ends, so the socket stays counted against the worker limits until it
+		// is released. The deadline covers a recipient that trickles its reply.
 		return new Promise((resolve, reject) => {
+			let status: number | undefined;
+			let failure: Error | undefined;
 			const req = lib.request(
 				{
 					hostname: url.hostname,
 					port: url.port || (isHttps ? 443 : 80),
 					path: url.pathname + url.search,
 					method: 'POST',
-					headers,
-					timeout: DELIVERY_TIMEOUT_MS
+					headers
 				},
 				(res) => {
+					status = res.statusCode;
+					// A response cut off mid-body emits an error of its own.
+					res.on('error', () => undefined);
 					// Consume response body to free memory
 					res.resume();
-					if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-						resolve();
-					} else {
-						reject(
-							new Error(`Webhook delivery failed: HTTP ${res.statusCode}`)
-						);
-					}
 				}
 			);
-
-			req.on('timeout', () => {
-				req.destroy();
-				reject(new Error('Webhook delivery timed out'));
-			});
+			const deadline = setTimeout(
+				() => req.destroy(new Error('Webhook delivery timed out')),
+				this.timeoutMs
+			);
+			run.request = req;
 
 			req.on('error', (err) => {
-				reject(err);
+				failure ??= err;
+			});
+
+			req.on('close', () => {
+				clearTimeout(deadline);
+				run.request = undefined;
+				if (status !== undefined && status >= 200 && status < 300) {
+					resolve();
+				} else {
+					reject(
+						failure ?? new Error(`Webhook delivery failed: HTTP ${status}`)
+					);
+				}
 			});
 
 			req.write(payload);

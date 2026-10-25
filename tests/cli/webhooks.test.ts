@@ -3,7 +3,9 @@ import * as crypto from 'crypto';
 import { expect } from 'chai';
 import {
 	IWebhookStorage,
+	WebhookDeliveryOptions,
 	WebhookManager,
+	webhookMetrics,
 	webhookTargetRefusal
 } from '../../src/cli/webhooks';
 import { BeignetError } from '../../src/cli/errors';
@@ -495,5 +497,456 @@ describe('WebhookManager', () => {
 			const restored = new WebhookManager(storage);
 			expect(restored.list().map((w) => w.id)).to.deep.equal(['kept']);
 		});
+	});
+});
+
+describe('WebhookManager delivery limits (issue #1865)', function () {
+	this.timeout(10_000);
+
+	interface Arrival {
+		url: string;
+		event: string;
+		data: unknown;
+		payload: string;
+		res: http.ServerResponse;
+	}
+
+	let server: http.Server;
+	let port: number;
+	let arrivals: Arrival[];
+	let held: Arrival[];
+	let answer: (arrival: Arrival) => number | 'hold';
+	let open: Map<string, number>;
+	let peakOpen: Map<string, number>;
+	let peakOpenTotal: number;
+	let managers: WebhookManager[];
+	let unhandled: unknown[];
+	const onUnhandled = (reason: unknown): void => {
+		unhandled.push(reason);
+	};
+
+	function openTotal(): number {
+		return [...open.values()].reduce((sum, n) => sum + n, 0);
+	}
+
+	before((done) => {
+		server = http.createServer((req, res) => {
+			const url = req.url ?? '';
+			open.set(url, (open.get(url) ?? 0) + 1);
+			peakOpen.set(url, Math.max(peakOpen.get(url) ?? 0, open.get(url)!));
+			peakOpenTotal = Math.max(peakOpenTotal, openTotal());
+			res.on('close', () => open.set(url, open.get(url)! - 1));
+			const chunks: Buffer[] = [];
+			req.on('data', (chunk: Buffer) => chunks.push(chunk));
+			req.on('end', () => {
+				const payload = Buffer.concat(chunks).toString();
+				const body = JSON.parse(payload) as { event: string; data: unknown };
+				const arrival = {
+					url,
+					event: body.event,
+					data: body.data,
+					payload,
+					res
+				};
+				arrivals.push(arrival);
+				const status = answer(arrival);
+				if (status === 'hold') {
+					held.push(arrival);
+				} else {
+					res.statusCode = status;
+					res.end();
+				}
+			});
+		});
+		server.listen(0, '127.0.0.1', () => {
+			port = (server.address() as { port: number }).port;
+			done();
+		});
+	});
+
+	after((done) => {
+		server.close(done);
+	});
+
+	beforeEach(() => {
+		arrivals = [];
+		held = [];
+		answer = (): number => 200;
+		open = new Map();
+		peakOpen = new Map();
+		peakOpenTotal = 0;
+		managers = [];
+		unhandled = [];
+		process.on('unhandledRejection', onUnhandled);
+	});
+
+	afterEach(async () => {
+		answer = (): number => 200;
+		release(200);
+		await Promise.all(managers.map((manager) => manager.stop()));
+		// A rejection is reported a tick after it goes unhandled.
+		await new Promise((resolve) => setImmediate(resolve));
+		process.off('unhandledRejection', onUnhandled);
+		expect(unhandled).to.deep.equal([]);
+	});
+
+	function create(options: WebhookDeliveryOptions): WebhookManager {
+		const manager = new WebhookManager(undefined, options);
+		managers.push(manager);
+		return manager;
+	}
+
+	/** Answer every held request with `status`. */
+	function release(status: number): void {
+		for (const arrival of held.splice(0)) {
+			if (arrival.res.destroyed) continue;
+			arrival.res.statusCode = status;
+			arrival.res.end();
+		}
+	}
+
+	/** Poll `condition`, recording the manager's peak work along the way. */
+	async function until(
+		condition: () => boolean,
+		manager?: WebhookManager,
+		peak?: { active: number; queuedBytes: number }
+	): Promise<void> {
+		const deadline = Date.now() + 5000;
+		for (;;) {
+			if (manager && peak) {
+				const stats = manager.deliveryStats();
+				peak.active = Math.max(peak.active, stats.active);
+				peak.queuedBytes = Math.max(peak.queuedBytes, stats.queuedBytes);
+			}
+			if (condition()) return;
+			if (Date.now() > deadline) throw new Error('until timed out');
+			await new Promise((resolve) => setTimeout(resolve, 2));
+		}
+	}
+
+	/** Bytes of the payload dispatch() builds for `data`. */
+	function payloadBytes(eventType: string, data: unknown): number {
+		return Buffer.byteLength(
+			JSON.stringify({ event: eventType, data, timestamp: Date.now() })
+		);
+	}
+
+	const seq = (i: number): { seq: string } => ({
+		seq: String(i).padStart(4, '0')
+	});
+
+	it('a slow recipient burst stays within the worker and byte ceilings', async () => {
+		const size = payloadBytes('payment:received', seq(0));
+		const manager = create({
+			maxActiveDeliveries: 3,
+			maxActivePerWebhook: 2,
+			maxQueuedBytesPerWebhook: size * 8,
+			maxQueuedBytes: size * 100
+		});
+		manager.register(`http://127.0.0.1:${port}/a`, ['*']);
+		manager.register(`http://127.0.0.1:${port}/b`, ['*']);
+		answer = (): 'hold' => 'hold';
+		const peak = { active: 0, queuedBytes: 0 };
+
+		for (let i = 0; i < 50; i++) manager.dispatch('payment:received', seq(i));
+
+		await until(() => held.length === 3, manager, peak);
+		// Settle any extra arrival before asserting none came.
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(held).to.have.length(3);
+		expect(new Set(held.map((arrival) => arrival.url))).to.deep.equal(
+			new Set(['/a', '/b'])
+		);
+		expect(manager.deliveryStats()).to.deep.include({
+			active: 3,
+			queued: 13,
+			queuedBytes: size * 16,
+			overflowed: 84,
+			delivered: 0
+		});
+
+		answer = (): number => 200;
+		release(200);
+		await until(() => manager.deliveryStats().delivered === 16, manager, peak);
+
+		expect(peak.active).to.be.at.most(3);
+		expect(peak.queuedBytes).to.equal(size * 16);
+		expect(peakOpenTotal).to.be.at.most(3);
+		expect(peakOpen.get('/a')).to.be.at.most(2);
+		expect(peakOpen.get('/b')).to.be.at.most(2);
+		for (const url of ['/a', '/b']) {
+			expect(
+				arrivals
+					.filter((arrival) => arrival.url === url)
+					.map((arrival) => (arrival.data as { seq: string }).seq)
+			).to.deep.equal([
+				'0000',
+				'0001',
+				'0002',
+				'0003',
+				'0004',
+				'0005',
+				'0006',
+				'0007'
+			]);
+		}
+		expect(manager.deliveryStats()).to.deep.equal({
+			active: 0,
+			queued: 0,
+			queuedBytes: 0,
+			delivered: 16,
+			failed: 0,
+			overflowed: 84,
+			discarded: 0
+		});
+	});
+
+	it('a failing recipient burst retries each delivery once, with its payload, within the ceilings', async () => {
+		const manager = create({
+			maxActiveDeliveries: 8,
+			maxActivePerWebhook: 2,
+			retryDelayMs: 10
+		});
+		manager.register(`http://127.0.0.1:${port}/fail`, ['*'], 'secret');
+		answer = (): number => 500;
+		const peak = { active: 0, queuedBytes: 0 };
+
+		for (let i = 0; i < 10; i++) manager.dispatch('payment:received', seq(i));
+		await until(() => manager.deliveryStats().failed === 10, manager, peak);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		expect(peak.active).to.be.at.most(2);
+		expect(peakOpen.get('/fail')).to.be.at.most(2);
+		expect(arrivals).to.have.length(20);
+		const attempts = new Map<string, number>();
+		for (const arrival of arrivals) {
+			attempts.set(arrival.payload, (attempts.get(arrival.payload) ?? 0) + 1);
+		}
+		expect([...attempts.values()]).to.deep.equal(new Array(10).fill(2));
+		expect(manager.deliveryStats()).to.deep.include({
+			active: 0,
+			queued: 0,
+			queuedBytes: 0,
+			delivered: 0,
+			failed: 10
+		});
+	});
+
+	it('a backlog at one recipient neither starves another of workers nor of bytes', async () => {
+		const size = payloadBytes('payment:received', seq(0));
+		const manager = create({
+			maxActiveDeliveries: 3,
+			maxActivePerWebhook: 2,
+			maxQueuedBytesPerWebhook: size * 5,
+			maxQueuedBytes: size * 10
+		});
+		manager.register(`http://127.0.0.1:${port}/slow`, ['*']);
+		manager.register(`http://127.0.0.1:${port}/fast`, ['*']);
+		answer = (arrival): number | 'hold' =>
+			arrival.url === '/slow' ? 'hold' : 200;
+
+		for (let i = 0; i < 5; i++) manager.dispatch('payment:received', seq(i));
+		await until(
+			() => arrivals.filter((arrival) => arrival.url === '/fast').length === 5
+		);
+		// The slow backlog keeps its own bytes; the fast one's are released.
+		expect(manager.deliveryStats().queuedBytes).to.equal(size * 5);
+
+		for (let i = 5; i < 10; i++) manager.dispatch('payment:received', seq(i));
+		await until(
+			() => arrivals.filter((arrival) => arrival.url === '/fast').length === 10
+		);
+
+		expect(held).to.have.length(2);
+		expect(held.every((arrival) => arrival.url === '/slow')).to.equal(true);
+		expect(manager.deliveryStats()).to.deep.include({
+			delivered: 10,
+			overflowed: 5,
+			queuedBytes: size * 5
+		});
+	});
+
+	it('hold deliveries keep their order per payment hash with workers to spare', async () => {
+		const manager = create({ maxActivePerWebhook: 4 });
+		manager.register(`http://127.0.0.1:${port}/hook`, ['*']);
+		answer = (arrival): number | 'hold' =>
+			arrival.event === 'hold:accepted' &&
+			(arrival.data as { paymentHash: string }).paymentHash === 'invoice-a'
+				? 'hold'
+				: 200;
+
+		manager.dispatch('hold:accepted', { paymentHash: 'invoice-a' });
+		manager.dispatch('hold:settled', { paymentHash: 'invoice-a' });
+		manager.dispatch('hold:accepted', { paymentHash: 'invoice-b' });
+		manager.dispatch('hold:settled', { paymentHash: 'invoice-b' });
+		await until(() => arrivals.length === 3);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		const lifecycle = (hash: string): string[] =>
+			arrivals
+				.filter(
+					(arrival) =>
+						(arrival.data as { paymentHash: string }).paymentHash === hash
+				)
+				.map((arrival) => arrival.event);
+		expect(lifecycle('invoice-a')).to.deep.equal(['hold:accepted']);
+		expect(lifecycle('invoice-b')).to.deep.equal([
+			'hold:accepted',
+			'hold:settled'
+		]);
+
+		release(200);
+		await until(() => arrivals.length === 4);
+		expect(lifecycle('invoice-a')).to.deep.equal([
+			'hold:accepted',
+			'hold:settled'
+		]);
+	});
+
+	it('unregister drops queued deliveries and does not retry the one in flight', async () => {
+		const manager = create({ maxActivePerWebhook: 1, retryDelayMs: 10 });
+		const registration = manager.register(`http://127.0.0.1:${port}/hook`, [
+			'*'
+		]);
+		const size = payloadBytes('payment:received', seq(0));
+		answer = (): 'hold' => 'hold';
+		for (let i = 0; i < 3; i++) manager.dispatch('payment:received', seq(i));
+		await until(() => held.length === 1);
+
+		manager.unregister(registration.id);
+		// The request already sent is left to finish, and keeps its bytes.
+		expect(manager.deliveryStats()).to.deep.include({
+			active: 1,
+			queued: 0,
+			queuedBytes: size,
+			discarded: 2
+		});
+
+		release(500);
+		await until(() => manager.deliveryStats().active === 0);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		expect(arrivals).to.have.length(1);
+		expect(manager.deliveryStats()).to.deep.include({
+			queuedBytes: 0,
+			failed: 0,
+			discarded: 3
+		});
+	});
+
+	it('unregister ends a retry pause at once', async () => {
+		const manager = create({ retryDelayMs: 60_000 });
+		const registration = manager.register(`http://127.0.0.1:${port}/hook`, [
+			'*'
+		]);
+		answer = (): number => 500;
+		manager.dispatch('hold:accepted', { paymentHash: 'invoice-a' });
+		manager.dispatch('hold:settled', { paymentHash: 'invoice-a' });
+		await until(() => arrivals.length === 1);
+		expect(manager.deliveryStats().active).to.equal(1);
+
+		manager.unregister(registration.id);
+		await until(() => manager.deliveryStats().active === 0);
+		expect(arrivals).to.have.length(1);
+		expect(manager.deliveryStats()).to.deep.include({
+			queued: 0,
+			queuedBytes: 0,
+			discarded: 2
+		});
+	});
+
+	it('stop() aborts requests in flight, drops the queue and ignores later dispatches', async () => {
+		const manager = create({ maxActivePerWebhook: 1 });
+		manager.register(`http://127.0.0.1:${port}/hook`, ['*']);
+		answer = (): 'hold' => 'hold';
+		manager.dispatch('payment:received', seq(0));
+		manager.dispatch('payment:received', seq(1));
+		await until(() => held.length === 1);
+
+		const aborted = new Promise<void>((resolve) =>
+			held[0].res.on('close', () => resolve())
+		);
+		await manager.stop();
+		await aborted;
+		expect(manager.deliveryStats()).to.deep.equal({
+			active: 0,
+			queued: 0,
+			queuedBytes: 0,
+			delivered: 0,
+			failed: 0,
+			overflowed: 0,
+			discarded: 2
+		});
+
+		manager.dispatch('payment:received', seq(2));
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		expect(arrivals).to.have.length(1);
+		expect(manager.deliveryStats().queued).to.equal(0);
+		expect(manager.list()).to.have.length(1);
+	});
+
+	it('an attempt that outlasts timeoutMs fails, and its retry follows', async () => {
+		const manager = create({ timeoutMs: 100, retryDelayMs: 10 });
+		manager.register(`http://127.0.0.1:${port}/hook`, ['*']);
+		answer = (): 'hold' => 'hold';
+		manager.dispatch('payment:received', seq(0));
+		await until(() => manager.deliveryStats().failed === 1);
+		expect(arrivals).to.have.length(2);
+		expect(arrivals[1].payload).to.equal(arrivals[0].payload);
+	});
+
+	it('refused connections and unusable stored urls fail without an unhandled rejection', async () => {
+		const closed = http.createServer();
+		await new Promise<void>((resolve) =>
+			closed.listen(0, '127.0.0.1', () => resolve())
+		);
+		const deadPort = (closed.address() as { port: number }).port;
+		await new Promise((resolve) => closed.close(resolve));
+		const storage: IWebhookStorage = {
+			saveWebhook: () => undefined,
+			deleteWebhook: () => undefined,
+			deleteAllWebhooks: () => undefined,
+			loadAllWebhooks: () => [
+				{ id: 'ftp', url: 'ftp://example.com/x', events: ['*'], createdAt: 1 },
+				{ id: 'bad', url: 'not a url', events: ['*'], createdAt: 1 },
+				{
+					id: 'refused',
+					url: `http://127.0.0.1:${deadPort}/hook`,
+					events: ['*'],
+					createdAt: 1
+				}
+			]
+		};
+		const manager = new WebhookManager(storage, { retryDelayMs: 10 });
+		managers.push(manager);
+		manager.dispatch('payment:received', seq(0));
+		await until(() => manager.deliveryStats().failed === 3);
+		expect(manager.deliveryStats().active).to.equal(0);
+	});
+
+	it('webhookMetrics reports the stats in Prometheus text format', () => {
+		const text = webhookMetrics({
+			active: 1,
+			queued: 2,
+			queuedBytes: 300,
+			delivered: 4,
+			failed: 5,
+			overflowed: 6,
+			discarded: 7
+		});
+		for (const line of text.trim().split('\n')) {
+			expect(
+				line.startsWith('#') || /^[a-z_]+(\{[^}]*\})?\s+[\d.]+$/.test(line),
+				line
+			).to.equal(true);
+		}
+		expect(text).to.include('beignet_webhook_deliveries_active 1\n');
+		expect(text).to.include('beignet_webhook_deliveries_queued 2\n');
+		expect(text).to.include('beignet_webhook_queued_bytes 300\n');
+		expect(text).to.include(
+			'beignet_webhook_deliveries_total{outcome="overflow"} 6\n'
+		);
+		expect(text).to.include(
+			'beignet_webhook_deliveries_total{outcome="discarded"} 7\n'
+		);
 	});
 });

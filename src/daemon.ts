@@ -15,5 +15,10 @@ export {
 	scopesAllowRoute
 } from './cli/auth';
 export { getOpenApiSpec } from './cli/openapi';
-export { WebhookManager, IWebhookStorage } from './cli/webhooks';
+export {
+	WebhookManager,
+	IWebhookStorage,
+	WebhookDeliveryOptions,
+	WebhookDeliveryStats
+} from './cli/webhooks';
 export { HttpRateLimiter, RateLimitOptions } from './cli/http-rate-limiter';

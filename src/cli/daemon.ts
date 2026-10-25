@@ -45,6 +45,7 @@ import type { IWebhookStorage } from './webhooks';
 import {
 	WEBHOOK_SECRETS_STORAGE_KEY,
 	WebhookManager,
+	webhookMetrics,
 	webhookTargetRefusal
 } from './webhooks';
 import type { RateLimitOptions } from './http-rate-limiter';
@@ -3883,7 +3884,9 @@ async function bootDaemon(
 		// back into the old unauthenticated behavior).
 		if (routeKey === 'GET /metrics') {
 			res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
-			res.end(node.getMetrics());
+			res.end(
+				node.getMetrics() + webhookMetrics(webhookManager.deliveryStats())
+			);
 			return;
 		}
 
@@ -4159,8 +4162,8 @@ async function bootDaemon(
 	// The in-flight promise is memoized so a second caller (a signal during
 	// /stop) waits for the SAME teardown instead of resolving early and
 	// letting the process exit before it finishes. Webhook registrations are
-	// deliberately left alone: they persist across restarts by contract, and
-	// dispatch stops with the node's listeners.
+	// deliberately left alone: they persist across restarts by contract.
+	// Deliveries still queued or in flight once the node is down are dropped.
 	let stopping: Promise<void> | null = null;
 	const stop = (timeoutMs = 30_000): Promise<void> => {
 		stopping ??= (async (): Promise<void> => {
@@ -4170,6 +4173,7 @@ async function bootDaemon(
 			paymentQueue.stop();
 			paymentQueue.removeAllListeners();
 			await node.gracefulShutdown(timeoutMs).catch(() => node.destroy());
+			await webhookManager.stop();
 			if (rateLimiter) rateLimiter.destroy();
 			clearInterval(idempotencyCleanupTimer);
 			// SSE responses hold their sockets open indefinitely; destroy them

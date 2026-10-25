@@ -236,6 +236,81 @@ describe('Webhooks survive a graceful stop (issue 402)', function () {
 	});
 });
 
+describe('Webhook deliveries at a graceful stop (issue #1865)', function () {
+	this.timeout(120_000);
+
+	let tmpDir: string;
+	let recipient: http.Server;
+
+	before(function () {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-stop-delivery-'));
+	});
+
+	after(function () {
+		recipient?.close();
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	it('GET /metrics counts a delivery in flight, and stop() aborts it', async () => {
+		let aborted: Promise<void> | undefined;
+		recipient = http.createServer((req, res) => {
+			req.resume();
+			// Never answers: the delivery stays in flight until stop().
+			aborted = new Promise((resolve) => res.on('close', () => resolve()));
+		});
+		await new Promise<void>((resolve) =>
+			recipient.listen(0, '127.0.0.1', () => resolve())
+		);
+		const recipientPort = (recipient.address() as AddressInfo).port;
+
+		const daemon = await bootDaemon(tmpDir);
+		const port = (daemon.server.address() as AddressInfo).port;
+		try {
+			const registered = await request(port, 'POST', '/webhooks/register', {
+				url: `http://127.0.0.1:${recipientPort}/hook`,
+				events: ['*'],
+				allowPrivateNetwork: true
+			});
+			expect(registered.status).to.equal(200);
+			(daemon.node as unknown as NodeJS.EventEmitter).emit('channel:ready', {
+				channelId: 'ab'.repeat(32)
+			});
+			await waitFor(() => aborted !== undefined);
+
+			const metrics = await new Promise<string>((resolve, reject) => {
+				http
+					.get(
+						{
+							hostname: '127.0.0.1',
+							port,
+							path: '/metrics',
+							headers: { Authorization: `Bearer ${TOKEN}` }
+						},
+						(res) => {
+							const chunks: Buffer[] = [];
+							res.on('data', (chunk: Buffer) => chunks.push(chunk));
+							res.on('end', () => resolve(Buffer.concat(chunks).toString()));
+						}
+					)
+					.on('error', reject);
+			});
+			expect(metrics).to.include('beignet_webhook_deliveries_active 1\n');
+			expect(metrics).to.include(
+				'beignet_webhook_deliveries_total{outcome="overflow"} 0\n'
+			);
+		} finally {
+			await daemon.stop();
+		}
+		// Well inside the 5 s attempt deadline, which would close it anyway.
+		await Promise.race([
+			aborted,
+			new Promise((resolve, reject) =>
+				setTimeout(() => reject(new Error('delivery not aborted')), 1000)
+			)
+		]);
+	});
+});
+
 describe('A queued payment survives a graceful stop (issue #958)', function () {
 	this.timeout(120_000);
 
