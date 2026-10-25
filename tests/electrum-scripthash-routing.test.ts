@@ -30,7 +30,6 @@ import {
 	Electrum,
 	EProtocol,
 	err,
-	EScanningStrategy,
 	IGetUtxosResponse,
 	ok,
 	Result,
@@ -220,7 +219,7 @@ describe('Electrum script hash subscription routing (issue #478)', () => {
 		expect(refreshSpy.callCount).to.equal(2);
 	});
 
-	it('rescans a tracked UTXO index before refreshing on its notification', async () => {
+	it('refreshes for a tracked UTXO without a scan of its own (#1859)', async () => {
 		const getUtxosSpy = sinon.stub().resolves(undefined);
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		(electrum as any).getUtxos = getUtxosSpy;
@@ -233,13 +232,9 @@ describe('Electrum script hash subscription routing (issue #478)', () => {
 
 		await fireNotification(['ffff', 's']);
 
-		expect(getUtxosSpy.calledOnce).to.be.true;
-		expect(getUtxosSpy.firstCall.args[0]).to.deep.include({
-			scanningStrategy: EScanningStrategy.singleIndex,
-			addressIndex: 3,
-			changeAddressIndex: 3
-		});
-		expect(getUtxosSpy.calledBefore(refreshSpy)).to.be.true;
+		// The refresh lists every UTXO the wallet holds.
+		expect(getUtxosSpy.called).to.be.false;
+		expect(refreshSpy.calledOnce).to.be.true;
 	});
 
 	it('removeScriptHashCallback detaches one callback and leaves siblings', async () => {
@@ -418,7 +413,9 @@ describe('Electrum script hash subscription routing (issue #478)', () => {
  * snapshot of the ENTRIES and never re-read the map, so an instance that
  * disconnected while an earlier entry was parked in getUtxos still had its
  * callbacks fired and its wallet refreshed. The header dispatcher already
- * re-read its handler at the moment of the call; this is its sibling.
+ * re-read its handler at the moment of the call; this is its sibling. That
+ * scan is gone (#1859), but a callback ahead of an entry can still withdraw
+ * its instance.
  *
  * Issue #502: a stopped instance answers every subscribe with the disconnected
  * refusal by design, and ElectrumBackend's reconnect monitor could not tell
@@ -468,30 +465,22 @@ describe('Electrum dispatch and monitor against a stopped instance', () => {
 		const electrumB = createElectrum(refreshB);
 		const cbB = sinon.spy();
 
-		// Both instances subscribe the SAME hash, and the first tracks a UTXO
-		// on it, so its entry parks the dispatch inside getUtxos.
-		let release = (): void => {};
-		const parked = new Promise<void>((resolve) => {
-			release = (): void => resolve();
-		});
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		(electrum as any).getUtxos = async (): Promise<void> => parked;
+		// Both instances subscribe the SAME hash, and the first one's callback
+		// disconnects the second before the dispatch reaches it.
+		let withdrawn: Promise<void> | undefined;
 		await electrum.subscribeToAddresses({
 			scriptHashes: ['abab'],
-			onReceive: sinon.spy()
+			onReceive: (): void => {
+				withdrawn = electrumB.disconnect();
+			}
 		});
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		(electrum as any)._scriptHashRecord('abab').utxoIndex = 0;
 		await electrumB.subscribeToAddresses({
 			scriptHashes: ['abab'],
 			onReceive: cbB
 		});
 
-		const dispatched = fireNotification(['abab', 's1']);
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		await electrumB.disconnect();
-		release();
-		await dispatched;
+		await fireNotification(['abab', 's1']);
+		await withdrawn;
 
 		expect(
 			refreshB.called,
@@ -500,35 +489,6 @@ describe('Electrum dispatch and monitor against a stopped instance', () => {
 		expect(cbB.called, 'and its callback must not be called either').to.equal(
 			false
 		);
-	});
-
-	it('does not refresh a wallet that disconnects inside its own scan (#505)', async () => {
-		// The sibling of the case above: the parked entry is this instance's
-		// OWN, so the re-read at the top of the loop has already happened and
-		// only the check after the scan can catch the withdrawal.
-		let release = (): void => {};
-		const parked = new Promise<void>((resolve) => {
-			release = (): void => resolve();
-		});
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		(electrum as any).getUtxos = async (): Promise<void> => parked;
-		await electrum.subscribeToAddresses({
-			scriptHashes: ['bcbc'],
-			onReceive: sinon.spy()
-		});
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		(electrum as any)._scriptHashRecord('bcbc').utxoIndex = 0;
-
-		const dispatched = fireNotification(['bcbc', 's1']);
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		await electrum.disconnect();
-		release();
-		await dispatched;
-
-		expect(
-			refreshSpy.called,
-			'a wallet that shut down while its own scan ran must not be refreshed'
-		).to.equal(false);
 	});
 
 	it('lets the reconnect monitor tick past a stopped instance (#502)', async () => {
