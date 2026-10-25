@@ -1167,27 +1167,32 @@ function sentSats(info: IPaymentInfo): number | undefined {
 /**
  * A payment's amount as every public surface reports it (history, proof,
  * stats): an outgoing amount is what left the node, fees included, rounded
- * UP; an incoming amount rounds down, as the balance does (issue #1185).
- * Truncating the outgoing figure let a send paying 20,001.5 sats from a
- * 50,000 sat balance read 20,001 while the balance fell to 29,998. Rounding
- * up makes one send agree with the balance when the balance held whole sats
- * before it; sub-sat remainders across several sends can still differ from
- * the balance by a sat, which only msat figures reconcile exactly.
+ * UP; an incoming amount is what the node was credited, rounded down, as the
+ * balance does (issue #1185). Truncating the outgoing figure let a send
+ * paying 20,001.5 sats from a 50,000 sat balance read 20,001 while the
+ * balance fell to 29,998. Rounding up makes one send agree with the balance
+ * when the balance held whole sats before it; sub-sat remainders across
+ * several sends can still differ from the balance by a sat, which only msat
+ * figures reconcile exactly.
  */
 function paymentAmountSats(info: IPaymentInfo): number {
 	return info.direction === PaymentDirection.OUTGOING
 		? sentSats(info) ?? spendLimitSats(info.amountMsat)
-		: Number(info.amountMsat / 1000n);
+		: Number((info.receivedMsat ?? info.amountMsat) / 1000n);
 }
 
 /**
- * The routing fee a payment paid, in msat, or undefined when the record does
- * not say. An MPP record's route is its first part only, so its fee is what
- * left the node over what the invoice asked (#1008).
+ * The fee a payment paid, in msat, or undefined when the record does not
+ * say. An MPP record's route is its first part only, so its fee is what left
+ * the node over what the invoice asked (#1008). An incoming payment's fee is
+ * a JIT LSP's skim: what the invoice asked over what the node was credited.
  */
 function paymentFeeMsat(info: IPaymentInfo): bigint | undefined {
 	if (info.sentMsat !== undefined && info.sentMsat >= info.amountMsat) {
 		return info.sentMsat - info.amountMsat;
+	}
+	if (info.receivedMsat !== undefined && info.receivedMsat < info.amountMsat) {
+		return info.amountMsat - info.receivedMsat;
 	}
 	return info.route?.totalFeeMsat;
 }
@@ -14862,7 +14867,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				}
 			} else if (p.direction === 'INCOMING' && p.status === 'COMPLETED') {
 				received++;
-				satsReceived += Number(p.amountMsat / 1000n);
+				satsReceived += paymentAmountSats(p);
 			} else if (p.status === 'FAILED') {
 				failed++;
 			}

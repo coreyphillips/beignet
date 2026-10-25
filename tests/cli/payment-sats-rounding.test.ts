@@ -183,6 +183,43 @@ describe('outgoing payment sats round up and agree across surfaces (#1185)', fun
 		expect(info.feeSats).to.equal(undefined);
 	});
 
+	it('a JIT skim receive reads what was credited, with the skim as its fee (#1869)', () => {
+		// A 20,000 sat invoice whose LSP skimmed its 120 sat opening fee: the
+		// record keeps the invoice amount and notes what the channel credited.
+		const info = report({
+			amountMsat: 20_000_000n,
+			receivedMsat: 19_880_000n,
+			direction: PaymentDirection.INCOMING
+		})!;
+		expect(info.amountSats).to.equal(19_880);
+		expect(info.feeSats).to.equal(120);
+		const proof = node.getPaymentProof(info.paymentHash)!;
+		expect(proof.amountSats).to.equal(19_880);
+		expect(proof.feeSats).to.equal(120);
+		expect(node.listPayments()[0].amountSats).to.equal(19_880);
+		expect(node.getStats().totalSatsReceived).to.equal(19_880);
+
+		// A sub-sat skim: the credit rounds down and the fee up, so the two
+		// still add up to the invoice amount.
+		const fractional = report({
+			amountMsat: 20_000_000n,
+			receivedMsat: 19_880_500n,
+			direction: PaymentDirection.INCOMING
+		})!;
+		expect(fractional.amountSats).to.equal(19_880);
+		expect(fractional.feeSats).to.equal(120);
+	});
+
+	it('an overpaid receive reads what was credited and no fee', () => {
+		const info = report({
+			amountMsat: 20_000_000n,
+			receivedMsat: 20_002_000n,
+			direction: PaymentDirection.INCOMING
+		})!;
+		expect(info.amountSats).to.equal(20_002);
+		expect(info.feeSats).to.equal(undefined);
+	});
+
 	it('the proof and the stats report the history figures, single-path and MPP', () => {
 		const shapes: Array<
 			Partial<IPaymentInfo> & Pick<IPaymentInfo, 'amountMsat'>

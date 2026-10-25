@@ -826,6 +826,15 @@ function boundedFailureReason(reason: string): string {
 }
 
 /**
+ * Note what a settled receive's HTLCs paid when it is not the record's
+ * amount. The record keeps the amount it was validated against, which a
+ * JIT skim or an overpaying sender moves away from what the channel credits.
+ */
+function recordReceivedMsat(payment: IPaymentInfo, settledMsat: bigint): void {
+	if (settledMsat !== payment.amountMsat) payment.receivedMsat = settledMsat;
+}
+
+/**
  * How long `requestJitReceive` waits for the LSP's ack. Kept at 15 s because
  * the round trip sits inside the caller's own request budget: the daemon's
  * only consumer allows 20 s for the whole POST /jit/invoice call, so raising
@@ -21626,6 +21635,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				htlcId,
 				paymentHash,
 				keysendPreimage,
+				amountMsat,
 				amountMsat
 			);
 			return;
@@ -21964,6 +21974,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				channelId,
 				htlcId,
 				partAmountMsat,
+				amountMsat,
 				paymentHash,
 				hopPayload!,
 				preimage!,
@@ -21982,7 +21993,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			htlcId,
 			paymentHash,
 			preimage!,
-			partAmountMsat
+			partAmountMsat,
+			amountMsat
 		);
 	}
 
@@ -22218,6 +22230,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			);
 			// 0n is an any-amount invoice that had no payment until now.
 			if (payment.amountMsat === 0n) payment.amountMsat = settledMsat;
+			recordReceivedMsat(payment, settledMsat);
 			this.safeStorage(
 				() => this.persistPayment(paymentHash),
 				'persistPayment'
@@ -24123,14 +24136,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * handleFinalHopHtlc (the payment_secret match for BOLT 11 parts, the
 	 * blinded path_id match for BOLT 12 parts, which have no payment_data).
 	 * amountMsat is the part's onion-declared amt_to_forward, NOT the
-	 * incoming HTLC value, which may exceed it; declaredTotalMsat is the
-	 * sender-declared total the parts accumulate toward: payment_data
-	 * total_msat or blinded-final total_amount_msat.
+	 * incoming HTLC value, which may exceed it or (a JIT skim) fall short of
+	 * it; htlcAmountMsat is that HTLC value, kept for what the settled set
+	 * credits. declaredTotalMsat is the sender-declared total the parts
+	 * accumulate toward: payment_data total_msat or blinded-final
+	 * total_amount_msat.
 	 */
 	private handleMppPart(
 		channelId: Buffer,
 		htlcId: bigint,
 		amountMsat: bigint,
+		htlcAmountMsat: bigint,
 		paymentHash: Buffer,
 		hopPayload: IHopPayload,
 		preimage: Buffer,
@@ -24225,6 +24241,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			channelId,
 			htlcId,
 			amountMsat,
+			htlcAmountMsat,
 			status: PaymentStatus.PENDING
 		};
 		pending.receivedParts.push(part);
@@ -24284,6 +24301,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				// An any-amount invoice's record holds 0n until paid, so the
 				// settled parts are the only source of what it received.
 				if (payment.amountMsat === 0n) payment.amountMsat = totalReceived;
+				recordReceivedMsat(
+					payment,
+					pending.receivedParts.reduce((sum, p) => sum + p.htlcAmountMsat, 0n)
+				);
 				this.persistPayment(paymentHash);
 				this.emit('payment:received', payment);
 				this.emitInvoiceSettled(paymentHash, payment);
@@ -24413,16 +24434,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
-	 * receivedMsat is the settled HTLC's payment amount. It replaces the
-	 * record's amount only when that is 0n, which is an any-amount invoice
-	 * that has not been paid yet.
+	 * declaredMsat is the onion's amt_to_forward for the settled HTLC. It
+	 * replaces the record's amount only when that is 0n, which is an
+	 * any-amount invoice that has not been paid yet. htlcMsat is the HTLC's
+	 * own value, what the channel credits, recorded as receivedMsat when the
+	 * two differ.
 	 */
 	private fulfillPayment(
 		channelId: Buffer,
 		htlcId: bigint,
 		paymentHash: Buffer,
 		preimage: Buffer,
-		receivedMsat: bigint
+		declaredMsat: bigint,
+		htlcMsat: bigint
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		// Clean up shared secret on fulfillment
@@ -24443,7 +24467,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			payment.status = PaymentStatus.COMPLETED;
 			payment.completedAt = Date.now();
 			payment.settledHtlcs = [`${channelId.toString('hex')}:${htlcId}`];
-			if (payment.amountMsat === 0n) payment.amountMsat = receivedMsat;
+			if (payment.amountMsat === 0n) payment.amountMsat = declaredMsat;
+			recordReceivedMsat(payment, htlcMsat);
 		}
 
 		// Persist BEFORE sending fulfill message: on crash, reestablish
@@ -27111,8 +27136,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					),
 					`${'0'.repeat(64)}:${U64_MAX}`
 				];
-				// An any-amount invoice records what its parts paid.
+				// An any-amount invoice records what its parts paid, and any
+				// invoice what they credited when that differs.
 				if (payment.amountMsat === 0n) settled.amountMsat = U64_MAX;
+				settled.receivedMsat = U64_MAX;
 			}
 		}
 		return { type: 'payment_state', paymentHash: hashHex, payment: settled };

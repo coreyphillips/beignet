@@ -5568,8 +5568,16 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						payAll: { $ref: '#/components/schemas/PayAllPayment' },
 						paymentHash: { type: 'string' },
 						preimage: { type: 'string' },
-						amountSats: { type: 'integer' },
-						feeSats: { type: 'integer' },
+						amountSats: {
+							type: 'integer',
+							description:
+								'OUTGOING: what left the node, fees included, rounded up. INCOMING: what the node was credited, rounded down'
+						},
+						feeSats: {
+							type: 'integer',
+							description:
+								"OUTGOING: routing fee paid. INCOMING: a JIT LSP's skim, the invoice amount less what was credited. Rounded up"
+						},
 						status: {
 							type: 'string',
 							enum: ['PENDING', 'COMPLETED', 'FAILED']

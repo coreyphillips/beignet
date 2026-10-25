@@ -5369,6 +5369,7 @@ property node.IPaymentInfo.metadata?: Record<string, string>
 property node.IPaymentInfo.payAll?: node.IPayAllPayment
 property node.IPaymentInfo.paymentHash: Buffer
 property node.IPaymentInfo.preimage?: Buffer
+property node.IPaymentInfo.receivedMsat?: bigint
 property node.IPaymentInfo.retryCount?: number
 property node.IPaymentInfo.route?: gossip.IRoute
 property node.IPaymentInfo.sentMsat?: bigint
@@ -5378,6 +5379,7 @@ property node.IPaymentInfo.status: node.PaymentStatus
 interface node.IPaymentPart
 property node.IPaymentPart.amountMsat: bigint
 property node.IPaymentPart.channelId: Buffer
+property node.IPaymentPart.htlcAmountMsat: bigint
 property node.IPaymentPart.htlcId: bigint
 property node.IPaymentPart.partIndex: number
 property node.IPaymentPart.status: node.PaymentStatus
@@ -7732,6 +7734,7 @@ property storage.ISerializedPaymentInfo.metadata?: Record<string, string>
 property storage.ISerializedPaymentInfo.payAll?: { debitMsat: string; maxFeeMsat: string; deliveredMsat: string; feeMsat: string; remainderMsat: string; }
 property storage.ISerializedPaymentInfo.paymentHash: string
 property storage.ISerializedPaymentInfo.preimage?: string
+property storage.ISerializedPaymentInfo.receivedMsat?: string
 property storage.ISerializedPaymentInfo.route?: string
 property storage.ISerializedPaymentInfo.sentMsat?: string
 property storage.ISerializedPaymentInfo.settledHtlcs?: string[]

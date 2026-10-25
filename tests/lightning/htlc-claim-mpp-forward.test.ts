@@ -103,6 +103,7 @@ describe('C4 regression: preimage → ChainMonitor wiring', function () {
 				channelId: Buffer,
 				htlcId: bigint,
 				amountMsat: bigint,
+				htlcAmountMsat: bigint,
 				paymentHash: Buffer,
 				hopPayload: unknown,
 				preimage: Buffer,
@@ -114,6 +115,7 @@ describe('C4 regression: preimage → ChainMonitor wiring', function () {
 		internal.handleMppPart(
 			part1Channel,
 			0n,
+			600n,
 			600n,
 			paymentHash,
 			hopPayload,
@@ -128,6 +130,7 @@ describe('C4 regression: preimage → ChainMonitor wiring', function () {
 		internal.handleMppPart(
 			part2Channel,
 			0n,
+			600n,
 			600n,
 			paymentHash,
 			hopPayload,
