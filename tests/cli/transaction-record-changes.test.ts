@@ -439,7 +439,12 @@ describe('transaction record changes (#1810)', function () {
 			}
 		} as unknown as Partial<ITransaction<IUtxo>>);
 		// The rescan the ghost path fires needs a server; the record is the subject.
-		sinon.stub(w, 'rescanAddresses').resolves(ok(w.data));
+		sinon
+			.stub(
+				w as unknown as { _rescanAddresses: () => unknown },
+				'_rescanAddresses'
+			)
+			.resolves(ok(undefined));
 
 		const res = await w.checkUnconfirmedTransactions();
 		expect(res.isOk(), res.isErr() ? res.error.message : '').to.equal(true);

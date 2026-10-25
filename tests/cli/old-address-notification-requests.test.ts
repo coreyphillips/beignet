@@ -446,7 +446,11 @@ describe('old address notification requests (#1859)', function () {
 			}
 		});
 		if (subscription.isErr()) throw subscription.error;
-		const refresh = sinon.spy(wallet, 'refreshWallet');
+		// A notification refreshes through _refresh, not refreshWallet.
+		const refresh = sinon.spy(
+			wallet as unknown as { _refresh: () => Promise<unknown> },
+			'_refresh'
+		);
 		const start = electrumHelpers.start as sinon.SinonStub;
 		start.resetHistory();
 		payOldAgain();

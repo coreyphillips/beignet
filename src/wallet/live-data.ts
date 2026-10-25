@@ -1,17 +1,25 @@
 import type { IWalletData } from '../types';
+import type { Result } from '../utils/result';
 
-// Each Wallet's own data object, for the library code that works on it
-// alongside the wallet: Electrum and Transaction, which the wallet builds,
-// and the daemon. Wallet.data hands out a frozen copy instead, which costs a
-// walk of the whole history per read and would not show a change the wallet
-// makes while the reader awaits.
-const liveData = new WeakMap<object, () => IWalletData>();
+type TLiveRefreshOptions = { onStart?: () => void };
 
-export const registerLiveWalletData = (
+type TLiveWallet = {
+	data: () => IWalletData;
+	refresh: (options: TLiveRefreshOptions) => Promise<Result<unknown>>;
+};
+
+// Each Wallet's own data object and refresh, for the library code that works
+// on it alongside the wallet: Electrum and Transaction, which the wallet
+// builds, and the daemon. Wallet.data and refreshWallet hand out a frozen copy
+// instead, which costs a walk of the whole history each time and would not
+// show a change the wallet makes while the reader awaits.
+const live = new WeakMap<object, TLiveWallet>();
+
+export const registerLiveWallet = (
 	wallet: object,
-	read: () => IWalletData
+	access: TLiveWallet
 ): void => {
-	liveData.set(wallet, read);
+	live.set(wallet, access);
 };
 
 /**
@@ -22,4 +30,23 @@ export const registerLiveWalletData = (
  */
 export const liveWalletData = (wallet: {
 	readonly data: Readonly<IWalletData>;
-}): IWalletData => liveData.get(wallet)?.() ?? (wallet.data as IWalletData);
+}): IWalletData => live.get(wallet)?.data() ?? (wallet.data as IWalletData);
+
+/**
+ * Refreshes the wallet as refreshWallet does, settling with whether it worked
+ * but without the copy of the data, for a caller that only waits for the
+ * refresh. Falls back to refreshWallet for an object no Wallet registered,
+ * such as a test double.
+ * @param {{ refreshWallet: Function }} wallet
+ * @param {TLiveRefreshOptions} [options]
+ * @returns {Promise<Result<unknown>>}
+ */
+export const refreshLiveWallet = (
+	wallet: {
+		refreshWallet: (options?: TLiveRefreshOptions) => Promise<Result<unknown>>;
+	},
+	options: TLiveRefreshOptions = {}
+): Promise<Result<unknown>> => {
+	const access = live.get(wallet);
+	return access ? access.refresh(options) : wallet.refreshWallet(options);
+};

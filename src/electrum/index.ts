@@ -54,7 +54,7 @@ import {
 	splitAddresses
 } from '../utils';
 import type { Wallet } from '../wallet';
-import { liveWalletData } from '../wallet/live-data';
+import { liveWalletData, refreshLiveWallet } from '../wallet/live-data';
 import {
 	defaultElectrumPeers,
 	ELECTRUM_SERVER_COOLDOWN_MS,
@@ -443,7 +443,7 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 					owed.heard = created.statuses.get(data[0]) ?? null;
 				}
 			};
-			void instance.wallet.refreshWallet({ onStart: started });
+			void refreshLiveWallet(instance.wallet, { onStart: started });
 		};
 		const created: TScriptHashRouter = {
 			instances: new Set(),
@@ -508,7 +508,7 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 					// subscription that predates the registry): fall back to the
 					// pre-registry behaviour and refresh every subscribed wallet.
 					for (const instance of [...created.instances]) {
-						void instance.wallet.refreshWallet({});
+						void refreshLiveWallet(instance.wallet);
 					}
 					return;
 				}
@@ -2284,7 +2284,7 @@ export class Electrum {
 			this._wallet.coinbaseMatured
 		) {
 			this._fullRefreshOwed = false;
-			await this._wallet.refreshWallet();
+			await refreshLiveWallet(this._wallet);
 		} else {
 			// Every script a refresh scans is subscribed, and a status change
 			// refreshes on its own, so a block that changed none of them only

@@ -98,6 +98,15 @@ const NO_TXINDEX_MISS = `No such mempool transaction. Use -txindex or provide a 
 const OLD_NO_TXINDEX_MISS = `No such mempool transaction. Use -txindex to enable blockchain transaction queries.${WALLET_HINT}`;
 /** With a txindex still being built: says nothing about the chain. */
 const STILL_INDEXING = `No such mempool transaction. Blockchain transactions are still in the process of being indexed.${WALLET_HINT}`;
+
+/** Stubs the rescan the ghost path runs, which needs a server. */
+const stubGhostRescan = (wallet: Wallet): sinon.SinonStub =>
+	sinon
+		.stub(
+			wallet as unknown as { _rescanAddresses: () => Promise<Result<void>> },
+			'_rescanAddresses'
+		)
+		.resolves(ok(undefined));
 /** The no-txindex answer inside the daemon error an ElectrumX or Fulcrum returns. */
 const WRAPPED_NO_TXINDEX_MISS = `daemon error: DaemonError({'code': -5, 'message': '${NO_TXINDEX_MISS}'})`;
 
@@ -348,7 +357,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		// it is unknown, and the ghost path handles it instead.
 		answerWith(txAnswer(undefined, { code: 2, message: TXINDEX_MISS }));
 		// The rescan the ghost path fires needs a server; the record is the subject.
-		sinon.stub(wallet, 'rescanAddresses').resolves(ok(wallet.data));
+		stubGhostRescan(wallet);
 
 		const res = await wallet.checkUnconfirmedTransactions();
 		expect(res.isOk(), 'the check ran').to.equal(true);
@@ -610,7 +619,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 
 		beforeEach(function () {
 			// The rescan the ghost path fires needs a server.
-			sinon.stub(wallet, 'rescanAddresses').resolves(ok(wallet.data));
+			stubGhostRescan(wallet);
 			sinon
 				.stub(wallet.electrum, 'getAddressHistory')
 				.resolves(ok([historyEntry]));
@@ -955,8 +964,7 @@ describe('a transaction the chain no longer holds (issue #863)', function () {
 		const miss = (message: string): ITransaction<IUtxo> =>
 			txAnswer(undefined, { code: 2, message });
 
-		const stubRescan = (): sinon.SinonStub =>
-			sinon.stub(wallet, 'rescanAddresses').resolves(ok(wallet.data));
+		const stubRescan = (): sinon.SinonStub => stubGhostRescan(wallet);
 
 		/** The record is where it was, still observed, and nothing was sent. */
 		const expectKept = (
@@ -1526,8 +1534,7 @@ describe('a reorg repair that storage refuses (issue #870)', function () {
 	};
 
 	/** The rescan the ghost path fires needs a server; it is counted instead. */
-	const stubRescan = (): sinon.SinonStub =>
-		sinon.stub(wallet, 'rescanAddresses').resolves(ok(wallet.data));
+	const stubRescan = (): sinon.SinonStub => stubGhostRescan(wallet);
 
 	const stored = (
 		key: 'transactions' | 'unconfirmedTransactions'

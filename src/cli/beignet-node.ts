@@ -31,7 +31,7 @@ import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { TypedEmitter } from '../utils/typed-emitter';
 import { Wallet } from '../wallet';
-import { liveWalletData } from '../wallet/live-data';
+import { liveWalletData, refreshLiveWallet } from '../wallet/live-data';
 import { getDefaultSendTransaction } from '../shapes/wallet';
 import type { EAddressType, ISendTransaction } from '../types/wallet';
 import type { ILogger, TLogLevel } from '../logger';
@@ -4293,8 +4293,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				);
 				timer.unref?.();
 			});
-			const attempt = this.wallet
-				.refreshWallet({})
+			const attempt = refreshLiveWallet(this.wallet)
 				.then((res) => {
 					if (res.isErr()) {
 						this.log('warn', 'Initial wallet refresh failed', {
@@ -7769,7 +7768,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	async refreshWallet(): Promise<void> {
-		const result = await this.wallet.refreshWallet({});
+		const result = await refreshLiveWallet(this.wallet);
 		if (result.isErr()) {
 			throw new BeignetError('REFRESH_FAILED', result.error.message);
 		}

@@ -109,6 +109,13 @@ const makeStorage = (
 	return { getData, setData };
 };
 
+/** The rescan the ghost repair runs, reached through a cast. */
+type TGhostRescan = {
+	_rescanAddresses: (options: {
+		shouldClearAddresses?: boolean;
+	}) => Promise<Result<void>>;
+};
+
 /** What `store` holds under `key`, parsed. */
 const read = (store: Map<string, string>, key: string): unknown => {
 	const json = store.get(key);
@@ -1303,8 +1310,9 @@ describe('switchNetwork against an unreachable target', function () {
 					[pending]: { result: { confirmations: 0 } }
 				});
 			let rescans = 0;
-			const rescanAddresses = w.rescanAddresses.bind(w);
-			w.rescanAddresses = async (options): Promise<Result<IWalletData>> => {
+			const internals = w as unknown as TGhostRescan;
+			const rescanAddresses = internals._rescanAddresses.bind(w);
+			internals._rescanAddresses = async (options): Promise<Result<void>> => {
 				rescans += 1;
 				return rescanAddresses(options);
 			};
@@ -1414,9 +1422,10 @@ describe('switchNetwork against an unreachable target', function () {
 						}
 					}
 				});
-			let rescanned: Result<IWalletData> | undefined;
-			const rescanAddresses = w.rescanAddresses.bind(w);
-			w.rescanAddresses = async (options): Promise<Result<IWalletData>> => {
+			let rescanned: Result<void> | undefined;
+			const internals = w as unknown as TGhostRescan;
+			const rescanAddresses = internals._rescanAddresses.bind(w);
+			internals._rescanAddresses = async (options): Promise<Result<void>> => {
 				saving.holdNext(key(network, field));
 				rescanned = await rescanAddresses(options);
 				return rescanned;

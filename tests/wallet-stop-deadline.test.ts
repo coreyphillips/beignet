@@ -61,6 +61,7 @@ type TWalletInternals = {
 	_quietUntilFirstRefresh: boolean;
 	_setData?: (key: string, data: unknown) => Promise<Result<string>>;
 	processUnconfirmedTransactions: () => Promise<Result<unknown>>;
+	_refresh: () => Promise<Result<unknown>>;
 };
 
 /** Rejects loudly rather than leaving the suite to hit mocha's own timeout. */
@@ -411,10 +412,10 @@ describe('stop() refresh deadline', function () {
 	});
 
 	it('tears down when the refresh rejects rather than resolving', async function () {
-		// refreshWallet answers an Err rather than throwing today; this stands in
+		// A refresh answers an Err rather than throwing today; this stands in
 		// for any future path out of the wait that is not a clean resolve.
 		sinon
-			.stub(wallet, 'refreshWallet')
+			.stub(wallet as unknown as TWalletInternals, '_refresh')
 			.rejects(new Error('electrum went away'));
 		wallet.isRefreshing = true;
 

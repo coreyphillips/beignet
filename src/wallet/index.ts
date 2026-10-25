@@ -163,7 +163,7 @@ import { btcToSats } from '../utils/conversion';
 import { derivePathCached } from '../utils/derive-path-cached';
 import type { ILogger } from '../logger';
 import { createConsoleLogger } from '../logger';
-import { registerLiveWalletData } from './live-data';
+import { registerLiveWallet } from './live-data';
 import { CoinControl } from './coin-control';
 
 type TAddressLookup = {
@@ -179,6 +179,13 @@ type TCosigner = {
 	keyOrigin?: IKeyOrigin;
 	// The node's change-level children, for derivePathCached.
 	branches: Map<string, BIP32Interface>;
+};
+
+type TRefreshOptions = {
+	scanAllAddresses?: boolean;
+	additionalAddresses?: string[];
+	force?: boolean;
+	onStart?: () => void;
 };
 
 // Each BTC field of a formatted transaction and the sats field beside it.
@@ -285,9 +292,14 @@ export class Wallet {
 	private _customGetScriptHash?: (
 		data: ICustomGetScriptHash
 	) => Promise<string>; // For use with Bitkit.
-	private _pendingRefreshPromises: Array<
-		(result: Result<IWalletData>) => void
-	> = [];
+	private _pendingRefreshPromises: Array<(result: Result<void>) => void> = [];
+	// The copy of the data refreshWallet answers with, keyed by the result of
+	// the refresh it answers for. Made for the first caller that asks and
+	// shared with the rest. A refresh whose callers only wait for it makes none.
+	private readonly _refreshCopies = new WeakMap<
+		Result<void>,
+		Readonly<IWalletData>
+	>();
 	// Refresh bodies currently running. Forced refreshes bypass the isRefreshing
 	// guard, so more than one can be in flight and the flag belongs to all of
 	// them until the last one finishes.
@@ -551,7 +563,10 @@ export class Wallet {
 		}
 		this.logger = logger ?? createConsoleLogger('info');
 		this._data = getDefaultWalletData();
-		registerLiveWalletData(this, () => this._data);
+		registerLiveWallet(this, {
+			data: () => this._data,
+			refresh: (options) => this._refresh(options)
+		});
 		this._getData = storage?.getData ?? getDataFallback;
 		this._setData = storage?.setData;
 		this._setTransactionChanges = storage?.setTransactionChanges;
@@ -765,7 +780,7 @@ export class Wallet {
 			// A host that owns the startup refresh (and must hold its ONE
 			// promise, e.g. BeignetNode.waitForInitialSync) opts out here so
 			// the wallet never scans twice at boot (issue #548).
-			if (!wallet._disableRefreshOnCreate) void wallet.refreshWallet({});
+			if (!wallet._disableRefreshOnCreate) void wallet._refresh({});
 			return ok(wallet);
 		} catch (e) {
 			if (wallet) await wallet._abandonFailedCreate();
@@ -1144,7 +1159,7 @@ export class Wallet {
 		});
 		try {
 			return await Promise.race([
-				this.refreshWallet().then(
+				this._refresh({}).then(
 					() => true,
 					// A refresh that threw is a refresh that is over.
 					() => true
@@ -1297,7 +1312,7 @@ export class Wallet {
 				network,
 				...params.electrumOptions
 			});
-			void this.refreshWallet({});
+			void this._refresh({});
 			await this.updateFeeEstimates(true);
 			return ok(this);
 		} catch (e) {
@@ -1326,7 +1341,7 @@ export class Wallet {
 			this.addressTypesToMonitor.push(this.addressType);
 		}
 		await this.saveWalletData('addressType', addressType);
-		await this.refreshWallet({});
+		await this._refresh({});
 	}
 
 	/**
@@ -1337,12 +1352,13 @@ export class Wallet {
 	 * @param {() => void} [onStart] Called when a refresh body that starts after
 	 * this call begins: at once when nothing is refreshing, later when the call
 	 * queues behind a refresh in flight, never when the wallet stops first.
-	 * @returns {Promise<Result<IWalletData>>}
+	 * @returns {Promise<Result<IWalletData>>} A frozen copy of the data once
+	 * the refresh ends.
 	 */
 	public async refreshWallet({
-		scanAllAddresses = false,
-		additionalAddresses = [],
-		force = false,
+		scanAllAddresses,
+		additionalAddresses,
+		force,
 		onStart
 	}: {
 		scanAllAddresses?: boolean;
@@ -1350,6 +1366,28 @@ export class Wallet {
 		force?: boolean;
 		onStart?: () => void;
 	} = {}): Promise<Result<IWalletData>> {
+		return this._snapshotOf(
+			await this._refresh({
+				scanAllAddresses,
+				additionalAddresses,
+				force,
+				onStart
+			})
+		);
+	}
+
+	/**
+	 * refreshWallet without the copy of the data, for the callers that only
+	 * wait for the refresh: the wallet itself, Electrum and the daemon. The
+	 * copy walks the whole history.
+	 * @private
+	 */
+	private async _refresh({
+		scanAllAddresses = false,
+		additionalAddresses = [],
+		force = false,
+		onStart
+	}: TRefreshOptions): Promise<Result<void>> {
 		// A stopping wallet starts no new body: one started while stop() waits
 		// on queued writes would only be abandoned mid-step by the teardown. A
 		// call made while a refresh is in flight still queues behind it, which
@@ -1365,9 +1403,9 @@ export class Wallet {
 		}
 		// The flag stays up until the LAST refresh body finishes, not the first.
 		// A forced refresh bypasses the guard above, so it can run nested inside
-		// one already in flight (refreshWallet -> updateTransactions ->
+		// one already in flight (_refresh -> updateTransactions ->
 		// checkUnconfirmedTransactions -> updateGhostTransactions ->
-		// rescanAddresses -> refreshWallet) or alongside one as a sibling, and
+		// _rescanAddresses -> _refresh) or alongside one as a sibling, and
 		// lowering the flag while either is still working hands a third caller a
 		// concurrent refresh and lets stop() disconnect underneath it. Never
 		// lowering it for forced refreshes was the other half of the bug: a
@@ -1377,7 +1415,7 @@ export class Wallet {
 		this._activeRefreshes += 1;
 		this.isRefreshing = true;
 		void this.updateFeeEstimates();
-		let result: Result<IWalletData>;
+		let result: Result<void>;
 		let scan = { scanAllAddresses, additionalAddresses };
 		try {
 			for (;;) {
@@ -1417,10 +1455,10 @@ export class Wallet {
 	}
 
 	/**
-	 * The refresh itself. The isRefreshing flag is owned by refreshWallet.
+	 * The refresh itself. The isRefreshing flag is owned by _refresh.
 	 * @param {boolean} scanAllAddresses
 	 * @param {string[]} additionalAddresses
-	 * @returns {Promise<Result<IWalletData>>}
+	 * @returns {Promise<Result<void>>}
 	 */
 	private async _runRefresh({
 		scanAllAddresses,
@@ -1428,7 +1466,7 @@ export class Wallet {
 	}: {
 		scanAllAddresses: boolean;
 		additionalAddresses: string[];
-	}): Promise<Result<IWalletData>> {
+	}): Promise<Result<void>> {
 		// stop() abandons the refresh it timed out on rather than cancelling it,
 		// so every step boundary below is a point that refresh can wake up on the
 		// far side of the teardown. Each remaining step reaches Electrum, and
@@ -1469,7 +1507,7 @@ export class Wallet {
 		}
 		if (this._stopped) return err(stopped);
 		await this.subscribeWindows();
-		return ok(this.data);
+		return ok(undefined);
 	}
 
 	/**
@@ -1484,8 +1522,22 @@ export class Wallet {
 		if (subscribed.isErr()) this._refreshFailed = true;
 	}
 
+	/**
+	 * What refreshWallet and rescanAddresses answer a settled refresh with.
+	 * @private
+	 */
+	private _snapshotOf(refreshed: Result<void>): Result<IWalletData> {
+		if (refreshed.isErr()) return err(refreshed.error);
+		let copy = this._refreshCopies.get(refreshed);
+		if (!copy) {
+			copy = this.data;
+			this._refreshCopies.set(refreshed, copy);
+		}
+		return ok(copy);
+	}
+
 	/** Releases the refresh flag and hands `result` to every queued caller. */
-	private _resolveAllPendingRefreshPromises(result: Result<IWalletData>): void {
+	private _resolveAllPendingRefreshPromises(result: Result<void>): void {
 		this.isRefreshing = false;
 		this._refreshOwed = false;
 		while (this._pendingRefreshPromises.length > 0) {
@@ -4932,7 +4984,7 @@ export class Wallet {
 			if (this.electrum !== electrum) return err(switched);
 
 			//Rescan the addresses to get the correct balance.
-			await this.rescanAddresses({
+			await this._rescanAddresses({
 				shouldClearAddresses: false // No need to clear addresses since we are only updating the balance.
 			});
 			// Reported only after the rescan. Memory no longer observes these
@@ -4955,15 +5007,35 @@ export class Wallet {
 	 * @async
 	 * @param {boolean} [shouldClearAddresses] - Clears and re-generates all addresses when true.
 	 * @param shouldClearTransactions
-	 * @returns {Promise<Result<string>>}
+	 * @returns {Promise<Result<IWalletData>>} A frozen copy of the data once
+	 * the rescan ends.
 	 */
 	public async rescanAddresses({
+		shouldClearAddresses,
+		shouldClearTransactions
+	}: {
+		shouldClearAddresses?: boolean;
+		shouldClearTransactions?: boolean;
+	}): Promise<Result<IWalletData>> {
+		return this._snapshotOf(
+			await this._rescanAddresses({
+				shouldClearAddresses,
+				shouldClearTransactions
+			})
+		);
+	}
+
+	/**
+	 * rescanAddresses without the copy of the data, for the ghost repair.
+	 * @private
+	 */
+	private async _rescanAddresses({
 		shouldClearAddresses = true, // It's assumed we want to clear addresses in this method unless explicitly set to false.
 		shouldClearTransactions = false // We'll lose some timestamp information about the transactions if we clear them. So it's set to false by default.
 	}: {
 		shouldClearAddresses?: boolean;
 		shouldClearTransactions?: boolean;
-	}): Promise<Result<IWalletData>> {
+	}): Promise<Result<void>> {
 		// switchNetwork replaces the Electrum instance along with the data, and
 		// each step below resets whichever network is live when it starts. One
 		// started after a switch would rewind the receive index of the network
@@ -5014,7 +5086,7 @@ export class Wallet {
 			// Wait to generate our zero index addresses.
 			await this.setZeroIndexAddresses();
 			if (this.electrum !== electrum) return err(switched);
-			return await this.refreshWallet({
+			return await this._refresh({
 				scanAllAddresses: true,
 				force: true
 			});

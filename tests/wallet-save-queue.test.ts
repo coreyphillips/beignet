@@ -482,8 +482,8 @@ describe('Wallet storage writes (#946)', function () {
 	// second one after it.
 	it('waits for a refresh and queued writes within one deadline', async () => {
 		sinon
-			.stub(wallet, 'refreshWallet')
-			.returns(new Promise<Result<IWalletData>>(() => undefined));
+			.stub(wallet as unknown as { _refresh: () => unknown }, '_refresh')
+			.returns(new Promise<Result<void>>(() => undefined));
 		wallet.isRefreshing = true;
 		// Keeps the socket teardown out of the timing; afterEach does it.
 		sinon.stub(wallet.electrum, 'disconnect').resolves();
