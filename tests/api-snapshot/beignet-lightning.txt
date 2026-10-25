@@ -1030,7 +1030,7 @@ method channel.Channel.getFullState(): Readonly<channel.IChannelState>
 method channel.Channel.getFundingPubkeys(): { local: Buffer; remote: Buffer; } | null
 method channel.Channel.getFundingSatoshis(): bigint
 method channel.Channel.getPendingSpliceLocalBalanceMsat(): bigint | null
-method channel.Channel.getPendingSpliceTx(): { tx: bitcoinjs-lib#Transaction; spliceTxid: Buffer; sharedInputIndex: number; newFundingOutputIndex: number; prevouts: { scripts: Buffer[]; values: bigint[]; } | null; owedExternalInputs: Array<{ inputIndex: number; prevTxid: Buffer; prevOutputIndex: number; }>; filledExternalInputs: Array<{ inputIndex: number; prevTxid: Buffer; prevOutputIndex: number; }>; sentTxSignatures: boolean; } | null
+method channel.Channel.getPendingSpliceTx(): { tx: bitcoinjs-lib#Transaction; spliceTxid: Buffer; sharedInputIndex: number; newFundingOutputIndex: number; newFundingPubkeys: { local: Buffer; remote: Buffer; } | null; prevouts: { scripts: Buffer[]; values: bigint[]; } | null; owedExternalInputs: Array<{ inputIndex: number; prevTxid: Buffer; prevOutputIndex: number; }>; filledExternalInputs: Array<{ inputIndex: number; prevTxid: Buffer; prevOutputIndex: number; }>; sentTxSignatures: boolean; } | null
 method channel.Channel.getPendingV2FundingTx(): { tx: bitcoinjs-lib#Transaction; fundingTxid: Buffer; fundingOutputIndex: number; prevouts: { scripts: Buffer[]; values: bigint[]; } | null; owedExternalInputs: Array<{ inputIndex: number; prevTxid: Buffer; prevOutputIndex: number; }>; filledExternalInputs: Array<{ inputIndex: number; prevTxid: Buffer; prevOutputIndex: number; }>; sentTxSignatures: boolean; } | null
 method channel.Channel.getQuiescenceState(): channel.QuiescenceState
 method channel.Channel.getRecoveryCloseReason(): channel.RecoveryCloseReason | undefined
@@ -2449,6 +2449,7 @@ property directFunding.IDfAttemptFunding.splice: boolean
 interface directFunding.IDfAttestation
 property directFunding.IDfAttestation.fundingOutputIndex: number
 property directFunding.IDfAttestation.localFundingPubkey: Buffer
+property directFunding.IDfAttestation.priorFundingPubkeys?: { local: Buffer; remote: Buffer; }
 property directFunding.IDfAttestation.remoteFundingPubkey: Buffer
 property directFunding.IDfAttestation.signature: Buffer
 interface directFunding.IDfBlindedHop
@@ -2587,7 +2588,7 @@ property directFunding.IDfOwnershipProof.pubkey: Buffer
 property directFunding.IDfOwnershipProof.signature: Buffer
 interface directFunding.IDfPaymentRecord
 property directFunding.IDfPaymentRecord.amountSat: string
-property directFunding.IDfPaymentRecord.attestation?: { fundingOutputIndex: number; localFundingPubkey: string; remoteFundingPubkey: string; signature: string; }
+property directFunding.IDfPaymentRecord.attestation?: { fundingOutputIndex: number; localFundingPubkey: string; remoteFundingPubkey: string; sharedInputIndex?: number; priorLocalFundingPubkey?: string; priorRemoteFundingPubkey?: string; signature: string; }
 property directFunding.IDfPaymentRecord.broadcastTx?: string
 property directFunding.IDfPaymentRecord.changeScript: string
 property directFunding.IDfPaymentRecord.createdAt: number
@@ -2625,6 +2626,7 @@ method directFunding.IDfPeerMessaging.sendCustomMessage(peerPubkeyHex: string, s
 interface directFunding.IDfPendingSpliceTx
 property directFunding.IDfPendingSpliceTx.filledExternalInputs: directFunding.IDfExternalInput[]
 property directFunding.IDfPendingSpliceTx.newFundingOutputIndex: number
+property directFunding.IDfPendingSpliceTx.newFundingPubkeys?: { local: Buffer; remote: Buffer; } | null
 property directFunding.IDfPendingSpliceTx.owedExternalInputs: directFunding.IDfExternalInput[]
 property directFunding.IDfPendingSpliceTx.prevouts: { scripts: Buffer[]; values: bigint[]; } | null
 property directFunding.IDfPendingSpliceTx.sentTxSignatures: boolean
@@ -2937,6 +2939,7 @@ function directFunding.sealFrame(key: Buffer, requestId: Buffer, subtype: number
 function directFunding.senderLaneKeys(requestEncryptionKey: Buffer, requestId: Buffer, ephemeralPrivateKey?: Buffer): directFunding.IDfSenderLane
 function directFunding.senderLaneKeysForEnvelope(env: directFunding.IDfRequestEnvelope, ephemeralPrivateKey?: Buffer): directFunding.IDfSenderLane
 function directFunding.signRequestProblem(c: directFunding.IDfSignRequestCheck): { problem: string; } | { verdict: directFunding.IDfSignRequestVerdict; }
+function directFunding.spliceAttestationMessage(offerId: Buffer, rawTx: Buffer, fundingOutputIndex: number, fundingPubkeys: { local: Buffer; remote: Buffer; }, sharedInputIndex: number, priorFundingPubkeys: { local: Buffer; remote: Buffer; }): string
 function directFunding.spliceFeerateCeiling(c: { valueSat: bigint; amountSat: bigint; maxTotalFeeSat: bigint; changeScriptLen: number; dustFloorSat: bigint; }): directFunding.IDfSpliceFeerateCeiling
 function directFunding.verifyRequestEnvelope(env: directFunding.IDfRequestEnvelope, opts: directFunding.IDfVerifyOptions): void
 function directFunding.withSynthesizedRelay(transports: readonly directFunding.DfTransportDescriptor[]): directFunding.DfTransportDescriptor[]

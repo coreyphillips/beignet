@@ -58,7 +58,8 @@ export {
 	ownershipDigest,
 	ownershipMessage,
 	ownershipProbePoisonTxid,
-	ownershipProbeTransaction
+	ownershipProbeTransaction,
+	spliceAttestationMessage
 } from './messages';
 export type {
 	IDfAttestation,

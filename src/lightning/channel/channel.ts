@@ -1471,7 +1471,9 @@ export class Channel {
 	 * The two funding keys of the 2-of-2, once both sides are known. What the
 	 * direct-funding attestation binds a payer's coin to: the payer rebuilds the
 	 * funding script from these and refuses if the transaction's output is not
-	 * it. Null before accept_channel2 has delivered the peer's key.
+	 * it. Null before accept_channel2 has delivered the peer's key. During a
+	 * splice this is still the pair the shared input spends; the new output's
+	 * pair is getPendingSpliceTx().newFundingPubkeys.
 	 */
 	getFundingPubkeys(): { local: Buffer; remote: Buffer } | null {
 		const local = this._state.localBasepoints?.fundingPubkey;
@@ -19931,12 +19933,18 @@ export class Channel {
 	 * a delivery it crashed part way through reads (issue #645): an owner that
 	 * has been credited leaves the owed list, and only the release flag says
 	 * whether its witness bought anything.
+	 *
+	 * `newFundingPubkeys` are the keys of the new funding output's 2-of-2. The
+	 * peer may have sent a fresh funding key for this splice, so they can
+	 * differ from getFundingPubkeys(), which the shared input spends until the
+	 * splice locks (issue #1871).
 	 */
 	getPendingSpliceTx(): {
 		tx: import('bitcoinjs-lib').Transaction;
 		spliceTxid: Buffer;
 		sharedInputIndex: number;
 		newFundingOutputIndex: number;
+		newFundingPubkeys: { local: Buffer; remote: Buffer } | null;
 		prevouts: { scripts: Buffer[]; values: bigint[] } | null;
 		owedExternalInputs: Array<{
 			inputIndex: number;
@@ -19965,11 +19973,22 @@ export class Channel {
 				prevTxid: Buffer.from(st.tx.ins[inputIndex].hash),
 				prevOutputIndex: st.tx.ins[inputIndex].index
 			}));
+		// Resolved as buildAndSignSpliceTx resolved it; a restored session
+		// carries the key from the in-flight record.
+		const local = this._state.localBasepoints?.fundingPubkey;
+		const remote =
+			this._spliceSession?.getRemoteFundingPubkey() ??
+			this._state.spliceInFlight?.remoteFundingPubkey ??
+			this._state.remoteBasepoints?.fundingPubkey;
 		return {
 			tx: clone,
 			spliceTxid: Buffer.from(st.tx.getHash()),
 			sharedInputIndex: st.sharedInputIndex,
 			newFundingOutputIndex: st.newFundingOutputIndex,
+			newFundingPubkeys:
+				local && remote
+					? { local: Buffer.from(local), remote: Buffer.from(remote) }
+					: null,
 			prevouts: this._spliceInputPrevouts(),
 			owedExternalInputs: outpointsOf(this._spliceOwedExternal()),
 			filledExternalInputs: outpointsOf(this._spliceFilledExternal()),

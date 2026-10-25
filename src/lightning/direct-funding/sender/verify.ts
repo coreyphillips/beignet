@@ -19,7 +19,7 @@ import {
 } from '../../crypto/message-signing';
 import { createFundingScript } from '../../script/funding';
 import type { IDfPrevout, IDfSignRequest } from '../messages';
-import { attestationMessage } from '../messages';
+import { attestationMessage, spliceAttestationMessage } from '../messages';
 import { DF_MAX_PREVOUTS, DF_MAX_TX_OUTPUTS } from '../types';
 
 /** Rev 2: height-based locktimes only, so the transaction is final on a block. */
@@ -188,6 +188,12 @@ export function signRequestProblem(
 	// built from the attested funding pubkeys, and the node the payment request
 	// named is what attested to it. Without both, "delivery" is a claim. ──
 	const att = c.request.attestation;
+	const prior = att.priorFundingPubkeys;
+	if (prior && c.request.sharedInputIndex === undefined) {
+		return {
+			problem: 'attestation names a prior channel funding but no shared input'
+		};
+	}
 	const funding = createFundingScript(
 		att.localFundingPubkey,
 		att.remoteFundingPubkey
@@ -206,8 +212,10 @@ export function signRequestProblem(
 	if (c.request.sharedInputIndex !== undefined) {
 		// Splice extension: our payment goes into a channel that already holds
 		// value, so both halves have to be verified. The shared input must BE the
-		// attested channel funding (the same 2-of-2 we just checked the output
-		// against), and the new output must carry the old capacity as well.
+		// attested channel funding, and the new output must carry the old
+		// capacity as well. That funding is the 2-of-2 we just checked the output
+		// against, unless the splice rotated a funding key: the attestation then
+		// names the old pair too, and signs over both (issue #1871).
 		const shared = c.request.sharedInputIndex;
 		if (shared === inputIndex) {
 			return {
@@ -219,8 +227,11 @@ export function signRequestProblem(
 				problem: 'shared input index is not an input of the transaction'
 			};
 		}
+		const sharedFunding = prior
+			? createFundingScript(prior.local, prior.remote).p2wshOutput
+			: funding;
 		const sharedPrevout: IDfPrevout | undefined = c.request.prevouts[shared];
-		if (!sharedPrevout || !sharedPrevout.script.equals(funding)) {
+		if (!sharedPrevout || !sharedPrevout.script.equals(sharedFunding)) {
 			return { problem: 'shared input is not the attested channel funding' };
 		}
 		// The fee this transaction actually charges us, not the ceiling we were
@@ -245,12 +256,21 @@ export function signRequestProblem(
 	// message still recovers SOME key), so the recovered key must BE the
 	// receiver the request named. ──
 	const verdict = verifyMessageSignature(
-		attestationMessage(
-			c.offerId,
-			c.request.rawTx,
-			att.fundingOutputIndex,
-			att.localFundingPubkey
-		),
+		prior
+			? spliceAttestationMessage(
+					c.offerId,
+					c.request.rawTx,
+					att.fundingOutputIndex,
+					{ local: att.localFundingPubkey, remote: att.remoteFundingPubkey },
+					c.request.sharedInputIndex!,
+					prior
+			  )
+			: attestationMessage(
+					c.offerId,
+					c.request.rawTx,
+					att.fundingOutputIndex,
+					att.localFundingPubkey
+			  ),
 		zbase32Encode(att.signature)
 	);
 	if (!verdict.valid || !verdict.pubkey) {

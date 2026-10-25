@@ -65,7 +65,8 @@ import {
 	decodeDfWitness,
 	encodeDfOfferAck,
 	encodeDfReceipt,
-	encodeDfSignRequest
+	encodeDfSignRequest,
+	spliceAttestationMessage
 } from '../messages';
 import type { IDfAttemptFunding, IDfRequestRecord } from '../types';
 import { DF_SIGNATURE_BYTES, DirectFundingError } from '../types';
@@ -74,6 +75,7 @@ import type { IDfInboundFrame, IDfLaneSender } from '../transport/types';
 import type { IDfOfferSession } from './sessions';
 import { contentHashOf, DfOfferSessions, outpointKey } from './sessions';
 import {
+	attestedKeysProblem,
 	classifyOfferedCoin,
 	fundingTransactionProblem,
 	offerFieldProblem,
@@ -170,6 +172,8 @@ interface IDfFinalTx {
 	baseFundingValueSat?: bigint;
 	/** Splice only. */
 	sharedInputIndex?: number;
+	/** Splice only: the new output's pair, when the channel reports it. */
+	newFundingPubkeys?: { local: Buffer; remote: Buffer };
 }
 
 interface DfFinalTxWaiter {
@@ -2254,17 +2258,49 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 			offer: ctx.offer
 		});
 		if (problem) throw new Error(`refusing to attest: ${problem}`);
-		const pubkeys = this.deps.fundingPubkeys(final.channelId);
-		if (!pubkeys) throw new Error('funding pubkeys are unavailable');
+		const committed = this.deps.fundingPubkeys(final.channelId);
+		if (!committed) throw new Error('funding pubkeys are unavailable');
+		// A splice's output pays the keys negotiated for it, which a peer may
+		// have rotated (issue #1871). The shared input still spends the committed
+		// pair, and the attestation then has to name both.
+		const pubkeys = final.newFundingPubkeys ?? committed;
+		const prior =
+			final.sharedInputIndex !== undefined &&
+			!(
+				pubkeys.local.equals(committed.local) &&
+				pubkeys.remote.equals(committed.remote)
+			)
+				? committed
+				: undefined;
+		const keysProblem = attestedKeysProblem({
+			tx: final.tx,
+			fundingOutputIndex: final.fundingOutputIndex,
+			fundingPubkeys: pubkeys,
+			prevoutScripts: final.prevouts.scripts,
+			...(final.sharedInputIndex !== undefined
+				? { sharedInputIndex: final.sharedInputIndex }
+				: {}),
+			...(prior ? { priorFundingPubkeys: prior } : {})
+		});
+		if (keysProblem) throw new Error(`refusing to attest: ${keysProblem}`);
 		const rawTx = final.tx.toBuffer();
 		const signature = zbase32Decode(
 			this.deps.signMessage(
-				attestationMessage(
-					ctx.offer.offerId,
-					rawTx,
-					final.fundingOutputIndex,
-					pubkeys.local
-				)
+				prior
+					? spliceAttestationMessage(
+							ctx.offer.offerId,
+							rawTx,
+							final.fundingOutputIndex,
+							pubkeys,
+							final.sharedInputIndex!,
+							prior
+					  )
+					: attestationMessage(
+							ctx.offer.offerId,
+							rawTx,
+							final.fundingOutputIndex,
+							pubkeys.local
+					  )
 			)
 		);
 		if (!signature || signature.length !== DF_SIGNATURE_BYTES) {
@@ -2286,6 +2322,7 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 					fundingOutputIndex: final.fundingOutputIndex,
 					localFundingPubkey: pubkeys.local,
 					remoteFundingPubkey: pubkeys.remote,
+					...(prior ? { priorFundingPubkeys: prior } : {}),
 					signature
 				},
 				...(final.sharedInputIndex !== undefined
@@ -2748,7 +2785,10 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 				// The new funding output carries the pre-splice capacity as well,
 				// and the shared input's value IS that capacity.
 				baseFundingValueSat: prevouts.values[pending.sharedInputIndex],
-				sharedInputIndex: pending.sharedInputIndex
+				sharedInputIndex: pending.sharedInputIndex,
+				...(pending.newFundingPubkeys
+					? { newFundingPubkeys: pending.newFundingPubkeys }
+					: {})
 			};
 		}
 		return {

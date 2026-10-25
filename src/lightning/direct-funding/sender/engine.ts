@@ -1724,6 +1724,7 @@ export class DirectFundingSender {
 		}
 		if (ctl.settled()) return;
 
+		const prior = request.attestation.priorFundingPubkeys;
 		const persisted = this.deps.payments.commitWitness(
 			attempt.record.requestId,
 			{
@@ -1733,6 +1734,13 @@ export class DirectFundingSender {
 						request.attestation.localFundingPubkey.toString('hex'),
 					remoteFundingPubkey:
 						request.attestation.remoteFundingPubkey.toString('hex'),
+					...(prior
+						? {
+								sharedInputIndex: request.sharedInputIndex,
+								priorLocalFundingPubkey: prior.local.toString('hex'),
+								priorRemoteFundingPubkey: prior.remote.toString('hex')
+						  }
+						: {}),
 					signature: request.attestation.signature.toString('hex')
 				},
 				negotiatedTx: request.rawTx.toString('hex'),

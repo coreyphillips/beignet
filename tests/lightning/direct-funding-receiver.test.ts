@@ -17,13 +17,16 @@ import { BeignetCustomSubtype } from '../../src/lightning/message/custom';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { DirectFundingReceiver } from '../../src/lightning/direct-funding/receiver/engine';
 import {
+	attestationMessage,
 	decodeDfOfferAck,
 	decodeDfReceipt,
-	decodeDfSignRequest
+	decodeDfSignRequest,
+	spliceAttestationMessage
 } from '../../src/lightning/direct-funding/messages';
 import { DF_REQUESTS_STORAGE_KEY } from '../../src/lightning/direct-funding/requests';
 import {
 	buildOffer,
+	COMMITTED_FUNDING_PUBKEYS,
 	FakeDfNode,
 	FakePayerLane,
 	flush,
@@ -3156,6 +3159,186 @@ describe('Direct funding receiver: routing and zero-conf (issue #612)', () => {
 		expect(h.payer.bodiesOf(SIGN_REQUEST)).to.have.length(0);
 		expect(h.lastAck()?.reason).to.contain('below the offered');
 		expect(h.node.aborts.map((a) => a.kind)).to.deep.equal(['splice']);
+	});
+
+	// Issue #1871: a peer that derives a fresh funding key per splice. The
+	// output pays the new pair, the shared input still spends the committed
+	// one, and the attestation has to say both.
+	describe('a splice that rotated a funding key (issue #1871)', () => {
+		const ROTATED = {
+			local: COMMITTED_FUNDING_PUBKEYS.local,
+			remote: getPublicKey(
+				crypto.createHash('sha256').update('remote-rotated').digest()
+			)
+		};
+
+		async function splicing(): Promise<IHarness & { signed: string[] }> {
+			const h = harness(
+				{ allowSplice: true, negotiationTimeoutMs: 5_000 },
+				{ authenticatedPeer: 'payer-node-id' }
+			);
+			h.node.spliceChannel = crypto.randomBytes(32);
+			h.node.trustedPayers.add('payer-node-id');
+			const signed: string[] = [];
+			h.node.signMessage = (message?: string): string => {
+				signed.push(message ?? '');
+				return 'y'.repeat(104);
+			};
+			await h.sendOffer();
+			return { ...h, signed };
+		}
+
+		it('names the new pair for the output and the committed pair for the shared input', async () => {
+			const h = await splicing();
+			const { tx } = h.node.completeSpliceNegotiation(
+				h.coin,
+				h.offer,
+				200_000n,
+				{
+					newFundingPubkeys: ROTATED
+				}
+			);
+			await flush();
+			const request = decodeDfSignRequest(h.payer.bodiesOf(SIGN_REQUEST)[0]);
+			expect(request.sharedInputIndex).to.equal(1);
+			expect(request.attestation.localFundingPubkey).to.deep.equal(
+				ROTATED.local
+			);
+			expect(request.attestation.remoteFundingPubkey).to.deep.equal(
+				ROTATED.remote
+			);
+			expect(request.attestation.priorFundingPubkeys).to.deep.equal(
+				COMMITTED_FUNDING_PUBKEYS
+			);
+			expect(h.signed).to.deep.equal([
+				spliceAttestationMessage(
+					h.offer.offerId,
+					tx.toBuffer(),
+					0,
+					ROTATED,
+					1,
+					COMMITTED_FUNDING_PUBKEYS
+				)
+			]);
+		});
+
+		it('keeps the plain form for a splice whose keys did not change', async () => {
+			const h = await splicing();
+			const { tx } = h.node.completeSpliceNegotiation(
+				h.coin,
+				h.offer,
+				200_000n,
+				{
+					newFundingPubkeys: COMMITTED_FUNDING_PUBKEYS
+				}
+			);
+			await flush();
+			const request = decodeDfSignRequest(h.payer.bodiesOf(SIGN_REQUEST)[0]);
+			expect(request.attestation.priorFundingPubkeys).to.equal(undefined);
+			expect(h.signed).to.deep.equal([
+				attestationMessage(
+					h.offer.offerId,
+					tx.toBuffer(),
+					0,
+					COMMITTED_FUNDING_PUBKEYS.local
+				)
+			]);
+		});
+
+		it('refuses to attest a rotated output its channel did not report the keys of', async () => {
+			const h = await splicing();
+			h.node.completeSpliceNegotiation(h.coin, h.offer, 200_000n, {
+				newFundingPubkeys: ROTATED,
+				reportNewFundingPubkeys: false
+			});
+			await flush();
+			expect(h.signed, 'the node key signed nothing').to.deep.equal([]);
+			expect(h.payer.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+			expect(h.lastAck()?.reason).to.contain(
+				'not the 2-of-2 of the attested keys'
+			);
+			expect(h.node.aborts.map((a) => a.kind)).to.deep.equal(['splice']);
+		});
+
+		it('refuses to attest a shared input that is not the committed funding', async () => {
+			const h = await splicing();
+			h.node.completeSpliceNegotiation(h.coin, h.offer, 200_000n, {
+				newFundingPubkeys: ROTATED,
+				fundingScript: Buffer.alloc(34, 2)
+			});
+			await flush();
+			expect(h.payer.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+			expect(h.lastAck()?.reason).to.contain(
+				'shared input is not the 2-of-2 of the channel funding keys'
+			);
+		});
+
+		it('rebuilds the same proof after a restart', async () => {
+			const storage = memoryStorage();
+			const first = new FakeDfNode(storage);
+			first.spliceChannel = crypto.randomBytes(32);
+			first.trustedPayers.add(LSP_PUBKEY);
+			const record = first.mintRequest();
+			const coin = makeCoin();
+			first.publish(coin);
+			const offer = buildOffer(record, coin);
+			const payer = new FakePayerLane(record, 'lane-before', LSP_PUBKEY);
+			const config = {
+				allowSplice: true,
+				negotiationTimeoutMs: 5_000,
+				sweepIntervalMs: 60_000
+			};
+			const engine = new DirectFundingReceiver(first, config);
+			engine.start();
+			engine.handleFrame(payer.offerFrame(offer));
+			await flush();
+			const { channelId } = first.completeSpliceNegotiation(
+				coin,
+				offer,
+				40_000n,
+				{ newFundingPubkeys: ROTATED }
+			);
+			await flush();
+			expect(payer.bodiesOf(SIGN_REQUEST)).to.have.length(1);
+			engine.stop();
+
+			const second = new FakeDfNode(storage);
+			second.publish(coin);
+			second.stagePendingSplice(channelId, coin, offer, 40_000n, {
+				newFundingPubkeys: ROTATED
+			});
+			const again = new FakePayerLane(record, 'lane-after', LSP_PUBKEY);
+			const restarted = new DirectFundingReceiver(second, config);
+			restarted.start();
+			restarted.handleFrame(again.offerFrame(offer));
+			await flush();
+
+			expect(second.splices, 'no second splice').to.have.length(0);
+			const bodies = again.bodiesOf(SIGN_REQUEST);
+			expect(bodies).to.have.length(1);
+			const rebuilt = decodeDfSignRequest(bodies[0]);
+			expect(rebuilt.sharedInputIndex).to.equal(1);
+			expect(rebuilt.attestation.remoteFundingPubkey).to.deep.equal(
+				ROTATED.remote
+			);
+			expect(rebuilt.attestation.priorFundingPubkeys).to.deep.equal(
+				COMMITTED_FUNDING_PUBKEYS
+			);
+			restarted.stop();
+		});
+	});
+
+	it('refuses to attest a new channel whose output is not the 2-of-2 of its keys', async () => {
+		const h = harness({ negotiationTimeoutMs: 5_000 });
+		await h.sendOffer();
+		h.node.completeNegotiation(h.coin, h.offer, {
+			fundingScript: Buffer.alloc(34, 1)
+		});
+		await flush();
+		expect(h.payer.bodiesOf(SIGN_REQUEST)).to.have.length(0);
+		expect(h.lastAck()?.reason).to.contain(
+			'not the 2-of-2 of the attested keys'
+		);
 	});
 
 	// Issue #760. A stranger's coin can go under the home channel because the

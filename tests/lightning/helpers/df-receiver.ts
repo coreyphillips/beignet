@@ -55,6 +55,7 @@ import {
 	IDfLaneSender
 } from '../../../src/lightning/direct-funding/transport/types';
 import { ISpliceWalletInput } from '../../../src/lightning/channel/channel';
+import { createFundingScript } from '../../../src/lightning/script/funding';
 import { taprootTweakPrivateKey } from '../../../src/lightning/wallet/wallet-funding-provider';
 
 export const LSP_PUBKEY = getPublicKey(
@@ -65,6 +66,20 @@ export const LSP_PUBKEY = getPublicKey(
 export const RECEIVER_NODE_ID = getPublicKey(
 	crypto.createHash('sha256').update('df-receiver').digest()
 );
+
+/** What a FakeDfNode's `fundingPubkeys` answers with. */
+export const COMMITTED_FUNDING_PUBKEYS = {
+	local: getPublicKey(crypto.createHash('sha256').update('local').digest()),
+	remote: getPublicKey(crypto.createHash('sha256').update('remote').digest())
+};
+
+/** The P2WSH 2-of-2 of a funding key pair. */
+export function fundingScriptOf(pair: {
+	local: Buffer;
+	remote: Buffer;
+}): Buffer {
+	return createFundingScript(pair.local, pair.remote).p2wshOutput;
+}
 
 /** Let every pending microtask and zero-delay timer run. */
 export async function flush(times = 4): Promise<void> {
@@ -467,6 +482,20 @@ function externalSlot(
 	};
 }
 
+export interface ISpliceStageOptions {
+	feeSat?: bigint;
+	fundingValueSat?: bigint;
+	/** The 2-of-2 the shared input spends, and the new output too unless rotated. */
+	fundingScript?: Buffer;
+	/**
+	 * The peer rotated a funding key for this splice: the new output pays this
+	 * pair, and the channel reports it unless `reportNewFundingPubkeys` is false.
+	 */
+	newFundingPubkeys?: { local: Buffer; remote: Buffer };
+	reportNewFundingPubkeys?: boolean;
+	externalWitness?: DfExternalWitnessState;
+}
+
 /** A wallet-data store two FakeDfNodes can share, i.e. survive a restart. */
 export function memoryStorage(): {
 	saveWalletData(key: string, value: string): void;
@@ -644,12 +673,7 @@ export class FakeDfNode implements IDfReceiverDeps {
 
 	fundingPubkeys(): { local: Buffer; remote: Buffer } | null {
 		if (!this.pubkeysAvailable) return null;
-		return {
-			local: getPublicKey(crypto.createHash('sha256').update('local').digest()),
-			remote: getPublicKey(
-				crypto.createHash('sha256').update('remote').digest()
-			)
-		};
+		return COMMITTED_FUNDING_PUBKEYS;
 	}
 
 	canOpenZeroConfTo(peerHex: string): boolean {
@@ -870,13 +894,7 @@ export class FakeDfNode implements IDfReceiverDeps {
 		coin: IDfTestCoin,
 		offer: IDfOffer,
 		preCapacitySat: bigint,
-		opts: {
-			feeSat?: bigint;
-			fundingValueSat?: bigint;
-			channelId?: Buffer;
-			/** The real 2-of-2; the shared input spends it too. */
-			fundingScript?: Buffer;
-		} = {}
+		opts: ISpliceStageOptions & { channelId?: Buffer } = {}
 	): { channelId: Buffer; tx: bitcoin.Transaction } {
 		const channelId =
 			opts.channelId ?? this.splices[this.splices.length - 1].channelId;
@@ -899,15 +917,14 @@ export class FakeDfNode implements IDfReceiverDeps {
 		coin: IDfTestCoin,
 		offer: IDfOffer,
 		preCapacitySat: bigint,
-		opts: {
-			feeSat?: bigint;
-			fundingValueSat?: bigint;
-			fundingScript?: Buffer;
-			externalWitness?: DfExternalWitnessState;
-		} = {}
+		opts: ISpliceStageOptions = {}
 	): bitcoin.Transaction {
+		const oldFunding =
+			opts.fundingScript ?? fundingScriptOf(COMMITTED_FUNDING_PUBKEYS);
+		const rotated = opts.newFundingPubkeys;
 		const built = this.buildNegotiatedTx(coin, offer, {
 			...opts,
+			fundingScript: rotated ? fundingScriptOf(rotated) : oldFunding,
 			fundingValueSat: opts.fundingValueSat ?? preCapacitySat + offer.amountSat,
 			sharedInput: preCapacitySat
 		});
@@ -916,8 +933,11 @@ export class FakeDfNode implements IDfReceiverDeps {
 			spliceTxid: Buffer.from(built.getHash()),
 			sharedInputIndex: 1,
 			newFundingOutputIndex: 0,
+			...(rotated && opts.reportNewFundingPubkeys !== false
+				? { newFundingPubkeys: rotated }
+				: {}),
 			prevouts: {
-				scripts: [coin.script, opts.fundingScript ?? Buffer.alloc(34, 2)],
+				scripts: [coin.script, oldFunding],
 				values: [coin.valueSat, preCapacitySat]
 			},
 			...externalSlot(coin, opts.externalWitness)
@@ -953,7 +973,7 @@ export class FakeDfNode implements IDfReceiverDeps {
 			tx.addInput(crypto.randomBytes(32), 0, 0xfffffffd);
 		}
 		tx.addOutput(
-			opts.fundingScript ?? Buffer.alloc(34, 1),
+			opts.fundingScript ?? fundingScriptOf(COMMITTED_FUNDING_PUBKEYS),
 			Number(opts.fundingValueSat ?? offer.amountSat)
 		);
 		const change = offer.valueSat - offer.amountSat - fee;
