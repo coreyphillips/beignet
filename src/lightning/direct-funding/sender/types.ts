@@ -366,6 +366,13 @@ export interface IDfPaymentRecord {
 		fundingOutputIndex: number;
 		localFundingPubkey: string;
 		remoteFundingPubkey: string;
+		/**
+		 * A splice that rotated a funding key: the shared input and the pair it
+		 * spent, which the signature covers as well (`IDfAttestation`).
+		 */
+		sharedInputIndex?: number;
+		priorLocalFundingPubkey?: string;
+		priorRemoteFundingPubkey?: string;
 		signature: string;
 	};
 	/** The transaction we verified and signed, hex. */

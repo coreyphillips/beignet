@@ -37,7 +37,8 @@ import {
 	encodeDfReceipt,
 	encodeDfSignRequest,
 	IDfOffer,
-	IDfPrevout
+	IDfPrevout,
+	spliceAttestationMessage
 } from '../../../src/lightning/direct-funding/messages';
 import {
 	encodeRequestEnvelope,
@@ -653,6 +654,12 @@ export interface ISignRequestOptions {
 	extraOutputs?: number;
 	/** Splice: the shared old-funding input, at index 1. */
 	sharedInput?: { valueSat: bigint; script?: Buffer };
+	/**
+	 * Splice: the peer rotated its funding key, so the output pays a new pair
+	 * while the shared input spends the old one, and the attestation names both
+	 * (issue #1871).
+	 */
+	rotateRemoteFundingKey?: boolean;
 	/** Sign the attestation with this key instead of the receiver's node key. */
 	attestWith?: Buffer;
 	/** Corrupt the attestation signature. */
@@ -687,13 +694,23 @@ export function buildSignRequest(
 	const localFundingPubkey = getPublicKey(
 		crypto.createHash('sha256').update('df-local').digest()
 	);
-	const remoteFundingPubkey = getPublicKey(
+	const priorRemoteFundingPubkey = getPublicKey(
 		crypto.createHash('sha256').update('df-remote').digest()
 	);
+	const priorFundingScript = createFundingScript(
+		localFundingPubkey,
+		priorRemoteFundingPubkey
+	).p2wshOutput;
+	const remoteFundingPubkey = opts.rotateRemoteFundingKey
+		? getPublicKey(crypto.createHash('sha256').update('df-remote-2').digest())
+		: priorRemoteFundingPubkey;
 	const fundingScript = createFundingScript(
 		localFundingPubkey,
 		remoteFundingPubkey
 	).p2wshOutput;
+	const prior = opts.rotateRemoteFundingKey
+		? { local: localFundingPubkey, remote: priorRemoteFundingPubkey }
+		: undefined;
 
 	const tx = new bitcoin.Transaction();
 	tx.version = opts.version ?? 2;
@@ -708,10 +725,15 @@ export function buildSignRequest(
 
 	const sharedBase = opts.sharedInput?.valueSat ?? 0n;
 	if (opts.sharedInput) {
-		tx.addInput(crypto.randomBytes(32), 0, PAYER_SEQUENCE);
+		// Fixed, so a receiver in a later life rebuilds the same transaction.
+		tx.addInput(
+			crypto.createHash('sha256').update('df-shared-funding').digest(),
+			0,
+			PAYER_SEQUENCE
+		);
 		prevouts.push({
 			valueSat: opts.sharedInput.valueSat,
-			script: opts.sharedInput.script ?? fundingScript
+			script: opts.sharedInput.script ?? priorFundingScript
 		});
 	}
 	for (const extra of opts.extraInputs ?? []) {
@@ -738,12 +760,21 @@ export function buildSignRequest(
 	const signer = opts.attestWith ?? request.nodePrivkey;
 	let signature = zbase32Decode(
 		signMessageWithKey(
-			attestationMessage(
-				opts.offerId ?? offer.offerId,
-				rawTx,
-				fundingOutputIndex,
-				localFundingPubkey
-			),
+			prior
+				? spliceAttestationMessage(
+						opts.offerId ?? offer.offerId,
+						rawTx,
+						fundingOutputIndex,
+						{ local: localFundingPubkey, remote: remoteFundingPubkey },
+						1,
+						prior
+				  )
+				: attestationMessage(
+						opts.offerId ?? offer.offerId,
+						rawTx,
+						fundingOutputIndex,
+						localFundingPubkey
+				  ),
 			signer
 		)
 	)!;
@@ -760,6 +791,7 @@ export function buildSignRequest(
 				fundingOutputIndex,
 				localFundingPubkey,
 				remoteFundingPubkey,
+				...(prior ? { priorFundingPubkeys: prior } : {}),
 				signature
 			},
 			...(opts.sharedInput ? { sharedInputIndex: 1 } : {})

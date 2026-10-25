@@ -21,6 +21,7 @@ import { MAX_INTERACTIVE_TX_SEQUENCE } from '../../interactive-tx/validation';
 import { schnorrVerify } from '../../offer/schnorr';
 import { isValidShutdownScript } from '../../channel/validation';
 import { estimateSpliceTxWeight } from '../../channel/splice-weight';
+import { createFundingScript } from '../../script/funding';
 import { scriptKind } from '../../wallet/wallet-funding-provider';
 import type { IDfOffer } from '../messages';
 import {
@@ -431,6 +432,49 @@ export function fundingTransactionProblem(c: IDfFundingCheck): string | null {
 	const payerFee = payerCost - c.offer.amountSat;
 	if (payerFee > c.offer.maxTotalFeeSat) {
 		return `payer would pay ${payerFee} sat in fees, above the ${c.offer.maxTotalFeeSat} sat it allowed`;
+	}
+	return null;
+}
+
+export interface IDfAttestedKeysCheck {
+	tx: bitcoin.Transaction;
+	fundingOutputIndex: number;
+	/** The pair the attestation names for the funding output. */
+	fundingPubkeys: { local: Buffer; remote: Buffer };
+	prevoutScripts: Buffer[];
+	/** Splice only. */
+	sharedInputIndex?: number;
+	/** The pair the shared input spends, when it is not `fundingPubkeys`. */
+	priorFundingPubkeys?: { local: Buffer; remote: Buffer };
+}
+
+/**
+ * Do the keys about to be attested build the scripts the transaction pays and
+ * spends? Returns the problem, or null.
+ *
+ * The payer rebuilds both from the attestation and refuses a mismatch, so
+ * attesting one only puts this node's key over a claim the transaction
+ * contradicts, and reports the failure on the wrong side. Issue #1871 was
+ * that: a splice whose peer rotated its funding key, attested with the pair
+ * the shared input spends.
+ */
+export function attestedKeysProblem(c: IDfAttestedKeysCheck): string | null {
+	const out = c.tx.outs[c.fundingOutputIndex];
+	const funding = createFundingScript(
+		c.fundingPubkeys.local,
+		c.fundingPubkeys.remote
+	).p2wshOutput;
+	if (!out || !Buffer.from(out.script).equals(funding)) {
+		return 'the funding output is not the 2-of-2 of the attested keys';
+	}
+	if (c.sharedInputIndex === undefined) return null;
+	const prior = c.priorFundingPubkeys ?? c.fundingPubkeys;
+	const shared = c.prevoutScripts[c.sharedInputIndex];
+	if (
+		!shared ||
+		!shared.equals(createFundingScript(prior.local, prior.remote).p2wshOutput)
+	) {
+		return 'the shared input is not the 2-of-2 of the channel funding keys';
 	}
 	return null;
 }

@@ -437,6 +437,47 @@ describe('Direct funding end to end: payer against receiver', () => {
 		}
 	});
 
+	// Issue #1871: the liquidity peer derives a new funding key for the splice,
+	// as LDK's splice signer does, so the new output pays a pair the shared
+	// input does not spend.
+	it('splices into a channel whose peer rotated its funding key', async () => {
+		const e2e = await setup({ paired: true, allowSplice: true });
+		e2e.node.spliceChannel = Buffer.alloc(32, 9);
+		try {
+			const send = e2e.sender.send(e2e.request, {
+				amountSat: AMOUNT,
+				maxTotalFeeSat: FEE_CEILING
+			});
+			await flush(8);
+			expect(e2e.node.splices).to.have.length(1);
+			const committed = e2e.node.fundingPubkeys()!;
+			const rotated = {
+				local: committed.local,
+				remote: getPublicKey(
+					crypto.createHash('sha256').update('e2e-rotated').digest()
+				)
+			};
+			e2e.node.completeSpliceNegotiation(
+				e2e.coin,
+				e2e.expectedOffer(),
+				500_000n,
+				{ fundingScript: e2e.fundingScript, newFundingPubkeys: rotated }
+			);
+			const result = await send;
+			expect(result.attested).to.equal(true);
+			expect(result.status).to.equal('SIGNED_PENDING');
+			expect(e2e.node.witnesses[0].kind).to.equal('splice');
+			expect(result.receiptPreimageHex).to.equal(e2e.record.preimageHex);
+			const att = e2e.payments.list()[0].attestation!;
+			expect(att.remoteFundingPubkey).to.equal(rotated.remote.toString('hex'));
+			expect(att.priorRemoteFundingPubkey).to.equal(
+				committed.remote.toString('hex')
+			);
+		} finally {
+			e2e.stop();
+		}
+	});
+
 	// Issue #760: the same exchange for a payer the receiver never paired with.
 	// The payer side is untouched; what changes is the funding the receiver
 	// negotiates behind it, a splice that locks at depth rather than a second

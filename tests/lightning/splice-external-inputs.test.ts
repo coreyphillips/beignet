@@ -74,6 +74,7 @@ import {
 	realInitialCommitmentSig
 } from './helpers/real-signing';
 import { taprootTweakPrivateKey } from '../../src/lightning/wallet/wallet-funding-provider';
+import { createFundingScript } from '../../src/lightning/script/funding';
 
 const FUNDING_SATOSHIS = 1_000_000n;
 const SPLICE_AMOUNT = 300_000n;
@@ -908,6 +909,38 @@ describe('Splice external inputs (issue #592)', function () {
 				record.spliceTxid
 			)
 		).to.equal(true);
+	});
+
+	it('names the pair the new funding output pays, as the splice negotiated it (issue #1871)', function () {
+		const { pair } = driveToWithhold();
+		const committed = pair.opener.getFundingPubkeys()!;
+		const pending = pair.opener.getPendingSpliceTx()!;
+		const pays = pending.newFundingPubkeys!;
+		// Our own peer keeps its key, so the pair is the committed one, and its
+		// 2-of-2 is the output the transaction actually built.
+		expect(pays).to.deep.equal(committed);
+		expect(
+			createFundingScript(pays.local, pays.remote).p2wshOutput
+		).to.deep.equal(
+			Buffer.from(pending.tx.outs[pending.newFundingOutputIndex].script)
+		);
+
+		// A peer that sent a fresh key in splice_ack: a restored channel reads it
+		// from the in-flight record, while the shared input still spends the
+		// committed pair.
+		const rotated = getPublicKey(Buffer.alloc(32, 0x5a));
+		const serialized = JSON.parse(
+			JSON.stringify(serializeChannelState(pair.opener.getFullState()))
+		);
+		serialized.spliceInFlight.remoteFundingPubkey = rotated.toString('hex');
+		const restored = new Channel(deserializeChannelState(serialized));
+		restored.setSigner(signerFromSeed(openerSeed));
+		restored.restoreSpliceInFlight();
+		expect(restored.getPendingSpliceTx()!.newFundingPubkeys).to.deep.equal({
+			local: committed.local,
+			remote: rotated
+		});
+		expect(restored.getFundingPubkeys()).to.deep.equal(committed);
 	});
 
 	/**

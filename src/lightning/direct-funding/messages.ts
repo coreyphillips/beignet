@@ -130,8 +130,20 @@ export interface IDfPrevout {
 
 export interface IDfAttestation {
 	fundingOutputIndex: number;
+	/** The keys of the funding output's 2-of-2. */
 	localFundingPubkey: Buffer;
 	remoteFundingPubkey: Buffer;
+	/**
+	 * Splice only, and only when a funding key was rotated for it: the keys of
+	 * the 2-of-2 the shared input spends. A splice may pay a new pair (a peer
+	 * deriving a fresh funding key per splice is the common case), so the old
+	 * funding and the new output are then two scripts, and the signature covers
+	 * both through `spliceAttestationMessage`. Absent, the shared input spends
+	 * the same 2-of-2 the output pays and `attestationMessage` is what is
+	 * signed. Carried in an odd TLV: a payer that predates it finds the shared
+	 * input is not the attested 2-of-2 and refuses, as it did before.
+	 */
+	priorFundingPubkeys?: { local: Buffer; remote: Buffer };
 	/** Raw 65-byte compact recoverable signature by the receiver's node key. */
 	signature: Buffer;
 }
@@ -486,8 +498,12 @@ const SIGN_REQUEST_TYPES = {
 	localFundingPubkey: 8n,
 	remoteFundingPubkey: 10n,
 	attestationSignature: 12n,
-	sharedInputIndex: 13n
+	sharedInputIndex: 13n,
+	/** Odd: 33-byte local then 33-byte remote key of the spliced-away funding. */
+	priorFundingPubkeys: 15n
 };
+
+const PRIOR_FUNDING_PUBKEYS_BYTES = 2 * DF_NODE_ID_BYTES;
 
 function encodePrevouts(prevouts: IDfPrevout[]): Buffer {
 	if (prevouts.length > DF_MAX_PREVOUTS) {
@@ -574,6 +590,16 @@ export function encodeDfSignRequest(s: IDfSignRequest): Buffer {
 			value: u32Buf(s.sharedInputIndex, 'shared input index')
 		});
 	}
+	const prior = s.attestation.priorFundingPubkeys;
+	if (prior) {
+		records.push({
+			type: SIGN_REQUEST_TYPES.priorFundingPubkeys,
+			value: Buffer.concat([
+				fixed(prior.local, DF_NODE_ID_BYTES, 'prior local funding pubkey'),
+				fixed(prior.remote, DF_NODE_ID_BYTES, 'prior remote funding pubkey')
+			])
+		});
+	}
 	return encodeTlvStream(records);
 }
 
@@ -584,6 +610,10 @@ export function decodeDfSignRequest(data: Buffer): IDfSignRequest {
 		'funding_sign_request'
 	);
 	const shared = f.get(SIGN_REQUEST_TYPES.sharedInputIndex);
+	const prior = f.get(SIGN_REQUEST_TYPES.priorFundingPubkeys);
+	const priorBytes = prior
+		? fixed(prior, PRIOR_FUNDING_PUBKEYS_BYTES, 'prior funding pubkeys')
+		: undefined;
 	return {
 		offerId: needFixed(
 			f,
@@ -617,6 +647,14 @@ export function decodeDfSignRequest(data: Buffer): IDfSignRequest {
 				DF_NODE_ID_BYTES,
 				'remote funding pubkey'
 			),
+			...(priorBytes
+				? {
+						priorFundingPubkeys: {
+							local: Buffer.from(priorBytes.subarray(0, DF_NODE_ID_BYTES)),
+							remote: Buffer.from(priorBytes.subarray(DF_NODE_ID_BYTES))
+						}
+				  }
+				: {}),
 			signature: needFixed(
 				f,
 				SIGN_REQUEST_TYPES.attestationSignature,
@@ -1009,5 +1047,44 @@ export function attestationMessage(
 	return (
 		`lfbw-direct-funding-attest:${offerId.toString('hex')}:${txHash}:` +
 		`${fundingOutputIndex}:${localFundingPubkey.toString('hex')}`
+	);
+}
+
+/**
+ * The attestation string for a splice that rotated a funding key (issue
+ * #1871): the shared input spends one 2-of-2 and the funding output pays
+ * another, so the receiver vouches for both, and for which input spends the
+ * old one. Every key is named rather than left to the script hashes, and the
+ * prefix differs from `attestationMessage`'s so a signature over one form
+ * never verifies as the other.
+ */
+export function spliceAttestationMessage(
+	offerId: Buffer,
+	rawTx: Buffer,
+	fundingOutputIndex: number,
+	fundingPubkeys: { local: Buffer; remote: Buffer },
+	sharedInputIndex: number,
+	priorFundingPubkeys: { local: Buffer; remote: Buffer }
+): string {
+	fixed(offerId, DF_OFFER_ID_BYTES, 'offer id');
+	const keys = [
+		fixed(fundingPubkeys.local, DF_NODE_ID_BYTES, 'local funding pubkey'),
+		fixed(fundingPubkeys.remote, DF_NODE_ID_BYTES, 'remote funding pubkey'),
+		fixed(
+			priorFundingPubkeys.local,
+			DF_NODE_ID_BYTES,
+			'prior local funding pubkey'
+		),
+		fixed(
+			priorFundingPubkeys.remote,
+			DF_NODE_ID_BYTES,
+			'prior remote funding pubkey'
+		)
+	].map((k) => k.toString('hex'));
+	const txHash = sha256(rawTx).toString('hex');
+	return (
+		`lfbw-direct-funding-splice-attest:${offerId.toString('hex')}:${txHash}:` +
+		`${fundingOutputIndex}:${keys[0]}:${keys[1]}:` +
+		`${sharedInputIndex}:${keys[2]}:${keys[3]}`
 	);
 }

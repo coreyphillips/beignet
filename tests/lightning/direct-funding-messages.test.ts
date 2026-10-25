@@ -33,7 +33,8 @@ import {
 	ownershipDigest,
 	ownershipMessage,
 	ownershipProbePoisonTxid,
-	ownershipProbeTransaction
+	ownershipProbeTransaction,
+	spliceAttestationMessage
 } from '../../src/lightning/direct-funding';
 import { BeignetCustomSubtype } from '../../src/lightning/message/custom';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -50,6 +51,7 @@ const RECEIVER_NODE_ID = getPublicKey(Buffer.alloc(32, 0x51));
 const OWNER_PUBKEY = getPublicKey(Buffer.alloc(32, 0x21));
 const LOCAL_FUNDING = getPublicKey(Buffer.alloc(32, 0x31));
 const REMOTE_FUNDING = getPublicKey(Buffer.alloc(32, 0x41));
+const PRIOR_REMOTE_FUNDING = getPublicKey(Buffer.alloc(32, 0x42));
 
 function offer(over: Partial<IDfOffer> = {}): IDfOffer {
 	return {
@@ -445,6 +447,61 @@ describe('Direct funding: protocol messages', () => {
 				DirectFundingErrorCode.MALFORMED
 			);
 		});
+
+		describe('a splice that rotated a funding key (issue #1871)', () => {
+			const rotated = (): IDfSignRequest =>
+				signRequest({
+					sharedInputIndex: 1,
+					attestation: {
+						...signRequest().attestation,
+						priorFundingPubkeys: {
+							local: LOCAL_FUNDING,
+							remote: PRIOR_REMOTE_FUNDING
+						}
+					}
+				});
+
+			it('round trips the prior pair in odd TLV 15', () => {
+				const encoded = encodeDfSignRequest(rotated());
+				expect(decodeDfSignRequest(encoded)).to.deep.equal(rotated());
+				const prior = decodeTlvStream(encoded).records.find(
+					(r) => r.type === 15n
+				);
+				expect(prior?.value).to.deep.equal(
+					Buffer.concat([LOCAL_FUNDING, PRIOR_REMOTE_FUNDING])
+				);
+			});
+
+			it('leaves the body of an unrotated request byte for byte as it was', () => {
+				const spliced = signRequest({ sharedInputIndex: 1 });
+				const types = decodeTlvStream(encodeDfSignRequest(spliced)).records.map(
+					(r) => r.type
+				);
+				expect(types).to.deep.equal([0n, 2n, 4n, 6n, 8n, 10n, 12n, 13n]);
+			});
+
+			it('is skipped by a decoder that predates it', () => {
+				// What an older payer reads: the new output's pair alone, whose
+				// 2-of-2 is not what the shared input spends, so it refuses.
+				expect(() =>
+					decodeTlvStream(
+						encodeDfSignRequest(rotated()),
+						0,
+						new Set([0n, 2n, 4n, 6n, 8n, 10n, 12n, 13n])
+					)
+				).to.not.throw();
+			});
+
+			it('refuses a prior pair that is not two 33-byte keys', () => {
+				const body = Buffer.concat([
+					encodeDfSignRequest(signRequest({ sharedInputIndex: 1 })),
+					encodeTlvStream([{ type: 15n, value: Buffer.alloc(65, 2) }])
+				]);
+				expect(codeOf(() => decodeDfSignRequest(body))).to.equal(
+					DirectFundingErrorCode.MALFORMED
+				);
+			});
+		});
 	});
 
 	describe('funding_witness (19)', () => {
@@ -627,6 +684,25 @@ describe('Direct funding: protocol messages', () => {
 			expect(attestationMessage(OFFER_ID, rawTx, 0, LOCAL_FUNDING)).to.equal(
 				`lfbw-direct-funding-attest:${OFFER_ID.toString('hex')}:${txHash}:0:` +
 					LOCAL_FUNDING.toString('hex')
+			);
+		});
+
+		it('names both pairs and the shared input in the splice attestation string', () => {
+			const rawTx = Buffer.alloc(120, 0x0d);
+			const txHash = crypto.createHash('sha256').update(rawTx).digest('hex');
+			const hex = (b: Buffer): string => b.toString('hex');
+			const message = spliceAttestationMessage(
+				OFFER_ID,
+				rawTx,
+				0,
+				{ local: LOCAL_FUNDING, remote: REMOTE_FUNDING },
+				1,
+				{ local: LOCAL_FUNDING, remote: PRIOR_REMOTE_FUNDING }
+			);
+			expect(message).to.equal(
+				`lfbw-direct-funding-splice-attest:${hex(OFFER_ID)}:${txHash}:0:` +
+					`${hex(LOCAL_FUNDING)}:${hex(REMOTE_FUNDING)}:1:` +
+					`${hex(LOCAL_FUNDING)}:${hex(PRIOR_REMOTE_FUNDING)}`
 			);
 		});
 	});

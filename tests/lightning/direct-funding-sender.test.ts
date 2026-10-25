@@ -13,14 +13,26 @@ import * as bitcoin from 'bitcoinjs-lib';
 import { BeignetCustomSubtype } from '../../src/lightning/message/custom';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import {
+	attestationMessage,
 	bitcoinMessageHash,
 	decodeDfOffer,
 	encodeDfOfferAck,
 	encodeDfReceipt,
+	IDfAttestation,
 	IDfOffer,
 	ownershipMessage,
-	ownershipProbeTransaction
+	ownershipProbeTransaction,
+	spliceAttestationMessage
 } from '../../src/lightning/direct-funding/messages';
+import { signRequestProblem } from '../../src/lightning/direct-funding/sender/verify';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import {
+	signMessageWithKey,
+	verifyMessageSignature,
+	zbase32Decode,
+	zbase32Encode
+} from '../../src/lightning/crypto/message-signing';
+import { createFundingScript } from '../../src/lightning/script/funding';
 import {
 	DirectFundingError,
 	DirectFundingErrorCode,
@@ -932,6 +944,324 @@ describe('Direct funding sender: the seven sign-request checks', () => {
 		// It is not refused as a bad transaction: it is not our exchange at all,
 		// so the send runs out of time instead.
 		expect(err.code).to.equal(DirectFundingErrorCode.EXCHANGE_TIMEOUT);
+	});
+});
+
+/**
+ * Issue #1871. A liquidity peer may derive a fresh funding key for each
+ * splice, so the shared input spends one 2-of-2 and the new output pays
+ * another. The attestation names both, and every check the same-key splice
+ * gets still runs. The fixture is the issue's own: a 40,000 sat channel, a
+ * 20,000 sat coin, a 5,000 sat payment under a 1,000 sat fee ceiling.
+ */
+describe('Direct funding sender: a splice that rotated a funding key (issue #1871)', () => {
+	type Pair = { local: Buffer; remote: Buffer };
+	const keyOf = (label: string): Buffer =>
+		getPublicKey(crypto.createHash('sha256').update(label).digest());
+	const nodeKey = crypto.createHash('sha256').update('df-1871-node').digest();
+	const OLD: Pair = { local: keyOf('local'), remote: keyOf('remote') };
+	const NEW: Pair = { local: OLD.local, remote: keyOf('remote-rotated') };
+	const OTHER: Pair = { local: OLD.local, remote: keyOf('someone-else') };
+	const scriptOf = (p: Pair): Buffer =>
+		createFundingScript(p.local, p.remote).p2wshOutput;
+	const OFFER_ID = Buffer.alloc(16, 3);
+	const OLD_FUNDING_TXID = Buffer.alloc(32, 1);
+	const PAYER_TXID = Buffer.alloc(32, 2);
+	const CHANGE = Buffer.from('0014' + '04'.repeat(20), 'hex');
+
+	interface ISplice {
+		/** The pair the attestation names for the output (default NEW). */
+		attested?: Pair;
+		/** The prior pair it names, or null to name none (default OLD). */
+		prior?: Pair | null;
+		/** What the output pays and the shared input spends. */
+		outputPays?: Pair;
+		sharedSpends?: Pair;
+		fundingValueSat?: number;
+		/** Sign the plain form even though a prior pair is named. */
+		plainForm?: boolean;
+		signer?: Buffer;
+		/** Applied after the receiver signed, i.e. by someone else. */
+		tamper?: (tx: bitcoin.Transaction, att: IDfAttestation) => void;
+	}
+
+	function check(o: ISplice = {}): ReturnType<typeof signRequestProblem> {
+		const attested = o.attested ?? NEW;
+		const prior = o.prior === undefined ? OLD : o.prior;
+		const tx = new bitcoin.Transaction();
+		tx.version = 2;
+		tx.addInput(OLD_FUNDING_TXID, 0, 0xfffffffd);
+		tx.addInput(PAYER_TXID, 0, 0xfffffffd);
+		tx.addOutput(
+			scriptOf(o.outputPays ?? attested),
+			o.fundingValueSat ?? 45_000
+		);
+		tx.addOutput(CHANGE, 14_800);
+		const message =
+			prior && !o.plainForm
+				? spliceAttestationMessage(
+						OFFER_ID,
+						tx.toBuffer(),
+						0,
+						attested,
+						0,
+						prior
+				  )
+				: attestationMessage(OFFER_ID, tx.toBuffer(), 0, attested.local);
+		const att: IDfAttestation = {
+			fundingOutputIndex: 0,
+			localFundingPubkey: attested.local,
+			remoteFundingPubkey: attested.remote,
+			...(prior ? { priorFundingPubkeys: { ...prior } } : {}),
+			signature: zbase32Decode(
+				signMessageWithKey(message, o.signer ?? nodeKey)
+			)!
+		};
+		o.tamper?.(tx, att);
+		return signRequestProblem({
+			tx,
+			offerId: OFFER_ID,
+			payerPrevTxid: PAYER_TXID,
+			payerVout: 0,
+			payerValueSat: 20_000n,
+			sequence: 0xfffffffd,
+			changeScript: CHANGE,
+			amountSat: 5_000n,
+			maxTotalFeeSat: 1_000n,
+			receiverNodeId: getPublicKey(nodeKey),
+			tipHeight: 100,
+			ownsOutpoint: () => false,
+			request: {
+				offerId: OFFER_ID,
+				rawTx: tx.toBuffer(),
+				sharedInputIndex: 0,
+				prevouts: [
+					{
+						script: scriptOf(o.sharedSpends ?? prior ?? attested),
+						valueSat: 40_000n
+					},
+					{
+						script: Buffer.from('0014' + '05'.repeat(20), 'hex'),
+						valueSat: 20_000n
+					}
+				],
+				attestation: att
+			}
+		});
+	}
+
+	const problemOf = (o: ISplice): string => {
+		const r = check(o);
+		expect(r, 'expected a refusal').to.have.property('problem');
+		return (r as { problem: string }).problem;
+	};
+
+	it('still refuses the committed pair attested over a rotated output', () => {
+		expect(problemOf({ attested: OLD, prior: null, outputPays: NEW })).to.equal(
+			'funding output does not match the attested 2-of-2'
+		);
+	});
+
+	it('still refuses the new pair alone, which the shared input does not spend', () => {
+		expect(problemOf({ prior: null, sharedSpends: OLD })).to.equal(
+			'shared input is not the attested channel funding'
+		);
+	});
+
+	it('accepts a rotated remote key when the attestation names both pairs', () => {
+		const r = check();
+		expect(r).to.have.property('verdict');
+		const { verdict } = r as { verdict: { fundingScript: Buffer } };
+		expect(verdict.fundingScript).to.deep.equal(scriptOf(NEW));
+	});
+
+	it('accepts a rotated local key the same way', () => {
+		const rotatedLocal = { local: keyOf('local-rotated'), remote: OLD.remote };
+		expect(check({ attested: rotatedLocal })).to.have.property('verdict');
+	});
+
+	it('accepts an unchanged-key splice in the plain form', () => {
+		expect(check({ attested: OLD, prior: null })).to.have.property('verdict');
+	});
+
+	it('refuses a substituted old funding outpoint', () => {
+		expect(
+			problemOf({
+				tamper: (tx) => {
+					tx.ins[0].hash = Buffer.alloc(32, 9);
+				}
+			})
+		).to.match(
+			/attestation (signature is invalid|was signed by a different node)/
+		);
+	});
+
+	it('refuses a shared input that is not the prior 2-of-2', () => {
+		expect(problemOf({ sharedSpends: OTHER })).to.equal(
+			'shared input is not the attested channel funding'
+		);
+	});
+
+	it('refuses a substituted new output', () => {
+		expect(problemOf({ outputPays: OTHER })).to.equal(
+			'funding output does not match the attested 2-of-2'
+		);
+	});
+
+	it('refuses a tampered new key, alone or with the output moved to match', () => {
+		expect(
+			problemOf({
+				tamper: (_tx, att) => {
+					att.remoteFundingPubkey = OTHER.remote;
+				}
+			})
+		).to.equal('funding output does not match the attested 2-of-2');
+		expect(
+			problemOf({
+				tamper: (tx, att) => {
+					att.remoteFundingPubkey = OTHER.remote;
+					tx.outs[0].script = scriptOf(OTHER);
+				}
+			})
+		).to.match(
+			/attestation (signature is invalid|was signed by a different node)/
+		);
+	});
+
+	it('refuses a tampered old key, alone or with the shared input moved to match', () => {
+		expect(
+			problemOf({
+				tamper: (_tx, att) => {
+					att.priorFundingPubkeys!.remote = OTHER.remote;
+				}
+			})
+		).to.equal('shared input is not the attested channel funding');
+		// The prevout script is not in the signed transaction, so only the
+		// signature over the named keys can catch this one.
+		expect(
+			problemOf({
+				sharedSpends: OTHER,
+				tamper: (_tx, att) => {
+					att.priorFundingPubkeys!.remote = OTHER.remote;
+				}
+			})
+		).to.match(
+			/attestation (signature is invalid|was signed by a different node)/
+		);
+	});
+
+	it('refuses a prior pair under a signature over the plain form', () => {
+		expect(problemOf({ plainForm: true })).to.match(
+			/attestation (signature is invalid|was signed by a different node)/
+		);
+	});
+
+	it('refuses an attestation by another node', () => {
+		expect(problemOf({ signer: crypto.randomBytes(32) })).to.equal(
+			'attestation was signed by a different node than the payment request named'
+		);
+	});
+
+	it('refuses a new output below the old capacity plus the payment', () => {
+		// 40,000 + 5,000, less the 200 sat fee this transaction charges us.
+		expect(problemOf({ fundingValueSat: 44_799 })).to.contain(
+			'below the 44800 sat'
+		);
+		expect(check({ fundingValueSat: 44_800 })).to.have.property('verdict');
+	});
+
+	it('refuses a prior pair on a transaction with no shared input', () => {
+		const tx = new bitcoin.Transaction();
+		tx.version = 2;
+		tx.addInput(PAYER_TXID, 0, 0xfffffffd);
+		tx.addOutput(scriptOf(NEW), 5_000);
+		tx.addOutput(CHANGE, 14_800);
+		expect(
+			signRequestProblem({
+				tx,
+				offerId: OFFER_ID,
+				payerPrevTxid: PAYER_TXID,
+				payerVout: 0,
+				payerValueSat: 20_000n,
+				sequence: 0xfffffffd,
+				changeScript: CHANGE,
+				amountSat: 5_000n,
+				maxTotalFeeSat: 1_000n,
+				receiverNodeId: getPublicKey(nodeKey),
+				tipHeight: 100,
+				ownsOutpoint: () => false,
+				request: {
+					offerId: OFFER_ID,
+					rawTx: tx.toBuffer(),
+					prevouts: [
+						{
+							script: Buffer.from('0014' + '05'.repeat(20), 'hex'),
+							valueSat: 20_000n
+						}
+					],
+					attestation: {
+						fundingOutputIndex: 0,
+						localFundingPubkey: NEW.local,
+						remoteFundingPubkey: NEW.remote,
+						priorFundingPubkeys: OLD,
+						signature: Buffer.alloc(65)
+					}
+				}
+			})
+		).to.deep.equal({
+			problem: 'attestation names a prior channel funding but no shared input'
+		});
+	});
+
+	it('pays into a rotated splice end to end and keeps a proof it can re-check', async () => {
+		const h = harness({
+			receiver: {
+				sharedInput: { valueSat: 500_000n },
+				rotateRemoteFundingKey: true
+			}
+		});
+		const result = await h.sender.send(h.request.encoded, {
+			amountSat: 100_000n
+		});
+		expect(result.attested).to.equal(true);
+		expect(result.status).to.equal('SIGNED_PENDING');
+		const record = h.payments.get(h.request.requestId.toString('hex'))!;
+		const att = record.attestation!;
+		expect(att.sharedInputIndex).to.equal(1);
+		expect(att.priorRemoteFundingPubkey).to.not.equal(att.remoteFundingPubkey);
+		// Everything the signature covers is on the record.
+		const message = spliceAttestationMessage(
+			Buffer.from(record.offerId, 'hex'),
+			Buffer.from(record.negotiatedTx!, 'hex'),
+			att.fundingOutputIndex,
+			{
+				local: Buffer.from(att.localFundingPubkey, 'hex'),
+				remote: Buffer.from(att.remoteFundingPubkey, 'hex')
+			},
+			att.sharedInputIndex!,
+			{
+				local: Buffer.from(att.priorLocalFundingPubkey!, 'hex'),
+				remote: Buffer.from(att.priorRemoteFundingPubkey!, 'hex')
+			}
+		);
+		const verdict = verifyMessageSignature(
+			message,
+			zbase32Encode(Buffer.from(att.signature, 'hex'))
+		);
+		expect(verdict.pubkey?.equals(h.request.nodeId)).to.equal(true);
+	});
+
+	it('records no prior pair for a splice that kept its keys', async () => {
+		const h = harness({ receiver: { sharedInput: { valueSat: 500_000n } } });
+		await h.sender.send(h.request.encoded, { amountSat: 100_000n });
+		const att = h.payments.get(h.request.requestId.toString('hex'))!
+			.attestation!;
+		expect(att).to.have.all.keys(
+			'fundingOutputIndex',
+			'localFundingPubkey',
+			'remoteFundingPubkey',
+			'signature'
+		);
 	});
 });
 
@@ -2558,7 +2888,7 @@ describe('Direct funding sender: a commit the wire may never have taken', () => 
 	}
 
 	/** A first life that pays, over storage and a wallet the caller keeps. */
-	async function firstLife(): Promise<{
+	async function firstLife(signRequest?: ISignRequestOptions): Promise<{
 		request: ITestRequest;
 		wallet: FakeSenderWallet;
 		storage: ReturnType<typeof memoryStorage>;
@@ -2566,7 +2896,9 @@ describe('Direct funding sender: a commit the wire may never have taken', () => 
 		const storage = memoryStorage();
 		const request = mintRequest();
 		const wallet = new FakeSenderWallet([makeCoin(200_000)]);
-		await life(request, wallet, storage).sender.send(request.encoded, {
+		await life(request, wallet, storage, {
+			...(signRequest ? { signRequest } : {})
+		}).sender.send(request.encoded, {
 			amountSat: 100_000n
 		});
 		return { request, wallet, storage };
@@ -2600,6 +2932,30 @@ describe('Direct funding sender: a commit the wire may never have taken', () => 
 		expect(record.fundingTxid).to.equal(committed.fundingTxid);
 		expect(result.status).to.equal('SIGNED_PENDING');
 		expect(result.spentTxid).to.equal(wallet.coins[0].txidHex);
+	});
+
+	it('retransmits a rotated-key splice witness with its proof intact (issue #1871)', async () => {
+		const rotated: ISignRequestOptions = {
+			sharedInput: { valueSat: 500_000n },
+			rotateRemoteFundingKey: true
+		};
+		const { request, wallet, storage } = await firstLife(rotated);
+		const committed = committedRow(storage);
+		expect(committed.attestation!.priorRemoteFundingPubkey).to.be.a('string');
+		rewindToPreEmit(storage);
+
+		const second = life(request, wallet, storage, { signRequest: rotated });
+		const result = await second.sender.send(request.encoded, {
+			amountSat: 100_000n
+		});
+		expect(second.witnesses).to.have.length(1);
+		expect(
+			second.witnesses[0].map((item) => item.toString('hex'))
+		).to.deep.equal(committed.witness);
+		const record = second.payments.get(request.requestId.toString('hex'))!;
+		expect(record.attestation).to.deep.equal(committed.attestation);
+		expect(result.status).to.equal('SIGNED_PENDING');
+		expect(result.caveat).to.equal(undefined);
 	});
 
 	it('will not sign a second transaction for a payment it already made', async () => {

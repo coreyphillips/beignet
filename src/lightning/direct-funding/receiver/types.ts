@@ -263,6 +263,13 @@ export interface IDfPendingSpliceTx {
 	spliceTxid: Buffer;
 	sharedInputIndex: number;
 	newFundingOutputIndex: number;
+	/**
+	 * The keys of the new funding output's 2-of-2, which a splice that rotated
+	 * a funding key makes different from `fundingPubkeys` (issue #1871).
+	 * Absent or null reads as unchanged keys, and the receiver refuses to attest
+	 * if the transaction says otherwise.
+	 */
+	newFundingPubkeys?: { local: Buffer; remote: Buffer } | null;
 	prevouts: { scripts: Buffer[]; values: bigint[] } | null;
 	owedExternalInputs: IDfExternalInput[];
 	filledExternalInputs: IDfExternalInput[];
@@ -341,7 +348,10 @@ export interface IDfReceiverDeps {
 	 * peer is started, splice or open.
 	 */
 	spliceInFlightWith(peerHex: string): boolean;
-	/** Funding pubkeys of a channel, for the attestation. */
+	/**
+	 * The committed funding pubkeys of a channel, for the attestation: the 2-of-2
+	 * a new channel's output pays, or the one a splice's shared input spends.
+	 */
 	fundingPubkeys(channelId: Buffer): { local: Buffer; remote: Buffer } | null;
 	/** Upstream's own zero-conf gate (zero-conf.ts canOpenZeroConfTo). */
 	canOpenZeroConfTo(peerHex: string): boolean;
