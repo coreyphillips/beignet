@@ -24,6 +24,7 @@ import crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import sinon from 'sinon';
 import {
 	IChannelAnnouncementMessage,
 	NetworkGraph,
@@ -1799,6 +1800,223 @@ describe('Gossip intake queue (LightningNode)', () => {
 				statics.GOSSIP_INTAKE_SLICE_MS = savedSlice;
 				NetworkGraph.MAX_CHANNELS = savedCap;
 			}
+		});
+	});
+
+	describe('retention (issue #1855)', () => {
+		type TIntake = {
+			gossipIntake: unknown[];
+			gossipIntakeHead: number;
+			gossipIntakeBytes: number;
+			rapidGossipImporting: boolean;
+			gossipSyncManagers: Map<string, unknown>;
+			drainGossipIntake(): void;
+			handleChannelAnnouncement(payload: Buffer): void;
+			handleNodeAnnouncement(payload: Buffer): void;
+		};
+		const statics = LightningNode as unknown as {
+			GOSSIP_INTAKE_SLICE_MS: number;
+			GOSSIP_INTAKE_MAX_BYTES: number;
+		};
+		const intakeOf = (n: LightningNode): TIntake => n as unknown as TIntake;
+		const queuedIn = (intake: TIntake): number =>
+			intake.gossipIntake.length - intake.gossipIntakeHead;
+		/** Slots before the head that still hold a message. */
+		const heldBehindHead = (intake: TIntake): number =>
+			intake.gossipIntake
+				.slice(0, intake.gossipIntakeHead)
+				.filter((item) => item !== undefined).length;
+		/** A payload carrying its feed order in its first four bytes. */
+		const tagged = (i: number, size = 1024): Buffer => {
+			const payload = Buffer.alloc(size);
+			payload.writeUInt32BE(i);
+			return payload;
+		};
+		/** Records the order node announcements are handled in. */
+		const recordNodeAnnouncements = (
+			intake: TIntake,
+			onHandle?: () => void
+		): number[] => {
+			const handled: number[] = [];
+			intake.handleNodeAnnouncement = (payload: Buffer): void => {
+				handled.push(payload.readUInt32BE(0));
+				onHandle?.();
+			};
+			return handled;
+		};
+
+		let savedSlice: number;
+		let savedBytes: number;
+		let clock: { tick(ms: number): void; restore(): void } | undefined;
+
+		beforeEach(() => {
+			savedSlice = statics.GOSSIP_INTAKE_SLICE_MS;
+			savedBytes = statics.GOSSIP_INTAKE_MAX_BYTES;
+		});
+
+		afterEach(() => {
+			statics.GOSSIP_INTAKE_SLICE_MS = savedSlice;
+			statics.GOSSIP_INTAKE_MAX_BYTES = savedBytes;
+			clock?.restore();
+			clock = undefined;
+		});
+
+		/**
+		 * Each handled message moves the clock 1 ms, so a 9 ms slice takes
+		 * exactly nine messages.
+		 */
+		const nineMessageSlices = (): (() => void) => {
+			const fake = sinon.useFakeTimers({ now: Date.now(), toFake: ['Date'] });
+			clock = fake;
+			statics.GOSSIP_INTAKE_SLICE_MS = 9;
+			return () => fake.tick(1);
+		};
+
+		it('a queue that never empties holds no taken payload and stays under twice its length', async () => {
+			const intake = intakeOf(node);
+			const handled = recordNodeAnnouncements(intake, nineMessageSlices());
+			let fed = 0;
+			const announce = (): void =>
+				feed(MessageType.NODE_ANNOUNCEMENT, tagged(fed++));
+			while (fed < 100) announce();
+			// Nine in and nine out per cycle: the queue never empties, so it
+			// never resets.
+			for (let cycle = 0; cycle < 1000; cycle++) {
+				for (let i = 0; i < 9; i++) announce();
+				intake.drainGossipIntake();
+				expect(queuedIn(intake)).to.equal(100);
+				expect(heldBehindHead(intake)).to.equal(0);
+				expect(intake.gossipIntake.length).to.be.below(200);
+				expect(intake.gossipIntakeBytes).to.equal(100 * 1024);
+			}
+			await node.flushGossip();
+			expect(handled).to.deep.equal(Array.from({ length: fed }, (_, i) => i));
+			expect(intake.gossipIntake).to.have.length(0);
+			expect(intake.gossipIntakeBytes).to.equal(0);
+		});
+
+		it('storage failures in a queue that never empties still release taken payloads', async () => {
+			const intake = intakeOf(node);
+			const tick = nineMessageSlices();
+			const handle = intake.handleChannelAnnouncement.bind(node);
+			intake.handleChannelAnnouncement = (payload: Buffer): void => {
+				handle(payload);
+				tick();
+			};
+			storage.saveGossipChannel = (): void => {
+				throw new Error('disk full');
+			};
+			const errors: string[] = [];
+			node.on('node:error', (err) => errors.push(err.message));
+			// Lazy intake checks no signature, so unsigned messages are
+			// accepted and reach storage.
+			const { key1, key2 } = makeOrderedKeypairs();
+			let fed = 0;
+			const announce = (): void =>
+				feed(
+					MessageType.CHANNEL_ANNOUNCEMENT,
+					encodeChannelAnnouncementMessage({
+						nodeSignature1: Buffer.alloc(64),
+						nodeSignature2: Buffer.alloc(64),
+						bitcoinSignature1: Buffer.alloc(64),
+						bitcoinSignature2: Buffer.alloc(64),
+						features: Buffer.alloc(0),
+						chainHash: REGTEST_CHAIN_HASH,
+						shortChannelId: encodeShortChannelId({
+							block: 2000 + fed++,
+							txIndex: 1,
+							outputIndex: 0
+						}),
+						nodeId1: key1.publicKey,
+						nodeId2: key2.publicKey,
+						bitcoinKey1: key1.publicKey,
+						bitcoinKey2: key2.publicKey
+					})
+				);
+			while (fed < 20) announce();
+			const queuedBytes = intake.gossipIntakeBytes;
+			for (let cycle = 0; cycle < 50; cycle++) {
+				for (let i = 0; i < 9; i++) announce();
+				intake.drainGossipIntake();
+				expect(queuedIn(intake)).to.equal(20);
+				expect(heldBehindHead(intake)).to.equal(0);
+				expect(intake.gossipIntake.length).to.be.below(40);
+				expect(intake.gossipIntakeBytes).to.equal(queuedBytes);
+			}
+			expect(errors).to.have.length(50);
+			expect(errors[0]).to.contain('9 of 9 writes failed (disk full)');
+			await node.flushGossip();
+			expect(graphOf(node).getChannelCount()).to.equal(fed);
+			expect(intake.gossipIntake).to.have.length(0);
+			expect(intake.gossipIntakeBytes).to.equal(0);
+		});
+
+		it('a flood past the byte budget is dropped newest-first and counted as intake loss', async () => {
+			statics.GOSSIP_INTAKE_MAX_BYTES = 3000;
+			const intake = intakeOf(node);
+			const handled = recordNodeAnnouncements(intake);
+			const logs: Array<[string, Record<string, unknown>]> = [];
+			node.on('log', (log) => {
+				if (log.action.startsWith('gossip_intake')) {
+					logs.push([log.action, log.data]);
+				}
+			});
+			const pubkey = 'aa'.repeat(33);
+			let losses = 0;
+			intake.gossipSyncManagers.set(pubkey, {
+				noteIntakeLoss: () => losses++
+			});
+			try {
+				for (let i = 0; i < 4; i++) {
+					feed(MessageType.NODE_ANNOUNCEMENT, tagged(i, 1000));
+				}
+				expect(queuedIn(intake)).to.equal(3);
+				expect(intake.gossipIntakeBytes).to.equal(3000);
+				expect(losses).to.equal(1);
+				await node.flushGossip();
+				expect(handled).to.deep.equal([0, 1, 2]);
+				expect(logs).to.deep.equal([
+					['gossip_intake_overflow', { pubkey, queued: 3, bytes: 3000 }],
+					['gossip_intake_overflow_ended', { dropped: 1 }]
+				]);
+				// Only what is still queued spends the budget.
+				feed(MessageType.NODE_ANNOUNCEMENT, tagged(4, 3000));
+				await node.flushGossip();
+				expect(handled).to.deep.equal([0, 1, 2, 4]);
+				expect(losses).to.equal(1);
+			} finally {
+				intake.gossipSyncManagers.delete(pubkey);
+			}
+		});
+
+		it('an import pause keeps the queue in order, and teardown releases it', async () => {
+			const intake = intakeOf(node);
+			const handled = recordNodeAnnouncements(intake);
+			intake.rapidGossipImporting = true;
+			for (let i = 0; i < 3; i++)
+				feed(MessageType.NODE_ANNOUNCEMENT, tagged(i));
+			// Longer than the paused drain's 25 ms retry.
+			await new Promise((resolve) => setTimeout(resolve, 60));
+			expect(handled).to.deep.equal([]);
+			expect(intake.gossipIntakeBytes).to.equal(3 * 1024);
+			intake.rapidGossipImporting = false;
+			await node.flushGossip();
+			expect(handled).to.deep.equal([0, 1, 2]);
+			expect(intake.gossipIntake).to.have.length(0);
+			expect(intake.gossipIntakeBytes).to.equal(0);
+
+			intake.rapidGossipImporting = true;
+			for (let i = 3; i < 6; i++)
+				feed(MessageType.NODE_ANNOUNCEMENT, tagged(i));
+			node.destroy();
+			expect(intake.gossipIntake).to.have.length(0);
+			expect(intake.gossipIntakeBytes).to.equal(0);
+			await node.flushGossip();
+			expect(handled).to.deep.equal([0, 1, 2]);
+			// destroy() closed the storage handle; afterEach destroys again.
+			storage = new SqliteStorage(dbPath);
+			storage.open();
+			node = new LightningNode(makeConfig());
 		});
 	});
 });
