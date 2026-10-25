@@ -24,7 +24,6 @@ import {
 	EAvailableNetworks,
 	EProtocol,
 	IAddress,
-	IWalletData,
 	ok,
 	Wallet
 } from '../../src';
@@ -201,10 +200,15 @@ describe('an address asked for before the first refresh (#1783)', function () {
 			const held = new Promise<void>((resolve) => {
 				releaseRefreshes = resolve;
 			});
-			sinon.stub(Wallet.prototype, 'refreshWallet').callsFake(async () => {
-				await held;
-				return ok({} as IWalletData);
-			});
+			sinon
+				.stub(
+					Wallet.prototype as unknown as { _refresh: () => Promise<unknown> },
+					'_refresh'
+				)
+				.callsFake(async () => {
+					await held;
+					return ok({});
+				});
 			answerNoHistory();
 		});
 

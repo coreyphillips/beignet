@@ -968,8 +968,8 @@ describe('Wallet writes that storage refuses (issue #1642)', function () {
 		const wallet = await open(storage);
 		refused.add('addressType');
 		// The refresh it starts needs Electrum, which this test does not have.
-		wallet.refreshWallet = async (): Promise<Result<IWalletData>> =>
-			ok(wallet.data);
+		(wallet as unknown as { _refresh: () => Promise<Result<void>> })._refresh =
+			async (): Promise<Result<void>> => ok(undefined);
 
 		await wallet.updateAddressType(wallet.addressType);
 

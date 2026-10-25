@@ -169,11 +169,14 @@ describe('Startup and wallet ergonomics (issue #548)', function () {
 		// the whole wallet twice (issue #548 review).
 		this.timeout(30_000);
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-ergo-once-'));
-		const original = Wallet.prototype.refreshWallet;
+		// Every refresh, refreshWallet's and the ones that skip its copy of the
+		// data, goes through the private _refresh.
+		const proto = Wallet.prototype as unknown as {
+			_refresh: (...args: unknown[]) => Promise<unknown>;
+		};
+		const original = proto._refresh;
 		let calls = 0;
-		Wallet.prototype.refreshWallet = function (
-			...args: Parameters<typeof original>
-		): ReturnType<typeof original> {
+		proto._refresh = function (...args: unknown[]): Promise<unknown> {
 			calls++;
 			return original.apply(this, args);
 		};
@@ -183,7 +186,7 @@ describe('Startup and wallet ergonomics (issue #548)', function () {
 			await counted.waitForInitialSync();
 			expect(calls, 'one startup refresh, one owner').to.equal(1);
 		} finally {
-			Wallet.prototype.refreshWallet = original;
+			proto._refresh = original;
 			if (counted) await counted.destroy();
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
