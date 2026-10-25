@@ -36,6 +36,7 @@ import {
 	signTranscript
 } from './guardian-wire';
 import { JOURNAL_META_KEYS, storedTipSequence } from './journal';
+import { storedFrameHeaderAt } from './frame-reads';
 import type { IGuardianReplicationEvent } from './guardian-replication';
 import {
 	GuardianReplicator,
@@ -631,12 +632,6 @@ export class GuardianRotation {
 				// replicated) while the set was asked is this journal's own,
 				// and a retry carries it over. Any head this journal cannot
 				// show with the same hash is history it lost.
-				const ours = new Map(
-					(storage.loadRecoveryFrames?.(0) ?? []).map((row) => [
-						BigInt(row.sequence),
-						row.frameHash
-					])
-				);
 				const held = past.reduce(
 					(max, state) =>
 						state.logHead.sequence > max ? state.logHead.sequence : max,
@@ -644,7 +639,10 @@ export class GuardianRotation {
 				);
 				const lost = past.some(
 					(state) =>
-						!ours.get(state.logHead.sequence)?.equals(state.logHead.frameHash)
+						!storedFrameHeaderAt(
+							storage,
+							state.logHead.sequence
+						)?.frameHash.equals(state.logHead.frameHash)
 				);
 				if (lost) {
 					throw new RotationRefusedError(

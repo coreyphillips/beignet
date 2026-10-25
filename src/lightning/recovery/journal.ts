@@ -29,12 +29,13 @@ import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
 import { deriveFrameIv } from './guardian-wire';
 import { hkdfKey } from '../storage/encryption';
 import { usesCompactHtlcHistory } from '../storage/htlc-history';
-import type {
-	IStorageBackend,
-	IStoredRecoveryFrame,
-	IStoredRecoveryFrameHeader
-} from '../storage/types';
+import type { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
 import { CorruptRecoveryRowError } from '../storage/types';
+import {
+	storedFrameAt,
+	storedFrameHeaderAt,
+	storedFrameSpan
+} from './frame-reads';
 import {
 	isStorageTransactionActive,
 	withStorageTransaction
@@ -215,46 +216,6 @@ export function resolveWatermarkAnchor(
 	if (base == null || !/^[1-9]\d*$/.test(base)) return null;
 	if (BigInt(base) !== sequence + 1n) return null;
 	return successor.previousFrameHash;
-}
-
-/** The stored frame at exactly `sequence`, or null. */
-function storedFrameAt(
-	storage: IStorageBackend,
-	sequence: bigint
-): IStoredRecoveryFrame | null {
-	if (storage.loadRecoveryFrame) {
-		return storage.loadRecoveryFrame(Number(sequence));
-	}
-	const [row] = storage.loadRecoveryFrames?.(Number(sequence) - 1) ?? [];
-	return row && BigInt(row.sequence) === sequence ? row : null;
-}
-
-/** The cleartext columns of the stored frame at exactly `sequence`, or null. */
-function storedFrameHeaderAt(
-	storage: IStorageBackend,
-	sequence: bigint
-): IStoredRecoveryFrameHeader | null {
-	if (storage.loadRecoveryFrameHeader) {
-		return storage.loadRecoveryFrameHeader(Number(sequence));
-	}
-	return storedFrameAt(storage, sequence);
-}
-
-/** Row count and sequence span of the frame store, null when empty. */
-function storedFrameSpan(storage: IStorageBackend): {
-	count: number;
-	minSequence: number;
-	maxSequence: number;
-} | null {
-	const stats = storage.recoveryFrameStats?.();
-	if (stats !== undefined) return stats;
-	const rows = storage.loadRecoveryFrames?.() ?? [];
-	if (rows.length === 0) return null;
-	return {
-		count: rows.length,
-		minSequence: rows[0].sequence,
-		maxSequence: rows[rows.length - 1].sequence
-	};
 }
 
 /**
