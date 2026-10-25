@@ -1387,13 +1387,30 @@ property UtxoInfo.height: number
 property UtxoInfo.txid: TxidHex
 property UtxoInfo.valueSats: number
 property UtxoInfo.vout: number
+interface WebhookDeliveryOptions
+property WebhookDeliveryOptions.maxActiveDeliveries?: number
+property WebhookDeliveryOptions.maxActivePerWebhook?: number
+property WebhookDeliveryOptions.maxQueuedBytes?: number
+property WebhookDeliveryOptions.maxQueuedBytesPerWebhook?: number
+property WebhookDeliveryOptions.retryDelayMs?: number
+property WebhookDeliveryOptions.timeoutMs?: number
+interface WebhookDeliveryStats
+property WebhookDeliveryStats.active: number
+property WebhookDeliveryStats.delivered: number
+property WebhookDeliveryStats.discarded: number
+property WebhookDeliveryStats.failed: number
+property WebhookDeliveryStats.overflowed: number
+property WebhookDeliveryStats.queued: number
+property WebhookDeliveryStats.queuedBytes: number
 class WebhookManager
-constructor WebhookManager(storage?: IWebhookStorage)
+constructor WebhookManager(storage?: IWebhookStorage, options?: WebhookDeliveryOptions)
 method WebhookManager.clear(): void
+method WebhookManager.deliveryStats(): WebhookDeliveryStats
 method WebhookManager.dispatch(eventType: string, data: unknown): void
 method WebhookManager.list(): ./webhooks#WebhookRegistration[]
 method WebhookManager.register(url: string, events: string[], secret?: string): ./webhooks#WebhookRegistration
 get WebhookManager.size(): number
+method WebhookManager.stop(): Promise<void>
 method WebhookManager.unregister(id: string): boolean
 interface WebhookRegistration
 property WebhookRegistration.createdAt: number

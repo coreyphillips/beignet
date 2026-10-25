@@ -2702,6 +2702,19 @@ after both attempts fail. Handle duplicates without repeating funding and treat
 `SETTLED` and `CANCELLED` as terminal. After a disconnect or missed delivery,
 reconcile with `GET /invoices/held` before acting on an old acceptance event.
 
+Deliveries wait for a worker: at most 4 per registration and 32 in all are in
+flight or waiting to retry, and registrations take turns, so a slow recipient
+does not hold up the others. An attempt that takes longer than 5 seconds,
+response included, fails. Queued and active deliveries may hold at most 1 MiB
+of payload per registration and 8 MiB in all. An event that would pass either
+ceiling is not delivered to that registration. Unregistering drops the
+registration's queued deliveries and its pending retries. Stopping the daemon
+drops all of them and aborts the requests in flight. `GET /metrics` reports
+`beignet_webhook_deliveries_active`, `beignet_webhook_deliveries_queued`,
+`beignet_webhook_queued_bytes`, and `beignet_webhook_deliveries_total` by
+`outcome` (`delivered`, `failed`, `overflow`, `discarded`). A library host sets
+the ceilings with the second `WebhookManager` constructor argument.
+
 ### API Versioning
 
 All endpoints support an optional `/v1/` prefix for forward compatibility. The daemon strips the prefix automatically:
