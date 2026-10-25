@@ -1376,7 +1376,10 @@ export interface IPaymentPart {
 	partIndex: number;
 	channelId: Buffer;
 	htlcId: bigint;
+	/** The part's onion amt_to_forward, which the set accumulates toward its total. */
 	amountMsat: bigint;
+	/** The committed HTLC's value: what settling this part credits. */
+	htlcAmountMsat: bigint;
 	status: PaymentStatus;
 }
 

@@ -1158,7 +1158,9 @@ interface PaymentInfo {
   paymentHash: string;      // hex
   preimage?: string;        // hex, present when settled
   amountSats: number;       // OUTGOING: what left the node, fees included, rounded up
-  feeSats?: number;         // routing fee paid, rounded up
+                            // INCOMING: what the node was credited, rounded down
+  feeSats?: number;         // OUTGOING: routing fee paid; INCOMING: a JIT LSP's skim
+                            // (invoice amount less amountSats); rounded up
   status: 'PENDING' | 'COMPLETED' | 'FAILED';
   direction: 'OUTGOING' | 'INCOMING';
   failureCode?: number;     // BOLT 4 failure code

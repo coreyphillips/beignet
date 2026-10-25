@@ -50,6 +50,14 @@ export interface IPaymentInfo {
 	 * subtracted, so this can overstate by that part.
 	 */
 	sentMsat?: bigint;
+	/**
+	 * The msat this node was credited for an incoming payment, the sum of the
+	 * HTLCs it settled, when amountMsat is not that figure. amountMsat stays
+	 * the invoice (or onion-declared) amount the payment was validated
+	 * against. A JIT skim settles HTLCs short of it by the LSP's opening fee,
+	 * and an overpaying sender's HTLCs exceed it.
+	 */
+	receivedMsat?: bigint;
 	status: PaymentStatus;
 	direction: PaymentDirection;
 	route?: IRoute;
