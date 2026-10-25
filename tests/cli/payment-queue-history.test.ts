@@ -368,6 +368,43 @@ describe('PaymentQueue keeps finished history out of memory and dispatch (issue 
 		expect(queue.list()).to.deep.equal([]);
 	});
 
+	it('an unknown outcome whose save failed stays in memory past the bound', async () => {
+		const { pay } = payer({ lnbc_unknown: 'PENDING' });
+		const flaky: IPaymentQueueStorage = {
+			...requiredOnly(storage),
+			saveQueueEntry: (entry): void => {
+				if (entry.bolt11 === 'lnbc_unknown') throw new Error('SQLITE_FULL');
+				storage.saveQueueEntry(entry);
+			}
+		};
+		const queue = new PaymentQueue(
+			pay,
+			canSend,
+			{ maxRetainedHistory: 1 },
+			flaky
+		);
+		const unknown = queue.enqueue('lnbc_unknown');
+		await drained(queue);
+		queue.enqueue('lnbc_0');
+		queue.enqueue('lnbc_1');
+		await drained(queue);
+
+		expect(storage.loadQueueEntry(unknown.id)).to.equal(undefined);
+		expect(queue.get(unknown.id)?.error).to.equal(IN_FLIGHT_PAYMENT_ERROR);
+		expect(queue.list().map((e) => e.id)).to.include(unknown.id);
+	});
+
+	it('a restart lists finished entries that tie on priority and enqueue time in enqueue order', () => {
+		for (const id of ['q-1-100', 'q-2-100', 'q-3-100'])
+			seedFinished(id, 'completed', 100, 100);
+		const queue = new PaymentQueue(payer().pay, canSend, {}, storage);
+		expect(queue.list().map((e) => e.id)).to.deep.equal([
+			'q-1-100',
+			'q-2-100',
+			'q-3-100'
+		]);
+	});
+
 	it('maxRetainedHistory takes a whole number zero or greater, or Infinity to keep every finished entry', async () => {
 		for (const bad of [-1, 1.5, Number.NaN, '5']) {
 			expect(

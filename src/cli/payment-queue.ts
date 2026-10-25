@@ -209,6 +209,12 @@ function historyPage<T extends { id: string }>(
 	return at < 0 ? [] : sorted.slice(at + 1, at + 1 + limit);
 }
 
+/** The counter in an id enqueue() made, 0 for any other id. */
+function idCounterOf(id: string): number {
+	const parts = id.match(/^q-(\d+)-/);
+	return parts ? parseInt(parts[1], 10) : 0;
+}
+
 function entryFromRow(row: PaymentQueueRow): QueuedPayment {
 	return {
 		id: row.id,
@@ -263,11 +269,17 @@ export class PaymentQueue extends EventEmitter {
 	/** Finished entries list() shows, oldest finished first. */
 	private finished = new Map<string, QueuedPayment>();
 	/**
-	 * Finished entries whose outcome is unknown, in a queue without storage.
-	 * They are the only record that the payment needs checking before it is
-	 * paid again, so maxRetainedHistory does not drop them; prune() does.
+	 * Finished entries whose outcome is unknown, in a queue without storage
+	 * or one whose storage may not hold their outcome. They are the only
+	 * record that the payment needs checking before it is paid again, so
+	 * maxRetainedHistory does not drop them; prune() does.
 	 */
 	private unknownOutcomes = new Map<string, QueuedPayment>();
+	/**
+	 * Entries a storage write threw for. An update of a row that was never
+	 * saved does not throw, so a failed save counts too.
+	 */
+	private unstored = new WeakSet<QueuedPayment>();
 	/** Where each entry falls among those of its priority in list() order. */
 	private sequence = new WeakMap<QueuedPayment, number>();
 	private nextSequence = 0;
@@ -348,8 +360,13 @@ export class PaymentQueue extends EventEmitter {
 						// storage, and the rest are restored.
 					}
 				}
+				// The id's counter settles a tie in enqueue order: history
+				// arrives most recently finished first.
 				entries.sort(
-					(a, b) => a.priority - b.priority || a.createdAt - b.createdAt
+					(a, b) =>
+						a.priority - b.priority ||
+						a.createdAt - b.createdAt ||
+						idCounterOf(a.id) - idCounterOf(b.id)
 				);
 				const finished: QueuedPayment[] = [];
 				for (const entry of entries) {
@@ -383,7 +400,7 @@ export class PaymentQueue extends EventEmitter {
 									entry.completedAt
 								);
 							} catch {
-								/* best-effort */
+								this.unstored.add(entry);
 							}
 							finished.push(entry);
 						}
@@ -392,11 +409,7 @@ export class PaymentQueue extends EventEmitter {
 					}
 
 					// Track max ID counter for new entries
-					const idParts = entry.id.match(/^q-(\d+)-/);
-					if (idParts) {
-						const num = parseInt(idParts[1], 10);
-						if (num > this.idCounter) this.idCounter = num;
-					}
+					this.idCounter = Math.max(this.idCounter, idCounterOf(entry.id));
 				}
 				finished.sort((a, b) => newestFinishedFirst(b, a));
 				for (const entry of finished) this.retire(entry);
@@ -494,6 +507,7 @@ export class PaymentQueue extends EventEmitter {
 				});
 			} catch {
 				// Best-effort — queue still works in-memory
+				this.unstored.add(entry);
 			}
 		}
 
@@ -960,7 +974,10 @@ export class PaymentQueue extends EventEmitter {
 	 */
 	private retire(entry: QueuedPayment): void {
 		this.active.delete(entry.id);
-		if (!this.storage && isOutcomeUnknown(entry)) {
+		if (
+			(!this.storage || this.unstored.has(entry)) &&
+			isOutcomeUnknown(entry)
+		) {
 			this.unknownOutcomes.set(entry.id, entry);
 			return;
 		}
@@ -1056,7 +1073,7 @@ export class PaymentQueue extends EventEmitter {
 						entry.completedAt
 					);
 				} catch {
-					/* best-effort */
+					this.unstored.add(entry);
 				}
 			}
 			if (!stillOut) this.retire(entry);
