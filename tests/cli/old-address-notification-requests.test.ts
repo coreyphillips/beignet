@@ -437,6 +437,29 @@ describe('old address notification requests (#1859)', function () {
 		expect(wallet.data.balance).to.equal(0);
 	});
 
+	it('stays disconnected when its old-address callback disconnects', async function () {
+		let disconnected: Promise<void> | undefined;
+		const subscription = await wallet.electrum.subscribeToAddresses({
+			scriptHashes: [old.scriptHash],
+			onReceive: () => {
+				disconnected = wallet.electrum.disconnect();
+			}
+		});
+		if (subscription.isErr()) throw subscription.error;
+		const refresh = sinon.spy(wallet, 'refreshWallet');
+		const start = electrumHelpers.start as sinon.SinonStub;
+		start.resetHistory();
+		payOldAgain();
+
+		await notifyOld();
+		await disconnected;
+		await settled();
+
+		expect(refresh.notCalled).to.equal(true);
+		expect(start.notCalled).to.equal(true);
+		expect(wallet.electrum.isDisconnected).to.equal(true);
+	});
+
 	it('finds a payment to an old address announced while a refresh was listing', async function () {
 		holdNextListing = true;
 		listings = [];

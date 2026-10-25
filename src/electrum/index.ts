@@ -429,6 +429,7 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 					// One subscriber must not starve the rest or the refresh.
 				}
 			}
+			if (subs.get(instance) !== pending) return;
 			// Spent when the refresh body starts rather than here: a wallet
 			// already refreshing only queues this call, and the refresh in flight
 			// may have scanned before this status arrived.
