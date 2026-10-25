@@ -938,6 +938,13 @@ const GRAPH_READING_GOSSIP: ReadonlySet<number> = new Set([
 	MessageType.GOSSIP_TIMESTAMP_FILTER
 ]);
 
+/** A broadcast gossip message waiting in the intake queue. */
+interface IGossipIntakeItem {
+	pubkey: string;
+	type: number;
+	payload: Buffer;
+}
+
 /** A peer's gossip query waiting for the query budget (issue #1398). */
 type TGossipQuery =
 	| { type: MessageType.QUERY_CHANNEL_RANGE; msg: IQueryChannelRangeMessage }
@@ -1166,17 +1173,23 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * for the whole dump, starving every route, ping, and signal handler,
 	 * and the resulting pong timeouts make peers reconnect and restart the
 	 * dump: a livelock. Head index instead of shift() so draining a deep
-	 * queue is linear, not quadratic.
+	 * queue is linear, not quadratic. A taken slot is cleared at once and
+	 * the taken prefix is cut off between slices, since a queue that keeps
+	 * receiving may never empty and reset.
 	 */
-	private gossipIntake: Array<{
-		pubkey: string;
-		type: number;
-		payload: Buffer;
-	}> = [];
+	private gossipIntake: Array<IGossipIntakeItem | undefined> = [];
 	private gossipIntakeHead = 0;
+	/** Payload bytes of the messages still queued. */
+	private gossipIntakeBytes = 0;
 	private gossipIntakeDraining = false;
 	private gossipIntakeDropped = 0;
 	private static readonly GOSSIP_INTAKE_MAX = 30_000;
+	/**
+	 * Ordinary gossip meets the item cap first (30,000 announcements are
+	 * about 13 MB); this bounds a peer whose messages run to the 65 KB
+	 * message maximum.
+	 */
+	private static readonly GOSSIP_INTAKE_MAX_BYTES = 16 * 1024 * 1024;
 	private static readonly GOSSIP_INTAKE_SLICE_MS = 10;
 	/**
 	 * The gossip row writes of the drain slice now running, keyed by row,
@@ -11452,6 +11465,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// checks _destroyed so an in-flight slice stops rescheduling.
 		this.gossipIntake = [];
 		this.gossipIntakeHead = 0;
+		this.gossipIntakeBytes = 0;
 		this.gossipQueries.clear();
 		if (this.gossipQueryTimer) {
 			clearTimeout(this.gossipQueryTimer);
@@ -16547,10 +16561,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
-	 * Queue one broadcast gossip message. Bounded: a flood beyond the cap is
-	 * dropped newest-first (dropping oldest would orphan queued updates from
-	 * their announcements) and counted, with one structured log per overflow
-	 * episode rather than per message.
+	 * Queue one broadcast gossip message. Bounded in messages and in payload
+	 * bytes: a flood beyond either cap is dropped newest-first (dropping
+	 * oldest would orphan queued updates from their announcements) and
+	 * counted, with one structured log per overflow episode rather than per
+	 * message.
 	 */
 	private enqueueBroadcastGossip(
 		pubkey: string,
@@ -16558,11 +16573,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		payload: Buffer
 	): void {
 		const queued = this.gossipIntake.length - this.gossipIntakeHead;
-		if (queued >= LightningNode.GOSSIP_INTAKE_MAX) {
+		if (
+			queued >= LightningNode.GOSSIP_INTAKE_MAX ||
+			this.gossipIntakeBytes + payload.length >
+				LightningNode.GOSSIP_INTAKE_MAX_BYTES
+		) {
 			if (this.gossipIntakeDropped === 0) {
 				this.emitStructuredLog('peer', 'gossip_intake_overflow', {
 					pubkey,
-					queued
+					queued,
+					bytes: this.gossipIntakeBytes
 				});
 			}
 			this.gossipIntakeDropped++;
@@ -16570,6 +16590,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return;
 		}
 		this.gossipIntake.push({ pubkey, type, payload });
+		this.gossipIntakeBytes += payload.length;
 		if (!this.gossipIntakeDraining) {
 			this.gossipIntakeDraining = true;
 			setImmediate(() => this.drainGossipIntake());
@@ -16601,7 +16622,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				!this._destroyed &&
 				Date.now() - sliceStart < LightningNode.GOSSIP_INTAKE_SLICE_MS
 			) {
-				const item = this.gossipIntake[this.gossipIntakeHead++];
+				const index = this.gossipIntakeHead++;
+				const item = this.gossipIntake[index] as IGossipIntakeItem;
+				this.gossipIntake[index] = undefined;
+				this.gossipIntakeBytes -= item.payload.length;
 				try {
 					switch (item.type) {
 						case MessageType.CHANNEL_ANNOUNCEMENT:
@@ -16627,11 +16651,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			this.batchStorageWrites([...writes.values()], 'gossipIntake');
 		}
 		if (this.gossipIntakeHead < this.gossipIntake.length && !this._destroyed) {
+			// Cut once taken slots are as many as queued ones: the backing
+			// array stays under twice the queue, and each cut copies no more
+			// messages than were taken since the last.
+			if (
+				this.gossipIntakeHead >=
+				this.gossipIntake.length - this.gossipIntakeHead
+			) {
+				this.gossipIntake = this.gossipIntake.slice(this.gossipIntakeHead);
+				this.gossipIntakeHead = 0;
+			}
 			setImmediate(() => this.drainGossipIntake());
 			return;
 		}
 		this.gossipIntake = [];
 		this.gossipIntakeHead = 0;
+		this.gossipIntakeBytes = 0;
 		this.gossipIntakeDraining = false;
 		if (this.gossipIntakeDropped > 0) {
 			this.emitStructuredLog('peer', 'gossip_intake_overflow_ended', {
