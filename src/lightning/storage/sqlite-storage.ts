@@ -81,6 +81,9 @@ const OWNER_ONLY_FILE_MODE = 0o600;
 /** Payment keys read per query by paymentsNewestFirst. */
 const PAYMENT_KEY_BATCH = 500;
 
+/** Rows read per query by _rowsInBatches. */
+const HISTORY_ROW_BATCH = 500;
+
 /** Derives the key payments.metadata_tags are computed under. */
 const METADATA_TAG_INFO = 'beignet-payment-metadata-tag-v1';
 
@@ -341,6 +344,30 @@ export class SqliteStorage implements IStorageBackend {
 			this.statements.set(sql, statement);
 		}
 		return statement;
+	}
+
+	/**
+	 * Every row of a table that only grows with history, in rowid order (the
+	 * order a plain scan returns), read a batch at a time. A loader that
+	 * decodes as it goes then never holds every raw row beside its decoded
+	 * copy (issue #1861). Each batch is a whole all(), so no statement is
+	 * left busy while the caller decodes or reports a corrupt row.
+	 */
+	private *_rowsInBatches<T>(table: string, columns: string): Generator<T> {
+		const first = this._stmt(
+			`SELECT rowid, ${columns} FROM ${table} ORDER BY rowid LIMIT ?`
+		);
+		const next = this._stmt(
+			`SELECT rowid, ${columns} FROM ${table} WHERE rowid > ? ` +
+				'ORDER BY rowid LIMIT ?'
+		);
+		let rows = first.all(HISTORY_ROW_BATCH) as Array<T & { rowid: number }>;
+		for (;;) {
+			for (const row of rows) yield row;
+			if (rows.length < HISTORY_ROW_BATCH) return;
+			const after = rows[rows.length - 1].rowid;
+			rows = next.all(after, HISTORY_ROW_BATCH) as Array<T & { rowid: number }>;
+		}
 	}
 
 	open(opts?: { synchronous?: 'FULL' | 'NORMAL' }): void {
@@ -1125,11 +1152,11 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadAllPayments(): Array<{ paymentHash: string; payment: IPaymentInfo }> {
-		const rows = this._stmt(
-			'SELECT payment_hash, payment_json FROM payments'
-		).all() as Array<{ payment_hash: string; payment_json: string }>;
 		const results: Array<{ paymentHash: string; payment: IPaymentInfo }> = [];
-		for (const row of rows) {
+		for (const row of this._rowsInBatches<{
+			payment_hash: string;
+			payment_json: string;
+		}>('payments', 'payment_hash, payment_json')) {
 			try {
 				results.push({
 					paymentHash: row.payment_hash,
@@ -1260,11 +1287,11 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadAllPreimages(): Array<{ paymentHash: string; preimage: Buffer }> {
-		const rows = this._stmt(
-			'SELECT payment_hash, preimage FROM preimages'
-		).all() as Array<{ payment_hash: string; preimage: string }>;
 		const results: Array<{ paymentHash: string; preimage: Buffer }> = [];
-		for (const row of rows) {
+		for (const row of this._rowsInBatches<{
+			payment_hash: string;
+			preimage: string;
+		}>('preimages', 'payment_hash, preimage')) {
 			try {
 				results.push({
 					paymentHash: row.payment_hash,
@@ -1324,11 +1351,11 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadAllHtlcPaymentMappings(): Array<{ key: string; paymentHashHex: string }> {
-		const rows = this._stmt(
-			'SELECT htlc_key, payment_hash_hex FROM htlc_payment_map'
-		).all() as Array<{ htlc_key: string; payment_hash_hex: string }>;
 		const results: Array<{ key: string; paymentHashHex: string }> = [];
-		for (const row of rows) {
+		for (const row of this._rowsInBatches<{
+			htlc_key: string;
+			payment_hash_hex: string;
+		}>('htlc_payment_map', 'htlc_key, payment_hash_hex')) {
 			try {
 				results.push({
 					key: row.htlc_key,
@@ -1553,11 +1580,11 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadAllPaymentSecrets(): Array<{ paymentHashHex: string; secret: Buffer }> {
-		const rows = this._stmt(
-			'SELECT payment_hash_hex, secret FROM payment_secrets'
-		).all() as Array<{ payment_hash_hex: string; secret: string }>;
 		const results: Array<{ paymentHashHex: string; secret: Buffer }> = [];
-		for (const row of rows) {
+		for (const row of this._rowsInBatches<{
+			payment_hash_hex: string;
+			secret: string;
+		}>('payment_secrets', 'payment_hash_hex, secret')) {
 			try {
 				results.push({
 					paymentHashHex: row.payment_hash_hex,
@@ -1630,12 +1657,12 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadAllInvoices(): Array<{ paymentHashHex: string; invoice: IInvoiceInfo }> {
-		const rows = this._stmt(
-			'SELECT payment_hash_hex, invoice_json FROM invoices'
-		).all() as Array<{ payment_hash_hex: string; invoice_json: string }>;
 		const results: Array<{ paymentHashHex: string; invoice: IInvoiceInfo }> =
 			[];
-		for (const row of rows) {
+		for (const row of this._rowsInBatches<{
+			payment_hash_hex: string;
+			invoice_json: string;
+		}>('invoices', 'payment_hash_hex, invoice_json')) {
 			try {
 				results.push({
 					paymentHashHex: row.payment_hash_hex,
@@ -1847,11 +1874,11 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadAllHtlcSharedSecrets(): Array<{ key: string; secret: Buffer }> {
-		const rows = this._stmt(
-			'SELECT key, secret FROM htlc_shared_secrets'
-		).all() as Array<{ key: string; secret: string }>;
 		const results: Array<{ key: string; secret: Buffer }> = [];
-		for (const row of rows) {
+		for (const row of this._rowsInBatches<{
+			key: string;
+			secret: string;
+		}>('htlc_shared_secrets', 'key, secret')) {
 			try {
 				results.push({
 					key: row.key,
