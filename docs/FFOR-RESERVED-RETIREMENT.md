@@ -3,7 +3,7 @@
 Concurrent version 2 preserves unresolved voucher claims when a receiver closes
 an offline receive book early. Ordinary online payments can continue using the
 channel's remaining capacity. This extension is experimental. Feature bits
-562/563 are advertised by default when their dependencies are enabled. Explicit
+442/443 are advertised by default when their dependencies are enabled. Explicit
 `ffor.concurrent.enabled: false` disables advertisement; `ffor.settle.allowConcurrent:
 false` refuses new books while retaining support for existing ones.
 

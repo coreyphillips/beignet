@@ -232,8 +232,9 @@ shows why no script, covenant, or taproot construction changes it.
   60-second bound for a quiescent channel with pending HTLCs. Reconciliation in A and
   B runs on a channel that is synchronized by construction (§11.1); Variant D's drain
   is ordinary traffic and needs no quiescence at all.
-- Feature bit: `option_ff_receive`, bits **560/561** (provisional, experimental range),
-  advertised in `init` and `node_announcement`.
+- Feature bit: `option_ff_receive`, bits **440/441** (provisional, experimental range),
+  advertised in `init` and `node_announcement`. Earlier drafts used 560/561, which
+  eclair assigns to `on_the_fly_funding`; the two assignments do not interoperate.
 - The commitment feerate is **frozen** for the duration of the epoch at the last signed
   value (`update_fee` is impossible with `R` offline). Anchor outputs make this safe:
   fees are trivial at signing time and attached via CPFP at broadcast time.
@@ -2589,7 +2590,7 @@ TLV 11: `init_hash` (§7.2, §7.5.2). `ff_init` TLV 13: `witness_peers` (§9.6.3
 `ff_init` TLV 15: `hash_chain` (§9.5.4; `[1: 1]`, present iff `R` asks for a chained
 book). `ff_close_ack` TLV 1: `preimages` (§7.5.4). BOLT 12 invoice TLV 1000055001:
 `ffor_issuer_attestation` (§9.7.5). Feature bits
-560/561 (`option_ff_receive`). `node_announcement` TLVs 55007 (FFOR standing terms,
+440/441 (`option_ff_receive`). `node_announcement` TLVs 55007 (FFOR standing terms,
 §11.3) and 55043 (tower service advertisement, §11.3). All numbers provisional
 pending bLIP assignment.
 

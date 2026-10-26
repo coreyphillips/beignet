@@ -4,7 +4,7 @@
  *
  * R asks for the profile in ff_init TLV 17 and S selects it only by the
  * exact signed echo in ff_accept. Each peer must have advertised either bit
- * of 560/561 and of 562/563 first. An unsupported value, a missing feature,
+ * of 440/441 and of 442/443 first. An unsupported value, a missing feature,
  * a disallowed variant or profile, a missing, unsolicited or different echo
  * all end the setup, and a failed negotiation never continues as a baseline
  * epoch under the same epoch id.
@@ -813,13 +813,13 @@ describe('FFOR concurrent receive: negotiation through the node (CONCURRENT-RECE
 			).to.equal(false);
 		});
 
-		it('enabled: the optional bit 563 is advertised, beside option_ff_receive', () => {
+		it('enabled: the optional bit 443 is advertised, beside option_ff_receive', () => {
 			const node = new LightningNode(
 				makeNodeConfig(9003, undefined, { fforConcurrent: { enabled: true } })
 			);
 			const flags = node.getLocalFeatures();
-			expect(flags.hasBit(563)).to.equal(true);
-			expect(flags.hasBit(562)).to.equal(false);
+			expect(flags.hasBit(443)).to.equal(true);
+			expect(flags.hasBit(442)).to.equal(false);
 			expect(flags.hasFeature(Feature.OPTION_FF_RECEIVE)).to.equal(true);
 		});
 

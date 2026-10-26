@@ -132,7 +132,7 @@ describe('Async receive grant codecs (issue #709)', () => {
 		const back = decodeReceiverGrant(wire)!;
 		expect(back).to.not.equal(null);
 		expect(verifyReceiverGrant(back)).to.equal(true);
-		expect(back.featureBit).to.equal(261);
+		expect(back.featureBit).to.equal(445);
 		expect(back.maxPartMsat).to.equal(1_000_000n);
 		expect(back.maxParts).to.equal(3);
 		expect(back.admissionFeeMsat).to.equal(100n);

@@ -6420,7 +6420,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	/**
 	 * Whether the peer's init features negotiated FFOR: option_ff_receive
-	 * (560/561) and option_quiesce (activation runs under quiescence). True
+	 * (440/441) and option_quiesce (activation runs under quiescence). True
 	 * when the peer's init is unknown, as for splicing.
 	 */
 	private peerSupportsFfor(peerPubkey: string): boolean {
@@ -6452,8 +6452,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	/**
 	 * Whether the current init exchange negotiated concurrent receive
 	 * (docs/specs/CONCURRENT-RECEIVE.md section 1.1): each side advertised either
-	 * bit of option_ff_receive (560/561) and either bit of option_ff_concurrent
-	 * (562/563). Unlike peerSupportsFfor this is FALSE when the peer's init
+	 * bit of option_ff_receive (440/441) and either bit of option_ff_concurrent
+	 * (442/443). Unlike peerSupportsFfor this is FALSE when the peer's init
 	 * is unknown: an advertisement that was not seen selects nothing, and
 	 * the reconnect check of section 8 must not pass on a guess.
 	 */

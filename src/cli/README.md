@@ -158,7 +158,7 @@ await node.destroy();
 | `fforSettle.maxEpochBlocks?` | `number` | Longest epoch accepted, in blocks. |
 | `fforSettle.feeBaseMsat?` | `number` | Smallest base fee accepted, in msat. |
 | `fforSettle.feePpm?` | `number` | Smallest proportional fee accepted, in ppm. |
-| `fforConcurrent?` | `boolean` | Advertise FFOR concurrent receive, feature bits 562/563 (default true). |
+| `fforConcurrent?` | `boolean` | Advertise FFOR concurrent receive, feature bits 442/443 (default true). |
 | `fforSettleConcurrent?` | `boolean` | Accept new concurrent-profile settlements when fforSettle is on (default true). |
 | `fforWitness?` | `object` | FFOR receipt witness role: store a receiver-encrypted record of every delegated preimage this node relays before propagating the fulfil. |
 | `fforWitness.enabled` | `boolean` | Run the witness role. |

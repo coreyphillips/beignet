@@ -576,7 +576,7 @@ The experimental concurrent profile keeps ordinary payments available
 within the channel's remaining capacity. `LightningNode.fforSync()` fetches paid
 slot receipts and redeems them while other vouchers remain live.
 `rescueFforEpoch()` syncs a connected concurrent book without retiring it.
-Feature bits 562/563 are advertised by default when their dependencies are enabled.
+Feature bits 442/443 are advertised by default when their dependencies are enabled.
 See [concurrent receive and reserved retirement](docs/FFOR-RESERVED-RETIREMENT.md)
 for the version 1 and 2 contracts and storage requirements. The daemon enables
 advertisement with `BEIGNET_FFOR_CONCURRENT=true` and new concurrent settlement
