@@ -100,6 +100,8 @@ describe('gap-limit scan requests (#1661)', function () {
 	let served: Map<string, TServed>;
 	/** Runs as each UTXO listing goes out. */
 	let onListing: () => void;
+	/** Script hashes the UTXO listing answers with an error entry. */
+	let failListing: Set<string>;
 	/** Every script hash a get_history request named. */
 	let historyAsked: string[];
 	let utxoScans: number;
@@ -112,6 +114,7 @@ describe('gap-limit scan requests (#1661)', function () {
 		mined = new Map();
 		served = new Map();
 		onListing = (): void => undefined;
+		failListing = new Set();
 		historyAsked = [];
 		duplicates = [];
 		messages = [];
@@ -167,20 +170,28 @@ describe('gap-limit scan requests (#1661)', function () {
 				onListing();
 				return {
 					error: false,
-					data: Object.values(scriptHashes.data).map((a) => ({
-						data: a,
-						param: a.scriptHash,
-						result: paid.has(a.scriptHash)
-							? [
-									{
-										tx_hash: paid.get(a.scriptHash),
-										tx_pos: 0,
-										height: heightOf(a.scriptHash),
-										value: 100_000
-									}
-							  ]
-							: []
-					}))
+					data: Object.values(scriptHashes.data).map((a) =>
+						failListing.has(a.scriptHash)
+							? {
+									data: a,
+									param: a.scriptHash,
+									error: { code: -32603, message: 'Server busy.' }
+							  }
+							: {
+									data: a,
+									param: a.scriptHash,
+									result: paid.has(a.scriptHash)
+										? [
+												{
+													tx_hash: paid.get(a.scriptHash),
+													tx_pos: 0,
+													height: heightOf(a.scriptHash),
+													value: 100_000
+												}
+										  ]
+										: []
+							  }
+					)
 				};
 			});
 		sinon
@@ -378,6 +389,42 @@ describe('gap-limit scan requests (#1661)', function () {
 		expect(utxoScans, 'one UTXO listing for the whole refresh').to.equal(1);
 		expect(askedMoreThanOnce(), 'each history asked once').to.deep.equal([]);
 		expect(duplicates).to.deep.equal([]);
+	});
+
+	it('lists the coins the extension rounds reached on the refresh after their listing failed (#1882)', async function () {
+		const first = await wallet.refreshWallet();
+		expect(first.isOk(), first.isErr() ? first.error.message : '').to.equal(
+			true
+		);
+		for (const index of [3, 22, 41]) {
+			const gen = await wallet.generateAddresses({
+				addressAmount: 1,
+				addressIndex: index,
+				changeAddressAmount: 0,
+				addressType: EAddressType.p2wpkh
+			});
+			if (gen.isErr()) throw gen.error;
+			pay(at(gen.value.addresses, index));
+		}
+		// An empty address, so only the failure itself costs the listing.
+		failListing.add(
+			at(wallet.data.changeAddresses[EAddressType.p2wpkh], 0).scriptHash
+		);
+
+		const failed = await wallet.refreshWallet();
+		expect(failed.isErr(), 'the failed entry fails the refresh').to.equal(true);
+		expect(wallet.data.addressIndex[EAddressType.p2wpkh].index).to.equal(42);
+		expect(wallet.data.utxos).to.deep.equal([]);
+
+		failListing.clear();
+		const res = await wallet.refreshWallet();
+		expect(res.isOk(), res.isErr() ? res.error.message : '').to.equal(true);
+
+		expect(
+			wallet.data.utxos.map((u) => u.index).sort((a, b) => a - b),
+			'the coin at 3 is outside the window around 42'
+		).to.deep.equal([3, 22, 41]);
+		expect(wallet.data.balance).to.equal(300_000);
 	});
 
 	it('asks again for a history the scan was answered before the check repaired its record', async function () {

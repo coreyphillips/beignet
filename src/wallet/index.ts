@@ -315,6 +315,10 @@ export class Wallet {
 	// only runs a full refresh when something calls for one, and this is what
 	// retries it.
 	private _refreshFailed = false;
+	// Addresses a refresh's gap scan handed to a UTXO listing that failed.
+	// The scan already saved indexes past them, so later refreshes list them
+	// from here until a listing that names them succeeds. Memory only.
+	private readonly _unlistedUtxoAddresses: IAddresses = {};
 	// Outpoints our own broadcasts have spent, keyed 'txid:vout', each holding
 	// the value _spendSeq had when the broadcast landed. The UTXO set is only
 	// ever replaced wholesale by a scan, so a scan already in flight at that
@@ -1492,13 +1496,24 @@ export class Wallet {
 			return err(r1.error);
 		}
 		if (this._stopped) return err(stopped);
+		const utxoAddresses = {
+			...this._unlistedUtxoAddresses,
+			...scan.utxoAddresses
+		};
 		const r2 = await this.refreshUtxos({
 			scanningStrategy: scanAllAddresses ? EScanningStrategy.all : undefined,
 			additionalAddresses,
-			additionalScriptHashes: scan.utxoAddresses
+			additionalScriptHashes: utxoAddresses
 		});
 		if (r2.isErr()) {
+			// switchNetwork replaced the map, and these are the old network's.
+			if (this.electrum === electrum) {
+				Object.assign(this._unlistedUtxoAddresses, scan.utxoAddresses);
+			}
 			return err(r2.error);
+		}
+		for (const scriptHash in utxoAddresses) {
+			delete this._unlistedUtxoAddresses[scriptHash];
 		}
 		if (this._stopped) return err(stopped);
 		const r3 = await this.updateTransactions({ scanAllAddresses, scan });
