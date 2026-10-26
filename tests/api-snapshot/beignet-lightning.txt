@@ -1262,6 +1262,7 @@ method channel.ChannelManager.canOpenZeroConfTo(pubkeyHex: string): boolean
 get channel.ChannelManager.channelIndexTipFloorArmed(): boolean
 method channel.ChannelManager.channelsAwaitingDurability(): Set<string>
 method channel.ChannelManager.closeFforEpoch(channelId: Buffer): channel.ChannelResult
+method channel.ChannelManager.countChannelsWithPeer(pubkey: string): number
 method channel.ChannelManager.createDualFundedChannel(peerPubkey: string, params: channel.IDualFundingParams, opts?: { trusted?: boolean; contribution?: { inputs: channel.ISpliceWalletInput[]; changeScript: Buffer; }; }): channel.Channel
 method channel.ChannelManager.createFunding(channel: channel.Channel, fundingTxid: Buffer, fundingOutputIndex: number, signature: Buffer): Buffer | null
 method channel.ChannelManager.detachFromPeerManager(): void

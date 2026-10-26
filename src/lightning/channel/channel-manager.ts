@@ -729,7 +729,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private ownChannelIndex: {
 		revision: number;
 		byScid: Map<string, Channel[]>;
-		peers: Set<string>;
+		peers: Map<string, number>;
 	} | null = null;
 	/** Synchronous funding promotions reserved across reentrant observers. */
 	private channelIdReservations: Map<string, Channel> = new Map();
@@ -2946,9 +2946,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		return this.getOwnChannelIndex().peers.has(pubkey);
 	}
 
+	/** How many of `pubkey`'s channels hasChannelWithPeer counts. */
+	countChannelsWithPeer(pubkey: string): number {
+		return this.getOwnChannelIndex().peers.get(pubkey) ?? 0;
+	}
+
 	private getOwnChannelIndex(): {
 		byScid: Map<string, Channel[]>;
-		peers: Set<string>;
+		peers: Map<string, number>;
 	} {
 		// Every counter only grows, so the sum changes whenever any of them does.
 		const revision =
@@ -2959,7 +2964,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (this.ownChannelIndex?.revision === revision)
 			return this.ownChannelIndex;
 		const byScid = new Map<string, Channel[]>();
-		const peers = new Set<string>();
+		const peers = new Map<string, number>();
 		for (const map of [this.channels, this.tempChannels]) {
 			for (const channel of map.values()) {
 				const state = channel.getFullState();
@@ -2976,7 +2981,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				}
 				const channelId = channel.getChannelId();
 				const peer = channelId && this.getPeerForChannel(channelId);
-				if (peer) peers.add(peer);
+				if (peer) peers.set(peer, (peers.get(peer) ?? 0) + 1);
 			}
 		}
 		this.ownChannelIndex = { revision, byScid, peers };

@@ -16572,7 +16572,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					held.delete(scidHex);
 					held.set(scidHex, payload);
 					// One slot per channel with the peer, oldest dropped first.
-					const slots = this.channelManager.getChannelsByPeer(pubkey).length;
+					const slots = this.channelManager.countChannelsWithPeer(pubkey);
 					for (const key of held.keys()) {
 						if (held.size <= slots) break;
 						held.delete(key);
