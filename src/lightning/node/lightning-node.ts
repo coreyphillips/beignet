@@ -1301,14 +1301,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	/** Last timestamp signed into a direct channel_update, per channel. */
 	private directUpdateTimestamps = new Map<string, number>();
 	/**
-	 * Per channel peer, its newest private update naming an SCID we have not
-	 * assigned yet. Without an alias, each side takes the real SCID from its
-	 * own chain view, so the peer's update can arrive first.
+	 * Per channel peer, its newest private update for each SCID we have not
+	 * assigned yet, keyed by SCID hex. Without an alias, each side takes the
+	 * real SCID from its own chain view, so the peer's update can arrive first.
 	 */
-	private earlyPeerUpdates = new Map<
-		string,
-		{ scidHex: string; payload: Buffer }
-	>();
+	private earlyPeerUpdates = new Map<string, Map<string, Buffer>>();
 	/** Periodic timer that refreshes + re-broadcasts our gossip so the node stays in the public graph. */
 	private _gossipRefreshTimer?: ReturnType<typeof setInterval>;
 	// MPP: pending multi-part payments awaiting all parts (keyed by paymentHash hex)
@@ -13220,9 +13217,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private adoptEarlyPeerUpdate(channelId: Buffer, scid: Buffer): void {
 		const peer = this.channelManager.getPeerForChannel(channelId);
 		const held = peer ? this.earlyPeerUpdates.get(peer) : undefined;
-		if (!peer || !held || held.scidHex !== scid.toString('hex')) return;
-		this.earlyPeerUpdates.delete(peer);
-		this.adoptPeerChannelPolicyNow(held.payload);
+		const scidHex = scid.toString('hex');
+		const payload = held?.get(scidHex);
+		if (!peer || !held || !payload) return;
+		held.delete(scidHex);
+		if (held.size === 0) this.earlyPeerUpdates.delete(peer);
+		this.adoptPeerChannelPolicyNow(payload);
 	}
 
 	/**
@@ -16567,10 +16567,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					(msg.messageFlags & 0x02) !== 0 &&
 					this.channelManager.hasChannelWithPeer(pubkey)
 				) {
-					this.earlyPeerUpdates.set(pubkey, {
-						scidHex: msg.shortChannelId.toString('hex'),
-						payload
-					});
+					const held = this.earlyPeerUpdates.get(pubkey) ?? new Map();
+					const scidHex = msg.shortChannelId.toString('hex');
+					held.delete(scidHex);
+					held.set(scidHex, payload);
+					// One slot per channel with the peer, oldest dropped first.
+					const slots = this.channelManager.getChannelsByPeer(pubkey).length;
+					for (const key of held.keys()) {
+						if (held.size <= slots) break;
+						held.delete(key);
+					}
+					this.earlyPeerUpdates.set(pubkey, held);
 				}
 				this.enqueueBroadcastGossip(pubkey, type, payload);
 				break;
