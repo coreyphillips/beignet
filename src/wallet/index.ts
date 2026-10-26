@@ -344,6 +344,14 @@ export class Wallet {
 	// is looked up once rather than on every scan. Kept to the young coins of
 	// the last lookup.
 	private readonly _coinbaseTxids: Map<string, boolean> = new Map();
+	// The coins that left the UTXO set, keyed 'txid:vout', with the address
+	// each was at. A refresh reads the history of the addresses in the window
+	// and of the coins still in the set, so the spend of a coin below the
+	// window, by another device on the same seed or by a send of ours with no
+	// change, is read only through this. An entry stays until a stored record
+	// spends the coin, or its address's history no longer lists the
+	// transaction that made it, or a scan finds the coin again. Memory only.
+	private readonly _goneCoins: Map<string, IAddress> = new Map();
 	// This wallet's tip at the first check a node without a txindex answered
 	// "no such mempool transaction" for a record the rule of issue #871 kept,
 	// by txid, or the highest tip it held if that was higher. A miss that
@@ -3469,11 +3477,15 @@ export class Wallet {
 		// network's coins and its number means nothing to the new count.
 		const electrum = this.electrum;
 		// The set does not hold these, so nothing else keeps their addresses in
-		// the scan once the strategy's window has moved past them.
+		// the scan once the strategy's window has moved past them. A gone coin
+		// that a scan lists again is back in the set, and no longer gone.
 		const heldBack: IAddresses = {};
 		for (const { index, path, address, scriptHash, publicKey } of this
 			._immatureUtxos) {
 			heldBack[scriptHash] = { index, path, address, scriptHash, publicKey };
+		}
+		for (const address of this._goneCoins.values()) {
+			heldBack[address.scriptHash] = address;
 		}
 		// The held-back list is memory only, and a stored record names just one
 		// of the addresses its transaction paid. So until a scan has applied
@@ -3537,6 +3549,10 @@ export class Wallet {
 			utxos.reduce((sum, utxo) => sum + utxo.value, 0);
 		const balance =
 			(getUtxosRes.value?.balance ?? 0) - scanned.spentValue - droppedValue;
+		this.noteGoneCoins(
+			[...this._data.utxos, ...this._immatureUtxos],
+			[...utxos, ...immature]
+		);
 		this._data.utxos = utxos;
 		this._data.balance = balance;
 		this._immatureUtxos = immature;
@@ -3667,6 +3683,7 @@ export class Wallet {
 			spent.has(`${utxo.tx_hash}:${utxo.tx_pos}`)
 		);
 		if (!removed.length) return ok([]);
+		this.noteGoneCoins(removed, []);
 		this._data.utxos = this._data.utxos.filter(
 			(utxo) => !spent.has(`${utxo.tx_hash}:${utxo.tx_pos}`)
 		);
@@ -3712,6 +3729,64 @@ export class Wallet {
 			if (mark <= settled) this._spentOutpoints.delete(outpoint);
 		}
 		return { utxos, spentValue };
+	}
+
+	/**
+	 * Records in _goneCoins the coins of `before` that `after` does not hold,
+	 * and drops the entries of coins it holds again.
+	 * @param {IUtxo[]} before
+	 * @param {IUtxo[]} after
+	 */
+	private noteGoneCoins(before: IUtxo[], after: IUtxo[]): void {
+		const held = new Set(after.map((utxo) => `${utxo.tx_hash}:${utxo.tx_pos}`));
+		for (const outpoint of this._goneCoins.keys()) {
+			if (held.has(outpoint)) this._goneCoins.delete(outpoint);
+		}
+		for (const utxo of before) {
+			const outpoint = `${utxo.tx_hash}:${utxo.tx_pos}`;
+			if (held.has(outpoint)) continue;
+			const { index, path, address, scriptHash, publicKey } = utxo;
+			this._goneCoins.set(outpoint, {
+				index,
+				path,
+				address,
+				scriptHash,
+				publicKey
+			});
+		}
+	}
+
+	/**
+	 * Drops the _goneCoins entries a history lookup settled: a transaction
+	 * its address's history lists spends the coin and is stored, or is about
+	 * to be from `fresh`, or the history no longer lists the transaction that
+	 * made the coin. An entry replaced since the lookup went out, or whose
+	 * address the server did not answer, waits for the next lookup.
+	 * @param {Map<string, IAddress>} gone The entries as the lookup went out.
+	 * @param {Map<string, TTxResult[]>} answered The lookup's answers, by
+	 * script hash.
+	 * @param {IFormattedTransactions} fresh
+	 */
+	private settleGoneCoins(
+		gone: Map<string, IAddress>,
+		answered: Map<string, TTxResult[]>,
+		fresh: IFormattedTransactions
+	): void {
+		for (const [outpoint, address] of gone) {
+			if (this._goneCoins.get(outpoint) !== address) continue;
+			const listed = answered.get(address.scriptHash);
+			if (!listed) continue;
+			const funding = outpoint.slice(0, outpoint.lastIndexOf(':'));
+			const settled =
+				!listed.some(({ tx_hash }) => tx_hash === funding) ||
+				listed.some(
+					({ tx_hash }) =>
+						(fresh[tx_hash] ?? this._data.transactions[tx_hash])?.vin?.some(
+							(vin) => 'txid' in vin && `${vin.txid}:${vin.vout}` === outpoint
+						)
+				);
+			if (settled) this._goneCoins.delete(outpoint);
+		}
 	}
 
 	/**
@@ -4352,14 +4427,26 @@ export class Wallet {
 		// stand in for this lookup only if nothing has been cleared or repaired
 		// since they were asked for. Then the counts above are also the ones
 		// they went out at, and no answer can undo a repair.
+		// Otherwise an empty map, which still tells settleGoneCoins which
+		// addresses the server answered.
+		const answered = scan?.current()
+			? scan.history
+			: new Map<string, TTxResult[]>();
+		const gone = new Map(this._goneCoins);
+		const goneAddresses: IAddresses = {};
+		for (const address of gone.values()) {
+			goneAddresses[address.scriptHash] = address;
+		}
 		const history = await electrum.getAddressHistory({
 			scanAllAddresses: scanAllAddresses || replaceStoredTransactions,
-			answered: scan?.current() ? scan.history : undefined
+			answered,
+			additionalScriptHashes: goneAddresses
 		});
 		if (history.isErr()) {
 			return err(history.error);
 		}
 		if (!history.value.length) {
+			this.settleGoneCoins(gone, answered, {});
 			return ok(undefined);
 		}
 
@@ -4419,6 +4506,9 @@ export class Wallet {
 				fresh[txid] = transaction;
 			}
 		}
+		// Every record in fresh is stored by the time this returns, if it is
+		// not already.
+		this.settleGoneCoins(gone, answered, fresh);
 
 		// Add unconfirmed transactions.
 		// No need to wait for this to finish.

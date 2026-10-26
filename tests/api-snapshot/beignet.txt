@@ -86,7 +86,7 @@ get Electrum.currentServer(): TServer | null
 method Electrum.disconnect(): Promise<void>
 property Electrum.electrumNetwork: EElectrumNetworks
 method Electrum.getAddressBalance(scriptHash: string): Promise<IElectrumGetAddressBalanceRes>
-method Electrum.getAddressHistory({ scriptHashes, scanAllAddresses, answered }: { scriptHashes?: IAddress[]; scanAllAddresses?: boolean; answered?: Map<string, TTxResult[]>; }): Promise<Result<IGetAddressHistoryResponse[]>>
+method Electrum.getAddressHistory({ scriptHashes, scanAllAddresses, answered, additionalScriptHashes }: { scriptHashes?: IAddress[]; scanAllAddresses?: boolean; answered?: Map<string, TTxResult[]>; additionalScriptHashes?: IAddresses; }): Promise<Result<IGetAddressHistoryResponse[]>>
 method Electrum.getAddressScriptHashBalances(scriptHashes: string[]): Promise<IGetAddressScriptHashBalances>
 method Electrum.getAddressScriptHashesHistory(scriptHashes?: string[]): Promise<Result<IGetAddressTxResponse>>
 method Electrum.getBlockHashFromHex({ blockHex }: { blockHex?: string; }): string

@@ -1,12 +1,18 @@
 /**
  * Regression test for issue #1859: a notification for a UTXO tracked beyond
  * the gap limit listed the UTXOs at that address index, discarded the answer,
- * and then ran the wallet refresh, which listed them again.
+ * and then ran the wallet refresh, which listed them again. Also issue #1883:
+ * a spend of that UTXO never reached the history.
  *
  * Fully OFFLINE: the client helpers are stubbed with a counting fake server.
  */
 
-import { Block } from 'bitcoinjs-lib';
+import {
+	address as bitcoinAddress,
+	Block,
+	networks,
+	Transaction
+} from 'bitcoinjs-lib';
 import { expect } from 'chai';
 import net from 'net';
 import sinon from 'sinon';
@@ -136,6 +142,8 @@ describe('old address notification requests (#1859)', function () {
 	let scriptHashHandler: ((data: TNotification) => Promise<void>) | undefined;
 	/** The script hashes of each UTXO listing request, in order. */
 	let listings: string[][];
+	/** The script hashes of each history request, in order. */
+	let histories: string[][];
 	/** Holds the next UTXO listing until releaseListing is called. */
 	let holdNextListing: boolean;
 	let releaseListing: (() => void) | undefined;
@@ -151,6 +159,10 @@ describe('old address notification requests (#1859)', function () {
 	const oldListed = (): number =>
 		listings.filter((batch) => batch.includes(old.scriptHash)).length;
 
+	/** How many history requests named the old address. */
+	const oldRead = (): number =>
+		histories.filter((batch) => batch.includes(old.scriptHash)).length;
+
 	beforeEach(async function () {
 		history = new Map();
 		unspent = new Map();
@@ -159,6 +171,7 @@ describe('old address notification requests (#1859)', function () {
 		headerHandler = undefined;
 		scriptHashHandler = undefined;
 		listings = [];
+		histories = [];
 		holdNextListing = false;
 		releaseListing = undefined;
 		let peer: { host: string; port: number; protocol: EProtocol } | undefined;
@@ -213,14 +226,17 @@ describe('old address notification requests (#1859)', function () {
 		sinon
 			.stub(electrumHelpers, 'getAddressScriptHashesHistory')
 			.callsFake(
-				async ({ scriptHashes }: { scriptHashes: TBatch<IAddress> }) => ({
-					error: false,
-					data: scriptHashes.data.map((a) => ({
-						data: a,
-						param: a.scriptHash,
-						result: history.get(a.scriptHash) ?? []
-					}))
-				})
+				async ({ scriptHashes }: { scriptHashes: TBatch<IAddress> }) => {
+					histories.push(scriptHashes.data.map((a) => a.scriptHash));
+					return {
+						error: false,
+						data: scriptHashes.data.map((a) => ({
+							data: a,
+							param: a.scriptHash,
+							result: history.get(a.scriptHash) ?? []
+						}))
+					};
+				}
 			);
 		sinon
 			.stub(electrumHelpers, 'listUnspentAddressScriptHashes')
@@ -390,6 +406,16 @@ describe('old address notification requests (#1859)', function () {
 		});
 	};
 
+	/** A spend of the old address's coin to outside, once the server has it. */
+	const spendOld = (txid = SPEND): void => {
+		served.set(
+			txid,
+			details(txid, [{ txid: FUNDING, vout: 6 }], [[EXTERNAL, 0.0009]], 0)
+		);
+		history.get(old.scriptHash)?.push({ tx_hash: txid, height: 0 });
+		unspent.set(old.scriptHash, []);
+	};
+
 	const notifyOld = async (): Promise<void> => {
 		if (!scriptHashHandler)
 			throw new Error('No script hash handler was wired.');
@@ -420,12 +446,7 @@ describe('old address notification requests (#1859)', function () {
 	});
 
 	it('lists a spent old coin once and drops it', async function () {
-		served.set(
-			SPEND,
-			details(SPEND, [{ txid: FUNDING, vout: 6 }], [[EXTERNAL, 0.0009]], 0)
-		);
-		history.get(old.scriptHash)?.push({ tx_hash: SPEND, height: 0 });
-		unspent.set(old.scriptHash, []);
+		spendOld();
 		listings = [];
 
 		await notifyOld();
@@ -434,6 +455,76 @@ describe('old address notification requests (#1859)', function () {
 		expect(listings.length, 'one UTXO listing').to.equal(1);
 		expect(oldListed()).to.equal(1);
 		expect(wallet.data.utxos).to.deep.equal([]);
+		expect(wallet.data.balance).to.equal(0);
+	});
+
+	it('records an external spend of an old coin as sent (#1883)', async function () {
+		spendOld();
+		histories = [];
+
+		await notifyOld();
+		await settled();
+
+		expect(oldRead(), 'the refresh reads the old address').to.equal(1);
+		expect(wallet.data.utxos).to.deep.equal([]);
+		const spend = wallet.data.transactions[SPEND];
+		expect(spend?.type).to.equal(EPaymentType.sent);
+		expect(spend?.valueSats).to.equal(-100_000);
+		expect(spend?.feeSats).to.equal(10_000);
+
+		listings = [];
+		histories = [];
+		const refreshed = await wallet.refreshWallet();
+		if (refreshed.isErr()) throw refreshed.error;
+		expect(oldListed(), 'recorded, so no longer listed').to.equal(0);
+		expect(oldRead(), 'recorded, so no longer read').to.equal(0);
+	});
+
+	it('reads an old address again until the spend of its coin is recorded', async function () {
+		spendOld();
+		const spend = served.get(SPEND);
+		// The server answers the history but not the transaction.
+		served.delete(SPEND);
+
+		await notifyOld();
+		await settled();
+
+		expect(wallet.data.utxos).to.deep.equal([]);
+		expect(wallet.data.transactions[SPEND]).to.equal(undefined);
+
+		if (spend) served.set(SPEND, spend);
+		listings = [];
+		histories = [];
+		const refreshed = await wallet.refreshWallet();
+		if (refreshed.isErr()) throw refreshed.error;
+
+		expect(oldListed()).to.equal(1);
+		expect(oldRead()).to.equal(1);
+		expect(wallet.data.transactions[SPEND]?.type).to.equal(EPaymentType.sent);
+		expect(wallet.data.balance).to.equal(0);
+	});
+
+	it('records its own spend of an old coin once the server has it', async function () {
+		const own = new Transaction();
+		own.version = 2;
+		own.addInput(Buffer.from(FUNDING, 'hex').reverse(), 6);
+		own.addOutput(
+			bitcoinAddress.toOutputScript(EXTERNAL, networks.regtest),
+			90_000
+		);
+		// What a broadcast does to the set before the server reports the spend.
+		const removed = await wallet.removeSpentUtxos(own.toHex());
+		if (removed.isErr()) throw removed.error;
+		expect(removed.value.map((u) => u.tx_hash)).to.deep.equal([FUNDING]);
+		expect(wallet.data.utxos).to.deep.equal([]);
+
+		spendOld(own.getId());
+		await notifyOld();
+		await settled();
+
+		expect(wallet.data.transactions[own.getId()]?.type).to.equal(
+			EPaymentType.sent
+		);
 		expect(wallet.data.balance).to.equal(0);
 	});
 

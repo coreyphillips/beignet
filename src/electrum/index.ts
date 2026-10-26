@@ -1422,16 +1422,20 @@ export class Electrum {
 	 * answered for each script hash. A script hash found here is not asked
 	 * again, and every one the server answers is added to it. One the server
 	 * failed is left out, which is how the gap scan tells it from unused.
+	 * @param {IAddresses} [additionalScriptHashes] Read besides the addresses
+	 * picked above.
 	 * @returns {Promise<Result<IGetAddressHistoryResponse[]>>}
 	 */
 	async getAddressHistory({
 		scriptHashes = [],
 		scanAllAddresses = false,
-		answered
+		answered,
+		additionalScriptHashes = {}
 	}: {
 		scriptHashes?: IAddress[];
 		scanAllAddresses?: boolean;
 		answered?: Map<string, TTxResult[]>;
+		additionalScriptHashes?: IAddresses;
 	}): Promise<Result<IGetAddressHistoryResponse[]>> {
 		try {
 			if (this._disconnected) return err(DISCONNECTED_ERROR);
@@ -1500,6 +1504,7 @@ export class Electrum {
 					addToScan(changeAddressValues);
 				});
 			}
+			addToScan(Object.values(additionalScriptHashes));
 			scriptHashes = [...toScan.values()];
 			if (scriptHashes.length < 1) {
 				return err('No scriptHashes available to check.');
