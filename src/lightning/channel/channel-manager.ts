@@ -1754,7 +1754,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		paymentHash: Buffer,
 		cltvExpiry: number,
 		onionRoutingPacket: Buffer,
-		blindingPoint?: Buffer
+		blindingPoint?: Buffer,
+		skimmedFeeMsat?: bigint
 	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
@@ -1775,7 +1776,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			paymentHash,
 			cltvExpiry,
 			onionRoutingPacket,
-			blindingPoint
+			blindingPoint,
+			skimmedFeeMsat
 		);
 		this.processActions(peerPubkey, channel, actions);
 

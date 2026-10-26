@@ -5023,6 +5023,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					return;
 				}
 				this.registerChannelScid(channelId, scid);
+				// A private peer may omit the channel_ready alias. Its first
+				// addressable policy update then has to wait for the real SCID.
+				this.sendPrivateChannelPolicy(channelId);
 			}
 		);
 		// A channel restored from persistence has finished reestablishing:
@@ -5061,6 +5064,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// facts only, which is what makes it safe on this every-reconnect
 		// event where the restore repair above is not.
 		this.channelManager.on('channel:reestablished', (channelId: Buffer) => {
+			this.sendPrivateChannelPolicy(channelId);
 			this.settleForwardsOwedUpstream(channelId);
 			this.fulfillSettledReceivedHtlcs(channelId);
 			// A conflict verdict the peer has not yet agreed is re-asked on
@@ -5082,6 +5086,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.channelManager.on('channel:ready', (channelId: Buffer) => {
 			this.registerChannelScids(channelId);
 			this.persistChannel(channelId);
+			this.sendPrivateChannelPolicy(channelId);
 			// Clear reestablish stuck tracker when channel reaches NORMAL
 			this._stuckChannelTracker.delete(
 				`reestablish:${channelId.toString('hex')}`
@@ -13188,6 +13193,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		return out;
 	}
 
+	private sendPrivateChannelPolicy(channelId: Buffer): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (channel && !channel.getFullState().announceChannel) {
+			// Private peers cannot learn our fees from public gossip. Send the
+			// signed policy when the channel first becomes usable and after each
+			// reconnect so their invoice hints use the fees we actually enforce.
+			this.regenerateChannelUpdateForPolicy(channelId);
+		}
+	}
+
 	/**
 	 * Push the (new) effective policy out as a channel_update. Announced
 	 * channels: rewrite the cached update, re-add to our graph, and broadcast
@@ -13222,7 +13237,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			try {
 				this.peerManager.sendToPeer(peer, MessageType.CHANNEL_UPDATE, payload);
 			} catch {
-				// Peer not connected; it will learn the policy from route hints.
+				// Retry when the channel reestablishes with the peer.
 			}
 		} else {
 			this.emitOutbound(peer, MessageType.CHANNEL_UPDATE, payload);
@@ -25284,7 +25299,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					part.paymentHash,
 					part.forwardCltv,
 					nextOnionBuf,
-					part.nextBlindingPoint
+					part.nextBlindingPoint,
+					part.skimmedFeeMsat
 				);
 			}
 		);

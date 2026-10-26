@@ -31,7 +31,7 @@
  *   [4: feerate_per_kw]
  */
 
-import { decodeTlvStream } from './tlv';
+import { decodeTlvStream, encodeTlvRecord } from './tlv';
 
 export interface IUpdateAddHtlcMessage {
 	channelId: Buffer;
@@ -46,6 +46,8 @@ export interface IUpdateAddHtlcMessage {
 	 * hop can derive its blinded node key. 33-byte compressed point.
 	 */
 	blindingPoint?: Buffer;
+	/** Agreed liquidity fee withheld from this HTLC, in millisatoshis. */
+	skimmedFeeMsat?: bigint;
 }
 
 export interface IUpdateFulfillHtlcMessage {
@@ -89,7 +91,11 @@ const UPDATE_FAIL_MALFORMED_HTLC_LENGTH = 74; // 32 + 8 + 32 + 2
 const UPDATE_FEE_LENGTH = 36; // 32 + 4
 
 const TLV_BLINDING_POINT = 0n;
-const UPDATE_ADD_HTLC_TLV_TYPES = new Set<bigint>([TLV_BLINDING_POINT]);
+const TLV_SKIMMED_FEE_MSAT = 65537n;
+const UPDATE_ADD_HTLC_TLV_TYPES = new Set<bigint>([
+	TLV_BLINDING_POINT,
+	TLV_SKIMMED_FEE_MSAT
+]);
 
 /**
  * Encode an `update_add_htlc` message payload.
@@ -112,18 +118,22 @@ export function encodeUpdateAddHtlcMessage(msg: IUpdateAddHtlcMessage): Buffer {
 
 	// Optional trailing blinding_point TLV (type 0, length 33). BOLT 1 allows
 	// trailing TLV extensions; legacy decoders ignore the extra bytes.
+	const parts = [buf];
 	if (msg.blindingPoint) {
 		if (msg.blindingPoint.length !== 33) {
 			throw new Error('blindingPoint must be 33 bytes');
 		}
-		return Buffer.concat([
-			buf,
-			Buffer.from([0x00, 0x21]), // type 0, length 33
-			msg.blindingPoint
-		]);
+		parts.push(
+			encodeTlvRecord({ type: TLV_BLINDING_POINT, value: msg.blindingPoint })
+		);
 	}
 
-	return buf;
+	if (msg.skimmedFeeMsat !== undefined) {
+		const value = Buffer.alloc(8);
+		value.writeBigUInt64BE(msg.skimmedFeeMsat);
+		parts.push(encodeTlvRecord({ type: TLV_SKIMMED_FEE_MSAT, value }));
+	}
+	return Buffer.concat(parts);
 }
 
 /**
@@ -155,13 +165,14 @@ export function decodeUpdateAddHtlcMessage(
 	);
 	offset += 1366;
 
-	// Optional trailing update_add_htlc_tlvs; only blinding_point is known.
+	// Optional trailing update_add_htlc_tlvs.
 	// Its length is checked, since every sender serializes a point as 33
 	// bytes. It is not checked to be a curve point: a decode error fails the
 	// channel, and an honest relay can pass on a bad point chosen by the
 	// path's creator. The node fails only that HTLC, with
 	// invalid_onion_blinding (BOLT 2).
 	let blindingPoint: Buffer | undefined;
+	let skimmedFeeMsat: bigint | undefined;
 	if (offset < payload.length) {
 		const { records } = decodeTlvStream(
 			payload,
@@ -176,6 +187,11 @@ export function decodeUpdateAddHtlcMessage(
 					);
 				}
 				blindingPoint = record.value;
+			} else if (record.type === TLV_SKIMMED_FEE_MSAT) {
+				if (record.value.length !== 8) {
+					throw new Error('update_add_htlc: skimmed_fee_msat must be 8 bytes');
+				}
+				skimmedFeeMsat = record.value.readBigUInt64BE();
 			}
 		}
 	}
@@ -191,6 +207,7 @@ export function decodeUpdateAddHtlcMessage(
 	if (blindingPoint) {
 		result.blindingPoint = blindingPoint;
 	}
+	if (skimmedFeeMsat !== undefined) result.skimmedFeeMsat = skimmedFeeMsat;
 	return result;
 }
 

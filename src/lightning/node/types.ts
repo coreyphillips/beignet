@@ -1432,6 +1432,8 @@ export interface IForwardablePart {
 	inHtlcId: bigint;
 	paymentHash: Buffer;
 	forwardAmountMsat: bigint;
+	/** Agreed JIT fee deducted from this part, announced to its recipient. */
+	skimmedFeeMsat?: bigint;
 	/**
 	 * The inbound HTLC's value (msat), i.e. `forwardAmountMsat` plus whatever
 	 * routing fee the sender paid this hop. Recorded by the forwarding path

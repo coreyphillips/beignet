@@ -954,7 +954,7 @@ method channel.Channel.abortDualFunding(reason?: string): channel.ChannelAction[
 method channel.Channel.abortFforEpoch(reason?: ffor.FforAbortReason, text?: string): channel.ChannelAction[]
 method channel.Channel.abortSplice(reason?: string): channel.ChannelAction[]
 method channel.Channel.acceptsNewHtlcs(lookThroughReestablish?: boolean, reservationHint?: boolean): boolean
-method channel.Channel.addHtlc(amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer): channel.ChannelAction[]
+method channel.Channel.addHtlc(amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint): channel.ChannelAction[]
 method channel.Channel.addTxInput(input: interactiveTx.IInteractiveTxInput): channel.ChannelAction[]
 method channel.Channel.addTxOutput(output: interactiveTx.IInteractiveTxOutput): channel.ChannelAction[]
 method channel.Channel.adoptRemoteForwardingPolicy(policy: channel.IRemoteForwardingPolicy): boolean
@@ -1252,7 +1252,7 @@ method channel.ChannelManager.abortDualFundedOpen(channelId: Buffer, reason?: st
 method channel.ChannelManager.abortFforEpoch(channelId: Buffer, reason?: ffor.FforAbortReason, text?: string): channel.ChannelResult
 method channel.ChannelManager.abortPendingOpen(channel: channel.Channel, reason: string): void
 method channel.ChannelManager.abortSplice(channelId: Buffer, reason?: string): channel.ChannelResult
-method channel.ChannelManager.addHtlc(channelId: Buffer, amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer): channel.ChannelResult
+method channel.ChannelManager.addHtlc(channelId: Buffer, amountMsat: bigint, paymentHash: Buffer, cltvExpiry: number, onionRoutingPacket: Buffer, blindingPoint?: Buffer, skimmedFeeMsat?: bigint): channel.ChannelResult
 method channel.ChannelManager.addTrustedPeer(pubkeyHex: string): void
 method channel.ChannelManager.armChannelIndexTipFloor(knownTipHeight?: number): void
 method channel.ChannelManager.attachToPeerManager(peerManager: transport.PeerManager): void
@@ -4779,6 +4779,7 @@ property message.IUpdateAddHtlcMessage.cltvExpiry: number
 property message.IUpdateAddHtlcMessage.id: bigint
 property message.IUpdateAddHtlcMessage.onionRoutingPacket: Buffer
 property message.IUpdateAddHtlcMessage.paymentHash: Buffer
+property message.IUpdateAddHtlcMessage.skimmedFeeMsat?: bigint
 interface message.IUpdateBlockheightMessage
 property message.IUpdateBlockheightMessage.blockheight: number
 property message.IUpdateBlockheightMessage.channelId: Buffer
@@ -5119,6 +5120,7 @@ property node.IForwardablePart.incomingCltvExpiry: number
 property node.IForwardablePart.nextBlindingPoint?: Buffer
 property node.IForwardablePart.nextPacket: { version: number; ephemeralKey: Buffer; routingInfo: Buffer; hmac: Buffer; }
 property node.IForwardablePart.paymentHash: Buffer
+property node.IForwardablePart.skimmedFeeMsat?: bigint
 interface node.IFundingProvider
 method node.IFundingProvider.broadcastTransaction(txHex: string): Promise<string>
 method node.IFundingProvider.buildFundingTransaction(address: string, amountSats: bigint, satsPerByte?: number, max?: boolean): Promise<{ txHex: string; txid: Buffer; outputIndex: number; }>

@@ -3581,8 +3581,15 @@ export class Channel {
 		paymentHash: Buffer,
 		cltvExpiry: number,
 		onionRoutingPacket: Buffer,
-		blindingPoint?: Buffer
+		blindingPoint?: Buffer,
+		skimmedFeeMsat?: bigint
 	): ChannelAction[] {
+		if (
+			skimmedFeeMsat !== undefined &&
+			(skimmedFeeMsat < 0n || skimmedFeeMsat > 0xffffffffffffffffn)
+		) {
+			throw new Error('skimmedFeeMsat must fit in u64');
+		}
 		const refusal = this.validateOutgoingHtlc(amountMsat, cltvExpiry);
 		if (refusal.length > 0) return refusal;
 		const htlcId = this._state.localHtlcCounter++;
@@ -3618,6 +3625,7 @@ export class Channel {
 			onionRoutingPacket,
 			...(blindingPoint ? { blindingPoint } : {})
 		};
+		if (skimmedFeeMsat !== undefined) msg.skimmedFeeMsat = skimmedFeeMsat;
 
 		// We added an offered HTLC — we owe the remote a commitment_signed.
 		this._state.needsCommitment = true;

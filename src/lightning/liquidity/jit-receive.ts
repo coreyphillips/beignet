@@ -1929,6 +1929,7 @@ export class JitReceiveManager extends TypedEmitter<JitReceiveEvents> {
 			b.forwardAmountMsat > a.forwardAmountMsat ? b : a
 		);
 		largest.forwardAmountMsat -= feeMsat;
+		largest.skimmedFeeMsat = (largest.skimmedFeeMsat ?? 0n) + feeMsat;
 	}
 
 	// ─────────────── Resolution ───────────────
