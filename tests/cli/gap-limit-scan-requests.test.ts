@@ -14,6 +14,7 @@ import tls from 'tls';
 
 import {
 	createConsoleLogger,
+	createMemoryStorage,
 	EAddressType,
 	EAvailableNetworks,
 	EPaymentType,
@@ -25,6 +26,7 @@ import {
 	ok,
 	Result,
 	TMessageDataMap,
+	TStorage,
 	TTxDetails,
 	Wallet
 } from '../../src';
@@ -108,6 +110,33 @@ describe('gap-limit scan requests (#1661)', function () {
 	/** Each index addAddresses derived that was already stored. */
 	let duplicates: string[];
 	let messages: (keyof TMessageDataMap)[];
+	/** What the wallet wrote, as JSON, keyed as storage keys it. */
+	let written: Map<string, string>;
+
+	const open = async (storage: TStorage): Promise<Wallet> => {
+		const res = await Wallet.create({
+			mnemonic: MNEMONIC,
+			network: EAvailableNetworks.regtest,
+			addressType: EAddressType.p2wpkh,
+			addressTypesToMonitor: TYPES,
+			electrumOptions,
+			feeEstimationSource: 'electrum',
+			// The test drives the refresh itself; nothing may scan behind it.
+			disableRefreshOnCreate: true,
+			logger: createConsoleLogger('silent'),
+			onMessage: (key): void => {
+				messages.push(key);
+			},
+			storage
+		});
+		if (res.isErr()) throw res.error;
+		const opened = res.value;
+		opened.electrum.stopConnectionPolling();
+		opened.electrum.batchDelay = 0;
+		const connected = await opened.connectToElectrum();
+		if (connected.isErr()) throw connected.error;
+		return opened;
+	};
 
 	beforeEach(async function () {
 		paid = new Map();
@@ -207,32 +236,16 @@ describe('gap-limit scan requests (#1661)', function () {
 				})
 			);
 
-		const res = await Wallet.create({
-			mnemonic: MNEMONIC,
-			network: EAvailableNetworks.regtest,
-			addressType: EAddressType.p2wpkh,
-			addressTypesToMonitor: TYPES,
-			electrumOptions,
-			feeEstimationSource: 'electrum',
-			// The test drives the refresh itself; nothing may scan behind it.
-			disableRefreshOnCreate: true,
-			logger: createConsoleLogger('silent'),
-			onMessage: (key): void => {
-				messages.push(key);
-			},
-			storage: {
-				setData: async <K extends keyof IWalletData>(
-					_key: string,
-					_value: IWalletData[K]
-				): Promise<Result<boolean>> => ok(true)
+		written = new Map();
+		wallet = await open({
+			setData: async <K extends keyof IWalletData>(
+				key: string,
+				value: IWalletData[K]
+			): Promise<Result<boolean>> => {
+				written.set(key, JSON.stringify(value));
+				return ok(true);
 			}
 		});
-		if (res.isErr()) throw res.error;
-		wallet = res.value;
-		wallet.electrum.stopConnectionPolling();
-		wallet.electrum.batchDelay = 0;
-		const connected = await wallet.connectToElectrum();
-		if (connected.isErr()) throw connected.error;
 
 		const internals = wallet as unknown as {
 			addAddresses: (args: IGenerateAddresses) => Promise<unknown>;
@@ -391,41 +404,51 @@ describe('gap-limit scan requests (#1661)', function () {
 		expect(duplicates).to.deep.equal([]);
 	});
 
-	it('lists the coins the extension rounds reached on the refresh after their listing failed (#1882)', async function () {
-		const first = await wallet.refreshWallet();
-		expect(first.isOk(), first.isErr() ? first.error.message : '').to.equal(
-			true
-		);
-		for (const index of [3, 22, 41]) {
-			const gen = await wallet.generateAddresses({
-				addressAmount: 1,
-				addressIndex: index,
-				changeAddressAmount: 0,
-				addressType: EAddressType.p2wpkh
-			});
-			if (gen.isErr()) throw gen.error;
-			pay(at(gen.value.addresses, index));
-		}
-		// An empty address, so only the failure itself costs the listing.
-		failListing.add(
-			at(wallet.data.changeAddresses[EAddressType.p2wpkh], 0).scriptHash
-		);
+	for (const restart of [false, true]) {
+		it(`lists the coins the extension rounds reached on the refresh after their listing failed${
+			restart ? ', across a restart' : ''
+		} (#1882)`, async function () {
+			const first = await wallet.refreshWallet();
+			expect(first.isOk(), first.isErr() ? first.error.message : '').to.equal(
+				true
+			);
+			for (const index of [3, 22, 41]) {
+				const gen = await wallet.generateAddresses({
+					addressAmount: 1,
+					addressIndex: index,
+					changeAddressAmount: 0,
+					addressType: EAddressType.p2wpkh
+				});
+				if (gen.isErr()) throw gen.error;
+				pay(at(gen.value.addresses, index));
+			}
+			// An empty address, so only the failure itself costs the listing.
+			failListing.add(
+				at(wallet.data.changeAddresses[EAddressType.p2wpkh], 0).scriptHash
+			);
 
-		const failed = await wallet.refreshWallet();
-		expect(failed.isErr(), 'the failed entry fails the refresh').to.equal(true);
-		expect(wallet.data.addressIndex[EAddressType.p2wpkh].index).to.equal(42);
-		expect(wallet.data.utxos).to.deep.equal([]);
+			const failed = await wallet.refreshWallet();
+			expect(failed.isErr(), 'the failed entry fails the refresh').to.equal(
+				true
+			);
+			expect(wallet.data.addressIndex[EAddressType.p2wpkh].index).to.equal(42);
+			expect(wallet.data.utxos).to.deep.equal([]);
 
-		failListing.clear();
-		const res = await wallet.refreshWallet();
-		expect(res.isOk(), res.isErr() ? res.error.message : '').to.equal(true);
+			failListing.clear();
+			if (restart) {
+				await wallet.stop();
+				wallet = await open(createMemoryStorage(written));
+			}
+			const res = await wallet.refreshWallet();
+			expect(res.isOk(), res.isErr() ? res.error.message : '').to.equal(true);
 
-		expect(
-			wallet.data.utxos.map((u) => u.index).sort((a, b) => a - b),
-			'the coin at 3 is outside the window around 42'
-		).to.deep.equal([3, 22, 41]);
-		expect(wallet.data.balance).to.equal(300_000);
-	});
+			expect(
+				wallet.data.utxos.map((u) => u.index).sort((a, b) => a - b),
+				'the coin at 3 is outside the window around 42'
+			).to.deep.equal([3, 22, 41]);
+			expect(wallet.data.balance).to.equal(300_000);
+		});
+	}
 
 	it('asks again for a history the scan was answered before the check repaired its record', async function () {
 		const first = await wallet.refreshWallet();

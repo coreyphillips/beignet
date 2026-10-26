@@ -316,8 +316,9 @@ export class Wallet {
 	// retries it.
 	private _refreshFailed = false;
 	// Addresses a refresh's gap scan handed to a UTXO listing that failed.
-	// The scan already saved indexes past them, so later refreshes list them
-	// from here until a listing that names them succeeds. Memory only.
+	// The scan already moved the indexes past them, so later refreshes list
+	// them from here until a listing that names them succeeds. Memory only: a
+	// restart scans them again from the indexes last saved.
 	private readonly _unlistedUtxoAddresses: IAddresses = {};
 	// Outpoints our own broadcasts have spent, keyed 'txid:vout', each holding
 	// the value _spendSeq had when the broadcast landed. The UTXO set is only
@@ -1515,6 +1516,7 @@ export class Wallet {
 		for (const scriptHash in utxoAddresses) {
 			delete this._unlistedUtxoAddresses[scriptHash];
 		}
+		await this.saveAddressIndexes();
 		if (this._stopped) return err(stopped);
 		const r3 = await this.updateTransactions({ scanAllAddresses, scan });
 		if (r3.isErr()) {
@@ -3107,29 +3109,41 @@ export class Wallet {
 		try {
 			await Promise.all(promises);
 			if (this.electrum !== electrum) throw switched;
-			if (updated) {
-				await Promise.all([
-					this.saveReceiveIndex(),
-					this.saveWalletData(
-						'changeAddressIndex',
-						this._data.changeAddressIndex
-					),
-					this.saveWalletData(
-						'lastUsedAddressIndex',
-						this._data.lastUsedAddressIndex
-					),
-					this.saveWalletData(
-						'lastUsedChangeAddressIndex',
-						this._data.lastUsedChangeAddressIndex
-					)
-				]);
-			}
+			if (updated) this.unsavedAddressIndexes = true;
 			return ok(
 				updated ? 'Successfully updated indexes.' : 'No update needed.'
 			);
 		} catch (e) {
 			return err(e);
 		}
+	}
+
+	// Set when updateAddressIndexes moved the indexes. They are saved only once
+	// a UTXO listing succeeds: a restart scans from the saved indexes, so ones
+	// saved past coins whose listing failed would leave those coins unlisted.
+	private unsavedAddressIndexes = false;
+
+	/**
+	 * Saves the indexes updateAddressIndexes moved since the last save.
+	 * @private
+	 * @async
+	 * @returns {Promise<void>}
+	 */
+	private async saveAddressIndexes(): Promise<void> {
+		if (!this.unsavedAddressIndexes) return;
+		this.unsavedAddressIndexes = false;
+		await Promise.all([
+			this.saveReceiveIndex(),
+			this.saveWalletData('changeAddressIndex', this._data.changeAddressIndex),
+			this.saveWalletData(
+				'lastUsedAddressIndex',
+				this._data.lastUsedAddressIndex
+			),
+			this.saveWalletData(
+				'lastUsedChangeAddressIndex',
+				this._data.lastUsedChangeAddressIndex
+			)
+		]);
 	}
 
 	/**
