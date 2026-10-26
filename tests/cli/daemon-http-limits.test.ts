@@ -172,14 +172,19 @@ describe('HTTP server connection limits (issue #1401)', function () {
 	});
 
 	it('closes connections past the cap and admits one again once a slot frees', async () => {
-		for (let i = 0; i < HTTP_MAX_CONNECTIONS; i++) {
-			const socket = net.connect(port, '127.0.0.1');
-			socket.on('error', () => undefined);
-			held.push(socket);
+		// Opened in batches that the server accepts before the next one: macOS
+		// caps a listen backlog at kern.ipc.somaxconn (128 by default) and
+		// resets the connections past it, so 256 at once never all arrive.
+		const batch = 64;
+		while (held.length < HTTP_MAX_CONNECTIONS) {
+			const target = Math.min(held.length + batch, HTTP_MAX_CONNECTIONS);
+			while (held.length < target) {
+				const socket = net.connect(port, '127.0.0.1');
+				socket.on('error', () => undefined);
+				held.push(socket);
+			}
+			await until(async () => (await connectionCount(daemon)) === target);
 		}
-		await until(
-			async () => (await connectionCount(daemon)) === HTTP_MAX_CONNECTIONS
-		);
 
 		let refused: unknown = null;
 		try {
