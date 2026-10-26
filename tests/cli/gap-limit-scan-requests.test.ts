@@ -404,9 +404,15 @@ describe('gap-limit scan requests (#1661)', function () {
 		expect(duplicates).to.deep.equal([]);
 	});
 
-	for (const restart of [false, true]) {
+	for (const [restart, issued] of [
+		[false, false],
+		[true, false],
+		[true, true]
+	]) {
 		it(`lists the coins the extension rounds reached on the refresh after their listing failed${
 			restart ? ', across a restart' : ''
+		}${
+			issued ? ' after a receive address was issued' : ''
 		} (#1882)`, async function () {
 			const first = await wallet.refreshWallet();
 			expect(first.isOk(), first.isErr() ? first.error.message : '').to.equal(
@@ -435,6 +441,15 @@ describe('gap-limit scan requests (#1661)', function () {
 			expect(wallet.data.utxos).to.deep.equal([]);
 
 			failListing.clear();
+			if (issued) {
+				const address = await wallet.getReceiveAddress({});
+				if (address.isErr()) throw address.error;
+				const stored = written.get(wallet.getWalletDataKey('addressIndex'));
+				expect(
+					JSON.parse(stored!)[EAddressType.p2wpkh].index,
+					'issuing saved the index past the coins'
+				).to.equal(42);
+			}
 			if (restart) {
 				await wallet.stop();
 				wallet = await open(createMemoryStorage(written));
@@ -447,6 +462,7 @@ describe('gap-limit scan requests (#1661)', function () {
 				'the coin at 3 is outside the window around 42'
 			).to.deep.equal([3, 22, 41]);
 			expect(wallet.data.balance).to.equal(300_000);
+			expect(wallet.data.unlistedUtxoAddresses).to.deep.equal({});
 		});
 	}
 

@@ -315,11 +315,6 @@ export class Wallet {
 	// only runs a full refresh when something calls for one, and this is what
 	// retries it.
 	private _refreshFailed = false;
-	// Addresses a refresh's gap scan handed to a UTXO listing that failed.
-	// The scan already moved the indexes past them, so later refreshes list
-	// them from here until a listing that names them succeeds. Memory only: a
-	// restart scans them again from the indexes last saved.
-	private readonly _unlistedUtxoAddresses: IAddresses = {};
 	// Outpoints our own broadcasts have spent, keyed 'txid:vout', each holding
 	// the value _spendSeq had when the broadcast landed. The UTXO set is only
 	// ever replaced wholesale by a scan, so a scan already in flight at that
@@ -1498,7 +1493,7 @@ export class Wallet {
 		}
 		if (this._stopped) return err(stopped);
 		const utxoAddresses = {
-			...this._unlistedUtxoAddresses,
+			...this._data.unlistedUtxoAddresses,
 			...scan.utxoAddresses
 		};
 		const r2 = await this.refreshUtxos({
@@ -1506,15 +1501,26 @@ export class Wallet {
 			additionalAddresses,
 			additionalScriptHashes: utxoAddresses
 		});
+		const unlisted = this._data.unlistedUtxoAddresses;
 		if (r2.isErr()) {
-			// switchNetwork replaced the map, and these are the old network's.
-			if (this.electrum === electrum) {
-				Object.assign(this._unlistedUtxoAddresses, scan.utxoAddresses);
+			// switchNetwork replaced the data, and these are the old network's.
+			// Saved, not only kept: issuing a receive address saves the receive
+			// index past them, and a restart scans from the saved index.
+			if (
+				this.electrum === electrum &&
+				Object.keys(scan.utxoAddresses).length
+			) {
+				Object.assign(unlisted, scan.utxoAddresses);
+				await this.saveWalletData('unlistedUtxoAddresses', unlisted);
 			}
 			return err(r2.error);
 		}
-		for (const scriptHash in utxoAddresses) {
-			delete this._unlistedUtxoAddresses[scriptHash];
+		const listed = Object.keys(unlisted).filter(
+			(scriptHash) => scriptHash in utxoAddresses
+		);
+		if (listed.length) {
+			for (const scriptHash of listed) delete unlisted[scriptHash];
+			await this.saveWalletData('unlistedUtxoAddresses', unlisted);
 		}
 		await this.saveAddressIndexes();
 		if (this._stopped) return err(stopped);
@@ -1797,6 +1803,9 @@ export class Wallet {
 							break;
 						case 'birthdayHeight':
 							walletData[key] = data as number;
+							break;
+						case 'unlistedUtxoAddresses':
+							walletData[key] = data as IAddresses;
 							break;
 						default:
 							this.logger.warn(`Unhandled key in getWalletData: ${key}`);

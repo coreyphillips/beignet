@@ -282,6 +282,10 @@ export interface IWalletData {
 	// Wallet creation height (0 = unknown). Metadata only on Electrum; see
 	// Wallet.birthdayHeight docs.
 	birthdayHeight: number;
+	// Addresses a refresh's gap scan found used, keyed by script hash, whose
+	// UTXO listing failed. The scan moved the indexes past them, so refreshes
+	// list them from here until a listing that names them succeeds.
+	unlistedUtxoAddresses: IAddresses;
 }
 
 export type TAddressLabels = { [address: string]: string };
